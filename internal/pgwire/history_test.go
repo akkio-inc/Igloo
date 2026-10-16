@@ -1,12 +1,87 @@
 package pgwire
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 )
+
+// backgroundStore hides a MemoryStore's type, so that the history is
+// written in the background and statements are analyzed in the
+// background, as with PostgreSQL.
+type backgroundStore struct{ *audit.MemoryStore }
+
+// TestBackgroundAnalysis checks that statements analyzed in the background
+// go to the history once each, with what they read and wrote next to what
+// the session and the workload recorded of them.
+func TestBackgroundAnalysis(t *testing.T) {
+	store := backgroundStore{audit.NewMemoryStore(1000, 1000)}
+	history := audit.New(store, audit.Options{Pool: "etl"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if history.Immediate() {
+		t.Fatal("the history is written directly")
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		history.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-done
+	})
+	cs := startCatalogServer(t, func(o *Options) { o.Audit, o.Pool = history, "etl" })
+	walt := cs.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeExec)
+	mustExec(t, walt, "SET query_tag = 'nightly'")
+	statements := []string{
+		"CREATE TABLE lake.public.src AS SELECT range AS i FROM range(10)",
+		"INSERT INTO lake.public.src SELECT i + 10 FROM lake.public.src",
+		"CREATE TABLE lake.public.dst AS SELECT * FROM lake.public.src",
+	}
+	for _, sql := range statements {
+		mustExec(t, walt, sql)
+	}
+	var qs []audit.Query
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		all, err := store.Queries(context.Background(), audit.Viewer{User: "walt"}, audit.Page{Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		qs = slices.DeleteFunc(all, func(q audit.Query) bool { return !slices.Contains(statements, q.Text) })
+		if len(qs) >= len(statements) {
+			break
+		}
+	}
+	if len(qs) != len(statements) {
+		t.Fatalf("%d of the %d statements in the history: %+v", len(qs), len(statements), qs)
+	}
+	for _, q := range qs {
+		if q.QueryTag != "nightly" || q.Pool != "etl" || q.Outcome != audit.OutcomeOK || len(q.TablesWritten) != 1 {
+			t.Errorf("%s: %+v", q.Text, q)
+		}
+		if q.Text == statements[2] && !slices.Equal(q.TablesRead, []string{"lake.public.src"}) {
+			t.Errorf("%s read %q", q.Text, q.TablesRead)
+		}
+	}
+	usage, err := history.TableUsage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range usage {
+		if u.Table == "lake.public.src" && (u.Reads != 2 || u.Writes != 2) {
+			t.Errorf("src's usage counted twice: %+v", u)
+		}
+	}
+}
 
 func TestRedactQuery(t *testing.T) {
 	cases := map[string]string{

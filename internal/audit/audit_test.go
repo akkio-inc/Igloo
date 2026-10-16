@@ -226,14 +226,35 @@ func TestPostgresStore(t *testing.T) {
 	// committed, is not an error and adds nothing twice.
 	again := []Query{{ID: "retried-1", User: "ana", Start: time.Now(), Outcome: "ok", StatementType: "SELECT", Text: "SELECT 1"},
 		{ID: "retried-2", User: "ana", Start: time.Now(), Outcome: "ok", StatementType: "SELECT", Text: "SELECT 2"}}
-	for i := range 2 {
-		if err := s.WriteQueries(ctx, again); err != nil {
-			t.Fatalf("write %d: %v", i+1, err)
-		}
+	if err := s.WriteQueries(ctx, again); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	// Written again with a statement more, through the staging table,
+	// which must carry every column.
+	full := Query{ID: "retried-3", User: "ana", Start: time.Now().Truncate(time.Millisecond), Outcome: "ok", StatementType: "COPY",
+		Text: "COPY t FROM 's3://landing/a.csv'", TablesWritten: []string{"lake.public.t"}, LocationsRead: []string{"s3://landing/a.csv"},
+		Job: "pipe drops", QueryTag: "etl", Pool: "default", Queued: time.Second,
+		Resources: &Resources{CPUTime: 2 * time.Millisecond, BytesRead: 10, MemoryAllocated: 20}}
+	if err := s.WriteQueries(ctx, append(again, full)); err != nil {
+		t.Fatalf("write 2: %v", err)
 	}
 	var n int
-	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM igloo_audit.query_history WHERE query_id LIKE 'retried-%'").Scan(&n); err != nil || n != 2 {
-		t.Fatalf("retried batch: %d rows, %v; want 2", n, err)
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM igloo_audit.query_history WHERE query_id LIKE 'retried-%'").Scan(&n); err != nil || n != 3 {
+		t.Fatalf("retried batch: %d rows, %v; want 3", n, err)
+	}
+	qs, err := s.Queries(ctx, Viewer{All: true}, Page{Limit: 100})
+	i := slices.IndexFunc(qs, func(q Query) bool { return q.ID == full.ID })
+	if err != nil || i < 0 {
+		t.Fatalf("read back: %v %v", qs, err)
+	}
+	if got := qs[i]; !slices.Equal(got.LocationsRead, full.LocationsRead) || got.Job != full.Job ||
+		!slices.Equal(got.TablesWritten, full.TablesWritten) || got.QueryTag != "etl" || got.Pool != "default" ||
+		got.Queued != time.Second || got.Resources == nil || *got.Resources != *full.Resources {
+		t.Errorf("a statement written through the staging table read back as %+v", got)
+	}
+	if usage, err := s.TableUsage(ctx, time.Now().Add(-time.Hour)); err != nil ||
+		!slices.ContainsFunc(usage, func(u TableUsage) bool { return u.Table == "lake.public.t" && u.Writes == 1 }) {
+		t.Errorf("usage after a retried write: %+v %v", usage, err)
 	}
 	logins := []Login{{ID: "retried-login", User: "ana", Time: time.Now(), Result: "success"}}
 	for i := range 2 {
