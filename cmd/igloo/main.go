@@ -1,5 +1,5 @@
-// Command igloo serves SQL over the Postgres wire protocol, running queries on
-// an embedded DuckDB attached to an Iceberg catalog.
+// Command igloo serves SQL over the Postgres wire protocol, and a web console,
+// running queries on an embedded DuckDB attached to an Iceberg catalog.
 //
 // Configuration comes from IGLOO_* environment variables; see
 // docs/configuration.md. Subcommands:
@@ -90,6 +90,7 @@ func serve() error {
 		log.Warn("TLS is optional (IGLOO_TLS_REQUIRED=false); clients may still connect unencrypted")
 	}
 
+	started := time.Now()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -149,22 +150,40 @@ func serve() error {
 		return err
 	}
 
-	if cat != nil && cfg.Maintenance.Enabled {
-		stopMaintenance, err := startMaintenance(ctx, cfg, cat, reg, work, log)
+	maintains := cat != nil && cfg.Maintenance.Enabled
+	var schedule maintenance.Schedule
+	if maintains {
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, reg, work, log)
 		if err != nil {
 			return err
 		}
 		defer stopMaintenance()
+		if lock != nil {
+			schedule = lock
+		}
+	}
+
+	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work}
+	errc := make(chan error, 3)
+	var consoleSrv *http.Server
+	if cfg.ConsoleAddr != "" {
+		consoleLn, err := listenConsole(cfg.ConsoleAddr)
+		if err != nil {
+			return err
+		}
+		status := consoleStatus(cfg, started, work, health, schedule, maintains)
+		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, tlsConfig, status, errc, log); err != nil {
+			_ = consoleLn.Close()
+			return err
+		}
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
-	errc := make(chan error, 2)
 	go func() { errc <- srv.Serve(ln) }()
 
-	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work}
 	var httpSrv *http.Server
 	if cfg.HTTPAddr != "" {
 		httpSrv = &http.Server{Addr: cfg.HTTPAddr, Handler: health.handler(reg), ReadHeaderTimeout: 5 * time.Second}
@@ -174,7 +193,7 @@ func serve() error {
 			}
 		}()
 	}
-	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr)
+	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr)
 
 	select {
 	case err := <-errc:
@@ -198,6 +217,9 @@ func serve() error {
 	defer cancelShutdown()
 	if httpSrv != nil {
 		_ = httpSrv.Shutdown(shutdownCtx)
+	}
+	if consoleSrv != nil {
+		_ = consoleSrv.Shutdown(shutdownCtx)
 	}
 	return srv.Shutdown(shutdownCtx)
 }
@@ -244,18 +266,18 @@ func openUsers(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.S
 }
 
 // startMaintenance compacts and expires tables in the background until ctx is
-// canceled. Replicas sharing a metadata database take turns.
-func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, reg prometheus.Registerer, work *activity.Tracker, log *slog.Logger) (stop func(), err error) {
+// canceled. Replicas sharing a metadata database take turns, through lock,
+// which also records when passes ran; it is nil without one.
+func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, reg prometheus.Registerer, work *activity.Tracker, log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	opts := maintenance.Options{
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
 		Metrics:   maintenance.NewMetrics(reg),
 		Activity:  work,
 	}
-	var lock *maintenance.PostgresLock
 	if cfg.MetadataDatabaseURL != "" {
 		if lock, err = maintenance.NewPostgresLock(ctx, cfg.MetadataDatabaseURL); err != nil {
-			return nil, fmt.Errorf("maintenance lock: %w", err)
+			return nil, nil, fmt.Errorf("maintenance lock: %w", err)
 		}
 		opts.Lock, opts.Schedule = lock, lock
 	}
@@ -273,7 +295,7 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		if lock != nil {
 			lock.Close()
 		}
-	}, nil
+	}, lock, nil
 }
 
 func newLogger(cfg config.Config) *slog.Logger {

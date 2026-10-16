@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	wire "github.com/jeroenrinzema/psql-wire"
@@ -121,8 +122,8 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 		return ctx, err
 	}
 
-	s.metrics.login(true)
-	s.log.Info("login", "user", name, "role", user.Role, "addr", wire.RemoteAddress(ctx))
+	addr := wire.RemoteAddress(ctx)
+	s.loginSucceeded(user, addr)
 
 	sess := &session{
 		user:     user,
@@ -131,17 +132,33 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 		activity: s.activity,
 		open:     make(map[*wire.PreparedStatement]*statement),
 	}
+	if addr != nil {
+		sess.client = addr.String()
+	}
 	return context.WithValue(ctx, sessionKey{}, sess), nil
 }
 
-func (s *Server) loginFailed(ctx context.Context, writer *buffer.Writer, name string, cause error) (context.Context, error) {
+// loginSucceeded counts and logs a login from addr, which may be nil.
+// Logins through the web console use it too; attrs say so.
+func (s *Server) loginSucceeded(user auth.User, addr net.Addr, attrs ...any) {
+	s.metrics.login(true)
+	s.log.Info("login", append([]any{"user", user.Name, "role", user.Role, "addr", addr}, attrs...)...)
+}
+
+// loginRejected slows down password guessing, then counts and logs a failed
+// login. Logins through the web console use it too; attrs say so.
+func (s *Server) loginRejected(name string, addr net.Addr, cause error, attrs ...any) {
 	time.Sleep(failedLoginDelay)
 	s.metrics.login(false)
-	attrs := []any{"user", name, "addr", wire.RemoteAddress(ctx)}
+	attrs = append([]any{"user", name, "addr", addr}, attrs...)
 	if cause != nil {
 		attrs = append(attrs, "reason", cause)
 	}
 	s.log.Warn("login failed", attrs...)
+}
+
+func (s *Server) loginFailed(ctx context.Context, writer *buffer.Writer, name string, cause error) (context.Context, error) {
+	s.loginRejected(name, wire.RemoteAddress(ctx), cause)
 
 	err := pgerror.WithSeverity(pgerror.WithCode(
 		fmt.Errorf("password authentication failed for user %q", name), codes.InvalidPassword),

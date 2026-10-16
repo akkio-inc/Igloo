@@ -21,6 +21,11 @@ type Config struct {
 	SuspendAfter  time.Duration
 	ResumeTimeout time.Duration
 
+	// ConsoleListenAddr and ConsoleBackend forward the web console too,
+	// when ConsoleBackend is set.
+	ConsoleListenAddr string
+	ConsoleBackend    string
+
 	// Compute is ec2, kubernetes or command.
 	Compute        string
 	EC2InstanceIDs []string
@@ -56,6 +61,14 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 	host, port, err := net.SplitHostPort(cfg.Backend)
 	if err != nil || host == "" || port == "" {
 		addErr("IGLOO_GATEWAY_BACKEND must be Igloo's SQL address as host:port, got %q", cfg.Backend)
+	}
+
+	cfg.ConsoleBackend = get("IGLOO_GATEWAY_CONSOLE_BACKEND", "")
+	cfg.ConsoleListenAddr = get("IGLOO_GATEWAY_CONSOLE_LISTEN_ADDR", ":8443")
+	if cfg.ConsoleBackend != "" {
+		if h, p, err := net.SplitHostPort(cfg.ConsoleBackend); err != nil || h == "" || p == "" {
+			addErr("IGLOO_GATEWAY_CONSOLE_BACKEND must be Igloo's console address as host:port, got %q", cfg.ConsoleBackend)
+		}
 	}
 
 	// The activity endpoint defaults to Igloo's HTTP port on the same host.

@@ -12,6 +12,9 @@ otherwise unchanged except for these patches:
   not exist gets error 26000 and the connection discards messages until
   Sync, as in PostgreSQL. It used to end the connection, for instance when a
   client reused statements after `DEALLOCATE ALL`.
+- `igloo_embedded.go` (new): `PreparedStatement.Columns` and
+  `PreparedStatement.Run`, so Igloo's in-process sessions (the web console)
+  can run what its parse function prepared without a client connection.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

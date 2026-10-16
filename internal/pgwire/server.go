@@ -188,6 +188,9 @@ type session struct {
 	portals *portalCache
 	// cursors are the open SQL cursors, by name.
 	cursors map[string]*cursor
+	// client describes where the session comes from, for the console's
+	// list of sessions.
+	client string
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -195,6 +198,9 @@ type session struct {
 	user    auth.User
 	checked time.Time
 	running context.CancelFunc
+	// statement and started describe the running statement.
+	statement string
+	started   time.Time
 }
 
 type sessionKey struct{}
@@ -325,8 +331,9 @@ func (s *Server) releaseConn() { s.conns.Add(-1) }
 var errStatementTimeout = pgerror.WithCode(errors.New("canceling statement due to statement timeout"), codes.QueryCanceled)
 
 // runCancelable runs fn with a context that a cancel request, or the
-// session's statement timeout, can end.
-func (sess *session) runCancelable(ctx context.Context, fn func(context.Context) error) error {
+// session's statement timeout, can end. query is the statement as the
+// client sent it, which the console lists while it runs.
+func (sess *session) runCancelable(ctx context.Context, query string, fn func(context.Context) error) error {
 	defer sess.activity.Begin()()
 	var cancel context.CancelFunc
 	if sess.timeout > 0 {
@@ -335,12 +342,12 @@ func (sess *session) runCancelable(ctx context.Context, fn func(context.Context)
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	sess.mu.Lock()
-	sess.running = cancel
+	sess.running, sess.statement, sess.started = cancel, query, time.Now()
 	sess.mu.Unlock()
 
 	defer func() {
 		sess.mu.Lock()
-		sess.running = nil
+		sess.running, sess.statement, sess.started = nil, "", time.Time{}
 		sess.mu.Unlock()
 		cancel()
 	}()
@@ -485,7 +492,7 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		}
 
 		start := time.Now()
-		err = sess.runCancelable(ctx, func(ctx context.Context) error {
+		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			return runWithCommitRetry(ctx, sess, st, func() error { return st.run(ctx, args, w) })
 		})
 		if isIcebergNoReplace(err) {
@@ -493,7 +500,7 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 				err = pgerror.WithCode(errors.New("CREATE OR REPLACE TABLE on an Iceberg table cannot run inside a transaction block"),
 					codes.ActiveSQLTransaction)
 			} else if r, ok := s.replaceable(sess, st); ok {
-				err = sess.runCancelable(ctx, func(ctx context.Context) error { return s.replaceTable(ctx, sess, r) })
+				err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error { return s.replaceTable(ctx, sess, r) })
 				if err == nil {
 					err = w.Complete("CREATE TABLE")
 				}

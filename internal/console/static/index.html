@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Igloo</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body>
+  <noscript><p class="noscript">The Igloo console needs JavaScript. SQL clients such as psql work without it.</p></noscript>
+
+  <div id="loading" class="loading" aria-label="Loading"><span class="spinner"></span></div>
+
+  <main id="signin" class="signin" hidden>
+    <form id="signin-form" class="signin-card" autocomplete="on" novalidate>
+      <span class="signin-art" data-mark></span>
+      <h1 class="wordmark">igloo</h1>
+      <p class="signin-sub">Sign in with your Igloo user</p>
+      <label for="signin-user">User</label>
+      <input id="signin-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="signin-password">Password</label>
+      <input id="signin-password" name="password" type="password" autocomplete="current-password" required>
+      <p id="signin-error" class="form-error" role="alert" hidden></p>
+      <button id="signin-submit" class="btn primary wide" type="submit">Sign in</button>
+      <p class="signin-foot">Same user names and passwords as SQL clients such as psql.</p>
+    </form>
+  </main>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <button id="menu" class="btn ghost icon-only" type="button" aria-label="Menu" aria-expanded="false" aria-controls="sidebar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <a class="brand" href="#/worksheets">
+        <span class="mark" data-mark></span>
+        <span class="wordmark">igloo</span>
+      </a>
+    </header>
+    <nav id="sidebar" class="sidebar" aria-label="Console">
+      <a class="brand" href="#/worksheets">
+        <span class="mark" data-mark></span>
+        <span class="wordmark">igloo</span>
+      </a>
+      <ul class="nav">
+        <li><a href="#/worksheets" data-route="worksheets"><span data-icon="sheet"></span>Worksheets</a></li>
+        <li><a href="#/data" data-route="data"><span data-icon="data"></span>Data</a></li>
+        <li><a href="#/history" data-route="history"><span data-icon="history"></span>Query history</a></li>
+      </ul>
+      <div id="admin-nav" hidden>
+        <p class="nav-heading">Admin</p>
+        <ul class="nav">
+          <li><a href="#/admin/users" data-route="admin/users"><span data-icon="users"></span>Users</a></li>
+          <li><a href="#/admin/roles" data-route="admin/roles"><span data-icon="key"></span>Roles and grants</a></li>
+          <li><a href="#/admin/compute" data-route="admin/compute"><span data-icon="cpu"></span>Compute</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-foot">
+        <div class="whoami">
+          <span id="whoami-name" class="whoami-name"></span>
+          <span id="whoami-role" class="badge"></span>
+        </div>
+        <div class="foot-actions">
+          <button id="theme" class="btn ghost small" type="button" title="Switch between light, dark and system themes"></button>
+          <button id="signout" class="btn ghost small" type="button">Sign out</button>
+        </div>
+      </div>
+    </nav>
+    <div id="scrim" class="scrim" hidden></div>
+    <main id="main" class="main"></main>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # End-to-end test of the single-machine stack: builds the image, starts an
-# isolated copy of deploy/single-vm (its own project name, ports and data),
-# and checks Igloo through real psql clients. Removes everything afterwards
-# unless KEEP_E2E=1.
+# isolated copy of deploy/single-vm (its own project name, image, ports and
+# data), and checks Igloo through real psql clients and the web console.
+# Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT and the
+# E2E_*_PORT variables let several runs share a Docker host.
 #
 #   scripts/e2e.sh
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-project=igloo-e2e
+project="${E2E_PROJECT:-igloo-e2e}"
 sql_port="${E2E_SQL_PORT:-15433}"
 http_port="${E2E_HTTP_PORT:-18432}"
+console_port="${E2E_CONSOLE_PORT:-18443}"
 work="$(mktemp -d)"
 env_file="$work/e2e.env"
 
@@ -39,7 +41,8 @@ pass() { printf '  ok    %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
 "$root/deploy/single-vm/init-env.sh" "$env_file" >/dev/null
-sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" "$env_file"
+sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" \
+  -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_IMAGE=.*/IGLOO_IMAGE=$project:dev/" "$env_file"
 # Maintain tables every few seconds, so the maintenance checks need not wait
 # an hour.
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
@@ -99,6 +102,36 @@ elif grep -q "password authentication failed" <<<"$got"; then
 else
   fail "wrong password: $got"
 fi
+
+echo "web console"
+console="http://127.0.0.1:$console_port"
+jar="$work/console.cookies"
+# console_post PATH JSON [CSRF] posts JSON with the console session's cookie.
+console_post() {
+  curl -sS -b "$jar" -c "$jar" -H 'Content-Type: application/json' -H "X-CSRF-Token: ${3:-}" -d "$2" "$console$1"
+}
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+  -d '{"user":"walt","password":"not-the-password"}' "$console/api/login")"
+if [ "$code" = 401 ]; then pass "console refuses a wrong password"; else fail "console wrong password: $code"; fi
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: igloo.example.com' -H 'Content-Type: application/json' \
+  -d '{"user":"walt","password":"walt-password-1"}' "$console/api/login")"
+if [ "$code" = 403 ]; then pass "console refuses unencrypted sign-ins from afar"; else fail "console sign-in without TLS: $code"; fi
+login="$(console_post /api/login '{"user":"walt","password":"walt-password-1"}')"
+csrf="$(sed -n 's/.*"csrf":"\([^"]*\)".*/\1/p' <<<"$login")"
+if [ -n "$csrf" ]; then pass "console sign-in"; else fail "console sign-in: $login"; fi
+got="$(console_post /api/query '{"sql":"SELECT count(*) AS n FROM e2e"}' "$csrf")"
+if grep -q '"rows":\[\["3"\]\]' <<<"$got"; then pass "console runs a query as the user"; else fail "console query: $got"; fi
+got="$(console_post /api/query "{\"sql\":\"SELECT count(*) FROM duckdb_columns() WHERE table_name = 'e2e'\"}" "$csrf")"
+if grep -q '"rows":\[\["3"\]\]' <<<"$got"; then pass "console reads Iceberg columns"; else fail "console columns: $got"; fi
+got="$(console_post /api/query '{"sql":"DROP USER rita"}' "$csrf")"
+if grep -q '"code":"42501"' <<<"$got"; then pass "console statements are authorized as SQL ones"; else fail "console authorization: $got"; fi
+code="$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" "$console/api/admin/users")"
+if [ "$code" = 403 ]; then pass "console admin pages refuse a writer"; else fail "console admin page as a writer: $code"; fi
+got="$(console_post /api/download '{"sql":"SELECT id, name FROM e2e ORDER BY id"}' "$csrf")"
+if [ "$got" = "$(printf 'id,name\n1,alpha\n2,beta\n3,gamma')" ]; then pass "console CSV download"; else fail "console CSV: $got"; fi
+console_post /api/logout '{}' "$csrf" >/dev/null
+code="$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" "$console/api/session")"
+if [ "$code" = 401 ]; then pass "console sign-out"; else fail "console session after sign-out: $code"; fi
 
 echo "sandbox"
 expect_error "no local files" 42501 igloo "$admin_password" "SELECT * FROM read_text('/etc/passwd')"

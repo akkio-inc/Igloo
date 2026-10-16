@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"errors"
 	"time"
 
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -75,7 +76,9 @@ func (m *Metrics) query(start time.Time, err error) {
 }
 
 func queryOutcome(err error) string {
-	if err == nil {
+	// A client that stops reading rows early (the console showing the
+	// first rows of a large result) got what it asked for.
+	if err == nil || errors.Is(err, ErrStopRows) {
 		return "ok"
 	}
 	switch pgerror.GetCode(pgError(err)) {

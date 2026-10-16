@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -26,7 +27,13 @@ type health struct {
 	client   *http.Client
 	activity *activity.Tracker
 	stopping atomic.Bool
+	// gatewaySeen is when a scale-to-zero gateway last read /activity, in
+	// Unix nanoseconds, for the console's compute page.
+	gatewaySeen atomic.Int64
 }
+
+// gatewayAgent is the User-Agent of the scale-to-zero gateway's requests.
+const gatewayAgent = "igloo-gateway"
 
 func (h *health) handler(reg *prometheus.Registry) http.Handler {
 	mux := http.NewServeMux()
@@ -45,7 +52,10 @@ func (h *health) handler(reg *prometheus.Registry) http.Handler {
 	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	// Activity: whether statements or maintenance are running, for the
 	// scale-to-zero gateway.
-	mux.HandleFunc("GET /activity", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /activity", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.UserAgent(), gatewayAgent) {
+			h.gatewaySeen.Store(time.Now().UnixNano())
+		}
 		running, idle := h.activity.Snapshot()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"running": running, "idle_seconds": idle.Seconds()})

@@ -1,10 +1,11 @@
 // Package gateway lets Igloo scale to zero. The gateway is a small,
-// always-on process that SQL clients connect to in Igloo's place. When a
-// client connects while Igloo is stopped, the gateway starts Igloo's compute
-// and holds the connection until Igloo accepts it; from then on it copies
-// bytes in both directions, so TLS and authentication stay end to end
-// between the client and Igloo. After a period without client traffic or
-// running work, it stops the compute again.
+// always-on process that SQL clients, and optionally browsers using the web
+// console, connect to in Igloo's place. When a client connects while Igloo
+// is stopped, the gateway starts Igloo's compute and holds the connection
+// until Igloo accepts it; from then on it copies bytes in both directions,
+// so TLS and authentication stay end to end between the client and Igloo.
+// After a period without client traffic or running work, it stops the
+// compute again.
 //
 // Stopping closes open sessions, as a database restart would; clients
 // reconnect, and their next connection starts the compute.
@@ -38,8 +39,12 @@ type Compute interface {
 
 // Options configure a Gateway.
 type Options struct {
-	// Backend is Igloo's SQL address, host:port.
+	// Backend is Igloo's SQL address, host:port. Igloo is ready once it
+	// accepts connections there.
 	Backend string
+	// ConsoleBackend is Igloo's web console address, host:port, for
+	// ServeConsole.
+	ConsoleBackend string
 	// ActivityURL is Igloo's /activity endpoint. Every address its host
 	// resolves to is asked, so a headless Kubernetes Service covers all
 	// replicas. Empty means the gateway judges idleness by traffic alone,
@@ -109,8 +114,8 @@ func New(opts Options) *Gateway {
 	return g
 }
 
-// Serve accepts client connections on ln, and stops idle compute, until ctx
-// is done. It closes ln and every open connection before returning.
+// Serve accepts SQL client connections on ln, and stops idle compute, until
+// ctx is done. It closes ln and every open connection before returning.
 func (g *Gateway) Serve(ctx context.Context, ln net.Listener) error {
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -118,15 +123,32 @@ func (g *Gateway) Serve(ctx context.Context, ln net.Listener) error {
 		defer wg.Done()
 		g.suspendWhenIdle(ctx)
 	}()
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
 	defer func() {
 		g.closeClients()
 		wg.Wait()
 	}()
+	return g.accept(ctx, ln, g.opts.Backend, &wg)
+}
 
+// ServeConsole accepts web console connections on ln and forwards them to
+// ConsoleBackend until ctx is done, starting the compute as SQL connections
+// do; their traffic keeps it running too. Run it alongside Serve, which
+// stops idle compute.
+func (g *Gateway) ServeConsole(ctx context.Context, ln net.Listener) error {
+	var wg sync.WaitGroup
+	defer func() {
+		g.closeClients()
+		wg.Wait()
+	}()
+	return g.accept(ctx, ln, g.opts.ConsoleBackend, &wg)
+}
+
+// accept forwards connections from ln to backend until ctx is done.
+func (g *Gateway) accept(ctx context.Context, ln net.Listener, backend string, wg *sync.WaitGroup) error {
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -142,17 +164,17 @@ func (g *Gateway) Serve(ctx context.Context, ln net.Listener) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			g.handle(ctx, conn)
+			g.handle(ctx, conn, backend)
 		}()
 	}
 }
 
-func (g *Gateway) handle(ctx context.Context, client net.Conn) {
+func (g *Gateway) handle(ctx context.Context, client net.Conn, addr string) {
 	g.track(client, true)
 	defer g.track(client, false)
 	defer client.Close() //nolint:errcheck
 
-	backend, err := g.connect(ctx)
+	backend, err := g.connect(ctx, addr)
 	if err != nil {
 		g.opts.Log.Warn("could not reach igloo", "client", client.RemoteAddr().String(), "err", err)
 		return
@@ -173,14 +195,14 @@ func (g *Gateway) handle(ctx context.Context, client net.Conn) {
 	<-done
 }
 
-// connect returns a connection to Igloo, starting its compute first if
-// needed.
-func (g *Gateway) connect(ctx context.Context) (net.Conn, error) {
+// connect returns a connection to Igloo at addr, starting its compute first
+// if needed.
+func (g *Gateway) connect(ctx context.Context, addr string) (net.Conn, error) {
 	g.mu.Lock()
 	st := g.state
 	g.mu.Unlock()
 	if st == stateRunning || st == stateUnknown {
-		conn, err := g.dialer.DialContext(ctx, "tcp", g.opts.Backend)
+		conn, err := g.dialer.DialContext(ctx, "tcp", addr)
 		if err == nil {
 			g.setState(stateRunning)
 			return conn, nil
@@ -197,7 +219,7 @@ func (g *Gateway) connect(ctx context.Context) (net.Conn, error) {
 	if err := g.wake(ctx); err != nil {
 		return nil, err
 	}
-	return g.dialer.DialContext(ctx, "tcp", g.opts.Backend)
+	return g.dialer.DialContext(ctx, "tcp", addr)
 }
 
 // wake starts the compute, or joins a start already under way, and returns
@@ -410,6 +432,8 @@ func (g *Gateway) activity(ctx context.Context, u string) (activityReport, error
 	if err != nil {
 		return report, err
 	}
+	// Igloo's console shows that a gateway is watching it.
+	req.Header.Set("User-Agent", "igloo-gateway")
 	resp, err := g.client.Do(req)
 	if err != nil {
 		return report, err

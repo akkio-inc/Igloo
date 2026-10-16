@@ -218,7 +218,7 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 				codes.ActiveSQLTransaction)
 		}
 		start := time.Now()
-		err := sess.runCancelable(ctx, run)
+		err := sess.runCancelable(ctx, query, run)
 		s.metrics.query(start, err)
 		if err != nil {
 			return catalogDDLError(err)

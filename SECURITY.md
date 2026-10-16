@@ -64,6 +64,18 @@ reference for every setting mentioned here.
   on a private network that only Igloo can reach.
 - **Health and metrics.** Port 8080 (`/healthz`, `/readyz`, `/metrics`) has no
   authentication. Expose it only to your orchestrator and monitoring.
+- **Web console.** Port 8443 serves the [web console](docs/console.md). Users
+  sign in with their Igloo password, checked against the same SCRAM verifier,
+  with the same failed-login delay and logging as SQL logins. The browser
+  sends the password inside HTTPS; without TLS the console accepts sign-ins
+  only from a browser at `localhost`. Every statement runs as the signed-in
+  user through the same authorization as SQL clients, and admin pages are
+  refused to non-admins on the server. Sessions are encrypted, signed,
+  `HttpOnly`, `SameSite=Strict` cookies (`Secure` under TLS) that expire
+  after 12 hours or an hour idle and end when the user is dropped or their
+  password changes. Changes need a CSRF token; pages have a strict
+  Content-Security-Policy and cannot be framed. Set `IGLOO_CONSOLE_ADDR=` to
+  turn the console off.
 
 ## Verifying release images
 

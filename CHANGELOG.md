@@ -54,6 +54,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   JDBC metadata calls and schema browsers.
 - Statement timeouts, connection limits, TLS, health and readiness endpoints,
   Prometheus metrics, and text or JSON logs.
+- A web console on port 8443 (`IGLOO_CONSOLE_ADDR`): SQL worksheets with
+  cancel and CSV download, a data browser, query history, and admin pages
+  for users, roles and grants, and the replica's sessions. Users sign in
+  with their Igloo password; statements run as them through the same
+  authorization as SQL clients. Sessions are stateless sealed cookies, so
+  the console works behind a load balancer. The scale-to-zero gateway can
+  forward it too (`IGLOO_GATEWAY_CONSOLE_BACKEND`).
 - Deployment with Docker Compose on one machine, a Helm chart, and OpenTofu
   modules for AWS, Google Cloud and Azure.
 

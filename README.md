@@ -53,6 +53,9 @@ password `IGLOO_ADMIN_PASSWORD` from `deploy/single-vm/.env`:
 psql "host=127.0.0.1 port=5433 user=igloo dbname=igloo"
 ```
 
+Or open the [web console](docs/console.md) at `http://127.0.0.1:8443` and sign
+in with the same user and password.
+
 Try it on real data with the TPC-H benchmark:
 
 ```sh
@@ -86,6 +89,9 @@ the official TPC-H answers.
 - **[Scale to zero](docs/scale-to-zero.md)**: a small gateway stops Igloo's
   machines or pods when nobody uses them and starts them when a client
   connects, on AWS, Google Cloud, Azure or Kubernetes.
+- **[Web console](docs/console.md)** at `http://127.0.0.1:8443`: SQL
+  worksheets, a data browser, query history, and user and compute
+  administration, signed in with the same users as SQL clients.
 - **Operations basics**: health and readiness endpoints, Prometheus metrics,
   JSON logs, statement timeouts, connection limits, TLS, query cancel.
 
@@ -136,6 +142,8 @@ PostgreSQL License).
 
 - [Product principles](docs/principles.md): what Igloo optimizes for, in order
 - [Configuration](docs/configuration.md): every setting
+- [Web console](docs/console.md): worksheets, data browser, history and
+  administration in the browser, and their security
 - [Operations](docs/operations.md): sizing, scaling, users, monitoring,
   backups, table maintenance, upgrades, troubleshooting
 - [Scale to zero](docs/scale-to-zero.md): stop compute when idle and start it

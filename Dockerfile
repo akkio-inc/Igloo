@@ -33,7 +33,7 @@ ENV IGLOO_DUCKDB_EXTENSION_DIR=/usr/local/share/igloo/extensions \
 # directory itself is not writable either (see internal/engine).
 COPY --from=build /out/empty /data
 WORKDIR /
-EXPOSE 5432 8080
+EXPOSE 5432 8080 8443
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
     CMD ["/usr/local/bin/igloo", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/igloo"]

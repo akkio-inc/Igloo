@@ -18,6 +18,8 @@ type Config struct {
 	ListenAddr string
 	// HTTPAddr serves health checks and metrics. Empty disables it.
 	HTTPAddr string
+	// ConsoleAddr serves the web console. Empty disables it.
+	ConsoleAddr string
 	// TLSCertFile and TLSKeyFile enable TLS for SQL clients.
 	TLSCertFile string
 	TLSKeyFile  string
@@ -169,10 +171,15 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if !ok {
 		httpAddr = ":8080"
 	}
+	consoleAddr, ok := lookup("IGLOO_CONSOLE_ADDR")
+	if !ok {
+		consoleAddr = ":8443"
+	}
 
 	cfg := Config{
 		ListenAddr:          get("IGLOO_LISTEN_ADDR", ":5432"),
 		HTTPAddr:            strings.TrimSpace(httpAddr),
+		ConsoleAddr:         strings.TrimSpace(consoleAddr),
 		TLSCertFile:         get("IGLOO_TLS_CERT_FILE", ""),
 		TLSKeyFile:          get("IGLOO_TLS_KEY_FILE", ""),
 		LogFormat:           get("IGLOO_LOG_FORMAT", "text"),

@@ -129,7 +129,7 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 		}
 		start := time.Now()
 		var rows driver.Rows
-		err = sess.runCancelable(ctx, func(ctx context.Context) error {
+		err = sess.runCancelable(ctx, query, func(ctx context.Context) error {
 			var err error
 			rows, err = own.stmt.QueryContext(ctx, args)
 			return err

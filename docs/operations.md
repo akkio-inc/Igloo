@@ -36,6 +36,8 @@ Settings a reader or writer changes with `SET` apply to their own session only.
   schema `igloo_auth`), so every replica sees the same accounts. Without that
   setting the administrator is the only account.
 - Igloo refuses to remove or demote the last admin.
+- Admins can do the same on the [web console](console.md)'s Users page,
+  which runs these statements as them.
 
 ## Sizing
 
@@ -119,7 +121,9 @@ Igloo's metrics, besides the standard Go and process metrics:
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
-`user changed`, `statement denied`, and refused connections. Query text and
+`user changed`, `statement denied`, `statement canceled` (from the web
+console's compute page), and refused connections. Sign-ins through the web
+console log `client=console`. Query text and
 DuckDB error details, which can quote the query, are logged only at debug
 level; user-management statements, which carry passwords, are never logged.
 

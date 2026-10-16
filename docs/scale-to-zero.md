@@ -17,7 +17,8 @@ first query after a quiet period waits while the compute starts.
 ```
 
 The gateway is the `igloo gateway` command of the usual Igloo image.
-Clients connect to it instead of to Igloo:
+Clients connect to it instead of to Igloo, and so can browsers using the
+[web console](console.md):
 
 - When a client connects and Igloo is stopped, the gateway starts the
   compute and holds the connection until Igloo accepts it. The client sees a
@@ -28,6 +29,11 @@ Clients connect to it instead of to Igloo:
 - When no client has sent or received anything for `IGLOO_GATEWAY_SUSPEND_AFTER`
   (10 minutes by default) and Igloo reports no running statements or table
   maintenance, the gateway stops the compute.
+- With `IGLOO_GATEWAY_CONSOLE_BACKEND` set, the gateway forwards the web
+  console's port the same way, on a second listener: opening the console
+  starts Igloo, and its requests count as traffic. The console sends nothing
+  while nobody uses it, so a browser tab left open does not keep Igloo
+  running.
 
 **Open sessions are closed when Igloo stops**, as they would be by a database
 restart. Interactive clients reconnect on their next query, which starts
@@ -76,11 +82,15 @@ same VPC.
    ```sh
    IGLOO_BIND=0.0.0.0
    IGLOO_HTTP_BIND=0.0.0.0
+   IGLOO_CONSOLE_BIND=0.0.0.0   # to use the web console through the gateway
    ```
 
    Allow the gateway's security group to reach the instance on
-   `IGLOO_PORT` (5433) and `IGLOO_HTTP_PORT` (8432), and nothing else. The
-   stack restarts by itself when the instance boots.
+   `IGLOO_PORT` (5433), `IGLOO_HTTP_PORT` (8432) and, for the console,
+   `IGLOO_CONSOLE_PORT` (8443), and nothing else. The stack restarts by
+   itself when the instance boots. The console accepts sign-ins from other
+   machines only over TLS, so set up TLS (see `.env`) to use it through the
+   gateway; the gateway passes TLS through untouched.
 
 3. **Run the gateway** on the small machine, with the Igloo image:
 
@@ -90,12 +100,14 @@ same VPC.
      -e IGLOO_GATEWAY_ACTIVITY_URL=http://10.0.1.23:8432/activity \
      -e IGLOO_GATEWAY_COMPUTE=ec2 \
      -e IGLOO_GATEWAY_EC2_INSTANCE_IDS=i-0123456789abcdef0 \
+     -e IGLOO_GATEWAY_CONSOLE_BACKEND=10.0.1.23:8443 \
      -e AWS_REGION=us-east-1 \
      ghcr.io/akkio-inc/igloo:VERSION gateway
    ```
 
    Use the instance's private IP address, which survives stops and starts.
-   Point clients at the gateway machine's port 5432.
+   Point clients at the gateway machine's port 5432, and browsers at its
+   port 8443. Leave out `IGLOO_GATEWAY_CONSOLE_BACKEND` to forward SQL only.
 
 On a machine with 512 MB of memory, package installs can run out of memory;
 add a swap file first, or use a `t4g.micro`.
@@ -157,9 +169,10 @@ and takes over again after a start.
 
 Without the chart, set up the same pieces yourself, following its
 `gateway.yaml` and `service.yaml` templates: `IGLOO_GATEWAY_BACKEND` pointing
-at a Service for the Igloo pods, `IGLOO_GATEWAY_ACTIVITY_URL` at a headless
-one (`clusterIP: None`), and those permissions for the gateway's service
-account. Leave `replicas` out of Igloo's Deployment, so that applying it
+at a Service for the Igloo pods (and `IGLOO_GATEWAY_CONSOLE_BACKEND` at their
+console port, 8443, to forward the [web console](console.md) too),
+`IGLOO_GATEWAY_ACTIVITY_URL` at a headless one (`clusterIP: None`), and those
+permissions for the gateway's service account. Leave `replicas` out of Igloo's Deployment, so that applying it
 again does not undo the gateway's scaling.
 
 ## Settings
@@ -172,6 +185,8 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_RESUME_TIMEOUT` | `5m` | How long a connecting client waits for Igloo to start before the gateway gives up and closes the connection |
 | `IGLOO_GATEWAY_ACTIVITY_URL` | `http://BACKEND_HOST:8080/activity` | Igloo's activity endpoint. Set it empty to judge idleness by traffic alone, which can stop Igloo during a long statement that sends nothing. |
 | `IGLOO_GATEWAY_LISTEN_ADDR` | `:5432` | Where clients connect |
+| `IGLOO_GATEWAY_CONSOLE_BACKEND` | | Igloo's web console address, `host:port` (port 8443). Set it to forward the console too. |
+| `IGLOO_GATEWAY_CONSOLE_LISTEN_ADDR` | `:8443` | Where browsers connect for the console, when it is forwarded |
 | `IGLOO_GATEWAY_HTTP_ADDR` | `:8080` | `GET /healthz` and `GET /metrics`. Empty disables it. |
 | `IGLOO_GATEWAY_EC2_INSTANCE_IDS` | | `ec2`: the instances to start and stop, comma separated. Credentials and region come from the usual AWS sources. |
 | `IGLOO_GATEWAY_K8S_DEPLOYMENT` | | `kubernetes`: Igloo's Deployment |
@@ -189,8 +204,8 @@ passes running now, and the time since one last started or ended.
 | Metric | Labels | Meaning |
 |---|---|---|
 | `igloo_gateway_compute_running` | | 1 while Igloo's compute is known to be running |
-| `igloo_gateway_connections` | | Open client connections |
-| `igloo_gateway_connections_total` | | Client connections accepted |
+| `igloo_gateway_connections` | | Open client connections, SQL and console |
+| `igloo_gateway_connections_total` | | Client connections accepted, SQL and console |
 | `igloo_gateway_resumes_total` | `result` = `success`, `failure` | Starts of the compute |
 | `igloo_gateway_resume_seconds` | | Time from asking the compute to start until Igloo accepted connections |
 | `igloo_gateway_suspends_total` | | Stops for idleness |
