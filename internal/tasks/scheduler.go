@@ -33,7 +33,8 @@ const (
 // Runner runs a job as its owner, with the owner's privileges at the time.
 // It returns the rows the run loaded, wrote or returned, or -1;
 // ErrOwnerGone when the owner has been dropped; ErrIdle for a pipe that
-// found nothing to load.
+// found nothing to load; an error wrapping ErrSkipped for a run it did not
+// carry out. RunOf(ctx) is the run.
 type Runner interface {
 	RunJob(ctx context.Context, j Job) (rows int64, err error)
 }
@@ -42,7 +43,10 @@ type Runner interface {
 type Options struct {
 	// Retention is how long runs are kept. Zero keeps them.
 	Retention time.Duration
-	Log       *slog.Logger
+	// Ended, if set, is told about every run recorded once it has ended,
+	// as for alerts on failed runs. It must not block.
+	Ended func(Job, Run)
+	Log   *slog.Logger
 }
 
 // Scheduler runs jobs when they are due. Every replica runs one; each due
@@ -50,6 +54,7 @@ type Options struct {
 type Scheduler struct {
 	store     Store
 	retention time.Duration
+	ended     func(Job, Run)
 	log       *slog.Logger
 	kick      chan struct{}
 	slots     chan struct{}
@@ -77,6 +82,7 @@ func NewScheduler(store Store, opts Options) *Scheduler {
 		cancelRuns: cancel,
 		store:      store,
 		retention:  opts.Retention,
+		ended:      opts.Ended,
 		log:        opts.Log.With("component", "tasks"),
 		kick:       make(chan struct{}, 1),
 		slots:      make(chan struct{}, maxConcurrentRuns),
@@ -231,6 +237,7 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		}
 		run.Outcome, run.Error, run.End = OutcomeSkipped, "the previous run was still running", run.Start
 		s.write(ctx, run)
+		s.end(j, run)
 		return run, nil
 	}
 	defer unlock()
@@ -245,13 +252,15 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		s.write(ctx, run)
 	}
 
-	run.Rows, err = r.RunJob(ctx, j)
+	run.Rows, err = r.RunJob(context.WithValue(ctx, runKey{}, run), j)
 	run.End = s.nowFunc()
 	switch {
 	case errors.Is(err, ErrIdle):
 		return run, err
 	case err == nil:
 		run.Outcome = OutcomeSucceeded
+	case errors.Is(err, ErrSkipped):
+		run.Outcome, run.Error = OutcomeSkipped, err.Error()
 	default:
 		run.Outcome, run.Error = OutcomeFailed, err.Error()
 		if ctx.Err() != nil && trigger == TriggerSchedule {
@@ -259,10 +268,18 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		}
 	}
 	s.write(ctx, run)
+	s.end(j, run)
 	if errors.Is(err, ErrOwnerGone) {
 		s.suspend(ctx, j, err)
 	}
 	return run, err
+}
+
+// end tells Options.Ended about a run that ended.
+func (s *Scheduler) end(j Job, run Run) {
+	if s.ended != nil {
+		s.ended(j, run)
+	}
 }
 
 func (s *Scheduler) write(ctx context.Context, run Run) {

@@ -607,6 +607,7 @@ func (s *Server) dropUser(ctx context.Context, cmd userCommand) error {
 		if ferr := s.grants.ForgetUser(ctx, cmd.name); ferr != nil {
 			s.log.Warn("could not remove a dropped user's grants", "user", cmd.name, "err", ferr)
 		}
+		s.forgetGrantee(auth.GranteeUser, cmd.name)
 	}
 	if errors.Is(err, auth.ErrNotFound) && cmd.ifExists {
 		err = nil

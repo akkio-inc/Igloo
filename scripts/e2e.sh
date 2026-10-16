@@ -3,7 +3,8 @@
 # isolated copy of deploy/single-vm (its own project name, image, ports and
 # data), and checks Igloo through real psql clients, the web console, Arrow
 # Flight SQL clients and PyIceberg on the Iceberg REST catalog
-# (scripts/engines-e2e.sh adds Spark and Trino).
+# (scripts/engines-e2e.sh adds Spark and Trino), with a webhook receiver
+# for alerts.
 # Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT and the
 # E2E_*_PORT variables let several runs share a Docker host; E2E_IMAGE
 # tests an image built already instead of building one.
@@ -42,7 +43,8 @@ cleanup() {
     compose logs --no-color --tail 80 igloo || true
   fi
   if [ "${KEEP_E2E:-}" != 1 ]; then
-    docker rm -f -v "$project-crm" "$project-ops" >/dev/null 2>&1 || true
+    # The receiver is on the stack's network, which cannot go while it is.
+    docker rm -f -v "$project-crm" "$project-ops" "$project-hooks" >/dev/null 2>&1 || true
     compose_pools --profile local-storage --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$work"
   else
@@ -76,6 +78,9 @@ IGLOO_REPORTING_PORT=$pool_port
 IGLOO_REPORTING_MEMORY_LIMIT=1GB
 IGLOO_REPORTING_THREADS=2
 EOF
+# A webhook receiver on the stack's network, as "hooks": notifications may
+# reach it although it is not public.
+sed -i.bak -e "s/^IGLOO_NOTIFICATION_ALLOW_HOSTS=.*/IGLOO_NOTIFICATION_ALLOW_HOSTS=hooks/" "$env_file"
 admin_password="$(grep '^IGLOO_ADMIN_PASSWORD=' "$env_file" | cut -d= -f2)"
 bucket="$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)"
 
@@ -902,6 +907,89 @@ psql_admin -c "GRANT SELECT ON TABLE e2e_sales_totals TO nora" >/dev/null
 expect "reading it needs SELECT on it" "8" nora nora-password-1 "SELECT orders FROM e2e_sales_totals"
 expect_error "not on what it reads" 42501 nora nora-password-1 "SELECT count(*) FROM e2e_sales"
 
+echo "alerts and notifications"
+# The receiver prints each request: its path, whether its signature checks
+# out with the integration's SECRET, and its body.
+hooks_py=$(cat <<'EOF'
+import hashlib, hmac, http.server
+SECRET = b"e2e-signing-secret-123"
+class Hook(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        ts = self.headers.get("X-Igloo-Timestamp", "")
+        want = "v1=" + hmac.new(SECRET, ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+        signed = hmac.compare_digest(self.headers.get("X-Igloo-Signature", ""), want)
+        print(self.path, "signed" if signed else "unsigned", body.decode(), flush=True)
+        self.send_response(204)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.ThreadingHTTPServer(("", 8080), Hook).serve_forever()
+EOF
+)
+docker run -d --name "$project-hooks" --network "$network" --network-alias hooks python:3.12-slim \
+  python -u -c "$hooks_py" >/dev/null
+for _ in $(seq 1 30); do
+  docker exec "$project-hooks" python -c "import socket; socket.create_connection(('localhost', 8080))" >/dev/null 2>&1 && break
+  sleep 1
+done
+hooks() { docker logs "$project-hooks" 2>&1; }
+# expect_hook NAME TEXT...: waits up to a minute for a request with every TEXT.
+expect_hook() {
+  local name=$1 deadline=$((SECONDS + 60)) line
+  shift
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    while IFS= read -r line; do
+      local all=1 text
+      for text in "$@"; do grep -qF -- "$text" <<<"$line" || all=0; done
+      if [ "$all" = 1 ]; then pass "$name"; return; fi
+    done < <(hooks)
+    sleep 1
+  done
+  fail "$name: no request with $*; got: $(hooks | tail -5)"
+}
+
+expect "an admin creates a webhook integration" "CREATE NOTIFICATION INTEGRATION" igloo "$admin_password" \
+  "CREATE NOTIFICATION INTEGRATION e2e_hook TYPE webhook URL 'http://hooks:8080/hook/e2e-s3cret-token' SECRET 'e2e-signing-secret-123'"
+got="$(psql_admin -c 'SHOW INTEGRATIONS')" || true
+if grep -q '^e2e_hook|webhook|t|http://hooks:8080|' <<<"$got" && ! grep -q 's3cret' <<<"$got"; then
+  pass "SHOW INTEGRATIONS hides the URL's token"
+else
+  fail "SHOW INTEGRATIONS: $got"
+fi
+expect "so does the query history" "0" igloo "$admin_password" "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '%s3cret%'"
+expect_error "integrations reach only public addresses" 42501 igloo "$admin_password" \
+  "CREATE NOTIFICATION INTEGRATION e2e_meta TYPE webhook URL 'https://169.254.169.254/latest/meta-data/'"
+expect_error "not the private network" 42501 igloo "$admin_password" \
+  "CREATE NOTIFICATION INTEGRATION e2e_db TYPE webhook URL 'https://postgres:5432/'"
+expect_error "only admins create integrations" 42501 walt walt-password-1 \
+  "CREATE NOTIFICATION INTEGRATION e2e_mine TYPE webhook URL 'https://example.com/hook'"
+alert="CREATE ALERT e2e_big_sales SCHEDULE '2 seconds' IF (EXISTS (SELECT id, name, amount FROM e2e_sales WHERE amount >= 10 ORDER BY id))
+  THEN NOTIFY e2e_hook MESSAGE 'Big sale: {{name}}' WITH RESULT"
+expect_error "alerts need USAGE on the integration" 42501 walt walt-password-1 "$alert"
+expect "GRANT USAGE ON INTEGRATION" "GRANT" igloo "$admin_password" "GRANT USAGE ON INTEGRATION e2e_hook TO walt"
+expect "an alert" "CREATE ALERT" walt walt-password-1 "$alert"
+got="$(psql_as walt walt-password-1 -c 'SHOW ALERTS')" || true
+if grep -q "^e2e_big_sales|walt|suspended|2 seconds|UTC|" <<<"$got"; then pass "SHOW ALERTS: suspended at first"; else fail "SHOW ALERTS: $got"; fi
+expect "EXECUTE ALERT runs it now, as its owner" "EXECUTE ALERT" igloo "$admin_password" "EXECUTE ALERT e2e_big_sales"
+expect_hook "the webhook gets the alert, signed, with its rows" "/hook/e2e-s3cret-token signed" '"name":"e2e_big_sales"' \
+  '"message":"Big sale: piped"' '"rows":[["10","piped","10.00"],["11","piped","11.00"]]'
+expect "the alert history records it" "alert|walt|manual|triggered|2|e2e_hook" walt walt-password-1 \
+  "SELECT alert_type, user_name, trigger, state, row_count, integration FROM igloo.alert_history WHERE alert_name = 'e2e_big_sales'"
+expect "others do not see it" "0" rita rita-password-1 "SELECT count(*) FROM igloo.alert_history"
+expect "ALTER ALERT RESUME" "ALTER ALERT" walt walt-password-1 "ALTER ALERT e2e_big_sales RESUME"
+expect_soon "the alert runs on its schedule" "t" walt walt-password-1 \
+  "SELECT count(*) >= 1 FROM igloo.alert_history WHERE alert_name = 'e2e_big_sales' AND trigger = 'schedule' AND state = 'triggered'"
+expect "ALTER ALERT SUSPEND" "ALTER ALERT" walt walt-password-1 "ALTER ALERT e2e_big_sales SUSPEND"
+expect "SYSTEM\$SEND_NOTIFICATION" "CALL" walt walt-password-1 "CALL SYSTEM\$SEND_NOTIFICATION('e2e_hook', 'hello from walt')"
+expect_hook "sends the message" '"type":"call"' '"message":"hello from walt"' '"user":"walt"'
+expect "built-in alerts for an integration" "ALTER NOTIFICATION INTEGRATION" igloo "$admin_password" \
+  "ALTER NOTIFICATION INTEGRATION e2e_hook SET OPERATIONAL_ALERTS = (FAILED_RUNS, LOAD_ERRORS)"
+psql_as walt walt-password-1 -c "CREATE TASK e2e_broken SCHEDULE '2 seconds' AS INSERT INTO e2e_missing VALUES (1)" >/dev/null
+psql_as walt walt-password-1 -c "ALTER TASK e2e_broken RESUME" >/dev/null
+expect_hook "a failed scheduled run is reported" '"type":"builtin"' '"name":"failed_runs"' '"name":"e2e_broken"'
+psql_as walt walt-password-1 -c "DROP TASK e2e_broken" >/dev/null
+
 echo "health and metrics"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http_port/readyz")"
 if [ "$code" = 200 ]; then pass "readyz"; else fail "readyz returned $code"; fi
@@ -1002,6 +1090,13 @@ expect "and do not load their files again" "2" walt walt-password-1 "SELECT coun
 expect "drop a pipe" "DROP PIPE" walt walt-password-1 "DROP PIPE e2e_pipe"
 expect "drop a task" "DROP TASK" walt walt-password-1 "DROP TASK e2e_task"
 expect "drop a materialized view" "DROP MATERIALIZED VIEW" walt walt-password-1 "DROP MATERIALIZED VIEW e2e_sales_totals"
+# The integration's URL and secret were stored encrypted; after a restart
+# they still decrypt, and the alert still sends.
+expect "alerts survive a restart" "EXECUTE ALERT" walt walt-password-1 "EXECUTE ALERT e2e_big_sales"
+expect "and so do integrations" "triggered" walt walt-password-1 \
+  "SELECT state FROM igloo.alert_history WHERE alert_name = 'e2e_big_sales' ORDER BY start_time DESC LIMIT 1"
+expect "drop an alert" "DROP ALERT" walt walt-password-1 "DROP ALERT e2e_big_sales"
+expect "drop an integration" "DROP INTEGRATION" igloo "$admin_password" "DROP INTEGRATION e2e_hook"
 expect "policies survive a restart" "1|***@acme.com" nora nora-password-1 "SELECT id, email FROM crm.contacts"
 
 echo "connections after the restart"

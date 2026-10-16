@@ -20,18 +20,21 @@ import (
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
-// Tasks, pipes and materialized views. DuckDB has none of them, so Igloo
-// carries out these statements itself and keeps the definitions in the
-// tasks store (package tasks):
+// Tasks, pipes, materialized views and alerts. DuckDB has none of them, so
+// Igloo carries out these statements itself and keeps the definitions in
+// the tasks store (package tasks):
 //
 //	CREATE [OR REPLACE] TASK [IF NOT EXISTS] name SCHEDULE 'spec' [TIMEZONE 'tz'] AS statement
 //	CREATE [OR REPLACE] PIPE [IF NOT EXISTS] name [SCHEDULE 'spec' [TIMEZONE 'tz']] AS COPY INTO ...
 //	CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name [SCHEDULE 'spec' [TIMEZONE 'tz']] AS query
-//	ALTER TASK | PIPE | MATERIALIZED VIEW [IF EXISTS] name RESUME | SUSPEND | SET SCHEDULE 'spec' [TIMEZONE 'tz']
-//	DROP TASK | PIPE | MATERIALIZED VIEW [IF EXISTS] name
-//	EXECUTE TASK name
+//	CREATE [OR REPLACE] ALERT [IF NOT EXISTS] name SCHEDULE 'spec' [TIMEZONE 'tz'] IF (EXISTS (query)) THEN NOTIFY ...
+//	ALTER TASK | PIPE | MATERIALIZED VIEW | ALERT [IF EXISTS] name RESUME | SUSPEND | SET SCHEDULE 'spec' [TIMEZONE 'tz']
+//	DROP TASK | PIPE | MATERIALIZED VIEW | ALERT [IF EXISTS] name
+//	EXECUTE TASK | ALERT name
 //	REFRESH MATERIALIZED VIEW name
-//	SHOW TASKS | PIPES | MATERIALIZED VIEWS
+//	SHOW TASKS | PIPES | MATERIALIZED VIEWS | ALERTS
+//
+// What an alert does, IF ... THEN NOTIFY ..., is in alerts.go.
 //
 // Work always runs as its owner, the user who created it, with the
 // privileges the owner has when it runs: a run is a new session of the
@@ -69,6 +72,8 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			c.kind = tasks.KindPipe
 		case sc.keywords("MATERIALIZED", "VIEW"):
 			c.kind = tasks.KindMaterializedView
+		case sc.keywords("ALERT"):
+			c.kind = tasks.KindAlert
 		default:
 			return false
 		}
@@ -82,6 +87,8 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			c.kind = tasks.KindPipe
 		case sc.keywords("MATERIALIZED", "VIEWS"):
 			c.kind = tasks.KindMaterializedView
+		case sc.keywords("ALERTS"):
+			c.kind = tasks.KindAlert
 		default:
 			return false
 		}
@@ -106,6 +113,8 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 		c.verb = "DROP"
 	case sc.keywords("EXECUTE", "TASK"):
 		c.verb, c.kind = "EXECUTE", tasks.KindTask
+	case sc.keywords("EXECUTE", "ALERT"):
+		c.verb, c.kind = "EXECUTE", tasks.KindAlert
 	case sc.keywords("REFRESH", "MATERIALIZED", "VIEW"):
 		c.verb, c.kind = "REFRESH", tasks.KindMaterializedView
 	case sc.keywords("SHOW"):
@@ -159,6 +168,18 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 				return c, true, err
 			}
 		}
+		if c.kind == tasks.KindAlert {
+			// As in Snowflake, an alert's IF follows its schedule.
+			if c.schedule == nil {
+				return c, true, jobSyntax("CREATE ALERT needs a SCHEDULE, such as SCHEDULE '1 hour' or SCHEDULE '0 9 * * *'")
+			}
+			if sc.word() != "IF" {
+				return c, true, jobSyntax("expected SCHEDULE '...' [TIMEZONE '...'] IF (EXISTS (query)) THEN NOTIFY ... after CREATE ALERT %s",
+					strings.Join(c.name, "."))
+			}
+			c.body = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sc.rest()), ";"))
+			return c, true, nil
+		}
 		if !sc.keywords("AS") {
 			return c, true, jobSyntax("expected [SCHEDULE '...' [TIMEZONE '...']] AS ... after %s %s", what, strings.Join(c.name, "."))
 		}
@@ -206,7 +227,7 @@ func (c jobCommand) plural() string {
 func (c jobCommand) tag() string {
 	switch c.verb {
 	case "EXECUTE":
-		return "EXECUTE TASK"
+		return "EXECUTE " + strings.ToUpper(c.kind)
 	case "REFRESH":
 		return "REFRESH MATERIALIZED VIEW"
 	}
@@ -325,8 +346,11 @@ func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.Use
 		}
 	case "EXECUTE", "REFRESH":
 		_, err = s.tasks.RunNow(ctx, s, j)
-		if errors.Is(err, tasks.ErrRunning) {
+		switch {
+		case errors.Is(err, tasks.ErrRunning):
 			err = pgerror.WithCode(err, codes.ObjectInUse)
+		case errors.Is(err, tasks.ErrSkipped):
+			err = pgerror.WithCode(err, codes.ObjectNotInPrerequisiteState)
 		}
 	}
 	if err != nil {
@@ -444,7 +468,7 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 			return pgerror.WithCode(errors.New("a task runs one SQL statement"), codes.FeatureNotSupported)
 		}
 		if inner, isJob, _ := parseJobCommand(c.body); isJob && inner.kind != tasks.KindMaterializedView {
-			return pgerror.WithCode(errors.New("a task cannot create, change, run or drop tasks and pipes"), codes.FeatureNotSupported)
+			return pgerror.WithCode(errors.New("a task cannot create, change, run or drop tasks, pipes and alerts"), codes.FeatureNotSupported)
 		}
 		j.Statement = c.body
 	case tasks.KindPipe:
@@ -475,6 +499,17 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 		}
 		// A new pipe looks for files at once.
 		j.NextRun = time.Now()
+	case tasks.KindAlert:
+		// As in Snowflake, a new alert waits for ALTER ALERT ... RESUME.
+		j.State, j.NextRun = tasks.StateSuspended, time.Time{}
+		def, err := parseAlert(c.body)
+		if err != nil {
+			return err
+		}
+		if err := s.checkAlert(ctx, sess, user, def); err != nil {
+			return err
+		}
+		j.Statement = def.String()
 	case tasks.KindMaterializedView:
 		if n, err := s.engine.CountStatements(c.body); err != nil || n != 1 || !selectLike(c.body) {
 			return pgerror.WithCode(errors.New("a materialized view is defined by one query: CREATE MATERIALIZED VIEW name AS SELECT ..."),
@@ -601,6 +636,9 @@ func nullTime(t time.Time) any {
 // materialized view's refresh are recorded in the owner's query history
 // when they change anything.
 func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
+	if j.Kind == tasks.KindAlert {
+		return s.runAlert(ctx, j)
+	}
 	owner, err := s.users.Get(ctx, j.Owner)
 	if errors.Is(err, auth.ErrNotFound) {
 		return -1, fmt.Errorf("%w: %s", tasks.ErrOwnerGone, j.Owner)

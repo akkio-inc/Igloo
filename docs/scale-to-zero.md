@@ -29,8 +29,9 @@ Clients connect to it instead of to Igloo, and so can browsers using the
 - When no client has sent or received anything for `IGLOO_GATEWAY_SUSPEND_AFTER`
   (10 minutes by default) and Igloo reports no running statements or table
   maintenance, the gateway stops the compute.
-- When [scheduled work](#scheduled-work) (tasks, pipes, materialized views)
-  is due, the gateway starts the compute for it, with nobody connected.
+- When [scheduled work](#scheduled-work) (tasks, pipes, materialized views,
+  alerts) is due, the gateway starts the compute for it, with nobody
+  connected.
 - With `IGLOO_GATEWAY_CONSOLE_BACKEND` set, the gateway forwards the web
   console's port the same way, on a second listener: opening the console
   starts Igloo, and its requests count as traffic. The console sends nothing
@@ -268,8 +269,8 @@ connect while starts fail.
 
 ## Scheduled work
 
-[Tasks, pipes and materialized views](loading.md) run on their schedules
-while Igloo is stopped, too. Igloo reports on `/activity` when its next
+[Tasks, pipes, materialized views](loading.md) and [alerts](alerts.md) run
+on their schedules while Igloo is stopped, too. Igloo reports on `/activity` when its next
 scheduled run is due, and the gateway:
 
 - stops Igloo as usual once it is idle, unless work is due within

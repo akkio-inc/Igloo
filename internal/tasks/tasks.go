@@ -1,8 +1,10 @@
 // Package tasks keeps Igloo's scheduled work and its history: tasks (one SQL
 // statement on a schedule), pipes (COPY INTO from a location, run every
-// minute or on a schedule) and materialized views (a query kept as a table
-// and refreshed on demand or on a schedule). It also keeps the load history
-// of COPY INTO, which makes sure a file is loaded into a table once.
+// minute or on a schedule), materialized views (a query kept as a table
+// and refreshed on demand or on a schedule) and alerts (a query on a
+// schedule that sends a notification when it returns rows). It also keeps
+// the load history of COPY INTO, which makes sure a file is loaded into a
+// table once.
 //
 // Definitions and history live in the metadata database (PostgresStore,
 // schema igloo_tasks) so every replica shares them, or in memory
@@ -26,6 +28,7 @@ const (
 	KindTask             = "task"
 	KindPipe             = "pipe"
 	KindMaterializedView = "materialized view"
+	KindAlert            = "alert"
 )
 
 // States of a job.
@@ -79,17 +82,21 @@ var (
 	ErrIdle = errors.New("nothing to do")
 	// ErrRunning is returned by RunNow for a job that is running.
 	ErrRunning = errors.New("is already running")
+	// ErrSkipped is wrapped by a Runner's error for a run it did not
+	// carry out, such as an alert's while its owner is disabled. The run
+	// is recorded as skipped, with the error.
+	ErrSkipped = errors.New("skipped")
 )
 
-// Job is a task, pipe or materialized view.
+// Job is a task, pipe, materialized view or alert.
 type Job struct {
 	Kind string
-	// Name is a task's or pipe's name, or a materialized view's
+	// Name is a task's, pipe's or alert's name, or a materialized view's
 	// schema.table.
 	Name  string
 	Owner string
-	// Statement is what runs: a task's SQL, a pipe's COPY INTO, or a
-	// materialized view's query.
+	// Statement is what runs: a task's SQL, a pipe's COPY INTO, a
+	// materialized view's query, or an alert's IF ... THEN ....
 	Statement string
 	// Schedule and Timezone are as written. A materialized view without a
 	// schedule has none.
@@ -187,6 +194,9 @@ type Store interface {
 	Runs(ctx context.Context, v audit.Viewer, p audit.Page) ([]Run, error)
 	// Prune deletes runs, and failed loads, older than before.
 	Prune(ctx context.Context, before time.Time) error
+	// LastLoad is when the pipe's latest run that loaded files started,
+	// or zero if none of the runs kept did.
+	LastLoad(ctx context.Context, pipe string) (time.Time, error)
 
 	// PreviousLoads returns the latest load of each of files into table.
 	PreviousLoads(ctx context.Context, table string, files []string) (map[string]Load, error)
@@ -201,6 +211,16 @@ type Store interface {
 	RenameTable(ctx context.Context, from, to string) error
 
 	Close()
+}
+
+// runKey carries the Run a Runner's job runs as.
+type runKey struct{}
+
+// RunOf returns the run that ctx, passed to Runner.RunJob, belongs to:
+// its ID, trigger and scheduled time.
+func RunOf(ctx context.Context) (Run, bool) {
+	r, ok := ctx.Value(runKey{}).(Run)
+	return r, ok
 }
 
 // JobKey names a job's lock.

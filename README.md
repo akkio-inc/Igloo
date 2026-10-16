@@ -163,6 +163,22 @@ the official TPC-H answers.
   CREATE TASK nightly SCHEDULE '0 6 * * *' TIMEZONE 'America/New_York' AS
     CREATE OR REPLACE TABLE report AS SELECT day, sum(spend) FROM sales GROUP BY day;
   ```
+- **[Alerts and notifications](docs/alerts.md)** to Slack, Microsoft
+  Teams, email and webhooks: alerts run a query on a schedule, as their
+  owner and through their owner's policies, and notify when it returns
+  rows; built-in alerts report failed runs and loads, pipes whose files
+  stopped arriving, long queries, failed-login bursts and maintenance
+  failures. Notifications reach only public addresses over TLS, and
+  webhook URLs are stored encrypted.
+
+  ```sql
+  CREATE NOTIFICATION INTEGRATION ops_slack TYPE slack URL 'https://hooks.slack.com/services/...'
+    OPERATIONAL_ALERTS = (FAILED_RUNS, IDLE_PIPES = 26);
+  GRANT USAGE ON INTEGRATION ops_slack TO ROLE analysts;
+  CREATE ALERT pacing SCHEDULE '0 9 * * MON-FRI' IF (EXISTS (
+      SELECT campaign FROM marts.pacing WHERE abs(spend / planned - 1) > 0.2))
+    THEN NOTIFY ops_slack MESSAGE 'Pacing is off plan for {{campaign}}' WITH RESULT;
+  ```
 - **[Media analytics](docs/media-analytics.md)**: HLL and theta sketches
   that merge into deduplicated reach and audience overlap across campaigns,
   platforms and days; geometry and H3 functions for DMA, zip code and
@@ -273,6 +289,9 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   mapping, tested drivers and tools
 - [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
   materialized views
+- [Alerts and notifications](docs/alerts.md): alerts, notification
+  integrations for Slack, Teams, email and webhooks, and built-in
+  operational alerts
 - [Masking, row access policies and tags](docs/security-policies.md): what
   each user sees of tables' rows and columns
 - [Media analytics](docs/media-analytics.md): reach and frequency with
@@ -328,11 +347,12 @@ internal/engine/    embedded DuckDB, storage, sandbox
 internal/federation/ connections to other databases and their proxy
 internal/flightsql/ Arrow Flight SQL endpoint
 internal/icebergrest/ Iceberg REST catalog for other engines
+internal/notify/    notification integrations, sending, built-in alerts, alert history
 internal/pgwire/    Postgres wire protocol, authorization, policies, compatibility
 internal/policy/    masking and row access policies and tags, stored
 internal/schedule/  cron and interval schedules
 internal/sharing/   Delta Sharing: the provider endpoint and external tables
-internal/tasks/     tasks, pipes, materialized views, load history, scheduler
+internal/tasks/     tasks, pipes, materialized views, alerts, load history, scheduler
 internal/workload/  query tags, role limits and their enforcement
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules
 docs/               documentation

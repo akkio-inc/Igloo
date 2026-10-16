@@ -158,7 +158,7 @@ func rewriteSessionUser(query, user string) string {
 
 // historyViews are the views of the history, the usage and the policies,
 // in the local database's schema engine.HistorySchema.
-var historyViews = []string{"query_history", "login_history", "task_history", "load_history", "usage",
+var historyViews = []string{"query_history", "login_history", "task_history", "load_history", "alert_history", "usage",
 	"policy_references", "tag_references"}
 
 // isHistoryView reports whether name is one of historyViews.

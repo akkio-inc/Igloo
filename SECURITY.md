@@ -188,6 +188,30 @@ reference for every setting mentioned here.
   suspended. Scheduling needs the writer role, and only owners and admins
   may change, run or drop scheduled work. Reading a materialized view
   needs `SELECT` on it, like a table.
+- **Alerts and notifications** ([details](docs/alerts.md#security)). Only
+  admins create notification integrations and grant `USAGE` on them. An
+  alert runs as its owner, through the owner's grants and policies, and
+  sends at most 20 rows of what its query returns, only to integrations
+  its owner has `USAGE` on when it runs; `SYSTEM$SEND_NOTIFICATION` sends
+  only text written in the statement. Integrations' URLs, headers and
+  signing secrets are stored encrypted (AES-256-GCM, under a key in
+  `igloo_auth.secrets`), never shown, and replaced by `***` in errors,
+  logs, the query history and the alert history. Values from data are
+  escaped for Slack and Teams, so they cannot mention people or make
+  links.
+- **Outbound connections.** Besides the catalog, object storage and the
+  identity provider, Igloo connects out only to send notifications. These
+  connections reach only public addresses: Igloo resolves the host for
+  every connection, refuses it if any address is loopback, private,
+  link-local (which holds cloud metadata endpoints), multicast, reserved or
+  an IPv6 form of one, connects to the address it checked, and checks it
+  again as the socket connects, so DNS rebinding cannot redirect it. It
+  uses no proxy, follows no redirects, and requires TLS: `https` for
+  webhooks, implicit TLS or STARTTLS for mail.
+  `IGLOO_NOTIFICATION_ALLOW_HOSTS` exempts the hosts it names, which may
+  then be private and unencrypted; list only hosts meant to receive
+  notifications. The Helm chart's network policies restrict ingress only;
+  restrict egress there too if you need a second line.
 - **Query sandbox.** Queries run in an embedded DuckDB that cannot read or
   write files on the server's local disk and cannot reach any URL outside the
   warehouse location and the prefixes in `IGLOO_ALLOWED_LOCATIONS`. DuckDB

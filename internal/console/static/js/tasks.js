@@ -1,9 +1,10 @@
-// Tasks, pipes and materialized views with their runs, and the load
-// history of COPY INTO, read with SQL as the signed-in user: SHOW TASKS,
-// SHOW PIPES, SHOW MATERIALIZED VIEWS, igloo.task_history and
-// igloo.load_history. Admins see everyone's; other users see their own,
-// which the server decides. Older versions of Igloo have none of these;
-// the pages say so instead of failing.
+// Tasks, pipes, materialized views and alerts with their runs, and the
+// load history of COPY INTO, read with SQL as the signed-in user: SHOW
+// TASKS, SHOW PIPES, SHOW MATERIALIZED VIEWS, SHOW ALERTS,
+// igloo.task_history, igloo.alert_history and igloo.load_history. Admins
+// see everyone's; other users see their own, which the server decides.
+// Older versions of Igloo have none of these; the pages say so instead of
+// failing.
 
 import * as api from './api.js';
 import { h, clear, icon, button, fmtMs, fmtTime, fmtAgo, plural, mark, toast, confirmDialog } from './dom.js';
@@ -21,6 +22,10 @@ const KINDS = {
     show: 'SHOW MATERIALIZED VIEWS', title: 'Materialized views', noun: 'materialized view', sql: 'MATERIALIZED VIEW',
     run: { label: 'Refresh', sql: (n) => `REFRESH MATERIALIZED VIEW ${n}`, done: 'Refreshed' },
   },
+  alert: {
+    show: 'SHOW ALERTS', title: 'Alerts', noun: 'alert', sql: 'ALERT',
+    run: { label: 'Run now', sql: (n) => `EXECUTE ALERT ${n}`, done: 'Ran' },
+  },
 };
 
 const LIMIT = 500;
@@ -34,7 +39,10 @@ function sqlName(kind, name) {
 function outcomeBadge(v) {
   if (v === null || v === undefined) return null;
   const s = String(v);
-  const cls = { succeeded: 'ok', loaded: 'ok', failed: 'error', unknown: 'error', running: 'warn', loading: 'warn', skipped: '', 'partially loaded': 'warn' }[s] ?? '';
+  const cls = {
+    succeeded: 'ok', loaded: 'ok', failed: 'error', unknown: 'error', running: 'warn', loading: 'warn', skipped: '', 'partially loaded': 'warn',
+    triggered: 'warn', condition_false: 'ok', condition_failed: 'error', action_failed: 'error',
+  }[s] ?? '';
   return h('span', { class: `badge ${cls}`.trim(), text: s });
 }
 
@@ -108,6 +116,7 @@ export function createJobs(app) {
         task: 'CREATE TASK nightly SCHEDULE \'0 6 * * *\' AS INSERT INTO ...',
         pipe: 'CREATE PIPE drops AS COPY INTO sales FROM \'s3://landing/sales/\'',
         'materialized view': 'CREATE MATERIALIZED VIEW totals SCHEDULE \'1 hour\' AS SELECT ...',
+        alert: 'CREATE ALERT pacing SCHEDULE \'0 9 * * *\' IF (EXISTS (SELECT ...)) THEN NOTIFY slack_ops',
       }[kind];
       clear(list, h('div', { class: 'empty' }, h('h2', { text: `No ${k.noun}s yet` }),
         h('p', {}, app.isAdmin ? 'Create one in a worksheet, such as ' : 'You have none. Create one in a worksheet, such as ', h('code', { text: hint }))));
@@ -196,6 +205,22 @@ ORDER BY start_time DESC LIMIT 50`));
             r.first_error ? h('tr', {}, h('td', { colspan: '4' }, h('pre', { class: 'mono', text: r.first_error }))) : null,
           ]))))
           : h('p', { class: 'muted', text: 'No files loaded yet. Checks that find nothing new are not recorded.' }));
+      } else if (kind === 'alert') {
+        const res = api.objects(await api.query(`SELECT start_time, trigger, state, duration_ms, row_count, integration, error
+FROM igloo.alert_history WHERE alert_type = 'alert' AND alert_name = ${api.literal(j.name)}
+ORDER BY start_time DESC LIMIT 50`));
+        clear(runs, res.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
+          h('thead', {}, h('tr', {}, ['Started', 'Trigger', 'State', 'Took', 'Rows'].map((t) => h('th', { text: t })))),
+          h('tbody', {}, res.map((r) => [
+            h('tr', {},
+              h('td', { class: 'nowrap muted', text: fmtTime(r.start_time) }),
+              h('td', { text: r.trigger }),
+              h('td', {}, outcomeBadge(r.state)),
+              h('td', { class: 'num nowrap', text: r.duration_ms === null ? '' : fmtMs(Number(r.duration_ms)) }),
+              h('td', { class: 'num', text: num(r.row_count) })),
+            r.error ? h('tr', {}, h('td', { colspan: '5' }, h('pre', { class: 'mono', text: r.error }))) : null,
+          ]))))
+          : h('p', { class: 'muted', text: 'No runs yet.' }));
       } else {
         const res = api.objects(await api.query(`SELECT start_time, trigger, outcome, duration_ms, row_count, error
 FROM igloo.task_history WHERE kind = ${api.literal(kind)} AND name = ${api.literal(j.name)}

@@ -353,6 +353,9 @@ func (s *Server) runACLCommand(ctx context.Context, sess *session, c *aclCommand
 		err = s.grants.CreateRole(ctx, c.role)
 	case aclDropRole:
 		err = s.grants.DropRole(ctx, c.role)
+		if err == nil {
+			s.forgetGrantee(auth.GranteeRole, c.role)
+		}
 		if errors.Is(err, auth.ErrRoleNotFound) && c.ifExists {
 			err = nil
 		}

@@ -344,6 +344,18 @@ func (s *PostgresStore) Prune(ctx context.Context, before time.Time) error {
 	})
 }
 
+// LastLoad reads the pipe's runs: a pipe's check is recorded only when it
+// loaded files or failed, and a failed one may have loaded some.
+func (s *PostgresStore) LastLoad(ctx context.Context, pipe string) (time.Time, error) {
+	var at *time.Time
+	err := s.pool.QueryRow(ctx, `SELECT max(start_time) FROM igloo_tasks.runs
+		WHERE kind = $1 AND lower(name) = lower($2) AND (outcome = 'succeeded' OR row_count > 0)`, KindPipe, pipe).Scan(&at)
+	if err != nil || at == nil {
+		return time.Time{}, err
+	}
+	return *at, nil
+}
+
 const loadColumns = `load_id, table_name, file, size, last_modified, status, row_count, error_count,
 	coalesce(first_error, ''), start_time, end_time, user_name, coalesce(pipe_name, '')`
 

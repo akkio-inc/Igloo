@@ -42,7 +42,7 @@ page is the reference they are built on.
 |---|---|---|
 | `IGLOO_ADMIN_USER` | `igloo` | Name of the first administrator |
 | `IGLOO_ADMIN_PASSWORD` | (required) | That administrator's password. Used to create the account on first start only; afterwards change it with `ALTER USER`. |
-| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants, access tokens (hashed) and single sign-on links are stored (schema `igloo_auth`), with the keys that seal web console sessions and Iceberg REST tokens, the query and login history (schema `igloo_audit`), tasks, pipes, materialized views and the load history (schema `igloo_tasks`), masking policies, row access policies and tags (schema `igloo_policy`), and Delta Sharing's shares, recipients, providers and external tables (schema `igloo_sharing`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit`, `igloo_tasks`, `igloo_policy` or `igloo_sharing`. Without it, the administrator is the only account, `CREATE USER`, access tokens, single sign-on and Delta Sharing are unavailable, console sessions and Iceberg REST tokens end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes, the load history and policies are lost on restart. |
+| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants, access tokens (hashed) and single sign-on links are stored (schema `igloo_auth`), with the keys that seal web console sessions, Iceberg REST tokens, connection passwords and notification integrations' secrets, the query and login history (schema `igloo_audit`), tasks, pipes, materialized views, alerts and the load history (schema `igloo_tasks`), masking policies, row access policies and tags (schema `igloo_policy`), Delta Sharing's shares, recipients, providers and external tables (schema `igloo_sharing`), and notification integrations, encrypted, and the alert history (schema `igloo_notify`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit`, `igloo_tasks`, `igloo_policy`, `igloo_sharing` or `igloo_notify`. Without it, the administrator is the only account, `CREATE USER`, access tokens, single sign-on and Delta Sharing are unavailable, console sessions and Iceberg REST tokens end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes, alerts, notification integrations, the load history and policies are lost on restart. |
 | `IGLOO_CONNECTION_SECRETS_DIR` | | Absolute path of a directory of files, such as a mounted Kubernetes Secret, holding the passwords of [connections to other databases](federation.md#credentials) that name them with `password_secret`. Igloo reads a file each time it signs in to that database, so rotating it there needs no restart. Without it, connections store their passwords, encrypted, in the metadata database. |
 
 Users sign in with SCRAM-SHA-256, the PostgreSQL default, with a password
@@ -90,7 +90,25 @@ Igloo records every statement and login in `igloo.query_history` and
 | Variable | Default | Meaning |
 |---|---|---|
 | `IGLOO_AUDIT` | `true` | Record the query and login history |
-| `IGLOO_AUDIT_RETENTION` | `90d` | How long history is kept, e.g. `30d` or `720h`: queries, logins, runs of tasks and pipes, and failed loads. Files loaded stay in the load history as long as their table exists. |
+| `IGLOO_AUDIT_RETENTION` | `90d` | How long history is kept, e.g. `30d` or `720h`: queries, logins, runs of tasks, pipes and alerts, the alert history, and failed loads. Files loaded stay in the load history as long as their table exists. |
+
+## Alerts and notifications
+
+[Alerts and notifications](alerts.md) go to webhooks, Slack, Microsoft
+Teams and email. Webhooks need no setting; email needs a mail server.
+Notifications reach only public addresses, over TLS, unless the allow list
+names the host.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_NOTIFICATION_ALLOW_HOSTS` | | Comma-separated host names and IP addresses, as written in integrations' URLs and `IGLOO_SMTP_HOST`, that notifications may reach although they are not public, such as a webhook receiver or a mail relay on the private network, and over plain HTTP or SMTP. No wildcards; list only hosts meant to receive notifications. |
+| `IGLOO_SMTP_HOST` | | The mail server email integrations send through. Empty: no email integrations. |
+| `IGLOO_SMTP_PORT` | `587` | Its port. On 465 Igloo speaks TLS from the start; on others it requires STARTTLS, unless the host is in `IGLOO_NOTIFICATION_ALLOW_HOSTS`. |
+| `IGLOO_SMTP_FROM` | (required with a host) | The sender of every email, such as `alerts@agency.com`. |
+| `IGLOO_SMTP_ALLOWED_DOMAINS` | (required with a host) | Comma-separated email domains integrations may send to, such as `agency.com`. Recipients elsewhere are refused. |
+| `IGLOO_SMTP_USERNAME` | | The user to sign in to the mail server as, with PLAIN authentication inside TLS. Empty: no sign-in. |
+| `IGLOO_SMTP_PASSWORD_FILE` | | File holding its password, such as a mounted Kubernetes Secret. |
+| `IGLOO_SMTP_PASSWORD` | | The password itself, if not in a file. |
 
 ## Catalog
 

@@ -160,6 +160,9 @@ func startServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*O
 	if opts.Tasks != nil {
 		eng.SetJobHistory(opts.Tasks.Store(), HistoryViewer)
 	}
+	if opts.Notify != nil {
+		eng.SetAlertHistory(opts.Notify.Store(), HistoryViewer)
+	}
 	srv, err := New(eng, opts, log)
 	if err != nil {
 		t.Fatal(err)

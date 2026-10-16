@@ -4,9 +4,14 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
@@ -100,5 +105,29 @@ func TestPostgresSchedule(t *testing.T) {
 	runs, err = lock.LastRuns(ctx, "pass")
 	if err != nil || !runs["pass"].Equal(now) {
 		t.Fatalf("pass run: %v, %v", runs, err)
+	}
+}
+
+// TestFailuresAreReported checks that a pass that cannot list the tables
+// tells Options.Failed, as the built-in maintenance alert needs.
+func TestFailuresAreReported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/config" {
+			_, _ = io.WriteString(w, `{"defaults": {}, "overrides": {}}`)
+			return
+		}
+		http.Error(w, `{"error": {"message": "down", "type": "ServiceUnavailable", "code": 503}}`, http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	cat, err := catalog.Open(ctx, config.Config{Catalog: config.Catalog{URI: srv.URL, Warehouse: "w"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failed []string
+	opts := Options{Interval: time.Hour, Failed: func(table string, err error) { failed = append(failed, table+": "+err.Error()) }}
+	New(cat, "s3://b/w/", opts, slog.New(slog.NewTextHandler(io.Discard, nil))).RunOnce(ctx)
+	if len(failed) != 1 || !strings.HasPrefix(failed[0], ": ") {
+		t.Errorf("failures reported: %q", failed)
 	}
 }

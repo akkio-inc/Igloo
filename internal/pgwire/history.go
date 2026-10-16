@@ -200,6 +200,9 @@ func statementKind(query string) string {
 			// CREATE MASKING POLICY, not CREATE MASKING.
 			return c.tag
 		}
+		if c, ok, err := parseIntegrationCommand(query); ok && err == nil {
+			return c.tag()
+		}
 		return ddlTag(query)
 	case "SHOW":
 		return strings.Join(words, " ")
@@ -210,9 +213,10 @@ func statementKind(query string) string {
 // secretWords mark statements that can carry passwords or credentials.
 // Their string literals are kept out of the history, as is the word after
 // PASSWORD, which a malformed statement may leave unquoted. CREATE PROVIDER
-// carries a Delta Sharing profile file, with its bearer token.
+// carries a Delta Sharing profile file, with its bearer token, and a
+// notification integration's URL its webhook's token.
 var secretWords = []string{"PASSWORD", "SECRET", "KEY_ID", "SESSION_TOKEN", "ACCOUNT_KEY",
-	"CONNECTION_STRING", "CLIENT_SECRET", "TOKEN", "CREDENTIAL", "CREDENTIALS", "PROVIDER"}
+	"CONNECTION_STRING", "CLIENT_SECRET", "TOKEN", "CREDENTIAL", "CREDENTIALS", "PROVIDER", "INTEGRATION"}
 
 // sensitiveSetting matches settings whose values are credentials, such as
 // s3_secret_access_key.

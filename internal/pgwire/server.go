@@ -32,6 +32,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/federation"
+	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sharing"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -130,6 +131,11 @@ type Options struct {
 	// there are none and CREATE CONNECTION is unavailable.
 	Federation *federation.Manager
 
+	// Notify keeps notification integrations and sends alerts'
+	// notifications. Nil means a service in memory that reaches only
+	// public addresses.
+	Notify *notify.Service
+
 	// external and externalFiles stand in for Sharing's external tables
 	// and the prefix of their files, in tests.
 	external      externalCatalog
@@ -182,6 +188,7 @@ type Server struct {
 	audit       *audit.Log
 	catalog     string
 	tasks       *tasks.Scheduler
+	notify      *notify.Service
 	// gov holds the policies (see protect.go).
 	gov      *governance
 	settings auth.SettingStore
@@ -247,6 +254,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		shares:      opts.Sharing,
 		external:    opts.external,
 		fed:         opts.Federation,
+		notify:      opts.Notify,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -262,6 +270,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	if s.fed != nil {
 		s.remotes = s.fed
+	}
+	if s.notify == nil {
+		s.notify = notify.New(notify.Options{Log: log})
 	}
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
@@ -704,6 +715,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			}
 			return w.Complete("SHOW")
 		}), wire.WithColumns(wire.Columns{{Name: "password_encryption", Oid: pgtype.TextOID, Width: -1}}))), nil
+	}
+
+	if ps, ok, err := s.notificationCommand(sess, q.Query); ok || err != nil {
+		return ps, err
 	}
 
 	if cmds, ok, err := parseUserCommands(q.Query); ok {

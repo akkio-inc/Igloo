@@ -12,6 +12,9 @@ by itself, with no external scheduler:
   expression, in any time zone.
 - **Materialized views** keep a query's result as a table, refreshed on
   demand or on a schedule.
+- **[Alerts](alerts.md)** run a query on a schedule and tell Slack, Teams,
+  email or a webhook when it returns rows; built-in alerts report failed
+  runs, failed loads and pipes that stop receiving files.
 
 Everything runs inside Igloo, as the user who created it, with that user's
 privileges at the time it runs. With [scale to zero](scale-to-zero.md), the
@@ -244,12 +247,13 @@ EXECUTE TASK hourly_rollup;   -- run it now, as it would run on its schedule
   due, and then on schedule.
 - **What it may run:** any one statement its owner could run: `INSERT`,
   `MERGE`, `CREATE OR REPLACE TABLE ... AS`, `COPY INTO`,
-  `REFRESH MATERIALIZED VIEW`, and so on, but not statements on tasks and
-  pipes. Unqualified names resolve in the default schema `public`, as in a
+  `REFRESH MATERIALIZED VIEW`, [`CALL SYSTEM$SEND_NOTIFICATION`](alerts.md#sending-from-tasks),
+  and so on, but not statements on tasks, pipes and alerts. Unqualified names resolve in the default schema `public`, as in a
   new session. `IGLOO_STATEMENT_TIMEOUT` applies.
 
-Runs of tasks, pipes and materialized views are in `igloo.task_history`.
-Admins see every run; other users see the runs of what they own.
+Runs of tasks, pipes, materialized views and [alerts](alerts.md) are in
+`igloo.task_history`. Admins see every run; other users see the runs of
+what they own.
 
 ```sql
 SELECT start_time, name, outcome, duration_ms, error
@@ -259,7 +263,7 @@ FROM igloo.task_history WHERE outcome <> 'succeeded' ORDER BY start_time DESC LI
 | Column | Meaning |
 |---|---|
 | `run_id` | Identifies the run |
-| `kind`, `name` | `task`, `pipe` or `materialized view`, and its name |
+| `kind`, `name` | `task`, `pipe`, `materialized view` or `alert`, and its name |
 | `user_name` | The owner it ran as |
 | `trigger` | `schedule`, or `manual` for `EXECUTE TASK` and `REFRESH MATERIALIZED VIEW` |
 | `scheduled_time` | When a scheduled run was due |
@@ -368,5 +372,6 @@ things out.
 | A task does not run | It is suspended: `ALTER TASK ... RESUME`. `SHOW TASKS` shows its state and next run. |
 | A run failed with `permission denied for ...` | The owner lost a privilege the task needs. Grant it again, or `CREATE OR REPLACE` the task as someone who has it. |
 | A task was suspended by itself | Its owner was dropped. Recreate it as another user. |
+| Nobody noticed a failed run, or a partner's file that never came | Switch on the [built-in alerts](alerts.md#built-in-operational-alerts) `FAILED_RUNS`, `LOAD_ERRORS` and `IDLE_PIPES` for a Slack, Teams or email integration. |
 | Runs are `skipped` | Each run takes longer than the schedule's interval. Lengthen the interval. |
 | A file is `unknown` in the load history | Igloo stopped while loading it. Check whether its rows are in the table; if not, load it with `FORCE true`. |

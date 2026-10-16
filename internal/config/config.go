@@ -83,6 +83,8 @@ type Config struct {
 	OIDC OIDC
 	// TokenMaxLifetime caps how long an access token may last.
 	TokenMaxLifetime time.Duration
+	// Notifications configures alerts' destinations (see notify.go).
+	Notifications Notifications
 }
 
 // Audit controls the query and login history.
@@ -479,6 +481,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	loadOIDC(&cfg, lookup, addErr)
+	loadNotifications(&cfg, lookup, addErr)
 
 	return cfg, errors.Join(errs...)
 }

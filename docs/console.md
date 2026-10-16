@@ -40,13 +40,15 @@ the table.
 text, read from `igloo.query_history` and `igloo.login_history`. On a server
 without those views the page says that history is not available.
 
-**Tasks.** [Tasks, pipes and materialized views](loading.md), each with its
-owner, state, schedule, next run and last outcome, from `SHOW TASKS`,
-`SHOW PIPES` and `SHOW MATERIALIZED VIEWS`. Selecting one shows its
-definition and its recent runs from `igloo.task_history` (for a pipe, the
-files it loaded), and buttons that run it now (`EXECUTE TASK`,
-`REFRESH MATERIALIZED VIEW`), suspend it and resume it, which the server
-allows its owner and admins. Admins see everyone's; other users their own.
+**Tasks.** [Tasks, pipes, materialized views](loading.md) and
+[alerts](alerts.md), each with its owner, state, schedule, next run and
+last outcome, from `SHOW TASKS`, `SHOW PIPES`, `SHOW MATERIALIZED VIEWS`
+and `SHOW ALERTS`. Selecting one shows its definition and its recent runs
+from `igloo.task_history` (for a pipe, the files it loaded; for an alert,
+what it found and sent, from `igloo.alert_history`), and buttons that run
+it now (`EXECUTE TASK`, `REFRESH MATERIALIZED VIEW`, `EXECUTE ALERT`),
+suspend it and resume it, which the server allows its owner and admins.
+Admins see everyone's; other users their own.
 
 **Load history.** The files `COPY INTO` and pipes loaded, with their
 status, rows and first error, from `igloo.load_history`, filtered by table,

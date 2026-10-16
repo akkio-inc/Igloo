@@ -37,6 +37,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
+	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/pgwire"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/scim"
@@ -186,6 +187,11 @@ func serve() error {
 		return err
 	}
 	defer taskStore.Close()
+	notifyStore, err := openNotifications(startCtx, cfg, users, log)
+	if err != nil {
+		return err
+	}
+	defer notifyStore.Close()
 	cancel()
 
 	reg := prometheus.NewRegistry()
@@ -214,9 +220,6 @@ func serve() error {
 		<-historyDone
 	}()
 
-	jobs := tasks.NewScheduler(taskStore, tasks.Options{Retention: cfg.Audit.Retention, Log: log})
-	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
-
 	var shares *sharing.Service
 	if proxy != nil && cat != nil {
 		sharingCtx, cancelSharing := context.WithTimeout(ctx, startupTimeout)
@@ -239,8 +242,21 @@ func serve() error {
 	}
 
 	// srv is set before it serves anyone; single sign-on tells it about
-	// role changes.
+	// role changes, and the long query alert asks it what runs.
 	var srv *pgwire.Server
+	notifier := notify.New(notify.Options{
+		Store:      notifyStore,
+		AllowHosts: cfg.Notifications.AllowHosts,
+		SMTP:       cfg.Notifications.SMTP,
+		Jobs:       taskStore,
+		Statements: func() []notify.Statement { return srv.RunningStatements() },
+		Retention:  cfg.Audit.Retention,
+		Metrics:    notify.NewMetrics(reg),
+		Log:        log,
+	})
+	eng.SetAlertHistory(notifyStore, pgwire.HistoryViewer)
+	jobs := tasks.NewScheduler(taskStore, tasks.Options{Retention: cfg.Audit.Retention, Ended: notifier.RunEnded, Log: log})
+	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
 	single, err := openSSO(cfg, users, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
 		return err
@@ -271,6 +287,7 @@ func serve() error {
 		Pool:                cfg.Pool,
 		Sharing:             shares,
 		Federation:          fed,
+		Notify:              notifier,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -291,7 +308,20 @@ func serve() error {
 		return err
 	}
 
-	// Tasks, pipes and materialized views start until shutdown begins.
+	// Built-in alerts go out until shutdown begins.
+	notifyCtx, stopNotify := context.WithCancel(ctx)
+	notifyDone := make(chan struct{})
+	go func() {
+		defer close(notifyDone)
+		notifier.Run(notifyCtx)
+	}()
+	defer func() {
+		stopNotify()
+		<-notifyDone
+	}()
+
+	// Tasks, pipes, materialized views and alerts start until shutdown
+	// begins.
 	// Runs under way then get the time running queries get; any left when
 	// the server returns are canceled before the engine closes.
 	jobsCtx, stopJobs := context.WithCancel(ctx)
@@ -311,7 +341,7 @@ func serve() error {
 	maintains := cat != nil && cfg.Maintenance.Enabled
 	var schedule maintenance.Schedule
 	if maintains {
-		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, reg, work, log)
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, reg, work, notifier.MaintenanceFailed, log)
 		if err != nil {
 			return err
 		}
@@ -575,12 +605,14 @@ func warehouseRoot(cfg config.Config) string {
 // startMaintenance compacts and expires tables in the background until ctx is
 // canceled. Replicas sharing a metadata database take turns, through lock,
 // which also records when passes ran; it is nil without one.
-func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, reg prometheus.Registerer, work *activity.Tracker, log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, reg prometheus.Registerer, work *activity.Tracker,
+	failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	opts := maintenance.Options{
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
 		Metrics:   maintenance.NewMetrics(reg),
 		Activity:  work,
+		Failed:    failed,
 	}
 	if cfg.MetadataDatabaseURL != "" {
 		if lock, err = maintenance.NewPostgresLock(ctx, cfg.MetadataDatabaseURL); err != nil {

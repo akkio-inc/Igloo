@@ -214,6 +214,19 @@ func (m *MemoryStore) Prune(_ context.Context, before time.Time) error {
 	return nil
 }
 
+func (m *MemoryStore) LastLoad(_ context.Context, pipe string) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var last time.Time
+	for _, r := range m.runs {
+		if r.Kind == KindPipe && strings.EqualFold(r.Name, pipe) && (r.Outcome == OutcomeSucceeded || r.Rows > 0) &&
+			r.Start.After(last) {
+			last = r.Start
+		}
+	}
+	return last, nil
+}
+
 func (m *MemoryStore) PreviousLoads(_ context.Context, table string, files []string) (map[string]Load, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

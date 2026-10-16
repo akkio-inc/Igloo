@@ -462,6 +462,7 @@ func (s *Server) copyInto(ctx context.Context, sess *session, user auth.User, c 
 				"they stay marked as loading and will not be loaded again: %w", err)
 		}
 	}
+	s.notifyLoadErrors(table, user.Name, pipe, finish)
 	return finish, target, loadErr
 }
 

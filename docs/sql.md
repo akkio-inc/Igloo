@@ -238,10 +238,12 @@ FROM igloo.login_history WHERE result = 'failure';
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,
 `auth_method` (`password`, `token`, `sso` or `access_token`, when known) and
 `token_name`, the [access token](sso.md#access-tokens) a login used.
-The runs of tasks, pipes and materialized views are in `igloo.task_history`,
-and the files `COPY INTO` loaded in `igloo.load_history`, with the same
-rule: admins see everything, other users their own (see
-[loading](loading.md#tasks)).
+The runs of tasks, pipes, materialized views and alerts are in
+`igloo.task_history`, the files `COPY INTO` loaded in
+`igloo.load_history`, and what alerts found and sent in
+`igloo.alert_history`, with the same rule: admins see everything, other
+users their own (see [loading](loading.md#tasks) and
+[alerts](alerts.md#alert-history)).
 
 History is kept for `IGLOO_AUDIT_RETENTION` (90 days by default). Rows arrive
 in the background, usually within a second or two of the statement ending.

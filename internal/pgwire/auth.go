@@ -302,7 +302,9 @@ func (s *Server) loginSucceededSession(user auth.User, addr net.Addr, sess *sess
 // for the login history, and says why without detail a client could use.
 func (s *Server) loginRejected(name string, addr net.Addr, cause error, reason string, how login) {
 	time.Sleep(failedLoginDelay)
-	s.limiter.failed(name, addr)
+	if user, address := s.limiter.failed(name, addr); user || address {
+		s.notifyLoginsBlocked(name, addr, user, address)
+	}
 	s.metrics.login(false)
 	s.recordLogin(name, addr, clientAttr(how.attrs), nil, reason, how)
 	attrs := append([]any{"user", name, "addr", addr}, how.attrs...)

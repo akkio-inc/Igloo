@@ -93,6 +93,46 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the modes that do not are explicit choices that draw a warning, and
   `require` checks the certificate's chain.
 
+### Alerts and notifications
+
+- Notification integrations (`CREATE [OR REPLACE] NOTIFICATION INTEGRATION
+  ... TYPE webhook | slack | teams | email`, `ALTER`, `DROP`,
+  `SHOW INTEGRATIONS`), created by admins, with `GRANT USAGE ON INTEGRATION`
+  to roles and users. Webhooks take `HEADERS` and a signing `SECRET`
+  (HMAC-SHA256 of the timestamp and body); Slack and Microsoft Teams
+  incoming webhooks get their own payloads; email goes through
+  `IGLOO_SMTP_HOST` to `IGLOO_SMTP_ALLOWED_DOMAINS` only. URLs, headers and
+  secrets are stored encrypted, never shown, and scrubbed from errors,
+  logs and the query history.
+- Alerts, with Snowflake's syntax: `CREATE [OR REPLACE] ALERT ... SCHEDULE
+  ... IF (EXISTS (query)) THEN NOTIFY integration [MESSAGE '...'] [WITH
+  RESULT]`, `ALTER ALERT ... RESUME | SUSPEND | SET SCHEDULE`,
+  `EXECUTE ALERT`, `DROP ALERT`, `SHOW ALERTS`. They are scheduled work like
+  tasks: run as their owner with the owner's grants and policies, skipped
+  while the owner is disabled, and the scale-to-zero gateway starts Igloo
+  for them. Messages take `{{column}}` values from the first row; results
+  are capped at 20 rows and 16 KiB, and values from data are escaped so
+  they cannot mention people or make links in Slack or Teams.
+- `igloo.alert_history`: every alert run, built-in alert and message, with
+  its state (`condition_false`, `triggered`, `condition_failed`,
+  `action_failed`, `skipped`), integration, attempts and error. Admins see
+  everything, others their own.
+- `CALL SYSTEM$SEND_NOTIFICATION('integration', 'message')`, from tasks or
+  any session, with `USAGE` on the integration.
+- Built-in operational alerts admins switch on per integration
+  (`OPERATIONAL_ALERTS`): failed scheduled runs, `COPY INTO` and pipe load
+  errors, pipes with no new files for N hours, statements running longer
+  than N minutes, failed-login bursts from the login limiter, and table
+  maintenance failures, each sent at most once per problem in a while.
+- Notifications reach only public addresses (no loopback, private,
+  link-local or metadata, multicast or reserved addresses, in IPv4 or
+  IPv6), checked again at every connection against DNS rebinding, over
+  TLS, without redirects or proxies, unless `IGLOO_NOTIFICATION_ALLOW_HOSTS`
+  names the host. Sends are rate-limited per integration, time out, and are
+  retried with backoff; `igloo_notifications_total` counts them.
+- The web console's Tasks page lists alerts, with their runs from
+  `igloo.alert_history`.
+
 ### Security and governance
 
 - Users with SCRAM-SHA-256 passwords, managed in SQL (`CREATE USER`,

@@ -360,18 +360,21 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_cache_limit_bytes` | | Size the read cache may grow to, given the disk's free space; 0 while it is off or paused |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
+| `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
 `user changed`, `grants changed`, `role settings changed`, `job changed`
-(tasks, pipes and materialized views created, changed or dropped),
-`statement denied`, `statement canceled` (from the web console's compute
-page), and refused connections. Failed scheduled runs log `scheduled run
-failed` (component `tasks`). Sign-ins through the web console log
-`client=console`, and through Arrow Flight SQL `client="flight sql"`.
-Query text and DuckDB error details, which can quote the query, are logged
-only at debug level; user-management statements, which carry passwords,
-are never logged.
+(tasks, pipes, materialized views and alerts created, changed or dropped),
+`notification integration changed`, `statement denied`, `statement
+canceled` (from the web console's compute page), and refused connections.
+Failed scheduled runs log `scheduled run failed` (component `tasks`), and
+notifications that could not be sent `notification failed` (component
+`notifications`), with the integration's host, never its URL. Sign-ins
+through the web console log `client=console`, and through Arrow Flight SQL
+`client="flight sql"`. Query text and DuckDB error details, which can quote
+the query, are logged only at debug level; user-management statements,
+which carry passwords, are never logged.
 The [query history](#query-and-login-history) keeps statement text, with
 passwords and secrets removed.
 
@@ -382,8 +385,9 @@ Two things hold state:
 1. **The PostgreSQL database** (`IGLOO_METADATA_DATABASE_URL` and the
    catalog's database, normally the same one). It holds the catalog, which
    maps table names to their current metadata in object storage, and Igloo's
-   users, roles, grants and history, its tasks, pipes and materialized
-   views, and the load history that keeps files from loading twice. Back it up like any production database: managed-service backups
+   users, roles, grants and history, its tasks, pipes, materialized views
+   and alerts, its notification integrations, and the load history that
+   keeps files from loading twice. Back it up like any production database: managed-service backups
    with point-in-time recovery, or regular `pg_dump`. Losing it loses track of
    every table, even though the data files are still in object storage.
 2. **Object storage.** Table data and Iceberg metadata files. Turn on bucket
@@ -451,8 +455,10 @@ Set `IGLOO_MAINTENANCE=false` only if another tool maintains the tables.
 
 ## Scheduled work
 
-Tasks, pipes and materialized views ([loading and scheduling](loading.md))
-run inside Igloo; nothing else needs scheduling. How they run:
+Tasks, pipes, materialized views ([loading and scheduling](loading.md)) and
+[alerts](alerts.md) run inside Igloo; nothing else needs scheduling. To
+hear of failed runs and loads without watching for them, switch on the
+[built-in alerts](alerts.md#built-in-operational-alerts). How they run:
 
 - Every replica runs a scheduler, which looks for due work every few
   seconds. Each due run is claimed by one replica through the metadata
@@ -463,8 +469,8 @@ run inside Igloo; nothing else needs scheduling. How they run:
 - A replica runs at most four scheduled runs at once; further due work
   waits for a free slot or another replica. Each run is a session of its
   owner, which counts against `IGLOO_MAX_CONNECTIONS` while it lasts and
-  shows on the console's compute page as `task <name>`, `pipe <name>` or
-  `materialized view <name>`.
+  shows on the console's compute page as `task <name>`, `pipe <name>`,
+  `materialized view <name>` or `alert <name>`.
 - Runs and loads count as running work on `/activity`, so a scale-to-zero
   gateway does not stop Igloo during one. On shutdown, Igloo starts no new
   runs; those under way get the 30 seconds running queries get, then are

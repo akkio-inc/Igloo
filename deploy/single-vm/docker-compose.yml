@@ -70,6 +70,15 @@ services:
       IGLOO_POOL: ${IGLOO_POOL:-default}
       IGLOO_PRICE_PER_HOUR: ${IGLOO_PRICE_PER_HOUR:-0}
       IGLOO_SHARING_URL: ${IGLOO_SHARING_URL:-}
+      # Alerts and notifications (docs/alerts.md): private hosts they may
+      # reach, and the mail server for email alerts.
+      IGLOO_NOTIFICATION_ALLOW_HOSTS: ${IGLOO_NOTIFICATION_ALLOW_HOSTS:-}
+      IGLOO_SMTP_HOST: ${IGLOO_SMTP_HOST:-}
+      IGLOO_SMTP_PORT: ${IGLOO_SMTP_PORT:-}
+      IGLOO_SMTP_FROM: ${IGLOO_SMTP_FROM:-}
+      IGLOO_SMTP_ALLOWED_DOMAINS: ${IGLOO_SMTP_ALLOWED_DOMAINS:-}
+      IGLOO_SMTP_USERNAME: ${IGLOO_SMTP_USERNAME:-}
+      IGLOO_SMTP_PASSWORD: ${IGLOO_SMTP_PASSWORD:-}
     ports:
       # Loopback only by default. Set IGLOO_BIND=0.0.0.0 to accept remote
       # clients, and turn on TLS first (see .env).

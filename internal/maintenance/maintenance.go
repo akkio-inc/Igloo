@@ -78,6 +78,10 @@ type Options struct {
 	// across restarts and replicas. Without it, a replica that keeps
 	// restarting, as with scale to zero, may rarely maintain tables.
 	Schedule Schedule
+	// Failed, if set, is told about each table whose maintenance failed,
+	// as namespace.table, or "" when the tables could not be listed. It
+	// must not block.
+	Failed func(table string, err error)
 }
 
 // Schedule records when maintenance jobs last ran.
@@ -187,6 +191,7 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 	if err != nil {
 		m.log.Warn("could not list tables", "err", err)
 		m.opts.Metrics.pass(false)
+		m.failed("", err)
 		return
 	}
 	failed := 0
@@ -197,11 +202,19 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 		if err := m.maintain(ctx, ident); err != nil {
 			failed++
 			m.log.Warn("table maintenance failed", "table", name(ident), "err", err)
+			m.failed(name(ident), err)
 		}
 	}
 	m.opts.Metrics.pass(failed == 0)
 	m.record(ctx, passJob)
 	m.log.Debug("maintenance pass finished", "tables", len(tables), "failed", failed, "took", time.Since(start))
+}
+
+// failed tells Options.Failed about a failure, unless Igloo is stopping.
+func (m *Maintainer) failed(table string, err error) {
+	if m.opts.Failed != nil && !errors.Is(err, context.Canceled) {
+		m.opts.Failed(table, err)
+	}
 }
 
 // record notes in the Schedule that job ran just now.

@@ -3,6 +3,8 @@ package tasks
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,6 +132,13 @@ func testStore(t *testing.T, s Store) {
 	}
 	if jobs, _ := s.Jobs(ctx, KindTask); len(jobs) != 1 || jobs[0].LastRun == nil || jobs[0].LastRun.Outcome != OutcomeFailed {
 		t.Errorf("tasks: %+v", jobs)
+	}
+	// The pipe's run loaded files; the task is no pipe.
+	if at, err := s.LastLoad(ctx, "NIGHTLY"); err != nil || !at.Equal(runs[1].Start) {
+		t.Errorf("last load: %v %v", at, err)
+	}
+	if at, err := s.LastLoad(ctx, "other"); err != nil || !at.IsZero() {
+		t.Errorf("last load of a pipe without runs: %v %v", at, err)
 	}
 
 	// Loads.
@@ -424,6 +433,46 @@ func TestIdlePipeChecksAreNotRecorded(t *testing.T) {
 	}
 	if runs, _ := store.Runs(ctx, audit.Viewer{All: true}, audit.Page{}); len(runs) != 1 || runs[0].Trigger != TriggerManual {
 		t.Errorf("recorded: %+v", runs)
+	}
+}
+
+// runnerFunc is a Runner.
+type runnerFunc func(context.Context, Job) (int64, error)
+
+func (f runnerFunc) RunJob(ctx context.Context, j Job) (int64, error) { return f(ctx, j) }
+
+// TestSkippedRuns checks that a run the Runner skips is recorded as
+// skipped, that the Runner sees its run, and that Ended hears of it.
+func TestSkippedRuns(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	var (
+		mu    sync.Mutex
+		ended []Run
+	)
+	s := NewScheduler(store, Options{Ended: func(_ Job, r Run) {
+		mu.Lock()
+		defer mu.Unlock()
+		ended = append(ended, r)
+	}})
+	j := Job{Kind: KindAlert, Name: "a", Owner: "ana", Statement: "IF ...", Schedule: "1 hour", State: StateStarted}
+	r := runnerFunc(func(ctx context.Context, _ Job) (int64, error) {
+		if run, ok := RunOf(ctx); !ok || run.Trigger != TriggerManual || run.ID == "" {
+			return -1, errors.New("the run is not in the context")
+		}
+		return -1, fmt.Errorf("%w: the owner ana is disabled", ErrSkipped)
+	})
+	run, err := s.RunNow(ctx, r, j)
+	if !errors.Is(err, ErrSkipped) || run.Outcome != OutcomeSkipped || !strings.Contains(run.Error, "disabled") {
+		t.Fatalf("run %+v, %v", run, err)
+	}
+	if runs, _ := store.Runs(ctx, audit.Viewer{All: true}, audit.Page{}); len(runs) != 1 || runs[0].Outcome != OutcomeSkipped {
+		t.Errorf("recorded: %+v", runs)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ended) != 1 || ended[0].Outcome != OutcomeSkipped || ended[0].ID != run.ID {
+		t.Errorf("ended: %+v", ended)
 	}
 }
 

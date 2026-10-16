@@ -950,7 +950,7 @@ var allowedFunctions = map[string]bool{
 	"pragma_platform": true, "pragma_show": true, "pragma_table_info": true, "pragma_user_agent": true,
 	"pragma_version": true,
 	"igloo_comments": true, "igloo_query_history": true, "igloo_login_history": true,
-	"igloo_task_history": true, "igloo_load_history": true, "igloo_usage": true,
+	"igloo_task_history": true, "igloo_load_history": true, "igloo_usage": true, "igloo_alert_history": true,
 	"igloo_policy_references": true, "igloo_tag_references": true,
 }
 

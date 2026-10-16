@@ -58,6 +58,8 @@ type Engine struct {
 	history atomic.Pointer[historyConfig]
 	// jobHistory supplies the job history functions; see SetJobHistory.
 	jobHistory atomic.Pointer[jobHistoryConfig]
+	// alertHistory supplies igloo_alert_history(); see SetAlertHistory.
+	alertHistory atomic.Pointer[alertHistoryConfig]
 	// locations are where COPY INTO may load from; see Locations.
 	locations []string
 	// policies supplies the policy reference functions; see SetPolicies.
@@ -212,6 +214,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	}
 	if err := e.registerJobHistory(ctx); err != nil {
 		return fmt.Errorf("register task and load history: %w", err)
+	}
+	if err := e.registerAlertHistory(ctx); err != nil {
+		return fmt.Errorf("register alert history: %w", err)
 	}
 	e.locations = loadLocations(cfg)
 	if err := e.registerPolicies(ctx); err != nil {
