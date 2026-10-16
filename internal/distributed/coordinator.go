@@ -311,6 +311,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		return nil, err
 	}
 
+	snapshots := time.Since(start)
 	qid := filepath.Base(ex.dir)
 	results := make([]*jobResult, len(plan.Jobs))
 	used := map[string]bool{}
@@ -371,6 +372,8 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 	ex.Workers = len(used)
 	co.pool.touch()
+	co.log.Debug("ran a statement's parts", "query", qid, "jobs", len(plan.Jobs), "workers", ex.Workers,
+		"snapshots_seconds", snapshots.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true
 	return ex, nil
