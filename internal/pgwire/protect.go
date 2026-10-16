@@ -58,14 +58,21 @@ type governance struct {
 
 	// allowed are the locations users other than admins may read files
 	// from while policies exist, and warehouse the warehouse's, which they
-	// may not.
+	// may not; nor external, where external tables' files are (Delta
+	// Sharing's proxy), which they read through the external tables. The
+	// warehouse holds the copies of shared files with deletes applied, in
+	// its .igloo/sharing/ directory.
 	allowed   []string
 	warehouse string
+	external  string
 }
 
 func newGovernance(ctx context.Context, store policy.Store, refresh time.Duration, log *slog.Logger,
-	connect func(context.Context) (*duckdb.Conn, error), allowed []string, warehouse string) (*governance, error) {
+	connect func(context.Context) (*duckdb.Conn, error), allowed []string, warehouse, external string) (*governance, error) {
 	g := &governance{store: store, refresh: refresh, log: log, templates: map[string]*bodyTemplate{}}
+	if external != "" {
+		g.external = strings.ToLower(withSlash(external))
+	}
 	g.probe.connect = connect
 	for _, a := range allowed {
 		if a != "" {
@@ -180,6 +187,41 @@ func (s *Server) Protected(ctx context.Context, schema, table string) bool {
 	return s.gov.snapshot(ctx).Rules(schema, table) != nil
 }
 
+// ProtectedBy names, sorted, the policies that protect the catalog table
+// schema.table: its row access policy, and the masking policies of its
+// columns, set on them or through their tags. It is empty exactly when
+// Protected reports false. Delta Sharing refuses to share or serve such a
+// table (package sharing).
+func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string {
+	r := s.gov.snapshot(ctx).Rules(schema, table)
+	if r == nil {
+		return nil
+	}
+	var names []string
+	if r.FilterPolicy != nil {
+		names = append(names, r.FilterPolicy.Name)
+	}
+	for _, c := range r.Columns {
+		switch {
+		case c.Mask != nil:
+			names = append(names, c.Mask.Name)
+		default:
+			for _, m := range c.TagMasks {
+				names = append(names, m.Policy.Name)
+			}
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// externalFiles reports whether reading prefix, the start of a path
+// before any wildcard, could read the external tables' files.
+func (g *governance) externalFiles(prefix string) bool {
+	p := strings.ToLower(prefix)
+	return g.external != "" && (strings.HasPrefix(p, g.external) || strings.HasPrefix(g.external, p))
+}
+
 // --- what statements may name --------------------------------------------------
 
 // sensitivity is what a session's statements may name that policies
@@ -283,6 +325,9 @@ func (s *Server) checkPath(path string) error {
 	if g.warehouse != "" && (strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix)) {
 		return denied("reading %q: the warehouse's files are read through its tables, which policies apply to", path)
 	}
+	if g.externalFiles(prefix) {
+		return denied("reading %q: external tables' files are read through the external tables", path)
+	}
 	return nil
 }
 
@@ -325,6 +370,12 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 		name, _ := dest[3].(string)
 		text, _ := dest[4].(string)
 		lower := strings.ToLower(name)
+		if kind == "view" && s.isExternal(db, schema, name) {
+			// Igloo's own view over files only its proxy serves, of a
+			// table that policies cannot be attached to: like a table
+			// without policies.
+			continue
+		}
 		switch kind {
 		case "table function":
 			if !safeTableFunctions[lower] {
@@ -885,12 +936,18 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 // string: DuckDB opens the files a function reads as soon as it binds the
 // statement, before any check that needs the bound statement.
 func (s *Server) checkWarehouseFiles(ctx context.Context, user auth.User, query string) error {
-	if user.Role == auth.RoleAdmin || s.gov.warehouse == "" || s.gov.snapshot(ctx).Empty() {
+	g := s.gov
+	if user.Role == auth.RoleAdmin || g.warehouse == "" && g.external == "" || g.snapshot(ctx).Empty() {
 		return nil
 	}
 	for _, lit := range literalsOf(query) {
-		if strings.HasPrefix(lit, s.gov.warehouse) || strings.HasPrefix(s.gov.warehouse, lit) && strings.ContainsAny(lit, "*?[{") {
+		wild := strings.ContainsAny(lit, "*?[{")
+		if g.warehouse != "" && (strings.HasPrefix(lit, g.warehouse) || strings.HasPrefix(g.warehouse, lit) && wild) {
 			return denied("reading %q: the warehouse's files are read through its tables, which policies apply to", lit)
+		}
+		l := strings.ToLower(lit)
+		if g.external != "" && (strings.HasPrefix(l, g.external) || strings.HasPrefix(g.external, l) && wild) {
+			return denied("reading %q: external tables' files are read through the external tables", lit)
 		}
 	}
 	return nil
@@ -912,7 +969,20 @@ func (s *Server) checkLoadLocation(ctx context.Context, user auth.User, loc stri
 	if strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix) {
 		return denied("COPY INTO from %q: while tables have policies, the warehouse's files are read through its tables; load from a location outside it", loc)
 	}
+	if g.externalFiles(prefix) {
+		return denied("COPY INTO from %q: external tables' files are read through the external tables", loc)
+	}
 	return nil
+}
+
+// isExternal reports whether the view db.schema.name is an external
+// table's (Delta Sharing).
+func (s *Server) isExternal(db, schema, name string) bool {
+	if s.external == nil || !strings.EqualFold(db, s.engine.LocalDatabase()) {
+		return false
+	}
+	_, ok := s.external.IsExternal(schema, name)
+	return ok
 }
 
 // protectBeforePrepare refuses a query DuckDB runs as several statements,

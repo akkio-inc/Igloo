@@ -124,6 +124,27 @@ type Options struct {
 	// Sharing carries out Delta Sharing statements and keeps external
 	// tables. Nil when it is not set up.
 	Sharing *sharing.Service
+
+	// external and externalFiles stand in for Sharing's external tables
+	// and the prefix of their files, in tests.
+	external      externalCatalog
+	externalFiles string
+}
+
+// externalCatalog is what statements need of Delta Sharing's external
+// tables, views in the local database over files that only Igloo's proxy
+// serves (*sharing.Consumer implements it).
+type externalCatalog interface {
+	// IsExternal reports whether schema.name is an external table, and
+	// how many Parquet scans its view makes.
+	IsExternal(schema, name string) (scans int, ok bool)
+	// TableNames lists the external tables in schema.
+	TableNames(schema string) []string
+	// Prepare points a statement's references to external tables at their
+	// views, and makes sure those list the tables' current files.
+	Prepare(ctx context.Context, query string) (string, error)
+	// Sync loads external tables created on other replicas.
+	Sync(ctx context.Context) (bool, error)
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -161,7 +182,10 @@ type Server struct {
 	settings auth.SettingStore
 	workload *workload.Controller
 	pool     string
+	// shares carries out Delta Sharing statements, and external are its
+	// external tables.
 	shares   *sharing.Service
+	external externalCatalog
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -211,6 +235,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		workload:    opts.Workload,
 		pool:        opts.Pool,
 		shares:      opts.Sharing,
+		external:    opts.external,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -253,8 +278,12 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	if policies == nil {
 		policies = policy.NewMemoryStore()
 	}
+	externalFiles := opts.externalFiles
+	if opts.Sharing != nil {
+		s.external, externalFiles = opts.Sharing.Consumer(), opts.Sharing.ProxyPrefix()
+	}
 	if s.gov, err = newGovernance(context.Background(), policies, s.roleRefresh, log, engine.Connect,
-		opts.AllowedLocations, opts.Warehouse); err != nil {
+		opts.AllowedLocations, opts.Warehouse, externalFiles); err != nil {
 		return nil, err
 	}
 	if e, ok := engine.(interface {
@@ -856,10 +885,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 			s.log.Warn("could not load table schemas", "err", err)
 		}
 	}
-	if s.shares != nil {
+	if s.external != nil {
 		// External tables the statement names must list their current
 		// files before DuckDB binds their views.
-		external, err := s.shares.Consumer().Prepare(ctx, query)
+		external, err := s.external.Prepare(ctx, query)
 		if err != nil {
 			return fail(pgerror.WithCode(err, codeExternal))
 		}
@@ -873,10 +902,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}
 	}
-	if err != nil && s.shares != nil && missingRelation.MatchString(err.Error()) {
+	if err != nil && s.external != nil && missingRelation.MatchString(err.Error()) {
 		// Or an external table another replica just created.
-		if changed, _ := s.shares.Consumer().Sync(ctx); changed {
-			external, perr := s.shares.Consumer().Prepare(ctx, query)
+		if changed, _ := s.external.Sync(ctx); changed {
+			external, perr := s.external.Prepare(ctx, query)
 			if perr != nil {
 				return fail(pgerror.WithCode(perr, codeExternal))
 			}

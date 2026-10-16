@@ -252,9 +252,10 @@ func copyStats(df iceberg.DataFile, sch *iceberg.Schema, count int64) string {
 }
 
 // collect deletes the copies that no current version of a shared table
-// needs and that are older than materializedRetention. needed holds the
-// paths of the copies the current versions use.
-func (m *materializer) collect(needed map[string]bool, now time.Time) (int, error) {
+// needs and that are older than materializedRetention, and every copy in
+// the purge directories, those of tables that now have policies. needed
+// holds the paths of the copies the current versions use.
+func (m *materializer) collect(needed map[string]bool, purge []string, now time.Time) (int, error) {
 	walker, ok := m.files.(iceio.ListableIO)
 	if !ok {
 		return 0, nil
@@ -268,7 +269,15 @@ func (m *materializer) collect(needed map[string]bool, now time.Time) (int, erro
 			}
 			return err
 		}
-		if d.IsDir() || !strings.HasSuffix(path, ".parquet") || needed[path] {
+		if d.IsDir() || !strings.HasSuffix(path, ".parquet") {
+			return nil
+		}
+		if slices.ContainsFunc(purge, func(dir string) bool { return strings.HasPrefix(path, dir) }) {
+			// A table with policies: its copies go now.
+			stale = append(stale, path)
+			return nil
+		}
+		if needed[path] {
 			return nil
 		}
 		info, err := d.Info()

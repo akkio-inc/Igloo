@@ -695,6 +695,11 @@ func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User,
 // columns.
 func (s *Server) policyTable(ctx context.Context, sess *session, name []string, exists bool) (string, string, []columnType, error) {
 	catalogName := s.catalogName()
+	if schema, table, ok := s.externalNamed(ctx, sess, name); ok && exists {
+		return "", "", nil, pgerror.WithCode(fmt.Errorf("%s.%s is an external table (Delta Sharing): policies and tags attach only to the %s catalog's tables, "+
+			"which Igloo reads through them. To protect its rows, copy what users may read into a table, such as CREATE TABLE ... AS SELECT ... FROM %s.%s, "+
+			"and attach policies to that", schema, table, catalogName, schema, table), codes.WrongObjectType)
+	}
 	if len(name) == 3 && !strings.EqualFold(name[0], catalogName) {
 		return "", "", nil, pgerror.WithCode(fmt.Errorf("policies apply to the %s catalog only, not %q", catalogName, name[0]), codes.FeatureNotSupported)
 	}

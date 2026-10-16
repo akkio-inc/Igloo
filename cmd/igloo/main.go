@@ -266,6 +266,11 @@ func serve() error {
 	if srv, err = pgwire.New(eng, opts, log); err != nil {
 		return err
 	}
+	if shares != nil {
+		// Tables with masking or row access policies are neither shared
+		// nor served; until now the sharing endpoint served none.
+		shares.SetProtection(srv.ProtectedBy)
+	}
 	provisioning, err := openSCIM(users, single, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
 		return err

@@ -199,8 +199,8 @@ func (r *resolver) load(names []string) error {
 		o.sql, _ = dest[4].(string)
 		o.internal, _ = dest[5].(bool)
 		o.catalogView = o.view && r.s.ddl != nil && strings.EqualFold(o.db, r.local) && r.s.ddl.IsView(o.schema, o.name)
-		if o.view && r.s.shares != nil && strings.EqualFold(o.db, r.local) {
-			o.externalScans, o.external = r.s.shares.Consumer().IsExternal(o.schema, o.name)
+		if o.view && r.s.external != nil && strings.EqualFold(o.db, r.local) {
+			o.externalScans, o.external = r.s.external.IsExternal(o.schema, o.name)
 		}
 		k := strings.ToLower(o.name)
 		r.objects[k] = append(r.objects[k], o)
@@ -414,8 +414,13 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 	case o.external:
 		// Reading an external table is reading the table, whatever its
 		// view does: Igloo wrote the view, over files only it can reach.
-		// Its Parquet scans are counted against the plan's (planScans).
+		// Its Parquet scans are counted against the plan's (planScans);
+		// the lenient count is of catalog scans (see verify in
+		// protect.go), of which it makes none.
 		rs = readSet{scans: o.externalScans, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
+		if r.lenient {
+			rs.scans = 0
+		}
 	case o.view:
 		if !r.ownDatabase(o.db) {
 			return rs, denied("reading views of database %s needs the reader role", o.db)

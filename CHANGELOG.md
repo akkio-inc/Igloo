@@ -170,6 +170,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   SHARE provider.share.schema.table` makes a shared table queryable, and
   grantable, like any table. Queries read the partner's current version
   through a proxy that is the only address the sandbox gains.
+- Delta Sharing and policies: tables with masking or row access policies
+  cannot be shared, and a shared table that gains one is refused to
+  recipients, downloads of files listed before included, with each refusal
+  and its policies in the query history. Policies and tags do not attach
+  to external tables, and while tables have policies only admins read
+  external tables' files or the copies of shared files directly.
 
 ### Web console
 

@@ -955,7 +955,7 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 			switch {
 			case fn == "iceberg_scan":
 				scans.iceberg++
-			case fn == "read_parquet" && s.shares != nil:
+			case fn == "read_parquet" && s.external != nil:
 				scans.external++
 			case fn == "seq_scan":
 				extra, _ := n["extra_info"].(map[string]any)

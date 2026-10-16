@@ -220,7 +220,10 @@ While any table has policies:
   (`read_parquet`, `parquet_metadata`, `glob`, `COPY ... FROM`, `COPY INTO`
   and pipes from the warehouse or a location that holds it, and the like;
   files elsewhere in `IGLOO_ALLOWED_LOCATIONS` remain readable, named as
-  string literals), table functions that read tables by name or show their
+  string literals), including the copies of shared files in its
+  `.igloo/sharing/` directory, and external tables' files at Igloo's
+  [Delta Sharing](sharing.md) proxy, which are read through the external
+  tables, table functions that read tables by name or show their
   statistics (`duckdb_table_sample`, `pragma_storage_info`,
   `iceberg_metadata`, `iceberg_snapshots` of a protected table), and
   `PRAGMA` and `CALL` of anything but the catalog listings.
@@ -246,8 +249,12 @@ of users a policy exempts run as written, after the same checks.
 - **External engines.** Spark, Trino and others that read the Iceberg
   tables directly, through the catalog database or object storage, see raw
   data: they cannot apply policies. Do not give them access to tables with
-  policies. Igloo serves no tables to other engines itself; an endpoint that
-  does must refuse tables with policies.
+  policies. [Delta Sharing](sharing.md#tables-with-masking-or-row-access-policies),
+  Igloo's one way of serving tables to other engines, refuses tables with
+  policies: they cannot be added to a share, and a shared table that gains
+  one is no longer served.
+- **External tables** (Delta Sharing) take no policies or tags; copy what
+  users may read into a table to protect it.
 - **Existence of hidden rows.** A condition that fails on `NULL` can show,
   by failing, that a table has rows the user cannot see, though nothing
   about them.

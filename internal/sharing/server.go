@@ -66,6 +66,10 @@ type ServerOptions struct {
 	Metrics *Metrics
 	// Tables are the catalog's tables.
 	Tables TableSource
+	// Protection names the policies of a catalog table. Tables with
+	// policies are never served; until a Protection is set (here or with
+	// SetProtection), no table is.
+	Protection Protection
 }
 
 // Server serves the Delta Sharing protocol to recipients.
@@ -81,6 +85,8 @@ type Server struct {
 	log       *slog.Logger
 	metrics   *Metrics
 	mux       *http.ServeMux
+	// protection says which tables have policies (see protect.go).
+	protection protection
 
 	// tokensMu guards the caches of bearer tokens and of recipients'
 	// access to tables.
@@ -114,6 +120,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		log: opts.Log.With("component", "sharing"), metrics: opts.Metrics,
 		tokens: map[string]cachedToken{}, access: map[string]cachedAccess{}, now: time.Now,
 	}
+	s.protection.set(opts.Protection)
 	s.routes()
 	return s, nil
 }
@@ -181,6 +188,8 @@ type call struct {
 	// rows is how many files a query returned, for the history.
 	rows int64
 	text string
+	// policies name the policies that made Igloo refuse the table.
+	policies []string
 }
 
 // apiError is an error response in the protocol's format.
@@ -337,6 +346,7 @@ func (s *Server) record(r *http.Request, c *call, start time.Time, status int) {
 	if c.table != "" {
 		q.TablesRead = []string{c.table}
 	}
+	q.Policies = c.policies
 	switch {
 	case status == http.StatusForbidden || status == http.StatusNotFound:
 		q.Outcome, q.SQLState = audit.OutcomeDenied, "42501"
@@ -541,6 +551,9 @@ func (s *Server) sharedTable(r *http.Request, c *call) (SharedTable, error) {
 	for _, t := range tables {
 		if strings.EqualFold(t.Schema, schema) && strings.EqualFold(t.Name, name) {
 			c.table = s.catalog + "." + t.SourceSchema + "." + t.SourceTable
+			if err := s.checkTable(r.Context(), c, t); err != nil {
+				return SharedTable{}, err
+			}
 			return t, nil
 		}
 	}

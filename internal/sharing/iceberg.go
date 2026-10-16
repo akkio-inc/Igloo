@@ -198,9 +198,11 @@ func hasDeletes(t table.FileScanTask) bool {
 
 // collect deletes the copies of data files that no current version of the
 // given tables needs (see materializer.collect).
-func (s *icebergSource) collect(ctx context.Context, tables []SharedTable) (int, error) {
+func (s *icebergSource) collect(ctx context.Context, tables []SharedTable, protected func(context.Context, SharedTable) bool) (int, error) {
 	needed := map[string]bool{}
 	seen := map[string]bool{}
+	// purge are the copy directories of tables that now have policies.
+	var purge []string
 	for _, t := range tables {
 		key := strings.ToLower(t.SourceSchema + "." + t.SourceTable)
 		if seen[key] {
@@ -214,6 +216,10 @@ func (s *icebergSource) collect(ctx context.Context, tables []SharedTable) (int,
 		if err != nil {
 			// Unsure what it needs: keep everything.
 			return 0, err
+		}
+		if protected != nil && protected(ctx, t) {
+			purge = append(purge, s.copies.root+tbl.Metadata().TableUUID().String()+"/")
+			continue
 		}
 		snap := tbl.CurrentSnapshot()
 		if snap == nil {
@@ -229,7 +235,7 @@ func (s *icebergSource) collect(ctx context.Context, tables []SharedTable) (int,
 			}
 		}
 	}
-	return s.copies.collect(needed, time.Now())
+	return s.copies.collect(needed, purge, time.Now())
 }
 
 // withFileSizes fills in the table's size from its files when the snapshot's

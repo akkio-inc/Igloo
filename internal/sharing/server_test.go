@@ -101,6 +101,9 @@ type fixture struct {
 	data   []byte
 	// token is the recipient acme's bearer token.
 	token string
+	// policies are the policies of catalog tables, by schema.table, as the
+	// fixture's Protection reports them.
+	policies map[string][]string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -128,14 +131,18 @@ func newFixture(t *testing.T) *fixture {
 	history := audit.New(audit.NewMemoryStore(100, 100), audit.Options{}, slog.New(slog.DiscardHandler))
 	key := make([]byte, 32)
 	_, _ = rand.Read(key)
+	policies := map[string][]string{}
 	server, err := NewServer(ServerOptions{
 		Store: store, Key: key, Files: iceio.LocalFS{}, Warehouse: warehouse, Catalog: "lake", Audit: history,
 		Tables: TableSource{source: src},
+		Protection: func(_ context.Context, schema, table string) []string {
+			return policies[strings.ToLower(schema+"."+table)]
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fixture{t: t, store: store, server: server, http: httptest.NewServer(server), src: src, audit: history, data: data}
+	f := &fixture{t: t, store: store, server: server, http: httptest.NewServer(server), src: src, audit: history, data: data, policies: policies}
 	t.Cleanup(f.http.Close)
 
 	must := func(err error) {

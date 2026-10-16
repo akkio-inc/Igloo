@@ -448,7 +448,7 @@ func sharingError(err error, what string) error {
 		return pgerror.WithCode(msg, codes.DuplicateObject)
 	case errors.Is(err, sharing.ErrInUse):
 		return pgerror.WithCode(msg, codes.DependentObjectsStillExist)
-	case sharing.IsNotShareable(err):
+	case sharing.IsNotShareable(err), sharing.IsProtected(err):
 		return pgerror.WithCode(msg, codes.FeatureNotSupported)
 	case sharing.IsProviderError(err):
 		return pgerror.WithCode(msg, codeExternal)
@@ -656,7 +656,7 @@ func (s *Server) shareSource(ctx context.Context, sess *session, c *shareCommand
 	if err != nil {
 		return sharing.SharedTable{}, err
 	}
-	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM duckdb_tables()
+	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM system.main.duckdb_tables()
 		WHERE database_name = $1 AND schema_name = $2 AND table_name = $3`, s.catalogName(), o.Schema, o.Table)
 	if err != nil {
 		return sharing.SharedTable{}, err
@@ -736,6 +736,36 @@ func lifetimeText(d time.Duration) string {
 	return d.String()
 }
 
+// externalNamed returns the external table name means, if it is one:
+// written as the catalog's tables are, schema.table or table, or with the
+// catalog's name or the local database's in front.
+func (s *Server) externalNamed(ctx context.Context, sess *session, name []string) (schema, table string, ok bool) {
+	if s.external == nil || len(name) == 0 || len(name) > 3 {
+		return "", "", false
+	}
+	switch len(name) {
+	case 3:
+		if !strings.EqualFold(name[0], s.catalogName()) && !strings.EqualFold(name[0], s.engine.LocalDatabase()) {
+			return "", "", false
+		}
+		schema = name[1]
+	case 2:
+		schema = name[0]
+	default:
+		db, current, err := currentSchema(ctx, sess.conn)
+		if err != nil {
+			return "", "", false
+		}
+		schema = current
+		if !strings.EqualFold(db, s.catalogName()) {
+			schema = "public"
+		}
+	}
+	table = name[len(name)-1]
+	_, ok = s.external.IsExternal(schema, table)
+	return schema, table, ok
+}
+
 // externalTarget resolves the name of an external table: the schema of the
 // Iceberg catalog it lives in, which must exist, and its name there.
 func (s *Server) externalTarget(ctx context.Context, sess *session, name []string) (schema, table string, err error) {
@@ -778,6 +808,12 @@ func (s *Server) createExternalTable(ctx context.Context, sess *session, me auth
 	}
 	if _, ok := s.shares.Consumer().IsExternal(schema, name); ok && c.ifNotExists {
 		return w.Complete(c.tag)
+	}
+	if s.gov.snapshot(ctx).Tagged(schema, name) != nil {
+		// Policies stay with a table's name after it is dropped, and could
+		// not apply to an external table there.
+		return pgerror.WithCode(fmt.Errorf("%s.%s has policies or tags, left by a table of that name; policies cannot apply to an external table, so unset them first",
+			schema, name), codes.ObjectNotInPrerequisiteState)
 	}
 	relations, err := s.catalogRelations(ctx, sess, schema)
 	if err != nil {

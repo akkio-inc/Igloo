@@ -17,19 +17,23 @@ import (
 // and with every kind of storage credential, keeps bucket names and paths
 // private (the URL's last segment is encrypted), and lets Igloo end access
 // at once. Each URL names one file, for one recipient token, for an hour,
-// and every request for it checks that the token is still valid and that
-// the table is still in a share granted to the recipient.
+// and every request for it checks that the token is still valid, that the
+// table is still in a share granted to the recipient, and that it has no
+// policies (see protect.go).
 
 // accessTTL is how long a recipient's access to a shared table, once
 // checked, is trusted without asking the metadata database again.
 const accessTTL = 10 * time.Second
 
 type cachedAccess struct {
-	ok     bool
+	ok bool
+	// table is the shared table, when ok.
+	table  SharedTable
 	loaded time.Time
 }
 
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request) {
+	start := s.now()
 	denied := func(msg string) {
 		s.metrics.request("file_denied")
 		writeError(w, &apiError{status: http.StatusForbidden, code: "PERMISSION_DENIED", msg: msg})
@@ -44,7 +48,7 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request) {
 		denied("the recipient's access has ended; ask the provider")
 		return
 	}
-	ok, err := s.canRead(r.Context(), tok.Recipient, g.Table)
+	shared, ok, err := s.canRead(r.Context(), tok.Recipient, g.Table)
 	if err != nil {
 		s.log.Warn("could not check a recipient's access", "recipient", tok.Recipient, "err", err)
 		writeError(w, &apiError{status: http.StatusServiceUnavailable, code: "INTERNAL_ERROR", msg: "could not check access; try again"})
@@ -52,6 +56,17 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		denied("the table is no longer shared with you")
+		return
+	}
+	// A table that gained policies after its files were listed: no more
+	// of them. The refusal goes to the history, as the request did.
+	c := &call{recipient: tok.Recipient, tokenID: tok.ID, table: s.catalog + "." + shared.SourceSchema + "." + shared.SourceTable,
+		rows: -1, text: r.Method + " /files of " + g.Table}
+	if err := s.checkTable(r.Context(), c, shared); err != nil {
+		ae := err.(*apiError)
+		s.metrics.request("file_denied")
+		writeError(w, ae)
+		s.record(r, c, start, ae.status)
 		return
 	}
 	if !strings.HasPrefix(g.Path, s.warehouse) {
@@ -88,39 +103,42 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // canRead reports whether recipient may still read the shared table named
-// share.schema.table, through a short-lived cache.
-func (s *Server) canRead(ctx context.Context, recipient, table string) (bool, error) {
+// share.schema.table, and returns it, through a short-lived cache.
+func (s *Server) canRead(ctx context.Context, recipient, table string) (SharedTable, bool, error) {
 	key := recipient + "/" + table
 	now := s.now()
 	s.tokensMu.Lock()
 	c, ok := s.access[key]
 	s.tokensMu.Unlock()
 	if ok && now.Sub(c.loaded) < accessTTL {
-		return c.ok, nil
+		return c.table, c.ok, nil
 	}
 	share, rest, _ := strings.Cut(table, ".")
 	schema, name, _ := strings.Cut(rest, ".")
 	shares, err := s.store.RecipientShares(ctx, recipient)
 	if err != nil {
-		return false, err
+		return SharedTable{}, false, err
 	}
+	var found SharedTable
 	allowed := false
 	if slices.ContainsFunc(shares, func(sh Share) bool { return sh.Name == share }) {
 		tables, err := s.store.ShareTables(ctx, share)
 		if err != nil && !errors.Is(err, ErrNotFound) {
-			return false, err
+			return SharedTable{}, false, err
 		}
-		allowed = slices.ContainsFunc(tables, func(t SharedTable) bool {
+		if i := slices.IndexFunc(tables, func(t SharedTable) bool {
 			return strings.EqualFold(t.Schema, schema) && strings.EqualFold(t.Name, name)
-		})
+		}); i >= 0 {
+			found, allowed = tables[i], true
+		}
 	}
 	s.tokensMu.Lock()
 	defer s.tokensMu.Unlock()
 	if len(s.access) > 10_000 {
 		clear(s.access)
 	}
-	s.access[key] = cachedAccess{ok: allowed, loaded: now}
-	return allowed, nil
+	s.access[key] = cachedAccess{ok: allowed, table: found, loaded: now}
+	return found, allowed, nil
 }
 
 // countingWriter counts the bytes of a response body.

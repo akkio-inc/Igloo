@@ -726,6 +726,63 @@ psql_admin -c "INSERT INTO shared_spend VALUES (100, 'client_9', 10.00)" >/dev/n
 expect_soon "the external table follows new versions" "31" rita rita-password-1 "SELECT count(*) FROM partners.spend"
 psql_admin -c "DELETE FROM shared_spend WHERE id < 10" >/dev/null
 expect_soon "and rows deleted from the shared table" "21|10" rita rita-password-1 "SELECT count(*), min(id) FROM partners.spend"
+
+# Policies (crm.contacts has some, from above): recipients cannot apply
+# them, so tables with policies are neither shared nor served.
+warehouse_root="s3://$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)/warehouse"
+expect_error "a table with policies cannot be shared" 0A000 igloo "$admin_password" "ALTER SHARE e2e_share ADD TABLE crm.contacts"
+psql_admin -c "CREATE MATERIALIZED VIEW crm.contacts_shared AS SELECT id, client_id, email FROM crm.contacts" >/dev/null
+expect "but a materialized view of what its creator sees can" "ALTER SHARE" igloo "$admin_password" \
+  "ALTER SHARE e2e_share ADD TABLE crm.contacts_shared"
+got="$(ds -X POST -d '{}' "$sharing/shares/e2e_share/schemas/crm/tables/contacts_shared/query")" || true
+mv_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | head -1)"
+[ -z "$mv_url" ] || curl -sS -o "$work/mv.parquet" "$mv_url" || true
+if grep -q 'numRecords\\":2' <<<"$got" && [ -s "$work/mv.parquet" ] && ! grep -qa 'ann@acme' "$work/mv.parquet"; then
+  pass "and its files hold masked values"
+else
+  fail "a shared materialized view: $got"
+fi
+psql_admin -c "ALTER SHARE e2e_share REMOVE TABLE crm.contacts_shared" >/dev/null
+psql_admin -c "DROP MATERIALIZED VIEW crm.contacts_shared" >/dev/null
+expect_error "external tables take no policies" 42809 igloo "$admin_password" \
+  "ALTER TABLE partners.spend ALTER COLUMN client SET MASKING POLICY mask_email"
+expect_error "readers cannot read external tables' files while tables have policies" 42501 rita rita-password-1 \
+  "SELECT count(*) FROM read_parquet('$proxy_url')"
+expect_error "nor the copies of shared files with deletes applied" 42501 rita rita-password-1 \
+  "SELECT count(*) FROM read_parquet('$warehouse_root/.igloo/sharing/*/*.parquet')"
+got="$(ds -X POST -d '{}' "$sharing/shares/e2e_share/schemas/public/tables/shared_spend/query")" || true
+file_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | head -1)"
+psql_admin -c "ALTER TABLE shared_spend ALTER COLUMN client SET MASKING POLICY mask_email" >/dev/null
+status="$(curl -s -o "$work/refused.json" -w '%{http_code}' -X POST -H "Authorization: Bearer $token" -d '{}' \
+  "$sharing/shares/e2e_share/schemas/public/tables/shared_spend/query")"
+if [ "$status" = 403 ] && grep -q 'masking or row access policies' "$work/refused.json" && ! grep -q mask_email "$work/refused.json"; then
+  pass "a shared table that gains a policy is refused, and the recipient is told why"
+else
+  fail "a shared table with a policy: $status $(cat "$work/refused.json")"
+fi
+status="$(curl -s -o /dev/null -w '%{http_code}' -r 0-3 "$file_url")"
+if [ "$status" = 403 ]; then pass "and so are its files listed before"; else fail "a file listed before the policy: $status"; fi
+expect_soon "the history names the policies that stopped the recipient" '["mask_email"]|denied|42501' igloo "$admin_password" \
+  "SELECT policies, outcome, sqlstate FROM igloo.query_history WHERE user_name = 'recipient:e2e_partner'
+   AND policies IS NOT NULL ORDER BY start_time DESC LIMIT 1"
+refused=""
+for _ in $(seq 1 30); do
+  if ! psql_as rita rita-password-1 -c "SELECT count(*) FROM partners.spend" >/dev/null 2>&1; then refused=1; break; fi
+  sleep 2
+done
+if [ -n "$refused" ]; then pass "an external table of it stops reading"; else fail "an external table read a table with a policy"; fi
+psql_admin -c "ALTER TABLE shared_spend ALTER COLUMN client UNSET MASKING POLICY" >/dev/null
+expect_soon "without the policy, it is served again" "21|10" rita rita-password-1 "SELECT count(*), min(id) FROM partners.spend"
+# Recipients' tokens and Igloo's access tokens do not stand in for each other.
+status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $bot_token" "$sharing/shares")"
+if [ "$status" = 401 ]; then pass "an Igloo access token is not a recipient's token"; else fail "an access token at the sharing endpoint: $status"; fi
+if got="$(psql_as rita "$token" -c "SELECT 1")"; then
+  fail "a recipient's token signed in to SQL"
+elif grep -q 'password authentication failed' <<<"$got"; then
+  pass "nor is a recipient's token a SQL password"
+else
+  fail "a recipient's token as a password: $got"
+fi
 got="$(psql_admin -c "SHOW EXTERNAL TABLES")" || true
 if grep -q '^partners|spend|self|e2e_share|public|shared_spend|[0-9]' <<<"$got"; then pass "SHOW EXTERNAL TABLES"; else fail "SHOW EXTERNAL TABLES: $got"; fi
 expect_soon "recipients' requests are in the query history" "t" igloo "$admin_password" \

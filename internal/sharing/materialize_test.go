@@ -66,7 +66,7 @@ func TestCollectCopies(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	n, err := m.collect(map[string]bool{filepath.Join(root, "needed.parquet"): true}, time.Now())
+	n, err := m.collect(map[string]bool{filepath.Join(root, "needed.parquet"): true}, nil, time.Now())
 	if err != nil || n != 1 {
 		t.Fatalf("collect = %d, %v", n, err)
 	}
@@ -76,7 +76,29 @@ func TestCollectCopies(t *testing.T) {
 		}
 	}
 	// No sharing area yet is not an error.
-	if _, err := newMaterializer(iceio.LocalFS{}, t.TempDir()+"/").collect(nil, time.Now()); err != nil {
+	if _, err := newMaterializer(iceio.LocalFS{}, t.TempDir()+"/").collect(nil, nil, time.Now()); err != nil {
 		t.Errorf("collect without copies: %v", err)
+	}
+
+	// A table that gained policies loses its copies at once, needed or
+	// recent; other tables' stay.
+	other := filepath.Join(dir, ".igloo", "sharing", "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "keep.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, err = m.collect(map[string]bool{filepath.Join(root, "needed.parquet"): true}, []string{root + "/"}, time.Now())
+	if err != nil || n != 2 {
+		t.Fatalf("collect with a purge = %d, %v; want the needed and the recent copies gone", n, err)
+	}
+	for _, p := range []string{filepath.Join(root, "needed.parquet"), filepath.Join(root, "recent.parquet")} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s was kept", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(other, "keep.parquet")); err != nil {
+		t.Errorf("another table's copy went: %v", err)
 	}
 }

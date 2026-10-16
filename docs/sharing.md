@@ -128,6 +128,51 @@ Igloo translates each Iceberg table into the protocol's terms:
 - Change data feeds (`table_changes`) and streaming are not offered.
   Clients that ask only for the `delta` response format get it.
 
+### Tables with masking or row access policies
+
+[Masking and row access policies](security-policies.md) apply to what
+Igloo reads for its users, evaluated for their roles. Recipients download a
+table's data files and read them with their own tools, which cannot apply
+Igloo's policies, and they have no Igloo roles to evaluate them for. So, as
+Databricks does for open sharing, a table that has a row access policy, or a
+masking policy on any column (set on the column or through a tag), is never
+shared:
+
+- `ALTER SHARE ... ADD TABLE` refuses it, naming the policies. A tag
+  without a masking policy does not count.
+- A shared table that gains a policy is refused to recipients from then on,
+  at once on the replica that attached the policy and within 30 seconds on
+  the others: its version, metadata and files, and every download of a file
+  listed before. Recipients get `403 PERMISSION_DENIED`, saying the table
+  is protected by the provider's policies; they are not told which. The
+  share still lists the table, and its other tables are served as before.
+  Removing the policy serves the table again.
+- The query history records each refused request as the recipient's, with
+  `outcome` `denied`, `sqlstate` `42501` and the policies in `policies`:
+
+  ```sql
+  SELECT start_time, user_name, query_text, policies FROM igloo.query_history
+  WHERE role = 'recipient' AND policies IS NOT NULL ORDER BY start_time DESC;
+  ```
+
+- The copies of the table's files with deletes applied are deleted at the
+  next collection, within six hours. Until then they are in the warehouse,
+  whose files users other than admins cannot read directly while tables
+  have policies.
+
+To share what a recipient may see of a protected table, make a table of
+just that and share it. Statements read protected tables through their
+policies, admins' too unless a policy exempts them, so the new table holds
+what its creator sees; it has no policies of its own. A materialized view
+(see [Loading and scheduling](loading.md#materialized-views)) keeps it
+current:
+
+```sql
+CREATE MATERIALIZED VIEW shared.acme_contacts SCHEDULE '1 hour' AS
+  SELECT id, client_id, sha256(email) AS email_hash FROM crm.contacts WHERE client_id = 'acme';
+ALTER SHARE acme_reporting ADD TABLE shared.acme_contacts;
+```
+
 ### Recipient instructions
 
 Send recipients the activation link and these instructions for their tool.
@@ -222,6 +267,18 @@ How it works, and its limits:
   dots, such as a Docker or Kubernetes service).
 - Files are read when queries need them, as DuckDB reads the warehouse,
   through a proxy inside Igloo. Nothing is copied ahead of time.
+- **Policies.** Masking and row access policies and tags attach only to
+  the catalog's tables, so `ALTER TABLE` refuses to attach them to an
+  external table and says so; to protect a partner's rows, copy what users
+  may read into a table (`CREATE TABLE ... AS SELECT ... FROM` the external
+  table, or a materialized view) and attach policies to that. An external
+  table cannot be created under a name that still has policies or tags,
+  left by a dropped table. External tables stay readable while other tables
+  have policies, and statements that join them with protected tables read
+  those through their policies as usual. While any table has policies,
+  users other than admins cannot read external tables' files through the
+  proxy directly (`read_parquet` and the like, `COPY ... FROM`, `COPY
+  INTO`), as they cannot read the warehouse's.
 
 ## Security
 
@@ -243,6 +300,15 @@ How it works, and its limits:
   that exist but are not granted look like shares that do not exist. Time
   travel is off unless a table is added `WITH HISTORY`. Tables whose dropped
   columns may linger in their files are refused (see above).
+- **Policies.** Tables with masking or row access policies are never
+  shared or served, and downloads of their files listed before a policy was
+  attached are refused ([above](#tables-with-masking-or-row-access-policies)).
+  The endpoint serves no table until Igloo has loaded the policies.
+- **Tokens apart.** Recipients' tokens (`dst_...`) and activation codes
+  (`dsa_...`) are kept apart from Igloo's access tokens (`igloo_...`): they
+  have different forms and are stored and checked separately. A
+  recipient's token signs in to nothing else (SQL, Flight SQL, the web
+  console, SCIM), and an Igloo access token reads no share.
 - **Providers' tokens** are stored encrypted with a key kept in the
   metadata database, never shown again, and removed from the query history
   with the rest of `CREATE PROVIDER`.

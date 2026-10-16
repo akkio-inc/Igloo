@@ -392,6 +392,10 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 	at := *ref
 	at.loc = loc
 	switch {
+	case o.external:
+		// Igloo's own view of an external table (Delta Sharing), over
+		// files only its proxy serves; policies cannot be attached to
+		// one (see policyTable).
 	case !o.view && strings.EqualFold(o.db, rw.r.catalog) && rw.snap.Rules(o.schema, o.name) != nil:
 		rw.touched = true
 		plan, err := rw.plan(o, rw.snap.Rules(o.schema, o.name))

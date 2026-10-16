@@ -103,6 +103,18 @@ func (s *Service) Handler() *Server { return s.server }
 // Consumer keeps external tables.
 func (s *Service) Consumer() *Consumer { return s.consumer }
 
+// SetProtection tells the service which tables have masking or row access
+// policies, which it then neither shares nor serves (see protect.go). Until
+// it is set, the endpoint serves no table and no table can be added to a
+// share.
+func (s *Service) SetProtection(p Protection) { s.server.SetProtection(p) }
+
+// ProxyPrefix is where DuckDB reads external tables' files: Igloo's own
+// proxy, on the loopback interface under a random path. Users other than
+// admins must not read it directly while tables have policies, as they may
+// not read the warehouse's files.
+func (s *Service) ProxyPrefix() string { return s.consumer.proxy.Prefix() }
+
 // Run keeps external tables current, and deletes copies of data files that
 // shared tables no longer need, until ctx is done.
 func (s *Service) Run(ctx context.Context) {
@@ -138,7 +150,7 @@ func (s *Service) collectCopies(ctx context.Context) {
 		tables, err := s.allSharedTables(ctx)
 		if err == nil {
 			var n int
-			if n, err = src.collect(ctx, tables); n > 0 {
+			if n, err = src.collect(ctx, tables, s.protectedTable); n > 0 {
 				s.log.Info("deleted copies of shared data files that are no longer needed", "files", n)
 			}
 		}
@@ -146,6 +158,14 @@ func (s *Service) collectCopies(ctx context.Context) {
 			s.log.Warn("could not collect copies of shared data files", "err", err)
 		}
 	}
+}
+
+// protectedTable reports whether a shared table now has policies, so its
+// copies are deleted at once rather than kept for earlier URLs, which are
+// refused anyway. While policies cannot be checked, nothing counts as
+// protected and copies are kept.
+func (s *Service) protectedTable(ctx context.Context, t SharedTable) bool {
+	return IsProtected(s.server.protection.check(ctx, t.SourceSchema, t.SourceTable))
 }
 
 func (s *Service) allSharedTables(ctx context.Context) ([]SharedTable, error) {
@@ -190,6 +210,9 @@ func (s *Service) AddTable(ctx context.Context, t SharedTable) error {
 		return err
 	}
 	if err := ValidSharedName(t.Name); err != nil {
+		return err
+	}
+	if err := s.server.protection.check(ctx, t.SourceSchema, t.SourceTable); err != nil {
 		return err
 	}
 	if _, err := s.source.snapshot(ctx, t.SourceSchema, t.SourceTable, version{}, false); err != nil {

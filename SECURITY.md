@@ -258,7 +258,18 @@ reference for every setting mentioned here.
   provider listed for an external table and does not connect to loopback,
   link-local or multicast addresses other than the provider's endpoint;
   the sandbox is otherwise unchanged. Set `IGLOO_SHARING_ADDR=` to turn the
-  endpoint off.
+  endpoint off. Tables with masking or row access policies are never
+  shared: recipients read files with their own tools, which cannot apply
+  Igloo's policies. `ALTER SHARE ... ADD TABLE` refuses them, and a shared
+  table that gains a policy is refused to recipients from then on (on other
+  replicas within 30 seconds), downloads of files listed before included,
+  with each refusal and the policies behind it in the query history; until
+  Igloo has loaded the policies, the endpoint serves no table. Policies do
+  not attach to external tables, and while tables have policies users
+  other than admins cannot read external tables' files through the proxy,
+  nor the copies of shared files in the warehouse. Recipients' tokens
+  (`dst_`) and Igloo's access tokens (`igloo_`) are distinct: neither
+  signs in where the other does.
 
 ## Verifying release images
 
