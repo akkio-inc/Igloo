@@ -1,6 +1,7 @@
 package icebergrest
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -11,9 +12,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -24,12 +27,17 @@ import (
 // Engines sign in with the OAuth2 client-credentials grant of the Iceberg
 // REST specification: an Igloo user name as client_id and its password as
 // client_secret, which stock Spark, Trino and PyIceberg configurations send
-// as credential=user:password. Igloo answers with an access token of its
-// own: the user, a session and an expiry, encrypted and authenticated with
-// a key every replica shares, so any replica accepts it and nothing needs
-// storing. A token ends after tokenLifetime, or at once when its user is
-// dropped or their password changes. Clients renew it before then, with
-// their credentials or by exchanging the token itself (RFC 8693).
+// as credential=user:password, or an Igloo access token (igloo_...) as
+// client_secret, with or without the user name. Service accounts have no
+// password, so jobs sign in with tokens. Igloo answers with an access token
+// of its own: the user, a session and an expiry, encrypted and
+// authenticated with a key every replica shares, so any replica accepts it
+// and nothing needs storing. A token ends after tokenLifetime, or at once
+// when its user is dropped or disabled, their password changes (one made
+// from a password), or the access token it was made from is dropped or
+// expires (one made from that), which it never outlives. Clients renew it
+// before then, with their credentials or by exchanging the token itself
+// (RFC 8693).
 
 // failedTokenDelay slows down guessing tokens, as SQL logins slow down
 // guessing passwords. Tests shorten it.
@@ -58,7 +66,8 @@ func (s *Server) slowDown() bool {
 
 // tooBusy is the token endpoint's answer when slowDown or the sign-in limit
 // refuses a request.
-var tooBusy = &oauthError{http.StatusServiceUnavailable, "temporarily_unavailable", "too many sign-ins at once; try again shortly"}
+var tooBusy = &oauthError{status: http.StatusServiceUnavailable, code: "temporarily_unavailable",
+	desc: "too many sign-ins at once; try again shortly", retryAfter: time.Second}
 
 const (
 	tokenLifetime = time.Hour
@@ -78,8 +87,20 @@ type token struct {
 	// Expires is a Unix time.
 	Expires int64 `json:"e"`
 	// Password fingerprints the user's verifier when the session began, so
-	// changing the password ends it.
-	Password string `json:"p"`
+	// changing the password ends it; empty for a session that began with an
+	// access token.
+	Password string `json:"p,omitempty"`
+	// TokenID is the Igloo access token the session began with, which it
+	// stands and falls with.
+	TokenID string `json:"t,omitempty"`
+}
+
+// signedIn is a session a token request began or renewed.
+type signedIn struct {
+	user    auth.User
+	session string
+	tokenID string
+	expires time.Time
 }
 
 // sealer encrypts and authenticates tokens with AES-256-GCM.
@@ -172,22 +193,26 @@ type oauthError struct {
 	status int
 	code   string
 	desc   string
+	// retryAfter, if set, says when to try again.
+	retryAfter time.Duration
 }
 
 // token serves POST /v1/oauth/tokens.
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 	var (
-		user    auth.User
-		session string
-		oerr    *oauthError
+		in   signedIn
+		oerr *oauthError
 	)
 	select {
 	case s.signIns <- struct{}{}:
-		user, session, oerr = s.grant(w, r)
+		in, oerr = s.grant(w, r)
 		<-s.signIns
 	default:
 		oerr = tooBusy
+	}
+	if oerr == nil && !time.Now().Before(in.expires) {
+		oerr = &oauthError{status: http.StatusUnauthorized, code: "invalid_grant", desc: "the access token has expired"}
 	}
 	outcome := outcomeOK
 	if oerr != nil {
@@ -195,19 +220,18 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		if oerr.status >= 500 {
 			outcome = outcomeError
 		}
-		if oerr == tooBusy {
-			w.Header().Set("Retry-After", "1")
+		if oerr.retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(oerr.retryAfter.Round(time.Second).Seconds())))
 		}
 		s.opts.Metrics.request(opToken, outcome)
 		writeJSON(w, oerr.status, map[string]string{"error": oerr.code, "error_description": oerr.desc})
 		return
 	}
-	value, err := s.tokens.seal(token{
-		User:     user.Name,
-		Session:  session,
-		Expires:  time.Now().Add(tokenLifetime).Unix(),
-		Password: s.tokens.fingerprint(user.Verifier),
-	})
+	t := token{User: in.user.Name, Session: in.session, Expires: in.expires.Unix(), TokenID: in.tokenID}
+	if in.tokenID == "" {
+		t.Password = s.tokens.fingerprint(in.user.Verifier)
+	}
+	value, err := s.tokens.seal(t)
 	if err != nil {
 		s.log.Error("could not seal a token", "err", err)
 		s.opts.Metrics.request(opToken, outcomeError)
@@ -218,83 +242,180 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":      value,
 		"token_type":        "bearer",
-		"expires_in":        int(tokenLifetime.Seconds()),
+		"expires_in":        max(1, int(time.Until(in.expires).Round(time.Second).Seconds())),
 		"issued_token_type": accessTokenType,
 	})
 }
 
-// grant decides a token request: whose token it is, and its session.
-func (s *Server) grant(w http.ResponseWriter, r *http.Request) (auth.User, string, *oauthError) {
+// grant decides a token request: whose token it is, its session and when
+// it expires.
+func (s *Server) grant(w http.ResponseWriter, r *http.Request) (signedIn, *oauthError) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxTokenRequest)
 	if err := r.ParseForm(); err != nil {
-		return auth.User{}, "", &oauthError{http.StatusBadRequest, "invalid_request", "send an application/x-www-form-urlencoded form"}
+		return signedIn{}, &oauthError{status: http.StatusBadRequest, code: "invalid_request", desc: "send an application/x-www-form-urlencoded form"}
 	}
 	form := r.PostForm
 	id, secret := form.Get("client_id"), form.Get("client_secret")
 	basicID, basicSecret, basic := r.BasicAuth()
 	switch form.Get("grant_type") {
 	case grantClientCredentials:
-		if id == "" && basic {
+		if id == "" && secret == "" && basic {
 			id, secret = basicID, basicSecret
 		}
-		user, err := s.signIn(r, id, secret)
-		return user, newSession(), err
+		return s.signIn(r, id, secret)
 	case grantTokenExchange:
 		// Iceberg clients renew an expired token by exchanging it with
 		// their credentials in an Authorization: Basic header.
 		if basic {
-			user, err := s.signIn(r, basicID, basicSecret)
-			return user, newSession(), err
+			return s.signIn(r, basicID, basicSecret)
 		}
 		t, err := s.tokens.open(form.Get("subject_token"))
 		if err != nil {
 			if !s.slowDown() {
-				return auth.User{}, "", tooBusy
+				return signedIn{}, tooBusy
 			}
-			return auth.User{}, "", &oauthError{http.StatusUnauthorized, "invalid_grant", "the subject token is invalid or expired; sign in again"}
+			return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_grant", desc: "the subject token is invalid or expired; sign in again"}
 		}
-		user, err := s.opts.Users.Get(r.Context(), t.User)
-		switch {
-		case errors.Is(err, auth.ErrNotFound) || err == nil && !s.tokens.current(t, user):
-			return auth.User{}, "", &oauthError{http.StatusUnauthorized, "invalid_grant", "the user was dropped or their password changed; sign in again"}
-		case err != nil:
-			s.log.Warn("could not look up user", "user", t.User, "err", err)
-			return auth.User{}, "", &oauthError{http.StatusServiceUnavailable, "temporarily_unavailable", "could not reach the metadata database"}
+		in, err := s.session(r.Context(), t)
+		if err != nil {
+			var api *apiError
+			if errors.As(err, &api) && api.status == http.StatusUnauthorized {
+				return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_grant", desc: api.msg + "; sign in again"}
+			}
+			return signedIn{}, &oauthError{status: http.StatusServiceUnavailable, code: "temporarily_unavailable", desc: "could not reach the metadata database"}
 		}
-		return user, t.Session, nil
+		return in, nil
 	}
-	return auth.User{}, "", &oauthError{http.StatusBadRequest, "unsupported_grant_type",
-		"use grant_type=client_credentials with an Igloo user name and password"}
+	return signedIn{}, &oauthError{status: http.StatusBadRequest, code: "unsupported_grant_type",
+		desc: "use grant_type=client_credentials with an Igloo user name and a password or access token"}
 }
 
-// signIn checks a user name and password like a SQL login does.
-func (s *Server) signIn(r *http.Request, name, password string) (auth.User, *oauthError) {
+// signIn checks a user name and password, or an access token, like a SQL
+// login does, and begins a session.
+func (s *Server) signIn(r *http.Request, name, secret string) (signedIn, *oauthError) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" || password == "" {
-		return auth.User{}, &oauthError{http.StatusUnauthorized, "invalid_client",
-			"send an Igloo user name as client_id and its password as client_secret (credential=user:password)"}
+	if auth.LooksLikeToken(secret) {
+		return s.signInWithToken(r, name, secret)
 	}
-	user, err := s.opts.Authenticate(r.Context(), name, password, remoteAddr(r))
+	if name == "" || secret == "" {
+		return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_client",
+			desc: "send an Igloo user name as client_id and its password as client_secret (credential=user:password), " +
+				"or an access token as client_secret (credential=igloo_...)"}
+	}
+	user, err := s.opts.Authenticate(r.Context(), name, secret, remoteAddr(r))
+	var blocked *LoginBlockedError
+	switch {
+	case errors.Is(err, ErrLoginFailed):
+		return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_client", desc: "password authentication failed for user \"" + name + "\""}
+	case errors.Is(err, ErrUserDisabled):
+		return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_client", desc: "user \"" + name + "\" is not permitted to sign in"}
+	case errors.As(err, &blocked):
+		return signedIn{}, &oauthError{status: http.StatusTooManyRequests, code: "temporarily_unavailable", desc: blocked.Error(), retryAfter: blocked.Wait}
+	case err != nil:
+		s.log.Warn("could not check a password", "user", name, "err", err)
+		return signedIn{}, &oauthError{status: http.StatusServiceUnavailable, code: "temporarily_unavailable", desc: "could not check the password; try again"}
+	}
+	return signedIn{user: user, session: newSession(), expires: time.Now().Add(tokenLifetime)}, nil
+}
+
+// signInWithToken signs in with an Igloo access token, of name's if name is
+// not empty. The session lasts no longer than the token, and ends when it
+// is dropped.
+func (s *Server) signInWithToken(r *http.Request, name, secret string) (signedIn, *oauthError) {
+	if s.opts.AuthenticateToken == nil || s.opts.Tokens == nil {
+		return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_client", desc: "this server takes no access tokens; sign in with a password"}
+	}
+	user, t, err := s.opts.AuthenticateToken(r.Context(), name, secret, remoteAddr(r))
 	if errors.Is(err, ErrLoginFailed) {
-		return auth.User{}, &oauthError{http.StatusUnauthorized, "invalid_client", "password authentication failed for user \"" + name + "\""}
+		desc := "the access token is invalid, expired or dropped"
+		if name != "" {
+			desc += ", or not user \"" + name + "\"'s"
+		}
+		return signedIn{}, &oauthError{status: http.StatusUnauthorized, code: "invalid_client", desc: desc}
 	}
 	if err != nil {
-		s.log.Warn("could not check a password", "user", name, "err", err)
-		return auth.User{}, &oauthError{http.StatusServiceUnavailable, "temporarily_unavailable", "could not check the password; try again"}
+		s.log.Warn("could not check an access token", "user", name, "err", err)
+		return signedIn{}, &oauthError{status: http.StatusServiceUnavailable, code: "temporarily_unavailable", desc: "could not check the access token; try again"}
 	}
-	return user, nil
+	return signedIn{user: user, session: newSession(), tokenID: t.ID, expires: earlier(time.Now().Add(tokenLifetime), t.ExpiresAt)}, nil
 }
 
-// ErrLoginFailed is what Options.Authenticate returns for an unknown user
-// and a wrong password alike.
-var ErrLoginFailed = errors.New("password authentication failed")
+// earlier returns the earlier of a and b.
+func earlier(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// session checks that t's session still stands, as SQL sessions are
+// checked (refreshUser): its user exists and may sign in, and still has the
+// password, or the access token, it began with. It returns the session as
+// a renewal of t would be, which a token's expiry may shorten. Errors are
+// *apiError, 401 for an ended session.
+func (s *Server) session(ctx context.Context, t token) (signedIn, error) {
+	ended := func(format string, args ...any) (signedIn, error) {
+		return signedIn{}, errorf(http.StatusUnauthorized, errNotAuthorized, format, args...)
+	}
+	unavailable := func(what string, err error) (signedIn, error) {
+		s.log.Warn("could not check a session", "user", t.User, "checking", what, "err", err)
+		return signedIn{}, errorf(http.StatusServiceUnavailable, errUnavailable, "could not reach the metadata database")
+	}
+	user, err := s.opts.Users.Get(ctx, t.User)
+	switch {
+	case errors.Is(err, auth.ErrNotFound):
+		return ended("user %q no longer exists", t.User)
+	case err != nil:
+		return unavailable("user", err)
+	case user.Disabled:
+		return ended("user %q is not permitted to sign in", t.User)
+	}
+	in := signedIn{user: user, session: t.Session, tokenID: t.TokenID, expires: time.Now().Add(tokenLifetime)}
+	if t.TokenID == "" {
+		if !s.tokens.current(t, user) {
+			return ended("the password of %q changed", t.User)
+		}
+		return in, nil
+	}
+	if s.opts.Tokens == nil {
+		return ended("this server takes no access tokens")
+	}
+	at, _, err := s.opts.Tokens.TokenByID(ctx, t.TokenID)
+	switch {
+	case errors.Is(err, auth.ErrTokenNotFound) || err == nil && at.User != t.User:
+		return ended("the access token this session began with was dropped")
+	case err != nil:
+		return unavailable("access token", err)
+	case at.Expired(time.Now()):
+		return ended("the access token this session began with has expired")
+	}
+	in.expires = earlier(in.expires, at.ExpiresAt)
+	return in, nil
+}
+
+// ErrLoginFailed is what Options.Authenticate and AuthenticateToken return
+// for a sign-in that fails: an unknown user, a wrong password, or a token
+// that is not valid.
+var ErrLoginFailed = errors.New("authentication failed")
+
+// ErrUserDisabled is what Options.Authenticate returns, after the password
+// checked out, for a user who may not sign in.
+var ErrUserDisabled = errors.New("this user is not permitted to sign in")
+
+// LoginBlockedError is what Options.Authenticate returns after too many
+// failed logins for the user or from the address.
+type LoginBlockedError struct{ Wait time.Duration }
+
+func (e *LoginBlockedError) Error() string {
+	return fmt.Sprintf("too many failed sign-ins; try again in %s", e.Wait.Round(time.Second))
+}
 
 // authenticate returns who sent r, from its bearer token.
 func (s *Server) authenticate(r *http.Request) (*caller, error) {
 	scheme, raw, _ := strings.Cut(r.Header.Get("Authorization"), " ")
 	if !strings.EqualFold(scheme, "Bearer") {
 		return nil, errorf(http.StatusUnauthorized, errNotAuthorized,
-			"sign in: get a token from /v1/oauth/tokens with an Igloo user name and password")
+			"sign in: get a token from /v1/oauth/tokens with an Igloo user name and a password or access token")
 	}
 	t, err := s.tokens.open(strings.TrimSpace(raw))
 	if err != nil {
@@ -303,16 +424,15 @@ func (s *Server) authenticate(r *http.Request) (*caller, error) {
 		}
 		return nil, errorf(http.StatusUnauthorized, errNotAuthorized, "the access token is invalid or expired; sign in again")
 	}
-	user, err := s.opts.Users.Get(r.Context(), t.User)
-	switch {
-	case errors.Is(err, auth.ErrNotFound):
-		return nil, errorf(http.StatusUnauthorized, errNotAuthorized, "user %q no longer exists", t.User)
-	case err != nil:
-		s.log.Warn("could not look up user", "user", t.User, "err", err)
-		return nil, errorf(http.StatusServiceUnavailable, errUnavailable, "could not reach the metadata database")
-	case !s.tokens.current(t, user):
-		return nil, errorf(http.StatusUnauthorized, errNotAuthorized, "the password of %q changed; sign in again", t.User)
+	in, err := s.session(r.Context(), t)
+	if err != nil {
+		var api *apiError
+		if errors.As(err, &api) && api.status == http.StatusUnauthorized {
+			api.msg += "; sign in again"
+		}
+		return nil, err
 	}
+	user := in.user
 	c := &caller{user: user, session: t.Session, client: clientName(r)}
 	if !c.writer() {
 		p, err := s.opts.Grants.UserPrivileges(r.Context(), user.Name)

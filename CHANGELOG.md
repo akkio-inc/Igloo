@@ -169,9 +169,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - An Iceberg REST catalog on port 8181 (`IGLOO_ICEBERG_ADDR`) through which
   Spark, Trino, PyIceberg, Databricks and Snowflake read and write Igloo's
   tables. Engines sign in as Igloo users with the OAuth2 client-credentials
-  flow and get Igloo's own tokens; every request is checked against the
-  user's role and grants and recorded in the query history, and token
-  requests in the login history. Lakekeeper stays private. Tested with
+  flow, with a password or an access token (so service accounts can), and
+  get Igloo's own tokens, which end with the access token they came from;
+  every request is checked against the user's role and grants and recorded
+  in the query history, and token requests in the login history. Tables
+  with masking or row access policies are refused to everyone but admins,
+  since engines would read their files unmasked. Lakekeeper stays private.
+  Tested with
   Spark 3.5 and Iceberg 1.11 (reads, `INSERT`, `MERGE INTO`,
   `CREATE TABLE AS`), Trino 483 (reads, `INSERT`, `UPDATE`, `DELETE`) and
   PyIceberg 0.12 (`scripts/engines-e2e.sh`, `scripts/e2e.sh`).

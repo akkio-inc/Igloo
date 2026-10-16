@@ -24,6 +24,10 @@ import (
 // tokens of the Iceberg REST endpoint.
 const icebergSecret = "iceberg-token"
 
+// icebergClient names the endpoint's sign-ins in the log and the login
+// history.
+const icebergClient = "iceberg rest"
+
 // icebergDeps is what the Iceberg REST endpoint shares with the rest of
 // the server.
 type icebergDeps struct {
@@ -48,6 +52,8 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 	if err != nil {
 		return nil, err
 	}
+	// Without a metadata database there are no access tokens.
+	tokens, _ := deps.users.(auth.TokenStore)
 	handler, err := icebergrest.New(icebergrest.Options{
 		CatalogURI:  cfg.Catalog.URI,
 		Warehouse:   cfg.Catalog.Warehouse,
@@ -55,11 +61,30 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 		Users:       deps.users,
 		Grants:      deps.grants,
 		Authenticate: func(ctx context.Context, name, password string, addr net.Addr) (auth.User, error) {
-			user, err := deps.sql.AuthenticateClient(ctx, name, password, addr, "iceberg")
+			user, err := deps.sql.AuthenticateClient(ctx, name, password, addr, icebergClient)
+			var blocked *pgwire.LoginBlockedError
+			switch {
+			case errors.Is(err, pgwire.ErrLoginFailed):
+				err = icebergrest.ErrLoginFailed
+			case errors.Is(err, pgwire.ErrUserDisabled):
+				err = icebergrest.ErrUserDisabled
+			case errors.As(err, &blocked):
+				err = &icebergrest.LoginBlockedError{Wait: blocked.Wait}
+			}
+			return user, err
+		},
+		AuthenticateToken: func(ctx context.Context, name, secret string, addr net.Addr) (auth.User, auth.Token, error) {
+			user, token, err := deps.sql.AuthenticateToken(ctx, name, secret, addr, icebergClient)
 			if errors.Is(err, pgwire.ErrLoginFailed) {
 				err = icebergrest.ErrLoginFailed
 			}
-			return user, err
+			return user, token, err
+		},
+		Tokens: tokens,
+		// Policies reach every replica within the refresh interval; each
+		// request asks this replica's current ones.
+		Protected: func(ctx context.Context, o auth.Object) (bool, error) {
+			return deps.sql.Protected(ctx, o.Schema, o.Table), nil
 		},
 		Key:         key,
 		Credentials: vendor,

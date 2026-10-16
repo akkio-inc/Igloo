@@ -523,6 +523,29 @@ code="$(curl -s -o /dev/null -w '%{http_code}' "$iceberg/v1/config")"
 if [ "$code" = 401 ]; then pass "the catalog needs a token"; else fail "catalog without a token: $code"; fi
 got="$(curl -s -d grant_type=client_credentials -d client_id=ivy -d client_secret=wrong "$iceberg/v1/oauth/tokens")"
 if grep -q '"error":"invalid_client"' <<<"$got"; then pass "the token endpoint refuses a wrong password"; else fail "token with a wrong password: $got"; fi
+# catalog_token ARGS... signs in to the catalog with curl's -d ARGS and
+# prints the access token.
+catalog_token() {
+  curl -s -d grant_type=client_credentials "$@" "$iceberg/v1/oauth/tokens" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p'
+}
+catalog_get() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "$iceberg$2"; }
+rest_token="$(token_of "$(psql_admin -c "CREATE TOKEN rest FOR USER etl_bot EXPIRES '1d'")")"
+bearer="$(catalog_token --data-urlencode "client_secret=$rest_token")"
+if [ "$(catalog_get "$bearer" /v1/namespaces)" = 200 ]; then
+  pass "a service account signs in to the catalog with an access token"
+else
+  fail "catalog with an access token: $(catalog_get "$bearer" /v1/namespaces)"
+fi
+psql_admin -c "DROP TOKEN rest FOR USER etl_bot" >/dev/null
+code="$(catalog_get "$bearer" /v1/namespaces)"
+if [ "$code" = 401 ]; then pass "and the session ends when the token is dropped"; else fail "after DROP TOKEN: $code"; fi
+# crm.contacts has a row access policy and a masked column, which an engine
+# reading its files would bypass.
+got="$(curl -s -H "Authorization: Bearer $(catalog_token -d client_id=rita -d client_secret=rita-password-1)" \
+  "$iceberg/v1/namespaces/crm/tables/contacts")"
+if grep -q "data policies" <<<"$got"; then pass "engines may not load a table with data policies"; else fail "protected table for a reader: $got"; fi
+code="$(catalog_get "$(catalog_token -d client_id=igloo --data-urlencode "client_secret=$admin_password")" /v1/namespaces/crm/tables/contacts)"
+if [ "$code" = 200 ]; then pass "admins may"; else fail "protected table for an admin: $code"; fi
 pyiceberg_version=0.12.0
 s3_key="$(grep '^S3_ACCESS_KEY_ID=' "$env_file" | cut -d= -f2)"
 if docker run --rm --network "$network" -e ICEBERG_URI=http://igloo:8181 -e IGLOO_ACCESS_KEY_ID="$s3_key" \
@@ -540,9 +563,10 @@ expect_soon "catalog requests are in the query history" "t|t|t" igloo "$admin_pa
          bool_or(user_name = 'ivy' AND outcome = 'denied' AND sqlstate = '42501'),
          bool_or(user_name = 'ian' AND statement_type = 'updateTable' AND query_text LIKE '%(add-snapshot (append)%')
   FROM igloo.query_history WHERE application_name LIKE 'iceberg-rest%'"
-expect_soon "and their sign-ins in the login history" "t|t" igloo "$admin_password" \
-  "SELECT bool_or(user_name = 'ivy' AND result = 'failure'), bool_or(user_name = 'ian' AND result = 'success')
-   FROM igloo.login_history WHERE application_name = 'iceberg'"
+expect_soon "and their sign-ins in the login history" "t|t|t" igloo "$admin_password" \
+  "SELECT bool_or(user_name = 'ivy' AND result = 'failure'), bool_or(user_name = 'ian' AND result = 'success'),
+     bool_or(user_name = 'etl_bot' AND result = 'success' AND token_name = 'rest')
+   FROM igloo.login_history WHERE application_name = 'iceberg rest'"
 
 echo "SQL from strings, PIVOT and the read cache"
 expect_error "query() is refused" 42501 rita rita-password-1 "SELECT * FROM query('SELECT * FROM duckdb_secrets()')"

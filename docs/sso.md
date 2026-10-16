@@ -211,7 +211,10 @@ igloo:
 ```
 
 Tableau, Power BI, Looker, Metabase and DBeaver take it in their password
-field; JDBC as `password=`.
+field; JDBC as `password=`. Spark, Trino and PyIceberg send it to the
+[Iceberg REST catalog](external-engines.md#users-for-engines) as the OAuth
+client secret, `credential=igloo_...` or `credential=user:igloo_...`; the
+catalog's session lasts an hour at most, never longer than the token.
 
 - **Expiry.** Tokens last 90 days unless `EXPIRES` says otherwise, at most
   `IGLOO_TOKEN_MAX_LIFETIME` (365 days). Durations are days (`90d`), weeks
@@ -236,8 +239,11 @@ field; JDBC as `password=`.
   every login in `igloo.login_history` with `auth_method` `token` and the
   token's `token_name`.
 - **Revoking** a token (`DROP TOKEN`) stops new logins at once and ends the
-  SQL and Arrow Flight SQL sessions it opened within 30 seconds. A session
-  also ends, before its next statement, once its token has expired.
+  SQL and Arrow Flight SQL sessions it opened within 30 seconds, and its
+  Iceberg REST catalog sessions at their next request. A session also ends,
+  before its next statement or request, once its token has expired. Storage
+  credentials the catalog already handed an engine for a table's files last
+  until they expire, at most an hour.
 - **Passwords and tokens** of a user share a SCRAM salt, which is what lets
   one SQL login accept either. Changing the password keeps the salt, so
   tokens keep working, except that psql's `\password`, which encrypts the
@@ -307,8 +313,8 @@ Good practice:
 
 | To | Do | Takes effect |
 |---|---|---|
-| Stop a person or service account | `ALTER USER name NOLOGIN` (console: *Disable*) | At once for new logins, single sign-on and console sessions, and the runs of their tasks, pipes and materialized views; open SQL sessions end within 30 seconds. `ALTER USER name LOGIN` enables them again, without bringing back their old console sessions. |
-| Revoke one token | `DROP TOKEN name [FOR USER user]` | At once for new logins; its open SQL sessions end within 30 seconds. |
+| Stop a person or service account | `ALTER USER name NOLOGIN` (console: *Disable*) | At once for new logins, single sign-on and console sessions, Iceberg REST catalog requests, and the runs of their tasks, pipes and materialized views; open SQL sessions end within 30 seconds. `ALTER USER name LOGIN` enables them again, without bringing back their old console sessions. |
+| Revoke one token | `DROP TOKEN name [FOR USER user]` | At once for new logins and Iceberg REST catalog requests; its open SQL sessions end within 30 seconds. |
 | Remove someone | `DROP USER name` | Also deletes their tokens and their link to the provider. |
 | Deactivate someone at the provider | With [SCIM](#scim-provisioning), the provider disables them in Igloo | As soon as the provider pushes the change, as for `NOLOGIN`. |
 

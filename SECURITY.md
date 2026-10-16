@@ -168,10 +168,13 @@ reference for every setting mentioned here.
 - **Other engines.** Port 8181 (`IGLOO_ICEBERG_ADDR`) serves the Iceberg REST
   catalog to Spark, Trino and other engines
   ([details](docs/external-engines.md)). Engines get an access token by
-  sending an Igloo user's password (OAuth2 client credentials), checked like a
-  SQL login, with the same failed-login delay and login history. Tokens are
+  sending an Igloo user's password or Igloo access token (OAuth2 client
+  credentials), checked like a SQL login, with the same failed-login delay,
+  limits and login history; at most 32 sign-ins run at once. Tokens are
   encrypted and authenticated with a key every replica shares, last an hour,
-  and end when the user is dropped or their password changes. Every request
+  never longer than the access token they were made from, and end at the
+  next request when the user is dropped or disabled, their password changes,
+  or that access token is dropped. Every request
   is checked against the user's role and grants, which are read again each
   time, before Igloo forwards it to Lakekeeper, and is recorded in the query
   history. Engines never learn Lakekeeper's address and never receive Igloo's
@@ -190,12 +193,13 @@ reference for every setting mentioned here.
   so a request is checked against the table it changes. Tables with masking
   or row access policies, which Igloo enforces in the SQL it runs, cannot be
   loaded or changed through the endpoint except by admins: their files hold
-  the unmasked data. Without TLS the port serves clients
-  on private networks only, since passwords, tokens and credentials cross it
-  (behind a proxy, such as the scale-to-zero gateway, the proxy's address
-  counts, so enable TLS before exposing the proxy); with TLS it serves HTTPS
-  only. What remains: credentials outlive a revoked grant, a dropped user
-  or a newly attached data policy by up to an hour; an engine with write credentials for a table can
+  the unmasked data. Without TLS the port serves clients on private networks
+  only, since passwords, tokens and credentials cross it (behind a proxy,
+  such as the scale-to-zero gateway, the proxy's address counts, so enable
+  TLS before exposing the proxy); with TLS it serves HTTPS only. What
+  remains: storage credentials outlive a revoked grant, a dropped user or
+  token, or a newly attached data policy by up to an hour; an engine with
+  write credentials for a table can
   rewrite that table's files and manifests as it likes, including making them
   name files of tables whose paths it knows, which Igloo would then read with
   its own access when that table is queried (paths contain random IDs, shown

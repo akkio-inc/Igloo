@@ -39,13 +39,30 @@ GRANT ALL ON SCHEMA marts TO spark_etl;      -- SELECT, INSERT, UPDATE, DELETE, 
 ```
 
 Engines send the user name and password as the OAuth2 client ID and secret
-(`credential=spark_etl:<password>` in Spark, Trino and PyIceberg). Igloo
-answers with an access token of its own that lasts an hour; clients renew it
-before then, with their credentials or by exchanging the token. A token stops
-working at once when its user is dropped or their password changes, and
-grants are read again on every request, so revoking one takes effect on the
-next request. Credentials an engine already holds keep working until they
-expire, at most an hour later.
+(`credential=spark_etl:<password>` in Spark, Trino and PyIceberg), with the
+same failed-login limits and login history as SQL logins. Jobs are better
+off with a [service account](sso.md#service-accounts) and an Igloo access
+token, which has no password to share and can be revoked on its own:
+
+```sql
+CREATE USER airflow TYPE SERVICE ROLE none;
+GRANT SELECT ON SCHEMA marts TO airflow;
+CREATE TOKEN nightly FOR USER airflow EXPIRES '90d';   -- shows igloo_... once
+```
+
+Engines then send the token as the client secret, with or without the user
+name: `credential=airflow:igloo_...`, or `credential=igloo_...`, which
+Spark, Trino and PyIceberg send as the secret alone.
+
+Igloo answers with an access token of its own that lasts an hour, or until
+the Igloo access token it was made from expires, whichever comes first;
+clients renew it before then, with their credentials or by exchanging the
+token. It stops working at once when its user is dropped or disabled, when
+their password changes (for one made from a password), or when the access
+token it was made from is dropped (`DROP TOKEN`). Grants are read again on
+every request, so revoking one takes effect on the next request.
+Credentials an engine already holds keep working until they expire, at most
+an hour later.
 
 What each request needs, by the user's built-in role or their grants, as the
 matching SQL statement would:
@@ -100,7 +117,7 @@ before still work until they expire, at most an hour later.
 |---|---|
 | Catalog URI | `http://<igloo>:8181`, or `https://` when TLS is on |
 | Warehouse | `igloo` (`IGLOO_CATALOG_WAREHOUSE`); clients may leave it out |
-| Credential | `<Igloo user>:<password>` |
+| Credential | `<Igloo user>:<password>`, or an access token: `igloo_...` or `<Igloo user>:igloo_...` |
 | Token endpoint | `<catalog URI>/v1/oauth/tokens`, which clients use by default |
 | Storage credentials | ask for them: `X-Iceberg-Access-Delegation: vended-credentials` |
 
@@ -341,7 +358,8 @@ ORDER BY start_time DESC;
 ```
 
 Token requests are logins, in `igloo.login_history` with application name
-`iceberg`. Prometheus counts requests in `igloo_iceberg_requests_total`, by
+`iceberg rest` (and `auth_method` `token` and the token's `token_name` for
+access tokens). Prometheus counts requests in `igloo_iceberg_requests_total`, by
 operation and outcome.
 
 ## Why Igloo serves the catalog itself

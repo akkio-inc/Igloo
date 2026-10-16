@@ -86,10 +86,22 @@ type Options struct {
 	Users  auth.Store
 	Grants auth.GrantStore
 	// Authenticate checks a password as a SQL login does: failures are
-	// delayed, and both outcomes logged, counted and kept in the login
-	// history. It returns ErrLoginFailed for an unknown user or a wrong
-	// password.
+	// delayed and count towards the failed-login limits, and every outcome
+	// is logged, counted and kept in the login history. It returns
+	// ErrLoginFailed for an unknown user or a wrong password,
+	// ErrUserDisabled for a user who may not sign in, and a
+	// *LoginBlockedError while the limits refuse passwords.
 	Authenticate func(ctx context.Context, name, password string, addr net.Addr) (auth.User, error)
+	// AuthenticateToken checks an Igloo access token (igloo_...) as a SQL
+	// login with one does, and returns its user and the token; name, when
+	// not empty, must be the token's user. It returns ErrLoginFailed for a
+	// token that does not sign in: malformed, unknown, dropped or expired,
+	// another user's, or a disabled user's. Nil, or a nil Tokens, means
+	// engines sign in with passwords only.
+	AuthenticateToken func(ctx context.Context, name, secret string, addr net.Addr) (auth.User, auth.Token, error)
+	// Tokens keeps access tokens. A session that began with one is checked
+	// against it on every request, so dropping the token ends the session.
+	Tokens auth.TokenStore
 	// Key seals access tokens. Replicas behind one address need the same
 	// key; it must be at least 32 random bytes.
 	Key []byte

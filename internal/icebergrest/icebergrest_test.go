@@ -3,6 +3,7 @@ package icebergrest
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +19,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/xdg-go/scram"
+
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 )
@@ -29,6 +32,9 @@ type users struct {
 	mu        sync.Mutex
 	users     map[string]auth.User
 	passwords map[string]string
+	// blocked users' password sign-ins are refused for this long, as after
+	// too many failures.
+	blocked map[string]time.Duration
 }
 
 func (s *users) Get(_ context.Context, name string) (auth.User, error) {
@@ -72,11 +78,100 @@ func (s *users) add(t *testing.T, name, password string, role auth.Role) {
 func (s *users) authenticate(_ context.Context, name, password string, _ net.Addr) (auth.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if u, ok := s.users[name]; ok && s.passwords[name] == password {
-		return u, nil
+	if wait := s.blocked[name]; wait > 0 {
+		return auth.User{}, &LoginBlockedError{Wait: wait}
 	}
-	return auth.User{}, ErrLoginFailed
+	u, ok := s.users[name]
+	switch {
+	case !ok || password == "" || s.passwords[name] != password:
+		return auth.User{}, ErrLoginFailed
+	case u.Disabled:
+		return auth.User{}, ErrUserDisabled
+	}
+	return u, nil
 }
+
+// change applies fn to a user, as ALTER USER does.
+func (s *users) change(name string, fn func(*auth.User)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.users[name]
+	fn(&u)
+	s.users[name] = u
+}
+
+// tokens fakes the access token store, and sign-ins with tokens as
+// pgwire.Server.AuthenticateToken makes them.
+type tokens struct {
+	mu      sync.Mutex
+	users   *users
+	byID    map[string]auth.Token
+	secrets map[string]string
+}
+
+func (s *tokens) mint(t *testing.T, user string, lifetime time.Duration) (string, auth.Token) {
+	t.Helper()
+	secret, tok, _, err := auth.NewToken(user, "job", "ada", time.Now().Add(lifetime), scram.KeyFactors{Salt: "salt", Iters: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byID[tok.ID] = tok
+	s.secrets[secret] = tok.ID
+	return secret, tok
+}
+
+func (s *tokens) authenticate(ctx context.Context, name, secret string, _ net.Addr) (auth.User, auth.Token, error) {
+	s.mu.Lock()
+	tok, ok := s.byID[s.secrets[secret]]
+	s.mu.Unlock()
+	if !ok || tok.Expired(time.Now()) || name != "" && name != tok.User {
+		return auth.User{}, auth.Token{}, ErrLoginFailed
+	}
+	u, err := s.users.Get(ctx, tok.User)
+	if err != nil || u.Disabled {
+		return auth.User{}, auth.Token{}, ErrLoginFailed
+	}
+	return u, tok, nil
+}
+
+// expire makes a token expire now.
+func (s *tokens) expire(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.byID[id]
+	t.ExpiresAt = time.Now().Add(-time.Second)
+	s.byID[id] = t
+}
+
+func (s *tokens) TokenByID(_ context.Context, id string) (auth.Token, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.byID[id]
+	if !ok {
+		return auth.Token{}, nil, auth.ErrTokenNotFound
+	}
+	return t, nil, nil
+}
+
+func (s *tokens) DropToken(_ context.Context, _, name string) (auth.Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.byID[name]
+	delete(s.byID, name)
+	if !ok {
+		return auth.Token{}, auth.ErrTokenNotFound
+	}
+	return t, nil
+}
+
+func (s *tokens) CreateToken(context.Context, auth.Token, auth.TokenSecret) error { return nil }
+func (s *tokens) Tokens(context.Context, string) ([]auth.Token, error)            { return nil, nil }
+func (s *tokens) TokenCredentials(context.Context, string) ([]auth.TokenCredential, error) {
+	return nil, nil
+}
+func (s *tokens) TokenUsed(context.Context, string, time.Time) error { return nil }
 
 // lakekeeper fakes the catalog's Iceberg REST API for one warehouse.
 type lakekeeper struct {
@@ -285,6 +380,7 @@ type harness struct {
 	users   *users
 	grants  *auth.MemoryGrants
 	vendor  *vendor
+	tokens  *tokens
 	history *audit.Log
 }
 
@@ -293,23 +389,26 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{
 		t:      t,
 		cat:    &lakekeeper{namespaces: map[string]bool{}, tables: map[string]string{}, uuids: map[string]string{}, staged: map[string]string{}},
-		users:  &users{users: map[string]auth.User{}, passwords: map[string]string{}},
+		users:  &users{users: map[string]auth.User{}, passwords: map[string]string{}, blocked: map[string]time.Duration{}},
 		vendor: &vendor{},
 	}
+	h.tokens = &tokens{users: h.users, byID: map[string]auth.Token{}, secrets: map[string]string{}}
 	h.grants = auth.NewMemoryGrants(h.users)
 	h.history = audit.New(audit.NewMemoryStore(1000, 1000), audit.Options{}, slog.New(slog.DiscardHandler))
 	catalog := httptest.NewServer(h.cat)
 	t.Cleanup(catalog.Close)
 	srv, err := New(Options{
-		CatalogURI:   catalog.URL + "/catalog",
-		Warehouse:    "igloo",
-		CatalogName:  "lake",
-		Users:        h.users,
-		Grants:       h.grants,
-		Authenticate: h.users.authenticate,
-		Key:          bytes.Repeat([]byte("k"), 32),
-		Credentials:  h.vendor,
-		Audit:        h.history,
+		CatalogURI:        catalog.URL + "/catalog",
+		Warehouse:         "igloo",
+		CatalogName:       "lake",
+		Users:             h.users,
+		Grants:            h.grants,
+		Authenticate:      h.users.authenticate,
+		AuthenticateToken: h.tokens.authenticate,
+		Tokens:            h.tokens,
+		Key:               bytes.Repeat([]byte("k"), 32),
+		Credentials:       h.vendor,
+		Audit:             h.history,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1463,5 +1562,153 @@ func TestBusySignIns(t *testing.T) {
 	}
 	if w := h.request("GET", "/v1/config", "not-a-token", nil); w.Code != 401 {
 		t.Errorf("a bad token: %d %s", w.Code, w.Body)
+	}
+}
+
+// tokenRequest asks the token endpoint for a token with form.
+func (h *harness) tokenRequest(form url.Values, header ...string) (*httptest.ResponseRecorder, string, int) {
+	h.t.Helper()
+	w := h.request("POST", "/v1/oauth/tokens", "", form.Encode(), append([]string{"Content-Type", "application/x-www-form-urlencoded"}, header...)...)
+	var resp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	return w, resp.AccessToken, resp.ExpiresIn
+}
+
+func clientCredentials(id, secret string) url.Values {
+	form := url.Values{"grant_type": {"client_credentials"}, "client_secret": {secret}}
+	if id != "" {
+		form.Set("client_id", id)
+	}
+	return form
+}
+
+// Service accounts have no password: jobs sign in with an Igloo access
+// token, whose session lasts no longer than the token and ends when it is
+// dropped.
+func TestAccessTokens(t *testing.T) {
+	h := newHarness(t)
+	h.users.change("svc", func(u *auth.User) { *u = auth.User{Name: "svc", Role: auth.RoleNone, Kind: auth.KindService} })
+	h.grant("svc", auth.PrivilegeSelect, "public", "events")
+	secret, tok := h.tokens.mint(t, "svc", 10*time.Minute)
+
+	// With the user name or without, as credential=igloo_... sends it.
+	for _, id := range []string{"svc", "SVC", ""} {
+		w, token, expires := h.tokenRequest(clientCredentials(id, secret))
+		if w.Code != 200 || token == "" || expires > 600 || expires < 590 {
+			t.Fatalf("sign in as %q: %d %s", id, w.Code, w.Body)
+		}
+		if w := h.request("GET", "/v1/namespaces/public/tables/events", token, nil); w.Code != 200 {
+			t.Errorf("load with a token session: %d %s", w.Code, w.Body)
+		}
+	}
+	for name, form := range map[string]url.Values{
+		"another user's":          clientCredentials("nora", secret),
+		"a malformed token":       clientCredentials("svc", secret[:len(secret)-1]),
+		"a service's no password": clientCredentials("svc", ""),
+	} {
+		if w, _, _ := h.tokenRequest(form); w.Code != 401 || !strings.Contains(w.Body.String(), "invalid_client") {
+			t.Errorf("%s: %d %s", name, w.Code, w.Body)
+		}
+	}
+	// In an Authorization: Basic header, too.
+	if w, _, _ := h.tokenRequest(url.Values{"grant_type": {"client_credentials"}}, "Authorization",
+		"Basic "+base64.StdEncoding.EncodeToString([]byte("svc:"+secret))); w.Code != 200 {
+		t.Errorf("Basic: %d %s", w.Code, w.Body)
+	}
+
+	// Renewing keeps the session bound to the token.
+	_, token, _ := h.tokenRequest(clientCredentials("", secret))
+	exchange := url.Values{"grant_type": {grantTokenExchange}, "subject_token": {token}, "subject_token_type": {accessTokenType}}
+	w, renewed, expires := h.tokenRequest(exchange)
+	if w.Code != 200 || expires > 600 {
+		t.Fatalf("exchange: %d %s", w.Code, w.Body)
+	}
+
+	// Dropping the token ends its sessions, renewed or not, at once.
+	if _, err := h.tokens.DropToken(context.Background(), "svc", tok.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{token, renewed} {
+		w := h.request("GET", "/v1/config", s, nil)
+		if _, msg := errorType(t, w); w.Code != 401 || !strings.Contains(msg, "dropped") {
+			t.Errorf("after DROP TOKEN: %d %s", w.Code, w.Body)
+		}
+	}
+	if w, _, _ := h.tokenRequest(exchange); w.Code != 401 || !strings.Contains(w.Body.String(), "invalid_grant") {
+		t.Errorf("exchange after DROP TOKEN: %d %s", w.Code, w.Body)
+	}
+	if w, _, _ := h.tokenRequest(clientCredentials("", secret)); w.Code != 401 {
+		t.Errorf("sign in with a dropped token: %d %s", w.Code, w.Body)
+	}
+
+	// So does its expiry.
+	secret, tok = h.tokens.mint(t, "svc", time.Hour)
+	_, token, _ = h.tokenRequest(clientCredentials("svc", secret))
+	h.tokens.expire(tok.ID)
+	if w := h.request("GET", "/v1/config", token, nil); w.Code != 401 || !strings.Contains(w.Body.String(), "expired") {
+		t.Errorf("after the token expired: %d %s", w.Code, w.Body)
+	}
+	// A token that outlives the hour gives an hour.
+	secret, _ = h.tokens.mint(t, "svc", 90*24*time.Hour)
+	if _, _, expires := h.tokenRequest(clientCredentials("svc", secret)); expires != 3600 {
+		t.Errorf("a long-lived token's session lasts %d seconds", expires)
+	}
+
+	// Without access tokens, a token is refused, not tried as a password.
+	h.srv.opts.AuthenticateToken = nil
+	if w, _, _ := h.tokenRequest(clientCredentials("svc", secret)); w.Code != 401 || !strings.Contains(w.Body.String(), "takes no access tokens") {
+		t.Errorf("tokens off: %d %s", w.Code, w.Body)
+	}
+}
+
+// Disabled users are refused, whether they sign in with a password or a
+// token, and sessions they already have end.
+func TestDisabledUsers(t *testing.T) {
+	h := newHarness(t)
+	secret, _ := h.tokens.mint(t, "nora", time.Hour)
+	byPassword := h.login("nora", "nora-password")
+	_, byToken, _ := h.tokenRequest(clientCredentials("nora", secret))
+	h.users.change("nora", func(u *auth.User) { u.Disabled = true })
+	for name, token := range map[string]string{"password": byPassword, "token": byToken} {
+		w := h.request("GET", "/v1/config", token, nil)
+		if _, msg := errorType(t, w); w.Code != 401 || !strings.Contains(msg, "not permitted") {
+			t.Errorf("%s session of a disabled user: %d %s", name, w.Code, w.Body)
+		}
+	}
+	if w, _, _ := h.tokenRequest(clientCredentials("nora", "nora-password")); w.Code != 401 || !strings.Contains(w.Body.String(), "not permitted") {
+		t.Errorf("password sign-in of a disabled user: %d %s", w.Code, w.Body)
+	}
+	if w, _, _ := h.tokenRequest(clientCredentials("nora", secret)); w.Code != 401 {
+		t.Errorf("token sign-in of a disabled user: %d %s", w.Code, w.Body)
+	}
+	exchange := url.Values{"grant_type": {grantTokenExchange}, "subject_token": {byPassword}}
+	if w, _, _ := h.tokenRequest(exchange); w.Code != 401 || !strings.Contains(w.Body.String(), "not permitted") {
+		t.Errorf("renewing a disabled user's session: %d %s", w.Code, w.Body)
+	}
+	h.users.change("nora", func(u *auth.User) { u.Disabled = false })
+	if w := h.request("GET", "/v1/config", byPassword, nil); w.Code != 200 {
+		t.Errorf("enabled again: %d %s", w.Code, w.Body)
+	}
+
+	// A token session does not end when the password changes; a password
+	// session does.
+	h.users.add(t, "nora", "a-new-password", auth.RoleNone)
+	if w := h.request("GET", "/v1/config", byToken, nil); w.Code != 200 {
+		t.Errorf("token session after a password change: %d %s", w.Code, w.Body)
+	}
+	if w := h.request("GET", "/v1/config", byPassword, nil); w.Code != 401 {
+		t.Errorf("password session after a password change: %d %s", w.Code, w.Body)
+	}
+
+	// While failed logins block a user's passwords, the endpoint says when
+	// to try again.
+	h.users.mu.Lock()
+	h.users.blocked["nora"] = 90 * time.Second
+	h.users.mu.Unlock()
+	if w, _, _ := h.tokenRequest(clientCredentials("nora", "a-new-password")); w.Code != 429 || w.Header().Get("Retry-After") != "90" {
+		t.Errorf("blocked: %d %v %s", w.Code, w.Header(), w.Body)
 	}
 }
