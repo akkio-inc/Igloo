@@ -7,6 +7,7 @@
 #   - grants hold on the workers,
 #   - a worker killed in the middle of a statement does not fail it,
 #   - statement timeouts reach the workers,
+#   - tables that maintenance compacted still run distributed,
 #   - workers accept no one without the worker secret.
 # Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT, the
 # E2E_*_PORT variables, E2E_WORKERS and E2E_TPCH_SF change the defaults;
@@ -195,6 +196,28 @@ echo "statement timeout"
 got="$(psql_admin -v VERBOSITY=verbose -c "SET distributed_execution = 'on'" -c "SET statement_timeout = '1s'" \
   -c "SELECT l_returnflag, sum(length(repeat(l_comment, 3000))) FROM lineitem GROUP BY 1" || true)"
 if grep -q "57014" <<<"$got"; then pass "statement_timeout cancels a distributed statement"; else fail "timeout: $got"; fi
+
+echo "after table maintenance"
+# Compaction rewrites the small files loaded above, and gives every table
+# it compacts a name mapping (for files without field IDs, which these are
+# not); the tables must still run distributed.
+echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
+compose up -d --no-build --wait igloo >/dev/null
+deadline=$((SECONDS + 180))
+until curl -fsS "http://127.0.0.1:$http_port/metrics" 2>/dev/null | grep -q '^igloo_maintenance_compacted_files_total [1-9]'; do
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    fail "no table was compacted"
+    break
+  fi
+  sleep 2
+done
+query="SELECT l_returnflag, count(*), sum(l_quantity) FROM lineitem GROUP BY 1 ORDER BY 1"
+want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$query" | grep -v '^SET$')"
+got="$(psql_admin -c "SET distributed_execution = 'on'" -c "/* compacted */ $query" | grep -v '^SET$')"
+if [ "$got" = "$want" ]; then pass "a compacted table returns the same rows"; else fail "compacted: [$got], want [$want]"; fi
+sleep 2
+got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* compacted */%' ORDER BY start_time DESC LIMIT 1")"
+if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a compacted table ran on $got workers"; fi
 
 echo "worker endpoint"
 if docker run --rm --network "$network" curlimages/curl:8.22.0 -sk --max-time 10 "https://worker:7433/v1/status" >/dev/null 2>&1; then

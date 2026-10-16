@@ -137,10 +137,9 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 		}
 		t.Columns = append(t.Columns, Column{Name: f.Name, Type: typ, ID: f.ID})
 	}
-	if _, ok := tbl.Properties()["schema.name-mapping.default"]; ok && t.Unsupported == "" {
-		// Files without field IDs, read by name: workers read by ID.
-		t.Unsupported = "it maps columns by name"
-	}
+	// A name mapping (schema.name-mapping.default) applies only to files
+	// without field IDs, which workers refuse; iceberg-go adds one to every
+	// table it compacts, whose files all have field IDs.
 	snap := tbl.CurrentSnapshot()
 	t.source = &icebergHandle{tbl: tbl, snap: snap}
 	if snap == nil {

@@ -110,6 +110,11 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			return 0, true, ctx.Err()
 		case distributed.DataError(err):
 			return 0, true, err
+		case distributed.IsUnsupported(err):
+			// The workers found what planning could not, such as data
+			// files without field IDs.
+			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+			return 0, false, nil
 		}
 		reason := "worker_error"
 		if errors.Is(err, distributed.ErrNoWorkers) {

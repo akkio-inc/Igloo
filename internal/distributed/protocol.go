@@ -85,6 +85,9 @@ type taskErr struct {
 	// Data says the error came from the data the fragment computes on,
 	// such as a failed cast, rather than from running it.
 	Data bool `json:"data,omitempty"`
+	// Unsupported says no worker can run the task, so the statement runs
+	// on the coordinator: its files cannot be read as the table says.
+	Unsupported bool `json:"unsupported,omitempty"`
 }
 
 func (e *taskErr) Error() string { return e.Message }

@@ -540,6 +540,10 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
+		if IsUnsupported(err) {
+			// Every worker would refuse it.
+			return nil, nil, err
+		}
 		if dataError(err) {
 			co.opts.Metrics.task("failed")
 			return nil, nil, err
@@ -570,6 +574,9 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 		var res taskResult
 		if err := json.NewDecoder(io.LimitReader(br, 1<<20)).Decode(&res); err != nil || res.Error == nil {
 			return nil, fmt.Errorf("worker answered %s", resp.Status)
+		}
+		if res.Error.Unsupported {
+			return nil, &errUnsupported{reason: strings.TrimPrefix(res.Error.Message, "cannot distribute: ")}
 		}
 		if res.Error.Type != 0 {
 			return nil, &duckdb.Error{Type: duckdb.ErrorType(res.Error.Type), Msg: res.Error.Message}

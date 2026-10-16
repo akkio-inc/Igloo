@@ -175,18 +175,18 @@ func TestSchemaEvolution(t *testing.T) {
 		{[]string{b, c, d}, false},
 		{paths(h.files["main.lineitem"][0:1]), false}, // other columns
 	} {
-		got, err := w.namedAsTable(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: tc.files})
+		got, err := w.readByName(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: tc.files})
 		if err != nil || got != tc.want {
 			t.Errorf("%v read by name: %v, %v; want %v", tc.files, got, err, tc.want)
 		}
 	}
 	li := h.tables["lineitem"]
-	if got, err := w.namedAsTable(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: li.Columns, Files: paths(h.files[li.key()])}); err != nil || !got {
+	if got, err := w.readByName(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: li.Columns, Files: paths(h.files[li.key()])}); err != nil || !got {
 		t.Errorf("lineitem's files are not read by name: %v", err)
 	}
 	// One type across files: k is INTEGER in e and BIGINT in b.
 	e := write("e", `SELECT CAST(i AS INTEGER) AS k, 'e' || i AS name, 0.5 AS added FROM range(10) t(i)`, "k: 1, name: 2, added: 3")
-	if got, _ := w.namedAsTable(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{e, b}}); got {
+	if got, _ := w.readByName(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{e, b}}); got {
 		t.Error("files with different types read by name")
 	}
 
@@ -201,6 +201,29 @@ func TestSchemaEvolution(t *testing.T) {
 				t.Error("did not run distributed")
 			}
 		})
+	}
+	h.t = t
+
+	// A file without field IDs is read through the table's name mapping,
+	// which workers do not apply: the statement runs on the coordinator,
+	// and the workers stay in use.
+	plain := filepath.Join(dir, "plain.parquet")
+	h.exec(fmt.Sprintf("COPY (SELECT i AS k, 'p' || i AS name, 1.5 AS added FROM range(10) t(i)) TO %s (FORMAT parquet)", quoteLiteral(plain)))
+	if _, err := w.readByName(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{b, plain}}); !IsUnsupported(err) {
+		t.Errorf("a file without field IDs: %v", err)
+	}
+	info, err := os.Stat(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.files[tbl.key()] = append(h.files[tbl.key()], File{Path: plain, Size: info.Size()})
+	for range 2 {
+		if _, _, _, _, err := h.run(t.Context(), `SELECT count(*), sum(k) FROM evolved`, ModeOn); !IsUnsupported(err) {
+			t.Errorf("a table with a file without field IDs: %v", err)
+		}
+	}
+	if !h.check(`SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1 ORDER BY 1`) {
+		t.Error("workers were left out after refusing a task")
 	}
 }
 

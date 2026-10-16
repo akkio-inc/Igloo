@@ -127,7 +127,7 @@ func NewWorkerMetrics(reg prometheus.Registerer) *WorkerMetrics {
 	m := &WorkerMetrics{
 		tasks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_worker_tasks_total",
-			Help: "Fragments run for coordinators, by outcome: ok, error or canceled.",
+			Help: "Fragments run for coordinators, by outcome: ok, error, canceled, or refused (files workers cannot read as the table says).",
 		}, []string{"outcome"}),
 		duration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "igloo_worker_task_seconds",
