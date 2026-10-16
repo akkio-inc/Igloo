@@ -132,6 +132,9 @@ cover data that lives elsewhere:
   download is in the query history but not counted as usage.
 - A connection's table has the connection's name as `table_catalog` and
   `table_type` `FOREIGN`, and no owner, description, size or freshness.
+  The schemas in which the database describes itself (`pg_catalog`,
+  `information_schema`, MySQL's `mysql`, `performance_schema` and `sys`)
+  are left out.
   Igloo lists them from what DuckDB read of each database when it attached
   the connection or at `ALTER CONNECTION ... REFRESH`, so listing them
   does not query the database. It lists them again in the background, when

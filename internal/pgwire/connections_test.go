@@ -609,7 +609,10 @@ func TestConnectionsInTheCatalog(t *testing.T) {
 	c.Schemas = []string{schema}
 	gone := federation.New("gone", federation.Postgres)
 	gone.Host, gone.Port, gone.User, gone.Database = "127.0.0.1", 1, "nobody", "nothing"
-	for _, conn := range []federation.Connection{c, gone} {
+	// The whole database, with PostgreSQL's own schemas.
+	whole := c
+	whole.Name, whole.Schemas = "whole", nil
+	for _, conn := range []federation.Connection{c, gone, whole} {
 		if err := store.Create(ctx, conn); err != nil {
 			t.Fatal(err)
 		}
@@ -623,6 +626,10 @@ func TestConnectionsInTheCatalog(t *testing.T) {
 	// a grant, whatever their role.
 	tables := "SELECT table_catalog, table_schema, table_name, table_type, table_owner FROM igloo.tables WHERE table_catalog = 'crm' ORDER BY 3"
 	expectRows(t, fs.admin, tables, "crm|"+schema+"|customers|FOREIGN|NULL", "crm|"+schema+"|pii|FOREIGN|NULL")
+	// The remote database's own catalogs are not in it.
+	expectRows(t, fs.admin, `SELECT count(*) FILTER (WHERE table_schema = '`+schema+`') = 2,
+		count(*) FILTER (WHERE table_schema IN ('pg_catalog', 'information_schema'))
+		FROM igloo.tables WHERE table_catalog = 'whole'`, "true|0")
 	for _, conn := range []*pgx.Conn{nina, rita} {
 		if got := texts(t, conn, "SELECT * FROM igloo.tables WHERE table_catalog <> 'lake'"); len(got) != 0 {
 			t.Errorf("%s sees a connection's tables without a grant: %q", userName(t, conn), got)

@@ -181,6 +181,11 @@ func (s *Server) listConnectionTables(ctx context.Context) {
 	}
 }
 
+// remoteSystemSchemas are the schemas in which PostgreSQL and MySQL
+// describe themselves, which DuckDB attaches with a connection's own: the
+// catalog leaves them out.
+var remoteSystemSchemas = []string{"information_schema", "pg_catalog", "mysql", "performance_schema", "sys"}
+
 // readConnectionTables lists the tables of the connections catalogs, with
 // their columns, as DuckDB has them.
 func (s *Server) readConnectionTables(ctx context.Context, catalogs map[string]string) ([]catalog.TableMeta, error) {
@@ -193,8 +198,13 @@ func (s *Server) readConnectionTables(ctx context.Context, catalogs map[string]s
 	for name := range catalogs {
 		names = append(names, quoteLiteral(name))
 	}
+	system := make([]string, len(remoteSystemSchemas))
+	for i, name := range remoteSystemSchemas {
+		system[i] = quoteLiteral(name)
+	}
 	rows, err := queryRows(ctx, conn, `SELECT database_name, schema_name, table_name, column_name, data_type
 		FROM system.main.duckdb_columns() WHERE system.main.lower(database_name) IN (`+strings.Join(names, ", ")+`)
+			AND system.main.lower(schema_name) NOT IN (`+strings.Join(system, ", ")+`)
 		ORDER BY database_name, schema_name, table_name, column_index`)
 	if err != nil {
 		return nil, err
