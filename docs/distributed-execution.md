@@ -94,8 +94,10 @@ not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
 itself or read again in a subquery (TPC-H Q17, Q18, Q20, Q21), three large
 tables joined on different keys, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
-pending delete files (maintenance merges them within the hour) or with
-nested columns, and views (name the tables they read to distribute them).
+pending delete files (maintenance merges them within the hour), with
+nested columns or with data files that have no Iceberg field IDs (files
+added from outside and read through a name mapping), and views (name the
+tables they read to distribute them).
 
 ### When
 
@@ -286,8 +288,8 @@ fit one replica gain little and are not distributed.
 Distributing does not make a statement cheaper: the same work runs on more
 machines for less time, plus the start and the idle tail. It makes a
 statement that would take many minutes on one machine finish in a fraction
-of that, and lets statements whose joins and aggregations need more memory
-than one machine has run without spilling.
+of that, and lets a join of two large tables whose state is many times one
+machine's memory run where that machine would run out of memory.
 
 ## Limitations
 
@@ -303,8 +305,9 @@ than one machine has run without spilling.
 - The coordinator receives every partial result. A `GROUP BY` with billions
   of groups, or `count(DISTINCT x)` over billions of values, sends them all
   to it.
-- Tables with delete files (from `UPDATE`, `DELETE` or `MERGE`) or nested
-  columns, views, and time travel run on one machine.
+- Tables with delete files (from `UPDATE`, `DELETE` or `MERGE`), nested
+  columns or data files without field IDs, views, and time travel run on
+  one machine.
 - Workers read each table's files directly and do not use Iceberg partition
   statistics to skip files; DuckDB skips row groups by their Parquet
   statistics instead.

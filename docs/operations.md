@@ -193,15 +193,18 @@ one client's or team's compute apart from everyone else's, give them a
 
 Scale up first: one larger machine is the cheapest and simplest way to run
 bigger queries, and DuckDB spills joins, aggregations and sorts that do not
-fit in memory to disk. Two things eventually limit it:
+fit in memory to disk, slowing down only modestly. Two things eventually
+limit it:
 
-- **Scan time.** A replica scans compressed Parquet at roughly 64 to 300 MB/s
-  per thread, depending on the query and on whether the files come from
-  object storage or the [read cache](#read-cache). A query over a terabyte
-  takes minutes on even the largest machines, and object storage bandwidth
-  per machine is capped by its network.
-- **Memory.** Joins and aggregations with far more state than memory spill
-  heavily and slow down several times over.
+- **Scan time.** A query's time grows with the bytes it reads divided by
+  what one machine reads and decompresses per second, which is bounded by
+  its cores and, for files in object storage, by its network. A query over
+  a terabyte of compressed Parquet takes minutes on even the largest
+  machines.
+- **Memory.** Below some fraction of the memory a join or aggregation
+  needs, DuckDB stops spilling and the query fails with an out-of-memory
+  error. A larger machine moves that limit; on workers, a join of two
+  large tables is partitioned so that each worker holds a share of it.
 
 For those queries, run [workers](distributed-execution.md): a statement over
 a table that a replica would take more than a few seconds to scan runs in

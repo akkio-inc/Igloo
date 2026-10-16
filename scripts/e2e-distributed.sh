@@ -180,7 +180,9 @@ got="$(psql_as nora nora-password-1 -c "SET distributed_execution = 'on'" \
 if grep -q "permission denied" <<<"$got"; then pass "an ungranted table is refused"; else fail "ungranted table: $got"; fi
 
 echo "a worker dies in the middle of a statement"
-slow="SELECT l_returnflag, sum(length(repeat(l_comment, 300))) FROM lineitem GROUP BY 1 ORDER BY 1"
+# Several seconds on the workers, so that the kill a second in lands while
+# they work.
+slow="SELECT l_returnflag, sum(length(repeat(l_comment, 1500))) FROM lineitem GROUP BY 1 ORDER BY 1"
 want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$slow" | grep -v '^SET$')"
 start=$SECONDS
 psql_admin -c "SET distributed_execution = 'on'" -c "$slow" | grep -v '^SET$' >"$work/slow" &

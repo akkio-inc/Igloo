@@ -26,8 +26,8 @@ that one machine serves badly:
   households through device graphs of billions of edges) and clean-room
   joins (an advertiser's conversions against a publisher's exposures) join
   two large tables and then group. Their hash tables do not fit in one
-  machine's memory, so DuckDB spills them to disk and slows down several
-  times over.
+  machine's memory; DuckDB spills them to disk, which costs little until
+  memory is a fraction of what the join needs, and then the query fails.
 
 The 1.0 README said: "One engine per query ... very large queries that need
 a cluster are not supported yet." This design removes that limit for the
@@ -46,15 +46,18 @@ spills joins, aggregations and sorts that exceed memory to local disk.
 Scaling up keeps one moving part, one failure domain and no network
 exchange.
 
-It stops being enough in two ways, measured below (see
-[Evidence](#evidence)):
+It stops being enough in two ways (see [Evidence](#evidence)):
 
 - **Time grows with data.** Scan-bound queries take time proportional to
   the bytes read divided by one machine's throughput; for a terabyte that
   is minutes, and S3 throughput per machine is bounded by its network
   (tens of Gbit/s), not by how much the bucket can serve.
-- **Spilling is a cliff, not a slope.** Join- and aggregation-heavy queries
-  slow down several times once their state exceeds memory.
+- **Memory ends in a wall, not a slope.** DuckDB spills well: in our
+  measurements queries ran at most about twice as slow with memory cut to
+  well below the size of the data, and then, with less still, join-heavy
+  queries failed with out-of-memory errors rather than slowing down
+  further. A join whose state is many times one machine's memory needs
+  more machines' memory.
 
 So scale-up is the default and the first recommendation
 ([operations.md](../operations.md#when-one-machine-is-not-enough)), and the
@@ -237,13 +240,29 @@ widened read as the current schema does.
 
 A worker defines those views over `read_parquet`, runs the fragment on a
 connection of its own, and writes the result as Parquet, which it streams
-back. When the footers of a view's files show every column under its
-current name and field ID, with one type across the files, the view reads
-by name; otherwise by field ID. The two read the same rows, but DuckDB 1.5
-orders joins much better over reads by name (TPC-H Q5 took 20 times as
-long by field ID, joining customer to supplier first), so tables without
-schema changes, the usual case, get the better plans. Footers are read
-once per file and remembered, since data files never change.
+back. Two details decide whether DuckDB plans the fragment as well as it
+plans the statement on one machine, where it reads through its Iceberg
+extension:
+
+- **Row counts.** Each view carries its row count from Iceberg's
+  manifests, which the worker passes to `read_parquet`
+  (`explicit_cardinality`). DuckDB's own estimate from Parquet footers is
+  poor for tables of many small files: it took nation (25 rows in 8 files)
+  for 8,000 rows, joined supplier, nation and customer first (12 million
+  rows), and Q5's fragment ran eight times as long.
+- **Reading by name.** When the footers of a view's files show every
+  column under its current name and field ID, with one type across the
+  files, the view reads by name; otherwise by field ID. The two read the
+  same rows; without row counts, DuckDB's estimates were better by name
+  (Q5's fragment once took 9 seconds by field ID and 0.4 by name). With
+  them, Q5 plans alike either way. Footers are read once per file and
+  remembered, since data files never change.
+
+A file without field IDs, which only the table's name mapping can read,
+makes the worker refuse the task, and the statement runs on the
+coordinator. (iceberg-go gives every table it compacts a name mapping, but
+its files have field IDs, so the mapping alone does not keep a table on
+one machine.)
 
 Column types Parquet would change (HUGEINT, INTERVAL, TIME WITH TIME ZONE)
 cross as text and are cast back. The coordinator then runs the rest of the
@@ -358,11 +377,145 @@ cache never keeps these files.
 ## Evidence
 
 Measured on the development machine (18 cores, Docker with 15.6 GB of
-memory shared with other projects). Absolute times on that machine vary
-two- to fourfold with its load, so every comparison below is interleaved in
-one session and reports the fastest of several runs.
+memory shared with other projects, which kept it busy throughout).
+Absolute times on that machine vary two- to fourfold with its load, so
+every comparison below is interleaved in one session and reports the
+fastest of several runs. Nothing larger than TPC-H scale factor 1 was run
+there; the measurements that decide price-performance at the sizes this
+design is for are planned for EC2
+([bench/README.md](../../bench/README.md#distributed-execution)) and not
+yet made.
 
-(Filled in from `bench/distributed.py` runs; see below.)
+### One machine as memory shrinks
+
+TPC-H at scale factor 1 (lineitem is 207 MB of Parquet), DuckDB 1.5.6 with
+4 threads and the memory limit lowered step by step; seconds, fastest of
+three:
+
+| Query | 4 GB | 128 MB | 64 MB | 40 MB |
+|---|---:|---:|---:|---:|
+| Q1 (scan, aggregate) | 0.24 | 0.16 | 0.15 | 0.20 |
+| Q3 (3 joins) | 0.21 | 0.10 | 0.17 | out of memory |
+| Q6 (scan, filter) | 0.04 | 0.05 | 0.04 | 0.04 |
+| Q9 (5 joins) | 0.19 | 0.41 | out of memory | out of memory |
+| Q13 (outer join, 2 aggregations) | 0.17 | 0.14 | out of memory | out of memory |
+| Q18 (large aggregation, joins) | 0.17 | 0.21 | 0.39 | out of memory |
+| Q21 (4 joins, `EXISTS`) | 0.26 | 0.26 | out of memory | out of memory |
+
+With memory at 60% of the compressed data, no query slowed by more than
+2.2 times; at 30%, three of the five join-heavy queries failed, and at 20%
+all five did, while the scans ran as fast as ever. (Limits of 8 GB down to
+250 MB changed nothing beyond noise.) DuckDB's spilling is good enough that
+memory pressure alone is rarely a reason to distribute; running out of
+memory is. These limits are small in absolute terms, where DuckDB's fixed
+per-thread buffers weigh more than they would on a large machine, so the
+fractions are indicative only.
+
+### Correctness
+
+- **In process** (`go test ./internal/distributed`): the 22 TPC-H queries
+  at scale factor 0.05, seven files per table, over three workers; 13 run
+  distributed and all 22 return what DuckDB returns on one machine. TPC-H
+  again with orders and partsupp too large for every worker to read, so
+  that Q3, Q5, Q7, Q8, Q10 and Q12 partition their joins; some forty other
+  shapes (aggregates, grouping sets, `DISTINCT`, windows over aggregates,
+  top-N, semi and anti joins, time functions, `UNION ALL`); session time
+  zones and `integer_division`; files written under older schemas
+  (renamed, added, dropped and re-added, widened columns); a worker that
+  dies mid-task or is gone, every worker failing (the statement runs on
+  the coordinator), cancellation and errors in the data; and, through the
+  PostgreSQL protocol (`internal/pgwire`), grants, parameters and
+  fallbacks.
+- **In Docker** (`scripts/e2e-distributed.sh`): Igloo, Lakekeeper, MinIO and
+  three workers; TPC-H at scale factor 0.1, six files per table. All 22
+  queries return the same rows with and without workers, 13 of them run by
+  all three workers (from the query history); a role-`none` user's granted
+  table runs distributed and an ungranted one is refused; a worker killed
+  mid-statement has its share rerun elsewhere and the statement returns
+  the right rows; `statement_timeout` cancels a distributed statement
+  (SQLSTATE 57014); tables that maintenance compacted (and so gave a name
+  mapping) still run on workers; and the worker port refuses clients
+  without the secret.
+
+### Overhead and scaling on one machine
+
+TPC-H at scale factor 1 and the media workload at 20 million impressions
+(`bench/queries/media`), every Igloo process limited to 2 threads, tables
+in MinIO on the same machine, read cache and table maintenance off;
+`SET distributed_execution` forced each statement on or off (the automatic
+decision distributes none of these: the coordinator scans them in well
+under four seconds). One pass per worker count, each statement on one
+machine and distributed, interleaved, fastest of three; milliseconds, one
+machine / distributed. All 204 forced statements ran distributed (from the
+query history). The machine was busier during the 2-worker pass, so
+compare within a column:
+
+| Query | 1 worker | 2 workers | 4 workers |
+|---|---:|---:|---:|
+| Q1 | 266 / 534 | 263 / 389 | 189 / 192 |
+| Q3 | 197 / 748 | 182 / 480 | 160 / 428 |
+| Q5 | 114 / 467 | 197 / 685 | 197 / 679 |
+| Q6 | 84 / 173 | 118 / 265 | 90 / 236 |
+| Q7 | 196 / 561 | 343 / 979 | 254 / 664 |
+| Q8 | 194 / 491 | 345 / 784 | 334 / 973 |
+| Q9 | 300 / 568 | 422 / 1,091 | 438 / 842 |
+| Q10 | 212 / 647 | 239 / 691 | 251 / 601 |
+| Q12 | 115 / 401 | 160 / 368 | 137 / 371 |
+| Q14 | 138 / 424 | 178 / 421 | 131 / 239 |
+| Q19 | 162 / 385 | 161 / 372 | 162 / 260 |
+| m01 | 296 / 396 | 704 / 579 | 656 / 458 |
+| m02 | 1,810 / 3,303 | 4,257 / 8,708 | 2,116 / 3,000 |
+| m03 | 166 / 334 | 329 / 518 | 271 / 399 |
+| m04 | 1,034 / 1,245 | 2,304 / 1,811 | 1,853 / 1,328 |
+| m05 | 508 / 720 | 1,230 / 1,348 | 1,060 / 1,315 |
+| m06 | 107 / 217 | 222 / 378 | 209 / 335 |
+| Total | 5,900 / 11,612 | 11,654 / 19,868 | 8,507 / 12,321 |
+
+These are not the speedups to expect; on one machine, workers add no
+cores. They measure what distributing costs when there is little work to
+divide:
+
+- **Fixed cost.** Distributing added a median of about 0.3 seconds to a
+  TPC-H statement (0 to 0.7), whatever the number of workers: loading
+  each table's current snapshot from the catalog, a task round trip per
+  worker (settings, views, the fragment, writing and sending Parquet), and
+  the combine step. The automatic decision distributes only statements
+  that the coordinator would take at least four seconds for, where the
+  median is under a tenth of the time.
+- **Work that divides.** The media queries that scan the 20 million
+  impressions into few groups, m01 (weekly delivery) and m04 (household
+  reach through the device graph), ran 1.2 to 1.4 times faster on 2 and 4
+  workers, even sharing one machine's cores.
+- **Work that does not.** m02 (distinct devices per advertiser) and m05
+  (spend per device, top ten) ran slower: every worker sends its distinct
+  devices or its per-device sums to the coordinator, which then does much
+  of the work again. This is the coordinator bottleneck under
+  [Risks](#risks).
+
+Earlier runs of this benchmark found two problems, both fixed in the
+numbers above: Q5 took 2 to 4 seconds distributed against 0.2 on one
+machine, because workers' DuckDB misjudged the small tables' sizes (see
+[Running it](#running-it)); and after table maintenance compacted a table
+partway through, statements over it stopped running distributed, because
+compaction gives a table a name mapping and tables with one were kept on
+one machine. Maintenance was off for these runs, so that every statement
+saw the same files.
+
+### Cost
+
+For a statement that takes `t1` seconds on the coordinator alone and `tn`
+on the coordinator with `n` workers of the same machine type, at `p` per
+machine-hour, the distributed run costs `(n + 1) * p * tn` against
+`p * t1`, or `n * p * tn` when the coordinator runs anyway for other
+sessions. It is cheaper only if the speedup `t1 / tn` exceeds `n + 1` (or
+`n`), which happens when one machine would spill or reread from object
+storage what the workers together hold in memory. Otherwise distribution
+buys latency at a higher cost per query, and the automatic decision spends
+it only on statements one machine would take seconds to minutes for.
+Workers started for a statement run until idle (`IGLOO_WORKER_IDLE_AFTER`,
+10 minutes), so a single large statement a day also pays for that idle
+time; a busy warehouse amortizes it over many. `bench/distributed.py`
+reports the cost per query on the EC2 runs.
 
 ## Risks
 
@@ -381,3 +534,11 @@ one session and reports the fastest of several runs.
 - **Deletes.** Tables with position deletes, equality deletes or deletion
   vectors run on one machine until maintenance merges them (hourly).
   Applying position deletes on workers is straightforward future work.
+- **Files without identity-partition columns.** The Iceberg spec lets a
+  data file omit a column that an identity partition holds, to be read from
+  the file's partition value. Workers would read such a column as `NULL`.
+  No writer Igloo is used with omits them (Igloo does not write partitioned
+  tables; Spark, Flink, Trino and PyIceberg write the column); tables
+  migrated from Hive layouts do, and their files have no field IDs, which
+  workers refuse. Checking the footers, which workers already read, against
+  the identity-partitioned columns would close this.
