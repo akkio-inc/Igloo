@@ -1,0 +1,117 @@
+package distributed
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestTPCH runs the 22 TPC-H queries distributed over three workers and
+// compares every result with DuckDB's on one machine. Queries that read
+// lineitem more than once, or whose largest table sits where its rows
+// cannot be divided, run on one machine; the rest must run distributed.
+func TestTPCH(t *testing.T) {
+	h := newHarness(t, 0.05, 7, 3)
+	distributed := 0
+	for q := 1; q <= 22; q++ {
+		b, err := os.ReadFile(filepath.Join("..", "..", "bench", "queries", "tpch", fmt.Sprintf("q%02d.sql", q)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Run(fmt.Sprintf("q%02d", q), func(t *testing.T) {
+			h.t = t
+			if h.check(string(b)) {
+				distributed++
+			}
+		})
+	}
+	t.Logf("%d of 22 queries ran distributed", distributed)
+	if distributed < 12 {
+		t.Errorf("only %d of 22 TPC-H queries ran distributed", distributed)
+	}
+}
+
+// TestShapes covers the statement shapes distributed execution handles,
+// with results compared to one machine's.
+func TestShapes(t *testing.T) {
+	h := newHarness(t, 0.02, 5, 3)
+	queries := []string{
+		// Aggregates and their combinations.
+		`SELECT count(*), count(l_comment), sum(l_quantity), min(l_shipdate), max(l_comment), avg(l_discount) FROM lineitem`,
+		`SELECT l_returnflag, l_linestatus, sum(l_extendedprice * (1 - l_discount)) / sum(l_quantity) AS r, count(*) FILTER (WHERE l_tax > 0.04) AS taxed FROM lineitem GROUP BY ALL ORDER BY ALL`,
+		`SELECT l_returnflag AS f, count(DISTINCT l_partkey) AS parts, count(*) AS n, sum(DISTINCT l_partkey) AS s FROM lineitem GROUP BY 1 ORDER BY f`,
+		`SELECT count(DISTINCT l_suppkey) FROM lineitem WHERE l_quantity > 49`,
+		`SELECT count(DISTINCT l_suppkey) FROM lineitem WHERE l_quantity > 1000`,
+		`SELECT count(*), sum(l_quantity) FROM lineitem WHERE l_quantity > 1000`,
+		`SELECT l_shipmode, count(*) FROM lineitem WHERE l_quantity > 1000 GROUP BY l_shipmode`,
+		`SELECT l_shipmode, l_returnflag, count(*) AS n, sum(l_quantity) AS q FROM lineitem GROUP BY ROLLUP (l_shipmode, l_returnflag) ORDER BY 1, 2`,
+		`SELECT l_shipmode, l_returnflag, GROUPING(l_shipmode, l_returnflag) AS g, count(*) FROM lineitem GROUP BY CUBE (l_shipmode, l_returnflag) ORDER BY 1, 2, 3`,
+		`SELECT l_linestatus, sum(l_quantity) AS total FROM lineitem GROUP BY l_linestatus HAVING total > 10 AND count(*) > 5 ORDER BY total DESC`,
+		`SELECT extract(year FROM l_shipdate) AS y, sum(l_quantity) FROM lineitem GROUP BY y ORDER BY y`,
+		`SELECT lineitem.l_returnflag, sum(l_quantity) FROM lineitem GROUP BY l_returnflag ORDER BY 1`,
+		`SELECT l_returnflag, bool_and(l_quantity > 0), bool_or(l_quantity > 49), bit_or(l_linenumber), max(l_shipinstruct) FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`SELECT l_returnflag, rank() OVER (ORDER BY sum(l_quantity) DESC) AS r, sum(sum(l_quantity)) OVER () AS total FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`SELECT l_returnflag, count(*) AS n FROM lineitem GROUP BY 1 QUALIFY rank() OVER (ORDER BY n DESC) <= 2 ORDER BY 1`,
+		`SELECT DISTINCT l_returnflag, l_linestatus FROM lineitem ORDER BY 1, 2`,
+		`SELECT CASE WHEN l_quantity < 10 THEN 'small' ELSE 'large' END AS size, count(*) FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`SELECT l_returnflag, sum(l_quantity)::BIGINT AS q, count(*) * 2 AS twice FROM lineitem GROUP BY l_returnflag ORDER BY q`,
+		`SELECT l_returnflag, any_value(l_returnflag) = l_returnflag AS same FROM lineitem GROUP BY 1 ORDER BY 1`,
+		// Joins with the other tables read in full by every worker.
+		`SELECT n_name, count(*) FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey GROUP BY n_name ORDER BY 2 DESC, 1`,
+		`SELECT p_brand, sum(l_quantity) FROM lineitem LEFT JOIN part ON l_partkey = p_partkey AND p_size > 40 GROUP BY 1 ORDER BY 1 NULLS FIRST`,
+		`SELECT count(*) FROM lineitem SEMI JOIN part ON l_partkey = p_partkey AND p_size = 1`,
+		`SELECT count(*) FROM lineitem ANTI JOIN part ON l_partkey = p_partkey AND p_size = 1`,
+		`SELECT l_shipmode, count(*) FROM lineitem WHERE l_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE '%green%') GROUP BY 1 ORDER BY 1`,
+		`SELECT count(*) FROM lineitem l WHERE EXISTS (SELECT 1 FROM supplier s WHERE s.s_suppkey = l.l_suppkey AND s.s_acctbal > 5000)`,
+		`SELECT s.n, sum(s.q) FROM (SELECT n_name AS n, l_quantity AS q FROM lineitem, supplier, nation WHERE l_suppkey = s_suppkey AND s_nationkey = n_nationkey) AS s GROUP BY 1 ORDER BY 1`,
+		// Rows: filters, top-N, DISTINCT.
+		`SELECT l_orderkey, l_linenumber, l_comment FROM lineitem WHERE l_quantity = 50 AND l_discount = 0.1`,
+		`SELECT l_orderkey, l_linenumber, l_extendedprice FROM lineitem ORDER BY l_extendedprice DESC, l_orderkey, l_linenumber LIMIT 7`,
+		`SELECT * FROM lineitem ORDER BY l_extendedprice DESC, l_orderkey, l_linenumber LIMIT 3 OFFSET 2`,
+		`SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey, l_linenumber`,
+		`SELECT DISTINCT l_shipmode FROM lineitem`,
+		// Time functions every machine must agree on.
+		`SELECT count(*) FROM lineitem WHERE l_shipdate < current_date AND l_commitdate < now()`,
+		// The coordinator part may hold anything.
+		`SELECT f, n FROM (SELECT l_returnflag AS f, count(*) AS n FROM lineitem GROUP BY 1) AS x JOIN (VALUES ('A'), ('R')) v(f2) ON f = f2 ORDER BY 1`,
+		`WITH t AS (SELECT l_returnflag AS f, count(*) AS n FROM lineitem GROUP BY 1) SELECT * FROM t WHERE n > 10 ORDER BY 1`,
+		`SELECT f, c, count(*) FROM (SELECT l_orderkey, min(l_returnflag) AS f, count(*) AS c FROM lineitem GROUP BY l_orderkey) GROUP BY f, c ORDER BY f, c`,
+		`SELECT 'lineitem' AS t, count(*) FROM lineitem UNION ALL SELECT 'orders', count(*) FROM orders ORDER BY 1`,
+	}
+	for _, q := range queries {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Errorf("did not run distributed")
+			}
+		})
+	}
+}
+
+// TestLocal covers statements that must run on one machine.
+func TestLocal(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	for _, q := range []string{
+		`SELECT median(l_quantity) FROM lineitem`,
+		`SELECT l_orderkey, sum(l_quantity) OVER (PARTITION BY l_orderkey) FROM lineitem`,
+		`SELECT count(*) FROM lineitem a JOIN lineitem b USING (l_orderkey, l_linenumber)`,
+		`SELECT count(*) FROM part LEFT JOIN lineitem ON p_partkey = l_partkey`,
+		`SELECT * FROM lineitem LIMIT 5`,
+		`SELECT l_quantity FROM lineitem`,
+		`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`,
+		`SELECT string_agg(l_comment, ',' ORDER BY l_comment) FROM lineitem`,
+		`SELECT count(*) FROM lineitem, range(3)`,
+		`SELECT count(DISTINCT l_partkey), count(DISTINCT l_suppkey) FROM lineitem`,
+		`SELECT getvariable('x'), count(*) FROM lineitem WHERE l_quantity > getvariable('y')`,
+		`SELECT count(*) FROM lineitem WHERE l_quantity > $1`,
+		`SELECT (SELECT count(*) FROM lineitem) + (SELECT count(*) FROM orders) AS n`,
+	} {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if _, _, _, _, err := h.run(t.Context(), q, ModeOn); !IsUnsupported(err) {
+				t.Errorf("want it to run on one machine, got %v", err)
+			}
+		})
+	}
+}
