@@ -272,5 +272,6 @@
       "error": null,
       "timing": "client"
     }
-  ]
+  ],
+  "storage": "local disk"
 }

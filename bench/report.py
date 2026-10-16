@@ -80,7 +80,7 @@ def merge(results: list[dict]) -> list[dict]:
     median cold time per query, every warm time, the median resume."""
     groups: dict[tuple, list[dict]] = {}
     for r in results:
-        key = (r["platform"], r["size"], r["scale"], r["suite"], bool(r.get("scale_to_zero")))
+        key = (r["platform"], r["size"], r["scale"], r["suite"], bool(r.get("scale_to_zero")), r.get("storage"))
         groups.setdefault(key, []).append(r)
     merged = []
     for rs in groups.values():
@@ -155,7 +155,8 @@ def main() -> None:
         else:
             burst = burst_seconds(pricing, platform, s["cold"]) * rate / 3600
             monthly = burst * args.runs_per_day * DAYS_PER_MONTH
-        rows.append({**result, **s, "platform": platform, "rate": rate, "resume": resume,
+        size = result["size"] + (f" ({result['storage']})" if result.get("storage") else "")
+        rows.append({**result, **s, "platform": platform, "size": size, "rate": rate, "resume": resume,
                      "warm_cost": s["warm"] * rate / 3600, "burst_cost": burst, "monthly": monthly})
 
     out = sys.stdout

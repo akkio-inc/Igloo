@@ -272,5 +272,6 @@
       "timing": "client"
     }
   ],
-  "scale_to_zero": true
+  "scale_to_zero": true,
+  "storage": "local disk"
 }

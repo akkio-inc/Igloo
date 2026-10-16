@@ -21,7 +21,11 @@ is deterministic, so every platform gets identical rows:
 
 - Igloo: `make load-tpch SF=10`, or on a cloud deployment
   `CALL dbgen(sf = 10)` followed by `CREATE TABLE ... AS SELECT` per table,
-  as `deploy/single-vm/sql/load-tpch.sql` does.
+  as `deploy/single-vm/sql/load-tpch.sql` does. Keep the tables in the
+  cloud's object storage (Amazon S3 here), as Snowflake and Databricks do,
+  and pass `--storage S3` so the report labels the run; results with tables
+  on the machine's own disk are labeled `local disk` and are not a fair
+  comparison.
 - Snowflake: the built-in `SNOWFLAKE_SAMPLE_DATA.TPCH_SF10` and `TPCH_SF100`
   schemas hold the same data (set `SNOWFLAKE_SCHEMA`).
 - Databricks: write Parquet with DuckDB
@@ -63,6 +67,20 @@ and is left out.
 The list prices in `pricing.toml` are a starting point. Replace them with
 negotiated rates (`--set snowflake.price_per_credit=...`) before drawing
 conclusions, and record which prices a published report used.
+
+## Reading the Igloo results
+
+- **First runs read from object storage.** The first run after Igloo
+  starts fetches every file from S3: on a c7g.4xlarge it took 31 to 59
+  seconds for the 22 queries, against 5.5 seconds once the files are
+  cached in memory. With scale to zero, every burst after a stop pays this,
+  and the report bills it.
+- **Repeat runs** are the same on S3 and on local disk, within a few
+  percent.
+- `report.py` merges repeated results for the same platform, size, storage
+  and mode. A run's first ("cold") pass is only cold if nothing ran on the
+  machine since it started, so keep one result per fresh start when
+  comparing cold times.
 
 ## What it does not measure yet
 

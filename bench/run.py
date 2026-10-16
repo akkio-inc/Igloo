@@ -152,6 +152,7 @@ def main() -> None:
     p.add_argument("--scale", type=float, required=True, help="data scale factor, for the report")
     p.add_argument("--runs", type=int, default=3, help="warm runs after the cold one")
     p.add_argument("--out", type=pathlib.Path, help="results file (default bench/results/<platform>-<size>-sf<scale>.json)")
+    p.add_argument("--storage", help="Igloo only: where table data lives, e.g. S3 or local disk, for the report")
     p.add_argument("--scale-to-zero", action="store_true",
                    help="Igloo only: the client connects through the scale-to-zero gateway to a stopped machine, "
                         "so the connect time is the time to resume")
@@ -210,6 +211,7 @@ def main() -> None:
         "runs": args.runs,
         "connect_seconds": connect_seconds,
         "scale_to_zero": args.scale_to_zero,
+        "storage": args.storage,
         "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "queries": results,
     }, indent=2) + "\n")
