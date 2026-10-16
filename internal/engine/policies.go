@@ -102,10 +102,15 @@ func policyReferences(catalog string, snap *policy.Snapshot) [][]any {
 	}
 	var rows [][]any
 	for _, t := range snap.Tables() {
+		db := catalog
+		if t.Catalog != "" {
+			// A table of a connection to another database.
+			db = t.Catalog
+		}
 		if t.Filter != nil {
 			cols := make([]string, len(t.Filter.Columns))
 			copy(cols, t.Filter.Columns)
-			rows = append(rows, []any{t.Filter.Policy, string(policy.RowAccess), catalog, t.Schema, t.Table, "TABLE", nil, cols, nil})
+			rows = append(rows, []any{t.Filter.Policy, string(policy.RowAccess), db, t.Schema, t.Table, "TABLE", nil, cols, nil})
 		}
 		names := make([]string, 0, len(t.Columns))
 		for name := range t.Columns {
@@ -115,10 +120,10 @@ func policyReferences(catalog string, snap *policy.Snapshot) [][]any {
 		for _, name := range names {
 			c := t.Columns[name]
 			if c.Mask != nil {
-				rows = append(rows, []any{c.Mask.Name, string(policy.Masking), catalog, t.Schema, t.Table, "TABLE", c.Column, nil, nil})
+				rows = append(rows, []any{c.Mask.Name, string(policy.Masking), db, t.Schema, t.Table, "TABLE", c.Column, nil, nil})
 			}
 			for _, tm := range c.TagMasks {
-				rows = append(rows, []any{tm.Policy.Name, string(policy.Masking), catalog, t.Schema, t.Table, "TABLE", c.Column, nil, tm.Tag})
+				rows = append(rows, []any{tm.Policy.Name, string(policy.Masking), db, t.Schema, t.Table, "TABLE", c.Column, nil, tm.Tag})
 			}
 		}
 	}
@@ -137,7 +142,11 @@ func tagReferences(catalog string, snap *policy.Snapshot) [][]any {
 	})
 	rows := make([][]any, len(tags))
 	for i, ct := range tags {
-		rows[i] = []any{ct.Tag, ct.Value, catalog, ct.Schema, ct.Table, "COLUMN", ct.Column}
+		db := catalog
+		if ct.Catalog != "" {
+			db = ct.Catalog
+		}
+		rows[i] = []any{ct.Tag, ct.Value, db, ct.Schema, ct.Table, "COLUMN", ct.Column}
 	}
 	return rows
 }

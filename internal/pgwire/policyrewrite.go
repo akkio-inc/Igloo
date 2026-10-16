@@ -140,6 +140,23 @@ func (rw *rewriter) plan(o object, rules *policy.TableRules) (*tablePlan, error)
 		return slices.IndexFunc(cols, func(c columnType) bool { return strings.EqualFold(c.name, name) })
 	}
 	table := o.schema + "." + o.name
+	if rules.Catalog != "" {
+		// A table of a connection, whose database renames and drops its
+		// columns without Igloo: a masked column it no longer has may
+		// have been renamed, so the table is not read until its policies
+		// are set again. Nor is one whose name Igloo cannot tell apart
+		// from another's.
+		table = o.db + "." + table
+		if err := rw.r.distinctInCase(o); err != nil {
+			return nil, err
+		}
+		for _, cr := range rules.Columns {
+			if cr.Masked() && index(cr.Column) < 0 {
+				return nil, denied("column %s of %s has a masking policy, but the table no longer has it; "+
+					"unset the policy, or set it on the column's new name, to read the table", cr.Column, table)
+			}
+		}
+	}
 
 	if rules.Filter != nil {
 		p := *rules.FilterPolicy
@@ -316,7 +333,21 @@ func (rw *rewriter) sensitive(o object) bool {
 	if o.view {
 		return rw.sens.viewProtected[o.key()]
 	}
-	return strings.EqualFold(o.db, rw.r.catalog) && rw.snap.Rules(o.schema, o.name) != nil
+	return rw.rules(o) != nil
+}
+
+// rules returns what protects o, a table of the catalog or of a
+// connection, or nil.
+func (rw *rewriter) rules(o object) *policy.TableRules {
+	switch {
+	case o.view:
+		return nil
+	case strings.EqualFold(o.db, rw.r.catalog):
+		return rw.snap.Rules(o.schema, o.name)
+	case rw.r.isExternal(o.db):
+		return rw.snap.ConnectionRules(strings.ToLower(o.db), o.schema, o.name)
+	}
+	return nil
 }
 
 // queryEdits returns the edits that make text, a query written in the
@@ -415,9 +446,9 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		// Igloo's own view of an external table (Delta Sharing), over
 		// files only its proxy serves; policies cannot be attached to
 		// one (see policyTable).
-	case !o.view && strings.EqualFold(o.db, rw.r.catalog) && rw.snap.Rules(o.schema, o.name) != nil:
+	case rw.rules(o) != nil:
 		rw.touched = true
-		plan, err := rw.plan(o, rw.snap.Rules(o.schema, o.name))
+		plan, err := rw.plan(o, rw.rules(o))
 		if err != nil {
 			return nil, err
 		}
@@ -983,7 +1014,7 @@ func (rw *rewriter) insertEdits(query string) ([]edit, error) {
 		if o, ok, err := rw.target(target); err != nil {
 			return nil, err
 		} else if ok {
-			plan, err := rw.plan(o, rw.snap.Rules(o.schema, o.name))
+			plan, err := rw.plan(o, rw.rules(o))
 			if err != nil {
 				return nil, err
 			}
@@ -1003,7 +1034,7 @@ func (rw *rewriter) insertEdits(query string) ([]edit, error) {
 }
 
 // target resolves the table a statement writes, reporting whether it is a
-// protected catalog table.
+// protected table.
 func (rw *rewriter) target(name []string) (object, bool, error) {
 	res, err := rw.r.resolve(tableRef{parts: name}, nil)
 	if err != nil {
@@ -1021,7 +1052,7 @@ func (rw *rewriter) target(name []string) (object, bool, error) {
 			return object{}, false, denied("%s is ambiguous; qualify it", strings.Join(name, "."))
 		}
 	}
-	if o.view || !strings.EqualFold(o.db, rw.r.catalog) || rw.snap.Rules(o.schema, o.name) == nil {
+	if rw.rules(o) == nil {
 		return o, false, nil
 	}
 	rw.touched = true
@@ -1513,7 +1544,7 @@ func (rw *rewriter) dmlEdits(t duckdb.StmtType, query string) ([]edit, error) {
 	// A target with an alias of this rewrite's was rewritten already.
 	ours := strings.HasPrefix(strings.Trim(d.alias, `"`), rw.prefix("g"))
 	if protected && !ours {
-		if plan, err = rw.plan(o, rw.snap.Rules(o.schema, o.name)); err != nil {
+		if plan, err = rw.plan(o, rw.rules(o)); err != nil {
 			return nil, err
 		}
 		if plan.noop() {

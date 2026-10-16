@@ -86,19 +86,24 @@ type Tag struct {
 	Policies []string `json:"policies,omitempty"`
 }
 
-// ColumnMask attaches a masking policy to a column.
+// ColumnMask attaches a masking policy to a column. Catalog, in this and
+// the other attachments, is empty for a table of the Iceberg catalog and
+// names the connection, lower-cased, for a table of a connection to
+// another database.
 type ColumnMask struct {
-	Schema string    `json:"schema"`
-	Table  string    `json:"table"`
-	Column string    `json:"column"`
-	Policy string    `json:"policy"`
-	SetBy  string    `json:"set_by,omitempty"`
-	SetAt  time.Time `json:"set_at"`
+	Catalog string    `json:"catalog,omitempty"`
+	Schema  string    `json:"schema"`
+	Table   string    `json:"table"`
+	Column  string    `json:"column"`
+	Policy  string    `json:"policy"`
+	SetBy   string    `json:"set_by,omitempty"`
+	SetAt   time.Time `json:"set_at"`
 }
 
 // RowFilter attaches a row access policy to a table, with the columns that
 // are its arguments.
 type RowFilter struct {
+	Catalog string    `json:"catalog,omitempty"`
 	Schema  string    `json:"schema"`
 	Table   string    `json:"table"`
 	Policy  string    `json:"policy"`
@@ -109,13 +114,23 @@ type RowFilter struct {
 
 // ColumnTag sets a tag on a column.
 type ColumnTag struct {
-	Schema string    `json:"schema"`
-	Table  string    `json:"table"`
-	Column string    `json:"column"`
-	Tag    string    `json:"tag"`
-	Value  string    `json:"value"`
-	SetBy  string    `json:"set_by,omitempty"`
-	SetAt  time.Time `json:"set_at"`
+	Catalog string    `json:"catalog,omitempty"`
+	Schema  string    `json:"schema"`
+	Table   string    `json:"table"`
+	Column  string    `json:"column"`
+	Tag     string    `json:"tag"`
+	Value   string    `json:"value"`
+	SetBy   string    `json:"set_by,omitempty"`
+	SetAt   time.Time `json:"set_at"`
+}
+
+// TableName is a table's name as attachments show it: schema.table, or
+// connection.schema.table for a table of a connection.
+func TableName(catalog, schema, table string) string {
+	if catalog != "" {
+		return catalog + "." + schema + "." + table
+	}
+	return schema + "." + table
 }
 
 // Catalog is every policy, tag and attachment. Attachments name tables and
@@ -142,12 +157,12 @@ func (c *Catalog) clone() Catalog {
 	return out
 }
 
-func sameTable(schema, table, s, t string) bool {
-	return strings.EqualFold(schema, s) && strings.EqualFold(table, t)
+func sameTable(catalog, schema, table, k, s, t string) bool {
+	return strings.EqualFold(catalog, k) && strings.EqualFold(schema, s) && strings.EqualFold(table, t)
 }
 
-func sameColumn(schema, table, column, s, t, c string) bool {
-	return sameTable(schema, table, s, t) && strings.EqualFold(column, c)
+func sameColumn(catalog, schema, table, column, k, s, t, c string) bool {
+	return sameTable(catalog, schema, table, k, s, t) && strings.EqualFold(column, c)
 }
 
 func (c *Catalog) policyIndex(name string) int {
@@ -179,12 +194,12 @@ func (c *Catalog) uses(name string) []string {
 	var out []string
 	for _, m := range c.Masks {
 		if m.Policy == name {
-			out = append(out, "column "+m.Schema+"."+m.Table+"."+m.Column)
+			out = append(out, "column "+TableName(m.Catalog, m.Schema, m.Table)+"."+m.Column)
 		}
 	}
 	for _, f := range c.RowFilters {
 		if f.Policy == name {
-			out = append(out, "table "+f.Schema+"."+f.Table)
+			out = append(out, "table "+TableName(f.Catalog, f.Schema, f.Table))
 		}
 	}
 	for _, t := range c.Tags {
@@ -261,10 +276,10 @@ func (c *Catalog) SetMask(m ColumnMask, force bool, now time.Time) error {
 	}
 	m.SetAt = now
 	for i, old := range c.Masks {
-		if sameColumn(old.Schema, old.Table, old.Column, m.Schema, m.Table, m.Column) {
+		if sameColumn(old.Catalog, old.Schema, old.Table, old.Column, m.Catalog, m.Schema, m.Table, m.Column) {
 			if old.Policy != m.Policy && !force {
-				return fmt.Errorf("column %s.%s.%s has masking policy %q %w; add FORCE to replace it",
-					m.Schema, m.Table, m.Column, old.Policy, ErrExists)
+				return fmt.Errorf("column %s.%s has masking policy %q %w; add FORCE to replace it",
+					TableName(m.Catalog, m.Schema, m.Table), m.Column, old.Policy, ErrExists)
 			}
 			c.Masks[i] = m
 			return nil
@@ -275,13 +290,13 @@ func (c *Catalog) SetMask(m ColumnMask, force bool, now time.Time) error {
 }
 
 // UnsetMask detaches a column's masking policy.
-func (c *Catalog) UnsetMask(schema, table, column string) error {
+func (c *Catalog) UnsetMask(catalog, schema, table, column string) error {
 	n := len(c.Masks)
 	c.Masks = slices.DeleteFunc(c.Masks, func(m ColumnMask) bool {
-		return sameColumn(m.Schema, m.Table, m.Column, schema, table, column)
+		return sameColumn(m.Catalog, m.Schema, m.Table, m.Column, catalog, schema, table, column)
 	})
 	if len(c.Masks) == n {
-		return fmt.Errorf("column %s.%s.%s has no masking policy: %w", schema, table, column, ErrNotFound)
+		return fmt.Errorf("column %s.%s has no masking policy: %w", TableName(catalog, schema, table), column, ErrNotFound)
 	}
 	return nil
 }
@@ -297,8 +312,8 @@ func (c *Catalog) AddRowFilter(f RowFilter, now time.Time) error {
 		return fmt.Errorf("row access policy %q takes %d arguments, not %d: %w", p.Name, len(p.Args), len(f.Columns), ErrInvalid)
 	}
 	for _, old := range c.RowFilters {
-		if sameTable(old.Schema, old.Table, f.Schema, f.Table) {
-			return fmt.Errorf("table %s.%s has row access policy %q %w; drop it first", f.Schema, f.Table, old.Policy, ErrExists)
+		if sameTable(old.Catalog, old.Schema, old.Table, f.Catalog, f.Schema, f.Table) {
+			return fmt.Errorf("table %s has row access policy %q %w; drop it first", TableName(f.Catalog, f.Schema, f.Table), old.Policy, ErrExists)
 		}
 	}
 	f.SetAt = now
@@ -308,16 +323,16 @@ func (c *Catalog) AddRowFilter(f RowFilter, now time.Time) error {
 
 // DropRowFilter detaches a table's row access policy, which must be name
 // unless name is empty.
-func (c *Catalog) DropRowFilter(schema, table, name string) error {
+func (c *Catalog) DropRowFilter(catalog, schema, table, name string) error {
 	n := len(c.RowFilters)
 	c.RowFilters = slices.DeleteFunc(c.RowFilters, func(f RowFilter) bool {
-		return sameTable(f.Schema, f.Table, schema, table) && (name == "" || f.Policy == name)
+		return sameTable(f.Catalog, f.Schema, f.Table, catalog, schema, table) && (name == "" || f.Policy == name)
 	})
 	if len(c.RowFilters) == n {
 		if name == "" {
-			return fmt.Errorf("table %s.%s has no row access policy: %w", schema, table, ErrNotFound)
+			return fmt.Errorf("table %s has no row access policy: %w", TableName(catalog, schema, table), ErrNotFound)
 		}
-		return fmt.Errorf("table %s.%s has no row access policy %q: %w", schema, table, name, ErrNotFound)
+		return fmt.Errorf("table %s has no row access policy %q: %w", TableName(catalog, schema, table), name, ErrNotFound)
 	}
 	return nil
 }
@@ -350,7 +365,7 @@ func (c *Catalog) DropTag(name string) error {
 	var uses []string
 	for _, ct := range c.ColumnTags {
 		if ct.Tag == name {
-			uses = append(uses, "column "+ct.Schema+"."+ct.Table+"."+ct.Column)
+			uses = append(uses, "column "+TableName(ct.Catalog, ct.Schema, ct.Table)+"."+ct.Column)
 		}
 	}
 	if len(uses) > 0 {
@@ -411,7 +426,7 @@ func (c *Catalog) SetColumnTag(ct ColumnTag, now time.Time) error {
 	}
 	ct.SetAt = now
 	for i, old := range c.ColumnTags {
-		if old.Tag == ct.Tag && sameColumn(old.Schema, old.Table, old.Column, ct.Schema, ct.Table, ct.Column) {
+		if old.Tag == ct.Tag && sameColumn(old.Catalog, old.Schema, old.Table, old.Column, ct.Catalog, ct.Schema, ct.Table, ct.Column) {
 			c.ColumnTags[i] = ct
 			return nil
 		}
@@ -421,13 +436,13 @@ func (c *Catalog) SetColumnTag(ct ColumnTag, now time.Time) error {
 }
 
 // UnsetColumnTag removes a tag from a column.
-func (c *Catalog) UnsetColumnTag(schema, table, column, tag string) error {
+func (c *Catalog) UnsetColumnTag(catalog, schema, table, column, tag string) error {
 	n := len(c.ColumnTags)
 	c.ColumnTags = slices.DeleteFunc(c.ColumnTags, func(ct ColumnTag) bool {
-		return ct.Tag == tag && sameColumn(ct.Schema, ct.Table, ct.Column, schema, table, column)
+		return ct.Tag == tag && sameColumn(ct.Catalog, ct.Schema, ct.Table, ct.Column, catalog, schema, table, column)
 	})
 	if len(c.ColumnTags) == n {
-		return fmt.Errorf("column %s.%s.%s has no tag %q: %w", schema, table, column, tag, ErrNotFound)
+		return fmt.Errorf("column %s.%s has no tag %q: %w", TableName(catalog, schema, table), column, tag, ErrNotFound)
 	}
 	return nil
 }
@@ -463,9 +478,10 @@ type ColumnRules struct {
 // Masked reports whether some masking policy applies to the column.
 func (r *ColumnRules) Masked() bool { return r != nil && (r.Mask != nil || len(r.TagMasks) > 0) }
 
-// TableRules is what protects one table.
+// TableRules is what protects one table. Catalog is empty for a table of
+// the Iceberg catalog and names the connection for a table of one.
 type TableRules struct {
-	Schema, Table string
+	Catalog, Schema, Table string
 	// Filter and FilterPolicy are the table's row access policy, if any.
 	Filter       *RowFilter
 	FilterPolicy *Policy
@@ -499,10 +515,10 @@ func (r *TableRules) Column(name string) *ColumnRules {
 	return r.Columns[strings.ToLower(name)]
 }
 
-type tableKey struct{ schema, table string }
+type tableKey struct{ catalog, schema, table string }
 
-func keyOf(schema, table string) tableKey {
-	return tableKey{strings.ToLower(schema), strings.ToLower(table)}
+func keyOf(catalog, schema, table string) tableKey {
+	return tableKey{strings.ToLower(catalog), strings.ToLower(schema), strings.ToLower(table)}
 }
 
 // Snapshot is a Catalog as of a version, indexed by table. It must not be
@@ -512,16 +528,18 @@ type Snapshot struct {
 	Catalog Catalog
 	tables  map[tableKey]*TableRules
 	names   map[string]bool
+	// connections is set when a policy protects a table of a connection.
+	connections bool
 }
 
 // NewSnapshot indexes c.
 func NewSnapshot(version int64, c Catalog) *Snapshot {
 	s := &Snapshot{Version: version, Catalog: c, tables: map[tableKey]*TableRules{}, names: map[string]bool{}}
-	table := func(schema, name string) *TableRules {
-		k := keyOf(schema, name)
+	table := func(catalog, schema, name string) *TableRules {
+		k := keyOf(catalog, schema, name)
 		t := s.tables[k]
 		if t == nil {
-			t = &TableRules{Schema: schema, Table: name, Columns: map[string]*ColumnRules{}}
+			t = &TableRules{Catalog: strings.ToLower(catalog), Schema: schema, Table: name, Columns: map[string]*ColumnRules{}}
 			s.tables[k] = t
 		}
 		return t
@@ -537,17 +555,17 @@ func NewSnapshot(version int64, c Catalog) *Snapshot {
 	}
 	for _, f := range c.RowFilters {
 		if p, ok := c.Policy(f.Policy); ok {
-			t := table(f.Schema, f.Table)
+			t := table(f.Catalog, f.Schema, f.Table)
 			t.Filter, t.FilterPolicy = &f, &p
 		}
 	}
 	for _, m := range c.Masks {
 		if p, ok := c.Policy(m.Policy); ok {
-			column(table(m.Schema, m.Table), m.Column).Mask = &p
+			column(table(m.Catalog, m.Schema, m.Table), m.Column).Mask = &p
 		}
 	}
 	for _, ct := range c.ColumnTags {
-		col := column(table(ct.Schema, ct.Table), ct.Column)
+		col := column(table(ct.Catalog, ct.Schema, ct.Table), ct.Column)
 		col.Tags = append(col.Tags, ct)
 		if tag, ok := c.Tag(ct.Tag); ok {
 			for _, name := range tag.Policies {
@@ -560,10 +578,15 @@ func NewSnapshot(version int64, c Catalog) *Snapshot {
 	for k, t := range s.tables {
 		if t.Protected() {
 			s.names[k.table] = true
+			s.connections = s.connections || k.catalog != ""
 		}
 	}
 	return s
 }
+
+// ProtectsConnections reports whether a policy protects a table of a
+// connection to another database.
+func (s *Snapshot) ProtectsConnections() bool { return s != nil && s.connections }
 
 // Empty reports whether no policy protects anything.
 func (s *Snapshot) Empty() bool { return s == nil || len(s.names) == 0 }
@@ -582,28 +605,41 @@ func BaseName(table string) string {
 	return table
 }
 
-// Rules returns what protects schema.table, or nil when nothing does.
+// Rules returns what protects schema.table of the Iceberg catalog, or nil
+// when nothing does.
 func (s *Snapshot) Rules(schema, table string) *TableRules {
 	if s == nil {
 		return nil
 	}
-	if t := s.tables[keyOf(schema, BaseName(table))]; t.Protected() {
+	if t := s.tables[keyOf("", schema, BaseName(table))]; t.Protected() {
 		return t
 	}
 	return nil
 }
 
-// Tagged returns the tags and policies of schema.table, protecting it or
-// not, or nil.
+// ConnectionRules returns what protects schema.table of the connection
+// called catalog, or nil when nothing does.
+func (s *Snapshot) ConnectionRules(catalog, schema, table string) *TableRules {
+	if s == nil || catalog == "" {
+		return nil
+	}
+	if t := s.tables[keyOf(catalog, schema, table)]; t.Protected() {
+		return t
+	}
+	return nil
+}
+
+// Tagged returns the tags and policies of schema.table of the Iceberg
+// catalog, protecting it or not, or nil.
 func (s *Snapshot) Tagged(schema, table string) *TableRules {
 	if s == nil {
 		return nil
 	}
-	return s.tables[keyOf(schema, table)]
+	return s.tables[keyOf("", schema, table)]
 }
 
 // ProtectedNames are the lower-case names of the protected tables, without
-// their schemas.
+// their schemas or catalogs.
 func (s *Snapshot) ProtectedNames() map[string]bool {
 	if s == nil {
 		return nil
@@ -611,7 +647,8 @@ func (s *Snapshot) ProtectedNames() map[string]bool {
 	return s.names
 }
 
-// Tables lists every table with rules or tags, by schema and name.
+// Tables lists every table with rules or tags, by catalog, schema and
+// name: the Iceberg catalog's first.
 func (s *Snapshot) Tables() []*TableRules {
 	if s == nil {
 		return nil
@@ -621,7 +658,10 @@ func (s *Snapshot) Tables() []*TableRules {
 		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		a, b := keyOf(out[i].Schema, out[i].Table), keyOf(out[j].Schema, out[j].Table)
+		a, b := keyOf(out[i].Catalog, out[i].Schema, out[i].Table), keyOf(out[j].Catalog, out[j].Schema, out[j].Table)
+		if a.catalog != b.catalog {
+			return a.catalog < b.catalog
+		}
 		return a.schema < b.schema || a.schema == b.schema && a.table < b.table
 	})
 	return out

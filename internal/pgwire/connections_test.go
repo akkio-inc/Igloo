@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -609,6 +610,129 @@ func TestConnectionNamesDifferingInCase(t *testing.T) {
 		t.Errorf("a grant on one of two schemas differing in case: %v", err)
 	}
 	mustExec(t, fs.admin, "GRANT SELECT ON TABLE crm."+schema+".alone TO rita")
+}
+
+// TestConnectionPolicies checks masking and row access policies on a table
+// of a connection: they apply as they do to Iceberg tables, admins
+// included, and a masked column that the remote database renames keeps
+// the table from being read until the policy is set again.
+func TestConnectionPolicies(t *testing.T) {
+	needExtensions(t)
+	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
+	ctx := context.Background()
+	remote, err := pgx.Connect(ctx, pg.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close(ctx) //nolint:errcheck
+	schema := uniqueName("crm_")
+	for _, sql := range []string{
+		"CREATE SCHEMA " + schema,
+		"CREATE TABLE " + schema + ".contacts (id int, client text, email text, phone text)",
+		"INSERT INTO " + schema + ".contacts VALUES (1, 'acme', 'ann@acme.com', '555-1'), (2, 'acme', 'al@acme.com', '555-2'), " +
+			"(3, 'globex', 'gus@globex.com', '555-3')",
+	} {
+		if _, err := remote.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), pg.url)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+			_ = c.Close(context.Background())
+		}
+	})
+	store := federation.NewMemoryStore()
+	c := federation.New("crm", federation.Postgres)
+	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
+	c.Schemas = []string{schema}
+	if err := store.Create(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	fs := startFedServer(t, store)
+	admin := fs.admin
+	contacts := "crm." + schema + ".contacts"
+	for _, sql := range []string{
+		"CREATE SCHEMA lake.gov",
+		"CREATE TABLE lake.gov.client_access (role_name VARCHAR, client VARCHAR)",
+		"INSERT INTO lake.gov.client_access VALUES ('acme_team', 'acme')",
+		"CREATE ROLE acme_team",
+		"CREATE ROLE pii_reader",
+		`CREATE MASKING POLICY mask_email AS (val VARCHAR) RETURNS VARCHAR ->
+			CASE WHEN is_role_in_session('pii_reader') THEN val ELSE '***' END`,
+		`CREATE ROW ACCESS POLICY client_rows AS (c VARCHAR) RETURNS BOOLEAN ->
+			EXISTS (SELECT 1 FROM lake.gov.client_access a WHERE a.client = c AND is_role_in_session(a.role_name))`,
+		"ALTER TABLE " + contacts + " ALTER COLUMN email SET MASKING POLICY mask_email",
+		"ALTER TABLE " + contacts + " ADD ROW ACCESS POLICY client_rows ON (client)",
+		"GRANT SELECT ON TABLE " + contacts + " TO acme_team",
+	} {
+		mustExec(t, admin, sql)
+	}
+	rita := fs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeCacheStatement)
+	mustExec(t, admin, "GRANT acme_team TO rita")
+	want := func(conn *pgx.Conn, sql string, rows ...string) {
+		t.Helper()
+		if got := texts(t, conn, sql); !slices.Equal(got, rows) {
+			t.Errorf("%s: got %q, want %q", sql, got, rows)
+		}
+	}
+	want(rita, "SELECT id, email, phone FROM "+contacts+" ORDER BY id", "1|***|555-1", "2|***|555-2")
+	// Conditions see the masked values, in joins with Iceberg tables too.
+	want(rita, "SELECT count(*) FROM "+contacts+" WHERE email = 'ann@acme.com'", "0")
+	want(rita, "SELECT count(*) FROM lake.gov.client_access a JOIN "+contacts+" c USING (client)", "2")
+	// Admins are not exempt unless a policy says so.
+	want(admin, "SELECT count(*), min(email) FROM "+contacts, "0|NULL")
+	mustExec(t, admin, "GRANT pii_reader TO rita")
+	want(rita, "SELECT email FROM "+contacts+" ORDER BY id", "ann@acme.com", "al@acme.com")
+	mustExec(t, admin, "REVOKE pii_reader FROM rita")
+	want(rita, "SELECT email FROM "+contacts+" ORDER BY id", "***", "***")
+	want(admin, "SELECT ref_database_name, ref_column_name FROM igloo_policy_references() WHERE policy_name = 'mask_email'",
+		"crm|email")
+
+	// Nothing reads the table around its policies.
+	for _, sql := range []string{
+		"SELECT email FROM query_table('" + contacts + "')",
+		"SELECT * FROM postgres_query('crm', 'SELECT email FROM " + schema + ".contacts')",
+	} {
+		if err := runQuery(admin, sql); pgCode(err) != "42501" {
+			t.Errorf("%s: %v", sql, err)
+		}
+	}
+	// Policies read only the Iceberg catalog's tables.
+	if _, err := admin.Exec(ctx, `CREATE ROW ACCESS POLICY reads_crm AS (c VARCHAR) RETURNS BOOLEAN ->
+		EXISTS (SELECT 1 FROM `+contacts+` x WHERE x.client = c)`); err == nil {
+		t.Error("a policy that reads a connection's table")
+	}
+	if _, err := admin.Exec(ctx, "ALTER TABLE ghost.s.t ALTER COLUMN x SET MASKING POLICY mask_email"); pgCode(err) != "0A000" {
+		t.Errorf("a policy on a table of no connection: %v", err)
+	}
+	if _, err := admin.Exec(ctx, "ALTER TABLE crm."+schema+".missing ALTER COLUMN x SET MASKING POLICY mask_email"); pgCode(err) != "42P01" {
+		t.Errorf("a policy on a missing table: %v", err)
+	}
+
+	// The remote database renames the masked column: the table is
+	// refused until the policy follows it.
+	if _, err := remote.Exec(ctx, "ALTER TABLE "+schema+".contacts RENAME COLUMN email TO mail"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, "ALTER CONNECTION crm REFRESH")
+	for _, conn := range []*pgx.Conn{rita, admin} {
+		if err := runQuery(conn, "SELECT * FROM "+contacts); pgCode(err) != "42501" || !strings.Contains(err.Error(), "no longer has it") {
+			t.Errorf("%s after the remote rename: %v", userName(t, conn), err)
+		}
+	}
+	mustExec(t, admin, "ALTER TABLE "+contacts+" ALTER COLUMN email UNSET MASKING POLICY")
+	mustExec(t, admin, "ALTER TABLE "+contacts+" ALTER COLUMN mail SET MASKING POLICY mask_email")
+	want(rita, "SELECT id, mail FROM "+contacts+" ORDER BY id", "1|***", "2|***")
+
+	// Dropping the connection leaves its tables' policies, as dropping a
+	// table does, so they apply again if it comes back.
+	mustExec(t, admin, "DROP CONNECTION crm")
+	want(admin, "SELECT count(*) FROM igloo_policy_references() WHERE ref_database_name = 'crm'", "2")
+	mustExec(t, admin, "ALTER TABLE "+contacts+" ALTER COLUMN mail UNSET MASKING POLICY")
+	mustExec(t, admin, "ALTER TABLE "+contacts+" DROP ROW ACCESS POLICY client_rows")
+	want(admin, "SELECT count(*) FROM igloo_policy_references()", "0")
 }
 
 // laterAttach stands in for the federation manager in the checks of

@@ -599,7 +599,7 @@ func firstNonEmpty(values ...string) string {
 // named with its schema, as they stay with its name when it is dropped.
 func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User, c *policyCmd, now time.Time) (func(*policy.Catalog) error, error) {
 	attach := c.kind == pcSetMask || c.kind == pcAddRowPolicy || c.kind == pcSetColumnTag
-	schema, table, cols, err := s.policyTable(ctx, sess, c.table, attach)
+	catalog, schema, table, cols, err := s.policyTable(ctx, sess, c.table, attach)
 	if err != nil {
 		if c.ifExists && pgerror.GetCode(err) == codes.UndefinedTable {
 			return nil, nil
@@ -609,7 +609,8 @@ func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User,
 	column := func(name string) (columnType, error) {
 		i := slices.IndexFunc(cols, func(col columnType) bool { return strings.EqualFold(col.name, name) })
 		if i < 0 {
-			return columnType{}, pgerror.WithCode(fmt.Errorf("column %q of table %s.%s does not exist", name, schema, table), codes.UndefinedColumn)
+			return columnType{}, pgerror.WithCode(fmt.Errorf("column %q of table %s does not exist", name, policy.TableName(catalog, schema, table)),
+				codes.UndefinedColumn)
 		}
 		return cols[i], nil
 	}
@@ -637,10 +638,10 @@ func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User,
 			return nil, pgerror.WithCode(fmt.Errorf("masking policy %s takes %s, but column %s is %s", p.Name, p.Args[0].Type, col.name, col.typ),
 				codes.DatatypeMismatch)
 		}
-		m := policy.ColumnMask{Schema: schema, Table: table, Column: columnName, Policy: c.name, SetBy: user.Name}
+		m := policy.ColumnMask{Catalog: catalog, Schema: schema, Table: table, Column: columnName, Policy: c.name, SetBy: user.Name}
 		return func(cat *policy.Catalog) error { return cat.SetMask(m, c.force, now) }, nil
 	case pcUnsetMask:
-		return func(cat *policy.Catalog) error { return cat.UnsetMask(schema, table, columnName) }, nil
+		return func(cat *policy.Catalog) error { return cat.UnsetMask(catalog, schema, table, columnName) }, nil
 	case pcAddRowPolicy:
 		p, ok := snap.Catalog.Policy(c.name)
 		if !ok || p.Kind != policy.RowAccess {
@@ -662,14 +663,14 @@ func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User,
 			}
 			names[i] = col.name
 		}
-		f := policy.RowFilter{Schema: schema, Table: table, Policy: c.name, Columns: names, SetBy: user.Name}
+		f := policy.RowFilter{Catalog: catalog, Schema: schema, Table: table, Policy: c.name, Columns: names, SetBy: user.Name}
 		return func(cat *policy.Catalog) error { return cat.AddRowFilter(f, now) }, nil
 	case pcDropRowPolicy:
-		return func(cat *policy.Catalog) error { return cat.DropRowFilter(schema, table, c.name) }, nil
+		return func(cat *policy.Catalog) error { return cat.DropRowFilter(catalog, schema, table, c.name) }, nil
 	case pcSetColumnTag:
 		return func(cat *policy.Catalog) error {
 			for _, t := range c.tags {
-				ct := policy.ColumnTag{Schema: schema, Table: table, Column: columnName, Tag: t.Tag, Value: t.Value, SetBy: user.Name}
+				ct := policy.ColumnTag{Catalog: catalog, Schema: schema, Table: table, Column: columnName, Tag: t.Tag, Value: t.Value, SetBy: user.Name}
 				if err := cat.SetColumnTag(ct, now); err != nil {
 					return err
 				}
@@ -679,7 +680,7 @@ func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User,
 	case pcUnsetColumnTag:
 		return func(cat *policy.Catalog) error {
 			for _, t := range c.tags {
-				if err := cat.UnsetColumnTag(schema, table, columnName, t.Tag); err != nil {
+				if err := cat.UnsetColumnTag(catalog, schema, table, columnName, t.Tag); err != nil {
 					return err
 				}
 			}
@@ -690,46 +691,110 @@ func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User,
 }
 
 // policyTable resolves the table an ALTER TABLE about policies names to a
-// table of the catalog and its columns. With exists false, a schema-
-// qualified name of a table that no longer exists is accepted, with no
-// columns.
-func (s *Server) policyTable(ctx context.Context, sess *session, name []string, exists bool) (string, string, []columnType, error) {
+// table of the catalog, or of a connection named in full (see
+// connectionPolicyTable), and its columns. catalog is empty for the
+// catalog's tables and the connection's name for a connection's. With
+// exists false, a schema-qualified name of a table that no longer exists
+// is accepted, with no columns.
+func (s *Server) policyTable(ctx context.Context, sess *session, name []string, exists bool) (catalog, schema, table string, cols []columnType, err error) {
 	catalogName := s.catalogName()
 	if schema, table, ok := s.externalNamed(ctx, sess, name); ok && exists {
-		return "", "", nil, pgerror.WithCode(fmt.Errorf("%s.%s is an external table (Delta Sharing): policies and tags attach only to the %s catalog's tables, "+
-			"which Igloo reads through them. To protect its rows, copy what users may read into a table, such as CREATE TABLE ... AS SELECT ... FROM %s.%s, "+
-			"and attach policies to that", schema, table, catalogName, schema, table), codes.WrongObjectType)
+		return "", "", "", nil, pgerror.WithCode(fmt.Errorf("%s.%s is an external table (Delta Sharing): policies and tags attach only to the %s catalog's "+
+			"tables and connections' tables, which Igloo reads through them. To protect its rows, copy what users may read into a table, such as "+
+			"CREATE TABLE ... AS SELECT ... FROM %s.%s, and attach policies to that", schema, table, catalogName, schema, table), codes.WrongObjectType)
 	}
 	if len(name) == 3 && !strings.EqualFold(name[0], catalogName) {
-		return "", "", nil, pgerror.WithCode(fmt.Errorf("policies apply to the %s catalog only, not %q", catalogName, name[0]), codes.FeatureNotSupported)
+		return s.connectionPolicyTable(ctx, sess, name, exists)
 	}
 	missing := pgerror.WithCode(fmt.Errorf("table %q does not exist", strings.Join(name, ".")), codes.UndefinedTable)
 	objects, err := s.catalogCandidates(ctx, sess, name, false)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", "", nil, err
 	}
 	for _, o := range objects {
 		if s.ddl != nil && s.ddl.IsView(o.Schema, o.Table) {
-			return "", "", nil, pgerror.WithCode(fmt.Errorf("%s is a view; policies attach to the tables it reads", o),
+			return "", "", "", nil, pgerror.WithCode(fmt.Errorf("%s is a view; policies attach to the tables it reads", o),
 				codes.WrongObjectType)
 		}
 	}
 	if len(objects) > 1 {
-		return "", "", nil, pgerror.WithCode(fmt.Errorf("%s is ambiguous; qualify it with its schema", strings.Join(name, ".")),
+		return "", "", "", nil, pgerror.WithCode(fmt.Errorf("%s is ambiguous; qualify it with its schema", strings.Join(name, ".")),
 			codes.AmbiguousAlias)
 	}
 	if len(objects) == 0 {
 		if exists || len(name) < 2 {
-			return "", "", nil, missing
+			return "", "", "", nil, missing
 		}
-		return name[len(name)-2], name[len(name)-1], nil, nil
+		return "", name[len(name)-2], name[len(name)-1], nil, nil
 	}
 	o := objects[0]
-	cols, err := describeTable(ctx, sess, quoteName([]string{catalogName, o.Schema, o.Table}))
+	cols, err = describeTable(ctx, sess, quoteName([]string{catalogName, o.Schema, o.Table}))
 	if err != nil {
-		return "", "", nil, pgError(err)
+		return "", "", "", nil, pgError(err)
 	}
-	return o.Schema, o.Table, cols, nil
+	return "", o.Schema, o.Table, cols, nil
+}
+
+// connectionPolicyTable resolves connection.schema.table, a table of a
+// connection to another database that policies are to protect. Only its
+// full name counts, which nothing else can mean. The connection must be
+// attached on this replica to have policies set on its tables, so their
+// columns are known, but its tables' policies can be unset at any time,
+// even once the connection is dropped.
+func (s *Server) connectionPolicyTable(ctx context.Context, sess *session, name []string, exists bool) (string, string, string, []columnType, error) {
+	conn := strings.ToLower(name[0])
+	asWritten := func() (string, string, string, []columnType, error) {
+		if exists {
+			return "", "", "", nil, pgerror.WithCode(fmt.Errorf("table %q does not exist", strings.Join(name, ".")), codes.UndefinedTable)
+		}
+		return conn, name[1], name[2], nil, nil
+	}
+	if _, attached := s.externalCatalogs()[conn]; !attached {
+		known := false
+		if s.fed != nil {
+			var err error
+			if known, err = s.fed.Exists(ctx, conn); err != nil {
+				return "", "", "", nil, err
+			}
+		}
+		// A connection dropped since can still lose its tables' policies.
+		dropped := !known && !exists && slices.ContainsFunc(s.gov.snapshot(ctx).Tables(), func(t *policy.TableRules) bool { return t.Catalog == conn })
+		switch {
+		case !known && !dropped:
+			return "", "", "", nil, pgerror.WithCode(fmt.Errorf("policies apply to tables of the %s catalog and of connections, and %q is neither",
+				s.catalogName(), name[0]), codes.FeatureNotSupported)
+		case known && exists:
+			return "", "", "", nil, pgerror.WithCode(fmt.Errorf("connection %s is not attached on this replica yet, so its tables' columns are not known; "+
+				"set policies on them once it is", conn), codes.ObjectNotInPrerequisiteState)
+		}
+		return asWritten()
+	}
+	r, err := s.newResolver(ctx, sess)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	res, err := r.resolve(tableRef{parts: name}, nil)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	var objects []object
+	for _, o := range res.all {
+		if strings.EqualFold(o.db, conn) {
+			objects = append(objects, o)
+		}
+	}
+	if len(objects) == 0 {
+		return asWritten()
+	}
+	o := objects[0]
+	if err := r.distinctInCase(o); err != nil {
+		return "", "", "", nil, pgerror.WithCode(errors.New(strings.TrimPrefix(err.Error(), "permission denied: ")), codes.AmbiguousAlias)
+	}
+	cols, err := describeTable(ctx, sess, quoteName([]string{o.db, o.schema, o.name}))
+	if err != nil {
+		return "", "", "", nil, pgError(err)
+	}
+	return conn, o.schema, o.name, cols, nil
 }
 
 // checkPolicy validates a new policy and returns it as stored: types as

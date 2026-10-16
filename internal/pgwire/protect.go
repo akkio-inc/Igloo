@@ -847,6 +847,19 @@ func (rw *rewriter) verify(t duckdb.StmtType, query, text string, oids []uint32)
 		return denied("cannot verify which tables this statement reads (the plan scans %d catalog tables, the statement names %d)",
 			scans, reads.scans)
 	}
+	if rw.snap.ProtectsConnections() && len(rw.s.externalCatalogs()) > 0 {
+		// Tables of connections, which policies protect too: the plan
+		// scans each as POSTGRES_SCAN or MYSQL_SCAN, which countCatalogScans
+		// leaves out.
+		ps, err := rw.s.scansOf(rw.ctx, rw.sess, plan, false)
+		if err != nil {
+			return err
+		}
+		if !sameScans(ps.connections, reads.extScans) {
+			return denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
+				len(ps.connections), len(reads.extScans))
+		}
+	}
 	return nil
 }
 
@@ -893,7 +906,8 @@ func policyPlanTexts(t duckdb.StmtType, text string) (string, string) {
 }
 
 // countCatalogScans counts the scans of catalog tables in an unoptimized
-// plan.
+// plan. Scans of connections' tables are not among them; verify checks
+// those with scansOf.
 func (s *Server) countCatalogScans(plan any) (int, error) {
 	n := 0
 	catalogName := s.catalogName()

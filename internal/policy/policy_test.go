@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,9 +140,9 @@ func testStore(t *testing.T, s Store) {
 	// A tag without masking policies protects nothing.
 	must(update(func(c *Catalog) error { return c.UnsetTagPolicy("pii", "mask_email") }))
 	must(update(func(c *Catalog) error { return c.UnsetTagPolicy("pii", "mask_id") }))
-	must(update(func(c *Catalog) error { return c.UnsetMask("crm", "contacts", "email") }))
-	must(update(func(c *Catalog) error { return c.DropRowFilter("crm", "contacts", "") }))
-	if err := update(func(c *Catalog) error { return c.DropRowFilter("crm", "contacts", "") }); !errors.Is(err, ErrNotFound) {
+	must(update(func(c *Catalog) error { return c.UnsetMask("", "crm", "contacts", "email") }))
+	must(update(func(c *Catalog) error { return c.DropRowFilter("", "crm", "contacts", "") }))
+	if err := update(func(c *Catalog) error { return c.DropRowFilter("", "crm", "contacts", "") }); !errors.Is(err, ErrNotFound) {
 		t.Errorf("dropping a missing row filter: %v", err)
 	}
 	snap, err = s.Load(ctx)
@@ -152,11 +153,59 @@ func testStore(t *testing.T, s Store) {
 	if tagged := snap.Tagged("crm", "events"); tagged == nil || len(tagged.Column("ip").Tags) != 1 {
 		t.Errorf("tags are kept: %+v", tagged)
 	}
-	must(update(func(c *Catalog) error { return c.UnsetColumnTag("crm", "events", "IP", "pii") }))
+	must(update(func(c *Catalog) error { return c.UnsetColumnTag("", "crm", "events", "IP", "pii") }))
 	must(update(func(c *Catalog) error { return c.DropTag("pii") }))
 	must(update(func(c *Catalog) error { return c.DropPolicy(Masking, "mask_email") }))
 	if err := update(func(c *Catalog) error { return c.DropPolicy(Masking, "by_client") }); !errors.Is(err, ErrNotFound) {
 		t.Errorf("dropping a policy as the wrong kind: %v", err)
+	}
+}
+
+// TestConnectionTables checks that attachments to a table of a connection
+// apply to that table only, not to a table of the Iceberg catalog of the
+// same schema and name, nor the other way round.
+func TestConnectionTables(t *testing.T) {
+	now := time.Now()
+	var c Catalog
+	mask := Policy{Kind: Masking, Name: "hide", Args: []Arg{{Name: "v", Type: "VARCHAR"}}, Returns: "VARCHAR", Body: "'x'"}
+	rows := Policy{Kind: RowAccess, Name: "none", Args: []Arg{{Name: "v", Type: "INTEGER"}}, Returns: "BOOLEAN", Body: "false"}
+	for _, p := range []Policy{mask, rows} {
+		if err := c.PutPolicy(p, false, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.SetMask(ColumnMask{Catalog: "crm", Schema: "sales", Table: "customers", Column: "email", Policy: "hide"}, false, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AddRowFilter(RowFilter{Catalog: "crm", Schema: "sales", Table: "customers", Policy: "none", Columns: []string{"id"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	// The same names in the Iceberg catalog are another table.
+	if err := c.AddRowFilter(RowFilter{Schema: "sales", Table: "customers", Policy: "none", Columns: []string{"id"}}, now); err != nil {
+		t.Errorf("a row filter on the Iceberg table of the same name: %v", err)
+	}
+	snap := NewSnapshot(1, c)
+	r := snap.ConnectionRules("CRM", "Sales", "customers")
+	if r == nil || r.Catalog != "crm" || r.Filter == nil || !r.Column("email").Masked() {
+		t.Fatalf("rules of crm.sales.customers: %+v", r)
+	}
+	if lake := snap.Rules("sales", "customers"); lake == nil || lake.Column("email").Masked() {
+		t.Errorf("the Iceberg table has the connection table's mask: %+v", lake)
+	}
+	if snap.ConnectionRules("ops", "sales", "customers") != nil || snap.ConnectionRules("", "sales", "customers") != nil {
+		t.Error("rules for another connection")
+	}
+	if !snap.ProtectedNames()["customers"] {
+		t.Error("the table's name is not protected")
+	}
+	if err := c.UnsetMask("", "sales", "customers", "email"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unsetting the connection table's mask on the Iceberg table: %v", err)
+	}
+	if err := c.UnsetMask("crm", "sales", "customers", "email"); err != nil {
+		t.Error(err)
+	}
+	if err := c.DropPolicy(RowAccess, "none"); !errors.Is(err, ErrInUse) || !strings.Contains(err.Error(), "crm.sales.customers") {
+		t.Errorf("dropping a policy in use on a connection table: %v", err)
 	}
 }
 
