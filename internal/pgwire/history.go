@@ -267,13 +267,19 @@ func redactUnquoted(code string, pending bool) (string, bool) {
 	return code[:loc[1]] + " ***", false
 }
 
+// objectNames names objects in full: catalog.schema.table, where a
+// connection's objects name their connection.
 func objectNames(catalog string, objs []auth.Object) []string {
 	if objs == nil {
 		return nil
 	}
 	out := make([]string, len(objs))
 	for i, o := range objs {
-		out[i] = catalog + "." + o.String()
+		if o.Catalog != "" {
+			out[i] = o.String()
+		} else {
+			out[i] = catalog + "." + o.String()
+		}
 	}
 	return out
 }

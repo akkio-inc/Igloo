@@ -27,15 +27,19 @@ import (
 //	GRANT role TO user
 //	REVOKE role FROM user
 //	GRANT privilege[, ...] | ALL [PRIVILEGES]
-//	    ON [TABLE] name | SCHEMA name | ALL TABLES IN SCHEMA name TO role_or_user
+//	    ON [TABLE] name | SCHEMA name | ALL TABLES IN SCHEMA name | CONNECTION name TO role_or_user
 //	REVOKE privilege[, ...] | ALL [PRIVILEGES] ON ... FROM role_or_user
 //	SHOW ROLES
-//	SHOW GRANTS [TO role_or_user | ON [TABLE] name | ON SCHEMA name]
+//	SHOW GRANTS [TO role_or_user | ON [TABLE] name | ON SCHEMA name | ON CONNECTION name]
 //
 // Privileges are SELECT, INSERT, UPDATE, DELETE and, on schemas, CREATE.
 // ALL TABLES IN SCHEMA grants on the tables and views there now, as in
 // PostgreSQL; a grant ON SCHEMA also covers ones created later. Only admins
 // may change roles and grants; anyone may see the ones that apply to them.
+//
+// A connection to another database (package federation) is granted as a
+// whole, by schema (connection.schema) or by table
+// (connection.schema.table), and only SELECT: connections are read-only.
 
 type aclKind int
 
@@ -52,9 +56,10 @@ const (
 
 // Grant targets.
 const (
-	targetTable     = "TABLE"
-	targetSchema    = "SCHEMA"
-	targetAllTables = "ALL TABLES IN SCHEMA"
+	targetTable      = "TABLE"
+	targetSchema     = "SCHEMA"
+	targetAllTables  = "ALL TABLES IN SCHEMA"
+	targetConnection = "CONNECTION"
 )
 
 // aclCommand is a parsed role or grant statement.
@@ -170,7 +175,7 @@ func parseACLCommand(toks []token) (c *aclCommand, ok bool, err error) {
 		case rest[0].upper() == "ON":
 			kind, name, n, perr := parseTarget(rest[1:])
 			if perr != nil || n != len(rest)-1 || kind == targetAllTables {
-				return syntax("expected SHOW GRANTS ON [TABLE] name or ON SCHEMA name")
+				return syntax("expected SHOW GRANTS ON [TABLE] name, ON SCHEMA name or ON CONNECTION name")
 			}
 			c.targetKind, c.target = kind, name
 		default:
@@ -281,14 +286,16 @@ func parseTarget(toks []token) (kind string, name []string, n int, err error) {
 		kind, n = targetSchema, 1
 	case word(0) == "TABLE":
 		kind, n = targetTable, 1
+	case word(0) == "CONNECTION":
+		kind, n = targetConnection, 1
 	default:
 		kind = targetTable
 	}
 	name, used := tokenName(toks[n:])
 	if used == 0 {
-		return "", nil, 0, pgerror.WithCode(errors.New("expected the name of a table or schema"), codes.Syntax)
+		return "", nil, 0, pgerror.WithCode(errors.New("expected the name of a table, schema or connection"), codes.Syntax)
 	}
-	if kind != targetTable && len(name) > 2 || len(name) > 3 {
+	if kind == targetConnection && len(name) > 1 || kind != targetTable && len(name) > 2 || len(name) > 3 {
 		return "", nil, 0, pgerror.WithCode(fmt.Errorf("improper qualified name %q", strings.Join(name, ".")), codes.Syntax)
 	}
 	return kind, name, n + used, nil
@@ -382,7 +389,14 @@ func (s *Server) changeGrants(ctx context.Context, sess *session, me auth.User, 
 		return err
 	}
 	privs := c.privileges
-	if privs == nil {
+	switch {
+	case len(objects) > 0 && objects[0].Catalog != "":
+		// Connections are read-only.
+		if privs != nil && !slices.Equal(privs, []auth.Privilege{auth.PrivilegeSelect}) {
+			return pgerror.WithCode(errors.New("connections are read-only: only SELECT can be granted on them"), codes.InvalidGrantOperation)
+		}
+		privs = []auth.Privilege{auth.PrivilegeSelect}
+	case privs == nil:
 		privs = auth.TablePrivileges
 		if c.targetKind == targetSchema {
 			privs = auth.SchemaPrivileges
@@ -434,6 +448,9 @@ func (s *Server) isCustomRole(ctx context.Context, name string) (bool, error) {
 // Iceberg catalog: one schema, one table or view, or every table and view
 // in a schema.
 func (s *Server) grantObjects(ctx context.Context, sess *session, kind string, name []string) ([]auth.Object, error) {
+	if objects, ok, err := s.connectionObjects(ctx, sess, kind, name); ok || err != nil {
+		return objects, err
+	}
 	catalogName := s.catalogName()
 	if catalogName == "" {
 		return nil, pgerror.WithCode(errors.New("grants need an Iceberg catalog (IGLOO_CATALOG_URI)"), codes.FeatureNotSupported)
@@ -469,6 +486,89 @@ func (s *Server) grantObjects(ctx context.Context, sess *session, kind string, n
 		objects[i] = auth.Object{Schema: schema, Table: t}
 	}
 	return objects, nil
+}
+
+// connectionObjects resolves what a grant names when it is a connection or
+// a schema or table of one: ok is false for anything else. Schemas and
+// tables are checked against what the connection's database has when this
+// replica has it attached; a connection created since this replica started
+// is taken at its word.
+func (s *Server) connectionObjects(ctx context.Context, sess *session, kind string, name []string) ([]auth.Object, bool, error) {
+	if s.fed == nil || len(name) == 0 || len(name) == 1 && kind != targetConnection {
+		return nil, false, nil
+	}
+	conn := strings.ToLower(name[0])
+	exists, err := s.fed.Exists(ctx, conn)
+	if err != nil {
+		return nil, true, err
+	}
+	switch {
+	case kind == targetConnection && !exists:
+		return nil, true, pgerror.WithCode(fmt.Errorf("connection %q does not exist", name[0]), codes.UndefinedObject)
+	case !exists:
+		return nil, false, nil
+	case kind == targetConnection:
+		return []auth.Object{{Catalog: conn}}, true, nil
+	case kind == targetTable && len(name) == 2:
+		if _, isSchema, err := s.catalogSchema(ctx, sess, name[0]); err != nil || isSchema {
+			// A table of the Iceberg catalog's schema of that name.
+			return nil, err != nil, err
+		}
+		return nil, true, pgerror.WithCode(fmt.Errorf("name a table of connection %s with its schema, as in %s.public.%s", conn, conn, name[1]),
+			codes.Syntax)
+	}
+	_, attached := s.externalCatalogs()[conn]
+	exact := func(query string, args ...any) (string, bool, error) {
+		if !attached {
+			return "", true, nil
+		}
+		names, err := queryStrings(ctx, sess, query, args...)
+		if err != nil || len(names) == 0 {
+			return "", false, err
+		}
+		return names[0], true, nil
+	}
+	schema, ok, err := exact(`SELECT schema_name FROM duckdb_schemas() WHERE database_name = $1 AND lower(schema_name) = lower($2)`, conn, name[1])
+	if err != nil {
+		return nil, true, err
+	}
+	if !ok {
+		return nil, true, pgerror.WithCode(fmt.Errorf("schema %s.%s does not exist", conn, name[1]), codes.InvalidSchemaName)
+	}
+	if schema == "" {
+		schema = name[1]
+	}
+	switch kind {
+	case targetSchema:
+		return []auth.Object{{Catalog: conn, Schema: schema}}, true, nil
+	case targetAllTables:
+		if !attached {
+			return nil, true, pgerror.WithCode(fmt.Errorf("connection %s is not attached on this replica yet; grant on the schema instead", conn),
+				codes.ObjectNotInPrerequisiteState)
+		}
+		tables, err := queryStrings(ctx, sess, `SELECT table_name FROM duckdb_tables()
+			WHERE database_name = $1 AND schema_name = $2 ORDER BY 1`, conn, schema)
+		if err != nil {
+			return nil, true, err
+		}
+		objects := make([]auth.Object, len(tables))
+		for i, t := range tables {
+			objects[i] = auth.Object{Catalog: conn, Schema: schema, Table: t}
+		}
+		return objects, true, nil
+	}
+	table, ok, err := exact(`SELECT table_name FROM duckdb_tables() WHERE database_name = $1 AND schema_name = $2
+		AND lower(table_name) = lower($3)`, conn, schema, name[2])
+	if err != nil {
+		return nil, true, err
+	}
+	if !ok {
+		return nil, true, pgerror.WithCode(fmt.Errorf("relation %q does not exist", strings.Join(name, ".")), codes.UndefinedTable)
+	}
+	if table == "" {
+		table = name[2]
+	}
+	return []auth.Object{{Catalog: conn, Schema: schema, Table: table}}, true, nil
 }
 
 // resolveGrantTable finds the table or view a grant names. An unqualified
@@ -616,7 +716,22 @@ func (s *Server) showGrants(ctx context.Context, sess *session, me auth.User, c 
 	}
 
 	keep := func(auth.Grant) bool { return true }
+	var external []auth.Object
+	if c.grantee == "" && c.targetKind != "" {
+		if external, _, err = s.connectionObjects(ctx, sess, c.targetKind, c.target); err != nil {
+			return err
+		}
+	}
 	switch {
+	case len(external) == 1:
+		// A connection, or a schema or table of one: the grants that cover
+		// it, and for a connection or schema those on what is in it.
+		o := external[0]
+		keep = func(g auth.Grant) bool {
+			return strings.EqualFold(g.Object.Catalog, o.Catalog) &&
+				(o.IsConnection() || g.Object.IsConnection() || strings.EqualFold(g.Object.Schema, o.Schema) &&
+					(o.IsSchema() || g.Object.IsSchema() || strings.EqualFold(g.Object.Table, o.Table)))
+		}
 	case c.grantee != "":
 		roles := []string{c.grantee}
 		if isRole, err := s.isCustomRole(ctx, c.grantee); err != nil {
@@ -636,14 +751,14 @@ func (s *Server) showGrants(ctx context.Context, sess *session, me auth.User, c 
 		keep = func(g auth.Grant) bool { return appliesTo(g, c.grantee, roles) }
 	case c.targetKind == targetSchema:
 		schema := c.target[len(c.target)-1]
-		keep = func(g auth.Grant) bool { return strings.EqualFold(g.Object.Schema, schema) }
+		keep = func(g auth.Grant) bool { return g.Object.Catalog == "" && strings.EqualFold(g.Object.Schema, schema) }
 	case c.targetKind == targetTable:
 		o, err := s.resolveGrantTable(ctx, sess, c.target)
 		if err != nil {
 			return err
 		}
 		keep = func(g auth.Grant) bool {
-			return strings.EqualFold(g.Object.Schema, o.Schema) && (g.Object.IsSchema() || g.Object.Equal(o))
+			return g.Object.Catalog == "" && strings.EqualFold(g.Object.Schema, o.Schema) && (g.Object.IsSchema() || g.Object.Equal(o))
 		}
 	}
 

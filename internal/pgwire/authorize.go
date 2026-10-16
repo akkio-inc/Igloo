@@ -61,8 +61,11 @@ func requiredRole(t duckdb.StmtType, query string) auth.Role {
 	}
 	// query_table reads tables named in strings. The read cache's functions
 	// and settings (cache_httpfs_*) are shared by every session: clearing
-	// it, changing its rules, listing what it holds.
-	if mentionsFunction(query, words, "query_table") || mentionsPrefix(query, words, "cache_httpfs_") {
+	// it, changing its rules, listing what it holds. So are the lists of
+	// connections' tables that the postgres and mysql extensions keep (see
+	// package federation), and their connection pools.
+	if mentionsFunction(query, words, "query_table") || mentionsPrefix(query, words, "cache_httpfs_") ||
+		mentionsFunction(query, words, connectionAdminFunctions...) {
 		return auth.RoleAdmin
 	}
 
@@ -183,6 +186,24 @@ var fixedCacheSettings = []string{
 	"cache_httpfs_add_exclusion_regex", "cache_httpfs_reset_exclusion_regex",
 }
 
+// connectionAdminFunctions are the postgres and mysql extensions' functions
+// that change state every session shares: their lists of tables, which
+// ALTER CONNECTION ... REFRESH reloads safely, and their pools.
+var connectionAdminFunctions = []string{
+	"pg_clear_cache", "mysql_clear_cache", "postgres_configure_pool",
+	"mysql_debug_execution_plan", "mysql_explain_federated",
+}
+
+// remoteSQLFunctions are the postgres and mysql extensions' functions that
+// run SQL given as a string on a remote server, write to it, or connect to
+// any server at all with credentials given in the call. None of what they
+// do can be checked against grants, and they ignore that connections are
+// attached read-only.
+var remoteSQLFunctions = []string{
+	"postgres_query", "postgres_execute", "postgres_scan", "postgres_scan_pushdown", "postgres_attach",
+	"mysql_query", "mysql_execute",
+}
+
 // forbidden returns an insufficient_privilege error for a statement that
 // no one may run, admins included, or nil.
 //
@@ -193,7 +214,8 @@ var fixedCacheSettings = []string{
 // setting a statement uses is named in its text. (query_table() takes only
 // table names and is admin-only, see requiredRole; a name it builds at run
 // time is refused here, see queryTableComputed.) Spatial's GDAL readers and
-// writers open files outside the sandbox (see gdalUse).
+// writers open files outside the sandbox (see gdalUse). The functions of
+// remoteSQLFunctions run SQL from strings on other databases.
 func forbidden(query string) error {
 	words := sqllex.CodeWords(query)
 	var err error
@@ -209,6 +231,10 @@ func forbidden(query string) error {
 	case queryTableComputed(query):
 		err = errors.New("permission denied: query_table needs a table name written out as text; a name built at run time " +
 			"could resolve to a file, including spatial's GDAL formats, that reads outside Igloo's sandbox")
+	case mentionsFunction(query, words, remoteSQLFunctions...):
+		err = errors.New("permission denied: the functions that run SQL on other databases (postgres_query, mysql_query and the like) " +
+			"are not available, as Igloo cannot check that SQL against grants; query connections' tables by name instead, " +
+			"as in SELECT * FROM crm.public.customers")
 	default:
 		for _, name := range fixedCacheSettings {
 			if mentionsFunction(query, words, name) {

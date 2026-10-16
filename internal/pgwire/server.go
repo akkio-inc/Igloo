@@ -31,6 +31,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sharing"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -125,6 +126,10 @@ type Options struct {
 	// tables. Nil when it is not set up.
 	Sharing *sharing.Service
 
+	// Federation keeps the connections to other databases. Nil means
+	// there are none and CREATE CONNECTION is unavailable.
+	Federation *federation.Manager
+
 	// external and externalFiles stand in for Sharing's external tables
 	// and the prefix of their files, in tests.
 	external      externalCatalog
@@ -186,6 +191,8 @@ type Server struct {
 	// external tables.
 	shares   *sharing.Service
 	external externalCatalog
+	// fed keeps the connections to other databases (see external.go).
+	fed *federation.Manager
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -236,6 +243,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		pool:        opts.Pool,
 		shares:      opts.Sharing,
 		external:    opts.external,
+		fed:         opts.Federation,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -725,6 +733,19 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return ps, err
 	}
 
+	if cmd, ok, err := parseConnectionCommand(q.Query); ok {
+		if err != nil {
+			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+			return nil, err
+		}
+		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			start := time.Now()
+			err := s.runConnectionCommand(ctx, sess, cmd, w)
+			s.metrics.query(start, err)
+			return err
+		}), wire.WithColumns(cmd.columns()))), nil
+	}
+
 	if ps, ok, err := s.catalogDDL(ctx, sess, user, q.Query); ok || err != nil {
 		return ps, err
 	}
@@ -864,6 +885,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 			if err := multipleStatements(user.Role, query); err != nil {
 				return fail(err)
 			}
+			if err := s.pivotReachesConnection(ctx, sess, query); err != nil {
+				s.metrics.query(time.Now(), errDenied)
+				return fail(err)
+			}
 			pivot = true
 		}
 	} else if strings.Contains(strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"), ";") {
@@ -957,6 +982,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if err == nil {
 		err = s.authorizeLocal(user.Role, st.stmtType, text)
 	}
+	if err == nil {
+		// What it reads from connections, whatever the role.
+		st.access, err = s.authorizeExternal(ctx, sess, user, st, query, st.access)
+	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		_ = st.close()
@@ -1047,18 +1076,29 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 		return err
 	}
 	privs, err := s.privileges(ctx, sess, user)
-	if !force && err == nil && privs == st.access.privs && time.Since(st.access.checked) < s.roleRefresh &&
+	if !force && err == nil && (privs == st.access.privs || st.access.privs == nil && user.Role == auth.RoleAdmin) &&
+		time.Since(st.access.checked) < s.roleRefresh &&
 		st.access.catalogGen == s.catalogGeneration() && st.access.settingGen == sess.settingGen {
 		return nil
 	}
-	roleErr := authorize(user.Role, st.stmtType, st.sourceText())
-	if roleErr == nil {
-		return nil
+	// A refusal leaves st.access as it was, stale, so the statement is
+	// decided again if it is run again.
+	var acc *access
+	if roleErr := authorize(user.Role, st.stmtType, st.sourceText()); roleErr != nil {
+		if acc, err = s.authorizeByGrants(ctx, sess, user, st, st.sourceText(), roleErr); err != nil {
+			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+			return err
+		}
 	}
-	acc, err := s.authorizeByGrants(ctx, sess, user, st, st.sourceText(), roleErr)
-	if err != nil {
+	// What it reads from connections, whatever the role.
+	if acc, err = s.authorizeExternal(ctx, sess, user, st, st.sourceText(), acc); err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		return err
+	}
+	if acc == nil {
+		// The role allows it and no connection is attached any more.
+		st.access = nil
+		return nil
 	}
 	if err := st.reprepare(ctx, sess.conn); err != nil {
 		return pgError(err)

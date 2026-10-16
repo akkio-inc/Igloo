@@ -8,12 +8,25 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
+
+	"github.com/akkio-inc/igloo/internal/federation"
 )
 
 // pgError attaches a Postgres SQLSTATE to err so clients can react to the kind
 // of failure (retry a conflict, report a missing table) rather than only
-// showing the message.
+// showing the message. DuckDB's postgres and mysql extensions may quote
+// the token they sign in to connections' proxies with; it is replaced.
 func pgError(err error) error {
+	err = codedError(err)
+	if err != nil {
+		if msg := err.Error(); federation.Scrub(msg) != msg {
+			return pgerror.WithCode(errors.New(federation.Scrub(msg)), pgerror.GetCode(err))
+		}
+	}
+	return err
+}
+
+func codedError(err error) error {
 	if err == nil || pgerror.GetCode(err) != codes.Uncategorized {
 		return err
 	}

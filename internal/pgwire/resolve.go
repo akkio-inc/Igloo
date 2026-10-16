@@ -112,11 +112,12 @@ func splitTopLevelQuoted(s string, sep byte) []string {
 
 // resolver resolves names for one statement on one session.
 type resolver struct {
-	s         *Server
-	ctx       context.Context
-	sess      *session
-	path      searchPath
-	databases map[string]bool
+	s    *Server
+	ctx  context.Context
+	sess *session
+	path searchPath
+	// databases are the attached databases' types, by lower-cased name.
+	databases map[string]string
 	catalog   string
 	local     string
 	objects   map[string][]object
@@ -131,6 +132,10 @@ type resolver struct {
 	// names that are not tables through, for checks of statements of
 	// users who may use them.
 	lenient bool
+	// external is set when only reads from connections matter, for users
+	// whose role reads the rest (see external.go): table functions and
+	// other DuckDB databases are theirs to read.
+	external bool
 }
 
 func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, error) {
@@ -138,22 +143,24 @@ func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, err
 	if err != nil {
 		return nil, err
 	}
-	dbs, err := queryStrings(ctx, sess, "SELECT system.main.lower(database_name) FROM system.main.duckdb_databases()")
+	dbs, err := databaseTypes(ctx, sess)
 	if err != nil {
 		return nil, err
 	}
-	r := &resolver{
+	return &resolver{
 		s: s, ctx: ctx, sess: sess, path: path,
-		databases: map[string]bool{},
+		databases: dbs,
 		catalog:   s.catalogName(),
 		local:     s.engine.LocalDatabase(),
 		objects:   map[string][]object{},
 		readsOf:   map[string]readSet{},
-	}
-	for _, d := range dbs {
-		r.databases[d] = true
-	}
-	return r, nil
+	}, nil
+}
+
+// isExternal reports whether db is a connection, or any other database
+// that is neither DuckDB's own nor the Iceberg catalog.
+func (r *resolver) isExternal(db string) bool {
+	return isExternalType(r.databases[strings.ToLower(db)])
 }
 
 // load fetches the tables and views called any of names that are not
@@ -256,7 +263,7 @@ func (r *resolver) resolve(ref tableRef, view *object) (resolution, error) {
 	case 2:
 		a := parts[0]
 		var positions []pathEntry
-		if r.databases[strings.ToLower(a)] {
+		if _, ok := r.databases[strings.ToLower(a)]; ok {
 			// db.name: the database's schemas on the path, else any.
 			for _, p := range r.positions(view) {
 				if strings.EqualFold(p.db, a) {
@@ -305,7 +312,8 @@ func (r *resolver) resolve(ref tableRef, view *object) (resolution, error) {
 	return res, nil
 }
 
-// readSet is what a query or view reads from the catalog.
+// readSet is what a query or view reads from the catalog and from
+// connections.
 type readSet struct {
 	// scans is how many catalog table scans DuckDB plans for it.
 	scans  int
@@ -313,11 +321,19 @@ type readSet struct {
 	// policyTables are the tables that policies read (see
 	// resolver.policyMarker).
 	policyTables []auth.Object
+	// extScans are the scans of connections' tables DuckDB plans for it,
+	// and extObjects every table of a connection it may read.
+	extScans   []externalScan
+	extObjects []auth.Object
 }
 
 func (rs *readSet) add(o auth.Object) {
-	if !slices.ContainsFunc(rs.tables, func(t auth.Object) bool { return t.Equal(o) }) {
-		rs.tables = append(rs.tables, o)
+	list := &rs.tables
+	if o.Catalog != "" {
+		list = &rs.extObjects
+	}
+	if !slices.ContainsFunc(*list, func(t auth.Object) bool { return t.Equal(o) }) {
+		*list = append(*list, o)
 	}
 }
 
@@ -340,6 +356,10 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 
 	if !r.lenient {
 		for _, f := range w.tableFunctions {
+			if r.external {
+				// Scans a table function makes show in the plan, unmatched.
+				break
+			}
 			if !allowedFunctions[strings.ToLower(f.name)] || f.schema != "" && !strings.EqualFold(f.schema, "main") {
 				return rs, denied("%s reads data that grants do not cover, which needs the reader role", f.name)
 			}
@@ -362,23 +382,28 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 			return rs, err
 		}
 		if len(res.all) == 0 {
-			if r.lenient {
+			if r.lenient || r.external {
+				// A file or a replacement scan: not a connection's table,
+				// which DuckDB lists.
 				continue
 			}
 			return rs, denied("%s is not a table or view; reading files directly needs the reader role", strings.Join(ref.parts, "."))
 		}
-		scans := -1
+		var first *readSet
 		for _, o := range res.first {
 			reads, err := r.reads(o, depth)
 			if err != nil {
 				return rs, err
 			}
-			if scans >= 0 && reads.scans != scans {
+			if first != nil && (reads.scans != first.scans || !sameScans(reads.extScans, first.extScans)) {
 				return rs, denied("%s is ambiguous", strings.Join(ref.parts, "."))
 			}
-			scans = reads.scans
+			first = &reads
 		}
-		rs.scans += max(scans, 0)
+		if first != nil {
+			rs.scans += first.scans
+			rs.extScans = append(rs.extScans, first.extScans...)
+		}
 		if r.policyMarker != "" && strings.HasPrefix(ref.alias, r.policyMarker) {
 			// A policy reads it, not the user.
 			for _, o := range res.first {
@@ -393,7 +418,7 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 			if err != nil {
 				return rs, err
 			}
-			for _, t := range reads.tables {
+			for _, t := range append(reads.tables, reads.extObjects...) {
 				rs.add(t)
 			}
 		}
@@ -401,9 +426,9 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 	return rs, nil
 }
 
-// reads returns what reading o reads from the catalog: a catalog table
-// itself, a view what its query reads, and local, temporary and system
-// objects nothing.
+// reads returns what reading o reads from the catalog and from
+// connections: a catalog table or a connection's table itself, a view what
+// its query reads, and local, temporary and system objects nothing.
 func (r *resolver) reads(o object, depth int) (readSet, error) {
 	if rs, ok := r.readsOf[o.key()]; ok {
 		return rs, nil
@@ -422,7 +447,7 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 			rs.scans = 0
 		}
 	case o.view:
-		if !r.ownDatabase(o.db) {
+		if !r.ownDatabase(o.db) && (!r.external || r.isExternal(o.db)) {
 			return rs, denied("reading views of database %s needs the reader role", o.db)
 		}
 		body := viewBody(o.sql)
@@ -435,7 +460,15 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 		}
 	case strings.EqualFold(o.db, r.catalog):
 		rs = readSet{scans: 1, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
+	case r.isExternal(o.db):
+		// The postgres and mysql extensions show a remote view as a table.
+		rs = readSet{
+			extScans:   []externalScan{{r.databases[strings.ToLower(o.db)], strings.ToLower(o.name)}},
+			extObjects: []auth.Object{{Catalog: strings.ToLower(o.db), Schema: o.schema, Table: o.name}},
+		}
 	case strings.EqualFold(o.db, "temp") || strings.EqualFold(o.db, r.local) || strings.EqualFold(o.db, "system"):
+	case r.external:
+		// Another of DuckDB's databases, which the user's role reads.
 	default:
 		return rs, denied("reading tables of database %s needs the reader role", o.db)
 	}

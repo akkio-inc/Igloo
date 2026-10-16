@@ -34,10 +34,13 @@ import (
 // exactly as many catalog tables as the parse found. Anything Igloo cannot
 // account for in this way is refused.
 
-// access is what a statement allowed by grants touches.
+// access is what a statement allowed by grants touches, and what any
+// non-admin's statement reads from connections (see external.go).
 type access struct {
 	read    []auth.Object
 	written []auth.Object
+	// externalChecked is set once reads from connections were checked.
+	externalChecked bool
 	// checked is when the decision was made, with which privileges, and
 	// with the catalog and session settings at which generations. DuckDB
 	// binds a prepared statement again when the catalog changes, with the
@@ -56,6 +59,9 @@ func (s *Server) catalogGeneration() uint64 {
 	g := s.ddlGen.Load()
 	if s.ddl != nil {
 		g += s.ddl.Generation()
+	}
+	if s.fed != nil {
+		g += s.fed.Generation()
 	}
 	return g
 }
@@ -118,7 +124,7 @@ func (s *Server) authorizeByGrants(ctx context.Context, sess *session, user auth
 		if err != nil {
 			return nil, err
 		}
-		acc.read = read
+		acc.read, acc.externalChecked = read, true
 		for _, o := range read {
 			needs = append(needs, need{auth.PrivilegeSelect, o})
 		}
@@ -132,8 +138,12 @@ func (s *Server) authorizeByGrants(ctx context.Context, sess *session, user auth
 }
 
 // allows reports whether user may do n, by their built-in role or grants.
+// The built-in roles cover the Iceberg catalog only: a connection's tables
+// need grants.
 func allows(user auth.User, privs *auth.Privileges, n need) bool {
 	switch {
+	case n.obj.Catalog != "":
+		return n.priv == auth.PrivilegeSelect && privs.AllowsConnection(n.priv, n.obj.Catalog, n.obj.Schema, n.obj.Table)
 	case n.priv == auth.PrivilegeSelect && rank[user.Role] >= rank[auth.RoleReader]:
 		return true
 	case n.obj.IsSchema():
@@ -146,6 +156,11 @@ func allows(user auth.User, privs *auth.Privileges, n need) bool {
 // privilege.
 func needError(user auth.User, n need) error {
 	var msg string
+	switch {
+	case n.obj.Catalog != "":
+		msg = fmt.Sprintf("SELECT on table %s needs a SELECT grant on it, its schema or connection %s", n.obj, n.obj.Catalog)
+		return pgerror.WithCode(fmt.Errorf("permission denied for %s: %s", user.Name, msg), codes.InsufficientPrivilege)
+	}
 	switch n.priv {
 	case auth.PrivilegeCreate:
 		msg = fmt.Sprintf("creating, changing or dropping tables in schema %s needs the writer role or CREATE on the schema", n.obj.Schema)
@@ -544,16 +559,20 @@ func (s *Server) readTables(ctx context.Context, sess *session, st *statement, q
 	if err != nil {
 		return nil, err
 	}
-	if reads.scans != scans.total() {
+	if reads.scans != scans.catalogTotal() {
 		return nil, denied("cannot verify which tables this statement reads (the plan scans %d catalog tables, the statement names %d)",
-			scans.total(), reads.scans)
+			scans.catalogTotal(), reads.scans)
+	}
+	if !sameScans(reads.extScans, scans.connections) {
+		return nil, denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
+			len(scans.connections), len(reads.extScans))
 	}
 	for _, named := range scans.named {
 		if !slices.ContainsFunc(slices.Concat(reads.tables, reads.policyTables), func(o auth.Object) bool { return o.Equal(named) }) {
 			return nil, denied("cannot verify which tables this statement reads (%s)", named)
 		}
 	}
-	return reads.tables, nil
+	return append(reads.tables, reads.extObjects...), nil
 }
 
 // readTexts decides what to EXPLAIN for a statement's reads and what to
@@ -886,7 +905,8 @@ func matchParen(s string, open int) int {
 
 // --- plans ----------------------------------------------------------------
 
-// planScans is what a statement's unoptimized plan reads from the catalog.
+// planScans is what a statement's unoptimized plan reads from the catalog
+// and from connections.
 type planScans struct {
 	// iceberg counts Iceberg scans, which do not say which table they
 	// read.
@@ -900,9 +920,15 @@ type planScans struct {
 	// analyzed, and refused if they call it, unless they are external
 	// tables' own.
 	external int
+	// connections are scans of connections' tables (see external.go).
+	connections []externalScan
 }
 
-func (p planScans) total() int { return p.iceberg + len(p.named) + p.external }
+// catalogTotal counts the scans that are not of connections' tables: of
+// the catalog's tables and of external tables' files.
+func (p planScans) catalogTotal() int { return p.iceberg + len(p.named) + p.external }
+
+func (p planScans) total() int { return p.catalogTotal() + len(p.connections) }
 
 // allowedFunctions are the table functions users with the none role may
 // use: generators and catalog listings, which read no table data and no
@@ -926,19 +952,28 @@ var allowedFunctions = map[string]bool{
 }
 
 // planScans explains text on the session's connection and returns the
-// catalog scans in its unoptimized plan, refusing scans of anything else
-// that needs a grant.
+// catalog and connection scans in its unoptimized plan, refusing scans of
+// anything else that needs a grant.
 func (s *Server) planScans(ctx context.Context, sess *session, text string) (planScans, error) {
-	var scans planScans
 	plan, err := explainLogical(ctx, sess.conn, text)
 	if err != nil {
-		return scans, denied("cannot analyze this statement: %v", err)
+		return planScans{}, denied("cannot analyze this statement: %v", err)
 	}
+	return s.scansOf(ctx, sess, plan, true)
+}
+
+// scansOf returns the scans in a plan. strict, for users with the none
+// role, refuses table functions they may not use and scans of databases
+// other than the catalog and connections; otherwise only scans of
+// connections are of interest.
+func (s *Server) scansOf(ctx context.Context, sess *session, plan any, strict bool) (planScans, error) {
+	var scans planScans
 	tableFunctions, err := s.tableFunctions(ctx, sess)
 	if err != nil {
 		return scans, err
 	}
 	catalogName, local := s.catalogName(), s.engine.LocalDatabase()
+	connections := len(s.externalCatalogs()) > 0
 
 	var visit func(n any) error
 	visit = func(n any) error {
@@ -952,16 +987,17 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 		case map[string]any:
 			name, _ := n["name"].(string)
 			fn := strings.ToLower(strings.TrimSpace(name))
+			extra, _ := n["extra_info"].(map[string]any)
+			table, hasTable := extra["Table"].(string)
 			switch {
 			case fn == "iceberg_scan":
 				scans.iceberg++
 			case fn == "read_parquet" && s.external != nil:
 				scans.external++
 			case fn == "seq_scan":
-				extra, _ := n["extra_info"].(map[string]any)
-				table, _ := extra["Table"].(string)
 				parts := splitQualified(table)
 				switch {
+				case !strict:
 				case len(parts) != 3:
 					return denied("cannot tell which table a scan reads (%q)", table)
 				case strings.EqualFold(parts[0], catalogName):
@@ -971,7 +1007,17 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 				default:
 					return denied("reading tables of database %s needs the reader role", parts[0])
 				}
-			case tableFunctions[fn] && !allowedFunctions[fn]:
+			case externalScans[fn] != "":
+				if table == "" {
+					return denied("cannot tell which table of a connection a scan reads")
+				}
+				scans.connections = append(scans.connections, externalScan{externalScans[fn], strings.ToLower(table)})
+			case hasTable && connections && isLeaf(n):
+				// A scan of some other kind of database (scans have no
+				// children; writes to a table do): it would have to be
+				// accounted for like the known ones, and is not.
+				return denied("cannot tell what a %s scan reads", name)
+			case strict && tableFunctions[fn] && !allowedFunctions[fn]:
 				return denied("%s reads data that grants do not cover, which needs the reader role", fn)
 			}
 			return visit(n["children"])
@@ -979,6 +1025,12 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 		return nil
 	}
 	return scans, visit(plan)
+}
+
+// isLeaf reports whether a plan node has no children.
+func isLeaf(n map[string]any) bool {
+	children, _ := n["children"].([]any)
+	return len(children) == 0
 }
 
 // tableFunctions returns the names of every table function, lower-cased.

@@ -135,11 +135,25 @@ func serve() error {
 		defer proxy.Close() //nolint:errcheck
 	}
 
-	eng, err := engine.Open(startCtx, cfg, log)
+	fed, closeFederation, err := openFederation(startCtx, cfg, users, log)
+	if err != nil {
+		return err
+	}
+	defer closeFederation()
+	var engineOpts []engine.Option
+	if fed != nil {
+		// Connections are attached before DuckDB's sandbox is locked.
+		engineOpts = append(engineOpts, engine.BeforeLockdown(fed.Attach))
+	}
+	eng, err := engine.Open(startCtx, cfg, log, engineOpts...)
 	if err != nil {
 		return err
 	}
 	defer eng.Close() //nolint:errcheck
+	if fed != nil {
+		fed.SetConnect(eng.Connect)
+		go fed.Run(ctx)
+	}
 
 	var (
 		cat     *catalog.Client
@@ -256,6 +270,7 @@ func serve() error {
 		Workload:            limits,
 		Pool:                cfg.Pool,
 		Sharing:             shares,
+		Federation:          fed,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
