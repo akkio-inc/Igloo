@@ -72,6 +72,12 @@ jobs:
       - name: Vet
         run: go vet -tags duckdb_arrow ./...
 
+      # The spatial and sketch tests load the extensions the image ships.
+      - name: Install DuckDB extensions
+        run: |
+          go run -tags duckdb_arrow ./cmd/igloo install-extensions "$RUNNER_TEMP/duckdb-extensions"
+          echo "IGLOO_TEST_EXTENSION_DIR=$RUNNER_TEMP/duckdb-extensions" >>"$GITHUB_ENV"
+
       - name: Test
         run: go test -tags duckdb_arrow ./...
 

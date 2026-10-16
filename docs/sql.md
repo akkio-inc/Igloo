@@ -8,6 +8,10 @@ which is close to PostgreSQL's. Everyday SQL (joins, window functions, CTEs,
 aggregates, `GROUP BY ALL`, `QUALIFY`) works as written; DuckDB's function
 library applies.
 
+Sketches for deduplicated reach, geometry and H3 functions, and DuckDB's
+approximate and statistical functions are described in
+[media analytics](media-analytics.md).
+
 Tables live in the Iceberg catalog, named `lake` in SQL (`IGLOO_CATALOG_NAME`),
 and the default schema is `public`. Unqualified names resolve to
 `lake.public`, so `events` and `lake.public.events` are the same table.
@@ -300,11 +304,13 @@ Values go to clients as these PostgreSQL types:
 | `TIMESTAMP` (any precision), `TIMESTAMPTZ` | `timestamp`, `timestamptz` |
 | `INTERVAL` | `interval` |
 | `JSON`, `LIST`, `ARRAY`, `STRUCT`, `MAP`, `UNION` | `json` |
+| `GEOMETRY` | `text`, as WKT such as `POINT (-73.98 40.75)` |
 | others (`TIMETZ`, `BIT`, ...) | `text` |
 
 Nested values arrive as JSON, which every PostgreSQL client can read. Over
 [Arrow Flight SQL](flight-sql.md), values keep DuckDB's own Arrow types
-instead, nested ones included.
+instead, nested ones included. Sketches (`sketch_hll`, `sketch_theta` and
+the others) are `BLOB`s, sent as `bytea`.
 
 ## Clients
 
@@ -364,6 +370,11 @@ service accounts, connect BI tools, dbt and scripts.
   string, are refused for everyone, admins included: Igloo checks a
   statement's text, and cannot check SQL that a statement builds. Write the
   query itself instead. `query_table()` is limited to admins.
+- The spatial extension's GDAL readers and writers (`ST_Read`,
+  `ST_Read_Meta`, `FROM 'x.gpkg'`, `FROM 'x.fgb'`, `COPY ... (FORMAT GDAL)`)
+  are refused for everyone too: GDAL opens files that a dataset names
+  outside the sandbox. `ST_ReadSHP`, `ST_ReadOSM` and GeoParquet work; see
+  [media analytics](media-analytics.md#loading-boundaries).
 - Session settings that PostgreSQL drivers send on connect
   (`application_name`, `extra_float_digits`, `DateStyle` and similar) are
   accepted and ignored. `statement_timeout` is honored.

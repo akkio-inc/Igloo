@@ -57,6 +57,7 @@ echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
 landing="s3://$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)/landing"
 sed -i.bak -e "s#^IGLOO_ALLOWED_LOCATIONS=.*#IGLOO_ALLOWED_LOCATIONS=$landing/#" "$env_file"
 admin_password="$(grep '^IGLOO_ADMIN_PASSWORD=' "$env_file" | cut -d= -f2)"
+bucket="$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)"
 
 echo "starting the stack"
 compose up -d "$build" --wait --wait-timeout 300 >/dev/null
@@ -85,6 +86,14 @@ expect_error() {
   local name=$1 code=$2 got
   got="$(psql_as "$3" "$4" -c "$5")" && { fail "$name: succeeded, want $code"; return; }
   if grep -q "ERROR:  $code" <<<"$got"; then pass "$name"; else fail "$name: want $code, got [$got]"; fi
+}
+
+# expect_refused NAME USER PASSWORD SQL: must fail without showing any of
+# /etc/passwd.
+expect_refused() {
+  local name=$1 got
+  got="$(psql_as "$2" "$3" -c "$4")" && { fail "$name: succeeded"; return; }
+  if grep -q 'root:' <<<"$got"; then fail "$name: showed the file: $got"; else pass "$name"; fi
 }
 
 # expect_soon NAME WANT USER PASSWORD SQL: like expect, but waits up to a
@@ -208,6 +217,60 @@ expect_error "no local files" 42501 igloo "$admin_password" "SELECT * FROM read_
 expect_error "no other buckets" 42501 igloo "$admin_password" "SELECT * FROM read_parquet('s3://elsewhere/x.parquet')"
 expect_error "no arbitrary URLs" 42501 igloo "$admin_password" "SELECT * FROM read_csv('http://lakekeeper:8181/management/v1/warehouse')"
 expect_error "cannot reopen the sandbox" 22P02 igloo "$admin_password" "SET enable_external_access = true"
+
+echo "media analytics"
+expect "impressions" "CREATE TABLE" walt walt-password-1 "CREATE TABLE impressions AS
+  SELECT (i % 4)::INT AS campaign_id, (ARRAY['ctv', 'social', 'display'])[1 + (i // 4) % 3] AS platform,
+    DATE '2026-10-01' + (i % 7)::INT AS day, 'u' || (hash(i) % 20000)::VARCHAR AS user_id,
+    -74.1 + (i % 300) / 1000.0 AS lon, 40.6 + (i % 290) / 1000.0 AS lat
+  FROM range(100000) t(i)"
+expect "sketches per campaign, platform and day, kept in Iceberg" "CREATE TABLE" walt walt-password-1 "CREATE TABLE daily_reach AS
+  SELECT campaign_id, platform, day, count(*) AS impressions,
+    datasketch_hll(12, user_id)::BLOB AS hll, datasketch_theta(12, user_id)::BLOB AS theta
+  FROM impressions GROUP BY ALL"
+expect "deduplicated reach from merged sketches" "t" rita rita-password-1 "
+  SELECT abs(datasketch_hll_estimate(datasketch_hll_union(12, hll))
+    / (SELECT count(DISTINCT user_id) FROM impressions WHERE campaign_id < 3) - 1) < 0.05
+  FROM daily_reach WHERE campaign_id < 3"
+expect "audience overlap from theta sketches" "t" rita rita-password-1 "
+  WITH p AS (SELECT platform, datasketch_theta(12, theta::sketch_theta) AS s FROM daily_reach GROUP BY platform),
+  exact AS (SELECT count(*) AS n FROM (SELECT user_id FROM impressions WHERE platform = 'ctv'
+    INTERSECT SELECT user_id FROM impressions WHERE platform = 'social'))
+  SELECT abs(datasketch_theta_estimate(datasketch_theta_intersect(a.s, b.s)) / exact.n - 1) < 0.1
+  FROM p a, p b, exact WHERE a.platform = 'ctv' AND b.platform = 'social'"
+expect "points in polygons" "t" rita rita-password-1 "
+  SELECT count(*) FILTER (WHERE ST_Contains(ST_GeomFromText('POLYGON((-74.05 40.65, -73.9 40.65, -73.9 40.8, -74.05 40.8, -74.05 40.65))'),
+    ST_Point(lon, lat))) = count(*) FILTER (WHERE lon > -74.05 AND lon < -73.9 AND lat > 40.65 AND lat < 40.8) FROM impressions"
+expect "boundaries kept as WKB in Iceberg" "CREATE TABLE" walt walt-password-1 "CREATE TABLE zones AS
+  SELECT 'z1' AS zone, ST_AsWKB(ST_GeomFromText('POLYGON((-74.05 40.65, -73.9 40.65, -73.9 40.8, -74.05 40.8, -74.05 40.65))')) AS boundary"
+expect "and joined to points" "z1|t" rita rita-password-1 "
+  SELECT z.zone, count(*) > 1000 FROM impressions i JOIN zones z ON ST_Contains(ST_GeomFromWKB(z.boundary), ST_Point(i.lon, i.lat)) GROUP BY ALL"
+expect "geometries reach clients as WKT" "POINT (-73.98 40.75)" rita rita-password-1 "SELECT ST_Point(-73.98, 40.75)"
+expect "distances in meters, longitude first" "6286" rita rita-password-1 \
+  "SELECT round(ST_Distance_Sphere(ST_Point(-74.0060, 40.7128), ST_Point(-73.9352, 40.7306)))"
+expect "H3 cells" "892a1072893ffff" rita rita-password-1 "SELECT h3_h3_to_string(h3_latlng_to_cell(40.7128, -74.0060, 9))"
+expect "approximate and statistical functions" "t|t|t" rita rita-password-1 "
+  SELECT approx_count_distinct(user_id) BETWEEN 18000 AND 22000, approx_quantile(lat, 0.5) BETWEEN 40.7 AND 40.8,
+    regr_r2(lat, lon) BETWEEN 0 AND 1 FROM impressions"
+expect "time zones" "2026-09-30 23:30" rita rita-password-1 \
+  "SELECT strftime(timezone('America/New_York', TIMESTAMPTZ '2026-10-01 03:30:00+00'), '%Y-%m-%d %H:%M')"
+# GDAL opens files a dataset names on its own: a VRT file a writer puts in
+# the warehouse can name /etc/passwd. Igloo refuses GDAL for everyone.
+vrt='<OGRVRTDataSource><OGRVRTLayer name="x"><SrcDataSource relativeToVRT="0">CSV:/etc/passwd</SrcDataSource></OGRVRTLayer></OGRVRTDataSource>'
+expect "a writer can put any file in the warehouse" "COPY 1" walt walt-password-1 \
+  "COPY (SELECT '$vrt' AS l) TO 's3://$bucket/warehouse/e2e/evil.vrt' (HEADER false, QUOTE '', DELIMITER E'\\x01')"
+expect_error "ST_Read of that file is refused" 42501 igloo "$admin_password" "SELECT * FROM ST_Read('s3://$bucket/warehouse/e2e/evil.vrt')"
+expect_error "ST_Read of a local file is refused" 42501 igloo "$admin_password" "SELECT * FROM ST_Read('/etc/passwd')"
+expect_error "ST_Read of an outside URL is refused" 42501 igloo "$admin_password" \
+  "SELECT * FROM ST_Read('http://lakekeeper:8181/management/v1/warehouse')"
+expect_error "GeoPackages, which DuckDB reads with ST_Read, are refused" 42501 rita rita-password-1 \
+  "SELECT * FROM 's3://$bucket/warehouse/e2e/zones.gpkg'"
+expect_error "GDAL writes are refused" 42501 walt walt-password-1 \
+  "COPY (SELECT ST_Point(1, 2) AS geom) TO 's3://$bucket/warehouse/e2e/x.geojson' (FORMAT GDAL, DRIVER 'GeoJSON')"
+expect_refused "ST_ReadSHP cannot read local files" igloo "$admin_password" "SELECT * FROM ST_ReadSHP('/etc/passwd')"
+expect_refused "nor outside URLs" igloo "$admin_password" "SELECT * FROM ST_ReadSHP('http://lakekeeper:8181/management/v1/x.shp')"
+expect_refused "ST_ReadOSM cannot read local files" igloo "$admin_password" "SELECT * FROM ST_ReadOSM('/etc/passwd')"
+expect_refused "nor outside URLs" igloo "$admin_password" "SELECT * FROM ST_ReadOSM('http://lakekeeper:8181/management/v1/x.osm.pbf')"
 
 echo "client compatibility"
 got="$(psql_admin -c '\dt')"

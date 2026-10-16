@@ -138,6 +138,11 @@ the official TPC-H answers.
   CREATE TASK nightly SCHEDULE '0 6 * * *' TIMEZONE 'America/New_York' AS
     CREATE OR REPLACE TABLE report AS SELECT day, sum(spend) FROM sales GROUP BY day;
   ```
+- **[Media analytics](docs/media-analytics.md)**: HLL and theta sketches
+  that merge into deduplicated reach and audience overlap across campaigns,
+  platforms and days; geometry and H3 functions for DMA, zip code and
+  store-radius reporting; DuckDB's approximate, statistical and time zone
+  functions.
 - **A locked-down query engine**: SQL cannot read the server's files or reach
   any location except the warehouse and locations you allow.
 - **Automatic table maintenance**: small files are compacted, snapshots older
@@ -205,7 +210,8 @@ local store; see the bottom of `deploy/single-vm/.env`.
 - **Object storage** holds the table data as Parquet files.
 
 Every component uses a permissive open-source license (Apache 2.0, MIT or the
-PostgreSQL License).
+PostgreSQL License), except GEOS, under the LGPL 2.1, inside DuckDB's spatial
+extension (see [media analytics](docs/media-analytics.md#security)).
 
 ## Documentation
 
@@ -227,6 +233,8 @@ PostgreSQL License).
   materialized views
 - [Masking, row access policies and tags](docs/security-policies.md): what
   each user sees of tables' rows and columns
+- [Media analytics](docs/media-analytics.md): reach and frequency with
+  sketches, geospatial reporting, approximate and statistical functions
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a

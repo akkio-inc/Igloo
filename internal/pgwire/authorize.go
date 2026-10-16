@@ -191,7 +191,8 @@ var fixedCacheSettings = []string{
 // them, a reader could call functions only admins may call, and an admin
 // could change the settings below. Without them, every function and
 // setting a statement uses is named in its text. (query_table() takes only
-// table names and is admin-only, see requiredRole.)
+// table names and is admin-only, see requiredRole.) Spatial's GDAL readers
+// and writers open files outside the sandbox (see gdalUse).
 func forbidden(query string) error {
 	words := sqllex.CodeWords(query)
 	var err error
@@ -200,6 +201,10 @@ func forbidden(query string) error {
 		err = errors.New("permission denied: query() runs SQL from a string, which Igloo cannot check; write the query itself instead")
 	case mentionsFunction(query, words, "json_execute_serialized_sql"):
 		err = errors.New("permission denied: json_execute_serialized_sql runs SQL that Igloo cannot check; write the query itself instead")
+	case gdalUse(query) != "":
+		err = fmt.Errorf("permission denied: %s goes through GDAL, which can open files and URLs outside Igloo's sandbox; "+
+			"read GeoParquet with read_parquet, shapefiles with ST_ReadSHP, or GeoJSON with read_json and ST_GeomFromGeoJSON instead",
+			gdalUse(query))
 	default:
 		for _, name := range fixedCacheSettings {
 			if mentionsFunction(query, words, name) {

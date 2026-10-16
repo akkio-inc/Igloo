@@ -74,6 +74,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   stack publishes it on loopback, the Helm chart on the SQL Service
   (`flightSQL.enabled`), and the scale-to-zero gateway forwards it
   (`IGLOO_GATEWAY_FLIGHT_BACKEND`).
+- Media analytics functions, from DuckDB extensions baked into the image:
+  HLL and theta sketches (datasketches) that can be stored in tables and
+  merged into deduplicated reach and audience overlaps across campaigns,
+  platforms and days; geometries, points in polygons and distances
+  (spatial), with geometries sent to clients as WKT; and the H3 grid (h3).
+  See docs/media-analytics.md for reach, overlap and frequency examples and
+  DuckDB's approximate, statistical and time zone functions.
 
 ### Security and governance
 
@@ -136,7 +143,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   days); `IGLOO_AUDIT=false` turns it off. Passwords are never recorded.
 - A query sandbox: SQL cannot read the server's files or reach locations
   outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`, nor run SQL built
-  from strings (`query()`, `json_execute_serialized_sql()`).
+  from strings (`query()`, `json_execute_serialized_sql()`), nor use the
+  spatial extension's GDAL readers and writers (`ST_Read`, `ST_Read_Meta`,
+  `FROM '*.gpkg'`, `COPY ... (FORMAT GDAL)`), which open files a dataset
+  names outside the sandbox. `ST_ReadSHP` and `ST_ReadOSM` stay confined to
+  the warehouse and allowed locations.
 - TLS for SQL clients, the web console and Arrow Flight SQL.
 
 ### Web console

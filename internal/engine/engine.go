@@ -27,13 +27,14 @@ const attachRetryInterval = 2 * time.Second
 
 // Extensions are the DuckDB extensions Igloo uses: object storage (httpfs,
 // aws, azure), Iceberg (which reads manifests with avro), TPC-H data for
-// demos and benchmarks, and the read cache (cache_httpfs, see cache.go). The
-// image installs them at build time.
-var Extensions = []string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs"}
+// demos and benchmarks, the read cache (cache_httpfs, see cache.go), and
+// geospatial functions and sketches (see media.go). The image installs them
+// at build time.
+var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs"}, mediaExtensions...)
 
 // communityExtensions come from DuckDB's community repository rather than
 // the core one. DuckDB checks their signatures on load just the same.
-var communityExtensions = map[string]bool{"cache_httpfs": true}
+var communityExtensions = map[string]bool{"cache_httpfs": true, "h3": true, "datasketches": true}
 
 // Engine owns the embedded DuckDB database.
 type Engine struct {
@@ -400,7 +401,7 @@ func storageStatements(s config.Storage) []string {
 
 // extensionStatements load the extensions every deployment uses.
 func extensionStatements() []string {
-	return []string{"LOAD httpfs", "LOAD iceberg", "LOAD avro", "LOAD tpch"}
+	return append([]string{"LOAD httpfs", "LOAD iceberg", "LOAD avro", "LOAD tpch"}, mediaStatements()...)
 }
 
 func secret(opts ...string) string {

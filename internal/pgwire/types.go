@@ -63,6 +63,8 @@ func wireType(t duckdb.Type, alias string) (uint32, encoder) {
 		return pgtype.IntervalOID, toInterval
 	case duckdb.TYPE_LIST, duckdb.TYPE_ARRAY, duckdb.TYPE_STRUCT, duckdb.TYPE_MAP, duckdb.TYPE_UNION, duckdb.TYPE_VARIANT:
 		return pgtype.JSONOID, toJSON
+	case duckdb.TYPE_GEOMETRY:
+		return pgtype.TextOID, toWKT
 	default:
 		return pgtype.TextOID, toText
 	}

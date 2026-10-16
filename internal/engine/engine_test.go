@@ -110,7 +110,7 @@ func TestEveryExtensionLoadsBeforeLockdown(t *testing.T) {
 	// LOAD reads extension files, which lockdown forbids, so every
 	// extension a query might need has to be loaded up front.
 	got := joined(storageStatements(config.Storage{Type: config.StorageS3}))
-	for _, ext := range []string{"httpfs", "iceberg", "avro", "tpch"} {
+	for _, ext := range []string{"httpfs", "iceberg", "avro", "tpch", "spatial", "h3", "datasketches"} {
 		if !strings.Contains(got, "LOAD "+ext) {
 			t.Errorf("%s is not loaded", ext)
 		}

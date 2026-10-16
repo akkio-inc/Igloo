@@ -146,7 +146,13 @@ reference for every setting mentioned here.
   write files on the server's local disk and cannot reach any URL outside the
   warehouse location and the prefixes in `IGLOO_ALLOWED_LOCATIONS`. DuckDB
   extensions are installed in the image at build time; the server does not
-  download code while running.
+  download code while running. The spatial extension's GDAL readers and
+  writers (`ST_Read`, `ST_Read_Meta`, `FROM '*.gpkg'` and `'*.fgb'`, `COPY
+  ... (FORMAT GDAL)`) are refused for everyone: GDAL opens files that a
+  dataset names inside itself, such as a VRT file's sources, on its own and
+  outside the sandbox. PROJ, behind `ST_Transform`, can open a local file
+  that a coordinate system definition names, without returning its
+  contents ([details](docs/media-analytics.md#security)).
 - **Transport.** TLS is on when `IGLOO_TLS_CERT_FILE` and `IGLOO_TLS_KEY_FILE`
   are set, and unencrypted SQL sessions are then refused unless
   `IGLOO_TLS_REQUIRED=false` (the web console and Flight SQL then serve TLS
