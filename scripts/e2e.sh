@@ -654,10 +654,17 @@ expect "reaches its members' sessions" "client:analysts" nora nora-password-1 "S
 expect "a built-in role's statement timeout" "ALTER ROLE" igloo "$admin_password" "ALTER ROLE reader SET statement_timeout = '1s'"
 expect_error "cancels its users' long statements" 57014 rita rita-password-1 "$slow"
 expect "a role's concurrency limit" "ALTER ROLE" igloo "$admin_password" "ALTER ROLE analysts SET max_concurrent_statements = 1"
-psql_as nora nora-password-1 -c "SET statement_timeout = '15s'" -c "$slow" >/dev/null 2>&1 &
+psql_as nora nora-password-1 -c "SET statement_timeout = '30s'" -c "$slow" >/dev/null 2>&1 &
 holder=$!
-sleep 5
-got="$(psql_as nora nora-password-1 -c "SET statement_timeout = '1s'" -c "SELECT 1")" || true
+# On a busy host the holder can take a while to start: until it holds the
+# slot, a second statement just runs, so try again while the holder lives.
+for _ in $(seq 30); do
+  got="$(psql_as nora nora-password-1 -c "SET statement_timeout = '1s'" -c "SELECT 1")" || true
+  if grep -q "behind the limit of 1 statement at once for role analysts" <<<"$got" || ! kill -0 "$holder" 2>/dev/null; then
+    break
+  fi
+  sleep 2
+done
 if grep -q "behind the limit of 1 statement at once for role analysts" <<<"$got"; then
   pass "statements beyond it wait in line, until their timeout"
 else
