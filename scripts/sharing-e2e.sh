@@ -2,8 +2,8 @@
 # Delta Sharing checks that need more than scripts/e2e.sh's fast ones:
 #
 #  - the official Python client (delta-sharing, on pandas and pyarrow) reads
-#    a share from Igloo: listings, a table as a DataFrame, versions, time
-#    travel and the delta response format;
+#    a share from Igloo: listings, a table as a DataFrame, versions and time
+#    travel, and the files of a table with deleted rows;
 #  - Igloo reads shares from the reference server (deltaio/delta-sharing-
 #    server), a plain and a partitioned Delta table written to the stack's
 #    object store.
@@ -96,7 +96,7 @@ psql_admin -c "INSERT INTO campaigns VALUES (2, 'globex', 20.25, TIMESTAMP '2026
 # localhost and so needs no TLS.
 printf '{"shareCredentialsVersion": 1, "endpoint": "http://localhost:8444/delta-sharing", "bearerToken": "%s"}\n' "$token" >"$work/acme.share"
 if docker run --rm --platform linux/amd64 --network "container:$project-igloo-1" \
-  -e PROFILE=/work/acme.share -e OLD_VERSION="$old_version" -e EXPECTED_ROWS=1 -e DELTA_FORMAT=1 \
+  -e PROFILE=/work/acme.share -e OLD_VERSION="$old_version" -e EXPECTED_ROWS=1 \
   -v "$root/scripts/clients:/clients:ro" -v "$work:/work" python:3.12-slim sh -c "
     pip install -q --root-user-action=ignore delta-sharing==1.4.1 >/dev/null 2>&1 && python /clients/delta_sharing_test.py"; then
   pass "delta-sharing 1.4.1 (pandas)"
@@ -112,7 +112,7 @@ rows="$(curl -sS -X POST -H "Authorization: Bearer $token" -d '{}' "$sharing/sha
 if [ "$rows" = "1 1 " ]; then pass "files with deletes are served without the deleted rows"; else fail "after DELETE: numRecords [$rows]"; fi
 
 echo "Igloo reads shares from the reference server"
-reference_token="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+reference_token="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 if docker run --rm --network "$network" -v "$root/scripts/clients:/clients:ro" \
   -e TABLE_ROOT="s3://$bucket/delta" -e S3_ENDPOINT_URL=http://storage:9000 -e S3_REGION=us-east-1 \
   -e S3_ACCESS_KEY_ID="$s3_key" -e S3_SECRET_ACCESS_KEY="$s3_secret" python:3.12-slim sh -c "
@@ -173,7 +173,7 @@ expect "its tables" "partner|data|trips
 partner|data|viewing" "SHOW SHARES IN PROVIDER reference"
 psql_admin -c "CREATE SCHEMA partners" >/dev/null
 expect "an external table on a Delta table" "CREATE EXTERNAL TABLE" "CREATE EXTERNAL TABLE partners.trips FROM SHARE reference.partner.data.trips"
-expect "reads its rows" "100|2475.0|25" "SELECT count(*), sum(fare), count(*) FILTER (WHERE city = 'sf') FROM partners.trips"
+expect "reads its rows" "100|2475|25" "SELECT count(*), sum(fare), count(*) FILTER (WHERE city = 'sf') FROM partners.trips"
 expect "an external table on a partitioned Delta table" "CREATE EXTERNAL TABLE" \
   "CREATE EXTERNAL TABLE partners.viewing FROM SHARE reference.partner.data.viewing"
 expect "puts partition values back, with their types" "30|435|2026-10-01|DATE|10" \

@@ -260,7 +260,8 @@ func (m *materializer) collect(needed map[string]bool, now time.Time) (int, erro
 		return 0, nil
 	}
 	var stale []string
-	err := walker.WalkDir(m.root, func(path string, d fs.DirEntry, err error) error {
+	// Object stores' file systems take directory names without the slash.
+	err := walker.WalkDir(strings.TrimSuffix(m.root, "/"), func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if isNotExist(err) {
 				return fs.SkipDir

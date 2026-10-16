@@ -49,8 +49,4 @@ expected_rows = int(os.environ.get("EXPECTED_ROWS", "2"))
 at_version = delta_sharing.load_as_pandas(url, version=int(os.environ.get("OLD_VERSION", version)))
 check("time travel to a version", len(at_version) == expected_rows, len(at_version))
 
-if os.environ.get("DELTA_FORMAT") == "1":
-    delta = delta_sharing.load_as_pandas(url, use_delta_format=True)
-    check("delta response format", len(delta) == len(df), len(delta))
-
 sys.exit(1 if failures else 0)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,7 +96,20 @@ func newIcebergSource(cat *catalog.Client, warehouse string, files iceio.IO) *ic
 	return &icebergSource{cat: cat, warehouse: warehouse, copies: newMaterializer(files, warehouse), files: map[string][]dataFile{}}
 }
 
-func (s *icebergSource) gone(path string) { s.copies.forget(path) }
+// gone forgets a file that could not be found, which can only be a copy
+// collected while a listing still named it, so the next listing writes it
+// again.
+func (s *icebergSource) gone(path string) {
+	s.copies.forget(path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, files := range s.files {
+		if slices.ContainsFunc(files, func(f dataFile) bool { return f.path == path }) {
+			delete(s.files, key)
+			s.order = slices.DeleteFunc(s.order, func(k string) bool { return k == key })
+		}
+	}
+}
 
 func (s *icebergSource) load(ctx context.Context, schema, name string) (*table.Table, error) {
 	tbl, err := s.cat.LoadTable(ctx, catalog.Ident(schema, name))
