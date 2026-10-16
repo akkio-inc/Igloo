@@ -81,6 +81,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (spatial), with geometries sent to clients as WKT; and the H3 grid (h3).
   See docs/media-analytics.md for reach, overlap and frequency examples and
   DuckDB's approximate, statistical and time zone functions.
+- Connections to PostgreSQL and MySQL databases (`CREATE`, `ALTER`, `DROP`
+  and `SHOW CONNECTIONS`): each replica attaches them read-only as catalogs
+  of their own, such as `crm.public.customers`, which queries join with
+  Iceberg tables, with filters and columns pushed down. Credentials are
+  stored encrypted or read from files of `IGLOO_CONNECTION_SECRETS_DIR`,
+  never shown again, and rotate without a restart; a new connection is
+  attached when each replica next starts. A database that is down or stops
+  answering fails only the queries that read it.
 
 ### Security and governance
 
@@ -163,6 +171,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `FROM '*.gpkg'`, `COPY ... (FORMAT GDAL)`), which open files a dataset
   names outside the sandbox. `ST_ReadSHP` and `ST_ReadOSM` stay confined to
   the warehouse and allowed locations.
+- Grants on connections to other databases (`GRANT SELECT ON CONNECTION`,
+  `ON SCHEMA conn.schema`, `ON TABLE conn.schema.table`), required for
+  every role but admin. Every statement's reads of connections are checked
+  against DuckDB's plan and recorded in the query history. Remote sessions
+  are read-only, and the functions that run SQL on remote databases
+  (`postgres_query`, `mysql_query` and the like) are refused for everyone.
 - TLS for SQL clients, the web console and Arrow Flight SQL.
 
 ### Data sharing

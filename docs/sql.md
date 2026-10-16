@@ -15,6 +15,8 @@ approximate and statistical functions are described in
 Tables live in the Iceberg catalog, named `lake` in SQL (`IGLOO_CATALOG_NAME`),
 and the default schema is `public`. Unqualified names resolve to
 `lake.public`, so `events` and `lake.public.events` are the same table.
+[Connections](#connections-to-other-databases) to PostgreSQL and MySQL
+databases are catalogs of their own, such as `crm.public.customers`.
 
 ## Tables
 
@@ -114,16 +116,19 @@ GRANT SELECT, INSERT ON SCHEMA staging TO analysts;  -- every table in it, now a
 GRANT SELECT ON ALL TABLES IN SCHEMA finance TO analysts;  -- the tables there now
 GRANT CREATE ON SCHEMA sandbox TO nora;
 GRANT ALL PRIVILEGES ON SCHEMA sandbox TO nora;  -- SELECT, INSERT, UPDATE, DELETE, CREATE
+GRANT SELECT ON CONNECTION crm TO analysts;      -- a connection to another database
+GRANT SELECT ON SCHEMA crm.public TO nora;       -- or one of its schemas, or crm.public.customers
 REVOKE INSERT ON SCHEMA staging FROM analysts;
 REVOKE analysts FROM nora;
 DROP ROLE [IF EXISTS] analysts;
 SHOW ROLES;
-SHOW GRANTS;                       -- or TO name, ON TABLE name, ON SCHEMA name
+SHOW GRANTS;                       -- or TO name, ON TABLE name, ON SCHEMA name, ON CONNECTION name
 ```
 
 | Privilege | On | Allows |
 |---|---|---|
 | `SELECT` | table, view or schema | Reading the table |
+| `SELECT` | connection, or its schema or table | Reading the connection's tables, which the built-in roles do not cover (see [connections](#connections-to-other-databases)) |
 | `INSERT` | table or schema | `INSERT`, `COPY ... FROM`, `COPY INTO` and `MERGE ... INSERT` into it |
 | `UPDATE` | table or schema | `UPDATE` and `MERGE ... UPDATE` |
 | `DELETE` | table or schema | `DELETE`, `TRUNCATE` and `MERGE ... DELETE` |
@@ -285,6 +290,28 @@ External tables are read-only and take grants like any table. See
 [Delta Sharing](sharing.md) for every statement, what recipients receive,
 and the security model.
 
+## Connections to other databases
+
+Admins connect PostgreSQL and MySQL databases, which Igloo then queries in
+place, read-only, alongside its Iceberg tables; see
+[connections](federation.md) for everything about them.
+
+```sql
+CREATE CONNECTION crm TYPE postgres
+  WITH (host 'crm.db.example.com', database 'crm', user 'igloo_ro', password 'a-long-password');
+-- each replica attaches it when it next starts
+GRANT SELECT ON SCHEMA crm.public TO analysts;
+SELECT count(*) FROM lake.public.audiences a JOIN crm.public.customers c ON c.email = a.email;
+ALTER CONNECTION crm SET (password 'a-new-password');  -- applies without a restart
+SHOW CONNECTIONS;
+DROP CONNECTION crm;
+```
+
+A connection's tables need a `SELECT` grant on them, their schema or the
+connection for everyone but admins, readers and writers included. The
+functions that run SQL on the remote database (`postgres_query`,
+`mysql_query` and the like) are refused for everyone.
+
 ## Time travel
 
 Every write creates an Iceberg snapshot, and you can query earlier ones:
@@ -419,7 +446,11 @@ the same users and grants; see [other engines](external-engines.md).
   string, are refused for everyone, admins included: Igloo checks a
   statement's text, and cannot check SQL that a statement builds. Write the
   query itself instead. `query_table()` is limited to admins, and needs its
-  table name written out as text, not built at run time.
+  table name written out as text, not built at run time. The functions
+  that run SQL on other databases (`postgres_query`, `postgres_execute`,
+  `postgres_scan`, `mysql_query`, `mysql_execute` and the like) are refused
+  for everyone too, for the same reason; see
+  [connections](federation.md#what-no-one-can-do).
 - The spatial extension's GDAL readers and writers (`ST_Read`,
   `ST_Read_Meta`, `FROM 'x.gpkg'`, `FROM 'x.fgb'`, `COPY ... (FORMAT GDAL)`)
   are refused for everyone too: GDAL opens files that a dataset names

@@ -127,6 +127,35 @@ reference for every setting mentioned here.
   views run through their owners' policies. Policies are not a boundary for admins, who manage them and can
   read the warehouse's files, nor for other engines reading the Iceberg
   tables directly. Policy changes reach other replicas within 30 seconds.
+- **Connections to other databases.** Only admins create, change and drop
+  [connections](docs/federation.md) to PostgreSQL and MySQL databases. A
+  connection's tables need a `SELECT` grant (on the table, its schema or the
+  connection) for everyone but admins: the built-in roles `reader` and
+  `writer` do not cover them. Whenever connections are attached, every
+  statement of a user who is not an admin is checked the way reads are for
+  role `none`: DuckDB's plan must scan exactly the connection tables
+  DuckDB's parse of the statement names, by type and table, with views
+  expanded, and each must be granted, or the statement is refused.
+  Connections are attached read-only, and every remote session is
+  read-only too. The extensions' functions that run SQL on a remote
+  database or connect to any server (`postgres_query`, `postgres_execute`,
+  `postgres_scan`, `mysql_query` and the like) are refused for everyone,
+  admins included; a data-driven `PIVOT` that may read a connection is
+  refused for non-admins. Connections are attached only at startup, before
+  the sandbox locks, so SQL cannot attach a database or reach a server that
+  is not a connection. DuckDB never sees a connection's credentials: it
+  reaches each database through a proxy inside Igloo on the loopback
+  interface, signing in with a random per-process token, and the proxy
+  signs in to the database. Stored passwords are encrypted (AES-256-GCM,
+  bound to the connection's name) under a key in the metadata database, so
+  they are safe from a copy of the connections table but not from someone
+  with the whole metadata database; `password_secret` keeps them in files
+  of `IGLOO_CONNECTION_SECRETS_DIR` instead. Passwords never appear in
+  `SHOW CONNECTIONS`, the history or the logs. The proxy refuses a MySQL
+  server's request for a local file. A connection to the server of the
+  metadata database is refused, as a guard against mistakes; do not
+  connect the catalog's database or other internal services either. Give
+  each connection a database user that can read only what Igloo should.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history

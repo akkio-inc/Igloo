@@ -138,6 +138,16 @@ the official TPC-H answers.
   GRANT SELECT ON SHARE acme_reporting TO RECIPIENT acme;
   CREATE EXTERNAL TABLE partners.viewership FROM SHARE tvco_ads.tv.viewing.daily;
   ```
+- **[Connections to other databases](docs/federation.md)**: query
+  PostgreSQL and MySQL databases in place, read-only, and join them with
+  Iceberg tables, with filters pushed down to them and their tables
+  governed by the same grants.
+
+  ```sql
+  CREATE CONNECTION crm TYPE postgres WITH (host 'crm.example.com', database 'crm', user 'igloo_ro', password '...');
+  GRANT SELECT ON SCHEMA crm.public TO analysts;
+  SELECT count(*) FROM audiences a JOIN crm.public.customers c ON c.email = a.email;
+  ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days, with
   each statement's CPU time, bytes and memory.
@@ -237,8 +247,10 @@ local store; see the bottom of `deploy/single-vm/.env`.
 - **Object storage** holds the table data as Parquet files.
 
 Every component uses a permissive open-source license (Apache 2.0, MIT or the
-PostgreSQL License), except GEOS, under the LGPL 2.1, inside DuckDB's spatial
-extension (see [media analytics](docs/media-analytics.md#security)).
+PostgreSQL License), except two libraries under the LGPL 2.1 inside DuckDB's
+extensions: GEOS in the spatial extension (see
+[media analytics](docs/media-analytics.md#security)), and MariaDB
+Connector/C, the MySQL client library, in the `mysql` extension.
 
 ## Documentation
 
@@ -269,6 +281,8 @@ extension (see [media analytics](docs/media-analytics.md#security)).
   cost per client, role limits, compute pools
 - [Delta Sharing](docs/sharing.md): sharing tables with outside recipients,
   reading partners' shares, and their security
+- [Connections](docs/federation.md): querying PostgreSQL and MySQL
+  databases in place, and governing them with grants
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a
@@ -294,6 +308,10 @@ extension (see [media analytics](docs/media-analytics.md#security)).
 - **Other engines get storage credentials on S3 only.** On Google Cloud
   Storage and Azure, engines using the Iceberg REST catalog need their own
   access to the files ([details](docs/external-engines.md#storage-credentials)).
+- **Connections attach at startup.** A new connection to another database
+  is attached when each replica next restarts; changes to its credentials
+  and host apply at once. Connections are read-only, and BigQuery and
+  Snowflake are not supported yet ([details](docs/federation.md)).
 
 ## Repository layout
 
@@ -307,6 +325,7 @@ internal/sso/       single sign-on with OpenID Connect
 internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox
+internal/federation/ connections to other databases and their proxy
 internal/flightsql/ Arrow Flight SQL endpoint
 internal/icebergrest/ Iceberg REST catalog for other engines
 internal/pgwire/    Postgres wire protocol, authorization, policies, compatibility

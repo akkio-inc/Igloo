@@ -257,6 +257,22 @@ community extension, baked into the image like the other extensions; DuckDB
 checks its signature when it loads. If it cannot load or its directory is
 not writable, Igloo logs a warning and runs without it.
 
+## Connections to other databases
+
+[Connections](federation.md) to PostgreSQL and MySQL databases are kept in
+the metadata database and attached by each replica when it starts, so after
+`CREATE CONNECTION`, restart the replicas (`docker compose restart igloo`,
+or `kubectl rollout restart deployment/igloo`); changes to credentials,
+hosts and timeouts and `DROP CONNECTION` need none. Each replica checks
+every connection's database when it starts, at once, and starts without the
+ones it cannot reach, logging `connection not attached` with the reason;
+`SHOW CONNECTIONS` shows each one's state on the replica that answers.
+
+Igloo logs `cannot sign in to the remote database` the first time in a row
+that it cannot, and `remote database reachable again` when it can again.
+Queries of a connection whose database is down fail within its
+`connect_timeout`; nothing else is affected, listing tables included.
+
 ## Scaling out
 
 Run more replicas behind one load balancer or Kubernetes Service. Replicas
@@ -487,6 +503,9 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `42501`, `permission denied for ana: SELECT on table s.t needs ... a SELECT grant` | Neither the user's role nor their grants allow it. An admin can `GRANT` the privilege named on the table, its schema or one of the user's roles. |
 | SQLSTATE `42501`, `read_parquet reads data that grants do not cover` | Users with role `none` cannot read files or call functions that take a table's name; query the tables instead. |
 | `cannot verify which tables this statement reads` | A user with role `none` sent a statement whose reads Igloo could not account for, such as one through a macro. Rewrite it over tables and views, or give the user the reader role. |
+| SQLSTATE `55000`, `connection crm is not attached on this replica` | The connection was created after the replica started, or its database could not be reached then (`SHOW CONNECTIONS` says which). Restart the replica. |
+| SQLSTATE `42501`, `SELECT on table crm.s.t needs a SELECT grant on it, its schema or connection crm` | Connections' tables need grants for every role but admin; `GRANT SELECT ON CONNECTION crm TO ...` or on the schema or table. |
+| A new table of a connection's database is missing from listings | Replicas list a connection's tables when they attach it. Run `ALTER CONNECTION name REFRESH`, or restart. |
 | `send one statement at a time` | Only admins may send several statements in one query. Most tools send one at a time; for scripts, run them as an admin or split them. |
 | `Permission Error: Cannot access file ...` | The sandbox blocked a file or URL outside the warehouse. To load from or export to another bucket, add it to `IGLOO_ALLOWED_LOCATIONS`. |
 | SQLSTATE `40001`, `CatalogCommitConflicts` | Two writers committed to the same table at once inside explicit transactions. Retry the transaction. |
