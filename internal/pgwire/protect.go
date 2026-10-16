@@ -959,14 +959,14 @@ func (s *Server) checkWarehouseFiles(ctx context.Context, user auth.User, query 
 // the tables. Each file's INSERT is checked as well (see checkPath).
 func (s *Server) checkLoadLocation(ctx context.Context, user auth.User, loc string) error {
 	g := s.gov
-	if user.Role == auth.RoleAdmin || g.warehouse == "" || g.snapshot(ctx).Empty() {
+	if user.Role == auth.RoleAdmin || g.warehouse == "" && g.external == "" || g.snapshot(ctx).Empty() {
 		return nil
 	}
 	prefix := loc
 	if i := strings.IndexAny(loc, "*?[{"); i >= 0 {
 		prefix = loc[:i]
 	}
-	if strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix) {
+	if g.warehouse != "" && (strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix)) {
 		return denied("COPY INTO from %q: while tables have policies, the warehouse's files are read through its tables; load from a location outside it", loc)
 	}
 	if g.externalFiles(prefix) {
