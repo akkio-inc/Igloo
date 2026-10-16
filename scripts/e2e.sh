@@ -1049,6 +1049,21 @@ fi
 docker start "$project-crm" >/dev/null
 until docker exec "$project-crm" pg_isready -U crm -d crm >/dev/null 2>&1; do sleep 1; done
 expect_soon "and work again once it is back" "1000" igloo "$admin_password" "SELECT count(*) FROM crmdb.sales.customers"
+# The same for MySQL.
+docker stop -t 1 "$project-ops" >/dev/null
+expect "with a MySQL database down, everything else works" "3|1000" igloo "$admin_password" \
+  "SELECT (SELECT count(*) FROM e2e), (SELECT count(*) FROM crmdb.sales.customers)"
+start=$SECONDS
+if got="$(psql_admin -c "SELECT count(*) FROM ops.ops.campaigns")"; then
+  fail "a query of a MySQL database that is down succeeded"
+elif grep -q "connection ops" <<<"$got" && [ $((SECONDS - start)) -lt 30 ]; then
+  pass "and queries of it fail, quickly"
+else
+  fail "a query of a MySQL database that is down, after $((SECONDS - start))s: $got"
+fi
+docker start "$project-ops" >/dev/null
+until docker exec "$project-ops" mysql -h127.0.0.1 -uops -p"$ops_password" -e 'SELECT 1' ops >/dev/null 2>&1; do sleep 2; done
+expect_soon "and work again once it is back" "3" igloo "$admin_password" "SELECT count(*) FROM ops.ops.campaigns"
 expect "dropping a connection detaches it at once" "DROP CONNECTION" igloo "$admin_password" "DROP CONNECTION ops"
 if got="$(psql_admin -c "SELECT * FROM ops.ops.campaigns")"; then
   fail "a dropped connection's table is still there"
