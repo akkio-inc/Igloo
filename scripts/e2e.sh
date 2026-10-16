@@ -18,6 +18,7 @@ http_port="${E2E_HTTP_PORT:-18432}"
 console_port="${E2E_CONSOLE_PORT:-18443}"
 flight_port="${E2E_FLIGHT_PORT:-13137}"
 iceberg_port="${E2E_ICEBERG_PORT:-18181}"
+sharing_port="${E2E_SHARING_PORT:-18444}"
 image="${E2E_IMAGE:-$project:dev}"
 build=--build
 [ -z "${E2E_IMAGE:-}" ] || build=--no-build
@@ -57,7 +58,8 @@ fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 "$root/deploy/single-vm/init-env.sh" "$env_file" >/dev/null
 sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" \
   -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_FLIGHT_PORT=.*/IGLOO_FLIGHT_PORT=$flight_port/" \
-  -e "s/^IGLOO_ICEBERG_PORT=.*/IGLOO_ICEBERG_PORT=$iceberg_port/" -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" "$env_file"
+  -e "s/^IGLOO_ICEBERG_PORT=.*/IGLOO_ICEBERG_PORT=$iceberg_port/" -e "s/^IGLOO_SHARING_PORT=.*/IGLOO_SHARING_PORT=$sharing_port/" \
+  -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" "$env_file"
 # Maintain tables every few seconds, so the maintenance checks need not wait
 # an hour.
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
@@ -664,6 +666,74 @@ psql_host=igloo-reporting expect "a second compute pool reads the same tables" "
 expect_soon "its statements carry its pool" "reporting" igloo "$admin_password" \
   "SELECT pool FROM igloo.query_history WHERE query_text = 'SELECT count(*) FROM e2e /* reporting */' LIMIT 1"
 compose_pools rm -sf igloo-reporting >/dev/null
+
+echo "delta sharing"
+# The provider side over the protocol with curl, then Igloo reading its own
+# share as a provider's. scripts/sharing-e2e.sh adds the official Python
+# client and the reference sharing server.
+sharing="http://127.0.0.1:$sharing_port/delta-sharing"
+psql_admin -c "CREATE TABLE shared_spend AS SELECT range::INTEGER AS id, 'client_' || (range % 3) AS client,
+  (range * 1.5)::DECIMAL(10,2) AS spend FROM range(30)" >/dev/null
+expect "an admin creates a share" "CREATE SHARE
+ALTER SHARE" igloo "$admin_password" "CREATE SHARE e2e_share COMMENT 'For partners';
+  ALTER SHARE e2e_share ADD TABLE shared_spend WITH HISTORY;"
+expect_error "only admins manage shares" 42501 walt walt-password-1 "CREATE SHARE nope"
+recipient="$(psql_admin -c "CREATE RECIPIENT e2e_partner COMMENT 'E2E partner'")" || true
+code="${recipient#*/activate/}"
+code="${code%%|*}"
+expect "and grants it to a recipient" "GRANT" igloo "$admin_password" "GRANT SELECT ON SHARE e2e_share TO RECIPIENT e2e_partner"
+profile="$(curl -sS -X POST "$sharing/activate/$code")" || true
+token="$(sed -n 's/.*"bearerToken": "\([^"]*\)".*/\1/p' <<<"$profile")"
+if [ -n "$token" ]; then pass "the activation link gives a profile file"; else fail "activation: [$recipient] [$profile]"; fi
+status="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$sharing/activate/$code")"
+if [ "$status" = 404 ]; then pass "an activation link works once"; else fail "a second activation: $status"; fi
+ds() { curl -sS -H "Authorization: Bearer $token" "$@"; }
+got="$(ds "$sharing/shares")" || true
+if grep -q '"name":"e2e_share"' <<<"$got"; then pass "the recipient lists its shares"; else fail "list shares: $got"; fi
+got="$(ds -X POST -H 'Content-Type: application/json' -d '{}' "$sharing/shares/e2e_share/schemas/public/tables/shared_spend/query")" || true
+file_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | head -1)"
+if grep -q '"protocol":{"minReaderVersion":1}' <<<"$got" && grep -q 'numRecords\\":30' <<<"$got" && [ -n "$file_url" ]; then
+  pass "a query lists the snapshot's files"
+else
+  fail "query: $got"
+fi
+if [ "$(curl -sS -r 0-3 "$file_url")" = PAR1 ]; then pass "a signed URL serves the Parquet file"; else fail "file URL $file_url"; fi
+status="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: igloo.example.com' -H "Authorization: Bearer $token" "$sharing/shares")"
+if [ "$status" = 403 ]; then pass "the endpoint refuses unencrypted requests from afar"; else fail "plain HTTP from afar: $status"; fi
+status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}x" "$sharing/shares")"
+if [ "$status" = 401 ]; then pass "a wrong token is refused"; else fail "wrong token: $status"; fi
+
+self_profile="{\"shareCredentialsVersion\": 1, \"endpoint\": \"http://localhost:8444/delta-sharing\", \"bearerToken\": \"$token\"}"
+expect "an admin registers a provider's profile" "CREATE PROVIDER" igloo "$admin_password" "CREATE PROVIDER self FROM '$self_profile'"
+expect "and lists its tables" "e2e_share|public|shared_spend" igloo "$admin_password" "SHOW SHARES IN PROVIDER self"
+psql_admin -c "CREATE SCHEMA partners" >/dev/null
+expect "an external table reads a shared table" "CREATE EXTERNAL TABLE" igloo "$admin_password" \
+  "CREATE EXTERNAL TABLE partners.spend FROM SHARE self.e2e_share.public.shared_spend"
+expect "readers query it by every name" "30|652.50|30" rita rita-password-1 \
+  "SELECT count(*), sum(spend), (SELECT count(*) FROM lake.partners.spend) FROM partners.spend"
+expect_error "a user with role none needs a grant" 42501 nora nora-password-1 "SELECT count(*) FROM partners.spend"
+psql_admin -c "GRANT SELECT ON TABLE partners.spend TO nora" >/dev/null
+expect "and reads it with one" "30" nora nora-password-1 "SELECT count(*) FROM partners.spend"
+expect_error "but not with a table not granted" 42501 nora nora-password-1 \
+  "SELECT count(*) FROM partners.spend, (SELECT max(n) FROM lake.public.contended)"
+psql_admin -c "INSERT INTO shared_spend VALUES (100, 'client_9', 10.00)" >/dev/null
+expect_soon "the external table follows new versions" "31" rita rita-password-1 "SELECT count(*) FROM partners.spend"
+psql_admin -c "DELETE FROM shared_spend WHERE id < 10" >/dev/null
+expect_soon "and rows deleted from the shared table" "21|10" rita rita-password-1 "SELECT count(*), min(id) FROM partners.spend"
+got="$(psql_admin -c "SHOW EXTERNAL TABLES")" || true
+if grep -q '^partners|spend|self|e2e_share|public|shared_spend|[0-9]' <<<"$got"; then pass "SHOW EXTERNAL TABLES"; else fail "SHOW EXTERNAL TABLES: $got"; fi
+expect_soon "recipients' requests are in the query history" "t" igloo "$admin_password" \
+  "SELECT count(*) > 0 FROM igloo.query_history WHERE user_name = 'recipient:e2e_partner'
+   AND list_contains(tables_read, 'lake.public.shared_spend')"
+expect "bearer tokens are never recorded" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '%' || 'dst' || '_%'"
+psql_admin -c "REVOKE SELECT ON SHARE e2e_share FROM RECIPIENT e2e_partner" >/dev/null
+if [ "$(ds "$sharing/shares")" = '{"items":[]}' ]; then pass "a revoked share is gone at once"; else fail "after REVOKE: $(ds "$sharing/shares")"; fi
+expect "dropping an external table" "DROP EXTERNAL TABLE" igloo "$admin_password" "DROP EXTERNAL TABLE partners.spend"
+expect "and its provider" "DROP PROVIDER" igloo "$admin_password" "DROP PROVIDER self"
+psql_admin -c "DROP RECIPIENT e2e_partner" >/dev/null
+status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$sharing/shares")"
+if [ "$status" = 401 ]; then pass "a dropped recipient's token stops working"; else fail "dropped recipient: $status"; fi
 
 echo "table maintenance"
 psql_admin -c "CREATE TABLE fragmented (id INTEGER, v VARCHAR, amount DECIMAL(15,2))" >/dev/null
