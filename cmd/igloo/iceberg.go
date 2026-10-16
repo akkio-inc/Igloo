@@ -61,6 +61,8 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 	if deps.clones != nil {
 		clones = deps.clones
 	}
+	// Owners are kept with the grants, as for SQL (see pgwire.Options).
+	owners, _ := deps.grants.(auth.OwnerStore)
 	handler, err := icebergrest.New(icebergrest.Options{
 		Clones:      clones,
 		CatalogURI:  cfg.Catalog.URI,
@@ -68,6 +70,7 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 		CatalogName: cfg.Catalog.Name,
 		Users:       deps.users,
 		Grants:      deps.grants,
+		Owners:      owners,
 		Authenticate: func(ctx context.Context, name, password string, addr net.Addr) (auth.User, error) {
 			user, err := deps.sql.AuthenticateClient(ctx, name, password, addr, icebergClient)
 			var blocked *pgwire.LoginBlockedError

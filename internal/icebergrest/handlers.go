@@ -1,6 +1,7 @@
 package icebergrest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -182,6 +183,7 @@ func (s *Server) createNamespace(c *call) error {
 	if err != nil {
 		return err
 	}
+	s.recordOwner(c, c.written[0])
 	writeBody(c.w, r.status, r.body)
 	return nil
 }
@@ -351,6 +353,7 @@ func (s *Server) createTable(c *call) error {
 	if err != nil {
 		return err
 	}
+	s.recordOwner(c, o)
 	// The new table is empty, and its creator fills it, as with CREATE
 	// TABLE AS.
 	return s.writeTable(c, ns, o, r, true)
@@ -676,6 +679,21 @@ func (s *Server) requireUnprotected(c *call, o auth.Object) error {
 			"read it through Igloo's SQL or Flight SQL", o))
 	}
 	return nil
+}
+
+// recordOwner makes the caller the owner of the schema or table they
+// created. A table's owner may set its comments and hand it on, and
+// nothing else (see auth.Ownership).
+func (s *Server) recordOwner(c *call, o auth.Object) {
+	if s.opts.Owners == nil {
+		return
+	}
+	user := c.who.user.Name
+	err := s.opts.Owners.SetObjectOwner(context.WithoutCancel(c.ctx()),
+		auth.Ownership{Object: o, Owner: user, OwnerType: auth.GranteeUser, SetBy: user}, false)
+	if err != nil {
+		s.log.Warn("could not record the owner of a new "+o.Kind(), "object", o.String(), "owner", user, "err", err)
+	}
 }
 
 // forget removes the grants on a dropped table or schema.

@@ -402,6 +402,7 @@ func newHarness(t *testing.T) *harness {
 		CatalogName:       "lake",
 		Users:             h.users,
 		Grants:            h.grants,
+		Owners:            h.grants,
 		Authenticate:      h.users.authenticate,
 		AuthenticateToken: h.tokens.authenticate,
 		Tokens:            h.tokens,
@@ -923,6 +924,54 @@ func TestCreateTable(t *testing.T) {
 	ada := h.login("ada", "ada-password")
 	if w := h.request("POST", "/v1/namespaces/team/tables", ada, map[string]any{"name": "placed", "location": "s3://bucket/wh/team/placed"}); w.Code != 200 {
 		t.Errorf("admin creates with a location: %d %s", w.Code, w.Body)
+	}
+}
+
+// TestCreatorsOwn checks that engines' creators own what they create, as
+// in SQL, and that owners follow renames and go with drops.
+func TestCreatorsOwn(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.grant("nora", auth.PrivilegeCreate, "team", "")
+	nora := h.login("nora", "nora-password")
+	walt := h.login("walt", "walt-password")
+	owners := func() []string {
+		t.Helper()
+		ws, err := h.grants.ObjectOwners(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, w := range ws {
+			out = append(out, w.Object.String()+"="+w.Owner)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	if w := h.request("POST", "/v1/namespaces/team/tables", nora, map[string]any{"name": "mine"}); w.Code != 200 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	if w := h.request("POST", "/v1/namespaces/public/tables", nora, map[string]any{"name": "refused"}); w.Code != 403 {
+		t.Fatalf("create without CREATE: %d %s", w.Code, w.Body)
+	}
+	if w := h.request("POST", "/v1/namespaces", walt, map[string]any{"namespace": []string{"marts"}}); w.Code != 200 {
+		t.Fatalf("create namespace: %d %s", w.Code, w.Body)
+	}
+	if got, want := owners(), []string{"marts=walt", "team.mine=nora"}; !slices.Equal(got, want) {
+		t.Errorf("owners: %q, want %q", got, want)
+	}
+	if w := h.request("POST", "/v1/tables/rename", walt, map[string]any{
+		"source":      map[string]any{"namespace": []string{"team"}, "name": "mine"},
+		"destination": map[string]any{"namespace": []string{"team"}, "name": "ours"},
+	}); w.Code != 204 {
+		t.Fatalf("rename: %d %s", w.Code, w.Body)
+	}
+	if w := h.request("DELETE", "/v1/namespaces/marts", walt, nil); w.Code != 204 {
+		t.Fatalf("drop namespace: %d %s", w.Code, w.Body)
+	}
+	if got, want := owners(), []string{"team.ours=nora"}; !slices.Equal(got, want) {
+		t.Errorf("owners after a rename and a drop: %q, want %q", got, want)
 	}
 }
 

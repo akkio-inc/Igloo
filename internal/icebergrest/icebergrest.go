@@ -87,6 +87,9 @@ type Options struct {
 	// new passwords take effect at once; Grants likewise.
 	Users  auth.Store
 	Grants auth.GrantStore
+	// Owners records who created a schema or table here as its owner, as
+	// SQL's CREATE does. Nil records none.
+	Owners auth.OwnerStore
 	// Authenticate checks a password as a SQL login does: failures are
 	// delayed and count towards the failed-login limits, and every outcome
 	// is logged, counted and kept in the login history. It returns
