@@ -251,6 +251,8 @@ func (s *Server) cloneTable(ctx context.Context, sess *session, user auth.User, 
 		return acc, cloneError(err)
 	}
 	s.log.Info("table cloned", "source", src.String(), "target", dst.String(), "snapshot", snapshotID(res.Snapshot), "by", user.Name)
+	// The cloner owns the clone; one that replaced a table keeps its owner.
+	s.recordOwner(ctx, user, &createdObject{object: dst, keep: exists})
 	return acc, nil
 }
 
@@ -319,6 +321,7 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 		if err := s.execDDL(ctx, sess, user, "CREATE SCHEMA "+quoteName([]string{s.catalogName(), dst})); err != nil {
 			return acc, err
 		}
+		s.recordOwner(ctx, user, &createdObject{object: auth.Object{Schema: dst}})
 	}
 	if err := s.carryPolicies(ctx, user, pairs); err != nil {
 		return acc, err
@@ -333,6 +336,7 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 			return acc, fmt.Errorf("clone %s: %w", p.source, cloneError(err))
 		}
 		s.log.Info("table cloned", "source", p.source.String(), "target", p.target.String(), "snapshot", snapshotID(res.Snapshot), "by", user.Name)
+		s.recordOwner(ctx, user, &createdObject{object: p.target, keep: p.exists})
 	}
 	if s.ddl != nil {
 		if _, err := s.ddl.SyncViews(ctx); err != nil {
@@ -347,6 +351,7 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 				return acc, fmt.Errorf("clone view %s.%s: %w", src, v.Name, catalogDDLError(err))
 			}
 			acc.written = append(acc.written, auth.Object{Schema: dst, Table: v.Name})
+			s.recordOwner(ctx, user, &createdObject{object: auth.Object{Schema: dst, Table: v.Name}, keep: true})
 		}
 	}
 	if exists {

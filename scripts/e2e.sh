@@ -1017,6 +1017,8 @@ expect_soon "cloning takes moments" "t" igloo "$admin_password" \
   "SELECT max(duration_ms) < 5000 FROM igloo.query_history WHERE query_text = 'CREATE TABLE dev.lineitem CLONE lineitem' AND outcome = 'ok'"
 expect_soon "the history names the clone's source and target" '["lake.public.lineitem"]|["lake.dev.lineitem"]' igloo "$admin_password" \
   "SELECT tables_read, tables_written FROM igloo.query_history WHERE query_text = 'CREATE TABLE dev.lineitem CLONE lineitem'"
+expect_soon "the cloner owns the clone" "walt" igloo "$admin_password" \
+  "SELECT table_owner FROM igloo.tables WHERE table_schema = 'dev' AND table_name = 'lineitem'"
 expect_error "readers cannot clone" 42501 rita rita-password-1 "CREATE TABLE dev.mine CLONE lineitem"
 expect_error "a clone's name must be free" 42P07 walt walt-password-1 "CREATE TABLE dev.lineitem CLONE orders"
 
