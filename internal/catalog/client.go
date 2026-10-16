@@ -15,6 +15,9 @@ import (
 // writes table files with Igloo's own storage credentials, as DuckDB does.
 type Client struct {
 	*rest.Catalog
+	// uri and warehouse are for the calls iceberg-go does not make (see
+	// register.go).
+	uri, warehouse string
 }
 
 // Open connects to the catalog Igloo serves.
@@ -27,7 +30,7 @@ func Open(ctx context.Context, cfg config.Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to catalog %s: %w", cfg.Catalog.URI, err)
 	}
-	return &Client{Catalog: cat}, nil
+	return &Client{Catalog: cat, uri: cfg.Catalog.URI, warehouse: cfg.Catalog.Warehouse}, nil
 }
 
 // Namespaces returns every namespace, including nested ones.

@@ -453,6 +453,48 @@ Watch `igloo_maintenance_last_success_timestamp_seconds`: if it stops
 advancing, the logs (component `maintenance`) say which table failed and why.
 Set `IGLOO_MAINTENANCE=false` only if another tool maintains the tables.
 
+### Files that clones share
+
+A [clone](sql.md#clones) reads its source's data files, delete files and
+manifests where they are, under the source's location. Every way Igloo
+deletes files keeps those a clone still reads, whichever of the two tables
+it works on:
+
+- **Snapshot expiry** deletes the files that only expired snapshots
+  referenced, and only files inside the table's own location: a clone's
+  maintenance never deletes its source's files. A source's maintenance
+  keeps every file a clone references in any of its snapshots.
+- **Orphan cleanup** keeps them the same way.
+- **Compaction** deletes nothing itself; the files it replaces go with the
+  snapshots that read them.
+- **`DROP TABLE`** never asks the catalog to purge the table, which would
+  delete everything under its location: a dropped table's files stay in the
+  bucket, clones keep reading theirs, and Igloo does not delete the rest.
+  The catalog deletes files only when asked to purge, and only Igloo can
+  reach it. Igloo's warehouse uses the catalog's default hard deletion, in
+  which a dropped table cannot be restored; with Lakekeeper's soft deletion
+  turned on instead, a clone restored after it was dropped may miss
+  files of its source that maintenance deleted meanwhile.
+
+Which tables share which files is recorded twice: in each clone's own
+metadata (the table property `igloo.clone.shares-files-of`, the locations
+it reads from) and in the metadata database (schema `igloo_clones`). Each
+pass first visits every table, recording what the clones declare, so a
+replica without a metadata database, or a database restored from a
+backup, has the record back before anything is deleted. Deleting a table's
+files then takes a lock that cloning the table takes too (in the metadata
+database, so replicas share it), and reads the metadata of each of its
+clones. Whenever Igloo cannot tell what a clone needs (the metadata
+database does not answer, a clone was renamed or dropped during the pass,
+or was made less than an hour ago), it keeps the table's files; a later
+pass deletes them.
+
+A clone stops sharing once its own maintenance has replaced and expired
+everything it read of its source. The source's files that only clones
+needed are then orphans, which the orphan cleanup deletes once they are
+three days old. Until then a shared file counts once in the bucket, but a
+file the source no longer needs stays as long as a clone reads it.
+
 ## Scheduled work
 
 Tasks, pipes, materialized views ([loading and scheduling](loading.md)) and

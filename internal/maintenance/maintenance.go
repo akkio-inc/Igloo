@@ -6,12 +6,18 @@
 // Every write through DuckDB adds a snapshot and at least one data file, so
 // without this a table that takes frequent small writes grows without bound
 // and gets slower to read.
+//
+// Clones share their source's files (see package clone). A table's
+// maintenance deletes only files inside its own location, and of those only
+// ones no clone references: each pass first compacts and expires every
+// table, noting what each clone shares, then deletes.
 package maintenance
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"log/slog"
 	"math/rand/v2"
 	"strconv"
@@ -19,11 +25,12 @@ import (
 	"time"
 
 	icecat "github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/compaction"
 
 	"github.com/akkio-inc/igloo/internal/activity"
-	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/clone"
 )
 
 // Standard Iceberg table properties that override the retention defaults for
@@ -82,6 +89,14 @@ type Options struct {
 	// as namespace.table, or "" when the tables could not be listed. It
 	// must not block.
 	Failed func(table string, err error)
+	// Clones keeps the files clones share. Nil means no table is a clone.
+	Clones *clone.Guard
+}
+
+// Catalog is the Iceberg catalog; *catalog.Client implements it.
+type Catalog interface {
+	Tables(ctx context.Context) ([]table.Identifier, error)
+	LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error)
 }
 
 // Schedule records when maintenance jobs last ran.
@@ -101,7 +116,7 @@ type Lock interface {
 
 // Maintainer runs table maintenance against an Iceberg REST catalog.
 type Maintainer struct {
-	catalog *catalog.Client
+	catalog Catalog
 	opts    Options
 	log     *slog.Logger
 	// warehouse is the warehouse root with a trailing slash.
@@ -114,7 +129,7 @@ type Maintainer struct {
 
 // New maintains the tables in cat. warehouse is the warehouse root, such as
 // s3://bucket/warehouse/.
-func New(cat *catalog.Client, warehouse string, opts Options, log *slog.Logger) *Maintainer {
+func New(cat Catalog, warehouse string, opts Options, log *slog.Logger) *Maintainer {
 	return &Maintainer{
 		catalog:        cat,
 		opts:           opts,
@@ -195,16 +210,35 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 		return
 	}
 	failed := 0
+	pass := m.opts.Clones.Begin()
+	var cleanups []*cleanup
 	for _, ident := range tables {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := m.maintain(ctx, ident); err != nil {
+		c, err := m.maintain(ctx, ident, pass)
+		if err != nil {
 			failed++
 			m.log.Warn("table maintenance failed", "table", name(ident), "err", err)
 			m.failed(name(ident), err)
 		}
+		if c != nil {
+			cleanups = append(cleanups, c)
+		}
 	}
+	// Files are deleted once every table was seen, so what every clone
+	// shares is known.
+	pass.Settle(ctx)
+	for _, c := range cleanups {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := m.clean(ctx, c, pass); err != nil {
+			failed++
+			m.log.Warn("table maintenance failed", "table", name(c.ident), "err", err)
+		}
+	}
+	pass.Sweep(ctx)
 	m.opts.Metrics.pass(failed == 0)
 	m.record(ctx, passJob)
 	m.log.Debug("maintenance pass finished", "tables", len(tables), "failed", failed, "took", time.Since(start))
@@ -227,17 +261,31 @@ func (m *Maintainer) record(ctx context.Context, job string) {
 	}
 }
 
-// maintain compacts, expires and cleans one table. A commit that loses a race
-// with a writer is not an error; the next pass tries again. A failure in one
-// step does not stop the others.
-func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier) error {
+// cleanup is what is left to delete of one table once it is compacted and
+// expired.
+type cleanup struct {
+	ident table.Identifier
+	// expired are the files only expired snapshots referenced.
+	expired []string
+	// orphans says whether to look for orphan files too.
+	orphans bool
+}
+
+// maintain compacts and expires one table, and returns what is left to
+// delete, if anything. A commit that loses a race with a writer is not an
+// error; the next pass tries again. A failure in one step does not stop
+// the others.
+func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass *clone.Pass) (*cleanup, error) {
 	tbl, err := m.catalog.LoadTable(ctx, ident)
 	if errors.Is(err, icecat.ErrNoSuchTable) {
-		return nil // dropped since the listing
+		pass.Missing() // dropped or renamed since the listing
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("load: %w", err)
+		pass.Failed()
+		return nil, fmt.Errorf("load: %w", err)
 	}
+	pass.Saw(ctx, tbl)
 	log := m.log.With("table", name(ident))
 	var errs []error
 
@@ -250,20 +298,124 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier) error
 		errs = append(errs, fmt.Errorf("compact: %w", err))
 	}
 	if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
-		return errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
+		return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
 	}
 
-	switch expired, err := m.expire(ctx, tbl, log); {
+	c := &cleanup{ident: ident, orphans: m.orphansDue(tbl)}
+	switch expired, files, err := m.expire(ctx, tbl, log); {
 	case err == nil:
-		tbl = expired
+		c.expired = files
+		if expired != tbl {
+			if err := pass.Release(ctx, expired); err != nil {
+				log.Warn("could not update which files the clone shares", "err", err)
+			}
+		}
 	case errors.Is(err, table.ErrCommitFailed):
 		log.Debug("snapshot expiry lost a race with a writer; retrying next pass")
 	default:
 		errs = append(errs, fmt.Errorf("expire snapshots: %w", err))
 	}
+	if len(c.expired) == 0 && !c.orphans {
+		c = nil
+	}
+	return c, errors.Join(errs...)
+}
 
-	if err := m.removeOrphans(ctx, tbl, log); err != nil {
-		errs = append(errs, fmt.Errorf("delete orphan files: %w", err))
+// orphansDue reports whether to look for the table's orphan files, which
+// happens at most once per orphanInterval. Iceberg treats everything under a
+// table's location as the table's, so this is only for tables inside
+// Igloo's warehouse: a table registered from elsewhere may share its
+// location with other data.
+func (m *Maintainer) orphansDue(tbl *table.Table) bool {
+	return time.Since(m.lastOrphanScan[name(tbl.Identifier())]) >= orphanInterval &&
+		strings.HasPrefix(strings.TrimSuffix(tbl.Location(), "/")+"/", m.warehouse)
+}
+
+// clean deletes the files only expired snapshots referenced and, when due,
+// the table's orphan files: files under its location that no snapshot
+// references and that are older than orphanAge, such as the leftovers of
+// failed writes. Files that clones share stay (see clone.Guard).
+func (m *Maintainer) clean(ctx context.Context, c *cleanup, pass *clone.Pass) error {
+	log := m.log.With("table", name(c.ident))
+	tbl, err := m.catalog.LoadTable(ctx, c.ident)
+	if errors.Is(err, icecat.ErrNoSuchTable) {
+		return nil // dropped meanwhile: its files stay, as dropping leaves them
+	}
+	if err != nil {
+		return fmt.Errorf("load: %w", err)
+	}
+	files := c.expired
+	var orphans []string
+	if c.orphans {
+		res, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(orphanAge), table.WithDryRun(true))
+		if err != nil {
+			return fmt.Errorf("find orphan files: %w", err)
+		}
+		orphans = res.OrphanFileLocations
+		files = append(files, orphans...)
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return err
+	}
+	deleted, err := pass.Delete(ctx, tbl, files, func(ctx context.Context, paths []string) error {
+		return remove(ctx, fs, paths)
+	})
+	if errors.Is(err, clone.ErrBusy) || errors.Is(err, clone.ErrUnsure) {
+		log.Debug("kept the table's files for a later pass", "reason", err)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delete files: %w", err)
+	}
+	if !c.orphans {
+		return nil
+	}
+	key := name(c.ident)
+	m.lastOrphanScan[key] = time.Now()
+	m.record(ctx, orphanJobPrefix+key)
+	isOrphan := make(map[string]bool, len(orphans))
+	for _, f := range orphans {
+		isOrphan[f] = true
+	}
+	n := 0
+	for _, f := range deleted {
+		if isOrphan[f] {
+			n++
+		}
+	}
+	if n > 0 {
+		m.opts.Metrics.orphansDeleted(n)
+		log.Info("deleted orphan files", "files", n)
+	}
+	return nil
+}
+
+// remove deletes files, in bulk where the storage can. Files already gone
+// are not an error.
+func remove(ctx context.Context, fs iceio.IO, paths []string) error {
+	if bulk, ok := fs.(iceio.BulkRemovableIO); ok {
+		deleted, err := bulk.DeleteFiles(ctx, paths)
+		if err == nil {
+			return nil
+		}
+		done := make(map[string]bool, len(deleted))
+		for _, d := range deleted {
+			done[d] = true
+		}
+		var rest []string
+		for _, p := range paths {
+			if !done[p] {
+				rest = append(rest, p)
+			}
+		}
+		paths = rest
+	}
+	var errs []error
+	for _, p := range paths {
+		if err := fs.Remove(p); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -360,10 +512,11 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 }
 
 // expire removes snapshots older than the table's retention, always keeping
-// the current one, and deletes the files that only they referenced. Files
-// that compaction replaced stay until the snapshots that read them expire,
-// so time travel within the retention window keeps working.
-func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Logger) (*table.Table, error) {
+// the current one, and returns the table as committed and the files inside
+// its location that only those snapshots referenced, for clean to delete.
+// Files that compaction replaced stay until the snapshots that read them
+// expire, so time travel within the retention window keeps working.
+func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Logger) (*table.Table, []string, error) {
 	maxAge, minKeep := m.retention(tbl)
 	cutoff := time.Now().Add(-maxAge).UnixMilli()
 	expirable := 0
@@ -373,23 +526,37 @@ func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Log
 		}
 	}
 	if expirable == 0 || len(tbl.Metadata().Snapshots()) <= minKeep {
-		return tbl, nil
+		return tbl, nil, nil
 	}
 
 	before := len(tbl.Metadata().Snapshots())
 	tx := tbl.NewTransaction()
-	if err := tx.ExpireSnapshots(table.WithOlderThan(maxAge), table.WithRetainLast(minKeep)); err != nil {
-		return tbl, err
+	// iceberg-go would delete the files itself, a clone's included and
+	// those of its source that a clone references.
+	if err := tx.ExpireSnapshots(table.WithOlderThan(maxAge), table.WithRetainLast(minKeep), table.WithPostCommit(false)); err != nil {
+		return tbl, nil, err
 	}
 	committed, err := tx.Commit(ctx)
 	if err != nil {
-		return tbl, err
+		return tbl, nil, err
 	}
-	if n := before - len(committed.Metadata().Snapshots()); n > 0 {
-		m.opts.Metrics.expired(n)
-		log.Info("expired snapshots", "snapshots", n, "retention", maxAge)
+	n := before - len(committed.Metadata().Snapshots())
+	if n == 0 {
+		return committed, nil, nil
 	}
-	return committed, nil
+	m.opts.Metrics.expired(n)
+	log.Info("expired snapshots", "snapshots", n, "retention", maxAge)
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return committed, nil, err
+	}
+	// Files missed here, if a manifest cannot be read, are orphans that
+	// the orphan cleanup deletes later.
+	files, err := clone.Unreferenced(fs, tbl.Metadata(), committed.Metadata(), tbl.Location())
+	if err != nil {
+		return committed, nil, fmt.Errorf("find the files of expired snapshots: %w", err)
+	}
+	return committed, files, nil
 }
 
 // retention is how long tbl keeps snapshots and how many it always keeps.

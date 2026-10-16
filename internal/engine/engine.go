@@ -426,10 +426,13 @@ func secret(opts ...string) string {
 
 // attachStatement attaches the Iceberg REST catalog. Igloo uses its own
 // storage credentials rather than ones vended by the catalog, so it works
-// with object stores that have no STS endpoint.
+// with object stores that have no STS endpoint. DROP TABLE never asks the
+// catalog to purge the table's files (DuckDB's default for REST catalogs
+// other than AWS's, made explicit): the catalog would delete everything
+// under the table's location, files that clones of it share included.
 func attachStatement(c config.Catalog) string {
 	return fmt.Sprintf(
-		"ATTACH %s AS %s (TYPE iceberg, ENDPOINT %s, AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none')",
+		"ATTACH %s AS %s (TYPE iceberg, ENDPOINT %s, AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', PURGE_REQUESTED false)",
 		literal(c.Warehouse), ident(c.Name), literal(c.URI),
 	)
 }

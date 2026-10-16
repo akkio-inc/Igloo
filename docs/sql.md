@@ -33,6 +33,8 @@ databases are catalogs of their own, such as `crm.public.customers`.
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
 | `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
+| `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
+| `ALTER TABLE ... CREATE BRANCH`, `CREATE TAG`, `DROP BRANCH`, `DROP TAG`, `FAST FORWARD` | Yes, outside transactions; see [branches and tags](#branches-and-tags) |
 | `CREATE TASK`, `CREATE PIPE` | Yes; see [tasks](loading.md#tasks) and [pipes](loading.md#pipes) |
 | `PRIMARY KEY`, `UNIQUE` | Accepted but not enforced |
 | `NOT NULL` | Enforced |
@@ -328,7 +330,175 @@ SELECT * FROM events AT (TIMESTAMP => TIMESTAMP '2026-10-01 00:00:00');
 Time travel reaches back as far as the snapshot retention: 7 days by default
 (`IGLOO_SNAPSHOT_RETENTION`), or a table's own
 `history.expire.max-snapshot-age-ms`. Older snapshots are expired by
-[table maintenance](operations.md#table-maintenance).
+[table maintenance](operations.md#table-maintenance). A
+[tag](#branches-and-tags) keeps a snapshot for as long as you need it.
+
+## Clones
+
+A clone is a full copy of a table, or of a schema's tables and views, that
+costs nothing to make. It is a new Iceberg table whose metadata points at
+its source's data and delete files, so no data is copied and no storage is
+added, however large the table: making one takes moments. From then on the
+two are separate tables. Writes to either go to new files of that table's
+own, which the other never sees, and only those new files cost storage.
+
+```sql
+CREATE TABLE dev.orders CLONE prod.orders;
+CREATE OR REPLACE TABLE dev.orders CLONE prod.orders AT (TIMESTAMP => now() - INTERVAL 1 DAY);
+CREATE TABLE dev.orders_v7 CLONE prod.orders AT (SNAPSHOT => 7983066988386993768);
+CREATE TABLE dev.orders_q3 CLONE prod.orders AT (TAG => 'q3_close');
+CREATE SCHEMA dev CLONE prod;                  -- every table and view
+CREATE OR REPLACE SCHEMA dev CLONE prod;       -- make dev a fresh copy of prod
+```
+
+- **Which snapshot.** Without `AT`, the source as it is now. `AT
+  (TIMESTAMP => expression)` takes the source as of a time, as far back as
+  [time travel](#time-travel) reaches; `AT (SNAPSHOT => id)`, or `VERSION =>`
+  as in time travel, one snapshot; `AT (BRANCH => 'name')` or `AT (TAG =>
+  'name')` the snapshot a [branch or tag](#branches-and-tags) names. A
+  schema is cloned as it is now or as of a time.
+- **What it has.** The source's columns, as of the snapshot cloned, its
+  table and column comments and its table properties, snapshot retention
+  included. Its history starts at the snapshot cloned: time travel on the
+  clone reaches no further back, and the source's branches and tags are not
+  cloned.
+- **Schemas.** `CREATE SCHEMA ... CLONE` clones every table of the source
+  schema and copies every view's SQL. As in Snowflake, a view's SQL is kept
+  as it is, so a view that reads `lake.prod.orders` reads the source's table
+  still; views that leave out the schema read whatever the reader's search
+  path finds. A materialized view is cloned as a table, which nothing
+  refreshes. `OR REPLACE` clones each table over the one of the same name,
+  and drops the tables and views of the schema that the source does not
+  have. A schema clone is not atomic: if a table cannot be cloned, the
+  error names it, the tables cloned so far stay, and running the statement
+  again finishes the job.
+- **Who may clone.** Cloning a table needs `SELECT` on it, or the reader
+  role, and `CREATE` on the clone's schema, or the writer role: what
+  `CREATE TABLE ... AS SELECT * FROM` it needs. Cloning a schema needs the
+  writer role, as creating a schema does.
+- **Grants.** A clone starts with no grants of its own, as any new table
+  does; grants follow names, so a clone made again under a name keeps the
+  grants on that name. A schema's clone gets the source schema's own grants,
+  which cover every table in it, now and later; grants on the source's
+  tables are not copied.
+- **Policies.** A clone gets every masking policy, row access policy and
+  tag of its source, so no user sees more of the clone than of the source:
+  cloning is no way around [policies](#policies-and-tags). They are in place
+  before the clone exists. Other replicas take up to 30 seconds to learn of
+  a policy change, so the first clone of a table with policies under a new
+  name waits that long before it is created; making it again under that
+  name, as a development copy is every day, does not wait. A table of the
+  clone's name that has a different policy or tag value of its own is not
+  replaced: an admin decides which applies first.
+- **Readers.** Like a table made with `CREATE TABLE AS`, a clone may be read
+  by whoever may read its schema. Unlike one, it holds every row of the
+  source behind the source's policies, so a user whose roles a row access
+  policy admits sees those rows in the clone, even without `SELECT` on the
+  source. Clone tables with policies into schemas that only their intended
+  readers can read.
+- **History.** `CLONE` statements are recorded in
+  [`igloo.query_history`](#query-history) with the source in `tables_read`
+  and the clone in `tables_written`.
+- **Storage.** Table maintenance never deletes a file a clone still reads,
+  whichever table is compacted, expires snapshots, loses orphan files or is
+  dropped; a source's old files are deleted once no clone reads them either.
+  See [files that clones share](operations.md#files-that-clones-share).
+- Tables of format version 1 and encrypted tables cannot be cloned, nor can
+  a view on its own. `CLONE` runs outside transactions.
+
+## Branches and tags
+
+Iceberg tables can have named references to their snapshots. A tag names
+one snapshot and keeps it, however old it gets, until it is dropped: a
+quarter-end close, the table before a backfill. A branch is a line of
+snapshots of its own. (These are snapshot tags, not the
+[tags](#policies-and-tags) that classify columns.)
+
+```sql
+ALTER TABLE events CREATE TAG q3_close;                         -- the current snapshot
+ALTER TABLE events CREATE TAG before_fix AT (TIMESTAMP => TIMESTAMP '2026-10-01 00:00:00');
+ALTER TABLE events CREATE BRANCH audit AT (TAG => 'q3_close');
+ALTER TABLE events CREATE OR REPLACE BRANCH audit;               -- move it to the current snapshot
+SELECT count(*) FROM events AT (TAG => 'q3_close');
+SELECT * FROM events e AT (BRANCH => 'audit') WHERE e.kind = 'click';
+SHOW BRANCHES ON events;                                        -- branches and tags, main first
+ALTER TABLE events FAST FORWARD main TO audit;
+ALTER TABLE events DROP TAG IF EXISTS q3_close;
+ALTER TABLE events DROP BRANCH audit;
+```
+
+- `AT` takes what time travel and clones take: `TIMESTAMP`, `SNAPSHOT`,
+  `BRANCH` and `TAG`. `CREATE ... IF NOT EXISTS` leaves an existing branch
+  or tag alone; `OR REPLACE` moves it.
+- **Branches are read-only in Igloo.** DuckDB 1.5's Iceberg writer commits
+  every `INSERT`, `UPDATE`, `DELETE` and `MERGE` to `main`, the table
+  itself. Other engines can write to a branch, as in Spark's
+  write-audit-publish; `FAST FORWARD main TO audit` then publishes what they
+  wrote, and is refused if `main` has commits the branch does not have. For
+  changes made in Igloo, use a [clone](#clones).
+- Reading a branch or tag reads the snapshot it names when the statement is
+  prepared, through the table's grants and policies. `AT (BRANCH => ...)`
+  and `AT (TAG => ...)` follow a table's name, or its alias, in `FROM` or
+  `JOIN`.
+- Branches and tags made in Igloo are kept until they are dropped. Table
+  maintenance keeps the snapshot each names, and a branch's history within
+  the snapshot retention.
+- Making, moving and dropping them needs the writer role or `CREATE` on the
+  table's schema; `SHOW BRANCHES` needs `SELECT` on the table. `main` cannot
+  be dropped.
+
+## A dbt development environment
+
+Each analytics engineer can build models against a full copy of
+production, made in seconds and costing no storage until their models
+change it, with the same masking and row access policies as production.
+
+As an admin, once: give Ana a schema of her own and read access to
+production.
+
+```sql
+CREATE SCHEMA dbt_ana;
+GRANT SELECT ON SCHEMA analytics TO ana;
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON SCHEMA dbt_ana TO ana;
+CREATE TASK refresh_dbt_ana SCHEDULE '0 6 * * 1-5' TIMEZONE 'America/New_York' AS
+  CREATE OR REPLACE SCHEMA dbt_ana CLONE analytics;
+ALTER TASK refresh_dbt_ana RESUME;
+```
+
+Every weekday morning `dbt_ana` becomes a fresh copy of `analytics`, and
+the tables she built there that production does not have are dropped. It
+keeps the grants on `analytics` as well, so whoever may read production
+may read her copy. Ana can also refresh one table herself whenever she
+wants:
+
+```sql
+CREATE OR REPLACE TABLE dbt_ana.orders CLONE analytics.orders;
+```
+
+Point dbt's development target at her schema, with an
+[access token](sso.md#access-tokens) as the password:
+
+```yaml
+# ~/.dbt/profiles.yml
+agency:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: igloo.example.com
+      port: 5432
+      user: ana
+      password: "{{ env_var('IGLOO_TOKEN') }}"
+      dbname: igloo
+      schema: dbt_ana
+      threads: 4
+```
+
+`dbt build --select orders_daily+` then rebuilds just the models she
+changed, and the ones downstream of them, in `dbt_ana`, reading every other
+model from the clone; no `--defer` to production is needed. dbt's own
+`dbt clone` command creates views with the PostgreSQL adapter; run `CREATE
+... CLONE` instead.
 
 ## Loading and exporting data
 

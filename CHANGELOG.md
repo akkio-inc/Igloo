@@ -31,6 +31,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `igloo_comments()`.
 - SQL cursors (`DECLARE`, `FETCH`, `CLOSE`) and array parameters, so
   psycopg's server-side cursors and Ibis's PostgreSQL backend work.
+- Zero-copy clones, with Snowflake's syntax: `CREATE [OR REPLACE] TABLE
+  ... CLONE source [AT (TIMESTAMP | SNAPSHOT | BRANCH | TAG => ...)]` and
+  `CREATE [OR REPLACE] SCHEMA ... CLONE source`, its tables and views. A
+  clone is a new Iceberg table whose metadata reads its source's data and
+  delete files, so it takes moments and no storage, however large the table;
+  the two then change independently. Cloning a table needs `SELECT` on it
+  and `CREATE` on the clone's schema. A clone carries its source's masking
+  and row access policies and tags, gets no grants but a schema clone's
+  schema-wide ones, and is recorded in the query history with its source.
+  Table maintenance never deletes a file a clone still reads.
+- Iceberg branches and tags: `ALTER TABLE ... CREATE [OR REPLACE] BRANCH |
+  TAG ... [AT (...)]`, `DROP BRANCH`, `DROP TAG`, `SHOW BRANCHES ON`,
+  reading them with `AT (BRANCH => ...)` and `AT (TAG => ...)`, and `ALTER
+  TABLE ... FAST FORWARD main TO branch`. Branches are read-only in Igloo,
+  as DuckDB writes only to `main`; tags keep their snapshots from expiring.
 
 ### Loading and scheduling
 
@@ -326,7 +341,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and deletes unreferenced files. Compacted files use DuckDB's own Parquet
   layout, so compaction makes scans faster, not slower. Replicas take turns
   through a lock in the metadata database, and record passes there so a
-  pass that is due runs soon after a start.
+  pass that is due runs soon after a start. A table's maintenance deletes
+  only files inside its own location, and keeps those that clones still
+  read; `DROP TABLE` never asks the catalog to purge files.
 
 ### Operations and deployment
 

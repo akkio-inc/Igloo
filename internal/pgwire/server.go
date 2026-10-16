@@ -29,6 +29,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/federation"
@@ -130,6 +131,9 @@ type Options struct {
 	// Federation keeps the connections to other databases. Nil means
 	// there are none and CREATE CONNECTION is unavailable.
 	Federation *federation.Manager
+	// Clones makes zero-copy clones and manages tables' branches and tags.
+	// Nil without a catalog.
+	Clones *clone.Manager
 
 	// Notify keeps notification integrations and sends alerts'
 	// notifications. Nil means a service in memory that reaches only
@@ -189,6 +193,7 @@ type Server struct {
 	catalog     string
 	tasks       *tasks.Scheduler
 	notify      *notify.Service
+	clones      *clone.Manager
 	// gov holds the policies (see protect.go).
 	gov      *governance
 	settings auth.SettingStore
@@ -255,6 +260,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		external:    opts.external,
 		fed:         opts.Federation,
 		notify:      opts.Notify,
+		clones:      opts.Clones,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -750,6 +756,14 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return ps, err
 	}
 
+	if ps, ok, err := s.cloneStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
+	if ps, ok, err := s.refStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
 	if ps, ok, err := s.policyCommand(ctx, sess, q); ok || err != nil {
 		return ps, err
 	}
@@ -883,7 +897,10 @@ func (s *Server) rewrite(ctx context.Context, user auth.User, text string) strin
 // user's own.
 func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
 	fail := func(err error) (*statement, error) { return nil, err }
-	query := s.rewrite(ctx, user, text)
+	query, err := s.resolveRefReads(ctx, sess, s.rewrite(ctx, user, text))
+	if err != nil {
+		return fail(err)
+	}
 
 	// Preparing runs all but the last of several statements, so this
 	// comes first.

@@ -32,6 +32,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
@@ -159,6 +160,8 @@ func serve() error {
 	var (
 		cat     *catalog.Client
 		objects *ddl.Manager
+		clones  *clone.Manager
+		guard   *clone.Guard
 	)
 	if cfg.Catalog.URI != "" {
 		if cat, err = catalog.Open(startCtx, cfg); err != nil {
@@ -169,6 +172,12 @@ func serve() error {
 		}
 		defer objects.Close() //nolint:errcheck
 		go objects.Run(ctx)
+		cloneStore, err := openCloneStore(startCtx, cfg)
+		if err != nil {
+			return err
+		}
+		defer cloneStore.Close()
+		clones, guard = clone.NewManager(cat, cloneStore, log), clone.NewGuard(cat, cloneStore, log)
 	}
 	policies, err := openPolicies(startCtx, cfg, log)
 	if err != nil {
@@ -288,6 +297,7 @@ func serve() error {
 		Sharing:             shares,
 		Federation:          fed,
 		Notify:              notifier,
+		Clones:              clones,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -344,7 +354,7 @@ func serve() error {
 	maintains := cat != nil && cfg.Maintenance.Enabled
 	var schedule maintenance.Schedule
 	if maintains {
-		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, reg, work, notifier.MaintenanceFailed, log)
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, reg, work, notifier.MaintenanceFailed, log)
 		if err != nil {
 			return err
 		}
@@ -605,17 +615,34 @@ func warehouseRoot(cfg config.Config) string {
 	return cfg.Storage.Root()
 }
 
+// openCloneStore opens where the record of which tables share files with
+// clones is kept: the metadata database, shared by every replica, or else
+// this replica's memory, which maintenance rebuilds from the clones' own
+// metadata.
+func openCloneStore(ctx context.Context, cfg config.Config) (clone.Store, error) {
+	if cfg.MetadataDatabaseURL == "" {
+		return clone.NewMemoryStore(), nil
+	}
+	store, err := clone.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("clones: %w", err)
+	}
+	return store, nil
+}
+
 // startMaintenance compacts and expires tables in the background until ctx is
 // canceled. Replicas sharing a metadata database take turns, through lock,
-// which also records when passes ran; it is nil without one.
-func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, reg prometheus.Registerer, work *activity.Tracker,
-	failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+// which also records when passes ran; it is nil without one. guard keeps
+// the files clones share.
+func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, reg prometheus.Registerer,
+	work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	opts := maintenance.Options{
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
 		Metrics:   maintenance.NewMetrics(reg),
 		Activity:  work,
 		Failed:    failed,
+		Clones:    guard,
 	}
 	if cfg.MetadataDatabaseURL != "" {
 		if lock, err = maintenance.NewPostgresLock(ctx, cfg.MetadataDatabaseURL); err != nil {

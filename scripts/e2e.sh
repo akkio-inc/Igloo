@@ -854,6 +854,90 @@ expect "maintenance keeps every row" "5|v1v2v4v5v6" igloo "$admin_password" \
 expect "writes after compaction" "6" igloo "$admin_password" \
   "INSERT INTO fragmented VALUES (7, 'v7', 7.25); SELECT count(*) FROM fragmented"
 
+echo "clones, branches and tags"
+psql_admin -c "CREATE SCHEMA dev" >/dev/null
+# The tables that have data files: a clone adds none, as it has no files
+# of its own until it is written to.
+tables_with_data="SELECT count(DISTINCT regexp_extract(file, '^(.*)/data/', 1)) FROM glob('s3://$bucket/warehouse/**/*.parquet')"
+data_tables="$(psql_admin -c "$tables_with_data")"
+expect "clone a table" "CREATE TABLE" walt walt-password-1 "CREATE TABLE dev.lineitem CLONE lineitem"
+expect "the clone has every row" "600572" walt walt-password-1 "SELECT count(*) FROM dev.lineitem"
+expect "it reads the source's files" "t" igloo "$admin_password" \
+  "SELECT (SELECT list(file_path ORDER BY file_path) FROM iceberg_metadata(lake.dev.lineitem))
+        = (SELECT list(file_path ORDER BY file_path) FROM iceberg_metadata(lake.public.lineitem))"
+expect "cloning wrote no data files" "$data_tables" igloo "$admin_password" "$tables_with_data"
+expect_soon "cloning takes moments" "t" igloo "$admin_password" \
+  "SELECT max(duration_ms) < 5000 FROM igloo.query_history WHERE query_text = 'CREATE TABLE dev.lineitem CLONE lineitem' AND outcome = 'ok'"
+expect_soon "the history names the clone's source and target" '["lake.public.lineitem"]|["lake.dev.lineitem"]' igloo "$admin_password" \
+  "SELECT tables_read, tables_written FROM igloo.query_history WHERE query_text = 'CREATE TABLE dev.lineitem CLONE lineitem'"
+expect_error "readers cannot clone" 42501 rita rita-password-1 "CREATE TABLE dev.mine CLONE lineitem"
+expect_error "a clone's name must be free" 42P07 walt walt-password-1 "CREATE TABLE dev.lineitem CLONE orders"
+
+# A clone of a table maintenance compacts and expires, and the other way
+# round: neither loses a row, and dropping the source, which never purges,
+# leaves the clone whole.
+psql_admin -c "CREATE TABLE clone_src (id INTEGER, v VARCHAR)" >/dev/null
+for i in 1 2 3 4 5 6; do psql_admin -c "INSERT INTO clone_src VALUES ($i, 'v$i')" >/dev/null; done
+psql_admin -c "CREATE TABLE dev.clone_dst CLONE clone_src" >/dev/null
+psql_admin -c "INSERT INTO dev.clone_dst VALUES (7, 'v7')" >/dev/null
+psql_admin -c "DELETE FROM clone_src WHERE id = 2" >/dev/null
+expect "source and clone diverge" "1,3,4,5,6|1,2,3,4,5,6,7" walt walt-password-1 \
+  "SELECT (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM clone_src), (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM dev.clone_dst)"
+psql_admin -c "SELECT * FROM set_iceberg_table_properties(lake.public.clone_src, {'history.expire.max-snapshot-age-ms': '0'})" >/dev/null
+compacted="SELECT (SELECT count(*) FROM iceberg_metadata(lake.public.clone_src) WHERE status <> 'DELETED' AND manifest_content = 'DATA') <= 2
+  AND (SELECT count(*) FROM iceberg_snapshots(lake.public.clone_src)) = 1"
+expect_soon "the source is compacted and expired" "t" igloo "$admin_password" "$compacted"
+expect "the clone still reads every row" "1,2,3,4,5,6,7" walt walt-password-1 "SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM dev.clone_dst"
+psql_admin -c "SELECT * FROM set_iceberg_table_properties(lake.dev.clone_dst, {'history.expire.max-snapshot-age-ms': '0'})" >/dev/null
+for i in 8 9 10 11; do psql_admin -c "INSERT INTO dev.clone_dst VALUES ($i, 'v$i')" >/dev/null; done
+expect_soon "the clone is compacted and expired" "t" igloo "$admin_password" \
+  "SELECT (SELECT count(*) FROM iceberg_snapshots(lake.dev.clone_dst)) = 1 AND (SELECT count(*) FROM dev.clone_dst) = 11"
+expect "the source still reads every row" "1,3,4,5,6" walt walt-password-1 "SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM clone_src"
+expect "drop the source" "DROP TABLE" walt walt-password-1 "DROP TABLE clone_src"
+expect "the clone outlives it" "11" walt walt-password-1 "SELECT count(*) FROM dev.clone_dst"
+
+# A clone carries its source's policies and tags: nora, who may read the
+# contacts and create tables in team, sees no more of her clone than of the
+# source.
+expect "a user with SELECT and CREATE grants clones a protected table" "CREATE TABLE" nora nora-password-1 \
+  "CREATE TABLE team.contacts_dev CLONE crm.contacts"
+expect "and sees only her rows, masked" "1|acme|***@acme.com|$device" nora nora-password-1 "SELECT * FROM team.contacts_dev"
+expect "the clone has the source's policies and tags" "client_rows|ROW ACCESS POLICY||
+mask_email|MASKING POLICY|email|
+pii_hash|MASKING POLICY|device_id|pii" nora nora-password-1 \
+  "SELECT policy_name, policy_kind, ref_column_name, tag_name FROM igloo.policy_references
+   WHERE ref_schema_name = 'team' AND ref_entity_name = 'contacts_dev' ORDER BY policy_name"
+expect "admins too" "2|***@acme.com" igloo "$admin_password" "SELECT count(*), min(email) FROM team.contacts_dev"
+expect "cloning it again under the name is quick" "CREATE TABLE" nora nora-password-1 \
+  "CREATE OR REPLACE TABLE team.contacts_dev CLONE crm.contacts AT (TIMESTAMP => now())"
+expect "and keeps the policies" "1|***@acme.com" nora nora-password-1 "SELECT count(*), min(email) FROM team.contacts_dev"
+expect_error "a user cannot clone what she cannot read" 42501 nora nora-password-1 "CREATE TABLE team.contended CLONE contended"
+expect_error "nor where she cannot create tables" 42501 nora nora-password-1 "CREATE TABLE public.contacts_dev CLONE crm.contacts"
+
+psql_admin -c "CREATE TABLE tagged AS SELECT range AS n FROM range(3)" >/dev/null
+expect "tag a snapshot" "ALTER TABLE" walt walt-password-1 "ALTER TABLE tagged CREATE TAG v1"
+psql_admin -c "INSERT INTO tagged VALUES (3)" >/dev/null
+expect "branch at the tag" "ALTER TABLE" walt walt-password-1 "ALTER TABLE tagged CREATE BRANCH audit AT (TAG => 'v1')"
+expect "read a tag and a branch" "3|3|4" rita rita-password-1 \
+  "SELECT (SELECT count(*) FROM tagged AT (TAG => 'v1')), (SELECT count(*) FROM tagged t AT (BRANCH => 'audit')), (SELECT count(*) FROM tagged)"
+got="$(psql_as rita rita-password-1 -c "SHOW BRANCHES ON tagged" | cut -d'|' -f1,2 | tr '\n' ' ')" || true
+if [ "$got" = "main|branch audit|branch v1|tag " ]; then pass "SHOW BRANCHES"; else fail "SHOW BRANCHES: $got"; fi
+expect_error "readers cannot tag" 42501 rita rita-password-1 "ALTER TABLE tagged CREATE TAG v2"
+expect "clone at a tag" "CREATE TABLE" walt walt-password-1 "CREATE TABLE dev.tagged_v1 CLONE tagged AT (TAG => 'v1')"
+expect "which has the tag's rows" "3" walt walt-password-1 "SELECT count(*) FROM dev.tagged_v1"
+expect_error "a branch moves only ahead" 55000 walt walt-password-1 "ALTER TABLE tagged FAST FORWARD main TO audit"
+expect "fast-forward a branch" "ALTER TABLE" walt walt-password-1 "ALTER TABLE tagged FAST FORWARD audit TO main"
+expect "to the head of the other" "4" walt walt-password-1 "SELECT count(*) FROM tagged AT (BRANCH => 'audit')"
+expect "drop a tag" "ALTER TABLE" walt walt-password-1 "ALTER TABLE tagged DROP TAG v1"
+expect_error "a dropped tag is gone" 42704 rita rita-password-1 "SELECT count(*) FROM tagged AT (TAG => 'v1')"
+
+psql_admin -c "CREATE SCHEMA mart" -c "CREATE TABLE mart.daily AS SELECT range AS n FROM range(3)" \
+  -c "CREATE VIEW mart.daily_big AS SELECT n FROM lake.mart.daily WHERE n > 1" -c "GRANT SELECT ON SCHEMA mart TO analysts" >/dev/null
+expect "clone a schema" "CREATE SCHEMA" walt walt-password-1 "CREATE SCHEMA mart_dev CLONE mart"
+expect "with its tables, views and schema grants" "3|1" nora nora-password-1 \
+  "SELECT (SELECT count(*) FROM mart_dev.daily), (SELECT count(*) FROM lake.mart_dev.daily_big)"
+expect_error "readers cannot clone schemas" 42501 rita rita-password-1 "CREATE SCHEMA mine CLONE mart"
+
 echo "loading, tasks, pipes and materialized views"
 # Drops arrive as files in the landing area; the admin writes them there.
 psql_admin -c "COPY (SELECT range AS id, 'item ' || range AS name, range * 1.5 AS amount FROM range(1, 4))

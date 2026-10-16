@@ -88,6 +88,16 @@ the official TPC-H answers.
 - **Iceberg tables** with `CREATE [OR REPLACE] TABLE`, `CREATE TABLE AS`,
   `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, schemas, views, comments,
   and time travel (`SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-01 00:00')`).
+- **[Zero-copy clones](docs/sql.md#clones)** of tables and schemas, as in
+  Snowflake: a full copy of production to develop and test against, made in
+  seconds without copying data, with the source's policies; and Iceberg
+  [branches and tags](docs/sql.md#branches-and-tags) of tables.
+
+  ```sql
+  CREATE OR REPLACE SCHEMA dbt_ana CLONE analytics;
+  CREATE TABLE dev.orders CLONE prod.orders AT (TIMESTAMP => now() - INTERVAL 1 DAY);
+  ALTER TABLE prod.orders CREATE TAG q3_close;
+  ```
 - **Users, roles and grants**: SCRAM-SHA-256 passwords, built-in roles for
   the whole warehouse, and custom roles with grants on schemas and tables,
   all managed in SQL.
@@ -321,6 +331,9 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   modules.** The AWS, Google Cloud and Azure modules run Igloo on their
   general node pool, so scaling its pods to zero does not release nodes
   ([details](docs/scale-to-zero.md#on-kubernetes)).
+- **Branches are read-only.** Writes go to a table's `main` branch. Other
+  engines can write to branches, which Igloo reads and fast-forwards `main`
+  to; for changes made in Igloo, clone the table.
 - **Keys are not enforced.** `PRIMARY KEY` and `UNIQUE` on Iceberg tables are
   accepted but not checked, so duplicates are possible. `NOT NULL` is
   enforced.
@@ -342,6 +355,7 @@ internal/console/   web console
 internal/scim/      SCIM 2.0 provisioning of users and groups
 internal/sso/       single sign-on with OpenID Connect
 internal/catalog/   catalog and warehouse setup
+internal/clone/     zero-copy clones, the files they share, branches and tags
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox
 internal/federation/ connections to other databases and their proxy

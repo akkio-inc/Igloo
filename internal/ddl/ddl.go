@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,6 +122,21 @@ func (m *Manager) Catalog() string { return m.eng.Catalog() }
 // IsView reports whether schema.name is a view in the catalog.
 func (m *Manager) IsView(schema, name string) bool {
 	return (*m.known.Load())[keyOf(schema, name)]
+}
+
+// Views returns the catalog's views in schema, as of the last sync, by
+// name.
+func (m *Manager) Views(schema string) []catalog.View {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []catalog.View
+	for _, v := range m.views {
+		if strings.EqualFold(v.Schema, schema) {
+			out = append(out, v)
+		}
+	}
+	slices.SortFunc(out, func(a, b catalog.View) int { return strings.Compare(a.Name, b.Name) })
+	return out
 }
 
 // Generation changes whenever a local copy of a view may have changed, so

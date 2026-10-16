@@ -136,7 +136,7 @@ func TestLockdown(t *testing.T) {
 
 func TestAttachStatementQuotesNames(t *testing.T) {
 	got := attachStatement(config.Catalog{URI: "http://catalog:8181/catalog", Warehouse: "wh", Name: `my"lake`})
-	want := `ATTACH 'wh' AS "my""lake" (TYPE iceberg, ENDPOINT 'http://catalog:8181/catalog', AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none')`
+	want := `ATTACH 'wh' AS "my""lake" (TYPE iceberg, ENDPOINT 'http://catalog:8181/catalog', AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', PURGE_REQUESTED false)`
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}

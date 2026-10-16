@@ -124,7 +124,12 @@ reference for every setting mentioned here.
   While any table has policies, users other than admins may not read the
   warehouse's files directly (file functions, `COPY INTO`, pipes) nor call
   table functions that read tables by name. Tasks, pipes and materialized
-  views run through their owners' policies. Policies are not a boundary for admins, who manage them and can
+  views run through their owners' policies. A [clone](docs/sql.md#clones)
+  of a table gets the table's policies and tags before it exists, waiting
+  for other replicas to learn of them the first time a name gets policies,
+  so no statement reads it unprotected; cloning needs `SELECT` on the table
+  and `CREATE` on the clone's schema, and a clone holds every row of its
+  source behind those policies. Policies are not a boundary for admins, who manage them and can
   read the warehouse's files, nor for other engines reading the Iceberg
   tables directly. Policy changes reach other replicas within 30 seconds.
 - **Connections to other databases.** Only admins create, change and drop

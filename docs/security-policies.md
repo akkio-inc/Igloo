@@ -210,7 +210,16 @@ policy and tags.
 - **Changes** apply at once on the replica that made them and within 30
   seconds on the others, to statements prepared before them too.
 - **Time travel** (`AT (VERSION => ...)`) reads old snapshots through
-  today's policies.
+  today's policies, as does reading a branch or tag.
+- **Clones** ([details](sql.md#clones)) get their source's masking and row
+  access policies and tags, attached to the clone's name before the clone
+  exists. Unlike `CREATE TABLE AS`, a clone holds the source's raw rows and
+  shows each reader what the source would, so a user with `SELECT` on a
+  protected table and `CREATE` on a schema of their own sees no more of
+  their clone than of the table. The first clone of a protected table under
+  a new name waits 30 seconds, so that every replica protects it. If the
+  name already has a different policy or tag value of its own, from an
+  earlier table, the clone is refused until an admin changes one.
 
 ## What is refused
 
