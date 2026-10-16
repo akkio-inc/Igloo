@@ -929,6 +929,8 @@ crm_sql -c "CREATE SCHEMA sales;
 docker exec "$project-ops" mysql -h127.0.0.1 -uops -p"$ops_password" ops -e "
   CREATE TABLE campaigns (id INT PRIMARY KEY, customer_id INT, budget INT);
   INSERT INTO campaigns VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300);" 2>/dev/null
+expect_error "a connection may not be named like a schema of the catalog" 22023 igloo "$admin_password" \
+  "CREATE CONNECTION crm TYPE postgres WITH (host '$project-crm', database 'crm', user 'crm', password '$crm_password')"
 expect "admins register a PostgreSQL connection" "CREATE CONNECTION" igloo "$admin_password" \
   "CREATE CONNECTION crmdb TYPE postgres WITH (host '$project-crm', database 'crm', user 'crm', password '$crm_password')"
 expect "and a MySQL one" "CREATE CONNECTION" igloo "$admin_password" \
@@ -997,8 +999,20 @@ expect "the system catalogs list connections' tables" "2" nora nora-password-1 \
 expect "a grant on a table of a connection" "GRANT" igloo "$admin_password" "GRANT SELECT ON TABLE crmdb.sales.customers TO analysts"
 expect "lets a user with no role join it with Iceberg tables" "3" nora nora-password-1 \
   "SELECT count(*) FROM e2e i JOIN crmdb.sales.customers c ON c.id = i.id"
+expect "a masking policy on a connection's table" "ALTER TABLE" igloo "$admin_password" \
+  "ALTER TABLE crmdb.sales.customers ALTER COLUMN email SET MASKING POLICY mask_email"
+expect "masks it in joins with Iceberg tables" "3|***@example.com" nora nora-password-1 \
+  "SELECT count(*), min(c.email) FROM e2e i JOIN crmdb.sales.customers c ON c.id = i.id"
+expect "for admins too" "***@example.com" igloo "$admin_password" "SELECT min(email) FROM crmdb.sales.customers"
+expect "and is listed with its connection" "crmdb|sales|email" igloo "$admin_password" \
+  "SELECT ref_database_name, ref_schema_name, ref_column_name FROM igloo.policy_references WHERE ref_entity_name = 'customers'"
+expect "unset it" "ALTER TABLE" igloo "$admin_password" \
+  "ALTER TABLE crmdb.sales.customers ALTER COLUMN email UNSET MASKING POLICY"
 expect_error "but no other table of the connection" 42501 nora nora-password-1 "SELECT * FROM crmdb.sales.pii"
 expect_error "nor the other connection" 42501 nora nora-password-1 "SELECT * FROM ops.ops.campaigns"
+expect_error "a writer may not make a view of a connection's table it may not read" 42501 walt walt-password-1 \
+  "CREATE VIEW e2e_pii AS SELECT p.* FROM lake.public.e2e e JOIN crmdb.sales.pii p USING (id)"
+expect "but may once granted" "GRANT" igloo "$admin_password" "GRANT SELECT ON TABLE crmdb.sales.pii TO walt"
 expect "a writer makes an Iceberg view of a connection's table" "CREATE VIEW" walt walt-password-1 \
   "CREATE VIEW e2e_pii AS SELECT p.* FROM lake.public.e2e e JOIN crmdb.sales.pii p USING (id)"
 expect_error "which reads with the reader's grants" 42501 nora nora-password-1 "SELECT * FROM e2e_pii"
