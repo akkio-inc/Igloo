@@ -1,7 +1,20 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
+    <img alt="igloo: open source SQL warehouse on Apache Iceberg. 5x faster, 25x cheaper per query." src="docs/assets/banner-light.png" width="100%">
+  </picture>
+</p>
+
 # Igloo
 
 Igloo is an open-source SQL data warehouse that runs in your own cloud
 account or on your own hardware.
+
+On TPC-H at scale factor 10 with tables in Amazon S3, Igloo on one 16-core
+machine ran the 22 queries at least 5 times faster than a Snowflake X-Small
+or Databricks SQL Serverless 2X-Small warehouse, for less than a twenty-fifth
+of the cost per query at list prices. See the [benchmark](bench/README.md)
+for the method, every result and its caveats.
 
 - **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
   so `psql`, JDBC, psycopg, pgx and BI tools work without an Igloo driver.
