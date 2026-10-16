@@ -148,6 +148,10 @@ func TestGrantable(t *testing.T) {
 		{duckdb.STATEMENT_TYPE_SET, "SET threads = 1", false},
 		{duckdb.STATEMENT_TYPE_ATTACH, "ATTACH 'x'", false},
 		{duckdb.STATEMENT_TYPE_EXPLAIN, "EXPLAIN ANALYZE SELECT 1", false},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM query('SELECT 1')", false},
+		{duckdb.STATEMENT_TYPE_CREATE, "CREATE VIEW v AS FROM query('SELECT 1')", false},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM query_table('t')", false},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM cache_httpfs_cache_status_query()", false},
 	}
 	for _, c := range cases {
 		if got := grantable(c.t, c.query); got != c.want {

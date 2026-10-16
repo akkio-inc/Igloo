@@ -210,6 +210,12 @@ expect "replace a view and read it from another view" "CREATE VIEW" walt walt-pa
   "CREATE OR REPLACE VIEW e2e_big (big_id) AS SELECT id FROM lake.public.e2e WHERE amount > 0"
 expect "views read views" "3" rita rita-password-1 \
   "SELECT count(*) FROM (SELECT big_id FROM lake.public.e2e_big)"
+expect "replace a view with another table's columns" "CREATE VIEW" walt walt-password-1 \
+  "CREATE OR REPLACE VIEW e2e_big AS SELECT n, letter FROM lake.public.e2e_copy"
+expect "the replaced view reads the other table" "3|c" rita rita-password-1 "SELECT count(*), max(letter) FROM e2e_big"
+expect "and back to columns and SQL it had before" "CREATE VIEW" walt walt-password-1 \
+  "CREATE OR REPLACE VIEW e2e_big (big_id) AS SELECT id FROM lake.public.e2e WHERE amount > 0"
+expect "the view reads the first table again" "3" rita rita-password-1 "SELECT count(*) FROM (SELECT big_id FROM e2e_big)"
 expect_error "ALTER VIEW is refused" 0A000 walt walt-password-1 "ALTER VIEW e2e_big RENAME TO e2e_huge"
 expect_error "writers cannot change the local view copies" 42501 walt walt-password-1 "DROP VIEW memory.public.e2e_big"
 expect "comment on a table" "COMMENT" walt walt-password-1 "COMMENT ON TABLE e2e IS 'Test rows | :tag:e2e'"
@@ -254,8 +260,48 @@ expect "and replaces them" "CREATE TABLE" nora nora-password-1 "CREATE OR REPLAC
 expect "INSERT through a schema grant" "INSERT 0 1" nora nora-password-1 "INSERT INTO team.mine VALUES (4)"
 expect_error "but not in other schemas" 42501 nora nora-password-1 "CREATE TABLE public.mine (i INTEGER)"
 expect_error "nor from tables not granted" 42501 nora nora-password-1 "CREATE TABLE team.copy AS SELECT * FROM contended"
+expect "describing a granted table" "id|name|amount" nora nora-password-1 \
+  "SELECT string_agg(name, '|' ORDER BY cid) FROM pragma_table_info('e2e')"
+got="$(psql_as nora nora-password-1 -c "CALL pragma_table_info('e2e')")" || true
+if [ "$(wc -l <<<"$got" | tr -d ' ')" = 3 ] && grep -q '^0|id|INTEGER|' <<<"$got"; then
+  pass "CALL pragma_table_info as a user with no role"
+else
+  fail "CALL pragma_table_info as a user with no role: got [$got]"
+fi
+expect_error "CALL of other table functions" 42501 nora nora-password-1 "CALL range(3)"
+expect_error "a PIVOT that reads its columns from the data" 42501 nora nora-password-1 \
+  "PIVOT (SELECT name, amount FROM e2e) ON name USING sum(amount)"
+expect "a PIVOT that lists its columns" "10.50|20.25" nora nora-password-1 \
+  "SELECT alpha, beta FROM (PIVOT (SELECT name, amount FROM e2e) ON name IN ('alpha', 'beta') USING sum(amount))"
 got="$(psql_as nora nora-password-1 -c 'SHOW GRANTS ON TABLE e2e')"
 if grep -q "^analysts|role|SELECT|table|public.e2e|igloo|" <<<"$got"; then pass "SHOW GRANTS"; else fail "SHOW GRANTS: $got"; fi
+
+echo "SQL from strings, PIVOT and the read cache"
+expect_error "query() is refused" 42501 rita rita-password-1 "SELECT * FROM query('SELECT * FROM duckdb_secrets()')"
+expect_error "even for admins" 42501 igloo "$admin_password" "SELECT * FROM query('SELECT 1')"
+expect_error "so is serialized SQL" 42501 rita rita-password-1 \
+  "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT * FROM duckdb_secrets()'))"
+expect_error "query_table is admin-only" 42501 rita rita-password-1 "SELECT * FROM query_table('e2e')"
+expect "readers PIVOT on values from the data" "10.50|20.25|1.00" rita rita-password-1 \
+  "SELECT alpha, beta, gamma FROM (PIVOT (SELECT name, amount FROM e2e) ON name USING sum(amount))"
+expect_error "but not in CREATE TABLE AS, which DuckDB would run while preparing" 42501 walt walt-password-1 \
+  "CREATE TABLE e2e_pivot AS PIVOT (SELECT name, amount FROM e2e) ON name USING sum(amount)"
+expect_error "a PIVOT refused there created nothing" 42P01 walt walt-password-1 "SELECT * FROM e2e_pivot"
+expect "writers create tables from a PIVOT that lists its columns" "CREATE TABLE" walt walt-password-1 \
+  "CREATE TABLE e2e_pivot AS PIVOT (SELECT name, amount FROM e2e) ON name IN ('alpha', 'beta') USING sum(amount)"
+expect_error "a PIVOT over admin-only functions" 42501 rita rita-password-1 \
+  "PIVOT (SELECT * FROM duckdb_secrets()) ON name USING count(*)"
+expect_error "readers cannot clear the read cache" 42501 rita rita-password-1 "SELECT cache_httpfs_clear_cache()"
+expect_error "nor list it" 42501 rita rita-password-1 "SELECT * FROM cache_httpfs_cache_status_query()"
+expect_error "no one moves the read cache" 42501 igloo "$admin_password" \
+  "SET GLOBAL cache_httpfs_cache_directory = '/tmp/elsewhere'"
+expect_error "or splits it across directories" 42501 igloo "$admin_password" \
+  "SET GLOBAL cache_httpfs_cache_directories_config = '/tmp/a;/tmp/b'"
+expect_error "or wraps other filesystems" 42501 igloo "$admin_password" \
+  "SELECT cache_httpfs_wrap_cache_filesystem('LocalFileSystem')"
+expect_error "or caches more than the warehouse" 42501 igloo "$admin_password" "SELECT cache_httpfs_reset_exclusion_regex()"
+expect "the read cache still caches only the warehouse" "1" igloo "$admin_password" \
+  "SELECT count(*) FROM cache_httpfs_list_exclusion_regex()"
 
 echo "query history"
 expect_soon "users see their own statements" "t" nora nora-password-1 \

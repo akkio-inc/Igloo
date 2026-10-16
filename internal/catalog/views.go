@@ -117,28 +117,43 @@ func (c *Client) PutView(ctx context.Context, v View, replace bool) error {
 		return ErrViewExists
 	}
 
-	meta := existing.Metadata()
-	schemaID := 0
-	for id := range meta.SchemasByID() {
-		schemaID = max(schemaID, id+1)
-	}
-	var versionID int64 = 1
-	for _, ver := range meta.Versions() {
-		versionID = max(versionID, ver.VersionID+1)
-	}
-	version, err := view.NewVersion(versionID, schemaID, []view.Representation{view.NewRepresentation(v.SQL, Dialect)},
-		[]string{v.Schema}, view.WithVersionSummary(view.VersionSummary{"engine-name": "igloo"}))
+	requirements, updates, err := replaceView(existing.Metadata(), v)
 	if err != nil {
 		return err
 	}
-	_, err = c.UpdateView(ctx, ident,
-		[]view.Requirement{view.AssertViewUUID(meta.ViewUUID())},
-		[]view.Update{
-			view.NewAddSchemaUpdate(icebergSchema(schemaID, v.Columns)),
-			view.NewAddViewVersionUpdate(version),
-			view.NewSetCurrentVersionUpdate(versionID),
-		})
+	_, err = c.UpdateView(ctx, ident, requirements, updates)
 	return err
+}
+
+// replaceView returns the changes that make v the current version of the
+// view whose metadata is meta.
+//
+// A view can go back to columns it had before, and the catalog then reuses
+// the earlier schema rather than adding one, so the changes come from the
+// view metadata builder, which names a reused schema by its ID and a new
+// one as the last added, as the catalog expects. A version equal to an
+// earlier one would be reused the same way, but Lakekeeper then fails to
+// record the change in the view's version log (a duplicate key), so every
+// replacement adds a version: its summary names the version it replaces,
+// which no earlier version can, as the current version is always the
+// latest.
+func replaceView(meta view.Metadata, v View) ([]view.Requirement, []view.Update, error) {
+	summary := view.VersionSummary{"engine-name": "igloo", "igloo.replaces-version": strconv.FormatInt(meta.CurrentVersionID(), 10)}
+	// The builder assigns the version and schema IDs.
+	version, err := view.NewVersion(1, view.LastAddedID, []view.Representation{view.NewRepresentation(v.SQL, Dialect)},
+		[]string{v.Schema}, view.WithVersionSummary(summary))
+	if err != nil {
+		return nil, nil, err
+	}
+	b, err := view.MetadataBuilderFromBase(meta)
+	if err != nil {
+		return nil, nil, err
+	}
+	res, err := b.SetCurrentVersion(version, icebergSchema(0, v.Columns)).Build()
+	if err != nil {
+		return nil, nil, err
+	}
+	return []view.Requirement{view.AssertViewUUID(meta.ViewUUID())}, res.Changes, nil
 }
 
 // ErrViewExists is returned by PutView for a view that exists.

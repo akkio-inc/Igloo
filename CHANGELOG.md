@@ -24,7 +24,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   managed with `CREATE USER`, `ALTER USER`, `DROP USER` and `SHOW USERS`, and
   stored in PostgreSQL so every replica shares them.
 - A query sandbox: SQL cannot read the server's files or reach locations
-  outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`.
+  outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`, nor run SQL built
+  from strings (`query()`, `json_execute_serialized_sql()`).
 - Grants: `CREATE ROLE`, `DROP ROLE`, `GRANT role TO user`, and `GRANT` and
   `REVOKE` of `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `CREATE` on tables,
   views, schemas and `ALL TABLES IN SCHEMA`, to users or custom roles;
@@ -37,7 +38,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   their own. Kept in the metadata database for `IGLOO_AUDIT_RETENTION` (90
   days); `IGLOO_AUDIT=false` turns it off. Passwords are never recorded.
 - Views on the Iceberg catalog (`CREATE [OR REPLACE] VIEW`, `DROP VIEW`),
-  stored as Iceberg views and kept in sync across replicas.
+  stored as Iceberg views and kept in sync across replicas. Replacing a view
+  may change its columns and the tables it reads, including back to earlier
+  ones.
 - `CREATE OR REPLACE TABLE` on Iceberg tables.
 - Scale to zero: `igloo gateway` accepts client connections in Igloo's
   place, starts Igloo's EC2 instances, Kubernetes Deployment or (through
@@ -54,6 +57,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Storage. It survives restarts and machine stops, so the first queries
   after a start no longer fetch every file again. It sizes itself from the
   disk's free space; `IGLOO_CACHE_SIZE` overrides that or turns it off.
+  Only admins may use its functions and settings from SQL, and where it
+  lives and what it caches cannot be changed from SQL.
 - `COMMENT ON TABLE`, `VIEW` and `COLUMN`, stored as Iceberg metadata and
   shown through `obj_description`, `col_description`, `pg_description` and
   `igloo_comments()`.

@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -165,15 +166,20 @@ func TestNoneRoleCannotReadFilesOrBypassAnalysis(t *testing.T) {
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.public TO nina")
 	expectAllowed(t, nina, "SELECT * FROM orders")
+	// Describing tables is allowed. (With Iceberg tables these failed until
+	// statements were prepared again after the check: see reprepare.)
+	expectAllowed(t, nina, "SELECT * FROM pragma_table_info('orders')")
+	expectAllowed(t, nina, "CALL pragma_table_info('orders')")
+	expectDenied(t, nina, "CALL range(3)", "admin")
 
 	// Functions that take a table's name or a query read what their call
 	// does not name. (The Iceberg functions are in the e2e test: this
 	// engine does not load the extension. Files are in
 	// TestNoneRoleCannotReadAllowedFiles.)
 	for sql, reason := range map[string]string{
-		"SELECT * FROM query_table('lake.sales.leads')":             "query_table",
-		"SELECT * FROM query('SELECT * FROM lake.sales.leads')":     "query reads data",
-		"SELECT * FROM orders, query_table('lake.sales.leads')":     "query_table",
+		"SELECT * FROM query_table('lake.sales.leads')":             "requires the admin role",
+		"SELECT * FROM query('SELECT * FROM lake.sales.leads')":     "query()",
+		"SELECT * FROM orders, query_table('lake.sales.leads')":     "requires the admin role",
 		"SELECT * FROM read_parquet('s3://bucket/x.parquet')":       "",
 		"SELECT * FROM duckdb_secrets()":                            "requires the admin role",
 		"PRAGMA table_info('orders')":                               "PRAGMA",
@@ -379,6 +385,92 @@ func TestPreparedStatementsAreCheckedAgain(t *testing.T) {
 	if _, err := nina.Exec(ctx, unqualified, 0); pgCode(err) != "42501" {
 		t.Errorf("a prepared statement read another table after SET search_path: %v", err)
 	}
+
+	// Checked again, a statement is prepared again; one whose columns
+	// changed meanwhile fails rather than send rows the client was not
+	// told about.
+	const star = "SELECT * FROM lake.public.orders WHERE id > $1"
+	if _, err := nina.Exec(ctx, star, 0); err != nil {
+		t.Fatalf("select *: %v", err)
+	}
+	mustExec(t, cs.admin, "UPDATE lake.public.orders SET amount = amount + 1")
+	mustExec(t, cs.admin, "CREATE OR REPLACE VIEW memory.main.unrelated AS SELECT 1 AS x")
+	if n := count(t, nina, "SELECT sum(amount) FROM lake.public.orders WHERE id > $1", 0); n != 32 {
+		t.Errorf("after the catalog changed: sum %d", n)
+	}
+	mustExec(t, cs.admin, "ALTER TABLE lake.public.orders ADD COLUMN note VARCHAR")
+	if _, err := nina.Exec(ctx, star, 0); pgCode(err) != "0A000" {
+		t.Errorf("a prepared statement whose columns changed: %v", err)
+	}
+}
+
+// TestPivot runs PIVOTs that take their columns from the data, which DuckDB
+// turns into several statements.
+func TestPivot(t *testing.T) {
+	cs := startCatalogServer(t)
+	ctx := context.Background()
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.sales (region VARCHAR, quarter VARCHAR, amount INTEGER)")
+	mustExec(t, cs.admin, "INSERT INTO lake.public.sales VALUES ('east', 'q1', 1), ('east', 'q2', 2), ('west', 'q1', 4)")
+
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeCacheStatement} {
+		rita := cs.user(t, fmt.Sprintf("rita%d", mode), auth.RoleReader, mode)
+		var q1, q2 int64
+		err := rita.QueryRow(ctx, "SELECT q1, q2 FROM (PIVOT sales ON quarter USING sum(amount)) WHERE region = 'east'").Scan(&q1, &q2)
+		if err != nil || q1 != 1 || q2 != 2 {
+			t.Errorf("%v: pivot: %d %d %v", mode, q1, q2, err)
+		}
+		// UNPIVOT leaves out west's q2, which is NULL.
+		if n := count(t, rita, "SELECT count(*) FROM (UNPIVOT (PIVOT sales ON quarter USING sum(amount)) ON q1, q2 INTO NAME quarter VALUE amount)"); n != 3 {
+			t.Errorf("%v: unpivot of a pivot: %d rows", mode, n)
+		}
+		// The query that finds the columns is checked first.
+		const types = "SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum_%'"
+		before := count(t, rita, types)
+		expectDenied(t, rita, "PIVOT (SELECT * FROM duckdb_secrets()) ON name USING count(*)", "admin")
+		expectDenied(t, rita, "PIVOT (SELECT * FROM query('SELECT 1 AS a')) ON a USING count(*)", "query()")
+		if n := count(t, rita, types); before < 1 || n != before {
+			t.Errorf("%v: %d pivot types, then %d: a refused PIVOT ran", mode, before, n)
+		}
+	}
+
+	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	expectDenied(t, rita, "PIVOT sales ON quarter USING sum(amount); DELETE FROM sales", "one statement at a time")
+	// Outside a query, DuckDB would run the statement itself while
+	// preparing it.
+	for _, sql := range []string{
+		"CREATE TABLE lake.public.by_quarter AS PIVOT sales ON quarter USING sum(amount)",
+		"INSERT INTO lake.public.orders SELECT 9, q1 FROM (PIVOT sales ON quarter USING sum(amount))",
+		"WITH p AS (PIVOT sales ON quarter USING sum(amount)) INSERT INTO lake.public.orders SELECT 9, q1 FROM p",
+		"EXPLAIN PIVOT sales ON quarter USING sum(amount)",
+	} {
+		expectDenied(t, rita, sql, "IN (")
+	}
+	mustExec(t, rita, "BEGIN")
+	if n := count(t, rita, "SELECT count(*) FROM (PIVOT sales ON quarter USING sum(amount))"); n != 2 {
+		t.Errorf("pivot in a transaction: %d rows", n)
+	}
+	mustExec(t, rita, "COMMIT")
+	walt := cs.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	expectDenied(t, walt, "CREATE TABLE lake.public.by_quarter AS PIVOT sales ON quarter USING sum(amount)", "IN (")
+	mustExec(t, walt, "BEGIN")
+	expectDenied(t, walt, "INSERT INTO lake.public.orders SELECT 9, q1 FROM (PIVOT sales ON quarter USING sum(amount))", "IN (")
+	mustExec(t, walt, "ROLLBACK")
+	expectAllowed(t, walt, "CREATE TABLE lake.public.by_quarter AS PIVOT sales ON quarter IN ('q1', 'q2') USING sum(amount)")
+	if n := count(t, cs.admin, "SELECT count(*) FROM lake.public.orders WHERE id = 9"); n != 0 {
+		t.Errorf("a refused PIVOT inserted %d rows", n)
+	}
+	if n := count(t, cs.admin, "SELECT count(*) FROM lake.public.by_quarter"); n != 2 {
+		t.Errorf("created from a pivot: %d rows", n)
+	}
+
+	// Users with the none role list the columns.
+	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.sales TO nina")
+	expectDenied(t, nina, "PIVOT sales ON quarter USING sum(amount)", "IN (")
+	if n := count(t, nina, "SELECT count(*) FROM (PIVOT sales ON quarter IN ('q1', 'q2') USING sum(amount))"); n != 2 {
+		t.Errorf("none role, static pivot: %d rows", n)
+	}
+	expectDenied(t, nina, "SELECT * FROM (PIVOT secrets ON code IN ('x') USING count(*))", "secrets")
 }
 
 func TestDroppedTablesLoseTheirGrants(t *testing.T) {

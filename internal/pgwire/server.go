@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
 // Engine runs queries; *engine.Engine implements it.
@@ -592,10 +594,18 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		}
 	}
 
+	// Preparing runs all but the last of several statements, so this
+	// comes first.
+	if err := forbidden(query); err != nil {
+		s.metrics.query(time.Now(), err)
+		return fail(err)
+	}
+
 	// Preparing a multi-statement query runs all but the last statement, so
 	// only admins, whose statements need no checks, may send one. If the
 	// count fails, the query does not parse; stop here rather than let the
 	// session connection interpret it.
+	pivot := false // a query with a PIVOT that DuckDB runs as several
 	if user.Role != auth.RoleAdmin {
 		query = sessionScoped(query)
 		n, err := s.engine.CountStatements(query)
@@ -603,10 +613,11 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 			return fail(pgerror.WithCode(err, codes.Syntax))
 		}
 		if n > 1 {
-			s.metrics.query(time.Now(), errDenied)
-			return fail(pgerror.WithCode(
-				errors.New("send one statement at a time; only admins may send several in one query"),
-				codes.InsufficientPrivilege))
+			if err := multipleStatements(user.Role, query); err != nil {
+				s.metrics.query(time.Now(), errDenied)
+				return fail(err)
+			}
+			pivot = true
 		}
 	} else if strings.Contains(strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"), ";") {
 		// Preparing may run statements that change the catalog or the
@@ -633,6 +644,12 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		sess.observe(nil, err)
 		return fail(pgError(err))
 	}
+	if pivot && st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
+		// multipleStatements let through what it takes for a query.
+		s.log.Error("a PIVOT statement that is not a query was prepared", "user", user.Name, "type", st.stmtType)
+		_ = st.close()
+		return fail(pgerror.WithCode(errors.New("permission denied: only admins may run this PIVOT"), codes.InsufficientPrivilege))
+	}
 	err = authorize(user.Role, st.stmtType, query)
 	if err != nil {
 		// The built-in role does not allow it; grants may.
@@ -650,7 +667,69 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 	if st.stmtType == duckdb.STATEMENT_TYPE_DROP || st.stmtType == duckdb.STATEMENT_TYPE_ALTER {
 		st.effect = s.ddlEffect(ctx, sess, query)
 	}
+	if st.access != nil {
+		// Checking grants ran statements on the session's connection.
+		if err := st.reprepare(ctx, sess.conn); err != nil {
+			_ = st.close()
+			return fail(pgError(err))
+		}
+	}
 	return st, nil
+}
+
+// multipleStatements decides whether a non-admin may run query, which
+// DuckDB parses as several statements, all but the last of which run while
+// it is prepared, before any check that needs the prepared statement.
+//
+// Only a query (a SELECT) with a PIVOT that takes its columns from the data
+// qualifies. DuckDB finds the columns first, with one generated statement
+// per such PIVOT: CREATE TEMP TYPE __pivot_enum_<uuid> AS ENUM (SELECT
+// DISTINCT <column> FROM <the PIVOT's source> ...), which stays in the
+// session's temp schema. That is the only way its parser turns one
+// statement into several (Transformer::CreatePivotStatement in DuckDB 1.5).
+// Those statements read what the PIVOT reads, so the query's text is
+// checked as a SELECT's before they run; the query itself is checked as
+// usual once prepared, and must be a SELECT.
+//
+// Any other statement with such a PIVOT (CREATE TABLE AS, INSERT, EXPLAIN)
+// is refused: DuckDB then also wraps the statements in BEGIN and COMMIT,
+// or in SET current_transaction_invalidation_policy inside a transaction
+// (StatementPreprocessor), so preparing would run the statement itself and
+// leave only the COMMIT to check. A statement is a query when its first
+// word says so; DuckDB's grammar decides a statement's kind by it too. Users
+// with the none role are refused: what they may read is known only from
+// the prepared statement.
+func multipleStatements(role auth.Role, query string) error {
+	err := errors.New("send one statement at a time; only admins may send several in one query")
+	words := sqllex.CodeWords(query)
+	if len(sqllex.Split(query)) == 1 && (slices.Contains(words, "PIVOT") || slices.Contains(words, "PIVOT_WIDER")) {
+		switch {
+		case role == auth.RoleNone:
+			err = errors.New("permission denied: a PIVOT that takes its columns from the data runs a query before " +
+				"Igloo can check it; list the columns instead, as in PIVOT ... ON col IN ('a', 'b')")
+		case !startsQuery(query):
+			err = errors.New("permission denied: only admins may use a PIVOT that takes its columns from the data " +
+				"outside a query; list the columns instead, as in PIVOT ... ON col IN ('a', 'b')")
+		default:
+			return authorize(role, duckdb.STATEMENT_TYPE_SELECT, query)
+		}
+	}
+	return pgerror.WithCode(err, codes.InsufficientPrivilege)
+}
+
+// startsQuery reports whether query's first word makes it a SELECT
+// statement in DuckDB's grammar. WITH does not: a CTE may come before
+// INSERT, UPDATE or DELETE.
+func startsQuery(query string) bool {
+	toks := sqlTokens(query)
+	if len(toks) == 0 {
+		return false
+	}
+	switch toks[0].keyword {
+	case "SELECT", "FROM", "PIVOT", "PIVOT_WIDER", "UNPIVOT", "PIVOT_LONGER":
+		return true
+	}
+	return toks[0].punct == '('
 }
 
 // recheckGrants decides again, before it runs, a statement that grants
@@ -681,6 +760,9 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		return err
+	}
+	if err := st.reprepare(ctx, sess.conn); err != nil {
+		return pgError(err)
 	}
 	st.access = acc
 	return nil

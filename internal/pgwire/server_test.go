@@ -685,6 +685,59 @@ func TestRoles(t *testing.T) {
 	}
 }
 
+// TestSQLFromStrings checks that no one, admins included, may run SQL that
+// a statement builds from strings, which Igloo's checks cannot see into, or
+// move the read cache.
+func TestSQLFromStrings(t *testing.T) {
+	ts := startServer(t)
+	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	mustExec(t, admin, "CREATE TABLE facts (i INTEGER)")
+	mustExec(t, admin, "CREATE USER rita PASSWORD 'rita-password' ROLE reader")
+	mustExec(t, admin, "CREATE USER walt PASSWORD 'walt-password' ROLE writer")
+	reader := connect(t, ts.url("rita", "rita-password"), pgx.QueryExecModeCacheStatement)
+	writer := connect(t, ts.url("walt", "walt-password"), pgx.QueryExecModeSimpleProtocol)
+
+	for _, c := range []struct {
+		conn    *pgx.Conn
+		sql     string
+		mention string
+	}{
+		{reader, "SELECT * FROM query('SELECT * FROM duckdb_secrets()')", "query()"},
+		{reader, `SELECT * FROM "query"('SELECT * FROM duckdb_secrets()')`, "query()"},
+		{reader, "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT * FROM duckdb_secrets()'))", "json_execute_serialized_sql"},
+		{reader, "SELECT * FROM query_table('facts')", "admin"},
+		{writer, "CREATE VIEW leak AS SELECT * FROM query('SELECT * FROM duckdb_secrets()')", "query()"},
+		{admin, "SELECT * FROM query('SELECT 1')", "query()"},
+		{admin, "SET cache_httpfs_cache_directory = '/tmp/elsewhere'", "cache_httpfs_cache_directory"},
+		{admin, "SELECT cache_httpfs_add_exclusion_regex('.*')", "cache_httpfs_add_exclusion_regex"},
+		// Readers calling the cache's other functions is in the e2e test:
+		// this engine does not load the extension.
+	} {
+		_, err := c.conn.Exec(ctx, c.sql)
+		if pgCode(err) != "42501" || !strings.Contains(err.Error(), c.mention) {
+			t.Errorf("%s: want 42501 mentioning %q, got %v", c.sql, c.mention, err)
+		}
+	}
+
+	// An admin's statements before a refused one in the same query do not
+	// run either.
+	if _, err := admin.Exec(ctx, "CREATE TABLE ran (i INTEGER); SELECT * FROM query('SELECT 1')"); pgCode(err) != "42501" {
+		t.Errorf("multi-statement query with query(): %v", err)
+	}
+	if _, err := admin.Exec(ctx, "SELECT * FROM ran"); err == nil {
+		t.Error("the statement before query() ran")
+	}
+
+	// Tables and columns may still be called query.
+	mustExec(t, writer, "CREATE TABLE query (query VARCHAR)")
+	mustExec(t, writer, "INSERT INTO query (query) VALUES ('q')")
+	var q string
+	if err := reader.QueryRow(ctx, "SELECT query FROM query").Scan(&q); err != nil || q != "q" {
+		t.Errorf("reading a table named query: %q, %v", q, err)
+	}
+}
+
 func TestRoleChangesReachOpenSessions(t *testing.T) {
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)

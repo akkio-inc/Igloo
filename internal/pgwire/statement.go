@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/duckdb/duckdb-go/v2"
 	wire "github.com/jeroenrinzema/psql-wire"
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 )
 
 // kind is how a statement's result reaches the client.
@@ -34,6 +37,8 @@ type statement struct {
 	columns  wire.Columns
 	encoders []encoder
 	params   []uint32
+	// clientOIDs are the parameter types the client declared.
+	clientOIDs []uint32
 	// access is set when grants allowed the statement (see access.go).
 	access *access
 	// effect is what the statement, once it succeeds, does to the objects
@@ -53,11 +58,33 @@ func prepare(ctx context.Context, conn *duckdb.Conn, query string, clientOIDs []
 		return nil, err
 	}
 
-	st := &statement{stmt: ds.(*duckdb.Stmt), query: query, prepared: typed}
+	st := &statement{stmt: ds.(*duckdb.Stmt), query: query, prepared: typed, clientOIDs: clientOIDs}
 	if err := st.describe(oids); err != nil {
 		return nil, errors.Join(err, st.close())
 	}
 	return st, nil
+}
+
+// reprepare prepares st's query again on conn, in place. Igloo does so after
+// checking a statement against grants, which binds the statement's table
+// functions again on the same connection: DuckDB 1.5.6 then fails a
+// statement prepared earlier that calls pragma_table_info on an Iceberg
+// table with "basic_string::_M_create" when it runs. The statement must
+// keep the columns and parameters clients were told about.
+func (st *statement) reprepare(ctx context.Context, conn *duckdb.Conn) error {
+	fresh, err := prepare(ctx, conn, st.query, st.clientOIDs)
+	if err != nil {
+		return err
+	}
+	if fresh.stmtType != st.stmtType || fresh.kind != st.kind || !slices.Equal(fresh.params, st.params) ||
+		!slices.EqualFunc(fresh.columns, st.columns, func(a, b wire.Column) bool { return a.Name == b.Name && a.Oid == b.Oid }) {
+		_ = fresh.close()
+		return pgerror.WithCode(errors.New("the statement's result changed since it was prepared; prepare it again"),
+			codes.FeatureNotSupported)
+	}
+	old := st.stmt
+	st.stmt, st.encoders = fresh.stmt, fresh.encoders
+	return old.Close()
 }
 
 func (st *statement) describe(clientOIDs []uint32) error {

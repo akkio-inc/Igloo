@@ -28,6 +28,14 @@ func TestRequiredRole(t *testing.T) {
 		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM enable_logging()", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_SELECT, "SELECT message FROM duckdb_logs", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM tpch_queries()", auth.RoleReader},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM query_table('lake.public.t')", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, `SELECT * FROM "Query_Table"(['t'])`, auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT cache_httpfs_clear_cache()", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM cache_httpfs_cache_status_query()", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, `SELECT "CACHE_HTTPFS_get_profile"()`, auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT current_setting('cache_httpfs_type')", auth.RoleReader},
+		{duckdb.STATEMENT_TYPE_SET, "SET cache_httpfs_profile_type = 'temp'", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SET, "SET SESSION cache_httpfs_type = 'noop'", auth.RoleAdmin},
 		{statementTypeMergeInto, "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", auth.RoleWriter},
 		{duckdb.STATEMENT_TYPE_TRANSACTION, "BEGIN", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_EXPLAIN, "EXPLAIN SELECT 1", auth.RoleReader},
@@ -73,6 +81,100 @@ func TestRequiredRole(t *testing.T) {
 	for _, c := range cases {
 		if got := requiredRole(c.t, c.query); got != c.want {
 			t.Errorf("%q: got %s, want %s", c.query, got, c.want)
+		}
+	}
+}
+
+// TestForbidden covers statements no one may run: SQL run from strings,
+// and moving the read cache or changing what it caches.
+func TestForbidden(t *testing.T) {
+	refused := []string{
+		"SELECT * FROM query('SELECT * FROM duckdb_secrets()')",
+		"FROM query('SELECT 1')",
+		"SELECT * FROM t, query ( 'SELECT 1' )",
+		"SELECT * FROM QUERY/* c */('SELECT 1')",
+		`SELECT * FROM "query"('SELECT 1')`,
+		`SELECT * FROM "Query"('SELECT 1')`,
+		"SELECT * FROM system.main.query('SELECT 1')",
+		`SELECT * FROM "system"."main"."query"('SELECT 1')`,
+		"SELECT * FROM t JOIN query('SELECT 1') q ON true",
+		"SELECT * FROM (SELECT 1) WHERE EXISTS (SELECT * FROM query('SELECT 1'))",
+		"MERGE INTO t USING query('SELECT 1') s ON t.a = s.a WHEN MATCHED THEN DELETE",
+		"CREATE VIEW v AS SELECT * FROM query('SELECT 1')",
+		"WITH a AS (SELECT 1), query (x) AS (SELECT 2) SELECT * FROM query",
+		"query('SELECT 1')",
+		"SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))",
+		"PRAGMA json_execute_serialized_sql('{}')",
+		`SELECT * FROM "JSON_EXECUTE_SERIALIZED_SQL"('{}')`,
+		"SET cache_httpfs_cache_directory = '/tmp/elsewhere'",
+		"SET GLOBAL cache_httpfs_cache_directory = '/tmp/elsewhere'",
+		"RESET cache_httpfs_cache_directory",
+		"SET cache_httpfs_cache_directories_config = '[]'",
+		`SET "cache_httpfs_cache_directory" = '/tmp/x'`,
+		"PRAGMA cache_httpfs_cache_directory = '/tmp/x'",
+		"SELECT cache_httpfs_wrap_cache_filesystem('LocalFileSystem')",
+		"SELECT cache_httpfs_add_exclusion_regex('.*')",
+		"SELECT cache_httpfs_reset_exclusion_regex()",
+	}
+	for _, q := range refused {
+		for _, role := range []auth.Role{auth.RoleAdmin, auth.RoleReader} {
+			if err := authorize(role, duckdb.STATEMENT_TYPE_SELECT, q); err == nil {
+				t.Errorf("%s may run %q", role, q)
+			}
+		}
+		if forbidden(q) == nil {
+			t.Errorf("not forbidden: %q", q)
+		}
+	}
+	allowed := []string{
+		"SELECT query FROM log",
+		"SELECT query, query_text FROM igloo.query_history",
+		"SELECT current_query()",
+		"INSERT INTO query (a, b) VALUES (1, 2)",
+		"INSERT INTO main.query (a) VALUES (1)",
+		"CREATE TABLE query (a INT)",
+		"CREATE TABLE IF NOT EXISTS query (a INT)",
+		"CREATE TABLE t (a INT REFERENCES query (a))",
+		"CREATE VIEW query (a) AS SELECT 1",
+		"WITH query (a) AS (SELECT 1) SELECT * FROM query",
+		"WITH RECURSIVE query (a) AS (SELECT 1) SELECT * FROM query",
+		"SELECT * FROM t AS query (a, b)",
+		"COPY query (a) FROM 'x.csv'",
+		"CREATE INDEX i ON query (a)",
+		"CREATE MACRO query(x) AS x + 1",
+		"SELECT 'query(1)' AS s",
+		`SELECT "query" FROM t`,
+		"SELECT json_serialize_sql('SELECT 1')",
+		"SELECT current_setting('cache_httpfs_cache_directory')",
+		"SET cache_httpfs_profile_type = 'temp'",
+		"SELECT cache_httpfs_clear_cache()",
+	}
+	for _, q := range allowed {
+		if err := forbidden(q); err != nil {
+			t.Errorf("%q: %v", q, err)
+		}
+	}
+}
+
+func TestStartsQuery(t *testing.T) {
+	for q, want := range map[string]bool{
+		"SELECT * FROM (PIVOT t ON c USING sum(n))":        true,
+		"  /* c */ -- d\n pivot t ON c":                    true,
+		"FROM (PIVOT t ON c)":                              true,
+		"(PIVOT t ON c) UNION ALL (PIVOT t ON c)":          true,
+		"UNPIVOT (PIVOT t ON c) ON COLUMNS(*) INTO NAME k": true,
+		"PIVOT_WIDER t ON c":                               true,
+		"WITH p AS (PIVOT t ON c) SELECT * FROM p":         false,
+		"WITH p AS (PIVOT t ON c) INSERT INTO x FROM p":    false,
+		"CREATE TABLE x AS PIVOT t ON c":                   false,
+		"INSERT INTO x PIVOT t ON c":                       false,
+		"EXPLAIN PIVOT t ON c":                             false,
+		"DESCRIBE PIVOT t ON c":                            false,
+		`"select" FROM t`:                                  false,
+		"":                                                 false,
+	} {
+		if got := startsQuery(q); got != want {
+			t.Errorf("startsQuery(%q) = %v, want %v", q, got, want)
 		}
 	}
 }

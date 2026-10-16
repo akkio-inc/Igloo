@@ -193,6 +193,14 @@ memory, in front of the disk cache.
   you delete the contents of the cache directory (with Docker Compose:
   `docker compose rm -sf igloo && docker volume rm igloo_igloo-cache &&
   make up`).
+- **From SQL**, only admins may call the cache's functions and change its
+  settings (`cache_httpfs_*`). Where the cache lives, whether it wraps other
+  filesystems and that it caches only the warehouse are set at startup and
+  cannot be changed from SQL, even by admins
+  (`cache_httpfs_cache_directory`, `cache_httpfs_cache_directories_config`,
+  `cache_httpfs_wrap_cache_filesystem`, `cache_httpfs_add_exclusion_regex`
+  and `cache_httpfs_reset_exclusion_regex` are refused): the extension
+  creates and deletes files in its directory, outside DuckDB's sandbox.
 
 The cache is DuckDB's [`cache_httpfs`](https://github.com/dentiny/duck-read-cache-fs)
 community extension, baked into the image like the other extensions; DuckDB

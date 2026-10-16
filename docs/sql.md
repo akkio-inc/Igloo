@@ -282,12 +282,28 @@ name is ignored.
   `GRANT` and `REVOKE` cover tables and schemas of the Iceberg catalog (see
   [roles and grants](#roles-and-grants)); there are no column privileges,
   `GRANT OPTION`, `USAGE` or roles granted to roles.
-- Only admins may send several statements in one query string.
+- Only admins may send several statements in one query string. A `PIVOT`
+  that takes its columns from the data (no `IN (...)` after `ON`) is one
+  statement to the client, but DuckDB runs it as two: first a query that
+  finds the columns, kept as a temporary enum type in the session. Readers
+  and writers may run such a `PIVOT` in a query (a statement that starts
+  with `SELECT`, `FROM`, `PIVOT`, `UNPIVOT` or a parenthesis), and the query
+  that finds the columns is checked like the `PIVOT` before it runs. In
+  other statements (`CREATE TABLE AS`, `INSERT`, `EXPLAIN`, or after
+  `WITH`), DuckDB would run the whole statement while preparing it, before
+  Igloo can check it, so only admins may; others, and users with role
+  `none` everywhere, list the columns, as in
+  `PIVOT sales ON quarter IN ('q1', 'q2') USING sum(amount)`.
+- `query()` and `json_execute_serialized_sql()`, which run SQL given as a
+  string, are refused for everyone, admins included: Igloo checks a
+  statement's text, and cannot check SQL that a statement builds. Write the
+  query itself instead. `query_table()` is limited to admins.
 - Session settings that PostgreSQL drivers send on connect
   (`application_name`, `extra_float_digits`, `DateStyle` and similar) are
   accepted and ignored. `statement_timeout` is honored.
 - `SET` of DuckDB settings that affect every session (memory, threads,
-  secrets) is limited to admins.
+  secrets) is limited to admins, as are the read cache's functions and
+  settings (`cache_httpfs_*`, see [operations](operations.md#read-cache)).
 - `pg_catalog` views are compatible enough for the clients above but are not
   a complete copy of PostgreSQL's. Storage-level details (sizes, indexes,
   tablespaces) are empty. Temporary objects are in the schema `pg_temp`.

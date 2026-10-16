@@ -189,6 +189,12 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		return nil, true, err
 	}
 
+	if err := forbidden(query); err != nil {
+		// Checked apart from authorize: grants must not allow it either.
+		s.metrics.query(time.Now(), err)
+		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
+		return nil, true, err
+	}
 	stmtType := duckdb.STATEMENT_TYPE_CREATE
 	if view.drop {
 		stmtType = duckdb.STATEMENT_TYPE_DROP

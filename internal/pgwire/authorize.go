@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -27,6 +28,9 @@ const statementTypeMergeInto duckdb.StmtType = 30
 // warehouse and allowed locations; roles decide who may change data and who
 // may touch instance-wide state such as secrets, attachments and settings.
 func authorize(role auth.Role, t duckdb.StmtType, query string) error {
+	if err := forbidden(query); err != nil {
+		return err
+	}
 	need := requiredRole(t, query)
 	if rank[role] >= rank[need] {
 		return nil
@@ -55,6 +59,12 @@ func requiredRole(t duckdb.StmtType, query string) auth.Role {
 		"duckdb_log_contexts", "enable_profiling", "disable_profiling") {
 		return auth.RoleAdmin
 	}
+	// query_table reads tables named in strings. The read cache's functions
+	// and settings (cache_httpfs_*) are shared by every session: clearing
+	// it, changing its rules, listing what it holds.
+	if mentionsFunction(query, words, "query_table") || mentionsPrefix(query, words, "cache_httpfs_") {
+		return auth.RoleAdmin
+	}
 
 	role := statementRole(t, query, words)
 	// These change the catalog from inside a SELECT. Table properties
@@ -76,7 +86,7 @@ var propertyFunctions = []string{
 // what it is, rather than for the functions it calls. Grants never allow
 // what needs admin, nor changing table properties.
 func grantable(t duckdb.StmtType, query string) bool {
-	if requiredRole(t, query) == auth.RoleAdmin {
+	if forbidden(query) != nil || requiredRole(t, query) == auth.RoleAdmin {
 		return false
 	}
 	return !mentionsFunction(query, sqllex.CodeWords(query), propertyFunctions...)
@@ -150,6 +160,134 @@ func mentionsFunction(query string, words []string, fns ...string) bool {
 		}
 	}
 	return false
+}
+
+// mentionsPrefix reports whether query's code has a name, unquoted or
+// quoted, that starts with prefix (in lower case).
+func mentionsPrefix(query string, words []string, prefix string) bool {
+	upper := strings.ToUpper(prefix)
+	return slices.ContainsFunc(words, func(w string) bool { return strings.HasPrefix(w, upper) }) ||
+		slices.ContainsFunc(sqllex.QuotedIdentifiers(query), func(name string) bool { return strings.HasPrefix(name, prefix) })
+}
+
+// fixedCacheSettings are the read cache's settings and functions that
+// decide where its files live, whether it wraps other filesystems and which
+// files it caches. Igloo sets them up at startup (see engine.setupCache).
+// Moving the cache directory would have the extension create and delete
+// directories outside DuckDB's sandbox, which is why DuckDB refuses to move
+// its own temp_directory once it is in use; caching files outside the
+// warehouse would keep copies of files that change.
+var fixedCacheSettings = []string{
+	"cache_httpfs_cache_directory", "cache_httpfs_cache_directories_config",
+	"cache_httpfs_wrap_cache_filesystem",
+	"cache_httpfs_add_exclusion_regex", "cache_httpfs_reset_exclusion_regex",
+}
+
+// forbidden returns an insufficient_privilege error for a statement that
+// no one may run, admins included, or nil.
+//
+// query() and json_execute_serialized_sql() run SQL that a statement builds
+// from strings, which no check of the statement's text can see into: with
+// them, a reader could call functions only admins may call, and an admin
+// could change the settings below. Without them, every function and
+// setting a statement uses is named in its text. (query_table() takes only
+// table names and is admin-only, see requiredRole.)
+func forbidden(query string) error {
+	words := sqllex.CodeWords(query)
+	var err error
+	switch {
+	case callsQuery(query):
+		err = errors.New("permission denied: query() runs SQL from a string, which Igloo cannot check; write the query itself instead")
+	case mentionsFunction(query, words, "json_execute_serialized_sql"):
+		err = errors.New("permission denied: json_execute_serialized_sql runs SQL that Igloo cannot check; write the query itself instead")
+	default:
+		for _, name := range fixedCacheSettings {
+			if mentionsFunction(query, words, name) {
+				err = fmt.Errorf("permission denied: %s is set when Igloo starts (IGLOO_CACHE_DIR) and cannot be changed", name)
+				break
+			}
+		}
+	}
+	if err != nil {
+		return pgerror.WithCode(err, codes.InsufficientPrivilege)
+	}
+	return nil
+}
+
+// callsQuery reports whether query calls DuckDB's query table function: it
+// has the name query, unquoted or quoted and perhaps qualified, followed by
+// an opening parenthesis, other than where the word before makes it the
+// name of a table, view, CTE or macro being defined or written, as in
+// INSERT INTO query (a) VALUES (1). Where it cannot tell, it reports a call,
+// so a CTE named query with a column list after the first one is refused.
+func callsQuery(query string) bool {
+	toks := sqlTokens(query)
+	for i, t := range toks {
+		if t.name != "query" || i+1 >= len(toks) || toks[i+1].punct != '(' {
+			continue
+		}
+		// Step back over qualifiers (main.query, "system"."main".query).
+		j := i
+		for j >= 2 && toks[j-1].punct == '.' && toks[j-2].name != "" {
+			j -= 2
+		}
+		if j == 0 || !namesTableBefore[toks[j-1].keyword] {
+			return true
+		}
+	}
+	return false
+}
+
+// namesTableBefore are the keywords after which query (...) is the name of
+// a table, view, CTE or macro with a column or parameter list rather than
+// a call.
+var namesTableBefore = map[string]bool{
+	"INTO": true, "TABLE": true, "VIEW": true, "EXISTS": true, "UPDATE": true, "REFERENCES": true,
+	"ON": true, "AS": true, "COPY": true, "WITH": true, "RECURSIVE": true, "MACRO": true, "FUNCTION": true,
+}
+
+// sqlToken is a token of SQL code: a name, a punctuation character or a
+// literal. Comments are left out.
+type sqlToken struct {
+	// name is a name, unquoted or quoted, in lower case.
+	name string
+	// keyword is an unquoted name in upper case.
+	keyword string
+	// punct is a punctuation character.
+	punct byte
+}
+
+// sqlTokens splits query into tokens.
+func sqlTokens(query string) []sqlToken {
+	var out []sqlToken
+	for _, seg := range sqllex.Segments(query) {
+		switch seg.Kind {
+		case sqllex.String:
+			out = append(out, sqlToken{punct: '\''})
+		case sqllex.Ident:
+			name := strings.ReplaceAll(strings.Trim(seg.Text, `"`), `""`, `"`)
+			out = append(out, sqlToken{name: strings.ToLower(name)})
+		case sqllex.Code:
+			s := seg.Text
+			for i := 0; i < len(s); {
+				switch c := s[i]; {
+				case sqllex.IdentByte(c):
+					j := i
+					for j < len(s) && sqllex.IdentByte(s[j]) {
+						j++
+					}
+					out = append(out, sqlToken{name: strings.ToLower(s[i:j]), keyword: strings.ToUpper(s[i:j])})
+					i = j
+				case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+					i++
+				default:
+					out = append(out, sqlToken{punct: c})
+					i++
+				}
+			}
+		}
+	}
+	return out
 }
 
 // readOnlyPragmas only report information.

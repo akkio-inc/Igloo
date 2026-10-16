@@ -46,8 +46,14 @@ reference for every setting mentioned here.
   `none` can do nothing on its own. Each statement is checked before it runs,
   using DuckDB's own classification of the statement plus its SQL code (never
   its comments or literals); anything Igloo cannot classify needs `admin`.
-  Non-admins may send only one statement per query, and their `SET` commands
-  apply to their own session only.
+  Non-admins may send only one statement per query (DuckDB's own expansion
+  of a `PIVOT` in a `SELECT` aside, whose generated query is checked
+  first), and their
+  `SET` commands apply to their own session only. No one, admins included,
+  may run SQL built from strings (`query()`, `json_execute_serialized_sql()`),
+  which a check of the statement's text cannot see into, or move the read
+  cache or change what it caches; its other functions and settings, and
+  `query_table()`, are limited to admins.
 - **Grants.** Admins grant `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables
   and schemas, and `CREATE` on schemas, to users or to custom roles. A
   statement the built-in role does not allow runs only if every catalog
