@@ -166,6 +166,9 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		}
 		return w.Complete(commandTag(st.stmtType, st.query, n))
 	}
+	if aw := arrowWriterOf(w); aw != nil {
+		return st.runArrow(ctx, args, w, aw)
+	}
 
 	rows, err := st.stmt.QueryContext(ctx, args)
 	if err != nil {

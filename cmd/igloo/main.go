@@ -1,5 +1,6 @@
-// Command igloo serves SQL over the Postgres wire protocol, and a web console,
-// running queries on an embedded DuckDB attached to an Iceberg catalog.
+// Command igloo serves SQL over the Postgres wire protocol and Arrow Flight
+// SQL, and a web console, running queries on an embedded DuckDB attached to
+// an Iceberg catalog.
 //
 // Configuration comes from IGLOO_* environment variables; see
 // docs/configuration.md. Subcommands:
@@ -33,6 +34,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/pgwire"
 	"github.com/akkio-inc/igloo/internal/tasks"
@@ -221,7 +223,7 @@ func serve() error {
 	}
 
 	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work, jobs: jobs}
-	errc := make(chan error, 3)
+	errc := make(chan error, 4)
 	var consoleSrv *http.Server
 	if cfg.ConsoleAddr != "" {
 		consoleLn, err := listenConsole(cfg.ConsoleAddr)
@@ -231,6 +233,17 @@ func serve() error {
 		status := consoleStatus(cfg, started, work, health, schedule, maintains)
 		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, tlsConfig, status, errc, log); err != nil {
 			_ = consoleLn.Close()
+			return err
+		}
+	}
+	var flightSrv *flightsql.Server
+	if cfg.FlightAddr != "" {
+		flightLn, err := listenFlight(cfg.FlightAddr)
+		if err != nil {
+			return err
+		}
+		if flightSrv, err = serveFlight(flightLn, srv, tlsConfig, errc, log); err != nil {
+			_ = flightLn.Close()
 			return err
 		}
 	}
@@ -250,7 +263,8 @@ func serve() error {
 			}
 		}()
 	}
-	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr)
+	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr,
+		"flight_sql", cfg.FlightAddr)
 
 	select {
 	case err := <-errc:
@@ -277,6 +291,9 @@ func serve() error {
 	}
 	if consoleSrv != nil {
 		_ = consoleSrv.Shutdown(shutdownCtx)
+	}
+	if flightSrv != nil {
+		_ = flightSrv.Shutdown(shutdownCtx)
 	}
 	err = srv.Shutdown(shutdownCtx)
 	jobs.Wait(shutdownCtx)

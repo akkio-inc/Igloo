@@ -20,10 +20,11 @@ import (
 )
 
 // Embedded sessions run SQL in process for users who sign in some other way
-// than the wire protocol: the web console. A statement takes the same path
-// as one from a network client (parse, prepareStatement, runCancelable), so
-// authorization, statement timeouts, cancellation, metrics and logging apply
-// identically; only the transport differs.
+// than the wire protocol: the web console and Arrow Flight SQL. A statement
+// takes the same path as one from a network client (parse,
+// prepareStatement, runCancelable), so authorization, statement timeouts,
+// cancellation, metrics and logging apply identically; only the transport
+// differs.
 
 // ErrLoginFailed is returned by Authenticate for an unknown user and for a
 // wrong password alike.
@@ -33,14 +34,18 @@ var ErrLoginFailed = errors.New("password authentication failed")
 // as a client closing a portal does. The statement counts as successful.
 var ErrStopRows = errors.New("enough rows")
 
-// consoleLogin marks log lines of logins through the web console.
-var consoleLogin = []any{"client", "console"}
-
 // Authenticate checks name's password against the user's stored SCRAM
 // verifier, for sign-ins through the web console. It behaves like a SQL
 // login: unknown users go through the same work against mock credentials,
 // failures wait as long, and both outcomes are logged and counted.
 func (s *Server) Authenticate(ctx context.Context, name, password string, addr net.Addr) (auth.User, error) {
+	return s.AuthenticateClient(ctx, name, password, addr, "console")
+}
+
+// AuthenticateClient is Authenticate for sign-ins through client, such as
+// "flight sql", which the log and the login history name.
+func (s *Server) AuthenticateClient(ctx context.Context, name, password string, addr net.Addr, client string) (auth.User, error) {
+	attrs := []any{"client", client}
 	user, err := s.users.Get(ctx, name)
 	known := err == nil
 	if err != nil && !errors.Is(err, auth.ErrNotFound) {
@@ -54,10 +59,10 @@ func (s *Server) Authenticate(ctx context.Context, name, password string, addr n
 		}
 	}
 	if !checkPassword(creds, password) || !known {
-		s.loginRejected(name, addr, errors.New("wrong password"), consoleLogin...)
+		s.loginRejected(name, addr, errors.New("wrong password"), attrs...)
 		return auth.User{}, ErrLoginFailed
 	}
-	s.loginSucceeded(user, addr, consoleLogin...)
+	s.loginSucceeded(user, addr, attrs...)
 	return user, nil
 }
 
@@ -84,9 +89,10 @@ type EmbeddedSession struct {
 }
 
 // OpenEmbedded opens a session for user, who signed in through the web
-// console. client says where the user is, for the list of sessions. Like a
-// network session it holds a DuckDB connection, counts against
-// MaxConnections and can be canceled; Close ends it.
+// console or Flight SQL. client says where the user is, for the list of
+// sessions and the history. Like a network session it holds a DuckDB
+// connection, counts against MaxConnections and can be canceled; Close
+// ends it.
 func (s *Server) OpenEmbedded(ctx context.Context, user auth.User, client string) (*EmbeddedSession, error) {
 	if !s.acquireConn() {
 		s.log.Warn("connection refused: too many sessions", "user", user.Name, "max", s.maxConns, "client", client)
@@ -176,30 +182,40 @@ func (e *EmbeddedSession) run(ctx context.Context, query string, out ResultWrite
 	}
 
 	for _, ps := range stmts {
-		st, ok := e.sess.open[ps]
-		w := &embeddedWriter{out: out, columns: ps.Columns(), types: e.types, canStop: ok && st.onlyReads()}
-		if len(w.columns) > 0 {
-			cols := make([]Column, len(w.columns))
-			for i, c := range w.columns {
-				cols[i] = Column{Name: c.Name, Type: typeName(c.Oid)}
-			}
-			if err := out.Columns(cols); err != nil {
-				return err
-			}
-			w.values = make([]any, len(w.columns))
-		}
-		err := ps.Run(ctx, w, nil)
-		switch {
-		case errors.Is(err, ErrStopRows):
-			err = out.Complete(fmt.Sprintf("SELECT %d", w.written))
-		case err == nil && w.tag != "":
-			err = out.Complete(w.tag)
-		}
-		if err != nil {
-			return pgError(err)
+		if err := e.runStatement(ctx, ps, nil, out); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// runStatement runs ps, one statement parse prepared, with params and
+// sends its result to out. ctx carries the session.
+func (e *EmbeddedSession) runStatement(ctx context.Context, ps *wire.PreparedStatement, params []wire.Parameter, out ResultWriter) error {
+	st, ok := e.sess.open[ps]
+	w := &embeddedWriter{out: out, columns: ps.Columns(), types: e.types, canStop: ok && st.onlyReads()}
+	if len(w.columns) > 0 {
+		if err := out.Columns(columnsOf(w.columns)); err != nil {
+			return err
+		}
+		w.values = make([]any, len(w.columns))
+	}
+	err := ps.Run(ctx, w, params)
+	switch {
+	case errors.Is(err, ErrStopRows):
+		err = out.Complete(fmt.Sprintf("SELECT %d", w.written))
+	case err == nil && w.tag != "":
+		err = out.Complete(w.tag)
+	}
+	return pgError(err)
+}
+
+func columnsOf(wcols wire.Columns) []Column {
+	cols := make([]Column, len(wcols))
+	for i, c := range wcols {
+		cols[i] = Column{Name: c.Name, Type: typeName(c.Oid)}
+	}
+	return cols
 }
 
 // onlyReads reports whether running the statement again changes nothing.

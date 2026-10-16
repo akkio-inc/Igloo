@@ -20,6 +20,8 @@ type Config struct {
 	HTTPAddr string
 	// ConsoleAddr serves the web console. Empty disables it.
 	ConsoleAddr string
+	// FlightAddr serves Arrow Flight SQL. Empty disables it.
+	FlightAddr string
 	// TLSCertFile and TLSKeyFile enable TLS for SQL clients.
 	TLSCertFile string
 	TLSKeyFile  string
@@ -195,11 +197,16 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if !ok {
 		consoleAddr = ":8443"
 	}
+	flightAddr, ok := lookup("IGLOO_FLIGHT_ADDR")
+	if !ok {
+		flightAddr = ":31337"
+	}
 
 	cfg := Config{
 		ListenAddr:          get("IGLOO_LISTEN_ADDR", ":5432"),
 		HTTPAddr:            strings.TrimSpace(httpAddr),
 		ConsoleAddr:         strings.TrimSpace(consoleAddr),
+		FlightAddr:          strings.TrimSpace(flightAddr),
 		TLSCertFile:         get("IGLOO_TLS_CERT_FILE", ""),
 		TLSKeyFile:          get("IGLOO_TLS_KEY_FILE", ""),
 		LogFormat:           get("IGLOO_LOG_FORMAT", "text"),
