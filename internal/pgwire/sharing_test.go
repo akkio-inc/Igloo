@@ -142,4 +142,9 @@ func TestProviderProfilesAreRedacted(t *testing.T) {
 	if strings.Contains(got, "dst_secret") || !strings.Contains(got, "'***'") {
 		t.Errorf("redactQuery = %q", got)
 	}
+	// Pasted without the quotes, the token is a quoted identifier.
+	q = `CREATE PROVIDER tvco FROM {"bearerToken": "dst_secret"}`
+	if got := redactQuery(q); strings.Contains(got, "dst_secret") {
+		t.Errorf("redactQuery = %q", got)
+	}
 }

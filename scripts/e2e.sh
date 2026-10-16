@@ -716,6 +716,12 @@ psql_admin -c "GRANT SELECT ON TABLE partners.spend TO nora" >/dev/null
 expect "and reads it with one" "30" nora nora-password-1 "SELECT count(*) FROM partners.spend"
 expect_error "but not with a table not granted" 42501 nora nora-password-1 \
   "SELECT count(*) FROM partners.spend, (SELECT max(n) FROM lake.public.contended)"
+# The view's SQL, which anyone can list, names the proxy's file URLs.
+proxy_url="$(psql_as nora nora-password-1 -c "SELECT regexp_extract(sql, '(http://127[.]0[.]0[.]1[^'']*)', 1)
+  FROM duckdb_views() WHERE view_name = 'spend'")" || true
+if [[ "$proxy_url" == http://127.0.0.1:* ]]; then pass "the external table's view lists proxy URLs"; else fail "proxy URL: $proxy_url"; fi
+expect_error "which users with role none cannot read directly" 42501 nora nora-password-1 \
+  "SELECT count(*) FROM read_parquet('$proxy_url')"
 psql_admin -c "INSERT INTO shared_spend VALUES (100, 'client_9', 10.00)" >/dev/null
 expect_soon "the external table follows new versions" "31" rita rita-password-1 "SELECT count(*) FROM partners.spend"
 psql_admin -c "DELETE FROM shared_spend WHERE id < 10" >/dev/null

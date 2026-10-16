@@ -110,9 +110,14 @@ type remoteFile struct {
 	Expires         time.Time
 }
 
-// defaultURLLifetime is assumed for file URLs whose expiry the provider
-// does not say.
-const defaultURLLifetime = 15 * time.Minute
+const (
+	// defaultURLLifetime is assumed for file URLs whose expiry the
+	// provider does not say.
+	defaultURLLifetime = 15 * time.Minute
+	// maxRemoteFiles bounds what a provider can make Igloo hold in memory
+	// and put in an external table's view.
+	maxRemoteFiles = 200_000
+)
 
 // providerError is an error response from a provider.
 type providerError struct {
@@ -337,6 +342,9 @@ func (c *client) query(ctx context.Context, share, schema, name string, now time
 			expires := now.Add(defaultURLLifetime)
 			if f.ExpirationTimestamp != nil {
 				expires = time.UnixMilli(*f.ExpirationTimestamp)
+			}
+			if len(snap.files) == maxRemoteFiles {
+				return nil, fmt.Errorf("the shared table has more than %d files, more than Igloo reads through an external table", maxRemoteFiles)
 			}
 			snap.files = append(snap.files, remoteFile{ID: f.ID, URL: f.URL, Size: f.Size, PartitionValues: f.PartitionValues, Expires: expires})
 		case action.EndStream != nil && action.EndStream.ErrorMessage != "":

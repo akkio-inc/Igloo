@@ -161,7 +161,9 @@ func (c *Consumer) Prepare(ctx context.Context, query string) (string, error) {
 		}
 		named = true
 		if err := c.refresh(ctx, t, false); err != nil {
-			return "", fmt.Errorf("external table %s.%s (%s): %w", t.def.Schema, t.def.Name, t.def.Remote(), err)
+			// Any user may name the table, so the error says no more
+			// than the provider's name about where it comes from.
+			return "", fmt.Errorf("external table %s.%s could not be read from provider %s: %w", t.def.Schema, t.def.Name, t.def.Provider, err)
 		}
 	}
 	if !named {

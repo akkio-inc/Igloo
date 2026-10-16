@@ -221,11 +221,14 @@ func redactQuery(query string) string {
 	if sensitive {
 		var b strings.Builder
 		afterPassword := false
+		// A profile file pasted without quotes holds its token in a
+		// "quoted identifier".
+		provider := slices.Contains(words, "PROVIDER")
 		for _, seg := range sqllex.Segments(query) {
 			switch {
 			case seg.Kind == sqllex.String:
 				seg.Text, afterPassword = "'***'", false
-			case seg.Kind == sqllex.Ident && afterPassword:
+			case seg.Kind == sqllex.Ident && (afterPassword || provider):
 				seg.Text, afterPassword = "***", false
 			case seg.Kind == sqllex.Code:
 				seg.Text, afterPassword = redactUnquoted(seg.Text, afterPassword)
