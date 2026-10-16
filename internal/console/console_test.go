@@ -531,13 +531,19 @@ func TestUsersPage(t *testing.T) {
 		t.Errorf("users %+v", users)
 	}
 
-	// Roles and grants are not in this version: the page says so.
+	// Roles and grants go through the page as SQL.
+	if resp := b.do("POST", "/api/admin/grants", map[string]string{"sql": "CREATE ROLE analyst"}, nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("CREATE ROLE on the grants page: %s", resp.Status)
+	}
 	var grants struct {
 		Available bool `json:"available"`
+		Roles     struct {
+			Rows [][]any `json:"rows"`
+		} `json:"roles"`
 	}
 	decode(t, b.do("GET", "/api/admin/grants", nil, nil), &grants)
-	if grants.Available {
-		t.Error("roles and grants reported available")
+	if !grants.Available || len(grants.Roles.Rows) != 1 {
+		t.Errorf("roles and grants: %+v", grants)
 	}
 	if resp := b.do("POST", "/api/admin/grants", map[string]string{"sql": "DROP TABLE t"}, nil); resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("non-grant statement on the grants page: %s", resp.Status)

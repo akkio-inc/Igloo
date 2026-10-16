@@ -39,7 +39,7 @@ const SOURCES = {
       time: ['event_time', 'login_time', 'time', 'timestamp', 'at', 'created_at', 'start_time'],
       user: ['user_name', 'username', 'user', 'usename'],
       outcome: ['outcome', 'status', 'result', 'success', 'is_success'],
-      client: ['client', 'client_ip', 'address', 'addr', 'remote_address', 'source'],
+      client: ['client_address', 'client', 'client_ip', 'address', 'addr', 'remote_address', 'source'],
       error: ['reason', 'error_message', 'error', 'message'],
     },
     list: ['time', 'user', 'outcome', 'client', 'error'],

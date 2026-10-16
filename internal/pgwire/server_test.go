@@ -126,10 +126,16 @@ type testServer struct {
 // configure, if given, adjusts the server options.
 func startServer(t *testing.T, configure ...func(*Options)) *testServer {
 	t.Helper()
+	return startServerWithConfig(t, config.Config{}, configure...)
+}
+
+// startServerWithConfig is startServer with an engine configured by cfg.
+func startServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*Options)) *testServer {
+	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	eng, err := engine.Open(ctx, config.Config{}, log)
+	eng, err := engine.Open(ctx, cfg, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +152,9 @@ func startServer(t *testing.T, configure ...func(*Options)) *testServer {
 	opts := Options{Users: store, RoleRefresh: time.Hour}
 	for _, f := range configure {
 		f(&opts)
+	}
+	if opts.Audit != nil {
+		eng.SetHistory(opts.Audit, HistoryViewer)
 	}
 	srv, err := New(eng, opts, log)
 	if err != nil {

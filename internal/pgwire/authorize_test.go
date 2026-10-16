@@ -24,6 +24,11 @@ func TestRequiredRole(t *testing.T) {
 		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM set_iceberg_schema_properties('s', {'a': 'b'})", auth.RoleWriter},
 		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM iceberg_table_properties(t)", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM iceberg_to_ducklake('lake', 'dl')", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM dbgen(sf = 1, catalog = 'lake')", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM enable_logging()", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT message FROM duckdb_logs", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SELECT, "SELECT * FROM tpch_queries()", auth.RoleReader},
+		{statementTypeMergeInto, "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", auth.RoleWriter},
 		{duckdb.STATEMENT_TYPE_TRANSACTION, "BEGIN", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_EXPLAIN, "EXPLAIN SELECT 1", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_EXPLAIN, "EXPLAIN ANALYZE SELECT 1", auth.RoleAdmin},
@@ -97,6 +102,12 @@ func TestAuthorizeRanksRoles(t *testing.T) {
 	for _, r := range []auth.Role{auth.RoleWriter, auth.RoleAdmin} {
 		if err := authorize(r, insert, "INSERT INTO t VALUES (1)"); err != nil {
 			t.Errorf("%s may insert: %v", r, err)
+		}
+	}
+	// The none role, like an unknown one, allows nothing by itself.
+	for _, r := range []auth.Role{auth.RoleNone, "superuser"} {
+		if authorize(r, duckdb.STATEMENT_TYPE_SELECT, "SELECT 1") == nil {
+			t.Errorf("%s may select without grants", r)
 		}
 	}
 }

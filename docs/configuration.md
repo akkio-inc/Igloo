@@ -33,15 +33,28 @@ page is the reference they are built on.
 |---|---|---|
 | `IGLOO_ADMIN_USER` | `igloo` | Name of the first administrator |
 | `IGLOO_ADMIN_PASSWORD` | (required) | That administrator's password. Used to create the account on first start only; afterwards change it with `ALTER USER`. |
-| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users and roles are stored (schema `igloo_auth`), with the key that seals web console sessions. It can be the same database the catalog uses, as long as no database role is named `igloo_auth`. Without it, the administrator is the only account, `CREATE USER` is unavailable, and console sessions end when Igloo restarts. |
+| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants are stored (schema `igloo_auth`), with the key that seals web console sessions and the query and login history (schema `igloo_audit`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth` or `igloo_audit`. Without it, the administrator is the only account, `CREATE USER` is unavailable, console sessions end when Igloo restarts, and each replica keeps only recent history in memory. |
 
-Users sign in with SCRAM-SHA-256, the PostgreSQL default. Roles:
+Users sign in with SCRAM-SHA-256, the PostgreSQL default. Each has one
+built-in role, and [grants](sql.md#roles-and-grants) can add privileges on
+schemas and tables:
 
 | Role | Can |
 |---|---|
-| `admin` | Everything, including managing users |
+| `admin` | Everything, including managing users, roles and grants |
 | `writer` | Read and write tables, create and drop tables, views and schemas, set comments and table properties |
 | `reader` | Read tables |
+| `none` | Only what grants allow |
+
+## Query history
+
+Igloo records every statement and login in `igloo.query_history` and
+`igloo.login_history`; see [query and login history](operations.md#query-and-login-history).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_AUDIT` | `true` | Record the query and login history |
+| `IGLOO_AUDIT_RETENTION` | `90d` | How long history is kept, e.g. `30d` or `720h` |
 
 ## Catalog
 

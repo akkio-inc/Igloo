@@ -83,7 +83,7 @@ func TestParseVerifierRejectsJunk(t *testing.T) {
 }
 
 func TestParseRole(t *testing.T) {
-	for _, s := range []string{"admin", "WRITER", "reader"} {
+	for _, s := range []string{"admin", "WRITER", "reader", "none"} {
 		if _, err := ParseRole(s); err != nil {
 			t.Errorf("%s: %v", s, err)
 		}
@@ -128,7 +128,7 @@ func TestPostgresStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if _, err := s.pool.Exec(ctx, "TRUNCATE igloo_auth.users"); err != nil {
+	if _, err := s.pool.Exec(ctx, "TRUNCATE igloo_auth.users, igloo_auth.roles, igloo_auth.grants CASCADE"); err != nil {
 		t.Fatal(err)
 	}
 

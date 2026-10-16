@@ -77,6 +77,18 @@ expect_error() {
   if grep -q "ERROR:  $code" <<<"$got"; then pass "$name"; else fail "$name: want $code, got [$got]"; fi
 }
 
+# expect_soon NAME WANT USER PASSWORD SQL: like expect, but waits up to a
+# minute for the output, for history that is written in the background.
+expect_soon() {
+  local name=$1 want=$2 got="" deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    got="$(psql_as "$3" "$4" -c "$5")" || true
+    [ "$got" = "$want" ] && break
+    sleep 2
+  done
+  if [ "$got" = "$want" ]; then pass "$name"; else fail "$name: got [$got], want [$want]"; fi
+}
+
 echo "tables and Iceberg writes"
 expect "create, insert, CTAS, update, delete" "2|beta|40.50" igloo "$admin_password" "
   CREATE TABLE e2e (id INTEGER, name VARCHAR, amount DECIMAL(10,2));
@@ -207,6 +219,58 @@ expect "comments in obj_description and col_description" "Test rows | :tag:e2e|I
   "SELECT obj_description(c.oid, 'pg_class'), col_description(c.oid, a.attnum)
    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'e2e' AND a.attname = 'amount'"
 
+echo "grants"
+expect "a user with no role of their own, and a custom role" "CREATE ROLE
+CREATE ROLE
+GRANT
+GRANT" igloo "$admin_password" "
+  CREATE USER nora WITH PASSWORD 'nora-password-1' ROLE none;
+  CREATE ROLE analysts;
+  GRANT analysts TO nora;
+  GRANT SELECT ON TABLE e2e TO analysts;"
+expect "a granted table" "3" nora nora-password-1 "SELECT count(*) FROM e2e"
+expect "the system catalogs need no grant" "t" nora nora-password-1 "SELECT count(*) > 0 FROM information_schema.tables"
+expect_error "a table not granted" 42501 nora nora-password-1 "SELECT count(*) FROM contended"
+expect_error "a join with a table not granted" 42501 nora nora-password-1 \
+  "SELECT count(*) FROM e2e, (SELECT max(n) FROM lake.public.contended)"
+expect "a view reads with the reader's grants" "3" nora nora-password-1 "SELECT count(*) FROM e2e_big"
+psql_admin -c "CREATE VIEW e2e_contended AS SELECT * FROM lake.public.contended" >/dev/null
+expect_error "a view of a table not granted" 42501 nora nora-password-1 "SELECT * FROM e2e_contended"
+data_file="$(psql_admin -c "SELECT file_path FROM iceberg_metadata(lake.public.contended) LIMIT 1")"
+metadata_file="$(psql_admin -c "SELECT file FROM glob(regexp_replace('$data_file', '/data/.*', '/metadata/*.metadata.json')) ORDER BY 1 DESC LIMIT 1")"
+expect_error "no reading a table's files directly" 42501 nora nora-password-1 "SELECT * FROM read_parquet('$data_file')"
+expect_error "no Iceberg scans of a table's metadata" 42501 nora nora-password-1 "SELECT * FROM iceberg_scan('$metadata_file')"
+expect_error "no Iceberg metadata functions" 42501 nora nora-password-1 "SELECT * FROM iceberg_snapshots(lake.public.e2e)"
+expect "a direct grant to a user" "GRANT" igloo "$admin_password" "GRANT SELECT ON contended TO nora"
+expect "the direct grant applies" "10" nora nora-password-1 "SELECT count(*) FROM contended"
+psql_admin -c "REVOKE SELECT ON contended FROM nora" >/dev/null
+expect_error "a revoked grant no longer applies" 42501 nora nora-password-1 "SELECT count(*) FROM contended"
+psql_admin -c "CREATE SCHEMA team" >/dev/null
+expect "grants on a schema" "GRANT" igloo "$admin_password" "GRANT SELECT, INSERT, CREATE ON SCHEMA team TO analysts"
+psql_admin -c "CREATE TABLE team.later AS SELECT 1 AS x" >/dev/null
+expect "a schema grant covers tables created later" "1" nora nora-password-1 "SELECT count(*) FROM team.later"
+expect "CREATE on a schema creates tables there" "CREATE TABLE" nora nora-password-1 "CREATE TABLE team.mine AS SELECT * FROM e2e"
+expect "and replaces them" "CREATE TABLE" nora nora-password-1 "CREATE OR REPLACE TABLE team.mine AS SELECT id FROM e2e"
+expect "INSERT through a schema grant" "INSERT 0 1" nora nora-password-1 "INSERT INTO team.mine VALUES (4)"
+expect_error "but not in other schemas" 42501 nora nora-password-1 "CREATE TABLE public.mine (i INTEGER)"
+expect_error "nor from tables not granted" 42501 nora nora-password-1 "CREATE TABLE team.copy AS SELECT * FROM contended"
+got="$(psql_as nora nora-password-1 -c 'SHOW GRANTS ON TABLE e2e')"
+if grep -q "^analysts|role|SELECT|table|public.e2e|igloo|" <<<"$got"; then pass "SHOW GRANTS"; else fail "SHOW GRANTS: $got"; fi
+
+echo "query history"
+expect_soon "users see their own statements" "t" nora nora-password-1 \
+  "SELECT count(*) > 0 AND count(*) FILTER (WHERE user_name <> 'nora') = 0 FROM igloo.query_history"
+expect_soon "with the tables they read" '["lake.public.e2e"]' igloo "$admin_password" \
+  "SELECT tables_read FROM igloo.query_history WHERE user_name = 'nora' AND query_text = 'SELECT count(*) FROM e2e' LIMIT 1"
+expect_soon "denied statements are recorded" "t" igloo "$admin_password" \
+  "SELECT count(*) > 0 FROM igloo.query_history WHERE user_name = 'nora' AND outcome = 'denied' AND sqlstate = '42501'"
+expect "passwords are never recorded" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '%password-1%'"
+expect_soon "logins and failed logins are recorded" "t|t" igloo "$admin_password" \
+  "SELECT bool_or(result = 'success' AND user_name = 'nora'), bool_or(result = 'failure' AND user_name = 'rita') FROM igloo.login_history"
+got="$(psql_admin -c '\dv igloo.*')"
+if grep -q "igloo|query_history|view" <<<"$got"; then pass '\dv lists the history views'; else fail "\\dv igloo.*: $got"; fi
+
 echo "table maintenance"
 psql_admin -c "CREATE TABLE fragmented (id INTEGER, v VARCHAR, amount DECIMAL(15,2))" >/dev/null
 for i in 1 2 3 4 5 6; do psql_admin -c "INSERT INTO fragmented VALUES ($i, 'v$i', $i.25)" >/dev/null; done
@@ -245,6 +309,11 @@ if [ "$code" = 200 ]; then pass "readyz"; else fail "readyz returned $code"; fi
 metrics="$(curl -s "http://127.0.0.1:$http_port/metrics")"
 if grep -q '^igloo_queries_total' <<<"$metrics"; then pass "metrics"; else fail "metrics"; fi
 if grep -q '^igloo_maintenance_passes_total{result="ok"}' <<<"$metrics"; then pass "maintenance metrics"; else fail "maintenance metrics"; fi
+if grep -q '^igloo_audit_written_total{kind="query"}' <<<"$metrics" && ! grep -q '^igloo_audit_dropped_total' <<<"$metrics"; then
+  pass "history metrics"
+else
+  fail "history metrics: $(grep '^igloo_audit' <<<"$metrics")"
+fi
 
 echo "restart"
 # Read a table once so its files land in the read cache.
@@ -267,6 +336,7 @@ else
 fi
 expect "views and comments survive a restart" "3|Test rows | :tag:e2e" rita rita-password-1 \
   "SELECT (SELECT count(*) FROM e2e_big), (SELECT comment FROM igloo_comments() WHERE table_name = 'e2e' AND column_name IS NULL)"
+expect "grants survive a restart" "3" nora nora-password-1 "SELECT count(*) FROM e2e"
 expect "drop a view" "DROP VIEW" walt walt-password-1 "DROP VIEW e2e_big"
 expect_error "a dropped view is gone" 42P01 walt walt-password-1 "DROP VIEW e2e_big"
 

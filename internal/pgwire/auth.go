@@ -73,7 +73,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 		return ctx, err
 	}
 	if mechanism != saslMechanism {
-		return s.loginFailed(ctx, writer, name, fmt.Errorf("unsupported SASL mechanism %q", mechanism))
+		return s.loginFailed(ctx, writer, name, fmt.Errorf("unsupported SASL mechanism %q", mechanism), "unsupported authentication method")
 	}
 	n, err := reader.GetInt32()
 	if err != nil {
@@ -82,7 +82,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 	// The length comes from the client; anything but a length that fits the
 	// message is malformed (the protocol library panics on negative ones).
 	if n < 0 || int(n) > len(reader.Msg) {
-		return s.loginFailed(ctx, writer, name, errors.New("malformed SASL initial response"))
+		return s.loginFailed(ctx, writer, name, errors.New("malformed SASL initial response"), "malformed authentication message")
 	}
 	clientFirst, err := reader.GetBytes(int(n))
 	if err != nil {
@@ -91,7 +91,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 
 	serverFirst, err := conv.Step(string(clientFirst))
 	if err != nil {
-		return s.loginFailed(ctx, writer, name, err)
+		return s.loginFailed(ctx, writer, name, err, "malformed authentication message")
 	}
 	if err := writeAuth(writer, authSASLContinue, []byte(serverFirst)); err != nil {
 		return ctx, err
@@ -103,7 +103,11 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 	}
 	serverFinal, err := conv.Step(string(reader.Msg))
 	if err != nil || !conv.Valid() || !known {
-		return s.loginFailed(ctx, writer, name, err)
+		reason := "wrong password"
+		if !known {
+			reason = "unknown user"
+		}
+		return s.loginFailed(ctx, writer, name, err, reason)
 	}
 	if err := writeAuth(writer, authSASLFinal, []byte(serverFinal)); err != nil {
 		return ctx, err
@@ -116,6 +120,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 		err := pgerror.WithSeverity(pgerror.WithCode(
 			errors.New("sorry, too many clients already"), codes.TooManyConnections), pgerror.LevelFatal)
 		s.log.Warn("connection refused: too many sessions", "user", name, "max", s.maxConns)
+		s.recordLogin(name, wire.RemoteAddress(ctx), wire.ClientParameters(ctx)[wire.ParamApplicationName], nil, "too many connections")
 		if werr := wire.WriteUnterminatedError(writer, err); werr != nil {
 			return ctx, werr
 		}
@@ -123,33 +128,55 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 	}
 
 	addr := wire.RemoteAddress(ctx)
-	s.loginSucceeded(user, addr)
-
 	sess := &session{
 		user:     user,
 		checked:  time.Now(),
 		timeout:  s.timeout,
 		activity: s.activity,
 		open:     make(map[*wire.PreparedStatement]*statement),
+		appName:  wire.ClientParameters(ctx)[wire.ParamApplicationName],
 	}
 	if addr != nil {
 		sess.client = addr.String()
 	}
+	s.loginSucceededSession(user, addr, sess)
 	return context.WithValue(ctx, sessionKey{}, sess), nil
 }
 
-// loginSucceeded counts and logs a login from addr, which may be nil.
-// Logins through the web console use it too; attrs say so.
+// loginSucceeded counts, logs and records in the login history a login from
+// addr, which may be nil. Logins through the web console use it too; attrs
+// say so.
 func (s *Server) loginSucceeded(user auth.User, addr net.Addr, attrs ...any) {
-	s.metrics.login(true)
-	s.log.Info("login", append([]any{"user", user.Name, "role", user.Role, "addr", addr}, attrs...)...)
+	s.loginSucceededSession(user, addr, nil, attrs...)
 }
 
-// loginRejected slows down password guessing, then counts and logs a failed
-// login. Logins through the web console use it too; attrs say so.
+// loginSucceededSession is loginSucceeded for a login that opened sess.
+func (s *Server) loginSucceededSession(user auth.User, addr net.Addr, sess *session, attrs ...any) {
+	s.metrics.login(true)
+	s.log.Info("login", append([]any{"user", user.Name, "role", user.Role, "addr", addr}, attrs...)...)
+	appName := clientAttr(attrs)
+	if sess != nil {
+		appName = sess.applicationName()
+	}
+	s.recordLogin(user.Name, addr, appName, sess, "")
+}
+
+// loginRejected slows down password guessing, then counts, logs and records
+// a failed login. Logins through the web console use it too; attrs say so.
 func (s *Server) loginRejected(name string, addr net.Addr, cause error, attrs ...any) {
+	reason := "wrong password"
+	if cause != nil {
+		reason = cause.Error()
+	}
+	s.loginRejectedReason(name, addr, cause, reason, attrs...)
+}
+
+// loginRejectedReason is loginRejected with the reason the login history
+// gives, which says why without detail a client could use.
+func (s *Server) loginRejectedReason(name string, addr net.Addr, cause error, reason string, attrs ...any) {
 	time.Sleep(failedLoginDelay)
 	s.metrics.login(false)
+	s.recordLogin(name, addr, clientAttr(attrs), nil, reason)
 	attrs = append([]any{"user", name, "addr", addr}, attrs...)
 	if cause != nil {
 		attrs = append(attrs, "reason", cause)
@@ -157,8 +184,20 @@ func (s *Server) loginRejected(name string, addr net.Addr, cause error, attrs ..
 	s.log.Warn("login failed", attrs...)
 }
 
-func (s *Server) loginFailed(ctx context.Context, writer *buffer.Writer, name string, cause error) (context.Context, error) {
-	s.loginRejected(name, wire.RemoteAddress(ctx), cause)
+// clientAttr returns the "client" of log attributes, such as "console".
+func clientAttr(attrs []any) string {
+	for i := 0; i+1 < len(attrs); i += 2 {
+		if k, _ := attrs[i].(string); k == "client" {
+			v, _ := attrs[i+1].(string)
+			return v
+		}
+	}
+	return ""
+}
+
+// loginFailed refuses a login. reason is for the login history.
+func (s *Server) loginFailed(ctx context.Context, writer *buffer.Writer, name string, cause error, reason string) (context.Context, error) {
+	s.loginRejectedReason(name, wire.RemoteAddress(ctx), cause, reason)
 
 	err := pgerror.WithSeverity(pgerror.WithCode(
 		fmt.Errorf("password authentication failed for user %q", name), codes.InvalidPassword),

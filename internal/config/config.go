@@ -52,6 +52,14 @@ type Config struct {
 	Catalog     Catalog
 	Storage     Storage
 	Maintenance Maintenance
+	Audit       Audit
+}
+
+// Audit controls the query and login history.
+type Audit struct {
+	Enabled bool
+	// Retention is how long history is kept.
+	Retention time.Duration
 }
 
 // Cache keeps local copies of the table files Igloo reads from object
@@ -325,6 +333,17 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_SNAPSHOT_RETENTION must be a duration such as 7d or 36h, got %q", get("IGLOO_SNAPSHOT_RETENTION", ""))
 	} else {
 		cfg.Maintenance.Retention = d
+	}
+
+	audit, err := strconv.ParseBool(get("IGLOO_AUDIT", "true"))
+	if err != nil {
+		addErr("IGLOO_AUDIT must be true or false: %w", err)
+	}
+	cfg.Audit.Enabled = audit
+	if d, err := parseDays(get("IGLOO_AUDIT_RETENTION", "90d")); err != nil || d <= 0 {
+		addErr("IGLOO_AUDIT_RETENTION must be a positive duration such as 90d or 720h, got %q", get("IGLOO_AUDIT_RETENTION", ""))
+	} else {
+		cfg.Audit.Retention = d
 	}
 
 	setup, err := strconv.ParseBool(get("IGLOO_CATALOG_SETUP", "true"))

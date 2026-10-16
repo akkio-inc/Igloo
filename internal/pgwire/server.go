@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 
 	"github.com/akkio-inc/igloo/internal/activity"
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
 )
@@ -64,6 +66,14 @@ type Options struct {
 	DDL *ddl.Manager
 	// Activity, if set, records statements while they run.
 	Activity *activity.Tracker
+	// Grants keeps custom roles and grants. Nil means Users if it keeps
+	// them too, and otherwise a store in memory.
+	Grants auth.GrantStore
+	// Audit, if set, records the query and login history.
+	Audit *audit.Log
+	// Catalog is the name in SQL of the catalog grants apply to. Empty
+	// means the engine's Iceberg catalog.
+	Catalog string
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -92,6 +102,12 @@ type Server struct {
 	version     string
 	ddl         *ddl.Manager
 	activity    *activity.Tracker
+	grants      auth.GrantStore
+	audit       *audit.Log
+	catalog     string
+	// ddlGen counts statements run here that may change the catalog; see
+	// catalogGeneration.
+	ddlGen atomic.Uint64
 	// mockSecret derives the credentials a login for an unknown user runs
 	// against (see mockCredentials).
 	mockSecret []byte
@@ -120,10 +136,20 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		version:     opts.Version,
 		ddl:         opts.DDL,
 		activity:    opts.Activity,
+		grants:      opts.Grants,
+		audit:       opts.Audit,
+		catalog:     opts.Catalog,
 		mockSecret:  mockSecret,
 	}
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
+	}
+	if s.grants == nil {
+		if g, ok := opts.Users.(auth.GrantStore); ok {
+			s.grants = g
+		} else {
+			s.grants = auth.NewMemoryGrants(opts.Users)
+		}
 	}
 	s.sessions.abandoned = s.releaseConn
 
@@ -189,8 +215,11 @@ type session struct {
 	// cursors are the open SQL cursors, by name.
 	cursors map[string]*cursor
 	// client describes where the session comes from, for the console's
-	// list of sessions.
+	// list of sessions and the history.
 	client string
+	// settingGen counts the session's SET statements, which may change
+	// how its statements resolve names.
+	settingGen uint64
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -201,6 +230,12 @@ type session struct {
 	// statement and started describe the running statement.
 	statement string
 	started   time.Time
+	// privs are the user's grants, loaded when first needed.
+	privs privilegeSnapshot
+	// id identifies the session in the history; see sessionID.
+	id string
+	// appName is the client's application_name.
+	appName string
 }
 
 type sessionKey struct{}
@@ -415,7 +450,7 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	// psycopg sends this after DDL to drop its prepared statements; DuckDB
 	// has no DEALLOCATE ALL.
 	if deallocateAll.MatchString(q.Query) {
-		return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 			if c := sess.statements; c != nil {
 				for name := range c.names {
 					if err := c.Delete(ctx, name); err != nil {
@@ -424,44 +459,45 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 				}
 			}
 			return w.Complete("DEALLOCATE ALL")
-		})), nil
+		}))), nil
 	}
 
 	if tag, ok := ignoredCommand(q.Query); ok {
-		return wire.Prepared(wire.NewStatement(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		appName, setsAppName := applicationNameValue(q.Query)
+		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			if setsAppName {
+				sess.setApplicationName(appName)
+			}
 			return w.Complete(tag)
-		})), nil
+		}))), nil
 	}
 
 	// psql's \password asks which hash to send before ALTER USER.
 	if showPasswordEncryption.MatchString(q.Query) {
-		return wire.Prepared(wire.NewStatement(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 			if err := w.Row([]any{"scram-sha-256"}); err != nil {
 				return err
 			}
 			return w.Complete("SHOW")
-		}, wire.WithColumns(wire.Columns{{Name: "password_encryption", Oid: pgtype.TextOID, Width: -1}}))), nil
+		}), wire.WithColumns(wire.Columns{{Name: "password_encryption", Oid: pgtype.TextOID, Width: -1}}))), nil
 	}
 
 	if cmds, ok, err := parseUserCommands(q.Query); ok {
-		if err != nil {
-			return nil, err
+		if err == nil && len(cmds) > 1 && !q.SimpleQuery {
+			err = pgerror.WithCode(errors.New("cannot prepare several statements at once"), codes.Syntax)
 		}
-		if len(cmds) > 1 && !q.SimpleQuery {
-			return nil, pgerror.WithCode(errors.New("cannot prepare several statements at once"), codes.Syntax)
+		if err != nil {
+			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+			return nil, err
 		}
 		var stmts wire.PreparedStatements
 		for _, cmd := range cmds {
-			var columns wire.Columns
-			if cmd.verb == "SHOW" {
-				columns = userColumns
-			}
-			stmts = append(stmts, wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			stmts = append(stmts, wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 				start := time.Now()
 				err := s.runUserCommand(ctx, sess, cmd, w)
 				s.metrics.query(start, err)
 				return err
-			}, wire.WithColumns(columns)))
+			}), wire.WithColumns(cmd.columns())))
 		}
 		return stmts, nil
 	}
@@ -492,8 +528,14 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		}
 
 		start := time.Now()
+		tw := &tagWriter{DataWriter: w}
+		if err := s.recheckGrants(ctx, sess, st); err != nil {
+			s.metrics.query(start, err)
+			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access})
+			return err
+		}
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
-			return runWithCommitRetry(ctx, sess, st, func() error { return st.run(ctx, args, w) })
+			return runWithCommitRetry(ctx, sess, st, func() error { return st.run(ctx, args, tw) })
 		})
 		if isIcebergNoReplace(err) {
 			if sess.inTx {
@@ -502,12 +544,24 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			} else if r, ok := s.replaceable(sess, st); ok {
 				err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error { return s.replaceTable(ctx, sess, r) })
 				if err == nil {
-					err = w.Complete("CREATE TABLE")
+					err = tw.Complete("CREATE TABLE")
 				}
 			}
 		}
 		s.metrics.query(start, err)
 		sess.observe(st, err)
+		if err == nil {
+			switch {
+			case changesCatalog(st.stmtType):
+				s.ddlGen.Add(1)
+			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
+				sess.settingGen++
+			}
+			if st.effect != nil {
+				s.applyEffect(ctx, sess, st.effect)
+			}
+		}
+		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
@@ -519,10 +573,16 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 }
 
 // prepareStatement rewrites text for DuckDB, checks it against the user's
-// role and prepares it on the session's connection. oids are the parameter
-// types the client declared. Errors carry PostgreSQL codes.
+// role and grants and prepares it on the session's connection. oids are
+// the parameter types the client declared. Errors carry PostgreSQL codes,
+// and statements that fail here are recorded in the history.
 func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
-	query := rewriteSessionUser(rewriteCatalogQuery(text), user.Name)
+	start := time.Now()
+	fail := func(err error) (*statement, error) {
+		s.recordQuery(sess, queryRecord{text: text, start: start, err: err, rows: -1})
+		return nil, err
+	}
+	query := rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(text), user.Name), s.engine.LocalDatabase())
 	if s.ddl != nil {
 		query = s.ddl.RewriteViewRefs(query)
 		if readsComments.MatchString(query) {
@@ -540,14 +600,19 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		query = sessionScoped(query)
 		n, err := s.engine.CountStatements(query)
 		if err != nil {
-			return nil, pgerror.WithCode(err, codes.Syntax)
+			return fail(pgerror.WithCode(err, codes.Syntax))
 		}
 		if n > 1 {
 			s.metrics.query(time.Now(), errDenied)
-			return nil, pgerror.WithCode(
+			return fail(pgerror.WithCode(
 				errors.New("send one statement at a time; only admins may send several in one query"),
-				codes.InsufficientPrivilege)
+				codes.InsufficientPrivilege))
 		}
+	} else if strings.Contains(strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"), ";") {
+		// Preparing may run statements that change the catalog or the
+		// session's settings; count it as doing both.
+		s.ddlGen.Add(1)
+		sess.settingGen++
 	}
 
 	if listsColumns.MatchString(query) {
@@ -566,9 +631,13 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 	}
 	if err != nil {
 		sess.observe(nil, err)
-		return nil, pgError(err)
+		return fail(pgError(err))
 	}
 	err = authorize(user.Role, st.stmtType, query)
+	if err != nil {
+		// The built-in role does not allow it; grants may.
+		st.access, err = s.authorizeByGrants(ctx, sess, user, st, query, err)
+	}
 	if err == nil {
 		err = s.authorizeLocal(user.Role, st.stmtType, text)
 	}
@@ -576,16 +645,52 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		s.metrics.query(time.Now(), err)
 		_ = st.close()
-		return nil, err
+		return fail(err)
+	}
+	if st.stmtType == duckdb.STATEMENT_TYPE_DROP || st.stmtType == duckdb.STATEMENT_TYPE_ALTER {
+		st.effect = s.ddlEffect(ctx, sess, query)
 	}
 	return st, nil
+}
+
+// recheckGrants decides again, before it runs, a statement that grants
+// allowed, if the decision may be stale: the session's grants were reloaded
+// since, the catalog or the session's settings changed, or the decision is
+// as old as the role refresh interval. A prepared statement then outlives a
+// REVOKE no longer than a session's cached grants do, and cannot be made to
+// read a table nobody checked by replacing a view or changing the search
+// path before it runs.
+func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement) error {
+	if st.access == nil {
+		return nil
+	}
+	user, err := s.refreshUser(ctx, sess)
+	if err != nil {
+		return err
+	}
+	privs, err := s.privileges(ctx, sess, user)
+	if err == nil && privs == st.access.privs && time.Since(st.access.checked) < s.roleRefresh &&
+		st.access.catalogGen == s.catalogGeneration() && st.access.settingGen == sess.settingGen {
+		return nil
+	}
+	roleErr := authorize(user.Role, st.stmtType, st.query)
+	if roleErr == nil {
+		return nil
+	}
+	acc, err := s.authorizeByGrants(ctx, sess, user, st, st.query, roleErr)
+	if err != nil {
+		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+		return err
+	}
+	st.access = acc
+	return nil
 }
 
 // statementTimeoutCommand handles SET, RESET and SHOW statement_timeout,
 // which Igloo enforces itself rather than DuckDB.
 func (s *Server) statementTimeoutCommand(sess *session, query string) (wire.PreparedStatements, bool) {
 	respond := func(fn wire.PreparedStatementFn, opts ...wire.PreparedOptionFn) (wire.PreparedStatements, bool) {
-		return wire.Prepared(wire.NewStatement(fn, opts...)), true
+		return wire.Prepared(wire.NewStatement(s.audited(sess, query, fn), opts...)), true
 	}
 
 	if m := setStatementTimeout.FindStringSubmatch(query); m != nil {
@@ -673,8 +778,8 @@ func (r *registry) cancel(pid, secret int32) {
 	sess.mu.Unlock()
 }
 
-// expire makes every session of user re-read its role before its next
-// statement.
+// expire makes every session of user re-read its role and grants before
+// its next statement.
 func (r *registry) expire(user string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -682,7 +787,20 @@ func (r *registry) expire(user string) {
 		sess.mu.Lock()
 		if sess.user.Name == user {
 			sess.checked = time.Time{}
+			sess.privs.loaded = time.Time{}
 		}
+		sess.mu.Unlock()
+	}
+}
+
+// expireAll makes every session re-read its grants before its next
+// statement, as after a change to a custom role.
+func (r *registry) expireAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, sess := range r.byPID {
+		sess.mu.Lock()
+		sess.privs.loaded = time.Time{}
 		sess.mu.Unlock()
 	}
 }

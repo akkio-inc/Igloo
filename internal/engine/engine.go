@@ -51,6 +51,8 @@ type Engine struct {
 	comments atomic.Pointer[func() []catalog.Comment]
 	// cache is the on-disk read cache, or nil when it is off.
 	cache *readCache
+	// history supplies the history functions; see SetHistory.
+	history atomic.Pointer[historyConfig]
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -191,6 +193,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger)
 	}
 	if err := e.registerComments(ctx); err != nil {
 		return fmt.Errorf("register igloo_comments: %w", err)
+	}
+	if err := e.registerHistory(ctx); err != nil {
+		return fmt.Errorf("register query history: %w", err)
 	}
 
 	if cfg.Catalog.URI == "" {

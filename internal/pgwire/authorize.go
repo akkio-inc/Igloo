@@ -15,7 +15,12 @@ import (
 )
 
 // rank orders roles so a higher role can do everything a lower one can.
-var rank = map[auth.Role]int{auth.RoleReader: 1, auth.RoleWriter: 2, auth.RoleAdmin: 3}
+// The none role, like any unknown one, ranks below them all.
+var rank = map[auth.Role]int{auth.RoleNone: 0, auth.RoleReader: 1, auth.RoleWriter: 2, auth.RoleAdmin: 3}
+
+// statementTypeMergeInto is DuckDB's statement type for MERGE INTO, which
+// duckdb-go does not name.
+const statementTypeMergeInto duckdb.StmtType = 30
 
 // authorize returns an insufficient_privilege error unless role may run a
 // statement of type t. DuckDB's sandbox already confines everyone to the
@@ -42,8 +47,12 @@ func requiredRole(t duckdb.StmtType, query string) auth.Role {
 
 	// Secret metadata (key ids, scopes) and secrets themselves are shared
 	// by every session. iceberg_to_ducklake copies tables into another
-	// catalog.
-	if mentionsFunction(query, words, "duckdb_secrets", "which_secret", "iceberg_to_ducklake") {
+	// catalog, and dbgen writes tables wherever it is told. DuckDB's log
+	// and profiler are shared too: once on, the log holds every session's
+	// statements.
+	if mentionsFunction(query, words, "duckdb_secrets", "which_secret", "iceberg_to_ducklake", "dbgen",
+		"enable_logging", "disable_logging", "truncate_duckdb_logs", "duckdb_logs", "duckdb_logs_parsed",
+		"duckdb_log_contexts", "enable_profiling", "disable_profiling") {
 		return auth.RoleAdmin
 	}
 
@@ -51,12 +60,26 @@ func requiredRole(t duckdb.StmtType, query string) auth.Role {
 	// These change the catalog from inside a SELECT. Table properties
 	// include snapshot retention, which decides how long history and time
 	// travel survive table maintenance.
-	if rank[role] < rank[auth.RoleWriter] && mentionsFunction(query, words,
-		"set_iceberg_table_properties", "remove_iceberg_table_properties",
-		"set_iceberg_schema_properties", "remove_iceberg_schema_properties") {
+	if rank[role] < rank[auth.RoleWriter] && mentionsFunction(query, words, propertyFunctions...) {
 		return auth.RoleWriter
 	}
 	return role
+}
+
+var propertyFunctions = []string{
+	"set_iceberg_table_properties", "remove_iceberg_table_properties",
+	"set_iceberg_schema_properties", "remove_iceberg_schema_properties",
+}
+
+// grantable reports whether grants can allow a statement that the user's
+// built-in role does not: one that needs no more than the writer role for
+// what it is, rather than for the functions it calls. Grants never allow
+// what needs admin, nor changing table properties.
+func grantable(t duckdb.StmtType, query string) bool {
+	if requiredRole(t, query) == auth.RoleAdmin {
+		return false
+	}
+	return !mentionsFunction(query, sqllex.CodeWords(query), propertyFunctions...)
 }
 
 // statementRole is the least role for a statement of type t, from its type
@@ -102,7 +125,8 @@ func statementRole(t duckdb.StmtType, query string, words []string) auth.Role {
 		return auth.RoleAdmin
 
 	case duckdb.STATEMENT_TYPE_INSERT, duckdb.STATEMENT_TYPE_UPDATE, duckdb.STATEMENT_TYPE_DELETE,
-		duckdb.STATEMENT_TYPE_ALTER, duckdb.STATEMENT_TYPE_CREATE_FUNC, duckdb.STATEMENT_TYPE_COPY:
+		duckdb.STATEMENT_TYPE_ALTER, duckdb.STATEMENT_TYPE_CREATE_FUNC, duckdb.STATEMENT_TYPE_COPY,
+		statementTypeMergeInto:
 		return auth.RoleWriter
 
 	case duckdb.STATEMENT_TYPE_CREATE, duckdb.STATEMENT_TYPE_DROP:

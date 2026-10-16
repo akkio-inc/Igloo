@@ -17,6 +17,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -179,14 +180,28 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		return nil, false, nil
 	}
 
+	start := time.Now()
+	target := []auth.Object{{Schema: schema, Table: name}}
+	if isView && !view.drop && strings.EqualFold(schema, engine.HistorySchema) &&
+		(strings.EqualFold(name, "query_history") || strings.EqualFold(name, "login_history")) {
+		err := pgerror.WithCode(fmt.Errorf("%s.%s is reserved for Igloo's history", schema, name), codes.ReservedName)
+		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
+		return nil, true, err
+	}
+
 	stmtType := duckdb.STATEMENT_TYPE_CREATE
 	if view.drop {
 		stmtType = duckdb.STATEMENT_TYPE_DROP
 	}
 	if err := authorize(user.Role, stmtType, query); err != nil {
-		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
-		s.metrics.query(time.Now(), err)
-		return nil, true, err
+		// Creating, replacing, dropping and commenting on the catalog's
+		// views and tables is CREATE on their schema.
+		if err = s.authorizeSchemaCreate(ctx, sess, user, schema, err); err != nil {
+			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+			s.metrics.query(time.Now(), err)
+			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
+			return nil, true, err
+		}
 	}
 
 	var run func(context.Context) error
@@ -213,18 +228,50 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 	}
 
 	return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
-		if sess.inTx {
-			return pgerror.WithCode(errors.New(tag+" on the Iceberg catalog cannot run inside a transaction block"),
-				codes.ActiveSQLTransaction)
-		}
 		start := time.Now()
+		record := func(err error) error {
+			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1, written: target})
+			return err
+		}
+		if sess.inTx {
+			return record(pgerror.WithCode(errors.New(tag+" on the Iceberg catalog cannot run inside a transaction block"),
+				codes.ActiveSQLTransaction))
+		}
 		err := sess.runCancelable(ctx, query, run)
 		s.metrics.query(start, err)
 		if err != nil {
-			return catalogDDLError(err)
+			return record(catalogDDLError(err))
 		}
-		return w.Complete(tag)
+		if view.drop {
+			if ferr := s.grants.ForgetObject(ctx, target[0]); ferr != nil {
+				s.log.Warn("could not remove a dropped view's grants", "view", target[0].String(), "err", ferr)
+			}
+			s.sessions.expireAll()
+		}
+		return record(w.Complete(tag))
 	})), true, nil
+}
+
+// authorizeSchemaCreate allows a user whose built-in role refused a change
+// to the catalog's tables or views in schema (roleErr) if they have CREATE
+// on the schema.
+func (s *Server) authorizeSchemaCreate(ctx context.Context, sess *session, user auth.User, schema string, roleErr error) error {
+	if s.catalogName() == "" {
+		return roleErr
+	}
+	privs, err := s.privileges(ctx, sess, user)
+	if err != nil {
+		s.log.Warn("could not load grants", "user", user.Name, "err", err)
+		return roleErr
+	}
+	if user.Role != auth.RoleNone && privs.Empty() {
+		return roleErr
+	}
+	n := need{auth.PrivilegeCreate, auth.Object{Schema: schema}}
+	if allows(user, privs, n) {
+		return nil
+	}
+	return needError(user, n)
 }
 
 // authorizeLocal keeps non-admins from changing DuckDB's own database, where

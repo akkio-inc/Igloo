@@ -60,8 +60,11 @@ DROP VIEW IF EXISTS recent_orders;
   tables of views that sessions with other search paths will read.
 - A view created on one replica reaches the others within 30 seconds, or at
   once when a query there names it.
-- Writers create and drop views. Other engines see the views in the catalog
-  but cannot run their DuckDB SQL.
+- Writers create and drop views, as do users with `CREATE` on the view's
+  schema. Other engines see the views in the catalog but cannot run their
+  DuckDB SQL.
+- A view runs with the privileges of whoever queries it: reading one needs
+  `SELECT` on the tables it reads (see [grants](#roles-and-grants)).
 
 ## Comments
 
@@ -84,6 +87,114 @@ SELECT table_schema, table_name, column_name, comment FROM igloo_comments();
 A replica rereads every table's comments at most every 30 seconds, when a
 query reads them, so comments set on another replica can take that long to
 appear.
+
+## Roles and grants
+
+Every user has one built-in role that applies to the whole warehouse, set
+with `CREATE USER ... ROLE` and `ALTER USER ... ROLE` (see
+[operations](operations.md#users-and-roles)): `admin`, `writer`, `reader`,
+or `none`, which allows nothing on its own. Grants add privileges on
+schemas and tables of the Iceberg catalog, to a user directly or to a custom
+role that users are given. Only admins create roles and grant; the syntax is
+PostgreSQL's:
+
+```sql
+CREATE USER nora WITH PASSWORD 'a-long-password' ROLE none;
+CREATE ROLE analysts;
+GRANT analysts TO nora;
+GRANT SELECT ON TABLE sales.orders TO analysts;   -- TABLE is optional; views too
+GRANT SELECT, INSERT ON SCHEMA staging TO analysts;  -- every table in it, now and later
+GRANT SELECT ON ALL TABLES IN SCHEMA finance TO analysts;  -- the tables there now
+GRANT CREATE ON SCHEMA sandbox TO nora;
+GRANT ALL PRIVILEGES ON SCHEMA sandbox TO nora;  -- SELECT, INSERT, UPDATE, DELETE, CREATE
+REVOKE INSERT ON SCHEMA staging FROM analysts;
+REVOKE analysts FROM nora;
+DROP ROLE [IF EXISTS] analysts;
+SHOW ROLES;
+SHOW GRANTS;                       -- or TO name, ON TABLE name, ON SCHEMA name
+```
+
+| Privilege | On | Allows |
+|---|---|---|
+| `SELECT` | table, view or schema | Reading the table |
+| `INSERT` | table or schema | `INSERT`, `COPY ... FROM` and `MERGE ... INSERT` into it |
+| `UPDATE` | table or schema | `UPDATE` and `MERGE ... UPDATE` |
+| `DELETE` | table or schema | `DELETE`, `TRUNCATE` and `MERGE ... DELETE` |
+| `CREATE` | schema | Creating, replacing, altering, renaming, commenting on and dropping its tables and views, including `CREATE TABLE AS` |
+
+A statement runs if the user's built-in role allows it, or if every access
+it makes to the catalog is granted, to them or to one of their roles. So a
+`reader` with `INSERT` on a table may insert into it, and a user with role
+`none` may run only queries whose tables are all granted to them. How it
+works and what it means:
+
+- A grant on a schema covers every table and view in it, including ones
+  created later. `ALL TABLES IN SCHEMA` covers the tables and views there
+  at the time of the grant, as in PostgreSQL.
+- Users with role `none` need `SELECT` on everything a statement reads,
+  including the target of `UPDATE`, `DELETE` and `MERGE`, the query of
+  `CREATE TABLE AS`, and the tables behind every view (see below). They can
+  read the system catalogs (`information_schema`, `pg_catalog`, the
+  `duckdb_*` functions, `igloo_comments()`) and their own
+  [history](#query-history), but not files: `read_parquet`, `read_csv`,
+  `iceberg_scan`, `iceberg_metadata`, `glob`, `COPY ... FROM` and similar
+  functions could read any table's files directly. Statements Igloo cannot
+  analyze, such as `PRAGMA`, are refused for them with SQLSTATE `42501`.
+- Views run with the querying user's privileges: reading a view needs
+  `SELECT` on the tables it reads. Owner's-rights views, column masking and
+  row filters are not available yet.
+- `CREATE` on a schema does not include reading or writing the tables made
+  there; grant those as well.
+- Grants never allow what needs `admin` (users, secrets, `ATTACH`, global
+  settings), writing files with `COPY ... TO`, temporary tables, creating or
+  dropping schemas, or changing table properties.
+- Grants follow tables by name. Dropping a table or view through Igloo
+  removes its grants, and renaming one moves them; `CREATE OR REPLACE`
+  keeps them.
+- Grant and role changes apply at once on the replica that made them and
+  within 30 seconds on the others, also to statements prepared before.
+- Table and column names are visible to every user, through the system
+  catalogs.
+
+A refused statement gets SQLSTATE `42501` and a message that names the
+table or schema and the privilege it needs, such as `permission denied for
+nora: SELECT on table public.orders needs the reader role or a SELECT
+grant`.
+
+## Query history
+
+Every statement and login is recorded: `igloo.query_history` and
+`igloo.login_history` list them, newest first. Admins see everyone's;
+other users see their own.
+
+```sql
+SELECT start_time, user_name, outcome, duration_ms, query_text
+FROM igloo.query_history
+WHERE outcome <> 'ok'
+ORDER BY start_time DESC LIMIT 20;
+
+SELECT event_time, user_name, result, reason, client_address
+FROM igloo.login_history WHERE result = 'failure';
+```
+
+| `igloo.query_history` column | Meaning |
+|---|---|
+| `query_id`, `session_id` | Identify the statement and the session that ran it |
+| `user_name`, `role` | Who ran it, and their built-in role then |
+| `start_time`, `end_time`, `duration_ms` | When it ran, and for how long, including sending results |
+| `outcome`, `sqlstate` | `ok`, `error`, `denied` or `canceled`, and the error's SQLSTATE |
+| `row_count` | Rows returned or changed, when known |
+| `statement_type` | Such as `SELECT`, `CREATE TABLE` or `GRANT` |
+| `query_text` | The statement as sent, with passwords and secrets replaced by `'***'` |
+| `tables_read`, `tables_written` | Catalog tables the statement used, when Igloo checked them against grants; `NULL` otherwise |
+| `client_address`, `application_name` | Where the session came from |
+
+`igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
+`failure`), `reason`, `client_address`, `application_name` and `session_id`.
+History is kept for `IGLOO_AUDIT_RETENTION` (90 days by default). Rows arrive
+in the background, usually within a second or two of the statement ending.
+Reading the views fetches history page by page, so `LIMIT` without `ORDER BY`
+reads only the newest pages; filters and sorts read everything visible.
 
 ## Time travel
 
@@ -167,8 +278,10 @@ name is ignored.
   stored procedures, triggers, sequences on Iceberg tables, `LISTEN/NOTIFY`
   and row-level security are not available.
 - Users, roles and passwords are managed with `CREATE USER`, `ALTER USER`,
-  `DROP USER` and `SHOW USERS` (see [operations](operations.md#users-and-roles));
-  `GRANT` and `REVOKE` are not supported.
+  `DROP USER` and `SHOW USERS` (see [operations](operations.md#users-and-roles)).
+  `GRANT` and `REVOKE` cover tables and schemas of the Iceberg catalog (see
+  [roles and grants](#roles-and-grants)); there are no column privileges,
+  `GRANT OPTION`, `USAGE` or roles granted to roles.
 - Only admins may send several statements in one query string.
 - Session settings that PostgreSQL drivers send on connect
   (`application_name`, `extra_float_digits`, `DateStyle` and similar) are

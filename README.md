@@ -72,13 +72,19 @@ the official TPC-H answers.
 - **Iceberg tables** with `CREATE [OR REPLACE] TABLE`, `CREATE TABLE AS`,
   `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, schemas, views, comments,
   and time travel (`SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-01 00:00')`).
-- **Users and roles**: SCRAM-SHA-256 passwords and three roles managed in SQL.
+- **Users, roles and grants**: SCRAM-SHA-256 passwords, built-in roles for
+  the whole warehouse, and custom roles with grants on schemas and tables,
+  all managed in SQL.
 
   ```sql
-  CREATE USER ana WITH PASSWORD 'a-long-password' ROLE writer;  -- admin, writer or reader
-  ALTER USER ana ROLE reader;
-  SHOW USERS;
+  CREATE USER ana WITH PASSWORD 'a-long-password' ROLE writer;  -- admin, writer, reader or none
+  CREATE USER nora WITH PASSWORD 'another-password' ROLE none;
+  CREATE ROLE analysts;
+  GRANT analysts TO nora;
+  GRANT SELECT ON SCHEMA marts TO analysts;
   ```
+- **Query and login history** in `igloo.query_history` and
+  `igloo.login_history`: every statement and login, kept for 90 days.
 - **A locked-down query engine**: SQL cannot read the server's files or reach
   any location except the warehouse and locations you allow.
 - **Automatic table maintenance**: small files are compacted, snapshots older
@@ -126,9 +132,9 @@ local store; see the bottom of `deploy/single-vm/.env`.
 ```
 
 - **igloo** (this repository, Go) accepts Postgres connections, checks each
-  statement against the user's role, and runs it on an embedded DuckDB
-  attached to the catalog. On start it sets up the catalog and warehouse
-  itself, so every deployment works the same way.
+  statement against the user's role and grants, and runs it on an embedded
+  DuckDB attached to the catalog. On start it sets up the catalog and
+  warehouse itself, so every deployment works the same way.
 - **[Lakekeeper](https://github.com/lakekeeper/lakekeeper)** is the Iceberg
   REST catalog: it tracks tables, schemas and snapshots. Only Igloo talks to
   it.
@@ -161,8 +167,9 @@ PostgreSQL License).
 - **One engine per query.** Each query runs on one Igloo replica. Scale up
   with bigger machines and out with more replicas; very large queries that
   need a cluster are not supported yet.
-- **Roles apply to the whole warehouse.** There are no per-schema or per-table
-  grants yet.
+- **Grants stop at tables.** Views run with the querying user's privileges,
+  and there are no column masks, row filters or column privileges yet. Table
+  and column names are visible to every user.
 - **Keys are not enforced.** `PRIMARY KEY` and `UNIQUE` on Iceberg tables are
   accepted but not checked, so duplicates are possible. `NOT NULL` is
   enforced.
@@ -171,7 +178,8 @@ PostgreSQL License).
 
 ```
 cmd/igloo/          server entry point and subcommands
-internal/auth/      users, roles, SCRAM verifiers
+internal/audit/     query and login history
+internal/auth/      users, roles, grants, SCRAM verifiers
 internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox

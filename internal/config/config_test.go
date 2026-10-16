@@ -38,6 +38,32 @@ func TestLoadDefaults(t *testing.T) {
 	if m := cfg.Maintenance; !m.Enabled || m.Interval != time.Hour || m.Retention != 7*24*time.Hour {
 		t.Errorf("unexpected maintenance defaults: %+v", m)
 	}
+	if a := cfg.Audit; !a.Enabled || a.Retention != 90*24*time.Hour {
+		t.Errorf("unexpected audit defaults: %+v", a)
+	}
+}
+
+func TestAudit(t *testing.T) {
+	cfg, err := Load(env(map[string]string{
+		"IGLOO_ADMIN_PASSWORD":  "password",
+		"IGLOO_AUDIT":           "false",
+		"IGLOO_AUDIT_RETENTION": "36h",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := cfg.Audit; a.Enabled || a.Retention != 36*time.Hour {
+		t.Errorf("got %+v", a)
+	}
+	for _, kv := range [][2]string{
+		{"IGLOO_AUDIT", "maybe"},
+		{"IGLOO_AUDIT_RETENTION", "0"},
+		{"IGLOO_AUDIT_RETENTION", "forever"},
+	} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", kv[0]: kv[1]})); err == nil {
+			t.Errorf("%s=%s accepted", kv[0], kv[1])
+		}
+	}
 }
 
 func TestMaintenance(t *testing.T) {

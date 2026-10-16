@@ -40,13 +40,38 @@ reference for every setting mentioned here.
   administrator is created from `IGLOO_ADMIN_PASSWORD` on first start; users
   and roles are stored in the PostgreSQL database named by
   `IGLOO_METADATA_DATABASE_URL`.
-- **Roles.** `admin` can do everything, including managing users. `writer` can
-  read and write tables and create and drop tables and schemas. `reader` can
-  read tables. Each statement is checked before it runs, using DuckDB's own
-  classification of the statement plus its SQL code (never its comments or
-  literals); anything Igloo cannot classify needs `admin`. Non-admins may send
-  only one statement per query, and their `SET` commands apply to their own
-  session only.
+- **Roles.** Every user has one built-in role. `admin` can do everything,
+  including managing users, roles and grants. `writer` can read and write
+  tables and create and drop tables and schemas. `reader` can read tables.
+  `none` can do nothing on its own. Each statement is checked before it runs,
+  using DuckDB's own classification of the statement plus its SQL code (never
+  its comments or literals); anything Igloo cannot classify needs `admin`.
+  Non-admins may send only one statement per query, and their `SET` commands
+  apply to their own session only.
+- **Grants.** Admins grant `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables
+  and schemas, and `CREATE` on schemas, to users or to custom roles. A
+  statement the built-in role does not allow runs only if every catalog
+  table it touches is granted. The table it writes comes from its text,
+  resolved along the session's search path; every object the name could
+  mean must be granted. What it reads, for users with role `none`, comes
+  from DuckDB: Igloo parses the statement with DuckDB's own parser, resolves
+  and expands views the way DuckDB does, and checks the result against
+  DuckDB's plan of the statement, which must scan exactly as many catalog
+  tables as the parse found. A statement whose reads cannot be accounted for
+  is refused. Users with role `none` may not call functions that read files
+  or take a table's name (`read_parquet`, `iceberg_scan`, `query_table` and
+  the like), nor macros an admin defined, since those could read data
+  without naming it. Views run with the querying user's privileges. Grants
+  never allow what needs `admin`. A prepared statement is checked again
+  before it runs when grants, the catalog or the session's settings changed,
+  so replacing a view or changing `search_path` cannot widen it. Table and
+  column names are visible to every user through the system catalogs.
+- **History.** Every statement (with passwords and secrets removed) and
+  every login attempt is recorded in the metadata database, schema
+  `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history
+  through `igloo.query_history` and `igloo.login_history`; only admins see
+  others'. The functions behind the views decide what to show from the
+  session running them, so calling them directly shows no more.
 - **Query sandbox.** Queries run in an embedded DuckDB that cannot read or
   write files on the server's local disk and cannot reach any URL outside the
   warehouse location and the prefixes in `IGLOO_ALLOWED_LOCATIONS`. DuckDB

@@ -4,11 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -153,6 +155,80 @@ func rewriteSessionUser(query, user string) string {
 	return sqllex.MapCode(query, func(code string) string {
 		return sessionUser.ReplaceAllLiteralString(code, name)
 	})
+}
+
+// historyViews are the views of the history, in the local database's
+// schema engine.HistorySchema.
+var historyViews = []string{"query_history", "login_history"}
+
+// rewriteHistoryRefs points igloo.query_history and igloo.login_history at
+// the local database, where the views are, whatever the session's search
+// path. Literals, comments and every other name are left as written.
+func rewriteHistoryRefs(query, local string) string {
+	lower := strings.ToLower(query)
+	if !strings.Contains(lower, engine.HistorySchema) || !strings.Contains(lower, "_history") {
+		return query
+	}
+	type tok struct {
+		start, end int
+		name       string
+		dot        bool
+	}
+	var toks []tok
+	pos := 0
+	for _, seg := range sqllex.Segments(query) {
+		start := pos
+		pos += len(seg.Text)
+		switch seg.Kind {
+		case sqllex.Ident:
+			if len(seg.Text) >= 2 {
+				toks = append(toks, tok{start: start, end: pos, name: strings.ReplaceAll(seg.Text[1:len(seg.Text)-1], `""`, `"`)})
+			}
+		case sqllex.Code:
+			for i := 0; i < len(seg.Text); {
+				c := seg.Text[i]
+				switch {
+				case unicode.IsSpace(rune(c)):
+					i++
+				case c == '.':
+					toks = append(toks, tok{start: start + i, end: start + i + 1, dot: true})
+					i++
+				case sqllex.IdentByte(c) && (c < '0' || c > '9'):
+					j := i
+					for j < len(seg.Text) && sqllex.IdentByte(seg.Text[j]) {
+						j++
+					}
+					toks = append(toks, tok{start: start + i, end: start + j, name: seg.Text[i:j]})
+					i = j
+				default:
+					toks = append(toks, tok{start: start + i, end: start + i + 1})
+					i++
+				}
+			}
+		default:
+			toks = append(toks, tok{start: start, end: pos})
+		}
+	}
+
+	isView := func(name string) bool {
+		return slices.ContainsFunc(historyViews, func(v string) bool { return strings.EqualFold(v, name) })
+	}
+	var out strings.Builder
+	last := 0
+	for i := 0; i+2 < len(toks); i++ {
+		if !strings.EqualFold(toks[i].name, engine.HistorySchema) || i > 0 && toks[i-1].dot ||
+			!toks[i+1].dot || !isView(toks[i+2].name) || i+3 < len(toks) && toks[i+3].dot {
+			continue
+		}
+		out.WriteString(query[last:toks[i].start])
+		out.WriteString(quoteIdent(local) + "." + quoteIdent(engine.HistorySchema))
+		last = toks[i].end
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
 }
 
 // sessionCatalogSetup creates, for one session, the PostgreSQL catalog
@@ -314,10 +390,18 @@ const pgCatalogNamespace = 11
 // its temp database. Ibis looks temporary views up there.
 const pgTempNamespace = 99
 
+// pgNamespaceView adds to DuckDB's pg_namespace, which lists the current
+// database's schemas, pg_catalog, pg_temp and the local database's schema
+// of the history views, so clients list those as igloo.query_history and
+// igloo.login_history.
 var pgNamespaceView = fmt.Sprintf(`CREATE OR REPLACE TEMP VIEW pg_namespace AS
 	SELECT * FROM pg_catalog.pg_namespace
 	UNION ALL SELECT %d, 'pg_catalog', 0, NULL
-	UNION ALL SELECT %d, 'pg_temp', 0, NULL`, pgCatalogNamespace, pgTempNamespace)
+	UNION ALL SELECT %d, 'pg_temp', 0, NULL
+	UNION ALL SELECT oid, schema_name, 0, NULL FROM duckdb_schemas()
+		WHERE schema_name = '%s' AND database_name NOT IN (current_database(), 'temp', 'system')
+		AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '%[3]s')`,
+	pgCatalogNamespace, pgTempNamespace, engine.HistorySchema)
 
 // pgTypes lists the PostgreSQL types Igloo sends: oid, name, length and
 // category.

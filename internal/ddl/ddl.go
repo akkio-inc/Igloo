@@ -63,6 +63,8 @@ type Manager struct {
 	views map[key]catalog.View
 	// known is the set of view keys, read without locking by IsView.
 	known atomic.Pointer[map[key]bool]
+	// gen counts changes to the local copies; see Generation.
+	gen atomic.Uint64
 
 	commentsMu sync.Mutex
 	commentsAt time.Time
@@ -121,6 +123,11 @@ func (m *Manager) IsView(schema, name string) bool {
 	return (*m.known.Load())[keyOf(schema, name)]
 }
 
+// Generation changes whenever a local copy of a view may have changed, so
+// callers can tell that statements reading views may now read other
+// tables.
+func (m *Manager) Generation() uint64 { return m.gen.Load() }
+
 // SyncViews makes the local copies match the catalog's views. changed says
 // whether anything changed.
 func (m *Manager) SyncViews(ctx context.Context) (changed bool, err error) {
@@ -130,6 +137,11 @@ func (m *Manager) SyncViews(ctx context.Context) (changed bool, err error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer func() {
+		if changed {
+			m.gen.Add(1)
+		}
+	}()
 
 	want := map[key]catalog.View{}
 	for _, v := range defs {
@@ -202,6 +214,7 @@ func (m *Manager) publish(extra map[key]catalog.View) {
 func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, name string, columns []string, query string, replace bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.gen.Add(1)
 	k := keyOf(schema, name)
 
 	exists, err := m.cat.CheckTableExists(ctx, catalog.Ident(schema, name))
@@ -270,6 +283,7 @@ func (m *Manager) restore(ctx context.Context, k key, schema, name string) {
 func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.gen.Add(1)
 	k := keyOf(schema, name)
 
 	err := m.cat.DropView(ctx, catalog.Ident(schema, name))

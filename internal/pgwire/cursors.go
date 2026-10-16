@@ -59,7 +59,7 @@ func unquoteName(s string) string {
 // cursorCommand handles DECLARE, FETCH and CLOSE.
 func (s *Server) cursorCommand(ctx context.Context, sess *session, user auth.User, q wire.Query) (wire.PreparedStatements, bool, error) {
 	if m := declareCursor.FindStringSubmatch(q.Query); m != nil {
-		ps, err := s.declareCursor(ctx, sess, user, unquoteName(m[1]), strings.EqualFold(m[2], "WITH"), m[3], q.ParameterOIDs)
+		ps, err := s.declareCursor(ctx, sess, user, unquoteName(m[1]), strings.EqualFold(m[2], "WITH"), m[3], q.ParameterOIDs, q.Query)
 		return ps, true, err
 	}
 	if m := fetchCursor.FindStringSubmatch(q.Query); m != nil && !strings.EqualFold(m[3], "ALL") {
@@ -76,18 +76,18 @@ func (s *Server) cursorCommand(ctx context.Context, sess *session, user auth.Use
 		default:
 			limit = 1
 		}
-		return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 			n, err := c.fetch(w, limit)
 			if err != nil {
 				return pgError(err)
 			}
 			return w.Complete(fmt.Sprintf("FETCH %d", n))
-		}, wire.WithColumns(c.st.columns))), true, nil
+		}), wire.WithColumns(c.st.columns))), true, nil
 	}
 	if m := closeCursor.FindStringSubmatch(q.Query); m != nil {
 		all := strings.EqualFold(m[1], "ALL")
 		name := unquoteName(m[1])
-		return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 			if all {
 				sess.closeCursors(ctx, true)
 				return w.Complete("CLOSE CURSOR ALL")
@@ -97,12 +97,13 @@ func (s *Server) cursorCommand(ctx context.Context, sess *session, user auth.Use
 			}
 			sess.closeCursor(ctx, name)
 			return w.Complete("CLOSE CURSOR")
-		})), true, nil
+		}))), true, nil
 	}
 	return nil, false, nil
 }
 
-func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.User, name string, hold bool, query string, oids []uint32) (wire.PreparedStatements, error) {
+// text is the whole DECLARE statement, for the history.
+func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.User, name string, hold bool, query string, oids []uint32, text string) (wire.PreparedStatements, error) {
 	st, err := s.prepareStatement(ctx, sess, user, query, oids)
 	if err != nil {
 		return nil, err
@@ -113,13 +114,16 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 	}
 
 	var ps *wire.PreparedStatement
-	ps = wire.NewStatement(func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
+	ps = wire.NewStatement(s.audited(sess, text, func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
 		if _, ok := sess.cursors[name]; ok {
 			return pgerror.WithCode(fmt.Errorf("cursor %q already exists", name), codes.DuplicateCursor)
 		}
 		args, err := decodeParams(params, st.params)
 		if err != nil {
 			return pgerror.WithCode(err, codes.InvalidTextRepresentation)
+		}
+		if err := s.recheckGrants(ctx, sess, st); err != nil {
+			return err
 		}
 		// The cursor gets a statement of its own, which lives as long as
 		// it does; the one prepared here is released with the DECLARE.
@@ -147,7 +151,7 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 		// same name, as PostgreSQL allows.
 		sess.describePortal(ctx, name, own.columns)
 		return w.Complete("DECLARE CURSOR")
-	}, wire.WithParameters(st.params))
+	}), wire.WithParameters(st.params))
 	sess.open[ps] = st
 	return wire.Prepared(ps), nil
 }

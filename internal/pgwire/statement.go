@@ -27,10 +27,18 @@ type statement struct {
 	stmt     *duckdb.Stmt
 	stmtType duckdb.StmtType
 	query    string
+	// prepared is the text DuckDB prepared: query with array parameters
+	// typed (see typeArrayParams).
+	prepared string
 	kind     kind
 	columns  wire.Columns
 	encoders []encoder
 	params   []uint32
+	// access is set when grants allowed the statement (see access.go).
+	access *access
+	// effect is what the statement, once it succeeds, does to the objects
+	// grants name.
+	effect *grantEffect
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client
@@ -45,7 +53,7 @@ func prepare(ctx context.Context, conn *duckdb.Conn, query string, clientOIDs []
 		return nil, err
 	}
 
-	st := &statement{stmt: ds.(*duckdb.Stmt), query: query}
+	st := &statement{stmt: ds.(*duckdb.Stmt), query: query, prepared: typed}
 	if err := st.describe(oids); err != nil {
 		return nil, errors.Join(err, st.close())
 	}

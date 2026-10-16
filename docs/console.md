@@ -39,8 +39,9 @@ without those views the page says that history is not available.
 drop users.
 
 **Roles and grants** (admins). Lists roles and grants with `SHOW ROLES` and
-`SHOW GRANTS`, and runs `GRANT`, `REVOKE`, `CREATE ROLE`, `ALTER ROLE` and
-`DROP ROLE`. On a server without custom roles the page says so.
+`SHOW GRANTS`, and runs `GRANT`, `REVOKE`, `CREATE ROLE` and `DROP ROLE`
+(see [roles and grants](sql.md#roles-and-grants)). On a server without
+custom roles the page says so.
 
 **Compute** (admins). This replica's version and uptime, its open sessions
 (SQL clients and console requests alike) with the statements running in

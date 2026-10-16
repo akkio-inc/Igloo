@@ -30,14 +30,30 @@ type userCommand struct {
 	ifExists bool
 	// currentUser is set for ALTER USER CURRENT_USER.
 	currentUser bool
+	// acl, when set, makes this a role or grant command instead (see
+	// grants.go).
+	acl *aclCommand
+}
+
+// columns describes the rows the command sends, if any.
+func (c userCommand) columns() wire.Columns {
+	switch {
+	case c.acl != nil:
+		return c.acl.columns()
+	case c.verb == "SHOW":
+		return userColumns
+	}
+	return nil
 }
 
 // parseUserCommands recognises queries made of user-management statements:
 //
-//	CREATE USER name [WITH] PASSWORD 'secret' [ROLE admin|writer|reader]
+//	CREATE USER name [WITH] PASSWORD 'secret' [ROLE admin|writer|reader|none]
 //	ALTER USER name|CURRENT_USER [WITH] [PASSWORD 'secret'] [ROLE role]
 //	DROP USER [IF EXISTS] name
 //	SHOW USERS
+//
+// and the role and grant statements of grants.go.
 //
 // ok is false when the query holds none. err reports a malformed command,
 // or one mixed with other SQL, which DuckDB would reject anyway.
@@ -83,6 +99,12 @@ func parseUserCommands(query string) (cmds []userCommand, ok bool, err error) {
 // parseUserCommand parses one statement's tokens. ok is false when it is not
 // a user-management statement.
 func parseUserCommand(toks []token) (cmd userCommand, ok bool, err error) {
+	if acl, ok, err := parseACLCommand(toks); ok {
+		if err != nil {
+			return userCommand{}, true, err
+		}
+		return userCommand{verb: acl.verb(), acl: acl}, true, nil
+	}
 	if len(toks) < 2 {
 		return cmd, false, nil
 	}
@@ -168,6 +190,9 @@ func parseUserCommand(toks []token) (cmd userCommand, ok bool, err error) {
 
 // runUserCommand executes cmd on behalf of sess and writes the result to w.
 func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userCommand, w wire.DataWriter) error {
+	if cmd.acl != nil {
+		return s.runACLCommand(ctx, sess, cmd.acl, w)
+	}
 	me := sess.currentUser()
 	isAdmin := me.Role == auth.RoleAdmin
 	if cmd.currentUser {
@@ -214,6 +239,13 @@ func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userComm
 		if cmd.role != nil {
 			role = *cmd.role
 		}
+		// Users and custom roles share names. The Postgres store checks
+		// this itself, atomically; this covers the others.
+		if isRole, rerr := s.isCustomRole(ctx, cmd.name); rerr != nil {
+			return rerr
+		} else if isRole {
+			return userStoreError(auth.ErrNameTaken, cmd.name)
+		}
 		err = s.users.Create(ctx, auth.User{Name: cmd.name, Role: role, Verifier: verifier})
 	case "ALTER":
 		if cmd.role != nil {
@@ -224,6 +256,13 @@ func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userComm
 		}
 	case "DROP":
 		err = s.users.Delete(ctx, cmd.name)
+		if err == nil {
+			// The Postgres store drops them with the user; other stores
+			// keep grants apart.
+			if ferr := s.grants.ForgetUser(ctx, cmd.name); ferr != nil {
+				s.log.Warn("could not remove a dropped user's grants", "user", cmd.name, "err", ferr)
+			}
+		}
 		if errors.Is(err, auth.ErrNotFound) && cmd.ifExists {
 			err = nil
 		}
@@ -267,6 +306,8 @@ func userStoreError(err error, name string) error {
 		return pgerror.WithCode(fmt.Errorf("user %q does not exist", name), codes.UndefinedObject)
 	case errors.Is(err, auth.ErrExists):
 		return pgerror.WithCode(fmt.Errorf("user %q already exists", name), codes.DuplicateObject)
+	case errors.Is(err, auth.ErrNameTaken):
+		return pgerror.WithCode(fmt.Errorf("a user or role named %q already exists", name), codes.DuplicateObject)
 	case errors.Is(err, auth.ErrReadOnly), errors.Is(err, auth.ErrLastAdmin):
 		return pgerror.WithCode(err, codes.FeatureNotSupported)
 	}
@@ -282,6 +323,8 @@ const (
 	tokQuoted
 	tokString
 	tokSemicolon
+	tokDot
+	tokComma
 )
 
 type token struct {
@@ -305,8 +348,8 @@ func (t token) ident() string {
 	return t.text
 }
 
-// tokenize splits SQL into words, "quoted" identifiers, 'string' literals
-// and semicolons, ignoring comments.
+// tokenize splits SQL into words, "quoted" identifiers, 'string' literals,
+// semicolons, dots and commas, ignoring comments.
 func tokenize(query string) ([]token, error) {
 	var toks []token
 	s := []rune(query)
@@ -317,6 +360,12 @@ func tokenize(query string) ([]token, error) {
 			i++
 		case r == ';':
 			toks = append(toks, token{kind: tokSemicolon, text: ";"})
+			i++
+		case r == '.':
+			toks = append(toks, token{kind: tokDot, text: "."})
+			i++
+		case r == ',':
+			toks = append(toks, token{kind: tokComma, text: ","})
 			i++
 		case r == '-' && i+1 < len(s) && s[i+1] == '-':
 			for i < len(s) && s[i] != '\n' {

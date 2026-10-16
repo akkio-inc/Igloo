@@ -25,6 +25,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   stored in PostgreSQL so every replica shares them.
 - A query sandbox: SQL cannot read the server's files or reach locations
   outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`.
+- Grants: `CREATE ROLE`, `DROP ROLE`, `GRANT role TO user`, and `GRANT` and
+  `REVOKE` of `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `CREATE` on tables,
+  views, schemas and `ALL TABLES IN SCHEMA`, to users or custom roles;
+  `SHOW ROLES` and `SHOW GRANTS`. A new built-in role, `none`, allows only
+  what is granted. Grants on a schema cover tables created later, and views
+  run with the querying user's privileges.
+- Query and login history: every statement and login attempt, with its
+  outcome, duration, rows and the tables it used, in `igloo.query_history`
+  and `igloo.login_history`. Admins see everyone's history, other users
+  their own. Kept in the metadata database for `IGLOO_AUDIT_RETENTION` (90
+  days); `IGLOO_AUDIT=false` turns it off. Passwords are never recorded.
 - Views on the Iceberg catalog (`CREATE [OR REPLACE] VIEW`, `DROP VIEW`),
   stored as Iceberg views and kept in sync across replicas.
 - `CREATE OR REPLACE TABLE` on Iceberg tables.

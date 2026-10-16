@@ -15,7 +15,8 @@ import (
 	"github.com/xdg-go/scram"
 )
 
-// Role decides what a user may do.
+// Role is a user's built-in role, which decides what they may do across the
+// whole warehouse. Grants (see Grant) add to it.
 type Role string
 
 const (
@@ -25,15 +26,25 @@ const (
 	RoleWriter Role = "writer"
 	// RoleReader may only read.
 	RoleReader Role = "reader"
+	// RoleNone may do nothing across the warehouse: only what grants allow,
+	// and reading the system catalogs.
+	RoleNone Role = "none"
 )
 
 // ParseRole validates a role name.
 func ParseRole(s string) (Role, error) {
 	switch r := Role(strings.ToLower(s)); r {
-	case RoleAdmin, RoleWriter, RoleReader:
+	case RoleAdmin, RoleWriter, RoleReader, RoleNone:
 		return r, nil
 	}
-	return "", fmt.Errorf("unknown role %q; use admin, writer or reader", s)
+	return "", fmt.Errorf("unknown role %q; use admin, writer, reader or none", s)
+}
+
+// IsBuiltinRole reports whether name is a built-in role, which custom roles
+// may not be named after.
+func IsBuiltinRole(name string) bool {
+	_, err := ParseRole(name)
+	return err == nil
 }
 
 // User is an account clients log in as.
@@ -48,6 +59,9 @@ type User struct {
 var (
 	ErrNotFound = errors.New("user does not exist")
 	ErrExists   = errors.New("user already exists")
+	// ErrNameTaken is returned when a user would get the name of a custom
+	// role, or a custom role the name of a user: grants name either.
+	ErrNameTaken = errors.New("a user or role of that name already exists")
 	// ErrReadOnly is returned by stores that cannot change users.
 	ErrReadOnly = errors.New("user management needs IGLOO_METADATA_DATABASE_URL")
 	// ErrLastAdmin prevents locking everyone out.

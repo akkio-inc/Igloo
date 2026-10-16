@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	"github.com/akkio-inc/igloo/internal/activity"
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
@@ -130,12 +131,40 @@ func serve() error {
 		defer objects.Close() //nolint:errcheck
 		go objects.Run(ctx)
 	}
+	var historyStore audit.Store
+	if cfg.Audit.Enabled {
+		if historyStore, err = openHistory(startCtx, cfg, log); err != nil {
+			return err
+		}
+		defer historyStore.Close()
+	}
 	cancel()
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	reg.MustRegister(eng.Metrics()...)
 	work := activity.New()
+
+	// The history is written in the background until the server has shut
+	// down, then flushed.
+	var history *audit.Log
+	historyDone := make(chan struct{})
+	historyCtx, stopHistory := context.WithCancel(context.Background())
+	if historyStore != nil {
+		history = audit.New(historyStore, audit.Options{Retention: cfg.Audit.Retention, Metrics: audit.NewMetrics(reg)}, log)
+		eng.SetHistory(history, pgwire.HistoryViewer)
+		go func() {
+			defer close(historyDone)
+			history.Run(historyCtx)
+		}()
+	} else {
+		close(historyDone)
+	}
+	defer func() {
+		stopHistory()
+		<-historyDone
+	}()
+
 	srv, err := pgwire.New(eng, pgwire.Options{
 		Users:            users,
 		TLS:              tlsConfig,
@@ -146,6 +175,7 @@ func serve() error {
 		Version:          version,
 		DDL:              objects,
 		Activity:         work,
+		Audit:            history,
 	}, log)
 	if err != nil {
 		return err
@@ -263,6 +293,22 @@ func openUsers(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.S
 	if created {
 		log.Info("created admin user", "user", cfg.AdminUser)
 	}
+	return store, nil
+}
+
+// openHistory opens where the query and login history is kept: the
+// metadata database, shared by every replica, or else this replica's
+// memory.
+func openHistory(ctx context.Context, cfg config.Config, log *slog.Logger) (audit.Store, error) {
+	if cfg.MetadataDatabaseURL == "" {
+		log.Warn("IGLOO_METADATA_DATABASE_URL is not set; each replica keeps only its own recent query and login history, in memory")
+		return audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins), nil
+	}
+	store, err := audit.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("query history: %w", err)
+	}
+	log.Info("query and login history is on", "retention", cfg.Audit.Retention)
 	return store, nil
 }
 

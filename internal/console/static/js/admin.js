@@ -5,7 +5,7 @@
 import * as api from './api.js';
 import { h, clear, icon, button, fmtTime, fmtAgo, fmtMs, plural, roleBadge, toast, dialog, confirmDialog, mark } from './dom.js';
 
-const ROLES = ['reader', 'writer', 'admin'];
+const ROLES = ['none', 'reader', 'writer', 'admin'];
 const NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 
 function errorView(e) {

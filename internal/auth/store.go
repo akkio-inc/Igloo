@@ -97,6 +97,11 @@ type PostgresStore struct {
 // the same time. The value is arbitrary but fixed.
 const migrationLock = 7_440_011_001
 
+// namesLock serializes changes that create or drop users and custom roles,
+// which share one namespace, with grants that name them, so a grant never
+// outlives its grantee.
+const namesLock = 7_440_011_002
+
 var migrations = []string{
 	`CREATE SCHEMA IF NOT EXISTS igloo_auth`,
 	`CREATE TABLE IF NOT EXISTS igloo_auth.users (
@@ -110,6 +115,50 @@ var migrations = []string{
 		name  text PRIMARY KEY,
 		value bytea NOT NULL
 	)`,
+	// Allow the built-in role none. Older versions created the role check
+	// without it; replace that check once, so later starts change nothing.
+	// Older replicas still running read a user with role none as having no
+	// role at all, and refuse their statements.
+	`DO $$
+	DECLARE c record;
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint
+				WHERE conrelid = 'igloo_auth.users'::regclass AND conname = 'users_role_check'
+				AND pg_get_constraintdef(oid) LIKE '%''none''%') THEN
+			FOR c IN SELECT conname FROM pg_constraint
+					WHERE conrelid = 'igloo_auth.users'::regclass AND contype = 'c'
+					AND pg_get_constraintdef(oid) LIKE '%role%' LOOP
+				EXECUTE format('ALTER TABLE igloo_auth.users DROP CONSTRAINT %I', c.conname);
+			END LOOP;
+			ALTER TABLE igloo_auth.users ADD CONSTRAINT users_role_check
+				CHECK (role IN ('admin', 'writer', 'reader', 'none'));
+		END IF;
+	END $$`,
+	`CREATE TABLE IF NOT EXISTS igloo_auth.roles (
+		name       text PRIMARY KEY,
+		created_at timestamptz NOT NULL DEFAULT now()
+	)`,
+	`CREATE TABLE IF NOT EXISTS igloo_auth.role_members (
+		role       text NOT NULL REFERENCES igloo_auth.roles (name) ON DELETE CASCADE,
+		member     text NOT NULL REFERENCES igloo_auth.users (name) ON DELETE CASCADE,
+		granted_by text NOT NULL DEFAULT '',
+		granted_at timestamptz NOT NULL DEFAULT now(),
+		PRIMARY KEY (role, member)
+	)`,
+	`CREATE INDEX IF NOT EXISTS role_members_member ON igloo_auth.role_members (member)`,
+	// A grant to a user or custom role on a schema (table_name '') or on a
+	// table or view. Grantees are deleted with the user or role.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.grants (
+		grantee      text NOT NULL,
+		grantee_type text NOT NULL CHECK (grantee_type IN ('user', 'role')),
+		privilege    text NOT NULL CHECK (privilege IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE')),
+		schema_name  text NOT NULL,
+		table_name   text NOT NULL DEFAULT '',
+		granted_by   text NOT NULL DEFAULT '',
+		granted_at   timestamptz NOT NULL DEFAULT now(),
+		PRIMARY KEY (grantee_type, grantee, privilege, schema_name, table_name)
+	)`,
+	`CREATE INDEX IF NOT EXISTS grants_object ON igloo_auth.grants (lower(schema_name), lower(table_name))`,
 }
 
 // OpenPostgresStore connects to url and creates Igloo's tables if needed.
@@ -164,8 +213,21 @@ func (s *PostgresStore) List(ctx context.Context) ([]User, error) {
 }
 
 func (s *PostgresStore) Create(ctx context.Context, u User) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO igloo_auth.users (name, role, verifier) VALUES ($1, $2, $3)`, u.Name, u.Role, u.Verifier)
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockNames(ctx, tx); err != nil {
+			return err
+		}
+		var isRole bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM igloo_auth.roles WHERE name = $1)`, u.Name).Scan(&isRole); err != nil {
+			return err
+		}
+		if isRole {
+			return ErrNameTaken
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO igloo_auth.users (name, role, verifier) VALUES ($1, $2, $3)`, u.Name, u.Role, u.Verifier)
+		return err
+	})
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return ErrExists
@@ -198,16 +260,26 @@ func (s *PostgresStore) SetRole(ctx context.Context, name string, role Role) err
 	})
 }
 
+// Delete removes the user with their memberships (by cascade) and grants.
 func (s *PostgresStore) Delete(ctx context.Context, name string) error {
 	return s.changeAdmins(ctx, name, func(tx pgx.Tx) (pgconn.CommandTag, error) {
-		return tx.Exec(ctx, `DELETE FROM igloo_auth.users WHERE name = $1`, name)
+		tag, err := tx.Exec(ctx, `DELETE FROM igloo_auth.users WHERE name = $1`, name)
+		if err != nil || tag.RowsAffected() == 0 {
+			return tag, err
+		}
+		_, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, name)
+		return tag, err
 	})
 }
 
 // changeAdmins applies change and rolls it back if no admin would remain.
 // The table lock stops two concurrent demotions from both passing the check.
+// The names lock comes first, as in every transaction that takes both.
 func (s *PostgresStore) changeAdmins(ctx context.Context, name string, change func(pgx.Tx) (pgconn.CommandTag, error)) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockNames(ctx, tx); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `LOCK TABLE igloo_auth.users IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 			return err
 		}

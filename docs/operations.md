@@ -19,13 +19,17 @@ DROP USER IF EXISTS ana;
 SHOW USERS;                                            -- admins see everyone
 ```
 
+Every user has one built-in role, which applies to the whole warehouse:
+
 | Role | Can |
 |---|---|
+| `none` | Nothing on its own: only what [grants](#grants) allow, plus reading the system catalogs and their own history |
 | `reader` | Run queries and `EXPLAIN`, and change their own session settings such as `search_path` and `TimeZone` |
 | `writer` | Everything a reader can, plus `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`, creating, altering and dropping tables, views and schemas, comments, and table properties such as snapshot retention |
-| `admin` | Everything, including users, secrets, `ATTACH`, global settings, `EXPLAIN ANALYZE`, and several statements in one query |
+| `admin` | Everything, including users, roles and grants, secrets, `ATTACH`, global settings, `EXPLAIN ANALYZE`, and several statements in one query |
 
-Settings a reader or writer changes with `SET` apply to their own session only.
+`CREATE USER` without `ROLE` makes a reader. Settings a non-admin changes
+with `SET` apply to their own session only.
 
 - Passwords must be at least 8 characters. Igloo stores SCRAM-SHA-256
   verifiers, never passwords. psql's `\password` works and sends a verifier
@@ -38,6 +42,76 @@ Settings a reader or writer changes with `SET` apply to their own session only.
 - Igloo refuses to remove or demote the last admin.
 - Admins can do the same on the [web console](console.md)'s Users page,
   which runs these statements as them.
+
+### Grants
+
+Grants give users access to particular schemas and tables, beyond their
+built-in role: give a user the role `none` and grant what they need, or
+give a reader `INSERT` on the tables they load. Grant to custom roles, and
+give the roles to users:
+
+```sql
+CREATE USER nora WITH PASSWORD 'a-long-password' ROLE none;
+CREATE ROLE analysts;
+GRANT analysts TO nora;
+GRANT SELECT ON SCHEMA marts TO analysts;        -- every table, now and later
+GRANT SELECT, INSERT ON TABLE staging.events TO analysts;
+GRANT CREATE ON SCHEMA sandbox TO nora;           -- create and drop tables there
+SHOW GRANTS TO nora;
+```
+
+[SQL and clients](sql.md#roles-and-grants) describes every statement and
+privilege and what a grant covers. In short:
+
+- A statement runs if the built-in role allows it, or if every table it reads
+  or writes is granted to the user or one of their roles. Users with role
+  `none` need `SELECT` on what they read, views included: a view reads with
+  the querying user's privileges.
+- Users with role `none` cannot read files (`read_parquet`, `iceberg_scan`,
+  `COPY ... FROM` and the like), which could read any table's data files.
+- Grants never allow what needs `admin`, nor writing files.
+- Roles and grants live in the metadata database, next to the users. Changes
+  apply at once on the replica that made them and within 30 seconds on the
+  others, as role changes do.
+- For users with role `none`, Igloo plans each statement before running it
+  to see what it reads. That costs a few milliseconds per statement; other
+  roles are not affected. A statement whose reads it cannot account for is
+  refused with SQLSTATE `42501`.
+
+## Query and login history
+
+Igloo records every statement and every login attempt: who, when, how long,
+the outcome and SQLSTATE, rows returned or changed, the statement text,
+the tables it read and wrote (for statements checked against grants), and
+the client's address and `application_name`. Read them with SQL:
+
+```sql
+SELECT start_time, user_name, outcome, duration_ms, query_text
+FROM igloo.query_history ORDER BY start_time DESC LIMIT 50;
+SELECT * FROM igloo.login_history WHERE result = 'failure';
+```
+
+[SQL and clients](sql.md#query-history) lists the columns. Admins see every
+record; other users see only their own, whichever way they read them.
+Passwords never reach the history: string literals of user-management
+statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
+
+- With `IGLOO_METADATA_DATABASE_URL`, history is kept in its schema
+  `igloo_audit` and shared by all replicas. Records are written in the
+  background in batches of up to a thousand, about once a second.
+- Records older than `IGLOO_AUDIT_RETENTION` (90 days by default) are
+  deleted every hour, by one replica at a time.
+- Without a metadata database, each replica keeps its latest 10,000
+  statements and 10,000 logins in memory, lost on restart.
+- Recording never slows down or fails a statement. If the metadata database
+  is unavailable or falls behind, records are dropped: the log warns
+  (`dropped history records`, at most once a minute) and
+  `igloo_audit_dropped_total` counts them.
+- `IGLOO_AUDIT=false` turns recording off.
+- The views read the history page by page, newest first; `LIMIT` without
+  `ORDER BY` reads only the newest pages, while other filters and sorts read
+  everything visible. To analyze months of history from a busy warehouse,
+  query `igloo_audit.query_history` in the metadata database directly.
 
 ## Sizing
 
@@ -181,6 +255,8 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_queries_total` | `outcome` = `ok`, `error`, `denied`, `canceled` | Statements run |
 | `igloo_query_duration_seconds` | `outcome` | Time to run a statement and send its results |
 | `igloo_logins_total` | `result` = `success`, `failure` | Login attempts |
+| `igloo_audit_written_total` | `kind` = `query`, `login` | History records written |
+| `igloo_audit_dropped_total` | `kind` = `query`, `login` | History records dropped because the queue was full or the metadata database failed |
 | `igloo_maintenance_passes_total` | `result` = `ok`, `error` | Table maintenance passes run by this replica |
 | `igloo_maintenance_last_success_timestamp_seconds` | | When this replica last finished a maintenance pass without errors |
 | `igloo_maintenance_compacted_files_total`, `igloo_maintenance_compaction_output_files_total` | | Data files replaced and written by compaction |
@@ -191,11 +267,13 @@ Igloo's metrics, besides the standard Go and process metrics:
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
-`user changed`, `statement denied`, `statement canceled` (from the web
-console's compute page), and refused connections. Sign-ins through the web
-console log `client=console`. Query text and
+`user changed`, `grants changed`, `statement denied`, `statement canceled`
+(from the web console's compute page), and refused connections. Sign-ins
+through the web console log `client=console`. Query text and
 DuckDB error details, which can quote the query, are logged only at debug
 level; user-management statements, which carry passwords, are never logged.
+The [query history](#query-and-login-history) keeps statement text, with
+passwords and secrets removed.
 
 ## Backups
 
@@ -204,7 +282,7 @@ Two things hold state:
 1. **The PostgreSQL database** (`IGLOO_METADATA_DATABASE_URL` and the
    catalog's database, normally the same one). It holds the catalog, which
    maps table names to their current metadata in object storage, and Igloo's
-   users. Back it up like any production database: managed-service backups
+   users, roles, grants and history. Back it up like any production database: managed-service backups
    with point-in-time recovery, or regular `pg_dump`. Losing it loses track of
    every table, even though the data files are still in object storage.
 2. **Object storage.** Table data and Iceberg metadata files. Turn on bucket
@@ -288,6 +366,9 @@ and the catalog runs its database migrations before it serves. Read
 |---|---|
 | `password authentication failed` | Wrong user or password. Unknown users get the same error by design. |
 | SQLSTATE `42501`, `permission denied: X requires the writer role` | The user's role does not allow the statement. An admin can change it with `ALTER USER`. |
+| SQLSTATE `42501`, `permission denied for ana: SELECT on table s.t needs ... a SELECT grant` | Neither the user's role nor their grants allow it. An admin can `GRANT` the privilege named on the table, its schema or one of the user's roles. |
+| SQLSTATE `42501`, `read_parquet reads data that grants do not cover` | Users with role `none` cannot read files or call functions that take a table's name; query the tables instead. |
+| `cannot verify which tables this statement reads` | A user with role `none` sent a statement whose reads Igloo could not account for, such as one through a macro. Rewrite it over tables and views, or give the user the reader role. |
 | `send one statement at a time` | Only admins may send several statements in one query. Most tools send one at a time; for scripts, run them as an admin or split them. |
 | `Permission Error: Cannot access file ...` | The sandbox blocked a file or URL outside the warehouse. To load from or export to another bucket, add it to `IGLOO_ALLOWED_LOCATIONS`. |
 | SQLSTATE `40001`, `CatalogCommitConflicts` | Two writers committed to the same table at once inside explicit transactions. Retry the transaction. |
