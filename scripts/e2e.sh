@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test of the single-machine stack: builds the image, starts an
 # isolated copy of deploy/single-vm (its own project name, image, ports and
-# data), and checks Igloo through real psql clients and the web console.
+# data), and checks Igloo through real psql clients, the web console and
+# Arrow Flight SQL clients.
 # Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT and the
 # E2E_*_PORT variables let several runs share a Docker host.
 #
@@ -13,6 +14,7 @@ project="${E2E_PROJECT:-igloo-e2e}"
 sql_port="${E2E_SQL_PORT:-15433}"
 http_port="${E2E_HTTP_PORT:-18432}"
 console_port="${E2E_CONSOLE_PORT:-18443}"
+flight_port="${E2E_FLIGHT_PORT:-13137}"
 work="$(mktemp -d)"
 env_file="$work/e2e.env"
 
@@ -42,7 +44,8 @@ fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
 "$root/deploy/single-vm/init-env.sh" "$env_file" >/dev/null
 sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" \
-  -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_IMAGE=.*/IGLOO_IMAGE=$project:dev/" "$env_file"
+  -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_FLIGHT_PORT=.*/IGLOO_FLIGHT_PORT=$flight_port/" \
+  -e "s/^IGLOO_IMAGE=.*/IGLOO_IMAGE=$project:dev/" "$env_file"
 # Maintain tables every few seconds, so the maintenance checks need not wait
 # an hour.
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
@@ -184,6 +187,32 @@ if docker run --rm --network "$network" -e PGHOST=igloo -e PGUSER=igloo -e PGPAS
 else
   fail "psycopg: $(tail -5 "$work/psycopg.out")"
 fi
+
+echo "Arrow Flight SQL"
+# The clients run on this machine's network and reach the published
+# loopback port: without TLS, Igloo serves only clients that connect to it
+# as localhost.
+if docker run --rm --network host -e FLIGHT_URI="grpc://127.0.0.1:$flight_port" -e IGLOO_ADMIN_PASSWORD="$admin_password" \
+  -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+    pip install -q adbc-driver-flightsql==1.12.0 adbc-driver-manager==1.12.0 pyarrow==26.0.0 pandas==3.0.6 \
+      polars==1.44.2 >/dev/null 2>&1 && python /clients/flight_test.py" >"$work/flight.out" 2>&1; then
+  pass "ADBC with pandas and polars, and pyarrow.flight"
+else
+  fail "Flight SQL from Python: $(tail -5 "$work/flight.out")"
+fi
+flight_jdbc_version=19.0.0
+if docker run --rm --network host -e FLIGHT_HOST=127.0.0.1 -e FLIGHT_PORT="$flight_port" -e IGLOO_ADMIN_PASSWORD="$admin_password" \
+  -v "$root/scripts/clients:/clients:ro" eclipse-temurin:21-jdk sh -c "
+    cd /tmp && curl -fsSLO https://repo1.maven.org/maven2/org/apache/arrow/flight-sql-jdbc-driver/$flight_jdbc_version/flight-sql-jdbc-driver-$flight_jdbc_version.jar &&
+    java --add-opens=java.base/java.nio=ALL-UNNAMED -cp flight-sql-jdbc-driver-$flight_jdbc_version.jar /clients/FlightJdbcTest.java" \
+  >"$work/flight-jdbc.out" 2>&1; then
+  pass "Flight SQL JDBC driver $flight_jdbc_version"
+else
+  fail "Flight SQL JDBC: $(tail -5 "$work/flight-jdbc.out")"
+fi
+expect_soon "Flight SQL statements are in the query history" "t" igloo "$admin_password" \
+  "SELECT count(*) FILTER (WHERE outcome = 'denied' AND user_name = 'rita') > 0 AND count(*) FILTER (WHERE outcome = 'ok') > 0
+   FROM igloo.query_history WHERE client_address LIKE 'flight sql %'"
 
 echo "concurrent writes"
 psql_admin -c "CREATE TABLE contended (n INTEGER)" >/dev/null

@@ -159,10 +159,10 @@ pass for each cloud.
   `metrics.serviceMonitor.enabled=true` creates a ServiceMonitor for both.
 - **NetworkPolicy** (on by default) restricts ingress only: Lakekeeper accepts
   igloo pods; the bundled PostgreSQL and object store accept igloo and
-  Lakekeeper pods; igloo pods accept the SQL and metrics ports (narrow them with
-  `networkPolicy.sqlFrom` / `metricsFrom`). With scale to zero, those ports
-  apply to the gateway, and igloo's SQL port accepts only the gateway. Egress
-  is not restricted.
+  Lakekeeper pods; igloo pods accept the SQL, console, Flight SQL and metrics
+  ports (narrow them with `networkPolicy.sqlFrom` / `metricsFrom`). With scale
+  to zero, those ports apply to the gateway, and igloo's client ports accept
+  only the gateway. Egress is not restricted.
 - **Security**: every pod runs as non-root with a read-only root filesystem,
   all capabilities dropped and the `RuntimeDefault` seccomp profile, which
   satisfies the `restricted` Pod Security Standard. Service account tokens are
@@ -277,6 +277,8 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `service.port` | `5432` | |
 | `console.enabled` | `true` | [Web console](../../../docs/console.md) on the SQL Service; it signs users in only over TLS or through `kubectl port-forward` |
 | `console.port` | `8443` | Console port on the SQL Service |
+| `flightSQL.enabled` | `true` | [Arrow Flight SQL](../../../docs/flight-sql.md) on the SQL Service; it serves clients only over TLS or through `kubectl port-forward` |
+| `flightSQL.port` | `31337` | Flight SQL port on the SQL Service |
 | `service.annotations` | `{}` | |
 | `service.loadBalancerSourceRanges` | `[]` | Client CIDRs allowed through a LoadBalancer |
 | `service.loadBalancerClass`, `service.externalTrafficPolicy` | `""` | |
@@ -294,7 +296,7 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
-| `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for the SQL and console ports (5432, 8443) and for 8080; empty: everyone |
+| `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for the SQL, console and Flight SQL ports (5432, 8443, 31337) and for 8080; empty: everyone |
 | `catalog.image.repository` / `tag` / `pullPolicy` | `quay.io/lakekeeper/catalog` / `v0.14.0` / `IfNotPresent` | |
 | `catalog.replicaCount` | `1` | Lakekeeper pods (a PodDisruptionBudget is added above 1) |
 | `catalog.warehouse` | `igloo` | `IGLOO_CATALOG_WAREHOUSE` |

@@ -61,6 +61,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `GET /activity`, and the gateway starts the compute for it.
 - Several replicas can serve the same tables; conflicting concurrent writes
   are retried automatically.
+- Arrow Flight SQL on port 31337 (`IGLOO_FLIGHT_ADDR`): queries, updates,
+  prepared statements with parameters, catalog metadata and cancellation,
+  with results streamed as DuckDB's own Arrow record batches, for the ADBC
+  driver (pandas, polars), pyarrow and the Flight SQL JDBC driver. Pulling 3
+  million TPC-H lineitem rows into Python is 29 times faster than with
+  psycopg as Arrow, and 14 times faster as a pandas DataFrame
+  (`bench/extract.py`). Users sign in with their Igloo password; statements
+  go through the same authorization, statement timeout and query history as
+  SQL clients. Without TLS it serves only clients at localhost. The Compose
+  stack publishes it on loopback, the Helm chart on the SQL Service
+  (`flightSQL.enabled`), and the scale-to-zero gateway forwards it
+  (`IGLOO_GATEWAY_FLIGHT_BACKEND`).
 
 ### Security and governance
 
@@ -81,7 +93,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A query sandbox: SQL cannot read the server's files or reach locations
   outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`, nor run SQL built
   from strings (`query()`, `json_execute_serialized_sql()`).
-- TLS for SQL clients and the web console.
+- TLS for SQL clients, the web console and Arrow Flight SQL.
 
 ### Web console
 

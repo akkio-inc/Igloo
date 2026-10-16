@@ -270,7 +270,9 @@ Values go to clients as these PostgreSQL types:
 | `JSON`, `LIST`, `ARRAY`, `STRUCT`, `MAP`, `UNION` | `json` |
 | others (`TIMETZ`, `BIT`, ...) | `text` |
 
-Nested values arrive as JSON, which every PostgreSQL client can read.
+Nested values arrive as JSON, which every PostgreSQL client can read. Over
+[Arrow Flight SQL](flight-sql.md), values keep DuckDB's own Arrow types
+instead, nested ones included.
 
 ## Clients
 
@@ -283,6 +285,9 @@ Tested with every release, by the test suite and `scripts/e2e.sh`:
 | psycopg (Python) | 3.3 | Including server-side prepared statements, server-side cursors and transactions |
 | PostgreSQL JDBC | 42.7 | `getTables` and `getColumns` with comments, views, prepared statements, fetch-size paging |
 | Ibis (Python) | 10.8 | Through its PostgreSQL backend: `sql()`, `table()`, expressions, `to_pyarrow_batches()` |
+| ADBC Flight SQL driver (Python) | 1.12 | Over [Arrow Flight SQL](flight-sql.md): Arrow tables, pandas and polars, parameters, `adbc_get_objects` |
+| pyarrow.flight | 26.0 | Over Flight SQL: handshake, `get_flight_info`, `do_get` |
+| Arrow Flight SQL JDBC | 19.0 | Over Flight SQL: `getTables`, `getColumns`, prepared statements, `executeUpdate`, large results |
 
 Tools built on these drivers, such as DBeaver, Metabase, Superset, Tableau
 and dbt (with `materialized='table'`), should work with their PostgreSQL

@@ -28,10 +28,10 @@ spec:
         - port: http
           protocol: TCP
 ---
-# Igloo pods: the SQL and console ports and the health/metrics port, nothing
-# else; the console is open to whoever may reach SQL. With
-# scale to zero, SQL comes only through the gateway, and the gateway reads
-# /activity on the health/metrics port.
+# Igloo pods: the SQL, console and Flight SQL ports and the health/metrics
+# port, nothing else; the console and Flight SQL are open to whoever may
+# reach SQL. With scale to zero, clients come only through the gateway, and
+# the gateway reads /activity on the health/metrics port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -50,6 +50,10 @@ spec:
           protocol: TCP
         {{- if .Values.console.enabled }}
         - port: console
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.flightSQL.enabled }}
+        - port: flight-sql
           protocol: TCP
         {{- end }}
       {{- if .Values.scaleToZero.enabled }}
@@ -96,6 +100,10 @@ spec:
           protocol: TCP
         {{- if .Values.console.enabled }}
         - port: console
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.flightSQL.enabled }}
+        - port: flight-sql
           protocol: TCP
         {{- end }}
       {{- with .Values.networkPolicy.sqlFrom }}

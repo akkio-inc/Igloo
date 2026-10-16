@@ -40,6 +40,12 @@ spec:
       targetPort: console
       protocol: TCP
     {{- end }}
+    {{- if .Values.flightSQL.enabled }}
+    - name: flight-sql
+      port: {{ .Values.flightSQL.port }}
+      targetPort: flight-sql
+      protocol: TCP
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -82,6 +88,12 @@ spec:
     - name: console
       port: 8443
       targetPort: console
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.flightSQL.enabled }}
+    - name: flight-sql
+      port: 31337
+      targetPort: flight-sql
       protocol: TCP
     {{- end }}
 ---

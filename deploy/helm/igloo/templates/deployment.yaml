@@ -130,9 +130,16 @@ spec:
               containerPort: 8443
               protocol: TCP
             {{- end }}
+            {{- if .Values.flightSQL.enabled }}
+            - name: flight-sql
+              containerPort: 31337
+              protocol: TCP
+            {{- end }}
           env:
             - name: IGLOO_CONSOLE_ADDR
               value: {{ ternary ":8443" "" .Values.console.enabled | quote }}
+            - name: IGLOO_FLIGHT_ADDR
+              value: {{ ternary ":31337" "" .Values.flightSQL.enabled | quote }}
             - name: IGLOO_ADMIN_USER
               value: {{ .Values.admin.user | quote }}
             - name: IGLOO_ADMIN_PASSWORD

@@ -95,8 +95,9 @@ reference for every setting mentioned here.
   extensions are installed in the image at build time; the server does not
   download code while running.
 - **Transport.** TLS is on when `IGLOO_TLS_CERT_FILE` and `IGLOO_TLS_KEY_FILE`
-  are set, and unencrypted sessions are then refused unless
-  `IGLOO_TLS_REQUIRED=false`. Without TLS, queries and results cross the
+  are set, and unencrypted SQL sessions are then refused unless
+  `IGLOO_TLS_REQUIRED=false` (the web console and Flight SQL then serve TLS
+  only). Without TLS, queries and results cross the
   network unencrypted. Enable TLS before accepting connections from outside a
   private network. The single-machine stack accepts local connections only by
   default.
@@ -118,6 +119,19 @@ reference for every setting mentioned here.
   password changes. Changes need a CSRF token; pages have a strict
   Content-Security-Policy and cannot be framed. Set `IGLOO_CONSOLE_ADDR=` to
   turn the console off.
+- **Arrow Flight SQL.** Port 31337 serves [Arrow Flight SQL](docs/flight-sql.md)
+  (gRPC). Clients sign in with a handshake carrying their Igloo password in
+  HTTP basic authentication, checked against the same SCRAM verifier with
+  the same failed-login delay, logging and login history as SQL logins.
+  Basic authentication sends the password itself, so with TLS configured the
+  port serves TLS only, and without TLS it serves only clients that connect
+  to it as `localhost` (on the same machine, or through an SSH tunnel or
+  `kubectl port-forward`); others are refused before their password is
+  checked. The handshake returns a random bearer token that is valid only on
+  the connection it was issued on and ends with it. Every statement and
+  metadata call runs as the user through the same authorization, sandbox,
+  statement timeout and query history as SQL clients. Set
+  `IGLOO_FLIGHT_ADDR=` to turn it off.
 
 ## Verifying release images
 

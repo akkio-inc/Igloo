@@ -51,6 +51,11 @@ spec:
               containerPort: 8443
               protocol: TCP
             {{- end }}
+            {{- if .Values.flightSQL.enabled }}
+            - name: flight-sql
+              containerPort: 31337
+              protocol: TCP
+            {{- end }}
           env:
             - name: IGLOO_GATEWAY_COMPUTE
               value: kubernetes
@@ -64,6 +69,11 @@ spec:
             # The web console wakes Igloo like a SQL client does.
             - name: IGLOO_GATEWAY_CONSOLE_BACKEND
               value: {{ printf "%s:8443" (include "igloo.serverServiceName" .) | quote }}
+            {{- end }}
+            {{- if .Values.flightSQL.enabled }}
+            # So does a Flight SQL client.
+            - name: IGLOO_GATEWAY_FLIGHT_BACKEND
+              value: {{ printf "%s:31337" (include "igloo.serverServiceName" .) | quote }}
             {{- end }}
             - name: IGLOO_GATEWAY_ACTIVITY_URL
               value: {{ printf "http://%s:8080/activity" (include "igloo.headlessServiceName" .) | quote }}

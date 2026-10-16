@@ -11,6 +11,7 @@ page is the reference they are built on.
 | 5432 | PostgreSQL wire protocol | SQL clients |
 | 8080 | HTTP | `GET /healthz` (process is up), `GET /readyz` (catalog and storage reachable), `GET /metrics` (Prometheus), `GET /activity` (running and scheduled work, for the [scale-to-zero gateway](scale-to-zero.md)) |
 | 8443 | HTTP, or HTTPS with TLS | The [web console](console.md) |
+| 31337 | Arrow Flight SQL (gRPC), with TLS when configured | [Flight SQL clients](flight-sql.md): ADBC, pyarrow, the Flight SQL JDBC driver |
 
 ## Server
 
@@ -19,12 +20,13 @@ page is the reference they are built on.
 | `IGLOO_LISTEN_ADDR` | `:5432` | SQL listen address |
 | `IGLOO_HTTP_ADDR` | `:8080` | Health and metrics listen address. Empty disables it. |
 | `IGLOO_CONSOLE_ADDR` | `:8443` | [Web console](console.md) listen address. Empty disables it. |
-| `IGLOO_TLS_CERT_FILE`, `IGLOO_TLS_KEY_FILE` | | PEM certificate and key. Enables TLS for SQL clients, and HTTPS (only) for the web console. Without them the console accepts sign-ins only from a browser at `localhost`. |
+| `IGLOO_FLIGHT_ADDR` | `:31337` | [Arrow Flight SQL](flight-sql.md) listen address. Empty disables it. |
+| `IGLOO_TLS_CERT_FILE`, `IGLOO_TLS_KEY_FILE` | | PEM certificate and key. Enables TLS for SQL clients, and TLS only for the web console (HTTPS) and Flight SQL. Without them the console accepts sign-ins only from a browser at `localhost`, and Flight SQL serves only clients at `localhost`. |
 | `IGLOO_TLS_REQUIRED` | `true` | With a certificate configured, refuse sessions that do not use TLS. Set `false` to allow both. |
 | `IGLOO_LOG_FORMAT` | `text` | `text` or `json` |
 | `IGLOO_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 | `IGLOO_STATEMENT_TIMEOUT` | `0` (none) | Cancel statements that run longer, e.g. `30m`. Sessions can change their own limit with `SET statement_timeout`. |
-| `IGLOO_MAX_CONNECTIONS` | `100` | Concurrent client sessions per Igloo process, counting web console requests while they run. Further logins get `too many clients`. |
+| `IGLOO_MAX_CONNECTIONS` | `100` | Concurrent client sessions per Igloo process, counting Flight SQL sessions and web console requests while they run. Further logins get `too many clients`. |
 | `IGLOO_SHUTDOWN_DELAY` | `0` | On SIGTERM, keep accepting connections this long (e.g. `5s`) while `/readyz` reports not ready, so load balancers stop routing new connections first. Running queries then get 30 seconds to finish. |
 
 ## Users

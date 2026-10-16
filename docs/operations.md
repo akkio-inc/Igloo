@@ -281,8 +281,8 @@ events are logged at info level or above: `login`, `login failed`,
 materialized views created, changed or dropped), `statement denied`,
 `statement canceled` (from the web console's compute page), and refused
 connections. Failed scheduled runs log `scheduled run failed` (component
-`tasks`). Sign-ins
-through the web console log `client=console`. Query text and
+`tasks`). Sign-ins through the web console log `client=console`, and
+through Arrow Flight SQL `client="flight sql"`. Query text and
 DuckDB error details, which can quote the query, are logged only at debug
 level; user-management statements, which carry passwords, are never logged.
 The [query history](#query-and-login-history) keeps statement text, with

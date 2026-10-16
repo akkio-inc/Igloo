@@ -217,6 +217,15 @@ console:
   enabled: true
   port: 8443
 
+# Arrow Flight SQL (docs/flight-sql.md) on the SQL Service: query results as
+# Arrow record batches for ADBC, pyarrow and the Flight SQL JDBC driver.
+# Clients sign in with their Igloo password, so it serves them only over TLS
+# (tls.existingSecret) or when reached as localhost, e.g. through kubectl
+# port-forward.
+flightSQL:
+  enabled: true
+  port: 31337
+
 autoscaling:
   enabled: false
   minReplicas: 2

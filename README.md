@@ -18,6 +18,10 @@ for the method, every result and its caveats.
 
 - **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
   so `psql`, JDBC, psycopg, pgx and BI tools work without an Igloo driver.
+- **Arrow-native extracts.** [Arrow Flight SQL](docs/flight-sql.md) streams
+  results to pandas, polars, Spark and BI tools as Arrow record batches,
+  through ADBC or the Flight SQL JDBC driver, several times faster than the
+  PostgreSQL protocol.
 - **Open table format.** Tables are [Apache Iceberg](https://iceberg.apache.org/)
   in object storage (S3, GCS, Azure Data Lake Storage, or any S3-compatible
   store). Spark, Trino, Snowflake and Databricks can read the same data; there
@@ -54,7 +58,17 @@ psql "host=127.0.0.1 port=5433 user=igloo dbname=igloo"
 ```
 
 Or open the [web console](docs/console.md) at `http://127.0.0.1:8443` and sign
-in with the same user and password.
+in with the same user and password, or fetch results as Arrow over
+[Flight SQL](docs/flight-sql.md) at `grpc://localhost:31337`:
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+with flightsql.connect("grpc://localhost:31337",
+                       db_kwargs={"username": "igloo", "password": "..."}) as conn, conn.cursor() as cur:
+    cur.execute("SELECT * FROM events")
+    df = cur.fetch_df()  # or fetch_arrow_table(), or polars.read_database(query, conn)
+```
 
 Try it on real data with the TPC-H benchmark:
 
@@ -113,6 +127,10 @@ the official TPC-H answers.
 - **[Web console](docs/console.md)** at `http://127.0.0.1:8443`: SQL
   worksheets, a data browser, query history, tasks and loads, and user and
   compute administration, signed in with the same users as SQL clients.
+- **[Arrow Flight SQL](docs/flight-sql.md)** at `grpc://localhost:31337`:
+  query results as DuckDB's Arrow record batches for ADBC (pandas, polars),
+  pyarrow and the Flight SQL JDBC driver, with the same users, grants,
+  timeouts and history as SQL clients.
 - **Operations basics**: health and readiness endpoints, Prometheus metrics,
   JSON logs, statement timeouts, connection limits, TLS, query cancel.
 
@@ -132,9 +150,11 @@ local store; see the bottom of `deploy/single-vm/.env`.
 ## How it works
 
 ```
- psql / JDBC / BI tool
-          │  PostgreSQL wire protocol (SCRAM, optional TLS)
-          ▼
+ psql / JDBC / BI tool          pandas / polars / Spark (ADBC), Flight JDBC
+          │  PostgreSQL wire protocol      │  Arrow Flight SQL
+          │  (SCRAM, optional TLS)         │  (TLS, or localhost only)
+          │            ┌───────────────────┘
+          ▼            ▼
  ┌──────────────────────┐   Iceberg REST   ┌────────────┐     ┌────────────┐
  │ igloo (1..n replicas)│ ───────────────▶ │ Lakekeeper │ ──▶ │ PostgreSQL │
  │  DuckDB inside       │                  │  catalog   │     │  metadata  │
@@ -146,10 +166,11 @@ local store; see the bottom of `deploy/single-vm/.env`.
  └─────────────────────────────────────────────┘
 ```
 
-- **igloo** (this repository, Go) accepts Postgres connections, checks each
-  statement against the user's role and grants, and runs it on an embedded
-  DuckDB attached to the catalog. On start it sets up the catalog and
-  warehouse itself, so every deployment works the same way.
+- **igloo** (this repository, Go) accepts Postgres and Arrow Flight SQL
+  connections, checks each statement against the user's role and grants,
+  and runs it on an embedded DuckDB attached to the catalog. On start it
+  sets up the catalog and warehouse itself, so every deployment works the
+  same way.
 - **[Lakekeeper](https://github.com/lakekeeper/lakekeeper)** is the Iceberg
   REST catalog: it tracks tables, schemas and snapshots. Only Igloo talks to
   it.
@@ -165,6 +186,8 @@ PostgreSQL License).
 - [Configuration](docs/configuration.md): every setting
 - [Web console](docs/console.md): worksheets, data browser, history and
   administration in the browser, and their security
+- [Arrow Flight SQL](docs/flight-sql.md): fast columnar results for ADBC,
+  pandas, polars and JDBC, and their security
 - [Operations](docs/operations.md): sizing, scaling, users, monitoring,
   backups, table maintenance, upgrades, troubleshooting
 - [Scale to zero](docs/scale-to-zero.md): stop compute when idle and start it
@@ -204,6 +227,7 @@ internal/auth/      users, roles, grants, SCRAM verifiers
 internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox
+internal/flightsql/ Arrow Flight SQL endpoint
 internal/pgwire/    Postgres wire protocol, authorization, compatibility
 internal/schedule/  cron and interval schedules
 internal/tasks/     tasks, pipes, materialized views, load history, scheduler

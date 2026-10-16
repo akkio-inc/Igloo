@@ -1,6 +1,6 @@
 // Package gateway lets Igloo scale to zero. The gateway is a small,
 // always-on process that SQL clients, and optionally browsers using the web
-// console, connect to in Igloo's place. When a client connects while Igloo
+// console and Arrow Flight SQL clients, connect to in Igloo's place. When a client connects while Igloo
 // is stopped, the gateway starts Igloo's compute and holds the connection
 // until Igloo accepts it; from then on it copies bytes in both directions,
 // so TLS and authentication stay end to end between the client and Igloo.
@@ -50,6 +50,9 @@ type Options struct {
 	// ConsoleBackend is Igloo's web console address, host:port, for
 	// ServeConsole.
 	ConsoleBackend string
+	// FlightBackend is Igloo's Arrow Flight SQL address, host:port, for
+	// ServeFlight.
+	FlightBackend string
 	// ActivityURL is Igloo's /activity endpoint. Every address its host
 	// resolves to is asked, so a headless Kubernetes Service covers all
 	// replicas. Empty means the gateway judges idleness by traffic alone,
@@ -156,6 +159,17 @@ func (g *Gateway) ServeConsole(ctx context.Context, ln net.Listener) error {
 		wg.Wait()
 	}()
 	return g.accept(ctx, ln, g.opts.ConsoleBackend, &wg)
+}
+
+// ServeFlight accepts Arrow Flight SQL connections on ln and forwards them
+// to FlightBackend until ctx is done, as ServeConsole does for the console.
+func (g *Gateway) ServeFlight(ctx context.Context, ln net.Listener) error {
+	var wg sync.WaitGroup
+	defer func() {
+		g.closeClients()
+		wg.Wait()
+	}()
+	return g.accept(ctx, ln, g.opts.FlightBackend, &wg)
 }
 
 // accept forwards connections from ln to backend until ctx is done.

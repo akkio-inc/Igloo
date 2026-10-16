@@ -48,6 +48,7 @@ func serveGateway() error {
 	gw := gateway.New(gateway.Options{
 		Backend:        cfg.Backend,
 		ConsoleBackend: cfg.ConsoleBackend,
+		FlightBackend:  cfg.FlightBackend,
 		ActivityURL:    cfg.ActivityURL,
 		SuspendAfter:   cfg.SuspendAfter,
 		ResumeTimeout:  cfg.ResumeTimeout,
@@ -60,7 +61,7 @@ func serveGateway() error {
 	if err != nil {
 		return err
 	}
-	errc := make(chan error, 3)
+	errc := make(chan error, 4)
 	go func() { errc <- gw.Serve(ctx, ln) }()
 	if cfg.ConsoleBackend != "" {
 		consoleLn, err := net.Listen("tcp", cfg.ConsoleListenAddr)
@@ -68,6 +69,13 @@ func serveGateway() error {
 			return err
 		}
 		go func() { errc <- gw.ServeConsole(ctx, consoleLn) }()
+	}
+	if cfg.FlightBackend != "" {
+		flightLn, err := net.Listen("tcp", cfg.FlightListenAddr)
+		if err != nil {
+			return err
+		}
+		go func() { errc <- gw.ServeFlight(ctx, flightLn) }()
 	}
 
 	var httpSrv *http.Server
@@ -83,8 +91,8 @@ func serveGateway() error {
 		}()
 	}
 	log.Info("igloo gateway is ready", "sql", ln.Addr().String(), "backend", cfg.Backend,
-		"console_backend", cfg.ConsoleBackend, "compute", cfg.Compute, "suspend_after", cfg.SuspendAfter,
-		"activity", cfg.ActivityURL)
+		"console_backend", cfg.ConsoleBackend, "flight_backend", cfg.FlightBackend, "compute", cfg.Compute,
+		"suspend_after", cfg.SuspendAfter, "activity", cfg.ActivityURL)
 
 	select {
 	case err = <-errc:

@@ -25,6 +25,10 @@ type Config struct {
 	// when ConsoleBackend is set.
 	ConsoleListenAddr string
 	ConsoleBackend    string
+	// FlightListenAddr and FlightBackend forward Arrow Flight SQL too, when
+	// FlightBackend is set.
+	FlightListenAddr string
+	FlightBackend    string
 
 	// Compute is ec2, kubernetes or command.
 	Compute        string
@@ -68,6 +72,13 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 	if cfg.ConsoleBackend != "" {
 		if h, p, err := net.SplitHostPort(cfg.ConsoleBackend); err != nil || h == "" || p == "" {
 			addErr("IGLOO_GATEWAY_CONSOLE_BACKEND must be Igloo's console address as host:port, got %q", cfg.ConsoleBackend)
+		}
+	}
+	cfg.FlightBackend = get("IGLOO_GATEWAY_FLIGHT_BACKEND", "")
+	cfg.FlightListenAddr = get("IGLOO_GATEWAY_FLIGHT_LISTEN_ADDR", ":31337")
+	if cfg.FlightBackend != "" {
+		if h, p, err := net.SplitHostPort(cfg.FlightBackend); err != nil || h == "" || p == "" {
+			addErr("IGLOO_GATEWAY_FLIGHT_BACKEND must be Igloo's Flight SQL address as host:port, got %q", cfg.FlightBackend)
 		}
 	}
 

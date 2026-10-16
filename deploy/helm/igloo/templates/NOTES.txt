@@ -32,6 +32,11 @@ Web console: kubectl --namespace {{ $ns }} port-forward service/{{ $svc }} 8443:
 then open {{ ternary "https" "http" (not (empty .Values.tls.existingSecret)) }}://localhost:8443 and sign in as {{ .Values.admin.user }}.
 
 {{ end -}}
+{{- if .Values.flightSQL.enabled }}
+Arrow Flight SQL: kubectl --namespace {{ $ns }} port-forward service/{{ $svc }} 31337:{{ .Values.flightSQL.port }}
+then connect ADBC or JDBC clients to {{ ternary "grpc+tls" "grpc" (not (empty .Values.tls.existingSecret)) }}://localhost:31337 as {{ .Values.admin.user }}.
+
+{{ end -}}
 Health and Prometheus metrics: http://{{ include "igloo.metricsServiceName" . }}.{{ $ns }}.svc:8080/metrics
 Check the release with: helm test {{ .Release.Name }} --namespace {{ $ns }}
 {{- if .Values.scaleToZero.enabled }}
