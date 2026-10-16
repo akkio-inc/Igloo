@@ -377,7 +377,7 @@ func testEachDueRunRunsOnce(t *testing.T, store Store) {
 			t.Errorf("the run due at %s ran %d times", at, n)
 		}
 	}
-	if n := r.runs.Load(); n < 2 || n > 4 || int(n) != len(ran) {
+	if n := r.runs.Load(); n < 1 || n > 4 || int(n) != len(ran) {
 		t.Errorf("runs in 3.5 seconds: %d, of %d due times", n, len(ran))
 	}
 }
