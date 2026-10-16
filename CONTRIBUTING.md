@@ -25,6 +25,7 @@ its tools in containers.
 | `make helm-e2e` | Install the Helm chart on a throwaway kind cluster and test it end to end |
 | `make e2e` | Start an isolated copy of the stack and run `scripts/e2e.sh` against it, including the JDBC, psycopg and PyIceberg checks in `scripts/clients/` |
 | `make engines-e2e` | Run Spark and Trino against an isolated copy of the stack's Iceberg REST catalog (`scripts/engines-e2e.sh`; pulls about 3 GB, not part of CI) |
+| `make sharing-e2e` | Test Delta Sharing with the official Python client and the reference sharing server (`scripts/sharing-e2e.sh`); slower, and not part of CI |
 | `make down`, `make reset` | Stop the stack; `reset` also deletes its data |
 
 `make help` lists every target.

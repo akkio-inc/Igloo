@@ -126,6 +126,18 @@ the official TPC-H answers.
   ALTER TAG pii SET MASKING POLICY mask_pii;
   ALTER TABLE marts.impressions ALTER COLUMN email SET TAG pii = 'email';
   ```
+- **[Delta Sharing](docs/sharing.md)**, both ways: share tables with clients
+  and partners, who read them with Databricks, Spark, pandas, Power BI or
+  Tableau through the open protocol, and query partners' shares as
+  external tables, with grants as for any table.
+
+  ```sql
+  CREATE SHARE acme_reporting;
+  ALTER SHARE acme_reporting ADD TABLE marts.campaign_daily;
+  CREATE RECIPIENT acme;                       -- returns a one-time activation link
+  GRANT SELECT ON SHARE acme_reporting TO RECIPIENT acme;
+  CREATE EXTERNAL TABLE partners.viewership FROM SHARE tvco_ads.tv.viewing.daily;
+  ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days, with
   each statement's CPU time, bytes and memory.
@@ -255,6 +267,8 @@ extension (see [media analytics](docs/media-analytics.md#security)).
   sketches, geospatial reporting, approximate and statistical functions
 - [Workload management](docs/workload-management.md): query tags, usage and
   cost per client, role limits, compute pools
+- [Delta Sharing](docs/sharing.md): sharing tables with outside recipients,
+  reading partners' shares, and their security
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a
@@ -298,6 +312,7 @@ internal/icebergrest/ Iceberg REST catalog for other engines
 internal/pgwire/    Postgres wire protocol, authorization, policies, compatibility
 internal/policy/    masking and row access policies and tags, stored
 internal/schedule/  cron and interval schedules
+internal/sharing/   Delta Sharing: the provider endpoint and external tables
 internal/tasks/     tasks, pipes, materialized views, load history, scheduler
 internal/workload/  query tags, role limits and their enforcement
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules

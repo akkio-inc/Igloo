@@ -236,6 +236,29 @@ reference for every setting mentioned here.
   metadata call runs as the user through the same authorization, sandbox,
   statement timeout and query history as SQL clients. Set
   `IGLOO_FLIGHT_ADDR=` to turn it off.
+- **Delta Sharing.** Port 8444 serves [Delta Sharing](docs/sharing.md) to
+  outside recipients: over HTTPS, or without TLS only to requests addressed
+  to `localhost`. Only admins create shares, recipients and providers.
+  Recipients authenticate with 256-bit bearer tokens that Igloo stores as
+  SHA-256 hashes and checks in constant time; tokens expire, can be rotated,
+  and are delivered through one-time activation links that only a button
+  press redeems. A recipient reads only the shares granted to it, and only
+  the current version of a table unless the table was shared `WITH
+  HISTORY`. Data files are downloaded from URLs Igloo signs and serves,
+  each for one file, one token and one hour, with the path encrypted; every
+  download rechecks the token and the grant, so revocation is immediate on
+  the replica that ran it and within ten seconds on the others. Recipients
+  never receive storage credentials. Rows deleted from a table are never
+  served (files with deletes are served as copies with them applied), and
+  tables with renamed or dropped columns, whose files may hold data the
+  table no longer shows, are refused. Every recipient request is in the
+  query history. Partners' bearer tokens (`CREATE PROVIDER`) are stored
+  encrypted and kept out of the history. DuckDB reads partners' files only
+  through a loopback proxy, under a random path, that serves files the
+  provider listed for an external table and does not connect to loopback,
+  link-local or multicast addresses other than the provider's endpoint;
+  the sandbox is otherwise unchanged. Set `IGLOO_SHARING_ADDR=` to turn the
+  endpoint off.
 
 ## Verifying release images
 

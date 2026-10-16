@@ -265,6 +265,26 @@ reader) or a user, and only admins may run it. The settings are
 `memory_limit`; [workload management](workload-management.md) says how
 they combine and how they are enforced.
 
+## Delta Sharing
+
+Admins share tables with outside recipients and read partners' shares as
+external tables, with statements Igloo carries out itself:
+
+```sql
+CREATE SHARE acme_reporting;
+ALTER SHARE acme_reporting ADD TABLE marts.campaign_daily;
+CREATE RECIPIENT acme;                        -- returns a one-time activation link
+GRANT SELECT ON SHARE acme_reporting TO RECIPIENT acme;
+
+CREATE PROVIDER tvco_ads FROM '<the partner''s profile file>';
+CREATE EXTERNAL TABLE partners.viewership FROM SHARE tvco_ads.tv.viewing.daily;
+SELECT count(*) FROM partners.viewership;
+```
+
+External tables are read-only and take grants like any table. See
+[Delta Sharing](sharing.md) for every statement, what recipients receive,
+and the security model.
+
 ## Time travel
 
 Every write creates an Iceberg snapshot, and you can query earlier ones:

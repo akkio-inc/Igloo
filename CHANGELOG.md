@@ -150,6 +150,27 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the warehouse and allowed locations.
 - TLS for SQL clients, the web console and Arrow Flight SQL.
 
+### Data sharing
+
+- Delta Sharing as a provider: admins share Iceberg tables with outside
+  recipients (`CREATE SHARE`, `ALTER SHARE ... ADD TABLE [AS alias] [WITH
+  HISTORY]`, `CREATE RECIPIENT`, `GRANT SELECT ON SHARE ... TO RECIPIENT`),
+  who read them with any Delta Sharing client (Databricks and Spark, pandas,
+  Power BI, Tableau) from a new endpoint on port 8444
+  (`IGLOO_SHARING_ADDR`, `IGLOO_SHARING_URL`), over TLS or at `localhost`.
+  Recipients get a one-time activation link to their profile file; tokens
+  are stored hashed, expire and can be rotated. Data files download from
+  hour-long URLs that Igloo signs and serves itself, so recipients never see
+  storage credentials, and revoking access ends downloads at once. Rows
+  deleted from a table are never served: data files with deletes are served
+  as copies with them applied. Every recipient request is in the query
+  history. See [docs/sharing.md](docs/sharing.md).
+- Delta Sharing as a consumer: `CREATE PROVIDER` registers a partner's
+  profile (its token stored encrypted), and `CREATE EXTERNAL TABLE ... FROM
+  SHARE provider.share.schema.table` makes a shared table queryable, and
+  grantable, like any table. Queries read the partner's current version
+  through a proxy that is the only address the sandbox gains.
+
 ### Web console
 
 - A web console on port 8443 (`IGLOO_CONSOLE_ADDR`): SQL worksheets with

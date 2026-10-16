@@ -11,6 +11,7 @@ page is the reference they are built on.
 | 5432 | PostgreSQL wire protocol | SQL clients |
 | 8080 | HTTP | `GET /healthz` (process is up), `GET /readyz` (catalog and storage reachable), `GET /metrics` (Prometheus), `GET /activity` (running and scheduled work, for the [scale-to-zero gateway](scale-to-zero.md)) |
 | 8443 | HTTP, or HTTPS with TLS | The [web console](console.md), its [single sign-on](sso.md) callback `/sso/callback`, and [SCIM provisioning](sso.md#scim-provisioning) at `/scim/v2` |
+| 8444 | HTTP, or HTTPS with TLS | The [Delta Sharing](sharing.md) endpoint, for recipients of shares |
 | 31337 | Arrow Flight SQL (gRPC), with TLS when configured | [Flight SQL clients](flight-sql.md): ADBC, pyarrow, the Flight SQL JDBC driver |
 | 8181 | HTTP, or HTTPS with TLS | The [Iceberg REST catalog](external-engines.md) for Spark, Trino, PyIceberg and other engines |
 
@@ -23,7 +24,9 @@ page is the reference they are built on.
 | `IGLOO_CONSOLE_ADDR` | `:8443` | [Web console](console.md) listen address. Empty disables it. |
 | `IGLOO_FLIGHT_ADDR` | `:31337` | [Arrow Flight SQL](flight-sql.md) listen address. Empty disables it. |
 | `IGLOO_ICEBERG_ADDR` | `:8181` | [Iceberg REST catalog](external-engines.md) listen address, for other engines. Empty disables it; it is off without `IGLOO_CATALOG_URI`. Without TLS it serves clients on private networks only. |
-| `IGLOO_TLS_CERT_FILE`, `IGLOO_TLS_KEY_FILE` | | PEM certificate and key. Enables TLS for SQL clients, and TLS only for the web console (HTTPS), Flight SQL and the Iceberg REST catalog (HTTPS). Without them the console accepts sign-ins only from a browser at `localhost`, Flight SQL serves only clients at `localhost`, and the Iceberg REST catalog serves only clients on private networks. |
+| `IGLOO_SHARING_ADDR` | `:8444` | [Delta Sharing](sharing.md) endpoint listen address. Empty disables it; shares can still be managed in SQL and served by other replicas. The endpoint runs only with a metadata database and a catalog. |
+| `IGLOO_SHARING_URL` | | The sharing endpoint's public address, such as `https://data.example.com:8444`, for activation links and recipients' profile files. Must use `https://` unless it is `localhost`. Empty uses the address a recipient reaches Igloo at, and `localhost` in activation links. |
+| `IGLOO_TLS_CERT_FILE`, `IGLOO_TLS_KEY_FILE` | | PEM certificate and key. Enables TLS for SQL clients, and TLS only for the web console (HTTPS), Flight SQL, the Iceberg REST catalog (HTTPS) and the Delta Sharing endpoint (HTTPS). Without them the console accepts sign-ins only from a browser at `localhost`, Flight SQL serves only clients at `localhost`, the Iceberg REST catalog serves only clients on private networks, and the sharing endpoint answers only requests to `localhost`. |
 | `IGLOO_TLS_REQUIRED` | `true` | With a certificate configured, refuse sessions that do not use TLS. Set `false` to allow both. |
 | `IGLOO_LOG_FORMAT` | `text` | `text` or `json` |
 | `IGLOO_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -39,7 +42,7 @@ page is the reference they are built on.
 |---|---|---|
 | `IGLOO_ADMIN_USER` | `igloo` | Name of the first administrator |
 | `IGLOO_ADMIN_PASSWORD` | (required) | That administrator's password. Used to create the account on first start only; afterwards change it with `ALTER USER`. |
-| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants, access tokens (hashed) and single sign-on links are stored (schema `igloo_auth`), with the keys that seal web console sessions and Iceberg REST tokens, the query and login history (schema `igloo_audit`), tasks, pipes, materialized views and the load history (schema `igloo_tasks`), and masking policies, row access policies and tags (schema `igloo_policy`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit`, `igloo_tasks` or `igloo_policy`. Without it, the administrator is the only account, `CREATE USER`, access tokens and single sign-on are unavailable, console sessions and Iceberg REST tokens end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes, the load history and policies are lost on restart. |
+| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants, access tokens (hashed) and single sign-on links are stored (schema `igloo_auth`), with the keys that seal web console sessions and Iceberg REST tokens, the query and login history (schema `igloo_audit`), tasks, pipes, materialized views and the load history (schema `igloo_tasks`), masking policies, row access policies and tags (schema `igloo_policy`), and Delta Sharing's shares, recipients, providers and external tables (schema `igloo_sharing`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit`, `igloo_tasks`, `igloo_policy` or `igloo_sharing`. Without it, the administrator is the only account, `CREATE USER`, access tokens, single sign-on and Delta Sharing are unavailable, console sessions and Iceberg REST tokens end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes, the load history and policies are lost on restart. |
 
 Users sign in with SCRAM-SHA-256, the PostgreSQL default, with a password
 or an [access token](sso.md#access-tokens). Each has one built-in role, and
