@@ -2,13 +2,13 @@ package clone_test
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/akkio-inc/igloo/internal/clone"
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 func testStore(t *testing.T, s, other clone.Store) {
@@ -94,7 +94,7 @@ func TestMemoryStore(t *testing.T) {
 }
 
 func TestPostgresStore(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}
