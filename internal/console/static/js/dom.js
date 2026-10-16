@@ -82,6 +82,10 @@ const ICONS = {
   open: 'M14 4h6v6M20 4l-9 9M18 14v6H4V6h6',
   clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2',
   inbox: 'M3 13h5l1.5 3h5l1.5-3h5M5.5 5h13L21 13v6H3v-6z',
+  token: 'M4 7h16v3a2 2 0 0 0 0 4v3H4v-3a2 2 0 0 0 0-4zM10 7v10',
+  bot: 'M6 9h12v10H6zM12 5v4M9.5 14h.01M14.5 14h.01M3 13v3M21 13v3',
+  shield: 'M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6zM9 12l2 2 4-4',
+  copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
 };
 
 export function icon(name) {

@@ -4,7 +4,8 @@
 # data), and checks Igloo through real psql clients, the web console and
 # Arrow Flight SQL clients.
 # Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT and the
-# E2E_*_PORT variables let several runs share a Docker host.
+# E2E_*_PORT variables let several runs share a Docker host; E2E_IMAGE
+# tests an image built already instead of building one.
 #
 #   scripts/e2e.sh
 set -euo pipefail
@@ -15,6 +16,9 @@ sql_port="${E2E_SQL_PORT:-15433}"
 http_port="${E2E_HTTP_PORT:-18432}"
 console_port="${E2E_CONSOLE_PORT:-18443}"
 flight_port="${E2E_FLIGHT_PORT:-13137}"
+image="${E2E_IMAGE:-$project:dev}"
+build=--build
+[ -z "${E2E_IMAGE:-}" ] || build=--no-build
 work="$(mktemp -d)"
 env_file="$work/e2e.env"
 
@@ -45,7 +49,7 @@ fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 "$root/deploy/single-vm/init-env.sh" "$env_file" >/dev/null
 sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" \
   -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_FLIGHT_PORT=.*/IGLOO_FLIGHT_PORT=$flight_port/" \
-  -e "s/^IGLOO_IMAGE=.*/IGLOO_IMAGE=$project:dev/" "$env_file"
+  -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" "$env_file"
 # Maintain tables every few seconds, so the maintenance checks need not wait
 # an hour.
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
@@ -55,7 +59,7 @@ sed -i.bak -e "s#^IGLOO_ALLOWED_LOCATIONS=.*#IGLOO_ALLOWED_LOCATIONS=$landing/#"
 admin_password="$(grep '^IGLOO_ADMIN_PASSWORD=' "$env_file" | cut -d= -f2)"
 
 echo "starting the stack"
-compose up -d --build --wait --wait-timeout 300 >/dev/null
+compose up -d "$build" --wait --wait-timeout 300 >/dev/null
 
 network="${project}_default"
 
@@ -121,6 +125,49 @@ else
   fail "wrong password: $got"
 fi
 
+echo "access tokens and service accounts"
+# token_of OUTPUT prints the token in a CREATE TOKEN row (user|name|token|expires).
+token_of() { cut -d'|' -f3 <<<"$1"; }
+expect "create a service account" "CREATE ROLE" igloo "$admin_password" "CREATE USER etl_bot TYPE SERVICE ROLE writer"
+expect_error "service accounts have no password" 22023 igloo "$admin_password" "ALTER USER etl_bot PASSWORD 'some-password'"
+got="$(psql_admin -c "SHOW USERS" | grep '^etl_bot|')"
+if [ "$(cut -d'|' -f4,5,6,7 <<<"$got")" = "service|igloo|t|f" ]; then pass "SHOW USERS lists the service account and its owner"; else fail "SHOW USERS: $got"; fi
+bot_token="$(token_of "$(psql_admin -c "CREATE TOKEN ci FOR USER etl_bot EXPIRES '1d'")")"
+if [[ "$bot_token" == igloo_* ]]; then pass "CREATE TOKEN returns the token once"; else fail "CREATE TOKEN: $bot_token"; fi
+expect "a service account signs in with its token" "3" etl_bot "$bot_token" "SELECT count(*) FROM e2e"
+expect_error "service accounts cannot make themselves tokens" 42501 etl_bot "$bot_token" "CREATE TOKEN more"
+if got="$(psql_as etl_bot "${bot_token%?}x" -c "SELECT 1")"; then
+  fail "a wrong token was accepted"
+elif grep -q "password authentication failed" <<<"$got"; then
+  pass "a wrong token is rejected"
+else
+  fail "wrong token: $got"
+fi
+rita_token="$(token_of "$(psql_as rita rita-password-1 -c "CREATE TOKEN tableau EXPIRES '7d'")")"
+expect "a person's token signs in where their password does" "rita" rita "$rita_token" "SELECT current_user"
+expect "and the password still works" "rita" rita rita-password-1 "SELECT current_user"
+expect_error "a token session cannot set the password" 42501 rita "$rita_token" "ALTER USER CURRENT_USER PASSWORD 'stolen-password'"
+got="$(psql_as rita rita-password-1 -c "SHOW TOKENS")"
+if [ "$(cut -d'|' -f1,2 <<<"$got")" = "rita|tableau" ] && ! grep -q "$rita_token" <<<"$got"; then
+  pass "SHOW TOKENS lists one's own tokens, never the secret"
+else
+  fail "SHOW TOKENS: $got"
+fi
+expect_soon "token logins are recorded with the token's name" "t" igloo "$admin_password" \
+  "SELECT bool_or(user_name = 'etl_bot' AND auth_method = 'token' AND token_name = 'ci') FROM igloo.login_history WHERE result = 'success'"
+expect "an admin revokes a token" "DROP TOKEN" igloo "$admin_password" "DROP TOKEN ci FOR USER etl_bot"
+if psql_as etl_bot "$bot_token" -c "SELECT 1" >/dev/null; then fail "a revoked token signed in"; else pass "a revoked token no longer signs in"; fi
+expect "disable a user" "ALTER ROLE" igloo "$admin_password" "ALTER USER rita NOLOGIN"
+if got="$(psql_as rita rita-password-1 -c "SELECT 1")"; then
+  fail "a disabled user signed in"
+elif grep -q "not permitted to log in" <<<"$got"; then
+  pass "a disabled user cannot sign in, with a password or a token"
+else
+  fail "disabled user: $got"
+fi
+expect "enable the user again" "ALTER ROLE" igloo "$admin_password" "ALTER USER rita LOGIN"
+expect "and they sign in again" "1" rita "$rita_token" "SELECT 1"
+
 echo "web console"
 console="http://127.0.0.1:$console_port"
 jar="$work/console.cookies"
@@ -147,6 +194,11 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" "$console/api/admin/use
 if [ "$code" = 403 ]; then pass "console admin pages refuse a writer"; else fail "console admin page as a writer: $code"; fi
 got="$(console_post /api/download '{"sql":"SELECT id, name FROM e2e ORDER BY id"}' "$csrf")"
 if [ "$got" = "$(printf 'id,name\n1,alpha\n2,beta\n3,gamma')" ]; then pass "console CSV download"; else fail "console CSV: $got"; fi
+console_token="$(console_post /api/query '{"sql":"CREATE TOKEN from_console"}' "$csrf" | grep -o 'igloo_[a-z2-7]\{68\}' | head -1)"
+expect "a token made in the console signs in to SQL" "walt" walt "${console_token:-none}" "SELECT current_user"
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+  -d "{\"user\":\"walt\",\"password\":\"${console_token:-none}\"}" "$console/api/login")"
+if [ "$code" = 401 ]; then pass "tokens do not sign in to the console"; else fail "console sign-in with a token: $code"; fi
 console_post /api/logout '{}' "$csrf" >/dev/null
 code="$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" "$console/api/session")"
 if [ "$code" = 401 ]; then pass "console sign-out"; else fail "console session after sign-out: $code"; fi

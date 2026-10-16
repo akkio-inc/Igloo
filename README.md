@@ -97,6 +97,17 @@ the official TPC-H answers.
   GRANT analysts TO nora;
   GRANT SELECT ON SCHEMA marts TO analysts;
   ```
+- **[Single sign-on](docs/sso.md)** to the web console with Okta, Microsoft
+  Entra ID, Google Workspace or any OpenID Connect provider, with users
+  created at first sign-in (or provisioned with SCIM) and the provider's
+  groups mapped to roles; **access tokens** that BI tools, dbt and scripts
+  send instead of a password; and **service accounts** for programs.
+
+  ```sql
+  GRANT analysts TO SSO GROUP 'Data Team';
+  CREATE USER dbt_prod TYPE SERVICE ROLE none;
+  CREATE TOKEN ci FOR USER dbt_prod EXPIRES '90d';   -- shown once, stored hashed
+  ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days.
 - **[Loading and scheduling](docs/loading.md)** with nothing else to run:
@@ -188,6 +199,8 @@ PostgreSQL License).
   administration in the browser, and their security
 - [Arrow Flight SQL](docs/flight-sql.md): fast columnar results for ADBC,
   pandas, polars and JDBC, and their security
+- [Single sign-on](docs/sso.md): identity providers, access tokens for SQL
+  clients, service accounts
 - [Operations](docs/operations.md): sizing, scaling, users, monitoring,
   backups, table maintenance, upgrades, troubleshooting
 - [Scale to zero](docs/scale-to-zero.md): stop compute when idle and start it
@@ -223,7 +236,10 @@ PostgreSQL License).
 ```
 cmd/igloo/          server entry point and subcommands
 internal/audit/     query and login history
-internal/auth/      users, roles, grants, SCRAM verifiers
+internal/auth/      users, roles, grants, SCRAM verifiers, access tokens
+internal/console/   web console
+internal/scim/      SCIM 2.0 provisioning of users and groups
+internal/sso/       single sign-on with OpenID Connect
 internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox

@@ -67,7 +67,22 @@ type Login struct {
 	ApplicationName string
 	// SessionID is the session a successful login opened.
 	SessionID string
+	// Method is how the user signed in, or tried to: one of the
+	// Method constants, or empty when that is not known.
+	Method string
+	// Token names the access token a login used.
+	Token string
 }
+
+// Login methods.
+const (
+	MethodPassword = "password"
+	MethodToken    = "token"
+	MethodSSO      = "sso"
+	// MethodAccessToken is an identity provider's access token sent as a
+	// SQL password.
+	MethodAccessToken = "access_token"
+)
 
 // Viewer is who reads the history: admins see every record, everyone else
 // their own.

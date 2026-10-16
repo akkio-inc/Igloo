@@ -15,9 +15,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/pgwire"
 )
@@ -25,7 +27,7 @@ import (
 // Console sessions live in a cookie that is encrypted and authenticated
 // with a key every replica shares, so they survive restarts and work on any
 // replica. They end after sessionLifetime, or sessionIdle without a request,
-// or at once when the user is dropped or their password changes.
+// or at once when the user is dropped or disabled or their password changes.
 const (
 	sessionLifetime = 12 * time.Hour
 	sessionIdle     = time.Hour
@@ -54,9 +56,26 @@ type session struct {
 	Seen   int64 `json:"s"`
 	// CSRF is a random token the page must echo in csrfHeader.
 	CSRF string `json:"c"`
-	// Password fingerprints the user's verifier at sign-in, so changing
-	// the password signs out every console session.
+	// Password fingerprints the user's verifier and epoch at sign-in (see
+	// credentials), so changing the password or disabling the user signs
+	// out every console session.
 	Password string `json:"p"`
+	// Method is how the user signed in: audit.MethodPassword or
+	// audit.MethodSSO.
+	Method string `json:"m,omitempty"`
+}
+
+// credentials is what a session's Password fingerprints: the user's
+// verifier, epoch and creation time, so a user dropped and created again
+// under the same name, even without a password, does not inherit the old
+// one's sessions. Users with a password and no epoch yet fingerprint the
+// verifier alone, as before epochs existed, so their sessions stay valid
+// across the upgrade.
+func credentials(u auth.User) string {
+	if u.Epoch == 0 && u.Verifier != "" {
+		return u.Verifier
+	}
+	return u.Verifier + "\x00epoch:" + strconv.FormatInt(u.Epoch, 10) + "\x00created:" + strconv.FormatInt(u.CreatedAt.UnixMicro(), 10)
 }
 
 // sealer encrypts and authenticates cookies with AES-256-GCM.
@@ -92,8 +111,17 @@ func newSealer(secret []byte) (*sealer, error) {
 // cookieAD binds sealed cookies to their purpose.
 var cookieAD = []byte("igloo-console-session")
 
-func (s *sealer) seal(sess session) (string, error) {
-	plain, err := json.Marshal(sess)
+func (s *sealer) seal(sess session) (string, error) { return s.sealAs(sess, cookieAD) }
+
+func (s *sealer) open(value string) (session, error) {
+	var sess session
+	err := s.openAs(value, cookieAD, &sess)
+	return sess, err
+}
+
+// sealAs encrypts and authenticates v as JSON for the purpose ad names.
+func (s *sealer) sealAs(v any, ad []byte) (string, error) {
+	plain, err := json.Marshal(v)
 	if err != nil {
 		return "", err
 	}
@@ -101,22 +129,21 @@ func (s *sealer) seal(sess session) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(s.aead.Seal(nonce, nonce, plain, cookieAD)), nil
+	return base64.RawURLEncoding.EncodeToString(s.aead.Seal(nonce, nonce, plain, ad)), nil
 }
 
-func (s *sealer) open(value string) (session, error) {
-	var sess session
+// openAs reverses sealAs into v.
+func (s *sealer) openAs(value string, ad []byte, v any) error {
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(value)
 	if err != nil || len(raw) < s.aead.NonceSize() {
-		return sess, errors.New("malformed session cookie")
+		return errors.New("malformed cookie")
 	}
 	n := s.aead.NonceSize()
-	plain, err := s.aead.Open(nil, raw[:n], raw[n:], cookieAD)
+	plain, err := s.aead.Open(nil, raw[:n], raw[n:], ad)
 	if err != nil {
-		return sess, errors.New("session cookie does not verify")
+		return errors.New("cookie does not verify")
 	}
-	err = json.Unmarshal(plain, &sess)
-	return sess, err
+	return json.Unmarshal(plain, v)
 }
 
 // fingerprint identifies a password verifier without revealing it.
@@ -179,7 +206,11 @@ func (c *Console) signedIn(next func(http.ResponseWriter, *http.Request, *reques
 		if req == nil {
 			if status == http.StatusUnauthorized {
 				_ = c.setCookie(w, r, nil)
-				writeJSON(w, status, map[string]any{"error": msg, "signin": c.signInAllowed(r) == nil})
+				body := map[string]any{"error": msg, "signin": c.signInAllowed(r) == nil}
+				if c.sso != nil {
+					body["sso"] = map[string]string{"name": c.sso.DisplayName()}
+				}
+				writeJSON(w, status, body)
 				return
 			}
 			writeError(w, status, msg)
@@ -242,8 +273,13 @@ func (c *Console) authenticate(r *http.Request) (*request, int, string) {
 		c.log.Warn("could not look up user", "user", sess.User, "err", err)
 		return nil, http.StatusServiceUnavailable, "could not reach the metadata database"
 	}
-	if subtle.ConstantTimeCompare([]byte(c.cookies.fingerprint(user.Verifier)), []byte(sess.Password)) != 1 {
-		return nil, http.StatusUnauthorized, "your password changed; sign in again"
+	switch {
+	case user.Disabled:
+		return nil, http.StatusUnauthorized, "your user was disabled"
+	case user.IsService():
+		return nil, http.StatusUnauthorized, "service accounts cannot use the console"
+	case subtle.ConstantTimeCompare([]byte(c.cookies.fingerprint(credentials(user))), []byte(sess.Password)) != 1:
+		return nil, http.StatusUnauthorized, "your password changed or your sessions were ended; sign in again"
 	}
 	return &request{user: user, sess: sess}, 0, ""
 }
@@ -297,6 +333,16 @@ type sessionInfo struct {
 	User string    `json:"user"`
 	Role auth.Role `json:"role"`
 	CSRF string    `json:"csrf"`
+	// Method is how the user signed in: password or sso.
+	Method string `json:"method"`
+}
+
+// startSession signs user in with a new session cookie.
+func (c *Console) startSession(w http.ResponseWriter, r *http.Request, user auth.User, method string) (session, error) {
+	now := time.Now().Unix()
+	sess := session{User: user.Name, Issued: now, Seen: now, CSRF: randomToken(),
+		Password: c.cookies.fingerprint(credentials(user)), Method: method}
+	return sess, c.setCookie(w, r, &sess)
 }
 
 func (c *Console) login(w http.ResponseWriter, r *http.Request) {
@@ -318,26 +364,36 @@ func (c *Console) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := c.sql.Authenticate(r.Context(), name, in.Password, remoteAddr(r))
-	if errors.Is(err, pgwire.ErrLoginFailed) {
+	var blocked *pgwire.LoginBlockedError
+	switch {
+	case errors.Is(err, pgwire.ErrLoginFailed):
 		writeError(w, http.StatusUnauthorized, fmt.Sprintf("password authentication failed for user %q", name))
 		return
-	}
-	if err != nil {
+	case errors.Is(err, pgwire.ErrUserDisabled):
+		writeError(w, http.StatusForbidden, fmt.Sprintf("user %q is not permitted to sign in", name))
+		return
+	case errors.As(err, &blocked):
+		writeError(w, http.StatusTooManyRequests, blocked.Error())
+		return
+	case err != nil:
 		c.log.Warn("sign-in failed", "user", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "could not check the password; try again")
 		return
 	}
-	now := time.Now().Unix()
-	sess := session{User: user.Name, Issued: now, Seen: now, CSRF: randomToken(), Password: c.cookies.fingerprint(user.Verifier)}
-	if err := c.setCookie(w, r, &sess); err != nil {
+	sess, err := c.startSession(w, r, user, audit.MethodPassword)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not start a session")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionInfo{User: user.Name, Role: user.Role, CSRF: sess.CSRF})
+	writeJSON(w, http.StatusOK, sessionInfo{User: user.Name, Role: user.Role, CSRF: sess.CSRF, Method: sess.Method})
 }
 
 func (c *Console) session(w http.ResponseWriter, _ *http.Request, req *request) {
-	writeJSON(w, http.StatusOK, sessionInfo{User: req.user.Name, Role: req.user.Role, CSRF: req.sess.CSRF})
+	method := req.sess.Method
+	if method == "" {
+		method = audit.MethodPassword
+	}
+	writeJSON(w, http.StatusOK, sessionInfo{User: req.user.Name, Role: req.user.Role, CSRF: req.sess.CSRF, Method: method})
 }
 
 func (c *Console) logout(w http.ResponseWriter, r *http.Request, req *request) {

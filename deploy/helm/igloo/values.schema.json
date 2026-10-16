@@ -459,6 +459,74 @@
         }
       }
     },
+    "sso": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "pattern": "^$|^https://|^http://(localhost|127\\.0\\.0\\.1)(:|/|$)",
+          "description": "The identity provider's issuer URL, https."
+        },
+        "clientId": {
+          "type": "string"
+        },
+        "existingSecret": {
+          "$ref": "#/definitions/secretName"
+        },
+        "redirectUrl": {
+          "type": "string",
+          "pattern": "^$|^https://[^/]+/sso/callback$",
+          "description": "https://<console host>/sso/callback, or empty."
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\s,]+$"
+          }
+        },
+        "usernameClaim": {
+          "type": "string",
+          "minLength": 1
+        },
+        "groupsClaim": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowedDomains": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\s,]+$"
+          }
+        },
+        "allowedGroups": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^,]+$"
+          }
+        },
+        "createUsers": {
+          "type": "boolean"
+        },
+        "passwordSignIn": {
+          "type": "boolean"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "accessTokenAudience": {
+          "type": "string"
+        }
+      }
+    },
+    "tokenMaxLifetime": {
+      "type": "string",
+      "pattern": "^[0-9]+d$|^([0-9.]+(h|m|s))+$",
+      "description": "A Go duration or a number of days, at least 1h, e.g. 365d."
+    },
     "autoscaling": {
       "type": "object",
       "additionalProperties": false,

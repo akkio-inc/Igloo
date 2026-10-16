@@ -159,6 +159,95 @@ var migrations = []string{
 		PRIMARY KEY (grantee_type, grantee, privilege, schema_name, table_name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS grants_object ON igloo_auth.grants (lower(schema_name), lower(table_name))`,
+	// Service accounts, disabled users, emails for single sign-on, and the
+	// salt of access tokens for users without a password. Added once, so
+	// later starts take no lock on the table. Older replicas still running
+	// ignore these columns, and let disabled users sign in until they are
+	// upgraded.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_auth' AND table_name = 'users' AND column_name = 'epoch') THEN
+			ALTER TABLE igloo_auth.users
+				ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'person' CHECK (kind IN ('person', 'service')),
+				ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT '',
+				ADD COLUMN IF NOT EXISTS disabled boolean NOT NULL DEFAULT false,
+				ADD COLUMN IF NOT EXISTS email text NOT NULL DEFAULT '',
+				ADD COLUMN IF NOT EXISTS token_salt bytea,
+				ADD COLUMN IF NOT EXISTS epoch bigint NOT NULL DEFAULT 0;
+		END IF;
+	END $$`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON igloo_auth.users (lower(email)) WHERE email <> ''`,
+	// Access tokens: hashes only. See token.go.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.tokens (
+		id               text PRIMARY KEY,
+		user_name        text NOT NULL REFERENCES igloo_auth.users (name) ON DELETE CASCADE,
+		name             text NOT NULL,
+		secret_hash      bytea NOT NULL,
+		scram_salt       bytea NOT NULL,
+		scram_iterations integer NOT NULL,
+		stored_key       bytea NOT NULL,
+		server_key       bytea NOT NULL,
+		created_by       text NOT NULL DEFAULT '',
+		created_at       timestamptz NOT NULL DEFAULT now(),
+		expires_at       timestamptz NOT NULL,
+		last_used_at     timestamptz,
+		UNIQUE (user_name, name)
+	)`,
+	// Single sign-on: which identity provider account each user is, and
+	// which of its groups give which roles.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.identities (
+		issuer       text NOT NULL,
+		subject      text NOT NULL,
+		user_name    text NOT NULL UNIQUE REFERENCES igloo_auth.users (name) ON DELETE CASCADE,
+		email        text NOT NULL DEFAULT '',
+		groups       text[] NOT NULL DEFAULT '{}',
+		created_at   timestamptz NOT NULL DEFAULT now(),
+		last_sign_in timestamptz,
+		PRIMARY KEY (issuer, subject)
+	)`,
+	`CREATE TABLE IF NOT EXISTS igloo_auth.sso_group_roles (
+		group_name text NOT NULL,
+		role       text NOT NULL,
+		granted_by text NOT NULL DEFAULT '',
+		granted_at timestamptz NOT NULL DEFAULT now(),
+		PRIMARY KEY (group_name, role)
+	)`,
+	// SCIM provisioning: the users it manages, and its groups.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.scim_users (
+		user_name      text PRIMARY KEY REFERENCES igloo_auth.users (name) ON DELETE CASCADE,
+		external_id    text NOT NULL DEFAULT '',
+		scim_user_name text NOT NULL DEFAULT '',
+		display_name   text NOT NULL DEFAULT '',
+		given_name     text NOT NULL DEFAULT '',
+		family_name    text NOT NULL DEFAULT '',
+		created_at     timestamptz NOT NULL DEFAULT now(),
+		updated_at     timestamptz NOT NULL DEFAULT now()
+	)`,
+	`CREATE TABLE IF NOT EXISTS igloo_auth.scim_groups (
+		id           text PRIMARY KEY,
+		display_name text NOT NULL UNIQUE,
+		external_id  text NOT NULL DEFAULT '',
+		created_at   timestamptz NOT NULL DEFAULT now(),
+		updated_at   timestamptz NOT NULL DEFAULT now()
+	)`,
+	// Only provisioned users are members, so a group never changes the
+	// roles of a user SCIM does not manage.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.scim_members (
+		group_id  text NOT NULL REFERENCES igloo_auth.scim_groups (id) ON DELETE CASCADE,
+		user_name text NOT NULL REFERENCES igloo_auth.scim_users (user_name) ON DELETE CASCADE,
+		PRIMARY KEY (group_id, user_name)
+	)`,
+	`CREATE INDEX IF NOT EXISTS scim_members_user ON igloo_auth.scim_members (user_name)`,
+}
+
+// userColumns are what Get and List read.
+const userColumns = `name, role, verifier, created_at, kind, owner, disabled, email, token_salt, epoch`
+
+func scanUser(row pgx.Row) (User, error) {
+	var u User
+	err := row.Scan(&u.Name, &u.Role, &u.Verifier, &u.CreatedAt, &u.Kind, &u.Owner, &u.Disabled, &u.Email, &u.TokenSalt, &u.Epoch)
+	return u, err
 }
 
 // OpenPostgresStore connects to url and creates Igloo's tables if needed.
@@ -190,10 +279,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 }
 
 func (s *PostgresStore) Get(ctx context.Context, name string) (User, error) {
-	var u User
-	err := s.pool.QueryRow(ctx,
-		`SELECT name, role, verifier, created_at FROM igloo_auth.users WHERE name = $1`, name,
-	).Scan(&u.Name, &u.Role, &u.Verifier, &u.CreatedAt)
+	u, err := scanUser(s.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM igloo_auth.users WHERE name = $1`, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -201,18 +287,17 @@ func (s *PostgresStore) Get(ctx context.Context, name string) (User, error) {
 }
 
 func (s *PostgresStore) List(ctx context.Context) ([]User, error) {
-	rows, err := s.pool.Query(ctx, `SELECT name, role, verifier, created_at FROM igloo_auth.users ORDER BY name`)
+	rows, err := s.pool.Query(ctx, `SELECT `+userColumns+` FROM igloo_auth.users ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (User, error) {
-		var u User
-		err := row.Scan(&u.Name, &u.Role, &u.Verifier, &u.CreatedAt)
-		return u, err
-	})
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (User, error) { return scanUser(row) })
 }
 
 func (s *PostgresStore) Create(ctx context.Context, u User) error {
+	if u.Kind == "" {
+		u.Kind = KindPerson
+	}
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockNames(ctx, tx); err != nil {
 			return err
@@ -224,13 +309,23 @@ func (s *PostgresStore) Create(ctx context.Context, u User) error {
 		if isRole {
 			return ErrNameTaken
 		}
-		_, err := tx.Exec(ctx,
-			`INSERT INTO igloo_auth.users (name, role, verifier) VALUES ($1, $2, $3)`, u.Name, u.Role, u.Verifier)
+		_, err := tx.Exec(ctx, `INSERT INTO igloo_auth.users (name, role, verifier, kind, owner, disabled, email, token_salt)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			u.Name, u.Role, u.Verifier, u.Kind, u.Owner, u.Disabled, u.Email, u.TokenSalt)
 		return err
 	})
+	return uniqueError(err, ErrExists)
+}
+
+// uniqueError maps a unique violation to exists, or to ErrEmailTaken when
+// it is the email's.
+func uniqueError(err, exists error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return ErrExists
+		if pgErr.ConstraintName == "users_email" {
+			return ErrEmailTaken
+		}
+		return exists
 	}
 	return err
 }
@@ -272,9 +367,11 @@ func (s *PostgresStore) Delete(ctx context.Context, name string) error {
 	})
 }
 
-// changeAdmins applies change and rolls it back if no admin would remain.
-// The table lock stops two concurrent demotions from both passing the check.
-// The names lock comes first, as in every transaction that takes both.
+// changeAdmins applies change and rolls it back if no enabled admin who is
+// a person would remain: admin service accounts, such as SCIM's, cannot
+// sign in to the console or fix what went wrong. The table lock stops two
+// concurrent demotions from both passing the check. The names lock comes
+// first, as in every transaction that takes both.
 func (s *PostgresStore) changeAdmins(ctx context.Context, name string, change func(pgx.Tx) (pgconn.CommandTag, error)) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockNames(ctx, tx); err != nil {
@@ -291,7 +388,8 @@ func (s *PostgresStore) changeAdmins(ctx context.Context, name string, change fu
 			return ErrNotFound
 		}
 		var admins int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM igloo_auth.users WHERE role = 'admin'`).Scan(&admins); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM igloo_auth.users
+				WHERE role = 'admin' AND NOT disabled AND kind = 'person'`).Scan(&admins); err != nil {
 			return err
 		}
 		if admins == 0 {

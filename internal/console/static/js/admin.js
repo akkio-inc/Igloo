@@ -46,14 +46,15 @@ export function createUsers(app) {
   const body = h('div', { class: 'page-body' });
   const el = h('section', { class: 'page', 'aria-label': 'Users' },
     h('div', { class: 'page-head' }, h('h1', { text: 'Users' }),
-      h('span', { class: 'sub', text: 'Users sign in to SQL clients and this console with the same name and password.' }),
+      h('span', { class: 'sub', text: 'Users sign in to SQL clients and this console with the same name, with a password, single sign-on or access tokens.' }),
       h('span', { class: 'spacer' }),
       button('Refresh', { icon: 'refresh', onclick: () => load() })),
     body);
 
   const name = h('input', { placeholder: 'ana', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', required: true, 'aria-label': 'User name' });
   const role = roleSelect('reader', { 'aria-label': 'Role' });
-  const password = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters', required: true, 'aria-label': 'Password' });
+  const password = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters', 'aria-label': 'Password' });
+  const email = h('input', { type: 'email', autocomplete: 'off', placeholder: 'For single sign-on', 'aria-label': 'Email' });
   const createError = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const create = h('form', {
     class: 'card',
@@ -63,13 +64,15 @@ export function createUsers(app) {
       const n = name.value.trim().toLowerCase();
       let msg = '';
       if (!NAME.test(n)) msg = 'A user name is lowercase letters, digits and underscores, starting with a letter or underscore.';
-      else if (password.value.length < 8) msg = 'Use a password of at least 8 characters.';
+      else if (password.value && password.value.length < 8) msg = 'Use a password of at least 8 characters.';
+      else if (!password.value && !email.value.trim()) msg = 'Enter a password, or the email of someone who signs in with single sign-on.';
       if (msg) { createError.textContent = msg; createError.hidden = false; return; }
       try {
-        await api.post('/api/admin/users', { action: 'create', name: n, password: password.value, role: role.value });
+        await api.post('/api/admin/users', { action: 'create', name: n, password: password.value, email: email.value.trim(), role: role.value });
         toast(`Created user ${n}`);
         name.value = '';
         password.value = '';
+        email.value = '';
         load();
       } catch (err) {
         createError.textContent = err.message;
@@ -82,6 +85,7 @@ export function createUsers(app) {
     h('div', { class: 'form-grid' },
       h('div', { class: 'field' }, h('label', { text: 'Name' }), name),
       h('div', { class: 'field' }, h('label', { text: 'Password' }), password),
+      h('div', { class: 'field' }, h('label', { text: 'Email (optional)' }), email),
       h('div', { class: 'field' }, h('label', { text: 'Role' }), role),
       h('button', { class: 'btn primary', type: 'submit' }, icon('plus'), 'Create user')),
     createError));
@@ -104,14 +108,21 @@ export function createUsers(app) {
       clear(body, errorView(e));
       return;
     }
-    const users = res.rows.map((r) => Object.fromEntries(res.columns.map((c, i) => [c, r[i]])));
+    // Service accounts have a page of their own.
+    const users = res.rows.map((r) => Object.fromEntries(res.columns.map((c, i) => [c, r[i]])))
+      .filter((u) => u.type !== 'service');
     users.sort((a, b) => a.name.localeCompare(b.name));
+    const yes = (v) => v === undefined || v === true || v === 't' || v === 'true';
     clear(body, h('div', { class: 'stack' }, create,
       h('div', { class: 'card' },
-        h('div', { class: 'card-head' }, h('h2', { text: plural(users.length, 'user') })),
+        h('div', { class: 'card-head' }, h('h2', { text: plural(users.length, 'user') }),
+          h('span', { class: 'muted', text: 'Service accounts are on their own page.' })),
         h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
-          h('thead', {}, h('tr', {}, h('th', { text: 'Name' }), h('th', { text: 'Role' }), h('th', { text: 'Created' }), h('th', { class: 'num', text: '' }))),
+          h('thead', {}, h('tr', {}, h('th', { text: 'Name' }), h('th', { text: 'Role' }), h('th', { text: 'Signs in with' }),
+            h('th', { text: 'Created' }), h('th', { class: 'num', text: '' }))),
           h('tbody', {}, users.map((u) => {
+            const enabled = yes(u.can_login);
+            const how = [yes(u.has_password) ? 'password' : null, u.sso !== undefined && yes(u.sso) ? 'SSO' : null].filter(Boolean);
             const select = roleSelect(u.role, { 'aria-label': `Role of ${u.name}` });
             select.addEventListener('change', async () => {
               if (u.name === app.user && select.value !== 'admin'
@@ -122,11 +133,16 @@ export function createUsers(app) {
               change({ action: 'role', name: u.name, role: select.value }, `${u.name} is now a ${select.value}`);
             });
             return h('tr', {},
-              h('td', {}, h('span', { class: 'mono', text: u.name }), u.name === app.user ? h('span', { class: 'faint', text: ' (you)' }) : null),
+              h('td', {}, h('span', { class: 'mono', text: u.name }), u.name === app.user ? h('span', { class: 'faint', text: ' (you)' }) : null,
+                u.email ? h('div', { class: 'faint', text: u.email }) : null),
               h('td', {}, select),
+              h('td', { class: 'nowrap' }, enabled ? h('span', { class: 'muted', text: how.join(', ') || 'access tokens' })
+                : h('span', { class: 'badge error', text: 'disabled' })),
               h('td', { class: 'nowrap muted', text: fmtTime(u.created_at) }),
               h('td', { class: 'actions' },
-                button('Reset password', { kind: 'small', onclick: () => resetPassword(u) }),
+                button(yes(u.has_password) ? 'Reset password' : 'Set password', { kind: 'small', onclick: () => resetPassword(u) }),
+                u.can_login === undefined ? null : button(enabled ? 'Disable' : 'Enable', { kind: 'small', onclick: () => toggle(u, enabled) }),
+                yes(u.sso) && u.sso !== undefined ? button('Unlink SSO', { kind: 'small', onclick: () => unlink(u) }) : null,
                 button('Drop', { kind: 'small danger', onclick: () => drop(u) })));
           })))))));
   }
@@ -145,6 +161,22 @@ export function createUsers(app) {
   async function drop(u) {
     const ok = await confirmDialog('Drop user', `Drop user ${u.name}? Their open sessions end within 30 seconds. Their tables stay.`, { confirm: 'Drop user', danger: true });
     if (ok) change({ action: 'drop', name: u.name }, `Dropped user ${u.name}`);
+  }
+
+  async function unlink(u) {
+    const ok = await confirmDialog('Unlink from single sign-on', `Forget which identity provider account ${u.name} is? Their next single sign-on links them again, by email or name, as at a first sign-in. Do this when their account at the provider was replaced.`,
+      { confirm: 'Unlink' });
+    if (ok) change({ action: 'unlink', name: u.name }, `Unlinked ${u.name}`);
+  }
+
+  async function toggle(u, enabled) {
+    if (enabled) {
+      const ok = await confirmDialog('Disable user', `Disable ${u.name}? They cannot sign in with a password, single sign-on or access tokens until enabled again, and their sessions end: in the console at once, in SQL clients within 30 seconds.`,
+        { confirm: 'Disable user', danger: true });
+      if (ok) change({ action: 'disable', name: u.name }, `Disabled ${u.name}`);
+      return;
+    }
+    change({ action: 'enable', name: u.name }, `Enabled ${u.name}`);
   }
 
   return { el, shown: load };

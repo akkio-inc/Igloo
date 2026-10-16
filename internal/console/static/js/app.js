@@ -7,6 +7,7 @@ import { createData } from './data.js';
 import { createHistory } from './history.js';
 import { createJobs, createLoads } from './tasks.js';
 import { createUsers, createRoles, createCompute } from './admin.js';
+import { createTokens, createServiceAccounts, createSSO } from './access.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -34,7 +35,34 @@ function cycleTheme() {
 
 // Sign-in
 
-function showSignIn(message, allowed = true) {
+// Why a single sign-on did not sign the user in, by the code the server
+// puts in ?sso_error= (see internal/console/sso.go).
+const SSO_ERRORS = {
+  expired: 'The sign-in took too long, or was started in another tab. Try again.',
+  denied: 'The identity provider did not sign you in.',
+  failed: 'Igloo could not verify the identity provider\'s answer. Try again, or ask an admin to check Igloo\'s log.',
+  unavailable: 'Igloo could not reach the identity provider. Try again later.',
+  insecure: 'This connection is not encrypted, so single sign-on works only at localhost. Configure TLS to sign in from other machines.',
+  unverified: 'The identity provider did not confirm who you are (no verified email or user name).',
+  domain: 'Accounts of your email domain may not sign in to Igloo.',
+  group: 'Your account is in none of the groups that may sign in to Igloo.',
+  no_user: 'There is no Igloo user for your account. Ask an admin to create one.',
+  conflict: 'Your account matches an Igloo user that belongs to someone else. Ask an admin.',
+  service: 'That account is a service account, which cannot sign in to the console.',
+  disabled: 'Your Igloo user is disabled. Ask an admin.',
+};
+
+// ssoError takes the code a failed single sign-on left in the address,
+// and removes it.
+function ssoError() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get('sso_error');
+  if (!code) return '';
+  history.replaceState(null, '', location.pathname + location.hash);
+  return SSO_ERRORS[code] || 'Single sign-on failed. Try again.';
+}
+
+function showSignIn(message, allowed = true, sso = null) {
   $('loading').hidden = true;
   $('app').hidden = true;
   $('signin').hidden = false;
@@ -42,6 +70,8 @@ function showSignIn(message, allowed = true) {
   error.textContent = message || '';
   error.hidden = !message;
   $('signin-submit').disabled = !allowed;
+  $('signin-sso').hidden = !sso;
+  if (sso) $('signin-sso-label').textContent = `Sign in with ${sso.name}`;
   $('signin-user').focus();
 }
 
@@ -85,8 +115,11 @@ const ROUTES = {
   history: { make: createHistory, title: 'Query history' },
   tasks: { make: createJobs, title: 'Tasks' },
   loads: { make: createLoads, title: 'Load history' },
+  tokens: { make: createTokens, title: 'Access tokens' },
   'admin/users': { make: createUsers, title: 'Users', admin: true },
+  'admin/services': { make: createServiceAccounts, title: 'Service accounts', admin: true },
   'admin/roles': { make: createRoles, title: 'Roles and grants', admin: true },
+  'admin/sso': { make: createSSO, title: 'Single sign-on', admin: true },
   'admin/compute': { make: createCompute, title: 'Compute', admin: true },
 };
 
@@ -95,6 +128,7 @@ function start(session) {
   const app = {
     user: session.user,
     role: session.role,
+    method: session.method,
     isAdmin: session.role === 'admin',
     openWorksheet(sql, name) {
       location.hash = '#/worksheets';
@@ -167,14 +201,16 @@ async function main() {
 
   const note = sessionStorage.getItem('igloo.signedOut');
   sessionStorage.removeItem('igloo.signedOut');
+  const failedSSO = ssoError();
   try {
     start(await api.get('/api/session'));
   } catch (e) {
     if (e.status === 401) {
+      const sso = e.body.sso || null;
       if (e.body.signin === false) {
         showSignIn('This connection is not encrypted, so sign-in works only at localhost. Configure TLS to sign in from other machines.', false);
       } else {
-        showSignIn(note && note !== 'You signed out.' ? note : '');
+        showSignIn(failedSSO || (note && note !== 'You signed out.' ? note : ''), true, sso);
         if (note === 'You signed out.') toast(note);
       }
       return;

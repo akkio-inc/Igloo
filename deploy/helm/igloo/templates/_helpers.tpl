@@ -385,6 +385,10 @@ Outputs YAML comments describing what is missing in that case.
 {{- end -}}
 {{- end -}}
 
+{{- if and $v.sso.issuer (not $v.sso.clientId) -}}
+{{- fail (printf "%ssso.issuer is set, so sso.clientId must be set too: the client ID Igloo is registered under at the identity provider" $prefix) -}}
+{{- end -}}
+
 {{- $missing := list -}}
 {{- if not $location -}}
 {{- $missing = append $missing "a warehouse location: set storage.warehouseLocation (s3://, gs:// or abfss://), or objectStorage.enabled=true for the bundled object store" -}}

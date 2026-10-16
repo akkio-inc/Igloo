@@ -25,6 +25,10 @@
       <input id="signin-password" name="password" type="password" autocomplete="current-password" required>
       <p id="signin-error" class="form-error" role="alert" hidden></p>
       <button id="signin-submit" class="btn primary wide" type="submit">Sign in</button>
+      <div id="signin-sso" class="signin-sso" hidden>
+        <p class="signin-or"><span>or</span></p>
+        <a id="signin-sso-link" class="btn wide" href="/sso/start"><span data-icon="shield"></span><span id="signin-sso-label">Sign in with SSO</span></a>
+      </div>
       <p class="signin-foot">Same user names and passwords as SQL clients such as psql.</p>
     </form>
   </main>
@@ -50,12 +54,15 @@
         <li><a href="#/history" data-route="history"><span data-icon="history"></span>Query history</a></li>
         <li><a href="#/tasks" data-route="tasks"><span data-icon="clock"></span>Tasks</a></li>
         <li><a href="#/loads" data-route="loads"><span data-icon="inbox"></span>Load history</a></li>
+        <li><a href="#/tokens" data-route="tokens"><span data-icon="token"></span>Access tokens</a></li>
       </ul>
       <div id="admin-nav" hidden>
         <p class="nav-heading">Admin</p>
         <ul class="nav">
           <li><a href="#/admin/users" data-route="admin/users"><span data-icon="users"></span>Users</a></li>
+          <li><a href="#/admin/services" data-route="admin/services"><span data-icon="bot"></span>Service accounts</a></li>
           <li><a href="#/admin/roles" data-route="admin/roles"><span data-icon="key"></span>Roles and grants</a></li>
+          <li><a href="#/admin/sso" data-route="admin/sso"><span data-icon="shield"></span>Single sign-on</a></li>
           <li><a href="#/admin/compute" data-route="admin/compute"><span data-icon="cpu"></span>Compute</a></li>
         </ul>
       </div>

@@ -3,9 +3,9 @@
 // roles and grants, and to watch this replica's sessions.
 //
 // The console holds no state of its own. Passwords are checked by the SQL
-// server (pgwire.Server.Authenticate), as for SQL logins, and a signed-in
-// session lives in a sealed cookie, so any replica behind a load balancer
-// serves any request. Everything the console shows or changes it reads or
+// server (pgwire.Server.Authenticate), as for SQL logins, single sign-on by
+// package sso (see sso.go), and a signed-in session lives in a sealed
+// cookie, so any replica behind a load balancer serves any request. Everything the console shows or changes it reads or
 // does with SQL, run as the signed-in user through an in-process SQL session
 // (pgwire.EmbeddedSession) on the same path as statements from SQL clients:
 // the console never decides itself what a user may see or do.
@@ -25,6 +25,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/sso"
 )
 
 // Options configure the console.
@@ -39,7 +40,13 @@ type Options struct {
 	Key []byte
 	// Status describes this replica on the compute page. It may be nil.
 	Status func(context.Context) Status
-	Log    *slog.Logger
+	// SSO, if set, signs users in with an OpenID Connect identity
+	// provider besides passwords.
+	SSO *sso.Service
+	// SCIM, if set, serves SCIM provisioning under /scim/v2/ (package
+	// scim), which authenticates requests itself.
+	SCIM http.Handler
+	Log  *slog.Logger
 }
 
 // Status describes this replica on the compute page, besides its sessions.
@@ -75,6 +82,8 @@ type Console struct {
 	users   auth.Store
 	cookies *sealer
 	status  func(context.Context) Status
+	sso     *sso.Service
+	scim    http.Handler
 	log     *slog.Logger
 	// replica names this process on the compute page.
 	replica string
@@ -102,6 +111,8 @@ func New(opts Options) (*Console, error) {
 		users:   opts.Users,
 		cookies: cookies,
 		status:  opts.Status,
+		sso:     opts.SSO,
+		scim:    opts.SCIM,
 		log:     opts.Log.With("component", "console"),
 		replica: replica,
 		mux:     http.NewServeMux(),
@@ -123,6 +134,12 @@ func (c *Console) routes() {
 	c.mux.HandleFunc("POST /api/admin/grants", c.admin(c.changeGrants))
 	c.mux.HandleFunc("GET /api/admin/compute", c.admin(c.compute))
 	c.mux.HandleFunc("POST /api/admin/cancel", c.admin(c.cancel))
+	c.mux.HandleFunc("GET /api/admin/sso", c.admin(c.ssoStatus))
+	c.mux.HandleFunc("GET /sso/start", c.ssoStart)
+	c.mux.HandleFunc("GET /sso/callback", c.ssoCallback)
+	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
+		c.mux.HandleFunc(method+" /scim/v2/", c.scimRequest)
+	}
 	notFound := func(w http.ResponseWriter, _ *http.Request) { writeError(w, http.StatusNotFound, "no such endpoint") }
 	c.mux.HandleFunc("GET /api/", notFound)
 	c.mux.HandleFunc("POST /api/", notFound)
@@ -143,10 +160,25 @@ func (c *Console) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")
 	h.Set("Cross-Origin-Resource-Policy", "same-origin")
 	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
-	if strings.HasPrefix(r.URL.Path, "/api/") {
+	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/sso/") || strings.HasPrefix(r.URL.Path, "/scim/") {
 		h.Set("Cache-Control", "no-store")
 	}
 	c.mux.ServeHTTP(w, r)
+}
+
+// scimRequest hands SCIM provisioning requests to its handler. Like a
+// password, the bearer token they carry may cross a network only inside
+// TLS.
+func (c *Console) scimRequest(w http.ResponseWriter, r *http.Request) {
+	if c.scim == nil {
+		writeError(w, http.StatusNotFound, "SCIM provisioning needs single sign-on (IGLOO_OIDC_ISSUER) and the metadata database")
+		return
+	}
+	if err := c.signInAllowed(r); err != nil {
+		writeError(w, http.StatusForbidden, "this connection is not encrypted, so SCIM is accepted only at localhost; configure TLS")
+		return
+	}
+	c.scim.ServeHTTP(w, r)
 }
 
 // writeJSON sends v as the response body.

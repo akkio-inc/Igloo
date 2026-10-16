@@ -530,7 +530,7 @@ func TestUsersPage(t *testing.T) {
 	}
 	var users result
 	decode(t, b.do("GET", "/api/admin/users", nil, nil), &users)
-	if len(users.Rows) != 3 || strings.Join(users.Columns, ",") != "name,role,created_at" {
+	if len(users.Rows) != 3 || strings.Join(users.Columns, ",") != "name,role,created_at,type,owner,can_login,has_password,email,sso" {
 		t.Errorf("users %+v", users)
 	}
 

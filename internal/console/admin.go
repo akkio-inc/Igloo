@@ -36,11 +36,17 @@ func (c *Console) listUsers(w http.ResponseWriter, r *http.Request, req *request
 }
 
 type userChange struct {
-	// Action is create, role, password or drop.
+	// Action is create, service, role, password, owner, disable, enable,
+	// unlink (from single sign-on) or drop.
 	Action   string `json:"action"`
 	Name     string `json:"name"`
 	Password string `json:"password"`
 	Role     string `json:"role"`
+	// Email, for create, is how single sign-on recognises a user created
+	// without a password.
+	Email string `json:"email"`
+	// Owner is a service account's owner, for service and owner.
+	Owner string `json:"owner"`
 }
 
 func (c *Console) changeUser(w http.ResponseWriter, r *http.Request, req *request) {
@@ -53,29 +59,53 @@ func (c *Console) changeUser(w http.ResponseWriter, r *http.Request, req *reques
 		return
 	}
 	var role auth.Role
-	if in.Action == "create" || in.Action == "role" {
+	if in.Action == "create" || in.Action == "role" || in.Action == "service" {
 		var err error
 		if role, err = auth.ParseRole(in.Role); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	if (in.Action == "create" || in.Action == "password") && in.Password == "" {
-		writeError(w, http.StatusBadRequest, "enter a password")
+	if (in.Action == "password" || in.Action == "create" && in.Email == "") && in.Password == "" {
+		writeError(w, http.StatusBadRequest, "enter a password, or for a user who signs in with single sign-on, their email")
+		return
+	}
+	if (in.Action == "owner" || in.Action == "service" && in.Owner != "") && !config.ValidName(in.Owner) {
+		writeError(w, http.StatusBadRequest, "the owner must be a user name")
 		return
 	}
 	var sql string
 	switch in.Action {
 	case "create":
-		sql = "CREATE USER " + in.Name + " WITH PASSWORD " + quoteLiteral(in.Password) + " ROLE " + string(role)
+		password := "NULL"
+		if in.Password != "" {
+			password = quoteLiteral(in.Password)
+		}
+		sql = "CREATE USER " + in.Name + " WITH PASSWORD " + password + " ROLE " + string(role)
+		if in.Email != "" {
+			sql += " EMAIL " + quoteLiteral(in.Email)
+		}
+	case "service":
+		sql = "CREATE USER " + in.Name + " TYPE SERVICE ROLE " + string(role)
+		if in.Owner != "" {
+			sql += " OWNER " + in.Owner
+		}
 	case "role":
 		sql = "ALTER USER " + in.Name + " ROLE " + string(role)
 	case "password":
 		sql = "ALTER USER " + in.Name + " PASSWORD " + quoteLiteral(in.Password)
+	case "owner":
+		sql = "ALTER USER " + in.Name + " OWNER " + in.Owner
+	case "disable":
+		sql = "ALTER USER " + in.Name + " NOLOGIN"
+	case "enable":
+		sql = "ALTER USER " + in.Name + " LOGIN"
+	case "unlink":
+		sql = "ALTER USER " + in.Name + " SSO NULL"
 	case "drop":
 		sql = "DROP USER " + in.Name
 	default:
-		writeError(w, http.StatusBadRequest, "action must be create, role, password or drop")
+		writeError(w, http.StatusBadRequest, "action must be create, service, role, password, owner, disable, enable, unlink or drop")
 		return
 	}
 	res, err := c.run(r.Context(), req.user, r, sql)

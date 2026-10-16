@@ -48,6 +48,9 @@ func (s *PostgresStore) DropRole(ctx context.Context, name string) error {
 		if tag.RowsAffected() == 0 {
 			return ErrRoleNotFound
 		}
+		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.sso_group_roles WHERE role = $1`, name); err != nil {
+			return err
+		}
 		_, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'role' AND grantee = $1`, name)
 		return err
 	})
@@ -79,8 +82,11 @@ func (s *PostgresStore) AddMember(ctx context.Context, role, user, by string) er
 		if err := checkGrantee(ctx, tx, GranteeUser, user); err != nil {
 			return err
 		}
+		// A membership single sign-on manages becomes the admin's, so the
+		// next sign-in does not remove it.
 		_, err := tx.Exec(ctx, `INSERT INTO igloo_auth.role_members (role, member, granted_by) VALUES ($1, $2, $3)
-			ON CONFLICT (role, member) DO NOTHING`, role, user, by)
+			ON CONFLICT (role, member) DO UPDATE SET granted_by = EXCLUDED.granted_by, granted_at = now()
+			WHERE igloo_auth.role_members.granted_by = $4`, role, user, by, SSOGrantor)
 		return err
 	})
 }

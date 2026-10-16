@@ -8,11 +8,13 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.339.0
+	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/duckdb/duckdb-go/v2 v2.10506.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/jeroenrinzema/psql-wire v0.20.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/xdg-go/scram v1.2.0
+	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.24.0
 )
 
@@ -130,7 +132,6 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
 	golang.org/x/net v0.59.0 // indirect
-	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

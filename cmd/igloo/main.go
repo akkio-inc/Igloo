@@ -37,6 +37,8 @@ import (
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/scim"
+	"github.com/akkio-inc/igloo/internal/sso"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
@@ -175,19 +177,38 @@ func serve() error {
 
 	jobs := tasks.NewScheduler(taskStore, tasks.Options{Retention: cfg.Audit.Retention, Log: log})
 	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
-	srv, err := pgwire.New(eng, pgwire.Options{
-		Users:            users,
-		TLS:              tlsConfig,
-		RequireTLS:       cfg.TLSRequired,
-		Metrics:          pgwire.NewMetrics(reg),
-		StatementTimeout: cfg.StatementTimeout,
-		MaxConnections:   cfg.MaxConnections,
-		Version:          version,
-		DDL:              objects,
-		Activity:         work,
-		Audit:            history,
-		Tasks:            jobs,
-	}, log)
+	// srv is set before it serves anyone; single sign-on tells it about
+	// role changes.
+	var srv *pgwire.Server
+	single, err := openSSO(cfg, users, func(user string) { srv.UserChanged(user) }, log)
+	if err != nil {
+		return err
+	}
+	opts := pgwire.Options{
+		Users:               users,
+		TLS:                 tlsConfig,
+		RequireTLS:          cfg.TLSRequired,
+		Metrics:             pgwire.NewMetrics(reg),
+		StatementTimeout:    cfg.StatementTimeout,
+		MaxConnections:      cfg.MaxConnections,
+		Version:             version,
+		DDL:                 objects,
+		Activity:            work,
+		Audit:               history,
+		Tasks:               jobs,
+		DisableSSOPasswords: single != nil && !cfg.OIDC.PasswordSignIn,
+		TokenMaxLifetime:    cfg.TokenMaxLifetime,
+	}
+	if single != nil && single.AccessTokensEnabled() {
+		opts.AccessTokens = single
+		if tlsConfig == nil {
+			log.Warn("IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE has no effect without TLS: access tokens are accepted only inside TLS")
+		}
+	}
+	if srv, err = pgwire.New(eng, opts, log); err != nil {
+		return err
+	}
+	provisioning, err := openSCIM(users, single, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
 		return err
 	}
@@ -231,7 +252,7 @@ func serve() error {
 			return err
 		}
 		status := consoleStatus(cfg, started, work, health, schedule, maintains)
-		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, tlsConfig, status, errc, log); err != nil {
+		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, single, provisioning, tlsConfig, status, errc, log); err != nil {
 			_ = consoleLn.Close()
 			return err
 		}
@@ -339,6 +360,51 @@ func openUsers(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.S
 		log.Info("created admin user", "user", cfg.AdminUser)
 	}
 	return store, nil
+}
+
+// openSSO sets up single sign-on, when IGLOO_OIDC_ISSUER is set. It needs
+// the metadata database, which keeps the links between users and identity
+// provider accounts. changed is told about users whose roles a sign-in
+// changed.
+func openSSO(cfg config.Config, users auth.Store, changed func(string), log *slog.Logger) (*sso.Service, error) {
+	if !cfg.OIDC.Enabled() {
+		return nil, nil
+	}
+	accounts, ok1 := users.(auth.AccountStore)
+	links, ok2 := users.(auth.SSOStore)
+	if !ok1 || !ok2 {
+		return nil, errors.New("IGLOO_OIDC_ISSUER needs IGLOO_METADATA_DATABASE_URL, where single sign-on keeps who is who")
+	}
+	provisioned, _ := users.(auth.SCIMStore)
+	single, err := sso.New(sso.Options{Config: cfg.OIDC, Users: users, Accounts: accounts, SSO: links, SCIM: provisioned,
+		Changed: changed, Log: log})
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.OIDC.AllowedDomains) == 0 && len(cfg.OIDC.AllowedGroups) == 0 {
+		log.Warn("single sign-on admits every account of the identity provider; set IGLOO_OIDC_ALLOWED_DOMAINS or IGLOO_OIDC_ALLOWED_GROUPS to limit it",
+			"issuer", cfg.OIDC.Issuer)
+	}
+	log.Info("single sign-on is on", "issuer", cfg.OIDC.Issuer, "create_users", cfg.OIDC.CreateUsers,
+		"password_sign_in", cfg.OIDC.PasswordSignIn, "access_tokens", cfg.OIDC.AccessTokenAudience != "")
+	return single, nil
+}
+
+// openSCIM sets up SCIM provisioning, which comes with single sign-on. It
+// returns nil without single sign-on.
+func openSCIM(users auth.Store, single *sso.Service, changed func(string), log *slog.Logger) (http.Handler, error) {
+	store, ok := users.(auth.SCIMStore)
+	accounts, _ := users.(auth.AccountStore)
+	tokens, _ := users.(auth.TokenStore)
+	if single == nil || !ok || accounts == nil || tokens == nil {
+		return nil, nil
+	}
+	h, err := scim.New(scim.Options{Users: users, Accounts: accounts, SCIM: store, Tokens: auth.NewTokenChecker(users, tokens),
+		SSO: single, Changed: changed, Log: log})
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
 }
 
 // openHistory opens where the query and login history is kept: the

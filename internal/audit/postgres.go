@@ -52,6 +52,17 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS login_history_time ON igloo_audit.login_history (event_time DESC, event_id DESC)`,
 	`CREATE INDEX IF NOT EXISTS login_history_user ON igloo_audit.login_history (user_name, event_time DESC, event_id DESC)`,
+	// How each login signed in, and with which access token. Added once,
+	// so later starts take no lock on the table.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_audit' AND table_name = 'login_history' AND column_name = 'token_name') THEN
+			ALTER TABLE igloo_audit.login_history
+				ADD COLUMN IF NOT EXISTS auth_method text,
+				ADD COLUMN IF NOT EXISTS token_name text;
+		END IF;
+	END $$`,
 }
 
 // PostgresStore keeps history in the "igloo_audit" schema of the metadata
@@ -112,10 +123,11 @@ func (s *PostgresStore) WriteLogins(ctx context.Context, ls []Login) error {
 	rows := make([][]any, len(ls))
 	for i, x := range ls {
 		rows[i] = []any{x.ID, x.Time, x.User, x.Result, nullable(x.Reason), nullable(x.ClientAddress),
-			nullable(x.ApplicationName), nullable(x.SessionID)}
+			nullable(x.ApplicationName), nullable(x.SessionID), nullable(x.Method), nullable(x.Token)}
 	}
 	return s.copy(ctx, "login_history", "event_id", []string{
 		"event_id", "event_time", "user_name", "result", "reason", "client_address", "application_name", "session_id",
+		"auth_method", "token_name",
 	}, rows)
 }
 
@@ -171,7 +183,8 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 
 func (s *PostgresStore) Logins(ctx context.Context, v Viewer, p Page) ([]Login, error) {
 	rows, err := s.pool.Query(ctx, `SELECT event_id, event_time, user_name, result, coalesce(reason, ''),
-			coalesce(client_address, ''), coalesce(application_name, ''), coalesce(session_id, '')
+			coalesce(client_address, ''), coalesce(application_name, ''), coalesce(session_id, ''),
+			coalesce(auth_method, ''), coalesce(token_name, '')
 		FROM igloo_audit.login_history
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR event_time >= $2)
@@ -184,7 +197,8 @@ func (s *PostgresStore) Logins(ctx context.Context, v Viewer, p Page) ([]Login, 
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Login, error) {
 		var x Login
-		err := row.Scan(&x.ID, &x.Time, &x.User, &x.Result, &x.Reason, &x.ClientAddress, &x.ApplicationName, &x.SessionID)
+		err := row.Scan(&x.ID, &x.Time, &x.User, &x.Result, &x.Reason, &x.ClientAddress, &x.ApplicationName, &x.SessionID,
+			&x.Method, &x.Token)
 		return x, err
 	})
 }

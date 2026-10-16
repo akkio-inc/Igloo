@@ -227,8 +227,9 @@ EXECUTE TASK hourly_rollup;   -- run it now, as it would run on its schedule
   and returns its error if it fails.
 - **It runs as its owner**, the user who created it, in a new session of
   theirs, with the privileges they have when it runs. If they lose a
-  privilege the task needs, its runs fail; if they are dropped, its runs
-  fail and it is suspended. A task never runs with more privileges than its
+  privilege the task needs, its runs fail; while they are disabled
+  (`NOLOGIN`), its runs fail; if they are dropped, its runs fail and it is
+  suspended. A task never runs with more privileges than its
   owner has. Its statements are in the owner's query history, with client
   `task <name>`.
 - **One run at a time, on one replica.** Each scheduled run is claimed by

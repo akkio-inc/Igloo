@@ -18,6 +18,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/console"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/sso"
 )
 
 // consoleSecret names the key in igloo_auth.secrets that seals console
@@ -36,14 +37,18 @@ func listenConsole(addr string) (net.Listener, error) {
 }
 
 // serveConsole serves the web console on ln, over HTTPS with the SQL
-// port's certificate when TLS is configured. Serving errors go to errc.
-func serveConsole(ctx context.Context, ln net.Listener, srv *pgwire.Server, users auth.Store, tlsConfig *tls.Config,
-	status func(context.Context) console.Status, errc chan<- error, log *slog.Logger) (*http.Server, error) {
+// port's certificate when TLS is configured, with single sign-on if single
+// is not nil and SCIM provisioning if provisioning is not. Serving errors
+// go to errc.
+func serveConsole(ctx context.Context, ln net.Listener, srv *pgwire.Server, users auth.Store, single *sso.Service,
+	provisioning http.Handler, tlsConfig *tls.Config, status func(context.Context) console.Status, errc chan<- error,
+	log *slog.Logger) (*http.Server, error) {
 	key, err := consoleKey(ctx, users)
 	if err != nil {
 		return nil, fmt.Errorf("console session key: %w", err)
 	}
-	handler, err := console.New(console.Options{SQL: srv, Users: users, Key: key, Status: status, Log: log})
+	handler, err := console.New(console.Options{SQL: srv, Users: users, Key: key, Status: status, SSO: single,
+		SCIM: provisioning, Log: log})
 	if err != nil {
 		return nil, err
 	}

@@ -225,6 +225,53 @@ console:
 flightSQL:
   enabled: true
   port: 31337
+# Single sign-on to the web console with an OpenID Connect identity provider
+# (Okta, Microsoft Entra ID, Google Workspace, Keycloak), and access tokens for
+# SQL clients of people who sign in that way; see docs/sso.md. Turn on TLS
+# (tls.existingSecret) unless the console is reached only through kubectl
+# port-forward.
+sso:
+  # The provider's issuer URL -> IGLOO_OIDC_ISSUER. Empty turns single
+  # sign-on off.
+  issuer: ""
+  # -> IGLOO_OIDC_CLIENT_ID
+  clientId: ""
+  # Secret with key "client-secret", mounted as a file ->
+  # IGLOO_OIDC_CLIENT_SECRET_FILE. Empty for a public client (PKCE only).
+  existingSecret: ""
+  # The console's callback as registered at the provider,
+  # https://<console host>/sso/callback -> IGLOO_OIDC_REDIRECT_URL. Empty:
+  # derived from each request, which works when browsers reach the console
+  # under one name.
+  redirectUrl: ""
+  # -> IGLOO_OIDC_SCOPES. Add "groups" for providers that send groups only
+  # when asked (Okta, Dex).
+  scopes: [openid, profile, email]
+  # Claim that names and recognises users -> IGLOO_OIDC_USERNAME_CLAIM: email
+  # (verified), or preferred_username for Microsoft Entra ID.
+  usernameClaim: email
+  # -> IGLOO_OIDC_GROUPS_CLAIM
+  groupsClaim: groups
+  # Only these email domains, and members of these groups, may sign in ->
+  # IGLOO_OIDC_ALLOWED_DOMAINS, IGLOO_OIDC_ALLOWED_GROUPS. Google Workspace
+  # needs allowedDomains.
+  allowedDomains: []
+  allowedGroups: []
+  # Create an Igloo user, with role none, at someone's first sign-in ->
+  # IGLOO_OIDC_CREATE_USERS. false: admins create users first.
+  createUsers: true
+  # Let users linked to the provider still sign in with a password ->
+  # IGLOO_OIDC_PASSWORD_SIGNIN.
+  passwordSignIn: true
+  # Label of the sign-in button -> IGLOO_OIDC_DISPLAY_NAME.
+  displayName: SSO
+  # Accept the provider's access tokens for this audience as SQL passwords,
+  # inside TLS -> IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE. Empty: off.
+  accessTokenAudience: ""
+
+# Longest lifetime of an access token (CREATE TOKEN ... EXPIRES) ->
+# IGLOO_TOKEN_MAX_LIFETIME.
+tokenMaxLifetime: 365d
 
 autoscaling:
   enabled: false

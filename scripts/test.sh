@@ -10,7 +10,7 @@ go_image="${GO_IMAGE:-golang:1.27-bookworm}"
 name="igloo-test-$$"
 
 cleanup() {
-  docker rm -f "$name-db" >/dev/null 2>&1 || true
+  docker rm -f -v "$name-db" >/dev/null 2>&1 || true
   docker network rm "$name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT

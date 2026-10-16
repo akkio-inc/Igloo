@@ -98,6 +98,24 @@ service:
   loadBalancerSourceRanges: ["203.0.113.0/24"]
 ```
 
+### Single sign-on
+
+Register Igloo at the identity provider with the redirect URI
+`https://<console host>:8443/sso/callback`, put the client secret in a
+Secret, and add the `sso` values ([details](../../../docs/sso.md)):
+
+```sh
+kubectl -n igloo create secret generic igloo-oidc --from-literal=client-secret='<client secret>'
+```
+
+```yaml
+sso:
+  issuer: https://agency.okta.com
+  clientId: 0oa1b2c3d4
+  existingSecret: igloo-oidc
+  allowedDomains: [agency.com]
+```
+
 ```sh
 helm install igloo deploy/helm/igloo --namespace igloo --values values.yaml
 ```
@@ -279,6 +297,18 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `console.port` | `8443` | Console port on the SQL Service |
 | `flightSQL.enabled` | `true` | [Arrow Flight SQL](../../../docs/flight-sql.md) on the SQL Service; it serves clients only over TLS or through `kubectl port-forward` |
 | `flightSQL.port` | `31337` | Flight SQL port on the SQL Service |
+| `sso.issuer` | `""` | [Single sign-on](../../../docs/sso.md): the OpenID Connect provider's issuer URL (`IGLOO_OIDC_ISSUER`). Empty: off. |
+| `sso.clientId` | `""` | `IGLOO_OIDC_CLIENT_ID`; required with `sso.issuer` |
+| `sso.existingSecret` | `""` | Secret with key `client-secret`, mounted as `IGLOO_OIDC_CLIENT_SECRET_FILE`. Empty for a public client. |
+| `sso.redirectUrl` | `""` | `https://<console host>/sso/callback` as registered at the provider; empty: from each request |
+| `sso.scopes` | `[openid, profile, email]` | Add `groups` where the provider needs it |
+| `sso.usernameClaim`, `sso.groupsClaim` | `email`, `groups` | `preferred_username` for Microsoft Entra ID |
+| `sso.allowedDomains`, `sso.allowedGroups` | `[]` | Only these email domains, and members of these groups, may sign in. Google needs `allowedDomains`. |
+| `sso.createUsers` | `true` | Create users, role `none`, at their first sign-in |
+| `sso.passwordSignIn` | `true` | `false`: users linked to the provider may not use passwords |
+| `sso.displayName` | `SSO` | Label of the sign-in button |
+| `sso.accessTokenAudience` | `""` | Accept the provider's access tokens for this audience as SQL passwords, inside TLS |
+| `tokenMaxLifetime` | `365d` | Longest lifetime of an access token (`IGLOO_TOKEN_MAX_LIFETIME`) |
 | `service.annotations` | `{}` | |
 | `service.loadBalancerSourceRanges` | `[]` | Client CIDRs allowed through a LoadBalancer |
 | `service.loadBalancerClass`, `service.externalTrafficPolicy` | `""` | |

@@ -267,6 +267,48 @@ spec:
               value: {{ .Values.maintenance.enabled | quote }}
             - name: IGLOO_SNAPSHOT_RETENTION
               value: {{ .Values.maintenance.snapshotRetention | quote }}
+            - name: IGLOO_TOKEN_MAX_LIFETIME
+              value: {{ .Values.tokenMaxLifetime | quote }}
+            {{- with .Values.sso }}
+            {{- if .issuer }}
+            - name: IGLOO_OIDC_ISSUER
+              value: {{ .issuer | quote }}
+            - name: IGLOO_OIDC_CLIENT_ID
+              value: {{ .clientId | quote }}
+            {{- if .existingSecret }}
+            - name: IGLOO_OIDC_CLIENT_SECRET_FILE
+              value: /etc/igloo/oidc/client-secret
+            {{- end }}
+            {{- with .redirectUrl }}
+            - name: IGLOO_OIDC_REDIRECT_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: IGLOO_OIDC_SCOPES
+              value: {{ join " " .scopes | quote }}
+            - name: IGLOO_OIDC_USERNAME_CLAIM
+              value: {{ .usernameClaim | quote }}
+            - name: IGLOO_OIDC_GROUPS_CLAIM
+              value: {{ .groupsClaim | quote }}
+            {{- with .allowedDomains }}
+            - name: IGLOO_OIDC_ALLOWED_DOMAINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .allowedGroups }}
+            - name: IGLOO_OIDC_ALLOWED_GROUPS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: IGLOO_OIDC_CREATE_USERS
+              value: {{ .createUsers | quote }}
+            - name: IGLOO_OIDC_PASSWORD_SIGNIN
+              value: {{ .passwordSignIn | quote }}
+            - name: IGLOO_OIDC_DISPLAY_NAME
+              value: {{ .displayName | quote }}
+            {{- with .accessTokenAudience }}
+            - name: IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -303,6 +345,11 @@ spec:
               mountPath: /etc/igloo/tls
               readOnly: true
             {{- end }}
+            {{- if and .Values.sso.issuer .Values.sso.existingSecret }}
+            - name: oidc
+              mountPath: /etc/igloo/oidc
+              readOnly: true
+            {{- end }}
       volumes:
         - name: spill
           emptyDir:
@@ -317,6 +364,17 @@ spec:
           secret:
             secretName: {{ .Values.tls.existingSecret }}
             defaultMode: 0440
+        {{- end }}
+        {{- if and .Values.sso.issuer .Values.sso.existingSecret }}
+        # Only the client secret, as a file, so it is not in the process's
+        # environment.
+        - name: oidc
+          secret:
+            secretName: {{ .Values.sso.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: client-secret
+                path: client-secret
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

@@ -193,7 +193,9 @@ FROM igloo.login_history WHERE result = 'failure';
 | `client_address`, `application_name` | Where the session came from |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
-`failure`), `reason`, `client_address`, `application_name` and `session_id`.
+`failure`), `reason`, `client_address`, `application_name`, `session_id`,
+`auth_method` (`password`, `token`, `sso` or `access_token`, when known) and
+`token_name`, the [access token](sso.md#access-tokens) a login used.
 The runs of tasks, pipes and materialized views are in `igloo.task_history`,
 and the files `COPY INTO` loaded in `igloo.load_history`, with the same
 rule: admins see everything, other users their own (see
@@ -297,7 +299,9 @@ catalog.
 
 Connect with any PostgreSQL connection string, for example
 `postgres://ana@igloo.example.com:5432/igloo?sslmode=require`. The database
-name is ignored.
+name is ignored. The password may be an [access token](sso.md#access-tokens)
+(`CREATE TOKEN`), which is how people who sign in with single sign-on, and
+service accounts, connect BI tools, dbt and scripts.
 
 ## Differences from PostgreSQL
 
@@ -305,7 +309,11 @@ name is ignored.
   stored procedures, triggers, sequences on Iceberg tables, `LISTEN/NOTIFY`
   and row-level security are not available.
 - Users, roles and passwords are managed with `CREATE USER`, `ALTER USER`,
-  `DROP USER` and `SHOW USERS` (see [operations](operations.md#users-and-roles)).
+  `DROP USER` and `SHOW USERS` (see [operations](operations.md#users-and-roles)),
+  with Igloo's own options: `TYPE SERVICE`, `OWNER`, `EMAIL`, `LOGIN` and
+  `NOLOGIN`, `PASSWORD NULL`. Access tokens are managed with `CREATE TOKEN`,
+  `SHOW TOKENS` and `DROP TOKEN`, and single sign-on's group mappings with
+  `GRANT role TO SSO GROUP 'name'` (see [single sign-on](sso.md)).
   `GRANT` and `REVOKE` cover tables and schemas of the Iceberg catalog (see
   [roles and grants](#roles-and-grants)); there are no column privileges,
   `GRANT OPTION`, `USAGE` or roles granted to roles.

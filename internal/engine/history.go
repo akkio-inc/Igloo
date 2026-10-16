@@ -268,12 +268,14 @@ func (t historyTypes) loginColumns() []duckdb.ColumnInfo {
 		{Name: "client_address", T: t.varchar},
 		{Name: "application_name", T: t.varchar},
 		{Name: "session_id", T: t.varchar},
+		{Name: "auth_method", T: t.varchar},
+		{Name: "token_name", T: t.varchar},
 	}
 }
 
 func loginValues(x audit.Login) []any {
 	return []any{x.Time, x.User, x.Result, nullString(x.Reason), nullString(x.ClientAddress),
-		nullString(x.ApplicationName), nullString(x.SessionID)}
+		nullString(x.ApplicationName), nullString(x.SessionID), nullString(x.Method), nullString(x.Token)}
 }
 
 func nullString(s string) any {

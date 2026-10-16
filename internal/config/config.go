@@ -55,6 +55,10 @@ type Config struct {
 	Storage     Storage
 	Maintenance Maintenance
 	Audit       Audit
+	// OIDC configures single sign-on to the web console (see sso.go).
+	OIDC OIDC
+	// TokenMaxLifetime caps how long an access token may last.
+	TokenMaxLifetime time.Duration
 }
 
 // Audit controls the query and login history.
@@ -393,6 +397,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("IGLOO_WAREHOUSE_LOCATION: %w", err)
 		}
 	}
+
+	loadOIDC(&cfg, lookup, addErr)
 
 	return cfg, errors.Join(errs...)
 }

@@ -15,6 +15,9 @@ otherwise unchanged except for these patches:
 - `igloo_embedded.go` (new): `PreparedStatement.Columns` and
   `PreparedStatement.Run`, so Igloo's in-process sessions (the web console)
   can run what its parse function prepared without a client connection.
+- `igloo_tls.go` (new) and `wire.go`, `serve`: `IsTLS` reports whether a
+  connection negotiated TLS, so authentication can ask for a clear-text
+  password (an identity provider's access token) only inside TLS.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

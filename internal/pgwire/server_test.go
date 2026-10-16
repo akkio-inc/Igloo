@@ -567,13 +567,19 @@ func TestUserManagement(t *testing.T) {
 	}
 
 	type row struct {
-		Name    string
-		Role    string
-		Created time.Time
+		Name     string
+		Role     string
+		Created  time.Time
+		Type     string
+		Owner    *string
+		CanLogin bool
+		Password bool
+		Email    *string
+		SSO      bool
 	}
 	rows, _ := admin.Query(ctx, "SHOW USERS")
 	users, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
-	if err != nil || len(users) != 2 {
+	if err != nil || len(users) != 2 || users[0].Type != "person" || !users[0].CanLogin || !users[0].Password {
 		t.Fatalf("SHOW USERS: %v %v", users, err)
 	}
 
@@ -592,9 +598,8 @@ func TestUserManagement(t *testing.T) {
 
 	var seen []string
 	rows, _ = ana.Query(ctx, "SHOW USERS")
-	for rows.Next() {
-		var r row
-		_ = rows.Scan(&r.Name, &r.Role, &r.Created)
+	mine, _ := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
+	for _, r := range mine {
 		seen = append(seen, r.Name)
 	}
 	if !reflect.DeepEqual(seen, []string{"ana"}) {

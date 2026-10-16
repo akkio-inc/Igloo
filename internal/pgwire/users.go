@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -26,13 +27,27 @@ type userCommand struct {
 	verb     string // CREATE, ALTER, DROP or SHOW
 	name     string // empty for SHOW
 	password *string
-	role     *auth.Role
-	ifExists bool
+	// noPassword is set by PASSWORD NULL.
+	noPassword bool
+	role       *auth.Role
+	kind       *auth.Kind
+	owner      *string
+	// email is empty for EMAIL NULL.
+	email *string
+	// login is set by LOGIN (true) and NOLOGIN (false).
+	login *bool
+	// unlinkSSO is set by SSO NULL: forget the user's single sign-on
+	// identity, so their next sign-in links one again.
+	unlinkSSO bool
+	ifExists  bool
 	// currentUser is set for ALTER USER CURRENT_USER.
 	currentUser bool
-	// acl, when set, makes this a role or grant command instead (see
-	// grants.go).
-	acl *aclCommand
+	// acl, token or group, when set, makes this a role or grant command
+	// (see grants.go), an access token command (tokens.go) or a single
+	// sign-on group mapping (ssogroups.go) instead.
+	acl   *aclCommand
+	token *tokenCommand
+	group *groupCommand
 }
 
 // columns describes the rows the command sends, if any.
@@ -40,20 +55,41 @@ func (c userCommand) columns() wire.Columns {
 	switch {
 	case c.acl != nil:
 		return c.acl.columns()
+	case c.token != nil:
+		return c.token.columns()
+	case c.group != nil:
+		return c.group.columns()
 	case c.verb == "SHOW":
 		return userColumns
 	}
 	return nil
 }
 
+// passwordOnly reports whether an ALTER USER changes nothing but the
+// password, which users may do to their own.
+func (c userCommand) passwordOnly() bool {
+	return (c.password != nil || c.noPassword) && c.role == nil && c.kind == nil && c.owner == nil &&
+		c.email == nil && c.login == nil && !c.unlinkSSO
+}
+
 // parseUserCommands recognises queries made of user-management statements:
 //
-//	CREATE USER name [WITH] PASSWORD 'secret' [ROLE admin|writer|reader|none]
-//	ALTER USER name|CURRENT_USER [WITH] [PASSWORD 'secret'] [ROLE role]
+//	CREATE USER name [WITH] option ...
+//	ALTER USER name|CURRENT_USER [WITH] option ...
 //	DROP USER [IF EXISTS] name
 //	SHOW USERS
 //
-// and the role and grant statements of grants.go.
+// where the options are
+//
+//	PASSWORD 'secret' | PASSWORD NULL
+//	ROLE admin|writer|reader|none
+//	TYPE PERSON|SERVICE            (CREATE only)
+//	OWNER name                     (service accounts)
+//	EMAIL 'address' | EMAIL NULL
+//	LOGIN | NOLOGIN
+//	SSO NULL                       (ALTER only: unlink from single sign-on)
+//
+// and the statements of grants.go, tokens.go and ssogroups.go.
 //
 // ok is false when the query holds none. err reports a malformed command,
 // or one mixed with other SQL, which DuckDB would reject anyway.
@@ -99,6 +135,18 @@ func parseUserCommands(query string) (cmds []userCommand, ok bool, err error) {
 // parseUserCommand parses one statement's tokens. ok is false when it is not
 // a user-management statement.
 func parseUserCommand(toks []token) (cmd userCommand, ok bool, err error) {
+	if tc, ok, err := parseTokenCommand(toks); ok {
+		if err != nil {
+			return userCommand{}, true, err
+		}
+		return userCommand{verb: tc.verb(), token: tc}, true, nil
+	}
+	if gc, ok, err := parseGroupCommand(toks); ok {
+		if err != nil {
+			return userCommand{}, true, err
+		}
+		return userCommand{verb: gc.verb(), group: gc}, true, nil
+	}
 	if acl, ok, err := parseACLCommand(toks); ok {
 		if err != nil {
 			return userCommand{}, true, err
@@ -156,42 +204,116 @@ func parseUserCommand(toks []token) (cmd userCommand, ok bool, err error) {
 	if len(rest) > 0 && rest[0].upper() == "WITH" {
 		rest = rest[1:]
 	}
+	seen := map[string]bool{}
 	for len(rest) > 0 {
+		option := rest[0].upper()
+		if option == "NOLOGIN" {
+			option = "LOGIN"
+		}
+		if seen[option] {
+			return syntax("conflicting or redundant option %s", rest[0].text)
+		}
+		seen[option] = true
+		// LOGIN and NOLOGIN take no value; the others take one.
+		if option == "LOGIN" {
+			login := rest[0].upper() == "LOGIN"
+			cmd.login, rest = &login, rest[1:]
+			continue
+		}
 		if len(rest) < 2 {
 			return syntax("expected a value after %s", rest[0].text)
 		}
-		switch rest[0].upper() {
+		value := rest[1]
+		isNull := value.kind == tokWord && value.upper() == "NULL"
+		switch option {
 		case "PASSWORD":
-			if rest[1].kind != tokString {
-				return syntax("PASSWORD needs a quoted string")
+			switch {
+			case isNull:
+				cmd.noPassword = true
+			case value.kind == tokString:
+				pw := value.text
+				cmd.password = &pw
+			default:
+				return syntax("PASSWORD needs a quoted string, or NULL")
 			}
-			pw := rest[1].text
-			cmd.password = &pw
 		case "ROLE":
-			role, err := auth.ParseRole(rest[1].ident())
+			role, err := auth.ParseRole(value.ident())
 			if err != nil {
 				return userCommand{}, true, pgerror.WithCode(err, codes.InvalidParameterValue)
 			}
 			cmd.role = &role
+		case "TYPE":
+			if verb != "CREATE" {
+				return userCommand{}, true, pgerror.WithCode(errors.New("a user's type cannot change; create another user"),
+					codes.FeatureNotSupported)
+			}
+			kind, err := auth.ParseKind(value.ident())
+			if err != nil {
+				return userCommand{}, true, pgerror.WithCode(err, codes.InvalidParameterValue)
+			}
+			cmd.kind = &kind
+		case "OWNER":
+			owner, err := principalName(value)
+			if err != nil {
+				return userCommand{}, true, err
+			}
+			cmd.owner = &owner
+		case "EMAIL":
+			email := ""
+			switch {
+			case isNull:
+			case value.kind == tokString:
+				if email = auth.NormalizeEmail(value.text); !validEmail(email) {
+					return userCommand{}, true, pgerror.WithCode(fmt.Errorf("%q is not an email address", value.text),
+						codes.InvalidParameterValue)
+				}
+			default:
+				return syntax("EMAIL needs a quoted string, or NULL")
+			}
+			cmd.email = &email
+		case "SSO":
+			if verb != "ALTER" || !isNull {
+				return syntax("only ALTER USER name SSO NULL, which unlinks the user from single sign-on, is supported")
+			}
+			cmd.unlinkSSO = true
 		default:
-			return syntax("unexpected %q; expected PASSWORD or ROLE", rest[0].text)
+			return syntax("unexpected %q; expected PASSWORD, ROLE, TYPE, OWNER, EMAIL, LOGIN, NOLOGIN or SSO", rest[0].text)
 		}
 		rest = rest[2:]
 	}
 
-	if verb == "CREATE" && cmd.password == nil {
-		return syntax("CREATE USER needs a PASSWORD")
-	}
-	if verb == "ALTER" && cmd.password == nil && cmd.role == nil {
-		return syntax("ALTER USER needs PASSWORD or ROLE")
+	service := cmd.kind != nil && *cmd.kind == auth.KindService
+	switch {
+	case verb == "CREATE" && service && cmd.password != nil:
+		return userCommand{}, true, pgerror.WithCode(
+			errors.New("service accounts have no password; they sign in with access tokens (CREATE TOKEN ... FOR USER)"),
+			codes.InvalidParameterValue)
+	case verb == "CREATE" && !service && cmd.owner != nil:
+		return syntax("OWNER applies to service accounts (TYPE SERVICE)")
+	case verb == "CREATE" && !service && cmd.password == nil && !cmd.noPassword:
+		return syntax("CREATE USER needs a PASSWORD, or PASSWORD NULL for a user who signs in with single sign-on or access tokens")
+	case verb == "ALTER" && len(seen) == 0:
+		return syntax("ALTER USER needs PASSWORD, ROLE, OWNER, EMAIL, LOGIN, NOLOGIN or SSO NULL")
 	}
 	return cmd, true, nil
 }
 
+// validEmail is a loose check that s is an email address.
+func validEmail(s string) bool {
+	local, domain, ok := strings.Cut(s, "@")
+	return ok && local != "" && domain != "" && !strings.Contains(domain, "@") && len(s) <= 254 &&
+		!strings.ContainsFunc(s, unicode.IsSpace)
+}
+
 // runUserCommand executes cmd on behalf of sess and writes the result to w.
 func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userCommand, w wire.DataWriter) error {
-	if cmd.acl != nil {
+	switch {
+	case cmd.acl != nil:
 		return s.runACLCommand(ctx, sess, cmd.acl, w)
+	case cmd.token != nil:
+		return s.runTokenCommand(ctx, sess, cmd.token, w)
+	case cmd.group != nil:
+		return s.runGroupCommand(ctx, sess, cmd.group, w)
 	}
 	me := sess.currentUser()
 	isAdmin := me.Role == auth.RoleAdmin
@@ -200,72 +322,30 @@ func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userComm
 	}
 
 	if cmd.verb == "SHOW" {
-		users, err := s.users.List(ctx)
-		if err != nil {
-			return err
-		}
-		for _, u := range users {
-			// Non-admins see only themselves.
-			if !isAdmin && u.Name != me.Name {
-				continue
-			}
-			if err := w.Row([]any{u.Name, string(u.Role), u.CreatedAt}); err != nil {
-				return err
-			}
-		}
-		return w.Complete(fmt.Sprintf("SELECT %d", w.Written()))
+		return s.showUsers(ctx, me, w)
 	}
 
 	// Anyone may change their own password; everything else needs admin.
-	ownPassword := cmd.verb == "ALTER" && cmd.name == me.Name && cmd.role == nil
+	ownPassword := cmd.verb == "ALTER" && cmd.name == me.Name && cmd.passwordOnly()
 	if !isAdmin && !ownPassword {
 		return pgerror.WithCode(fmt.Errorf("permission denied: %s USER requires the admin role", cmd.verb),
 			codes.InsufficientPrivilege)
 	}
-
-	var verifier string
-	if cmd.password != nil {
-		v, err := verifierFor(*cmd.password)
-		if err != nil {
-			return err
-		}
-		verifier = v
+	// A stolen access token must not let its holder set a password that
+	// outlives it.
+	if cmd.name == me.Name && (cmd.password != nil || cmd.noPassword) && sess.bearer() {
+		return pgerror.WithCode(errors.New("permission denied: a session that signed in with an access token, or a task, cannot change its user's password"),
+			codes.InsufficientPrivilege)
 	}
 
 	var err error
 	switch cmd.verb {
 	case "CREATE":
-		role := auth.RoleReader
-		if cmd.role != nil {
-			role = *cmd.role
-		}
-		// Users and custom roles share names. The Postgres store checks
-		// this itself, atomically; this covers the others.
-		if isRole, rerr := s.isCustomRole(ctx, cmd.name); rerr != nil {
-			return rerr
-		} else if isRole {
-			return userStoreError(auth.ErrNameTaken, cmd.name)
-		}
-		err = s.users.Create(ctx, auth.User{Name: cmd.name, Role: role, Verifier: verifier})
+		err = s.createUser(ctx, me, cmd)
 	case "ALTER":
-		if cmd.role != nil {
-			err = s.users.SetRole(ctx, cmd.name, *cmd.role)
-		}
-		if err == nil && cmd.password != nil {
-			err = s.users.SetVerifier(ctx, cmd.name, verifier)
-		}
+		err = s.alterUser(ctx, cmd)
 	case "DROP":
-		err = s.users.Delete(ctx, cmd.name)
-		if err == nil {
-			// The Postgres store drops them with the user; other stores
-			// keep grants apart.
-			if ferr := s.grants.ForgetUser(ctx, cmd.name); ferr != nil {
-				s.log.Warn("could not remove a dropped user's grants", "user", cmd.name, "err", ferr)
-			}
-		}
-		if errors.Is(err, auth.ErrNotFound) && cmd.ifExists {
-			err = nil
-		}
+		err = s.dropUser(ctx, cmd)
 	}
 	if err != nil {
 		return userStoreError(err, cmd.name)
@@ -278,11 +358,282 @@ func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userComm
 	return w.Complete(cmd.verb + " ROLE")
 }
 
+func (s *Server) createUser(ctx context.Context, me auth.User, cmd userCommand) error {
+	u := auth.User{Name: cmd.name, Role: auth.RoleReader, Kind: auth.KindPerson}
+	if cmd.role != nil {
+		u.Role = *cmd.role
+	}
+	if cmd.kind != nil {
+		u.Kind = *cmd.kind
+	}
+	if u.IsService() {
+		u.Owner = me.Name
+		if cmd.owner != nil {
+			if err := s.checkOwner(ctx, *cmd.owner); err != nil {
+				return err
+			}
+			u.Owner = *cmd.owner
+		}
+	}
+	if cmd.password != nil {
+		v, err := verifierFor(*cmd.password)
+		if err != nil {
+			return err
+		}
+		u.Verifier = v
+	} else {
+		// Access tokens of a user without a password use a salt of
+		// their own.
+		salt, err := auth.NewSalt()
+		if err != nil {
+			return err
+		}
+		u.TokenSalt = salt
+	}
+	if cmd.email != nil {
+		u.Email = *cmd.email
+	}
+	if cmd.login != nil {
+		u.Disabled = !*cmd.login
+	}
+	// Users and custom roles share names. The Postgres store checks this
+	// itself, atomically; this covers the others.
+	if isRole, err := s.isCustomRole(ctx, cmd.name); err != nil {
+		return err
+	} else if isRole {
+		return auth.ErrNameTaken
+	}
+	return s.users.Create(ctx, u)
+}
+
+// checkOwner checks that a service account's owner is an admin.
+func (s *Server) checkOwner(ctx context.Context, name string) error {
+	owner, err := s.users.Get(ctx, name)
+	if errors.Is(err, auth.ErrNotFound) {
+		return pgerror.WithCode(fmt.Errorf("owner %q does not exist", name), codes.UndefinedObject)
+	}
+	if err != nil {
+		return err
+	}
+	if owner.Role != auth.RoleAdmin || owner.IsService() {
+		return pgerror.WithCode(fmt.Errorf("the owner of a service account must be a person with the admin role, not %q", name),
+			codes.InvalidParameterValue)
+	}
+	return nil
+}
+
+func (s *Server) alterUser(ctx context.Context, cmd userCommand) error {
+	target, err := s.users.Get(ctx, cmd.name)
+	if err != nil {
+		return err
+	}
+	needsAccounts := cmd.owner != nil || cmd.email != nil || cmd.login != nil || cmd.noPassword
+	if needsAccounts && s.accounts == nil || cmd.unlinkSSO && s.sso == nil {
+		return auth.ErrReadOnly
+	}
+	if cmd.owner != nil && !target.IsService() {
+		return pgerror.WithCode(fmt.Errorf("%q is not a service account; only service accounts have an owner", cmd.name),
+			codes.InvalidParameterValue)
+	}
+	if (cmd.password != nil || cmd.noPassword) && target.IsService() {
+		return pgerror.WithCode(errors.New("service accounts have no password; they sign in with access tokens"),
+			codes.InvalidParameterValue)
+	}
+
+	// Everything that can be refused is checked before anything changes.
+	if cmd.owner != nil {
+		if err := s.checkOwner(ctx, *cmd.owner); err != nil {
+			return err
+		}
+	}
+	var verifier string
+	if cmd.password != nil {
+		if verifier, err = s.newPassword(ctx, target, *cmd.password); err != nil {
+			return err
+		}
+	}
+	// The user's access tokens keep the removed password's salt.
+	tokenSalt, err := s.keptTokenSalt(ctx, target, cmd.noPassword)
+	if err != nil {
+		return err
+	}
+
+	if cmd.role != nil {
+		if err := s.users.SetRole(ctx, cmd.name, *cmd.role); err != nil {
+			return err
+		}
+	}
+	if cmd.owner != nil {
+		if err := s.accounts.SetOwner(ctx, cmd.name, *cmd.owner); err != nil {
+			return err
+		}
+	}
+	if cmd.email != nil {
+		if err := s.accounts.SetEmail(ctx, cmd.name, *cmd.email); err != nil {
+			return err
+		}
+	}
+	if cmd.unlinkSSO {
+		if err := s.sso.UnlinkIdentity(ctx, cmd.name); err != nil {
+			return err
+		}
+	}
+	switch {
+	case cmd.password != nil:
+		if err := s.users.SetVerifier(ctx, cmd.name, verifier); err != nil {
+			return err
+		}
+	case tokenSalt != nil:
+		if err := s.accounts.SetPassword(ctx, cmd.name, "", tokenSalt); err != nil {
+			return err
+		}
+	}
+	if cmd.login != nil {
+		return s.accounts.SetLogin(ctx, cmd.name, *cmd.login)
+	}
+	return nil
+}
+
+// newPassword returns the verifier for target's new password. While target
+// has access tokens, which share the password's salt (auth.TokenFactors),
+// the new password keeps that salt, so the tokens keep working.
+func (s *Server) newPassword(ctx context.Context, target auth.User, password string) (string, error) {
+	factors, hasFactors := auth.TokenFactors(target)
+	var tokens []auth.TokenCredential
+	if s.tokens != nil && hasFactors {
+		var err error
+		if tokens, err = s.tokens.TokenCredentials(ctx, target.Name); err != nil {
+			return "", err
+		}
+	}
+	if !slices.ContainsFunc(tokens, func(t auth.TokenCredential) bool { return t.SCRAM.KeyFactors == factors }) {
+		return verifierFor(password)
+	}
+	if auth.IsVerifier(password) {
+		creds, _ := auth.ParseVerifier(password)
+		if creds.KeyFactors != factors {
+			return "", pgerror.WithCode(fmt.Errorf("%s has access tokens, which share the password's salt; send the new "+
+				"password itself (ALTER USER %s PASSWORD '...') rather than one psql's \\password encrypted, or drop the tokens first",
+				target.Name, target.Name), codes.InvalidParameterValue)
+		}
+		return password, nil
+	}
+	if _, err := verifierFor(password); err != nil {
+		return "", err
+	}
+	return auth.NewVerifierWith(password, factors)
+}
+
+// keptTokenSalt returns the token salt target keeps when PASSWORD NULL
+// removes their password: the password's, which their access tokens were
+// made with. It is nil when there is no password to remove. Tokens of a
+// user without a password use PostgreSQL's iteration count, so removing a
+// password with another one is refused while tokens made with it exist.
+func (s *Server) keptTokenSalt(ctx context.Context, target auth.User, noPassword bool) ([]byte, error) {
+	if !noPassword || !target.HasPassword() {
+		return nil, nil
+	}
+	factors, ok := auth.TokenFactors(target)
+	if !ok {
+		return auth.NewSalt()
+	}
+	salt := []byte(factors.Salt)
+	if after, _ := auth.TokenFactors(auth.User{TokenSalt: salt}); after == factors || s.tokens == nil {
+		return salt, nil
+	}
+	tokens, err := s.tokens.TokenCredentials(ctx, target.Name)
+	if err != nil {
+		return nil, err
+	}
+	if slices.ContainsFunc(tokens, func(t auth.TokenCredential) bool { return t.SCRAM.KeyFactors == factors }) {
+		return nil, pgerror.WithCode(fmt.Errorf("%s has access tokens made with the password's %d SCRAM iterations, which "+
+			"would stop working without it; drop the tokens first, or set a new password instead", target.Name, factors.Iters),
+			codes.ObjectNotInPrerequisiteState)
+	}
+	return salt, nil
+}
+
+func (s *Server) dropUser(ctx context.Context, cmd userCommand) error {
+	// A service account must always have someone responsible for it.
+	users, err := s.users.List(ctx)
+	if err != nil {
+		return err
+	}
+	var owned []string
+	for _, u := range users {
+		if u.IsService() && u.Owner == cmd.name && u.Name != cmd.name {
+			owned = append(owned, u.Name)
+		}
+	}
+	if len(owned) > 0 {
+		return pgerror.WithCode(fmt.Errorf("%s owns the service accounts %s; give them another owner first (ALTER USER %s OWNER name)",
+			cmd.name, strings.Join(owned, ", "), owned[0]), codes.DependentObjectsStillExist)
+	}
+
+	err = s.users.Delete(ctx, cmd.name)
+	if err == nil {
+		// The Postgres store drops them with the user; other stores
+		// keep grants apart.
+		if ferr := s.grants.ForgetUser(ctx, cmd.name); ferr != nil {
+			s.log.Warn("could not remove a dropped user's grants", "user", cmd.name, "err", ferr)
+		}
+	}
+	if errors.Is(err, auth.ErrNotFound) && cmd.ifExists {
+		err = nil
+	}
+	return err
+}
+
+// showUsers lists users: all of them for admins, themselves for others.
+func (s *Server) showUsers(ctx context.Context, me auth.User, w wire.DataWriter) error {
+	users, err := s.users.List(ctx)
+	if err != nil {
+		return err
+	}
+	linked := map[string]bool{}
+	if s.sso != nil {
+		ids, err := s.sso.Identities(ctx)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			linked[id.User] = true
+		}
+	}
+	nullable := func(s string) any {
+		if s == "" {
+			return nil
+		}
+		return s
+	}
+	for _, u := range users {
+		if me.Role != auth.RoleAdmin && u.Name != me.Name {
+			continue
+		}
+		kind := u.Kind
+		if kind == "" {
+			kind = auth.KindPerson
+		}
+		row := []any{u.Name, string(u.Role), u.CreatedAt, string(kind), nullable(u.Owner), !u.Disabled,
+			u.HasPassword(), nullable(u.Email), linked[u.Name]}
+		if err := w.Row(row); err != nil {
+			return err
+		}
+	}
+	return w.Complete(fmt.Sprintf("SELECT %d", w.Written()))
+}
+
 // userColumns describe SHOW USERS.
 var userColumns = wire.Columns{
 	{Name: "name", Oid: pgtype.TextOID, Width: -1},
 	{Name: "role", Oid: pgtype.TextOID, Width: -1},
 	{Name: "created_at", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "type", Oid: pgtype.TextOID, Width: -1},
+	{Name: "owner", Oid: pgtype.TextOID, Width: -1},
+	{Name: "can_login", Oid: pgtype.BoolOID, Width: 1},
+	{Name: "has_password", Oid: pgtype.BoolOID, Width: 1},
+	{Name: "email", Oid: pgtype.TextOID, Width: -1},
+	{Name: "sso", Oid: pgtype.BoolOID, Width: 1},
 }
 
 func verifierFor(password string) (string, error) {
@@ -302,12 +653,16 @@ func verifierFor(password string) (string, error) {
 
 func userStoreError(err error, name string) error {
 	switch {
+	case pgerror.GetCode(err) != codes.Uncategorized:
+		return err
 	case errors.Is(err, auth.ErrNotFound):
 		return pgerror.WithCode(fmt.Errorf("user %q does not exist", name), codes.UndefinedObject)
 	case errors.Is(err, auth.ErrExists):
 		return pgerror.WithCode(fmt.Errorf("user %q already exists", name), codes.DuplicateObject)
 	case errors.Is(err, auth.ErrNameTaken):
 		return pgerror.WithCode(fmt.Errorf("a user or role named %q already exists", name), codes.DuplicateObject)
+	case errors.Is(err, auth.ErrEmailTaken):
+		return pgerror.WithCode(errors.New("another user has that email"), codes.UniqueViolation)
 	case errors.Is(err, auth.ErrReadOnly), errors.Is(err, auth.ErrLastAdmin):
 		return pgerror.WithCode(err, codes.FeatureNotSupported)
 	}

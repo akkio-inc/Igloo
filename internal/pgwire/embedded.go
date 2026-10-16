@@ -2,7 +2,6 @@ package pgwire
 
 import (
 	"context"
-	"crypto/hmac"
 	"errors"
 	"fmt"
 	"net"
@@ -14,8 +13,8 @@ import (
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
-	"github.com/xdg-go/scram"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 )
 
@@ -30,14 +29,30 @@ import (
 // wrong password alike.
 var ErrLoginFailed = errors.New("password authentication failed")
 
+// ErrUserDisabled is returned by Authenticate, after the password checked
+// out, for a user who may not sign in.
+var ErrUserDisabled = errors.New("this user is not permitted to sign in")
+
+// LoginBlockedError is returned by Authenticate after too many failed
+// logins for the user or from the address.
+type LoginBlockedError struct{ Wait time.Duration }
+
+func (e *LoginBlockedError) Error() string {
+	return "too many failed sign-ins; try again in " + roundUp(e.Wait)
+}
+
 // ErrStopRows, returned by ResultWriter.Row, ends a statement's rows early,
 // as a client closing a portal does. The statement counts as successful.
 var ErrStopRows = errors.New("enough rows")
 
+// consoleLogin marks log lines of logins through the web console.
+var consoleLogin = []any{"client", "console"}
+
 // Authenticate checks name's password against the user's stored SCRAM
 // verifier, for sign-ins through the web console. It behaves like a SQL
 // login: unknown users go through the same work against mock credentials,
-// failures wait as long, and both outcomes are logged and counted.
+// failures wait as long and count towards the same limits, and every
+// outcome is logged and counted. Access tokens do not sign in here.
 func (s *Server) Authenticate(ctx context.Context, name, password string, addr net.Addr) (auth.User, error) {
 	return s.AuthenticateClient(ctx, name, password, addr, "console")
 }
@@ -45,40 +60,74 @@ func (s *Server) Authenticate(ctx context.Context, name, password string, addr n
 // AuthenticateClient is Authenticate for sign-ins through client, such as
 // "flight sql", which the log and the login history name.
 func (s *Server) AuthenticateClient(ctx context.Context, name, password string, addr net.Addr, client string) (auth.User, error) {
-	attrs := []any{"client", client}
+	how := login{method: audit.MethodPassword, attrs: []any{"client", client}}
+	done, wait := s.limiter.begin(name, addr)
+	defer done()
+	if wait > 0 {
+		s.signInRefused(name, addr, client, audit.MethodPassword, "too many failed logins")
+		return auth.User{}, &LoginBlockedError{Wait: wait}
+	}
 	user, err := s.users.Get(ctx, name)
 	known := err == nil
 	if err != nil && !errors.Is(err, auth.ErrNotFound) {
 		return auth.User{}, fmt.Errorf("look up user: %w", err)
 	}
-	creds := s.mockCredentials(name)
+	creds, reason := s.mockCredentials(name), "unknown user"
 	if known {
-		if creds, err = auth.ParseVerifier(user.Verifier); err != nil {
-			s.log.Error("stored password verifier is invalid", "user", name)
-			creds, known = s.mockCredentials(name), false
+		reason = "wrong password"
+		allowed, err := s.passwordAllowed(ctx, user)
+		if err != nil {
+			return auth.User{}, err
+		}
+		switch {
+		case !user.HasPassword():
+			known, reason = false, "user has no password"
+		case !allowed:
+			known, reason = false, "password sign-in is off for this user"
+		default:
+			if creds, err = auth.ParseVerifier(user.Verifier); err != nil {
+				s.log.Error("stored password verifier is invalid", "user", name)
+				creds, known = s.mockCredentials(name), false
+			}
 		}
 	}
-	if !checkPassword(creds, password) || !known {
-		s.loginRejected(name, addr, errors.New("wrong password"), attrs...)
+	if !auth.CheckSecret(creds, password) || !known {
+		s.loginRejected(name, addr, nil, reason, how)
 		return auth.User{}, ErrLoginFailed
 	}
-	s.loginSucceeded(user, addr, attrs...)
+	if user.Disabled {
+		s.signInRefused(name, addr, client, audit.MethodPassword, "user is disabled")
+		return auth.User{}, ErrUserDisabled
+	}
+	s.limiter.succeeded(name)
+	s.loginSucceeded(user, addr, how)
 	return user, nil
 }
 
-// checkPassword derives the stored key from password the way a SCRAM client
-// does and compares it with the verifier's.
-func checkPassword(creds scram.StoredCredentials, password string) bool {
-	client, err := scram.SHA256.NewClient("", password, "")
-	if err != nil {
-		return false
-	}
-	derived, err := client.GetStoredCredentialsWithError(creds.KeyFactors)
-	if err != nil {
-		return false
-	}
-	return hmac.Equal(derived.StoredKey, creds.StoredKey)
+// SignedIn counts, logs and records a sign-in to the web console that used
+// no password, such as single sign-on; method is one of audit's.
+func (s *Server) SignedIn(user auth.User, addr net.Addr, method string) {
+	s.loginSucceeded(user, addr, login{method: method, attrs: consoleLogin})
 }
+
+// SignInRefused counts, logs and records a refused sign-in to the web
+// console. name is whom it was for, as far as known, and reason, for the
+// history, why it was refused.
+func (s *Server) SignInRefused(name string, addr net.Addr, method, reason string) {
+	s.signInRefused(name, addr, "console", method, reason)
+}
+
+// signInRefused is SignInRefused for a sign-in through client.
+func (s *Server) signInRefused(name string, addr net.Addr, client, method, reason string) {
+	s.metrics.login(false)
+	s.recordLogin(name, addr, client, nil, reason, login{method: method})
+	s.log.Warn("login refused", "user", name, "addr", addr, "method", method, "reason", reason, "client", client)
+}
+
+// UserChanged makes the open sessions of the named user on this replica
+// read the user again before their next statement, after a change made
+// outside SQL, such as roles that single sign-on gave.
+func (s *Server) UserChanged(name string) { s.sessions.expire(name) }
 
 // EmbeddedSession is a session opened in process with OpenEmbedded. It is
 // not safe for concurrent use.

@@ -9,6 +9,8 @@ install or run.
 Open `http://127.0.0.1:8443` on the machine running the single-machine stack
 (`make up`), and sign in with an Igloo user: the same name and password as
 for `psql`. With TLS configured, the console is at `https://<host>:8443`.
+With [single sign-on](sso.md) configured, the sign-in page also offers
+*Sign in with SSO*, through your identity provider.
 
 ## Pages
 
@@ -48,13 +50,30 @@ status, rows and first error, from `igloo.load_history`, filtered by table,
 status, time and file name. Admins see every load; other users the files
 they and their pipes loaded.
 
-**Users** (admins). Create users, change their roles, set new passwords and
-drop users.
+**Access tokens.** Create, list and revoke your own
+[access tokens](sso.md#access-tokens), which SQL clients such as dbt and BI
+tools send instead of a password. A new token is shown once, with a copy
+button; this is how people who sign in with single sign-on, and have no
+password, connect SQL clients.
+
+**Users** (admins). Create users (with a password, or with an email for
+someone who will sign in with single sign-on), change their roles, set new
+passwords, disable and enable them, and drop them. The list says how each
+user signs in.
+
+**Service accounts** (admins). Create [service accounts](sso.md#service-accounts)
+for programs, give them access tokens (shown once), disable and drop them,
+and see and revoke every user's tokens.
 
 **Roles and grants** (admins). Lists roles and grants with `SHOW ROLES` and
 `SHOW GRANTS`, and runs `GRANT`, `REVOKE`, `CREATE ROLE` and `DROP ROLE`
 (see [roles and grants](sql.md#roles-and-grants)). On a server without
 custom roles the page says so.
+
+**Single sign-on** (admins). The single sign-on settings and whether Igloo
+reaches the identity provider, the redirect URI to register there, the
+mappings of the provider's groups to roles (`GRANT role TO SSO GROUP`), and
+who has signed in with which groups.
 
 **Compute** (admins). This replica's version and uptime, its open sessions
 (SQL clients and console requests alike) with the statements running in
@@ -71,8 +90,10 @@ signed-in user, through the same code path as a statement from a SQL client:
 the same authorization, statement timeout, cancellation, metrics and logs.
 The console itself never decides what a user may see or do. The admin pages
 issue the statements an administrator would type in psql (`CREATE USER`,
-`ALTER USER`, `DROP USER`, `SHOW USERS`, `GRANT` and so on), and are also
-refused by the server to anyone who is not an admin.
+`ALTER USER`, `DROP USER`, `SHOW USERS`, `CREATE TOKEN`, `SHOW TOKENS`,
+`GRANT` and so on), and are also refused by the server to anyone who is not
+an admin. Only the compute page's sessions and the single sign-on page's
+settings and linked users are read from the server directly.
 
 Each request runs in a SQL session of its own, which counts against
 `IGLOO_MAX_CONNECTIONS` while it lasts and shows on the compute page as
@@ -92,9 +113,17 @@ does not keep a [scale-to-zero](scale-to-zero.md) deployment awake.
 
 - **Sign-in** checks the password against the user's stored SCRAM-SHA-256
   verifier, as a SQL login does: the same 500 ms delay after a failure, the
-  same `login` and `login failed` log lines (with `client=console`) and the
-  same `igloo_logins_total` metric. Unknown users and wrong passwords fail
-  alike.
+  same limits on repeated failures, the same `login` and `login failed` log
+  lines (with `client=console`), login history and `igloo_logins_total`
+  metric. Unknown users and wrong passwords fail alike. Access tokens do not
+  sign in to the console, and service accounts cannot.
+- **Single sign-on** uses the authorization code flow with PKCE; the
+  sign-in's state, nonce and PKCE verifier wait in an encrypted,
+  ten-minute, `HttpOnly` cookie (`SameSite=Lax`, so that it comes back with
+  the identity provider's redirect), used once. Igloo verifies the ID
+  token's signature, issuer, audience, expiry and nonce before it starts a
+  session like a password sign-in's. Without TLS it works only at
+  `localhost`, like password sign-in. See [single sign-on](sso.md).
 - **TLS.** With `IGLOO_TLS_CERT_FILE` and `IGLOO_TLS_KEY_FILE` set, the
   console serves HTTPS only, with the same certificate as the SQL port.
   Unlike SQL clients, which use SCRAM, a browser sends the password itself,
@@ -106,11 +135,13 @@ does not keep a [scale-to-zero](scale-to-zero.md) deployment awake.
   keep the request's `Host` header, which the console compares with the
   browser's `Origin`.
 - **Sessions** end after 12 hours, after an hour without a request, at sign
-  out, and at once when the user is dropped or their password changes. The
-  user's role is read again on every request. The session cookie is
-  `HttpOnly`, `SameSite=Strict`, and under TLS `Secure` with the `__Host-`
-  prefix. Signing out removes the cookie from the browser; to end every
-  session of a user everywhere, change their password.
+  out, and at once when the user is dropped or disabled or their password
+  changes. The user's role is read again on every request. The session
+  cookie is `HttpOnly`, `SameSite=Strict`, and under TLS `Secure` with the
+  `__Host-` prefix. Signing out removes the cookie from the browser; to end
+  every session of a user everywhere, change their password, or disable
+  them (`ALTER USER name NOLOGIN`) and enable them again: their old
+  sessions stay ended.
 - **Requests** that change anything need the session's CSRF token in a
   header and must come from the console's own origin; sign-ins must be JSON
   from the same origin.
@@ -128,8 +159,9 @@ does not keep a [scale-to-zero](scale-to-zero.md) deployment awake.
 |---|---|---|
 | `IGLOO_CONSOLE_ADDR` | `:8443` | Where the console listens. Empty turns it off. |
 
-The console uses the server's TLS settings and `IGLOO_MAX_CONNECTIONS`;
-there is nothing else to configure. In the single-machine stack,
+The console uses the server's TLS settings and `IGLOO_MAX_CONNECTIONS`, and
+the `IGLOO_OIDC_*` settings of [single sign-on](sso.md); there is nothing
+else to configure. In the single-machine stack,
 `IGLOO_CONSOLE_PORT` (8443) and `IGLOO_CONSOLE_BIND` (127.0.0.1) in
 `deploy/single-vm/.env` choose where the host publishes it; set TLS up before
 binding it to anything but loopback.
@@ -139,8 +171,10 @@ binding it to anything but loopback.
 | Symptom | Cause and fix |
 |---|---|
 | Sign-in says the connection is not encrypted | The console has no TLS and the browser did not reach it as `localhost`. Configure TLS, or use an SSH tunnel (`ssh -L 8443:127.0.0.1:8443 host`) or `kubectl port-forward`. |
-| `password authentication failed` | Wrong user or password, the same as for psql. |
-| Signed out unexpectedly | The session was idle for an hour or is 12 hours old, or the password changed, or the user was dropped. |
+| `password authentication failed` | Wrong user or password, the same as for psql. Access tokens do not sign in to the console. |
+| `too many failed sign-ins` | 10 failures for the user, or 50 from the address, in 15 minutes; wait. |
+| Signed out unexpectedly | The session was idle for an hour or is 12 hours old, or the password changed, or the user was disabled or dropped. |
+| A single sign-on error on the sign-in page | See [single sign-on troubleshooting](sso.md#troubleshooting). |
 | `sorry, too many clients already` | The replica is at `IGLOO_MAX_CONNECTIONS`; each running console request holds a session. |
 | Only the first 10,000 rows | The grid's limit. Download CSV for every row. |
 | History, roles, tasks or load history pages say "not available" | The server predates query history, custom roles, or tasks and loading. |

@@ -39,7 +39,38 @@ reference for every setting mentioned here.
   default, so passwords are not sent over the connection. The first
   administrator is created from `IGLOO_ADMIN_PASSWORD` on first start; users
   and roles are stored in the PostgreSQL database named by
-  `IGLOO_METADATA_DATABASE_URL`.
+  `IGLOO_METADATA_DATABASE_URL`. After 10 failed logins for a user, or 50
+  from an address, in 15 minutes, each replica refuses further ones for a
+  while. Disabled users (`NOLOGIN`) cannot sign in by any means, and their
+  sessions end.
+- **Access tokens** ([details](docs/sso.md#access-tokens)) stand in for
+  passwords in SQL clients. They are 256-bit random secrets with an
+  `igloo_` prefix, shown once and stored only as a SHA-256 hash and SCRAM
+  keys; SQL logins with them use SCRAM, so the token does not cross the
+  network, and hashes are compared in constant time. Every token expires
+  (90 days by default, at most `IGLOO_TOKEN_MAX_LIFETIME`); its use is
+  recorded; revoking it ends its sessions within 30 seconds. A session that
+  signed in with a token, or a task, cannot create tokens for its user or
+  set its password; an admin's token can still do anything an admin can. Tokens do
+  not sign in to the web console. Service accounts have no password and
+  only admin-made tokens.
+- **Single sign-on** ([details](docs/sso.md)) to the web console uses
+  OpenID Connect's authorization code flow with PKCE, with state and nonce
+  checked in constant time, and verifies the ID token's signature against
+  the provider's published keys, its issuer, audience and expiry. The
+  issuer must be `https`. Identity provider accounts are matched to users by
+  their stable subject, then a verified email, and never by name to a user
+  with a password; allowed domains and groups limit who may sign in. No
+  code, token, state or verifier is logged or put in a URL Igloo makes.
+  Optionally, identity provider access tokens are accepted as SQL passwords,
+  only inside TLS and for users without a password, after the same
+  verification with a configured audience; with that on, whether a user
+  has no password can be told from the login. SCIM provisioning, with single
+  sign-on, accepts only access tokens of admins as bearer tokens, inside
+  TLS (or at `localhost`); it can create, change and disable people and
+  their groups, never service accounts, and never disables the last
+  enabled admin who is a person. Its token is a full admin credential in
+  SQL too.
 - **Roles.** Every user has one built-in role. `admin` can do everything,
   including managing users, roles and grants. `writer` can read and write
   tables and create and drop tables and schemas. `reader` can read tables.
@@ -109,13 +140,14 @@ reference for every setting mentioned here.
   authentication. Expose it only to your orchestrator and monitoring.
 - **Web console.** Port 8443 serves the [web console](docs/console.md). Users
   sign in with their Igloo password, checked against the same SCRAM verifier,
-  with the same failed-login delay and logging as SQL logins. The browser
-  sends the password inside HTTPS; without TLS the console accepts sign-ins
-  only from a browser at `localhost`. Every statement runs as the signed-in
-  user through the same authorization as SQL clients, and admin pages are
-  refused to non-admins on the server. Sessions are encrypted, signed,
-  `HttpOnly`, `SameSite=Strict` cookies (`Secure` under TLS) that expire
-  after 12 hours or an hour idle and end when the user is dropped or their
+  with the same failed-login delay, limits and logging as SQL logins, or
+  with single sign-on. The browser sends the password inside HTTPS; without
+  TLS the console accepts sign-ins, single sign-on included, only from a
+  browser at `localhost`. Every statement runs as the signed-in user through
+  the same authorization as SQL clients, and admin pages are refused to
+  non-admins on the server. Sessions are encrypted, signed, `HttpOnly`,
+  `SameSite=Strict` cookies (`Secure` under TLS) that expire after 12 hours
+  or an hour idle and end when the user is dropped or disabled or their
   password changes. Changes need a CSRF token; pages have a strict
   Content-Security-Policy and cannot be framed. Set `IGLOO_CONSOLE_ADDR=` to
   turn the console off.

@@ -15,9 +15,18 @@ CREATE USER ana WITH PASSWORD 'a-long-password' ROLE writer;
 ALTER USER ana ROLE reader;
 ALTER USER ana PASSWORD 'another-long-password';
 ALTER USER CURRENT_USER PASSWORD 'my-new-password';   -- any user, for themselves
+ALTER USER ana NOLOGIN;                                -- disable; LOGIN enables
 DROP USER IF EXISTS ana;
 SHOW USERS;                                            -- admins see everyone
+
+CREATE USER bo PASSWORD NULL EMAIL 'bo@agency.com';    -- signs in with single sign-on
+CREATE USER dbt_prod TYPE SERVICE ROLE none;           -- a service account, tokens only
+CREATE TOKEN ci FOR USER dbt_prod EXPIRES '90d';       -- shown once
 ```
+
+People can also sign in through the company's identity provider, and SQL
+clients with access tokens instead of passwords: see
+[single sign-on, access tokens and service accounts](sso.md).
 
 Every user has one built-in role, which applies to the whole warehouse:
 
@@ -33,15 +42,22 @@ with `SET` apply to their own session only.
 
 - Passwords must be at least 8 characters. Igloo stores SCRAM-SHA-256
   verifiers, never passwords. psql's `\password` works and sends a verifier
-  computed on the client.
-- Role changes and dropped users reach open connections within 30 seconds;
-  on the replica that made the change, immediately.
+  computed on the client (except for users with access tokens; see
+  [access tokens](sso.md#access-tokens)).
+- Role changes, disabled and dropped users and revoked tokens reach open
+  connections within 30 seconds; on the replica that made the change,
+  immediately.
+- After 10 failed logins for a user, or 50 from an address, within 15
+  minutes, further logins for it are refused for a while
+  ([details](sso.md#failed-logins)).
 - Users are stored in the metadata database (`IGLOO_METADATA_DATABASE_URL`,
   schema `igloo_auth`), so every replica sees the same accounts. Without that
   setting the administrator is the only account.
-- Igloo refuses to remove or demote the last admin.
-- Admins can do the same on the [web console](console.md)'s Users page,
-  which runs these statements as them.
+- Igloo refuses to remove, demote or disable the last enabled admin who
+  is a person: service accounts with the admin role do not count, since
+  no one can sign in to the console as them.
+- Admins can do the same on the [web console](console.md)'s Users and
+  Service accounts pages, which run these statements as them.
 
 ### Grants
 

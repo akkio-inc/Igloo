@@ -10,7 +10,7 @@ page is the reference they are built on.
 |---|---|---|
 | 5432 | PostgreSQL wire protocol | SQL clients |
 | 8080 | HTTP | `GET /healthz` (process is up), `GET /readyz` (catalog and storage reachable), `GET /metrics` (Prometheus), `GET /activity` (running and scheduled work, for the [scale-to-zero gateway](scale-to-zero.md)) |
-| 8443 | HTTP, or HTTPS with TLS | The [web console](console.md) |
+| 8443 | HTTP, or HTTPS with TLS | The [web console](console.md), its [single sign-on](sso.md) callback `/sso/callback`, and [SCIM provisioning](sso.md#scim-provisioning) at `/scim/v2` |
 | 31337 | Arrow Flight SQL (gRPC), with TLS when configured | [Flight SQL clients](flight-sql.md): ADBC, pyarrow, the Flight SQL JDBC driver |
 
 ## Server
@@ -35,11 +35,11 @@ page is the reference they are built on.
 |---|---|---|
 | `IGLOO_ADMIN_USER` | `igloo` | Name of the first administrator |
 | `IGLOO_ADMIN_PASSWORD` | (required) | That administrator's password. Used to create the account on first start only; afterwards change it with `ALTER USER`. |
-| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants are stored (schema `igloo_auth`), with the key that seals web console sessions, the query and login history (schema `igloo_audit`), and tasks, pipes, materialized views and the load history (schema `igloo_tasks`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit` or `igloo_tasks`. Without it, the administrator is the only account, `CREATE USER` is unavailable, console sessions end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes and the load history are lost on restart. |
+| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants, access tokens (hashed) and single sign-on links are stored (schema `igloo_auth`), with the key that seals web console sessions, the query and login history (schema `igloo_audit`), and tasks, pipes, materialized views and the load history (schema `igloo_tasks`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit` or `igloo_tasks`. Without it, the administrator is the only account, `CREATE USER`, access tokens and single sign-on are unavailable, console sessions end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes and the load history are lost on restart. |
 
-Users sign in with SCRAM-SHA-256, the PostgreSQL default. Each has one
-built-in role, and [grants](sql.md#roles-and-grants) can add privileges on
-schemas and tables:
+Users sign in with SCRAM-SHA-256, the PostgreSQL default, with a password
+or an [access token](sso.md#access-tokens). Each has one built-in role, and
+[grants](sql.md#roles-and-grants) can add privileges on schemas and tables:
 
 | Role | Can |
 |---|---|
@@ -47,6 +47,32 @@ schemas and tables:
 | `writer` | Read and write tables, create and drop tables, views and schemas, set comments and table properties |
 | `reader` | Read tables |
 | `none` | Only what grants allow |
+
+## Single sign-on and access tokens
+
+People can sign in to the web console with an OpenID Connect identity
+provider, and SQL clients with access tokens; see
+[single sign-on](sso.md). Single sign-on needs `IGLOO_METADATA_DATABASE_URL`,
+and brings [SCIM provisioning](sso.md#scim-provisioning), which needs no
+setting of its own.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_OIDC_ISSUER` | | The identity provider's issuer URL, `https` (plain `http` only at `localhost`). Empty turns single sign-on off. |
+| `IGLOO_OIDC_CLIENT_ID` | | Igloo's client ID at the provider. Required with an issuer. |
+| `IGLOO_OIDC_CLIENT_SECRET_FILE` | | File holding the client secret, such as a mounted Kubernetes Secret. |
+| `IGLOO_OIDC_CLIENT_SECRET` | | The client secret itself, if not in a file. Leave both empty for a public client, which PKCE protects. |
+| `IGLOO_OIDC_REDIRECT_URL` | from the request | The console's callback as registered at the provider, `https://<host>:8443/sso/callback`. Empty uses the address the browser reached the console at. |
+| `IGLOO_OIDC_SCOPES` | `openid profile email` | Scopes to ask for, space or comma separated. Add `groups` for providers that send groups only when asked. |
+| `IGLOO_OIDC_USERNAME_CLAIM` | `email` | Claim users are named and recognised by. `email` counts only when `email_verified` is true; use `preferred_username` for Microsoft Entra ID. |
+| `IGLOO_OIDC_GROUPS_CLAIM` | `groups` | Claim listing the user's groups, for allowed groups and [group mappings](sso.md#groups-and-roles). |
+| `IGLOO_OIDC_ALLOWED_DOMAINS` | | Comma-separated email domains whose people may sign in. Required for Google, where it is checked against the Workspace domain. |
+| `IGLOO_OIDC_ALLOWED_GROUPS` | | Comma-separated groups; people in none of them may not sign in. |
+| `IGLOO_OIDC_CREATE_USERS` | `true` | Create a user, with role `none` and no password, at the first sign-in of someone without one. `false` admits only users admins created. |
+| `IGLOO_OIDC_PASSWORD_SIGNIN` | `true` | Let users linked to the provider also sign in with a password. `false` makes them use single sign-on in the console and access tokens in SQL clients. |
+| `IGLOO_OIDC_DISPLAY_NAME` | `SSO` | Label of the console's sign-in button: *Sign in with ...*. |
+| `IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE` | | When set, SQL clients of users without a password may send the provider's own access tokens for this audience, inside TLS ([details](sso.md#identity-provider-access-tokens)). |
+| `IGLOO_TOKEN_MAX_LIFETIME` | `365d` | Longest an access token may last (`CREATE TOKEN ... EXPIRES`). Tokens last 90 days by default. |
 
 ## Query history
 

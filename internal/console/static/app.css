@@ -875,3 +875,20 @@ dialog::backdrop { background: rgba(14, 21, 48, .45); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Single sign-on and access tokens */
+
+.signin-sso { display: flex; flex-direction: column; }
+.signin-or {
+  display: flex; align-items: center; gap: 10px;
+  margin: 14px 0 0; color: var(--text-faint); font-size: 12px;
+}
+.signin-or::before, .signin-or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.signin-sso .btn { margin-top: 10px; text-decoration: none; color: var(--text); }
+pre.secret, pre.example {
+  margin: 0; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-all;
+  background: var(--code-bg); border-radius: var(--radius);
+}
+pre.secret { font-size: 13px; border: 1px solid var(--border-strong); user-select: all; }
+pre.example { font-size: 12.5px; }

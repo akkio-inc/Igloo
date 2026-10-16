@@ -81,6 +81,22 @@ type Options struct {
 	// and runs them. Nil means a store in memory, whose jobs only run when
 	// asked to.
 	Tasks *tasks.Scheduler
+	// Tokens keeps access tokens, Accounts what users are besides their
+	// password and role, and SSO single sign-on links and group mappings.
+	// Each nil means Users if it keeps them too; without one, what needs
+	// it is unavailable.
+	Tokens   auth.TokenStore
+	Accounts auth.AccountStore
+	SSO      auth.SSOStore
+	// DisableSSOPasswords refuses password logins of users linked to
+	// single sign-on; they sign in with access tokens instead.
+	DisableSSOPasswords bool
+	// TokenMaxLifetime caps how long an access token may last. Zero means
+	// 365 days.
+	TokenMaxLifetime time.Duration
+	// AccessTokens, if set, lets users without a password sign in to SQL
+	// with an identity provider's access token (see accesstoken.go).
+	AccessTokens AccessTokenVerifier
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -119,6 +135,16 @@ type Server struct {
 	// mockSecret derives the credentials a login for an unknown user runs
 	// against (see mockCredentials).
 	mockSecret []byte
+
+	tokens              auth.TokenStore
+	accounts            auth.AccountStore
+	sso                 auth.SSOStore
+	tokenChecker        *auth.TokenChecker
+	disableSSOPasswords bool
+	tokenMaxLifetime    time.Duration
+	accessTokens        AccessTokenVerifier
+	// limiter refuses logins after too many failures.
+	limiter *loginLimiter
 }
 
 // New builds a server that runs queries on engine.
@@ -149,6 +175,14 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		catalog:     opts.Catalog,
 		tasks:       opts.Tasks,
 		mockSecret:  mockSecret,
+
+		tokens:              opts.Tokens,
+		accounts:            opts.Accounts,
+		sso:                 opts.SSO,
+		disableSSOPasswords: opts.DisableSSOPasswords,
+		tokenMaxLifetime:    opts.TokenMaxLifetime,
+		accessTokens:        opts.AccessTokens,
+		limiter:             newLoginLimiter(),
 	}
 	if s.tasks == nil {
 		s.tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{Log: log})
@@ -162,6 +196,21 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		} else {
 			s.grants = auth.NewMemoryGrants(opts.Users)
 		}
+	}
+	if s.tokens == nil {
+		s.tokens, _ = opts.Users.(auth.TokenStore)
+	}
+	if s.accounts == nil {
+		s.accounts, _ = opts.Users.(auth.AccountStore)
+	}
+	if s.sso == nil {
+		s.sso, _ = opts.Users.(auth.SSOStore)
+	}
+	if s.tokens != nil {
+		s.tokenChecker = auth.NewTokenChecker(opts.Users, s.tokens)
+	}
+	if s.tokenMaxLifetime == 0 {
+		s.tokenMaxLifetime = 365 * 24 * time.Hour
 	}
 	s.sessions.abandoned = s.releaseConn
 
@@ -232,6 +281,12 @@ type session struct {
 	// settingGen counts the session's SET statements, which may change
 	// how its statements resolve names.
 	settingGen uint64
+	// tokenID and tokenName identify the Igloo access token the session
+	// signed in with, if any: the session ends when the token is revoked.
+	tokenID, tokenName string
+	// method is how the session signed in: one of audit's Method
+	// constants, or empty for the console's sessions.
+	method string
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -261,6 +316,23 @@ func (sess *session) currentUser() auth.User {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	return sess.user
+}
+
+// methodTask marks the sessions tasks, pipes and materialized views run
+// in.
+const methodTask = "task"
+
+// bearer reports whether the session acts on a token's authority, Igloo's
+// or the identity provider's, rather than a password's or single
+// sign-on's: it signed in with one, or it runs a task, which a token's
+// session may have created. Such a session may not mint its user a
+// longer-lived credential: a token or a password.
+func (sess *session) bearer() bool {
+	switch sess.method {
+	case audit.MethodToken, audit.MethodAccessToken, methodTask:
+		return true
+	}
+	return false
 }
 
 // backendKeyData gives the client the key it needs to cancel its queries.
@@ -335,7 +407,8 @@ func (sess *session) release(ps *wire.PreparedStatement) error {
 }
 
 // refreshUser re-reads the session's user when the cached role is stale, so
-// role changes and dropped users take effect on open connections.
+// role changes, disabled and dropped users and revoked access tokens take
+// effect on open connections.
 func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, error) {
 	sess.mu.Lock()
 	user, fresh := sess.user, time.Since(sess.checked) < s.roleRefresh
@@ -344,11 +417,23 @@ func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, err
 		return user, nil
 	}
 
+	ended := func(format string, args ...any) (auth.User, error) {
+		return user, pgerror.WithSeverity(pgerror.WithCode(
+			fmt.Errorf(format, args...), codes.InvalidAuthorizationSpecification), pgerror.LevelFatal)
+	}
 	latest, err := s.users.Get(ctx, user.Name)
 	if errors.Is(err, auth.ErrNotFound) {
-		return user, pgerror.WithSeverity(pgerror.WithCode(
-			fmt.Errorf("user %q no longer exists", user.Name), codes.InvalidAuthorizationSpecification),
-			pgerror.LevelFatal)
+		return ended("user %q no longer exists", user.Name)
+	}
+	if err == nil && latest.Disabled {
+		return ended("user %q is not permitted to log in", user.Name)
+	}
+	if err == nil && sess.tokenID != "" && s.tokens != nil {
+		if _, _, terr := s.tokens.TokenByID(ctx, sess.tokenID); errors.Is(terr, auth.ErrTokenNotFound) {
+			return ended("the access token %q this session signed in with was revoked", sess.tokenName)
+		} else if terr != nil {
+			err = terr
+		}
 	}
 	if err != nil {
 		// Keep the last known role if the metadata database blips.

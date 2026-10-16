@@ -1,0 +1,87 @@
+{
+  "realm": "igloo",
+  "enabled": true,
+  "sslRequired": "external",
+  "groups": [
+    { "name": "data-team" },
+    { "name": "igloo-writers" }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@agency.example",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Liddell",
+      "credentials": [{ "type": "password", "value": "alice-password", "temporary": false }],
+      "groups": ["/data-team", "/igloo-writers"]
+    },
+    {
+      "username": "bob",
+      "enabled": false,
+      "email": "bob@agency.example",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Disabled",
+      "credentials": [{ "type": "password", "value": "bob-password", "temporary": false }]
+    },
+    {
+      "username": "carol",
+      "enabled": true,
+      "email": "carol@agency.example",
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "Turned-Off",
+      "credentials": [{ "type": "password", "value": "carol-password", "temporary": false }]
+    },
+    {
+      "username": "eve",
+      "enabled": true,
+      "email": "eve@elsewhere.example",
+      "emailVerified": true,
+      "firstName": "Eve",
+      "lastName": "Outsider",
+      "credentials": [{ "type": "password", "value": "eve-password", "temporary": false }]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "igloo",
+      "name": "Igloo console (end-to-end test only)",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "e2e-only-client-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["https://igloo:8443/sso/callback"],
+      "webOrigins": [],
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "igloo-sql-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "igloo-sql",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ]
+}

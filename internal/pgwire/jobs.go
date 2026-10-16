@@ -604,12 +604,19 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 	if err != nil {
 		return -1, err
 	}
+	// A disabled user's jobs fail until they are enabled again, rather
+	// than act for someone who may no longer sign in.
+	if owner.Disabled {
+		return -1, pgerror.WithCode(fmt.Errorf("the owner %s is disabled (ALTER USER %s LOGIN enables them)", owner.Name, owner.Name),
+			codes.ObjectNotInPrerequisiteState)
+	}
 	es, err := s.OpenEmbedded(ctx, owner, j.Kind+" "+j.Name)
 	if err != nil {
 		return -1, err
 	}
 	defer es.Close() //nolint:errcheck
 	sess := es.sess
+	sess.method = methodTask
 
 	switch j.Kind {
 	case tasks.KindTask:

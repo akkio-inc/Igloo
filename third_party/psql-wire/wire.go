@@ -241,6 +241,7 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+	ctx = setTLS(ctx, conn)
 
 	if version == types.VersionCancel {
 		return conn.Close()

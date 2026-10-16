@@ -85,9 +85,34 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   roles; `SHOW ROLES` and `SHOW GRANTS`. The role `none` allows only what is
   granted. Grants on a schema cover tables created later; views run with the
   querying user's privileges.
+- Single sign-on to the web console with OpenID Connect (Okta, Microsoft
+  Entra ID, Google Workspace, Keycloak, others): the authorization code flow
+  with PKCE, verified ID tokens, allowed domains and groups
+  (`IGLOO_OIDC_*`), users created at first sign-in with role `none` and
+  matched by subject, verified email or name, and the provider's groups
+  mapped to custom and built-in roles at each sign-in
+  (`GRANT role TO SSO GROUP 'name'`, `SHOW SSO GROUPS`).
+  `IGLOO_OIDC_PASSWORD_SIGNIN=false` makes linked users use single sign-on.
+- SCIM 2.0 provisioning from Okta and Microsoft Entra ID at `/scim/v2` on
+  the console's port, with an admin's access token: users created, updated
+  and deactivated (disabled at once) as they change at the provider, and
+  groups and members kept, with their role mappings applied at each change.
+- Access tokens for SQL clients: `CREATE TOKEN`, `SHOW TOKENS`, `DROP TOKEN`,
+  sent as the password, checked with SCRAM-SHA-256 so they never cross the
+  network, stored as hashes, always expiring (`IGLOO_TOKEN_MAX_LIFETIME`),
+  with their last use and every login recorded. Optionally the identity
+  provider's own access tokens, inside TLS
+  (`IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE`). `auth.TokenChecker` verifies tokens
+  for HTTP APIs.
+- Service accounts (`CREATE USER ... TYPE SERVICE`), owned by an admin,
+  without a password, signing in with tokens only. Users can be disabled
+  (`ALTER USER ... NOLOGIN`), which ends their sessions, and given an email
+  (`EMAIL`) for single sign-on.
+- Limits on failed logins: 10 per user and 50 per address in 15 minutes.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
-  and `igloo.login_history`. Admins see everyone's history, other users
+  and `igloo.login_history`, which records how each login signed in
+  (`auth_method`) and with which token (`token_name`). Admins see everyone's history, other users
   their own. Kept in the metadata database for `IGLOO_AUDIT_RETENTION` (90
   days); `IGLOO_AUDIT=false` turns it off. Passwords are never recorded.
 - A query sandbox: SQL cannot read the server's files or reach locations
@@ -101,9 +126,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   cancel and CSV download, a data browser, query history, tasks, pipes and
   materialized views with their runs, the load history, and admin pages
   for users, roles and grants, and the replica's sessions. Users sign in
-  with their Igloo password; statements run as them through the same
-  authorization as SQL clients. Sessions are stateless sealed cookies, so
-  the console works behind a load balancer.
+  with their Igloo password or single sign-on; statements run as them
+  through the same authorization as SQL clients. Sessions are stateless
+  sealed cookies, so the console works behind a load balancer, and end when
+  the user is disabled or their password changes.
+- Console pages for access tokens (everyone's own), service accounts and
+  every token (admins), and single sign-on: settings, whether the provider
+  answers, group mappings and who signed in with which groups.
 
 ### Performance and cost
 

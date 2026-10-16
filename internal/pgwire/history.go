@@ -91,7 +91,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 // recordLogin sends a login attempt from addr, which may be nil, to the
 // history. A failed one has a reason; a successful one may have opened
 // sess.
-func (s *Server) recordLogin(user string, addr net.Addr, appName string, sess *session, reason string) {
+func (s *Server) recordLogin(user string, addr net.Addr, appName string, sess *session, reason string, how login) {
 	if s.audit == nil {
 		return
 	}
@@ -101,6 +101,8 @@ func (s *Server) recordLogin(user string, addr net.Addr, appName string, sess *s
 		Result:          audit.LoginSuccess,
 		Reason:          reason,
 		ApplicationName: appName,
+		Method:          how.method,
+		Token:           how.token,
 	}
 	if addr != nil {
 		if a, ok := addr.(*net.TCPAddr); !ok || a != nil {
