@@ -143,6 +143,7 @@ psql "host=sql.example.com port=5432 user=igloo dbname=igloo sslmode=verify-full
 | `name` | `igloo` | Resource name prefix and cluster name |
 | `install_chart` | `true` | Install `../helm/igloo` |
 | `image_tag` | `""` | Igloo image tag; empty uses the chart's appVersion |
+| `image_repository` | `""` | Igloo image repository, for a mirror or private registry; empty uses the chart's default |
 | `replica_count` | `2` | igloo pods |
 | `igloo_cpu`, `igloo_memory` | `2`, `8Gi` | Requests per igloo pod (memory is also the limit) |
 | `spill_size` | `50Gi` | Local disk per pod for larger-than-memory queries |

@@ -176,6 +176,12 @@ variable "namespace" {
   }
 }
 
+variable "image_repository" {
+  description = "Igloo image repository, for a mirror or private registry. Empty uses the chart's default."
+  type        = string
+  default     = ""
+}
+
 variable "image_tag" {
   description = "Igloo image tag. Empty uses the chart's appVersion."
   type        = string

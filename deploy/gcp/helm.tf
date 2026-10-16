@@ -11,9 +11,10 @@ locals {
   }] : []
 
   helm_values = {
-    image = {
-      tag = var.image_tag
-    }
+    image = merge(
+      { tag = var.image_tag },
+      var.image_repository == "" ? {} : { repository = var.image_repository },
+    )
 
     replicaCount = var.replica_count
 

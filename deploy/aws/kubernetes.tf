@@ -108,9 +108,10 @@ resource "kubernetes_secret_v1" "tls" {
 
 locals {
   helm_values = {
-    image = {
-      tag = var.igloo_image_tag
-    }
+    image = merge(
+      { tag = var.igloo_image_tag },
+      var.igloo_image_repository == "" ? {} : { repository = var.igloo_image_repository },
+    )
     replicaCount = var.igloo_replicas
 
     admin = {

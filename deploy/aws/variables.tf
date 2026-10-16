@@ -320,6 +320,12 @@ variable "install_chart" {
   default     = true
 }
 
+variable "igloo_image_repository" {
+  description = "Igloo image repository, for a mirror or private registry. Empty uses the chart's default."
+  type        = string
+  default     = ""
+}
+
 variable "igloo_image_tag" {
   description = "Igloo image tag. Empty uses the chart's appVersion."
   type        = string

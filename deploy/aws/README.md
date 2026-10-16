@@ -161,6 +161,7 @@ group in the EKS console, and raise `igloo_replicas`.
 |---|---|---|
 | `region`, `name_prefix` | `us-east-1`, `igloo` | Where, and the prefix for every resource name |
 | `igloo_image_tag` | chart appVersion | Igloo version |
+| `igloo_image_repository` | chart default | Igloo image repository, for a mirror or private registry |
 | `igloo_replicas`, `igloo_cpu_request`, `igloo_memory` | `2`, `1500m`, `12Gi` | Query engine pods |
 | `duckdb_memory_limit`, `duckdb_threads`, `duckdb_spill_size` | 80% of pod, cores, `50Gi` | DuckDB tuning |
 | `node_instance_types`, `node_use_spot`, `node_min_size`/`node_max_size`/`node_desired_size`, `node_disk_size_gib` | `["r7g.xlarge"]`, `false`, 2/4/2, 150 | Nodes |
