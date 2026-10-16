@@ -143,6 +143,12 @@ where the saving comes from: give Igloo its own node pool with a minimum
 size of zero (`nodeSelector`, `tolerations`), and keep the gateway on an
 always-on one (`scaleToZero.nodeSelector`, `scaleToZero.tolerations`).
 
+The OpenTofu modules for AWS, Google Cloud and Azure do not set this node
+pool up yet: they run Igloo on their general node pool, so with
+`scaleToZero.enabled` the Igloo pods stop but the nodes keep running (the AWS
+module installs no cluster autoscaler at all). Until they do, the single-VM
+setup above is the one where scale to zero saves the machine's cost.
+
 The gateway reaches Igloo through a second Service, and asks every Igloo
 pod for running work through a headless Service on port 8080, so a
 statement running on any replica keeps them all up. If Igloo also has a
