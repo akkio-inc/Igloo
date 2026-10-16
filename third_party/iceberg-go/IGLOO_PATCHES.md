@@ -27,6 +27,29 @@ were removed; the code is otherwise unchanged except for these patches:
   LRU instead of `github.com/hashicorp/golang-lru`, which is MPL-2.0. Igloo
   links only permissively licensed code.
 
+The next three patches make files written by compaction match the Parquet
+DuckDB writes. Without them, TPC-H queries at scale factor 10 ran 10-40%
+slower after compaction than on the files DuckDB had written; with them they
+run about 13% faster in total. `internal/maintenance/parquet_test.go` checks
+the layout.
+
+- `table/internal/parquet_files.go`, `GetWriteProperties`: decimals with
+  precision up to 18 are stored as INT32 or INT64, as Java Iceberg and DuckDB
+  store them, instead of FIXED_LEN_BYTE_ARRAY, which DuckDB decodes much more
+  slowly.
+- `table/internal/parquet_files.go`: the default
+  `write.parquet.compression-codec` is `snappy`, DuckDB's codec, instead of
+  `zstd`. DuckDB decompresses Snappy faster. Tables that set the property
+  keep their codec.
+- `table/internal/parquet_files.go`, `ParquetFileWriter`: the Parquet writer
+  is created once a row group's worth of rows has arrived, and dictionary
+  encoding is turned off for each top-level column in which more than a fifth
+  of those values are distinct. This is the rule DuckDB's writer applies per
+  row group. The Arrow writer otherwise dictionary-encodes every column until
+  the dictionary reaches `write.parquet.dict-size-bytes` (2 MB), so keys,
+  prices and free text got dictionaries nearly as large as the data, which
+  made DuckDB's scans slower without saving space.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults and
 no longer needs an MPL-licensed dependency.

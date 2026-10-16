@@ -157,7 +157,15 @@ tables itself, so nobody has to schedule anything. Every hour
 1. **Compaction.** Small files, and files with many deletes, are rewritten
    into files of the table's target size (`write.target-file-size-bytes`,
    512 MB by default), with deletes applied. A pass rewrites at most 8 GB per
-   table; larger backlogs finish over several passes.
+   table; larger backlogs finish over several passes. The new files are laid
+   out the way DuckDB writes Parquet, so compaction does not make scans
+   slower: row groups of 122,880 rows, Snappy compression, decimals stored as
+   integers, and dictionary encoding only for columns in which at most a
+   fifth of the values are distinct. A table's
+   `write.parquet.compression-codec` and `write.parquet.row-group-limit`
+   properties override the codec and row group size. File size does not
+   limit parallelism: DuckDB divides a scan by row group, so a table in a few
+   large files still uses every core.
 2. **Snapshot expiry.** Snapshots older than `IGLOO_SNAPSHOT_RETENTION`
    (7 days by default) are removed, always keeping the current one, and the
    files that only they referenced are deleted. Files that compaction

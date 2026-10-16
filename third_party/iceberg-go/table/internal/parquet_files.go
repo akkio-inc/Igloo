@@ -52,17 +52,20 @@ const (
 	// DuckDB's row group size: DuckDB parallelizes scans by row group, so
 	// larger groups leave cores idle. (Patched in Igloo's copy; upstream
 	// default 1048576. See IGLOO_PATCHES.md.)
-	ParquetRowGroupLimitDefault              = 122880
-	ParquetPageSizeBytesKey                  = "write.parquet.page-size-bytes"
-	ParquetPageSizeBytesDefault              = 1024 * 1024 // 1 MB
-	ParquetPageRowLimitKey                   = "write.parquet.page-row-limit"
-	ParquetPageRowLimitDefault               = 20000
-	ParquetDictSizeBytesKey                  = "write.parquet.dict-size-bytes"
-	ParquetDictSizeBytesDefault              = 2 * 1024 * 1024 // 2 MB
-	ParquetPageVersionKey                    = "write.parquet.page-version"
-	ParquetPageVersionDefault                = "2"
-	ParquetCompressionKey                    = "write.parquet.compression-codec"
-	ParquetCompressionDefault                = "zstd"
+	ParquetRowGroupLimitDefault = 122880
+	ParquetPageSizeBytesKey     = "write.parquet.page-size-bytes"
+	ParquetPageSizeBytesDefault = 1024 * 1024 // 1 MB
+	ParquetPageRowLimitKey      = "write.parquet.page-row-limit"
+	ParquetPageRowLimitDefault  = 20000
+	ParquetDictSizeBytesKey     = "write.parquet.dict-size-bytes"
+	ParquetDictSizeBytesDefault = 2 * 1024 * 1024 // 2 MB
+	ParquetPageVersionKey       = "write.parquet.page-version"
+	ParquetPageVersionDefault   = "2"
+	ParquetCompressionKey       = "write.parquet.compression-codec"
+	// DuckDB's codec: DuckDB decompresses Snappy faster than Zstandard.
+	// (Patched in Igloo's copy; upstream default "zstd". See
+	// IGLOO_PATCHES.md.)
+	ParquetCompressionDefault                = "snappy"
 	ParquetCompressionLevelKey               = "write.parquet.compression-level"
 	ParquetCompressionLevelDefault           = -1
 	ParquetBloomFilterMaxBytesKey            = "write.parquet.bloom-filter-max-bytes"
@@ -257,6 +260,11 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 			ParquetPageRowLimitDefault))),
 		parquet.WithDictionaryPageSizeLimit(int64(props.GetInt(ParquetDictSizeBytesKey,
 			ParquetDictSizeBytesDefault))),
+		// Decimals with precision up to 18 as INT32 or INT64, as Java
+		// Iceberg and DuckDB write them, not FIXED_LEN_BYTE_ARRAY, which
+		// DuckDB decodes much more slowly. (Patched in Igloo's copy; see
+		// IGLOO_PATCHES.md.)
+		parquet.WithStoreDecimalAsInteger(true),
 	}
 
 	compression := props.Get(ParquetCompressionKey, ParquetCompressionDefault)
@@ -339,6 +347,17 @@ type ParquetFileWriter struct {
 	info       WriteFileInfo
 	partition  map[int]any
 	colMapping map[string]int
+
+	// The Parquet writer is created once sampleRows rows (a row group, at
+	// most 122,880) have arrived, so that dictionary encoding can be chosen
+	// per column from them (see plainColumns). Until then the batches wait
+	// in pending. (Patched in Igloo's copy; see IGLOO_PATCHES.md.)
+	arrowSchema *arrow.Schema
+	writerProps []parquet.WriterProperty
+	arrProps    pqarrow.ArrowWriterProperties
+	sampleRows  int64
+	pending     []arrow.RecordBatch
+	pendingRows int64
 }
 
 // NewFileWriter creates a ParquetFileWriter that writes batches to a single
@@ -361,30 +380,151 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 
 	counter := &internal.CountingWriter{W: fw}
 	mem := compute.GetAllocator(ctx)
-	writerProps := parquet.NewWriterProperties(info.WriteProps.([]parquet.WriterProperty)...)
+	props := info.WriteProps.([]parquet.WriterProperty)
+	writerProps := parquet.NewWriterProperties(props...)
 	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
 
-	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, writerProps, arrProps)
-	if err != nil {
+	// Check the schema now; the writer itself is created later.
+	if _, err := pqarrow.ToParquet(arrowSchema, writerProps, arrProps); err != nil {
 		fw.Close()
 
 		return nil, err
 	}
 
 	return &ParquetFileWriter{
-		pqWriter:   writer,
-		counter:    counter,
-		fileCloser: fw,
-		format:     p,
-		info:       info,
-		partition:  partitionValues,
-		colMapping: colMapping,
+		counter:     counter,
+		fileCloser:  fw,
+		format:      p,
+		info:        info,
+		partition:   partitionValues,
+		colMapping:  colMapping,
+		arrowSchema: arrowSchema,
+		writerProps: props,
+		arrProps:    arrProps,
+		sampleRows:  min(writerProps.MaxRowGroupLength(), ParquetRowGroupLimitDefault),
 	}, nil
 }
 
 // Write appends a record batch to the Parquet file.
 func (w *ParquetFileWriter) Write(batch arrow.RecordBatch) error {
-	return w.pqWriter.WriteBuffered(batch)
+	if w.pqWriter != nil {
+		return w.pqWriter.WriteBuffered(batch)
+	}
+	batch.Retain()
+	w.pending = append(w.pending, batch)
+	w.pendingRows += batch.NumRows()
+	if w.pendingRows < w.sampleRows {
+		return nil
+	}
+
+	return w.open()
+}
+
+// open creates the Parquet writer, turning dictionary encoding off for the
+// columns that plainColumns picks from the pending rows, and writes them.
+func (w *ParquetFileWriter) open() error {
+	pending := w.pending
+	w.pending = nil
+	defer func() {
+		for _, b := range pending {
+			b.Release()
+		}
+	}()
+
+	props := slices.Clone(w.writerProps)
+	for _, col := range plainColumns(w.arrowSchema, pending, w.pendingRows) {
+		props = append(props, parquet.WithDictionaryFor(col, false))
+	}
+	writer, err := pqarrow.NewFileWriter(w.arrowSchema, w.counter, parquet.NewWriterProperties(props...), w.arrProps)
+	if err != nil {
+		return err
+	}
+	w.pqWriter = writer
+	for _, b := range pending {
+		if err := writer.WriteBuffered(b); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// plainColumns returns the top-level primitive columns in which more than a
+// fifth of the sampled values are distinct. DuckDB's Parquet writer stores
+// those without a dictionary, deciding per row group by the same rule: such a
+// dictionary is nearly as large as the column and makes scans slower.
+// (Igloo's copy only; see IGLOO_PATCHES.md.)
+func plainColumns(schema *arrow.Schema, sample []arrow.RecordBatch, rows int64) []string {
+	if len(sample) == 0 {
+		return nil
+	}
+	limit := int(rows / 5)
+	var plain []string
+	for i, field := range schema.Fields() {
+		cols := make([]arrow.Array, len(sample))
+		for j, b := range sample {
+			cols[j] = b.Column(i)
+		}
+		if distinctAbove(cols, limit) {
+			plain = append(plain, field.Name)
+		}
+	}
+
+	return plain
+}
+
+// distinctAbove reports whether cols, the chunks of one column, hold more
+// than limit distinct non-null values. It is false for types it does not
+// count, such as nested and boolean columns, which keep their dictionary.
+func distinctAbove(cols []arrow.Array, limit int) bool {
+	switch cols[0].(type) {
+	case *array.Int32:
+		return countAbove(cols, limit, (*array.Int32).Value)
+	case *array.Int64:
+		return countAbove(cols, limit, (*array.Int64).Value)
+	case *array.Float32:
+		return countAbove(cols, limit, (*array.Float32).Value)
+	case *array.Float64:
+		return countAbove(cols, limit, (*array.Float64).Value)
+	case *array.Date32:
+		return countAbove(cols, limit, (*array.Date32).Value)
+	case *array.Time64:
+		return countAbove(cols, limit, (*array.Time64).Value)
+	case *array.Timestamp:
+		return countAbove(cols, limit, (*array.Timestamp).Value)
+	case *array.Decimal128:
+		return countAbove(cols, limit, (*array.Decimal128).Value)
+	case *array.String:
+		return countAbove(cols, limit, (*array.String).Value)
+	case *array.LargeString:
+		return countAbove(cols, limit, (*array.LargeString).Value)
+	case *array.Binary:
+		return countAbove(cols, limit, (*array.Binary).ValueString)
+	case *array.LargeBinary:
+		return countAbove(cols, limit, (*array.LargeBinary).ValueString)
+	case *array.FixedSizeBinary:
+		return countAbove(cols, limit, func(a *array.FixedSizeBinary, i int) string { return string(a.Value(i)) })
+	default:
+		return false
+	}
+}
+
+func countAbove[A arrow.Array, T comparable](cols []arrow.Array, limit int, value func(A, int) T) bool {
+	seen := map[T]struct{}{}
+	for _, col := range cols {
+		a := col.(A)
+		for i := range a.Len() {
+			if a.IsNull(i) {
+				continue
+			}
+			seen[value(a, i)] = struct{}{}
+			if len(seen) > limit {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // BytesWritten returns the number of bytes flushed to the output so far.
@@ -397,6 +537,11 @@ func (w *ParquetFileWriter) BytesWritten() int64 {
 func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 	defer internal.CheckedClose(w.fileCloser, &err)
 
+	if w.pqWriter == nil {
+		if err = w.open(); err != nil {
+			return nil, err
+		}
+	}
 	if err = w.pqWriter.Close(); err != nil {
 		return nil, err
 	}
@@ -422,6 +567,11 @@ func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 }
 
 func (w *ParquetFileWriter) Abort() error {
+	for _, b := range w.pending {
+		b.Release()
+	}
+	w.pending = nil
+
 	return w.fileCloser.Close()
 }
 

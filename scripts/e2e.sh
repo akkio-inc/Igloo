@@ -208,8 +208,8 @@ expect "comments in obj_description and col_description" "Test rows | :tag:e2e|I
    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'e2e' AND a.attname = 'amount'"
 
 echo "table maintenance"
-psql_admin -c "CREATE TABLE fragmented (id INTEGER, v VARCHAR)" >/dev/null
-for i in 1 2 3 4 5 6; do psql_admin -c "INSERT INTO fragmented VALUES ($i, 'v$i')" >/dev/null; done
+psql_admin -c "CREATE TABLE fragmented (id INTEGER, v VARCHAR, amount DECIMAL(15,2))" >/dev/null
+for i in 1 2 3 4 5 6; do psql_admin -c "INSERT INTO fragmented VALUES ($i, 'v$i', $i.25)" >/dev/null; done
 psql_admin -c "DELETE FROM fragmented WHERE id = 3" >/dev/null
 retention="SELECT * FROM set_iceberg_table_properties(lake.public.fragmented, {'history.expire.max-snapshot-age-ms': '0'})"
 expect_error "reader cannot change table properties" 42501 rita rita-password-1 "$retention"
@@ -228,10 +228,16 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   sleep 2
 done
 if [ "$state" = "t" ]; then pass "compaction and snapshot expiry"; else fail "compaction and snapshot expiry: not done after 4 minutes"; fi
+# Compacted files must be laid out as DuckDB writes Parquet (decimals as
+# integers, Snappy), or compaction makes scans slower.
+files="$(psql_admin -c "SELECT string_agg(chr(39) || file_path || chr(39), ',') FROM iceberg_metadata(lake.public.fragmented)
+  WHERE status <> 'DELETED' AND manifest_content = 'DATA'")"
+expect "compacted files use DuckDB's Parquet layout" "INT64|SNAPPY" igloo "$admin_password" \
+  "SELECT DISTINCT type, compression FROM parquet_metadata([$files]) WHERE path_in_schema = 'amount'"
 expect "maintenance keeps every row" "5|v1v2v4v5v6" igloo "$admin_password" \
   "SELECT count(*), string_agg(v, '' ORDER BY id) FROM fragmented"
 expect "writes after compaction" "6" igloo "$admin_password" \
-  "INSERT INTO fragmented VALUES (7, 'v7'); SELECT count(*) FROM fragmented"
+  "INSERT INTO fragmented VALUES (7, 'v7', 7.25); SELECT count(*) FROM fragmented"
 
 echo "health and metrics"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http_port/readyz")"
