@@ -2,6 +2,19 @@ provider "azurerm" {
   # Null falls back to the ARM_SUBSCRIPTION_ID environment variable.
   subscription_id = var.subscription_id
 
+  # Register the resource providers this module needs (Compute for the AKS
+  # node VMs), so a fresh subscription works without manual registration.
+  # azurerm 5 registers nothing by default.
+  resource_providers_to_register = [
+    "Microsoft.Authorization",
+    "Microsoft.Compute",
+    "Microsoft.ContainerService",
+    "Microsoft.DBforPostgreSQL",
+    "Microsoft.ManagedIdentity",
+    "Microsoft.Network",
+    "Microsoft.Storage",
+  ]
+
   # Shared-key access to the storage account is off, so any storage data-plane
   # request the provider makes must use Entra ID.
   storage_use_azuread = true

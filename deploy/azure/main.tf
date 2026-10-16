@@ -48,7 +48,9 @@ resource "azurerm_subnet" "aks" {
 
   # Nodes reach the storage account through this service endpoint; the
   # account's firewall admits this subnet and nothing else by default.
-  service_endpoints = ["Microsoft.Storage"]
+  service_endpoint {
+    service = "Microsoft.Storage"
+  }
 
   # Outbound traffic leaves through the AKS load balancer, never through
   # Azure's implicit default outbound address.
@@ -77,12 +79,11 @@ resource "azurerm_private_dns_zone" "postgres" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "postgres" {
-  name                  = "${var.name}-vnet"
-  resource_group_name   = azurerm_resource_group.this.name
-  private_dns_zone_name = azurerm_private_dns_zone.postgres.name
-  virtual_network_id    = azurerm_virtual_network.this.id
-  registration_enabled  = false
-  tags                  = local.tags
+  name                 = "${var.name}-vnet"
+  private_dns_zone_id  = azurerm_private_dns_zone.postgres.id
+  virtual_network_id   = azurerm_virtual_network.this.id
+  registration_enabled = false
+  tags                 = local.tags
 }
 
 # Static address for the SQL endpoint, so it survives chart reinstalls. AKS

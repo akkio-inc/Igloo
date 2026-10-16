@@ -59,6 +59,12 @@ resource "azurerm_kubernetes_cluster" "this" {
     }
   }
 
+  # Node auto-provisioning stays off: the cluster autoscaler scales the
+  # node pools defined here, and nothing else creates nodes.
+  node_provisioning_profile {
+    mode = "Manual"
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.aks.id]

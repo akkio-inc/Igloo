@@ -29,6 +29,10 @@ Kubernetes workload identity.
 - `kubectl` and `psql` to connect afterwards.
 - On the target subscription: **Owner**, or **Contributor** plus **Role Based
   Access Control Administrator** (the module creates role assignments).
+  `tofu` registers the resource providers the module uses
+  (`Microsoft.Authorization`, `Microsoft.Compute`, `Microsoft.ContainerService`,
+  `Microsoft.DBforPostgreSQL`, `Microsoft.ManagedIdentity`, `Microsoft.Network`,
+  `Microsoft.Storage`) if the subscription has not registered them yet.
 - vCPU quota in the region for the VM families you use. The defaults need the
   `Standard DPSv6 Family` (2 to 6 vCPUs) and `Standard EPSv6 Family` (8 to 16
   vCPUs); Spot nodes draw from the separate low-priority quota. Check with:

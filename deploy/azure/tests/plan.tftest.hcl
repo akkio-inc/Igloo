@@ -152,6 +152,15 @@ run "storage_is_adls_gen2_and_locked_down" {
   }
 
   assert {
+    condition = (
+      length(azurerm_subnet.aks.service_endpoint) == 1 &&
+      azurerm_subnet.aks.service_endpoint[0].service == "Microsoft.Storage" &&
+      azurerm_storage_account.this.network_rules[0].virtual_network_subnet_ids == toset([azurerm_subnet.aks.id])
+    )
+    error_message = "the storage firewall must admit the AKS subnet, which reaches storage through a Microsoft.Storage service endpoint"
+  }
+
+  assert {
     condition     = azurerm_storage_container.warehouse.container_access_type == "private"
     error_message = "the filesystem must be private"
   }
@@ -178,6 +187,15 @@ run "postgres_is_private" {
   assert {
     condition     = endswith(azurerm_postgresql_flexible_server.this.delegated_subnet_id, "/subnets/postgres")
     error_message = "PostgreSQL must sit in the delegated subnet"
+  }
+
+  assert {
+    condition = (
+      azurerm_private_dns_zone_virtual_network_link.postgres.private_dns_zone_id == azurerm_private_dns_zone.postgres.id &&
+      azurerm_private_dns_zone_virtual_network_link.postgres.virtual_network_id == azurerm_virtual_network.this.id &&
+      azurerm_postgresql_flexible_server.this.private_dns_zone_id == azurerm_private_dns_zone.postgres.id
+    )
+    error_message = "PostgreSQL's private DNS zone must be linked to the VNet"
   }
 
   assert {

@@ -24,7 +24,7 @@ resource "azurerm_storage_account" "this" {
   nfsv3_enabled                     = false
 
   # The public endpoint stays enabled but only answers the networks below.
-  public_network_access_enabled = true
+  public_network_access = "Enabled"
 
   network_rules {
     default_action             = "Deny"
