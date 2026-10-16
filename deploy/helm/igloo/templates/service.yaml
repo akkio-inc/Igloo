@@ -1,12 +1,14 @@
 {{- /* SQL endpoint. Metrics are on a separate ClusterIP Service, so a
-LoadBalancer here never exposes them. */ -}}
+LoadBalancer here never exposes them. With scale to zero it leads to the
+gateway instead of the igloo pods, so clients keep the same address. */ -}}
+{{- $sqlComponent := ternary "gateway" "server" .Values.scaleToZero.enabled -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "igloo.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" $sqlComponent) | nindent 4 }}
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -26,7 +28,7 @@ spec:
   externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
   {{- end }}
   selector:
-    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.selectorLabels" (dict "root" . "component" $sqlComponent) | nindent 4 }}
   ports:
     - name: sql
       port: {{ .Values.service.port }}
@@ -49,3 +51,47 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
+{{- if .Values.scaleToZero.enabled }}
+---
+# The gateway's way to the igloo pods (IGLOO_GATEWAY_BACKEND). It has
+# endpoints only while a pod is ready, so the gateway knows Igloo has started
+# once a connection succeeds.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igloo.serverServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+  ports:
+    - name: sql
+      port: 5432
+      targetPort: sql
+      protocol: TCP
+---
+# Every igloo pod's address, for the gateway's activity checks
+# (IGLOO_GATEWAY_ACTIVITY_URL): a statement running on any replica keeps them
+# all up. Pods that are not ready are listed too, so a busy pod that briefly
+# fails its readiness probe still counts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igloo.headlessServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+{{- end }}

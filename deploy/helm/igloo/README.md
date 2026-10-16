@@ -148,20 +148,26 @@ pass for each cloud.
 - **Startup**: on first start Igloo waits up to 3 minutes for PostgreSQL and
   the catalog, then bootstraps Lakekeeper and creates the warehouse; the
   startup probe allows 5 minutes.
-- **Scaling**: `replicaCount`, or `autoscaling.enabled` for a CPU-based HPA.
-  Replicas prefer different nodes. `podDisruptionBudget` keeps
-  `minAvailable` pods during node drains; disable it with a single replica.
+- **Scaling**: `replicaCount`, or `autoscaling.enabled` for a CPU-based HPA,
+  and `scaleToZero.enabled` to stop igloo pods when idle (see
+  [below](#scale-to-zero)). Replicas prefer different nodes.
+  `podDisruptionBudget` keeps `minAvailable` pods during node drains; disable
+  it with a single replica.
 - **Metrics**: Prometheus metrics at `:8080/metrics` through the
-  `<release>-metrics` ClusterIP Service (never through the SQL Service);
-  `metrics.serviceMonitor.enabled=true` creates a ServiceMonitor.
+  `<release>-metrics` ClusterIP Service (never through the SQL Service), and
+  the scale-to-zero gateway's through `<release>-gateway-metrics`;
+  `metrics.serviceMonitor.enabled=true` creates a ServiceMonitor for both.
 - **NetworkPolicy** (on by default) restricts ingress only: Lakekeeper accepts
   igloo pods; the bundled PostgreSQL and object store accept igloo and
   Lakekeeper pods; igloo pods accept the SQL and metrics ports (narrow them with
-  `networkPolicy.sqlFrom` / `metricsFrom`). Egress is not restricted.
+  `networkPolicy.sqlFrom` / `metricsFrom`). With scale to zero, those ports
+  apply to the gateway, and igloo's SQL port accepts only the gateway. Egress
+  is not restricted.
 - **Security**: every pod runs as non-root with a read-only root filesystem,
   all capabilities dropped and the `RuntimeDefault` seccomp profile, which
   satisfies the `restricted` Pod Security Standard. Service account tokens are
-  not mounted.
+  not mounted, except in the scale-to-zero gateway, which may only change the
+  igloo Deployment's replica count.
 - **One database for both**: Igloo keeps its users in schema `igloo_auth`,
   Lakekeeper its catalog in schema `public`. Lakekeeper's tables are
   unqualified, so the chart also pins its `search_path` to `public`
@@ -174,6 +180,44 @@ pass for each cloud.
   `admin.existingSecret` and `catalog.encryptionKey.existingSecret` there.
 - `helm test igloo` logs in through the SQL Service with psql.
 
+## Scale to zero
+
+With `scaleToZero.enabled=true` the release also runs Igloo's
+[scale-to-zero gateway](../../../docs/scale-to-zero.md), and Igloo stops
+when nobody uses it:
+
+```
+SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Service igloo-server ──> igloo pods (0 to N)
+                                            └── scales Deployment igloo through the Kubernetes API
+```
+
+- The SQL Service keeps its name, type and load balancer settings but leads
+  to the gateway, so clients keep their address. The gateway copies bytes:
+  TLS and passwords stay end to end between clients and Igloo.
+- After `scaleToZero.suspendAfter` without client traffic, running
+  statements or table maintenance, the gateway scales the igloo Deployment to
+  zero. The next connection scales it back to `scaleToZero.replicas` (by
+  default `replicaCount`) and waits until Igloo accepts it, at most
+  `scaleToZero.resumeTimeout`. Clients need a connect timeout that allows for
+  this (libpq's `connect_timeout`, for example). Open sessions end when Igloo
+  stops; connection pools should check connections before use.
+- The chart no longer sets the Deployment's replica count, so `helm upgrade`
+  leaves it where the gateway put it. A new release starts with one igloo pod
+  until the gateway first stops it.
+- The saving comes from nodes: put igloo on a node pool the cluster
+  autoscaler can shrink to zero (`nodeSelector`, `tolerations`), and the
+  gateway on an always-on one (`scaleToZero.nodeSelector`, `tolerations`,
+  `affinity`).
+- With `autoscaling.enabled`, the HorizontalPodAutoscaler pauses while the
+  Deployment is at zero and takes over after a start. `scaleToZero.replicas`
+  then defaults to `autoscaling.minReplicas` and must lie between it and
+  `maxReplicas`. The PodDisruptionBudget does not hold the gateway back:
+  scaling is not an eviction.
+- The gateway's service account may only get and patch the scale
+  subresource of the igloo Deployment. Alert on
+  `igloo_gateway_resumes_total{result="failure"}`: clients cannot connect
+  while starts fail.
+
 ## Values
 
 | Key | Default | Description |
@@ -183,7 +227,7 @@ pass for each cloud.
 | `image.pullPolicy` | `IfNotPresent` | |
 | `imagePullSecrets` | `[]` | Pull secrets for every pod of the chart |
 | `nameOverride`, `fullnameOverride` | `""` | Resource names. Release `igloo` gives Service `igloo`. |
-| `replicaCount` | `2` | Igloo pods (ignored with `autoscaling.enabled`) |
+| `replicaCount` | `2` | Igloo pods (ignored with `autoscaling.enabled`; with `scaleToZero.enabled`, what the gateway starts) |
 | `admin.user` | `igloo` | `IGLOO_ADMIN_USER` |
 | `admin.existingSecret` | `""` | Secret with key `password` for `IGLOO_ADMIN_PASSWORD` |
 | `admin.password` | `""` | Inline password (8+ characters); generated and kept when both are empty |
@@ -234,6 +278,12 @@ pass for each cloud.
 | `autoscaling.targetCPUUtilizationPercentage` | `70` | |
 | `podDisruptionBudget.enabled` | `true` | |
 | `podDisruptionBudget.minAvailable` | `1` | |
+| `scaleToZero.enabled` | `false` | Run the [scale-to-zero](#scale-to-zero) gateway behind the SQL Service |
+| `scaleToZero.suspendAfter` | `10m` | `IGLOO_GATEWAY_SUSPEND_AFTER`: stop igloo after this long without client traffic or running work |
+| `scaleToZero.resumeTimeout` | `5m` | `IGLOO_GATEWAY_RESUME_TIMEOUT`: how long a connecting client waits for igloo to start |
+| `scaleToZero.replicas` | `null` | Igloo pods the gateway starts; null: `replicaCount`, or `autoscaling.minReplicas` with `autoscaling.enabled` |
+| `scaleToZero.resources` | `50m` / `64Mi`, limit `256Mi` | Gateway container |
+| `scaleToZero.nodeSelector`, `tolerations`, `affinity` | | Gateway pod scheduling, separate from igloo's |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
@@ -269,5 +319,7 @@ early.
 `deploy/helm/e2e.sh` creates a kind cluster named `igloo-e2e`, builds and loads
 `igloo:dev`, installs the chart in bundled mode with two replicas and checks
 SQL through the Service and through each pod, roles, health and metrics, the
-network policies, `helm test`, an upgrade, and uninstall/reinstall. It needs
-only Docker and deletes the cluster when done (`KEEP_CLUSTER=1` keeps it).
+network policies, `helm test`, an upgrade, uninstall/reinstall, and scale to
+zero: the gateway stops igloo when idle, `helm upgrade` leaves it stopped, and
+a client connection starts it again. It needs only Docker and deletes the
+cluster when done (`KEEP_CLUSTER=1` keeps it).

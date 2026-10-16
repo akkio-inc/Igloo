@@ -10,7 +10,9 @@ metadata:
   labels:
     {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
+  {{- /* The HorizontalPodAutoscaler or the scale-to-zero gateway owns the
+  replica count; setting it here would undo their work on every upgrade. */}}
+  {{- if not (or .Values.autoscaling.enabled .Values.scaleToZero.enabled) }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   {{- with .Values.strategy }}

@@ -35,6 +35,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   reports running statements and maintenance on `GET /activity`, and
   records maintenance passes in the metadata database so a pass that is due
   runs soon after a start.
+- `scaleToZero.enabled` in the Helm chart runs the gateway in front of
+  Igloo's Deployment, behind the same SQL Service, with the RBAC and network
+  policies it needs.
 - `COMMENT ON TABLE`, `VIEW` and `COLUMN`, stored as Iceberg metadata and
   shown through `obj_description`, `col_description`, `pg_description` and
   `igloo_comments()`.

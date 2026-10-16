@@ -179,6 +179,29 @@ jobs:
       - name: Render with bundled PostgreSQL and object storage
         run: helm template igloo "$CHART" --set postgresql.enabled=true --set objectStorage.enabled=true >/dev/null
 
+      - name: Lint and render with scale to zero
+        run: |
+          helm lint "$CHART" --set scaleToZero.enabled=true
+          helm lint "$CHART" --set postgresql.enabled=true --set objectStorage.enabled=true \
+            --set scaleToZero.enabled=true --set autoscaling.enabled=true
+          helm template igloo "$CHART" --set postgresql.enabled=true --set objectStorage.enabled=true \
+            --set scaleToZero.enabled=true --set autoscaling.enabled=true \
+            --set 'networkPolicy.metricsFrom[0].namespaceSelector.matchLabels.name=monitoring' >/dev/null
+
+      - name: Refuse invalid scale-to-zero settings
+        run: |
+          for invalid in replicaCount=0 autoscaling.enabled=true,scaleToZero.replicas=11; do
+            if out=$(helm template igloo "$CHART" --set postgresql.enabled=true --set objectStorage.enabled=true \
+              --set scaleToZero.enabled=true --set "$invalid" 2>&1); then
+              echo "::error::scaleToZero.enabled with $invalid rendered"
+              exit 1
+            fi
+            if ! grep -q scaleToZero <<<"$out"; then
+              echo "::error::unexpected error for $invalid: $out"
+              exit 1
+            fi
+          done
+
       # The release workflow packages the chart this way; catch problems early.
       - name: Package
         run: helm package "$CHART" --version 0.0.0-ci --app-version 0.0.0-ci --destination "$RUNNER_TEMP/chart"

@@ -1,0 +1,148 @@
+{{- /*
+Scale-to-zero gateway (docs/scale-to-zero.md). It takes SQL connections in
+the igloo pods' place through the SQL Service, scales the igloo Deployment to
+zero when idle and back up when a client connects, and copies bytes, so TLS
+and passwords stay end to end between clients and Igloo.
+*/ -}}
+{{- if .Values.scaleToZero.enabled }}
+{{- $name := include "igloo.gatewayName" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  # Exactly one: each gateway decides on its own when to stop Igloo.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "igloo.podLabels" (dict "root" . "component" "gateway") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      # The gateway scales the igloo Deployment with this token (see the Role
+      # below).
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- include "igloo.imagePullSecrets" . | nindent 6 }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "igloo.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["gateway"]
+          ports:
+            - name: sql
+              containerPort: 5432
+              protocol: TCP
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: IGLOO_GATEWAY_COMPUTE
+              value: kubernetes
+            - name: IGLOO_GATEWAY_K8S_DEPLOYMENT
+              value: {{ include "igloo.fullname" . | quote }}
+            - name: IGLOO_GATEWAY_K8S_REPLICAS
+              value: {{ include "igloo.scaleToZeroReplicas" . | quote }}
+            - name: IGLOO_GATEWAY_BACKEND
+              value: {{ printf "%s:5432" (include "igloo.serverServiceName" .) | quote }}
+            - name: IGLOO_GATEWAY_ACTIVITY_URL
+              value: {{ printf "http://%s:8080/activity" (include "igloo.headlessServiceName" .) | quote }}
+            - name: IGLOO_GATEWAY_SUSPEND_AFTER
+              value: {{ .Values.scaleToZero.suspendAfter | quote }}
+            - name: IGLOO_GATEWAY_RESUME_TIMEOUT
+              value: {{ .Values.scaleToZero.resumeTimeout | quote }}
+            - name: IGLOO_LOG_FORMAT
+              value: {{ .Values.log.format | quote }}
+            - name: IGLOO_LOG_LEVEL
+              value: {{ .Values.log.level | quote }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.scaleToZero.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.scaleToZero.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scaleToZero.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scaleToZero.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# Gateway metrics (igloo_gateway_*). Labelled like the igloo metrics Service,
+# so the ServiceMonitor scrapes both.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igloo.gatewayMetricsServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "metrics") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "gateway") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+# The gateway may read and change the igloo Deployment's replica count, and
+# nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: [{{ include "igloo.fullname" . | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

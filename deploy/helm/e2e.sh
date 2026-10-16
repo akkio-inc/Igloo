@@ -22,6 +22,11 @@
 #     the running pods alone and keeps the data
 #   - `helm uninstall` removes everything but the generated Secret and the
 #     PVCs, and reinstalling finds the data again
+#   - scale to zero: with scaleToZero.enabled the SQL Service leads to the
+#     gateway and queries work through it; the gateway scales igloo to zero
+#     after suspendAfter (20s here), `helm upgrade` leaves it there, and the
+#     next connection starts it again; only the gateway reaches igloo's SQL
+#     port; turning scale to zero off restores replicaCount pods
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -105,7 +110,7 @@ k() { kubectl --namespace "$NAMESPACE" "$@"; }
 
 diagnostics() {
   log "Diagnostics"
-  k get pods,svc,pvc,networkpolicy -o wide || true
+  k get deployments,pods,svc,pvc,networkpolicy -o wide || true
   k get events --sort-by=.lastTimestamp | tail -40 || true
   local pod
   for pod in $(k get pods -o name 2>/dev/null); do
@@ -172,9 +177,11 @@ admin_password() {
 }
 
 # sql HOST USER PASSWORD QUERY: run one statement with psql; prints the result.
+# CONNECT_TIMEOUT (seconds, default 10) bounds the login, which through the
+# scale-to-zero gateway includes waiting for igloo to start.
 sql() {
   k exec psql-client -- env PGPASSWORD="$3" \
-    psql "host=$1 port=5432 user=$2 dbname=igloo sslmode=disable connect_timeout=10" \
+    psql "host=$1 port=5432 user=$2 dbname=igloo sslmode=disable connect_timeout=${CONNECT_TIMEOUT:-10}" \
     -X -v ON_ERROR_STOP=1 -At -c "$4"
 }
 
@@ -204,11 +211,71 @@ server_pod_ips() {
     -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
 }
 
+# The chart deletes the test pod as soon as it passes (hook-succeeded), which
+# can race `helm test --logs`; its logs are read only when it fails, when the
+# pod is kept.
+run_helm_test() {
+  if ! helm test "$RELEASE" --namespace "$NAMESPACE" --timeout "$TIMEOUT"; then
+    k logs "$FULLNAME-test" 2>&1 || true
+    fail "helm test"
+  fi
+  pass "helm test"
+}
+
+# After `helm uninstall`, only the generated Secret and the PVCs may remain.
+check_uninstalled() {
+  local left unexpected
+  left=$(k get deployments,statefulsets,services,networkpolicies,poddisruptionbudgets,serviceaccounts,roles,rolebindings,configmaps,secrets,pvc \
+    --selector "app.kubernetes.io/instance=$RELEASE" -o name | sort)
+  printf 'Left behind:\n%s\n' "$left"
+  unexpected=$(grep -v -e "^secret/$FULLNAME\$" -e '^persistentvolumeclaim/' <<<"$left" || true)
+  [[ -z "$unexpected" ]] || fail "helm uninstall left: $unexpected"
+  grep -q "^secret/$FULLNAME\$" <<<"$left" || fail "the generated Secret was deleted"
+  pass "only the generated Secret and the PVCs remain"
+  k wait --for=delete pod --selector "app.kubernetes.io/instance=$RELEASE" --timeout="$TIMEOUT" >/dev/null 2>&1 || true
+}
+
+# Desired and ready replicas of the igloo Deployment, as "desired/ready".
+igloo_replicas() {
+  local desired ready
+  desired=$(k get deployment "$FULLNAME" -o jsonpath='{.spec.replicas}')
+  ready=$(k get deployment "$FULLNAME" -o jsonpath='{.status.readyReplicas}')
+  echo "${desired:-0}/${ready:-0}"
+}
+
+# Waits until the gateway has scaled igloo to zero and its pods are gone.
+wait_suspended() {
+  local started=$SECONDS deadline=$((SECONDS + 300))
+  until [[ "$(igloo_replicas)" == 0/0 && -z "$(k get pods --selector "$SERVER_PODS" -o name)" ]]; do
+    ((SECONDS < deadline)) || fail "igloo was not scaled to zero within 300s (desired/ready: $(igloo_replicas))"
+    sleep 5
+  done
+  pass "igloo scaled to zero, its pods gone $((SECONDS - started))s later"
+}
+
+gateway_metrics() {
+  k exec curl-client -- curl -fsS --max-time 10 "http://$FULLNAME-gateway-metrics:8080/metrics" ||
+    fail "could not read the gateway's /metrics"
+}
+
+# metric_value METRICS SAMPLE: the sample's value, 0 when it is absent.
+metric_value() {
+  awk -v sample="$2" '$1 == sample {value = $2} END {print value + 0}' <<<"$1"
+}
+
 # --- Cluster ----------------------------------------------------------------
 
 log "Creating kind cluster $CLUSTER"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
-kind create cluster --name "$CLUSTER" --image "$KIND_NODE_IMAGE" --kubeconfig "$KUBECONFIG" --wait 120s
+# On a busy Docker host the control plane sometimes misses kubeadm's
+# deadlines; a second attempt usually works.
+for attempt in 1 2 3; do
+  kind create cluster --name "$CLUSTER" --image "$KIND_NODE_IMAGE" --kubeconfig "$KUBECONFIG" --wait 120s && break
+  [[ $attempt -lt 3 ]] || fail "could not create kind cluster $CLUSTER"
+  echo "kind create cluster failed (attempt $attempt of 3)"
+  kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+  sleep 10
+done
 if [[ "${IGLOO_E2E_IN_TOOLBOX:-0}" == 1 ]]; then
   # Reach the API server over the kind network rather than a host port.
   docker network connect kind "$(hostname)" 2>/dev/null || true
@@ -352,7 +419,7 @@ fi
 pass "PostgreSQL is unreachable from other pods"
 
 log "helm test"
-helm test "$RELEASE" --namespace "$NAMESPACE" --logs
+run_helm_test
 
 # --- Upgrade -------------------------------------------------------------------
 
@@ -379,14 +446,7 @@ done
 
 log "Uninstalling"
 helm uninstall "$RELEASE" --namespace "$NAMESPACE" --wait --timeout "$TIMEOUT"
-left=$(k get deployments,statefulsets,services,networkpolicies,poddisruptionbudgets,serviceaccounts,configmaps,secrets,pvc \
-  --selector "app.kubernetes.io/instance=$RELEASE" -o name | sort)
-printf 'Left behind:\n%s\n' "$left"
-unexpected=$(grep -v -e "^secret/$FULLNAME\$" -e '^persistentvolumeclaim/' <<<"$left" || true)
-[[ -z "$unexpected" ]] || fail "helm uninstall left: $unexpected"
-grep -q "^secret/$FULLNAME\$" <<<"$left" || fail "the generated Secret was deleted"
-pass "only the generated Secret and the PVCs remain"
-k wait --for=delete pod --selector "app.kubernetes.io/instance=$RELEASE" --timeout="$TIMEOUT" >/dev/null 2>&1 || true
+check_uninstalled
 
 log "Reinstalling finds the data again"
 helm_install install
@@ -396,3 +456,87 @@ pass "admin password unchanged after reinstall"
 expect_eq "rows after reinstall" "$(sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "SELECT count(*) FROM e2e_items")" "3"
 expect_eq "reader after reinstall" "$(sql "$FULLNAME" r reader-password "SELECT note FROM e2e_items WHERE id = 1")" "through the service"
 helm uninstall "$RELEASE" --namespace "$NAMESPACE" --wait --timeout "$TIMEOUT"
+check_uninstalled
+
+# --- Scale to zero ------------------------------------------------------------------
+
+SUSPEND_AFTER=20s
+# A generous resumeTimeout: igloo starts slowly on busy CI machines.
+SCALE_TO_ZERO=(--set scaleToZero.enabled=true --set scaleToZero.suspendAfter="$SUSPEND_AFTER"
+  --set scaleToZero.resumeTimeout=10m)
+# Logins through the gateway may wait that long for igloo to start.
+RESUME_WAIT=600
+
+log "Installing with scaleToZero.enabled=true, suspendAfter=$SUSPEND_AFTER"
+helm_install install "${SCALE_TO_ZERO[@]}"
+expect_eq "the SQL Service selects" \
+  "$(k get service "$FULLNAME" -o jsonpath='{.spec.selector.app\.kubernetes\.io/component}')" "gateway"
+echo "igloo replicas (desired/ready) after install: $(igloo_replicas)"
+
+log "SQL through the gateway"
+started=$SECONDS
+expect_eq "rows through the gateway" \
+  "$(CONNECT_TIMEOUT=$RESUME_WAIT sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "SELECT count(*) FROM e2e_items")" "3"
+echo "the first query took $((SECONDS - started))s"
+CONNECT_TIMEOUT=$RESUME_WAIT sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "INSERT INTO e2e_items VALUES (4, 'through the gateway')" >/dev/null
+
+log "The gateway scales igloo to zero after $SUSPEND_AFTER without traffic"
+wait_suspended
+metrics=$(gateway_metrics)
+suspends=$(metric_value "$metrics" igloo_gateway_suspends_total)
+((suspends >= 1)) || fail "igloo_gateway_suspends_total is $suspends"
+pass "igloo_gateway_suspends_total = $suspends"
+resumes_before=$(metric_value "$metrics" 'igloo_gateway_resumes_total{result="success"}')
+
+log "helm upgrade leaves igloo at zero"
+helm_install upgrade "${SCALE_TO_ZERO[@]}"
+expect_eq "igloo replicas (desired/ready) after helm upgrade" "$(igloo_replicas)" "0/0"
+
+log "A client connection starts igloo again"
+started=$SECONDS
+expect_eq "rows after the resume" \
+  "$(CONNECT_TIMEOUT=$RESUME_WAIT sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "SELECT count(*) FROM e2e_items")" "4"
+pass "igloo answered $((SECONDS - started))s after the connection"
+expect_eq "igloo Deployment's desired replicas" "$(k get deployment "$FULLNAME" -o jsonpath='{.spec.replicas}')" "2"
+# Right after the query, while igloo stays up for suspendAfter: one ready pod.
+ready_ip=$(k get pods --selector "$SERVER_PODS" \
+  -o jsonpath='{range .items[*]}{.status.podIP} {.status.containerStatuses[0].ready}{"\n"}{end}' |
+  awk '$2 == "true" && !found {print $1; found = 1}')
+[[ -n "$ready_ip" ]] || fail "no ready igloo pod after the resume"
+expect_eq "igloo /healthz on $ready_ip from another pod" \
+  "$(k exec curl-client -- curl -fsS --max-time 10 "http://$ready_ip:8080/healthz")" "ok"
+if k exec psql-client -- pg_isready -h "$ready_ip" -p 5432 -t 5 >/dev/null 2>&1; then
+  fail "a pod other than the gateway reached igloo's SQL port at $ready_ip"
+fi
+pass "igloo's SQL port is unreachable from pods other than the gateway"
+metrics=$(gateway_metrics)
+expect_eq "igloo_gateway_resumes_total{result=\"success\"} increase" \
+  "$(($(metric_value "$metrics" 'igloo_gateway_resumes_total{result="success"}') - resumes_before))" "1"
+expect_eq "igloo_gateway_resumes_total{result=\"failure\"}" \
+  "$(metric_value "$metrics" 'igloo_gateway_resumes_total{result="failure"}')" "0"
+expect_eq "reader through the gateway" \
+  "$(CONNECT_TIMEOUT=$RESUME_WAIT sql "$FULLNAME" r reader-password "SELECT note FROM e2e_items WHERE id = 4")" "through the gateway"
+
+log "helm test through the gateway"
+run_helm_test
+
+log "Turning scale to zero off brings back replicaCount pods"
+# Start from a stopped igloo, so no pod is shutting down during the upgrade.
+wait_suspended
+helm_install upgrade
+k wait --for=delete pod --selector "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gateway" \
+  --timeout="$TIMEOUT" >/dev/null 2>&1 || true
+wait_ready 2
+expect_eq "the SQL Service selects" \
+  "$(k get service "$FULLNAME" -o jsonpath='{.spec.selector.app\.kubernetes\.io/component}')" "server"
+left=$(k get "deployment/$FULLNAME-gateway" "serviceaccount/$FULLNAME-gateway" "role/$FULLNAME-gateway" \
+  "rolebinding/$FULLNAME-gateway" "networkpolicy/$FULLNAME-gateway" "service/$FULLNAME-gateway-metrics" \
+  "service/$FULLNAME-server" "service/$FULLNAME-headless" --ignore-not-found -o name)
+[[ -z "$left" ]] || fail "turning scale to zero off left: $left"
+pass "the gateway and its Services, RBAC and NetworkPolicy are gone"
+expect_eq "rows through the Service without the gateway" \
+  "$(sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "SELECT count(*) FROM e2e_items")" "4"
+
+log "Uninstalling"
+helm uninstall "$RELEASE" --namespace "$NAMESPACE" --wait --timeout "$TIMEOUT"
+check_uninstalled

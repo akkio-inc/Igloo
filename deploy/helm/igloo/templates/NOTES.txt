@@ -29,6 +29,15 @@ create the warehouse; this can take a few minutes. Watch them with:
 
 Health and Prometheus metrics: http://{{ include "igloo.metricsServiceName" . }}.{{ $ns }}.svc:8080/metrics
 Check the release with: helm test {{ .Release.Name }} --namespace {{ $ns }}
+{{- if .Values.scaleToZero.enabled }}
+
+Scale to zero is on: Service {{ $svc }} leads to the gateway. It scales
+Deployment {{ $svc }} to zero after {{ .Values.scaleToZero.suspendAfter }} without client traffic or
+running work, and back to {{ include "igloo.scaleToZeroReplicas" . }} replicas when a client connects. That
+connection waits while igloo starts (up to {{ .Values.scaleToZero.resumeTimeout }}): give clients a
+connect timeout to match. Open sessions end when igloo stops. Gateway
+metrics: http://{{ include "igloo.gatewayMetricsServiceName" . }}.{{ $ns }}.svc:8080/metrics
+{{- end }}
 {{- if and (eq .Values.service.type "LoadBalancer") (not .Values.tls.existingSecret) }}
 
 WARNING: service.type is LoadBalancer but TLS is off (tls.existingSecret is
@@ -41,9 +50,11 @@ WARNING: service.loadBalancerSourceRanges is empty, so the SQL port accepts
 connections from any address the load balancer can reach. List your client
 CIDRs there.
 {{- end }}
-{{- if and .Values.podDisruptionBudget.enabled (not .Values.autoscaling.enabled) (le (int .Values.replicaCount) (int .Values.podDisruptionBudget.minAvailable)) }}
+{{- $replicas := ternary (include "igloo.scaleToZeroReplicas" .) .Values.replicaCount .Values.scaleToZero.enabled }}
+{{- $replicasKey := ternary "scaleToZero.replicas" "replicaCount" .Values.scaleToZero.enabled }}
+{{- if and .Values.podDisruptionBudget.enabled (not .Values.autoscaling.enabled) (le (int $replicas) (int .Values.podDisruptionBudget.minAvailable)) }}
 
-WARNING: replicaCount ({{ .Values.replicaCount }}) is not above podDisruptionBudget.minAvailable
+WARNING: {{ $replicasKey }} ({{ $replicas }}) is not above podDisruptionBudget.minAvailable
 ({{ .Values.podDisruptionBudget.minAvailable }}), so node drains will wait forever. Add replicas or set
 podDisruptionBudget.enabled=false.
 {{- end }}

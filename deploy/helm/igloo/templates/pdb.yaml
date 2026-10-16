@@ -1,3 +1,6 @@
+{{- /* The scale-to-zero gateway stops pods through the Deployment's scale
+subresource, which is not an eviction, so this budget does not hold it back;
+at zero replicas it simply has no pods to protect. */ -}}
 {{- if .Values.podDisruptionBudget.enabled }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget

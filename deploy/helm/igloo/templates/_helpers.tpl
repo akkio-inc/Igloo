@@ -35,6 +35,12 @@ the SQL Service to be called exactly that.
 {{- define "igloo.metricsServiceName" -}}{{ include "igloo.componentName" (list . "metrics") }}{{- end -}}
 {{- define "igloo.postgresqlName" -}}{{ include "igloo.componentName" (list . "postgresql") }}{{- end -}}
 {{- define "igloo.objectStorageName" -}}{{ include "igloo.componentName" (list . "object-storage") }}{{- end -}}
+{{/* Scale to zero: the gateway, its metrics, and the two Services it reaches
+the igloo pods through (SQL, and every pod's /activity). */}}
+{{- define "igloo.gatewayName" -}}{{ include "igloo.componentName" (list . "gateway") }}{{- end -}}
+{{- define "igloo.gatewayMetricsServiceName" -}}{{ include "igloo.componentName" (list . "gateway-metrics") }}{{- end -}}
+{{- define "igloo.serverServiceName" -}}{{ include "igloo.componentName" (list . "server") }}{{- end -}}
+{{- define "igloo.headlessServiceName" -}}{{ include "igloo.componentName" (list . "headless") }}{{- end -}}
 {{/* The Secret holding everything the chart generates or is given inline. */}}
 {{- define "igloo.secretName" -}}{{ include "igloo.fullname" . }}{{- end -}}
 
@@ -224,6 +230,25 @@ kubelet evicting the pod. Empty when neither is set.
 {{- end -}}
 
 {{/* ---------------------------------------------------------------------
+Scale to zero
+--------------------------------------------------------------------- */}}
+
+{{/*
+Igloo pods the gateway starts (IGLOO_GATEWAY_K8S_REPLICAS):
+scaleToZero.replicas, else autoscaling.minReplicas with autoscaling on, else
+replicaCount.
+*/}}
+{{- define "igloo.scaleToZeroReplicas" -}}
+{{- if not (kindIs "invalid" .Values.scaleToZero.replicas) -}}
+{{- int .Values.scaleToZero.replicas -}}
+{{- else if .Values.autoscaling.enabled -}}
+{{- int .Values.autoscaling.minReplicas -}}
+{{- else -}}
+{{- int .Values.replicaCount -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---------------------------------------------------------------------
 Generated secrets
 --------------------------------------------------------------------- */}}
 
@@ -348,6 +373,16 @@ Outputs YAML comments describing what is missing in that case.
 
 {{- if and $v.autoscaling.enabled (gt (int $v.autoscaling.minReplicas) (int $v.autoscaling.maxReplicas)) -}}
 {{- fail (printf "%sautoscaling.minReplicas (%v) is larger than autoscaling.maxReplicas (%v)" $prefix $v.autoscaling.minReplicas $v.autoscaling.maxReplicas) -}}
+{{- end -}}
+
+{{- if $v.scaleToZero.enabled -}}
+{{- $replicas := int (include "igloo.scaleToZeroReplicas" .) -}}
+{{- if lt $replicas 1 -}}
+{{- fail (printf "%sscaleToZero.enabled starts scaleToZero.replicas igloo pods (default: replicaCount), which must be at least 1" $prefix) -}}
+{{- end -}}
+{{- if and $v.autoscaling.enabled (or (lt $replicas (int $v.autoscaling.minReplicas)) (gt $replicas (int $v.autoscaling.maxReplicas))) -}}
+{{- fail (printf "%sscaleToZero.replicas (%d) must lie between autoscaling.minReplicas (%v) and autoscaling.maxReplicas (%v), or the HorizontalPodAutoscaler resizes the Deployment as soon as the gateway starts it. Leave it empty to use autoscaling.minReplicas." $prefix $replicas $v.autoscaling.minReplicas $v.autoscaling.maxReplicas) -}}
+{{- end -}}
 {{- end -}}
 
 {{- $missing := list -}}

@@ -1,3 +1,5 @@
+{{- /* With scale to zero, the autoscaler pauses while the gateway holds the
+Deployment at zero replicas, and takes over again once the gateway starts it. */ -}}
 {{- if .Values.autoscaling.enabled }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

@@ -124,30 +124,37 @@ gateway waits for Igloo's port itself, so start commands need not wait.
 
 ## On Kubernetes
 
-The `kubernetes` driver scales Igloo's Deployment between zero and
-`IGLOO_GATEWAY_K8S_REPLICAS` through the Kubernetes API. The cluster
-autoscaler (or Karpenter) then removes nodes that only ran Igloo, which is
-where the saving comes from: give Igloo its own node pool with a minimum
-size of zero.
-
-Run the gateway as its own Deployment with one replica and point the SQL
-Service that clients use at it. The gateway's service account needs:
+The [Helm chart](../deploy/helm/igloo/README.md#scale-to-zero) sets up the
+gateway with one setting:
 
 ```yaml
-rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    resourceNames: ["igloo"]
-    verbs: ["get", "patch"]
+scaleToZero:
+  enabled: true
+  suspendAfter: 10m   # the default
 ```
 
-Set `IGLOO_GATEWAY_BACKEND` to a Service in front of the Igloo pods, and
-`IGLOO_GATEWAY_ACTIVITY_URL` to a headless Service for them
-(`clusterIP: None`) on port 8080: the gateway asks every address the name
-resolves to, so a statement running on any replica keeps them all up. If
-Igloo also has a HorizontalPodAutoscaler, it pauses at zero replicas and
-takes over again after a start. The Helm chart does not set up the gateway
-yet.
+The gateway then runs as its own Deployment with one replica, and the SQL
+Service clients already use leads to it. Its `kubernetes` driver scales
+Igloo's Deployment between zero and `scaleToZero.replicas` (by default
+`replicaCount`) through the Kubernetes API, with a service account that may
+only get and patch that Deployment's `scale` subresource. The cluster
+autoscaler (or Karpenter) then removes nodes that only ran Igloo, which is
+where the saving comes from: give Igloo its own node pool with a minimum
+size of zero (`nodeSelector`, `tolerations`), and keep the gateway on an
+always-on one (`scaleToZero.nodeSelector`, `scaleToZero.tolerations`).
+
+The gateway reaches Igloo through a second Service, and asks every Igloo
+pod for running work through a headless Service on port 8080, so a
+statement running on any replica keeps them all up. If Igloo also has a
+HorizontalPodAutoscaler (`autoscaling.enabled`), it pauses at zero replicas
+and takes over again after a start.
+
+Without the chart, set up the same pieces yourself, following its
+`gateway.yaml` and `service.yaml` templates: `IGLOO_GATEWAY_BACKEND` pointing
+at a Service for the Igloo pods, `IGLOO_GATEWAY_ACTIVITY_URL` at a headless
+one (`clusterIP: None`), and those permissions for the gateway's service
+account. Leave `replicas` out of Igloo's Deployment, so that applying it
+again does not undo the gateway's scaling.
 
 ## Settings
 

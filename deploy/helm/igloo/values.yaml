@@ -21,7 +21,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 # Igloo pods. Each one is a complete query engine; they share the catalog and
-# the users database, and keep nothing but spill files locally.
+# the users database, and keep nothing but spill files locally. Ignored with
+# autoscaling.enabled; with scaleToZero.enabled, the number the gateway starts
+# unless scaleToZero.replicas is set.
 replicaCount: 2
 
 admin:
@@ -217,8 +219,35 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
+# Scale to zero (docs/scale-to-zero.md). A small, always-on gateway takes the
+# igloo pods' place behind the SQL Service. It scales the igloo Deployment to
+# zero after suspendAfter without client traffic or running work, and back up
+# when a client connects; that connection waits while the pods start. The
+# chart then leaves the Deployment's replica count to the gateway.
+scaleToZero:
+  enabled: false
+  # -> IGLOO_GATEWAY_SUSPEND_AFTER, a Go duration.
+  suspendAfter: 10m
+  # How long a connecting client waits for igloo to start before the gateway
+  # closes its connection -> IGLOO_GATEWAY_RESUME_TIMEOUT. Allow for the
+  # cluster autoscaler adding a node.
+  resumeTimeout: 5m
+  # Igloo pods the gateway starts -> IGLOO_GATEWAY_K8S_REPLICAS. null:
+  # replicaCount, or autoscaling.minReplicas with autoscaling.enabled.
+  replicas: null
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  # Gateway pod scheduling, separate from igloo's: keep the gateway on an
+  # always-on node pool, and igloo (nodeSelector, tolerations, affinity above)
+  # on one the cluster autoscaler can shrink to zero.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # Prometheus metrics are served on port 8080 at /metrics, through the
-# <fullname>-metrics ClusterIP Service (never through the SQL Service).
+# <fullname>-metrics ClusterIP Service (never through the SQL Service), and the
+# scale-to-zero gateway's through <fullname>-gateway-metrics.
 metrics:
   serviceMonitor:
     # Requires the Prometheus Operator CRDs.

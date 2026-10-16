@@ -5,6 +5,7 @@ storage and cloud identity endpoints, which differ per cloud.
 {{- if .Values.networkPolicy.enabled }}
 {{- $server := include "igloo.selectorLabels" (dict "root" . "component" "server") -}}
 {{- $catalog := include "igloo.selectorLabels" (dict "root" . "component" "catalog") -}}
+{{- $gateway := include "igloo.selectorLabels" (dict "root" . "component" "gateway") -}}
 # Lakekeeper has no authentication: only igloo pods may call it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -27,7 +28,9 @@ spec:
         - port: http
           protocol: TCP
 ---
-# Igloo pods: the SQL port and the health/metrics port, nothing else.
+# Igloo pods: the SQL port and the health/metrics port, nothing else. With
+# scale to zero, SQL comes only through the gateway, and the gateway reads
+# /activity on the health/metrics port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -44,6 +47,48 @@ spec:
     - ports:
         - port: sql
           protocol: TCP
+      {{- if .Values.scaleToZero.enabled }}
+      from:
+        - podSelector:
+            matchLabels:
+              {{- $gateway | nindent 14 }}
+      {{- else }}
+      {{- with .Values.networkPolicy.sqlFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- with .Values.networkPolicy.metricsFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+        {{- if $.Values.scaleToZero.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- $gateway | nindent 14 }}
+        {{- end }}
+      {{- end }}
+{{- if .Values.scaleToZero.enabled }}
+---
+# Scale-to-zero gateway: SQL clients, and its health/metrics port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "igloo.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- $gateway | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: sql
+          protocol: TCP
       {{- with .Values.networkPolicy.sqlFrom }}
       from:
         {{- toYaml . | nindent 8 }}
@@ -55,6 +100,7 @@ spec:
       from:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}
 {{- if .Values.postgresql.enabled }}
 ---
 # Bundled PostgreSQL: igloo (users) and Lakekeeper (catalog) only.
