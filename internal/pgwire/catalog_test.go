@@ -14,6 +14,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // fixedMetadata is a MetadataSource whose metadata a test sets, standing
@@ -421,4 +422,34 @@ func sorted(s []string) []string {
 	s = slices.Clone(s)
 	slices.Sort(s)
 	return s
+}
+
+func TestLineageOfMergesDeletesAndPipes(t *testing.T) {
+	ls := startLoadServer(t)
+	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	ls.write(t, "drops/day1.csv", "id,name,amount\n1,one,1.50\n", false)
+	for _, sql := range []string{
+		"CREATE TABLE lake.public.totals (id INTEGER, amount INTEGER)",
+		`MERGE INTO lake.public.totals t USING lake.public.orders o ON t.id = o.id
+			WHEN MATCHED THEN UPDATE SET amount = o.amount WHEN NOT MATCHED THEN INSERT VALUES (o.id, o.amount)`,
+		"DELETE FROM lake.public.totals USING lake.sales.leads l WHERE totals.id = l.id + 100",
+		"CREATE PIPE drops AS COPY INTO lake.public.sales FROM '" + ls.dir + "/drops/'",
+	} {
+		mustExec(t, walt, sql)
+	}
+	j, err := ls.tasks.Store().Job(context.Background(), tasks.KindPipe, "drops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ls.tasks.RunNow(context.Background(), ls.srv, j); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := texts(t, walt, `SELECT upstream_name, downstream_name, last_statement_type, last_job FROM igloo.lineage
+		ORDER BY downstream_name, upstream_name`), []string{
+		ls.dir + "/drops/|sales|COPY|pipe drops",
+		"leads|totals|DELETE|NULL",
+		"orders|totals|MERGE|NULL",
+	}; !slices.Equal(got, want) {
+		t.Errorf("lineage:\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
 }

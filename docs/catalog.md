@@ -85,7 +85,8 @@ or, for a table or view, `CREATE` on its schema, or being its owner; the
 new owner must exist. Owners follow renamed tables. Dropping an object, or
 the user or role that owns it, leaves no owner behind; objects created
 before Igloo recorded owners, or by other engines, have none until one is
-set.
+set. Owners are kept in the metadata database with the grants, and a change
+reaches other replicas within 30 seconds.
 
 Owners show in `igloo.tables` (`table_owner`, `owner_type`),
 `igloo.schemata` (`schema_owner`), `information_schema.tables`
