@@ -40,6 +40,117 @@ func TestPrivileges(t *testing.T) {
 	}
 }
 
+// TestConnectionPrivileges checks grants on connections, which never
+// stand for the Iceberg catalog's objects of the same names, nor the other
+// way round.
+func TestConnectionPrivileges(t *testing.T) {
+	p := &Privileges{Grants: []Grant{
+		{Privilege: PrivilegeSelect, Object: Object{Catalog: "crm", Schema: "public", Table: "customers"}},
+		{Privilege: PrivilegeSelect, Object: Object{Catalog: "crm", Schema: "Sales"}},
+		{Privilege: PrivilegeSelect, Object: Object{Catalog: "ops"}},
+		{Privilege: PrivilegeSelect, Object: Object{Schema: "marts"}},
+	}}
+	cases := []struct {
+		catalog, schema, table string
+		want                   bool
+	}{
+		{"crm", "public", "customers", true},
+		{"CRM", "PUBLIC", "Customers", true},
+		{"crm", "public", "pii", false},
+		{"crm", "sales", "anything", true},
+		{"ops", "any", "thing", true},
+		{"other", "public", "customers", false},
+		{"", "public", "customers", false},
+		{"crm", "marts", "x", false},
+	}
+	for _, c := range cases {
+		if got := p.AllowsConnection(PrivilegeSelect, c.catalog, c.schema, c.table); got != c.want {
+			t.Errorf("AllowsConnection(%s.%s.%s) = %v", c.catalog, c.schema, c.table, got)
+		}
+	}
+	if p.Allows(PrivilegeSelect, "public", "customers") || p.Allows(PrivilegeSelect, "sales", "x") || p.AllowsSchema(PrivilegeSelect, "sales") {
+		t.Error("a grant on a connection's object allowed the Iceberg catalog's of the same name")
+	}
+	if !p.Allows(PrivilegeSelect, "marts", "x") {
+		t.Error("a grant on an Iceberg schema")
+	}
+	for o, want := range map[Object]string{
+		{Catalog: "crm"}:                                    "connection crm",
+		{Catalog: "crm", Schema: "public"}:                  "schema crm.public",
+		{Catalog: "crm", Schema: "public", Table: "orders"}: "table crm.public.orders",
+		{Schema: "public", Table: "orders"}:                 "table public.orders",
+		{Schema: "public"}:                                  "schema public",
+	} {
+		if got := o.Kind() + " " + o.String(); got != want {
+			t.Errorf("%+v: %s, want %s", o, got, want)
+		}
+	}
+	if (Object{Catalog: "crm", Schema: "s", Table: "t"}).Equal(Object{Schema: "s", Table: "t"}) {
+		t.Error("Equal ignores the catalog")
+	}
+}
+
+// testConnectionGrants checks a GrantStore's grants on connections; ana and
+// bob exist.
+func testConnectionGrants(t *testing.T, g GrantStore) {
+	t.Helper()
+	ctx := context.Background()
+	customers := Object{Catalog: "crm", Schema: "public", Table: "customers"}
+	lakeCustomers := Object{Schema: "public", Table: "customers"}
+	grants := []Grant{
+		{Grantee: "ana", GranteeType: GranteeUser, Privilege: PrivilegeSelect, Object: customers, GrantedBy: "root"},
+		{Grantee: "ana", GranteeType: GranteeUser, Privilege: PrivilegeSelect, Object: Object{Catalog: "ops"}, GrantedBy: "root"},
+		{Grantee: "bob", GranteeType: GranteeUser, Privilege: PrivilegeSelect, Object: lakeCustomers, GrantedBy: "root"},
+	}
+	if err := g.Grant(ctx, grants); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Grant(ctx, grants[:1]); err != nil {
+		t.Errorf("granting twice: %v", err)
+	}
+	p, err := g.UserPrivileges(ctx, "ana")
+	if err != nil || !p.AllowsConnection(PrivilegeSelect, "crm", "public", "customers") || p.Allows(PrivilegeSelect, "public", "customers") ||
+		!p.AllowsConnection(PrivilegeSelect, "ops", "x", "y") {
+		t.Errorf("ana: %+v %v", p, err)
+	}
+	p, _ = g.UserPrivileges(ctx, "bob")
+	if p.AllowsConnection(PrivilegeSelect, "crm", "public", "customers") || !p.Allows(PrivilegeSelect, "public", "customers") {
+		t.Errorf("bob: %+v", p)
+	}
+	all, _ := g.Grants(ctx)
+	if !slices.ContainsFunc(all, func(x Grant) bool { return x.Object.Equal(customers) }) {
+		t.Errorf("Grants does not list a grant on a connection: %+v", all)
+	}
+	// Dropping or renaming the Iceberg table leaves the connection's alone.
+	if err := g.ForgetObject(ctx, lakeCustomers); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.RenameObject(ctx, Object{Schema: "public", Table: "customers"}, Object{Schema: "public", Table: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := g.UserPrivileges(ctx, "ana"); !p.AllowsConnection(PrivilegeSelect, "crm", "public", "customers") {
+		t.Errorf("an Iceberg table's drop took a connection's grant: %+v", p)
+	}
+	if err := g.Revoke(ctx, grants[1:2]); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := g.UserPrivileges(ctx, "ana"); p.AllowsConnection(PrivilegeSelect, "ops", "x", "y") {
+		t.Errorf("after revoke: %+v", p)
+	}
+	// Dropping the connection takes its grants.
+	if err := g.ForgetObject(ctx, Object{Catalog: "CRM"}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := g.UserPrivileges(ctx, "ana"); !p.Empty() {
+		t.Errorf("after the connection is dropped: %+v", p)
+	}
+	// Granted again, for the callers to check that dropping the user takes
+	// it.
+	if err := g.Grant(ctx, grants[:1]); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // testGrantStore checks a GrantStore whose users ana and bob exist.
 func testGrantStore(t *testing.T, g GrantStore) {
 	t.Helper()
@@ -170,6 +281,13 @@ func TestMemoryGrants(t *testing.T) {
 	}
 	g := NewMemoryGrants(users)
 	testGrantStore(t, g)
+	testConnectionGrants(t, g)
+	if err := g.ForgetUser(ctx, "ana"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := g.UserPrivileges(ctx, "ana"); !p.Empty() {
+		t.Errorf("a forgotten user keeps grants on connections: %+v", p)
+	}
 
 	if err := g.Grant(ctx, []Grant{{Grantee: "bob", GranteeType: GranteeUser, Privilege: PrivilegeSelect, Object: Object{Schema: "s"}}}); err != nil {
 		t.Fatal(err)
@@ -208,7 +326,7 @@ func TestPostgresGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if _, err := s.pool.Exec(ctx, "TRUNCATE igloo_auth.users, igloo_auth.roles, igloo_auth.grants CASCADE"); err != nil {
+	if _, err := s.pool.Exec(ctx, "TRUNCATE igloo_auth.users, igloo_auth.roles, igloo_auth.grants, igloo_auth.connection_grants CASCADE"); err != nil {
 		t.Fatal(err)
 	}
 	for _, u := range []User{{Name: "root", Role: RoleAdmin}, {Name: "ana", Role: RoleNone}, {Name: "bob", Role: RoleReader}} {
@@ -218,6 +336,21 @@ func TestPostgresGrants(t *testing.T) {
 		}
 	}
 	testGrantStore(t, s)
+	testConnectionGrants(t, s)
+	if err := s.Delete(ctx, "ana"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create(ctx, User{Name: "ana", Role: RoleNone, Verifier: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s.UserPrivileges(ctx, "ana"); !p.Empty() {
+		t.Errorf("a dropped user's grants on connections reach a new user of the name: %+v", p)
+	}
+	// The table refuses privileges other than SELECT on connections.
+	if err := s.Grant(ctx, []Grant{{Grantee: "bob", GranteeType: GranteeUser, Privilege: PrivilegeInsert,
+		Object: Object{Catalog: "crm"}}}); err == nil {
+		t.Error("INSERT was granted on a connection")
+	}
 
 	// Users and roles share names.
 	if err := s.CreateRole(ctx, "team"); err != nil {

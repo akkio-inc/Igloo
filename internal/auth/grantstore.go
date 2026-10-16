@@ -51,8 +51,10 @@ func (s *PostgresStore) DropRole(ctx context.Context, name string) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.sso_group_roles WHERE role = $1`, name); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'role' AND grantee = $1`, name)
-		return err
+		if _, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'role' AND grantee = $1`, name); err != nil {
+			return err
+		}
+		return forgetGrantee(ctx, tx, GranteeRole, name)
 	})
 }
 
@@ -127,6 +129,12 @@ func (s *PostgresStore) Grant(ctx context.Context, grants []Grant) error {
 			if err := checkGrantee(ctx, tx, g.GranteeType, g.Grantee); err != nil {
 				return err
 			}
+			if g.Object.Catalog != "" {
+				if err := grantConnection(ctx, tx, g); err != nil {
+					return err
+				}
+				continue
+			}
 			_, err := tx.Exec(ctx, `INSERT INTO igloo_auth.grants
 				(grantee, grantee_type, privilege, schema_name, table_name, granted_by)
 				SELECT $1, $2, $3, $4, $5, $6
@@ -144,6 +152,12 @@ func (s *PostgresStore) Grant(ctx context.Context, grants []Grant) error {
 func (s *PostgresStore) Revoke(ctx context.Context, grants []Grant) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		for _, g := range grants {
+			if g.Object.Catalog != "" {
+				if err := revokeConnection(ctx, tx, g); err != nil {
+					return err
+				}
+				continue
+			}
 			_, err := tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee = $1 AND grantee_type = $2
 				AND privilege = $3 AND lower(schema_name) = lower($4) AND lower(table_name) = lower($5)`,
 				g.Grantee, g.GranteeType, string(g.Privilege), g.Object.Schema, g.Object.Table)
@@ -173,7 +187,17 @@ func (s *PostgresStore) Grants(ctx context.Context) ([]Grant, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanGrant)
+	grants, err := pgx.CollectRows(rows, scanGrant)
+	if err != nil {
+		return nil, err
+	}
+	rows, err = s.pool.Query(ctx, `SELECT `+connectionGrantColumns+` FROM igloo_auth.connection_grants
+		ORDER BY grantee, connection_name, schema_name, table_name, privilege`)
+	if err != nil {
+		return nil, err
+	}
+	more, err := pgx.CollectRows(rows, scanConnectionGrant)
+	return append(grants, more...), err
 }
 
 func (s *PostgresStore) UserPrivileges(ctx context.Context, user string) (Privileges, error) {
@@ -192,7 +216,17 @@ func (s *PostgresStore) UserPrivileges(ctx context.Context, user string) (Privil
 		if err != nil {
 			return err
 		}
-		p.Grants, err = pgx.CollectRows(rows, scanGrant)
+		if p.Grants, err = pgx.CollectRows(rows, scanGrant); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT `+connectionGrantColumns+` FROM igloo_auth.connection_grants
+			WHERE (grantee_type = 'user' AND grantee = $1)
+			   OR (grantee_type = 'role' AND grantee = ANY ($2))`, user, p.Roles)
+		if err != nil {
+			return err
+		}
+		more, err := pgx.CollectRows(rows, scanConnectionGrant)
+		p.Grants = append(p.Grants, more...)
 		return err
 	})
 	return p, err
@@ -208,12 +242,17 @@ func (s *PostgresStore) ForgetUser(ctx context.Context, user string) error {
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM igloo_auth.users WHERE name = $1)`, user).Scan(&exists); err != nil || exists {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, user)
-		return err
+		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, user); err != nil {
+			return err
+		}
+		return forgetGrantee(ctx, tx, GranteeUser, user)
 	})
 }
 
 func (s *PostgresStore) ForgetObject(ctx context.Context, o Object) error {
+	if o.Catalog != "" {
+		return s.forgetConnectionObject(ctx, o)
+	}
 	var err error
 	if o.IsSchema() {
 		_, err = s.pool.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE lower(schema_name) = lower($1)`, o.Schema)
@@ -225,6 +264,9 @@ func (s *PostgresStore) ForgetObject(ctx context.Context, o Object) error {
 }
 
 func (s *PostgresStore) RenameObject(ctx context.Context, from, to Object) error {
+	if from.Catalog != "" || to.Catalog != "" {
+		return nil
+	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		// Grants left on the new name belong to a table dropped outside
 		// Igloo, not to this one, unless the new name is the old one, or

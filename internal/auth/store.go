@@ -239,6 +239,7 @@ var migrations = []string{
 		PRIMARY KEY (group_id, user_name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS scim_members_user ON igloo_auth.scim_members (user_name)`,
+	connectionGrantsTable,
 }
 
 // userColumns are what Get and List read.
@@ -362,8 +363,10 @@ func (s *PostgresStore) Delete(ctx context.Context, name string) error {
 		if err != nil || tag.RowsAffected() == 0 {
 			return tag, err
 		}
-		_, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, name)
-		return tag, err
+		if _, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, name); err != nil {
+			return tag, err
+		}
+		return tag, forgetGrantee(ctx, tx, GranteeUser, name)
 	})
 }
 

@@ -38,36 +38,58 @@ func ParsePrivilege(s string) (Privilege, bool) {
 	return p, slices.Contains(SchemaPrivileges, p)
 }
 
-// Object is a schema of the Iceberg catalog, or a table or view in one.
-// Names compare case-insensitively, as DuckDB resolves them.
+// Object is a schema of the Iceberg catalog, or a table or view in one; or,
+// with Catalog set, a connection to another database (see package
+// federation), or a schema or table of one. Names compare
+// case-insensitively, as DuckDB resolves them.
 type Object struct {
+	// Catalog is the connection's name for objects of a connection, and
+	// empty for the Iceberg catalog's.
+	Catalog string
+	// Schema is empty for a connection itself.
 	Schema string
-	// Table is empty for the schema itself.
+	// Table is empty for a schema or connection itself.
 	Table string
 }
 
-// IsSchema reports whether o is a schema rather than a table or view.
+// IsSchema reports whether o is a schema or connection rather than a table
+// or view.
 func (o Object) IsSchema() bool { return o.Table == "" }
 
-// Kind is "schema" or "table".
+// IsConnection reports whether o is a whole connection.
+func (o Object) IsConnection() bool { return o.Catalog != "" && o.Schema == "" }
+
+// Kind is "connection", "schema" or "table".
 func (o Object) Kind() string {
-	if o.IsSchema() {
+	switch {
+	case o.IsConnection():
+		return "connection"
+	case o.IsSchema():
 		return "schema"
 	}
 	return "table"
 }
 
-// String names o for messages: schema or schema.table.
+// String names o for messages: schema or schema.table, prefixed with the
+// connection for a connection's objects.
 func (o Object) String() string {
-	if o.IsSchema() {
-		return o.Schema
+	name := o.Schema
+	if !o.IsSchema() {
+		name += "." + o.Table
 	}
-	return o.Schema + "." + o.Table
+	switch {
+	case o.Catalog == "":
+		return name
+	case o.IsConnection():
+		return o.Catalog
+	}
+	return o.Catalog + "." + name
 }
 
 // Equal compares objects case-insensitively.
 func (o Object) Equal(other Object) bool {
-	return strings.EqualFold(o.Schema, other.Schema) && strings.EqualFold(o.Table, other.Table)
+	return strings.EqualFold(o.Catalog, other.Catalog) && strings.EqualFold(o.Schema, other.Schema) &&
+		strings.EqualFold(o.Table, other.Table)
 }
 
 // Grantee types: a grant names a user or a custom role. Users and custom
@@ -112,14 +134,14 @@ type Privileges struct {
 // Empty reports whether p allows nothing.
 func (p *Privileges) Empty() bool { return p == nil || len(p.Grants) == 0 }
 
-// Allows reports whether p includes priv on the table or view schema.table,
-// through a grant on it or on its schema.
+// Allows reports whether p includes priv on the table or view schema.table
+// of the Iceberg catalog, through a grant on it or on its schema.
 func (p *Privileges) Allows(priv Privilege, schema, table string) bool {
 	if p == nil {
 		return false
 	}
 	for _, g := range p.Grants {
-		if g.Privilege == priv && strings.EqualFold(g.Object.Schema, schema) &&
+		if g.Privilege == priv && g.Object.Catalog == "" && strings.EqualFold(g.Object.Schema, schema) &&
 			(g.Object.IsSchema() || strings.EqualFold(g.Object.Table, table)) {
 			return true
 		}
@@ -127,13 +149,31 @@ func (p *Privileges) Allows(priv Privilege, schema, table string) bool {
 	return false
 }
 
-// AllowsSchema reports whether p includes priv on schema itself.
+// AllowsSchema reports whether p includes priv on schema itself, a schema
+// of the Iceberg catalog.
 func (p *Privileges) AllowsSchema(priv Privilege, schema string) bool {
 	if p == nil {
 		return false
 	}
 	for _, g := range p.Grants {
-		if g.Privilege == priv && g.Object.IsSchema() && strings.EqualFold(g.Object.Schema, schema) {
+		if g.Privilege == priv && g.Object.Catalog == "" && g.Object.IsSchema() && strings.EqualFold(g.Object.Schema, schema) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsConnection reports whether p includes priv on the table
+// schema.table of the connection called catalog, through a grant on it, on
+// its schema or on the whole connection.
+func (p *Privileges) AllowsConnection(priv Privilege, catalog, schema, table string) bool {
+	if p == nil || catalog == "" {
+		return false
+	}
+	for _, g := range p.Grants {
+		if g.Privilege == priv && strings.EqualFold(g.Object.Catalog, catalog) &&
+			(g.Object.IsConnection() || strings.EqualFold(g.Object.Schema, schema) &&
+				(g.Object.IsSchema() || strings.EqualFold(g.Object.Table, table))) {
 			return true
 		}
 	}
@@ -174,9 +214,11 @@ type GrantStore interface {
 	// ForgetUser removes a dropped user's memberships and grants.
 	ForgetUser(ctx context.Context, user string) error
 	// ForgetObject removes the grants on a dropped table or view, or on a
-	// dropped schema and everything in it.
+	// dropped schema and everything in it, or on a dropped connection and
+	// everything in it.
 	ForgetObject(ctx context.Context, o Object) error
-	// RenameObject moves a renamed table's grants to its new name.
+	// RenameObject moves a renamed table's grants to its new name. Tables
+	// of connections are never renamed through Igloo.
 	RenameObject(ctx context.Context, from, to Object) error
 }
 
@@ -340,6 +382,9 @@ func (m *MemoryGrants) ForgetObject(_ context.Context, o Object) error {
 }
 
 func (m *MemoryGrants) RenameObject(_ context.Context, from, to Object) error {
+	if from.Catalog != "" || to.Catalog != "" {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// A rename to the same name, or one that changes its case only, keeps
@@ -360,9 +405,15 @@ func (m *MemoryGrants) removeGrants(drop func(Grant) bool) {
 }
 
 // covers reports whether forgetting o removes grants on target: o itself,
-// or anything in o when o is a schema.
+// or anything in o when o is a schema or connection. Objects of the Iceberg
+// catalog never cover a connection's, nor the other way round.
 func covers(o, target Object) bool {
-	if o.IsSchema() {
+	switch {
+	case !strings.EqualFold(o.Catalog, target.Catalog):
+		return false
+	case o.IsConnection():
+		return true
+	case o.IsSchema():
 		return strings.EqualFold(o.Schema, target.Schema)
 	}
 	return !target.IsSchema() && o.Equal(target)
