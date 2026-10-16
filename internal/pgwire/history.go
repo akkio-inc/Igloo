@@ -201,9 +201,10 @@ func statementKind(query string) string {
 
 // secretWords mark statements that can carry passwords or credentials.
 // Their string literals are kept out of the history, as is the word after
-// PASSWORD, which a malformed statement may leave unquoted.
+// PASSWORD, which a malformed statement may leave unquoted. CREATE PROVIDER
+// carries a Delta Sharing profile file, with its bearer token.
 var secretWords = []string{"PASSWORD", "SECRET", "KEY_ID", "SESSION_TOKEN", "ACCOUNT_KEY",
-	"CONNECTION_STRING", "CLIENT_SECRET", "TOKEN", "CREDENTIAL", "CREDENTIALS"}
+	"CONNECTION_STRING", "CLIENT_SECRET", "TOKEN", "CREDENTIAL", "CREDENTIALS", "PROVIDER"}
 
 // sensitiveSetting matches settings whose values are credentials, such as
 // s3_secret_access_key.

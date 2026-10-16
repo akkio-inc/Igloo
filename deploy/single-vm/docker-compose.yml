@@ -69,6 +69,7 @@ services:
       # cost estimates of igloo.usage (docs/workload-management.md).
       IGLOO_POOL: ${IGLOO_POOL:-default}
       IGLOO_PRICE_PER_HOUR: ${IGLOO_PRICE_PER_HOUR:-0}
+      IGLOO_SHARING_URL: ${IGLOO_SHARING_URL:-}
     ports:
       # Loopback only by default. Set IGLOO_BIND=0.0.0.0 to accept remote
       # clients, and turn on TLS first (see .env).
@@ -87,6 +88,10 @@ services:
       # (docs/external-engines.md). Loopback only by default; without TLS it
       # serves clients on private networks only.
       - "${IGLOO_ICEBERG_BIND:-127.0.0.1}:${IGLOO_ICEBERG_PORT:-8181}:8181"
+      # The Delta Sharing endpoint for recipients of shares. Loopback only
+      # by default; without TLS it answers only requests to localhost
+      # (docs/sharing.md).
+      - "${IGLOO_SHARING_BIND:-127.0.0.1}:${IGLOO_SHARING_PORT:-8444}:8444"
     volumes:
       - igloo-spill:/var/lib/igloo/tmp
       # Copies of table files read from object storage, kept across

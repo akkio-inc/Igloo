@@ -525,10 +525,14 @@ func (s *Server) catalogSchema(ctx context.Context, sess *session, name string) 
 }
 
 // catalogRelations lists the tables and views in a schema of the catalog.
-// Views are the catalog's, whose copies live in the local database.
+// Views are the catalog's, whose copies live in the local database, and
+// external tables (package sharing) count as tables.
 func (s *Server) catalogRelations(ctx context.Context, sess *session, schema string) ([]string, error) {
 	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM system.main.duckdb_tables()
 		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2) ORDER BY 1`, s.catalogName(), schema)
+	if err == nil && s.shares != nil {
+		tables = append(tables, s.shares.Consumer().TableNames(schema)...)
+	}
 	if err != nil || s.ddl == nil {
 		return tables, err
 	}

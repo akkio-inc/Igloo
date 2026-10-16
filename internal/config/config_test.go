@@ -66,6 +66,30 @@ func TestAudit(t *testing.T) {
 	}
 }
 
+func TestSharing(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil || cfg.SharingAddr != ":8444" || cfg.SharingURL != "" {
+		t.Fatalf("defaults: %q %q %v", cfg.SharingAddr, cfg.SharingURL, err)
+	}
+	cfg, err = Load(env(map[string]string{
+		"IGLOO_ADMIN_PASSWORD": "password",
+		"IGLOO_SHARING_ADDR":   "",
+		"IGLOO_SHARING_URL":    "https://data.example.com:8444/",
+	}))
+	if err != nil || cfg.SharingAddr != "" || cfg.SharingURL != "https://data.example.com:8444/delta-sharing" {
+		t.Errorf("got %q %q %v", cfg.SharingAddr, cfg.SharingURL, err)
+	}
+	if cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_SHARING_URL": "http://localhost:8444"})); err != nil ||
+		cfg.SharingURL != "http://localhost:8444/delta-sharing" {
+		t.Errorf("a local URL: %q %v", cfg.SharingURL, err)
+	}
+	for _, v := range []string{"http://data.example.com", "data.example.com", "https://data.example.com/?x=1", "https://user:pw@data.example.com"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_SHARING_URL": v})); err == nil {
+			t.Errorf("IGLOO_SHARING_URL=%s accepted", v)
+		}
+	}
+}
+
 func TestMaintenance(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
 		"IGLOO_ADMIN_PASSWORD":       "password",

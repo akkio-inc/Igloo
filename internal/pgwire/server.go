@@ -32,6 +32,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/sharing"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
 	"github.com/akkio-inc/igloo/internal/workload"
@@ -120,6 +121,9 @@ type Options struct {
 	// Pool names the compute pool this replica belongs to, for the
 	// history.
 	Pool string
+	// Sharing carries out Delta Sharing statements and keeps external
+	// tables. Nil when it is not set up.
+	Sharing *sharing.Service
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -157,6 +161,7 @@ type Server struct {
 	settings auth.SettingStore
 	workload *workload.Controller
 	pool     string
+	shares   *sharing.Service
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -205,6 +210,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		settings:    opts.Settings,
 		workload:    opts.Workload,
 		pool:        opts.Pool,
+		shares:      opts.Sharing,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -850,11 +856,31 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 			s.log.Warn("could not load table schemas", "err", err)
 		}
 	}
+	if s.shares != nil {
+		// External tables the statement names must list their current
+		// files before DuckDB binds their views.
+		external, err := s.shares.Consumer().Prepare(ctx, query)
+		if err != nil {
+			return fail(pgerror.WithCode(err, codeExternal))
+		}
+		query = external
+	}
 	st, err := prepare(ctx, sess.conn, query, oids)
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created: sync and try again.
 		if changed, _ := s.ddl.SyncViews(ctx); changed {
 			query = s.ddl.RewriteViewRefs(query)
+			st, err = prepare(ctx, sess.conn, query, oids)
+		}
+	}
+	if err != nil && s.shares != nil && missingRelation.MatchString(err.Error()) {
+		// Or an external table another replica just created.
+		if changed, _ := s.shares.Consumer().Sync(ctx); changed {
+			external, perr := s.shares.Consumer().Prepare(ctx, query)
+			if perr != nil {
+				return fail(pgerror.WithCode(perr, codeExternal))
+			}
+			query = external
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}
 	}

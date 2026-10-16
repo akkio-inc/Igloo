@@ -50,11 +50,15 @@ type userCommand struct {
 	token   *tokenCommand
 	group   *groupCommand
 	setting *settingCommand
+	// share, when set, makes this a Delta Sharing command (see sharing.go).
+	share *shareCommand
 }
 
 // columns describes the rows the command sends, if any.
 func (c userCommand) columns() wire.Columns {
 	switch {
+	case c.share != nil:
+		return c.share.columns()
 	case c.acl != nil:
 		return c.acl.columns()
 	case c.token != nil:
@@ -160,6 +164,13 @@ func parseUserCommand(toks []token) (cmd userCommand, ok bool, err error) {
 			verb = "ALTER"
 		}
 		return userCommand{verb: verb, setting: set}, true, nil
+	}
+	// Before the grant statements: GRANT ... ON SHARE is a sharing one.
+	if sc, ok, err := parseShareCommand(toks); ok {
+		if err != nil {
+			return userCommand{}, true, err
+		}
+		return userCommand{verb: sc.tag, share: sc}, true, nil
 	}
 	if acl, ok, err := parseACLCommand(toks); ok {
 		if err != nil {
@@ -322,6 +333,8 @@ func validEmail(s string) bool {
 // runUserCommand executes cmd on behalf of sess and writes the result to w.
 func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userCommand, w wire.DataWriter) error {
 	switch {
+	case cmd.share != nil:
+		return s.runShareCommand(ctx, sess, cmd.share, w)
 	case cmd.acl != nil:
 		return s.runACLCommand(ctx, sess, cmd.acl, w)
 	case cmd.token != nil:

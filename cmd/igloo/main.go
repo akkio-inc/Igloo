@@ -40,6 +40,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/pgwire"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/scim"
+	"github.com/akkio-inc/igloo/internal/sharing"
 	"github.com/akkio-inc/igloo/internal/sso"
 	"github.com/akkio-inc/igloo/internal/tasks"
 	"github.com/akkio-inc/igloo/internal/workload"
@@ -124,6 +125,16 @@ func serve() error {
 		}
 	}
 
+	// One for each server and the sharing proxy.
+	errc := make(chan error, 8)
+	var proxy *sharing.Proxy
+	if sharingPossible(cfg) {
+		if proxy, err = startSharingProxy(&cfg, errc, log); err != nil {
+			return err
+		}
+		defer proxy.Close() //nolint:errcheck
+	}
+
 	eng, err := engine.Open(startCtx, cfg, log)
 	if err != nil {
 		return err
@@ -191,6 +202,28 @@ func serve() error {
 
 	jobs := tasks.NewScheduler(taskStore, tasks.Options{Retention: cfg.Audit.Retention, Log: log})
 	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
+
+	var shares *sharing.Service
+	if proxy != nil && cat != nil {
+		sharingCtx, cancelSharing := context.WithTimeout(ctx, startupTimeout)
+		shares, err = openSharing(sharingCtx, cfg, users, cat, eng, proxy, history, reg, log)
+		cancelSharing()
+		if err != nil {
+			return err
+		}
+		runCtx, stopRun := context.WithCancel(ctx)
+		runDone := make(chan struct{})
+		go func() {
+			defer close(runDone)
+			shares.Run(runCtx)
+		}()
+		defer func() {
+			stopRun()
+			<-runDone
+			_ = shares.Close()
+		}()
+	}
+
 	// srv is set before it serves anyone; single sign-on tells it about
 	// role changes.
 	var srv *pgwire.Server
@@ -222,6 +255,7 @@ func serve() error {
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,
 		Pool:                cfg.Pool,
+		Sharing:             shares,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -268,7 +302,6 @@ func serve() error {
 	}
 
 	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work, jobs: jobs}
-	errc := make(chan error, 5)
 	var consoleSrv *http.Server
 	if cfg.ConsoleAddr != "" {
 		consoleLn, err := listenConsole(cfg.ConsoleAddr)
@@ -311,6 +344,16 @@ func serve() error {
 		}
 	}
 
+	// Like the console, the sharing endpoint listens before the SQL port.
+	var sharingSrv *http.Server
+	if shares != nil && cfg.SharingAddr != "" {
+		sharingLn, err := net.Listen("tcp", cfg.SharingAddr)
+		if err != nil {
+			return fmt.Errorf("delta sharing: %w", err)
+		}
+		sharingSrv = serveSharing(sharingLn, shares.Handler(), tlsConfig, errc, log)
+	}
+
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
@@ -327,7 +370,7 @@ func serve() error {
 		}()
 	}
 	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr,
-		"flight_sql", cfg.FlightAddr, "iceberg", icebergAddr, "pool", cfg.Pool)
+		"flight_sql", cfg.FlightAddr, "iceberg", icebergAddr, "sharing", sharingAddr(shares, cfg), "pool", cfg.Pool)
 
 	select {
 	case err := <-errc:
@@ -360,6 +403,9 @@ func serve() error {
 	}
 	if icebergSrv != nil {
 		_ = icebergSrv.Shutdown(shutdownCtx)
+	}
+	if sharingSrv != nil {
+		_ = sharingSrv.Shutdown(shutdownCtx)
 	}
 	err = srv.Shutdown(shutdownCtx)
 	jobs.Wait(shutdownCtx)

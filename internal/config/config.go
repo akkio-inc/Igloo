@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -27,6 +28,13 @@ type Config struct {
 	// IcebergAddr serves the Iceberg REST catalog to other engines. Empty
 	// disables it.
 	IcebergAddr string
+	// SharingAddr serves the Delta Sharing protocol to recipients of
+	// shares. Empty disables it.
+	SharingAddr string
+	// SharingURL is the sharing endpoint's public URL, ending in
+	// /delta-sharing, for activation links and profile files. Empty uses
+	// the address a recipient reaches it at.
+	SharingURL string
 	// TLSCertFile and TLSKeyFile enable TLS for SQL clients.
 	TLSCertFile string
 	TLSKeyFile  string
@@ -225,6 +233,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if !ok {
 		icebergAddr = ":8181"
 	}
+	sharingAddr, ok := lookup("IGLOO_SHARING_ADDR")
+	if !ok {
+		sharingAddr = ":8444"
+	}
 
 	cfg := Config{
 		ListenAddr:          get("IGLOO_LISTEN_ADDR", ":5432"),
@@ -232,6 +244,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		ConsoleAddr:         strings.TrimSpace(consoleAddr),
 		FlightAddr:          strings.TrimSpace(flightAddr),
 		IcebergAddr:         strings.TrimSpace(icebergAddr),
+		SharingAddr:         strings.TrimSpace(sharingAddr),
 		TLSCertFile:         get("IGLOO_TLS_CERT_FILE", ""),
 		TLSKeyFile:          get("IGLOO_TLS_KEY_FILE", ""),
 		LogFormat:           get("IGLOO_LOG_FORMAT", "text"),
@@ -424,6 +437,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.Storage.AllowedLocations = append(cfg.Storage.AllowedLocations, loc)
 	}
 
+	if v := get("IGLOO_SHARING_URL", ""); v != "" {
+		u, err := url.Parse(strings.TrimSuffix(v, "/"))
+		switch {
+		case err != nil || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil:
+			addErr("IGLOO_SHARING_URL must be a URL such as https://data.example.com:8444, got %q", v)
+		case u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())):
+			addErr("IGLOO_SHARING_URL must use https://, which recipients' tokens need, got %q", v)
+		default:
+			cfg.SharingURL = u.String() + "/delta-sharing"
+		}
+	}
+
 	if cfg.Catalog.URI != "" {
 		if _, err := url.ParseRequestURI(cfg.Catalog.URI); err != nil {
 			addErr("IGLOO_CATALOG_URI: %w", err)
@@ -532,6 +557,15 @@ func validPoolName(name string) bool {
 		}
 	}
 	return true
+}
+
+// isLoopbackHost reports whether host names this machine.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ValidName reports whether name is a valid user name: a safe, unquoted,

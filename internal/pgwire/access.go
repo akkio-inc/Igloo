@@ -894,9 +894,15 @@ type planScans struct {
 	// named are scans of catalog tables that name their table, which only
 	// happens when the catalog is a DuckDB database (as in tests).
 	named []auth.Object
+	// external counts Parquet scans, which statements of users who need
+	// grants can make only through external tables' views: they may not
+	// call read_parquet themselves, and the views they may read are
+	// analyzed, and refused if they call it, unless they are external
+	// tables' own.
+	external int
 }
 
-func (p planScans) total() int { return p.iceberg + len(p.named) }
+func (p planScans) total() int { return p.iceberg + len(p.named) + p.external }
 
 // allowedFunctions are the table functions users with the none role may
 // use: generators and catalog listings, which read no table data and no
@@ -949,6 +955,8 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 			switch {
 			case fn == "iceberg_scan":
 				scans.iceberg++
+			case fn == "read_parquet" && s.shares != nil:
+				scans.external++
 			case fn == "seq_scan":
 				extra, _ := n["extra_info"].(map[string]any)
 				table, _ := extra["Table"].(string)

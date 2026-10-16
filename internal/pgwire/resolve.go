@@ -36,6 +36,10 @@ type object struct {
 	internal bool
 	// catalogView is a local copy of a view of the Iceberg catalog.
 	catalogView bool
+	// external is the view of an external table (package sharing), and
+	// externalScans how many Parquet scans it makes.
+	external      bool
+	externalScans int
 }
 
 func (o object) key() string { return strings.ToLower(o.db + "." + o.schema + "." + o.name) }
@@ -195,6 +199,9 @@ func (r *resolver) load(names []string) error {
 		o.sql, _ = dest[4].(string)
 		o.internal, _ = dest[5].(bool)
 		o.catalogView = o.view && r.s.ddl != nil && strings.EqualFold(o.db, r.local) && r.s.ddl.IsView(o.schema, o.name)
+		if o.view && r.s.shares != nil && strings.EqualFold(o.db, r.local) {
+			o.externalScans, o.external = r.s.shares.Consumer().IsExternal(o.schema, o.name)
+		}
 		k := strings.ToLower(o.name)
 		r.objects[k] = append(r.objects[k], o)
 	}
@@ -404,6 +411,11 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 	var rs readSet
 	switch {
 	case o.view && o.internal:
+	case o.external:
+		// Reading an external table is reading the table, whatever its
+		// view does: Igloo wrote the view, over files only it can reach.
+		// Its Parquet scans are counted against the plan's (planScans).
+		rs = readSet{scans: o.externalScans, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
 	case o.view:
 		if !r.ownDatabase(o.db) {
 			return rs, denied("reading views of database %s needs the reader role", o.db)
