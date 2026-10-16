@@ -235,15 +235,22 @@ and the views the fragment reads: the files of each table and its columns
 by Iceberg field ID, so files written before a column was renamed, added or
 widened read as the current schema does.
 
-A worker defines those views over `read_parquet` with a field-ID schema,
-runs the fragment on a connection of its own, and writes the result as
-Parquet, which it streams back. Column types Parquet would change (HUGEINT,
-INTERVAL, TIME WITH TIME ZONE) cross as text and are cast back. The
-coordinator then runs the rest of the statement on the session's own
-connection, with the part replaced by a read of the partial results and the
-statement's parameters, and streams rows to the client through the same
-encoders as any statement. The result's columns must match the prepared
-statement's, or it falls back.
+A worker defines those views over `read_parquet`, runs the fragment on a
+connection of its own, and writes the result as Parquet, which it streams
+back. When the footers of a view's files show every column under its
+current name and field ID, with one type across the files, the view reads
+by name; otherwise by field ID. The two read the same rows, but DuckDB 1.5
+orders joins much better over reads by name (TPC-H Q5 took 20 times as
+long by field ID, joining customer to supplier first), so tables without
+schema changes, the usual case, get the better plans. Footers are read
+once per file and remembered, since data files never change.
+
+Column types Parquet would change (HUGEINT, INTERVAL, TIME WITH TIME ZONE)
+cross as text and are cast back. The coordinator then runs the rest of the
+statement on the session's own connection, with the part replaced by a
+read of the partial results and the statement's parameters, and streams
+rows to the client through the same encoders as any statement. The
+result's columns must match the prepared statement's, or it falls back.
 
 ### Correctness
 

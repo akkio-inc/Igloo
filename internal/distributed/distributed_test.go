@@ -118,6 +118,92 @@ func TestSessionSettings(t *testing.T) {
 	h.exec("RESET TimeZone")
 }
 
+// TestSchemaEvolution checks that workers read files written under older
+// schemas as the current schema says, and read files that name the
+// current columns by name.
+func TestSchemaEvolution(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	dir := filepath.Join(h.dir, "warehouse", "evolved")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, query, ids string) string {
+		path := filepath.Join(dir, name+".parquet")
+		h.exec(fmt.Sprintf("COPY (%s) TO %s (FORMAT parquet, FIELD_IDS {%s})", query, quoteLiteral(path), ids))
+		return path
+	}
+	// Before name was renamed from old_name, k widened and added added.
+	a := write("a", `SELECT CAST(i AS INTEGER) AS k, 'a' || i AS old_name FROM range(1000) t(i)`, "k: 1, old_name: 2")
+	b := write("b", `SELECT i AS k, 'b' || i AS name, i / 2 AS added FROM range(1000, 3000) t(i)`, "k: 1, name: 2, added: 3")
+	// When a column named added was another one, dropped since.
+	c := write("c", `SELECT i AS k, 'c' || i AS name, -1.0 AS added FROM range(3000, 4000) t(i)`, "k: 1, name: 2, added: 4")
+	// Written like b, with the current schema.
+	d := write("d", `SELECT i AS k, 'd' || i AS name, i / 3 AS added FROM range(4000, 5000) t(i)`, "k: 1, name: 2, added: 3")
+
+	tbl := &Table{Schema: "main", Name: "evolved", Columns: []Column{
+		{Name: "k", Type: "BIGINT", ID: 1}, {Name: "name", Type: "VARCHAR", ID: 2}, {Name: "added", Type: "DOUBLE", ID: 3},
+	}}
+	var fs []File
+	for _, p := range []string{a, b, c, d} {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fs = append(fs, File{Path: p, Size: info.Size()})
+		tbl.Bytes += info.Size()
+	}
+	h.tables["evolved"], h.files[tbl.key()] = tbl, fs
+	h.exec(fmt.Sprintf(`CREATE OR REPLACE VIEW main.evolved AS
+		SELECT CAST(k AS BIGINT) AS k, old_name AS name, CAST(NULL AS DOUBLE) AS added FROM read_parquet(%s)
+		UNION ALL SELECT k, name, added FROM read_parquet([%s, %s])
+		UNION ALL SELECT k, name, CAST(NULL AS DOUBLE) FROM read_parquet(%s)`, quoteLiteral(a), quoteLiteral(b), quoteLiteral(d), quoteLiteral(c)))
+
+	w := h.workers[0]
+	conn, err := w.opts.Engine.Connect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, tc := range []struct {
+		files []string
+		want  bool
+	}{
+		{[]string{b, d}, true},
+		{[]string{b}, true},
+		{[]string{a, b}, false}, // renamed and added
+		{[]string{c}, false},    // dropped and added again
+		{[]string{b, c, d}, false},
+		{paths(h.files["main.lineitem"][0:1]), false}, // other columns
+	} {
+		got, err := w.namedAsTable(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: tc.files})
+		if err != nil || got != tc.want {
+			t.Errorf("%v read by name: %v, %v; want %v", tc.files, got, err, tc.want)
+		}
+	}
+	li := h.tables["lineitem"]
+	if got, err := w.namedAsTable(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: li.Columns, Files: paths(h.files[li.key()])}); err != nil || !got {
+		t.Errorf("lineitem's files are not read by name: %v", err)
+	}
+	// One type across files: k is INTEGER in e and BIGINT in b.
+	e := write("e", `SELECT CAST(i AS INTEGER) AS k, 'e' || i AS name, 0.5 AS added FROM range(10) t(i)`, "k: 1, name: 2, added: 3")
+	if got, _ := w.namedAsTable(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{e, b}}); got {
+		t.Error("files with different types read by name")
+	}
+
+	for _, q := range []string{
+		`SELECT count(*), count(added), sum(k), min(name), max(name), sum(added) FROM evolved`,
+		`SELECT k, name, added FROM evolved WHERE k % 250 = 0 ORDER BY k`,
+		`SELECT left(name, 1) AS f, count(*), count(added) FROM evolved GROUP BY 1 ORDER BY 1`,
+	} {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Error("did not run distributed")
+			}
+		})
+	}
+}
+
 // TestLocal covers statements that must run on one machine.
 func TestLocal(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)

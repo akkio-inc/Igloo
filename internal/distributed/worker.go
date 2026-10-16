@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -70,6 +71,10 @@ type Worker struct {
 	// beforeTask, if set, runs before each task; tests use it to make a
 	// worker fail or hang.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
+
+	// footers are data files' columns by path; see footerColumns.
+	footersMu sync.Mutex
+	footers   map[string]map[string]fileColumn
 }
 
 // NewWorker returns a worker; call Serve to accept tasks.
@@ -247,6 +252,11 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		}
 	}
 	for _, v := range req.Views {
+		if !v.ByName && len(v.Files) > 0 {
+			if v.ByName, err = w.namedAsTable(ctx, conn, v); err != nil {
+				return "", nil, err
+			}
+		}
 		stmt, err := w.viewStatement(v)
 		if err != nil {
 			return "", nil, err
@@ -360,10 +370,130 @@ func globFiles(ctx context.Context, conn *duckdb.Conn, pattern string) ([]string
 	}
 }
 
-// viewStatement defines a view over data files, read by Iceberg field ID
+// fileColumn is a column of a data file as the file's footer declares it.
+type fileColumn struct {
+	id  int64 // 0 without a field ID
+	typ string
+	// leaf is false for groups (structs, lists, maps).
+	leaf bool
+	// n counts the file's schema elements of this name, nested ones too.
+	n int
+}
+
+// maxFooters bounds the data files whose columns a worker remembers.
+const maxFooters = 10000
+
+// namedAsTable reports whether every file of v holds each of v's columns
+// under its current name and field ID, with one type across the files.
+// Such files read the same by name as by field ID, and DuckDB plans reads
+// by name better: reading TPC-H Q5's tables by field ID, DuckDB 1.5 joined
+// customer to supplier first, 60 million rows, and took 20 times as long.
+// Anything else (a column renamed, added, dropped and added again, or
+// widened since some file was written, or a nested column) reads by field
+// ID.
+func (w *Worker) namedAsTable(ctx context.Context, conn *duckdb.Conn, v viewDef) (bool, error) {
+	for _, c := range v.Columns {
+		if c.ID <= 0 || nestedType(c.Type) {
+			return false, nil
+		}
+	}
+	if slices.ContainsFunc(v.Files, func(f string) bool { return !w.allowed(f) }) {
+		// viewStatement refuses them.
+		return false, nil
+	}
+	files, err := w.footerColumns(ctx, conn, v.Files)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		w.log.Debug("could not read data file footers; reading by field ID", "view", v.Name, "err", err)
+		return false, nil
+	}
+	types := make([]string, len(v.Columns))
+	for _, f := range v.Files {
+		cols := files[f]
+		for i, c := range v.Columns {
+			fc, ok := cols[c.Name]
+			if !ok || fc.n != 1 || !fc.leaf || fc.id != int64(c.ID) || (types[i] != "" && fc.typ != types[i]) {
+				return false, nil
+			}
+			types[i] = fc.typ
+		}
+	}
+	return true, nil
+}
+
+// footerColumns returns the columns of each file by name, from the files'
+// footers or from those read before: a data file never changes.
+func (w *Worker) footerColumns(ctx context.Context, conn *duckdb.Conn, files []string) (map[string]map[string]fileColumn, error) {
+	out := make(map[string]map[string]fileColumn, len(files))
+	var missing []string
+	w.footersMu.Lock()
+	for _, f := range files {
+		if cols, ok := w.footers[f]; ok {
+			out[f] = cols
+		} else {
+			missing = append(missing, quoteLiteral(f))
+		}
+	}
+	w.footersMu.Unlock()
+	if len(missing) == 0 {
+		return out, nil
+	}
+	rows, err := conn.QueryContext(ctx, "SELECT file_name, name, coalesce(field_id, 0), coalesce(duckdb_type, ''), "+
+		"coalesce(num_children, 0) FROM parquet_schema(["+strings.Join(missing, ", ")+"])", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	read := map[string]map[string]fileColumn{}
+	dest := make([]driver.Value, 5)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		file, _ := dest[0].(string)
+		name, _ := dest[1].(string)
+		cols := read[file]
+		if cols == nil {
+			cols = map[string]fileColumn{}
+			read[file] = cols
+		}
+		c := cols[name]
+		c.id, _ = dest[2].(int64)
+		c.typ, _ = dest[3].(string)
+		children, _ := dest[4].(int64)
+		c.leaf = children == 0
+		c.n++
+		cols[name] = c
+	}
+	w.footersMu.Lock()
+	if w.footers == nil || len(w.footers)+len(read) > maxFooters {
+		w.footers = map[string]map[string]fileColumn{}
+	}
+	for f, cols := range read {
+		w.footers[f] = cols
+		out[f] = cols
+	}
+	w.footersMu.Unlock()
+	return out, nil
+}
+
+// nestedType reports whether a DuckDB type is a struct, list, map or union.
+func nestedType(t string) bool {
+	u := strings.ToUpper(strings.TrimSpace(t))
+	return strings.HasSuffix(u, "]") || strings.HasPrefix(u, "STRUCT") || strings.HasPrefix(u, "MAP") || strings.HasPrefix(u, "UNION")
+}
+
+// viewStatement defines a view over data files: read by Iceberg field ID,
 // so files written before a column was renamed, added or widened read as
-// the table's current schema does, or over shuffled files, read by name. A
-// table without files is empty.
+// the table's current schema does; or, with ByName, read by column name,
+// for files that namedAsTable found to name the table's columns, and for
+// shuffled files. Paths are never read as Hive partitions. A table without
+// files is empty.
 func (w *Worker) viewStatement(v viewDef) (string, error) {
 	if !strings.HasPrefix(v.Name, "__igloo_") {
 		return "", fmt.Errorf("view name %q", v.Name)
@@ -391,7 +521,7 @@ func (w *Worker) viewStatement(v viewDef) (string, error) {
 			cols[i] = "CAST(" + quoteIdent(c.Name) + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
 		}
 		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT " + strings.Join(cols, ", ") +
-			" FROM read_parquet([" + strings.Join(files, ", ") + "])", nil
+			" FROM read_parquet([" + strings.Join(files, ", ") + "], hive_partitioning = false)", nil
 	}
 	schema := make([]string, len(v.Columns))
 	for i, c := range v.Columns {
@@ -401,7 +531,7 @@ func (w *Worker) viewStatement(v viewDef) (string, error) {
 		schema[i] = fmt.Sprintf("%d: {name: %s, type: %s, default_value: NULL}", c.ID, quoteLiteral(c.Name), quoteLiteral(c.Type))
 	}
 	return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT * FROM read_parquet([" + strings.Join(files, ", ") +
-		"], schema = MAP {" + strings.Join(schema, ", ") + "})", nil
+		"], schema = MAP {" + strings.Join(schema, ", ") + "}, hive_partitioning = false)", nil
 }
 
 // allowed reports whether a data file lies under the warehouse or an
