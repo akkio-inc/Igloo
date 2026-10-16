@@ -88,6 +88,12 @@ func isExternalType(t string) bool {
 // views or connections change; on an error the caller keeps what it had.
 func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth.User, st *statement, query string, acc *access) (*access, error) {
 	if len(s.externalCatalogs()) == 0 {
+		// Nothing to read. This leaves a statement its role allows
+		// unchecked from then on, which holds only because connections are
+		// attached before any session starts (see federation.Manager.Attach)
+		// and never after: a statement prepared now cannot come to read
+		// one. Attaching connections later would need every non-admin
+		// statement checked again when one is attached.
 		return acc, nil
 	}
 	if st.stmtType == duckdb.STATEMENT_TYPE_DETACH {

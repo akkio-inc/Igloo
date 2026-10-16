@@ -174,6 +174,9 @@ SHOW GRANTS ON CONNECTION crm;
 - Grants follow names, as for Iceberg tables. Dropping a connection removes
   its grants; a connection created again under the same name starts with
   none.
+- Names compare without regard to case, as DuckDB resolves them: a grant
+  on `crm.public.customers` also covers a PostgreSQL table named
+  `"Customers"` in the same schema, should there be both.
 - Table and column names and types of a connection's tables are visible to
   every user, through the system catalogs, as Iceberg tables' are.
 
