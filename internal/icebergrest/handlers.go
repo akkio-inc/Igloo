@@ -3,34 +3,52 @@ package icebergrest
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/akkio-inc/igloo/internal/auth"
 )
 
-// schemaOf names a namespace as grants do. Nested namespaces, which SQL
-// does not show and so grants cannot name, get their levels joined by dots.
+// schemaOf names a namespace as grants do. Only admins may use nested
+// namespaces, which SQL does not show, so grants never name one; the
+// history names them with their levels joined by dots, which no level
+// contains.
 func schemaOf(ns []string) string { return strings.Join(ns, ".") }
 
-// validName reports whether s may name a namespace level or a table. "."
-// and ".." would be path segments that move up Lakekeeper's API.
-func validName(s string) bool { return s != "" && s != "." && s != ".." }
+// validName reports whether s may name a table. "." and ".." would be path
+// segments that move up Lakekeeper's API.
+func validName(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsFunc(s, unicode.IsControl)
+}
+
+// validLevel reports whether s may name a namespace level. Levels with dots
+// would make ["a", "b"] and ["a.b"] one schema to grants; Lakekeeper refuses
+// them too.
+func validLevel(s string) bool { return validName(s) && !strings.Contains(s, ".") }
+
+// pathName reads a namespace level or table name in a request's path as
+// Lakekeeper does, which turns "+" into a space: Iceberg's Java client
+// form-encodes names, spaces as "+", and Lakekeeper refuses "+" in names.
+// Read otherwise, a request could be checked for one table and act on
+// another.
+func pathName(s string) string { return strings.ReplaceAll(s, "+", " ") }
 
 // pathNamespace is the namespace in a request's path: levels separated by
 // the unit separator (%1F).
 func pathNamespace(r *http.Request) ([]string, error) {
-	ns := strings.Split(r.PathValue("namespace"), "\x1f")
+	ns := strings.Split(pathName(r.PathValue("namespace")), "\x1f")
 	if !allValid(ns) {
 		return nil, errorf(http.StatusBadRequest, errBadRequest, "malformed namespace %q", r.PathValue("namespace"))
 	}
 	return ns, nil
 }
 
-func allValid(names []string) bool {
-	return len(names) > 0 && !slices.ContainsFunc(names, func(n string) bool { return !validName(n) })
+func allValid(levels []string) bool {
+	return len(levels) > 0 && !slices.ContainsFunc(levels, func(n string) bool { return !validLevel(n) })
 }
 
 // pathTable is the namespace and table in a request's path.
@@ -39,11 +57,39 @@ func pathTable(r *http.Request) ([]string, auth.Object, error) {
 	if err != nil {
 		return nil, auth.Object{}, err
 	}
-	name := r.PathValue("table")
+	name := pathName(r.PathValue("table"))
 	if !validName(name) {
-		return nil, auth.Object{}, errorf(http.StatusBadRequest, errBadRequest, "malformed table name %q", name)
+		return nil, auth.Object{}, errorf(http.StatusBadRequest, errBadRequest, "malformed table name %q", r.PathValue("table"))
 	}
 	return ns, auth.Object{Schema: schemaOf(ns), Table: name}, nil
+}
+
+// namespace is the namespace in c's path, which must be one c may use.
+func (c *call) namespace() ([]string, error) {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return nil, err
+	}
+	return ns, c.who.requireTopLevel(ns)
+}
+
+// table is the namespace and table in c's path, in a namespace c may use.
+func (c *call) table() ([]string, auth.Object, error) {
+	ns, o, err := pathTable(c.r)
+	if err != nil {
+		return nil, auth.Object{}, err
+	}
+	return ns, o, c.who.requireTopLevel(ns)
+}
+
+// requireTopLevel refuses non-admins a nested namespace. Igloo's SQL shows
+// top-level schemas only, so grants cannot name nested ones, nor SQL
+// clients see their tables.
+func (c *caller) requireTopLevel(ns []string) error {
+	if len(ns) == 1 || c.admin() {
+		return nil
+	}
+	return c.deny("only admins may use nested namespaces, which Igloo's SQL does not show")
 }
 
 // identifier is a TableIdentifier.
@@ -57,6 +103,12 @@ func (id identifier) object() auth.Object {
 }
 
 func (id identifier) valid() bool { return validName(id.Name) && allValid(id.Namespace) }
+
+// is reports whether id names the table name in namespace ns, exactly, as
+// Lakekeeper compares them.
+func (id identifier) is(ns []string, name string) bool {
+	return slices.Equal(id.Namespace, ns) && id.Name == name
+}
 
 // vendRequested reports whether the client asked for storage credentials.
 func vendRequested(r *http.Request) bool {
@@ -94,7 +146,9 @@ func (s *Server) listNamespaces(c *call) error {
 	if err := json.Unmarshal(r.body, &list); err != nil {
 		return err
 	}
-	list.Namespaces = slices.DeleteFunc(list.Namespaces, func(ns []string) bool { return !c.who.seesSchema(schemaOf(ns)) })
+	list.Namespaces = slices.DeleteFunc(list.Namespaces, func(ns []string) bool {
+		return c.who.requireTopLevel(ns) != nil || !c.who.seesSchema(schemaOf(ns))
+	})
 	if list.Namespaces == nil {
 		list.Namespaces = [][]string{}
 	}
@@ -114,13 +168,12 @@ func (s *Server) createNamespace(c *call) error {
 	if !allValid(req.Namespace) {
 		return errorf(http.StatusBadRequest, errBadRequest, "missing or malformed namespace")
 	}
+	c.written = []auth.Object{{Schema: schemaOf(req.Namespace)}}
 	if err := c.who.requireWriter("creating schemas"); err != nil {
 		return err
 	}
-	// Igloo's SQL shows top-level namespaces only, so grants could not
-	// name a nested one, nor SQL clients see its tables.
-	if len(req.Namespace) > 1 && !c.who.admin() {
-		return c.who.deny("only admins may create nested namespaces, which Igloo's SQL does not show")
+	if err := c.who.requireTopLevel(req.Namespace); err != nil {
+		return err
 	}
 	if err := c.who.checkLocation(keys(req.Properties)); err != nil {
 		return err
@@ -134,7 +187,7 @@ func (s *Server) createNamespace(c *call) error {
 }
 
 func (s *Server) loadNamespace(c *call) error {
-	ns, err := pathNamespace(c.r)
+	ns, err := c.namespace()
 	if err != nil {
 		return err
 	}
@@ -150,7 +203,7 @@ func (s *Server) loadNamespace(c *call) error {
 }
 
 func (s *Server) namespaceExists(c *call) error {
-	ns, err := pathNamespace(c.r)
+	ns, err := c.namespace()
 	if err != nil {
 		return err
 	}
@@ -166,10 +219,11 @@ func (s *Server) namespaceExists(c *call) error {
 }
 
 func (s *Server) dropNamespace(c *call) error {
-	ns, err := pathNamespace(c.r)
+	ns, err := c.namespace()
 	if err != nil {
 		return err
 	}
+	c.written = []auth.Object{{Schema: schemaOf(ns)}}
 	if err := c.who.requireWriter("dropping schemas"); err != nil {
 		return err
 	}
@@ -183,7 +237,7 @@ func (s *Server) dropNamespace(c *call) error {
 }
 
 func (s *Server) updateNamespace(c *call) error {
-	ns, err := pathNamespace(c.r)
+	ns, err := c.namespace()
 	if err != nil {
 		return err
 	}
@@ -195,6 +249,7 @@ func (s *Server) updateNamespace(c *call) error {
 	if err != nil {
 		return err
 	}
+	c.written = []auth.Object{{Schema: schemaOf(ns)}}
 	if err := c.who.requireWriter("changing schema properties"); err != nil {
 		return err
 	}
@@ -228,7 +283,7 @@ func keys(m map[string]string) []string {
 }
 
 func (s *Server) listTables(c *call) error {
-	ns, err := pathNamespace(c.r)
+	ns, err := c.namespace()
 	if err != nil {
 		return err
 	}
@@ -255,7 +310,7 @@ func (s *Server) listTables(c *call) error {
 }
 
 func (s *Server) createTable(c *call) error {
-	ns, err := pathNamespace(c.r)
+	ns, err := c.namespace()
 	if err != nil {
 		return err
 	}
@@ -285,6 +340,10 @@ func (s *Server) createTable(c *call) error {
 	if err := checkProperties(keys(req.Properties)); err != nil {
 		return err
 	}
+	// Policies name the tables they protect.
+	if err := s.requireUnprotected(c, o); err != nil {
+		return err
+	}
 	r, err := s.cat.call(c.ctx(), http.MethodPost, namespacePathOf(ns)+"/tables", nil, body)
 	if err != nil {
 		return err
@@ -295,13 +354,16 @@ func (s *Server) createTable(c *call) error {
 }
 
 func (s *Server) loadTable(c *call) error {
-	ns, o, err := pathTable(c.r)
+	ns, o, err := c.table()
 	if err != nil {
 		return err
 	}
 	c.read = []auth.Object{o}
 	if err := c.who.require(auth.PrivilegeSelect, o); err != nil {
 		return s.unlessMissing(c, ns, o.Table, err)
+	}
+	if err := s.requireUnprotected(c, o); err != nil {
+		return err
 	}
 	r, err := s.cat.call(c.ctx(), http.MethodGet, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "snapshots"), nil)
 	if err != nil {
@@ -319,7 +381,7 @@ func (s *Server) writeTable(c *call, ns []string, o auth.Object, r *reply, write
 	}
 	var creds *Credentials
 	if vendRequested(c.r) {
-		if creds, err = s.vend(c, result.location, write); err != nil {
+		if creds, err = s.vend(c, ns, result, write); err != nil {
 			return err
 		}
 	}
@@ -331,11 +393,23 @@ func (s *Server) writeTable(c *call, ns []string, o auth.Object, r *reply, write
 	return nil
 }
 
-// vend gets credentials for the table at location, or nil when none can
+// vend gets credentials for table t in namespace ns, or nil when none can
 // be given.
-func (s *Server) vend(c *call, location string, write bool) (*Credentials, error) {
+func (s *Server) vend(c *call, ns []string, t *loadResult, write bool) (*Credentials, error) {
 	if s.opts.Credentials == nil {
 		return nil, nil
+	}
+	location := t.location
+	if !c.who.admin() {
+		assigned, err := s.assignedLocation(c, ns, t)
+		if err != nil {
+			return nil, err
+		}
+		if !assigned {
+			s.log.Warn("no storage credentials for a table that is not where the catalog put it",
+				"location", location, "uuid", t.uuid, "namespace", schemaOf(ns))
+			return nil, nil
+		}
 	}
 	creds, err := s.opts.Credentials.Vend(c.ctx(), location, write, c.who.user.Name)
 	if errors.Is(err, ErrNoCredentials) {
@@ -352,8 +426,29 @@ func (s *Server) vend(c *call, location string, write bool) (*Credentials, error
 	return &creds, nil
 }
 
+// assignedLocation reports whether table t is where Lakekeeper put it when
+// it was created: in its namespace's location, in a directory named for its
+// UUID. Lakekeeper refuses to move a table or change its UUID, and Igloo
+// lets only admins ask; credentials for a table anywhere else could reach
+// another table's files, or a directory above or below another table's.
+func (s *Server) assignedLocation(c *call, ns []string, t *loadResult) (bool, error) {
+	r, err := s.cat.call(c.ctx(), http.MethodGet, namespacePathOf(ns), nil, nil)
+	if err != nil {
+		return false, err
+	}
+	var meta struct {
+		Properties map[string]string `json:"properties"`
+	}
+	if err := json.Unmarshal(r.body, &meta); err != nil {
+		return false, fmt.Errorf("catalog returned malformed namespace metadata: %w", err)
+	}
+	base := strings.TrimSuffix(meta.Properties["location"], "/")
+	return base != "" && validName(t.uuid) && !strings.Contains(t.uuid, "/") &&
+		strings.TrimSuffix(t.location, "/") == base+"/"+t.uuid, nil
+}
+
 func (s *Server) tableExists(c *call) error {
-	ns, o, err := pathTable(c.r)
+	ns, o, err := c.table()
 	if err != nil {
 		return err
 	}
@@ -369,7 +464,7 @@ func (s *Server) tableExists(c *call) error {
 }
 
 func (s *Server) updateTable(c *call) error {
-	ns, o, err := pathTable(c.r)
+	ns, o, err := c.table()
 	if err != nil {
 		return err
 	}
@@ -378,14 +473,32 @@ func (s *Server) updateTable(c *call) error {
 	if err != nil {
 		return err
 	}
-	n := classify(req)
 	c.written = []auth.Object{o}
+	// Lakekeeper commits to the body's table when it differs from the
+	// path's in one way (a Spark branch commit), so Igloo would check one
+	// table and Lakekeeper change another.
+	if req.Identifier != nil && !req.Identifier.is(ns, o.Table) {
+		return errorf(http.StatusBadRequest, errBadRequest, "the table identifier in the request body differs from the table in the path")
+	}
+	n := classify(req)
 	c.detail = strings.Join(n.summary, ", ")
 	if err := c.who.allowsCommit(o, n); err != nil {
 		return err
 	}
 	if err := checkProperties(req.propertyKeys()); err != nil {
 		return err
+	}
+	if err := s.requireUnprotected(c, o); err != nil {
+		return err
+	}
+	// The staged table already has the UUID and location Lakekeeper gave
+	// it, which clients restate when they create it. Lakekeeper refuses
+	// others, and Igloo leaves them out, so they cannot name another
+	// table's.
+	if n.creates && !c.who.admin() {
+		if body, err = withoutUpdates(body, stagedUpdates...); err != nil {
+			return err
+		}
 	}
 	// Creating needs only CREATE, so it must not touch an existing table.
 	// Lakekeeper refuses that too.
@@ -403,7 +516,7 @@ func (s *Server) updateTable(c *call) error {
 }
 
 func (s *Server) dropTable(c *call) error {
-	ns, o, err := pathTable(c.r)
+	ns, o, err := c.table()
 	if err != nil {
 		return err
 	}
@@ -434,14 +547,27 @@ func (s *Server) renameTable(c *call) error {
 	}
 	from, to := req.Source.object(), req.Destination.object()
 	c.written = []auth.Object{from, to}
+	for _, ns := range [][]string{req.Source.Namespace, req.Destination.Namespace} {
+		if err := c.who.requireTopLevel(ns); err != nil {
+			return err
+		}
+	}
 	if err := c.who.require(auth.PrivilegeCreate, auth.Object{Schema: from.Schema}); err != nil {
 		return err
 	}
 	// Grants on the other schema would then reach the table: moving a
 	// table out of a schema could hand it to whoever may read another.
-	// SQL cannot move tables between schemas either.
+	// SQL cannot move tables between schemas either. Lakekeeper compares
+	// names without case, as grants do.
 	if !strings.EqualFold(from.Schema, to.Schema) && !c.who.admin() {
 		return c.who.deny("only admins may move a table to another schema")
+	}
+	// Policies name the tables they protect, so a protected table renamed
+	// would lose them, and a table renamed to a protected name gain them.
+	for _, o := range []auth.Object{from, to} {
+		if err := s.requireUnprotected(c, o); err != nil {
+			return err
+		}
 	}
 	if _, err := s.cat.call(c.ctx(), http.MethodPost, "tables/rename", nil, body); err != nil {
 		return err
@@ -455,13 +581,16 @@ func (s *Server) renameTable(c *call) error {
 }
 
 func (s *Server) loadCredentials(c *call) error {
-	ns, o, err := pathTable(c.r)
+	ns, o, err := c.table()
 	if err != nil {
 		return err
 	}
 	c.read = []auth.Object{o}
 	if err := c.who.require(auth.PrivilegeSelect, o); err != nil {
 		return s.unlessMissing(c, ns, o.Table, err)
+	}
+	if err := s.requireUnprotected(c, o); err != nil {
+		return err
 	}
 	r, err := s.cat.call(c.ctx(), http.MethodGet, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "snapshots"), nil)
 	if err != nil {
@@ -471,7 +600,7 @@ func (s *Server) loadCredentials(c *call) error {
 	if err != nil {
 		return err
 	}
-	creds, err := s.vend(c, result.location, c.who.writesData(o))
+	creds, err := s.vend(c, ns, result, c.who.writesData(o))
 	if err != nil {
 		return err
 	}
@@ -506,6 +635,27 @@ func (s *Server) unlessMissing(c *call, ns []string, table string, refusal error
 		return errorf(http.StatusNotFound, kind, "%s does not exist", name)
 	}
 	return refusal
+}
+
+// requireUnprotected refuses non-admins table o if it has data policies.
+// Igloo enforces masking and row access policies by rewriting the SQL it
+// runs; an engine with the table's metadata and files reads the raw data,
+// so such tables are read through Igloo, as Unity Catalog does for engines
+// outside it. Admins, whom policies do not bind, are not refused.
+func (s *Server) requireUnprotected(c *call, o auth.Object) error {
+	if s.opts.Protected == nil || c.who.admin() {
+		return nil
+	}
+	protected, err := s.opts.Protected(c.ctx(), o)
+	if err != nil {
+		s.log.Warn("could not check a table's data policies", "table", o.String(), "err", err)
+		return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check the table's data policies; try again")
+	}
+	if protected {
+		return c.who.deny(fmt.Sprintf("table %s has data policies (masking or row access) that other engines would bypass; "+
+			"read it through Igloo's SQL or Flight SQL", o))
+	}
+	return nil
 }
 
 // forget removes the grants on a dropped table or schema.

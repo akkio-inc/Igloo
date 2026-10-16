@@ -532,8 +532,9 @@ if docker run --rm --network "$network" -e ICEBERG_URI=http://igloo:8181 -e IGLO
 else
   fail "PyIceberg: $(tail -5 "$work/pyiceberg.out")"
 fi
-expect "SQL sees what PyIceberg wrote" "1:signup,2:login,3:purchase|1" igloo "$admin_password" \
-  "SELECT (SELECT string_agg(id || ':' || kind, ',' ORDER BY id) FROM ice_events), (SELECT count(*) FROM ice_created)"
+expect "SQL sees what PyIceberg wrote" "1:signup,2:login,3:purchase|1|staged" igloo "$admin_password" \
+  "SELECT (SELECT string_agg(id || ':' || kind, ',' ORDER BY id) FROM ice_events), (SELECT count(*) FROM ice_created),
+     (SELECT string_agg(kind, ',') FROM ice_staged)"
 expect_soon "catalog requests are in the query history" "t|t|t" igloo "$admin_password" "
   SELECT bool_or(user_name = 'ivy' AND statement_type = 'loadTable' AND outcome = 'ok'),
          bool_or(user_name = 'ivy' AND outcome = 'denied' AND sqlstate = '42501'),

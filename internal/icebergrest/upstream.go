@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -86,10 +87,32 @@ func (u *upstream) do(ctx context.Context, method, target string, body []byte) (
 	return &reply{status: resp.StatusCode, body: data}, nil
 }
 
-// refusal turns an error response from Lakekeeper into the client's. Its
-// type and message pass on, as they describe the client's mistake (no
-// such table, a conflicting commit); internal detail does not, nor do
-// server errors, which go to the log.
+// catalogRefusals are the error types of Lakekeeper's refusals that
+// clients act on, which pass on with Igloo's words for them.
+var catalogRefusals = map[string]string{
+	"NoSuchTableException":       "the table does not exist",
+	"NoSuchNamespaceException":   "the namespace does not exist",
+	"AlreadyExistsException":     "a table or namespace of that name already exists",
+	"NamespaceNotEmptyException": "the namespace is not empty",
+	"CommitFailedException":      "the table changed since it was loaded; load it again and retry",
+}
+
+// refusalKinds are the error types a refusal of each status gets when
+// Lakekeeper's is not one clients act on.
+var refusalKinds = map[int]string{
+	http.StatusNotFound: "NotFoundException",
+	http.StatusConflict: "CommitFailedException",
+}
+
+// refusalCode is what a Lakekeeper error type that passes on, as a hint,
+// looks like: a name such as SetLocationNotAllowed.
+var refusalCode = regexp.MustCompile(`^[A-Za-z]{1,64}$`)
+
+// refusal turns an error response from Lakekeeper into the client's.
+// Lakekeeper's messages can name its internal IDs and storage locations,
+// so they go to the log; the client gets the status, the type for the
+// refusals clients act on (no such table, a conflicting commit), and
+// Igloo's own message.
 func (u *upstream) refusal(method, target string, status int, body []byte) *apiError {
 	if status >= 500 {
 		u.log.Error("catalog error", "method", method, "url", target, "status", status, "body", truncate(string(body), 2000))
@@ -104,10 +127,29 @@ func (u *upstream) refusal(method, target string, status int, body []byte) *apiE
 			Type    string `json:"type"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(body, &m) != nil || m.Error.Type == "" {
-		return errorf(status, errBadRequest, "the catalog refused the request (HTTP %d)", status)
+	_ = json.Unmarshal(body, &m)
+	level := slog.LevelInfo
+	if status == http.StatusNotFound {
+		level = slog.LevelDebug // engines look tables up before creating them
 	}
-	return &apiError{status: status, kind: m.Error.Type, msg: m.Error.Message}
+	u.log.Log(context.Background(), level, "catalog refused a request", "method", method, "url", target, "status", status,
+		"type", m.Error.Type, "message", truncate(m.Error.Message, 2000))
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		// Lakekeeper refusing Igloo is Igloo's misconfiguration, not the
+		// client's mistake.
+		return errorf(http.StatusInternalServerError, errInternal, "the catalog refused Igloo's request; see Igloo's log")
+	case catalogRefusals[m.Error.Type] != "":
+		return errorf(status, m.Error.Type, "%s", catalogRefusals[m.Error.Type])
+	}
+	kind := refusalKinds[status]
+	if kind == "" {
+		kind = errBadRequest
+	}
+	if refusalCode.MatchString(m.Error.Type) {
+		return errorf(status, kind, "the catalog refused the request: %s", m.Error.Type)
+	}
+	return errorf(status, kind, "the catalog refused the request (HTTP %d)", status)
 }
 
 // warehousePrefix returns, and remembers, the warehouse's prefix.
@@ -164,8 +206,8 @@ func pick(q url.Values, keys ...string) url.Values {
 // loadResult is a LoadTableResult from Lakekeeper.
 type loadResult struct {
 	fields map[string]json.RawMessage
-	// location is the table's location, from its metadata.
-	location string
+	// location and uuid are the table's, from its metadata.
+	location, uuid string
 }
 
 // parseLoadResult reads a LoadTableResult and drops what Lakekeeper says
@@ -179,13 +221,14 @@ func parseLoadResult(body []byte) (*loadResult, error) {
 	}
 	var meta struct {
 		Location string `json:"location"`
+		UUID     string `json:"table-uuid"`
 	}
 	if err := json.Unmarshal(fields["metadata"], &meta); err != nil || meta.Location == "" {
 		return nil, fmt.Errorf("catalog returned table metadata without a location")
 	}
 	delete(fields, "config")
 	delete(fields, "storage-credentials")
-	return &loadResult{fields: fields, location: meta.Location}, nil
+	return &loadResult{fields: fields, location: meta.Location, uuid: meta.UUID}, nil
 }
 
 // marshal returns the result with Igloo's credentials, if any.

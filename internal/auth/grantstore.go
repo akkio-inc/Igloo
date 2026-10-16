@@ -227,9 +227,12 @@ func (s *PostgresStore) ForgetObject(ctx context.Context, o Object) error {
 func (s *PostgresStore) RenameObject(ctx context.Context, from, to Object) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		// Grants left on the new name belong to a table dropped outside
-		// Igloo, not to this one.
+		// Igloo, not to this one, unless the new name is the old one, or
+		// differs from it in case only.
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE table_name <> ''
-			AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)`, to.Schema, to.Table); err != nil {
+			AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)
+			AND NOT (lower(schema_name) = lower($3) AND lower(table_name) = lower($4))`,
+			to.Schema, to.Table, from.Schema, from.Table); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `UPDATE igloo_auth.grants SET schema_name = $3, table_name = $4

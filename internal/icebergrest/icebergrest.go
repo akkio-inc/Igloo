@@ -39,9 +39,16 @@
 //
 // Built-in roles count as in SQL: reader may read every table, writer may
 // do everything here but what only admins may: choose table and schema
-// locations, create nested namespaces, and move tables between schemas,
-// where other schemas' grants would reach them.
-// Views, table registration and multi-table transactions are not served.
+// locations, move a table or change its UUID, use nested namespaces, and
+// move tables between schemas, where other schemas' grants would reach
+// them. Tables with data policies (Options.Protected) are admins' alone
+// here, since their files hold the data the policies hide.
+//
+// Igloo must check the request Lakekeeper will carry out, so it reads
+// requests as Lakekeeper does: names in paths with "+" as a space, bodies
+// with exact keys (readJSON), and a commit's body identifier only when it
+// is the path's. Views, table registration and multi-table transactions
+// are not served.
 package icebergrest
 
 import (
@@ -55,6 +62,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -88,6 +96,12 @@ type Options struct {
 	// Credentials hands out storage credentials limited to one table. Nil
 	// hands out none: engines then need their own access to the files.
 	Credentials Vendor
+	// Protected reports whether a table has data policies (masking or row
+	// access), which Igloo applies to the SQL it runs: an engine reading the
+	// table's files would bypass them, so non-admins may neither load nor
+	// change such a table here. It is asked on every request, since
+	// policies change. Nil means no table has any.
+	Protected func(ctx context.Context, o auth.Object) (bool, error)
 	// TLS says whether requests arrive over TLS. Without it, only clients
 	// on private networks are served, since tokens, passwords and storage
 	// credentials cross the connection.
@@ -108,6 +122,9 @@ type Server struct {
 	tokens *sealer
 	log    *slog.Logger
 	mux    *http.ServeMux
+	// delayed and signIns hold a slot per failed request waiting out its
+	// delay and per token request being served.
+	delayed, signIns chan struct{}
 }
 
 // New builds the endpoint.
@@ -127,11 +144,13 @@ func New(opts Options) (*Server, error) {
 	}
 	log := opts.Log.With("component", "iceberg")
 	s := &Server{
-		opts:   opts,
-		cat:    &upstream{base: strings.TrimSuffix(opts.CatalogURI, "/"), warehouse: opts.Warehouse, http: opts.HTTP, log: log},
-		tokens: tokens,
-		log:    log,
-		mux:    http.NewServeMux(),
+		opts:    opts,
+		cat:     &upstream{base: strings.TrimSuffix(opts.CatalogURI, "/"), warehouse: opts.Warehouse, http: opts.HTTP, log: log},
+		tokens:  tokens,
+		log:     log,
+		mux:     http.NewServeMux(),
+		delayed: make(chan struct{}, maxDelayed),
+		signIns: make(chan struct{}, maxSignIns),
 	}
 	s.routes()
 	return s, nil
@@ -374,6 +393,33 @@ func readJSON(c *call, v any) ([]byte, error) {
 	}
 	if err := json.Unmarshal(out.Bytes(), v); err != nil {
 		return nil, malformed(err)
+	}
+	return out.Bytes(), nil
+}
+
+// withoutUpdates returns body, a commit as readJSON returned it, without
+// its updates of the given actions.
+func withoutUpdates(body []byte, actions ...string) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, err
+	}
+	updates, ok := doc["updates"].([]any)
+	if !ok {
+		return body, nil
+	}
+	doc["updates"] = slices.DeleteFunc(updates, func(u any) bool {
+		m, _ := u.(map[string]any)
+		action, _ := m["action"].(string)
+		return slices.Contains(actions, action)
+	})
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(doc); err != nil {
+		return nil, err
 	}
 	return out.Bytes(), nil
 }

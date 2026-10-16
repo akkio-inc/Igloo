@@ -89,3 +89,13 @@ created = walt.create_table(
 )
 created.append(pa.Table.from_pylist([{"id": 1, "kind": "from-pyiceberg"}], schema=created.schema().as_arrow()))
 print("  pyiceberg: a writer creates and fills a table")
+
+# Staged, as CREATE TABLE AS: the commit restates the table's UUID and
+# location, which Igloo leaves out, so it keeps the catalog's.
+staged_schema = Schema(NestedField(1, "id", IntegerType(), required=False), NestedField(2, "kind", StringType(), required=False))
+with walt.create_table_transaction("public.ice_staged", schema=staged_schema) as txn:
+    txn.append(pa.Table.from_pylist([{"id": 1, "kind": "staged"}], schema=staged_schema.as_arrow()))
+staged = walt.load_table("public.ice_staged")
+assert rows(staged) == [{"id": 1, "kind": "staged"}], rows(staged)
+assert staged.metadata.location.rstrip("/").endswith("/" + str(staged.metadata.table_uuid)), staged.metadata.location
+print("  pyiceberg: a writer creates and fills a table in one transaction")

@@ -145,6 +145,7 @@ func checkProperties(keys []string) error {
 // commitRequest is what Igloo reads of a table commit
 // (CommitTableRequest).
 type commitRequest struct {
+	Identifier   *identifier   `json:"identifier"`
 	Requirements []requirement `json:"requirements"`
 	Updates      []tableUpdate `json:"updates"`
 }
@@ -173,14 +174,16 @@ type commitNeeds struct {
 	// create is CREATE on the table's schema, as ALTER TABLE needs, and
 	// CREATE TABLE AS for the commit that creates a staged table.
 	create bool
-	// creates is set for that commit, which needs no more.
+	// creates is set for that commit, which fills the new table with
+	// CREATE alone, as CREATE TABLE AS does.
 	creates bool
 	// writer is the writer role, which SQL requires for table properties,
 	// and so for snapshot removal, which they govern.
 	writer bool
-	// unknown are update actions Igloo does not know; only admins may
-	// commit them.
-	unknown []string
+	// admin are update actions only admins may commit: moving a table or
+	// changing its UUID, which could point it at another table's files, and
+	// actions Igloo does not know.
+	admin []string
 	// summary describes the commit for the history.
 	summary []string
 }
@@ -188,6 +191,10 @@ type commitNeeds struct {
 // rowChanges are the privileges a change of snapshots needs: it may change
 // any row.
 var rowChanges = []auth.Privilege{auth.PrivilegeInsert, auth.PrivilegeUpdate, auth.PrivilegeDelete}
+
+// stagedUpdates restate the UUID and location Lakekeeper gave a staged
+// table, in the commit that creates it.
+var stagedUpdates = []string{"assign-uuid", "set-location"}
 
 // classify works out what a commit needs. Any change to the table's
 // snapshots needs INSERT, UPDATE and DELETE, whatever operation the engine
@@ -198,30 +205,39 @@ var rowChanges = []auth.Privilege{auth.PrivilegeInsert, auth.PrivilegeUpdate, au
 // files anyway.
 func classify(req commitRequest) commitNeeds {
 	var n commitNeeds
-	// The commit that creates a staged table, as in CREATE TABLE AS, sets
-	// everything about it.
+	// The commit that creates a staged table, as in CREATE TABLE AS.
 	if slices.ContainsFunc(req.Requirements, func(r requirement) bool { return r.Type == "assert-create" }) {
 		n.create, n.creates = true, true
 		n.summary = append(n.summary, "create")
-		return n
 	}
 	for _, u := range req.Updates {
 		action := u.Action
 		switch u.Action {
 		case "add-snapshot", "set-snapshot-ref", "set-statistics", "remove-statistics",
 			"set-partition-statistics", "remove-partition-statistics":
-			n.table = slices.Clone(rowChanges)
+			if !n.creates {
+				n.table = slices.Clone(rowChanges)
+			}
 			if u.Snapshot != nil {
 				action += " (" + u.Snapshot.Summary["operation"] + ")"
 			}
 		case "add-schema", "set-current-schema", "add-spec", "set-default-spec", "add-sort-order",
-			"set-default-sort-order", "upgrade-format-version", "assign-uuid", "set-location",
-			"remove-partition-specs", "remove-schemas":
+			"set-default-sort-order", "upgrade-format-version", "remove-partition-specs", "remove-schemas":
 			n.create = true
-		case "set-properties", "remove-properties", "remove-snapshots", "remove-snapshot-ref":
+		case "assign-uuid", "set-location":
+			// A new table restates its own; updateTable leaves them out.
+			if !n.creates {
+				n.admin = append(n.admin, u.Action)
+			}
+		case "set-properties", "remove-properties":
+			// A new table's properties are its creator's, as in CREATE TABLE.
+			if !n.creates {
+				n.writer = true
+			}
+		case "remove-snapshots", "remove-snapshot-ref":
 			n.writer = true
 		default:
-			n.unknown = append(n.unknown, u.Action)
+			n.admin = append(n.admin, u.Action)
 		}
 		n.summary = append(n.summary, action)
 	}
@@ -246,8 +262,8 @@ func (c *caller) allowsCommit(o auth.Object, n commitNeeds) error {
 	if c.admin() {
 		return nil
 	}
-	if len(n.unknown) > 0 {
-		return c.deny(fmt.Sprintf("only admins may commit %s", strings.Join(n.unknown, ", ")))
+	if len(n.admin) > 0 {
+		return c.deny(fmt.Sprintf("only admins may commit %s", strings.Join(n.admin, ", ")))
 	}
 	if n.writer {
 		if err := c.requireWriter("changing table properties or removing snapshots"); err != nil {

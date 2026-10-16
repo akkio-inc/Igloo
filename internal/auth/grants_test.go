@@ -103,6 +103,16 @@ func testGrantStore(t *testing.T, g GrantStore) {
 		t.Errorf("Roles: %+v %v", roles, err)
 	}
 
+	// Renaming to the same name, or a case variant of it, keeps the grants.
+	for _, same := range []Object{orders, {Schema: "PUBLIC", Table: "Orders"}, orders} {
+		if err := g.RenameObject(ctx, orders, same); err != nil {
+			t.Fatal(err)
+		}
+		if p, _ := g.UserPrivileges(ctx, "ana"); !p.Allows(PrivilegeSelect, "public", "orders") {
+			t.Errorf("a rename to %s dropped the grants: %+v", same, p)
+		}
+	}
+
 	// Renaming moves grants; dropping removes them.
 	if err := g.RenameObject(ctx, orders, Object{Schema: "public", Table: "orders2"}); err != nil {
 		t.Fatal(err)

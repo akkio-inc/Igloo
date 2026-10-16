@@ -83,8 +83,11 @@ type lakekeeper struct {
 	mu sync.Mutex
 	// namespaces and tables are keyed by namespace levels joined by \x1f;
 	// tables map "ns\x1ftable" to its location.
+	// As in Lakekeeper, tables are at the namespaces' location, warehouse,
+	// in a directory named for their UUID, unless uuids says otherwise.
 	namespaces map[string]bool
 	tables     map[string]string
+	uuids      map[string]string
 	// staged tables answer commits but, as in Lakekeeper, not HEAD.
 	staged map[string]string
 	// requests are what reached the catalog: "METHOD path?query".
@@ -95,7 +98,10 @@ type lakekeeper struct {
 	fail int
 }
 
-const prefix = "4b1c-warehouse"
+const (
+	prefix    = "4b1c-warehouse"
+	warehouse = "s3://bucket/wh"
+)
 
 func (l *lakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.mu.Lock()
@@ -119,7 +125,9 @@ func (l *lakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(rest, "/")
 	for i := range parts {
+		// Lakekeeper reads "+" in names as a space.
 		parts[i], _ = url.PathUnescape(parts[i])
+		parts[i] = strings.ReplaceAll(parts[i], "+", " ")
 	}
 	notFound := func(kind string) {
 		writeJSON(w, 404, map[string]any{"error": map[string]any{"message": kind + " does not exist", "type": "NoSuch" + kind + "Exception", "code": 404,
@@ -162,7 +170,7 @@ func (l *lakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case len(parts) == 2 && r.Method == "GET":
-			writeJSON(w, 200, map[string]any{"namespace": strings.Split(ns, "\x1f"), "properties": map[string]string{"owner": "x"}})
+			writeJSON(w, 200, map[string]any{"namespace": strings.Split(ns, "\x1f"), "properties": map[string]string{"owner": "x", "location": warehouse}})
 		case len(parts) == 2 && r.Method == "HEAD":
 			w.WriteHeader(204)
 		case len(parts) == 2 && r.Method == "DELETE":
@@ -188,10 +196,10 @@ func (l *lakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(body, &req)
 			loc := req.Location
 			if loc == "" {
-				loc = "s3://bucket/wh/" + strings.ReplaceAll(ns, "\x1f", "-") + "/" + req.Name
+				loc = warehouse + "/u-" + req.Name
 			}
 			l.tables[ns+"\x1f"+req.Name] = loc
-			l.writeTable(w, loc)
+			l.writeTable(w, ns+"\x1f"+req.Name, loc)
 		case len(parts) == 4 && parts[2] == "tables":
 			key := ns + "\x1f" + parts[3]
 			if loc, ok := l.staged[key]; ok && r.Method == "POST" {
@@ -205,7 +213,7 @@ func (l *lakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			switch r.Method {
 			case "GET":
-				l.writeTable(w, loc)
+				l.writeTable(w, key, loc)
 			case "HEAD":
 				w.WriteHeader(204)
 			case "POST":
@@ -224,10 +232,14 @@ func (l *lakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // writeTable answers with a LoadTableResult carrying Lakekeeper's own
 // client settings, which Igloo must drop.
-func (l *lakekeeper) writeTable(w http.ResponseWriter, loc string) {
+func (l *lakekeeper) writeTable(w http.ResponseWriter, key, loc string) {
+	uuid, ok := l.uuids[key]
+	if !ok {
+		uuid = loc[strings.LastIndex(loc, "/")+1:]
+	}
 	writeJSON(w, 200, map[string]any{
 		"metadata-location":   loc + "/metadata/1.json",
-		"metadata":            map[string]any{"format-version": 2, "location": loc},
+		"metadata":            map[string]any{"format-version": 2, "location": loc, "table-uuid": uuid},
 		"config":              map[string]string{"s3.remote-signing-enabled": "true", "s3.signer.uri": "http://lakekeeper:8181/catalog/"},
 		"storage-credentials": []any{map[string]any{"prefix": loc, "config": map[string]string{"s3.secret-access-key": "lakekeeper's"}}},
 	})
@@ -280,7 +292,7 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 	h := &harness{
 		t:      t,
-		cat:    &lakekeeper{namespaces: map[string]bool{}, tables: map[string]string{}, staged: map[string]string{}},
+		cat:    &lakekeeper{namespaces: map[string]bool{}, tables: map[string]string{}, uuids: map[string]string{}, staged: map[string]string{}},
 		users:  &users{users: map[string]auth.User{}, passwords: map[string]string{}},
 		vendor: &vendor{},
 	}
@@ -311,9 +323,9 @@ func newHarness(t *testing.T) *harness {
 	h.cat.namespaces["public"] = true
 	h.cat.namespaces["secret"] = true
 	h.cat.namespaces["team"] = true
-	h.cat.tables["public\x1fevents"] = "s3://bucket/wh/public/events"
-	h.cat.tables["public\x1fusers"] = "s3://bucket/wh/public/users"
-	h.cat.tables["secret\x1fpay"] = "s3://bucket/wh/secret/pay"
+	h.cat.tables["public\x1fevents"] = warehouse + "/u-events"
+	h.cat.tables["public\x1fusers"] = warehouse + "/u-users"
+	h.cat.tables["secret\x1fpay"] = warehouse + "/u-pay"
 	return h
 }
 
@@ -668,10 +680,15 @@ func TestLoadTable(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("load: %d %s", w.Code, w.Body)
 	}
-	req, header := h.cat.last()
+	// The table's load, then its namespace's, whose location tells where
+	// the table should be.
+	h.cat.mu.Lock()
+	n := len(h.cat.requests)
+	req, header, after := h.cat.requests[n-2], h.cat.headers[n-2], h.cat.requests[n-1]
+	h.cat.mu.Unlock()
 	if req != "GET "+prefix+"/namespaces/public/tables/events?snapshots=refs" || header.Get(accessDelegation) != "" ||
-		header.Get("Authorization") != "" {
-		t.Errorf("forwarded %q with %v", req, header)
+		header.Get("Authorization") != "" || after != "GET "+prefix+"/namespaces/public?" {
+		t.Errorf("forwarded %q with %v, then %q", req, header, after)
 	}
 	var result struct {
 		Metadata           map[string]any    `json:"metadata"`
@@ -682,12 +699,12 @@ func TestLoadTable(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.MetadataLocation == "" || result.Metadata["location"] != "s3://bucket/wh/public/events" {
+	if result.MetadataLocation == "" || result.Metadata["location"] != warehouse+"/u-events" {
 		t.Errorf("metadata did not pass through: %s", w.Body)
 	}
 	if strings.Contains(w.Body.String(), "lakekeeper") || result.Config["s3.access-key-id"] != "scoped-read" ||
 		result.Config["client.refresh-credentials-endpoint"] != "v1/namespaces/public/tables/events/credentials" ||
-		len(result.StorageCredentials) != 1 || result.StorageCredentials[0]["prefix"] != "s3://bucket/wh/public/events" {
+		len(result.StorageCredentials) != 1 || result.StorageCredentials[0]["prefix"] != warehouse+"/u-events" {
 		t.Errorf("credentials: %s", w.Body)
 	}
 
@@ -705,11 +722,11 @@ func TestLoadTable(t *testing.T) {
 		t.Errorf("credentials nobody asked for: %s", w.Body)
 	}
 	want := []string{
-		"nora read s3://bucket/wh/public/events",
-		"nora read s3://bucket/wh/public/events",
-		"nora write s3://bucket/wh/public/events",
-		"rita read s3://bucket/wh/public/users",
-		"walt write s3://bucket/wh/public/users",
+		"nora read s3://bucket/wh/u-events",
+		"nora read s3://bucket/wh/u-events",
+		"nora write s3://bucket/wh/u-events",
+		"rita read s3://bucket/wh/u-users",
+		"walt write s3://bucket/wh/u-users",
 	}
 	if !slices.Equal(h.vendor.calls, want) {
 		t.Errorf("vended:\n%s\nwant:\n%s", strings.Join(h.vendor.calls, "\n"), strings.Join(want, "\n"))
@@ -735,6 +752,48 @@ func TestLoadTable(t *testing.T) {
 	}
 	if w := h.request("GET", "/v1/namespaces/secret/tables/pay/credentials", nora, nil); w.Code != 403 {
 		t.Errorf("credentials without SELECT: %d", w.Code)
+	}
+}
+
+// A table that is not where Lakekeeper put it, in its namespace's location
+// under its UUID, gets no credentials: they could reach another table's
+// files, or a directory above or below another table's.
+func TestNoCredentialsForMovedTables(t *testing.T) {
+	h := newHarness(t)
+	h.grant("nora", auth.PrivilegeSelect, "public", "")
+	nora := h.login("nora", "nora-password")
+	vended := []string{accessDelegation, vendedCredentials}
+	for name, loc := range map[string]string{
+		"onto":   warehouse + "/u-pay",           // another table's directory
+		"below":  warehouse + "/u-pay/u-below",   // inside another table's
+		"above":  warehouse,                      // above every table's
+		"nested": warehouse + "/team/u-nested",   // not in its namespace's location
+		"slash":  warehouse + "/u-slash/",        // its own, spelled with a slash
+		"placed": "s3://bucket/elsewhere/placed", // chosen by an admin
+	} {
+		h.cat.tables["public\x1f"+name] = loc
+		h.cat.uuids["public\x1f"+name] = "u-" + name
+	}
+	h.cat.uuids["public\x1fplaced"] = "placed"
+	for _, name := range []string{"onto", "below", "above", "nested", "placed"} {
+		w := h.request("GET", "/v1/namespaces/public/tables/"+name, nora, nil, vended...)
+		if w.Code != 200 || strings.Contains(w.Body.String(), "storage-credentials") {
+			t.Errorf("%s: %d %s", name, w.Code, w.Body)
+		}
+		w = h.request("GET", "/v1/namespaces/public/tables/"+name+"/credentials", nora, nil)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"storage-credentials":[]`) {
+			t.Errorf("%s credentials: %d %s", name, w.Code, w.Body)
+		}
+	}
+	if w := h.request("GET", "/v1/namespaces/public/tables/slash", nora, nil, vended...); !strings.Contains(w.Body.String(), "scoped-read") {
+		t.Errorf("a table's own location with a slash: %d %s", w.Code, w.Body)
+	}
+	// Admins, who may place tables, get credentials for wherever they are.
+	if w := h.request("GET", "/v1/namespaces/public/tables/placed", h.login("ada", "ada-password"), nil, vended...); !strings.Contains(w.Body.String(), "scoped-write") {
+		t.Errorf("admin: %d %s", w.Code, w.Body)
+	}
+	if want := []string{"nora read " + warehouse + "/u-slash/", "ada write s3://bucket/elsewhere/placed"}; !slices.Equal(h.vendor.calls, want) {
+		t.Errorf("vended %q", h.vendor.calls)
 	}
 }
 
@@ -826,20 +885,55 @@ func TestCommits(t *testing.T) {
 		t.Errorf("unknown update as admin: %d %s", w.Code, w.Body)
 	}
 
+	// Moving a table or changing its UUID could point it at another
+	// table's files.
+	for _, u := range []map[string]any{{"action": "set-location", "location": warehouse + "/u-pay"}, {"action": "assign-uuid", "uuid": "u-pay"}} {
+		if w := commit(walt, u); w.Code != 403 {
+			t.Errorf("%s as a writer: %d %s", u["action"], w.Code, w.Body)
+		}
+	}
+
 	// The commit that creates a staged table needs CREATE only, as CREATE
-	// TABLE AS does.
+	// TABLE AS does. Its UUID and location are the staged table's, so the
+	// ones it restates are left out, whatever they say.
 	h.grant("nora", auth.PrivilegeCreate, "team", "")
-	h.cat.staged["team\x1fstaged"] = "s3://bucket/wh/team/staged"
-	w = h.request("POST", "/v1/namespaces/team/tables/staged", nora, map[string]any{
-		"requirements": []any{map[string]any{"type": "assert-create"}},
-		"updates":      []any{snapshot(1, "append"), ref(1), map[string]any{"action": "set-properties", "updates": map[string]string{"x": "y"}}},
-	})
-	if w.Code != 200 {
+	create := func(token, name string) *httptest.ResponseRecorder {
+		h.cat.staged["team\x1f"+name] = warehouse + "/u-" + name
+		return h.request("POST", "/v1/namespaces/team/tables/"+name, token, map[string]any{
+			"requirements": []any{map[string]any{"type": "assert-create"}},
+			"updates": []any{map[string]any{"action": "assign-uuid", "uuid": "u-pay"}, map[string]any{"action": "set-location", "location": warehouse + "/u-pay"},
+				snapshot(1, "append"), ref(1), map[string]any{"action": "set-properties", "updates": map[string]string{"x": "y"}}},
+		})
+	}
+	if w := create(nora, "staged"); w.Code != 200 {
 		t.Errorf("create commit: %d %s", w.Code, w.Body)
+	}
+	if got := h.cat.lastBody(); strings.Contains(got, "assign-uuid") || strings.Contains(got, "set-location") ||
+		!strings.Contains(got, "add-snapshot") || !strings.Contains(got, "set-properties") {
+		t.Errorf("forwarded %s", got)
+	}
+	if w := create(h.login("ada", "ada-password"), "by_admin"); w.Code != 200 || !strings.Contains(h.cat.lastBody(), "set-location") {
+		t.Errorf("an admin's create commit: %d %s", w.Code, h.cat.lastBody())
+	}
+	// Its other updates are checked as in any commit.
+	h.cat.staged["team\x1fodd"] = warehouse + "/u-odd"
+	w = h.request("POST", "/v1/namespaces/team/tables/odd", nora, map[string]any{
+		"requirements": []any{map[string]any{"type": "assert-create"}},
+		"updates":      []any{map[string]any{"action": "add-encryption-key"}},
+	})
+	if w.Code != 403 {
+		t.Errorf("unknown update in a create commit: %d %s", w.Code, w.Body)
+	}
+	w = h.request("POST", "/v1/namespaces/team/tables/odd", nora, map[string]any{
+		"requirements": []any{map[string]any{"type": "assert-create"}},
+		"updates":      []any{map[string]any{"action": "set-properties", "updates": map[string]string{"write.data.path": warehouse + "/u-pay"}}},
+	})
+	if w.Code != 400 {
+		t.Errorf("data path in a create commit: %d %s", w.Code, w.Body)
 	}
 	// It cannot rewrite a table that exists, which would need INSERT,
 	// UPDATE and DELETE.
-	h.cat.tables["team\x1fexisting"] = "s3://bucket/wh/team/existing"
+	h.cat.tables["team\x1fexisting"] = warehouse + "/u-existing"
 	w = h.request("POST", "/v1/namespaces/team/tables/existing", nora, map[string]any{
 		"requirements": []any{map[string]any{"type": "assert-create"}},
 		"updates":      []any{snapshot(2, "overwrite"), ref(2)},
@@ -939,12 +1033,38 @@ func TestNamespaces(t *testing.T) {
 	if w := h.request("HEAD", "/v1/namespaces/nope", walt, nil); w.Code != 404 {
 		t.Errorf("HEAD of a missing schema: %d", w.Code)
 	}
-	// Nested namespaces are named with dots, as grants name them.
+	// Only admins use nested namespaces, which Igloo's SQL does not show,
+	// so no grant names them: joining levels with dots, a grant on
+	// schema "team.sub" could otherwise name a nested one.
 	h.cat.namespaces["team\x1fsub"] = true
-	h.cat.tables["team\x1fsub\x1fdeep"] = "s3://bucket/wh/team-sub/deep"
+	h.cat.tables["team\x1fsub\x1fdeep"] = warehouse + "/u-deep"
 	h.grant("nora", auth.PrivilegeSelect, "team.sub", "deep")
-	if w := h.request("GET", "/v1/namespaces/team%1Fsub/tables/deep", nora, nil); w.Code != 200 {
-		t.Errorf("load from a nested namespace: %d %s", w.Code, w.Body)
+	for _, path := range []string{"/v1/namespaces/team%1Fsub/tables/deep", "/v1/namespaces/team%1Fsub", "/v1/namespaces/team%1Fsub/tables"} {
+		if w := h.request("GET", path, nora, nil); w.Code != 403 {
+			t.Errorf("%s as none: %d %s", path, w.Code, w.Body)
+		}
+	}
+	if w := h.request("GET", "/v1/namespaces/team%1Fsub/tables/deep", h.login("rita", "rita-password"), nil); w.Code != 403 {
+		t.Errorf("load from a nested namespace as a reader: %d %s", w.Code, w.Body)
+	}
+	ada := h.login("ada", "ada-password")
+	if w := h.request("GET", "/v1/namespaces/team%1Fsub/tables/deep", ada, nil); w.Code != 200 {
+		t.Errorf("load from a nested namespace as an admin: %d %s", w.Code, w.Body)
+	}
+	listed := func(token string) string {
+		return h.request("GET", "/v1/namespaces?parent=team", token, nil).Body.String()
+	}
+	if strings.Contains(listed(walt), "sub") || !strings.Contains(listed(ada), "sub") {
+		t.Errorf("listing nested namespaces: writer %s, admin %s", listed(walt), listed(ada))
+	}
+	// A level with a dot would make ["a", "b"] and ["a.b"] one schema.
+	for _, body := range []any{map[string]any{"namespace": []string{"team.sub"}}, map[string]any{"namespace": []string{"a\x1fb"}}} {
+		if w := h.request("POST", "/v1/namespaces", ada, body); w.Code != 400 {
+			t.Errorf("namespace %v: %d %s", body, w.Code, w.Body)
+		}
+	}
+	if w := h.request("GET", "/v1/namespaces/team.sub/tables/deep", ada, nil); w.Code != 400 {
+		t.Errorf("a path level with a dot: %d %s", w.Code, w.Body)
 	}
 }
 
@@ -990,16 +1110,30 @@ func TestCatalogErrors(t *testing.T) {
 	h := newHarness(t)
 	walt := h.login("walt", "walt-password")
 	w := h.request("GET", "/v1/namespaces/public/tables/nope", walt, nil)
-	if typ, msg := errorType(t, w); w.Code != 404 || typ != "NoSuchTableException" || msg != "Table does not exist" || strings.Contains(w.Body.String(), "internal") {
+	if typ, msg := errorType(t, w); w.Code != 404 || typ != "NoSuchTableException" || msg != "the table does not exist" || strings.Contains(w.Body.String(), "internal") {
 		t.Errorf("missing table: %d %s", w.Code, w.Body)
 	}
 	if qs := h.queries(); len(qs) != 1 || qs[0].Outcome != audit.OutcomeError || qs[0].SQLState != "42704" {
 		t.Errorf("history: %+v", qs)
 	}
-	h.cat.fail = 500
-	w = h.request("GET", "/v1/namespaces", walt, nil)
-	if _, msg := errorType(t, w); w.Code != 500 || strings.Contains(msg, "hunter2") {
-		t.Errorf("catalog failure: %d %s", w.Code, w.Body)
+	// Lakekeeper's messages can name its internal IDs and locations, so
+	// clients get the status, the type when they act on it, and Igloo's
+	// words.
+	for status, want := range map[int]struct {
+		status      int
+		kind, words string
+	}{
+		500: {500, errInternal, "the catalog failed"},
+		400: {400, errBadRequest, "the catalog refused the request: Internal"},
+		409: {409, "CommitFailedException", "the catalog refused the request: Internal"},
+		404: {404, "NotFoundException", "the catalog refused the request: Internal"},
+		403: {500, errInternal, "the catalog refused Igloo's request"},
+	} {
+		h.cat.fail = status
+		w = h.request("GET", "/v1/namespaces", walt, nil)
+		if typ, msg := errorType(t, w); w.Code != want.status || typ != want.kind || !strings.HasPrefix(msg, want.words) || strings.Contains(msg, "hunter2") {
+			t.Errorf("catalog answering %d: %d %s", status, w.Code, w.Body)
+		}
 	}
 }
 
@@ -1082,5 +1216,252 @@ func TestMovingTablesBetweenSchemas(t *testing.T) {
 	}
 	if code := move(h.login("ada", "ada-password")); code != 204 {
 		t.Errorf("admin moves a table to another schema: %d", code)
+	}
+}
+
+// posts counts the commits and other POSTs that reached the catalog.
+func (l *lakekeeper) posts() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, r := range l.requests {
+		if strings.HasPrefix(r, "POST ") {
+			n++
+		}
+	}
+	return n
+}
+
+// Lakekeeper commits to the body's table when it names the path's
+// namespace as namespace and table (a Spark branch commit), so a commit
+// whose body names another table than its path is refused.
+func TestCommitsNameOneTable(t *testing.T) {
+	h := newHarness(t)
+	for _, p := range rowChanges {
+		h.grant("nora", p, "public", "users")
+	}
+	nora := h.login("nora", "nora-password")
+	ada := h.login("ada", "ada-password")
+	commit := func(token, path string, id any) *httptest.ResponseRecorder {
+		body := map[string]any{"updates": []any{map[string]any{"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 1}}}
+		if id != nil {
+			body["identifier"] = id
+		}
+		return h.request("POST", path, token, body)
+	}
+	before := h.cat.posts()
+	for _, c := range []struct {
+		token, path string
+		id          any
+	}{
+		{nora, "/v1/namespaces/public/tables/users", map[string]any{"namespace": []string{"public"}, "name": "events"}},
+		{nora, "/v1/namespaces/public/tables/users", map[string]any{"namespace": []string{"PUBLIC"}, "name": "users"}},
+		{nora, "/v1/namespaces/public/tables/users", map[string]any{}},
+		{ada, "/v1/namespaces/public%1Fevents/tables/branch_x", map[string]any{"namespace": []string{"public"}, "name": "events"}},
+	} {
+		if w := commit(c.token, c.path, c.id); w.Code != 400 {
+			t.Errorf("%s with %v: %d %s", c.path, c.id, w.Code, w.Body)
+		}
+	}
+	if h.cat.posts() != before {
+		t.Error("a mismatched commit reached the catalog")
+	}
+	if w := commit(nora, "/v1/namespaces/public/tables/users", map[string]any{"namespace": []string{"public"}, "name": "users"}); w.Code != 200 {
+		t.Errorf("matching identifier: %d %s", w.Code, w.Body)
+	}
+	if w := commit(nora, "/v1/namespaces/public/tables/users", nil); w.Code != 200 {
+		t.Errorf("no identifier: %d %s", w.Code, w.Body)
+	}
+}
+
+// Lakekeeper reads "+" in a path's names as a space, so Igloo must too, or
+// it would check one table and serve another.
+func TestPlusInPathsIsASpace(t *testing.T) {
+	h := newHarness(t)
+	h.cat.tables["public\x1fa b"] = warehouse + "/u-ab"
+	h.grant("nora", auth.PrivilegeSelect, "public", "a+b")
+	nora := h.login("nora", "nora-password")
+	for _, path := range []string{"/v1/namespaces/public/tables/a+b", "/v1/namespaces/public/tables/a%2Bb"} {
+		if w := h.request("GET", path, nora, nil); w.Code != 403 {
+			t.Errorf("%s with SELECT on \"a+b\" only: %d %s", path, w.Code, w.Body)
+		}
+	}
+	h.grant("nora", auth.PrivilegeSelect, "public", "a b")
+	if w := h.request("GET", "/v1/namespaces/public/tables/a+b", nora, nil); w.Code != 200 {
+		t.Fatalf("with SELECT on \"a b\": %d %s", w.Code, w.Body)
+	}
+	if req, _ := h.cat.last(); req != "GET "+prefix+"/namespaces/public/tables/a%20b?" {
+		t.Errorf("forwarded %q", req)
+	}
+	if qs := h.queries(); !slices.Equal(qs[len(qs)-1].TablesRead, []string{"lake.public.a b"}) {
+		t.Errorf("history: %+v", qs[len(qs)-1])
+	}
+}
+
+// Lakekeeper renames a table to its own name; that must not drop its
+// grants, whose new name would be the old one.
+func TestRenameToItsOwnName(t *testing.T) {
+	h := newHarness(t)
+	h.grant("nora", auth.PrivilegeSelect, "public", "events")
+	walt := h.login("walt", "walt-password")
+	for _, name := range []string{"events", "EVENTS"} {
+		w := h.request("POST", "/v1/tables/rename", walt, map[string]any{
+			"source":      map[string]any{"namespace": []string{"public"}, "name": "events"},
+			"destination": map[string]any{"namespace": []string{"public"}, "name": name},
+		})
+		if w.Code != 204 {
+			t.Fatalf("rename to %s: %d %s", name, w.Code, w.Body)
+		}
+		if p, _ := h.grants.UserPrivileges(context.Background(), "nora"); !p.Allows(auth.PrivilegeSelect, "public", "events") {
+			t.Errorf("rename to %s dropped the grants", name)
+		}
+	}
+	// Nested namespaces are admins' alone, as source or destination.
+	w := h.request("POST", "/v1/tables/rename", walt, map[string]any{
+		"source":      map[string]any{"namespace": []string{"public"}, "name": "events"},
+		"destination": map[string]any{"namespace": []string{"public", "x"}, "name": "events"},
+	})
+	if w.Code != 403 {
+		t.Errorf("rename into a nested namespace: %d %s", w.Code, w.Body)
+	}
+}
+
+// Tables with masking or row access policies are read through Igloo's SQL:
+// an engine with their metadata and files would bypass the policies.
+func TestTablesWithDataPolicies(t *testing.T) {
+	h := newHarness(t)
+	var (
+		mu        sync.Mutex
+		protected = map[string]bool{"public.events": true, "team.masked": true}
+		failure   error
+	)
+	h.srv.opts.Protected = func(_ context.Context, o auth.Object) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return protected[strings.ToLower(o.String())], failure
+	}
+	for _, p := range append(slices.Clone(rowChanges), auth.PrivilegeSelect) {
+		h.grant("nora", p, "public", "events")
+	}
+	h.grant("nora", auth.PrivilegeCreate, "team", "")
+	nora := h.login("nora", "nora-password")
+	rita := h.login("rita", "rita-password")
+	walt := h.login("walt", "walt-password")
+	ada := h.login("ada", "ada-password")
+	vended := []string{accessDelegation, vendedCredentials}
+	refused := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if typ, msg := errorType(t, w); w.Code != 403 || typ != errForbidden || !strings.Contains(msg, "data policies") ||
+			!strings.Contains(msg, "Igloo's SQL or Flight SQL") {
+			t.Errorf("%s: %d %s", what, w.Code, w.Body)
+		}
+	}
+	for name, token := range map[string]string{"a user with SELECT": nora, "a reader": rita, "a writer": walt} {
+		refused(name+" loads", h.request("GET", "/v1/namespaces/public/tables/events", token, nil, vended...))
+		refused(name+" refreshes credentials", h.request("GET", "/v1/namespaces/public/tables/events/credentials", token, nil))
+	}
+	refused("a commit", h.request("POST", "/v1/namespaces/public/tables/events", nora, map[string]any{
+		"updates": []any{map[string]any{"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 1}}}))
+	refused("creating a protected name", h.request("POST", "/v1/namespaces/team/tables", nora, map[string]any{"name": "masked"}))
+	h.cat.staged["team\x1fmasked"] = warehouse + "/u-masked"
+	refused("creating a protected name by commit", h.request("POST", "/v1/namespaces/team/tables/masked", nora, map[string]any{
+		"requirements": []any{map[string]any{"type": "assert-create"}}, "updates": []any{}}))
+	rename := func(from, to string) *httptest.ResponseRecorder {
+		return h.request("POST", "/v1/tables/rename", walt, map[string]any{
+			"source":      map[string]any{"namespace": []string{"public"}, "name": from},
+			"destination": map[string]any{"namespace": []string{"public"}, "name": to},
+		})
+	}
+	refused("renaming a protected table away", rename("events", "events_raw"))
+	refused("renaming a table to a protected name", rename("users", "EVENTS"))
+	if strings.Contains(strings.Join(h.vendor.calls, ","), "u-events") {
+		t.Errorf("credentials for a protected table: %v", h.vendor.calls)
+	}
+
+	// Listings still show it; admins, whom policies do not bind, load it.
+	if w := h.request("GET", "/v1/namespaces/public/tables", nora, nil); !strings.Contains(w.Body.String(), `"events"`) {
+		t.Errorf("listing: %d %s", w.Code, w.Body)
+	}
+	if w := h.request("HEAD", "/v1/namespaces/public/tables/events", nora, nil); w.Code != 204 {
+		t.Errorf("HEAD: %d", w.Code)
+	}
+	if w := h.request("GET", "/v1/namespaces/public/tables/events", ada, nil, vended...); w.Code != 200 || !strings.Contains(w.Body.String(), "scoped-write") {
+		t.Errorf("admin: %d %s", w.Code, w.Body)
+	}
+	// Other tables are unaffected.
+	if w := h.request("GET", "/v1/namespaces/public/tables/users", rita, nil, vended...); w.Code != 200 || !strings.Contains(w.Body.String(), "scoped-read") {
+		t.Errorf("an unprotected table: %d %s", w.Code, w.Body)
+	}
+	// Policies are checked on every request.
+	mu.Lock()
+	protected["public.events"] = false
+	mu.Unlock()
+	if w := h.request("GET", "/v1/namespaces/public/tables/events", nora, nil); w.Code != 200 {
+		t.Errorf("after the policy went: %d %s", w.Code, w.Body)
+	}
+	mu.Lock()
+	failure = errors.New("database down")
+	mu.Unlock()
+	if w := h.request("GET", "/v1/namespaces/public/tables/events", nora, nil); w.Code != 503 {
+		t.Errorf("when policies cannot be checked: %d %s", w.Code, w.Body)
+	}
+}
+
+// Schema changes name the schema in the history.
+func TestSchemaChangesInHistory(t *testing.T) {
+	h := newHarness(t)
+	walt := h.login("walt", "walt-password")
+	h.request("POST", "/v1/namespaces", walt, map[string]any{"namespace": []string{"sales"}})
+	h.request("POST", "/v1/namespaces/sales/properties", walt, map[string]any{"updates": map[string]string{"owner": "x"}})
+	h.request("DELETE", "/v1/namespaces/sales", walt, nil)
+	h.request("DELETE", "/v1/namespaces/secret", h.login("nora", "nora-password"), nil)
+	qs := h.queries()
+	if len(qs) != 4 {
+		t.Fatalf("got %d records: %+v", len(qs), qs)
+	}
+	for i, op := range []string{opCreateNamespace, opUpdateNamespace, opDropNamespace, opDropNamespace} {
+		want := "lake.sales"
+		if i == 3 {
+			want = "lake.secret"
+		}
+		if qs[i].StatementType != op || !slices.Equal(qs[i].TablesWritten, []string{want}) {
+			t.Errorf("record %d: %+v", i, qs[i])
+		}
+	}
+	if qs[3].Outcome != audit.OutcomeDenied {
+		t.Errorf("refused drop: %+v", qs[3])
+	}
+}
+
+// Sign-ins and failed requests that wait out a delay are limited, so
+// guessing cannot tie up the server.
+func TestBusySignIns(t *testing.T) {
+	h := newHarness(t)
+	token := h.login("walt", "walt-password")
+	for range cap(h.srv.signIns) {
+		h.srv.signIns <- struct{}{}
+	}
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {"walt"}, "client_secret": {"walt-password"}}
+	w := h.request("POST", "/v1/oauth/tokens", "", form.Encode(), "Content-Type", "application/x-www-form-urlencoded")
+	if w.Code != 503 || w.Header().Get("Retry-After") == "" || !strings.Contains(w.Body.String(), "temporarily_unavailable") {
+		t.Errorf("sign-in when busy: %d %s", w.Code, w.Body)
+	}
+	for range cap(h.srv.signIns) {
+		<-h.srv.signIns
+	}
+	for range cap(h.srv.delayed) {
+		h.srv.delayed <- struct{}{}
+	}
+	if w := h.request("GET", "/v1/config", "not-a-token", nil); w.Code != 503 {
+		t.Errorf("a bad token when busy: %d %s", w.Code, w.Body)
+	}
+	if w := h.request("GET", "/v1/config", token, nil); w.Code != 200 {
+		t.Errorf("a good token when busy: %d %s", w.Code, w.Body)
+	}
+	for range cap(h.srv.delayed) {
+		<-h.srv.delayed
+	}
+	if w := h.request("GET", "/v1/config", "not-a-token", nil); w.Code != 401 {
+		t.Errorf("a bad token: %d %s", w.Code, w.Body)
 	}
 }

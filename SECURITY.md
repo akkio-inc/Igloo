@@ -181,13 +181,21 @@ reference for every setting mentioned here.
   table's snapshots needs as well. On S3-compatible stores Igloo first
   checks that the store enforces the session policy, and hands out nothing if
   it does not; on Google Cloud Storage and Azure it hands out nothing yet.
-  Only admins may choose where a table's or schema's files go, so every table
-  has a directory no other table shares. Without TLS the port serves clients
+  Only admins may choose where a table's or schema's files go, move a table
+  or change its UUID, so every table has a directory no other table shares;
+  Lakekeeper refuses moves and new UUIDs too, and Igloo hands non-admins
+  credentials only for a table in the directory the catalog gave it. Names
+  in paths are read as Lakekeeper reads them, nested namespaces are for
+  admins only, and a commit naming another table than its path is refused,
+  so a request is checked against the table it changes. Tables with masking
+  or row access policies, which Igloo enforces in the SQL it runs, cannot be
+  loaded or changed through the endpoint except by admins: their files hold
+  the unmasked data. Without TLS the port serves clients
   on private networks only, since passwords, tokens and credentials cross it
   (behind a proxy, such as the scale-to-zero gateway, the proxy's address
   counts, so enable TLS before exposing the proxy); with TLS it serves HTTPS
-  only. What remains: credentials outlive a revoked
-  grant by up to an hour; an engine with write credentials for a table can
+  only. What remains: credentials outlive a revoked grant, a dropped user
+  or a newly attached data policy by up to an hour; an engine with write credentials for a table can
   rewrite that table's files and manifests as it likes, including making them
   name files of tables whose paths it knows, which Igloo would then read with
   its own access when that table is queried (paths contain random IDs, shown

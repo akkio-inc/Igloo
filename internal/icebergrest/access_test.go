@@ -44,10 +44,24 @@ func TestClassify(t *testing.T) {
 			commit: `{"updates":[{"action":"set-properties","updates":{"a":"b"}}]}`},
 		{name: "snapshot expiry", writer: true,
 			commit: `{"updates":[{"action":"remove-snapshots","snapshot-ids":[1,2]}]}`},
+		// A new table is its creator's to fill and describe, as with CREATE
+		// TABLE AS, and restates its UUID and location.
 		{name: "staged create", create: true,
 			commit: `{"requirements":[{"type":"assert-create"}],"updates":[{"action":"assign-uuid","uuid":"u"},
+				{"action":"set-location","location":"s3://b/wh/u"},
 				{"action":"add-snapshot","snapshot":{"snapshot-id":5,"summary":{"operation":"overwrite"}}},
 				{"action":"set-properties","updates":{"a":"b"}}]}`},
+		// Its other updates are classified as in any commit.
+		{name: "staged create with unknown and writer updates", create: true, writer: true,
+			reject: []string{"add-encryption-key"},
+			commit: `{"requirements":[{"type":"assert-create"}],"updates":[{"action":"remove-snapshots","snapshot-ids":[1]},
+				{"action":"add-encryption-key"}]}`},
+		// Moving a table, or changing its UUID, could point it at another
+		// table's files.
+		{name: "move", reject: []string{"set-location"},
+			commit: `{"updates":[{"action":"set-location","location":"s3://b/wh/other"}]}`},
+		{name: "new UUID", reject: []string{"assign-uuid"},
+			commit: `{"updates":[{"action":"assign-uuid","uuid":"other"}]}`},
 		{name: "unknown", reject: []string{"add-encryption-key"},
 			commit: `{"updates":[{"action":"add-encryption-key"}]}`},
 	}
@@ -59,9 +73,48 @@ func TestClassify(t *testing.T) {
 		n := classify(req)
 		slices.Sort(n.table)
 		slices.Sort(c.table)
-		if !slices.Equal(n.table, c.table) || n.create != c.create || n.writer != c.writer || !slices.Equal(n.unknown, c.reject) {
+		if !slices.Equal(n.table, c.table) || n.create != c.create || n.writer != c.writer || !slices.Equal(n.admin, c.reject) {
 			t.Errorf("%s: got %+v", c.name, n)
 		}
+	}
+}
+
+func TestWithoutUpdates(t *testing.T) {
+	body := []byte(`{"requirements":[{"type":"assert-create"}],"updates":[{"action":"assign-uuid","uuid":"x"},` +
+		`{"action":"add-snapshot","snapshot":{"snapshot-id":9007199254740993}},{"action":"set-location","location":"s3://b/<v>"}]}`)
+	got, err := withoutUpdates(body, stagedUpdates...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"requirements":[{"type":"assert-create"}],"updates":[{"action":"add-snapshot","snapshot":{"snapshot-id":9007199254740993}}]}` + "\n"
+	if string(got) != want {
+		t.Errorf("got %s", got)
+	}
+	if got, err := withoutUpdates([]byte(`{"requirements":[]}`), stagedUpdates...); err != nil || string(got) != `{"requirements":[]}` {
+		t.Errorf("without updates: %s %v", got, err)
+	}
+}
+
+func TestNames(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		table, level bool
+	}{
+		{"events", true, true},
+		{"a b", true, true},
+		{"a.b", true, false},
+		{".", false, false},
+		{"..", false, false},
+		{"", false, false},
+		{"a\x1fb", false, false},
+		{"a\nb", false, false},
+	} {
+		if validName(c.name) != c.table || validLevel(c.name) != c.level {
+			t.Errorf("%q: table %v, level %v", c.name, validName(c.name), validLevel(c.name))
+		}
+	}
+	if got := pathName("a+b%20c"); got != "a b%20c" {
+		t.Errorf("pathName: %q", got)
 	}
 }
 

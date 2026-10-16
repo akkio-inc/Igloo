@@ -339,7 +339,11 @@ func (m *MemoryGrants) ForgetObject(_ context.Context, o Object) error {
 func (m *MemoryGrants) RenameObject(_ context.Context, from, to Object) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.removeGrants(func(g Grant) bool { return !g.Object.IsSchema() && g.Object.Equal(to) })
+	// A rename to the same name, or one that changes its case only, keeps
+	// the table's grants.
+	if !from.Equal(to) {
+		m.removeGrants(func(g Grant) bool { return !g.Object.IsSchema() && g.Object.Equal(to) })
+	}
 	for i, g := range m.grants {
 		if !g.Object.IsSchema() && g.Object.Equal(from) {
 			m.grants[i].Object = to

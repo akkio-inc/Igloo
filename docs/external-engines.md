@@ -66,14 +66,33 @@ since engines check that way before `CREATE TABLE AS`; table names are no
 secret in Igloo, where SQL clients see every table's name. Dropping a table
 drops its grants, and renaming one moves them, as in SQL.
 
-Only admins may choose a table's or a schema's location (otherwise every
-table gets a new directory of its own, so credentials for it reach no other
-table's files, not even a dropped one's), create nested namespaces (Igloo's
-SQL shows top-level schemas only, so grants could not name them), or move a
-table to another schema (whose grants would then reach it). No one may
-set table properties that write files outside the table (`write.data.path`
-and the like). Views, registering existing tables and multi-table
-transactions are not served yet.
+Only admins may choose a table's or a schema's location, move a table to
+another location or change its UUID (otherwise every table gets a new
+directory of its own, so credentials for it reach no other table's files,
+not even a dropped one's), use nested namespaces (Igloo's SQL shows
+top-level schemas only, so grants could not name them), or move a table to
+another schema (whose grants would then reach it). No one may set table
+properties that write files outside the table (`write.data.path` and the
+like), or use a dot in a namespace's name. The commit that creates a
+table, as in `CREATE TABLE AS`, restates the UUID and location the catalog
+gave it; Igloo leaves those out, so the table keeps them. A commit whose
+body names another table than its path is refused. Views, registering
+existing tables and multi-table transactions are not served yet.
+
+### Tables with data policies
+
+Igloo applies masking and row access policies to the SQL it runs. An engine
+that loads a table gets its metadata and credentials for its files, and
+reading those files directly would bypass every policy. So, as Unity
+Catalog does for engines outside it, Igloo refuses everyone but admins
+loading a table with a masking policy on any column or a row access
+policy, refreshing its credentials, and committing to it, with 403 and a
+message to read it through Igloo's SQL or Flight SQL. Creating or renaming
+a table to the name of a protected table, or renaming a protected one, is
+refused too, since policies name the tables they protect. Listings still
+show such tables. Igloo checks for policies on every request, so attaching
+one stops new loads at once; credentials an engine got for the table
+before still work until they expire, at most an hour later.
 
 ## Connecting
 
@@ -226,7 +245,17 @@ CREATE ICEBERG TABLE orders CATALOG = 'igloo' CATALOG_TABLE_NAME = 'orders' AUTO
 When an engine asks for them, Igloo hands it credentials for the table it
 loads or creates: they last an hour, reach only the files under that table's
 location, and read only, unless the user may change every row. They are never
-Igloo's own keys. How Igloo makes them depends on the storage:
+Igloo's own keys. Only a table where the catalog put it, in its schema's
+location in a directory named for its UUID, gets them: anywhere else, its
+directory could hold another table's files, or lie above or below another
+table's. Tables an admin placed elsewhere get credentials for admins only.
+
+Credentials cannot be taken back. Revoking a grant, dropping a user or
+attaching a data policy stops new loads and new credentials at once, but
+credentials an engine already holds keep working until they expire, at most
+an hour later.
+
+How Igloo makes them depends on the storage:
 
 ### Amazon S3
 

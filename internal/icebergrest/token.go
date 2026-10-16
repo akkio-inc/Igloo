@@ -35,6 +35,31 @@ import (
 // guessing passwords. Tests shorten it.
 var failedTokenDelay = 500 * time.Millisecond
 
+// At most maxDelayed failed requests wait out the delay at once, and at
+// most maxSignIns token requests, each of which may hash a password, run
+// at once; more are refused as busy, so guessing cannot tie up the server.
+const (
+	maxDelayed = 64
+	maxSignIns = 32
+)
+
+// slowDown delays a failed request, or reports false at once when too many
+// already wait.
+func (s *Server) slowDown() bool {
+	select {
+	case s.delayed <- struct{}{}:
+	default:
+		return false
+	}
+	time.Sleep(failedTokenDelay)
+	<-s.delayed
+	return true
+}
+
+// tooBusy is the token endpoint's answer when slowDown or the sign-in limit
+// refuses a request.
+var tooBusy = &oauthError{http.StatusServiceUnavailable, "temporarily_unavailable", "too many sign-ins at once; try again shortly"}
+
 const (
 	tokenLifetime = time.Hour
 	// maxTokenRequest bounds a token request's form.
@@ -152,12 +177,26 @@ type oauthError struct {
 // token serves POST /v1/oauth/tokens.
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
-	user, session, oerr := s.grant(w, r)
+	var (
+		user    auth.User
+		session string
+		oerr    *oauthError
+	)
+	select {
+	case s.signIns <- struct{}{}:
+		user, session, oerr = s.grant(w, r)
+		<-s.signIns
+	default:
+		oerr = tooBusy
+	}
 	outcome := outcomeOK
 	if oerr != nil {
 		outcome = outcomeDenied
 		if oerr.status >= 500 {
 			outcome = outcomeError
+		}
+		if oerr == tooBusy {
+			w.Header().Set("Retry-After", "1")
 		}
 		s.opts.Metrics.request(opToken, outcome)
 		writeJSON(w, oerr.status, map[string]string{"error": oerr.code, "error_description": oerr.desc})
@@ -209,7 +248,9 @@ func (s *Server) grant(w http.ResponseWriter, r *http.Request) (auth.User, strin
 		}
 		t, err := s.tokens.open(form.Get("subject_token"))
 		if err != nil {
-			time.Sleep(failedTokenDelay)
+			if !s.slowDown() {
+				return auth.User{}, "", tooBusy
+			}
 			return auth.User{}, "", &oauthError{http.StatusUnauthorized, "invalid_grant", "the subject token is invalid or expired; sign in again"}
 		}
 		user, err := s.opts.Users.Get(r.Context(), t.User)
@@ -257,7 +298,9 @@ func (s *Server) authenticate(r *http.Request) (*caller, error) {
 	}
 	t, err := s.tokens.open(strings.TrimSpace(raw))
 	if err != nil {
-		time.Sleep(failedTokenDelay)
+		if !s.slowDown() {
+			return nil, errorf(http.StatusServiceUnavailable, errUnavailable, "too many failed requests at once; try again shortly")
+		}
 		return nil, errorf(http.StatusUnauthorized, errNotAuthorized, "the access token is invalid or expired; sign in again")
 	}
 	user, err := s.opts.Users.Get(r.Context(), t.User)
