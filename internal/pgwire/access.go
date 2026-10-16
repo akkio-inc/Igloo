@@ -962,7 +962,8 @@ var allowedFunctions = map[string]bool{
 	"igloo_comments": true, "igloo_query_history": true, "igloo_login_history": true,
 	"igloo_schemata": true, "igloo_tables": true, "igloo_columns": true, "igloo_lineage": true, "igloo_table_usage": true,
 	"igloo_task_history": true, "igloo_load_history": true, "igloo_usage": true, "igloo_alert_history": true,
-	"igloo_policy_references": true, "igloo_tag_references": true,
+	"igloo_policy_references": true, "igloo_tag_references": true, "igloo_data_retention": true,
+	"igloo_erasure_requests": true,
 }
 
 // planScans explains text on the session's connection and returns the

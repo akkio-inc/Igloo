@@ -108,11 +108,30 @@ tags](security-policies.md) describes them.
   memory, lost on restart.
 - Changes apply at once on the replica that made them and within 30 seconds
   on the others.
-- Policies stay with a table's name when the table is dropped, and renaming
-  a table or column they protect is refused: unset them first.
+- Policies and tags stay with a table's name when the table is dropped, and
+  renaming a table or column they protect or tag is refused: unset them
+  first.
 - While any table has policies, users other than admins cannot read the
   warehouse's files directly; give loading jobs files in
   `IGLOO_ALLOWED_LOCATIONS`.
+
+### Erasure requests
+
+[Erasure requests](privacy.md) (`ERASE SUBJECT`) delete a person's data from
+every table whose columns are tagged with an identifier, and keep a record
+that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
+
+- Each request runs as a job on the [scheduler](#scheduled-work), every
+  minute until it completes, one request at a time across replicas; its
+  runs are in `igloo.task_history` as kind `erasure`. It reads the tagged
+  columns of the tagged tables in full, with all of a replica's cores.
+- Every replica checks every 15 seconds for files that requests deleted and
+  drops them from its read cache; a request waits for the replicas seen in
+  the last 2 minutes. A replica that was stopped drops them when it starts.
+- Requests, and the files each deleted, are in the metadata database
+  (schema `igloo_erasure`) and survive restarts; without one, in memory.
+- `ALTER TABLE ... SET (data_retention_days = N)` limits how long a table
+  keeps old versions of its rows; table maintenance enforces it.
 
 ## Query and login history
 
@@ -437,7 +456,8 @@ Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
 `user changed`, `grants changed`, `role settings changed`, `job changed`
 (tasks, pipes, materialized views and alerts created, changed or dropped),
-`notification integration changed`, `statement denied`, `statement
+`notification integration changed`, `erasure requested`, `erasure request
+completed`, `data retention changed`, `statement denied`, `statement
 canceled` (from the web console's compute page), and refused connections.
 Failed scheduled runs log `scheduled run failed` (component `tasks`), and
 notifications that could not be sent `notification failed` (component
@@ -469,6 +489,11 @@ Restore the database to a point in time no later than the storage contents
 you have. Table maintenance deletes the files of expired snapshots, so a
 database restore older than `IGLOO_SNAPSHOT_RETENTION` can point at files that
 are gone unless bucket versioning kept them.
+
+Backups, versions and soft-deleted objects keep what [erasure
+requests](privacy.md) delete until they expire, and restoring one brings it
+back: keep their retention within what your privacy obligations allow, and
+erase again after a restore.
 
 ## Table maintenance
 
@@ -513,6 +538,12 @@ SELECT * FROM set_iceberg_table_properties(lake.public.events,
 
 `history.expire.min-snapshots-to-keep` sets a minimum number of snapshots to
 keep regardless of age.
+
+A table's [data retention](privacy.md#data-retention) (`ALTER TABLE ... SET
+(data_retention_days = N)`, for tables that hold personal data) caps both:
+maintenance keeps no snapshot older than it but the current one, and
+rewrites, with the deletes applied, the data files whose rows were deleted
+longer ago, so they leave the files too.
 
 Maintenance commits are ordinary Iceberg commits. A query that is running
 keeps reading the snapshot it started with; a write that commits at the same

@@ -39,6 +39,9 @@ func TestPrivileges(t *testing.T) {
 	if !(&Privileges{}).Empty() || p.Empty() || (*Privileges)(nil).Allows(PrivilegeSelect, "a", "b") {
 		t.Error("Empty")
 	}
+	if Account.Kind() != "account" || (Object{Schema: "s"}).Kind() != "schema" || p.AllowsAccount(PrivilegeErase) {
+		t.Error("the account")
+	}
 }
 
 // TestConnectionPrivileges checks grants on connections, which never
@@ -253,6 +256,27 @@ func testGrantStore(t *testing.T, g GrantStore) {
 	}
 	if p, _ := g.UserPrivileges(ctx, "bob"); p.AllowsSchema(PrivilegeCreate, "sales") || !p.Allows(PrivilegeSelect, "sales", "x") {
 		t.Errorf("after revoke: %+v", p)
+	}
+
+	// ERASE on the account, which dropping a schema leaves alone.
+	erase := Grant{Grantee: "analyst", GranteeType: GranteeRole, Privilege: PrivilegeErase, Object: Account, GrantedBy: "root"}
+	if err := g.Grant(ctx, []Grant{erase}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.ForgetObject(ctx, sales); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := g.UserPrivileges(ctx, "ana"); !p.AllowsAccount(PrivilegeErase) {
+		t.Errorf("ERASE on the account: %+v", p)
+	}
+	if p, _ := g.UserPrivileges(ctx, "bob"); p.AllowsAccount(PrivilegeErase) {
+		t.Errorf("ERASE for someone without it: %+v", p)
+	}
+	if err := g.Revoke(ctx, []Grant{erase}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := g.UserPrivileges(ctx, "ana"); p.AllowsAccount(PrivilegeErase) {
+		t.Errorf("ERASE after revoke: %+v", p)
 	}
 	if err := g.RemoveMember(ctx, "analyst", "ana"); err != nil {
 		t.Fatal(err)

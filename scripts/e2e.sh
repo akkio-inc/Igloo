@@ -1352,6 +1352,141 @@ psql_as walt walt-password-1 -c "ALTER TASK e2e_broken RESUME" >/dev/null
 expect_hook "a failed scheduled run is reported" '"type":"builtin"' '"name":"failed_runs"' '"name":"e2e_broken"'
 psql_as walt walt-password-1 -c "DROP TASK e2e_broken" >/dev/null
 
+echo "erasure and data retention"
+# A person's email and device ID in a table, written over several
+# snapshots, the email's SHA-256 in another table, and a copy made from the
+# first. A privacy officer, with ERASE ON ACCOUNT and no role of their own,
+# erases them. scan_bucket NEEDLES CONTROL proves the result: it reads every
+# object in the bucket, Avro manifests decompressed and Parquet files
+# decoded, and succeeds when no needle is anywhere and CONTROL, a row that
+# stays, is.
+erase_email=Erase.Me@Subject.example
+erase_device=DEV-ERASE-ME-0001
+s3_access_key="$(grep '^S3_ACCESS_KEY_ID=' "$env_file" | cut -d= -f2)"
+s3_secret_key="$(grep '^S3_SECRET_ACCESS_KEY=' "$env_file" | cut -d= -f2)"
+scan_bucket() {
+  docker run --rm --network "$network" -e S3_ENDPOINT=http://storage:9000 -e S3_BUCKET="$bucket" \
+    -e S3_ACCESS_KEY_ID="$s3_access_key" -e S3_SECRET_ACCESS_KEY="$s3_secret_key" -e NEEDLES="$1" -e CONTROL="$2" \
+    -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+      pip install -q boto3==1.40.61 pyarrow==26.0.0 >/dev/null 2>&1 && python /clients/scan_bucket.py" 2>&1
+}
+psql_admin -c "CREATE TABLE crm.people (id INTEGER, email VARCHAR, device_id VARCHAR, note VARCHAR)" \
+  -c "INSERT INTO crm.people VALUES (1, 'ann@other.example', 'dev-ann', 'stays'), (2, 'bob@other.example', 'dev-bob', 'stays')" >/dev/null
+people_before="$(psql_admin -c "SELECT max_by(snapshot_id, timestamp_ms) FROM iceberg_snapshots(lake.crm.people)")"
+psql_admin \
+  -c "INSERT INTO crm.people VALUES (3, '$erase_email', 'dev-x', 'goes'), (4, 'cy@other.example', '$erase_device', 'goes'),
+        (5, 'di@other.example', 'dev-di', 'stays')" \
+  -c "INSERT INTO crm.people VALUES (6, 'eve@other.example', 'dev-eve', 'stays')" \
+  -c "CREATE TABLE crm.audience (segment VARCHAR, email_sha256 VARCHAR)" \
+  -c "INSERT INTO crm.audience VALUES ('sports', sha256(lower('$erase_email'))), ('sports', sha256('ann@other.example'))" \
+  -c "CREATE TABLE crm.people_copy AS SELECT * FROM crm.people" >/dev/null
+email_hash="$(psql_admin -c "SELECT sha256(lower('$erase_email'))")"
+if got="$(psql_admin \
+  -c "CREATE TAG person ALLOWED_VALUES 'email', 'email:sha256', 'device_id'" \
+  -c "ALTER TABLE crm.people ALTER COLUMN email SET TAG person = 'email'" \
+  -c "ALTER TABLE crm.people ALTER COLUMN device_id SET TAG person = 'device_id'" \
+  -c "ALTER TABLE crm.audience ALTER COLUMN email_sha256 SET TAG person = 'email:sha256'" \
+  -c "ALTER TABLE crm.people_copy ALTER COLUMN email SET TAG person = 'email'" \
+  -c "ALTER TABLE crm.people_copy ALTER COLUMN device_id SET TAG person = 'device_id'" \
+  -c "CREATE USER pat WITH PASSWORD 'pat-password-1' ROLE none" -c "CREATE ROLE privacy_officer" \
+  -c "GRANT ERASE ON ACCOUNT TO privacy_officer" -c "GRANT privacy_officer TO pat")"; then
+  pass "tag the columns that hold identifiers, and make a privacy officer"
+else
+  fail "erasure setup: $got"
+fi
+# A statement that names the person, for the history to forget, and one
+# that reads their rows into the read cache.
+psql_admin -c "SELECT count(*) FROM crm.people WHERE email = '$erase_email'" -c "SELECT count(*) FROM crm.people WHERE note = 'goes'" >/dev/null
+people_files="$(psql_admin -c "SELECT string_agg(chr(39) || file_path || chr(39), ',') FROM iceberg_metadata(lake.crm.people)")"
+cache_on=1
+curl -s "http://127.0.0.1:$http_port/metrics" | grep -q '^igloo_cache_limit_bytes 0$' && cache_on=0
+if [ "$cache_on" = 1 ]; then
+  expect "the read cache holds the person's files" "t" igloo "$admin_password" \
+    "SELECT count(*) > 0 FROM cache_httpfs_cache_status_query() WHERE original_remote_path IN ($people_files)"
+fi
+lower_email="$(tr '[:upper:]' '[:lower:]' <<<"$erase_email")"
+lower_device="$(tr '[:upper:]' '[:lower:]' <<<"$erase_device")"
+# Manifest bounds keep 16 characters of a string.
+needles="$(printf '%s\n' "$erase_email" "$erase_device" "${erase_device:0:16}" "$email_hash")"
+if got="$(scan_bucket "$needles" di@other.example)"; then
+  fail "before erasing, the scan finds nothing: $got"
+elif grep -q "[.]parquet (decoded): $lower_email" <<<"$got" && grep -q "[.]avro (.*): $(tr '[:upper:]' '[:lower:]' <<<"${erase_device:0:16}")" <<<"$got"; then
+  pass "before erasing, the scan finds the person in data files and manifest bounds"
+else
+  fail "the scan before erasing: $got"
+fi
+
+expect_error "readers cannot erase" 42501 rita rita-password-1 "ERASE SUBJECT WHERE person.email = 'someone@else.example'"
+expect_error "nor see the requests" 42501 rita rita-password-1 "SHOW ERASURE REQUESTS"
+expect_error "a tag value no column has is refused" 22023 pat pat-password-1 "ERASE SUBJECT WHERE pii.email = 'someone@else.example'"
+request="$(psql_as pat pat-password-1 -c "ERASE SUBJECT WHERE person.email = '  $lower_email' OR person.device_id = '$lower_device'" | cut -d'|' -f1)"
+status=""
+deadline=$((SECONDS + 240))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  status="$(psql_as pat pat-password-1 -c "SELECT status FROM igloo.erasure_requests WHERE request_id = '$request'")" || true
+  [ "$status" = completed ] && break
+  sleep 2
+done
+if [ "$status" = completed ]; then
+  pass "the erasure request completes"
+else
+  fail "the erasure request: $(psql_admin -c "SELECT status, step, error FROM igloo.erasure_requests WHERE request_id = '$request'")"
+fi
+expect "its verification finds nothing" "0|0|0|0|0|0|0|0|1" pat pat-password-1 \
+  "SELECT v->>'rows', v->>'files', v->>'bounds', v->>'statistics', v->>'storage', v->>'orphans', v->>'sharing', v->>'history', v->>'caches'
+   FROM (SELECT verification::JSON AS v FROM igloo.erasure_requests WHERE request_id = '$request')"
+expect "it erased from the tagged tables" "crm.audience:1,crm.people:2,crm.people_copy:2" pat pat-password-1 \
+  "SELECT string_agg((t->>'table') || ':' || (t->>'rows_deleted'), ',' ORDER BY t->>'table')
+   FROM (SELECT unnest(json_extract(tables::JSON, '\$[*]')) AS t FROM igloo.erasure_requests WHERE request_id = '$request')"
+expect "and reports the copy as written from one" "crm.people_copy|crm.people|true" pat pat-password-1 \
+  "SELECT d->>'table', d->'from'->>0, d->>'erased'
+   FROM (SELECT unnest(json_extract(downstream::JSON, '\$[*]')) AS d FROM igloo.erasure_requests WHERE request_id = '$request')"
+got="$(psql_as pat pat-password-1 -c "SHOW ERASURE REQUESTS")" || true
+if grep -q "^$request|pat|completed|done|" <<<"$got" && ! grep -qi "$lower_email\|$lower_device\|$email_hash" <<<"$got"; then
+  pass "SHOW ERASURE REQUESTS, without the identifiers"
+else
+  fail "SHOW ERASURE REQUESTS: $got"
+fi
+expect "others see no requests" "0" rita rita-password-1 "SELECT count(*) FROM igloo.erasure_requests"
+expect "every other row stays" "1,2,5,6|1,2,5,6|1" igloo "$admin_password" \
+  "SELECT (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM crm.people), (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM crm.people_copy),
+     (SELECT count(*) FROM crm.audience)"
+expect "time travel to before the person's data still works" "2" igloo "$admin_password" \
+  "SELECT count(*) FROM crm.people AT (VERSION => $people_before)"
+expect "the history no longer holds the identifiers" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM igloo.query_history WHERE query_text ILIKE '%subject.example%' OR query_text ILIKE '%dev-erase-me%'"
+expect "the request is recorded without them" "ERASE SUBJECT WHERE \"person\".\"email\" IN ('***') OR \"person\".\"device_id\" IN ('***')" \
+  igloo "$admin_password" "SELECT query_text FROM igloo.query_history WHERE user_name = 'pat' AND statement_type = 'ERASE' AND outcome = 'ok'"
+if [ "$cache_on" = 1 ]; then
+  expect "the read cache holds none of the deleted files" "0" igloo "$admin_password" \
+    "SELECT count(*) FROM cache_httpfs_cache_status_query() WHERE original_remote_path IN ($people_files)
+       AND original_remote_path NOT IN (SELECT file FROM glob('s3://$bucket/warehouse/**'))"
+fi
+if got="$(scan_bucket "$needles" di@other.example)"; then
+  pass "no trace of the person in any object of the bucket ($(tail -1 <<<"$got"))"
+else
+  fail "the bucket after erasing: $got"
+fi
+
+expect_error "writers cannot set a data retention" 42501 walt walt-password-1 "ALTER TABLE crm.people SET (data_retention_days = 0)"
+expect "a privacy officer sets one" "ALTER TABLE" pat pat-password-1 "ALTER TABLE crm.people SET (data_retention_days = 0)"
+expect "everyone sees it" "people|0|pat" rita rita-password-1 "SELECT table_name, data_retention_days, set_by FROM igloo.data_retention"
+expect_error "a table with a data retention keeps its name" 42501 igloo "$admin_password" "ALTER TABLE crm.people RENAME TO folks"
+psql_admin -c "INSERT INTO crm.people VALUES (7, 'fay@other.example', 'dev-fay', 'goes')" -c "DELETE FROM crm.people WHERE id = 7" >/dev/null
+# Maintenance (every 5 seconds here) keeps no older version of the table's
+# rows: one snapshot, and no file holds the deleted row.
+state=""
+deadline=$((SECONDS + 120))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  live="$(psql_admin -c "SELECT string_agg(chr(39) || file_path || chr(39), ',') FROM iceberg_metadata(lake.crm.people)
+    WHERE manifest_content = 'DATA' AND status <> 'DELETED'")" || true
+  state="$(psql_admin -c "SELECT (SELECT count(*) FROM iceberg_snapshots(lake.crm.people)) || '|' ||
+    (SELECT count(*) FROM read_parquet([$live]) WHERE note = 'goes')")" || true
+  [ "$state" = "1|0" ] && break
+  sleep 2
+done
+if [ "$state" = "1|0" ]; then pass "maintenance enforces the data retention"; else fail "data retention: got [$state], want [1|0]"; fi
+
 echo "health and metrics"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http_port/readyz")"
 if [ "$code" = 200 ]; then pass "readyz"; else fail "readyz returned $code"; fi
@@ -1460,6 +1595,8 @@ expect "and so do integrations" "triggered" walt walt-password-1 \
 expect "drop an alert" "DROP ALERT" walt walt-password-1 "DROP ALERT e2e_big_sales"
 expect "drop an integration" "DROP INTEGRATION" igloo "$admin_password" "DROP INTEGRATION e2e_hook"
 expect "policies survive a restart" "1|***@acme.com" nora nora-password-1 "SELECT id, email FROM crm.contacts"
+expect "erasure requests and data retentions survive a restart" "completed|0" pat pat-password-1 \
+  "SELECT status, (SELECT data_retention_days FROM igloo.data_retention) FROM igloo.erasure_requests WHERE request_id = '$request'"
 
 echo "connections after the restart"
 got="$(connections)"

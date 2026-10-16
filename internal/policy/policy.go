@@ -133,16 +133,30 @@ func TableName(catalog, schema, table string) string {
 	return schema + "." + table
 }
 
+// DataRetention limits how long a table that holds personal data keeps
+// old versions of its rows (ALTER TABLE ... SET (data_retention_days = N)):
+// table maintenance expires its older snapshots and rewrites files whose
+// deleted rows are older, so neither time travel nor the files reach back
+// further.
+type DataRetention struct {
+	Schema string    `json:"schema"`
+	Table  string    `json:"table"`
+	Days   int       `json:"days"`
+	SetBy  string    `json:"set_by,omitempty"`
+	SetAt  time.Time `json:"set_at"`
+}
+
 // Catalog is every policy, tag and attachment. Attachments name tables and
 // columns, which compare case-insensitively as DuckDB resolves them. They
 // stay when a table or column is dropped, so one created again under the
 // name is protected as soon as it exists.
 type Catalog struct {
-	Policies   []Policy     `json:"policies,omitempty"`
-	Tags       []Tag        `json:"tags,omitempty"`
-	Masks      []ColumnMask `json:"masks,omitempty"`
-	RowFilters []RowFilter  `json:"row_filters,omitempty"`
-	ColumnTags []ColumnTag  `json:"column_tags,omitempty"`
+	Policies   []Policy        `json:"policies,omitempty"`
+	Tags       []Tag           `json:"tags,omitempty"`
+	Masks      []ColumnMask    `json:"masks,omitempty"`
+	RowFilters []RowFilter     `json:"row_filters,omitempty"`
+	ColumnTags []ColumnTag     `json:"column_tags,omitempty"`
+	Retentions []DataRetention `json:"retentions,omitempty"`
 }
 
 func (c *Catalog) clone() Catalog {
@@ -447,6 +461,34 @@ func (c *Catalog) UnsetColumnTag(catalog, schema, table, column, tag string) err
 	return nil
 }
 
+// SetRetention sets a table's data retention, replacing the one it has.
+func (c *Catalog) SetRetention(r DataRetention, now time.Time) error {
+	if r.Days < 0 {
+		return fmt.Errorf("data_retention_days must not be negative: %w", ErrInvalid)
+	}
+	r.SetAt = now
+	for i, old := range c.Retentions {
+		if sameTable("", old.Schema, old.Table, "", r.Schema, r.Table) {
+			c.Retentions[i] = r
+			return nil
+		}
+	}
+	c.Retentions = append(c.Retentions, r)
+	return nil
+}
+
+// UnsetRetention removes a table's data retention.
+func (c *Catalog) UnsetRetention(schema, table string) error {
+	n := len(c.Retentions)
+	c.Retentions = slices.DeleteFunc(c.Retentions, func(r DataRetention) bool {
+		return sameTable("", r.Schema, r.Table, "", schema, table)
+	})
+	if len(c.Retentions) == n {
+		return fmt.Errorf("table %s.%s has no data retention: %w", schema, table, ErrNotFound)
+	}
+	return nil
+}
+
 func quoteList(values []string) string {
 	q := make([]string, len(values))
 	for i, v := range values {
@@ -488,6 +530,8 @@ type TableRules struct {
 	// Columns are the columns with masking policies or tags, by lower-case
 	// name.
 	Columns map[string]*ColumnRules
+	// Retention is the table's data retention, if any.
+	Retention *DataRetention
 }
 
 // Protected reports whether a policy applies to the table: a row access
@@ -575,6 +619,9 @@ func NewSnapshot(version int64, c Catalog) *Snapshot {
 			}
 		}
 	}
+	for _, r := range c.Retentions {
+		table("", r.Schema, r.Table).Retention = &r
+	}
 	for k, t := range s.tables {
 		if t.Protected() {
 			s.names[k.table] = true
@@ -590,6 +637,10 @@ func (s *Snapshot) ProtectsConnections() bool { return s != nil && s.connections
 
 // Empty reports whether no policy protects anything.
 func (s *Snapshot) Empty() bool { return s == nil || len(s.names) == 0 }
+
+// Classified reports whether any table has policies, tags or a data
+// retention, which all stay with tables' names.
+func (s *Snapshot) Classified() bool { return s != nil && len(s.tables) > 0 }
 
 // StagingMark is in the name of the table that CREATE OR REPLACE TABLE
 // writes before renaming it into place: name__igloo_new_<random>. It has

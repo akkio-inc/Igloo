@@ -115,7 +115,7 @@ func TestMaxRefAgeForever(t *testing.T) {
 	}
 	time.Sleep(10 * time.Millisecond)
 	m := New(cat, cat.Dir+"/", Options{Interval: time.Hour, Retention: time.Hour}, quiet)
-	if _, _, err := m.expire(ctx, cat.Load(t, "fin", "ledger"), quiet); err != nil {
+	if _, _, err := m.expire(ctx, cat.Load(t, "fin", "ledger"), quiet, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	kept := false

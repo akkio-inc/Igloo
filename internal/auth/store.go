@@ -251,6 +251,18 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS scim_members_user ON igloo_auth.scim_members (user_name)`,
 	connectionGrantsTable,
+	// ERASE on the account, which lets a custom role erase people's data
+	// (see package erasure). Changed once, so later starts take no lock on
+	// the table.
+	`DO $$
+	BEGIN
+		IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'igloo_auth.grants'::regclass
+				AND conname = 'grants_privilege_check' AND pg_get_constraintdef(oid) NOT LIKE '%ERASE%') THEN
+			ALTER TABLE igloo_auth.grants DROP CONSTRAINT grants_privilege_check,
+				ADD CONSTRAINT grants_privilege_check
+				CHECK (privilege IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ERASE'));
+		END IF;
+	END $$`,
 }
 
 // userColumns are what Get and List read.

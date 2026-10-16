@@ -29,10 +29,13 @@ import (
 //	GRANT privilege[, ...] | ALL [PRIVILEGES]
 //	    ON [TABLE] name | SCHEMA name | ALL TABLES IN SCHEMA name | CONNECTION name TO role_or_user
 //	REVOKE privilege[, ...] | ALL [PRIVILEGES] ON ... FROM role_or_user
+//	GRANT ERASE ON ACCOUNT TO role_or_user
+//	REVOKE ERASE ON ACCOUNT FROM role_or_user
 //	SHOW ROLES
 //	SHOW GRANTS [TO role_or_user | ON [TABLE] name | ON SCHEMA name | ON CONNECTION name]
 //
 // Privileges are SELECT, INSERT, UPDATE, DELETE and, on schemas, CREATE.
+// ERASE, on the account, allows erasure requests (see erasure.go).
 // ALL TABLES IN SCHEMA grants on the tables and views there now, as in
 // PostgreSQL; a grant ON SCHEMA also covers ones created later. Only admins
 // may change roles and grants; anyone may see the ones that apply to them.
@@ -60,6 +63,8 @@ const (
 	targetSchema     = "SCHEMA"
 	targetAllTables  = "ALL TABLES IN SCHEMA"
 	targetConnection = "CONNECTION"
+	// targetAccount is what ERASE is granted on.
+	targetAccount = "ACCOUNT"
 )
 
 // aclCommand is a parsed role or grant statement.
@@ -209,6 +214,16 @@ func parseACLCommand(toks []token) (c *aclCommand, ok bool, err error) {
 		c.kind = aclGrant
 		if !grant {
 			c.kind = aclRevoke
+		}
+		if on == 2 && toks[1].upper() == string(auth.PrivilegeErase) {
+			// GRANT ERASE ON ACCOUNT TO role_or_user.
+			rest := toks[on+1:]
+			if len(rest) != 3 || rest[0].upper() != "ACCOUNT" || rest[1].upper() != toWord {
+				return syntax("expected %s ERASE ON ACCOUNT %s role_or_user", word(0), toWord)
+			}
+			c.privileges, c.targetKind = []auth.Privilege{auth.PrivilegeErase}, targetAccount
+			c.grantee, err = principalName(rest[2])
+			return c, true, err
 		}
 		if c.privileges, err = parsePrivileges(toks[1:on]); err != nil {
 			return nil, true, err
@@ -387,9 +402,11 @@ func (s *Server) changeGrants(ctx context.Context, sess *session, me auth.User, 
 	if err != nil {
 		return err
 	}
-	objects, err := s.grantObjects(ctx, sess, c.targetKind, c.target)
-	if err != nil {
-		return err
+	objects := []auth.Object{auth.Account}
+	if c.targetKind != targetAccount {
+		if objects, err = s.grantObjects(ctx, sess, c.targetKind, c.target); err != nil {
+			return err
+		}
 	}
 	privs := c.privileges
 	switch {

@@ -69,6 +69,8 @@ type Engine struct {
 	locations []string
 	// policies supplies the policy reference functions; see SetPolicies.
 	policies atomic.Pointer[func() *policy.Snapshot]
+	// erasure supplies igloo.erasure_requests; see SetErasure.
+	erasure atomic.Pointer[erasureConfig]
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -234,6 +236,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	e.locations = loadLocations(cfg)
 	if err := e.registerPolicies(ctx); err != nil {
 		return fmt.Errorf("register policy references: %w", err)
+	}
+	if err := e.registerErasure(ctx); err != nil {
+		return fmt.Errorf("register erasure requests: %w", err)
 	}
 
 	if cfg.Catalog.URI == "" {

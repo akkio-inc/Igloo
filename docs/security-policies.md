@@ -225,6 +225,14 @@ policy and tags.
 
 ## What is refused
 
+Renaming a table with policies, tags or a [data
+retention](privacy.md#data-retention), or one of its protected or tagged
+columns, and changing such a column's type, whether or not any table has
+policies. Policies and tags stay with a table's name, also when it is
+dropped, so a table created again under the name is protected at once, and
+a renamed table would escape them and [erasure requests](privacy.md). Unset
+them first.
+
 While any table has policies:
 
 - Statements Igloo cannot rewrite with certainty that name a protected table
@@ -233,10 +241,6 @@ While any table has policies:
   time), a `PIVOT` that finds its columns in the data, statements behind a
   `WITH` clause before `UPDATE`, `DELETE` or `MERGE`, macros that read
   protected tables, `stats()`, and table names in escaped strings.
-- Renaming a table with policies or tags, or one of its protected columns,
-  and changing such a column's type. Policies stay with a table's name, also
-  when it is dropped, so a table created again under the name is protected
-  at once. Unset them first.
 - For a user the policies do not exempt: `TRUNCATE` of a table with a row
   access policy, `MERGE` into it with `WHEN NOT MATCHED` clauses (add new
   rows with `INSERT`), `INSERT OR REPLACE` and `ON CONFLICT` into it, and

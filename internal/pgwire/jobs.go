@@ -15,6 +15,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/schedule"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
@@ -685,6 +686,14 @@ func nullTime(t time.Time) any {
 // materialized view's refresh are recorded in the owner's query history
 // when they change anything.
 func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
+	if j.Kind == erasure.JobKind {
+		// An erasure request is carried out whatever became of whoever
+		// made it: the obligation stays.
+		if s.erasure == nil {
+			return -1, errors.New("erasure requests need an Iceberg catalog (IGLOO_CATALOG_URI)")
+		}
+		return -1, s.erasure.Run(ctx, j.Name)
+	}
 	if j.Kind == tasks.KindAlert {
 		return s.runAlert(ctx, j)
 	}

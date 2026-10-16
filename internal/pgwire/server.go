@@ -34,6 +34,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -151,6 +152,8 @@ type Options struct {
 	// Lineage, if set, is told about every statement that wrote a table
 	// (see catalog.go).
 	Lineage LineageSink
+	// Erasure carries out erasure requests. Nil without a catalog.
+	Erasure *erasure.Service
 
 	// Distributed, if set, runs statements that read large tables in
 	// parts on workers (docs/distributed-execution.md).
@@ -212,6 +215,7 @@ type Server struct {
 	tasks       *tasks.Scheduler
 	notify      *notify.Service
 	clones      *clone.Manager
+	erasure     *erasure.Service
 	// gov holds the policies (see protect.go).
 	gov      *governance
 	settings auth.SettingStore
@@ -291,6 +295,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		notify:      opts.Notify,
 		clones:      opts.Clones,
 		dist:        opts.Distributed,
+		erasure:     opts.Erasure,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -868,6 +873,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	}
 
 	if ps, ok, err := s.loadingCommand(sess, q.Query); ok || err != nil {
+		return ps, err
+	}
+
+	if ps, ok, err := s.erasureCommand(sess, q.Query); ok || err != nil {
 		return ps, err
 	}
 

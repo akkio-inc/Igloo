@@ -30,7 +30,8 @@ func (e *Engine) policySnapshot() *policy.Snapshot {
 // igloo.tag_references over them, after Snowflake's views of the same
 // names: which masking and row access policies apply to which tables and
 // columns, and which columns have which tags. Each user sees those of the
-// tables they may see (see CatalogSource).
+// tables they may see (see CatalogSource), as igloo.data_retention lists
+// their data retentions.
 func (e *Engine) registerPolicies(ctx context.Context) error {
 	// Not closed: closing a DB closes its connector.
 	db := sql.OpenDB(e.connector)
@@ -103,11 +104,48 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 		return err
 	}
 
+	bigint, err := duckdb.NewTypeInfo(duckdb.TYPE_BIGINT)
+	if err != nil {
+		return err
+	}
+	timestamp, err := duckdb.NewTypeInfo(duckdb.TYPE_TIMESTAMP_TZ)
+	if err != nil {
+		return err
+	}
+	err = duckdb.RegisterTableUDF(conn, "igloo_data_retention", duckdb.RowTableFunction{
+		BindArgumentsContext: func(ctx context.Context, _ map[string]any, _ ...any) (duckdb.RowTableSource, error) {
+			source := e.catalogSource(ctx)
+			return &lazySource{
+				columns: []duckdb.ColumnInfo{
+					column("table_catalog", varchar), column("table_schema", varchar), column("table_name", varchar),
+					column("data_retention_days", bigint), column("set_by", varchar), column("set_at", timestamp),
+				},
+				fill: func() ([][]any, error) {
+					src, ok := source()
+					if !ok {
+						return nil, nil
+					}
+					var out [][]any
+					for _, r := range dataRetention(src.Catalog(), e.policySnapshot()) {
+						if schema, name := r[1].(string), r[2].(string); src.SeesTable(schema, name) {
+							out = append(out, r)
+						}
+					}
+					return out, nil
+				},
+			}, nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+
 	schema := ident(e.local) + "." + ident(HistorySchema)
 	for _, stmt := range []string{
 		"CREATE SCHEMA IF NOT EXISTS " + schema,
 		"CREATE OR REPLACE VIEW " + schema + ".policy_references AS SELECT * FROM system.main.igloo_policy_references()",
 		"CREATE OR REPLACE VIEW " + schema + ".tag_references AS SELECT * FROM system.main.igloo_tag_references()",
+		"CREATE OR REPLACE VIEW " + schema + ".data_retention AS SELECT * FROM system.main.igloo_data_retention()",
 	} {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("%s: %w", stmt, err)
@@ -170,6 +208,23 @@ func tagReferences(catalog string, snap *policy.Snapshot) [][]any {
 			db = ct.Catalog
 		}
 		rows[i] = []any{ct.Tag, ct.Value, db, ct.Schema, ct.Table, "COLUMN", ct.Column}
+	}
+	return rows
+}
+
+// dataRetention lists the tables with a data retention (ALTER TABLE ...
+// SET (data_retention_days = N)).
+func dataRetention(catalog string, snap *policy.Snapshot) [][]any {
+	if snap == nil {
+		return nil
+	}
+	retentions := slices.Clone(snap.Catalog.Retentions)
+	slices.SortFunc(retentions, func(a, b policy.DataRetention) int {
+		return strings.Compare(strings.ToLower(a.Schema+"."+a.Table), strings.ToLower(b.Schema+"."+b.Table))
+	})
+	rows := make([][]any, len(retentions))
+	for i, r := range retentions {
+		rows[i] = []any{catalog, r.Schema, r.Table, int64(r.Days), r.SetBy, r.SetAt}
 	}
 	return rows
 }

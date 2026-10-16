@@ -284,10 +284,14 @@ var secretWords = []string{"PASSWORD", "SECRET", "KEY_ID", "SESSION_TOKEN", "ACC
 var sensitiveSetting = regexp.MustCompile(`(?i)(secret|password|key|token|credential)`)
 
 // redactQuery returns query fit for the history: passwords and secrets
-// replaced by '***', and at most maxQueryText bytes.
+// replaced by '***', as are the identifiers of ERASE SUBJECT, and at most
+// maxQueryText bytes.
 func redactQuery(query string) string {
 	words := sqllex.CodeWords(query)
-	sensitive := slices.ContainsFunc(words, func(w string) bool { return slices.Contains(secretWords, w) })
+	if len(words) > 0 && words[0] == "ERASE" {
+		query = erasureText(query)
+	}
+	sensitive := slices.ContainsFunc(words, func(w string) bool { return slices.Contains(secretWords, w) || w == "ERASE" })
 	if !sensitive && len(words) > 1 && (words[0] == "SET" || words[0] == "RESET") {
 		sensitive = slices.ContainsFunc(words[1:min(len(words), 4)], func(w string) bool { return sensitiveSetting.MatchString(w) })
 	}

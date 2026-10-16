@@ -190,6 +190,18 @@ reference for every setting mentioned here.
   is refused, as a guard against mistakes; do not connect the catalog's
   database or other internal services either. Give each connection a
   database user that can read only what Igloo should.
+- **Erasure** ([details](docs/privacy.md)). Admins and holders of `ERASE ON
+  ACCOUNT` ask for erasures and set data retentions; others see no
+  requests. A request's identifiers are kept only as SHA-256 hashes salted
+  with 128 random bits of the request's, and those go when it completes;
+  `ERASE SUBJECT` reaches the history, the logs and the list of running
+  statements with its identifiers replaced by `'***'`. Requests read and
+  change tables with Igloo's own access, not through policies, which would
+  hide the values they look for, and are carried out whatever later happens
+  to the account that made them. They delete files from the warehouse, only
+  once no table they erase from references them, and orphan files only
+  after 3 days, as maintenance does. They do not reach backups, bucket
+  versions, soft-deleted objects, or copies outside the warehouse.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history

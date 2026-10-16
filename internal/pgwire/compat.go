@@ -350,10 +350,11 @@ func rewriteSessionUser(query, user string) string {
 }
 
 // historyViews are the views of the history, the usage, the policies and
-// the catalog (see engine.CatalogViews), in the local database's schema
+// the catalog (see engine.CatalogViews), data retentions and erasure
+// requests, in the local database's schema
 // engine.HistorySchema.
 var historyViews = append([]string{"query_history", "login_history", "task_history", "load_history", "alert_history", "usage",
-	"policy_references", "tag_references"}, engine.CatalogViews()...)
+	"policy_references", "tag_references", "data_retention", "erasure_requests"}, engine.CatalogViews()...)
 
 // informationSchemaViews are the views of information_schema that Igloo
 // adds owners, comments and sizes to (see engine.InformationSchemaView).

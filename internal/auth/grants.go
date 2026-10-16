@@ -23,6 +23,10 @@ const (
 	// replacing, altering, commenting on and dropping the schema's tables
 	// and views.
 	PrivilegeCreate Privilege = "CREATE"
+	// PrivilegeErase exists on the account only (GRANT ERASE ON ACCOUNT).
+	// It allows erasure requests and data retentions, which otherwise
+	// need admin: what a privacy officer does.
+	PrivilegeErase Privilege = "ERASE"
 )
 
 var (
@@ -41,7 +45,8 @@ func ParsePrivilege(s string) (Privilege, bool) {
 // Object is a schema of the Iceberg catalog, or a table or view in one; or,
 // with Catalog set, a connection to another database (see package
 // federation), or a schema or table of one. Names compare
-// case-insensitively, as DuckDB resolves them.
+// case-insensitively, as DuckDB resolves them. The zero Object is the
+// account, which only ERASE is granted on.
 type Object struct {
 	// Catalog is the connection's name for objects of a connection, and
 	// empty for the Iceberg catalog's.
@@ -52,6 +57,9 @@ type Object struct {
 	Table string
 }
 
+// Account is what account-level privileges are granted on.
+var Account = Object{}
+
 // IsSchema reports whether o is a schema or connection rather than a table
 // or view.
 func (o Object) IsSchema() bool { return o.Table == "" }
@@ -59,9 +67,11 @@ func (o Object) IsSchema() bool { return o.Table == "" }
 // IsConnection reports whether o is a whole connection.
 func (o Object) IsConnection() bool { return o.Catalog != "" && o.Schema == "" }
 
-// Kind is "connection", "schema" or "table".
+// Kind is "account", "connection", "schema" or "table".
 func (o Object) Kind() string {
 	switch {
+	case o == Account:
+		return "account"
 	case o.IsConnection():
 		return "connection"
 	case o.IsSchema():
@@ -178,6 +188,11 @@ func (p *Privileges) AllowsConnection(priv Privilege, catalog, schema, table str
 		}
 	}
 	return false
+}
+
+// AllowsAccount reports whether p includes priv on the account.
+func (p *Privileges) AllowsAccount(priv Privilege) bool {
+	return p != nil && slices.ContainsFunc(p.Grants, func(g Grant) bool { return g.Privilege == priv && g.Object == Account })
 }
 
 var (

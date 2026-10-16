@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/notify"
@@ -301,6 +303,31 @@ func serve() error {
 	eng.SetAlertHistory(notifyStore, pgwire.HistoryViewer)
 	jobs := tasks.NewScheduler(taskStore, tasks.Options{Retention: cfg.Audit.Retention, Ended: notifier.RunEnded, Log: log})
 	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
+
+	var eraser *erasure.Service
+	if cat != nil {
+		erasureStore, purger, err := openErasure(ctx, cfg, eng, log)
+		if err != nil {
+			return err
+		}
+		defer erasureStore.Close()
+		if eraser, err = newEraser(cfg, erasureStore, purger, cat, eng, policies, historyStore, taskStore, jobs, log); err != nil {
+			return err
+		}
+		// Every replica drops what requests delete from its read cache,
+		// until shutdown, before the engine closes.
+		purgeCtx, stopPurging := context.WithCancel(ctx)
+		purged := make(chan struct{})
+		go func() {
+			defer close(purged)
+			purger.Run(purgeCtx)
+		}()
+		defer func() {
+			stopPurging()
+			<-purged
+		}()
+	}
+
 	single, err := openSSO(cfg, users, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
 		return err
@@ -335,6 +362,7 @@ func serve() error {
 		Clones:              clones,
 		Lineage:             lineage,
 		Distributed:         dist,
+		Erasure:             eraser,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -349,6 +377,9 @@ func serve() error {
 		// Tables with masking or row access policies are neither shared
 		// nor served; until now the sharing endpoint served none.
 		shares.SetProtection(srv.ProtectedBy)
+	}
+	if eraser != nil {
+		eng.SetErasure(eraser.List, srv.ErasureViewer)
 	}
 	provisioning, err := openSCIM(users, single, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
@@ -391,7 +422,7 @@ func serve() error {
 	maintains := cat != nil && cfg.Maintenance.Enabled
 	var schedule maintenance.Schedule
 	if maintains {
-		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, reg, work, notifier.MaintenanceFailed, log)
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, reg, work, notifier.MaintenanceFailed, log)
 		if err != nil {
 			return err
 		}
@@ -644,6 +675,55 @@ func openPolicies(ctx context.Context, cfg config.Config, log *slog.Logger) (pol
 	return store, nil
 }
 
+// openErasure opens where erasure requests are kept, the metadata database
+// or else this replica's memory, and the purger that drops what they
+// delete from this replica's read cache.
+func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log *slog.Logger) (erasure.Store, *erasure.Purger, error) {
+	var store erasure.Store
+	if cfg.MetadataDatabaseURL == "" {
+		log.Warn("IGLOO_METADATA_DATABASE_URL is not set; erasure requests are kept in memory and lost on restart")
+		store = erasure.NewMemoryStore()
+	} else {
+		var err error
+		if store, err = erasure.OpenPostgres(ctx, cfg.MetadataDatabaseURL); err != nil {
+			return nil, nil, fmt.Errorf("erasure requests: %w", err)
+		}
+	}
+	cacheID, err := eng.CacheID()
+	if err != nil {
+		store.Close()
+		return nil, nil, fmt.Errorf("read cache ID: %w", err)
+	}
+	host, _ := os.Hostname()
+	return store, erasure.NewPurger(store, eng, cacheID, host, log), nil
+}
+
+// newEraser sets up erasure requests. They redact the query history and
+// the load and task history, so both stores must be able to: a store that
+// cannot would keep identifiers the request is meant to erase.
+func newEraser(cfg config.Config, store erasure.Store, purger *erasure.Purger, cat *catalog.Client, eng *engine.Engine,
+	policies policy.Store, history audit.Store, taskStore tasks.Store, jobs *tasks.Scheduler, log *slog.Logger) (*erasure.Service, error) {
+	opts := erasure.Options{
+		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng,
+		CatalogName: cfg.Catalog.Name, Schema: cfg.Catalog.Schema, Warehouse: cfg.Storage.Root(),
+		Jobs: jobs, Purger: purger, Log: log,
+	}
+	tasksHistory, ok := taskStore.(erasure.History)
+	if !ok {
+		return nil, errors.New("the task store cannot redact its history")
+	}
+	opts.History = append(opts.History, tasksHistory)
+	if history != nil {
+		queries, ok := history.(erasure.History)
+		lineage, ok2 := history.(erasure.Lineage)
+		if !ok || !ok2 {
+			return nil, errors.New("the query history cannot be redacted")
+		}
+		opts.History, opts.Lineage = append(opts.History, queries), lineage
+	}
+	return erasure.New(opts), nil
+}
+
 // warehouseRoot is where the warehouse's files are, or "" without one.
 func warehouseRoot(cfg config.Config) string {
 	if cfg.Storage.Location == "" {
@@ -670,9 +750,9 @@ func openCloneStore(ctx context.Context, cfg config.Config) (clone.Store, error)
 // startMaintenance compacts and expires tables in the background until ctx is
 // canceled. Replicas sharing a metadata database take turns, through lock,
 // which also records when passes ran; it is nil without one. guard keeps
-// the files clones share.
-func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, reg prometheus.Registerer,
-	work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+// the files clones share, and policies have the tables' data retentions.
+func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
+	reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	opts := maintenance.Options{
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
@@ -680,6 +760,17 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		Activity:  work,
 		Failed:    failed,
 		Clones:    guard,
+		DataRetention: func(ctx context.Context) (map[string]time.Duration, error) {
+			snap, err := policies.Load(ctx)
+			if err != nil {
+				return nil, err
+			}
+			limits := map[string]time.Duration{}
+			for _, r := range snap.Catalog.Retentions {
+				limits[strings.ToLower(r.Schema+"."+r.Table)] = time.Duration(r.Days) * 24 * time.Hour
+			}
+			return limits, nil
+		},
 	}
 	if cfg.MetadataDatabaseURL != "" {
 		if lock, err = maintenance.NewPostgresLock(ctx, cfg.MetadataDatabaseURL); err != nil {

@@ -1,0 +1,281 @@
+// Package erasure carries out requests to erase a person's data from the
+// warehouse, as the GDPR and the CCPA require, and keeps a record of each
+// that shows it was done.
+//
+// A request names identifiers by tag value: ERASE SUBJECT WHERE
+// pii.email = 'a@b.com' erases the rows whose columns tagged pii = 'email'
+// hold a@b.com, and those whose columns tagged pii = 'email:sha256' hold
+// its SHA-256 in hex. Igloo keeps the identifiers only as salted hashes and
+// finds rows by hashing column values with the same salt, so not even a
+// request's own record holds them. Values compare lower-cased and without
+// surrounding spaces.
+//
+// A request runs as a job on the scheduler (package tasks), on one replica
+// at a time, through these steps. Each is recorded when it ends, and each
+// works from the tables as they are when it runs, so a job that stops
+// resumes where it was, and running a step again is harmless:
+//
+//  1. find: the tables with tagged columns, the tables that share data
+//     files with them (clones), and those history says were written from
+//     them, which are reported, and erased too if they have the tags;
+//  2. delete: DELETE the matching rows, as any statement would, which adds
+//     delete files beside the data files that hold them;
+//  3. rewrite: write those data files again without the rows, and the
+//     manifests that still list them, whose column bounds can hold the
+//     values;
+//  4. expire: expire the snapshots that still reference such files, as
+//     recent as they are: time travel to them ends, while older snapshots
+//     that do not hold the person's data stay;
+//  5. purge: delete from object storage the files that no snapshot
+//     references any more, and orphan files old enough to be safe to;
+//  6. sharing: delete the Delta Sharing copies made from those files;
+//  7. history: redact the identifiers from the query and load history;
+//  8. cache: wait until every running replica dropped the deleted files
+//     from its read cache;
+//  9. verify: look for the identifiers in what is left: table rows, every
+//     file any snapshot references, manifest bounds, Parquet statistics,
+//     sharing copies, history. Anything found sends the request back to
+//     the step that removes it.
+//
+// Once complete, the request's hashes are deleted: its record says what was
+// erased, from where and when, but no longer whose data it was.
+package erasure
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// JobKind is the kind of the scheduler's jobs that run requests.
+const JobKind = "erasure"
+
+// Statuses of a request.
+const (
+	StatusQueued  = "queued"
+	StatusRunning = "running"
+	// StatusRetrying is a request whose last run failed; Error says why.
+	// It runs again a minute later.
+	StatusRetrying = "retrying"
+	// StatusWaiting is a request that waits for something to happen
+	// before it can go on: replicas to drop files from their caches, or
+	// unreferenced files that may still be part of a write in progress to
+	// grow old enough to delete.
+	StatusWaiting   = "waiting"
+	StatusCompleted = "completed"
+)
+
+// Steps of a request, in order.
+const (
+	StepFind    = "find"
+	StepDelete  = "delete"
+	StepRewrite = "rewrite"
+	StepExpire  = "expire"
+	StepPurge   = "purge"
+	StepSharing = "sharing"
+	StepHistory = "history"
+	StepCache   = "cache"
+	StepVerify  = "verify"
+	StepDone    = "done"
+)
+
+var steps = []string{StepFind, StepDelete, StepRewrite, StepExpire, StepPurge, StepSharing, StepHistory, StepCache, StepVerify, StepDone}
+
+func nextStep(step string) string {
+	for i, s := range steps {
+		if s == step && i+1 < len(steps) {
+			return steps[i+1]
+		}
+	}
+	return StepDone
+}
+
+var (
+	ErrNotFound = errors.New("does not exist")
+	// ErrInvalid is a request that cannot be carried out as written.
+	ErrInvalid = errors.New("invalid erasure request")
+)
+
+// Request is an erasure request and its progress. It never holds the
+// identifiers it erases.
+type Request struct {
+	ID        string    `json:"id"`
+	Requester string    `json:"requester"`
+	Created   time.Time `json:"created"`
+	Updated   time.Time `json:"updated"`
+	Completed time.Time `json:"completed,omitzero"`
+	Status    string    `json:"status"`
+	// Step is the step it runs next, or done.
+	Step     string    `json:"step"`
+	Subjects []Subject `json:"subjects"`
+	// Salt is what the identifiers' hashes are salted with; empty once
+	// the request completes.
+	Salt string `json:"salt,omitempty"`
+	// Tables are what the request erases from.
+	Tables []Table `json:"tables"`
+	// Downstream are tables history says were written from Tables.
+	Downstream []Downstream `json:"downstream"`
+	// HistoryRedacted counts history records it redacted.
+	HistoryRedacted int64         `json:"history_redacted"`
+	Steps           []StepRecord  `json:"steps"`
+	Verification    *Verification `json:"verification,omitempty"`
+	// Error is why the last run failed, while Status is retrying.
+	Error    string `json:"error,omitempty"`
+	Attempts int    `json:"attempts"`
+	// Rounds counts how often verification sent it back to an earlier
+	// step.
+	Rounds int `json:"rounds"`
+	// WaitUntil is, while it waits, when it may make progress.
+	WaitUntil time.Time `json:"wait_until,omitzero"`
+}
+
+// Subject is a tag value the request erases identifiers of.
+type Subject struct {
+	Tag   string `json:"tag"`
+	Value string `json:"value"`
+	// Count is how many identifiers the request names.
+	Count int `json:"identifiers"`
+	// Plain are the salted hashes of the identifiers as columns tagged
+	// with Value hold them.
+	Plain []string `json:"plain,omitempty"`
+	// Digests are, by algorithm, the salted hashes of the identifiers'
+	// digests in hex, which columns tagged Value:algorithm hold.
+	Digests map[string][]string `json:"digests,omitempty"`
+	// Prefixes are the salted hashes of what Iceberg truncates long
+	// identifiers to in manifest bounds.
+	Prefixes []string `json:"prefixes,omitempty"`
+}
+
+// Table is a table a request erases from, and what it did there.
+type Table struct {
+	// Name is schema.table in the catalog.
+	Name    string   `json:"table"`
+	Columns []Column `json:"columns"`
+	// Reason is "tagged", or how it shares data files with a tagged table.
+	Reason           string `json:"reason"`
+	RowsDeleted      int64  `json:"rows_deleted"`
+	FilesRewritten   int    `json:"files_rewritten"`
+	SnapshotsExpired int    `json:"snapshots_expired"`
+	FilesDeleted     int    `json:"files_deleted"`
+	// Steps are when each step last finished for the table.
+	Steps map[string]time.Time `json:"steps,omitempty"`
+	// Missing says the table no longer exists; its tags stay with its
+	// name.
+	Missing bool `json:"missing,omitempty"`
+}
+
+// Column is a column that holds identifiers.
+type Column struct {
+	Name  string `json:"name"`
+	Tag   string `json:"tag"`
+	Value string `json:"value"`
+	// Digest is the algorithm whose hex digests of the identifiers the
+	// column holds, or empty.
+	Digest string `json:"digest,omitempty"`
+}
+
+// Downstream is a table written from tables a request erases from.
+type Downstream struct {
+	Table string   `json:"table"`
+	From  []string `json:"from"`
+	// Via is what tells: "query history", "materialized view" or "task".
+	Via string `json:"via"`
+	// Erased says the request erases from it too, because it has the
+	// tags; otherwise tag it and ask again.
+	Erased bool `json:"erased"`
+}
+
+// StepRecord is when a step of a request ran.
+type StepRecord struct {
+	Step     string    `json:"step"`
+	Started  time.Time `json:"started"`
+	Finished time.Time `json:"finished"`
+	Runs     int       `json:"runs"`
+}
+
+// Verification is what the last check of a request found: counts, never
+// values. A request completes when all of them but Pending are zero.
+type Verification struct {
+	At time.Time `json:"at"`
+	// Rows are matching rows in the tables' current data.
+	Rows int64 `json:"rows"`
+	// Files are data and delete files that any snapshot references and
+	// that hold matching rows, deleted or not.
+	Files int64 `json:"files"`
+	// Bounds are manifest entries, live or deleted, whose column bounds
+	// match.
+	Bounds int64 `json:"bounds"`
+	// Statistics are Parquet column chunks whose minimum or maximum
+	// matches.
+	Statistics int64 `json:"statistics"`
+	// Storage are files the request deleted that object storage still
+	// has.
+	Storage int64 `json:"storage"`
+	// Orphans are unreferenced files with matching rows that are too new
+	// to delete: they may belong to a write in progress.
+	Orphans int64 `json:"orphans"`
+	// Sharing are Delta Sharing copies with matching rows.
+	Sharing int64 `json:"sharing"`
+	// History are history records that still hold an identifier.
+	History int64 `json:"history"`
+	// Caches are the read caches of running replicas that dropped the
+	// deleted files; Pending are those of replicas not running now,
+	// which drop them when they start.
+	Caches  int `json:"caches"`
+	Pending int `json:"caches_pending"`
+}
+
+// File is a file a request deletes once nothing references it.
+type File struct {
+	Path  string
+	Table string
+	// Kind is why: "matched" (it held matching rows), "expired" (only
+	// expired snapshots referenced it), "orphan" or "sharing".
+	Kind    string
+	Deleted time.Time
+}
+
+// Cache is a replica's read cache.
+type Cache struct {
+	ID   string
+	Host string
+	Seen time.Time
+}
+
+// Unpurged are files a request deleted that a cache has not dropped yet.
+type Unpurged struct {
+	Request string
+	Paths   []string
+	// Through is when the last of them was deleted.
+	Through time.Time
+}
+
+// Store keeps requests and what they deleted. Implementations must be
+// safe for concurrent use.
+type Store interface {
+	Create(ctx context.Context, r *Request) error
+	// Get returns ErrNotFound for a request that does not exist.
+	Get(ctx context.Context, id string) (*Request, error)
+	// List returns every request, newest first.
+	List(ctx context.Context) ([]*Request, error)
+	Save(ctx context.Context, r *Request) error
+
+	// AddFiles records files to delete, keeping those already recorded.
+	AddFiles(ctx context.Context, id string, files []File) error
+	Files(ctx context.Context, id string) ([]File, error)
+	// Deleted records that files were deleted at at.
+	Deleted(ctx context.Context, id string, paths []string, at time.Time) error
+
+	// Seen records that the replica with read cache cache is running.
+	Seen(ctx context.Context, cache, host string, at time.Time) error
+	Caches(ctx context.Context) ([]Cache, error)
+	// Unpurged returns, by request, the deleted files cache has not
+	// dropped yet.
+	Unpurged(ctx context.Context, cache string) ([]Unpurged, error)
+	// Purged records that cache dropped the request's files deleted up
+	// to through.
+	Purged(ctx context.Context, id, cache string, through time.Time) error
+	// Purges returns, by cache, up to when it dropped the request's files.
+	Purges(ctx context.Context, id string) (map[string]time.Time, error)
+	Close()
+}

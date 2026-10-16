@@ -360,6 +360,29 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and only then its `file_path` column. Table maintenance also reads a
   `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
   ("forever") as forever; it overflowed into a negative age.
+- Erasure of people's data for GDPR and CCPA requests (`ERASE SUBJECT
+  WHERE pii.email = '...'`), found through tagged columns, including
+  columns of hex SHA-256, SHA-1 and MD5 digests (`pii = 'email:sha256'`) and
+  clones that share the tables' files: it deletes the rows, rewrites the
+  data files and manifests that held them, expires the snapshots that
+  reference those, however recent, deletes them and old orphan files from
+  object storage, deletes Delta Sharing copies made from them, drops them
+  from every replica's read cache, redacts the identifiers from the query,
+  load and task history, and verifies that none is left in rows, files,
+  manifest bounds, Parquet statistics or history. Requests run in the
+  background on the scheduler, survive restarts, resume after failures, keep
+  identifiers only as salted hashes, deleted on completion, and are listed
+  with what they did per table and step in `SHOW ERASURE REQUESTS` and
+  `igloo.erasure_requests`, with the tables history says were written from
+  the erased ones. Admins and roles granted `ERASE ON ACCOUNT` make them.
+  `iceberg-go`'s copy gains `Transaction.ForgetFiles`, which rewrites the
+  manifests that list removed files.
+- Data retention for tables that hold personal data (`ALTER TABLE ... SET
+  (data_retention_days = N)`, `igloo.data_retention`): table maintenance
+  keeps no older snapshot, whatever else the table keeps, and rewrites the
+  files whose rows were deleted longer ago.
+- Renaming a table or column with tags, or a table with a data retention,
+  is refused even when no table has policies.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in

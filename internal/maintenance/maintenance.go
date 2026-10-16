@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/iceberg-go"
 	icecat "github.com/apache/iceberg-go/catalog"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
@@ -95,6 +96,11 @@ type Options struct {
 	Failed func(table string, err error)
 	// Clones keeps the files clones share. Nil means no table is a clone.
 	Clones *clone.Guard
+	// DataRetention, if set, returns the tables' data retentions, by
+	// lower-case schema.table (ALTER TABLE ... SET (data_retention_days
+	// = N)): how long tables that hold personal data keep old versions of
+	// their rows, whatever their own retention properties say.
+	DataRetention func(ctx context.Context) (map[string]time.Duration, error)
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -216,6 +222,16 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 		m.failed("", err)
 		return
 	}
+	var limits map[string]time.Duration
+	if m.opts.DataRetention != nil {
+		if limits, err = m.opts.DataRetention(ctx); err != nil {
+			// Without them, tables would keep data longer than they may.
+			m.log.Warn("could not read data retentions; skipping the pass", "err", err)
+			m.opts.Metrics.pass(false)
+			m.failed("", err)
+			return
+		}
+	}
 	failed := 0
 	pass := m.opts.Clones.Begin()
 	var cleanups []*cleanup
@@ -223,7 +239,8 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		c, err := m.maintain(ctx, ident, pass)
+		limit, limited := limits[strings.ToLower(name(ident))]
+		c, err := m.maintain(ctx, ident, pass, limit, limited)
 		if err != nil {
 			failed++
 			m.log.Warn("table maintenance failed", "table", name(ident), "err", err)
@@ -281,8 +298,9 @@ type cleanup struct {
 // maintain compacts and expires one table, and returns what is left to
 // delete, if anything. A commit that loses a race with a writer is not an
 // error; the next pass tries again. A failure in one step does not stop
-// the others.
-func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass *clone.Pass) (*cleanup, error) {
+// the others. A table with a data retention (limited) keeps no version of
+// its rows older than limit.
+func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass *clone.Pass, limit time.Duration, limited bool) (*cleanup, error) {
 	tbl, err := m.catalog.LoadTable(ctx, ident)
 	if errors.Is(err, icecat.ErrNoSuchTable) {
 		pass.Missing() // dropped or renamed since the listing
@@ -304,12 +322,24 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 	default:
 		errs = append(errs, fmt.Errorf("compact: %w", err))
 	}
+	if limited {
+		if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
+			return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
+		}
+		switch _, err := m.purgeDeleted(ctx, tbl, limit, log); {
+		case err == nil:
+		case errors.Is(err, table.ErrCommitFailed):
+			log.Debug("rewriting files with old deletes lost a race with a writer; retrying next pass")
+		default:
+			errs = append(errs, fmt.Errorf("rewrite files with old deletes: %w", err))
+		}
+	}
 	if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
 		return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
 	}
 
 	c := &cleanup{ident: ident, orphans: m.orphansDue(tbl)}
-	switch expired, files, err := m.expire(ctx, tbl, log); {
+	switch expired, files, err := m.expire(ctx, tbl, log, limit, limited); {
 	case err == nil:
 		c.expired = files
 		if expired != tbl {
@@ -594,8 +624,11 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 // its location that only those snapshots referenced, for clean to delete.
 // Files that compaction replaced stay until the snapshots that read them
 // expire, so time travel within the retention window keeps working.
-func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Logger) (*table.Table, []string, error) {
+func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Logger, limit time.Duration, limited bool) (*table.Table, []string, error) {
 	maxAge, minKeep := m.retention(tbl)
+	if limited {
+		maxAge, minKeep = min(maxAge, limit), 1
+	}
 	cutoff := time.Now().Add(-maxAge).UnixMilli()
 	expirable := 0
 	for _, s := range tbl.Metadata().Snapshots() {
@@ -648,6 +681,122 @@ func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Log
 		return committed, nil, fmt.Errorf("find the files of expired snapshots: %w", err)
 	}
 	return committed, files, nil
+}
+
+// purgeDeleted rewrites the data files that delete files older than limit
+// delete rows of, with the deletes applied, so rows deleted longer ago
+// leave the table's files, as expiring snapshots makes old versions of rows
+// leave. A delete file is as old as the snapshot that added it; one whose
+// snapshot has expired counts as old. It returns the table as committed.
+func (m *Maintainer) purgeDeleted(ctx context.Context, tbl *table.Table, limit time.Duration, log *slog.Logger) (*table.Table, error) {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return tbl, nil
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return tbl, err
+	}
+	manifests, err := snap.Manifests(fs)
+	if err != nil {
+		return tbl, err
+	}
+	cutoff := time.Now().Add(-limit).UnixMilli()
+	old := map[string]bool{}
+	for _, mf := range manifests {
+		if mf.ManifestContent() != iceberg.ManifestContentDeletes {
+			continue
+		}
+		for e, err := range mf.Entries(fs, true) {
+			if err != nil {
+				return tbl, err
+			}
+			if added := tbl.SnapshotByID(e.SnapshotID()); added == nil || added.TimestampMs < cutoff {
+				old[e.DataFile().FilePath()] = true
+			}
+		}
+	}
+	if len(old) == 0 {
+		return tbl, nil
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		return tbl, err
+	}
+	var (
+		groups  []table.CompactionTaskGroup
+		index   = map[string]int{}
+		total   int64
+		rewrite = map[string]struct{}{}
+	)
+	for _, task := range tasks {
+		if hit, err := m.deletesFrom(ctx, fs, task, old); err != nil {
+			return tbl, err
+		} else if !hit {
+			continue
+		}
+		if len(rewrite) > 0 && total+task.File.FileSizeBytes() > maxCompactBytes {
+			break
+		}
+		key := fmt.Sprint(task.File.SpecID(), task.File.Partition())
+		i, ok := index[key]
+		if !ok {
+			i, index[key] = len(groups), len(groups)
+			groups = append(groups, table.CompactionTaskGroup{PartitionKey: key})
+		}
+		groups[i].Tasks = append(groups[i].Tasks, task)
+		groups[i].TotalSizeBytes += task.File.FileSizeBytes()
+		total += task.File.FileSizeBytes()
+		rewrite[task.File.FilePath()] = struct{}{}
+	}
+	if len(rewrite) == 0 {
+		return tbl, nil
+	}
+	deadDeletes, err := compaction.CollectDeadEqualityDeletes(ctx, fs, snap, rewrite)
+	if err != nil {
+		return tbl, fmt.Errorf("find dead equality deletes: %w", err)
+	}
+	tx := tbl.NewTransaction()
+	res, err := tx.RewriteDataFiles(ctx, groups, table.RewriteDataFilesOptions{
+		ExtraDeleteFilesToRemove: deadDeletes,
+		SnapshotProps:            map[string]string{"igloo.operation": "purge-deleted"},
+	})
+	if err != nil {
+		return tbl, err
+	}
+	committed, err := tx.Commit(ctx)
+	if err != nil {
+		return tbl, err
+	}
+	m.opts.Metrics.compacted(res.RemovedDataFiles, res.AddedDataFiles)
+	log.Info("rewrote files whose deleted rows are older than the data retention",
+		"files", res.RemovedDataFiles, "retention", limit)
+	return committed, nil
+}
+
+// deletesFrom reports whether one of the old delete files deletes rows of
+// task's data file. Planning attaches a position delete file to every data
+// file it may apply to, which for DuckDB's is every file of the partition:
+// those it really applies to are the ones its file_path column names.
+func (m *Maintainer) deletesFrom(ctx context.Context, fs iceio.IO, task table.FileScanTask, old map[string]bool) (bool, error) {
+	if slices.ContainsFunc(slices.Concat(task.EqualityDeleteFiles, task.DeletionVectorFiles), func(d iceberg.DataFile) bool {
+		return old[d.FilePath()]
+	}) {
+		return true, nil
+	}
+	for _, d := range task.DeleteFiles {
+		if !old[d.FilePath()] {
+			continue
+		}
+		targets, err := m.targets.Of(ctx, fs, d)
+		if err != nil {
+			return false, err
+		}
+		if targets[task.File.FilePath()] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // retention is how long tbl keeps snapshots and how many it always keeps.

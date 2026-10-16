@@ -704,16 +704,26 @@ func policyRules(t duckdb.StmtType, query string) error {
 func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32) (string, *guard, bool, error) {
 	snap := s.gov.snapshot(ctx)
 	g := &guard{policyGen: s.gov.gen.Load(), catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
+	// Tags and data retentions follow names too, policies or not: a
+	// renamed table would escape erasure (see package erasure).
+	checked := false
+	if t == duckdb.STATEMENT_TYPE_ALTER && snap.Classified() {
+		checked = true
+		if err := s.checkAlterNames(ctx, sess, snap, query); err != nil {
+			return "", nil, checked, err
+		}
+	}
 	if snap.Empty() {
-		return query, g, false, nil
+		return query, g, checked, nil
 	}
 	admin := user.Role == auth.RoleAdmin
 	if !admin {
 		if err := policyRules(t, query); err != nil {
-			return "", nil, false, err
+			return "", nil, checked, err
 		}
 	}
 	sens, ran, err := s.sensitivity(ctx, sess, snap)
+	ran = ran || checked
 	if err != nil {
 		return "", nil, ran, err
 	}
@@ -950,18 +960,17 @@ func (s *Server) countCatalogScans(plan any) (int, error) {
 }
 
 // checkAlter refuses an ALTER TABLE that would read a policied table's rows
-// or move a policy away from the name it is attached to:
-//   - renaming a table with policies or tags, or one of its protected
-//     columns, or changing such a column's type (policies follow names, and a
-//     renamed table would be readable unprotected under its new name until
-//     every replica learned of it);
-//   - any form that evaluates an expression over the existing rows
-//     (ALTER COLUMN ... [SET DATA] TYPE ... USING, ADD/SET a non-constant
-//     DEFAULT, a generated column, a CHECK constraint), which runs over every
-//     raw row, hidden ones included, so it can read masked values and the
-//     rows a row access policy hides. These are refused whether or not the
-//     user is exempt, like a rename: unset the policies first.
+// or move a policy away from the name it is attached to (see
+// checkAlterNames), and any form that evaluates an expression over the
+// existing rows (ALTER COLUMN ... [SET DATA] TYPE ... USING, ADD/SET a
+// non-constant DEFAULT, a generated column, a CHECK constraint), which runs
+// over every raw row, hidden ones included, so it can read masked values
+// and the rows a row access policy hides. These are refused whether or not
+// the user is exempt, like a rename: unset the policies first.
 func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Snapshot, sens *sensitivity, query string, admin bool) error {
+	if err := s.checkAlterNames(ctx, sess, snap, query); err != nil {
+		return err
+	}
 	sc := &scanner{s: query}
 	if !sc.keywords("ALTER", "TABLE") {
 		return nil
@@ -976,8 +985,37 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 		return denied("cannot determine which table this ALTER changes; it is refused while policies exist")
 	}
 	action := sc.rest()
-	evaluates := alterEvaluatesRows(&scanner{s: action})
+	if !alterEvaluatesRows(&scanner{s: action}) {
+		return nil
+	}
+	objects, err := s.catalogCandidates(ctx, sess, name, false)
+	if err != nil {
+		return err
+	}
+	// An expression over the rows is refused when the table is policied, or
+	// when the expression names another policied table (a subquery).
+	policied := slices.ContainsFunc(objects, func(o auth.Object) bool { return snap.Tagged(o.Schema, o.Table) != nil })
+	if policied || sens.triggers(action, admin) {
+		return denied("this ALTER TABLE evaluates an expression over the table's rows, which a policy or tag protects; unset the policies before altering it this way")
+	}
+	return nil
+}
 
+// checkAlterNames refuses renaming a table with policies, tags or a data
+// retention, or one of its protected or tagged columns, or changing such a
+// column's type: they follow names, and a renamed table would be readable
+// unprotected under its new name until every replica learned of it, and
+// out of reach of erasure requests and its retention.
+func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *policy.Snapshot, query string) error {
+	sc := &scanner{s: query}
+	if !sc.keywords("ALTER", "TABLE") {
+		return nil
+	}
+	sc.keywords("IF", "EXISTS")
+	name, ok := sc.name()
+	if !ok {
+		return nil
+	}
 	var table, column bool
 	var col string
 	switch {
@@ -985,33 +1023,30 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 		table = true
 	case sc.keywords("RENAME", "COLUMN"), sc.keywords("RENAME"),
 		sc.keywords("ALTER", "COLUMN"), sc.keywords("ALTER"):
-		if c, ok := sc.name(); ok && len(c) == 1 {
-			col, column = c[0], true
+		c, ok := sc.name()
+		if !ok || len(c) != 1 {
+			return nil
 		}
+		col, column = c[0], true
+	default:
+		return nil
 	}
 	objects, err := s.catalogCandidates(ctx, sess, name, false)
 	if err != nil {
 		return err
 	}
-	policied := false
 	for _, o := range objects {
 		rules := snap.Tagged(o.Schema, o.Table)
 		if rules == nil {
 			continue
 		}
-		policied = true
 		if table {
-			return denied("table %s has policies or tags, which stay with its name; unset them before renaming it", o)
+			return denied("table %s has policies, tags or a data retention, which stay with its name; unset them before renaming it", o)
 		}
 		inFilter := rules.Filter != nil && slices.ContainsFunc(rules.Filter.Columns, func(c string) bool { return strings.EqualFold(c, col) })
 		if column && (rules.Column(col) != nil || inFilter) {
 			return denied("column %s of %s has a policy or tags, which stay with its name; unset them before renaming it or changing its type", col, o)
 		}
-	}
-	// An expression over the rows is refused when the table is policied, or
-	// when the expression names another policied table (a subquery).
-	if evaluates && (policied || sens.triggers(action, admin)) {
-		return denied("this ALTER TABLE evaluates an expression over the table's rows, which a policy or tag protects; unset the policies before altering it this way")
 	}
 	return nil
 }

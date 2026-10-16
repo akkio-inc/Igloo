@@ -175,6 +175,7 @@ SHOW GRANTS;                       -- or TO name, ON TABLE name, ON SCHEMA name,
 | `UPDATE` | table or schema | `UPDATE` and `MERGE ... UPDATE` |
 | `DELETE` | table or schema | `DELETE`, `TRUNCATE` and `MERGE ... DELETE` |
 | `CREATE` | schema | Creating, replacing, altering, renaming, commenting on and dropping its tables and views, including `CREATE TABLE AS` |
+| `ERASE` | `ACCOUNT` | [Erasure requests](privacy.md) and data retentions, which otherwise need admin |
 
 A statement runs if the user's built-in role allows it, or if every access
 it makes to the catalog is granted, to them or to one of their roles. So a
@@ -244,6 +245,22 @@ SELECT * FROM igloo.policy_references;
 
 [Masking, row access policies and tags](security-policies.md) describes every
 statement, how policies apply and what they refuse.
+
+## Erasure and data retention
+
+[Erasure requests](privacy.md) delete a person's data from every table
+whose columns are tagged with their identifiers, physically and with a
+record that shows it, for GDPR and CCPA requests. Admins and holders of
+`ERASE ON ACCOUNT` make them:
+
+```sql
+GRANT ERASE ON ACCOUNT TO privacy_officer;
+ERASE SUBJECT WHERE pii.email = 'ann@example.com' OR pii.device_id IN ('6F9619FF-...', '0C8C2A9E-...');
+SHOW ERASURE REQUESTS;                       -- or SELECT * FROM igloo.erasure_requests
+ALTER TABLE marts.impressions SET (data_retention_days = 30);
+ALTER TABLE marts.impressions RESET (data_retention_days);
+SELECT * FROM igloo.data_retention;
+```
 
 ## Query history
 

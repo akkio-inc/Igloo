@@ -238,3 +238,31 @@ func TestPostgresStore(t *testing.T) {
 	}
 	testStore(t, s)
 }
+
+func TestRetention(t *testing.T) {
+	var c Catalog
+	now := time.Now()
+	if NewSnapshot(0, c).Classified() {
+		t.Error("an empty catalog classifies nothing")
+	}
+	if err := c.SetRetention(DataRetention{Schema: "crm", Table: "people", Days: 30}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetRetention(DataRetention{Schema: "CRM", Table: "People", Days: 7}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetRetention(DataRetention{Schema: "crm", Table: "x", Days: -1}, now); !errors.Is(err, ErrInvalid) {
+		t.Errorf("negative days: %v", err)
+	}
+	snap := NewSnapshot(1, c)
+	rules := snap.Tagged("crm", "people")
+	if len(c.Retentions) != 1 || rules == nil || rules.Retention.Days != 7 || !snap.Classified() || !snap.Empty() {
+		t.Errorf("retention: %+v %+v", c.Retentions, rules)
+	}
+	if err := c.UnsetRetention("crm", "PEOPLE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UnsetRetention("crm", "people"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unset twice: %v", err)
+	}
+}

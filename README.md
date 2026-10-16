@@ -163,6 +163,21 @@ the official TPC-H answers.
   GRANT SELECT ON SCHEMA crm.public TO analysts;
   SELECT count(*) FROM audiences a JOIN crm.public.customers c ON c.email = a.email;
   ```
+- **[Erasure of personal data](docs/privacy.md)** for GDPR and CCPA
+  requests: one statement deletes a person's rows from every table whose
+  columns are tagged with their identifiers, hashed ones included, rewrites
+  the files that held them, expires the snapshots that still reference
+  them, deletes them from object storage and every replica's read cache,
+  redacts the query history and verifies that nothing is left, with a
+  record that shows it but not whose data it was. Data retentions limit how
+  long tables keep old versions of rows.
+
+  ```sql
+  GRANT ERASE ON ACCOUNT TO privacy_officer;
+  ERASE SUBJECT WHERE pii.email = 'ann@example.com' OR pii.device_id = '6F9619FF-8B86-D011-B42D-00C04FC964FF';
+  SELECT status, verification FROM igloo.erasure_requests;
+  ALTER TABLE marts.impressions SET (data_retention_days = 30);
+  ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days, with
   each statement's CPU time, bytes and memory.
@@ -335,6 +350,9 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   each user sees of tables' rows and columns
 - [Data catalog](docs/catalog.md): descriptions, owners, freshness, usage
   and lineage, and OpenLineage
+- [Erasing personal data](docs/privacy.md): GDPR and CCPA erasure
+  requests, the record they keep, data retention, and what they do not
+  reach
 - [Media analytics](docs/media-analytics.md): reach and frequency with
   sketches, geospatial reporting, approximate and statistical functions
 - [Workload management](docs/workload-management.md): query tags, usage and
@@ -395,6 +413,7 @@ cmd/igloo/          server entry point and subcommands
 internal/audit/     query and login history
 internal/auth/      users, roles, grants, SCRAM verifiers, access tokens
 internal/console/   web console
+internal/erasure/   erasure of people's data across the warehouse
 internal/scim/      SCIM 2.0 provisioning of users and groups
 internal/sso/       single sign-on with OpenID Connect
 internal/catalog/   catalog and warehouse setup
