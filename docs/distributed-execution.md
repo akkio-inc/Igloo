@@ -96,8 +96,15 @@ tables joined on different keys, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
 pending delete files (maintenance merges them within the hour), with
 nested columns or with data files that have no Iceberg field IDs (files
-added from outside and read through a name mapping), and views (name the
-tables they read to distribute them).
+added from outside and read through a name mapping), tables with
+[masking or row access policies](security-policies.md) and statements those
+policies rewrite (directly or through a view), views (name the tables they
+read to distribute them), [connections](federation.md)' tables and Delta
+Sharing's [external tables](sharing.md). Workers read table files
+directly and could not apply policies; a connection's table or an external
+table may still be read in the part of a statement the coordinator runs
+itself, such as a scalar subquery over a distributed part, but never on a
+worker.
 
 ### When
 
@@ -130,6 +137,18 @@ floating-point sums and averages can differ in their last digits, as they
 do in DuckDB on one machine between runs with different numbers of threads.
 Rows without `ORDER BY` come in no particular order, as on one machine.
 
+A statement reads each table at one snapshot, its current one when the
+statement's parts start, everywhere: workers read that snapshot's data
+files, and where the part the coordinator runs itself reads the same table
+again, it reads it at that snapshot too (`AT (VERSION => ...)`). Commits
+made meanwhile, by Igloo or by other engines through the
+[Iceberg REST catalog](external-engines.md), are not seen by either part,
+whether they add rows or delete files or change the schema. A table whose
+columns changed between planning and the start runs on one machine, as
+does a statement whose coordinator part reads a view, which could read a
+table at another snapshot. Tables may share files, as clones do: workers
+read the files the metadata lists, wherever they lie in the warehouse.
+
 If a worker fails or stops in the middle of a statement, its share runs on
 another worker. If no worker can run it, or the parts cannot be combined,
 the statement runs on the coordinator instead, so a client sees a slower
@@ -144,19 +163,28 @@ parts on the workers.
   user's role and grants before Igloo plans it, as always. Its parts read
   only the tables the statement reads, resolved the way DuckDB resolves
   them in the session; for users with role `none`, only tables the grant
-  check found and allowed. Workers have no catalog and no credentials of
-  their own beyond object storage: each task lists the data files to read,
-  and a worker refuses files outside the warehouse and
-  `IGLOO_ALLOWED_LOCATIONS`. Their DuckDB is locked down as the server's is:
-  no local files, no other locations, no SQL from strings.
+  check found and allowed, through their own grants or their roles'.
+  Workers have no catalog and no credentials of their own beyond object
+  storage: each task lists the data files to read, which Igloo took from
+  the tables' Iceberg metadata, never from a path a user wrote. A worker
+  refuses files outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`, and a
+  task whose SQL reads anything but the files it lists (a table function, a
+  table by name). Their DuckDB is locked down as the server's is: no local
+  files, no other locations, no SQL from strings.
+- **Policies keep a statement on one machine.** A statement that masking
+  or row access policies apply to, or that names anything they concern,
+  runs on the replica, where Igloo applies them. Workers never see a masked
+  column's raw values or a hidden row.
 - **Workers accept no one but Igloo.** Coordinators and workers talk TLS 1.3
   and authenticate each other with keys derived from `IGLOO_WORKER_SECRET`;
   without the secret, neither SQL users nor anything else on the network
   can connect to a worker's task port (7433) or pretend to be a worker.
   Treat the secret like the object storage keys: whoever holds it can make
-  workers read any table. The Helm chart generates it and lets only igloo
-  pods reach the task port; workers' port 8080 serves only health checks
-  and metrics, like the server's.
+  workers read any table. The task port is TLS only, on private networks
+  too. The Helm chart generates the secret and lets only the igloo pods of
+  the workers' own compute pool reach the task port; Docker Compose does
+  not publish it. Workers' port 8080 serves only health checks and metrics,
+  like the server's.
 - **What crosses the network.** Tasks carry the statement's SQL fragments
   and file lists; results carry aggregated or filtered rows, encrypted.
   Partial results live in the spill directories of the workers and the
@@ -218,12 +246,15 @@ workers:
 The chart adds a worker Deployment that starts at zero pods, a headless
 Service the igloo pods find workers through, a Role that lets the igloo pods
 change only that Deployment's replica count, a NetworkPolicy that admits
-only igloo pods to the task port, and the secret. Igloo scales the
+only igloo pods to the task port, and the secret. Each
+[compute pool](workload-management.md#compute-pools) gets the same of its
+own (`<release>-pool-<name>-workers`), used only by its igloo pods; a pool
+can set `workers` to size them differently, or `workers.enabled: false`. Igloo scales the
 Deployment up when a statement needs workers (never down while another
 replica uses them) and to zero after `workers.idleAfter` (10 minutes)
 without tasks; the cluster autoscaler or Karpenter then removes their
-nodes. With [scale to zero](scale-to-zero.md), the gateway stops the
-workers along with the igloo pods. See the
+nodes. With [scale to zero](scale-to-zero.md), a pool's gateway stops the
+pool's workers along with its igloo pods. See the
 [chart's README](../deploy/helm/igloo/README.md#distributed-execution).
 
 ### Docker Compose

@@ -341,13 +341,26 @@ reference for every setting mentioned here.
 - **Health and metrics.** Port 8080 (`/healthz`, `/readyz`, `/metrics`) has no
   authentication. Expose it only to your orchestrator and monitoring.
 - **Distributed execution.** [Workers](docs/distributed-execution.md#security)
-  run parts of statements that Igloo has already authorized; the parts read
-  only the data files of the tables the statement reads, and workers refuse
-  files outside the warehouse and allowed locations. Their DuckDB has the
-  server's sandbox and no catalog. Igloo and its workers talk TLS 1.3 on port
-  7433 and accept only each other, with keys derived from
-  `IGLOO_WORKER_SECRET`: protect it like the object storage keys, since a
-  holder can make workers read any table.
+  run parts of statements that Igloo has already authorized, grants of the
+  `none` role included. A part reads only the data files that Igloo listed
+  from the Iceberg metadata of the tables the statement reads, at the
+  snapshot the statement reads, never a path a user wrote: no part that
+  reads a table function, a view, a temporary table, a connection's table or
+  a Delta Sharing external table goes to workers, and a worker refuses a task
+  whose SQL reads anything but the files its task lists, and files outside
+  the warehouse and allowed locations. Statements that masking or row
+  access policies apply to, directly or through a view, run on one replica:
+  workers read table files and could not apply the policies. Workers' DuckDB
+  has the server's sandbox and no catalog, no users and no credentials but
+  object storage's. Igloo and its workers talk TLS 1.3 on port 7433 and
+  accept only each other: both derive one key from `IGLOO_WORKER_SECRET`
+  (HKDF-SHA256, Ed25519) and refuse a peer that does not prove it holds it
+  (compared in constant time); there is no plain-text mode, on private
+  networks either. Protect the secret like the object storage keys, since a
+  holder can make workers read any table's files. The task port is not
+  published in Docker Compose, and in Kubernetes a NetworkPolicy admits only
+  the igloo pods of the workers' own [compute pool](docs/workload-management.md#compute-pools);
+  workers' port 8080 serves health checks and metrics only, as above.
 - **Web console.** Port 8443 serves the [web console](docs/console.md). Users
   sign in with their Igloo password, checked against the same SCRAM verifier,
   with the same failed-login delay, limits and logging as SQL logins, or

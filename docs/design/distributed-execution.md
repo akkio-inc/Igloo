@@ -278,6 +278,19 @@ result's columns must match the prepared statement's, or it falls back.
   coordinator pinned. `TimeZone`, `Calendar`, collation, ordering and other
   settings that change results are sent with every task; a session that
   changed any other setting runs on one machine.
+- **One snapshot per table, everywhere.** When a statement's parts start,
+  the coordinator loads each table's current snapshot and lists that
+  snapshot's files for the workers. Where the part it runs itself reads
+  one of those tables again (a scalar subquery over the distributed part,
+  say), it pins that read to the same snapshot with `AT (VERSION => ...)`,
+  so a commit made while the workers run, by Igloo or by another engine
+  through the Iceberg REST catalog, adding rows or delete files or changing
+  the schema, is seen by neither part. A view in the coordinator's part
+  could read a table at another snapshot, so a statement with one is not
+  distributed; nor is a table whose columns changed since planning, or one
+  with snapshots but none yet (empty, it could be filled meanwhile). Data
+  files are listed from metadata, so files that several tables share, as
+  clones do, read like any others.
 - **Exact where one machine is exact.** Sums of integers and decimals,
   counts, minimums, maximums and distinct aggregates are exact.
   Floating-point sums and averages may differ in their last digits, as they
@@ -296,20 +309,38 @@ result's columns must match the prepared statement's, or it falls back.
   (a view, a temporary table, an ambiguous name) is not distributed. For
   users with role `none`, a table must be one the grant check found and
   allowed, or the part runs on one machine.
+- **Policies keep statements on one machine.** Masking and row access
+  policies are applied by rewriting statements, for the requesting user,
+  on the replica; workers read table files directly and know nothing of
+  the user. Rather than push the masked expressions, the row filters and
+  their mapping-table reads and `is_role_in_session` to the workers, a
+  statement that the rewriter changed, or that reads or names anything
+  policies concern, is not distributed, and the planner refuses a protected
+  table should a statement reach it anyway. Tested with masked columns
+  aggregated by `count(DISTINCT)`, `min` and `max` and a row-filtered table,
+  directly and through a view, over three workers: no raw value and no
+  hidden row's contribution comes back (`internal/pgwire`).
 - **Workers read only what tasks list.** Workers have no catalog and no
-  users. A task names data files, which must lie in the warehouse or the
-  allowed locations, and the worker's DuckDB has the server's sandbox:
-  `enable_external_access=false` with only the warehouse, the allowed
-  locations, its spill directory and its cache allowed, no extensions
-  loaded at run time.
+  users. A task names data files, which Igloo listed from Iceberg metadata
+  and which must lie in the warehouse or the allowed locations, and the
+  worker's DuckDB has the server's sandbox: `enable_external_access=false`
+  with only the warehouse, the allowed locations, its spill directory and
+  its cache allowed, no extensions loaded at run time. A worker parses a
+  task's SQL and refuses it unless it reads only the task's views: no table
+  function, no table by name. The planner never distributes a part that
+  reads a table function, a view, a temporary table, a connection's table
+  or an external table.
 - **No new endpoint is open.** Workers accept tasks only over TLS 1.3 with a
   client certificate whose key is derived (HKDF-SHA256, Ed25519) from
   `IGLOO_WORKER_SECRET`, and coordinators accept results only from servers
   proving the same key: no certificate authority to run, nothing to rotate
   but the secret. Port 8080 on workers serves only health and metrics, like
-  the server's. On Kubernetes a NetworkPolicy admits only igloo pods to the
-  task port, and the igloo pods' Kubernetes token may only change the
-  workers' replica count.
+  the server's. Unlike Igloo's other listeners, which serve plain text to
+  loopback or private networks when TLS is off, the task port is TLS only.
+  On Kubernetes a NetworkPolicy admits only the igloo pods of the workers'
+  compute pool to the task port, and the igloo pods' Kubernetes token may
+  only change workers' replica counts; Docker Compose does not publish the
+  port.
 
 ### Failures, cancellation and limits
 
@@ -324,6 +355,11 @@ result's columns must match the prepared statement's, or it falls back.
   statement's error, as on one machine.
 - Canceling the statement, or its `statement_timeout`, cancels the HTTP
   requests and so the workers' queries.
+- A distributed statement runs where any statement does, inside the
+  session's admission: it holds its role's statement slot and memory
+  reservation on the coordinator until it ends, and its timeout includes
+  the workers' time. Workers' memory is not reserved; statements on a
+  pool's workers share it, as on one replica.
 
 ### Worker lifecycle
 
@@ -337,6 +373,14 @@ each other) and stops them once this coordinator has not used them for
 `IGLOO_WORKER_IDLE_AFTER` and every worker reports as long without tasks.
 The drivers are the scale-to-zero gateway's (`internal/gateway`), and the
 gateway stops workers along with Igloo.
+
+Workers belong to one compute pool. Pools exist so that a client's queries
+do not compete with another's and its compute is billed to it; shared
+workers would undo both. So the chart gives each pool a worker Deployment
+of its own, which only its igloo pods reach (NetworkPolicy) and start, and
+which its gateway stops; the secret is shared, since the network policy,
+not the secret, separates pools. Docker Compose's example pool runs without
+workers.
 
 ## Partitioned joins
 
@@ -426,6 +470,14 @@ fractions are indicative only.
   the coordinator), cancellation and errors in the data; and, through the
   PostgreSQL protocol (`internal/pgwire`), grants, parameters and
   fallbacks.
+- **Governance, in process**: statements that policies apply to stay on
+  one machine (and returned workers' raw values when the check was taken
+  out); users of the `none` role read through grants of their own and of
+  custom roles, and nothing else; connections' tables and external tables
+  never reach workers; role limits hold a distributed statement's slot and
+  memory, and its timeout ends its tasks; the coordinator's own reads are
+  pinned to the workers' snapshot; workers refuse SQL over anything but
+  their views.
 - **In Docker** (`scripts/e2e-distributed.sh`): Igloo, Lakekeeper, MinIO and
   three workers; TPC-H at scale factor 0.1, six files per table. All 22
   queries return the same rows with and without workers, 13 of them run by
@@ -434,8 +486,10 @@ fractions are indicative only.
   mid-statement has its share rerun elsewhere and the statement returns
   the right rows; `statement_timeout` cancels a distributed statement
   (SQLSTATE 57014); tables that maintenance compacted (and so gave a name
-  mapping) still run on workers; and the worker port refuses clients
-  without the secret.
+  mapping) still run on workers; a statement keeps its snapshot while
+  another session deletes rows and adds a column; a table with masking and
+  row access policies runs on one replica; and the worker port
+  refuses clients without the secret.
 
 ### Overhead and scaling on one machine
 

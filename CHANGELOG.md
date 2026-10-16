@@ -187,6 +187,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   runs on another worker, and a statement that workers cannot run runs on
   the coordinator. Canceling a statement or its `statement_timeout` stops
   its parts.
+- Statements that masking or row access policies apply to, directly or
+  through a view, run on one replica, as do parts that read connections'
+  tables or Delta Sharing's external tables. Workers read only the files
+  Igloo lists from Iceberg metadata, and refuse tasks whose SQL reads
+  anything else; the part of a statement the coordinator runs itself reads
+  a table at the same snapshot as the workers.
+- Distributed statements count against their users' role limits and
+  timeouts like any other. Workers belong to one compute pool: the chart
+  gives each pool its own.
 - `igloo.query_history` has a `workers` column; `igloo_distributed_*` and
   `igloo_worker_*` metrics report statements, fallbacks, tasks and workers.
 
