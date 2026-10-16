@@ -70,11 +70,14 @@ conclusions, and record which prices a published report used.
 
 ## Reading the Igloo results
 
-- **First runs read from object storage.** The first run after Igloo
-  starts fetches every file from S3: on a c7g.4xlarge it took 31 to 59
-  seconds for the 22 queries, against 5.5 seconds once the files are
-  cached in memory. With scale to zero, every burst after a stop pays this,
-  and the report bills it.
+- **Igloo caches table files on local disk.** The first time a machine reads
+  a file from S3 it keeps a copy on its disk ([read cache](../docs/operations.md#read-cache)),
+  and the copy survives restarts. On a c7g.4xlarge with tables in S3, the
+  first run of the 22 queries after a scale-to-zero resume took about 8
+  seconds with the cache warm, against 37 to 59 seconds before Igloo had a
+  cache; repeat runs take 5.5 seconds either way. Results labeled
+  `S3, empty disk cache` are the first burst after a fresh install, which
+  still reads everything from S3.
 - **Repeat runs** are the same on S3 and on local disk, within a few
   percent.
 - `report.py` merges repeated results for the same platform, size, storage
