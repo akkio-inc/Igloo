@@ -35,12 +35,12 @@ import (
 // account for in this way is refused.
 
 // access is what a statement allowed by grants touches, and what any
-// non-admin's statement reads from connections (see external.go).
+// non-admin's statement reads from connections (see connreads.go).
 type access struct {
 	read    []auth.Object
 	written []auth.Object
-	// externalChecked is set once reads from connections were checked.
-	externalChecked bool
+	// connectionsChecked is set once reads from connections were checked.
+	connectionsChecked bool
 	// ranStatements says the checks ran statements on the session's
 	// connection, after which the statement is prepared again.
 	ranStatements bool
@@ -127,7 +127,7 @@ func (s *Server) authorizeByGrants(ctx context.Context, sess *session, user auth
 		if err != nil {
 			return nil, err
 		}
-		acc.read, acc.externalChecked = read, true
+		acc.read, acc.connectionsChecked = read, true
 		for _, o := range read {
 			needs = append(needs, need{auth.PrivilegeSelect, o})
 		}
@@ -566,16 +566,16 @@ func (s *Server) readTables(ctx context.Context, sess *session, st *statement, q
 		return nil, denied("cannot verify which tables this statement reads (the plan scans %d catalog tables, the statement names %d)",
 			scans.catalogTotal(), reads.scans)
 	}
-	if !sameScans(reads.extScans, scans.connections) {
+	if !sameScans(reads.connScans, scans.connections) {
 		return nil, denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
-			len(scans.connections), len(reads.extScans))
+			len(scans.connections), len(reads.connScans))
 	}
 	for _, named := range scans.named {
 		if !slices.ContainsFunc(slices.Concat(reads.tables, reads.policyTables), func(o auth.Object) bool { return o.Equal(named) }) {
 			return nil, denied("cannot verify which tables this statement reads (%s)", named)
 		}
 	}
-	return append(reads.tables, reads.extObjects...), nil
+	return append(reads.tables, reads.connObjects...), nil
 }
 
 // readTexts decides what to EXPLAIN for a statement's reads and what to
@@ -923,8 +923,8 @@ type planScans struct {
 	// analyzed, and refused if they call it, unless they are external
 	// tables' own.
 	external int
-	// connections are scans of connections' tables (see external.go).
-	connections []externalScan
+	// connections are scans of connections' tables (see connreads.go).
+	connections []connectionScan
 }
 
 // catalogTotal counts the scans that are not of connections' tables: of
@@ -976,7 +976,7 @@ func (s *Server) scansOf(ctx context.Context, sess *session, plan any, strict bo
 		return scans, err
 	}
 	catalogName, local := s.catalogName(), s.engine.LocalDatabase()
-	connections := len(s.externalCatalogs()) > 0
+	connections := len(s.connectionCatalogs()) > 0
 
 	var visit func(n any) error
 	visit = func(n any) error {
@@ -1010,11 +1010,11 @@ func (s *Server) scansOf(ctx context.Context, sess *session, plan any, strict bo
 				default:
 					return denied("reading tables of database %s needs the reader role", parts[0])
 				}
-			case externalScans[fn] != "":
+			case connectionScanNodes[fn] != "":
 				if table == "" {
 					return denied("cannot tell which table of a connection a scan reads")
 				}
-				scans.connections = append(scans.connections, externalScan{externalScans[fn], strings.ToLower(table)})
+				scans.connections = append(scans.connections, connectionScan{connectionScanNodes[fn], strings.ToLower(table)})
 			case hasTable && connections && isLeaf(n):
 				// A scan of some other kind of database (scans have no
 				// children; writes to a table do): it would have to be

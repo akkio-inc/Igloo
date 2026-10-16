@@ -344,7 +344,7 @@ func (rw *rewriter) rules(o object) *policy.TableRules {
 		return nil
 	case strings.EqualFold(o.db, rw.r.catalog):
 		return rw.snap.Rules(o.schema, o.name)
-	case rw.r.isExternal(o.db):
+	case rw.r.isConnection(o.db):
 		return rw.snap.ConnectionRules(strings.ToLower(o.db), o.schema, o.name)
 	}
 	return nil

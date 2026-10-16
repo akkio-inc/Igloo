@@ -394,7 +394,7 @@ func (s *Server) connectionHint(ctx context.Context, err error) error {
 		return err
 	}
 	name := strings.ToLower(m[1])
-	if _, attached := s.externalCatalogs()[name]; attached {
+	if _, attached := s.connectionCatalogs()[name]; attached {
 		return err
 	}
 	if exists, ferr := s.fed.Exists(ctx, name); ferr != nil || !exists {

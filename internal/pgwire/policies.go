@@ -749,7 +749,7 @@ func (s *Server) connectionPolicyTable(ctx context.Context, sess *session, name 
 		}
 		return conn, name[1], name[2], nil, nil
 	}
-	if _, attached := s.externalCatalogs()[conn]; !attached {
+	if _, attached := s.connectionCatalogs()[conn]; !attached {
 		known := false
 		if s.fed != nil {
 			var err error

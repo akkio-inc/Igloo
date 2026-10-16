@@ -36,19 +36,19 @@ import (
 // Iceberg tables. Admins' statements are not refused, but their reads are
 // worked out the same way, as far as possible, for the query history.
 
-// externalScans are DuckDB's names, lower-cased, for scans of the tables
+// connectionScanNodes are DuckDB's names, lower-cased, for scans of the tables
 // of attached databases, by the database type (duckdb_databases().type)
 // they read. A plan node that names a table and is none of these, nor a
 // scan of DuckDB's own tables or of Iceberg, is refused.
-var externalScans = map[string]string{"postgres_scan": "postgres", "mysql_scan": "mysql"}
+var connectionScanNodes = map[string]string{"postgres_scan": "postgres", "mysql_scan": "mysql"}
 
-// externalScan is a scan of a table of an attached database: its database
+// connectionScan is a scan of a table of an attached database: its database
 // type and its table's name, lower-cased.
-type externalScan struct{ kind, table string }
+type connectionScan struct{ kind, table string }
 
 // sameScans reports whether two lists hold the same scans, in any order.
-func sameScans(a, b []externalScan) bool {
-	key := func(s externalScan) string { return s.kind + "\x00" + s.table }
+func sameScans(a, b []connectionScan) bool {
+	key := func(s connectionScan) string { return s.kind + "\x00" + s.table }
 	ka, kb := make([]string, len(a)), make([]string, len(b))
 	for i, s := range a {
 		ka[i] = key(s)
@@ -69,10 +69,10 @@ type connectionSource interface {
 	Generation() uint64
 }
 
-// externalCatalogs returns the names, lower-cased, and types of the
+// connectionCatalogs returns the names, lower-cased, and types of the
 // attached databases that are not DuckDB's own or the Iceberg catalog: the
 // connections. It is empty without any.
-func (s *Server) externalCatalogs() map[string]string {
+func (s *Server) connectionCatalogs() map[string]string {
 	if s.remotes == nil {
 		return nil
 	}
@@ -83,13 +83,13 @@ func (s *Server) externalCatalogs() map[string]string {
 	return out
 }
 
-// isExternalType reports whether a database type from duckdb_databases()
+// isConnectionType reports whether a database type from duckdb_databases()
 // is another database's rather than DuckDB's own or Iceberg's.
-func isExternalType(t string) bool {
+func isConnectionType(t string) bool {
 	return t != "" && !strings.EqualFold(t, "duckdb") && !strings.EqualFold(t, "iceberg")
 }
 
-// authorizeExternal checks what a statement reads from connections, for
+// authorizeConnectionReads checks what a statement reads from connections, for
 // every user but admins, unless readTables already did. It checks the
 // statement as it runs, st.query, which policies may have rewritten. acc is
 // what the statement's other checks found, nil when its role allowed it.
@@ -102,9 +102,9 @@ func isExternalType(t string) bool {
 // view it reads is replaced, whatever its role. For admins it returns acc,
 // with their reads added for the history. On an error the caller keeps
 // what it had.
-func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth.User, st *statement, acc *access) (*access, error) {
+func (s *Server) authorizeConnectionReads(ctx context.Context, sess *session, user auth.User, st *statement, acc *access) (*access, error) {
 	admin := user.Role == auth.RoleAdmin
-	if len(s.externalCatalogs()) == 0 {
+	if len(s.connectionCatalogs()) == 0 {
 		// Nothing to read yet.
 		if admin || acc != nil {
 			return acc, nil
@@ -119,22 +119,22 @@ func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth
 		// connection cannot be attached again until Igloo restarts.
 		names := append(sqllex.CodeWords(st.query), sqllex.QuotedIdentifiers(st.query)...)
 		for _, q := range names {
-			if _, ok := s.externalCatalogs()[strings.ToLower(q)]; ok {
+			if _, ok := s.connectionCatalogs()[strings.ToLower(q)]; ok {
 				return nil, denied("%s is a connection; use DROP CONNECTION", strings.ToLower(q))
 			}
 		}
 	}
-	if acc != nil && acc.externalChecked {
+	if acc != nil && acc.connectionsChecked {
 		return acc, nil
 	}
 	if admin && viewQuery(st.query) != "" {
 		// Creating a view reads nothing; nor is it for the history.
 		return acc, nil
 	}
-	planText, parseText, err := externalTexts(st.stmtType, st.query, st.prepared)
+	planText, parseText, err := connectionTexts(st.stmtType, st.query, st.prepared)
 	var objects []auth.Object
 	if err == nil && planText != "" {
-		objects, err = s.externalReads(ctx, sess, planText, parseText, st.policyMarker())
+		objects, err = s.connectionReads(ctx, sess, planText, parseText, st.policyMarker())
 	}
 	if admin && (err != nil || len(objects) == 0) {
 		// Admins may read anything; what they read is only for the
@@ -150,7 +150,7 @@ func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth
 	} else {
 		out = access{checked: time.Now(), catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
 	}
-	out.externalChecked, out.ranStatements = true, out.ranStatements || planText != ""
+	out.connectionsChecked, out.ranStatements = true, out.ranStatements || planText != ""
 	out.read = append(slices.Clone(out.read), objects...)
 	if !admin {
 		privs, err := s.privileges(ctx, sess, user)
@@ -176,10 +176,10 @@ func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth
 // grants of whoever reads them; this keeps users from leaving views that
 // read what they themselves may not.
 func (s *Server) authorizeViewReads(ctx context.Context, sess *session, user auth.User, query string) error {
-	if user.Role == auth.RoleAdmin || len(s.externalCatalogs()) == 0 {
+	if user.Role == auth.RoleAdmin || len(s.connectionCatalogs()) == 0 {
 		return nil
 	}
-	objects, err := s.externalReads(ctx, sess, query, query, "")
+	objects, err := s.connectionReads(ctx, sess, query, query, "")
 	if err != nil || len(objects) == 0 {
 		return err
 	}
@@ -195,11 +195,11 @@ func (s *Server) authorizeViewReads(ctx context.Context, sess *session, user aut
 	return nil
 }
 
-// externalReads returns every object of a connection that reading
+// connectionReads returns every object of a connection that reading
 // planText, which DuckDB plans, and parseText, its query as written, may
 // read, or an error when that cannot be worked out. policyMarker marks the
 // tables that policies read in a statement they rewrote.
-func (s *Server) externalReads(ctx context.Context, sess *session, planText, parseText, policyMarker string) ([]auth.Object, error) {
+func (s *Server) connectionReads(ctx context.Context, sess *session, planText, parseText, policyMarker string) ([]auth.Object, error) {
 	plan, err := explainLogical(ctx, sess.conn, planText)
 	if err != nil {
 		return nil, denied("cannot analyze which tables of connections this statement reads: %v", err)
@@ -218,22 +218,22 @@ func (s *Server) externalReads(ctx context.Context, sess *session, planText, par
 	if err != nil {
 		return nil, err
 	}
-	r.external, r.policyMarker = true, policyMarker
+	r.connectionsOnly, r.policyMarker = true, policyMarker
 	reads, err := r.analyze(parseText, nil, 0)
 	if err != nil {
 		return nil, err
 	}
-	if !sameScans(reads.extScans, scans.connections) {
+	if !sameScans(reads.connScans, scans.connections) {
 		return nil, denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
-			len(scans.connections), len(reads.extScans))
+			len(scans.connections), len(reads.connScans))
 	}
-	return reads.extObjects, nil
+	return reads.connObjects, nil
 }
 
-// externalTexts decides what to EXPLAIN for a statement's reads and what to
+// connectionTexts decides what to EXPLAIN for a statement's reads and what to
 // parse for the tables it names, for users of any role. An empty planText
 // means the statement reads no table.
-func externalTexts(t duckdb.StmtType, query, prepared string) (planText, parseText string, err error) {
+func connectionTexts(t duckdb.StmtType, query, prepared string) (planText, parseText string, err error) {
 	switch t {
 	case duckdb.STATEMENT_TYPE_TRANSACTION, duckdb.STATEMENT_TYPE_DROP, duckdb.STATEMENT_TYPE_ALTER,
 		duckdb.STATEMENT_TYPE_PRAGMA, duckdb.STATEMENT_TYPE_ATTACH, duckdb.STATEMENT_TYPE_DETACH,
@@ -363,7 +363,7 @@ func isCopyFrom(query string) bool {
 // in it that is a connection, a table of one, a view that may read one or
 // a macro could. Such a PIVOT is refused; listing its columns works.
 func (s *Server) pivotReachesConnection(ctx context.Context, sess *session, query string) error {
-	ext := s.externalCatalogs()
+	ext := s.connectionCatalogs()
 	if len(ext) == 0 {
 		return nil
 	}
@@ -405,7 +405,7 @@ func (s *Server) pivotReachesConnection(ctx context.Context, sess *session, quer
 		for _, n := range fresh {
 			for _, o := range r.objects[n] {
 				switch {
-				case r.isExternal(o.db):
+				case r.isConnection(o.db):
 					return refused
 				case o.view && !o.internal:
 					if err := check(viewBody(o.sql), depth+1); err != nil {

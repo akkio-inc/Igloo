@@ -191,7 +191,7 @@ type Server struct {
 	// external tables.
 	shares   *sharing.Service
 	external externalCatalog
-	// fed keeps the connections to other databases (see external.go), and
+	// fed keeps the connections to other databases (see connreads.go), and
 	// remotes is what reads are checked against: fed, unless a test
 	// stands in for it.
 	fed     *federation.Manager
@@ -991,7 +991,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if err == nil {
 		// What it reads from connections, whatever the role, with a
 		// record that has it checked again when they change.
-		st.access, err = s.authorizeExternal(ctx, sess, user, st, st.access)
+		st.access, err = s.authorizeConnectionReads(ctx, sess, user, st, st.access)
 	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
@@ -1100,7 +1100,7 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 		}
 	}
 	// What it reads from connections, whatever the role.
-	if acc, err = s.authorizeExternal(ctx, sess, user, st, acc); err != nil {
+	if acc, err = s.authorizeConnectionReads(ctx, sess, user, st, acc); err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		return err
 	}

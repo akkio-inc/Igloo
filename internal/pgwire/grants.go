@@ -517,7 +517,7 @@ func (s *Server) connectionObjects(ctx context.Context, sess *session, kind stri
 		return nil, true, pgerror.WithCode(fmt.Errorf("name a table of connection %s with its schema, as in %s.public.%s", conn, conn, name[1]),
 			codes.Syntax)
 	}
-	_, attached := s.externalCatalogs()[conn]
+	_, attached := s.connectionCatalogs()[conn]
 	exact := func(query string, args ...any) (string, bool, error) {
 		if !attached {
 			return "", true, nil
