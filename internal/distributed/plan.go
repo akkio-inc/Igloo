@@ -55,7 +55,7 @@ type Column struct {
 	ID int `json:"id,omitempty"`
 }
 
-// Table is a catalog table at its current snapshot.
+// Table is a catalog table at one of its snapshots.
 type Table struct {
 	Schema, Name string
 	// Columns are the table's columns as DuckDB sees them, with their

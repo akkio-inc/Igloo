@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -73,8 +74,11 @@ func (p *parser) parse(query string) (node, error) {
 		return nil, fmt.Errorf("expected one statement, found %d", len(stmts))
 	}
 	stmt, _ := stmts[0].(node)
-	if len(list(stmt, "named_param_map")) > 0 {
-		return nil, unsupported("named parameters")
+	// $1 and ? are listed by number; $name parameters by name.
+	for _, e := range list(stmt, "named_param_map") {
+		if _, err := strconv.Atoi(str(e.(node)["key"])); err != nil {
+			return nil, unsupported("named parameters")
+		}
 	}
 	n, _ := stmt["node"].(node)
 	if n == nil {
@@ -316,9 +320,9 @@ func walk(v any, fn func(n node) bool) {
 	}
 }
 
-// rewrite replaces, bottom-up within each untouched subtree, every node for
-// which fn returns a replacement. fn sees nodes parents first; a node it
-// replaces is not descended into.
+// rewrite replaces every node under v for which fn returns a replacement,
+// in place, and returns v (or its replacement). fn sees parents before
+// children; a node it replaces is not descended into.
 func rewrite(v any, fn func(n node) (node, bool)) any {
 	switch t := v.(type) {
 	case node:

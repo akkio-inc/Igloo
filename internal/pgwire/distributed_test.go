@@ -247,8 +247,14 @@ func TestDistributedStatements(t *testing.T) {
 
 			// Parameters are bound where the combined result is computed.
 			var n int64
-			if err := conn.QueryRow(ctx, "SELECT count(*) FROM (SELECT amount FROM orders GROUP BY amount HAVING count(*) > $1)", 280).Scan(&n); err != nil || n != 7 {
+			having := "SELECT count(*) FROM (SELECT amount FROM orders GROUP BY amount HAVING count(*) > $1)"
+			if err := conn.QueryRow(ctx, having, 280).Scan(&n); err != nil || n != 7 {
 				t.Errorf("parameter in HAVING: %d, %v", n, err)
+			}
+			if mode != pgx.QueryExecModeSimpleProtocol {
+				if w := lastWorkers(t, ds.history, having); w != 2 {
+					t.Errorf("a statement with a parameter in HAVING ran on %d workers, want 2", w)
+				}
 			}
 
 			// Inside a transaction a statement runs here.

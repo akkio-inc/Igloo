@@ -309,8 +309,20 @@ func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
 }
 
 // Describe binds query on the session's connection.
+// Parameters are bound to NULL, as for the grant check's plans: the result
+// columns must match the statement's, which runFinal checks.
 func (e *sessionEnv) Describe(ctx context.Context, query string) ([]distributed.Column, error) {
-	rows, err := e.sess.conn.QueryContext(ctx, "DESCRIBE "+query, nil)
+	ds, err := e.sess.conn.PrepareContext(ctx, "DESCRIBE "+query)
+	if err != nil {
+		return nil, err
+	}
+	stmt := ds.(*duckdb.Stmt)
+	defer stmt.Close() //nolint:errcheck
+	args := make([]driver.NamedValue, stmt.NumInput())
+	for i := range args {
+		args[i] = driver.NamedValue{Ordinal: i + 1}
+	}
+	rows, err := stmt.QueryContext(ctx, args)
 	if err != nil {
 		return nil, err
 	}

@@ -209,6 +209,9 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	stmt, err := co.parser.parse(query)
 	if err != nil {
+		if IsUnsupported(err) {
+			return nil, err
+		}
 		return nil, unsupported("%v", err)
 	}
 	plan, err := newPlanner(ctx, env, co.parser, co.aggs, opts).plan(stmt)
