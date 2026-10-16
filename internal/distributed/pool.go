@@ -88,7 +88,13 @@ func newPool(opts PoolOptions, t *transport, version string, metrics *Metrics, l
 			TLSClientConfig:     t.client,
 			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     time.Minute,
-			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			// A task's response starts only when its result is ready, which
+			// may take a while. TCP keepalives, which the worker's kernel
+			// answers however busy the worker is, tell a worker that is
+			// working from one whose machine is gone, within half a minute.
+			DialContext: (&net.Dialer{Timeout: 5 * time.Second, KeepAliveConfig: net.KeepAliveConfig{
+				Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 3,
+			}}).DialContext,
 		}},
 		down:      map[string]time.Time{},
 		startTook: 30 * time.Second,

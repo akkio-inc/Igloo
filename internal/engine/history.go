@@ -212,7 +212,7 @@ func (s *historySource[T]) load() error {
 }
 
 type historyTypes struct {
-	varchar, timestamp, double, bigint, list, date duckdb.TypeInfo
+	varchar, timestamp, double, bigint, integer, list, date duckdb.TypeInfo
 }
 
 func newHistoryTypes() (historyTypes, error) {
@@ -231,6 +231,9 @@ func newHistoryTypes() (historyTypes, error) {
 		return t, err
 	}
 	if t.date, err = duckdb.NewTypeInfo(duckdb.TYPE_DATE); err != nil {
+		return t, err
+	}
+	if t.integer, err = duckdb.NewTypeInfo(duckdb.TYPE_INTEGER); err != nil {
 		return t, err
 	}
 	t.list, err = duckdb.NewListInfo(t.varchar)
@@ -264,6 +267,7 @@ func (t historyTypes) queryColumns() []duckdb.ColumnInfo {
 		{Name: "memory_allocated_bytes", T: t.bigint},
 		{Name: "locations_read", T: t.list},
 		{Name: "job", T: t.varchar},
+		{Name: "workers", T: t.integer},
 	}
 }
 
@@ -281,7 +285,7 @@ func queryValues(q audit.Query) []any {
 		millis(q.Duration), q.Outcome, nullString(q.SQLState), rows, q.StatementType, q.Text,
 		nullList(q.TablesRead), nullList(q.TablesWritten), nullString(q.ClientAddress), nullString(q.ApplicationName),
 		nullList(q.Policies), nullString(q.QueryTag), nullString(q.Pool), millis(q.Queued), cpu, read, memory,
-		nullList(q.LocationsRead), nullString(q.Job)}
+		nullList(q.LocationsRead), nullString(q.Job), int32(q.Workers)}
 }
 
 func millis(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }

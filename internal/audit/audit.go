@@ -72,6 +72,9 @@ type Query struct {
 	// Job is the task, pipe or materialized view the statement ran for,
 	// such as "task nightly"; empty for a session's own statements.
 	Job string
+	// Workers is how many workers ran parts of the statement; 0 when it ran
+	// on one replica alone.
+	Workers int
 }
 
 // Resources is what DuckDB's profiler measured while a statement ran.

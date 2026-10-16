@@ -99,6 +99,10 @@ func knownSetting(name string) bool {
 	return slices.ContainsFunc(SettingNames, func(s string) bool { return strings.EqualFold(s, name) })
 }
 
+// DataError reports whether err is an error in the data a statement
+// computes on, which it would have raised on one machine too.
+func DataError(err error) bool { return dataError(err) }
+
 // dataError reports whether a DuckDB error came from the values a fragment
 // computes on (a failed cast, a division by zero), which a single machine
 // would have raised as well, rather than from reading files.

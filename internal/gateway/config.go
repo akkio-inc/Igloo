@@ -40,8 +40,11 @@ type Config struct {
 	K8sNamespace   string
 	K8sDeployment  string
 	K8sReplicas    int
-	StartCommand   string
-	StopCommand    string
+	// K8sWorkerDeployment, if set, is a Deployment of distributed-execution
+	// workers to stop along with Igloo.
+	K8sWorkerDeployment string
+	StartCommand        string
+	StopCommand         string
 }
 
 // LoadConfig reads the configuration using lookup, normally os.LookupEnv.
@@ -53,14 +56,15 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 		return fallback
 	}
 	cfg := Config{
-		ListenAddr:    get("IGLOO_GATEWAY_LISTEN_ADDR", ":5432"),
-		HTTPAddr:      get("IGLOO_GATEWAY_HTTP_ADDR", ":8080"),
-		Backend:       get("IGLOO_GATEWAY_BACKEND", ""),
-		Compute:       get("IGLOO_GATEWAY_COMPUTE", ""),
-		K8sNamespace:  get("IGLOO_GATEWAY_K8S_NAMESPACE", ""),
-		K8sDeployment: get("IGLOO_GATEWAY_K8S_DEPLOYMENT", ""),
-		StartCommand:  get("IGLOO_GATEWAY_START_COMMAND", ""),
-		StopCommand:   get("IGLOO_GATEWAY_STOP_COMMAND", ""),
+		ListenAddr:          get("IGLOO_GATEWAY_LISTEN_ADDR", ":5432"),
+		HTTPAddr:            get("IGLOO_GATEWAY_HTTP_ADDR", ":8080"),
+		Backend:             get("IGLOO_GATEWAY_BACKEND", ""),
+		Compute:             get("IGLOO_GATEWAY_COMPUTE", ""),
+		K8sNamespace:        get("IGLOO_GATEWAY_K8S_NAMESPACE", ""),
+		K8sDeployment:       get("IGLOO_GATEWAY_K8S_DEPLOYMENT", ""),
+		K8sWorkerDeployment: get("IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT", ""),
+		StartCommand:        get("IGLOO_GATEWAY_START_COMMAND", ""),
+		StopCommand:         get("IGLOO_GATEWAY_STOP_COMMAND", ""),
 	}
 
 	var errs []error
@@ -153,7 +157,15 @@ func NewCompute(ctx context.Context, cfg Config) (Compute, error) {
 	case "ec2":
 		return NewEC2(ctx, cfg.EC2InstanceIDs)
 	case "kubernetes":
-		return NewKubernetes(cfg.K8sNamespace, cfg.K8sDeployment, cfg.K8sReplicas)
+		k, err := NewKubernetes(cfg.K8sNamespace, cfg.K8sDeployment, cfg.K8sReplicas)
+		if err != nil || cfg.K8sWorkerDeployment == "" {
+			return k, err
+		}
+		workers, err := NewKubernetes(cfg.K8sNamespace, cfg.K8sWorkerDeployment, 0)
+		if err != nil {
+			return nil, err
+		}
+		return AlsoStops{Compute: k, Others: []Compute{workers}}, nil
 	case "command":
 		return Command{StartCommand: cfg.StartCommand, StopCommand: cfg.StopCommand}, nil
 	}

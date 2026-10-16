@@ -153,6 +153,14 @@ func (co *Coordinator) Close() error {
 	return co.parser.close()
 }
 
+// Table returns a catalog table at its current snapshot.
+func (co *Coordinator) Table(ctx context.Context, schema, name string) (*Table, error) {
+	return co.opts.Source.Table(ctx, schema, name)
+}
+
+// Metrics returns the coordinator's metrics, which may be nil.
+func (co *Coordinator) Metrics() *Metrics { return co.opts.Metrics }
+
 // Workers returns the number of workers that answered the last check.
 func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.ready(ctx)) }
 
@@ -303,8 +311,12 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		})
 	}
 	if err := g.Wait(); err != nil {
-		if ctx.Err() != nil {
+		switch {
+		case ctx.Err() != nil:
+			co.opts.Metrics.query("canceled", start)
 			return nil, ctx.Err()
+		case dataError(err):
+			co.opts.Metrics.query("error", start)
 		}
 		return nil, err
 	}

@@ -10,6 +10,7 @@
 //	igloo healthcheck               exit 0 if the server is up (for containers)
 //	igloo install-extensions <dir>  download DuckDB extensions into dir
 //	igloo gateway                   run the scale-to-zero gateway (docs/scale-to-zero.md)
+//	igloo worker                    run a distributed-execution worker (docs/distributed-execution.md)
 package main
 
 import (
@@ -35,6 +36,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
@@ -69,6 +71,8 @@ func main() {
 		err = healthcheck()
 	case len(os.Args) > 1 && os.Args[1] == "gateway":
 		err = serveGateway()
+	case len(os.Args) > 1 && os.Args[1] == "worker":
+		err = serveWorker()
 	case len(os.Args) > 1 && os.Args[1] == "install-extensions":
 		if len(os.Args) != 3 {
 			err = errors.New("usage: igloo install-extensions <dir>")
@@ -269,6 +273,18 @@ func serve() error {
 		}()
 	}
 
+	// Statements that read large tables run in parts on workers.
+	var dist *distributed.Coordinator
+	if len(cfg.Workers.Addresses) > 0 {
+		if cat == nil {
+			return errors.New("IGLOO_WORKERS needs IGLOO_CATALOG_URI")
+		}
+		if dist, err = newCoordinator(ctx, cfg, distributed.NewIceberg(cat), eng, reg, log); err != nil {
+			return err
+		}
+		defer dist.Close() //nolint:errcheck
+	}
+
 	// srv is set before it serves anyone; single sign-on tells it about
 	// role changes, and the long query alert asks it what runs.
 	var srv *pgwire.Server
@@ -318,6 +334,7 @@ func serve() error {
 		Notify:              notifier,
 		Clones:              clones,
 		Lineage:             lineage,
+		Distributed:         dist,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single

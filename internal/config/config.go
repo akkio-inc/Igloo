@@ -86,6 +86,8 @@ type Config struct {
 	TokenMaxLifetime time.Duration
 	// Notifications configures alerts' destinations (see notify.go).
 	Notifications Notifications
+	// Workers configures distributed execution (see workers.go).
+	Workers Workers
 }
 
 // Audit controls the query and login history.
@@ -493,6 +495,11 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		default:
 			cfg.SharingURL = u.String() + "/delta-sharing"
 		}
+	}
+
+	cfg.Workers = loadWorkers(lookup, &errs)
+	if len(cfg.Workers.Addresses) > 0 && cfg.DuckDB.TempDir == "" {
+		addErr("IGLOO_WORKERS needs IGLOO_DUCKDB_TEMP_DIR, where partial results are kept")
 	}
 
 	if cfg.Catalog.URI != "" {

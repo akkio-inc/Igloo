@@ -69,6 +69,8 @@ type queryRecord struct {
 	// it waited for its user's limits.
 	used   *audit.Resources
 	queued time.Duration
+	// workers is how many workers ran parts of the statement.
+	workers int
 }
 
 // recordQuery sends a statement to the history.
@@ -93,6 +95,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Pool:            s.pool,
 		Queued:          r.queued,
 		Resources:       r.used,
+		Workers:         r.workers,
 	}
 	if r.err != nil && q.Outcome != audit.OutcomeOK {
 		q.SQLState = string(pgerror.GetCode(pgError(r.err)))

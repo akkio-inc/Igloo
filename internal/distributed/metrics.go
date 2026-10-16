@@ -24,7 +24,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		queries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_distributed_queries_total",
-			Help: "Statements run on workers, by outcome: ok, error, canceled or fallback (ran on this replica instead).",
+			Help: "Statements whose parts ran on workers, by outcome: ok, error (in the data), canceled, or fallback (ran on this replica instead).",
 		}, []string{"outcome"}),
 		fallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_distributed_fallbacks_total",

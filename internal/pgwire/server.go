@@ -32,6 +32,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/notify"
@@ -151,6 +152,10 @@ type Options struct {
 	// (see catalog.go).
 	Lineage LineageSink
 
+	// Distributed, if set, runs statements that read large tables in
+	// parts on workers (docs/distributed-execution.md).
+	Distributed *distributed.Coordinator
+
 	// external and externalFiles stand in for Sharing's external tables
 	// and the prefix of their files, in tests.
 	external      externalCatalog
@@ -221,6 +226,7 @@ type Server struct {
 	// stands in for it.
 	fed     *federation.Manager
 	remotes connectionSource
+	dist    *distributed.Coordinator
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -284,6 +290,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		fed:         opts.Federation,
 		notify:      opts.Notify,
 		clones:      opts.Clones,
+		dist:        opts.Distributed,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -466,6 +473,8 @@ type session struct {
 	// protect.go).
 	sens     *sensitivity
 	settings *settingsCheck
+	// distMode is the session's distributed_execution; empty means auto.
+	distMode distributed.Mode
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -741,6 +750,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if stmt, ok := s.queryTagCommand(sess, q.Query); ok {
 		return stmt, nil
 	}
+	if stmt, ok := s.distributedCommand(sess, q.Query); ok {
+		return stmt, nil
+	}
 
 	// psycopg sends this after DDL to drop its prepared statements; DuckDB
 	// has no DEALLOCATE ALL.
@@ -871,7 +883,13 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
 			return err
 		}
+		workers := 0
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
+			n, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
+			if done {
+				workers = n
+				return err
+			}
 			return runWithCommitRetry(ctx, sess, st, func() error {
 				return sess.profiled(ctx, st, func() error { return st.run(ctx, args, tw) })
 			})
@@ -910,7 +928,7 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			}
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
-			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType})
+			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, workers: workers})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
