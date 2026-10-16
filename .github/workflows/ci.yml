@@ -68,11 +68,12 @@ jobs:
             exit 1
           fi
 
+      # duckdb_arrow builds DuckDB's Arrow results, for Arrow Flight SQL.
       - name: Vet
-        run: go vet ./...
+        run: go vet -tags duckdb_arrow ./...
 
       - name: Test
-        run: go test ./...
+        run: go test -tags duckdb_arrow ./...
 
   image:
     name: Image (${{ matrix.arch }})

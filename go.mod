@@ -150,3 +150,6 @@ replace github.com/jeroenrinzema/psql-wire => ./third_party/psql-wire
 
 // A patched copy; see third_party/iceberg-go/IGLOO_PATCHES.md.
 replace github.com/apache/iceberg-go => ./third_party/iceberg-go
+
+// A patched copy; see third_party/duckdb-go/IGLOO_PATCHES.md.
+replace github.com/duckdb/duckdb-go/v2 => ./third_party/duckdb-go

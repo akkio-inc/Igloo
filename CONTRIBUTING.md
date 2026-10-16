@@ -32,11 +32,13 @@ its tools in containers.
 
 For faster iteration, install Go 1.27 and a C compiler (gcc or clang). Igloo
 embeds DuckDB through cgo, so `CGO_ENABLED` must be `1` (the default when a C
-compiler is installed).
+compiler is installed). The `duckdb_arrow` build tag builds DuckDB's Arrow
+results, which the Arrow Flight SQL endpoint streams; every build needs it
+(set `GOFLAGS=-tags=duckdb_arrow` for your editor).
 
 ```sh
-go test ./...
-go vet ./...
+go test -tags duckdb_arrow ./...
+go vet -tags duckdb_arrow ./...
 gofmt -l cmd internal    # must print nothing
 ```
 
@@ -71,7 +73,7 @@ scripts/                 helper scripts, including the end-to-end test
 
 ## Conventions
 
-- **Formatting.** Code is formatted with gofmt and `go vet ./...` is clean.
+- **Formatting.** Code is formatted with gofmt and `go vet -tags duckdb_arrow ./...` is clean.
 - **Comments explain why.** Say what constraint, trade-off or past bug the code
   is shaped by, not what the next line does. Exported identifiers get doc
   comments.

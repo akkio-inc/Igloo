@@ -9,8 +9,9 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 ARG VERSION=dev
 COPY . .
+# duckdb_arrow: DuckDB's Arrow results, for Arrow Flight SQL.
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/igloo ./cmd/igloo
+    go build -tags duckdb_arrow -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/igloo ./cmd/igloo
 
 # Bake DuckDB's extensions into the image so the server never downloads code
 # at runtime.
@@ -37,7 +38,7 @@ ENV IGLOO_DUCKDB_EXTENSION_DIR=/usr/local/share/igloo/extensions \
 # directory itself is not writable either (see internal/engine).
 COPY --from=build /out/empty /data
 WORKDIR /
-EXPOSE 5432 8080 8443
+EXPOSE 5432 8080 8443 31337
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
     CMD ["/usr/local/bin/igloo", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/igloo"]

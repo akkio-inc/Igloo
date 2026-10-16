@@ -14,7 +14,7 @@ test: ## Run the Go tests (starts a throwaway Postgres)
 
 lint: ## Check formatting and run go vet
 	docker run --rm -v "$(CURDIR)":/src -v igloo-go-mod:/go/pkg/mod -w /src $(GO_IMAGE) \
-		sh -c 'test -z "$$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }; go vet ./...'
+		sh -c 'test -z "$$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }; go vet -tags duckdb_arrow ./...'
 
 e2e: ## Run the end-to-end test against an isolated copy of the stack
 	scripts/e2e.sh

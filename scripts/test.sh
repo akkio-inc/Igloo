@@ -22,4 +22,4 @@ until docker exec "$name-db" pg_isready -U postgres >/dev/null 2>&1; do sleep 1;
 docker run --rm --network "$name" \
   -e IGLOO_TEST_DATABASE_URL="postgres://postgres:test@$name-db:5432/postgres" \
   -v "$root":/src -v igloo-go-mod:/go/pkg/mod -v igloo-go-build:/root/.cache/go-build \
-  -w /src "$go_image" go test "${@:-./...}"
+  -w /src "$go_image" go test -tags duckdb_arrow "${@:-./...}"
