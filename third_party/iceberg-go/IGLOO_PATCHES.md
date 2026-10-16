@@ -86,6 +86,15 @@ branches and tags:
   Maintenance passes that property, which iceberg-go itself reads under
   another name.
 
+One addition serves the erasure of a person's data (`internal/erasure`):
+
+- `table/igloo_forget_files.go` (new): `Transaction.ForgetFiles` commits a
+  snapshot of the same data whose manifests no longer mention given files.
+  A removed file stays in its manifest as a DELETED entry, with column
+  bounds that can hold the very values erased, and iceberg-go carries such
+  manifests into every later snapshot. Java Iceberg has no such operation
+  either; `RewriteManifests` comes closest.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
-DuckDB-written tables, lets callers choose these Parquet writer defaults and
-no longer needs an MPL-licensed dependency.
+DuckDB-written tables, lets callers choose these Parquet writer defaults,
+no longer needs an MPL-licensed dependency and can rewrite manifests.
