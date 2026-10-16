@@ -7,6 +7,11 @@
 // After a period without client traffic or running work, it stops the
 // compute again.
 //
+// Igloo also reports when scheduled work (tasks, pipes, materialized
+// views) is next due. The gateway keeps Igloo running when that is sooner
+// than it would stop it for, and otherwise starts the compute again in
+// time for the work: so schedules run while nobody is connected.
+//
 // Stopping closes open sessions, as a database restart would; clients
 // reconnect, and their next connection starts the compute.
 package gateway
@@ -97,6 +102,14 @@ type Gateway struct {
 	state   state
 	waking  *wake
 	clients map[net.Conn]struct{}
+	// due is when Igloo last said scheduled work is next due; zero when
+	// none is, or the gateway does not know. dueKnown says whether it
+	// knows.
+	due      time.Time
+	dueKnown bool
+	// lastStart is how long the last start of the compute took, by which
+	// starts for scheduled work come early.
+	lastStart time.Duration
 }
 
 // New returns a gateway; call Serve to accept connections.
@@ -114,13 +127,15 @@ func New(opts Options) *Gateway {
 	return g
 }
 
-// Serve accepts SQL client connections on ln, and stops idle compute, until
-// ctx is done. It closes ln and every open connection before returning.
+// Serve accepts SQL client connections on ln, stops idle compute and
+// starts it for scheduled work, until ctx is done. It closes ln and every
+// open connection before returning.
 func (g *Gateway) Serve(ctx context.Context, ln net.Listener) error {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		g.learnSchedule(ctx)
 		g.suspendWhenIdle(ctx)
 	}()
 	defer func() {
@@ -265,6 +280,7 @@ func (g *Gateway) start(w *wake) {
 	g.mu.Lock()
 	if err == nil {
 		g.state = stateRunning
+		g.lastStart = elapsed
 		g.touch()
 	} else {
 		g.state = stateUnknown
@@ -300,8 +316,51 @@ func (g *Gateway) waitReady(ctx context.Context) error {
 	}
 }
 
+// learnSchedule asks Igloo, when the gateway starts, when scheduled work
+// is next due. If Igloo cannot be asked, it is presumably stopped, and the
+// gateway has no way to know when to start it for its schedules; it
+// starts it now, to find out the next time it stops it.
+func (g *Gateway) learnSchedule(ctx context.Context) {
+	if g.opts.ActivityURL == "" {
+		return
+	}
+	if _, _, err := g.busy(ctx); err == nil || ctx.Err() != nil {
+		return
+	}
+	g.opts.Log.Info("starting igloo to learn when its scheduled work is due")
+	if err := g.wake(ctx); err != nil && ctx.Err() == nil {
+		g.opts.Log.Error("could not start igloo", "err", err)
+	}
+}
+
+// startForSchedule starts the stopped compute when scheduled work is due,
+// early by as long as the last start took, so that the work starts about
+// on time.
+func (g *Gateway) startForSchedule(ctx context.Context) {
+	g.mu.Lock()
+	st, due, known, early := g.state, g.due, g.dueKnown, g.lastStart
+	g.mu.Unlock()
+	if st == stateRunning || st == stateStarting || !known || due.IsZero() || time.Until(due) > early {
+		return
+	}
+	g.opts.Log.Info("starting igloo for scheduled work", "due", due.UTC().Format(time.RFC3339))
+	// The work is underway once Igloo runs; the next due time comes from
+	// Igloo the next time it stops.
+	g.setDue(time.Time{}, false)
+	if err := g.wake(ctx); err != nil && ctx.Err() == nil {
+		g.opts.Log.Error("could not start igloo for scheduled work", "err", err)
+	}
+}
+
+func (g *Gateway) setDue(due time.Time, known bool) {
+	g.mu.Lock()
+	g.due, g.dueKnown = due, known
+	g.mu.Unlock()
+	g.opts.Metrics.setNextDue(due)
+}
+
 // suspendWhenIdle stops the compute after SuspendAfter without client
-// traffic or running work.
+// traffic or running work, and starts it when scheduled work is due.
 func (g *Gateway) suspendWhenIdle(ctx context.Context) {
 	interval := min(g.opts.SuspendAfter/4, 10*time.Second)
 	if interval <= 0 {
@@ -318,6 +377,7 @@ func (g *Gateway) suspendWhenIdle(ctx context.Context) {
 		if err := g.suspendIfIdle(ctx); err != nil {
 			g.opts.Log.Error("could not stop igloo", "err", err)
 		}
+		g.startForSchedule(ctx)
 	}
 }
 
@@ -329,12 +389,17 @@ func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 		return nil
 	}
 	if g.opts.ActivityURL != "" {
-		busy, err := g.busy(ctx)
+		busy, asked, err := g.busy(ctx)
 		if err != nil {
 			g.opts.Log.Debug("could not read igloo activity", "err", err)
 		}
 		if busy {
 			return nil
+		}
+		if !asked {
+			// Without an answer the next due time may be stale; forget it
+			// rather than start Igloo for work that is not due.
+			g.setDue(time.Time{}, false)
 		}
 	}
 
@@ -393,21 +458,28 @@ func (g *Gateway) waitDown(ctx context.Context) error {
 type activityReport struct {
 	Running     int64   `json:"running"`
 	IdleSeconds float64 `json:"idle_seconds"`
+	// NextDue is when scheduled work is next due, if any is scheduled.
+	NextDue *time.Time `json:"next_due"`
 }
 
-// busy asks every Igloo replica behind ActivityURL whether it is working
-// or worked within SuspendAfter. A replica that cannot be asked is taken to
-// be idle: it is down, or it is not serving clients.
-func (g *Gateway) busy(ctx context.Context) (bool, error) {
+// busy asks every Igloo replica behind ActivityURL whether it is working,
+// worked within SuspendAfter, or has scheduled work due within it, and
+// remembers when that work is due. A replica that cannot be asked is
+// taken to be idle: it is down, or it is not serving clients. asked says
+// whether any replica answered.
+func (g *Gateway) busy(ctx context.Context) (busy, asked bool, err error) {
 	u, err := url.Parse(g.opts.ActivityURL)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	addrs, err := net.DefaultResolver.LookupHost(ctx, u.Hostname())
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	var errs []error
+	var (
+		errs []error
+		due  time.Time
+	)
 	for _, addr := range addrs {
 		target := *u
 		target.Host = net.JoinHostPort(addr, u.Port())
@@ -419,11 +491,24 @@ func (g *Gateway) busy(ctx context.Context) (bool, error) {
 			errs = append(errs, err)
 			continue
 		}
+		asked = true
+		if report.NextDue != nil && (due.IsZero() || report.NextDue.Before(due)) {
+			due = *report.NextDue
+		}
 		if report.Running > 0 || report.IdleSeconds < g.opts.SuspendAfter.Seconds() {
-			return true, nil
+			busy = true
 		}
 	}
-	return false, errors.Join(errs...)
+	if asked {
+		g.setDue(due, true)
+		// Work due before Igloo would be stopped anyway keeps it up:
+		// stopping and starting again would save little and close
+		// sessions.
+		if !due.IsZero() && time.Until(due) < g.opts.SuspendAfter {
+			busy = true
+		}
+	}
+	return busy, asked, errors.Join(errs...)
 }
 
 func (g *Gateway) activity(ctx context.Context, u string) (activityReport, error) {

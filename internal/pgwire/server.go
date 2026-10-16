@@ -31,6 +31,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/sqllex"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // Engine runs queries; *engine.Engine implements it.
@@ -76,6 +77,10 @@ type Options struct {
 	// Catalog is the name in SQL of the catalog grants apply to. Empty
 	// means the engine's Iceberg catalog.
 	Catalog string
+	// Tasks keeps tasks, pipes, materialized views and the load history,
+	// and runs them. Nil means a store in memory, whose jobs only run when
+	// asked to.
+	Tasks *tasks.Scheduler
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -107,6 +112,7 @@ type Server struct {
 	grants      auth.GrantStore
 	audit       *audit.Log
 	catalog     string
+	tasks       *tasks.Scheduler
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -141,7 +147,11 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		grants:      opts.Grants,
 		audit:       opts.Audit,
 		catalog:     opts.Catalog,
+		tasks:       opts.Tasks,
 		mockSecret:  mockSecret,
+	}
+	if s.tasks == nil {
+		s.tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{Log: log})
 	}
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
@@ -504,6 +514,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return stmts, nil
 	}
 
+	if ps, ok, err := s.loadingCommand(sess, q.Query); ok || err != nil {
+		return ps, err
+	}
+
 	if ps, ok, err := s.catalogDDL(ctx, sess, user, q.Query); ok || err != nil {
 		return ps, err
 	}
@@ -580,10 +594,20 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 // and statements that fail here are recorded in the history.
 func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
 	start := time.Now()
-	fail := func(err error) (*statement, error) {
+	st, err := s.prepareChecked(ctx, sess, user, text, oids)
+	if err != nil {
+		if pgerror.GetCode(err) == codes.InsufficientPrivilege {
+			s.metrics.query(time.Now(), err)
+		}
 		s.recordQuery(sess, queryRecord{text: text, start: start, err: err, rows: -1})
 		return nil, err
 	}
+	return st, nil
+}
+
+// rewrite points the names in text that Igloo serves itself (PostgreSQL's
+// catalog, the history views, the catalog's views) at where they are.
+func (s *Server) rewrite(ctx context.Context, user auth.User, text string) string {
 	query := rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(text), user.Name), s.engine.LocalDatabase())
 	if s.ddl != nil {
 		query = s.ddl.RewriteViewRefs(query)
@@ -593,11 +617,20 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 			}
 		}
 	}
+	return query
+}
+
+// prepareChecked is prepareStatement without recording failures, for the
+// statements Igloo runs for a user to carry out one of its own commands
+// (COPY INTO, materialized views): they are checked exactly like the
+// user's own.
+func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
+	fail := func(err error) (*statement, error) { return nil, err }
+	query := s.rewrite(ctx, user, text)
 
 	// Preparing runs all but the last of several statements, so this
 	// comes first.
 	if err := forbidden(query); err != nil {
-		s.metrics.query(time.Now(), err)
 		return fail(err)
 	}
 
@@ -614,7 +647,6 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		}
 		if n > 1 {
 			if err := multipleStatements(user.Role, query); err != nil {
-				s.metrics.query(time.Now(), errDenied)
 				return fail(err)
 			}
 			pivot = true
@@ -660,7 +692,6 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
-		s.metrics.query(time.Now(), err)
 		_ = st.close()
 		return fail(err)
 	}

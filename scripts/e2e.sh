@@ -46,6 +46,9 @@ sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*
 # Maintain tables every few seconds, so the maintenance checks need not wait
 # an hour.
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
+# A landing area in the bundled object store, for COPY INTO and pipes.
+landing="s3://$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)/landing"
+sed -i.bak -e "s#^IGLOO_ALLOWED_LOCATIONS=.*#IGLOO_ALLOWED_LOCATIONS=$landing/#" "$env_file"
 admin_password="$(grep '^IGLOO_ADMIN_PASSWORD=' "$env_file" | cut -d= -f2)"
 
 echo "starting the stack"
@@ -349,6 +352,60 @@ expect "maintenance keeps every row" "5|v1v2v4v5v6" igloo "$admin_password" \
 expect "writes after compaction" "6" igloo "$admin_password" \
   "INSERT INTO fragmented VALUES (7, 'v7', 7.25); SELECT count(*) FROM fragmented"
 
+echo "loading, tasks, pipes and materialized views"
+# Drops arrive as files in the landing area; the admin writes them there.
+psql_admin -c "COPY (SELECT range AS id, 'item ' || range AS name, range * 1.5 AS amount FROM range(1, 4))
+  TO '$landing/drops/2026-10-01.csv.gz' (FORMAT csv, HEADER true)" >/dev/null
+psql_admin -c "COPY (SELECT range AS id, 'item ' || range AS name, range * 1.5 AS amount FROM range(4, 6))
+  TO '$landing/drops/2026-10-02.csv.gz' (FORMAT csv, HEADER true)" >/dev/null
+psql_admin -c "COPY (SELECT 99 AS id) TO '$landing/drops/readme.parquet' (FORMAT parquet)" >/dev/null
+psql_as walt walt-password-1 -c "CREATE TABLE e2e_sales (id INTEGER, name VARCHAR, amount DECIMAL(10,2))" >/dev/null
+load="COPY INTO e2e_sales FROM '$landing/drops/' (PATTERN '.*[.]csv[.]gz')"
+got="$(psql_as walt walt-password-1 -c "$load")" || true
+if [ "$(grep -c '[.]csv[.]gz|loaded|[23]|0|$' <<<"$got")" = 2 ]; then pass "COPY INTO loads the matching files"; else fail "COPY INTO: $got"; fi
+got="$(psql_as walt walt-password-1 -c "$load")" || true
+if [ -z "$got" ]; then pass "and skips them the next time"; else fail "COPY INTO loaded again: $got"; fi
+expect "the table has each row once" "5|7.50" walt walt-password-1 "SELECT count(*), max(amount) FROM e2e_sales"
+expect "the load history records each file" "2|5|walt" walt walt-password-1 \
+  "SELECT count(*), sum(row_count), any_value(user_name) FROM igloo.load_history WHERE table_name = 'lake.public.e2e_sales' AND status = 'loaded'"
+expect_error "readers need INSERT to load" 42501 rita rita-password-1 "$load"
+expect_error "only from the allowed locations" 42501 walt walt-password-1 "COPY INTO e2e_sales FROM 's3://elsewhere/drops/'"
+psql_as walt walt-password-1 -c "COPY INTO e2e_readme FROM '$landing/drops/readme.parquet' (CREATE_TABLE true)" >/dev/null || true
+expect "CREATE_TABLE makes a table from the files" "1|99" walt walt-password-1 "SELECT count(*), max(id) FROM e2e_readme"
+
+expect "a pipe" "CREATE PIPE" walt walt-password-1 \
+  "CREATE PIPE e2e_pipe SCHEDULE '2 seconds' AS COPY INTO e2e_sales FROM '$landing/pipe/'"
+psql_admin -c "COPY (SELECT 10 AS id, 'piped' AS name, 10.0 AS amount) TO '$landing/pipe/a.parquet' (FORMAT parquet)" >/dev/null
+expect_soon "loads a file that arrives" "1" walt walt-password-1 "SELECT count(*) FROM e2e_sales WHERE name = 'piped'"
+psql_admin -c "COPY (SELECT 11 AS id, 'piped' AS name, 11.0 AS amount) TO '$landing/pipe/b.parquet' (FORMAT parquet)" >/dev/null
+expect_soon "and the next, once" "2" walt walt-password-1 "SELECT count(*) FROM e2e_sales WHERE name = 'piped'"
+expect "pipe loads are in the load history" "2" walt walt-password-1 \
+  "SELECT count(*) FROM igloo.load_history WHERE pipe_name = 'e2e_pipe' AND status = 'loaded'"
+
+psql_as walt walt-password-1 -c "CREATE TABLE e2e_ticks (n INTEGER)" >/dev/null
+expect "a task" "CREATE TASK" walt walt-password-1 "CREATE TASK e2e_task SCHEDULE '2 seconds' AS INSERT INTO e2e_ticks VALUES (1)"
+got="$(psql_as walt walt-password-1 -c 'SHOW TASKS')" || true
+if grep -q "^e2e_task|walt|suspended|2 seconds|UTC|" <<<"$got"; then pass "SHOW TASKS: suspended at first"; else fail "SHOW TASKS: $got"; fi
+expect "EXECUTE TASK runs it now, as its owner" "EXECUTE TASK" igloo "$admin_password" "EXECUTE TASK e2e_task"
+expect "ALTER TASK RESUME" "ALTER TASK" walt walt-password-1 "ALTER TASK e2e_task RESUME"
+expect_soon "the task runs on its schedule" "t" walt walt-password-1 "SELECT count(*) >= 3 FROM e2e_ticks"
+expect_soon "and its runs are recorded" "t" walt walt-password-1 \
+  "SELECT count(*) >= 2 FROM igloo.task_history WHERE name = 'e2e_task' AND trigger = 'schedule' AND outcome = 'succeeded'"
+expect_error "only its owner changes it" 42501 rita rita-password-1 "ALTER TASK e2e_task SUSPEND"
+activity="$(curl -s "http://127.0.0.1:$http_port/activity")"
+if grep -q '"next_due":"' <<<"$activity"; then pass "/activity reports when work is next due"; else fail "/activity: $activity"; fi
+expect "ALTER TASK SUSPEND" "ALTER TASK" walt walt-password-1 "ALTER TASK e2e_task SUSPEND"
+
+expect "a materialized view" "CREATE MATERIALIZED VIEW" walt walt-password-1 \
+  "CREATE MATERIALIZED VIEW e2e_sales_totals AS SELECT count(*) AS orders, sum(amount) AS total FROM e2e_sales"
+psql_as walt walt-password-1 -c "INSERT INTO e2e_sales VALUES (12, 'late', 1)" >/dev/null
+expect "keeps its rows until refreshed" "7" rita rita-password-1 "SELECT orders FROM e2e_sales_totals"
+expect "REFRESH MATERIALIZED VIEW" "REFRESH MATERIALIZED VIEW" walt walt-password-1 "REFRESH MATERIALIZED VIEW e2e_sales_totals"
+expect "which replaces them" "8|44.50" rita rita-password-1 "SELECT orders, total FROM e2e_sales_totals"
+psql_admin -c "GRANT SELECT ON TABLE e2e_sales_totals TO nora" >/dev/null
+expect "reading it needs SELECT on it" "8" nora nora-password-1 "SELECT orders FROM e2e_sales_totals"
+expect_error "not on what it reads" 42501 nora nora-password-1 "SELECT count(*) FROM e2e_sales"
+
 echo "health and metrics"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http_port/readyz")"
 if [ "$code" = 200 ]; then pass "readyz"; else fail "readyz returned $code"; fi
@@ -383,6 +440,13 @@ fi
 expect "views and comments survive a restart" "3|Test rows | :tag:e2e" rita rita-password-1 \
   "SELECT (SELECT count(*) FROM e2e_big), (SELECT comment FROM igloo_comments() WHERE table_name = 'e2e' AND column_name IS NULL)"
 expect "grants survive a restart" "3" nora nora-password-1 "SELECT count(*) FROM e2e"
+got="$(psql_as walt walt-password-1 -c 'SHOW PIPES')" || true
+if grep -q "^e2e_pipe|walt|started|2 seconds|" <<<"$got"; then pass "pipes survive a restart"; else fail "SHOW PIPES after a restart: $got"; fi
+sleep 5
+expect "and do not load their files again" "2" walt walt-password-1 "SELECT count(*) FROM e2e_sales WHERE name = 'piped'"
+expect "drop a pipe" "DROP PIPE" walt walt-password-1 "DROP PIPE e2e_pipe"
+expect "drop a task" "DROP TASK" walt walt-password-1 "DROP TASK e2e_task"
+expect "drop a materialized view" "DROP MATERIALIZED VIEW" walt walt-password-1 "DROP MATERIALIZED VIEW e2e_sales_totals"
 expect "drop a view" "DROP VIEW" walt walt-password-1 "DROP VIEW e2e_big"
 expect_error "a dropped view is gone" 42P01 walt walt-password-1 "DROP VIEW e2e_big"
 

@@ -85,6 +85,18 @@ the official TPC-H answers.
   ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days.
+- **[Loading and scheduling](docs/loading.md)** with nothing else to run:
+  `COPY INTO` loads CSV, TSV, Parquet and JSON drops from a bucket, each
+  file once; pipes load new files as they land; tasks run SQL on a cron or
+  interval schedule in any time zone; materialized views keep a query's
+  result as a table. Everything runs as its owner, and a scaled-to-zero
+  Igloo is started when work is due.
+
+  ```sql
+  COPY INTO sales FROM 's3://drops/sales/' (FORMAT csv, PATTERN '.*[.]csv[.]gz');
+  CREATE TASK nightly SCHEDULE '0 6 * * *' TIMEZONE 'America/New_York' AS
+    CREATE OR REPLACE TABLE report AS SELECT day, sum(spend) FROM sales GROUP BY day;
+  ```
 - **A locked-down query engine**: SQL cannot read the server's files or reach
   any location except the warehouse and locations you allow.
 - **Automatic table maintenance**: small files are compacted, snapshots older
@@ -99,8 +111,8 @@ the official TPC-H answers.
   object storage are kept on local disk across restarts, so the first
   queries after a start (or a scale-to-zero resume) do not fetch them again.
 - **[Web console](docs/console.md)** at `http://127.0.0.1:8443`: SQL
-  worksheets, a data browser, query history, and user and compute
-  administration, signed in with the same users as SQL clients.
+  worksheets, a data browser, query history, tasks and loads, and user and
+  compute administration, signed in with the same users as SQL clients.
 - **Operations basics**: health and readiness endpoints, Prometheus metrics,
   JSON logs, statement timeouts, connection limits, TLS, query cancel.
 
@@ -159,6 +171,8 @@ PostgreSQL License).
   on the next connection
 - [SQL and clients](docs/sql.md): the SQL dialect, Iceberg features, type
   mapping, tested drivers and tools
+- [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
+  materialized views
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a
@@ -191,6 +205,8 @@ internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox
 internal/pgwire/    Postgres wire protocol, authorization, compatibility
+internal/schedule/  cron and interval schedules
+internal/tasks/     tasks, pipes, materialized views, load history, scheduler
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules
 docs/               documentation
 scripts/            test and end-to-end scripts

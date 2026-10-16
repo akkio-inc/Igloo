@@ -78,6 +78,17 @@ reference for every setting mentioned here.
   through `igloo.query_history` and `igloo.login_history`; only admins see
   others'. The functions behind the views decide what to show from the
   session running them, so calling them directly shows no more.
+- **Loading and scheduled work.** `COPY INTO` loads only from the warehouse
+  and `IGLOO_ALLOWED_LOCATIONS`, never the server's own directories, and is
+  checked as the `INSERT ... SELECT FROM read_csv(...)` statements it runs,
+  one per file, as the user's own: writing needs `INSERT` on the table, and
+  reading files the reader role. Tasks, pipes and materialized view
+  refreshes run as their owner, in a new session of the owner's, checked
+  against the owner's role and grants at the time they run, so they never
+  have more privileges than the owner has then; a dropped owner's work is
+  suspended. Scheduling needs the writer role, and only owners and admins
+  may change, run or drop scheduled work. Reading a materialized view
+  needs `SELECT` on it, like a table.
 - **Query sandbox.** Queries run in an embedded DuckDB that cannot read or
   write files on the server's local disk and cannot reach any URL outside the
   warehouse location and the prefixes in `IGLOO_ALLOWED_LOCATIONS`. DuckDB

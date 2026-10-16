@@ -9,7 +9,7 @@ page is the reference they are built on.
 | Port | Protocol | Purpose |
 |---|---|---|
 | 5432 | PostgreSQL wire protocol | SQL clients |
-| 8080 | HTTP | `GET /healthz` (process is up), `GET /readyz` (catalog and storage reachable), `GET /metrics` (Prometheus), `GET /activity` (running work, for the [scale-to-zero gateway](scale-to-zero.md)) |
+| 8080 | HTTP | `GET /healthz` (process is up), `GET /readyz` (catalog and storage reachable), `GET /metrics` (Prometheus), `GET /activity` (running and scheduled work, for the [scale-to-zero gateway](scale-to-zero.md)) |
 | 8443 | HTTP, or HTTPS with TLS | The [web console](console.md) |
 
 ## Server
@@ -33,7 +33,7 @@ page is the reference they are built on.
 |---|---|---|
 | `IGLOO_ADMIN_USER` | `igloo` | Name of the first administrator |
 | `IGLOO_ADMIN_PASSWORD` | (required) | That administrator's password. Used to create the account on first start only; afterwards change it with `ALTER USER`. |
-| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants are stored (schema `igloo_auth`), with the key that seals web console sessions and the query and login history (schema `igloo_audit`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth` or `igloo_audit`. Without it, the administrator is the only account, `CREATE USER` is unavailable, console sessions end when Igloo restarts, and each replica keeps only recent history in memory. |
+| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users, roles and grants are stored (schema `igloo_auth`), with the key that seals web console sessions, the query and login history (schema `igloo_audit`), and tasks, pipes, materialized views and the load history (schema `igloo_tasks`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`, `igloo_audit` or `igloo_tasks`. Without it, the administrator is the only account, `CREATE USER` is unavailable, console sessions end when Igloo restarts, each replica keeps only recent history in memory, and tasks, pipes and the load history are lost on restart. |
 
 Users sign in with SCRAM-SHA-256, the PostgreSQL default. Each has one
 built-in role, and [grants](sql.md#roles-and-grants) can add privileges on
@@ -54,7 +54,7 @@ Igloo records every statement and login in `igloo.query_history` and
 | Variable | Default | Meaning |
 |---|---|---|
 | `IGLOO_AUDIT` | `true` | Record the query and login history |
-| `IGLOO_AUDIT_RETENTION` | `90d` | How long history is kept, e.g. `30d` or `720h` |
+| `IGLOO_AUDIT_RETENTION` | `90d` | How long history is kept, e.g. `30d` or `720h`: queries, logins, runs of tasks and pipes, and failed loads. Files loaded stay in the load history as long as their table exists. |
 
 ## Catalog
 
@@ -79,7 +79,7 @@ storage type. It is required whenever `IGLOO_CATALOG_URI` is set.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `IGLOO_ALLOWED_LOCATIONS` | | Comma-separated URL prefixes users may also read and write, e.g. a landing bucket for `COPY` and `read_parquet`. Everything else outside the warehouse is blocked. |
+| `IGLOO_ALLOWED_LOCATIONS` | | Comma-separated URL prefixes users may also read and write, e.g. a landing bucket for [`COPY INTO`](loading.md), pipes, `COPY` and `read_parquet`. Everything else outside the warehouse is blocked. |
 
 ### S3 and S3-compatible stores
 

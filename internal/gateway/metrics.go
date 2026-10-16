@@ -15,6 +15,7 @@ type Metrics struct {
 	resumes     *prometheus.CounterVec
 	resumeTime  prometheus.Histogram
 	suspends    prometheus.Counter
+	nextDue     prometheus.Gauge
 }
 
 // NewMetrics registers the gateway's metrics with reg.
@@ -45,9 +46,24 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_gateway_suspends_total",
 			Help: "Times Igloo's compute was stopped for being idle.",
 		}),
+		nextDue: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "igloo_gateway_next_due_timestamp_seconds",
+			Help: "When Igloo last said its scheduled work is next due, which the gateway starts it for; 0 if none is, or it is not known.",
+		}),
 	}
-	reg.MustRegister(m.running, m.clients, m.clientTotal, m.resumes, m.resumeTime, m.suspends)
+	reg.MustRegister(m.running, m.clients, m.clientTotal, m.resumes, m.resumeTime, m.suspends, m.nextDue)
 	return m
+}
+
+func (m *Metrics) setNextDue(due time.Time) {
+	if m == nil {
+		return
+	}
+	if due.IsZero() {
+		m.nextDue.Set(0)
+	} else {
+		m.nextDue.Set(float64(due.UnixMilli()) / 1000)
+	}
 }
 
 func (m *Metrics) setRunning(running bool) {

@@ -31,6 +31,34 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `igloo_comments()`.
 - SQL cursors (`DECLARE`, `FETCH`, `CLOSE`) and array parameters, so
   psycopg's server-side cursors and Ibis's PostgreSQL backend work.
+
+### Loading and scheduling
+
+- `COPY INTO table FROM 'location'` loads CSV, TSV, Parquet, JSON and
+  NDJSON files, gzip- or zstd-compressed or not (detected from the name or
+  the file), from the warehouse and `IGLOO_ALLOWED_LOCATIONS`: a prefix, a
+  glob or one file, filtered by `PATTERN`. Columns match by name or
+  position; `CREATE_TABLE` creates the table from the files;
+  `ON_ERROR abort | skip_file | continue` stops, skips bad files, or skips
+  and counts bad rows. The files of one load commit together.
+- A load history (`igloo.load_history`) records each file loaded into each
+  table, by path, size and time, so a file is loaded once unless it changes
+  or `FORCE` is given; a load cut short by a crash is marked `unknown`
+  rather than repeated.
+- Pipes (`CREATE PIPE ... AS COPY INTO ...`) load new files every minute or
+  on a schedule. Event notifications are not supported yet.
+- Tasks (`CREATE TASK ... SCHEDULE ... AS statement`, `ALTER TASK ...
+  RESUME | SUSPEND | SET SCHEDULE`, `EXECUTE TASK`, `DROP TASK`,
+  `SHOW TASKS`) run one statement on an interval or cron schedule in any
+  time zone, on one replica at a time, never overlapping, with their runs
+  in `igloo.task_history`.
+- Materialized views (`CREATE [OR REPLACE] MATERIALIZED VIEW ... [SCHEDULE]
+  AS query`, `REFRESH MATERIALIZED VIEW`) keep a query's result as an
+  Iceberg table, refreshed in one transaction on demand or on a schedule.
+- Tasks, pipes and refreshes run as their owner, with the owner's role and
+  grants at the time they run; scheduling needs the writer role.
+- With scale to zero, Igloo reports when work is next due on
+  `GET /activity`, and the gateway starts the compute for it.
 - Several replicas can serve the same tables; conflicting concurrent writes
   are retried automatically.
 
@@ -58,7 +86,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 ### Web console
 
 - A web console on port 8443 (`IGLOO_CONSOLE_ADDR`): SQL worksheets with
-  cancel and CSV download, a data browser, query history, and admin pages
+  cancel and CSV download, a data browser, query history, tasks, pipes and
+  materialized views with their runs, the load history, and admin pages
   for users, roles and grants, and the replica's sessions. Users sign in
   with their Igloo password; statements run as them through the same
   authorization as SQL clients. Sessions are stateless sealed cookies, so

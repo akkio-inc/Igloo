@@ -35,6 +35,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -138,6 +139,11 @@ func serve() error {
 		}
 		defer historyStore.Close()
 	}
+	taskStore, err := openTasks(startCtx, cfg, log)
+	if err != nil {
+		return err
+	}
+	defer taskStore.Close()
 	cancel()
 
 	reg := prometheus.NewRegistry()
@@ -165,6 +171,8 @@ func serve() error {
 		<-historyDone
 	}()
 
+	jobs := tasks.NewScheduler(taskStore, tasks.Options{Retention: cfg.Audit.Retention, Log: log})
+	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
 	srv, err := pgwire.New(eng, pgwire.Options{
 		Users:            users,
 		TLS:              tlsConfig,
@@ -176,10 +184,28 @@ func serve() error {
 		DDL:              objects,
 		Activity:         work,
 		Audit:            history,
+		Tasks:            jobs,
 	}, log)
 	if err != nil {
 		return err
 	}
+
+	// Tasks, pipes and materialized views start until shutdown begins.
+	// Runs under way then get the time running queries get; any left when
+	// the server returns are canceled before the engine closes.
+	jobsCtx, stopJobs := context.WithCancel(ctx)
+	jobsDone := make(chan struct{})
+	go func() {
+		defer close(jobsDone)
+		jobs.Run(jobsCtx, srv)
+	}()
+	defer func() {
+		stopJobs()
+		<-jobsDone
+		canceled, cancel := context.WithCancel(context.Background())
+		cancel()
+		jobs.Wait(canceled)
+	}()
 
 	maintains := cat != nil && cfg.Maintenance.Enabled
 	var schedule maintenance.Schedule
@@ -194,7 +220,7 @@ func serve() error {
 		}
 	}
 
-	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work}
+	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work, jobs: jobs}
 	errc := make(chan error, 3)
 	var consoleSrv *http.Server
 	if cfg.ConsoleAddr != "" {
@@ -252,7 +278,9 @@ func serve() error {
 	if consoleSrv != nil {
 		_ = consoleSrv.Shutdown(shutdownCtx)
 	}
-	return srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
+	jobs.Wait(shutdownCtx)
+	return err
 }
 
 // openUsers connects the user store and makes sure the bootstrap admin
@@ -309,6 +337,21 @@ func openHistory(ctx context.Context, cfg config.Config, log *slog.Logger) (audi
 		return nil, fmt.Errorf("query history: %w", err)
 	}
 	log.Info("query and login history is on", "retention", cfg.Audit.Retention)
+	return store, nil
+}
+
+// openTasks opens where tasks, pipes, materialized views and the load
+// history are kept: the metadata database, shared by every replica, or
+// else this replica's memory.
+func openTasks(ctx context.Context, cfg config.Config, log *slog.Logger) (tasks.Store, error) {
+	if cfg.MetadataDatabaseURL == "" {
+		log.Warn("IGLOO_METADATA_DATABASE_URL is not set; tasks, pipes, materialized views and the load history are kept in memory and lost on restart")
+		return tasks.NewMemoryStore(), nil
+	}
+	store, err := tasks.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("tasks: %w", err)
+	}
 	return store, nil
 }
 

@@ -80,6 +80,8 @@ const ICONS = {
   monitor: 'M3 4h18v12H3zM8 20h8M12 16v4',
   search: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4',
   open: 'M14 4h6v6M20 4l-9 9M18 14v6H4V6h6',
+  clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2',
+  inbox: 'M3 13h5l1.5 3h5l1.5-3h5M5.5 5h13L21 13v6H3v-6z',
 };
 
 export function icon(name) {

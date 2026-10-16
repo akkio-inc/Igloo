@@ -25,6 +25,9 @@ and the default schema is `public`. Unqualified names resolve to
 | `CREATE [OR REPLACE] VIEW`, `DROP VIEW` | Yes, outside transactions; see [views](#views) |
 | `COMMENT ON TABLE`, `VIEW`, `COLUMN` | Yes; see [comments](#comments) |
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
+| `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
+| `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
+| `CREATE TASK`, `CREATE PIPE` | Yes; see [tasks](loading.md#tasks) and [pipes](loading.md#pipes) |
 | `PRIMARY KEY`, `UNIQUE` | Accepted but not enforced |
 | `NOT NULL` | Enforced |
 
@@ -117,7 +120,7 @@ SHOW GRANTS;                       -- or TO name, ON TABLE name, ON SCHEMA name
 | Privilege | On | Allows |
 |---|---|---|
 | `SELECT` | table, view or schema | Reading the table |
-| `INSERT` | table or schema | `INSERT`, `COPY ... FROM` and `MERGE ... INSERT` into it |
+| `INSERT` | table or schema | `INSERT`, `COPY ... FROM`, `COPY INTO` and `MERGE ... INSERT` into it |
 | `UPDATE` | table or schema | `UPDATE` and `MERGE ... UPDATE` |
 | `DELETE` | table or schema | `DELETE`, `TRUNCATE` and `MERGE ... DELETE` |
 | `CREATE` | schema | Creating, replacing, altering, renaming, commenting on and dropping its tables and views, including `CREATE TABLE AS` |
@@ -191,6 +194,11 @@ FROM igloo.login_history WHERE result = 'failure';
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name` and `session_id`.
+The runs of tasks, pipes and materialized views are in `igloo.task_history`,
+and the files `COPY INTO` loaded in `igloo.load_history`, with the same
+rule: admins see everything, other users their own (see
+[loading](loading.md#tasks)).
+
 History is kept for `IGLOO_AUDIT_RETENTION` (90 days by default). Rows arrive
 in the background, usually within a second or two of the statement ending.
 Reading the views fetches history page by page, so `LIMIT` without `ORDER BY`
@@ -226,6 +234,20 @@ COPY (SELECT * FROM orders WHERE o_orderdate >= DATE '2026-01-01')
 ```
 
 Every other file or URL is blocked, including the server's local disk.
+
+To load drops from a landing bucket, `COPY INTO` loads every new file under
+a prefix, in CSV, TSV, Parquet or JSON, compressed or not, and remembers
+what it loaded so that running it again loads only new files. Pipes run it
+every minute, tasks run any statement on a schedule, and materialized views
+keep a query's result as a table; [Loading and scheduling](loading.md)
+describes them all.
+
+```sql
+COPY INTO orders FROM 's3://landing-bucket/orders/' (PATTERN '.*[.]csv[.]gz');
+CREATE PIPE orders_drops AS COPY INTO orders FROM 's3://landing-bucket/orders/';
+CREATE TASK nightly SCHEDULE '0 6 * * *' TIMEZONE 'America/New_York' AS
+  CREATE OR REPLACE TABLE order_summary AS SELECT o_orderdate, sum(o_totalprice) FROM orders GROUP BY 1;
+```
 
 ## Types
 

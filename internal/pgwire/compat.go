@@ -159,7 +159,7 @@ func rewriteSessionUser(query, user string) string {
 
 // historyViews are the views of the history, in the local database's
 // schema engine.HistorySchema.
-var historyViews = []string{"query_history", "login_history"}
+var historyViews = []string{"query_history", "login_history", "task_history", "load_history"}
 
 // rewriteHistoryRefs points igloo.query_history and igloo.login_history at
 // the local database, where the views are, whatever the session's search

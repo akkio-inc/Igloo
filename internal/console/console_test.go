@@ -22,6 +22,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // store is a writable in-memory user store.
@@ -128,7 +129,9 @@ func newTestConsole(t *testing.T, tls bool) *testConsole {
 	users.add(t, "igloo", "igloo-password", auth.RoleAdmin)
 	users.add(t, "walt", "walt-password", auth.RoleWriter)
 	users.add(t, "rita", "rita-password", auth.RoleReader)
-	sql, err := pgwire.New(eng, pgwire.Options{Users: users}, log)
+	jobs := tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{Log: log})
+	eng.SetJobHistory(jobs.Store(), pgwire.HistoryViewer)
+	sql, err := pgwire.New(eng, pgwire.Options{Users: users, Tasks: jobs}, log)
 	if err != nil {
 		t.Fatal(err)
 	}

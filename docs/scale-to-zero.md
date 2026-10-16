@@ -29,6 +29,8 @@ Clients connect to it instead of to Igloo, and so can browsers using the
 - When no client has sent or received anything for `IGLOO_GATEWAY_SUSPEND_AFTER`
   (10 minutes by default) and Igloo reports no running statements or table
   maintenance, the gateway stops the compute.
+- When [scheduled work](#scheduled-work) (tasks, pipes, materialized views)
+  is due, the gateway starts the compute for it, with nobody connected.
 - With `IGLOO_GATEWAY_CONSOLE_BACKEND` set, the gateway forwards the web
   console's port the same way, on a second listener: opening the console
   starts Igloo, and its requests count as traffic. The console sends nothing
@@ -214,8 +216,10 @@ again does not undo the gateway's scaling.
 | `IGLOO_LOG_FORMAT`, `IGLOO_LOG_LEVEL` | `text`, `info` | As for the server |
 
 Igloo's `GET /activity` on port 8080 answers
-`{"running": 0, "idle_seconds": 312.5}`: the statements and maintenance
-passes running now, and the time since one last started or ended.
+`{"running": 0, "idle_seconds": 312.5, "next_due": "2026-10-17T10:00:00Z"}`:
+the statements, maintenance passes and scheduled runs running now, the time
+since one last started or ended, and when scheduled work is next due (left
+out when none is scheduled).
 
 ## Metrics
 
@@ -227,9 +231,41 @@ passes running now, and the time since one last started or ended.
 | `igloo_gateway_resumes_total` | `result` = `success`, `failure` | Starts of the compute |
 | `igloo_gateway_resume_seconds` | | Time from asking the compute to start until Igloo accepted connections |
 | `igloo_gateway_suspends_total` | | Stops for idleness |
+| `igloo_gateway_next_due_timestamp_seconds` | | When Igloo last said its scheduled work is next due, which the gateway starts it for; 0 if none is, or the gateway does not know |
 
 Alert on `igloo_gateway_resumes_total{result="failure"}`: clients cannot
 connect while starts fail.
+
+## Scheduled work
+
+[Tasks, pipes and materialized views](loading.md) run on their schedules
+while Igloo is stopped, too. Igloo reports on `/activity` when its next
+scheduled run is due, and the gateway:
+
+- stops Igloo as usual once it is idle, unless work is due within
+  `IGLOO_GATEWAY_SUSPEND_AFTER`: stopping and starting again would save
+  little, and close sessions;
+- starts Igloo when the work is due, early by as long as its last start
+  took, so the work starts about on time. Igloo runs it within seconds of
+  starting, and the gateway stops it again after
+  `IGLOO_GATEWAY_SUSPEND_AFTER` without traffic or work, as after any
+  start.
+
+So a nightly task costs one start and about `IGLOO_GATEWAY_SUSPEND_AFTER`
+of compute a night, plus its run. Work that is due often keeps Igloo
+running: a pipe checks for new files every minute by default, so with
+scale to zero give pipes a longer schedule that matches how often files
+arrive, such as `SCHEDULE '1 hour'` for daily drops.
+
+The gateway keeps the due time in memory, and learns it each time it
+stops Igloo. A gateway that starts while Igloo is stopped cannot know it,
+so it starts Igloo once to find out; after a gateway restart, expect one
+start of up to `IGLOO_GATEWAY_SUSPEND_AFTER`. With
+`IGLOO_GATEWAY_ACTIVITY_URL` set empty the gateway reads no activity, and
+scheduled work runs only while clients keep Igloo up.
+
+Work that came due while Igloo could not be started at all (the gateway
+was down, say) runs once when Igloo next starts, then on schedule.
 
 ## Table maintenance
 

@@ -201,6 +201,11 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
   `scaleToZero.resumeTimeout`. Clients need a connect timeout that allows for
   this (libpq's `connect_timeout`, for example). Open sessions end when Igloo
   stops; connection pools should check connections before use.
+- [Tasks, pipes and materialized views](../../../docs/loading.md) that are
+  due start Igloo too, with nobody connected
+  ([details](../../../docs/scale-to-zero.md#scheduled-work)). A gateway pod
+  that starts while Igloo is at zero scales it up once to learn when work
+  is due.
 - The chart no longer sets the Deployment's replica count, so `helm upgrade`
   leaves it where the gateway put it. A new release starts with one igloo pod
   until the gateway first stops it.

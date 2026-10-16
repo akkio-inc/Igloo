@@ -56,6 +56,9 @@ type Status struct {
 	// GatewaySeen is when a scale-to-zero gateway last asked this replica
 	// whether it was busy; nil if none has since it started.
 	GatewaySeen *time.Time `json:"gateway_seen"`
+	// NextDue is when the soonest task, pipe or materialized view is due,
+	// which a gateway starts Igloo for; nil if none is scheduled.
+	NextDue *time.Time `json:"next_due"`
 }
 
 // Maintenance describes automatic table maintenance.

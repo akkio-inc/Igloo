@@ -53,6 +53,10 @@ type Engine struct {
 	cache *readCache
 	// history supplies the history functions; see SetHistory.
 	history atomic.Pointer[historyConfig]
+	// jobHistory supplies the job history functions; see SetJobHistory.
+	jobHistory atomic.Pointer[jobHistoryConfig]
+	// locations are where COPY INTO may load from; see Locations.
+	locations []string
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -197,6 +201,10 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger)
 	if err := e.registerHistory(ctx); err != nil {
 		return fmt.Errorf("register query history: %w", err)
 	}
+	if err := e.registerJobHistory(ctx); err != nil {
+		return fmt.Errorf("register task and load history: %w", err)
+	}
+	e.locations = loadLocations(cfg)
 
 	if cfg.Catalog.URI == "" {
 		log.Warn("IGLOO_CATALOG_URI is not set; tables will not persist")

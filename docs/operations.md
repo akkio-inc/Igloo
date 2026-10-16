@@ -1,8 +1,8 @@
 # Operating Igloo
 
 This page covers running Igloo once it is deployed: users, sizing and
-scaling, monitoring, backups, table maintenance, upgrades and
-troubleshooting. Settings are described in [configuration.md](configuration.md).
+scaling, monitoring, backups, table maintenance, scheduled work, upgrades
+and troubleshooting. Settings are described in [configuration.md](configuration.md).
 
 ## Users and roles
 
@@ -253,7 +253,7 @@ Port 8080 serves:
 | `/healthz` | The process is up. Use for liveness. |
 | `/readyz` | The engine runs queries, the metadata database answers, and the catalog answers. Use for readiness. |
 | `/metrics` | Prometheus metrics |
-| `/activity` | Statements and maintenance passes running now, and seconds since one last started or ended, as JSON. The [scale-to-zero gateway](scale-to-zero.md) reads it. |
+| `/activity` | Statements, maintenance passes and scheduled runs running now, seconds since one last started or ended, and when scheduled work is next due, as JSON. The [scale-to-zero gateway](scale-to-zero.md) reads it. |
 
 Igloo's metrics, besides the standard Go and process metrics:
 
@@ -275,8 +275,11 @@ Igloo's metrics, besides the standard Go and process metrics:
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
-`user changed`, `grants changed`, `statement denied`, `statement canceled`
-(from the web console's compute page), and refused connections. Sign-ins
+`user changed`, `grants changed`, `job changed` (tasks, pipes and
+materialized views created, changed or dropped), `statement denied`,
+`statement canceled` (from the web console's compute page), and refused
+connections. Failed scheduled runs log `scheduled run failed` (component
+`tasks`). Sign-ins
 through the web console log `client=console`. Query text and
 DuckDB error details, which can quote the query, are logged only at debug
 level; user-management statements, which carry passwords, are never logged.
@@ -290,7 +293,8 @@ Two things hold state:
 1. **The PostgreSQL database** (`IGLOO_METADATA_DATABASE_URL` and the
    catalog's database, normally the same one). It holds the catalog, which
    maps table names to their current metadata in object storage, and Igloo's
-   users, roles, grants and history. Back it up like any production database: managed-service backups
+   users, roles, grants and history, its tasks, pipes and materialized
+   views, and the load history that keeps files from loading twice. Back it up like any production database: managed-service backups
    with point-in-time recovery, or regular `pg_dump`. Losing it loses track of
    every table, even though the data files are still in object storage.
 2. **Object storage.** Table data and Iceberg metadata files. Turn on bucket
@@ -356,6 +360,40 @@ Watch `igloo_maintenance_last_success_timestamp_seconds`: if it stops
 advancing, the logs (component `maintenance`) say which table failed and why.
 Set `IGLOO_MAINTENANCE=false` only if another tool maintains the tables.
 
+## Scheduled work
+
+Tasks, pipes and materialized views ([loading and scheduling](loading.md))
+run inside Igloo; nothing else needs scheduling. How they run:
+
+- Every replica runs a scheduler, which looks for due work every few
+  seconds. Each due run is claimed by one replica through the metadata
+  database, and a session-level lock there keeps a job from running twice
+  at once on any replica; a run that comes due while the last one still
+  runs is recorded as `skipped`. Postgres releases the lock of a replica
+  that dies, and the next run marks the dead one's run `failed`.
+- A replica runs at most four scheduled runs at once; further due work
+  waits for a free slot or another replica. Each run is a session of its
+  owner, which counts against `IGLOO_MAX_CONNECTIONS` while it lasts and
+  shows on the console's compute page as `task <name>`, `pipe <name>` or
+  `materialized view <name>`.
+- Runs and loads count as running work on `/activity`, so a scale-to-zero
+  gateway does not stop Igloo during one. On shutdown, Igloo starts no new
+  runs; those under way get the 30 seconds running queries get, then are
+  canceled and recorded as failed.
+- Work missed while Igloo was not running runs once when it starts, then
+  on schedule. With [scale to zero](scale-to-zero.md#scheduled-work), the
+  gateway starts Igloo when work is due.
+- Without `IGLOO_METADATA_DATABASE_URL`, definitions and history are in
+  memory and lost on restart; run a single replica.
+
+Watch failures in `igloo.task_history` (as an admin, every run is there) and
+`igloo.load_history`:
+
+```sql
+SELECT start_time, kind, name, user_name, error FROM igloo.task_history
+WHERE outcome = 'failed' AND start_time > now() - INTERVAL 1 DAY;
+```
+
 ## Upgrades
 
 Igloo itself is stateless: replace the binary or image and restart.
@@ -388,3 +426,4 @@ and the catalog runs its database migrations before it serves. Read
 | Log says `read cache off: cannot load the cache_httpfs extension ... Read-only file system` | The root filesystem is read-only and `/tmp` is not writable. Mount a small writable volume at `/tmp`. |
 | Log says `read cache off: its directory is not writable` | Make the volume at `IGLOO_CACHE_DIR` writable by the container's user (UID 65532), e.g. with `fsGroup: 65532` on Kubernetes. |
 | Log says `read cache paused` | Less than 5% of the cache's disk is free. Free space or give the cache its own volume; it resumes on its own. |
+| A task, pipe or `COPY INTO` does not do what you expect | See [loading troubleshooting](loading.md#troubleshooting). |

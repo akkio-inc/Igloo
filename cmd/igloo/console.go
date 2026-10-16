@@ -113,6 +113,9 @@ func consoleStatus(cfg config.Config, started time.Time, work *activity.Tracker,
 			seen := time.Unix(0, t)
 			st.GatewaySeen = &seen
 		}
+		if due, ok := h.nextDue(ctx); ok {
+			st.NextDue = &due
+		}
 		if maintains {
 			st.Maintenance = &console.Maintenance{
 				Interval:  shortDuration(cfg.Maintenance.Interval),

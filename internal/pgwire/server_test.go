@@ -120,6 +120,7 @@ func (s *testStore) Close()                     {}
 type testServer struct {
 	addr  string
 	store *testStore
+	srv   *Server
 }
 
 // startServer runs Igloo on an in-memory DuckDB with an "igloo" admin.
@@ -156,6 +157,9 @@ func startServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*O
 	if opts.Audit != nil {
 		eng.SetHistory(opts.Audit, HistoryViewer)
 	}
+	if opts.Tasks != nil {
+		eng.SetJobHistory(opts.Tasks.Store(), HistoryViewer)
+	}
 	srv, err := New(eng, opts, log)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +178,7 @@ func startServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*O
 		_ = eng.Close()
 	})
 
-	return &testServer{addr: ln.Addr().String(), store: store}
+	return &testServer{addr: ln.Addr().String(), store: store, srv: srv}
 }
 
 func (ts *testServer) url(user, password string) string {

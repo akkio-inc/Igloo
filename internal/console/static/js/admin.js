@@ -299,6 +299,7 @@ export function createCompute(app) {
             : h('p', { class: 'muted', text: 'This replica does not maintain tables: there is no catalog, or IGLOO_MAINTENANCE is false.' }))),
         h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { text: 'Scale to zero' })),
           h('div', { class: 'card-body' }, h('p', { text: gateway }),
+            st.next_due ? h('p', { text: `Scheduled work (tasks, pipes, materialized views) is next due at ${fmtTime(st.next_due)}; a gateway starts Igloo for it.` }) : null,
             h('p', { class: 'muted', text: 'The console sends nothing while you are not using it, so an open console never keeps Igloo awake.' }))))));
   }
 

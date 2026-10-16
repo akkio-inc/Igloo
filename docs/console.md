@@ -1,8 +1,8 @@
 # Web console
 
 Igloo serves a web console for running SQL and looking after the
-warehouse from a browser: worksheets, a data browser, query history, and
-pages for administrators to manage users, roles and grants, and to watch the
+warehouse from a browser: worksheets, a data browser, query history, tasks
+and loads, and pages for administrators to manage users, roles and grants, and to watch the
 replica's sessions. It is part of the `igloo` binary; there is nothing else to
 install or run.
 
@@ -35,6 +35,19 @@ worksheet with a `SELECT` on the table.
 text, read from `igloo.query_history` and `igloo.login_history`. On a server
 without those views the page says that history is not available.
 
+**Tasks.** [Tasks, pipes and materialized views](loading.md), each with its
+owner, state, schedule, next run and last outcome, from `SHOW TASKS`,
+`SHOW PIPES` and `SHOW MATERIALIZED VIEWS`. Selecting one shows its
+definition and its recent runs from `igloo.task_history` (for a pipe, the
+files it loaded), and buttons that run it now (`EXECUTE TASK`,
+`REFRESH MATERIALIZED VIEW`), suspend it and resume it, which the server
+allows its owner and admins. Admins see everyone's; other users their own.
+
+**Load history.** The files `COPY INTO` and pipes loaded, with their
+status, rows and first error, from `igloo.load_history`, filtered by table,
+status, time and file name. Admins see every load; other users the files
+they and their pipes loaded.
+
 **Users** (admins). Create users, change their roles, set new passwords and
 drop users.
 
@@ -46,7 +59,8 @@ custom roles the page says so.
 **Compute** (admins). This replica's version and uptime, its open sessions
 (SQL clients and console requests alike) with the statements running in
 them, which can be canceled, when table maintenance last finished a pass,
-and whether a scale-to-zero gateway is watching the replica. Behind a load
+whether a scale-to-zero gateway is watching the replica, and when
+scheduled work is next due. Behind a load
 balancer, each refresh may reach a different replica; the page names the one
 it shows.
 
@@ -129,4 +143,4 @@ binding it to anything but loopback.
 | Signed out unexpectedly | The session was idle for an hour or is 12 hours old, or the password changed, or the user was dropped. |
 | `sorry, too many clients already` | The replica is at `IGLOO_MAX_CONNECTIONS`; each running console request holds a session. |
 | Only the first 10,000 rows | The grid's limit. Download CSV for every row. |
-| History or roles pages say "not available" | The server predates query history or custom roles. |
+| History, roles, tasks or load history pages say "not available" | The server predates query history, custom roles, or tasks and loading. |

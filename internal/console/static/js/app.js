@@ -5,6 +5,7 @@ import { hydrate, icon, toast, h, clear, mark } from './dom.js';
 import { createWorksheets } from './worksheets.js';
 import { createData } from './data.js';
 import { createHistory } from './history.js';
+import { createJobs, createLoads } from './tasks.js';
 import { createUsers, createRoles, createCompute } from './admin.js';
 
 const $ = (id) => document.getElementById(id);
@@ -82,6 +83,8 @@ const ROUTES = {
   worksheets: { make: createWorksheets, title: 'Worksheets' },
   data: { make: createData, title: 'Data' },
   history: { make: createHistory, title: 'Query history' },
+  tasks: { make: createJobs, title: 'Tasks' },
+  loads: { make: createLoads, title: 'Load history' },
   'admin/users': { make: createUsers, title: 'Users', admin: true },
   'admin/roles': { make: createRoles, title: 'Roles and grants', admin: true },
   'admin/compute': { make: createCompute, title: 'Compute', admin: true },
