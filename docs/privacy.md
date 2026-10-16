@@ -49,6 +49,8 @@ ALTER TABLE audiences.segments ALTER COLUMN email_hash SET TAG pii = 'email:sha2
   columns tagged `pii = 'email:sha256'`.
 - A request for a tag value no column has is refused, so a request never
   silently erases nothing.
+- Zero-copy clones count as tagged where their source is, and the reverse
+  ([below](#clones)): tag either.
 - Tags stay with a table's name, and renaming a table or column with tags is
   refused, so it cannot slip out of later requests.
 
@@ -95,15 +97,39 @@ request has work to do.
 
 | Step | What it does |
 |---|---|
-| `find` | Lists the tables with columns tagged with the request's tag values; the tables that share data files with them, as zero-copy clones do, whose columns of the same names count as tagged; and the tables that the query history and the definitions of materialized views and tasks say were written from them. |
+| `find` | Lists the tables with columns tagged with the request's tag values; the tables that share data files with them ([clones](#clones)); and the tables that the query history and the definitions of materialized views and tasks say were written from them. Tagged tables of [connections](federation.md) are listed, but nothing is erased from them. |
 | `delete` | Deletes the matching rows, as a `DELETE` would: queries no longer see them. |
 | `rewrite` | Writes every data file that still holds matching rows again, without them, and then the manifests that still list the old files: a manifest keeps a removed file's entry, with the column bounds that can hold the value itself. |
 | `expire` | Expires the snapshots that reference a file that held matching rows, or whose bounds may, however recent, so time travel to them ends. Snapshots that reference none stay, older ones included. Branches and tags pointing at an expired snapshot go too. |
-| `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. |
+| `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. A file that another table references is never deleted ([clones](#clones)). |
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`; it writes them again from the files that remain. |
 | `history` | Replaces the identifiers in the query history, and in the errors of the load history and of task runs, with `***`. |
 | `cache` | Waits until every running replica has dropped the deleted files from its [read cache](operations.md#read-cache), on disk and in memory. A replica that is not running drops them when it starts. |
 | `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; sharing copies; history. Anything found sends the request back to the step that removes it, at most five times. |
+
+### Clones
+
+A zero-copy clone references its source's data files, under the source's
+location, and its compactions and updates write copies of the source's
+rows under its own. A request therefore erases from the clones of the
+tables it finds and from the tables those were cloned from, clones of
+clones included, whichever of them has the tags; a clone's columns are its
+source's, renamed or not. A file one of them references is rewritten in
+each, and its snapshots expired in each, before it is deleted. Tables that
+reference another's files otherwise, as another engine's `add_files` can
+make them, are found by their manifests, and their columns named like the
+tagged ones count as tagged.
+
+While a request deletes files, it holds the locks that making a clone of
+one of its tables takes, so no clone is made meanwhile; while one is being
+made, the request tries again a minute later. A clone made after the
+request began is added to it. If a table the request does not erase from
+references a file it would delete, the request stops with an error that
+names the table instead of breaking it: tag that table's columns and ask
+again for the same identifiers, and the first request goes on once the
+second has erased from it.
+
+### Once complete
 
 Once a request completes, its hashes and salt are deleted too: its record
 says what was erased, from which tables and when, but not whose data it
@@ -122,7 +148,7 @@ request, newest first, to admins and holders of `ERASE`:
 | `step` | The step it runs next, `done` once complete |
 | `created_at`, `updated_at`, `completed_at` | When |
 | `subjects` | JSON: the tag values, and how many identifiers of each |
-| `tables` | JSON: per table, its tagged columns, why it was included, rows deleted, files rewritten, snapshots expired, files deleted, and when each step ended for it |
+| `tables` | JSON: per table, its tagged columns, why it was included, rows deleted, files rewritten, snapshots expired, files deleted, and when each step ended for it; `remote` for a table of a connection, which it did not erase from |
 | `downstream` | JSON: tables written from those, as history tells, and whether the request erased from them because they have the tags too |
 | `history_redacted` | History records redacted |
 | `steps` | JSON: when each step started and last finished, and how often it ran |
@@ -187,10 +213,22 @@ and renaming such a table is refused.
   its write-ahead log. Lakekeeper's tables (also in PostgreSQL) hold table
   metadata, such as snapshots, schemas and properties, not rows: only
   comments or properties that you wrote identifiers into.
+- **Tables of connections** ([federation](federation.md)), which are in
+  another database: Igloo reads them but cannot erase from them. A tagged
+  column of one is listed in the request's `tables` as `remote`; erase the
+  person in that database. A request for a tag value only connections'
+  tables have is refused.
 - **Copies outside the warehouse**: files in `IGLOO_ALLOWED_LOCATIONS`,
   landing buckets that loads read and exports wrote, other engines' copies
   of the tables (Spark, Trino, Snowflake), BI tools' caches, and files
-  partners already downloaded through Delta Sharing.
+  partners already downloaded through [Delta Sharing](sharing.md).
+- **Engines that read through the [Iceberg REST
+  catalog](external-engines.md)** get storage credentials that last up to
+  an hour. Until a request deletes the files, such an engine can read them
+  with credentials it already holds, and what it read or cached is its own
+  to erase. An engine that holds a table's metadata from before the
+  request still lists the deleted files, and fails to read them once they
+  are gone.
 - **Tables dropped before the request**, whose files the catalog may keep
   for a while, and the definitions of tasks, pipes and materialized views,
   which are SQL and not history.
@@ -205,6 +243,8 @@ and renaming such a table is refused.
 A request reads the tagged columns of every tagged table in full, every
 file of every snapshot, when it starts and again when it verifies, and
 rewrites only the files that hold matching rows, at most 8 GB per commit.
+Before it deletes files, it reads the metadata of every table in the
+catalog, to be sure no other table references them.
 DuckDB reads only the tagged columns, with all of a replica's cores; a
 table of billions of rows takes minutes. Requests run one at a time, so
 batching people into one request saves reading the same tables again.

@@ -40,6 +40,13 @@ type Lineage interface {
 	Writes(ctx context.Context, tables, names []string) ([]audit.Query, error)
 }
 
+// Locks are locks of table locations, shared by every replica.
+type Locks interface {
+	// Lock takes the lock of every location, or with wait false gives
+	// up (ok false) if another holds one. Call release once ok.
+	Lock(ctx context.Context, locations []string, wait bool) (release func(), ok bool, err error)
+}
+
 // Options configure a Service.
 type Options struct {
 	Store   Store
@@ -64,6 +71,10 @@ type Options struct {
 	Lineage Lineage
 	// Purger is this replica's, which a request has drop files at once.
 	Purger *Purger
+	// Locks, if set, are the locks of tables' locations that making a
+	// zero-copy clone holds (clone.Store is one), which a request holds
+	// while it deletes files: a clone made meanwhile could reference one.
+	Locks Locks
 	// Rows deletes and counts rows. Nil means statements in DuckDB on the
 	// catalog's tables.
 	Rows Rows
@@ -161,9 +172,11 @@ func (s *Service) check(ctx context.Context, wanted []Wanted) ([]Wanted, error) 
 		if len(tag.AllowedValues) > 0 && !slices.ContainsFunc(tag.AllowedValues, func(v string) bool { return held(v, w.Value) }) {
 			return nil, fmt.Errorf("%w: tag %s allows no value %q", ErrInvalid, w.Tag, w.Value)
 		}
-		if !slices.ContainsFunc(snap.Catalog.ColumnTags, func(ct policy.ColumnTag) bool { return ct.Tag == w.Tag && held(ct.Value, w.Value) }) {
-			return nil, fmt.Errorf("%w: no column is tagged %s = '%s'; tag the columns that hold these identifiers first",
-				ErrInvalid, w.Tag, w.Value)
+		if !slices.ContainsFunc(snap.Catalog.ColumnTags, func(ct policy.ColumnTag) bool {
+			return ct.Tag == w.Tag && ct.Catalog == "" && held(ct.Value, w.Value)
+		}) {
+			return nil, fmt.Errorf("%w: no column of the %s catalog's tables is tagged %s = '%s'; tag the columns that hold these identifiers first",
+				ErrInvalid, s.opts.CatalogName, w.Tag, w.Value)
 		}
 		i := slices.IndexFunc(out, func(o Wanted) bool { return o.Tag == w.Tag && o.Value == w.Value })
 		if i < 0 {

@@ -362,8 +362,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   ("forever") as forever; it overflowed into a negative age.
 - Erasure of people's data for GDPR and CCPA requests (`ERASE SUBJECT
   WHERE pii.email = '...'`), found through tagged columns, including
-  columns of hex SHA-256, SHA-1 and MD5 digests (`pii = 'email:sha256'`) and
-  clones that share the tables' files: it deletes the rows, rewrites the
+  columns of hex SHA-256, SHA-1 and MD5 digests (`pii = 'email:sha256'`),
+  zero-copy clones of the tables and the tables they were cloned from, and
+  other tables that share their files: it deletes the rows, rewrites the
   data files and manifests that held them, expires the snapshots that
   reference those, however recent, deletes them and old orphan files from
   object storage, deletes Delta Sharing copies made from them, drops them
@@ -374,7 +375,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   identifiers only as salted hashes, deleted on completion, and are listed
   with what they did per table and step in `SHOW ERASURE REQUESTS` and
   `igloo.erasure_requests`, with the tables history says were written from
-  the erased ones. Admins and roles granted `ERASE ON ACCOUNT` make them.
+  the erased ones, and tagged tables of connections, which it cannot erase
+  from. Admins and roles granted `ERASE ON ACCOUNT` make them.
   `iceberg-go`'s copy gains `Transaction.ForgetFiles`, which rewrites the
   manifests that list removed files.
 - Data retention for tables that hold personal data (`ALTER TABLE ... SET

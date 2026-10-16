@@ -199,9 +199,11 @@ reference for every setting mentioned here.
   change tables with Igloo's own access, not through policies, which would
   hide the values they look for, and are carried out whatever later happens
   to the account that made them. They delete files from the warehouse, only
-  once no table they erase from references them, and orphan files only
-  after 3 days, as maintenance does. They do not reach backups, bucket
-  versions, soft-deleted objects, or copies outside the warehouse.
+  once no table in the catalog references them, holding the locks making a
+  clone takes, and orphan files only after 3 days, as maintenance does.
+  They do not reach backups, bucket versions, soft-deleted objects, tables
+  of connections, or copies outside the warehouse, such as what engines
+  read with Iceberg REST credentials before the files were deleted.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history

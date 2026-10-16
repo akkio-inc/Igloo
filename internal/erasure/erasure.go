@@ -162,6 +162,10 @@ type Table struct {
 	// Missing says the table no longer exists; its tags stay with its
 	// name.
 	Missing bool `json:"missing,omitempty"`
+	// Remote says the table is a connection's, in another database
+	// (package federation): the request reports it and erases nothing
+	// there.
+	Remote bool `json:"remote,omitempty"`
 }
 
 // Column is a column that holds identifiers.

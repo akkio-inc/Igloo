@@ -124,7 +124,9 @@ that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
 - Each request runs as a job on the [scheduler](#scheduled-work), every
   minute until it completes, one request at a time across replicas; its
   runs are in `igloo.task_history` as kind `erasure`. It reads the tagged
-  columns of the tagged tables in full, with all of a replica's cores.
+  columns of the tagged tables in full, with all of a replica's cores, and
+  before it deletes files, the metadata of every table in the catalog, so
+  it deletes none that another table references.
 - Every replica checks every 15 seconds for files that requests deleted and
   drops them from its read cache; a request waits for the replicas seen in
   the last 2 minutes. A replica that was stopped drops them when it starts.

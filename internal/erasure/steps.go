@@ -2,6 +2,7 @@ package erasure
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,6 +18,8 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/compaction"
 	"gocloud.dev/gcerrors"
+
+	"github.com/akkio-inc/igloo/internal/policy"
 )
 
 const (
@@ -69,6 +72,9 @@ type loaded struct {
 func (s *Service) tables(ctx context.Context, r *Request) ([]loaded, error) {
 	var out []loaded
 	for i := range r.Tables {
+		if r.Tables[i].Remote {
+			continue
+		}
 		tbl, ok, err := s.load(ctx, &r.Tables[i])
 		if err != nil {
 			return nil, err
@@ -94,14 +100,19 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 			if ct.Tag != sub.Tag || !ok {
 				continue
 			}
-			key := strings.ToLower(ct.Schema + "." + ct.Table)
+			name := policy.TableName(ct.Catalog, ct.Schema, ct.Table)
+			key := strings.ToLower(name)
 			if byName[key] == nil {
-				byName[key] = &Table{Name: ct.Schema + "." + ct.Table, Reason: "tagged"}
+				byName[key] = &Table{Name: name, Reason: "tagged"}
+				if ct.Catalog != "" {
+					byName[key].Reason = "a table of connection " + ct.Catalog + ", which Igloo reads but cannot erase from: erase there"
+					byName[key].Remote = true
+				}
 			}
 			byName[key].Columns = append(byName[key].Columns, Column{Name: ct.Column, Tag: ct.Tag, Value: sub.Value, Digest: digest})
 		}
 	}
-	if len(byName) == 0 {
+	if !slices.ContainsFunc(slices.Collect(maps.Values(byName)), func(t *Table) bool { return !t.Remote }) {
 		// The tags were unset since the request was made: completing
 		// it would erase nothing.
 		return errors.New("no column is tagged with the request's tag values any more; tag the columns again")
@@ -125,56 +136,132 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// clones finds the other tables that reference data files under the
-// location of one of sources, as zero-copy clones do. Only tables with a
-// column named like one of the source's tagged columns can hold its
-// identifiers, and only those are read; their columns of those names are
+// Properties of a zero-copy clone (see package clone): sharesProperty
+// lists, as a JSON array, the locations of other tables whose files its
+// metadata may reference, the table it was cloned from and those that one
+// shares files with in turn; sourceProperty names the table it was cloned
+// from, and stays once it references none of that table's files.
+const (
+	sharesProperty = "igloo.clone.shares-files-of"
+	sourceProperty = "igloo.clone.source"
+)
+
+// shares are the locations whose files tbl says it may reference.
+func shares(tbl *table.Table) []string {
+	var locs []string
+	if v := tbl.Properties()[sharesProperty]; v != "" {
+		_ = json.Unmarshal([]byte(v), &locs)
+	}
+	for i, l := range locs {
+		locs[i] = strings.TrimRight(l, "/")
+	}
+	return locs
+}
+
+// clones finds the tables that share data files with sources, which a
+// file must be rewritten in, and its snapshots expired in, before it can
+// go: zero-copy clones of them, the tables they are clones of, and so on.
+// A clone says what it was made from and shares, and its columns are the
+// source's, by field ID; a clone that no longer shares files still holds
+// copies of its source's rows. Tables that reference another's files
+// without saying so are found by their manifests, among those with a
+// column named like a tagged one, and their columns of those names are
 // taken to hold the same.
 func (s *Service) clones(ctx context.Context, r *Request, sources []loaded) ([]Table, error) {
 	idents, err := s.opts.Catalog.Tables(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []Table
+	var others []*table.Table
 	for _, id := range idents {
-		name := tableName(id)
-		if slices.ContainsFunc(r.Tables, func(t Table) bool { return strings.EqualFold(t.Name, name) }) {
+		if slices.ContainsFunc(r.Tables, func(t Table) bool { return strings.EqualFold(t.Name, tableName(id)) }) {
 			continue
 		}
-		var (
-			tbl *table.Table
-			tf  *tableFiles
-		)
+		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
+		if errors.Is(err, icecat.ErrNoSuchTable) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", tableName(id), err)
+		}
+		others = append(others, tbl)
+	}
+	var out []Table
+	read := map[*table.Table]*tableFiles{}
+	for len(sources) > 0 {
+		var found []loaded
 		for _, src := range sources {
-			if tbl == nil {
-				if tbl, err = s.opts.Catalog.LoadTable(ctx, id); errors.Is(err, icecat.ErrNoSuchTable) {
-					break
-				} else if err != nil {
-					return nil, fmt.Errorf("load %s: %w", name, err)
+			for i := 0; i < len(others); i++ {
+				o := others[i]
+				t, err := s.related(ctx, src, o, read)
+				if err != nil {
+					return nil, err
 				}
-			}
-			var cols []Column
-			for _, c := range src.t.Columns {
-				if f, ok := tbl.Schema().FindFieldByNameCaseInsensitive(c.Name); ok {
-					c.Name = f.Name
-					cols = append(cols, c)
+				if t == nil {
+					continue
 				}
+				out = append(out, *t)
+				found = append(found, loaded{&out[len(out)-1], o})
+				others = slices.Delete(others, i, i+1)
+				i--
 			}
-			if len(cols) == 0 {
-				continue
-			}
-			if tf == nil {
-				if tf, err = readFiles(ctx, tbl); err != nil {
-					return nil, fmt.Errorf("read %s: %w", name, err)
-				}
-			}
-			if slices.ContainsFunc(slices.Collect(maps.Keys(tf.live(false))), func(p string) bool { return within(p, src.tbl.Location()) }) {
-				out = append(out, Table{Name: name, Columns: cols, Reason: "shares data files with " + src.t.Name})
+		}
+		// Clones of clones, and their sources, share files too.
+		sources = found
+	}
+	return out, nil
+}
+
+// related returns other as a table the request erases from too, if it
+// shares data files with src, or nil.
+func (s *Service) related(ctx context.Context, src loaded, other *table.Table, read map[*table.Table]*tableFiles) (*Table, error) {
+	name := tableName(other.Identifier())
+	srcLoc, otherLoc := strings.TrimRight(src.tbl.Location(), "/"), strings.TrimRight(other.Location(), "/")
+	switch {
+	case slices.Contains(shares(other), srcLoc) || strings.EqualFold(other.Properties()[sourceProperty], src.t.Name):
+		return &Table{Name: name, Columns: sameFields(src, other), Reason: "a clone of " + src.t.Name}, nil
+	case slices.Contains(shares(src.tbl), otherLoc) || strings.EqualFold(src.tbl.Properties()[sourceProperty], name):
+		return &Table{Name: name, Columns: sameFields(src, other), Reason: src.t.Name + " is a clone of it"}, nil
+	}
+	var cols []Column
+	for _, c := range src.t.Columns {
+		if f, ok := other.Schema().FindFieldByNameCaseInsensitive(c.Name); ok {
+			c.Name = f.Name
+			cols = append(cols, c)
+		}
+	}
+	if len(cols) == 0 {
+		return nil, nil
+	}
+	tf := read[other]
+	if tf == nil {
+		var err error
+		if tf, err = readFiles(ctx, other); err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		read[other] = tf
+	}
+	if slices.ContainsFunc(slices.Collect(maps.Keys(tf.live(false))), func(p string) bool { return within(p, srcLoc) }) {
+		return &Table{Name: name, Columns: cols, Reason: "shares data files with " + src.t.Name}, nil
+	}
+	return nil, nil
+}
+
+// sameFields are src's tagged columns as other names them: the fields
+// with the same IDs, as a clone's metadata copies its source's.
+func sameFields(src loaded, other *table.Table) []Column {
+	var out []Column
+	for _, f := range fields(src.tbl, src.t) {
+		c := f.Column
+		for _, sc := range append([]*iceberg.Schema{other.Schema()}, other.Metadata().Schemas()...) {
+			if n, ok := sc.FindColumnName(f.id); ok {
+				c.Name = n
 				break
 			}
 		}
+		out = append(out, c)
 	}
-	return out, nil
+	return out
 }
 
 // deleteRows deletes the matching rows of every table, as a DELETE does:
@@ -206,6 +293,9 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 func (s *Service) rewrite(ctx context.Context, r *Request) error {
 	for i := range r.Tables {
 		t := &r.Tables[i]
+		if t.Remote {
+			continue
+		}
 		for attempt := 1; ; attempt++ {
 			tbl, ok, err := s.load(ctx, t)
 			if err != nil {
@@ -620,8 +710,15 @@ func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, tbl *ta
 // purge deletes from object storage the files the request recorded, once
 // none of its tables references them, and the tables' orphan files old
 // enough to be safe to delete. A newer orphan that holds matching rows
-// makes the request wait until it is old enough.
+// makes the request wait until it is old enough. It holds the locks of the
+// tables' locations meanwhile, which making a clone of one takes too, so
+// no clone that references a file it deletes is made.
 func (s *Service) purge(ctx context.Context, r *Request) error {
+	release, err := s.lockLocations(ctx, r)
+	if err != nil {
+		return err
+	}
+	defer release()
 	tables, referenced, err := s.referenced(ctx, r)
 	if err != nil {
 		return err
@@ -659,6 +756,9 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 			}
 		}
 	}
+	if err := s.unshared(ctx, r, gone); err != nil {
+		return err
+	}
 	if err := s.delete(ctx, r, tables, gone); err != nil {
 		return err
 	}
@@ -673,12 +773,93 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// referenced loads r's tables and returns them with every file any of
-// them references.
+// unshared checks that no table the request does not erase from
+// references one of files, as a table that shares files with one of its
+// tables without saying so, or by columns of other names, may: deleting
+// the file would break that table, which holds the rows too.
+func (s *Service) unshared(ctx context.Context, r *Request, files []File) error {
+	if len(files) == 0 {
+		return nil
+	}
+	paths := map[string]bool{}
+	for _, f := range files {
+		paths[f.Path] = true
+	}
+	idents, err := s.opts.Catalog.Tables(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range idents {
+		name := tableName(id)
+		if slices.ContainsFunc(r.Tables, func(t Table) bool { return strings.EqualFold(t.Name, name) }) {
+			continue
+		}
+		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
+		if errors.Is(err, icecat.ErrNoSuchTable) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load %s: %w", name, err)
+		}
+		tf, err := readFiles(ctx, tbl)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", name, err)
+		}
+		for p := range tf.referenced() {
+			if paths[p] {
+				return fmt.Errorf("%s references %s, a file the request deletes, but the request does not erase from %[1]s: "+
+					"tag the columns of %[1]s that hold the identifiers and make a new request for them; this one goes on once that one is done", name, base(p))
+			}
+		}
+	}
+	return nil
+}
+
+// lockLocations takes the locks of the locations of r's tables
+// (Options.Locks).
+func (s *Service) lockLocations(ctx context.Context, r *Request) (release func(), err error) {
+	if s.opts.Locks == nil {
+		return func() {}, nil
+	}
+	tables, err := s.tables(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	var locs []string
+	for _, l := range tables {
+		locs = append(locs, l.tbl.Location())
+	}
+	release, ok, err := s.opts.Locks.Lock(ctx, locs, false)
+	if err != nil {
+		return nil, fmt.Errorf("lock the tables' locations: %w", err)
+	}
+	if !ok {
+		return nil, errors.New("a clone of one of the tables is being made; deleting files once it is")
+	}
+	return release, nil
+}
+
+// referenced loads r's tables, and clones of them made since the request
+// found its tables, which it adds to them, and returns them with every
+// file any of them references.
 func (s *Service) referenced(ctx context.Context, r *Request) ([]loaded, map[string]bool, error) {
 	tables, err := s.tables(ctx, r)
 	if err != nil {
 		return nil, nil, err
+	}
+	added, err := s.clones(ctx, r, tables)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(added) > 0 {
+		for _, t := range added {
+			s.log.Info("erasure found a table made since it began that shares files with its tables",
+				"request", r.ID, "table", t.Name, "reason", t.Reason)
+		}
+		r.Tables = append(r.Tables, added...)
+		if tables, err = s.tables(ctx, r); err != nil {
+			return nil, nil, err
+		}
 	}
 	referenced := map[string]bool{}
 	for _, l := range tables {
