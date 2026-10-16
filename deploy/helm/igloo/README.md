@@ -300,6 +300,36 @@ other clients   ──> Service igloo ──────────────
 - Names are 1 to 20 lowercase letters, digits and hyphens; `default` is the
   release's own Deployment.
 
+## Distributed execution
+
+With `workers.enabled=true`, statements that read very large tables run in
+parts on worker pods ([distributed execution](../../../docs/distributed-execution.md)):
+
+```
+igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> worker pods (0 to workers.maxReplicas)
+     └── scale Deployment igloo-workers through the Kubernetes API
+```
+
+- The worker Deployment starts with no pods. An igloo pod scales it up when
+  a statement is worth distributing (never down while another igloo pod uses
+  the workers), and to zero once every worker has been idle for
+  `workers.idleAfter`. A statement waits for workers at most
+  `workers.startTimeout`, then runs on its igloo pod instead.
+- Give workers their own node pool with a minimum size of zero
+  (`workers.nodeSelector`, `workers.tolerations`), so idle workers cost
+  nothing; by default they prefer one per node.
+- Workers use the igloo pods' service account (and so their cloud identity
+  for object storage) without a Kubernetes API token. The igloo pods get a
+  token, for a Role that may only get and patch the workers' `scale`
+  subresource.
+- Igloo pods and workers authenticate each other with the worker secret
+  (generated and kept, or `workers.existingSecret`); the NetworkPolicy also
+  admits only igloo pods to the task port. Port 8080 serves health checks
+  and metrics through `<fullname>-workers-metrics`, which the ServiceMonitor
+  scrapes too.
+- With `scaleToZero.enabled`, the gateway stops the workers along with the
+  igloo pods.
+
 ## Values
 
 | Key | Default | Description |
@@ -387,6 +417,17 @@ other clients   ──> Service igloo ──────────────
 | `scaleToZero.nodeSelector`, `tolerations`, `affinity` | | Gateway pod scheduling, separate from igloo's |
 | `pricePerHour` | `0` | `IGLOO_PRICE_PER_HOUR`: what one igloo pod's machine costs an hour, for `igloo.usage`; `0` is unknown |
 | `pools` | `[]` | [Compute pools](#compute-pools), each with `name` and the overrides listed there |
+| `workers.enabled` | `false` | [Distributed execution](#distributed-execution) on worker pods |
+| `workers.maxReplicas` | `4` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
+| `workers.idleAfter` | `10m` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks |
+| `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |
+| `workers.existingSecret` | `""` | Secret with key `secret` (32+ characters) for `IGLOO_WORKER_SECRET`; generated and kept when empty |
+| `workers.duckdb.memoryLimit`, `threads` | `""`, `null` | As `duckdb.*`, from `workers.resources` |
+| `workers.duckdb.spillVolume.sizeLimit` / `medium` | `100Gi` / `""` | Workers' spill `emptyDir`; `IGLOO_DUCKDB_MAX_TEMP_SIZE` is 90% of it |
+| `workers.cacheVolume.sizeLimit` | `50Gi` | Workers' read cache `emptyDir`; the cache may use 90% of it |
+| `workers.resources` | requests `4` CPU / `16Gi`, limit `16Gi` | Worker container |
+| `workers.podLabels`, `podAnnotations`, `nodeSelector`, `tolerations` | | Worker pods |
+| `workers.affinity` | `{}` | Empty: prefer one worker per node |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |

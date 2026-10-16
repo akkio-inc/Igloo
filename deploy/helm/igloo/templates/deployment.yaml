@@ -42,8 +42,9 @@ spec:
     spec:
       serviceAccountName: {{ include "igloo.serviceAccountName" . }}
       # Cloud identity webhooks (IRSA, Azure workload identity) mount their own
-      # tokens; igloo never talks to the Kubernetes API.
-      automountServiceAccountToken: false
+      # tokens. igloo talks to the Kubernetes API only to start and stop
+      # distributed-execution workers (workers.yaml).
+      automountServiceAccountToken: {{ .Values.workers.enabled }}
       # Service links would put IGLOO_* variables into the environment for
       # Services named igloo-*.
       enableServiceLinks: false
@@ -331,6 +332,9 @@ spec:
             {{- with .Values.pricePerHour }}
             - name: IGLOO_PRICE_PER_HOUR
               value: {{ . | toString | quote }}
+            {{- end }}
+            {{- if .Values.workers.enabled }}
+            {{- include "igloo.coordinatorEnv" . | nindent 12 }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

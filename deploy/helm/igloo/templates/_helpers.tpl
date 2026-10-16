@@ -298,6 +298,9 @@ install (otherwise the first upgrade would restart every pod).
 {{- $url := printf "postgresql://igloo:%s@%s:5432/igloo" (b64dec $password) (include "igloo.postgresqlName" .) -}}
 {{- $_ := set $data "database-url" ($url | b64enc) -}}
 {{- end -}}
+{{- if and .Values.workers.enabled (not .Values.workers.existingSecret) -}}
+{{- $_ := set $data "worker-secret" (get $existing "worker-secret" | default (randAlphaNum 48 | b64enc)) -}}
+{{- end -}}
 {{- if .Values.objectStorage.enabled -}}
 {{- $_ := set $data "object-storage-access-key-id" (get $existing "object-storage-access-key-id" | default (randAlphaNum 20 | b64enc)) -}}
 {{- $_ := set $data "object-storage-secret-access-key" (get $existing "object-storage-secret-access-key" | default (randAlphaNum 40 | b64enc)) -}}
@@ -388,6 +391,10 @@ Outputs YAML comments describing what is missing in that case.
 
 {{- if and $v.sso.issuer (not $v.sso.clientId) -}}
 {{- fail (printf "%ssso.issuer is set, so sso.clientId must be set too: the client ID Igloo is registered under at the identity provider" $prefix) -}}
+{{- end -}}
+
+{{- if and $v.workers.enabled (lt (int $v.workers.maxReplicas) 1) -}}
+{{- fail (printf "%sworkers.maxReplicas must be at least 1 with workers.enabled" $prefix) -}}
 {{- end -}}
 
 {{- $missing := list -}}

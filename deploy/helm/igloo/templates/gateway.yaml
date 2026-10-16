@@ -71,6 +71,11 @@ spec:
               value: {{ include "igloo.serverName" . | quote }}
             - name: IGLOO_GATEWAY_K8S_REPLICAS
               value: {{ include "igloo.scaleToZeroReplicas" . | quote }}
+            {{- if .Values.workers.enabled }}
+            # Workers stop with the igloo pods that start them.
+            - name: IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT
+              value: {{ include "igloo.workersName" . | quote }}
+            {{- end }}
             - name: IGLOO_GATEWAY_BACKEND
               value: {{ printf "%s:5432" (include "igloo.serverServiceName" .) | quote }}
             {{- if .Values.console.enabled }}
@@ -148,8 +153,8 @@ spec:
       targetPort: http
       protocol: TCP
 ---
-# The gateway may read and change the igloo Deployment's replica count, and
-# nothing else.
+# The gateway may read and change the igloo Deployment's replica count (and
+# the workers', to stop them too), and nothing else.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -160,7 +165,11 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
-    resourceNames: [{{ include "igloo.serverName" . | quote }}]
+    resourceNames:
+      - {{ include "igloo.serverName" . | quote }}
+      {{- if .Values.workers.enabled }}
+      - {{ include "igloo.workersName" . | quote }}
+      {{- end }}
     verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -86,6 +86,11 @@ services:
       IGLOO_OPENLINEAGE_NAMESPACE: ${IGLOO_OPENLINEAGE_NAMESPACE:-igloo}
       IGLOO_OPENLINEAGE_SEND_SQL: ${IGLOO_OPENLINEAGE_SEND_SQL:-false}
       IGLOO_OPENLINEAGE_ALLOW_PRIVATE: ${IGLOO_OPENLINEAGE_ALLOW_PRIVATE:-false}
+      # Distributed execution (docs/distributed-execution.md): with
+      # IGLOO_WORKERS=worker and the "workers" profile, statements that read
+      # large tables run in parts on the worker containers.
+      IGLOO_WORKERS: ${IGLOO_WORKERS:-}
+      IGLOO_WORKER_SECRET: ${IGLOO_WORKER_SECRET:-}
     ports:
       # Loopback only by default. Set IGLOO_BIND=0.0.0.0 to accept remote
       # clients, and turn on TLS first (see .env).
@@ -119,6 +124,40 @@ services:
         condition: service_healthy
       lakekeeper:
         condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+        required: false
+
+  # Distributed-execution workers, enabled by adding "workers" to
+  # COMPOSE_PROFILES and setting IGLOO_WORKERS=worker in .env. Each runs
+  # parts of statements for igloo on its own DuckDB; on one machine they
+  # share its cores, so this is for trying distributed execution out and
+  # testing it. Only igloo can reach them, over TLS keyed by
+  # IGLOO_WORKER_SECRET.
+  worker:
+    build:
+      context: ../..
+    image: ${IGLOO_IMAGE:-igloo:dev}
+    profiles: ["workers"]
+    restart: unless-stopped
+    command: ["worker"]
+    deploy:
+      replicas: ${IGLOO_WORKER_REPLICAS:-2}
+    environment:
+      IGLOO_WORKER_SECRET: ${IGLOO_WORKER_SECRET:-}
+      IGLOO_WAREHOUSE_LOCATION: s3://${S3_BUCKET:?}/warehouse
+      IGLOO_ALLOWED_LOCATIONS: ${IGLOO_ALLOWED_LOCATIONS:-}
+      IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_WORKER_MEMORY_LIMIT:-}
+      IGLOO_DUCKDB_THREADS: ${IGLOO_WORKER_THREADS:-}
+      IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
+      IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
+      IGLOO_S3_REGION: ${S3_REGION:?}
+      IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}
+      IGLOO_S3_USE_SSL: ${S3_USE_SSL:?}
+      IGLOO_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      IGLOO_S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      IGLOO_LOG_FORMAT: ${IGLOO_LOG_FORMAT:-text}
+    depends_on:
       create-bucket:
         condition: service_completed_successfully
         required: false

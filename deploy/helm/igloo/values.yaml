@@ -351,6 +351,46 @@ pricePerHour: 0
 #     extraEnv: []
 pools: []
 
+# Distributed execution (docs/distributed-execution.md). Statements that read
+# large tables run in parts on worker pods, which igloo starts when a
+# statement needs them and stops when they have been idle; the chart leaves
+# their number to igloo. Give them their own node pool with a minimum size of
+# zero (nodeSelector, tolerations) so idle workers cost nothing.
+workers:
+  enabled: false
+  # The most worker pods igloo starts -> IGLOO_WORKER_MAX.
+  maxReplicas: 4
+  # Stop workers after this long without tasks -> IGLOO_WORKER_IDLE_AFTER.
+  idleAfter: 10m
+  # How long a statement waits for workers to start before it runs on one
+  # igloo pod instead -> IGLOO_WORKER_START_TIMEOUT. Allow for the cluster
+  # autoscaler adding nodes.
+  startTimeout: 3m
+  # Secret with key "secret" (at least 32 characters) -> IGLOO_WORKER_SECRET,
+  # which igloo and workers authenticate each other with. Generated and kept
+  # across upgrades when empty.
+  existingSecret: ""
+  duckdb:
+    # As duckdb.* for igloo pods, from workers.resources.
+    memoryLimit: ""
+    threads: null
+    spillVolume:
+      sizeLimit: 100Gi
+      medium: ""
+  # emptyDir for the read cache: data files the worker read, so repeated
+  # statements read them from local disk.
+  cacheVolume:
+    sizeLimit: 50Gi
+  resources:
+    requests: { cpu: "4", memory: 16Gi }
+    limits: { memory: 16Gi }
+  podLabels: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  # Empty: prefer one worker per node.
+  affinity: {}
+
 # Prometheus metrics are served on port 8080 at /metrics, through the
 # <fullname>-metrics ClusterIP Service (never through the SQL Service), and the
 # scale-to-zero gateway's through <fullname>-gateway-metrics.
