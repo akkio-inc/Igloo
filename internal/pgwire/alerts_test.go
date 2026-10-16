@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -603,8 +604,14 @@ func TestBuiltinAlertsFromSQL(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	expectRows(t, admin, "SELECT DISTINCT alert_type, alert_name, state FROM igloo.alert_history ORDER BY alert_name",
-		"builtin|failed_runs|triggered", "builtin|load_errors|triggered")
+	// The history records a delivery once it has completed, just after the
+	// receiver has the post.
+	history := "SELECT DISTINCT alert_type, alert_name, state FROM igloo.alert_history ORDER BY alert_name"
+	want := []string{"builtin|failed_runs|triggered", "builtin|load_errors|triggered"}
+	for deadline := time.Now().Add(10 * time.Second); !slices.Equal(texts(t, admin, history), want) && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	expectRows(t, admin, history, want...)
 	expectRows(t, walt, "SELECT count(*) FROM igloo.alert_history", "0")
 }
 
