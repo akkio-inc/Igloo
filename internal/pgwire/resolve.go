@@ -136,6 +136,8 @@ type resolver struct {
 	// whose role reads the rest (see external.go): table functions and
 	// other DuckDB databases are theirs to read.
 	external bool
+	// schemas caches the schemas of connections, by lower-cased name.
+	schemas map[string][]string
 }
 
 func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, error) {
@@ -461,6 +463,9 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 	case strings.EqualFold(o.db, r.catalog):
 		rs = readSet{scans: 1, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
 	case r.isExternal(o.db):
+		if err := r.distinctInCase(o); err != nil {
+			return rs, err
+		}
 		// The postgres and mysql extensions show a remote view as a table.
 		rs = readSet{
 			extScans:   []externalScan{{r.databases[strings.ToLower(o.db)], strings.ToLower(o.name)}},
@@ -474,6 +479,41 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 	}
 	r.readsOf[o.key()] = rs
 	return rs, nil
+}
+
+// distinctInCase refuses a table of a connection whose name, or whose
+// schema's name, differs only in case from another's in the same
+// connection. PostgreSQL, and MySQL on Linux, tell such names apart, and
+// DuckDB attaches both; but Igloo names a connection's schemas and tables
+// without case, in grants and policies as DuckDB does in SQL (which of the
+// two crm.s.CUSTOMERS means is DuckDB's choice), so a grant on one would
+// cover the other.
+func (r *resolver) distinctInCase(o object) error {
+	for _, p := range r.objects[strings.ToLower(o.name)] {
+		if strings.EqualFold(p.db, o.db) && strings.EqualFold(p.schema, o.schema) && (p.schema != o.schema || p.name != o.name) {
+			return denied("%s.%s.%s and %s.%s.%s differ only in case, which Igloo's grants and policies do not tell apart; "+
+				"rename one of them in the remote database", o.db, o.schema, o.name, p.db, p.schema, p.name)
+		}
+	}
+	db := strings.ToLower(o.db)
+	if _, ok := r.schemas[db]; !ok {
+		names, err := queryStrings(r.ctx, r.sess, `SELECT schema_name FROM system.main.duckdb_schemas()
+			WHERE system.main.lower(database_name) = $1`, db)
+		if err != nil {
+			return err
+		}
+		if r.schemas == nil {
+			r.schemas = map[string][]string{}
+		}
+		r.schemas[db] = names
+	}
+	for _, s := range r.schemas[db] {
+		if s != o.schema && strings.EqualFold(s, o.schema) {
+			return denied("schemas %s.%s and %s.%s differ only in case, which Igloo's grants and policies do not tell apart; "+
+				"rename one of them in the remote database", o.db, o.schema, o.db, s)
+		}
+	}
+	return nil
 }
 
 // ownDatabase reports whether db is the catalog, the local database or the

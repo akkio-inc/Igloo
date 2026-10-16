@@ -526,6 +526,11 @@ func (s *Server) connectionObjects(ctx context.Context, sess *session, kind stri
 		if err != nil || len(names) == 0 {
 			return "", false, err
 		}
+		if len(names) > 1 {
+			// Reads of either are refused (see resolver.distinctInCase).
+			return "", false, pgerror.WithCode(fmt.Errorf("connection %s has %s, which differ only in case; Igloo's grants do not tell them apart",
+				conn, strings.Join(names, " and ")), codes.AmbiguousAlias)
+		}
 		return names[0], true, nil
 	}
 	schema, ok, err := exact(`SELECT schema_name FROM system.main.duckdb_schemas()

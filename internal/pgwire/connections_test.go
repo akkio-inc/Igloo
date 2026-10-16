@@ -547,6 +547,70 @@ func TestConnectionGrants(t *testing.T) {
 	}
 }
 
+// TestConnectionNamesDifferingInCase checks that a connection's tables
+// and schemas whose names differ only in case, which PostgreSQL tells
+// apart but Igloo's grants do not, are refused to everyone but admins.
+func TestConnectionNamesDifferingInCase(t *testing.T) {
+	needExtensions(t)
+	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, pg.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx) //nolint:errcheck
+	schema, mixed := uniqueName("case_"), uniqueName("mixed_")
+	upper := strings.ToUpper(mixed[:1]) + mixed[1:]
+	for _, sql := range []string{
+		"CREATE SCHEMA " + schema,
+		"CREATE TABLE " + schema + ".customers (id int)",
+		"CREATE TABLE " + schema + `."Customers" (id int, secret text)`,
+		"CREATE TABLE " + schema + ".alone (id int)",
+		"CREATE SCHEMA " + mixed,
+		`CREATE SCHEMA "` + upper + `"`,
+		"CREATE TABLE " + mixed + ".t (id int)",
+		`CREATE TABLE "` + upper + `".u (secret text)`,
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), pg.url)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE; DROP SCHEMA "+mixed+` CASCADE; DROP SCHEMA "`+upper+`" CASCADE`)
+			_ = c.Close(context.Background())
+		}
+	})
+	store := federation.NewMemoryStore()
+	c := federation.New("crm", federation.Postgres)
+	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
+	if err := store.Create(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	fs := startFedServer(t, store)
+	rita := fs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, fs.admin, "GRANT SELECT ON CONNECTION crm TO rita")
+	for _, sql := range []string{
+		"SELECT * FROM crm." + schema + ".customers",
+		"SELECT * FROM crm." + schema + `."Customers"`,
+		"SELECT * FROM crm." + schema + ".CUSTOMERS",
+		"SELECT * FROM crm." + mixed + ".t",
+		`SELECT * FROM crm."` + upper + `".u`,
+	} {
+		expectDenied(t, rita, sql, "only in case")
+	}
+	expectAllowed(t, rita, "SELECT * FROM crm."+schema+".alone")
+	expectAllowed(t, fs.admin, "SELECT * FROM crm."+schema+".customers")
+	if _, err := fs.admin.Exec(ctx, "GRANT SELECT ON TABLE crm."+schema+".customers TO rita"); pgCode(err) != "42P09" {
+		t.Errorf("a grant on one of two tables differing in case: %v", err)
+	}
+	if _, err := fs.admin.Exec(ctx, "GRANT SELECT ON SCHEMA crm."+mixed+" TO rita"); pgCode(err) != "42P09" {
+		t.Errorf("a grant on one of two schemas differing in case: %v", err)
+	}
+	mustExec(t, fs.admin, "GRANT SELECT ON TABLE crm."+schema+".alone TO rita")
+}
+
 // laterAttach stands in for the federation manager in the checks of
 // reads, with its connections hidden until attach: as if they were
 // attached after statements were prepared, which Igloo does not do today.
