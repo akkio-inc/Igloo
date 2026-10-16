@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,11 +111,12 @@ type fedServer struct {
 	*catalogServer
 	fed   *federation.Manager
 	store *federation.MemoryStore
+	srv   *Server
 }
 
 // startFedServer starts a server that attaches store's connections when
 // its engine opens, as Igloo does on startup.
-func startFedServer(t *testing.T, store *federation.MemoryStore) *fedServer {
+func startFedServer(t *testing.T, store *federation.MemoryStore, hooks ...func(*Server)) *fedServer {
 	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -144,6 +146,9 @@ func startFedServer(t *testing.T, store *federation.MemoryStore) *fedServer {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, hook := range hooks {
+		hook(srv)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -165,7 +170,7 @@ func startFedServer(t *testing.T, store *federation.MemoryStore) *fedServer {
 	} {
 		mustExec(t, cs.admin, sql)
 	}
-	return &fedServer{catalogServer: cs, fed: fed, store: store}
+	return &fedServer{catalogServer: cs, fed: fed, store: store, srv: srv}
 }
 
 // pgFixture creates a schema with two tables in the test PostgreSQL and
@@ -390,11 +395,13 @@ func TestConnectionGrants(t *testing.T) {
 			expectAllowed(t, nina, "SELECT * FROM lake.public.audiences a JOIN "+customers+" c ON c.id = a.customer_id")
 
 			// Revoking reaches prepared statements.
+			expectQueryAllowed(t, rita, "SELECT * FROM "+customers)
+			expectQueryAllowed(t, rita, "SELECT * FROM "+mine)
 			mustExec(t, fs.admin, "REVOKE SELECT ON TABLE "+customers+" FROM "+userName(t, rita))
 			// Twice: a statement refused when checked again stays refused.
 			for range 2 {
-				expectDenied(t, rita, "SELECT * FROM "+customers, "customers")
-				expectDenied(t, rita, "SELECT * FROM "+mine, "customers")
+				expectQueryDenied(t, rita, "SELECT * FROM "+customers, "customers")
+				expectQueryDenied(t, rita, "SELECT * FROM "+mine, "customers")
 			}
 
 			// A grant on the whole connection covers its schemas, the
@@ -406,9 +413,9 @@ func TestConnectionGrants(t *testing.T) {
 			// Replacing a view so it reads a connection reaches statements
 			// prepared before.
 			mustExec(t, fs.admin, "CREATE OR REPLACE VIEW "+mine+" AS SELECT * FROM lake.public.audiences")
-			expectAllowed(t, rita, "SELECT * FROM "+mine)
+			expectQueryAllowed(t, rita, "SELECT * FROM "+mine)
 			mustExec(t, fs.admin, "CREATE OR REPLACE VIEW "+mine+" AS SELECT * FROM "+pii)
-			expectDenied(t, rita, "SELECT * FROM "+mine, "pii")
+			expectQueryDenied(t, rita, "SELECT * FROM "+mine, "pii")
 		})
 	}
 
@@ -416,6 +423,18 @@ func TestConnectionGrants(t *testing.T) {
 	walt := fs.user(t, "walt_misc", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, fs.admin, "GRANT SELECT ON TABLE "+customers+" TO rita_misc")
 	mustExec(t, fs.admin, "GRANT SELECT ON TABLE "+customers+" TO walt_misc")
+
+	// Creating a view of a connection's tables needs a grant on them,
+	// though the view reads with its readers' grants.
+	expectDenied(t, walt, "CREATE VIEW lake.public.v_pii AS SELECT * FROM "+pii, "pii")
+	expectDenied(t, walt, "CREATE OR REPLACE VIEW lake.public.v_pii AS SELECT c.* FROM "+customers+" c JOIN "+pii+" p USING (id)", "pii")
+	expectDenied(t, walt, "CREATE TEMP VIEW v_pii AS SELECT * FROM "+pii, "pii")
+	mustExec(t, walt, "CREATE VIEW lake.public.v_customers AS SELECT * FROM "+customers)
+	mustExec(t, walt, "CREATE TEMP VIEW v_customers AS SELECT * FROM "+customers)
+	expectAllowed(t, walt, "SELECT * FROM v_customers")
+	expectAllowed(t, rita, "SELECT * FROM lake.public.v_customers")
+	mustExec(t, fs.admin, "CREATE VIEW lake.public.v_pii AS SELECT * FROM "+pii)
+	expectDenied(t, rita, "SELECT * FROM lake.public.v_pii", "pii")
 
 	// Connections are read-only, and only SELECT is granted on them.
 	if _, err := fs.admin.Exec(context.Background(), "GRANT INSERT ON TABLE "+customers+" TO rita_misc"); pgCode(err) != "0LP01" {
@@ -528,6 +547,101 @@ func TestConnectionGrants(t *testing.T) {
 	}
 }
 
+// laterAttach stands in for the federation manager in the checks of
+// reads, with its connections hidden until attach: as if they were
+// attached after statements were prepared, which Igloo does not do today.
+type laterAttach struct {
+	m        *federation.Manager
+	attached atomic.Bool
+	gen      atomic.Uint64
+}
+
+func (l *laterAttach) Catalogs() map[string]federation.Type {
+	if !l.attached.Load() {
+		return nil
+	}
+	return l.m.Catalogs()
+}
+
+func (l *laterAttach) Generation() uint64 { return l.m.Generation() + l.gen.Load() }
+
+func (l *laterAttach) attach() {
+	l.attached.Store(true)
+	l.gen.Add(1)
+}
+
+// TestConnectionAttachedLater checks that a statement prepared while no
+// connection was attached is checked again before it runs once one is,
+// whatever its user's role: replacing a view it reads so that it reads the
+// connection does not get past the checks.
+func TestConnectionAttachedLater(t *testing.T) {
+	needExtensions(t)
+	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
+	schema := pgFixture(t, pg)
+	store := federation.NewMemoryStore()
+	c := federation.New("crm", federation.Postgres)
+	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
+	c.Schemas = []string{schema}
+	if err := store.Create(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	later := &laterAttach{}
+	fs := startFedServer(t, store, func(s *Server) {
+		later.m = s.fed
+		s.remotes = later
+	})
+	view := "memory.main." + uniqueName("v_")
+	mustExec(t, fs.admin, "CREATE VIEW "+view+" AS SELECT segment FROM lake.public.audiences")
+	q := "SELECT count(*) FROM " + view
+	rita := fs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeCacheStatement)
+	walt := fs.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeCacheStatement)
+	for _, conn := range []*pgx.Conn{rita, walt} {
+		if n := count(t, conn, q); n != 3 {
+			t.Fatalf("%s before: %d", userName(t, conn), n)
+		}
+	}
+	later.attach()
+	mustExec(t, fs.admin, "CREATE OR REPLACE VIEW "+view+" AS SELECT ssn AS segment FROM crm."+schema+".pii")
+	for _, conn := range []*pgx.Conn{rita, walt} {
+		expectQueryDenied(t, conn, q, "pii")
+	}
+}
+
+// expectQueryDenied runs sql as a query, which a connection that caches
+// statements runs as the statement it prepared the last time; Exec without
+// arguments would send it again with the simple protocol.
+func expectQueryDenied(t *testing.T, conn *pgx.Conn, sql string, mentions ...string) {
+	t.Helper()
+	err := runQuery(conn, sql)
+	if pgCode(err) != "42501" {
+		t.Errorf("%s: want 42501, got %v", sql, err)
+		return
+	}
+	for _, m := range mentions {
+		if !strings.Contains(err.Error(), m) {
+			t.Errorf("%s: error %q does not mention %q", sql, err, m)
+		}
+	}
+}
+
+func expectQueryAllowed(t *testing.T, conn *pgx.Conn, sql string) {
+	t.Helper()
+	if err := runQuery(conn, sql); err != nil {
+		t.Errorf("%s: %v", sql, err)
+	}
+}
+
+func runQuery(conn *pgx.Conn, sql string) error {
+	rows, err := conn.Query(context.Background(), sql)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+	}
+	rows.Close()
+	return rows.Err()
+}
+
 // userName is the user a test connection signed in as.
 func userName(t *testing.T, conn *pgx.Conn) string {
 	t.Helper()
@@ -551,12 +665,16 @@ func TestMySQLConnectionGrants(t *testing.T) {
 	}
 	defer sc.Close() //nolint:errcheck
 	dsn := "host=" + my.host + " port=" + strconv.Itoa(my.port) + " user=" + my.user + " password=" + my.password + " database=" + my.database
-	for _, sql := range []string{
+	var stmts []string
+	if dir := os.Getenv("IGLOO_TEST_EXTENSION_DIR"); dir != "" {
+		stmts = append(stmts, "SET extension_directory = "+quoteLiteral(dir))
+	}
+	for _, sql := range append(stmts,
 		"LOAD mysql",
-		"ATTACH '" + dsn + "' AS setup (TYPE mysql)",
-		"CALL mysql_execute('setup', 'CREATE TABLE " + table + " (id INT PRIMARY KEY, client VARCHAR(20), budget INT)')",
-		"CALL mysql_execute('setup', 'INSERT INTO " + table + " VALUES (2, ''acme'', 100), (4, ''acme'', 200), (5, ''globex'', 300)')",
-	} {
+		"ATTACH '"+dsn+"' AS setup (TYPE mysql)",
+		"CALL mysql_execute('setup', 'CREATE TABLE "+table+" (id INT PRIMARY KEY, client VARCHAR(20), budget INT)')",
+		"CALL mysql_execute('setup', 'INSERT INTO "+table+" VALUES (2, ''acme'', 100), (4, ''acme'', 200), (5, ''globex'', 300)')",
+	) {
 		if _, err := sc.(*duckdb.Conn).ExecContext(ctx, sql, nil); err != nil {
 			t.Fatal(err)
 		}

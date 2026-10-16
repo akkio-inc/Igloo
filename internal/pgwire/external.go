@@ -12,6 +12,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -60,15 +61,23 @@ func sameScans(a, b []externalScan) bool {
 	return slices.Equal(ka, kb)
 }
 
+// connectionSource is what checks of reads know of connections: those
+// attached, by lower-cased name, and a generation that changes whenever
+// one is attached, changed or dropped. *federation.Manager is one.
+type connectionSource interface {
+	Catalogs() map[string]federation.Type
+	Generation() uint64
+}
+
 // externalCatalogs returns the names, lower-cased, and types of the
 // attached databases that are not DuckDB's own or the Iceberg catalog: the
 // connections. It is empty without any.
 func (s *Server) externalCatalogs() map[string]string {
-	if s.fed == nil {
+	if s.remotes == nil {
 		return nil
 	}
 	out := map[string]string{}
-	for name, t := range s.fed.Catalogs() {
+	for name, t := range s.remotes.Catalogs() {
 		out[name] = string(t)
 	}
 	return out
@@ -81,25 +90,34 @@ func isExternalType(t string) bool {
 }
 
 // authorizeExternal checks what a statement reads from connections, for
-// every user but admins, unless readTables already did. acc is what the
-// statement's other checks found, nil when its role allowed it. It returns
-// acc with what it found added, or a new access when acc is nil and
-// connections are attached, so the statement is checked again when grants,
-// views or connections change; on an error the caller keeps what it had.
-func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth.User, st *statement, query string, acc *access) (*access, error) {
+// every user but admins, unless readTables already did. It checks the
+// statement as it runs, st.query, which policies may have rewritten. acc is
+// what the statement's other checks found, nil when its role allowed it.
+//
+// For every user but admins it returns an access, acc with what it found
+// added or a new one, even when no connection is attached: the access
+// holds the catalog's generation, which every change to connections
+// changes too (see catalogGeneration), so the statement is checked again
+// before it runs once a connection is attached, changed or dropped, or a
+// view it reads is replaced, whatever its role. For admins it returns acc,
+// with their reads added for the history. On an error the caller keeps
+// what it had.
+func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth.User, st *statement, acc *access) (*access, error) {
+	admin := user.Role == auth.RoleAdmin
 	if len(s.externalCatalogs()) == 0 {
-		// Nothing to read. This leaves a statement its role allows
-		// unchecked from then on, which holds only because connections are
-		// attached before any session starts (see federation.Manager.Attach)
-		// and never after: a statement prepared now cannot come to read
-		// one. Attaching connections later would need every non-admin
-		// statement checked again when one is attached.
-		return acc, nil
+		// Nothing to read yet.
+		if admin || acc != nil {
+			return acc, nil
+		}
+		// Grants only tell when the decision is stale; without them it is
+		// stale at once, and cheap to make again.
+		privs, _ := s.privileges(ctx, sess, user)
+		return &access{checked: time.Now(), privs: privs, catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}, nil
 	}
 	if st.stmtType == duckdb.STATEMENT_TYPE_DETACH {
 		// Even admins drop connections with DROP CONNECTION: a detached
 		// connection cannot be attached again until Igloo restarts.
-		names := append(sqllex.CodeWords(query), sqllex.QuotedIdentifiers(query)...)
+		names := append(sqllex.CodeWords(st.query), sqllex.QuotedIdentifiers(st.query)...)
 		for _, q := range names {
 			if _, ok := s.externalCatalogs()[strings.ToLower(q)]; ok {
 				return nil, denied("%s is a connection; use DROP CONNECTION", strings.ToLower(q))
@@ -109,8 +127,15 @@ func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth
 	if acc != nil && acc.externalChecked {
 		return acc, nil
 	}
-	admin := user.Role == auth.RoleAdmin
-	objects, err := s.externalReads(ctx, sess, st, query)
+	if admin && viewQuery(st.query) != "" {
+		// Creating a view reads nothing; nor is it for the history.
+		return acc, nil
+	}
+	planText, parseText, err := externalTexts(st.stmtType, st.query, st.prepared)
+	var objects []auth.Object
+	if err == nil && planText != "" {
+		objects, err = s.externalReads(ctx, sess, planText, parseText, st.policyMarker())
+	}
 	if admin && (err != nil || len(objects) == 0) {
 		// Admins may read anything; what they read is only for the
 		// history.
@@ -125,7 +150,7 @@ func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth
 	} else {
 		out = access{checked: time.Now(), catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
 	}
-	out.externalChecked = true
+	out.externalChecked, out.ranStatements = true, out.ranStatements || planText != ""
 	out.read = append(slices.Clone(out.read), objects...)
 	if !admin {
 		privs, err := s.privileges(ctx, sess, user)
@@ -145,13 +170,36 @@ func (s *Server) authorizeExternal(ctx context.Context, sess *session, user auth
 	return &out, nil
 }
 
-// externalReads returns every object of a connection a statement may read,
-// or an error when that cannot be worked out.
-func (s *Server) externalReads(ctx context.Context, sess *session, st *statement, query string) ([]auth.Object, error) {
-	planText, parseText, err := externalTexts(st.stmtType, query, st.prepared)
-	if err != nil || planText == "" {
-		return nil, err
+// authorizeViewReads checks what the query of a view that user creates
+// reads from connections: like the statements that read it later, the
+// view may read only connection tables user may read. Views read with the
+// grants of whoever reads them; this keeps users from leaving views that
+// read what they themselves may not.
+func (s *Server) authorizeViewReads(ctx context.Context, sess *session, user auth.User, query string) error {
+	if user.Role == auth.RoleAdmin || len(s.externalCatalogs()) == 0 {
+		return nil
 	}
+	objects, err := s.externalReads(ctx, sess, query, query, "")
+	if err != nil || len(objects) == 0 {
+		return err
+	}
+	privs, err := s.privileges(ctx, sess, user)
+	if err != nil {
+		return denied("could not load grants: %v", err)
+	}
+	for _, o := range objects {
+		if n := (need{auth.PrivilegeSelect, o}); !allows(user, privs, n) {
+			return needError(user, n)
+		}
+	}
+	return nil
+}
+
+// externalReads returns every object of a connection that reading
+// planText, which DuckDB plans, and parseText, its query as written, may
+// read, or an error when that cannot be worked out. policyMarker marks the
+// tables that policies read in a statement they rewrote.
+func (s *Server) externalReads(ctx context.Context, sess *session, planText, parseText, policyMarker string) ([]auth.Object, error) {
 	plan, err := explainLogical(ctx, sess.conn, planText)
 	if err != nil {
 		return nil, denied("cannot analyze which tables of connections this statement reads: %v", err)
@@ -170,7 +218,7 @@ func (s *Server) externalReads(ctx context.Context, sess *session, st *statement
 	if err != nil {
 		return nil, err
 	}
-	r.external = true
+	r.external, r.policyMarker = true, policyMarker
 	reads, err := r.analyze(parseText, nil, 0)
 	if err != nil {
 		return nil, err
@@ -216,8 +264,41 @@ func externalTexts(t duckdb.StmtType, query, prepared string) (planText, parseTe
 			return "", "", nil
 		}
 		return prepared, sel, nil
+	case duckdb.STATEMENT_TYPE_CREATE:
+		if isCreateView(query) {
+			// The view's query, as reading it would.
+			q := viewQuery(query)
+			if q == "" {
+				return "", "", denied("cannot analyze this CREATE VIEW")
+			}
+			return q, q, nil
+		}
 	}
 	return readTexts(t, query, prepared)
+}
+
+// isCreateView reports whether query is CREATE [OR REPLACE] [TEMP] VIEW.
+func isCreateView(query string) bool {
+	sc := &scanner{s: query}
+	if !sc.keywords("CREATE") {
+		return false
+	}
+	sc.keywords("OR", "REPLACE")
+	_ = sc.keywords("TEMP") || sc.keywords("TEMPORARY")
+	return sc.keywords("VIEW")
+}
+
+// viewQuery returns the query of CREATE [OR REPLACE] [TEMP] VIEW ... AS
+// query, or "".
+func viewQuery(query string) string {
+	if !isCreateView(query) {
+		return ""
+	}
+	i := topLevelKeyword(query, "AS")
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query[i+2:]), ";"))
 }
 
 // copySource returns the query a COPY ... TO reads: the table it copies, as
@@ -349,7 +430,7 @@ func fnRefs(names []string) []fnRef {
 // databaseTypes returns every attached database's type, by lower-cased
 // name.
 func databaseTypes(ctx context.Context, sess *session) (map[string]string, error) {
-	rows, err := sess.conn.QueryContext(ctx, "SELECT lower(database_name), type FROM duckdb_databases()", nil)
+	rows, err := sess.conn.QueryContext(ctx, "SELECT system.main.lower(database_name), type FROM system.main.duckdb_databases()", nil)
 	if err != nil {
 		return nil, err
 	}

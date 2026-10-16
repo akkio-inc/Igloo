@@ -208,6 +208,14 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 			return nil, true, err
 		}
 	}
+	if isView && !view.drop {
+		if err := s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, user, view.query)); err != nil {
+			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+			s.metrics.query(time.Now(), err)
+			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
+			return nil, true, err
+		}
+	}
 
 	var run func(context.Context) error
 	var tag string

@@ -41,6 +41,9 @@ type access struct {
 	written []auth.Object
 	// externalChecked is set once reads from connections were checked.
 	externalChecked bool
+	// ranStatements says the checks ran statements on the session's
+	// connection, after which the statement is prepared again.
+	ranStatements bool
 	// checked is when the decision was made, with which privileges, and
 	// with the catalog and session settings at which generations. DuckDB
 	// binds a prepared statement again when the catalog changes, with the
@@ -60,8 +63,8 @@ func (s *Server) catalogGeneration() uint64 {
 	if s.ddl != nil {
 		g += s.ddl.Generation()
 	}
-	if s.fed != nil {
-		g += s.fed.Generation()
+	if s.remotes != nil {
+		g += s.remotes.Generation()
 	}
 	return g
 }
@@ -108,7 +111,7 @@ func (s *Server) authorizeByGrants(ctx context.Context, sess *session, user auth
 		return nil, roleErr
 	}
 
-	acc := &access{checked: time.Now(), privs: privs, catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
+	acc := &access{checked: time.Now(), privs: privs, catalogGen: s.catalogGeneration(), settingGen: sess.settingGen, ranStatements: true}
 	needs, written, err := s.writeNeeds(ctx, sess, st.stmtType, query)
 	if errors.Is(err, errNoGrantPath) {
 		return nil, roleErr

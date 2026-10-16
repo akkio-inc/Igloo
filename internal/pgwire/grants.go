@@ -528,7 +528,8 @@ func (s *Server) connectionObjects(ctx context.Context, sess *session, kind stri
 		}
 		return names[0], true, nil
 	}
-	schema, ok, err := exact(`SELECT schema_name FROM duckdb_schemas() WHERE database_name = $1 AND lower(schema_name) = lower($2)`, conn, name[1])
+	schema, ok, err := exact(`SELECT schema_name FROM system.main.duckdb_schemas()
+		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2)`, conn, name[1])
 	if err != nil {
 		return nil, true, err
 	}
@@ -546,7 +547,7 @@ func (s *Server) connectionObjects(ctx context.Context, sess *session, kind stri
 			return nil, true, pgerror.WithCode(fmt.Errorf("connection %s is not attached on this replica yet; grant on the schema instead", conn),
 				codes.ObjectNotInPrerequisiteState)
 		}
-		tables, err := queryStrings(ctx, sess, `SELECT table_name FROM duckdb_tables()
+		tables, err := queryStrings(ctx, sess, `SELECT table_name FROM system.main.duckdb_tables()
 			WHERE database_name = $1 AND schema_name = $2 ORDER BY 1`, conn, schema)
 		if err != nil {
 			return nil, true, err
@@ -557,8 +558,8 @@ func (s *Server) connectionObjects(ctx context.Context, sess *session, kind stri
 		}
 		return objects, true, nil
 	}
-	table, ok, err := exact(`SELECT table_name FROM duckdb_tables() WHERE database_name = $1 AND schema_name = $2
-		AND lower(table_name) = lower($3)`, conn, schema, name[2])
+	table, ok, err := exact(`SELECT table_name FROM system.main.duckdb_tables() WHERE database_name = $1 AND schema_name = $2
+		AND system.main.lower(table_name) = system.main.lower($3)`, conn, schema, name[2])
 	if err != nil {
 		return nil, true, err
 	}

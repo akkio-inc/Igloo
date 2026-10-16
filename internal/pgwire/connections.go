@@ -330,7 +330,7 @@ func (s *Server) createConnection(ctx context.Context, sess *session, me auth.Us
 		}
 	}
 	conn.CreatedBy = me.Name
-	taken, err := queryStrings(ctx, sess, "SELECT database_name FROM duckdb_databases()")
+	taken, err := queryStrings(ctx, sess, "SELECT database_name FROM system.main.duckdb_databases()")
 	if err != nil {
 		return err
 	}

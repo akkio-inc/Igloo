@@ -191,8 +191,11 @@ type Server struct {
 	// external tables.
 	shares   *sharing.Service
 	external externalCatalog
-	// fed keeps the connections to other databases (see external.go).
-	fed *federation.Manager
+	// fed keeps the connections to other databases (see external.go), and
+	// remotes is what reads are checked against: fed, unless a test
+	// stands in for it.
+	fed     *federation.Manager
+	remotes connectionSource
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -256,6 +259,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	if s.tasks == nil {
 		s.tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{Log: log})
+	}
+	if s.fed != nil {
+		s.remotes = s.fed
 	}
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
@@ -983,8 +989,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		err = s.authorizeLocal(user.Role, st.stmtType, text)
 	}
 	if err == nil {
-		// What it reads from connections, whatever the role.
-		st.access, err = s.authorizeExternal(ctx, sess, user, st, query, st.access)
+		// What it reads from connections, whatever the role, with a
+		// record that has it checked again when they change.
+		st.access, err = s.authorizeExternal(ctx, sess, user, st, st.access)
 	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
@@ -994,7 +1001,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if st.stmtType == duckdb.STATEMENT_TYPE_DROP || st.stmtType == duckdb.STATEMENT_TYPE_ALTER {
 		st.effect = s.ddlEffect(ctx, sess, query)
 	}
-	if st.access != nil {
+	if st.access != nil && st.access.ranStatements {
 		// Checking grants ran statements on the session's connection.
 		if err := st.reprepare(ctx, sess.conn); err != nil {
 			_ = st.close()
@@ -1059,16 +1066,18 @@ func startsQuery(query string) bool {
 	return toks[0].punct == '('
 }
 
-// recheckGrants decides again, before it runs, a statement that grants
-// allowed, if the decision may be stale: the session's grants were reloaded
-// since, the catalog or the session's settings changed, or the decision is
-// as old as the role refresh interval. A prepared statement then outlives a
-// REVOKE no longer than a session's cached grants do, and cannot be made to
-// read a table nobody checked by replacing a view or changing the search
-// path before it runs. force decides again regardless, as after policies
-// rewrote the statement anew.
+// recheckGrants decides again, before it runs, a statement of a user who is
+// not an admin, or of an admin that reads connections, if the decision may
+// be stale: the session's grants were reloaded since, the catalog, the
+// connections or the session's settings changed, or the decision is as old
+// as the role refresh interval. A prepared statement then outlives a REVOKE
+// no longer than a session's cached grants do, and cannot be made to read a
+// table nobody checked by replacing a view, attaching a connection or
+// changing the search path before it runs. force decides again regardless,
+// as after policies rewrote the statement anew.
 func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement, force bool) error {
 	if st.access == nil {
+		// An admin's statement that reads no connection.
 		return nil
 	}
 	user, err := s.refreshUser(ctx, sess)
@@ -1091,17 +1100,19 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 		}
 	}
 	// What it reads from connections, whatever the role.
-	if acc, err = s.authorizeExternal(ctx, sess, user, st, st.sourceText(), acc); err != nil {
+	if acc, err = s.authorizeExternal(ctx, sess, user, st, acc); err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		return err
 	}
 	if acc == nil {
-		// The role allows it and no connection is attached any more.
+		// An admin's statement that reads no connection.
 		st.access = nil
 		return nil
 	}
-	if err := st.reprepare(ctx, sess.conn); err != nil {
-		return pgError(err)
+	if acc.ranStatements {
+		if err := st.reprepare(ctx, sess.conn); err != nil {
+			return pgError(err)
+		}
 	}
 	st.access = acc
 	return nil

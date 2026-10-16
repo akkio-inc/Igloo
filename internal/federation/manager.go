@@ -117,8 +117,9 @@ func (t Type) extension() string {
 
 // Attach attaches every registered connection on conn, the engine's setup
 // connection, before the sandbox is locked (see engine.BeforeLockdown) and
-// so before any session starts; nothing is attached after that, which
-// package pgwire's checks rely on (see authorizeExternal there). A
+// so before any session starts; nothing is attached after that. Each
+// attachment changes Generation, which package pgwire's checks follow, so
+// they would hold if connections were attached later too. A
 // connection whose database cannot be reached is left out, with the
 // reason, so one database being down never stops Igloo from starting; the
 // remote databases are tried all at once, so startup waits at most about
