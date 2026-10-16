@@ -400,7 +400,7 @@ func serve() error {
 		if err != nil {
 			return fmt.Errorf("iceberg: %w", err)
 		}
-		deps := icebergDeps{sql: srv, users: users, grants: grants, history: history, work: work, reg: reg, tls: tlsConfig}
+		deps := icebergDeps{sql: srv, users: users, grants: grants, history: history, work: work, reg: reg, tls: tlsConfig, clones: guard}
 		if icebergSrv, err = serveIceberg(ctx, icebergLn, cfg, deps, errc, log); err != nil {
 			_ = icebergLn.Close()
 			return err

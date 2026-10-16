@@ -403,6 +403,10 @@ CREATE OR REPLACE SCHEMA dev CLONE prod;       -- make dev a fresh copy of prod
   whichever table is compacted, expires snapshots, loses orphan files or is
   dropped; a source's old files are deleted once no clone reads them either.
   See [files that clones share](operations.md#files-that-clones-share).
+- **Other engines.** Through the [Iceberg REST
+  catalog](external-engines.md#clones), engines get no storage credentials
+  for a clone, and cannot purge a table whose files clones read nor delete
+  its files with the credentials they get for it.
 - Tables of format version 1 and encrypted tables cannot be cloned, nor can
   a view on its own. `CLONE` runs outside transactions.
 

@@ -165,8 +165,9 @@ type tableUpdate struct {
 	Snapshot *struct {
 		Summary map[string]string `json:"summary"`
 	} `json:"snapshot"`
-	// Updates are set-properties'.
-	Updates map[string]string `json:"updates"`
+	// Updates are set-properties', and Removals remove-properties'.
+	Updates  map[string]string `json:"updates"`
+	Removals []string          `json:"removals"`
 }
 
 // commitNeeds is what a commit needs of its user.
@@ -254,6 +255,17 @@ func (req commitRequest) propertyKeys() []string {
 			for k := range u.Updates {
 				keys = append(keys, k)
 			}
+		}
+	}
+	return keys
+}
+
+// removedKeys are the table properties a commit removes.
+func (req commitRequest) removedKeys() []string {
+	var keys []string
+	for _, u := range req.Updates {
+		if u.Action == "remove-properties" {
+			keys = append(keys, u.Removals...)
 		}
 	}
 	return keys

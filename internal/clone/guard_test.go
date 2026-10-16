@@ -5,12 +5,66 @@ import (
 	"encoding/json"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/clone/clonetest"
 )
+
+func TestReaders(t *testing.T) {
+	ctx := context.Background()
+	cat := clonetest.New(t.TempDir())
+	src := source(t, cat)
+	store := clone.NewMemoryStore()
+	if _, err := clone.NewManager(cat, store, quiet()).Clone(ctx,
+		clone.Request{Source: table.Identifier{"prod", "events"}, Target: table.Identifier{"dev", "events"}}); err != nil {
+		t.Fatal(err)
+	}
+	g := clone.NewGuard(cat, store, quiet())
+	readers := func() []string {
+		t.Helper()
+		names, release, err := g.Readers(ctx, src.Location())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Held: no clone of the source can be made meanwhile.
+		if _, ok, _ := store.Lock(ctx, []string{src.Location()}, false); ok {
+			t.Fatal("Readers does not hold the source's files")
+		}
+		release()
+		return names
+	}
+	if got := readers(); !slices.Equal(got, []string{"dev.events"}) {
+		t.Fatalf("readers: %v", got)
+	}
+	// Renamed: found under its new name.
+	cat.Rename(table.Identifier{"dev", "events"}, table.Identifier{"dev", "renamed"})
+	if got := readers(); !slices.Equal(got, []string{"dev.renamed"}) {
+		t.Fatalf("readers after a rename: %v", got)
+	}
+	// Dropped: gone once its share is too old to be a clone in the making.
+	cat.Drop(table.Identifier{"dev", "renamed"})
+	if got := readers(); len(got) != 1 {
+		t.Fatalf("readers just after a drop: %v", got)
+	}
+	shares, _ := store.All(ctx)
+	for _, s := range shares {
+		_ = store.Remove(ctx, s.Clone, s.Location)
+		s.Created = s.Created.Add(-2 * time.Hour)
+		_ = store.Add(ctx, []clone.Share{s})
+	}
+	if got := readers(); len(got) != 0 {
+		t.Fatalf("readers of a dropped clone: %v", got)
+	}
+	if shared, err := g.Shared(ctx, src.Location()); err != nil || !shared {
+		t.Fatalf("Shared: %v %v", shared, err)
+	}
+	if got := g.Sources(src.Properties()); len(got) != 0 {
+		t.Fatalf("the source counts as a clone: %v", got)
+	}
+}
 
 func TestReleaseForgetsWhatIsNoLongerShared(t *testing.T) {
 	ctx := context.Background()

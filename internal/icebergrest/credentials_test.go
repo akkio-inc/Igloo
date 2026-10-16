@@ -66,7 +66,7 @@ func TestS3Vendor(t *testing.T) {
 	v, f, heads := newTestVendor(t, "storage:9000", "")
 	ctx := context.Background()
 
-	creds, err := v.Vend(ctx, "s3://bucket/wh/0193/0194/", false, "nora")
+	creds, err := v.Vend(ctx, "s3://bucket/wh/0193/0194/", ReadFiles, "nora")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestS3Vendor(t *testing.T) {
 		len(*heads) != 1 || (*heads)[0] != "ASIAigloo-check wh/.igloo-credential-check-outside" {
 		t.Fatalf("check: %d calls, heads %v", len(f.calls), *heads)
 	}
-	if _, err := v.Vend(ctx, "s3://bucket/wh/0193/0195", true, "walt"); err != nil || len(f.calls) != 3 || len(*heads) != 1 {
+	if _, err := v.Vend(ctx, "s3://bucket/wh/0193/0195", WriteFiles, "walt"); err != nil || len(f.calls) != 3 || len(*heads) != 1 {
 		t.Errorf("second vend: %v, %d calls", err, len(f.calls))
 	}
 	if d := *f.calls[1].DurationSeconds; d != 3600 {
@@ -114,8 +114,16 @@ func TestS3Vendor(t *testing.T) {
 		got.Condition["StringLike"]["s3:prefix"][0] != "wh/0193/0194/*" {
 		t.Errorf("list statement: %s", *f.calls[1].Policy)
 	}
-	if !strings.Contains(*f.calls[2].Policy, `"s3:PutObject","s3:DeleteObject"`) || strings.Contains(*f.calls[1].Policy, "PutObject") {
+	if !strings.Contains(*f.calls[2].Policy, `"s3:PutObject"`) || !strings.Contains(*f.calls[2].Policy, `"s3:DeleteObject"`) ||
+		strings.Contains(*f.calls[1].Policy, "PutObject") {
 		t.Errorf("write policy: %s", *f.calls[2].Policy)
+	}
+	// A table whose files clones read: written, never deleted.
+	if _, err := v.Vend(ctx, "s3://bucket/wh/0193/0196", AddFiles, "walt"); err != nil {
+		t.Fatal(err)
+	}
+	if p := *f.calls[3].Policy; !strings.Contains(p, `"s3:PutObject"`) || strings.Contains(p, "DeleteObject") {
+		t.Errorf("write policy without deletes: %s", p)
 	}
 	if strings.Contains(*f.calls[1].Policy, "kms:") {
 		t.Errorf("S3-compatible stores have no KMS: %s", *f.calls[1].Policy)
@@ -127,13 +135,13 @@ func TestS3Vendor(t *testing.T) {
 		"s3://other/wh/t", "s3://bucket/elsewhere/t", "s3://bucket/wh", "s3://bucket/wh/*", "s3://bucket/wh/a/../../x",
 		"s3://bucket/wh/${aws:username}", "s3://bucket/wh/t?x=1", "gs://bucket/wh/t", "s3://bucket/wh//t", "s3://bucket/wh/t%2A",
 	} {
-		if _, err := v.Vend(ctx, loc, false, "nora"); !errors.Is(err, ErrNoCredentials) {
+		if _, err := v.Vend(ctx, loc, ReadFiles, "nora"); !errors.Is(err, ErrNoCredentials) {
 			t.Errorf("%s: got %v", loc, err)
 		}
 	}
 
 	f.err = errors.New("throttled")
-	if _, err := v.Vend(ctx, "s3://bucket/wh/0193/0194", false, "nora"); err == nil || errors.Is(err, ErrNoCredentials) {
+	if _, err := v.Vend(ctx, "s3://bucket/wh/0193/0194", ReadFiles, "nora"); err == nil || errors.Is(err, ErrNoCredentials) {
 		t.Errorf("STS failure: %v", err)
 	}
 }
@@ -142,7 +150,7 @@ func TestS3VendorRefusesStoresThatIgnoreThePolicy(t *testing.T) {
 	v, f, _ := newTestVendor(t, "storage:9000", "")
 	v.head = func(context.Context, aws.Credentials, string) (int, error) { return 404, nil }
 	for range 2 {
-		if _, err := v.Vend(context.Background(), "s3://bucket/wh/t", false, "nora"); !errors.Is(err, ErrNoCredentials) {
+		if _, err := v.Vend(context.Background(), "s3://bucket/wh/t", ReadFiles, "nora"); !errors.Is(err, ErrNoCredentials) {
 			t.Fatalf("got %v", err)
 		}
 	}
@@ -153,7 +161,7 @@ func TestS3VendorRefusesStoresThatIgnoreThePolicy(t *testing.T) {
 
 func TestS3VendorOnAWS(t *testing.T) {
 	v, f, _ := newTestVendor(t, "", "arn:aws-us-gov:iam::123456789012:role/igloo-engines")
-	creds, err := v.Vend(context.Background(), "s3://bucket/wh/t", true, "a_very_long_user_name_that_goes_on_and_on_and_on_beyond_limits")
+	creds, err := v.Vend(context.Background(), "s3://bucket/wh/t", WriteFiles, "a_very_long_user_name_that_goes_on_and_on_and_on_beyond_limits")
 	if err != nil {
 		t.Fatal(err)
 	}

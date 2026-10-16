@@ -206,8 +206,9 @@ func pick(q url.Values, keys ...string) url.Values {
 // loadResult is a LoadTableResult from Lakekeeper.
 type loadResult struct {
 	fields map[string]json.RawMessage
-	// location and uuid are the table's, from its metadata.
+	// location, uuid and properties are the table's, from its metadata.
 	location, uuid string
+	properties     map[string]string
 }
 
 // parseLoadResult reads a LoadTableResult and drops what Lakekeeper says
@@ -220,15 +221,16 @@ func parseLoadResult(body []byte) (*loadResult, error) {
 		return nil, fmt.Errorf("catalog returned malformed table metadata: %w", err)
 	}
 	var meta struct {
-		Location string `json:"location"`
-		UUID     string `json:"table-uuid"`
+		Location   string            `json:"location"`
+		UUID       string            `json:"table-uuid"`
+		Properties map[string]string `json:"properties"`
 	}
 	if err := json.Unmarshal(fields["metadata"], &meta); err != nil || meta.Location == "" {
 		return nil, fmt.Errorf("catalog returned table metadata without a location")
 	}
 	delete(fields, "config")
 	delete(fields, "storage-credentials")
-	return &loadResult{fields: fields, location: meta.Location, uuid: meta.UUID}, nil
+	return &loadResult{fields: fields, location: meta.Location, uuid: meta.UUID, properties: meta.Properties}, nil
 }
 
 // marshal returns the result with Igloo's credentials, if any.

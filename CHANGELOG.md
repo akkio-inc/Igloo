@@ -40,7 +40,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and `CREATE` on the clone's schema. A clone carries its source's masking
   and row access policies and tags, gets no grants but a schema clone's
   schema-wide ones, and is recorded in the query history with its source.
-  Table maintenance never deletes a file a clone still reads.
+  Table maintenance never deletes a file a clone still reads, and through
+  the Iceberg REST catalog other engines cannot either: a table whose files
+  clones read is not purged (409, naming the clones), write credentials
+  for it delete nothing, and clones get no storage credentials.
 - Iceberg branches and tags: `ALTER TABLE ... CREATE [OR REPLACE] BRANCH |
   TAG ... [AT (...)]`, `DROP BRANCH`, `DROP TAG`, `SHOW BRANCHES ON`,
   reading them with `AT (BRANCH => ...)` and `AT (TAG => ...)`, and `ALTER

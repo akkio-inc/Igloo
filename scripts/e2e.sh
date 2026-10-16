@@ -715,7 +715,7 @@ ds() { curl -sS -H "Authorization: Bearer $token" "$@"; }
 got="$(ds "$sharing/shares")" || true
 if grep -q '"name":"e2e_share"' <<<"$got"; then pass "the recipient lists its shares"; else fail "list shares: $got"; fi
 got="$(ds -X POST -H 'Content-Type: application/json' -d '{}' "$sharing/shares/e2e_share/schemas/public/tables/shared_spend/query")" || true
-file_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | head -1)"
+file_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | sed -n 1p)"
 if grep -q '"protocol":{"minReaderVersion":1}' <<<"$got" && grep -q 'numRecords\\":30' <<<"$got" && [ -n "$file_url" ]; then
   pass "a query lists the snapshot's files"
 else
@@ -759,7 +759,7 @@ psql_admin -c "CREATE MATERIALIZED VIEW crm.contacts_shared AS SELECT id, client
 expect "but a materialized view of what its creator sees can" "ALTER SHARE" igloo "$admin_password" \
   "ALTER SHARE e2e_share ADD TABLE crm.contacts_shared"
 got="$(ds -X POST -d '{}' "$sharing/shares/e2e_share/schemas/crm/tables/contacts_shared/query")" || true
-mv_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | head -1)"
+mv_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | sed -n 1p)"
 [ -z "$mv_url" ] || curl -sS -o "$work/mv.parquet" "$mv_url" || true
 if grep -q 'numRecords\\":2' <<<"$got" && [ -s "$work/mv.parquet" ] && ! grep -qa 'ann@acme' "$work/mv.parquet"; then
   pass "and its files hold masked values"
@@ -775,7 +775,7 @@ expect_error "readers cannot read external tables' files while tables have polic
 expect_error "nor the copies of shared files with deletes applied" 42501 rita rita-password-1 \
   "SELECT count(*) FROM read_parquet('$warehouse_root/.igloo/sharing/*/*.parquet')"
 got="$(ds -X POST -d '{}' "$sharing/shares/e2e_share/schemas/public/tables/shared_spend/query")" || true
-file_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | head -1)"
+file_url="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$got" | sed -n 1p)"
 psql_admin -c "ALTER TABLE shared_spend ALTER COLUMN client SET MASKING POLICY mask_email" >/dev/null
 status="$(curl -s -o "$work/refused.json" -w '%{http_code}' -X POST -H "Authorization: Bearer $token" -d '{}' \
   "$sharing/shares/e2e_share/schemas/public/tables/shared_spend/query")"
@@ -873,6 +873,44 @@ expect_soon "the history names the clone's source and target" '["lake.public.lin
 expect_error "readers cannot clone" 42501 rita rita-password-1 "CREATE TABLE dev.mine CLONE lineitem"
 expect_error "a clone's name must be free" 42P07 walt walt-password-1 "CREATE TABLE dev.lineitem CLONE orders"
 
+# Through the Iceberg REST catalog: no purge, no storage credentials for the
+# clone, and write credentials for its source that delete nothing.
+walt_bearer="$(catalog_token -d client_id=walt -d client_secret=walt-password-1)"
+vend() { curl -s -H "Authorization: Bearer $walt_bearer" -H 'X-Iceberg-Access-Delegation: vended-credentials' "$iceberg$1"; }
+got="$(vend /v1/namespaces/dev/tables/lineitem)"
+if grep -q "is a clone" <<<"$got"; then pass "engines get no storage credentials for a clone"; else fail "credentials for a clone: $got"; fi
+code="$(catalog_get "$walt_bearer" /v1/namespaces/dev/tables/lineitem)"
+if [ "$code" = 200 ]; then pass "but may load it without"; else fail "loading a clone without credentials: $code"; fi
+got="$(curl -s -X DELETE -H "Authorization: Bearer $walt_bearer" "$iceberg/v1/namespaces/public/tables/lineitem?purgeRequested=true")"
+if grep -q '"code":409' <<<"$got" && grep -q "dev.lineitem" <<<"$got"; then
+  pass "engines may not purge a table that clones read"
+else
+  fail "purge of a clone's source: $got"
+fi
+expect "which keeps every row" "600572" walt walt-password-1 "SELECT count(*) FROM lineitem"
+# s3_as LOADTABLE CURL_ARGS... sends a request for the object e2e-junk under
+# the table's prefix, signed with the credentials of a loadTable response,
+# and prints the status.
+field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" <<<"$2" | sed -n 1p; }
+s3_as() {
+  local creds=$1 prefix
+  shift
+  prefix="$(field prefix "$creds")"
+  docker run --rm --network "$network" curlimages/curl:8.22.0 -s -o /dev/null -w '%{http_code}' "$@" \
+    --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
+    --user "$(field s3.access-key-id "$creds"):$(field s3.secret-access-key "$creds")" \
+    -H "x-amz-security-token: $(field s3.session-token "$creds")" "http://storage:9000/${prefix#s3://}/e2e-junk"
+}
+shared="$(vend /v1/namespaces/public/tables/lineitem)"
+alone="$(vend /v1/namespaces/public/tables/contended)"
+got="$(s3_as "$alone" -X PUT --data-binary junk) $(s3_as "$alone" -X DELETE)"
+got="$got $(s3_as "$shared" -X PUT --data-binary junk) $(s3_as "$shared" -X DELETE)"
+if [ "$got" = "200 204 200 403" ]; then
+  pass "write credentials for a table that clones read delete nothing"
+else
+  fail "PUT and DELETE with write credentials, without and with clones: $got"
+fi
+
 # A clone of a table maintenance compacts and expires, and the other way
 # round: neither loses a row, and dropping the source, which never purges,
 # leaves the clone whole.
@@ -911,6 +949,9 @@ expect "admins too" "2|***@acme.com" igloo "$admin_password" "SELECT count(*), m
 expect "cloning it again under the name is quick" "CREATE TABLE" nora nora-password-1 \
   "CREATE OR REPLACE TABLE team.contacts_dev CLONE crm.contacts AT (TIMESTAMP => now())"
 expect "and keeps the policies" "1|***@acme.com" nora nora-password-1 "SELECT count(*), min(email) FROM team.contacts_dev"
+got="$(curl -s -H "Authorization: Bearer $(catalog_token -d client_id=nora -d client_secret=nora-password-1)" \
+  "$iceberg/v1/namespaces/team/tables/contacts_dev")"
+if grep -q "data policies" <<<"$got"; then pass "so engines may not load it either"; else fail "protected clone through the catalog: $got"; fi
 expect_error "a user cannot clone what she cannot read" 42501 nora nora-password-1 "CREATE TABLE team.contended CLONE contended"
 expect_error "nor where she cannot create tables" 42501 nora nora-password-1 "CREATE TABLE public.contacts_dev CLONE crm.contacts"
 

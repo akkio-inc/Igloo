@@ -183,6 +183,8 @@ type lakekeeper struct {
 	namespaces map[string]bool
 	tables     map[string]string
 	uuids      map[string]string
+	// props are tables' properties, by the same keys.
+	props map[string]map[string]string
 	// staged tables answer commits but, as in Lakekeeper, not HEAD.
 	staged map[string]string
 	// requests are what reached the catalog: "METHOD path?query".
@@ -334,7 +336,7 @@ func (l *lakekeeper) writeTable(w http.ResponseWriter, key, loc string) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"metadata-location":   loc + "/metadata/1.json",
-		"metadata":            map[string]any{"format-version": 2, "location": loc, "table-uuid": uuid},
+		"metadata":            map[string]any{"format-version": 2, "location": loc, "table-uuid": uuid, "properties": l.props[key]},
 		"config":              map[string]string{"s3.remote-signing-enabled": "true", "s3.signer.uri": "http://lakekeeper:8181/catalog/"},
 		"storage-credentials": []any{map[string]any{"prefix": loc, "config": map[string]string{"s3.secret-access-key": "lakekeeper's"}}},
 	})
@@ -359,13 +361,10 @@ type vendor struct {
 	err   error
 }
 
-func (v *vendor) Vend(_ context.Context, location string, write bool, user string) (Credentials, error) {
+func (v *vendor) Vend(_ context.Context, location string, a Access, user string) (Credentials, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	access := "read"
-	if write {
-		access = "write"
-	}
+	access := map[Access]string{ReadFiles: "read", WriteFiles: "write", AddFiles: "add"}[a]
 	v.calls = append(v.calls, user+" "+access+" "+location)
 	if v.err != nil {
 		return Credentials{}, v.err

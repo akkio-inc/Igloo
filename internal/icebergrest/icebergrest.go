@@ -42,7 +42,9 @@
 // locations, move a table or change its UUID, use nested namespaces, and
 // move tables between schemas, where other schemas' grants would reach
 // them. Tables with data policies (Options.Protected) are admins' alone
-// here, since their files hold the data the policies hide.
+// here, since their files hold the data the policies hide. Clones get no
+// storage credentials, and a table whose files clones read is not purged,
+// nor its files deleted with write credentials (see clones.go).
 //
 // Igloo must check the request Lakekeeper will carry out, so it reads
 // requests as Lakekeeper does: names in paths with "+" as a space, bodies
@@ -108,6 +110,9 @@ type Options struct {
 	// Credentials hands out storage credentials limited to one table. Nil
 	// hands out none: engines then need their own access to the files.
 	Credentials Vendor
+	// Clones knows which tables are clones and which clones read a
+	// table's files (see clones.go). Nil means no table is a clone.
+	Clones Clones
 	// Protected reports whether a table has data policies (masking or row
 	// access), which Igloo applies to the SQL it runs: an engine reading the
 	// table's files would bypass them, so non-admins may neither load nor

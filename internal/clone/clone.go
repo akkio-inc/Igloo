@@ -25,6 +25,25 @@
 // no clone needs them (see Guard). Which tables may reference which
 // locations is recorded in a Store and, durably, in each clone's
 // SharesProperty.
+//
+// Whatever must find every copy of some data, such as erasing a person's,
+// finds the clones that may read a table's files in the metadata database:
+// igloo_clones.shares has a row for each clone and location it may read
+// under, with clone_uuid (the clone's table-uuid), location (the other
+// table's location as the catalog gives it, without a trailing slash;
+// indexed), clone_schema and clone_name (where the clone was last seen)
+// and created_at. A clone of a clone has rows for its source's location
+// and for every location its source shares, so the rows of a table's
+// location name its clones' clones too. Each clone's SharesProperty, a
+// JSON array of the same locations, is the durable record that
+// maintenance rebuilds the rows from, and the one to read without a
+// metadata database. Both say where a clone may read, not what: the files
+// it reads are those its metadata lists, and its rows for a location go
+// once its own maintenance has replaced all it read there. A row's name
+// may be stale, after a rename, and a row may outlive its clone, dropped
+// or never made, until a later maintenance pass; Guard.Readers resolves
+// both, and holds the location's lock while the caller deletes, so that no
+// new clone starts reading files that are about to go.
 package clone
 
 import (

@@ -129,9 +129,10 @@ reference for every setting mentioned here.
   for other replicas to learn of them the first time a name gets policies,
   so no statement reads it unprotected; cloning needs `SELECT` on the table
   and `CREATE` on the clone's schema, and a clone holds every row of its
-  source behind those policies. Policies are not a boundary for admins, who manage them and can
-  read the warehouse's files, nor for other engines reading the Iceberg
-  tables directly. Policy changes reach other replicas within 30 seconds.
+  source behind those policies. Policies are not a boundary for admins,
+  who manage them and can read the warehouse's files, nor for other
+  engines reading the Iceberg tables directly. Policy changes reach other
+  replicas within 30 seconds.
 - **Connections to other databases.** Only admins create, change and drop
   [connections](docs/federation.md) to PostgreSQL and MySQL databases. A
   connection's tables need a `SELECT` grant (on the table, its schema or the
@@ -266,7 +267,10 @@ reference for every setting mentioned here.
   reachable by SQL clients or from the internet. Whoever can reach the catalog
   can change table metadata and may obtain object-storage credentials. Keep it
   on a private network that only Igloo can reach; other engines use the
-  catalog through Igloo instead.
+  catalog through Igloo instead. A client that reaches it and asks it to
+  drop a table with a purge deletes every file under the table's location,
+  files that clones of the table read included; Igloo never asks for one,
+  and refuses engines' purges of tables whose files clones read.
 - **Other engines.** Port 8181 (`IGLOO_ICEBERG_ADDR`) serves the Iceberg REST
   catalog to Spark, Trino and other engines
   ([details](docs/external-engines.md)). Engines get an access token by
@@ -286,6 +290,10 @@ reference for every setting mentioned here.
   table's snapshots needs as well. On S3-compatible stores Igloo first
   checks that the store enforces the session policy, and hands out nothing if
   it does not; on Google Cloud Storage and Azure it hands out nothing yet.
+  Clones, whose files lie under their sources' locations, get no
+  credentials; write credentials for a table whose files clones read
+  cannot delete files, and when Igloo cannot tell whether clones do, they
+  cannot either.
   Only admins may choose where a table's or schema's files go, move a table
   or change its UUID, so every table has a directory no other table shares;
   Lakekeeper refuses moves and new UUIDs too, and Igloo hands non-admins

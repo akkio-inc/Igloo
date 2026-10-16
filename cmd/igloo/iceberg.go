@@ -15,6 +15,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/icebergrest"
 	"github.com/akkio-inc/igloo/internal/pgwire"
@@ -38,6 +39,8 @@ type icebergDeps struct {
 	work    *activity.Tracker
 	reg     prometheus.Registerer
 	tls     *tls.Config
+	// clones keeps the files clones share; nil without a catalog.
+	clones *clone.Guard
 }
 
 // serveIceberg serves the Iceberg REST catalog for other engines on ln,
@@ -54,7 +57,12 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 	}
 	// Without a metadata database there are no access tokens.
 	tokens, _ := deps.users.(auth.TokenStore)
+	var clones icebergrest.Clones
+	if deps.clones != nil {
+		clones = deps.clones
+	}
 	handler, err := icebergrest.New(icebergrest.Options{
+		Clones:      clones,
 		CatalogURI:  cfg.Catalog.URI,
 		Warehouse:   cfg.Catalog.Warehouse,
 		CatalogName: cfg.Catalog.Name,

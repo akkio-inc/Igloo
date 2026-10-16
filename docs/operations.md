@@ -471,7 +471,10 @@ it works on:
   delete everything under its location: a dropped table's files stay in the
   bucket, clones keep reading theirs, and Igloo does not delete the rest.
   The catalog deletes files only when asked to purge, and only Igloo can
-  reach it. Igloo's warehouse uses the catalog's default hard deletion, in
+  reach it; other engines go through [Igloo's Iceberg REST
+  catalog](external-engines.md#clones), which refuses to purge a table
+  whose files clones read (409, naming the clones; dropping it without
+  purging works). Igloo's warehouse uses the catalog's default hard deletion, in
   which a dropped table cannot be restored; with Lakekeeper's soft deletion
   turned on instead, a clone restored after it was dropped may miss
   files of its source that maintenance deleted meanwhile.
@@ -494,6 +497,28 @@ everything it read of its source. The source's files that only clones
 needed are then orphans, which the orphan cleanup deletes once they are
 three days old. Until then a shared file counts once in the bucket, but a
 file the source no longer needs stays as long as a clone reads it.
+
+To find every table that may hold a table's data, as erasing a person's
+data must, look up the table's location (the `location` of its Iceberg
+metadata, as the catalog returns it) in the metadata database:
+
+```sql
+SELECT clone_schema, clone_name, clone_uuid, created_at
+FROM igloo_clones.shares
+WHERE location = 's3://warehouse/0193.../0193...';  -- no trailing slash
+```
+
+Each row is a clone, or a clone of a clone, whose metadata may reference
+files under that location; `clone_uuid` is its `table-uuid`. The name is
+where the clone was last seen, so a renamed clone shows its new name only
+after the next maintenance pass, and a dropped clone's row goes only at a
+later one: check a row by loading the table and comparing its UUID. The clones' own
+metadata says the same, readably without the metadata database: the table
+property `igloo.clone.shares-files-of` is a JSON array of the locations a
+clone may read from (`igloo.clone.source` and
+`igloo.clone.source-snapshot-id` say what it was made from). Both are where
+a clone may read, not what it reads: the files themselves are those the
+clone's snapshots list, under each location.
 
 ## Scheduled work
 

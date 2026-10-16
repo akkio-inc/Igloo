@@ -340,6 +340,9 @@ func (s *Server) createTable(c *call) error {
 	if err := checkProperties(keys(req.Properties)); err != nil {
 		return err
 	}
+	if err := checkCloneProperties(keys(req.Properties)); err != nil {
+		return err
+	}
 	// Policies name the tables they protect.
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
@@ -381,7 +384,7 @@ func (s *Server) writeTable(c *call, ns []string, o auth.Object, r *reply, write
 	}
 	var creds *Credentials
 	if vendRequested(c.r) {
-		if creds, err = s.vend(c, ns, result, write); err != nil {
+		if creds, err = s.vend(c, ns, o, result, write); err != nil {
 			return err
 		}
 	}
@@ -393,11 +396,14 @@ func (s *Server) writeTable(c *call, ns []string, o auth.Object, r *reply, write
 	return nil
 }
 
-// vend gets credentials for table t in namespace ns, or nil when none can
-// be given.
-func (s *Server) vend(c *call, ns []string, t *loadResult, write bool) (*Credentials, error) {
+// vend gets credentials for table o, loaded as t, in namespace ns, or nil
+// when none can be given.
+func (s *Server) vend(c *call, ns []string, o auth.Object, t *loadResult, write bool) (*Credentials, error) {
 	if s.opts.Credentials == nil {
 		return nil, nil
+	}
+	if err := s.cloneCredentials(o, t); err != nil {
+		return nil, err
 	}
 	location := t.location
 	if !c.who.admin() {
@@ -411,7 +417,11 @@ func (s *Server) vend(c *call, ns []string, t *loadResult, write bool) (*Credent
 			return nil, nil
 		}
 	}
-	creds, err := s.opts.Credentials.Vend(c.ctx(), location, write, c.who.user.Name)
+	access := ReadFiles
+	if write {
+		access = s.writeAccess(c, location)
+	}
+	creds, err := s.opts.Credentials.Vend(c.ctx(), location, access, c.who.user.Name)
 	if errors.Is(err, ErrNoCredentials) {
 		return nil, nil
 	}
@@ -419,10 +429,7 @@ func (s *Server) vend(c *call, ns []string, t *loadResult, write bool) (*Credent
 		s.log.Warn("could not vend storage credentials", "location", location, "err", err)
 		return nil, errorf(http.StatusServiceUnavailable, errUnavailable, "could not get storage credentials for the table; try again")
 	}
-	c.detail = "read credentials"
-	if write {
-		c.detail = "read-write credentials"
-	}
+	c.detail = access.credentials()
 	return &creds, nil
 }
 
@@ -488,6 +495,9 @@ func (s *Server) updateTable(c *call) error {
 	if err := checkProperties(req.propertyKeys()); err != nil {
 		return err
 	}
+	if err := checkCloneProperties(append(req.propertyKeys(), req.removedKeys()...)); err != nil {
+		return err
+	}
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
@@ -523,6 +533,16 @@ func (s *Server) dropTable(c *call) error {
 	c.written = []auth.Object{o}
 	if err := c.who.require(auth.PrivilegeCreate, auth.Object{Schema: o.Schema}); err != nil {
 		return err
+	}
+	// Purging deletes every file under the table's location, those that
+	// clones read included (see clones.go).
+	if purgeRequested(c) && s.opts.Clones != nil {
+		release, err := s.holdForPurge(c, tablePathOf(ns, o.Table))
+		if err != nil {
+			return err
+		}
+		defer release()
+		c.detail = "purge"
 	}
 	if _, err := s.cat.call(c.ctx(), http.MethodDelete, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "purgeRequested"), nil); err != nil {
 		return err
@@ -600,7 +620,7 @@ func (s *Server) loadCredentials(c *call) error {
 	if err != nil {
 		return err
 	}
-	creds, err := s.vend(c, ns, result, c.who.writesData(o))
+	creds, err := s.vend(c, ns, o, result, c.who.writesData(o))
 	if err != nil {
 		return err
 	}

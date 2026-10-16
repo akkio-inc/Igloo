@@ -159,22 +159,52 @@ func TestCloneWithoutCatalog(t *testing.T) {
 	}
 }
 
+// protectedContacts fills cat with policies and a tag on crm.contacts.
+func protectedContacts(t *testing.T, cat *policy.Catalog, now time.Time) {
+	t.Helper()
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(cat.PutPolicy(policy.Policy{Kind: policy.Masking, Name: "mask_email", Args: []policy.Arg{{Name: "v", Type: "VARCHAR"}}, Returns: "VARCHAR", Body: "'***'"}, false, now))
+	must(cat.PutPolicy(policy.Policy{Kind: policy.Masking, Name: "other_mask", Args: []policy.Arg{{Name: "v", Type: "VARCHAR"}}, Returns: "VARCHAR", Body: "v"}, false, now))
+	must(cat.PutPolicy(policy.Policy{Kind: policy.RowAccess, Name: "client_rows", Args: []policy.Arg{{Name: "c", Type: "VARCHAR"}}, Returns: "BOOLEAN", Body: "true"}, false, now))
+	must(cat.PutTag(policy.Tag{Name: "pii"}, false, now))
+	must(cat.SetMask(policy.ColumnMask{Schema: "crm", Table: "contacts", Column: "email", Policy: "mask_email"}, false, now))
+	must(cat.AddRowFilter(policy.RowFilter{Schema: "crm", Table: "contacts", Policy: "client_rows", Columns: []string{"client_id"}}, now))
+	must(cat.SetColumnTag(policy.ColumnTag{Schema: "crm", Table: "contacts", Column: "device_id", Tag: "pii", Value: "device"}, now))
+}
+
+// The Iceberg REST endpoint refuses non-admins every table Server.Protected
+// reports, since engines reading its files would bypass its policies: a
+// clone of a protected table is one.
+func TestCloneOfProtectedTableIsProtected(t *testing.T) {
+	ctx := context.Background()
+	store := policy.NewMemoryStore()
+	err := store.Update(ctx, func(cat *policy.Catalog) error {
+		protectedContacts(t, cat, time.Now())
+		_, err := attachClonePolicies(cat, []clonePair{{source: auth.Object{Schema: "crm", Table: "contacts"},
+			target: auth.Object{Schema: "team", Table: "contacts"}}}, "nora", time.Now())
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := startServer(t, func(o *Options) { o.Policies = store })
+	if !ts.srv.Protected(ctx, "crm", "contacts") || !ts.srv.Protected(ctx, "team", "contacts") {
+		t.Fatal("the source or its clone is not protected")
+	}
+	if ts.srv.Protected(ctx, "team", "other") {
+		t.Fatal("an unrelated table is protected")
+	}
+}
+
 func TestAttachClonePolicies(t *testing.T) {
 	now := time.Now()
 	base := func() *policy.Catalog {
 		cat := &policy.Catalog{}
-		must := func(err error) {
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		must(cat.PutPolicy(policy.Policy{Kind: policy.Masking, Name: "mask_email", Args: []policy.Arg{{Name: "v", Type: "VARCHAR"}}, Returns: "VARCHAR", Body: "'***'"}, false, now))
-		must(cat.PutPolicy(policy.Policy{Kind: policy.Masking, Name: "other_mask", Args: []policy.Arg{{Name: "v", Type: "VARCHAR"}}, Returns: "VARCHAR", Body: "v"}, false, now))
-		must(cat.PutPolicy(policy.Policy{Kind: policy.RowAccess, Name: "client_rows", Args: []policy.Arg{{Name: "c", Type: "VARCHAR"}}, Returns: "BOOLEAN", Body: "true"}, false, now))
-		must(cat.PutTag(policy.Tag{Name: "pii"}, false, now))
-		must(cat.SetMask(policy.ColumnMask{Schema: "crm", Table: "contacts", Column: "email", Policy: "mask_email"}, false, now))
-		must(cat.AddRowFilter(policy.RowFilter{Schema: "crm", Table: "contacts", Policy: "client_rows", Columns: []string{"client_id"}}, now))
-		must(cat.SetColumnTag(policy.ColumnTag{Schema: "crm", Table: "contacts", Column: "device_id", Tag: "pii", Value: "device"}, now))
+		protectedContacts(t, cat, now)
 		return cat
 	}
 	pair := clonePair{source: auth.Object{Schema: "crm", Table: "contacts"}, target: auth.Object{Schema: "team", Table: "contacts"}}

@@ -60,6 +60,84 @@ func NewGuard(cat Catalog, store Store, log *slog.Logger) *Guard {
 	return &Guard{cat: cat, store: store, log: log.With("component", "maintenance")}
 }
 
+// Sources returns the locations of other tables whose files a table with
+// these properties reads: none for a table that is no clone, or no longer
+// reads its source's files.
+func (g *Guard) Sources(properties map[string]string) []string { return declaredShares(properties) }
+
+// Shared reports whether clones may read files under location, as far as
+// the Store knows.
+func (g *Guard) Shared(ctx context.Context, location string) (bool, error) {
+	shares, err := g.store.Sharers(ctx, location)
+	return len(shares) > 0, err
+}
+
+// Readers takes the lock of location, which making a clone of the table
+// there takes too, and names the clones that read files under it, or may:
+// every clone the catalog has, under the name it was recorded with or
+// another, and every clone recorded within the hour, which may still be
+// being made. Until release is called no clone of the table is made, so a
+// caller that finds none may delete the table's files meanwhile.
+func (g *Guard) Readers(ctx context.Context, location string) (names []string, release func(), err error) {
+	release, _, err = g.store.Lock(ctx, []string{location}, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(err error) ([]string, func(), error) {
+		release()
+		return nil, nil, err
+	}
+	shares, err := g.store.Sharers(ctx, location)
+	if err != nil {
+		return fail(err)
+	}
+	var live map[uuid.UUID]table.Identifier
+	for _, sh := range shares {
+		tbl, err := g.cat.LoadTable(ctx, table.Identifier{sh.Schema, sh.Table})
+		switch {
+		case err == nil && tbl.Metadata().TableUUID() == sh.Clone:
+			names = append(names, sh.Schema+"."+sh.Table)
+			continue
+		case err != nil && !errors.Is(err, icecat.ErrNoSuchTable):
+			return fail(err)
+		}
+		// Renamed, or dropped: look for it under every name.
+		if live == nil {
+			if live, err = g.tables(ctx); err != nil {
+				return fail(err)
+			}
+		}
+		if ident, ok := live[sh.Clone]; ok {
+			names = append(names, strings.Join(ident, "."))
+		} else if time.Since(sh.Created) <= settle {
+			names = append(names, sh.Schema+"."+sh.Table)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names), release, nil
+}
+
+// tables maps the UUID of every table of the catalog to its name.
+func (g *Guard) tables(ctx context.Context) (map[uuid.UUID]table.Identifier, error) {
+	idents, err := g.cat.Tables(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uuid.UUID]table.Identifier, len(idents))
+	for _, ident := range idents {
+		tbl, err := g.cat.LoadTable(ctx, ident)
+		if errors.Is(err, icecat.ErrNoSuchTable) {
+			// Renamed since it was listed: it may be the clone sought.
+			return nil, fmt.Errorf("%w: the catalog changed while it was read", ErrUnsure)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[tbl.Metadata().TableUUID()] = ident
+	}
+	return out, nil
+}
+
 // Pass is one maintenance pass's view of the catalog: which tables exist,
 // by UUID, and whether it saw all of them.
 type Pass struct {

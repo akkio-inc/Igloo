@@ -111,6 +111,40 @@ show such tables. Igloo checks for policies on every request, so attaching
 one stops new loads at once; credentials an engine got for the table
 before still work until they expire, at most an hour later.
 
+### Clones
+
+A [clone](sql.md#clones) reads the data files and manifests of the table
+it was cloned from where they are, under that table's location, so other
+engines are kept from deleting them and from reading past them:
+
+- **Purging.** Dropping a table whose files clones read with
+  `purgeRequested=true` (Spark's `DROP TABLE ... PURGE`) is refused with
+  409, naming the clones: the catalog would delete every file under the
+  table's location. Drop the clones first, or drop the table without
+  purging, which keeps its files, as SQL's `DROP TABLE` does.
+- **Credentials for a clone.** Loading a clone with vended credentials, or
+  refreshing them, is refused with 403: credentials reach one table's
+  location, which holds none of the files the clone reads from its source,
+  and credentials that reached the source's too would read its newer rows
+  and its history as well. Read clones through Igloo's SQL or Flight SQL;
+  an engine with access of its own to the bucket may load one without
+  asking for credentials.
+- **Writing to the source.** Write credentials for a table whose files
+  clones read can add files but not delete any, so an engine's snapshot
+  expiry or orphan cleanup cannot remove files a clone still reads: the
+  deletes fail (Iceberg's Spark procedures log them and go on), and Igloo's
+  maintenance deletes the files once no clone needs them. When Igloo
+  cannot tell whether clones read a table's files, its write credentials
+  delete nothing, and a purge is refused with 503.
+- **Commits** delete nothing a clone reads: the catalog deletes only the
+  table's own old metadata files when it commits, and removing snapshots
+  changes the metadata alone; the engine deletes the files, with
+  credentials that cannot. The table properties `igloo.clone.*`, which
+  record what a clone reads, cannot be set or removed through the catalog.
+
+A clone of a table with data policies has the same policies, so only admins
+may load it.
+
 ## Connecting
 
 | Setting | Value |
@@ -266,6 +300,8 @@ Igloo's own keys. Only a table where the catalog put it, in its schema's
 location in a directory named for its UUID, gets them: anywhere else, its
 directory could hold another table's files, or lie above or below another
 table's. Tables an admin placed elsewhere get credentials for admins only.
+[Clones](#clones) get none, and writers of a table whose files clones read
+get credentials that delete nothing.
 
 Credentials cannot be taken back. Revoking a grant, dropping a user or
 attaching a data policy stops new loads and new credentials at once, but
@@ -278,7 +314,8 @@ How Igloo makes them depends on the storage:
 
 Igloo assumes `IGLOO_S3_STS_ROLE_ARN` with a session policy that allows
 `s3:GetObject` (and `PutObject`, `DeleteObject` and multipart uploads, for
-writers) on `<table location>/*` and listing that prefix, nothing else. The
+writers; no `DeleteObject` for a table whose files clones read) on
+`<table location>/*` and listing that prefix, nothing else. The
 role must allow the warehouse prefix and trust Igloo's own identity (its IAM
 role or user); the session policy narrows it to the table. The
 [AWS module](../deploy/aws/README.md) creates the role, `<name_prefix>-engines`;

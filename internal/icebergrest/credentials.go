@@ -38,13 +38,38 @@ func (c *Credentials) storageCredentials() []map[string]any {
 	return []map[string]any{{"prefix": c.Prefix, "config": c.Config}}
 }
 
+// Access is what vended credentials may do with a table's files.
+type Access int
+
+const (
+	// ReadFiles reads them.
+	ReadFiles Access = iota
+	// WriteFiles reads, writes and deletes them.
+	WriteFiles
+	// AddFiles reads and writes them but deletes none, for a table whose
+	// files clones read: an engine's own snapshot expiry or orphan cleanup
+	// would delete files the clones need.
+	AddFiles
+)
+
+// credentials describes credentials of a, for the history.
+func (a Access) credentials() string {
+	switch a {
+	case WriteFiles:
+		return "read-write credentials"
+	case AddFiles:
+		return "read-write credentials that delete nothing"
+	}
+	return "read credentials"
+}
+
 // Vendor hands out storage credentials limited to one table.
 type Vendor interface {
-	// Vend returns credentials that read the files under location, and
-	// with write also write and delete them, and reach nothing else. user
-	// is who they are for, for the storage provider's logs. It returns
-	// ErrNoCredentials when it cannot limit credentials to location.
-	Vend(ctx context.Context, location string, write bool, user string) (Credentials, error)
+	// Vend returns credentials that do what access says with the files
+	// under location, and reach nothing else. user is who they are for,
+	// for the storage provider's logs. It returns ErrNoCredentials when it
+	// cannot limit credentials to location.
+	Vend(ctx context.Context, location string, access Access, user string) (Credentials, error)
 }
 
 // ErrNoCredentials means credentials limited to the table cannot be given,
@@ -166,7 +191,7 @@ func NewS3Vendor(ctx context.Context, s config.Storage, log *slog.Logger) (*S3Ve
 }
 
 // Vend implements Vendor.
-func (v *S3Vendor) Vend(ctx context.Context, location string, write bool, user string) (Credentials, error) {
+func (v *S3Vendor) Vend(ctx context.Context, location string, access Access, user string) (Credentials, error) {
 	prefix, err := v.tablePrefix(location)
 	if err != nil {
 		v.log.Warn("no credentials for a table outside the warehouse", "location", location, "err", err)
@@ -175,7 +200,7 @@ func (v *S3Vendor) Vend(ctx context.Context, location string, write bool, user s
 	if err := v.check(ctx); err != nil {
 		return Credentials{}, err
 	}
-	creds, err := v.credentials(ctx, prefix, write, "igloo-"+user)
+	creds, err := v.credentials(ctx, prefix, access, "igloo-"+user)
 	if err != nil {
 		return Credentials{}, err
 	}
@@ -192,8 +217,8 @@ func (v *S3Vendor) Vend(ctx context.Context, location string, write bool, user s
 }
 
 // credentials assumes the role with a policy allowing prefix only.
-func (v *S3Vendor) credentials(ctx context.Context, prefix string, write bool, session string) (aws.Credentials, error) {
-	policy, err := sessionPolicy(v.partition, v.bucket, prefix, write, v.kms)
+func (v *S3Vendor) credentials(ctx context.Context, prefix string, access Access, session string) (aws.Credentials, error) {
+	policy, err := sessionPolicy(v.partition, v.bucket, prefix, access, v.kms)
 	if err != nil {
 		return aws.Credentials{}, err
 	}
@@ -232,7 +257,7 @@ func (v *S3Vendor) check(ctx context.Context) error {
 		return ErrNoCredentials
 	}
 	scratch := v.key(checkPrefix)
-	creds, err := v.credentials(ctx, scratch, false, "igloo-check")
+	creds, err := v.credentials(ctx, scratch, ReadFiles, "igloo-check")
 	if err != nil {
 		return err
 	}
@@ -306,16 +331,19 @@ type statement struct {
 	Condition map[string]map[string][]string `json:"Condition,omitempty"`
 }
 
-// sessionPolicy allows reading, and with write writing and deleting, the
-// objects under prefix in bucket, and listing them.
-func sessionPolicy(partition, bucket, prefix string, write, kms bool) (string, error) {
+// sessionPolicy allows reading the objects under prefix in bucket and
+// listing them, and as access says writing and deleting them.
+func sessionPolicy(partition, bucket, prefix string, access Access, kms bool) (string, error) {
 	bucketARN := "arn:" + partition + ":s3:::" + bucket
 	objects := []string{"s3:GetObject", "s3:GetObjectVersion"}
 	keys := []string{"kms:Decrypt"}
-	if write {
+	if access != ReadFiles {
 		// PutObject covers multipart uploads.
-		objects = append(objects, "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts")
+		objects = append(objects, "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts")
 		keys = append(keys, "kms:GenerateDataKey", "kms:Encrypt")
+	}
+	if access == WriteFiles {
+		objects = append(objects, "s3:DeleteObject")
 	}
 	statements := []statement{
 		{Effect: "Allow", Action: objects, Resource: []string{bucketARN + "/" + prefix + "/*"}},
