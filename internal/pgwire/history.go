@@ -126,6 +126,18 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 func (s *Server) finishRecord(q *audit.Query, read, written []auth.Object, locations []string) {
 	q.TablesRead = objectNames(s.catalogName(), read)
 	q.TablesWritten = objectNames(s.catalogName(), written)
+	if external := s.gov.external; external != "" {
+		// External tables' files are served by Igloo's proxy under a
+		// secret prefix, which the history, the lineage and lineage
+		// events must not show; reads of them through their tables are
+		// recorded as reads of the tables.
+		locations = slices.DeleteFunc(slices.Clone(locations), func(l string) bool {
+			return strings.HasPrefix(strings.ToLower(l), external)
+		})
+		if len(locations) == 0 {
+			locations = nil
+		}
+	}
 	q.LocationsRead = locations
 	s.audit.RecordQuery(*q)
 	if q.Outcome != audit.OutcomeOK || len(written) == 0 {

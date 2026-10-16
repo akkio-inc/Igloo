@@ -38,9 +38,22 @@ function num(v) {
   return v === null || v === undefined ? '' : fmtCount(v);
 }
 
-// hashFor is the address of a table's page.
-function hashFor(schema, name) {
-  return `#/catalog/${encodeURIComponent(schema)}/${encodeURIComponent(name)}`;
+// hashFor is the address of a table's page: in the Iceberg catalog, or a
+// connection's.
+function hashFor(catalog, schema, name) {
+  return `#/catalog/${[catalog, schema, name].map(encodeURIComponent).join('/')}`;
+}
+
+// kindOf names a table type for people: external tables come from a Delta
+// Sharing provider, and connections' tables (FOREIGN) from another
+// database.
+function kindOf(type) {
+  return { VIEW: 'view', 'EXTERNAL TABLE': 'external table', FOREIGN: 'connection table' }[type] || 'table';
+}
+
+// titleOf names a table as people write it: a connection's in full.
+function titleOf(type, catalog, schema, name) {
+  return type === 'FOREIGN' ? `${catalog}.${schema}.${name}` : `${schema}.${name}`;
 }
 
 function errorView(e) {
@@ -94,15 +107,17 @@ export function createCatalog(app) {
       return;
     }
     clear(results, h('ul', { class: 'catalog-list' }, found.map((m) => h('li', {},
-      h('a', { class: 'catalog-hit card', href: hashFor(m.schema, m.name) },
+      h('a', { class: 'catalog-hit card', href: hashFor(m.catalog, m.schema, m.name) },
         h('div', { class: 'catalog-hit-title' },
           h('span', { class: `kind-${m.type === 'VIEW' ? 'view' : 'table'}` }, icon(m.type === 'VIEW' ? 'view' : 'table')),
-          h('strong', { class: 'mono', text: `${m.schema}.${m.name}` }),
-          m.type === 'VIEW' ? h('span', { class: 'badge', text: 'view' }) : null,
+          h('strong', { class: 'mono', text: titleOf(m.type, m.catalog, m.schema, m.name) }),
+          kindOf(m.type) !== 'table' ? h('span', { class: 'badge', text: kindOf(m.type) }) : null,
           ...(m.tags || []).slice(0, 4).map((t) => h('span', { class: 'badge', text: t }))),
         m.comment ? h('p', { class: 'catalog-hit-comment', text: m.comment }) : null,
         h('div', { class: 'catalog-hit-meta muted' },
-          m.owner ? h('span', {}, 'Owner ', h('span', { class: 'mono', text: m.owner })) : h('span', { class: 'faint', text: 'No owner' }),
+          m.provider ? h('span', {}, 'From ', h('span', { class: 'mono', text: m.provider })) : null,
+          m.owner ? h('span', {}, 'Owner ', h('span', { class: 'mono', text: m.owner }))
+            : m.type === 'FOREIGN' ? null : h('span', { class: 'faint', text: 'No owner' }),
           m.rows !== null && m.rows !== undefined ? h('span', { text: plural(Number(m.rows), 'row') }) : null,
           m.bytes ? h('span', { text: fmtBytes(m.bytes) }) : null,
           m.last_altered ? h('span', { title: fmtTime(m.last_altered), text: `changed ${fmtAgo(m.last_altered)}` }) : null,
@@ -112,7 +127,7 @@ export function createCatalog(app) {
 
   // The page of one table or view.
 
-  async function showObject(schema, name) {
+  async function showObject(catalog, schema, name) {
     searchView.hidden = true;
     head.hidden = true;
     detail.hidden = false;
@@ -122,11 +137,13 @@ export function createCatalog(app) {
     clear(detail, h('div', { class: 'result-message', text: 'Loading…' }));
     let page;
     try {
-      page = await api.get(`/api/catalog/object?schema=${encodeURIComponent(schema)}&name=${encodeURIComponent(name)}`, { signal });
+      const q = new URLSearchParams({ catalog, schema, name });
+      page = await api.get(`/api/catalog/object?${q}`, { signal });
     } catch (e) {
       if (e.name === 'AbortError') return;
       clear(detail, backLink(), e.status === 404
-        ? h('div', { class: 'empty' }, h('h2', { text: 'Not found' }), h('p', { text: `There is no table or view ${schema}.${name} that you may see.` }))
+        ? h('div', { class: 'empty' }, h('h2', { text: 'Not found' }),
+          h('p', { text: `There is no table or view ${catalog}.${schema}.${name} that you may see.` }))
         : errorView(e));
       return;
     }
@@ -159,18 +176,23 @@ export function createCatalog(app) {
 
   function renderObject(page, signal) {
     const o = page.object;
+    const catalog = o.table_catalog;
     const schema = o.table_schema;
     const name = o.table_name;
     const isView = o.table_type === 'VIEW';
+    const foreign = o.table_type === 'FOREIGN';
+    // Only the Iceberg catalog's own tables have files and snapshots.
+    const own = !isView && !foreign && o.table_type !== 'EXTERNAL TABLE';
     const canComment = page.can_comment;
-    const qualified = `${api.ident(schema)}.${api.ident(name)}`;
+    const qualified = [...(foreign ? [catalog] : []), schema, name].map(api.ident).join('.');
     const u = page.usage || {};
 
     const stats = [
-      ['Rows', isView ? '' : num(o.row_count)],
-      ['Size', isView ? '' : fmtBytes(o.bytes), o.file_count ? plural(Number(o.file_count), 'file') : null],
-      [isView ? 'Last replaced' : 'Data last changed', o.last_altered ? fmtAgo(o.last_altered) : 'never', o.last_altered ? fmtTime(o.last_altered) : null],
-      ['Snapshots', isView ? '' : num(o.snapshot_count), isView ? null : 'kept for time travel'],
+      ['Rows', own ? num(o.row_count) : ''],
+      ['Size', own ? fmtBytes(o.bytes) : '', o.file_count ? plural(Number(o.file_count), 'file') : null],
+      [isView ? 'Last replaced' : 'Data last changed', own || isView ? (o.last_altered ? fmtAgo(o.last_altered) : 'never') : '',
+        o.last_altered ? fmtTime(o.last_altered) : null],
+      ['Snapshots', own ? num(o.snapshot_count) : '', own ? 'kept for time travel' : null],
       ['Reads, 30 days', num(u.reads_30d) || '0', u.last_read ? `last ${fmtAgo(u.last_read)}` : null],
       ['Writes, 30 days', num(u.writes_30d) || '0', u.last_written ? `last ${fmtAgo(u.last_written)}` : null],
       ['Users, 30 days', num(u.users_30d) || '0'],
@@ -181,9 +203,10 @@ export function createCatalog(app) {
       backLink(),
       h('div', { class: 'title' },
         h('span', { class: `kind-${isView ? 'view' : 'table'}` }, icon(isView ? 'view' : 'table')),
-        h('h1', { text: `${schema}.${name}` }),
-        h('span', { class: 'badge', text: isView ? 'view' : 'table' }),
-        h('span', { class: 'badge', title: 'The owner may set its descriptions and hand it on', text: `owner: ${ownerText}` }),
+        h('h1', { text: titleOf(o.table_type, catalog, schema, name) }),
+        h('span', { class: 'badge', text: kindOf(o.table_type) }),
+        o.provider ? h('span', { class: 'badge', title: 'The Delta Sharing provider it is read from', text: `from ${o.provider}` }) : null,
+        foreign ? null : h('span', { class: 'badge', title: 'The owner may set its descriptions and hand it on', text: `owner: ${ownerText}` }),
         h('span', { class: 'spacer' }),
         button('Query in a worksheet', { icon: 'open', onclick: () => app.openWorksheet(`SELECT *\nFROM ${qualified}\nLIMIT 100;\n`, name) })),
       h('div', { class: 'catalog-description' },
@@ -304,7 +327,7 @@ export function createCatalog(app) {
     const nodes = g.nodes.map((n) => {
       const p = pos.get(n.id);
       const link = n.kind === 'table' && n.depth !== 0;
-      const open = () => { location.hash = hashFor(n.schema, n.name); };
+      const open = () => { location.hash = hashFor(n.catalog, n.schema, n.name); };
       return svg('g', {
         class: `lineage-node ${n.kind}${n.depth === 0 ? ' root' : ''}${link ? ' link' : ''}`,
         transform: `translate(${p.x},${p.y})`,
@@ -330,8 +353,8 @@ export function createCatalog(app) {
   function route(param = current) {
     current = param;
     const parts = param ? param.split('/').map(decodeURIComponent) : [];
-    if (parts.length === 2) {
-      showObject(parts[0], parts[1]);
+    if (parts.length === 3) {
+      showObject(parts[0], parts[1], parts[2]);
       return;
     }
     detail.hidden = true;

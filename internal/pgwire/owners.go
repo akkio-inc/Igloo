@@ -160,6 +160,14 @@ func (s *Server) changeOwner(ctx context.Context, sess *session, user auth.User,
 		if err != nil && !errors.Is(err, errNoGrantPath) {
 			return err
 		}
+		if len(objects) == 0 && c.kind == "TABLE" && s.external != nil {
+			// External tables have their names in the catalog's schemas.
+			if schema, table, err := s.externalTarget(ctx, sess, c.name); err == nil {
+				if _, ok := s.external.IsExternal(schema, table); ok {
+					objects = []auth.Object{{Schema: schema, Table: table}}
+				}
+			}
+		}
 		switch {
 		case len(objects) == 0 && c.ifExists:
 			return w.Complete(tag)
@@ -259,13 +267,17 @@ func (s *Server) showObjects(ctx context.Context, sess *session, user auth.User,
 		}
 	}
 	for _, t := range md.Tables {
-		if !in(t.Schema) {
+		// Connections' tables are not in the catalog's schemas.
+		if t.Catalog != "" || !in(t.Schema) {
 			continue
 		}
 		owner, kind := ownerValues(owners, auth.Object{Schema: t.Schema, Table: t.Name})
 		values := []any{t.Schema, t.Name, "TABLE", owner, kind, nullText(t.Comment), nullCount(t.Rows), nullCount(t.Bytes), nullTime(t.LastModified)}
-		if t.View {
+		switch {
+		case t.View:
 			values[2], values[6], values[7] = "VIEW", nil, nil
+		case t.Provider != "":
+			values[2] = "EXTERNAL TABLE"
 		}
 		rows = append(rows, row{t.Schema, t.Name, values[2].(string), values})
 	}

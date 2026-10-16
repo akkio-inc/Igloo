@@ -49,19 +49,23 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 		return err
 	}
 	column := func(name string, t duckdb.TypeInfo) duckdb.ColumnInfo { return duckdb.ColumnInfo{Name: name, T: t} }
-	// visible keeps the rows, whose schema and table are at 3 and 4, of
-	// the tables the statement's user may see.
-	visible := func(ctx context.Context, rows func() [][]any) func() ([][]any, error) {
+	// visible keeps the rows, whose database, schema and table are at 2, 3
+	// and 4, of the tables the statement's user may see: the catalog's, or
+	// connections'.
+	visible := func(ctx context.Context, rows func(catalog string) [][]any) func() ([][]any, error) {
 		source := e.catalogSource(ctx)
 		return func() ([][]any, error) {
 			src, ok := source()
 			if !ok {
 				return nil, nil
 			}
-			all := rows()
+			all := rows(src.Catalog())
 			out := all[:0]
 			for _, r := range all {
-				if schema, _ := r[3].(string); src.SeesTable(schema, r[4].(string)) {
+				db, _ := r[2].(string)
+				schema, _ := r[3].(string)
+				name, _ := r[4].(string)
+				if db == src.Catalog() && src.SeesTable(schema, name) || db != src.Catalog() && src.SeesConnectionTable(db, schema, name) {
 					out = append(out, r)
 				}
 			}
@@ -76,7 +80,7 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 					column("ref_schema_name", varchar), column("ref_entity_name", varchar), column("ref_entity_domain", varchar),
 					column("ref_column_name", varchar), column("ref_arg_column_names", list), column("tag_name", varchar),
 				},
-				fill: visible(ctx, func() [][]any { return policyReferences(e.catalog, e.policySnapshot()) }),
+				fill: visible(ctx, func(catalog string) [][]any { return policyReferences(catalog, e.policySnapshot()) }),
 			}, nil
 		},
 	})
@@ -91,7 +95,7 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 					column("object_schema", varchar), column("object_name", varchar), column("domain", varchar),
 					column("column_name", varchar),
 				},
-				fill: visible(ctx, func() [][]any { return tagReferences(e.catalog, e.policySnapshot()) }),
+				fill: visible(ctx, func(catalog string) [][]any { return tagReferences(catalog, e.policySnapshot()) }),
 			}, nil
 		},
 	})

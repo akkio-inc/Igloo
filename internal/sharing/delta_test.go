@@ -221,4 +221,28 @@ func TestViewSQL(t *testing.T) {
 	if _, _, err := viewSQL(&remoteSnapshot{schema: `{"type":"struct","fields":[]}`}, nil); err == nil {
 		t.Error("a table without columns made a view")
 	}
+
+	// The catalog lists the columns as the views have them: partition
+	// columns last, as read_parquet adds them, but only once there are
+	// files.
+	columns := func(snap *remoteSnapshot) string {
+		t.Helper()
+		cols, err := remoteColumns(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, c := range cols {
+			out = append(out, c.Name+" "+c.Type)
+		}
+		return strings.Join(out, ", ")
+	}
+	partitioned := &remoteSnapshot{schema: schema, partitionColumns: []string{"at", "day"}}
+	if got, want := columns(partitioned), "id BIGINT, day DATE, at TIMESTAMPTZ"; got != want {
+		t.Errorf("columns of an empty table: %s, want %s", got, want)
+	}
+	partitioned.files = []remoteFile{{ID: "a"}}
+	if got, want := columns(partitioned), "id BIGINT, at TIMESTAMP, day DATE"; got != want {
+		t.Errorf("columns of a partitioned table: %s, want %s", got, want)
+	}
 }

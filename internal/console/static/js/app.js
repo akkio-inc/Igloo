@@ -150,7 +150,7 @@ function start(session) {
 
   function route() {
     let name = location.hash.replace(/^#\/?/, '') || 'worksheets';
-    // A table's catalog page is catalog/<schema>/<name>.
+    // A table's catalog page is catalog/<catalog>/<schema>/<name>.
     let param = '';
     if (!ROUTES[name] && name.startsWith('catalog/')) [name, param] = ['catalog', name.slice('catalog/'.length)];
     if (!ROUTES[name] || (ROUTES[name].admin && !app.isAdmin)) name = 'worksheets';

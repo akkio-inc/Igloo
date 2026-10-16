@@ -10,13 +10,13 @@ import { createGrid } from './grid.js';
 // Tables of the current database (the Iceberg catalog), and views: Igloo
 // keeps a copy of each catalog view in DuckDB's own database.
 const OBJECTS = `
-SELECT schema_name, table_name AS name, 'table' AS kind, database_name FROM duckdb_tables()
+SELECT schema_name, table_name AS name, 'table' AS kind, database_name, current_database() AS catalog FROM duckdb_tables()
   WHERE database_name = current_database() AND NOT temporary AND NOT internal
 UNION ALL
-SELECT schema_name, view_name, 'view', database_name FROM duckdb_views()
+SELECT schema_name, view_name, 'view', database_name, current_database() FROM duckdb_views()
   WHERE NOT temporary AND NOT internal AND schema_name NOT IN ('information_schema', 'pg_catalog')
 UNION ALL
-SELECT schema_name, NULL, 'schema', database_name FROM duckdb_schemas()
+SELECT schema_name, NULL, 'schema', database_name, current_database() FROM duckdb_schemas()
   WHERE database_name = current_database() AND NOT internal AND schema_name NOT IN ('information_schema', 'pg_catalog')
 ORDER BY 1, 2`;
 
@@ -47,7 +47,7 @@ export function createData(app) {
       schemas = new Map();
       for (const o of api.objects(res)) {
         if (!schemas.has(o.schema_name)) schemas.set(o.schema_name, []);
-        if (o.kind !== 'schema') schemas.get(o.schema_name).push({ name: o.name, kind: o.kind, database: o.database_name, schema: o.schema_name });
+        if (o.kind !== 'schema') schemas.get(o.schema_name).push({ name: o.name, kind: o.kind, database: o.database_name, catalog: o.catalog, schema: o.schema_name });
       }
       loaded = true;
       renderTree();
@@ -116,7 +116,7 @@ export function createData(app) {
         h('h1', { text: `${o.schema}.${o.name}` }),
         h('span', { class: 'badge', text: o.kind }),
         h('span', { class: 'spacer' }),
-        button('Catalog page', { icon: 'catalog', onclick: () => { location.hash = `#/catalog/${encodeURIComponent(o.schema)}/${encodeURIComponent(o.name)}`; } }),
+        button('Catalog page', { icon: 'catalog', onclick: () => { location.hash = `#/catalog/${[o.catalog, o.schema, o.name].map(encodeURIComponent).join('/')}`; } }),
         button('Query in a worksheet', { icon: 'open', onclick: () => app.openWorksheet(`SELECT *\nFROM ${qualified(o)}\nLIMIT 100;\n`, o.name) })),
       h('p', { class: 'comment' }));
     clear(detail, head, tabs, panel);

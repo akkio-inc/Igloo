@@ -70,11 +70,13 @@ func str(v any) string {
 
 // match is a search hit: a table or view and why it matched.
 type match struct {
+	Catalog      string   `json:"catalog"`
 	Schema       string   `json:"schema"`
 	Name         string   `json:"name"`
 	Type         string   `json:"type"`
 	Owner        any      `json:"owner"`
 	Comment      any      `json:"comment"`
+	Provider     any      `json:"provider"`
 	Rows         any      `json:"rows"`
 	Bytes        any      `json:"bytes"`
 	LastAltered  any      `json:"last_altered"`
@@ -87,38 +89,42 @@ type match struct {
 }
 
 // searchSQL finds the tables and views whose schema, name, comment, owner,
-// columns, column comments or tags contain every term.
+// provider, columns, column comments or tags contain every term, or for
+// a connection's table its connection's name.
 func searchSQL(terms []string) string {
 	where := "true"
 	for _, term := range terms {
-		where += " AND contains(lower(concat_ws(' ', t.table_schema, t.table_name, t.comment, t.table_owner, s.comment," +
-			" c.names, c.comments, g.tags)), lower(" + quoteLiteral(term) + "))"
+		where += " AND contains(lower(concat_ws(' ', t.table_schema, t.table_name, t.comment, t.table_owner, t.provider," +
+			" CASE WHEN t.table_type = 'FOREIGN' THEN t.table_catalog END, s.comment, c.names, c.comments, g.tags))," +
+			" lower(" + quoteLiteral(term) + "))"
 	}
 	nameHit := "false"
 	for _, term := range terms {
 		nameHit += " OR contains(lower(t.table_name), lower(" + quoteLiteral(term) + "))"
 	}
 	return `WITH c AS (
-	SELECT lower(table_schema) AS s, lower(table_name) AS n,
+	SELECT lower(table_catalog) AS d, lower(table_schema) AS s, lower(table_name) AS n,
 		string_agg(column_name, ' ') AS names, string_agg(comment, ' ') AS comments,
 		to_json(list(column_name ORDER BY ordinal_position)) AS column_list,
 		to_json(list(coalesce(comment, '') ORDER BY ordinal_position)) AS comment_list
-	FROM igloo.columns GROUP BY 1, 2
+	FROM igloo.columns GROUP BY 1, 2, 3
 ), g AS (
-	SELECT lower(object_schema) AS s, lower(object_name) AS n,
+	SELECT lower(object_database) AS d, lower(object_schema) AS s, lower(object_name) AS n,
 		string_agg(tag_name || '=' || tag_value || ' ' || column_name, ' ') AS tags,
 		to_json(list(DISTINCT tag_name || ' = ' || tag_value)) AS tag_list
-	FROM igloo.tag_references GROUP BY 1, 2
+	FROM igloo.tag_references GROUP BY 1, 2, 3
 )
-SELECT t.table_schema, t.table_name, t.table_type, t.table_owner, t.comment, t.row_count, t.bytes, t.last_altered,
-	u.reads_30d, u.users_30d, c.column_list, c.comment_list, g.tag_list, s.comment AS schema_comment, (` + nameHit + `) AS name_hit
+SELECT t.table_catalog, t.table_schema, t.table_name, t.table_type, t.table_owner, t.comment, t.provider, t.row_count, t.bytes,
+	t.last_altered, u.reads_30d, u.users_30d, c.column_list, c.comment_list, g.tag_list, s.comment AS schema_comment,
+	(` + nameHit + `) AS name_hit
 FROM igloo.tables t
-LEFT JOIN igloo.schemata s ON s.schema_name = t.table_schema
-LEFT JOIN c ON c.s = lower(t.table_schema) AND c.n = lower(t.table_name)
-LEFT JOIN g ON g.s = lower(t.table_schema) AND g.n = lower(t.table_name)
-LEFT JOIN igloo.table_usage u ON lower(u.table_schema) = lower(t.table_schema) AND lower(u.table_name) = lower(t.table_name)
+LEFT JOIN igloo.schemata s ON s.catalog_name = t.table_catalog AND s.schema_name = t.table_schema
+LEFT JOIN c ON c.d = lower(t.table_catalog) AND c.s = lower(t.table_schema) AND c.n = lower(t.table_name)
+LEFT JOIN g ON g.d = lower(t.table_catalog) AND g.s = lower(t.table_schema) AND g.n = lower(t.table_name)
+LEFT JOIN igloo.table_usage u ON lower(u.table_catalog) = lower(t.table_catalog) AND lower(u.table_schema) = lower(t.table_schema)
+	AND lower(u.table_name) = lower(t.table_name)
 WHERE ` + where + `
-ORDER BY name_hit DESC, coalesce(u.reads_30d, 0) DESC, lower(t.table_schema), lower(t.table_name)
+ORDER BY name_hit DESC, coalesce(u.reads_30d, 0) DESC, t.table_type = 'FOREIGN', lower(t.table_schema), lower(t.table_name)
 LIMIT ` + strconv.Itoa(maxResults)
 }
 
@@ -142,9 +148,9 @@ func (c *Console) search(w http.ResponseWriter, r *http.Request, req *request) {
 	}
 	matches := []match{}
 	for _, o := range objectsOf(res) {
-		m := match{Schema: str(o["table_schema"]), Name: str(o["table_name"]), Type: str(o["table_type"]), Owner: o["table_owner"],
-			Comment: o["comment"], Rows: o["row_count"], Bytes: o["bytes"], LastAltered: o["last_altered"],
-			Reads: o["reads_30d"], Users: o["users_30d"], MatchedName: str(o["name_hit"]) == "t"}
+		m := match{Catalog: str(o["table_catalog"]), Schema: str(o["table_schema"]), Name: str(o["table_name"]), Type: str(o["table_type"]),
+			Owner: o["table_owner"], Comment: o["comment"], Provider: o["provider"], Rows: o["row_count"], Bytes: o["bytes"],
+			LastAltered: o["last_altered"], Reads: o["reads_30d"], Users: o["users_30d"], MatchedName: str(o["name_hit"]) == "t"}
 		var columns, comments []string
 		_ = json.Unmarshal([]byte(str(o["column_list"])), &columns)
 		_ = json.Unmarshal([]byte(str(o["comment_list"])), &comments)
@@ -154,11 +160,13 @@ func (c *Console) search(w http.ResponseWriter, r *http.Request, req *request) {
 			t := strings.ToLower(term)
 			has := func(s string) bool { return strings.Contains(strings.ToLower(s), t) }
 			switch {
-			case has(m.Name) || has(m.Schema):
+			case has(m.Name) || has(m.Schema) || m.Type == "FOREIGN" && has(m.Catalog):
 			case has(str(m.Comment)):
 				m.MatchedOther = appendNew(m.MatchedOther, "description")
 			case has(str(m.Owner)):
 				m.MatchedOther = appendNew(m.MatchedOther, "owner")
+			case has(str(m.Provider)):
+				m.MatchedOther = appendNew(m.MatchedOther, "provider")
 			default:
 				for i, col := range columns {
 					if has(col) || i < len(comments) && has(comments[i]) {
@@ -196,9 +204,10 @@ type node struct {
 	ID    string `json:"id"`
 	Kind  string `json:"kind"` // table, location or hidden
 	Label string `json:"label"`
-	// Schema and Name name a table.
-	Schema string `json:"schema,omitempty"`
-	Name   string `json:"name,omitempty"`
+	// Catalog, Schema and Name name a table.
+	Catalog string `json:"catalog,omitempty"`
+	Schema  string `json:"schema,omitempty"`
+	Name    string `json:"name,omitempty"`
 	// Depth is how many steps upstream (negative) or downstream
 	// (positive) of the table it is.
 	Depth int `json:"depth"`
@@ -214,12 +223,20 @@ type edge struct {
 	Job        any    `json:"job,omitempty"`
 }
 
-// lineageGraph is what the lineage says about the table schema.name: the
-// tables and locations its data came from and the tables made from it, up
-// to maxDepth steps each way, with each table's ends the user may not see
-// counted, not named.
-func lineageGraph(rows []map[string]any, schema, name string) ([]node, []edge) {
-	key := func(schema, name string) string { return "table:" + strings.ToLower(schema+"."+name) }
+// lineageGraph is what the lineage says about the table db.schema.name:
+// the tables and locations its data came from and the tables made from
+// it, up to maxDepth steps each way, with each table's ends the user may
+// not see counted, not named. Tables of other databases than db, such as
+// a connection's, are labelled with their database.
+func lineageGraph(rows []map[string]any, db, schema, name string) ([]node, []edge) {
+	key := func(db, schema, name string) string { return "table:" + strings.ToLower(db+"."+schema+"."+name) }
+	table := func(d, s, n string) node {
+		label := s + "." + n
+		if !strings.EqualFold(d, db) {
+			label = d + "." + label
+		}
+		return node{Kind: "table", Catalog: d, Schema: s, Name: n, Label: label}
+	}
 	type end struct {
 		id    string
 		n     node
@@ -233,19 +250,21 @@ func lineageGraph(rows []map[string]any, schema, name string) ([]node, []edge) {
 		case o["upstream_name"] == nil:
 			return end{}
 		}
-		s, n := str(o["upstream_schema"]), str(o["upstream_name"])
-		return end{id: key(s, n), n: node{Kind: "table", Schema: s, Name: n, Label: s + "." + n}, known: true}
+		d, s, n := str(o["upstream_database"]), str(o["upstream_schema"]), str(o["upstream_name"])
+		return end{id: key(d, s, n), n: table(d, s, n), known: true}
 	}
 	to := func(o map[string]any) end {
 		if o["downstream_name"] == nil {
 			return end{}
 		}
-		s, n := str(o["downstream_schema"]), str(o["downstream_name"])
-		return end{id: key(s, n), n: node{Kind: "table", Schema: s, Name: n, Label: s + "." + n}, known: true}
+		d, s, n := str(o["downstream_database"]), str(o["downstream_schema"]), str(o["downstream_name"])
+		return end{id: key(d, s, n), n: table(d, s, n), known: true}
 	}
 
-	root := key(schema, name)
-	nodes := map[string]*node{root: {ID: root, Kind: "table", Schema: schema, Name: name, Label: schema + "." + name}}
+	root := key(db, schema, name)
+	rootNode := table(db, schema, name)
+	rootNode.ID = root
+	nodes := map[string]*node{root: &rootNode}
 	order := []string{root}
 	var edges []edge
 	seen := map[[2]string]bool{}
@@ -327,30 +346,33 @@ func lineageGraph(rows []map[string]any, schema, name string) ([]node, []edge) {
 	return out, edges
 }
 
-// object describes a table or view: GET /api/catalog/object?schema=s&name=n.
-// A table the user may not see is not found, as one that does not exist.
+// object describes a table or view: GET
+// /api/catalog/object?catalog=c&schema=s&name=n, where the catalog is the
+// Iceberg catalog's or a connection's name. A table the user may not see
+// is not found, as one that does not exist.
 func (c *Console) object(w http.ResponseWriter, r *http.Request, req *request) {
-	schema, name := r.URL.Query().Get("schema"), r.URL.Query().Get("name")
-	if schema == "" || name == "" {
-		writeError(w, http.StatusBadRequest, "send a schema and a name")
+	db, schema, name := r.URL.Query().Get("catalog"), r.URL.Query().Get("schema"), r.URL.Query().Get("name")
+	if db == "" || schema == "" || name == "" {
+		writeError(w, http.StatusBadRequest, "send a catalog, a schema and a name")
 		return
 	}
-	s, n := quoteLiteral(schema), quoteLiteral(name)
-	is := func(schemaCol, nameCol string) string {
-		return "lower(" + schemaCol + ") = lower(" + s + ") AND lower(" + nameCol + ") = lower(" + n + ")"
+	d, s, n := quoteLiteral(db), quoteLiteral(schema), quoteLiteral(name)
+	is := func(dbCol, schemaCol, nameCol string) string {
+		return "lower(" + dbCol + ") = lower(" + d + ") AND lower(" + schemaCol + ") = lower(" + s + ") AND lower(" + nameCol + ") = lower(" + n + ")"
 	}
 	results, err := c.runAll(r.Context(), req.user, r,
-		`SELECT table_schema, table_name, table_type, table_owner, owner_type, comment, row_count, bytes, file_count,
-			snapshot_count, last_altered FROM igloo.tables WHERE `+is("table_schema", "table_name"),
-		"SELECT schema_owner, owner_type, comment FROM igloo.schemata WHERE lower(schema_name) = lower("+s+")",
-		"SELECT column_name, data_type, comment FROM igloo.columns WHERE "+is("table_schema", "table_name")+" ORDER BY ordinal_position",
-		"SELECT column_name, tag_name, tag_value FROM igloo.tag_references WHERE "+is("object_schema", "object_name")+" ORDER BY 1, 2",
+		`SELECT table_catalog, table_schema, table_name, table_type, table_owner, owner_type, comment, provider, row_count, bytes,
+			file_count, snapshot_count, last_altered FROM igloo.tables WHERE `+is("table_catalog", "table_schema", "table_name"),
+		"SELECT schema_owner, owner_type, comment FROM igloo.schemata WHERE lower(catalog_name) = lower("+d+") AND lower(schema_name) = lower("+s+")",
+		"SELECT column_name, data_type, comment FROM igloo.columns WHERE "+is("table_catalog", "table_schema", "table_name")+" ORDER BY ordinal_position",
+		"SELECT column_name, tag_name, tag_value FROM igloo.tag_references WHERE "+is("object_database", "object_schema", "object_name")+" ORDER BY 1, 2",
 		"SELECT policy_name, policy_kind, ref_column_name, tag_name FROM igloo.policy_references WHERE "+
-			is("ref_schema_name", "ref_entity_name")+" ORDER BY 3 NULLS FIRST, 1",
-		"SELECT reads_30d, writes_30d, users_30d, last_read, last_written FROM igloo.table_usage WHERE "+is("table_schema", "table_name"),
-		`SELECT upstream_type, upstream_schema, upstream_name, downstream_schema, downstream_name, last_seen, statements, last_job
-			FROM igloo.lineage`,
-		"SELECT sql FROM duckdb_views() WHERE NOT internal AND "+is("schema_name", "view_name")+" LIMIT 1",
+			is("ref_database_name", "ref_schema_name", "ref_entity_name")+" ORDER BY 3 NULLS FIRST, 1",
+		"SELECT reads_30d, writes_30d, users_30d, last_read, last_written FROM igloo.table_usage WHERE "+
+			is("table_catalog", "table_schema", "table_name"),
+		`SELECT upstream_type, upstream_database, upstream_schema, upstream_name, downstream_database, downstream_schema,
+			downstream_name, last_seen, statements, last_job FROM igloo.lineage`,
+		"SELECT sql FROM duckdb_views() WHERE NOT internal AND lower(schema_name) = lower("+s+") AND lower(view_name) = lower("+n+") LIMIT 1",
 	)
 	if err != nil {
 		writeSQLError(w, err)
@@ -358,13 +380,13 @@ func (c *Console) object(w http.ResponseWriter, r *http.Request, req *request) {
 	}
 	objects := objectsOf(results[0])
 	if len(objects) == 0 {
-		writeError(w, http.StatusNotFound, "no table or view "+schema+"."+name+" that you may see")
+		writeError(w, http.StatusNotFound, "no table or view "+db+"."+schema+"."+name+" that you may see")
 		return
 	}
 	obj := objects[0]
 	// The names as the catalog has them.
-	schema, name = str(obj["table_schema"]), str(obj["table_name"])
-	nodes, edges := lineageGraph(objectsOf(results[6]), schema, name)
+	db, schema, name = str(obj["table_catalog"]), str(obj["table_schema"]), str(obj["table_name"])
+	nodes, edges := lineageGraph(objectsOf(results[6]), db, schema, name)
 	out := map[string]any{
 		"object":   obj,
 		"columns":  objectsOf(results[2]),
@@ -381,7 +403,14 @@ func (c *Console) object(w http.ResponseWriter, r *http.Request, req *request) {
 	if str(obj["table_type"]) == "VIEW" && len(results[7].Rows) > 0 {
 		out["definition"] = results[7].Rows[0][0]
 	}
-	out["can_comment"] = c.mayComment(r.Context(), req.user, r, schema, str(obj["table_owner"]), str(obj["owner_type"]))
+	// Comments are kept in the Iceberg metadata, which external tables and
+	// connections' tables have none of.
+	switch str(obj["table_type"]) {
+	case "BASE TABLE", "VIEW":
+		out["can_comment"] = c.mayComment(r.Context(), req.user, r, schema, str(obj["table_owner"]), str(obj["owner_type"]))
+	default:
+		out["can_comment"] = false
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 

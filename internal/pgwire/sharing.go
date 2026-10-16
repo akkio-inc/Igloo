@@ -832,6 +832,7 @@ func (s *Server) createExternalTable(ctx context.Context, sess *session, me auth
 	if err != nil {
 		return sharingError(err, fmt.Sprintf("provider %q", c.name))
 	}
+	s.recordOwner(ctx, me, &createdObject{object: auth.Object{Schema: schema, Table: name}})
 	s.log.Info("external table created", "table", schema+"."+name, "remote", def.Remote(), "by", me.Name)
 	return w.Complete(c.tag)
 }

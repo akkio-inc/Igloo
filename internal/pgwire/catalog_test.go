@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
@@ -153,6 +155,9 @@ func TestCatalogShowsOnlyWhatTheUserMaySee(t *testing.T) {
 		[]string{"main|duckdb|NULL", "public|igloo|Shared tables", "sales|duckdb|NULL"}; !slices.Equal(got, want) {
 		t.Errorf("nora's information_schema.schemata: %q, want %q", got, want)
 	}
+	// Flight SQL's metadata commands read it as DuckDB's own.
+	sameAsInformationSchema(t, nora)
+	sameAsInformationSchema(t, cs.admin)
 
 	// Nothing nora may read mentions what she may not see, however she
 	// asks.
@@ -180,6 +185,119 @@ func TestCatalogShowsOnlyWhatTheUserMaySee(t *testing.T) {
 	cs.srv.sessions.expire("nora")
 	if got := texts(t, nora, "SELECT * FROM igloo.tables"); len(got) != 0 {
 		t.Errorf("without grants, nora sees tables: %q", got)
+	}
+}
+
+// flightMetadataQueries are the queries of Flight SQL's metadata commands
+// (internal/flightsql/metadata.go), with the filters they take, which read
+// information_schema: Igloo's versions of its views must answer them as
+// DuckDB's own do, with the same catalogs, tables and table types.
+var flightMetadataQueries = []struct {
+	sql  string
+	args []any
+}{
+	{sql: "SELECT DISTINCT catalog_name FROM information_schema.schemata ORDER BY catalog_name"},
+	{sql: "SELECT catalog_name, schema_name FROM information_schema.schemata ORDER BY 1, 2"},
+	{sql: `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = $1 AND schema_name LIKE $2 ESCAPE '\'
+		ORDER BY 1, 2`, args: []any{"lake", "%"}},
+	{sql: `SELECT table_catalog, table_schema, table_name, CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END
+		FROM information_schema.tables ORDER BY 1, 2, 3, 4`},
+	{sql: `SELECT table_catalog, table_schema, table_name, CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END
+		FROM information_schema.tables WHERE table_name LIKE $1 ESCAPE '\'
+		AND CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END IN ($2, $3) ORDER BY 1, 2, 3, 4`,
+		args: []any{"%", "TABLE", "VIEW"}},
+	{sql: `SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable
+		FROM information_schema.columns ORDER BY 1, 2, 3, ordinal_position`},
+}
+
+// sameAsInformationSchema checks that Flight SQL's metadata queries read
+// the same from information_schema, as Igloo serves it, as from DuckDB's,
+// and that Igloo's columns come after DuckDB's.
+func sameAsInformationSchema(t *testing.T, conn *pgx.Conn) {
+	t.Helper()
+	for _, q := range flightMetadataQueries {
+		got := texts(t, conn, q.sql, q.args...)
+		want := texts(t, conn, strings.ReplaceAll(q.sql, "information_schema.", "system.information_schema."), q.args...)
+		if len(want) == 0 || !slices.Equal(got, want) {
+			t.Errorf("%s:\n got %q\nwant %q", q.sql, got, want)
+		}
+	}
+	for _, view := range []string{"schemata", "tables"} {
+		got, want := columnNames(t, conn, "information_schema."+view), columnNames(t, conn, "system.information_schema."+view)
+		if len(got) <= len(want) || !slices.Equal(got[:len(want)], want) {
+			t.Errorf("information_schema.%s has the columns %q, want %q and Igloo's", view, got, want)
+		}
+	}
+}
+
+// columnNames lists the columns of a table or view.
+func columnNames(t *testing.T, conn *pgx.Conn, table string) []string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), "SELECT * FROM "+table+" LIMIT 0")
+	if err != nil {
+		t.Fatalf("%s: %v", table, err)
+	}
+	defer rows.Close()
+	var out []string
+	for _, f := range rows.FieldDescriptions() {
+		out = append(out, strings.ToLower(f.Name))
+	}
+	return out
+}
+
+// TestExternalTablesInTheCatalog checks that the catalog lists external
+// tables (Delta Sharing) as such, with their provider, to whoever may see
+// them; that lineage records reads of them; and that their views' files,
+// under the proxy's secret prefix, stay out of the history.
+func TestExternalTablesInTheCatalog(t *testing.T) {
+	dir := t.TempDir()
+	proxy := dir + "/proxy/"
+	if err := os.MkdirAll(proxy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	md := &fixedMetadata{md: catalogFixture()}
+	cs := startCatalogServerWithConfig(t, config.Config{Storage: config.Storage{AllowedLocations: []string{dir + "/"}}},
+		func(o *Options) {
+			o.Metadata = md
+			o.external, o.externalFiles = fakeExternal{"public.viewing": true}, proxy
+		})
+	file := proxy + "f1.parquet"
+	for _, sql := range []string{
+		"COPY (SELECT 1 AS id) TO '" + file + "' (FORMAT parquet)",
+		"CREATE SCHEMA memory.public",
+		"CREATE VIEW memory.public.viewing AS SELECT * FROM read_parquet(['" + file + "'])",
+	} {
+		mustExec(t, cs.admin, sql)
+	}
+	nora := cs.user(t, "nora", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+
+	tables := "SELECT table_catalog, table_schema, table_name, table_type, provider, row_count FROM igloo.tables WHERE table_name = 'viewing'"
+	expectRows(t, cs.admin, tables, "lake|public|viewing|EXTERNAL TABLE|acme|NULL")
+	if got := texts(t, nora, tables); len(got) != 0 {
+		t.Errorf("nora sees an external table without a grant: %q", got)
+	}
+	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.viewing TO nora")
+	mustExec(t, cs.admin, "ALTER TABLE lake.public.viewing OWNER TO nora")
+	cs.srv.sessions.expire("nora")
+	expectRows(t, nora, tables, "lake|public|viewing|EXTERNAL TABLE|acme|NULL")
+	expectRows(t, nora, "SELECT column_name, data_type FROM igloo.columns WHERE table_name = 'viewing'", "id|INTEGER")
+	expectRows(t, nora, "SELECT table_catalog, table_type, table_owner FROM information_schema.tables WHERE table_name = 'viewing'",
+		"memory|VIEW|nora")
+	expectRows(t, nora, "SHOW OBJECTS", "public|NULL|SCHEMA|igloo|user|Shared tables|NULL|NULL|NULL",
+		"public|viewing|EXTERNAL TABLE|nora|user|NULL|NULL|NULL|NULL")
+	sameAsInformationSchema(t, nora)
+
+	// Reading it is reading the table, not its files.
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.copied AS SELECT * FROM memory.public.viewing")
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.raw AS SELECT * FROM read_parquet('"+file+"')")
+	expectRows(t, cs.admin, `SELECT upstream_type, upstream_schema, upstream_name, downstream_name FROM igloo.lineage
+		WHERE downstream_name IN ('copied', 'raw')`, "TABLE|public|viewing|copied")
+	expectRows(t, cs.admin, `SELECT list_contains(tables_written, 'lake.public.raw'), locations_read IS NULL FROM igloo.query_history
+		WHERE statement_type = 'CREATE TABLE' AND query_text LIKE '%read_parquet%'`, "true|true")
+	for _, l := range texts(t, cs.admin, "SELECT locations_read FROM igloo.query_history WHERE locations_read IS NOT NULL") {
+		if strings.Contains(l, proxy) {
+			t.Errorf("the history shows the proxy's prefix: %s", l)
+		}
 	}
 }
 

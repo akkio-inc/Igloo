@@ -26,7 +26,7 @@ type CatalogSource interface {
 	// Catalog is the catalog's name in SQL.
 	Catalog() string
 	// Metadata is the schemas, tables and views, with their comments,
-	// columns and sizes.
+	// columns and sizes, and the external tables and connections' tables.
 	Metadata() *catalog.Metadata
 	// Owners are the owners recorded.
 	Owners() []auth.Ownership
@@ -37,8 +37,10 @@ type CatalogSource interface {
 	// TableUsage is how often tables were read and written lately.
 	TableUsage(ctx context.Context) ([]audit.TableUsage, error)
 	// SeesTable reports whether the user may see the table or view
-	// schema.name.
+	// schema.name of the catalog, and SeesConnectionTable whether they may
+	// see the table schema.name of the connection catalog.
 	SeesTable(schema, name string) bool
+	SeesConnectionTable(catalog, schema, name string) bool
 }
 
 // CatalogViewer works out the CatalogSource of a statement prepared with
@@ -92,7 +94,8 @@ func CatalogViews() []string {
 //
 //   - igloo.schemata: each schema's owner and comment
 //   - igloo.tables: each table's and view's owner, comment, size and when
-//     its data last changed
+//     its data last changed; also external tables, with their provider,
+//     and connections' tables
 //   - igloo.columns: each column with its DuckDB type and comment
 //   - igloo.lineage: where tables' data came from, from the query history
 //   - igloo.table_usage: how often tables were read and written in the last
@@ -138,7 +141,8 @@ func (e *Engine) registerCatalog(ctx context.Context) error {
 			rows:    e.schemaRows,
 		},
 		"igloo_tables": {
-			columns: append(varchars("table_catalog", "table_schema", "table_name", "table_type", "table_owner", "owner_type", "comment"),
+			columns: append(varchars("table_catalog", "table_schema", "table_name", "table_type", "table_owner", "owner_type", "comment",
+				"provider"),
 				col("row_count", t.bigint), col("bytes", t.bigint), col("file_count", t.bigint), col("snapshot_count", t.bigint),
 				col("last_altered", t.timestamp)),
 			rows: e.tableRows,
@@ -250,18 +254,30 @@ func (e *Engine) tableRows(_ context.Context, src CatalogSource) ([][]any, error
 	}
 	rows := make([][]any, 0, len(md.Tables))
 	for _, t := range md.Tables {
-		owner, kind := ownerOf(owners, auth.Object{Schema: t.Schema, Table: t.Name})
+		db, owner, kind := src.Catalog(), any(nil), any(nil)
+		if t.Catalog != "" {
+			// Connections' tables have no owner in Igloo.
+			db = t.Catalog
+		} else {
+			owner, kind = ownerOf(owners, auth.Object{Schema: t.Schema, Table: t.Name})
+		}
 		typ := "BASE TABLE"
-		if t.View {
+		switch {
+		case t.View:
 			typ = "VIEW"
+		case t.Provider != "":
+			typ = "EXTERNAL TABLE"
+		case t.Catalog != "":
+			// As PostgreSQL's information_schema calls them.
+			typ = "FOREIGN"
 		}
-		rows = append(rows, []any{src.Catalog(), t.Schema, t.Name, typ, owner, kind, nullString(t.Comment),
-			nullCount(t.Rows), nullCount(t.Bytes), nullCount(t.Files), nullCount(int64(t.Snapshots)), nullTime(t.LastModified)})
-		if t.View {
-			// Views have no files or snapshots.
-			last := rows[len(rows)-1]
-			last[7], last[8], last[9], last[10] = nil, nil, nil, nil
+		row := []any{db, t.Schema, t.Name, typ, owner, kind, nullString(t.Comment), nullString(t.Provider),
+			nullCount(t.Rows), nullCount(t.Bytes), nullCount(t.Files), nullCount(int64(t.Snapshots)), nullTime(t.LastModified)}
+		if t.View || t.Catalog != "" || t.Provider != "" {
+			// Only the catalog's own tables have files and snapshots.
+			row[8], row[9], row[10], row[11] = nil, nil, nil, nil
 		}
+		rows = append(rows, row)
 	}
 	return rows, nil
 }
@@ -273,8 +289,12 @@ func (e *Engine) columnRows(_ context.Context, src CatalogSource) ([][]any, erro
 	}
 	var rows [][]any
 	for _, t := range md.Tables {
+		db := src.Catalog()
+		if t.Catalog != "" {
+			db = t.Catalog
+		}
 		for i, c := range t.Columns {
-			rows = append(rows, []any{src.Catalog(), t.Schema, t.Name, c.Name, int32(i + 1), c.Type, nullString(c.Comment)})
+			rows = append(rows, []any{db, t.Schema, t.Name, c.Name, int32(i + 1), c.Type, nullString(c.Comment)})
 		}
 	}
 	return rows, nil

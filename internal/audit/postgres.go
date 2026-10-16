@@ -317,13 +317,13 @@ func (s *PostgresStore) TableUsage(ctx context.Context, since time.Time) ([]Tabl
 		FROM (
 			SELECT q.user_name, q.start_time, t, false AS w
 			FROM igloo_audit.query_history q, unnest(q.tables_read) AS t
-			WHERE q.tables_read IS NOT NULL AND q.outcome = 'ok' AND q.start_time >= $1
+			WHERE q.tables_read IS NOT NULL AND q.outcome = 'ok' AND q.start_time >= $1 AND q.role IS DISTINCT FROM $3
 			UNION ALL
 			SELECT q.user_name, q.start_time, t, true
 			FROM igloo_audit.query_history q, unnest(q.tables_written) AS t
 			WHERE q.tables_written IS NOT NULL AND q.outcome = 'ok' AND q.start_time >= $1 AND q.statement_type = ANY ($2)
 		) used
-		GROUP BY lower(t) ORDER BY lower(t)`, since, DataStatements)
+		GROUP BY lower(t) ORDER BY lower(t)`, since, DataStatements, RecipientRole)
 	if err != nil {
 		return nil, err
 	}

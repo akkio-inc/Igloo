@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
 )
 
@@ -30,6 +31,17 @@ func (f fakeExternal) TableNames(schema string) []string {
 			out = append(out, n)
 		}
 	}
+	return out
+}
+
+func (f fakeExternal) CatalogTables() []catalog.TableMeta {
+	var out []catalog.TableMeta
+	for k := range f {
+		s, n, _ := strings.Cut(k, ".")
+		out = append(out, catalog.TableMeta{Schema: s, Name: n, Provider: "acme", Rows: -1, Bytes: -1, Files: -1,
+			Columns: []catalog.ColumnMeta{{Name: "id", Type: "INTEGER"}}})
+	}
+	slices.SortFunc(out, func(a, b catalog.TableMeta) int { return strings.Compare(a.Schema+"."+a.Name, b.Schema+"."+b.Name) })
 	return out
 }
 

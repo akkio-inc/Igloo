@@ -593,6 +593,78 @@ func TestConnectionGrants(t *testing.T) {
 	}
 }
 
+// TestConnectionsInTheCatalog checks the data catalog's view of
+// connections: it lists their tables, and lineage names them in full, to
+// whoever may read them, as their grants say, whatever their role;
+// information_schema answers Flight SQL as DuckDB's own does; and a
+// connection that cannot be reached keeps nothing else from working.
+func TestConnectionsInTheCatalog(t *testing.T) {
+	needExtensions(t)
+	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
+	schema := pgFixture(t, pg)
+	store := federation.NewMemoryStore()
+	ctx := context.Background()
+	c := federation.New("crm", federation.Postgres)
+	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
+	c.Schemas = []string{schema}
+	gone := federation.New("gone", federation.Postgres)
+	gone.Host, gone.Port, gone.User, gone.Database = "127.0.0.1", 1, "nobody", "nothing"
+	for _, conn := range []federation.Connection{c, gone} {
+		if err := store.Create(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs := startFedServer(t, store)
+	customers := "crm." + schema + ".customers"
+	nina := fs.user(t, uniqueName("nina"), auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+	rita := fs.user(t, uniqueName("rita"), auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+
+	// Admins see every table of the connection; nobody else does without
+	// a grant, whatever their role.
+	tables := "SELECT table_catalog, table_schema, table_name, table_type, table_owner FROM igloo.tables WHERE table_catalog = 'crm' ORDER BY 3"
+	expectRows(t, fs.admin, tables, "crm|"+schema+"|customers|FOREIGN|NULL", "crm|"+schema+"|pii|FOREIGN|NULL")
+	for _, conn := range []*pgx.Conn{nina, rita} {
+		if got := texts(t, conn, "SELECT * FROM igloo.tables WHERE table_catalog <> 'lake'"); len(got) != 0 {
+			t.Errorf("%s sees a connection's tables without a grant: %q", userName(t, conn), got)
+		}
+	}
+	// A grant on one table shows it, with its columns, and no other.
+	mustExec(t, fs.admin, "GRANT SELECT ON TABLE "+customers+" TO "+userName(t, nina))
+	fs.srv.sessions.expire(userName(t, nina))
+	expectRows(t, nina, tables, "crm|"+schema+"|customers|FOREIGN|NULL")
+	expectRows(t, nina, "SELECT column_name, data_type FROM igloo.columns WHERE table_catalog = 'crm' ORDER BY ordinal_position",
+		"id|INTEGER", "name|VARCHAR", "region|VARCHAR")
+	sameAsInformationSchema(t, nina)
+	sameAsInformationSchema(t, fs.admin)
+
+	// Lineage names a connection's table in full, and shows each end to
+	// those who may see it.
+	mustExec(t, fs.admin, "CREATE TABLE lake.public.regions AS SELECT region, count(*) AS n FROM "+customers+" GROUP BY 1")
+	lineage := `SELECT upstream_database, upstream_schema, upstream_name, downstream_database, downstream_schema, downstream_name
+		FROM igloo.lineage WHERE downstream_name = 'regions' OR upstream_name = 'customers'`
+	expectRows(t, fs.admin, lineage, "crm|"+schema+"|customers|lake|public|regions")
+	expectRows(t, rita, lineage, "NULL|NULL|NULL|lake|public|regions")
+	expectRows(t, nina, lineage, "crm|"+schema+"|customers|NULL|NULL|NULL")
+	usage := "SELECT table_catalog, table_name, reads_30d > 0 FROM igloo.table_usage WHERE table_name IN ('customers', 'regions') ORDER BY 1"
+	expectRows(t, fs.admin, usage, "crm|customers|true", "lake|regions|false")
+	expectRows(t, nina, usage, "crm|customers|true")
+	expectRows(t, rita, usage, "lake|regions|false")
+	// A grant on a schema of a connection says nothing of the catalog's
+	// schema of the same name.
+	mustExec(t, fs.admin, "CREATE SCHEMA lake."+schema)
+	mustExec(t, fs.admin, "CREATE TABLE lake."+schema+".twin AS SELECT 1 AS id")
+	mustExec(t, fs.admin, "CREATE TABLE lake."+schema+".twin_copy AS SELECT * FROM lake."+schema+".twin")
+	mustExec(t, fs.admin, "GRANT SELECT ON SCHEMA crm."+schema+" TO "+userName(t, rita))
+	fs.srv.sessions.expire(userName(t, rita))
+	expectRows(t, rita, tables, "crm|"+schema+"|customers|FOREIGN|NULL", "crm|"+schema+"|pii|FOREIGN|NULL")
+	mustExec(t, fs.admin, "GRANT SELECT ON SCHEMA crm."+schema+" TO "+userName(t, nina))
+	fs.srv.sessions.expire(userName(t, nina))
+	expectRows(t, fs.admin, "SELECT upstream_name FROM igloo.lineage WHERE downstream_name = 'twin_copy'", "twin")
+	if got := texts(t, nina, "SELECT * FROM igloo.lineage WHERE downstream_name = 'twin_copy'"); len(got) != 0 {
+		t.Errorf("a grant on a connection's schema shows the catalog's: %q", got)
+	}
+}
+
 // TestConnectionNamesDifferingInCase checks that a connection's tables
 // and schemas whose names differ only in case, which PostgreSQL tells
 // apart but Igloo's grants do not, are refused to everyone but admins.

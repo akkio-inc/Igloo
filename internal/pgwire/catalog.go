@@ -94,14 +94,127 @@ func (s *Server) ownersChanged() {
 }
 
 // refreshMetadata reads the catalog's metadata, if it is not read already,
-// before a statement that shows it.
+// and lists the connections' tables, before a statement that shows them.
 func (s *Server) refreshMetadata(ctx context.Context) {
+	s.listConnectionTables(ctx)
 	if s.meta == nil {
 		return
 	}
 	if err := s.meta.RefreshMetadata(ctx); err != nil {
 		s.log.Warn("could not read the catalog's metadata", "err", err)
 	}
+}
+
+const (
+	// connectionsTTL is how long a listing of the connections' tables is
+	// used, unless connections change. DuckDB lists them from what it read
+	// when it attached each connection, without asking the remote
+	// database again; tables created since show once a statement names
+	// them, or after ALTER CONNECTION ... REFRESH.
+	connectionsTTL = time.Minute
+	// connectionsWait is how long the first listing may hold up the
+	// statement that needs it; later ones are made in the background.
+	connectionsWait = 5 * time.Second
+)
+
+// connectionListing keeps the tables and columns of the connections.
+type connectionListing struct {
+	mu      sync.Mutex
+	gen     uint64
+	at      time.Time
+	listing bool
+	tables  []catalog.TableMeta
+}
+
+// connectionTables returns the connections' tables as last listed.
+func (s *Server) connectionTables() []catalog.TableMeta {
+	c := &s.connections
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tables
+}
+
+// listConnectionTables lists the connections' tables again when
+// connections changed or the listing is connectionsTTL old. Only the
+// first listing waits, and for at most connectionsWait; when one fails,
+// the last stays in use and the next is tried connectionsTTL later, so a
+// database that is down never keeps the catalog from answering.
+func (s *Server) listConnectionTables(ctx context.Context) {
+	catalogs := s.connectionCatalogs()
+	c := &s.connections
+	c.mu.Lock()
+	if len(catalogs) == 0 {
+		c.tables = nil
+		c.mu.Unlock()
+		return
+	}
+	gen := s.remotes.Generation()
+	if c.listing || c.gen == gen && time.Since(c.at) < connectionsTTL {
+		c.mu.Unlock()
+		return
+	}
+	first := c.at.IsZero()
+	c.listing = true
+	c.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		tables, err := s.readConnectionTables(ctx, catalogs)
+		if err != nil {
+			s.log.Warn("could not list the tables of connections", "err", err)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.listing, c.gen, c.at = false, gen, time.Now()
+		if err == nil {
+			c.tables = tables
+		}
+	}()
+	if first {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		case <-time.After(connectionsWait):
+		}
+	}
+}
+
+// readConnectionTables lists the tables of the connections catalogs, with
+// their columns, as DuckDB has them.
+func (s *Server) readConnectionTables(ctx context.Context, catalogs map[string]string) ([]catalog.TableMeta, error) {
+	conn, err := s.engine.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close() //nolint:errcheck
+	names := make([]string, 0, len(catalogs))
+	for name := range catalogs {
+		names = append(names, quoteLiteral(name))
+	}
+	rows, err := queryRows(ctx, conn, `SELECT database_name, schema_name, table_name, column_name, data_type
+		FROM system.main.duckdb_columns() WHERE system.main.lower(database_name) IN (`+strings.Join(names, ", ")+`)
+		ORDER BY database_name, schema_name, table_name, column_index`)
+	if err != nil {
+		return nil, err
+	}
+	var out []catalog.TableMeta
+	for _, row := range rows {
+		var db, schema, table, column, typ string
+		db, _ = row[0].(string)
+		schema, _ = row[1].(string)
+		table, _ = row[2].(string)
+		column, _ = row[3].(string)
+		typ, _ = row[4].(string)
+		db = strings.ToLower(db)
+		if n := len(out); n == 0 || out[n-1].Catalog != db || out[n-1].Schema != schema || out[n-1].Name != table {
+			out = append(out, catalog.TableMeta{Catalog: db, Schema: schema, Name: table, Rows: -1, Bytes: -1, Files: -1})
+		}
+		t := &out[len(out)-1]
+		t.Columns = append(t.Columns, catalog.ColumnMeta{Name: column, Type: typ})
+	}
+	return out, nil
 }
 
 // metadataChanged reads again the metadata of the tables a statement
@@ -119,12 +232,15 @@ func (s *Server) metadataChanged(objects []auth.Object) {
 
 // metadataAccess is what of the catalog's metadata one user may see.
 type metadataAccess struct {
-	// all is set for users who may read every table.
+	// all is set for users who may read every table of the catalog.
 	all bool
-	// admin may see every statement in the history.
+	// admin may see every statement in the history, and every table of
+	// every connection.
 	admin bool
 	user  string
 	roles []string
+	// privs are the user's grants; nil for admins, and for readers and
+	// writers whose grants could not be read.
 	privs *auth.Privileges
 	// owners are every owner recorded.
 	owners []auth.Ownership
@@ -138,15 +254,35 @@ func (s *Server) metadataAccess(ctx context.Context, sess *session, user auth.Us
 		user:   user.Name,
 		owners: s.objectOwners(ctx),
 	}
-	if a.all {
+	if a.admin {
 		return a, nil
 	}
 	privs, err := s.privileges(ctx, sess, user)
-	if err != nil {
+	switch {
+	case err != nil && !a.all:
 		return nil, err
+	case err != nil:
+		// Readers and writers need grants only for connections' tables,
+		// which they then do not see.
+		s.log.Warn("could not load grants", "user", user.Name, "err", err)
+	default:
+		a.privs, a.roles = privs, privs.Roles
 	}
-	a.privs, a.roles = privs, privs.Roles
 	return a, nil
+}
+
+// grants are the user's grants on the catalog's schemas and tables.
+func (a *metadataAccess) grants() []auth.Grant {
+	if a.privs == nil {
+		return nil
+	}
+	var out []auth.Grant
+	for _, g := range a.privs.Grants {
+		if g.Object.Catalog == "" {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // owns reports whether the user owns o, directly or through a custom role.
@@ -156,13 +292,13 @@ func (a *metadataAccess) owns(o auth.Object) bool {
 }
 
 // SeesTable reports whether the user may see the table or view
-// schema.name: they may read every table, or have a grant on it or its
-// schema, or own it or its schema.
+// schema.name of the catalog, or the external table: they may read every
+// table, or have a grant on it or its schema, or own it or its schema.
 func (a *metadataAccess) SeesTable(schema, name string) bool {
 	if a.all {
 		return true
 	}
-	for _, g := range a.privs.Grants {
+	for _, g := range a.grants() {
 		if strings.EqualFold(g.Object.Schema, schema) && (g.Object.IsSchema() || strings.EqualFold(g.Object.Table, name)) {
 			return true
 		}
@@ -170,34 +306,43 @@ func (a *metadataAccess) SeesTable(schema, name string) bool {
 	return a.owns(auth.Object{Schema: schema, Table: name}) || a.owns(auth.Object{Schema: schema})
 }
 
-// seesSchema reports whether the user may see the schema: they may see
-// something in it, or have a grant on it, or own it.
+// seesConnectionTable reports whether the user may see the table
+// schema.name of connection catalogName: as with reading it, admins may,
+// and everyone else through a grant on it, its schema or the connection;
+// the built-in roles do not cover connections.
+func (a *metadataAccess) seesConnectionTable(catalogName, schema, name string) bool {
+	return a.admin || a.privs.AllowsConnection(auth.PrivilegeSelect, catalogName, schema, name)
+}
+
+// seesSchema reports whether the user may see the catalog's schema: they
+// may see something in it, or have a grant on it, or own it.
 func (a *metadataAccess) seesSchema(schema string, md *catalog.Metadata) bool {
 	if a.all || a.owns(auth.Object{Schema: schema}) {
 		return true
 	}
-	if slices.ContainsFunc(a.privs.Grants, func(g auth.Grant) bool { return strings.EqualFold(g.Object.Schema, schema) }) {
+	if slices.ContainsFunc(a.grants(), func(g auth.Grant) bool { return strings.EqualFold(g.Object.Schema, schema) }) {
 		return true
 	}
 	return slices.ContainsFunc(a.owners, func(w auth.Ownership) bool {
 		return !w.Object.IsSchema() && strings.EqualFold(w.Object.Schema, schema) && w.Owns(a.user, a.roles)
 	}) || md != nil && slices.ContainsFunc(md.Tables, func(t catalog.TableMeta) bool {
-		return strings.EqualFold(t.Schema, schema) && a.SeesTable(t.Schema, t.Name)
+		return t.Catalog == "" && strings.EqualFold(t.Schema, schema) && a.SeesTable(t.Schema, t.Name)
 	})
 }
 
 // seesHistoryName reports whether the user may see a table the history
-// names as catalog.schema.table.
+// names as catalog.schema.table, or connection.schema.table for a
+// connection's (see objectNames).
 func (a *metadataAccess) seesHistoryName(catalogName, name string) bool {
-	if a.all {
-		return true
-	}
-	rest, ok := strings.CutPrefix(name, catalogName+".")
-	if !ok {
-		return false
-	}
+	db, rest, ok := strings.Cut(name, ".")
 	i := strings.LastIndexByte(rest, '.')
-	return i > 0 && a.SeesTable(rest[:i], rest[i+1:])
+	switch {
+	case !ok || i <= 0:
+		return false
+	case strings.EqualFold(db, catalogName):
+		return a.SeesTable(rest[:i], rest[i+1:])
+	}
+	return a.seesConnectionTable(db, rest[:i], rest[i+1:])
 }
 
 // seesStatement reports whether the user may see a statement of user's in
@@ -243,26 +388,46 @@ func (s *Server) CatalogViewer(ctx context.Context) func() (engine.CatalogSource
 func (v *catalogView) Catalog() string                    { return v.s.catalogName() }
 func (v *catalogView) SeesTable(schema, name string) bool { return v.access.SeesTable(schema, name) }
 
-// Metadata returns the schemas, tables and views the user may see.
+func (v *catalogView) SeesConnectionTable(catalog, schema, name string) bool {
+	return v.access.seesConnectionTable(catalog, schema, name)
+}
+
+// Metadata returns the schemas, tables and views the user may see: the
+// catalog's, the external tables in its schemas, and the connections'
+// tables (see connectionTables).
 func (v *catalogView) Metadata() *catalog.Metadata {
 	v.once.Do(func() {
-		if v.s.meta == nil {
+		var md *catalog.Metadata
+		if v.s.meta != nil {
+			md = v.s.meta.Metadata()
+		}
+		var external []catalog.TableMeta
+		if v.s.external != nil {
+			external = v.s.external.CatalogTables()
+		}
+		connections := v.s.connectionTables()
+		if md == nil && len(external) == 0 && len(connections) == 0 {
 			return
 		}
-		md := v.s.meta.Metadata()
-		if md == nil || v.access.all {
-			v.md = md
-			return
+		all := &catalog.Metadata{}
+		if md != nil {
+			all.Schemas, all.Tables = md.Schemas, slices.Clip(md.Tables)
 		}
+		all.Tables = append(all.Tables, external...)
 		out := &catalog.Metadata{}
-		for _, t := range md.Tables {
+		for _, t := range all.Tables {
 			if v.access.SeesTable(t.Schema, t.Name) {
 				out.Tables = append(out.Tables, t)
 			}
 		}
-		for _, sc := range md.Schemas {
-			if v.access.seesSchema(sc.Name, md) {
+		for _, sc := range all.Schemas {
+			if v.access.seesSchema(sc.Name, all) {
 				out.Schemas = append(out.Schemas, sc)
+			}
+		}
+		for _, t := range connections {
+			if v.access.seesConnectionTable(t.Catalog, t.Schema, t.Name) {
+				out.Tables = append(out.Tables, t)
 			}
 		}
 		v.md = out
@@ -329,7 +494,7 @@ func (v *catalogView) TableUsage(ctx context.Context) ([]audit.TableUsage, error
 		return nil, nil
 	}
 	usage, err := v.s.audit.TableUsage(ctx)
-	if err != nil || v.access.all {
+	if err != nil || v.access.admin {
 		return usage, err
 	}
 	catalogName := v.s.catalogName()

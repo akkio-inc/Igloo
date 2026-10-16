@@ -35,8 +35,14 @@ type SchemaMeta struct {
 type TableMeta struct {
 	Schema, Name string
 	View         bool
-	Comment      string
-	Columns      []ColumnMeta
+	// Catalog is the connection (package federation) that a table of
+	// another database is in, and Provider the Delta Sharing provider of an
+	// external table; both are empty for the catalog's own tables and
+	// views. Igloo records no comments, sizes or freshness for either.
+	Catalog  string
+	Provider string
+	Comment  string
+	Columns  []ColumnMeta
 	// LastModified is when the data last changed, the current snapshot's
 	// time, or for a view when it was last replaced. Zero for a table
 	// without data.

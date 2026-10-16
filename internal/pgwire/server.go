@@ -29,6 +29,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
@@ -165,6 +166,8 @@ type externalCatalog interface {
 	IsExternal(schema, name string) (scans int, ok bool)
 	// TableNames lists the external tables in schema.
 	TableNames(schema string) []string
+	// CatalogTables describes them for the data catalog.
+	CatalogTables() []catalog.TableMeta
 	// Prepare points a statement's references to external tables at their
 	// views, and makes sure those list the tables' current files.
 	Prepare(ctx context.Context, query string) (string, error)
@@ -239,6 +242,8 @@ type Server struct {
 	owners     auth.OwnerStore
 	ownerCache ownerCache
 	lineage    LineageSink
+	// connections lists the connections' tables for the catalog.
+	connections connectionListing
 	// analyzer works out what statements read and wrote, for the
 	// history; nil without one.
 	analyzer *analyzer

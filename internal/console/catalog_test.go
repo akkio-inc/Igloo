@@ -181,7 +181,7 @@ func TestCatalogObject(t *testing.T) {
 		Lineage    graph
 		CanComment bool `json:"can_comment"`
 	}
-	status, body := admin.get("/api/catalog/object?schema=public&name=ORDERS")
+	status, body := admin.get("/api/catalog/object?catalog=lake&schema=public&name=ORDERS")
 	if status != http.StatusOK {
 		t.Fatalf("admin: %d %s", status, body)
 	}
@@ -203,7 +203,7 @@ func TestCatalogObject(t *testing.T) {
 		t.Errorf("the admin's lineage: %+v", page.Lineage)
 	}
 
-	status, body = nora.get("/api/catalog/object?schema=public&name=orders")
+	status, body = nora.get("/api/catalog/object?catalog=lake&schema=public&name=orders")
 	if status != http.StatusOK {
 		t.Fatalf("nora: %d %s", status, body)
 	}
@@ -221,8 +221,8 @@ func TestCatalogObject(t *testing.T) {
 	}
 	// A table she may not see is not found, just as one that does not
 	// exist.
-	statusHidden, bodyHidden := nora.get("/api/catalog/object?schema=public&name=secrets")
-	statusMissing, bodyMissing := nora.get("/api/catalog/object?schema=public&name=nothing")
+	statusHidden, bodyHidden := nora.get("/api/catalog/object?catalog=lake&schema=public&name=secrets")
+	statusMissing, bodyMissing := nora.get("/api/catalog/object?catalog=lake&schema=public&name=nothing")
 	if statusHidden != http.StatusNotFound || statusMissing != http.StatusNotFound ||
 		strings.Replace(bodyHidden, "secrets", "nothing", 1) != bodyMissing {
 		t.Errorf("hidden: %d %s; missing: %d %s", statusHidden, bodyHidden, statusMissing, bodyMissing)
@@ -266,28 +266,43 @@ func TestCatalogComment(t *testing.T) {
 }
 
 func TestLineageGraph(t *testing.T) {
+	db := func(schema any) any {
+		if schema == nil {
+			return nil
+		}
+		return "lake"
+	}
 	row := func(upSchema, up, downSchema, down any) map[string]any {
-		return map[string]any{"upstream_type": "TABLE", "upstream_schema": upSchema, "upstream_name": up,
-			"downstream_schema": downSchema, "downstream_name": down}
+		return map[string]any{"upstream_type": "TABLE", "upstream_database": db(upSchema), "upstream_schema": upSchema, "upstream_name": up,
+			"downstream_database": db(downSchema), "downstream_schema": downSchema, "downstream_name": down}
 	}
 	rows := []map[string]any{
 		row("s", "a", "s", "b"), row("s", "b", "s", "c"), row("s", "c", "s", "d"), row("s", "d", "s", "e"),
 		row(nil, nil, "s", "b"), row(nil, nil, "s", "b"), row("s", "c", nil, nil),
-		{"upstream_type": "LOCATION", "upstream_name": "s3://drops/", "downstream_schema": "s", "downstream_name": "a"},
+		{"upstream_type": "LOCATION", "upstream_name": "s3://drops/", "downstream_database": "lake", "downstream_schema": "s", "downstream_name": "a"},
 		row("s", "x", "s", "y"),
+		// A connection's table of the same schema and name as a table of
+		// the catalog is another table.
+		{"upstream_type": "TABLE", "upstream_database": "crm", "upstream_schema": "s", "upstream_name": "a",
+			"downstream_database": "lake", "downstream_schema": "s", "downstream_name": "a"},
 	}
-	nodes, edges := lineageGraph(rows, "S", "B")
+	nodes, edges := lineageGraph(rows, "lake", "S", "B")
 	depth := map[string]int{}
 	for _, n := range nodes {
 		depth[n.Label] = n.Depth
 	}
-	for label, want := range map[string]int{"S.B": 0, "s.a": -1, "s3://drops/": -2, "2 hidden upstream tables": -1, "s.c": 1, "s.d": 2,
-		"s.e": 3, "1 hidden downstream table": 2} {
+	for label, want := range map[string]int{"S.B": 0, "s.a": -1, "s3://drops/": -2, "crm.s.a": -2, "2 hidden upstream tables": -1, "s.c": 1,
+		"s.d": 2, "s.e": 3, "1 hidden downstream table": 2} {
 		if got, ok := depth[label]; !ok || got != want {
 			t.Errorf("%s at %d (%v), want %d", label, got, ok, want)
 		}
 	}
-	if _, ok := depth["s.x"]; ok || len(edges) != 7 {
+	if _, ok := depth["s.x"]; ok || len(edges) != 8 {
 		t.Errorf("nodes %v, %d edges", depth, len(edges))
+	}
+	for _, n := range nodes {
+		if n.Label == "crm.s.a" && (n.Catalog != "crm" || n.Schema != "s" || n.Name != "a") {
+			t.Errorf("the connection's table: %+v", n)
+		}
 	}
 }

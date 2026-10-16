@@ -40,7 +40,7 @@ const (
 	// recipientRole is the role recipients' requests have in the query
 	// history; their user name there is recipientUser plus their name,
 	// which cannot be an Igloo user's name.
-	recipientRole = "recipient"
+	recipientRole = audit.RecipientRole
 	recipientUser = "recipient:"
 )
 

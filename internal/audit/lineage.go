@@ -25,6 +25,11 @@ var DataStatements = []string{"INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE",
 // ChangesData reports whether a statement of type t changes tables' data.
 func ChangesData(t string) bool { return slices.Contains(DataStatements, t) }
 
+// RecipientRole is the role of Delta Sharing recipients' requests in the
+// history (package sharing). TableUsage leaves them out: what recipients
+// read is for admins, who see it in the history.
+const RecipientRole = "recipient"
+
 // usageTTL is how long a Log reuses the usage it read: counting reads a
 // month of history.
 const usageTTL = time.Minute
@@ -183,7 +188,9 @@ func (m *MemoryStore) TableUsage(_ context.Context, since time.Time) ([]TableUsa
 			continue
 		}
 		for _, t := range q.TablesRead {
-			count(q, t, false)
+			if q.Role != RecipientRole {
+				count(q, t, false)
+			}
 		}
 		if ChangesData(q.StatementType) {
 			for _, t := range q.TablesWritten {

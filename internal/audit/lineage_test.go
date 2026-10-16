@@ -19,7 +19,11 @@ func testLineage(t *testing.T, s Store) {
 			StatementType: kind, Text: kind, TablesRead: read, LocationsRead: locations, TablesWritten: written, Job: job}
 	}
 	orders, report := []string{"lake.public.orders"}, []string{"lake.public.report"}
+	// What Delta Sharing recipients read is not usage.
+	recipient := q("8", "recipient:acme", 6*time.Minute, OutcomeOK, "DELTA SHARING", orders, nil, nil, "")
+	recipient.Role = RecipientRole
 	if err := s.WriteQueries(ctx, []Query{
+		recipient,
 		q("1", "ana", 0, OutcomeOK, "INSERT", orders, nil, report, ""),
 		q("2", "bob", time.Minute, OutcomeOK, "INSERT", []string{"lake.public.orders", "lake.public.report"}, nil, report, "task nightly"),
 		q("3", "ana", 2*time.Minute, OutcomeError, "INSERT", orders, nil, report, ""),
@@ -91,7 +95,7 @@ func TestPostgresLineage(t *testing.T) {
 	}
 	testLineage(t, s)
 	qs, err := s.Queries(ctx, Viewer{All: true}, Page{Limit: 10})
-	if err != nil || len(qs) != 7 {
+	if err != nil || len(qs) != 8 {
 		t.Fatalf("queries: %d %v", len(qs), err)
 	}
 	for _, q := range qs {

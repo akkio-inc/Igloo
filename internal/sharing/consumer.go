@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -85,6 +87,8 @@ type external struct {
 	scans    atomic.Int32
 	ready    atomic.Bool
 	tableKey string
+	// columns are the view's, for the data catalog.
+	columns atomic.Pointer[[]catalog.ColumnMeta]
 }
 
 func tableKey(schema, name string) string {
@@ -127,6 +131,25 @@ func (c *Consumer) IsExternal(schema, name string) (scans int, ok bool) {
 		return 0, false
 	}
 	return int(t.scans.Load()), true
+}
+
+// CatalogTables describes the external tables for the data catalog: their
+// providers, and their columns once their views are made. It says nothing
+// of the shares they come from.
+func (c *Consumer) CatalogTables() []catalog.TableMeta {
+	known := *c.known.Load()
+	out := make([]catalog.TableMeta, 0, len(known))
+	for _, t := range known {
+		m := catalog.TableMeta{Schema: t.def.Schema, Name: t.def.Name, Provider: t.def.Provider, Rows: -1, Bytes: -1, Files: -1}
+		if cols := t.columns.Load(); cols != nil {
+			m.Columns = *cols
+		}
+		out = append(out, m)
+	}
+	slices.SortFunc(out, func(a, b catalog.TableMeta) int {
+		return strings.Compare(tableKey(a.Schema, a.Name), tableKey(b.Schema, b.Name))
+	})
+	return out
 }
 
 // TableNames lists the external tables in schema.
@@ -214,6 +237,9 @@ func (c *Consumer) refresh(ctx context.Context, t *external, force bool) error {
 		t.viewSQL = sql
 		t.scans.Store(int32(scans))
 		t.ready.Store(true)
+		if cols, err := remoteColumns(snap); err == nil {
+			t.columns.Store(&cols)
+		}
 	}
 	t.version, t.checked = snap.version, now
 	t.expires = now.Add(24 * time.Hour)
@@ -268,6 +294,37 @@ func viewSQL(snap *remoteSnapshot, urls []string) (string, int, error) {
 		opts = ", union_by_name = true, hive_partitioning = true, hive_types = {" + strings.Join(types, ", ") + "}"
 	}
 	return "SELECT * FROM read_parquet([" + strings.Join(quoted, ", ") + "]" + opts + ")", 1, nil
+}
+
+// remoteColumns are the columns of a shared table's view (see viewSQL),
+// with their DuckDB types: read_parquet puts partition columns, which the
+// files lack, last.
+func remoteColumns(snap *remoteSnapshot) ([]catalog.ColumnMeta, error) {
+	rs, err := parseRemoteSchema(snap.schema)
+	if err != nil {
+		return nil, err
+	}
+	var cols, partitions []catalog.ColumnMeta
+	for _, f := range rs.Fields {
+		partition := len(snap.files) > 0 && slices.Contains(snap.partitionColumns, f.Name)
+		typeOf := duckType
+		if partition {
+			typeOf = hiveType
+		}
+		t, err := typeOf(f.Type)
+		if err != nil {
+			return nil, err
+		}
+		if partition {
+			partitions = append(partitions, catalog.ColumnMeta{Name: f.Name, Type: t})
+		} else {
+			cols = append(cols, catalog.ColumnMeta{Name: f.Name, Type: t})
+		}
+	}
+	slices.SortStableFunc(partitions, func(a, b catalog.ColumnMeta) int {
+		return slices.Index(snap.partitionColumns, a.Name) - slices.Index(snap.partitionColumns, b.Name)
+	})
+	return append(cols, partitions...), nil
 }
 
 // hiveType is the type of a partition column's values, which the protocol
