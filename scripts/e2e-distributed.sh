@@ -7,7 +7,9 @@
 #   - grants hold on the workers,
 #   - a worker killed in the middle of a statement does not fail it,
 #   - statement timeouts reach the workers,
+#   - a statement keeps its snapshot while another session commits,
 #   - tables that maintenance compacted still run distributed,
+#   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
 # Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT, the
 # E2E_*_PORT variables, E2E_WORKERS and E2E_TPCH_SF change the defaults;
@@ -98,14 +100,18 @@ until metric_matches '^igloo_maintenance_passes_total{result="ok"} [1-9]'; do
   sleep 2
 done
 
-# Several files per table, so that every worker gets some.
+# Several files per table, so that every worker gets some. Rows are divided
+# by their first column, not by rowid: with the spatial extension loaded,
+# DuckDB 1.5.6 cannot plan a filter on rowid.
 echo "loading TPC-H at scale factor $sf"
 {
   echo "ATTACH ':memory:' AS tpch_gen; CALL dbgen(sf = $sf, catalog = 'tpch_gen', schema = 'main');"
-  for t in region nation supplier customer part partsupp orders lineitem; do
+  for t in region:r_regionkey nation:n_nationkey supplier:s_suppkey customer:c_custkey part:p_partkey \
+    partsupp:ps_partkey orders:o_orderkey lineitem:l_orderkey; do
+    key=${t#*:} t=${t%%:*}
     echo "CREATE TABLE $t AS SELECT * FROM tpch_gen.main.$t WHERE false;"
     for part in 0 1 2 3 4 5; do
-      echo "INSERT INTO $t SELECT * FROM tpch_gen.main.$t WHERE hash(rowid) % 6 = $part;"
+      echo "INSERT INTO $t SELECT * FROM tpch_gen.main.$t WHERE hash($key) % 6 = $part;"
     done
   done
   echo "DETACH tpch_gen;"
@@ -208,6 +214,36 @@ got="$(psql_admin -v VERBOSITY=verbose -c "SET distributed_execution = 'on'" -c 
   -c "SELECT l_returnflag, sum(length(repeat(l_comment, 3000))) FROM lineitem GROUP BY 1" || true)"
 if grep -q "57014" <<<"$got"; then pass "statement_timeout cancels a distributed statement"; else fail "timeout: $got"; fi
 
+echo "snapshot isolation"
+# A statement reads one snapshot of each table, on the workers and in the
+# part the coordinator runs itself (the scalar subquery), while another
+# session deletes rows and adds a column.
+{
+  echo "CREATE TABLE iso AS SELECT * FROM orders WHERE false;"
+  for part in 0 1 2 3 4 5; do echo "INSERT INTO iso SELECT * FROM orders WHERE hash(o_orderkey) % 6 = $part;"; done
+} | psql_admin -q >/dev/null
+iso="SELECT x.o_orderstatus, x.n, x.s, (SELECT count(*) FROM iso) AS total FROM
+  (SELECT o_orderstatus, count(*) AS n, sum(length(repeat(o_comment, 5000))) AS s FROM iso GROUP BY 1) AS x ORDER BY 1"
+want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$iso" | grep -v '^SET$')"
+psql_admin -c "SET distributed_execution = 'on'" -c "/* iso */ $iso" | grep -v '^SET$' >"$work/iso" &
+query=$!
+sleep 1
+psql_admin -c "DELETE FROM iso WHERE o_orderkey % 2 = 0" -c "ALTER TABLE iso ADD COLUMN extra INTEGER" >/dev/null
+wait "$query" || true
+if [ "$(cat "$work/iso")" = "$want" ]; then
+  pass "a statement saw the snapshot it started with"
+else
+  fail "after a concurrent commit: [$(cat "$work/iso")], want [$want]"
+fi
+sleep 2
+got="$(psql_admin -c "SELECT q.workers, q.end_time > d.end_time FROM igloo.query_history q, igloo.query_history d
+  WHERE q.query_text LIKE '/* iso */%' AND d.query_text LIKE 'DELETE FROM iso%' ORDER BY q.start_time DESC LIMIT 1")"
+case "$got" in
+  [1-9]*\|t) pass "on workers, while the commit landed" ;;
+  [1-9]*\|f) echo "        (the statement finished before the commit; inconclusive)" ;;
+  *) fail "the snapshot check did not run distributed: [$got]" ;;
+esac
+
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
 # it compacts a name mapping (for files without field IDs, which these are
@@ -229,6 +265,24 @@ if [ "$got" = "$want" ]; then pass "a compacted table returns the same rows"; el
 sleep 2
 got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* compacted */%' ORDER BY start_time DESC LIMIT 1")"
 if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a compacted table ran on $got workers"; fi
+
+echo "policies"
+# Workers read table files and could not apply masking or row access
+# policies: a statement over a protected table runs on one replica and
+# returns what the policies let through, however it aggregates.
+{
+  echo "CREATE TABLE contacts AS SELECT c_custkey AS id, c_name AS name, c_nationkey AS nation FROM customer;"
+  echo "CREATE MASKING POLICY hide_name AS (val VARCHAR) RETURNS VARCHAR -> '***';"
+  echo "ALTER TABLE contacts ALTER COLUMN name SET MASKING POLICY hide_name;"
+  echo "CREATE ROW ACCESS POLICY low_nations AS (n INTEGER) RETURNS BOOLEAN -> n < 5;"
+  echo "ALTER TABLE contacts ADD ROW ACCESS POLICY low_nations ON (nation);"
+} | psql_admin -q >/dev/null
+got="$(psql_admin -c "SET distributed_execution = 'on'" \
+  -c "/* masked */ SELECT count(DISTINCT name), min(name), max(name), max(nation) FROM contacts" | grep -v '^SET$')"
+if [ "$got" = "1|***|***|4" ]; then pass "a protected table returns what its policies let through"; else fail "protected table: [$got]"; fi
+sleep 2
+expect "and runs on one replica" "0" \
+  "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* masked */%' ORDER BY start_time DESC LIMIT 1"
 
 echo "worker endpoint"
 if docker run --rm --network "$network" curlimages/curl:8.22.0 -sk --max-time 10 "https://worker:7433/v1/status" >/dev/null 2>&1; then
