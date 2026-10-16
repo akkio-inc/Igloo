@@ -3,10 +3,18 @@ package federation
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
@@ -42,8 +50,11 @@ func TestConnectionOptions(t *testing.T) {
 	if err := c.Set("password", "x"); err != nil || c.PasswordSecret != "" || c.PasswordSource() != "stored" {
 		t.Errorf("password: %v %+v", err, c)
 	}
-	if m := New("ops", MySQL); m.Port != 3306 || m.TLS != TLSPrefer {
+	if m := New("ops", MySQL); m.Port != 3306 || m.TLS != TLSVerifyFull {
 		t.Errorf("MySQL defaults: %+v", m)
+	}
+	if New("crm", Postgres).TLS != TLSVerifyFull {
+		t.Error("PostgreSQL connections do not verify their server by default")
 	}
 	if err := c.Set("tls", "verify_identity"); err != nil || c.TLS != TLSVerifyFull {
 		t.Errorf("MySQL's ssl_mode names: %v", err)
@@ -84,15 +95,31 @@ func TestConnectionOptions(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	m := NewManager(NewMemoryStore(), Options{Protected: []string{"meta.example.com:5432"}}, nil)
-	c = valid()
-	c.Host = "META.example.com"
+	ctx := context.Background()
+	m := NewManager(NewMemoryStore(), Options{Protected: []string{"meta.example.com:5432", "10.1.2.3:5432", "[2001:db8::7]:5432",
+		"localhost:6432"}}, nil)
 	var invalid *InvalidError
-	if err := m.validate(c, nil); !errors.As(err, &invalid) {
-		t.Errorf("a connection to the metadata database's server: %v", err)
+	for _, host := range []string{"META.example.com", "meta.example.com.", "10.1.2.3", "::ffff:10.1.2.3", "2001:db8:0:0::7",
+		"2001:DB8::7"} {
+		c = valid()
+		c.Host = host
+		if err := m.validate(ctx, c, nil); !errors.As(err, &invalid) {
+			t.Errorf("%s: a connection to the metadata database's server: %v", host, err)
+		}
 	}
-	c.Port = 5433
-	if err := m.validate(c, nil); err != nil {
+	// By the addresses names resolve to: localhost is in /etc/hosts.
+	c = valid()
+	c.Host, c.Port = "127.0.0.1", 6432
+	if err := m.validate(ctx, c, nil); !errors.As(err, &invalid) {
+		t.Errorf("127.0.0.1 for localhost: %v", err)
+	}
+	c = valid()
+	c.Host, c.Port = "meta.example.com", 5433
+	if err := m.validate(ctx, c, nil); err != nil {
+		t.Errorf("another port: %v", err)
+	}
+	c.Host, c.Port = "10.1.2.4", 5432
+	if err := m.validate(ctx, c, nil); err != nil {
 		t.Errorf("another server: %v", err)
 	}
 	if _, err := ParseType("MariaDB"); err != nil {
@@ -101,6 +128,111 @@ func TestConnectionOptions(t *testing.T) {
 	if _, err := ParseType("oracle"); err == nil {
 		t.Error("oracle accepted")
 	}
+}
+
+// TestTLSWarning checks which modes are said not to verify the server.
+func TestTLSWarning(t *testing.T) {
+	for mode, warns := range map[TLSMode]bool{TLSDisable: true, TLSPrefer: true, TLSRequire: true, TLSVerifyCA: true, TLSVerifyFull: false} {
+		c := New("crm", Postgres)
+		c.Host, c.TLS = "db.example.com", mode
+		if got := c.TLSWarning(); (got != "") != warns || warns && !strings.Contains(got, "verify-full") {
+			t.Errorf("%s: %q", mode, got)
+		}
+	}
+}
+
+// TestTLSModes checks what each mode accepts of a server whose certificate
+// is signed by a private authority, for db.example.com.
+func TestTLSModes(t *testing.T) {
+	ca, caPEM, leaf := testCertificates(t, "db.example.com")
+	_ = ca
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{leaf}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close() //nolint:errcheck
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_ = conn.(*tls.Conn).Handshake()
+				_ = conn.Close()
+			}()
+		}
+	}()
+	handshake := func(mode TLSMode, host, ca string) error {
+		c := New("crm", Postgres)
+		c.Host, c.TLS, c.TLSCA = host, mode, ca
+		cfg, err := tlsConfig(&c)
+		if err != nil {
+			return err
+		}
+		conn, err := tls.Dial("tcp", ln.Addr().String(), cfg)
+		if err != nil {
+			return err
+		}
+		return conn.Close()
+	}
+	for _, tc := range []struct {
+		mode     TLSMode
+		host, ca string
+		ok       bool
+	}{
+		// Without the authority, only prefer, which checks nothing, gets
+		// through: require checks the chain against the system's roots.
+		{TLSVerifyFull, "db.example.com", "", false},
+		{TLSVerifyCA, "db.example.com", "", false},
+		{TLSRequire, "db.example.com", "", false},
+		{TLSPrefer, "db.example.com", "", true},
+		// With it, verify-full also wants the right name.
+		{TLSVerifyFull, "db.example.com", caPEM, true},
+		{TLSVerifyFull, "other.example.com", caPEM, false},
+		{TLSVerifyCA, "other.example.com", caPEM, true},
+		{TLSRequire, "other.example.com", caPEM, true},
+	} {
+		if err := handshake(tc.mode, tc.host, tc.ca); (err == nil) != tc.ok {
+			t.Errorf("%s to %s with ca %v: %v", tc.mode, tc.host, tc.ca != "", err)
+		}
+	}
+	if cfg, err := tlsConfig(&Connection{TLS: TLSDisable}); cfg != nil || err != nil {
+		t.Errorf("disable: %v %v", cfg, err)
+	}
+}
+
+// testCertificates makes an authority and a certificate it signs for host.
+func testCertificates(t *testing.T, host string) (*x509.Certificate, string, tls.Certificate) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test authority"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageCertSign}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: host}, DNSNames: []string{host},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		KeyUsage: x509.KeyUsageDigitalSignature}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, ca, &leafKey.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
+	return ca, caPEM, tls.Certificate{Certificate: [][]byte{leafDER, caDER}, PrivateKey: leafKey}
 }
 
 func TestSealer(t *testing.T) {

@@ -87,6 +87,8 @@ func (r remote) connection(name string, t Type) Connection {
 	c := New(name, t)
 	c.Host, c.Port, c.User, c.Password, c.Database = r.host, r.port, r.user, r.password, r.database
 	c.ConnectTimeout = 5 * time.Second
+	// The test databases have no TLS.
+	c.TLS = TLSDisable
 	return c
 }
 

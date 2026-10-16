@@ -8,7 +8,7 @@ queries them like any other:
 
 ```sql
 CREATE CONNECTION crm TYPE postgres
-  WITH (host 'crm.db.example.com', database 'crm', user 'igloo_ro', password 'a-long-password', tls 'verify-full');
+  WITH (host 'crm.db.example.com', database 'crm', user 'igloo_ro', password 'a-long-password');
 
 -- after the next restart of each replica (see below)
 GRANT SELECT ON SCHEMA crm.public TO analysts;
@@ -78,8 +78,8 @@ connection.
 | `user` | (required) | The database user Igloo signs in as. Give it read access only to what Igloo should see. |
 | `password` | | Its password, stored encrypted (see [credentials](#credentials)) |
 | `password_secret` | | Instead of `password`: the name of a file in `IGLOO_CONNECTION_SECRETS_DIR` holding it, read at every sign-in |
-| `tls` (`sslmode`, `ssl_mode`) | `prefer` | `disable`, `prefer`, `require`, `verify-ca` or `verify-full`, as libpq means them; MySQL's names (`disabled`, `preferred`, `required`, `verify_identity`) work too. Use `verify-full` across untrusted networks. |
-| `tls_ca` | the system's | PEM certificates of the authorities that may sign the server's certificate. With `require`, setting it checks the chain, as libpq does. |
+| `tls` (`sslmode`, `ssl_mode`) | `verify-full` | How Igloo makes sure it reaches the right server; see [TLS](#tls). MySQL's names (`disabled`, `preferred`, `required`, `verify_identity`) work too. |
+| `tls_ca` | the system's | PEM certificates of the authorities that may sign the server's certificate |
 | `schema` | all | Comma-separated schemas to attach, for large databases or to expose only some |
 | `connect_timeout` | `10s` | How long connecting and signing in may take |
 | `query_timeout` | `5m` | How long the remote database may work on one statement (its `statement_timeout`, `max_execution_time` or `max_statement_time`) and how long it may leave Igloo waiting for the next part of a result before Igloo gives up; `0` for no limit |
@@ -90,6 +90,29 @@ anything. `SHOW CONNECTIONS` lists every connection's settings, never its
 password (`password` shows `stored`, `secret <name>` or `none`), with its
 state on the replica that answers: `attached`, `not attached` with the
 reason, or `failed` with the error.
+
+### TLS
+
+By default (`verify-full`) Igloo connects only over TLS, and only to a
+server whose certificate is signed by an authority the system trusts, or
+one in `tls_ca`, and issued for `host`: no one on the network path can
+read the password or the data, or pose as the server. Managed databases
+need their provider's authority, such as Amazon RDS's certificate bundle,
+in `tls_ca`. The other modes are there to be chosen explicitly, and
+`CREATE` and `ALTER CONNECTION` answer every choice of one with a warning
+(SQLSTATE `01000`, which psql prints as `WARNING:`):
+
+| `tls` | Encrypted | The server's certificate |
+|---|---|---|
+| `verify-full` | always | signed by a trusted authority, for `host` |
+| `verify-ca`, `require` | always | signed by a trusted authority, for any host: another server with a certificate from that authority could pose as it |
+| `prefer` | when the server offers TLS, else not | not checked: anyone on the path could pose as the server |
+| `disable` | never | none |
+
+Unlike libpq, `require` does not take any certificate: it checks the chain
+as `verify-ca` does, against `tls_ca` or the system's authorities. For a
+server with a self-signed certificate, put that certificate in `tls_ca`
+and keep `verify-full` if it names the host, or use `verify-ca`.
 
 ### When changes take effect
 
@@ -250,11 +273,14 @@ ALTER TABLE crm.public.customers ALTER COLUMN phone SET TAG pii = 'phone';
   settings (`pg_*`, `mysql_*`) are for admins only.
 - **Detach a connection** with `DETACH`: use `DROP CONNECTION`.
 - **Connect to Igloo's metadata database**, which holds its users, grants
-  and history: a connection to the host and port of
-  `IGLOO_METADATA_DATABASE_URL` is refused. That guards against mistakes
-  only; the same server under another name, and other internal services
-  such as the catalog's database, are reached just the same, so do not
-  create connections to them.
+  and history: `CREATE` and `ALTER CONNECTION` refuse a host and port that
+  is `IGLOO_METADATA_DATABASE_URL`'s, however the name is written (case, a
+  trailing dot, IPv6 and IPv4-in-IPv6 forms), or that resolves, then, to
+  one of the addresses its host does. That guards against mistakes only:
+  the server can still be reached through a name that resolves differently
+  later, a proxy or a port forward, and other internal services such as
+  the catalog's database are not guarded at all, so do not create
+  connections to them.
 - **Pivot on a connection's values.** A `PIVOT` that takes its columns from
   the data (no `IN (...)` after `ON`) runs a query while it is prepared,
   before it can be checked; for users who are not admins it is refused

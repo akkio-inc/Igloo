@@ -88,7 +88,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   stored encrypted or read from files of `IGLOO_CONNECTION_SECRETS_DIR`,
   never shown again, and rotate without a restart; a new connection is
   attached when each replica next starts. A database that is down or stops
-  answering fails only the queries that read it.
+  answering fails only the queries that read it. Connections verify their
+  server's certificate and host name by default (`tls 'verify-full'`);
+  the modes that do not are explicit choices that draw a warning, and
+  `require` checks the certificate's chain.
 
 ### Security and governance
 

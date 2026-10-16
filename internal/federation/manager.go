@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,8 +32,10 @@ type Options struct {
 	Connect func(context.Context) (*duckdb.Conn, error)
 	// Protected are host:port addresses no connection may reach: the
 	// metadata database's server, whose users, grants and catalog no grant
-	// should expose. It guards against mistakes, not a determined admin,
-	// who can name the server another way.
+	// should expose. They are compared however the names are written, and
+	// by the addresses they resolve to when a connection is created or
+	// changed (see reachesProtected). It guards against mistakes, not a
+	// determined admin, who can reach the server another way.
 	Protected []string
 }
 
@@ -40,7 +44,7 @@ type Options struct {
 type Manager struct {
 	store     Store
 	secrets   string
-	protected []string
+	protected []server
 	log       *slog.Logger
 	token     string
 
@@ -69,7 +73,7 @@ type attachment struct {
 // NewManager returns a manager for the connections in store.
 func NewManager(store Store, opts Options, log *slog.Logger) *Manager {
 	m := &Manager{
-		store: store, secrets: opts.SecretsDir, protected: opts.Protected, log: log, token: newToken(),
+		store: store, secrets: opts.SecretsDir, protected: parseServers(opts.Protected), log: log, token: newToken(),
 		attached: map[string]*attachment{}, failed: map[string]string{},
 	}
 	if opts.Connect != nil {
@@ -350,7 +354,7 @@ func (m *Manager) closeAll() {
 // database. taken are the names of the databases DuckDB has. Replicas
 // attach it when they next start.
 func (m *Manager) Create(ctx context.Context, c Connection, taken []string) error {
-	if err := m.validate(c, taken); err != nil {
+	if err := m.validate(ctx, c, taken); err != nil {
 		return err
 	}
 	if err := m.signIn(c); err != nil {
@@ -372,7 +376,7 @@ func (m *Manager) Alter(ctx context.Context, name string, set func(*Connection) 
 	if err := set(&c); err != nil {
 		return c, &InvalidError{err}
 	}
-	if err := m.validate(c, nil); err != nil {
+	if err := m.validate(ctx, c, nil); err != nil {
 		return c, err
 	}
 	c.Unusable = ""
@@ -387,12 +391,13 @@ func (m *Manager) Alter(ctx context.Context, name string, set func(*Connection) 
 
 // validate checks c's settings, and that it does not reach a protected
 // server.
-func (m *Manager) validate(c Connection, taken []string) error {
+func (m *Manager) validate(ctx context.Context, c Connection, taken []string) error {
 	if err := c.Validate(taken); err != nil {
 		return &InvalidError{err}
 	}
-	if slices.ContainsFunc(m.protected, func(a string) bool { return strings.EqualFold(a, c.Address()) }) {
-		return &InvalidError{fmt.Errorf("%s is the server of Igloo's metadata database, which a connection must not reach", c.Address())}
+	if p, ok := reachesProtected(ctx, m.protected, c.Host, c.Port); ok {
+		return &InvalidError{fmt.Errorf("%s is the server of Igloo's metadata database (%s), which a connection must not reach",
+			c.Address(), net.JoinHostPort(p.host, strconv.Itoa(p.port)))}
 	}
 	return nil
 }

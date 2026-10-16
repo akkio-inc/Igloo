@@ -19,6 +19,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
@@ -95,7 +96,13 @@ func remoteFromEnv(t *testing.T, env string) remoteDatabase {
 		database: strings.TrimPrefix(u.Path, "/")}
 }
 
+// options are CREATE CONNECTION's for the database, without TLS, which the
+// test databases do not have, and without the closing parenthesis.
 func (r remoteDatabase) options(t federation.Type) string {
+	return r.optionsWithTLS(t) + ", tls 'disable'"
+}
+
+func (r remoteDatabase) optionsWithTLS(t federation.Type) string {
 	return "TYPE " + string(t) + " WITH (host '" + r.host + "', port " + strconv.Itoa(r.port) + ", database '" + r.database +
 		"', user '" + r.user + "', password '" + r.password + "', connect_timeout '5s'"
 }
@@ -233,7 +240,39 @@ func TestConnectionStatements(t *testing.T) {
 	if _, err := admin.Exec(context.Background(), "CREATE CONNECTION crm "+pg.options(federation.Postgres)+", read_only false)"); pgCode(err) != "22023" {
 		t.Errorf("a writable connection: %v", err)
 	}
-	mustExec(t, admin, "CREATE CONNECTION crm "+pg.options(federation.Postgres)+", query_timeout = '30s')")
+	// By default a connection verifies its server, which the test database
+	// cannot be: it has no TLS.
+	if _, err := admin.Exec(context.Background(), "CREATE CONNECTION crm "+pg.optionsWithTLS(federation.Postgres)+")"); pgCode(err) != "08001" ||
+		!strings.Contains(err.Error(), "TLS") {
+		t.Errorf("a connection verifying a server without TLS: %v", err)
+	}
+	// Modes that do not verify the server are allowed, with a warning.
+	var notices []string
+	cfg, err := pgx.ParseConfig(fs.url("igloo", adminPassword))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		notices = append(notices, n.Severity+" "+n.Code+" "+n.Message)
+	}
+	warned, err := pgx.ConnectConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer warned.Close(context.Background()) //nolint:errcheck
+	mustExec(t, warned, "CREATE CONNECTION crm "+pg.options(federation.Postgres)+", query_timeout = '30s')")
+	if len(notices) != 1 || !strings.HasPrefix(notices[0], "WARNING 01000 connection crm does not use TLS") {
+		t.Errorf("CREATE CONNECTION without TLS: notices %q", notices)
+	}
+	notices = nil
+	if _, err := warned.Exec(context.Background(), "ALTER CONNECTION crm SET (tls 'prefer')"); err != nil {
+		t.Fatal(err)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "does not check the server's certificate") {
+		t.Errorf("ALTER CONNECTION to prefer: notices %q", notices)
+	}
+	mustExec(t, admin, "ALTER CONNECTION crm SET (tls 'disable')")
 	mustExec(t, admin, "CREATE CONNECTION IF NOT EXISTS crm "+pg.options(federation.Postgres)+")")
 	if _, err := admin.Exec(context.Background(), "CREATE CONNECTION crm "+pg.options(federation.Postgres)+")"); pgCode(err) != "42710" {
 		t.Errorf("a duplicate: %v", err)
@@ -329,6 +368,7 @@ func TestConnectionGrants(t *testing.T) {
 	schema := pgFixture(t, pg)
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
 	c.Schemas = []string{schema}
 	if err := store.Create(context.Background(), c); err != nil {
@@ -590,6 +630,7 @@ func TestConnectionNamesDifferingInCase(t *testing.T) {
 	})
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
 	if err := store.Create(ctx, c); err != nil {
 		t.Fatal(err)
@@ -650,6 +691,7 @@ func TestConnectionPolicies(t *testing.T) {
 	})
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
 	c.Schemas = []string{schema}
 	if err := store.Create(ctx, c); err != nil {
@@ -758,6 +800,7 @@ func TestConnectionWorkloadLimits(t *testing.T) {
 	}
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
 	c.Schemas = []string{schema}
 	if err := store.Create(ctx, c); err != nil {
@@ -834,6 +877,7 @@ func TestConnectionAttachedLater(t *testing.T) {
 	schema := pgFixture(t, pg)
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
 	c.Schemas = []string{schema}
 	if err := store.Create(context.Background(), c); err != nil {
@@ -939,6 +983,7 @@ func TestMySQLConnectionGrants(t *testing.T) {
 
 	store := federation.NewMemoryStore()
 	c := federation.New("ops", federation.MySQL)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = my.host, my.port, my.user, my.password, my.database
 	if err := store.Create(ctx, c); err != nil {
 		t.Fatal(err)

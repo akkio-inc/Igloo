@@ -931,14 +931,32 @@ docker exec "$project-ops" mysql -h127.0.0.1 -uops -p"$ops_password" ops -e "
   INSERT INTO campaigns VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300);" 2>/dev/null
 expect_error "a connection may not be named like a schema of the catalog" 22023 igloo "$admin_password" \
   "CREATE CONNECTION crm TYPE postgres WITH (host '$project-crm', database 'crm', user 'crm', password '$crm_password')"
-expect "admins register a PostgreSQL connection" "CREATE CONNECTION" igloo "$admin_password" \
+# The databases here have no TLS, or a self-signed certificate.
+expect_error "a connection verifies its server by default" 08001 igloo "$admin_password" \
   "CREATE CONNECTION crmdb TYPE postgres WITH (host '$project-crm', database 'crm', user 'crm', password '$crm_password')"
-expect "and a MySQL one" "CREATE CONNECTION" igloo "$admin_password" \
+expect_error "MySQL's too" 08001 igloo "$admin_password" \
   "CREATE CONNECTION ops TYPE mysql WITH (host '$project-ops', port 3306, database 'ops', user 'ops', password '$ops_password')"
+# warned NAME CONNECTION SQL: SQL must succeed with a warning that the
+# connection does not verify its server.
+warned() {
+  local got
+  got="$(psql_admin -c "$3")" || true
+  if grep -q "^WARNING:  01000: connection $2 does not" <<<"$got" && grep -q "^${3%% *} CONNECTION$" <<<"$got"; then
+    pass "$1"
+  else
+    fail "$1: $got"
+  fi
+}
+warned "admins register a PostgreSQL connection without TLS, warned" crmdb \
+  "CREATE CONNECTION crmdb TYPE postgres WITH (host '$project-crm', database 'crm', user 'crm', password '$crm_password', tls 'disable')"
+warned "and a MySQL one" ops \
+  "CREATE CONNECTION ops TYPE mysql WITH (host '$project-ops', port 3306, database 'ops', user 'ops', password '$ops_password', tls 'disable')"
 expect_error "only admins do" 42501 walt walt-password-1 \
   "CREATE CONNECTION evil TYPE postgres WITH (host 'postgres', database 'igloo', user 'igloo')"
 expect_error "and never to Igloo's own metadata database" 22023 igloo "$admin_password" \
   "CREATE CONNECTION meta TYPE postgres WITH (host 'postgres', port 5432, database 'igloo', user 'igloo')"
+expect_error "however its name is written" 22023 igloo "$admin_password" \
+  "CREATE CONNECTION meta TYPE postgres WITH (host 'POSTGRES.', port 5432, database 'igloo', user 'igloo', tls 'disable')"
 # connections prints each connection's name, state and password column.
 connections() { psql_admin -c "SHOW CONNECTIONS" | cut -d'|' -f1,12,7 | awk -F'|' '{print $1 "|" $3 "|" $2}' | sort; }
 got="$(connections)"
@@ -1042,8 +1060,7 @@ expect "connection passwords are never recorded" "0" igloo "$admin_password" \
 if compose logs igloo 2>&1 | grep -q -e "$crm_password" -e "$ops_password"; then fail "a connection password is in the logs"; else pass "nor logged"; fi
 # Rotating the password: on the remote database, then in Igloo, no restart.
 crm_sql -c "ALTER ROLE crm PASSWORD 'crm-password-2'" >/dev/null
-expect "credentials rotate without a restart" "ALTER CONNECTION" igloo "$admin_password" \
-  "ALTER CONNECTION crmdb SET (password 'crm-password-2')"
+warned "credentials rotate without a restart" crmdb "ALTER CONNECTION crmdb SET (password 'crm-password-2')"
 crm_sql -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'crm' AND pid <> pg_backend_pid()" >/dev/null
 expect "and the connection keeps working" "1000" igloo "$admin_password" "SELECT count(*) FROM crmdb.sales.customers"
 # One database going down breaks nothing else.

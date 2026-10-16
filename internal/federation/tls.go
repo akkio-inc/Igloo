@@ -17,12 +17,13 @@ func certPool(pem string) (*x509.CertPool, error) {
 }
 
 // tlsConfig returns the TLS settings for reaching c's server, or nil for
-// TLSDisable. The modes mean what libpq's sslmode values mean: prefer and
-// require encrypt without checking the certificate (unless tls_ca is set,
-// which makes require check the chain, as libpq does with a root
-// certificate), verify-ca checks it was signed by a trusted authority, and
-// verify-full also that it was issued for the host. Whether prefer falls
-// back to an unencrypted connection is up to the caller.
+// TLSDisable. verify-full, the default, checks that the server's
+// certificate was signed by an authority of tls_ca, or of the system's when
+// it is empty, and issued for the host. require and verify-ca check only
+// the signature: unlike libpq, require never takes any certificate, as if
+// the system's roots were always its root certificates. prefer, an
+// explicit choice, encrypts without checking anything, and whether it
+// falls back to an unencrypted connection is up to the caller.
 func tlsConfig(c *Connection) (*tls.Config, error) {
 	if c.TLS == TLSDisable {
 		return nil, nil
@@ -38,9 +39,10 @@ func tlsConfig(c *Connection) (*tls.Config, error) {
 	switch {
 	case c.TLS == TLSVerifyFull:
 		cfg.RootCAs = roots
-	case c.TLS == TLSVerifyCA || roots != nil && c.TLS == TLSRequire:
-		// Check the chain but not the name. crypto/tls does both or
-		// neither, so the chain is checked here.
+	case c.TLS == TLSVerifyCA || c.TLS == TLSRequire:
+		// Check the chain, against the system's roots when roots is nil,
+		// but not the name. crypto/tls does both or neither, so the chain
+		// is checked here.
 		cfg.InsecureSkipVerify = true //nolint:gosec // verified below
 		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
@@ -56,8 +58,8 @@ func tlsConfig(c *Connection) (*tls.Config, error) {
 			return nil
 		}
 	default:
-		// prefer and require: encrypted, but anyone may be at the other
-		// end, as with libpq.
+		// prefer: encrypted, but anyone may be at the other end, as with
+		// libpq. Choosing it draws a warning (Connection.TLSWarning).
 		cfg.InsecureSkipVerify = true //nolint:gosec // the mode asks for no verification
 	}
 	return cfg, nil

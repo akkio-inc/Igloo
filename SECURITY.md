@@ -163,10 +163,13 @@ reference for every setting mentioned here.
   with the whole metadata database; `password_secret` keeps them in files
   of `IGLOO_CONNECTION_SECRETS_DIR` instead. Passwords never appear in
   `SHOW CONNECTIONS`, the history or the logs. The proxy refuses a MySQL
-  server's request for a local file. A connection to the server of the
-  metadata database is refused, as a guard against mistakes; do not
-  connect the catalog's database or other internal services either. Give
-  each connection a database user that can read only what Igloo should.
+  server's request for a local file. Connections use TLS and verify their
+  server's certificate and host name unless an admin chooses otherwise,
+  which draws a warning. A connection to the server of the metadata
+  database, by any spelling of its name or by the address it resolves to,
+  is refused, as a guard against mistakes; do not connect the catalog's
+  database or other internal services either. Give each connection a
+  database user that can read only what Igloo should.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history

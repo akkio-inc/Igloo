@@ -155,6 +155,14 @@ func (w *tagWriter) Complete(tag string) error {
 	return w.DataWriter.Complete(tag)
 }
 
+// Notice passes a warning on to the client, if its writer sends them.
+func (w *tagWriter) Notice(code, message string) error {
+	if n, ok := w.DataWriter.(wire.Noticer); ok {
+		return n.Notice(code, message)
+	}
+	return nil
+}
+
 // rows is the row count in the tag, such as 5 in "INSERT 0 5", or the rows
 // sent before a client stopped reading, or -1.
 func (w *tagWriter) rows() int64 {

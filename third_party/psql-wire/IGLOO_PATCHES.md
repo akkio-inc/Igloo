@@ -18,6 +18,10 @@ otherwise unchanged except for these patches:
 - `igloo_tls.go` (new) and `wire.go`, `serve`: `IsTLS` reports whether a
   connection negotiated TLS, so authentication can ask for a clear-text
   password (an identity provider's access token) only inside TLS.
+- `igloo_notice.go` (new): the `Noticer` interface, which a statement's
+  `DataWriter` implements, sends the client a warning as a NoticeResponse,
+  as PostgreSQL does, for statements that succeed but leave something open
+  (a connection to another database that does not verify its server).
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

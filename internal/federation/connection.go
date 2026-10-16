@@ -68,7 +68,8 @@ func (t Type) defaultPort() int {
 
 // TLSMode says whether and how to encrypt the connection to the remote
 // database, with libpq's names: disable, prefer, require, verify-ca and
-// verify-full.
+// verify-full (the default). Only verify-full makes sure the server is the
+// one named by host; see tlsConfig and Warning.
 type TLSMode string
 
 const (
@@ -78,6 +79,24 @@ const (
 	TLSVerifyCA   TLSMode = "verify-ca"
 	TLSVerifyFull TLSMode = "verify-full"
 )
+
+// TLSWarning says what c's TLS mode leaves open, for a connection that
+// does not make sure its server is the one named by host, or is "" for
+// verify-full.
+func (c Connection) TLSWarning() string {
+	const use = "; use tls 'verify-full', with tls_ca if the server's certificate is not signed by an authority the system trusts"
+	switch c.TLS {
+	case TLSDisable:
+		return fmt.Sprintf("connection %s does not use TLS: its password and data cross the network unencrypted%s", c.Name, use)
+	case TLSPrefer:
+		return fmt.Sprintf("connection %s does not check the server's certificate, and goes on without TLS if the server offers none: "+
+			"anyone on the network path could pose as the server and read its password and data%s", c.Name, use)
+	case TLSRequire, TLSVerifyCA:
+		return fmt.Sprintf("connection %s checks that the server's certificate is signed by a trusted authority, but not that it was issued "+
+			"for %s: a server with another certificate from that authority could pose as it%s", c.Name, c.Host, use)
+	}
+	return ""
+}
 
 // parseTLSMode accepts libpq's sslmode names and MySQL's ssl_mode ones.
 func parseTLSMode(s string) (TLSMode, error) {
@@ -148,7 +167,7 @@ type Connection struct {
 // New returns a connection called name of type t with the defaults set.
 func New(name string, t Type) Connection {
 	return Connection{
-		Name: name, Type: t, Port: t.defaultPort(), TLS: TLSPrefer,
+		Name: name, Type: t, Port: t.defaultPort(), TLS: TLSVerifyFull,
 		ConnectTimeout: defaultConnectTimeout, QueryTimeout: defaultQueryTimeout,
 	}
 }

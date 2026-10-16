@@ -285,15 +285,22 @@ func (s *Server) runConnectionCommand(ctx context.Context, sess *session, c *con
 		return pgerror.WithCode(errors.New("connections need IGLOO_METADATA_DATABASE_URL"), codes.FeatureNotSupported)
 	}
 	var err error
+	// changed is the connection as CREATE or ALTER left it.
+	var changed *federation.Connection
 	switch {
 	case c.verb == "SHOW":
 		return s.showConnections(ctx, w)
 	case c.verb == "CREATE":
-		err = s.createConnection(ctx, sess, me, c)
+		var conn federation.Connection
+		var created bool
+		if conn, created, err = s.createConnection(ctx, sess, me, c); created {
+			changed = &conn
+		}
 	case c.refresh:
 		err = s.fed.Refresh(ctx, c.name)
 	case c.verb == "ALTER":
-		_, err = s.fed.Alter(ctx, c.name, func(conn *federation.Connection) error {
+		var conn federation.Connection
+		conn, err = s.fed.Alter(ctx, c.name, func(conn *federation.Connection) error {
 			for _, o := range c.options {
 				if err := conn.Set(o[0], o[1]); err != nil {
 					return err
@@ -301,6 +308,7 @@ func (s *Server) runConnectionCommand(ctx context.Context, sess *session, c *con
 			}
 			return nil
 		})
+		changed = &conn
 	case c.verb == "DROP":
 		err = s.fed.Drop(ctx, c.name)
 		if err == nil {
@@ -320,20 +328,33 @@ func (s *Server) runConnectionCommand(ctx context.Context, sess *session, c *con
 	}
 	s.ddlGen.Add(1)
 	s.log.Info("connection changed", "action", strings.ToLower(c.verb), "connection", c.name, "by", me.Name)
+	if changed != nil {
+		if warning := changed.TLSWarning(); warning != "" {
+			// Allowed, as an explicit choice, but said every time.
+			s.log.Warn("connection does not verify its server", "connection", changed.Name, "tls", changed.TLS)
+			if n, ok := w.(wire.Noticer); ok {
+				if err := n.Notice(string(codes.Warning), warning); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return w.Complete(c.tag())
 }
 
-func (s *Server) createConnection(ctx context.Context, sess *session, me auth.User, c *connCommand) error {
+// createConnection carries out CREATE CONNECTION, reporting whether it
+// created one: IF NOT EXISTS may leave one there.
+func (s *Server) createConnection(ctx context.Context, sess *session, me auth.User, c *connCommand) (federation.Connection, bool, error) {
 	conn := federation.New(c.name, c.typ)
 	for _, o := range c.options {
 		if err := conn.Set(o[0], o[1]); err != nil {
-			return &federation.InvalidError{Err: err}
+			return conn, false, &federation.InvalidError{Err: err}
 		}
 	}
 	conn.CreatedBy = me.Name
 	taken, err := queryStrings(ctx, sess, "SELECT database_name FROM system.main.duckdb_databases()")
 	if err != nil {
-		return err
+		return conn, false, err
 	}
 	if cat := s.catalogName(); cat != "" {
 		taken = append(taken, cat)
@@ -343,18 +364,18 @@ func (s *Server) createConnection(ctx context.Context, sess *session, me auth.Us
 		schemas, err := queryStrings(ctx, sess, `SELECT schema_name FROM system.main.duckdb_schemas()
 			WHERE system.main.lower(database_name) = system.main.lower($1)`, cat)
 		if err != nil {
-			return err
+			return conn, false, err
 		}
 		if slices.ContainsFunc(schemas, func(n string) bool { return strings.EqualFold(n, conn.Name) }) {
-			return &federation.InvalidError{Err: fmt.Errorf("the %s catalog has a schema named %s, and a connection named so too "+
+			return conn, false, &federation.InvalidError{Err: fmt.Errorf("the %s catalog has a schema named %s, and a connection named so too "+
 				"would make names such as %s.contacts ambiguous; choose another name", cat, conn.Name, conn.Name)}
 		}
 	}
 	err = s.fed.Create(ctx, conn, taken)
 	if errors.Is(err, federation.ErrExists) && c.ifNotExists {
-		return nil
+		return conn, false, nil
 	}
-	return err
+	return conn, err == nil, err
 }
 
 func (s *Server) showConnections(ctx context.Context, w wire.DataWriter) error {

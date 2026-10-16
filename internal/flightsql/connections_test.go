@@ -65,6 +65,7 @@ func TestConnectionsNeedGrants(t *testing.T) {
 	pw, _ := u.User.Password()
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = u.Hostname(), port, u.User.Username(), pw, strings.TrimPrefix(u.Path, "/")
 	c.Schemas = []string{schema}
 	if err := store.Create(ctx, c); err != nil {
