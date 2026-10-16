@@ -308,7 +308,8 @@ DROP CONNECTION crm;
 ```
 
 A connection's tables need a `SELECT` grant on them, their schema or the
-connection for everyone but admins, readers and writers included. The
+connection for everyone but admins, readers and writers included, and
+masking and row access policies apply to them as to Iceberg tables. The
 functions that run SQL on the remote database (`postgres_query`,
 `mysql_query` and the like) are refused for everyone.
 

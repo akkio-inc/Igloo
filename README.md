@@ -141,7 +141,7 @@ the official TPC-H answers.
 - **[Connections to other databases](docs/federation.md)**: query
   PostgreSQL and MySQL databases in place, read-only, and join them with
   Iceberg tables, with filters pushed down to them and their tables
-  governed by the same grants.
+  governed by the same grants and policies.
 
   ```sql
   CREATE CONNECTION crm TYPE postgres WITH (host 'crm.example.com', database 'crm', user 'igloo_ro', password '...');

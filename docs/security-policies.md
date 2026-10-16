@@ -145,6 +145,22 @@ its type, reads as NULL. A column with two tags that both mask its type is
 refused until one is unset. A tag in use cannot be dropped, nor a policy
 that is attached anywhere.
 
+## Tables of connections
+
+Policies and tags apply to the tables of
+[connections to other databases](federation.md) as to the catalog's, named
+in full:
+
+```sql
+ALTER TABLE crm.public.customers ALTER COLUMN email SET MASKING POLICY mask_email;
+```
+
+The remote database can rename a column without Igloo, so a connection's
+table with a masked column it no longer has is refused until the policy
+follows the column; and a policy protects only the table it is set on, not
+other tables or views of that database that hold the same data. See
+[connections](federation.md#masking-and-row-access-policies).
+
 ## Listing them
 
 ```sql

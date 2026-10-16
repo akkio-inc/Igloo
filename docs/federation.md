@@ -64,7 +64,11 @@ SHOW CONNECTIONS;
 ```
 
 Options may be written `option value` or `option = value`; values are
-strings, numbers or words.
+strings, numbers or words. A connection's name is a catalog name in SQL, so
+it may not be one DuckDB has already, nor that of a schema of the Iceberg
+catalog: `crm.contacts` would then mean two things, which DuckDB refuses.
+For the same reason, do not create a schema of the catalog named like a
+connection.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -170,13 +174,19 @@ SHOW GRANTS ON CONNECTION crm;
   tables also needs whatever those need: nothing more for readers, grants
   for users with role `none`.
 - Views read with the querying user's grants, also views of the Iceberg
-  catalog that read a connection.
+  catalog that read a connection. Creating a view that reads a
+  connection's table, in the catalog or temporary, needs a grant on that
+  table as well, so nobody leaves views of what they may not read.
 - Grants follow names, as for Iceberg tables. Dropping a connection removes
   its grants; a connection created again under the same name starts with
   none.
-- Names compare without regard to case, as DuckDB resolves them: a grant
-  on `crm.public.customers` also covers a PostgreSQL table named
-  `"Customers"` in the same schema, should there be both.
+- Names of a connection's schemas and tables compare without regard to
+  case, in grants as in SQL, where DuckDB resolves them so. PostgreSQL, and
+  MySQL on Linux, can have two tables or two schemas whose names differ
+  only in case, such as `customers` and `"Customers"`, which grants could
+  not tell apart: Igloo refuses to read either for everyone but admins, and
+  refuses grants that name either. Rename one on the database, or connect
+  with a database user that sees only one.
 - Table and column names and types of a connection's tables are visible to
   every user, through the system catalogs, as Iceberg tables' are.
 
@@ -188,8 +198,40 @@ search path and with views expanded, says which connection, schema and
 table each name means. The two must agree scan for scan, and every table a
 name could mean must be granted; otherwise the statement is refused with
 SQLSTATE `42501`. A scan the check cannot account for, such as one through
-a macro an admin defined, is refused. Prepared statements are checked
-again when grants, views, connections or the session's search path change.
+a macro an admin defined, is refused. Every prepared statement of a user
+who is not an admin, whatever their role, is checked again before it runs
+when grants, views, connections or the session's search path changed since
+it was checked, including statements prepared before a connection was
+attached. The same holds over Arrow Flight SQL and in the web console,
+which go through the same checks, and for service accounts, which are
+users like any other.
+
+## Masking and row access policies
+
+[Masking policies, row access policies and tags](security-policies.md)
+apply to a connection's tables as to Iceberg tables, in every statement of
+every user, admins included. Name the table in full:
+
+```sql
+ALTER TABLE crm.public.customers ALTER COLUMN email SET MASKING POLICY mask_email;
+ALTER TABLE crm.public.customers ADD ROW ACCESS POLICY client_rows ON (client_id);
+ALTER TABLE crm.public.customers ALTER COLUMN phone SET TAG pii = 'phone';
+```
+
+- Policies are set on tables of connections attached on the replica that
+  runs the statement, whose columns Igloo knows, and can be unset at any
+  time. Policy expressions still read only Iceberg tables.
+- The database can rename or drop a column without Igloo. A connection's
+  table with a masked column it no longer has is refused, to everyone,
+  until its policy is unset or set on the column's new name; after a change
+  on the database, `ALTER CONNECTION name REFRESH` shows Igloo the new
+  columns.
+- A policy protects the table it is set on. Other tables and views of the
+  remote database that hold the same data are not protected: set policies
+  on them too, or connect with a database user that cannot read them.
+- Policies stay when a connection is dropped, as they do when a table is,
+  so a connection created again under the name is protected from the start.
+- `igloo.policy_references` names the connection in `ref_database_name`.
 
 ## What no one can do
 
@@ -270,8 +312,11 @@ reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
 - New connections, and changes to a connection's database or schemas, need
   a restart of each replica (see [when changes take effect](#when-changes-take-effect)).
 - Read-only: no writes to connections, not even by admins.
-- Grants stop at tables, as for Iceberg tables: no column or row
-  restrictions on a connection's tables yet. Restrict what the connection's
-  database user can see on the database itself.
+- Grants stop at tables, as for Iceberg tables; masking and row access
+  policies restrict columns and rows (see above). Restrict what the
+  connection's database user can see on the database itself as well.
+- Tables and schemas whose names differ only in case from another's in the
+  same connection cannot be read by users who are not admins (see
+  [grants](#grants)).
 - Without a metadata database (`IGLOO_METADATA_DATABASE_URL`) there are no
   connections.

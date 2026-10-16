@@ -173,10 +173,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the warehouse and allowed locations.
 - Grants on connections to other databases (`GRANT SELECT ON CONNECTION`,
   `ON SCHEMA conn.schema`, `ON TABLE conn.schema.table`), required for
-  every role but admin. Every statement's reads of connections are checked
-  against DuckDB's plan and recorded in the query history. Remote sessions
-  are read-only, and the functions that run SQL on remote databases
-  (`postgres_query`, `mysql_query` and the like) are refused for everyone.
+  every role but admin, over SQL clients, Arrow Flight SQL and the web
+  console alike. Every statement's reads of connections are checked
+  against DuckDB's plan, again whenever connections, views or grants
+  change, and recorded in the query history. Creating a view of a
+  connection's table needs a grant on it. Tables whose names differ only
+  in case from another's in the same connection are refused. Remote
+  sessions are read-only, and the functions that run SQL on remote
+  databases (`postgres_query`, `mysql_query` and the like) are refused for
+  everyone.
+- Masking and row access policies, and tags, on connections' tables, as on
+  Iceberg tables (`ALTER TABLE crm.public.customers ALTER COLUMN email SET
+  MASKING POLICY ...`).
 - TLS for SQL clients, the web console and Arrow Flight SQL.
 
 ### Data sharing

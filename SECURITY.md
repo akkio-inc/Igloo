@@ -135,7 +135,18 @@ reference for every setting mentioned here.
   statement of a user who is not an admin is checked the way reads are for
   role `none`: DuckDB's plan must scan exactly the connection tables
   DuckDB's parse of the statement names, by type and table, with views
-  expanded, and each must be granted, or the statement is refused.
+  expanded, and each must be granted, or the statement is refused. Every
+  statement of a user who is not an admin carries a record of that check
+  tied to the connections and the catalog, so a prepared statement is
+  checked again when either changes. Creating a view that reads a
+  connection's table needs a grant on it too. Igloo names a connection's
+  schemas and tables without case, so tables or schemas whose names differ
+  only in case are refused to everyone but admins. Masking and row access
+  policies apply to connections' tables too; the check of a statement
+  rewritten for them compares the plan's scans of connections' tables with
+  the statement's, and a table whose masked column the remote database
+  renamed is refused until the policy follows it. A policy does not protect
+  other tables or views of the remote database holding the same data.
   Connections are attached read-only, and every remote session is
   read-only too. The extensions' functions that run SQL on a remote
   database or connect to any server (`postgres_query`, `postgres_execute`,
