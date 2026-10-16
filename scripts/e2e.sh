@@ -761,7 +761,9 @@ expect_error "or splits it across directories" 42501 igloo "$admin_password" \
 expect_error "or wraps other filesystems" 42501 igloo "$admin_password" \
   "SELECT cache_httpfs_wrap_cache_filesystem('LocalFileSystem')"
 expect_error "or caches more than the warehouse" 42501 igloo "$admin_password" "SELECT cache_httpfs_reset_exclusion_regex()"
-expect "the read cache still caches only the warehouse" "1" igloo "$admin_password" \
+# Two exclusions: everything outside the warehouse, and the rows workers
+# exchange under it.
+expect "the read cache still caches only the warehouse" "2" igloo "$admin_password" \
   "SELECT count(*) FROM cache_httpfs_list_exclusion_regex()"
 
 echo "query history"
