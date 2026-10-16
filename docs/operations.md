@@ -93,6 +93,8 @@ privilege and what a grant covers. In short:
   to see what it reads. That costs a few milliseconds per statement; other
   roles are not affected. A statement whose reads it cannot account for is
   refused with SQLSTATE `42501`.
+- The same grants apply to [other engines](external-engines.md#users-for-engines)
+  using the Iceberg REST catalog, and take effect there on the next request.
 
 ### Policies and tags
 
@@ -127,6 +129,10 @@ SELECT * FROM igloo.login_history WHERE result = 'failure';
 
 [SQL and clients](sql.md#query-history) lists the columns. Admins see every
 record; other users see only their own, whichever way they read them.
+Requests from [other engines](external-engines.md#history) through the
+Iceberg REST catalog are recorded the same way, with application name
+`iceberg-rest` and the catalog operation, such as `loadTable`, as the
+statement type.
 Passwords never reach the history: string literals of user-management
 statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
 

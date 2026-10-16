@@ -66,6 +66,11 @@ storage:
     # AWS credential chain (IRSA, EKS Pod Identity); then set
     # catalog.systemCredentials=aws.
     existingSecret: ""
+    # IAM role Igloo assumes to hand other engines short-lived credentials
+    # limited to one table (docs/external-engines.md) -> IGLOO_S3_STS_ROLE_ARN.
+    # Empty on AWS: engines get table metadata but no storage credentials.
+    # S3-compatible stores need none.
+    stsRoleArn: ""
   gcs:
     # Secret with keys "hmac-key-id" and "hmac-secret" -> IGLOO_GCS_HMAC_*.
     # Required for gs:// locations; also set catalog.systemCredentials=gcp.
@@ -217,6 +222,14 @@ console:
   enabled: true
   port: 8443
 
+# Iceberg REST catalog (docs/external-engines.md) on the SQL Service: Spark,
+# Trino, PyIceberg, Snowflake and Databricks sign in with Igloo users and use
+# Igloo's tables under its grants. Without TLS (tls.existingSecret) it serves
+# clients on private networks only. With the bundled object store, let the
+# engines reach it with networkPolicy.objectStorageFrom.
+iceberg:
+  enabled: true
+  port: 8181
 # Arrow Flight SQL (docs/flight-sql.md) on the SQL Service: query results as
 # Arrow record batches for ADBC, pyarrow and the Flight SQL JDBC driver.
 # Clients sign in with their Igloo password, so it serves them only over TLS
@@ -323,14 +336,20 @@ metrics:
 # Ingress rules only; egress is not restricted (pods need DNS, PostgreSQL,
 # object storage and cloud identity endpoints). Lakekeeper accepts connections
 # only from igloo pods, the bundled PostgreSQL and object store only from igloo
-# and Lakekeeper pods.
+# and Lakekeeper pods (and the store from objectStorageFrom).
 networkPolicy:
   enabled: true
-  # NetworkPolicy peers allowed to reach the SQL port. Empty: everyone (the
-  # Service type and loadBalancerSourceRanges decide who that is).
+  # NetworkPolicy peers allowed to reach the SQL, console and Iceberg REST
+  # ports. Empty: everyone (the Service type and loadBalancerSourceRanges
+  # decide who that is).
   sqlFrom: []
   # Peers allowed to reach the metrics/health port 8080. Empty: everyone.
   metricsFrom: []
+  # Peers besides igloo and Lakekeeper allowed to reach the bundled object
+  # store: engines in the cluster, such as Spark or Trino pods, that read and
+  # write table files with the credentials for one table that the Iceberg
+  # REST catalog hands them. Empty: none.
+  objectStorageFrom: []
 
 # Bundled Lakekeeper (Iceberg REST catalog). Always deployed by this chart. It
 # runs without authentication, so it is only reachable inside the cluster.

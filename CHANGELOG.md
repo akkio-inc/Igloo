@@ -164,6 +164,27 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   every token (admins), and single sign-on: settings, whether the provider
   answers, group mappings and who signed in with which groups.
 
+### Other engines
+
+- An Iceberg REST catalog on port 8181 (`IGLOO_ICEBERG_ADDR`) through which
+  Spark, Trino, PyIceberg, Databricks and Snowflake read and write Igloo's
+  tables. Engines sign in as Igloo users with the OAuth2 client-credentials
+  flow and get Igloo's own tokens; every request is checked against the
+  user's role and grants and recorded in the query history, and token
+  requests in the login history. Lakekeeper stays private. Tested with
+  Spark 3.5 and Iceberg 1.11 (reads, `INSERT`, `MERGE INTO`,
+  `CREATE TABLE AS`), Trino 483 (reads, `INSERT`, `UPDATE`, `DELETE`) and
+  PyIceberg 0.12 (`scripts/engines-e2e.sh`, `scripts/e2e.sh`).
+- Storage credentials for engines that last an hour and reach one table's
+  files only, read-only unless the user has `INSERT`, `UPDATE` and `DELETE`
+  on the table: STS with a session policy, on AWS through
+  `IGLOO_S3_STS_ROLE_ARN` (created by the AWS module), on S3-compatible stores
+  through their own STS after checking that they enforce the policy. None on
+  Google Cloud Storage and Azure yet.
+- The Compose stack publishes the endpoint on loopback, the Helm chart on the
+  SQL Service (`iceberg.enabled`, with NetworkPolicy), and the scale-to-zero
+  gateway forwards it (`IGLOO_GATEWAY_ICEBERG_BACKEND`).
+
 ### Performance and cost
 
 - Scale to zero: `igloo gateway` accepts client connections in Igloo's

@@ -1,0 +1,516 @@
+package icebergrest
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/akkio-inc/igloo/internal/auth"
+)
+
+// schemaOf names a namespace as grants do. Nested namespaces, which SQL
+// does not show and so grants cannot name, get their levels joined by dots.
+func schemaOf(ns []string) string { return strings.Join(ns, ".") }
+
+// validName reports whether s may name a namespace level or a table. "."
+// and ".." would be path segments that move up Lakekeeper's API.
+func validName(s string) bool { return s != "" && s != "." && s != ".." }
+
+// pathNamespace is the namespace in a request's path: levels separated by
+// the unit separator (%1F).
+func pathNamespace(r *http.Request) ([]string, error) {
+	ns := strings.Split(r.PathValue("namespace"), "\x1f")
+	if !allValid(ns) {
+		return nil, errorf(http.StatusBadRequest, errBadRequest, "malformed namespace %q", r.PathValue("namespace"))
+	}
+	return ns, nil
+}
+
+func allValid(names []string) bool {
+	return len(names) > 0 && !slices.ContainsFunc(names, func(n string) bool { return !validName(n) })
+}
+
+// pathTable is the namespace and table in a request's path.
+func pathTable(r *http.Request) ([]string, auth.Object, error) {
+	ns, err := pathNamespace(r)
+	if err != nil {
+		return nil, auth.Object{}, err
+	}
+	name := r.PathValue("table")
+	if !validName(name) {
+		return nil, auth.Object{}, errorf(http.StatusBadRequest, errBadRequest, "malformed table name %q", name)
+	}
+	return ns, auth.Object{Schema: schemaOf(ns), Table: name}, nil
+}
+
+// identifier is a TableIdentifier.
+type identifier struct {
+	Namespace []string `json:"namespace"`
+	Name      string   `json:"name"`
+}
+
+func (id identifier) object() auth.Object {
+	return auth.Object{Schema: schemaOf(id.Namespace), Table: id.Name}
+}
+
+func (id identifier) valid() bool { return validName(id.Name) && allValid(id.Namespace) }
+
+// vendRequested reports whether the client asked for storage credentials.
+func vendRequested(r *http.Request) bool {
+	for _, v := range strings.Split(r.Header.Get(accessDelegation), ",") {
+		if strings.TrimSpace(v) == vendedCredentials {
+			return true
+		}
+	}
+	return false
+}
+
+// config serves GET /v1/config. Igloo serves one warehouse, with no path
+// prefix.
+func (s *Server) config(c *call) error {
+	if w := c.r.URL.Query().Get("warehouse"); w != "" && w != s.opts.Warehouse {
+		return errorf(http.StatusNotFound, errNoSuchWarehouse, "this catalog serves one warehouse, %q", s.opts.Warehouse)
+	}
+	writeJSON(c.w, http.StatusOK, map[string]any{
+		"defaults":  map[string]string{},
+		"overrides": map[string]string{},
+		"endpoints": endpoints,
+	})
+	return nil
+}
+
+func (s *Server) listNamespaces(c *call) error {
+	r, err := s.cat.call(c.ctx(), http.MethodGet, "namespaces", pick(c.r.URL.Query(), "parent", "pageToken", "pageSize"), nil)
+	if err != nil {
+		return err
+	}
+	var list struct {
+		Namespaces [][]string      `json:"namespaces"`
+		Next       json.RawMessage `json:"next-page-token,omitempty"`
+	}
+	if err := json.Unmarshal(r.body, &list); err != nil {
+		return err
+	}
+	list.Namespaces = slices.DeleteFunc(list.Namespaces, func(ns []string) bool { return !c.who.seesSchema(schemaOf(ns)) })
+	if list.Namespaces == nil {
+		list.Namespaces = [][]string{}
+	}
+	writeJSON(c.w, http.StatusOK, list)
+	return nil
+}
+
+func (s *Server) createNamespace(c *call) error {
+	var req struct {
+		Namespace  []string          `json:"namespace"`
+		Properties map[string]string `json:"properties"`
+	}
+	body, err := readJSON(c, &req)
+	if err != nil {
+		return err
+	}
+	if !allValid(req.Namespace) {
+		return errorf(http.StatusBadRequest, errBadRequest, "missing or malformed namespace")
+	}
+	if err := c.who.requireWriter("creating schemas"); err != nil {
+		return err
+	}
+	// Igloo's SQL shows top-level namespaces only, so grants could not
+	// name a nested one, nor SQL clients see its tables.
+	if len(req.Namespace) > 1 && !c.who.admin() {
+		return c.who.deny("only admins may create nested namespaces, which Igloo's SQL does not show")
+	}
+	if err := c.who.checkLocation(keys(req.Properties)); err != nil {
+		return err
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodPost, "namespaces", nil, body)
+	if err != nil {
+		return err
+	}
+	writeBody(c.w, r.status, r.body)
+	return nil
+}
+
+func (s *Server) loadNamespace(c *call) error {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return err
+	}
+	if err := c.who.requireSeesSchema(schemaOf(ns)); err != nil {
+		return s.unlessMissing(c, ns, "", err)
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodGet, namespacePathOf(ns), nil, nil)
+	if err != nil {
+		return err
+	}
+	writeBody(c.w, r.status, r.body)
+	return nil
+}
+
+func (s *Server) namespaceExists(c *call) error {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return err
+	}
+	if err := c.who.requireSeesSchema(schemaOf(ns)); err != nil {
+		return s.unlessMissing(c, ns, "", err)
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodHead, namespacePathOf(ns), nil, nil)
+	if err != nil {
+		return err
+	}
+	c.w.WriteHeader(r.status)
+	return nil
+}
+
+func (s *Server) dropNamespace(c *call) error {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return err
+	}
+	if err := c.who.requireWriter("dropping schemas"); err != nil {
+		return err
+	}
+	if _, err := s.cat.call(c.ctx(), http.MethodDelete, namespacePathOf(ns), nil, nil); err != nil {
+		return err
+	}
+	// Grants go with what they name, as with DROP SCHEMA.
+	s.forget(c, auth.Object{Schema: schemaOf(ns)})
+	c.w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (s *Server) updateNamespace(c *call) error {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return err
+	}
+	var req struct {
+		Removals []string          `json:"removals"`
+		Updates  map[string]string `json:"updates"`
+	}
+	body, err := readJSON(c, &req)
+	if err != nil {
+		return err
+	}
+	if err := c.who.requireWriter("changing schema properties"); err != nil {
+		return err
+	}
+	if err := c.who.checkLocation(append(keys(req.Updates), req.Removals...)); err != nil {
+		return err
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodPost, namespacePathOf(ns)+"/properties", nil, body)
+	if err != nil {
+		return err
+	}
+	writeBody(c.w, r.status, r.body)
+	return nil
+}
+
+// checkLocation refuses non-admins a schema's location. Lakekeeper places
+// tables under their schema's location, so choosing it would choose where
+// tables' files go, possibly among old files of dropped ones.
+func (c *caller) checkLocation(props []string) error {
+	if c.admin() || !slices.Contains(props, "location") {
+		return nil
+	}
+	return c.deny("only admins may choose a schema's location")
+}
+
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (s *Server) listTables(c *call) error {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return err
+	}
+	if err := c.who.requireSeesSchema(schemaOf(ns)); err != nil {
+		return s.unlessMissing(c, ns, "", err)
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodGet, namespacePathOf(ns)+"/tables", pick(c.r.URL.Query(), "pageToken", "pageSize"), nil)
+	if err != nil {
+		return err
+	}
+	var list struct {
+		Identifiers []identifier    `json:"identifiers"`
+		Next        json.RawMessage `json:"next-page-token,omitempty"`
+	}
+	if err := json.Unmarshal(r.body, &list); err != nil {
+		return err
+	}
+	list.Identifiers = slices.DeleteFunc(list.Identifiers, func(id identifier) bool { return !c.who.sees(id.object()) })
+	if list.Identifiers == nil {
+		list.Identifiers = []identifier{}
+	}
+	writeJSON(c.w, http.StatusOK, list)
+	return nil
+}
+
+func (s *Server) createTable(c *call) error {
+	ns, err := pathNamespace(c.r)
+	if err != nil {
+		return err
+	}
+	var req struct {
+		Name       string            `json:"name"`
+		Location   string            `json:"location"`
+		Properties map[string]string `json:"properties"`
+	}
+	body, err := readJSON(c, &req)
+	if err != nil {
+		return err
+	}
+	if !validName(req.Name) {
+		return errorf(http.StatusBadRequest, errBadRequest, "missing or malformed table name")
+	}
+	o := auth.Object{Schema: schemaOf(ns), Table: req.Name}
+	c.written = []auth.Object{o}
+	if err := c.who.require(auth.PrivilegeCreate, auth.Object{Schema: o.Schema}); err != nil {
+		return err
+	}
+	// Lakekeeper gives each table a new location under its schema's. A
+	// chosen one could hold old files of a dropped table, which the
+	// table's credentials would then reach.
+	if req.Location != "" && !c.who.admin() {
+		return c.who.deny("only admins may choose a table's location; leave it out")
+	}
+	if err := checkProperties(keys(req.Properties)); err != nil {
+		return err
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodPost, namespacePathOf(ns)+"/tables", nil, body)
+	if err != nil {
+		return err
+	}
+	// The new table is empty, and its creator fills it, as with CREATE
+	// TABLE AS.
+	return s.writeTable(c, ns, o, r, true)
+}
+
+func (s *Server) loadTable(c *call) error {
+	ns, o, err := pathTable(c.r)
+	if err != nil {
+		return err
+	}
+	c.read = []auth.Object{o}
+	if err := c.who.require(auth.PrivilegeSelect, o); err != nil {
+		return s.unlessMissing(c, ns, o.Table, err)
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodGet, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "snapshots"), nil)
+	if err != nil {
+		return err
+	}
+	return s.writeTable(c, ns, o, r, c.who.writesData(o))
+}
+
+// writeTable sends a LoadTableResult with Igloo's credentials for the
+// table, if the client asked for them.
+func (s *Server) writeTable(c *call, ns []string, o auth.Object, r *reply, write bool) error {
+	result, err := parseLoadResult(r.body)
+	if err != nil {
+		return err
+	}
+	var creds *Credentials
+	if vendRequested(c.r) {
+		if creds, err = s.vend(c, result.location, write); err != nil {
+			return err
+		}
+	}
+	body, err := result.marshal(creds, "v1/"+tablePathOf(ns, o.Table)+"/credentials")
+	if err != nil {
+		return err
+	}
+	writeBody(c.w, r.status, body)
+	return nil
+}
+
+// vend gets credentials for the table at location, or nil when none can
+// be given.
+func (s *Server) vend(c *call, location string, write bool) (*Credentials, error) {
+	if s.opts.Credentials == nil {
+		return nil, nil
+	}
+	creds, err := s.opts.Credentials.Vend(c.ctx(), location, write, c.who.user.Name)
+	if errors.Is(err, ErrNoCredentials) {
+		return nil, nil
+	}
+	if err != nil {
+		s.log.Warn("could not vend storage credentials", "location", location, "err", err)
+		return nil, errorf(http.StatusServiceUnavailable, errUnavailable, "could not get storage credentials for the table; try again")
+	}
+	c.detail = "read credentials"
+	if write {
+		c.detail = "read-write credentials"
+	}
+	return &creds, nil
+}
+
+func (s *Server) tableExists(c *call) error {
+	ns, o, err := pathTable(c.r)
+	if err != nil {
+		return err
+	}
+	if err := c.who.requireSees(o); err != nil {
+		return s.unlessMissing(c, ns, o.Table, err)
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodHead, tablePathOf(ns, o.Table), nil, nil)
+	if err != nil {
+		return err
+	}
+	c.w.WriteHeader(r.status)
+	return nil
+}
+
+func (s *Server) updateTable(c *call) error {
+	ns, o, err := pathTable(c.r)
+	if err != nil {
+		return err
+	}
+	var req commitRequest
+	body, err := readJSON(c, &req)
+	if err != nil {
+		return err
+	}
+	n := classify(req)
+	c.written = []auth.Object{o}
+	c.detail = strings.Join(n.summary, ", ")
+	if err := c.who.allowsCommit(o, n); err != nil {
+		return err
+	}
+	if err := checkProperties(req.propertyKeys()); err != nil {
+		return err
+	}
+	// Creating needs only CREATE, so it must not touch an existing table.
+	// Lakekeeper refuses that too.
+	if n.creates {
+		if _, err := s.cat.call(c.ctx(), http.MethodHead, tablePathOf(ns, o.Table), nil, nil); err == nil {
+			return errorf(http.StatusConflict, "CommitFailedException", "table %s already exists", o)
+		}
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodPost, tablePathOf(ns, o.Table), nil, body)
+	if err != nil {
+		return err
+	}
+	writeBody(c.w, r.status, r.body)
+	return nil
+}
+
+func (s *Server) dropTable(c *call) error {
+	ns, o, err := pathTable(c.r)
+	if err != nil {
+		return err
+	}
+	c.written = []auth.Object{o}
+	if err := c.who.require(auth.PrivilegeCreate, auth.Object{Schema: o.Schema}); err != nil {
+		return err
+	}
+	if _, err := s.cat.call(c.ctx(), http.MethodDelete, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "purgeRequested"), nil); err != nil {
+		return err
+	}
+	// A table created later under the name starts with no grants.
+	s.forget(c, o)
+	c.w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (s *Server) renameTable(c *call) error {
+	var req struct {
+		Source      identifier `json:"source"`
+		Destination identifier `json:"destination"`
+	}
+	body, err := readJSON(c, &req)
+	if err != nil {
+		return err
+	}
+	if !req.Source.valid() || !req.Destination.valid() {
+		return errorf(http.StatusBadRequest, errBadRequest, "missing source or destination")
+	}
+	from, to := req.Source.object(), req.Destination.object()
+	c.written = []auth.Object{from, to}
+	if err := c.who.require(auth.PrivilegeCreate, auth.Object{Schema: from.Schema}); err != nil {
+		return err
+	}
+	// Grants on the other schema would then reach the table: moving a
+	// table out of a schema could hand it to whoever may read another.
+	// SQL cannot move tables between schemas either.
+	if !strings.EqualFold(from.Schema, to.Schema) && !c.who.admin() {
+		return c.who.deny("only admins may move a table to another schema")
+	}
+	if _, err := s.cat.call(c.ctx(), http.MethodPost, "tables/rename", nil, body); err != nil {
+		return err
+	}
+	// Grants follow a renamed table, as with ALTER TABLE ... RENAME TO.
+	if err := s.opts.Grants.RenameObject(c.ctx(), from, to); err != nil {
+		s.log.Warn("could not move grants to a renamed table", "from", from.String(), "to", to.String(), "err", err)
+	}
+	c.w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (s *Server) loadCredentials(c *call) error {
+	ns, o, err := pathTable(c.r)
+	if err != nil {
+		return err
+	}
+	c.read = []auth.Object{o}
+	if err := c.who.require(auth.PrivilegeSelect, o); err != nil {
+		return s.unlessMissing(c, ns, o.Table, err)
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodGet, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "snapshots"), nil)
+	if err != nil {
+		return err
+	}
+	result, err := parseLoadResult(r.body)
+	if err != nil {
+		return err
+	}
+	creds, err := s.vend(c, result.location, c.who.writesData(o))
+	if err != nil {
+		return err
+	}
+	list := []map[string]any{}
+	if creds != nil {
+		list = creds.storageCredentials()
+	}
+	writeJSON(c.w, http.StatusOK, map[string]any{"storage-credentials": list})
+	return nil
+}
+
+// reportMetrics accepts an engine's scan and commit reports, and drops
+// them.
+func (s *Server) reportMetrics(c *call) error {
+	_, _ = io.Copy(io.Discard, http.MaxBytesReader(c.w, c.r.Body, maxRequestBody))
+	c.w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// unlessMissing returns refusal, the reason c may not use a table (or with
+// an empty table, a namespace), unless it does not exist: then a 404 says
+// so. Names are no secret (SQL clients see every table's), and engines
+// learn whether a table exists by loading it, as before CREATE TABLE AS.
+func (s *Server) unlessMissing(c *call, ns []string, table string, refusal error) error {
+	path, kind, name := namespacePathOf(ns), "NoSuchNamespaceException", "namespace "+schemaOf(ns)
+	if table != "" {
+		path, kind, name = tablePathOf(ns, table), "NoSuchTableException", "table "+schemaOf(ns)+"."+table
+	}
+	_, err := s.cat.call(c.ctx(), http.MethodHead, path, nil, nil)
+	var api *apiError
+	if errors.As(err, &api) && api.status == http.StatusNotFound {
+		return errorf(http.StatusNotFound, kind, "%s does not exist", name)
+	}
+	return refusal
+}
+
+// forget removes the grants on a dropped table or schema.
+func (s *Server) forget(c *call, o auth.Object) {
+	if err := s.opts.Grants.ForgetObject(c.ctx(), o); err != nil {
+		s.log.Warn("could not remove the grants of a dropped "+o.Kind(), "object", o.String(), "err", err)
+	}
+}

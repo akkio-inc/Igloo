@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ type Config struct {
 	ConsoleAddr string
 	// FlightAddr serves Arrow Flight SQL. Empty disables it.
 	FlightAddr string
+	// IcebergAddr serves the Iceberg REST catalog to other engines. Empty
+	// disables it.
+	IcebergAddr string
 	// TLSCertFile and TLSKeyFile enable TLS for SQL clients.
 	TLSCertFile string
 	TLSKeyFile  string
@@ -162,6 +166,10 @@ type S3 struct {
 	// URLStyle is "path" for most self-hosted stores, "vhost" for AWS.
 	URLStyle string
 	UseSSL   bool
+	// STSRoleARN is the IAM role Igloo assumes to hand other engines
+	// credentials limited to one table. Required on AWS for that;
+	// S3-compatible stores scope Igloo's own keys instead.
+	STSRoleARN string
 }
 
 // GCS configures Google Cloud Storage. DuckDB reaches GCS through its
@@ -205,12 +213,17 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if !ok {
 		flightAddr = ":31337"
 	}
+	icebergAddr, ok := lookup("IGLOO_ICEBERG_ADDR")
+	if !ok {
+		icebergAddr = ":8181"
+	}
 
 	cfg := Config{
 		ListenAddr:          get("IGLOO_LISTEN_ADDR", ":5432"),
 		HTTPAddr:            strings.TrimSpace(httpAddr),
 		ConsoleAddr:         strings.TrimSpace(consoleAddr),
 		FlightAddr:          strings.TrimSpace(flightAddr),
+		IcebergAddr:         strings.TrimSpace(icebergAddr),
 		TLSCertFile:         get("IGLOO_TLS_CERT_FILE", ""),
 		TLSKeyFile:          get("IGLOO_TLS_KEY_FILE", ""),
 		LogFormat:           get("IGLOO_LOG_FORMAT", "text"),
@@ -241,6 +254,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 				AccessKeyID:     get("IGLOO_S3_ACCESS_KEY_ID", ""),
 				SecretAccessKey: getenv("IGLOO_S3_SECRET_ACCESS_KEY"),
 				URLStyle:        get("IGLOO_S3_URL_STYLE", "vhost"),
+				STSRoleARN:      get("IGLOO_S3_STS_ROLE_ARN", ""),
 			},
 			GCS: GCS{
 				HMACKeyID:  get("IGLOO_GCS_HMAC_KEY_ID", ""),
@@ -375,6 +389,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if cfg.Storage.S3.AccessKeyID != "" && cfg.Storage.S3.SecretAccessKey == "" {
 		addErr("IGLOO_S3_SECRET_ACCESS_KEY must be set when IGLOO_S3_ACCESS_KEY_ID is")
 	}
+	if arn := cfg.Storage.S3.STSRoleARN; arn != "" && !roleARN.MatchString(arn) {
+		addErr("IGLOO_S3_STS_ROLE_ARN must be an IAM role ARN such as arn:aws:iam::123456789012:role/igloo-engines, got %q", arn)
+	}
 
 	for _, loc := range strings.Split(get("IGLOO_ALLOWED_LOCATIONS", ""), ",") {
 		if loc = strings.TrimSpace(loc); loc == "" {
@@ -402,6 +419,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	return cfg, errors.Join(errs...)
 }
+
+// roleARN matches an IAM role ARN in any AWS partition.
+var roleARN = regexp.MustCompile(`^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$`)
 
 // parseDays parses a Go duration, also accepting a whole number of days such
 // as "7d".

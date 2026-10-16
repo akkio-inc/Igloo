@@ -24,8 +24,10 @@ for the method, every result and its caveats.
   PostgreSQL protocol.
 - **Open table format.** Tables are [Apache Iceberg](https://iceberg.apache.org/)
   in object storage (S3, GCS, Azure Data Lake Storage, or any S3-compatible
-  store). Spark, Trino, Snowflake and Databricks can read the same data; there
-  is no proprietary storage to migrate out of.
+  store), with no proprietary storage to migrate out of. Spark, Trino and
+  PyIceberg read and write them through Igloo's
+  [Iceberg REST catalog](docs/external-engines.md), under Igloo's users and
+  grants; Databricks and Snowflake connect the same way.
 - **Fast on one machine, cheap to run.** Queries run on an embedded
   [DuckDB](https://duckdb.org/). Most analytical workloads fit on a single
   node; you pay for your own VMs and storage, nothing else.
@@ -143,6 +145,11 @@ the official TPC-H answers.
   platforms and days; geometry and H3 functions for DMA, zip code and
   store-radius reporting; DuckDB's approximate, statistical and time zone
   functions.
+- **[Other engines](docs/external-engines.md)** through an Iceberg REST
+  catalog on port 8181: Spark, Trino, PyIceberg, Databricks and Snowflake
+  sign in as Igloo users, Igloo's grants decide what they may read and change,
+  their requests go to the query history, and they get storage credentials
+  that last an hour and reach one table's files only.
 - **A locked-down query engine**: SQL cannot read the server's files or reach
   any location except the warehouse and locations you allow.
 - **Automatic table maintenance**: small files are compacted, snapshots older
@@ -205,7 +212,9 @@ local store; see the bottom of `deploy/single-vm/.env`.
   same way.
 - **[Lakekeeper](https://github.com/lakekeeper/lakekeeper)** is the Iceberg
   REST catalog: it tracks tables, schemas and snapshots. Only Igloo talks to
-  it.
+  it; other engines use Igloo's own Iceberg REST endpoint (port 8181), which
+  checks their requests against the same users and grants and passes them
+  on.
 - **PostgreSQL** stores the catalog's metadata and Igloo's users.
 - **Object storage** holds the table data as Parquet files.
 
@@ -227,6 +236,9 @@ extension (see [media analytics](docs/media-analytics.md#security)).
   backups, table maintenance, upgrades, troubleshooting
 - [Scale to zero](docs/scale-to-zero.md): stop compute when idle and start it
   on the next connection
+- [Other engines](docs/external-engines.md): Spark, Trino, PyIceberg,
+  Databricks and Snowflake on Igloo's tables, through its Iceberg REST
+  catalog
 - [SQL and clients](docs/sql.md): the SQL dialect, Iceberg features, type
   mapping, tested drivers and tools
 - [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
@@ -257,6 +269,9 @@ extension (see [media analytics](docs/media-analytics.md#security)).
 - **Keys are not enforced.** `PRIMARY KEY` and `UNIQUE` on Iceberg tables are
   accepted but not checked, so duplicates are possible. `NOT NULL` is
   enforced.
+- **Other engines get storage credentials on S3 only.** On Google Cloud
+  Storage and Azure, engines using the Iceberg REST catalog need their own
+  access to the files ([details](docs/external-engines.md#storage-credentials)).
 
 ## Repository layout
 
@@ -271,6 +286,7 @@ internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox
 internal/flightsql/ Arrow Flight SQL endpoint
+internal/icebergrest/ Iceberg REST catalog for other engines
 internal/pgwire/    Postgres wire protocol, authorization, policies, compatibility
 internal/policy/    masking and row access policies and tags, stored
 internal/schedule/  cron and interval schedules

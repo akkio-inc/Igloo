@@ -56,6 +56,11 @@ spec:
               containerPort: 31337
               protocol: TCP
             {{- end }}
+            {{- if .Values.iceberg.enabled }}
+            - name: iceberg
+              containerPort: 8181
+              protocol: TCP
+            {{- end }}
           env:
             - name: IGLOO_GATEWAY_COMPUTE
               value: kubernetes
@@ -74,6 +79,11 @@ spec:
             # So does a Flight SQL client.
             - name: IGLOO_GATEWAY_FLIGHT_BACKEND
               value: {{ printf "%s:31337" (include "igloo.serverServiceName" .) | quote }}
+            {{- end }}
+            {{- if .Values.iceberg.enabled }}
+            # So do other engines on the Iceberg REST catalog.
+            - name: IGLOO_GATEWAY_ICEBERG_BACKEND
+              value: {{ printf "%s:8181" (include "igloo.serverServiceName" .) | quote }}
             {{- end }}
             - name: IGLOO_GATEWAY_ACTIVITY_URL
               value: {{ printf "http://%s:8080/activity" (include "igloo.headlessServiceName" .) | quote }}

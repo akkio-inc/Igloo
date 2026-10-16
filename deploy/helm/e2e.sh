@@ -17,6 +17,8 @@
 #   - a reader user cannot write (SQLSTATE 42501)
 #   - /readyz and /metrics; Lakekeeper, PostgreSQL and RustFS are unreachable
 #     from pods outside the release (NetworkPolicy)
+#   - the Iceberg REST catalog through the Service: a token, a listing and
+#     storage credentials from the bundled store's STS
 #   - `helm test`
 #   - `helm upgrade` to 3 replicas keeps the generated admin password, leaves
 #     the running pods alone and keeps the data
@@ -405,6 +407,18 @@ expect_eq "metrics Service" \
   "$(k exec curl-client -- curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "http://$FULLNAME-metrics:8080/metrics")" "200"
 expect_eq "web console through Service $FULLNAME" \
   "$(k exec curl-client -- curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "http://$FULLNAME:8443/")" "200"
+
+log "Iceberg REST catalog for other engines"
+token=$(k exec curl-client -- curl -fsS --max-time 10 -d grant_type=client_credentials -d client_id=r \
+  -d client_secret=reader-password "http://$FULLNAME:8181/v1/oauth/tokens" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+[[ -n "$token" ]] || fail "no Iceberg REST token for the reader through Service $FULLNAME"
+pass "the reader gets an Iceberg REST token through Service $FULLNAME"
+expect_eq "the reader lists the tables" "$(k exec curl-client -- curl -fsS --max-time 10 \
+  -H "Authorization: Bearer $token" "http://$FULLNAME:8181/v1/namespaces/public/tables" | grep -o '"e2e_items"')" '"e2e_items"'
+table=$(k exec curl-client -- curl -fsS --max-time 30 -H "Authorization: Bearer $token" \
+  -H 'X-Iceberg-Access-Delegation: vended-credentials' "http://$FULLNAME:8181/v1/namespaces/public/tables/e2e_items")
+grep -q '"s3.session-token":"[^"]' <<<"$table" || fail "no storage credentials for e2e_items: $(head -c 300 <<<"$table")"
+pass "the reader gets storage credentials for e2e_items from the bundled store's STS"
 
 log "Only igloo pods may reach Lakekeeper; only igloo and Lakekeeper reach PostgreSQL and RustFS"
 if k exec curl-client -- curl -fsS --max-time 5 -o /dev/null "http://$FULLNAME-catalog:8181/health" 2>/dev/null; then

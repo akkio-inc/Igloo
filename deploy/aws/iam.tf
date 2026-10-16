@@ -108,3 +108,58 @@ resource "aws_iam_role_policy_attachment" "igloo_additional" {
   role       = aws_iam_role.service["igloo"].name
   policy_arn = each.value
 }
+
+################################################################################
+# Storage credentials for other engines
+#
+# Spark, Trino and other engines that read and write tables through Igloo's
+# Iceberg REST catalog get credentials for one table at a time
+# (docs/external-engines.md). Igloo makes them by assuming this role with a
+# session policy that allows only that table's prefix, read-only unless the
+# user may change the table, for an hour. Only the igloo pods' role may
+# assume it, and it can do no more than they can.
+################################################################################
+
+resource "aws_iam_role" "engines" {
+  name        = "${var.name_prefix}-engines"
+  description = "Assumed by Igloo to hand other engines credentials limited to one table"
+
+  # Role chaining (IRSA role -> this one) caps sessions at an hour.
+  max_session_duration = 3600
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.service["igloo"].arn }
+        Action    = "sts:AssumeRole"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "engines_warehouse" {
+  name = "warehouse-access"
+  role = aws_iam_role.engines.id
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = local.warehouse_access_statements
+  })
+}
+
+resource "aws_iam_role_policy" "igloo_assume_engines" {
+  name = "assume-engines-role"
+  role = aws_iam_role.service["igloo"].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "VendTableCredentials"
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = aws_iam_role.engines.arn
+      },
+    ]
+  })
+}

@@ -29,6 +29,10 @@ type Config struct {
 	// FlightBackend is set.
 	FlightListenAddr string
 	FlightBackend    string
+	// IcebergListenAddr and IcebergBackend forward the Iceberg REST catalog
+	// too, when IcebergBackend is set.
+	IcebergListenAddr string
+	IcebergBackend    string
 
 	// Compute is ec2, kubernetes or command.
 	Compute        string
@@ -79,6 +83,13 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 	if cfg.FlightBackend != "" {
 		if h, p, err := net.SplitHostPort(cfg.FlightBackend); err != nil || h == "" || p == "" {
 			addErr("IGLOO_GATEWAY_FLIGHT_BACKEND must be Igloo's Flight SQL address as host:port, got %q", cfg.FlightBackend)
+		}
+	}
+	cfg.IcebergBackend = get("IGLOO_GATEWAY_ICEBERG_BACKEND", "")
+	cfg.IcebergListenAddr = get("IGLOO_GATEWAY_ICEBERG_LISTEN_ADDR", ":8181")
+	if cfg.IcebergBackend != "" {
+		if h, p, err := net.SplitHostPort(cfg.IcebergBackend); err != nil || h == "" || p == "" {
+			addErr("IGLOO_GATEWAY_ICEBERG_BACKEND must be Igloo's Iceberg REST address as host:port, got %q", cfg.IcebergBackend)
 		}
 	}
 

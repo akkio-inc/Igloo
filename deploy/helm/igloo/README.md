@@ -177,10 +177,20 @@ pass for each cloud.
   `metrics.serviceMonitor.enabled=true` creates a ServiceMonitor for both.
 - **NetworkPolicy** (on by default) restricts ingress only: Lakekeeper accepts
   igloo pods; the bundled PostgreSQL and object store accept igloo and
-  Lakekeeper pods; igloo pods accept the SQL, console, Flight SQL and metrics
-  ports (narrow them with `networkPolicy.sqlFrom` / `metricsFrom`). With scale
-  to zero, those ports apply to the gateway, and igloo's client ports accept
-  only the gateway. Egress is not restricted.
+  Lakekeeper pods; igloo pods accept the SQL, console, Flight SQL, Iceberg REST
+  and metrics ports (narrow them with `networkPolicy.sqlFrom` / `metricsFrom`).
+  Engines in the cluster that use the bundled object store with the
+  credentials the Iceberg REST catalog hands them need
+  `networkPolicy.objectStorageFrom`. With scale to zero, those ports apply to
+  the gateway, and igloo's ports accept only the gateway. Egress is not
+  restricted.
+- **Other engines**: Spark, Trino, PyIceberg and others use Igloo's tables
+  through its [Iceberg REST catalog](../../../docs/external-engines.md) on
+  port 8181 of the SQL Service (`iceberg.enabled`). On AWS, set
+  `storage.s3.stsRoleArn` to a role Igloo's own role may assume, so that
+  engines get credentials for one table at a time; S3-compatible stores need
+  no role, and the bundled one only `networkPolicy.objectStorageFrom` for the
+  engines' pods.
 - **Security**: every pod runs as non-root with a read-only root filesystem,
   all capabilities dropped and the `RuntimeDefault` seccomp profile, which
   satisfies the `restricted` Pod Security Standard. Service account tokens are
@@ -263,6 +273,7 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `storage.s3.urlStyle` | `vhost` | `IGLOO_S3_URL_STYLE`: `vhost` or `path` |
 | `storage.s3.useSSL` | `true` | `IGLOO_S3_USE_SSL` |
 | `storage.s3.existingSecret` | `""` | Keys `access-key-id`, `secret-access-key`. Empty: AWS credential chain (IRSA) and `catalog.systemCredentials=aws`. |
+| `storage.s3.stsRoleArn` | `""` | `IGLOO_S3_STS_ROLE_ARN`: role Igloo assumes to hand other engines credentials limited to one table. Empty on AWS: engines get metadata but no credentials. |
 | `storage.gcs.existingSecret` | `""` | Keys `hmac-key-id`, `hmac-secret` for `IGLOO_GCS_HMAC_*`; required for `gs://` |
 | `storage.azure.existingSecret` | `""` | Key `account-key` for `IGLOO_AZURE_ACCOUNT_KEY`. Empty: workload identity. |
 | `duckdb.memoryLimit` | `""` | `IGLOO_DUCKDB_MEMORY_LIMIT`, e.g. `6GB`. Empty: 80% of `resources.limits.memory`, leaving at least 512Mi. |
@@ -309,6 +320,8 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `sso.displayName` | `SSO` | Label of the sign-in button |
 | `sso.accessTokenAudience` | `""` | Accept the provider's access tokens for this audience as SQL passwords, inside TLS |
 | `tokenMaxLifetime` | `365d` | Longest lifetime of an access token (`IGLOO_TOKEN_MAX_LIFETIME`) |
+| `iceberg.enabled` | `true` | [Iceberg REST catalog](../../../docs/external-engines.md) for other engines on the SQL Service; without TLS it serves clients on private networks only |
+| `iceberg.port` | `8181` | Iceberg REST port on the SQL Service |
 | `service.annotations` | `{}` | |
 | `service.loadBalancerSourceRanges` | `[]` | Client CIDRs allowed through a LoadBalancer |
 | `service.loadBalancerClass`, `service.externalTrafficPolicy` | `""` | |
@@ -326,7 +339,8 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
-| `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for the SQL, console and Flight SQL ports (5432, 8443, 31337) and for 8080; empty: everyone |
+| `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for the SQL, console, Flight SQL and Iceberg REST ports (5432, 8443, 31337, 8181) and for 8080; empty: everyone |
+| `networkPolicy.objectStorageFrom` | `[]` | NetworkPolicy peers, besides igloo and Lakekeeper, for the bundled object store: engines using the Iceberg REST catalog's credentials; empty: none |
 | `catalog.image.repository` / `tag` / `pullPolicy` | `quay.io/lakekeeper/catalog` / `v0.14.0` / `IfNotPresent` | |
 | `catalog.replicaCount` | `1` | Lakekeeper pods (a PodDisruptionBudget is added above 1) |
 | `catalog.warehouse` | `igloo` | `IGLOO_CATALOG_WAREHOUSE` |

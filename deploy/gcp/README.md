@@ -111,6 +111,17 @@ psql "host=127.0.0.1 port=5432 user=igloo dbname=igloo"
 `tofu output admin_password_command` prints the password command for your
 namespace and Secret name.
 
+### Other engines
+
+Spark, Trino, PyIceberg and other engines use the tables through Igloo's
+[Iceberg REST catalog](../../docs/external-engines.md) on port 8181 of the same
+Service (`kubectl -n igloo port-forward svc/igloo 8181:8181`, or
+`http://igloo.igloo.svc:8181` inside the cluster), signed in as Igloo users.
+Igloo does not hand out credentials for Google Cloud Storage yet, so engines
+get table metadata only: to read or write the files they need a service
+account of their own with access to the bucket, whose reach Igloo's grants do
+not limit.
+
 ### Exposing SQL through a load balancer
 
 ```hcl

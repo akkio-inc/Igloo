@@ -39,6 +39,12 @@ Clients connect to it instead of to Igloo, and so can browsers using the
 - With `IGLOO_GATEWAY_FLIGHT_BACKEND` set, it forwards
   [Arrow Flight SQL](flight-sql.md) too: a Flight SQL client's connection
   starts Igloo like a SQL client's, and an idle one sends nothing.
+- With `IGLOO_GATEWAY_ICEBERG_BACKEND` set, it forwards the
+  [Iceberg REST catalog](external-engines.md) the same way, so a Spark or
+  Trino job's catalog request starts Igloo. Engines read and write table
+  files in object storage directly, which the gateway does not see: a job
+  that goes longer than `IGLOO_GATEWAY_SUSPEND_AFTER` between catalog
+  requests finds Igloo stopped, and its next request waits while it starts.
 
 **Open sessions are closed when Igloo stops**, as they would be by a database
 restart. Interactive clients reconnect on their next query, which starts
@@ -102,15 +108,19 @@ same VPC.
    IGLOO_HTTP_BIND=0.0.0.0
    IGLOO_CONSOLE_BIND=0.0.0.0   # to use the web console through the gateway
    IGLOO_FLIGHT_BIND=0.0.0.0    # and Arrow Flight SQL
+   IGLOO_ICEBERG_BIND=0.0.0.0   # for other engines, through the gateway
    ```
 
    Allow the gateway's security group to reach the instance on
-   `IGLOO_PORT` (5433), `IGLOO_HTTP_PORT` (8432) and, for the console and
-   Flight SQL, `IGLOO_CONSOLE_PORT` (8443) and `IGLOO_FLIGHT_PORT` (31337),
-   and nothing else. The stack restarts by itself when the instance boots.
-   The console and Flight SQL accept clients from other machines only over
-   TLS, so set up TLS (see `.env`) to use them through the gateway; the
-   gateway passes TLS through untouched.
+   `IGLOO_PORT` (5433), `IGLOO_HTTP_PORT` (8432) and, for the console,
+   Flight SQL and other engines, `IGLOO_CONSOLE_PORT` (8443),
+   `IGLOO_FLIGHT_PORT` (31337) and `IGLOO_ICEBERG_PORT` (8181), and nothing
+   else. The stack restarts by itself when the instance boots. The console
+   and Flight SQL accept clients from other machines only over TLS, so set
+   up TLS (see `.env`) to use them through the gateway; the gateway passes
+   TLS through untouched. Do the same before engines outside the private
+   network use the Iceberg REST catalog through the gateway: Igloo sees the
+   gateway's private address, not theirs.
 
 3. **Run the gateway** on the small machine, with the Igloo image:
 
@@ -122,14 +132,16 @@ same VPC.
      -e IGLOO_GATEWAY_EC2_INSTANCE_IDS=i-0123456789abcdef0 \
      -e IGLOO_GATEWAY_CONSOLE_BACKEND=10.0.1.23:8443 \
      -e IGLOO_GATEWAY_FLIGHT_BACKEND=10.0.1.23:31337 \
+     -e IGLOO_GATEWAY_ICEBERG_BACKEND=10.0.1.23:8181 \
      -e AWS_REGION=us-east-1 \
      ghcr.io/akkio-inc/igloo:VERSION gateway
    ```
 
    Use the instance's private IP address, which survives stops and starts.
    Point clients at the gateway machine's port 5432, browsers at its port
-   8443 and Flight SQL clients at its port 31337. Leave out
-   `IGLOO_GATEWAY_CONSOLE_BACKEND` and `IGLOO_GATEWAY_FLIGHT_BACKEND` to
+   8443, Flight SQL clients at its port 31337 and engines at its port 8181.
+   Leave out `IGLOO_GATEWAY_CONSOLE_BACKEND`, `IGLOO_GATEWAY_FLIGHT_BACKEND`
+   and `IGLOO_GATEWAY_ICEBERG_BACKEND` to
    forward SQL only.
 
 On a machine with 512 MB of memory, package installs can run out of memory;
@@ -197,9 +209,10 @@ file from object storage again.
 
 Without the chart, set up the same pieces yourself, following its
 `gateway.yaml` and `service.yaml` templates: `IGLOO_GATEWAY_BACKEND` pointing
-at a Service for the Igloo pods (and `IGLOO_GATEWAY_CONSOLE_BACKEND` and
-`IGLOO_GATEWAY_FLIGHT_BACKEND` at their ports 8443 and 31337, to forward the
-[web console](console.md) and [Flight SQL](flight-sql.md) too),
+at a Service for the Igloo pods (and `IGLOO_GATEWAY_CONSOLE_BACKEND`,
+`IGLOO_GATEWAY_FLIGHT_BACKEND` and `IGLOO_GATEWAY_ICEBERG_BACKEND` at their
+ports 8443, 31337 and 8181, to forward the [web console](console.md),
+[Flight SQL](flight-sql.md) and the [Iceberg REST catalog](external-engines.md) too),
 `IGLOO_GATEWAY_ACTIVITY_URL` at a headless one (`clusterIP: None`), and those
 permissions for the gateway's service account. Leave `replicas` out of Igloo's Deployment, so that applying it
 again does not undo the gateway's scaling.
@@ -218,6 +231,8 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_CONSOLE_LISTEN_ADDR` | `:8443` | Where browsers connect for the console, when it is forwarded |
 | `IGLOO_GATEWAY_FLIGHT_BACKEND` | | Igloo's Arrow Flight SQL address, `host:port` (port 31337). Set it to forward Flight SQL too. |
 | `IGLOO_GATEWAY_FLIGHT_LISTEN_ADDR` | `:31337` | Where Flight SQL clients connect, when it is forwarded |
+| `IGLOO_GATEWAY_ICEBERG_BACKEND` | | Igloo's Iceberg REST catalog address, `host:port` (port 8181). Set it to forward other engines' catalog requests too. |
+| `IGLOO_GATEWAY_ICEBERG_LISTEN_ADDR` | `:8181` | Where engines connect for the Iceberg REST catalog, when it is forwarded |
 | `IGLOO_GATEWAY_HTTP_ADDR` | `:8080` | `GET /healthz` and `GET /metrics`. Empty disables it. |
 | `IGLOO_GATEWAY_EC2_INSTANCE_IDS` | | `ec2`: the instances to start and stop, comma separated. Credentials and region come from the usual AWS sources. |
 | `IGLOO_GATEWAY_K8S_DEPLOYMENT` | | `kubernetes`: Igloo's Deployment |
@@ -237,8 +252,8 @@ out when none is scheduled).
 | Metric | Labels | Meaning |
 |---|---|---|
 | `igloo_gateway_compute_running` | | 1 while Igloo's compute is known to be running |
-| `igloo_gateway_connections` | | Open client connections: SQL, console and Flight SQL |
-| `igloo_gateway_connections_total` | | Client connections accepted: SQL, console and Flight SQL |
+| `igloo_gateway_connections` | | Open client connections: SQL, console, Flight SQL and Iceberg REST |
+| `igloo_gateway_connections_total` | | Client connections accepted: SQL, console, Flight SQL and Iceberg REST |
 | `igloo_gateway_resumes_total` | `result` = `success`, `failure` | Starts of the compute |
 | `igloo_gateway_resume_seconds` | | Time from asking the compute to start until Igloo accepted connections |
 | `igloo_gateway_suspends_total` | | Stops for idleness |

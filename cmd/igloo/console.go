@@ -43,7 +43,7 @@ func listenConsole(addr string) (net.Listener, error) {
 func serveConsole(ctx context.Context, ln net.Listener, srv *pgwire.Server, users auth.Store, single *sso.Service,
 	provisioning http.Handler, tlsConfig *tls.Config, status func(context.Context) console.Status, errc chan<- error,
 	log *slog.Logger) (*http.Server, error) {
-	key, err := consoleKey(ctx, users)
+	key, err := sharedKey(ctx, users, consoleSecret)
 	if err != nil {
 		return nil, fmt.Errorf("console session key: %w", err)
 	}
@@ -78,13 +78,14 @@ func serveConsole(ctx context.Context, ln net.Listener, srv *pgwire.Server, user
 	return httpSrv, nil
 }
 
-// consoleKey returns the key that seals console session cookies: shared by
-// every replica through the metadata database, so a session works on any
-// of them. Without a metadata database there is one replica, and a key of
-// its own, which signs everyone out when it restarts, is enough.
-func consoleKey(ctx context.Context, users auth.Store) ([]byte, error) {
+// sharedKey returns the key named name in igloo_auth.secrets, such as the
+// one that seals console session cookies: shared by every replica through
+// the metadata database, so a session works on any of them. Without a
+// metadata database there is one replica, and a key of its own, which signs
+// everyone out when it restarts, is enough.
+func sharedKey(ctx context.Context, users auth.Store, name string) ([]byte, error) {
 	if pg, ok := users.(*auth.PostgresStore); ok {
-		return pg.Secret(ctx, consoleSecret)
+		return pg.Secret(ctx, name)
 	}
 	key := make([]byte, 32)
 	_, err := rand.Read(key)

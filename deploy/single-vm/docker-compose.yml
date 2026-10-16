@@ -43,6 +43,7 @@ services:
       IGLOO_S3_USE_SSL: ${S3_USE_SSL:?}
       IGLOO_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
       IGLOO_S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      IGLOO_S3_STS_ROLE_ARN: ${S3_STS_ROLE_ARN:-}
       IGLOO_TLS_CERT_FILE: ${IGLOO_TLS_CERT_FILE:-}
       IGLOO_TLS_KEY_FILE: ${IGLOO_TLS_KEY_FILE:-}
       IGLOO_LOG_FORMAT: ${IGLOO_LOG_FORMAT:-text}
@@ -78,6 +79,10 @@ services:
       # Arrow Flight SQL. Loopback only by default; without TLS it serves
       # only clients that connect as localhost (docs/flight-sql.md).
       - "${IGLOO_FLIGHT_BIND:-127.0.0.1}:${IGLOO_FLIGHT_PORT:-31337}:31337"
+      # The Iceberg REST catalog for Spark, Trino and other engines
+      # (docs/external-engines.md). Loopback only by default; without TLS it
+      # serves clients on private networks only.
+      - "${IGLOO_ICEBERG_BIND:-127.0.0.1}:${IGLOO_ICEBERG_PORT:-8181}:8181"
     volumes:
       - igloo-spill:/var/lib/igloo/tmp
       # Copies of table files read from object storage, kept across
@@ -94,7 +99,8 @@ services:
         required: false
 
   # Iceberg REST catalog: tracks tables, schemas and snapshots. Only igloo
-  # can reach it; it is not published on the host.
+  # can reach it; it is not published on the host. Other engines use the
+  # catalog through Igloo's port 8181 instead.
   lakekeeper:
     image: quay.io/lakekeeper/catalog:v0.14.0
     restart: unless-stopped

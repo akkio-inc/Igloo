@@ -1,6 +1,7 @@
 // Command igloo serves SQL over the Postgres wire protocol and Arrow Flight
 // SQL, and a web console, running queries on an embedded DuckDB attached to
-// an Iceberg catalog.
+// an Iceberg catalog, and serves that catalog's tables to other engines over
+// the Iceberg REST protocol.
 //
 // Configuration comes from IGLOO_* environment variables; see
 // docs/configuration.md. Subcommands:
@@ -109,6 +110,11 @@ func serve() error {
 		return err
 	}
 	defer users.Close()
+	// SQL sessions and the Iceberg REST endpoint check the same grants.
+	grants, ok := users.(auth.GrantStore)
+	if !ok {
+		grants = auth.NewMemoryGrants(users)
+	}
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	if cfg.Catalog.URI != "" && cfg.Catalog.Setup {
@@ -200,6 +206,7 @@ func serve() error {
 		Version:             version,
 		DDL:                 objects,
 		Activity:            work,
+		Grants:              grants,
 		Audit:               history,
 		Tasks:               jobs,
 		DisableSSOPasswords: single != nil && !cfg.OIDC.PasswordSignIn,
@@ -253,7 +260,7 @@ func serve() error {
 	}
 
 	health := &health{engine: eng, users: users, catalog: cfg.Catalog, client: httpClient, activity: work, jobs: jobs}
-	errc := make(chan error, 4)
+	errc := make(chan error, 5)
 	var consoleSrv *http.Server
 	if cfg.ConsoleAddr != "" {
 		consoleLn, err := listenConsole(cfg.ConsoleAddr)
@@ -277,6 +284,24 @@ func serve() error {
 			return err
 		}
 	}
+	// Like the console, the Iceberg REST endpoint listens before the SQL
+	// port, which the scale-to-zero gateway waits for.
+	var icebergSrv *http.Server
+	icebergAddr := cfg.IcebergAddr
+	if cat == nil {
+		icebergAddr = ""
+	}
+	if icebergAddr != "" {
+		icebergLn, err := net.Listen("tcp", icebergAddr)
+		if err != nil {
+			return fmt.Errorf("iceberg: %w", err)
+		}
+		deps := icebergDeps{sql: srv, users: users, grants: grants, history: history, work: work, reg: reg, tls: tlsConfig}
+		if icebergSrv, err = serveIceberg(ctx, icebergLn, cfg, deps, errc, log); err != nil {
+			_ = icebergLn.Close()
+			return err
+		}
+	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -294,7 +319,7 @@ func serve() error {
 		}()
 	}
 	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr,
-		"flight_sql", cfg.FlightAddr)
+		"flight_sql", cfg.FlightAddr, "iceberg", icebergAddr)
 
 	select {
 	case err := <-errc:
@@ -324,6 +349,9 @@ func serve() error {
 	}
 	if flightSrv != nil {
 		_ = flightSrv.Shutdown(shutdownCtx)
+	}
+	if icebergSrv != nil {
+		_ = icebergSrv.Shutdown(shutdownCtx)
 	}
 	err = srv.Shutdown(shutdownCtx)
 	jobs.Wait(shutdownCtx)

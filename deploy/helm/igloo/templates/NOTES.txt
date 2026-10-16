@@ -37,6 +37,17 @@ Arrow Flight SQL: kubectl --namespace {{ $ns }} port-forward service/{{ $svc }} 
 then connect ADBC or JDBC clients to {{ ternary "grpc+tls" "grpc" (not (empty .Values.tls.existingSecret)) }}://localhost:31337 as {{ .Values.admin.user }}.
 
 {{ end -}}
+{{- if .Values.iceberg.enabled }}
+Iceberg REST catalog for Spark, Trino and other engines (docs/external-engines.md):
+{{ ternary "https" "http" (not (empty .Values.tls.existingSecret)) }}://{{ $svc }}.{{ $ns }}.svc:{{ .Values.iceberg.port }}, with credential=<igloo user>:<password>.
+{{- $scheme := include "igloo.warehouseScheme" . }}
+{{- if and (eq $scheme "s3") (not .Values.objectStorage.enabled) (not .Values.storage.s3.endpoint) (not .Values.storage.s3.stsRoleArn) }}
+Engines get table metadata but no storage credentials until storage.s3.stsRoleArn is set.
+{{- else if has $scheme (list "gs" "abfss") }}
+Igloo hands out no storage credentials for {{ $scheme }}:// warehouses yet; engines need their own access to the files.
+{{- end }}
+
+{{ end -}}
 Health and Prometheus metrics: http://{{ include "igloo.metricsServiceName" . }}.{{ $ns }}.svc:8080/metrics
 Check the release with: helm test {{ .Release.Name }} --namespace {{ $ns }}
 {{- if .Values.scaleToZero.enabled }}

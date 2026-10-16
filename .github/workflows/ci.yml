@@ -209,6 +209,14 @@ jobs:
             fi
           done
 
+      - name: Lint without the Iceberg REST catalog, and refuse bad STS roles
+        run: |
+          helm lint "$CHART" --set postgresql.enabled=true --set objectStorage.enabled=true --set iceberg.enabled=false
+          if helm template igloo "$CHART" --set storage.s3.stsRoleArn=not-a-role >/dev/null 2>&1; then
+            echo "::error::an invalid storage.s3.stsRoleArn rendered"
+            exit 1
+          fi
+
       # The release workflow packages the chart this way; catch problems early.
       - name: Package
         run: helm package "$CHART" --version 0.0.0-ci --app-version 0.0.0-ci --destination "$RUNNER_TEMP/chart"

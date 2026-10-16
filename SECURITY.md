@@ -163,7 +163,36 @@ reference for every setting mentioned here.
 - **Catalog.** The Lakekeeper catalog and its PostgreSQL database must not be
   reachable by SQL clients or from the internet. Whoever can reach the catalog
   can change table metadata and may obtain object-storage credentials. Keep it
-  on a private network that only Igloo can reach.
+  on a private network that only Igloo can reach; other engines use the
+  catalog through Igloo instead.
+- **Other engines.** Port 8181 (`IGLOO_ICEBERG_ADDR`) serves the Iceberg REST
+  catalog to Spark, Trino and other engines
+  ([details](docs/external-engines.md)). Engines get an access token by
+  sending an Igloo user's password (OAuth2 client credentials), checked like a
+  SQL login, with the same failed-login delay and login history. Tokens are
+  encrypted and authenticated with a key every replica shares, last an hour,
+  and end when the user is dropped or their password changes. Every request
+  is checked against the user's role and grants, which are read again each
+  time, before Igloo forwards it to Lakekeeper, and is recorded in the query
+  history. Engines never learn Lakekeeper's address and never receive Igloo's
+  storage keys: with a table they get STS credentials (an hour) whose session
+  policy allows only that table's files, read-only unless the user has
+  `INSERT`, `UPDATE` and `DELETE` on it, which any commit that changes the
+  table's snapshots needs as well. On S3-compatible stores Igloo first
+  checks that the store enforces the session policy, and hands out nothing if
+  it does not; on Google Cloud Storage and Azure it hands out nothing yet.
+  Only admins may choose where a table's or schema's files go, so every table
+  has a directory no other table shares. Without TLS the port serves clients
+  on private networks only, since passwords, tokens and credentials cross it
+  (behind a proxy, such as the scale-to-zero gateway, the proxy's address
+  counts, so enable TLS before exposing the proxy); with TLS it serves HTTPS
+  only. What remains: credentials outlive a revoked
+  grant by up to an hour; an engine with write credentials for a table can
+  rewrite that table's files and manifests as it likes, including making them
+  name files of tables whose paths it knows, which Igloo would then read with
+  its own access when that table is queried (paths contain random IDs, shown
+  only to those who may read the table); and engines that bring their own
+  storage access are bound by Igloo's grants in the catalog only.
 - **Health and metrics.** Port 8080 (`/healthz`, `/readyz`, `/metrics`) has no
   authentication. Expose it only to your orchestrator and monitoring.
 - **Web console.** Port 8443 serves the [web console](docs/console.md). Users

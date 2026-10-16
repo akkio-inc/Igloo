@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test of the single-machine stack: builds the image, starts an
 # isolated copy of deploy/single-vm (its own project name, image, ports and
-# data), and checks Igloo through real psql clients, the web console and
-# Arrow Flight SQL clients.
+# data), and checks Igloo through real psql clients, the web console, Arrow
+# Flight SQL clients and PyIceberg on the Iceberg REST catalog
+# (scripts/engines-e2e.sh adds Spark and Trino).
 # Removes everything afterwards unless KEEP_E2E=1. E2E_PROJECT and the
 # E2E_*_PORT variables let several runs share a Docker host; E2E_IMAGE
 # tests an image built already instead of building one.
@@ -16,6 +17,7 @@ sql_port="${E2E_SQL_PORT:-15433}"
 http_port="${E2E_HTTP_PORT:-18432}"
 console_port="${E2E_CONSOLE_PORT:-18443}"
 flight_port="${E2E_FLIGHT_PORT:-13137}"
+iceberg_port="${E2E_ICEBERG_PORT:-18181}"
 image="${E2E_IMAGE:-$project:dev}"
 build=--build
 [ -z "${E2E_IMAGE:-}" ] || build=--no-build
@@ -49,7 +51,7 @@ fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 "$root/deploy/single-vm/init-env.sh" "$env_file" >/dev/null
 sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" \
   -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_FLIGHT_PORT=.*/IGLOO_FLIGHT_PORT=$flight_port/" \
-  -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" "$env_file"
+  -e "s/^IGLOO_ICEBERG_PORT=.*/IGLOO_ICEBERG_PORT=$iceberg_port/" -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" "$env_file"
 # Maintain tables every few seconds, so the maintenance checks need not wait
 # an hour.
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
@@ -505,6 +507,41 @@ mv_dump="$(psql_admin -c "SELECT email FROM crm.contact_mv")" || true
 if grep -q "ann@acme.com\|gus@" <<<"$mv_dump"; then fail "a materialized view stored raw emails: $mv_dump"; else pass "a materialized view stores masked values"; fi
 psql_admin -c "DROP MATERIALIZED VIEW crm.contact_mv" >/dev/null 2>&1 || true
 psql_admin -c "REVOKE acme_team FROM walt" >/dev/null 2>&1 || true
+echo "Iceberg REST catalog for other engines"
+psql_admin -c "CREATE TABLE ice_events (id INTEGER, kind VARCHAR); INSERT INTO ice_events VALUES (1, 'signup'), (2, 'login');
+  CREATE TABLE ice_private (id INTEGER)" >/dev/null
+expect "users for other engines" "CREATE ROLE
+CREATE ROLE
+GRANT
+GRANT" igloo "$admin_password" "
+  CREATE USER ivy WITH PASSWORD 'ivy-password-1' ROLE none;
+  CREATE USER ian WITH PASSWORD 'ian-password-1' ROLE none;
+  GRANT SELECT ON ice_events TO ivy;
+  GRANT SELECT, INSERT, UPDATE, DELETE ON ice_events TO ian;"
+iceberg="http://127.0.0.1:$iceberg_port"
+code="$(curl -s -o /dev/null -w '%{http_code}' "$iceberg/v1/config")"
+if [ "$code" = 401 ]; then pass "the catalog needs a token"; else fail "catalog without a token: $code"; fi
+got="$(curl -s -d grant_type=client_credentials -d client_id=ivy -d client_secret=wrong "$iceberg/v1/oauth/tokens")"
+if grep -q '"error":"invalid_client"' <<<"$got"; then pass "the token endpoint refuses a wrong password"; else fail "token with a wrong password: $got"; fi
+pyiceberg_version=0.12.0
+s3_key="$(grep '^S3_ACCESS_KEY_ID=' "$env_file" | cut -d= -f2)"
+if docker run --rm --network "$network" -e ICEBERG_URI=http://igloo:8181 -e IGLOO_ACCESS_KEY_ID="$s3_key" \
+  -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+    pip install -q 'pyiceberg[pyarrow]==$pyiceberg_version' >/dev/null 2>&1 && python /clients/pyiceberg_test.py" >"$work/pyiceberg.out" 2>&1; then
+  pass "PyIceberg $pyiceberg_version"
+else
+  fail "PyIceberg: $(tail -5 "$work/pyiceberg.out")"
+fi
+expect "SQL sees what PyIceberg wrote" "1:signup,2:login,3:purchase|1" igloo "$admin_password" \
+  "SELECT (SELECT string_agg(id || ':' || kind, ',' ORDER BY id) FROM ice_events), (SELECT count(*) FROM ice_created)"
+expect_soon "catalog requests are in the query history" "t|t|t" igloo "$admin_password" "
+  SELECT bool_or(user_name = 'ivy' AND statement_type = 'loadTable' AND outcome = 'ok'),
+         bool_or(user_name = 'ivy' AND outcome = 'denied' AND sqlstate = '42501'),
+         bool_or(user_name = 'ian' AND statement_type = 'updateTable' AND query_text LIKE '%(add-snapshot (append)%')
+  FROM igloo.query_history WHERE application_name LIKE 'iceberg-rest%'"
+expect_soon "and their sign-ins in the login history" "t|t" igloo "$admin_password" \
+  "SELECT bool_or(user_name = 'ivy' AND result = 'failure'), bool_or(user_name = 'ian' AND result = 'success')
+   FROM igloo.login_history WHERE application_name = 'iceberg'"
 
 echo "SQL from strings, PIVOT and the read cache"
 expect_error "query() is refused" 42501 rita rita-password-1 "SELECT * FROM query('SELECT * FROM duckdb_secrets()')"

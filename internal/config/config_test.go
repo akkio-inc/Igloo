@@ -176,6 +176,35 @@ func TestEmptyHTTPAddrDisablesHTTP(t *testing.T) {
 	}
 }
 
+func TestIceberg(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IcebergAddr != ":8181" || cfg.Storage.S3.STSRoleARN != "" {
+		t.Errorf("unexpected Iceberg defaults: %q, %q", cfg.IcebergAddr, cfg.Storage.S3.STSRoleARN)
+	}
+
+	cfg, err = Load(env(map[string]string{
+		"IGLOO_ADMIN_PASSWORD":  "password",
+		"IGLOO_ICEBERG_ADDR":    "",
+		"IGLOO_S3_STS_ROLE_ARN": "arn:aws-us-gov:iam::123456789012:role/igloo/engines",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IcebergAddr != "" || cfg.Storage.S3.STSRoleARN != "arn:aws-us-gov:iam::123456789012:role/igloo/engines" {
+		t.Errorf("got %q, %q", cfg.IcebergAddr, cfg.Storage.S3.STSRoleARN)
+	}
+
+	for _, arn := range []string{"igloo-engines", "arn:aws:iam::123456789012:user/igloo", "arn:aws:iam::123:role/x"} {
+		_, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_S3_STS_ROLE_ARN": arn}))
+		if err == nil || !strings.Contains(err.Error(), "IGLOO_S3_STS_ROLE_ARN") {
+			t.Errorf("%q: got %v", arn, err)
+		}
+	}
+}
+
 func TestLoadRequiresAdminPassword(t *testing.T) {
 	_, err := Load(env(nil))
 	if err == nil || !strings.Contains(err.Error(), "IGLOO_ADMIN_PASSWORD") {

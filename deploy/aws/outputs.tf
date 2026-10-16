@@ -79,6 +79,11 @@ output "igloo_role_arn" {
   value       = aws_iam_role.service["igloo"].arn
 }
 
+output "engines_role_arn" {
+  description = "IAM role Igloo assumes to hand other engines credentials limited to one table."
+  value       = aws_iam_role.engines.arn
+}
+
 output "catalog_role_arn" {
   description = "IAM role assumed by the Lakekeeper catalog pods."
   value       = aws_iam_role.service["catalog"].arn

@@ -53,6 +53,9 @@ type Options struct {
 	// FlightBackend is Igloo's Arrow Flight SQL address, host:port, for
 	// ServeFlight.
 	FlightBackend string
+	// IcebergBackend is Igloo's Iceberg REST catalog address, host:port,
+	// for ServeIceberg.
+	IcebergBackend string
 	// ActivityURL is Igloo's /activity endpoint. Every address its host
 	// resolves to is asked, so a headless Kubernetes Service covers all
 	// replicas. Empty means the gateway judges idleness by traffic alone,
@@ -170,6 +173,17 @@ func (g *Gateway) ServeFlight(ctx context.Context, ln net.Listener) error {
 		wg.Wait()
 	}()
 	return g.accept(ctx, ln, g.opts.FlightBackend, &wg)
+}
+
+// ServeIceberg is ServeConsole for other engines' connections to the
+// Iceberg REST catalog, forwarded to IcebergBackend.
+func (g *Gateway) ServeIceberg(ctx context.Context, ln net.Listener) error {
+	var wg sync.WaitGroup
+	defer func() {
+		g.closeClients()
+		wg.Wait()
+	}()
+	return g.accept(ctx, ln, g.opts.IcebergBackend, &wg)
 }
 
 // accept forwards connections from ln to backend until ctx is done.

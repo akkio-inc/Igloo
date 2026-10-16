@@ -133,6 +133,8 @@ locals {
         useSSL   = true
         # No static keys: pods get credentials from IRSA.
         existingSecret = ""
+        # Credentials for other engines, limited to one table each.
+        stsRoleArn = aws_iam_role.engines.arn
       }
     }
 
@@ -239,6 +241,8 @@ resource "helm_release" "igloo" {
   depends_on = [
     module.eks, # nodes and add-ons must be up before pods can schedule
     aws_iam_role_policy.warehouse,
+    aws_iam_role_policy.engines_warehouse,
+    aws_iam_role_policy.igloo_assume_engines,
     aws_iam_role_policy_attachment.igloo_additional,
     aws_vpc_endpoint.s3,
     aws_s3_bucket_policy.warehouse,

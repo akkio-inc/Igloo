@@ -339,6 +339,10 @@ name is ignored. The password may be an [access token](sso.md#access-tokens)
 (`CREATE TOKEN`), which is how people who sign in with single sign-on, and
 service accounts, connect BI tools, dbt and scripts.
 
+Engines that read Iceberg tables themselves, such as Spark, Trino and
+PyIceberg, use Igloo's tables through its Iceberg REST catalog instead, under
+the same users and grants; see [other engines](external-engines.md).
+
 ## Differences from PostgreSQL
 
 - The SQL dialect is DuckDB's (above). PostgreSQL-only features such as

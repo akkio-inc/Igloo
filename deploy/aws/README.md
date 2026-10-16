@@ -16,7 +16,7 @@ module from other code, because it configures its own providers.
 | EKS | Cluster with the VPC CNI (NetworkPolicy enforcement on), kube-proxy and CoreDNS add-ons. Kubernetes secrets are encrypted with a KMS key. One managed node group: 2 x `r7g.xlarge` (Graviton, 4 vCPU, 32 GiB), 150 GiB encrypted gp3 root volume each, Amazon Linux 2023. |
 | S3 | Private bucket for Iceberg data, tables under `s3://<bucket>/warehouse`. All public access blocked, SSE-S3 encryption (or your KMS key), a policy that rejects requests without TLS, a lifecycle rule that removes abandoned multipart uploads. Versioning optional. |
 | RDS | PostgreSQL 17, `db.t4g.small`, 20 GiB gp3 (autoscaling to 100 GiB), encrypted, private, reachable only from the cluster, TLS required, 7 days of backups, deletion protection on. One database, `igloo`, holds the catalog (schema `public`) and Igloo's users (schema `igloo_auth`). |
-| IAM | Two roles for service accounts (IRSA): one for the igloo pods and one for the Lakekeeper catalog. Each can be assumed only by its own Kubernetes service account and can only list, read, write and delete objects under `warehouse/` in the bucket. |
+| IAM | Two roles for service accounts (IRSA): one for the igloo pods and one for the Lakekeeper catalog. Each can be assumed only by its own Kubernetes service account and can only list, read, write and delete objects under `warehouse/` in the bucket. A third, `<name_prefix>-engines`, with the same access, can be assumed only by the igloo role: Igloo assumes it, with a session policy for one table, to hand [other engines](../../docs/external-engines.md) credentials for that table for an hour. |
 | Kubernetes | Namespace `igloo`, Secrets `igloo-admin` (key `password`), `igloo-database` (key `url`), `igloo-catalog-encryption` (key `encryption-key`), and `igloo-tls` when TLS is on. |
 | Helm | The Igloo chart: 2 igloo pods (1.5 CPU, 12 GiB each), the Lakekeeper catalog, and a ClusterIP SQL service (or a Network Load Balancer with `expose_sql`). |
 
@@ -89,6 +89,16 @@ By default the SQL port is not reachable from outside the cluster.
 kubectl -n igloo port-forward svc/igloo 5433:5432
 psql "host=127.0.0.1 port=5433 user=igloo dbname=igloo"
 ```
+
+### Other engines
+
+Spark, Trino, PyIceberg and other engines use the tables through Igloo's
+[Iceberg REST catalog](../../docs/external-engines.md) on port 8181 of the same
+Service: `http://igloo.igloo.svc:8181` inside the cluster, or through
+`kubectl -n igloo port-forward svc/igloo 8181:8181`, or on the load balancer
+below (over TLS). They sign in as Igloo users and get credentials for one table
+at a time from the `<name_prefix>-engines` role; nothing else is needed on
+AWS.
 
 ### Through a load balancer (`expose_sql = true`)
 
@@ -274,6 +284,7 @@ tofu test
 
 They check, among other things, that the bucket blocks public access, RDS is
 private and encrypted, each IAM role trusts only its own service account and
-reaches only the warehouse prefix, the Helm values carry the warehouse
+reaches only the warehouse prefix, only the igloo role may assume the engines
+role (whose ARN the chart gets as `storage.s3.stsRoleArn`), the Helm values carry the warehouse
 location and `systemCredentials: aws`, the SQL service stays ClusterIP unless
 exposed, and bad input is rejected.

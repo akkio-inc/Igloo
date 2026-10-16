@@ -210,6 +210,50 @@ func TestConsoleConnectionWakesIgloo(t *testing.T) {
 	}
 }
 
+func TestIcebergConnectionWakesIgloo(t *testing.T) {
+	// The console's echo port stands in for the Iceberg REST port: the
+	// gateway forwards bytes, whatever they are.
+	compute := newTwoPorts(t)
+	icebergLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gw := New(Options{Backend: compute.sql, IcebergBackend: compute.console,
+		SuspendAfter: time.Minute, ResumeTimeout: 5 * time.Second, Compute: compute})
+	done := make(chan error, 2)
+	go func() { done <- gw.Serve(ctx, sqlLn) }()
+	go func() { done <- gw.ServeIceberg(ctx, icebergLn) }()
+	defer func() {
+		cancel()
+		for range 2 {
+			if err := <-done; err != nil {
+				t.Errorf("serve: %v", err)
+			}
+		}
+	}()
+
+	conn, err := net.Dial("tcp", icebergLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintln(conn, "GET /v1/config HTTP/1.1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := bufio.NewReader(conn).ReadString('\n'); err != nil || got != "console: GET /v1/config HTTP/1.1\n" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if starts, _ := compute.counts(); starts != 1 {
+		t.Fatalf("starts = %d, want 1", starts)
+	}
+}
+
 func TestConsoleConfig(t *testing.T) {
 	base := map[string]string{"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "command",
 		"IGLOO_GATEWAY_START_COMMAND": "true", "IGLOO_GATEWAY_STOP_COMMAND": "true"}
@@ -241,5 +285,19 @@ func TestConsoleConfig(t *testing.T) {
 
 	if _, err := LoadConfig(lookup(map[string]string{"IGLOO_GATEWAY_CONSOLE_BACKEND": "igloo"})); err == nil {
 		t.Error("a console backend without a port was accepted")
+	}
+
+	if cfg.IcebergBackend != "" {
+		t.Errorf("Iceberg forwarding is on by default: %q", cfg.IcebergBackend)
+	}
+	cfg, err = LoadConfig(lookup(map[string]string{"IGLOO_GATEWAY_ICEBERG_BACKEND": "igloo:8181"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IcebergBackend != "igloo:8181" || cfg.IcebergListenAddr != ":8181" {
+		t.Errorf("Iceberg settings: %q on %q", cfg.IcebergBackend, cfg.IcebergListenAddr)
+	}
+	if _, err := LoadConfig(lookup(map[string]string{"IGLOO_GATEWAY_ICEBERG_BACKEND": "igloo"})); err == nil {
+		t.Error("an Iceberg backend without a port was accepted")
 	}
 }

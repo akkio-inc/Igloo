@@ -135,6 +135,18 @@ kubectl --namespace igloo port-forward service/igloo 5433:5432
 psql "host=127.0.0.1 port=5433 user=igloo dbname=igloo"
 ```
 
+### Other engines
+
+Spark, Trino, PyIceberg and other engines use the tables through Igloo's
+[Iceberg REST catalog](../../docs/external-engines.md) on port 8181 of the same
+Service (`kubectl --namespace igloo port-forward service/igloo 8181:8181`,
+or `http://igloo.igloo.svc:8181` inside the cluster), signed in as Igloo
+users. Igloo does not hand out credentials for Azure storage yet, so engines
+get table metadata only: to read or write the files they need an identity of
+their own with access to the filesystem, whose reach Igloo's grants do not
+limit. On the load balancer below, the port serves only over TLS; without a
+certificate it refuses clients outside private networks.
+
 ### Through a load balancer (`expose_sql = true`)
 
 The SQL port is published on a static public IP, and Azure's network security

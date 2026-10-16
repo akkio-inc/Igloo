@@ -118,6 +118,10 @@ run "defaults" {
     target = aws_iam_role.service["catalog"]
     values = { arn = "arn:aws:iam::123456789012:role/igloo-catalog" }
   }
+  override_resource {
+    target = aws_iam_role.engines
+    values = { arn = "arn:aws:iam::123456789012:role/igloo-engines" }
+  }
 
   # --- S3 -------------------------------------------------------------------
 
@@ -307,6 +311,31 @@ run "defaults" {
   assert {
     condition     = yamldecode(helm_release.igloo[0].values[0]).catalog.systemCredentials == "aws"
     error_message = "catalog.systemCredentials must be aws."
+  }
+
+  # --- Storage credentials for other engines --------------------------------
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).storage.s3.stsRoleArn == "arn:aws:iam::123456789012:role/igloo-engines"
+    error_message = "storage.s3.stsRoleArn must be the engines role, so Igloo can vend table-scoped credentials."
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role.engines.assume_role_policy).Statement) == 1 &&
+      jsondecode(aws_iam_role.engines.assume_role_policy).Statement[0].Principal.AWS == "arn:aws:iam::123456789012:role/igloo-igloo" &&
+      jsondecode(aws_iam_role.engines.assume_role_policy).Statement[0].Action == "sts:AssumeRole" &&
+      aws_iam_role.engines.max_session_duration == 3600
+    )
+    error_message = "Only the igloo pods' role may assume the engines role, for at most an hour."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role_policy.engines_warehouse.policy).Statement == jsondecode(aws_iam_role_policy.warehouse["igloo"].policy).Statement &&
+      jsondecode(aws_iam_role_policy.igloo_assume_engines.policy).Statement[0].Resource == "arn:aws:iam::123456789012:role/igloo-engines"
+    )
+    error_message = "The engines role must reach the warehouse prefix only, and the igloo role may assume it."
   }
 
   assert {

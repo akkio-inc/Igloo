@@ -206,6 +206,10 @@
             },
             "existingSecret": {
               "$ref": "#/definitions/secretName"
+            },
+            "stsRoleArn": {
+              "type": "string",
+              "pattern": "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$"
             }
           }
         },
@@ -459,6 +463,20 @@
         }
       }
     },
+    "iceberg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
     "sso": {
       "type": "object",
       "additionalProperties": false,
@@ -642,6 +660,12 @@
           }
         },
         "metricsFrom": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "objectStorageFrom": {
           "type": "array",
           "items": {
             "type": "object"

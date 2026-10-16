@@ -46,6 +46,12 @@ spec:
       targetPort: flight-sql
       protocol: TCP
     {{- end }}
+    {{- if .Values.iceberg.enabled }}
+    - name: iceberg
+      port: {{ .Values.iceberg.port }}
+      targetPort: iceberg
+      protocol: TCP
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -94,6 +100,12 @@ spec:
     - name: flight-sql
       port: 31337
       targetPort: flight-sql
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.iceberg.enabled }}
+    - name: iceberg
+      port: 8181
+      targetPort: iceberg
       protocol: TCP
     {{- end }}
 ---

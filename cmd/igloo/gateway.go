@@ -49,6 +49,7 @@ func serveGateway() error {
 		Backend:        cfg.Backend,
 		ConsoleBackend: cfg.ConsoleBackend,
 		FlightBackend:  cfg.FlightBackend,
+		IcebergBackend: cfg.IcebergBackend,
 		ActivityURL:    cfg.ActivityURL,
 		SuspendAfter:   cfg.SuspendAfter,
 		ResumeTimeout:  cfg.ResumeTimeout,
@@ -61,7 +62,7 @@ func serveGateway() error {
 	if err != nil {
 		return err
 	}
-	errc := make(chan error, 4)
+	errc := make(chan error, 5)
 	go func() { errc <- gw.Serve(ctx, ln) }()
 	if cfg.ConsoleBackend != "" {
 		consoleLn, err := net.Listen("tcp", cfg.ConsoleListenAddr)
@@ -77,6 +78,13 @@ func serveGateway() error {
 		}
 		go func() { errc <- gw.ServeFlight(ctx, flightLn) }()
 	}
+	if cfg.IcebergBackend != "" {
+		icebergLn, err := net.Listen("tcp", cfg.IcebergListenAddr)
+		if err != nil {
+			return err
+		}
+		go func() { errc <- gw.ServeIceberg(ctx, icebergLn) }()
+	}
 
 	var httpSrv *http.Server
 	if cfg.HTTPAddr != "" {
@@ -91,7 +99,8 @@ func serveGateway() error {
 		}()
 	}
 	log.Info("igloo gateway is ready", "sql", ln.Addr().String(), "backend", cfg.Backend,
-		"console_backend", cfg.ConsoleBackend, "flight_backend", cfg.FlightBackend, "compute", cfg.Compute,
+		"console_backend", cfg.ConsoleBackend, "flight_backend", cfg.FlightBackend, "iceberg_backend", cfg.IcebergBackend,
+		"compute", cfg.Compute,
 		"suspend_after", cfg.SuspendAfter, "activity", cfg.ActivityURL)
 
 	select {

@@ -28,10 +28,11 @@ spec:
         - port: http
           protocol: TCP
 ---
-# Igloo pods: the SQL, console and Flight SQL ports and the health/metrics
-# port, nothing else; the console and Flight SQL are open to whoever may
-# reach SQL. With scale to zero, clients come only through the gateway, and
-# the gateway reads /activity on the health/metrics port.
+# Igloo pods: the SQL, console, Flight SQL and Iceberg REST ports and the
+# health/metrics port, nothing else; the console, Flight SQL and the Iceberg
+# REST catalog are open to whoever may reach SQL. With scale to zero, clients
+# come only through the gateway, and the gateway reads /activity on the
+# health/metrics port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -54,6 +55,10 @@ spec:
         {{- end }}
         {{- if .Values.flightSQL.enabled }}
         - port: flight-sql
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.iceberg.enabled }}
+        - port: iceberg
           protocol: TCP
         {{- end }}
       {{- if .Values.scaleToZero.enabled }}
@@ -106,6 +111,10 @@ spec:
         - port: flight-sql
           protocol: TCP
         {{- end }}
+        {{- if .Values.iceberg.enabled }}
+        - port: iceberg
+          protocol: TCP
+        {{- end }}
       {{- with .Values.networkPolicy.sqlFrom }}
       from:
         {{- toYaml . | nindent 8 }}
@@ -147,7 +156,10 @@ spec:
 {{- end }}
 {{- if .Values.objectStorage.enabled }}
 ---
-# Bundled object store: igloo (table data) and Lakekeeper (metadata files) only.
+# Bundled object store: igloo (table data) and Lakekeeper (metadata files),
+# and networkPolicy.objectStorageFrom: engines that read and write table
+# files with the credentials for one table that the Iceberg REST catalog
+# hands them.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -171,5 +183,12 @@ spec:
       ports:
         - port: s3
           protocol: TCP
+    {{- with .Values.networkPolicy.objectStorageFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: s3
+          protocol: TCP
+    {{- end }}
 {{- end }}
 {{- end }}
