@@ -2,9 +2,12 @@
 Distributed-execution workers (docs/distributed-execution.md). Igloo pods
 scale this Deployment up when a statement needs workers and back to zero
 once the workers have been idle for workers.idleAfter; the chart leaves its
-replica count to them after the first install.
+replica count to them after the first install. Each compute pool gets
+workers of its own (pools.yaml renders this for it too), which only its
+igloo pods reach and start, so one client's distributed statements never
+take another pool's workers.
 */ -}}
-{{- if .Values.workers.enabled }}
+{{- define "igloo.workers" -}}
 {{- $name := include "igloo.workersName" . -}}
 {{- $memoryLimit := include "igloo.workerMemoryLimit" . -}}
 apiVersion: apps/v1
@@ -13,7 +16,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
 spec:
   {{- /* Start with none; later upgrades keep whatever Igloo scaled it to. */}}
   {{- if not (lookup "apps/v1" "Deployment" .Release.Namespace $name) }}
@@ -21,11 +24,11 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- include "igloo.selectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+      {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "igloo.podLabels" (dict "root" . "component" "worker") | nindent 8 }}
+        {{- include "igloo.podLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 8 }}
         {{- with .Values.workers.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -159,7 +162,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
                 labelSelector:
                   matchLabels:
-                    {{- include "igloo.selectorLabels" (dict "root" . "component" "worker") | nindent 20 }}
+                    {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 20 }}
         {{- end }}
 ---
 # The workers' addresses (IGLOO_WORKERS): ready workers only.
@@ -169,11 +172,11 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
 spec:
   clusterIP: None
   selector:
-    {{- include "igloo.selectorLabels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
   ports:
     - name: worker
       port: {{ include "igloo.workerPort" . }}
@@ -185,14 +188,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "igloo.componentName" (list . "workers-metrics") }}
+  name: {{ include "igloo.poolComponentName" (list . "workers-metrics") }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "igloo.labels" (dict "root" . "component" "metrics") | nindent 4 }}
 spec:
   type: ClusterIP
   selector:
-    {{- include "igloo.selectorLabels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
   ports:
     - name: http
       port: 8080
@@ -200,14 +203,15 @@ spec:
       protocol: TCP
 ---
 # Igloo pods may read and change the workers' replica count, and nothing
-# else.
+# else. (Every pool's pods use the release's service account, so a pool's
+# pods could resize another pool's workers, but not reach them.)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
@@ -220,7 +224,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -231,25 +235,25 @@ subjects:
     namespace: {{ .Release.Namespace }}
 {{- if .Values.networkPolicy.enabled }}
 ---
-# Workers take tasks from igloo pods only, and serve health checks and
-# metrics.
+# Workers take tasks from their own igloo pods only (those of their compute
+# pool), and serve health checks and metrics.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "worker") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "igloo.selectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+      {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 6 }}
   policyTypes: ["Ingress"]
   ingress:
     - from:
         - podSelector:
             matchLabels:
-              {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 14 }}
+              {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.serverComponent" .)) | nindent 14 }}
       ports:
         - port: worker
           protocol: TCP
@@ -261,4 +265,8 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}
+{{- end -}}
+
+{{- if .Values.workers.enabled }}
+{{ include "igloo.workers" . }}
 {{- end }}

@@ -21,6 +21,11 @@ services:
       IGLOO_DUCKDB_THREADS: ${IGLOO_REPORTING_THREADS:-4}
       # Only the default pool maintains tables.
       IGLOO_MAINTENANCE: "false"
+      # Workers belong to one pool (docs/distributed-execution.md): the
+      # main service's workers are not this pool's. To give it its own, copy
+      # the worker service of docker-compose.yml as worker-reporting and set
+      # IGLOO_WORKERS: worker-reporting here.
+      IGLOO_WORKERS: ""
     ports: !override
       - "${IGLOO_BIND:-127.0.0.1}:${IGLOO_REPORTING_PORT:-5434}:5432"
     volumes: !override

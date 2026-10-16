@@ -21,6 +21,9 @@ pools copy the values, so their pods see the same checksum. */ -}}
 {{- if and $pool.scaleToZero (hasKey $pool.scaleToZero "enabled") }}
 {{- $_ := set $values.scaleToZero "enabled" $pool.scaleToZero.enabled }}
 {{- end }}
+{{- if and $pool.workers (hasKey $pool.workers "enabled") }}
+{{- $_ := set $values.workers "enabled" $pool.workers.enabled }}
+{{- end }}
 {{- $_ := set $values "extraEnv" (concat ($.Values.extraEnv | default list) ($pool.extraEnv | default list)) }}
 {{- $_ := set $values.autoscaling "enabled" false }}
 {{- $_ := set $values.maintenance "enabled" false }}
@@ -49,6 +52,10 @@ automountServiceAccountToken: true
 {{- if $values.networkPolicy.enabled }}
 ---
 {{ include "igloo.serverNetworkPolicies" $ctx }}
+{{- end }}
+{{- if $values.workers.enabled }}
+---
+{{ include "igloo.workers" $ctx }}
 {{- end }}
 {{- end }}
 {{- end }}

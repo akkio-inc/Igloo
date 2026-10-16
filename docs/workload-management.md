@@ -183,6 +183,13 @@ How limits are enforced:
   statement wait until no other reservation is held. To be sure a client's
   queries never compete for memory with another's, give the client its own
   [compute pool](#compute-pools).
+- **Distributed statements too.** A statement whose parts run on
+  [workers](distributed-execution.md) holds its slot and its memory
+  reservation on the replica that runs it, from before its first task to
+  its last row, and its `statement_timeout` ends its tasks on the workers.
+  Workers' memory is the workers' own: a reservation does not reserve it,
+  and statements on a pool's workers share them as statements on one
+  replica share its memory.
 - Limits reach open sessions at once on the replica that changed them and
   within 30 seconds on the others. They are kept in the metadata database,
   next to users and roles, and go when the user or role is dropped. If the
@@ -208,6 +215,16 @@ change it from SQL. Leave table maintenance to the `default` pool
 (`IGLOO_MAINTENANCE=false` elsewhere, which the chart and the Compose
 example set), so other pools run, and are billed, only for their own
 statements.
+
+[Workers](distributed-execution.md) belong to one pool too: the replicas
+of a pool use that pool's workers and no other's, so one client's large
+statements never take another's workers, and a pool's workers stop with it.
+The chart gives every pool workers of its own while `workers.enabled` is
+set (a pool can set `workers` to change them, or `workers.enabled: false`
+to have none); in Docker Compose the example pool runs without workers. The
+history records a distributed statement with the pool of the replica that
+ran it, like any other; the workers' own machines are not in
+`igloo.usage`'s costs yet.
 
 ### With the Helm chart
 
@@ -235,8 +252,9 @@ a metrics Service, NetworkPolicies, and with `scaleToZero.enabled` its own
 gateway, which starts and stops only that pool. Clients connect to the
 pool's Service (`igloo-pool-acme:5432` above); the release's own Service is
 the `default` pool. A pool takes every value it does not set from the
-release's values; `extraEnv` adds to the release's. Pools have no
-HorizontalPodAutoscaler or PodDisruptionBudget of their own. See
+release's values; `extraEnv` adds to the release's. With `workers.enabled`,
+each pool also gets its own worker Deployment, `<release>-pool-<name>-workers`.
+Pools have no HorizontalPodAutoscaler or PodDisruptionBudget of their own. See
 [the chart's README](../deploy/helm/igloo/README.md#compute-pools).
 
 ### With Docker Compose

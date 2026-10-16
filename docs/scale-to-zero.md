@@ -208,9 +208,9 @@ Each [compute pool](workload-management.md#compute-pools) of the chart
 of its Service: one client's pool can stop overnight while another's runs.
 
 With [distributed execution](distributed-execution.md#kubernetes)
-(`workers.enabled`), the gateway also stops the worker Deployment when it
-stops Igloo, so workers never outlive the pods that start them; its service
-account may then patch that Deployment's scale too.
+(`workers.enabled`), the gateway also stops its pool's worker Deployment
+when it stops Igloo, so workers never outlive the pods that start them; its
+service account may then patch that Deployment's scale too.
 
 Pods scaled to zero lose whatever their containers held, including the
 [read cache](operations.md#read-cache) unless `/var/lib/igloo/cache` is on a

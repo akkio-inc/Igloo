@@ -2,7 +2,28 @@
 Distributed-execution workers (docs/distributed-execution.md)
 --------------------------------------------------------------------- */}}
 
-{{- define "igloo.workersName" -}}{{ include "igloo.componentName" (list . "workers") }}{{- end -}}
+{{/* The workers' Deployment and Service: <fullname>-workers, or a compute
+pool's own, <fullname>-pool-<name>-workers. Each pool has workers of its
+own, which only its igloo pods use. */}}
+{{- define "igloo.workersName" -}}{{ include "igloo.poolComponentName" (list . "workers") }}{{- end -}}
+
+{{/* The workers' component label: "worker", or "pool-<name>-worker". */}}
+{{- define "igloo.workerComponent" -}}
+{{- with (get . "Pool") -}}pool-{{ .name }}-worker{{- else -}}worker{{- end -}}
+{{- end -}}
+
+{{/* "true" when the release or any compute pool runs workers. */}}
+{{- define "igloo.anyWorkers" -}}
+{{- $any := .Values.workers.enabled -}}
+{{- range .Values.pools -}}
+{{- if and .workers (hasKey .workers "enabled") -}}
+{{- if .workers.enabled -}}{{- $any = true -}}{{- end -}}
+{{- else if $.Values.workers.enabled -}}
+{{- $any = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $any -}}true{{- end -}}
+{{- end -}}
 
 {{/* Worker port: TLS keyed by the worker secret. */}}
 {{- define "igloo.workerPort" -}}7433{{- end -}}

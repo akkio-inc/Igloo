@@ -348,6 +348,7 @@ pricePerHour: 0
 #     nodeSelector: {}
 #     tolerations: []
 #     affinity: {}
+#     workers: {}             # its own workers, with workers.enabled: overrides, or enabled: false
 #     extraEnv: []
 pools: []
 

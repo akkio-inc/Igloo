@@ -327,6 +327,11 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
   admits only igloo pods to the task port. Port 8080 serves health checks
   and metrics through `<fullname>-workers-metrics`, which the ServiceMonitor
   scrapes too.
+- Every [compute pool](#compute-pools) gets workers of its own,
+  `<fullname>-pool-<name>-workers`, used only by its igloo pods and admitted
+  only from them; a pool can set `workers` (`maxReplicas`, `resources`,
+  `nodeSelector` and the rest), or `workers.enabled: false` to run without.
+  The worker secret is the release's.
 - With `scaleToZero.enabled`, the gateway stops the workers along with the
   igloo pods.
 

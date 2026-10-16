@@ -696,6 +696,9 @@
           },
           "scaleToZero": {
             "$ref": "#/properties/scaleToZero"
+          },
+          "workers": {
+            "$ref": "#/properties/workers"
           }
         }
       }

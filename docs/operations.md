@@ -341,8 +341,8 @@ limiting work:
   `deploy/single-vm/compute-pool.yml` with Docker Compose.
 
 Statements over very large tables can also run in parts on
-[workers](distributed-execution.md), which any replica may use; workers are
-shared by all replicas and stopped once idle.
+[workers](distributed-execution.md). Workers belong to one compute pool,
+whose replicas share them and stop them once idle; each pool has its own.
 
 ## Timeouts and limits
 

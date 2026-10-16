@@ -132,8 +132,9 @@ services:
   # COMPOSE_PROFILES and setting IGLOO_WORKERS=worker in .env. Each runs
   # parts of statements for igloo on its own DuckDB; on one machine they
   # share its cores, so this is for trying distributed execution out and
-  # testing it. Only igloo can reach them, over TLS keyed by
-  # IGLOO_WORKER_SECRET.
+  # testing it. Their task port (7433) is not published on the host: only
+  # containers of this stack reach it, and it serves only holders of
+  # IGLOO_WORKER_SECRET, over TLS keyed by it.
   worker:
     build:
       context: ../..
