@@ -32,15 +32,16 @@ the SQL Service to be called exactly that.
 {{- end -}}
 
 {{- define "igloo.catalogName" -}}{{ include "igloo.componentName" (list . "catalog") }}{{- end -}}
-{{- define "igloo.metricsServiceName" -}}{{ include "igloo.componentName" (list . "metrics") }}{{- end -}}
+{{- define "igloo.metricsServiceName" -}}{{ include "igloo.poolComponentName" (list . "metrics") }}{{- end -}}
 {{- define "igloo.postgresqlName" -}}{{ include "igloo.componentName" (list . "postgresql") }}{{- end -}}
 {{- define "igloo.objectStorageName" -}}{{ include "igloo.componentName" (list . "object-storage") }}{{- end -}}
 {{/* Scale to zero: the gateway, its metrics, and the two Services it reaches
-the igloo pods through (SQL, and every pod's /activity). */}}
-{{- define "igloo.gatewayName" -}}{{ include "igloo.componentName" (list . "gateway") }}{{- end -}}
-{{- define "igloo.gatewayMetricsServiceName" -}}{{ include "igloo.componentName" (list . "gateway-metrics") }}{{- end -}}
-{{- define "igloo.serverServiceName" -}}{{ include "igloo.componentName" (list . "server") }}{{- end -}}
-{{- define "igloo.headlessServiceName" -}}{{ include "igloo.componentName" (list . "headless") }}{{- end -}}
+the igloo pods through (SQL, and every pod's /activity). Each compute pool
+has its own (see _pools.tpl). */}}
+{{- define "igloo.gatewayName" -}}{{ include "igloo.poolComponentName" (list . "gateway") }}{{- end -}}
+{{- define "igloo.gatewayMetricsServiceName" -}}{{ include "igloo.poolComponentName" (list . "gateway-metrics") }}{{- end -}}
+{{- define "igloo.serverServiceName" -}}{{ include "igloo.poolComponentName" (list . "server") }}{{- end -}}
+{{- define "igloo.headlessServiceName" -}}{{ include "igloo.poolComponentName" (list . "headless") }}{{- end -}}
 {{/* The Secret holding everything the chart generates or is given inline. */}}
 {{- define "igloo.secretName" -}}{{ include "igloo.fullname" . }}{{- end -}}
 

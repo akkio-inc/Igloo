@@ -30,14 +30,19 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // Engine runs queries; *engine.Engine implements it.
 type Engine interface {
 	Connect(ctx context.Context) (*duckdb.Conn, error)
+	// ConnectMetered opens a session's connection, with the Meter that
+	// reads what its statements used and closes it.
+	ConnectMetered(ctx context.Context) (*duckdb.Conn, *engine.Meter, error)
 	// CountStatements counts the statements in a query without running them.
 	CountStatements(query string) (int, error)
 	// LoadSchemas makes catalog views list every table's real columns.
@@ -106,6 +111,15 @@ type Options struct {
 	// Warehouse is the warehouse's location, whose files they may not.
 	AllowedLocations []string
 	Warehouse        string
+	// Settings keeps the workload settings of users and roles. Nil means
+	// Grants if it keeps them too.
+	Settings auth.SettingStore
+	// Workload holds statements back for their users' limits. Nil means
+	// a controller that knows no memory budget.
+	Workload *workload.Controller
+	// Pool names the compute pool this replica belongs to, for the
+	// history.
+	Pool string
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -139,7 +153,10 @@ type Server struct {
 	catalog     string
 	tasks       *tasks.Scheduler
 	// gov holds the policies (see protect.go).
-	gov *governance
+	gov      *governance
+	settings auth.SettingStore
+	workload *workload.Controller
+	pool     string
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -185,6 +202,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		audit:       opts.Audit,
 		catalog:     opts.Catalog,
 		tasks:       opts.Tasks,
+		settings:    opts.Settings,
+		workload:    opts.Workload,
+		pool:        opts.Pool,
 		mockSecret:  mockSecret,
 
 		tokens:              opts.Tokens,
@@ -235,6 +255,12 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		SetPolicies(func() *policy.Snapshot)
 	}); ok {
 		e.SetPolicies(func() *policy.Snapshot { return s.gov.snapshot(context.Background()) })
+	}
+	if s.settings == nil {
+		s.settings, _ = s.grants.(auth.SettingStore)
+	}
+	if s.workload == nil {
+		s.workload = workload.NewController(0)
 	}
 	s.sessions.abandoned = s.releaseConn
 
@@ -336,6 +362,10 @@ type session struct {
 	id string
 	// appName is the client's application_name.
 	appName string
+
+	// wl is what the session's statements run under: query tag, limits
+	// and meter (see workload.go).
+	wl workloadState
 }
 
 type sessionKey struct{}
@@ -394,18 +424,18 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	if sess == nil {
 		return ctx, errors.New("session was not authenticated")
 	}
-	conn, err := s.engine.Connect(ctx)
+	conn, meter, err := s.engine.ConnectMetered(ctx)
 	if err != nil {
 		s.sessions.remove(sess)
 		s.releaseConn()
 		return ctx, fmt.Errorf("open session: %w", err)
 	}
-	sess.conn = conn
+	sess.conn, sess.wl.meter, sess.wl.controller = conn, meter, s.workload
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			s.sessions.remove(sess)
 			s.releaseConn()
-			return ctx, errors.Join(fmt.Errorf("set up session catalog: %w", err), conn.Close())
+			return ctx, errors.Join(fmt.Errorf("set up session catalog: %w", err), meter.Close())
 		}
 	}
 	s.metrics.sessionOpened(string(sess.user.Role))
@@ -426,7 +456,7 @@ func (s *Server) closeSession(ctx context.Context) error {
 	for ps := range sess.open {
 		errs = append(errs, sess.release(ps))
 	}
-	return errors.Join(append(errs, sess.conn.Close())...)
+	return errors.Join(append(errs, sess.wl.meter.Close())...)
 }
 
 // release closes the DuckDB statement behind ps.
@@ -504,8 +534,8 @@ var errStatementTimeout = pgerror.WithCode(errors.New("canceling statement due t
 func (sess *session) runCancelable(ctx context.Context, query string, fn func(context.Context) error) error {
 	defer sess.activity.Begin()()
 	var cancel context.CancelFunc
-	if sess.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, sess.timeout)
+	if timeout := sess.statementTimeout(); timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 	} else {
 		ctx, cancel = context.WithCancel(ctx)
 	}
@@ -520,7 +550,14 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		cancel()
 	}()
 
-	err := fn(ctx)
+	// The statement may wait here for its user's limits; the timeout and
+	// cancel requests apply while it does.
+	release, err := sess.admit(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	err = fn(ctx)
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errStatementTimeout
 	}
@@ -576,7 +613,12 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return nil, err
 	}
 
+	s.refreshLimits(ctx, sess, user)
+
 	if stmt, ok := s.statementTimeoutCommand(sess, q.Query); ok {
+		return stmt, nil
+	}
+	if stmt, ok := s.queryTagCommand(sess, q.Query); ok {
 		return stmt, nil
 	}
 
@@ -681,8 +723,15 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			return err
 		}
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
-			return runWithCommitRetry(ctx, sess, st, func() error { return st.run(ctx, args, tw) })
+			return runWithCommitRetry(ctx, sess, st, func() error {
+				return sess.profiled(ctx, st, func() error { return st.run(ctx, args, tw) })
+			})
 		})
+		var used *audit.Resources
+		if err == nil {
+			used = sess.measure(st)
+		}
+		queued := sess.wl.queued
 		if isIcebergNoReplace(err) {
 			if sess.inTx {
 				err = pgerror.WithCode(errors.New("CREATE OR REPLACE TABLE on an Iceberg table cannot run inside a transaction block"),
@@ -707,7 +756,8 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 				s.applyEffect(ctx, sess, st.effect)
 			}
 		}
-		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access, policies: st.policies()})
+		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
+			policies: st.policies(), used: used, queued: queued})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
@@ -980,7 +1030,7 @@ func (s *Server) statementTimeoutCommand(sess *session, query string) (wire.Prep
 	}
 	if showStatementTimeout.MatchString(query) {
 		return respond(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
-			if err := w.Row([]any{formatTimeout(sess.timeout)}); err != nil {
+			if err := w.Row([]any{formatTimeout(sess.statementTimeout())}); err != nil {
 				return err
 			}
 			return w.Complete("SHOW")
@@ -1054,6 +1104,7 @@ func (r *registry) expire(user string) {
 		if sess.user.Name == user {
 			sess.checked = time.Time{}
 			sess.privs.loaded = time.Time{}
+			sess.wl.loaded = time.Time{}
 		}
 		sess.mu.Unlock()
 	}
@@ -1067,6 +1118,7 @@ func (r *registry) expireAll() {
 	for _, sess := range r.byPID {
 		sess.mu.Lock()
 		sess.privs.loaded = time.Time{}
+		sess.wl.loaded = time.Time{}
 		sess.mu.Unlock()
 	}
 }

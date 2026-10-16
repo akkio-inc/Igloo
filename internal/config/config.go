@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -52,6 +53,13 @@ type Config struct {
 	// reporting not ready, after it is asked to stop. It gives load
 	// balancers time to stop sending new connections.
 	ShutdownDelay time.Duration
+	// Pool names the compute pool this replica belongs to: replicas that
+	// share a catalog and metadata database but have their own machines,
+	// so a client or team gets its own compute and bill.
+	Pool string
+	// PricePerHour is what this replica's machine costs an hour, for the
+	// cost estimates of igloo.usage. Zero means unknown.
+	PricePerHour float64
 
 	DuckDB      DuckDB
 	Cache       Cache
@@ -312,6 +320,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.ShutdownDelay = d
 	}
 
+	cfg.Pool = get("IGLOO_POOL", "default")
+	if !validPoolName(cfg.Pool) {
+		addErr("IGLOO_POOL %q must be a name of up to 63 lowercase letters, digits, hyphens and underscores", cfg.Pool)
+	}
+	if v := get("IGLOO_PRICE_PER_HOUR", "0"); v != "0" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+			addErr("IGLOO_PRICE_PER_HOUR must be a price such as 0.58, or 0 for unknown, got %q", v)
+		}
+		cfg.PricePerHour = f
+	}
+
 	cfg.MaxConnections = 100
 	if v := get("IGLOO_MAX_CONNECTIONS", ""); v != "" {
 		n, err := strconv.Atoi(v)
@@ -334,7 +354,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	case "0":
 		cfg.Cache.Dir = ""
 	default:
-		n, err := parseSize(v)
+		n, err := ParseSize(v)
 		if err != nil || n <= 0 {
 			addErr("IGLOO_CACHE_SIZE must be a size such as 50GB or 40GiB, or 0 to turn the cache off, got %q", v)
 		}
@@ -436,10 +456,10 @@ func parseDays(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
-// parseSize parses a number of bytes such as 50GB, 40 GiB or 1073741824.
+// ParseSize parses a number of bytes such as 50GB, 40 GiB or 1073741824.
 // As in DuckDB, KB, MB, GB and TB are powers of 1000, and KiB, MiB, GiB and
 // TiB powers of 1024.
-func parseSize(s string) (int64, error) {
+func ParseSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	i := strings.IndexFunc(s, func(r rune) bool { return (r < '0' || r > '9') && r != '.' })
 	if i < 0 {
@@ -498,6 +518,20 @@ func (s *Storage) parseLocation() error {
 // Root is the warehouse location with a trailing slash, for prefix checks.
 func (s Storage) Root() string {
 	return strings.TrimSuffix(s.Location, "/") + "/"
+}
+
+// validPoolName reports whether name can name a compute pool: also a
+// Kubernetes name, so it may contain hyphens but not start with one.
+func validPoolName(name string) bool {
+	if name == "" || len(name) > 63 || name[0] == '-' {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidName reports whether name is a valid user name: a safe, unquoted,

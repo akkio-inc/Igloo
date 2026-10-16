@@ -16,10 +16,12 @@ import (
 // igloo.query_history and igloo.login_history.
 const HistorySchema = "igloo"
 
-// History serves igloo_query_history() and igloo_login_history().
+// History serves igloo_query_history(), igloo_login_history() and
+// igloo_usage().
 type History interface {
 	Queries(ctx context.Context, v audit.Viewer, p audit.Page) ([]audit.Query, error)
 	Logins(ctx context.Context, v audit.Viewer, p audit.Page) ([]audit.Login, error)
+	Usage(ctx context.Context, v audit.Viewer, since, until time.Time) ([]audit.Usage, error)
 }
 
 // HistoryViewer says whose history a statement may read. ctx is the context
@@ -97,12 +99,16 @@ func (e *Engine) registerHistory(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := e.registerUsage(conn, types); err != nil {
+		return err
+	}
 
 	schema := ident(e.local) + "." + ident(HistorySchema)
 	for _, stmt := range []string{
 		"CREATE SCHEMA IF NOT EXISTS " + schema,
 		"CREATE OR REPLACE VIEW " + schema + ".query_history AS SELECT * FROM system.main.igloo_query_history()",
 		"CREATE OR REPLACE VIEW " + schema + ".login_history AS SELECT * FROM system.main.igloo_login_history()",
+		"CREATE OR REPLACE VIEW " + schema + ".usage AS SELECT * FROM system.main.igloo_usage()",
 	} {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("%s: %w", stmt, err)
@@ -206,7 +212,7 @@ func (s *historySource[T]) load() error {
 }
 
 type historyTypes struct {
-	varchar, timestamp, double, bigint, list duckdb.TypeInfo
+	varchar, timestamp, double, bigint, list, date duckdb.TypeInfo
 }
 
 func newHistoryTypes() (historyTypes, error) {
@@ -222,6 +228,9 @@ func newHistoryTypes() (historyTypes, error) {
 		return t, err
 	}
 	if t.bigint, err = duckdb.NewTypeInfo(duckdb.TYPE_BIGINT); err != nil {
+		return t, err
+	}
+	if t.date, err = duckdb.NewTypeInfo(duckdb.TYPE_DATE); err != nil {
 		return t, err
 	}
 	t.list, err = duckdb.NewListInfo(t.varchar)
@@ -247,6 +256,12 @@ func (t historyTypes) queryColumns() []duckdb.ColumnInfo {
 		{Name: "client_address", T: t.varchar},
 		{Name: "application_name", T: t.varchar},
 		{Name: "policies", T: t.list},
+		{Name: "query_tag", T: t.varchar},
+		{Name: "pool", T: t.varchar},
+		{Name: "queued_ms", T: t.double},
+		{Name: "cpu_time_ms", T: t.double},
+		{Name: "bytes_read", T: t.bigint},
+		{Name: "memory_allocated_bytes", T: t.bigint},
 	}
 }
 
@@ -255,11 +270,18 @@ func queryValues(q audit.Query) []any {
 	if q.Rows >= 0 {
 		rows = q.Rows
 	}
+	// What DuckDB did not measure is NULL.
+	var cpu, read, memory any
+	if r := q.Resources; r != nil {
+		cpu, read, memory = millis(r.CPUTime), r.BytesRead, r.MemoryAllocated
+	}
 	return []any{q.ID, q.SessionID, q.User, q.Role, q.Start, q.Start.Add(q.Duration),
-		float64(q.Duration.Microseconds()) / 1000, q.Outcome, nullString(q.SQLState), rows, q.StatementType, q.Text,
+		millis(q.Duration), q.Outcome, nullString(q.SQLState), rows, q.StatementType, q.Text,
 		nullList(q.TablesRead), nullList(q.TablesWritten), nullString(q.ClientAddress), nullString(q.ApplicationName),
-		nullList(q.Policies)}
+		nullList(q.Policies), nullString(q.QueryTag), nullString(q.Pool), millis(q.Queued), cpu, read, memory}
 }
+
+func millis(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 func (t historyTypes) loginColumns() []duckdb.ColumnInfo {
 	return []duckdb.ColumnInfo{

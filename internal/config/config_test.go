@@ -135,12 +135,12 @@ func TestParseSize(t *testing.T) {
 		"100 MiB":    100 << 20,
 		"2kb":        2000,
 	} {
-		if got, err := parseSize(s); err != nil || got != want {
+		if got, err := ParseSize(s); err != nil || got != want {
 			t.Errorf("%q: got %d, %v; want %d", s, got, err, want)
 		}
 	}
 	for _, s := range []string{"", "GB", "1PB", "1 G B", "-1", "1e3", "9999999TiB"} {
-		if got, err := parseSize(s); err == nil {
+		if got, err := ParseSize(s); err == nil {
 			t.Errorf("%q: accepted as %d", s, got)
 		}
 	}
@@ -344,5 +344,24 @@ func TestTLSRequired(t *testing.T) {
 	}
 	if _, err := Load(env(with(map[string]string{"IGLOO_TLS_REQUIRED": "true"}))); err == nil {
 		t.Error("requiring TLS without a certificate should be an error")
+	}
+}
+
+func TestPoolAndPrice(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil || cfg.Pool != "default" || cfg.PricePerHour != 0 {
+		t.Fatalf("defaults: %q %v %v", cfg.Pool, cfg.PricePerHour, err)
+	}
+	cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_POOL": "acme-reporting", "IGLOO_PRICE_PER_HOUR": "0.58"}))
+	if err != nil || cfg.Pool != "acme-reporting" || cfg.PricePerHour != 0.58 {
+		t.Fatalf("got %q %v %v", cfg.Pool, cfg.PricePerHour, err)
+	}
+	for _, kv := range [][2]string{
+		{"IGLOO_POOL", "Acme"}, {"IGLOO_POOL", "-acme"}, {"IGLOO_POOL", strings.Repeat("a", 64)}, {"IGLOO_POOL", "a b"},
+		{"IGLOO_PRICE_PER_HOUR", "-1"}, {"IGLOO_PRICE_PER_HOUR", "cheap"}, {"IGLOO_PRICE_PER_HOUR", "NaN"},
+	} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", kv[0]: kv[1]})); err == nil {
+			t.Errorf("%s=%s should be refused", kv[0], kv[1])
+		}
 	}
 }

@@ -217,6 +217,11 @@ jobs:
             exit 1
           fi
 
+      - name: Lint and test compute pools
+        run: |
+          helm lint "$CHART" -f deploy/helm/test-values/pools.yaml
+          deploy/helm/template-test.sh
+
       # The release workflow packages the chart this way; catch problems early.
       - name: Package
         run: helm package "$CHART" --version 0.0.0-ci --app-version 0.0.0-ci --destination "$RUNNER_TEMP/chart"

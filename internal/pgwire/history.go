@@ -55,6 +55,10 @@ type queryRecord struct {
 	written []auth.Object
 	// policies names the policies that applied.
 	policies []string
+	// used is what DuckDB measured of the statement, and queued how long
+	// it waited for its user's limits.
+	used   *audit.Resources
+	queued time.Duration
 }
 
 // recordQuery sends a statement to the history.
@@ -75,6 +79,10 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Text:            redactQuery(r.text),
 		ClientAddress:   sess.client,
 		ApplicationName: sess.applicationName(),
+		QueryTag:        sess.queryTag(),
+		Pool:            s.pool,
+		Queued:          r.queued,
+		Resources:       r.used,
 	}
 	if r.err != nil && q.Outcome != audit.OutcomeOK {
 		q.SQLState = string(pgerror.GetCode(pgError(r.err)))

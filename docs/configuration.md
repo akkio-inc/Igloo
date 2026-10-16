@@ -30,6 +30,8 @@ page is the reference they are built on.
 | `IGLOO_STATEMENT_TIMEOUT` | `0` (none) | Cancel statements that run longer, e.g. `30m`. Sessions can change their own limit with `SET statement_timeout`. |
 | `IGLOO_MAX_CONNECTIONS` | `100` | Concurrent client sessions per Igloo process, counting Flight SQL sessions and web console requests while they run. Further logins get `too many clients`. |
 | `IGLOO_SHUTDOWN_DELAY` | `0` | On SIGTERM, keep accepting connections this long (e.g. `5s`) while `/readyz` reports not ready, so load balancers stop routing new connections first. Running queries then get 30 seconds to finish. |
+| `IGLOO_POOL` | `default` | The [compute pool](workload-management.md#compute-pools) this replica belongs to, recorded with every statement in the history and `igloo.usage`: up to 63 lowercase letters, digits, hyphens and underscores. |
+| `IGLOO_PRICE_PER_HOUR` | `0` | What this replica's machine costs an hour, e.g. `0.58`, for the cost estimates of [`igloo.usage`](workload-management.md#usage-and-cost). `0` means unknown, and costs are `NULL`. |
 
 ## Users
 

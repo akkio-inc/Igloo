@@ -322,6 +322,35 @@ scaleToZero:
   tolerations: []
   affinity: {}
 
+# What one igloo pod's machine costs an hour, e.g. 0.58, for the cost
+# estimates of igloo.usage -> IGLOO_PRICE_PER_HOUR. 0: unknown, and costs
+# are NULL.
+pricePerHour: 0
+
+# Compute pools ("virtual warehouses", docs/workload-management.md): more
+# igloo Deployments that share this release's catalog, metadata database and
+# warehouse, each sized, scaled and billed on its own, so a client or team
+# gets its own compute. Each pool gets a Deployment and SQL Service named
+# <fullname>-pool-<name>, a metrics Service, and, with scaleToZero.enabled,
+# its own gateway. Its statements are recorded with its name in
+# igloo.query_history and igloo.usage. Every key but name defaults to the
+# release's own value; extraEnv adds to it. Pools never run table
+# maintenance, and have no HorizontalPodAutoscaler or PodDisruptionBudget.
+#   - name: acme              # 1 to 20 lowercase letters, digits, hyphens
+#     replicaCount: 1
+#     pricePerHour: 1.45
+#     resources:
+#       requests: { cpu: "8", memory: 32Gi }
+#       limits: { memory: 32Gi }
+#     duckdb: {}              # memoryLimit, threads, maxTempSize, spillVolume
+#     scaleToZero: { enabled: true, suspendAfter: 15m }
+#     service: { type: LoadBalancer, loadBalancerSourceRanges: ["203.0.113.0/24"] }
+#     nodeSelector: {}
+#     tolerations: []
+#     affinity: {}
+#     extraEnv: []
+pools: []
+
 # Prometheus metrics are served on port 8080 at /metrics, through the
 # <fullname>-metrics ClusterIP Service (never through the SQL Service), and the
 # scale-to-zero gateway's through <fullname>-gateway-metrics.

@@ -57,6 +57,26 @@ type Query struct {
 	// Policies names the masking and row access policies that applied to
 	// the statement; nil when none did.
 	Policies []string
+	// QueryTag is the tag the statement ran under (SET query_tag or a
+	// default its user's roles set), if any.
+	QueryTag string
+	// Pool is the compute pool of the replica that ran it.
+	Pool string
+	// Queued is how long it waited for its role's limits before starting.
+	Queued time.Duration
+	// Resources is what DuckDB measured while it ran; nil when it did not.
+	Resources *Resources
+}
+
+// Resources is what DuckDB's profiler measured while a statement ran.
+type Resources struct {
+	// CPUTime is the time its operators ran, summed over DuckDB's threads.
+	CPUTime time.Duration
+	// BytesRead is what DuckDB counted of the statement's file reads.
+	BytesRead int64
+	// MemoryAllocated is the memory DuckDB's buffer pool allocated for it
+	// over its whole run: memory freed and allocated again counts again.
+	MemoryAllocated int64
 }
 
 // Login is one login attempt.
@@ -116,6 +136,12 @@ type Store interface {
 	// Prune deletes records older than before. Stores shared by several
 	// replicas let one of them do it at a time.
 	Prune(ctx context.Context, before time.Time) error
+	// WriteCompute adds to the time replicas ran (see usage.go).
+	WriteCompute(ctx context.Context, cs []Compute) error
+	// Usage sums the statements v may see by day, pool, user, role and
+	// query tag, from since (inclusive) to until, either of which may be
+	// zero.
+	Usage(ctx context.Context, v Viewer, since, until time.Time) ([]Usage, error)
 	Close()
 }
 
@@ -150,6 +176,10 @@ type Log struct {
 	direct bool
 	queue  chan any
 
+	// compute records how long this replica runs, for the cost estimates
+	// of igloo.usage; see usage.go.
+	compute computeClock
+
 	dropMu   sync.Mutex
 	dropped  int
 	lastWarn time.Time
@@ -182,6 +212,10 @@ type Options struct {
 	Retention time.Duration
 	// Metrics may be nil.
 	Metrics *Metrics
+	// Pool is the compute pool this replica belongs to, and PricePerHour
+	// what its machine costs an hour, or zero if unknown.
+	Pool         string
+	PricePerHour float64
 }
 
 // New records into store. Run must be running for records to reach a
@@ -195,6 +229,7 @@ func New(store Store, opts Options, log *slog.Logger) *Log {
 		log:       log.With("component", "audit"),
 		direct:    direct,
 		queue:     make(chan any, queueSize),
+		compute:   newComputeClock(opts.Pool, opts.PricePerHour),
 	}
 }
 
@@ -260,6 +295,8 @@ func (l *Log) Run(ctx context.Context) {
 	// replicas starting together do not all try at once.
 	prune := time.NewTimer(time.Minute + rand.N(time.Minute))
 	defer prune.Stop()
+	compute := time.NewTicker(computeInterval)
+	defer compute.Stop()
 
 	var batch []any
 	write := func() {
@@ -281,6 +318,8 @@ func (l *Log) Run(ctx context.Context) {
 		case <-prune.C:
 			l.prune(ctx)
 			prune.Reset(pruneInterval)
+		case <-compute.C:
+			l.writeCompute(time.Now())
 		case <-ctx.Done():
 			for drained := false; !drained; {
 				select {
@@ -292,6 +331,7 @@ func (l *Log) Run(ctx context.Context) {
 			}
 			write()
 			l.retryDue(context.Background(), time.Now(), true)
+			l.writeCompute(time.Now())
 			return
 		}
 	}

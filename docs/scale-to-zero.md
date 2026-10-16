@@ -202,6 +202,10 @@ statement running on any replica keeps them all up. If Igloo also has a
 HorizontalPodAutoscaler (`autoscaling.enabled`), it pauses at zero replicas
 and takes over again after a start.
 
+Each [compute pool](workload-management.md#compute-pools) of the chart
+(`pools`) can scale to zero on its own, with a gateway of its own in front
+of its Service: one client's pool can stop overnight while another's runs.
+
 Pods scaled to zero lose whatever their containers held, including the
 [read cache](operations.md#read-cache) unless `/var/lib/igloo/cache` is on a
 PersistentVolumeClaim, so the first queries after a start read every table

@@ -3,10 +3,9 @@ Ingress rules only. Egress stays open: pods need DNS, PostgreSQL, object
 storage and cloud identity endpoints, which differ per cloud.
 */ -}}
 {{- if .Values.networkPolicy.enabled }}
-{{- $server := include "igloo.selectorLabels" (dict "root" . "component" "server") -}}
 {{- $catalog := include "igloo.selectorLabels" (dict "root" . "component" "catalog") -}}
-{{- $gateway := include "igloo.selectorLabels" (dict "root" . "component" "gateway") -}}
-# Lakekeeper has no authentication: only igloo pods may call it.
+# Lakekeeper has no authentication: only igloo pods may call it, those of
+# every compute pool included.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -21,13 +20,81 @@ spec:
   policyTypes: ["Ingress"]
   ingress:
     - from:
-        - podSelector:
-            matchLabels:
-              {{- $server | nindent 14 }}
+        {{- include "igloo.enginePeers" . | nindent 8 }}
       ports:
         - port: http
           protocol: TCP
 ---
+{{ include "igloo.serverNetworkPolicies" . }}
+{{- if .Values.postgresql.enabled }}
+---
+# Bundled PostgreSQL: igloo (users) and Lakekeeper (catalog) only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "igloo.postgresqlName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "postgresql") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "postgresql") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        {{- include "igloo.enginePeers" . | nindent 8 }}
+        - podSelector:
+            matchLabels:
+              {{- $catalog | nindent 14 }}
+      ports:
+        - port: postgresql
+          protocol: TCP
+{{- end }}
+{{- if .Values.objectStorage.enabled }}
+---
+# Bundled object store: igloo (table data) and Lakekeeper (metadata files),
+# and networkPolicy.objectStorageFrom: engines that read and write table
+# files with the credentials for one table that the Iceberg REST catalog
+# hands them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "igloo.objectStorageName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "object-storage") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "object-storage") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        {{- include "igloo.enginePeers" . | nindent 8 }}
+        - podSelector:
+            matchLabels:
+              {{- $catalog | nindent 14 }}
+      ports:
+        - port: s3
+          protocol: TCP
+    {{- with .Values.networkPolicy.objectStorageFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: s3
+          protocol: TCP
+    {{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* The policies of one igloo Deployment and its gateway: the release's,
+or a compute pool's. */ -}}
+{{- define "igloo.serverNetworkPolicies" -}}
+{{- $component := include "igloo.serverComponent" . -}}
+{{- $server := include "igloo.selectorLabels" (dict "root" . "component" $component) -}}
+{{- $gatewayComponent := include "igloo.gatewayComponent" . -}}
+{{- $gateway := include "igloo.selectorLabels" (dict "root" . "component" $gatewayComponent) -}}
 # Igloo pods: the SQL, console, Flight SQL and Iceberg REST ports and the
 # health/metrics port, nothing else; the console, Flight SQL and the Iceberg
 # REST catalog are open to whoever may reach SQL. With scale to zero, clients
@@ -36,10 +103,10 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "igloo.fullname" . }}
+  name: {{ include "igloo.serverName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" $component) | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
@@ -93,7 +160,7 @@ metadata:
   name: {{ include "igloo.gatewayName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" $gatewayComponent) | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
@@ -127,68 +194,4 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}
-{{- if .Values.postgresql.enabled }}
----
-# Bundled PostgreSQL: igloo (users) and Lakekeeper (catalog) only.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{ include "igloo.postgresqlName" . }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "igloo.labels" (dict "root" . "component" "postgresql") | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      {{- include "igloo.selectorLabels" (dict "root" . "component" "postgresql") | nindent 6 }}
-  policyTypes: ["Ingress"]
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              {{- $server | nindent 14 }}
-        - podSelector:
-            matchLabels:
-              {{- $catalog | nindent 14 }}
-      ports:
-        - port: postgresql
-          protocol: TCP
-{{- end }}
-{{- if .Values.objectStorage.enabled }}
----
-# Bundled object store: igloo (table data) and Lakekeeper (metadata files),
-# and networkPolicy.objectStorageFrom: engines that read and write table
-# files with the credentials for one table that the Iceberg REST catalog
-# hands them.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{ include "igloo.objectStorageName" . }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "igloo.labels" (dict "root" . "component" "object-storage") | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      {{- include "igloo.selectorLabels" (dict "root" . "component" "object-storage") | nindent 6 }}
-  policyTypes: ["Ingress"]
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              {{- $server | nindent 14 }}
-        - podSelector:
-            matchLabels:
-              {{- $catalog | nindent 14 }}
-      ports:
-        - port: s3
-          protocol: TCP
-    {{- with .Values.networkPolicy.objectStorageFrom }}
-    - from:
-        {{- toYaml . | nindent 8 }}
-      ports:
-        - port: s3
-          protocol: TCP
-    {{- end }}
-{{- end }}
-{{- end }}
+{{- end -}}

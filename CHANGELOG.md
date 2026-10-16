@@ -226,5 +226,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Server), each able to pull Igloo from a mirror or private registry.
 - A price-performance benchmark (`bench/`) that runs the same TPC-H queries
   on Igloo, Snowflake and Databricks and prices them by each one's billing.
+- Workload management and chargeback (docs/workload-management.md): query
+  tags (`SET query_tag`, and defaults per user or role), recorded with each
+  statement's compute pool, CPU time, bytes read, memory allocated and time
+  waiting in `igloo.query_history`; `igloo.usage`, the history summed by
+  day, pool, user, role and tag with an estimated compute cost from each
+  replica's running time and `IGLOO_PRICE_PER_HOUR`; and
+  per-user and per-role limits (`ALTER ROLE ... SET statement_timeout`,
+  `max_concurrent_statements`, `memory_limit`) under which statements wait
+  in line, in arrival order, on each replica.
+- Compute pools ("virtual warehouses") that share the catalog, users and
+  history but run on their own machines and scale to zero on their own:
+  `pools` in the Helm chart (a Deployment, Services and optional gateway per
+  pool), and `deploy/single-vm/compute-pool.yml` for Docker Compose.
+  `IGLOO_POOL` names a replica's pool in the history and usage.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

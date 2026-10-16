@@ -225,6 +225,9 @@ FROM igloo.login_history WHERE result = 'failure';
 | `tables_read`, `tables_written` | Catalog tables the statement used, when Igloo checked them against grants; `NULL` otherwise |
 | `client_address`, `application_name` | Where the session came from |
 | `policies` | The masking and row access policies that applied to the statement; `NULL` when none did |
+| `query_tag`, `pool` | The session's [query tag](workload-management.md#query-tags), and the compute pool of the replica that ran it |
+| `queued_ms` | Time it waited for its [role limits](workload-management.md#role-limits) |
+| `cpu_time_ms`, `bytes_read`, `memory_allocated_bytes` | What DuckDB measured while it ran; `NULL` for statements DuckDB did not run and ones that failed (see [resources](workload-management.md#resources-in-the-history)) |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,
@@ -239,6 +242,28 @@ History is kept for `IGLOO_AUDIT_RETENTION` (90 days by default). Rows arrive
 in the background, usually within a second or two of the statement ending.
 Reading the views fetches history page by page, so `LIMIT` without `ORDER BY`
 reads only the newest pages; filters and sorts read everything visible.
+
+`igloo.usage` sums the history by day, compute pool, user, role and query
+tag, with each group's share of the day's compute cost; see
+[usage and cost](workload-management.md#usage-and-cost).
+
+## Query tags and role settings
+
+```sql
+SET query_tag = 'client:acme;campaign:q4';         -- recorded with every statement
+ALTER ROLE analysts SET max_concurrent_statements = 4;
+ALTER ROLE analysts SET statement_timeout = '15min';
+ALTER ROLE analysts SET memory_limit = '8GB';
+ALTER USER ana SET query_tag = 'client:acme';      -- a default for her sessions
+ALTER ROLE analysts RESET ALL;
+SHOW ROLE SETTINGS;
+```
+
+`ALTER ROLE` takes a custom role, a built-in role (`reader` means every
+reader) or a user, and only admins may run it. The settings are
+`query_tag`, `statement_timeout`, `max_concurrent_statements` and
+`memory_limit`; [workload management](workload-management.md) says how
+they combine and how they are enforced.
 
 ## Time travel
 
@@ -373,12 +398,17 @@ the same users and grants; see [other engines](external-engines.md).
 - `query()` and `json_execute_serialized_sql()`, which run SQL given as a
   string, are refused for everyone, admins included: Igloo checks a
   statement's text, and cannot check SQL that a statement builds. Write the
-  query itself instead. `query_table()` is limited to admins.
+  query itself instead. `query_table()` is limited to admins, and needs its
+  table name written out as text, not built at run time.
 - The spatial extension's GDAL readers and writers (`ST_Read`,
   `ST_Read_Meta`, `FROM 'x.gpkg'`, `FROM 'x.fgb'`, `COPY ... (FORMAT GDAL)`)
   are refused for everyone too: GDAL opens files that a dataset names
   outside the sandbox. `ST_ReadSHP`, `ST_ReadOSM` and GeoParquet work; see
   [media analytics](media-analytics.md#loading-boundaries).
+- `ALTER ROLE ... SET` and `ALTER USER ... SET` take Igloo's
+  [workload settings](#query-tags-and-role-settings) only, not other
+  PostgreSQL parameters. `SET query_tag` and Snowflake's `ALTER SESSION SET
+  QUERY_TAG` set the session's query tag.
 - Session settings that PostgreSQL drivers send on connect
   (`application_name`, `extra_float_digits`, `DateStyle` and similar) are
   accepted and ignored. `statement_timeout` is honored.

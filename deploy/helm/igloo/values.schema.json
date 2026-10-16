@@ -622,6 +622,84 @@
         }
       }
     },
+    "pricePerHour": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Hourly price of one igloo pod's machine, for igloo.usage; 0 for unknown."
+    },
+    "pools": {
+      "type": "array",
+      "description": "Compute pools: more igloo Deployments sharing the catalog and metadata database.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z]([-a-z0-9]{0,18}[a-z0-9])?$",
+            "description": "1 to 20 lowercase letters, digits and hyphens, starting with a letter."
+          },
+          "replicaCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pricePerHour": {
+            "$ref": "#/properties/pricePerHour"
+          },
+          "resources": {
+            "$ref": "#/definitions/resources"
+          },
+          "duckdb": {
+            "$ref": "#/properties/duckdb"
+          },
+          "statementTimeout": {
+            "$ref": "#/properties/statementTimeout"
+          },
+          "maxConnections": {
+            "$ref": "#/properties/maxConnections"
+          },
+          "extraEnv": {
+            "$ref": "#/definitions/envList"
+          },
+          "podLabels": {
+            "$ref": "#/definitions/stringMap"
+          },
+          "podAnnotations": {
+            "$ref": "#/definitions/stringMap"
+          },
+          "nodeSelector": {
+            "$ref": "#/definitions/stringMap"
+          },
+          "tolerations": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "affinity": {
+            "type": "object"
+          },
+          "topologySpreadConstraints": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "priorityClassName": {
+            "type": "string"
+          },
+          "service": {
+            "$ref": "#/properties/service"
+          },
+          "scaleToZero": {
+            "$ref": "#/properties/scaleToZero"
+          }
+        }
+      }
+    },
     "metrics": {
       "type": "object",
       "additionalProperties": false,

@@ -1,0 +1,36 @@
+# A second compute pool on this machine (docs/workload-management.md): an
+# igloo service named reporting that shares the catalog, the metadata
+# database and the warehouse with the main one, with memory, threads and a
+# port of its own. Statements it runs are recorded with pool "reporting" in
+# igloo.query_history and igloo.usage. Needs Compose 2.24 or later:
+#
+#   docker compose -f docker-compose.yml -f compute-pool.yml up -d
+#   psql "host=127.0.0.1 port=5434 user=igloo dbname=igloo"
+#
+# Copy the service to add more pools; give each its own name, port and
+# volumes, and memory and threads that, together, fit the machine.
+services:
+  igloo-reporting:
+    extends:
+      file: docker-compose.yml
+      service: igloo
+    environment:
+      IGLOO_POOL: reporting
+      IGLOO_PRICE_PER_HOUR: ${IGLOO_REPORTING_PRICE_PER_HOUR:-0}
+      IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_REPORTING_MEMORY_LIMIT:-4GB}
+      IGLOO_DUCKDB_THREADS: ${IGLOO_REPORTING_THREADS:-4}
+      # Only the default pool maintains tables.
+      IGLOO_MAINTENANCE: "false"
+    ports: !override
+      - "${IGLOO_BIND:-127.0.0.1}:${IGLOO_REPORTING_PORT:-5434}:5432"
+    volumes: !override
+      - igloo-reporting-spill:/var/lib/igloo/tmp
+      - igloo-reporting-cache:/var/lib/igloo/cache
+      - ./tls:/tls:ro
+    depends_on:
+      igloo:
+        condition: service_healthy
+
+volumes:
+  igloo-reporting-spill:
+  igloo-reporting-cache:

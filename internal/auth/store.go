@@ -269,7 +269,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrationLock); err != nil {
 			return err
 		}
-		for _, m := range migrations {
+		for _, m := range append(migrations, settingsMigrations...) {
 			if _, err := tx.Exec(ctx, m); err != nil {
 				return err
 			}

@@ -183,10 +183,11 @@ type GrantStore interface {
 // MemoryGrants is a GrantStore in memory, for tests and for servers without
 // a metadata database. Users is consulted to check that grantees exist.
 type MemoryGrants struct {
-	users  Store
-	mu     sync.Mutex
-	roles  map[string]*CustomRole
-	grants []Grant
+	users    Store
+	mu       sync.Mutex
+	roles    map[string]*CustomRole
+	grants   []Grant
+	settings []Setting
 }
 
 // NewMemoryGrants returns an empty store whose users come from users.
@@ -215,6 +216,7 @@ func (m *MemoryGrants) DropRole(_ context.Context, name string) error {
 	}
 	delete(m.roles, name)
 	m.removeGrants(func(g Grant) bool { return g.GranteeType == GranteeRole && g.Grantee == name })
+	m.forgetSettings(GranteeRole, name)
 	return nil
 }
 
@@ -326,6 +328,7 @@ func (m *MemoryGrants) ForgetUser(_ context.Context, user string) error {
 		r.Members = slices.DeleteFunc(r.Members, func(u string) bool { return u == user })
 	}
 	m.removeGrants(func(g Grant) bool { return g.GranteeType == GranteeUser && g.Grantee == user })
+	m.forgetSettings(GranteeUser, user)
 	return nil
 }
 

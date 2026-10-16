@@ -14,6 +14,7 @@ type MemoryStore struct {
 	mu         sync.Mutex
 	queries    []Query
 	logins     []Login
+	compute    []Compute
 	maxQueries int
 	maxLogins  int
 }
@@ -75,6 +76,7 @@ func (m *MemoryStore) Prune(_ context.Context, before time.Time) error {
 	defer m.mu.Unlock()
 	m.queries = dropOlder(m.queries, func(q Query) bool { return q.Start.Before(before) })
 	m.logins = dropOlder(m.logins, func(x Login) bool { return x.Time.Before(before) })
+	m.compute = dropOlder(m.compute, func(c Compute) bool { return c.Day.Add(24 * time.Hour).Before(before) })
 	return nil
 }
 

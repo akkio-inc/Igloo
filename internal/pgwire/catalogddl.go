@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -183,8 +182,7 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 
 	start := time.Now()
 	target := []auth.Object{{Schema: schema, Table: name}}
-	if isView && !view.drop && strings.EqualFold(schema, engine.HistorySchema) &&
-		slices.ContainsFunc(historyViews, func(v string) bool { return strings.EqualFold(v, name) }) {
+	if isView && !view.drop && strings.EqualFold(schema, engine.HistorySchema) && isHistoryView(name) {
 		err := pgerror.WithCode(fmt.Errorf("%s.%s is reserved for Igloo's own views", schema, name), codes.ReservedName)
 		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
 		return nil, true, err

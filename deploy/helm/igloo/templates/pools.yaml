@@ -1,0 +1,54 @@
+{{- /*
+Compute pools (docs/workload-management.md): for each entry of .Values.pools,
+an igloo Deployment, its SQL and metrics Services and, with
+scaleToZero.enabled, its own gateway, all rendered by the templates of the
+release's own Deployment from the release's values with the pool's on top.
+Pools share the catalog, the metadata database (users, grants, history) and
+the warehouse. Only the release's own Deployment maintains tables, so a pool
+runs, and is billed, only for its own clients' statements.
+*/ -}}
+{{- if .Values.pools }}
+{{- include "igloo.validatePools" . }}
+{{- /* Generated secrets are computed once per render; do it before the
+pools copy the values, so their pods see the same checksum. */ -}}
+{{- $_ := include "igloo.secretData" . }}
+{{- range $pool := .Values.pools }}
+{{- $values := mergeOverwrite (deepCopy $.Values) (omit $pool "name" "extraEnv") }}
+{{- /* mergeOverwrite skips zeros and false; a pool may still set them. */ -}}
+{{- range $key := list "replicaCount" "pricePerHour" }}
+{{- if hasKey $pool $key }}{{ $_ := set $values $key (get $pool $key) }}{{ end }}
+{{- end }}
+{{- if and $pool.scaleToZero (hasKey $pool.scaleToZero "enabled") }}
+{{- $_ := set $values.scaleToZero "enabled" $pool.scaleToZero.enabled }}
+{{- end }}
+{{- $_ := set $values "extraEnv" (concat ($.Values.extraEnv | default list) ($pool.extraEnv | default list)) }}
+{{- $_ := set $values.autoscaling "enabled" false }}
+{{- $_ := set $values.maintenance "enabled" false }}
+{{- $ctx := dict "Values" $values "Release" $.Release "Chart" $.Chart "Capabilities" $.Capabilities "Template" $.Template "Files" $.Files "Pool" $pool }}
+{{- if and $values.scaleToZero.enabled (lt (int (include "igloo.scaleToZeroReplicas" $ctx)) 1) }}
+{{- fail (printf "igloo: pool %q scales to zero but would start no pods: set its replicaCount or scaleToZero.replicas to at least 1" $pool.name) }}
+{{- end }}
+---
+{{ include "igloo.serverDeployment" $ctx }}
+---
+{{ include "igloo.services" $ctx }}
+{{- if $values.scaleToZero.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "igloo.gatewayName" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" $ctx "component" (include "igloo.gatewayComponent" $ctx)) | nindent 4 }}
+# The pool's gateway scales the pool's Deployment, and nothing else.
+automountServiceAccountToken: true
+---
+{{ include "igloo.gateway" $ctx }}
+{{- end }}
+{{- if $values.networkPolicy.enabled }}
+---
+{{ include "igloo.serverNetworkPolicies" $ctx }}
+{{- end }}
+{{- end }}
+{{- end }}

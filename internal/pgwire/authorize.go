@@ -191,8 +191,9 @@ var fixedCacheSettings = []string{
 // them, a reader could call functions only admins may call, and an admin
 // could change the settings below. Without them, every function and
 // setting a statement uses is named in its text. (query_table() takes only
-// table names and is admin-only, see requiredRole.) Spatial's GDAL readers
-// and writers open files outside the sandbox (see gdalUse).
+// table names and is admin-only, see requiredRole; a name it builds at run
+// time is refused here, see queryTableComputed.) Spatial's GDAL readers and
+// writers open files outside the sandbox (see gdalUse).
 func forbidden(query string) error {
 	words := sqllex.CodeWords(query)
 	var err error
@@ -205,6 +206,9 @@ func forbidden(query string) error {
 		err = fmt.Errorf("permission denied: %s goes through GDAL, which can open files and URLs outside Igloo's sandbox; "+
 			"read GeoParquet with read_parquet, shapefiles with ST_ReadSHP, or GeoJSON with read_json and ST_GeomFromGeoJSON instead",
 			gdalUse(query))
+	case queryTableComputed(query):
+		err = errors.New("permission denied: query_table needs a table name written out as text; a name built at run time " +
+			"could resolve to a file, including spatial's GDAL formats, that reads outside Igloo's sandbox")
 	default:
 		for _, name := range fixedCacheSettings {
 			if mentionsFunction(query, words, name) {
@@ -239,6 +243,37 @@ func callsQuery(query string) bool {
 		if j == 0 || !namesTableBefore[toks[j-1].keyword] {
 			return true
 		}
+	}
+	return false
+}
+
+// queryTableComputed reports whether query calls DuckDB's query_table
+// function with a name it builds at run time rather than writes out. The
+// function turns its argument into a table reference, which can be a path a
+// replacement scan opens, including spatial's GDAL formats (see gdalUse).
+// A name written as string literals is visible to gdalUse; one built from a
+// variable, a concatenation, a column or a subquery is not, so Igloo cannot
+// tell whether it reaches GDAL and refuses it. A name written out as one
+// literal, or a list of literals (query_table(['a', 'b'])), is allowed.
+func queryTableComputed(query string) bool {
+	toks := sqlTokens(query)
+	for i, t := range toks {
+		if t.name != "query_table" || i+1 >= len(toks) || toks[i+1].punct != '(' {
+			continue
+		}
+		// Scan the argument: a written-out name is string literals (which
+		// sqlTokens shows as a ' token), perhaps in a [ ] list. A name, an
+		// operator or a nested call means it is computed.
+		for _, a := range toks[i+2:] {
+			switch a.punct {
+			case ')':
+				return false
+			case '\'', '[', ']', ',':
+			default:
+				return true
+			}
+		}
+		return true // no closing parenthesis: treat as computed
 	}
 	return false
 }

@@ -42,6 +42,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/scim"
 	"github.com/akkio-inc/igloo/internal/sso"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -173,7 +174,8 @@ func serve() error {
 	historyDone := make(chan struct{})
 	historyCtx, stopHistory := context.WithCancel(context.Background())
 	if historyStore != nil {
-		history = audit.New(historyStore, audit.Options{Retention: cfg.Audit.Retention, Metrics: audit.NewMetrics(reg)}, log)
+		history = audit.New(historyStore, audit.Options{Retention: cfg.Audit.Retention, Metrics: audit.NewMetrics(reg),
+			Pool: cfg.Pool, PricePerHour: cfg.PricePerHour}, log)
 		eng.SetHistory(history, pgwire.HistoryViewer)
 		go func() {
 			defer close(historyDone)
@@ -196,6 +198,10 @@ func serve() error {
 	if err != nil {
 		return err
 	}
+	// Memory reservations for role limits come out of DuckDB's memory.
+	limits := workload.NewController(eng.MemoryLimit(ctx))
+	reg.MustRegister(limits.Metrics()...)
+
 	opts := pgwire.Options{
 		Users:               users,
 		TLS:                 tlsConfig,
@@ -214,6 +220,8 @@ func serve() error {
 		Policies:            policies,
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
+		Workload:            limits,
+		Pool:                cfg.Pool,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -319,7 +327,7 @@ func serve() error {
 		}()
 	}
 	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr,
-		"flight_sql", cfg.FlightAddr, "iceberg", icebergAddr)
+		"flight_sql", cfg.FlightAddr, "iceberg", icebergAddr, "pool", cfg.Pool)
 
 	select {
 	case err := <-errc:

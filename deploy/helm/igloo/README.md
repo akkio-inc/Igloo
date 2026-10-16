@@ -251,6 +251,55 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
   `igloo_gateway_resumes_total{result="failure"}`: clients cannot connect
   while starts fail.
 
+## Compute pools
+
+`pools` adds compute pools, "virtual warehouses": more igloo Deployments
+that share the release's catalog, metadata database (users, grants, query
+history) and warehouse, each with its own size, replicas and scale-to-zero
+settings, so a client or team gets compute, and a bill, of its own
+([workload management](../../../docs/workload-management.md#compute-pools)).
+
+```yaml
+pricePerHour: 0.68                 # the release's own pods: the "default" pool
+pools:
+  - name: acme
+    replicaCount: 1
+    pricePerHour: 2.72
+    resources:
+      requests: { cpu: "16", memory: 64Gi }
+      limits: { memory: 64Gi }
+    scaleToZero: { enabled: true, suspendAfter: 15m }
+    nodeSelector: { node-pool: igloo-large }
+```
+
+```
+clients of acme ──> Service igloo-pool-acme ──> gateway ──> Deployment igloo-pool-acme (0 to N pods) ─┐
+other clients   ──> Service igloo ─────────────────────────> Deployment igloo (the default pool) ─────┴─> catalog, metadata database, warehouse
+```
+
+- Each pool gets a Deployment and SQL Service named `<release>-pool-<name>`,
+  a `<release>-pool-<name>-metrics` Service (scraped by the ServiceMonitor
+  too), NetworkPolicies, and with `scaleToZero.enabled` its own gateway,
+  Services and RBAC, which start and stop only that pool. Its pods have the
+  component label `pool-<name>`, so no Service or Deployment of another pool
+  selects them; the catalog, bundled PostgreSQL and object store accept
+  them.
+- A pool takes every value it does not set from the release's: `image`,
+  `admin`, storage, databases, TLS, `console`, `networkPolicy`, `service`,
+  `duckdb`, `resources`, scheduling and the rest. `extraEnv` adds to the
+  release's. Pools can set `replicaCount`, `pricePerHour`, `resources`,
+  `duckdb`, `statementTimeout`, `maxConnections`, `extraEnv`, `podLabels`,
+  `podAnnotations`, `nodeSelector`, `tolerations`, `affinity`,
+  `topologySpreadConstraints`, `priorityClassName`, `service` and
+  `scaleToZero`.
+- Pods know their pool from `IGLOO_POOL`, and record it with every
+  statement in `igloo.query_history` and `igloo.usage`. Set `pricePerHour`
+  per pool to what its nodes cost, for the cost estimates.
+- Pools never run table maintenance, which stays with the release's own
+  Deployment, and have no HorizontalPodAutoscaler or PodDisruptionBudget.
+- Names are 1 to 20 lowercase letters, digits and hyphens; `default` is the
+  release's own Deployment.
+
 ## Values
 
 | Key | Default | Description |
@@ -336,6 +385,8 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `scaleToZero.replicas` | `null` | Igloo pods the gateway starts; null: `replicaCount`, or `autoscaling.minReplicas` with `autoscaling.enabled` |
 | `scaleToZero.resources` | `50m` / `64Mi`, limit `256Mi` | Gateway container |
 | `scaleToZero.nodeSelector`, `tolerations`, `affinity` | | Gateway pod scheduling, separate from igloo's |
+| `pricePerHour` | `0` | `IGLOO_PRICE_PER_HOUR`: what one igloo pod's machine costs an hour, for `igloo.usage`; `0` is unknown |
+| `pools` | `[]` | [Compute pools](#compute-pools), each with `name` and the overrides listed there |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
@@ -368,6 +419,10 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 early.
 
 ## Testing the chart
+
+`deploy/helm/template-test.sh` renders the chart with compute pools
+(`test-values/pools.yaml`) and checks the objects it makes, and that it
+refuses pools that cannot work; it needs only helm.
 
 `deploy/helm/e2e.sh` creates a kind cluster named `igloo-e2e`, builds and loads
 `igloo:dev`, installs the chart in bundled mode with two replicas and checks

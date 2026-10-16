@@ -108,6 +108,10 @@ func (failingHistory) Logins(context.Context, audit.Viewer, audit.Page) ([]audit
 	return nil, errors.New("database down")
 }
 
+func (failingHistory) Usage(context.Context, audit.Viewer, time.Time, time.Time) ([]audit.Usage, error) {
+	return nil, errors.New("database down")
+}
+
 func TestHistoryErrors(t *testing.T) {
 	ctx := context.Background()
 	e, err := Open(ctx, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))

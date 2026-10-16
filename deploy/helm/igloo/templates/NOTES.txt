@@ -59,6 +59,13 @@ connection waits while igloo starts (up to {{ .Values.scaleToZero.resumeTimeout 
 connect timeout to match. Open sessions end when igloo stops. Gateway
 metrics: http://{{ include "igloo.gatewayMetricsServiceName" . }}.{{ $ns }}.svc:8080/metrics
 {{- end }}
+{{- with .Values.pools }}
+
+Compute pools, each with its own igloo pods, sharing the catalog and users:
+{{- range . }}
+  {{ .name }}: {{ include "igloo.componentName" (list $ (printf "pool-%s" .name)) }}.{{ $ns }}.svc:{{ $.Values.service.port }}
+{{- end }}
+{{- end }}
 {{- if and (eq .Values.service.type "LoadBalancer") (not .Values.tls.existingSecret) }}
 
 WARNING: service.type is LoadBalancer but TLS is off (tls.existingSecret is

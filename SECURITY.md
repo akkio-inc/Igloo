@@ -84,7 +84,9 @@ reference for every setting mentioned here.
   may run SQL built from strings (`query()`, `json_execute_serialized_sql()`),
   which a check of the statement's text cannot see into, or move the read
   cache or change what it caches; its other functions and settings, and
-  `query_table()`, are limited to admins.
+  `query_table()`, are limited to admins. `query_table()` needs its table
+  name written out as text, since a name built at run time could resolve to
+  a file, GDAL formats included, that a text check cannot see.
 - **Grants.** Admins grant `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables
   and schemas, and `CREATE` on schemas, to users or to custom roles. A
   statement the built-in role does not allow runs only if every catalog
@@ -128,9 +130,10 @@ reference for every setting mentioned here.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history
-  through `igloo.query_history` and `igloo.login_history`; only admins see
-  others'. The functions behind the views decide what to show from the
-  session running them, so calling them directly shows no more.
+  through `igloo.query_history`, `igloo.login_history` and `igloo.usage`;
+  only admins see others'. The functions behind the views decide what to
+  show from the session running them, so calling them directly shows no
+  more.
 - **Loading and scheduled work.** `COPY INTO` loads only from the warehouse
   and `IGLOO_ALLOWED_LOCATIONS`, never the server's own directories, and is
   checked as the `INSERT ... SELECT FROM read_csv(...)` statements it runs,

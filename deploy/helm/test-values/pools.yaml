@@ -1,0 +1,30 @@
+# Compute pools in bundled mode, for deploy/helm/template-test.sh: a large
+# pool that scales to zero, and a small one that does not.
+postgresql:
+  enabled: true
+objectStorage:
+  enabled: true
+pricePerHour: 0.68
+extraEnv:
+  - name: IGLOO_CATALOG_SCHEMA
+    value: analytics
+pools:
+  - name: acme
+    replicaCount: 1
+    pricePerHour: 2.72
+    resources:
+      requests: { cpu: "16", memory: 64Gi }
+      limits: { memory: 64Gi }
+    scaleToZero:
+      enabled: true
+      suspendAfter: 15m
+    nodeSelector:
+      node-pool: igloo-large
+    extraEnv:
+      - name: IGLOO_STATEMENT_TIMEOUT
+        value: 2h
+  - name: reporting
+    replicaCount: 2
+    service:
+      type: LoadBalancer
+      loadBalancerSourceRanges: ["203.0.113.0/24"]

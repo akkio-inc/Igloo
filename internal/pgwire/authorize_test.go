@@ -115,6 +115,16 @@ func TestForbidden(t *testing.T) {
 		"SELECT cache_httpfs_wrap_cache_filesystem('LocalFileSystem')",
 		"SELECT cache_httpfs_add_exclusion_regex('.*')",
 		"SELECT cache_httpfs_reset_exclusion_regex()",
+		// query_table with a name built at run time, which could resolve to
+		// a GDAL dataset without a check of the text seeing it.
+		"SELECT * FROM query_table('lake.public.' || 't')",
+		"SELECT * FROM query_table(getvariable('f'))",
+		"SELECT * FROM query_table(name) ",
+		"SELECT * FROM main.query_table('a.' || 'gpkg')",
+		`SELECT * FROM "query_table"('a' || 'b')`,
+		"SELECT * FROM query_table((SELECT 'lake.public.t'))",
+		"SELECT * FROM query_table(['a.' || 'fgb'])",
+		"SELECT * FROM t, query_table(format('{}', x))",
 	}
 	for _, q := range refused {
 		for _, role := range []auth.Role{auth.RoleAdmin, auth.RoleReader} {
@@ -148,6 +158,13 @@ func TestForbidden(t *testing.T) {
 		"SELECT current_setting('cache_httpfs_cache_directory')",
 		"SET cache_httpfs_profile_type = 'temp'",
 		"SELECT cache_httpfs_clear_cache()",
+		// query_table with a name written out as literals is checked by the
+		// text (gdalUse) and admin-gated; it is not forbidden outright.
+		"SELECT * FROM query_table('lake.public.t')",
+		"SELECT * FROM query_table(['lake.a', 'lake.b'])",
+		`SELECT * FROM "query_table"('lake.public.t')`,
+		"SELECT query_table FROM t",
+		"WITH query_table AS (SELECT 1) SELECT * FROM query_table",
 	}
 	for _, q := range allowed {
 		if err := forbidden(q); err != nil {

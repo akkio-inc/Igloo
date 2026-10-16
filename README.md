@@ -127,7 +127,8 @@ the official TPC-H answers.
   ALTER TABLE marts.impressions ALTER COLUMN email SET TAG pii = 'email';
   ```
 - **Query and login history** in `igloo.query_history` and
-  `igloo.login_history`: every statement and login, kept for 90 days.
+  `igloo.login_history`: every statement and login, kept for 90 days, with
+  each statement's CPU time, bytes and memory.
 - **[Loading and scheduling](docs/loading.md)** with nothing else to run:
   `COPY INTO` loads CSV, TSV, Parquet and JSON drops from a bucket, each
   file once; pipes load new files as they land; tasks run SQL on a cron or
@@ -150,6 +151,11 @@ the official TPC-H answers.
   sign in as Igloo users, Igloo's grants decide what they may read and change,
   their requests go to the query history, and they get storage credentials
   that last an hour and reach one table's files only.
+- **[Workload management](docs/workload-management.md)**: query tags
+  (`SET query_tag = 'client:acme'`), per-client usage and estimated cost in
+  `igloo.usage`, per-role concurrency, timeout and memory limits
+  (`ALTER ROLE analysts SET max_concurrent_statements = 4`), and compute
+  pools that give a client or team compute and a bill of its own.
 - **A locked-down query engine**: SQL cannot read the server's files or reach
   any location except the warehouse and locations you allow.
 - **Automatic table maintenance**: small files are compacted, snapshots older
@@ -247,6 +253,8 @@ extension (see [media analytics](docs/media-analytics.md#security)).
   each user sees of tables' rows and columns
 - [Media analytics](docs/media-analytics.md): reach and frequency with
   sketches, geospatial reporting, approximate and statistical functions
+- [Workload management](docs/workload-management.md): query tags, usage and
+  cost per client, role limits, compute pools
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a
@@ -291,6 +299,7 @@ internal/pgwire/    Postgres wire protocol, authorization, policies, compatibili
 internal/policy/    masking and row access policies and tags, stored
 internal/schedule/  cron and interval schedules
 internal/tasks/     tasks, pipes, materialized views, load history, scheduler
+internal/workload/  query tags, role limits and their enforcement
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules
 docs/               documentation
 scripts/            test and end-to-end scripts

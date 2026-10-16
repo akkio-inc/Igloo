@@ -21,11 +21,17 @@ iceberg_port="${E2E_ICEBERG_PORT:-18181}"
 image="${E2E_IMAGE:-$project:dev}"
 build=--build
 [ -z "${E2E_IMAGE:-}" ] || build=--no-build
+pool_port="${E2E_POOL_PORT:-15434}"
 work="$(mktemp -d)"
 env_file="$work/e2e.env"
 
 compose() {
   docker compose -p "$project" --project-directory "$root/deploy/single-vm" --env-file "$env_file" "$@"
+}
+
+# compose_pools adds the example compute pool (deploy/single-vm/compute-pool.yml).
+compose_pools() {
+  compose -f "$root/deploy/single-vm/docker-compose.yml" -f "$root/deploy/single-vm/compute-pool.yml" "$@"
 }
 
 cleanup() {
@@ -35,7 +41,7 @@ cleanup() {
     compose logs --no-color --tail 80 igloo || true
   fi
   if [ "${KEEP_E2E:-}" != 1 ]; then
-    compose --profile local-storage --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
+    compose_pools --profile local-storage --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$work"
   else
     echo "kept the stack: docker compose -p $project --env-file $env_file ..."
@@ -58,6 +64,15 @@ echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
 # A landing area in the bundled object store, for COPY INTO and pipes.
 landing="s3://$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)/landing"
 sed -i.bak -e "s#^IGLOO_ALLOWED_LOCATIONS=.*#IGLOO_ALLOWED_LOCATIONS=$landing/#" "$env_file"
+# A pool name and machine price, for the history and the cost estimates,
+# and a small second pool.
+cat >>"$env_file" <<EOF
+IGLOO_POOL=e2e
+IGLOO_PRICE_PER_HOUR=1.5
+IGLOO_REPORTING_PORT=$pool_port
+IGLOO_REPORTING_MEMORY_LIMIT=1GB
+IGLOO_REPORTING_THREADS=2
+EOF
 admin_password="$(grep '^IGLOO_ADMIN_PASSWORD=' "$env_file" | cut -d= -f2)"
 bucket="$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)"
 
@@ -72,7 +87,7 @@ psql_as() {
   local user=$1 password=$2
   shift 2
   docker run --rm -i --network "$network" -e PGPASSWORD="$password" postgres:17 \
-    psql -h igloo -U "$user" -d igloo -X -At -v ON_ERROR_STOP=1 -v VERBOSITY=verbose "$@" 2>&1
+    psql -h "${psql_host:-igloo}" -U "$user" -d igloo -X -At -v ON_ERROR_STOP=1 -v VERBOSITY=verbose "$@" 2>&1
 }
 psql_admin() { psql_as igloo "$admin_password" "$@"; }
 
@@ -608,6 +623,47 @@ expect_soon "logins and failed logins are recorded" "t|t" igloo "$admin_password
   "SELECT bool_or(result = 'success' AND user_name = 'nora'), bool_or(result = 'failure' AND user_name = 'rita') FROM igloo.login_history"
 got="$(psql_admin -c '\dv igloo.*')"
 if grep -q "igloo|query_history|view" <<<"$got"; then pass '\dv lists the history views'; else fail "\\dv igloo.*: $got"; fi
+
+echo "workload management"
+got="$(psql_as rita rita-password-1 -c "SET query_tag = 'client:acme;campaign:e2e'" -c "SELECT count(*) FROM impressions /* tagged */")" || true
+if [ "$got" = "$(printf 'SET\n100000')" ]; then pass "a tagged query"; else fail "a tagged query: got [$got]"; fi
+expect_soon "the history records its tag, pool and resources" "client:acme;campaign:e2e|e2e|t|t" igloo "$admin_password" "
+  SELECT query_tag, pool, cpu_time_ms > 0, bytes_read IS NOT NULL FROM igloo.query_history
+  WHERE user_name = 'rita' AND query_text LIKE '%/* tagged */' LIMIT 1"
+# Replicas record their running time every minute, which prices the day.
+expect_soon "usage per tag, with a share of the day's cost" "2|t|t" igloo "$admin_password" "
+  SELECT statements, time_share > 0, estimated_cost > 0 FROM igloo.usage
+  WHERE user_name = 'rita' AND query_tag = 'client:acme;campaign:e2e'"
+expect "users see their own usage" "t" rita rita-password-1 "SELECT count(*) > 0 AND bool_and(user_name = 'rita') FROM igloo.usage"
+slow="SELECT count(*) FROM range(10000000000) a, range(10) b WHERE a.range % 7 = b.range"
+expect "a role's default tag" "ALTER ROLE" igloo "$admin_password" "ALTER ROLE analysts SET query_tag = 'client:analysts'"
+expect "reaches its members' sessions" "client:analysts" nora nora-password-1 "SHOW query_tag"
+expect "a built-in role's statement timeout" "ALTER ROLE" igloo "$admin_password" "ALTER ROLE reader SET statement_timeout = '1s'"
+expect_error "cancels its users' long statements" 57014 rita rita-password-1 "$slow"
+expect "a role's concurrency limit" "ALTER ROLE" igloo "$admin_password" "ALTER ROLE analysts SET max_concurrent_statements = 1"
+psql_as nora nora-password-1 -c "SET statement_timeout = '15s'" -c "$slow" >/dev/null 2>&1 &
+holder=$!
+sleep 5
+got="$(psql_as nora nora-password-1 -c "SET statement_timeout = '1s'" -c "SELECT 1")" || true
+if grep -q "behind the limit of 1 statement at once for role analysts" <<<"$got"; then
+  pass "statements beyond it wait in line, until their timeout"
+else
+  fail "a role's concurrency limit: got [$got]"
+fi
+wait "$holder" || true
+got="$(psql_admin -c 'SHOW ROLE SETTINGS')"
+if grep -q '^role|analysts|max_concurrent_statements|1|igloo|' <<<"$got"; then pass "SHOW ROLE SETTINGS"; else fail "SHOW ROLE SETTINGS: $got"; fi
+psql_admin -c "ALTER ROLE analysts RESET ALL" >/dev/null
+psql_admin -c "ALTER ROLE reader RESET ALL" >/dev/null
+expect "limits lifted" "100000" rita rita-password-1 "SELECT count(*) FROM impressions"
+
+echo "compute pools"
+compose_pools up -d --no-build --wait --wait-timeout 180 igloo-reporting >/dev/null
+psql_host=igloo-reporting expect "a second compute pool reads the same tables" "3" rita rita-password-1 \
+  "SELECT count(*) FROM e2e /* reporting */"
+expect_soon "its statements carry its pool" "reporting" igloo "$admin_password" \
+  "SELECT pool FROM igloo.query_history WHERE query_text = 'SELECT count(*) FROM e2e /* reporting */' LIMIT 1"
+compose_pools rm -sf igloo-reporting >/dev/null
 
 echo "table maintenance"
 psql_admin -c "CREATE TABLE fragmented (id INTEGER, v VARCHAR, amount DECIMAL(15,2))" >/dev/null

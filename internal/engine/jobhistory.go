@@ -148,6 +148,10 @@ func (noHistory) Logins(context.Context, audit.Viewer, audit.Page) ([]audit.Logi
 	return nil, nil
 }
 
+func (noHistory) Usage(context.Context, audit.Viewer, time.Time, time.Time) ([]audit.Usage, error) {
+	return nil, nil
+}
+
 func runValues(r tasks.Run) []any {
 	var rows, end, duration any
 	if r.Rows >= 0 {

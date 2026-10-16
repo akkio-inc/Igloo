@@ -1,17 +1,16 @@
 package pgwire
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/sqllex"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // postgresOnlySettings are session settings Postgres drivers send when they
@@ -157,10 +156,15 @@ func rewriteSessionUser(query, user string) string {
 	})
 }
 
-// historyViews are the views of the history and of the policies, in the
-// local database's schema engine.HistorySchema.
-var historyViews = []string{"query_history", "login_history", "task_history", "load_history",
+// historyViews are the views of the history, the usage and the policies,
+// in the local database's schema engine.HistorySchema.
+var historyViews = []string{"query_history", "login_history", "task_history", "load_history", "usage",
 	"policy_references", "tag_references"}
+
+// isHistoryView reports whether name is one of historyViews.
+func isHistoryView(name string) bool {
+	return slices.ContainsFunc(historyViews, func(v string) bool { return strings.EqualFold(v, name) })
+}
 
 // rewriteHistoryRefs points igloo.query_history, igloo.login_history and
 // the other historyViews at the local database, where the views are,
@@ -213,14 +217,11 @@ func rewriteHistoryRefs(query, local string) string {
 		}
 	}
 
-	isView := func(name string) bool {
-		return slices.ContainsFunc(historyViews, func(v string) bool { return strings.EqualFold(v, name) })
-	}
 	var out strings.Builder
 	last := 0
 	for i := 0; i+2 < len(toks); i++ {
 		if !strings.EqualFold(toks[i].name, engine.HistorySchema) || i > 0 && toks[i-1].dot ||
-			!toks[i+1].dot || !isView(toks[i+2].name) || i+3 < len(toks) && toks[i+3].dot {
+			!toks[i+1].dot || !isHistoryView(toks[i+2].name) || i+3 < len(toks) && toks[i+3].dot {
 			continue
 		}
 		out.WriteString(query[last:toks[i].start])
@@ -343,46 +344,21 @@ var (
 	setStatementTimeout   = regexp.MustCompile(`(?is)^\s*SET\s+(?:SESSION\s+|LOCAL\s+)?statement_timeout\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$`)
 	resetStatementTimeout = regexp.MustCompile(`(?is)^\s*RESET\s+statement_timeout\s*;?\s*$`)
 	showStatementTimeout  = regexp.MustCompile(`(?is)^\s*SHOW\s+statement_timeout\s*;?\s*$`)
-	timeoutValue          = regexp.MustCompile(`(?i)^(\d+)\s*(us|ms|s|min|h|d)?$`)
 )
 
 // parseStatementTimeout parses a PostgreSQL statement_timeout value: a
 // number of milliseconds, or a quoted number with a unit ('30s', '5min').
 // Zero means no timeout; DEFAULT means the server default.
 func parseStatementTimeout(value string) (d time.Duration, isDefault bool, err error) {
-	value = strings.Trim(strings.TrimSpace(value), `'"`)
-	if strings.EqualFold(value, "default") {
+	if strings.EqualFold(strings.Trim(strings.TrimSpace(value), `'"`), "default") {
 		return 0, true, nil
 	}
-	m := timeoutValue.FindStringSubmatch(strings.TrimSpace(value))
-	if m == nil {
-		return 0, false, errors.New(`invalid value for statement_timeout; use milliseconds or a unit, e.g. '30s' or '5min'`)
-	}
-	n, err := strconv.ParseInt(m[1], 10, 64)
-	if err != nil {
-		return 0, false, err
-	}
-	unit := map[string]time.Duration{
-		"": time.Millisecond, "us": time.Microsecond, "ms": time.Millisecond, "s": time.Second,
-		"min": time.Minute, "h": time.Hour, "d": 24 * time.Hour,
-	}[strings.ToLower(m[2])]
-	return time.Duration(n) * unit, false, nil
+	d, err = workload.ParseTimeout(value)
+	return d, false, err
 }
 
 // formatTimeout renders a timeout the way PostgreSQL's SHOW does.
-func formatTimeout(d time.Duration) string {
-	switch {
-	case d == 0:
-		return "0"
-	case d%time.Hour == 0:
-		return fmt.Sprintf("%dh", d/time.Hour)
-	case d%time.Minute == 0:
-		return fmt.Sprintf("%dmin", d/time.Minute)
-	case d%time.Second == 0:
-		return fmt.Sprintf("%ds", d/time.Second)
-	}
-	return fmt.Sprintf("%dms", d/time.Millisecond)
-}
+func formatTimeout(d time.Duration) string { return workload.FormatTimeout(d) }
 
 // pgCatalogNamespace is the OID clients see for the pg_catalog schema, which
 // DuckDB's pg_namespace does not list.

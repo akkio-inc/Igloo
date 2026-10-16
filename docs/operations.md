@@ -118,8 +118,10 @@ tags](security-policies.md) describes them.
 
 Igloo records every statement and every login attempt: who, when, how long,
 the outcome and SQLSTATE, rows returned or changed, the statement text,
-the tables it read and wrote (for statements checked against grants), and
-the client's address and `application_name`. Read them with SQL:
+the tables it read and wrote (for statements checked against grants), the
+client's address and `application_name`, the query tag and compute pool,
+and what DuckDB measured: CPU time, bytes read and memory allocated.
+Read them with SQL:
 
 ```sql
 SELECT start_time, user_name, outcome, duration_ms, query_text
@@ -149,7 +151,11 @@ statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
   If it stays unavailable, or falls far enough behind that 10,000 records
   wait, records are dropped: the log warns (`dropped history records`, at
   most once a minute) and `igloo_audit_dropped_total` counts them.
-- `IGLOO_AUDIT=false` turns recording off.
+- `IGLOO_AUDIT=false` turns recording off, and with it `igloo.usage`.
+- Each replica also records, once a minute, how long it has been running,
+  for the cost estimates of [`igloo.usage`](workload-management.md#usage-and-cost),
+  in `igloo_audit.compute_time`; it is pruned with the history. A minute
+  that cannot be written is counted in the next one.
 - The views read the history page by page, newest first; `LIMIT` without
   `ORDER BY` reads only the newest pages, while other filters and sorts read
   everything visible. To analyze months of history from a busy warehouse,
@@ -174,7 +180,9 @@ using all of its cores.
   space, or set `IGLOO_CACHE_SIZE`.
 
 A memory-optimized machine with 4 to 8 cores and 32 to 64 GB handles most
-datasets up to a few hundred GB of compressed Parquet comfortably.
+datasets up to a few hundred GB of compressed Parquet comfortably. To size
+one client's or team's compute apart from everyone else's, give them a
+[compute pool](workload-management.md#compute-pools).
 
 ## Read cache
 
@@ -266,11 +274,30 @@ share nothing but the catalog and object storage:
   transaction. Many small concurrent writes to one table are slow; batch them
   into fewer, larger statements.
 
+## Workload management
+
+[Workload management](workload-management.md) covers attributing and
+limiting work:
+
+- **Query tags** (`SET query_tag = 'client:acme'`, or a default per user or
+  role) and the replica's **compute pool** (`IGLOO_POOL`) are recorded with
+  every statement, as are the CPU time, bytes and memory DuckDB measured
+  and the time the statement waited for its limits.
+- **`igloo.usage`** sums the history per day, pool, user, role and tag, and
+  estimates each group's compute cost from `IGLOO_PRICE_PER_HOUR`.
+- **Role limits** (`ALTER ROLE analysts SET max_concurrent_statements = 4`,
+  `statement_timeout`, `memory_limit`) hold statements in line on each
+  replica.
+- **Compute pools** give a client or team replicas of their own, sharing
+  the catalog, users and history: `pools` in the Helm chart, or
+  `deploy/single-vm/compute-pool.yml` with Docker Compose.
+
 ## Timeouts and limits
 
 - `IGLOO_STATEMENT_TIMEOUT` cancels statements that run too long (default: no
   limit). Sessions can set their own with `SET statement_timeout = '5min'`
-  and see it with `SHOW statement_timeout`.
+  and see it with `SHOW statement_timeout`. A role's `statement_timeout`
+  ([role limits](workload-management.md#role-limits)) caps both.
 - Clients can cancel a running query with a PostgreSQL cancel request (Ctrl-C
   in psql, `Statement.cancel()` in JDBC, context cancellation in Go).
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
@@ -314,17 +341,20 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_maintenance_orphan_files_deleted_total` | | Unreferenced files deleted |
 | `igloo_cache_size_bytes` | | Bytes in the [read cache](#read-cache), measured every 5 minutes |
 | `igloo_cache_limit_bytes` | | Size the read cache may grow to, given the disk's free space; 0 while it is off or paused |
+| `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
+| `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
-`user changed`, `grants changed`, `job changed` (tasks, pipes and
-materialized views created, changed or dropped), `statement denied`,
-`statement canceled` (from the web console's compute page), and refused
-connections. Failed scheduled runs log `scheduled run failed` (component
-`tasks`). Sign-ins through the web console log `client=console`, and
-through Arrow Flight SQL `client="flight sql"`. Query text and
-DuckDB error details, which can quote the query, are logged only at debug
-level; user-management statements, which carry passwords, are never logged.
+`user changed`, `grants changed`, `role settings changed`, `job changed`
+(tasks, pipes and materialized views created, changed or dropped),
+`statement denied`, `statement canceled` (from the web console's compute
+page), and refused connections. Failed scheduled runs log `scheduled run
+failed` (component `tasks`). Sign-ins through the web console log
+`client=console`, and through Arrow Flight SQL `client="flight sql"`.
+Query text and DuckDB error details, which can quote the query, are logged
+only at debug level; user-management statements, which carry passwords,
+are never logged.
 The [query history](#query-and-login-history) keeps statement text, with
 passwords and secrets removed.
 
@@ -461,6 +491,7 @@ and the catalog runs its database migrations before it serves. Read
 | `Permission Error: Cannot access file ...` | The sandbox blocked a file or URL outside the warehouse. To load from or export to another bucket, add it to `IGLOO_ALLOWED_LOCATIONS`. |
 | SQLSTATE `40001`, `CatalogCommitConflicts` | Two writers committed to the same table at once inside explicit transactions. Retry the transaction. |
 | SQLSTATE `57014` | The statement was canceled, by the client or by `statement_timeout`. |
+| SQLSTATE `57014`, `it waited 30s to start, behind the limit of 4 statements at once for role analysts` | The statement waited for its [role limits](workload-management.md#role-limits) until its timeout. Run fewer statements at once, raise the limit, or give the team a compute pool. |
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |
 | `CREATE TABLE` fails with `schema: data did not match any variant` | The table has a column the catalog cannot store, such as a `GEOMETRY`; store `ST_AsWKB(geom)` instead ([media analytics](media-analytics.md#loading-boundaries)). |
 | SQLSTATE `53300` | The replica is at `IGLOO_MAX_CONNECTIONS`. Use a connection pool, raise the limit, or add replicas. |

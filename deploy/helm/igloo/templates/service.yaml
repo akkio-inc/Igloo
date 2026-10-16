@@ -1,11 +1,13 @@
 {{- /* SQL endpoint. Metrics are on a separate ClusterIP Service, so a
 LoadBalancer here never exposes them. With scale to zero it leads to the
 gateway instead of the igloo pods, so clients keep the same address. */ -}}
-{{- $sqlComponent := ternary "gateway" "server" .Values.scaleToZero.enabled -}}
+{{- define "igloo.services" -}}
+{{- $component := include "igloo.serverComponent" . -}}
+{{- $sqlComponent := ternary (include "igloo.gatewayComponent" .) $component .Values.scaleToZero.enabled -}}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "igloo.fullname" . }}
+  name: {{ include "igloo.serverName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "igloo.labels" (dict "root" . "component" $sqlComponent) | nindent 4 }}
@@ -63,7 +65,7 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.selectorLabels" (dict "root" . "component" $component) | nindent 4 }}
   ports:
     - name: http
       port: 8080
@@ -80,11 +82,11 @@ metadata:
   name: {{ include "igloo.serverServiceName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" $component) | nindent 4 }}
 spec:
   type: ClusterIP
   selector:
-    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.selectorLabels" (dict "root" . "component" $component) | nindent 4 }}
   ports:
     - name: sql
       port: 5432
@@ -119,15 +121,17 @@ metadata:
   name: {{ include "igloo.headlessServiceName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.labels" (dict "root" . "component" $component) | nindent 4 }}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+    {{- include "igloo.selectorLabels" (dict "root" . "component" $component) | nindent 4 }}
   ports:
     - name: http
       port: 8080
       targetPort: http
       protocol: TCP
 {{- end }}
+{{- end -}}
+{{- include "igloo.services" . }}

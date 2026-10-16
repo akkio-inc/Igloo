@@ -206,6 +206,11 @@ func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.T
 	if _, err := s.openSession(ctx); err != nil {
 		return nil, err
 	}
+	// Load the user's workload limits now, so pipes and materialized view
+	// refreshes, which run their statements through runCancelable without
+	// going through parse, are still held to their owner's limits. Console
+	// and Flight SQL statements go through parse, which refreshes them.
+	s.refreshLimits(ctx, sess, user)
 	return &EmbeddedSession{srv: s, sess: sess, types: pgtype.NewMap()}, nil
 }
 

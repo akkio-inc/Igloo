@@ -64,6 +64,33 @@ var migrations = []string{
 				ADD COLUMN IF NOT EXISTS token_name text;
 		END IF;
 	END $$`,
+	// Workload attribution: the query tag, the compute pool, the time spent
+	// waiting for limits, and what DuckDB measured. Added once, too.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_audit' AND table_name = 'query_history' AND column_name = 'memory_allocated') THEN
+			ALTER TABLE igloo_audit.query_history
+				ADD COLUMN IF NOT EXISTS query_tag text,
+				ADD COLUMN IF NOT EXISTS pool text,
+				ADD COLUMN IF NOT EXISTS queued_us bigint,
+				ADD COLUMN IF NOT EXISTS cpu_time_us bigint,
+				ADD COLUMN IF NOT EXISTS bytes_read bigint,
+				ADD COLUMN IF NOT EXISTS memory_allocated bigint;
+		END IF;
+	END $$`,
+	// How long each replica process ran on each day. A process writes its
+	// running total, so writing it again after a failure counts nothing
+	// twice.
+	`CREATE TABLE IF NOT EXISTS igloo_audit.compute_time (
+		day            date NOT NULL,
+		pool           text NOT NULL,
+		replica        text NOT NULL,
+		started        timestamptz NOT NULL,
+		seconds        double precision NOT NULL,
+		price_per_hour double precision NOT NULL,
+		PRIMARY KEY (day, pool, replica, started)
+	)`,
 }
 
 // PostgresStore keeps history in the "igloo_audit" schema of the metadata
@@ -110,14 +137,19 @@ func (s *PostgresStore) WriteQueries(ctx context.Context, qs []Query) error {
 		if q.Rows >= 0 {
 			rowCount = q.Rows
 		}
+		var cpu, read, memory any
+		if r := q.Resources; r != nil {
+			cpu, read, memory = r.CPUTime.Microseconds(), r.BytesRead, r.MemoryAllocated
+		}
 		rows[i] = []any{q.ID, q.SessionID, q.User, q.Role, q.Start, q.Duration.Microseconds(), q.Outcome,
 			nullable(q.SQLState), rowCount, q.StatementType, q.Text, nullSlice(q.TablesRead), nullSlice(q.TablesWritten),
-			nullable(q.ClientAddress), nullable(q.ApplicationName), nullSlice(q.Policies)}
+			nullable(q.ClientAddress), nullable(q.ApplicationName), nullSlice(q.Policies), nullable(q.QueryTag),
+			nullable(q.Pool), q.Queued.Microseconds(), cpu, read, memory}
 	}
 	return s.copy(ctx, "query_history", "query_id", []string{
 		"query_id", "session_id", "user_name", "role", "start_time", "duration_us", "outcome", "sqlstate",
 		"row_count", "statement_type", "query_text", "tables_read", "tables_written", "client_address", "application_name",
-		"policies",
+		"policies", "query_tag", "pool", "queued_us", "cpu_time_us", "bytes_read", "memory_allocated",
 	}, rows)
 }
 
@@ -160,7 +192,8 @@ func (s *PostgresStore) copy(ctx context.Context, table, key string, cols []stri
 func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query, error) {
 	rows, err := s.pool.Query(ctx, `SELECT query_id, session_id, user_name, role, start_time, duration_us, outcome,
 			coalesce(sqlstate, ''), coalesce(row_count, -1), statement_type, query_text, tables_read, tables_written,
-			coalesce(client_address, ''), coalesce(application_name, ''), policies
+			coalesce(client_address, ''), coalesce(application_name, ''), policies, coalesce(query_tag, ''),
+			coalesce(pool, ''), coalesce(queued_us, 0), cpu_time_us, coalesce(bytes_read, 0), coalesce(memory_allocated, 0)
 		FROM igloo_audit.query_history
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR start_time >= $2)
@@ -173,12 +206,19 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Query, error) {
 		var (
-			q  Query
-			us int64
+			q            Query
+			us, queuedUS int64
+			cpuUS        *int64
+			r            Resources
 		)
 		err := row.Scan(&q.ID, &q.SessionID, &q.User, &q.Role, &q.Start, &us, &q.Outcome, &q.SQLState, &q.Rows,
-			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName, &q.Policies)
-		q.Duration = time.Duration(us) * time.Microsecond
+			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName, &q.Policies,
+			&q.QueryTag, &q.Pool, &queuedUS, &cpuUS, &r.BytesRead, &r.MemoryAllocated)
+		q.Duration, q.Queued = micros(us), micros(queuedUS)
+		if cpuUS != nil {
+			r.CPUTime = micros(*cpuUS)
+			q.Resources = &r
+		}
 		return q, err
 	})
 }
@@ -229,7 +269,10 @@ func (s *PostgresStore) Prune(ctx context.Context, before time.Time) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_audit.query_history WHERE start_time < $1`, before); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM igloo_audit.login_history WHERE event_time < $1`, before)
+		if _, err := tx.Exec(ctx, `DELETE FROM igloo_audit.login_history WHERE event_time < $1`, before); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM igloo_audit.compute_time WHERE day < ($1::timestamptz AT TIME ZONE 'UTC')::date`, before)
 		return err
 	})
 }

@@ -42,12 +42,14 @@ type userCommand struct {
 	ifExists  bool
 	// currentUser is set for ALTER USER CURRENT_USER.
 	currentUser bool
-	// acl, token or group, when set, makes this a role or grant command
-	// (see grants.go), an access token command (tokens.go) or a single
-	// sign-on group mapping (ssogroups.go) instead.
-	acl   *aclCommand
-	token *tokenCommand
-	group *groupCommand
+	// acl, token, group or setting, when set, makes this a role or grant
+	// command (see grants.go), an access token command (tokens.go), a
+	// single sign-on group mapping (ssogroups.go) or a role settings
+	// command (workload.go) instead.
+	acl     *aclCommand
+	token   *tokenCommand
+	group   *groupCommand
+	setting *settingCommand
 }
 
 // columns describes the rows the command sends, if any.
@@ -59,6 +61,8 @@ func (c userCommand) columns() wire.Columns {
 		return c.token.columns()
 	case c.group != nil:
 		return c.group.columns()
+	case c.setting != nil:
+		return c.setting.columns()
 	case c.verb == "SHOW":
 		return userColumns
 	}
@@ -146,6 +150,16 @@ func parseUserCommand(toks []token) (cmd userCommand, ok bool, err error) {
 			return userCommand{}, true, err
 		}
 		return userCommand{verb: gc.verb(), group: gc}, true, nil
+	}
+	if set, ok, err := parseSettingCommand(toks); ok {
+		if err != nil {
+			return userCommand{}, true, err
+		}
+		verb := "SHOW"
+		if !set.show {
+			verb = "ALTER"
+		}
+		return userCommand{verb: verb, setting: set}, true, nil
 	}
 	if acl, ok, err := parseACLCommand(toks); ok {
 		if err != nil {
@@ -314,6 +328,9 @@ func (s *Server) runUserCommand(ctx context.Context, sess *session, cmd userComm
 		return s.runTokenCommand(ctx, sess, cmd.token, w)
 	case cmd.group != nil:
 		return s.runGroupCommand(ctx, sess, cmd.group, w)
+	}
+	if cmd.setting != nil {
+		return s.runSettingCommand(ctx, sess, cmd.setting, w)
 	}
 	me := sess.currentUser()
 	isAdmin := me.Role == auth.RoleAdmin
@@ -680,6 +697,8 @@ const (
 	tokSemicolon
 	tokDot
 	tokComma
+	// tokEquals is the = of SET name = value.
+	tokEquals
 )
 
 type token struct {
@@ -704,7 +723,7 @@ func (t token) ident() string {
 }
 
 // tokenize splits SQL into words, "quoted" identifiers, 'string' literals,
-// semicolons, dots and commas, ignoring comments.
+// semicolons, dots, commas and equals signs, ignoring comments.
 func tokenize(query string) ([]token, error) {
 	var toks []token
 	s := []rune(query)
@@ -721,6 +740,9 @@ func tokenize(query string) ([]token, error) {
 			i++
 		case r == ',':
 			toks = append(toks, token{kind: tokComma, text: ","})
+			i++
+		case r == '=':
+			toks = append(toks, token{kind: tokEquals, text: "="})
 			i++
 		case r == '-' && i+1 < len(s) && s[i+1] == '-':
 			for i < len(s) && s[i] != '\n' {
