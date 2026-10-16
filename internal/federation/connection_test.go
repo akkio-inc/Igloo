@@ -2,6 +2,7 @@ package federation
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -76,6 +77,17 @@ func TestConnectionOptions(t *testing.T) {
 		if err := c.Validate([]string{"lake"}); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+	m := NewManager(NewMemoryStore(), Options{Protected: []string{"meta.example.com:5432"}}, nil)
+	c = valid()
+	c.Host = "META.example.com"
+	var invalid *InvalidError
+	if err := m.validate(c, nil); !errors.As(err, &invalid) {
+		t.Errorf("a connection to the metadata database's server: %v", err)
+	}
+	c.Port = 5433
+	if err := m.validate(c, nil); err != nil {
+		t.Errorf("another server: %v", err)
 	}
 	if _, err := ParseType("MariaDB"); err != nil {
 		t.Error(err)
@@ -233,6 +245,43 @@ func TestRelaySilence(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a silent remote database was not given up on")
+	}
+}
+
+// TestClassify checks which statements the proxy may answer itself: only
+// the exact ones DuckDB's extensions send alone, never one sent together
+// with other statements.
+func TestClassify(t *testing.T) {
+	for text, want := range map[string]int{
+		"BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY\x00":              stmtBegin,
+		"BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT oid\x00": stmtOther,
+		"COMMIT\x00":                      stmtCommit,
+		"rollback;\x00":                   stmtRollback,
+		"DISCARD ALL\x00":                 stmtDiscard,
+		"SELECT 1\x00":                    stmtPing,
+		"SELECT 1 FROM pg_class\x00":      stmtOther,
+		"COMMIT; DROP TABLE x\x00":        stmtOther,
+		"COPY (SELECT 1) TO STDOUT\x00":   stmtOther,
+		"SELECT pg_export_snapshot()\x00": stmtOther,
+	} {
+		if got, _ := classify([]byte(text)); got != want {
+			t.Errorf("classify(%q) = %d, want %d", text, got, want)
+		}
+	}
+	for text, want := range map[string]int{
+		"START TRANSACTION READ ONLY":     myBegin,
+		"BEGIN":                           myBegin,
+		"COMMIT":                          myEnd,
+		"ROLLBACK":                        myEnd,
+		"SET autocommit=1":                myAutocommit,
+		"set autocommit = 1;":             myAutocommit,
+		"SET autocommit=0":                myOther,
+		"START TRANSACTION; DROP TABLE x": myOther,
+		"SELECT 1":                        myOther,
+	} {
+		if got := classifyMySQL([]byte(text)); got != want {
+			t.Errorf("classifyMySQL(%q) = %d, want %d", text, got, want)
+		}
 	}
 }
 

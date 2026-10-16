@@ -232,9 +232,16 @@ func TestConnectionStatements(t *testing.T) {
 	if state != "not attached" || !strings.Contains(detail, "restart") || password != "stored" || timeout != "30s" {
 		t.Errorf("SHOW CONNECTIONS: %s %s %s %s", state, detail, password, timeout)
 	}
+	if _, err := admin.Exec(context.Background(), "SELECT * FROM crm.public.x"); pgCode(err) != "55000" ||
+		!strings.Contains(err.Error(), "restart") {
+		t.Errorf("a connection not attached yet: %v", err)
+	}
 	// The password is stored, and never shown again.
-	if rows := queryAll(t, admin, "SHOW CONNECTIONS"); strings.Contains(rows, pg.password) && pg.password != "" {
-		t.Errorf("SHOW CONNECTIONS shows the password: %s", rows)
+	rows := queryAll(t, admin, "SHOW CONNECTIONS")
+	for _, field := range strings.FieldsFunc(rows, func(r rune) bool { return r == '|' || r == '\n' }) {
+		if field == pg.password {
+			t.Errorf("SHOW CONNECTIONS shows the password: %s", rows)
+		}
 	}
 
 	fs2 := startFedServer(t, store)

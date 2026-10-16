@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -363,6 +364,31 @@ func (s *Server) showConnections(ctx context.Context, w wire.DataWriter) error {
 		}
 	}
 	return w.Complete(fmt.Sprintf("SELECT %d", w.Written()))
+}
+
+// missingCatalog matches DuckDB's error for a catalog it does not have.
+var missingCatalog = regexp.MustCompile(`Catalog "([^"]+)" does not exist`)
+
+// connectionHint explains DuckDB's error for a missing catalog when the
+// catalog is a connection this replica has not attached: one created since
+// it started, or one it could not reach then.
+func (s *Server) connectionHint(ctx context.Context, err error) error {
+	if err == nil || s.fed == nil {
+		return err
+	}
+	m := missingCatalog.FindStringSubmatch(err.Error())
+	if m == nil {
+		return err
+	}
+	name := strings.ToLower(m[1])
+	if _, attached := s.externalCatalogs()[name]; attached {
+		return err
+	}
+	if exists, ferr := s.fed.Exists(ctx, name); ferr != nil || !exists {
+		return err
+	}
+	return pgerror.WithCode(fmt.Errorf("connection %s is not attached on this replica: connections are attached when Igloo starts, "+
+		"so restart it to attach one created since (SHOW CONNECTIONS says why one is not attached)", name), codes.ObjectNotInPrerequisiteState)
 }
 
 // connectionError gives connection errors PostgreSQL codes.

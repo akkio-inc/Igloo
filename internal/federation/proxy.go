@@ -76,9 +76,10 @@ type proxy struct {
 	attached Connection
 	secrets  string
 	log      *slog.Logger
-	// failures counts failed sign-ins to the remote database in a row;
-	// see healthy.
+	// failures counts failed sign-ins to the remote database in a row,
+	// and lastErr says why the last one failed; see signedIn.
 	failures atomic.Int32
+	lastErr  atomic.Pointer[string]
 
 	mu       sync.Mutex
 	current  Connection
@@ -281,15 +282,27 @@ func (p *proxy) untrack(r *relay) {
 	p.mu.Unlock()
 }
 
-// signedIn records whether signing in to the remote database worked.
+// signedIn records whether signing in to the remote database worked,
+// logging the first failure in a row and the recovery after it.
 func (p *proxy) signedIn(err error) {
 	if err == nil {
+		p.lastErr.Store(nil)
 		if p.failures.Swap(0) > 0 {
 			p.log.Info("remote database reachable again")
 		}
 		return
 	}
+	msg := Scrub(err.Error())
+	p.lastErr.Store(&msg)
 	if p.failures.Add(1) == 1 {
-		p.log.Warn("cannot sign in to the remote database", "err", err)
+		p.log.Warn("cannot sign in to the remote database", "err", msg)
 	}
+}
+
+// lastError says why the last sign-in failed, or "" if it worked.
+func (p *proxy) lastError() string {
+	if e := p.lastErr.Load(); e != nil {
+		return *e
+	}
+	return ""
 }

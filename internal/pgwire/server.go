@@ -950,7 +950,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	if err != nil {
 		sess.observe(nil, err)
-		return fail(pgError(err))
+		return fail(pgError(s.connectionHint(ctx, err)))
 	}
 	if pivot && st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
 		// multipleStatements let through what it takes for a query.

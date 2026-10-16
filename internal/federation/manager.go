@@ -28,15 +28,21 @@ type Options struct {
 	// Connect opens a DuckDB connection, for detaching and refreshing
 	// connections once the engine is running. Set it with SetConnect.
 	Connect func(context.Context) (*duckdb.Conn, error)
+	// Protected are host:port addresses no connection may reach: the
+	// metadata database's server, whose users, grants and catalog no grant
+	// should expose. It guards against mistakes, not a determined admin,
+	// who can name the server another way.
+	Protected []string
 }
 
 // Manager attaches connections to DuckDB and keeps them in step with the
 // store.
 type Manager struct {
-	store   Store
-	secrets string
-	log     *slog.Logger
-	token   string
+	store     Store
+	secrets   string
+	protected []string
+	log       *slog.Logger
+	token     string
 
 	connect atomic.Pointer[func(context.Context) (*duckdb.Conn, error)]
 	// gen counts changes to what is attached; see Generation.
@@ -63,7 +69,7 @@ type attachment struct {
 // NewManager returns a manager for the connections in store.
 func NewManager(store Store, opts Options, log *slog.Logger) *Manager {
 	m := &Manager{
-		store: store, secrets: opts.SecretsDir, log: log, token: newToken(),
+		store: store, secrets: opts.SecretsDir, protected: opts.Protected, log: log, token: newToken(),
 		attached: map[string]*attachment{}, failed: map[string]string{},
 	}
 	if opts.Connect != nil {
@@ -341,8 +347,8 @@ func (m *Manager) closeAll() {
 // database. taken are the names of the databases DuckDB has. Replicas
 // attach it when they next start.
 func (m *Manager) Create(ctx context.Context, c Connection, taken []string) error {
-	if err := c.Validate(taken); err != nil {
-		return &InvalidError{err}
+	if err := m.validate(c, taken); err != nil {
+		return err
 	}
 	if err := m.signIn(c); err != nil {
 		return &UnreachableError{c.Name, err}
@@ -363,8 +369,8 @@ func (m *Manager) Alter(ctx context.Context, name string, set func(*Connection) 
 	if err := set(&c); err != nil {
 		return c, &InvalidError{err}
 	}
-	if err := c.Validate(nil); err != nil {
-		return c, &InvalidError{err}
+	if err := m.validate(c, nil); err != nil {
+		return c, err
 	}
 	c.Unusable = ""
 	if err := m.signIn(c); err != nil {
@@ -374,6 +380,18 @@ func (m *Manager) Alter(ctx context.Context, name string, set func(*Connection) 
 		return c, err
 	}
 	return c, m.Sync(ctx)
+}
+
+// validate checks c's settings, and that it does not reach a protected
+// server.
+func (m *Manager) validate(c Connection, taken []string) error {
+	if err := c.Validate(taken); err != nil {
+		return &InvalidError{err}
+	}
+	if slices.ContainsFunc(m.protected, func(a string) bool { return strings.EqualFold(a, c.Address()) }) {
+		return &InvalidError{fmt.Errorf("%s is the server of Igloo's metadata database, which a connection must not reach", c.Address())}
+	}
+	return nil
 }
 
 // Drop removes a connection and its grants, and detaches it here at once
@@ -465,12 +483,12 @@ func (m *Manager) List(ctx context.Context) ([]Status, error) {
 		s := Status{Connection: c}
 		a := m.attached[c.Name]
 		switch {
-		case a != nil && a.conn.attachedFields() != c.attachedFields():
+		case a != nil && a.proxy.attached.attachedFields() != c.attachedFields():
 			s.State, s.Detail = "attached", "restart to apply the new database or schema"
 		case a != nil:
 			s.State = "attached"
-			if a.proxy.failures.Load() > 0 {
-				s.Detail = "the last sign-in to the database failed"
+			if err := a.proxy.lastError(); err != "" {
+				s.Detail = "the last sign-in to the database failed: " + err
 			}
 		case m.failed[c.Name] != "":
 			s.State, s.Detail = "failed", m.failed[c.Name]+"; restart to retry"

@@ -291,6 +291,9 @@ const (
 // extension sends it.
 func classifyMySQL(text []byte) int {
 	q := strings.ToUpper(strings.Join(strings.Fields(strings.TrimRight(string(text), "; \t\r\n")), " "))
+	if strings.Contains(q, ";") {
+		return myOther
+	}
 	switch {
 	case q == "BEGIN" || strings.HasPrefix(q, "START TRANSACTION"):
 		return myBegin
