@@ -19,17 +19,37 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ready CONTAINER COMMAND...: waits until COMMAND succeeds, failing with the
+# container's log if it stops or takes more than 3 minutes.
+ready() {
+  local container=$1
+  shift
+  for _ in $(seq 180); do
+    if "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != true ]; then
+      echo "$container stopped:" >&2
+      docker logs --tail 20 "$container" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "$container was not ready after 3 minutes" >&2
+  return 1
+}
+
 docker network create "$name" >/dev/null
 docker run -d --name "$name-db" --network "$name" -e POSTGRES_PASSWORD=test postgres:17 >/dev/null
 docker run -d --name "$name-mysql" --network "$name" -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=igloo_test mysql:8.4 >/dev/null
-until docker exec "$name-db" pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+ready "$name-db" docker exec "$name-db" pg_isready -U postgres
 
 mounts=(-v "$root":/src -v igloo-go-mod:/go/pkg/mod -v igloo-go-build:/root/.cache/go-build -v igloo-duckdb-extensions:/ext)
 # Downloads only what the volume does not have yet.
 docker run --rm "${mounts[@]}" -w /src "$go_image" go run -tags duckdb_arrow ./cmd/igloo install-extensions /ext
 
 # MySQL first starts without networking to initialize; wait for TCP.
-until docker exec "$name-mysql" mysql -h127.0.0.1 -uroot -ptest -e 'SELECT 1' igloo_test >/dev/null 2>&1; do sleep 1; done
+ready "$name-mysql" docker exec "$name-mysql" mysql -h127.0.0.1 -uroot -ptest -e 'SELECT 1' igloo_test
 
 docker run --rm --network "$name" \
   -e IGLOO_TEST_DATABASE_URL="postgres://postgres:test@$name-db:5432/postgres" \
