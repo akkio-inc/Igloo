@@ -27,6 +27,12 @@ updates:
     groups:
       compose-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # A PostgreSQL major upgrade needs pg_upgrade or a dump and restore, and
+      # the same change in the Helm chart and the cloud modules; it is done
+      # deliberately, not by a bot.
+      - dependency-name: postgres
+        update-types: [version-update:semver-major]
 
   - package-ecosystem: github-actions
     directory: /
