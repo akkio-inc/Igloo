@@ -140,8 +140,8 @@ type Store interface {
 	Queries(ctx context.Context, v Viewer, p Page) ([]Query, error)
 	Logins(ctx context.Context, v Viewer, p Page) ([]Login, error)
 	// Lineage returns the edges that successful statements since since
-	// made, and TableUsage how often they read and wrote each table (see
-	// lineage.go). Both cover every user's statements.
+	// made, and TableUsage how often they read each table and changed its
+	// data (see lineage.go). Both cover every user's statements.
 	Lineage(ctx context.Context, since time.Time) ([]Edge, error)
 	TableUsage(ctx context.Context, since time.Time) ([]TableUsage, error)
 	// Prune deletes records older than before. Stores shared by several

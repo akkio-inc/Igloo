@@ -134,19 +134,9 @@ func (s *Server) finishRecord(q *audit.Query, read, written []auth.Object, locat
 	if s.lineage != nil {
 		s.lineage.Statement(*q)
 	}
-	if dataChanged(q.StatementType) {
+	if audit.ChangesData(q.StatementType) {
 		s.metadataChanged(written)
 	}
-}
-
-// dataChanged reports whether statements of a type, as the history names
-// them, change tables' data.
-func dataChanged(statementType string) bool {
-	switch statementType {
-	case "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "COPY", "CREATE TABLE", "CREATE MATERIALIZED", "REFRESH":
-		return true
-	}
-	return false
 }
 
 // recordLogin sends a login attempt from addr, which may be nil, to the

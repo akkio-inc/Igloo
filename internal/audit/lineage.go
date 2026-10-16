@@ -16,6 +16,15 @@ import (
 // UsageWindow is how far back TableUsage counts.
 const UsageWindow = 30 * 24 * time.Hour
 
+// DataStatements are the types of statement, as the history names them,
+// that change tables' data. TableUsage counts only these as writes: not,
+// say, comments.
+var DataStatements = []string{"INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "COPY", "CREATE TABLE",
+	"CREATE MATERIALIZED", "REFRESH"}
+
+// ChangesData reports whether a statement of type t changes tables' data.
+func ChangesData(t string) bool { return slices.Contains(DataStatements, t) }
+
 // usageTTL is how long a Log reuses the usage it read: counting reads a
 // month of history.
 const usageTTL = time.Minute
@@ -40,7 +49,7 @@ type Edge struct {
 	LastJob           string
 }
 
-// TableUsage is how often statements read and wrote a table.
+// TableUsage is how often statements read a table and changed its data.
 type TableUsage struct {
 	// Table is catalog.schema.table.
 	Table         string
@@ -176,8 +185,10 @@ func (m *MemoryStore) TableUsage(_ context.Context, since time.Time) ([]TableUsa
 		for _, t := range q.TablesRead {
 			count(q, t, false)
 		}
-		for _, t := range q.TablesWritten {
-			count(q, t, true)
+		if ChangesData(q.StatementType) {
+			for _, t := range q.TablesWritten {
+				count(q, t, true)
+			}
 		}
 	}
 	out := make([]TableUsage, 0, len(tables))

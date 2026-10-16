@@ -23,9 +23,11 @@ func testLineage(t *testing.T, s Store) {
 		q("1", "ana", 0, OutcomeOK, "INSERT", orders, nil, report, ""),
 		q("2", "bob", time.Minute, OutcomeOK, "INSERT", []string{"lake.public.orders", "lake.public.report"}, nil, report, "task nightly"),
 		q("3", "ana", 2*time.Minute, OutcomeError, "INSERT", orders, nil, report, ""),
-		q("4", "bob", 3*time.Minute, OutcomeOK, "COPY INTO", nil, []string{"s3://landing/sales/"}, []string{"lake.public.Report"}, "pipe drops"),
+		q("4", "bob", 3*time.Minute, OutcomeOK, "COPY", nil, []string{"s3://landing/sales/"}, []string{"lake.public.Report"}, "pipe drops"),
 		q("5", "cy", 4*time.Minute, OutcomeOK, "SELECT", orders, nil, nil, ""),
 		q("6", "ana", -48*time.Hour, OutcomeOK, "INSERT", []string{"lake.public.old"}, nil, report, ""),
+		// A comment changes no data.
+		q("7", "ana", 5*time.Minute, OutcomeOK, "COMMENT", nil, nil, report, ""),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -89,12 +91,12 @@ func TestPostgresLineage(t *testing.T) {
 	}
 	testLineage(t, s)
 	qs, err := s.Queries(ctx, Viewer{All: true}, Page{Limit: 10})
-	if err != nil || len(qs) != 6 {
+	if err != nil || len(qs) != 7 {
 		t.Fatalf("queries: %d %v", len(qs), err)
 	}
 	for _, q := range qs {
-		if q.StatementType == "COPY INTO" && (q.Job != "pipe drops" || len(q.LocationsRead) != 1) {
-			t.Errorf("a COPY INTO read back: %+v", q)
+		if q.StatementType == "COPY" && (q.Job != "pipe drops" || len(q.LocationsRead) != 1) {
+			t.Errorf("a COPY read back: %+v", q)
 		}
 	}
 }
