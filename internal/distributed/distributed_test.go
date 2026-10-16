@@ -89,6 +89,35 @@ func TestShapes(t *testing.T) {
 	}
 }
 
+// TestSessionSettings checks that workers compute with the session's
+// settings: a time zone that moves rows across days, and integer division.
+func TestSessionSettings(t *testing.T) {
+	h := newHarness(t, 0.01, 4, 2)
+	h.addTable("events", `(SELECT CAST(TIMESTAMPTZ '2026-01-01 00:00:00+00' + to_minutes(i * 37) AS TIMESTAMPTZ) AS ts,
+		i % 7 AS k FROM range(5000) t(i))`, 4)
+	for _, setting := range []string{"SET TimeZone = 'America/Los_Angeles'", "SET TimeZone = 'Asia/Kolkata'"} {
+		h.exec(setting)
+		for _, q := range []string{
+			`SELECT date_trunc('day', ts) AS day, count(*) FROM events GROUP BY 1 ORDER BY 1`,
+			`SELECT CAST(ts AS DATE) AS d, strftime(ts, '%H') AS hour, count(*) FROM events GROUP BY ALL ORDER BY ALL`,
+		} {
+			t.Run(setting+" "+short(q), func(t *testing.T) {
+				h.t = t
+				if !h.check(q) {
+					t.Error("did not run distributed")
+				}
+			})
+		}
+	}
+	h.t = t
+	h.exec("SET integer_division = true")
+	if !h.check(`SELECT k, sum(k / 2) AS half FROM events GROUP BY k ORDER BY k`) {
+		t.Error("did not run distributed")
+	}
+	h.exec("RESET integer_division")
+	h.exec("RESET TimeZone")
+}
+
 // TestLocal covers statements that must run on one machine.
 func TestLocal(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)

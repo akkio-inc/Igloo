@@ -83,8 +83,8 @@ In detail, a part runs distributed when:
 - The large table appears once in it, and the other tables it reads
   together fit comfortably in a worker's memory (an eighth of it, in
   compressed size); or all but the largest of them fit, and that one is
-  joined to the large table directly (by `JOIN ... ON` or `WHERE`) on
-  equal columns of the same type (integer types may mix).
+  joined to the large table directly, by an inner `JOIN ... ON` or `WHERE`,
+  on equal columns of the same type (integer types may mix).
 - It runs outside an explicit transaction, so it reads the tables' latest
   snapshots, and does not use time travel.
 
@@ -174,7 +174,7 @@ parts on the workers.
 
   | Metric | Labels | Meaning |
   |---|---|---|
-  | `igloo_distributed_queries_total` | `outcome` = `ok`, `fallback` | Statements whose parts ran on workers, and statements that started to and ran on the coordinator instead |
+  | `igloo_distributed_queries_total` | `outcome` = `ok`, `error`, `canceled`, `fallback` | Statements whose parts ran on workers (`error`: an error in the data), and statements that started to and ran on the coordinator instead |
   | `igloo_distributed_fallbacks_total` | `reason` = `no_workers`, `worker_error`, `combine_error` | Why a statement ran on the coordinator after all |
   | `igloo_distributed_query_seconds` | | Time to run a statement's parts and combine them, before results are sent |
   | `igloo_distributed_tasks_total` | `result` = `ok`, `retried`, `failed` | Parts sent to workers |
@@ -260,7 +260,7 @@ On the Igloo server:
 | `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
 | `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
-| `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | , the server's | `kubernetes`: the workers' Deployment |
+| `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |
 

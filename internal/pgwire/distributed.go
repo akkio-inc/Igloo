@@ -93,7 +93,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		if !distributed.IsUnsupported(err) {
 			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
-		} else if sess.mode() == distributed.ModeOn {
+		} else {
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 		}
 		return 0, false, nil

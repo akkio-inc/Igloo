@@ -228,7 +228,7 @@ to deploy workers. On the Igloo server:
 | `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
 | `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before running on the server |
-| `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | , Igloo's | `kubernetes`: the workers' Deployment and its namespace |
+| `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not Igloo's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances, comma separated |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop every worker |
 
