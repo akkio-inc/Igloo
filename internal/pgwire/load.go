@@ -1078,8 +1078,8 @@ func (s *Server) execDDL(ctx context.Context, sess *session, user auth.User, que
 	if st.effect != nil {
 		s.applyEffect(ctx, sess, st.effect)
 	}
-	if st.created != nil {
-		s.recordOwner(ctx, user, st.created)
+	for _, c := range st.created {
+		s.recordOwner(ctx, user, c)
 	}
 	return nil
 }

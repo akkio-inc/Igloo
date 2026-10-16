@@ -286,6 +286,12 @@ func TestOwners(t *testing.T) {
 		!slices.Contains(got, "public.orders=igloo/user") {
 		t.Errorf("owners after creates: %q", got)
 	}
+	// So does an admin's, in a query of several statements.
+	mustExec(t, cs.admin, "CREATE TABLE lake.marts.a (i INTEGER); CREATE SCHEMA lake.extra; CREATE TABLE lake.marts.b AS SELECT 1 AS x")
+	if got := owners(); !slices.Contains(got, "marts.a=igloo/user") || !slices.Contains(got, "extra=igloo/user") ||
+		!slices.Contains(got, "marts.b=igloo/user") {
+		t.Errorf("owners after several creates: %q", got)
+	}
 	// Replacing a table keeps its owner; the reader cannot change it.
 	mustExec(t, cs.admin, "CREATE OR REPLACE TABLE lake.marts.spend AS SELECT 2 AS n")
 	expectDenied(t, rita, "ALTER TABLE lake.marts.spend OWNER TO rita", "changing the owner of table marts.spend")
@@ -313,6 +319,7 @@ func TestOwners(t *testing.T) {
 	}
 	mustExec(t, wally, "DROP TABLE lake.marts.outlay")
 	mustExec(t, cs.admin, "DROP ROLE analysts")
+	mustExec(t, cs.admin, "DROP SCHEMA lake.marts CASCADE")
 	if got := owners(); slices.ContainsFunc(got, func(s string) bool { return strings.HasPrefix(s, "marts") }) {
 		t.Errorf("owners after the drops: %q", got)
 	}

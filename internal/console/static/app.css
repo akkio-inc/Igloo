@@ -819,6 +819,7 @@ td .statement { display: block; max-width: 520px; white-space: pre-wrap; word-br
 .catalog-description .comment { flex: 1; white-space: pre-wrap; }
 .catalog-body { padding: 14px 24px 0; }
 .catalog-stats .stat .value { font-size: 18px; }
+.badge-list { display: flex; flex-wrap: wrap; gap: 4px; }
 .lineage-wrap { overflow: auto; padding: 8px; }
 svg.lineage { display: block; }
 .lineage-edge { fill: none; stroke: var(--border-strong); stroke-width: 1.5; }

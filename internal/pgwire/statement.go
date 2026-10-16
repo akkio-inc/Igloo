@@ -48,9 +48,9 @@ type statement struct {
 	// effect is what the statement, once it succeeds, does to the objects
 	// grants name.
 	effect *grantEffect
-	// created is the catalog object a CREATE makes, whose owner its user
-	// becomes.
-	created *createdObject
+	// created are the catalog objects its CREATE statements make, whose
+	// owner its user becomes.
+	created []*createdObject
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

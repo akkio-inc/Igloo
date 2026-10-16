@@ -900,8 +900,8 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			if st.effect != nil {
 				s.applyEffect(ctx, sess, st.effect)
 			}
-			if st.created != nil {
-				s.recordOwner(ctx, user, st.created)
+			for _, c := range st.created {
+				s.recordOwner(ctx, user, c)
 			}
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
@@ -1010,7 +1010,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// What a CREATE makes, whose owner its user becomes, is worked out
 	// before it is prepared, since afterwards that could make preparing
 	// it again necessary (see reprepare).
-	created := s.createdObject(ctx, sess, query)
+	created := s.createdObjects(ctx, sess, query)
 
 	if listsColumns.MatchString(query) {
 		// Best effort: a table that fails to load keeps its placeholder.
@@ -1093,7 +1093,8 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if st.stmtType == duckdb.STATEMENT_TYPE_DROP || st.stmtType == duckdb.STATEMENT_TYPE_ALTER {
 		st.effect = s.ddlEffect(ctx, sess, query)
 	}
-	if st.stmtType == duckdb.STATEMENT_TYPE_CREATE {
+	// Preparing several statements ran all but the last.
+	if st.stmtType == duckdb.STATEMENT_TYPE_CREATE || len(sqllex.Split(query)) > 1 {
 		st.created = created
 	}
 	if st.access != nil && st.access.ranStatements {

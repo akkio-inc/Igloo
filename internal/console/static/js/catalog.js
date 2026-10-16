@@ -232,15 +232,18 @@ export function createCatalog(app) {
         .map((t) => h('span', { class: 'badge', text: `${t.tag_name} = ${t.tag_value}` })),
     ];
     const rowPolicy = page.policies.find((p) => p.policy_kind === 'ROW ACCESS POLICY');
+    const governed = page.columns.some((c) => badges(c).length);
+    const headings = ['Column', 'Type', 'Description', ''];
+    if (governed) headings.splice(3, 0, 'Policies and tags');
     return h('div', { class: 'stack' },
       rowPolicy ? h('p', { class: 'notice', text: `Rows are filtered by the row access policy ${rowPolicy.policy_name}.` }) : null,
       h('div', { class: 'card table-wrap' }, h('table', { class: 'list' },
-        h('thead', {}, h('tr', {}, ['Column', 'Type', 'Description', 'Policies and tags', ''].map((t) => h('th', { text: t })))),
+        h('thead', {}, h('tr', {}, headings.map((t) => h('th', { text: t })))),
         h('tbody', {}, page.columns.map((c) => h('tr', {},
           h('td', { class: 'mono', text: c.column_name }),
           h('td', { class: 'mono muted', text: c.data_type }),
           h('td', { class: c.comment ? '' : 'faint', text: c.comment || '' }),
-          h('td', { class: 'badges' }, badges(c)),
+          governed ? h('td', {}, h('div', { class: 'badge-list' }, badges(c))) : null,
           h('td', { class: 'actions' }, canComment ? button('Edit', {
             kind: 'small ghost',
             onclick: () => editComment(`Describe ${name}.${c.column_name}`, c.comment, { kind: 'column', schema, name, column: c.column_name }),

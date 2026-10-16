@@ -351,12 +351,27 @@ type createdObject struct {
 	keep bool
 }
 
-// createdObject works out what a CREATE statement makes in the catalog,
-// or nil.
+// createdObjects works out what the CREATE statements of query make in
+// the catalog: only admins may send several statements in one query.
+func (s *Server) createdObjects(ctx context.Context, sess *session, query string) []*createdObject {
+	if s.catalogName() == "" {
+		return nil
+	}
+	var out []*createdObject
+	for _, stmt := range sqllex.Split(query) {
+		if c := s.createdObject(ctx, sess, stmt.Text); c != nil {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// createdObject works out what one CREATE statement makes in the
+// catalog, or nil.
 func (s *Server) createdObject(ctx context.Context, sess *session, query string) *createdObject {
 	catalogName := s.catalogName()
 	sc := &scanner{s: query}
-	if catalogName == "" || sc.word() != "CREATE" || len(sqllex.Split(query)) != 1 {
+	if sc.word() != "CREATE" {
 		return nil
 	}
 	if sc.keywords("CREATE", "SCHEMA") {

@@ -118,10 +118,11 @@ tags](security-policies.md) describes them.
 
 Igloo records every statement and every login attempt: who, when, how long,
 the outcome and SQLSTATE, rows returned or changed, the statement text,
-the tables it read and wrote (for statements checked against grants), the
-client's address and `application_name`, the query tag and compute pool,
-and what DuckDB measured: CPU time, bytes read and memory allocated.
-Read them with SQL:
+the tables and locations it read and the tables it wrote, the task, pipe or
+materialized view it ran for, the client's address and `application_name`,
+the query tag and compute pool, and what DuckDB measured: CPU time, bytes
+read and memory allocated. The [catalog](catalog.md)'s lineage and table
+usage are worked out from it. Read them with SQL:
 
 ```sql
 SELECT start_time, user_name, outcome, duration_ms, query_text
@@ -151,7 +152,11 @@ statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
   If it stays unavailable, or falls far enough behind that 10,000 records
   wait, records are dropped: the log warns (`dropped history records`, at
   most once a minute) and `igloo_audit_dropped_total` counts them.
-- `IGLOO_AUDIT=false` turns recording off, and with it `igloo.usage`.
+- What a statement read and wrote is worked out in the background after it
+  runs (see [lineage](catalog.md#lineage)); when more than 10,000 statements
+  wait for that, statements are recorded without it, and the log warns.
+- `IGLOO_AUDIT=false` turns recording off, and with it `igloo.usage`,
+  lineage, table usage and lineage events.
 - Each replica also records, once a minute, how long it has been running,
   for the cost estimates of [`igloo.usage`](workload-management.md#usage-and-cost),
   in `igloo_audit.compute_time`; it is pruned with the history. A minute
