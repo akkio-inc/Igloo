@@ -27,8 +27,8 @@ async function fail(res) {
   return new APIError(res.status, body);
 }
 
-export async function get(path) {
-  const res = await fetch(path, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+export async function get(path, { signal } = {}) {
+  const res = await fetch(path, { headers: { Accept: 'application/json' }, credentials: 'same-origin', signal });
   if (!res.ok) throw await fail(res);
   return res.json();
 }

@@ -4,6 +4,7 @@ import * as api from './api.js';
 import { hydrate, icon, toast, h, clear, mark } from './dom.js';
 import { createWorksheets } from './worksheets.js';
 import { createData } from './data.js';
+import { createCatalog } from './catalog.js';
 import { createHistory } from './history.js';
 import { createJobs, createLoads } from './tasks.js';
 import { createUsers, createRoles, createCompute } from './admin.js';
@@ -112,6 +113,7 @@ function signedOut(body) {
 const ROUTES = {
   worksheets: { make: createWorksheets, title: 'Worksheets' },
   data: { make: createData, title: 'Data' },
+  catalog: { make: createCatalog, title: 'Catalog' },
   history: { make: createHistory, title: 'Query history' },
   tasks: { make: createJobs, title: 'Tasks' },
   loads: { make: createLoads, title: 'Load history' },
@@ -148,6 +150,9 @@ function start(session) {
 
   function route() {
     let name = location.hash.replace(/^#\/?/, '') || 'worksheets';
+    // A table's catalog page is catalog/<schema>/<name>.
+    let param = '';
+    if (!ROUTES[name] && name.startsWith('catalog/')) [name, param] = ['catalog', name.slice('catalog/'.length)];
     if (!ROUTES[name] || (ROUTES[name].admin && !app.isAdmin)) name = 'worksheets';
     for (const [key, p] of pages) p.el.hidden = key !== name;
     const p = page(name);
@@ -158,7 +163,7 @@ function start(session) {
       else a.removeAttribute('aria-current');
     }
     closeMenu();
-    p.shown?.();
+    p.shown?.(param);
   }
 
   $('whoami-name').textContent = session.user;

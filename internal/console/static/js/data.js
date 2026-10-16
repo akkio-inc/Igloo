@@ -116,6 +116,7 @@ export function createData(app) {
         h('h1', { text: `${o.schema}.${o.name}` }),
         h('span', { class: 'badge', text: o.kind }),
         h('span', { class: 'spacer' }),
+        button('Catalog page', { icon: 'catalog', onclick: () => { location.hash = `#/catalog/${encodeURIComponent(o.schema)}/${encodeURIComponent(o.name)}`; } }),
         button('Query in a worksheet', { icon: 'open', onclick: () => app.openWorksheet(`SELECT *\nFROM ${qualified(o)}\nLIMIT 100;\n`, o.name) })),
       h('p', { class: 'comment' }));
     clear(detail, head, tabs, panel);

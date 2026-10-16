@@ -1,6 +1,7 @@
 // Package console serves Igloo's web console: SQL worksheets, a data
-// browser, query history, and pages for administrators to manage users,
-// roles and grants, and to watch this replica's sessions.
+// browser, a catalog of tables with their owners and lineage, query
+// history, and pages for administrators to manage users, roles and grants,
+// and to watch this replica's sessions.
 //
 // The console holds no state of its own. Passwords are checked by the SQL
 // server (pgwire.Server.Authenticate), as for SQL logins, single sign-on by
@@ -128,6 +129,9 @@ func (c *Console) routes() {
 	c.mux.HandleFunc("POST /api/logout", c.signedIn(c.logout))
 	c.mux.HandleFunc("POST /api/query", c.signedIn(c.query))
 	c.mux.HandleFunc("POST /api/download", c.signedIn(c.download))
+	c.mux.HandleFunc("GET /api/catalog/search", c.signedIn(c.search))
+	c.mux.HandleFunc("GET /api/catalog/object", c.signedIn(c.object))
+	c.mux.HandleFunc("POST /api/catalog/comment", c.signedIn(c.comment))
 	c.mux.HandleFunc("GET /api/admin/users", c.admin(c.listUsers))
 	c.mux.HandleFunc("POST /api/admin/users", c.admin(c.changeUser))
 	c.mux.HandleFunc("GET /api/admin/grants", c.admin(c.listGrants))
