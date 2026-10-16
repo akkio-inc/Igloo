@@ -80,6 +80,10 @@ func (s *lakeSource) Files(_ context.Context, t *distributed.Table) ([]distribut
 	return s.files[t.Schema+"."+t.Name], nil
 }
 
+func (s *lakeSource) RemoveAll(_ context.Context, _ *distributed.Table, dir string) error {
+	return os.RemoveAll(dir)
+}
+
 type workerEngine struct{ c *duckdb.Connector }
 
 func (e workerEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {

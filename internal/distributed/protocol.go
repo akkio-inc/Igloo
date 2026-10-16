@@ -38,6 +38,10 @@ type taskRequest struct {
 	SQL      string    `json:"sql"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
+	// Shuffle, if set, makes the task write its result to this directory
+	// in object storage, partitioned by its __b column, instead of sending
+	// it back; the response lists the files.
+	Shuffle string `json:"shuffle,omitempty"`
 }
 
 // setting is a session setting the fragment runs with.
@@ -47,11 +51,14 @@ type setting struct {
 }
 
 // viewDef is a table as a fragment reads it: the data files of its
-// snapshot, or of one worker's share of it, read by field ID.
+// snapshot, or of one worker's share of it, read by field ID; or, with
+// ByName, files of one partition of the table's rows that workers wrote,
+// read by column name.
 type viewDef struct {
 	Name    string   `json:"name"`
 	Columns []Column `json:"columns"`
 	Files   []string `json:"files"`
+	ByName  bool     `json:"by_name,omitempty"`
 }
 
 // taskResult heads a task's response.
@@ -59,7 +66,15 @@ type taskResult struct {
 	// Columns are the result's columns, with their DuckDB types.
 	Columns []Column `json:"columns,omitempty"`
 	Rows    int64    `json:"rows"`
-	Error   *taskErr `json:"error,omitempty"`
+	// Files are a shuffle task's output files.
+	Files []shuffleFile `json:"files,omitempty"`
+	Error *taskErr      `json:"error,omitempty"`
+}
+
+// shuffleFile is a file of rows a shuffle task wrote for one partition.
+type shuffleFile struct {
+	Path      string `json:"path"`
+	Partition int    `json:"partition"`
 }
 
 // taskErr is a failed task.

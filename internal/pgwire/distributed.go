@@ -85,8 +85,13 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || sess.mode() == distributed.ModeOff {
 		return 0, false, nil
 	}
+	settings, err := s.distributedSettings(ctx, sess)
+	if err != nil {
+		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+		return 0, false, nil
+	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
-	plan, err := s.dist.Plan(ctx, st.query, env, sess.mode())
+	plan, err := s.dist.Plan(ctx, st.query, env, sess.mode(), settings)
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, true, ctx.Err()
@@ -98,12 +103,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		return 0, false, nil
 	}
-	settings, err := s.distributedSettings(ctx, sess)
-	if err != nil {
-		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-		return 0, false, nil
-	}
-	ex, err := s.dist.Execute(ctx, plan, settings)
+	ex, err := s.dist.Execute(ctx, plan)
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:

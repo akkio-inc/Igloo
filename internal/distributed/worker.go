@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/activity"
+	"github.com/akkio-inc/igloo/internal/config"
 )
 
 // A worker runs fragments for coordinators. It is an Igloo process with a
@@ -172,6 +174,16 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		w.fail(rw, http.StatusUnprocessableEntity, te)
 		return
 	}
+	if req.Shuffle != "" {
+		// The rows are in object storage; the response lists the files.
+		head, _ := json.Marshal(res)
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Header().Set("Content-Length", strconv.Itoa(len(head)+1))
+		_, _ = rw.Write(append(head, '\n'))
+		w.opts.Metrics.task("ok", start)
+		log.Debug("shuffle task done", "rows", res.Rows, "files", len(res.Files), "seconds", time.Since(start).Seconds())
+		return
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -213,7 +225,8 @@ func (w *Worker) fail(rw http.ResponseWriter, status int, te *taskErr) {
 }
 
 // run runs a task on a connection of its own and writes the result to a
-// Parquet file, whose path it returns.
+// Parquet file, whose path it returns; a shuffle task writes it to object
+// storage instead, one directory per partition, and lists the files.
 func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult, error) {
 	conn, err := w.opts.Engine.Connect(ctx)
 	if err != nil {
@@ -255,6 +268,10 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	if err != nil {
 		return "", nil, err
 	}
+	if req.Shuffle != "" {
+		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols)
+		return "", res, err
+	}
 	// Columns Parquet would change cross as text; see transferType.
 	sel := make([]string, len(cols))
 	for i, c := range cols {
@@ -280,9 +297,73 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	return path, &taskResult{Columns: cols, Rows: rows}, nil
 }
 
+// shuffle writes the rows of query, partitioned by its __b column, under
+// dir, and lists the files written.
+func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column) (*taskResult, error) {
+	if !w.allowed(dir+"/") || !strings.Contains(dir, "/"+config.ShuffleDir+"/") {
+		return nil, fmt.Errorf("shuffle directory %s is outside the warehouse's %s", dir, config.ShuffleDir)
+	}
+	if !slices.ContainsFunc(cols, func(c Column) bool { return c.Name == "__b" }) {
+		return nil, errors.New("a shuffle task's rows have no __b column")
+	}
+	if !strings.Contains(dir, "://") {
+		// A warehouse on local disk, as in tests: DuckDB creates only the
+		// last directory. Object stores have no directories to create.
+		if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+			return nil, err
+		}
+	}
+	res, err := conn.ExecContext(ctx, "COPY ("+query+") TO "+quoteLiteral(dir)+" (FORMAT parquet, PARTITION_BY (__b))", nil)
+	if err != nil {
+		return nil, err
+	}
+	rows, _ := res.RowsAffected()
+	out := &taskResult{Rows: rows, Files: []shuffleFile{}}
+	for _, c := range cols {
+		if c.Name != "__b" {
+			out.Columns = append(out.Columns, c)
+		}
+	}
+	files, err := globFiles(ctx, conn, dir+"/*/*.parquet")
+	if err != nil {
+		return nil, fmt.Errorf("list shuffle files: %w", err)
+	}
+	for _, f := range files {
+		rest, ok := strings.CutPrefix(f, dir+"/__b=")
+		part, _, _ := strings.Cut(rest, "/")
+		n, err := strconv.Atoi(part)
+		if !ok || err != nil {
+			return nil, fmt.Errorf("unexpected shuffle file %s", f)
+		}
+		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n})
+	}
+	return out, nil
+}
+
+func globFiles(ctx context.Context, conn *duckdb.Conn, pattern string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT file FROM glob("+quoteLiteral(pattern)+") ORDER BY file", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var out []string
+	dest := make([]driver.Value, 1)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		s, _ := dest[0].(string)
+		out = append(out, s)
+	}
+}
+
 // viewStatement defines a view over data files, read by Iceberg field ID
 // so files written before a column was renamed, added or widened read as
-// the table's current schema does. A table without files is empty.
+// the table's current schema does, or over shuffled files, read by name. A
+// table without files is empty.
 func (w *Worker) viewStatement(v viewDef) (string, error) {
 	if !strings.HasPrefix(v.Name, "__igloo_") {
 		return "", fmt.Errorf("view name %q", v.Name)
@@ -303,6 +384,14 @@ func (w *Worker) viewStatement(v viewDef) (string, error) {
 			return "", fmt.Errorf("file %s is outside the warehouse", f)
 		}
 		files[i] = quoteLiteral(f)
+	}
+	if v.ByName {
+		cols := make([]string, len(v.Columns))
+		for i, c := range v.Columns {
+			cols[i] = "CAST(" + quoteIdent(c.Name) + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
+		}
+		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT " + strings.Join(cols, ", ") +
+			" FROM read_parquet([" + strings.Join(files, ", ") + "])", nil
 	}
 	schema := make([]string, len(v.Columns))
 	for i, c := range v.Columns {

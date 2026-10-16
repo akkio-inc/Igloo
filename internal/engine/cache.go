@@ -152,8 +152,10 @@ func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool) []strin
 		"SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = false",
 		"SET GLOBAL enable_external_file_cache = true",
 		// Cache only the warehouse: other allowed locations hold files
-		// that are read once, such as data to load.
+		// that are read once, such as data to load, and so do the rows
+		// distributed-execution workers exchange.
 		"SELECT cache_httpfs_add_exclusion_regex("+literal("^(?!"+regexp.QuoteMeta(warehouseRoot)+")")+")",
+		"SELECT cache_httpfs_add_exclusion_regex("+literal("^"+regexp.QuoteMeta(warehouseRoot+config.ShuffleDir+"/"))+")",
 		// Remove blocks a crash left half written.
 		"SELECT cache_httpfs_cleanup_dead_temp()",
 		"SET GLOBAL cache_httpfs_type = "+literal(cacheType),

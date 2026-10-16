@@ -135,7 +135,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	}
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: source, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
-		Threads: threads, Metrics: distributed.NewMetrics(reg),
+		Warehouse: cfg.Storage.Root(), Threads: threads, Metrics: distributed.NewMetrics(reg),
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, StartTimeout: cfg.Workers.StartTimeout,

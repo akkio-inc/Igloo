@@ -39,6 +39,8 @@ type harness struct {
 	workers []*Worker
 	lns     []net.Listener
 	log     *slog.Logger
+	// removed are the directories the coordinator removed.
+	removed []string
 }
 
 // fileSource serves the harness's tables.
@@ -54,6 +56,11 @@ func (s fileSource) Table(_ context.Context, schema, name string) (*Table, error
 
 func (s fileSource) Files(_ context.Context, t *Table) ([]File, error) {
 	return s.h.files[t.key()], nil
+}
+
+func (s fileSource) RemoveAll(_ context.Context, _ *Table, dir string) error {
+	s.h.removed = append(s.h.removed, dir)
+	return os.RemoveAll(dir)
 }
 
 // harnessEnv resolves names in the harness's session.
@@ -193,7 +200,7 @@ func (h *harness) startWorkers(n int) {
 	}
 	co, err := NewCoordinator(Options{
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator"),
-		Threads: 2, Pool: PoolOptions{Addresses: addrs},
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Threads: 2, Pool: PoolOptions{Addresses: addrs},
 	}, h.log)
 	if err != nil {
 		h.t.Fatal(err)
@@ -260,12 +267,11 @@ func (h *harness) startWorker(i int) {
 // run plans and executes query distributed and returns its rows, or
 // ok = false if it ran on one machine.
 func (h *harness) run(ctx context.Context, query string, mode Mode) (rows [][]any, cols []string, plan *Plan, ex *Execution, err error) {
-	plan, err = h.co.Plan(ctx, query, harnessEnv{h}, mode)
+	plan, err = h.co.Plan(ctx, query, harnessEnv{h}, mode, h.settings(ctx))
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	settings := h.settings(ctx)
-	ex, err = h.co.Execute(ctx, plan, settings)
+	ex, err = h.co.Execute(ctx, plan)
 	if err != nil {
 		return nil, nil, plan, nil, err
 	}

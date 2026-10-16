@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,9 @@ type Options struct {
 	// TempDir holds partial results while the final query reads them. It
 	// must be a directory DuckDB may read: the server's spill directory.
 	TempDir string
+	// Warehouse is the warehouse root, with a trailing slash. Partitioned
+	// joins exchange rows under it.
+	Warehouse string
 	// Threads are the coordinator's DuckDB threads, for estimating how
 	// long a statement would take on it.
 	Threads int
@@ -82,14 +86,17 @@ type Options struct {
 
 // Coordinator splits statements into parts that workers run.
 type Coordinator struct {
-	opts   Options
-	pool   *pool
-	parser *parser
-	aggs   map[string]bool
-	dir    string
-	log    *slog.Logger
-	stop   context.CancelFunc
-	done   chan struct{}
+	opts Options
+	pool *pool
+	// maxBroadcast, if set, overrides what every worker may read in full,
+	// for tests.
+	maxBroadcast int64
+	parser       *parser
+	aggs         map[string]bool
+	dir          string
+	log          *slog.Logger
+	stop         context.CancelFunc
+	done         chan struct{}
 }
 
 // NewCoordinator returns a coordinator for the workers opts.Pool names.
@@ -165,13 +172,19 @@ func (co *Coordinator) Metrics() *Metrics { return co.opts.Metrics }
 func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.ready(ctx)) }
 
 // Plan decides whether a statement runs distributed and, if so, how. query
-// is the statement as the session prepared it. An error for which
-// IsUnsupported is true means it runs on the coordinator as usual.
-func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode) (*Plan, error) {
+// is the statement as the session prepared it, settings the session's
+// values of SettingNames. An error for which IsUnsupported is true means
+// it runs on the coordinator as usual.
+func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode, settings []Setting) (*Plan, error) {
 	if mode == ModeOff {
 		return nil, unsupported("distributed execution is off for this session")
 	}
 	opts := planOptions{force: mode == ModeOn, now: time.Now(), maxBroadcast: defaultBroadcast}
+	for _, s := range settings {
+		if strings.EqualFold(s.Name, "default_collation") {
+			opts.collation = s.Value
+		}
+	}
 	ws := co.pool.ready(ctx)
 	rate := int64(co.opts.Threads) * scanRatePerThread
 	switch {
@@ -193,6 +206,9 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	default:
 		return nil, unsupported("no workers are running")
 	}
+	if co.maxBroadcast > 0 {
+		opts.maxBroadcast = co.maxBroadcast
+	}
 	stmt, err := co.parser.parse(query)
 	if err != nil {
 		return nil, unsupported("%v", err)
@@ -201,7 +217,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if err != nil {
 		return nil, err
 	}
-	plan.force = opts.force
+	plan.force, plan.settings = opts.force, settings
 	return plan, nil
 }
 
@@ -228,10 +244,11 @@ var ErrNoWorkers = errors.New("no workers available")
 // Setting is a session setting a statement runs with.
 type Setting = setting
 
-// Execute runs a plan's jobs on workers, with the session's settings. An
-// error that is not a *duckdb.Error from the data, nor the context's, means
-// the statement should run on the coordinator instead.
-func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setting) (*Execution, error) {
+// Execute runs a plan's jobs on workers. An error that is not a
+// *duckdb.Error from the data, nor the context's, means the statement
+// should run on the coordinator instead.
+func (co *Coordinator) Execute(ctx context.Context, plan *Plan) (*Execution, error) {
+	settings := plan.settings
 	start := time.Now()
 	ex := &Execution{dir: filepath.Join(co.dir, newID())}
 	if err := os.MkdirAll(ex.dir, 0o700); err != nil {
@@ -297,7 +314,13 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	g, gctx = errgroup.WithContext(ctx)
 	for i, j := range plan.Jobs {
 		g.Go(func() error {
-			r, err := co.runJob(gctx, qid, ex.dir, j, ws, files, settings, plan.force)
+			var r *jobResult
+			var err error
+			if j.Partition != nil {
+				r, err = co.runPartitioned(gctx, qid, ex.dir, j, ws, files, settings)
+			} else {
+				r, err = co.runJob(gctx, qid, ex.dir, j, ws, files, settings, plan.force)
+			}
 			if err != nil {
 				return err
 			}
@@ -487,14 +510,20 @@ func assign(files []File, ws []*worker) [][]File {
 
 // dispatch runs a task, first on worker first (an index into ws), then on
 // other workers if that fails for any reason other than the data. It
-// returns the worker that ran it.
+// returns the worker that ran it. The result goes to path; a shuffle task
+// writes each attempt to a directory of its own, so the files of a failed
+// attempt are never read.
 func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*worker, first int, path string) (*worker, *taskResult, error) {
-	body, err := json.Marshal(task)
-	if err != nil {
-		return nil, nil, err
-	}
 	var last error
 	for attempt := range min(maxAttempts, len(ws)) {
+		t := *task
+		if t.Shuffle != "" {
+			t.Shuffle += "/a" + strconv.Itoa(attempt)
+		}
+		body, err := json.Marshal(&t)
+		if err != nil {
+			return nil, nil, err
+		}
 		w := ws[(first+attempt)%len(ws)]
 		head, err := co.fetch(ctx, w, body, path)
 		if err == nil {
@@ -547,6 +576,10 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 	var head taskResult
 	if err := json.Unmarshal(line, &head); err != nil {
 		return nil, fmt.Errorf("read result header: %w", err)
+	}
+	if path == "" {
+		// A shuffle task's rows are in object storage.
+		return &head, nil
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {

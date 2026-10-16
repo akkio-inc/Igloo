@@ -82,6 +82,8 @@ type Plan struct {
 	final node
 	// force uses every worker, whatever the tables' sizes.
 	force bool
+	// settings are the session's, which tasks run with.
+	settings []Setting
 }
 
 // Job is one part of a statement that workers run in parallel.
@@ -100,6 +102,10 @@ type Job struct {
 	Columns []string
 	// Broadcast is the size of the tables every worker reads in full.
 	Broadcast int64
+	// Partition, if set, says how the split table and a second large table
+	// are partitioned by their join key, so that each task reads matching
+	// partitions of both.
+	Partition *Partition
 
 	fragment    node
 	placeholder string
@@ -123,6 +129,8 @@ type planOptions struct {
 	// now is what the statement's now() and current_date stand for, so
 	// every machine sees the same time.
 	now time.Time
+	// collation is the session's default_collation.
+	collation string
 }
 
 // planner plans one statement.
@@ -180,6 +188,17 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		}
 		if j.Fragment, err = pl.p.print(j.fragment); err != nil {
 			return nil, unsupported("%v", err)
+		}
+		if j.Partition != nil {
+			for i := range j.Partition.Sides {
+				s := &j.Partition.Sides[i]
+				if err := pl.fixTime(s.stage); err != nil {
+					return nil, err
+				}
+				if s.SQL, err = pl.p.print(s.stage); err != nil {
+					return nil, unsupported("%v", err)
+				}
+			}
 		}
 	}
 	return &Plan{Jobs: pl.jobs, final: out}, nil
@@ -266,6 +285,9 @@ type candidate struct {
 	scope *scope
 	uses  []*tableUse
 	split *tableUse
+	// partition, if set, divides the split table and a second large table
+	// by their join key instead of reading the second in full.
+	partition *partitionPlan
 	// columns are its result columns.
 	columns []Column
 }
@@ -309,6 +331,11 @@ func (pl *planner) build(c *candidate, top bool, ctes []string) (*Job, *jobBuild
 			delete(u.ref, viewMark)
 		}
 	}()
+	if c.partition != nil {
+		if j.Partition, err = pl.stages(c, j); err != nil {
+			return nil, nil, err
+		}
+	}
 	var b *jobBuild
 	switch {
 	case c.aggregating(pl):
@@ -336,6 +363,9 @@ func (pl *planner) build(c *candidate, top bool, ctes []string) (*Job, *jobBuild
 // scope is the FROM clause of a SELECT: what its expressions can name.
 type scope struct {
 	items []*fromItem
+	// conds hold for every row the SELECT's FROM and WHERE produce: the
+	// conjuncts of its WHERE clause and of its inner joins' conditions.
+	conds []node
 }
 
 // fromItem is a table or subquery in a FROM clause.
@@ -355,6 +385,10 @@ type tableUse struct {
 	// reached from the candidate's FROM through joins that keep its rows
 	// whole, and not from a subquery expression.
 	splittable bool
+	// scope and item are the FROM clause the table is an item of and its
+	// item there; nil for tables read by subquery expressions.
+	scope *scope
+	item  *fromItem
 }
 
 // hasColumn reports whether some item of sc has a column called name
@@ -431,6 +465,7 @@ func (pl *planner) analyze(c *candidate, ctes []string) error {
 	if err := pl.filterSubqueries(child(sel, "where_clause"), ctes, &c.uses); err != nil {
 		return err
 	}
+	c.scope.conds = append(c.scope.conds, conjuncts(child(sel, "where_clause"))...)
 	// Subqueries in the select list, HAVING, QUALIFY or ORDER BY would run
 	// on the coordinator over the combined result, where the columns they
 	// may refer to no longer exist.
@@ -474,7 +509,7 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		}
 		renameColumns(item, list(ref, "column_name_alias"))
 		sc.items = append(sc.items, item)
-		*uses = append(*uses, &tableUse{ref: ref, table: tbl, splittable: splittable})
+		*uses = append(*uses, &tableUse{ref: ref, table: tbl, splittable: splittable, scope: sc, item: item})
 		return nil
 
 	case "JOIN":
@@ -487,6 +522,9 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		}
 		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, uses); err != nil {
 			return err
+		}
+		if str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF" {
+			sc.conds = append(sc.conds, conjuncts(child(ref, "condition"))...)
 		}
 		return pl.filterSubqueries(child(ref, "condition"), ctes, uses)
 
@@ -560,7 +598,23 @@ func (pl *planner) transparent(sel node, splittable bool, ctes []string, sc *sco
 	if err := pl.filterSubqueries(sel["select_list"], ctes, uses); err != nil {
 		return err
 	}
+	sc.conds = append(sc.conds, conjuncts(child(sel, "where_clause"))...)
 	return pl.filterSubqueries(child(sel, "where_clause"), ctes, uses)
+}
+
+// conjuncts splits a condition at its top-level ANDs.
+func conjuncts(e node) []node {
+	if e == nil {
+		return nil
+	}
+	if str(e["class"]) == "CONJUNCTION" && str(e["type"]) == "CONJUNCTION_AND" {
+		var out []node
+		for _, c := range list(e, "children") {
+			out = append(out, conjuncts(c.(node))...)
+		}
+		return out
+	}
+	return []node{e}
 }
 
 // filterSubqueries adds the tables that subquery expressions in v read to
@@ -734,6 +788,7 @@ func (pl *planner) chooseSplit(c *candidate) error {
 		return unsupported("the largest table, %s, is read where its rows cannot be divided", largest.table)
 	}
 	var broadcast int64
+	var second *tableUse
 	for _, u := range c.uses {
 		if u == c.split {
 			continue
@@ -742,13 +797,26 @@ func (pl *planner) chooseSplit(c *candidate) error {
 			return unsupported("%s is read more than once", c.split.table)
 		}
 		broadcast += u.table.Bytes
+		if second == nil || u.table.Bytes > second.table.Bytes {
+			second = u
+		}
 	}
 	if !pl.opts.force && c.split.table.Bytes < pl.opts.minBytes {
 		return unsupported("%s is small (%d bytes)", c.split.table, c.split.table.Bytes)
 	}
-	if broadcast > pl.opts.maxBroadcast {
+	if broadcast <= pl.opts.maxBroadcast {
+		return nil
+	}
+	// Too much for every worker to read: partition the two largest tables
+	// by their join key, if the rest fits.
+	if broadcast-second.table.Bytes > pl.opts.maxBroadcast {
 		return unsupported("the tables joined to %s are too large for every worker to read (%d bytes)", c.split.table, broadcast)
 	}
+	p, err := pl.partition(c, second)
+	if err != nil {
+		return err
+	}
+	c.partition = p
 	return nil
 }
 
@@ -784,7 +852,9 @@ func (pl *planner) views(c *candidate) *Job {
 			if name = names[u.table.key()]; name == "" {
 				name = fmt.Sprintf("__igloo_t%d", len(names))
 				names[u.table.key()] = name
-				j.Broadcast += u.table.Bytes
+				if c.partition == nil || u != c.partition.other {
+					j.Broadcast += u.table.Bytes
+				}
 			}
 		}
 		if !slices.ContainsFunc(j.Views, func(v View) bool { return v.Name == name }) {

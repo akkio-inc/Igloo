@@ -42,6 +42,11 @@ type Workers struct {
 // WorkerPort is the port workers listen on unless told otherwise.
 const WorkerPort = "7433"
 
+// ShuffleDir is the directory under the warehouse root where workers
+// exchange the rows of tables partitioned for a join, while a statement
+// runs.
+const ShuffleDir = "_igloo_shuffle"
+
 // minWorkerSecret matches distributed.MinSecretLength.
 const minWorkerSecret = 32
 

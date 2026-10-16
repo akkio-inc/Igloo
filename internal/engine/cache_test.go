@@ -52,6 +52,7 @@ func TestCacheStatements(t *testing.T) {
 		"SET GLOBAL cache_httpfs_evict_policy = 'lru_sp'",
 		"SET GLOBAL enable_external_file_cache = true",
 		`SELECT cache_httpfs_add_exclusion_regex('^(?!s3://my\.bucket/ware''house/)')`,
+		`SELECT cache_httpfs_add_exclusion_regex('^s3://my\.bucket/ware''house/_igloo_shuffle/')`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
