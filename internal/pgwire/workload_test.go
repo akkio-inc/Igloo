@@ -51,9 +51,15 @@ func TestQueryTags(t *testing.T) {
 			}
 			mustExec(t, conn, "RESET query_tag")
 			mustExec(t, conn, "SELECT 43 AS untagged_"+name)
-			if _, err := conn.Exec(ctx, "SET query_tag = 'a'; SELECT 1"); pgCode(err) != "42601" {
+			// The statements of a query run one at a time, so a tag set
+			// there applies to those after it.
+			if _, err := conn.Exec(ctx, "SET query_tag = 'a'; SELECT 1"); err != nil {
 				t.Errorf("a tag followed by more SQL: %v", err)
 			}
+			if err := conn.QueryRow(ctx, "SHOW query_tag").Scan(&tag); err != nil || tag != "a" {
+				t.Errorf("after SET with more SQL: %q %v", tag, err)
+			}
+			mustExec(t, conn, "RESET query_tag")
 		})
 	}
 	q := lastQuery(t, cs, "igloo", "SELECT 42 AS tagged_simple")

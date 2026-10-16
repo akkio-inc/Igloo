@@ -23,7 +23,8 @@ its tools in containers.
 | `make up` | Start the single-machine stack: Igloo, the Lakekeeper catalog, PostgreSQL and local object storage |
 | `make psql` | Open a SQL shell on the running stack |
 | `make helm-e2e` | Install the Helm chart on a throwaway kind cluster and test it end to end |
-| `make e2e` | Start an isolated copy of the stack and run `scripts/e2e.sh` against it, including the JDBC, psycopg and PyIceberg checks in `scripts/clients/` |
+| `make e2e` | Start an isolated copy of the stack and run `scripts/e2e.sh` against it, including the JDBC, psycopg, PyIceberg, notebook (SQLAlchemy, pandas, polars) and dbt checks in `scripts/clients/` |
+| `make bi-e2e` | Run `scripts/bi-e2e.sh`: Metabase, Apache Superset and Npgsql (Power BI) against an isolated stack. Pulls about 3 GB of images |
 | `make engines-e2e` | Run Spark and Trino against an isolated copy of the stack's Iceberg REST catalog (`scripts/engines-e2e.sh`; pulls about 3 GB, not part of CI) |
 | `make sharing-e2e` | Test Delta Sharing with the official Python client and the reference sharing server (`scripts/sharing-e2e.sh`); slower, and not part of CI |
 | `make down`, `make reset` | Stop the stack; `reset` also deletes its data |
@@ -56,6 +57,9 @@ Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 - `helm lint` and `helm template` for `deploy/helm/igloo`
 - `tofu fmt`, `tofu validate` and `tofu test` for `deploy/aws`, `deploy/gcp` and `deploy/azure`
 - ShellCheck on shell scripts and actionlint on the workflows
+
+[`.github/workflows/bi-tools.yml`](.github/workflows/bi-tools.yml) runs
+`make bi-e2e` weekly and on demand.
 
 The Helm and OpenTofu versions CI uses are set at the top of `ci.yml`; use the
 same ones to check chart or module changes locally.

@@ -1209,6 +1209,27 @@ func (r *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 	return r.LoadTable(ctx, to)
 }
 
+// RenameView renames a view. (Igloo patch; see IGLOO_PATCHES.md.)
+func (r *Catalog) RenameView(ctx context.Context, from, to table.Identifier) error {
+	type payload struct {
+		Source      identifier `json:"source"`
+		Destination identifier `json:"destination"`
+	}
+	src := identifier{
+		Namespace: catalog.NamespaceFromIdent(from),
+		Name:      catalog.TableNameFromIdent(from),
+	}
+	dst := identifier{
+		Namespace: catalog.NamespaceFromIdent(to),
+		Name:      catalog.TableNameFromIdent(to),
+	}
+
+	_, err := doPostAllowNoContent[payload, any](ctx, r.baseURI, []string{"views", "rename"}, payload{Source: src, Destination: dst}, r.cl,
+		map[int]error{http.StatusNotFound: catalog.ErrNoSuchView, http.StatusConflict: catalog.ErrViewAlreadyExists}, true)
+
+	return err
+}
+
 func (r *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifier, props iceberg.Properties) error {
 	if err := checkValidNamespace(namespace); err != nil {
 		return err

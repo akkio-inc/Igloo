@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
+
+	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
 // kind is how a statement's result reaches the client.
@@ -51,6 +55,13 @@ type statement struct {
 	// created are the catalog objects its CREATE statements make, whose
 	// owner its user becomes.
 	created []*createdObject
+	// changesIceberg says the statement creates, alters or drops a schema,
+	// table or view in the Iceberg catalog, so it runs outside the
+	// session's transaction block (see outsideTransaction).
+	changesIceberg bool
+	// unknown says DuckDB could not tell the type of a column of the result
+	// when it prepared the statement.
+	unknown bool
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client
@@ -69,7 +80,57 @@ func prepare(ctx context.Context, conn *duckdb.Conn, query string, clientOIDs []
 	if err := st.describe(oids); err != nil {
 		return nil, errors.Join(err, st.close())
 	}
+	if st.unknown {
+		// Best effort: otherwise the unknown columns go out as text.
+		_ = st.describeWithNulls(ctx, conn)
+	}
 	return st, nil
+}
+
+// describeWithNulls describes the result of a statement that DuckDB binds
+// only once it has its parameters' values, such as one that calls
+// json_object($1, x), as SQLAlchemy's reflection does: until then DuckDB
+// reports a single column of unknown type. It prepares the query again with
+// each parameter replaced by a NULL of the parameter's type, which DuckDB
+// can bind, and takes that statement's columns; st itself runs as prepared.
+func (st *statement) describeWithNulls(ctx context.Context, conn *duckdb.Conn) error {
+	nulls := sqllex.MapCode(st.prepared, func(code string) string {
+		return placeholder.ReplaceAllStringFunc(code, func(m string) string {
+			t := "VARCHAR"
+			if n, err := strconv.Atoi(m[1:]); err == nil && n >= 1 && n <= len(st.params) {
+				if name, ok := paramTypes[st.params[n-1]]; ok {
+					t = name
+				} else if name, ok := arrayOIDs[st.params[n-1]]; ok {
+					t = name
+				}
+			}
+			return "CAST(NULL AS " + t + ")"
+		})
+	})
+	ds, err := conn.PrepareContext(ctx, nulls)
+	if err != nil {
+		return err
+	}
+	probe := &statement{stmt: ds.(*duckdb.Stmt), query: nulls}
+	defer probe.close() //nolint:errcheck
+	if err := probe.describe(nil); err != nil {
+		return err
+	}
+	if probe.unknown || probe.kind != returnsRows {
+		return errors.New("the result's columns are still unknown")
+	}
+	st.columns, st.encoders, st.unknown = probe.columns, probe.encoders, false
+	return nil
+}
+
+// paramTypes are the DuckDB types of the PostgreSQL types clients declare
+// parameters as.
+var paramTypes = map[uint32]string{
+	pgtype.BoolOID: "BOOLEAN", pgtype.Int2OID: "SMALLINT", pgtype.Int4OID: "INTEGER", pgtype.Int8OID: "BIGINT",
+	pgtype.Float4OID: "FLOAT", pgtype.Float8OID: "DOUBLE", pgtype.NumericOID: "DOUBLE", pgtype.TextOID: "VARCHAR",
+	pgtype.VarcharOID: "VARCHAR", pgtype.BPCharOID: "VARCHAR", pgtype.DateOID: "DATE", pgtype.TimeOID: "TIME",
+	pgtype.TimestampOID: "TIMESTAMP", pgtype.TimestamptzOID: "TIMESTAMPTZ", pgtype.IntervalOID: "INTERVAL",
+	pgtype.UUIDOID: "UUID", pgtype.ByteaOID: "BLOB", pgtype.JSONOID: "JSON",
 }
 
 // reprepare prepares st's query again on conn, in place. Igloo does so after
@@ -122,12 +183,25 @@ func (st *statement) describe(clientOIDs []uint32) error {
 	st.kind = classify(st.stmtType, names)
 	if st.kind == returnsRows {
 		for i, name := range names {
+			if t, err := st.stmt.ColumnType(i); err == nil && t == duckdb.TYPE_INVALID {
+				// DuckDB cannot tell yet (see describeWithNulls). As
+				// PostgreSQL does an untyped parameter, send it as text.
+				st.columns = append(st.columns, wire.Column{Name: name, Oid: pgtype.TextOID, Width: -1})
+				st.encoders = append(st.encoders, toText)
+				st.unknown = true
+				continue
+			}
 			info, err := st.stmt.ColumnTypeInfo(i)
 			if err != nil {
 				return err
 			}
 			oid, enc := wireType(info.InternalType(), info.Alias())
-			st.columns = append(st.columns, wire.Column{Name: name, Oid: oid, Width: -1})
+			col := wire.Column{Name: name, Oid: oid, Width: -1}
+			if d, ok := info.Details().(*duckdb.DecimalDetails); ok {
+				// PostgreSQL's numeric(p,s) modifier, as pg_attribute has it.
+				col.TypeModifier = int32(d.Width)<<16 | int32(d.Scale) + 4
+			}
+			st.columns = append(st.columns, col)
 			st.encoders = append(st.encoders, enc)
 		}
 	}
@@ -191,8 +265,8 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 	}
 	defer rows.Close() //nolint:errcheck
 
+	b := newRowBatcher(w, st.columns)
 	dest := make([]driver.Value, len(st.columns))
-	values := make([]any, len(st.columns))
 	for {
 		err := rows.Next(dest)
 		if errors.Is(err, io.EOF) {
@@ -201,23 +275,68 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		if err != nil {
 			return err
 		}
-
-		for i, v := range dest {
-			if v == nil {
-				values[i] = nil
-				continue
-			}
-			if values[i], err = st.encoders[i](v); err != nil {
-				return fmt.Errorf("column %q: %w", st.columns[i].Name, err)
-			}
-		}
-		// Row encodes values before returning, so the slices can be reused.
-		if err := w.Row(values); err != nil {
+		if err := b.add(dest, st.encoders); err != nil {
 			return err
 		}
 	}
-
+	if err := b.flush(); err != nil {
+		return err
+	}
 	return w.Complete(commandTag(st.stmtType, st.query, int64(w.Written())))
+}
+
+// rowBatch is how many rows go to the client at a time. psql-wire sends a
+// batch in a few large writes rather than a network write per row, which
+// was the bottleneck for large results; within a portal that a client reads
+// a few rows at a time, it still sends them row by row.
+const rowBatch = 256
+
+// rowBatcher collects encoded rows for the client.
+type rowBatcher struct {
+	w       wire.DataWriter
+	columns wire.Columns
+	rows    [][]any
+	values  []any
+}
+
+func newRowBatcher(w wire.DataWriter, columns wire.Columns) *rowBatcher {
+	return &rowBatcher{w: w, columns: columns, rows: make([][]any, 0, rowBatch), values: make([]any, rowBatch*len(columns))}
+}
+
+// add encodes a row scanned from DuckDB and sends the batch once it is full.
+func (b *rowBatcher) add(dest []driver.Value, encoders []encoder) error {
+	n := len(b.columns)
+	row := b.values[len(b.rows)*n : (len(b.rows)+1)*n]
+	for i, v := range dest {
+		if v == nil {
+			row[i] = nil
+			continue
+		}
+		if bytes, ok := v.([]byte); ok {
+			// The driver may reuse the bytes for the next row.
+			v = append([]byte(nil), bytes...)
+		}
+		var err error
+		if row[i], err = encoders[i](v); err != nil {
+			return fmt.Errorf("column %q: %w", b.columns[i].Name, err)
+		}
+	}
+	b.rows = append(b.rows, row)
+	if len(b.rows) == rowBatch {
+		return b.flush()
+	}
+	return nil
+}
+
+// flush sends the rows collected so far. They are encoded before it
+// returns, so their slices are reused.
+func (b *rowBatcher) flush() error {
+	if len(b.rows) == 0 {
+		return nil
+	}
+	err := wire.WriteRows(b.w, b.rows)
+	b.rows = b.rows[:0]
+	return err
 }
 
 func (st *statement) close() error {

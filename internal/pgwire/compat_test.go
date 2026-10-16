@@ -1,10 +1,15 @@
 package pgwire
 
 import (
+	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestIgnoredCommand(t *testing.T) {
@@ -81,9 +86,11 @@ func TestClassify(t *testing.T) {
 
 func TestRewriteCatalogQuery(t *testing.T) {
 	cases := map[string]string{
-		// Queries without pg_catalog are never touched, nor are literals,
-		// quoted identifiers and comments in queries that have it.
-		"SELECT x::regclass FROM t": "SELECT x::regclass FROM t",
+		// Queries without pg_ names or reg* types are never touched, nor
+		// are literals, quoted identifiers and comments in queries that
+		// have them.
+		"SELECT x::text FROM t":     "SELECT x::text FROM t",
+		"SELECT x::regclass FROM t": "SELECT x::VARCHAR FROM t",
 		"SELECT 'OPERATOR(pg_catalog.~)', E'it\\'s pg_catalog.f(', $$pg_catalog.g($$ -- pg_catalog.h(\nFROM pg_catalog.pg_class": "SELECT 'OPERATOR(pg_catalog.~)', E'it\\'s pg_catalog.f(', $$pg_catalog.g($$ -- pg_catalog.h(\nFROM pg_class",
 		`SELECT "pg_catalog.x(" FROM pg_catalog.pg_class /* pg_catalog.y( */`:                                                    `SELECT "pg_catalog.x(" FROM pg_class /* pg_catalog.y( */`,
 
@@ -94,6 +101,20 @@ func TestRewriteCatalogQuery(t *testing.T) {
 		"FROM pg_catalog.generate_series(0, pg_catalog.array_upper(a, 1)) s, pg_catalog.pg_attribute": "FROM generate_series(0, array_upper(a, 1)) AS s(s), pg_attribute",
 		// pgjdbc's getTables join on comments.
 		"LEFT JOIN pg_catalog.pg_description d ON (d.classoid = 'pg_class'::regclass)": "LEFT JOIN pg_description d ON (d.classoid = 1259)",
+		// dbt-postgres's view dependencies.
+		"join pg_depend d on d.classid = 'pg_rewrite'::regclass and d.refclassid = 'pg_class' :: pg_catalog.regclass": "join pg_depend d on d.classid = 2618 and d.refclassid = 1259",
+		// SQLAlchemy's reflection.
+		"ON d.classoid = CAST($2 AS REGCLASS) WHERE x = CAST(CAST(a.attrelid AS pg_catalog.regclass) AS TEXT)": "ON d.classoid = pg_regclass($2::VARCHAR) WHERE x = CAST(pg_regclass(a.attrelid) AS TEXT)",
+		"SELECT CAST(f('a)', ')') AS regclass), 'CAST(x AS regclass)' FROM pg_catalog.pg_class":                "SELECT pg_regclass(f('a)', ')')), 'CAST(x AS regclass)' FROM pg_class",
+		"SELECT pg_catalog.json_build_object('a', 1)":                                                          "SELECT json_object('a', 1)",
+		// information_schema.columns in any quoting, as dbt, Npgsql and
+		// Metabase write it, and PostgreSQL's format().
+		`SELECT FORMAT('%I.%I', "c"."table_schema", c.table_name), format('{}%', 1) FROM "information_schema"."columns" AS "c", information_schema.tables`: `SELECT printf('%s.%s', "c"."table_schema", c.table_name), format('{}%', 1) FROM pg_information_schema_columns AS "c", information_schema.tables`,
+		"SELECT column_name FROM information_schema . columns WHERE table_name = 'columns'":                                                                "SELECT column_name FROM pg_information_schema_columns WHERE table_name = 'columns'",
+		// SQLAlchemy 1.4's indexes (Superset).
+		"FROM pg_class t LEFT JOIN pg_attribute a ON t.oid = a.attrelid AND a.attnum = ANY(ix.indkey) WHERE x = ANY($1)": "FROM pg_class t LEFT JOIN pg_attribute a ON t.oid = a.attrelid AND list_contains(ix.indkey, a.attnum) WHERE x = ANY($1)",
+		// Metabase quotes the qualifier.
+		`SELECT * FROM "pg_catalog"."pg_class" AS "c" JOIN "pg_catalog"."pg_tables" t ON true, "pg_catalog".format_type(1, 2), '"pg_catalog"."pg_type"'`: `SELECT * FROM "pg_class" AS "c" JOIN "pg_catalog"."pg_tables" t ON true, format_type(1, 2), '"pg_catalog"."pg_type"'`,
 	}
 	for in, want := range cases {
 		if got := rewriteCatalogQuery(in); got != want {
@@ -134,5 +155,139 @@ func TestRewriteSessionUser(t *testing.T) {
 		if got := rewriteSessionUser(in, "ana"); got != want {
 			t.Errorf("rewriteSessionUser(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestRewriteSystemSchemaRefs(t *testing.T) {
+	for q, want := range map[string]string{
+		// dbt's get_columns_in_relation
+		`select column_name from "lake".information_schema.columns where table_name = 'm'`: `select column_name from information_schema.columns where table_name = 'm'`,
+		"SELECT * FROM LAKE . pg_catalog.pg_class, lake.information_schema.tables":         "SELECT * FROM pg_catalog.pg_class, information_schema.tables",
+		"SELECT * FROM lake.public.columns":                                                "SELECT * FROM lake.public.columns",
+		"SELECT * FROM other.information_schema.columns":                                   "SELECT * FROM other.information_schema.columns",
+		"SELECT 'lake.information_schema.columns'":                                         "SELECT 'lake.information_schema.columns'",
+		"SELECT x.lake.information_schema.columns":                                         "SELECT x.lake.information_schema.columns",
+	} {
+		if got := rewriteSystemSchemaRefs(q, "lake"); got != want {
+			t.Errorf("rewriteSystemSchemaRefs(%q) = %q, want %q", q, got, want)
+		}
+	}
+}
+
+func TestDBTCatalogQueries(t *testing.T) {
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	// dbt-postgres lists relations from pg_tables, pg_views and pg_matviews.
+	mustExec(t, conn, "CREATE TABLE facts (i INTEGER)")
+	rows, err := conn.Query(context.Background(), `select tablename from pg_tables where schemaname ilike 'main'
+		union all select viewname from pg_views where schemaname ilike 'main'
+		union all select matviewname from pg_catalog.pg_matviews where schemaname ilike 'main'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || !slices.Contains(names, "facts") {
+		t.Errorf("relations: %q %v", names, err)
+	}
+}
+
+func TestShowPostgresSettings(t *testing.T) {
+	ts := startServer(t)
+	for name, mode := range modes {
+		conn := ts.admin(t, mode)
+		for sql, want := range map[string]string{
+			// SQLAlchemy and JDBC read the isolation level when they connect.
+			"show transaction isolation level": "repeatable read",
+			"SHOW standard_conforming_strings": "on",
+			"SHOW is_superuser":                "on",
+			"SHOW server_version_num;":         "150000",
+		} {
+			var got string
+			if err := conn.QueryRow(context.Background(), sql).Scan(&got); err != nil || got != want {
+				t.Errorf("%s: %s: %q %v, want %q", name, sql, got, err, want)
+			}
+		}
+		// DuckDB's own setting, which defaults to the machine's zone.
+		var zone string
+		if err := conn.QueryRow(context.Background(), `SHOW "TimeZone"`).Scan(&zone); err != nil || !strings.HasSuffix(zone, "UTC") {
+			t.Errorf("%s: SHOW TimeZone: %q %v", name, zone, err)
+		}
+		// current_setting, of a literal or (as SQLAlchemy sends it) a
+		// parameter.
+		var version, method, zone2 string
+		err := conn.QueryRow(context.Background(), "SELECT current_setting('server_version_num'), current_setting($1), current_setting('TimeZone')",
+			"default_table_access_method").Scan(&version, &method, &zone2)
+		if err != nil || version != "150000" || method != "heap" || zone2 == "" {
+			t.Errorf("%s: current_setting: %q %q %q %v", name, version, method, zone2, err)
+		}
+		// DuckDB's own SHOW still describes tables.
+		if _, err := conn.Exec(context.Background(), "SHOW TABLES"); err != nil {
+			t.Errorf("%s: SHOW TABLES: %v", name, err)
+		}
+	}
+}
+
+// TestDriverCatalogQueries runs the catalog lookups of JDBC's key metadata
+// and SQLAlchemy's reflection that need more than the views above.
+func TestDriverCatalogQueries(t *testing.T) {
+	ts := startServer(t)
+	ctx := context.Background()
+	for name, mode := range modes {
+		conn := ts.admin(t, mode)
+		var setting string
+		var position int64
+		err := conn.QueryRow(ctx, `SELECT setting, (SELECT max(n) FROM (SELECT (information_schema._pg_expandarray([5, 7])).n AS n))
+			FROM pg_catalog.pg_settings WHERE name = 'max_index_keys'`).Scan(&setting, &position)
+		if err != nil || setting != "32" || position != 2 {
+			t.Errorf("%s: JDBC's max_index_keys and _pg_expandarray: %q %d %v", name, setting, position, err)
+		}
+		// DuckDB binds json_object of a parameter only with the value, as
+		// SQLAlchemy's column reflection sends it; the result is described
+		// all the same.
+		rows, err := conn.Query(ctx, "SELECT json_build_object($1::VARCHAR, 1) AS options, 2 AS n FROM pg_catalog.pg_class LIMIT 1", "always")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		fields := rows.FieldDescriptions()
+		rows.Close()
+		if len(fields) != 2 || fields[0].Name != "options" || fields[1].Name != "n" || fields[1].DataTypeOID != pgtype.Int4OID || rows.Err() != nil {
+			t.Errorf("%s: json_object of a parameter: %+v %v", name, fields, rows.Err())
+		}
+		var oid int64
+		if err := conn.QueryRow(ctx, "SELECT CAST($1 AS REGCLASS)", "pg_catalog.pg_constraint").Scan(&oid); err != nil || oid != 2606 {
+			t.Errorf("%s: a catalog name cast to regclass: %d %v", name, oid, err)
+		}
+	}
+}
+
+func TestToChar(t *testing.T) {
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	var got []string
+	err := conn.QueryRow(context.Background(), `SELECT [
+		to_char(DATE_TRUNC('month', DATE '2026-10-05'), 'YYYY-MM'),
+		to_char(TIMESTAMP '2026-10-05 14:07:09', 'YYYY-MM-DD HH24:MI:SS'),
+		to_char(DATE '2026-10-05', 'FMMonth DD, YYYY (Dy)'),
+		to_char(TIMESTAMP '2026-10-05 14:07:09', 'HH12:MI AM, 100%')]`).Scan(&got)
+	want := []string{"2026-10", "2026-10-05 14:07:09", "October 05, 2026 (Mon)", "02:07 PM, 100%"}
+	if err != nil || !slices.Equal(got, want) {
+		t.Errorf("got %q %v, want %q", got, err, want)
+	}
+}
+
+// TestTimestamptzText checks that timestamps with time zone reach clients
+// in text as PostgreSQL writes them: psycopg2 cannot parse pgx's "Z".
+func TestTimestamptzText(t *testing.T) {
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	res := conn.PgConn().ExecParams(context.Background(),
+		"SELECT TIMESTAMPTZ '2026-10-14 12:00:00.25+02', TIMESTAMPTZ '2026-10-14 12:00:00+00'",
+		nil, nil, nil, []int16{pgtype.TextFormatCode}).Read()
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	got := []string{string(res.Rows[0][0]), string(res.Rows[0][1])}
+	if !slices.Equal(got, []string{"2026-10-14 10:00:00.25+00", "2026-10-14 12:00:00+00"}) {
+		t.Errorf("got %q", got)
 	}
 }

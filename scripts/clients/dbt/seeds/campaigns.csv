@@ -1,0 +1,9 @@
+campaign_id,client_name,channel,campaign_name,start_date,daily_budget
+101,Northwind Foods,search,NW Brand Search,2026-09-01,500.00
+102,Northwind Foods,social,NW Autumn Launch,2026-09-15,750.00
+103,Northwind Foods,display,NW Retargeting,2026-09-01,250.00
+201,Contoso Motors,search,CM Dealer Search,2026-08-20,1200.00
+202,Contoso Motors,video,CM Launch Video,2026-09-10,2000.00
+203,Contoso Motors,social,CM Test Drive,2026-09-20,400.00
+301,Fabrikam Travel,search,FT Winter Getaways,2026-09-05,800.00
+302,Fabrikam Travel,display,FT Prospecting,2026-09-05,300.00

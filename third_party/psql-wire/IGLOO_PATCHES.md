@@ -21,7 +21,16 @@ otherwise unchanged except for these patches:
 - `igloo_notice.go` (new): the `Noticer` interface, which a statement's
   `DataWriter` implements, sends the client a warning as a NoticeResponse,
   as PostgreSQL does, for statements that succeed but leave something open
-  (a connection to another database that does not verify its server).
+  (a connection to another database that does not verify its server), or
+  do nothing (`BEGIN` inside a transaction block).
+- `row.go`, `Column.Define`: a RowDescription carries the column's
+  `TypeModifier` when it is set, instead of always -1, so clients learn a
+  numeric's precision and scale.
+- `igloo_writer.go` (new): `DefineColumns`, so a statement of a simple query
+  can describe its rows when it runs rather than when the query is parsed
+  (Igloo prepares each statement of a multi-statement query only once the
+  one before has run), and `CopyOut`, `CopyData` and `CopyDone`, the
+  messages of `COPY ... TO STDOUT`.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

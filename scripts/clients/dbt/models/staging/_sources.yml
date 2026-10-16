@@ -1,0 +1,28 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Ad-platform and conversion exports, loaded by the ingestion pipeline.
+    schema: raw
+    loaded_at_field: _loaded_at
+    freshness:
+      warn_after: {count: 12, period: hour}
+      error_after: {count: 24, period: hour}
+    tables:
+      - name: ad_platform_daily
+        description: Daily delivery per campaign from each ad platform.
+        columns:
+          - name: platform
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: [google_ads, meta, dv360, youtube]
+      - name: conversions
+        description: Conversions attributed to a campaign; a restated conversion is loaded again.
+        columns:
+          - name: conversion_id
+            data_tests: [not_null]
+      - name: campaign_settings
+        description: Current bidding settings per campaign; rows change in place.
+        freshness: null

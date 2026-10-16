@@ -1,0 +1,28 @@
+name: BI tools
+
+# Metabase, Apache Superset and Npgsql (Power BI) against the Docker Compose
+# stack. It pulls about 3 GB of images, so it runs weekly and on demand
+# rather than on every pull request; scripts/e2e.sh covers the drivers and
+# dbt in CI.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bi-tools:
+    name: BI tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # scripts/bi-e2e.sh prints Igloo's and the tools' logs when a check
+      # fails.
+      - name: Test Metabase, Superset and Npgsql against the stack
+        run: make bi-e2e

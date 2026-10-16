@@ -204,8 +204,56 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - `igloo.query_history` has a `workers` column; `igloo_distributed_*` and
   `igloo_worker_*` metrics report statements, fallbacks, tasks and workers.
 
+### Tools and integrations
+
+- dbt with the standard dbt-postgres adapter: seeds, views, tables,
+  incremental models (`append`, `merge`, `delete+insert`), snapshots, tests,
+  `persist_docs`, `docs generate` and `source freshness`, tested on every
+  pull request with a sample agency project (`scripts/clients/dbt`). The
+  profile's `dbname` is the catalog's name. See
+  [docs/integrations.md](docs/integrations.md).
+- Tested clients: SQLAlchemy 2 with psycopg 3, pandas and polars (through
+  SQLAlchemy, connectorx and ADBC), and the JDBC metadata calls and SQL of
+  Tableau and Looker, in `scripts/e2e.sh`; Metabase, Apache Superset and
+  Npgsql (Power BI) weekly in the new `scripts/bi-e2e.sh` (`make bi-e2e`).
+- A query string with several statements runs them one at a time, each
+  checked as if sent alone, in one transaction, for every role (only admins
+  could send several before, and DuckDB ran all but the last unchecked).
+- Transaction blocks behave as in PostgreSQL: after a failed statement,
+  everything but `COMMIT` and `ROLLBACK` fails with `25P02` and `COMMIT`
+  rolls back (a failed block's other statements used to be committed);
+  `BEGIN` in a block and `COMMIT` outside one only warn; `SAVEPOINT`,
+  `RELEASE` and, when nothing changed since, `ROLLBACK TO SAVEPOINT` work.
+  Changes to the catalog in a block, which used to be refused for
+  `CREATE OR REPLACE TABLE`, views and comments, now commit the block first,
+  as in Snowflake.
+- `COPY (query) TO STDOUT` and `COPY table TO STDOUT` in text, CSV and binary
+  format, checked as the query they run.
+- `ALTER VIEW ... RENAME TO` (and `ALTER TABLE` on a view), comments on a
+  view's columns, `DROP TABLE` and `DROP VIEW ... CASCADE`, `SHOW` and
+  `current_setting()` of the PostgreSQL settings drivers read, `TO_CHAR` for
+  dates and timestamps, and catalog queries of SQLAlchemy's inspector, JDBC's
+  key and index metadata, ADBC and Npgsql.
+- Views outside the default schema can be queried by schema-qualified name
+  (`sales.v`) and, after `SET search_path`, unqualified, and views can read
+  tables named by schema (`sales.orders`); all three failed before. Such
+  table names are stored with the catalog's (`lake.sales.orders`).
+- Timestamps with time zone go to clients in text as PostgreSQL writes them
+  (`+00`), which psycopg2, and so dbt, Superset and pandas, could not parse
+  before. Result metadata carries a `numeric` column's precision and scale.
+- Renaming or dropping a table while another session lists its schema no
+  longer fails spuriously after the catalog has made the change (a race in
+  DuckDB's shared list of the schema's tables that dbt's threads hit).
+  Other effects of that race remain, so run dbt with one thread.
+
 ### Security and governance
 
+- Only admins may change DuckDB's own database, `memory`, where each
+  replica keeps its copies of the catalog's views: the target of a
+  statement is resolved through the session's current database and search
+  path, so an unqualified or schema-qualified name cannot reach it either,
+  and non-admins cannot put `memory` first on the search path. SQL with a
+  NUL in it is refused.
 - Users with SCRAM-SHA-256 passwords, managed in SQL (`CREATE USER`,
   `ALTER USER`, `DROP USER`, `SHOW USERS`) and stored in PostgreSQL so every
   replica shares them. Built-in roles `admin`, `writer`, `reader` and `none`.
@@ -453,6 +501,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   pass that is due runs soon after a start. A table's maintenance deletes
   only files inside its own location, and keeps those that clones still
   read; `DROP TABLE` never asks the catalog to purge files.
+- Results reach clients in batches rather than one network write per row:
+  large results arrive four to five times faster.
 
 ### Operations and deployment
 

@@ -38,6 +38,8 @@ type Column struct {
 	Name string
 	// Type is the DuckDB type, as DESCRIBE reports it.
 	Type string
+	// Doc is the column's comment, if any.
+	Doc string
 }
 
 // LoadDuckDBView loads one view. ok is false if it has no DuckDB SQL, as
@@ -60,10 +62,51 @@ func (c *Client) LoadDuckDBView(ctx context.Context, schema, name string) (v Vie
 	v = View{Schema: schema, Name: name, SQL: version.Representations[i].Sql, Version: version.VersionID}
 	if sc := loaded.CurrentSchema(); sc != nil {
 		for _, f := range sc.Fields() {
-			v.Columns = append(v.Columns, Column{Name: f.Name, Type: duckDBType(f.Type)})
+			v.Columns = append(v.Columns, Column{Name: f.Name, Type: duckDBType(f.Type), Doc: f.Doc})
 		}
 	}
 	return v, true, nil
+}
+
+// RenameView renames the view schema.from to schema.to.
+func (c *Client) RenameView(ctx context.Context, schema, from, to string) error {
+	err := c.Catalog.RenameView(ctx, Ident(schema, from), Ident(schema, to))
+	if errors.Is(err, icecat.ErrViewAlreadyExists) {
+		return ErrViewExists
+	}
+	return err
+}
+
+// SetViewColumnComment sets or, when text is nil, removes the comment on a
+// view's column: its field's doc string in the view's schema, as for
+// tables. Column names match case-insensitively, as in DuckDB. The view
+// gets a new version with the new schema and the same SQL.
+func (c *Client) SetViewColumnComment(ctx context.Context, schema, name, column string, text *string) error {
+	loaded, err := c.LoadView(ctx, Ident(schema, name))
+	if err != nil {
+		return err
+	}
+	v, ok, err := c.LoadDuckDBView(ctx, schema, name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("view %q has no DuckDB SQL", name)
+	}
+	i := slices.IndexFunc(v.Columns, func(col Column) bool { return strings.EqualFold(col.Name, column) })
+	if i < 0 {
+		return fmt.Errorf("column %q of view %q does not exist", column, name)
+	}
+	v.Columns[i].Doc = ""
+	if text != nil {
+		v.Columns[i].Doc = *text
+	}
+	requirements, updates, err := replaceView(loaded.Metadata(), v)
+	if err != nil {
+		return err
+	}
+	_, err = c.UpdateView(ctx, Ident(schema, name), requirements, updates)
+	return err
 }
 
 // DuckDBViews returns every view that has DuckDB SQL.
@@ -165,7 +208,7 @@ var ErrViewExists = errors.New("view already exists")
 func icebergSchema(id int, cols []Column) *iceberg.Schema {
 	fields := make([]iceberg.NestedField, len(cols))
 	for i, c := range cols {
-		fields[i] = iceberg.NestedField{ID: i + 1, Name: c.Name, Type: icebergType(c.Type)}
+		fields[i] = iceberg.NestedField{ID: i + 1, Name: c.Name, Type: icebergType(c.Type), Doc: c.Doc}
 	}
 	return iceberg.NewSchema(id, fields...)
 }

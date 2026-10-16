@@ -1,0 +1,5 @@
+channel,channel_group,is_paid
+search,Paid Search,true
+social,Paid Social,true
+display,Programmatic,true
+video,Programmatic,true

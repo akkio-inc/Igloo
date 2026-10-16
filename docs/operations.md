@@ -35,7 +35,7 @@ Every user has one built-in role, which applies to the whole warehouse:
 | `none` | Nothing on its own: only what [grants](#grants) allow, plus reading the system catalogs and their own history |
 | `reader` | Run queries and `EXPLAIN`, and change their own session settings such as `search_path` and `TimeZone` |
 | `writer` | Everything a reader can, plus `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`, creating, altering and dropping tables, views and schemas, comments, and table properties such as snapshot retention |
-| `admin` | Everything, including users, roles and grants, secrets, `ATTACH`, global settings, `EXPLAIN ANALYZE`, and several statements in one query |
+| `admin` | Everything, including users, roles and grants, secrets, `ATTACH`, global settings, `EXPLAIN ANALYZE`, and several statements in one prepared statement |
 
 `CREATE USER` without `ROLE` makes a reader. Settings a non-admin changes
 with `SET` apply to their own session only.
@@ -652,7 +652,8 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `42501`, `SELECT on table crm.s.t needs a SELECT grant on it, its schema or connection crm` | Connections' tables need grants for every role but admin; `GRANT SELECT ON CONNECTION crm TO ...` or on the schema or table. |
 | A new table of a connection's database is missing from listings | Replicas list a connection's tables when they attach it. Run `ALTER CONNECTION name REFRESH`, or restart. |
 | SQLSTATE `08001` on `CREATE CONNECTION`, `certificate signed by unknown authority`, `server refused TLS connection` or `does not support TLS` | Connections verify their server by default (`tls 'verify-full'`). Give the authority that signed its certificate in `tls_ca` (managed databases publish theirs), or turn TLS on for the server; choose a weaker `tls` mode only on a network you trust ([TLS](federation.md#tls)). |
-| `send one statement at a time` | Only admins may send several statements in one query. Most tools send one at a time; for scripts, run them as an admin or split them. |
+| `send one statement at a time` | A prepared statement (the extended protocol, such as a driver's statement with parameters) held several statements, which only admins may send. Send them one at a time, or without parameters, as one simple query. |
+| SQLSTATE `42501`, `only admins may change the memory database` or `only admins may make memory the current database` | The statement would create, change or drop something in DuckDB's own database, where each replica keeps its copies of the catalog's views, by name or through the search path. Name the catalog's schema (`lake.public.t`), and keep a schema of the catalog first in `search_path`. |
 | `Permission Error: Cannot access file ...` | The sandbox blocked a file or URL outside the warehouse. To load from or export to another bucket, add it to `IGLOO_ALLOWED_LOCATIONS`. |
 | SQLSTATE `40001`, `CatalogCommitConflicts` | Two writers committed to the same table at once inside explicit transactions. Retry the transaction. |
 | SQLSTATE `40003`, `CommitStateUnknownException` | The catalog did not answer whether a write was applied ([writes when the catalog fails](#writes-when-the-catalog-fails)). Check the table's snapshots before running the write again, and the catalog's health. |

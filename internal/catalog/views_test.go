@@ -61,8 +61,8 @@ func TestReplaceView(t *testing.T) {
 		return v.Representations[0].Sql, v.SchemaID, v.VersionID
 	}
 
-	a := View{Schema: "public", Name: "v", SQL: "SELECT * FROM a", Columns: []Column{{"id", "INTEGER"}, {"name", "VARCHAR"}}}
-	b := View{Schema: "public", Name: "v", SQL: "SELECT * FROM b", Columns: []Column{{"x", "DOUBLE"}, {"d", "DATE"}}}
+	a := View{Schema: "public", Name: "v", SQL: "SELECT * FROM a", Columns: []Column{{Name: "id", Type: "INTEGER"}, {Name: "name", Type: "VARCHAR"}}}
+	b := View{Schema: "public", Name: "v", SQL: "SELECT * FROM b", Columns: []Column{{Name: "x", Type: "DOUBLE"}, {Name: "d", Type: "DATE"}}}
 
 	meta = apply(meta, b)
 	if sql, schema, version := current(meta); sql != b.SQL || schema != 1 || version != 2 {

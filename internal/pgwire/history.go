@@ -185,15 +185,15 @@ func (s *Server) recordLogin(user string, addr net.Addr, appName string, sess *s
 }
 
 // audited wraps a statement Igloo carries out itself so it is recorded
-// when it runs.
+// when it runs, and refused in a failed transaction block.
 func (s *Server) audited(sess *session, text string, fn wire.PreparedStatementFn) wire.PreparedStatementFn {
-	if s.audit == nil {
-		return fn
-	}
 	return func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
 		tw := &tagWriter{DataWriter: w}
 		start := time.Now()
-		err := fn(ctx, tw, params)
+		err := sess.checkAborted(text)
+		if err == nil {
+			err = fn(ctx, tw, params)
+		}
 		s.recordQuery(sess, queryRecord{text: text, start: start, err: err, rows: tw.rows()})
 		return err
 	}
@@ -216,6 +216,12 @@ func (w *tagWriter) Notice(code, message string) error {
 		return n.Notice(code, message)
 	}
 	return nil
+}
+
+func (w *tagWriter) Rows(rows [][]any) error { return wire.WriteRows(w.DataWriter, rows) }
+
+func (w *tagWriter) DefineColumns(columns wire.Columns) error {
+	return wire.DefineColumns(w.DataWriter, columns)
 }
 
 // rows is the row count in the tag, such as 5 in "INSERT 0 5", or the rows

@@ -1,0 +1,14 @@
+# dbname is the Iceberg catalog's name in SQL (IGLOO_CATALOG_NAME, "lake"
+# by default): dbt-postgres writes three-part names, database.schema.table.
+igloo:
+  target: igloo
+  outputs:
+    igloo:
+      type: postgres
+      host: "{{ env_var('PGHOST') }}"
+      port: "{{ env_var('PGPORT', '5432') | as_number }}"
+      user: "{{ env_var('PGUSER') }}"
+      password: "{{ env_var('PGPASSWORD') }}"
+      dbname: lake
+      schema: analytics
+      threads: 1  # several can leave DuckDB-Iceberg out of step; see docs/integrations.md

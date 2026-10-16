@@ -25,10 +25,10 @@ databases are catalogs of their own, such as `crm.public.customers`.
 | `CREATE TABLE`, `CREATE TABLE AS SELECT` | Yes |
 | `INSERT`, `INSERT ... SELECT`, `INSERT ... RETURNING`, `MERGE INTO` | Yes |
 | `UPDATE`, `DELETE` | Yes |
-| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes |
+| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `CASCADE` drops only the table, see below |
 | `ALTER TABLE ... RENAME TO`, `ADD COLUMN`, `DROP COLUMN` | Yes |
-| `CREATE OR REPLACE TABLE` | Yes, outside transactions; see below |
-| `CREATE [OR REPLACE] VIEW`, `DROP VIEW` | Yes, outside transactions; see [views](#views) |
+| `CREATE OR REPLACE TABLE` | Yes; see below |
+| `CREATE [OR REPLACE] VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO` | Yes; see [views](#views) |
 | `COMMENT ON SCHEMA`, `TABLE`, `VIEW`, `COLUMN` | Yes; see [comments](#comments) |
 | `ALTER TABLE`, `VIEW`, `SCHEMA ... OWNER TO` | Yes; see [the catalog](catalog.md#owners) |
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
@@ -40,15 +40,39 @@ databases are catalogs of their own, such as `crm.public.customers`.
 | `PRIMARY KEY`, `UNIQUE` | Accepted but not enforced |
 | `NOT NULL` | Enforced |
 
-Writes are transactional. `BEGIN ... COMMIT` groups statements; a failed
-statement inside a transaction aborts it until `ROLLBACK`, as in PostgreSQL.
-Statements that change the catalog itself, `CREATE OR REPLACE TABLE`, views
-and comments, take effect at once and cannot run inside a transaction block.
-
 `CREATE OR REPLACE TABLE` writes the new table under a temporary name, then
 drops the old table and renames the new one into place. A failure while
 writing leaves the old table as it was. The swap is quick but not atomic: a
 query that starts in the instant between drop and rename finds no table.
+
+The catalog records nothing that depends on a table, so `DROP TABLE ...
+CASCADE` drops just the table, like `DROP TABLE`: views that read it fail
+when they are next queried.
+
+### Transactions
+
+Writes are transactional. `BEGIN ... COMMIT` groups statements, and as in
+PostgreSQL:
+
+- once a statement in a block fails, every statement until `COMMIT` or
+  `ROLLBACK` fails with SQLSTATE `25P02`, and `COMMIT` rolls the block back;
+- `BEGIN` inside a block, and `COMMIT` or `ROLLBACK` outside one, only warn;
+- a query string with several statements (see
+  [differences](#differences-from-postgresql)) runs them in one transaction,
+  unless they hold transaction statements of their own.
+
+As in Snowflake, a statement that creates, alters, renames, drops or
+comments on a schema, table or view in the Iceberg catalog commits the
+block first and then runs on its own; the block carries on in a new
+transaction. A later `ROLLBACK` does not undo it, nor what came before it in
+the block. Temporary tables and views stay in the block. dbt builds models
+this way: `CREATE TABLE ... AS`, then `ALTER TABLE ... RENAME TO` to swap the
+new table in, all in one block.
+
+`SAVEPOINT` and `RELEASE SAVEPOINT` are accepted. `ROLLBACK TO SAVEPOINT`
+cannot undo changes: it works when nothing changed since the savepoint,
+which lets psycopg's and SQLAlchemy's nested blocks recover from a failed
+query, and otherwise fails with SQLSTATE `0A000`.
 
 ## Views
 
@@ -60,21 +84,29 @@ CREATE VIEW recent_orders AS
   SELECT * FROM orders WHERE o_orderdate > current_date - INTERVAL 30 DAY;
 CREATE OR REPLACE VIEW order_totals (customer, total) AS
   SELECT o_custkey, sum(o_totalprice) FROM lake.public.orders GROUP BY 1;
+ALTER VIEW order_totals RENAME TO customer_totals;  -- ALTER TABLE works too
 DROP VIEW IF EXISTS recent_orders;
 ```
 
 - Query a view by any name: `recent_orders`, `public.recent_orders` or
   `lake.public.recent_orders`. In listings (`information_schema`, `\dv`)
   views appear under the database `memory`, where each replica keeps its
-  copy.
+  copy. An unqualified name finds views on the search path as it finds
+  tables: after `SET search_path = sales`, `v` is `sales.v`. Only admins
+  may change `memory`, and so only they may put it first on the search
+  path.
 - Unqualified table names in a view resolve when the view is queried,
   against the querying session's search path, as in DuckDB. Qualify the
   tables of views that sessions with other search paths will read.
+  Schema-qualified table names are stored with the catalog's name:
+  `sales.orders` becomes `lake.sales.orders`.
 - A view created on one replica reaches the others within 30 seconds, or at
   once when a query there names it.
-- Writers create and drop views, as do users with `CREATE` on the view's
-  schema. Other engines see the views in the catalog but cannot run their
-  DuckDB SQL.
+- Writers create, rename and drop views, as do users with `CREATE` on the
+  view's schema. Other engines see the views in the catalog but cannot run
+  their DuckDB SQL. `ALTER VIEW` supports only `RENAME TO`; a renamed view
+  keeps its grants and comments, and views that read it by its old name
+  fail until they are replaced. `DROP VIEW ... CASCADE` drops only the view.
 - A view runs with the privileges of whoever queries it: reading one needs
   `SELECT` on the tables it reads (see [grants](#roles-and-grants)).
 
@@ -85,14 +117,16 @@ COMMENT ON SCHEMA public IS 'Shared tables';
 COMMENT ON TABLE orders IS 'One row per order';
 COMMENT ON COLUMN orders.o_totalprice IS 'In dollars';
 COMMENT ON VIEW order_totals IS 'Updated live';
+COMMENT ON COLUMN order_totals.total IS 'Lifetime revenue';
 COMMENT ON TABLE orders IS NULL;  -- remove
 ```
 
 Comments are stored as Iceberg metadata: a `comment` property of the table,
-view or namespace and the columns' doc strings, which Spark and Trino also
-read. Clients see them as in PostgreSQL, through `obj_description`,
-`col_description` and `pg_description` (psql's `\dt+` and `\d+` show them),
-in `information_schema`, in the [catalog's views](catalog.md) such as
+view or namespace and the columns' doc strings (a view's in a new version of
+the view), which Spark and Trino also read. Clients see them as in
+PostgreSQL, through `obj_description`, `col_description` and
+`pg_description` (psql's `\dt+` and `\d+` show them), in
+`information_schema`, in the [catalog's views](catalog.md) such as
 `igloo.tables`, and in one listing:
 
 ```sql
@@ -574,30 +608,37 @@ the others) are `BLOB`s, sent as `bytea`.
 
 ## Clients
 
-Tested with every release, by the test suite and `scripts/e2e.sh`:
+Tested with every release, by the test suite and `scripts/e2e.sh`, and
+weekly by `scripts/bi-e2e.sh` (marked BI):
 
 | Client | Version | Notes |
 |---|---|---|
-| psql (libpq) | 17 | Including `\dt`, `\d`, `\d+`, `\dn`, `\l`, `\du`, `\password` |
+| psql (libpq) | 17 | Including `\dt`, `\d`, `\d+`, `\dn`, `\l`, `\du`, `\password`, `\copy ... to` |
 | pgx (Go) | 5.11 | Simple protocol, and the extended protocol with named and unnamed statements |
-| psycopg (Python) | 3.3 | Including server-side prepared statements, server-side cursors and transactions |
-| PostgreSQL JDBC | 42.7 | `getTables` and `getColumns` with comments, views, prepared statements, fetch-size paging |
+| psycopg (Python) | 3.3 | Including server-side prepared statements, server-side cursors, transactions and `copy()` out |
+| PostgreSQL JDBC | 42.7 | `DatabaseMetaData` as Tableau, Looker and DBeaver call it, result metadata of prepared and `LIMIT 0` queries, fetch-size paging |
 | Ibis (Python) | 10.8 | Through its PostgreSQL backend: `sql()`, `table()`, expressions, `to_pyarrow_batches()` |
 | ADBC Flight SQL driver (Python) | 1.12 | Over [Arrow Flight SQL](flight-sql.md): Arrow tables, pandas and polars, parameters, `adbc_get_objects` |
 | pyarrow.flight | 26.0 | Over Flight SQL: handshake, `get_flight_info`, `do_get` |
 | Arrow Flight SQL JDBC | 19.0 | Over Flight SQL: `getTables`, `getColumns`, prepared statements, `executeUpdate`, large results |
+| dbt Core with dbt-postgres | 1.12, 1.11 | Seeds, views, tables, incremental `append`, `merge` and `delete+insert`, snapshots, tests, `persist_docs`, `docs generate`, `source freshness`; see [integrations](integrations.md#dbt) |
+| SQLAlchemy with psycopg | 2.1 | The inspector and `MetaData.reflect`; pandas 3 `read_sql` and `to_sql` |
+| polars | 2.0 | `read_database` and `write_database` through SQLAlchemy, `read_database_uri` through connectorx 0.4 and ADBC 1.12 |
+| Npgsql (.NET, Power BI) | 4.0, 10.0 | BI: type loading, Power BI's navigator queries, `GetSchema`, `GetSchemaTable`, parameters |
+| Metabase | 0.64 | BI: sync, native and editor-built questions |
+| Apache Superset (psycopg2) | 6.1 | BI: datasets, time-series charts, SQL Lab |
 
-Tools built on these drivers, such as DBeaver, Metabase, Superset, Tableau
-and dbt (with `materialized='table'`), should work with their PostgreSQL
-connector; they are not yet part of the test suite. Their schema browsers read
-the `pg_catalog` and `information_schema` views, which Igloo fills in from the
-catalog.
+[Tools and integrations](integrations.md) says how to connect dbt, BI tools
+and notebooks. Schema browsers read the `pg_catalog` and
+`information_schema` views, which Igloo fills in from the catalog.
 
 Connect with any PostgreSQL connection string, for example
 `postgres://ana@igloo.example.com:5432/igloo?sslmode=require`. The database
-name is ignored. The password may be an [access token](sso.md#access-tokens)
-(`CREATE TOKEN`), which is how people who sign in with single sign-on, and
-service accounts, connect BI tools, dbt and scripts.
+name is ignored; dbt needs it to be the catalog's name (see
+[integrations](integrations.md#dbt)). The password may be an
+[access token](sso.md#access-tokens) (`CREATE TOKEN`), which is how people
+who sign in with single sign-on, and service accounts, connect BI tools, dbt
+and scripts.
 
 Engines that read Iceberg tables themselves, such as Spark, Trino and
 PyIceberg, use Igloo's tables through its Iceberg REST catalog instead, under
@@ -618,9 +659,17 @@ the same users and grants; see [other engines](external-engines.md).
   `GRANT` and `REVOKE` cover tables and schemas of the Iceberg catalog (see
   [roles and grants](#roles-and-grants)); there are no column privileges,
   `GRANT OPTION`, `USAGE` or roles granted to roles.
-- Only admins may send several statements in one query string. A `PIVOT`
-  that takes its columns from the data (no `IN (...)` after `ON`) is one
-  statement to the client, but DuckDB runs it as two: first a query that
+- A query string with several statements, as `psql -c` and psycopg2 (and
+  so dbt) send them, runs them one at a time, each checked and run as if
+  sent alone, in one transaction unless they hold transaction statements of
+  their own. The first that fails ends the query. A prepared statement
+  (the extended protocol) holds one statement. Statements Igloo carries out
+  outside transactions must be sent on their own (statements on users,
+  connections, notification integrations, policies, tags, owners, tasks,
+  pipes and materialized views, `COPY INTO`, `CLONE`, branches and tags);
+  several user statements may come together.
+- A `PIVOT` that takes its columns from the data (no `IN (...)` after
+  `ON`) is one statement to the client, but DuckDB runs it as two: first a query that
   finds the columns, kept as a temporary enum type in the session. Readers
   and writers may run such a `PIVOT` in a query (a statement that starts
   with `SELECT`, `FROM`, `PIVOT`, `UNPIVOT` or a parenthesis), and the query
@@ -653,13 +702,26 @@ the same users and grants; see [other engines](external-engines.md).
   accepted and ignored. `statement_timeout` is honored.
   `distributed_execution` (`auto`, `on` or `off`) is Igloo's own: whether
   the session's statements may run in parts on workers
-  ([distributed execution](distributed-execution.md#when)).
+  ([distributed execution](distributed-execution.md#when)). `SHOW` and
+  `current_setting()` answer the PostgreSQL settings drivers read, such as
+  `transaction_isolation` (`repeatable read`: DuckDB transactions see a
+  snapshot), `server_version` and `standard_conforming_strings`.
+- Transaction blocks behave as in PostgreSQL, except that changes to the
+  catalog commit the block first, and `ROLLBACK TO SAVEPOINT` cannot undo
+  changes (see [transactions](#transactions)).
+- `COPY (query) TO STDOUT` and `COPY table TO STDOUT` work, in text, CSV and
+  binary format, with `HEADER`, `DELIMITER` and `NULL`; they need `SELECT`
+  on what they read, like the query. `COPY ... FROM STDIN` is not supported.
+- `TO_CHAR` formats dates and timestamps; number formats are not supported.
 - `SET` of DuckDB settings that affect every session (memory, threads,
   secrets) is limited to admins, as are the read cache's functions and
   settings (`cache_httpfs_*`, see [operations](operations.md#read-cache)).
 - `pg_catalog` views are compatible enough for the clients above but are not
   a complete copy of PostgreSQL's. Storage-level details (sizes, indexes,
-  tablespaces) are empty. Temporary objects are in the schema `pg_temp`.
+  tablespaces) are empty, and so are keys: Iceberg does not keep primary
+  or foreign keys. Temporary objects are in the schema `pg_temp`.
+  `lake.information_schema` and `lake.pg_catalog` mean the same as
+  `information_schema` and `pg_catalog`.
 - SQL cursors support `DECLARE ... CURSOR [WITH HOLD] FOR`, `FETCH [FORWARD
   | NEXT] [n | ALL]` and `CLOSE`; they read forward only, and `MOVE` and
   scrollable cursors are not supported. A cursor's whole result is computed

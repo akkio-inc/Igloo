@@ -145,7 +145,13 @@ func (column Column) Define(ctx context.Context, writer *buffer.Writer, format F
 	// https://www.postgresql.org/docs/current/protocol-message-formats.html
 	// https://www.postgresql.org/docs/current/catalog-pg-attribute.html
 
-	writer.AddInt32(-1)
+	// Igloo patch: send TypeModifier when set, such as a numeric's
+	// precision and scale, which JDBC and Npgsql report to BI tools.
+	if column.TypeModifier != 0 {
+		writer.AddInt32(column.TypeModifier)
+	} else {
+		writer.AddInt32(-1)
+	}
 	writer.AddInt16(int16(format))
 }
 

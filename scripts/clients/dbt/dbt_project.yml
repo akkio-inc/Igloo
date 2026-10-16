@@ -1,0 +1,25 @@
+# A small agency reporting project: ad-platform spend and conversions per
+# campaign, run against Igloo with the standard dbt-postgres adapter by
+# scripts/clients/dbt_test.sh.
+name: agency_reporting
+version: "1.0.0"
+config-version: 2
+profile: igloo
+
+seeds:
+  agency_reporting:
+    +schema: ref
+    campaigns:
+      +column_types:
+        start_date: date
+        daily_budget: numeric(12,2)
+
+models:
+  agency_reporting:
+    +persist_docs:
+      relation: true
+      columns: true
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

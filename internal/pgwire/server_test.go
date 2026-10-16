@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -125,13 +126,13 @@ type testServer struct {
 
 // startServer runs Igloo on an in-memory DuckDB with an "igloo" admin.
 // configure, if given, adjusts the server options.
-func startServer(t *testing.T, configure ...func(*Options)) *testServer {
+func startServer(t testing.TB, configure ...func(*Options)) *testServer {
 	t.Helper()
 	return startServerWithConfig(t, config.Config{}, configure...)
 }
 
 // startServerWithConfig is startServer with an engine configured by cfg.
-func startServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*Options)) *testServer {
+func startServerWithConfig(t testing.TB, cfg config.Config, configure ...func(*Options)) *testServer {
 	t.Helper()
 	return startServerWithEngine(t, cfg, nil, configure...)
 }
@@ -525,13 +526,52 @@ func TestPostgresOnlySettingsAreAccepted(t *testing.T) {
 
 func TestMultipleStatementsInOneQuery(t *testing.T) {
 	ts := startServer(t)
-	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE USER walt WITH PASSWORD 'walt-password' ROLE writer")
+	mustExec(t, admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
+	walt := connect(t, ts.url("walt", "walt-password"), pgx.QueryExecModeSimpleProtocol)
+	rita := connect(t, ts.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)
+	rows := func(conn *pgx.Conn) int64 { return count(t, conn, "SELECT count(*) FROM multi") }
 
-	var n int64
-	err := conn.QueryRow(context.Background(),
-		"CREATE TABLE multi (i INTEGER); INSERT INTO multi VALUES (1), (2); SELECT count(*) FROM multi").Scan(&n)
-	if err != nil || n != 2 {
-		t.Fatalf("got %d, %v", n, err)
+	// Not only admins: each statement is checked and run on its own, can
+	// use what the one before created, and sends its own result.
+	results, err := walt.PgConn().Exec(ctx,
+		"CREATE TABLE multi (i INTEGER); INSERT INTO multi VALUES (1), (2); SELECT count(*) FROM multi").ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tags []string
+	for _, r := range results {
+		tags = append(tags, r.CommandTag.String())
+	}
+	if !slices.Equal(tags, []string{"CREATE TABLE", "INSERT 0 2", "SELECT 1"}) || string(results[2].Rows[0][0]) != "2" {
+		t.Errorf("results: %q, last %q", tags, results[2].Rows)
+	}
+
+	// They form one transaction: a failure undoes the statements before it
+	// and skips the ones after.
+	_, err = walt.PgConn().Exec(ctx, "INSERT INTO multi VALUES (3); INSERT INTO missing VALUES (4); INSERT INTO multi VALUES (5)").ReadAll()
+	if pgCode(err) != "42P01" || rows(walt) != 2 || walt.PgConn().TxStatus() != 'I' {
+		t.Errorf("failed statement: %v, %d rows, status %c", err, rows(walt), walt.PgConn().TxStatus())
+	}
+	// Unless they manage transactions themselves.
+	_, err = walt.PgConn().Exec(ctx, "BEGIN; INSERT INTO multi VALUES (3); COMMIT; INSERT INTO missing VALUES (4)").ReadAll()
+	if pgCode(err) != "42P01" || rows(walt) != 3 {
+		t.Errorf("own transaction: %v, %d rows", err, rows(walt))
+	}
+
+	// A reader's DELETE is refused, wherever it comes in the query.
+	_, err = rita.PgConn().Exec(ctx, "SELECT 1; DELETE FROM multi").ReadAll()
+	if pgCode(err) != "42501" || rows(rita) != 3 {
+		t.Errorf("reader's DELETE: %v, %d rows", err, rows(rita))
+	}
+
+	// Statements Igloo carries out outside DuckDB's transactions must come
+	// alone, and nothing of the query runs.
+	_, err = walt.PgConn().Exec(ctx, "INSERT INTO multi VALUES (6); ALTER TABLE multi OWNER TO rita").ReadAll()
+	if pgCode(err) != "0A000" || rows(walt) != 3 {
+		t.Errorf("an owner change among other statements: %v, %d rows", err, rows(walt))
 	}
 }
 
@@ -692,7 +732,7 @@ func TestRoles(t *testing.T) {
 		t.Errorf("reader catalog query: %d, %v", tables, err)
 	}
 
-	// Non-admins send one statement at a time, so each is checked.
+	// Each statement of a query is checked on its own.
 	simpleReader := connect(t, ts.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)
 	if _, err := simpleReader.Exec(ctx, "SELECT 1; DELETE FROM facts"); pgCode(err) != "42501" {
 		t.Errorf("multi-statement query from a reader: %v", err)
@@ -738,8 +778,8 @@ func TestSQLFromStrings(t *testing.T) {
 		}
 	}
 
-	// An admin's statements before a refused one in the same query do not
-	// run either.
+	// The statements of a query form one transaction, so an admin's
+	// statements before a refused one are undone.
 	if _, err := admin.Exec(ctx, "CREATE TABLE ran (i INTEGER); SELECT * FROM query('SELECT 1')"); pgCode(err) != "42501" {
 		t.Errorf("multi-statement query with query(): %v", err)
 	}

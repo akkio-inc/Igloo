@@ -23,6 +23,9 @@ were removed; the code is otherwise unchanged except for these patches:
   encoding is on by default, as in DuckDB and Java Iceberg. iceberg-go turns
   it off, which made compacted files with repetitive string columns slower
   for DuckDB to scan. Also Igloo tuning.
+- `catalog/rest/rest.go`, `RenameView` (new): renames a view through the
+  REST catalog's `views/rename` endpoint, as `RenameTable` does for tables.
+  Igloo renames views for `ALTER VIEW ... RENAME TO`, which dbt runs.
 - `data_file_codec.go`: the manifest-entry schema cache is a small built-in
   LRU instead of `github.com/hashicorp/golang-lru`, which is MPL-2.0. Igloo
   links only permissively licensed code.

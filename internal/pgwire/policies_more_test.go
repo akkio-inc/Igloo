@@ -124,10 +124,11 @@ func TestPoliciesFailClosed(t *testing.T) {
 	mustExec(t, cs.admin, "GRANT acme_team TO walt")
 	mustExec(t, cs.admin, "GRANT acme_team TO rita")
 
-	// Several statements at once, which preparing would partly run.
-	expectRefused(t, cs.admin, "SELECT 1; SELECT email FROM "+c, "42501")
-	expectRefused(t, cs.admin, "CREATE TABLE lake.public.raw AS SELECT * FROM "+c+"; SELECT 1", "42501")
-	expectRefused(t, cs.admin, "SELECT * FROM lake.public.raw", "")
+	// Several statements in one simple query run one at a time, each under
+	// the policies as if sent alone.
+	mustExec(t, cs.admin, "SELECT 1; CREATE TABLE lake.public.raw AS SELECT * FROM "+c+"; SELECT 1")
+	expectRows(t, cs.admin, "SELECT DISTINCT email FROM lake.public.raw", "***")
+	mustExec(t, cs.admin, "DROP TABLE lake.public.raw")
 	// A PIVOT that finds its columns by reading the data first.
 	const types = "SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum_%'"
 	before := count(t, rita, types)

@@ -231,3 +231,22 @@ func TestASTWalk(t *testing.T) {
 		}
 	}
 }
+
+func TestWithViewSchemas(t *testing.T) {
+	for _, c := range []struct {
+		setting, db, want string
+		ok                bool
+	}{
+		{`"public"`, "lake", `"public","memory"."public"`, true},
+		{"sales, lake.ops", "lake", `"sales","memory"."sales","lake"."ops","memory"."ops"`, true},
+		{"", "lake", `"lake"."public","memory"."public"`, true},
+		{"lake.public,memory.public", "lake", `"lake"."public","memory"."public"`, false},
+		{"other.main", "lake", `"other"."main"`, false},
+		{"public", "memory", `"public"`, false},
+	} {
+		got, ok := withViewSchemas(c.setting, c.db, "public", "lake", "memory")
+		if got != c.want || ok != c.ok {
+			t.Errorf("withViewSchemas(%q, %q) = %q, %v; want %q, %v", c.setting, c.db, got, ok, c.want, c.ok)
+		}
+	}
+}

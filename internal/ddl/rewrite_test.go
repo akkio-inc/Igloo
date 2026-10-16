@@ -26,3 +26,20 @@ func TestRewriteNames(t *testing.T) {
 		}
 	}
 }
+
+func TestQualifyNames(t *testing.T) {
+	tables := map[string]bool{"sales.orders": true, "public.t": true}
+	match := func(schema, name string) bool { return tables[schema+"."+name] }
+	for in, want := range map[string]string{
+		"SELECT * FROM sales.orders":                         `SELECT * FROM "lake".sales.orders`,
+		`SELECT o.x FROM sales . orders o JOIN "public"."t"`: `SELECT o.x FROM "lake".sales . orders o JOIN "lake"."public"."t"`,
+		"SELECT * FROM lake.sales.orders":                    "SELECT * FROM lake.sales.orders",
+		"SELECT sales.orders.x FROM other.sales.orders":      "SELECT sales.orders.x FROM other.sales.orders",
+		"SELECT 'sales.orders' -- sales.orders":              "SELECT 'sales.orders' -- sales.orders",
+		"SELECT * FROM sales.other, orders":                  "SELECT * FROM sales.other, orders",
+	} {
+		if got := qualifyNames(in, match, `"lake"`); got != want {
+			t.Errorf("qualifyNames(%q)\n got %q\nwant %q", in, got, want)
+		}
+	}
+}

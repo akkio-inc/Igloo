@@ -41,7 +41,7 @@ func (m *Manager) Comment(ctx context.Context, t CommentTarget) error {
 	var err error
 	switch {
 	case t.Kind == "COLUMN" && isView:
-		return errors.New("comments on view columns are not supported")
+		err = m.setViewColumnComment(ctx, t)
 	case t.Kind == "COLUMN":
 		err = m.cat.SetColumnComment(ctx, t.Schema, t.Name, t.Column, t.Text)
 	case t.Kind == "VIEW" || isView:
@@ -57,6 +57,21 @@ func (m *Manager) Comment(ctx context.Context, t CommentTarget) error {
 		return err
 	}
 	m.reloadTable(ctx, t.Schema, t.Name, isView)
+	return nil
+}
+
+// setViewColumnComment comments on a view's column, which gives the view a
+// new version; the local copy records it, so the next sync does not
+// recreate the copy for it.
+func (m *Manager) setViewColumnComment(ctx context.Context, t CommentTarget) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.cat.SetViewColumnComment(ctx, t.Schema, t.Name, t.Column, t.Text); err != nil {
+		return err
+	}
+	if v, ok, err := m.cat.LoadDuckDBView(ctx, t.Schema, t.Name); err == nil && ok {
+		m.views[keyOf(t.Schema, t.Name)] = v
+	}
 	return nil
 }
 

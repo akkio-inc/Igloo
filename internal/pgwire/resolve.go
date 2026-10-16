@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -114,6 +115,77 @@ func splitTopLevelQuoted(s string, sep byte) []string {
 		out = append(out, s[start:])
 	}
 	return out
+}
+
+// setsSearchPath matches the SET and RESET that change the search path.
+var setsSearchPath = regexp.MustCompile(`(?is)^(SET|RESET)\s+(?:SESSION\s+|LOCAL\s+)?"?(search_path|schema)"?(\s|=|;|$)`)
+
+// keepViewsOnPath puts the local copies of the catalog's views back on the
+// session's search path after a client set it, next to each catalog schema
+// there, as on the path sessions start with (lake.public,memory.public).
+// Superset's SQL Lab, for one, sets the path to the schema the analyst
+// picked, and its views would no longer resolve.
+func (s *Server) keepViewsOnPath(ctx context.Context, sess *session) error {
+	rows, err := sess.conn.QueryContext(ctx,
+		"SELECT system.main.current_setting('search_path')::VARCHAR, system.main.current_database(), system.main.current_schema()", nil)
+	if err != nil {
+		return err
+	}
+	dest := make([]driver.Value, 3)
+	err = rows.Next(dest)
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	setting, _ := dest[0].(string)
+	db, _ := dest[1].(string)
+	schema, _ := dest[2].(string)
+	if path, ok := withViewSchemas(setting, db, schema, s.catalogName(), s.engine.LocalDatabase()); ok {
+		_, err = sess.conn.ExecContext(ctx, "SET SESSION search_path = "+quoteLiteral(path), nil)
+	}
+	return err
+}
+
+// withViewSchemas returns the search path setting with local, the database
+// of views' local copies, after each schema of catalog on it. setting is
+// empty for the default path, schema of db. ok is false if nothing was
+// missing.
+func withViewSchemas(setting, db, schema, catalog, local string) (path string, ok bool) {
+	entries := splitTopLevelQuoted(setting, ',')
+	if strings.TrimSpace(setting) == "" {
+		entries = []string{quoteName([]string{db, schema})}
+	}
+	key := func(parts []string) string { return strings.ToLower(strings.Join(parts, ".")) }
+	present := map[string]bool{}
+	for _, e := range entries {
+		present[key(splitQualified(strings.TrimSpace(e)))] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(parts []string) {
+		if k := key(parts); !seen[k] {
+			seen[k] = true
+			out = append(out, quoteName(parts))
+		}
+	}
+	for _, e := range entries {
+		parts := splitQualified(strings.TrimSpace(e))
+		var views []string
+		switch {
+		case len(parts) == 1 && strings.EqualFold(db, catalog):
+			views = []string{local, parts[0]}
+		case len(parts) == 2 && strings.EqualFold(parts[0], catalog):
+			views = []string{local, parts[1]}
+		case len(parts) == 0:
+			continue
+		}
+		add(parts)
+		if views != nil {
+			add(views)
+			ok = ok || !present[key(views)]
+		}
+	}
+	return strings.Join(out, ","), ok
 }
 
 // resolver resolves names for one statement on one session.

@@ -211,7 +211,7 @@ func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.T
 	// going through parse, are still held to their owner's limits. Console
 	// and Flight SQL statements go through parse, which refreshes them.
 	s.refreshLimits(ctx, sess, user)
-	return &EmbeddedSession{srv: s, sess: sess, types: pgtype.NewMap()}, nil
+	return &EmbeddedSession{srv: s, sess: sess, types: newTypeMap()}, nil
 }
 
 // User is the session's user as of its last role check.
@@ -292,12 +292,11 @@ func (e *EmbeddedSession) run(ctx context.Context, query string, out ResultWrite
 // sends its result to out. ctx carries the session.
 func (e *EmbeddedSession) runStatement(ctx context.Context, ps *wire.PreparedStatement, params []wire.Parameter, out ResultWriter) error {
 	st, ok := e.sess.open[ps]
-	w := &embeddedWriter{out: out, columns: ps.Columns(), types: e.types, canStop: ok && st.onlyReads()}
-	if len(w.columns) > 0 {
-		if err := out.Columns(columnsOf(w.columns)); err != nil {
+	w := &embeddedWriter{out: out, types: e.types, canStop: ok && st.onlyReads()}
+	if cols := ps.Columns(); len(cols) > 0 {
+		if err := w.DefineColumns(cols); err != nil {
 			return err
 		}
-		w.values = make([]any, len(w.columns))
 	}
 	err := ps.Run(ctx, w, params)
 	switch {
@@ -371,6 +370,16 @@ func (w *embeddedWriter) Row(values []any) error {
 	}
 	w.written++
 	return nil
+}
+
+// DefineColumns announces the columns of the rows to come; statements of a
+// query that holds several announce them as they run (see parseScript).
+func (w *embeddedWriter) DefineColumns(columns wire.Columns) error {
+	if w.written > 0 || len(w.columns) > 0 {
+		return errors.New("the statement's columns are already described")
+	}
+	w.columns, w.values = columns, make([]any, len(columns))
+	return w.out.Columns(columnsOf(columns))
 }
 
 func (w *embeddedWriter) Written() uint32 { return w.written }

@@ -390,6 +390,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		wire.Portals(newPortalCache),
 		wire.TxStatus(txStatus),
 		wire.GlobalParameters(serverParameters),
+		wire.ExtendTypes(extendTypes),
 		// The protocol library logs query text at debug level, which would
 		// include passwords from CREATE USER; keep it at info or above.
 		wire.Logger(slog.New(minLevel{log.Handler(), slog.LevelInfo})),
@@ -435,6 +436,11 @@ type session struct {
 	open     map[*wire.PreparedStatement]*statement
 	inTx     bool
 	txFailed bool
+	// changes counts the statements in the transaction block that may have
+	// changed something, and savepoints are its savepoints (see
+	// savepointCommand).
+	changes    int
+	savepoints []savepoint
 	// timeout limits each statement; zero means none.
 	timeout time.Duration
 	// activity records statements while they run; it may be nil.
@@ -698,19 +704,26 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 func (sess *session) observe(st *statement, err error) {
 	if st != nil && st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION {
 		if err == nil || isTransactionEnd(st.query) {
-			switch transactionChange(st.query) {
-			case 1:
+			// BEGIN inside a block, and COMMIT or ROLLBACK outside one,
+			// change nothing (see redundantTransaction).
+			switch change := transactionChange(st.query); {
+			case change > 0 && !sess.inTx:
 				sess.inTx, sess.txFailed = true, false
-			case -1:
+				sess.savepoints, sess.changes = nil, 0
+			case change < 0 && sess.inTx:
 				sess.inTx, sess.txFailed = false, false
+				sess.savepoints, sess.changes = nil, 0
 				// Cursors without WITH HOLD end with their transaction.
 				sess.closeCursors(context.Background(), false)
 			}
 			return
 		}
 	}
-	if err != nil && sess.inTx {
+	switch {
+	case err != nil && sess.inTx:
 		sess.txFailed = true
+	case st != nil && sess.inTx && !st.onlyReads():
+		sess.changes++
 	}
 }
 
@@ -729,13 +742,19 @@ func txStatus(ctx context.Context) types.ServerStatus {
 // loaded first (see Engine.LoadSchemas): ones that read columns, and ones
 // that read table OIDs, because loading a schema gives the table a new OID
 // and clients such as psql look up an OID before listing its columns.
-var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_schema\s*\.\s*columns|duckdb_columns)\b`)
+var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_schema"?\s*\.\s*"?columns|pg_information_schema_columns|duckdb_columns)\b`)
 
 var deallocateAll = regexp.MustCompile(`(?is)^\s*DEALLOCATE\s+(?:PREPARE\s+)?ALL\s*;?\s*$`)
 
 var showPasswordEncryption = regexp.MustCompile(`(?is)^\s*SHOW\s+password_encryption\s*;?\s*$`)
 
 func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatements, error) {
+	// DuckDB reads SQL up to the first NUL, while Igloo's checks read all
+	// of it; PostgreSQL refuses NUL in text, and so does Igloo, from the
+	// web console and Flight SQL too, so the two never disagree.
+	if strings.IndexByte(q.Query, 0) >= 0 {
+		return nil, pgerror.WithCode(errors.New(`invalid byte sequence for encoding "UTF8": 0x00`), codes.CharacterNotInRepertoire)
+	}
 	sess := sessionFrom(ctx)
 	user, err := s.refreshUser(ctx, sess)
 	if err != nil {
@@ -743,6 +762,26 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	}
 
 	s.refreshLimits(ctx, sess, user)
+	// User statements, alone or together, go to parseUserCommands below.
+	if parts := sqllex.Split(q.Query); q.SimpleQuery && len(parts) > 1 {
+		if _, users, _ := parseUserCommands(q.Query); !users {
+			if ps, ok, err := s.policyCommand(ctx, sess, q); ok || err != nil {
+				return ps, err
+			}
+			for _, p := range parts {
+				if err := aloneError(p.Text); err != nil {
+					s.metrics.query(time.Now(), err)
+					s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+					return nil, err
+				}
+			}
+			return s.parseScript(sess, parts), nil
+		}
+	}
+	if err := sess.checkAborted(q.Query); err != nil {
+		s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+		return nil, err
+	}
 
 	if stmt, ok := s.statementTimeoutCommand(sess, q.Query); ok {
 		return stmt, nil
@@ -751,6 +790,12 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return stmt, nil
 	}
 	if stmt, ok := s.distributedCommand(sess, q.Query); ok {
+		return stmt, nil
+	}
+	if stmt, ok := s.showCommand(sess, q.Query); ok {
+		return stmt, nil
+	}
+	if stmt, ok := s.savepointCommand(sess, q.Query); ok {
 		return stmt, nil
 	}
 
@@ -859,6 +904,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return ps, err
 	}
 
+	if ps, ok, err := s.copyToCommand(ctx, sess, user, q); ok || err != nil {
+		return ps, err
+	}
+
 	st, err := s.prepareStatement(ctx, sess, user, q.Query, q.ParameterOIDs)
 	if err != nil {
 		return nil, err
@@ -878,38 +927,40 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 
 		start := time.Now()
 		tw := &tagWriter{DataWriter: w}
-		if err := s.recheck(ctx, sess, st); err != nil {
+		err = sess.checkAborted(st.query)
+		if err == nil {
+			err = s.recheck(ctx, sess, st)
+		}
+		if err != nil {
 			s.metrics.query(start, err)
 			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
 			return err
 		}
 		workers := 0
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
-			n, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
-			if done {
-				workers = n
-				return err
+			run := func() error {
+				n, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
+				if done {
+					workers = n
+					return err
+				}
+				return s.runStatement(ctx, sess, st, args, tw)
 			}
-			return runWithCommitRetry(ctx, sess, st, func() error {
-				return sess.profiled(ctx, st, func() error { return st.run(ctx, args, tw) })
-			})
+			switch {
+			case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
+				return sess.runTransaction(ctx, st, tw, run)
+			case st.changesIceberg:
+				return sess.outsideTransaction(ctx, run)
+			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
+				return s.runSetting(ctx, sess, st, args, tw)
+			}
+			return run()
 		})
 		var used *audit.Resources
 		if err == nil {
 			used = sess.measure(st)
 		}
 		queued := sess.wl.queued
-		if isIcebergNoReplace(err) {
-			if sess.inTx {
-				err = pgerror.WithCode(errors.New("CREATE OR REPLACE TABLE on an Iceberg table cannot run inside a transaction block"),
-					codes.ActiveSQLTransaction)
-			} else if r, ok := s.replaceable(sess, st); ok {
-				err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error { return s.replaceTable(ctx, sess, r) })
-				if err == nil {
-					err = tw.Complete("CREATE TABLE")
-				}
-			}
-		}
 		s.metrics.query(start, err)
 		sess.observe(st, err)
 		if err == nil {
@@ -957,11 +1008,13 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 }
 
 // rewrite points the names in text that Igloo serves itself (PostgreSQL's
-// catalog, the history views, the catalog's views) at where they are.
-func (s *Server) rewrite(ctx context.Context, user auth.User, text string) string {
-	query := rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(text), user.Name), s.engine.LocalDatabase())
+// catalog and settings, the history views, the catalog's views) at where
+// they are.
+func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, text string) string {
+	query := rewriteCurrentSetting(rewriteSystemSchemaRefs(text, s.catalogName()))
+	query = rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(query), user.Name), s.engine.LocalDatabase())
 	if s.ddl != nil {
-		query = s.ddl.RewriteViewRefs(query)
+		query = s.withoutIcebergCascade(ctx, sess, s.ddl.RewriteViewRefs(query))
 	}
 	if readsMetadata.MatchString(query) {
 		s.refreshMetadata(ctx)
@@ -975,7 +1028,7 @@ func (s *Server) rewrite(ctx context.Context, user auth.User, text string) strin
 // user's own.
 func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
 	fail := func(err error) (*statement, error) { return nil, err }
-	query, err := s.resolveRefReads(ctx, sess, s.rewrite(ctx, user, text))
+	query, err := s.resolveRefReads(ctx, sess, s.rewrite(ctx, sess, user, text))
 	if err != nil {
 		return fail(err)
 	}
@@ -1081,10 +1134,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	// Apply policies: what runs is the statement rewritten to read
 	// protected tables through them.
-	text, g, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, query, oids)
-	if err == nil && text != query {
+	protected, g, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, query, oids)
+	if err == nil && protected != query {
 		st.original = query
-		err = st.adopt(ctx, sess.conn, text)
+		err = st.adopt(ctx, sess.conn, protected)
 	} else if err == nil && ran {
 		err = st.reprepare(ctx, sess.conn)
 	}
@@ -1101,7 +1154,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		st.access, err = s.authorizeByGrants(ctx, sess, user, st, query, err)
 	}
 	if err == nil {
-		err = s.authorizeLocal(user.Role, st.stmtType, text)
+		err = s.authorizeLocal(ctx, sess, user.Role, st.stmtType, text, protected)
 	}
 	if err == nil {
 		// What it reads from connections, whatever the role, with a
@@ -1119,6 +1172,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// Preparing several statements ran all but the last.
 	if st.stmtType == duckdb.STATEMENT_TYPE_CREATE || len(sqllex.Split(query)) > 1 {
 		st.created = created
+	}
+	if changesCatalog(st.stmtType) {
+		st.changesIceberg = s.changesIceberg(ctx, sess, st.stmtType, query)
 	}
 	if st.access != nil && st.access.ranStatements {
 		// Checking grants ran statements on the session's connection.
@@ -1272,6 +1328,40 @@ func (s *Server) statementTimeoutCommand(sess *session, query string) (wire.Prep
 		}, wire.WithColumns(wire.Columns{{Name: "statement_timeout", Oid: pgtype.TextOID, Width: -1}}))
 	}
 	return nil, false
+}
+
+// showCommand answers SHOW of the PostgreSQL settings in pgSettings.
+func (s *Server) showCommand(sess *session, query string) (wire.PreparedStatements, bool) {
+	m := showSetting.FindStringSubmatch(query)
+	if m == nil {
+		return nil, false
+	}
+	setting, ok := pgSettings[strings.ToLower(strings.Join(strings.Fields(strings.Trim(m[1], `"`)), " "))]
+	if !ok {
+		return nil, false
+	}
+	return wire.Prepared(wire.NewStatement(s.audited(sess, query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		value := setting.value
+		switch setting.name {
+		case "TimeZone", "search_path":
+			v, err := settingValue(ctx, sess.conn, setting.name)
+			if err != nil {
+				return pgError(err)
+			}
+			value = v
+		case "application_name":
+			value = sess.applicationName()
+		case "is_superuser":
+			value = "off"
+			if sess.currentUser().Role == auth.RoleAdmin {
+				value = "on"
+			}
+		}
+		if err := w.Row([]any{value}); err != nil {
+			return err
+		}
+		return w.Complete("SHOW")
+	}), wire.WithColumns(wire.Columns{{Name: setting.name, Oid: pgtype.TextOID, Width: -1}}))), true
 }
 
 // errDenied stands in for a refused statement in metrics.

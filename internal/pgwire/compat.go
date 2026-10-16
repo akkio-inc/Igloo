@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -108,27 +109,129 @@ var catalogRewrites = []struct {
 	{regexp.MustCompile(`(?i)(\bgenerate_series\((?:[^()]|\([^()]*\))*\))\s+s\s*,`), "$1 AS s(s),"},
 	// pg_get_expr(expr, relation, pretty): DuckDB's takes no pretty flag.
 	{regexp.MustCompile(`(?i)\bpg_get_expr\(([^(),]+),([^(),]+),\s*(?:true|false)\s*\)`), "pg_get_expr($1,$2)"},
-	// Relations DuckDB's pg_catalog lacks or lacks columns of; each session
-	// defines them as temporary views (see sessionCatalogSetup), which are
-	// found only unqualified.
-	{regexp.MustCompile(`(?i)\bpg_catalog\.(pg_class|pg_attribute|pg_type|pg_namespace|pg_database|pg_roles|pg_user|pg_inherits|pg_policy|pg_trigger|pg_statistic_ext|pg_publication|pg_publication_rel|pg_publication_namespace|pg_publication_tables|pg_partitioned_table|pg_rewrite|pg_description)\b`), "$1"},
+	// a.attnum = ANY(ix.indkey) in a LEFT JOIN, as SQLAlchemy 1.4 lists
+	// indexes: DuckDB plans ANY over a list as a subquery, which it cannot
+	// join that way.
+	{regexp.MustCompile(`(?i)\b(\w+\.\w+)\s*=\s*ANY\s*\(\s*(\w+\.\w+)\s*\)`), "list_contains($2, $1)"},
+	// information_schema._pg_expandarray(a), as JDBC lists keys.
+	{regexp.MustCompile(`(?i)\binformation_schema\s*\.\s*_pg_expandarray\s*\(`), "_pg_expandarray("},
+	// json_build_object(k, v, ...), as SQLAlchemy reads identity columns.
+	{regexp.MustCompile(`(?i)\bjson_build_object\s*\(`), "json_object("},
+	// typreceive != 0: a type's I/O functions are names here, and a
+	// missing one is '-', as PostgreSQL prints it.
+	{regexp.MustCompile(`(?i)\b(typinput|typoutput|typreceive|typsend)\s*(!=|<>|=)\s*0\b`), "$1 $2 '-'"},
+	// proc.oid = typ.typreceive, as Npgsql looks up array types: the names
+	// stand in for the functions' OIDs.
+	{regexp.MustCompile(`(?i)\b(\w+)\.oid\s*=\s*(\w+)\.(typinput|typoutput|typreceive|typsend)\b`), "$1.proname = $2.$3"},
+	// Relations DuckDB's pg_catalog lacks or lacks columns of, which each
+	// session defines as temporary views; see sessionRelations.
+	{regexp.MustCompile(`(?i)\bpg_catalog\.(` + strings.Join(sessionRelations, "|") + `)\b`), "$1"},
 }
 
-// pgClassRegclass matches 'pg_class'::regclass, which drivers compare
-// pg_description.classoid with: pg_class's OID in PostgreSQL, as Igloo's
-// pg_description has it.
-var pgClassRegclass = regexp.MustCompile(`(?i)'pg_class'\s*::\s*(pg_catalog\.)?regclass\b`)
+// sessionRelations are the catalog relations DuckDB's pg_catalog lacks or
+// lacks columns of. Each session defines them as temporary views (see
+// sessionCatalogSetup), which are found only unqualified.
+var sessionRelations = []string{
+	"pg_class", "pg_attribute", "pg_type", "pg_namespace", "pg_database", "pg_roles", "pg_user", "pg_inherits",
+	"pg_policy", "pg_trigger", "pg_statistic_ext", "pg_publication", "pg_publication_rel",
+	"pg_publication_namespace", "pg_publication_tables", "pg_partitioned_table", "pg_rewrite", "pg_description",
+	"pg_matviews", "pg_collation", "pg_index", "pg_opclass", "pg_settings", "pg_range", "pg_proc",
+	"pg_stat_user_tables",
+}
 
-// rewriteCatalogQuery applies catalogRewrites to the SQL code of queries
-// that mention pg_catalog. String literals, quoted identifiers and comments
-// are left exactly as written, as is every other query.
-func rewriteCatalogQuery(query string) string {
-	if !strings.Contains(strings.ToLower(query), "pg_catalog") {
+// rewriteCatalogNames points names of the system catalogs, quoted or not,
+// at the session's versions of them: pg_catalog.name, where name is one of
+// sessionRelations or a function, becomes name (Metabase quotes both
+// parts), and information_schema.columns becomes
+// pg_information_schema_columns, which also fills in udt_schema and udt_name
+// for the clients that join them with pg_type, Npgsql and Metabase. Literals,
+// comments and every other name are left as written.
+func rewriteCatalogNames(query string) string {
+	lower := strings.ToLower(query)
+	if !strings.Contains(lower, "pg_catalog") && !strings.Contains(lower, "information_schema") {
 		return query
 	}
-	// Before the code-only rewrites, which cannot see a pattern that starts
-	// inside a string literal.
-	query = pgClassRegclass.ReplaceAllString(query, "1259")
+	toks := nameTokens(query)
+	var out strings.Builder
+	last := 0
+	for i := 0; i+2 < len(toks); i++ {
+		if i > 0 && toks[i-1].dot || !toks[i+1].dot || toks[i+2].name == "" || i+3 < len(toks) && toks[i+3].dot {
+			continue
+		}
+		schema, name := strings.ToLower(toks[i].name), strings.ToLower(toks[i+2].name)
+		switch {
+		case schema == "information_schema" && name == "columns":
+			out.WriteString(query[last:toks[i].start])
+			out.WriteString("pg_information_schema_columns")
+			last = toks[i+2].end
+		case schema == "pg_catalog" && (slices.Contains(sessionRelations, name) || i+3 < len(toks) && query[toks[i+3].start] == '('):
+			out.WriteString(query[last:toks[i].start])
+			last = toks[i+2].start
+		}
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
+}
+
+// regclassValue matches a literal or a parameter cast to regclass, as in
+// 'pg_class'::regclass, which drivers compare pg_description.classoid and
+// dbt compares pg_depend.classid with.
+var regclassValue = regexp.MustCompile(`(?i)('(?:[^']|'')*'|\$\d+)\s*::\s*(?:pg_catalog\.)?regclass\b`)
+
+// pgFormat matches PostgreSQL's format() with a literal format string that
+// has % placeholders.
+var pgFormat = regexp.MustCompile(`(?i)\bformat\s*\(\s*('(?:[^']|'')*%(?:[^']|'')*')`)
+
+// castStart and castToRegclass find CAST(x AS REGCLASS), which SQLAlchemy
+// writes.
+var (
+	castStart      = regexp.MustCompile(`(?i)\bCAST\s*\(`)
+	castToRegclass = regexp.MustCompile(`(?is)\s+AS\s+(?:pg_catalog\.)?regclass\s*$`)
+)
+
+// catalogOIDs are the system catalogs' OIDs in PostgreSQL, which Igloo's
+// pg_description uses too.
+var catalogOIDs = map[string]int{
+	"pg_type": 1247, "pg_attribute": 1249, "pg_proc": 1255, "pg_class": 1259,
+	"pg_database": 1262, "pg_namespace": 2615, "pg_constraint": 2606,
+	"pg_depend": 2608, "pg_description": 2609, "pg_index": 2610, "pg_rewrite": 2618,
+	"pg_trigger": 2620,
+}
+
+// rewriteCatalogQuery applies catalogRewrites to the SQL code of queries
+// that mention the system catalogs or reg* types. String literals,
+// quoted identifiers and comments are left exactly as written, as is every
+// other query.
+func rewriteCatalogQuery(query string) string {
+	lower := strings.ToLower(query)
+	query = rewriteCatalogNames(query)
+	if !strings.Contains(lower, "pg_") && !strings.Contains(lower, "reg") && !strings.Contains(lower, "information_schema") {
+		return query
+	}
+	// format('%I.%I', schema, name), as Metabase names relations: DuckDB's
+	// format takes {} placeholders, its printf %s.
+	query = pgFormat.ReplaceAllStringFunc(query, func(m string) string {
+		literal := pgFormat.FindStringSubmatch(m)[1]
+		if strings.Contains(literal, "{") {
+			return m
+		}
+		return "printf(" + strings.NewReplacer("%I", "%s", "%L", "%s").Replace(literal)
+	})
+	// Names and OIDs cast to regclass become OIDs: system catalogs' at once,
+	// others through pg_regclass (see sessionCatalogSetup). Before the
+	// code-only rewrites, which cannot see a pattern that starts inside a
+	// string literal.
+	query = regclassValue.ReplaceAllStringFunc(query, func(m string) string {
+		value := regclassValue.FindStringSubmatch(m)[1]
+		if oid, ok := catalogOIDs[strings.TrimPrefix(strings.ToLower(strings.Trim(value, "'")), "pg_catalog.")]; ok {
+			return strconv.Itoa(oid)
+		}
+		return regclassCall(value)
+	})
+	query = rewriteRegclassCasts(query)
 	return sqllex.MapCode(query, func(code string) string {
 		for _, r := range catalogRewrites {
 			code = r.re.ReplaceAllString(code, r.repl)
@@ -136,6 +239,96 @@ func rewriteCatalogQuery(query string) string {
 		return code
 	})
 }
+
+// rewriteRegclassCasts replaces CAST(x AS REGCLASS) in SQL code with
+// pg_regclass(x).
+func rewriteRegclassCasts(query string) string {
+	for from := 0; ; {
+		loc := castStart.FindStringIndex(query[from:])
+		if loc == nil {
+			return query
+		}
+		start, open := from+loc[0], from+loc[1]-1
+		close, ok := closingParen(query, open)
+		if !ok || !inCode(query, start) {
+			from = open + 1
+			continue
+		}
+		inner := query[open+1 : close]
+		m := castToRegclass.FindStringIndex(inner)
+		if m == nil {
+			from = open + 1
+			continue
+		}
+		query = query[:start] + regclassCall(inner[:m[0]]) + query[close+1:]
+		from = start + len("pg_regclass(")
+	}
+}
+
+var bareParam = regexp.MustCompile(`^\s*\$\d+\s*$`)
+
+// regclassCall calls pg_regclass on x. A parameter is a relation's name: in
+// pg_regclass, DuckDB could not tell its type, nor so the call's.
+func regclassCall(x string) string {
+	if bareParam.MatchString(x) {
+		x = strings.TrimSpace(x) + "::VARCHAR"
+	}
+	return "pg_regclass(" + x + ")"
+}
+
+// inCode reports whether query[at] is SQL code rather than a literal,
+// quoted identifier or comment.
+func inCode(query string, at int) bool {
+	pos := 0
+	for _, seg := range sqllex.Segments(query) {
+		if at < pos+len(seg.Text) {
+			return seg.Kind == sqllex.Code
+		}
+		pos += len(seg.Text)
+	}
+	return false
+}
+
+// toCharPatterns are the template patterns of PostgreSQL's to_char for
+// dates and times, longest first, and DuckDB's strftime specifiers for
+// them. FM (fill mode) is dropped: strftime does not pad names.
+var toCharPatterns = [][2]string{
+	{"%", "%%"}, {"FM", ""}, {"HH24", "%H"}, {"HH12", "%I"}, {"HH", "%I"}, {"IYYY", "%G"}, {"YYYY", "%Y"},
+	{"YY", "%y"}, {"Month", "%B"}, {"Mon", "%b"}, {"MM", "%m"}, {"MI", "%M"}, {"MS", "%g"}, {"US", "%f"},
+	{"SS", "%S"}, {"DDD", "%j"}, {"DD", "%d"}, {"Day", "%A"}, {"Dy", "%a"}, {"IW", "%V"}, {"AM", "%p"},
+	{"PM", "%p"},
+}
+
+// toCharMacro defines to_char(value, pattern) for dates and timestamps,
+// as Looker formats months ('YYYY-MM') and BI tools label dates.
+var toCharMacro = func() string {
+	format := "pattern"
+	for _, p := range toCharPatterns {
+		format = fmt.Sprintf("replace(%s, '%s', '%s')", format, p[0], p[1])
+	}
+	return "CREATE OR REPLACE TEMP MACRO to_char(value, pattern) AS strftime(value, " + format + ")"
+}()
+
+// pgRegclassMacro defines pg_regclass(x), which stands in for x::regclass:
+// x itself when it is an OID, the OID PostgreSQL gives a system catalog, or
+// the OID of the relation named, perhaps with its schema.
+var pgRegclassMacro = func() string {
+	names := make([]string, 0, len(catalogOIDs))
+	for name := range catalogOIDs {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	var cases strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&cases, " WHEN '%s' THEN %d", name, catalogOIDs[name])
+	}
+	return `CREATE OR REPLACE TEMP MACRO pg_regclass(x) AS coalesce(
+		TRY_CAST(x AS BIGINT),
+		CASE regexp_replace(lower(x::VARCHAR), '^pg_catalog\.', '')` + cases.String() + ` END,
+		(SELECT min(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = string_split(x::VARCHAR, '.')[-1]
+			AND (strpos(x::VARCHAR, '.') = 0 OR n.nspname = string_split(x::VARCHAR, '.')[-2])))`
+}()
 
 // sessionUser matches the SQL functions naming the current user. DuckDB
 // answers "duckdb" for them; Igloo substitutes the logged-in user. They are
@@ -183,47 +376,7 @@ func rewriteHistoryRefs(query, local string) string {
 		!strings.Contains(lower, "information_schema") {
 		return query
 	}
-	type tok struct {
-		start, end int
-		name       string
-		dot        bool
-	}
-	var toks []tok
-	pos := 0
-	for _, seg := range sqllex.Segments(query) {
-		start := pos
-		pos += len(seg.Text)
-		switch seg.Kind {
-		case sqllex.Ident:
-			if len(seg.Text) >= 2 {
-				toks = append(toks, tok{start: start, end: pos, name: strings.ReplaceAll(seg.Text[1:len(seg.Text)-1], `""`, `"`)})
-			}
-		case sqllex.Code:
-			for i := 0; i < len(seg.Text); {
-				c := seg.Text[i]
-				switch {
-				case unicode.IsSpace(rune(c)):
-					i++
-				case c == '.':
-					toks = append(toks, tok{start: start + i, end: start + i + 1, dot: true})
-					i++
-				case sqllex.IdentByte(c) && (c < '0' || c > '9'):
-					j := i
-					for j < len(seg.Text) && sqllex.IdentByte(seg.Text[j]) {
-						j++
-					}
-					toks = append(toks, tok{start: start + i, end: start + j, name: seg.Text[i:j]})
-					i = j
-				default:
-					toks = append(toks, tok{start: start + i, end: start + i + 1})
-					i++
-				}
-			}
-		default:
-			toks = append(toks, tok{start: start, end: pos})
-		}
-	}
-
+	toks := nameTokens(query)
 	var out strings.Builder
 	last := 0
 	for i := 0; i+2 < len(toks); i++ {
@@ -242,6 +395,87 @@ func rewriteHistoryRefs(query, local string) string {
 				quoteIdent(engine.InformationSchemaView(strings.ToLower(name))))
 			last = toks[i+2].end
 		}
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
+}
+
+// nameTok is a name, a dot, or (with neither) anything else in a query.
+type nameTok struct {
+	start, end int
+	name       string
+	dot        bool
+}
+
+// nameTokens splits query into names, dots and other tokens, for rewrites
+// of qualified names. Quoted names are unquoted and white space is left
+// out; a comment is a token of its own.
+func nameTokens(query string) []nameTok {
+	var toks []nameTok
+	pos := 0
+	for _, seg := range sqllex.Segments(query) {
+		start := pos
+		pos += len(seg.Text)
+		switch seg.Kind {
+		case sqllex.Ident:
+			if len(seg.Text) >= 2 {
+				toks = append(toks, nameTok{start: start, end: pos, name: strings.ReplaceAll(seg.Text[1:len(seg.Text)-1], `""`, `"`)})
+			}
+		case sqllex.Code:
+			for i := 0; i < len(seg.Text); {
+				c := seg.Text[i]
+				switch {
+				case unicode.IsSpace(rune(c)):
+					i++
+				case c == '.':
+					toks = append(toks, nameTok{start: start + i, end: start + i + 1, dot: true})
+					i++
+				case sqllex.IdentByte(c) && (c < '0' || c > '9'):
+					j := i
+					for j < len(seg.Text) && sqllex.IdentByte(seg.Text[j]) {
+						j++
+					}
+					toks = append(toks, nameTok{start: start + i, end: start + j, name: seg.Text[i:j]})
+					i = j
+				default:
+					toks = append(toks, nameTok{start: start + i, end: start + i + 1})
+					i++
+				}
+			}
+		default:
+			toks = append(toks, nameTok{start: start, end: pos})
+		}
+	}
+	return toks
+}
+
+// systemSchemas are the schemas DuckDB keeps once, outside every database.
+var systemSchemas = []string{"information_schema", "pg_catalog"}
+
+// rewriteSystemSchemaRefs drops the database from catalog.information_schema.x
+// and catalog.pg_catalog.x, where catalog is the Iceberg catalog's name.
+// PostgreSQL clients qualify these schemas with the database they connected
+// to (dbt does, with the database named in its profile); DuckDB has them
+// only in its system database. Literals, comments and every other name are
+// left as written.
+func rewriteSystemSchemaRefs(query, catalog string) string {
+	if catalog == "" || !strings.Contains(strings.ToLower(query), strings.ToLower(catalog)) {
+		return query
+	}
+	toks := nameTokens(query)
+	var out strings.Builder
+	last := 0
+	for i := 0; i+3 < len(toks); i++ {
+		if !strings.EqualFold(toks[i].name, catalog) || i > 0 && toks[i-1].dot || !toks[i+1].dot ||
+			!slices.ContainsFunc(systemSchemas, func(s string) bool { return strings.EqualFold(s, toks[i+2].name) }) ||
+			!toks[i+3].dot {
+			continue
+		}
+		out.WriteString(query[last:toks[i].start])
+		last = toks[i+2].start
 	}
 	if last == 0 {
 		return query
@@ -352,8 +586,152 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 		`CREATE OR REPLACE TEMP VIEW pg_partitioned_table AS SELECT 0::BIGINT AS partrelid WHERE false`,
 		`CREATE OR REPLACE TEMP VIEW pg_rewrite AS SELECT 0::BIGINT AS oid, 0::BIGINT AS ev_class,
 			''::VARCHAR AS rulename WHERE false`,
+		// dbt lists materialized views along with tables and views.
+		`CREATE OR REPLACE TEMP VIEW pg_matviews AS SELECT ''::VARCHAR AS schemaname, ''::VARCHAR AS matviewname,
+			''::VARCHAR AS matviewowner, NULL::VARCHAR AS tablespace, false AS hasindexes,
+			false AS ispopulated, ''::VARCHAR AS definition WHERE false`,
+		// Collations and indexes, with the columns SQLAlchemy reads.
+		`CREATE OR REPLACE TEMP VIEW pg_collation AS SELECT 0::BIGINT AS oid, ''::VARCHAR AS collname,
+			0::BIGINT AS collnamespace, 0::BIGINT AS collowner, 'c' AS collprovider, true AS collisdeterministic,
+			6 AS collencoding, 'C' AS collcollate, 'C' AS collctype, NULL::VARCHAR AS colliculocale,
+			NULL::VARCHAR AS collicurules, NULL::VARCHAR AS collversion WHERE false`,
+		`CREATE OR REPLACE TEMP VIEW pg_index AS SELECT 0::BIGINT AS indexrelid, 0::BIGINT AS indrelid,
+			0::SMALLINT AS indnatts, 0::SMALLINT AS indnkeyatts, false AS indisunique, false AS indnullsnotdistinct,
+			false AS indisprimary, false AS indisexclusion, true AS indimmediate, false AS indisclustered,
+			true AS indisvalid, false AS indcheckxmin, true AS indisready, true AS indislive, false AS indisreplident,
+			[]::SMALLINT[] AS indkey, []::BIGINT[] AS indcollation, []::BIGINT[] AS indclass,
+			[]::SMALLINT[] AS indoption, NULL::VARCHAR AS indexprs, NULL::VARCHAR AS indpred WHERE false`,
+		`CREATE OR REPLACE TEMP VIEW pg_information_schema_columns AS SELECT * REPLACE (
+			'pg_catalog' AS udt_schema, (SELECT typname FROM pg_type WHERE oid = (` + pgTypeOID + `)) AS udt_name)
+			FROM information_schema.columns`,
+		// Metabase's row count estimates; Iceberg tables have none here.
+		`CREATE OR REPLACE TEMP VIEW pg_stat_user_tables AS SELECT 0::BIGINT AS relid, ''::VARCHAR AS schemaname,
+			''::VARCHAR AS relname, 0::BIGINT AS seq_scan, 0::BIGINT AS idx_scan, 0::BIGINT AS n_live_tup,
+			0::BIGINT AS n_dead_tup, NULL::TIMESTAMPTZ AS last_vacuum, NULL::TIMESTAMPTZ AS last_analyze WHERE false`,
+		// Npgsql loads types with their ranges and I/O functions.
+		`CREATE OR REPLACE TEMP VIEW pg_range AS SELECT 0::BIGINT AS rngtypid, 0::BIGINT AS rngsubtype,
+			0::BIGINT AS rngmultitypid, 0::BIGINT AS rngcollation, 0::BIGINT AS rngsubopc,
+			NULL::VARCHAR AS rngcanonical, NULL::VARCHAR AS rngsubdiff WHERE false`,
+		`CREATE OR REPLACE TEMP VIEW pg_proc AS SELECT * FROM pg_catalog.pg_proc
+			UNION ALL BY NAME SELECT proname, ` + fmt.Sprint(pgCatalogNamespace) + `::BIGINT AS pronamespace,
+				'f' AS prokind, false AS proretset
+			FROM (SELECT typreceive FROM pg_type UNION ALL SELECT typsend FROM pg_type) t(proname)`,
+		`CREATE OR REPLACE TEMP VIEW pg_opclass AS SELECT 0::BIGINT AS oid, 0::BIGINT AS opcmethod, ''::VARCHAR AS opcname,
+			0::BIGINT AS opcnamespace, 0::BIGINT AS opcowner, 0::BIGINT AS opcfamily, 0::BIGINT AS opcintype,
+			false AS opcdefault, 0::BIGINT AS opckeytype WHERE false`,
+		// psycopg looks types up by name, as SQLAlchemy does for hstore.
+		`CREATE OR REPLACE TEMP MACRO to_regtype(name) AS (SELECT oid FROM pg_type WHERE typname = name)`,
+		pgRegclassMacro,
+		pgSettingMacro,
+		// DuckDB's settings and the PostgreSQL ones drivers read, such as
+		// JDBC's max_index_keys.
+		`CREATE OR REPLACE TEMP VIEW pg_settings AS
+			SELECT name, setting, NULL::VARCHAR AS unit, NULL::VARCHAR AS category, short_desc,
+				NULL::VARCHAR AS extra_desc, 'user' AS context, vartype, 'default' AS source
+			FROM pg_catalog.pg_settings
+			UNION ALL SELECT * FROM (VALUES ('max_index_keys', '32', NULL, NULL, 'Shows the maximum number of index keys.',
+				NULL, 'internal', 'integer', 'default')) t
+			UNION ALL SELECT name, pg_setting(name), NULL, NULL, '', NULL, 'internal', 'string', 'default'
+				FROM (VALUES ` + pgSettingNames() + `) t(name)`,
+		// A row (x, n) per element of an array: its value and position.
+		`CREATE OR REPLACE TEMP MACRO _pg_expandarray(arr) AS
+			unnest(list_transform(range(1, len(arr) + 1), i -> {'x': arr[i], 'n': i}))`,
+		toCharMacro,
+		`CREATE OR REPLACE TEMP MACRO pg_get_viewdef(oid) AS (SELECT sql FROM duckdb_views() WHERE view_oid = oid),
+			(oid, pretty) AS (SELECT sql FROM duckdb_views() WHERE view_oid = oid)`,
 	}
 }
+
+// showSetting matches SHOW of one setting, SHOW TRANSACTION ISOLATION LEVEL
+// included.
+var showSetting = regexp.MustCompile(`(?is)^\s*SHOW\s+(TRANSACTION\s+ISOLATION\s+LEVEL|"?[a-z_]+"?)\s*;?\s*$`)
+
+// pgSettings are the PostgreSQL settings that drivers and tools read with
+// SHOW, as SQLAlchemy and JDBC do the isolation level, under PostgreSQL's
+// names for them. DuckDB has none of them: SHOW name describes a table.
+// An empty value is read from the session (see showCommand).
+var pgSettings = map[string]struct{ name, value string }{
+	// DuckDB transactions see a snapshot, as in PostgreSQL's REPEATABLE
+	// READ, and fail with 40001 when another commits a conflicting change.
+	"transaction isolation level":   {"transaction_isolation", "repeatable read"},
+	"transaction_isolation":         {"transaction_isolation", "repeatable read"},
+	"default_transaction_isolation": {"default_transaction_isolation", "repeatable read"},
+	"transaction_read_only":         {"transaction_read_only", "off"},
+	"default_transaction_read_only": {"default_transaction_read_only", "off"},
+	"standard_conforming_strings":   {"standard_conforming_strings", "on"},
+	"server_version":                {"server_version", "15.0"},
+	"server_version_num":            {"server_version_num", "150000"},
+	"server_encoding":               {"server_encoding", "UTF8"},
+	"client_encoding":               {"client_encoding", "UTF8"},
+	"datestyle":                     {"DateStyle", "ISO, MDY"},
+	"intervalstyle":                 {"IntervalStyle", "postgres"},
+	"integer_datetimes":             {"integer_datetimes", "on"},
+	"max_identifier_length":         {"max_identifier_length", "63"},
+	"lc_collate":                    {"lc_collate", "C"},
+	"lc_ctype":                      {"lc_ctype", "C"},
+	"default_table_access_method":   {"default_table_access_method", "heap"},
+	"timezone":                      {"TimeZone", ""},
+	"search_path":                   {"search_path", ""},
+	"application_name":              {"application_name", ""},
+	"is_superuser":                  {"is_superuser", ""},
+}
+
+// currentSetting matches current_setting('name') and current_setting($n).
+var currentSetting = regexp.MustCompile(`(?i)\bcurrent_setting\s*\(\s*('[^']*'|\$\d+)(\s*::\s*\w+)?\s*\)`)
+
+// rewriteCurrentSetting answers current_setting of the PostgreSQL settings
+// in pgSettings, which DuckDB does not have, and current_setting of a
+// parameter, which DuckDB refuses (SQLAlchemy reads
+// default_table_access_method so): through pg_setting (see
+// sessionCatalogSetup). DuckDB's own settings, named in literals, are left
+// to DuckDB.
+func rewriteCurrentSetting(query string) string {
+	if !strings.Contains(strings.ToLower(query), "current_setting") {
+		return query
+	}
+	return currentSetting.ReplaceAllStringFunc(query, func(m string) string {
+		arg := currentSetting.FindStringSubmatch(m)[1]
+		if strings.HasPrefix(arg, "$") {
+			return "pg_setting(" + arg + "::VARCHAR)"
+		}
+		if s, ok := pgSettings[strings.ToLower(strings.Trim(arg, "'"))]; ok && s.value != "" {
+			return "pg_setting(" + arg + ")"
+		}
+		return m
+	})
+}
+
+// staticSettings lists the settings in pgSettings that do not depend on the
+// session, sorted.
+func staticSettings() []string {
+	var names []string
+	for name, s := range pgSettings {
+		if s.value != "" && !strings.Contains(name, " ") {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// pgSettingNames lists staticSettings as SQL VALUES rows.
+func pgSettingNames() string {
+	rows := make([]string, 0, len(pgSettings))
+	for _, name := range staticSettings() {
+		rows = append(rows, "('"+pgSettings[name].name+"')")
+	}
+	return strings.Join(rows, ", ")
+}
+
+// pgSettingMacro defines pg_setting(name), the value of a setting in
+// pgSettings that does not depend on the session, or NULL.
+var pgSettingMacro = func() string {
+	var cases strings.Builder
+	for _, name := range staticSettings() {
+		fmt.Fprintf(&cases, " WHEN '%s' THEN '%s'", name, pgSettings[name].value)
+	}
+	return "CREATE OR REPLACE TEMP MACRO pg_setting(name) AS CASE lower(name)" + cases.String() + " END"
+}()
 
 var (
 	setStatementTimeout   = regexp.MustCompile(`(?is)^\s*SET\s+(?:SESSION\s+|LOCAL\s+)?statement_timeout\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$`)
@@ -414,6 +792,8 @@ var pgTypes = []struct {
 	{2950, "uuid", 16, "U"},
 }
 
+// pgTypeView lists pgTypes, with PostgreSQL's names for their binary I/O
+// functions, by which ADBC tells types apart.
 var pgTypeView = func() string {
 	rows := make([]string, len(pgTypes))
 	for i, t := range pgTypes {
@@ -424,7 +804,10 @@ var pgTypeView = func() string {
 		typlen::SMALLINT AS typlen, typlen > 0 AS typbyval, 'b' AS typtype, typcategory,
 		false AS typispreferred, true AS typisdefined, ',' AS typdelim, 0::BIGINT AS typrelid,
 		0::BIGINT AS typelem, 0::BIGINT AS typarray, typname || 'in' AS typinput,
-		typname || 'out' AS typoutput, 'd' AS typalign, 'p' AS typstorage, false AS typnotnull,
+		typname || 'out' AS typoutput,
+		typname || CASE WHEN oid IN (114, 1082, 1083, 1114, 1184, 1186, 1266, 1700, 2950) THEN '_recv' ELSE 'recv' END AS typreceive,
+		typname || CASE WHEN oid IN (114, 1082, 1083, 1114, 1184, 1186, 1266, 1700, 2950) THEN '_send' ELSE 'send' END AS typsend,
+		'd' AS typalign, 'p' AS typstorage, false AS typnotnull,
 		0::BIGINT AS typbasetype, -1 AS typtypmod, 0 AS typndims, 0::BIGINT AS typcollation,
 		NULL::VARCHAR AS typdefault, NULL::VARCHAR[] AS typacl
 		FROM (VALUES %s) t(oid, typname, typlen, typcategory)`,

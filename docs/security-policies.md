@@ -228,8 +228,9 @@ policy and tags.
 While any table has policies:
 
 - Statements Igloo cannot rewrite with certainty that name a protected table
-  or a view or macro that reads one: several statements in one query
-  string, a `PIVOT` that finds its columns in the data, statements behind a
+  or a view or macro that reads one: several statements in one prepared
+  statement (those of a simple query run, and are rewritten, one at a
+  time), a `PIVOT` that finds its columns in the data, statements behind a
   `WITH` clause before `UPDATE`, `DELETE` or `MERGE`, macros that read
   protected tables, `stats()`, and table names in escaped strings.
 - Renaming a table with policies or tags, or one of its protected columns,

@@ -17,7 +17,8 @@ of the cost per query at list prices. See the [benchmark](bench/README.md)
 for the method, every result and its caveats.
 
 - **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
-  so `psql`, JDBC, psycopg, pgx and BI tools work without an Igloo driver.
+  so `psql`, JDBC, psycopg, pgx, dbt, BI tools and notebooks work without an
+  Igloo driver.
 - **Arrow-native extracts.** [Arrow Flight SQL](docs/flight-sql.md) streams
   results to pandas, polars, Spark and BI tools as Arrow record batches,
   through ADBC or the Flight SQL JDBC driver, several times faster than the
@@ -241,6 +242,11 @@ the official TPC-H answers.
   query results as DuckDB's Arrow record batches for ADBC (pandas, polars),
   pyarrow and the Flight SQL JDBC driver, with the same users, grants,
   timeouts and history as SQL clients.
+- **[Your tools, unchanged](docs/integrations.md)**: dbt with the standard
+  dbt-postgres adapter (incremental models, snapshots, tests, docs),
+  Metabase, Superset, Power BI, Tableau and Looker through their PostgreSQL
+  connectors, and SQLAlchemy, pandas and polars in notebooks, tested on
+  every release.
 - **Operations basics**: health and readiness endpoints, Prometheus metrics,
   JSON logs, statement timeouts, connection limits, TLS, query cancel.
 
@@ -333,6 +339,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   reading partners' shares, and their security
 - [Connections](docs/federation.md): querying PostgreSQL and MySQL
   databases in place, and governing them with grants
+- [Tools and integrations](docs/integrations.md): dbt, BI tools and
+  notebooks, how to connect each and what to expect
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a

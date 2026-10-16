@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: stg_ad_platform_daily
+    description: One row per platform, campaign and day.
+    columns:
+      - name: campaign_id
+        description: Campaign the delivery belongs to.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_campaigns')
+                field: campaign_id
+      - name: spend
+        description: Media spend in the client's currency.
+  - name: stg_conversions
+    description: One row per conversion.
+    columns:
+      - name: conversion_id
+        data_tests: [unique, not_null]
+  - name: stg_campaigns
+    description: Campaigns with their channel group.
+    columns:
+      - name: campaign_id
+        data_tests: [unique, not_null]
+      - name: channel_group
+        data_tests: [not_null]

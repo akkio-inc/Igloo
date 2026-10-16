@@ -77,10 +77,19 @@ reference for every setting mentioned here.
   `none` can do nothing on its own. Each statement is checked before it runs,
   using DuckDB's own classification of the statement plus its SQL code (never
   its comments or literals); anything Igloo cannot classify needs `admin`.
-  Non-admins may send only one statement per query (DuckDB's own expansion
-  of a `PIVOT` in a `SELECT` aside, whose generated query is checked
-  first), and their
-  `SET` commands apply to their own session only. No one, admins included,
+  The statements of a query with several run one at a time, each checked
+  as if sent alone; a prepared statement holds only one for non-admins
+  (DuckDB's own expansion of a `PIVOT` in a `SELECT` aside, whose generated
+  query is checked first). SQL with a NUL in it is refused, since DuckDB
+  would read it only up to the NUL. Non-admins' `SET` commands apply to their own
+  session only. Only admins may change DuckDB's own database, `memory`,
+  where each replica keeps its copies of the catalog's views that every
+  session reads: Igloo resolves the object a statement creates, changes or
+  drops as DuckDB does, through the session's current database and search
+  path, and refuses it there whatever the statement's text says; non-admins
+  cannot make `memory` their current database with `SET search_path`, and a
+  writing statement whose target Igloo cannot tell is refused.
+  `COPY ... TO STDOUT` is checked as the query it runs. No one, admins included,
   may run SQL built from strings (`query()`, `json_execute_serialized_sql()`),
   which a check of the statement's text cannot see into, or move the read
   cache or change what it caches; its other functions and settings, and
@@ -114,12 +123,13 @@ reference for every setting mentioned here.
   the statement, and error messages, see only what the user may see. It
   checks the result (rewritten again, it must not change; DuckDB's plan of
   it must read exactly the tables its text names) and refuses statements it
-  cannot rewrite with certainty, including several statements in one query
-  that name a protected table, renames of protected tables and columns, and
-  DDL that would evaluate an expression over the table's rows (a column type
-  change, `ALTER ... USING`, a non-constant `DEFAULT`, a generated column, a
-  `CHECK` constraint, or `CREATE INDEX`), which could otherwise read masked
-  values and hidden rows.
+  cannot rewrite with certainty, including several statements in one
+  prepared statement that name a protected table (those of a simple query
+  are rewritten one at a time), renames of protected tables and columns,
+  and DDL that would evaluate an expression over the table's rows (a column
+  type change, `ALTER ... USING`, a non-constant `DEFAULT`, a generated
+  column, a `CHECK` constraint, or `CREATE INDEX`), which could otherwise
+  read masked values and hidden rows.
   Policy expressions are stored with their tables qualified and may not
   call macros, read files or depend on session state, and a statement is
   refused if a macro of its session replaces a function a policy calls, or

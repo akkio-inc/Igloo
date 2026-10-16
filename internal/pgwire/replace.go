@@ -3,12 +3,17 @@ package pgwire
 import (
 	"context"
 	"crypto/rand"
+	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	wire "github.com/jeroenrinzema/psql-wire"
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/policy"
 )
@@ -87,6 +92,77 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 	}
 	return fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
 		quoteName(r.staging), quoteName(r.target), err)
+}
+
+// runStatement runs st, retrying lost Iceberg commits (see
+// runWithCommitRetry), and carries out CREATE OR REPLACE TABLE on an
+// Iceberg table, which DuckDB refuses.
+func (s *Server) runStatement(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
+	err := runWithCommitRetry(ctx, sess, st, func() error {
+		return sess.profiled(ctx, st, func() error { return st.run(ctx, args, w) })
+	})
+	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
+		return w.Complete(commandTag(st.stmtType, st.query, 0))
+	}
+	if !isIcebergNoReplace(err) {
+		return err
+	}
+	if sess.inTx {
+		// Statements that change the catalog run outside the block (see
+		// outsideTransaction); this one was not recognized as one.
+		return pgerror.WithCode(errors.New("CREATE OR REPLACE TABLE on an Iceberg table cannot run inside a transaction block"),
+			codes.ActiveSQLTransaction)
+	}
+	r, ok := s.replaceable(sess, st)
+	if !ok {
+		return err
+	}
+	if err := s.replaceTable(ctx, sess, r); err != nil {
+		return err
+	}
+	return w.Complete("CREATE TABLE")
+}
+
+// doneAnyway reports whether a rename or drop of an Iceberg table that
+// DuckDB reported failed did in fact happen, as the catalog shows. DuckDB
+// keeps one list of each schema's tables for all sessions, and a session
+// that lists the schema while another renames or drops one of its tables
+// can make DuckDB fail the change after the catalog has made it: a rename
+// fails with "was already created by a different transaction" once
+// committed, and DROP TABLE IF EXISTS of a table already gone with
+// NoSuchTableException. dbt, with several threads, renames and drops
+// tables in one schema at once.
+func (s *Server) doneAnyway(ctx context.Context, st *statement, err error) bool {
+	msg := err.Error()
+	e := st.effect
+	if s.ddl == nil || e == nil || len(e.objects) == 0 {
+		return false
+	}
+	exists := func(schema, name string) bool {
+		ok, err := s.ddl.TableExists(ctx, schema, name)
+		return err != nil || ok // when in doubt, the error stands
+	}
+	switch {
+	case e.renameTo != "" && strings.Contains(msg, "was already created by a different transaction"):
+		for _, o := range e.objects {
+			if exists(o.Schema, o.Table) || !exists(o.Schema, e.renameTo) {
+				return false
+			}
+		}
+		return true
+	case st.stmtType == duckdb.STATEMENT_TYPE_DROP && strings.Contains(msg, "NoSuchTableException"):
+		sc := &scanner{s: st.query}
+		if !sc.keywords("DROP", "TABLE", "IF", "EXISTS") {
+			return false
+		}
+		for _, o := range e.objects {
+			if exists(o.Schema, o.Table) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // replaceable returns how to carry out st, which DuckDB refused as CREATE

@@ -253,6 +253,9 @@ func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, nam
 	if _, ok := m.views[k]; ok && !replace {
 		return fmt.Errorf("view %q %w", name, ErrExists)
 	}
+	if query, err = m.qualifyTables(ctx, query); err != nil {
+		return err
+	}
 
 	// Create the local copy first: DuckDB checks the SQL and works out the
 	// columns, which the catalog records.
@@ -316,7 +319,12 @@ func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bo
 	_, local := m.views[k]
 	switch {
 	case errors.Is(err, icecat.ErrNoSuchView):
-		if !local && !ifExists {
+		// Without a local copy of a catalog view, the local database's
+		// object of the name, if any, is not the catalog's to drop.
+		if !local {
+			if ifExists {
+				return nil
+			}
 			return fmt.Errorf("view %q %w", name, ErrNotFound)
 		}
 	case err != nil:
@@ -328,6 +336,60 @@ func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bo
 	delete(m.views, k)
 	m.publish(nil)
 	m.reloadTable(ctx, schema, name, true)
+	return nil
+}
+
+// TableExists asks the catalog itself, not DuckDB's copy of it, whether
+// the table schema.name exists.
+func (m *Manager) TableExists(ctx context.Context, schema, name string) (bool, error) {
+	return m.cat.CheckTableExists(ctx, catalog.Ident(schema, name))
+}
+
+// RenameView renames the view schema.from to to, in the same schema. Views
+// that read it by its old name fail until they are replaced, as in DuckDB.
+func (m *Manager) RenameView(ctx context.Context, schema, from, to string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	defer m.gen.Add(1)
+	v, ok := m.views[keyOf(schema, from)]
+	if !ok {
+		return fmt.Errorf("view %q %w", from, ErrNotFound)
+	}
+	if _, taken := m.views[keyOf(schema, to)]; taken {
+		return fmt.Errorf("view %q %w", to, ErrExists)
+	}
+	exists, err := m.cat.CheckTableExists(ctx, catalog.Ident(schema, to))
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("a table named %q %w", to, ErrExists)
+	}
+
+	err = m.cat.RenameView(ctx, schema, from, to)
+	switch {
+	case errors.Is(err, catalog.ErrViewExists):
+		return fmt.Errorf("view %q %w", to, ErrExists)
+	case errors.Is(err, icecat.ErrNoSuchView):
+		return fmt.Errorf("view %q %w", from, ErrNotFound)
+	case err != nil:
+		return err
+	}
+	delete(m.views, keyOf(schema, from))
+	v.Name = to
+	m.views[keyOf(schema, to)] = v
+	m.publish(nil)
+	m.reloadTable(ctx, schema, from, true)
+	m.reloadTable(ctx, schema, to, true)
+	// The catalog has the new name; if the local copies cannot follow, the
+	// next sync puts them right.
+	err = m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(schema, from))
+	if err == nil {
+		err = m.createLocal(ctx, m.conn, v)
+	}
+	if err != nil {
+		m.log.Warn("could not rename the local copy of a view", "view", schema+"."+to, "err", err)
+	}
 	return nil
 }
 

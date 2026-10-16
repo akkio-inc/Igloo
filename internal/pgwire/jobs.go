@@ -249,6 +249,18 @@ var jobColumns = wire.Columns{
 	{Name: "created_at", Oid: pgtype.TimestamptzOID, Width: 8},
 }
 
+// errNotAlone refuses the statements loadingCommand carries out when sent
+// with others.
+var errNotAlone = pgerror.WithCode(errors.New("send COPY INTO, and statements on tasks, pipes and materialized views, on their own"),
+	codes.FeatureNotSupported)
+
+// isLoadingCommand reports whether loadingCommand carries out query.
+func isLoadingCommand(query string) bool {
+	_, isCopy, _ := parseCopyInto(query)
+	_, isJob, _ := parseJobCommand(query)
+	return isCopy || isJob
+}
+
 // loadingCommand carries out COPY INTO and the statements on tasks, pipes
 // and materialized views. ok is false for every other statement.
 func (s *Server) loadingCommand(sess *session, query string) (wire.PreparedStatements, bool, error) {
@@ -262,8 +274,7 @@ func (s *Server) loadingCommand(sess *session, query string) (wire.PreparedState
 		return nil, false, nil
 	}
 	if len(sqllex.Split(query)) != 1 {
-		err = pgerror.WithCode(errors.New("send COPY INTO, and statements on tasks, pipes and materialized views, on their own"),
-			codes.FeatureNotSupported)
+		err = errNotAlone
 	}
 	if err != nil {
 		s.metrics.query(time.Now(), err)
@@ -552,7 +563,7 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 			return err
 		}
 		rec.written = []auth.Object{{Schema: schema, Table: table}}
-		rec.analyze, rec.stmtType = s.rewrite(ctx, user, create), duckdb.STATEMENT_TYPE_CREATE
+		rec.analyze, rec.stmtType = s.rewrite(ctx, sess, user, create), duckdb.STATEMENT_TYPE_CREATE
 	}
 	// A materialized view's table is in place by now, so its definition
 	// goes with it, whatever was there.
@@ -761,7 +772,7 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		schema, table, _ := strings.Cut(j.Name, ".")
 		s.recordQuery(sess, queryRecord{text: "REFRESH MATERIALIZED VIEW " + quoteName([]string{schema, table}),
 			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: policies,
-			analyze:  s.rewrite(ctx, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
+			analyze:  s.rewrite(ctx, sess, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
 			stmtType: duckdb.STATEMENT_TYPE_CREATE})
 		return rows, err
 	}
@@ -798,7 +809,7 @@ func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, use
 	_ = st.close()
 	// What runs is the query as policies rewrite it for user, so the view
 	// holds what its owner may see of protected tables.
-	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, user, j.Statement), nil)
+	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, j.Statement), nil)
 	if err != nil {
 		return -1, nil, pgError(err)
 	}

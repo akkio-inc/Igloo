@@ -161,8 +161,8 @@ func (c *cursor) fetch(w wire.DataWriter, limit int) (int, error) {
 	if c.done {
 		return 0, nil
 	}
+	b := newRowBatcher(w, c.st.columns)
 	dest := make([]driver.Value, len(c.st.columns))
-	values := make([]any, len(c.st.columns))
 	n := 0
 	for limit < 0 || n < limit {
 		err := c.rows.Next(dest)
@@ -173,21 +173,12 @@ func (c *cursor) fetch(w wire.DataWriter, limit int) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		for i, v := range dest {
-			if v == nil {
-				values[i] = nil
-				continue
-			}
-			if values[i], err = c.st.encoders[i](v); err != nil {
-				return n, fmt.Errorf("column %q: %w", c.st.columns[i].Name, err)
-			}
-		}
-		if err := w.Row(values); err != nil {
+		if err := b.add(dest, c.st.encoders); err != nil {
 			return n, err
 		}
 		n++
 	}
-	return n, nil
+	return n, b.flush()
 }
 
 // closeCursor closes one cursor.

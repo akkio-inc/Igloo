@@ -48,7 +48,9 @@ func parseViewCommand(query string) (viewCommand, bool) {
 			return c, false
 		}
 		c.name = name
-		sc.keywords("RESTRICT")
+		// Iceberg views record no dependents: a view that reads a dropped
+		// one fails when queried, whichever is given.
+		_ = sc.keywords("RESTRICT") || sc.keywords("CASCADE")
 		return c, sc.done()
 	default:
 		return c, false
@@ -87,14 +89,38 @@ func parseViewCommand(query string) (viewCommand, bool) {
 	return c, c.query != ""
 }
 
-// parseAlterView returns the name in ALTER VIEW name ....
-func parseAlterView(query string) ([]string, bool) {
+// alterRelation is ALTER TABLE or ALTER VIEW. PostgreSQL lets ALTER TABLE
+// rename views too, and dbt does so.
+type alterRelation struct {
+	view, ifExists bool
+	name           []string
+	// renameTo is the new name of ALTER ... RENAME TO, or empty for any
+	// other change.
+	renameTo string
+}
+
+func parseAlterRelation(query string) (alterRelation, bool) {
 	sc := &scanner{s: query}
-	if !sc.keywords("ALTER", "VIEW") {
-		return nil, false
+	var a alterRelation
+	switch {
+	case sc.keywords("ALTER", "VIEW"):
+		a.view = true
+	case sc.keywords("ALTER", "TABLE"):
+	default:
+		return a, false
 	}
-	sc.keywords("IF", "EXISTS")
-	return sc.name()
+	a.ifExists = sc.keywords("IF", "EXISTS")
+	name, ok := sc.name()
+	if !ok {
+		return a, false
+	}
+	a.name = name
+	if sc.keywords("RENAME", "TO") {
+		if to, ok := sc.name(); ok && len(to) == 1 && sc.done() {
+			a.renameTo = to[0]
+		}
+	}
+	return a, true
 }
 
 // commentCommand is COMMENT ON SCHEMA, TABLE, VIEW or COLUMN.
@@ -139,24 +165,17 @@ func parseCommentCommand(query string) (commentCommand, bool) {
 }
 
 // catalogDDL carries out view and comment statements that target the
-// Iceberg catalog. ok is false for anything else, including statements on
-// temporary or local objects, which DuckDB handles itself.
+// Iceberg catalog, and renames of its views. ok is false for anything
+// else, including statements on temporary or local objects and ALTER TABLE
+// on the catalog's tables, which DuckDB handles itself.
 func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, query string) (wire.PreparedStatements, bool, error) {
 	if s.ddl == nil {
 		return nil, false, nil
 	}
 	view, isView := parseViewCommand(query)
 	comment, isComment := parseCommentCommand(query)
-	if alter, ok := parseAlterView(query); ok {
-		if _, _, inCatalog, err := s.resolveCatalogName(ctx, sess, alter); err != nil || inCatalog {
-			if err == nil {
-				err = pgerror.WithCode(errors.New("ALTER VIEW is not supported on the Iceberg catalog; use CREATE OR REPLACE VIEW, or DROP VIEW and CREATE VIEW"),
-					codes.FeatureNotSupported)
-			}
-			return nil, true, err
-		}
-	}
-	if !isView && !isComment {
+	alter, isAlter := parseAlterRelation(query)
+	if !isView && !isComment && !isAlter {
 		return nil, false, nil
 	}
 	// DuckDB's parser refuses COMMENT ON SCHEMA, which it cannot carry
@@ -169,6 +188,8 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 	switch {
 	case isView:
 		nameParts = view.name
+	case isAlter:
+		nameParts = alter.name
 	default:
 		nameParts = comment.name
 		if comment.kind == "COLUMN" {
@@ -196,6 +217,16 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		// Nothing in the catalog to drop: DuckDB makes it a no-op.
 		return nil, false, nil
 	}
+	if isAlter {
+		switch {
+		case !s.ddl.IsView(schema, name) && !alter.view:
+			// The catalog's tables are DuckDB's to alter.
+			return nil, false, nil
+		case alter.renameTo == "":
+			return nil, true, pgerror.WithCode(errors.New("ALTER VIEW on the Iceberg catalog supports only RENAME TO; use CREATE OR REPLACE VIEW, or DROP VIEW and CREATE VIEW"),
+				codes.FeatureNotSupported)
+		}
+	}
 
 	start := time.Now()
 	target := []auth.Object{{Schema: schema, Table: name}}
@@ -203,7 +234,8 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		// A schema's comment changes no table.
 		target = nil
 	}
-	if isView && !view.drop && strings.EqualFold(schema, engine.HistorySchema) && isHistoryView(name) {
+	reserved := func(name string) bool { return strings.EqualFold(schema, engine.HistorySchema) && isHistoryView(name) }
+	if isView && !view.drop && reserved(name) || isAlter && (reserved(name) || reserved(alter.renameTo)) {
 		err := pgerror.WithCode(fmt.Errorf("%s.%s is reserved for Igloo's own views", schema, name), codes.ReservedName)
 		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
 		return nil, true, err
@@ -216,13 +248,16 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		return nil, true, err
 	}
 	stmtType := duckdb.STATEMENT_TYPE_CREATE
-	if view.drop {
+	switch {
+	case view.drop:
 		stmtType = duckdb.STATEMENT_TYPE_DROP
+	case isAlter:
+		stmtType = duckdb.STATEMENT_TYPE_ALTER
 	}
 	if err := authorize(user.Role, stmtType, query); err != nil {
-		// Creating, replacing, dropping and commenting on the catalog's
-		// views and tables is CREATE on their schema. Their owners may
-		// comment on them too.
+		// Creating, replacing, renaming, dropping and commenting on the
+		// catalog's views and tables is CREATE on their schema. Their
+		// owners may comment on them too.
 		if isComment && s.mayComment(ctx, sess, user, auth.Object{Schema: schema, Table: name}) {
 			err = nil
 		} else if comment.kind == "SCHEMA" {
@@ -242,7 +277,7 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		}
 	}
 	if isView && !view.drop {
-		if err := s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, user, view.query)); err != nil {
+		if err := s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, sess, user, view.query)); err != nil {
 			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 			s.metrics.query(time.Now(), err)
 			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
@@ -260,6 +295,17 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		}
 		run = func(ctx context.Context) error { return s.ddl.Comment(ctx, target) }
 		tag = "COMMENT"
+	case isAlter:
+		run = func(ctx context.Context) error {
+			if alter.ifExists && !s.ddl.IsView(schema, name) {
+				return nil
+			}
+			return s.ddl.RenameView(ctx, schema, name, alter.renameTo)
+		}
+		tag = "ALTER TABLE"
+		if alter.view {
+			tag = "ALTER VIEW"
+		}
 	case view.drop:
 		run = func(ctx context.Context) error { return s.ddl.DropView(ctx, schema, name, view.ifExists) }
 		tag = "DROP VIEW"
@@ -279,20 +325,30 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1, written: target})
 			return err
 		}
-		if sess.inTx {
-			return record(pgerror.WithCode(errors.New(tag+" on the Iceberg catalog cannot run inside a transaction block"),
-				codes.ActiveSQLTransaction))
+		if err := sess.checkAborted(query); err != nil {
+			return record(err)
 		}
-		err := sess.runCancelable(ctx, query, run)
+		err := sess.runCancelable(ctx, query, func(ctx context.Context) error {
+			return sess.outsideTransaction(ctx, func() error { return run(ctx) })
+		})
 		s.metrics.query(start, err)
+		sess.observe(nil, err)
 		if err != nil {
 			return record(catalogDDLError(err))
 		}
+		var gerr error
 		switch {
 		case view.drop:
-			if ferr := s.grants.ForgetObject(ctx, target[0]); ferr != nil {
-				s.log.Warn("could not remove a dropped view's grants", "view", target[0].String(), "err", ferr)
-			}
+			gerr = s.grants.ForgetObject(ctx, target[0])
+		case isAlter:
+			// Grants and the owner follow the view to its new name.
+			gerr = s.grants.RenameObject(ctx, target[0], auth.Object{Schema: schema, Table: alter.renameTo})
+		}
+		if gerr != nil {
+			s.log.Warn("could not update a view's grants and owner", "view", target[0].String(), "err", gerr)
+		}
+		switch {
+		case view.drop || isAlter:
 			s.ownersChanged()
 			s.sessions.expireAll()
 		case isView:
@@ -322,25 +378,6 @@ func (s *Server) authorizeSchemaCreate(ctx context.Context, sess *session, user 
 		return nil
 	}
 	return needError(user, n)
-}
-
-// authorizeLocal keeps non-admins from changing DuckDB's own database, where
-// each replica keeps its copies of the catalog's views: a change there would
-// differ from the catalog and from other replicas. query is the statement as
-// the client sent it, before Igloo rewrote view names to point there.
-func (s *Server) authorizeLocal(role auth.Role, t duckdb.StmtType, query string) error {
-	switch t {
-	case duckdb.STATEMENT_TYPE_SELECT, duckdb.STATEMENT_TYPE_EXPLAIN, duckdb.STATEMENT_TYPE_RELATION,
-		duckdb.STATEMENT_TYPE_TRANSACTION, duckdb.STATEMENT_TYPE_SET, duckdb.STATEMENT_TYPE_VARIABLE_SET,
-		duckdb.STATEMENT_TYPE_PRAGMA:
-		return nil
-	}
-	if role == auth.RoleAdmin || !namesDatabase(query, s.engine.LocalDatabase()) {
-		return nil
-	}
-	return pgerror.WithCode(
-		fmt.Errorf("permission denied: only admins may change the %s database", s.engine.LocalDatabase()),
-		codes.InsufficientPrivilege)
 }
 
 // namesDatabase reports whether query's code uses db as a qualifier, as in

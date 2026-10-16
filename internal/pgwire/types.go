@@ -70,6 +70,44 @@ func wireType(t duckdb.Type, alias string) (uint32, encoder) {
 	}
 }
 
+// newTypeMap returns the types values are encoded with: pgx's, but with
+// timestamptz in text written as PostgreSQL writes it.
+func newTypeMap() *pgtype.Map {
+	m := pgtype.NewMap()
+	extendTypes(m)
+	return m
+}
+
+// extendTypes registers Igloo's changes to pgx's types in m.
+func extendTypes(m *pgtype.Map) {
+	m.RegisterType(&pgtype.Type{Name: "timestamptz", OID: pgtype.TimestamptzOID, Codec: &timestamptzCodec{}})
+}
+
+// timestamptzCodec is pgx's timestamptz codec, except that in text it ends
+// a value with the offset "+00", as PostgreSQL does in the time zone UTC,
+// rather than with "Z", which psycopg2 (and so dbt, Superset and pandas)
+// cannot parse.
+type timestamptzCodec struct{ pgtype.TimestamptzCodec }
+
+func (c *timestamptzCodec) PlanEncode(m *pgtype.Map, oid uint32, format int16, value any) pgtype.EncodePlan {
+	plan := c.TimestamptzCodec.PlanEncode(m, oid, format, value)
+	if format != pgtype.TextFormatCode || plan == nil {
+		return plan
+	}
+	return utcOffsetPlan{plan}
+}
+
+type utcOffsetPlan struct{ pgtype.EncodePlan }
+
+func (p utcOffsetPlan) Encode(value any, buf []byte) ([]byte, error) {
+	start := len(buf)
+	buf, err := p.EncodePlan.Encode(value, buf)
+	if err == nil && len(buf) > start && buf[len(buf)-1] == 'Z' {
+		buf = append(buf[:len(buf)-1], "+00"...)
+	}
+	return buf, err
+}
+
 // paramOID is the type Igloo asks clients to send a parameter as. When
 // DuckDB cannot infer one, text lets DuckDB cast the value itself.
 func paramOID(t duckdb.Type) uint32 {

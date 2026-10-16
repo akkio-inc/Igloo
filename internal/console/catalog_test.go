@@ -78,7 +78,7 @@ func newCatalogConsole(t *testing.T) *testConsole {
 		"CREATE TAG pii",
 		"ALTER TABLE lake.public.orders ALTER COLUMN amount SET TAG pii = 'money'",
 		"GRANT SELECT ON TABLE lake.public.orders TO nora",
-		"CREATE TABLE memory.main.notes (id INTEGER)",
+		"CREATE TABLE lake.main.notes (id INTEGER)",
 	} {
 		if err := es.Run(ctx, stmt, &collect{}); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -233,8 +233,10 @@ func TestCatalogComment(t *testing.T) {
 	tc := newCatalogConsole(t)
 	walt := tc.signedIn(t, "walt")
 	nora := tc.signedIn(t, "nora")
+	// The test engine starts sessions in its own database, not in the stand-in
+	// catalog, whose main schema "lake"."notes" names.
 	text := "Notes, by Walt's team"
-	resp := walt.do("POST", "/api/catalog/comment", map[string]any{"kind": "table", "schema": "main", "name": "notes", "comment": text}, nil)
+	resp := walt.do("POST", "/api/catalog/comment", map[string]any{"kind": "table", "schema": "lake", "name": "notes", "comment": text}, nil)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("walt: %d %s", resp.StatusCode, body)
@@ -243,7 +245,7 @@ func TestCatalogComment(t *testing.T) {
 	if len(events) < 3 || events[2].Rows == nil || *events[2].Rows[0][0] != text {
 		t.Errorf("the comment was not set: %+v", events)
 	}
-	resp = nora.do("POST", "/api/catalog/comment", map[string]any{"kind": "table", "schema": "main", "name": "notes", "comment": "x"}, nil)
+	resp = nora.do("POST", "/api/catalog/comment", map[string]any{"kind": "table", "schema": "lake", "name": "notes", "comment": "x"}, nil)
 	var e map[string]string
 	decode(t, resp, &e)
 	if resp.StatusCode != http.StatusForbidden || e["code"] != "42501" {

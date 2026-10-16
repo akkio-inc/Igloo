@@ -96,13 +96,26 @@ func (sc *scanner) name() ([]string, bool) {
 	}
 }
 
-// literal reads a standard 'string' literal, or NULL, which it reports as
-// nil.
+// literal reads a standard 'string' literal, a $tag$dollar-quoted$tag$ one
+// (dbt quotes comments so), or NULL, which it reports as nil.
 func (sc *scanner) literal() (*string, bool) {
 	if sc.keywords("NULL") {
 		return nil, true
 	}
 	sc.skip()
+	if sc.i < len(sc.s) && sc.s[sc.i] == '$' {
+		seg := sqllex.Segments(sc.s[sc.i:])[0]
+		if seg.Kind != sqllex.String {
+			return nil, false
+		}
+		tag := seg.Text[:strings.IndexByte(seg.Text[1:], '$')+2]
+		if len(seg.Text) < 2*len(tag) || !strings.HasSuffix(seg.Text, tag) {
+			return nil, false
+		}
+		v := seg.Text[len(tag) : len(seg.Text)-len(tag)]
+		sc.i += len(seg.Text)
+		return &v, true
+	}
 	if sc.i >= len(sc.s) || sc.s[sc.i] != '\'' {
 		return nil, false
 	}

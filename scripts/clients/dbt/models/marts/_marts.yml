@@ -1,0 +1,45 @@
+version: 2
+
+models:
+  - name: fct_campaign_daily
+    description: Delivery and conversions per campaign and day.
+    columns:
+      - name: campaign_id
+        description: Campaign, see dim_campaigns.
+        data_tests: [not_null]
+      - name: event_date
+        description: Day of delivery.
+        data_tests: [not_null]
+      - name: spend
+        description: Media spend in the client's currency.
+      - name: ctr
+        description: Clicks per impression.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "campaign_id || '-' || event_date"
+  - name: fct_conversions
+    description: The latest version of every conversion.
+    columns:
+      - name: conversion_id
+        data_tests: [unique, not_null]
+  - name: fct_spend_log
+    description: Delivery rows in the order they were loaded.
+  - name: dim_campaigns
+    description: Campaigns with their current bidding settings.
+    columns:
+      - name: campaign_id
+        data_tests: [unique, not_null]
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [active, paused]
+  - name: rpt_client_weekly
+    description: Weekly performance per client and channel group, for the client dashboard.
+    columns:
+      - name: spend_band
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [heavy, typical, light]

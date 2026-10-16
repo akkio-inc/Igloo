@@ -189,7 +189,7 @@ func TestNoneRoleCannotReadFilesOrBypassAnalysis(t *testing.T) {
 		// s3://bucket/ is not an allowed location, so the file guard refuses
 		// the write before the role check names it; both deny with 42501.
 		"COPY orders TO 's3://bucket/out.parquet'":                  "",
-		"SELECT 1; SELECT * FROM lake.sales.leads":                  "one statement at a time",
+		"SELECT 1; SELECT * FROM lake.sales.leads":                  "sales.leads",
 		"SELECT * FROM orders, (FROM duckdb_tables()), sales.leads": "sales.leads",
 	} {
 		if reason == "" {
@@ -439,7 +439,8 @@ func TestPivot(t *testing.T) {
 	}
 
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
-	expectDenied(t, rita, "PIVOT sales ON quarter USING sum(amount); DELETE FROM sales", "one statement at a time")
+	// Each statement of a query is checked on its own.
+	expectDenied(t, rita, "PIVOT sales ON quarter USING sum(amount); DELETE FROM sales", "DELETE requires the writer role")
 	// Outside a query, DuckDB would run the statement itself while
 	// preparing it.
 	for _, sql := range []string{

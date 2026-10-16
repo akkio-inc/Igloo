@@ -1,0 +1,9 @@
+snapshots:
+  - name: campaign_settings_snapshot
+    description: History of each campaign's bidding settings.
+    relation: source('raw', 'campaign_settings')
+    config:
+      schema: snapshots
+      unique_key: campaign_id
+      strategy: timestamp
+      updated_at: updated_at

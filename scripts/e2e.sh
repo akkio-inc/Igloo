@@ -154,7 +154,13 @@ expect_soon() {
 }
 
 echo "tables and Iceberg writes"
-expect "create, insert, CTAS, update, delete" "2|beta|40.50" igloo "$admin_password" "
+# psql prints the result of every statement in a multi-statement -c.
+expect "create, insert, CTAS, update, delete" "CREATE TABLE
+INSERT 0 2
+CREATE TABLE
+UPDATE 1
+DELETE 1
+2|beta|40.50" igloo "$admin_password" "
   CREATE TABLE e2e (id INTEGER, name VARCHAR, amount DECIMAL(10,2));
   INSERT INTO e2e VALUES (1, 'alpha', 10.50), (2, 'beta', 20.25);
   CREATE TABLE e2e_copy AS SELECT * FROM e2e;
@@ -357,6 +363,28 @@ if docker run --rm --network "$network" -e PGHOST=igloo -e PGUSER=igloo -e PGPAS
 else
   fail "psycopg: $(tail -5 "$work/psycopg.out")"
 fi
+# Notebooks: SQLAlchemy, pandas and polars, and how fast each pulls a large
+# result.
+if docker run --rm --network "$network" -e PGHOST=igloo -e PGUSER=walt -e PGPASSWORD=walt-password-1 \
+  -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+    pip install -q --disable-pip-version-check --root-user-action=ignore 'psycopg[binary]==3.3.6' 'sqlalchemy==2.1.4' \
+      'pandas==3.0.6' 'polars==2.0.0' 'pyarrow==26.0.0' 'connectorx==0.4.6' 'adbc-driver-postgresql==1.12.0' >/dev/null &&
+    python /clients/notebook_test.py" >"$work/notebook.out" 2>&1; then
+  pass "SQLAlchemy, pandas and polars"
+  grep "rows/s" "$work/notebook.out" | sed 's/^  notebook: /        /'
+else
+  fail "notebooks: $(tail -5 "$work/notebook.out")"
+fi
+# dbt with the standard dbt-postgres adapter, as a writer (see the
+# project in scripts/clients/dbt).
+if docker run --rm --network "$network" -e PGHOST=igloo -e PGUSER=walt -e PGPASSWORD=walt-password-1 \
+  -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+    pip install -q --disable-pip-version-check --root-user-action=ignore 'dbt-core==1.12.6' 'dbt-postgres==1.11.0' >/dev/null &&
+    python /clients/dbt_test.py" >"$work/dbt.out" 2>&1; then
+  pass "dbt (dbt-postgres 1.11): seeds, views, tables, incremental merge, delete+insert and append, snapshots, tests, docs, freshness"
+else
+  fail "dbt: $(tail -15 "$work/dbt.out")"
+fi
 
 echo "Arrow Flight SQL"
 # The clients run on this machine's network and reach the published
@@ -401,14 +429,48 @@ for i in "${!pids[@]}"; do
   fi
 done
 expect "10 concurrent inserts all commit" "10" igloo "$admin_password" "SELECT count(*) FROM contended"
+# Sessions renaming tables in one schema at once, as dbt's threads do.
+psql_admin -c "CREATE SCHEMA renames" >/dev/null
+pids=()
+for i in 1 2 3 4; do
+  for round in 1 2 3; do
+    printf '%s\n' "CREATE TABLE renames.t${i}_new AS SELECT $round AS v;" "ALTER TABLE IF EXISTS renames.t$i RENAME TO t${i}_old;" \
+      "ALTER TABLE renames.t${i}_new RENAME TO t$i;" "DROP TABLE IF EXISTS renames.t${i}_old CASCADE;"
+  done | psql_admin -v ON_ERROR_STOP=1 >"$work/rename-$i.out" &
+  pids+=($!)
+done
+ok=0
+for pid in "${pids[@]}"; do wait "$pid" && ok=$((ok + 1)); done
+if [ "$ok" = 4 ]; then pass "concurrent renames in one schema"; else fail "concurrent renames: $(grep -h ERROR "$work"/rename-*.out | head -3)"; fi
+# A dropped _old table can stay behind: DuckDB-Iceberg's shared list of the
+# schema's tables can miss it (see docs/integrations.md, dbt).
+expect "leave every table in place" "4|3" igloo "$admin_password" \
+  "SELECT count(*), (SELECT min(v) FROM renames.t1) FROM information_schema.tables
+   WHERE table_schema = 'renames' AND table_name IN ('t1', 't2', 't3', 't4')"
 
 echo "replace, views and comments"
 expect "writer replaces a table with a new schema" "CREATE TABLE" walt walt-password-1 \
   "CREATE OR REPLACE TABLE e2e_copy AS SELECT range AS n, chr(97 + range::INT) AS letter FROM range(3)"
 expect "replaced table has the new rows" "3|b" walt walt-password-1 "SELECT count(*), min(letter) FILTER (WHERE n = 1) FROM e2e_copy"
-# Statement by statement, as one query would run them all while preparing.
-got="$(printf 'BEGIN;\nCREATE OR REPLACE TABLE e2e_copy AS SELECT 1 AS x;\nROLLBACK;\n' | psql_admin)" || true
-if grep -q "ERROR:  25001" <<<"$got"; then pass "replace inside a transaction is refused"; else fail "replace inside a transaction: got [$got]"; fi
+# In a transaction block, a change to the catalog commits the block first,
+# as in Snowflake; dbt builds tables so. Statement by statement, as psycopg2
+# sends them.
+psql_as walt walt-password-1 -c "CREATE TABLE e2e_tx (x INTEGER)" >/dev/null
+printf '%s\n' "BEGIN;" "INSERT INTO e2e_tx VALUES (1);" "CREATE TABLE e2e_tx_new AS SELECT x + 1 AS x FROM e2e_tx;" \
+  "ALTER TABLE e2e_tx RENAME TO e2e_tx_old;" "ALTER TABLE e2e_tx_new RENAME TO e2e_tx;" "INSERT INTO e2e_tx VALUES (10);" \
+  "ROLLBACK;" | psql_as walt walt-password-1 >/dev/null
+expect "catalog changes in a block commit what came before them" "1|2" walt walt-password-1 \
+  "SELECT (SELECT count(*) FROM e2e_tx_old), (SELECT max(x) FROM e2e_tx)"
+printf '%s\n' "BEGIN;" "CREATE OR REPLACE TABLE e2e_tx AS SELECT 3 AS x;" "ROLLBACK;" | psql_as walt walt-password-1 >/dev/null
+expect "replace inside a block" "3" walt walt-password-1 "SELECT max(x) FROM e2e_tx"
+got="$(printf '%s\n' "BEGIN;" "INSERT INTO e2e_tx VALUES (4);" "SELECT * FROM e2e_missing;" "INSERT INTO e2e_tx VALUES (5);" \
+  "COMMIT;" | psql_as walt walt-password-1 -v ON_ERROR_STOP=0)" || true
+if grep -q "25P02" <<<"$got" && grep -q "^ROLLBACK$" <<<"$got"; then
+  pass "a failed block refuses statements and rolls back at COMMIT"
+else
+  fail "failed block: got [$got]"
+fi
+expect "so nothing of it is kept" "1" walt walt-password-1 "SELECT count(*) FROM e2e_tx"
 expect "writer creates a view" "CREATE VIEW" walt walt-password-1 \
   "CREATE VIEW e2e_big AS SELECT id, name FROM e2e WHERE amount > 15"
 expect_error "reader cannot create views" 42501 rita rita-password-1 "CREATE VIEW nope AS SELECT 1"
@@ -419,14 +481,27 @@ expect "replace a view and read it from another view" "CREATE VIEW" walt walt-pa
   "CREATE OR REPLACE VIEW e2e_big (big_id) AS SELECT id FROM lake.public.e2e WHERE amount > 0"
 expect "views read views" "3" rita rita-password-1 \
   "SELECT count(*) FROM (SELECT big_id FROM lake.public.e2e_big)"
+expect "a view in another schema reads a table by schema" "CREATE SCHEMA
+CREATE TABLE
+CREATE VIEW" walt walt-password-1 \
+  "CREATE SCHEMA e2e_views; CREATE TABLE e2e_views.t AS SELECT 7 AS v; CREATE VIEW e2e_views.sevens AS SELECT v FROM e2e_views.t"
+expect "and is found by schema and on the search path" "7
+SET
+7" rita rita-password-1 "SELECT v FROM e2e_views.sevens; SET search_path = e2e_views; SELECT v FROM sevens"
 expect "replace a view with another table's columns" "CREATE VIEW" walt walt-password-1 \
   "CREATE OR REPLACE VIEW e2e_big AS SELECT n, letter FROM lake.public.e2e_copy"
 expect "the replaced view reads the other table" "3|c" rita rita-password-1 "SELECT count(*), max(letter) FROM e2e_big"
 expect "and back to columns and SQL it had before" "CREATE VIEW" walt walt-password-1 \
   "CREATE OR REPLACE VIEW e2e_big (big_id) AS SELECT id FROM lake.public.e2e WHERE amount > 0"
 expect "the view reads the first table again" "3" rita rita-password-1 "SELECT count(*) FROM (SELECT big_id FROM e2e_big)"
-expect_error "ALTER VIEW is refused" 0A000 walt walt-password-1 "ALTER VIEW e2e_big RENAME TO e2e_huge"
+expect "rename a view" "ALTER VIEW" walt walt-password-1 "ALTER VIEW e2e_big RENAME TO e2e_huge"
+expect "and back with ALTER TABLE, as dbt does" "ALTER TABLE" walt walt-password-1 "ALTER TABLE e2e_huge RENAME TO e2e_big"
+expect "the renamed view reads the same rows" "3" rita rita-password-1 "SELECT count(*) FROM e2e_big"
+expect_error "the old name is gone" 42P01 rita rita-password-1 "SELECT count(*) FROM e2e_huge"
 expect_error "writers cannot change the local view copies" 42501 walt walt-password-1 "DROP VIEW memory.public.e2e_big"
+expect_error "nor replace one with a table" 42501 walt walt-password-1 "CREATE OR REPLACE TABLE lake.public.e2e_big AS SELECT 1 AS x"
+expect "but build tables from views by any name" "CREATE TABLE" walt walt-password-1 \
+  "CREATE TABLE e2e_from_view AS SELECT * FROM lake.public.e2e_big"
 expect "comment on a table" "COMMENT" walt walt-password-1 "COMMENT ON TABLE e2e IS 'Test rows | :tag:e2e'"
 expect "comment on a column" "COMMENT" walt walt-password-1 "COMMENT ON COLUMN e2e.amount IS 'In dollars'"
 expect_error "reader cannot comment" 42501 rita rita-password-1 "COMMENT ON TABLE e2e IS 'x'"
@@ -1008,7 +1083,8 @@ expect "compacted files use DuckDB's Parquet layout" "INT64|SNAPPY" igloo "$admi
   "SELECT DISTINCT type, compression FROM parquet_metadata([$files]) WHERE path_in_schema = 'amount'"
 expect "maintenance keeps every row" "5|v1v2v4v5v6" igloo "$admin_password" \
   "SELECT count(*), string_agg(v, '' ORDER BY id) FROM fragmented"
-expect "writes after compaction" "6" igloo "$admin_password" \
+expect "writes after compaction" "INSERT 0 1
+6" igloo "$admin_password" \
   "INSERT INTO fragmented VALUES (7, 'v7', 7.25); SELECT count(*) FROM fragmented"
 
 echo "clones, branches and tags"
