@@ -43,9 +43,13 @@ func TestParseCommentCommand(t *testing.T) {
 	if !ok || c.kind != "COLUMN" || c.text != nil || !slices.Equal(c.name, []string{"events", "User Id"}) {
 		t.Errorf("column: %+v %v", c, ok)
 	}
+	c, ok = parseCommentCommand("COMMENT ON SCHEMA lake.marts IS 'Reporting tables'")
+	if !ok || c.kind != "SCHEMA" || c.text == nil || *c.text != "Reporting tables" || !slices.Equal(c.name, []string{"lake", "marts"}) {
+		t.Errorf("schema: %+v %v", c, ok)
+	}
 	for _, q := range []string{
 		"COMMENT ON COLUMN events IS 'x'",
-		"COMMENT ON SCHEMA s IS 'x'",
+		"COMMENT ON SCHEMA lake.marts.x IS 'x'",
 		"COMMENT ON TABLE t IS 'x'; DROP TABLE t",
 		"COMMENT ON TABLE t IS E'x'",
 	} {

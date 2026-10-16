@@ -16,7 +16,6 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
-	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
@@ -50,8 +49,8 @@ type Engine struct {
 	// resolve to the catalog's default schema, and to the views kept for
 	// it in the local database.
 	connectStmts []string
-	// comments supplies igloo_comments(); see SetComments.
-	comments atomic.Pointer[func() []catalog.Comment]
+	// catalogViewer supplies the catalog functions; see SetCatalogViewer.
+	catalogViewer atomic.Pointer[CatalogViewer]
 	// cache is the on-disk read cache, or nil when it is off.
 	cache *readCache
 	// history supplies the history functions; see SetHistory.
@@ -206,8 +205,8 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}
-	if err := e.registerComments(ctx); err != nil {
-		return fmt.Errorf("register igloo_comments: %w", err)
+	if err := e.registerCatalog(ctx); err != nil {
+		return fmt.Errorf("register the catalog functions: %w", err)
 	}
 	if err := e.registerHistory(ctx); err != nil {
 		return fmt.Errorf("register query history: %w", err)

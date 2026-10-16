@@ -5,23 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/apache/iceberg-go"
 	icecat "github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/view"
-	"golang.org/x/sync/errgroup"
 )
 
-// commentProperty is where Iceberg engines (Spark, Trino) keep a table's or
-// view's comment. Column comments are the schema fields' doc strings.
+// commentProperty is where Iceberg engines (Spark, Trino) keep a table's,
+// view's or namespace's comment. Column comments are the schema fields'
+// doc strings.
 const commentProperty = "comment"
 
-// Comment is the comment on a table, view or column.
+// Comment is the comment on a schema, table, view or column.
 type Comment struct {
 	Schema string
-	// Name is the table or view.
+	// Name is the table or view; empty for the schema's own comment.
 	Name string
 	// Column is empty for the comment on the table or view itself.
 	Column string
@@ -91,60 +90,20 @@ func (c *Client) SetViewComment(ctx context.Context, schema, name string, text *
 	return err
 }
 
-// Comments returns every comment on every table, column and view.
-func (c *Client) Comments(ctx context.Context) ([]Comment, error) {
-	tables, err := c.Tables(ctx)
-	if err != nil {
-		return nil, err
-	}
-	views, err := c.Views(ctx)
-	if err != nil {
-		return nil, err
-	}
-
+// SetSchemaComment sets or, when text is nil, removes a schema's comment,
+// the namespace's "comment" property.
+func (c *Client) SetSchemaComment(ctx context.Context, schema string, text *string) error {
 	var (
-		mu  sync.Mutex
-		out []Comment
+		removals []string
+		updates  iceberg.Properties
 	)
-	add := func(cs ...Comment) {
-		mu.Lock()
-		out = append(out, cs...)
-		mu.Unlock()
+	if text != nil {
+		updates = iceberg.Properties{commentProperty: *text}
+	} else {
+		removals = []string{commentProperty}
 	}
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(8)
-	for _, ident := range tables {
-		g.Go(func() error {
-			tbl, err := c.LoadTable(ctx, ident)
-			if err != nil {
-				return ignoreDropped(err)
-			}
-			schema, name := splitIdent(ident)
-			if text := tbl.Properties()[commentProperty]; text != "" {
-				add(Comment{Schema: schema, Name: name, Text: text})
-			}
-			for _, f := range tbl.Schema().Fields() {
-				if f.Doc != "" {
-					add(Comment{Schema: schema, Name: name, Column: f.Name, Text: f.Doc})
-				}
-			}
-			return nil
-		})
-	}
-	for _, ident := range views {
-		g.Go(func() error {
-			v, err := c.LoadView(ctx, ident)
-			if err != nil {
-				return ignoreDropped(err)
-			}
-			schema, name := splitIdent(ident)
-			if text := v.Metadata().Properties()[commentProperty]; text != "" {
-				add(Comment{Schema: schema, Name: name, Text: text, View: true})
-			}
-			return nil
-		})
-	}
-	return out, g.Wait()
+	_, err := c.UpdateNamespaceProperties(ctx, strings.Split(schema, "."), removals, updates)
+	return err
 }
 
 // splitIdent returns the namespace, joined with dots if nested, and the name.

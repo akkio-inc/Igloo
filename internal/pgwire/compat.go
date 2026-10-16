@@ -156,10 +156,15 @@ func rewriteSessionUser(query, user string) string {
 	})
 }
 
-// historyViews are the views of the history, the usage and the policies,
-// in the local database's schema engine.HistorySchema.
-var historyViews = []string{"query_history", "login_history", "task_history", "load_history", "alert_history", "usage",
-	"policy_references", "tag_references"}
+// historyViews are the views of the history, the usage, the policies and
+// the catalog (see engine.CatalogViews), in the local database's schema
+// engine.HistorySchema.
+var historyViews = append([]string{"query_history", "login_history", "task_history", "load_history", "alert_history", "usage",
+	"policy_references", "tag_references"}, engine.CatalogViews()...)
+
+// informationSchemaViews are the views of information_schema that Igloo
+// adds owners, comments and sizes to (see engine.InformationSchemaView).
+var informationSchemaViews = []string{"schemata", "tables"}
 
 // isHistoryView reports whether name is one of historyViews.
 func isHistoryView(name string) bool {
@@ -168,12 +173,14 @@ func isHistoryView(name string) bool {
 
 // rewriteHistoryRefs points igloo.query_history, igloo.login_history and
 // the other historyViews at the local database, where the views are,
-// whatever the session's search path. Literals, comments and every other
-// name are left as written.
+// whatever the session's search path, and information_schema.schemata and
+// information_schema.tables at Igloo's versions of them. Literals, comments
+// and every other name are left as written.
 func rewriteHistoryRefs(query, local string) string {
 	lower := strings.ToLower(query)
-	if !strings.Contains(lower, engine.HistorySchema) ||
-		!slices.ContainsFunc(historyViews, func(v string) bool { return strings.Contains(lower, v) }) {
+	if !(strings.Contains(lower, engine.HistorySchema) &&
+		slices.ContainsFunc(historyViews, func(v string) bool { return strings.Contains(lower, v) })) &&
+		!strings.Contains(lower, "information_schema") {
 		return query
 	}
 	type tok struct {
@@ -220,13 +227,21 @@ func rewriteHistoryRefs(query, local string) string {
 	var out strings.Builder
 	last := 0
 	for i := 0; i+2 < len(toks); i++ {
-		if !strings.EqualFold(toks[i].name, engine.HistorySchema) || i > 0 && toks[i-1].dot ||
-			!toks[i+1].dot || !isHistoryView(toks[i+2].name) || i+3 < len(toks) && toks[i+3].dot {
+		if i > 0 && toks[i-1].dot || !toks[i+1].dot || i+3 < len(toks) && toks[i+3].dot {
 			continue
 		}
-		out.WriteString(query[last:toks[i].start])
-		out.WriteString(quoteIdent(local) + "." + quoteIdent(engine.HistorySchema))
-		last = toks[i].end
+		switch schema, name := toks[i].name, toks[i+2].name; {
+		case strings.EqualFold(schema, engine.HistorySchema) && isHistoryView(name):
+			out.WriteString(query[last:toks[i].start])
+			out.WriteString(quoteIdent(local) + "." + quoteIdent(engine.HistorySchema))
+			last = toks[i].end
+		case strings.EqualFold(schema, "information_schema") &&
+			slices.ContainsFunc(informationSchemaViews, func(v string) bool { return strings.EqualFold(v, name) }):
+			out.WriteString(query[last:toks[i].start])
+			out.WriteString(quoteIdent(local) + "." + quoteIdent(engine.HistorySchema) + "." +
+				quoteIdent(engine.InformationSchemaView(strings.ToLower(name))))
+			last = toks[i+2].end
+		}
 	}
 	if last == 0 {
 		return query
@@ -466,7 +481,8 @@ const formatTypeMacro = `CREATE OR REPLACE TEMP MACRO format_type(type_oid, type
 END`
 
 // pgDescriptionView lists the comments igloo_comments() reports under the
-// OIDs that pg_class and pg_attribute give the tables, views and columns.
+// OIDs that pg_class, pg_attribute and pg_namespace give the tables, views,
+// columns and schemas.
 const pgDescriptionView = `CREATE OR REPLACE TEMP VIEW pg_description AS
 	SELECT t.table_oid::BIGINT AS objoid, 1259::BIGINT AS classoid, 0 AS objsubid, c.comment AS description
 	FROM igloo_comments() c JOIN duckdb_tables() t ON t.database_name = c.table_catalog
@@ -482,4 +498,9 @@ const pgDescriptionView = `CREATE OR REPLACE TEMP VIEW pg_description AS
 	FROM igloo_comments() c JOIN duckdb_columns() col ON col.database_name = c.table_catalog
 		AND col.schema_name = c.table_schema AND col.table_name = c.table_name
 		AND lower(col.column_name) = lower(c.column_name)
-	WHERE c.column_name IS NOT NULL`
+	WHERE c.column_name IS NOT NULL
+	UNION ALL
+	SELECT s.oid::BIGINT, 2615::BIGINT, 0, c.comment
+	FROM igloo_comments() c JOIN duckdb_schemas() s ON s.database_name = c.table_catalog
+		AND s.schema_name = c.table_schema
+	WHERE c.table_name IS NULL`

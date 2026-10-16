@@ -75,8 +75,14 @@ func sessionPath(ctx context.Context, conn *duckdb.Conn) (searchPath, error) {
 		return searchPath{}, err
 	}
 	setting, _ := dest[0].(string)
-	p := searchPath{}
-	p.defaultDB, _ = dest[1].(string)
+	defaultDB, _ := dest[1].(string)
+	return parseSearchPath(setting, defaultDB), nil
+}
+
+// parseSearchPath reads the search_path setting, with defaultDB the
+// session's current database.
+func parseSearchPath(setting, defaultDB string) searchPath {
+	p := searchPath{defaultDB: defaultDB}
 	for _, e := range splitTopLevelQuoted(setting, ',') {
 		parts := splitQualified(strings.TrimSpace(e))
 		switch len(parts) {
@@ -88,7 +94,7 @@ func sessionPath(ctx context.Context, conn *duckdb.Conn) (searchPath, error) {
 			p.entries = append(p.entries, pathEntry{p.defaultDB, parts[0]}, pathEntry{parts[0], "main"})
 		}
 	}
-	return p, nil
+	return p
 }
 
 // splitTopLevelQuoted splits s at sep outside double quotes.
@@ -138,6 +144,11 @@ type resolver struct {
 	connectionsOnly bool
 	// schemas caches the schemas of connections, by lower-cased name.
 	schemas map[string][]string
+	// lookup and parse, when set, stand in for the session's connection:
+	// lookup returns the objects called a lower-cased name, and parse
+	// parses a statement (see objects.go).
+	lookup func(name string) []object
+	parse  func(text string) (any, error)
 }
 
 func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, error) {
@@ -177,6 +188,12 @@ func (r *resolver) load(names []string) error {
 		}
 	}
 	if len(missing) == 0 {
+		return nil
+	}
+	if r.lookup != nil {
+		for _, n := range missing {
+			r.objects[n] = r.lookup(n)
+		}
 		return nil
 	}
 	quoted := make([]string, len(missing))
@@ -463,8 +480,11 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 	case strings.EqualFold(o.db, r.catalog):
 		rs = readSet{scans: 1, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
 	case r.isConnection(o.db):
-		if err := r.distinctInCase(o); err != nil {
-			return rs, err
+		// The history's analysis (r.lookup) refuses nothing.
+		if r.lookup == nil {
+			if err := r.distinctInCase(o); err != nil {
+				return rs, err
+			}
 		}
 		// The postgres and mysql extensions show a remote view as a table.
 		rs = readSet{
@@ -550,6 +570,9 @@ func (r *resolver) checkMacros(calls []fnRef) error {
 
 // serialize returns DuckDB's parse of a query as JSON.
 func (r *resolver) serialize(text string) (any, error) {
+	if r.parse != nil {
+		return r.parse(text)
+	}
 	rows, err := r.sess.conn.QueryContext(r.ctx,
 		"SELECT system.main.json_serialize_sql($1::VARCHAR, skip_null := true, skip_empty := true)::VARCHAR",
 		[]driver.NamedValue{{Ordinal: 1, Value: text}})
@@ -562,6 +585,11 @@ func (r *resolver) serialize(text string) (any, error) {
 		return nil, err
 	}
 	raw, _ := dest[0].(string)
+	return decodeParse(raw)
+}
+
+// decodeParse reads the one statement of json_serialize_sql's result.
+func decodeParse(raw string) (any, error) {
 	var doc struct {
 		Error        bool   `json:"error"`
 		ErrorMessage string `json:"error_message"`

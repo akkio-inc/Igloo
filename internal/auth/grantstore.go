@@ -51,6 +51,9 @@ func (s *PostgresStore) DropRole(ctx context.Context, name string) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.sso_group_roles WHERE role = $1`, name); err != nil {
 			return err
 		}
+		if err := forgetOwned(ctx, tx, GranteeRole, name); err != nil {
+			return err
+		}
 		if _, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'role' AND grantee = $1`, name); err != nil {
 			return err
 		}
@@ -242,6 +245,9 @@ func (s *PostgresStore) ForgetUser(ctx context.Context, user string) error {
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM igloo_auth.users WHERE name = $1)`, user).Scan(&exists); err != nil || exists {
 			return err
 		}
+		if err := forgetOwned(ctx, tx, GranteeUser, user); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, user); err != nil {
 			return err
 		}
@@ -253,14 +259,21 @@ func (s *PostgresStore) ForgetObject(ctx context.Context, o Object) error {
 	if o.Catalog != "" {
 		return s.forgetConnectionObject(ctx, o)
 	}
-	var err error
-	if o.IsSchema() {
-		_, err = s.pool.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE lower(schema_name) = lower($1)`, o.Schema)
-	} else {
-		_, err = s.pool.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE table_name <> ''
-			AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)`, o.Schema, o.Table)
-	}
-	return err
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		for _, table := range []string{"igloo_auth.grants", "igloo_auth.owners"} {
+			var err error
+			if o.IsSchema() {
+				_, err = tx.Exec(ctx, `DELETE FROM `+table+` WHERE lower(schema_name) = lower($1)`, o.Schema)
+			} else {
+				_, err = tx.Exec(ctx, `DELETE FROM `+table+` WHERE table_name <> ''
+					AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)`, o.Schema, o.Table)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *PostgresStore) RenameObject(ctx context.Context, from, to Object) error {
@@ -268,19 +281,23 @@ func (s *PostgresStore) RenameObject(ctx context.Context, from, to Object) error
 		return nil
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		// Grants left on the new name belong to a table dropped outside
-		// Igloo, not to this one, unless the new name is the old one, or
-		// differs from it in case only.
-		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE table_name <> ''
-			AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)
-			AND NOT (lower(schema_name) = lower($3) AND lower(table_name) = lower($4))`,
-			to.Schema, to.Table, from.Schema, from.Table); err != nil {
-			return err
+		for _, table := range []string{"igloo_auth.grants", "igloo_auth.owners"} {
+			// Grants and owners left on the new name belong to a table
+			// dropped outside Igloo, not to this one, unless the new name
+			// is the old one, or differs from it in case only.
+			if _, err := tx.Exec(ctx, `DELETE FROM `+table+` WHERE table_name <> ''
+				AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)
+				AND NOT (lower(schema_name) = lower($3) AND lower(table_name) = lower($4))`,
+				to.Schema, to.Table, from.Schema, from.Table); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE `+table+` SET schema_name = $3, table_name = $4
+				WHERE table_name <> '' AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)`,
+				from.Schema, from.Table, to.Schema, to.Table); err != nil {
+				return err
+			}
 		}
-		_, err := tx.Exec(ctx, `UPDATE igloo_auth.grants SET schema_name = $3, table_name = $4
-			WHERE table_name <> '' AND lower(schema_name) = lower($1) AND lower(table_name) = lower($2)`,
-			from.Schema, from.Table, to.Schema, to.Table)
-		return err
+		return nil
 	})
 }
 

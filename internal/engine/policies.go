@@ -29,8 +29,8 @@ func (e *Engine) policySnapshot() *policy.Snapshot {
 // igloo_tag_references(), and the views igloo.policy_references and
 // igloo.tag_references over them, after Snowflake's views of the same
 // names: which masking and row access policies apply to which tables and
-// columns, and which columns have which tags. Every user may read them, as
-// they may read table and column names.
+// columns, and which columns have which tags. Each user sees those of the
+// tables they may see (see CatalogSource).
 func (e *Engine) registerPolicies(ctx context.Context) error {
 	// Not closed: closing a DB closes its connector.
 	db := sql.OpenDB(e.connector)
@@ -49,15 +49,34 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 		return err
 	}
 	column := func(name string, t duckdb.TypeInfo) duckdb.ColumnInfo { return duckdb.ColumnInfo{Name: name, T: t} }
+	// visible keeps the rows, whose schema and table are at 3 and 4, of
+	// the tables the statement's user may see.
+	visible := func(ctx context.Context, rows func() [][]any) func() ([][]any, error) {
+		source := e.catalogSource(ctx)
+		return func() ([][]any, error) {
+			src, ok := source()
+			if !ok {
+				return nil, nil
+			}
+			all := rows()
+			out := all[:0]
+			for _, r := range all {
+				if schema, _ := r[3].(string); src.SeesTable(schema, r[4].(string)) {
+					out = append(out, r)
+				}
+			}
+			return out, nil
+		}
+	}
 	err = duckdb.RegisterTableUDF(conn, "igloo_policy_references", duckdb.RowTableFunction{
-		BindArguments: func(map[string]any, ...any) (duckdb.RowTableSource, error) {
-			return &rowSource{
+		BindArgumentsContext: func(ctx context.Context, _ map[string]any, _ ...any) (duckdb.RowTableSource, error) {
+			return &lazySource{
 				columns: []duckdb.ColumnInfo{
 					column("policy_name", varchar), column("policy_kind", varchar), column("ref_database_name", varchar),
 					column("ref_schema_name", varchar), column("ref_entity_name", varchar), column("ref_entity_domain", varchar),
 					column("ref_column_name", varchar), column("ref_arg_column_names", list), column("tag_name", varchar),
 				},
-				rows: policyReferences(e.catalog, e.policySnapshot()),
+				fill: visible(ctx, func() [][]any { return policyReferences(e.catalog, e.policySnapshot()) }),
 			}, nil
 		},
 	})
@@ -65,14 +84,14 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 		return err
 	}
 	err = duckdb.RegisterTableUDF(conn, "igloo_tag_references", duckdb.RowTableFunction{
-		BindArguments: func(map[string]any, ...any) (duckdb.RowTableSource, error) {
-			return &rowSource{
+		BindArgumentsContext: func(ctx context.Context, _ map[string]any, _ ...any) (duckdb.RowTableSource, error) {
+			return &lazySource{
 				columns: []duckdb.ColumnInfo{
 					column("tag_name", varchar), column("tag_value", varchar), column("object_database", varchar),
 					column("object_schema", varchar), column("object_name", varchar), column("domain", varchar),
 					column("column_name", varchar),
 				},
-				rows: tagReferences(e.catalog, e.policySnapshot()),
+				fill: visible(ctx, func() [][]any { return tagReferences(e.catalog, e.policySnapshot()) }),
 			}, nil
 		},
 	})
@@ -149,33 +168,4 @@ func tagReferences(catalog string, snap *policy.Snapshot) [][]any {
 		rows[i] = []any{ct.Tag, ct.Value, db, ct.Schema, ct.Table, "COLUMN", ct.Column}
 	}
 	return rows
-}
-
-// rowSource is a table function's rows, worked out when it is bound.
-type rowSource struct {
-	columns []duckdb.ColumnInfo
-	rows    [][]any
-	next    int
-}
-
-func (s *rowSource) ColumnInfos() []duckdb.ColumnInfo { return s.columns }
-
-func (s *rowSource) Cardinality() *duckdb.CardinalityInfo {
-	return &duckdb.CardinalityInfo{Cardinality: uint(len(s.rows)), Exact: true}
-}
-
-func (s *rowSource) Init() {}
-
-func (s *rowSource) FillRow(row duckdb.Row) (bool, error) {
-	if s.next >= len(s.rows) {
-		return false, nil
-	}
-	r := s.rows[s.next]
-	s.next++
-	for i, v := range r {
-		if err := row.SetRowValue(i, v); err != nil {
-			return false, err
-		}
-	}
-	return true, nil
 }

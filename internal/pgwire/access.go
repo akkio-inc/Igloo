@@ -408,9 +408,9 @@ func (s *Server) ddlNeeds(ctx context.Context, sess *session, t duckdb.StmtType,
 // createTable is the start of CREATE [OR REPLACE] [TEMP] TABLE [IF NOT
 // EXISTS] name, and the query of CREATE TABLE AS, if any.
 type createTable struct {
-	replace, temporary bool
-	name               []string
-	query              string
+	replace, temporary, ifNotExists bool
+	name                            []string
+	query                           string
 }
 
 func parseCreateTable(query string) (createTable, bool) {
@@ -428,7 +428,7 @@ func parseCreateTable(query string) (createTable, bool) {
 	if !sc.keywords("TABLE") {
 		return c, false
 	}
-	sc.keywords("IF", "NOT", "EXISTS")
+	c.ifNotExists = sc.keywords("IF", "NOT", "EXISTS")
 	name, ok := sc.name()
 	if !ok {
 		return c, false
@@ -950,6 +950,7 @@ var allowedFunctions = map[string]bool{
 	"pragma_platform": true, "pragma_show": true, "pragma_table_info": true, "pragma_user_agent": true,
 	"pragma_version": true,
 	"igloo_comments": true, "igloo_query_history": true, "igloo_login_history": true,
+	"igloo_schemata": true, "igloo_tables": true, "igloo_columns": true, "igloo_lineage": true, "igloo_table_usage": true,
 	"igloo_task_history": true, "igloo_load_history": true, "igloo_usage": true, "igloo_alert_history": true,
 	"igloo_policy_references": true, "igloo_tag_references": true,
 }

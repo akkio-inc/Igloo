@@ -97,10 +97,11 @@ func parseAlterView(query string) ([]string, bool) {
 	return sc.name()
 }
 
-// commentCommand is COMMENT ON TABLE, VIEW or COLUMN.
+// commentCommand is COMMENT ON SCHEMA, TABLE, VIEW or COLUMN.
 type commentCommand struct {
 	kind string
-	// name is the table or view, then the column for COLUMN.
+	// name is the schema, or the table or view, then the column for
+	// COLUMN.
 	name []string
 	text *string
 }
@@ -112,6 +113,8 @@ func parseCommentCommand(query string) (commentCommand, bool) {
 	}
 	var c commentCommand
 	switch {
+	case sc.keywords("SCHEMA"):
+		c.kind = "SCHEMA"
 	case sc.keywords("TABLE"):
 		c.kind = "TABLE"
 	case sc.keywords("VIEW"):
@@ -122,7 +125,7 @@ func parseCommentCommand(query string) (commentCommand, bool) {
 		return c, false
 	}
 	name, ok := sc.name()
-	if !ok || (c.kind == "COLUMN" && len(name) < 2) {
+	if !ok || (c.kind == "COLUMN" && len(name) < 2) || (c.kind == "SCHEMA" && len(name) > 2) {
 		return c, false
 	}
 	c.name = name
@@ -170,9 +173,21 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 			nameParts = nameParts[:len(nameParts)-1]
 		}
 	}
-	schema, name, ok, err := s.resolveCatalogName(ctx, sess, nameParts)
-	if err != nil || !ok {
-		return nil, false, err
+	var (
+		schema, name string
+		err          error
+	)
+	if isComment && comment.kind == "SCHEMA" {
+		var ok bool
+		if schema, ok, err = s.resolveCatalogSchema(ctx, sess, nameParts); err != nil || !ok {
+			return nil, false, err
+		}
+	} else {
+		var ok bool
+		schema, name, ok, err = s.resolveCatalogName(ctx, sess, nameParts)
+		if err != nil || !ok {
+			return nil, false, err
+		}
 	}
 
 	if isView && view.drop && view.ifExists && !s.ddl.IsView(schema, name) {
@@ -182,6 +197,10 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 
 	start := time.Now()
 	target := []auth.Object{{Schema: schema, Table: name}}
+	if name == "" {
+		// A schema's comment changes no table.
+		target = nil
+	}
 	if isView && !view.drop && strings.EqualFold(schema, engine.HistorySchema) && isHistoryView(name) {
 		err := pgerror.WithCode(fmt.Errorf("%s.%s is reserved for Igloo's own views", schema, name), codes.ReservedName)
 		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
@@ -200,8 +219,20 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 	}
 	if err := authorize(user.Role, stmtType, query); err != nil {
 		// Creating, replacing, dropping and commenting on the catalog's
-		// views and tables is CREATE on their schema.
-		if err = s.authorizeSchemaCreate(ctx, sess, user, schema, err); err != nil {
+		// views and tables is CREATE on their schema. Their owners may
+		// comment on them too.
+		if isComment && s.mayComment(ctx, sess, user, auth.Object{Schema: schema, Table: name}) {
+			err = nil
+		} else if comment.kind == "SCHEMA" {
+			err = needError(user, need{auth.PrivilegeCreate, auth.Object{Schema: schema}})
+			if user.Role != auth.RoleNone {
+				err = pgerror.WithCode(fmt.Errorf("permission denied for %s: commenting on schema %s needs the writer role or owning it",
+					user.Name, schema), codes.InsufficientPrivilege)
+			}
+		} else {
+			err = s.authorizeSchemaCreate(ctx, sess, user, schema, err)
+		}
+		if err != nil {
 			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 			s.metrics.query(time.Now(), err)
 			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
@@ -255,11 +286,15 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		if err != nil {
 			return record(catalogDDLError(err))
 		}
-		if view.drop {
+		switch {
+		case view.drop:
 			if ferr := s.grants.ForgetObject(ctx, target[0]); ferr != nil {
 				s.log.Warn("could not remove a dropped view's grants", "view", target[0].String(), "err", ferr)
 			}
+			s.ownersChanged()
 			s.sessions.expireAll()
+		case isView:
+			s.recordOwner(ctx, user, &createdObject{object: target[0], keep: view.replace || view.ifNotExists})
 		}
 		return record(w.Complete(tag))
 	})), true, nil
@@ -357,6 +392,22 @@ func catalogDDLError(err error) error {
 	return pgError(err)
 }
 
+// resolveCatalogSchema works out which schema of the Iceberg catalog a
+// schema name written in a statement refers to: schema or catalog.schema.
+// ok is false for another database's.
+func (s *Server) resolveCatalogSchema(ctx context.Context, sess *session, parts []string) (schema string, ok bool, err error) {
+	if len(parts) == 2 && !strings.EqualFold(parts[0], s.ddl.Catalog()) {
+		return "", false, nil
+	}
+	if len(parts) == 1 {
+		db, _, err := currentSchema(ctx, sess.conn)
+		if err != nil || !strings.EqualFold(db, s.ddl.Catalog()) {
+			return "", false, err
+		}
+	}
+	return parts[len(parts)-1], true, nil
+}
+
 // resolveCatalogName works out which schema and table or view a name written
 // in a statement refers to in the Iceberg catalog. ok is false when it names
 // something in another database: temporary objects, or DuckDB's own.
@@ -422,10 +473,6 @@ func currentSchema(ctx context.Context, conn *duckdb.Conn) (db, schema string, e
 	schema, _ = dest[1].(string)
 	return db, schema, nil
 }
-
-// readsComments matches queries that read comments, before which the
-// comment cache is refreshed.
-var readsComments = regexp.MustCompile(`(?i)\b(pg_description|obj_description|col_description|igloo_comments)\b`)
 
 // missingRelation matches DuckDB's error for an unknown table or view: one
 // created on another replica, perhaps, that this one has not synced yet.

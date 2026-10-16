@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/duckdb/duckdb-go/v2"
 	wire "github.com/jeroenrinzema/psql-wire"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
@@ -53,6 +54,15 @@ type queryRecord struct {
 	acc *access
 	// written names what catalog DDL changed.
 	written []auth.Object
+	// read and locations name what a command Igloo carries out itself
+	// read: catalog tables, and locations outside the catalog.
+	read      []auth.Object
+	locations []string
+	// analyze is the statement, of type stmtType, as the session prepared
+	// it, when what it read and wrote is to be worked out from it (see
+	// objects.go).
+	analyze  string
+	stmtType duckdb.StmtType
 	// policies names the policies that applied.
 	policies []string
 	// used is what DuckDB measured of the statement, and queued how long
@@ -88,15 +98,55 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		q.SQLState = string(pgerror.GetCode(pgError(r.err)))
 		q.Rows = -1
 	}
-	if r.acc != nil {
-		q.TablesRead = objectNames(s.catalogName(), r.acc.read)
-		q.TablesWritten = objectNames(s.catalogName(), r.acc.written)
-	}
-	if r.written != nil {
-		q.TablesWritten = objectNames(s.catalogName(), r.written)
-	}
 	q.Policies = r.policies
-	s.audit.RecordQuery(q)
+	q.Job = sess.job
+	known := statementObjects{read: r.read, written: r.written, locations: r.locations}
+	readKnown := r.read != nil
+	if r.acc != nil {
+		known.written = r.acc.written
+		// For users with the role none, grants were checked for what the
+		// statement reads.
+		known.read, readKnown = r.acc.read, user.Role == auth.RoleNone
+	}
+	if r.analyze != "" && !readKnown && q.Outcome == audit.OutcomeOK && s.analyzer != nil && s.catalogName() != "" &&
+		s.analyzer.worthwhile(r.stmtType, r.analyze) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		names, err := s.names(ctx, sess)
+		cancel()
+		if err == nil && s.analyzer.add(analysis{q: &q, text: r.analyze, kind: r.stmtType, names: names, known: known, readKnown: readKnown}) {
+			return
+		}
+	}
+	s.finishRecord(&q, known.read, known.written, known.locations)
+}
+
+// finishRecord writes q to the history with what it read and wrote, tells
+// the lineage sink about it, and has the metadata of the tables it wrote
+// read again.
+func (s *Server) finishRecord(q *audit.Query, read, written []auth.Object, locations []string) {
+	q.TablesRead = objectNames(s.catalogName(), read)
+	q.TablesWritten = objectNames(s.catalogName(), written)
+	q.LocationsRead = locations
+	s.audit.RecordQuery(*q)
+	if q.Outcome != audit.OutcomeOK || len(written) == 0 {
+		return
+	}
+	if s.lineage != nil {
+		s.lineage.Statement(*q)
+	}
+	if dataChanged(q.StatementType) {
+		s.metadataChanged(written)
+	}
+}
+
+// dataChanged reports whether statements of a type, as the history names
+// them, change tables' data.
+func dataChanged(statementType string) bool {
+	switch statementType {
+	case "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "COPY", "CREATE TABLE", "CREATE MATERIALIZED", "REFRESH":
+		return true
+	}
+	return false
 }
 
 // recordLogin sends a login attempt from addr, which may be nil, to the

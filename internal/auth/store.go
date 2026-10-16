@@ -159,6 +159,17 @@ var migrations = []string{
 		PRIMARY KEY (grantee_type, grantee, privilege, schema_name, table_name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS grants_object ON igloo_auth.grants (lower(schema_name), lower(table_name))`,
+	// The owner, a user or custom role, of a schema (table_name '') or of a
+	// table or view. Dropping the owner drops the row.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.owners (
+		schema_name text NOT NULL,
+		table_name  text NOT NULL DEFAULT '',
+		owner       text NOT NULL,
+		owner_type  text NOT NULL CHECK (owner_type IN ('user', 'role')),
+		set_by      text NOT NULL DEFAULT '',
+		set_at      timestamptz NOT NULL DEFAULT now()
+	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS owners_object ON igloo_auth.owners (lower(schema_name), lower(table_name))`,
 	// Service accounts, disabled users, emails for single sign-on, and the
 	// salt of access tokens for users without a password. Added once, so
 	// later starts take no lock on the table. Older replicas still running
@@ -356,11 +367,15 @@ func (s *PostgresStore) SetRole(ctx context.Context, name string, role Role) err
 	})
 }
 
-// Delete removes the user with their memberships (by cascade) and grants.
+// Delete removes the user with their memberships (by cascade), grants and
+// ownership of objects.
 func (s *PostgresStore) Delete(ctx context.Context, name string) error {
 	return s.changeAdmins(ctx, name, func(tx pgx.Tx) (pgconn.CommandTag, error) {
 		tag, err := tx.Exec(ctx, `DELETE FROM igloo_auth.users WHERE name = $1`, name)
 		if err != nil || tag.RowsAffected() == 0 {
+			return tag, err
+		}
+		if err := forgetOwned(ctx, tx, GranteeUser, name); err != nil {
 			return tag, err
 		}
 		if _, err = tx.Exec(ctx, `DELETE FROM igloo_auth.grants WHERE grantee_type = 'user' AND grantee = $1`, name); err != nil {

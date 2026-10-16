@@ -91,6 +91,20 @@ var migrations = []string{
 		price_per_hour double precision NOT NULL,
 		PRIMARY KEY (day, pool, replica, started)
 	)`,
+	// The locations a statement read files from, and the job it ran for,
+	// for lineage. Added once, as above.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_audit' AND table_name = 'query_history' AND column_name = 'job') THEN
+			ALTER TABLE igloo_audit.query_history
+				ADD COLUMN IF NOT EXISTS locations_read text[],
+				ADD COLUMN IF NOT EXISTS job text;
+		END IF;
+	END $$`,
+	// Lineage reads only the statements that wrote tables.
+	`CREATE INDEX IF NOT EXISTS query_history_writes ON igloo_audit.query_history (start_time)
+		WHERE tables_written IS NOT NULL`,
 }
 
 // PostgresStore keeps history in the "igloo_audit" schema of the metadata
@@ -144,12 +158,12 @@ func (s *PostgresStore) WriteQueries(ctx context.Context, qs []Query) error {
 		rows[i] = []any{q.ID, q.SessionID, q.User, q.Role, q.Start, q.Duration.Microseconds(), q.Outcome,
 			nullable(q.SQLState), rowCount, q.StatementType, q.Text, nullSlice(q.TablesRead), nullSlice(q.TablesWritten),
 			nullable(q.ClientAddress), nullable(q.ApplicationName), nullSlice(q.Policies), nullable(q.QueryTag),
-			nullable(q.Pool), q.Queued.Microseconds(), cpu, read, memory}
+			nullable(q.Pool), q.Queued.Microseconds(), cpu, read, memory, nullSlice(q.LocationsRead), nullable(q.Job)}
 	}
 	return s.copy(ctx, "query_history", "query_id", []string{
 		"query_id", "session_id", "user_name", "role", "start_time", "duration_us", "outcome", "sqlstate",
 		"row_count", "statement_type", "query_text", "tables_read", "tables_written", "client_address", "application_name",
-		"policies", "query_tag", "pool", "queued_us", "cpu_time_us", "bytes_read", "memory_allocated",
+		"policies", "query_tag", "pool", "queued_us", "cpu_time_us", "bytes_read", "memory_allocated", "locations_read", "job",
 	}, rows)
 }
 
@@ -193,7 +207,8 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 	rows, err := s.pool.Query(ctx, `SELECT query_id, session_id, user_name, role, start_time, duration_us, outcome,
 			coalesce(sqlstate, ''), coalesce(row_count, -1), statement_type, query_text, tables_read, tables_written,
 			coalesce(client_address, ''), coalesce(application_name, ''), policies, coalesce(query_tag, ''),
-			coalesce(pool, ''), coalesce(queued_us, 0), cpu_time_us, coalesce(bytes_read, 0), coalesce(memory_allocated, 0)
+			coalesce(pool, ''), coalesce(queued_us, 0), cpu_time_us, coalesce(bytes_read, 0), coalesce(memory_allocated, 0),
+			locations_read, coalesce(job, '')
 		FROM igloo_audit.query_history
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR start_time >= $2)
@@ -213,7 +228,7 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 		)
 		err := row.Scan(&q.ID, &q.SessionID, &q.User, &q.Role, &q.Start, &us, &q.Outcome, &q.SQLState, &q.Rows,
 			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName, &q.Policies,
-			&q.QueryTag, &q.Pool, &queuedUS, &cpuUS, &r.BytesRead, &r.MemoryAllocated)
+			&q.QueryTag, &q.Pool, &queuedUS, &cpuUS, &r.BytesRead, &r.MemoryAllocated, &q.LocationsRead, &q.Job)
 		q.Duration, q.Queued = micros(us), micros(queuedUS)
 		if cpuUS != nil {
 			r.CPUTime = micros(*cpuUS)
@@ -257,6 +272,75 @@ func (p Page) args(v Viewer) []any {
 		limit = 1000
 	}
 	return []any{user, nullTime(p.Since), nullTime(p.Until), nullTime(p.AfterTime), p.AfterID, limit}
+}
+
+// Lineage pairs what each successful statement read with what it wrote,
+// in the database: one row per edge, with its latest statement. Names
+// that differ only in case are one table, shown as last written.
+func (s *PostgresStore) Lineage(ctx context.Context, since time.Time) ([]Edge, error) {
+	rows, err := s.pool.Query(ctx, `WITH writes AS (
+			SELECT query_id, user_name, start_time, statement_type, job, tables_read, locations_read, tables_written
+			FROM igloo_audit.query_history
+			WHERE tables_written IS NOT NULL AND outcome = 'ok' AND ($1::timestamptz IS NULL OR start_time >= $1)
+		), edges AS (
+			SELECT q.*, r.name AS src, false AS loc, w.name AS dst
+			FROM writes q, unnest(q.tables_read) AS r(name), unnest(q.tables_written) AS w(name)
+			WHERE lower(r.name) <> lower(w.name)
+			UNION ALL
+			SELECT q.*, r.name, true, w.name
+			FROM writes q, unnest(q.locations_read) AS r(name), unnest(q.tables_written) AS w(name)
+		)
+		SELECT DISTINCT ON (lower(src), loc, lower(dst)) src, loc, dst,
+			min(start_time) OVER e, max(start_time) OVER e, count(*) OVER e,
+			query_id, user_name, statement_type, coalesce(job, '')
+		FROM edges
+		WINDOW e AS (PARTITION BY lower(src), loc, lower(dst))
+		ORDER BY lower(src), loc, lower(dst), start_time DESC, query_id DESC`, nullTime(since))
+	if err != nil {
+		return nil, err
+	}
+	edges, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Edge, error) {
+		var e Edge
+		err := row.Scan(&e.From, &e.FromLocation, &e.To, &e.FirstSeen, &e.LastSeen, &e.Statements,
+			&e.LastQueryID, &e.LastUser, &e.LastStatementType, &e.LastJob)
+		return e, err
+	})
+	sortEdges(edges)
+	return edges, err
+}
+
+// TableUsage counts, in the database, the successful statements since
+// since that read and wrote each table.
+func (s *PostgresStore) TableUsage(ctx context.Context, since time.Time) ([]TableUsage, error) {
+	rows, err := s.pool.Query(ctx, `SELECT max(t), count(*) FILTER (WHERE NOT w), count(*) FILTER (WHERE w),
+			count(DISTINCT user_name), max(start_time) FILTER (WHERE NOT w), max(start_time) FILTER (WHERE w)
+		FROM (
+			SELECT q.user_name, q.start_time, t, false AS w
+			FROM igloo_audit.query_history q, unnest(q.tables_read) AS t
+			WHERE q.tables_read IS NOT NULL AND q.outcome = 'ok' AND q.start_time >= $1
+			UNION ALL
+			SELECT q.user_name, q.start_time, t, true
+			FROM igloo_audit.query_history q, unnest(q.tables_written) AS t
+			WHERE q.tables_written IS NOT NULL AND q.outcome = 'ok' AND q.start_time >= $1
+		) used
+		GROUP BY lower(t) ORDER BY lower(t)`, since)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (TableUsage, error) {
+		var (
+			u           TableUsage
+			read, write *time.Time
+		)
+		err := row.Scan(&u.Table, &u.Reads, &u.Writes, &u.Users, &read, &write)
+		if read != nil {
+			u.LastRead = *read
+		}
+		if write != nil {
+			u.LastWrite = *write
+		}
+		return u, err
+	})
 }
 
 // Prune deletes old history if no other replica is doing so.

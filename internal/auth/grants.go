@@ -211,14 +211,15 @@ type GrantStore interface {
 	// UserPrivileges returns what applies to user: their custom roles and
 	// every grant to them or to those roles.
 	UserPrivileges(ctx context.Context, user string) (Privileges, error)
-	// ForgetUser removes a dropped user's memberships and grants.
+	// ForgetUser removes a dropped user's memberships and grants, and
+	// their ownership of objects.
 	ForgetUser(ctx context.Context, user string) error
 	// ForgetObject removes the grants on a dropped table or view, or on a
 	// dropped schema and everything in it, or on a dropped connection and
-	// everything in it.
+	// everything in it, and their owners.
 	ForgetObject(ctx context.Context, o Object) error
-	// RenameObject moves a renamed table's grants to its new name. Tables
-	// of connections are never renamed through Igloo.
+	// RenameObject moves a renamed table's grants and owner to its new
+	// name. Tables of connections are never renamed through Igloo.
 	RenameObject(ctx context.Context, from, to Object) error
 }
 
@@ -230,6 +231,7 @@ type MemoryGrants struct {
 	roles    map[string]*CustomRole
 	grants   []Grant
 	settings []Setting
+	owners   []Ownership
 }
 
 // NewMemoryGrants returns an empty store whose users come from users.
@@ -259,6 +261,7 @@ func (m *MemoryGrants) DropRole(_ context.Context, name string) error {
 	delete(m.roles, name)
 	m.removeGrants(func(g Grant) bool { return g.GranteeType == GranteeRole && g.Grantee == name })
 	m.forgetSettings(GranteeRole, name)
+	m.dropOwners(func(o Ownership) bool { return o.OwnerType == GranteeRole && o.Owner == name })
 	return nil
 }
 
@@ -371,6 +374,7 @@ func (m *MemoryGrants) ForgetUser(_ context.Context, user string) error {
 	}
 	m.removeGrants(func(g Grant) bool { return g.GranteeType == GranteeUser && g.Grantee == user })
 	m.forgetSettings(GranteeUser, user)
+	m.dropOwners(func(o Ownership) bool { return o.OwnerType == GranteeUser && o.Owner == user })
 	return nil
 }
 
@@ -378,6 +382,7 @@ func (m *MemoryGrants) ForgetObject(_ context.Context, o Object) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.removeGrants(func(g Grant) bool { return covers(o, g.Object) })
+	m.dropOwners(func(w Ownership) bool { return covers(o, w.Object) })
 	return nil
 }
 
@@ -395,6 +400,14 @@ func (m *MemoryGrants) RenameObject(_ context.Context, from, to Object) error {
 	for i, g := range m.grants {
 		if !g.Object.IsSchema() && g.Object.Equal(from) {
 			m.grants[i].Object = to
+		}
+	}
+	if !from.Equal(to) {
+		m.dropOwners(func(w Ownership) bool { return !w.Object.IsSchema() && w.Object.Equal(to) })
+	}
+	for i, w := range m.owners {
+		if !w.Object.IsSchema() && w.Object.Equal(from) {
+			m.owners[i].Object = to
 		}
 	}
 	return nil

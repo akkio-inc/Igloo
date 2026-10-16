@@ -57,14 +57,19 @@ func TestTagRowsAndKinds(t *testing.T) {
 
 func TestRewriteHistoryRefs(t *testing.T) {
 	cases := map[string]string{
-		"SELECT * FROM igloo.query_history":                      `SELECT * FROM "memory"."igloo".query_history`,
-		`SELECT * FROM "igloo"."login_history" h`:                `SELECT * FROM "memory"."igloo"."login_history" h`,
-		"SELECT * FROM IGLOO . QUERY_HISTORY":                    `SELECT * FROM "memory"."igloo" . QUERY_HISTORY`,
-		"SELECT * FROM lake.igloo.query_history":                 "SELECT * FROM lake.igloo.query_history",
-		"SELECT * FROM igloo.query_history.x":                    "SELECT * FROM igloo.query_history.x",
-		"SELECT 'igloo.query_history', igloo.other_history":      "SELECT 'igloo.query_history', igloo.other_history",
-		"SELECT * FROM igloo.events":                             "SELECT * FROM igloo.events",
-		"SELECT * FROM igloo.query_history, igloo.login_history": `SELECT * FROM "memory"."igloo".query_history, "memory"."igloo".login_history`,
+		"SELECT * FROM igloo.query_history":                       `SELECT * FROM "memory"."igloo".query_history`,
+		`SELECT * FROM "igloo"."login_history" h`:                 `SELECT * FROM "memory"."igloo"."login_history" h`,
+		"SELECT * FROM IGLOO . QUERY_HISTORY":                     `SELECT * FROM "memory"."igloo" . QUERY_HISTORY`,
+		"SELECT * FROM lake.igloo.query_history":                  "SELECT * FROM lake.igloo.query_history",
+		"SELECT * FROM igloo.query_history.x":                     "SELECT * FROM igloo.query_history.x",
+		"SELECT 'igloo.query_history', igloo.other_history":       "SELECT 'igloo.query_history', igloo.other_history",
+		"SELECT * FROM igloo.events":                              "SELECT * FROM igloo.events",
+		"SELECT * FROM igloo.query_history, igloo.login_history":  `SELECT * FROM "memory"."igloo".query_history, "memory"."igloo".login_history`,
+		"SELECT table_owner FROM information_schema.TABLES t":     `SELECT table_owner FROM "memory"."igloo"."information_schema_tables" t`,
+		`SELECT * FROM "information_schema"."schemata"`:           `SELECT * FROM "memory"."igloo"."information_schema_schemata"`,
+		"SELECT * FROM system.information_schema.tables":          "SELECT * FROM system.information_schema.tables",
+		"SELECT * FROM information_schema.columns":                "SELECT * FROM information_schema.columns",
+		"SELECT * FROM igloo.tables JOIN igloo.lineage USING (x)": `SELECT * FROM "memory"."igloo".tables JOIN "memory"."igloo".lineage USING (x)`,
 	}
 	for in, want := range cases {
 		if got := rewriteHistoryRefs(in, "memory"); got != want {

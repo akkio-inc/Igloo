@@ -50,8 +50,11 @@ type Query struct {
 	Text string
 	// TablesRead and TablesWritten are set when Igloo worked out which
 	// tables the statement uses; nil otherwise.
-	TablesRead      []string
-	TablesWritten   []string
+	TablesRead    []string
+	TablesWritten []string
+	// LocationsRead are the locations outside the catalog that the
+	// statement read files from, when known: COPY INTO's.
+	LocationsRead   []string
 	ClientAddress   string
 	ApplicationName string
 	// Policies names the masking and row access policies that applied to
@@ -66,6 +69,9 @@ type Query struct {
 	Queued time.Duration
 	// Resources is what DuckDB measured while it ran; nil when it did not.
 	Resources *Resources
+	// Job is the task, pipe or materialized view the statement ran for,
+	// such as "task nightly"; empty for a session's own statements.
+	Job string
 }
 
 // Resources is what DuckDB's profiler measured while a statement ran.
@@ -133,6 +139,11 @@ type Store interface {
 	// Queries and Logins return what v may see, newest first.
 	Queries(ctx context.Context, v Viewer, p Page) ([]Query, error)
 	Logins(ctx context.Context, v Viewer, p Page) ([]Login, error)
+	// Lineage returns the edges that successful statements since since
+	// made, and TableUsage how often they read and wrote each table (see
+	// lineage.go). Both cover every user's statements.
+	Lineage(ctx context.Context, since time.Time) ([]Edge, error)
+	TableUsage(ctx context.Context, since time.Time) ([]TableUsage, error)
 	// Prune deletes records older than before. Stores shared by several
 	// replicas let one of them do it at a time.
 	Prune(ctx context.Context, before time.Time) error
@@ -187,6 +198,8 @@ type Log struct {
 	// retries are batches whose write failed, oldest first. Only Run
 	// touches them.
 	retries []retry
+
+	tableUsage usageCache
 }
 
 // retry is a batch of one kind waiting to be written again.
@@ -232,6 +245,10 @@ func New(store Store, opts Options, log *slog.Logger) *Log {
 		compute:   newComputeClock(opts.Pool, opts.PricePerHour),
 	}
 }
+
+// Immediate reports whether records are written as they come, so that
+// readers see a statement as soon as it ends: true for a MemoryStore.
+func (l *Log) Immediate() bool { return l != nil && l.direct }
 
 // RecordQuery queues q for writing. It never blocks.
 func (l *Log) RecordQuery(q Query) {

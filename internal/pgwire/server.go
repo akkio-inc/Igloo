@@ -140,6 +140,16 @@ type Options struct {
 	// public addresses.
 	Notify *notify.Service
 
+	// Metadata keeps the catalog's metadata for the catalog functions.
+	// Nil means DDL, if set.
+	Metadata MetadataSource
+	// Owners keeps the owners of the catalog's objects. Nil means Grants
+	// if it keeps them too, and otherwise a store in memory.
+	Owners auth.OwnerStore
+	// Lineage, if set, is told about every statement that wrote a table
+	// (see catalog.go).
+	Lineage LineageSink
+
 	// external and externalFiles stand in for Sharing's external tables
 	// and the prefix of their files, in tests.
 	external      externalCatalog
@@ -224,6 +234,14 @@ type Server struct {
 	accessTokens        AccessTokenVerifier
 	// limiter refuses logins after too many failures.
 	limiter *loginLimiter
+
+	meta       MetadataSource
+	owners     auth.OwnerStore
+	ownerCache ownerCache
+	lineage    LineageSink
+	// analyzer works out what statements read and wrote, for the
+	// history; nil without one.
+	analyzer *analyzer
 }
 
 // New builds a server that runs queries on engine.
@@ -270,6 +288,16 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		tokenMaxLifetime:    opts.TokenMaxLifetime,
 		accessTokens:        opts.AccessTokens,
 		limiter:             newLoginLimiter(),
+
+		meta:    opts.Metadata,
+		owners:  opts.Owners,
+		lineage: opts.Lineage,
+	}
+	if s.meta == nil && opts.DDL != nil {
+		s.meta = opts.DDL
+	}
+	if s.audit != nil {
+		s.analyzer = newAnalyzer(s, s.audit.Immediate())
 	}
 	if s.tasks == nil {
 		s.tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{Log: log})
@@ -288,6 +316,13 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 			s.grants = g
 		} else {
 			s.grants = auth.NewMemoryGrants(opts.Users)
+		}
+	}
+	if s.owners == nil {
+		if o, ok := s.grants.(auth.OwnerStore); ok {
+			s.owners = o
+		} else {
+			s.owners = auth.NewMemoryGrants(opts.Users)
 		}
 	}
 	if s.tokens == nil {
@@ -327,6 +362,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	if s.workload == nil {
 		s.workload = workload.NewController(0)
+	}
+	if e, ok := engine.(catalogEngine); ok {
+		e.SetCatalogViewer(s.CatalogViewer)
 	}
 	s.sessions.abandoned = s.releaseConn
 
@@ -368,6 +406,9 @@ func (s *Server) Serve(l net.Listener) error {
 // until ctx is done.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.wire.Shutdown(ctx)
+	if s.analyzer != nil {
+		s.analyzer.close(ctx)
+	}
 	s.gov.close()
 	return err
 }
@@ -407,6 +448,14 @@ type session struct {
 	// method is how the session signed in: one of audit's Method
 	// constants, or empty for the console's sessions.
 	method string
+	// job is the task, pipe or materialized view the session runs, as
+	// "task nightly", for the history.
+	job string
+	// ddlCount counts the session's DDL, which may change its temporary
+	// objects; names is what decides what names in its statements mean,
+	// as last read (see objects.go).
+	ddlCount uint64
+	names    *sessionNames
 	// sens is what the session's statements may name that policies
 	// concern, and settings whether its settings let policies apply (see
 	// protect.go).
@@ -747,6 +796,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return stmts, nil
 	}
 
+	if ps, ok, err := s.ownerCommand(sess, q.Query); ok || err != nil {
+		return ps, err
+	}
+
 	if err := s.checkWarehouseFiles(ctx, user, q.Query); err != nil {
 		s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
 		return nil, err
@@ -840,15 +893,19 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			switch {
 			case changesCatalog(st.stmtType):
 				s.ddlGen.Add(1)
+				sess.ddlCount++
 			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
 				sess.settingGen++
 			}
 			if st.effect != nil {
 				s.applyEffect(ctx, sess, st.effect)
 			}
+			if st.created != nil {
+				s.recordOwner(ctx, user, st.created)
+			}
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
-			policies: st.policies(), used: used, queued: queued})
+			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
@@ -882,11 +939,9 @@ func (s *Server) rewrite(ctx context.Context, user auth.User, text string) strin
 	query := rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(text), user.Name), s.engine.LocalDatabase())
 	if s.ddl != nil {
 		query = s.ddl.RewriteViewRefs(query)
-		if readsComments.MatchString(query) {
-			if err := s.ddl.RefreshComments(ctx); err != nil {
-				s.log.Warn("could not load comments", "err", err)
-			}
-		}
+	}
+	if readsMetadata.MatchString(query) {
+		s.refreshMetadata(ctx)
 	}
 	return query
 }
@@ -934,6 +989,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		// session's settings; count it as doing both.
 		s.ddlGen.Add(1)
 		sess.settingGen++
+		sess.ddlCount++
 	}
 	// Policies are applied to one statement at a time, before it runs;
 	// preparing several runs all but the last.
@@ -951,6 +1007,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		s.metrics.query(time.Now(), err)
 		return fail(pgError(err))
 	}
+	// What a CREATE makes, whose owner its user becomes, is worked out
+	// before it is prepared, since afterwards that could make preparing
+	// it again necessary (see reprepare).
+	created := s.createdObject(ctx, sess, query)
 
 	if listsColumns.MatchString(query) {
 		// Best effort: a table that fails to load keeps its placeholder.
@@ -1032,6 +1092,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	if st.stmtType == duckdb.STATEMENT_TYPE_DROP || st.stmtType == duckdb.STATEMENT_TYPE_ALTER {
 		st.effect = s.ddlEffect(ctx, sess, query)
+	}
+	if st.stmtType == duckdb.STATEMENT_TYPE_CREATE {
+		st.created = created
 	}
 	if st.access != nil && st.access.ranStatements {
 		// Checking grants ran statements on the session's connection.

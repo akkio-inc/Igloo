@@ -1,5 +1,7 @@
 // Package ddl carries out the DDL that DuckDB cannot run against the Iceberg
-// catalog: views, and comments on tables, views and columns.
+// catalog: views, and comments on schemas, tables, views and columns. It
+// also keeps what the catalog's metadata says about every object, for the
+// catalog functions (see comments.go).
 //
 // Both are stored in the catalog the standard Iceberg way, so they are
 // shared by every replica and outlive restarts: a view is an Iceberg view
@@ -33,8 +35,12 @@ const (
 	// syncInterval is how often a replica picks up views that other
 	// replicas created, replaced or dropped.
 	syncInterval = 30 * time.Second
-	// commentsTTL is how old the comments igloo_comments() lists may be.
-	commentsTTL = 30 * time.Second
+	// metadataTTL is how old the comments, columns and table sizes that
+	// the catalog functions list may be.
+	metadataTTL = 30 * time.Second
+	// changedDelay is how long after a write its table's metadata is read
+	// again; writes in between are read with it.
+	changedDelay = 2 * time.Second
 )
 
 var (
@@ -67,9 +73,18 @@ type Manager struct {
 	// gen counts changes to the local copies; see Generation.
 	gen atomic.Uint64
 
-	commentsMu sync.Mutex
-	commentsAt time.Time
-	comments   atomic.Pointer[[]catalog.Comment]
+	// meta is the catalog's metadata as last read. readMu serializes
+	// reading all of it; metaMu guards the fields below and changes to
+	// meta.
+	meta        atomic.Pointer[catalog.Metadata]
+	readMu      sync.Mutex
+	metaMu      sync.Mutex
+	metaAt      time.Time
+	metaReading bool
+	// touched are the objects read again on their own, and when.
+	touched map[key]time.Time
+	// changed are the tables to read again after changedDelay.
+	changed map[key][2]string
 }
 
 // New makes a manager for the catalog cat that eng is attached to, and
@@ -79,14 +94,9 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, log: log.With("component", "ddl")}
+	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, log: log.With("component", "ddl"),
+		touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
-	eng.SetComments(func() []catalog.Comment {
-		if p := m.comments.Load(); p != nil {
-			return *p
-		}
-		return nil
-	})
 	if _, err := m.SyncViews(ctx); err != nil {
 		m.log.Warn("could not load views", "err", err)
 	}
@@ -279,7 +289,7 @@ func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, nam
 	}
 	m.views[k] = v
 	m.publish(nil)
-	m.invalidateComments()
+	m.reloadTable(ctx, schema, name, true)
 	return nil
 }
 
@@ -317,7 +327,7 @@ func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bo
 	}
 	delete(m.views, k)
 	m.publish(nil)
-	m.invalidateComments()
+	m.reloadTable(ctx, schema, name, true)
 	return nil
 }
 

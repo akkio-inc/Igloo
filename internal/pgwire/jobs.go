@@ -277,23 +277,30 @@ func (s *Server) loadingCommand(sess *session, query string) (wire.PreparedState
 	if job.verb == "SHOW" {
 		opts = append(opts, wire.WithColumns(jobColumns))
 	}
-	return wire.Prepared(wire.NewStatement(s.audited(sess, query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+	return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 		start := time.Now()
+		tw := &tagWriter{DataWriter: w}
+		// What the command read and wrote, for the history.
+		var rec queryRecord
 		user, err := s.refreshUser(ctx, sess)
 		if err == nil {
 			err = sess.runCancelable(ctx, query, func(ctx context.Context) error {
-				return s.runJobCommand(ctx, sess, user, job, w)
+				return s.runJobCommand(ctx, sess, user, job, tw, &rec)
 			})
 		}
 		s.metrics.query(start, err)
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
+		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: tw.rows(),
+			written: rec.written, analyze: rec.analyze, stmtType: rec.stmtType})
 		return pgError(err)
-	}), opts...)), true, nil
+	}, opts...)), true, nil
 }
 
-func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.User, c jobCommand, w wire.DataWriter) error {
+// runJobCommand carries out c. A command that creates a materialized view
+// fills in rec what creating it read and wrote.
+func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.User, c jobCommand, w wire.DataWriter, rec *queryRecord) error {
 	if c.verb == "SHOW" {
 		return s.showJobs(ctx, user, c, w)
 	}
@@ -305,7 +312,7 @@ func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.Use
 		return err
 	}
 	if c.verb == "CREATE" {
-		if err := s.createJob(ctx, sess, user, c, name); err != nil {
+		if err := s.createJob(ctx, sess, user, c, name, rec); err != nil {
 			return err
 		}
 		s.tasks.Kick()
@@ -437,7 +444,7 @@ func parseSchedule(spec, tz string, now time.Time) (schedule.Schedule, time.Time
 	return sched, first, nil
 }
 
-func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c jobCommand, name string) error {
+func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c jobCommand, name string, rec *queryRecord) error {
 	store := s.tasks.Store()
 	j := tasks.Job{Kind: c.kind, Name: name, Owner: user.Name, State: tasks.StateStarted}
 	if c.schedule != nil || c.kind != tasks.KindMaterializedView {
@@ -540,9 +547,12 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 		if c.replace {
 			create = "CREATE OR REPLACE TABLE "
 		}
-		if err := s.execDDL(ctx, sess, user, create+quoteName([]string{s.catalogName(), schema, table})+" AS "+c.body); err != nil {
+		create += quoteName([]string{s.catalogName(), schema, table}) + " AS " + c.body
+		if err := s.execDDL(ctx, sess, user, create); err != nil {
 			return err
 		}
+		rec.written = []auth.Object{{Schema: schema, Table: table}}
+		rec.analyze, rec.stmtType = s.rewrite(ctx, user, create), duckdb.STATEMENT_TYPE_CREATE
 	}
 	// A materialized view's table is in place by now, so its definition
 	// goes with it, whatever was there.
@@ -686,7 +696,7 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 	}
 	defer es.Close() //nolint:errcheck
 	sess := es.sess
-	sess.method = methodTask
+	sess.method, sess.job = methodTask, j.Kind+" "+j.Name
 
 	switch j.Kind {
 	case tasks.KindTask:
@@ -729,8 +739,12 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 			err = fmt.Errorf("%d of %d files failed to load (see igloo.load_history); the first: %s", failed, len(loads), first)
 		}
 		target := cp.target[1:]
+		written := []auth.Object{{Schema: target[0], Table: target[1]}}
+		if rows > 0 {
+			s.metadataChanged(written)
+		}
 		s.recordQuery(sess, queryRecord{text: j.Statement, start: start, err: err, rows: rows,
-			written: []auth.Object{{Schema: target[0], Table: target[1]}}})
+			written: written, locations: []string{cp.location}})
 		return rows, err
 
 	case tasks.KindMaterializedView:
@@ -746,7 +760,9 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		})
 		schema, table, _ := strings.Cut(j.Name, ".")
 		s.recordQuery(sess, queryRecord{text: "REFRESH MATERIALIZED VIEW " + quoteName([]string{schema, table}),
-			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: policies})
+			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: policies,
+			analyze:  s.rewrite(ctx, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
+			stmtType: duckdb.STATEMENT_TYPE_CREATE})
 		return rows, err
 	}
 	return -1, fmt.Errorf("unknown kind of job %q", j.Kind)

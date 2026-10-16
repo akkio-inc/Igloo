@@ -319,7 +319,7 @@ func (s *Server) copyIntoStatement(sess *session, query string, c copyCommand) w
 		s.metrics.query(start, err)
 		rec := queryRecord{text: query, start: start, err: err, rows: total}
 		if target.Table != "" {
-			rec.written = []auth.Object{target}
+			rec.written, rec.locations = []auth.Object{target}, []string{c.location}
 		}
 		s.recordQuery(sess, rec)
 		return pgError(err)
@@ -1077,6 +1077,9 @@ func (s *Server) execDDL(ctx context.Context, sess *session, user auth.User, que
 	}
 	if st.effect != nil {
 		s.applyEffect(ctx, sess, st.effect)
+	}
+	if st.created != nil {
+		s.recordOwner(ctx, user, st.created)
 	}
 	return nil
 }
