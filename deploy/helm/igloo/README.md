@@ -270,6 +270,8 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `startupProbe`, `livenessProbe`, `readinessProbe` | `/healthz`, `/healthz`, `/readyz` on port 8080 | |
 | `service.type` | `ClusterIP` | `LoadBalancer` exposes SQL outside the cluster; set `tls.existingSecret` first |
 | `service.port` | `5432` | |
+| `console.enabled` | `true` | [Web console](../../../docs/console.md) on the SQL Service; it signs users in only over TLS or through `kubectl port-forward` |
+| `console.port` | `8443` | Console port on the SQL Service |
 | `service.annotations` | `{}` | |
 | `service.loadBalancerSourceRanges` | `[]` | Client CIDRs allowed through a LoadBalancer |
 | `service.loadBalancerClass`, `service.externalTrafficPolicy` | `""` | |
@@ -287,7 +289,7 @@ SQL clients ──5432──> Service igloo ──> gateway (1 pod) ──> Serv
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
-| `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for ports 5432 and 8080; empty: everyone |
+| `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for the SQL and console ports (5432, 8443) and for 8080; empty: everyone |
 | `catalog.image.repository` / `tag` / `pullPolicy` | `quay.io/lakekeeper/catalog` / `v0.14.0` / `IfNotPresent` | |
 | `catalog.replicaCount` | `1` | Lakekeeper pods (a PodDisruptionBudget is added above 1) |
 | `catalog.warehouse` | `igloo` | `IGLOO_CATALOG_WAREHOUSE` |

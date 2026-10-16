@@ -34,6 +34,12 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: sql
       protocol: TCP
+    {{- if .Values.console.enabled }}
+    - name: console
+      port: {{ .Values.console.port }}
+      targetPort: console
+      protocol: TCP
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -72,6 +78,12 @@ spec:
       port: 5432
       targetPort: sql
       protocol: TCP
+    {{- if .Values.console.enabled }}
+    - name: console
+      port: 8443
+      targetPort: console
+      protocol: TCP
+    {{- end }}
 ---
 # Every igloo pod's address, for the gateway's activity checks
 # (IGLOO_GATEWAY_ACTIVITY_URL): a statement running on any replica keeps them

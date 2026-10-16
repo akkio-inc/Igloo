@@ -209,6 +209,14 @@ service:
   # Cluster or Local (LoadBalancer and NodePort only).
   externalTrafficPolicy: ""
 
+# Web console (docs/console.md) on the SQL Service: sign in with Igloo users
+# to run SQL, browse data and manage users. Passwords cross the network in
+# the sign-in form, so it signs users in only over TLS (tls.existingSecret)
+# or when reached as localhost, e.g. through kubectl port-forward.
+console:
+  enabled: true
+  port: 8443
+
 autoscaling:
   enabled: false
   minReplicas: 2

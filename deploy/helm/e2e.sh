@@ -403,6 +403,8 @@ grep -q '^igloo_queries_total' <<<"$metrics" || fail "/metrics on $pod_b has no 
 pass "/metrics on $pod_b ($(grep -c '^igloo_' <<<"$metrics") igloo_* samples)"
 expect_eq "metrics Service" \
   "$(k exec curl-client -- curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "http://$FULLNAME-metrics:8080/metrics")" "200"
+expect_eq "web console through Service $FULLNAME" \
+  "$(k exec curl-client -- curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "http://$FULLNAME:8443/")" "200"
 
 log "Only igloo pods may reach Lakekeeper; only igloo and Lakekeeper reach PostgreSQL and RustFS"
 if k exec curl-client -- curl -fsS --max-time 5 -o /dev/null "http://$FULLNAME-catalog:8181/health" 2>/dev/null; then

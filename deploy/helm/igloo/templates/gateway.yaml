@@ -46,6 +46,11 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.console.enabled }}
+            - name: console
+              containerPort: 8443
+              protocol: TCP
+            {{- end }}
           env:
             - name: IGLOO_GATEWAY_COMPUTE
               value: kubernetes
@@ -55,6 +60,11 @@ spec:
               value: {{ include "igloo.scaleToZeroReplicas" . | quote }}
             - name: IGLOO_GATEWAY_BACKEND
               value: {{ printf "%s:5432" (include "igloo.serverServiceName" .) | quote }}
+            {{- if .Values.console.enabled }}
+            # The web console wakes Igloo like a SQL client does.
+            - name: IGLOO_GATEWAY_CONSOLE_BACKEND
+              value: {{ printf "%s:8443" (include "igloo.serverServiceName" .) | quote }}
+            {{- end }}
             - name: IGLOO_GATEWAY_ACTIVITY_URL
               value: {{ printf "http://%s:8080/activity" (include "igloo.headlessServiceName" .) | quote }}
             - name: IGLOO_GATEWAY_SUSPEND_AFTER

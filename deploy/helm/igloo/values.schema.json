@@ -307,7 +307,7 @@
       "anyOf": [
         {
           "type": "string",
-          "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+          "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
         {
           "type": "integer",
@@ -431,6 +431,20 @@
         }
       }
     },
+    "console": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
     "autoscaling": {
       "type": "object",
       "additionalProperties": false,
@@ -477,12 +491,12 @@
         "suspendAfter": {
           "description": "A Go duration such as 10m.",
           "type": "string",
-          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
         "resumeTimeout": {
           "description": "A Go duration such as 5m.",
           "type": "string",
-          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
         "replicas": {
           "type": [
@@ -721,7 +735,7 @@
         "snapshotRetention": {
           "description": "A Go duration such as 36h, or whole days such as 7d.",
           "type": "string",
-          "pattern": "^[0-9]+d$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+          "pattern": "^[0-9]+d$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         }
       }
     },
@@ -730,7 +744,7 @@
       "anyOf": [
         {
           "type": "string",
-          "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+          "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
         {
           "type": "integer",

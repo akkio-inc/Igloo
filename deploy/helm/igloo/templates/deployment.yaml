@@ -125,7 +125,14 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.console.enabled }}
+            - name: console
+              containerPort: 8443
+              protocol: TCP
+            {{- end }}
           env:
+            - name: IGLOO_CONSOLE_ADDR
+              value: {{ ternary ":8443" "" .Values.console.enabled | quote }}
             - name: IGLOO_ADMIN_USER
               value: {{ .Values.admin.user | quote }}
             - name: IGLOO_ADMIN_PASSWORD

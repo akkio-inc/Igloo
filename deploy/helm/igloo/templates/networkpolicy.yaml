@@ -28,7 +28,8 @@ spec:
         - port: http
           protocol: TCP
 ---
-# Igloo pods: the SQL port and the health/metrics port, nothing else. With
+# Igloo pods: the SQL and console ports and the health/metrics port, nothing
+# else; the console is open to whoever may reach SQL. With
 # scale to zero, SQL comes only through the gateway, and the gateway reads
 # /activity on the health/metrics port.
 apiVersion: networking.k8s.io/v1
@@ -47,6 +48,10 @@ spec:
     - ports:
         - port: sql
           protocol: TCP
+        {{- if .Values.console.enabled }}
+        - port: console
+          protocol: TCP
+        {{- end }}
       {{- if .Values.scaleToZero.enabled }}
       from:
         - podSelector:
@@ -89,6 +94,10 @@ spec:
     - ports:
         - port: sql
           protocol: TCP
+        {{- if .Values.console.enabled }}
+        - port: console
+          protocol: TCP
+        {{- end }}
       {{- with .Values.networkPolicy.sqlFrom }}
       from:
         {{- toYaml . | nindent 8 }}
