@@ -225,6 +225,11 @@ func TestConnectionStatements(t *testing.T) {
 	if _, err := admin.Exec(context.Background(), "CREATE CONNECTION lake "+pg.options(federation.Postgres)+")"); pgCode(err) != "22023" {
 		t.Errorf("a connection named like the catalog: %v", err)
 	}
+	mustExec(t, admin, "CREATE SCHEMA lake.sales")
+	if _, err := admin.Exec(context.Background(), "CREATE CONNECTION sales "+pg.options(federation.Postgres)+")"); pgCode(err) != "22023" ||
+		!strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("a connection named like a schema of the catalog: %v", err)
+	}
 	if _, err := admin.Exec(context.Background(), "CREATE CONNECTION crm "+pg.options(federation.Postgres)+", read_only false)"); pgCode(err) != "22023" {
 		t.Errorf("a writable connection: %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -334,8 +335,20 @@ func (s *Server) createConnection(ctx context.Context, sess *session, me auth.Us
 	if err != nil {
 		return err
 	}
-	if s.catalogName() != "" {
-		taken = append(taken, s.catalogName())
+	if cat := s.catalogName(); cat != "" {
+		taken = append(taken, cat)
+		// DuckDB refuses a two-part name such as crm.contacts as
+		// ambiguous when crm is both a schema of the default catalog and a
+		// database.
+		schemas, err := queryStrings(ctx, sess, `SELECT schema_name FROM system.main.duckdb_schemas()
+			WHERE system.main.lower(database_name) = system.main.lower($1)`, cat)
+		if err != nil {
+			return err
+		}
+		if slices.ContainsFunc(schemas, func(n string) bool { return strings.EqualFold(n, conn.Name) }) {
+			return &federation.InvalidError{Err: fmt.Errorf("the %s catalog has a schema named %s, and a connection named so too "+
+				"would make names such as %s.contacts ambiguous; choose another name", cat, conn.Name, conn.Name)}
+		}
 	}
 	err = s.fed.Create(ctx, conn, taken)
 	if errors.Is(err, federation.ErrExists) && c.ifNotExists {
