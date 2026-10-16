@@ -78,10 +78,19 @@ psql_as() {
 }
 psql_admin() { psql_as igloo "$admin_password" "$@"; }
 
+# metric_matches PATTERN: whether a line of Igloo's metrics matches. They
+# are read whole first: grep -q closing the pipe early would fail curl, and
+# with it the pipeline.
+metric_matches() {
+  local metrics
+  metrics="$(curl -fsS "http://127.0.0.1:$http_port/metrics" 2>/dev/null)" || return 1
+  grep -q "$1" <<<"$metrics"
+}
+
 # A fresh stack runs its first maintenance pass within seconds, which would
 # compact the small files loaded below into one per table; load after it.
 deadline=$((SECONDS + 120))
-until curl -fsS "http://127.0.0.1:$http_port/metrics" 2>/dev/null | grep -q '^igloo_maintenance_passes_total{result="ok"} [1-9]'; do
+until metric_matches '^igloo_maintenance_passes_total{result="ok"} [1-9]'; do
   if [ "$SECONDS" -ge "$deadline" ]; then
     echo "no maintenance pass finished; loading anyway"
     break
@@ -204,7 +213,7 @@ echo "after table maintenance"
 echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
 compose up -d --no-build --wait igloo >/dev/null
 deadline=$((SECONDS + 180))
-until curl -fsS "http://127.0.0.1:$http_port/metrics" 2>/dev/null | grep -q '^igloo_maintenance_compacted_files_total [1-9]'; do
+until metric_matches '^igloo_maintenance_compacted_files_total [1-9]'; do
   if [ "$SECONDS" -ge "$deadline" ]; then
     fail "no table was compacted"
     break

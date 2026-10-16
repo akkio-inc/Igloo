@@ -112,7 +112,11 @@ measurements are meant for EC2:
    above: `CALL dbgen(sf = 100, children = 10, step = n)` for n = 0..9 into
    a scratch database, then `INSERT` into the Iceberg tables, so no machine
    holds a whole table in memory), and `load-media.sql` with
-   `rows=10000000000` (about 10 billion impressions).
+   `rows=10000000000` (about 10 billion impressions). Let a maintenance
+   pass compact what loading wrote before measuring, and keep maintenance
+   off during the runs (`IGLOO_MAINTENANCE=false`): a compaction in the
+   middle changes how many files, and so how many workers, a statement
+   has.
 2. **Machines.** Igloo with the Helm chart on EKS, or `deploy/single-vm` on
    one instance with workers started by `IGLOO_WORKER_COMPUTE=ec2`; workers
    and coordinator of the same type (c7g.8xlarge, then c7gn.8xlarge for its
