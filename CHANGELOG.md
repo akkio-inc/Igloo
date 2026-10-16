@@ -290,25 +290,33 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `ALTER TABLE | VIEW | MATERIALIZED VIEW | SCHEMA ... OWNER TO`, shown in
   `SHOW OBJECTS`, `igloo.tables`, `igloo.schemata` and `information_schema`.
   Owners may set their objects' comments and hand them on; ownership grants
-  no access to data.
+  no access to data. Engines' users own what they create through the
+  Iceberg REST catalog, and admins the external tables they create.
 - `COMMENT ON SCHEMA`, stored as the Iceberg namespace's `comment` property.
 - `igloo.schemata`, `igloo.tables` and `igloo.columns`: owners, comments,
   columns, rows, bytes, files, snapshots and when the data last changed,
   read from the Iceberg metadata. `information_schema.tables` gains
   `table_owner`, `comment`, `row_count`, `bytes` and `last_altered`, as in
-  Snowflake.
+  Snowflake. `igloo.tables` and `igloo.columns` also list external tables,
+  with their provider, and connections' tables, the latter to admins and
+  to whoever has a grant on them only, from a listing that never waits for
+  a remote database.
 - `igloo.lineage`, table-level lineage from the query history: edges from
   the tables and locations that `INSERT ... SELECT`, `CREATE TABLE AS`,
   `MERGE`, `UPDATE ... FROM`, `COPY INTO`, tasks, pipes and materialized
   views read to the tables they wrote, with when they were last seen and by
-  which statement or job. `igloo.table_usage` counts reads, writes and users
-  of each table over 30 days.
+  which statement or job; connections' tables are named in full, and reads
+  of external tables count as reads of the tables, never of their files.
+  `igloo.table_usage` counts reads, writes and users of each table over 30
+  days, not Delta Sharing recipients' downloads.
 - The query history records what every statement read and wrote, not only
   those of users with the role none, worked out in the background, and new
   columns `locations_read` and `job`.
 - Lineage events for OpenLineage endpoints such as Marquez and DataHub
   (`IGLOO_OPENLINEAGE_URL`), without query results, and without statements'
-  text unless `IGLOO_OPENLINEAGE_SEND_SQL` is set.
+  text unless `IGLOO_OPENLINEAGE_SEND_SQL` is set. Events go only to public
+  addresses, or private ones when allowed, checked as connected, never
+  through a proxy or a redirect.
 - Everything the catalog shows is limited to what the user may see: users
   with the role none see only the tables they have a grant on or own, which
   now also applies to `igloo_comments()`, `pg_description`, and

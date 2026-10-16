@@ -191,12 +191,17 @@ reference for every setting mentioned here.
   schemas; of the others it shows nothing, not even names. A lineage edge
   to a table they may not see shows that end unnamed, and the statement
   that made an edge shows only to those who may see it in the history.
+  Connections' tables show only to admins and to whoever has a grant that
+  covers them, whatever their role; external tables' files, under the
+  sharing proxy's secret prefix, are never recorded as locations read.
   Owning an object lets its owner set its comments and hand it on, and
   grants nothing else. Lineage events go only to the endpoint Igloo is
-  configured with (`IGLOO_OPENLINEAGE_URL`), over `https`, never to a
-  link-local address and to private ones only when allowed, without
-  following redirects, and carry no query results, nor statements' text
-  unless configured.
+  configured with (`IGLOO_OPENLINEAGE_URL`), over `https`; never to
+  link-local, reserved or cloud metadata addresses, nor IPv6 addresses
+  that carry one, and to private ones only when allowed; to the addresses
+  checked, not ones a name resolves to later; never through a proxy or a
+  redirect. They carry no query results, nor statements' text unless
+  configured.
 - **Loading and scheduled work.** `COPY INTO` loads only from the warehouse
   and `IGLOO_ALLOWED_LOCATIONS`, never the server's own directories, and is
   checked as the `INSERT ... SELECT FROM read_csv(...)` statements it runs,

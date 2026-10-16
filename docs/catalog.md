@@ -83,10 +83,23 @@ never widens anyone's access.
 Changing an owner takes what changing the object takes, the writer role
 or, for a table or view, `CREATE` on its schema, or being its owner; the
 new owner must exist. Owners follow renamed tables. Dropping an object, or
-the user or role that owns it, leaves no owner behind; objects created
-before Igloo recorded owners, or by other engines, have none until one is
-set. Owners are kept in the metadata database with the grants, and a change
-reaches other replicas within 30 seconds.
+the user or role that owns it, leaves no owner behind. Owners are kept in
+the metadata database with the grants, and a change reaches other replicas
+within 30 seconds.
+
+Who owns what Igloo did not create from a session:
+
+- Schemas and tables that engines create through Igloo's
+  [Iceberg REST catalog](external-engines.md) are owned by the engine's
+  Igloo user, and follow renames and drops made there.
+- Materialized views, and tables that tasks and pipes create, are owned
+  by the job's owner, who runs them.
+- An [external table](sharing.md#reading-partners-shares) is owned by the
+  admin who created it.
+- Connections' tables have no owner in Igloo: their own database answers
+  for them.
+- Objects created before Igloo recorded owners, or by engines that reach
+  the Iceberg catalog without Igloo, have none until one is set.
 
 Owners show in `igloo.tables` (`table_owner`, `owner_type`),
 `igloo.schemata` (`schema_owner`), `information_schema.tables`
@@ -103,6 +116,27 @@ write too. Each replica reads every table's metadata when a query first
 needs it, then again in the background every 30 seconds while queries use
 it; tables written on the replica are read again a couple of seconds after
 the write.
+
+## External tables and connections
+
+`igloo.tables` and `igloo.columns` also list
+[external tables](sharing.md#reading-partners-shares) and the tables of
+[connections](federation.md), so that search, table pages and lineage
+cover data that lives elsewhere:
+
+- An external table is in the catalog's schema it was created in, with
+  `table_type` `EXTERNAL TABLE` and its Delta Sharing provider in
+  `provider`. Its columns are its view's; Igloo keeps no size, snapshots
+  or description of it. Shares and recipients are not in the catalog: they
+  are for admins (`SHOW SHARES`, `SHOW RECIPIENTS`), and what recipients
+  download is in the query history but not counted as usage.
+- A connection's table has the connection's name as `table_catalog` and
+  `table_type` `FOREIGN`, and no owner, description, size or freshness.
+  Igloo lists them from what DuckDB read of each database when it attached
+  the connection or at `ALTER CONNECTION ... REFRESH`, so listing them
+  does not query the database. It lists them again in the background, when
+  connections change and at most once a minute, and keeps the last listing
+  while a database is down.
 
 ## Usage
 
@@ -134,7 +168,11 @@ Statements that read tables or files and write a table make edges:
 file, and the same statements run by [tasks](loading.md#tasks), the
 loads of [pipes](loading.md#pipes) and the refreshes of
 [materialized views](loading.md#materialized-views). Reading a view counts
-as reading the tables it reads. Each edge says when it was first and last
+as reading the tables it reads, and reading an external table as reading
+that table, not its files. A connection's table is named in full, with the
+connection as `upstream_database`, such as `crm.sales.customers` for
+`INSERT INTO marts.customers SELECT ... FROM crm.sales.customers`. Each
+edge says when it was first and last
 seen, how many statements made it, and the latest one: its query ID
 (`last_query_id`, which `igloo.query_history` has), user, statement type
 and the task, pipe or materialized view it ran for (`last_job`, such as
@@ -182,11 +220,16 @@ read or change:
   `igloo.tables` and the other views, in `igloo_comments()` and
   `pg_description`, or in `igloo.policy_references` and
   `igloo.tag_references`.
+- A connection's table shows, as it is read, to admins and to whoever has
+  a grant on it, its schema or its connection; the built-in roles do not
+  cover connections, so readers and writers see none without a grant.
 - An edge of the lineage between a table they may see and one they may
   not shows the latter without a name, and says nothing else about it:
   the console draws "1 hidden upstream table". An edge between two tables
   they may not see does not show. Locations show only to users who may
-  read files, the reader role and above.
+  read files, the reader role and above. External tables' files, which
+  Igloo's sharing proxy serves under a secret address, are never recorded
+  as locations.
 - Which statement or job made an edge, and who ran it, shows only to those
   who may see that statement in the query history: its user and admins.
   Everyone else who may see both tables sees that the data flows, and how
@@ -223,11 +266,18 @@ statements are jobs named after the table they wrote (`sql.lake.marts.daily_spen
 Only whoever configures Igloo chooses the endpoint; SQL cannot. Events say
 what data moved where, never the data: no query results and no values, and
 the statement's text only with `IGLOO_OPENLINEAGE_SEND_SQL`. The endpoint
-must be `https`. Requests go to private and loopback addresses only with
-`IGLOO_OPENLINEAGE_ALLOW_PRIVATE=true`, and never to link-local addresses,
-where cloud metadata services are; addresses are checked when Igloo
-connects, so a name cannot later be pointed elsewhere, and redirects are not
-followed. Requests do not go through an HTTP proxy.
+must be `https`. Requests go to private addresses (loopback, private
+networks, unique and site-local IPv6, carrier-grade NAT, benchmarking
+networks) only with `IGLOO_OPENLINEAGE_ALLOW_PRIVATE=true`, and never to
+link-local, multicast, unspecified or reserved addresses, nor to cloud
+metadata services elsewhere (`100.100.100.200`, `fd00:ec2::254`). IPv6
+addresses that carry an IPv4 one (mapped, translated, NAT64, 6to4) are
+judged by it, and those whose IPv4 address cannot be read (IPv4-compatible,
+Teredo, local-use NAT64) are refused. Igloo resolves the endpoint's name
+once per connection, refuses it if any of its addresses is refused, and
+connects to the addresses it checked, so a name cannot be pointed
+elsewhere in between. Redirects are not followed, and requests never go
+through an HTTP proxy, whatever the environment says.
 
 Events are sent in the background and tried three times. When the endpoint
 is slow or down, events are dropped rather than slowing statements down,
@@ -239,9 +289,10 @@ them. Like lineage, events need the query history on.
 | `igloo.tables` column | Meaning |
 |---|---|
 | `table_catalog`, `table_schema`, `table_name` | The table or view |
-| `table_type` | `BASE TABLE` or `VIEW` |
+| `table_type` | `BASE TABLE`, `VIEW`, `EXTERNAL TABLE` or, for a connection's table, `FOREIGN` |
 | `table_owner`, `owner_type` | Its owner and whether that is a `user` or `role`; `NULL` without one |
 | `comment` | Its description |
+| `provider` | For an external table, the Delta Sharing provider it reads |
 | `row_count`, `bytes`, `file_count` | Of its current snapshot, for tables |
 | `snapshot_count` | Snapshots time travel can read, for tables |
 | `last_altered` | When its data last changed, or a view was last replaced |
@@ -257,10 +308,15 @@ them. Like lineage, events need the query history on.
 `comment`, `row_count`, `bytes` and `last_altered`, as in Snowflake, and
 its `TABLE_COMMENT` is filled in for Iceberg tables;
 `information_schema.schemata` has the real `schema_owner` and `comment`.
+Their own columns, rows and table types are DuckDB's, connections'
+catalogs included, so tools that list tables through them, such as Flight
+SQL clients' `GetTables`, see what they did before.
 
-`SHOW OBJECTS [IN SCHEMA name]` lists schemas, tables and views with
-`schema_name`, `name`, `kind`, `owner`, `owner_type`, `comment`,
-`row_count`, `bytes` and `last_altered`.
+`SHOW OBJECTS [IN SCHEMA name]` lists the catalog's schemas, tables, views
+and external tables (`kind` `EXTERNAL TABLE`) with `schema_name`, `name`,
+`kind`, `owner`, `owner_type`, `comment`, `row_count`, `bytes` and
+`last_altered`; connections' tables, which are not in the catalog's
+schemas, show in `igloo.tables` only.
 
 ## Cost
 

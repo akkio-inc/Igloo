@@ -618,6 +618,9 @@ expect_soon "and their sign-ins in the login history" "t|t|t" igloo "$admin_pass
   "SELECT bool_or(user_name = 'ivy' AND result = 'failure'), bool_or(user_name = 'ian' AND result = 'success'),
      bool_or(user_name = 'etl_bot' AND result = 'success' AND token_name = 'rest')
    FROM igloo.login_history WHERE application_name = 'iceberg rest'"
+expect_soon "tables an engine creates are owned by its user" "ice_created|walt
+ice_staged|walt" igloo "$admin_password" \
+  "SELECT table_name, table_owner FROM igloo.tables WHERE table_name IN ('ice_created', 'ice_staged') ORDER BY 1"
 
 echo "data catalog and lineage"
 # walt builds a small mart; cleo, whose role is none, may read one table of
@@ -693,14 +696,14 @@ if grep -q '"name":"daily"' <<<"$got" && ! grep -qi "raw_spend\|profit\|margin" 
 else
   fail "console search: $got"
 fi
-got="$(curl -sS -b "$work/cleo.cookies" "$console/api/catalog/object?schema=mart&name=daily")"
+got="$(curl -sS -b "$work/cleo.cookies" "$console/api/catalog/object?catalog=lake&schema=mart&name=daily")"
 if grep -q '"label":"1 hidden upstream table"' <<<"$got" && grep -q '"label":"1 hidden downstream table"' <<<"$got" &&
   grep -q '"can_comment":true' <<<"$got" && ! grep -qi "raw_spend\|profit\|margin" <<<"$got"; then
   pass "a console table page counts hidden tables, never names them"
 else
   fail "console table page: $got"
 fi
-code="$(curl -s -o /dev/null -w '%{http_code}' -b "$work/cleo.cookies" "$console/api/catalog/object?schema=mart&name=secret_margin")"
+code="$(curl -s -o /dev/null -w '%{http_code}' -b "$work/cleo.cookies" "$console/api/catalog/object?catalog=lake&schema=mart&name=secret_margin")"
 if [ "$code" = 404 ]; then pass "a table one may not see has no page"; else fail "console page of a hidden table: $code"; fi
 got="$(curl -sS -b "$work/cleo.cookies" -H 'Content-Type: application/json' -H "X-CSRF-Token: $cleo_csrf" \
   -d '{"kind":"column","schema":"mart","name":"daily","column":"day","comment":"The day spent"}' "$console/api/catalog/comment")"
@@ -708,7 +711,7 @@ if grep -q '"tag":"COMMENT"' <<<"$got"; then pass "an owner describes a column i
 expect "the console's comment is the column's" "The day spent" igloo "$admin_password" \
   "SELECT comment FROM igloo.columns WHERE table_schema = 'mart' AND table_name = 'daily' AND column_name = 'day'"
 login="$(console_post /api/login '{"user":"walt","password":"walt-password-1"}')"
-got="$(curl -sS -b "$jar" "$console/api/catalog/object?schema=mart&name=profit")"
+got="$(curl -sS -b "$jar" "$console/api/catalog/object?catalog=lake&schema=mart&name=profit")"
 if grep -q '"label":"mart.secret_margin"' <<<"$got" && grep -q '"label":"mart.daily"' <<<"$got"; then
   pass "a writer's table page draws the whole lineage"
 else
@@ -868,6 +871,13 @@ expect "readers query it by every name" "30|652.50|30" rita rita-password-1 \
 expect_error "a user with role none needs a grant" 42501 nora nora-password-1 "SELECT count(*) FROM partners.spend"
 psql_admin -c "GRANT SELECT ON TABLE partners.spend TO nora" >/dev/null
 expect "and reads it with one" "30" nora nora-password-1 "SELECT count(*) FROM partners.spend"
+expect "the catalog lists it, with its provider and creator" "lake|EXTERNAL TABLE|self|igloo|3" nora nora-password-1 \
+  "SELECT table_catalog, table_type, provider, table_owner,
+     (SELECT count(*) FROM igloo.columns WHERE table_schema = 'partners' AND table_name = 'spend')
+   FROM igloo.tables WHERE table_schema = 'partners' AND table_name = 'spend'"
+psql_admin -c "CREATE TABLE partners.spend_by_client AS SELECT client, sum(spend) AS spend FROM partners.spend GROUP BY 1" >/dev/null
+expect_soon "its lineage" "TABLE|partners|spend" igloo "$admin_password" \
+  "SELECT upstream_type, upstream_schema, upstream_name FROM igloo.lineage WHERE downstream_name = 'spend_by_client'"
 expect_error "but not with a table not granted" 42501 nora nora-password-1 \
   "SELECT count(*) FROM partners.spend, (SELECT max(n) FROM lake.public.contended)"
 # The view's SQL, which anyone can list, names the proxy's file URLs.
@@ -876,6 +886,13 @@ proxy_url="$(psql_as nora nora-password-1 -c "SELECT regexp_extract(sql, '(http:
 if [[ "$proxy_url" == http://127.0.0.1:* ]]; then pass "the external table's view lists proxy URLs"; else fail "proxy URL: $proxy_url"; fi
 expect_error "which users with role none cannot read directly" 42501 nora nora-password-1 \
   "SELECT count(*) FROM read_parquet('$proxy_url')"
+psql_admin -c "CREATE TABLE partners.spend_files AS SELECT * FROM read_parquet('$proxy_url')" >/dev/null
+expect_soon "the history keeps the proxy's URLs out of the locations read" "lake.partners.spend_files|t" igloo "$admin_password" \
+  "SELECT tables_written[1], locations_read IS NULL FROM igloo.query_history
+   WHERE query_text LIKE 'CREATE TABLE partners.spend_files%' AND outcome = 'ok'"
+expect "and out of the lineage" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM igloo.lineage WHERE upstream_name LIKE '%127.0.0.1%'"
+psql_admin -c "DROP TABLE partners.spend_files" -c "DROP TABLE partners.spend_by_client" >/dev/null
 psql_admin -c "INSERT INTO shared_spend VALUES (100, 'client_9', 10.00)" >/dev/null
 expect_soon "the external table follows new versions" "31" rita rita-password-1 "SELECT count(*) FROM partners.spend"
 psql_admin -c "DELETE FROM shared_spend WHERE id < 10" >/dev/null
@@ -1414,6 +1431,16 @@ expect_error "a PIVOT reading a connection's data while preparing" 42501 nora no
   "PIVOT crmdb.sales.customers ON region USING count(*)"
 expect_soon "the history names what was read from connections" '["lake.public.e2e","crmdb.sales.customers"]' igloo "$admin_password" \
   "SELECT tables_read FROM igloo.query_history WHERE user_name = 'nora' AND query_text LIKE '%JOIN crmdb.sales.customers%' AND outcome = 'ok' LIMIT 1"
+expect "the catalog lists a connection's tables to those who may read them" "crmdb|sales|customers|FOREIGN|3" nora nora-password-1 \
+  "SELECT table_catalog, table_schema, table_name, table_type,
+     (SELECT count(*) FROM igloo.columns WHERE table_catalog = 'crmdb' AND table_name = 'customers')
+   FROM igloo.tables WHERE table_catalog = 'crmdb'"
+psql_admin -c "CREATE TABLE e2e_regions AS SELECT region, count(*) AS customers FROM crmdb.sales.customers GROUP BY 1" >/dev/null
+expect_soon "lineage names a connection's tables in full" "crmdb|sales|customers" igloo "$admin_password" \
+  "SELECT upstream_database, upstream_schema, upstream_name FROM igloo.lineage WHERE downstream_name = 'e2e_regions'"
+expect "and leaves them unnamed to readers without a grant on them" "0|1" rita rita-password-1 \
+  "SELECT (SELECT count(*) FROM igloo.tables WHERE table_catalog = 'crmdb'),
+     (SELECT count(*) FROM igloo.lineage WHERE downstream_name = 'e2e_regions' AND upstream_name IS NULL)"
 expect "connection passwords are never recorded" "0" igloo "$admin_password" \
   "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '%$crm_password%' OR query_text LIKE '%$ops_password%'"
 if compose logs igloo 2>&1 | grep -q -e "$crm_password" -e "$ops_password"; then fail "a connection password is in the logs"; else pass "nor logged"; fi
@@ -1426,6 +1453,8 @@ expect "and the connection keeps working" "1000" igloo "$admin_password" "SELECT
 docker stop -t 1 "$project-crm" >/dev/null
 expect "with a database down, catalogs still list its tables" "2" nora nora-password-1 \
   "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'crmdb' AND table_schema = 'sales'"
+expect "and so does the data catalog" "2|t" igloo "$admin_password" \
+  "SELECT (SELECT count(*) FROM igloo.tables WHERE table_catalog = 'crmdb'), (SELECT count(*) > 0 FROM igloo.lineage)"
 expect "and everything else works" "3|3" rita rita-password-1 \
   "SELECT (SELECT count(*) FROM e2e), (SELECT count(*) FROM ops.ops.campaigns)"
 start=$SECONDS

@@ -211,7 +211,10 @@ SHOW GRANTS ON CONNECTION crm;
   refuses grants that name either. Rename one on the database, or connect
   with a database user that sees only one.
 - Table and column names and types of a connection's tables are visible to
-  every user, through the system catalogs, as Iceberg tables' are.
+  every user, through the system catalogs, as Iceberg tables' are. The
+  [data catalog](catalog.md#external-tables-and-connections) (`igloo.tables`,
+  its lineage and usage, the console's catalog) shows a connection's
+  tables only to admins and to those with a grant that covers them.
 
 How the check works: whenever connections are attached, Igloo has DuckDB
 plan every statement of a user who is not an admin. DuckDB's plan shows each

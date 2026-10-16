@@ -247,7 +247,10 @@ External tables are read-only. Query them by any name, `lake.partners.t` or
 `partners.t` (or `t` in `public`); SQL clients list them as views of the
 database `memory`, where each replica keeps them. Grants work as for any
 table, and users with role `none` need `SELECT` on an external table to
-read it.
+read it. The [data catalog](catalog.md#external-tables-and-connections)
+lists them as `EXTERNAL TABLE`s with their provider, owned by the admin
+who created them, and its lineage records statements that read them;
+shares and recipients stay out of it.
 
 Each statement that names an external table reads the shared table's
 current version: Igloo asks the provider for the version at most every 15

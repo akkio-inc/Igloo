@@ -164,9 +164,9 @@ the official TPC-H answers.
 - **[Data catalog](docs/catalog.md)**: search tables by name, description,
   column, tag and owner; owners and descriptions of schemas, tables and
   columns; size and freshness from the Iceberg metadata; usage and
-  table-level lineage worked out from the query history, also sent to
-  OpenLineage tools such as Marquez and DataHub. Each user sees only the
-  tables they may read.
+  table-level lineage worked out from the query history, external tables
+  and connections' tables included, also sent to OpenLineage tools such as
+  Marquez and DataHub. Each user sees only the tables they may read.
 
   ```sql
   COMMENT ON TABLE marts.daily_spend IS 'Spend per client, campaign and day';

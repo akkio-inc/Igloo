@@ -57,6 +57,13 @@ with connect(*admin) as conn, conn.cursor() as cur:
     columns = [c["column_name"] for cat in objects for s in cat["catalog_db_schemas"] or []
                for t in s["db_schema_tables"] or [] for c in t["table_columns"] or []]
     assert "l_extendedprice" in columns and len(columns) == 16, columns
+    # information_schema, which Igloo serves with the catalog's owners and
+    # comments, lists tables with DuckDB's catalogs and table types.
+    tables = [(cat["catalog_name"], t["table_name"], t["table_type"]) for cat in objects
+              for s in cat["catalog_db_schemas"] or [] for t in s["db_schema_tables"] or []]
+    cur.execute("SELECT current_database()")
+    assert tables == [(cur.fetchone()[0], "lineitem", "TABLE")], tables
+    assert sorted(conn.adbc_get_table_types()) == ["LOCAL TEMPORARY", "TABLE", "VIEW"], conn.adbc_get_table_types()
     assert conn.adbc_get_info()["vendor_name"] == "Igloo"
     print("  ADBC: catalog metadata")
 

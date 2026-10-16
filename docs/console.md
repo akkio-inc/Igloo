@@ -39,8 +39,10 @@ the table, and Catalog page its page in the catalog.
 
 **Catalog.** Search over the names, descriptions, columns, column
 descriptions, tags and owners of every table and view the signed-in user
-may see, most used first (see [the data catalog](catalog.md)). Each table
-and view has a page, which can be linked to (`#/catalog/schema/name`): its
+may see, external tables and connections' tables included, most used first
+(see [the data catalog](catalog.md)). Each has a page, which can be linked
+to (`#/catalog/catalog/schema/name`, the catalog being the Iceberg
+catalog's or a connection's name): its
 description, owner, size and freshness, reads, writes and users of the last
 30 days, its columns with their descriptions, tags and masking policies, a
 sample of its rows as the user sees them, and its lineage, drawn as a graph

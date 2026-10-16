@@ -81,7 +81,8 @@ Engines load a table before writing to it, so writing needs `SELECT` as well.
 Loading a table that does not exist answers 404 whatever the user's grants,
 since engines check that way before `CREATE TABLE AS`; table names are no
 secret in Igloo, where SQL clients see every table's name. Dropping a table
-drops its grants, and renaming one moves them, as in SQL.
+drops its grants, and renaming one moves them, as in SQL. The engine's user
+[owns](catalog.md#owners) the schemas and tables it creates, as in SQL.
 
 Only admins may choose a table's or a schema's location, move a table to
 another location or change its UUID (otherwise every table gets a new
