@@ -132,7 +132,7 @@ services:
       retries: 30
 
   create-bucket:
-    image: curlimages/curl:8.16.0
+    image: curlimages/curl:8.22.0
     profiles: ["local-storage"]
     entrypoint: ["sh", "-c"]
     command:
