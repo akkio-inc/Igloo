@@ -67,7 +67,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   driver (pandas, polars), pyarrow and the Flight SQL JDBC driver. Pulling 3
   million TPC-H lineitem rows into Python is 29 times faster than with
   psycopg as Arrow, and 14 times faster as a pandas DataFrame
-  (`bench/extract.py`). Users sign in with their Igloo password; statements
+  (`bench/extract.py`). Users sign in with their Igloo password or an access
+  token, sent in the handshake or as each call's bearer token; statements
   go through the same authorization, statement timeout and query history as
   SQL clients. Without TLS it serves only clients at localhost. The Compose
   stack publishes it on loopback, the Helm chart on the SQL Service

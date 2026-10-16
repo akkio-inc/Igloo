@@ -1,7 +1,8 @@
 """Checks Igloo's Arrow Flight SQL endpoint through the ADBC Flight SQL
 driver (with pandas and polars) and through pyarrow.flight directly.
 Expects the TPC-H tables at scale factor 0.1. Run from scripts/e2e.sh,
-which sets FLIGHT_URI and the users' passwords."""
+which sets FLIGHT_URI, the users' passwords and FLIGHT_TOKEN, an access
+token of the service account etl_bot."""
 
 import os
 
@@ -99,6 +100,27 @@ table = client.do_get(info.endpoints[0].ticket, options).read_all()
 assert table.num_rows > 0 and table.schema.names == ["l_orderkey", "l_partkey"], table.schema
 client.close()
 print("  pyarrow.flight: query")
+
+# A service account signs in with an access token: as the password, or as
+# the bearer token of each call without a handshake.
+token = os.environ["FLIGHT_TOKEN"]
+with connect("etl_bot", token) as conn, conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM region")
+    assert cur.fetchone()[0] == 5
+    try:
+        cur.execute("CREATE TOKEN more")
+        cur.fetchall()
+        raise AssertionError("a token's session created a token")
+    except adbc_driver_manager.Error as e:
+        assert "SQLSTATE 42501" in str(e), e
+print("  ADBC: a service account's access token as the password")
+client = flight.connect(uri)
+options = flight.FlightCallOptions(headers=[(b"authorization", b"Bearer " + token.encode())])
+info = client.get_flight_info(flight.FlightDescriptor.for_command(any_command(
+    "CommandStatementQuery", "SELECT count(*) AS n FROM region")), options)
+assert client.do_get(info.endpoints[0].ticket, options).read_all().column("n")[0].as_py() == 5
+client.close()
+print("  pyarrow.flight: an access token as the bearer token")
 
 # The client names Igloo as another machine: without TLS, Igloo refuses to
 # sign it in.

@@ -244,11 +244,12 @@ echo "Arrow Flight SQL"
 # The clients run on this machine's network and reach the published
 # loopback port: without TLS, Igloo serves only clients that connect to it
 # as localhost.
+flight_token="$(token_of "$(psql_admin -c "CREATE TOKEN flight FOR USER etl_bot EXPIRES '1d'")")"
 if docker run --rm --network host -e FLIGHT_URI="grpc://127.0.0.1:$flight_port" -e IGLOO_ADMIN_PASSWORD="$admin_password" \
-  -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+  -e FLIGHT_TOKEN="$flight_token" -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
     pip install -q adbc-driver-flightsql==1.12.0 adbc-driver-manager==1.12.0 pyarrow==26.0.0 pandas==3.0.6 \
       polars==1.44.2 >/dev/null 2>&1 && python /clients/flight_test.py" >"$work/flight.out" 2>&1; then
-  pass "ADBC with pandas and polars, and pyarrow.flight"
+  pass "ADBC with pandas and polars, pyarrow.flight, and access tokens"
 else
   fail "Flight SQL from Python: $(tail -5 "$work/flight.out")"
 fi

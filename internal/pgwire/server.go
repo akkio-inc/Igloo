@@ -282,8 +282,10 @@ type session struct {
 	// how its statements resolve names.
 	settingGen uint64
 	// tokenID and tokenName identify the Igloo access token the session
-	// signed in with, if any: the session ends when the token is revoked.
+	// signed in with, if any: the session ends when the token is revoked
+	// or, at tokenExpires, expires.
 	tokenID, tokenName string
+	tokenExpires       time.Time
 	// method is how the session signed in: one of audit's Method
 	// constants, or empty for the console's sessions.
 	method string
@@ -407,20 +409,23 @@ func (sess *session) release(ps *wire.PreparedStatement) error {
 }
 
 // refreshUser re-reads the session's user when the cached role is stale, so
-// role changes, disabled and dropped users and revoked access tokens take
-// effect on open connections.
+// role changes, disabled and dropped users and revoked or expired access
+// tokens take effect on open connections.
 func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, error) {
 	sess.mu.Lock()
 	user, fresh := sess.user, time.Since(sess.checked) < s.roleRefresh
 	sess.mu.Unlock()
-	if fresh {
-		return user, nil
-	}
-
 	ended := func(format string, args ...any) (auth.User, error) {
 		return user, pgerror.WithSeverity(pgerror.WithCode(
 			fmt.Errorf(format, args...), codes.InvalidAuthorizationSpecification), pgerror.LevelFatal)
 	}
+	if !sess.tokenExpires.IsZero() && !time.Now().Before(sess.tokenExpires) {
+		return ended("the access token %q this session signed in with expired", sess.tokenName)
+	}
+	if fresh {
+		return user, nil
+	}
+
 	latest, err := s.users.Get(ctx, user.Name)
 	if errors.Is(err, auth.ErrNotFound) {
 		return ended("user %q no longer exists", user.Name)

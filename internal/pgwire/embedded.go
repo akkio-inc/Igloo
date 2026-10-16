@@ -104,6 +104,34 @@ func (s *Server) AuthenticateClient(ctx context.Context, name, password string, 
 	return user, nil
 }
 
+// AuthenticateToken checks an Igloo access token, for clients that send one
+// instead of a password, as Arrow Flight SQL clients do. name, when not
+// empty, is the user the client named, who must own the token. The login is
+// logged, counted and recorded as a SQL login with a token is; pass the
+// token to OpenEmbeddedToken. Tokens cannot be guessed, so they sign in even
+// while failed logins block the user's passwords.
+func (s *Server) AuthenticateToken(ctx context.Context, name, secret string, addr net.Addr, client string) (auth.User, auth.Token, error) {
+	how := login{method: audit.MethodToken, attrs: []any{"client", client}}
+	if s.tokenChecker == nil {
+		s.loginRejected(name, addr, nil, "access tokens are not available", how)
+		return auth.User{}, auth.Token{}, ErrLoginFailed
+	}
+	user, token, err := s.tokenChecker.Verify(ctx, secret)
+	if err == nil && name != "" && user.Name != name {
+		err = fmt.Errorf("%w: the token is another user's", auth.ErrInvalidToken)
+	}
+	if errors.Is(err, auth.ErrInvalidToken) {
+		s.loginRejected(name, addr, err, "invalid access token", how)
+		return auth.User{}, auth.Token{}, ErrLoginFailed
+	}
+	if err != nil {
+		return auth.User{}, auth.Token{}, fmt.Errorf("check access token: %w", err)
+	}
+	how.token = token.Name
+	s.loginSucceeded(user, addr, how)
+	return user, token, nil
+}
+
 // SignedIn counts, logs and records a sign-in to the web console that used
 // no password, such as single sign-on; method is one of audit's.
 func (s *Server) SignedIn(user auth.User, addr net.Addr, method string) {
@@ -143,6 +171,19 @@ type EmbeddedSession struct {
 // connection, counts against MaxConnections and can be canceled; Close
 // ends it.
 func (s *Server) OpenEmbedded(ctx context.Context, user auth.User, client string) (*EmbeddedSession, error) {
+	return s.openEmbedded(ctx, user, nil, client)
+}
+
+// OpenEmbeddedToken is OpenEmbedded for a user who signed in with token, as
+// AuthenticateToken returned it. The session acts on the token's authority,
+// as a SQL session that signed in with it does: it cannot mint its user a
+// longer-lived credential, and it ends when the token is revoked or
+// expires.
+func (s *Server) OpenEmbeddedToken(ctx context.Context, user auth.User, token auth.Token, client string) (*EmbeddedSession, error) {
+	return s.openEmbedded(ctx, user, &token, client)
+}
+
+func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.Token, client string) (*EmbeddedSession, error) {
 	if !s.acquireConn() {
 		s.log.Warn("connection refused: too many sessions", "user", user.Name, "max", s.maxConns, "client", client)
 		return nil, pgerror.WithCode(errors.New("sorry, too many clients already"), codes.TooManyConnections)
@@ -154,6 +195,10 @@ func (s *Server) OpenEmbedded(ctx context.Context, user auth.User, client string
 		activity: s.activity,
 		open:     make(map[*wire.PreparedStatement]*statement),
 		client:   client,
+	}
+	if token != nil {
+		sess.method = audit.MethodToken
+		sess.tokenID, sess.tokenName, sess.tokenExpires = token.ID, token.Name, token.ExpiresAt
 	}
 	ctx = context.WithValue(ctx, sessionKey{}, sess)
 	// Registers the session, so it is listed and can be canceled.

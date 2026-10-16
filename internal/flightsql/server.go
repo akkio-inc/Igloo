@@ -31,16 +31,8 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 
-	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/pgwire"
 )
-
-// TokenAuthenticator checks bearer tokens that Igloo issued some other way
-// than a Flight handshake, such as personal access tokens, which clients
-// send on every call instead of signing in.
-type TokenAuthenticator interface {
-	AuthenticateToken(ctx context.Context, token string, addr net.Addr) (auth.User, error)
-}
 
 // Options configure the server.
 type Options struct {
@@ -49,9 +41,6 @@ type Options struct {
 	// TLS, when set, encrypts every connection. Without it the server
 	// serves only clients that connect to it as localhost.
 	TLS *tls.Config
-	// Tokens, if set, accepts bearer tokens other than the ones a
-	// handshake returns.
-	Tokens TokenAuthenticator
 	// Version is Igloo's version, which clients read in SqlInfo.
 	Version string
 	Log     *slog.Logger
@@ -59,11 +48,10 @@ type Options struct {
 
 // Server is an Arrow Flight SQL front end for the SQL server.
 type Server struct {
-	sql    *pgwire.Server
-	grpc   *grpc.Server
-	tls    bool
-	tokens TokenAuthenticator
-	log    *slog.Logger
+	sql  *pgwire.Server
+	grpc *grpc.Server
+	tls  bool
+	log  *slog.Logger
 	// sessions counts sessions that are open or closing.
 	sessions sync.WaitGroup
 }
@@ -76,7 +64,7 @@ func New(opts Options) (*Server, error) {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
-	s := &Server{sql: opts.SQL, tls: opts.TLS != nil, tokens: opts.Tokens, log: opts.Log.With("component", "flight sql")}
+	s := &Server{sql: opts.SQL, tls: opts.TLS != nil, log: opts.Log.With("component", "flight sql")}
 
 	h := &handler{s: s}
 	if err := h.registerSqlInfo(opts.Version); err != nil {

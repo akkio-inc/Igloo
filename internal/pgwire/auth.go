@@ -185,7 +185,7 @@ func (s *Server) loginAccepted(ctx context.Context, writer *buffer.Writer, user 
 	}
 	sess.method = how.method
 	if token != nil {
-		sess.tokenID, sess.tokenName = token.ID, token.Name
+		sess.tokenID, sess.tokenName, sess.tokenExpires = token.ID, token.Name, token.ExpiresAt
 		s.tokenChecker.Used(token.ID)
 	}
 	s.loginSucceededSession(user, addr, sess, how)

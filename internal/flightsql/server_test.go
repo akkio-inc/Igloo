@@ -8,13 +8,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"errors"
 	"io"
 	"log/slog"
 	"math/big"
 	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +22,7 @@ import (
 	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	pgcodes "github.com/jeroenrinzema/psql-wire/codes"
+	"github.com/xdg-go/scram"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -38,110 +37,48 @@ import (
 	"github.com/akkio-inc/igloo/internal/pgwire"
 )
 
-// store is a writable in-memory user store.
-type store struct {
-	mu    sync.Mutex
-	users map[string]auth.User
-}
-
-func (s *store) Get(_ context.Context, name string) (auth.User, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.users[name]
-	if !ok {
-		return auth.User{}, auth.ErrNotFound
-	}
-	return u, nil
-}
-
-func (s *store) List(context.Context) ([]auth.User, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []auth.User
-	for _, u := range s.users {
-		out = append(out, u)
-	}
-	return out, nil
-}
-
-func (s *store) Create(_ context.Context, u auth.User) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.users[u.Name]; ok {
-		return auth.ErrExists
-	}
-	s.users[u.Name] = u
-	return nil
-}
-
-func (s *store) update(name string, f func(*auth.User)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.users[name]
-	if !ok {
-		return auth.ErrNotFound
-	}
-	f(&u)
-	s.users[name] = u
-	return nil
-}
-
-func (s *store) SetVerifier(_ context.Context, name, v string) error {
-	return s.update(name, func(u *auth.User) { u.Verifier = v })
-}
-
-func (s *store) SetRole(_ context.Context, name string, r auth.Role) error {
-	return s.update(name, func(u *auth.User) { u.Role = r })
-}
-
-func (s *store) Delete(_ context.Context, name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.users, name)
-	return nil
-}
-
-func (s *store) EnsureAdmin(context.Context, string, string) (bool, error) { return false, nil }
-func (s *store) MockSecret(context.Context) ([]byte, error)                { return []byte("mock"), nil }
-func (s *store) Ping(context.Context) error                                { return nil }
-func (s *store) Close()                                                    {}
-
-func (s *store) add(t *testing.T, name, password string, role auth.Role) {
+// addUser creates name, with the password "<name>-password".
+func addUser(t *testing.T, users *auth.MemoryDirectory, name string, role auth.Role) {
 	t.Helper()
-	v, err := auth.NewVerifier(password)
+	v, err := auth.NewVerifier(name + "-password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.users[name] = auth.User{Name: name, Role: role, Verifier: v, CreatedAt: time.Now()}
+	if err := users.Create(context.Background(), auth.User{Name: name, Role: role, Verifier: v}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 type testServer struct {
 	addr    string
-	users   *store
+	users   *auth.MemoryDirectory
 	history *audit.MemoryStore
 	sql     *pgwire.Server
 }
 
 // startServer serves Flight SQL on a loopback port, without TLS unless
 // opts sets it, for users igloo (admin), walt (writer) and rita (reader),
-// each with the password "<name>-password".
-func startServer(t *testing.T, opts Options) *testServer {
+// each with the password "<name>-password". sqlOpts change the SQL
+// server's options.
+func startServer(t *testing.T, opts Options, sqlOpts ...func(*pgwire.Options)) *testServer {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	eng, err := engine.Open(context.Background(), config.Config{}, log)
 	if err != nil {
 		t.Fatal(err)
 	}
-	users := &store{users: map[string]auth.User{}}
-	users.add(t, "igloo", "igloo-password", auth.RoleAdmin)
-	users.add(t, "walt", "walt-password", auth.RoleWriter)
-	users.add(t, "rita", "rita-password", auth.RoleReader)
+	users := auth.NewMemoryDirectory()
+	addUser(t, users, "igloo", auth.RoleAdmin)
+	addUser(t, users, "walt", auth.RoleWriter)
+	addUser(t, users, "rita", auth.RoleReader)
 	history := audit.NewMemoryStore(1000, 1000)
 	hlog := audit.New(history, audit.Options{}, log)
 	eng.SetHistory(hlog, pgwire.HistoryViewer)
-	sql, err := pgwire.New(eng, pgwire.Options{Users: users, Audit: hlog}, log)
+	so := pgwire.Options{Users: users, Audit: hlog}
+	for _, f := range sqlOpts {
+		f(&so)
+	}
+	sql, err := pgwire.New(eng, so, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,34 +687,116 @@ func selfSigned(t *testing.T) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
 }
 
-// tokens accepts one personal access token, for rita.
-type tokens struct{ users *store }
-
-func (tk tokens) AuthenticateToken(ctx context.Context, token string, _ net.Addr) (auth.User, error) {
-	if token != "igloo_pat_rita" {
-		return auth.User{}, errors.New("unknown token")
+// run runs a query and fetches its result, returning the error of either.
+func run(ctx context.Context, cl *fsql.Client, sql string) error {
+	info, err := cl.Execute(ctx, sql)
+	if err != nil {
+		return err
 	}
-	return tk.users.Get(ctx, "rita")
+	_, _, err = fetch(ctx, cl, info)
+	return err
 }
 
-func TestTokensWithoutHandshake(t *testing.T) {
-	users := &store{users: map[string]auth.User{}}
-	ts := startServer(t, Options{Tokens: tokens{users}})
-	users.users = ts.users.users
+// bearer is ctx carrying token as the bearer token, without a handshake.
+func bearer(token string) context.Context {
+	return metadata.AppendToOutgoingContext(context.Background(), "authorization", "Bearer "+token)
+}
 
-	cl := ts.client(t)
-	ctx := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Bearer igloo_pat_rita")
-	update(t, ctx, cl, "SET statement_timeout = '1min'")
-	// The token's session lasts as long as the connection.
-	if _, rows := query(t, ctx, cl, "SHOW statement_timeout"); rows[0][0] != "1min" {
+func TestAccessTokens(t *testing.T) {
+	ts := startServer(t, Options{}, func(o *pgwire.Options) { o.RoleRefresh = time.Millisecond })
+	cl, ctx := ts.signIn(t, "rita")
+	_, rows := query(t, ctx, cl, "CREATE TOKEN flight")
+	if len(rows) != 1 || !auth.LooksLikeToken(rows[0][2]) {
+		t.Fatalf("CREATE TOKEN returned %v", rows)
+	}
+	token := rows[0][2]
+
+	// As the bearer token, without a handshake: the session lasts as long
+	// as the connection.
+	tc, tctx := ts.client(t), bearer(token)
+	update(t, tctx, tc, "SET statement_timeout = '1min'")
+	if _, rows := query(t, tctx, tc, "SHOW statement_timeout"); rows[0][0] != "1min" {
 		t.Errorf("session with a token: %v", rows)
 	}
-	_, err := cl.ExecuteUpdate(ctx, "CREATE TABLE t (i INTEGER)")
+	_, err := tc.ExecuteUpdate(tctx, "CREATE TABLE t (i INTEGER)")
 	wantCode(t, "token user's role", err, codes.PermissionDenied, "42501")
+	// Its session acts on the token's authority, which it cannot renew.
+	err = run(tctx, tc, "CREATE TOKEN renewed")
+	wantCode(t, "bearer session creates a token", err, codes.PermissionDenied, "signed in with an access token")
+	_, err = tc.ExecuteUpdate(tctx, "ALTER USER rita PASSWORD 'a-long-new-password'")
+	wantCode(t, "bearer session sets a password", err, codes.PermissionDenied, "42501")
 
-	bad := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Bearer igloo_pat_eve")
-	_, err = cl.Execute(bad, "SELECT 1")
-	wantCode(t, "unknown token", err, codes.Unauthenticated, "no session")
+	// In place of the password in a handshake.
+	hc := ts.client(t)
+	hctx, err := hc.Client.AuthenticateBasicToken(context.Background(), "rita", token)
+	if err != nil {
+		t.Fatalf("handshake with a token: %v", err)
+	}
+	query(t, hctx, hc, "SELECT 1")
+	err = run(hctx, hc, "CREATE TOKEN renewed")
+	wantCode(t, "handshake session creates a token", err, codes.PermissionDenied, "signed in with an access token")
+	_, err = ts.client(t).Client.AuthenticateBasicToken(context.Background(), "walt", token)
+	wantCode(t, "another user's token", err, codes.Unauthenticated, "password authentication failed")
+
+	unknown, _, _, err := auth.NewToken("rita", "unknown", "rita", time.Now().Add(time.Hour), scram.KeyFactors{Salt: "c2FsdA==", Iters: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ts.client(t).Execute(bearer(unknown), "SELECT 1")
+	wantCode(t, "wrong token", err, codes.Unauthenticated, "invalid access token")
+	_, err = ts.client(t).Execute(bearer("not-a-token"), "SELECT 1")
+	wantCode(t, "not a token", err, codes.Unauthenticated, "no session")
+
+	// Token sign-ins are in the login history, as for SQL clients.
+	logins, err := ts.history.Logins(context.Background(), audit.Viewer{All: true}, audit.Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ok, failed int
+	for _, l := range logins {
+		switch {
+		case l.Method == audit.MethodToken && l.Result == "success" && l.Token == "flight":
+			ok++
+		case l.Method == audit.MethodToken && l.Result != "success":
+			failed++
+		}
+	}
+	if ok != 2 || failed != 2 {
+		t.Errorf("login history has %d token sign-ins and %d failed ones, want 2 and 2: %+v", ok, failed, logins)
+	}
+
+	// Revoking the token ends its sessions and refuses it from then on.
+	update(t, ctx, cl, "DROP TOKEN flight")
+	err = run(tctx, tc, "SELECT 1")
+	wantCode(t, "bearer session after DROP TOKEN", err, codes.Unauthenticated, "revoked")
+	err = run(hctx, hc, "SELECT 1")
+	wantCode(t, "handshake session after DROP TOKEN", err, codes.Unauthenticated, "revoked")
+	_, err = ts.client(t).Execute(bearer(token), "SELECT 1")
+	wantCode(t, "revoked token", err, codes.Unauthenticated, "invalid access token")
+	query(t, ctx, cl, "SELECT 1") // the password's session goes on
+}
+
+func TestServiceAccounts(t *testing.T) {
+	ts := startServer(t, Options{})
+	cl, ctx := ts.signIn(t, "igloo")
+	update(t, ctx, cl, "CREATE USER etl TYPE SERVICE ROLE reader")
+	_, rows := query(t, ctx, cl, "CREATE TOKEN nightly FOR USER etl")
+	token := rows[0][2]
+
+	sc := ts.client(t)
+	sctx, err := sc.Client.AuthenticateBasicToken(context.Background(), "etl", token)
+	if err != nil {
+		t.Fatalf("service account's handshake: %v", err)
+	}
+	query(t, sctx, sc, "SELECT 1")
+	query(t, bearer(token), ts.client(t), "SELECT 1")
+	// A service account has no password to sign in with.
+	_, err = ts.client(t).Client.AuthenticateBasicToken(context.Background(), "etl", "etl-password")
+	wantCode(t, "service account's password", err, codes.Unauthenticated, "password authentication failed")
+
+	update(t, ctx, cl, "ALTER USER etl NOLOGIN")
+	_, err = ts.client(t).Execute(bearer(token), "SELECT 1")
+	wantCode(t, "disabled service account", err, codes.Unauthenticated, "invalid access token")
 }
 
 func TestStatusCodes(t *testing.T) {

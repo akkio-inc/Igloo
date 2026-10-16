@@ -236,7 +236,8 @@ field; JDBC as `password=`.
   every login in `igloo.login_history` with `auth_method` `token` and the
   token's `token_name`.
 - **Revoking** a token (`DROP TOKEN`) stops new logins at once and ends the
-  SQL sessions it opened within 30 seconds.
+  SQL and Arrow Flight SQL sessions it opened within 30 seconds. A session
+  also ends, before its next statement, once its token has expired.
 - **Passwords and tokens** of a user share a SCRAM salt, which is what lets
   one SQL login accept either. Changing the password keeps the salt, so
   tokens keep working, except that psql's `\password`, which encrypts the

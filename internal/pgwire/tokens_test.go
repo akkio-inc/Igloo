@@ -152,6 +152,17 @@ func TestServiceAccountTokens(t *testing.T) {
 	}
 	mustExec(t, admin, "DROP TOKEN IF EXISTS ci FOR USER dbt")
 
+	// A session ends once the token it signed in with has expired.
+	brief := newToken(t, admin, "CREATE TOKEN brief FOR USER dbt EXPIRES '2s'")
+	short := connect(t, ts.url("dbt", brief), pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, short, "SELECT 1")
+	time.Sleep(2100 * time.Millisecond)
+	if _, err := short.Exec(ctx, "SELECT 1"); pgCode(err) != "28000" || !strings.Contains(err.Error(), "expired") {
+		t.Errorf("a session of an expired token: %v", err)
+	}
+	loginFails(t, ts, "dbt", brief, "28P01")
+	mustExec(t, admin, "DROP TOKEN brief FOR USER dbt")
+
 	// A service account always has an admin who owns it.
 	mustExec(t, admin, "CREATE USER boss PASSWORD 'boss-password' ROLE admin")
 	if _, err := admin.Exec(ctx, "ALTER USER dbt OWNER ana"); pgCode(err) != "22023" {

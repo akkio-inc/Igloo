@@ -148,8 +148,9 @@ func sessionFrom(ctx context.Context) *session {
 
 // Handshake signs a client in with HTTP basic authentication and opens a
 // session, whose bearer token it returns in the authorization header. The
-// password is checked exactly as for a SQL login, with the same failure
-// delay, logging and login history.
+// password, or an Igloo access token in its place, is checked exactly as for
+// a SQL login, with the same failure delay, limits, logging and login
+// history.
 func (svc *service) Handshake(stream flight.FlightService_HandshakeServer) error {
 	s, ctx := svc.s, stream.Context()
 	c, _ := ctx.Value(connKey{}).(*conn)
@@ -163,50 +164,76 @@ func (svc *service) Handshake(stream flight.FlightService_HandshakeServer) error
 		return status.Error(codes.Unauthenticated, "malformed basic authentication header")
 	}
 	name = strings.ToLower(strings.TrimSpace(name))
-	user, err := s.sql.AuthenticateClient(ctx, name, password, peerAddr(ctx), "flight sql")
-	if errors.Is(err, pgwire.ErrLoginFailed) {
-		return status.Errorf(codes.Unauthenticated, "password authentication failed for user %q", name)
+	var (
+		user  auth.User
+		token *auth.Token
+		err   error
+	)
+	if auth.LooksLikeToken(password) {
+		var t auth.Token
+		user, t, err = s.sql.AuthenticateToken(ctx, name, password, peerAddr(ctx), "flight sql")
+		token = &t
+	} else {
+		user, err = s.sql.AuthenticateClient(ctx, name, password, peerAddr(ctx), "flight sql")
 	}
 	if err != nil {
-		s.log.Warn("sign-in failed", "user", name, "err", err)
-		return status.Error(codes.Unavailable, "could not check the password; try again")
+		return s.signInError(name, err)
 	}
 
-	token := make([]byte, 32)
-	_, _ = rand.Read(token)
-	bearer := base64.RawURLEncoding.EncodeToString(token)
-	if _, err := s.open(ctx, c, sha256.Sum256([]byte(bearer)), user); err != nil {
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	bearer := base64.RawURLEncoding.EncodeToString(secret)
+	if _, err := s.open(ctx, c, sha256.Sum256([]byte(bearer)), user, token); err != nil {
 		return err
 	}
 	return stream.SendHeader(metadata.Pairs("authorization", "Bearer "+bearer))
 }
 
+// signInError is the status a failed sign-in for name returns.
+func (s *Server) signInError(name string, err error) error {
+	var blocked *pgwire.LoginBlockedError
+	switch {
+	case errors.Is(err, pgwire.ErrLoginFailed):
+		return status.Errorf(codes.Unauthenticated, "password authentication failed for user %q", name)
+	case errors.Is(err, pgwire.ErrUserDisabled):
+		return status.Errorf(codes.PermissionDenied, "user %q is not permitted to log in", name)
+	case errors.As(err, &blocked):
+		return status.Error(codes.Unauthenticated, blocked.Error())
+	}
+	s.log.Warn("sign-in failed", "user", name, "err", err)
+	return status.Error(codes.Unavailable, "could not check the password; try again")
+}
+
 // session returns the session of the bearer token the call carries, which
-// must have been opened on the same connection. A token Igloo issued some
-// other way, such as a personal access token, opens a session on first
-// use.
+// must have been opened on the same connection. An Igloo access token sent
+// as the bearer token instead opens a session on its first use on a
+// connection, so clients need no handshake.
 func (s *Server) session(ctx context.Context) (*session, error) {
 	c, _ := ctx.Value(connKey{}).(*conn)
-	scheme, token := authorization(ctx)
-	if c == nil || !strings.EqualFold(scheme, "Bearer") || token == "" {
+	scheme, bearer := authorization(ctx)
+	if c == nil || !strings.EqualFold(scheme, "Bearer") || bearer == "" {
 		return nil, errSignIn
 	}
-	key := sha256.Sum256([]byte(token))
+	key := sha256.Sum256([]byte(bearer))
 	if sess := c.get(key); sess != nil {
 		return sess, nil
 	}
-	if s.tokens == nil {
+	if !auth.LooksLikeToken(bearer) {
 		return nil, errNoSession
 	}
-	user, err := s.tokens.AuthenticateToken(ctx, token, peerAddr(ctx))
+	user, token, err := s.sql.AuthenticateToken(ctx, "", bearer, peerAddr(ctx), "flight sql")
+	if errors.Is(err, pgwire.ErrLoginFailed) {
+		return nil, status.Error(codes.Unauthenticated, "invalid access token: it is wrong, expired or revoked, or its user may not sign in")
+	}
 	if err != nil {
-		return nil, errNoSession
+		return nil, s.signInError(user.Name, err)
 	}
-	return s.open(ctx, c, key, user)
+	return s.open(ctx, c, key, user, &token)
 }
 
-// open opens a session for user on connection c under key.
-func (s *Server) open(ctx context.Context, c *conn, key [32]byte, user auth.User) (*session, error) {
+// open opens a session for user on connection c under key, on the
+// authority of token if the user signed in with one.
+func (s *Server) open(ctx context.Context, c *conn, key [32]byte, user auth.User, token *auth.Token) (*session, error) {
 	client := "flight sql"
 	if addr := peerAddr(ctx); addr != nil {
 		host, _, err := net.SplitHostPort(addr.String())
@@ -215,7 +242,15 @@ func (s *Server) open(ctx context.Context, c *conn, key [32]byte, user auth.User
 		}
 		client += " " + host
 	}
-	es, err := s.sql.OpenEmbedded(ctx, user, client)
+	var (
+		es  *pgwire.EmbeddedSession
+		err error
+	)
+	if token != nil {
+		es, err = s.sql.OpenEmbeddedToken(ctx, user, *token, client)
+	} else {
+		es, err = s.sql.OpenEmbedded(ctx, user, client)
+	}
 	if err != nil {
 		return nil, statusOf(err)
 	}

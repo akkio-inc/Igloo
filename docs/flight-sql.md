@@ -87,6 +87,26 @@ DataGrip, Tableau's "Other Databases (JDBC)") browse schemas through it:
 schema, and key listings are empty, since Iceberg tables have no enforced
 keys. Tools that offer a PostgreSQL connector can keep using port 5432.
 
+### Access tokens and service accounts
+
+An Igloo [access token](sso.md#access-tokens) (`CREATE TOKEN`) works in
+place of a password: send it as the password in the handshake, with the
+user name, or skip the handshake and send it as the bearer token of every
+call (`Authorization: Bearer igloo_...`). That is how service accounts,
+which have no password, and people who sign in with single sign-on connect:
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect("grpc+tls://igloo.example.com:31337",
+                         db_kwargs={"username": "dbt_prod", "password": token})
+```
+
+A session opened with a token acts on the token's authority, as a SQL
+session that signed in with one does: it cannot create access tokens or
+change its user's password, and it ends when the token is revoked
+(`DROP TOKEN`) or expires.
+
 ## Sessions and statements
 
 A client's handshake opens a session, and the bearer token it returns
@@ -127,15 +147,22 @@ cursor, are strings, as the PostgreSQL protocol sends them.
 
 - **Sign-in.** The handshake carries the user name and password with HTTP
   basic authentication. Igloo checks the password against the user's stored
-  SCRAM-SHA-256 verifier exactly as for a SQL login: the same 500 ms delay
+  SCRAM-SHA-256 verifier exactly as for a SQL login, including whether the
+  user may use a password at all (see [single sign-on](sso.md)): the same 500 ms delay
   after a failure, unknown users and wrong passwords failing alike, the same
   `login` and `login failed` log lines (with `client="flight sql"`), the
   `igloo_logins_total` metric, and an entry in `igloo.login_history` with
   the application `flight sql`.
-- **Tokens.** The bearer token is 32 random bytes, valid only on the
-  connection it was issued on and only while that connection lasts, so a
-  token copied elsewhere is useless. Igloo keeps a hash of it, not the
-  token.
+- **Tokens.** The bearer token a handshake returns is 32 random bytes,
+  valid only on the connection it was issued on and only while that
+  connection lasts, so a token copied elsewhere is useless. Igloo keeps a
+  hash of it, not the token. An Igloo access token sent instead is checked
+  like one sent to the SQL port, opens a session on each connection it is
+  first used on, and is recorded in the login history with `auth_method`
+  `token` and its name.
+- **Limits.** Failed password sign-ins count towards the same limits as SQL
+  logins: 10 per user and 50 per address in 15 minutes. Access tokens still
+  sign in while a user's passwords are blocked.
 - **Transport.** Basic authentication sends the password itself, not a
   SCRAM proof, so Flight SQL follows the [web console](console.md)'s rule:
   with a certificate configured it serves TLS only, with the SQL port's
