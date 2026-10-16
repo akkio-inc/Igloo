@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 # Bake DuckDB's extensions into the image so the server never downloads code
 # at runtime.
-RUN /out/igloo install-extensions /out/extensions && mkdir -p /out/tmp /out/empty
+RUN /out/igloo install-extensions /out/extensions && mkdir -p /out/tmp /out/cache /out/empty
 
 # distroless/cc has the glibc DuckDB links against, CA certificates for
 # HTTPS object storage, and no shell.
@@ -23,9 +23,13 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /out/igloo /usr/local/bin/igloo
 COPY --from=build /out/extensions /usr/local/share/igloo/extensions
 COPY --from=build --chown=nonroot:nonroot /out/tmp /var/lib/igloo/tmp
+# The read cache of object storage files. Mount a volume here to keep it
+# across container restarts; a new named volume takes this ownership.
+COPY --from=build --chown=nonroot:nonroot /out/cache /var/lib/igloo/cache
 
 ENV IGLOO_DUCKDB_EXTENSION_DIR=/usr/local/share/igloo/extensions \
-    IGLOO_DUCKDB_TEMP_DIR=/var/lib/igloo/tmp
+    IGLOO_DUCKDB_TEMP_DIR=/var/lib/igloo/tmp \
+    IGLOO_CACHE_DIR=/var/lib/igloo/cache
 
 # DuckDB's Iceberg writer makes sure a relative directory named "data" exists
 # before CREATE TABLE AS writes to object storage. It exists here, owned by

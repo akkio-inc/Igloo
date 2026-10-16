@@ -35,6 +35,8 @@ services:
       IGLOO_WAREHOUSE_LOCATION: s3://${S3_BUCKET:?}/warehouse
       IGLOO_ALLOWED_LOCATIONS: ${IGLOO_ALLOWED_LOCATIONS:-}
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_MEMORY_LIMIT:-}
+      # Empty sizes the read cache from the free disk space; 0 turns it off.
+      IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}
@@ -59,6 +61,9 @@ services:
       - "${IGLOO_CONSOLE_BIND:-127.0.0.1}:${IGLOO_CONSOLE_PORT:-8443}:8443"
     volumes:
       - igloo-spill:/var/lib/igloo/tmp
+      # Copies of table files read from object storage, kept across
+      # restarts (docs/operations.md#read-cache).
+      - igloo-cache:/var/lib/igloo/cache
       - ./tls:/tls:ro
     depends_on:
       postgres:
@@ -174,5 +179,6 @@ services:
 
 volumes:
   igloo-spill:
+  igloo-cache:
   catalog-db:
   storage-data:

@@ -124,8 +124,8 @@ func TestLockdown(t *testing.T) {
 			Location:         "s3://bucket/warehouse",
 			AllowedLocations: []string{"s3://landing/"},
 		},
-	}))
-	want := "SET allowed_directories = ['s3://bucket/warehouse/', 's3://landing/', '/var/lib/igloo/tmp/']"
+	}, "/var/lib/igloo/cache/blocks"))
+	want := "SET allowed_directories = ['s3://bucket/warehouse/', 's3://landing/', '/var/lib/igloo/tmp/', '/var/lib/igloo/cache/blocks/']"
 	if !strings.Contains(got, want) {
 		t.Errorf("missing %q in\n%s", want, got)
 	}
@@ -205,7 +205,7 @@ func TestLockdownWithoutCatalog(t *testing.T) {
 }
 
 func TestLockdownNeverAllowsRoot(t *testing.T) {
-	got := joined(lockdownStatements(config.Config{}))
+	got := joined(lockdownStatements(config.Config{}, ""))
 	if strings.Contains(got, "'/'") {
 		t.Errorf("an empty warehouse location must not allow /:\n%s", got)
 	}

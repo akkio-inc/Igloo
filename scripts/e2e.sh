@@ -247,9 +247,24 @@ if grep -q '^igloo_queries_total' <<<"$metrics"; then pass "metrics"; else fail 
 if grep -q '^igloo_maintenance_passes_total{result="ok"}' <<<"$metrics"; then pass "maintenance metrics"; else fail "maintenance metrics"; fi
 
 echo "restart"
+# Read a table once so its files land in the read cache.
+psql_admin -c "CREATE TABLE cached AS SELECT range AS n, md5(range::VARCHAR) AS s FROM range(200000)" >/dev/null
+cached="$(psql_admin -c "SELECT sum(n), max(s) FROM cached")"
 compose restart igloo >/dev/null
 compose up -d --wait --wait-timeout 120 igloo >/dev/null
 expect "data survives a restart" "3" walt walt-password-1 "SELECT count(*) FROM e2e"
+if curl -s "http://127.0.0.1:$http_port/metrics" | grep -q '^igloo_cache_limit_bytes 0$'; then
+  printf '  skip  %s\n' "read cache: paused, the disk is almost full"
+else
+  got="$(printf '%s\n' "SET cache_httpfs_profile_type = 'temp';" "SELECT sum(n), max(s) FROM cached;" \
+    "SELECT cache_hit_count > 0 AND cache_miss_count = 0 FROM cache_httpfs_cache_access_info_query() WHERE cache_type = 'data';" \
+    "SET cache_httpfs_profile_type = 'noop';" | psql_admin)" || true
+  if [ "$got" = "$(printf 'SET\n%s\nt\nSET' "$cached")" ]; then
+    pass "after a restart, table files come from the read cache"
+  else
+    fail "read cache after a restart: got [$got], want the result [$cached] and only cache hits"
+  fi
+fi
 expect "views and comments survive a restart" "3|Test rows | :tag:e2e" rita rita-password-1 \
   "SELECT (SELECT count(*) FROM e2e_big), (SELECT comment FROM igloo_comments() WHERE table_name = 'e2e' AND column_name IS NULL)"
 expect "drop a view" "DROP VIEW" walt walt-password-1 "DROP VIEW e2e_big"

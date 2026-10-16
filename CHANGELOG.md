@@ -38,6 +38,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - `scaleToZero.enabled` in the Helm chart runs the gateway in front of
   Igloo's Deployment, behind the same SQL Service, with the RBAC and network
   policies it needs.
+- A read cache on local disk (DuckDB's `cache_httpfs` extension) for the
+  warehouse's files on Amazon S3, S3-compatible stores and Google Cloud
+  Storage. It survives restarts and machine stops, so the first queries
+  after a start no longer fetch every file again. It sizes itself from the
+  disk's free space; `IGLOO_CACHE_SIZE` overrides that or turns it off.
 - `COMMENT ON TABLE`, `VIEW` and `COLUMN`, stored as Iceberg metadata and
   shown through `obj_description`, `col_description`, `pg_description` and
   `igloo_comments()`.

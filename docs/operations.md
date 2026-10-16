@@ -53,9 +53,77 @@ using all of its cores.
   room for your largest sorts and joins.
 - **CPU.** DuckDB parallelizes each query across `IGLOO_DUCKDB_THREADS`
   threads (default: one per core).
+- **Cache disk.** The [read cache](#read-cache) keeps table files on local
+  disk. Size the disk so your frequently read tables fit in half of its free
+  space, or set `IGLOO_CACHE_SIZE`.
 
 A memory-optimized machine with 4 to 8 cores and 32 to 64 GB handles most
 datasets up to a few hundred GB of compressed Parquet comfortably.
+
+## Read cache
+
+Reading table files from object storage is far slower than reading them
+from local disk: on a c7g.4xlarge with tables in Amazon S3, the 22 TPC-H
+queries at scale factor 10 took 31 to 59 seconds when every file came from
+S3, and 5.5 seconds once the files were in memory. Igloo therefore keeps a
+copy of what it reads from the warehouse on local disk, and later reads,
+including those after a restart or a [scale-to-zero](scale-to-zero.md)
+start, use the copy. Within a run, DuckDB also keeps recently read data in
+memory, in front of the disk cache.
+
+- **What is cached.** Files under the warehouse location on Amazon S3,
+  S3-compatible stores and Google Cloud Storage, in blocks of 512 KiB, one
+  file per block: table data and delete files, and whatever else users read
+  there. Iceberg manifests are still fetched on every query; they are small.
+  Files in `IGLOO_ALLOWED_LOCATIONS`, and tables on Azure Storage, are read
+  directly.
+- **Always current.** Iceberg writes every file once and never changes it,
+  so a copy cannot go stale. Blocks of files read by path, such as
+  `read_parquet('s3://...')`, also record the object's ETag and are used only
+  while it matches, so a file overwritten in place is fetched again.
+  Directory listings and file sizes are never cached.
+- **Size.** Unless `IGLOO_CACHE_SIZE` says otherwise, the cache takes at most
+  half of the disk space that other files leave free, and at most 100 GiB.
+  It never fills the disk past 95%. Igloo remeasures every 5 minutes, so the
+  cache gives way when other files (spill files, logs, a local object store)
+  grow: it stops adding blocks, and drops the least recently used block each
+  time a read misses. If less than 5% of the disk would be free even without
+  the cache, Igloo empties it and pauses it until there is room.
+- **Where it lives.** `/var/lib/igloo/cache` in the container
+  (`IGLOO_CACHE_DIR`), on a filesystem with extended attributes, such as
+  ext4, XFS or btrfs. Docker Compose keeps it in the `igloo-cache` volume,
+  which survives restarts, `docker compose down` and machine stops. On
+  Kubernetes, mount a volume there, and a small writable `/tmp` if the root
+  filesystem is read-only (the extension that implements the cache needs
+  one). A PersistentVolumeClaim keeps the cache across pod restarts and
+  scaling to zero; any other volume is lost with the pod. Igloo sizes the
+  cache from the free space of the filesystem it is on, which an `emptyDir`
+  shares with the node: with an `emptyDir`, set `IGLOO_CACHE_SIZE` below its
+  `sizeLimit`. Instance-store (local NVMe) disks are fast, but empty when
+  the machine stops.
+- **Watching it.** `igloo_cache_size_bytes` and `igloo_cache_limit_bytes`
+  ([metrics](#monitoring)) show its size and how large it may grow. The log
+  says `read cache on` at startup, or why it is off. An admin can count an
+  own session's hits and misses:
+
+  ```sql
+  SET cache_httpfs_profile_type = 'temp';   -- every session that reads from now on
+  SELECT count(*) FROM lineitem WHERE l_quantity > 10;
+  SELECT cache_hit_count, cache_miss_count
+  FROM cache_httpfs_cache_access_info_query() WHERE cache_type = 'data';
+  SET cache_httpfs_profile_type = 'noop';   -- turn counting off again
+  ```
+
+- **Clearing it** is never needed for correctness. To free the space, an
+  admin runs `SELECT cache_httpfs_clear_cache();`, or, with Igloo stopped,
+  you delete the contents of the cache directory (with Docker Compose:
+  `docker compose rm -sf igloo && docker volume rm igloo_igloo-cache &&
+  make up`).
+
+The cache is DuckDB's [`cache_httpfs`](https://github.com/dentiny/duck-read-cache-fs)
+community extension, baked into the image like the other extensions; DuckDB
+checks its signature when it loads. If it cannot load or its directory is
+not writable, Igloo logs a warning and runs without it.
 
 ## Scaling out
 
@@ -118,6 +186,8 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_maintenance_compacted_files_total`, `igloo_maintenance_compaction_output_files_total` | | Data files replaced and written by compaction |
 | `igloo_maintenance_expired_snapshots_total` | | Snapshots expired |
 | `igloo_maintenance_orphan_files_deleted_total` | | Unreferenced files deleted |
+| `igloo_cache_size_bytes` | | Bytes in the [read cache](#read-cache), measured every 5 minutes |
+| `igloo_cache_limit_bytes` | | Size the read cache may grow to, given the disk's free space; 0 while it is off or paused |
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
@@ -226,3 +296,6 @@ and the catalog runs its database migrations before it serves. Read
 | Startup fails with `warehouse already exists in bucket ...` | `IGLOO_WAREHOUSE_LOCATION` does not match the existing warehouse. Point it at the existing data or use a different `IGLOO_CATALOG_WAREHOUSE`. |
 | Startup retries `catalog not reachable yet` | The catalog or its database is not up. Igloo waits up to 3 minutes. |
 | `/readyz` returns 503 | The body names the failing dependency: engine, metadata database or catalog. |
+| Log says `read cache off: cannot load the cache_httpfs extension ... Read-only file system` | The root filesystem is read-only and `/tmp` is not writable. Mount a small writable volume at `/tmp`. |
+| Log says `read cache off: its directory is not writable` | Make the volume at `IGLOO_CACHE_DIR` writable by the container's user (UID 65532), e.g. with `fsGroup: 65532` on Kubernetes. |
+| Log says `read cache paused` | Less than 5% of the cache's disk is free. Free space or give the cache its own volume; it resumes on its own. |

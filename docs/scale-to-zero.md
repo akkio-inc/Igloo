@@ -55,6 +55,19 @@ Compose) took about 16 seconds from the first connection to the first
 query. Kubernetes pods on a node that is already running start in a few
 seconds; a cluster that must first add a node takes a minute or two.
 
+The first queries after a start are slower for a second reason: memory
+starts empty, and table files fetched from object storage are slow to read
+(31 to 59 seconds for TPC-H at scale factor 10 from Amazon S3, against 5.5
+seconds from memory). Igloo keeps the files it has read in a
+[read cache](operations.md#read-cache) on local disk, which survives the
+stop, so after a start it reads them from the machine's disk instead of
+object storage. That works only on storage that outlives the compute: the
+EBS volume of a stopped EC2 instance (Docker Compose keeps the cache in the
+`igloo-cache` volume there), or a PersistentVolumeClaim on Kubernetes.
+Instance-store disks, `emptyDir` volumes and the disks of nodes the
+autoscaler removes start empty. The [read cache](operations.md#read-cache)
+section says how to watch and clear it.
+
 ## On one AWS machine
 
 This is the setup the benchmark measures: Igloo's single-machine stack on
@@ -166,6 +179,11 @@ pod for running work through a headless Service on port 8080, so a
 statement running on any replica keeps them all up. If Igloo also has a
 HorizontalPodAutoscaler (`autoscaling.enabled`), it pauses at zero replicas
 and takes over again after a start.
+
+Pods scaled to zero lose whatever their containers held, including the
+[read cache](operations.md#read-cache) unless `/var/lib/igloo/cache` is on a
+PersistentVolumeClaim, so the first queries after a start read every table
+file from object storage again.
 
 Without the chart, set up the same pieces yourself, following its
 `gateway.yaml` and `service.yaml` templates: `IGLOO_GATEWAY_BACKEND` pointing

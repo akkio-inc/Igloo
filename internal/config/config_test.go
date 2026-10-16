@@ -67,6 +67,59 @@ func TestMaintenance(t *testing.T) {
 	}
 }
 
+func TestCache(t *testing.T) {
+	load := func(m map[string]string) (Cache, error) {
+		m["IGLOO_ADMIN_PASSWORD"] = "password"
+		cfg, err := Load(env(m))
+		return cfg.Cache, err
+	}
+
+	if c, err := load(map[string]string{}); err != nil || c != (Cache{}) {
+		t.Errorf("no cache directory: %+v, %v", c, err)
+	}
+	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/var/lib/igloo/cache"}); err != nil || c.Dir != "/var/lib/igloo/cache" || c.MaxSize != 0 {
+		t.Errorf("automatic size: %+v, %v", c, err)
+	}
+	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "40GiB"}); err != nil || c.MaxSize != 40<<30 {
+		t.Errorf("40GiB: %+v, %v", c, err)
+	}
+	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "0"}); err != nil || c.Dir != "" {
+		t.Errorf("0 should turn the cache off: %+v, %v", c, err)
+	}
+	for _, bad := range []map[string]string{
+		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "lots"},
+		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "-1GB"},
+		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "0.1"},
+		{"IGLOO_CACHE_DIR": "relative/cache"},
+	} {
+		if _, err := load(bad); err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+}
+
+func TestParseSize(t *testing.T) {
+	for s, want := range map[string]int64{
+		"1073741824": 1 << 30,
+		"512B":       512,
+		"50GB":       50e9,
+		"50 gb":      50e9,
+		"40GiB":      40 << 30,
+		"1.5TiB":     3 << 39,
+		"100 MiB":    100 << 20,
+		"2kb":        2000,
+	} {
+		if got, err := parseSize(s); err != nil || got != want {
+			t.Errorf("%q: got %d, %v; want %d", s, got, err, want)
+		}
+	}
+	for _, s := range []string{"", "GB", "1PB", "1 G B", "-1", "1e3", "9999999TiB"} {
+		if got, err := parseSize(s); err == nil {
+			t.Errorf("%q: accepted as %d", s, got)
+		}
+	}
+}
+
 func TestLimits(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
 		"IGLOO_ADMIN_PASSWORD":    "password",

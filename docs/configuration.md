@@ -110,6 +110,17 @@ Azure identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AZURE_SYSTEM_CREDENTIALS
 | `IGLOO_DUCKDB_MAX_TEMP_SIZE` | 90% of the spill disk's free space | Cap on spill files, e.g. `40GiB`. Queries that need more fail. |
 | `IGLOO_DUCKDB_EXTENSION_DIR` | set in the image | Pre-installed DuckDB extensions |
 
+## Read cache
+
+Igloo keeps copies of the table files it reads from object storage on local
+disk, so that queries after a restart read them from there; see
+[the read cache](operations.md#read-cache).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_CACHE_SIZE` | automatic | Largest size of the cache, e.g. `50GB` or `40GiB`. Automatic is half of the disk space other files leave free, up to 100 GiB. `0` turns the cache off. |
+| `IGLOO_CACHE_DIR` | `/var/lib/igloo/cache` in the image | Where the cache lives. Mount a volume here to keep it across restarts. |
+
 ## Table maintenance
 
 Igloo compacts small files, expires old snapshots and deletes unreferenced

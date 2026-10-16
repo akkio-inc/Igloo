@@ -25,9 +25,14 @@ import (
 const attachRetryInterval = 2 * time.Second
 
 // Extensions are the DuckDB extensions Igloo uses: object storage (httpfs,
-// aws, azure), Iceberg (which reads manifests with avro), and TPC-H data for
-// demos and benchmarks. The image installs them at build time.
-var Extensions = []string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch"}
+// aws, azure), Iceberg (which reads manifests with avro), TPC-H data for
+// demos and benchmarks, and the read cache (cache_httpfs, see cache.go). The
+// image installs them at build time.
+var Extensions = []string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs"}
+
+// communityExtensions come from DuckDB's community repository rather than
+// the core one. DuckDB checks their signatures on load just the same.
+var communityExtensions = map[string]bool{"cache_httpfs": true}
 
 // Engine owns the embedded DuckDB database.
 type Engine struct {
@@ -44,6 +49,8 @@ type Engine struct {
 	connectStmts []string
 	// comments supplies igloo_comments(); see SetComments.
 	comments atomic.Pointer[func() []catalog.Comment]
+	// cache is the on-disk read cache, or nil when it is off.
+	cache *readCache
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -64,6 +71,9 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engine, er
 	if err := e.setup(ctx, cfg, log); err != nil {
 		p.close()
 		return nil, errors.Join(err, connector.Close())
+	}
+	if e.cache != nil {
+		e.startCache(log)
 	}
 
 	return e, nil
@@ -153,6 +163,7 @@ func (e *Engine) Ping(ctx context.Context) error {
 
 // Close shuts DuckDB down. Sessions must be closed first.
 func (e *Engine) Close() error {
+	e.stopCache()
 	e.parser.close()
 	return e.connector.Close()
 }
@@ -200,6 +211,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger)
 			// Never echo the statement: it can contain a secret key.
 			return fmt.Errorf("configure object storage: %w", err)
 		}
+	}
+	if err := e.setupCache(exec, cfg, log); err != nil {
+		return err
 	}
 
 	attach := attachStatement(cfg.Catalog)
@@ -274,7 +288,11 @@ func (e *Engine) lockDown(exec func(string) error, cfg config.Config) error {
 	if err := exec("SELECT count(*) FROM duckdb_secrets()"); err != nil {
 		return fmt.Errorf("initialize secrets: %w", err)
 	}
-	for _, stmt := range lockdownStatements(cfg) {
+	cacheDir := ""
+	if e.cache != nil {
+		cacheDir = e.cache.dir
+	}
+	for _, stmt := range lockdownStatements(cfg, cacheDir) {
 		if err := exec(stmt); err != nil {
 			return fmt.Errorf("lock down duckdb (%s): %w", stmt, err)
 		}
@@ -381,19 +399,27 @@ func attachStatement(c config.Catalog) string {
 }
 
 // lockdownStatements stop SQL from reading or writing anything but the
-// warehouse, the allowed locations and the spill directory: no local files,
-// no other buckets, no arbitrary URLs. DuckDB refuses to loosen these
-// settings once external access is off, so they hold for every session.
-// They apply without a catalog too, so a development server is no more open
-// than a production one.
-func lockdownStatements(cfg config.Config) []string {
+// warehouse, the allowed locations, the spill directory and the read cache
+// (cacheDir, if any): no local files, no other buckets, no arbitrary URLs.
+// DuckDB refuses to loosen these settings once external access is off, so
+// they hold for every session. They apply without a catalog too, so a
+// development server is no more open than a production one.
+//
+// The cache extension checks the same list before it touches its files, so
+// the cache works only if its directory is on it. That gives SQL no more
+// than it has: the cache holds copies of warehouse files, which SQL can
+// read anyway, and a writer able to plant a block there (with COPY TO) can
+// already overwrite the warehouse file itself.
+func lockdownStatements(cfg config.Config, cacheDir string) []string {
 	var dirs []string
 	if cfg.Storage.Location != "" {
 		dirs = append(dirs, cfg.Storage.Root())
 	}
 	dirs = append(dirs, cfg.Storage.AllowedLocations...)
-	if cfg.DuckDB.TempDir != "" {
-		dirs = append(dirs, strings.TrimSuffix(cfg.DuckDB.TempDir, "/")+"/")
+	for _, dir := range []string{cfg.DuckDB.TempDir, cacheDir} {
+		if dir != "" {
+			dirs = append(dirs, strings.TrimSuffix(dir, "/")+"/")
+		}
 	}
 
 	return []string{
@@ -426,7 +452,11 @@ func InstallExtensions(ctx context.Context, dir string) error {
 
 	stmts := []string{"SET extension_directory = " + literal(dir)}
 	for _, ext := range Extensions {
-		stmts = append(stmts, "INSTALL "+ext)
+		stmt := "INSTALL " + ext
+		if communityExtensions[ext] {
+			stmt += " FROM community"
+		}
+		stmts = append(stmts, stmt)
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {

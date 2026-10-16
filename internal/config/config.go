@@ -48,9 +48,21 @@ type Config struct {
 	ShutdownDelay time.Duration
 
 	DuckDB      DuckDB
+	Cache       Cache
 	Catalog     Catalog
 	Storage     Storage
 	Maintenance Maintenance
+}
+
+// Cache keeps local copies of the table files Igloo reads from object
+// storage, so queries after a restart read them from disk instead of
+// fetching them again.
+type Cache struct {
+	// Dir holds the cached files. Empty turns the cache off.
+	Dir string
+	// MaxSize caps the cache in bytes. Zero sizes it from the free space on
+	// Dir's disk.
+	MaxSize int64
 }
 
 // Maintenance controls automatic table maintenance: compaction, snapshot
@@ -193,6 +205,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			MaxTempSize:  get("IGLOO_DUCKDB_MAX_TEMP_SIZE", ""),
 			ExtensionDir: get("IGLOO_DUCKDB_EXTENSION_DIR", ""),
 		},
+		Cache: Cache{
+			Dir: get("IGLOO_CACHE_DIR", ""),
+		},
 		Catalog: Catalog{
 			URI:       get("IGLOO_CATALOG_URI", ""),
 			Warehouse: get("IGLOO_CATALOG_WAREHOUSE", "igloo"),
@@ -281,6 +296,21 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.DuckDB.Threads = n
 	}
 
+	switch v := get("IGLOO_CACHE_SIZE", ""); v {
+	case "":
+	case "0":
+		cfg.Cache.Dir = ""
+	default:
+		n, err := parseSize(v)
+		if err != nil || n <= 0 {
+			addErr("IGLOO_CACHE_SIZE must be a size such as 50GB or 40GiB, or 0 to turn the cache off, got %q", v)
+		}
+		cfg.Cache.MaxSize = n
+	}
+	if d := cfg.Cache.Dir; d != "" && !strings.HasPrefix(d, "/") {
+		addErr("IGLOO_CACHE_DIR must be an absolute path, got %q", d)
+	}
+
 	enabled, err := strconv.ParseBool(get("IGLOO_MAINTENANCE", "true"))
 	if err != nil {
 		addErr("IGLOO_MAINTENANCE must be true or false: %w", err)
@@ -352,6 +382,31 @@ func parseDays(s string) (time.Duration, error) {
 		return time.Duration(n) * 24 * time.Hour, nil
 	}
 	return time.ParseDuration(s)
+}
+
+// parseSize parses a number of bytes such as 50GB, 40 GiB or 1073741824.
+// As in DuckDB, KB, MB, GB and TB are powers of 1000, and KiB, MiB, GiB and
+// TiB powers of 1024.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	i := strings.IndexFunc(s, func(r rune) bool { return (r < '0' || r > '9') && r != '.' })
+	if i < 0 {
+		i = len(s)
+	}
+	n, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	units := map[string]float64{
+		"": 1, "b": 1, "bytes": 1,
+		"kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+		"kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40,
+	}
+	unit, ok := units[strings.ToLower(strings.TrimSpace(s[i:]))]
+	if !ok || n*unit > float64(1<<62) {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return int64(n * unit), nil
 }
 
 // parseLocation fills Type, Bucket, Prefix and the Azure account from

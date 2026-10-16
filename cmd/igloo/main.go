@@ -134,6 +134,7 @@ func serve() error {
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(eng.Metrics()...)
 	work := activity.New()
 	srv, err := pgwire.New(eng, pgwire.Options{
 		Users:            users,
