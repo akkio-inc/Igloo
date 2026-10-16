@@ -38,6 +38,8 @@ type Source interface {
 type File struct {
 	Path string `json:"path"`
 	Size int64  `json:"size"`
+	// Rows is the file's record count.
+	Rows int64 `json:"rows"`
 }
 
 // Iceberg is the Source for Igloo's Iceberg catalog. Every statement loads
@@ -199,7 +201,7 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
-		files = append(files, File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes()})
+		files = append(files, File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes(), Rows: task.File.Count()})
 	}
 
 	s.mu.Lock()

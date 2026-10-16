@@ -258,10 +258,15 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			return "", nil, fmt.Errorf("set %s: %w", s.Name, err)
 		}
 	}
+	start := time.Now()
+	var byID []string
 	for _, v := range req.Views {
 		if !v.ByName && len(v.Files) > 0 {
 			if v.ByName, err = w.readByName(ctx, conn, v); err != nil {
 				return "", nil, err
+			}
+			if !v.ByName {
+				byID = append(byID, v.Name)
 			}
 		}
 		stmt, err := w.viewStatement(v)
@@ -272,6 +277,8 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			return "", nil, fmt.Errorf("define %s: %w", v.Name, err)
 		}
 	}
+	w.log.Debug("defined a task's views", "query", req.Query, "task", req.Task, "views", len(req.Views),
+		"by_field_id", byID, "seconds", time.Since(start).Seconds())
 
 	query := req.SQL
 	if len(req.Columns) > 0 {
@@ -522,8 +529,9 @@ func nestedType(t string) bool {
 // so files written before a column was renamed, added or widened read as
 // the table's current schema does; or, with ByName, read by column name,
 // for files that readByName found to name the table's columns, and for
-// shuffled files. Paths are never read as Hive partitions. A table without
-// files is empty.
+// shuffled files. Paths are never read as Hive partitions, and DuckDB is
+// told how many rows the files hold when the coordinator knows. A table
+// without files is empty.
 func (w *Worker) viewStatement(v viewDef) (string, error) {
 	if !strings.HasPrefix(v.Name, "__igloo_") {
 		return "", fmt.Errorf("view name %q", v.Name)
@@ -545,13 +553,17 @@ func (w *Worker) viewStatement(v viewDef) (string, error) {
 		}
 		files[i] = quoteLiteral(f)
 	}
+	options := "hive_partitioning = false"
+	if v.Rows > 0 {
+		options += ", explicit_cardinality = " + strconv.FormatInt(v.Rows, 10)
+	}
 	if v.ByName {
 		cols := make([]string, len(v.Columns))
 		for i, c := range v.Columns {
 			cols[i] = "CAST(" + quoteIdent(c.Name) + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
 		}
 		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT " + strings.Join(cols, ", ") +
-			" FROM read_parquet([" + strings.Join(files, ", ") + "], hive_partitioning = false)", nil
+			" FROM read_parquet([" + strings.Join(files, ", ") + "], " + options + ")", nil
 	}
 	schema := make([]string, len(v.Columns))
 	for i, c := range v.Columns {
@@ -561,7 +573,7 @@ func (w *Worker) viewStatement(v viewDef) (string, error) {
 		schema[i] = fmt.Sprintf("%d: {name: %s, type: %s, default_value: NULL}", c.ID, quoteLiteral(c.Name), quoteLiteral(c.Type))
 	}
 	return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT * FROM read_parquet([" + strings.Join(files, ", ") +
-		"], schema = MAP {" + strings.Join(schema, ", ") + "}, hive_partitioning = false)", nil
+		"], schema = MAP {" + strings.Join(schema, ", ") + "}, " + options + ")", nil
 }
 
 // allowed reports whether a data file lies under the warehouse or an

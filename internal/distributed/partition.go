@@ -296,6 +296,7 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 	type sideResult struct {
 		columns []Column
 		files   [][]string
+		rows    int64
 	}
 	var sides [2]sideResult
 	var mu sync.Mutex
@@ -307,7 +308,7 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 			task := &taskRequest{
 				Query: qid, Task: j.ID*10000 + 1000*(s+1) + i, Version: co.opts.Version, Settings: settings,
 				SQL:     fmt.Sprintf("SELECT * EXCLUDE (__h), CAST(__h %% %d AS INTEGER) AS __b FROM (%s)", parts, side.SQL),
-				Views:   []viewDef{{Name: side.View, Columns: side.Table.Columns, Files: paths(share)}},
+				Views:   []viewDef{{Name: side.View, Columns: side.Table.Columns, Files: paths(share), Rows: rowCount(share)}},
 				Shuffle: root + "/" + strconv.Itoa(s) + "/" + strconv.Itoa(i),
 			}
 			var bytes int64
@@ -322,6 +323,7 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 				co.opts.Metrics.scan(bytes)
 				mu.Lock()
 				defer mu.Unlock()
+				sides[s].rows += head.Rows
 				if sides[s].columns == nil {
 					sides[s].columns = head.Columns
 				} else if !slices.Equal(sides[s].columns, head.Columns) {
@@ -348,7 +350,7 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 		if v.Name == j.Partition.Sides[0].View || v.Name == j.Partition.Sides[1].View {
 			continue
 		}
-		def := viewDef{Name: v.Name, Columns: v.Table.Columns}
+		def := viewDef{Name: v.Name, Columns: v.Table.Columns, Rows: rowCount(files[v.Table.key()])}
 		for _, f := range files[v.Table.key()] {
 			def.Files = append(def.Files, f.Path)
 		}
@@ -359,7 +361,9 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 	for p := range parts {
 		views := slices.Clone(others)
 		for s, side := range j.Partition.Sides {
-			views = append(views, viewDef{Name: side.View, Columns: sides[s].columns, Files: sides[s].files[p], ByName: true})
+			// The hash spreads rows evenly over the partitions.
+			views = append(views, viewDef{Name: side.View, Columns: sides[s].columns, Files: sides[s].files[p], ByName: true,
+				Rows: max(1, sides[s].rows/int64(parts))})
 		}
 		task := &taskRequest{Query: qid, Task: j.ID*10000 + p, Version: co.opts.Version, Settings: settings,
 			SQL: j.Fragment, Columns: j.Columns, Views: views}

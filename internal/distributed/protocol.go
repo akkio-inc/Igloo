@@ -59,6 +59,12 @@ type viewDef struct {
 	Columns []Column `json:"columns"`
 	Files   []string `json:"files"`
 	ByName  bool     `json:"by_name,omitempty"`
+	// Rows, if not 0, is how many rows the files hold (from Iceberg
+	// metadata) or about how many (for partitions), for DuckDB to plan
+	// joins by: estimating from Parquet footers, it took a table of 25 rows
+	// in 8 files for 8,000 and ordered TPC-H Q5's joins so that it ran eight
+	// times as long.
+	Rows int64 `json:"rows,omitempty"`
 }
 
 // taskResult heads a task's response.

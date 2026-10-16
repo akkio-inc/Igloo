@@ -402,7 +402,7 @@ func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws [
 		if v.Name == j.SplitView {
 			continue
 		}
-		def := viewDef{Name: v.Name, Columns: v.Table.Columns}
+		def := viewDef{Name: v.Name, Columns: v.Table.Columns, Rows: rowCount(files[v.Table.key()])}
 		for _, f := range files[v.Table.key()] {
 			def.Files = append(def.Files, f.Path)
 		}
@@ -415,7 +415,7 @@ func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws [
 	for i, share := range shares {
 		task := &taskRequest{
 			Query: qid, Task: j.ID*10000 + i, Version: co.opts.Version, Settings: settings, SQL: j.Fragment, Columns: j.Columns,
-			Views: append([]viewDef{{Name: j.SplitView, Columns: j.Split.Columns, Files: paths(share)}}, views...),
+			Views: append([]viewDef{{Name: j.SplitView, Columns: j.Split.Columns, Files: paths(share), Rows: rowCount(share)}}, views...),
 		}
 		var bytes int64
 		for _, f := range share {
@@ -444,6 +444,15 @@ func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws [
 		return nil, err
 	}
 	return res, nil
+}
+
+// rowCount adds up the files' record counts.
+func rowCount(fs []File) int64 {
+	var n int64
+	for _, f := range fs {
+		n += f.Rows
+	}
+	return n
 }
 
 func paths(fs []File) []string {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -183,6 +184,11 @@ func TestSchemaEvolution(t *testing.T) {
 	li := h.tables["lineitem"]
 	if got, err := w.readByName(t.Context(), conn, viewDef{Name: "__igloo_t0", Columns: li.Columns, Files: paths(h.files[li.key()])}); err != nil || !got {
 		t.Errorf("lineitem's files are not read by name: %v", err)
+	}
+	// DuckDB is told the row count the coordinator knows.
+	if stmt, err := w.viewStatement(viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{b}, Rows: 2000}); err != nil ||
+		!strings.Contains(stmt, "explicit_cardinality = 2000") {
+		t.Errorf("a view of 2000 rows: %s, %v", stmt, err)
 	}
 	// One type across files: k is INTEGER in e and BIGINT in b.
 	e := write("e", `SELECT CAST(i AS INTEGER) AS k, 'e' || i AS name, 0.5 AS added FROM range(10) t(i)`, "k: 1, name: 2, added: 3")

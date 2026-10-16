@@ -180,7 +180,11 @@ func (h *harness) addTable(name, source string, files int) {
 		if err != nil {
 			h.t.Fatal(err)
 		}
-		fs = append(fs, File{Path: path, Size: info.Size()})
+		var rows int64
+		if err := h.session.QueryRowContext(ctx, "SELECT count(*) FROM read_parquet("+quoteLiteral(path)+")").Scan(&rows); err != nil {
+			h.t.Fatal(err)
+		}
+		fs = append(fs, File{Path: path, Size: info.Size(), Rows: rows})
 		tbl.Bytes += info.Size()
 	}
 	h.exec("DROP TABLE __src")
