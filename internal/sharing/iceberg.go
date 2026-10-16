@@ -166,7 +166,9 @@ func (s *icebergSource) snapshot(ctx context.Context, schema, name string, v ver
 			if err != nil {
 				return nil, err
 			}
-			files = append(files, f)
+			if f.count > 0 {
+				files = append(files, f)
+			}
 			continue
 		}
 		files = append(files, dataFile{path: t.File.FilePath(), size: t.File.FileSizeBytes(), count: t.File.Count(), stats: fileStats(t.File, sch)})

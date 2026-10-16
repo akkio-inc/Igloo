@@ -164,8 +164,12 @@ func (s *Service) allSharedTables(ctx context.Context) ([]SharedTable, error) {
 	return out, nil
 }
 
-// Close releases the service's resources.
-func (s *Service) Close() error { return s.consumer.close() }
+// Close releases the service's resources. Run must have returned.
+func (s *Service) Close() error {
+	err := s.consumer.close()
+	s.store.Close()
+	return err
+}
 
 // --- shares -----------------------------------------------------------------
 
