@@ -4,7 +4,7 @@ GO_IMAGE := golang:1.27-bookworm
 COMPOSE  := docker compose --project-directory deploy/single-vm
 VERSION  ?= dev
 
-.PHONY: help test lint e2e engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch
+.PHONY: help test lint e2e e2e-distributed engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch
 
 help: ## List targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -19,6 +19,8 @@ lint: ## Check formatting and run go vet
 e2e: ## Run the end-to-end test against an isolated copy of the stack
 	scripts/e2e.sh
 
+e2e-distributed: ## Test distributed execution against a copy of the stack with workers
+	scripts/e2e-distributed.sh
 engines-e2e: ## Test Spark and Trino on the Iceberg REST catalog (pulls ~3 GB)
 	scripts/engines-e2e.sh
 sharing-e2e: ## Test Delta Sharing with the official Python client and the reference server

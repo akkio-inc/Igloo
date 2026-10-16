@@ -226,6 +226,10 @@ the official TPC-H answers.
 - **[Scale to zero](docs/scale-to-zero.md)**: a small gateway stops Igloo's
   machines or pods when nobody uses them and starts them when a client
   connects, on AWS, Google Cloud, Azure or Kubernetes.
+- **[Distributed execution](docs/distributed-execution.md)**: a query over
+  a very large table runs in parts on worker machines that Igloo starts when
+  it needs them and stops when they are idle, with the same grants, sandbox
+  and results as on one machine.
 - **[Read cache](docs/operations.md#read-cache)**: table files read from
   object storage are kept on local disk across restarts, so the first
   queries after a start (or a scale-to-zero resume) do not fetch them again.
@@ -308,6 +312,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
 - [Other engines](docs/external-engines.md): Spark, Trino, PyIceberg,
   Databricks and Snowflake on Igloo's tables, through its Iceberg REST
   catalog
+- [Distributed execution](docs/distributed-execution.md): queries larger than
+  one machine, run in parts on workers
 - [SQL and clients](docs/sql.md): the SQL dialect, Iceberg features, type
   mapping, tested drivers and tools
 - [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
@@ -335,9 +341,14 @@ Connector/C, the MySQL client library, in the `mysql` extension.
 
 ## Limitations in 1.0
 
-- **One engine per query.** Each query runs on one Igloo replica. Scale up
-  with bigger machines and out with more replicas; very large queries that
-  need a cluster are not supported yet.
+- **Distribution covers the common big shapes.** A query over a very large
+  table runs in parts on [workers](docs/distributed-execution.md) when it
+  scans, filters, aggregates and joins it to smaller tables, or to one other
+  large table on equal columns. A large table read twice (self-joins,
+  correlated subqueries over it), three large tables joined on different
+  keys, aggregates that do not combine (`median`, `string_agg`) and window
+  functions over rows still run on one replica; give it a large
+  memory-optimized machine and fast spill disk for those.
 - **Grants stop at tables.** Views run with the querying user's privileges,
   and there are no column privileges: use masking policies instead. Table
   and column names are visible to every user through the system catalogs
@@ -377,6 +388,7 @@ internal/sso/       single sign-on with OpenID Connect
 internal/catalog/   catalog and warehouse setup
 internal/clone/     zero-copy clones, the files they share, branches and tags
 internal/config/    environment-variable configuration
+internal/distributed/ queries in parts on workers: planner, coordinator, worker
 internal/engine/    embedded DuckDB, storage, sandbox
 internal/federation/ connections to other databases and their proxy
 internal/flightsql/ Arrow Flight SQL endpoint

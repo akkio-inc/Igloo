@@ -213,3 +213,31 @@ files on its own; see [table maintenance](operations.md#table-maintenance).
 | `IGLOO_MAINTENANCE` | `true` | Run table maintenance. Turn it off only if another tool maintains the tables. |
 | `IGLOO_SNAPSHOT_RETENTION` | `7d` | How long old snapshots are kept, and so how far back time travel reaches, e.g. `1d` or `36h`. A table's `history.expire.max-snapshot-age-ms` property overrides it. |
 | `IGLOO_MAINTENANCE_INTERVAL` | `1h` | Time between passes over every table |
+
+## Distributed execution
+
+Statements that read very large tables can run in parts on workers;
+[distributed-execution.md](distributed-execution.md) describes when, and how
+to deploy workers. On the Igloo server:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_WORKERS` | | Workers' addresses, `host[:port]` comma separated (port 7433 by default). A host may resolve to several workers, as a Kubernetes headless Service does. Empty turns distributed execution off. |
+| `IGLOO_WORKER_SECRET` | (required with `IGLOO_WORKERS`) | At least 32 characters, shared with the workers, which accept only holders of it |
+| `IGLOO_WORKER_COMPUTE` | | How Igloo starts and stops workers: `kubernetes`, `ec2`, `command`, or empty when they always run |
+| `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
+| `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
+| `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before running on the server |
+| `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | , Igloo's | `kubernetes`: the workers' Deployment and its namespace |
+| `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances, comma separated |
+| `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop every worker |
+
+Distributed execution keeps partial results in `IGLOO_DUCKDB_TEMP_DIR`, which
+must be set (the image sets it).
+
+A worker (`igloo worker`) reads `IGLOO_WORKER_SECRET`,
+`IGLOO_WORKER_LISTEN_ADDR` (`:7433`), and the server's settings for storage
+(`IGLOO_WAREHOUSE_LOCATION`, `IGLOO_ALLOWED_LOCATIONS`, `IGLOO_S3_*`,
+`IGLOO_GCS_*`, `IGLOO_AZURE_*`), DuckDB (`IGLOO_DUCKDB_*`), the read cache
+(`IGLOO_CACHE_*`), `IGLOO_HTTP_ADDR` (health checks and metrics) and logs.
+It needs no catalog, database or users.

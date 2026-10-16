@@ -340,6 +340,14 @@ reference for every setting mentioned here.
   storage access are bound by Igloo's grants in the catalog only.
 - **Health and metrics.** Port 8080 (`/healthz`, `/readyz`, `/metrics`) has no
   authentication. Expose it only to your orchestrator and monitoring.
+- **Distributed execution.** [Workers](docs/distributed-execution.md#security)
+  run parts of statements that Igloo has already authorized; the parts read
+  only the data files of the tables the statement reads, and workers refuse
+  files outside the warehouse and allowed locations. Their DuckDB has the
+  server's sandbox and no catalog. Igloo and its workers talk TLS 1.3 on port
+  7433 and accept only each other, with keys derived from
+  `IGLOO_WORKER_SECRET`: protect it like the object storage keys, since a
+  holder can make workers read any table.
 - **Web console.** Port 8443 serves the [web console](docs/console.md). Users
   sign in with their Igloo password, checked against the same SCRAM verifier,
   with the same failed-login delay, limits and logging as SQL logins, or

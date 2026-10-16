@@ -189,6 +189,29 @@ datasets up to a few hundred GB of compressed Parquet comfortably. To size
 one client's or team's compute apart from everyone else's, give them a
 [compute pool](workload-management.md#compute-pools).
 
+### When one machine is not enough
+
+Scale up first: one larger machine is the cheapest and simplest way to run
+bigger queries, and DuckDB spills joins, aggregations and sorts that do not
+fit in memory to disk. Two things eventually limit it:
+
+- **Scan time.** A replica scans compressed Parquet at roughly 64 to 300 MB/s
+  per thread, depending on the query and on whether the files come from
+  object storage or the [read cache](#read-cache). A query over a terabyte
+  takes minutes on even the largest machines, and object storage bandwidth
+  per machine is capped by its network.
+- **Memory.** Joins and aggregations with far more state than memory spill
+  heavily and slow down several times over.
+
+For those queries, run [workers](distributed-execution.md): a statement over
+a table that a replica would take more than a few seconds to scan runs in
+parts on them, and workers that are stopped are started for statements that
+would take more than a minute. Size workers like large replicas (many
+cores, about 4 GB per core, fast local disk, high network bandwidth) and put
+them on a node pool or machines that are stopped while idle. The
+[design document](design/distributed-execution.md#evidence) has the
+measurements behind these numbers.
+
 ## Read cache
 
 Reading table files from object storage is far slower than reading them
@@ -314,6 +337,10 @@ limiting work:
   the catalog, users and history: `pools` in the Helm chart, or
   `deploy/single-vm/compute-pool.yml` with Docker Compose.
 
+Statements over very large tables can also run in parts on
+[workers](distributed-execution.md), which any replica may use; workers are
+shared by all replicas and stopped once idle.
+
 ## Timeouts and limits
 
 - `IGLOO_STATEMENT_TIMEOUT` cancels statements that run too long (default: no
@@ -366,6 +393,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |
+| `igloo_distributed_*` | | [Distributed execution](distributed-execution.md#seeing-it): statements run on workers, fallbacks, tasks, workers available |
 
 Logs go to stderr, as text or JSON (`IGLOO_LOG_FORMAT=json`). Security-relevant
 events are logged at info level or above: `login`, `login failed`,
@@ -601,3 +629,6 @@ and the catalog runs its database migrations before it serves. Read
 | Log says `read cache off: its directory is not writable` | Make the volume at `IGLOO_CACHE_DIR` writable by the container's user (UID 65532), e.g. with `fsGroup: 65532` on Kubernetes. |
 | Log says `read cache paused` | Less than 5% of the cache's disk is free. Free space or give the cache its own volume; it resumes on its own. |
 | A task, pipe or `COPY INTO` does not do what you expect | See [loading troubleshooting](loading.md#troubleshooting). |
+| A large query did not run on workers | `SET distributed_execution = 'on'` and run it again with `IGLOO_LOG_LEVEL=debug`: the log says why it ran on the replica (for example a table with delete files, or an aggregate that does not combine). See [what runs distributed](distributed-execution.md#what-runs-distributed). |
+| Log says `workers could not run a statement; running it here` | Workers failed or could not be reached (`igloo_distributed_fallbacks_total` counts why). The statement still completed on the replica. Check the workers' logs and that they share `IGLOO_WORKER_SECRET` and Igloo's version. |
+| Log says `worker runs another version of Igloo; not using it` | Workers must run the same image as the server. Upgrade them together. |

@@ -207,6 +207,11 @@ Each [compute pool](workload-management.md#compute-pools) of the chart
 (`pools`) can scale to zero on its own, with a gateway of its own in front
 of its Service: one client's pool can stop overnight while another's runs.
 
+With [distributed execution](distributed-execution.md#kubernetes)
+(`workers.enabled`), the gateway also stops the worker Deployment when it
+stops Igloo, so workers never outlive the pods that start them; its service
+account may then patch that Deployment's scale too.
+
 Pods scaled to zero lose whatever their containers held, including the
 [read cache](operations.md#read-cache) unless `/var/lib/igloo/cache` is on a
 PersistentVolumeClaim, so the first queries after a start read every table
@@ -243,6 +248,7 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_K8S_DEPLOYMENT` | | `kubernetes`: Igloo's Deployment |
 | `IGLOO_GATEWAY_K8S_NAMESPACE` | the gateway's own | `kubernetes`: its namespace |
 | `IGLOO_GATEWAY_K8S_REPLICAS` | `1` | `kubernetes`: replicas to start |
+| `IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT` | | `kubernetes`: a Deployment of [distributed-execution workers](distributed-execution.md) to stop along with Igloo. Igloo starts them itself when a statement needs them. |
 | `IGLOO_GATEWAY_START_COMMAND`, `IGLOO_GATEWAY_STOP_COMMAND` | | `command`: shell commands that start and stop the compute |
 | `IGLOO_LOG_FORMAT`, `IGLOO_LOG_LEVEL` | `text`, `info` | As for the server |
 

@@ -160,6 +160,36 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - The web console's Tasks page lists alerts, with their runs from
   `igloo.alert_history`.
 
+### Distributed execution
+
+- Queries larger than one machine: a statement whose largest table would
+  take a replica more than a few seconds to scan runs in parts on worker
+  machines (`igloo worker`). Each worker reads a share of the table's data
+  files and every smaller table it is joined to, and returns partial results
+  that the coordinator combines; aggregates such as `count`, `sum`, `min`,
+  `max` and `avg`, aggregates over `DISTINCT` values, `GROUP BY` (with
+  `ROLLUP`, `CUBE` and `GROUPING SETS`), filters, top-N and joins to smaller
+  tables are covered. A join of the large table to a second table too large
+  for every worker to read is partitioned by its key through object
+  storage. Results are those of one machine. Igloo decides by itself when
+  to distribute; `SET distributed_execution` forces it on or off for a
+  session.
+- Workers start on demand and stop when idle: on Kubernetes the chart's
+  `workers.enabled` adds a worker Deployment that Igloo scales between zero
+  and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`
+  starts and stops them with EC2 or shell commands; Docker Compose has a
+  `workers` profile for trying it out. The scale-to-zero gateway stops
+  workers along with Igloo.
+- Grants and the sandbox hold: statements are authorized before they are
+  divided, workers read only the data files of the tables a statement
+  reads, with the server's sandbox and no catalog, and accept tasks only
+  over mutual TLS keyed by `IGLOO_WORKER_SECRET`. A failed worker's share
+  runs on another worker, and a statement that workers cannot run runs on
+  the coordinator. Canceling a statement or its `statement_timeout` stops
+  its parts.
+- `igloo.query_history` has a `workers` column; `igloo_distributed_*` and
+  `igloo_worker_*` metrics report statements, fallbacks, tasks and workers.
+
 ### Security and governance
 
 - Users with SCRAM-SHA-256 passwords, managed in SQL (`CREATE USER`,

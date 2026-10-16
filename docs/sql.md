@@ -245,6 +245,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `cpu_time_ms`, `bytes_read`, `memory_allocated_bytes` | What DuckDB measured while it ran; `NULL` for statements DuckDB did not run and ones that failed (see [resources](workload-management.md#resources-in-the-history)) |
 | `locations_read` | Locations outside the catalog that it read files from: `COPY INTO`'s, and the files a function such as `read_parquet` names; never external tables' files, which are read through the tables |
 | `job` | The task, pipe or materialized view it ran for, such as `task nightly`; `NULL` for a session's own statements |
+| `workers` | How many workers ran parts of the statement ([distributed execution](distributed-execution.md)); 0 when it ran on one replica |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,
@@ -650,6 +651,9 @@ the same users and grants; see [other engines](external-engines.md).
 - Session settings that PostgreSQL drivers send on connect
   (`application_name`, `extra_float_digits`, `DateStyle` and similar) are
   accepted and ignored. `statement_timeout` is honored.
+  `distributed_execution` (`auto`, `on` or `off`) is Igloo's own: whether
+  the session's statements may run in parts on workers
+  ([distributed execution](distributed-execution.md#when)).
 - `SET` of DuckDB settings that affect every session (memory, threads,
   secrets) is limited to admins, as are the read cache's functions and
   settings (`cache_httpfs_*`, see [operations](operations.md#read-cache)).
