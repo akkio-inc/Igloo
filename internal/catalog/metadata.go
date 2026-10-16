@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apache/iceberg-go"
 	icecat "github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/view"
@@ -230,8 +231,61 @@ func (c *Client) TableMetadata(ctx context.Context, schema, name string, isView 
 			t.Bytes = summaryCount(snap.Summary.Properties["total-files-size"])
 			t.Files = summaryCount(snap.Summary.Properties["total-data-files"])
 		}
+		if t.Bytes < 0 {
+			t.Bytes = c.dataBytes(ctx, tbl, snap)
+		}
 	}
 	return t, nil
+}
+
+// maxSizes bounds the snapshots whose sizes a Client keeps.
+const maxSizes = 100_000
+
+// sizeCache keeps what dataBytes worked out.
+type sizeCache struct {
+	mu    sync.Mutex
+	bytes map[string]int64
+}
+
+// dataBytes adds up the sizes of the data files of a table's snapshot
+// from its manifests, for snapshots whose summary does not say, as
+// DuckDB's do not; -1 when they cannot be read. The result is kept by
+// the snapshot's manifest list, which no other snapshot shares, so each
+// snapshot's manifests are read once.
+func (c *Client) dataBytes(ctx context.Context, tbl *table.Table, snap *table.Snapshot) int64 {
+	c.sizes.mu.Lock()
+	n, ok := c.sizes.bytes[snap.ManifestList]
+	c.sizes.mu.Unlock()
+	if ok {
+		return n
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return -1
+	}
+	manifests, err := snap.Manifests(fs)
+	if err != nil {
+		return -1
+	}
+	for _, m := range manifests {
+		if m.ManifestContent() != iceberg.ManifestContentData {
+			continue
+		}
+		entries, err := m.FetchEntries(fs, true)
+		if err != nil {
+			return -1
+		}
+		for _, e := range entries {
+			n += e.DataFile().FileSizeBytes()
+		}
+	}
+	c.sizes.mu.Lock()
+	defer c.sizes.mu.Unlock()
+	if c.sizes.bytes == nil || len(c.sizes.bytes) >= maxSizes {
+		c.sizes.bytes = map[string]int64{}
+	}
+	c.sizes.bytes[snap.ManifestList] = n
+	return n
 }
 
 func describeView(t *TableMeta, v *view.View) {

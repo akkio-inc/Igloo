@@ -159,7 +159,9 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 	if !isView && !isComment {
 		return nil, false, nil
 	}
-	if n, err := s.engine.CountStatements(query); err != nil || n != 1 {
+	// DuckDB's parser refuses COMMENT ON SCHEMA, which it cannot carry
+	// out; parseCommentCommand saw it end after its comment.
+	if n, err := s.engine.CountStatements(query); (err != nil || n != 1) && !(isComment && comment.kind == "SCHEMA") {
 		return nil, false, nil
 	}
 
