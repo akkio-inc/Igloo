@@ -27,8 +27,9 @@ import (
 
 // These tests attach the PostgreSQL of IGLOO_TEST_DATABASE_URL, and where
 // set the MySQL of IGLOO_TEST_MYSQL_URL (mysql://user:password@host:port/db),
-// as connections, with DuckDB's postgres and mysql extensions downloaded
-// once into DuckDB's default directory.
+// as connections, with DuckDB's postgres and mysql extensions from
+// IGLOO_TEST_EXTENSION_DIR (scripts/test.sh fills it), or downloaded once
+// into DuckDB's default directory without it.
 
 var (
 	extensionsOnce sync.Once
@@ -51,7 +52,11 @@ func needExtensions(t *testing.T) {
 			return
 		}
 		defer c.Close() //nolint:errcheck
-		for _, stmt := range []string{"INSTALL postgres", "INSTALL mysql"} {
+		var stmts []string
+		if dir := os.Getenv("IGLOO_TEST_EXTENSION_DIR"); dir != "" {
+			stmts = append(stmts, "SET extension_directory = "+quoteLiteral(dir))
+		}
+		for _, stmt := range append(stmts, "INSTALL postgres", "INSTALL mysql") {
 			if _, err := c.(*duckdb.Conn).ExecContext(ctx, stmt, nil); err != nil {
 				extensionsErr = err
 				return
@@ -114,7 +119,8 @@ func startFedServer(t *testing.T, store *federation.MemoryStore) *fedServer {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fed := federation.NewManager(store, federation.Options{}, log)
-	eng, err := engine.Open(ctx, config.Config{}, log, engine.BeforeLockdown(fed.Attach))
+	cfg := config.Config{DuckDB: config.DuckDB{ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")}}
+	eng, err := engine.Open(ctx, cfg, log, engine.BeforeLockdown(fed.Attach))
 	if err != nil {
 		t.Fatal(err)
 	}

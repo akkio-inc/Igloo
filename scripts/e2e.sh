@@ -42,6 +42,7 @@ cleanup() {
     compose logs --no-color --tail 80 igloo || true
   fi
   if [ "${KEEP_E2E:-}" != 1 ]; then
+    docker rm -f -v "$project-crm" "$project-ops" >/dev/null 2>&1 || true
     compose_pools --profile local-storage --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$work"
   else
@@ -906,6 +907,45 @@ else
   fail "history metrics: $(grep '^igloo_audit' <<<"$metrics")"
 fi
 
+echo "connections to other databases"
+# A client's CRM in PostgreSQL and an operational MySQL, on the stack's
+# network. Connections are attached when Igloo starts, so they are created
+# before the restart below and checked after it.
+crm_password=crm-password-1
+ops_password=ops-password-1
+docker run -d --name "$project-crm" --network "$network" -e POSTGRES_USER=crm -e POSTGRES_PASSWORD="$crm_password" \
+  -e POSTGRES_DB=crm postgres:17 >/dev/null
+docker run -d --name "$project-ops" --network "$network" -e MYSQL_ROOT_PASSWORD=root-password-1 -e MYSQL_DATABASE=ops \
+  -e MYSQL_USER=ops -e MYSQL_PASSWORD="$ops_password" mysql:8.4 >/dev/null
+until docker exec "$project-crm" pg_isready -U crm -d crm >/dev/null 2>&1; do sleep 1; done
+until docker exec "$project-ops" mysql -h127.0.0.1 -uops -p"$ops_password" -e 'SELECT 1' ops >/dev/null 2>&1; do sleep 2; done
+crm_sql() { docker exec -i "$project-crm" psql -U crm -d crm -v ON_ERROR_STOP=1 -qAt "$@"; }
+crm_sql -c "CREATE SCHEMA sales;
+  CREATE TABLE sales.customers (id int PRIMARY KEY, email text, region text);
+  INSERT INTO sales.customers SELECT g, 'c' || g || '@example.com', CASE WHEN g % 2 = 0 THEN 'east' ELSE 'west' END
+    FROM generate_series(1, 1000) g;
+  CREATE TABLE sales.pii (id int, ssn text);
+  INSERT INTO sales.pii VALUES (1, '123-45-6789');"
+docker exec "$project-ops" mysql -h127.0.0.1 -uops -p"$ops_password" ops -e "
+  CREATE TABLE campaigns (id INT PRIMARY KEY, customer_id INT, budget INT);
+  INSERT INTO campaigns VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300);" 2>/dev/null
+expect "admins register a PostgreSQL connection" "CREATE CONNECTION" igloo "$admin_password" \
+  "CREATE CONNECTION crmdb TYPE postgres WITH (host '$project-crm', database 'crm', user 'crm', password '$crm_password')"
+expect "and a MySQL one" "CREATE CONNECTION" igloo "$admin_password" \
+  "CREATE CONNECTION ops TYPE mysql WITH (host '$project-ops', port 3306, database 'ops', user 'ops', password '$ops_password')"
+expect_error "only admins do" 42501 walt walt-password-1 \
+  "CREATE CONNECTION evil TYPE postgres WITH (host 'postgres', database 'igloo', user 'igloo')"
+expect_error "and never to Igloo's own metadata database" 22023 igloo "$admin_password" \
+  "CREATE CONNECTION meta TYPE postgres WITH (host 'postgres', port 5432, database 'igloo', user 'igloo')"
+# connections prints each connection's name, state and password column.
+connections() { psql_admin -c "SHOW CONNECTIONS" | cut -d'|' -f1,12,7 | awk -F'|' '{print $1 "|" $3 "|" $2}' | sort; }
+got="$(connections)"
+if [ "$got" = "$(printf 'crmdb|not attached|stored\nops|not attached|stored')" ]; then
+  pass "connections attach when Igloo next starts"
+else
+  fail "SHOW CONNECTIONS before the restart: $got"
+fi
+
 echo "restart"
 # Read a table once so its files land in the read cache.
 psql_admin -c "CREATE TABLE cached AS SELECT range AS n, md5(range::VARCHAR) AS s FROM range(200000)" >/dev/null
@@ -936,6 +976,88 @@ expect "drop a pipe" "DROP PIPE" walt walt-password-1 "DROP PIPE e2e_pipe"
 expect "drop a task" "DROP TASK" walt walt-password-1 "DROP TASK e2e_task"
 expect "drop a materialized view" "DROP MATERIALIZED VIEW" walt walt-password-1 "DROP MATERIALIZED VIEW e2e_sales_totals"
 expect "policies survive a restart" "1|***@acme.com" nora nora-password-1 "SELECT id, email FROM crm.contacts"
+
+echo "connections after the restart"
+got="$(connections)"
+if [ "$got" = "$(printf 'crmdb|attached|stored\nops|attached|stored')" ]; then
+  pass "both connections are attached, and their passwords never shown again"
+else
+  fail "SHOW CONNECTIONS after the restart: $got"
+fi
+expect "admins join PostgreSQL, MySQL and Iceberg tables" "3|600" igloo "$admin_password" \
+  "SELECT count(*), sum(o.budget) FROM e2e i JOIN crmdb.sales.customers c ON c.id = i.id JOIN ops.ops.campaigns o ON o.customer_id = c.id"
+expect "filters reach the remote database" "500" igloo "$admin_password" \
+  "SELECT count(*) FROM crmdb.sales.customers WHERE region = 'east'"
+got="$(psql_admin -c "EXPLAIN SELECT email FROM crmdb.sales.customers WHERE region = 'east'")"
+if grep -q "POSTGRES_SCAN" <<<"$got" && grep -q "region='east'" <<<"$got"; then pass "the filter is pushed down"; else fail "pushdown: $got"; fi
+expect_error "readers need a grant on a connection" 42501 rita rita-password-1 "SELECT count(*) FROM crmdb.sales.customers"
+expect_error "so do users with no role" 42501 nora nora-password-1 "SELECT count(*) FROM crmdb.sales.customers"
+expect "the system catalogs list connections' tables" "2" nora nora-password-1 \
+  "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'crmdb' AND table_schema = 'sales'"
+expect "a grant on a table of a connection" "GRANT" igloo "$admin_password" "GRANT SELECT ON TABLE crmdb.sales.customers TO analysts"
+expect "lets a user with no role join it with Iceberg tables" "3" nora nora-password-1 \
+  "SELECT count(*) FROM e2e i JOIN crmdb.sales.customers c ON c.id = i.id"
+expect_error "but no other table of the connection" 42501 nora nora-password-1 "SELECT * FROM crmdb.sales.pii"
+expect_error "nor the other connection" 42501 nora nora-password-1 "SELECT * FROM ops.ops.campaigns"
+expect "a writer makes an Iceberg view of a connection's table" "CREATE VIEW" walt walt-password-1 \
+  "CREATE VIEW e2e_pii AS SELECT p.* FROM lake.public.e2e e JOIN crmdb.sales.pii p USING (id)"
+expect_error "which reads with the reader's grants" 42501 nora nora-password-1 "SELECT * FROM e2e_pii"
+expect "a grant on the whole connection" "GRANT" igloo "$admin_password" "GRANT SELECT ON CONNECTION ops TO rita"
+expect "covers its tables" "3" rita rita-password-1 "SELECT count(*) FROM ops.ops.campaigns"
+expect_error "readers still need a grant on the other connection" 42501 rita rita-password-1 "SELECT * FROM crmdb.sales.pii"
+expect_error "connections are read-only" 0LP01 igloo "$admin_password" "GRANT INSERT ON TABLE crmdb.sales.customers TO walt"
+if got="$(psql_admin -c "INSERT INTO crmdb.sales.customers VALUES (5000, 'x', 'y')")"; then
+  fail "an admin wrote to a connection"
+elif grep -qi "read-only" <<<"$got"; then
+  pass "even for admins"
+else
+  fail "write to a connection: $got"
+fi
+expect_error "no SQL runs on the remote server from strings" 42501 igloo "$admin_password" \
+  "SELECT * FROM postgres_query('crmdb', 'SELECT * FROM sales.pii')"
+expect_error "nor statements" 42501 igloo "$admin_password" "CALL postgres_execute('crmdb', 'DROP TABLE sales.pii')"
+expect_error "nor through MySQL" 42501 igloo "$admin_password" "SELECT * FROM mysql_query('ops', 'SELECT 1')"
+expect_error "nor to other servers" 42501 igloo "$admin_password" \
+  "SELECT * FROM postgres_scan('host=postgres user=igloo dbname=igloo', 'igloo_auth', 'users')"
+expect_error "a PIVOT reading a connection's data while preparing" 42501 nora nora-password-1 \
+  "PIVOT crmdb.sales.customers ON region USING count(*)"
+expect_soon "the history names what was read from connections" '["lake.public.e2e","crmdb.sales.customers"]' igloo "$admin_password" \
+  "SELECT tables_read FROM igloo.query_history WHERE user_name = 'nora' AND query_text LIKE '%JOIN crmdb.sales.customers%' AND outcome = 'ok' LIMIT 1"
+expect "connection passwords are never recorded" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '%$crm_password%' OR query_text LIKE '%$ops_password%'"
+if compose logs igloo 2>&1 | grep -q -e "$crm_password" -e "$ops_password"; then fail "a connection password is in the logs"; else pass "nor logged"; fi
+# Rotating the password: on the remote database, then in Igloo, no restart.
+crm_sql -c "ALTER ROLE crm PASSWORD 'crm-password-2'" >/dev/null
+expect "credentials rotate without a restart" "ALTER CONNECTION" igloo "$admin_password" \
+  "ALTER CONNECTION crmdb SET (password 'crm-password-2')"
+crm_sql -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'crm' AND pid <> pg_backend_pid()" >/dev/null
+expect "and the connection keeps working" "1000" igloo "$admin_password" "SELECT count(*) FROM crmdb.sales.customers"
+# One database going down breaks nothing else.
+docker stop -t 1 "$project-crm" >/dev/null
+expect "with a database down, catalogs still list its tables" "2" nora nora-password-1 \
+  "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'crmdb' AND table_schema = 'sales'"
+expect "and everything else works" "3|3" rita rita-password-1 \
+  "SELECT (SELECT count(*) FROM e2e), (SELECT count(*) FROM ops.ops.campaigns)"
+start=$SECONDS
+if got="$(psql_as nora nora-password-1 -c "SELECT count(*) FROM crmdb.sales.customers")"; then
+  fail "a query of a database that is down succeeded"
+elif grep -q "connection crmdb" <<<"$got" && [ $((SECONDS - start)) -lt 30 ]; then
+  pass "queries of it fail, quickly"
+else
+  fail "a query of a database that is down, after $((SECONDS - start))s: $got"
+fi
+docker start "$project-crm" >/dev/null
+until docker exec "$project-crm" pg_isready -U crm -d crm >/dev/null 2>&1; do sleep 1; done
+expect_soon "and work again once it is back" "1000" igloo "$admin_password" "SELECT count(*) FROM crmdb.sales.customers"
+expect "dropping a connection detaches it at once" "DROP CONNECTION" igloo "$admin_password" "DROP CONNECTION ops"
+if got="$(psql_admin -c "SELECT * FROM ops.ops.campaigns")"; then
+  fail "a dropped connection's table is still there"
+elif grep -q "does not exist" <<<"$got"; then
+  pass "and its tables are gone"
+else
+  fail "a dropped connection's table: $got"
+fi
+if psql_admin -c "SHOW GRANTS" | grep -q "|ops"; then fail "a dropped connection's grants remain"; else pass "with its grants"; fi
 expect "drop a view" "DROP VIEW" walt walt-password-1 "DROP VIEW e2e_big"
 expect_error "a dropped view is gone" 42P01 walt walt-password-1 "DROP VIEW e2e_big"
 

@@ -30,7 +30,8 @@ import (
 // These tests run against the PostgreSQL of IGLOO_TEST_DATABASE_URL and
 // the MySQL of IGLOO_TEST_MYSQL_URL (mysql://user:password@host:port/db),
 // which scripts/test.sh starts, with DuckDB's postgres and mysql extensions
-// downloaded once into DuckDB's default directory.
+// from IGLOO_TEST_EXTENSION_DIR (scripts/test.sh fills it), or downloaded
+// once into DuckDB's default directory without it.
 
 var installOnce sync.Once
 var installErr error
@@ -53,7 +54,7 @@ func installExtensions(t *testing.T) {
 			return
 		}
 		defer c.Close() //nolint:errcheck
-		for _, stmt := range []string{"INSTALL postgres", "INSTALL mysql"} {
+		for _, stmt := range append(useExtensionDir(), "INSTALL postgres", "INSTALL mysql") {
 			if _, err := c.(*duckdb.Conn).ExecContext(ctx, stmt, nil); err != nil {
 				installErr = err
 				return
@@ -63,6 +64,15 @@ func installExtensions(t *testing.T) {
 	if installErr != nil {
 		t.Skipf("cannot install DuckDB's postgres and mysql extensions: %v", installErr)
 	}
+}
+
+// useExtensionDir returns the statement that points a DuckDB connection at
+// IGLOO_TEST_EXTENSION_DIR, if it is set.
+func useExtensionDir() []string {
+	if dir := os.Getenv("IGLOO_TEST_EXTENSION_DIR"); dir != "" {
+		return []string{"SET extension_directory = '" + strings.ReplaceAll(dir, "'", "''") + "'"}
+	}
+	return nil
 }
 
 // remote is a database the tests reach.
@@ -106,7 +116,8 @@ func startEngine(t *testing.T, store Store) (*Manager, *engine.Engine) {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := NewManager(store, Options{}, log)
-	eng, err := engine.Open(context.Background(), config.Config{}, log, engine.BeforeLockdown(m.Attach))
+	cfg := config.Config{DuckDB: config.DuckDB{ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")}}
+	eng, err := engine.Open(context.Background(), cfg, log, engine.BeforeLockdown(m.Attach))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,12 +393,12 @@ func TestMySQLConnection(t *testing.T) {
 	}
 	defer sc.Close() //nolint:errcheck
 	dsn := "host=" + my.host + " port=" + strconv.Itoa(my.port) + " user=" + my.user + " password=" + my.password + " database=" + my.database
-	for _, sql := range []string{
+	for _, sql := range append(useExtensionDir(),
 		"LOAD mysql",
-		"ATTACH '" + dsn + "' AS setup (TYPE mysql)",
-		"CALL mysql_execute('setup', 'CREATE TABLE " + table + " (id INT PRIMARY KEY, name VARCHAR(50), budget DECIMAL(10,2))')",
-		"CALL mysql_execute('setup', 'INSERT INTO " + table + " VALUES (1, ''spring'', 1000), (2, ''summer'', 2000), (3, ''fall'', 3000)')",
-	} {
+		"ATTACH '"+dsn+"' AS setup (TYPE mysql)",
+		"CALL mysql_execute('setup', 'CREATE TABLE "+table+" (id INT PRIMARY KEY, name VARCHAR(50), budget DECIMAL(10,2))')",
+		"CALL mysql_execute('setup', 'INSERT INTO "+table+" VALUES (1, ''spring'', 1000), (2, ''summer'', 2000), (3, ''fall'', 3000)')",
+	) {
 		if _, err := sc.(*duckdb.Conn).ExecContext(ctx, sql, nil); err != nil {
 			t.Fatal(err)
 		}
