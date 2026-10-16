@@ -29,7 +29,7 @@ func TestProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go p.Serve() //nolint:errcheck
+	go p.Serve()    //nolint:errcheck
 	defer p.Close() //nolint:errcheck
 
 	file := func(sig string) remoteFile {

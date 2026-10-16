@@ -120,8 +120,8 @@ func newFixture(t *testing.T) *fixture {
 		"public.campaigns": {
 			tableID: "11111111-2222-3333-4444-555555555555", comment: "Campaign spend", version: 7, timestamp: 1_800_000_000_000,
 			schema: `{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}`,
-			files: []dataFile{{path: "file://" + path, size: int64(len(data)), count: 10, stats: `{"numRecords":10}`}},
-			size:  int64(len(data)),
+			files:  []dataFile{{path: "file://" + path, size: int64(len(data)), count: 10, stats: `{"numRecords":10}`}},
+			size:   int64(len(data)),
 		},
 		"public.secret": {tableID: "x", version: 1, schema: `{"type":"struct","fields":[]}`},
 	}}
