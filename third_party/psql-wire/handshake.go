@@ -1,0 +1,358 @@
+package wire
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net"
+	"strings"
+
+	"github.com/jeroenrinzema/psql-wire/codes"
+	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
+	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
+	"github.com/jeroenrinzema/psql-wire/pkg/types"
+)
+
+// Handshake performs the connection handshake and returns the connection
+// version and a buffered reader to read incoming messages send by the client.
+func (srv *Server) Handshake(conn net.Conn) (_ net.Conn, version types.Version, reader *buffer.Reader, err error) {
+	reader = buffer.NewReader(srv.logger, conn, srv.BufferedMsgSize)
+	version, err = srv.readVersion(reader)
+	if err != nil {
+		return conn, version, reader, err
+	}
+
+	// TODO: support GSS encryption
+	//
+	// `psql-wire` currently does not support GSS encrypted connections. The GSS
+	// authentication API is supported inside the PostgreSQL wire protocol and
+	// API's should be made available to support these type of connections.
+	// https://www.postgresql.org/docs/current/gssapi-auth.html
+	// https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.6.7.13
+	if version == types.VersionGSSENC {
+		_, err := conn.Write([]byte{'N'})
+		if err != nil {
+			return conn, version, reader, err
+		}
+
+		return srv.Handshake(conn)
+	}
+
+	conn, reader, version, err = srv.potentialConnUpgrade(conn, reader, version)
+	if err != nil {
+		return conn, version, reader, err
+	}
+
+	if version == types.VersionCancel {
+		processID, secretKey, err := srv.readCancelRequest(reader)
+		if err != nil {
+			return conn, version, reader, err
+		}
+
+		srv.logger.Debug("Received cancel request")
+
+		if srv.CancelRequest != nil {
+			ctx := context.Background()
+			err = srv.CancelRequest(ctx, processID, secretKey)
+			if err != nil {
+				srv.logger.Error("Failed to handle cancel request", "err", err)
+			}
+		} else {
+			srv.logger.Debug("Cancel request received but no handler configured")
+		}
+
+		return conn, version, reader, nil
+	}
+
+	return conn, version, reader, nil
+}
+
+// readVersion reads the start-up protocol version (uint32) and the
+// buffer containing the rest.
+func (srv *Server) readVersion(reader *buffer.Reader) (_ types.Version, err error) {
+	var version uint32
+	_, err = reader.ReadUntypedMsg()
+	if err != nil {
+		return 0, err
+	}
+
+	version, err = reader.GetUint32()
+	if err != nil {
+		return 0, err
+	}
+
+	return types.Version(version), nil
+}
+
+// readCancelRequest reads the cancel request parameters (processID and secretKey)
+// from the client connection. The full cancel request format is:
+// Int32(16) - Length of message contents in bytes, including self
+// Int32(80877102) - The cancel request code (already read as version)
+// Int32 - The process ID of the target backend
+// Int32 - The secret key for the target backend
+// The first two fields are already handled by readVersion, so this only needs
+// to read the last two fields.
+func (srv *Server) readCancelRequest(reader *buffer.Reader) (processID int32, secretKey int32, err error) {
+	processID, err = reader.GetInt32()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read process ID from cancel request: %w", err)
+	}
+
+	secretKey, err = reader.GetInt32()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read secret key from cancel request: %w", err)
+	}
+
+	return processID, secretKey, nil
+}
+
+// readyForQuery writes a ReadyForQuery message with the transaction status
+// reported by the configured [Server.TxStatus] handler (or ServerIdle if none
+// is configured). This message should be written when a command cycle has
+// been completed.
+//
+// Reporting idle on the wire means "no transaction in progress", and in
+// PostgreSQL portals live only inside a transaction — so whenever we report
+// idle we also drop the session's portals.
+func (srv *Session) readyForQuery(ctx context.Context, writer *buffer.Writer) error {
+	status := srv.txStatus(ctx)
+	if status == types.ServerIdle && srv.Portals != nil {
+		srv.Portals.Close()
+	}
+
+	writer.Start(types.ServerReady)
+	writer.AddByte(byte(status))
+	if err := writer.End(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// txStatus returns the byte that should be written into the next ReadyForQuery
+// message. It defers to the configured TxStatus handler when set; otherwise it
+// returns ServerIdle, preserving the pre-existing behavior for servers that
+// don't track transaction state.
+func (srv *Server) txStatus(ctx context.Context) types.ServerStatus {
+	if srv.TxStatus != nil {
+		return srv.TxStatus(ctx)
+	}
+	return types.ServerIdle
+}
+
+// protocolOptionPrefix identifies protocol-level options inside the startup
+// packet parameter list. Any parameter whose key starts with this prefix is
+// reserved for protocol extensions rather than being a regular server
+// (GUC) parameter.
+const protocolOptionPrefix = "_pq_."
+
+// readParameters reads the key/value connection parameters send by the client and
+// The read parameters will be set inside the given context. A new context containing
+// the consumed parameters will be returned. Any parameter prefixed with
+// `_pq_.` is a protocol extension option; since this library does not
+// implement any such extension the keys are collected and returned so they can
+// be reported back to the client through a NegotiateProtocolVersion message.
+func (srv *Server) readClientParameters(ctx context.Context, reader *buffer.Reader) (_ context.Context, unrecognizedOptions []string, err error) {
+	meta := make(Parameters)
+
+	srv.logger.Debug("reading client parameters")
+
+	for {
+		key, err := reader.GetString()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// an empty key indicates the end of the connection parameters
+		if len(key) == 0 {
+			break
+		}
+
+		value, err := reader.GetString()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if strings.HasPrefix(key, protocolOptionPrefix) {
+			srv.logger.Debug("unrecognized protocol option", slog.String("key", key))
+			unrecognizedOptions = append(unrecognizedOptions, key)
+			continue
+		}
+
+		srv.logger.Debug("client parameter", slog.String("key", key), slog.String("value", value))
+		meta[ParameterStatus(key)] = value
+	}
+
+	return setClientParameters(ctx, meta), unrecognizedOptions, nil
+}
+
+// checkProtocolVersion validates that the client requested a protocol major
+// version this library implements. Unlike the minor version, a differing major
+// version cannot be negotiated down to a supported one, so — matching the
+// PostgreSQL backend — the connection is rejected with a fatal error instead.
+// The error is written to the client before it is returned so the caller can
+// close the connection.
+func (srv *Server) checkProtocolVersion(writer *buffer.Writer, version types.Version) error {
+	if version.Major() == types.VersionLatest.Major() {
+		return nil
+	}
+
+	err := psqlerr.WithSeverity(
+		psqlerr.WithCode(
+			fmt.Errorf("unsupported frontend protocol %d.%d: server supports %d.0 to %d.%d",
+				version.Major(), version.Minor(),
+				types.VersionLatest.Major(),
+				types.VersionLatest.Major(), types.VersionLatest.Minor()),
+			codes.FeatureNotSupported),
+		psqlerr.LevelFatal)
+
+	if werr := WriteUnterminatedError(writer, err); werr != nil {
+		return werr
+	}
+
+	return err
+}
+
+// writeProtocolVersionNegotiation potentially informs the client that the
+// server speaks an older protocol version than the one requested, and lists
+// any protocol options that were not recognized. Following the PostgreSQL
+// backend, a NegotiateProtocolVersion message is only written when the client
+// requested a newer minor version than we implement or when it sent protocol
+// options we do not understand. When neither is the case this is a no-op and
+// the connection continues using the requested version.
+//
+// The negotiated version reported to the client is the older of the requested
+// version and the latest version this library implements, matching the
+// PostgreSQL behaviour of downgrading rather than rejecting the connection.
+func (srv *Server) writeProtocolVersionNegotiation(writer *buffer.Writer, requested types.Version, unrecognizedOptions []string) error {
+	if requested.Minor() <= types.VersionLatest.Minor() && len(unrecognizedOptions) == 0 {
+		return nil
+	}
+
+	negotiated := requested
+	if negotiated > types.VersionLatest {
+		negotiated = types.VersionLatest
+	}
+
+	srv.logger.Debug("negotiating protocol version",
+		slog.Uint64("requested", uint64(requested)),
+		slog.Uint64("negotiated", uint64(negotiated)),
+		slog.Int("unrecognized_options", len(unrecognizedOptions)),
+	)
+
+	writer.Start(types.ServerNegotiateVersion)
+	writer.AddInt32(int32(negotiated))
+	writer.AddInt32(int32(len(unrecognizedOptions)))
+	for _, option := range unrecognizedOptions {
+		writer.AddString(option)
+		writer.AddNullTerminate()
+	}
+
+	return writer.End()
+}
+
+// writeParameters writes the server parameters such as client encoding to the client.
+// The written parameters will be attached as a value to the given context. A new
+// context containing the written parameters will be returned.
+// https://www.postgresql.org/docs/10/libpq-status.html
+func (srv *Server) writeParameters(ctx context.Context, writer *buffer.Writer, params Parameters) (_ context.Context, err error) {
+	if params == nil {
+		params = make(Parameters, 4)
+	} else {
+		params = maps.Clone(params)
+	}
+
+	srv.logger.Debug("writing server parameters")
+
+	params[ParamServerEncoding] = "UTF8"
+	params[ParamClientEncoding] = "UTF8"
+	if srv.Version != "" {
+		params[ParamServerVersion] = srv.Version
+	}
+	params[ParamIsSuperuser] = buffer.EncodeBoolean(IsSuperUser(ctx))
+	params[ParamSessionAuthorization] = AuthenticatedUsername(ctx)
+	params[ParamServerVersion] = fmt.Sprintf("%d", 15*10000) // 15.1.2 => 15*10000 + 1*100 + 2*1 => 15102
+
+	for key, value := range params {
+		srv.logger.Debug("server parameter", slog.String("key", string(key)), slog.String("value", value))
+
+		writer.Start(types.ServerParameterStatus)
+		writer.AddString(string(key))
+		writer.AddNullTerminate()
+		writer.AddString(value)
+		writer.AddNullTerminate()
+		err = writer.End()
+		if err != nil {
+			return ctx, err
+		}
+	}
+
+	return setServerParameters(ctx, params), nil
+}
+
+// potentialConnUpgrade potentially upgrades the given connection using TLS
+// if the client requests for it. The connection upgrade is ignored if the
+// server does not support a secure connection.
+func (srv *Server) potentialConnUpgrade(conn net.Conn, reader *buffer.Reader, version types.Version) (_ net.Conn, _ *buffer.Reader, _ types.Version, err error) {
+	if version != types.VersionSSLRequest {
+		if srv.ClientAuth == tls.RequireAndVerifyClientCert {
+			srv.logger.Warn("client is requesting nil TLS, but the server mandates TLS")
+			return conn, reader, version, fmt.Errorf("client is requesting nil TLS, but the server mandates TLS")
+		}
+
+		return conn, reader, version, nil
+	}
+
+	srv.logger.Debug("attempting to upgrade the client to a TLS connection")
+
+	if srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+		if srv.ClientAuth == tls.RequireAndVerifyClientCert {
+			srv.logger.Warn("server mandates TLS, but does not possess the requisite certificates")
+			return conn, reader, version, fmt.Errorf("server mandates TLS, but does not possess the requisite certificates")
+		}
+
+		srv.logger.Debug("no TLS certificates available continuing with a insecure connection")
+		return srv.sslUnsupported(conn, reader, version)
+	}
+
+	_, err = conn.Write(sslSupported)
+	if err != nil {
+		return conn, reader, version, err
+	}
+
+	// NOTE: initialize the TLS connection and construct a new buffered
+	// reader for the constructed TLS connection.
+	conn = tls.Server(conn, srv.TLSConfig)
+	reader = buffer.NewReader(srv.logger, conn, srv.BufferedMsgSize)
+
+	version, err = srv.readVersion(reader)
+	if err != nil {
+		return conn, reader, version, err
+	}
+
+	srv.logger.Debug("connection has been upgraded successfully")
+	return conn, reader, version, err
+}
+
+// sslUnsupported announces to the PostgreSQL client that we are unable to
+// upgrade the connection to a secure connection at this time. The client
+// version is read again once the insecure connection has been announced.
+func (srv *Server) sslUnsupported(conn net.Conn, reader *buffer.Reader, version types.Version) (_ net.Conn, _ *buffer.Reader, _ types.Version, err error) {
+	_, err = conn.Write(sslUnsupported)
+	if err != nil {
+		return conn, reader, version, err
+	}
+
+	version, err = srv.readVersion(reader)
+	if err != nil {
+		return conn, reader, version, err
+	}
+
+	if version == types.VersionCancel {
+		return conn, reader, version, errors.New("unexpected cancel version after upgrading the client connection")
+	}
+
+	return conn, reader, version, nil
+}

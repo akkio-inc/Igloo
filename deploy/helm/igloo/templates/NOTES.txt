@@ -1,0 +1,64 @@
+{{- $ns := .Release.Namespace -}}
+{{- $svc := include "igloo.fullname" . -}}
+{{- $secret := .Values.admin.existingSecret | default (include "igloo.secretName" .) -}}
+{{- $key := ternary "password" "admin-password" (not (empty .Values.admin.existingSecret)) -}}
+{{- $sslmode := ternary "require" "disable" (not (empty .Values.tls.existingSecret)) -}}
+Igloo {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" in namespace "{{ $ns }}".
+
+On first start the igloo pods wait for PostgreSQL and the catalog, then
+create the warehouse; this can take a few minutes. Watch them with:
+
+  kubectl --namespace {{ $ns }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} --watch
+
+1. Read the password of the admin user "{{ .Values.admin.user }}":
+
+  export PGPASSWORD="$(kubectl --namespace {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.{{ $key }}}' | base64 --decode)"
+
+2. Connect from your machine through a port-forward:
+
+  kubectl --namespace {{ $ns }} port-forward service/{{ $svc }} 5433:{{ .Values.service.port }}
+  psql "host=127.0.0.1 port=5433 user={{ .Values.admin.user }} dbname=igloo sslmode={{ $sslmode }}"
+
+   Inside the cluster, connect to {{ $svc }}.{{ $ns }}.svc:{{ .Values.service.port }}.
+{{- if eq .Values.service.type "LoadBalancer" }}
+
+3. The load balancer's address (it can take a minute to appear):
+
+  kubectl --namespace {{ $ns }} get service {{ $svc }} -o jsonpath='{.status.loadBalancer.ingress[0]}'
+{{- end }}
+
+Health and Prometheus metrics: http://{{ include "igloo.metricsServiceName" . }}.{{ $ns }}.svc:8080/metrics
+Check the release with: helm test {{ .Release.Name }} --namespace {{ $ns }}
+{{- if and (eq .Values.service.type "LoadBalancer") (not .Values.tls.existingSecret) }}
+
+WARNING: service.type is LoadBalancer but TLS is off (tls.existingSecret is
+empty). Passwords and query results cross the network unencrypted. Create a
+kubernetes.io/tls Secret and set tls.existingSecret.
+{{- end }}
+{{- if and (eq .Values.service.type "LoadBalancer") (not .Values.service.loadBalancerSourceRanges) }}
+
+WARNING: service.loadBalancerSourceRanges is empty, so the SQL port accepts
+connections from any address the load balancer can reach. List your client
+CIDRs there.
+{{- end }}
+{{- if and .Values.podDisruptionBudget.enabled (not .Values.autoscaling.enabled) (le (int .Values.replicaCount) (int .Values.podDisruptionBudget.minAvailable)) }}
+
+WARNING: replicaCount ({{ .Values.replicaCount }}) is not above podDisruptionBudget.minAvailable
+({{ .Values.podDisruptionBudget.minAvailable }}), so node drains will wait forever. Add replicas or set
+podDisruptionBudget.enabled=false.
+{{- end }}
+{{- if or .Values.postgresql.enabled .Values.objectStorage.enabled }}
+
+NOTE: the bundled{{ if .Values.postgresql.enabled }} PostgreSQL{{ end }}{{ if and .Values.postgresql.enabled .Values.objectStorage.enabled }} and{{ end }}{{ if .Values.objectStorage.enabled }} object store{{ end }} run as single pods
+with one volume each: fine for development and small on-prem installs, not
+highly available.
+{{- end }}
+{{- if or (not .Values.admin.existingSecret) (not .Values.catalog.encryptionKey.existingSecret) .Values.postgresql.enabled .Values.objectStorage.enabled }}
+
+Generated passwords and keys are in Secret "{{ include "igloo.secretName" . }}". `helm uninstall` keeps
+it, and the PersistentVolumeClaims, so reinstalling the release finds its data
+again. To remove everything:
+
+  kubectl --namespace {{ $ns }} delete secret {{ include "igloo.secretName" . }}
+  kubectl --namespace {{ $ns }} delete pvc -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- end }}

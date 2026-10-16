@@ -1,0 +1,149 @@
+{{- /*
+Lakekeeper, the Iceberg REST catalog. It runs without authentication: only
+igloo pods may reach it (see networkpolicy.yaml), and its Service is always
+ClusterIP.
+*/ -}}
+{{- $catalogDb := include "igloo.catalogDatabaseRef" . | fromYaml -}}
+{{- $catalogName := include "igloo.catalogName" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $catalogName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "catalog") | nindent 4 }}
+spec:
+  replicas: {{ .Values.catalog.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "catalog") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "igloo.podLabels" (dict "root" . "component" "catalog") | nindent 8 }}
+        {{- with .Values.catalog.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/secret: {{ include "igloo.secretData" . | sha256sum }}
+        {{- with .Values.catalog.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "igloo.catalogServiceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- include "igloo.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        # The image runs as root by default; its binary lives in the home of
+        # the distroless "nonroot" user.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Wait for PostgreSQL (up to 3 minutes; it may be starting alongside),
+        # then migrate the catalog schema. Migrations are idempotent and take a
+        # lock, so several replicas can run them at once.
+        - name: wait-for-db
+          image: {{ include "igloo.catalogImage" . }}
+          imagePullPolicy: {{ .Values.catalog.image.pullPolicy }}
+          args: ["wait-for-db", "-d", "-r", "90", "-b", "2"]
+          env:
+            {{- include "igloo.catalogEnv" (list . $catalogDb) | nindent 12 }}
+          securityContext:
+            {{- include "igloo.catalogSecurityContext" . | nindent 12 }}
+          {{- with .Values.catalog.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: migrate
+          image: {{ include "igloo.catalogImage" . }}
+          imagePullPolicy: {{ .Values.catalog.image.pullPolicy }}
+          args: ["migrate"]
+          env:
+            {{- include "igloo.catalogEnv" (list . $catalogDb) | nindent 12 }}
+          securityContext:
+            {{- include "igloo.catalogSecurityContext" . | nindent 12 }}
+          {{- with .Values.catalog.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      containers:
+        - name: lakekeeper
+          image: {{ include "igloo.catalogImage" . }}
+          imagePullPolicy: {{ .Values.catalog.image.pullPolicy }}
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8181
+              protocol: TCP
+          env:
+            {{- include "igloo.catalogEnv" (list . $catalogDb) | nindent 12 }}
+          # /health reports the database too; liveness only checks the port,
+          # so a database outage does not restart the catalog.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          securityContext:
+            {{- include "igloo.catalogSecurityContext" . | nindent 12 }}
+          {{- with .Values.catalog.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.catalog.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.catalog.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.catalog.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $catalogName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "catalog") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "catalog") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8181
+      targetPort: http
+      protocol: TCP
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.catalog.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $catalogName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "catalog") | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "catalog") | nindent 6 }}
+{{- end }}

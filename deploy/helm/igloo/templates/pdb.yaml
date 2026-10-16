@@ -1,0 +1,14 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "igloo.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 6 }}
+{{- end }}

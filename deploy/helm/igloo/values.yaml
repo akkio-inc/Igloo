@@ -1,0 +1,309 @@
+# Values for the Igloo chart. Environment variables named below are documented
+# in docs/configuration.md.
+#
+# Required: a warehouse location (storage.warehouseLocation, or
+# objectStorage.enabled=true) and a PostgreSQL database (metadataDatabase /
+# catalog.database, or postgresql.enabled=true). For a self-contained
+# development install:
+#
+#   helm install igloo ./igloo --set postgresql.enabled=true --set objectStorage.enabled=true
+
+image:
+  repository: ghcr.io/akkio-inc/igloo
+  # Empty uses the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Pull secrets for every image in the chart.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Igloo pods. Each one is a complete query engine; they share the catalog and
+# the users database, and keep nothing but spill files locally.
+replicaCount: 2
+
+admin:
+  # -> IGLOO_ADMIN_USER. Lowercase letters, digits and underscores.
+  user: igloo
+  # Secret with key "password" -> IGLOO_ADMIN_PASSWORD. Takes precedence over
+  # admin.password.
+  existingSecret: ""
+  # Used when existingSecret is empty. If both are empty the chart generates a
+  # password and keeps it across upgrades. Igloo uses it only to create the
+  # account on first start; change it later with ALTER USER.
+  password: ""
+
+# PostgreSQL database for Igloo's users (schema "igloo"). Usually the same
+# database as the catalog's. When this is empty Igloo uses catalog.database, and
+# when both are empty, the bundled PostgreSQL (postgresql.enabled).
+metadataDatabase:
+  # Secret with key "url" (postgresql://...) -> IGLOO_METADATA_DATABASE_URL.
+  existingSecret: ""
+  url: ""
+
+storage:
+  # Where table data lives -> IGLOO_WAREHOUSE_LOCATION. One of
+  #   s3://bucket/warehouse
+  #   gs://bucket/warehouse
+  #   abfss://filesystem@account.dfs.core.windows.net/warehouse
+  # Defaults to s3://<objectStorage.bucket>/warehouse when objectStorage.enabled.
+  warehouseLocation: ""
+  # Extra URL prefixes users may read and write, e.g. a landing bucket for
+  # COPY -> IGLOO_ALLOWED_LOCATIONS.
+  allowedLocations: []
+  s3:
+    # host:port of an S3-compatible store. Empty means AWS -> IGLOO_S3_ENDPOINT.
+    endpoint: ""
+    region: us-east-1
+    # vhost for AWS, path for most self-hosted stores.
+    urlStyle: vhost
+    useSSL: true
+    # Secret with keys "access-key-id" and "secret-access-key". Empty uses the
+    # AWS credential chain (IRSA, EKS Pod Identity); then set
+    # catalog.systemCredentials=aws.
+    existingSecret: ""
+  gcs:
+    # Secret with keys "hmac-key-id" and "hmac-secret" -> IGLOO_GCS_HMAC_*.
+    # Required for gs:// locations; also set catalog.systemCredentials=gcp.
+    existingSecret: ""
+  azure:
+    # Secret with key "account-key" -> IGLOO_AZURE_ACCOUNT_KEY. Empty uses
+    # workload identity; then set catalog.systemCredentials=azure.
+    existingSecret: ""
+
+duckdb:
+  # -> IGLOO_DUCKDB_MEMORY_LIMIT, e.g. "6GB". Empty: 80% of
+  # resources.limits.memory, leaving at least 512Mi for the rest of the
+  # process, so queries spill to disk before the container is OOM-killed.
+  memoryLimit: ""
+  # -> IGLOO_DUCKDB_THREADS. null: one per core of the node.
+  threads: null
+  # -> IGLOO_DUCKDB_MAX_TEMP_SIZE, e.g. "40GiB": the most spill space one pod
+  # may use. Empty: 90% of spillVolume.sizeLimit, so a query that needs more
+  # fails instead of getting the pod evicted.
+  maxTempSize: ""
+  spillVolume:
+    # emptyDir for DuckDB spill files at /var/lib/igloo/tmp.
+    sizeLimit: 50Gi
+    # "" (node disk) or "Memory".
+    medium: ""
+
+# kubernetes.io/tls Secret (tls.crt, tls.key) -> IGLOO_TLS_CERT_FILE and
+# IGLOO_TLS_KEY_FILE. Igloo reads it at start; restart pods after rotating it.
+tls:
+  existingSecret: ""
+
+# Cancel statements that run longer, e.g. "30m" (a Go duration) ->
+# IGLOO_STATEMENT_TIMEOUT. Empty: no limit. Sessions can change their own
+# limit with SET statement_timeout.
+statementTimeout: ""
+# Concurrent client sessions per igloo pod -> IGLOO_MAX_CONNECTIONS. Further
+# logins get "too many clients".
+maxConnections: 100
+# On shutdown, keep accepting connections this long while reporting not
+# ready, so the Service stops routing here first -> IGLOO_SHUTDOWN_DELAY.
+# Keep terminationGracePeriodSeconds above this plus 30s of query draining.
+shutdownDelay: 5s
+
+# Automatic table maintenance: compaction, snapshot expiry and orphan file
+# cleanup. Replicas take turns through a lock in the metadata database.
+maintenance:
+  # -> IGLOO_MAINTENANCE. Turn off only if another tool maintains the tables.
+  enabled: true
+  # How long old snapshots, and so time travel, are kept, e.g. "7d" or "36h"
+  # -> IGLOO_SNAPSHOT_RETENTION. A table's
+  # history.expire.max-snapshot-age-ms property overrides it.
+  snapshotRetention: 7d
+
+log:
+  # text or json -> IGLOO_LOG_FORMAT
+  format: text
+  # debug, info, warn or error -> IGLOO_LOG_LEVEL
+  level: info
+
+# Extra environment variables (Kubernetes EnvVar objects) appended to the igloo
+# container, for any IGLOO_* setting without a dedicated value, e.g.
+#   - name: IGLOO_CATALOG_SCHEMA
+#     value: analytics
+extraEnv: []
+
+serviceAccount:
+  create: true
+  # Defaults to the release fullname. Workload identity bindings refer to it.
+  name: ""
+  # e.g. eks.amazonaws.com/role-arn, iam.gke.io/gcp-service-account,
+  # azure.workload.identity/client-id
+  annotations: {}
+
+# Added to igloo pods, e.g. azure.workload.identity/use: "true".
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+# Empty: prefer spreading igloo pods across nodes.
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests: { cpu: "2", memory: 8Gi }
+  limits: { memory: 8Gi }
+
+# Igloo stops accepting queries on SIGTERM and gives running ones 30 seconds.
+terminationGracePeriodSeconds: 45
+# e.g. {preStop: {sleep: {seconds: 5}}} (Kubernetes 1.30+) so load balancers
+# stop sending new connections before the pod shuts down.
+lifecycle: {}
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# On first start Igloo waits up to 3 minutes for the database and the catalog,
+# then bootstraps the catalog; /healthz answers once it serves SQL.
+startupProbe:
+  httpGet: { path: /healthz, port: http }
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 60
+livenessProbe:
+  httpGet: { path: /healthz, port: http }
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+# /readyz checks DuckDB, the users database and the catalog.
+readinessProbe:
+  httpGet: { path: /readyz, port: http }
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+service:
+  # LoadBalancer exposes SQL outside the cluster; turn on TLS first.
+  type: ClusterIP
+  port: 5432
+  annotations: {}
+  # Client CIDRs allowed through a LoadBalancer.
+  loadBalancerSourceRanges: []
+  loadBalancerClass: ""
+  # Cluster or Local (LoadBalancer and NodePort only).
+  externalTrafficPolicy: ""
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Prometheus metrics are served on port 8080 at /metrics, through the
+# <fullname>-metrics ClusterIP Service (never through the SQL Service).
+metrics:
+  serviceMonitor:
+    # Requires the Prometheus Operator CRDs.
+    enabled: false
+    interval: 30s
+    scrapeTimeout: ""
+    labels: {}
+
+# Ingress rules only; egress is not restricted (pods need DNS, PostgreSQL,
+# object storage and cloud identity endpoints). Lakekeeper accepts connections
+# only from igloo pods, the bundled PostgreSQL and object store only from igloo
+# and Lakekeeper pods.
+networkPolicy:
+  enabled: true
+  # NetworkPolicy peers allowed to reach the SQL port. Empty: everyone (the
+  # Service type and loadBalancerSourceRanges decide who that is).
+  sqlFrom: []
+  # Peers allowed to reach the metrics/health port 8080. Empty: everyone.
+  metricsFrom: []
+
+# Bundled Lakekeeper (Iceberg REST catalog). Always deployed by this chart. It
+# runs without authentication, so it is only reachable inside the cluster.
+catalog:
+  image:
+    repository: quay.io/lakekeeper/catalog
+    tag: v0.14.0
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  # Warehouse name in the catalog -> IGLOO_CATALOG_WAREHOUSE.
+  warehouse: igloo
+  # Defaults to metadataDatabase when empty, then to the bundled PostgreSQL.
+  database:
+    # Secret with key "url" -> LAKEKEEPER__PG_DATABASE_URL_READ/WRITE.
+    existingSecret: ""
+    url: ""
+  encryptionKey:
+    # Secret with key "encryption-key" -> LAKEKEEPER__PG_ENCRYPTION_KEY.
+    # Generated and kept across upgrades when empty. It must never change once
+    # the catalog stores credentials.
+    existingSecret: ""
+  # none | aws | gcp | azure: let Lakekeeper use its own cloud identity for
+  # storage (LAKEKEEPER__ENABLE_*_SYSTEM_CREDENTIALS).
+  systemCredentials: none
+  serviceAccount:
+    create: true
+    # Defaults to <fullname>-catalog.
+    name: ""
+    annotations: {}
+  podLabels: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+# Bundled PostgreSQL, for development and on-prem only. Cloud modules use
+# managed PostgreSQL.
+postgresql:
+  enabled: false
+  image: postgres:17
+  persistence:
+    size: 10Gi
+    # Empty uses the cluster's default StorageClass.
+    storageClass: ""
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+# Bundled S3-compatible store (RustFS), for development and on-prem only.
+objectStorage:
+  enabled: false
+  image: rustfs/rustfs:1.0.1
+  bucket: igloo
+  persistence:
+    size: 50Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 2Gi }
+  # Creates the bucket from an init container of each igloo pod.
+  initImage: curlimages/curl:8.16.0
+
+# `helm test` connects through the SQL Service with psql.
+tests:
+  image: postgres:17

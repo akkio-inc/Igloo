@@ -1,0 +1,51 @@
+{{- /* SQL endpoint. Metrics are on a separate ClusterIP Service, so a
+LoadBalancer here never exposes them. */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igloo.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- end }}
+  {{- if and .Values.service.externalTrafficPolicy (has .Values.service.type (list "LoadBalancer" "NodePort")) }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+  ports:
+    - name: sql
+      port: {{ .Values.service.port }}
+      targetPort: sql
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "igloo.metricsServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "metrics") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,120 @@
+# Configuration
+
+The `igloo` server is configured with environment variables. Deployment tools
+(Docker Compose, the Helm chart, the OpenTofu modules) set these for you; this
+page is the reference they are built on.
+
+## Ports
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| 5432 | PostgreSQL wire protocol | SQL clients |
+| 8080 | HTTP | `GET /healthz` (process is up), `GET /readyz` (catalog and storage reachable), `GET /metrics` (Prometheus), `GET /activity` (running work, for the [scale-to-zero gateway](scale-to-zero.md)) |
+
+## Server
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_LISTEN_ADDR` | `:5432` | SQL listen address |
+| `IGLOO_HTTP_ADDR` | `:8080` | Health and metrics listen address. Empty disables it. |
+| `IGLOO_TLS_CERT_FILE`, `IGLOO_TLS_KEY_FILE` | | PEM certificate and key. Enables TLS for SQL clients. |
+| `IGLOO_TLS_REQUIRED` | `true` | With a certificate configured, refuse sessions that do not use TLS. Set `false` to allow both. |
+| `IGLOO_LOG_FORMAT` | `text` | `text` or `json` |
+| `IGLOO_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `IGLOO_STATEMENT_TIMEOUT` | `0` (none) | Cancel statements that run longer, e.g. `30m`. Sessions can change their own limit with `SET statement_timeout`. |
+| `IGLOO_MAX_CONNECTIONS` | `100` | Concurrent client sessions per Igloo process. Further logins get `too many clients`. |
+| `IGLOO_SHUTDOWN_DELAY` | `0` | On SIGTERM, keep accepting connections this long (e.g. `5s`) while `/readyz` reports not ready, so load balancers stop routing new connections first. Running queries then get 30 seconds to finish. |
+
+## Users
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_ADMIN_USER` | `igloo` | Name of the first administrator |
+| `IGLOO_ADMIN_PASSWORD` | (required) | That administrator's password. Used to create the account on first start only; afterwards change it with `ALTER USER`. |
+| `IGLOO_METADATA_DATABASE_URL` | | PostgreSQL URL where users and roles are stored (schema `igloo_auth`). It can be the same database the catalog uses, as long as no database role is named `igloo_auth`. Without it, the administrator is the only account and `CREATE USER` is unavailable. |
+
+Users sign in with SCRAM-SHA-256, the PostgreSQL default. Roles:
+
+| Role | Can |
+|---|---|
+| `admin` | Everything, including managing users |
+| `writer` | Read and write tables, create and drop tables, views and schemas, set comments and table properties |
+| `reader` | Read tables |
+
+## Catalog
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_CATALOG_URI` | | Iceberg REST catalog URL, e.g. `http://lakekeeper:8181/catalog`. Empty runs without persistence (development only). |
+| `IGLOO_CATALOG_WAREHOUSE` | `igloo` | Warehouse name in the catalog |
+| `IGLOO_CATALOG_NAME` | `lake` | Catalog name in SQL (`lake.public.events`) |
+| `IGLOO_CATALOG_SCHEMA` | `public` | Default schema for unqualified table names |
+| `IGLOO_CATALOG_SETUP` | `true` | On start, bootstrap the Lakekeeper catalog and create the warehouse if it does not exist. Safe with several replicas. |
+
+## Storage
+
+`IGLOO_WAREHOUSE_LOCATION` says where table data lives; its scheme selects the
+storage type. It is required whenever `IGLOO_CATALOG_URI` is set.
+
+| Scheme | Example |
+|---|---|
+| Amazon S3 or S3-compatible | `s3://my-bucket/warehouse` |
+| Google Cloud Storage | `gs://my-bucket/warehouse` |
+| Azure Data Lake Storage Gen2 | `abfss://my-filesystem@myaccount.dfs.core.windows.net/warehouse` |
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_ALLOWED_LOCATIONS` | | Comma-separated URL prefixes users may also read and write, e.g. a landing bucket for `COPY` and `read_parquet`. Everything else outside the warehouse is blocked. |
+
+### S3 and S3-compatible stores
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_S3_ENDPOINT` | | `host:port` of an S3-compatible store. Empty means AWS. |
+| `IGLOO_S3_REGION` | `us-east-1` | |
+| `IGLOO_S3_URL_STYLE` | `vhost` | `path` for most self-hosted stores |
+| `IGLOO_S3_USE_SSL` | `true` | |
+| `IGLOO_S3_ACCESS_KEY_ID`, `IGLOO_S3_SECRET_ACCESS_KEY` | | Static keys. Empty uses the AWS credential chain (IAM roles for service accounts, instance profiles, environment). |
+
+With static keys, the catalog uses the same keys. Without them it uses its own
+AWS identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AWS_SYSTEM_CREDENTIALS=true`
+and `LAKEKEEPER__S3_ENABLE_DIRECT_SYSTEM_CREDENTIALS=true`.
+
+### Google Cloud Storage
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_GCS_HMAC_KEY_ID`, `IGLOO_GCS_HMAC_SECRET` | (required) | HMAC key for a service account with access to the bucket. DuckDB reads and writes GCS with HMAC keys. |
+
+The catalog uses its own GCP identity (Workload Identity); run Lakekeeper with
+`LAKEKEEPER__ENABLE_GCP_SYSTEM_CREDENTIALS=true`.
+
+### Azure Data Lake Storage Gen2
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_AZURE_ACCOUNT_KEY` | | Storage account key. Empty uses the Azure credential chain (Workload Identity, managed identity). |
+
+With an account key, the catalog uses the same key. Without one it uses its own
+Azure identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AZURE_SYSTEM_CREDENTIALS=true`.
+
+## Query engine
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_DUCKDB_MEMORY_LIMIT` | 80% of memory | e.g. `8GB`. Larger queries spill to disk. |
+| `IGLOO_DUCKDB_THREADS` | one per core | |
+| `IGLOO_DUCKDB_TEMP_DIR` | `/var/lib/igloo/tmp` in the image | Spill directory. Give it fast local disk. |
+| `IGLOO_DUCKDB_MAX_TEMP_SIZE` | 90% of the spill disk's free space | Cap on spill files, e.g. `40GiB`. Queries that need more fail. |
+| `IGLOO_DUCKDB_EXTENSION_DIR` | set in the image | Pre-installed DuckDB extensions |
+
+## Table maintenance
+
+Igloo compacts small files, expires old snapshots and deletes unreferenced
+files on its own; see [table maintenance](operations.md#table-maintenance).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_MAINTENANCE` | `true` | Run table maintenance. Turn it off only if another tool maintains the tables. |
+| `IGLOO_SNAPSHOT_RETENTION` | `7d` | How long old snapshots are kept, and so how far back time travel reaches, e.g. `1d` or `36h`. A table's `history.expire.max-snapshot-age-ms` property overrides it. |
+| `IGLOO_MAINTENANCE_INTERVAL` | `1h` | Time between passes over every table |

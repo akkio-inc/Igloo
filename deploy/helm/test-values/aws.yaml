@@ -1,0 +1,56 @@
+# Mirrors the values deploy/aws passes (S3 with IRSA, managed PostgreSQL,
+# NLB with TLS). Used by `helm template` checks; installs nothing real.
+image:
+  tag: ""
+replicaCount: 2
+admin:
+  user: igloo
+  existingSecret: igloo-admin
+metadataDatabase:
+  existingSecret: igloo-database
+storage:
+  warehouseLocation: s3://igloo-test-warehouse/warehouse
+  allowedLocations: ["s3://igloo-test-landing/"]
+  s3:
+    endpoint: ""
+    region: us-east-1
+    urlStyle: vhost
+    useSSL: true
+    existingSecret: ""
+duckdb:
+  memoryLimit: ""
+  threads: null
+  spillVolume:
+    sizeLimit: 50Gi
+tls:
+  existingSecret: igloo-tls
+serviceAccount:
+  create: true
+  name: igloo
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/igloo-igloo
+resources:
+  requests: { cpu: 1500m, memory: 12Gi }
+  limits: { memory: 12Gi }
+service:
+  type: LoadBalancer
+  port: 5432
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+  loadBalancerSourceRanges: ["10.0.0.0/8"]
+catalog:
+  database:
+    existingSecret: igloo-database
+  encryptionKey:
+    existingSecret: igloo-catalog-encryption
+  systemCredentials: aws
+  serviceAccount:
+    create: true
+    name: igloo-catalog
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/igloo-catalog
+postgresql:
+  enabled: false
+objectStorage:
+  enabled: false

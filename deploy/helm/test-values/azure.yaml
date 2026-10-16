@@ -1,0 +1,55 @@
+# Mirrors the values deploy/azure passes (ADLS Gen2 with workload identity for
+# both igloo and Lakekeeper, PostgreSQL Flexible Server, static public IP).
+image:
+  tag: ""
+  repository: ghcr.io/akkio-inc/igloo
+replicaCount: 2
+admin:
+  user: igloo
+  existingSecret: igloo-admin
+metadataDatabase:
+  existingSecret: igloo-database
+storage:
+  warehouseLocation: abfss://warehouse@iglooacct.dfs.core.windows.net/warehouse
+  azure:
+    existingSecret: ""
+duckdb:
+  spillVolume:
+    sizeLimit: 50Gi
+tls:
+  existingSecret: igloo-tls
+serviceAccount:
+  create: true
+  name: igloo
+  annotations:
+    azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000001
+podLabels:
+  azure.workload.identity/use: "true"
+nodeSelector:
+  igloo.dev/pool: igloo
+resources:
+  requests: { cpu: "2", memory: 24Gi }
+  limits: { memory: 24Gi }
+service:
+  type: LoadBalancer
+  port: 5432
+  annotations:
+    service.beta.kubernetes.io/azure-pip-name: igloo-sql
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: igloo-rg
+  loadBalancerSourceRanges: ["203.0.113.0/24"]
+podDisruptionBudget:
+  enabled: false
+catalog:
+  replicaCount: 2
+  systemCredentials: azure
+  database:
+    existingSecret: igloo-database
+  encryptionKey:
+    existingSecret: igloo-catalog-encryption
+  serviceAccount:
+    create: true
+    name: igloo-catalog
+    annotations:
+      azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000002
+  podLabels:
+    azure.workload.identity/use: "true"

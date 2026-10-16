@@ -1,0 +1,80 @@
+# Security policy
+
+## Supported versions
+
+| Version | Supported |
+|---|---|
+| 1.x | Yes |
+| Earlier than 1.0 | No |
+
+Security fixes are released as new 1.x versions. Run the latest one.
+
+## Reporting a vulnerability
+
+Please do not open a public issue, pull request or discussion for a security
+problem. Report it privately through GitHub:
+
+1. Open the **Security** tab of
+   [akkio-inc/Igloo](https://github.com/akkio-inc/Igloo).
+2. Click **Report a vulnerability**
+   ([direct link](https://github.com/akkio-inc/Igloo/security/advisories/new)).
+
+Include the Igloo version, how it is deployed, steps or SQL that reproduce the
+problem, and what an attacker could do with it.
+
+The maintainers will acknowledge the report, work with you on a fix in the
+private advisory, and publish the advisory when the fixed release is out. We
+credit reporters in the advisory unless you ask us not to.
+
+Vulnerabilities in components Igloo builds on (DuckDB, Lakekeeper, PostgreSQL,
+RustFS) belong with those projects. Tell us as well if Igloo's defaults or
+deployment files make one exploitable.
+
+## Security model
+
+A short summary. [docs/configuration.md](docs/configuration.md) is the full
+reference for every setting mentioned here.
+
+- **Authentication.** Clients sign in with SCRAM-SHA-256, the PostgreSQL
+  default, so passwords are not sent over the connection. The first
+  administrator is created from `IGLOO_ADMIN_PASSWORD` on first start; users
+  and roles are stored in the PostgreSQL database named by
+  `IGLOO_METADATA_DATABASE_URL`.
+- **Roles.** `admin` can do everything, including managing users. `writer` can
+  read and write tables and create and drop tables and schemas. `reader` can
+  read tables. Each statement is checked before it runs, using DuckDB's own
+  classification of the statement plus its SQL code (never its comments or
+  literals); anything Igloo cannot classify needs `admin`. Non-admins may send
+  only one statement per query, and their `SET` commands apply to their own
+  session only.
+- **Query sandbox.** Queries run in an embedded DuckDB that cannot read or
+  write files on the server's local disk and cannot reach any URL outside the
+  warehouse location and the prefixes in `IGLOO_ALLOWED_LOCATIONS`. DuckDB
+  extensions are installed in the image at build time; the server does not
+  download code while running.
+- **Transport.** TLS is on when `IGLOO_TLS_CERT_FILE` and `IGLOO_TLS_KEY_FILE`
+  are set, and unencrypted sessions are then refused unless
+  `IGLOO_TLS_REQUIRED=false`. Without TLS, queries and results cross the
+  network unencrypted. Enable TLS before accepting connections from outside a
+  private network. The single-machine stack accepts local connections only by
+  default.
+- **Catalog.** The Lakekeeper catalog and its PostgreSQL database must not be
+  reachable by SQL clients or from the internet. Whoever can reach the catalog
+  can change table metadata and may obtain object-storage credentials. Keep it
+  on a private network that only Igloo can reach.
+- **Health and metrics.** Port 8080 (`/healthz`, `/readyz`, `/metrics`) has no
+  authentication. Expose it only to your orchestrator and monitoring.
+
+## Verifying release images
+
+Release images at `ghcr.io/akkio-inc/igloo` are signed with Sigstore keyless
+signing from the release workflow, and carry SBOM and build provenance
+attestations. To verify an image:
+
+```sh
+cosign verify ghcr.io/akkio-inc/igloo:1.0.0 \
+  --certificate-identity-regexp '^https://github\.com/akkio-inc/Igloo/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+gh attestation verify oci://ghcr.io/akkio-inc/igloo:1.0.0 --repo akkio-inc/Igloo
+```

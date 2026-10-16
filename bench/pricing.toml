@@ -1,0 +1,53 @@
+# Prices for bench/report.py. These are on-demand list prices in AWS
+# us-east-1, gathered October 2026 from vendor documentation and published
+# price guides; verify them, and replace them with your negotiated rates,
+# before relying on a report. `report.py --set snowflake.price_per_credit=2.4`
+# overrides any value without editing this file.
+
+[snowflake]
+# Edition prices per credit: Standard 2.00, Enterprise 3.00, Business Critical 4.00.
+price_per_credit = 3.00
+# Credits per hour for a standard (Gen1) warehouse, by size. Gen2 warehouses,
+# reportedly the default for new warehouses since mid-2026, use 1.35x as
+# many on AWS; set generation_factor = 1.35 for them.
+generation_factor = 1.0
+credits_per_hour = { XS = 1, S = 2, M = 4, L = 8, XL = 16, "2XL" = 32, "3XL" = 64, "4XL" = 128 }
+# Billing: per second, with a 60-second minimum each time a warehouse
+# resumes; it then runs until AUTO_SUSPEND seconds of idleness (60 is the
+# lowest useful setting, 600 the default).
+minimum_seconds = 60
+auto_suspend_seconds = 60
+
+[databricks]
+# SQL Serverless, Premium tier. The DBU price includes the compute.
+price_per_dbu = 0.70
+dbu_per_hour = { "2XS" = 4, XS = 6, S = 12, M = 24, L = 40, XL = 80, "2XL" = 144, "3XL" = 272, "4XL" = 528 }
+# Serverless warehouses stop after this much idleness (the UI's lowest is
+# 5 minutes; the API allows 1).
+auto_stop_seconds = 300
+minimum_seconds = 0
+
+[igloo]
+# EC2 on-demand, per hour, for the machine Igloo runs on.
+instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge" = 1.157, "c7gd.4xlarge" = 0.726, "m7g.4xlarge" = 0.653, "r7g.4xlarge" = 0.857, "r7g.8xlarge" = 1.714 }
+# Costs that run all month whatever the machine does. The benchmark uses
+# Igloo's single-machine setup (deploy/single-vm), whose catalog database
+# lives on the machine's disk: 20 GB of gp3 at $0.08 per GB-month, enough
+# for the operating system, the images and the catalog. Table data belongs
+# in object storage, which is left out for every platform; the benchmark
+# machine kept TPC-H scale 10 (about 3 GB) on a larger disk, which this
+# does not charge for. A Kubernetes deployment pays for a managed PostgreSQL
+# instead, about 0.05 for RDS db.t4g.small with storage.
+fixed_per_hour = 0.0022
+# Scale to zero (docs/scale-to-zero.md): the always-on gateway machine
+# (t4g.nano); how long Igloo may idle before the gateway stops it
+# (IGLOO_GATEWAY_SUSPEND_AFTER, set to match Snowflake's auto_suspend
+# above); and EC2's minimum charge each time an instance starts.
+gateway_per_hour = 0.0042
+suspend_after_seconds = 60
+minimum_seconds = 60
+
+[storage]
+# All three keep data in object storage at about the same price; reports
+# show compute only unless --include-storage is given.
+s3_per_gb_month = 0.023

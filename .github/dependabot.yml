@@ -1,0 +1,50 @@
+version: 2
+
+# Weekly updates. Minor and patch bumps are grouped into one PR per ecosystem;
+# major bumps arrive as separate PRs because they usually need code changes.
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker-compose
+    directory: /deploy/single-vm
+    schedule:
+      interval: weekly
+    groups:
+      compose-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+
+  # The cloud modules are OpenTofu; this ecosystem resolves providers and
+  # modules against the OpenTofu registry, which their lock files reference.
+  - package-ecosystem: opentofu
+    directories:
+      - /deploy/aws
+      - /deploy/gcp
+      - /deploy/azure
+    schedule:
+      interval: weekly
+    groups:
+      opentofu-minor-patch:
+        update-types: [minor, patch]

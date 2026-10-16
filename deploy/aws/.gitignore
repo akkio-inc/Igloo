@@ -1,0 +1,12 @@
+# Local OpenTofu working files. Keep .terraform.lock.hcl under version control.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Variable files often hold account-specific values; the example is tracked.
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example

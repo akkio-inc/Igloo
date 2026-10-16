@@ -1,0 +1,12 @@
+# OpenTofu working files. State holds secrets; keep it in an encrypted remote
+# backend, never in git.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Local settings. terraform.tfvars.example is committed.
+*.tfvars
+*.tfvars.json

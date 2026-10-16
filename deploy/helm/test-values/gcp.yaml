@@ -1,0 +1,50 @@
+# Mirrors the values deploy/gcp passes (GCS with HMAC keys for DuckDB and
+# Workload Identity for Lakekeeper, Cloud SQL, Autopilot Spot).
+image:
+  tag: ""
+replicaCount: 2
+admin:
+  user: igloo
+  existingSecret: igloo-admin
+metadataDatabase:
+  existingSecret: igloo-database
+storage:
+  warehouseLocation: gs://igloo-warehouse-abc123/warehouse
+  gcs:
+    existingSecret: igloo-gcs-hmac
+duckdb:
+  memoryLimit: ""
+  spillVolume:
+    sizeLimit: 50Gi
+tls:
+  existingSecret: ""
+serviceAccount:
+  create: true
+  name: igloo
+  annotations:
+    iam.gke.io/gcp-service-account: igloo-igloo@my-project.iam.gserviceaccount.com
+nodeSelector:
+  cloud.google.com/gke-spot: "true"
+tolerations:
+  - key: cloud.google.com/gke-spot
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+resources:
+  requests: { cpu: "2", memory: 8Gi, ephemeral-storage: 50Gi }
+  limits: { memory: 8Gi, ephemeral-storage: 50Gi }
+service:
+  type: ClusterIP
+  loadBalancerSourceRanges: []
+catalog:
+  replicaCount: 1
+  database:
+    existingSecret: igloo-database
+  encryptionKey:
+    existingSecret: igloo-catalog-encryption
+  systemCredentials: gcp
+  serviceAccount:
+    create: true
+    name: igloo-catalog
+    annotations:
+      iam.gke.io/gcp-service-account: igloo-catalog@my-project.iam.gserviceaccount.com

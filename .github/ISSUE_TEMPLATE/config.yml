@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/akkio-inc/Igloo/security/advisories/new
+    about: Report vulnerabilities privately, not in a public issue.
+  - name: Configuration reference
+    url: https://github.com/akkio-inc/Igloo/blob/main/docs/configuration.md
+    about: Every setting, port and role, in one place.

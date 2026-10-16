@@ -1,0 +1,2 @@
+{{- /* Renders nothing for valid values; see "igloo.validate" in _helpers.tpl. */ -}}
+{{- include "igloo.validate" . }}

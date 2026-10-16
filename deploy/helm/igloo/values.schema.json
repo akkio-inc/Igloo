@@ -1,0 +1,701 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Values for the Igloo Helm chart",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "secretName": {
+      "type": "string",
+      "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+      "maxLength": 253
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "quantity": {
+      "type": [
+        "string",
+        "integer",
+        "number"
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "requests": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/definitions/quantity"
+          }
+        },
+        "limits": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/definitions/quantity"
+          }
+        }
+      }
+    },
+    "image": {
+      "type": "string",
+      "minLength": 1
+    },
+    "postgresUrl": {
+      "type": "string",
+      "pattern": "^$|^postgres(ql)?://"
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "size": {
+          "type": "string",
+          "minLength": 1
+        },
+        "storageClass": {
+          "type": "string"
+        }
+      }
+    },
+    "probe": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "envList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "global": {
+      "type": "object"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "nameOverride": {
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "admin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "user": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+          "description": "Lowercase letters, digits and underscores, not starting with a digit."
+        },
+        "existingSecret": {
+          "$ref": "#/definitions/secretName"
+        },
+        "password": {
+          "type": "string",
+          "pattern": "^$|^[\\s\\S]{8,}$",
+          "description": "At least 8 characters, or empty to generate one."
+        }
+      }
+    },
+    "metadataDatabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "$ref": "#/definitions/secretName"
+        },
+        "url": {
+          "$ref": "#/definitions/postgresUrl"
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "warehouseLocation": {
+          "type": "string",
+          "pattern": "^$|^(s3|gs|abfss)://[^/]+"
+        },
+        "allowedLocations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+://"
+          }
+        },
+        "s3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string",
+              "minLength": 1
+            },
+            "urlStyle": {
+              "type": "string",
+              "enum": [
+                "vhost",
+                "path"
+              ]
+            },
+            "useSSL": {
+              "type": "boolean"
+            },
+            "existingSecret": {
+              "$ref": "#/definitions/secretName"
+            }
+          }
+        },
+        "gcs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "$ref": "#/definitions/secretName"
+            }
+          }
+        },
+        "azure": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "$ref": "#/definitions/secretName"
+            }
+          }
+        }
+      }
+    },
+    "duckdb": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memoryLimit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threads": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "spillVolume": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sizeLimit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "medium": {
+              "type": "string",
+              "enum": [
+                "",
+                "Memory"
+              ]
+            }
+          }
+        },
+        "maxTempSize": {
+          "type": "string",
+          "description": "DuckDB size such as 40GiB; empty for 90% of spillVolume.sizeLimit."
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "$ref": "#/definitions/secretName"
+        }
+      }
+    },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "text",
+            "json"
+          ]
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        }
+      }
+    },
+    "statementTimeout": {
+      "description": "A Go duration such as 30m or 1h30m; empty for no limit.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+        },
+        {
+          "type": "integer",
+          "const": 0
+        }
+      ]
+    },
+    "maxConnections": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "extraEnv": {
+      "$ref": "#/definitions/envList"
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "annotations": {
+          "$ref": "#/definitions/stringMap"
+        }
+      }
+    },
+    "podLabels": {
+      "$ref": "#/definitions/stringMap"
+    },
+    "podAnnotations": {
+      "$ref": "#/definitions/stringMap"
+    },
+    "nodeSelector": {
+      "$ref": "#/definitions/stringMap"
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "affinity": {
+      "type": "object"
+    },
+    "topologySpreadConstraints": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "priorityClassName": {
+      "type": "string"
+    },
+    "podSecurityContext": {
+      "type": "object"
+    },
+    "securityContext": {
+      "type": "object"
+    },
+    "resources": {
+      "$ref": "#/definitions/resources"
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lifecycle": {
+      "type": "object"
+    },
+    "strategy": {
+      "type": "object"
+    },
+    "startupProbe": {
+      "$ref": "#/definitions/probe"
+    },
+    "livenessProbe": {
+      "$ref": "#/definitions/probe"
+    },
+    "readinessProbe": {
+      "$ref": "#/definitions/probe"
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "annotations": {
+          "$ref": "#/definitions/stringMap"
+        },
+        "loadBalancerSourceRanges": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "loadBalancerClass": {
+          "type": "string"
+        },
+        "externalTrafficPolicy": {
+          "type": "string",
+          "enum": [
+            "",
+            "Cluster",
+            "Local"
+          ]
+        }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targetCPUUtilizationPercentage": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minAvailable": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "interval": {
+              "type": "string"
+            },
+            "scrapeTimeout": {
+              "type": "string"
+            },
+            "labels": {
+              "$ref": "#/definitions/stringMap"
+            }
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "sqlFrom": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "metricsFrom": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "warehouse": {
+          "type": "string",
+          "minLength": 1
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "$ref": "#/definitions/secretName"
+            },
+            "url": {
+              "$ref": "#/definitions/postgresUrl"
+            }
+          }
+        },
+        "encryptionKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "$ref": "#/definitions/secretName"
+            }
+          }
+        },
+        "systemCredentials": {
+          "type": "string",
+          "enum": [
+            "none",
+            "aws",
+            "gcp",
+            "azure"
+          ]
+        },
+        "serviceAccount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "annotations": {
+              "$ref": "#/definitions/stringMap"
+            }
+          }
+        },
+        "podLabels": {
+          "$ref": "#/definitions/stringMap"
+        },
+        "podAnnotations": {
+          "$ref": "#/definitions/stringMap"
+        },
+        "nodeSelector": {
+          "$ref": "#/definitions/stringMap"
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "affinity": {
+          "type": "object"
+        },
+        "extraEnv": {
+          "$ref": "#/definitions/envList"
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        }
+      }
+    },
+    "postgresql": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "$ref": "#/definitions/image"
+        },
+        "persistence": {
+          "$ref": "#/definitions/persistence"
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        }
+      }
+    },
+    "objectStorage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "$ref": "#/definitions/image"
+        },
+        "bucket": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+          "description": "An S3 bucket name."
+        },
+        "persistence": {
+          "$ref": "#/definitions/persistence"
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        },
+        "initImage": {
+          "$ref": "#/definitions/image"
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "$ref": "#/definitions/image"
+        }
+      }
+    },
+    "maintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "snapshotRetention": {
+          "description": "A Go duration such as 36h, or whole days such as 7d.",
+          "type": "string",
+          "pattern": "^[0-9]+d$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+        }
+      }
+    },
+    "shutdownDelay": {
+      "description": "A Go duration such as 5s; empty or 0 for none.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+        },
+        {
+          "type": "integer",
+          "const": 0
+        }
+      ]
+    }
+  }
+}

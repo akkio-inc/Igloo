@@ -1,0 +1,18 @@
+# Local deployment secrets
+.env
+
+# Build output
+/bin/
+
+# TLS material for the single-machine stack
+deploy/single-vm/tls/*
+!deploy/single-vm/tls/README
+
+# OpenTofu working state (never commit state: it contains secrets)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Binaries built in the repository root
+/igloo

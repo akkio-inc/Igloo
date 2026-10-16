@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is git-ignored.
+
+project_id = "my-gcp-project"
+region     = "us-central1"
+
+# Prefix for resource names, and the GKE cluster name.
+# name = "igloo"
+
+# --- Sizing ---------------------------------------------------------------
+# replica_count = 2       # igloo pods
+# igloo_cpu     = "2"
+# igloo_memory  = "8Gi"   # DuckDB uses ~80% of it
+# spill_size    = "50Gi"  # local disk per pod for larger-than-memory queries
+# spot          = true    # ~60-70% cheaper igloo pods; preemptible
+
+# --- Reaching the SQL endpoint ----------------------------------------------
+# Default: private; use `kubectl port-forward` (see the next_steps output).
+# To expose it through a load balancer, list your client networks:
+# expose_sql        = true
+# sql_allowed_cidrs = ["203.0.113.0/24"]
+# TLS is strongly recommended with expose_sql. Pass the PEM files through the
+# environment rather than this file (tfvars cannot read files):
+#   export TF_VAR_tls_certificate="$(cat igloo.crt)" TF_VAR_tls_private_key="$(cat igloo.key)"
+
+# --- Data protection --------------------------------------------------------
+# deletion_protection     = true   # set to false and apply before `tofu destroy`
+# bucket_versioning       = false
+# bucket_soft_delete_days = 7
+# db_high_availability    = false  # true doubles the database cost
+
+# --- Before the Helm chart exists -------------------------------------------
+# install_chart = false   # create only the infrastructure, Secrets and IAM

@@ -1,0 +1,58 @@
+{{- /* `helm test <release>`: log in as the admin through the SQL Service. */ -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "igloo.componentName" (list . "test") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  {{- include "igloo.imagePullSecrets" . | nindent 2 }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: psql
+      image: {{ .Values.tests.image }}
+      imagePullPolicy: IfNotPresent
+      command: ["psql", "-v", "ON_ERROR_STOP=1", "-At", "-c", "SELECT 'igloo answers: ' || (1 + 1)"]
+      env:
+        - name: PGHOST
+          value: {{ include "igloo.fullname" . }}
+        - name: PGPORT
+          value: {{ .Values.service.port | quote }}
+        - name: PGUSER
+          value: {{ .Values.admin.user | quote }}
+        - name: PGDATABASE
+          value: igloo
+        - name: PGSSLMODE
+          value: {{ ternary "require" "disable" (not (empty .Values.tls.existingSecret)) }}
+        - name: PGCONNECT_TIMEOUT
+          value: "10"
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              {{- if .Values.admin.existingSecret }}
+              name: {{ .Values.admin.existingSecret }}
+              key: password
+              {{- else }}
+              name: {{ include "igloo.secretName" . }}
+              key: admin-password
+              {{- end }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits: { memory: 128Mi }

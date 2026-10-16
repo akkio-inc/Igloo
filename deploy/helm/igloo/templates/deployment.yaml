@@ -1,0 +1,330 @@
+{{- $secretName := include "igloo.secretName" . -}}
+{{- $metadataDb := include "igloo.metadataDatabaseRef" . | fromYaml -}}
+{{- $memoryLimit := include "igloo.duckdbMemoryLimit" . -}}
+{{- $objectStorage := include "igloo.objectStorageName" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "igloo.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "server") | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "igloo.podLabels" (dict "root" . "component" "server") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Restart pods when generated or inline secrets change.
+        checksum/secret: {{ include "igloo.secretData" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "igloo.serviceAccountName" . }}
+      # Cloud identity webhooks (IRSA, Azure workload identity) mount their own
+      # tokens; igloo never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      # Service links would put IGLOO_* variables into the environment for
+      # Services named igloo-*.
+      enableServiceLinks: false
+      {{- include "igloo.imagePullSecrets" . | nindent 6 }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.objectStorage.enabled }}
+      initContainers:
+        # Igloo creates the warehouse on start, and the catalog checks that the
+        # bucket exists, so the bucket is created first.
+        - name: create-bucket
+          image: {{ .Values.objectStorage.initImage }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              url="http://${S3_ENDPOINT}/${S3_BUCKET}"
+              sigv4="aws:amz:${S3_REGION}:s3"
+              keys="${S3_ACCESS_KEY_ID}:${S3_SECRET_ACCESS_KEY}"
+              tries=0
+              until curl -q -fsS -o /dev/null --max-time 5 "http://${S3_ENDPOINT}/health"; do
+                tries=$((tries + 1))
+                if [ "$tries" -ge 90 ]; then
+                  echo "object storage at ${S3_ENDPOINT} did not answer" >&2
+                  exit 1
+                fi
+                echo "waiting for object storage at ${S3_ENDPOINT}"
+                sleep 2
+              done
+              exists() {
+                curl -q -fs -o /dev/null --max-time 10 -I --aws-sigv4 "$sigv4" --user "$keys" "$url"
+              }
+              if exists; then
+                echo "bucket ${S3_BUCKET} exists"
+              elif curl -q -fsS -o /dev/null --max-time 10 -X PUT --aws-sigv4 "$sigv4" --user "$keys" "$url"; then
+                echo "created bucket ${S3_BUCKET}"
+              elif exists; then
+                echo "bucket ${S3_BUCKET} exists (created by another pod)"
+              else
+                echo "could not create bucket ${S3_BUCKET}" >&2
+                exit 1
+              fi
+          env:
+            - name: S3_ENDPOINT
+              value: {{ printf "%s:9000" $objectStorage | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.objectStorage.bucket | quote }}
+            - name: S3_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: object-storage-access-key-id
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: object-storage-secret-access-key
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+      {{- end }}
+      containers:
+        - name: igloo
+          image: {{ include "igloo.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: sql
+              containerPort: 5432
+              protocol: TCP
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: IGLOO_ADMIN_USER
+              value: {{ .Values.admin.user | quote }}
+            - name: IGLOO_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.admin.existingSecret }}
+                  name: {{ .Values.admin.existingSecret }}
+                  key: password
+                  {{- else }}
+                  name: {{ $secretName }}
+                  key: admin-password
+                  {{- end }}
+            {{- with $metadataDb }}
+            - name: IGLOO_METADATA_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key }}
+            {{- end }}
+            - name: IGLOO_CATALOG_URI
+              value: {{ printf "http://%s:8181/catalog" (include "igloo.catalogName" .) | quote }}
+            - name: IGLOO_CATALOG_WAREHOUSE
+              value: {{ .Values.catalog.warehouse | quote }}
+            - name: IGLOO_WAREHOUSE_LOCATION
+              value: {{ include "igloo.warehouseLocation" . | quote }}
+            {{- with .Values.storage.allowedLocations }}
+            - name: IGLOO_ALLOWED_LOCATIONS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.objectStorage.enabled }}
+            - name: IGLOO_S3_ENDPOINT
+              value: {{ printf "%s:9000" $objectStorage | quote }}
+            - name: IGLOO_S3_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            - name: IGLOO_S3_URL_STYLE
+              value: path
+            - name: IGLOO_S3_USE_SSL
+              value: "false"
+            - name: IGLOO_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: object-storage-access-key-id
+            - name: IGLOO_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: object-storage-secret-access-key
+            {{- else }}
+            {{- with .Values.storage.s3.endpoint }}
+            - name: IGLOO_S3_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: IGLOO_S3_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            - name: IGLOO_S3_URL_STYLE
+              value: {{ .Values.storage.s3.urlStyle | quote }}
+            - name: IGLOO_S3_USE_SSL
+              value: {{ .Values.storage.s3.useSSL | quote }}
+            {{- with .Values.storage.s3.existingSecret }}
+            - name: IGLOO_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: access-key-id
+            - name: IGLOO_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: secret-access-key
+            {{- end }}
+            {{- end }}
+            {{- with .Values.storage.gcs.existingSecret }}
+            - name: IGLOO_GCS_HMAC_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: hmac-key-id
+            - name: IGLOO_GCS_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: hmac-secret
+            {{- end }}
+            {{- with .Values.storage.azure.existingSecret }}
+            - name: IGLOO_AZURE_ACCOUNT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: account-key
+            {{- end }}
+            {{- with $memoryLimit }}
+            - name: IGLOO_DUCKDB_MEMORY_LIMIT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with include "igloo.duckdbMaxTempSize" . }}
+            - name: IGLOO_DUCKDB_MAX_TEMP_SIZE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .Values.duckdb.threads) }}
+            - name: IGLOO_DUCKDB_THREADS
+              value: {{ int .Values.duckdb.threads | quote }}
+            {{- end }}
+            {{- if .Values.tls.existingSecret }}
+            - name: IGLOO_TLS_CERT_FILE
+              value: /etc/igloo/tls/tls.crt
+            - name: IGLOO_TLS_KEY_FILE
+              value: /etc/igloo/tls/tls.key
+            {{- end }}
+            - name: IGLOO_LOG_FORMAT
+              value: {{ .Values.log.format | quote }}
+            - name: IGLOO_LOG_LEVEL
+              value: {{ .Values.log.level | quote }}
+            {{- with .Values.statementTimeout }}
+            - name: IGLOO_STATEMENT_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: IGLOO_MAX_CONNECTIONS
+              value: {{ int .Values.maxConnections | quote }}
+            {{- with .Values.shutdownDelay }}
+            - name: IGLOO_SHUTDOWN_DELAY
+              value: {{ . | quote }}
+            {{- end }}
+            - name: IGLOO_MAINTENANCE
+              value: {{ .Values.maintenance.enabled | quote }}
+            - name: IGLOO_SNAPSHOT_RETENTION
+              value: {{ .Values.maintenance.snapshotRetention | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # DuckDB spill files (IGLOO_DUCKDB_TEMP_DIR in the image).
+            - name: spill
+              mountPath: /var/lib/igloo/tmp
+            {{- if .Values.tls.existingSecret }}
+            - name: tls
+              mountPath: /etc/igloo/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: spill
+          emptyDir:
+            {{- with .Values.duckdb.spillVolume.medium }}
+            medium: {{ . }}
+            {{- end }}
+            {{- with .Values.duckdb.spillVolume.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        {{- if .Values.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            defaultMode: 0440
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        # Prefer one igloo pod per node, so losing a node loses one replica.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "igloo.selectorLabels" (dict "root" . "component" "server") | nindent 20 }}
+        {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

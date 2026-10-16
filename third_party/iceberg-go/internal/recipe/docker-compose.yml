@@ -1,0 +1,166 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+services:
+  spark-iceberg:
+    image: pyiceberg-spark
+    container_name: spark-iceberg
+    build: .
+    networks:
+      iceberg_net:
+    depends_on:
+      - rest
+      - minio
+    volumes:
+      - ./warehouse:/home/iceberg/warehouse
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - /tmp/iceberg-hadoop-warehouse:/tmp/iceberg-hadoop-warehouse
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    ports:
+      - 8888:8888
+      - 8080:8080
+      - 10000:10000
+      - 10001:10001
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+  rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    container_name: azurite
+    hostname: azurite
+    ports:
+      - 11000:11000
+    command: ["azurite-blob", "--loose", "--blobHost", "0.0.0.0" ,"--blobPort", "11000", "--skipApiVersionCheck"]
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/warehouse;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      tail -f /dev/null
+      "
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    container_name: clickhouse
+    networks:
+      iceberg_net:
+    ports:
+      - 8123:8123
+      - 9002:9000
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      iceberg_net:
+    environment:
+      - CATALOG_MANAGEMENT=dynamic
+    ports:
+      - 8088:8080
+
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server
+    container_name: fake-gcs-server
+    networks:
+      iceberg_net:
+    ports:
+      - 4443:4443
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "fake-gcs-server:4443"]
+
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: hive-metastore
+    user: root
+    networks:
+      iceberg_net:
+    ports:
+      - 9083:9083
+    environment:
+      - SERVICE_NAME=metastore
+      - DB_DRIVER=derby
+    volumes:
+      - hive-metastore-data:/opt/hive/data
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  hiveserver2:
+    image: apache/hive:4.0.0
+    container_name: hiveserver2
+    user: root
+    networks:
+      iceberg_net:
+    depends_on:
+      - hive-metastore
+    ports:
+      - "10003:10000"  # Adjusted to avoid conflict with spark-iceberg
+      - "10002:10002"  # Web UI
+    environment:
+      - SERVICE_NAME=hiveserver2
+      - SERVICE_OPTS=-Dhive.metastore.uris=thrift://hive-metastore:9083
+      - IS_RESUME=true
+    volumes:
+      - hive-metastore-data:/opt/hive/data
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+networks:
+  iceberg_net:
+
+volumes:
+  hive-metastore-data:

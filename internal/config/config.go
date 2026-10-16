@@ -1,0 +1,404 @@
+// Package config loads Igloo's runtime settings from IGLOO_* environment
+// variables. docs/configuration.md documents every variable.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Config is everything the igloo server needs to start.
+type Config struct {
+	// ListenAddr is where the Postgres-protocol endpoint listens.
+	ListenAddr string
+	// HTTPAddr serves health checks and metrics. Empty disables it.
+	HTTPAddr string
+	// TLSCertFile and TLSKeyFile enable TLS for SQL clients.
+	TLSCertFile string
+	TLSKeyFile  string
+	// TLSRequired refuses unencrypted sessions when TLS is configured.
+	TLSRequired bool
+
+	LogFormat string
+	LogLevel  slog.Level
+
+	// AdminUser and AdminPassword define the first administrator.
+	AdminUser     string
+	AdminPassword string
+	// MetadataDatabaseURL is the Postgres database that stores users. Empty
+	// means the administrator is the only account.
+	MetadataDatabaseURL string
+
+	// StatementTimeout cancels statements that run longer, unless a session
+	// sets its own statement_timeout. Zero means no limit.
+	StatementTimeout time.Duration
+	// MaxConnections caps concurrent client sessions; each holds DuckDB
+	// resources.
+	MaxConnections int
+	// ShutdownDelay is how long Igloo keeps accepting connections, while
+	// reporting not ready, after it is asked to stop. It gives load
+	// balancers time to stop sending new connections.
+	ShutdownDelay time.Duration
+
+	DuckDB      DuckDB
+	Catalog     Catalog
+	Storage     Storage
+	Maintenance Maintenance
+}
+
+// Maintenance controls automatic table maintenance: compaction, snapshot
+// expiry and orphan file cleanup.
+type Maintenance struct {
+	Enabled bool
+	// Interval is the time between passes over every table.
+	Interval time.Duration
+	// Retention is how long snapshots, and so time travel, are kept for
+	// tables that do not set history.expire.max-snapshot-age-ms.
+	Retention time.Duration
+}
+
+// DuckDB tunes the embedded query engine.
+type DuckDB struct {
+	// Path is the DuckDB database file. Empty means in-memory; tables live in
+	// the Iceberg catalog, so local state is only temp tables and settings.
+	Path string
+	// TempDir is where DuckDB spills when a query exceeds MemoryLimit.
+	TempDir string
+	// MemoryLimit is a DuckDB size string such as "8GB". Empty keeps DuckDB's
+	// default of 80% of system memory.
+	MemoryLimit string
+	// MaxTempSize caps spill files, e.g. "45GiB". Empty keeps DuckDB's
+	// default, 90% of the free space on the spill disk.
+	MaxTempSize string
+	// Threads caps worker threads. Zero keeps DuckDB's default of one per core.
+	Threads int
+	// ExtensionDir is where pre-installed DuckDB extensions live.
+	ExtensionDir string
+}
+
+// Catalog points at the Iceberg REST catalog. When URI is empty Igloo runs
+// without one and only in-memory tables are available.
+type Catalog struct {
+	URI string
+	// Warehouse is the warehouse name registered in the catalog.
+	Warehouse string
+	// Name is what the catalog is called in SQL, e.g. lake.public.orders.
+	Name string
+	// Schema is the default schema (Iceberg namespace) for unqualified names.
+	// It defaults to "public", which Postgres tools expect; DuckDB cannot
+	// select an Iceberg namespace named "main" as the default.
+	Schema string
+	// Setup bootstraps the catalog and creates the warehouse on start.
+	Setup bool
+}
+
+// StorageType is the object store holding table data.
+type StorageType string
+
+const (
+	StorageS3    StorageType = "s3"
+	StorageGCS   StorageType = "gcs"
+	StorageAzure StorageType = "azure"
+)
+
+// Storage says where table data lives and how to reach it.
+type Storage struct {
+	// Location is the warehouse root, e.g. s3://bucket/warehouse.
+	Location string
+	Type     StorageType
+	// Bucket is the S3 or GCS bucket, or the ADLS filesystem.
+	Bucket string
+	// Prefix is the path inside Bucket, without leading or trailing slashes.
+	Prefix string
+	// AllowedLocations are extra URL prefixes users may read and write.
+	AllowedLocations []string
+
+	S3    S3
+	GCS   GCS
+	Azure Azure
+}
+
+// S3 configures Amazon S3 and S3-compatible stores. Leaving AccessKeyID empty
+// uses the AWS credential chain (IAM roles for service accounts, instance
+// profiles, environment variables).
+type S3 struct {
+	Endpoint        string
+	Region          string
+	AccessKeyID     string
+	SecretAccessKey string
+	// URLStyle is "path" for most self-hosted stores, "vhost" for AWS.
+	URLStyle string
+	UseSSL   bool
+}
+
+// GCS configures Google Cloud Storage. DuckDB reaches GCS through its
+// S3-compatible API, which needs an HMAC key.
+type GCS struct {
+	HMACKeyID  string
+	HMACSecret string
+}
+
+// Azure configures ADLS Gen2. Leaving AccountKey empty uses the Azure
+// credential chain (workload identity, managed identity).
+type Azure struct {
+	Account    string
+	AccountKey string
+	// Host is the DFS endpoint, normally <account>.dfs.core.windows.net.
+	Host string
+}
+
+// Load reads the configuration using lookup, normally os.LookupEnv.
+func Load(lookup func(string) (string, bool)) (Config, error) {
+	getenv := func(key string) string {
+		v, _ := lookup(key)
+		return v
+	}
+	get := func(key, fallback string) string {
+		if v := strings.TrimSpace(getenv(key)); v != "" {
+			return v
+		}
+		return fallback
+	}
+	// HTTP can be switched off by setting the variable to an empty string.
+	httpAddr, ok := lookup("IGLOO_HTTP_ADDR")
+	if !ok {
+		httpAddr = ":8080"
+	}
+
+	cfg := Config{
+		ListenAddr:          get("IGLOO_LISTEN_ADDR", ":5432"),
+		HTTPAddr:            strings.TrimSpace(httpAddr),
+		TLSCertFile:         get("IGLOO_TLS_CERT_FILE", ""),
+		TLSKeyFile:          get("IGLOO_TLS_KEY_FILE", ""),
+		LogFormat:           get("IGLOO_LOG_FORMAT", "text"),
+		AdminUser:           get("IGLOO_ADMIN_USER", "igloo"),
+		AdminPassword:       getenv("IGLOO_ADMIN_PASSWORD"),
+		MetadataDatabaseURL: get("IGLOO_METADATA_DATABASE_URL", ""),
+		DuckDB: DuckDB{
+			Path:         get("IGLOO_DUCKDB_PATH", ""),
+			TempDir:      get("IGLOO_DUCKDB_TEMP_DIR", ""),
+			MemoryLimit:  get("IGLOO_DUCKDB_MEMORY_LIMIT", ""),
+			MaxTempSize:  get("IGLOO_DUCKDB_MAX_TEMP_SIZE", ""),
+			ExtensionDir: get("IGLOO_DUCKDB_EXTENSION_DIR", ""),
+		},
+		Catalog: Catalog{
+			URI:       get("IGLOO_CATALOG_URI", ""),
+			Warehouse: get("IGLOO_CATALOG_WAREHOUSE", "igloo"),
+			Name:      get("IGLOO_CATALOG_NAME", "lake"),
+			Schema:    get("IGLOO_CATALOG_SCHEMA", "public"),
+		},
+		Storage: Storage{
+			Location: get("IGLOO_WAREHOUSE_LOCATION", ""),
+			S3: S3{
+				Endpoint:        get("IGLOO_S3_ENDPOINT", ""),
+				Region:          get("IGLOO_S3_REGION", "us-east-1"),
+				AccessKeyID:     get("IGLOO_S3_ACCESS_KEY_ID", ""),
+				SecretAccessKey: getenv("IGLOO_S3_SECRET_ACCESS_KEY"),
+				URLStyle:        get("IGLOO_S3_URL_STYLE", "vhost"),
+			},
+			GCS: GCS{
+				HMACKeyID:  get("IGLOO_GCS_HMAC_KEY_ID", ""),
+				HMACSecret: getenv("IGLOO_GCS_HMAC_SECRET"),
+			},
+			Azure: Azure{
+				AccountKey: getenv("IGLOO_AZURE_ACCOUNT_KEY"),
+			},
+		},
+	}
+
+	var errs []error
+	addErr := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+
+	if len(cfg.AdminPassword) < 8 {
+		addErr("IGLOO_ADMIN_PASSWORD must be set to at least 8 characters")
+	}
+	if !ValidName(cfg.AdminUser) {
+		addErr("IGLOO_ADMIN_USER %q must be a lowercase name of letters, digits and underscores", cfg.AdminUser)
+	}
+
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		addErr("set both IGLOO_TLS_CERT_FILE and IGLOO_TLS_KEY_FILE, or neither")
+	}
+	_, requiredSet := lookup("IGLOO_TLS_REQUIRED")
+	required, err := strconv.ParseBool(get("IGLOO_TLS_REQUIRED", "true"))
+	switch {
+	case err != nil:
+		addErr("IGLOO_TLS_REQUIRED must be true or false: %w", err)
+	case required && requiredSet && cfg.TLSCertFile == "":
+		addErr("IGLOO_TLS_REQUIRED=true needs IGLOO_TLS_CERT_FILE and IGLOO_TLS_KEY_FILE")
+	}
+	cfg.TLSRequired = required && cfg.TLSCertFile != ""
+
+	if cfg.LogFormat != "text" && cfg.LogFormat != "json" {
+		addErr("IGLOO_LOG_FORMAT must be text or json, got %q", cfg.LogFormat)
+	}
+	if err := cfg.LogLevel.UnmarshalText([]byte(get("IGLOO_LOG_LEVEL", "info"))); err != nil {
+		addErr("IGLOO_LOG_LEVEL: %w", err)
+	}
+
+	if v := get("IGLOO_STATEMENT_TIMEOUT", "0"); v != "0" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			addErr("IGLOO_STATEMENT_TIMEOUT must be a duration such as 30m or 2h, got %q", v)
+		}
+		cfg.StatementTimeout = d
+	}
+
+	if v := get("IGLOO_SHUTDOWN_DELAY", "0"); v != "0" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			addErr("IGLOO_SHUTDOWN_DELAY must be a duration such as 5s, got %q", v)
+		}
+		cfg.ShutdownDelay = d
+	}
+
+	cfg.MaxConnections = 100
+	if v := get("IGLOO_MAX_CONNECTIONS", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			addErr("IGLOO_MAX_CONNECTIONS must be a positive integer, got %q", v)
+		}
+		cfg.MaxConnections = n
+	}
+
+	if v := get("IGLOO_DUCKDB_THREADS", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			addErr("IGLOO_DUCKDB_THREADS must be a positive integer, got %q", v)
+		}
+		cfg.DuckDB.Threads = n
+	}
+
+	enabled, err := strconv.ParseBool(get("IGLOO_MAINTENANCE", "true"))
+	if err != nil {
+		addErr("IGLOO_MAINTENANCE must be true or false: %w", err)
+	}
+	cfg.Maintenance.Enabled = enabled
+	if d, err := parseDays(get("IGLOO_MAINTENANCE_INTERVAL", "1h")); err != nil || d <= 0 {
+		addErr("IGLOO_MAINTENANCE_INTERVAL must be a positive duration such as 1h, got %q", get("IGLOO_MAINTENANCE_INTERVAL", ""))
+	} else {
+		cfg.Maintenance.Interval = d
+	}
+	if d, err := parseDays(get("IGLOO_SNAPSHOT_RETENTION", "7d")); err != nil || d < 0 {
+		addErr("IGLOO_SNAPSHOT_RETENTION must be a duration such as 7d or 36h, got %q", get("IGLOO_SNAPSHOT_RETENTION", ""))
+	} else {
+		cfg.Maintenance.Retention = d
+	}
+
+	setup, err := strconv.ParseBool(get("IGLOO_CATALOG_SETUP", "true"))
+	if err != nil {
+		addErr("IGLOO_CATALOG_SETUP must be true or false: %w", err)
+	}
+	cfg.Catalog.Setup = setup
+
+	useSSL, err := strconv.ParseBool(get("IGLOO_S3_USE_SSL", "true"))
+	if err != nil {
+		addErr("IGLOO_S3_USE_SSL must be true or false: %w", err)
+	}
+	cfg.Storage.S3.UseSSL = useSSL
+
+	if s := cfg.Storage.S3.URLStyle; s != "path" && s != "vhost" {
+		addErr("IGLOO_S3_URL_STYLE must be path or vhost, got %q", s)
+	}
+	if cfg.Storage.S3.AccessKeyID != "" && cfg.Storage.S3.SecretAccessKey == "" {
+		addErr("IGLOO_S3_SECRET_ACCESS_KEY must be set when IGLOO_S3_ACCESS_KEY_ID is")
+	}
+
+	for _, loc := range strings.Split(get("IGLOO_ALLOWED_LOCATIONS", ""), ",") {
+		if loc = strings.TrimSpace(loc); loc == "" {
+			continue
+		}
+		if _, err := url.Parse(loc); err != nil || !strings.Contains(loc, "://") {
+			addErr("IGLOO_ALLOWED_LOCATIONS entry %q must be a URL such as s3://bucket/path/", loc)
+			continue
+		}
+		cfg.Storage.AllowedLocations = append(cfg.Storage.AllowedLocations, loc)
+	}
+
+	if cfg.Catalog.URI != "" {
+		if _, err := url.ParseRequestURI(cfg.Catalog.URI); err != nil {
+			addErr("IGLOO_CATALOG_URI: %w", err)
+		}
+		if cfg.Storage.Location == "" {
+			addErr("IGLOO_WAREHOUSE_LOCATION must be set when IGLOO_CATALOG_URI is")
+		} else if err := cfg.Storage.parseLocation(); err != nil {
+			addErr("IGLOO_WAREHOUSE_LOCATION: %w", err)
+		}
+	}
+
+	return cfg, errors.Join(errs...)
+}
+
+// parseDays parses a Go duration, also accepting a whole number of days such
+// as "7d".
+func parseDays(s string) (time.Duration, error) {
+	if days, ok := strings.CutSuffix(s, "d"); ok {
+		n, err := strconv.Atoi(days)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}
+
+// parseLocation fills Type, Bucket, Prefix and the Azure account from
+// Location.
+func (s *Storage) parseLocation() error {
+	u, err := url.Parse(s.Location)
+	if err != nil {
+		return err
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%q has no bucket", s.Location)
+	}
+	s.Prefix = strings.Trim(u.Path, "/")
+
+	switch u.Scheme {
+	case "s3":
+		s.Type, s.Bucket = StorageS3, u.Host
+	case "gs":
+		s.Type, s.Bucket = StorageGCS, u.Host
+		if s.GCS.HMACKeyID == "" || s.GCS.HMACSecret == "" {
+			return errors.New("gs:// locations need IGLOO_GCS_HMAC_KEY_ID and IGLOO_GCS_HMAC_SECRET")
+		}
+	case "abfss":
+		// abfss://<filesystem>@<account>.dfs.core.windows.net/<prefix>
+		account, _, ok := strings.Cut(u.Hostname(), ".")
+		if u.User == nil || u.User.Username() == "" || !ok {
+			return fmt.Errorf("%q must look like abfss://filesystem@account.dfs.core.windows.net/path", s.Location)
+		}
+		s.Type, s.Bucket = StorageAzure, u.User.Username()
+		s.Azure.Account, s.Azure.Host = account, u.Hostname()
+	default:
+		return fmt.Errorf("unsupported scheme %q; use s3://, gs:// or abfss://", u.Scheme)
+	}
+	return nil
+}
+
+// Root is the warehouse location with a trailing slash, for prefix checks.
+func (s Storage) Root() string {
+	return strings.TrimSuffix(s.Location, "/") + "/"
+}
+
+// ValidName reports whether name is a valid user name: a safe, unquoted,
+// lowercase SQL identifier.
+func ValidName(name string) bool {
+	if name == "" || len(name) > 63 {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r == '_':
+		case r >= '0' && r <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}

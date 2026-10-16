@@ -1,0 +1,138 @@
+{{- /*
+Bundled PostgreSQL for development and on-prem: catalog metadata (schema
+public) and Igloo users (schema igloo) in database "igloo". Not highly
+available; use a managed database in production.
+*/ -}}
+{{- if .Values.postgresql.enabled }}
+{{- $name := include "igloo.postgresqlName" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "postgresql") | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "igloo.selectorLabels" (dict "root" . "component" "postgresql") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "igloo.podLabels" (dict "root" . "component" "postgresql") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- include "igloo.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        # The official image's "postgres" user; the entrypoint supports
+        # starting as it directly.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgresql
+          image: {{ .Values.postgresql.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: igloo
+            - name: POSTGRES_DB
+              value: igloo
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "igloo.secretName" . }}
+                  key: postgres-password
+            # A subdirectory, so the volume's root (and lost+found) is not
+            # the data directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          # TCP, not the socket: during first-start initialisation the server
+          # listens on the socket only.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "igloo", "-d", "igloo"]
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 150
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "igloo", "-d", "igloo"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "igloo", "-d", "igloo"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.postgresql.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "igloo.selectorLabels" (dict "root" . "component" "postgresql") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "igloo.labels" (dict "root" . "component" "postgresql") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "igloo.selectorLabels" (dict "root" . "component" "postgresql") | nindent 4 }}
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+      protocol: TCP
+{{- end }}

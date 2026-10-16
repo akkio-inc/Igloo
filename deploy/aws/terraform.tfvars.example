@@ -1,0 +1,28 @@
+# Copy to terraform.tfvars and edit. Every setting is optional; see
+# variables.tf for the full list and defaults.
+
+region      = "us-east-1"
+name_prefix = "igloo"
+
+# Limit the Kubernetes API endpoint to your own network. Find your address
+# with: curl -s https://checkip.amazonaws.com
+# cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"]
+
+# Give teammates or CI kubectl access (the identity running tofu gets it
+# automatically; do not list it here).
+# cluster_admin_arns = ["arn:aws:iam::111122223333:role/DataPlatformAdmins"]
+
+# Pin the Igloo version. Empty uses the chart's appVersion.
+# igloo_image_tag = "0.1.0"
+
+# Reach SQL from outside the cluster through a Network Load Balancer.
+# expose_sql        = true
+# sql_allowed_cidrs = ["203.0.113.0/24"]
+
+# Cheaper, interruptible nodes. List several Graviton types for Spot capacity.
+# node_use_spot       = true
+# node_instance_types = ["r7g.xlarge", "r6g.xlarge", "r8g.xlarge"]
+
+tags = {
+  Team = "data"
+}
