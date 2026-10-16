@@ -2,11 +2,17 @@ package federation
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestConnectionOptions(t *testing.T) {
@@ -245,6 +251,73 @@ func TestRelaySilence(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a silent remote database was not given up on")
+	}
+}
+
+// TestPostgresUnreachable fails statements that need a server the proxy
+// cannot reach as the server fails one, naming the connection, and keeps
+// DuckDB's session: ending it would hide the error.
+func TestPostgresUnreachable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	c := New("crm", Postgres)
+	c.Host, c.Port, c.Database, c.User, c.Password = "127.0.0.1", port, "crm", "crm", "pw"
+	c.ConnectTimeout = time.Second
+	p, err := newProxy(c, "token", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.close()
+	// As if Igloo had signed in before.
+	p.mu.Lock()
+	p.params = map[string]string{"server_version": "17.0", "client_encoding": "UTF8", "standard_conforming_strings": "on"}
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgconn.Connect(ctx, fmt.Sprintf("host=127.0.0.1 port=%d user=igloo dbname=crm password=token sslmode=disable", p.port()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx) //nolint:errcheck
+	run := func(sql, code string, status byte) {
+		t.Helper()
+		_, err := conn.Exec(ctx, sql).ReadAll()
+		var pe *pgconn.PgError
+		switch {
+		case code == "" && err != nil:
+			t.Errorf("%s: %v", sql, err)
+		case code != "" && (!errors.As(err, &pe) || pe.Code != code || !strings.Contains(pe.Message, "connection crm")):
+			t.Errorf("%s: got %v, want %s naming the connection", sql, err, code)
+		}
+		if got := conn.TxStatus(); got != status {
+			t.Errorf("%s: transaction status %c, want %c", sql, got, status)
+		}
+	}
+	run("SELECT 1", "", 'I')
+	run("SELECT * FROM customers", "08006", 'I')
+	run("SELECT * FROM customers", "08006", 'I')
+	// A transaction the server never saw fails, and can only end.
+	run("BEGIN", "", 'T')
+	run("SELECT * FROM customers", "08006", 'E')
+	run("SELECT 1", "25P02", 'E')
+	run("COMMIT", "", 'I')
+	// The extended protocol: the error, then nothing until Sync.
+	var pe *pgconn.PgError
+	if _, err := conn.Prepare(ctx, "", "SELECT $1::int", nil); !errors.As(err, &pe) || pe.Code != "08006" {
+		t.Errorf("prepare: got %v, want 08006", err)
+	}
+	res := conn.ExecParams(ctx, "SELECT $1::int", [][]byte{[]byte("1")}, nil, nil, nil).Read()
+	if !errors.As(res.Err, &pe) || pe.Code != "08006" {
+		t.Errorf("execute: got %v, want 08006", res.Err)
+	}
+	run("SELECT 1", "", 'I')
+	if conn.IsClosed() {
+		t.Error("the session ended")
 	}
 }
 

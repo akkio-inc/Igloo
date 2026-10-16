@@ -37,8 +37,11 @@ import (
 // (DISCARD ALL) by itself. A held BEGIN goes to the server just before the
 // first statement that does, which is when PostgreSQL takes a
 // transaction's snapshot anyway. The proxy signs in to the server when that
-// first statement comes; if the server cannot be reached then, the
-// statement fails and the session ends.
+// first statement comes. If the server cannot be reached then, the
+// statement fails as one the server refused would, with an error that names
+// the connection, and the session goes on: the next statement tries again.
+// Ending the session would hide the error, as libpq reports the lost
+// connection in its place.
 
 // maxMessage bounds a message from DuckDB, which sends statements and
 // their parameters.
@@ -164,6 +167,14 @@ type pgSession struct {
 	// dirty is set once the server ran a statement since the session was
 	// last reset.
 	dirty bool
+	// aborted is set when a statement of a transaction the server had not
+	// seen failed for want of the server: as on the server, nothing more
+	// runs until DuckDB ends the transaction.
+	aborted bool
+	// skipping is set when a message of the extended protocol failed for
+	// want of the server: as the server does, the proxy then discards
+	// DuckDB's messages until its next Sync.
+	skipping bool
 
 	// These are under r.mu.
 	// status is the transaction status the server last reported.
@@ -184,17 +195,55 @@ func (s *pgSession) fatal(code string, err error) error {
 	return errors.New(msg)
 }
 
+// fail fails a statement that needs the server while the proxy has none,
+// as the server fails one: with an error, after which the session goes on.
+// A simple query is answered at once; after a message of the extended
+// protocol, the answer waits for DuckDB's Sync. A transaction DuckDB began
+// is aborted.
+func (s *pgSession) fail(typ byte, code string, err error) {
+	if s.held != nil {
+		s.held, s.aborted = nil, true
+	}
+	e := &pgproto3.ErrorResponse{
+		Severity: "ERROR", SeverityUnlocalized: "ERROR", Code: code,
+		Message: Scrub(fmt.Sprintf("connection %s: %v", s.p.name, err)),
+	}
+	if typ != 'Q' && typ != 'S' {
+		s.skipping = true
+		s.send(e)
+		return
+	}
+	s.reply(s.emulatedStatus(), e)
+}
+
+// emulatedStatus is the transaction status DuckDB's session has while the
+// proxy has no session with the server.
+func (s *pgSession) emulatedStatus() byte {
+	switch {
+	case s.aborted:
+		return 'E'
+	case s.held != nil:
+		return 'T'
+	}
+	return 'I'
+}
+
 // reply answers DuckDB without the server.
 func (s *pgSession) reply(status byte, msgs ...pgproto3.BackendMessage) bool {
+	s.send(append(msgs, &pgproto3.ReadyForQuery{TxStatus: status})...)
+	return true
+}
+
+// send writes messages to DuckDB.
+func (s *pgSession) send(msgs ...pgproto3.BackendMessage) {
 	var buf []byte
-	for _, m := range append(msgs, &pgproto3.ReadyForQuery{TxStatus: status}) {
+	for _, m := range msgs {
 		buf, _ = m.Encode(buf)
 	}
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
 	_, _ = s.out.Write(buf)
 	_ = s.out.Flush()
-	return true
 }
 
 // connect signs in to the server, with the connection's settings of the
@@ -283,6 +332,13 @@ func (s *pgSession) run(in *bufio.Reader) error {
 			}
 			return errClientGone
 		}
+		if s.skipping {
+			if typ == 'S' {
+				s.skipping = false
+				s.reply(s.emulatedStatus())
+			}
+			continue
+		}
 		kind, tag := stmtOther, ""
 		if typ == 'Q' {
 			kind, tag = classify(msg[5:])
@@ -290,11 +346,16 @@ func (s *pgSession) run(in *bufio.Reader) error {
 		if kind != stmtOther && s.r.idle() && s.answer(kind, tag, msg) {
 			continue
 		}
+		if s.aborted {
+			s.fail(typ, "25P02", errors.New("current transaction is aborted, commands ignored until end of transaction block"))
+			continue
+		}
 
 		// A statement for the server.
 		if s.upstream == nil {
 			if err := s.connect(); err != nil {
-				return s.fatal("08006", err)
+				s.fail(typ, "08006", err)
+				continue
 			}
 		}
 		if s.held != nil {
@@ -334,6 +395,14 @@ func (s *pgSession) answer(kind int, tag string, msg []byte) bool {
 	}
 	held := s.held != nil
 	switch {
+	case s.aborted:
+		// Only ending the transaction, which rolls it back, as on the
+		// server. The server was never in it.
+		if kind != stmtCommit && kind != stmtRollback {
+			return false
+		}
+		s.aborted = false
+		return s.reply('I', &pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
 	case kind == stmtBegin && !held && !open:
 		s.held = msg
 		return s.reply('T', &pgproto3.CommandComplete{CommandTag: []byte(tag)})

@@ -337,6 +337,8 @@ func TestPostgresConnection(t *testing.T) {
 		t.Error("a query of an unreachable database succeeded")
 	} else if strings.Contains(err.Error(), m.token) {
 		t.Errorf("the error shows the proxy token: %v", err)
+	} else if !strings.Contains(err.Error(), "connection crm") {
+		t.Errorf("the error does not name the connection: %v", err)
 	}
 	if time.Since(start) > 20*time.Second {
 		t.Errorf("a query of an unreachable database took %s", time.Since(start))

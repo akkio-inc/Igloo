@@ -271,7 +271,8 @@ ones it cannot reach, logging `connection not attached` with the reason;
 Igloo logs `cannot sign in to the remote database` the first time in a row
 that it cannot, and `remote database reachable again` when it can again.
 Queries of a connection whose database is down fail within its
-`connect_timeout`; nothing else is affected, listing tables included.
+`connect_timeout`, with an error that names the connection; nothing else is
+affected, listing tables included.
 
 ## Scaling out
 
