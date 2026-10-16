@@ -605,6 +605,7 @@ func TestConnectionsInTheCatalog(t *testing.T) {
 	store := federation.NewMemoryStore()
 	ctx := context.Background()
 	c := federation.New("crm", federation.Postgres)
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
 	c.Schemas = []string{schema}
 	gone := federation.New("gone", federation.Postgres)
