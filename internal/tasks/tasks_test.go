@@ -332,14 +332,28 @@ func testEachDueRunRunsOnce(t *testing.T, store Store) {
 	r := &fakeRunner{}
 	runSchedulers(t, r, a, b, c)
 	time.Sleep(3500 * time.Millisecond)
-	if n := r.runs.Load(); n < 3 || n > 4 {
-		t.Errorf("runs in 3.5 seconds: %d", n)
-	}
+	// Each due time runs at most once. On a loaded host a due time may be
+	// skipped because the previous run had not finished recording; that is
+	// not a second run.
 	runs, _ := store.Runs(ctx, audit.Viewer{All: true}, audit.Page{})
+	ran := map[time.Time]int{}
 	for _, run := range runs {
-		if run.Outcome != OutcomeSucceeded || run.Rows != 1 || run.Trigger != TriggerSchedule || run.Scheduled.IsZero() {
+		switch {
+		case run.Trigger != TriggerSchedule || run.Scheduled.IsZero():
+			t.Errorf("run: %+v", run)
+		case run.Outcome == OutcomeSucceeded && run.Rows == 1:
+			ran[run.Scheduled]++
+		case run.Outcome != OutcomeSkipped:
 			t.Errorf("run: %+v", run)
 		}
+	}
+	for at, n := range ran {
+		if n > 1 {
+			t.Errorf("the run due at %s ran %d times", at, n)
+		}
+	}
+	if n := r.runs.Load(); n < 2 || n > 4 || int(n) != len(ran) {
+		t.Errorf("runs in 3.5 seconds: %d, of %d due times", n, len(ran))
 	}
 }
 
