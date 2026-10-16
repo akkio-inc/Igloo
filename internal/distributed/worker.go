@@ -413,11 +413,11 @@ const maxFooters = 10000
 //
 // Files that hold each of the view's columns under its current name and
 // field ID, with one type across the files, read the same by name as by
-// field ID, and DuckDB plans reads by name better: reading TPC-H Q5's
-// tables by field ID, DuckDB 1.5 joined customer to supplier first, 60
-// million rows, and took 20 times as long. Anything else (a column renamed,
-// added, dropped and added again, or widened since some file was written,
-// or a nested column) reads by field ID.
+// field ID, and DuckDB 1.5 estimates reads by name at least as well: once,
+// without row counts, TPC-H Q5's fragment took 9 seconds by field ID and
+// 0.4 by name. Anything else (a column renamed, added, dropped and added
+// again, or widened since some file was written, or a nested column) reads
+// by field ID.
 func (w *Worker) readByName(ctx context.Context, conn *duckdb.Conn, v viewDef) (bool, error) {
 	if slices.ContainsFunc(v.Files, func(f string) bool { return !w.allowed(f) }) ||
 		slices.ContainsFunc(v.Columns, func(c Column) bool { return c.ID <= 0 }) {
