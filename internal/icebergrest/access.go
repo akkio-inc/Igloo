@@ -60,12 +60,14 @@ func (c *caller) sees(o auth.Object) bool {
 }
 
 // seesSchema reports whether c may know of a schema: some grant in it.
+// Grants on connections to other databases (Catalog set) are on their
+// schemas, not the catalog's.
 func (c *caller) seesSchema(schema string) bool {
 	if c.user.Role == auth.RoleReader || c.writer() {
 		return true
 	}
 	return c.privs != nil && slices.ContainsFunc(c.privs.Grants, func(g auth.Grant) bool {
-		return strings.EqualFold(g.Object.Schema, schema)
+		return g.Object.Catalog == "" && strings.EqualFold(g.Object.Schema, schema)
 	})
 }
 

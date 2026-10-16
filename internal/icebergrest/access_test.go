@@ -124,6 +124,10 @@ func TestCallerPrivileges(t *testing.T) {
 		{Privilege: auth.PrivilegeSelect, Object: auth.Object{Schema: "PUBLIC", Table: "Events"}},
 		{Privilege: auth.PrivilegeInsert, Object: auth.Object{Schema: "public"}},
 		{Privilege: auth.PrivilegeCreate, Object: auth.Object{Schema: "team"}},
+		// Grants on a connection to another database, whose schemas and
+		// tables are not the catalog's of the same names.
+		{Privilege: auth.PrivilegeSelect, Object: auth.Object{Catalog: "crm", Schema: "secret"}},
+		{Privilege: auth.PrivilegeSelect, Object: auth.Object{Catalog: "crm", Schema: "sales", Table: "customers"}},
 	}}}
 	reader := &caller{user: auth.User{Name: "rita", Role: auth.RoleReader}, privs: &auth.Privileges{}}
 	writer := &caller{user: auth.User{Name: "walt", Role: auth.RoleWriter}}
@@ -140,6 +144,8 @@ func TestCallerPrivileges(t *testing.T) {
 		{"sees a table in a schema it may create in", none.sees(auth.Object{Schema: "team", Table: "x"}), true},
 		{"sees a table it may insert into", none.sees(auth.Object{Schema: "public", Table: "other"}), true},
 		{"not a schema without grants", none.seesSchema("secret"), false},
+		{"nor through a connection's schema of that name", none.seesSchema("secret"), false},
+		{"nor a table through a connection's of that name", none.may(auth.PrivilegeSelect, auth.Object{Schema: "sales", Table: "customers"}), false},
 		{"reader reads", reader.may(auth.PrivilegeSelect, events), true},
 		{"reader does not write", reader.may(auth.PrivilegeInsert, events), false},
 		{"reader sees every schema", reader.seesSchema("secret"), true},
