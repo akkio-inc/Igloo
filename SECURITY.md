@@ -184,24 +184,35 @@ reference for every setting mentioned here.
   reading files the reader role. Tasks, pipes and materialized view
   refreshes run as their owner, in a new session of the owner's, checked
   against the owner's role and grants at the time they run, so they never
-  have more privileges than the owner has then; a dropped owner's work is
-  suspended. Scheduling needs the writer role, and only owners and admins
-  may change, run or drop scheduled work. Reading a materialized view
+  have more privileges than the owner has then. A dropped owner's tasks,
+  pipes, materialized views and alerts are suspended and marked as a
+  dropped user's (`ana (dropped)`, a name no user can have), so a user
+  created later with the same name does not inherit them. Scheduling needs
+  the writer role, and only owners and admins may change, run or drop
+  scheduled work. Reading a materialized view
   needs `SELECT` on it, like a table.
 - **Alerts and notifications** ([details](docs/alerts.md#security)). Only
   admins create notification integrations and grant `USAGE` on them. An
   alert runs as its owner, through the owner's grants and policies, and
   sends at most 20 rows of what its query returns, only to integrations
   its owner has `USAGE` on when it runs; `SYSTEM$SEND_NOTIFICATION` sends
-  only text written in the statement. Integrations' URLs, headers and
-  signing secrets are stored encrypted (AES-256-GCM, under a key in
-  `igloo_auth.secrets`), never shown, and replaced by `***` in errors,
-  logs, the query history and the alert history. Values from data are
-  escaped for Slack and Teams, so they cannot mention people or make
-  links.
-- **Outbound connections.** Besides the catalog, object storage and the
-  identity provider, Igloo connects out only to send notifications. These
-  connections reach only public addresses: Igloo resolves the host for
+  only text written in the statement. What any notification carries is
+  capped: its text, details, and a result's rows, columns and bytes.
+  Integrations' URLs, headers and signing secrets are stored encrypted
+  (AES-256-GCM, under a key in `igloo_auth.secrets`, as connections'
+  passwords are), never shown, and replaced by `***`, along with the parts
+  of header values, in errors, logs, the query history and the alert
+  history; errors quote a destination's answer only when it is a short
+  error code. Values from data are escaped for Slack and Teams, so they
+  cannot mention people or make links. Failed-login notices, which clients
+  can cause, are raised only for addresses and existing users, at most 5 in
+  15 minutes from a replica, and cannot use the queue or rate limit the
+  other alerts need.
+- **Outbound connections for notifications.** Besides the catalog, object
+  storage, the identity provider, and the databases and Delta Sharing
+  servers admins connect it to, Igloo connects out only to send
+  notifications. These connections reach only public addresses: Igloo
+  resolves the host for
   every connection, refuses it if any address is loopback, private,
   link-local (which holds cloud metadata endpoints), multicast, reserved or
   an IPv6 form of one, connects to the address it checked, and checks it

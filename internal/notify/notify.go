@@ -83,7 +83,9 @@ func (in Integration) Target() string {
 	return u.Scheme + "://" + u.Host
 }
 
-// secrets lists what of in must never be shown.
+// secrets lists what of in must never be shown: the URL, its path, query
+// and long path segments, header values and their parts (the token of
+// "Bearer <token>"), and the signing secret.
 func (in Integration) secrets() []string {
 	out := []string{in.URL, in.Secret}
 	if u, err := url.Parse(in.URL); err == nil {
@@ -91,9 +93,15 @@ func (in Integration) secrets() []string {
 		for _, vs := range u.Query() {
 			out = append(out, vs...)
 		}
+		for _, seg := range strings.Split(u.Path, "/") {
+			if len(seg) >= 12 {
+				out = append(out, seg)
+			}
+		}
 	}
 	for _, v := range in.Headers {
 		out = append(out, v)
+		out = append(out, strings.FieldsFunc(v, func(r rune) bool { return strings.ContainsRune(" \t,;:=", r) })...)
 	}
 	return out
 }
@@ -319,14 +327,24 @@ type Record struct {
 	Error    string
 }
 
-// Caps on what a notification carries of a result.
+// Caps on what a notification carries. Send applies them to every
+// message, whoever wrote it.
 const (
-	// MaxResultRows is the most rows a notification shows.
-	MaxResultRows = 20
-	// MaxResultBytes caps the bytes of all values shown.
+	// MaxResultRows and MaxResultColumns are the most rows and columns of
+	// a result a notification shows.
+	MaxResultRows    = 20
+	MaxResultColumns = 30
+	// MaxResultBytes caps the bytes of all the result's values shown.
 	MaxResultBytes = 16 << 10
-	// MaxValueBytes caps each value; longer ones are cut.
+	// MaxValueBytes caps each value of a result; longer ones are cut.
 	MaxValueBytes = 500
+	// MaxMessageBytes caps a message's text, its MESSAGE with the values
+	// it names, or a built-in alert's.
+	MaxMessageBytes = 4 << 10
+	// MaxTitleBytes caps a title, and MaxDetailBytes each detail of a
+	// built-in alert.
+	MaxTitleBytes  = 200
+	MaxDetailBytes = 2 << 10
 )
 
 // Part is a stretch of a message's text. Text written by the alert's
@@ -349,8 +367,11 @@ type Result struct {
 	Columns []string
 	// Rows are values in PostgreSQL's text format; nil is NULL.
 	Rows [][]*string
-	// More says the query returned more rows than Rows.
+	// More says the query returned more rows than Rows, or more of a row
+	// than its values say.
 	More bool
+	// HiddenColumns counts the columns after Columns that are not shown.
+	HiddenColumns int
 }
 
 // Message is what a notification says.
@@ -371,8 +392,13 @@ type Message struct {
 
 // Template turns an alert's MESSAGE into parts: its text as written, and
 // each {{column}} replaced by that column's value in row, as a Value.
-// Placeholders that name no column are left as written.
+// Placeholders that name no column are left as written. The text is cut at
+// MaxMessageBytes, however often the template names a column.
 func Template(tmpl string, columns []string, row []*string) []Part {
+	return capParts(template(tmpl, columns, row), MaxMessageBytes)
+}
+
+func template(tmpl string, columns []string, row []*string) []Part {
 	var parts []Part
 	for tmpl != "" {
 		start := strings.Index(tmpl, "{{")

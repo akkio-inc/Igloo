@@ -22,16 +22,86 @@ import (
 //   - Webhooks: as JSON strings.
 //   - Email: as plain text in a text/plain body.
 
+// cut shortens s to at most n bytes, at a character boundary, marking the
+// cut with an ellipsis.
+func cut(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := max(n-len("…"), 0)
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i] + "…"
+}
+
+// capParts cuts parts to n bytes of text in all.
+func capParts(parts []Part, n int) []Part {
+	var out []Part
+	for _, p := range parts {
+		if n <= 0 {
+			break
+		}
+		if len(p.Text) > n {
+			p.Text = cut(p.Text, n)
+		}
+		n -= len(p.Text)
+		out = append(out, p)
+	}
+	return out
+}
+
+// capped returns m within the caps: title, text, details and result
+// (rows, columns, bytes of each value and of all of them). Every
+// destination gets at most this much, whatever wrote the message.
+func capped(m Message) Message {
+	m.Title = cut(m.Title, MaxTitleBytes)
+	m.Body = capParts(m.Body, MaxMessageBytes)
+	if len(m.Details) > 0 {
+		details := make(map[string]string, len(m.Details))
+		for k, v := range m.Details {
+			details[k] = cut(v, MaxDetailBytes)
+		}
+		m.Details = details
+	}
+	if r := m.Result; r != nil {
+		c := &Result{Columns: r.Columns, More: r.More, HiddenColumns: r.HiddenColumns}
+		if len(c.Columns) > MaxResultColumns {
+			c.HiddenColumns += len(c.Columns) - MaxResultColumns
+			c.Columns = c.Columns[:MaxResultColumns]
+		}
+		budget := MaxResultBytes
+		for i, row := range r.Rows {
+			if i == MaxResultRows || budget <= 0 {
+				c.More = true
+				break
+			}
+			out := make([]*string, len(c.Columns))
+			for j := range out {
+				if j >= len(row) || row[j] == nil {
+					continue
+				}
+				v := "…"
+				if budget > 0 {
+					v = cut(*row[j], min(MaxValueBytes, budget))
+				}
+				if len(*row[j]) > budget {
+					c.More = true
+				}
+				budget -= len(v)
+				out[j] = &v
+			}
+			c.Rows = append(c.Rows, out)
+		}
+		m.Result = c
+	}
+	return m
+}
+
 // sanitize cuts v to MaxValueBytes and writes control characters as
 // escapes, so a value is one line.
 func sanitize(v string) string {
-	if len(v) > MaxValueBytes {
-		cut := MaxValueBytes
-		for cut > 0 && !utf8.RuneStart(v[cut]) {
-			cut--
-		}
-		v = v[:cut] + "…"
-	}
+	v = cut(v, MaxValueBytes)
 	if !strings.ContainsFunc(v, isControl) {
 		return v
 	}
@@ -150,21 +220,39 @@ func teamsPayload(m Message) ([]byte, error) {
 	})
 }
 
-// webhookPayload is the JSON a generic webhook gets.
+// webhookPayload is the JSON a generic webhook gets. Values are one line
+// each, as everywhere else.
 func webhookPayload(in Integration, m Message) ([]byte, error) {
+	var message strings.Builder
+	for _, part := range m.Body {
+		if part.Value {
+			message.WriteString(sanitize(part.Text))
+		} else {
+			message.WriteString(part.Text)
+		}
+	}
 	p := map[string]any{
 		"type":        m.Type,
 		"name":        m.Name,
 		"integration": in.Name,
 		"title":       m.Title,
-		"message":     plain(m.Body),
+		"message":     message.String(),
 		"time":        m.Time.UTC().Format(time.RFC3339),
 	}
 	if m.User != "" {
 		p["user"] = m.User
 	}
 	if len(m.Details) > 0 {
-		p["details"] = m.Details
+		details := make(map[string]string, len(m.Details))
+		for k, v := range m.Details {
+			details[k] = strings.Map(func(r rune) rune {
+				if isControl(r) && r != '\n' && r != '\t' {
+					return '\uFFFD'
+				}
+				return r
+			}, v)
+		}
+		p["details"] = details
 	}
 	if r := m.Result; r != nil {
 		rows := make([][]*string, len(r.Rows))
@@ -177,7 +265,7 @@ func webhookPayload(in Integration, m Message) ([]byte, error) {
 				}
 			}
 		}
-		p["result"] = map[string]any{"columns": r.Columns, "rows": rows, "more": r.More}
+		p["result"] = map[string]any{"columns": r.Columns, "rows": rows, "more": r.More, "hidden_columns": r.HiddenColumns}
 	}
 	return json.Marshal(p)
 }
@@ -214,6 +302,14 @@ func emailContent(m Message) (subject, body string) {
 
 // table lays a result out as lines of text, columns aligned, each value
 // sanitized and then passed through esc.
+// A table's lines are cut at maxLineBytes, and it stops at maxTableBytes,
+// so a wide or long result fits every destination: Teams takes cards of
+// about 28 KB.
+const (
+	maxLineBytes  = 1000
+	maxTableBytes = 8 << 10
+)
+
 func table(r *Result, esc func(string) string) []string {
 	cells := make([][]string, 0, len(r.Rows)+1)
 	head := make([]string, len(r.Columns))
@@ -244,24 +340,32 @@ func table(r *Result, esc func(string) string) []string {
 		}
 		return strings.TrimRight(strings.Join(parts, " | "), " ")
 	}
-	out := []string{pad(cells[0])}
 	rule := make([]string, len(widths))
 	for i, w := range widths {
 		rule[i] = strings.Repeat("-", w)
 	}
-	out = append(out, strings.Join(rule, "-+-"))
+	out := []string{cut(pad(cells[0]), maxLineBytes), cut(strings.Join(rule, "-+-"), maxLineBytes)}
+	size, n, more := len(out[0])+len(out[1]), 0, r.More
 	for _, line := range cells[1:] {
-		out = append(out, pad(line))
+		text := cut(pad(line), maxLineBytes)
+		if size += len(text); size > maxTableBytes {
+			more = true
+			break
+		}
+		out = append(out, text)
+		n++
 	}
-	switch n := len(r.Rows); {
-	case r.More && n == 1:
-		out = append(out, "(1 row shown; there are more)")
-	case r.More:
-		out = append(out, fmt.Sprintf("(%d rows shown; there are more)", n))
+	footer := fmt.Sprintf("(%d rows)", n)
+	switch {
+	case more && n == 1:
+		footer = "(1 row shown; there is more)"
+	case more:
+		footer = fmt.Sprintf("(%d rows shown; there is more)", n)
 	case n == 1:
-		out = append(out, "(1 row)")
-	default:
-		out = append(out, fmt.Sprintf("(%d rows)", n))
+		footer = "(1 row)"
 	}
-	return out
+	if r.HiddenColumns > 0 {
+		footer += fmt.Sprintf(" (%d more columns not shown)", r.HiddenColumns)
+	}
+	return append(out, footer)
 }

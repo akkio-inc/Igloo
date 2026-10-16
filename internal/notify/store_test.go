@@ -115,23 +115,36 @@ func TestStore(t *testing.T) {
 			t.Errorf("everything, newest first: %+v", rs)
 		}
 
-		// A claim holds for its window.
+		// A claim holds for its window, unless held for less.
+		const key = "ops/failed_runs/task/x"
 		for i, want := range []bool{true, false} {
-			if ok, err := s.Claim(ctx, "ops/failed_runs/task/x", time.Hour); err != nil || ok != want {
+			if ok, err := s.Claim(ctx, key, time.Hour); err != nil || ok != want {
 				t.Errorf("claim %d: %v, %v", i, ok, err)
 			}
 		}
-		if ok, _ := s.Claim(ctx, "ops/failed_runs/task/x", 0); !ok {
-			t.Error("a claim without a window")
+		if err := s.Hold(ctx, key, 0); err != nil {
+			t.Fatal(err)
 		}
-		if err := s.Prune(ctx, now.Add(-time.Second), now.Add(time.Hour)); err != nil {
+		if ok, _ := s.Claim(ctx, key, time.Hour); !ok {
+			t.Error("a claim whose hold ended still holds")
+		}
+		if err := s.Prune(ctx, now.Add(-time.Second), time.Now().Add(2*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		if rs, _ := s.Records(ctx, audit.Viewer{All: true}, audit.Page{}); len(rs) != 2 {
 			t.Errorf("after pruning: %+v", rs)
 		}
-		if ok, _ := s.Claim(ctx, "ops/failed_runs/task/x", time.Hour); !ok {
+		if ok, _ := s.Claim(ctx, key, time.Hour); !ok {
 			t.Error("pruned claims still hold")
+		}
+		if err := s.Prune(ctx, time.Time{}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := s.Claim(ctx, key, time.Hour); ok {
+			t.Error("a claim that holds was pruned")
+		}
+		if rs, _ := s.Records(ctx, audit.Viewer{All: true}, audit.Page{}); len(rs) != 2 {
+			t.Errorf("pruning without a retention deleted history: %+v", rs)
 		}
 	})
 }

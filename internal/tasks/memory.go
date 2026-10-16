@@ -115,6 +115,18 @@ func (m *MemoryStore) DropJob(_ context.Context, kind, name string) error {
 	return nil
 }
 
+func (m *MemoryStore) DisownJobs(_ context.Context, owner, tombstone string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, j := range m.jobs {
+		if j.Owner == owner {
+			j.Owner, j.State, j.NextRun = tombstone, StateSuspended, time.Time{}
+			m.jobs[k] = j
+		}
+	}
+	return nil
+}
+
 func (m *MemoryStore) Scheduled(context.Context) ([]Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -118,7 +118,8 @@ SHOW ALERTS
   error if the query or the notification fails.
 - **Schedules** are those of [tasks](loading.md#schedules): an interval
   such as `'1 hour'`, or cron such as `'0 9 * * MON-FRI'`, in any time zone;
-  Snowflake's `'60 MINUTE'` and `'USING CRON ...'` work too.
+  Snowflake's `'60 MINUTE'` and `'USING CRON ...'` work too. As in
+  Snowflake, an alert runs at most once a minute.
 - **It runs as its owner**, the user who created it, in a new session of
   theirs, with their grants and their [masking and row access
   policies](security-policies.md) at the time it runs: masked columns stay
@@ -126,13 +127,23 @@ SHOW ALERTS
   client `alert <name>`. Unqualified names resolve in the default schema,
   as in a new session.
 - **While its owner is disabled** (`NOLOGIN`), its runs are skipped and
-  recorded as `skipped`. If the owner is dropped, the alert is suspended.
+  recorded as `skipped`. When the owner is dropped, their alerts, like their
+  tasks, pipes and materialized views, are suspended and marked as a
+  dropped user's: `SHOW ALERTS` gives their owner as `ana (dropped)`. A user
+  created later with the same name does not get them; admins may drop them,
+  or `CREATE OR REPLACE` them as their own.
 - **Creating an alert needs the writer role** and `USAGE` on its
-  integration. Only its owner and admins may change, run or drop it; users
-  other than admins see only their own in `SHOW ALERTS`.
+  integration. A user owns at most 50 alerts. Only its owner and admins may
+  change, run or drop it; users other than admins see only their own in
+  `SHOW ALERTS`.
 - **One run at a time**, on one replica, as for tasks: a run that comes due
   while the previous one still runs is skipped. Failed runs are not tried
   again before the next scheduled time.
+- **A scheduled run ends once its query has**: the notification waits in
+  its integration's outbox, so a slow destination holds up no other
+  scheduled work. The run's outcome in `igloo.task_history` is about the
+  query; whether the notification went out is in `igloo.alert_history`,
+  once it has or has failed. `EXECUTE ALERT` waits for the notification.
 
 `SHOW ALERTS` lists each alert's owner, state, schedule, time zone, next
 and last run, last outcome and error, and definition. Alerts' runs are in
@@ -152,9 +163,12 @@ CREATE ALERT big_spender SCHEDULE '1 hour'
   THEN NOTIFY analytics_slack MESSAGE '{{client}} has spent {{spend}} today';
 ```
 
-`WITH RESULT` adds the rows themselves, as a table: at most 20 rows, 16 KiB
-of values, and 500 bytes of each value; the notification says when there
-were more. Every placeholder must name a column of the query.
+`WITH RESULT` adds the rows themselves, as a table: at most 20 rows, 30
+columns, 16 KiB of values, and 500 bytes of each value, in lines of at most
+1,000 bytes and 8 KiB in all, which every destination takes; the
+notification says when there was more. A `MESSAGE` is at most 4,000 bytes
+as written, and 4 KiB once its placeholders are filled in. Every
+placeholder must name a column of the query.
 
 Your `MESSAGE` text is sent as written, so it may mention `<!here>` or link
 to a dashboard in Slack. Values from the query are not: in Slack they are
@@ -224,16 +238,25 @@ ALTER NOTIFICATION INTEGRATION analytics_slack
 | `LOAD_ERRORS` | `COPY INTO`, or a pipe, could not load some files, or loaded them without some rows | Once an hour per table |
 | `IDLE_PIPES [= hours]` | A started pipe has loaded no file for that many hours (24 by default) since its last load, or since it was created | Once per that many hours per pipe |
 | `LONG_QUERIES [= minutes]` | A statement has run for that many minutes (60 by default) | Once per statement |
-| `FAILED_LOGINS` | A replica starts refusing password logins for a user (10 failures in 15 minutes) or an address (50) | Once per 15 minutes per user or address, per replica |
+| `FAILED_LOGINS` | A replica starts refusing password logins from an address (50 failures in 15 minutes), or for a user who exists (10) | Once per 15 minutes per address or user, and at most 5 notices per 15 minutes from a replica |
 | `MAINTENANCE_FAILURES` | [Table maintenance](operations.md#table-maintenance) of a table fails | Once a day per table |
 
 They go to enabled integrations only, need no `USAGE`, and say what failed,
 whose it is, and the error, which may quote values from the data; a long
 query's notification carries the first 500 bytes of its statement, with
 passwords and secrets removed. Send them where the people who see them may
-see that. Alerts' own failures are
-in the alert history, not sent: an integration that cannot be reached would
-otherwise be told so through itself.
+see that. Alerts' own failures are in the alert history, not sent: an
+integration that cannot be reached would otherwise be told so through
+itself. A notification that could not be sent holds its problem back for
+5 minutes rather than its whole window, so the problem's next occurrence
+tries again.
+
+Clients choose the user names they fail to log in with, and the addresses
+they fail from, so failed-login notices cannot crowd out the rest: failures
+of names that are no user's raise none, a replica sends at most 5 in 15
+minutes and shows names quoted, as the data they are, and they never wait
+for their integration's rate limit nor use its last 5 notifications or 16
+places in its outbox, which are kept for the other alerts.
 
 Igloo notices failures as they happen; it looks for idle pipes and long
 queries every minute while it runs. With [scale to
@@ -243,6 +266,10 @@ built-in alerts of other replicas within 30 seconds.
 
 ## Delivery
 
+- **Outboxes.** Each integration has an outbox of 64 notifications on each
+  replica, sent one after another, so a slow or unreachable destination
+  delays only its own. When the outbox is full, a notification fails at
+  once.
 - **Rate limits.** Each integration may send 10 notifications at once,
   then one a second, on each replica. A notification waits up to a minute
   for its turn, then fails as rate limited.
@@ -251,7 +278,9 @@ built-in alerts of other replicas within 30 seconds.
   error) are tried again after about 1 and then 3 seconds, or as long as a
   `Retry-After` header asks (up to 10 seconds), up to 3 attempts. Other
   failures (HTTP 4xx, permanent SMTP errors) are not. Redirects are never
-  followed: use the URL they lead to.
+  followed: use the URL they lead to. Errors quote a webhook's answer only
+  when it is a short error code, such as Slack's `invalid_token`: anything
+  else it answers might echo what it was sent.
 - **Records.** Every attempt to notify ends up in the alert history, and in
   the metric `igloo_notifications_total{type, result}` (`sent`, `failed`,
   `rate_limited`).
@@ -360,3 +389,5 @@ memory and lost on restart.
 | `rate limited` | More than 10 notifications at once went to one integration and the rest waited over a minute. Spread alerts' schedules, or use more integrations. |
 | `the mail server ... does not offer STARTTLS` | Turn on STARTTLS at the server, use port 465, or allow a relay on the private network in `IGLOO_NOTIFICATION_ALLOW_HOSTS`. |
 | `skipped: the owner ... is disabled` | `ALTER USER ... LOGIN`, or `CREATE OR REPLACE` the alert as someone else. |
+| `alerts run at most once a minute` | Give the alert a schedule of `'1 minute'` or more, or a cron expression. |
+| `... notifications are waiting to go to ...` | The integration's outbox is full: its destination is slow or down, or too many alerts use it. Check `igloo.alert_history` for its errors. |

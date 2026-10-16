@@ -222,6 +222,12 @@ func (s *PostgresStore) DropJob(ctx context.Context, kind, name string) error {
 	return s.exec(ctx, `DELETE FROM igloo_tasks.jobs WHERE kind = $1 AND lower(name) = lower($2)`, kind, name)
 }
 
+func (s *PostgresStore) DisownJobs(ctx context.Context, owner, tombstone string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE igloo_tasks.jobs SET owner = $2, state = 'suspended', next_run = NULL WHERE owner = $1`,
+		owner, tombstone)
+	return err
+}
+
 func (s *PostgresStore) Scheduled(ctx context.Context) ([]Job, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+jobColumns+` FROM igloo_tasks.jobs j
 		WHERE j.state = 'started' AND j.next_run IS NOT NULL ORDER BY j.next_run`)

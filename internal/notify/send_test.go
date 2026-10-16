@@ -213,21 +213,39 @@ func TestRetries(t *testing.T) {
 		t.Errorf("after 503, 429, 200: %d attempts, %v", attempts, err)
 	}
 
-	// Permanent failures are not tried again, and errors never show the
-	// URL's token, even when the receiver quotes it.
-	rc.answers = []int{404}
+	// Permanent failures are not tried again. Errors quote an answer that
+	// is an error code, and nothing else a receiver answers, which may echo
+	// the URL's token or a header.
 	rc.handle = func(w http.ResponseWriter, r *http.Request) bool {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(w, "no_service for "+r.URL.Path)
+		_, _ = io.WriteString(w, "no_service\n")
 		return true
 	}
 	attempts, err = s.Send(context.Background(), in, testMessage())
 	var se *SendError
-	if !errors.As(err, &se) || attempts != 1 || !strings.Contains(err.Error(), "404") {
+	if !errors.As(err, &se) || attempts != 1 || !strings.Contains(err.Error(), `404 Not Found: "no_service"`) {
 		t.Errorf("404: %d attempts, %v", attempts, err)
 	}
-	if strings.Contains(err.Error(), "abcdefghijklmnop") || !strings.Contains(err.Error(), "***") {
-		t.Errorf("the error shows the token: %v", err)
+	for _, answer := range []func(r *http.Request) string{
+		func(r *http.Request) string { return "no_service for " + r.URL.Path },
+		func(r *http.Request) string { return r.URL.Path },
+		func(r *http.Request) string {
+			return "bad token: " + strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		},
+		func(r *http.Request) string { return "sk1" },
+	} {
+		rc.handle = func(w http.ResponseWriter, r *http.Request) bool {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, answer(r))
+			return true
+		}
+		hdr := Integration{Name: "ops", Type: TypeWebhook, Enabled: true, URL: in.URL,
+			Headers: map[string]string{"Authorization": "Bearer sk1-tok3n-value"}}
+		_, err = s.Send(context.Background(), hdr, testMessage())
+		if err == nil || strings.Contains(err.Error(), "abcdefghijklmnop") || strings.Contains(err.Error(), "tok3n") ||
+			strings.Contains(err.Error(), "sk1") || !strings.HasSuffix(err.Error(), "401 Unauthorized") {
+			t.Errorf("an answer that echoes secrets: %v", err)
+		}
 	}
 
 	// Nor when the connection fails.
@@ -375,10 +393,12 @@ func TestCheck(t *testing.T) {
 }
 
 func TestScrub(t *testing.T) {
-	in := Integration{URL: "https://hooks.slack.com/services/T0001/B0002/abcdefabcdef?key=qwertyuiop",
-		Headers: map[string]string{"Authorization": "Bearer zxcvbnmasdf", "X-One": "1"}, Secret: "signing-secret-value"}
-	msg := in.Scrub("Post " + in.URL + ": Bearer zxcvbnmasdf, signing-secret-value, 1 more, qwertyuiop")
-	for _, s := range []string{"abcdefabcdef", "qwertyuiop", "zxcvbnmasdf", "signing-secret-value", "services/T0001"} {
+	in := Integration{URL: "https://hooks.slack.com/services/T0001/B0002/abcdefabcdefghij?key=qwertyuiop",
+		Headers: map[string]string{"Authorization": "Bearer zxcvbnmasdf", "X-One": "1", "X-Api": "key=lkjhgfdsapoi; v=2"},
+		Secret:  "signing-secret-value"}
+	msg := in.Scrub("Post " + in.URL + ": Bearer zxcvbnmasdf, signing-secret-value, 1 more, qwertyuiop, " +
+		"the token abcdefabcdefghij, the key lkjhgfdsapoi, just zxcvbnmasdf")
+	for _, s := range []string{"abcdefabcdef", "qwertyuiop", "zxcvbnmasdf", "signing-secret-value", "services/T0001", "lkjhgfdsapoi"} {
 		if strings.Contains(msg, s) {
 			t.Errorf("%q shows %q", msg, s)
 		}

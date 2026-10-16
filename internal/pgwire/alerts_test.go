@@ -2,7 +2,9 @@ package pgwire
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -38,9 +40,10 @@ type hookPost struct {
 	Message string
 	Details map[string]string
 	Result  *struct {
-		Columns []string
-		Rows    [][]*string
-		More    bool
+		Columns       []string
+		Rows          [][]*string
+		More          bool
+		HiddenColumns int `json:"hidden_columns"`
 	}
 	Body string `json:"-"`
 }
@@ -242,7 +245,7 @@ func TestAlerts(t *testing.T) {
 
 	a := showJobs(t, walt, "ALERTS")["contacts"]
 	if a.owner != "walt" || a.state != "suspended" || a.nextRun != nil ||
-		!strings.HasPrefix(a.definition, "IF (EXISTS (SELECT id, email FROM lake.crm.contacts ORDER BY id)) THEN NOTIFY hook") {
+		!strings.HasPrefix(a.definition, "IF (EXISTS (\nSELECT id, email FROM lake.crm.contacts ORDER BY id\n)) THEN NOTIFY hook") {
 		t.Fatalf("new alert: %+v", a)
 	}
 
@@ -311,7 +314,10 @@ func TestAlerts(t *testing.T) {
 		"action_failed|hook|0")
 	mustExec(t, admin, "GRANT USAGE ON INTEGRATION hook TO walt")
 
-	// On its schedule; the gateway learns when it is due.
+	// On its schedule; the gateway learns when it is due. Alerts run at
+	// most once a minute, which this test shortens.
+	expectRefused(t, walt, "ALTER ALERT contacts SET SCHEDULE '1 second'", "22023")
+	shortAlertInterval(t)
 	mustExec(t, walt, "ALTER ALERT contacts SET SCHEDULE '1 second'")
 	mustExec(t, walt, "ALTER ALERT contacts RESUME")
 	as.sched.Kick()
@@ -324,7 +330,8 @@ func TestAlerts(t *testing.T) {
 		t.Errorf("a scheduled run sent %s", p.Body)
 	}
 	mustExec(t, walt, "ALTER ALERT contacts SUSPEND")
-	expectRows(t, walt, "SELECT count(*) > 0 FROM igloo.alert_history WHERE alert_name = 'contacts' AND trigger = 'schedule' AND state = 'triggered'", "true")
+	eventually(t, walt, "SELECT count(*) FROM igloo.alert_history WHERE alert_name = 'contacts' AND trigger = 'schedule' "+
+		"AND state = 'triggered' LIMIT 1", 1)
 
 	// While its owner is disabled (as ALTER USER ... NOLOGIN does with a
 	// metadata database), its runs are skipped.
@@ -341,6 +348,178 @@ func TestAlerts(t *testing.T) {
 	mustExec(t, admin, "DROP ALERT contacts")
 	if _, ok := showJobs(t, admin, "ALERTS")["contacts"]; ok {
 		t.Error("a dropped alert is listed")
+	}
+}
+
+// shortAlertInterval lets alerts run every second until the test ends.
+func shortAlertInterval(t *testing.T) {
+	saved := minAlertInterval
+	minAlertInterval = time.Second
+	t.Cleanup(func() { minAlertInterval = saved })
+}
+
+// TestAlertDefinitionIsWhatRuns creates an alert whose condition ends in a
+// comment and whose MESSAGE holds SQL: what runs and what is notified are
+// what was checked, and SHOW ALERTS shows it so that it reads back the same.
+func TestAlertDefinitionIsWhatRuns(t *testing.T) {
+	as := startAlertServer(t)
+	admin := as.admin
+	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	for _, name := range []string{"a", "b"} {
+		mustExec(t, admin, "CREATE NOTIFICATION INTEGRATION "+name+" TYPE webhook URL '"+as.hooks.URL+"/"+name+"'")
+	}
+	mustExec(t, admin, "GRANT USAGE ON INTEGRATION a TO walt")
+	mustExec(t, walt, "CREATE ALERT tricky SCHEDULE '1 hour' IF (EXISTS (SELECT 1 AS n --\n)) THEN NOTIFY a "+
+		"MESSAGE 'x\nUNION ALL SELECT 2)) THEN NOTIFY b' WITH RESULT")
+	mustExec(t, walt, "EXECUTE ALERT tricky")
+	p := as.hooks.wait(t, 1)
+	if p.Path != "/a" || p.Result == nil || len(p.Result.Rows) != 1 || p.Message != "x\nUNION ALL SELECT 2)) THEN NOTIFY b" {
+		t.Errorf("the alert sent to %s: %s", p.Path, p.Body)
+	}
+	def := showJobs(t, walt, "ALERTS")["tricky"].definition
+	back, err := parseAlert(def)
+	if err != nil || back.Condition != "SELECT 1 AS n --" || back.Integration != "a" || back.Message == nil ||
+		*back.Message != "x\nUNION ALL SELECT 2)) THEN NOTIFY b" || !back.WithResult {
+		t.Errorf("SHOW ALERTS shows %q, which reads back as %+v (%v)", def, back, err)
+	}
+}
+
+// TestAlertLimits checks the minimum interval and the alerts a user may
+// own.
+func TestAlertLimits(t *testing.T) {
+	as := startAlertServer(t)
+	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
+	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, as.admin, "GRANT USAGE ON INTEGRATION hook TO walt")
+	const alert = " IF (EXISTS (SELECT 1)) THEN NOTIFY hook"
+	for _, sched := range []string{"'1 second'", "'30 seconds'", "'59 SECOND'"} {
+		expectRefused(t, walt, "CREATE ALERT fast SCHEDULE "+sched+alert, "22023")
+	}
+	for i := range maxAlertsPerOwner {
+		mustExec(t, walt, fmt.Sprintf("CREATE ALERT a%d SCHEDULE '1 minute'", i)+alert)
+	}
+	expectRefused(t, walt, "CREATE ALERT one_more SCHEDULE '1 hour'"+alert, "53400")
+	mustExec(t, walt, "CREATE OR REPLACE ALERT a0 SCHEDULE '* * * * *'"+alert)
+	mustExec(t, walt, "DROP ALERT a1")
+	mustExec(t, walt, "CREATE ALERT one_more SCHEDULE '1 hour'"+alert)
+}
+
+// TestAlertCaps checks that a wide result and a MESSAGE that names a long
+// value many times are cut to the caps.
+func TestAlertCaps(t *testing.T) {
+	as := startAlertServer(t)
+	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
+	var cols []string
+	for i := range 200 {
+		cols = append(cols, fmt.Sprintf("repeat('x', 1000) AS c%d", i))
+	}
+	mustExec(t, as.admin, "CREATE ALERT wide SCHEDULE '1 hour' IF (EXISTS (SELECT "+strings.Join(cols, ", ")+
+		" FROM range(5))) THEN NOTIFY hook MESSAGE '"+strings.Repeat("{{c0}}", 600)+"' WITH RESULT")
+	mustExec(t, as.admin, "EXECUTE ALERT wide")
+	p := as.hooks.wait(t, 1)
+	if len(p.Body) > 64<<10 || len(p.Message) > notify.MaxMessageBytes || p.Result == nil ||
+		len(p.Result.Columns) != notify.MaxResultColumns || p.Result.HiddenColumns != 200-notify.MaxResultColumns || !p.Result.More {
+		t.Errorf("a wide alert sent %d bytes: message %d bytes, result %+v", len(p.Body), len(p.Message), p.Result != nil)
+	}
+}
+
+// TestScheduledAlertsLeaveTheScheduler checks that a scheduled alert's run
+// ends once its condition has run, whatever its integration is like: the
+// notification goes out from the integration's outbox, and the alert
+// history records it once sent.
+func TestScheduledAlertsLeaveTheScheduler(t *testing.T) {
+	as := startAlertServer(t)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(slow.Close)
+	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION slow TYPE webhook URL '"+slow.URL+"/hook'")
+	shortAlertInterval(t)
+	mustExec(t, as.admin, "CREATE ALERT ticking SCHEDULE '1 second' IF (EXISTS (SELECT 1)) THEN NOTIFY slow")
+	mustExec(t, as.admin, "ALTER ALERT ticking RESUME")
+	as.runScheduler(t)
+	eventually(t, as.admin, "SELECT count(*) FROM igloo.alert_history WHERE alert_name = 'ticking' AND state = 'triggered' LIMIT 1", 1)
+	mustExec(t, as.admin, "ALTER ALERT ticking SUSPEND")
+	if n := count(t, as.admin, "SELECT count(*) FROM igloo.task_history WHERE name = 'ticking' AND outcome = 'succeeded' "+
+		"AND duration_ms > 1500"); n != 0 {
+		t.Errorf("%d scheduled runs waited for the slow integration", n)
+	}
+}
+
+// TestDroppedOwnersWork checks that dropping a user disowns their alerts
+// and tasks: a new user of the same name does not get them.
+func TestDroppedOwnersWork(t *testing.T) {
+	as := startAlertServer(t)
+	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
+	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, as.admin, "GRANT USAGE ON INTEGRATION hook TO walt")
+	mustExec(t, walt, "CREATE ALERT watch SCHEDULE '1 hour' IF (EXISTS (SELECT 1)) THEN NOTIFY hook")
+	mustExec(t, walt, "ALTER ALERT watch RESUME")
+	mustExec(t, walt, "CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")
+	mustExec(t, walt, "ALTER TASK tick RESUME")
+	_ = walt.Close(context.Background())
+	mustExec(t, as.admin, "DROP USER walt")
+	for kind, name := range map[string]string{"ALERTS": "watch", "TASKS": "tick"} {
+		if j := showJobs(t, as.admin, kind)[name]; j.owner != "walt (dropped)" || j.state != "suspended" || j.nextRun != nil {
+			t.Errorf("%s %s after its owner was dropped: %+v", kind, name, j)
+		}
+	}
+	walt2 := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	if n := len(showJobs(t, walt2, "ALERTS")) + len(showJobs(t, walt2, "TASKS")); n != 0 {
+		t.Errorf("the new walt sees %d of the old one's jobs", n)
+	}
+	expectDenied(t, walt2, "ALTER ALERT watch RESUME", "walt (dropped)")
+	expectDenied(t, walt2, "EXECUTE TASK tick", "walt (dropped)")
+	if _, err := as.admin.Exec(context.Background(), "EXECUTE ALERT watch"); err == nil {
+		t.Error("a dropped owner's alert ran")
+	}
+	mustExec(t, as.admin, "DROP ALERT watch")
+}
+
+// TestFailedLoginsCannotFlood checks the failed_logins alert's inputs: a
+// client blocked from using passwords adds no failures, however malformed
+// its logins; and names that are no user's raise no notice.
+func TestFailedLoginsCannotFlood(t *testing.T) {
+	as := startAlertServer(t)
+	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION ops TYPE webhook URL '"+as.hooks.URL+"/ops' "+
+		"OPERATIONAL_ALERTS = (FAILED_LOGINS)")
+	as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	here := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	for i := range addrFailures {
+		as.srv.limiter.failed(fmt.Sprintf("probe%d", i), here)
+	}
+	for _, mechanism := range []string{"BOGUS", "SCRAM-SHA-256"} {
+		conn := rawStartup(t, as.addr, "please-call-555-0100")
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 512)
+		if _, err := conn.Read(buf); err != nil { // AuthenticationSASL
+			t.Fatal(err)
+		}
+		body := append([]byte(mechanism+"\x00"), 0xFF, 0xFF, 0xFF, 0xFE)
+		msg := append([]byte{'p'}, binary.BigEndian.AppendUint32(nil, uint32(4+len(body)))...)
+		_, _ = conn.Write(append(msg, body...))
+		n, _ := conn.Read(buf)
+		if !strings.Contains(string(buf[:n]), "too many failed logins") {
+			t.Errorf("a malformed %s login while blocked: %q", mechanism, buf[:n])
+		}
+		_ = conn.Close()
+	}
+	as.srv.limiter.mu.Lock()
+	failures := len(as.srv.limiter.users["please-call-555-0100"])
+	as.srv.limiter.mu.Unlock()
+	if failures != 0 {
+		t.Errorf("a blocked client's malformed logins counted %d failures", failures)
+	}
+
+	// An address's limit raises a notice; a name's, only a user's.
+	as.srv.notifyLoginsBlocked("please-call-555-0100", here, true, false)
+	as.srv.notifyLoginsBlocked("walt", here, true, true)
+	p := as.hooks.wait(t, 1)
+	p2 := as.hooks.wait(t, 2)
+	time.Sleep(200 * time.Millisecond)
+	if as.hooks.count() != 2 || p.Details["address"] != "127.0.0.1" || p2.Details["user"] != "walt" {
+		t.Errorf("notices: %s, %s (%d in all)", p.Body, p2.Body, as.hooks.count())
 	}
 }
 

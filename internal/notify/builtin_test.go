@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -12,16 +14,21 @@ import (
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
-// drain delivers the built-in alerts waiting, as Run does.
+// drain delivers the built-in alerts waiting, as Run does, and waits for
+// them to be sent or to fail.
 func drain(ctx context.Context, s *Service) {
-	for {
-		select {
-		case e := <-s.events:
-			s.deliver(ctx, e)
-		default:
-			return
+	for _, q := range []chan event{s.events, s.logins} {
+	more:
+		for {
+			select {
+			case e := <-q:
+				s.deliver(ctx, e)
+			default:
+				break more
+			}
 		}
 	}
+	s.pending.Wait()
 }
 
 func payloads(t *testing.T, rc *receiver) []map[string]any {
@@ -82,7 +89,7 @@ func TestBuiltinAlerts(t *testing.T) {
 			t.Errorf("type %v", p["type"])
 		}
 	}
-	if want := "failed_runs,load_errors,failed_logins,maintenance_failures"; strings.Join(names, ",") != want {
+	if want := "failed_runs,load_errors,maintenance_failures,failed_logins"; strings.Join(names, ",") != want {
 		t.Errorf("sent %v, want %s", names, want)
 	}
 	if len(got) > 0 {
@@ -112,7 +119,9 @@ func TestBuiltinAlerts(t *testing.T) {
 	running = []Statement{{PID: 42, User: "ana", Text: "SELECT * FROM big", Started: time.Now().Add(-2 * time.Hour)},
 		{PID: 43, User: "bo", Text: "SELECT 1", Started: time.Now()}}
 	s.check(ctx)
+	s.pending.Wait()
 	s.check(ctx)
+	s.pending.Wait()
 	got = payloads(t, rc)[4:]
 	names = nil
 	for _, p := range got {
@@ -138,6 +147,207 @@ func TestBuiltinAlerts(t *testing.T) {
 	}
 	if recs, _ := store.Records(ctx, audit.Viewer{User: "walt"}, audit.Page{}); len(recs) != 0 {
 		t.Errorf("walt sees %d built-in alerts", len(recs))
+	}
+}
+
+// TestLoginNoticesCannotFlood checks that failed-login notices, which
+// clients drive, are few per window, show names quoted, and leave the
+// integration's queue and rate limit to the other built-in alerts.
+func TestLoginNoticesCannotFlood(t *testing.T) {
+	ctx := context.Background()
+	rc := newReceiver(t, false)
+	s := newTestService(t, Options{})
+	in := Integration{Name: "ops", Type: TypeWebhook, Enabled: true, URL: rc.URL,
+		Builtin: Builtin{FailedRuns: true, FailedLogins: true}}
+	if err := s.Store().CreateIntegration(ctx, in, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 40 {
+		s.LoginsBlocked(fmt.Sprintf("198.51.100.%d", i), false, 50, 15*time.Minute)
+	}
+	if n := len(s.logins); n != maxLoginNotices {
+		t.Errorf("%d failed-login notices queued, want %d", n, maxLoginNotices)
+	}
+	if n := len(s.events); n != 0 {
+		t.Errorf("failed-login notices took %d of the other alerts' queue", n)
+	}
+	s.LoginsBlocked("please-call-555-0100", true, 10, 15*time.Minute)
+	if n := len(s.logins); n != maxLoginNotices {
+		t.Errorf("a notice past the cap was queued: %d", n)
+	}
+	drain(ctx, s)
+	// The other alerts still go out at once, from the reserve.
+	s.RunEnded(tasks.Job{Kind: tasks.KindTask, Name: "nightly", Owner: "walt"},
+		tasks.Run{Outcome: tasks.OutcomeFailed, Trigger: tasks.TriggerSchedule, Start: time.Now(), Error: "boom"})
+	drain(ctx, s)
+	var logins []map[string]any
+	failedRuns := 0
+	for _, p := range payloads(t, rc) {
+		switch p["name"] {
+		case BuiltinFailedLogins:
+			logins = append(logins, p)
+		case BuiltinFailedRuns:
+			failedRuns++
+		}
+	}
+	if len(logins) != maxLoginNotices || failedRuns != 1 {
+		t.Errorf("sent %d failed-login notices and %d failed runs", len(logins), failedRuns)
+	}
+	if last := logins[len(logins)-1]["message"].(string); !strings.Contains(last, "sends no more") {
+		t.Errorf("the last notice does not say more are held back: %q", last)
+	}
+
+	// Names are shown as the quoted data they are.
+	s2 := newTestService(t, Options{Store: s.Store()})
+	s2.LoginsBlocked("please-call-555-0100", true, 10, 15*time.Minute)
+	e := <-s2.logins
+	if text := slackText(e.msg); !strings.Contains(text, "`\"please-call-555-0100\"`") {
+		t.Errorf("Slack shows the name as %q", text)
+	}
+
+	// A failed-login notice takes from the rate limit only what the other
+	// alerts leave, and never waits for it.
+	s3 := newTestService(t, Options{})
+	for i := range sendBurst {
+		err := s3.take(ctx, "ops", true)
+		if i < sendBurst-reserveTokens && err != nil || i >= sendBurst-reserveTokens && !errors.Is(err, ErrRateLimited) {
+			t.Errorf("low-priority take %d: %v", i, err)
+		}
+	}
+	for i := range reserveTokens {
+		if err := s3.take(ctx, "ops", false); err != nil {
+			t.Errorf("take %d of the reserve: %v", i, err)
+		}
+	}
+}
+
+// TestFailedNotificationsAreTriedAgain checks that a built-in alert whose
+// notification failed holds its problem back only briefly, not for its
+// whole repeat window.
+func TestFailedNotificationsAreTriedAgain(t *testing.T) {
+	ctx := context.Background()
+	rc := newReceiver(t, false)
+	rc.handle = func(w http.ResponseWriter, _ *http.Request) bool { w.WriteHeader(http.StatusBadRequest); return true }
+	store := NewMemoryStore()
+	started := time.Now().Add(-3 * time.Hour)
+	s := newTestService(t, Options{Store: store, Statements: func() []Statement {
+		return []Statement{{PID: 7, User: "ana", Text: "SELECT 1", Started: started}}
+	}})
+	in := Integration{Name: "ops", Type: TypeWebhook, Enabled: true, URL: rc.URL, Builtin: Builtin{LongQueries: time.Hour}}
+	if err := store.CreateIntegration(ctx, in, false); err != nil {
+		t.Fatal(err)
+	}
+	s.check(ctx)
+	s.pending.Wait()
+	recs, _ := store.Records(ctx, audit.Viewer{All: true}, audit.Page{})
+	if len(recs) != 1 || recs[0].State != StateActionFailed {
+		t.Fatalf("history: %+v", recs)
+	}
+	store.mu.Lock()
+	var until time.Time
+	for _, u := range store.claims {
+		until = u
+	}
+	store.mu.Unlock()
+	if left := time.Until(until); left > retryFailed+time.Second || left <= 0 {
+		t.Errorf("a failed notification holds its problem back for %v, want about %v", left, retryFailed)
+	}
+	// Once the hold ends, the next check tries again, and succeeds.
+	store.mu.Lock()
+	for k := range store.claims {
+		store.claims[k] = time.Now()
+	}
+	store.mu.Unlock()
+	rc.handle = nil
+	s.check(ctx)
+	s.pending.Wait()
+	if recs, _ := store.Records(ctx, audit.Viewer{All: true}, audit.Page{}); len(recs) != 2 || recs[0].State != StateTriggered {
+		t.Errorf("after the hold: %+v", recs)
+	}
+	if left := func() time.Duration {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		for _, u := range store.claims {
+			return time.Until(u)
+		}
+		return 0
+	}(); left < repeatLongQuery-time.Minute {
+		t.Errorf("a sent notification holds its problem back for %v, want %v", left, repeatLongQuery)
+	}
+}
+
+// TestCaps checks that whatever a message carries, every destination gets
+// at most the caps: wide rows, many columns, long values, a MESSAGE that
+// names a column many times, a long error.
+func TestCaps(t *testing.T) {
+	long := strings.Repeat("x", 100_000)
+	cols := make([]string, 2000)
+	row := make([]*string, 2000)
+	for i := range cols {
+		cols[i], row[i] = fmt.Sprintf("c%d", i), &long
+	}
+	expanded := Template(strings.Repeat("{{c0}}", 650), cols, row)
+	if n := len(plain(expanded)); n > MaxMessageBytes {
+		t.Errorf("the MESSAGE expanded to %d bytes", n)
+	}
+	m := Message{Type: RecordBuiltin, Name: BuiltinFailedRuns, Title: strings.Repeat("t", 5000),
+		Body:    append(expanded, Text(" and then "), Value(long)),
+		Details: map[string]string{"error": long, "name": "x"},
+		Result:  &Result{Columns: cols, Rows: [][]*string{row, row, row}}}
+	if n := len(plain(capped(m).Body)); n > MaxMessageBytes {
+		t.Errorf("the message keeps %d bytes", n)
+	}
+	c := capped(m)
+	if len(c.Title) > MaxTitleBytes || len(c.Result.Columns) != MaxResultColumns || c.Result.HiddenColumns != 2000-MaxResultColumns ||
+		!c.Result.More {
+		t.Errorf("capped: title %d, %d columns, %d hidden, more %v", len(c.Title), len(c.Result.Columns), c.Result.HiddenColumns, c.Result.More)
+	}
+	total := 0
+	for _, r := range c.Result.Rows {
+		for _, v := range r {
+			if v != nil {
+				total += len(*v)
+			}
+		}
+	}
+	if total > MaxResultBytes+MaxResultColumns*len("…") {
+		t.Errorf("the result keeps %d bytes", total)
+	}
+	// Slack takes 40,000 characters of text; Teams cards of about 28 KB.
+	in := Integration{Name: "ops"}
+	for typ, limit := range map[string]int{TypeWebhook: 64 << 10, TypeSlack: 40_000, TypeTeams: 28_000} {
+		var b []byte
+		var err error
+		switch typ {
+		case TypeWebhook:
+			b, err = webhookPayload(in, c)
+		case TypeSlack:
+			b, err = slackPayload(c)
+		case TypeTeams:
+			b, err = teamsPayload(c)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(b) > limit {
+			t.Errorf("%s payload: %d bytes, over %d", typ, len(b), limit)
+		}
+	}
+	_, body := emailContent(c)
+	if len(body) > 48<<10 {
+		t.Errorf("email: %d bytes", len(body))
+	}
+	var p struct {
+		Message string
+		Details map[string]string
+	}
+	b, _ := webhookPayload(in, capped(Message{Body: []Part{Text("a\nb "), Value("line one\nline two")},
+		Details: map[string]string{"error": "x\x00y"}}))
+	if err := json.Unmarshal(b, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Message != `a`+"\n"+`b line one\nline two` || strings.ContainsRune(p.Details["error"], 0) {
+		t.Errorf("webhook values are not one line: %q %q", p.Message, p.Details["error"])
 	}
 }
 
@@ -193,7 +403,7 @@ func TestTable(t *testing.T) {
 	r := &Result{Columns: []string{"name", "v"}, Rows: [][]*string{{&long, &multi}}, More: true}
 	lines := table(r, func(v string) string { return v })
 	if len(lines) != 4 || !strings.HasPrefix(lines[0], "name") || !strings.Contains(lines[2], `line one\nline two`+"�") ||
-		lines[3] != "(1 row shown; there are more)" {
+		lines[3] != "(1 row shown; there is more)" {
 		t.Errorf("%q", lines)
 	}
 	if !strings.Contains(lines[2], "…") || len(lines[2]) > MaxValueBytes+100 {

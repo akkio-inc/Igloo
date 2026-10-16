@@ -234,9 +234,11 @@ EXECUTE TASK hourly_rollup;   -- run it now, as it would run on its schedule
 - **It runs as its owner**, the user who created it, in a new session of
   theirs, with the privileges they have when it runs. If they lose a
   privilege the task needs, its runs fail; while they are disabled
-  (`NOLOGIN`), its runs fail; if they are dropped, its runs fail and it is
-  suspended. A task never runs with more privileges than its
-  owner has. Its statements are in the owner's query history, with client
+  (`NOLOGIN`), its runs fail; when they are dropped, their tasks, pipes,
+  materialized views and alerts are suspended and marked as a dropped
+  user's (`SHOW TASKS` gives the owner as `ana (dropped)`), so a user
+  created later with the same name does not get them. A task never runs
+  with more privileges than its owner has. Its statements are in the owner's query history, with client
   `task <name>`.
 - **One run at a time, on one replica.** Each scheduled run is claimed by
   one replica, through the metadata database. A run that comes due while
@@ -371,7 +373,7 @@ things out.
 | `cannot tell the format of ...` | The file name has no known extension; give `FORMAT`. |
 | A task does not run | It is suspended: `ALTER TASK ... RESUME`. `SHOW TASKS` shows its state and next run. |
 | A run failed with `permission denied for ...` | The owner lost a privilege the task needs. Grant it again, or `CREATE OR REPLACE` the task as someone who has it. |
-| A task was suspended by itself | Its owner was dropped. Recreate it as another user. |
+| A task was suspended by itself, and its owner is `... (dropped)` | Its owner was dropped. An admin can recreate it, as themselves or another user, or drop it. |
 | Nobody noticed a failed run, or a partner's file that never came | Switch on the [built-in alerts](alerts.md#built-in-operational-alerts) `FAILED_RUNS`, `LOAD_ERRORS` and `IDLE_PIPES` for a Slack, Teams or email integration. |
 | Runs are `skipped` | Each run takes longer than the schedule's interval. Lengthen the interval. |
 | A file is `unknown` in the load history | Igloo stopped while loading it. Check whether its rows are in the table; if not, load it with `FORCE true`. |

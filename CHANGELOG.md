@@ -56,7 +56,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   AS query`, `REFRESH MATERIALIZED VIEW`) keep a query's result as an
   Iceberg table, refreshed in one transaction on demand or on a schedule.
 - Tasks, pipes and refreshes run as their owner, with the owner's role and
-  grants at the time they run; scheduling needs the writer role.
+  grants at the time they run; scheduling needs the writer role. When a
+  user is dropped, their tasks, pipes, materialized views and alerts are
+  suspended and marked as a dropped user's, so a user created later with
+  the same name does not inherit them.
 - With scale to zero, Igloo reports when work is next due on
   `GET /activity`, and the gateway starts the compute for it.
 - Several replicas can serve the same tables; conflicting concurrent writes
@@ -109,10 +112,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   RESULT]`, `ALTER ALERT ... RESUME | SUSPEND | SET SCHEDULE`,
   `EXECUTE ALERT`, `DROP ALERT`, `SHOW ALERTS`. They are scheduled work like
   tasks: run as their owner with the owner's grants and policies, skipped
-  while the owner is disabled, and the scale-to-zero gateway starts Igloo
-  for them. Messages take `{{column}}` values from the first row; results
-  are capped at 20 rows and 16 KiB, and values from data are escaped so
-  they cannot mention people or make links in Slack or Teams.
+  while the owner is disabled, at most once a minute, and the
+  scale-to-zero gateway starts Igloo for them. A user owns at most 50.
+  Messages take `{{column}}` values from the first row, up to 4 KiB;
+  results are capped at 20 rows, 30 columns and 16 KiB, and values from
+  data are escaped so they cannot mention people or make links in Slack or
+  Teams. Each integration sends from an outbox of its own, so a slow
+  destination holds up neither the scheduler nor other integrations.
 - `igloo.alert_history`: every alert run, built-in alert and message, with
   its state (`condition_false`, `triggered`, `condition_failed`,
   `action_failed`, `skipped`), integration, attempts and error. Admins see
@@ -122,8 +128,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Built-in operational alerts admins switch on per integration
   (`OPERATIONAL_ALERTS`): failed scheduled runs, `COPY INTO` and pipe load
   errors, pipes with no new files for N hours, statements running longer
-  than N minutes, failed-login bursts from the login limiter, and table
-  maintenance failures, each sent at most once per problem in a while.
+  than N minutes, failed-login bursts from the login limiter (for
+  addresses and existing users, at most 5 in 15 minutes from a replica,
+  never at the other alerts' expense), and table maintenance failures, each
+  sent at most once per problem in a while, and tried again 5 minutes after
+  a failed send.
 - Notifications reach only public addresses (no loopback, private,
   link-local or metadata, multicast or reserved addresses, in IPv4 or
   IPv6), checked again at every connection against DNS rebinding, over

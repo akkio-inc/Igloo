@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/notify"
+	"github.com/akkio-inc/igloo/internal/schedule"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
@@ -684,14 +686,23 @@ func (s *Server) sendNotification(ctx context.Context, sess *session, user auth.
 
 // --- alerts -------------------------------------------------------------
 
-// alertDef is what an alert does, as CREATE ALERT gives it after its
-// schedule and as it is stored.
+// Limits on alerts, which run often and hold a session while their query
+// runs: an alert's schedule is at least minAlertInterval apart (as in
+// Snowflake), and a user owns at most maxAlertsPerOwner of them.
+var minAlertInterval = time.Minute
+
+const maxAlertsPerOwner = 50
+
+// alertDef is what an alert does: CREATE ALERT's IF ... THEN ..., parsed. It
+// is stored field by field, as JSON in the job's statement, so what runs
+// is exactly what was checked when the alert was created; it is never read
+// from SQL text again.
 type alertDef struct {
-	// condition is the query in IF (EXISTS (...)).
-	condition   string
-	integration string
-	message     *string
-	withResult  bool
+	// Condition is the query in IF (EXISTS (...)).
+	Condition   string  `json:"condition"`
+	Integration string  `json:"integration"`
+	Message     *string `json:"message,omitempty"`
+	WithResult  bool    `json:"with_result,omitempty"`
 }
 
 func alertSyntax(format string, args ...any) error {
@@ -715,9 +726,9 @@ func parseAlert(body string) (alertDef, error) {
 	if !ok {
 		return a, alertSyntax("the alert's condition has unbalanced parentheses")
 	}
-	a.condition = strings.TrimSpace(body[sc.i:end])
+	a.Condition = strings.TrimSpace(body[sc.i:end])
 	sc.i = end + 1
-	if a.condition == "" {
+	if a.Condition == "" {
 		return a, alertSyntax("the alert needs a query in IF (EXISTS (...))")
 	}
 	if outer && !sc.punct(')') {
@@ -727,30 +738,35 @@ func parseAlert(body string) (alertDef, error) {
 		return a, alertSyntax("expected THEN NOTIFY integration after the alert's condition")
 	}
 	var err error
-	if a.integration, err = integrationName(sc); err != nil {
+	if a.Integration, err = integrationName(sc); err != nil {
 		return a, err
 	}
 	for !sc.done() {
 		switch {
-		case a.message == nil && sc.keywords("MESSAGE"):
+		case a.Message == nil && sc.keywords("MESSAGE"):
 			sc.punct('=')
 			v, ok := sc.literal()
 			if !ok || v == nil {
 				return a, alertSyntax("MESSAGE takes a string")
 			}
-			if len(*v) > 4000 {
-				return a, pgerror.WithCode(errors.New("an alert's MESSAGE is at most 4000 bytes"), codes.InvalidParameterValue)
+			if len(*v) > maxMessageTemplate {
+				return a, pgerror.WithCode(fmt.Errorf("an alert's MESSAGE is at most %d bytes", maxMessageTemplate),
+					codes.InvalidParameterValue)
 			}
-			a.message = v
-		case !a.withResult && sc.keywords("WITH", "RESULT"):
-			a.withResult = true
+			a.Message = v
+		case !a.WithResult && sc.keywords("WITH", "RESULT"):
+			a.WithResult = true
 		default:
 			return a, alertSyntax("unexpected text after THEN NOTIFY %s: %q; expected MESSAGE '...' or WITH RESULT",
-				a.integration, strings.TrimSpace(sc.rest()))
+				a.Integration, strings.TrimSpace(sc.rest()))
 		}
 	}
 	return a, nil
 }
+
+// maxMessageTemplate caps an alert's MESSAGE as written; what it expands
+// to is capped at notify.MaxMessageBytes.
+const maxMessageTemplate = 4000
 
 // closingParen returns the index of the parenthesis that closes the one at
 // s[open], looking only at SQL code.
@@ -774,60 +790,154 @@ func closingParen(s string, open int) (int, bool) {
 	return 0, false
 }
 
-// String writes a back as stored, and as SHOW ALERTS shows it.
-func (a alertDef) String() string {
-	out := "IF (EXISTS (" + a.condition + ")) THEN NOTIFY " + a.integration
-	if a.message != nil {
-		out += " MESSAGE " + quoteLiteral(*a.message)
+// encode is how a is stored.
+func (a alertDef) encode() string {
+	b, _ := json.Marshal(a)
+	return string(b)
+}
+
+// decodeAlert reads what encode stored.
+func decodeAlert(stored string) (alertDef, error) {
+	var a alertDef
+	dec := json.NewDecoder(strings.NewReader(stored))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&a); err != nil || a.Condition == "" || a.Integration == "" {
+		return alertDef{}, errors.New("the stored alert is damaged; CREATE OR REPLACE it")
 	}
-	if a.withResult {
+	return a, nil
+}
+
+// String writes a as SQL, as SHOW ALERTS shows it. The condition has lines
+// of its own, so a comment that ends it ends there.
+func (a alertDef) String() string {
+	out := "IF (EXISTS (\n" + a.Condition + "\n)) THEN NOTIFY " + a.Integration
+	if a.Message != nil {
+		out += " MESSAGE " + quoteLiteral(*a.Message)
+	}
+	if a.WithResult {
 		out += " WITH RESULT"
 	}
 	return out
 }
 
-// checkAlert checks a new alert as user: its condition is one query that
-// user may run, its MESSAGE names only the query's columns, and user may
-// use its integration.
-func (s *Server) checkAlert(ctx context.Context, sess *session, user auth.User, a alertDef) error {
-	notQuery := pgerror.WithCode(errors.New("an alert's condition is one query: IF (EXISTS (SELECT ...))"), codes.Syntax)
-	if n, err := s.engine.CountStatements(a.condition); err != nil || n != 1 || !selectLike(a.condition) {
-		return notQuery
+// alertDefinition is what SHOW ALERTS shows of a stored alert.
+func alertDefinition(stored string) string {
+	a, err := decodeAlert(stored)
+	if err != nil {
+		return stored
 	}
-	st, err := s.prepareChecked(ctx, sess, user, a.condition, nil)
+	return a.String()
+}
+
+// errNotQuery refuses a condition that is not one query.
+var errNotQuery = pgerror.WithCode(errors.New("an alert's condition is one query: IF (EXISTS (SELECT ...))"), codes.Syntax)
+
+// oneQuery reports whether condition is one statement that reads.
+func (s *Server) oneQuery(condition string) bool {
+	n, err := s.engine.CountStatements(condition)
+	return err == nil && n == 1 && selectLike(condition)
+}
+
+// checkAlert checks a new alert as user: its condition is one query that
+// user may run, its MESSAGE names only the query's columns, user may use
+// its integration, and user owns no more than maxAlertsPerOwner alerts with
+// it, other than the one called name it may replace.
+func (s *Server) checkAlert(ctx context.Context, sess *session, user auth.User, name string, a alertDef) error {
+	if !s.oneQuery(a.Condition) {
+		return errNotQuery
+	}
+	st, err := s.prepareChecked(ctx, sess, user, a.Condition, nil)
 	if err != nil {
 		return err
 	}
 	defer st.close() //nolint:errcheck
 	if !st.onlyReads() {
-		return notQuery
+		return errNotQuery
 	}
-	if a.message != nil {
-		for _, p := range notify.Placeholders(*a.message) {
+	if a.Message != nil {
+		for _, p := range notify.Placeholders(*a.Message) {
 			if !slices.ContainsFunc(st.columns, func(c wire.Column) bool { return strings.EqualFold(c.Name, p) }) {
 				return pgerror.WithCode(fmt.Errorf("the MESSAGE names {{%s}}, which is not a column of the condition's query", p),
 					codes.UndefinedColumn)
 			}
 		}
 	}
-	_, err = s.usableIntegration(ctx, user, a.integration)
-	return err
+	if _, err := s.usableIntegration(ctx, user, a.Integration); err != nil {
+		return err
+	}
+	alerts, err := s.tasks.Store().Jobs(ctx, tasks.KindAlert)
+	if err != nil {
+		return err
+	}
+	owned := 0
+	for _, j := range alerts {
+		if j.Owner == user.Name && !strings.EqualFold(j.Name, name) {
+			owned++
+		}
+	}
+	if owned >= maxAlertsPerOwner {
+		return pgerror.WithCode(fmt.Errorf("%s owns %d alerts, the most a user may; drop some first", user.Name, owned),
+			codes.ConfigurationLimitExceeded)
+	}
+	return nil
+}
+
+// checkAlertSchedule refuses schedules that would run an alert more often
+// than every minAlertInterval.
+func checkAlertSchedule(sched schedule.Schedule) error {
+	if sched.IsInterval() && sched.Every < minAlertInterval {
+		return pgerror.WithCode(fmt.Errorf("alerts run at most once a minute, and the schedule %q is more often", sched),
+			codes.InvalidParameterValue)
+	}
+	return nil
 }
 
 // alertResult keeps what an alert's condition returns, as much as a
-// notification shows.
+// notification shows: MaxResultColumns columns, MaxValueBytes of each
+// value, rows until MaxResultRows or MaxResultBytes, and the first row's
+// values of the columns the MESSAGE names.
 type alertResult struct {
+	named   []string
 	columns []string
-	rows    [][]*string
-	bytes   int
-	more    bool
+	// hidden counts the columns not kept.
+	hidden int
+	// index has the position of each column, by name in lower case.
+	index map[string]int
+	rows  [][]*string
+	// first holds the first row's values of the named columns.
+	first map[string]*string
+	bytes int
+	more  bool
 }
 
 func (r *alertResult) Columns(cols []Column) error {
-	for _, c := range cols {
-		r.columns = append(r.columns, c.Name)
+	r.index = map[string]int{}
+	for i, c := range cols {
+		if _, dup := r.index[strings.ToLower(c.Name)]; !dup {
+			r.index[strings.ToLower(c.Name)] = i
+		}
+		if i < notify.MaxResultColumns {
+			r.columns = append(r.columns, c.Name)
+		}
 	}
+	r.hidden = len(cols) - len(r.columns)
 	return nil
+}
+
+// alertValue renders a value, cut to MaxValueBytes.
+func alertValue(v any) *string {
+	if v == nil {
+		return nil
+	}
+	text := fmt.Sprint(v)
+	if len(text) > notify.MaxValueBytes {
+		cut := notify.MaxValueBytes - len("…")
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut] + "…"
+	}
+	return &text
 }
 
 func (r *alertResult) Row(values []any) error {
@@ -835,21 +945,19 @@ func (r *alertResult) Row(values []any) error {
 		r.more = true
 		return ErrStopRows
 	}
-	row := make([]*string, len(values))
-	for i, v := range values {
-		if v == nil {
-			continue
-		}
-		text := fmt.Sprint(v)
-		if len(text) > notify.MaxValueBytes {
-			cut := notify.MaxValueBytes
-			for cut > 0 && !utf8.RuneStart(text[cut]) {
-				cut--
+	if r.first == nil {
+		r.first = map[string]*string{}
+		for _, name := range r.named {
+			if i, ok := r.index[strings.ToLower(name)]; ok && i < len(values) {
+				r.first[strings.ToLower(name)] = alertValue(values[i])
 			}
-			text = text[:cut] + "…"
 		}
-		r.bytes += len(text)
-		row[i] = &text
+	}
+	row := make([]*string, len(r.columns))
+	for i := range row {
+		if row[i] = alertValue(values[i]); row[i] != nil {
+			r.bytes += len(*row[i])
+		}
 	}
 	r.rows = append(r.rows, row)
 	return nil
@@ -860,8 +968,12 @@ func (r *alertResult) Complete(string) error { return nil }
 // runAlert runs alert j as its owner: it runs the condition in a new
 // session of the owner's, with their grants and policies, and when it
 // returns rows sends the notification, if the owner may still use the
-// integration. Every run is recorded in the alert history. While the owner
-// is disabled, runs are skipped.
+// integration. The session ends before the notification goes out. A
+// scheduled run leaves the notification in the integration's outbox and
+// ends, so a slow destination holds no scheduler slot; EXECUTE ALERT waits
+// for it. Every run is recorded in the alert history, a scheduled one once
+// its notification was sent or failed. While the owner is disabled, runs
+// are skipped.
 func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 	run, _ := tasks.RunOf(ctx)
 	rec := notify.Record{ID: run.ID, Type: notify.RecordAlert, Name: j.Name, User: j.Owner, Trigger: run.Trigger,
@@ -878,9 +990,12 @@ func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 		return rows, err
 	}
 
-	def, err := parseAlert(j.Statement)
+	def, err := decodeAlert(j.Statement)
 	if err != nil {
-		return finish(notify.StateConditionFailed, -1, fmt.Errorf("the stored alert does not parse: %w", err))
+		return finish(notify.StateConditionFailed, -1, err)
+	}
+	if !s.oneQuery(def.Condition) {
+		return finish(notify.StateConditionFailed, -1, errNotQuery)
 	}
 	owner, err := s.users.Get(ctx, j.Owner)
 	if errors.Is(err, auth.ErrNotFound) {
@@ -894,14 +1009,18 @@ func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 			tasks.ErrSkipped, owner.Name, owner.Name))
 	}
 
+	res := &alertResult{}
+	if def.Message != nil {
+		res.named = notify.Placeholders(*def.Message)
+	}
 	es, err := s.OpenEmbedded(ctx, owner, tasks.KindAlert+" "+j.Name)
 	if err != nil {
 		return finish(notify.StateConditionFailed, -1, err)
 	}
-	defer es.Close() //nolint:errcheck
 	es.sess.method = methodTask
-	res := &alertResult{}
-	if err := es.RunQuery(ctx, def.condition, res); err != nil {
+	err = es.RunQuery(ctx, def.Condition, res)
+	_ = es.Close()
+	if err != nil {
 		if pgerror.GetCode(err) == codes.FeatureNotSupported && strings.Contains(err.Error(), "run again for a download") {
 			err = errors.New("an alert's condition must be a query")
 		}
@@ -916,14 +1035,26 @@ func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 	}
 
 	// Its owner may have lost USAGE since the alert was created.
-	rec.Integration = def.integration
-	in, err := s.usableIntegration(ctx, owner, def.integration)
+	rec.Integration = def.Integration
+	in, err := s.usableIntegration(ctx, owner, def.Integration)
 	if err != nil {
 		return finish(notify.StateActionFailed, rows, err)
 	}
-	rec.Attempts, err = s.notify.Send(ctx, in, alertMessage(j.Name, owner.Name, def, res))
+	msg := alertMessage(j.Name, owner.Name, def, res)
+	if run.Trigger == tasks.TriggerSchedule {
+		s.notify.Deliver(in, msg, false, func(attempts int, err error) {
+			rec.Attempts = attempts
+			if err != nil {
+				_, _ = finish(notify.StateActionFailed, rows, sendError(def.Integration, err))
+				return
+			}
+			_, _ = finish(notify.StateTriggered, rows, nil)
+		})
+		return rows, nil
+	}
+	rec.Attempts, err = s.notify.Send(ctx, in, msg)
 	if err != nil {
-		return finish(notify.StateActionFailed, rows, sendError(def.integration, err))
+		return finish(notify.StateActionFailed, rows, sendError(def.Integration, err))
 	}
 	return finish(notify.StateTriggered, rows, nil)
 }
@@ -931,8 +1062,13 @@ func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 // alertMessage is what alert name tells its integration about res.
 func alertMessage(name, owner string, def alertDef, res *alertResult) notify.Message {
 	m := notify.Message{Type: notify.RecordAlert, Name: name, User: owner, Title: "Igloo alert " + name}
-	if def.message != nil {
-		m.Body = notify.Template(*def.message, res.columns, res.rows[0])
+	if def.Message != nil {
+		var columns []string
+		var values []*string
+		for col, v := range res.first {
+			columns, values = append(columns, col), append(values, v)
+		}
+		m.Body = notify.Template(*def.Message, columns, values)
 	} else {
 		found := fmt.Sprintf("%d rows", len(res.rows))
 		switch {
@@ -943,8 +1079,8 @@ func alertMessage(name, owner string, def alertDef, res *alertResult) notify.Mes
 		}
 		m.Body = []notify.Part{notify.Text("The condition of the alert " + name + " found " + found + ".")}
 	}
-	if def.withResult {
-		m.Result = &notify.Result{Columns: res.columns, Rows: res.rows, More: res.more}
+	if def.WithResult {
+		m.Result = &notify.Result{Columns: res.columns, Rows: res.rows, More: res.more, HiddenColumns: res.hidden}
 	}
 	return m
 }
@@ -969,13 +1105,20 @@ func (s *Server) notifyLoadErrors(table, user, pipe string, loads []tasks.Load) 
 }
 
 // notifyLoginsBlocked raises the failed_logins alert when the limiter
-// starts refusing a user's or an address's password logins.
+// starts refusing an address's password logins, or a user's. Clients
+// choose the names they fail with, so a name's limit raises it only for a
+// user who exists.
 func (s *Server) notifyLoginsBlocked(name string, addr net.Addr, user, address bool) {
-	if user {
-		s.notify.LoginsBlocked(name, true, userFailures, failureWindow)
-	}
 	if address {
 		s.notify.LoginsBlocked(addrKey(addr), false, addrFailures, failureWindow)
+	}
+	if !user {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.users.Get(ctx, name); err == nil {
+		s.notify.LoginsBlocked(name, true, userFailures, failureWindow)
 	}
 }
 

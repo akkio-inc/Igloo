@@ -315,9 +315,12 @@ func serve() error {
 		defer close(notifyDone)
 		notifier.Run(notifyCtx)
 	}()
+	// Notifications still waiting once scheduled work has stopped are
+	// given up.
 	defer func() {
 		stopNotify()
 		<-notifyDone
+		notifier.Close()
 	}()
 
 	// Tasks, pipes, materialized views and alerts start until shutdown

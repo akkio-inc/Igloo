@@ -41,11 +41,13 @@ type Store interface {
 	// Records returns the alert history v may see, newest first.
 	Records(ctx context.Context, v audit.Viewer, p audit.Page) ([]Record, error)
 	// Claim reports whether a notification named key may go out now: it
-	// may, and Claim remembers so, unless one did within every. Replicas
-	// share claims, so only one of them sends.
-	Claim(ctx context.Context, key string, every time.Duration) (bool, error)
-	// Prune deletes history older than records, and claims older than
-	// claims.
+	// may, and Claim holds key for hold, unless key is held already.
+	// Replicas share claims, so only one of them sends.
+	Claim(ctx context.Context, key string, hold time.Duration) (bool, error)
+	// Hold holds key for d from now, as after a notification failed.
+	Hold(ctx context.Context, key string, d time.Duration) error
+	// Prune deletes history older than records, and claims that ended
+	// before claims.
 	Prune(ctx context.Context, records, claims time.Time) error
 	Close()
 }
@@ -217,15 +219,22 @@ func (m *MemoryStore) Records(_ context.Context, v audit.Viewer, p audit.Page) (
 	return out, nil
 }
 
-func (m *MemoryStore) Claim(_ context.Context, key string, every time.Duration) (bool, error) {
+func (m *MemoryStore) Claim(_ context.Context, key string, hold time.Duration) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
-	if at, ok := m.claims[key]; ok && now.Sub(at) < every {
+	if until, ok := m.claims[key]; ok && now.Before(until) {
 		return false, nil
 	}
-	m.claims[key] = now
+	m.claims[key] = now.Add(hold)
 	return true, nil
+}
+
+func (m *MemoryStore) Hold(_ context.Context, key string, d time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claims[key] = time.Now().Add(d)
+	return nil
 }
 
 func (m *MemoryStore) Prune(_ context.Context, records, claims time.Time) error {

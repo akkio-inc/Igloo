@@ -360,6 +360,20 @@ func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.Use
 	return w.Complete(c.tag())
 }
 
+// disownJobs suspends the tasks, pipes, materialized views and alerts of a
+// dropped user, and marks them as a dropped user's, "name (dropped)": a
+// user created later with the same name does not get them. Admins see
+// them, and may drop them, or CREATE OR REPLACE them as their own.
+func (s *Server) disownJobs(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.tasks.Store().DisownJobs(ctx, name, name+" (dropped)"); err != nil {
+		s.log.Warn("could not suspend a dropped user's scheduled work", "user", name, "err", err)
+		return
+	}
+	s.tasks.Kick()
+}
+
 // jobName is the name c's job is stored under: a task's or pipe's name,
 // or a materialized view's schema.table in the catalog.
 func (s *Server) jobName(ctx context.Context, sess *session, c jobCommand) (string, error) {
@@ -444,6 +458,11 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 		if err != nil {
 			return err
 		}
+		if c.kind == tasks.KindAlert {
+			if err := checkAlertSchedule(sched); err != nil {
+				return err
+			}
+		}
 		j.Schedule, j.Timezone, j.NextRun = sched.String(), tz, first
 	}
 
@@ -506,10 +525,10 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 		if err != nil {
 			return err
 		}
-		if err := s.checkAlert(ctx, sess, user, def); err != nil {
+		if err := s.checkAlert(ctx, sess, user, name, def); err != nil {
 			return err
 		}
-		j.Statement = def.String()
+		j.Statement = def.encode()
 	case tasks.KindMaterializedView:
 		if n, err := s.engine.CountStatements(c.body); err != nil || n != 1 || !selectLike(c.body) {
 			return pgerror.WithCode(errors.New("a materialized view is defined by one query: CREATE MATERIALIZED VIEW name AS SELECT ..."),
@@ -579,6 +598,11 @@ func (s *Server) alterJob(ctx context.Context, user auth.User, c jobCommand, j t
 		if err != nil {
 			return err
 		}
+		if j.Kind == tasks.KindAlert {
+			if err := checkAlertSchedule(sched); err != nil {
+				return err
+			}
+		}
 		if j.State != tasks.StateStarted {
 			next = time.Time{}
 		}
@@ -601,8 +625,12 @@ func (s *Server) showJobs(ctx context.Context, user auth.User, c jobCommand, w w
 		if j.Owner != user.Name && user.Role != auth.RoleAdmin {
 			continue
 		}
+		definition := j.Statement
+		if j.Kind == tasks.KindAlert {
+			definition = alertDefinition(j.Statement)
+		}
 		row := []any{j.Name, j.Owner, j.State, nullText(j.Schedule), nullText(j.Timezone), nullTime(j.NextRun),
-			nil, nil, nil, j.Statement, j.CreatedAt}
+			nil, nil, nil, definition, j.CreatedAt}
 		if j.Schedule != "" && j.Timezone == "" {
 			row[4] = "UTC"
 		}

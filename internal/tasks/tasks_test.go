@@ -209,6 +209,22 @@ func testStore(t *testing.T, s Store) {
 		t.Errorf("loads after prune: %+v", l)
 	}
 
+	// A dropped owner's jobs are suspended and theirs no more.
+	gone := Job{Kind: KindAlert, Name: "watch", Owner: "dee", Statement: "{}", Schedule: "1 hour", State: StateStarted,
+		NextRun: now.Add(time.Hour)}
+	if err := s.CreateJob(ctx, gone, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DisownJobs(ctx, "dee", "dee (dropped)"); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := s.Job(ctx, KindAlert, "watch"); j.Owner != "dee (dropped)" || j.State != StateSuspended || !j.NextRun.IsZero() {
+		t.Errorf("after its owner was dropped: %+v", j)
+	}
+	if j, _ := s.Job(ctx, KindTask, "nightly"); j.Owner != "ana" {
+		t.Errorf("another owner's job was disowned: %+v", j)
+	}
+
 	if err := s.DropJob(ctx, KindTask, "nightly"); err != nil {
 		t.Fatal(err)
 	}

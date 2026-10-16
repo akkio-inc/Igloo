@@ -179,13 +179,15 @@ func connect(ctx context.Context, network, addr string, allowed bool) (net.Conn,
 
 // blockedPrefixes are ranges that are not public besides those netip
 // classifies: shared address space, IETF and documentation ranges,
-// benchmarking, reserved space, deprecated and transition IPv6 ranges.
+// benchmarking, reserved space, deprecated and transition IPv6 ranges
+// (IPv4-compatible, SIIT's IPv4-translated ::ffff:0:a.b.c.d, local NAT64,
+// discard, Teredo and ORCHID, 6to4, site-local).
 var blockedPrefixes = func() []netip.Prefix {
 	var out []netip.Prefix
 	for _, p := range []string{
 		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24",
 		"203.0.113.0/24", "240.0.0.0/4",
-		"::/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32", "2002::/16", "fec0::/10",
+		"::/96", "::ffff:0:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32", "2002::/16", "fec0::/10",
 	} {
 		out = append(out, netip.MustParsePrefix(p))
 	}

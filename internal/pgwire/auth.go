@@ -57,6 +57,15 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 	done, wait := s.limiter.begin(name, addr)
 	defer done()
 	lim := limits{wait: wait}
+	// fail ends a login that went wrong. While passwords are blocked, it
+	// is refused without counting as another failure: a blocked client
+	// must not add to the counts, nor raise more failed-login alerts.
+	fail := func(cause error, reason string) (context.Context, error) {
+		if lim.blocked() {
+			return s.loginRefused(ctx, writer, name, "too many failed logins", login{}, lim.message(name))
+		}
+		return s.loginFailed(ctx, writer, name, cause, reason, login{})
+	}
 
 	user, err := s.users.Get(ctx, name)
 	known := err == nil
@@ -91,7 +100,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 		return ctx, err
 	}
 	if mechanism != saslMechanism {
-		return s.loginFailed(ctx, writer, name, fmt.Errorf("unsupported SASL mechanism %q", mechanism), "unsupported authentication method", login{})
+		return fail(fmt.Errorf("unsupported SASL mechanism %q", mechanism), "unsupported authentication method")
 	}
 	n, err := reader.GetInt32()
 	if err != nil {
@@ -100,7 +109,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 	// The length comes from the client; anything but a length that fits the
 	// message is malformed (the protocol library panics on negative ones).
 	if n < 0 || int(n) > len(reader.Msg) {
-		return s.loginFailed(ctx, writer, name, errors.New("malformed SASL initial response"), "malformed authentication message", login{})
+		return fail(errors.New("malformed SASL initial response"), "malformed authentication message")
 	}
 	clientFirst, err := reader.GetBytes(int(n))
 	if err != nil {
@@ -109,7 +118,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 
 	serverFirst, err := x.First(string(clientFirst))
 	if err != nil {
-		return s.loginFailed(ctx, writer, name, err, "malformed authentication message", login{})
+		return fail(err, "malformed authentication message")
 	}
 	if err := writeAuth(writer, authSASLContinue, []byte(serverFirst)); err != nil {
 		return ctx, err
@@ -122,9 +131,6 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 	serverFinal, err := x.Final(string(reader.Msg))
 	matched := x.Matched()
 	if err != nil || matched < 0 || !known {
-		if lim.blocked() {
-			return s.loginRefused(ctx, writer, name, "too many failed logins", login{}, lim.message(name))
-		}
 		reason := "wrong password"
 		switch {
 		case !known:
@@ -132,7 +138,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 		case len(tokens) > 0:
 			reason = "wrong password or access token"
 		}
-		return s.loginFailed(ctx, writer, name, err, reason, login{})
+		return fail(err, reason)
 	}
 	how := login{method: audit.MethodPassword}
 	var token *auth.Token

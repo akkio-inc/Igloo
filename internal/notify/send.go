@@ -16,36 +16,53 @@ import (
 	"net/mail"
 	"net/textproto"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
-// Sending. Each integration may send a burst of sendBurst notifications,
-// then one every sendEvery, on each replica; a send waits up to maxWait for
-// its turn and fails as rate limited after that. Each attempt has
-// attemptTimeout; failures that may pass (a network error, a timeout, 429
-// or 5xx, a temporary SMTP error) are tried again after backoff, up to
-// maxAttempts in all.
+// Sending. Every integration has an outbox of queueSize notifications and a
+// goroutine of its own that sends them in turn, so a slow or saturated
+// destination holds up only its own notifications: never the scheduler,
+// other integrations, or built-in alerts. A full outbox fails a
+// notification at once. Each integration may send a burst of sendBurst
+// notifications, then one every sendEvery, on each replica; a notification
+// waits up to maxWait for its turn and fails as rate limited after that.
+// Low-priority notifications (failed-login notices, whose numbers clients
+// drive) never wait, and leave lowReserve of the outbox and reserveTokens
+// of the burst to the rest. Each attempt has attemptTimeout; failures that
+// may pass (a network error, a timeout, 429 or 5xx, a temporary SMTP error)
+// are tried again after backoff, up to maxAttempts in all.
 const (
+	queueSize      = 64
+	lowReserve     = 16
 	sendBurst      = 10
+	reserveTokens  = 5
 	sendEvery      = time.Second
 	maxWait        = time.Minute
 	attemptTimeout = 10 * time.Second
 	maxAttempts    = 3
+	// idleTimeout is how long an outbox's goroutine waits for more before
+	// it ends.
+	idleTimeout = time.Minute
 	// maxRetryAfter caps how long a Retry-After header makes Igloo wait.
 	maxRetryAfter = 10 * time.Second
-	// maxResponse is how much of a webhook's answer is read, and
-	// maxResponseText how much an error quotes.
-	maxResponse     = 4 << 10
-	maxResponseText = 200
+	// maxResponse is how much of a webhook's answer is read.
+	maxResponse = 4 << 10
 )
+
+// errorCode matches the answers of webhooks that are worth quoting in an
+// error: a short error code such as Slack's "invalid_token". Anything else
+// a webhook answers may echo what it was sent, the integration's headers
+// included, and is not quoted: the alert history shows errors to the
+// alert's owner.
+var errorCode = regexp.MustCompile(`^[a-z][a-z_]{2,39}$`)
 
 // backoff is how long to wait before each attempt after the first.
 var backoff = []time.Duration{time.Second, 3 * time.Second}
@@ -88,14 +105,28 @@ type Service struct {
 	backoff []time.Duration
 	timeout time.Duration
 
-	mu      sync.Mutex
-	buckets map[string]*bucket
+	// ctx ends with Close, and with it every delivery.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	buckets  map[string]*bucket
+	outboxes map[string]chan delivery
+	// pending counts the deliveries queued and not yet done.
+	pending sync.WaitGroup
 	// burst, every and wait are the rate limit (tests shorten them).
 	burst int
 	every time.Duration
 	wait  time.Duration
 
+	// events and logins are the built-in alerts waiting to go out:
+	// failed-login notices have their own, small queue, so they cannot
+	// crowd out the rest.
 	events chan event
+	logins chan event
+	// loginMu guards loginSent, when failed-login notices went out.
+	loginMu   sync.Mutex
+	loginSent []time.Time
 	// cache holds the integrations for built-in alerts; see integrations.
 	cacheMu  sync.Mutex
 	cache    []Integration
@@ -125,13 +156,16 @@ func New(opts Options) *Service {
 		backoff:    backoff,
 		timeout:    attemptTimeout,
 		buckets:    map[string]*bucket{},
+		outboxes:   map[string]chan delivery{},
 		burst:      sendBurst,
 		every:      sendEvery,
 		wait:       maxWait,
 		events:     make(chan event, eventQueue),
+		logins:     make(chan event, loginQueue),
 		cacheTTL:   cacheTTL,
 		nowFunc:    time.Now,
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.http = &http.Client{
 		Transport: s.transport(),
 		// Never follow a redirect: it could lead elsewhere with the
@@ -157,6 +191,9 @@ func (s *Service) transport() *http.Transport {
 
 // Store is where integrations, who may use them and the alert history are.
 func (s *Service) Store() Store { return s.store }
+
+// Close ends every delivery under way, as Igloo stops; those waiting fail.
+func (s *Service) Close() { s.cancel() }
 
 // Guard is what decides which hosts may be reached.
 func (s *Service) Guard() *Guard { return s.guard }
@@ -266,18 +303,103 @@ type SendError struct {
 
 func (e *SendError) Error() string { return e.Msg }
 
-// Send sends m to in, waiting its turn under the rate limit, and trying
-// again after failures that may pass. It returns how many attempts it made.
-// Errors never carry in's secrets.
-func (s *Service) Send(ctx context.Context, in Integration, m Message) (attempts int, err error) {
-	defer func() { s.metrics.sent(in.Type, err) }()
+// delivery is a notification in an outbox.
+type delivery struct {
+	in  Integration
+	msg Message
+	low bool
+	// done is told how it went.
+	done func(attempts int, err error)
+}
+
+// Deliver queues m, within the caps, in in's outbox, and calls done from the
+// outbox's goroutine once it is sent or has failed; at once, if it cannot
+// be queued. low marks a low-priority notification. Errors never carry in's
+// secrets.
+func (s *Service) Deliver(in Integration, m Message, low bool, done func(attempts int, err error)) {
+	fail := func(err error) {
+		s.metrics.sent(in.Type, err)
+		done(0, err)
+	}
 	if !in.Enabled {
-		return 0, fmt.Errorf("the notification integration %s is disabled", in.Name)
+		fail(fmt.Errorf("the notification integration %s is disabled", in.Name))
+		return
+	}
+	if s.ctx.Err() != nil {
+		fail(errors.New("Igloo is shutting down"))
+		return
 	}
 	if m.Time.IsZero() {
 		m.Time = s.nowFunc()
 	}
-	if err := s.take(ctx, in.Name); err != nil {
+	d := delivery{in: in, msg: capped(m), low: low, done: done}
+	s.mu.Lock()
+	q, ok := s.outboxes[in.Name]
+	if !ok {
+		q = make(chan delivery, queueSize)
+		s.outboxes[in.Name] = q
+		go s.drain(in.Name, q)
+	}
+	free := cap(q) - len(q)
+	if free == 0 || low && free <= lowReserve {
+		waiting := len(q)
+		s.mu.Unlock()
+		fail(fmt.Errorf("%w: %d notifications are waiting to go to %s", ErrRateLimited, waiting, in.Name))
+		return
+	}
+	s.pending.Add(1)
+	q <- d
+	s.mu.Unlock()
+}
+
+// Send delivers m to in and waits for it to be sent, or to fail, or for ctx
+// to end. It returns how many attempts were made.
+func (s *Service) Send(ctx context.Context, in Integration, m Message) (attempts int, err error) {
+	type result struct {
+		attempts int
+		err      error
+	}
+	res := make(chan result, 1)
+	s.Deliver(in, m, false, func(attempts int, err error) { res <- result{attempts, err} })
+	select {
+	case r := <-res:
+		return r.attempts, r.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// drain sends what comes into name's outbox, until it has been empty for
+// idleTimeout or the service closes.
+func (s *Service) drain(name string, q chan delivery) {
+	idle := time.NewTimer(idleTimeout)
+	defer idle.Stop()
+	for {
+		select {
+		case d := <-q:
+			attempts, err := s.send(s.ctx, d)
+			d.done(attempts, err)
+			s.pending.Done()
+			idle.Reset(idleTimeout)
+		case <-idle.C:
+			s.mu.Lock()
+			if len(q) == 0 {
+				delete(s.outboxes, name)
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+			idle.Reset(idleTimeout)
+		}
+	}
+}
+
+// send sends d, waiting its turn under the rate limit and trying again
+// after failures that may pass.
+func (s *Service) send(ctx context.Context, d delivery) (attempts int, err error) {
+	in, m := d.in, d.msg
+	defer func() { s.metrics.sent(in.Type, err) }()
+	if err := s.take(ctx, in.Name, d.low); err != nil {
 		return 0, err
 	}
 	for attempts = 1; ; attempts++ {
@@ -381,21 +503,12 @@ func (s *Service) post(ctx context.Context, in Integration, body []byte) error {
 	}
 }
 
-// quoteAnswer quotes the start of a webhook's answer, which often says
-// what was wrong, such as Slack's "invalid_token".
+// quoteAnswer quotes a webhook's answer if it is an error code.
 func quoteAnswer(b []byte) string {
-	s := strings.Join(strings.Fields(string(b)), " ")
-	if s == "" || !utf8.ValidString(s) {
-		return ""
+	if s := strings.TrimSpace(string(b)); errorCode.MatchString(s) {
+		return ": " + strconv.Quote(s)
 	}
-	if len(s) > maxResponseText {
-		cut := maxResponseText
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		s = s[:cut] + "…"
-	}
-	return ": " + strconv.Quote(s)
+	return ""
 }
 
 // Sign is the signature of a webhook request: the hex HMAC-SHA256, keyed
@@ -416,8 +529,9 @@ type bucket struct {
 	at     time.Time
 }
 
-// take waits for name's turn to send.
-func (s *Service) take(ctx context.Context, name string) error {
+// take waits for name's turn to send. A low-priority send does not wait,
+// and leaves reserveTokens for the rest.
+func (s *Service) take(ctx context.Context, name string, low bool) error {
 	s.mu.Lock()
 	now := s.nowFunc()
 	b, ok := s.buckets[name]
@@ -427,6 +541,10 @@ func (s *Service) take(ctx context.Context, name string) error {
 	}
 	b.tokens = min(float64(s.burst), b.tokens+float64(now.Sub(b.at))/float64(s.every))
 	b.at = now
+	if low && b.tokens-1 < float64(min(reserveTokens, s.burst-1)) {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %s keeps its last notifications for alerts other than failed logins", ErrRateLimited, name)
+	}
 	b.tokens--
 	wait := time.Duration(0)
 	if b.tokens < 0 {

@@ -73,9 +73,10 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS alert_history_time ON igloo_notify.alert_history (start_time DESC, alert_id DESC)`,
 	`CREATE INDEX IF NOT EXISTS alert_history_user ON igloo_notify.alert_history (user_name, start_time DESC, alert_id DESC)`,
+	// A built-in alert's problem is held, not sent again, until held_until.
 	`CREATE TABLE IF NOT EXISTS igloo_notify.claims (
-		key     text PRIMARY KEY,
-		sent_at timestamptz NOT NULL
+		key        text PRIMARY KEY,
+		held_until timestamptz NOT NULL
 	)`,
 }
 
@@ -320,11 +321,17 @@ func (s *PostgresStore) Records(ctx context.Context, v audit.Viewer, p audit.Pag
 	})
 }
 
-func (s *PostgresStore) Claim(ctx context.Context, key string, every time.Duration) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO igloo_notify.claims (key, sent_at) VALUES ($1, now())
-		ON CONFLICT (key) DO UPDATE SET sent_at = now()
-		WHERE igloo_notify.claims.sent_at <= now() - $2::interval`, key, every)
+func (s *PostgresStore) Claim(ctx context.Context, key string, hold time.Duration) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `INSERT INTO igloo_notify.claims (key, held_until) VALUES ($1, now() + $2::interval)
+		ON CONFLICT (key) DO UPDATE SET held_until = excluded.held_until
+		WHERE igloo_notify.claims.held_until <= now()`, key, hold)
 	return err == nil && tag.RowsAffected() == 1, err
+}
+
+func (s *PostgresStore) Hold(ctx context.Context, key string, d time.Duration) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_notify.claims (key, held_until) VALUES ($1, now() + $2::interval)
+		ON CONFLICT (key) DO UPDATE SET held_until = excluded.held_until`, key, d)
+	return err
 }
 
 func (s *PostgresStore) Prune(ctx context.Context, records, claims time.Time) error {
@@ -336,7 +343,7 @@ func (s *PostgresStore) Prune(ctx context.Context, records, claims time.Time) er
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_notify.alert_history WHERE start_time < $1`, records); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM igloo_notify.claims WHERE sent_at < $1`, claims)
+		_, err := tx.Exec(ctx, `DELETE FROM igloo_notify.claims WHERE held_until < $1`, claims)
 		return err
 	})
 }

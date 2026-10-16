@@ -121,10 +121,11 @@ expect_refused() {
   if grep -q 'root:' <<<"$got"; then fail "$name: showed the file: $got"; else pass "$name"; fi
 }
 
-# expect_soon NAME WANT USER PASSWORD SQL: like expect, but waits up to a
-# minute for the output, for history that is written in the background.
+# expect_soon NAME WANT USER PASSWORD SQL [SECONDS]: like expect, but waits
+# up to a minute (or SECONDS) for the output, for history that is written
+# in the background.
 expect_soon() {
-  local name=$1 want=$2 got="" deadline=$((SECONDS + 60))
+  local name=$1 want=$2 got="" deadline=$((SECONDS + ${6:-60}))
   while [ "$SECONDS" -lt "$deadline" ]; do
     got="$(psql_as "$3" "$4" -c "$5")" || true
     [ "$got" = "$want" ] && break
@@ -964,13 +965,14 @@ expect_error "not the private network" 42501 igloo "$admin_password" \
   "CREATE NOTIFICATION INTEGRATION e2e_db TYPE webhook URL 'https://postgres:5432/'"
 expect_error "only admins create integrations" 42501 walt walt-password-1 \
   "CREATE NOTIFICATION INTEGRATION e2e_mine TYPE webhook URL 'https://example.com/hook'"
-alert="CREATE ALERT e2e_big_sales SCHEDULE '2 seconds' IF (EXISTS (SELECT id, name, amount FROM e2e_sales WHERE amount >= 10 ORDER BY id))
+alert="CREATE ALERT e2e_big_sales SCHEDULE '* * * * *' IF (EXISTS (SELECT id, name, amount FROM e2e_sales WHERE amount >= 10 ORDER BY id))
   THEN NOTIFY e2e_hook MESSAGE 'Big sale: {{name}}' WITH RESULT"
 expect_error "alerts need USAGE on the integration" 42501 walt walt-password-1 "$alert"
 expect "GRANT USAGE ON INTEGRATION" "GRANT" igloo "$admin_password" "GRANT USAGE ON INTEGRATION e2e_hook TO walt"
 expect "an alert" "CREATE ALERT" walt walt-password-1 "$alert"
 got="$(psql_as walt walt-password-1 -c 'SHOW ALERTS')" || true
-if grep -q "^e2e_big_sales|walt|suspended|2 seconds|UTC|" <<<"$got"; then pass "SHOW ALERTS: suspended at first"; else fail "SHOW ALERTS: $got"; fi
+if grep -q "^e2e_big_sales|walt|suspended|\* \* \* \* \*|UTC|" <<<"$got"; then pass "SHOW ALERTS: suspended at first"; else fail "SHOW ALERTS: $got"; fi
+expect_error "alerts run at most once a minute" 22023 walt walt-password-1 "ALTER ALERT e2e_big_sales SET SCHEDULE '2 seconds'"
 expect "EXECUTE ALERT runs it now, as its owner" "EXECUTE ALERT" igloo "$admin_password" "EXECUTE ALERT e2e_big_sales"
 expect_hook "the webhook gets the alert, signed, with its rows" "/hook/e2e-s3cret-token signed" '"name":"e2e_big_sales"' \
   '"message":"Big sale: piped"' '"rows":[["10","piped","10.00"],["11","piped","11.00"]]'
@@ -979,7 +981,7 @@ expect "the alert history records it" "alert|walt|manual|triggered|2|e2e_hook" w
 expect "others do not see it" "0" rita rita-password-1 "SELECT count(*) FROM igloo.alert_history"
 expect "ALTER ALERT RESUME" "ALTER ALERT" walt walt-password-1 "ALTER ALERT e2e_big_sales RESUME"
 expect_soon "the alert runs on its schedule" "t" walt walt-password-1 \
-  "SELECT count(*) >= 1 FROM igloo.alert_history WHERE alert_name = 'e2e_big_sales' AND trigger = 'schedule' AND state = 'triggered'"
+  "SELECT count(*) >= 1 FROM igloo.alert_history WHERE alert_name = 'e2e_big_sales' AND trigger = 'schedule' AND state = 'triggered'" 100
 expect "ALTER ALERT SUSPEND" "ALTER ALERT" walt walt-password-1 "ALTER ALERT e2e_big_sales SUSPEND"
 expect "SYSTEM\$SEND_NOTIFICATION" "CALL" walt walt-password-1 "CALL SYSTEM\$SEND_NOTIFICATION('e2e_hook', 'hello from walt')"
 expect_hook "sends the message" '"type":"call"' '"message":"hello from walt"' '"user":"walt"'

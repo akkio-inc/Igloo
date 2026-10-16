@@ -608,6 +608,7 @@ func (s *Server) dropUser(ctx context.Context, cmd userCommand) error {
 			s.log.Warn("could not remove a dropped user's grants", "user", cmd.name, "err", ferr)
 		}
 		s.forgetGrantee(auth.GranteeUser, cmd.name)
+		s.disownJobs(cmd.name)
 	}
 	if errors.Is(err, auth.ErrNotFound) && cmd.ifExists {
 		err = nil

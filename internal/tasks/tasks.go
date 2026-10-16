@@ -174,6 +174,10 @@ type Store interface {
 	// SetSchedule changes a job's schedule and next run.
 	SetSchedule(ctx context.Context, kind, name, schedule, timezone string, next time.Time) error
 	DropJob(ctx context.Context, kind, name string) error
+	// DisownJobs gives the jobs of owner, a user who was dropped, to
+	// tombstone, a name no user can have, and suspends them, so that a
+	// user created later with the same name does not inherit them.
+	DisownJobs(ctx context.Context, owner, tombstone string) error
 	// Scheduled lists started jobs with a next run, soonest first.
 	Scheduled(ctx context.Context) ([]Job, error)
 	// Claim moves a started job's next run from due to next, reporting
