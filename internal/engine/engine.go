@@ -432,15 +432,22 @@ func attachStatement(c config.Catalog) string {
 // already overwrite the warehouse file itself.
 func lockdownStatements(cfg config.Config, cacheDir string) []string {
 	var dirs []string
-	if cfg.Storage.Location != "" {
-		dirs = append(dirs, cfg.Storage.Root())
-	}
-	dirs = append(dirs, cfg.Storage.AllowedLocations...)
-	for _, dir := range []string{cfg.DuckDB.TempDir, cacheDir} {
+	// Every entry ends in a slash so a directory is a strict prefix: land/
+	// does not match landing-private/. The config validates and normalises
+	// the warehouse and allowed locations the same way (see safeLocation).
+	add := func(dir string) {
 		if dir != "" {
 			dirs = append(dirs, strings.TrimSuffix(dir, "/")+"/")
 		}
 	}
+	if cfg.Storage.Location != "" {
+		add(cfg.Storage.Root())
+	}
+	for _, loc := range cfg.Storage.AllowedLocations {
+		add(loc)
+	}
+	add(cfg.DuckDB.TempDir)
+	add(cacheDir)
 
 	return []string{
 		"SET allowed_directories = " + list(dirs),

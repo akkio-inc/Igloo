@@ -308,21 +308,68 @@ func pathLike(name string) bool {
 	return slices.ContainsFunc(fileExtensions, func(ext string) bool { return strings.HasSuffix(n, ext) })
 }
 
-// checkPath allows a user other than an admin to read a file while
-// policies exist: one in the allowed locations, outside the warehouse.
-func (s *Server) checkPath(path string) error {
+// checkPath decides whether a user other than an admin may name the file
+// path, which must be a plain string with no way to climb out of a prefix:
+// DuckDB 1.5.6 does not canonicalise remote paths before matching them
+// against allowed_directories, so a path such as "s3://b/land/../secret" or
+// "https://h/land/%2e%2e/x" would prefix-match an allowed location yet reach
+// elsewhere. allowWarehouse lets it read the warehouse's own files, which is
+// so for readers and writers until a table has a policy.
+func (s *Server) checkPath(path string, allowWarehouse bool) error {
 	g := s.gov
-	if strings.Contains(path, "..") || strings.ContainsAny(path, "%\\") {
-		return denied("cannot read %q: paths with .., %% or \\ are refused while tables have policies", path)
+	switch {
+	case path == "":
+		return denied("an empty file name is not allowed")
+	case strings.Contains(path, "\\"):
+		return denied("cannot read %q: backslashes are not allowed in file names", path)
+	case strings.ContainsAny(path, "?#"):
+		// '?' and '#' start a URL's query and fragment, which can redirect a
+		// remote read (an s3:// path's ?s3_endpoint= names another host); '?'
+		// is also a glob wildcard, so globbing uses '*', '[' and '{' instead.
+		return denied("cannot read %q: '?' and '#' are not allowed in file names", path)
+	case strings.Contains(path, "%"):
+		// No percent-encoding, so %2e (.), %2f (/), %5c (\\) and double
+		// encodings like %252e cannot smuggle a separator past this check.
+		return denied("cannot read %q: percent-encoding is not allowed in file names", path)
+	}
+	// The part after an optional scheme://authority, split into segments.
+	rest := path
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			rest = rest[j+1:]
+		} else {
+			rest = ""
+		}
+	}
+	segs := strings.Split(rest, "/")
+	for i, seg := range segs {
+		// A leading empty segment is a local path's root slash and a trailing
+		// one a directory's own slash; an interior empty segment is "//",
+		// which can normalise to a climb, so only that is refused.
+		if seg == "." || seg == ".." || (seg == "" && i != 0 && i != len(segs)-1) {
+			return denied("cannot read %q: '.', '..' and empty path segments are not allowed", path)
+		}
 	}
 	prefix := path
-	if i := strings.IndexAny(path, "*?[{"); i >= 0 {
+	if i := strings.IndexAny(path, "*[{"); i >= 0 {
 		prefix = path[:i]
 	}
-	if !slices.ContainsFunc(g.allowed, func(loc string) bool { return strings.HasPrefix(prefix, loc) }) {
+	// The allowed set is the warehouse (when permitted) and the allowed
+	// locations, each ending in a slash, as DuckDB's sandbox has them, so
+	// this check and the sandbox stay in step. The spill and cache
+	// directories are the server's own and not on it.
+	allowed := g.allowed
+	if allowWarehouse && g.warehouse != "" {
+		allowed = append(append([]string(nil), g.allowed...), g.warehouse)
+	}
+	if !slices.ContainsFunc(allowed, func(loc string) bool { return strings.HasPrefix(prefix, loc) }) {
+		if allowWarehouse {
+			return denied("reading %q: only files in the warehouse and IGLOO_ALLOWED_LOCATIONS may be read directly", path)
+		}
 		return denied("reading %q: while tables have policies, only files in IGLOO_ALLOWED_LOCATIONS may be read directly", path)
 	}
-	if g.warehouse != "" && (strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix)) {
+	if !allowWarehouse && g.warehouse != "" && (strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix)) {
 		return denied("reading %q: the warehouse's files are read through its tables, which policies apply to", path)
 	}
 	if g.externalFiles(prefix) {
@@ -953,26 +1000,16 @@ func (s *Server) checkWarehouseFiles(ctx context.Context, user auth.User, query 
 	return nil
 }
 
-// checkLoadLocation refuses, for users other than admins while tables
-// have policies, COPY INTO from the warehouse or from a location that
-// holds it: the files there are the tables' own, which are read through
-// the tables. Each file's INSERT is checked as well (see checkPath).
+// checkLoadLocation confines where a non-admin COPY INTO or pipe may load
+// from: a plain path in an allowed location that cannot climb out of it
+// (see checkPath), and, while a table has a policy, not the warehouse, whose
+// files are the tables' own and read through them. The INSERT of each file
+// is checked as the user's own statement besides.
 func (s *Server) checkLoadLocation(ctx context.Context, user auth.User, loc string) error {
-	g := s.gov
-	if user.Role == auth.RoleAdmin || g.warehouse == "" && g.external == "" || g.snapshot(ctx).Empty() {
+	if user.Role == auth.RoleAdmin {
 		return nil
 	}
-	prefix := loc
-	if i := strings.IndexAny(loc, "*?[{"); i >= 0 {
-		prefix = loc[:i]
-	}
-	if g.warehouse != "" && (strings.HasPrefix(prefix, g.warehouse) || strings.HasPrefix(g.warehouse, prefix)) {
-		return denied("COPY INTO from %q: while tables have policies, the warehouse's files are read through its tables; load from a location outside it", loc)
-	}
-	if g.externalFiles(prefix) {
-		return denied("COPY INTO from %q: external tables' files are read through the external tables", loc)
-	}
-	return nil
+	return s.checkPath(loc, s.gov.snapshot(ctx).Empty())
 }
 
 // isExternal reports whether the view db.schema.name is an external

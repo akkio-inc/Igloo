@@ -879,6 +879,16 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		return fail(err)
 	}
 
+	// Confine the files a non-admin names, before DuckDB prepares the
+	// statement: preparing a replacement scan or a schema-inferring read
+	// opens the file, so this cannot wait until after. When a table has a
+	// policy, the policy rewrite checks the files instead (guardFiles stops).
+	if err := s.guardFiles(ctx, sess, user, query); err != nil {
+		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+		s.metrics.query(time.Now(), err)
+		return fail(pgError(err))
+	}
+
 	if listsColumns.MatchString(query) {
 		// Best effort: a table that fails to load keeps its placeholder.
 		if err := s.engine.LoadSchemas(ctx, sess.conn); err != nil {

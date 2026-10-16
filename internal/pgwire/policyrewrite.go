@@ -50,6 +50,13 @@ type rewriter struct {
 	sens  *sensitivity
 	pc    policyContext
 	admin bool
+	// filesOnly limits the rewriter to checking the files a statement names,
+	// for non-admins whether or not any table has a policy; it makes no
+	// table edits. allowWarehouse lets those file checks read the
+	// warehouse's own files, which readers and writers may until a table has
+	// a policy.
+	filesOnly      bool
+	allowWarehouse bool
 	// nonce makes the aliases of this rewrite, which the checks use to
 	// recognise its subqueries; a statement cannot contain it.
 	nonce string
@@ -351,6 +358,18 @@ func (rw *rewriter) parseEdits(text string, ps *parseScan, view *object, depth i
 
 // refEdit returns the edit, if any, for one table reference.
 func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, toText func(int) (int, bool)) (*edit, error) {
+	if rw.filesOnly {
+		// Only a reference that names a file concerns the file checks: a
+		// path-like string or quoted identifier DuckDB reads as a file
+		// (a replacement scan). Real tables are left alone.
+		last := ref.parts[len(ref.parts)-1]
+		if !rw.admin && (pathLike(last) || strings.ContainsAny(last, "/\\")) {
+			if err := rw.s.checkPath(last, rw.allowWarehouse); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
 	name := strings.Join(ref.parts, ".")
 	res, err := rw.r.resolve(tableRef{parts: ref.parts}, view)
 	if err != nil {
@@ -363,7 +382,7 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		switch {
 		case pathLike(last) || strings.ContainsAny(last, "/\\"):
 			if !rw.admin {
-				if err := rw.s.checkPath(last); err != nil {
+				if err := rw.s.checkPath(last, rw.allowWarehouse); err != nil {
 					return nil, err
 				}
 			}
@@ -524,6 +543,19 @@ func (rw *rewriter) checkView(o object, depth int) error {
 // macros that read protected tables, and for users other than admins,
 // macros and table functions that read files or tables by name.
 func (rw *rewriter) checkFunctions(ps *parseScan) error {
+	if rw.filesOnly {
+		if rw.admin {
+			return nil
+		}
+		for _, f := range ps.functions {
+			if f.tableValue {
+				if err := rw.checkFileFunction(f); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	for _, f := range ps.functions {
 		name := strings.ToLower(f.name)
 		switch {
@@ -583,13 +615,63 @@ func (rw *rewriter) checkTableFunction(f *fnNode) error {
 			return denied("%s may read the warehouse's files directly while tables have policies; name the files as string literals", f.name)
 		}
 		for _, p := range paths {
-			if err := rw.s.checkPath(p); err != nil {
+			if err := rw.s.checkPath(p, rw.allowWarehouse); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	return denied("%s may read data that policies cannot check, which is refused while tables have policies", f.name)
+}
+
+// extraFileFunctions read the file their first argument names, like
+// fileFunctions, but are refused outright while a table has a policy (they
+// are not in safeTableFunctions). Without policies, a non-admin may call
+// them, naming the file as a plain string literal in an allowed location.
+// iceberg_metadata, iceberg_snapshots, iceberg_scan and read_duckdb may
+// instead name a catalog table or database, which is not a file.
+var extraFileFunctions = map[string]bool{
+	"iceberg_scan": true, "iceberg_metadata": true, "iceberg_snapshots": true,
+	"delta_scan": true, "read_xlsx": true, "read_duckdb": true,
+	"st_readshp": true, "st_readosm": true, "shapefile_meta": true,
+}
+
+// tableArgFunctions may take a catalog table or database (a plain
+// identifier) as their first argument instead of a file path.
+var tableArgFunctions = map[string]bool{
+	"iceberg_scan": true, "iceberg_metadata": true, "iceberg_snapshots": true, "read_duckdb": true,
+}
+
+// checkFileFunction refuses a file-reading table function, for a non-admin,
+// that names its file any way but as a plain string literal (or a list of
+// them) that checkPath allows. It is the files-only counterpart of
+// checkTableFunction, used whether or not a table has a policy.
+func (rw *rewriter) checkFileFunction(f *fnNode) error {
+	name := strings.ToLower(f.name)
+	if f.schema != "" && !strings.EqualFold(f.schema, "main") {
+		return nil
+	}
+	if !fileFunctions[name] && !extraFileFunctions[name] {
+		return nil
+	}
+	if len(f.args) == 0 {
+		return nil
+	}
+	if paths, ok := constantStrings(f.args[0]); ok {
+		for _, p := range paths {
+			if err := rw.s.checkPath(p, rw.allowWarehouse); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if tableArgFunctions[name] {
+		if n, _ := f.args[0].(map[string]any); str(n["class"]) == "COLUMN_REF" {
+			// A catalog table or database, not a file.
+			return nil
+		}
+	}
+	return denied("%s needs its file as a plain string literal, not an expression built as the statement runs", f.name)
 }
 
 // constantStrings returns the strings a table function's argument names:
@@ -694,6 +776,9 @@ func (rw *rewriter) statementEdits(t duckdb.StmtType, query string) ([]edit, err
 		return rw.dmlEdits(t, query)
 
 	case duckdb.STATEMENT_TYPE_CREATE:
+		if rw.filesOnly {
+			return nil, rw.createFileEdits(query)
+		}
 		c, ok := parseCreateSpans(query)
 		switch {
 		case ok && !c.query.empty():
@@ -736,6 +821,11 @@ func (rw *rewriter) statementEdits(t duckdb.StmtType, query string) ([]edit, err
 		// They read no rows. CALL and PRAGMA are limited in policyRules.
 		return nil, nil
 	}
+	if rw.filesOnly {
+		// The file checks do not refuse statement shapes they do not parse;
+		// the residual check catches a file named where they cannot look.
+		return nil, nil
+	}
 	return nil, denied("cannot apply policies to this statement, which names a table with policies")
 }
 
@@ -758,7 +848,14 @@ func (rw *rewriter) partEdits(text string, s span, prefix string) ([]edit, error
 // residual refuses a statement whose text outside the spans that were
 // analyzed names something sensitive: the rewrite would not have seen it.
 func (rw *rewriter) residual(text string, analyzed ...span) error {
-	if rw.sens.triggers(blank(text, analyzed...), rw.admin) {
+	b := blank(text, analyzed...)
+	if rw.filesOnly {
+		if toks := tokensOf(b); toks.paths || toks.opaque {
+			return denied("this statement names a file where Igloo cannot check it; name files as plain string literals")
+		}
+		return nil
+	}
+	if rw.sens.triggers(b, rw.admin) {
 		return denied("cannot apply policies to this statement: part of it names a table with policies where Igloo cannot rewrite it")
 	}
 	return nil
@@ -940,6 +1037,7 @@ func (rw *rewriter) copyEdits(query string) ([]edit, error) {
 	}
 	sc.skip()
 	if sc.i < len(sc.s) && sc.s[sc.i] == '(' {
+		// COPY (query) TO 'file': the query reads, the file is written.
 		end := matchParen(sc.s, sc.i)
 		if end < 0 {
 			return nil, denied("cannot apply policies to this COPY")
@@ -949,7 +1047,15 @@ func (rw *rewriter) copyEdits(query string) ([]edit, error) {
 		if err != nil {
 			return nil, err
 		}
-		return edits, rw.residual(query, inner)
+		sc.i = end + 1
+		if !sc.keywords("TO") {
+			return nil, denied("cannot apply policies to this COPY")
+		}
+		toStart := sc.i
+		if err := rw.copyTo(sc); err != nil {
+			return nil, err
+		}
+		return edits, rw.residual(query, inner, span{toStart, sc.i})
 	}
 	start := sc.i
 	if _, ok := sc.name(); !ok {
@@ -968,36 +1074,65 @@ func (rw *rewriter) copyEdits(query string) ([]edit, error) {
 	}
 	switch {
 	case sc.keywords("FROM"):
-		// Writes the table. Others than admins may read only files in the
-		// allowed locations.
+		// Writes the table. Others than admins may read only files they are
+		// allowed, as plain string literals.
 		sc.skip()
 		lit := sc.i
 		path, ok := sc.literal()
 		if !rw.admin {
 			if !ok || path == nil {
-				return nil, denied("COPY FROM needs a file name as a string literal while tables have policies")
+				return nil, denied("COPY FROM needs a file name as a plain string literal")
 			}
-			if err := rw.s.checkPath(*path); err != nil {
+			if err := rw.s.checkPath(*path, rw.allowWarehouse); err != nil {
 				return nil, err
 			}
 		}
 		return nil, rw.residual(query, span{start, end}, span{lit, sc.i})
 	case sc.keywords("TO"):
+		toStart := sc.i
+		if err := rw.copyTo(sc); err != nil {
+			return nil, err
+		}
+		if rw.filesOnly {
+			// The source table is read, but with no policies there is
+			// nothing to mask; checking the destination is enough.
+			synth := "SELECT " + cols + " FROM " + query[start:nameEnd]
+			if _, err := rw.queryEdits(synth, nil, 0); err != nil {
+				return nil, err
+			}
+			return nil, rw.residual(query, span{start, end}, span{toStart, sc.i})
+		}
 		synth := "SELECT " + cols + " FROM " + query[start:nameEnd]
 		edits, err := rw.queryEdits(synth, nil, 0)
 		if err != nil {
 			return nil, err
 		}
 		if len(edits) == 0 {
-			return nil, rw.residual(query, span{start, end})
+			return nil, rw.residual(query, span{start, end}, span{toStart, sc.i})
 		}
 		rewritten, err := applyEdits(synth, edits)
 		if err != nil {
 			return nil, denied("cannot apply policies to this COPY: %v", err)
 		}
-		return []edit{{start, end, "(" + rewritten + ")"}}, rw.residual(query, span{start, end})
+		return []edit{{start, end, "(" + rewritten + ")"}}, rw.residual(query, span{start, end}, span{toStart, sc.i})
 	}
 	return nil, denied("cannot apply policies to this COPY")
+}
+
+// copyTo checks the destination of COPY ... TO, with sc positioned just
+// after the TO keyword. A user other than an admin may write only to a
+// plain string path they are allowed, so the destination cannot be an
+// expression that builds a path at run time, nor climb out of a prefix.
+func (rw *rewriter) copyTo(sc *scanner) error {
+	sc.skip()
+	if rw.admin {
+		return nil
+	}
+	path, ok := sc.literal()
+	if !ok || path == nil {
+		return denied("COPY ... TO needs a file name as a plain string literal")
+	}
+	return rw.s.checkPath(*path, rw.allowWarehouse)
 }
 
 // --- UPDATE, DELETE, MERGE ---------------------------------------------------

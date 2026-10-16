@@ -156,6 +156,22 @@ reference for every setting mentioned here.
   outside the sandbox. PROJ, behind `ST_Transform`, can open a local file
   that a coordinate system definition names, without returning its
   contents ([details](docs/media-analytics.md#security)).
+- **File paths.** For users other than admins, Igloo checks the files a
+  statement names itself, before DuckDB opens them, in file-reading
+  functions (`read_parquet`, `read_csv`, `glob`, `iceberg_scan` and the
+  like), `COPY FROM`/`TO`, `COPY INTO`, pipes and replacement scans, whether
+  or not a table has a policy. A file must be named as a plain string
+  literal (not a value built as the statement runs) with no way to climb out
+  of its prefix: no `.`/`..` segments, no percent-encoding (so `%2e`/`%2f`
+  cannot stand in for a separator), no backslashes, no `?` or `#`, and no
+  empty segments. This is needed because DuckDB 1.5.6 prefix-matches a
+  remote path against `allowed_directories` without canonicalising it, so a
+  path such as `https://host/allowed/../other` or an `s3://` path with a
+  `?s3_endpoint=` query would otherwise pass its check and reach elsewhere.
+  Allowed locations are validated and given a trailing slash at startup so a
+  prefix cannot match a sibling (`s3://b/land` not matching
+  `s3://b/landing-private`). Without a policy, readers and writers may still
+  read the warehouse's own files; with one, those go through the tables.
 - **Transport.** TLS is on when `IGLOO_TLS_CERT_FILE` and `IGLOO_TLS_KEY_FILE`
   are set, and unencrypted SQL sessions are then refused unless
   `IGLOO_TLS_REQUIRED=false` (the web console and Flight SQL then serve TLS

@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -324,6 +325,40 @@ func TestBadWarehouseLocations(t *testing.T) {
 		}))
 		if err == nil {
 			t.Errorf("%s: expected an error", location)
+		}
+	}
+}
+
+func TestAllowedLocations(t *testing.T) {
+	// Good entries are kept and each is given a trailing slash, so a prefix
+	// check cannot match a sibling (land/ must not match landing-private/).
+	cfg, err := Load(env(map[string]string{
+		"IGLOO_ADMIN_PASSWORD":    "password",
+		"IGLOO_ALLOWED_LOCATIONS": "s3://bucket/land , gs://drops/exports/",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"s3://bucket/land/", "gs://drops/exports/"}
+	if !slices.Equal(cfg.Storage.AllowedLocations, want) {
+		t.Errorf("allowed locations: %q, want %q", cfg.Storage.AllowedLocations, want)
+	}
+
+	// Entries that could let a path climb out of a prefix are refused.
+	for _, loc := range []string{
+		"s3://bucket/../other/",
+		"s3://bucket/a/../b/",
+		"s3://bucket/%2e%2e/",
+		"s3://bucket/a//b/",
+		`s3://bucket/a\b/`,
+		"s3://bucket/land?x=1",
+	} {
+		_, err := Load(env(map[string]string{
+			"IGLOO_ADMIN_PASSWORD":    "password",
+			"IGLOO_ALLOWED_LOCATIONS": loc,
+		}))
+		if err == nil {
+			t.Errorf("%s: expected an error", loc)
 		}
 	}
 }

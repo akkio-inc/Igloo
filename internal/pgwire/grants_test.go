@@ -41,6 +41,9 @@ func startCatalogServerWithConfig(t *testing.T, cfg config.Config, configure ...
 		o.Grants = cs.grants
 		o.Catalog = "lake"
 		o.Audit = audit.New(cs.history, audit.Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		// Production sets these from the same config the engine's sandbox
+		// uses; mirror that so the file checks and the sandbox agree.
+		o.AllowedLocations = cfg.Storage.AllowedLocations
 	}
 	cs.testServer = startServerWithConfig(t, cfg, append([]func(*Options){setup}, configure...)...)
 	cs.admin = cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -177,13 +180,15 @@ func TestNoneRoleCannotReadFilesOrBypassAnalysis(t *testing.T) {
 	// engine does not load the extension. Files are in
 	// TestNoneRoleCannotReadAllowedFiles.)
 	for sql, reason := range map[string]string{
-		"SELECT * FROM query_table('lake.sales.leads')":             "requires the admin role",
-		"SELECT * FROM query('SELECT * FROM lake.sales.leads')":     "query()",
-		"SELECT * FROM orders, query_table('lake.sales.leads')":     "requires the admin role",
-		"SELECT * FROM read_parquet('s3://bucket/x.parquet')":       "",
-		"SELECT * FROM duckdb_secrets()":                            "requires the admin role",
-		"PRAGMA table_info('orders')":                               "PRAGMA",
-		"COPY orders TO 's3://bucket/out.parquet'":                  "COPY requires the writer role",
+		"SELECT * FROM query_table('lake.sales.leads')":         "requires the admin role",
+		"SELECT * FROM query('SELECT * FROM lake.sales.leads')": "query()",
+		"SELECT * FROM orders, query_table('lake.sales.leads')": "requires the admin role",
+		"SELECT * FROM read_parquet('s3://bucket/x.parquet')":   "",
+		"SELECT * FROM duckdb_secrets()":                        "requires the admin role",
+		"PRAGMA table_info('orders')":                           "PRAGMA",
+		// s3://bucket/ is not an allowed location, so the file guard refuses
+		// the write before the role check names it; both deny with 42501.
+		"COPY orders TO 's3://bucket/out.parquet'":                  "",
 		"SELECT 1; SELECT * FROM lake.sales.leads":                  "one statement at a time",
 		"SELECT * FROM orders, (FROM duckdb_tables()), sales.leads": "sales.leads",
 	} {

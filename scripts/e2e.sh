@@ -236,6 +236,16 @@ expect_error "no local files" 42501 igloo "$admin_password" "SELECT * FROM read_
 expect_error "no other buckets" 42501 igloo "$admin_password" "SELECT * FROM read_parquet('s3://elsewhere/x.parquet')"
 expect_error "no arbitrary URLs" 42501 igloo "$admin_password" "SELECT * FROM read_csv('http://lakekeeper:8181/management/v1/warehouse')"
 expect_error "cannot reopen the sandbox" 22P02 igloo "$admin_password" "SET enable_external_access = true"
+# A non-admin may read a file in the landing area, but not one that climbs
+# out of it: the path check refuses the climb before DuckDB opens anything.
+expect_error "no climbing out of an allowed location" 42501 walt walt-password-1 \
+  "SELECT * FROM read_text('$landing/../other.txt')"
+expect_error "nor with percent-encoded dots" 42501 walt walt-password-1 \
+  "SELECT * FROM read_text('$landing/%2e%2e/other.txt')"
+expect_error "nor a path built as the query runs" 42501 walt walt-password-1 \
+  "SELECT * FROM read_text('$landing/' || '../other.txt')"
+expect_error "nor an s3 endpoint override" 42501 walt walt-password-1 \
+  "SELECT * FROM read_text('$landing/x.txt?s3_endpoint=example.com')"
 
 echo "media analytics"
 expect "impressions" "CREATE TABLE" walt walt-password-1 "CREATE TABLE impressions AS

@@ -114,7 +114,7 @@ storage type. It is required whenever `IGLOO_CATALOG_URI` is set.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `IGLOO_ALLOWED_LOCATIONS` | | Comma-separated URL prefixes users may also read and write, e.g. a landing bucket for [`COPY INTO`](loading.md), pipes, `COPY` and `read_parquet`. Everything else outside the warehouse is blocked. |
+| `IGLOO_ALLOWED_LOCATIONS` | | Comma-separated URL prefixes users may also read and write, e.g. a landing bucket for [`COPY INTO`](loading.md), pipes, `COPY` and `read_parquet`. Everything else outside the warehouse is blocked. Each entry is given a trailing slash so it matches only its own prefix (`s3://b/land` does not match `s3://b/landing-private`), and an entry with a `.`/`..` segment, percent-encoding, a backslash, `?`, `#` or an empty segment is refused at startup. Users other than admins may name files here only as plain string literals that cannot climb out of the prefix (see [security](../SECURITY.md)). |
 
 ### S3 and S3-compatible stores
 

@@ -434,7 +434,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("IGLOO_ALLOWED_LOCATIONS entry %q must be a URL such as s3://bucket/path/", loc)
 			continue
 		}
-		cfg.Storage.AllowedLocations = append(cfg.Storage.AllowedLocations, loc)
+		if err := safeLocation(loc); err != nil {
+			addErr("IGLOO_ALLOWED_LOCATIONS entry %q: %w", loc, err)
+			continue
+		}
+		// A trailing slash makes the entry a prefix, so s3://b/land does not
+		// match s3://b/landing-private, and agrees with the warehouse root
+		// and DuckDB's allowed_directories (see internal/engine).
+		cfg.Storage.AllowedLocations = append(cfg.Storage.AllowedLocations, strings.TrimSuffix(loc, "/")+"/")
 	}
 
 	if v := get("IGLOO_SHARING_URL", ""); v != "" {
@@ -457,6 +464,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("IGLOO_WAREHOUSE_LOCATION must be set when IGLOO_CATALOG_URI is")
 		} else if err := cfg.Storage.parseLocation(); err != nil {
 			addErr("IGLOO_WAREHOUSE_LOCATION: %w", err)
+		} else if err := safeLocation(cfg.Storage.Location); err != nil {
+			addErr("IGLOO_WAREHOUSE_LOCATION %q: %w", cfg.Storage.Location, err)
 		}
 	}
 
@@ -566,6 +575,38 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// safeLocation refuses a warehouse or allowed location that could let a
+// path climb out of its prefix once it is used for prefix matching: a dot
+// segment, percent-encoding, a backslash, or an interior empty segment.
+// These are the same shapes checkPath refuses in the paths users name, so
+// the allowed set and the paths checked against it agree.
+func safeLocation(loc string) error {
+	rest := loc
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			rest = rest[j+1:]
+		} else {
+			rest = ""
+		}
+	}
+	switch {
+	case strings.Contains(loc, "\\"):
+		return errors.New("must not contain a backslash")
+	case strings.ContainsAny(loc, "?#"):
+		return errors.New("must not contain '?' or '#'")
+	case strings.Contains(loc, "%"):
+		return errors.New("must not be percent-encoded")
+	}
+	segs := strings.Split(rest, "/")
+	for i, seg := range segs {
+		if seg == "." || seg == ".." || (seg == "" && i != 0 && i != len(segs)-1) {
+			return errors.New("must not contain '.', '..' or empty path segments")
+		}
+	}
+	return nil
 }
 
 // ValidName reports whether name is a valid user name: a safe, unquoted,

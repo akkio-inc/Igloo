@@ -135,6 +135,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statements now call DuckDB's built-in functions by their qualified names,
   so a session's temporary macros cannot change what grants or policies
   find.
+- Confined the files users other than admins may name, for every statement
+  whether or not a table has a policy: a file must be a plain string literal
+  (not a value built as the statement runs) that cannot climb out of an
+  allowed prefix (no `.`/`..` segments, percent-encoding, backslashes, `?`,
+  `#` or empty segments), in file-reading functions (`read_parquet`,
+  `read_csv`, `glob`, `iceberg_scan`, `delta_scan`, `read_xlsx`, `ST_ReadSHP`,
+  `ST_ReadOSM` and the like), `COPY FROM`/`TO`, `COPY INTO`, pipes and
+  replacement scans. The check runs before DuckDB opens the file. This closes
+  a path-traversal gap: DuckDB 1.5.6 prefix-matches a remote path against
+  `allowed_directories` without canonicalising it, so
+  `https://host/allowed/../other` or an `s3://` path with a `?s3_endpoint=`
+  query would otherwise reach elsewhere. `IGLOO_ALLOWED_LOCATIONS` entries are
+  validated and given a trailing slash at startup so a prefix cannot match a
+  sibling. Without a policy, readers and writers may still read the
+  warehouse's own files; admins are unchanged.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in

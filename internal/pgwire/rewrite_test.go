@@ -215,19 +215,43 @@ func TestTextValues(t *testing.T) {
 
 func TestCheckPath(t *testing.T) {
 	s := &Server{gov: &governance{allowed: []string{"s3://landing/", "/data/"}, warehouse: "/data/warehouse/"}}
+	// With a table under a policy (allowWarehouse false), the warehouse is
+	// off limits; the rest must still be plain, in-prefix paths.
 	for path, ok := range map[string]bool{
-		"s3://landing/in.parquet":           true,
-		"s3://landing/day=*/part-*.parquet": true,
-		"/data/landing/x.csv":               true,
-		"/data/warehouse/t/data/x.parquet":  false,
-		"/data/*/x.parquet":                 false,
-		"/data/landing/../warehouse/x":      false,
-		"s3://other/x.parquet":              false,
-		"s3://landing/%2e%2e/x":             false,
-		"x.parquet":                         false,
+		"s3://landing/in.parquet":              true,
+		"s3://landing/day=*/part-*.parquet":    true,
+		"s3://landing/sub/":                    true, // a directory's own trailing slash
+		"/data/landing/x.csv":                  true,
+		"/data/warehouse/t/data/x.parquet":     false, // the warehouse
+		"/data/*/x.parquet":                    false, // glob covering the warehouse
+		"/data/landing/../warehouse/x":         false, // climbs with ..
+		"s3://other/x.parquet":                 false, // not an allowed location
+		"s3://landing/../other/x":              false, // climbs out of the prefix
+		"s3://landing/%2e%2e/x":                false, // percent-encoded ..
+		"s3://landing/%2f/x":                   false, // percent-encoded /
+		"s3://landing/%252e%252e/x":            false, // double-encoded ..
+		"s3://landing/a//b.parquet":            false, // empty interior segment
+		`s3://landing/a\b.parquet`:             false, // backslash
+		"s3://landing/x.parquet?s3_endpoint=h": false, // query redirect
+		"s3://landing/x.parquet#f":             false, // fragment
+		"s3://landing/./x":                     false, // dot segment
+		"x.parquet":                            false, // not in any location
+		"":                                     false,
 	} {
-		if err := s.checkPath(path); (err == nil) != ok {
-			t.Errorf("checkPath(%q): %v", path, err)
+		if err := s.checkPath(path, false); (err == nil) != ok {
+			t.Errorf("checkPath(%q, false): %v", path, err)
+		}
+	}
+	// Without any policy (allowWarehouse true), readers and writers may read
+	// the warehouse's own files, but the climb-out rules still hold.
+	for path, ok := range map[string]bool{
+		"/data/warehouse/t/data/x.parquet": true,
+		"/data/warehouse/../other/x":       false,
+		"/data/landing/x.csv":              true,
+		"s3://other/x.parquet":             false,
+	} {
+		if err := s.checkPath(path, true); (err == nil) != ok {
+			t.Errorf("checkPath(%q, true): %v", path, err)
 		}
 	}
 }
