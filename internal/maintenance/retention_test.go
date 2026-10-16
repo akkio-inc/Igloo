@@ -130,6 +130,9 @@ func TestDataRetention(t *testing.T) {
 				deleted = append(deleted, task.File.FilePath())
 			}
 		}
+		// Planning lists files in no particular order.
+		slices.Sort(all)
+		slices.Sort(deleted)
 		return all, deleted
 	}
 	before, withDeletes := files()
