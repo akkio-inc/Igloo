@@ -53,6 +53,8 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+# A command outside the checks that fails ends the run; say which.
+trap 'echo "e2e.sh: line $LINENO failed with status $?: $BASH_COMMAND" >&2' ERR
 
 failures=0
 pass() { printf '  ok    %s\n' "$1"; }
@@ -1121,12 +1123,12 @@ expect "to the head of the other" "4" walt walt-password-1 "SELECT count(*) FROM
 expect "drop a tag" "ALTER TABLE" walt walt-password-1 "ALTER TABLE tagged DROP TAG v1"
 expect_error "a dropped tag is gone" 42704 rita rita-password-1 "SELECT count(*) FROM tagged AT (TAG => 'v1')"
 
-psql_admin -c "CREATE SCHEMA mart" -c "CREATE TABLE mart.daily AS SELECT range AS n FROM range(3)" \
-  -c "CREATE VIEW mart.daily_big AS SELECT n FROM lake.mart.daily WHERE n > 1" -c "GRANT SELECT ON SCHEMA mart TO analysts" >/dev/null
-expect "clone a schema" "CREATE SCHEMA" walt walt-password-1 "CREATE SCHEMA mart_dev CLONE mart"
+psql_admin -c "CREATE SCHEMA shop" -c "CREATE TABLE shop.daily AS SELECT range AS n FROM range(3)" \
+  -c "CREATE VIEW shop.daily_big AS SELECT n FROM lake.shop.daily WHERE n > 1" -c "GRANT SELECT ON SCHEMA shop TO analysts" >/dev/null
+expect "clone a schema" "CREATE SCHEMA" walt walt-password-1 "CREATE SCHEMA shop_dev CLONE shop"
 expect "with its tables, views and schema grants" "3|1" nora nora-password-1 \
-  "SELECT (SELECT count(*) FROM mart_dev.daily), (SELECT count(*) FROM lake.mart_dev.daily_big)"
-expect_error "readers cannot clone schemas" 42501 rita rita-password-1 "CREATE SCHEMA mine CLONE mart"
+  "SELECT (SELECT count(*) FROM shop_dev.daily), (SELECT count(*) FROM lake.shop_dev.daily_big)"
+expect_error "readers cannot clone schemas" 42501 rita rita-password-1 "CREATE SCHEMA mine CLONE shop"
 
 echo "loading, tasks, pipes and materialized views"
 # Drops arrive as files in the landing area; the admin writes them there.
