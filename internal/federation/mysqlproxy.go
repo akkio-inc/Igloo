@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,11 +94,14 @@ const (
 // Like the PostgreSQL side (see pgproxy.go), the proxy completes DuckDB's
 // sign-in by itself once it has met the server, holds back START
 // TRANSACTION, and answers what needs no server (an empty transaction, a
-// ping, the reset of a session that ran nothing) itself, so that listing
-// tables never waits on the server. It signs in to the server at the first
-// command that needs it. Resetting a session that ran statements goes to
-// the server, which then forgets that the session is read-only, so the
-// proxy makes it so again before the next command.
+// ping, the reset of a session that ran nothing, and the client's SET NAMES
+// while it has no session with the server, which gets it when one starts)
+// itself, so that listing tables never waits on the server. It signs in to
+// the server at the first command that needs it; if it cannot, the command
+// fails with an error that names the connection and the session goes on.
+// Resetting a session that ran statements goes to the server, which then
+// forgets that the session is read-only, so the proxy makes it so again
+// before the next command.
 
 // serveMySQL signs DuckDB's MySQL client in with the token and runs its
 // session.
@@ -222,6 +226,11 @@ type mysqlSession struct {
 	held []byte
 	// autocommit is a SET autocommit=1 the server has not seen yet.
 	autocommit bool
+	// names is the last SET NAMES DuckDB sent since the session was last
+	// reset, which every new session with the server needs again;
+	// replayNames says the server's session has not seen it.
+	names       string
+	replayNames bool
 	// setUp says the server's session needs making read-only again, after
 	// a reset.
 	setUp bool
@@ -266,6 +275,7 @@ func (s *mysqlSession) connect() error {
 		return fmt.Errorf("cannot sign in to %s: %w", c.Address(), err)
 	}
 	s.started(up)
+	s.replayNames = s.names != ""
 	return nil
 }
 
@@ -285,16 +295,29 @@ const (
 	myBegin
 	myEnd
 	myAutocommit
+	myNames
 )
+
+// setNames matches the character set statement of DuckDB's MySQL client,
+// normalized.
+var setNames = regexp.MustCompile(`^SET NAMES [A-Z0-9_]+( COLLATE [A-Z0-9_]+)?$`)
+
+// normalizeMySQL is a statement's text in capitals, with its whitespace
+// collapsed and no trailing semicolons.
+func normalizeMySQL(text []byte) string {
+	return strings.ToUpper(strings.Join(strings.Fields(strings.TrimRight(string(text), "; \t\r\n")), " "))
+}
 
 // classifyMySQL names a COM_QUERY's statement, from its text as the mysql
 // extension sends it.
 func classifyMySQL(text []byte) int {
-	q := strings.ToUpper(strings.Join(strings.Fields(strings.TrimRight(string(text), "; \t\r\n")), " "))
+	q := normalizeMySQL(text)
 	if strings.Contains(q, ";") {
 		return myOther
 	}
 	switch {
+	case setNames.MatchString(q):
+		return myNames
 	case q == "BEGIN" || strings.HasPrefix(q, "START TRANSACTION"):
 		return myBegin
 	case q == "COMMIT" || q == "ROLLBACK":
@@ -333,6 +356,11 @@ func (s *mysqlSession) run(in *bufio.Reader) error {
 			}
 			return errClientGone
 		}
+		if cmd == comQuery {
+			if q := normalizeMySQL(pkt[5:]); setNames.MatchString(q) {
+				s.names = q
+			}
+		}
 		if s.r.idle() && s.answer(cmd, pkt) {
 			continue
 		}
@@ -340,8 +368,16 @@ func (s *mysqlSession) run(in *bufio.Reader) error {
 		// A command for the server.
 		if s.up == nil {
 			if err := s.connect(); err != nil {
-				_ = s.writeClient(errPacket(2013, "08S01", fmt.Sprintf("connection %s: %v", s.p.name, err)))
-				return err
+				// Failed as the server fails a command, the session goes
+				// on, and the next command tries again: ending it would
+				// hide the error behind the client's own. The code is the
+				// server's for a remote data source it cannot reach; with
+				// a client's code for a lost connection, DuckDB's client
+				// shows its own message instead of this one.
+				if cmd != comStmtClose && cmd != comStmtSendLongData {
+					_ = s.writeClient(errPacket(1429, "HY000", fmt.Sprintf("connection %s: %v", s.p.name, err)))
+				}
+				continue
 			}
 		}
 		if err := s.replay(); err != nil {
@@ -353,7 +389,7 @@ func (s *mysqlSession) run(in *bufio.Reader) error {
 		}
 		switch cmd {
 		case comResetConnection:
-			s.setUp, s.dirty = true, false
+			s.setUp, s.dirty, s.names = true, false, ""
 		case comPing, comStmtClose:
 		default:
 			s.dirty = true
@@ -381,7 +417,7 @@ func (s *mysqlSession) answer(cmd byte, pkt []byte) bool {
 	switch {
 	case cmd == comPing:
 	case cmd == comResetConnection && !open && !s.dirty:
-		s.held, s.autocommit = nil, false
+		s.held, s.autocommit, s.names, s.replayNames = nil, false, "", false
 	case cmd == comQuery && !open:
 		switch classifyMySQL(pkt[5:]) {
 		case myBegin:
@@ -393,6 +429,12 @@ func (s *mysqlSession) answer(cmd byte, pkt []byte) bool {
 			s.held = nil
 		case myAutocommit:
 			s.autocommit = true
+		case myNames:
+			// Only without a session with the server, which gets it
+			// when it starts.
+			if s.up != nil {
+				return false
+			}
 		default:
 			return false
 		}
@@ -419,13 +461,18 @@ func (s *mysqlSession) writeClient(payload []byte) error {
 }
 
 // replay sends the server what it has not seen yet that the next command
-// depends on: the session's setup after a reset, autocommit, and a held
-// START TRANSACTION. Each answer is one packet, which DuckDB does not see.
+// depends on: the session's setup after a reset, its character set,
+// autocommit, and a held START TRANSACTION. Each answer is one packet,
+// which DuckDB does not see.
 func (s *mysqlSession) replay() error {
 	var stmts []string
 	if s.setUp {
 		stmts = s.p.mysqlSetup(s.p.settings())
 		s.setUp = false
+	}
+	if s.replayNames {
+		stmts = append(stmts, s.names)
+		s.replayNames = false
 	}
 	if s.autocommit {
 		stmts = append(stmts, "SET autocommit=1")

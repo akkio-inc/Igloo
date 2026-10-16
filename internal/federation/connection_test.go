@@ -342,15 +342,20 @@ func TestClassify(t *testing.T) {
 		}
 	}
 	for text, want := range map[string]int{
-		"START TRANSACTION READ ONLY":     myBegin,
-		"BEGIN":                           myBegin,
-		"COMMIT":                          myEnd,
-		"ROLLBACK":                        myEnd,
-		"SET autocommit=1":                myAutocommit,
-		"set autocommit = 1;":             myAutocommit,
-		"SET autocommit=0":                myOther,
-		"START TRANSACTION; DROP TABLE x": myOther,
-		"SELECT 1":                        myOther,
+		"START TRANSACTION READ ONLY":           myBegin,
+		"BEGIN":                                 myBegin,
+		"COMMIT":                                myEnd,
+		"ROLLBACK":                              myEnd,
+		"SET autocommit=1":                      myAutocommit,
+		"set autocommit = 1;":                   myAutocommit,
+		"SET autocommit=0":                      myOther,
+		"START TRANSACTION; DROP TABLE x":       myOther,
+		"SELECT 1":                              myOther,
+		"SET NAMES utf8mb4":                     myNames,
+		"set names utf8mb4 collate utf8mb4_bin": myNames,
+		"SET NAMES utf8mb4; DROP TABLE x":       myOther,
+		"SET NAMES 'utf8mb4'":                   myOther,
+		"SET NAMES utf8mb4, autocommit=0":       myOther,
 	} {
 		if got := classifyMySQL([]byte(text)); got != want {
 			t.Errorf("classifyMySQL(%q) = %d, want %d", text, got, want)

@@ -412,6 +412,8 @@ func TestMySQLConnection(t *testing.T) {
 			store := NewMemoryStore()
 			ops := my.connection("ops", MySQL)
 			ops.TLS, ops.QueryTimeout = mode, 2*time.Second
+			fwd := newForwarder(t, net.JoinHostPort(my.host, strconv.Itoa(my.port)))
+			ops.Host, ops.Port = "127.0.0.1", fwd.port()
 			if err := store.Create(ctx, ops); err != nil {
 				t.Fatal(err)
 			}
@@ -430,6 +432,16 @@ func TestMySQLConnection(t *testing.T) {
 			// Prepared statements and their parameters go through the
 			// proxy too.
 			expect(t, eng, "SELECT * FROM mysql_query('ops', 'SELECT count(*) FROM "+table+" WHERE id > ?', params=row(1))", "2")
+
+			// The database becomes unreachable: its tables are still
+			// listed, queries of them fail naming the connection, and
+			// work again once it is back.
+			fwd.stop()
+			expect(t, eng, "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ops' AND table_name = '"+table+"'", "1")
+			expectError(t, eng, "SELECT count(*) FROM "+db, "connection ops")
+			expectError(t, eng, "SELECT count(*) FROM "+db, "connection ops")
+			fwd.restart(t)
+			expect(t, eng, "SELECT count(*) FROM "+db, "3")
 		})
 	}
 }
