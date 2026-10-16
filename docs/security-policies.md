@@ -246,13 +246,16 @@ of users a policy exempts run as written, after the same checks.
   may run (such as `PRAGMA tpch`) do not go through policies. Policies keep
   them from seeing raw data by accident; the query history records what
   they do.
-- **External engines.** Spark, Trino and others that read the Iceberg
-  tables directly, through the catalog database or object storage, see raw
-  data: they cannot apply policies. Do not give them access to tables with
-  policies. [Delta Sharing](sharing.md#tables-with-masking-or-row-access-policies),
-  Igloo's one way of serving tables to other engines, refuses tables with
-  policies: they cannot be added to a share, and a shared table that gains
-  one is no longer served.
+- **External engines.** Spark, Trino and others read table files
+  directly, so they cannot apply policies. Igloo's two ways of serving
+  tables to them both refuse tables with policies to everyone but admins:
+  the [Iceberg REST catalog](external-engines.md#tables-with-data-policies)
+  will not load, hand out credentials for or commit to such a table, and
+  [Delta Sharing](sharing.md#tables-with-masking-or-row-access-policies)
+  will not add one to a share or serve a shared table that gains one.
+  Storage credentials an engine got before a policy was attached work for
+  up to an hour. Engines given the catalog database or object storage
+  directly see raw data; do not give them access to tables with policies.
 - **External tables** (Delta Sharing) take no policies or tags; copy what
   users may read into a table to protect it.
 - **Existence of hidden rows.** A condition that fails on `NULL` can show,
