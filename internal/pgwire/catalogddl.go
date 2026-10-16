@@ -185,7 +185,7 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 	target := []auth.Object{{Schema: schema, Table: name}}
 	if isView && !view.drop && strings.EqualFold(schema, engine.HistorySchema) &&
 		slices.ContainsFunc(historyViews, func(v string) bool { return strings.EqualFold(v, name) }) {
-		err := pgerror.WithCode(fmt.Errorf("%s.%s is reserved for Igloo's history", schema, name), codes.ReservedName)
+		err := pgerror.WithCode(fmt.Errorf("%s.%s is reserved for Igloo's own views", schema, name), codes.ReservedName)
 		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
 		return nil, true, err
 	}
@@ -382,8 +382,9 @@ func (s *Server) resolveCatalogName(ctx context.Context, sess *session, parts []
 // isTemporary reports whether the session has a temporary table or view
 // named name.
 func isTemporary(ctx context.Context, conn *duckdb.Conn, name string) (bool, error) {
-	rows, err := conn.QueryContext(ctx, `SELECT (SELECT count(*) FROM duckdb_tables() WHERE temporary AND lower(table_name) = lower($1))
-		+ (SELECT count(*) FROM duckdb_views() WHERE temporary AND lower(view_name) = lower($1))`,
+	rows, err := conn.QueryContext(ctx, `SELECT system.main.count_star() FROM (
+			SELECT 1 FROM system.main.duckdb_tables() WHERE temporary AND system.main.lower(table_name) = system.main.lower($1)
+			UNION ALL SELECT 1 FROM system.main.duckdb_views() WHERE temporary AND system.main.lower(view_name) = system.main.lower($1))`,
 		[]driver.NamedValue{{Ordinal: 1, Value: name}})
 	if err != nil {
 		return false, err
@@ -399,7 +400,7 @@ func isTemporary(ctx context.Context, conn *duckdb.Conn, name string) (bool, err
 
 // currentSchema returns the session's current database and schema.
 func currentSchema(ctx context.Context, conn *duckdb.Conn) (db, schema string, err error) {
-	rows, err := conn.QueryContext(ctx, "SELECT current_database(), current_schema()", nil)
+	rows, err := conn.QueryContext(ctx, "SELECT system.main.current_database(), system.main.current_schema()", nil)
 	if err != nil {
 		return "", "", err
 	}

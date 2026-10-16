@@ -37,6 +37,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/scim"
 	"github.com/akkio-inc/igloo/internal/sso"
 	"github.com/akkio-inc/igloo/internal/tasks"
@@ -136,6 +137,11 @@ func serve() error {
 		defer objects.Close() //nolint:errcheck
 		go objects.Run(ctx)
 	}
+	policies, err := openPolicies(startCtx, cfg, log)
+	if err != nil {
+		return err
+	}
+	defer policies.Close()
 	var historyStore audit.Store
 	if cfg.Audit.Enabled {
 		if historyStore, err = openHistory(startCtx, cfg, log); err != nil {
@@ -198,6 +204,9 @@ func serve() error {
 		Tasks:               jobs,
 		DisableSSOPasswords: single != nil && !cfg.OIDC.PasswordSignIn,
 		TokenMaxLifetime:    cfg.TokenMaxLifetime,
+		Policies:            policies,
+		AllowedLocations:    cfg.Storage.AllowedLocations,
+		Warehouse:           warehouseRoot(cfg),
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -436,6 +445,29 @@ func openTasks(ctx context.Context, cfg config.Config, log *slog.Logger) (tasks.
 		return nil, fmt.Errorf("tasks: %w", err)
 	}
 	return store, nil
+}
+
+// openPolicies opens where masking policies, row access policies and tags
+// are kept: the metadata database, shared by every replica, or else this
+// replica's memory.
+func openPolicies(ctx context.Context, cfg config.Config, log *slog.Logger) (policy.Store, error) {
+	if cfg.MetadataDatabaseURL == "" {
+		log.Warn("IGLOO_METADATA_DATABASE_URL is not set; policies and tags are kept in memory and lost on restart")
+		return policy.NewMemoryStore(), nil
+	}
+	store, err := policy.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("policies: %w", err)
+	}
+	return store, nil
+}
+
+// warehouseRoot is where the warehouse's files are, or "" without one.
+func warehouseRoot(cfg config.Config) string {
+	if cfg.Storage.Location == "" {
+		return ""
+	}
+	return cfg.Storage.Root()
 }
 
 // startMaintenance compacts and expires tables in the background until ctx is

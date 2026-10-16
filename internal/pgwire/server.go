@@ -30,6 +30,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
@@ -97,6 +98,14 @@ type Options struct {
 	// AccessTokens, if set, lets users without a password sign in to SQL
 	// with an identity provider's access token (see accesstoken.go).
 	AccessTokens AccessTokenVerifier
+	// Policies keeps masking policies, row access policies and tags. Nil
+	// means a store in memory.
+	Policies policy.Store
+	// AllowedLocations are where users other than admins may read files
+	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
+	// Warehouse is the warehouse's location, whose files they may not.
+	AllowedLocations []string
+	Warehouse        string
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -129,6 +138,8 @@ type Server struct {
 	audit       *audit.Log
 	catalog     string
 	tasks       *tasks.Scheduler
+	// gov holds the policies (see protect.go).
+	gov *governance
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -212,6 +223,19 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	if s.tokenMaxLifetime == 0 {
 		s.tokenMaxLifetime = 365 * 24 * time.Hour
 	}
+	policies := opts.Policies
+	if policies == nil {
+		policies = policy.NewMemoryStore()
+	}
+	if s.gov, err = newGovernance(context.Background(), policies, s.roleRefresh, log, engine.Connect,
+		opts.AllowedLocations, opts.Warehouse); err != nil {
+		return nil, err
+	}
+	if e, ok := engine.(interface {
+		SetPolicies(func() *policy.Snapshot)
+	}); ok {
+		e.SetPolicies(func() *policy.Snapshot { return s.gov.snapshot(context.Background()) })
+	}
 	s.sessions.abandoned = s.releaseConn
 
 	options := []wire.OptionFn{
@@ -251,7 +275,9 @@ func (s *Server) Serve(l net.Listener) error {
 // Shutdown stops accepting connections and waits for open ones to finish
 // until ctx is done.
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.wire.Shutdown(ctx)
+	err := s.wire.Shutdown(ctx)
+	s.gov.close()
+	return err
 }
 
 // session is the state of one client connection.
@@ -289,6 +315,11 @@ type session struct {
 	// method is how the session signed in: one of audit's Method
 	// constants, or empty for the console's sessions.
 	method string
+	// sens is what the session's statements may name that policies
+	// concern, and settings whether its settings let policies apply (see
+	// protect.go).
+	sens     *sensitivity
+	settings *settingsCheck
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -604,7 +635,16 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		return stmts, nil
 	}
 
+	if err := s.checkWarehouseFiles(ctx, user, q.Query); err != nil {
+		s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+		return nil, err
+	}
+
 	if ps, ok, err := s.loadingCommand(sess, q.Query); ok || err != nil {
+		return ps, err
+	}
+
+	if ps, ok, err := s.policyCommand(ctx, sess, q); ok || err != nil {
 		return ps, err
 	}
 
@@ -635,9 +675,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 
 		start := time.Now()
 		tw := &tagWriter{DataWriter: w}
-		if err := s.recheckGrants(ctx, sess, st); err != nil {
+		if err := s.recheck(ctx, sess, st); err != nil {
 			s.metrics.query(start, err)
-			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access})
+			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
 			return err
 		}
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
@@ -667,7 +707,7 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 				s.applyEffect(ctx, sess, st.effect)
 			}
 		}
-		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access})
+		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access, policies: st.policies()})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
@@ -747,6 +787,12 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		s.ddlGen.Add(1)
 		sess.settingGen++
 	}
+	// Policies are applied to one statement at a time, before it runs;
+	// preparing several runs all but the last.
+	if err := s.protectBeforePrepare(ctx, sess, user, query, pivot); err != nil {
+		s.metrics.query(time.Now(), errDenied)
+		return fail(err)
+	}
 
 	if listsColumns.MatchString(query) {
 		// Best effort: a table that fails to load keeps its placeholder.
@@ -772,6 +818,22 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		_ = st.close()
 		return fail(pgerror.WithCode(errors.New("permission denied: only admins may run this PIVOT"), codes.InsufficientPrivilege))
 	}
+	// Apply policies: what runs is the statement rewritten to read
+	// protected tables through them.
+	text, g, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, query, oids)
+	if err == nil && text != query {
+		st.original = query
+		err = st.adopt(ctx, sess.conn, text)
+	} else if err == nil && ran {
+		err = st.reprepare(ctx, sess.conn)
+	}
+	if err != nil {
+		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+		s.metrics.query(time.Now(), err)
+		_ = st.close()
+		return fail(pgError(err))
+	}
+	st.guard = g
 	err = authorize(user.Role, st.stmtType, query)
 	if err != nil {
 		// The built-in role does not allow it; grants may.
@@ -859,8 +921,9 @@ func startsQuery(query string) bool {
 // as old as the role refresh interval. A prepared statement then outlives a
 // REVOKE no longer than a session's cached grants do, and cannot be made to
 // read a table nobody checked by replacing a view or changing the search
-// path before it runs.
-func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement) error {
+// path before it runs. force decides again regardless, as after policies
+// rewrote the statement anew.
+func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement, force bool) error {
 	if st.access == nil {
 		return nil
 	}
@@ -869,15 +932,15 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 		return err
 	}
 	privs, err := s.privileges(ctx, sess, user)
-	if err == nil && privs == st.access.privs && time.Since(st.access.checked) < s.roleRefresh &&
+	if !force && err == nil && privs == st.access.privs && time.Since(st.access.checked) < s.roleRefresh &&
 		st.access.catalogGen == s.catalogGeneration() && st.access.settingGen == sess.settingGen {
 		return nil
 	}
-	roleErr := authorize(user.Role, st.stmtType, st.query)
+	roleErr := authorize(user.Role, st.stmtType, st.sourceText())
 	if roleErr == nil {
 		return nil
 	}
-	acc, err := s.authorizeByGrants(ctx, sess, user, st, st.query, roleErr)
+	acc, err := s.authorizeByGrants(ctx, sess, user, st, st.sourceText(), roleErr)
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		return err

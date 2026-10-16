@@ -362,6 +362,9 @@ func (s *Server) copyInto(ctx context.Context, sess *session, user auth.User, c 
 	if err := s.checkLocation(c.location); err != nil {
 		return nil, auth.Object{}, err
 	}
+	if err := s.checkLoadLocation(ctx, user, c.location); err != nil {
+		return nil, auth.Object{}, err
+	}
 	target, exists, err := s.resolveLoadTarget(ctx, sess, c.target)
 	if err != nil {
 		return nil, target, err

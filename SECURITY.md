@@ -103,6 +103,28 @@ reference for every setting mentioned here.
   before it runs when grants, the catalog or the session's settings changed,
   so replacing a view or changing `search_path` cannot widen it. Table and
   column names are visible to every user through the system catalogs.
+- **Policies.** Masking policies, row access policies and tags
+  ([details](docs/security-policies.md)) apply to every statement of every
+  user, admins included, unless a policy's own expression exempts them.
+  Igloo rewrites a statement that reads a protected table so it reads the
+  table through a subquery that applies the policies, in which every column
+  is masked and guarded by the row access policy, so conditions anywhere in
+  the statement, and error messages, see only what the user may see. It
+  checks the result (rewritten again, it must not change; DuckDB's plan of
+  it must read exactly the tables its text names) and refuses statements it
+  cannot rewrite with certainty, including several statements in one query
+  that name a protected table, and renames of protected tables and columns.
+  Policy expressions are stored with their tables qualified and may not
+  call macros, read files or depend on session state, and a statement is
+  refused if a macro of its session replaces a function a policy calls, or
+  its session changed a setting that changes what expressions mean
+  (`integer_division`, for one).
+  While any table has policies, users other than admins may not read the
+  warehouse's files directly (file functions, `COPY INTO`, pipes) nor call
+  table functions that read tables by name. Tasks, pipes and materialized
+  views run through their owners' policies. Policies are not a boundary for admins, who manage them and can
+  read the warehouse's files, nor for other engines reading the Iceberg
+  tables directly. Policy changes reach other replicas within 30 seconds.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history

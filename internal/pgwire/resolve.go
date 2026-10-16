@@ -20,8 +20,12 @@ import (
 // parser, and resolved the way DuckDB's binder resolves them. Views are
 // expanded by parsing their definitions in turn.
 
-// tableRef is a table name as a statement writes it, parts unquoted.
-type tableRef struct{ parts []string }
+// tableRef is a table name as a statement writes it, parts unquoted, and
+// its alias.
+type tableRef struct {
+	parts []string
+	alias string
+}
 
 // object is a table or view a name can resolve to.
 type object struct {
@@ -57,7 +61,7 @@ type searchPath struct {
 
 // sessionPath returns the session's search path and default database.
 func sessionPath(ctx context.Context, conn *duckdb.Conn) (searchPath, error) {
-	rows, err := conn.QueryContext(ctx, "SELECT current_setting('search_path')::VARCHAR, current_database()", nil)
+	rows, err := conn.QueryContext(ctx, "SELECT system.main.current_setting('search_path')::VARCHAR, system.main.current_database()", nil)
 	if err != nil {
 		return searchPath{}, err
 	}
@@ -115,6 +119,14 @@ type resolver struct {
 	macros    map[string]bool
 	// readsOf caches what objects read, by object key.
 	readsOf map[string]readSet
+	// policyMarker is the alias prefix of the tables that policies read in
+	// a statement rewritten for them (see protect.go). Those count as
+	// scans but are not the user's reads, so they need no grant.
+	policyMarker string
+	// lenient only counts scans: it lets table functions, macros and
+	// names that are not tables through, for checks of statements of
+	// users who may use them.
+	lenient bool
 }
 
 func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, error) {
@@ -122,7 +134,7 @@ func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, err
 	if err != nil {
 		return nil, err
 	}
-	dbs, err := queryStrings(ctx, sess, "SELECT lower(database_name) FROM duckdb_databases()")
+	dbs, err := queryStrings(ctx, sess, "SELECT system.main.lower(database_name) FROM system.main.duckdb_databases()")
 	if err != nil {
 		return nil, err
 	}
@@ -160,9 +172,9 @@ func (r *resolver) load(names []string) error {
 	}
 	in := strings.Join(quoted, ", ")
 	rows, err := r.sess.conn.QueryContext(r.ctx, `SELECT database_name, schema_name, table_name, false, '', false
-			FROM duckdb_tables() WHERE lower(table_name) IN (`+in+`)
+			FROM system.main.duckdb_tables() WHERE system.main.lower(table_name) IN (`+in+`)
 		UNION ALL SELECT database_name, schema_name, view_name, true, sql, internal
-			FROM duckdb_views() WHERE lower(view_name) IN (`+in+`)`, nil)
+			FROM system.main.duckdb_views() WHERE system.main.lower(view_name) IN (`+in+`)`, nil)
 	if err != nil {
 		return err
 	}
@@ -291,6 +303,9 @@ type readSet struct {
 	// scans is how many catalog table scans DuckDB plans for it.
 	scans  int
 	tables []auth.Object
+	// policyTables are the tables that policies read (see
+	// resolver.policyMarker).
+	policyTables []auth.Object
 }
 
 func (rs *readSet) add(o auth.Object) {
@@ -316,13 +331,15 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 	w := &astWalk{}
 	w.walk(ast, nil)
 
-	for _, f := range w.tableFunctions {
-		if !allowedFunctions[strings.ToLower(f.name)] || f.schema != "" && !strings.EqualFold(f.schema, "main") {
-			return rs, denied("%s reads data that grants do not cover, which needs the reader role", f.name)
+	if !r.lenient {
+		for _, f := range w.tableFunctions {
+			if !allowedFunctions[strings.ToLower(f.name)] || f.schema != "" && !strings.EqualFold(f.schema, "main") {
+				return rs, denied("%s reads data that grants do not cover, which needs the reader role", f.name)
+			}
 		}
-	}
-	if err := r.checkMacros(append(w.functions, w.tableFunctions...)); err != nil {
-		return rs, err
+		if err := r.checkMacros(append(w.functions, w.tableFunctions...)); err != nil {
+			return rs, err
+		}
 	}
 
 	names := make([]string, len(w.refs))
@@ -338,6 +355,9 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 			return rs, err
 		}
 		if len(res.all) == 0 {
+			if r.lenient {
+				continue
+			}
 			return rs, denied("%s is not a table or view; reading files directly needs the reader role", strings.Join(ref.parts, "."))
 		}
 		scans := -1
@@ -352,6 +372,15 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 			scans = reads.scans
 		}
 		rs.scans += max(scans, 0)
+		if r.policyMarker != "" && strings.HasPrefix(ref.alias, r.policyMarker) {
+			// A policy reads it, not the user.
+			for _, o := range res.first {
+				if !o.view && strings.EqualFold(o.db, r.catalog) {
+					rs.policyTables = append(rs.policyTables, auth.Object{Schema: o.schema, Table: o.name})
+				}
+			}
+			continue
+		}
 		for _, o := range res.all {
 			reads, err := r.reads(o, depth)
 			if err != nil {
@@ -411,7 +440,7 @@ func (r *resolver) checkMacros(calls []fnRef) error {
 		return nil
 	}
 	if r.macros == nil {
-		names, err := queryStrings(r.ctx, r.sess, `SELECT DISTINCT lower(function_name) FROM duckdb_functions()
+		names, err := queryStrings(r.ctx, r.sess, `SELECT DISTINCT system.main.lower(function_name) FROM system.main.duckdb_functions()
 			WHERE NOT internal AND function_type IN ('macro', 'table_macro') AND database_name <> 'temp'`)
 		if err != nil {
 			return err
@@ -432,7 +461,7 @@ func (r *resolver) checkMacros(calls []fnRef) error {
 // serialize returns DuckDB's parse of a query as JSON.
 func (r *resolver) serialize(text string) (any, error) {
 	rows, err := r.sess.conn.QueryContext(r.ctx,
-		"SELECT json_serialize_sql($1::VARCHAR, skip_null := true, skip_empty := true)::VARCHAR",
+		"SELECT system.main.json_serialize_sql($1::VARCHAR, skip_null := true, skip_empty := true)::VARCHAR",
 		[]driver.NamedValue{{Ordinal: 1, Value: text}})
 	if err != nil {
 		return nil, err
@@ -567,7 +596,7 @@ func (w *astWalk) walk(n any, sc *cteScope) {
 					parts = append(parts, p)
 				}
 			}
-			w.refs = append(w.refs, tableRef{parts: parts})
+			w.refs = append(w.refs, tableRef{parts: parts, alias: str(n["alias"])})
 			w.walk(n["at_clause"], sc)
 			return
 		case "SHOW_REF":

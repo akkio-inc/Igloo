@@ -53,6 +53,8 @@ type queryRecord struct {
 	acc *access
 	// written names what catalog DDL changed.
 	written []auth.Object
+	// policies names the policies that applied.
+	policies []string
 }
 
 // recordQuery sends a statement to the history.
@@ -85,6 +87,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 	if r.written != nil {
 		q.TablesWritten = objectNames(s.catalogName(), r.written)
 	}
+	q.Policies = r.policies
 	s.audit.RecordQuery(q)
 }
 
@@ -177,6 +180,10 @@ func statementKind(query string) string {
 	}
 	switch words[0] {
 	case "CREATE", "DROP", "ALTER":
+		if c, ok, err := parsePolicyCommand(query); ok && err == nil {
+			// CREATE MASKING POLICY, not CREATE MASKING.
+			return c.tag
+		}
 		return ddlTag(query)
 	case "SHOW":
 		return strings.Join(words, " ")

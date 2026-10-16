@@ -112,7 +112,9 @@ func (s *Server) authorizeByGrants(ctx context.Context, sess *session, user auth
 	}
 	acc.written = written
 	if rank[user.Role] < rank[auth.RoleReader] {
-		read, err := s.readTables(ctx, sess, st, query)
+		// What the statement reads is what runs: the statement as
+		// policies rewrote it.
+		read, err := s.readTables(ctx, sess, st, st.query)
 		if err != nil {
 			return nil, err
 		}
@@ -461,7 +463,8 @@ func (s *Server) newTableTarget(ctx context.Context, sess *session, name []strin
 }
 
 func (s *Server) isDatabase(ctx context.Context, sess *session, name string) (bool, error) {
-	dbs, err := queryStrings(ctx, sess, `SELECT database_name FROM duckdb_databases() WHERE lower(database_name) = lower($1)`, name)
+	dbs, err := queryStrings(ctx, sess, `SELECT database_name FROM system.main.duckdb_databases()
+		WHERE system.main.lower(database_name) = system.main.lower($1)`, name)
 	return len(dbs) > 0, err
 }
 
@@ -536,6 +539,7 @@ func (s *Server) readTables(ctx context.Context, sess *session, st *statement, q
 	if err != nil {
 		return nil, err
 	}
+	r.policyMarker = st.policyMarker()
 	reads, err := r.analyze(parseText, nil, 0)
 	if err != nil {
 		return nil, err
@@ -545,7 +549,7 @@ func (s *Server) readTables(ctx context.Context, sess *session, st *statement, q
 			scans.total(), reads.scans)
 	}
 	for _, named := range scans.named {
-		if !slices.ContainsFunc(reads.tables, func(o auth.Object) bool { return o.Equal(named) }) {
+		if !slices.ContainsFunc(slices.Concat(reads.tables, reads.policyTables), func(o auth.Object) bool { return o.Equal(named) }) {
 			return nil, denied("cannot verify which tables this statement reads (%s)", named)
 		}
 	}
@@ -912,6 +916,7 @@ var allowedFunctions = map[string]bool{
 	"pragma_version": true,
 	"igloo_comments": true, "igloo_query_history": true, "igloo_login_history": true,
 	"igloo_task_history": true, "igloo_load_history": true,
+	"igloo_policy_references": true, "igloo_tag_references": true,
 }
 
 // planScans explains text on the session's connection and returns the
@@ -970,7 +975,7 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 
 // tableFunctions returns the names of every table function, lower-cased.
 func (s *Server) tableFunctions(ctx context.Context, sess *session) (map[string]bool, error) {
-	names, err := queryStrings(ctx, sess, `SELECT DISTINCT lower(function_name) FROM duckdb_functions()
+	names, err := queryStrings(ctx, sess, `SELECT DISTINCT system.main.lower(function_name) FROM system.main.duckdb_functions()
 		WHERE function_type IN ('table', 'table_macro')`)
 	if err != nil {
 		return nil, err
@@ -1032,7 +1037,7 @@ func explainLogical(ctx context.Context, conn *duckdb.Conn, text string) (any, e
 
 // settingValue returns a DuckDB setting's current value.
 func settingValue(ctx context.Context, conn *duckdb.Conn, name string) (string, error) {
-	rows, err := conn.QueryContext(ctx, "SELECT current_setting("+quoteLiteral(name)+")::VARCHAR", nil)
+	rows, err := conn.QueryContext(ctx, "SELECT system.main.current_setting("+quoteLiteral(name)+")::VARCHAR", nil)
 	if err != nil {
 		return "", err
 	}

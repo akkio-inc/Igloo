@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -457,6 +458,9 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 		if err := s.checkLocation(cp.location); err != nil {
 			return err
 		}
+		if err := s.checkLoadLocation(ctx, user, cp.location); err != nil {
+			return err
+		}
 		target, exists, err := s.resolveLoadTarget(ctx, sess, cp.target)
 		if err != nil {
 			return err
@@ -665,15 +669,18 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 
 	case tasks.KindMaterializedView:
 		start := time.Now()
-		var rows int64
+		var (
+			rows     int64
+			policies []string
+		)
 		err := sess.runCancelable(ctx, "REFRESH MATERIALIZED VIEW "+j.Name, func(ctx context.Context) error {
 			var err error
-			rows, err = s.refreshMaterializedView(ctx, sess, owner, j)
+			rows, policies, err = s.refreshMaterializedView(ctx, sess, owner, j)
 			return err
 		})
 		schema, table, _ := strings.Cut(j.Name, ".")
 		s.recordQuery(sess, queryRecord{text: "REFRESH MATERIALIZED VIEW " + quoteName([]string{schema, table}),
-			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}})
+			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: policies})
 		return rows, err
 	}
 	return -1, fmt.Errorf("unknown kind of job %q", j.Kind)
@@ -696,18 +703,23 @@ func (r *taskResult) Complete(tag string) error {
 // as user, in one transaction: queries see the old rows or the new ones,
 // never neither. It is what CREATE OR REPLACE TABLE ... AS does, and needs
 // the same privileges, which is how it is checked.
-func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, user auth.User, j tasks.Job) (int64, error) {
+func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, user auth.User, j tasks.Job) (int64, []string, error) {
 	schema, table, _ := strings.Cut(j.Name, ".")
 	qualified := quoteName([]string{s.catalogName(), schema, table})
 	if n, err := s.engine.CountStatements(j.Statement); err != nil || n != 1 || !selectLike(j.Statement) {
-		return -1, fmt.Errorf("the definition of materialized view %s is not one query", j.Name)
+		return -1, nil, fmt.Errorf("the definition of materialized view %s is not one query", j.Name)
 	}
 	st, err := s.prepareChecked(ctx, sess, user, "CREATE OR REPLACE TABLE "+qualified+" AS "+j.Statement, nil)
 	if err != nil {
-		return -1, err
+		return -1, nil, err
 	}
 	_ = st.close()
-	query := s.rewrite(ctx, user, j.Statement)
+	// What runs is the query as policies rewrite it for user, so the view
+	// holds what its owner may see of protected tables.
+	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, user, j.Statement), nil)
+	if err != nil {
+		return -1, nil, pgError(err)
+	}
 
 	exec := func(ctx context.Context, q string) (int64, error) {
 		res, err := sess.conn.ExecContext(ctx, q, nil)
@@ -728,16 +740,16 @@ func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, use
 		}
 		if err == nil {
 			if _, err = exec(ctx, "COMMIT"); err == nil {
-				return rows, nil
+				return rows, g.applied, nil
 			}
 		}
 		_, _ = exec(context.WithoutCancel(ctx), "ROLLBACK")
 		if !commitConflict(err) || attempt == maxCommitRetries {
-			return -1, pgError(err)
+			return -1, nil, pgError(err)
 		}
 		select {
 		case <-ctx.Done():
-			return -1, ctx.Err()
+			return -1, nil, ctx.Err()
 		case <-time.After(backoff):
 		}
 		backoff = min(2*backoff, time.Second)

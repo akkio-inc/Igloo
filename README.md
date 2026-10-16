@@ -108,6 +108,22 @@ the official TPC-H answers.
   CREATE USER dbt_prod TYPE SERVICE ROLE none;
   CREATE TOKEN ci FOR USER dbt_prod EXPIRES '90d';   -- shown once, stored hashed
   ```
+- **[Row access and masking policies, and tags](docs/security-policies.md)**,
+  as in Snowflake: show each team only its clients' rows, and mask emails,
+  device IDs and other identifiers for everyone not allowed to see them,
+  in every statement, the web console included.
+
+  ```sql
+  CREATE ROW ACCESS POLICY client_rows AS (cid VARCHAR) RETURNS BOOLEAN ->
+    EXISTS (SELECT 1 FROM governance.client_access a
+            WHERE a.client_id = cid AND is_role_in_session(a.role_name));
+  ALTER TABLE marts.impressions ADD ROW ACCESS POLICY client_rows ON (client_id);
+  CREATE MASKING POLICY mask_pii AS (val VARCHAR) RETURNS VARCHAR ->
+    CASE WHEN is_role_in_session('pii_reader') THEN val ELSE sha256(val) END;
+  CREATE TAG pii ALLOWED_VALUES 'email', 'device_id';
+  ALTER TAG pii SET MASKING POLICY mask_pii;
+  ALTER TABLE marts.impressions ALTER COLUMN email SET TAG pii = 'email';
+  ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days.
 - **[Loading and scheduling](docs/loading.md)** with nothing else to run:
@@ -209,6 +225,8 @@ PostgreSQL License).
   mapping, tested drivers and tools
 - [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
   materialized views
+- [Masking, row access policies and tags](docs/security-policies.md): what
+  each user sees of tables' rows and columns
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a
@@ -221,8 +239,9 @@ PostgreSQL License).
   with bigger machines and out with more replicas; very large queries that
   need a cluster are not supported yet.
 - **Grants stop at tables.** Views run with the querying user's privileges,
-  and there are no column masks, row filters or column privileges yet. Table
-  and column names are visible to every user.
+  and there are no column privileges: use masking policies instead. Table
+  and column names are visible to every user. Policies do not bind admins,
+  who manage them, nor engines that read the Iceberg tables directly.
 - **Scale to zero saves node costs on one machine, not yet in the cloud
   modules.** The AWS, Google Cloud and Azure modules run Igloo on their
   general node pool, so scaling its pods to zero does not release nodes
@@ -244,7 +263,8 @@ internal/catalog/   catalog and warehouse setup
 internal/config/    environment-variable configuration
 internal/engine/    embedded DuckDB, storage, sandbox
 internal/flightsql/ Arrow Flight SQL endpoint
-internal/pgwire/    Postgres wire protocol, authorization, compatibility
+internal/pgwire/    Postgres wire protocol, authorization, policies, compatibility
+internal/policy/    masking and row access policies and tags, stored
 internal/schedule/  cron and interval schedules
 internal/tasks/     tasks, pipes, materialized views, load history, scheduler
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules

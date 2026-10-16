@@ -1,6 +1,7 @@
 // The data browser: schemas, tables and views with their columns, comments,
-// definitions and a sample of rows. Everything is read with SQL as the
-// signed-in user, so it shows what that user may see.
+// policies, tags, definitions and a sample of rows. Everything is read with
+// SQL as the signed-in user, so it shows what that user may see: masked
+// values and only the rows that row access policies let through.
 
 import * as api from './api.js';
 import { h, clear, icon, button, plural, mark, fmtMs } from './dom.js';
@@ -125,7 +126,7 @@ export function createData(app) {
     let info;
     try {
       // One request: column details (with comments), the object's comment,
-      // and a view's definition.
+      // a view's definition, and the policies and tags of a table.
       const results = await api.queryAll(`
 SELECT c.column_name, c.data_type, c.is_nullable, coalesce(m.comment, c.comment) AS comment
 FROM duckdb_columns() c
@@ -137,11 +138,17 @@ SELECT coalesce(
   (SELECT comment FROM igloo_comments() WHERE table_schema = ${s} AND table_name = ${n} AND column_name IS NULL LIMIT 1),
   (SELECT comment FROM duckdb_tables() WHERE database_name = ${d} AND schema_name = ${s} AND table_name = ${n}),
   (SELECT comment FROM duckdb_views() WHERE database_name = ${d} AND schema_name = ${s} AND view_name = ${n})) AS comment;
-SELECT sql FROM duckdb_views() WHERE database_name = ${d} AND schema_name = ${s} AND view_name = ${n};`, signal);
+SELECT sql FROM duckdb_views() WHERE database_name = ${d} AND schema_name = ${s} AND view_name = ${n};
+SELECT policy_name, policy_kind, ref_column_name, tag_name FROM igloo.policy_references
+WHERE ref_database_name = ${d} AND lower(ref_schema_name) = lower(${s}) AND lower(ref_entity_name) = lower(${n});
+SELECT column_name, tag_name, tag_value FROM igloo.tag_references
+WHERE object_database = ${d} AND lower(object_schema) = lower(${s}) AND lower(object_name) = lower(${n});`, signal);
       info = {
         columns: api.objects(results[0]),
         comment: results[1].rows[0]?.[0] || '',
         definition: results[2].rows[0]?.[0] || '',
+        policies: api.objects(results[3]),
+        tags: api.objects(results[4]),
       };
     } catch (e) {
       if (e.name === 'AbortError') return;
@@ -149,9 +156,15 @@ SELECT sql FROM duckdb_views() WHERE database_name = ${d} AND schema_name = ${s}
       return;
     }
     head.querySelector('.comment').textContent = info.comment;
+    for (const p of info.policies.filter((p) => p.policy_kind === 'ROW ACCESS POLICY')) {
+      head.querySelector('.title .spacer').before(h('span', {
+        class: 'badge warn', text: `row access: ${p.policy_name}`,
+        title: 'Rows are filtered by this row access policy for every user, as it decides',
+      }));
+    }
 
     const views = {
-      columns: () => columnsView(info.columns),
+      columns: () => columnsView(info.columns, info.policies, info.tags),
       sample: () => sampleView(o, signal),
       definition: () => h('pre', { class: 'definition mono', text: info.definition }),
     };
@@ -170,14 +183,30 @@ SELECT sql FROM duckdb_views() WHERE database_name = ${d} AND schema_name = ${s}
     select('columns');
   }
 
-  function columnsView(columns) {
+  function columnsView(columns, policies = [], tags = []) {
     if (!columns.length) return h('div', { class: 'result-message', text: 'No columns.' });
+    const same = (a, b) => (a || '').toLowerCase() === (b || '').toLowerCase();
+    // Badges for a column: its masking policy, directly or through a tag,
+    // and its tags.
+    const badges = (c) => [
+      ...policies.filter((p) => p.policy_kind === 'MASKING POLICY' && same(p.ref_column_name, c.column_name))
+        .map((p) => h('span', {
+          class: 'badge warn', text: `masked: ${p.policy_name}`,
+          title: p.tag_name ? `Masked by ${p.policy_name}, through tag ${p.tag_name}` : `Masked by ${p.policy_name}`,
+        })),
+      ...tags.filter((t) => same(t.column_name, c.column_name))
+        .map((t) => h('span', { class: 'badge', text: `${t.tag_name} = ${t.tag_value}`, title: `Tag ${t.tag_name}` })),
+    ];
+    const governed = columns.some((c) => badges(c).length);
+    const headings = ['Column', 'Type', 'Nullable', 'Comment'];
+    if (governed) headings.splice(3, 0, 'Policies and tags');
     return h('div', { class: 'card table-wrap' }, h('table', { class: 'list' },
-      h('thead', {}, h('tr', {}, ['Column', 'Type', 'Nullable', 'Comment'].map((t) => h('th', { text: t })))),
+      h('thead', {}, h('tr', {}, headings.map((t) => h('th', { text: t })))),
       h('tbody', {}, columns.map((c) => h('tr', {},
         h('td', { class: 'mono', text: c.column_name }),
         h('td', { class: 'mono muted', text: c.data_type }),
         h('td', { text: ['t', 'true'].includes(c.is_nullable) ? 'yes' : 'no' }),
+        governed ? h('td', { class: 'badges' }, badges(c)) : null,
         h('td', { text: c.comment || '' }))))));
   }
 

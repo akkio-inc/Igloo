@@ -144,8 +144,9 @@ works and what it means:
   functions could read any table's files directly. Statements Igloo cannot
   analyze, such as `PRAGMA`, are refused for them with SQLSTATE `42501`.
 - Views run with the querying user's privileges: reading a view needs
-  `SELECT` on the tables it reads. Owner's-rights views, column masking and
-  row filters are not available yet.
+  `SELECT` on the tables it reads. Owner's-rights views are not available.
+  To show users only some rows or masked columns of a table, use
+  [policies](#policies-and-tags).
 - `CREATE` on a schema does not include reading or writing the tables made
   there; grant those as well.
 - Grants never allow what needs `admin` (users, secrets, `ATTACH`, global
@@ -163,6 +164,34 @@ A refused statement gets SQLSTATE `42501` and a message that names the
 table or schema and the privilege it needs, such as `permission denied for
 nora: SELECT on table public.orders needs the reader role or a SELECT
 grant`.
+
+## Policies and tags
+
+Masking policies replace a column's values and row access policies hide
+rows, for every user and statement, as in Snowflake; tags classify columns
+and can mask every column that has them. Admins create and attach them:
+
+```sql
+CREATE MASKING POLICY mask_email AS (val VARCHAR) RETURNS VARCHAR ->
+  CASE WHEN is_role_in_session('pii_reader') THEN val ELSE '***' END;
+ALTER TABLE crm.contacts ALTER COLUMN email SET MASKING POLICY mask_email;
+
+CREATE ROW ACCESS POLICY client_rows AS (cid VARCHAR) RETURNS BOOLEAN ->
+  is_role_in_session('admin')
+  OR EXISTS (SELECT 1 FROM governance.client_access a
+             WHERE a.client_id = cid AND is_role_in_session(a.role_name));
+ALTER TABLE crm.contacts ADD ROW ACCESS POLICY client_rows ON (client_id);
+
+CREATE TAG pii ALLOWED_VALUES 'email', 'device_id';
+ALTER TAG pii SET MASKING POLICY mask_email;
+ALTER TABLE crm.leads ALTER COLUMN email SET TAG pii = 'email';
+
+SHOW POLICIES;
+SELECT * FROM igloo.policy_references;
+```
+
+[Masking, row access policies and tags](security-policies.md) describes every
+statement, how policies apply and what they refuse.
 
 ## Query history
 
@@ -191,6 +220,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `query_text` | The statement as sent, with passwords and secrets replaced by `'***'` |
 | `tables_read`, `tables_written` | Catalog tables the statement used, when Igloo checked them against grants; `NULL` otherwise |
 | `client_address`, `application_name` | Where the session came from |
+| `policies` | The masking and row access policies that applied to the statement; `NULL` when none did |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,
@@ -306,8 +336,9 @@ service accounts, connect BI tools, dbt and scripts.
 ## Differences from PostgreSQL
 
 - The SQL dialect is DuckDB's (above). PostgreSQL-only features such as
-  stored procedures, triggers, sequences on Iceberg tables, `LISTEN/NOTIFY`
-  and row-level security are not available.
+  stored procedures, triggers, sequences on Iceberg tables and
+  `LISTEN/NOTIFY` are not available. Row-level security is Snowflake's
+  kind: [row access policies](#policies-and-tags), not `CREATE POLICY`.
 - Users, roles and passwords are managed with `CREATE USER`, `ALTER USER`,
   `DROP USER` and `SHOW USERS` (see [operations](operations.md#users-and-roles)),
   with Igloo's own options: `TYPE SERVICE`, `OWNER`, `EMAIL`, `LOGIN` and

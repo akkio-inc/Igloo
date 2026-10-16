@@ -170,6 +170,9 @@ amounts to, one file at a time, as the user's own statements:
   use `COPY INTO`, whatever their grants, as they cannot `read_csv`: files
   are not covered by grants.
 - The location must be in the warehouse or `IGLOO_ALLOWED_LOCATIONS`.
+  While any table has [policies](security-policies.md), users other than
+  admins may not load from the warehouse, nor from a location that holds
+  it: its files are the tables' own, read through the tables.
 
 ## Pipes
 
@@ -297,7 +300,9 @@ CREATE MATERIALIZED VIEW marts.campaign_totals SCHEDULE '30 minutes' AS
 - **Reading one needs `SELECT` on it**, not on the tables its query reads:
   grant it like a table. Refreshes run as the owner, with the owner's
   privileges at the time, and need what `CREATE OR REPLACE TABLE ... AS`
-  with its query needs.
+  with its query needs. [Policies](security-policies.md) apply to the
+  query as they do to the owner's own: the view holds what its owner may
+  see of protected tables, and whoever may read it sees that.
 - Only its owner and admins refresh, change or drop it. Dropping it drops
   its table; dropping the table with `DROP TABLE` drops the view too.
 

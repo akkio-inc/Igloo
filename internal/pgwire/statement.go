@@ -41,6 +41,10 @@ type statement struct {
 	clientOIDs []uint32
 	// access is set when grants allowed the statement (see access.go).
 	access *access
+	// original is the statement before policies rewrote it, when they did
+	// (see protect.go); guard records how they applied.
+	original string
+	guard    *guard
 	// effect is what the statement, once it succeeds, does to the objects
 	// grants name.
 	effect *grantEffect
@@ -76,8 +80,7 @@ func (st *statement) reprepare(ctx context.Context, conn *duckdb.Conn) error {
 	if err != nil {
 		return err
 	}
-	if fresh.stmtType != st.stmtType || fresh.kind != st.kind || !slices.Equal(fresh.params, st.params) ||
-		!slices.EqualFunc(fresh.columns, st.columns, func(a, b wire.Column) bool { return a.Name == b.Name && a.Oid == b.Oid }) {
+	if !sameShape(fresh, st, st.original == "") {
 		_ = fresh.close()
 		return pgerror.WithCode(errors.New("the statement's result changed since it was prepared; prepare it again"),
 			codes.FeatureNotSupported)
@@ -85,6 +88,15 @@ func (st *statement) reprepare(ctx context.Context, conn *duckdb.Conn) error {
 	old := st.stmt
 	st.stmt, st.encoders = fresh.stmt, fresh.encoders
 	return old.Close()
+}
+
+// sameShape reports whether a and b have the same type, result columns
+// and parameters. names compares the columns' names too: a statement that
+// policies rewrote names a column for an expression after its rewritten
+// text, so it keeps the names the client was given for the original.
+func sameShape(a, b *statement, names bool) bool {
+	return a.stmtType == b.stmtType && a.kind == b.kind && slices.Equal(a.params, b.params) &&
+		slices.EqualFunc(a.columns, b.columns, func(x, y wire.Column) bool { return (!names || x.Name == y.Name) && x.Oid == y.Oid })
 }
 
 func (st *statement) describe(clientOIDs []uint32) error {

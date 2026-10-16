@@ -248,6 +248,7 @@ kbd {
 .badge.error { background: var(--danger-soft); color: var(--danger); }
 .badge.warn { background: var(--warm-soft); color: var(--warm-text); }
 .badge.code { font-family: var(--mono); font-weight: 600; }
+td.badges { display: flex; flex-wrap: wrap; gap: 4px; }
 
 .muted { color: var(--text-muted); }
 .faint { color: var(--text-faint); }

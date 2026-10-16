@@ -122,7 +122,7 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 		if err != nil {
 			return pgerror.WithCode(err, codes.InvalidTextRepresentation)
 		}
-		if err := s.recheckGrants(ctx, sess, st); err != nil {
+		if err := s.recheck(ctx, sess, st); err != nil {
 			return err
 		}
 		// The cursor gets a statement of its own, which lives as long as

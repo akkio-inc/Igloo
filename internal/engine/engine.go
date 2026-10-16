@@ -18,6 +18,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/policy"
 )
 
 // attachRetryInterval is how long Open waits between attempts to reach the
@@ -57,6 +58,8 @@ type Engine struct {
 	jobHistory atomic.Pointer[jobHistoryConfig]
 	// locations are where COPY INTO may load from; see Locations.
 	locations []string
+	// policies supplies the policy reference functions; see SetPolicies.
+	policies atomic.Pointer[func() *policy.Snapshot]
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -205,6 +208,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger)
 		return fmt.Errorf("register task and load history: %w", err)
 	}
 	e.locations = loadLocations(cfg)
+	if err := e.registerPolicies(ctx); err != nil {
+		return fmt.Errorf("register policy references: %w", err)
+	}
 
 	if cfg.Catalog.URI == "" {
 		log.Warn("IGLOO_CATALOG_URI is not set; tables will not persist")

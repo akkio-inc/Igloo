@@ -632,6 +632,29 @@ func TestQuery(t *testing.T) {
 	}
 }
 
+// TestDataBrowserReadsPolicies runs the data browser's queries of a
+// table's policies and tags, as data.js sends them.
+func TestDataBrowserReadsPolicies(t *testing.T) {
+	tc := newTestConsole(t, false)
+	reader := tc.signedIn(t, "rita")
+	_, events := reader.query(`SELECT policy_name, policy_kind, ref_column_name, tag_name FROM igloo.policy_references
+WHERE ref_database_name = 'memory' AND lower(ref_schema_name) = lower('main') AND lower(ref_entity_name) = lower('t');
+SELECT column_name, tag_name, tag_value FROM igloo.tag_references
+WHERE object_database = 'memory' AND lower(object_schema) = lower('main') AND lower(object_name) = lower('t');`)
+	completed := 0
+	for _, ev := range events {
+		if ev.Error != nil {
+			t.Fatalf("error: %+v", ev.Error)
+		}
+		if ev.Complete != nil {
+			completed++
+		}
+	}
+	if completed != 2 {
+		t.Errorf("%d of 2 queries completed", completed)
+	}
+}
+
 func TestCancelByClosingTheRequest(t *testing.T) {
 	tc := newTestConsole(t, false)
 	b := tc.signedIn(t, "rita")

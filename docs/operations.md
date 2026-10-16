@@ -94,6 +94,24 @@ privilege and what a grant covers. In short:
   roles are not affected. A statement whose reads it cannot account for is
   refused with SQLSTATE `42501`.
 
+### Policies and tags
+
+Masking and row access policies decide what each user sees of a table's
+columns and rows, for every statement; tags classify columns and can mask
+all of them at once. [Masking, row access policies and
+tags](security-policies.md) describes them.
+
+- Admins create and attach them; anyone may list them. They live in the
+  metadata database (schema `igloo_policy`); without one, in each replica's
+  memory, lost on restart.
+- Changes apply at once on the replica that made them and within 30 seconds
+  on the others.
+- Policies stay with a table's name when the table is dropped, and renaming
+  a table or column they protect is refused: unset them first.
+- While any table has policies, users other than admins cannot read the
+  warehouse's files directly; give loading jobs files in
+  `IGLOO_ALLOWED_LOCATIONS`.
+
 ## Query and login history
 
 Igloo records every statement and every login attempt: who, when, how long,

@@ -361,6 +361,88 @@ expect "a PIVOT that lists its columns" "10.50|20.25" nora nora-password-1 \
 got="$(psql_as nora nora-password-1 -c 'SHOW GRANTS ON TABLE e2e')"
 if grep -q "^analysts|role|SELECT|table|public.e2e|igloo|" <<<"$got"; then pass "SHOW GRANTS"; else fail "SHOW GRANTS: $got"; fi
 
+echo "policies and tags"
+# An agency's contacts of two clients; nora's team sees acme's rows only,
+# with emails and device IDs masked. Policy statements go one at a time.
+psql_admin -c "
+  CREATE SCHEMA crm;
+  CREATE SCHEMA governance;
+  CREATE TABLE crm.contacts (id INTEGER, client_id VARCHAR, email VARCHAR, device_id VARCHAR);
+  INSERT INTO crm.contacts VALUES (1, 'acme', 'ann@acme.com', 'dev-1'), (2, 'globex', 'gus@globex.com', 'dev-2');
+  CREATE TABLE governance.client_access (role_name VARCHAR, client_id VARCHAR);
+  INSERT INTO governance.client_access VALUES ('acme_team', 'acme');" >/dev/null
+contacts_file="$(psql_admin -c "SELECT file_path FROM iceberg_metadata(lake.crm.contacts) LIMIT 1")"
+first_snapshot="$(psql_admin -c "SELECT snapshot_id FROM iceberg_snapshots(lake.crm.contacts) ORDER BY timestamp_ms LIMIT 1")"
+if got="$(psql_admin \
+  -c "CREATE ROLE acme_team" -c "CREATE ROLE pii_reader" -c "GRANT acme_team TO nora" \
+  -c "GRANT SELECT ON TABLE crm.contacts TO analysts" \
+  -c "CREATE ROW ACCESS POLICY client_rows AS (cid VARCHAR) RETURNS BOOLEAN ->
+        is_role_in_session('admin') OR EXISTS (SELECT 1 FROM governance.client_access a
+          WHERE a.client_id = cid AND is_role_in_session(a.role_name))" \
+  -c "CREATE MASKING POLICY mask_email AS (val VARCHAR) RETURNS VARCHAR ->
+        CASE WHEN is_role_in_session('pii_reader') THEN val ELSE '***@' || split_part(val, '@', 2) END" \
+  -c "CREATE TAG pii ALLOWED_VALUES 'email', 'device_id'" \
+  -c "CREATE MASKING POLICY pii_hash AS (val VARCHAR) RETURNS VARCHAR ->
+        CASE WHEN is_role_in_session('pii_reader') THEN val ELSE tag_value('pii') || ':' || left(sha256(val), 8) END" \
+  -c "ALTER TAG pii SET MASKING POLICY pii_hash" \
+  -c "ALTER TABLE crm.contacts ADD ROW ACCESS POLICY client_rows ON (client_id)" \
+  -c "ALTER TABLE crm.contacts ALTER COLUMN email SET MASKING POLICY mask_email" \
+  -c "ALTER TABLE crm.contacts ALTER COLUMN device_id SET TAG pii = 'device_id'")"; then
+  pass "create and attach policies and tags"
+else
+  fail "policies: $got"
+fi
+device="$(psql_admin -c "SELECT 'device_id:' || left(sha256('dev-1'), 8)")"
+expect "a row access policy and masks apply" "1|acme|***@acme.com|$device" nora nora-password-1 \
+  "SELECT * FROM crm.contacts"
+expect "filters see masked values" "0|1" nora nora-password-1 \
+  "SELECT count(*) FILTER (WHERE email = 'ann@acme.com'), count(*) FILTER (WHERE email LIKE '***@%') FROM crm.contacts"
+expect "joins see visible rows" "1" nora nora-password-1 \
+  "SELECT count(*) FROM crm.contacts a JOIN crm.contacts b USING (client_id)"
+expect "time travel reads through the policies" "1|***@acme.com" nora nora-password-1 \
+  "SELECT id, email FROM crm.contacts AT (VERSION => $first_snapshot)"
+expect "admins too, unless a policy exempts them" "2|***@acme.com" igloo "$admin_password" \
+  "SELECT count(*), min(email) FROM crm.contacts"
+got="$(psql_as nora nora-password-1 -c "SELECT CAST(email AS INTEGER) FROM crm.contacts")" || true
+if grep -q "ann@\|gus@" <<<"$got"; then fail "an error shows a raw email: $got"; else pass "errors show masked values"; fi
+expect_error "the mapping table needs no grant, and gives none" 42501 nora nora-password-1 \
+  "SELECT * FROM governance.client_access"
+expect_error "readers cannot read a protected table's files" 42501 rita rita-password-1 \
+  "SELECT * FROM read_parquet('$contacts_file')"
+expect_error "nor list them" 42501 rita rita-password-1 "SELECT * FROM iceberg_metadata(lake.crm.contacts)"
+expect_error "a protected table cannot be renamed" 42501 igloo "$admin_password" "ALTER TABLE crm.contacts RENAME TO contacts2"
+expect_error "readers cannot change policies" 42501 rita rita-password-1 \
+  "ALTER TABLE crm.contacts ALTER COLUMN email UNSET MASKING POLICY"
+expect "who has the role sees raw values" "GRANT" igloo "$admin_password" "GRANT pii_reader TO nora"
+expect "at once" "ann@acme.com|dev-1" nora nora-password-1 "SELECT email, device_id FROM crm.contacts"
+psql_admin -c "REVOKE pii_reader FROM nora" >/dev/null
+expect "policy and tag references" "client_rows|ROW ACCESS POLICY||
+mask_email|MASKING POLICY|email|
+pii_hash|MASKING POLICY|device_id|pii" nora nora-password-1 \
+  "SELECT policy_name, policy_kind, ref_column_name, tag_name FROM igloo.policy_references
+   WHERE ref_entity_name = 'contacts' ORDER BY policy_name"
+expect "tag references" "pii|device_id|device_id" nora nora-password-1 \
+  "SELECT tag_name, tag_value, column_name FROM igloo.tag_references"
+expect_soon "the history names the policies that applied" '["client_rows","mask_email","pii_hash"]' igloo "$admin_password" \
+  "SELECT policies FROM igloo.query_history WHERE user_name = 'nora' AND query_text = 'SELECT * FROM crm.contacts' LIMIT 1"
+login="$(curl -sS -c "$work/nora.cookies" -H 'Content-Type: application/json' \
+  -d '{"user":"nora","password":"nora-password-1"}' "$console/api/login")"
+nora_csrf="$(sed -n 's/.*"csrf":"\([^"]*\)".*/\1/p' <<<"$login")"
+got="$(curl -sS -b "$work/nora.cookies" -H 'Content-Type: application/json' -H "X-CSRF-Token: $nora_csrf" \
+  -d '{"sql":"SELECT email FROM crm.contacts"}' "$console/api/query")"
+if grep -q '"rows":\[\["\*\*\*@acme.com"\]\]' <<<"$got"; then pass "the console shows masked values"; else fail "console with policies: $got"; fi
+# A materialized view is computed through its owner's policies, so it stores
+# only masked values of the rows the owner may see; a reader of it, in no
+# team, sees that and nothing more.
+psql_admin -c "GRANT acme_team TO walt" >/dev/null
+psql_as walt walt-password-1 -c "CREATE MATERIALIZED VIEW crm.contact_mv AS SELECT id, email FROM crm.contacts" >/dev/null || true
+expect "a materialized view holds the owner's masked rows" "1|***@acme.com" rita rita-password-1 \
+  "SELECT id, email FROM crm.contact_mv ORDER BY id"
+mv_dump="$(psql_admin -c "SELECT email FROM crm.contact_mv")" || true
+if grep -q "ann@acme.com\|gus@" <<<"$mv_dump"; then fail "a materialized view stored raw emails: $mv_dump"; else pass "a materialized view stores masked values"; fi
+psql_admin -c "DROP MATERIALIZED VIEW crm.contact_mv" >/dev/null 2>&1 || true
+psql_admin -c "REVOKE acme_team FROM walt" >/dev/null 2>&1 || true
+
 echo "SQL from strings, PIVOT and the read cache"
 expect_error "query() is refused" 42501 rita rita-password-1 "SELECT * FROM query('SELECT * FROM duckdb_secrets()')"
 expect_error "even for admins" 42501 igloo "$admin_password" "SELECT * FROM query('SELECT 1')"
@@ -529,6 +611,7 @@ expect "and do not load their files again" "2" walt walt-password-1 "SELECT coun
 expect "drop a pipe" "DROP PIPE" walt walt-password-1 "DROP PIPE e2e_pipe"
 expect "drop a task" "DROP TASK" walt walt-password-1 "DROP TASK e2e_task"
 expect "drop a materialized view" "DROP MATERIALIZED VIEW" walt walt-password-1 "DROP MATERIALIZED VIEW e2e_sales_totals"
+expect "policies survive a restart" "1|***@acme.com" nora nora-password-1 "SELECT id, email FROM crm.contacts"
 expect "drop a view" "DROP VIEW" walt walt-password-1 "DROP VIEW e2e_big"
 expect_error "a dropped view is gone" 42P01 walt walt-password-1 "DROP VIEW e2e_big"
 

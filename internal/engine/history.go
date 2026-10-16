@@ -246,6 +246,7 @@ func (t historyTypes) queryColumns() []duckdb.ColumnInfo {
 		{Name: "tables_written", T: t.list},
 		{Name: "client_address", T: t.varchar},
 		{Name: "application_name", T: t.varchar},
+		{Name: "policies", T: t.list},
 	}
 }
 
@@ -256,7 +257,8 @@ func queryValues(q audit.Query) []any {
 	}
 	return []any{q.ID, q.SessionID, q.User, q.Role, q.Start, q.Start.Add(q.Duration),
 		float64(q.Duration.Microseconds()) / 1000, q.Outcome, nullString(q.SQLState), rows, q.StatementType, q.Text,
-		nullList(q.TablesRead), nullList(q.TablesWritten), nullString(q.ClientAddress), nullString(q.ApplicationName)}
+		nullList(q.TablesRead), nullList(q.TablesWritten), nullString(q.ClientAddress), nullString(q.ApplicationName),
+		nullList(q.Policies)}
 }
 
 func (t historyTypes) loginColumns() []duckdb.ColumnInfo {

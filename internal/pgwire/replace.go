@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/policy"
 )
 
 // icebergNoReplace is the error DuckDB gives for CREATE OR REPLACE TABLE on
@@ -44,7 +46,7 @@ func parseTableReplace(query string) (tableReplace, bool) {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	staging := append(append([]string{}, name[:len(name)-1]...),
-		name[len(name)-1]+"__igloo_new_"+hex.EncodeToString(b[:]))
+		name[len(name)-1]+policy.StagingMark+hex.EncodeToString(b[:]))
 	return tableReplace{target: name, staging: staging, rest: sc.rest()}, true
 }
 

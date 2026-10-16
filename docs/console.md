@@ -30,8 +30,11 @@ editor. In the results grid: arrow keys move, Enter (or a double click)
 opens a value in full, Ctrl+C (Cmd+C) copies it.
 
 **Data.** Schemas, tables and views with their columns, types and comments, a
-view's definition, and a sample of 100 rows. Query in a worksheet opens a
-worksheet with a `SELECT` on the table.
+view's definition, and a sample of 100 rows. A table's row access policy and
+each column's masking policy and tags show as badges
+([policies](security-policies.md)); the sample shows what policies let the
+signed-in user see. Query in a worksheet opens a worksheet with a `SELECT` on
+the table.
 
 **Query history.** Queries and sign-ins, filtered by user, outcome, time and
 text, read from `igloo.query_history` and `igloo.login_history`. On a server

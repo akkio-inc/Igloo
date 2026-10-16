@@ -176,9 +176,11 @@ cursor, are strings, as the PostgreSQL protocol sends them.
   TLS before publishing the port beyond loopback.
 - **Authorization.** Every statement and metadata call runs as the user, in
   an embedded session of the SQL server, through the same checks as a
-  statement from `psql`: built-in roles, grants, the sandbox. Nothing about
-  Flight SQL bypasses them. A refused statement fails with
-  `PERMISSION_DENIED` and its SQLSTATE in the message, as below.
+  statement from `psql`: built-in roles, grants, the sandbox, and
+  [masking and row access policies](security-policies.md), which rewrite it
+  before it runs and are applied again when a prepared statement runs after
+  they change. Nothing about Flight SQL bypasses them. A refused statement
+  fails with `PERMISSION_DENIED` and its SQLSTATE in the message, as below.
 - **History and metrics.** Statements appear in `igloo.query_history` with
   `client_address` `flight sql <address>` and the client's user agent as
   `application_name`, and count in `igloo_queries_total` like any other.

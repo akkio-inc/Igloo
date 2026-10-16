@@ -40,6 +40,7 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS query_history_time ON igloo_audit.query_history (start_time DESC, query_id DESC)`,
 	`CREATE INDEX IF NOT EXISTS query_history_user ON igloo_audit.query_history (user_name, start_time DESC, query_id DESC)`,
+	`ALTER TABLE igloo_audit.query_history ADD COLUMN IF NOT EXISTS policies text[]`,
 	`CREATE TABLE IF NOT EXISTS igloo_audit.login_history (
 		event_id         text PRIMARY KEY,
 		event_time       timestamptz NOT NULL,
@@ -111,11 +112,12 @@ func (s *PostgresStore) WriteQueries(ctx context.Context, qs []Query) error {
 		}
 		rows[i] = []any{q.ID, q.SessionID, q.User, q.Role, q.Start, q.Duration.Microseconds(), q.Outcome,
 			nullable(q.SQLState), rowCount, q.StatementType, q.Text, nullSlice(q.TablesRead), nullSlice(q.TablesWritten),
-			nullable(q.ClientAddress), nullable(q.ApplicationName)}
+			nullable(q.ClientAddress), nullable(q.ApplicationName), nullSlice(q.Policies)}
 	}
 	return s.copy(ctx, "query_history", "query_id", []string{
 		"query_id", "session_id", "user_name", "role", "start_time", "duration_us", "outcome", "sqlstate",
 		"row_count", "statement_type", "query_text", "tables_read", "tables_written", "client_address", "application_name",
+		"policies",
 	}, rows)
 }
 
@@ -158,7 +160,7 @@ func (s *PostgresStore) copy(ctx context.Context, table, key string, cols []stri
 func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query, error) {
 	rows, err := s.pool.Query(ctx, `SELECT query_id, session_id, user_name, role, start_time, duration_us, outcome,
 			coalesce(sqlstate, ''), coalesce(row_count, -1), statement_type, query_text, tables_read, tables_written,
-			coalesce(client_address, ''), coalesce(application_name, '')
+			coalesce(client_address, ''), coalesce(application_name, ''), policies
 		FROM igloo_audit.query_history
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR start_time >= $2)
@@ -175,7 +177,7 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 			us int64
 		)
 		err := row.Scan(&q.ID, &q.SessionID, &q.User, &q.Role, &q.Start, &us, &q.Outcome, &q.SQLState, &q.Rows,
-			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName)
+			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName, &q.Policies)
 		q.Duration = time.Duration(us) * time.Microsecond
 		return q, err
 	})

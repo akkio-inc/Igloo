@@ -157,16 +157,19 @@ func rewriteSessionUser(query, user string) string {
 	})
 }
 
-// historyViews are the views of the history, in the local database's
-// schema engine.HistorySchema.
-var historyViews = []string{"query_history", "login_history", "task_history", "load_history"}
+// historyViews are the views of the history and of the policies, in the
+// local database's schema engine.HistorySchema.
+var historyViews = []string{"query_history", "login_history", "task_history", "load_history",
+	"policy_references", "tag_references"}
 
-// rewriteHistoryRefs points igloo.query_history and igloo.login_history at
-// the local database, where the views are, whatever the session's search
-// path. Literals, comments and every other name are left as written.
+// rewriteHistoryRefs points igloo.query_history, igloo.login_history and
+// the other historyViews at the local database, where the views are,
+// whatever the session's search path. Literals, comments and every other
+// name are left as written.
 func rewriteHistoryRefs(query, local string) string {
 	lower := strings.ToLower(query)
-	if !strings.Contains(lower, engine.HistorySchema) || !strings.Contains(lower, "_history") {
+	if !strings.Contains(lower, engine.HistorySchema) ||
+		!slices.ContainsFunc(historyViews, func(v string) bool { return strings.Contains(lower, v) }) {
 		return query
 	}
 	type tok struct {

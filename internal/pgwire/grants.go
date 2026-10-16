@@ -516,8 +516,8 @@ func (s *Server) resolveGrantTable(ctx context.Context, sess *session, name []st
 
 // catalogSchema returns the catalog schema called name, in its own case.
 func (s *Server) catalogSchema(ctx context.Context, sess *session, name string) (string, bool, error) {
-	names, err := queryStrings(ctx, sess, `SELECT schema_name FROM duckdb_schemas()
-		WHERE database_name = $1 AND lower(schema_name) = lower($2)`, s.catalogName(), name)
+	names, err := queryStrings(ctx, sess, `SELECT schema_name FROM system.main.duckdb_schemas()
+		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2)`, s.catalogName(), name)
 	if err != nil || len(names) == 0 {
 		return "", false, err
 	}
@@ -527,13 +527,13 @@ func (s *Server) catalogSchema(ctx context.Context, sess *session, name string) 
 // catalogRelations lists the tables and views in a schema of the catalog.
 // Views are the catalog's, whose copies live in the local database.
 func (s *Server) catalogRelations(ctx context.Context, sess *session, schema string) ([]string, error) {
-	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM duckdb_tables()
-		WHERE database_name = $1 AND lower(schema_name) = lower($2) ORDER BY 1`, s.catalogName(), schema)
+	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM system.main.duckdb_tables()
+		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2) ORDER BY 1`, s.catalogName(), schema)
 	if err != nil || s.ddl == nil {
 		return tables, err
 	}
-	views, err := queryStrings(ctx, sess, `SELECT view_name FROM duckdb_views()
-		WHERE database_name = $1 AND lower(schema_name) = lower($2) AND NOT internal ORDER BY 1`,
+	views, err := queryStrings(ctx, sess, `SELECT view_name FROM system.main.duckdb_views()
+		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2) AND NOT internal ORDER BY 1`,
 		s.engine.LocalDatabase(), schema)
 	if err != nil {
 		return nil, err

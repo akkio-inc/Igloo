@@ -54,6 +54,9 @@ type Query struct {
 	TablesWritten   []string
 	ClientAddress   string
 	ApplicationName string
+	// Policies names the masking and row access policies that applied to
+	// the statement; nil when none did.
+	Policies []string
 }
 
 // Login is one login attempt.

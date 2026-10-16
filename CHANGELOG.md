@@ -110,6 +110,24 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`ALTER USER ... NOLOGIN`), which ends their sessions, and given an email
   (`EMAIL`) for single sign-on.
 - Limits on failed logins: 10 per user and 50 per address in 15 minutes.
+- Masking policies, row access policies and tags, after Snowflake's:
+  `CREATE [OR REPLACE] MASKING POLICY`, `CREATE [OR REPLACE] ROW ACCESS
+  POLICY`, `ALTER TABLE ... SET | UNSET MASKING POLICY`, `ADD | DROP ROW ACCESS
+  POLICY`, `CREATE TAG`, `SET | UNSET TAG`, tag-based masking with `ALTER TAG
+  ... SET MASKING POLICY`, `SHOW POLICIES`, `SHOW TAGS`, and the views
+  `igloo.policy_references` and `igloo.tag_references`. Policy expressions can
+  call `current_user`, `is_role_in_session(role)`, `current_available_roles()`
+  and `tag_value(tag)`, and read mapping tables. Policies apply to every user
+  and statement (queries, views, joins, subqueries, `INSERT ... SELECT`,
+  `CREATE TABLE AS`, `COPY`, `UPDATE`, `DELETE`, `MERGE`, cursors, time
+  travel, the web console, and tasks, pipes and materialized views, as
+  their owners), by rewriting statements to read protected tables
+  through them; statements that cannot be rewritten with certainty are
+  refused. The query history records which policies applied, and the
+  console's data browser shows policies and tags. Igloo's checks of
+  statements now call DuckDB's built-in functions by their qualified names,
+  so a session's temporary macros cannot change what grants or policies
+  find.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in
