@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // directory is a store with everything: users, grants, accounts, tokens
@@ -418,7 +419,7 @@ func TestMemoryDirectory(t *testing.T) {
 // TestPostgresDirectory runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresDirectory(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}
@@ -438,7 +439,7 @@ func TestPostgresDirectory(t *testing.T) {
 // TestPostgresAccountsMigration checks that users made by an older
 // version, without this version's columns, get them with defaults.
 func TestPostgresAccountsMigration(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

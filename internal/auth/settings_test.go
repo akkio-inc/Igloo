@@ -3,9 +3,10 @@ package auth
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // testSettingStore checks a SettingStore whose users ana and bob exist,
@@ -89,7 +90,7 @@ func TestMemorySettings(t *testing.T) {
 // TestPostgresSettings runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresSettings(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

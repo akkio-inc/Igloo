@@ -3,14 +3,15 @@ package auth
 import (
 	"bytes"
 	"context"
-	"os"
 	"testing"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // TestSecret runs against a real database when IGLOO_TEST_DATABASE_URL is
 // set (make test starts one).
 func TestSecret(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

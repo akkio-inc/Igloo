@@ -3,9 +3,10 @@ package auth
 import (
 	"context"
 	"errors"
-	"os"
 	"slices"
 	"testing"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 func TestPrivileges(t *testing.T) {
@@ -316,7 +317,7 @@ func (m *memoryUsers) Get(ctx context.Context, name string) (User, error) {
 // TestPostgresGrants runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresGrants(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}
@@ -380,7 +381,7 @@ func TestPostgresGrants(t *testing.T) {
 // TestPostgresRoleNoneMigration checks that a database made by an older
 // version, whose role check lacks none, accepts it after the migration.
 func TestPostgresRoleNoneMigration(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

@@ -3,13 +3,13 @@ package tasks
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/akkio-inc/igloo/internal/audit"
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // testStore checks a Store that starts empty.
@@ -215,7 +215,7 @@ func TestMemoryStore(t *testing.T) {
 // TestPostgresStore runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresStore(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}
@@ -299,7 +299,7 @@ func runSchedulers(t *testing.T, r Runner, schedulers ...*Scheduler) {
 // IGLOO_TEST_DATABASE_URL is set.
 func stores(t *testing.T, test func(t *testing.T, store Store)) {
 	t.Run("memory", func(t *testing.T) { test(t, NewMemoryStore()) })
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		return
 	}

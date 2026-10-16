@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"regexp"
 	"slices"
 	"testing"
@@ -14,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -186,7 +187,7 @@ func TestMemoryLogIsImmediate(t *testing.T) {
 // TestPostgresStore runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresStore(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

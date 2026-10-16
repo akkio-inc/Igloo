@@ -4,9 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 type fakeSchedule map[string]time.Time
@@ -55,7 +56,7 @@ func TestFirstDelay(t *testing.T) {
 }
 
 func TestPostgresSchedule(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

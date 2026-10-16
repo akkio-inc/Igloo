@@ -23,6 +23,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/pgwire"
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // TestConnectionsNeedGrants checks that Flight SQL statements read
@@ -33,7 +34,7 @@ import (
 // postgres extension from IGLOO_TEST_EXTENSION_DIR (scripts/test.sh sets
 // both).
 func TestConnectionsNeedGrants(t *testing.T) {
-	raw, ext := os.Getenv("IGLOO_TEST_DATABASE_URL"), os.Getenv("IGLOO_TEST_EXTENSION_DIR")
+	raw, ext := testdb.URL(), os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if raw == "" || ext == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL or IGLOO_TEST_EXTENSION_DIR not set")
 	}

@@ -3,10 +3,11 @@ package policy
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 var (
@@ -216,7 +217,7 @@ func TestMemoryStore(t *testing.T) {
 // TestPostgresStore runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set (make test starts one).
 func TestPostgresStore(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

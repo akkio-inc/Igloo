@@ -3,10 +3,11 @@ package audit
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 func TestComputeClockSplitsDays(t *testing.T) {
@@ -113,7 +114,7 @@ func TestMemoryUsage(t *testing.T) {
 // TestPostgresUsage runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresUsage(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}
