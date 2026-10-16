@@ -110,6 +110,11 @@ const (
 	flushInterval = time.Second
 	// writeTimeout bounds one batch write.
 	writeTimeout = 10 * time.Second
+	// writeAttempts is how often a batch is written before it is dropped,
+	// retryDelay doubling between attempts (about a minute in all), so a
+	// slow or briefly unavailable metadata database loses nothing.
+	writeAttempts = 6
+	retryDelay    = time.Second
 	// pruneInterval is how often old records are deleted.
 	pruneInterval = time.Hour
 	// warnInterval spaces out warnings about dropped records.
@@ -130,7 +135,28 @@ type Log struct {
 	dropMu   sync.Mutex
 	dropped  int
 	lastWarn time.Time
+
+	// retries are batches whose write failed, oldest first. Only Run
+	// touches them.
+	retries []retry
 }
+
+// retry is a batch of one kind waiting to be written again.
+type retry struct {
+	queries  []Query
+	logins   []Login
+	attempts int
+	next     time.Time
+}
+
+func (r retry) kind() string {
+	if len(r.queries) > 0 {
+		return "query"
+	}
+	return "login"
+}
+
+func (r retry) len() int { return len(r.queries) + len(r.logins) }
 
 // Options configures a Log.
 type Options struct {
@@ -223,6 +249,7 @@ func (l *Log) Run(ctx context.Context) {
 			l.write(context.Background(), batch)
 			batch = batch[:0]
 		}
+		l.retryDue(context.Background(), time.Now(), false)
 	}
 	for {
 		select {
@@ -246,12 +273,14 @@ func (l *Log) Run(ctx context.Context) {
 				}
 			}
 			write()
+			l.retryDue(context.Background(), time.Now(), true)
 			return
 		}
 	}
 }
 
-// write stores a batch of queries and logins, dropping it if that fails.
+// write stores a batch of queries and logins. A part that fails is retried
+// by Run, or dropped for a store written directly.
 func (l *Log) write(ctx context.Context, batch []any) {
 	var (
 		queries []Query
@@ -265,20 +294,69 @@ func (l *Log) write(ctx context.Context, batch []any) {
 			logins = append(logins, r)
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
-	defer cancel()
 	if len(queries) > 0 {
-		if err := l.store.WriteQueries(ctx, queries); err != nil {
-			l.drop("query", len(queries), err.Error())
-		} else {
-			l.metrics.written("query", len(queries))
-		}
+		l.attempt(ctx, retry{queries: queries}, time.Now())
 	}
 	if len(logins) > 0 {
-		if err := l.store.WriteLogins(ctx, logins); err != nil {
-			l.drop("login", len(logins), err.Error())
-		} else {
-			l.metrics.written("login", len(logins))
+		l.attempt(ctx, retry{logins: logins}, time.Now())
+	}
+}
+
+// attempt writes r once. On failure it keeps r for a later attempt, or
+// drops it once it has had writeAttempts.
+func (l *Log) attempt(ctx context.Context, r retry, now time.Time) {
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+	var err error
+	if len(r.queries) > 0 {
+		err = l.store.WriteQueries(ctx, r.queries)
+	} else {
+		err = l.store.WriteLogins(ctx, r.logins)
+	}
+	if err == nil {
+		l.metrics.written(r.kind(), r.len())
+		return
+	}
+	r.attempts++
+	if l.direct || r.attempts >= writeAttempts {
+		l.drop(r.kind(), r.len(), err.Error())
+		return
+	}
+	r.next = now.Add(retryDelay << (r.attempts - 1))
+	l.retries = append(l.retries, r)
+	// Keep the backlog within the queue's size, dropping the oldest.
+	for total := l.backlog(); total > queueSize && len(l.retries) > 0; total = l.backlog() {
+		l.drop(l.retries[0].kind(), l.retries[0].len(), "retry backlog full")
+		l.retries = l.retries[1:]
+	}
+}
+
+func (l *Log) backlog() int {
+	n := 0
+	for _, r := range l.retries {
+		n += r.len()
+	}
+	return n
+}
+
+// retryDue writes the batches due for another attempt, or every waiting
+// batch once more when last is set (Igloo is stopping), dropping what still
+// fails then.
+func (l *Log) retryDue(ctx context.Context, now time.Time, last bool) {
+	if len(l.retries) == 0 {
+		return
+	}
+	waiting := l.retries
+	l.retries = nil
+	for _, r := range waiting {
+		switch {
+		case last:
+			r.attempts = writeAttempts - 1
+			l.attempt(ctx, r, now)
+		case now.Before(r.next):
+			l.retries = append(l.retries, r)
+		default:
+			l.attempt(ctx, r, now)
 		}
 	}
 }

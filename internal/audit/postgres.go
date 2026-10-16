@@ -2,10 +2,12 @@ package audit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -100,11 +102,10 @@ func (s *PostgresStore) WriteQueries(ctx context.Context, qs []Query) error {
 			nullable(q.SQLState), rowCount, q.StatementType, q.Text, nullSlice(q.TablesRead), nullSlice(q.TablesWritten),
 			nullable(q.ClientAddress), nullable(q.ApplicationName)}
 	}
-	_, err := s.pool.CopyFrom(ctx, pgx.Identifier{"igloo_audit", "query_history"}, []string{
+	return s.copy(ctx, "query_history", "query_id", []string{
 		"query_id", "session_id", "user_name", "role", "start_time", "duration_us", "outcome", "sqlstate",
 		"row_count", "statement_type", "query_text", "tables_read", "tables_written", "client_address", "application_name",
-	}, pgx.CopyFromRows(rows))
-	return err
+	}, rows)
 }
 
 func (s *PostgresStore) WriteLogins(ctx context.Context, ls []Login) error {
@@ -113,10 +114,33 @@ func (s *PostgresStore) WriteLogins(ctx context.Context, ls []Login) error {
 		rows[i] = []any{x.ID, x.Time, x.User, x.Result, nullable(x.Reason), nullable(x.ClientAddress),
 			nullable(x.ApplicationName), nullable(x.SessionID)}
 	}
-	_, err := s.pool.CopyFrom(ctx, pgx.Identifier{"igloo_audit", "login_history"}, []string{
+	return s.copy(ctx, "login_history", "event_id", []string{
 		"event_id", "event_time", "user_name", "result", "reason", "client_address", "application_name", "session_id",
-	}, pgx.CopyFromRows(rows))
-	return err
+	}, rows)
+}
+
+// copy writes rows into table with COPY. A batch is written again after a
+// failure (see Log.retry), and a failure such as a timeout can come after
+// the batch committed: COPY then hits rows already there, and the batch is
+// written through a staging table that skips them.
+func (s *PostgresStore) copy(ctx context.Context, table, key string, cols []string, rows [][]any) error {
+	_, err := s.pool.CopyFrom(ctx, pgx.Identifier{"igloo_audit", table}, cols, pgx.CopyFromRows(rows))
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" { // unique_violation
+		return err
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			"CREATE TEMP TABLE staged (LIKE igloo_audit.%s) ON COMMIT DROP", table)); err != nil {
+			return err
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged"}, cols, pgx.CopyFromRows(rows)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, fmt.Sprintf(
+			"INSERT INTO igloo_audit.%s SELECT * FROM staged ON CONFLICT (%s) DO NOTHING", table, key))
+		return err
+	})
 }
 
 func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query, error) {

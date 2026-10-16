@@ -103,10 +103,12 @@ statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
   deleted every hour, by one replica at a time.
 - Without a metadata database, each replica keeps its latest 10,000
   statements and 10,000 logins in memory, lost on restart.
-- Recording never slows down or fails a statement. If the metadata database
-  is unavailable or falls behind, records are dropped: the log warns
-  (`dropped history records`, at most once a minute) and
-  `igloo_audit_dropped_total` counts them.
+- Recording never slows down or fails a statement. Records are written in
+  batches every second; a batch that fails is written again for about a
+  minute, so a slow or briefly unavailable metadata database loses nothing.
+  If it stays unavailable, or falls far enough behind that 10,000 records
+  wait, records are dropped: the log warns (`dropped history records`, at
+  most once a minute) and `igloo_audit_dropped_total` counts them.
 - `IGLOO_AUDIT=false` turns recording off.
 - The views read the history page by page, newest first; `LIMIT` without
   `ORDER BY` reads only the newest pages, while other filters and sorts read
@@ -264,7 +266,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_query_duration_seconds` | `outcome` | Time to run a statement and send its results |
 | `igloo_logins_total` | `result` = `success`, `failure` | Login attempts |
 | `igloo_audit_written_total` | `kind` = `query`, `login` | History records written |
-| `igloo_audit_dropped_total` | `kind` = `query`, `login` | History records dropped because the queue was full or the metadata database failed |
+| `igloo_audit_dropped_total` | `kind` = `query`, `login` | History records dropped because the queue was full or the metadata database failed for about a minute |
 | `igloo_maintenance_passes_total` | `result` = `ok`, `error` | Table maintenance passes run by this replica |
 | `igloo_maintenance_last_success_timestamp_seconds` | | When this replica last finished a maintenance pass without errors |
 | `igloo_maintenance_compacted_files_total`, `igloo_maintenance_compaction_output_files_total` | | Data files replaced and written by compaction |

@@ -220,4 +220,76 @@ func TestPostgresStore(t *testing.T) {
 	if qs, _ := s.Queries(ctx, Viewer{All: true}, Page{}); len(qs) != 15 {
 		t.Errorf("a prune ran while another replica held the lock: %d left", len(qs))
 	}
+
+	// A batch written again, as after a timeout that came once it had
+	// committed, is not an error and adds nothing twice.
+	again := []Query{{ID: "retried-1", User: "ana", Start: time.Now(), Outcome: "ok", StatementType: "SELECT", Text: "SELECT 1"},
+		{ID: "retried-2", User: "ana", Start: time.Now(), Outcome: "ok", StatementType: "SELECT", Text: "SELECT 2"}}
+	for i := range 2 {
+		if err := s.WriteQueries(ctx, again); err != nil {
+			t.Fatalf("write %d: %v", i+1, err)
+		}
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM igloo_audit.query_history WHERE query_id LIKE 'retried-%'").Scan(&n); err != nil || n != 2 {
+		t.Fatalf("retried batch: %d rows, %v; want 2", n, err)
+	}
+	logins := []Login{{ID: "retried-login", User: "ana", Time: time.Now(), Result: "success"}}
+	for i := range 2 {
+		if err := s.WriteLogins(ctx, logins); err != nil {
+			t.Fatalf("login write %d: %v", i+1, err)
+		}
+	}
+}
+
+// flakyStore fails its first fails writes.
+type flakyStore struct {
+	*MemoryStore
+	fails int
+}
+
+func (f *flakyStore) WriteQueries(ctx context.Context, qs []Query) error {
+	if f.fails > 0 {
+		f.fails--
+		return errors.New("timeout: context deadline exceeded")
+	}
+	return f.MemoryStore.WriteQueries(ctx, qs)
+}
+
+func TestFailedWritesAreRetried(t *testing.T) {
+	store := &flakyStore{MemoryStore: NewMemoryStore(100, 100), fails: writeAttempts - 1}
+	l := New(store, Options{}, slog.New(slog.DiscardHandler))
+	l.direct = false // the flaky wrapper hides the memory store
+
+	now := time.Now()
+	l.write(context.Background(), []any{Query{ID: "q1", User: "ana", Start: now}})
+	for i := 0; len(l.retries) > 0 && i < 2*writeAttempts; i++ {
+		// Not due yet: nothing is written.
+		l.retryDue(context.Background(), now, false)
+		now = now.Add(time.Hour)
+		l.retryDue(context.Background(), now, false)
+	}
+	if len(l.retries) != 0 || l.dropped != 0 {
+		t.Fatalf("retries %d, dropped %d", len(l.retries), l.dropped)
+	}
+	got, err := l.Queries(context.Background(), Viewer{All: true}, Page{})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("history %v, %v; want the one query", got, err)
+	}
+}
+
+func TestWritesThatKeepFailingAreDropped(t *testing.T) {
+	store := &flakyStore{MemoryStore: NewMemoryStore(100, 100), fails: 100}
+	l := New(store, Options{}, slog.New(slog.DiscardHandler))
+	l.direct = false
+
+	now := time.Now()
+	l.write(context.Background(), []any{Query{ID: "q1", User: "ana", Start: now}})
+	for i := 0; i < 2*writeAttempts; i++ {
+		now = now.Add(time.Hour)
+		l.retryDue(context.Background(), now, false)
+	}
+	if attempts := 100 - store.fails; len(l.retries) != 0 || attempts != writeAttempts {
+		t.Fatalf("retries %d after %d attempts; want the query dropped after %d", len(l.retries), attempts, writeAttempts)
+	}
 }
