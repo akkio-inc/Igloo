@@ -27,10 +27,11 @@ const attachRetryInterval = 2 * time.Second
 
 // Extensions are the DuckDB extensions Igloo uses: object storage (httpfs,
 // aws, azure), Iceberg (which reads manifests with avro), TPC-H data for
-// demos and benchmarks, the read cache (cache_httpfs, see cache.go), and
-// geospatial functions and sketches (see media.go). The image installs them
-// at build time.
-var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs"}, mediaExtensions...)
+// demos and benchmarks, the read cache (cache_httpfs, see cache.go),
+// geospatial functions and sketches (see media.go), and connections to
+// PostgreSQL and MySQL databases (see package federation), which are loaded
+// only when a connection needs them. The image installs them at build time.
+var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs", "postgres", "mysql"}, mediaExtensions...)
 
 // communityExtensions come from DuckDB's community repository rather than
 // the core one. DuckDB checks their signatures on load just the same.
@@ -66,7 +67,11 @@ type Engine struct {
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
 // retrying the attach until ctx is done. Once set up, DuckDB is locked down
 // so SQL cannot reach files or URLs outside the warehouse.
-func Open(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engine, error) {
+func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Option) (*Engine, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	connector, err := duckdb.NewConnector(cfg.DuckDB.Path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -78,7 +83,7 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engine, er
 	}
 
 	e := &Engine{connector: connector, parser: p}
-	if err := e.setup(ctx, cfg, log); err != nil {
+	if err := e.setup(ctx, cfg, log, o); err != nil {
 		p.close()
 		return nil, errors.Join(err, connector.Close())
 	}
@@ -178,7 +183,7 @@ func (e *Engine) Close() error {
 	return e.connector.Close()
 }
 
-func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger) error {
+func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger, o options) error {
 	c, err := e.connector.Connect(ctx)
 	if err != nil {
 		return fmt.Errorf("connect to duckdb: %w", err)
@@ -222,6 +227,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger)
 					return fmt.Errorf("load extensions: %w", err)
 				}
 			}
+		}
+		if err := beforeLockdown(ctx, conn, o); err != nil {
+			return err
 		}
 		return e.lockDown(exec, cfg)
 	}
@@ -278,6 +286,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger)
 	}
 	e.catalog = cfg.Catalog.Name
 
+	if err := beforeLockdown(ctx, conn, o); err != nil {
+		return err
+	}
 	if err := e.lockDown(exec, cfg); err != nil {
 		return err
 	}

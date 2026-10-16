@@ -50,6 +50,10 @@ type Config struct {
 	// MetadataDatabaseURL is the Postgres database that stores users. Empty
 	// means the administrator is the only account.
 	MetadataDatabaseURL string
+	// ConnectionSecretsDir holds files with the passwords of connections to
+	// other databases, which a connection names with password_secret.
+	// Empty means connections store their passwords.
+	ConnectionSecretsDir string
 
 	// StatementTimeout cancels statements that run longer, unless a session
 	// sets its own statement_timeout. Zero means no limit.
@@ -287,6 +291,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		},
 	}
 
+	cfg.ConnectionSecretsDir = get("IGLOO_CONNECTION_SECRETS_DIR", "")
+
 	var errs []error
 	addErr := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
 
@@ -295,6 +301,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if !ValidName(cfg.AdminUser) {
 		addErr("IGLOO_ADMIN_USER %q must be a lowercase name of letters, digits and underscores", cfg.AdminUser)
+	}
+	if cfg.ConnectionSecretsDir != "" && !strings.HasPrefix(cfg.ConnectionSecretsDir, "/") {
+		addErr("IGLOO_CONNECTION_SECRETS_DIR %q must be an absolute path", cfg.ConnectionSecretsDir)
 	}
 
 	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
