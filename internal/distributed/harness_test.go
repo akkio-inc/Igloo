@@ -58,6 +58,8 @@ func (s fileSource) Files(_ context.Context, t *Table) ([]File, error) {
 	return s.h.files[t.key()], nil
 }
 
+func (s fileSource) Refresh(context.Context, *Table) error { return nil }
+
 func (s fileSource) RemoveAll(_ context.Context, _ *Table, dir string) error {
 	s.h.removed = append(s.h.removed, dir)
 	return os.RemoveAll(dir)
@@ -94,6 +96,12 @@ func (e harnessEnv) Describe(ctx context.Context, query string) ([]Column, error
 }
 
 func (e harnessEnv) UserFunction(context.Context, string) (bool, error) { return false, nil }
+
+func (e harnessEnv) Setting(ctx context.Context, name string) (string, error) {
+	var v string
+	err := e.h.session.QueryRowContext(ctx, "SELECT current_setting("+quoteLiteral(name)+")::VARCHAR").Scan(&v)
+	return v, err
+}
 
 // connector adapts a DuckDB connector to Connector.
 type connector struct{ c *duckdb.Connector }
@@ -267,11 +275,11 @@ func (h *harness) startWorker(i int) {
 // run plans and executes query distributed and returns its rows, or
 // ok = false if it ran on one machine.
 func (h *harness) run(ctx context.Context, query string, mode Mode) (rows [][]any, cols []string, plan *Plan, ex *Execution, err error) {
-	plan, err = h.co.Plan(ctx, query, harnessEnv{h}, mode, h.settings(ctx))
+	plan, err = h.co.Plan(ctx, query, harnessEnv{h}, mode)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	ex, err = h.co.Execute(ctx, plan)
+	ex, err = h.co.Execute(ctx, plan, h.settings(ctx))
 	if err != nil {
 		return nil, nil, plan, nil, err
 	}

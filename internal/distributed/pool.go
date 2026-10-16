@@ -101,6 +101,18 @@ func newPool(opts PoolOptions, t *transport, version string, metrics *Metrics, l
 	}
 }
 
+// known returns the workers that answered the last check, checking now
+// only if there has been none.
+func (p *pool) known(ctx context.Context) []*worker {
+	p.mu.Lock()
+	ws, checked := p.workers, !p.refreshed.IsZero()
+	p.mu.Unlock()
+	if !checked {
+		ws = p.refresh(ctx)
+	}
+	return p.usable(ws)
+}
+
 // ready returns the workers that answer, checking again if the last check
 // is more than a couple of seconds old.
 func (p *pool) ready(ctx context.Context) []*worker {
@@ -288,14 +300,13 @@ func (p *pool) touch() {
 	p.mu.Unlock()
 }
 
-// run stops idle workers until ctx is done: once this coordinator has not
-// used them for IdleAfter and every worker reports as long without tasks,
-// so workers another coordinator uses keep running.
+// run checks the workers every few seconds, so statements decide from a
+// recent view of them without waiting, and stops idle workers until ctx is
+// done: once this coordinator has not used them for IdleAfter and every
+// worker reports as long without tasks, so workers another coordinator
+// uses keep running.
 func (p *pool) run(ctx context.Context) {
-	if !p.canStart() {
-		return
-	}
-	tick := time.NewTicker(15 * time.Second)
+	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
 		select {
@@ -303,13 +314,16 @@ func (p *pool) run(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
+		ws := p.refresh(ctx)
+		if !p.canStart() {
+			continue
+		}
 		p.mu.Lock()
 		idle := time.Since(p.used) >= p.opts.IdleAfter
 		p.mu.Unlock()
 		if !idle {
 			continue
 		}
-		ws := p.refresh(ctx)
 		busy := slices.ContainsFunc(ws, func(w *worker) bool {
 			return w.status.Running > 0 || time.Duration(w.status.IdleSeconds*float64(time.Second)) < p.opts.IdleAfter
 		})

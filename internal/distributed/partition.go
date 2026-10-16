@@ -103,9 +103,15 @@ func (pl *planner) partition(c *candidate, other *tableUse) (*partitionPlan, err
 		if !ok {
 			return nil, unsupported("join key %s (%s) = %s (%s) of different types", k[0], tf, k[1], tg)
 		}
-		if strings.HasPrefix(tf, "VARCHAR") && pl.opts.collation != "" {
-			// Equal under a collation is not equal hashes.
-			return nil, unsupported("a text join key under collation %s", pl.opts.collation)
+		if strings.HasPrefix(tf, "VARCHAR") {
+			// Values equal under a collation do not hash alike.
+			collation, err := pl.env.Setting(pl.ctx, "default_collation")
+			if err != nil {
+				return nil, err
+			}
+			if collation != "" {
+				return nil, unsupported("a text join key under collation %s", collation)
+			}
 		}
 		p.casts = append(p.casts, cast)
 	}

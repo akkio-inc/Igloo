@@ -80,6 +80,9 @@ func (s *lakeSource) Files(_ context.Context, t *distributed.Table) ([]distribut
 	return s.files[t.Schema+"."+t.Name], nil
 }
 
+// Refresh does nothing: Table wrote the table's current rows.
+func (s *lakeSource) Refresh(context.Context, *distributed.Table) error { return nil }
+
 func (s *lakeSource) RemoveAll(_ context.Context, _ *distributed.Table, dir string) error {
 	return os.RemoveAll(dir)
 }

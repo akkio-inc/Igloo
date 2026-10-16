@@ -16,7 +16,7 @@ func (h *harness) partitioned(query string) bool {
 	if !h.check(query) {
 		return false
 	}
-	plan, err := h.co.Plan(context.Background(), query, harnessEnv{h}, ModeOn, h.settings(context.Background()))
+	plan, err := h.co.Plan(context.Background(), query, harnessEnv{h}, ModeOn)
 	if err != nil {
 		h.t.Fatal(err)
 	}

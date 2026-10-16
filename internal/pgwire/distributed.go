@@ -85,13 +85,8 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || sess.mode() == distributed.ModeOff {
 		return 0, false, nil
 	}
-	settings, err := s.distributedSettings(ctx, sess)
-	if err != nil {
-		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-		return 0, false, nil
-	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
-	plan, err := s.dist.Plan(ctx, st.query, env, sess.mode(), settings)
+	plan, err := s.dist.Plan(ctx, st.query, env, sess.mode())
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, true, ctx.Err()
@@ -103,7 +98,12 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		return 0, false, nil
 	}
-	ex, err := s.dist.Execute(ctx, plan)
+	settings, err := s.distributedSettings(ctx, sess)
+	if err != nil {
+		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+		return 0, false, nil
+	}
+	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:
@@ -255,8 +255,9 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 	if err != nil {
 		return nil, false, err
 	}
-	// Workers must read the columns as DuckDB does here.
-	cols, err := e.Describe(ctx, "SELECT * FROM "+quoteIdent(catalogName)+"."+quoteIdent(o.schema)+"."+quoteIdent(o.name))
+	// Workers must read the columns as DuckDB does here. The statement was
+	// bound, so DuckDB has loaded them.
+	cols, err := tableColumns(ctx, e.sess, catalogName, o.schema, o.name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -276,6 +277,35 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		}
 	}
 	return t, true, nil
+}
+
+// tableColumns lists a table's columns as DuckDB has them.
+func tableColumns(ctx context.Context, sess *session, db, schema, table string) ([]distributed.Column, error) {
+	rows, err := sess.conn.QueryContext(ctx, `SELECT column_name, data_type FROM duckdb_columns()
+		WHERE database_name = $1 AND schema_name = $2 AND table_name = $3 ORDER BY column_index`,
+		[]driver.NamedValue{{Ordinal: 1, Value: db}, {Ordinal: 2, Value: schema}, {Ordinal: 3, Value: table}})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var cols []distributed.Column
+	dest := make([]driver.Value, 2)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return cols, nil
+			}
+			return nil, err
+		}
+		name, _ := dest[0].(string)
+		typ, _ := dest[1].(string)
+		cols = append(cols, distributed.Column{Name: name, Type: typ})
+	}
+}
+
+// Setting returns the session's value of a DuckDB setting.
+func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
+	return settingValue(ctx, e.sess.conn, name)
 }
 
 // Describe binds query on the session's connection.

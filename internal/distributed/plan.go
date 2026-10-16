@@ -42,6 +42,8 @@ type Env interface {
 	// defined rather than one built into DuckDB. Only built-in functions
 	// behave the same on every machine.
 	UserFunction(ctx context.Context, name string) (bool, error)
+	// Setting returns the session's value of a DuckDB setting.
+	Setting(ctx context.Context, name string) (string, error)
 }
 
 // Column is a column of a table or a result.
@@ -82,8 +84,6 @@ type Plan struct {
 	final node
 	// force uses every worker, whatever the tables' sizes.
 	force bool
-	// settings are the session's, which tasks run with.
-	settings []Setting
 }
 
 // Job is one part of a statement that workers run in parallel.
@@ -129,8 +129,6 @@ type planOptions struct {
 	// now is what the statement's now() and current_date stand for, so
 	// every machine sees the same time.
 	now time.Time
-	// collation is the session's default_collation.
-	collation string
 }
 
 // planner plans one statement.

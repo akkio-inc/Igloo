@@ -172,20 +172,18 @@ func (co *Coordinator) Metrics() *Metrics { return co.opts.Metrics }
 func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.ready(ctx)) }
 
 // Plan decides whether a statement runs distributed and, if so, how. query
-// is the statement as the session prepared it, settings the session's
-// values of SettingNames. An error for which IsUnsupported is true means
-// it runs on the coordinator as usual.
-func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode, settings []Setting) (*Plan, error) {
+// is the statement as the session prepared it. An error for which
+// IsUnsupported is true means it runs on the coordinator as usual.
+//
+// Every SELECT comes here, so deciding is cheap: workers are known from the
+// last background check, and tables' sizes may be a few seconds old.
+// Execute reads the tables' current snapshots.
+func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode) (*Plan, error) {
 	if mode == ModeOff {
 		return nil, unsupported("distributed execution is off for this session")
 	}
 	opts := planOptions{force: mode == ModeOn, now: time.Now(), maxBroadcast: defaultBroadcast}
-	for _, s := range settings {
-		if strings.EqualFold(s.Name, "default_collation") {
-			opts.collation = s.Value
-		}
-	}
-	ws := co.pool.ready(ctx)
+	ws := co.pool.known(ctx)
 	rate := int64(co.opts.Threads) * scanRatePerThread
 	switch {
 	case len(ws) > 0:
@@ -217,7 +215,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if err != nil {
 		return nil, err
 	}
-	plan.force, plan.settings = opts.force, settings
+	plan.force = opts.force
 	return plan, nil
 }
 
@@ -244,11 +242,10 @@ var ErrNoWorkers = errors.New("no workers available")
 // Setting is a session setting a statement runs with.
 type Setting = setting
 
-// Execute runs a plan's jobs on workers. An error that is not a
-// *duckdb.Error from the data, nor the context's, means the statement
-// should run on the coordinator instead.
-func (co *Coordinator) Execute(ctx context.Context, plan *Plan) (*Execution, error) {
-	settings := plan.settings
+// Execute runs a plan's jobs on workers, with the session's values of
+// SettingNames. An error that is not a *duckdb.Error from the data, nor the
+// context's, means the statement should run on the coordinator instead.
+func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setting) (*Execution, error) {
 	start := time.Now()
 	ex := &Execution{dir: filepath.Join(co.dir, newID())}
 	if err := os.MkdirAll(ex.dir, 0o700); err != nil {
@@ -281,7 +278,8 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan) (*Execution, err
 	slices.SortFunc(ws, func(a, b *worker) int { return strings.Compare(a.status.ID, b.status.ID) })
 	co.pool.touch()
 
-	// Each table's files, once per statement.
+	// Each table's current snapshot and its files, once per statement, so
+	// the statement sees every commit made before it.
 	files := map[string][]File{}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
@@ -295,6 +293,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan) (*Execution, err
 				continue
 			}
 			g.Go(func() error {
+				if err := co.opts.Source.Refresh(gctx, v.Table); err != nil {
+					return err
+				}
 				fs, err := co.opts.Source.Files(gctx, v.Table)
 				mu.Lock()
 				files[v.Table.key()] = fs

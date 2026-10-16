@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
@@ -18,10 +20,13 @@ import (
 
 // Source finds the data files of catalog tables.
 type Source interface {
-	// Table returns schema.name at its current snapshot, with its columns
-	// named and typed as DuckDB reads them. Workers cannot read it if
-	// Unsupported is set.
+	// Table returns schema.name, with its columns named and typed as DuckDB
+	// reads them. Workers cannot read it if Unsupported is set. Its snapshot
+	// may be a few seconds old: it decides only whether to distribute.
 	Table(ctx context.Context, schema, name string) (*Table, error)
+	// Refresh brings t to the table's current snapshot. It fails if the
+	// table's columns changed since.
+	Refresh(ctx context.Context, t *Table) error
 	// Files lists the data files of t's snapshot.
 	Files(ctx context.Context, t *Table) ([]File, error)
 	// RemoveAll deletes the files under dir, with the storage access t is
@@ -45,14 +50,25 @@ type Iceberg struct {
 	mu    sync.Mutex
 	files map[string][]File
 	order []string
+	// tables are recently loaded tables, for deciding.
+	tables map[string]loadedTable
 }
+
+type loadedTable struct {
+	t  *Table
+	at time.Time
+}
+
+// tableTTL is how long a loaded table's metadata decides whether a
+// statement is distributed.
+const tableTTL = 10 * time.Second
 
 // maxCachedSnapshots bounds the snapshots whose file lists are kept.
 const maxCachedSnapshots = 256
 
 // NewIceberg reads tables through cat.
 func NewIceberg(cat *catalog.Client) *Iceberg {
-	return &Iceberg{cat: cat, files: map[string][]File{}}
+	return &Iceberg{cat: cat, files: map[string][]File{}, tables: map[string]loadedTable{}}
 }
 
 type icebergHandle struct {
@@ -60,8 +76,55 @@ type icebergHandle struct {
 	snap *table.Snapshot
 }
 
-// Table loads a table's current metadata.
+// Table returns a table's metadata, loaded at most tableTTL ago.
 func (s *Iceberg) Table(ctx context.Context, schema, name string) (*Table, error) {
+	key := schema + "\x00" + name
+	s.mu.Lock()
+	lt, ok := s.tables[key]
+	s.mu.Unlock()
+	if ok && time.Since(lt.at) < tableTTL {
+		c := *lt.t
+		c.Columns = slices.Clone(lt.t.Columns)
+		return &c, nil
+	}
+	t, err := s.load(ctx, schema, name)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if len(s.tables) > 4096 {
+		clear(s.tables)
+	}
+	s.tables[key] = loadedTable{t: t, at: time.Now()}
+	s.mu.Unlock()
+	c := *t
+	c.Columns = slices.Clone(t.Columns)
+	return &c, nil
+}
+
+// Refresh loads the table's current metadata into t.
+func (s *Iceberg) Refresh(ctx context.Context, t *Table) error {
+	fresh, err := s.load(ctx, t.Schema, t.Name)
+	if err != nil {
+		return err
+	}
+	if len(fresh.Columns) != len(t.Columns) {
+		return unsupported("the columns of %s changed", t)
+	}
+	for i, c := range fresh.Columns {
+		if c.ID != t.Columns[i].ID || !strings.EqualFold(c.Name, t.Columns[i].Name) {
+			return unsupported("the columns of %s changed", t)
+		}
+	}
+	if fresh.Unsupported != "" {
+		return unsupported("table %s: %s", t, fresh.Unsupported)
+	}
+	t.Bytes, t.Snapshot, t.source = fresh.Bytes, fresh.Snapshot, fresh.source
+	return nil
+}
+
+// load loads a table's current metadata from the catalog.
+func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error) {
 	tbl, err := s.cat.LoadTable(ctx, catalog.Ident(schema, name))
 	if err != nil {
 		return nil, fmt.Errorf("load %s.%s: %w", schema, name, err)
