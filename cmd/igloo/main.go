@@ -39,6 +39,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/notify"
+	"github.com/akkio-inc/igloo/internal/openlineage"
 	"github.com/akkio-inc/igloo/internal/pgwire"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/scim"
@@ -229,6 +230,24 @@ func serve() error {
 		<-historyDone
 	}()
 
+	var lineage pgwire.LineageSink
+	if cfg.OpenLineage.URL != "" {
+		ol, err := openlineage.New(openlineage.Options{URL: cfg.OpenLineage.URL, APIKey: cfg.OpenLineage.APIKey,
+			Namespace: cfg.OpenLineage.Namespace, AllowPrivate: cfg.OpenLineage.AllowPrivate, SendSQL: cfg.OpenLineage.SendSQL,
+			Registerer: reg, Log: log})
+		if err != nil {
+			return err
+		}
+		if history == nil {
+			log.Warn("IGLOO_OPENLINEAGE_URL has no effect without the query history (IGLOO_AUDIT=false)")
+		}
+		// Events are sent until the server has shut down.
+		lineageCtx, stopLineage := context.WithCancel(context.Background())
+		defer stopLineage()
+		go ol.Run(lineageCtx)
+		lineage = ol
+	}
+
 	var shares *sharing.Service
 	if proxy != nil && cat != nil {
 		sharingCtx, cancelSharing := context.WithTimeout(ctx, startupTimeout)
@@ -298,6 +317,7 @@ func serve() error {
 		Federation:          fed,
 		Notify:              notifier,
 		Clones:              clones,
+		Lineage:             lineage,
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single

@@ -79,6 +79,7 @@ type Config struct {
 	Storage     Storage
 	Maintenance Maintenance
 	Audit       Audit
+	OpenLineage OpenLineage
 	// OIDC configures single sign-on to the web console (see sso.go).
 	OIDC OIDC
 	// TokenMaxLifetime caps how long an access token may last.
@@ -92,6 +93,19 @@ type Audit struct {
 	Enabled bool
 	// Retention is how long history is kept.
 	Retention time.Duration
+}
+
+// OpenLineage configures sending lineage events (package openlineage).
+type OpenLineage struct {
+	// URL is the endpoint; empty sends nothing.
+	URL    string
+	APIKey string
+	// Namespace names Igloo's jobs and tables in events.
+	Namespace string
+	// AllowPrivate allows an endpoint at a private or loopback address.
+	AllowPrivate bool
+	// SendSQL includes statements' text in events.
+	SendSQL bool
 }
 
 // Cache keeps local copies of the table files Igloo reads from object
@@ -413,6 +427,20 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_AUDIT_RETENTION must be a positive duration such as 90d or 720h, got %q", get("IGLOO_AUDIT_RETENTION", ""))
 	} else {
 		cfg.Audit.Retention = d
+	}
+
+	cfg.OpenLineage.URL = get("IGLOO_OPENLINEAGE_URL", "")
+	cfg.OpenLineage.APIKey = get("IGLOO_OPENLINEAGE_API_KEY", "")
+	cfg.OpenLineage.Namespace = get("IGLOO_OPENLINEAGE_NAMESPACE", "igloo")
+	for name, dst := range map[string]*bool{
+		"IGLOO_OPENLINEAGE_ALLOW_PRIVATE": &cfg.OpenLineage.AllowPrivate,
+		"IGLOO_OPENLINEAGE_SEND_SQL":      &cfg.OpenLineage.SendSQL,
+	} {
+		v, err := strconv.ParseBool(get(name, "false"))
+		if err != nil {
+			addErr("%s must be true or false: %w", name, err)
+		}
+		*dst = v
 	}
 
 	setup, err := strconv.ParseBool(get("IGLOO_CATALOG_SETUP", "true"))
