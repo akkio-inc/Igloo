@@ -95,6 +95,9 @@ the official TPC-H answers.
 - **[Scale to zero](docs/scale-to-zero.md)**: a small gateway stops Igloo's
   machines or pods when nobody uses them and starts them when a client
   connects, on AWS, Google Cloud, Azure or Kubernetes.
+- **[Read cache](docs/operations.md#read-cache)**: table files read from
+  object storage are kept on local disk across restarts, so the first
+  queries after a start (or a scale-to-zero resume) do not fetch them again.
 - **[Web console](docs/console.md)** at `http://127.0.0.1:8443`: SQL
   worksheets, a data browser, query history, and user and compute
   administration, signed in with the same users as SQL clients.
@@ -170,6 +173,10 @@ PostgreSQL License).
 - **Grants stop at tables.** Views run with the querying user's privileges,
   and there are no column masks, row filters or column privileges yet. Table
   and column names are visible to every user.
+- **Scale to zero saves node costs on one machine, not yet in the cloud
+  modules.** The AWS, Google Cloud and Azure modules run Igloo on their
+  general node pool, so scaling its pods to zero does not release nodes
+  ([details](docs/scale-to-zero.md#on-kubernetes)).
 - **Keys are not enforced.** `PRIMARY KEY` and `UNIQUE` on Iceberg tables are
   accepted but not checked, so duplicates are possible. `NOT NULL` is
   enforced.
