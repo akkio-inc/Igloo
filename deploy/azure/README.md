@@ -256,6 +256,8 @@ updates the autoscaler briefly adds an Igloo node (up to `igloo_node_max_count`)
 ## Operations
 
 - **Upgrade Igloo**: set `image_tag` and run `tofu apply`.
+- **Pull from a mirror or private registry**: set `image_repository`; empty
+  uses the chart's default. The AKS nodes must be able to pull from it.
 - **Scale**: `replica_count` adds Igloo pods; the node pool autoscales between
   `igloo_node_min_count` and `igloo_node_max_count`. Keep the maximum above
   `replica_count` so rolling updates can add a node.

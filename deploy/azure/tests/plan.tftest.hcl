@@ -271,7 +271,8 @@ run "chart_values_for_azure" {
   command = plan
 
   variables {
-    image_tag = "0.1.0"
+    image_tag        = "0.1.0"
+    image_repository = "registry.example.com/mirror/igloo"
   }
 
   assert {
@@ -340,6 +341,11 @@ run "chart_values_for_azure" {
       yamldecode(helm_release.igloo[0].values[0]).resources.limits.memory == "24Gi"
     )
     error_message = "image tag, replicas and sizing must be passed through"
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).image.repository == "registry.example.com/mirror/igloo"
+    error_message = "image_repository must be passed through"
   }
 
   assert {
@@ -479,6 +485,11 @@ run "infrastructure_only" {
   assert {
     condition     = yamldecode(output.helm_values).catalog.systemCredentials == "azure"
     error_message = "the helm_values output must hold the chart values"
+  }
+
+  assert {
+    condition     = !contains(keys(yamldecode(output.helm_values).image), "repository")
+    error_message = "an empty image_repository must leave the chart's default repository"
   }
 }
 

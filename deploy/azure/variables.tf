@@ -451,7 +451,7 @@ variable "helm_timeout_seconds" {
 }
 
 variable "image_repository" {
-  description = "Igloo image repository. Empty uses the chart default (ghcr.io/akkio-inc/igloo)."
+  description = "Igloo image repository, for a mirror or private registry. Empty uses the chart's default."
   type        = string
   default     = ""
 }
