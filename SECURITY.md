@@ -183,6 +183,20 @@ reference for every setting mentioned here.
   only admins see others'. The functions behind the views decide what to
   show from the session running them, so calling them directly shows no
   more.
+- **Catalog.** The [catalog](docs/catalog.md) (descriptions, owners, sizes,
+  usage and lineage, in `igloo.tables` and the other catalog views,
+  `information_schema`'s additions, `igloo_comments()`, the policy and tag
+  references, and the console's search and pages) shows users with the role
+  none only the tables and views they have a grant on or own, and their
+  schemas; of the others it shows nothing, not even names. A lineage edge
+  to a table they may not see shows that end unnamed, and the statement
+  that made an edge shows only to those who may see it in the history.
+  Owning an object lets its owner set its comments and hand it on, and
+  grants nothing else. Lineage events go only to the endpoint Igloo is
+  configured with (`IGLOO_OPENLINEAGE_URL`), over `https`, never to a
+  link-local address and to private ones only when allowed, without
+  following redirects, and carry no query results, nor statements' text
+  unless configured.
 - **Loading and scheduled work.** `COPY INTO` loads only from the warehouse
   and `IGLOO_ALLOWED_LOCATIONS`, never the server's own directories, and is
   checked as the `INSERT ... SELECT FROM read_csv(...)` statements it runs,

@@ -29,7 +29,8 @@ databases are catalogs of their own, such as `crm.public.customers`.
 | `ALTER TABLE ... RENAME TO`, `ADD COLUMN`, `DROP COLUMN` | Yes |
 | `CREATE OR REPLACE TABLE` | Yes, outside transactions; see below |
 | `CREATE [OR REPLACE] VIEW`, `DROP VIEW` | Yes, outside transactions; see [views](#views) |
-| `COMMENT ON TABLE`, `VIEW`, `COLUMN` | Yes; see [comments](#comments) |
+| `COMMENT ON SCHEMA`, `TABLE`, `VIEW`, `COLUMN` | Yes; see [comments](#comments) |
+| `ALTER TABLE`, `VIEW`, `SCHEMA ... OWNER TO` | Yes; see [the catalog](catalog.md#owners) |
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
 | `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
@@ -80,24 +81,29 @@ DROP VIEW IF EXISTS recent_orders;
 ## Comments
 
 ```sql
+COMMENT ON SCHEMA public IS 'Shared tables';
 COMMENT ON TABLE orders IS 'One row per order';
 COMMENT ON COLUMN orders.o_totalprice IS 'In dollars';
 COMMENT ON VIEW order_totals IS 'Updated live';
 COMMENT ON TABLE orders IS NULL;  -- remove
 ```
 
-Comments are stored as Iceberg metadata: a `comment` table property and the
-columns' doc strings, which Spark and Trino also read. Clients see them as
-in PostgreSQL, through `obj_description`, `col_description` and
-`pg_description` (psql's `\dt+` and `\d+` show them), and in one listing:
+Comments are stored as Iceberg metadata: a `comment` property of the table,
+view or namespace and the columns' doc strings, which Spark and Trino also
+read. Clients see them as in PostgreSQL, through `obj_description`,
+`col_description` and `pg_description` (psql's `\dt+` and `\d+` show them),
+in `information_schema`, in the [catalog's views](catalog.md) such as
+`igloo.tables`, and in one listing:
 
 ```sql
 SELECT table_schema, table_name, column_name, comment FROM igloo_comments();
 ```
 
-A replica rereads every table's comments at most every 30 seconds, when a
-query reads them, so comments set on another replica can take that long to
-appear.
+Each user sees the comments of the objects they may see (see
+[the catalog](catalog.md#who-sees-what)). Owners of an object may comment on
+it too. A replica rereads every table's comments in the background every 30
+seconds while queries read them, so comments set on another replica can take
+that long to appear.
 
 ## Roles and grants
 
@@ -149,7 +155,8 @@ works and what it means:
   including the target of `UPDATE`, `DELETE` and `MERGE`, the query of
   `CREATE TABLE AS`, and the tables behind every view (see below). They can
   read the system catalogs (`information_schema`, `pg_catalog`, the
-  `duckdb_*` functions, `igloo_comments()`) and their own
+  `duckdb_*` functions, the [catalog's views](catalog.md), which show them
+  only what they may see) and their own
   [history](#query-history), but not files: `read_parquet`, `read_csv`,
   `iceberg_scan`, `iceberg_metadata`, `glob`, `COPY ... FROM` and similar
   functions could read any table's files directly. Statements Igloo cannot
@@ -208,7 +215,8 @@ statement, how policies apply and what they refuse.
 
 Every statement and login is recorded: `igloo.query_history` and
 `igloo.login_history` list them, newest first. Admins see everyone's;
-other users see their own.
+other users see their own. The [catalog](catalog.md) works out lineage and
+table usage from it.
 
 ```sql
 SELECT start_time, user_name, outcome, duration_ms, query_text
@@ -229,12 +237,14 @@ FROM igloo.login_history WHERE result = 'failure';
 | `row_count` | Rows returned or changed, when known |
 | `statement_type` | Such as `SELECT`, `CREATE TABLE` or `GRANT` |
 | `query_text` | The statement as sent, with passwords and secrets replaced by `'***'` |
-| `tables_read`, `tables_written` | Catalog tables the statement used, when Igloo checked them against grants; `NULL` otherwise |
+| `tables_read`, `tables_written` | Catalog tables the statement read and wrote: for users with the role none, those their grants were checked for; for others, those its text names, views expanded, as worked out after it ran (see [lineage](catalog.md#lineage)); `NULL` when Igloo could not tell |
 | `client_address`, `application_name` | Where the session came from |
 | `policies` | The masking and row access policies that applied to the statement; `NULL` when none did |
 | `query_tag`, `pool` | The session's [query tag](workload-management.md#query-tags), and the compute pool of the replica that ran it |
 | `queued_ms` | Time it waited for its [role limits](workload-management.md#role-limits) |
 | `cpu_time_ms`, `bytes_read`, `memory_allocated_bytes` | What DuckDB measured while it ran; `NULL` for statements DuckDB did not run and ones that failed (see [resources](workload-management.md#resources-in-the-history)) |
+| `locations_read` | Locations outside the catalog that it read files from: `COPY INTO`'s, and the files a function such as `read_parquet` names |
+| `job` | The task, pipe or materialized view it ran for, such as `task nightly`; `NULL` for a session's own statements |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,

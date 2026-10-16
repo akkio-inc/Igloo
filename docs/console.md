@@ -1,8 +1,9 @@
 # Web console
 
 Igloo serves a web console for running SQL and looking after the
-warehouse from a browser: worksheets, a data browser, query history, tasks
-and loads, and pages for administrators to manage users, roles and grants, and to watch the
+warehouse from a browser: worksheets, a data browser, a catalog with owners,
+descriptions and lineage, query history, tasks and loads, and pages for
+administrators to manage users, roles and grants, and to watch the
 replica's sessions. It is part of the `igloo` binary; there is nothing else to
 install or run.
 
@@ -34,7 +35,19 @@ view's definition, and a sample of 100 rows. A table's row access policy and
 each column's masking policy and tags show as badges
 ([policies](security-policies.md)); the sample shows what policies let the
 signed-in user see. Query in a worksheet opens a worksheet with a `SELECT` on
-the table.
+the table, and Catalog page its page in the catalog.
+
+**Catalog.** Search over the names, descriptions, columns, column
+descriptions, tags and owners of every table and view the signed-in user
+may see, most used first (see [the data catalog](catalog.md)). Each table
+and view has a page, which can be linked to (`#/catalog/schema/name`): its
+description, owner, size and freshness, reads, writes and users of the last
+30 days, its columns with their descriptions, tags and masking policies, a
+sample of its rows as the user sees them, and its lineage, drawn as a graph
+of the tables and locations its data came from and the tables made from it,
+three steps each way. Tables the user may not see are counted in the graph,
+as "1 hidden upstream table", never named. Owners, writers and admins can
+edit descriptions there, which the console does with `COMMENT ON`.
 
 **Query history.** Queries and sign-ins, filtered by user, outcome, time and
 text, read from `igloo.query_history` and `igloo.login_history`. On a server
@@ -97,8 +110,10 @@ The console itself never decides what a user may see or do. The admin pages
 issue the statements an administrator would type in psql (`CREATE USER`,
 `ALTER USER`, `DROP USER`, `SHOW USERS`, `CREATE TOKEN`, `SHOW TOKENS`,
 `GRANT` and so on), and are also refused by the server to anyone who is not
-an admin. Only the compute page's sessions and the single sign-on page's
-settings and linked users are read from the server directly.
+an admin. The catalog pages read the [catalog's views](catalog.md) and
+change comments with `COMMENT ON`. Only the compute page's sessions and the
+single sign-on page's settings and linked users are read from the server
+directly.
 
 Each request runs in a SQL session of its own, which counts against
 `IGLOO_MAX_CONNECTIONS` while it lasts and shows on the compute page as

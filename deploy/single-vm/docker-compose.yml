@@ -79,6 +79,13 @@ services:
       IGLOO_SMTP_ALLOWED_DOMAINS: ${IGLOO_SMTP_ALLOWED_DOMAINS:-}
       IGLOO_SMTP_USERNAME: ${IGLOO_SMTP_USERNAME:-}
       IGLOO_SMTP_PASSWORD: ${IGLOO_SMTP_PASSWORD:-}
+      # Lineage events for OpenLineage tools (docs/catalog.md#openlineage).
+      # An empty URL sends none.
+      IGLOO_OPENLINEAGE_URL: ${IGLOO_OPENLINEAGE_URL:-}
+      IGLOO_OPENLINEAGE_API_KEY: ${IGLOO_OPENLINEAGE_API_KEY:-}
+      IGLOO_OPENLINEAGE_NAMESPACE: ${IGLOO_OPENLINEAGE_NAMESPACE:-igloo}
+      IGLOO_OPENLINEAGE_SEND_SQL: ${IGLOO_OPENLINEAGE_SEND_SQL:-false}
+      IGLOO_OPENLINEAGE_ALLOW_PRIVATE: ${IGLOO_OPENLINEAGE_ALLOW_PRIVATE:-false}
     ports:
       # Loopback only by default. Set IGLOO_BIND=0.0.0.0 to accept remote
       # clients, and turn on TLS first (see .env).

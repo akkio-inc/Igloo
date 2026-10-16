@@ -43,8 +43,8 @@ cleanup() {
     compose logs --no-color --tail 80 igloo || true
   fi
   if [ "${KEEP_E2E:-}" != 1 ]; then
-    # The receiver is on the stack's network, which cannot go while it is.
-    docker rm -f -v "$project-crm" "$project-ops" "$project-hooks" >/dev/null 2>&1 || true
+    # The receivers are on the stack's network, which cannot go while they are.
+    docker rm -f -v "$project-crm" "$project-ops" "$project-hooks" "$project-lineage" >/dev/null 2>&1 || true
     compose_pools --profile local-storage --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$work"
   else
@@ -70,13 +70,16 @@ echo "IGLOO_MAINTENANCE_INTERVAL=5s" >>"$env_file"
 landing="s3://$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)/landing"
 sed -i.bak -e "s#^IGLOO_ALLOWED_LOCATIONS=.*#IGLOO_ALLOWED_LOCATIONS=$landing/#" "$env_file"
 # A pool name and machine price, for the history and the cost estimates,
-# and a small second pool.
+# and a small second pool. Lineage events go to a receiver on the stack's
+# network, started below.
 cat >>"$env_file" <<EOF
 IGLOO_POOL=e2e
 IGLOO_PRICE_PER_HOUR=1.5
 IGLOO_REPORTING_PORT=$pool_port
 IGLOO_REPORTING_MEMORY_LIMIT=1GB
 IGLOO_REPORTING_THREADS=2
+IGLOO_OPENLINEAGE_URL=http://lineage:8080/api/v1/lineage
+IGLOO_OPENLINEAGE_ALLOW_PRIVATE=true
 EOF
 # A webhook receiver on the stack's network, as "hooks": notifications may
 # reach it although it is not public.
@@ -88,6 +91,20 @@ echo "starting the stack"
 compose up -d "$build" --wait --wait-timeout 300 >/dev/null
 
 network="${project}_default"
+
+# An OpenLineage endpoint that prints the events it receives.
+docker run -d --name "$project-lineage" --network "$network" --network-alias lineage python:3.12-slim python -u -c '
+import http.server, sys
+class Receiver(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        print(self.headers.get("Content-Type"), body.decode())
+        self.send_response(201)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("", 8080), Receiver).serve_forever()
+' >/dev/null
 
 # psql_as USER PASSWORD SQL... runs SQL through a fresh psql container and
 # prints tuples-only output (errors on stderr, merged).
@@ -601,6 +618,119 @@ expect_soon "and their sign-ins in the login history" "t|t|t" igloo "$admin_pass
   "SELECT bool_or(user_name = 'ivy' AND result = 'failure'), bool_or(user_name = 'ian' AND result = 'success'),
      bool_or(user_name = 'etl_bot' AND result = 'success' AND token_name = 'rest')
    FROM igloo.login_history WHERE application_name = 'iceberg rest'"
+
+echo "data catalog and lineage"
+# walt builds a small mart; cleo, whose role is none, may read one table of
+# it, mart.daily, and must learn nothing of the others.
+if got="$(psql_as walt walt-password-1 \
+  -c "CREATE SCHEMA mart" \
+  -c "CREATE TABLE mart.raw_spend (client VARCHAR, day DATE, spend DECIMAL(10,2))" \
+  -c "INSERT INTO mart.raw_spend VALUES ('acme', DATE '2026-10-01', 10.00), ('globex', DATE '2026-10-01', 20.00)" \
+  -c "CREATE TABLE mart.secret_margin (client VARCHAR, margin DECIMAL(4,2))" \
+  -c "INSERT INTO mart.secret_margin VALUES ('acme', 0.20), ('globex', 0.30)" \
+  -c "CREATE TABLE mart.daily AS SELECT client, day, sum(spend) AS spend FROM mart.raw_spend GROUP BY ALL" \
+  -c "CREATE TABLE mart.profit AS SELECT d.client, d.spend * m.margin AS profit FROM mart.daily d JOIN mart.secret_margin m USING (client)" \
+  -c "COMMENT ON SCHEMA mart IS 'Reporting mart'" \
+  -c "COMMENT ON TABLE mart.daily IS 'Spend per client and day'" \
+  -c "COMMENT ON COLUMN mart.daily.spend IS 'In USD'" \
+  -c "COMMENT ON TABLE mart.secret_margin IS 'Negotiated margins'")"; then
+  pass "a writer builds and describes a mart"
+else
+  fail "building the mart: $got"
+fi
+psql_admin -c "CREATE USER cleo WITH PASSWORD 'cleo-password-1' ROLE none" -c "GRANT SELECT ON TABLE mart.daily TO cleo" >/dev/null
+psql_as cleo cleo-password-1 -c "SELECT count(*) FROM mart.daily" -c "SELECT count(*) FROM mart.daily" >/dev/null
+expect_soon "owners, descriptions and sizes" "daily|walt|user|Spend per client and day|2|t|t" igloo "$admin_password" \
+  "SELECT table_name, table_owner, owner_type, comment, row_count, bytes > 0, last_altered > now() - INTERVAL 1 HOUR
+   FROM igloo.tables WHERE table_schema = 'mart' AND table_name = 'daily'"
+expect "schema comments in Iceberg" "mart|walt|Reporting mart" igloo "$admin_password" \
+  "SELECT schema_name, schema_owner, comment FROM igloo.schemata WHERE schema_name = 'mart'"
+expect "column comments" "spend|In USD" igloo "$admin_password" \
+  "SELECT column_name, comment FROM igloo.columns WHERE table_schema = 'mart' AND table_name = 'daily' AND comment IS NOT NULL"
+expect "information_schema has owners and sizes" "daily|walt|Spend per client and day|2" igloo "$admin_password" \
+  "SELECT table_name, table_owner, comment, row_count FROM information_schema.tables WHERE table_schema = 'mart' AND table_name = 'daily'"
+expect_soon "lineage from the history" "raw_spend|daily|CREATE TABLE|walt
+daily|profit|CREATE TABLE|walt
+secret_margin|profit|CREATE TABLE|walt" igloo "$admin_password" \
+  "SELECT upstream_name, downstream_name, last_statement_type, last_user FROM igloo.lineage
+   WHERE downstream_schema = 'mart' ORDER BY downstream_name, upstream_name"
+expect_soon "usage from the history" "daily|3|1|2" igloo "$admin_password" \
+  "SELECT table_name, reads_30d, writes_30d, users_30d FROM igloo.table_usage WHERE table_schema = 'mart' AND table_name = 'daily'"
+expect "a user with one grant sees that table" "mart|daily|walt|Spend per client and day" cleo cleo-password-1 \
+  "SELECT table_schema, table_name, table_owner, comment FROM igloo.tables"
+expect "and its lineage, the other ends unnamed" "(hidden)|daily|-
+daily|(hidden)|-" cleo cleo-password-1 \
+  "SELECT coalesce(upstream_name, '(hidden)'), coalesce(downstream_name, '(hidden)'), coalesce(last_user, '-')
+   FROM igloo.lineage ORDER BY 1, 2"
+expect "and only its usage" "daily|3" cleo cleo-password-1 "SELECT table_name, reads_30d FROM igloo.table_usage"
+got="$(psql_as cleo cleo-password-1 -c "SELECT * FROM igloo.tables" -c "SELECT * FROM igloo.schemata" \
+  -c "SELECT * FROM igloo.columns" -c "SELECT * FROM igloo.lineage" -c "SELECT * FROM igloo.table_usage" \
+  -c "SELECT * FROM igloo_comments()" -c "SELECT * FROM pg_description" -c "SHOW OBJECTS" \
+  -c "SELECT * FROM igloo.tag_references" -c "SELECT * FROM igloo.policy_references" \
+  -c "SELECT table_owner, comment FROM information_schema.tables WHERE table_owner IS NOT NULL OR comment IS NOT NULL")" || true
+if grep -qi "raw_spend\|secret_margin\|profit\|Negotiated\|e2e\|contacts\|pii" <<<"$got"; then
+  fail "the catalog shows a user with one grant what they may not see: $got"
+else
+  pass "nothing else leaks to a user with one grant"
+fi
+psql_admin -c "CREATE ROLE mart_owners" -c "GRANT mart_owners TO cleo" >/dev/null
+expect "an owner hands a table to a role" "ALTER TABLE" walt walt-password-1 "ALTER TABLE mart.daily OWNER TO mart_owners"
+expect "whose members may describe it" "COMMENT" cleo cleo-password-1 "COMMENT ON TABLE mart.daily IS 'Spend per client and day, in USD'"
+expect_error "but owning grants nothing more" 42501 cleo cleo-password-1 "INSERT INTO mart.daily VALUES ('x', DATE '2026-10-02', 1)"
+expect_error "nor describes what they do not own" 42501 cleo cleo-password-1 "COMMENT ON TABLE mart.profit IS 'x'"
+got="$(psql_as cleo cleo-password-1 -c "SHOW OBJECTS")" || true
+if [ "$(wc -l <<<"$got" | tr -d ' ')" = 2 ] && grep -q "^mart|daily|TABLE|mart_owners|role|Spend per client and day, in USD|2|" <<<"$got"; then
+  pass "SHOW OBJECTS"
+else
+  fail "SHOW OBJECTS: $got"
+fi
+login="$(curl -sS -c "$work/cleo.cookies" -H 'Content-Type: application/json' \
+  -d '{"user":"cleo","password":"cleo-password-1"}' "$console/api/login")"
+cleo_csrf="$(sed -n 's/.*"csrf":"\([^"]*\)".*/\1/p' <<<"$login")"
+got="$(curl -sS -b "$work/cleo.cookies" "$console/api/catalog/search?q=spend")"
+if grep -q '"name":"daily"' <<<"$got" && ! grep -qi "raw_spend\|profit\|margin" <<<"$got"; then
+  pass "console search shows a user only what they may see"
+else
+  fail "console search: $got"
+fi
+got="$(curl -sS -b "$work/cleo.cookies" "$console/api/catalog/object?schema=mart&name=daily")"
+if grep -q '"label":"1 hidden upstream table"' <<<"$got" && grep -q '"label":"1 hidden downstream table"' <<<"$got" &&
+  grep -q '"can_comment":true' <<<"$got" && ! grep -qi "raw_spend\|profit\|margin" <<<"$got"; then
+  pass "a console table page counts hidden tables, never names them"
+else
+  fail "console table page: $got"
+fi
+code="$(curl -s -o /dev/null -w '%{http_code}' -b "$work/cleo.cookies" "$console/api/catalog/object?schema=mart&name=secret_margin")"
+if [ "$code" = 404 ]; then pass "a table one may not see has no page"; else fail "console page of a hidden table: $code"; fi
+got="$(curl -sS -b "$work/cleo.cookies" -H 'Content-Type: application/json' -H "X-CSRF-Token: $cleo_csrf" \
+  -d '{"kind":"column","schema":"mart","name":"daily","column":"day","comment":"The day spent"}' "$console/api/catalog/comment")"
+if grep -q '"tag":"COMMENT"' <<<"$got"; then pass "an owner describes a column in the console"; else fail "console comment: $got"; fi
+expect "the console's comment is the column's" "The day spent" igloo "$admin_password" \
+  "SELECT comment FROM igloo.columns WHERE table_schema = 'mart' AND table_name = 'daily' AND column_name = 'day'"
+login="$(console_post /api/login '{"user":"walt","password":"walt-password-1"}')"
+got="$(curl -sS -b "$jar" "$console/api/catalog/object?schema=mart&name=profit")"
+if grep -q '"label":"mart.secret_margin"' <<<"$got" && grep -q '"label":"mart.daily"' <<<"$got"; then
+  pass "a writer's table page draws the whole lineage"
+else
+  fail "a writer's table page: $got"
+fi
+lineage_event=""
+for _ in $(seq 30); do
+  lineage_event="$(docker logs "$project-lineage" 2>&1 | grep '"name":"lake.mart.profit"' | head -1)" || true
+  [ -n "$lineage_event" ] && break
+  sleep 2
+done
+if grep -q '"eventType":"COMPLETE"' <<<"$lineage_event" && grep -q '"name":"lake.mart.secret_margin"' <<<"$lineage_event" &&
+  grep -q '"outputs":\[{"namespace":"igloo","name":"lake.mart.profit"}\]' <<<"$lineage_event"; then
+  pass "an OpenLineage event for the statement that made a table"
+else
+  fail "OpenLineage event: [$lineage_event]"
+fi
+if docker logs "$project-lineage" 2>&1 | grep -qi '"sql"\|0\.30\|globex'; then
+  fail "an OpenLineage event carries SQL or data"
+else
+  pass "OpenLineage events carry neither SQL nor data"
+fi
 
 echo "SQL from strings, PIVOT and the read cache"
 expect_error "query() is refused" 42501 rita rita-password-1 "SELECT * FROM query('SELECT * FROM duckdb_secrets()')"

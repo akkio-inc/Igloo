@@ -110,6 +110,20 @@ names the host.
 | `IGLOO_SMTP_PASSWORD_FILE` | | File holding its password, such as a mounted Kubernetes Secret. |
 | `IGLOO_SMTP_PASSWORD` | | The password itself, if not in a file. |
 
+## Lineage events
+
+Statements that write tables can also be sent as
+[OpenLineage](catalog.md#openlineage) events, to Marquez, DataHub or any
+other OpenLineage endpoint.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_OPENLINEAGE_URL` | | Where events are POSTed, `https`. Empty sends nothing. |
+| `IGLOO_OPENLINEAGE_API_KEY` | | Sent as a bearer token |
+| `IGLOO_OPENLINEAGE_NAMESPACE` | `igloo` | The namespace of Igloo's jobs and tables in events |
+| `IGLOO_OPENLINEAGE_SEND_SQL` | `false` | Include each statement's text, with passwords and secrets removed |
+| `IGLOO_OPENLINEAGE_ALLOW_PRIVATE` | `false` | Allow an endpoint at a private or loopback address, and `http`. Link-local addresses, such as cloud metadata services, are always refused. |
+
 ## Catalog
 
 | Variable | Default | Meaning |

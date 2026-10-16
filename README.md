@@ -161,6 +161,18 @@ the official TPC-H answers.
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days, with
   each statement's CPU time, bytes and memory.
+- **[Data catalog](docs/catalog.md)**: search tables by name, description,
+  column, tag and owner; owners and descriptions of schemas, tables and
+  columns; size and freshness from the Iceberg metadata; usage and
+  table-level lineage worked out from the query history, also sent to
+  OpenLineage tools such as Marquez and DataHub. Each user sees only the
+  tables they may read.
+
+  ```sql
+  COMMENT ON TABLE marts.daily_spend IS 'Spend per client, campaign and day';
+  ALTER TABLE marts.daily_spend OWNER TO analytics_eng;
+  SELECT upstream_name, last_seen, last_job FROM igloo.lineage WHERE downstream_name = 'daily_spend';
+  ```
 - **[Loading and scheduling](docs/loading.md)** with nothing else to run:
   `COPY INTO` loads CSV, TSV, Parquet and JSON drops from a bucket, each
   file once; pipes load new files as they land; tasks run SQL on a cron or
@@ -218,8 +230,9 @@ the official TPC-H answers.
   object storage are kept on local disk across restarts, so the first
   queries after a start (or a scale-to-zero resume) do not fetch them again.
 - **[Web console](docs/console.md)** at `http://127.0.0.1:8443`: SQL
-  worksheets, a data browser, query history, tasks and loads, and user and
-  compute administration, signed in with the same users as SQL clients.
+  worksheets, a data browser, a catalog with lineage graphs, query history,
+  tasks and loads, and user and compute administration, signed in with the
+  same users as SQL clients.
 - **[Arrow Flight SQL](docs/flight-sql.md)** at `grpc://localhost:31337`:
   query results as DuckDB's Arrow record batches for ADBC (pandas, polars),
   pyarrow and the Flight SQL JDBC driver, with the same users, grants,
@@ -304,6 +317,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   operational alerts
 - [Masking, row access policies and tags](docs/security-policies.md): what
   each user sees of tables' rows and columns
+- [Data catalog](docs/catalog.md): descriptions, owners, freshness, usage
+  and lineage, and OpenLineage
 - [Media analytics](docs/media-analytics.md): reach and frequency with
   sketches, geospatial reporting, approximate and statistical functions
 - [Workload management](docs/workload-management.md): query tags, usage and
@@ -325,8 +340,13 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   need a cluster are not supported yet.
 - **Grants stop at tables.** Views run with the querying user's privileges,
   and there are no column privileges: use masking policies instead. Table
-  and column names are visible to every user. Policies do not bind admins,
-  who manage them, nor engines that read the Iceberg tables directly.
+  and column names are visible to every user through the system catalogs
+  (descriptions, owners, usage and lineage only to those who may see the
+  table). Policies do not bind admins, who manage them, nor engines that
+  read the Iceberg tables directly.
+- **Lineage is table-level.** It comes from the statements Igloo runs; there
+  is no column-level lineage, and what other engines do to the tables
+  directly is not seen ([details](docs/catalog.md#lineage)).
 - **Scale to zero saves node costs on one machine, not yet in the cloud
   modules.** The AWS, Google Cloud and Azure modules run Igloo on their
   general node pool, so scaling its pods to zero does not release nodes
@@ -363,6 +383,7 @@ internal/flightsql/ Arrow Flight SQL endpoint
 internal/icebergrest/ Iceberg REST catalog for other engines
 internal/notify/    notification integrations, sending, built-in alerts, alert history
 internal/pgwire/    Postgres wire protocol, authorization, policies, compatibility
+internal/openlineage/ lineage events for OpenLineage endpoints
 internal/policy/    masking and row access policies and tags, stored
 internal/schedule/  cron and interval schedules
 internal/sharing/   Delta Sharing: the provider endpoint and external tables

@@ -284,6 +284,36 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   to external tables, and while tables have policies only admins read
   external tables' files or the copies of shared files directly.
 
+### Data catalog
+
+- Owners of schemas, tables and views, by default their creator:
+  `ALTER TABLE | VIEW | MATERIALIZED VIEW | SCHEMA ... OWNER TO`, shown in
+  `SHOW OBJECTS`, `igloo.tables`, `igloo.schemata` and `information_schema`.
+  Owners may set their objects' comments and hand them on; ownership grants
+  no access to data.
+- `COMMENT ON SCHEMA`, stored as the Iceberg namespace's `comment` property.
+- `igloo.schemata`, `igloo.tables` and `igloo.columns`: owners, comments,
+  columns, rows, bytes, files, snapshots and when the data last changed,
+  read from the Iceberg metadata. `information_schema.tables` gains
+  `table_owner`, `comment`, `row_count`, `bytes` and `last_altered`, as in
+  Snowflake.
+- `igloo.lineage`, table-level lineage from the query history: edges from
+  the tables and locations that `INSERT ... SELECT`, `CREATE TABLE AS`,
+  `MERGE`, `UPDATE ... FROM`, `COPY INTO`, tasks, pipes and materialized
+  views read to the tables they wrote, with when they were last seen and by
+  which statement or job. `igloo.table_usage` counts reads, writes and users
+  of each table over 30 days.
+- The query history records what every statement read and wrote, not only
+  those of users with the role none, worked out in the background, and new
+  columns `locations_read` and `job`.
+- Lineage events for OpenLineage endpoints such as Marquez and DataHub
+  (`IGLOO_OPENLINEAGE_URL`), without query results, and without statements'
+  text unless `IGLOO_OPENLINEAGE_SEND_SQL` is set.
+- Everything the catalog shows is limited to what the user may see: users
+  with the role none see only the tables they have a grant on or own, which
+  now also applies to `igloo_comments()`, `pg_description`, and
+  `igloo.policy_references` and `igloo.tag_references`.
+
 ### Web console
 
 - A web console on port 8443 (`IGLOO_CONSOLE_ADDR`): SQL worksheets with
@@ -297,6 +327,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Console pages for access tokens (everyone's own), service accounts and
   every token (admins), and single sign-on: settings, whether the provider
   answers, group mappings and who signed in with which groups.
+- A catalog page: search over tables' names, descriptions, columns, tags
+  and owners, and a page for each table and view with its description,
+  owner, size, freshness, usage, columns, sample rows and a lineage graph,
+  showing tables the user may not see only as a count. Owners, writers and
+  admins edit descriptions there.
 
 ### Other engines
 

@@ -170,9 +170,11 @@ SELECT * FROM igloo.policy_references;  -- which policy applies where, also thro
 SELECT * FROM igloo.tag_references;     -- which column has which tag
 ```
 
-Everyone may list policies, tags and where they apply, as they may list
-tables and columns; only admins see policies' expressions. The web console's
-data browser shows a table's row access policy and each column's masking
+Everyone may list policies and tags, and where they apply on the tables
+they may see (see [the catalog](catalog.md#who-sees-what)): users with the
+role none see only the references of the tables they have a grant on or
+own. Only admins see policies' expressions. The web console's data browser
+and catalog show a table's row access policy and each column's masking
 policy and tags.
 
 ## How they apply
