@@ -23,6 +23,9 @@ project="${E2E_PROJECT:-igloo-e2e-dist}"
 sql_port="${E2E_SQL_PORT:-25433}"
 http_port="${E2E_HTTP_PORT:-28432}"
 console_port="${E2E_CONSOLE_PORT:-28443}"
+flight_port="${E2E_FLIGHT_PORT:-23137}"
+iceberg_port="${E2E_ICEBERG_PORT:-28181}"
+sharing_port="${E2E_SHARING_PORT:-28444}"
 workers="${E2E_WORKERS:-3}"
 sf="${E2E_TPCH_SF:-0.1}"
 image="${E2E_IMAGE:-$project:dev}"
@@ -57,7 +60,9 @@ fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
 "$root/deploy/single-vm/init-env.sh" "$env_file" >/dev/null
 sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*/IGLOO_HTTP_PORT=$http_port/" \
-  -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" \
+  -e "s/^IGLOO_CONSOLE_PORT=.*/IGLOO_CONSOLE_PORT=$console_port/" -e "s/^IGLOO_FLIGHT_PORT=.*/IGLOO_FLIGHT_PORT=$flight_port/" \
+  -e "s/^IGLOO_ICEBERG_PORT=.*/IGLOO_ICEBERG_PORT=$iceberg_port/" -e "s/^IGLOO_SHARING_PORT=.*/IGLOO_SHARING_PORT=$sharing_port/" \
+  -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" \
   -e "s/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=local-storage,workers/" -e "s/^IGLOO_WORKERS=.*/IGLOO_WORKERS=worker/" \
   -e "s/^IGLOO_WORKER_REPLICAS=.*/IGLOO_WORKER_REPLICAS=$workers/" -e "s/^IGLOO_WORKER_THREADS=.*/IGLOO_WORKER_THREADS=2/" \
   -e "s/^IGLOO_WORKER_MEMORY_LIMIT=.*/IGLOO_WORKER_MEMORY_LIMIT=1GB/" -e "s/^IGLOO_CACHE_SIZE=.*/IGLOO_CACHE_SIZE=0/" "$env_file"
