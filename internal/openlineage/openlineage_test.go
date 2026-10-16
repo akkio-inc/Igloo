@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -44,14 +45,98 @@ func TestNewRefusesUnsafeEndpoints(t *testing.T) {
 }
 
 func TestAllowed(t *testing.T) {
-	for addr, want := range map[string]bool{
-		"8.8.8.8": true, "2001:4860:4860::8888": true, "10.1.2.3": false, "192.168.1.1": false,
-		"172.16.0.1": false, "::1": false, "fd00::1": false, "169.254.169.254": false, "100.64.0.1": false,
-		"2002:a9fe:a9fe::1": false, "224.0.0.1": false,
+	// Whether events may go to an address, with private addresses refused
+	// and allowed.
+	for addr, want := range map[string][2]bool{
+		"8.8.8.8":              {true, true},
+		"2001:4860:4860::8888": {true, true},
+		"10.1.2.3":             {false, true},
+		"192.168.1.1":          {false, true},
+		"172.16.0.1":           {false, true},
+		"127.0.0.1":            {false, true},
+		"::1":                  {false, true},
+		"fd00::1":              {false, true}, // unique local
+		"fec0::1":              {false, true}, // site-local
+		"100.64.0.1":           {false, true}, // carrier-grade NAT
+		"198.18.0.1":           {false, true}, // benchmarking
+		"198.19.255.255":       {false, true},
+		"169.254.169.254":      {false, false}, // link-local: cloud metadata
+		"fe80::1":              {false, false},
+		"100.100.100.200":      {false, false}, // Alibaba's metadata service
+		"fd00:ec2::254":        {false, false}, // AWS's over IPv6
+		"0.0.0.0":              {false, false},
+		"0.1.2.3":              {false, false}, // this network
+		"240.0.0.1":            {false, false}, // reserved
+		"255.255.255.255":      {false, false},
+		"::":                   {false, false},
+		"224.0.0.1":            {false, false},
+		"ff02::1":              {false, false},
+		// IPv6 that carries IPv4: checked as the IPv4 address it carries,
+		// or refused when that cannot be read off it.
+		"::ffff:169.254.169.254":               {false, false}, // IPv4-mapped
+		"::ffff:10.0.0.1":                      {false, true},
+		"::ffff:8.8.8.8":                       {true, true},
+		"::ffff:0:169.254.169.254":             {false, false}, // IPv4-translated
+		"::ffff:0:8.8.8.8":                     {true, true},
+		"64:ff9b::a9fe:a9fe":                   {false, false}, // NAT64 of link-local
+		"64:ff9b::808:808":                     {true, true},
+		"64:ff9b::a00:1":                       {false, true},
+		"64:ff9b:1::a9fe:a9fe":                 {false, false}, // local-use NAT64
+		"2002:a9fe:a9fe::1":                    {false, false}, // 6to4 of link-local
+		"2002:a00:1::1":                        {false, true},
+		"2002:808:808::1":                      {true, true},
+		"2001:0:4136:e378:8000:63bf:3fff:fdd2": {false, false}, // Teredo
+		"::169.254.169.254":                    {false, false}, // IPv4-compatible
+		"::8.8.8.8":                            {false, false},
 	} {
-		if got := allowed(netip.MustParseAddr(addr), false) == nil; got != want {
-			t.Errorf("allowed(%s) = %v, want %v", addr, got, want)
+		for i, private := range []bool{false, true} {
+			if got := allowed(netip.MustParseAddr(addr), private) == nil; got != want[i] {
+				t.Errorf("allowed(%s, private %v) = %v, want %v", addr, private, got, want[i])
+			}
 		}
+	}
+}
+
+// TestDialPinsAddresses checks that a name is resolved once, refused if
+// any of its addresses is, and connected to at the address checked.
+func TestDialPinsAddresses(t *testing.T) {
+	received := make(chan bool, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		received <- true
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	_, port, _ := strings.Cut(strings.TrimPrefix(srv.URL, "http://"), ":")
+	c, err := New(Options{URL: "http://lineage.example:" + port + "/api/v1/lineage", AllowPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := c.http.Transport.(*http.Transport)
+	var answers [][]netip.Addr
+	lookups := 0
+	pinned := &guard{private: true, dialer: &net.Dialer{Timeout: time.Second}, lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+		lookups++
+		return answers[min(lookups, len(answers))-1], nil
+	}}
+	g.DialContext = pinned.dial
+
+	answers = [][]netip.Addr{{netip.MustParseAddr("127.0.0.1")}}
+	if err := c.post(context.Background(), []byte("{}")); err != nil {
+		t.Fatalf("a name resolving to an allowed address: %v", err)
+	}
+	<-received
+	g.CloseIdleConnections()
+	// A name that resolves to an address events may not go to as well is
+	// refused, whichever address comes first.
+	answers = [][]netip.Addr{{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("169.254.169.254")}}
+	lookups = 0
+	if err := c.post(context.Background(), []byte("{}")); err == nil || !strings.Contains(err.Error(), "169.254.169.254") {
+		t.Errorf("a name resolving to a link-local address too: %v", err)
+	}
+	select {
+	case <-received:
+		t.Error("an event went to a name that also resolves to a refused address")
+	default:
 	}
 }
 

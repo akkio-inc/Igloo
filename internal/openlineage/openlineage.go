@@ -112,24 +112,21 @@ func New(opts Options) (*Client, error) {
 	if opts.Registerer != nil {
 		opts.Registerer.MustRegister(c.events)
 	}
-	dialer := &net.Dialer{Timeout: sendTimeout, Control: func(_, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
+	g := &guard{private: opts.AllowPrivate, lookup: net.DefaultResolver.LookupNetIP}
+	g.dialer = &net.Dialer{Timeout: sendTimeout, Control: func(_, address string, _ syscall.RawConn) error {
+		ap, err := netip.ParseAddrPort(address)
 		if err != nil {
 			return err
 		}
-		ip, err := netip.ParseAddr(host)
-		if err != nil {
-			return err
-		}
-		return allowed(ip, opts.AllowPrivate)
+		return allowed(ap.Addr(), opts.AllowPrivate)
 	}}
 	c.http = &http.Client{
 		Timeout: sendTimeout,
 		Transport: &http.Transport{
-			// Straight to the endpoint: through a proxy, the address
-			// checks would check the proxy's.
+			// Straight to the endpoint, never through a proxy from the
+			// environment: the address checks would check the proxy's.
 			Proxy:               nil,
-			DialContext:         dialer.DialContext,
+			DialContext:         g.dial,
 			TLSHandshakeTimeout: sendTimeout,
 			MaxIdleConns:        2,
 			IdleConnTimeout:     time.Minute,
@@ -139,35 +136,110 @@ func New(opts Options) (*Client, error) {
 	return c, nil
 }
 
-// cgnat is the shared address space of carrier-grade NAT, where some
-// clouds keep their metadata services.
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+// guard dials only addresses events may go to.
+type guard struct {
+	private bool
+	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	dialer  *net.Dialer
+}
 
-// nat64 and sixToFour are IPv6 addresses that carry an IPv4 one.
+// dial resolves the endpoint's name once, refuses it if any of its
+// addresses is one events may not go to, and connects to those addresses
+// themselves, so that a name cannot point somewhere else between the check
+// and the connection (DNS rebinding). The dialer checks the address it
+// connects to again.
+func (g *guard) dial(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := g.lookup(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("%s has no address", host)
+	}
+	for _, ip := range ips {
+		if err := allowed(ip, g.private); err != nil {
+			return nil, fmt.Errorf("%s: %w", host, err)
+		}
+	}
+	var errs []error
+	for _, ip := range ips {
+		conn, err := g.dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, errors.Join(errs...)
+}
+
+func prefixes(ps ...string) []netip.Prefix {
+	out := make([]netip.Prefix, len(ps))
+	for i, p := range ps {
+		out[i] = netip.MustParsePrefix(p)
+	}
+	return out
+}
+
 var (
-	nat64     = netip.MustParsePrefix("64:ff9b::/96")
-	sixToFour = netip.MustParsePrefix("2002::/16")
+	// never are addresses events never go to, besides unspecified,
+	// link-local and multicast ones: "this network" and the reserved
+	// 240.0.0.0/4, cloud metadata services outside link-local space
+	// (Alibaba's, AWS's over IPv6), and IPv6 addresses that carry an IPv4
+	// one that cannot be read off them: IPv4-compatible, Teredo and
+	// local-use NAT64.
+	never = prefixes("0.0.0.0/8", "240.0.0.0/4", "100.100.100.200/32", "fd00:ec2::254/128",
+		"::/96", "2001::/32", "64:ff9b:1::/48")
+	// privateRanges are addresses events go to only when private ones are
+	// allowed, besides loopback and the private networks (10.0.0.0/8,
+	// 172.16.0.0/12, 192.168.0.0/16, fc00::/7): carrier-grade NAT,
+	// benchmarking networks and deprecated site-local IPv6.
+	privateRanges = prefixes("100.64.0.0/10", "198.18.0.0/15", "fec0::/10")
+	// embedded are IPv6 addresses that carry an IPv4 one, which is
+	// checked instead, with the byte it starts at: IPv4-translated,
+	// NAT64 and 6to4. IPv4-mapped ones are unmapped first.
+	embedded = []struct {
+		prefix netip.Prefix
+		at     int
+	}{
+		{netip.MustParsePrefix("::ffff:0:0:0/96"), 12},
+		{netip.MustParsePrefix("64:ff9b::/96"), 12},
+		{netip.MustParsePrefix("2002::/16"), 2},
+	}
 )
 
-// allowed refuses addresses events must not go to: link-local, multicast
-// and unspecified ones always, private and loopback ones unless private
-// says they may.
+func within(ps []netip.Prefix, ip netip.Addr) bool {
+	for _, p := range ps {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowed refuses addresses events must not go to: unspecified,
+// link-local, multicast and the never addresses always, and loopback and
+// private ones unless private says they may.
 func allowed(ip netip.Addr, private bool) error {
-	ip = ip.Unmap()
-	if ip.Is6() {
-		b := ip.As16()
-		switch {
-		case nat64.Contains(ip):
-			ip = netip.AddrFrom4([4]byte(b[12:16]))
-		case sixToFour.Contains(ip):
-			ip = netip.AddrFrom4([4]byte(b[2:6]))
+	ip = ip.Unmap().WithZone("")
+	for _, e := range embedded {
+		if e.prefix.Contains(ip) {
+			b := ip.As16()
+			v4 := netip.AddrFrom4([4]byte(b[e.at : e.at+4]))
+			if err := allowed(v4, private); err != nil {
+				return fmt.Errorf("%s carries %s: %w", ip, v4, err)
+			}
+			return nil
 		}
 	}
 	switch {
-	case ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(), ip.IsMulticast(), ip.IsUnspecified(),
-		ip.IsInterfaceLocalMulticast(), ip.Is4() && ip.As4()[0] == 0:
+	case ip.IsUnspecified(), ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(), ip.IsInterfaceLocalMulticast(),
+		ip.IsMulticast(), !ip.IsLoopback() && within(never, ip):
 		return fmt.Errorf("lineage events may not go to %s", ip)
-	case !private && (ip.IsLoopback() || ip.IsPrivate() || cgnat.Contains(ip)):
+	case !private && (ip.IsLoopback() || ip.IsPrivate() || within(privateRanges, ip)):
 		return fmt.Errorf("lineage events go to %s, a private address, only with IGLOO_OPENLINEAGE_ALLOW_PRIVATE=true", ip)
 	}
 	return nil
