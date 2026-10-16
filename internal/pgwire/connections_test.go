@@ -740,6 +740,67 @@ func TestConnectionPolicies(t *testing.T) {
 	want(admin, "SELECT count(*) FROM igloo_policy_references()", "0")
 }
 
+// TestConnectionWorkloadLimits checks that role limits apply to
+// statements that read connections as to any other, and that file
+// functions cannot reach a connection's proxy.
+func TestConnectionWorkloadLimits(t *testing.T) {
+	needExtensions(t)
+	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
+	schema := pgFixture(t, pg)
+	ctx := context.Background()
+	remote, err := pgx.Connect(ctx, pg.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close(ctx) //nolint:errcheck
+	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow AS SELECT pg_sleep(3)::text AS x"); err != nil {
+		t.Fatal(err)
+	}
+	store := federation.NewMemoryStore()
+	c := federation.New("crm", federation.Postgres)
+	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
+	c.Schemas = []string{schema}
+	if err := store.Create(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	fs := startFedServer(t, store)
+	rita := fs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, fs.admin, "GRANT SELECT ON CONNECTION crm TO rita")
+	mustExec(t, fs.admin, "ALTER ROLE rita SET statement_timeout = '1s'")
+
+	start := time.Now()
+	err = runQuery(rita, "SELECT * FROM crm."+schema+".slow")
+	if pgCode(err) != "57014" || time.Since(start) > 10*time.Second {
+		t.Errorf("a connection's slow table under a 1s statement_timeout: %v after %s", err, time.Since(start))
+	}
+	if n := count(t, rita, "SELECT count(*) FROM crm."+schema+".customers"); n != 10 {
+		t.Errorf("after the timeout: %d", n)
+	}
+
+	// The proxy's address is in duckdb_databases(), but no file function
+	// reaches it.
+	var path string
+	if err := fs.admin.QueryRow(ctx, "SELECT path FROM duckdb_databases() WHERE database_name = 'crm'").Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	var port string
+	for _, f := range strings.Fields(path) {
+		if p, ok := strings.CutPrefix(f, "port="); ok {
+			port = p
+		}
+	}
+	if port == "" {
+		t.Fatalf("no port in %q", path)
+	}
+	for _, sql := range []string{
+		"SELECT * FROM read_parquet('http://127.0.0.1:" + port + "/x.parquet')",
+		"SELECT * FROM read_csv('http://localhost:" + port + "/x.csv')",
+		"SELECT * FROM 'http://127.0.0.1:" + port + "/x.parquet'",
+	} {
+		expectDenied(t, rita, sql)
+	}
+}
+
 // laterAttach stands in for the federation manager in the checks of
 // reads, with its connections hidden until attach: as if they were
 // attached after statements were prepared, which Igloo does not do today.
