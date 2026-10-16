@@ -284,6 +284,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	// Each table's current snapshot and its files, once per statement, so
 	// the statement sees every commit made before it.
 	files := map[string][]File{}
+	snapshots := map[string]*Table{}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	for _, j := range plan.Jobs {
@@ -291,6 +292,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			mu.Lock()
 			_, seen := files[v.Table.key()]
 			files[v.Table.key()] = nil
+			if !seen {
+				snapshots[v.Table.key()] = v.Table
+			}
 			mu.Unlock()
 			if seen {
 				continue
@@ -310,8 +314,15 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	for _, key := range plan.pins {
+		if t := snapshots[key]; t.Versioned && t.Snapshot == 0 {
+			// No snapshot to read it at: it is empty, but a commit could
+			// fill it before the coordinator's part reads it.
+			return nil, unsupported("table %s has no snapshot yet", t)
+		}
+	}
 
-	snapshots := time.Since(start)
+	loaded := time.Since(start)
 	qid := filepath.Base(ex.dir)
 	results := make([]*jobResult, len(plan.Jobs))
 	used := map[string]bool{}
@@ -367,16 +378,52 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			return nil, fmt.Errorf("job %d has no place in the statement", j.ID)
 		}
 	}
+	if err := co.pin(final, plan.pins, snapshots); err != nil {
+		return nil, err
+	}
 	if ex.SQL, err = co.parser.print(final); err != nil {
 		return nil, err
 	}
 	ex.Workers = len(used)
 	co.pool.touch()
 	co.log.Debug("ran a statement's parts", "query", qid, "jobs", len(plan.Jobs), "workers", ex.Workers,
-		"snapshots_seconds", snapshots.Seconds(), "seconds", time.Since(start).Seconds())
+		"snapshots_seconds", loaded.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true
 	return ex, nil
+}
+
+// pin points the coordinator's own reads, in final, of tables the jobs
+// read at the snapshots the workers read (AT (VERSION => ...)): a commit
+// made while the workers ran, by Igloo or another engine, adding rows or
+// delete files or changing the schema, is not seen by either part.
+func (co *Coordinator) pin(final node, pins map[string]string, tables map[string]*Table) error {
+	if len(pins) == 0 {
+		return nil
+	}
+	var err error
+	rewrite(final, func(n node) (node, bool) {
+		if err != nil || str(n["type"]) != "BASE_TABLE" {
+			return nil, false
+		}
+		key, ok := pins[strings.ToLower(strings.Join(tableParts(n), "\x00"))]
+		if !ok {
+			return nil, false
+		}
+		t := tables[key]
+		if t == nil || !t.Versioned {
+			// A table without snapshots, as in tests: nothing to pin.
+			return nil, false
+		}
+		tmpl, perr := co.parser.parse(fmt.Sprintf("SELECT 1 FROM t AT (VERSION => %d)", t.Snapshot))
+		if perr != nil {
+			err = perr
+			return nil, false
+		}
+		n["at_clause"] = child(child(tmpl, "from_table"), "at_clause")
+		return n, true
+	})
+	return err
 }
 
 // jobResult is where a job's partial results are.

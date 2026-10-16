@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,30 +28,38 @@ const testWorkerSecret = "the-test-worker-secret-0123456789abcdef"
 
 // lakeSource serves the stand-in catalog's tables to workers: each time a
 // table is looked up, it is written to a Parquet file with field IDs, as
-// an Iceberg table's data files are.
+// an Iceberg table's data files are. Like the Iceberg source, it reads
+// tables beneath grants and policies, with a connection of the engine's
+// own.
 type lakeSource struct {
 	dir string
 	mu  sync.Mutex
-	// conn is an admin's connection to the server, set once it runs.
-	conn  *pgx.Conn
+	// conn is the engine's, set once the server runs.
+	conn  *duckdb.Conn
 	files map[string][]distributed.File
 }
 
 func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distributed.Table, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.conn.Query(ctx, fmt.Sprintf("DESCRIBE lake.%s.%s", quoteIdent(schema), quoteIdent(name)))
+	rows, err := s.conn.QueryContext(ctx, fmt.Sprintf(`SELECT column_name, data_type FROM duckdb_columns()
+		WHERE database_name = 'lake' AND schema_name = %s AND table_name = %s ORDER BY column_index`,
+		quoteLiteral(schema), quoteLiteral(name)), nil)
 	if err != nil {
 		return nil, err
 	}
 	var cols []distributed.Column
 	var ids []string
-	for rows.Next() {
-		vals, err := rows.Values()
-		if err != nil {
+	dest := make([]driver.Value, 2)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			rows.Close()
 			return nil, err
 		}
-		c := distributed.Column{Name: vals[0].(string), Type: vals[1].(string), ID: len(cols) + 1}
+		c := distributed.Column{Name: dest[0].(string), Type: dest[1].(string), ID: len(cols) + 1}
 		cols = append(cols, c)
 		ids = append(ids, fmt.Sprintf("%s: %d", quoteIdent(c.Name), c.ID))
 	}
@@ -59,8 +68,10 @@ func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distribut
 	var files []distributed.File
 	for i := range 3 {
 		path := filepath.Join(s.dir, fmt.Sprintf("%s.%s.%d.%d.parquet", schema, name, time.Now().UnixNano(), i))
-		if _, err := s.conn.Exec(ctx, fmt.Sprintf("COPY (SELECT * FROM lake.%s.%s WHERE hash(rowid) %% 3 = %d) TO %s (FORMAT parquet, FIELD_IDS {%s})",
-			quoteIdent(schema), quoteIdent(name), i, quoteLiteral(path), strings.Join(ids, ", "))); err != nil {
+		// Not by rowid: with the spatial extension loaded, DuckDB 1.5.6 fails
+		// to plan a COPY that filters on it.
+		if _, err := s.conn.ExecContext(ctx, fmt.Sprintf("COPY (SELECT * EXCLUDE (__n) FROM (SELECT *, row_number() OVER () AS __n FROM lake.%s.%s) WHERE __n %% 3 = %d) TO %s (FORMAT parquet, FIELD_IDS {%s})",
+			quoteIdent(schema), quoteIdent(name), i, quoteLiteral(path), strings.Join(ids, ", ")), nil); err != nil {
 			return nil, err
 		}
 		info, err := os.Stat(path)
@@ -87,9 +98,17 @@ func (s *lakeSource) RemoveAll(_ context.Context, _ *distributed.Table, dir stri
 	return os.RemoveAll(dir)
 }
 
-type workerEngine struct{ c *duckdb.Connector }
+// workerEngine is a test worker's DuckDB. While gate holds them, tasks
+// wait to begin.
+type workerEngine struct {
+	c    *duckdb.Connector
+	gate *taskGate
+}
 
 func (e workerEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
+	if err := e.gate.wait(ctx); err != nil {
+		return nil, err
+	}
 	c, err := e.c.Connect(ctx)
 	if err != nil {
 		return nil, err
@@ -97,9 +116,63 @@ func (e workerEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
 	return c.(*duckdb.Conn), nil
 }
 
+// taskGate holds workers' tasks back while it is closed, and counts the
+// tasks waiting and those whose statement ended while they waited.
+type taskGate struct {
+	mu       sync.Mutex
+	open     chan struct{}
+	waiting  int
+	canceled int
+}
+
+func newTaskGate() *taskGate {
+	g := &taskGate{open: make(chan struct{})}
+	close(g.open)
+	return g
+}
+
+// hold makes tasks wait until the function it returns is called.
+func (g *taskGate) hold() func() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ch := make(chan struct{})
+	g.open = ch
+	return func() { close(ch) }
+}
+
+func (g *taskGate) wait(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	ch := g.open
+	g.waiting++
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.waiting--
+		g.mu.Unlock()
+	}()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		g.mu.Lock()
+		g.canceled++
+		g.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (g *taskGate) counts() (waiting, canceled int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.waiting, g.canceled
+}
+
 // startTestWorker starts a worker that may read dir, and returns its
 // address and a function that stops it.
-func startTestWorker(t *testing.T, dir string, i int) (string, func()) {
+func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, func()) {
 	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "worker")
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
@@ -123,7 +196,7 @@ func startTestWorker(t *testing.T, dir string, i int) (string, func()) {
 	}
 	setup.Close()
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
-		Engine: workerEngine{c}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
+		Engine: workerEngine{c, gate}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
 		Locations: []string{dir}, Threads: 1, MemoryBytes: 1 << 30,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -151,15 +224,23 @@ type distServer struct {
 	*catalogServer
 	source *lakeSource
 	stops  []func()
+	// gate holds the workers' tasks back when a test asks it to.
+	gate *taskGate
 }
 
-func startDistServer(t *testing.T, workers int) *distServer {
+func startDistServer(t *testing.T, workers int, configure ...func(*Options)) *distServer {
 	t.Helper()
-	dir := t.TempDir()
-	ds := &distServer{source: &lakeSource{dir: dir, files: map[string][]distributed.File{}}}
+	return startDistServerIn(t, t.TempDir(), workers, configure...)
+}
+
+// startDistServerIn starts a server whose tables' files, and whatever else
+// tests write, are in dir, which its DuckDB and the workers may read.
+func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(*Options)) *distServer {
+	t.Helper()
+	ds := &distServer{source: &lakeSource{dir: dir, files: map[string][]distributed.File{}}, gate: newTaskGate()}
 	var addrs []string
 	for i := range workers {
-		addr, stop := startTestWorker(t, dir, i)
+		addr, stop := startTestWorker(t, dir, i, ds.gate)
 		addrs = append(addrs, addr)
 		ds.stops = append(ds.stops, stop)
 	}
@@ -175,11 +256,17 @@ func startDistServer(t *testing.T, workers int) *distServer {
 	}
 	t.Cleanup(func() { co.Close() })
 	cfg := config.Config{
-		DuckDB:  config.DuckDB{TempDir: spill},
+		// The extensions production loads, where scripts/test.sh provides them.
+		DuckDB:  config.DuckDB{TempDir: spill, ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")},
 		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
 	}
-	ds.catalogServer = startCatalogServerWithConfig(t, cfg, func(o *Options) { o.Distributed = co })
-	ds.source.conn = ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ds.catalogServer = startCatalogServerWithConfig(t, cfg, append([]func(*Options){func(o *Options) { o.Distributed = co }}, configure...)...)
+	conn, err := ds.srv.engine.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	ds.source.conn = conn
 	mustExec(t, ds.catalogServer.admin, "INSERT INTO lake.public.orders SELECT i, i % 7 FROM range(3, 2000) t(i)")
 	return ds
 }

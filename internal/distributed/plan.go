@@ -44,6 +44,10 @@ type Env interface {
 	UserFunction(ctx context.Context, name string) (bool, error)
 	// Setting returns the session's value of a DuckDB setting.
 	Setting(ctx context.Context, name string) (string, error)
+	// View reports whether a name, as a statement writes it, may mean a
+	// view in this session: a view, or a name that does not resolve to
+	// exactly one relation.
+	View(ctx context.Context, parts []string) (bool, error)
 }
 
 // Column is a column of a table or a result.
@@ -66,8 +70,13 @@ type Table struct {
 	// Unsupported, if set, says why workers cannot read the table, such as
 	// delete files they cannot apply.
 	Unsupported string
-	// Snapshot is the table's snapshot ID, for logs.
+	// Snapshot is the table's snapshot ID. Execute reads every table at its
+	// current snapshot, and the coordinator's own reads of the table in the
+	// same statement at that snapshot too.
 	Snapshot int64
+	// Versioned says the table has snapshots, as Iceberg tables do, which
+	// the coordinator's reads can be pinned to (AT (VERSION => ...)).
+	Versioned bool
 	// source is the Source's own handle on the snapshot.
 	source any
 }
@@ -84,6 +93,10 @@ type Plan struct {
 	final node
 	// force uses every worker, whatever the tables' sizes.
 	force bool
+	// pins are the coordinator's own reads, in final, of tables that jobs
+	// read: by the name as written (lower case, parts joined by NUL), the
+	// table's key. Execute points them at the snapshot the workers read.
+	pins map[string]string
 }
 
 // Job is one part of a statement that workers run in parallel.
@@ -199,7 +212,81 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 			}
 		}
 	}
-	return &Plan{Jobs: pl.jobs, final: out}, nil
+	pins, err := pl.pinReads(out)
+	if err != nil {
+		return nil, err
+	}
+	return &Plan{Jobs: pl.jobs, final: out, pins: pins}, nil
+}
+
+// pinReads finds the tables the coordinator reads itself, in final, that
+// jobs read too: Execute points those reads at the snapshot the workers
+// read, so the statement sees one snapshot of each table, as on one
+// machine. A view there could read such a table at another snapshot, so
+// a statement whose coordinator part reads a view is not distributed.
+func (pl *planner) pinReads(final node) (map[string]string, error) {
+	jobTables := map[string]bool{}
+	for _, j := range pl.jobs {
+		for _, v := range j.Views {
+			jobTables[v.Table.key()] = true
+		}
+	}
+	ctes := map[string]bool{}
+	walk(final, func(n node) bool {
+		for _, name := range cteNames(n) {
+			ctes[name] = true
+		}
+		return true
+	})
+	pins := map[string]string{}
+	var err error
+	walk(final, func(n node) bool {
+		if err != nil || str(n["type"]) != "BASE_TABLE" || strings.HasPrefix(str(n["table_name"]), "__igloo_partials_") {
+			return err == nil
+		}
+		parts := tableParts(n)
+		key := strings.ToLower(strings.Join(parts, "\x00"))
+		cte := len(parts) == 1 && ctes[key]
+		if cte {
+			// A common table expression, unless it is named like a table
+			// the jobs read, which the name might mean here instead.
+			t, ok, terr := pl.env.Table(pl.ctx, parts)
+			switch {
+			case terr != nil:
+				err = terr
+			case ok && t != nil && jobTables[t.key()]:
+				err = unsupported("a common table expression is named like %s", t)
+			}
+			return err == nil
+		}
+		view, verr := pl.env.View(pl.ctx, parts)
+		if verr != nil {
+			err = verr
+			return false
+		}
+		if view {
+			err = unsupported("the coordinator's part reads %s, which may be a view", strings.Join(parts, "."))
+			return false
+		}
+		t, ok, terr := pl.env.Table(pl.ctx, parts)
+		if terr != nil {
+			err = terr
+			return false
+		}
+		if !ok || t == nil || !jobTables[t.key()] {
+			return true
+		}
+		if child(n, "at_clause") != nil {
+			err = unsupported("time travel")
+			return false
+		}
+		pins[key] = t.key()
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pins, nil
 }
 
 // skip records why a candidate was not distributed.

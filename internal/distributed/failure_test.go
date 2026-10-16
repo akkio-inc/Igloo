@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -143,5 +144,41 @@ func TestWorkerRefusesStrangers(t *testing.T) {
 	}
 	if _, err := w.viewStatement(viewDef{Name: "x; DROP TABLE y", Columns: []Column{{Name: "a", Type: "INTEGER", ID: 1}}}); err == nil {
 		t.Error("a view with a bad name was accepted")
+	}
+}
+
+// A worker runs only SQL that reads its task's views: nothing that names a
+// file, a table of a database or a table by name, whoever sent it.
+func TestWorkerReadsOnlyItsViews(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 1)
+	w := h.workers[0]
+	li := h.tables["lineitem"]
+	file := h.files[li.key()][0].Path
+	view := viewDef{Name: "__igloo_split", Columns: li.Columns, Files: []string{file}}
+	run := func(sql string) error {
+		path, _, err := w.run(t.Context(), &taskRequest{Query: "q", Version: "test", Views: []viewDef{view}, SQL: sql})
+		if path != "" {
+			_ = os.Remove(path)
+		}
+		return err
+	}
+	if err := run("SELECT count(*) FROM __igloo_split WHERE l_quantity > (SELECT avg(l_quantity) FROM __igloo_split)"); err != nil {
+		t.Errorf("a fragment over its views: %v", err)
+	}
+	if err := run("WITH x AS (SELECT * FROM __igloo_split) SELECT count(*) FROM x"); err != nil {
+		t.Errorf("a fragment with a common table expression: %v", err)
+	}
+	for _, sql := range []string{
+		"SELECT count(*) FROM read_parquet(" + quoteLiteral(file) + ")",
+		"SELECT count(*) FROM " + quoteLiteral(file),
+		"SELECT count(*) FROM __igloo_split WHERE l_orderkey IN (SELECT l_orderkey FROM read_parquet(" + quoteLiteral(file) + "))",
+		"SELECT count(*) FROM main.lineitem",
+		"SELECT count(*) FROM lineitem",
+		"SELECT * FROM (SUMMARIZE __igloo_split)",
+		"SELECT 1; SELECT 2",
+	} {
+		if err := run(sql); !IsUnsupported(err) {
+			t.Errorf("%s: want it refused, got %v", sql, err)
+		}
 	}
 }

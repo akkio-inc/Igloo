@@ -126,10 +126,17 @@ type fedServer struct {
 // its engine opens, as Igloo does on startup.
 func startFedServer(t *testing.T, store *federation.MemoryStore, hooks ...func(*Server)) *fedServer {
 	t.Helper()
+	return startFedServerWithConfig(t, store, config.Config{}, hooks...)
+}
+
+// startFedServerWithConfig is startFedServer with the engine configured by
+// cfg, whose extension directory it fills in.
+func startFedServerWithConfig(t *testing.T, store *federation.MemoryStore, cfg config.Config, hooks ...func(*Server)) *fedServer {
+	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fed := federation.NewManager(store, federation.Options{}, log)
-	cfg := config.Config{DuckDB: config.DuckDB{ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")}}
+	cfg.DuckDB.ExtensionDir = os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	eng, err := engine.Open(ctx, cfg, log, engine.BeforeLockdown(fed.Attach))
 	if err != nil {
 		t.Fatal(err)

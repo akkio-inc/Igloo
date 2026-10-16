@@ -85,6 +85,10 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || sess.mode() == distributed.ModeOff {
 		return 0, false, nil
 	}
+	if reason := policyReason(st); reason != "" {
+		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", reason)
+		return 0, false, nil
+	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
 	plan, err := s.dist.Plan(ctx, st.query, env, sess.mode())
 	if err != nil {
@@ -134,6 +138,27 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		return 0, false, nil
 	}
 	return ex.Workers, true, nil
+}
+
+// policyReason says why masking and row access policies keep st on this
+// replica, or is empty. Workers read table files directly and know nothing
+// of the requesting user, so they cannot apply policies: a statement that
+// policies rewrote, that reads a protected table or that names anything
+// policies concern (a protected table, or a view or macro that reads one)
+// is not distributed. sessionEnv.Table refuses protected tables as well,
+// should a statement reach the planner without having triggered the
+// rewriter.
+func policyReason(st *statement) string {
+	g := st.guard
+	switch {
+	case st.original != "":
+		return "masking or row access policies rewrote it"
+	case g != nil && (g.touched || len(g.applied) > 0):
+		return "masking or row access policies apply to what it reads"
+	case g != nil && g.nonce != "":
+		return "it names something masking or row access policies concern"
+	}
+	return ""
 }
 
 // runFinal runs the part of a distributed statement that combines its
@@ -256,6 +281,9 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 			return nil, false, nil
 		}
 	}
+	if e.s.Protected(ctx, o.schema, o.name) {
+		return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies apply to it"}, true, nil
+	}
 	t, err := e.s.dist.Table(ctx, o.schema, o.name)
 	if err != nil {
 		return nil, false, err
@@ -282,6 +310,26 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		}
 	}
 	return t, true, nil
+}
+
+// View reports whether a name may mean a view in this session: a view of
+// any database, or a name that does not resolve to exactly one relation.
+func (e *sessionEnv) View(ctx context.Context, parts []string) (bool, error) {
+	if e.resolver == nil {
+		r, err := e.s.newResolver(ctx, e.sess)
+		if err != nil {
+			return false, err
+		}
+		e.resolver = r
+	}
+	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	if err != nil {
+		return false, err
+	}
+	if len(res.all) != 1 || len(res.first) != 1 {
+		return true, nil
+	}
+	return res.first[0].view, nil
 }
 
 // tableColumns lists a table's columns as DuckDB has them.

@@ -121,7 +121,7 @@ func (s *Iceberg) Refresh(ctx context.Context, t *Table) error {
 	if fresh.Unsupported != "" {
 		return unsupported("table %s: %s", t, fresh.Unsupported)
 	}
-	t.Bytes, t.Snapshot, t.source = fresh.Bytes, fresh.Snapshot, fresh.source
+	t.Bytes, t.Snapshot, t.Versioned, t.source = fresh.Bytes, fresh.Snapshot, fresh.Versioned, fresh.source
 	return nil
 }
 
@@ -131,7 +131,7 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	if err != nil {
 		return nil, fmt.Errorf("load %s.%s: %w", schema, name, err)
 	}
-	t := &Table{Schema: schema, Name: name}
+	t := &Table{Schema: schema, Name: name, Versioned: true}
 	for _, f := range tbl.Schema().Fields() {
 		typ, ok := duckType(f.Type)
 		if !ok && t.Unsupported == "" {

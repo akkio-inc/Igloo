@@ -233,6 +233,74 @@ func TestSchemaEvolution(t *testing.T) {
 	}
 }
 
+// TestSnapshotPins checks that the coordinator's own reads of a table the
+// workers read are pinned to the snapshot the workers read, and that a
+// view in the coordinator's part, which could read such a table at another
+// snapshot, keeps the statement on one machine.
+func TestSnapshotPins(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	ctx := t.Context()
+	// The job reads nation in full; the scalar subquery, on the
+	// coordinator, reads it again.
+	const job = `(SELECT n_name, count(*) AS c FROM lineitem JOIN supplier ON l_suppkey = s_suppkey
+		JOIN main.nation ON s_nationkey = n_nationkey GROUP BY 1) AS x`
+	q := `SELECT x.n_name, x.c, (SELECT count(*) FROM nation) AS nations FROM ` + job + ` ORDER BY 1`
+	// The harness's files have no snapshots, so nothing is pinned.
+	if !h.check(q) {
+		t.Fatal("did not run distributed")
+	}
+	nation := h.tables["nation"]
+	defer func() { nation.Versioned, nation.Snapshot = false, 0 }()
+	nation.Versioned, nation.Snapshot = true, 4242
+	plan, err := h.co.Plan(ctx, q, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex, err := h.co.Execute(ctx, plan, h.settings(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex.Close()
+	if n := strings.Count(ex.SQL, "AT (VERSION => 4242)"); n != 1 || strings.Count(ex.SQL, "AT (") != 1 {
+		t.Errorf("want the coordinator's read of nation, alone, pinned (pins %v):\n%q", plan.pins, ex.SQL)
+	}
+	// A table with snapshots but none yet cannot be pinned.
+	nation.Snapshot = 0
+	if plan, err = h.co.Plan(ctx, q, harnessEnv{h}, ModeOn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.co.Execute(ctx, plan, h.settings(ctx)); !IsUnsupported(err) {
+		t.Errorf("a table without a snapshot yet: %v", err)
+	}
+	nation.Versioned = false
+
+	h.exec("CREATE VIEW nations AS SELECT * FROM nation")
+	for _, q := range []string{
+		`SELECT x.n_name, x.c, (SELECT count(*) FROM nations) AS nations FROM ` + job,
+		// The coordinator's nation is the common table expression, unless
+		// the name means the table there.
+		`WITH nation AS (SELECT 1 AS n) SELECT x.n_name, x.c, (SELECT count(*) FROM nation) AS k FROM ` + job,
+	} {
+		if _, err := h.co.Plan(ctx, q, harnessEnv{h}, ModeOn); !IsUnsupported(err) {
+			t.Errorf("want it to run on one machine, got %v: %s", err, q)
+		}
+	}
+}
+
+// TestSharedFiles checks a table whose files lie under another table's
+// directory, as a clone's do: workers read the files its metadata lists,
+// wherever they are in the warehouse.
+func TestSharedFiles(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	li := h.tables["lineitem"]
+	clone := &Table{Schema: "main", Name: "lineitem_clone", Columns: li.Columns, Bytes: li.Bytes}
+	h.tables["lineitem_clone"], h.files[clone.key()] = clone, h.files[li.key()]
+	h.exec("CREATE OR REPLACE VIEW main.lineitem_clone AS SELECT * FROM lineitem")
+	if !h.check(`SELECT l_returnflag, count(*), sum(l_quantity) FROM lineitem_clone GROUP BY 1 ORDER BY 1`) {
+		t.Error("did not run distributed")
+	}
+}
+
 // TestLocal covers statements that must run on one machine.
 func TestLocal(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)

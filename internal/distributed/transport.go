@@ -5,6 +5,7 @@ import (
 	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -69,7 +70,8 @@ func newTransport(secret string) (*transport, error) {
 		if err != nil {
 			return err
 		}
-		if k, ok := c.PublicKey.(ed25519.PublicKey); !ok || !k.Equal(pub) {
+		// The key is public, but compared in constant time all the same.
+		if k, ok := c.PublicKey.(ed25519.PublicKey); !ok || subtle.ConstantTimeCompare(k, pub) != 1 {
 			return errors.New("peer does not hold the worker secret")
 		}
 		return nil

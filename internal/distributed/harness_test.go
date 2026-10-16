@@ -97,6 +97,18 @@ func (e harnessEnv) Describe(ctx context.Context, query string) ([]Column, error
 
 func (e harnessEnv) UserFunction(context.Context, string) (bool, error) { return false, nil }
 
+// View reports views the session has besides the tables' own, which the
+// harness defines as views over their files.
+func (e harnessEnv) View(ctx context.Context, parts []string) (bool, error) {
+	name := strings.ToLower(parts[len(parts)-1])
+	if _, ok := e.h.tables[name]; ok {
+		return false, nil
+	}
+	var n int
+	err := e.h.session.QueryRowContext(ctx, "SELECT count(*) FROM duckdb_views() WHERE lower(view_name) = "+quoteLiteral(name)+" AND NOT internal").Scan(&n)
+	return n > 0, err
+}
+
 func (e harnessEnv) Setting(ctx context.Context, name string) (string, error) {
 	var v string
 	err := e.h.session.QueryRowContext(ctx, "SELECT current_setting("+quoteLiteral(name)+")::VARCHAR").Scan(&v)
