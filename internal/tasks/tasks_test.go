@@ -101,6 +101,36 @@ func testStore(t *testing.T, s Store) {
 		t.Fatal(err)
 	}
 	unlock2()
+	// A lease says whether it is still held, and excludes as a lock does.
+	lease, ok, err := s.TryLease(ctx, "erasure")
+	if !ok || err != nil {
+		t.Fatalf("lease: %v %v", ok, err)
+	}
+	if err := lease.Held(ctx); err != nil {
+		t.Errorf("held: %v", err)
+	}
+	if _, ok, _ := s.TryLease(ctx, "erasure"); ok {
+		t.Error("leased twice")
+	}
+	if _, ok, _ := s.TryLock(ctx, "erasure"); ok {
+		t.Error("locked what is leased")
+	}
+	lease.Release()
+	lease, ok, err = s.TryLease(ctx, "erasure")
+	if !ok || err != nil {
+		t.Fatalf("lease after release: %v %v", ok, err)
+	}
+	// A lease whose connection dropped is lost.
+	if pg, isPG := s.(*PostgresStore); isPG {
+		if _, err := pg.pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks
+			WHERE locktype = 'advisory' AND objid::bigint = $1::bigint & 4294967295`, lockID("erasure")); err != nil {
+			t.Fatal(err)
+		}
+		if err := lease.Held(ctx); err == nil {
+			t.Error("a lease whose connection was terminated is held")
+		}
+	}
+	lease.Release()
 
 	// Runs.
 	runs := []Run{
