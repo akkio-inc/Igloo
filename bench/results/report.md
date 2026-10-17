@@ -1,4 +1,4 @@
-# Cost comparison: tpch at scale 10
+# Cost comparison: tpch at scale 10, 100
 
 Monthly figures assume the suite runs 24 times a day, each run a separate burst that starts from a stopped warehouse or machine. Always-on Igloo serves them all from one machine.
 
@@ -16,12 +16,28 @@ Monthly figures assume the suite runs 24 times a day, each run a separate burst 
 | igloo | c7g.2xlarge (local disk) | 10 | $0.291 | - | 13.8s | 9.3s | $0.0008 | $0.0011 | $213 | - |
 | igloo | c7g.4xlarge (S3) | 10 | $0.580 | - | 31.2s | 5.6s | $0.0009 | $0.0050 | $424 | - |
 | igloo | c7g.4xlarge (local disk) | 10 | $0.580 | - | 9.3s | 5.5s | $0.0009 | $0.0015 | $424 | - |
+| igloo, scale to zero | c7g.4xlarge (S3, disk cache) | 100 | $0.578 | 16.6s | 136.1s | 58.5s | $0.0094 | $0.034 | $29.59 | - |
+| igloo, scale to zero | c7g.8xlarge (S3, disk cache) | 100 | $1.16 | 17.2s | 64.8s | 27.5s | $0.0088 | $0.046 | $37.95 | - |
+| igloo, scale to zero | c7g.4xlarge (S3, empty disk cache) | 100 | $0.578 | 16.3s | 333.3s | 59.1s | $0.0095 | $0.066 | $52.66 | - |
+| igloo, scale to zero | c7g.8xlarge (S3, empty disk cache) | 100 | $1.16 | 18.1s | 160.1s | 27.6s | $0.0089 | $0.077 | $60.53 | - |
+| igloo, scale to zero | c7g.16xlarge (S3, disk cache) | 100 | $2.32 | 17.9s | 57.0s | 17.8s | $0.011 | $0.087 | $68.13 | - |
+| igloo, scale to zero | c7g.16xlarge (S3, empty disk cache) | 100 | $2.32 | 17.7s | 101.5s | 17.8s | $0.011 | $0.116 | $88.94 | - |
+| snowflake | XS | 100 | $3.00 | - | 208.4s | 185.4s | $0.154 | $0.224 | $163 | - |
+| snowflake | S | 100 | $6.00 | - | 126.6s | 113.2s | $0.189 | $0.311 | $227 | - |
+| databricks | 2XS | 100 | $2.80 | - | 163.6s | 126.5s | $0.098 | $0.361 | $263 | - |
+| snowflake | M | 100 | $12.00 | - | 114.3s | 85.7s | $0.286 | $0.581 | $424 | - |
+| databricks | S | 100 | $8.40 | - | 84.8s | 62.8s | $0.147 | $0.898 | $655 | - |
+| snowflake | L | 100 | $24.00 | - | 80.6s | 66.2s | $0.441 | $0.937 | $684 | - |
+| databricks | M | 100 | $16.80 | - | 71.0s | 48.1s | $0.225 | $1.73 | $1,263 | - |
+| snowflake | XL | 100 | $48.00 | - | 70.5s | 57.0s | $0.760 | $1.74 | $1,269 | - |
+| databricks | L | 100 | $28.00 | - | 66.0s | 44.2s | $0.344 | $2.85 | $2,077 | - |
+| databricks | XL | 100 | $56.00 | - | 65.3s | 43.3s | $0.674 | $5.68 | $4,146 | - |
 
 Scale to zero: resume is the median time from a client connecting to a stopped machine until Igloo answered, over every burst measured. A burst is billed for the resume, the cold run and 60s of idleness; the gateway ($3.07/month) and disk ($1.61/month) run all month.
 
-## Warm run time per query (median seconds)
+## Warm run time per query at scale 10 (median seconds)
 
-| Query | databricks 2XS sf10 | igloo, scale to zero c7g.2xlarge (local disk) sf10 | igloo, scale to zero c7g.2xlarge (S3) sf10 | igloo c7g.2xlarge (local disk) sf10 | igloo, scale to zero c7g.4xlarge (local disk) sf10 | igloo c7g.4xlarge (S3) sf10 | igloo, scale to zero c7g.4xlarge (S3) sf10 | igloo, scale to zero c7g.4xlarge (S3, empty disk cache) sf10 | igloo, scale to zero c7g.4xlarge (S3, disk cache) sf10 | igloo c7g.4xlarge (local disk) sf10 | igloo, scale to zero c7g.8xlarge (local disk) sf10 | snowflake XS sf10 |
+| Query | databricks 2XS | igloo, scale to zero c7g.2xlarge (local disk) | igloo, scale to zero c7g.2xlarge (S3) | igloo c7g.2xlarge (local disk) | igloo, scale to zero c7g.4xlarge (local disk) | igloo c7g.4xlarge (S3) | igloo, scale to zero c7g.4xlarge (S3) | igloo, scale to zero c7g.4xlarge (S3, empty disk cache) | igloo, scale to zero c7g.4xlarge (S3, disk cache) | igloo c7g.4xlarge (local disk) | igloo, scale to zero c7g.8xlarge (local disk) | snowflake XS |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | q01 | 0.96 | 0.57 | 0.49 | 0.48 | 0.27 | 0.27 | 0.27 | 0.29 | 0.28 | 0.27 | 0.19 | 1.04 |
 | q02 | 2.08 | 0.16 | 0.14 | 0.14 | 0.11 | 0.11 | 0.11 | 0.11 | 0.11 | 0.11 | 0.10 | 1.30 |
@@ -45,3 +61,30 @@ Scale to zero: resume is the median time from a client connecting to a stopped m
 | q20 | 1.23 | 0.43 | 0.35 | 0.35 | 0.22 | 0.22 | 0.22 | 0.21 | 0.22 | 0.22 | 0.18 | 1.25 |
 | q21 | 1.93 | 1.45 | 1.31 | 1.30 | 0.75 | 0.75 | 0.74 | 0.75 | 0.74 | 0.75 | 0.51 | 2.79 |
 | q22 | 0.76 | 0.19 | 0.16 | 0.16 | 0.10 | 0.10 | 0.10 | 0.10 | 0.10 | 0.10 | 0.09 | 0.91 |
+
+## Warm run time per query at scale 100 (median seconds)
+
+| Query | databricks 2XS | databricks L | databricks M | databricks S | databricks XL | igloo, scale to zero c7g.16xlarge (S3, empty disk cache) | igloo, scale to zero c7g.16xlarge (S3, disk cache) | igloo, scale to zero c7g.4xlarge (S3, empty disk cache) | igloo, scale to zero c7g.4xlarge (S3, disk cache) | igloo, scale to zero c7g.8xlarge (S3, empty disk cache) | igloo, scale to zero c7g.8xlarge (S3, disk cache) | snowflake L | snowflake M | snowflake S | snowflake XL | snowflake XS |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q01 | 5.05 | 1.47 | 1.88 | 3.95 | 1.13 | 0.72 | 0.72 | 2.43 | 2.42 | 1.28 | 1.29 | 1.30 | 2.67 | 4.53 | 1.08 | 8.75 |
+| q02 | 3.44 | 2.52 | 2.14 | 2.17 | 2.27 | 0.23 | 0.22 | 0.47 | 0.47 | 0.31 | 0.31 | 4.30 | 6.09 | 5.21 | 6.22 | 12.27 |
+| q03 | 5.74 | 2.37 | 3.50 | 2.95 | 2.21 | 0.71 | 0.70 | 2.04 | 2.03 | 1.14 | 1.13 | 3.05 | 2.99 | 4.26 | 2.73 | 7.60 |
+| q04 | 2.99 | 1.43 | 1.45 | 1.76 | 1.22 | 0.53 | 0.52 | 1.48 | 1.46 | 0.85 | 0.85 | 1.75 | 2.86 | 3.74 | 1.84 | 7.66 |
+| q05 | 7.11 | 4.13 | 3.24 | 3.99 | 3.04 | 0.74 | 0.74 | 2.32 | 2.33 | 1.24 | 1.25 | 3.50 | 4.27 | 5.59 | 3.58 | 9.03 |
+| q06 | 2.08 | 0.53 | 0.67 | 0.84 | 0.48 | 0.33 | 0.33 | 0.90 | 0.89 | 0.51 | 0.51 | 0.32 | 0.24 | 0.26 | 0.19 | 0.48 |
+| q07 | 7.23 | 2.05 | 2.38 | 3.26 | 1.95 | 0.75 | 0.74 | 2.09 | 2.09 | 1.18 | 1.17 | 2.24 | 3.26 | 3.46 | 2.33 | 5.09 |
+| q08 | 8.15 | 3.22 | 3.46 | 4.36 | 5.42 | 0.83 | 0.82 | 2.40 | 2.38 | 1.32 | 1.31 | 2.59 | 2.97 | 3.97 | 2.36 | 7.05 |
+| q09 | 11.26 | 3.36 | 3.23 | 4.77 | 2.37 | 2.40 | 2.42 | 14.94 | 14.45 | 3.62 | 3.61 | 7.71 | 9.06 | 11.27 | 5.82 | 18.22 |
+| q10 | 7.85 | 2.41 | 2.74 | 3.29 | 3.28 | 0.82 | 0.84 | 2.33 | 2.33 | 1.32 | 1.31 | 2.65 | 4.42 | 7.25 | 2.18 | 10.41 |
+| q11 | 1.81 | 1.22 | 1.14 | 1.19 | 1.67 | 0.18 | 0.18 | 0.41 | 0.40 | 0.25 | 0.23 | 6.88 | 5.31 | 5.83 | 6.20 | 10.32 |
+| q12 | 3.73 | 1.97 | 2.19 | 2.25 | 2.06 | 0.44 | 0.43 | 1.20 | 1.21 | 0.68 | 0.68 | 1.97 | 1.58 | 1.89 | 1.37 | 2.66 |
+| q13 | 5.53 | 1.29 | 1.58 | 2.32 | 1.25 | 1.20 | 1.20 | 3.43 | 3.52 | 1.87 | 1.87 | 3.49 | 5.20 | 8.47 | 2.94 | 14.33 |
+| q14 | 3.63 | 0.78 | 1.06 | 1.53 | 0.78 | 0.60 | 0.59 | 1.56 | 1.56 | 0.92 | 0.90 | 0.58 | 0.62 | 0.73 | 0.56 | 0.88 |
+| q15 | 7.26 | 2.12 | 2.03 | 3.01 | 1.48 | 0.52 | 0.52 | 1.35 | 1.36 | 0.78 | 0.78 | 0.68 | 0.76 | 1.22 | 0.56 | 1.87 |
+| q16 | 3.83 | 2.43 | 2.47 | 2.87 | 2.55 | 0.41 | 0.41 | 0.82 | 0.83 | 0.52 | 0.51 | 4.58 | 5.32 | 6.60 | 3.99 | 10.02 |
+| q17 | 4.74 | 1.41 | 1.77 | 2.23 | 1.51 | 0.71 | 0.72 | 2.03 | 2.05 | 1.14 | 1.14 | 1.39 | 1.64 | 2.45 | 0.94 | 4.57 |
+| q18 | 14.06 | 2.65 | 3.34 | 5.54 | 2.15 | 1.29 | 1.29 | 4.27 | 4.33 | 1.95 | 1.95 | 3.58 | 5.96 | 10.95 | 2.56 | 17.20 |
+| q19 | 3.40 | 0.90 | 1.13 | 1.49 | 0.85 | 0.69 | 0.68 | 1.90 | 1.91 | 1.09 | 1.09 | 1.51 | 1.60 | 2.51 | 0.77 | 4.55 |
+| q20 | 4.51 | 1.60 | 1.77 | 2.22 | 1.53 | 0.73 | 0.74 | 1.77 | 1.78 | 1.06 | 1.06 | 5.16 | 6.02 | 6.23 | 4.59 | 6.91 |
+| q21 | 11.06 | 3.15 | 3.76 | 5.43 | 2.83 | 2.68 | 2.68 | 8.14 | 7.89 | 4.08 | 4.08 | 5.64 | 9.68 | 14.01 | 2.90 | 21.95 |
+| q22 | 2.02 | 1.24 | 1.20 | 1.39 | 1.27 | 0.30 | 0.31 | 0.85 | 0.84 | 0.49 | 0.47 | 1.30 | 3.24 | 2.75 | 1.26 | 3.54 |

@@ -29,7 +29,7 @@ minimum_seconds = 0
 
 [igloo]
 # EC2 on-demand, per hour, for the machine Igloo runs on.
-instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge" = 1.157, "c7gd.4xlarge" = 0.726, "m7g.4xlarge" = 0.653, "r7g.4xlarge" = 0.857, "r7g.8xlarge" = 1.714 }
+instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge" = 1.157, "c7g.16xlarge" = 2.32, "c7gd.4xlarge" = 0.726, "m7g.4xlarge" = 0.653, "r7g.4xlarge" = 0.857, "r7g.8xlarge" = 1.714 }
 # Costs that run all month whatever the machine does. The benchmark uses
 # Igloo's single-machine setup (deploy/single-vm), whose catalog database
 # lives on the machine's disk: 20 GB of gp3 at $0.08 per GB-month, enough
@@ -37,7 +37,10 @@ instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge
 # in object storage, which is left out for every platform; the benchmark
 # machine kept TPC-H scale 10 (about 3 GB) on a larger disk, which this
 # does not charge for. A Kubernetes deployment pays for a managed PostgreSQL
-# instead, about 0.05 for RDS db.t4g.small with storage.
+# instead, about 0.05 for RDS db.t4g.small with storage. At scale 100 the
+# read cache holds 27 GB, and the benchmark machine's disk was 100 GB of gp3
+# at 6,000 IOPS and 500 MB/s, about $38 a month: pass
+# --set igloo.fixed_per_hour=0.052 to charge for it.
 fixed_per_hour = 0.0022
 # Scale to zero (docs/scale-to-zero.md): the always-on gateway machine
 # (t4g.nano); how long Igloo may idle before the gateway stops it

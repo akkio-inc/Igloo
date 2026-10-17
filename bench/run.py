@@ -36,7 +36,10 @@ def connect(platform: str):
     if platform == "igloo":
         import psycopg
 
-        return psycopg.connect(env["IGLOO_DSN"], autocommit=True), []
+        # IGLOO_SCHEMA picks the schema holding the tables, e.g. one per
+        # scale factor.
+        setup = [f"SET search_path = '{env['IGLOO_SCHEMA']}'"] if "IGLOO_SCHEMA" in env else []
+        return psycopg.connect(env["IGLOO_DSN"], autocommit=True), setup
     if platform == "snowflake":
         import snowflake.connector
 

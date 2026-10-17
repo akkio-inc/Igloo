@@ -177,17 +177,18 @@ def main() -> None:
                   f" {prices['suspend_after_seconds']:g}s of idleness; the gateway ({money(prices['gateway_per_hour'] * HOURS_PER_MONTH)}/month)"
                   f" and disk ({money(prices['fixed_per_hour'] * HOURS_PER_MONTH)}/month) run all month.\n")
 
-    out.write("\n## Warm run time per query (median seconds)\n\n")
-    primary = rows
-    names = sorted({q for r in primary for q in r["per_query"]})
-    out.write("| Query | " + " | ".join(f"{r['platform']} {r['size']} sf{r['scale']:g}" for r in primary) + " |\n")
-    out.write("|---|" + "---|" * len(primary) + "\n")
-    for name in names:
-        cells = []
-        for r in primary:
-            v = r["per_query"].get(name)
-            cells.append("failed" if v is None else f"{v:.2f}")
-        out.write(f"| {name} | " + " | ".join(cells) + " |\n")
+    for scale in scales:
+        primary = [r for r in rows if r["scale"] == scale]
+        out.write(f"\n## Warm run time per query at scale {scale:g} (median seconds)\n\n")
+        names = sorted({q for r in primary for q in r["per_query"]} | {q for r in primary for q in r["failed"]})
+        out.write("| Query | " + " | ".join(f"{r['platform']} {r['size']}" for r in primary) + " |\n")
+        out.write("|---|" + "---|" * len(primary) + "\n")
+        for name in names:
+            cells = []
+            for r in primary:
+                v = r["per_query"].get(name)
+                cells.append("failed" if v is None else f"{v:.2f}")
+            out.write(f"| {name} | " + " | ".join(cells) + " |\n")
 
 
 if __name__ == "__main__":
