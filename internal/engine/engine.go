@@ -14,8 +14,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
@@ -42,6 +45,9 @@ type Engine struct {
 	parser    *parser
 	// catalog is the attached Iceberg catalog's name in SQL, if any.
 	catalog string
+	// proxy carries DuckDB's requests to the catalog, if any, and makes
+	// each change happen once (see package catalogproxy).
+	proxy *catalogproxy.Proxy
 	// local is DuckDB's own database, where Igloo keeps its copies of the
 	// catalog's views: DuckDB cannot keep views in an Iceberg catalog.
 	local string
@@ -86,7 +92,11 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 	e := &Engine{connector: connector, parser: p}
 	if err := e.setup(ctx, cfg, log, o); err != nil {
 		p.close()
-		return nil, errors.Join(err, connector.Close())
+		err = errors.Join(err, connector.Close())
+		if e.proxy != nil {
+			err = errors.Join(err, e.proxy.Close())
+		}
+		return nil, err
 	}
 	if e.cache != nil {
 		e.startCache(log)
@@ -181,7 +191,11 @@ func (e *Engine) Ping(ctx context.Context) error {
 func (e *Engine) Close() error {
 	e.stopCache()
 	e.parser.close()
-	return e.connector.Close()
+	err := e.connector.Close()
+	if e.proxy != nil {
+		err = errors.Join(err, e.proxy.Close())
+	}
+	return err
 }
 
 func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger, o options) error {
@@ -248,7 +262,23 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 		return err
 	}
 
-	attach := attachStatement(cfg.Catalog)
+	// DuckDB reaches the catalog through a proxy that applies each commit
+	// once, whatever the catalog answers (see package catalogproxy), and
+	// deletes the files of commits the catalog refused.
+	proxyOpts := catalogproxy.Options{
+		Catalog: cfg.Catalog.URI,
+		Files: func(ctx context.Context) (iceio.IO, error) {
+			return catalog.FS(ctx, cfg.Storage, cfg.Storage.Location)
+		},
+		Log: log,
+	}
+	for _, f := range o.catalogProxy {
+		f(&proxyOpts)
+	}
+	if e.proxy, err = catalogproxy.New(proxyOpts); err != nil {
+		return err
+	}
+	attach := attachStatement(cfg.Catalog, e.proxy.URL())
 	for {
 		err := exec(attach)
 		if err == nil {
@@ -423,16 +453,22 @@ func secret(opts ...string) string {
 	return "CREATE OR REPLACE SECRET igloo_storage (" + strings.Join(opts, ", ") + ")"
 }
 
-// attachStatement attaches the Iceberg REST catalog. Igloo uses its own
-// storage credentials rather than ones vended by the catalog, so it works
-// with object stores that have no STS endpoint. DROP TABLE never asks the
-// catalog to purge the table's files (DuckDB's default for REST catalogs
-// other than AWS's, made explicit): the catalog would delete everything
-// under the table's location, files that clones of it share included.
-func attachStatement(c config.Catalog) string {
+// attachStatement attaches the Iceberg REST catalog at endpoint, the
+// catalog proxy. Igloo uses its own storage credentials rather than ones
+// vended by the catalog, so it works with object stores that have no STS
+// endpoint. DROP TABLE never asks the catalog to purge the table's files
+// (DuckDB's default for REST catalogs other than AWS's, made explicit):
+// the catalog would delete everything under the table's location, files
+// that clones of it share included. DuckDB never deletes the files it
+// wrote for a commit that failed (REMOVE_FILES_ON_DELETE false): when the
+// catalog does not confirm a commit's outcome, the commit may have landed
+// and its files be the table's. The proxy deletes those of commits the
+// catalog refused, and the orphan cleanup those of statements that failed
+// or were rolled back before their commit.
+func attachStatement(c config.Catalog, endpoint string) string {
 	return fmt.Sprintf(
-		"ATTACH %s AS %s (TYPE iceberg, ENDPOINT %s, AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', PURGE_REQUESTED false)",
-		literal(c.Warehouse), ident(c.Name), literal(c.URI),
+		"ATTACH %s AS %s (TYPE iceberg, ENDPOINT %s, AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', PURGE_REQUESTED false, REMOVE_FILES_ON_DELETE false)",
+		literal(c.Warehouse), ident(c.Name), literal(endpoint),
 	)
 }
 

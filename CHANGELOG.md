@@ -472,4 +472,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   pool), and `deploy/single-vm/compute-pool.yml` for Docker Compose.
   `IGLOO_POOL` names a replica's pool in the history and usage.
 
+### Fixed
+
+- A write could land twice, with the first copy's data file deleted, when
+  the catalog applied a commit but answered with an error or not at all
+  (seen under heavy load as a 503). DuckDB sent the commit again, the
+  catalog refused the repeat as a conflict, DuckDB deleted the files of the
+  commit it took for failed, and Igloo ran the statement again. DuckDB now
+  reaches the catalog through a proxy inside Igloo that applies each commit
+  exactly once: it sends commits again itself, with an `Idempotency-Key`,
+  checks a refused commit's snapshot against the table before believing the
+  refusal, and deletes the files of commits the catalog refused. DuckDB no
+  longer deletes files itself, so a table never references a missing file;
+  when the catalog cannot be reached long enough that a write's outcome is
+  unknown, the statement fails with SQLSTATE `40003` instead of `40001`, and
+  its files are kept (docs/operations.md#writes-when-the-catalog-fails).
+
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

@@ -133,10 +133,16 @@ func startServer(t *testing.T, configure ...func(*Options)) *testServer {
 // startServerWithConfig is startServer with an engine configured by cfg.
 func startServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*Options)) *testServer {
 	t.Helper()
+	return startServerWithEngine(t, cfg, nil, configure...)
+}
+
+// startServerWithEngine is startServerWithConfig with engine options.
+func startServerWithEngine(t *testing.T, cfg config.Config, engineOpts []engine.Option, configure ...func(*Options)) *testServer {
+	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	eng, err := engine.Open(ctx, cfg, log)
+	eng, err := engine.Open(ctx, cfg, log, engineOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}

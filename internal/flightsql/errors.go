@@ -61,6 +61,9 @@ func grpcCode(state pgcodes.Code) codes.Code {
 		return codes.NotFound
 	case pgcodes.DuplicateObject, pgcodes.DuplicateSchema, pgcodes.DuplicateColumn, pgcodes.UniqueViolation, "42P07":
 		return codes.AlreadyExists
+	case pgcodes.StatementCompletionUnknown:
+		// Not Aborted, which clients retry: the commit may have landed.
+		return codes.Unknown
 	}
 	if len(state) < 2 {
 		return codes.Unknown

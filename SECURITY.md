@@ -293,7 +293,14 @@ reference for every setting mentioned here.
   catalog through Igloo instead. A client that reaches it and asks it to
   drop a table with a purge deletes every file under the table's location,
   files that clones of the table read included; Igloo never asks for one,
-  and refuses engines' purges of tables whose files clones read.
+  and refuses engines' purges of tables whose files clones read. DuckDB
+  reaches the catalog through a proxy inside Igloo on the loopback
+  interface, under a random path, which makes each commit apply once
+  ([details](docs/operations.md#writes-when-the-catalog-fails)); the query
+  sandbox does not let SQL reach it, and errors show the catalog's address
+  instead of the proxy's. Of a commit the catalog refused, the proxy
+  deletes only the files that the commit's own snapshots list as added,
+  under the table's location.
 - **Other engines.** Port 8181 (`IGLOO_ICEBERG_ADDR`) serves the Iceberg REST
   catalog to Spark, Trino and other engines
   ([details](docs/external-engines.md)). Engines get an access token by

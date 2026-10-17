@@ -322,6 +322,41 @@ share nothing but the catalog and object storage:
   transaction. Many small concurrent writes to one table are slow; batch them
   into fewer, larger statements.
 
+## Writes when the catalog fails
+
+Every write ends with a commit to the Iceberg catalog. An overloaded catalog,
+or a load balancer in front of it, can apply a commit and still answer with
+an error, or not answer at all. DuckDB reaches the catalog through a proxy
+inside Igloo, on the loopback interface, that applies each commit exactly
+once whatever the catalog answers:
+
+- **Errors and timeouts.** A commit the catalog answers with a 5xx, 408 or
+  429, or does not answer within 30 seconds, is sent again, with the same
+  `Idempotency-Key`. Lakekeeper answers a repeat of a commit it already
+  applied with that commit's success, and does not apply it again. DuckDB's
+  own repeats of a request it stopped waiting for never reach the catalog.
+- **Refusals.** When the catalog refuses a commit, Igloo first checks
+  whether the snapshot it adds is in the table, which it is when an earlier
+  attempt landed. If it is, the write succeeded. If not, another writer
+  committed first: the refusal is a conflict, retried as described under
+  [concurrent writes](#scaling-out), and the files written for the refused
+  commit are deleted straight away.
+- **Unknown outcome.** If the catalog cannot be reached for about 90
+  seconds after an attempt whose outcome was lost, the statement fails with
+  SQLSTATE `40003` (`statement_completion_unknown`): the write may or may
+  not have landed. Igloo does not run it again, and clients that retry
+  `40001` should not retry `40003`: check the table first, for example with
+  `SELECT * FROM iceberg_snapshots('lake.public.events')`. The write's files
+  are kept either way, so the table is never left referencing a missing
+  file. If the write did not land, the [orphan
+  cleanup](#table-maintenance) deletes them after three days, as it does
+  the files of statements that fail or roll back before they commit.
+
+The log (component `catalog-proxy`) records each commit sent again and each
+outcome confirmed after an error. Catalogs that ignore `Idempotency-Key`
+get the same guarantee for writes that change rows; a schema change whose
+answer was lost may then fail even though it was applied.
+
 ## Workload management
 
 [Workload management](workload-management.md) covers attributing and
@@ -620,6 +655,7 @@ and the catalog runs its database migrations before it serves. Read
 | `send one statement at a time` | Only admins may send several statements in one query. Most tools send one at a time; for scripts, run them as an admin or split them. |
 | `Permission Error: Cannot access file ...` | The sandbox blocked a file or URL outside the warehouse. To load from or export to another bucket, add it to `IGLOO_ALLOWED_LOCATIONS`. |
 | SQLSTATE `40001`, `CatalogCommitConflicts` | Two writers committed to the same table at once inside explicit transactions. Retry the transaction. |
+| SQLSTATE `40003`, `CommitStateUnknownException` | The catalog did not answer whether a write was applied ([writes when the catalog fails](#writes-when-the-catalog-fails)). Check the table's snapshots before running the write again, and the catalog's health. |
 | SQLSTATE `57014` | The statement was canceled, by the client or by `statement_timeout`. |
 | SQLSTATE `57014`, `it waited 30s to start, behind the limit of 4 statements at once for role analysts` | The statement waited for its [role limits](workload-management.md#role-limits) until its timeout. Run fewer statements at once, raise the limit, or give the team a compute pool. |
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |

@@ -9,18 +9,22 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/federation"
 )
 
 // pgError attaches a Postgres SQLSTATE to err so clients can react to the kind
 // of failure (retry a conflict, report a missing table) rather than only
 // showing the message. DuckDB's postgres and mysql extensions may quote
-// the token they sign in to connections' proxies with; it is replaced.
+// the token they sign in to connections' proxies with; it is replaced. Its
+// iceberg extension quotes the catalog proxy's URL, which becomes the
+// catalog's.
 func pgError(err error) error {
 	err = codedError(err)
 	if err != nil {
-		if msg := err.Error(); federation.Scrub(msg) != msg {
-			return pgerror.WithCode(errors.New(federation.Scrub(msg)), pgerror.GetCode(err))
+		msg := err.Error()
+		if scrubbed := catalogproxy.Scrub(federation.Scrub(msg)); scrubbed != msg {
+			return pgerror.WithCode(errors.New(scrubbed), pgerror.GetCode(err))
 		}
 	}
 	return err
@@ -43,6 +47,13 @@ func codedError(err error) error {
 
 func sqlState(err *duckdb.Error) codes.Code {
 	msg := strings.ToLower(err.Msg)
+
+	// The catalog did not confirm whether a commit was applied (see
+	// package catalogproxy). It must not look like a conflict, which
+	// clients retry: the commit may have landed.
+	if strings.Contains(msg, "commitstateunknownexception") {
+		return codes.StatementCompletionUnknown
+	}
 
 	switch err.Type {
 	case duckdb.ErrorTypeParser, duckdb.ErrorTypeSyntax:
