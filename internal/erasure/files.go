@@ -185,37 +185,71 @@ type field struct {
 	typ     iceberg.Type
 	names   []string
 	current string
+	// required says the current schema requires a value.
+	required bool
 }
 
-// fields finds t's columns in tbl's schemas, the current one first: a
-// dropped column's values stay in older files.
+// fields finds t's columns in tbl's schemas: every field that has had a
+// column's name in any of them, as a column renamed, or dropped and added
+// again, keeps its values in older files under its ID.
 func fields(tbl *table.Table, t *Table) []field {
 	schemas := slices.Clone(tbl.Metadata().Schemas())
 	slices.SortFunc(schemas, func(a, b *iceberg.Schema) int { return b.ID - a.ID })
 	var out []field
 	for _, c := range t.Columns {
-		f := field{Column: c}
-		if cur, ok := tbl.Schema().FindFieldByNameCaseInsensitive(c.Name); ok {
-			f.id, f.typ, f.current = cur.ID, cur.Type, cur.Name
-		} else {
+		var ids []int
+		for _, s := range schemas {
+			if f, ok := s.FindFieldByNameCaseInsensitive(c.Name); ok && !slices.Contains(ids, f.ID) {
+				ids = append(ids, f.ID)
+			}
+		}
+		for _, id := range ids {
+			if slices.ContainsFunc(out, func(f field) bool { return f.id == id && f.Column == c }) {
+				continue
+			}
+			f := field{Column: c, id: id}
+			if cur, ok := tbl.Schema().FindFieldByID(id); ok {
+				f.typ, f.required = cur.Type, cur.Required
+				f.current, _ = tbl.Schema().FindColumnName(id)
+			}
 			for _, s := range schemas {
-				if old, ok := s.FindFieldByNameCaseInsensitive(c.Name); ok {
-					f.id, f.typ = old.ID, old.Type
-					break
+				if name, ok := s.FindColumnName(id); ok && !slices.Contains(f.names, name) {
+					f.names = append(f.names, name)
+				}
+				if old, ok := s.FindFieldByID(id); ok && f.typ == nil {
+					f.typ = old.Type
 				}
 			}
+			out = append(out, f)
 		}
-		if f.id == 0 {
-			continue
-		}
-		for _, s := range schemas {
-			if name, ok := s.FindColumnName(f.id); ok && !slices.Contains(f.names, name) {
-				f.names = append(f.names, name)
-			}
-		}
-		out = append(out, f)
 	}
 	return out
+}
+
+// identifierType reports whether values of type t compare as identifiers do:
+// strings, UUIDs, binary values and integers. Lists, structs and maps hold
+// identifiers inside values, which a request does not reach.
+func identifierType(t iceberg.Type) bool {
+	switch t.(type) {
+	case iceberg.StringType, iceberg.UUIDType, iceberg.BinaryType, iceberg.FixedType, iceberg.Int32Type, iceberg.Int64Type:
+		return true
+	}
+	return false
+}
+
+// checkFields refuses columns a request cannot erase from as asked.
+func checkFields(t *Table, flds []field) error {
+	for _, f := range flds {
+		if !identifierType(f.typ) {
+			return fmt.Errorf("%w: column %s of %s is a %s, and only strings, UUIDs, binary values and integers can be compared with identifiers; "+
+				"unset its tag %s, and tag a column that holds the identifiers themselves", ErrInvalid, f.Name, t.Name, f.typ, f.Tag)
+		}
+		if f.Null && f.required {
+			return fmt.Errorf("%w: column %s of %s is tagged %s.%s%s, but it is NOT NULL, so it cannot be set to NULL",
+				ErrInvalid, f.current, t.Name, f.Tag, f.Value, nullSuffix)
+		}
+	}
+	return nil
 }
 
 // binaryType reports whether a column holds bytes, which compare as hex.
@@ -269,26 +303,28 @@ func (tf *tableFiles) boundMatches(m *matcher, flds []field) map[string]bool {
 }
 
 // scannable reports whether a file of the table holds column values worth
-// scanning for flds: data files, and equality delete files on one of them.
-// Position deletes and deletion vectors hold only positions.
-func scannable(df iceberg.DataFile, flds []field) bool {
+// scanning: data files, and equality delete files, which may hold whole
+// rows (as Flink's do) whatever columns they delete by. Position deletes
+// and deletion vectors hold only positions.
+func scannable(df iceberg.DataFile) bool {
 	switch df.ContentType() {
-	case iceberg.EntryContentData:
+	case iceberg.EntryContentData, iceberg.EntryContentEqDeletes:
 		return strings.EqualFold(string(df.FileFormat()), "PARQUET")
-	case iceberg.EntryContentEqDeletes:
-		return strings.EqualFold(string(df.FileFormat()), "PARQUET") &&
-			slices.ContainsFunc(flds, func(f field) bool { return slices.Contains(df.EqualityFieldIDs(), f.id) })
 	}
 	return false
 }
 
-// tableName is a table's identifier as a request records it.
+// tableName is a table's identifier as a request shows it: its namespace
+// and name joined with dots.
 func tableName(ident table.Identifier) string { return strings.Join(ident, ".") }
 
-// ident parses a name a request records.
-func ident(name string) table.Identifier {
-	schema, tbl, _ := strings.Cut(name, ".")
-	return table.Identifier{schema, tbl}
+// identOf is the identifier of a request's table.
+func identOf(t *Table) table.Identifier {
+	if len(t.Ident) > 0 {
+		return t.Ident
+	}
+	// Names of namespaces have no dots.
+	return strings.Split(t.Name, ".")
 }
 
 // within reports whether p is under dir.

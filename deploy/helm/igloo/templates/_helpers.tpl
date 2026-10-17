@@ -283,6 +283,9 @@ install (otherwise the first upgrade would restart every pod).
 {{- $_ := set $data "admin-password" (get $existing "admin-password" | default (randAlphaNum 32 | b64enc)) -}}
 {{- end -}}
 {{- end -}}
+{{- if not .Values.erasure.existingSecret -}}
+{{- $_ := set $data "erasure-key" (get $existing "erasure-key" | default (randAlphaNum 48 | b64enc)) -}}
+{{- end -}}
 {{- if not .Values.catalog.encryptionKey.existingSecret -}}
 {{- $_ := set $data "encryption-key" (get $existing "encryption-key" | default (randAlphaNum 48 | b64enc)) -}}
 {{- end -}}

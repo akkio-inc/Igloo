@@ -288,8 +288,11 @@ var sensitiveSetting = regexp.MustCompile(`(?i)(secret|password|key|token|creden
 // maxQueryText bytes.
 func redactQuery(query string) string {
 	words := sqllex.CodeWords(query)
-	if len(words) > 0 && words[0] == "ERASE" {
+	switch {
+	case len(words) > 0 && words[0] == "ERASE":
 		query = erasureText(query)
+	case mentionsErasure(words):
+		return erasureHidden
 	}
 	sensitive := slices.ContainsFunc(words, func(w string) bool { return slices.Contains(secretWords, w) || w == "ERASE" })
 	if !sensitive && len(words) > 1 && (words[0] == "SET" || words[0] == "RESET") {

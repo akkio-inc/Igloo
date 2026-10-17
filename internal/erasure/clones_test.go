@@ -175,7 +175,7 @@ func TestErasureClones(t *testing.T) {
 	store := NewMemoryStore()
 	locks := &testLocks{busy: true}
 	svc := New(Options{
-		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng, CatalogName: "lake",
+		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng, Key: testKey, CatalogName: "lake",
 		Warehouse: filepath.Join(dir, "warehouse") + "/", Locks: locks,
 		Purger: NewPurger(store, &readCache{}, MemoryCache+"test", "test", slog.New(slog.DiscardHandler)),
 		Rows: testRows{

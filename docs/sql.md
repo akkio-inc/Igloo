@@ -255,8 +255,11 @@ record that shows it, for GDPR and CCPA requests. Admins and holders of
 
 ```sql
 GRANT ERASE ON ACCOUNT TO privacy_officer;
+ERASE SUBJECT WHERE pii.email = 'ann@example.com' DRY RUN;   -- what it would erase, and nothing more
 ERASE SUBJECT WHERE pii.email = 'ann@example.com' OR pii.device_id IN ('6F9619FF-...', '0C8C2A9E-...');
 SHOW ERASURE REQUESTS;                       -- or SELECT * FROM igloo.erasure_requests
+CONFIRM ERASURE REQUEST '01a14588-...';      -- one held because it would delete much of a table
+CANCEL ERASURE REQUEST '01a14588-...';       -- one that has not begun deleting
 ALTER TABLE marts.impressions SET (data_retention_days = 30);
 ALTER TABLE marts.impressions RESET (data_retention_days);
 SELECT * FROM igloo.data_retention;

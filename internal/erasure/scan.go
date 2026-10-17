@@ -90,7 +90,8 @@ func commitConflict(err error) bool {
 	return errors.As(err, &de) && de.Type == duckdb.ErrorTypeTransaction && strings.Contains(de.Msg, "CatalogCommitConflicts")
 }
 
-// scanColumn is a column to look for identifiers in.
+// scanColumn is a column to look for identifiers in: by field ID in files
+// that have them, unless id is 0, and otherwise by the names it has had.
 type scanColumn struct {
 	id     int
 	names  []string
@@ -132,15 +133,15 @@ func condition(salt string, cols []scanColumn, refs []string) string {
 	return "(" + strings.Join(parts, " OR ") + ")"
 }
 
-// currentCondition is the condition on a table's current columns, or ""
-// when none of them is left.
-func currentCondition(salt string, flds []field, subjects []Subject) string {
+// currentCondition is the condition on a table's current columns, those
+// to be nulled too if withNull, or "" when none of them is left.
+func currentCondition(salt string, flds []field, subjects []Subject, withNull bool) string {
 	var (
 		cols []scanColumn
 		refs []string
 	)
 	for _, f := range flds {
-		if f.current == "" {
+		if f.current == "" || f.Null && !withNull {
 			continue
 		}
 		c := scanColumns([]field{f}, subjects)
@@ -227,7 +228,7 @@ func (s *Service) matchingFiles(ctx context.Context, salt string, paths []string
 			l := files[duckdbPath(p)]
 			switch {
 			case l == nil:
-			case l.ids:
+			case l.ids && !slices.ContainsFunc(cols, func(c scanColumn) bool { return c.id == 0 }):
 				byID = append(byID, p)
 			default:
 				var present []string

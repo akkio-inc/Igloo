@@ -6,6 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go"
+	icecat "github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/audit"
@@ -32,6 +37,11 @@ func TestParseErasureCommand(t *testing.T) {
 		{"ALTER TABLE crm.people SET (data_retention_days = 30)", true, false, ""},
 		{"ALTER TABLE IF EXISTS crm.people RESET (data_retention_days)", true, false, ""},
 		{"ALTER TABLE crm.people SET (data_retention_days = -1)", true, true, ""},
+		{"ALTER TABLE crm.people SET (data_retention_days = 0)", true, true, ""},
+		{"ERASE SUBJECT WHERE pii.email = 'a@b.com' DRY RUN", true, false, `"pii"."email" IN ('***') DRY RUN`},
+		{"CANCEL ERASURE REQUEST 'r1'", true, false, ""},
+		{"CONFIRM ERASURE REQUEST 'r1'", true, false, ""},
+		{"CANCEL ERASURE REQUEST r1", true, true, ""},
 		{"ALTER TABLE crm.people SET SCHEMA other", false, false, ""},
 		{"ALTER TABLE crm.people ALTER COLUMN email SET TAG pii = 'email'", false, false, ""},
 		{"SELECT 1", false, false, ""},
@@ -53,8 +63,16 @@ func TestParseErasureCommand(t *testing.T) {
 			t.Errorf("%s: the error shows the identifier: %v", c.sql, err)
 		}
 	}
-	// What the history keeps of any ERASE.
-	for _, sql := range []string{"ERASE SUBJECT WHERE pii.email = a@b.com", "ERASE SUBJECT WHERE pii.email = 'a@b.com'"} {
+	// What the history keeps of any statement with ERASE SUBJECT, in any
+	// form: the identifiers can be anywhere in it.
+	for _, sql := range []string{
+		"ERASE SUBJECT WHERE pii.email = a@b.com",
+		"ERASE SUBJECT WHERE pii.email = 'a@b.com'",
+		`EXPLAIN ERASE SUBJECT WHERE pii.email = "a@b.com"`,
+		"EXPLAIN ERASE SUBJECT WHERE pii.email = a@b.com",
+		"SELECT 1; ERASE SUBJECT WHERE pii.email = 'a@b.com'",
+		"select 1; erase /* x */ subject where pii.email = a@b.com",
+	} {
 		if got := redactQuery(sql); strings.Contains(got, "a@b.com") {
 			t.Errorf("history of %s: %s", sql, got)
 		}
@@ -76,7 +94,14 @@ func TestParseErasureCommand(t *testing.T) {
 func TestEraseSubject(t *testing.T) {
 	ctx := context.Background()
 	policies := policy.NewMemoryStore()
-	eraser := erasure.New(erasure.Options{Store: erasure.NewMemoryStore(), Policies: policies.Load})
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connector.Close() })
+	eraser := erasure.New(erasure.Options{Store: erasure.NewMemoryStore(), Policies: policies.Load, Catalog: icebergPeople(t),
+		Engine: duckdbConnector{connector}, Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake",
+		Warehouse: t.TempDir() + "/", Rows: countRows(3)})
 	cs := startCatalogServer(t, func(o *Options) { o.Policies, o.Erasure = policies, eraser })
 	for _, sql := range []string{
 		"CREATE TABLE lake.public.people (id INTEGER, email VARCHAR)",
@@ -111,8 +136,31 @@ func TestEraseSubject(t *testing.T) {
 	expectRefused(t, nora, "ERASE SUBJECT WHERE pii.device_id = 'dev-1'", "22023", "dev-1")
 	expectRefused(t, nora, "ERASE SUBJECT WHERE pii.email = ann@example.com", "42601", "ann@")
 	expectRefused(t, nora, "SELECT 1; ERASE SUBJECT WHERE pii.email = 'ann@example.com'", "")
+	expectRefused(t, nora, "ERASE SUBJECT WHERE pii.email = 'n/a'", "22023")
 
-	// Data retention, kept with tags and listed for everyone.
+	// A dry run says what a request would erase, and makes none.
+	if got := texts(t, nora, "ERASE SUBJECT WHERE pii.email = 'ann@example.com' DRY RUN"); len(got) != 1 || got[0] != "public.people|tagged|email (pii.email)|3|0" {
+		t.Errorf("DRY RUN: %q", got)
+	}
+	expectRows(t, nora, "SELECT count(*) FROM igloo.erasure_requests", "1")
+	// A request can be canceled before it deletes, once.
+	if got := texts(t, nora, "CANCEL ERASURE REQUEST '"+id+"'"); len(got) != 1 || got[0] != id+"|canceled" {
+		t.Errorf("CANCEL: %q", got)
+	}
+	expectRefused(t, nora, "CANCEL ERASURE REQUEST '"+id+"'", "22023")
+	expectRefused(t, nora, "CONFIRM ERASURE REQUEST 'nope'", "42704")
+	expectDenied(t, cs.user(t, "otto", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol), "CANCEL ERASURE REQUEST '"+id+"'")
+
+	// A tagged column can be neither dropped nor renamed.
+	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people DROP COLUMN email", "dropping")
+	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people DROP COLUMN IF EXISTS email", "dropping")
+
+	// Data retention, kept with tags and listed for everyone. Privacy
+	// officers set it on tables with tags, admins on any; a day at least.
+	expectRefused(t, nora, "ALTER TABLE people SET (data_retention_days = 0)", "42601")
+	expectDenied(t, nora, "ALTER TABLE orders SET (data_retention_days = 30)", "no tagged columns")
+	mustExec(t, cs.admin, "ALTER TABLE lake.public.orders SET (data_retention_days = 30)")
+	mustExec(t, cs.admin, "ALTER TABLE lake.public.orders RESET (data_retention_days)")
 	mustExec(t, nora, "ALTER TABLE people SET (data_retention_days = 30)")
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
 	expectRows(t, rita, "SELECT table_schema, table_name, data_retention_days, set_by FROM igloo.data_retention", "public|people|30|nora")
@@ -137,12 +185,60 @@ func TestEraseSubject(t *testing.T) {
 				erases++
 			}
 		}
-		if erases >= 4 || time.Now().After(deadline) {
-			if erases < 4 {
-				t.Errorf("history has %d ERASE statements, want at least 4", erases)
+		if erases >= 6 || time.Now().After(deadline) {
+			if erases < 6 {
+				t.Errorf("history has %d ERASE statements, want at least 6", erases)
 			}
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// icebergPeople is a catalog with one Iceberg table, public.people, as the
+// stand-in DuckDB catalog has it, for requests to check their columns in.
+func icebergPeople(t *testing.T) erasure.Catalog {
+	t.Helper()
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 2, Name: "email", Type: iceberg.PrimitiveTypes.String})
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+	return oneTable{table.New(table.Identifier{"public", "people"}, meta, "", fsF, nil)}
+}
+
+type oneTable struct{ tbl *table.Table }
+
+func (c oneTable) Tables(context.Context) ([]table.Identifier, error) {
+	return []table.Identifier{c.tbl.Identifier()}, nil
+}
+
+func (c oneTable) LoadTable(_ context.Context, id table.Identifier) (*table.Table, error) {
+	if strings.Join(id, ".") != strings.Join(c.tbl.Identifier(), ".") {
+		return nil, icecat.ErrNoSuchTable
+	}
+	return c.tbl, nil
+}
+
+func (oneTable) CommitTable(context.Context, table.Identifier, []table.Requirement, []table.Update) (table.Metadata, string, error) {
+	return nil, "", table.ErrCommitFailed
+}
+
+type duckdbConnector struct{ c *duckdb.Connector }
+
+func (d duckdbConnector) Connect(ctx context.Context) (*duckdb.Conn, error) {
+	c, err := d.c.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.(*duckdb.Conn), nil
+}
+
+// countRows counts n matching rows in every table, and deletes none.
+type countRows int64
+
+func (n countRows) Count(context.Context, *table.Table, string) (int64, error) { return int64(n), nil }
+func (countRows) Delete(context.Context, *table.Table, string) (int64, error)  { return 0, nil }

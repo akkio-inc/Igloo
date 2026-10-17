@@ -164,6 +164,16 @@ spec:
                   name: {{ $secretName }}
                   key: admin-password
                   {{- end }}
+            - name: IGLOO_ERASURE_KEY
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.erasure.existingSecret }}
+                  name: {{ .Values.erasure.existingSecret }}
+                  key: key
+                  {{- else }}
+                  name: {{ $secretName }}
+                  key: erasure-key
+                  {{- end }}
             {{- with $metadataDb }}
             - name: IGLOO_METADATA_DATABASE_URL
               valueFrom:

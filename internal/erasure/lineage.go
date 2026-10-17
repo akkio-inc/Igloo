@@ -28,6 +28,9 @@ func (s *Service) downstream(ctx context.Context, r *Request) ([]Downstream, err
 	ours := map[string]bool{}
 	var frontier []string
 	for _, t := range r.Tables {
+		if t.Remote {
+			continue
+		}
 		ours[strings.ToLower(t.Name)] = true
 		frontier = append(frontier, t.Name)
 	}
@@ -60,7 +63,7 @@ func (s *Service) downstream(ctx context.Context, r *Request) ([]Downstream, err
 			short := make([]string, len(frontier))
 			for i, t := range frontier {
 				full[i] = s.opts.CatalogName + "." + t
-				_, short[i], _ = strings.Cut(t, ".")
+				short[i] = shortName(t)
 			}
 			writes, err := s.opts.Lineage.Writes(ctx, full, short)
 			if err != nil {
@@ -150,6 +153,8 @@ func (s *Service) target(stmt string) string {
 
 // names reports whether text names table, schema.table, by its name.
 func names(text, table string) bool {
-	_, name, _ := strings.Cut(table, ".")
-	return regexp.MustCompile(`(?i)(^|[^\w$])` + regexp.QuoteMeta(name) + `($|[^\w$])`).MatchString(text)
+	return regexp.MustCompile(`(?i)(^|[^\w$])` + regexp.QuoteMeta(shortName(table)) + `($|[^\w$])`).MatchString(text)
 }
+
+// shortName is a table's name without its namespace.
+func shortName(table string) string { return table[strings.LastIndex(table, ".")+1:] }

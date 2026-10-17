@@ -370,21 +370,34 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   object storage, deletes Delta Sharing copies made from them, drops them
   from every replica's read cache, redacts the identifiers from the query,
   load and task history, and verifies that none is left in rows, files,
-  manifest bounds, Parquet statistics or history. Requests run in the
-  background on the scheduler, survive restarts, resume after failures, keep
-  identifiers only as salted hashes, deleted on completion, and are listed
-  with what they did per table and step in `SHOW ERASURE REQUESTS` and
+  manifest bounds, Parquet statistics or history. Every branch and tag is
+  rewritten, the rows a `DELETE` missed go when their files are rewritten,
+  and columns tagged `:null` are set to NULL instead of deleting the row.
+  Requests run in the background on the scheduler, survive restarts,
+  resume after failures with growing waits, fail for good with a metric
+  and an alert after 10 failures, keep their identifiers sealed under
+  `IGLOO_ERASURE_KEY` only while they run, and are listed with what they
+  did per table and step in `SHOW ERASURE REQUESTS` and
   `igloo.erasure_requests`, with the tables history says were written from
-  the erased ones, and tagged tables of connections, which it cannot erase
-  from. Admins and roles granted `ERASE ON ACCOUNT` make them.
-  `iceberg-go`'s copy gains `Transaction.ForgetFiles`, which rewrites the
-  manifests that list removed files.
+  the erased ones, and tagged tables of connections, which they cannot
+  erase from. `ERASE SUBJECT ... DRY RUN` previews a request; one that would
+  delete more than 1% of a table waits for `CONFIRM ERASURE REQUEST`, and
+  `CANCEL ERASURE REQUEST` cancels one before it deletes. Placeholder
+  identifiers, such as the all-zero advertising ID, are refused. Admins and
+  roles granted `ERASE ON ACCOUNT` make them. `iceberg-go`'s copy gains
+  `Transaction.ForgetFiles`, which rewrites the manifests that list removed
+  files, and `WithMaxRefAge`, so expiring snapshots keeps branches and tags.
 - Data retention for tables that hold personal data (`ALTER TABLE ... SET
-  (data_retention_days = N)`, `igloo.data_retention`): table maintenance
-  keeps no older snapshot, whatever else the table keeps, and rewrites the
-  files whose rows were deleted longer ago.
-- Renaming a table or column with tags, or a table with a data retention,
-  is refused even when no table has policies.
+  (data_retention_days = N)`, at least a day, `igloo.data_retention`): table
+  maintenance keeps no older snapshot, whatever else the table keeps, but
+  those branches and tags point at, and rewrites the files whose rows were
+  deleted longer ago. Privacy officers may set it on tables with tags.
+- Renaming a table with tags or a data retention, or renaming, dropping or
+  changing the type of a tagged column, is refused even when no table has
+  policies, and through the Iceberg REST catalog too.
+- Table maintenance no longer drops branches and tags whose snapshots are
+  older than the snapshot retention; they last as long as their own or the
+  table's `max-ref-age-ms` says, forever by default.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in

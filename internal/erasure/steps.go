@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,7 +17,6 @@ import (
 	icecat "github.com/apache/iceberg-go/catalog"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
-	"github.com/apache/iceberg-go/table/compaction"
 	"gocloud.dev/gcerrors"
 
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -35,31 +35,48 @@ const (
 	// sharingDir holds Delta Sharing's copies of data files with their
 	// deletes applied, under the warehouse root, by table UUID.
 	sharingDir = ".igloo/sharing/"
+	// A request that would delete more than holdFraction of a table's
+	// rows, and more than holdRows of them, waits to be confirmed: a
+	// mistaken or placeholder identifier matches much of a table.
+	holdFraction = 0.01
+	holdRows     = 100
 )
 
-// Kinds of files a request deletes.
+// Kinds of files a request deletes, or leaves.
 const (
 	fileMatched = "matched"
 	fileExpired = "expired"
 	fileOrphan  = "orphan"
 	fileSharing = "sharing"
+	// fileOutside are files outside the warehouse, which a request leaves:
+	// they are someone else's, as files added from a landing bucket are.
+	fileOutside = "outside"
 )
 
 // operation marks the snapshots requests commit.
 var operation = iceberg.Properties{"igloo.operation": "erase"}
 
-// load loads a request's table, recording a table that is gone.
-func (s *Service) load(ctx context.Context, t *Table) (*table.Table, bool, error) {
-	tbl, err := s.opts.Catalog.LoadTable(ctx, ident(t.Name))
+// reload loads a request's table, which must still exist: a table that a
+// request found and that is gone was dropped or renamed meanwhile, and
+// where its data went cannot be told.
+func (s *Service) reload(ctx context.Context, t *Table) (*table.Table, error) {
+	tbl, err := s.opts.Catalog.LoadTable(ctx, identOf(t))
 	if errors.Is(err, icecat.ErrNoSuchTable) {
-		t.Missing = true
-		return nil, false, nil
+		return nil, fmt.Errorf("%s does not exist any more: it was dropped or renamed while the request ran; "+
+			"tag it under its new name if it has one, and make the request again", t.Name)
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("load %s: %w", t.Name, err)
+		return nil, fmt.Errorf("load %s: %w", t.Name, err)
 	}
-	t.Missing = false
-	return tbl, true, nil
+	if id := tbl.Metadata().TableUUID().String(); t.UUID != id {
+		if t.UUID != "" {
+			// Replaced, as CREATE OR REPLACE TABLE does: what has the
+			// name now holds what the old table held.
+			s.log.Info("an erasure request's table was replaced; it erases from the new one", "table", t.Name)
+		}
+		t.UUID = id
+	}
+	return tbl, nil
 }
 
 // loaded is a request's table as the catalog has it now.
@@ -68,62 +85,77 @@ type loaded struct {
 	tbl *table.Table
 }
 
-// tables loads the request's tables that exist.
+// tables loads the request's tables, but connections'.
 func (s *Service) tables(ctx context.Context, r *Request) ([]loaded, error) {
 	var out []loaded
 	for i := range r.Tables {
 		if r.Tables[i].Remote {
 			continue
 		}
-		tbl, ok, err := s.load(ctx, &r.Tables[i])
+		tbl, err := s.reload(ctx, &r.Tables[i])
 		if err != nil {
 			return nil, err
 		}
-		if ok {
-			out = append(out, loaded{&r.Tables[i], tbl})
-		}
+		out = append(out, loaded{&r.Tables[i], tbl})
 	}
 	return out, nil
 }
 
-// find works out the tables r erases from: those with tagged columns, and
-// those that share data files with them.
+// find works out the tables r erases from (see discover), and holds a
+// request that would delete much of one until it is confirmed.
 func (s *Service) find(ctx context.Context, r *Request) error {
+	if err := s.discover(ctx, r); err != nil {
+		return err
+	}
+	if r.ConfirmedBy == "" {
+		for _, t := range r.Tables {
+			if t.Matched > holdRows && float64(t.Matched) > holdFraction*float64(t.Rows) {
+				s.log.Warn("erasure request held: it would delete much of a table; CONFIRM ERASURE REQUEST to go on",
+					"request", r.ID, "table", t.Name, "rows", t.Matched, "of", t.Rows)
+				r.Status = StatusHeld
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// discover works out the tables r erases from: those with tagged columns,
+// and those that share data files with them, and counts their rows and
+// those that match.
+func (s *Service) discover(ctx context.Context, r *Request) error {
 	snap, err := s.opts.Policies(ctx)
 	if err != nil {
 		return err
 	}
-	byName := map[string]*Table{}
-	for _, ct := range snap.Catalog.ColumnTags {
-		for _, sub := range r.Subjects {
-			digest, ok := holds(ct.Value, sub.Value)
-			if ct.Tag != sub.Tag || !ok {
-				continue
-			}
-			name := policy.TableName(ct.Catalog, ct.Schema, ct.Table)
-			key := strings.ToLower(name)
-			if byName[key] == nil {
-				byName[key] = &Table{Name: name, Reason: "tagged"}
-				if ct.Catalog != "" {
-					byName[key].Reason = "a table of connection " + ct.Catalog + ", which Igloo reads but cannot erase from: erase there"
-					byName[key].Remote = true
-				}
-			}
-			byName[key].Columns = append(byName[key].Columns, Column{Name: ct.Column, Tag: ct.Tag, Value: sub.Value, Digest: digest})
-		}
+	tables, err := s.tagged(snap, r.Subjects)
+	if err != nil {
+		return err
 	}
-	if !slices.ContainsFunc(slices.Collect(maps.Values(byName)), func(t *Table) bool { return !t.Remote }) {
+	if !slices.ContainsFunc(tables, func(t Table) bool { return !t.Remote }) {
 		// The tags were unset since the request was made: completing
 		// it would erase nothing.
 		return errors.New("no column is tagged with the request's tag values any more; tag the columns again")
 	}
-	r.Tables = nil
-	for _, key := range slices.Sorted(maps.Keys(byName)) {
-		r.Tables = append(r.Tables, *byName[key])
+	r.Tables = tables
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if t.Remote {
+			continue
+		}
+		if _, err := s.opts.Catalog.LoadTable(ctx, identOf(t)); errors.Is(err, icecat.ErrNoSuchTable) {
+			return fmt.Errorf("%s is tagged but does not exist: tags stay with a table's name, so if it was renamed, "+
+				"tag it under its new name; if it was dropped, unset its tags", t.Name)
+		}
 	}
 	sources, err := s.tables(ctx, r)
 	if err != nil {
 		return err
+	}
+	for _, l := range sources {
+		if err := checkFields(l.t, fields(l.tbl, l.t)); err != nil {
+			return err
+		}
 	}
 	clones, err := s.clones(ctx, r, sources)
 	if err != nil {
@@ -133,7 +165,68 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 	if r.Downstream, err = s.downstream(ctx, r); err != nil {
 		return fmt.Errorf("lineage: %w", err)
 	}
+	return s.count(ctx, r)
+}
+
+// tagged are the tables with columns tagged with subjects' tag values, by
+// name.
+func (s *Service) tagged(snap *policy.Snapshot, subjects []Subject) ([]Table, error) {
+	byName := map[string]*Table{}
+	for _, ct := range snap.Catalog.ColumnTags {
+		for _, sub := range subjects {
+			digest, null, ok := holds(ct.Value, sub.Value)
+			if ct.Tag != sub.Tag || !ok {
+				continue
+			}
+			name := policy.TableName(ct.Catalog, ct.Schema, ct.Table)
+			key := strings.ToLower(name)
+			if byName[key] == nil {
+				byName[key] = &Table{Name: name, Ident: []string{ct.Schema, ct.Table}, Reason: "tagged"}
+				if ct.Catalog != "" {
+					byName[key].Ident = nil
+					byName[key].Reason = "a table of connection " + ct.Catalog + ", which Igloo reads but cannot erase from: erase there"
+					byName[key].Remote = true
+				}
+			}
+			byName[key].Columns = append(byName[key].Columns, Column{Name: ct.Column, Tag: ct.Tag, Value: sub.Value, Digest: digest, Null: null})
+		}
+	}
+	var out []Table
+	for _, key := range slices.Sorted(maps.Keys(byName)) {
+		out = append(out, *byName[key])
+	}
+	return out, nil
+}
+
+// count counts the tables' rows, and those that match.
+func (s *Service) count(ctx context.Context, r *Request) error {
+	tables, err := s.tables(ctx, r)
+	if err != nil {
+		return err
+	}
+	for _, l := range tables {
+		cond := currentCondition(r.salt, fields(l.tbl, l.t), r.Subjects, true)
+		if cond == "" {
+			continue
+		}
+		if l.t.Matched, err = s.rows.Count(ctx, l.tbl, cond); err != nil {
+			return fmt.Errorf("count the matching rows of %s: %w", l.t.Name, err)
+		}
+		l.t.Rows = rowCount(l.tbl)
+	}
 	return nil
+}
+
+// rowCount is how many rows a table's current snapshot has, as its
+// summary says, less its position deletes: about as many as it has.
+func rowCount(tbl *table.Table) int64 {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil || snap.Summary == nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(snap.Summary.Properties["total-records"], 10, 64)
+	d, _ := strconv.ParseInt(snap.Summary.Properties["total-position-deletes"], 10, 64)
+	return max(n-d, 0)
 }
 
 // Properties of a zero-copy clone (see package clone): sharesProperty
@@ -158,6 +251,35 @@ func shares(tbl *table.Table) []string {
 	return locs
 }
 
+// uuids are the UUIDs of the request's tables that it loaded.
+func uuids(tables []loaded) map[string]bool {
+	out := map[string]bool{}
+	for _, l := range tables {
+		out[l.tbl.Metadata().TableUUID().String()] = true
+	}
+	return out
+}
+
+// others loads the catalog's tables that are not among ours. A table that
+// cannot be loaded may share files, so that fails the step.
+func (s *Service) others(ctx context.Context, ours map[string]bool) ([]*table.Table, error) {
+	idents, err := s.opts.Catalog.Tables(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []*table.Table
+	for _, id := range idents {
+		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("load %s, which may share files with the request's tables: %w", tableName(id), err)
+		}
+		if !ours[tbl.Metadata().TableUUID().String()] {
+			out = append(out, tbl)
+		}
+	}
+	return out, nil
+}
+
 // clones finds the tables that share data files with sources, which a
 // file must be rewritten in, and its snapshots expired in, before it can
 // go: zero-copy clones of them, the tables they are clones of, and so on.
@@ -168,23 +290,9 @@ func shares(tbl *table.Table) []string {
 // column named like a tagged one, and their columns of those names are
 // taken to hold the same.
 func (s *Service) clones(ctx context.Context, r *Request, sources []loaded) ([]Table, error) {
-	idents, err := s.opts.Catalog.Tables(ctx)
+	others, err := s.others(ctx, uuids(sources))
 	if err != nil {
 		return nil, err
-	}
-	var others []*table.Table
-	for _, id := range idents {
-		if slices.ContainsFunc(r.Tables, func(t Table) bool { return strings.EqualFold(t.Name, tableName(id)) }) {
-			continue
-		}
-		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
-		if errors.Is(err, icecat.ErrNoSuchTable) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("load %s: %w", tableName(id), err)
-		}
-		others = append(others, tbl)
 	}
 	var out []Table
 	read := map[*table.Table]*tableFiles{}
@@ -216,21 +324,23 @@ func (s *Service) clones(ctx context.Context, r *Request, sources []loaded) ([]T
 // shares data files with src, or nil.
 func (s *Service) related(ctx context.Context, src loaded, other *table.Table, read map[*table.Table]*tableFiles) (*Table, error) {
 	name := tableName(other.Identifier())
+	t := &Table{Name: name, Ident: other.Identifier(), UUID: other.Metadata().TableUUID().String()}
 	srcLoc, otherLoc := strings.TrimRight(src.tbl.Location(), "/"), strings.TrimRight(other.Location(), "/")
 	switch {
 	case slices.Contains(shares(other), srcLoc) || strings.EqualFold(other.Properties()[sourceProperty], src.t.Name):
-		return &Table{Name: name, Columns: sameFields(src, other), Reason: "a clone of " + src.t.Name}, nil
+		t.Columns, t.Reason = sameFields(src, other), "a clone of "+src.t.Name
+		return t, nil
 	case slices.Contains(shares(src.tbl), otherLoc) || strings.EqualFold(src.tbl.Properties()[sourceProperty], name):
-		return &Table{Name: name, Columns: sameFields(src, other), Reason: src.t.Name + " is a clone of it"}, nil
+		t.Columns, t.Reason = sameFields(src, other), src.t.Name+" is a clone of it"
+		return t, nil
 	}
-	var cols []Column
 	for _, c := range src.t.Columns {
 		if f, ok := other.Schema().FindFieldByNameCaseInsensitive(c.Name); ok {
 			c.Name = f.Name
-			cols = append(cols, c)
+			t.Columns = append(t.Columns, c)
 		}
 	}
-	if len(cols) == 0 {
+	if len(t.Columns) == 0 {
 		return nil, nil
 	}
 	tf := read[other]
@@ -242,7 +352,8 @@ func (s *Service) related(ctx context.Context, src loaded, other *table.Table, r
 		read[other] = tf
 	}
 	if slices.ContainsFunc(slices.Collect(maps.Keys(tf.live(false))), func(p string) bool { return within(p, srcLoc) }) {
-		return &Table{Name: name, Columns: cols, Reason: "shares data files with " + src.t.Name}, nil
+		t.Reason = "shares data files with " + src.t.Name
+		return t, nil
 	}
 	return nil, nil
 }
@@ -259,20 +370,23 @@ func sameFields(src loaded, other *table.Table) []Column {
 				break
 			}
 		}
-		out = append(out, c)
+		if !slices.Contains(out, c) {
+			out = append(out, c)
+		}
 	}
 	return out
 }
 
 // deleteRows deletes the matching rows of every table, as a DELETE does:
-// queries no longer see them, but their files still hold them.
+// queries no longer see them, but their files still hold them. Columns to
+// be nulled are nulled when the files are rewritten.
 func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 	tables, err := s.tables(ctx, r)
 	if err != nil {
 		return err
 	}
 	for _, l := range tables {
-		if cond := currentCondition(r.Salt, fields(l.tbl, l.t), r.Subjects); cond != "" {
+		if cond := currentCondition(r.salt, fields(l.tbl, l.t), r.Subjects, false); cond != "" {
 			n, err := s.rows.Delete(ctx, l.tbl, cond)
 			if err != nil {
 				return fmt.Errorf("delete from %s: %w", l.t.Name, err)
@@ -287,32 +401,21 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// rewrite writes every current data file that holds matching rows again
-// with its deletes applied, which leaves the rows out, and then the
-// current manifests that still list such files as deleted.
+// rewrite removes the matching rows from the files of every branch and tag
+// of every table (see rewrite.go), and then the manifests that still list
+// the old files.
 func (s *Service) rewrite(ctx context.Context, r *Request) error {
-	for i := range r.Tables {
-		t := &r.Tables[i]
-		if t.Remote {
-			continue
-		}
-		for attempt := 1; ; attempt++ {
-			tbl, ok, err := s.load(ctx, t)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				break
-			}
-			n, err := s.rewriteTable(ctx, r, t, tbl)
-			if errors.Is(err, table.ErrCommitFailed) && attempt < commitAttempts {
-				continue
-			}
-			if err != nil {
+	tables, err := s.tables(ctx, r)
+	if err != nil {
+		return err
+	}
+	for _, l := range tables {
+		t := l.t
+		for _, name := range refNames(l.tbl) {
+			if err := s.onRef(ctx, r, t, name, func(ctx context.Context, view *table.Table, branch string, commit bool) (bool, error) {
+				return s.rewriteRef(ctx, r, t, view, branch, commit)
+			}); err != nil {
 				return fmt.Errorf("rewrite %s: %w", t.Name, err)
-			}
-			if t.FilesRewritten += n; n == 0 {
-				break
 			}
 		}
 		t.done(StepRewrite, s.now())
@@ -321,150 +424,6 @@ func (s *Service) rewrite(ctx context.Context, r *Request) error {
 		}
 	}
 	return nil
-}
-
-// rewriteTable rewrites tbl's current files that hold matching rows and
-// returns how many it replaced. Once none does, it rewrites the manifests
-// that still list such files, and returns 0.
-func (s *Service) rewriteTable(ctx context.Context, r *Request, t *Table, tbl *table.Table) (int, error) {
-	if tbl.CurrentSnapshot() == nil {
-		return 0, nil
-	}
-	flds := fields(tbl, t)
-	tasks, err := tbl.Scan().PlanFiles(ctx)
-	if err != nil {
-		return 0, err
-	}
-	var paths []string
-	for _, task := range tasks {
-		if scannable(task.File, flds) {
-			paths = append(paths, task.File.FilePath())
-		}
-		for _, d := range task.EqualityDeleteFiles {
-			if scannable(d, flds) && !slices.Contains(paths, d.FilePath()) {
-				paths = append(paths, d.FilePath())
-			}
-		}
-	}
-	matched, err := s.matchingFiles(ctx, r.Salt, paths, scanColumns(flds, r.Subjects))
-	if err != nil {
-		return 0, err
-	}
-	if err := s.record(ctx, r, t, fileMatched, slices.Collect(maps.Keys(matched))); err != nil {
-		return 0, err
-	}
-	// A data file goes when it holds matches, or when an equality delete
-	// that does applies to it: once all of those are rewritten, the delete
-	// is dead and goes too.
-	var selected []table.FileScanTask
-	for _, task := range tasks {
-		if matched[task.File.FilePath()] > 0 || slices.ContainsFunc(task.EqualityDeleteFiles, func(d iceberg.DataFile) bool {
-			return matched[d.FilePath()] > 0
-		}) {
-			selected = append(selected, task)
-		}
-	}
-	if len(selected) == 0 {
-		bad, err := s.matched(ctx, r)
-		if err != nil {
-			return 0, err
-		}
-		_, err = s.forget(ctx, tbl, bad)
-		return 0, err
-	}
-	return s.rewriteFiles(ctx, tbl, selected)
-}
-
-// rewriteFiles writes the tasks' data files again with their deletes
-// applied, a partition at a time and at most maxRewriteBytes per commit,
-// and returns how many files it replaced.
-func (s *Service) rewriteFiles(ctx context.Context, tbl *table.Table, tasks []table.FileScanTask) (int, error) {
-	byPartition := map[string]*table.CompactionTaskGroup{}
-	for _, task := range tasks {
-		key := partitionKey(task.File)
-		g := byPartition[key]
-		if g == nil {
-			g = &table.CompactionTaskGroup{PartitionKey: key}
-			byPartition[key] = g
-		}
-		g.Tasks = append(g.Tasks, task)
-		g.TotalSizeBytes += task.File.FileSizeBytes()
-	}
-	fsys, err := tbl.FS(ctx)
-	if err != nil {
-		return 0, err
-	}
-	replaced := 0
-	keys := slices.Sorted(maps.Keys(byPartition))
-	for len(keys) > 0 {
-		var (
-			groups []table.CompactionTaskGroup
-			total  int64
-			paths  = map[string]struct{}{}
-		)
-		for len(keys) > 0 && (len(groups) == 0 || total+byPartition[keys[0]].TotalSizeBytes <= maxRewriteBytes) {
-			g := byPartition[keys[0]]
-			groups, total, keys = append(groups, *g), total+g.TotalSizeBytes, keys[1:]
-			for _, task := range g.Tasks {
-				paths[task.File.FilePath()] = struct{}{}
-			}
-		}
-		dead, err := compaction.CollectDeadEqualityDeletes(ctx, fsys, tbl.CurrentSnapshot(), paths)
-		if err != nil {
-			return replaced, fmt.Errorf("find dead equality deletes: %w", err)
-		}
-		tx := tbl.NewTransaction()
-		res, err := tx.RewriteDataFiles(ctx, groups, table.RewriteDataFilesOptions{ExtraDeleteFilesToRemove: dead, SnapshotProps: operation})
-		if err != nil {
-			return replaced, err
-		}
-		if tbl, err = tx.Commit(ctx); err != nil {
-			return replaced, err
-		}
-		replaced += res.RemovedDataFiles
-	}
-	return replaced, nil
-}
-
-// partitionKey groups files of one partition, as compaction does.
-func partitionKey(df iceberg.DataFile) string {
-	part := df.Partition()
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d", df.SpecID())
-	for _, id := range slices.Sorted(maps.Keys(part)) {
-		fmt.Fprintf(&b, "/%d=%v", id, part[id])
-	}
-	return b.String()
-}
-
-// forget writes the current snapshot's manifests again without the bad
-// files, which are no longer live, so they list them as deleted, with
-// their column bounds. It returns the table as committed.
-func (s *Service) forget(ctx context.Context, tbl *table.Table, bad map[string]bool) (*table.Table, error) {
-	tf, err := readCurrent(ctx, tbl)
-	if err != nil {
-		return nil, err
-	}
-	mentioned := map[string]struct{}{}
-	for _, m := range tf.manifests[tf.current()] {
-		for _, e := range tf.entries[m] {
-			if !bad[e.file.FilePath()] {
-				continue
-			}
-			if e.live() {
-				return nil, fmt.Errorf("%s still holds matching rows", base(e.file.FilePath()))
-			}
-			mentioned[e.file.FilePath()] = struct{}{}
-		}
-	}
-	if len(mentioned) == 0 {
-		return tbl, nil
-	}
-	tx := tbl.NewTransaction()
-	if err := tx.ForgetFiles(ctx, mentioned, operation); err != nil {
-		return nil, err
-	}
-	return tx.Commit(ctx)
 }
 
 // readCurrent reads the current snapshot's manifests only.
@@ -503,18 +462,33 @@ func (s *Service) matched(ctx context.Context, r *Request) (map[string]bool, err
 	}
 	out := map[string]bool{}
 	for _, f := range files {
-		if f.Kind == fileMatched {
+		if f.Kind == fileMatched || f.Kind == fileOutside {
 			out[f.Path] = true
 		}
 	}
 	return out, nil
 }
 
-// record notes files of t to delete once nothing references them.
+// record notes files of t to delete once nothing references them. Files
+// outside the warehouse are noted to be left, and logged: whoever keeps
+// them deletes them.
 func (s *Service) record(ctx context.Context, r *Request, t *Table, kind string, paths []string) error {
-	files := make([]File, len(paths))
-	for i, p := range paths {
-		files[i] = File{Path: p, Table: t.Name, Kind: kind}
+	known, err := s.opts.Store.Files(ctx, r.ID)
+	if err != nil {
+		return err
+	}
+	var files []File
+	for _, p := range paths {
+		f := File{Path: p, Table: t.Name, Kind: kind}
+		if !within(p, s.opts.Warehouse) {
+			f.Kind = fileOutside
+			if !slices.ContainsFunc(known, func(k File) bool { return k.Path == p }) {
+				t.FilesOutside++
+				s.log.Warn("an erasure request leaves a file outside the warehouse that held erased data or was referenced only by snapshots it expired; "+
+					"delete it where it is", "request", r.ID, "table", t.Name, "path", p)
+			}
+		}
+		files = append(files, f)
 	}
 	return s.opts.Store.AddFiles(ctx, r.ID, files)
 }
@@ -575,51 +549,51 @@ func (l *listings) exists(p string) (bool, error) {
 // bad are the files of a table that held identifiers: those the request
 // found matching rows in, those older snapshots reference that do, and
 // those whose manifest bounds may hold one, unless a scan of them found
-// none. It scans the files older snapshots reference that it has not yet.
+// none. It scans the files older snapshots reference that it has not yet,
+// and records what it finds.
 func (s *Service) bad(ctx context.Context, r *Request, t *Table, tf *tableFiles, flds []field, l *listings) (map[string]bool, error) {
 	known, err := s.matched(ctx, r)
 	if err != nil {
 		return nil, err
 	}
-	current := tf.live(true)
 	scanned := map[string]bool{}
 	var paths []string
 	for p, df := range tf.live(false) {
-		if !scannable(df, flds) {
-			continue
-		}
-		if current[p] != nil {
-			scanned[p] = true
+		if !scannable(df) {
 			continue
 		}
 		if exists, err := l.exists(p); err != nil {
 			return nil, err
-		} else if exists && !known[p] {
-			paths, scanned[p] = append(paths, p), true
+		} else if exists {
+			scanned[p] = true
+			if !known[p] {
+				paths = append(paths, p)
+			}
 		}
 	}
-	matched, err := s.matchingFiles(ctx, r.Salt, paths, scanColumns(flds, r.Subjects))
+	matched, err := s.matchingFiles(ctx, r.salt, paths, scanColumns(flds, r.Subjects))
 	if err != nil {
 		return nil, err
 	}
-	if err := s.record(ctx, r, t, fileMatched, slices.Collect(maps.Keys(matched))); err != nil {
+	found := slices.Collect(maps.Keys(matched))
+	for p := range tf.boundMatches(newMatcher(r), flds) {
+		if !scanned[p] && !known[p] {
+			found = append(found, p)
+		}
+	}
+	if err := s.record(ctx, r, t, fileMatched, found); err != nil {
 		return nil, err
 	}
-	for p := range matched {
+	for _, p := range found {
 		known[p] = true
-	}
-	for p := range tf.boundMatches(newMatcher(r), flds) {
-		if !scanned[p] {
-			known[p] = true
-		}
 	}
 	return known, nil
 }
 
 // expire expires, in every table, the snapshots that reference files that
 // held identifiers, however recent: time travel to them ends. Snapshots
-// that reference none stay, older ones included. The current snapshot is
-// first made to reference none.
+// that reference none stay, older ones included, and so do the snapshots
+// branches and tags point at, which the rewrite step made reference none.
 func (s *Service) expire(ctx context.Context, r *Request) error {
 	tables, err := s.tables(ctx, r)
 	if err != nil {
@@ -630,13 +604,11 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 		return err
 	}
 	for _, lt := range tables {
-		t, tbl := lt.t, lt.tbl
+		t := lt.t
 		for attempt := 1; ; attempt++ {
-			n, err := s.expireTable(ctx, r, t, tbl, l)
+			n, err := s.expireTable(ctx, r, t, l)
 			if errors.Is(err, table.ErrCommitFailed) && attempt < commitAttempts {
-				if tbl, err = s.opts.Catalog.LoadTable(ctx, tbl.Identifier()); err == nil {
-					continue
-				}
+				continue
 			}
 			if err != nil {
 				return fmt.Errorf("expire snapshots of %s: %w", t.Name, err)
@@ -652,27 +624,49 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 	return nil
 }
 
-func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, tbl *table.Table, l *listings) (int, error) {
-	flds := fields(tbl, t)
+func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, l *listings) (int, error) {
+	tbl, err := s.reload(ctx, t)
+	if err != nil {
+		return 0, err
+	}
 	tf, err := readFiles(ctx, tbl)
 	if err != nil {
 		return 0, err
 	}
-	bad, err := s.bad(ctx, r, t, tf, flds, l)
+	bad, err := s.bad(ctx, r, t, tf, fields(tbl, t), l)
 	if err != nil {
 		return 0, err
 	}
-	if tf.mentions(tf.current(), bad) {
-		if tbl, err = s.forget(ctx, tbl, bad); err != nil {
-			return 0, err
+	// A ref whose snapshot still mentions such a file, as one whose bounds
+	// only now told, is rewritten first.
+	for name, ref := range tbl.Metadata().Refs() {
+		if tf.mentions(ref.SnapshotID, bad) {
+			if err := s.onRef(ctx, r, t, name, func(ctx context.Context, view *table.Table, branch string, commit bool) (bool, error) {
+				return s.rewriteRef(ctx, r, t, view, branch, commit)
+			}); err != nil {
+				return 0, err
+			}
 		}
-		if tf, err = readFiles(ctx, tbl); err != nil {
-			return 0, err
+	}
+	if tbl, err = s.reload(ctx, t); err != nil {
+		return 0, err
+	}
+	if tf, err = readFiles(ctx, tbl); err != nil {
+		return 0, err
+	}
+	heads := map[int64]bool{}
+	var reqs []table.Requirement
+	for name, ref := range tbl.Metadata().Refs() {
+		if tf.mentions(ref.SnapshotID, bad) {
+			return 0, fmt.Errorf("%s still references a file that held matching rows", name)
 		}
+		heads[ref.SnapshotID] = true
+		id := ref.SnapshotID
+		reqs = append(reqs, table.AssertRefSnapshotID(name, &id))
 	}
 	var expired, retained []int64
 	for _, snap := range tbl.Metadata().Snapshots() {
-		if snap.SnapshotID != tf.current() && tf.mentions(snap.SnapshotID, bad) {
+		if !heads[snap.SnapshotID] && tf.mentions(snap.SnapshotID, bad) {
 			expired = append(expired, snap.SnapshotID)
 		} else {
 			retained = append(retained, snap.SnapshotID)
@@ -692,15 +686,9 @@ func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, tbl *ta
 	if err := s.record(ctx, r, t, fileExpired, gone); err != nil {
 		return 0, err
 	}
-	updates := []table.Update{table.NewRemoveSnapshotsUpdate(expired, false)}
-	for name, ref := range tbl.Metadata().Refs() {
-		if name != table.MainBranch && slices.Contains(expired, ref.SnapshotID) {
-			updates = append(updates, table.NewRemoveSnapshotRefUpdate(name))
-		}
-	}
-	current := tf.current()
-	reqs := []table.Requirement{table.AssertTableUUID(tbl.Metadata().TableUUID()), table.AssertRefSnapshotID(table.MainBranch, &current)}
-	if _, _, err := s.opts.Catalog.CommitTable(ctx, tbl.Identifier(), reqs, updates); err != nil {
+	// Every ref is asserted: a commit to any of them meanwhile could make
+	// an expired snapshot its parent.
+	if err := s.commitRefs(ctx, tbl, reqs, table.NewRemoveSnapshotsUpdate(expired, false)); err != nil {
 		return 0, err
 	}
 	s.log.Info("expired snapshots holding erased data", "request", r.ID, "table", t.Name, "snapshots", len(expired))
@@ -730,7 +718,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	var gone []File
 	going := map[string]bool{}
 	for _, f := range files {
-		if f.Deleted.IsZero() && !referenced[f.Path] {
+		if f.Deleted.IsZero() && f.Kind != fileOutside && !referenced[f.Path] {
 			gone, going[f.Path] = append(gone, f), true
 		}
 	}
@@ -746,7 +734,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 			}
 		}
 		maps.DeleteFunc(young, func(p string, _ time.Time) bool { return going[p] })
-		matched, err := s.matchingFiles(ctx, r.Salt, parquet(slices.Collect(maps.Keys(young))), scanColumns(fields(l.tbl, l.t), r.Subjects))
+		matched, err := s.matchingFiles(ctx, r.salt, parquet(slices.Collect(maps.Keys(young))), scanColumns(fields(l.tbl, l.t), r.Subjects))
 		if err != nil {
 			return err
 		}
@@ -756,7 +744,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 			}
 		}
 	}
-	if err := s.unshared(ctx, r, gone); err != nil {
+	if err := s.unshared(ctx, r, tables, gone); err != nil {
 		return err
 	}
 	if err := s.delete(ctx, r, tables, gone); err != nil {
@@ -777,7 +765,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 // references one of files, as a table that shares files with one of its
 // tables without saying so, or by columns of other names, may: deleting
 // the file would break that table, which holds the rows too.
-func (s *Service) unshared(ctx context.Context, r *Request, files []File) error {
+func (s *Service) unshared(ctx context.Context, r *Request, tables []loaded, files []File) error {
 	if len(files) == 0 {
 		return nil
 	}
@@ -785,22 +773,12 @@ func (s *Service) unshared(ctx context.Context, r *Request, files []File) error 
 	for _, f := range files {
 		paths[f.Path] = true
 	}
-	idents, err := s.opts.Catalog.Tables(ctx)
+	others, err := s.others(ctx, uuids(tables))
 	if err != nil {
 		return err
 	}
-	for _, id := range idents {
-		name := tableName(id)
-		if slices.ContainsFunc(r.Tables, func(t Table) bool { return strings.EqualFold(t.Name, name) }) {
-			continue
-		}
-		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
-		if errors.Is(err, icecat.ErrNoSuchTable) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("load %s: %w", name, err)
-		}
+	for _, tbl := range others {
+		name := tableName(tbl.Identifier())
 		tf, err := readFiles(ctx, tbl)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", name, err)
@@ -878,7 +856,7 @@ func (s *Service) referenced(ctx context.Context, r *Request) ([]loaded, map[str
 // elsewhere may share its location with other data.
 func (s *Service) orphans(ctx context.Context, tbl *table.Table, referenced map[string]bool) ([]string, map[string]time.Time, error) {
 	young := map[string]time.Time{}
-	if s.opts.Warehouse == "" || !within(tbl.Location(), s.opts.Warehouse) {
+	if !within(tbl.Location(), s.opts.Warehouse) {
 		return nil, young, nil
 	}
 	fsys, err := tbl.FS(ctx)
@@ -921,8 +899,11 @@ func parquet(paths []string) []string {
 	return slices.DeleteFunc(paths, func(p string) bool { return !strings.HasSuffix(p, ".parquet") })
 }
 
-// delete deletes files from object storage and records it.
+// delete deletes files from object storage and records it. It deletes
+// only files in the warehouse, with Igloo's own credentials: others were
+// recorded as left (see record).
 func (s *Service) delete(ctx context.Context, r *Request, tables []loaded, files []File) error {
+	files = slices.DeleteFunc(slices.Clone(files), func(f File) bool { return !within(f.Path, s.opts.Warehouse) })
 	if len(files) == 0 {
 		return nil
 	}
@@ -937,6 +918,12 @@ func (s *Service) delete(ctx context.Context, r *Request, tables []loaded, files
 		return err
 	}
 	var paths []string
+	defer func() {
+		// Whatever happens, replicas must empty their caches of what went.
+		if len(paths) > 0 {
+			r.DeletedThrough = s.now()
+		}
+	}()
 	for _, f := range files {
 		if err := fsys.Remove(f.Path); err != nil && !notExist(err) {
 			return errors.Join(fmt.Errorf("delete %s: %w", base(f.Path), err), s.opts.Store.Deleted(ctx, r.ID, paths, s.now()))
@@ -983,61 +970,98 @@ func notExist(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || gcerrors.Code(err) == gcerrors.NotFound
 }
 
-// sharing deletes the Delta Sharing copies of the tables' data files that
-// hold matching rows; Delta Sharing writes them again, from the files
-// that remain, when a recipient needs them.
+// sharing deletes the Delta Sharing copies of data files that hold
+// matching rows; Delta Sharing writes them again, from the files that
+// remain, when a recipient needs them.
 func (s *Service) sharing(ctx context.Context, r *Request) error {
 	tables, err := s.tables(ctx, r)
 	if err != nil {
 		return err
 	}
+	copies, err := s.sharedCopies(ctx, r, tables)
+	if err != nil {
+		return err
+	}
 	var gone []File
+	for _, c := range copies {
+		gone = append(gone, File{Path: c.path, Table: c.table, Kind: fileSharing})
+	}
 	for _, l := range tables {
-		matched, err := s.sharedCopies(ctx, r, l)
-		if err != nil {
-			return err
-		}
-		for _, p := range matched {
-			gone = append(gone, File{Path: p, Table: l.t.Name, Kind: fileSharing})
-		}
 		l.t.done(StepSharing, s.now())
 	}
 	return s.delete(ctx, r, tables, gone)
 }
 
-// sharedCopies returns the table's Delta Sharing copies that hold matching
-// rows.
-func (s *Service) sharedCopies(ctx context.Context, r *Request, l loaded) ([]string, error) {
-	if s.opts.Warehouse == "" {
+type sharedCopy struct{ path, table string }
+
+// sharedCopies returns the Delta Sharing copies that hold matching rows:
+// those of the tables, and those under other tables' UUIDs, such as the
+// copies of a table since replaced, which are looked in by the names of
+// every table's columns.
+func (s *Service) sharedCopies(ctx context.Context, r *Request, tables []loaded) ([]sharedCopy, error) {
+	if len(tables) == 0 {
 		return nil, nil
 	}
-	fsys, err := l.tbl.FS(ctx)
+	fsys, err := tables[0].tbl.FS(ctx)
 	if err != nil {
 		return nil, err
 	}
-	listed, err := listFiles(fsys, s.opts.Warehouse+sharingDir+l.tbl.Metadata().TableUUID().String()+"/")
+	listed, err := listFiles(fsys, s.opts.Warehouse+sharingDir)
 	if err != nil {
 		return nil, err
 	}
-	matched, err := s.matchingFiles(ctx, r.Salt, parquet(slices.Collect(maps.Keys(listed))), scanColumns(fields(l.tbl, l.t), r.Subjects))
-	if err != nil {
-		return nil, err
+	byDir := map[string][]string{}
+	for p := range listed {
+		dir, _, _ := strings.Cut(strings.TrimPrefix(p, s.opts.Warehouse+sharingDir), "/")
+		if strings.HasSuffix(p, ".parquet") {
+			byDir[dir] = append(byDir[dir], p)
+		}
 	}
-	return slices.Sorted(maps.Keys(matched)), nil
+	var (
+		out     []sharedCopy
+		anyCols []scanColumn
+	)
+	for _, l := range tables {
+		cols := scanColumns(fields(l.tbl, l.t), r.Subjects)
+		for _, c := range cols {
+			c.id = 0
+			anyCols = append(anyCols, c)
+		}
+		id := l.tbl.Metadata().TableUUID().String()
+		matched, err := s.matchingFiles(ctx, r.salt, byDir[id], cols)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range slices.Sorted(maps.Keys(matched)) {
+			out = append(out, sharedCopy{p, l.t.Name})
+		}
+		delete(byDir, id)
+	}
+	for _, dir := range slices.Sorted(maps.Keys(byDir)) {
+		matched, err := s.matchingFiles(ctx, r.salt, byDir[dir], anyCols)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range slices.Sorted(maps.Keys(matched)) {
+			out = append(out, sharedCopy{p, tables[0].t.Name})
+		}
+	}
+	return out, nil
 }
 
 // history redacts the identifiers from the history stores.
 func (s *Service) history(ctx context.Context, r *Request) error {
-	n, err := s.redact(ctx, r)
+	n, err := s.redact(ctx, newRedactor(r))
 	r.HistoryRedacted += n
 	return err
 }
 
-func (s *Service) redact(ctx context.Context, r *Request) (int64, error) {
-	m := newMatcher(r)
+func (s *Service) redact(ctx context.Context, x interface {
+	Redact(string) (string, bool)
+}) (int64, error) {
 	var total int64
 	for _, h := range s.opts.History {
-		n, err := h.Redact(ctx, m)
+		n, err := h.Redact(ctx, x)
 		total += n
 		if err != nil {
 			return total, err
@@ -1046,10 +1070,24 @@ func (s *Service) redact(ctx context.Context, r *Request) (int64, error) {
 	return total, nil
 }
 
+// counter counts the history records a redactor would change, changing
+// none.
+type counter struct {
+	x *redactor
+	n int64
+}
+
+func (c *counter) Redact(text string) (string, bool) {
+	if _, ok := c.x.Redact(text); ok {
+		c.n++
+	}
+	return text, false
+}
+
 const (
 	// liveWindow is how recently a replica must have been seen to count
-	// as running: one that was must drop a request's files before the
-	// request completes.
+	// as running: one that was must empty its cache before the request
+	// completes.
 	liveWindow = 2 * time.Minute
 	// cacheWait is how long a request waits for replicas at a time.
 	cacheWait = 20 * time.Second
@@ -1057,8 +1095,8 @@ const (
 	staleCache = 30 * 24 * time.Hour
 )
 
-// cache waits until every running replica dropped the files the request
-// deleted from its read cache.
+// cache waits until every running replica emptied its read cache since
+// the request last deleted files.
 func (s *Service) cache(ctx context.Context, r *Request) error {
 	if s.opts.Purger != nil {
 		if err := s.opts.Purger.Once(ctx); err != nil {
@@ -1070,43 +1108,29 @@ func (s *Service) cache(ctx context.Context, r *Request) error {
 		return err
 	}
 	if len(waiting) > 0 {
-		s.log.Info("erasure waits for replicas to drop deleted files from their read caches", "request", r.ID,
+		s.log.Info("erasure waits for replicas to empty their read caches", "request", r.ID,
 			"replicas", strings.Join(waiting, ", "))
 		r.wait(s.now().Add(cacheWait))
 	}
 	return nil
 }
 
-// caches counts the caches that dropped r's deleted files, and those of
-// replicas not running now, which will when they start, and names the
+// caches counts the caches emptied since r deleted files, and those of
+// replicas not running now, which will be when they start, and names the
 // running replicas that have yet to.
-func (s *Service) caches(ctx context.Context, r *Request) (dropped, pending int, waiting []string, err error) {
-	files, err := s.opts.Store.Files(ctx, r.ID)
-	if err != nil {
-		return 0, 0, nil, err
-	}
-	var latest time.Time
-	for _, f := range files {
-		if f.Deleted.After(latest) {
-			latest = f.Deleted
-		}
-	}
-	if latest.IsZero() {
+func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int, waiting []string, err error) {
+	if r.DeletedThrough.IsZero() {
 		return 0, 0, nil, nil
 	}
 	caches, err := s.opts.Store.Caches(ctx)
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	purges, err := s.opts.Store.Purges(ctx, r.ID)
-	if err != nil {
-		return 0, 0, nil, err
-	}
 	now := s.now()
 	for _, c := range caches {
 		switch {
-		case !purges[c.ID].Before(latest):
-			dropped++
+		case !c.Emptied.Before(r.DeletedThrough):
+			emptied++
 		case now.Sub(c.Seen) < liveWindow:
 			waiting = append(waiting, c.Host)
 		case !strings.HasPrefix(c.ID, MemoryCache) && now.Sub(c.Seen) < staleCache:
@@ -1114,7 +1138,7 @@ func (s *Service) caches(ctx context.Context, r *Request) (dropped, pending int,
 		}
 	}
 	sort.Strings(waiting)
-	return dropped, pending, waiting, nil
+	return emptied, pending, waiting, nil
 }
 
 // verify looks for the identifiers in what is left, and returns the step
@@ -1150,16 +1174,24 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 			v.Storage++
 		}
 	}
-	// What history replicas recorded since the history step is redacted
-	// too, and then nothing may be left.
-	n, err := s.redact(ctx, r)
+	copies, err := s.sharedCopies(ctx, r, tables)
+	if err != nil {
+		return "", err
+	}
+	v.Sharing = int64(len(copies))
+	// What replicas recorded since the history step is redacted too, and
+	// then nothing may be left.
+	x := newRedactor(r)
+	n, err := s.redact(ctx, x)
 	if err != nil {
 		return "", err
 	}
 	r.HistoryRedacted += n
-	if v.History, err = s.redact(ctx, r); err != nil {
+	c := &counter{x: x}
+	if _, err := s.redact(ctx, c); err != nil {
 		return "", err
 	}
+	v.History = c.n
 	var waiting []string
 	if v.Caches, v.Pending, waiting, err = s.caches(ctx, r); err != nil {
 		return "", err
@@ -1183,7 +1215,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		return next, nil
 	}
 	if r.Rounds++; r.Rounds > maxRounds {
-		return "", fmt.Errorf("after %d rounds, verification still finds %s", maxRounds, v)
+		return "", terminal(fmt.Errorf("after %d rounds, verification still finds %s", maxRounds, v))
 	}
 	s.log.Info("erasure verification found more to remove", "request", r.ID, "found", v.String(), "next", next)
 	return next, nil
@@ -1193,7 +1225,7 @@ func (s *Service) verifyTable(ctx context.Context, r *Request, lt loaded, m *mat
 	t, tbl := lt.t, lt.tbl
 	flds := fields(tbl, t)
 	cols := scanColumns(flds, r.Subjects)
-	if cond := currentCondition(r.Salt, flds, r.Subjects); cond != "" {
+	if cond := currentCondition(r.salt, flds, r.Subjects, true); cond != "" {
 		n, err := s.rows.Count(ctx, tbl, cond)
 		if err != nil {
 			return err
@@ -1206,14 +1238,14 @@ func (s *Service) verifyTable(ctx context.Context, r *Request, lt loaded, m *mat
 	}
 	var data, scanned []string
 	for p, df := range tf.live(false) {
-		if scannable(df, flds) {
+		if scannable(df) {
 			scanned = append(scanned, p)
 			if df.ContentType() == iceberg.EntryContentData {
 				data = append(data, p)
 			}
 		}
 	}
-	matched, err := s.matchingFiles(ctx, r.Salt, scanned, cols)
+	matched, err := s.matchingFiles(ctx, r.salt, scanned, cols)
 	if err != nil {
 		return err
 	}
@@ -1234,16 +1266,11 @@ func (s *Service) verifyTable(ctx context.Context, r *Request, lt loaded, m *mat
 	if err != nil {
 		return err
 	}
-	orphans, err := s.matchingFiles(ctx, r.Salt, parquet(slices.Collect(maps.Keys(young))), cols)
+	orphans, err := s.matchingFiles(ctx, r.salt, parquet(slices.Collect(maps.Keys(young))), cols)
 	if err != nil {
 		return err
 	}
 	v.Orphans += int64(len(orphans))
-	copies, err := s.sharedCopies(ctx, r, lt)
-	if err != nil {
-		return err
-	}
-	v.Sharing += int64(len(copies))
 	return nil
 }
 

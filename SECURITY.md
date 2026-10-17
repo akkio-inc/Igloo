@@ -191,19 +191,29 @@ reference for every setting mentioned here.
   database or other internal services either. Give each connection a
   database user that can read only what Igloo should.
 - **Erasure** ([details](docs/privacy.md)). Admins and holders of `ERASE ON
-  ACCOUNT` ask for erasures and set data retentions; others see no
-  requests. A request's identifiers are kept only as SHA-256 hashes salted
-  with 128 random bits of the request's, and those go when it completes;
-  `ERASE SUBJECT` reaches the history, the logs and the list of running
-  statements with its identifiers replaced by `'***'`. Requests read and
-  change tables with Igloo's own access, not through policies, which would
-  hide the values they look for, and are carried out whatever later happens
-  to the account that made them. They delete files from the warehouse, only
-  once no table in the catalog references them, holding the locks making a
-  clone takes, and orphan files only after 3 days, as maintenance does.
-  They do not reach backups, bucket versions, soft-deleted objects, tables
-  of connections, or copies outside the warehouse, such as what engines
-  read with Iceberg REST credentials before the files were deleted.
+  ACCOUNT` ask for, preview, confirm and cancel erasures and set data
+  retentions of tables with tags (admins of any table); others see no
+  requests. While a request is open, the metadata database holds its
+  identifiers sealed with AES-256-GCM under a key derived from
+  `IGLOO_ERASURE_KEY`, which it never holds, and a random salt; the salt of
+  the hashes that find rows is derived from both. That is pseudonymised
+  data, safe from someone with the database alone but not from someone with
+  the key too, which every replica has; it all goes when the request ends,
+  with the paths of the files it deleted. Nothing about the identifiers is
+  sent to the database, not even hashes: history is read and redacted in
+  Igloo. Any statement with `ERASE SUBJECT` reaches the history, the logs
+  and the list of running statements with its identifiers replaced, and
+  errors keep no identifier or hash. Requests read and change tables with
+  Igloo's own access, not through policies, which would hide the values they
+  look for, and are carried out whatever later happens to the account that
+  made them. They refuse placeholder identifiers, and wait for confirmation
+  before deleting more than 1% of a table. They delete files only in the
+  warehouse, only once no table in the catalog references them, holding the
+  locks making a clone takes, and orphan files only after 3 days, as
+  maintenance does. They do not reach backups, bucket versions,
+  soft-deleted objects, tables of connections, or copies outside the
+  warehouse, such as what engines read with Iceberg REST credentials before
+  the files were deleted.
 - **History.** Every statement (with passwords and secrets removed) and
   every login attempt is recorded in the metadata database, schema
   `igloo_audit`, for `IGLOO_AUDIT_RETENTION`. Users read their own history

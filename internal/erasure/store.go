@@ -33,8 +33,8 @@ var migrations = []string{
 		created_at timestamptz NOT NULL,
 		doc        jsonb NOT NULL
 	)`,
-	// Files a request deletes once nothing references them, kept as the
-	// record of what it deleted and for replicas to drop from their caches.
+	// Files a request deletes once nothing references them, while it is
+	// open: their paths can hold identifiers, as partition values.
 	`CREATE TABLE IF NOT EXISTS igloo_erasure.files (
 		request_id text NOT NULL,
 		path       text NOT NULL,
@@ -44,19 +44,15 @@ var migrations = []string{
 		PRIMARY KEY (request_id, path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS files_deleted ON igloo_erasure.files (deleted_at) WHERE deleted_at IS NOT NULL`,
-	// The replicas' read caches, and up to when each dropped a request's
-	// deleted files.
+	// The replicas' read caches, and up to when each was emptied of what
+	// requests deleted.
 	`CREATE TABLE IF NOT EXISTS igloo_erasure.caches (
 		cache_id text PRIMARY KEY,
 		host     text NOT NULL,
 		seen_at  timestamptz NOT NULL
 	)`,
-	`CREATE TABLE IF NOT EXISTS igloo_erasure.purges (
-		request_id     text NOT NULL,
-		cache_id       text NOT NULL,
-		purged_through timestamptz NOT NULL,
-		PRIMARY KEY (request_id, cache_id)
-	)`,
+	`ALTER TABLE igloo_erasure.caches ADD COLUMN IF NOT EXISTS emptied_through timestamptz`,
+	`DROP TABLE IF EXISTS igloo_erasure.purges`,
 }
 
 // OpenPostgres connects to url with a small pool of its own and creates
@@ -182,6 +178,11 @@ func (s *PostgresStore) Deleted(ctx context.Context, id string, paths []string, 
 	return err
 }
 
+func (s *PostgresStore) Forget(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM igloo_erasure.files WHERE request_id = $1`, id)
+	return err
+}
+
 func (s *PostgresStore) Seen(ctx context.Context, cache, host string, at time.Time) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_erasure.caches (cache_id, host, seen_at) VALUES ($1, $2, $3)
 		ON CONFLICT (cache_id) DO UPDATE SET host = excluded.host, seen_at = greatest(igloo_erasure.caches.seen_at, excluded.seen_at)`,
@@ -190,65 +191,36 @@ func (s *PostgresStore) Seen(ctx context.Context, cache, host string, at time.Ti
 }
 
 func (s *PostgresStore) Caches(ctx context.Context) ([]Cache, error) {
-	rows, err := s.pool.Query(ctx, `SELECT cache_id, host, seen_at FROM igloo_erasure.caches ORDER BY cache_id`)
+	rows, err := s.pool.Query(ctx, `SELECT cache_id, host, seen_at, emptied_through FROM igloo_erasure.caches ORDER BY cache_id`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Cache, error) {
-		var c Cache
-		return c, row.Scan(&c.ID, &c.Host, &c.Seen)
+		var (
+			c       Cache
+			emptied *time.Time
+		)
+		err := row.Scan(&c.ID, &c.Host, &c.Seen, &emptied)
+		if emptied != nil {
+			c.Emptied = *emptied
+		}
+		return c, err
 	})
 }
 
-func (s *PostgresStore) Unpurged(ctx context.Context, cache string) ([]Unpurged, error) {
-	rows, err := s.pool.Query(ctx, `SELECT f.request_id, f.path, f.deleted_at FROM igloo_erasure.files f
-		LEFT JOIN igloo_erasure.purges p ON p.request_id = f.request_id AND p.cache_id = $1
-		WHERE f.deleted_at IS NOT NULL AND (p.purged_through IS NULL OR f.deleted_at > p.purged_through)
-		ORDER BY f.request_id, f.path`, cache)
-	if err != nil {
-		return nil, err
-	}
-	var (
-		out     []Unpurged
-		id, p   string
-		deleted time.Time
-	)
-	_, err = pgx.ForEachRow(rows, []any{&id, &p, &deleted}, func() error {
-		if len(out) == 0 || out[len(out)-1].Request != id {
-			out = append(out, Unpurged{Request: id})
-		}
-		u := &out[len(out)-1]
-		u.Paths = append(u.Paths, p)
-		if deleted.After(u.Through) {
-			u.Through = deleted
-		}
-		return nil
-	})
-	return out, err
-}
-
-func (s *PostgresStore) Purged(ctx context.Context, id, cache string, through time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_erasure.purges (request_id, cache_id, purged_through) VALUES ($1, $2, $3)
-		ON CONFLICT (request_id, cache_id) DO UPDATE
-		SET purged_through = greatest(igloo_erasure.purges.purged_through, excluded.purged_through)`, id, cache, through)
+func (s *PostgresStore) Emptied(ctx context.Context, cache string, through time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE igloo_erasure.caches SET emptied_through = greatest(emptied_through, $2) WHERE cache_id = $1`,
+		cache, through)
 	return err
 }
 
-func (s *PostgresStore) Purges(ctx context.Context, id string) (map[string]time.Time, error) {
-	rows, err := s.pool.Query(ctx, `SELECT cache_id, purged_through FROM igloo_erasure.purges WHERE request_id = $1`, id)
-	if err != nil {
-		return nil, err
+func (s *PostgresStore) LatestDeletion(ctx context.Context) (time.Time, error) {
+	var at *time.Time
+	err := s.pool.QueryRow(ctx, `SELECT max((doc->>'deleted_through')::timestamptz) FROM igloo_erasure.requests`).Scan(&at)
+	if at == nil {
+		return time.Time{}, err
 	}
-	out := map[string]time.Time{}
-	var (
-		cache string
-		at    time.Time
-	)
-	_, err = pgx.ForEachRow(rows, []any{&cache, &at}, func() error {
-		out[cache] = at
-		return nil
-	})
-	return out, err
+	return *at, err
 }
 
 func (s *PostgresStore) Close() { s.pool.Close() }
@@ -260,13 +232,11 @@ type MemoryStore struct {
 	requests map[string][]byte
 	files    map[string][]File
 	caches   map[string]Cache
-	purges   map[string]map[string]time.Time
 }
 
 // NewMemoryStore returns an empty store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{requests: map[string][]byte{}, files: map[string][]File{}, caches: map[string]Cache{},
-		purges: map[string]map[string]time.Time{}}
+	return &MemoryStore{requests: map[string][]byte{}, files: map[string][]File{}, caches: map[string]Cache{}}
 }
 
 func (m *MemoryStore) Create(_ context.Context, r *Request) error {
@@ -363,12 +333,21 @@ func (m *MemoryStore) Deleted(_ context.Context, id string, paths []string, at t
 	return nil
 }
 
+func (m *MemoryStore) Forget(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.files, id)
+	return nil
+}
+
 func (m *MemoryStore) Seen(_ context.Context, cache, host string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if c, ok := m.caches[cache]; !ok || at.After(c.Seen) {
-		m.caches[cache] = Cache{ID: cache, Host: host, Seen: at}
+	c, ok := m.caches[cache]
+	if !ok || at.After(c.Seen) {
+		c.ID, c.Host, c.Seen = cache, host, at
 	}
+	m.caches[cache] = c
 	return nil
 }
 
@@ -383,49 +362,30 @@ func (m *MemoryStore) Caches(context.Context) ([]Cache, error) {
 	return out, nil
 }
 
-func (m *MemoryStore) Unpurged(_ context.Context, cache string) ([]Unpurged, error) {
+func (m *MemoryStore) Emptied(_ context.Context, cache string, through time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []Unpurged
-	for id, files := range m.files {
-		u := Unpurged{Request: id}
-		through := m.purges[id][cache]
-		for _, f := range files {
-			if !f.Deleted.IsZero() && f.Deleted.After(through) {
-				u.Paths = append(u.Paths, f.Path)
-				if f.Deleted.After(u.Through) {
-					u.Through = f.Deleted
-				}
-			}
-		}
-		if len(u.Paths) > 0 {
-			out = append(out, u)
-		}
-	}
-	slices.SortFunc(out, func(a, b Unpurged) int { return strings.Compare(a.Request, b.Request) })
-	return out, nil
-}
-
-func (m *MemoryStore) Purged(_ context.Context, id, cache string, through time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.purges[id] == nil {
-		m.purges[id] = map[string]time.Time{}
-	}
-	if through.After(m.purges[id][cache]) {
-		m.purges[id][cache] = through
+	if c, ok := m.caches[cache]; ok && through.After(c.Emptied) {
+		c.Emptied = through
+		m.caches[cache] = c
 	}
 	return nil
 }
 
-func (m *MemoryStore) Purges(_ context.Context, id string) (map[string]time.Time, error) {
+func (m *MemoryStore) LatestDeletion(context.Context) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := map[string]time.Time{}
-	for c, at := range m.purges[id] {
-		out[c] = at
+	var latest time.Time
+	for _, doc := range m.requests {
+		var r Request
+		if err := json.Unmarshal(doc, &r); err != nil {
+			return time.Time{}, err
+		}
+		if r.DeletedThrough.After(latest) {
+			latest = r.DeletedThrough
+		}
 	}
-	return out, nil
+	return latest, nil
 }
 
 func (m *MemoryStore) Close() {}

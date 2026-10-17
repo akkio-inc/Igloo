@@ -7,65 +7,66 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Redactor finds in history the identifiers an erasure request erases,
-// and removes them (see package erasure). It knows them only as salted
+// and removes them (see package erasure). Stores read every record to it:
+// nothing about the identifiers reaches the metadata database, not even
 // hashes.
 type Redactor interface {
-	// Prefilter describes the records a store can find by itself: those
-	// with a word, split off by the regular expression delimiters (valid
-	// in Go and PostgreSQL), or a '...' string literal, whose SHA-256
-	// after salt is in hashes, once lower-cased and trimmed of spaces.
-	Prefilter() (delimiters, salt string, hashes [][]byte)
-	// RedactSQL removes the identifiers from a statement, reporting
-	// whether there were any.
-	RedactSQL(text string) (string, bool)
-	// RedactText removes them from other text, such as error messages.
-	RedactText(text string) (string, bool)
+	// Redact removes the identifiers from text, reporting whether there
+	// were any.
+	Redact(text string) (string, bool)
 }
 
-// CandidateSQL is the condition on a text column, named by column, that
-// finds candidates for a Redactor's Prefilter given as $1, $2 and $3.
-// Stores that keep history elsewhere in the metadata database use it too.
-func CandidateSQL(column string) string {
-	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM regexp_split_to_table(lower(%[1]s), $1) AS w(word)
-			WHERE word <> '' AND sha256(convert_to($2 || word, 'UTF8')) = ANY ($3))
-		OR EXISTS (SELECT 1 FROM regexp_matches(%[1]s, '''((?:[^'']|'''')*)''', 'g') AS m(lit)
-			WHERE sha256(convert_to($2 || lower(btrim(replace(lit[1], '''''', ''''), ' ')), 'UTF8')) = ANY ($3)))`, column)
-}
+// redactBatch is how many records are read at a time.
+const redactBatch = 2000
 
-// redactBatch is how many candidates are redacted at a time.
-const redactBatch = 500
-
-// Redact removes r's identifiers from the statements in the history,
-// returning how many it changed.
-func (s *PostgresStore) Redact(ctx context.Context, r Redactor) (int64, error) {
-	delims, salt, hashes := r.Prefilter()
+// RedactColumns redacts the text columns of every row of table, read in
+// order of the text key column key, a batch at a time, returning how many
+// rows it changed. Stores that keep history elsewhere in the metadata
+// database use it too.
+func RedactColumns(ctx context.Context, pool *pgxpool.Pool, r Redactor, table, key string, columns ...string) (int64, error) {
 	var changed int64
 	after := ""
 	for {
-		rows, err := s.pool.Query(ctx, `SELECT query_id, query_text FROM igloo_audit.query_history
-			WHERE query_id > $4 AND `+CandidateSQL("query_text")+` ORDER BY query_id LIMIT `+fmt.Sprint(redactBatch),
-			delims, salt, hashes, after)
+		rows, err := pool.Query(ctx, `SELECT `+key+`, `+strings.Join(columns, ", ")+` FROM `+table+`
+			WHERE `+key+` > $1 ORDER BY `+key+` LIMIT `+fmt.Sprint(redactBatch), after)
 		if err != nil {
 			return changed, err
 		}
-		type record struct{ id, text string }
+		type record struct {
+			key    string
+			values []*string
+		}
 		batch, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (record, error) {
-			var r record
-			return r, row.Scan(&r.id, &r.text)
+			rec := record{values: make([]*string, len(columns))}
+			dest := []any{&rec.key}
+			for i := range rec.values {
+				dest = append(dest, &rec.values[i])
+			}
+			return rec, row.Scan(dest...)
 		})
 		if err != nil {
 			return changed, err
 		}
 		for _, rec := range batch {
-			text, ok := r.RedactSQL(rec.text)
-			if !ok {
+			var sets []string
+			args := []any{rec.key}
+			for i, v := range rec.values {
+				if v == nil {
+					continue
+				}
+				if text, ok := r.Redact(*v); ok {
+					args = append(args, text)
+					sets = append(sets, fmt.Sprintf("%s = $%d", columns[i], len(args)))
+				}
+			}
+			if len(sets) == 0 {
 				continue
 			}
-			if _, err := s.pool.Exec(ctx, `UPDATE igloo_audit.query_history SET query_text = $2 WHERE query_id = $1`,
-				rec.id, text); err != nil {
+			if _, err := pool.Exec(ctx, `UPDATE `+table+` SET `+strings.Join(sets, ", ")+` WHERE `+key+` = $1`, args...); err != nil {
 				return changed, err
 			}
 			changed++
@@ -73,8 +74,20 @@ func (s *PostgresStore) Redact(ctx context.Context, r Redactor) (int64, error) {
 		if len(batch) < redactBatch {
 			return changed, nil
 		}
-		after = batch[len(batch)-1].id
+		after = batch[len(batch)-1].key
 	}
+}
+
+// Redact removes r's identifiers from the history: from statements, the
+// query tags they ran under and the applications that sent them, and from
+// the applications that logged in.
+func (s *PostgresStore) Redact(ctx context.Context, r Redactor) (int64, error) {
+	n, err := RedactColumns(ctx, s.pool, r, "igloo_audit.query_history", "query_id", "query_text", "query_tag", "application_name")
+	if err != nil {
+		return n, err
+	}
+	m, err := RedactColumns(ctx, s.pool, r, "igloo_audit.login_history", "event_id", "application_name")
+	return n + m, err
 }
 
 // Writes returns successful statements that wrote catalog tables and that
@@ -107,16 +120,29 @@ func namesPattern(names []string) any {
 	return `\m(` + strings.Join(quoteAll(names), "|") + `)\M`
 }
 
-// Redact removes r's identifiers from the statements in the history.
+// Redact removes r's identifiers from the history, as
+// PostgresStore.Redact does.
 func (m *MemoryStore) Redact(_ context.Context, r Redactor) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var changed int64
-	for i, q := range m.queries {
-		if text, ok := r.RedactSQL(q.Text); ok {
-			m.queries[i].Text = text
+	redact := func(fields ...*string) {
+		hit := false
+		for _, f := range fields {
+			if text, ok := r.Redact(*f); ok {
+				*f, hit = text, true
+			}
+		}
+		if hit {
 			changed++
 		}
+	}
+	for i := range m.queries {
+		q := &m.queries[i]
+		redact(&q.Text, &q.QueryTag, &q.ApplicationName)
+	}
+	for i := range m.logins {
+		redact(&m.logins[i].ApplicationName)
 	}
 	return changed, nil
 }

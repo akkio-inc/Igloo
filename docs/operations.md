@@ -121,17 +121,31 @@ tags](security-policies.md) describes them.
 every table whose columns are tagged with an identifier, and keep a record
 that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
 
-- Each request runs as a job on the [scheduler](#scheduled-work), every
-  minute until it completes, one request at a time across replicas; its
-  runs are in `igloo.task_history` as kind `erasure`. It reads the tagged
-  columns of the tagged tables in full, with all of a replica's cores, and
-  before it deletes files, the metadata of every table in the catalog, so
-  it deletes none that another table references.
-- Every replica checks every 15 seconds for files that requests deleted and
-  drops them from its read cache; a request waits for the replicas seen in
-  the last 2 minutes. A replica that was stopped drops them when it starts.
-- Requests, and the files each deleted, are in the metadata database
-  (schema `igloo_erasure`) and survive restarts; without one, in memory.
+- Requests need `IGLOO_ERASURE_KEY` ([configuration](configuration.md)),
+  the same on every replica and kept out of the metadata database. Changing
+  it fails the requests that are open; they must be made again.
+- Each request runs as a job on the [scheduler](#scheduled-work), one
+  request at a time across replicas: a run that finds another running ends
+  at once, so requests never take the scheduler's slots from tasks, pipes
+  and materialized views. Runs are in `igloo.task_history` as kind
+  `erasure`. A request reads the tagged columns of the tagged tables in
+  full, with all of a replica's cores, every record of the history stores,
+  and, before it deletes files, the metadata of every table in the catalog,
+  so it deletes none that another table references.
+- A failed run is tried again after a minute, then 2, 4, up to an hour; a
+  request that fails 10 times in a row fails for good: it logs `erasure
+  request failed` at error level, raises the built-in alert, and counts in
+  `igloo_erasure_requests_failed_total`. Alert on that metric, and on
+  `igloo_erasure_requests_held_total`, which counts requests waiting for
+  `CONFIRM ERASURE REQUEST`.
+- Every replica checks every 15 seconds whether a request deleted files
+  since it last emptied its read cache, and empties it whole; a request
+  waits for the replicas seen in the last 2 minutes. A replica that was
+  stopped empties its cache when it starts. A cache on disk copied to
+  another machine, as with a VM image, is told apart by the machine, and
+  emptied.
+- Requests are in the metadata database (schema `igloo_erasure`) and
+  survive restarts; without one, in memory.
 - `ALTER TABLE ... SET (data_retention_days = N)` limits how long a table
   keeps old versions of its rows; table maintenance enforces it.
 
@@ -459,7 +473,8 @@ events are logged at info level or above: `login`, `login failed`,
 `user changed`, `grants changed`, `role settings changed`, `job changed`
 (tasks, pipes, materialized views and alerts created, changed or dropped),
 `notification integration changed`, `erasure requested`, `erasure request
-completed`, `data retention changed`, `statement denied`, `statement
+completed`, `erasure request held`, `erasure request confirmed`, `erasure
+request canceled`, `erasure request failed`, `data retention changed`, `statement denied`, `statement
 canceled` (from the web console's compute page), and refused connections.
 Failed scheduled runs log `scheduled run failed` (component `tasks`), and
 notifications that could not be sent `notification failed` (component
@@ -545,7 +560,9 @@ A table's [data retention](privacy.md#data-retention) (`ALTER TABLE ... SET
 (data_retention_days = N)`, for tables that hold personal data) caps both:
 maintenance keeps no snapshot older than it but the current one, and
 rewrites, with the deletes applied, the data files whose rows were deleted
-longer ago, so they leave the files too.
+longer ago, so they leave the files too. Branches and tags, and the
+snapshots they point at, are kept whatever the retentions, as long as the
+ref's or the table's `max-ref-age-ms` says, forever by default.
 
 Maintenance commits are ordinary Iceberg commits. A query that is running
 keeps reading the snapshot it started with; a write that commits at the same

@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,13 +127,17 @@ func (s *erasureSource) FillRow(row duckdb.Row) (bool, error) {
 	return true, nil
 }
 
-// cacheIDFile keeps the read cache's ID, beside its blocks.
+// cacheIDFile keeps the read cache's ID, beside its blocks, with the
+// machine it belongs to.
 const cacheIDFile = "cache-id"
 
 // CacheID identifies this replica's read cache to erasure requests, which
-// wait for every running replica to drop the files they deleted. A cache
-// on disk keeps its ID in its directory, so the ID lasts as long as the
-// cache does, across restarts; without one, the ID is the process's own.
+// wait for every running replica to empty its cache after they delete
+// files. A cache on disk keeps its ID in its directory, so the ID lasts as
+// long as the cache does, across restarts, but only on the machine that
+// made it: a disk copied with a VM image to another machine gets a new
+// one, and is emptied, so the two replicas are told apart. Without a cache
+// on disk, the ID is the process's own.
 func (e *Engine) CacheID() (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -145,20 +147,37 @@ func (e *Engine) CacheID() (string, error) {
 	if e.cache == nil {
 		return erasure.MemoryCache + random, nil
 	}
+	machine := machineID()
 	file := filepath.Join(filepath.Dir(e.cache.dir), cacheIDFile)
-	if id, err := os.ReadFile(file); err == nil && strings.TrimSpace(string(id)) != "" {
-		return strings.TrimSpace(string(id)), nil
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	saved, err := os.ReadFile(file)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
+	if id, on, ok := strings.Cut(strings.TrimSpace(string(saved)), " "); ok && id != "" && on == machine {
+		return id, nil
+	}
+	if len(saved) > 0 {
+		// Blocks from another machine, whose erasures this one's ID has
+		// not seen: they go.
+		if err := e.EmptyCache(context.Background()); err != nil {
+			return "", err
+		}
+	}
 	id := "disk:" + random
-	return id, os.WriteFile(file, []byte(id+"\n"), 0o640)
+	return id, os.WriteFile(file, []byte(id+" "+machine+"\n"), 0o640)
 }
 
-// ForgetCachedFiles drops paths from the read cache on disk, and from
-// DuckDB's cache of file contents in memory, which can only be emptied
-// whole: only when it holds one of them.
-func (e *Engine) ForgetCachedFiles(ctx context.Context, paths []string) error {
+// machineID tells this machine from others: its host name and, where
+// there is one, its machine ID, which a cloned VM gets anew.
+func machineID() string {
+	host, _ := os.Hostname()
+	id, _ := os.ReadFile("/etc/machine-id")
+	return strings.ReplaceAll(host, " ", "_") + "/" + strings.TrimSpace(string(id))
+}
+
+// EmptyCache drops everything the read cache on disk holds, and DuckDB's
+// cache of file contents in memory.
+func (e *Engine) EmptyCache(ctx context.Context) error {
 	c, err := e.connector.Connect(ctx)
 	if err != nil {
 		return err
@@ -166,39 +185,9 @@ func (e *Engine) ForgetCachedFiles(ctx context.Context, paths []string) error {
 	defer c.Close() //nolint:errcheck
 	conn := c.(*duckdb.Conn)
 	if e.cache != nil {
-		for _, p := range paths {
-			if _, err := conn.ExecContext(ctx, "SELECT cache_httpfs_clear_cache_for_file("+literal(p)+")", nil); err != nil {
-				return fmt.Errorf("drop %s from the read cache: %w", filepath.Base(p), err)
-			}
+		if _, err := conn.ExecContext(ctx, "SELECT cache_httpfs_clear_cache()", nil); err != nil {
+			return fmt.Errorf("empty the read cache: %w", err)
 		}
-	}
-	rows, err := conn.QueryContext(ctx, "SELECT DISTINCT path FROM duckdb_external_file_cache()", nil)
-	if err != nil {
-		return err
-	}
-	cached := map[string]bool{}
-	dest := make([]driver.Value, 1)
-	for {
-		if err := rows.Next(dest); err != nil {
-			if !errors.Is(err, io.EOF) {
-				rows.Close() //nolint:errcheck
-				return err
-			}
-			break
-		}
-		if p, ok := dest[0].(string); ok {
-			cached[p] = true
-		}
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	held := false
-	for _, p := range paths {
-		held = held || cached[p]
-	}
-	if !held {
-		return nil
 	}
 	for _, stmt := range []string{"SET GLOBAL enable_external_file_cache = false", "SET GLOBAL enable_external_file_cache = true"} {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {

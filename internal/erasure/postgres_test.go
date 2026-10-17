@@ -46,17 +46,17 @@ func testStore(t *testing.T, s Store) {
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Microsecond)
 	id := audit.NewID(now)
-	r := &Request{ID: id, Requester: "privacy", Created: now, Status: StatusQueued, Step: StepFind, Salt: "salt",
-		Subjects: []Subject{newSubject("salt", "pii", "email", []string{"ann@example.com"})}}
+	r := &Request{ID: id, Requester: "privacy", Created: now, Status: StatusQueued, Step: StepFind, Salt: "salt", Sealed: "sealed",
+		Subjects: []Subject{{Tag: "pii", Value: "email", Count: 1}}}
 	if err := s.Create(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	r.Status, r.Tables = StatusRunning, []Table{{Name: "crm.people", RowsDeleted: 2}}
+	r.Status, r.Tables = StatusRunning, []Table{{Name: "crm.people", Ident: []string{"crm", "people"}, RowsDeleted: 2}}
 	if err := s.Save(ctx, r); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Get(ctx, id)
-	if err != nil || got.Status != StatusRunning || got.Tables[0].RowsDeleted != 2 || got.Subjects[0].Plain[0] != r.Subjects[0].Plain[0] {
+	if err != nil || got.Status != StatusRunning || got.Tables[0].RowsDeleted != 2 || got.Sealed != "sealed" || got.Tables[0].Ident[1] != "people" {
 		t.Fatalf("get: %+v, %v", got, err)
 	}
 	if _, err := s.Get(ctx, "nope"); err != ErrNotFound {
@@ -74,54 +74,63 @@ func testStore(t *testing.T, s Store) {
 	if err := s.AddFiles(ctx, id, files[:1]); err != nil {
 		t.Fatal(err)
 	}
-	cache := "disk:" + id
-	if err := s.Seen(ctx, cache, "replica-1", now); err != nil {
-		t.Fatal(err)
-	}
-	pending := func() []string {
-		t.Helper()
-		u, err := s.Unpurged(ctx, cache)
-		if err != nil {
-			t.Fatal(err)
-		}
-		i := slices.IndexFunc(u, func(u Unpurged) bool { return u.Request == id })
-		if i < 0 {
-			return nil
-		}
-		return u[i].Paths
-	}
-	if p := pending(); p != nil {
-		t.Errorf("files not deleted yet are not for caches to drop: %v", p)
-	}
 	deleted := now.Add(time.Second)
 	if err := s.Deleted(ctx, id, []string{files[0].Path}, deleted); err != nil {
 		t.Fatal(err)
-	}
-	if p := pending(); !slices.Equal(p, []string{files[0].Path}) {
-		t.Errorf("unpurged: %v", p)
-	}
-	if err := s.Purged(ctx, id, cache, deleted); err != nil {
-		t.Fatal(err)
-	}
-	if p := pending(); p != nil {
-		t.Errorf("purged files are still pending: %v", p)
-	}
-	purges, err := s.Purges(ctx, id)
-	if err != nil || !purges[cache].Equal(deleted) {
-		t.Errorf("purges: %v, %v", purges, err)
 	}
 	stored, err := s.Files(ctx, id)
 	if err != nil || len(stored) != 2 || !stored[0].Deleted.Equal(deleted) || !stored[1].Deleted.IsZero() {
 		t.Errorf("files: %+v, %v", stored, err)
 	}
-	caches, err := s.Caches(ctx)
-	if err != nil || !slices.ContainsFunc(caches, func(c Cache) bool { return c.ID == cache && c.Host == "replica-1" }) {
-		t.Errorf("caches: %+v, %v", caches, err)
+	// Once the request ends, its paths go: they can hold identifiers.
+	if err := s.Forget(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if stored, err := s.Files(ctx, id); err != nil || len(stored) != 0 {
+		t.Errorf("files after Forget: %+v, %v", stored, err)
+	}
+
+	// Caches are emptied of what any request deleted, up to when.
+	cache := "disk:" + id
+	if err := s.Seen(ctx, cache, "replica-1", now); err != nil {
+		t.Fatal(err)
+	}
+	r.DeletedThrough = deleted
+	if err := s.Save(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if latest, err := s.LatestDeletion(ctx); err != nil || latest.Before(deleted) {
+		t.Errorf("latest deletion: %v, %v", latest, err)
+	}
+	cacheOf := func() Cache {
+		t.Helper()
+		caches, err := s.Caches(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(caches, func(c Cache) bool { return c.ID == cache })
+		if i < 0 {
+			t.Fatalf("cache %s is not listed: %+v", cache, caches)
+		}
+		return caches[i]
+	}
+	if c := cacheOf(); c.Host != "replica-1" || !c.Emptied.IsZero() {
+		t.Errorf("cache: %+v", c)
+	}
+	if err := s.Emptied(ctx, cache, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Emptied(ctx, cache, now); err != nil {
+		t.Fatal(err)
+	}
+	if c := cacheOf(); !c.Emptied.Equal(deleted) {
+		t.Errorf("emptied: %v, want %v", c.Emptied, deleted)
 	}
 }
 
-// The history stores find candidates in PostgreSQL by the hashes alone,
-// with the same words and literals redaction looks at.
+// The history stores read every record to the redactor, nothing about
+// the identifiers reaches PostgreSQL, and query tags and application names
+// are redacted too.
 func TestPostgresRedaction(t *testing.T) {
 	url := testDatabase(t)
 	ctx := context.Background()
@@ -143,6 +152,8 @@ func TestPostgresRedaction(t *testing.T) {
 		{Text: "SELECT * FROM crm.people WHERE email IN ('x@y.z', '  " + email + "')"},
 		{Text: "SELECT * FROM crm.people WHERE note LIKE '%" + email + "%' -- " + email},
 		{Text: `SELECT '{"email":"` + email + `"}'::JSON`},
+		{Text: "SELECT 1", QueryTag: "campaign for " + email},
+		{Text: "SELECT 2", ApplicationName: email},
 		{Text: "SELECT * FROM crm.people WHERE email = 'someone-else@example.com'"},
 		{Text: "INSERT INTO crm.report SELECT * FROM crm.people", StatementType: "INSERT"},
 		{Text: "SELECT 1", StatementType: "INSERT", TablesRead: []string{"lake.crm.people"}, TablesWritten: []string{"lake.crm.copy"}},
@@ -163,16 +174,16 @@ func TestPostgresRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := &Request{Salt: "pepper", Subjects: []Subject{newSubject("pepper", "pii", "email", []string{email})}}
-	m := newMatcher(r)
-	n, err := history.Redact(ctx, m)
-	if err != nil || n != 4 {
-		t.Errorf("query history: redacted %d, %v; want 4", n, err)
+	r := &Request{salt: "pepper", Subjects: []Subject{testSubject("pepper", "pii", "email", email)}}
+	x := newRedactor(r)
+	n, err := history.Redact(ctx, x)
+	if err != nil || n != 6 {
+		t.Errorf("query history: redacted %d, %v; want 6", n, err)
 	}
-	if n, err := history.Redact(ctx, m); err != nil || n != 0 {
+	if n, err := history.Redact(ctx, x); err != nil || n != 0 {
 		t.Errorf("redacting again: %d, %v", n, err)
 	}
-	if n, err := jobs.Redact(ctx, m); err != nil || n != 1 {
+	if n, err := jobs.Redact(ctx, x); err != nil || n != 1 {
 		t.Errorf("load history: redacted %d, %v; want 1", n, err)
 	}
 	got, err := history.Queries(ctx, audit.Viewer{All: true}, audit.Page{Since: now.Add(-time.Second)})
@@ -180,8 +191,8 @@ func TestPostgresRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, q := range got {
-		if strings.Contains(strings.ToLower(q.Text), email) {
-			t.Errorf("history still holds the identifier: %s", q.Text)
+		if strings.Contains(strings.ToLower(q.Text+q.QueryTag+q.ApplicationName), email) {
+			t.Errorf("history still holds the identifier: %+v", q)
 		}
 	}
 	if !slices.ContainsFunc(got, func(q audit.Query) bool { return strings.Contains(q.Text, "someone-else@example.com") }) {

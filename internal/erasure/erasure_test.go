@@ -40,6 +40,10 @@ import (
 type testCatalog struct {
 	mu     sync.Mutex
 	tables map[string]*table.Table
+	// before and after, if set, are called around each commit, outside
+	// the lock, so they may commit too.
+	before func(id table.Identifier, updates []table.Update)
+	after  func(id table.Identifier, meta table.Metadata)
 }
 
 func localFS(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
@@ -101,10 +105,24 @@ func (c *testCatalog) LoadTable(_ context.Context, id table.Identifier) (*table.
 	return tbl, nil
 }
 
-func (c *testCatalog) CommitTable(_ context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+func (c *testCatalog) CommitTable(ctx context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	if c.before != nil {
+		c.before(id, updates)
+	}
+	meta, loc, err := c.commit(id, reqs, updates)
+	if err == nil && c.after != nil {
+		c.after(id, meta)
+	}
+	return meta, loc, err
+}
+
+func (c *testCatalog) commit(id table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	cur := c.tables[tableName(id)]
+	cur, ok := c.tables[tableName(id)]
+	if !ok {
+		return nil, "", icecat.ErrNoSuchTable
+	}
 	for _, r := range reqs {
 		if err := r.Validate(cur.Metadata()); err != nil {
 			return nil, "", fmt.Errorf("%w: %v", table.ErrCommitFailed, err)
@@ -186,15 +204,24 @@ func (e duckdbEngine) values(t *testing.T, stmt string) []string {
 }
 
 // testRows deletes and counts rows with iceberg-go, by the raw values the
-// test knows, standing in for DuckDB's DELETE on the catalog.
+// test knows, standing in for DuckDB's DELETE on the catalog. A table it
+// has no expression for has no rows the DELETE can name, as when a column
+// was renamed by another engine.
 type testRows map[string]iceberg.BooleanExpression
+
+func (r testRows) expr(tbl *table.Table) iceberg.BooleanExpression {
+	if e, ok := r[tableName(tbl.Identifier())]; ok {
+		return e
+	}
+	return iceberg.AlwaysFalse{}
+}
 
 func (r testRows) Delete(ctx context.Context, tbl *table.Table, _ string) (int64, error) {
 	n, err := r.Count(ctx, tbl, "")
 	if err != nil || n == 0 {
 		return n, err
 	}
-	_, err = tbl.Delete(ctx, r[tableName(tbl.Identifier())], nil)
+	_, err = tbl.Delete(ctx, r.expr(tbl), nil)
 	return n, err
 }
 
@@ -202,7 +229,7 @@ func (r testRows) Count(ctx context.Context, tbl *table.Table, _ string) (int64,
 	if tbl.CurrentSnapshot() == nil {
 		return 0, nil
 	}
-	rows, err := tbl.Scan(table.WithRowFilter(r[tableName(tbl.Identifier())])).ToArrowTable(ctx)
+	rows, err := tbl.Scan(table.WithRowFilter(r.expr(tbl))).ToArrowTable(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -210,18 +237,24 @@ func (r testRows) Count(ctx context.Context, tbl *table.Table, _ string) (int64,
 	return rows.NumRows(), nil
 }
 
-// readCache records what it is told to drop.
+// readCache counts how often it is emptied.
 type readCache struct {
 	mu      sync.Mutex
-	dropped []string
+	emptied int
 }
 
-func (c *readCache) ForgetCachedFiles(_ context.Context, paths []string) error {
+func (c *readCache) EmptyCache(context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.dropped = append(c.dropped, paths...)
+	c.emptied++
 	return nil
 }
+
+// ident is the identifier of a table the tests name with dots.
+func ident(name string) table.Identifier { return strings.Split(name, ".") }
+
+// testKey is the erasure key of the tests.
+var testKey = []byte("an erasure key of thirty-two bytes")
 
 var peopleSchema = iceberg.NewSchema(0,
 	iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
@@ -386,7 +419,7 @@ func TestErasure(t *testing.T) {
 	store := NewMemoryStore()
 	cache := &readCache{}
 	svc := New(Options{
-		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng, CatalogName: "lake", Warehouse: warehouse,
+		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng, Key: testKey, CatalogName: "lake", Warehouse: warehouse,
 		History: []History{queries, loads}, Lineage: queries,
 		Purger: NewPurger(store, cache, MemoryCache+"test", "test", slog.New(slog.DiscardHandler)),
 		Rows: testRows{
@@ -452,8 +485,11 @@ func TestErasure(t *testing.T) {
 	if v == nil || v.Rows+v.Files+v.Bounds+v.Statistics+v.Storage+v.Orphans+v.Sharing+v.History != 0 || v.Caches != 1 {
 		t.Errorf("verification: %+v", v)
 	}
-	if got.Salt != "" || got.Subjects[0].Plain != nil || got.Subjects[0].Digests != nil {
-		t.Errorf("a completed request keeps its hashes: %+v", got.Subjects)
+	if got.Salt != "" || got.Sealed != "" {
+		t.Errorf("a completed request keeps its identifiers or salt: %q %q", got.Salt, got.Sealed)
+	}
+	if files, _ := store.Files(ctx, got.ID); len(files) > 0 {
+		t.Errorf("a completed request keeps the paths of the files it deleted: %+v", files)
 	}
 	tables := map[string]Table{}
 	for _, tt := range got.Tables {
@@ -510,8 +546,8 @@ func TestErasure(t *testing.T) {
 			t.Errorf("%s is still there: %v", p, err)
 		}
 	}
-	if len(cache.dropped) == 0 || !slices.Contains(cache.dropped, copyPath) {
-		t.Errorf("the read cache was not told to drop the deleted files: %v", cache.dropped)
+	if cache.emptied == 0 {
+		t.Errorf("the read cache was not emptied")
 	}
 
 	// Nor in history, whose other records stay as they were.

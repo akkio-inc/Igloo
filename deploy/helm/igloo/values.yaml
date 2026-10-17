@@ -37,6 +37,12 @@ admin:
   # account on first start; change it later with ALTER USER.
   password: ""
 
+erasure:
+  # Secret with key "key" -> IGLOO_ERASURE_KEY, which seals the identifiers of
+  # erasure requests while they run. Generated and kept across upgrades when
+  # empty; requests running when it changes must be made again.
+  existingSecret: ""
+
 # PostgreSQL database for Igloo's users (schema "igloo"). Usually the same
 # database as the catalog's. When this is empty Igloo uses catalog.database, and
 # when both are empty, the bundled PostgreSQL (postgresql.enabled).

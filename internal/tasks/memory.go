@@ -174,6 +174,20 @@ func (m *MemoryStore) TryLock(_ context.Context, key string) (func(), bool, erro
 	}
 }
 
+func (m *MemoryStore) TryLease(ctx context.Context, key string) (Lease, bool, error) {
+	release, ok, err := m.TryLock(ctx, key)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	return memLease(release), true, nil
+}
+
+// memLease is a lock of one process, which it cannot lose.
+type memLease func()
+
+func (memLease) Held(context.Context) error { return nil }
+func (l memLease) Release()                 { l() }
+
 func (m *MemoryStore) Lock(ctx context.Context, key string) (func(), error) {
 	ch := m.lock(key)
 	select {

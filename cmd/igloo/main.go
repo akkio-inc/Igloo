@@ -15,6 +15,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -311,7 +313,7 @@ func serve() error {
 			return err
 		}
 		defer erasureStore.Close()
-		if eraser, err = newEraser(cfg, erasureStore, purger, cat, eng, policies, historyStore, taskStore, jobs, log); err != nil {
+		if eraser, err = newEraser(cfg, erasureStore, purger, cat, eng, policies, historyStore, taskStore, jobs, reg, log); err != nil {
 			return err
 		}
 		// Every replica drops what requests delete from its read cache,
@@ -702,11 +704,27 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 // the load and task history, so both stores must be able to: a store that
 // cannot would keep identifiers the request is meant to erase.
 func newEraser(cfg config.Config, store erasure.Store, purger *erasure.Purger, cat *catalog.Client, eng *engine.Engine,
-	policies policy.Store, history audit.Store, taskStore tasks.Store, jobs *tasks.Scheduler, log *slog.Logger) (*erasure.Service, error) {
+	policies policy.Store, history audit.Store, taskStore tasks.Store, jobs *tasks.Scheduler, reg prometheus.Registerer,
+	log *slog.Logger) (*erasure.Service, error) {
 	opts := erasure.Options{
 		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng,
 		CatalogName: cfg.Catalog.Name, Schema: cfg.Catalog.Schema, Warehouse: cfg.Storage.Root(),
-		Jobs: jobs, Purger: purger, Log: log,
+		Jobs: jobs, Purger: purger, Metrics: erasure.NewMetrics(reg), Log: log,
+	}
+	// The key that seals requests' identifiers is not in the metadata
+	// database. A replica without one keeps its requests in memory, where
+	// a key of its own does.
+	switch {
+	case cfg.ErasureKey != "":
+		key := sha256.Sum256([]byte(cfg.ErasureKey))
+		opts.Key = key[:]
+	case cfg.MetadataDatabaseURL == "":
+		opts.Key = make([]byte, 32)
+		if _, err := rand.Read(opts.Key); err != nil {
+			return nil, err
+		}
+	default:
+		log.Warn("IGLOO_ERASURE_KEY is not set; ERASE SUBJECT is refused until it is")
 	}
 	tasksHistory, ok := taskStore.(erasure.History)
 	if !ok {

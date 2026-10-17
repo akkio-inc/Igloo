@@ -54,6 +54,9 @@ type Config struct {
 	// other databases, which a connection names with password_secret.
 	// Empty means connections store their passwords.
 	ConnectionSecretsDir string
+	// ErasureKey seals open erasure requests' identifiers and salts their
+	// hashes; it is kept out of the metadata database on purpose.
+	ErasureKey string
 
 	// StatementTimeout cancels statements that run longer, unless a session
 	// sets its own statement_timeout. Zero means no limit.
@@ -310,6 +313,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	cfg.ConnectionSecretsDir = get("IGLOO_CONNECTION_SECRETS_DIR", "")
+	cfg.ErasureKey = getenv("IGLOO_ERASURE_KEY")
 
 	var errs []error
 	addErr := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
@@ -322,6 +326,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.ConnectionSecretsDir != "" && !strings.HasPrefix(cfg.ConnectionSecretsDir, "/") {
 		addErr("IGLOO_CONNECTION_SECRETS_DIR %q must be an absolute path", cfg.ConnectionSecretsDir)
+	}
+	if cfg.ErasureKey != "" && len(cfg.ErasureKey) < 32 {
+		addErr("IGLOO_ERASURE_KEY must be at least 32 characters")
 	}
 
 	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {

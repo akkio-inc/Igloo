@@ -188,6 +188,10 @@ type Store interface {
 	// it. Locks are shared by every replica. Call release when done.
 	TryLock(ctx context.Context, key string) (release func(), ok bool, err error)
 	Lock(ctx context.Context, key string) (release func(), err error)
+	// TryLease takes the lock named key as TryLock does, as a lease that
+	// says whether it is still held: a lock is lost when its connection
+	// to the metadata database drops.
+	TryLease(ctx context.Context, key string) (lease Lease, ok bool, err error)
 
 	// WriteRun records r, or updates the run with its ID.
 	WriteRun(ctx context.Context, r Run) error
@@ -232,6 +236,13 @@ func JobKey(kind, name string) string { return "job " + kind + "/" + strings.ToL
 
 // TableKey names the lock held while loading files into table.
 func TableKey(table string) string { return "load " + strings.ToLower(table) }
+
+// Lease is a lock that can tell whether it is still held.
+type Lease interface {
+	// Held returns an error if the lock was lost.
+	Held(ctx context.Context) error
+	Release()
+}
 
 // lockID turns a lock's name into a Postgres advisory lock key.
 func lockID(key string) int64 {

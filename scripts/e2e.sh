@@ -1379,7 +1379,8 @@ psql_admin \
   -c "INSERT INTO crm.people VALUES (6, 'eve@other.example', 'dev-eve', 'stays')" \
   -c "CREATE TABLE crm.audience (segment VARCHAR, email_sha256 VARCHAR)" \
   -c "INSERT INTO crm.audience VALUES ('sports', sha256(lower('$erase_email'))), ('sports', sha256('ann@other.example'))" \
-  -c "CREATE TABLE crm.people_copy AS SELECT * FROM crm.people" >/dev/null
+  -c "CREATE TABLE crm.people_copy AS SELECT * FROM crm.people" \
+  -c "CREATE TABLE crm.untagged (id INTEGER)" >/dev/null
 email_hash="$(psql_admin -c "SELECT sha256(lower('$erase_email'))")"
 if got="$(psql_admin \
   -c "CREATE TAG person ALLOWED_VALUES 'email', 'email:sha256', 'device_id'" \
@@ -1419,6 +1420,15 @@ fi
 expect_error "readers cannot erase" 42501 rita rita-password-1 "ERASE SUBJECT WHERE person.email = 'someone@else.example'"
 expect_error "nor see the requests" 42501 rita rita-password-1 "SHOW ERASURE REQUESTS"
 expect_error "a tag value no column has is refused" 22023 pat pat-password-1 "ERASE SUBJECT WHERE pii.email = 'someone@else.example'"
+expect_error "a placeholder identifier is refused" 22023 pat pat-password-1 "ERASE SUBJECT WHERE person.device_id = '00000000-0000-0000-0000-000000000000'"
+got="$(psql_as pat pat-password-1 -c "ERASE SUBJECT WHERE person.email = '$lower_email' OR person.device_id = '$lower_device' DRY RUN" |
+  awk -F'|' '{printf "%s%s:%s", sep, $1, $4; sep=","}')" || true
+requests="$(psql_as pat pat-password-1 -c "SELECT count(*) FROM igloo.erasure_requests")" || true
+if [ "$got|$requests" = "crm.audience:1,crm.people:2,crm.people_copy:2|0" ]; then
+  pass "a dry run counts the rows it would erase, and makes no request"
+else
+  fail "dry run: got [$got|$requests]"
+fi
 request="$(psql_as pat pat-password-1 -c "ERASE SUBJECT WHERE person.email = '  $lower_email' OR person.device_id = '$lower_device'" | cut -d'|' -f1)"
 status=""
 deadline=$((SECONDS + 240))
@@ -1468,24 +1478,13 @@ else
   fail "the bucket after erasing: $got"
 fi
 
-expect_error "writers cannot set a data retention" 42501 walt walt-password-1 "ALTER TABLE crm.people SET (data_retention_days = 0)"
-expect "a privacy officer sets one" "ALTER TABLE" pat pat-password-1 "ALTER TABLE crm.people SET (data_retention_days = 0)"
-expect "everyone sees it" "people|0|pat" rita rita-password-1 "SELECT table_name, data_retention_days, set_by FROM igloo.data_retention"
+expect_error "writers cannot set a data retention" 42501 walt walt-password-1 "ALTER TABLE crm.people SET (data_retention_days = 1)"
+expect_error "a data retention is a day at least" 42601 pat pat-password-1 "ALTER TABLE crm.people SET (data_retention_days = 0)"
+expect "a privacy officer sets one on a table with tags" "ALTER TABLE" pat pat-password-1 "ALTER TABLE crm.people SET (data_retention_days = 1)"
+expect_error "but not on one without" 42501 pat pat-password-1 "ALTER TABLE crm.untagged SET (data_retention_days = 1)"
+expect "everyone sees it" "people|1|pat" rita rita-password-1 "SELECT table_name, data_retention_days, set_by FROM igloo.data_retention"
 expect_error "a table with a data retention keeps its name" 42501 igloo "$admin_password" "ALTER TABLE crm.people RENAME TO folks"
-psql_admin -c "INSERT INTO crm.people VALUES (7, 'fay@other.example', 'dev-fay', 'goes')" -c "DELETE FROM crm.people WHERE id = 7" >/dev/null
-# Maintenance (every 5 seconds here) keeps no older version of the table's
-# rows: one snapshot, and no file holds the deleted row.
-state=""
-deadline=$((SECONDS + 120))
-while [ "$SECONDS" -lt "$deadline" ]; do
-  live="$(psql_admin -c "SELECT string_agg(chr(39) || file_path || chr(39), ',') FROM iceberg_metadata(lake.crm.people)
-    WHERE manifest_content = 'DATA' AND status <> 'DELETED'")" || true
-  state="$(psql_admin -c "SELECT (SELECT count(*) FROM iceberg_snapshots(lake.crm.people)) || '|' ||
-    (SELECT count(*) FROM read_parquet([$live]) WHERE note = 'goes')")" || true
-  [ "$state" = "1|0" ] && break
-  sleep 2
-done
-if [ "$state" = "1|0" ]; then pass "maintenance enforces the data retention"; else fail "data retention: got [$state], want [1|0]"; fi
+expect_error "and a tagged column can be neither renamed nor dropped" 42501 igloo "$admin_password" "ALTER TABLE crm.people DROP COLUMN email"
 
 echo "health and metrics"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http_port/readyz")"
@@ -1595,7 +1594,7 @@ expect "and so do integrations" "triggered" walt walt-password-1 \
 expect "drop an alert" "DROP ALERT" walt walt-password-1 "DROP ALERT e2e_big_sales"
 expect "drop an integration" "DROP INTEGRATION" igloo "$admin_password" "DROP INTEGRATION e2e_hook"
 expect "policies survive a restart" "1|***@acme.com" nora nora-password-1 "SELECT id, email FROM crm.contacts"
-expect "erasure requests and data retentions survive a restart" "completed|0" pat pat-password-1 \
+expect "erasure requests and data retentions survive a restart" "completed|1" pat pat-password-1 \
   "SELECT status, (SELECT data_retention_days FROM igloo.data_retention) FROM igloo.erasure_requests WHERE request_id = '$request'"
 
 echo "connections after the restart"

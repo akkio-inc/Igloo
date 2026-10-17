@@ -274,6 +274,42 @@ func (s *PostgresStore) TryLock(ctx context.Context, key string) (func(), bool, 
 	return unlocker(conn), true, nil
 }
 
+func (s *PostgresStore) TryLease(ctx context.Context, key string) (Lease, bool, error) {
+	conn, err := s.lockConn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var ok bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockID(key)).Scan(&ok); err != nil || !ok {
+		unlocker(conn)()
+		return nil, false, err
+	}
+	return &pgLease{conn: conn, id: lockID(key)}, true, nil
+}
+
+// pgLease is an advisory lock on a connection of its own.
+type pgLease struct {
+	conn *pgx.Conn
+	id   int64
+}
+
+// Held asks the lock's own connection whether it holds the lock: one that
+// dropped has none, and another session may have taken it since.
+func (l *pgLease) Held(ctx context.Context) error {
+	var n int
+	err := l.conn.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()
+		AND classid::bigint = ($1::bigint >> 32) & 4294967295 AND objid::bigint = $1::bigint & 4294967295 AND objsubid = 1`, l.id).Scan(&n)
+	switch {
+	case err != nil:
+		return fmt.Errorf("the lock is lost: %w", err)
+	case n == 0:
+		return errors.New("the lock is lost")
+	}
+	return nil
+}
+
+func (l *pgLease) Release() { unlocker(l.conn)() }
+
 func (s *PostgresStore) Lock(ctx context.Context, key string) (func(), error) {
 	conn, err := s.lockConn(ctx)
 	if err != nil {

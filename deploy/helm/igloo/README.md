@@ -145,7 +145,7 @@ pass for each cloud.
 ## Operating
 
 - **Secrets the chart generates** (admin password, catalog encryption key,
-  bundled PostgreSQL password, bundled object store keys) are stored in the
+  erasure key, bundled PostgreSQL password, bundled object store keys) are stored in the
   Secret named after the release (`igloo`), are reused on every upgrade, and are
   kept by `helm uninstall` (`helm.sh/resource-policy: keep`), as are the
   PersistentVolumeClaims, so reinstalling finds the data again. To remove
@@ -451,6 +451,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `catalog.database.existingSecret` | `""` | Secret with key `url` for `LAKEKEEPER__PG_DATABASE_URL_READ/WRITE` |
 | `catalog.database.url` | `""` | Inline URL. Empty: `metadataDatabase`, or the bundled PostgreSQL. |
 | `catalog.encryptionKey.existingSecret` | `""` | Secret with key `encryption-key`; generated and kept when empty |
+| `erasure.existingSecret` | `""` | Secret with key `key` for `IGLOO_ERASURE_KEY`, which seals erasure requests' identifiers; generated and kept when empty |
 | `catalog.systemCredentials` | `none` | `none`, `aws`, `gcp` or `azure`: Lakekeeper uses its own cloud identity |
 | `catalog.serviceAccount.create` / `name` / `annotations` | `true` / `<fullname>-catalog` / `{}` | |
 | `catalog.podLabels`, `podAnnotations`, `nodeSelector`, `tolerations`, `affinity` | | Lakekeeper pods |

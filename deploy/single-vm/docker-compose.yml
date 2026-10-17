@@ -28,6 +28,7 @@ services:
     environment:
       IGLOO_ADMIN_USER: ${IGLOO_ADMIN_USER:-igloo}
       IGLOO_ADMIN_PASSWORD: ${IGLOO_ADMIN_PASSWORD:?}
+      IGLOO_ERASURE_KEY: ${IGLOO_ERASURE_KEY:-}
       # Users live in the same Postgres database as the catalog (schema "igloo").
       IGLOO_METADATA_DATABASE_URL: *database-url
       IGLOO_CATALOG_URI: http://lakekeeper:8181/catalog

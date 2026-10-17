@@ -21,19 +21,26 @@ import (
 
 // Erasure of people's data (package erasure), and data retention:
 //
-//	ERASE SUBJECT WHERE tag.value = 'identifier' [OR tag.value IN ('identifier', ...)] ...
+//	ERASE SUBJECT WHERE tag.value = 'identifier' [OR tag.value IN ('identifier', ...)] ... [DRY RUN]
 //	SHOW ERASURE REQUESTS
+//	CANCEL ERASURE REQUEST 'id'
+//	CONFIRM ERASURE REQUEST 'id'
 //	ALTER TABLE [IF EXISTS] name SET (data_retention_days = n)
 //	ALTER TABLE [IF EXISTS] name RESET (data_retention_days)
 //
 // Admins may run them, and users granted ERASE ON ACCOUNT, directly or
-// through a role: privacy officers. The identifiers in ERASE SUBJECT never
-// reach the history, the logs or the list of running statements.
+// through a role: privacy officers, who may set data retentions only of
+// tables with tags. The identifiers in ERASE SUBJECT never reach the
+// history, the logs or the list of running statements.
 
 // erasureCmd is a parsed erasure or retention statement.
 type erasureCmd struct {
 	tag    string
 	wanted []erasure.Wanted
+	// dryRun is ERASE SUBJECT ... DRY RUN's; id names the request CANCEL
+	// and CONFIRM change.
+	dryRun bool
+	id     string
 	// table, ifExists and days are ALTER TABLE's; days is nil for RESET.
 	table    []string
 	ifExists bool
@@ -41,13 +48,16 @@ type erasureCmd struct {
 }
 
 const (
-	tagErase     = "ERASE SUBJECT"
-	tagShowErase = "SHOW ERASURE REQUESTS"
-	tagRetention = "ALTER TABLE"
+	tagErase        = "ERASE SUBJECT"
+	tagShowErase    = "SHOW ERASURE REQUESTS"
+	tagCancelErase  = "CANCEL ERASURE REQUEST"
+	tagConfirmErase = "CONFIRM ERASURE REQUEST"
+	tagRetention    = "ALTER TABLE"
 )
 
-// maxRetentionDays bounds data_retention_days: a hundred years.
-const maxRetentionDays = 36500
+// data_retention_days is from a day, as maintenance keeps at least the
+// current snapshot anyway, to a hundred years.
+const minRetentionDays, maxRetentionDays = 1, 36500
 
 // parseErasureCommand recognizes the statements above. ok is false for
 // any other; err reports a malformed one. Anything that starts with ERASE
@@ -100,16 +110,28 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 			if sc.keywords("OR") {
 				continue
 			}
+			c.dryRun = sc.keywords("DRY", "RUN")
 			if sc.done() {
 				return c, true, nil
 			}
-			return syntax("expected OR or the end of ERASE SUBJECT")
+			return syntax("expected OR, DRY RUN or the end of ERASE SUBJECT")
 		}
 	case sc.keywords("SHOW", "ERASURE", "REQUESTS"):
 		c.tag = tagShowErase
 		if !sc.done() {
 			return syntax("unexpected text after SHOW ERASURE REQUESTS")
 		}
+		return c, true, nil
+	case sc.keywords("CANCEL", "ERASURE", "REQUEST"), sc.keywords("CONFIRM", "ERASURE", "REQUEST"):
+		c.tag = tagCancelErase
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "CONFIRM") {
+			c.tag = tagConfirmErase
+		}
+		lit, ok := sc.literal()
+		if !ok || lit == nil || !sc.done() {
+			return syntax("expected %s 'request id'", c.tag)
+		}
+		c.id = *lit
 		return c, true, nil
 	case sc.keywords("ALTER", "TABLE"):
 		c.tag = tagRetention
@@ -129,8 +151,8 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 				sc.i++
 			}
 			n, err := strconv.Atoi(sc.s[start:sc.i])
-			if err != nil || n > maxRetentionDays {
-				return syntax("data_retention_days takes a number of days from 0 to %d", maxRetentionDays)
+			if err != nil || n < minRetentionDays || n > maxRetentionDays {
+				return syntax("data_retention_days takes a number of days from %d to %d", minRetentionDays, maxRetentionDays)
 			}
 			c.days = &n
 		}
@@ -152,14 +174,42 @@ func erasureText(query string) string {
 	case !ok || c.tag != tagErase:
 		return query
 	case err != nil:
-		return "ERASE ... (not shown: it may hold identifiers)"
+		return erasureHidden
 	}
 	var parts []string
 	for _, w := range c.wanted {
 		stars := strings.TrimSuffix(strings.Repeat("'***', ", len(w.Identifiers)), ", ")
 		parts = append(parts, quoteIdent(w.Tag)+"."+quoteIdent(w.Value)+" IN ("+stars+")")
 	}
-	return "ERASE SUBJECT WHERE " + strings.Join(parts, " OR ")
+	text := "ERASE SUBJECT WHERE " + strings.Join(parts, " OR ")
+	if c.dryRun {
+		text += " DRY RUN"
+	}
+	return text
+}
+
+// erasureHidden is what the history shows of a statement that mentions
+// ERASE SUBJECT in any other form, as EXPLAIN or after another statement,
+// whose identifiers could be anywhere in it.
+const erasureHidden = "ERASE ... (not shown: it may hold identifiers)"
+
+// mentionsErasure reports whether a statement's code has ERASE SUBJECT.
+func mentionsErasure(words []string) bool {
+	for i := 0; i+1 < len(words); i++ {
+		if words[i] == "ERASE" && words[i+1] == "SUBJECT" {
+			return true
+		}
+	}
+	return false
+}
+
+// previewColumns describe ERASE SUBJECT ... DRY RUN.
+var previewColumns = wire.Columns{
+	{Name: "table_name", Oid: pgtype.TextOID, Width: -1},
+	{Name: "reason", Oid: pgtype.TextOID, Width: -1},
+	{Name: "columns", Oid: pgtype.TextOID, Width: -1},
+	{Name: "rows_matched", Oid: pgtype.Int8OID, Width: 8},
+	{Name: "rows", Oid: pgtype.Int8OID, Width: 8},
 }
 
 // erasureColumns describe SHOW ERASURE REQUESTS, as igloo.erasure_requests.
@@ -195,11 +245,15 @@ func (s *Server) erasureCommand(sess *session, query string) (wire.PreparedState
 	}
 	var opts []wire.PreparedOptionFn
 	switch c.tag {
-	case tagErase:
-		opts = append(opts, wire.WithColumns(wire.Columns{
+	case tagErase, tagCancelErase, tagConfirmErase:
+		cols := wire.Columns{
 			{Name: "request_id", Oid: pgtype.TextOID, Width: -1},
 			{Name: "status", Oid: pgtype.TextOID, Width: -1},
-		}))
+		}
+		if c.dryRun {
+			cols = previewColumns
+		}
+		opts = append(opts, wire.WithColumns(cols))
 	case tagShowErase:
 		opts = append(opts, wire.WithColumns(erasureColumns()))
 	}
@@ -234,22 +288,50 @@ func (s *Server) runErasureCommand(ctx context.Context, sess *session, user auth
 		return s.setRetention(ctx, sess, user, c, w)
 	}
 	if s.erasure == nil {
-		return pgerror.WithCode(errors.New("ERASE SUBJECT needs an Iceberg catalog (IGLOO_CATALOG_URI)"), codes.FeatureNotSupported)
+		return pgerror.WithCode(fmt.Errorf("%s needs an Iceberg catalog (IGLOO_CATALOG_URI)", c.tag), codes.FeatureNotSupported)
 	}
-	if err := s.inNoTransaction(sess, tagErase); err != nil {
+	if err := s.inNoTransaction(sess, c.tag); err != nil {
 		return err
 	}
-	r, err := s.erasure.Submit(ctx, user.Name, c.wanted)
-	if errors.Is(err, erasure.ErrInvalid) {
-		return pgerror.WithCode(err, codes.InvalidParameterValue)
+	var (
+		r   *erasure.Request
+		err error
+	)
+	switch {
+	case c.dryRun:
+		if r, err = s.erasure.Preview(ctx, c.wanted); err == nil {
+			for _, t := range r.Tables {
+				var cols []string
+				for _, col := range t.Columns {
+					cols = append(cols, col.Name+" ("+col.Tag+"."+col.Value+")")
+				}
+				if err := w.Row([]any{t.Name, t.Reason, strings.Join(cols, ", "), t.Matched, t.Rows}); err != nil {
+					return err
+				}
+			}
+			return w.Complete(fmt.Sprintf("SELECT %d", w.Written()))
+		}
+	case c.tag == tagCancelErase:
+		r, err = s.erasure.Cancel(ctx, c.id, user.Name)
+	case c.tag == tagConfirmErase:
+		r, err = s.erasure.Confirm(ctx, c.id, user.Name)
+	default:
+		r, err = s.erasure.Submit(ctx, user.Name, c.wanted)
 	}
-	if err != nil {
+	switch {
+	case errors.Is(err, erasure.ErrInvalid):
+		return pgerror.WithCode(err, codes.InvalidParameterValue)
+	case errors.Is(err, erasure.ErrNotFound):
+		return pgerror.WithCode(fmt.Errorf("erasure request %s does not exist", c.id), codes.UndefinedObject)
+	case errors.Is(err, erasure.ErrBusy):
+		return pgerror.WithCode(err, codes.LockNotAvailable)
+	case err != nil:
 		return err
 	}
 	if err := w.Row([]any{r.ID, r.Status}); err != nil {
 		return err
 	}
-	return w.Complete(tagErase)
+	return w.Complete(c.tag)
 }
 
 // mayErase reports whether user may erase people's data and see the
@@ -293,6 +375,19 @@ func (s *Server) showErasureRequests(ctx context.Context, w wire.DataWriter) err
 	return w.Complete(fmt.Sprintf("SELECT %d", w.Written()))
 }
 
+// hasTags reports whether a table has tagged columns.
+func hasTags(r *policy.TableRules) bool {
+	if r == nil {
+		return false
+	}
+	for _, c := range r.Columns {
+		if len(c.Tags) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // setRetention sets or removes a table's data retention, which is kept
 // with policies and tags and, like them, stays with the table's name.
 func (s *Server) setRetention(ctx context.Context, sess *session, user auth.User, c erasureCmd, w wire.DataWriter) error {
@@ -309,6 +404,13 @@ func (s *Server) setRetention(ctx context.Context, sess *session, user auth.User
 	if catalog != "" {
 		return pgerror.WithCode(fmt.Errorf("%s is a table of connection %s: its database keeps its rows, not Igloo", table, catalog),
 			codes.WrongObjectType)
+	}
+	// Privacy officers look after tables with personal data, which are
+	// tagged; a retention elsewhere would cut other tables' history, so
+	// that is up to admins.
+	if user.Role != auth.RoleAdmin && !hasTags(s.gov.snapshot(ctx).Tagged(schema, table)) {
+		return pgerror.WithCode(fmt.Errorf("permission denied: %s.%s has no tagged columns; only admins may set data retentions of other tables",
+			schema, table), codes.InsufficientPrivilege)
 	}
 	now := time.Now()
 	err = s.gov.store.Update(ctx, func(cat *policy.Catalog) error {

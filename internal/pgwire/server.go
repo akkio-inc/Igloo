@@ -680,7 +680,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started = cancel, query, time.Now()
+	sess.running, sess.statement, sess.started = cancel, redactQuery(query), time.Now()
 	sess.mu.Unlock()
 
 	defer func() {
