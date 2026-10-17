@@ -1466,7 +1466,7 @@ expect "time travel to before the person's data still works" "2" igloo "$admin_p
 expect "the history no longer holds the identifiers" "0" igloo "$admin_password" \
   "SELECT count(*) FROM igloo.query_history WHERE query_text ILIKE '%subject.example%' OR query_text ILIKE '%dev-erase-me%'"
 expect "the request is recorded without them" "ERASE SUBJECT WHERE \"person\".\"email\" IN ('***') OR \"person\".\"device_id\" IN ('***')" \
-  igloo "$admin_password" "SELECT query_text FROM igloo.query_history WHERE user_name = 'pat' AND statement_type = 'ERASE' AND outcome = 'ok'"
+  igloo "$admin_password" "SELECT query_text FROM igloo.query_history WHERE user_name = 'pat' AND statement_type = 'ERASE' AND outcome = 'ok' AND query_text NOT LIKE '%DRY RUN'"
 if [ "$cache_on" = 1 ]; then
   expect "the read cache holds none of the deleted files" "0" igloo "$admin_password" \
     "SELECT count(*) FROM cache_httpfs_cache_status_query() WHERE original_remote_path IN ($people_files)
