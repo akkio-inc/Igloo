@@ -138,7 +138,7 @@ func startServerWithConfig(t testing.TB, cfg config.Config, configure ...func(*O
 }
 
 // startServerWithEngine is startServerWithConfig with engine options.
-func startServerWithEngine(t *testing.T, cfg config.Config, engineOpts []engine.Option, configure ...func(*Options)) *testServer {
+func startServerWithEngine(t testing.TB, cfg config.Config, engineOpts []engine.Option, configure ...func(*Options)) *testServer {
 	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
