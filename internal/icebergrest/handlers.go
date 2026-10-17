@@ -504,6 +504,9 @@ func (s *Server) updateTable(c *call) error {
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
+	if err := s.checkClassifiedSchema(c, ns, o, req); err != nil {
+		return err
+	}
 	// The staged table already has the UUID and location Lakekeeper gave
 	// it, which clients restate when they create it. Lakekeeper refuses
 	// others, and Igloo leaves them out, so they cannot name another
@@ -596,6 +599,17 @@ func (s *Server) renameTable(c *call) error {
 	for _, o := range []auth.Object{from, to} {
 		if err := s.requireUnprotected(c, o); err != nil {
 			return err
+		}
+	}
+	// Tags and data retentions name tables too: a renamed table would be
+	// out of reach of erasure requests and its retention.
+	if s.opts.Classified != nil {
+		_, classified, err := s.opts.Classified(c.ctx(), from)
+		if err != nil {
+			return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check the table's policies and tags; try again")
+		}
+		if classified {
+			return c.who.deny(fmt.Sprintf("table %s has policies, tags or a data retention, which stay with its name; unset them before renaming it", from))
 		}
 	}
 	if _, err := s.cat.call(c.ctx(), http.MethodPost, "tables/rename", nil, body); err != nil {
@@ -700,6 +714,77 @@ func (s *Server) recordOwner(c *call, o auth.Object) {
 	if err != nil {
 		s.log.Warn("could not record the owner of a new "+o.Kind(), "object", o.String(), "owner", user, "err", err)
 	}
+}
+
+// checkClassifiedSchema refuses a commit that renames or drops a column of
+// table o with policies or tags, or changes its type, or adds another
+// column under its name, as ALTER TABLE in SQL is refused: they stay with
+// the column's name, and a column that changed under them would be out of
+// reach of its policies and of erasure requests.
+func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req commitRequest) error {
+	if s.opts.Classified == nil || !slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
+		return u.Action == "add-schema" || u.Action == "set-current-schema"
+	}) {
+		return nil
+	}
+	columns, _, err := s.opts.Classified(c.ctx(), o)
+	if err != nil {
+		return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check the table's policies and tags; try again")
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodGet, tablePathOf(ns, o.Table), nil, nil)
+	if err != nil {
+		return err
+	}
+	var loaded struct {
+		Metadata struct {
+			Current int          `json:"current-schema-id"`
+			Schemas []schemaJSON `json:"schemas"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(r.body, &loaded); err != nil {
+		return fmt.Errorf("catalog returned malformed table metadata: %w", err)
+	}
+	schemas := loaded.Metadata.Schemas
+	byID := func(id int) *schemaJSON {
+		for i := range schemas {
+			if schemas[i].ID == id {
+				return &schemas[i]
+			}
+		}
+		return nil
+	}
+	current, next := byID(loaded.Metadata.Current), byID(loaded.Metadata.Current)
+	for _, u := range req.Updates {
+		switch {
+		case u.Action == "add-schema" && u.Schema != nil:
+			schemas = append(schemas, *u.Schema)
+		case u.Action == "set-current-schema" && u.SchemaID != nil:
+			if *u.SchemaID == -1 {
+				next = &schemas[len(schemas)-1]
+			} else {
+				next = byID(*u.SchemaID)
+			}
+		}
+	}
+	if current == nil || next == nil || next == current {
+		return nil
+	}
+	for _, name := range columns {
+		id, _, typ, ok := current.field(0, name)
+		if !ok {
+			continue
+		}
+		_, newName, newTyp, found := next.field(id, "")
+		otherID, _, _, other := next.field(0, name)
+		if !found || !strings.EqualFold(newName, name) || newTyp != typ || other && otherID != id {
+			return c.who.deny(fmt.Sprintf("column %s of %s has a policy or tags, which stay with its name; "+
+				"unset them before renaming or dropping it or changing its type", name, o))
+		}
+	}
+	return nil
 }
 
 // forget removes the grants on a dropped table or schema.

@@ -1,6 +1,7 @@
 package icebergrest
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -168,6 +169,31 @@ type tableUpdate struct {
 	// Updates are set-properties', and Removals remove-properties'.
 	Updates  map[string]string `json:"updates"`
 	Removals []string          `json:"removals"`
+	// Schema is add-schema's, and SchemaID set-current-schema's, -1
+	// for the schema the commit added last.
+	Schema   *schemaJSON `json:"schema"`
+	SchemaID *int        `json:"schema-id"`
+}
+
+// schemaJSON is a schema, with the fields Igloo reads.
+type schemaJSON struct {
+	ID     int `json:"schema-id"`
+	Fields []struct {
+		ID   int             `json:"id"`
+		Name string          `json:"name"`
+		Type json.RawMessage `json:"type"`
+	} `json:"fields"`
+}
+
+// field returns the top-level field of the schema with id, or by name,
+// without regard to case, if id is 0.
+func (s *schemaJSON) field(id int, name string) (int, string, string, bool) {
+	for _, f := range s.Fields {
+		if id != 0 && f.ID == id || id == 0 && strings.EqualFold(f.Name, name) {
+			return f.ID, f.Name, string(f.Type), true
+		}
+	}
+	return 0, "", "", false
 }
 
 // commitNeeds is what a commit needs of its user.

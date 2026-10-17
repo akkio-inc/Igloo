@@ -97,6 +97,10 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 		Protected: func(ctx context.Context, o auth.Object) (bool, error) {
 			return deps.sql.Protected(ctx, o.Schema, o.Table), nil
 		},
+		Classified: func(ctx context.Context, o auth.Object) ([]string, bool, error) {
+			columns, classified := deps.sql.Classified(ctx, o.Schema, o.Table)
+			return columns, classified, nil
+		},
 		Key:         key,
 		Credentials: vendor,
 		TLS:         deps.tls != nil,

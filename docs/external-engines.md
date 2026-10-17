@@ -112,6 +112,12 @@ show such tables. Igloo checks for policies on every request, so attaching
 one stops new loads at once; credentials an engine got for the table
 before still work until they expire, at most an hour later.
 
+Tags and [data retentions](privacy.md#data-retention) name tables and
+columns too, for [erasure requests](privacy.md): no one, admins included,
+may rename a table with policies, tags or a data retention, nor commit a
+schema that renames or drops one of its tagged or protected columns,
+changes its type, or adds another column under its name, as in SQL.
+
 ### Clones
 
 A [clone](sql.md#clones) reads the data files and manifests of the table

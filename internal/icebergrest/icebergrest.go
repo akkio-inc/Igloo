@@ -122,6 +122,12 @@ type Options struct {
 	// change such a table here. It is asked on every request, since
 	// policies change. Nil means no table has any.
 	Protected func(ctx context.Context, o auth.Object) (bool, error)
+	// Classified, if set, reports whether table o has policies, tags or a
+	// data retention, which stay with its name, and names its columns
+	// with policies or tags, which stay with theirs: such a table may not
+	// be renamed, nor those columns renamed, dropped or given another
+	// type, by anyone, as in SQL.
+	Classified func(ctx context.Context, o auth.Object) (columns []string, classified bool, err error)
 	// TLS says whether requests arrive over TLS. Without it, only clients
 	// on private networks are served, since tokens, passwords and storage
 	// credentials cross the connection.

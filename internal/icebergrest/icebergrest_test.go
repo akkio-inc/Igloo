@@ -187,6 +187,8 @@ type lakekeeper struct {
 	props map[string]map[string]string
 	// staged tables answer commits but, as in Lakekeeper, not HEAD.
 	staged map[string]string
+	// metadata are more fields of tables' metadata, such as schemas.
+	metadata map[string]map[string]any
 	// requests are what reached the catalog: "METHOD path?query".
 	requests []string
 	headers  []http.Header
@@ -334,9 +336,13 @@ func (l *lakekeeper) writeTable(w http.ResponseWriter, key, loc string) {
 	if !ok {
 		uuid = loc[strings.LastIndex(loc, "/")+1:]
 	}
+	meta := map[string]any{"format-version": 2, "location": loc, "table-uuid": uuid, "properties": l.props[key]}
+	for k, v := range l.metadata[key] {
+		meta[k] = v
+	}
 	writeJSON(w, 200, map[string]any{
 		"metadata-location":   loc + "/metadata/1.json",
-		"metadata":            map[string]any{"format-version": 2, "location": loc, "table-uuid": uuid, "properties": l.props[key]},
+		"metadata":            meta,
 		"config":              map[string]string{"s3.remote-signing-enabled": "true", "s3.signer.uri": "http://lakekeeper:8181/catalog/"},
 		"storage-credentials": []any{map[string]any{"prefix": loc, "config": map[string]string{"s3.secret-access-key": "lakekeeper's"}}},
 	})
@@ -1558,6 +1564,57 @@ func TestTablesWithDataPolicies(t *testing.T) {
 	mu.Unlock()
 	if w := h.request("GET", "/v1/namespaces/public/tables/events", nora, nil); w.Code != 503 {
 		t.Errorf("when policies cannot be checked: %d %s", w.Code, w.Body)
+	}
+}
+
+// A table with tags or a data retention keeps its name, and its tagged
+// columns theirs, against other engines too, admins' included: renaming
+// the table, renaming or dropping such a column, adding another under its
+// name or changing its type is refused, as in SQL.
+func TestTablesWithTags(t *testing.T) {
+	h := newHarness(t)
+	h.srv.opts.Classified = func(_ context.Context, o auth.Object) ([]string, bool, error) {
+		if strings.EqualFold(o.String(), "public.users") {
+			return []string{"email"}, true, nil
+		}
+		return nil, false, nil
+	}
+	field := func(id int, name, typ string) map[string]any {
+		return map[string]any{"id": id, "name": name, "type": typ, "required": false}
+	}
+	h.cat.metadata = map[string]map[string]any{"public\x1fusers": {
+		"current-schema-id": 0,
+		"schemas":           []any{map[string]any{"type": "struct", "schema-id": 0, "fields": []any{field(1, "id", "long"), field(2, "email", "string")}}},
+	}}
+	ada := h.login("ada", "ada-password")
+	commit := func(fields ...map[string]any) *httptest.ResponseRecorder {
+		return h.request("POST", "/v1/namespaces/public/tables/users", ada, map[string]any{"updates": []any{
+			map[string]any{"action": "add-schema", "schema": map[string]any{"type": "struct", "schema-id": 1, "fields": fields}},
+			map[string]any{"action": "set-current-schema", "schema-id": -1},
+		}})
+	}
+	refused := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != 403 || !strings.Contains(w.Body.String(), "stay with its name") {
+			t.Errorf("%s: %d %s", what, w.Code, w.Body)
+		}
+	}
+	refused("renaming the column", commit(field(1, "id", "long"), field(2, "mail", "string")))
+	refused("dropping it", commit(field(1, "id", "long")))
+	refused("dropping it and adding it again", commit(field(1, "id", "long"), field(3, "email", "string")))
+	refused("changing its type", commit(field(1, "id", "long"), field(2, "email", "binary")))
+	if w := commit(field(1, "id", "long"), field(2, "email", "string"), field(3, "note", "string")); w.Code != 200 {
+		t.Errorf("adding another column: %d %s", w.Code, w.Body)
+	}
+	refused("renaming the table", h.request("POST", "/v1/tables/rename", ada, map[string]any{
+		"source":      map[string]any{"namespace": []string{"public"}, "name": "users"},
+		"destination": map[string]any{"namespace": []string{"public"}, "name": "people"},
+	}))
+	if w := h.request("POST", "/v1/tables/rename", ada, map[string]any{
+		"source":      map[string]any{"namespace": []string{"public"}, "name": "events"},
+		"destination": map[string]any{"namespace": []string{"public"}, "name": "events_raw"},
+	}); w.Code != 204 {
+		t.Errorf("renaming a table without tags: %d %s", w.Code, w.Body)
 	}
 }
 

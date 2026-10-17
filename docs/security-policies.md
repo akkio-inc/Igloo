@@ -226,12 +226,14 @@ policy and tags.
 ## What is refused
 
 Renaming a table with policies, tags or a [data
-retention](privacy.md#data-retention), or one of its protected or tagged
-columns, and changing such a column's type, whether or not any table has
-policies. Policies and tags stay with a table's name, also when it is
-dropped, so a table created again under the name is protected at once, and
-a renamed table would escape them and [erasure requests](privacy.md). Unset
-them first.
+retention](privacy.md#data-retention), renaming or dropping one of its
+protected or tagged columns, and changing such a column's type, whether or
+not any table has policies, in SQL and through the [Iceberg REST
+catalog](external-engines.md), by admins too. Policies and tags stay with a
+table's name and a column's, also when it is dropped, so a table created
+again under the name is protected at once, and a renamed table would
+escape them and [erasure requests](privacy.md), as would the old values of
+a column dropped and added again. Unset them first.
 
 While any table has policies:
 

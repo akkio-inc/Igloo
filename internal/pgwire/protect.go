@@ -187,6 +187,26 @@ func (s *Server) Protected(ctx context.Context, schema, table string) bool {
 	return s.gov.snapshot(ctx).Rules(schema, table) != nil
 }
 
+// Classified reports whether the catalog table schema.table has policies,
+// tags or a data retention, which stay with its name, and names its
+// columns with policies or tags, which stay with theirs, as checkAlter
+// guards them.
+func (s *Server) Classified(ctx context.Context, schema, table string) ([]string, bool) {
+	rules := s.gov.snapshot(ctx).Tagged(schema, table)
+	if rules == nil {
+		return nil, false
+	}
+	var columns []string
+	for name := range rules.Columns {
+		columns = append(columns, name)
+	}
+	if rules.Filter != nil {
+		columns = append(columns, rules.Filter.Columns...)
+	}
+	slices.Sort(columns)
+	return slices.Compact(columns), true
+}
+
 // ProtectedBy names, sorted, the policies that protect the catalog table
 // schema.table: its row access policy, and the masking policies of its
 // columns, set on them or through their tags. It is empty exactly when
@@ -1002,10 +1022,13 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 }
 
 // checkAlterNames refuses renaming a table with policies, tags or a data
-// retention, or one of its protected or tagged columns, or changing such a
-// column's type: they follow names, and a renamed table would be readable
-// unprotected under its new name until every replica learned of it, and
-// out of reach of erasure requests and its retention.
+// retention, or renaming or dropping one of its protected or tagged
+// columns, or changing such a column's type: they follow names, and a
+// renamed table would be readable unprotected under its new name until
+// every replica learned of it, and out of reach of erasure requests and
+// its retention, while a column dropped and added again under its name
+// would leave its old values, in older files, to a field the tags no
+// longer mean.
 func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *policy.Snapshot, query string) error {
 	sc := &scanner{s: query}
 	if !sc.keywords("ALTER", "TABLE") {
@@ -1022,7 +1045,9 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 	case sc.keywords("RENAME", "TO"), sc.keywords("SET", "SCHEMA"):
 		table = true
 	case sc.keywords("RENAME", "COLUMN"), sc.keywords("RENAME"),
-		sc.keywords("ALTER", "COLUMN"), sc.keywords("ALTER"):
+		sc.keywords("ALTER", "COLUMN"), sc.keywords("ALTER"),
+		sc.keywords("DROP", "COLUMN"), sc.keywords("DROP"):
+		sc.keywords("IF", "EXISTS")
 		c, ok := sc.name()
 		if !ok || len(c) != 1 {
 			return nil
@@ -1045,7 +1070,7 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 		}
 		inFilter := rules.Filter != nil && slices.ContainsFunc(rules.Filter.Columns, func(c string) bool { return strings.EqualFold(c, col) })
 		if column && (rules.Column(col) != nil || inFilter) {
-			return denied("column %s of %s has a policy or tags, which stay with its name; unset them before renaming it or changing its type", col, o)
+			return denied("column %s of %s has a policy or tags, which stay with its name; unset them before renaming or dropping it or changing its type", col, o)
 		}
 	}
 	return nil
