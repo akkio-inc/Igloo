@@ -110,6 +110,14 @@ scripts/                 helper scripts, including the end-to-end test
 - Add a line to [CHANGELOG.md](CHANGELOG.md) under Unreleased for anything
   users will notice.
 - CI must pass, and a maintainer reviews every pull request before it merges.
+- A change to erasure, or to what it relies on (the catalog, files, history,
+  caches, sharing), keeps [what erasure
+  guarantees](docs/privacy.md#what-erasure-guarantees): one that can let a
+  request report itself completed while the person's data is still readable
+  or recoverable within that guarantee does not merge. Anything else such a
+  change leaves, or that can keep a request from completing, is documented
+  under [Known limitations](docs/privacy.md#known-limitations), with what an
+  admin can do about it.
 
 ## Sign-off
 

@@ -28,6 +28,41 @@ single-VM setup and the Helm chart generate. Every replica needs the same
 one: a replica with another key, or none, leaves requests to those that have
 it.
 
+## What erasure guarantees
+
+**When a request completes, the person's rows cannot be read through
+Igloo, or recovered from storage, in any table Igloo manages.** That
+covers the tables' current data, their older snapshots (time travel),
+branches, tags and clones; what Delta Sharing recipients and engines
+reading through Igloo's Iceberg REST catalog can reach; every replica's
+read cache; and the query, login, load and task history. A request finds
+the person's rows by the columns tagged for the identifiers it names
+([below](#tag-the-columns-that-hold-identifiers)).
+
+**A request that cannot finish never reports itself completed.** One that
+has not deleted anything yet fails, and says why; one that has begun
+deleting stays `blocked`, alerts, and keeps its identifiers sealed until
+an admin fixes the cause, when it goes on, or closes it (`CLOSE ERASURE
+REQUEST`), which records what it left ([below](#what-a-request-does)).
+
+The guarantee trusts the admins, the Iceberg catalog (Lakekeeper) and the
+object store. It does not extend, and Igloo does not defend, against:
+
+- **Writes that go around Igloo**: engines or people that change the
+  catalog or the bucket directly rather than through Igloo's SQL or its
+  Iceberg REST catalog, such as a table another engine dropped, renamed
+  or upgraded to format version 3 in Lakekeeper itself, or files written
+  into the bucket.
+- **Copies outside Igloo**: exports and extracts, BI tools' caches, files
+  partners downloaded, other engines' own copies of the tables, and
+  backups or versions of the bucket and of the metadata database.
+- **An admin who sets out to defeat a request**, as by untagging the
+  columns that hold the identifiers, or restoring a backup.
+
+What else the guarantee does not cover, and what can keep a request from
+completing, is under [Known limitations](#known-limitations), with what an
+admin can do about each.
+
 ## Tag the columns that hold identifiers
 
 A request finds a person's data through [tags](security-policies.md#tags):
@@ -438,21 +473,25 @@ those of the tables they may see; admins and holders of `ERASE`, all of
 them. They are kept with policies and tags, stay with a table's name, and
 renaming such a table is refused.
 
-## What it does not cover
+## Known limitations
+
+### What a completed request leaves
+
+Within [the guarantee](#what-erasure-guarantees), a request finds the
+person by tagged columns and the identifiers as written. It leaves:
 
 - **Columns without tags.** A request finds rows only by tagged columns: an
   email in a free-text note stays, as does the rest of a row in a table
   without the tags. Lineage reports tables written from tagged ones; tag
-  them.
+  them. A table that references a tagged table's files without saying so,
+  and that cannot be read when the request looks for such tables, is left
+  out, with a warning in the log: the request deletes the tagged table's
+  old files all the same, and the rows of the other table's own files stay.
 - **Other forms of the identifier**: digests of other normalizations
   (Gmail's dots, phone numbers' formats), salted or keyed hashes, base64.
   In history, each identifier is found as it is, SQL-quoted or URL-escaped,
   compared without regard to case; a form written otherwise stays, as does
   one split across a concatenation (`'o''brien@' || 'example.com'`).
-- **The files the load history names.** `COPY INTO` skips the files it
-  loaded before by their paths, so the load history keeps them as they
-  were; a path that holds an identifier stays until the landing file and
-  its record go.
 - **Copies made on purpose.** Tags follow names: a statement that copies a
   tagged column into a column of another name, in another table or in a
   table that replaces the tagged one (`CREATE OR REPLACE TABLE t AS SELECT
@@ -462,17 +501,16 @@ renaming such a table is refused.
   engine dropped is not in the rows' current form: a request rewrites the
   files that hold the person's values in it, so the values go, but cannot
   tell which rows were the person's by it, so those rows stay.
-- **Backups and versions.** Backups and point-in-time recovery of the
-  metadata database keep the history as it was. Bucket versioning, soft
-  delete (7 days by default in the Google Cloud and Azure modules),
-  replication and storage snapshots keep deleted files; the erasure is
-  complete when they expire. Restoring an older backup brings the data
-  back: erase again.
-- **The metadata database itself.** Redacted history rows leave old row
-  versions in PostgreSQL's pages until they are vacuumed and reused, and in
-  its write-ahead log. Lakekeeper's tables (also in PostgreSQL) hold table
-  metadata, such as snapshots, schemas and properties, not rows: only
-  comments or properties that you wrote identifiers into.
+- **Tables partitioned by an identifier**, whose partition values are in
+  file paths and manifests.
+- **The files the load history names.** `COPY INTO` skips the files it
+  loaded before by their paths, so the load history keeps them as they
+  were; a path that holds an identifier stays until the landing file and
+  its record go.
+- **The definitions of tasks, pipes and materialized views**, which are
+  SQL and not history; statements run after the request completes, which
+  are recorded as usual; and logs at debug level, which can quote
+  statements other than those with `ERASE SUBJECT`.
 - **Tables of connections** ([federation](federation.md)), which are in
   another database: Igloo reads them but cannot erase from them. A tagged
   column of one is listed in the request's `tables` as `remote`; erase the
@@ -483,10 +521,22 @@ renaming such a table is refused.
   does not delete them with Igloo's credentials; it counts them in
   `files_outside_warehouse` and logs their paths, for whoever keeps them to
   delete.
-- **Copies outside the warehouse**: files in `IGLOO_ALLOWED_LOCATIONS`,
-  landing buckets that loads read and exports wrote, other engines' copies
-  of the tables (Spark, Trino, Snowflake), BI tools' caches, and files
-  partners already downloaded through [Delta Sharing](sharing.md).
+- **What is left of tables dropped before the request.** A table dropped
+  through Igloo's SQL or its Iceberg REST catalog has its files deleted
+  with it, unless clones read them, or Igloo cannot tell whether they do:
+  then they stay for the clones, and a request erases from the clones and
+  deletes the files it rewrites them out of. The files stay in the bucket,
+  where no table, and so no request, reaches them, for a table dropped
+  before this version of Igloo, one whose files clones read when it was
+  dropped (those the clones stop reading stay), and one replaced by
+  `CREATE OR REPLACE TABLE ... CLONE`, which keeps the old table's files.
+  Delete such leftovers with the bucket's own tools: the locations under
+  the warehouse that no table of the catalog has.
+- **The metadata database's own pages.** Redacted history rows leave old
+  row versions in PostgreSQL's pages until they are vacuumed and reused,
+  and in its write-ahead log. Lakekeeper's tables (also in PostgreSQL)
+  hold table metadata, such as snapshots, schemas and properties, not
+  rows: only comments or properties that you wrote identifiers into.
 - **Engines that read through the [Iceberg REST
   catalog](external-engines.md)** get storage credentials that last up to
   an hour. Until a request deletes the files, such an engine can read them
@@ -494,23 +544,73 @@ renaming such a table is refused.
   to erase. An engine that holds a table's metadata from before the
   request still lists the deleted files, and fails to read them once they
   are gone.
-- **What is left of tables dropped before the request, where something
-  kept it.** A table dropped in Igloo's warehouse, through SQL or the
-  Iceberg REST endpoint, has its files deleted with it: the catalog purges
-  it, unless clones read its files, or Igloo cannot tell whether they do,
-  when they stay for the clones (a request erases from the clones). So
-  does a table dropped before this version of Igloo, or by an engine that
-  reaches the catalog without Igloo, or replaced by `CREATE OR REPLACE
-  TABLE ... CLONE` (which keeps the old table's files): its files stay in
-  the bucket, where no table, and so no request, reaches them. Delete
-  such leftovers with the bucket's own tools.
-- The definitions of tasks, pipes and materialized views, which are SQL
-  and not history.
-- **Tables partitioned by an identifier**, whose partition values are in
-  file paths and manifests.
-- **Statements run after the request completes**, which are recorded as
-  usual, and logs at debug level, which can quote statements other than
-  those with `ERASE SUBJECT`.
+- **Backups and versions** (outside the guarantee): backups and
+  point-in-time recovery of the metadata database keep the history as it
+  was. Bucket versioning, soft delete (7 days by default in the Google
+  Cloud and Azure modules), replication and storage snapshots keep deleted
+  files; the erasure is complete when they expire. Restoring an older
+  backup brings the data back: erase again.
+- **Copies outside Igloo** (outside the guarantee): files in
+  `IGLOO_ALLOWED_LOCATIONS`, landing buckets that loads read and exports
+  wrote, other engines' copies of the tables (Spark, Trino, Snowflake), BI
+  tools' caches, and files partners already downloaded through [Delta
+  Sharing](sharing.md).
+
+### What keeps a request from completing
+
+None of these makes a request report itself completed; each makes it
+fail before it deletes anything, wait, or stay `blocked` and alert until
+it is fixed. An admin can close a blocked request (`CLOSE ERASURE
+REQUEST`) once what it could not erase has been erased otherwise.
+
+- **A table a request cannot erase from with certainty**: of Iceberg
+  format version 3, with files other than Parquet, or with a branch or tag
+  it could not write again (see [above](#tag-the-columns-that-hold-identifiers)).
+  Before the first `DELETE`, the request fails and says why; after it, the
+  table is set aside. Erase from such a table in an engine that can, and
+  untag it until then.
+- **A table that cannot be read**, as one whose metadata or manifest list
+  is damaged. A request that must erase from it fails before its first
+  `DELETE`, or sets it aside after it; the files under its location, and
+  those it says it shares, stay. Repair or drop the table. (A snapshot
+  whose manifest list does not exist at all stops nothing: nothing can
+  read it, and requests pass over it; Igloo's Iceberg REST catalog refuses
+  such snapshots, but checks only that the manifest list exists, not what
+  it holds.) A table outside the request that cannot be read is left out
+  of the search for tables that share files (above), and the files under
+  its own location stay.
+- **A table renamed, or upgraded to version 3, by an engine going around
+  Igloo** once the request has deleted from it is set aside: tag it under
+  its new name and make a new request, or erase from it elsewhere.
+- **A table the request does not erase from that references a file it
+  deletes**, as one another engine added the file to under columns of
+  other names: the request stops with an error that names the table,
+  rather than break it. Tag that table's columns and ask again for the
+  same identifiers; the first request goes on once the second has erased
+  from it.
+- **Rows that keep coming back**, as from a feed that writes the person's
+  rows again: after five rounds of verification finding them, the request
+  is blocked, and goes on once the writes stop.
+- **Recent files that may be another commit's.** A file under a table's
+  location, or a dropped table's, that no table references and that holds
+  matching rows is deleted only once it is three days old, as orphan
+  cleanup does, since a commit under way may be about to reference it: the
+  request waits until then.
+- **A replica that has yet to empty its read cache**: the request waits
+  for every running replica; closing a request is refused until they
+  have.
+- **A writer that keeps a table busy**: a request that loses commits to
+  other writers tries again later, however long that takes.
+- **The erasure key**: a replica without the key the request's
+  identifiers were sealed under leaves the request to one that has it.
+- **Time**: a request reads every tagged table in full, twice, and runs
+  one at a time ([Cost](#cost)).
+- **Format versions in the catalog**: the catalog refuses tables of
+  version 3 only as long as Igloo set its warehouse up so
+  (`IGLOO_CATALOG_SETUP`, on by default; Igloo warns when it is off), and
+  only Igloo reaches the catalog: Lakekeeper has no authentication of its
+  own, so keep it on a private network, as the Helm chart's NetworkPolicy
+  does.
 
 ## Cost
 
