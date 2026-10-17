@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img alt="igloo: open source SQL warehouse on Apache Iceberg. 5x faster, 30x cheaper per query (at 10GB query scale; exact speedup and cost reduction will vary)." src="docs/assets/banner-light.png" width="100%">
+    <img alt="Igloo: open source SQL warehouse on Apache Iceberg. 5x faster, 30x cheaper per query (at 10GB query scale; exact speedup and cost reduction will vary)." src="docs/assets/banner-light.png" width="100%">
   </picture>
 </p>
 

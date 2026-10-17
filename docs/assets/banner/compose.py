@@ -24,7 +24,7 @@ X = 850  # left edge of the text
 
 # Text, size (px), weight, optical size, tracking (em), baseline (px).
 LINES = [
-    ("igloo", 152, 700, 32, -0.025, 198),
+    ("Igloo", 152, 700, 32, -0.025, 198),
     ("Open source SQL warehouse on Apache Iceberg", 47, 400, 32, -0.005, 308),
     ("5x faster • 30x cheaper per query*", 60, 700, 32, -0.01, 392),
     ("*at 10GB query scale, exact speedup and cost reduction will vary", 28, 450, 14, 0.0, 447),
