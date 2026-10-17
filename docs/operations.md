@@ -138,13 +138,20 @@ that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
   request that fails 10 times in a row before its first `DELETE` fails for
   good: it logs `erasure request failed` at error level, raises the
   built-in alert, and counts in `igloo_erasure_requests_failed_total`. One
-  that has sent a `DELETE` never fails: it is `blocked`, keeps its
-  identifiers, logs `erasure request cannot go on` at error level, raises
-  the built-in alert, counts in `igloo_erasure_requests_blocked_runs_total`
-  and tries again every hour, until what its error says is fixed. Alert on
-  those metrics, and on `igloo_erasure_requests_held_total`, which counts
-  requests waiting for `CONFIRM ERASURE REQUEST` by someone other than
-  their requester. Runs
+  that has sent a `DELETE` never fails: a table it cannot go on with is
+  set aside, and the others go on; the request is then `blocked`, keeps
+  its identifiers, logs `erasure request cannot go on` at error level,
+  raises the built-in alert, counts in
+  `igloo_erasure_requests_blocked_runs_total` and tries again every hour,
+  until what its error says is fixed, or an admin closes it (`CLOSE
+  ERASURE REQUEST`, see [privacy](privacy.md#what-a-request-does)). Alert
+  on those metrics, and on `igloo_erasure_requests_held_total`, which
+  counts requests waiting for `CONFIRM ERASURE REQUEST` by someone other
+  than their requester. While a request is not over, its tables cannot be
+  dropped or renamed, through SQL or the Iceberg REST endpoint: tools that
+  swap tables by renaming them, as dbt does, wait until it is. Igloo has
+  Lakekeeper (0.13 or later) refuse tables of Iceberg format version 3 in
+  its warehouse, which erasure requests cannot rewrite yet. Runs
   that lose to other writers' commits, as on a table appended to without
   pause, do not count: the request tries again every minute until it wins.
 - Every replica checks every 15 seconds whether a request deleted files
@@ -484,7 +491,7 @@ events are logged at info level or above: `login`, `login failed`,
 `notification integration changed`, `erasure requested`, `erasure request
 completed`, `erasure request held`, `erasure request confirmed`, `erasure
 request canceled`, `erasure request failed`, `erasure request cannot go
-on`, `data retention changed`,
+on`, `erasure request closed`, `data retention changed`,
 `statement denied`, `statement canceled` (from the web console's compute
 page), and refused connections.
 Failed scheduled runs log `scheduled run failed` (component `tasks`), and

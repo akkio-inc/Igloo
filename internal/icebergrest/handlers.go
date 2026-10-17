@@ -350,6 +350,9 @@ func (s *Server) createTable(c *call) error {
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
+	if err := s.checkCreateFormat(c, o, req.Properties); err != nil {
+		return err
+	}
 	r, err := s.cat.call(c.ctx(), http.MethodPost, namespacePathOf(ns)+"/tables", nil, body)
 	if err != nil {
 		return err
@@ -550,6 +553,9 @@ func (s *Server) dropTable(c *call) error {
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
+	if err := s.refuseErasing(c, o, "it cannot be dropped"); err != nil {
+		return err
+	}
 	// Purging deletes every file under the table's location, those that
 	// clones read included (see clones.go).
 	if purgeRequested(c) && s.opts.Clones != nil {
@@ -604,6 +610,14 @@ func (s *Server) renameTable(c *call) error {
 		if err := s.requireUnprotected(c, o); err != nil {
 			return err
 		}
+	}
+	// An erasure request finds its tables by name: one renamed would be
+	// out of its reach, and one renamed to its name taken for it.
+	if err := s.refuseErasing(c, from, "it cannot be renamed or moved"); err != nil {
+		return err
+	}
+	if err := s.refuseErasing(c, to, "no other table can take its name"); err != nil {
+		return err
 	}
 	// Tags and data retentions name tables too: a renamed table would be
 	// out of reach of erasure requests and its retention.
@@ -868,6 +882,54 @@ func (s *Server) checkErasing(c *call, o auth.Object, req commitRequest) error {
 	}
 	if erasing {
 		return c.who.deny(fmt.Sprintf("an erasure request erases from %s; it stays at its Iceberg format version until the request is over, "+
+			"as erasure requests cannot rewrite tables of version 3 yet", o))
+	}
+	return nil
+}
+
+// refuseErasing refuses what to table o, as what says, while an erasure
+// request that is not over erases from it.
+func (s *Server) refuseErasing(c *call, o auth.Object, what string) error {
+	if s.opts.Erasing == nil {
+		return nil
+	}
+	erasing, err := s.opts.Erasing(c.ctx(), o)
+	if err != nil {
+		return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check whether an erasure request erases from the table; try again")
+	}
+	if erasing {
+		return c.who.deny(fmt.Sprintf("an erasure request erases from %s; %s until the request is over", o, what))
+	}
+	return nil
+}
+
+// checkCreateFormat refuses to create a table of Iceberg format version 3
+// under the name of a table with tags, or that an erasure request that is
+// not over erases from, which the request would take for that table:
+// erasure requests cannot rewrite tables of version 3 yet.
+func (s *Server) checkCreateFormat(c *call, o auth.Object, props map[string]string) error {
+	if !upgradesFormat(commitRequest{Updates: []tableUpdate{{Action: "set-properties", Updates: props}}}) {
+		return nil
+	}
+	if s.opts.Erasing != nil {
+		erasing, err := s.opts.Erasing(c.ctx(), o)
+		if err != nil {
+			return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check whether an erasure request erases from the table; try again")
+		}
+		if erasing {
+			return c.who.deny(fmt.Sprintf("an erasure request erases from %s; a table under its name stays at Iceberg format version 2 "+
+				"until the request is over, as erasure requests cannot rewrite tables of version 3 yet", o))
+		}
+	}
+	if s.opts.Classified == nil {
+		return nil
+	}
+	_, classified, err := s.opts.Classified(c.ctx(), o)
+	if err != nil {
+		return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check the table's policies and tags; try again")
+	}
+	if classified {
+		return c.who.deny(fmt.Sprintf("%s has policies or tags; a table under its name stays at Iceberg format version 2, "+
 			"as erasure requests cannot rewrite tables of version 3 yet", o))
 	}
 	return nil

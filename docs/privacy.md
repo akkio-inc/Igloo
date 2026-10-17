@@ -65,19 +65,33 @@ ALTER TABLE crm.referrals ALTER COLUMN referrer_email SET TAG pii = 'email:null'
   with a data or delete file that is not Parquet, which Igloo can neither
   search nor rewrite; and a table with a branch or tag whose schema
   requires a value in a column tagged `:null`, or whose files Igloo could
-  not write again with a partition spec that schema has the columns of.
-  Each table is loaded and checked again just before each `DELETE` from
-  it, on every run, retries included, so no `DELETE` runs on a table
-  another engine changed so meanwhile. A table with tags cannot be
-  upgraded to version 3, through SQL or the REST catalog, and neither can
-  any table an open request erases from (its clones too) until the request
-  is over. Parquet position delete files scoped to one data file, as
-  Java's Iceberg writes Spark's, are read as any.
+  not write again with a partition spec that schema has the columns of,
+  or whose manifests list files of a spec no schema of the table has the
+  columns of. Each table is loaded and checked again just before each
+  `DELETE` from it, on every run, retries included, a `DELETE` sent again
+  after losing to another writer's commit too, so no `DELETE` runs on a
+  table another engine changed so meanwhile.
+- **Tables stay within reach.** Igloo has its catalog (Lakekeeper 0.13 or
+  later) refuse tables of format version 3 in its warehouse, whoever makes
+  or upgrades them; tables of version 3 made before stay writable. On top
+  of that, and on any catalog, Igloo's SQL and its Iceberg REST endpoint
+  refuse, to everyone, admins included: to upgrade a table with tags to
+  version 3, or to make a table of version 3 under its name; and, while a
+  request that is not over erases from a table (its clones too), to drop
+  it or its schema, to rename it or another table to its name, to upgrade
+  it, or to make a table of version 3 under its name. Table properties of
+  such tables, and of tables with tags, are set with
+  `set_iceberg_table_properties` by keys and values written as literals
+  only, none of them `format-version`. Parquet position delete files
+  scoped to one data file, as Java's Iceberg writes Spark's, are read as
+  any.
 - **Once it has sent a `DELETE`, a request never fails**: failing would
-  forget whose rows it deleted while files may still hold them. What
-  stops it then, as another engine upgrading one of its tables to version
-  3 by going around Igloo, makes it `blocked` (see
-  [below](#what-a-request-does)) until someone fixes it.
+  forget whose rows it deleted while files may still hold them. A table
+  it cannot go on with then, as one another engine dropped or upgraded to
+  version 3 by going around Igloo, is set aside, and the request goes on
+  with its other tables through every step; it is then `blocked` (see
+  [below](#what-a-request-does)) until someone fixes it, or an admin
+  closes it.
 - **Hashed identifiers**: a tag value with `:sha256`, `:sha1` or `:md5`
   after it marks a column of the identifier's hex digest, as ad platforms
   match on: of the identifier as given, or lower-cased and trimmed. A
@@ -137,6 +151,7 @@ whatever later happens to the account that made it.
 ERASE SUBJECT WHERE tag.value = 'identifier' [OR tag.value IN ('identifier', ...)] ... [DRY RUN]
 CONFIRM ERASURE REQUEST 'request_id'
 CANCEL ERASURE REQUEST 'request_id'
+CLOSE ERASURE REQUEST 'request_id'   -- admins only: the last resort for a blocked request
 ```
 
 A request takes up to 1,000 identifiers, of one or more tag values; send a
@@ -210,16 +225,35 @@ raises the built-in alert `FAILED_RUNS`
 `error` says and make the request again.
 
 Once it has sent a `DELETE`, which may have committed even when no answer
-came, a request never fails: what would fail it, as runs that keep failing
-because matching rows keep arriving faster than it removes them,
-verification that sends it back more than five times, or a table that
-another engine changed so that the request cannot erase from it any more,
-makes it `blocked` instead. A blocked request keeps its identifiers
-sealed, logs at error level, raises `FAILED_RUNS` (once an hour), counts in
-`igloo_erasure_requests_blocked_runs_total`, and tries again every hour;
-it goes on once what `error` says is fixed, and cannot be canceled. Each
-failed run raises `FAILED_RUNS` for the request's job too, with the error,
-scrubbed of identifiers and hashes as everything the request logs is.
+came, a request never fails. A table it cannot go on with, as one another
+engine dropped, renamed or changed so that the request cannot erase from
+it any more, or whose runs fail 10 times in a row, is set aside: its
+`blocked` and `blocked_at` (in `tables`) say why and at which step, and
+the request goes on with its other tables through every step, so their
+old snapshots are expired and their files deleted. What would fail the
+request itself, as verification that sends it back more than five times
+because matching rows keep coming back, or a table set aside, makes it
+`blocked`: it keeps its identifiers sealed, logs at error level, raises
+`FAILED_RUNS` (once an hour), counts in
+`igloo_erasure_requests_blocked_runs_total`, and every hour takes up again
+the tables it set aside, each for one try, from the step the earliest
+stopped at, or goes on from the step that removes what verification found.
+It completes once what `error` says is fixed, and cannot be canceled.
+Each failed run raises `FAILED_RUNS` for the request's job too, with the
+error, scrubbed of identifiers and hashes as everything the request logs
+is.
+
+**The last resort.** When what blocks a request will not be fixed, as a
+table another engine dropped, or upgraded to version 3, which Igloo
+cannot rewrite yet, an admin can end it with `CLOSE ERASURE REQUEST`,
+once someone has erased what it could not in another way. What it erased
+stays erased; each table it did not finish with keeps why in `left` (in
+`tables`), the request records who closed it, as `closed` with `error`
+saying so, logs `erasure request closed` at warning level, and forgets its
+identifiers, as a completed request does. The statement is in the query
+history like any other. Only admins may close a request, and only a
+blocked one: privacy officers and the requester cannot, as they cannot
+cancel one that has begun deleting.
 
 Three kinds of run never count, however often they happen, since none
 says anything is wrong with the request:
@@ -293,11 +327,11 @@ request, newest first, to admins and holders of `ERASE`:
 | Column | Is |
 |---|---|
 | `request_id`, `requester` | The request, and who made it |
-| `status` | `queued`, `running`, `held` (waits for `CONFIRM ERASURE REQUEST`), `waiting` (for replicas, for a recent file to be old enough to delete, or for a staged snapshot to be published or discarded), `retrying` (the last run failed; `error` says why), `blocked` (has begun deleting and cannot go on until what `error` says is fixed), `completed`, `canceled` or `failed` (before it deleted anything) |
+| `status` | `queued`, `running`, `held` (waits for `CONFIRM ERASURE REQUEST`), `waiting` (for replicas, for a recent file to be old enough to delete, or for a staged snapshot to be published or discarded), `retrying` (the last run failed; `error` says why), `blocked` (has begun deleting and cannot go on until what `error` says is fixed), `completed`, `canceled`, `failed` (before it deleted anything) or `closed` (by an admin while blocked) |
 | `step` | The step it runs next, `done` once complete |
 | `created_at`, `updated_at`, `completed_at` | When |
 | `subjects` | JSON: the tag values, and how many identifiers of each |
-| `tables` | JSON: per table, its tagged columns, why it was included, rows that matched of how many, rows deleted, values nulled, files rewritten, snapshots expired, files deleted, files outside the warehouse it left, the branches and tags it rewrote, and when each step ended for it; `remote` for a table of a connection, which it did not erase from |
+| `tables` | JSON: per table, its tagged columns, why it was included, rows that matched of how many, rows deleted, values nulled, files rewritten, snapshots expired, files deleted, files outside the warehouse it left, the branches and tags it rewrote, and when each step ended for it; `remote` for a table of a connection, which it did not erase from; `blocked` and `blocked_at` for a table it set aside, and `left`, once an admin closed it, for one it did not finish with |
 | `downstream` | JSON: tables written from those, as history tells, and whether the request erased from them because they have the tags too |
 | `history_redacted` | History records redacted |
 | `steps` | JSON: when each step started and last finished, and how often it ran |
@@ -311,7 +345,8 @@ FROM (SELECT *, unnest(json_extract(tables::JSON, '$[*]')) AS t FROM igloo.erasu
 
 Each run of a request is in `igloo.task_history`, as kind `erasure`. The
 log says `erasure requested`, `erasure request completed`, `erasure request
-held`, `confirmed`, `canceled`, `failed` and `cannot go on` (blocked), and why a run failed. Requests
+held`, `confirmed`, `canceled`, `failed`, `cannot go on` (blocked, or a
+table set aside) and `closed`, and why a run failed. Requests
 are kept in the metadata database (schema `igloo_erasure`); without one, in
 memory, lost on restart.
 

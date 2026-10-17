@@ -1690,6 +1690,45 @@ func TestFormatVersionWhileErasing(t *testing.T) {
 			t.Errorf("%s while a request erases from the table: %d %s", what, w.Code, w.Body)
 		}
 	}
+	// Nor dropped, renamed, or given a table of version 3 under its name,
+	// which the request would take for it; a tagged table's name neither.
+	h.srv.opts.Classified = func(_ context.Context, o auth.Object) ([]string, bool, error) {
+		return nil, strings.EqualFold(o.String(), "public.users"), nil
+	}
+	rename := func(from, to string) *httptest.ResponseRecorder {
+		return h.request("POST", "/v1/tables/rename", ada, map[string]any{
+			"source":      map[string]any{"namespace": []string{"public"}, "name": from},
+			"destination": map[string]any{"namespace": []string{"public"}, "name": to},
+		})
+	}
+	create := func(name, version string) *httptest.ResponseRecorder {
+		props := map[string]string{}
+		if version != "" {
+			props["format-version"] = version
+		}
+		return h.request("POST", "/v1/namespaces/public/tables", ada,
+			map[string]any{"name": name, "schema": map[string]any{"type": "struct", "fields": []any{}}, "properties": props})
+	}
+	for what, w := range map[string]*httptest.ResponseRecorder{
+		"dropping it":                  h.request("DELETE", "/v1/namespaces/public/tables/events", ada, nil),
+		"renaming it":                  rename("events", "events_old"),
+		"renaming another to its name": rename("users_new", "events"),
+		"making a table of version 3 under its name": create("events", "3"),
+		"making one under a tagged name":             create("users", "v3"),
+	} {
+		if w.Code != 403 {
+			t.Errorf("%s while a request erases from the table: %d %s", what, w.Code, w.Body)
+		}
+	}
+	for what, w := range map[string]*httptest.ResponseRecorder{
+		"making a table of version 2 under its name": create("events", "2"),
+		"making a table of version 3 elsewhere":      create("clicks", "3"),
+		"renaming another table":                     rename("clicks", "taps"),
+	} {
+		if w.Code != 200 && w.Code != 204 {
+			t.Errorf("%s: %d %s", what, w.Code, w.Body)
+		}
+	}
 	set(false, errors.New("database down"))
 	if w := commit(upgrade); w.Code != 503 {
 		t.Errorf("when requests cannot be checked: %d %s", w.Code, w.Body)

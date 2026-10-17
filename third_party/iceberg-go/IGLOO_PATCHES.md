@@ -92,6 +92,17 @@ branches and tags:
   writes Parquet position delete files scoped to one data file with it set,
   as for Spark's deletes, and those are read as any position delete file.
 
+- `table/snapshot_producers.go` and `table/igloo_partition_schema.go`
+  (new): the manifests a commit writes, for the files it adds, removes or
+  keeps, take their partition type from a schema that has every column
+  their spec partitions by: the current one, or else the newest of the
+  table's schemas that does. iceberg-go used the current schema, which
+  lacks a column an older spec partitions by once it is dropped (as Spark
+  allows when a newer spec no longer uses it), and left that field out, so
+  every file of that spec in a manifest a compaction or a rewrite wrote
+  again lost its partition value. `HasSourceColumns` (new, exported)
+  tells whether a schema has a spec's columns.
+
 One addition serves the erasure of a person's data (`internal/erasure`):
 
 - `table/igloo_forget_files.go` (new): `Transaction.ForgetFiles` commits a

@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -104,19 +105,15 @@ func (c *lakekeeper) setup(ctx context.Context, cfg config.Config, log *slog.Log
 		return fmt.Errorf("bootstrap catalog: %w", err)
 	}
 
-	var list struct {
-		Warehouses []struct {
-			Name    string         `json:"name"`
-			Profile map[string]any `json:"storage-profile"`
-		} `json:"warehouses"`
+	w, err := c.warehouse(ctx, cfg.Catalog.Warehouse)
+	if err != nil {
+		return err
 	}
-	if err := c.call(ctx, http.MethodGet, "/warehouse", nil, &list); err != nil {
-		return fmt.Errorf("list warehouses: %w", err)
-	}
-	for _, w := range list.Warehouses {
-		if w.Name == cfg.Catalog.Warehouse {
-			return checkLocation(w.Profile, cfg.Storage)
+	if w != nil {
+		if err := checkLocation(w.Profile, cfg.Storage); err != nil {
+			return err
 		}
+		return c.capFormatVersions(ctx, w, log)
 	}
 
 	req, err := warehouseRequest(cfg)
@@ -124,13 +121,89 @@ func (c *lakekeeper) setup(ctx context.Context, cfg config.Config, log *slog.Log
 		return err
 	}
 	err = c.call(ctx, http.MethodPost, "/warehouse", req, nil)
-	if errors.As(err, &apiErr) && apiErr.status == http.StatusConflict {
-		return nil // another replica created it first
-	}
-	if err != nil {
+	switch {
+	case errors.As(err, &apiErr) && apiErr.status == http.StatusConflict:
+		// Another replica created it first.
+	case err != nil:
 		return fmt.Errorf("create warehouse %q: %w", cfg.Catalog.Warehouse, err)
+	default:
+		log.Info("created warehouse", "name", cfg.Catalog.Warehouse, "location", cfg.Storage.Location)
 	}
-	log.Info("created warehouse", "name", cfg.Catalog.Warehouse, "location", cfg.Storage.Location)
+	if w, err = c.warehouse(ctx, cfg.Catalog.Warehouse); err != nil || w == nil {
+		return err
+	}
+	return c.capFormatVersions(ctx, w, log)
+}
+
+// warehouseInfo is what Setup reads of a warehouse.
+type warehouseInfo struct {
+	// WarehouseID is its ID; older Lakekeepers call it id only.
+	WarehouseID string         `json:"warehouse-id"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Profile     map[string]any `json:"storage-profile"`
+	// Allowed are the Iceberg format versions tables may be created in or
+	// upgraded to, which Lakekeeper reports from 0.13; nil from older ones.
+	Allowed []int `json:"allowed-format-versions"`
+}
+
+// warehouse returns the warehouse named name, or nil if there is none.
+func (c *lakekeeper) warehouse(ctx context.Context, name string) (*warehouseInfo, error) {
+	var list struct {
+		Warehouses []warehouseInfo `json:"warehouses"`
+	}
+	if err := c.call(ctx, http.MethodGet, "/warehouse", nil, &list); err != nil {
+		return nil, fmt.Errorf("list warehouses: %w", err)
+	}
+	for i := range list.Warehouses {
+		if list.Warehouses[i].Name == name {
+			return &list.Warehouses[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// formatVersions are the Iceberg format versions Igloo's warehouse allows
+// tables to be created in or upgraded to: erasure requests cannot rewrite
+// tables of version 3 yet (see package erasure), and Igloo's own checks do
+// not reach another engine that uses the catalog directly.
+var formatVersions = []int{1, 2}
+
+// capFormatVersions has the warehouse allow formatVersions only, by
+// Lakekeeper's per-warehouse format-version policy, with version 2 the
+// default. Lakekeeper checks the policy when a table is created, upgraded
+// or registered, so tables of version 3 made before stay writable. A
+// Lakekeeper older than 0.13, which has no such policy, or one that
+// refuses the change, as for a warehouse an operator manages, is logged:
+// Igloo's own checks still refuse version 3 for tables with tags and
+// tables erasure requests erase from.
+func (c *lakekeeper) capFormatVersions(ctx context.Context, w *warehouseInfo, log *slog.Logger) error {
+	if w.Allowed == nil {
+		log.Warn("the catalog cannot limit the warehouse's Iceberg format versions (Lakekeeper 0.13 or later can); "+
+			"Igloo refuses version 3 itself for tables with tags and tables erasure requests erase from", "warehouse", w.Name)
+		return nil
+	}
+	if !slices.ContainsFunc(w.Allowed, func(v int) bool { return v >= 3 }) {
+		return nil
+	}
+	id := w.WarehouseID
+	if id == "" {
+		id = w.ID
+	}
+	err := c.call(ctx, http.MethodPost, "/warehouse/"+url.PathEscape(id)+"/format-version-policy",
+		map[string]any{"allowed-format-versions": formatVersions, "default-format-version": 2}, nil)
+	var apiErr *apiError
+	switch {
+	case errors.As(err, &apiErr) && apiErr.status < 500:
+		log.Error("the catalog refused to limit the warehouse's Iceberg format versions to 1 and 2; "+
+			"Igloo refuses version 3 itself for tables with tags and tables erasure requests erase from, but other engines can make them",
+			"warehouse", w.Name, "err", err)
+		return nil
+	case err != nil:
+		return fmt.Errorf("limit the format versions of warehouse %q: %w", w.Name, err)
+	}
+	log.Info("limited the warehouse's Iceberg format versions to 1 and 2: erasure requests cannot rewrite tables of version 3 yet",
+		"warehouse", w.Name)
 	return nil
 }
 

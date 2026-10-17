@@ -79,14 +79,17 @@ const (
 // operation marks the snapshots requests commit.
 var operation = iceberg.Properties{"igloo.operation": "erase"}
 
+// errGone is a request's table that does not exist any more.
+var errGone = errors.New("does not exist any more")
+
 // reload loads a request's table, which must still exist: a table that a
 // request found and that is gone was dropped or renamed meanwhile, and
 // where its data went cannot be told.
 func (s *Service) reload(ctx context.Context, t *Table) (*table.Table, error) {
 	tbl, err := s.opts.Catalog.LoadTable(ctx, identOf(t))
 	if errors.Is(err, icecat.ErrNoSuchTable) {
-		return nil, fmt.Errorf("%s does not exist any more: it was dropped or renamed while the request ran; "+
-			"tag it under its new name if it has one, and make the request again", t.Name)
+		return nil, fmt.Errorf("%s %w: it was dropped or renamed while the request ran; if it was renamed, tag it under its new name "+
+			"and make a new request for it", t.Name, errGone)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", t.Name, err)
@@ -102,31 +105,71 @@ func (s *Service) reload(ctx context.Context, t *Table) (*table.Table, error) {
 	return tbl, nil
 }
 
+// blocking reports whether err stops a request from going on with a table
+// until someone changes it: the table is gone, or it cannot erase from it
+// as it is (see erasable).
+func blocking(err error) bool { return errors.Is(err, ErrInvalid) || errors.Is(err, errGone) }
+
+// tableError is an error of a step with one of a request's tables, which,
+// should it keep failing once the request has begun deleting, sets that
+// table aside rather than stop the others (see failed).
+type tableError struct {
+	table string
+	err   error
+}
+
+func (e *tableError) Error() string { return e.err.Error() }
+func (e *tableError) Unwrap() error { return e.err }
+
+// block sets table t of r aside, as err says why the request cannot go on
+// with it now: the request goes on with its other tables through every
+// step, and takes t up again, from the step it stopped at, once they are
+// done (see advance and Run). It alerts, as a blocked request does.
+func (s *Service) block(ctx context.Context, r *Request, t *Table, err error) error {
+	t.Blocked, t.BlockedAt = scrub(r, err.Error()), r.Step
+	s.opts.Metrics.countBlocked()
+	if s.opts.Blocked != nil {
+		s.opts.Blocked(r.ID, r.Step, t.Name+": "+t.Blocked)
+	}
+	s.log.Error("erasure request cannot go on with a table until what its error says is fixed; it goes on with its other tables, "+
+		"and takes this one up again once they are done", "request", r.ID, "table", t.Name, "step", r.Step, "err", t.Blocked)
+	return s.save(ctx, r)
+}
+
 // loaded is a request's table as the catalog has it now.
 type loaded struct {
 	t   *Table
 	tbl *table.Table
 }
 
-// tables loads the request's tables, but connections'. One of a format
-// version the request cannot rewrite or read (see supported), which
-// another engine can upgrade a table to at any time, stops every step at
-// once: before the request's first DELETE, it fails; after it, it is
-// blocked (see failed).
+// tables loads the request's tables, but connections' and those set aside
+// (see block). One that is gone, or of a format version the request
+// cannot rewrite or read (see supported), which another engine can make
+// it at any time: before the request's first DELETE, stops it, and it
+// fails; once it has begun deleting, is set aside, and the others go on.
 func (s *Service) tables(ctx context.Context, r *Request) ([]loaded, error) {
 	var out []loaded
 	for i := range r.Tables {
-		if r.Tables[i].Remote {
+		t := &r.Tables[i]
+		if t.Remote || t.Blocked != "" {
 			continue
 		}
-		tbl, err := s.reload(ctx, &r.Tables[i])
-		if err != nil {
+		tbl, err := s.reload(ctx, t)
+		if err == nil {
+			err = supported(t, tbl)
+		}
+		switch {
+		case err == nil:
+			out = append(out, loaded{t, tbl})
+		case !blocking(err):
 			return nil, err
-		}
-		if err := supported(&r.Tables[i], tbl); err != nil {
+		case !deleting(r):
 			return nil, terminal(err)
+		default:
+			if err := s.block(ctx, r, t, err); err != nil {
+				return nil, err
+			}
 		}
-		out = append(out, loaded{&r.Tables[i], tbl})
 	}
 	return out, nil
 }
@@ -314,7 +357,7 @@ func (s *Service) discover(ctx context.Context, r *Request) error {
 // trying again cannot get past, stops the request at once (see failed);
 // reading the table can fail for a moment, and is tried again.
 func refusal(err error) error {
-	if errors.Is(err, ErrInvalid) {
+	if blocking(err) {
 		return terminal(err)
 	}
 	return err
@@ -432,15 +475,24 @@ func uuids(tables []loaded) map[string]bool {
 // stop every request. Any other error, as the catalog unavailable or
 // failing for a moment, stops the run, which tries again later without
 // counting it as a failure: leaving the table out could delete files it
-// references. One named as one of ours fails.
-func (s *Service) others(ctx context.Context, ours []loaded) ([]*table.Table, error) {
+// references. One named as one of ours fails. Those r set aside (see
+// block) are r's too, and left out (see referenced).
+func (s *Service) others(ctx context.Context, r *Request, ours []loaded) ([]*table.Table, error) {
 	uuid := uuids(ours)
+	for _, t := range r.Tables {
+		if t.UUID != "" {
+			uuid[t.UUID] = true
+		}
+	}
 	idents, err := s.opts.Catalog.Tables(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var out []*table.Table
 	for _, id := range idents {
+		if slices.ContainsFunc(r.Tables, func(t Table) bool { return t.Blocked != "" && strings.EqualFold(t.Name, tableName(id)) }) {
+			continue
+		}
 		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
 		if errors.Is(err, icecat.ErrNoSuchTable) {
 			continue
@@ -473,7 +525,7 @@ func (s *Service) others(ctx context.Context, ours []loaded) ([]*table.Table, er
 // column named like a tagged one, and their columns of those names are
 // taken to hold the same.
 func (s *Service) clones(ctx context.Context, r *Request, sources []loaded) ([]Table, error) {
-	others, err := s.others(ctx, sources)
+	others, err := s.others(ctx, r, sources)
 	if err != nil {
 		return nil, err
 	}
@@ -567,10 +619,10 @@ func sameFields(src loaded, other *table.Table) []Column {
 // (see erasable), and one that became a table it cannot erase from since
 // the find step makes it fail, having deleted nothing. Each table is
 // loaded and checked again just before each DELETE from it, on every run,
-// retries included: another engine can change a table at any time, and no
-// DELETE may run on one the request could not then rewrite. A table that
-// fails that check after the request's first DELETE blocks it (see
-// failed), which keeps its identifiers.
+// retries included (see deleteFrom): another engine can change a table at
+// any time, and no DELETE may run on one the request could not then
+// rewrite. Once the request has begun deleting, a table that fails that
+// check is set aside (see block), and the others go on.
 func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 	if !r.DeleteStarted {
 		if err := s.erasables(ctx, r); err != nil {
@@ -579,33 +631,21 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 	}
 	for i := range r.Tables {
 		t := &r.Tables[i]
-		if t.Remote {
+		if t.Remote || t.Blocked != "" {
 			continue
 		}
-		tbl, err := s.reload(ctx, t)
-		if err != nil {
-			return err
-		}
-		if err := s.erasable(ctx, t, tbl); err != nil {
-			return refusal(err)
-		}
-		if cond := currentCondition(r.salt, fields(tbl, t), r.Subjects, false); cond != "" {
-			if !r.DeleteStarted {
-				// A DELETE whose answer is lost may have committed: from
-				// here on, the request can neither be canceled nor fail.
-				r.DeleteStarted = true
-				if err := s.save(ctx, r); err != nil {
-					return err
-				}
+		err := s.deleteFrom(ctx, r, t)
+		switch {
+		case err == nil:
+		case blocking(err) && deleting(r):
+			if err := s.block(ctx, r, t, err); err != nil {
+				return err
 			}
-			n, err := s.rows.Delete(ctx, tbl, cond)
-			if commitConflict(err) {
-				return contended(fmt.Errorf("delete from %s: other writers' commits kept coming first: %w", t.Name, err))
-			}
-			if err != nil {
-				return fmt.Errorf("delete from %s: %w", t.Name, err)
-			}
-			t.RowsDeleted += n
+			continue
+		case blocking(err):
+			return terminal(err)
+		default:
+			return &tableError{t.Name, err}
 		}
 		t.done(StepDelete, s.now())
 		if err := s.save(ctx, r); err != nil {
@@ -615,9 +655,59 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 	return nil
 }
 
+// deleteFrom deletes the matching rows of t, as loaded and checked (see
+// erasable) just before the DELETE. A DELETE that loses to another
+// writer's commit is sent again, up to maxCommitRetries times, each time
+// on the table loaded and checked again: the commit that came first may
+// have been another engine upgrading the table, or deleting from it with a
+// deletion vector.
+func (s *Service) deleteFrom(ctx context.Context, r *Request, t *Table) error {
+	backoff := 20 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		tbl, err := s.reload(ctx, t)
+		if err != nil {
+			return err
+		}
+		if err := s.erasable(ctx, t, tbl); err != nil {
+			return err
+		}
+		cond := currentCondition(r.salt, fields(tbl, t), r.Subjects, false)
+		if cond == "" {
+			return nil
+		}
+		if !r.DeleteStarted {
+			// A DELETE whose answer is lost may have committed: from here
+			// on, the request can neither be canceled nor fail.
+			r.DeleteStarted = true
+			if err := s.save(ctx, r); err != nil {
+				return err
+			}
+		}
+		n, err := s.rows.Delete(ctx, tbl, cond)
+		if err == nil {
+			t.RowsDeleted += n
+			return nil
+		}
+		if !commitConflict(err) {
+			return fmt.Errorf("delete from %s: %w", t.Name, err)
+		}
+		if attempt >= maxCommitRetries {
+			return contended(fmt.Errorf("delete from %s: other writers' commits kept coming first: %w", t.Name, err))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, time.Second)
+	}
+}
+
 // rewrite removes the matching rows from the files of every branch and tag
 // of every table (see rewrite.go), and then the manifests that still list
-// the old files.
+// the old files. A table it cannot rewrite now, as one another engine
+// changed since its DELETE so that the request cannot rewrite it with
+// certainty, is set aside (see block), and the others go on.
 func (s *Service) rewrite(ctx context.Context, r *Request) error {
 	tables, err := s.tables(ctx, r)
 	if err != nil {
@@ -625,25 +715,36 @@ func (s *Service) rewrite(ctx context.Context, r *Request) error {
 	}
 	for _, l := range tables {
 		t := l.t
-		// Another engine may have changed the table since its DELETE so
-		// that the request cannot rewrite it with certainty: the request is
-		// blocked until that is undone, rather than rewrite the table as it
-		// cannot.
-		if err := s.erasable(ctx, t, l.tbl); err != nil {
-			return refusal(err)
-		}
-		if err := s.sweep(ctx, r, t, false); err != nil {
-			return err
-		}
-		for _, name := range refNames(l.tbl) {
-			if err := s.onRef(ctx, r, t, name, func(ctx context.Context, view *table.Table, branch string, commit bool) (bool, error) {
-				return s.rewriteRef(ctx, r, t, view, branch, commit)
-			}); err != nil {
-				return fmt.Errorf("rewrite %s: %w", t.Name, err)
+		err := s.rewriteTable(ctx, r, t, l.tbl)
+		switch {
+		case err == nil:
+		case blocking(err):
+			if err := s.block(ctx, r, t, err); err != nil {
+				return err
 			}
+			continue
+		default:
+			return &tableError{t.Name, fmt.Errorf("rewrite %s: %w", t.Name, err)}
 		}
 		t.done(StepRewrite, s.now())
 		if err := s.save(ctx, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) rewriteTable(ctx context.Context, r *Request, t *Table, tbl *table.Table) error {
+	if err := s.erasable(ctx, t, tbl); err != nil {
+		return err
+	}
+	if err := s.sweep(ctx, r, t, false); err != nil {
+		return err
+	}
+	for _, name := range refNames(tbl) {
+		if err := s.onRef(ctx, r, t, name, func(ctx context.Context, view *table.Table, branch string, commit bool) (bool, error) {
+			return s.rewriteRef(ctx, r, t, view, branch, commit)
+		}); err != nil {
 			return err
 		}
 	}
@@ -904,8 +1005,14 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 				}
 				err = contended(err)
 			}
+			if blocking(err) {
+				if err := s.block(ctx, r, t, err); err != nil {
+					return err
+				}
+				break
+			}
 			if err != nil {
-				return fmt.Errorf("expire snapshots of %s: %w", t.Name, err)
+				return &tableError{t.Name, fmt.Errorf("expire snapshots of %s: %w", t.Name, err)}
 			}
 			t.SnapshotsExpired += n
 			if !stagedUntil.IsZero() && (waitUntil.IsZero() || stagedUntil.Before(waitUntil)) {
@@ -922,7 +1029,9 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 		return nil
 	}
 	for _, lt := range tables {
-		lt.t.done(StepExpire, s.now())
+		if lt.t.Blocked == "" {
+			lt.t.done(StepExpire, s.now())
+		}
 	}
 	return nil
 }
@@ -1106,24 +1215,41 @@ func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, l *list
 // makes the request wait until it is old enough. It holds the locks of the
 // tables' locations meanwhile, which making a clone of one takes too, so
 // no clone that references a file it deletes is made.
+//
+// The files recorded for a table set aside (see block) are left until the
+// request takes it up again, and what such a table references is kept as
+// any table's is. While one exists but cannot be read, as a table another
+// engine upgraded to format version 3, any file might be one it
+// references, and the request deletes none.
 func (s *Service) purge(ctx context.Context, r *Request) error {
 	release, err := s.lockLocations(ctx, r)
 	if err != nil {
 		return err
 	}
 	defer release()
-	tables, referenced, err := s.referenced(ctx, r)
+	tables, referenced, unsure, err := s.referenced(ctx, r)
 	if err != nil {
 		return err
+	}
+	if len(unsure) > 0 {
+		s.log.Warn("an erasure request deletes no file while a table it set aside, and cannot read, may reference it",
+			"request", r.ID, "tables", strings.Join(unsure, ", "))
+		return nil
 	}
 	files, err := s.opts.Store.Files(ctx, r.ID)
 	if err != nil {
 		return err
 	}
+	aside := map[string]bool{}
+	for _, t := range r.Tables {
+		if t.Blocked != "" {
+			aside[t.Name] = true
+		}
+	}
 	var gone []File
 	going := pathSet{}
 	for _, f := range files {
-		if f.Deleted.IsZero() && f.Kind != fileOutside && !referenced.has(f.Path) {
+		if f.Deleted.IsZero() && f.Kind != fileOutside && !referenced.has(f.Path) && !aside[f.Table] {
 			gone = append(gone, f)
 			going.add(f.Path)
 		}
@@ -1132,7 +1258,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	for _, l := range tables {
 		o, err := s.orphans(ctx, l.tbl, referenced)
 		if err != nil {
-			return fmt.Errorf("orphan files of %s: %w", l.t.Name, err)
+			return &tableError{l.t.Name, fmt.Errorf("orphan files of %s: %w", l.t.Name, err)}
 		}
 		for _, p := range o.old {
 			if !going.has(p) {
@@ -1157,8 +1283,8 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 		}
 		if len(unsure) > 0 {
 			p := slices.Sorted(maps.Keys(unsure))[0]
-			return fmt.Errorf("%s, under %s, holds matching rows, and no file of the table is spelled as it is, but one has its name: "+
-				"it may be that file, spelled otherwise, so the request does not delete it; if nothing references it, delete it", base(p), l.t.Name)
+			return &tableError{l.t.Name, fmt.Errorf("%s, under %s, holds matching rows, and no file of the table is spelled as it is, but one has its name: "+
+				"it may be that file, spelled otherwise, so the request does not delete it; if nothing references it, delete it", base(p), l.t.Name)}
 		}
 	}
 	if err := s.unshared(ctx, r, tables, gone); err != nil {
@@ -1191,7 +1317,7 @@ func (s *Service) unshared(ctx context.Context, r *Request, tables []loaded, fil
 		paths.add(f.Path)
 		dirs.add(f.Path)
 	}
-	others, err := s.others(ctx, tables)
+	others, err := s.others(ctx, r, tables)
 	if err != nil {
 		return err
 	}
@@ -1246,15 +1372,16 @@ func (s *Service) lockLocations(ctx context.Context, r *Request) (release func()
 
 // referenced loads r's tables, and clones of them made since the request
 // found its tables, which it adds to them, and returns them with every
-// file any of them references.
-func (s *Service) referenced(ctx context.Context, r *Request) ([]loaded, pathSet, error) {
-	tables, err := s.tables(ctx, r)
-	if err != nil {
-		return nil, nil, err
+// file any of them, or any table r set aside (see block), references.
+// unsure names the tables set aside that exist but cannot be read, whose
+// references cannot be told; one that is gone references nothing.
+func (s *Service) referenced(ctx context.Context, r *Request) (tables []loaded, referenced pathSet, unsure []string, err error) {
+	if tables, err = s.tables(ctx, r); err != nil {
+		return nil, nil, nil, err
 	}
 	added, err := s.clones(ctx, r, tables)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(added) > 0 {
 		for _, t := range added {
@@ -1263,18 +1390,37 @@ func (s *Service) referenced(ctx context.Context, r *Request) ([]loaded, pathSet
 		}
 		r.Tables = append(r.Tables, added...)
 		if tables, err = s.tables(ctx, r); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
-	referenced := pathSet{}
+	referenced = pathSet{}
 	for _, l := range tables {
 		tf, err := readFiles(ctx, l.tbl)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		maps.Copy(referenced, tf.referenced())
 	}
-	return tables, referenced, nil
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if t.Remote || t.Blocked == "" {
+			continue
+		}
+		tbl, err := s.reload(ctx, t)
+		switch {
+		case errors.Is(err, errGone):
+			continue
+		case err != nil:
+			return nil, nil, nil, err
+		}
+		tf, err := readFiles(ctx, tbl)
+		if err != nil {
+			unsure = append(unsure, t.Name)
+			continue
+		}
+		maps.Copy(referenced, tf.referenced())
+	}
+	return tables, referenced, unsure, nil
 }
 
 // orphanFiles are the files under a table's location that nothing
@@ -1609,7 +1755,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tables, referenced, err := s.referenced(ctx, r)
+	tables, referenced, unsure, err := s.referenced(ctx, r)
 	if err != nil {
 		return "", err
 	}
@@ -1618,8 +1764,14 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		return "", err
 	}
 	for _, lt := range tables {
-		if err := s.verifyTable(ctx, r, lt, m, referenced, l, v); err != nil {
-			return "", fmt.Errorf("verify %s: %w", lt.t.Name, err)
+		err := s.verifyTable(ctx, r, lt, m, referenced, l, v)
+		switch {
+		case blocking(err):
+			if err := s.block(ctx, r, lt.t, err); err != nil {
+				return "", err
+			}
+		case err != nil:
+			return "", &tableError{lt.t.Name, fmt.Errorf("verify %s: %w", lt.t.Name, err)}
 		}
 	}
 	for _, f := range files {
@@ -1660,7 +1812,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	switch {
 	case v.Rows > 0 || v.Files > 0 || v.Bounds > 0 || v.Statistics > 0:
 		next = StepDelete
-	case v.Storage > 0 || v.Orphans > 0:
+	case (v.Storage > 0 || v.Orphans > 0) && len(unsure) == 0:
+		// While a table set aside cannot be read, purge deletes nothing
+		// (see purge): the request is blocked on it instead.
 		next = StepPurge
 	case v.Sharing > 0:
 		next = StepSharing
@@ -1670,9 +1824,19 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		next = StepCache
 	}
 	if next == StepDone {
+		for _, lt := range tables {
+			if lt.t.Blocked == "" && len(unsure) == 0 {
+				lt.t.done(StepVerify, s.now())
+			}
+		}
 		return next, nil
 	}
 	if r.Rounds++; r.Rounds > maxRounds {
+		// Blocked: it goes on from the step that removes what verification
+		// found, every blockedWait, and so completes once whatever keeps
+		// bringing it back, as a feed that writes the person's rows again,
+		// stops.
+		r.Step = next
 		return "", terminal(fmt.Errorf("after %d rounds, verification still finds %s", maxRounds, v))
 	}
 	s.log.Info("erasure verification found more to remove", "request", r.ID, "found", v.String(), "next", next)

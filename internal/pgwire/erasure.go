@@ -25,13 +25,15 @@ import (
 //	SHOW ERASURE REQUESTS
 //	CANCEL ERASURE REQUEST 'id'
 //	CONFIRM ERASURE REQUEST 'id'
+//	CLOSE ERASURE REQUEST 'id'
 //	ALTER TABLE [IF EXISTS] name SET (data_retention_days = n)
 //	ALTER TABLE [IF EXISTS] name RESET (data_retention_days)
 //
 // Admins may run them, and users granted ERASE ON ACCOUNT, directly or
 // through a role: privacy officers, who may set data retentions only of
-// tables with tags. The identifiers in ERASE SUBJECT never reach the
-// history, the logs or the list of running statements.
+// tables with tags. CLOSE ERASURE REQUEST, the last resort for a blocked
+// request, is for admins only. The identifiers in ERASE SUBJECT never
+// reach the history, the logs or the list of running statements.
 
 // erasureCmd is a parsed erasure or retention statement.
 type erasureCmd struct {
@@ -52,6 +54,7 @@ const (
 	tagShowErase    = "SHOW ERASURE REQUESTS"
 	tagCancelErase  = "CANCEL ERASURE REQUEST"
 	tagConfirmErase = "CONFIRM ERASURE REQUEST"
+	tagCloseErase   = "CLOSE ERASURE REQUEST"
 	tagRetention    = "ALTER TABLE"
 )
 
@@ -122,11 +125,15 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 			return syntax("unexpected text after SHOW ERASURE REQUESTS")
 		}
 		return c, true, nil
-	case sc.keywords("CANCEL", "ERASURE", "REQUEST"), sc.keywords("CONFIRM", "ERASURE", "REQUEST"):
+	case sc.keywords("CANCEL", "ERASURE", "REQUEST"), sc.keywords("CONFIRM", "ERASURE", "REQUEST"), sc.keywords("CLOSE", "ERASURE", "REQUEST"):
 		// The keyword the scanner read, after any comments, says which.
-		c.tag = tagCancelErase
-		if strings.EqualFold(firstWord(query), "CONFIRM") {
+		switch strings.ToUpper(firstWord(query)) {
+		case "CONFIRM":
 			c.tag = tagConfirmErase
+		case "CLOSE":
+			c.tag = tagCloseErase
+		default:
+			c.tag = tagCancelErase
 		}
 		lit, ok := sc.literal()
 		if !ok || lit == nil || !sc.done() {
@@ -254,7 +261,7 @@ func (s *Server) erasureCommand(sess *session, query string) (wire.PreparedState
 	}
 	var opts []wire.PreparedOptionFn
 	switch c.tag {
-	case tagErase, tagCancelErase, tagConfirmErase:
+	case tagErase, tagCancelErase, tagConfirmErase, tagCloseErase:
 		cols := wire.Columns{
 			{Name: "request_id", Oid: pgtype.TextOID, Width: -1},
 			{Name: "status", Oid: pgtype.TextOID, Width: -1},
@@ -324,6 +331,13 @@ func (s *Server) runErasureCommand(ctx context.Context, sess *session, user auth
 		r, err = s.erasure.Cancel(ctx, c.id, user.Name)
 	case c.tag == tagConfirmErase:
 		r, err = s.erasure.Confirm(ctx, c.id, user.Name)
+	case c.tag == tagCloseErase:
+		// The last resort: it forgets whose data the request erased while
+		// some is left, which only an admin decides.
+		if user.Role != auth.RoleAdmin {
+			return pgerror.WithCode(fmt.Errorf("permission denied: %s requires the admin role", c.tag), codes.InsufficientPrivilege)
+		}
+		r, err = s.erasure.Close(ctx, c.id, user.Name)
 	default:
 		r, err = s.erasure.Submit(ctx, user.Name, c.wanted)
 	}

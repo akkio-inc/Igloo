@@ -596,7 +596,7 @@ func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts .
 
 	counter := &internal.CountingWriter{W: out}
 	wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter, spec,
-		sp.txn.meta.CurrentSchema(), sp.snapshotID, opts...)
+		sp.txn.meta.partitionSchema(spec), sp.snapshotID, opts...)
 	if err != nil {
 		return nil, "", nil, nil, errors.Join(err, out.Close())
 	}
@@ -672,7 +672,7 @@ func (sp *snapshotProducer) manifests(ctx context.Context) (_ []iceberg.Manifest
 
 				counter := &internal.CountingWriter{W: out}
 				wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter,
-					sp.spec(key.specID), sp.txn.meta.CurrentSchema(),
+					sp.spec(key.specID), sp.txn.meta.partitionSchema(sp.spec(key.specID)),
 					sp.snapshotID, iceberg.WithManifestWriterContent(key.content))
 				if err != nil {
 					return nil, err
@@ -737,7 +737,7 @@ func (sp *snapshotProducer) manifestProducer(content iceberg.ManifestContent, fi
 			return fmt.Errorf("could not get current partition spec: %w", err)
 		}
 		wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter,
-			*currentSpec, sp.txn.meta.CurrentSchema(),
+			*currentSpec, sp.txn.meta.partitionSchema(*currentSpec),
 			sp.snapshotID, iceberg.WithManifestWriterContent(content))
 		if err != nil {
 			return err

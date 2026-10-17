@@ -1395,6 +1395,15 @@ if got="$(psql_admin \
 else
   fail "erasure setup: $got"
 fi
+# Igloo has the catalog refuse tables of Iceberg format version 3, which
+# erasure requests cannot rewrite yet, whatever their names.
+if got="$(psql_admin -c "CREATE TABLE crm.v3_probe (id INTEGER) WITH ('format-version' = '3')")"; then
+  fail "a table of format version 3 was created"
+elif grep -q "not allowed in this warehouse" <<<"$got"; then
+  pass "the catalog refuses tables of format version 3"
+else
+  fail "a table of format version 3: $got"
+fi
 # A statement that names the person, for the history to forget, and one
 # that reads their rows into the read cache.
 psql_admin -c "SELECT count(*) FROM crm.people WHERE email = '$erase_email'" -c "SELECT count(*) FROM crm.people WHERE note = 'goes'" >/dev/null

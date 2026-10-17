@@ -77,6 +77,10 @@ const (
 	// it could not carry out, before it sent a DELETE; Error says why.
 	// Make a new request once that is fixed.
 	StatusFailed = "failed"
+	// StatusClosed is a blocked request an admin closed (see
+	// Service.Close): what it erased stays erased, its tables' Left say
+	// what it did not, and it forgot its identifiers.
+	StatusClosed = "closed"
 )
 
 // Steps of a request, in order.
@@ -155,6 +159,9 @@ type Request struct {
 	DeletedThrough time.Time `json:"deleted_through,omitzero"`
 	// ConfirmedBy is who confirmed it after it was held.
 	ConfirmedBy string `json:"confirmed_by,omitempty"`
+	// ClosedBy is the admin who closed it while it was blocked (see
+	// Service.Close).
+	ClosedBy string `json:"closed_by,omitempty"`
 	// DeleteStarted says it sent its first DELETE, which may have
 	// committed even if no answer came: it can no longer be canceled.
 	DeleteStarted bool `json:"delete_started,omitempty"`
@@ -225,6 +232,17 @@ type Table struct {
 	// (package federation): the request reports it and erases nothing
 	// there.
 	Remote bool `json:"remote,omitempty"`
+	// Blocked says why the request cannot go on with the table now, once
+	// it has begun deleting, as when another engine dropped it or made it
+	// one the request cannot rewrite; BlockedAt is the step it stopped at.
+	// Its other tables go on through every step without it, and the
+	// request, then blocked, takes it up again from that step every
+	// blockedWait.
+	Blocked   string `json:"blocked,omitempty"`
+	BlockedAt string `json:"blocked_at,omitempty"`
+	// Left says why the request was closed (see Service.Close) without
+	// finishing with the table.
+	Left string `json:"left,omitempty"`
 }
 
 // Column is a column that holds identifiers.

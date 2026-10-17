@@ -413,8 +413,7 @@ func (s *Service) Erasing(ctx context.Context, schema, name string) (bool, error
 	}
 	want := schema + "." + name
 	for _, r := range all {
-		switch r.Status {
-		case StatusCompleted, StatusCanceled, StatusFailed:
+		if !r.open() {
 			continue
 		}
 		for i := range r.Tables {
@@ -424,6 +423,37 @@ func (s *Service) Erasing(ctx context.Context, schema, name string) (bool, error
 		}
 	}
 	return false, nil
+}
+
+// ErasingIn reports whether a request that is not over erases from a
+// table of the catalog's schema, which may then not be dropped.
+func (s *Service) ErasingIn(ctx context.Context, schema string) (bool, error) {
+	all, err := s.opts.Store.List(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range all {
+		if !r.open() {
+			continue
+		}
+		for i := range r.Tables {
+			t := &r.Tables[i]
+			if ident := identOf(t); !t.Remote && len(ident) > 1 && strings.EqualFold(strings.Join(ident[:len(ident)-1], "."), schema) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// open reports whether r is not over: not completed, canceled, failed or
+// closed.
+func (r *Request) open() bool {
+	switch r.Status {
+	case StatusCompleted, StatusCanceled, StatusFailed, StatusClosed:
+		return false
+	}
+	return true
 }
 
 // Run carries the request id as far as it can go now. The scheduler runs it
@@ -447,12 +477,14 @@ func (s *Service) Run(ctx context.Context, id string) error {
 		return err
 	}
 	switch r.Status {
-	case StatusCompleted, StatusCanceled, StatusFailed:
+	case StatusCompleted, StatusCanceled, StatusFailed, StatusClosed:
 		s.unschedule(ctx, id)
 		return nil
 	case StatusHeld:
 		s.suspend(ctx, id)
 		return nil
+	case StatusBlocked:
+		r.takeUp()
 	}
 	r.Status, r.Error, r.WaitUntil = StatusRunning, "", time.Time{}
 	r.Attempts++
@@ -548,6 +580,20 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 	r.Failures++
 	var t terminalError
 	final := errors.As(err, &t) || r.Failures >= maxFailures
+	var te *tableError
+	if final && deleting(r) && errors.As(err, &te) {
+		// One table keeps failing: it is set aside (see block), and the
+		// others go on at once.
+		if i := slices.IndexFunc(r.Tables, func(t Table) bool { return t.Name == te.table && t.Blocked == "" }); i >= 0 {
+			if berr := s.block(ctx, r, &r.Tables[i], te.err); berr != nil {
+				s.log.Warn("could not save an erasure request", "request", r.ID, "err", berr)
+			}
+			r.Failures = 0
+			r.Status, r.WaitUntil = StatusRetrying, s.now().Add(contentionWait)
+			s.wake(ctx, r.ID, r.WaitUntil)
+			return
+		}
+	}
 	if final && deleting(r) {
 		// Once it sent a DELETE, a request never fails: failing would
 		// forget whose rows it deleted while their files may still hold
@@ -671,6 +717,14 @@ func (s *Service) advance(ctx context.Context, r *Request, lease tasks.Lease) er
 		if r.Status == StatusWaiting {
 			return nil
 		}
+		if aside := r.setAside(); next == StepDone && len(aside) > 0 {
+			// The other tables went through every step; the request is
+			// blocked, and takes those set aside up again (see takeUp).
+			r.ran(step, started, s.now())
+			r.Step = r.resume()
+			return terminal(fmt.Errorf("the request went through every step with its other tables, but set aside %s; it takes them up again "+
+				"every hour, and an admin can close it (CLOSE ERASURE REQUEST) if what stops it will not be fixed", strings.Join(aside, "; ")))
+		}
 		r.ran(step, started, s.now())
 		r.Step, r.Failures = next, 0
 		if err := s.save(ctx, r); err != nil {
@@ -710,6 +764,47 @@ func (s *Service) step(ctx context.Context, r *Request) (string, error) {
 		err = fmt.Errorf("unknown step %q", r.Step)
 	}
 	return next, err
+}
+
+// Close ends a blocked request without finishing it: the last resort, for
+// an admin who decides that what blocks it will not be fixed, as a table
+// another engine dropped or upgraded to format version 3, and that
+// keeping the person's identifiers sealed for it serves no one. What it
+// erased stays erased; each table it did not finish with records why
+// (Left), and who closed it is recorded; it forgets its identifiers, as a
+// completed request does, and the log says what it left. Its callers
+// allow admins only; requesters and holders of ERASE cannot close a
+// request, as they cannot cancel one that has begun deleting.
+func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
+	return s.change(ctx, id, func(r *Request) error {
+		if r.Status != StatusBlocked {
+			return fmt.Errorf("%w: request %s is %s; only a blocked request can be closed", ErrInvalid, id, r.Status)
+		}
+		why := r.Error
+		var left []string
+		for i := range r.Tables {
+			t := &r.Tables[i]
+			switch {
+			case t.Remote:
+				continue
+			case t.Blocked != "":
+				t.Left = t.Blocked
+			case t.Steps[StepVerify].IsZero():
+				t.Left = fmt.Sprintf("the request was closed at its %s step before it finished with the table: %s", r.Step, why)
+			default:
+				continue
+			}
+			left = append(left, t.Name)
+		}
+		r.Status, r.ClosedBy, r.Completed = StatusClosed, by, s.now()
+		r.Error = "closed by " + by + " while blocked: " + why
+		s.dropBranches(ctx, r)
+		s.end(ctx, r)
+		s.unschedule(ctx, id)
+		s.log.Warn("erasure request closed while blocked: it forgot its identifiers, and what it did not erase stays",
+			"request", id, "by", by, "step", r.Step, "tables_left", strings.Join(left, ", "), "err", why)
+		return nil
+	})
 }
 
 // Cancel cancels a request that has not begun deleting.
@@ -769,8 +864,7 @@ func (s *Service) change(ctx context.Context, id string, fn func(r *Request) err
 	if err != nil {
 		return nil, err
 	}
-	switch r.Status {
-	case StatusCompleted, StatusCanceled, StatusFailed:
+	if !r.open() {
 		return nil, fmt.Errorf("%w: request %s is %s", ErrInvalid, id, r.Status)
 	}
 	if err := fn(r); err != nil {
@@ -791,6 +885,47 @@ func deleting(r *Request) bool {
 func (s *Service) save(ctx context.Context, r *Request) error {
 	r.Updated = s.now()
 	return s.opts.Store.Save(ctx, r)
+}
+
+// setAside describes the tables r set aside (see Service.block): each
+// one's name, the step it stopped at and why.
+func (r *Request) setAside() []string {
+	var out []string
+	for _, t := range r.Tables {
+		if t.Blocked != "" {
+			out = append(out, fmt.Sprintf("%s (at its %s step: %s)", t.Name, t.BlockedAt, t.Blocked))
+		}
+	}
+	return out
+}
+
+// resume is the step r goes on from to take up the tables it set aside:
+// the earliest one of them stopped at, or r's own step if that is earlier.
+func (r *Request) resume() string {
+	at := slices.Index(steps, r.Step)
+	for _, t := range r.Tables {
+		if j := slices.Index(steps, t.BlockedAt); t.Blocked != "" && j >= 0 && (at < 0 || j < at) {
+			at = j
+		}
+	}
+	if at < 0 {
+		return r.Step
+	}
+	return steps[at]
+}
+
+// takeUp has a blocked request take up the tables it set aside again,
+// from the step it goes on from (see resume), every blockedWait, so that
+// it goes on once someone fixed what blocked them. They get one try each
+// time: one that fails again is set aside again at once (see failed).
+func (r *Request) takeUp() {
+	r.Step = r.resume()
+	for i := range r.Tables {
+		if r.Tables[i].Blocked != "" {
+			r.Failures = max(r.Failures, maxFailures-1)
+		}
+		r.Tables[i].Blocked, r.Tables[i].BlockedAt = "", ""
+	}
 }
 
 // wait has r wait until at before it goes on.

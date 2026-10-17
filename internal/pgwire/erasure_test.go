@@ -278,13 +278,9 @@ func TestFormatVersionWhileErasing(t *testing.T) {
 		"SELECT * FROM set_iceberg_table_properties(lake.public.people, {'format-version': '3'})":        {"lake", "public", "people"},
 		`SELECT * FROM SET_ICEBERG_TABLE_PROPERTIES ( "lake".public."People" , {'format-version': '3'})`: {"lake", "public", "People"},
 	} {
-		m := propertyCall.FindAllStringSubmatch(sql, -1)
-		if len(m) != 1 {
-			t.Errorf("%s: %q", sql, m)
-			continue
-		}
-		if name, ok := (&scanner{s: m[0][1]}).name(); !ok || !slices.Equal(name, want) {
-			t.Errorf("%s: names %q", sql, name)
+		calls := propertyCalls(sql)
+		if len(calls) != 1 || !slices.Equal(calls[0].table, want) || !calls[0].literal || !slices.Equal(calls[0].keys, []string{"format-version"}) {
+			t.Errorf("%s: %+v", sql, calls)
 		}
 	}
 	if _, err := cs.admin.Exec(ctx, "CANCEL ERASURE REQUEST '"+id+"'"); err != nil {

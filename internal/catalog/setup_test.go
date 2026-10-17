@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,6 +24,20 @@ type fakeLakekeeper struct {
 	warehouses   map[string]map[string]any
 	unavailable  int // answer this many requests with 503 first
 	conflict     bool
+	// legacy is a Lakekeeper older than 0.13, without format-version
+	// policies; refusePolicy refuses to change one.
+	legacy, refusePolicy bool
+	// policies counts the format-version policies set.
+	policies int
+}
+
+// allowed are the format versions warehouse name allows, as Lakekeeper
+// reports them: all of them unless a policy says otherwise.
+func (f *fakeLakekeeper) allowed(name string) []any {
+	if a, ok := f.warehouses[name]["allowed-format-versions"].([]any); ok {
+		return a
+	}
+	return []any{1, 2, 3}
 }
 
 func (f *fakeLakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -48,9 +63,30 @@ func (f *fakeLakekeeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/management/v1/warehouse":
 		var list []map[string]any
 		for name, req := range f.warehouses {
-			list = append(list, map[string]any{"name": name, "storage-profile": req["storage-profile"]})
+			w := map[string]any{"name": name, "storage-profile": req["storage-profile"], "warehouse-id": "id-" + name}
+			if !f.legacy {
+				w["allowed-format-versions"] = f.allowed(name)
+			}
+			list = append(list, w)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"warehouses": list})
+
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/format-version-policy") && !f.legacy:
+		name := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/format-version-policy"), "/management/v1/warehouse/id-")
+		if f.warehouses[name] == nil || f.refusePolicy {
+			http.Error(w, `{"error":{"code":403,"type":"Forbidden"}}`, http.StatusForbidden)
+			return
+		}
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var allowed []any
+		for _, v := range req["allowed-format-versions"].([]any) {
+			allowed = append(allowed, int(v.(float64)))
+		}
+		f.warehouses[name]["allowed-format-versions"] = allowed
+		f.warehouses[name]["default-format-version"] = req["default-format-version"]
+		f.policies++
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": name})
 
 	case r.Method == http.MethodPost && r.URL.Path == "/management/v1/warehouse":
 		if f.conflict {
@@ -108,6 +144,36 @@ func TestSetupCreatesWarehouseOnce(t *testing.T) {
 	cred := req["storage-credential"].(map[string]any)
 	if cred["credential-type"] != "access-key" || cred["access-key-id"] != "k" {
 		t.Errorf("unexpected credential: %v", cred)
+	}
+}
+
+// The warehouse allows tables of format version 1 and 2 only, which
+// erasure requests can rewrite, whether Setup created it or found it, by
+// Lakekeeper's format-version policy; a Lakekeeper without one, or that
+// refuses to change it, does not stop Igloo.
+func TestSetupCapsFormatVersions(t *testing.T) {
+	fake := &fakeLakekeeper{warehouses: map[string]map[string]any{}}
+	for i := 0; i < 2; i++ {
+		if err := setupAgainst(t, fake, s3Storage); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+	}
+	w := fake.warehouses["igloo"]
+	if got := fmt.Sprint(w["allowed-format-versions"]); got != "[1 2]" || w["default-format-version"] != float64(2) || fake.policies != 1 {
+		t.Errorf("allowed %s, default %v, policies set %d", got, w["default-format-version"], fake.policies)
+	}
+	// A warehouse made before allows version 3 until Setup runs.
+	fake.warehouses["igloo"]["allowed-format-versions"] = []any{1, 2, 3}
+	if err := setupAgainst(t, fake, s3Storage); err != nil || fmt.Sprint(fake.allowed("igloo")) != "[1 2]" || fake.policies != 2 {
+		t.Errorf("an existing warehouse: %v, allowed %v", err, fake.allowed("igloo"))
+	}
+	for _, f := range []*fakeLakekeeper{
+		{warehouses: map[string]map[string]any{}, legacy: true},
+		{warehouses: map[string]map[string]any{}, refusePolicy: true},
+	} {
+		if err := setupAgainst(t, f, s3Storage); err != nil || len(f.warehouses) != 1 || f.policies != 0 {
+			t.Errorf("legacy %v, refusing %v: %v, %d policies", f.legacy, f.refusePolicy, err, f.policies)
+		}
 	}
 }
 

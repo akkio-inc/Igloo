@@ -738,8 +738,9 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	// Tags and data retentions follow names too, policies or not: a
 	// renamed table would escape erasure (see package erasure).
 	checked := false
-	if s.erasure != nil && formatVersion.MatchString(query) {
-		ran, err := s.checkErasingFormat(ctx, sess, t, query)
+	ddl := t == duckdb.STATEMENT_TYPE_DROP || t == duckdb.STATEMENT_TYPE_ALTER || t == duckdb.STATEMENT_TYPE_CREATE
+	if (s.erasure != nil || snap.Classified()) && (ddl || propertyFunction.MatchString(query)) {
+		ran, err := s.checkErasingDDL(ctx, sess, snap, t, query)
 		checked = checked || ran
 		if err != nil {
 			return "", nil, checked, err
@@ -1110,53 +1111,303 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 // what follows ALTER TABLE's name, or in CREATE TABLE's options.
 var formatVersion = regexp.MustCompile(`(?i)format[-_]version`)
 
-// propertyCall finds the table that a call of a table property function
-// names, as its first argument.
-var propertyCall = regexp.MustCompile(`(?i)\b(?:set|remove)_iceberg_table_properties\s*\(\s*([^,)]*)`)
+// propertyFunction finds calls of set_iceberg_table_properties.
+var propertyFunction = regexp.MustCompile(`(?i)(?:\bset_iceberg_table_properties|"set_iceberg_table_properties")\s*\(`)
 
-// checkErasingFormat refuses a statement that may change the Iceberg
-// format version of a table an erasure request erases from (see
-// erasure.Service.Erasing), whether its columns have tags or not: ALTER
-// TABLE, CREATE OR REPLACE TABLE, or a table property function. Erasure
-// requests cannot rewrite tables of version 3 yet, and one that has begun
-// deleting from the table could not go on. It reports whether it ran
-// statements on the session's connection.
-func (s *Server) checkErasingFormat(ctx context.Context, sess *session, t duckdb.StmtType, query string) (bool, error) {
-	var names [][]string
-	switch t {
-	case duckdb.STATEMENT_TYPE_ALTER:
-		sc := &scanner{s: query}
-		if sc.keywords("ALTER", "TABLE") {
-			if name, ok := sc.alterTarget(); ok && formatVersion.MatchString(sc.rest()) {
-				names = append(names, name)
+// propertyCall is a call of set_iceberg_table_properties: the table its
+// first argument names, or nil if it names none Igloo can read, and the
+// properties it sets, if it gives them, and their values, as literals:
+// literal is false for a key or value computed, or bound as a parameter.
+type propertyCall struct {
+	table   []string
+	keys    []string
+	literal bool
+}
+
+// propertyCalls are query's calls of set_iceberg_table_properties.
+func propertyCalls(query string) []propertyCall {
+	var out []propertyCall
+	for _, m := range propertyFunction.FindAllStringIndex(query, -1) {
+		sc := &scanner{s: query, i: m[1]}
+		var c propertyCall
+		if name, ok := sc.name(); ok && sc.punct(',') {
+			c.table = name
+			c.keys, c.literal = sc.literalMap()
+			c.literal = c.literal && sc.punct(')')
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// literalMap reads a map of literals, as {'key': 'value', ...} or MAP {...},
+// and returns its keys; ok is false for anything else.
+func (sc *scanner) literalMap() (keys []string, ok bool) {
+	sc.keywords("MAP")
+	if !sc.punct('{') {
+		return nil, false
+	}
+	if sc.punct('}') {
+		return nil, true
+	}
+	for {
+		k, ok := sc.literal()
+		if !ok || k == nil || !sc.punct(':') || !sc.literalValue() {
+			return nil, false
+		}
+		keys = append(keys, *k)
+		if sc.punct('}') {
+			return keys, true
+		}
+		if !sc.punct(',') {
+			return nil, false
+		}
+	}
+}
+
+// literalValue reads a string, a number, TRUE, FALSE or NULL.
+func (sc *scanner) literalValue() bool {
+	if _, ok := sc.literal(); ok {
+		return true
+	}
+	if sc.keywords("TRUE") || sc.keywords("FALSE") {
+		return true
+	}
+	sc.skip()
+	start := sc.i
+	if sc.i < len(sc.s) && (sc.s[sc.i] == '-' || sc.s[sc.i] == '+') {
+		sc.i++
+	}
+	digits := 0
+	for sc.i < len(sc.s) && (sc.s[sc.i] >= '0' && sc.s[sc.i] <= '9' || sc.s[sc.i] == '.') {
+		sc.i++
+		digits++
+	}
+	if digits == 0 {
+		sc.i = start
+		return false
+	}
+	return true
+}
+
+// catalogTarget is the catalog table a name written in a DDL statement
+// creates or drops, existing or not: as DuckDB resolves such a name, in
+// the session's current schema when it is not qualified. ok is false for a
+// name in another database, or a temporary table.
+func (s *Server) catalogTarget(ctx context.Context, sess *session, parts []string) (auth.Object, bool, error) {
+	catalogName := s.catalogName()
+	switch len(parts) {
+	case 3:
+		return auth.Object{Schema: parts[1], Table: parts[2]}, strings.EqualFold(parts[0], catalogName), nil
+	case 2:
+		switch strings.ToLower(parts[0]) {
+		case "temp", "system", strings.ToLower(s.engine.LocalDatabase()):
+			return auth.Object{}, false, nil
+		}
+		return auth.Object{Schema: parts[0], Table: parts[1]}, true, nil
+	case 1:
+		if temp, err := isTemporary(ctx, sess.conn, parts[0]); err != nil || temp {
+			return auth.Object{}, false, err
+		}
+		db, current, err := currentSchema(ctx, sess.conn)
+		if err != nil {
+			return auth.Object{}, false, err
+		}
+		return auth.Object{Schema: current, Table: parts[0]}, strings.EqualFold(db, catalogName), nil
+	}
+	return auth.Object{}, false, nil
+}
+
+// targets are the catalog tables a name in a DDL statement may mean: the
+// one DuckDB creates or drops under it, and those it resolves to along the
+// session's path.
+func (s *Server) targets(ctx context.Context, sess *session, name []string) ([]auth.Object, error) {
+	objects, err := s.catalogCandidates(ctx, sess, name, false)
+	if err != nil {
+		return nil, err
+	}
+	o, ok, err := s.catalogTarget(ctx, sess, name)
+	if err != nil {
+		return nil, err
+	}
+	if ok && !slices.ContainsFunc(objects, func(c auth.Object) bool { return strings.EqualFold(c.String(), o.String()) }) {
+		objects = append(objects, o)
+	}
+	return objects, nil
+}
+
+// erasing reports whether an erasure request that is not over erases from
+// table o (see erasure.Service.Erasing).
+func (s *Server) erasing(ctx context.Context, o auth.Object) (bool, error) {
+	if s.erasure == nil {
+		return false, nil
+	}
+	erasing, err := s.erasure.Erasing(ctx, o.Schema, o.Table)
+	if err != nil {
+		return false, fmt.Errorf("check whether an erasure request erases from %s: %w", o, err)
+	}
+	return erasing, nil
+}
+
+// checkErasingDDL refuses what would take a table out of reach of an
+// erasure request that is not over, or make a table one that requests
+// cannot rewrite, admins included: dropping a table the request erases
+// from, or the schema that holds it; renaming it, or another table to its
+// name, which the request would take for it; upgrading it to Iceberg format
+// version 3 (ALTER TABLE, CREATE OR REPLACE TABLE), or creating a table of
+// version 3 under its name or a tagged table's; and setting properties of
+// it or of a tagged table, or of a table Igloo cannot tell, but by keys
+// and values written as literals, none of them format-version. The catalog
+// refuses version 3 too (see package catalog), but not every catalog
+// Igloo runs on does. It reports whether it ran statements on the
+// session's connection.
+func (s *Server) checkErasingDDL(ctx context.Context, sess *session, snap *policy.Snapshot, t duckdb.StmtType, query string) (bool, error) {
+	ran := false
+	resolve := func(name []string) ([]auth.Object, error) {
+		ran = true
+		return s.targets(ctx, sess, name)
+	}
+	// refuse refuses o with reason if an open request erases from it.
+	refuse := func(name []string, reason string) error {
+		objects, err := resolve(name)
+		if err != nil {
+			return err
+		}
+		for _, o := range objects {
+			if erasing, err := s.erasing(ctx, o); err != nil {
+				return err
+			} else if erasing {
+				return denied("an erasure request erases from %s; "+reason, o)
 			}
 		}
-	case duckdb.STATEMENT_TYPE_CREATE:
-		if r, ok := parseTableReplace(query); ok && formatVersion.MatchString(r.rest) {
-			names = append(names, r.target)
-		}
+		return nil
 	}
-	for _, m := range propertyCall.FindAllStringSubmatch(query, -1) {
-		if name, ok := (&scanner{s: m[1]}).name(); ok {
-			names = append(names, name)
+	sc := &scanner{s: query}
+	switch {
+	case t == duckdb.STATEMENT_TYPE_DROP && sc.keywords("DROP", "TABLE"):
+		sc.keywords("IF", "EXISTS")
+		for {
+			name, ok := sc.name()
+			if !ok {
+				break
+			}
+			if err := refuse(name, "it cannot be dropped until the request is over"); err != nil {
+				return ran, err
+			}
+			if !sc.punct(',') {
+				break
+			}
 		}
-	}
-	ran := false
-	for _, name := range names {
-		objects, err := s.catalogCandidates(ctx, sess, name, false)
-		ran = true
+	case t == duckdb.STATEMENT_TYPE_DROP && sc.keywords("DROP", "SCHEMA"):
+		sc.keywords("IF", "EXISTS")
+		name, ok := sc.name()
+		if ok && s.erasure != nil && (len(name) == 1 || len(name) == 2 && strings.EqualFold(name[0], s.catalogName())) {
+			erasing, err := s.erasure.ErasingIn(ctx, name[len(name)-1])
+			if err != nil {
+				return ran, fmt.Errorf("check whether an erasure request erases from a table of %s: %w", name[len(name)-1], err)
+			}
+			if erasing {
+				return ran, denied("an erasure request erases from a table of schema %s, which cannot be dropped until the request is over", name[len(name)-1])
+			}
+		}
+	case t == duckdb.STATEMENT_TYPE_ALTER && sc.keywords("ALTER", "TABLE"):
+		name, ok := sc.alterTarget()
+		if !ok {
+			break
+		}
+		var to func(o auth.Object) auth.Object
+		switch {
+		case sc.keywords("RENAME", "TO"):
+			if n, ok := sc.name(); ok {
+				to = func(o auth.Object) auth.Object { return auth.Object{Schema: o.Schema, Table: n[len(n)-1]} }
+			}
+		case sc.keywords("SET", "SCHEMA"):
+			if n, ok := sc.name(); ok {
+				to = func(o auth.Object) auth.Object { return auth.Object{Schema: n[len(n)-1], Table: o.Table} }
+			}
+		case formatVersion.MatchString(sc.rest()):
+			return ran, refuse(name, "it stays at its Iceberg format version until the request is over, as erasure requests "+
+				"cannot rewrite tables of version 3 yet")
+		default:
+			return ran, nil
+		}
+		if err := refuse(name, "it cannot be renamed or moved until the request is over"); err != nil {
+			return ran, err
+		}
+		if to == nil {
+			break
+		}
+		objects, err := resolve(name)
 		if err != nil {
 			return ran, err
 		}
 		for _, o := range objects {
-			erasing, err := s.erasure.Erasing(ctx, o.Schema, o.Table)
-			if err != nil {
-				return ran, fmt.Errorf("check whether an erasure request erases from %s: %w", o, err)
+			dest := to(o)
+			if erasing, err := s.erasing(ctx, dest); err != nil {
+				return ran, err
+			} else if erasing {
+				return ran, denied("an erasure request erases from %s; no other table can take its name until the request is over", dest)
 			}
-			if erasing {
-				return ran, denied("an erasure request erases from %s; it stays at its Iceberg format version until the request is over, "+
+		}
+	case t == duckdb.STATEMENT_TYPE_CREATE:
+		replace := sc.keywords("CREATE", "OR", "REPLACE", "TABLE")
+		if !replace && !sc.keywords("CREATE", "TABLE") {
+			break
+		}
+		sc.keywords("IF", "NOT", "EXISTS")
+		name, ok := sc.name()
+		if !ok || !formatVersion.MatchString(sc.rest()) {
+			break
+		}
+		objects, err := resolve(name)
+		if err != nil {
+			return ran, err
+		}
+		for _, o := range objects {
+			erasing, err := s.erasing(ctx, o)
+			if err != nil {
+				return ran, err
+			}
+			if erasing || snap.Tagged(o.Schema, o.Table) != nil {
+				return ran, denied("%s has tags, or an erasure request erases from it; a table under its name stays at Iceberg format version 2, "+
 					"as erasure requests cannot rewrite tables of version 3 yet", o)
 			}
+		}
+	}
+	for _, c := range propertyCalls(query) {
+		version := slices.ContainsFunc(c.keys, func(k string) bool { return formatVersion.MatchString(k) })
+		if c.literal && !version {
+			continue
+		}
+		protected := c.table == nil
+		var target auth.Object
+		if c.table != nil {
+			objects, err := resolve(c.table)
+			if err != nil {
+				return ran, err
+			}
+			for _, o := range objects {
+				erasing, err := s.erasing(ctx, o)
+				if err != nil {
+					return ran, err
+				}
+				if erasing || snap.Tagged(o.Schema, o.Table) != nil {
+					protected, target = true, o
+					break
+				}
+			}
+		}
+		switch {
+		case !protected:
+		case c.table == nil:
+			return ran, denied("set_iceberg_table_properties must name its table directly, and its properties and values as literals, none of them format-version: " +
+				"Igloo checks that no table with tags, or that an erasure request erases from, changes its Iceberg format version")
+		case version:
+			return ran, denied("%s has tags, or an erasure request erases from it; it stays at Iceberg format version 2, "+
+				"as erasure requests cannot rewrite tables of version 3 yet", target)
+		default:
+			return ran, denied("%s has tags, or an erasure request erases from it: set_iceberg_table_properties must name its properties and values "+
+				"as literals, so that Igloo can tell that none changes its Iceberg format version", target)
 		}
 	}
 	return ran, nil

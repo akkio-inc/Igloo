@@ -252,7 +252,7 @@ func supported(t *Table, tbl *table.Table) error {
 	if v := tbl.Metadata().Version(); v >= 3 {
 		return fmt.Errorf("%w: %s is an Iceberg table of format version %d, which can hold deletion vectors that Igloo cannot read yet, "+
 			"so it could delete the rows but not rewrite the files that hold them; erase from it in an engine that reads them, "+
-			"and untag it until then", ErrInvalid, t.Name, v)
+			"and untag it until then (an admin can close a request it blocks)", ErrInvalid, t.Name, v)
 	}
 	return nil
 }
@@ -297,9 +297,10 @@ func (s *Service) erasable(ctx context.Context, t *Table, tbl *table.Table) erro
 		if err := checkFields(t, fields(view, t)); err != nil {
 			return fmt.Errorf("%s %s of %s, as its snapshot's schema has it: %w", kind, name, t.Name, err)
 		}
-		specs := map[int]bool{}
+		specs, listed := map[int]bool{}, map[int]bool{}
 		for _, m := range tf.manifests[ref.SnapshotID] {
 			for _, e := range tf.entries[m] {
+				listed[int(e.file.SpecID())] = true
 				if e.live() && e.file.ContentType() == iceberg.EntryContentData {
 					specs[int(e.file.SpecID())] = true
 				}
@@ -311,8 +312,27 @@ func (s *Service) erasable(ctx context.Context, t *Table, tbl *table.Table) erro
 					"and make the request again", kind, name, t.Name, err, kind)
 			}
 		}
+		// A manifest the rewrite writes again keeps its files' partition
+		// values only with a schema that has the columns its spec
+		// partitions by (see iceberg-go's partitionSchema).
+		for _, id := range slices.Sorted(maps.Keys(listed)) {
+			if !specColumns(tbl, id) {
+				return fmt.Errorf("%w: %s %s of %s lists files of partition spec %d, which partitions by a column none of the table's "+
+					"schemas has, so the request could not write its manifests again without losing their partition values", ErrInvalid, kind, name, t.Name, id)
+			}
+		}
 	}
 	return nil
+}
+
+// specColumns reports whether one of tbl's schemas has every column its
+// partition spec id partitions by.
+func specColumns(tbl *table.Table, id int) bool {
+	spec := tbl.Metadata().PartitionSpecByID(id)
+	if spec == nil {
+		return false
+	}
+	return slices.ContainsFunc(tbl.Metadata().Schemas(), func(s *iceberg.Schema) bool { return table.HasSourceColumns(*spec, s) })
 }
 
 // identifierType reports whether values of type t compare as identifiers do:

@@ -8,7 +8,6 @@ import (
 	"io"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
@@ -37,7 +36,7 @@ type catalogRows struct {
 }
 
 // maxCommitRetries bounds how often a DELETE that loses a commit race with
-// another writer is run again, as Igloo does for clients.
+// another writer is sent, as Igloo does for clients (see deleteFrom).
 const maxCommitRetries = 20
 
 func (c catalogRows) name(tbl *table.Table) string {
@@ -48,28 +47,19 @@ func (c catalogRows) name(tbl *table.Table) string {
 	return strings.Join(parts, ".")
 }
 
+// Delete sends one DELETE: one that loses a commit race is sent again by
+// the delete step, on the table loaded and checked again (see deleteFrom).
 func (c catalogRows) Delete(ctx context.Context, tbl *table.Table, cond string) (int64, error) {
 	conn, err := c.engine.Connect(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer conn.Close() //nolint:errcheck
-	backoff := 20 * time.Millisecond
-	for attempt := 0; ; attempt++ {
-		res, err := conn.ExecContext(ctx, "DELETE FROM "+c.name(tbl)+" WHERE "+cond, nil)
-		if err == nil {
-			return res.RowsAffected()
-		}
-		if !commitConflict(err) || attempt == maxCommitRetries {
-			return 0, err
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(backoff):
-		}
-		backoff = min(2*backoff, time.Second)
+	res, err := conn.ExecContext(ctx, "DELETE FROM "+c.name(tbl)+" WHERE "+cond, nil)
+	if err != nil {
+		return 0, err
 	}
+	return res.RowsAffected()
 }
 
 func (c catalogRows) Count(ctx context.Context, tbl *table.Table, cond string) (int64, error) {

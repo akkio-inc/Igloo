@@ -260,6 +260,7 @@ ERASE SUBJECT WHERE pii.email = 'ann@example.com' OR pii.device_id IN ('6F9619FF
 SHOW ERASURE REQUESTS;                       -- or SELECT * FROM igloo.erasure_requests
 CONFIRM ERASURE REQUEST '01a14588-...';      -- one held because it would delete much of a table; not by its requester
 CANCEL ERASURE REQUEST '01a14588-...';       -- one that has not begun deleting
+CLOSE ERASURE REQUEST '01a14588-...';        -- admins only: the last resort for a blocked one
 ALTER TABLE marts.impressions SET (data_retention_days = 30);
 ALTER TABLE marts.impressions RESET (data_retention_days);
 SELECT * FROM igloo.data_retention;
