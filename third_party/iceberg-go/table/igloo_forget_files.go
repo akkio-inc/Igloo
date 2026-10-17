@@ -70,8 +70,9 @@ func (f *forgetFiles) deletedEntries(context.Context) ([]iceberg.ManifestEntry, 
 	return nil, nil
 }
 
-// validate is a no-op: the commit changes no data, and its requirement on
-// the branch head refuses it if another commit came first.
+// validate is a no-op: the commit changes no data, and, as a replace, it
+// is never retried (see retriable), so its requirement on the branch
+// head refuses it if another commit came first.
 func (f *forgetFiles) validate(*conflictContext) error { return nil }
 
 func (f *forgetFiles) needsValidation() bool { return false }
