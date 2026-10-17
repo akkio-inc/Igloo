@@ -24,15 +24,15 @@ X = 850  # left edge of the text
 
 # Text, size (px), weight, optical size, tracking (em), baseline (px).
 LINES = [
-    ("Igloo", 152, 700, 32, -0.025, 198),
-    ("Open source SQL warehouse on Apache Iceberg", 47, 400, 32, -0.005, 308),
-    ("5x faster • 30x cheaper per query*", 60, 700, 32, -0.01, 392),
-    ("*at 10GB query scale, exact speedup and cost reduction will vary", 28, 450, 14, 0.0, 447),
+    ("Igloo", 152, 700, 32, -0.025, 190),
+    ("Open source SQL warehouse on Apache Iceberg", 45, 400, 32, -0.005, 333),
+    ("5x faster • 30x cheaper per query*", 57, 700, 32, -0.01, 406),
+    ("*at 10GB query scale, exact speedup and cost reduction will vary", 27, 450, 14, 0.0, 453),
 ]
 COLORS = {
     "light": ["#15203F", "#46557A", "#B26400", "#55627F"],
     # The lines below the wordmark sit on moonlit snow, so they stay dark.
-    "dark": ["#FFFFFF", "#2E3C60", "#9E5300", "#22304D"],
+    "dark": ["#FFFFFF", "#2E3C60", "#964E00", "#22304D"],
 }
 
 
