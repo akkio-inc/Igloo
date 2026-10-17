@@ -336,6 +336,9 @@ func (s *Service) prepare(ctx context.Context, wanted []Wanted) ([]Subject, erro
 		if err := checkFields(t, flds); err != nil {
 			return nil, err
 		}
+		if err := rewritable(t, tbl); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -462,14 +465,17 @@ func (e terminalError) Unwrap() error { return e.error }
 
 func terminal(err error) error { return terminalError{err} }
 
-// contentionError is a step that lost to other writers' commits more often
-// than it tries in one run: it tries again later, which does not count as
-// a failure, however long it takes.
+// contentionError is a step that cannot go on now for reasons outside the
+// request: it lost to other writers' commits more often than it tries in
+// one run, or the catalog could not answer. It tries again later, which
+// does not count as a failure, however long it takes.
 type contentionError struct{ error }
 
 func (e contentionError) Unwrap() error { return e.error }
 
 func contended(err error) error { return contentionError{err} }
+
+func unavailable(err error) error { return contentionError{err} }
 
 const (
 	// contentionWait is how long a request that lost to other writers
@@ -498,8 +504,8 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 		return
 	case errors.As(err, &c):
 		r.Status, r.WaitUntil = StatusRetrying, s.now().Add(contentionWait)
-		s.log.Warn("erasure request lost to other writers' commits; it tries again", "request", r.ID, "step", r.Step,
-			"in", contentionWait, "err", r.Error)
+		s.log.Warn("erasure request cannot go on now: other writers' commits came first, or the catalog could not answer; it tries again",
+			"request", r.ID, "step", r.Step, "in", contentionWait, "err", r.Error)
 		s.wake(ctx, r.ID, r.WaitUntil)
 		return
 	}

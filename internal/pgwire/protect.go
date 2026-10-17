@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1047,11 +1048,13 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 	if !ok {
 		return nil
 	}
-	var table, column bool
+	var table, column, version bool
 	var col string
 	switch {
 	case sc.keywords("RENAME", "TO"), sc.keywords("SET", "SCHEMA"):
 		table = true
+	case formatVersion.MatchString(sc.rest()):
+		version = true
 	case sc.keywords("RENAME", "COLUMN"), sc.keywords("RENAME"),
 		sc.keywords("ALTER", "COLUMN"), sc.keywords("ALTER"),
 		sc.keywords("DROP", "COLUMN"), sc.keywords("DROP"):
@@ -1076,6 +1079,9 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 		if table {
 			return denied("table %s has policies, tags or a data retention, which stay with its name; unset them before renaming it", o)
 		}
+		if version {
+			return denied("table %s has policies or tags; it stays at Iceberg format version 2, as erasure requests cannot rewrite tables of version 3 yet", o)
+		}
 		inFilter := rules.Filter != nil && slices.ContainsFunc(rules.Filter.Columns, func(c string) bool { return strings.EqualFold(c, col) })
 		if column && (rules.Column(col) != nil || inFilter) {
 			return denied("column %s of %s has a policy or tags, which stay with its name; unset them before renaming or dropping it or changing its type", col, o)
@@ -1084,14 +1090,21 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 	return nil
 }
 
+// formatVersion finds a change of a table's Iceberg format version in
+// what follows ALTER TABLE's name, or in CREATE TABLE's options.
+var formatVersion = regexp.MustCompile(`(?i)format[-_]version`)
+
 // checkReplaceKeeps refuses a CREATE OR REPLACE TABLE whose new table
 // lacks a column of the old one that has a policy or tags, or that its row
-// access policy reads: they follow names, so the column's values would be
-// left unmasked, or out of reach of erasure requests, under another name.
-// Keep the column, or unset them first. have are the new table's columns,
-// or nil to work them out from the statement: its query's, or its column
-// definitions'.
-func (s *Server) checkReplaceKeeps(ctx context.Context, sess *session, r tableReplace, have []string) error {
+// access policy reads, or gives one another kind of values (text, a UUID,
+// bytes, an integer, a date...): they follow names, so the column's values
+// would be left unmasked, or out of reach of erasure requests, under
+// another name, and identifiers would compare with them otherwise, or not
+// at all. Keep the column as it is, or unset them first. Nor may it make a
+// table with tags one of Iceberg format version 3, which erasure requests
+// cannot rewrite yet. have are the new table's columns, or nil to work
+// them out from the statement: its query's, or its column definitions'.
+func (s *Server) checkReplaceKeeps(ctx context.Context, sess *session, r tableReplace, have []columnType) error {
 	snap := s.gov.snapshot(ctx)
 	if !snap.Classified() {
 		return nil
@@ -1105,38 +1118,80 @@ func (s *Server) checkReplaceKeeps(ctx context.Context, sess *session, r tableRe
 		if rules == nil {
 			continue
 		}
+		if formatVersion.MatchString(r.rest) {
+			return denied("table %s has policies or tags; the table replacing it stays at Iceberg format version 2, "+
+				"as erasure requests cannot rewrite tables of version 3 yet", o)
+		}
 		if have == nil {
 			if have, err = s.replacementColumns(ctx, sess, r); err != nil {
 				return denied("%s has policies or tags, whose columns a table replacing it must keep, and Igloo cannot tell the new table's columns: %v", o, err)
 			}
+		}
+		old, err := describeTable(ctx, sess, quoteName(r.target))
+		if err != nil {
+			return err
 		}
 		keep := slices.Collect(maps.Keys(rules.Columns))
 		if rules.Filter != nil {
 			keep = append(keep, rules.Filter.Columns...)
 		}
 		slices.Sort(keep)
+		find := func(cols []columnType, name string) (columnType, bool) {
+			i := slices.IndexFunc(cols, func(c columnType) bool { return strings.EqualFold(c.name, name) })
+			if i < 0 {
+				return columnType{}, false
+			}
+			return cols[i], true
+		}
 		for _, col := range keep {
-			if !slices.ContainsFunc(have, func(h string) bool { return strings.EqualFold(h, col) }) {
+			now, ok := find(have, col)
+			if !ok {
 				return denied("column %s of %s has a policy or tags, which stay with its name, and the table replacing it has no column %[1]s: "+
 					"keep the column, or unset them first", col, o)
+			}
+			if was, ok := find(old, col); ok && valueKind(was.typ) != valueKind(now.typ) {
+				return denied("column %s of %s has a policy or tags, and the table replacing it makes it %s, from %s: "+
+					"keep its kind of values, or unset them first", col, o, now.typ, was.typ)
 			}
 		}
 	}
 	return nil
 }
 
+// valueKind is the kind of values a DuckDB type holds, as identifiers and
+// policies compare with them: text, a UUID, bytes, an integer, or the
+// type's own name.
+func valueKind(typ string) string {
+	word := strings.ToUpper(strings.TrimSpace(typ))
+	if i := strings.IndexAny(word, "( "); i >= 0 {
+		word = word[:i]
+	}
+	switch word {
+	case "VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR", "NVARCHAR":
+		return "text"
+	case "UUID":
+		return "uuid"
+	case "BLOB", "BYTEA", "BINARY", "VARBINARY":
+		return "bytes"
+	case "TINYINT", "SMALLINT", "INTEGER", "INT", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+		"INT1", "INT2", "INT4", "INT8", "LONG", "SHORT", "SIGNED":
+		return "integer"
+	}
+	return word
+}
+
 // replacementColumns are the columns of the table a CREATE OR REPLACE TABLE
-// makes: those its query returns, as DuckDB describes it, or those its
-// column definitions name.
-func (s *Server) replacementColumns(ctx context.Context, sess *session, r tableReplace) ([]string, error) {
+// makes, with their types: those its query returns, as DuckDB describes
+// it, or those its column definitions name.
+func (s *Server) replacementColumns(ctx context.Context, sess *session, r tableReplace) ([]columnType, error) {
 	sc := &scanner{s: r.rest}
 	if sc.keywords("AS") {
-		return queryStrings(ctx, sess, "SELECT column_name FROM (DESCRIBE "+strings.TrimRight(strings.TrimSpace(sc.rest()), ";")+")")
+		return describeTable(ctx, sess, strings.TrimRight(strings.TrimSpace(sc.rest()), ";"))
 	}
 	if !sc.punct('(') {
 		return nil, errors.New("no column definitions or query")
 	}
-	var cols []string
+	var cols []columnType
 	for {
 		switch {
 		case sc.keywords("CONSTRAINT"), sc.keywords("PRIMARY"), sc.keywords("UNIQUE"), sc.keywords("CHECK"), sc.keywords("FOREIGN"):
@@ -1145,7 +1200,7 @@ func (s *Server) replacementColumns(ctx context.Context, sess *session, r tableR
 			if !ok || len(name) != 1 {
 				return nil, errors.New("cannot read the column definitions")
 			}
-			cols = append(cols, name[0])
+			cols = append(cols, columnType{name[0], sc.word()})
 		}
 		last, err := skipDefinition(sc)
 		if err != nil || last {

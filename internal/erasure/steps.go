@@ -16,6 +16,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	icecat "github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"gocloud.dev/gcerrors"
@@ -46,10 +47,20 @@ const (
 	holdFraction = 0.01
 	holdRows     = 100
 	holdWindow   = 24 * time.Hour
+	// A request waits as long as countWait for the other requests made
+	// within holdWindow of it to count their rows, looking again every
+	// countRecheck, and is held after that.
+	countWait    = time.Hour
+	countRecheck = time.Minute
 	// stagedWait is how long a request waits for a snapshot staged by
 	// write-audit-publish that holds matching rows to be published or
-	// discarded, counted from when it was staged.
-	stagedWait = 7 * 24 * time.Hour
+	// discarded, counted from when the request was made: as long as
+	// maintenance keeps such a snapshot by default, or the table's
+	// history.expire.max-snapshot-age-ms if longer, but never more than
+	// stagedWaitMax, so that the request completes within the month the
+	// GDPR allows.
+	stagedWait    = 7 * 24 * time.Hour
+	stagedWaitMax = 21 * 24 * time.Hour
 	// stagedRecheck is how often a request that waits for one looks again.
 	stagedRecheck = 10 * time.Minute
 )
@@ -122,9 +133,22 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 	if r.ConfirmedBy != "" {
 		return nil
 	}
+	// The counts are saved first, so that requests that look at this one
+	// while it waits for them see its counts, and none waits for another
+	// that waits for it.
+	r.Counted = true
+	if err := s.save(ctx, r); err != nil {
+		return err
+	}
 	recent, err := s.recent(ctx, r)
 	if err != nil {
 		return err
+	}
+	var uncounted []string
+	for _, o := range recent {
+		if !counted(o) {
+			uncounted = append(uncounted, o.ID)
+		}
 	}
 	for _, t := range r.Tables {
 		if t.Remote {
@@ -134,10 +158,6 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 		// now, or will be.
 		matched, rows := t.Matched, t.Rows
 		for _, o := range recent {
-			if o.ConfirmedBy != "" {
-				// Someone other than its requester looked at it.
-				continue
-			}
 			for _, ot := range o.Tables {
 				if ot.Matched > 0 && sameTable(ot, t) {
 					matched += ot.Matched
@@ -154,11 +174,31 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 			return nil
 		}
 	}
+	if len(uncounted) == 0 {
+		return nil
+	}
+	// Requests made about when this one was that have yet to count their
+	// rows, as when they wait behind another, could take it over the hold
+	// once they do, whichever runs first: it waits for them, and is held
+	// if they still have not after countWait.
+	if r.CountWait.IsZero() {
+		r.CountWait = s.now()
+	}
+	if s.now().Sub(r.CountWait) >= countWait {
+		s.log.Warn("erasure request held: requests made about when it was have not counted their rows; "+
+			"someone other than its requester must CONFIRM ERASURE REQUEST for it to go on",
+			"request", r.ID, "requests", strings.Join(uncounted, ", "))
+		r.Status = StatusHeld
+		return nil
+	}
+	r.Error = "waiting: requests made within a day of this one have yet to count their rows, which its hold counts too: " +
+		strings.Join(uncounted, ", ")
+	r.wait(s.now().Add(countRecheck))
 	return nil
 }
 
-// recent are the requests other than r made within holdWindow before it,
-// but those canceled.
+// recent are the requests other than r made within holdWindow of it,
+// before or after, but those canceled and those someone confirmed.
 func (s *Service) recent(ctx context.Context, r *Request) ([]*Request, error) {
 	all, err := s.opts.Store.List(ctx)
 	if err != nil {
@@ -166,12 +206,17 @@ func (s *Service) recent(ctx context.Context, r *Request) ([]*Request, error) {
 	}
 	var out []*Request
 	for _, o := range all {
-		if o.ID != r.ID && o.Status != StatusCanceled && !o.Created.After(r.Created) && r.Created.Sub(o.Created) <= holdWindow {
+		d := r.Created.Sub(o.Created)
+		if o.ID != r.ID && o.Status != StatusCanceled && o.ConfirmedBy == "" && d <= holdWindow && d >= -holdWindow {
 			out = append(out, o)
 		}
 	}
 	return out, nil
 }
+
+// counted reports whether o counted the rows it matches: it did once it
+// went past the find step, in which it counts them.
+func counted(o *Request) bool { return o.Counted || o.Step != StepFind }
 
 // sameTable reports whether a and b are the same table: by UUID when both
 // know it, and otherwise by name.
@@ -214,6 +259,7 @@ func (s *Service) discover(ctx context.Context, r *Request) error {
 	if err != nil {
 		return err
 	}
+	families := map[string]map[string]bool{}
 	for _, l := range sources {
 		flds := fields(l.tbl, l.t)
 		if err := resolved(l.t, flds); err != nil {
@@ -221,6 +267,23 @@ func (s *Service) discover(ctx context.Context, r *Request) error {
 		}
 		if err := checkFields(l.t, flds); err != nil {
 			return err
+		}
+		for _, f := range flds {
+			key := f.Tag + "." + f.Value
+			if f.Digest != "" {
+				key += ":" + f.Digest
+			}
+			if families[key] == nil {
+				families[key] = map[string]bool{}
+			}
+			families[key][typeFamily(f.typ)] = true
+		}
+	}
+	for value, fams := range families {
+		if len(fams) > 1 {
+			s.log.Warn("an erasure request's tag value is on columns of different kinds of values; identifiers compare as text in each "+
+				"(UUIDs also as hex in binary columns), so one given in a form some of them do not hold finds nothing there",
+				"request", r.ID, "tag_value", value, "kinds", strings.Join(slices.Sorted(maps.Keys(fams)), ", "))
 		}
 	}
 	clones, err := s.clones(ctx, r, sources)
@@ -231,7 +294,25 @@ func (s *Service) discover(ctx context.Context, r *Request) error {
 	if r.Downstream, err = s.downstream(ctx, r); err != nil {
 		return fmt.Errorf("lineage: %w", err)
 	}
+	if err := s.rewritables(ctx, r); err != nil {
+		return err
+	}
 	return s.count(ctx, r)
+}
+
+// rewritables checks that every table of r can be rewritten (see
+// rewritable), as they are now, before the request deletes anything.
+func (s *Service) rewritables(ctx context.Context, r *Request) error {
+	tables, err := s.tables(ctx, r)
+	if err != nil {
+		return err
+	}
+	for _, l := range tables {
+		if err := rewritable(l.t, l.tbl); err != nil {
+			return terminal(err)
+		}
+	}
+	return nil
 }
 
 // tagged are the tables with columns tagged with subjects' tag values, by
@@ -309,6 +390,12 @@ func shares(tbl *table.Table) []string {
 	return locs
 }
 
+// refused reports whether err is the catalog refusing a table for good,
+// rather than failing to answer.
+func refused(err error) bool {
+	return errors.Is(err, rest.ErrForbidden) || errors.Is(err, rest.ErrUnauthorized) || errors.Is(err, rest.ErrBadRequest)
+}
+
 // uuids are the UUIDs of the request's tables that it loaded.
 func uuids(tables []loaded) map[string]bool {
 	out := map[string]bool{}
@@ -318,10 +405,14 @@ func uuids(tables []loaded) map[string]bool {
 	return out
 }
 
-// others loads the catalog's tables that are not among ours. One that
-// cannot be loaded is left out, and logged: nothing can read it either, so
-// deleting files it references breaks nothing that works, and one broken
-// table must not stop every request. One named as one of ours fails.
+// others loads the catalog's tables that are not among ours. One the
+// catalog refuses for good (forbidden, unauthorized, a bad request) is
+// left out, and logged: nothing can read it either, so deleting files it
+// references breaks nothing that works, and one broken table must not
+// stop every request. Any other error, as the catalog unavailable or
+// failing for a moment, stops the run, which tries again later without
+// counting it as a failure: leaving the table out could delete files it
+// references. One named as one of ours fails.
 func (s *Service) others(ctx context.Context, ours []loaded) ([]*table.Table, error) {
 	uuid := uuids(ours)
 	idents, err := s.opts.Catalog.Tables(ctx)
@@ -337,6 +428,9 @@ func (s *Service) others(ctx context.Context, ours []loaded) ([]*table.Table, er
 		if err != nil {
 			if slices.ContainsFunc(ours, func(l loaded) bool { return strings.EqualFold(l.t.Name, tableName(id)) }) {
 				return nil, fmt.Errorf("load %s: %w", tableName(id), err)
+			}
+			if !refused(err) {
+				return nil, unavailable(fmt.Errorf("load %s, to check whether it shares files with the request's tables: %w", tableName(id), err))
 			}
 			s.log.Warn("an erasure request could not load a table to check whether it shares files with the request's tables; it is left out",
 				"table", tableName(id), "err", err)
@@ -453,6 +547,11 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 		return err
 	}
 	if !r.DeleteStarted {
+		// A table that became one the request cannot rewrite since it found
+		// its tables stops it while it can still be canceled.
+		if err := s.rewritables(ctx, r); err != nil {
+			return err
+		}
 		// A DELETE whose answer is lost may have committed: from here on,
 		// the request cannot be canceled.
 		r.DeleteStarted = true
@@ -577,25 +676,67 @@ func (s *Service) record(ctx context.Context, r *Request, t *Table, kind string,
 // listings lists the files under the locations of a request's tables,
 // each once.
 type listings struct {
-	fsys      iceio.IO
+	ctx       context.Context
+	io        *fileIO
 	locations []string
 	// listed are the files under each location, by canonical path.
 	listed map[string]map[string]time.Time
 }
 
-func newListings(ctx context.Context, tables []loaded) (*listings, error) {
-	l := &listings{listed: map[string]map[string]time.Time{}}
+func newListings(ctx context.Context, tables []loaded, warehouse string) (*listings, error) {
+	l := &listings{ctx: ctx, io: newFileIO(tables, warehouse), listed: map[string]map[string]time.Time{}}
 	for _, t := range tables {
 		l.locations = append(l.locations, t.tbl.Location())
 	}
-	if len(tables) > 0 {
-		fsys, err := tables[0].tbl.FS(ctx)
-		if err != nil {
-			return nil, err
-		}
-		l.fsys = fsys
-	}
 	return l, nil
+}
+
+// fileIO opens the file IO of a request's tables, each once, and picks
+// the one a path is read, listed or deleted with: that of the table whose
+// location holds it, or, for a path under none, as the warehouse's sharing
+// copies are, that of a table in the warehouse. A table's IO carries the
+// endpoint and credentials of its own location, which another's may not
+// reach, as for tables in other buckets.
+type fileIO struct {
+	tables    []loaded
+	warehouse string
+	open      map[*table.Table]iceio.IO
+}
+
+func newFileIO(tables []loaded, warehouse string) *fileIO {
+	return &fileIO{tables: tables, warehouse: warehouse, open: map[*table.Table]iceio.IO{}}
+}
+
+func (x *fileIO) forPath(ctx context.Context, p string) (iceio.IO, error) {
+	var (
+		best *table.Table
+		size = -1
+	)
+	for _, l := range x.tables {
+		if loc := canonical(l.tbl.Location()); (within(p, loc) || canonical(p) == loc) && len(loc) > size {
+			best, size = l.tbl, len(loc)
+		}
+	}
+	for _, l := range x.tables {
+		if best == nil && within(l.tbl.Location(), x.warehouse) {
+			best = l.tbl
+		}
+	}
+	if best == nil {
+		if len(x.tables) == 0 {
+			return nil, errors.New("none of the request's tables exists to reach files through")
+		}
+		best = x.tables[0].tbl
+	}
+	if fsys, ok := x.open[best]; ok {
+		return fsys, nil
+	}
+	fsys, err := best.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	x.open[best] = fsys
+	return fsys, nil
 }
 
 // list lists the files under dir.
@@ -603,7 +744,11 @@ func (l *listings) list(dir string) (map[string]time.Time, error) {
 	if files, ok := l.listed[dir]; ok {
 		return files, nil
 	}
-	listed, err := listFiles(l.fsys, dir)
+	fsys, err := l.io.forPath(l.ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	listed, err := listFiles(fsys, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -657,10 +802,25 @@ func (s *Service) bad(ctx context.Context, r *Request, t *Table, tf *tableFiles,
 			}
 		}
 	}
-	matched, err := s.matchingFiles(ctx, r.salt, paths, scanColumns(flds, r.Subjects))
+	cols := scanColumns(flds, r.Subjects)
+	matched, err := s.matchingFiles(ctx, r.salt, paths, cols)
 	if err != nil {
 		return nil, err
 	}
+	// Position delete files that hold the person's rows (see rewriteRef).
+	var deletes []string
+	for _, p := range positionDeletes(tf.live(false)) {
+		if exists, err := l.exists(p); err != nil {
+			return nil, err
+		} else if exists && !known.has(p) {
+			deletes = append(deletes, p)
+		}
+	}
+	held, err := s.matchingDeleteRows(ctx, r.salt, deletes, cols)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(matched, held)
 	found := slices.Collect(maps.Keys(matched))
 	for p := range tf.boundMatches(newMatcher(r), flds) {
 		if !scanned[p] && !known.has(p) {
@@ -685,7 +845,7 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 	if err != nil {
 		return err
 	}
-	l, err := newListings(ctx, tables)
+	l, err := newListings(ctx, tables, s.opts.Warehouse)
 	if err != nil {
 		return err
 	}
@@ -724,10 +884,42 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 }
 
 // staged reports whether snap is a snapshot staged by write-audit-publish
-// (Spark's wap.id) that no branch or tag has: someone's unpublished
-// writes, which publishing adds to a branch later.
-func staged(snap table.Snapshot, ancestors map[int64]bool) bool {
-	return !ancestors[snap.SnapshotID] && snap.Summary != nil && snap.Summary.Properties["wap.id"] != ""
+// (Spark's wap.id) that no branch or tag has, and that is not published:
+// someone's unpublished writes, which publishing adds to a branch later.
+// Publishing fast-forwards a branch to the snapshot, which then has it,
+// or cherry-picks it, making a copy on the branch whose summary names
+// the same wap.id as published-wap-id; either way the branch holds its
+// rows, which the request rewrites there.
+func staged(tbl *table.Table, snap table.Snapshot, ancestors map[int64]bool) bool {
+	if ancestors[snap.SnapshotID] || snap.Summary == nil {
+		return false
+	}
+	wap := snap.Summary.Properties["wap.id"]
+	if wap == "" {
+		return false
+	}
+	for id := range ancestors {
+		if a := tbl.SnapshotByID(id); a != nil && a.Summary != nil &&
+			(a.Summary.Properties["published-wap-id"] == wap || a.Summary.Properties["wap.id"] == wap) {
+			return false
+		}
+	}
+	return true
+}
+
+// stagedUntil is how long r waits for t's staged snapshots (see
+// stagedWait).
+func stagedUntil(r *Request, tbl *table.Table) time.Time {
+	wait := stagedWait
+	if ms, err := strconv.ParseInt(tbl.Properties()["history.expire.max-snapshot-age-ms"], 10, 64); err == nil && ms > 0 {
+		switch {
+		case ms >= int64(stagedWaitMax/time.Millisecond):
+			wait = stagedWaitMax
+		case time.Duration(ms)*time.Millisecond > wait:
+			wait = time.Duration(ms) * time.Millisecond
+		}
+	}
+	return r.Created.Add(wait)
 }
 
 // ancestors are the snapshots some branch or tag has: its own, and those
@@ -794,15 +986,16 @@ func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, l *list
 		waitUntil         time.Time
 		reachable         = ancestors(tbl)
 		now               = s.now()
+		deadline          = stagedUntil(r, tbl)
 	)
 	for _, snap := range tbl.Metadata().Snapshots() {
 		switch {
 		case heads[snap.SnapshotID] || !tf.mentions(snap.SnapshotID, bad):
 			retained = append(retained, snap.SnapshotID)
-		case staged(snap, reachable) && now.Before(time.UnixMilli(snap.TimestampMs).Add(stagedWait)):
+		case staged(tbl, snap, reachable) && now.Before(deadline):
 			// Expiring it would discard everyone's unpublished rows in it.
 			retained = append(retained, snap.SnapshotID)
-			at := time.UnixMilli(snap.TimestampMs).Add(stagedWait)
+			at := deadline
 			if recheck := now.Add(stagedRecheck); recheck.Before(at) {
 				at = recheck
 			}
@@ -811,10 +1004,10 @@ func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, l *list
 			}
 			s.log.Warn("erasure waits for a snapshot staged by write-audit-publish that holds matching rows to be published or discarded",
 				"request", r.ID, "table", t.Name, "snapshot", snap.SnapshotID, "wap_id", snap.Summary.Properties["wap.id"],
-				"expired_after", time.UnixMilli(snap.TimestampMs).Add(stagedWait))
+				"expired_after", deadline)
 			r.Error = fmt.Sprintf("waiting: snapshot %d of %s, staged by write-audit-publish (wap.id %s), holds matching rows; "+
 				"publish it, and the request rewrites it, or discard it; after %s the request expires it",
-				snap.SnapshotID, t.Name, snap.Summary.Properties["wap.id"], time.UnixMilli(snap.TimestampMs).Add(stagedWait).UTC().Format(time.RFC3339))
+				snap.SnapshotID, t.Name, snap.Summary.Properties["wap.id"], deadline.UTC().Format(time.RFC3339))
 		default:
 			expired = append(expired, snap.SnapshotID)
 		}
@@ -1127,10 +1320,7 @@ func (s *Service) delete(ctx context.Context, r *Request, tables []loaded, files
 	if err := s.opts.Store.AddFiles(ctx, r.ID, files); err != nil {
 		return err
 	}
-	fsys, err := tables[0].tbl.FS(ctx)
-	if err != nil {
-		return err
-	}
+	fio := newFileIO(tables, s.opts.Warehouse)
 	var paths []string
 	defer func() {
 		// Whatever happens, replicas must empty their caches of what went.
@@ -1141,6 +1331,10 @@ func (s *Service) delete(ctx context.Context, r *Request, tables []loaded, files
 		}
 	}()
 	for _, f := range files {
+		fsys, err := fio.forPath(ctx, f.Path)
+		if err != nil {
+			return errors.Join(err, s.opts.Store.Deleted(ctx, r.ID, paths, s.now()))
+		}
 		if err := fsys.Remove(f.Path); err != nil && !notExist(err) {
 			return errors.Join(fmt.Errorf("delete %s: %w", base(f.Path), err), s.opts.Store.Deleted(ctx, r.ID, paths, s.now()))
 		}
@@ -1218,7 +1412,7 @@ func (s *Service) sharedCopies(ctx context.Context, r *Request, tables []loaded)
 	if len(tables) == 0 {
 		return nil, nil
 	}
-	fsys, err := tables[0].tbl.FS(ctx)
+	fsys, err := newFileIO(tables, s.opts.Warehouse).forPath(ctx, s.opts.Warehouse+sharingDir)
 	if err != nil {
 		return nil, err
 	}
@@ -1375,7 +1569,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	l, err := newListings(ctx, tables)
+	l, err := newListings(ctx, tables, s.opts.Warehouse)
 	if err != nil {
 		return "", err
 	}
@@ -1472,7 +1666,11 @@ func (s *Service) verifyTable(ctx context.Context, r *Request, lt loaded, m *mat
 	if err != nil {
 		return err
 	}
-	v.Files += int64(len(matched))
+	held, err := s.matchingDeleteRows(ctx, r.salt, positionDeletes(tf.live(false)), cols)
+	if err != nil {
+		return err
+	}
+	v.Files += int64(len(matched) + len(held))
 	// A bound that may hold an identifier counts unless the file's rows
 	// say otherwise: truncated bounds can match without the value.
 	for p := range tf.boundMatches(m, flds) {

@@ -179,6 +179,9 @@ func TestEraseSubject(t *testing.T) {
 	expectDenied(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people (id INTEGER, mail VARCHAR, CHECK (id > 0))", "keep the column")
 	expectRows(t, cs.admin, "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' AND table_name = 'people' ORDER BY ordinal_position",
 		"id", "email")
+	expectDenied(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people AS SELECT id, length(email) AS email FROM lake.public.people", "kind of values")
+	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people SET ('format-version' = '3')", "format version")
+	expectDenied(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people (id INTEGER, email BIGINT)", "kind of values")
 	mustExec(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people AS SELECT id, email, 'x' AS note FROM lake.public.people")
 	mustExec(t, nora, "CREATE OR REPLACE TABLE lake.public.fresh AS SELECT 1 AS x")
 	mustExec(t, nora, "CREATE OR REPLACE TABLE lake.public.fresh (y INTEGER)")

@@ -45,13 +45,24 @@ ALTER TABLE crm.referrals ALTER COLUMN referrer_email SET TAG pii = 'email:null'
 
 - **Values compare as DuckDB's `lower(trim(...))` leaves them**, so
   `' Ann@Example.com'` finds `ann@example.com`, UUIDs and integers compare
-  as their text, and binary columns as hex. What Igloo compares itself, in
+  as their text, and binary columns as hex. A UUID is found in UUID
+  columns and in binary columns that hold its 16 bytes, whether it is
+  given with dashes or as 32 hex digits. What Igloo compares itself, in
   manifest bounds, the rows it rewrites and history, it normalizes with
   DuckDB's own tables, which differ from Go's for characters newer Unicode
-  versions added. Tagged columns must be strings,
-  UUIDs, binary values or integers: a request is refused while a tag it
-  needs is on a list, struct or map, whose values hold identifiers inside
-  them. A JSON document in a string column compares as a whole, too.
+  versions added. Tagged columns must be strings, UUIDs, binary values or
+  integers: a request is refused while a tag it needs is on a list, struct
+  or map, whose values hold identifiers inside them. A JSON document in a
+  string column compares as a whole, too. A request logs a warning when
+  one tag value is on columns of different kinds (text, UUIDs, bytes,
+  integers): an identifier given in a form some of them do not hold finds
+  nothing there.
+- **Tables of Iceberg format version 3**, which can hold deletion vectors
+  that Igloo cannot read yet, are refused, when a request is made and again
+  before it deletes anything: it could delete their rows but not rewrite
+  the files that hold them. A table with tags cannot be upgraded to version
+  3, through SQL or the REST catalog. Parquet position delete files scoped
+  to one data file, as Java's Iceberg writes Spark's, are read as any.
 - **Hashed identifiers**: a tag value with `:sha256`, `:sha1` or `:md5`
   after it marks a column of the identifier's hex digest, as ad platforms
   match on: of the identifier as given, or lower-cased and trimmed. A
@@ -135,11 +146,14 @@ Safeguards against erasing the wrong people:
   would erase from, why, and how many of their rows match, of how many.
 - **Large deletions wait to be confirmed.** A request that would delete
   more than 1% of a table's rows, and more than 100 of them, counting
-  those that other requests made in the 24 hours before it matched in the
-  table (but those someone confirmed), or that would delete every row of a
-  table however small, is `held` once it has counted them, before it
-  deletes anything, until someone who may erase, other than its requester,
-  runs `CONFIRM ERASURE REQUEST`. The metric
+  those that other requests made within 24 hours of it, before or after,
+  match in the table (but those canceled or confirmed), or that would
+  delete every row of a table however small, is `held` once it has counted
+  them, before it deletes anything, until someone who may erase, other
+  than its requester, runs `CONFIRM ERASURE REQUEST`. Whichever of such
+  requests runs first, the others count it: one waits up to an hour for
+  the others made about when it was to count their rows (`waiting`, with
+  `error` naming them), and is held if they still have not. The metric
   `igloo_erasure_requests_held_total` counts held requests.
 - **`CANCEL ERASURE REQUEST`** cancels a request that has not begun
   deleting: once it has sent its first `DELETE`, which may have committed
@@ -161,8 +175,8 @@ Igloo while a request has work to do.
 |---|---|
 | `find` | Lists the tables with columns tagged with the request's tag values; the tables that share data files with them ([clones](#clones)); and the tables that the query history and the definitions of materialized views and tasks say were written from them. Tagged tables of [connections](federation.md) are listed, but nothing is erased from them. Counts their rows and those that match, and holds a request that would delete much of a table. |
 | `delete` | Deletes the matching rows, as a `DELETE` would: queries no longer see them. |
-| `rewrite` | On every branch and tag of every table, writes each data file that holds matching rows again with its deletes applied, leaving out the rows that match, or setting columns tagged `:null` to NULL in them, in the same commit that replaces the file: rows that arrived since the delete step go too. Equality delete files that hold matches go with the files they apply to, or at once if they apply to none; a position delete file goes only when every file it deletes rows of is replaced or gone, so rows deleted from files the commit keeps stay deleted. Then writes again the manifests that still list the old files: a manifest keeps a removed file's entry, with column bounds that can hold the value itself. A tag is rewritten on a branch of the request's (`igloo-erasure-...`) and moved to the result, if it still points where it did: a tag moved meanwhile is rewritten where it points now, and the branch of a tag dropped meanwhile goes. Branches keep their unpublished rows. |
-| `expire` | Expires the snapshots that reference a file that held matching rows, or whose bounds may, however recent, so time travel to them ends. Snapshots that reference none stay, older ones included, and so do the snapshots branches and tags point at, which the rewrite step made reference none. A snapshot staged by write-audit-publish (Spark's `wap.id`) that holds matching rows holds others' unpublished rows too: the request waits (`waiting`, with `error` saying which) for it to be published, and then rewrites it as part of the branch, or discarded, and expires it once it is 7 days old, as maintenance would. The commit asserts every branch and tag as the catalog has them just before it, so none made meanwhile at an expired snapshot is lost. |
+| `rewrite` | On every branch and tag of every table, writes each data file that holds matching rows again with its deletes applied, leaving out the rows that match, or setting columns tagged `:null` to NULL in them, in the same commit that replaces the file: rows that arrived since the delete step go too. Equality delete files that hold matches go with the files they apply to, or at once if they apply to none; a position delete file goes only when every file it deletes rows of is replaced or gone, so rows deleted from files the commit keeps stay deleted. Then writes again the manifests that still list the old files: a manifest keeps a removed file's entry, with column bounds that can hold the value itself. A tag is rewritten on a branch of the request's (`igloo-erasure-...`) with its snapshot's own schema, as a tag is read, so a column dropped since it was made stays in it, and moved to the result, if it still points where it did: a tag moved meanwhile is rewritten where it points now, and the branch of a tag dropped meanwhile goes. Branches keep their unpublished rows. A position delete file that carries the rows it deletes, as the spec allows, and holds the person's, goes too, with the files it deletes rows of rewritten so that it can. |
+| `expire` | Expires the snapshots that reference a file that held matching rows, or whose bounds may, however recent, so time travel to them ends. Snapshots that reference none stay, older ones included, and so do the snapshots branches and tags point at, which the rewrite step made reference none. A snapshot staged by write-audit-publish (Spark's `wap.id`) that holds matching rows holds others' unpublished rows too: the request waits (`waiting`, with `error` saying which) for it to be published, by fast-forward or by cherry-pick (a snapshot with its `wap.id` as `published-wap-id`), and then rewrites the branch, or discarded. It waits from when the request was made, as long as maintenance keeps such a snapshot (7 days, or the table's `history.expire.max-snapshot-age-ms` if longer), and at most 21 days, so that it completes within the month the GDPR allows; then it expires the snapshot, unpublished rows and all. The commit asserts every branch and tag as the catalog has them just before it, so none made meanwhile at an expired snapshot is lost. |
 | `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. It deletes files only in the warehouse, and never one that another table references ([clones](#clones)). Paths compare without their scheme (`s3a://` and `s3://` name the same file, as `file://` and a local path do), unescaped, and a listed file that the table references under a spelling Igloo cannot tell the same, but whose name a referenced file has, is kept: if it holds matching rows, the request stops with an error that names it, for someone to check. |
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`, those of tables since replaced included; it writes them again from the files that remain. |
 | `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). |
@@ -181,8 +195,8 @@ what `error` says and make the request again. Each failed run raises
 `FAILED_RUNS` for the request's job too, with the error, scrubbed of
 identifiers and hashes as everything the request logs is.
 
-Two kinds of run never count, however often they happen, since neither says
-anything is wrong with the request:
+Three kinds of run never count, however often they happen, since none
+says anything is wrong with the request:
 
 - **Other writers came first.** Igloo never lets iceberg-go retry a commit
   that removes files, whatever `commit.retry.num-retries` says: a retry
@@ -191,6 +205,12 @@ anything is wrong with the request:
   already wrote; one that lost to anything else is planned again. A table
   that writers change faster than that keeps the request `retrying`, a
   minute at a time, until they leave it a moment.
+- **The catalog could not answer.** A table that the catalog cannot load
+  for a moment (unavailable, or failing) when a request checks whether the
+  catalog's tables share files with its own stops the run, which tries
+  again a minute later: leaving the table out could delete files it
+  reads. A table the catalog refuses for good (forbidden, or a bad
+  request) is left out, with a warning in the log, as nothing can read it.
 - **The erasure key.** A replica whose `IGLOO_ERASURE_KEY` is not the one a
   request's identifiers were sealed under, or that has none, leaves the
   request `retrying` with an error that says so, logs it at error level,
@@ -219,7 +239,7 @@ file it would delete, the request stops with an error that names the table
 instead of breaking it: tag that table's columns and ask again for the
 same identifiers, and the first request goes on once the second has erased
 from it. So does a table the request found that was dropped or renamed
-while it ran. A table of the catalog that cannot be loaded at all, which
+while it ran. A table of the catalog that the catalog refuses for good, which
 nothing can read either, is left out of the search, with a warning in the
 log, rather than stopping every request.
 
@@ -256,7 +276,7 @@ request, newest first, to admins and holders of `ERASE`:
 | `history_redacted` | History records redacted |
 | `steps` | JSON: when each step started and last finished, and how often it ran |
 | `verification` | JSON: what the last check found, counts only (see the `verify` step); all zero once complete, with the number of read caches emptied since it deleted files and of those that will be when their replica starts |
-| `error` | Why the last run failed, or what it waits for, without identifiers or hashes |
+| `error` | Why the last run failed, or what it waits for, without identifiers or the request's hashes |
 
 ```sql
 SELECT request_id, completed_at, t->>'table', t->>'rows_deleted'
@@ -289,7 +309,8 @@ SELECT * FROM igloo.data_retention;
 older than that but the current one, whatever the table's snapshot
 retention and `history.expire.min-snapshots-to-keep` say, and rewrites the
 data files whose rows were deleted longer ago, so the rows leave the files
-too. Time travel on main reaches back that far at most. With an hourly
+too, but those of tables with deletion vectors, which Igloo cannot read
+yet: it logs a warning and leaves them. Time travel on main reaches back that far at most. With an hourly
 maintenance pass, a deleted row is gone from storage about an hour after it
 is older than the retention. Branches and tags, and the snapshots they point
 at, are kept as long as their own `max-ref-age-ms` or the table's says,

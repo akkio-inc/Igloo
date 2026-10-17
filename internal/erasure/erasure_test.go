@@ -45,9 +45,29 @@ type testCatalog struct {
 	// the lock, so they may commit too.
 	before func(id table.Identifier, updates []table.Update)
 	after  func(id table.Identifier, meta table.Metadata)
+	// io, if set, are the file IOs of tables, by name; others use the
+	// local file system.
+	io map[string]iceio.IO
 }
 
 func localFS(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+
+// fs is the file IO of table name.
+func (c *testCatalog) fs(name string) func(context.Context) (iceio.IO, error) {
+	if fsys, ok := c.io[name]; ok {
+		return func(context.Context) (iceio.IO, error) { return fsys, nil }
+	}
+	return localFS
+}
+
+// reopen loads table name again with its file IO.
+func (c *testCatalog) reopen(t *testing.T, name string) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tbl := c.tables[name]
+	c.tables[name] = table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), c.fs(name), c)
+}
 
 func (c *testCatalog) create(t *testing.T, dir, name string, schema *iceberg.Schema) *table.Table {
 	t.Helper()
@@ -143,7 +163,7 @@ func (c *testCatalog) commit(id table.Identifier, reqs []table.Requirement, upda
 		return nil, "", err
 	}
 	loc := c.write(nopTB{}, meta.Location(), meta)
-	c.tables[tableName(id)] = table.New(id, meta, loc, localFS, c)
+	c.tables[tableName(id)] = table.New(id, meta, loc, c.fs(tableName(id)), c)
 	return meta, loc, nil
 }
 

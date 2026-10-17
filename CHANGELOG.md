@@ -389,7 +389,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   deleted there, or all of it, waits for someone other than its requester
   to `CONFIRM ERASURE REQUEST`, and `CANCEL ERASURE REQUEST` cancels one
   before it sends a `DELETE`. Placeholder identifiers, such as the all-zero
-  advertising ID, and their digests, are refused. Admins and roles granted
+  advertising ID, and their digests, are refused; so are tables of Iceberg
+  format version 3, whose deletion vectors Igloo cannot read yet, before
+  anything is deleted, and tables with tags cannot be upgraded to it. A
+  tag is rewritten with its own snapshot's schema, so columns dropped
+  since it was made stay in it. Admins and roles granted
   `ERASE ON ACCOUNT` make them. `iceberg-go`'s copy gains
   `Transaction.ForgetFiles`, which rewrites the manifests that list removed
   files, and `WithMaxRefAge`, so expiring snapshots keeps branches and tags.

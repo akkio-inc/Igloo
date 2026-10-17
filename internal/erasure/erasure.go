@@ -151,6 +151,11 @@ type Request struct {
 	// DeleteStarted says it sent its first DELETE, which may have
 	// committed even if no answer came: it can no longer be canceled.
 	DeleteStarted bool `json:"delete_started,omitempty"`
+	// Counted says it counted the rows it matches in its tables, which
+	// other requests' holds count too; CountWait is when it began waiting
+	// for others made about when it was to count theirs.
+	Counted   bool      `json:"counted,omitempty"`
+	CountWait time.Time `json:"count_wait,omitzero"`
 
 	// salt is the salt of the request's hashes, derived from Salt and the
 	// erasure key, and written the files it wrote, while it runs.

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	"github.com/duckdb/duckdb-go/v2"
 )
@@ -287,6 +288,114 @@ func (s *Service) matchingFiles(ctx context.Context, salt string, paths []string
 		}
 	}
 	return out, nil
+}
+
+// rowColumn is the name of a position delete file's column that can hold
+// each deleted row whole, which the spec allows (Java's
+// PositionDeleteWriter writes it when given a row schema).
+const rowColumn = "row"
+
+// matchingDeleteRows returns, for each of paths, which are Parquet
+// position delete files, how many of the rows its row column holds match
+// on cols, leaving out files with none, and those without the column. The
+// row's fields are the table's, found by field ID or by the names the
+// columns have had.
+func (s *Service) matchingDeleteRows(ctx context.Context, salt string, paths []string, cols []scanColumn) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(paths) == 0 || len(cols) == 0 {
+		return out, nil
+	}
+	conn, err := s.engine.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close() //nolint:errcheck
+	for batch := range slices.Chunk(paths, scanBatch) {
+		original := map[string]string{}
+		for _, p := range batch {
+			original[duckdbPath(p)] = p
+		}
+		files, err := layouts(ctx, conn, batch)
+		if err != nil {
+			return nil, err
+		}
+		type group struct {
+			paths []string
+			cols  []scanColumn
+			refs  []string
+		}
+		groups := map[string]*group{}
+		for _, p := range batch {
+			l := files[duckdbPath(p)]
+			if l == nil {
+				continue
+			}
+			if _, ok := l.names[rowColumn]; !ok {
+				continue
+			}
+			var (
+				present []scanColumn
+				refs    []string
+			)
+			for _, c := range cols {
+				name := ""
+				if l.ids && c.id != 0 {
+					name = l.nameOf(c.id)
+				} else {
+					name = c.nameIn(l)
+				}
+				if name != "" {
+					present, refs = append(present, c), append(refs, quoteIdent(rowColumn)+"."+quoteIdent(name))
+				}
+			}
+			if len(present) == 0 {
+				continue
+			}
+			key := strings.Join(refs, "\x00")
+			if groups[key] == nil {
+				groups[key] = &group{cols: present, refs: refs}
+			}
+			groups[key].paths = append(groups[key].paths, p)
+		}
+		for _, g := range groups {
+			stmt := "SELECT filename, count(*) FROM read_parquet(" + pathList(g.paths) + ", filename = true, union_by_name = true) WHERE " +
+				condition(salt, g.cols, g.refs) + " GROUP BY ALL"
+			err := query(ctx, conn, stmt, func(row []driver.Value) error {
+				file, _ := row[0].(string)
+				n, _ := row[1].(int64)
+				if p, ok := original[file]; ok && n > 0 {
+					out[p] += n
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// positionDeletes keeps the Parquet position delete files of files.
+func positionDeletes(files map[string]iceberg.DataFile) []string {
+	var out []string
+	for p, df := range files {
+		if df.ContentType() == iceberg.EntryContentPosDeletes && strings.EqualFold(string(df.FileFormat()), "PARQUET") {
+			out = append(out, p)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// nameOf is the name of the element with field ID id, or "".
+func (l *fileLayout) nameOf(id int) string {
+	for name, fid := range l.names {
+		if fid == id {
+			return name
+		}
+	}
+	return ""
 }
 
 // nameIn is the column's name in a file without field IDs, or "".

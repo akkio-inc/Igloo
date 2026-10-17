@@ -723,7 +723,7 @@ func (s *Server) recordOwner(c *call, o auth.Object) {
 // reach of its policies and of erasure requests.
 func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req commitRequest) error {
 	if s.opts.Classified == nil || !slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
-		return u.Action == "add-schema" || u.Action == "set-current-schema" || u.Action == "remove-schemas"
+		return u.Action == "add-schema" || u.Action == "set-current-schema" || u.Action == "remove-schemas" || u.Action == "upgrade-format-version"
 	}) {
 		return nil
 	}
@@ -792,6 +792,13 @@ func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req 
 	added := false
 	for _, u := range req.Updates {
 		switch u.Action {
+		case "upgrade-format-version":
+			// Erasure requests cannot rewrite tables of format version 3,
+			// whose deletion vectors Igloo cannot read yet.
+			if u.FormatVersion == nil || *u.FormatVersion >= 3 {
+				return c.who.deny(fmt.Sprintf("%s has policies or tags; it stays at Iceberg format version 2, as erasure requests "+
+					"cannot rewrite tables of version 3 yet", o))
+			}
 		case "remove-schemas":
 			return c.who.deny(fmt.Sprintf("%s has policies or tags, whose columns its old schemas name; its schemas are not removed", o))
 		case "add-schema":

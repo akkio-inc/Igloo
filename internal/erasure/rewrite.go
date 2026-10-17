@@ -93,6 +93,10 @@ func branchFor(r *Request, tag string, id int64) string {
 	return tagBranch + strings.ToLower(r.ID) + "-" + hex.EncodeToString(sum[:4]) + "-" + strconv.FormatInt(id, 10)
 }
 
+// ownSchema reports whether branch is rewritten with its snapshots' own
+// schema: a branch a request rewrites a tag on is (see at).
+func ownSchema(branch string) bool { return strings.HasPrefix(branch, tagBranch) }
+
 // ownBranch reports whether ref name is one of r's branches.
 func ownBranch(r *Request, name string) bool {
 	own := tagBranch + strings.ToLower(r.ID)
@@ -102,8 +106,21 @@ func ownBranch(r *Request, name string) bool {
 // at is tbl as a table whose current snapshot is snapshot id: what scans
 // and commits work from. iceberg-go builds a commit to any branch on the
 // current snapshot, so a commit to another branch is made on this.
-func (s *Service) at(tbl *table.Table, id int64) (*table.Table, error) {
-	if cur := tbl.CurrentSnapshot(); cur != nil && cur.SnapshotID == id {
+//
+// With own, its current schema is the snapshot's own, as a tag reads its
+// snapshot (Java's SnapshotUtil.schemaFor: tags read with the snapshot's
+// schema, branches with the table's), so that a rewrite of a tag reads and
+// writes every column the snapshot has, and the snapshot that replaces it
+// keeps that schema, as iceberg-go gives a new snapshot the current one.
+// With the table's current schema, a column dropped since the tag was made
+// went from every row of the tag, the person's or not.
+func (s *Service) at(tbl *table.Table, id int64, own bool) (*table.Table, error) {
+	current := tbl.Metadata().CurrentSchema().ID
+	schema := current
+	if snap := tbl.SnapshotByID(id); own && snap != nil && snap.SchemaID != nil {
+		schema = *snap.SchemaID
+	}
+	if cur := tbl.CurrentSnapshot(); cur != nil && cur.SnapshotID == id && schema == current {
 		return tbl, nil
 	}
 	b, err := table.MetadataBuilderFromBase(tbl.Metadata(), tbl.MetadataLocation())
@@ -112,6 +129,11 @@ func (s *Service) at(tbl *table.Table, id int64) (*table.Table, error) {
 	}
 	if err := b.SetSnapshotRef(table.MainBranch, id, table.BranchRef); err != nil {
 		return nil, err
+	}
+	if schema != current {
+		if err := b.SetCurrentSchemaID(schema); err != nil {
+			return nil, err
+		}
 	}
 	meta, err := b.Build()
 	if err != nil {
@@ -155,7 +177,7 @@ func (s *Service) onRef(ctx context.Context, r *Request, t *Table, name string, 
 		original := ref.SnapshotID
 		branch := branchFor(r, name, original)
 		if _, exists := refs(tbl)[branch]; !exists {
-			view, err := s.at(tbl, original)
+			view, err := s.at(tbl, original, true)
 			if err != nil {
 				return err
 			}
@@ -222,7 +244,7 @@ func (s *Service) passes(ctx context.Context, t *Table, branch string, p pass) e
 		if !ok {
 			return errRefGone
 		}
-		view, err := s.at(tbl, head.SnapshotID)
+		view, err := s.at(tbl, head.SnapshotID, ownSchema(branch))
 		if err != nil {
 			return err
 		}
@@ -335,9 +357,32 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 			paths = append(paths, p)
 		}
 	}
-	matched, err := s.matchingFiles(ctx, r.salt, paths, scanColumns(flds, r.Subjects))
+	cols := scanColumns(flds, r.Subjects)
+	matched, err := s.matchingFiles(ctx, r.salt, paths, cols)
 	if err != nil {
 		return false, err
+	}
+	// A position delete file can hold the rows it deletes, the person's
+	// too: it goes once every file it deletes rows of is rewritten, so
+	// those are rewritten with it, or at once if none of them is left.
+	rowsHeld, err := s.matchingDeleteRows(ctx, r.salt, positionDeletes(live), cols)
+	if err != nil {
+		return false, err
+	}
+	fsys, err := view.FS(ctx)
+	if err != nil {
+		return false, err
+	}
+	targeted := map[string]bool{}
+	for p, n := range rowsHeld {
+		matched[p] += n
+		targets, err := s.targets.Of(ctx, fsys, live[p])
+		if err != nil {
+			return false, err
+		}
+		for t := range targets {
+			targeted[t] = true
+		}
 	}
 	for p := range matched {
 		if r.written[p] {
@@ -356,7 +401,7 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 		dangling []iceberg.DataFile
 	)
 	for _, task := range tasks {
-		if matched[task.File.FilePath()] > 0 || slices.ContainsFunc(task.EqualityDeleteFiles, func(d iceberg.DataFile) bool {
+		if matched[task.File.FilePath()] > 0 || targeted[task.File.FilePath()] || slices.ContainsFunc(task.EqualityDeleteFiles, func(d iceberg.DataFile) bool {
 			return matched[d.FilePath()] > 0
 		}) {
 			selected = append(selected, task)
@@ -365,6 +410,13 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	for p, df := range deletes {
 		if matched[p] > 0 && !attached[p] {
 			dangling = append(dangling, df)
+		}
+	}
+	for p := range rowsHeld {
+		if !slices.ContainsFunc(tasks, func(task table.FileScanTask) bool {
+			return slices.ContainsFunc(task.DeleteFiles, func(d iceberg.DataFile) bool { return d.FilePath() == p })
+		}) {
+			dangling = append(dangling, live[p])
 		}
 	}
 	if len(selected) > 0 || len(dangling) > 0 {
@@ -484,7 +536,7 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 		s.log.Info("rewrote files holding erased data", "request", r.ID, "table", t.Name, "branch", branch,
 			"files", len(paths), "rows", b.stats.dropped, "nulled", b.stats.nulled)
 		head := refs(committed)[branch]
-		if view, err = s.at(committed, head.SnapshotID); err != nil {
+		if view, err = s.at(committed, head.SnapshotID, ownSchema(branch)); err != nil {
 			return err
 		}
 	}
@@ -524,7 +576,7 @@ func (s *Service) commitBatch(ctx context.Context, t *Table, view *table.Table, 
 		if !appendedSince(tbl, view.CurrentSnapshot().SnapshotID, head.SnapshotID) {
 			return nil, err
 		}
-		if view, err = s.at(tbl, head.SnapshotID); err != nil {
+		if view, err = s.at(tbl, head.SnapshotID, ownSchema(branch)); err != nil {
 			return nil, err
 		}
 		// A little jitter keeps the commit from meeting a steady writer's

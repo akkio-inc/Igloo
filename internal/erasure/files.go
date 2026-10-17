@@ -242,6 +242,20 @@ func resolved(t *Table, flds []field) error {
 	return nil
 }
 
+// rewritable refuses a table the request could not rewrite: one of
+// format version 3, whose deletion vectors iceberg-go cannot read. The
+// request would delete its rows and then be unable to rewrite the files
+// that still hold them, nor be canceled, and after failing too often
+// forget whose rows they were, with them still in the files.
+func rewritable(t *Table, tbl *table.Table) error {
+	if v := tbl.Metadata().Version(); v >= 3 {
+		return fmt.Errorf("%w: %s is an Iceberg table of format version %d, which can hold deletion vectors that Igloo cannot read yet, "+
+			"so it could delete the rows but not rewrite the files that hold them; erase from it in an engine that reads them, "+
+			"and untag it until then", ErrInvalid, t.Name, v)
+	}
+	return nil
+}
+
 // identifierType reports whether values of type t compare as identifiers do:
 // strings, UUIDs, binary values and integers. Lists, structs and maps hold
 // identifiers inside values, which a request does not reach.
@@ -266,6 +280,20 @@ func checkFields(t *Table, flds []field) error {
 		}
 	}
 	return nil
+}
+
+// typeFamily is the kind of values a column of type t holds, as
+// identifiers compare with them: text, a UUID, bytes or an integer.
+func typeFamily(t iceberg.Type) string {
+	switch t.(type) {
+	case iceberg.UUIDType:
+		return "uuid"
+	case iceberg.BinaryType, iceberg.FixedType:
+		return "bytes"
+	case iceberg.Int32Type, iceberg.Int64Type:
+		return "integer"
+	}
+	return "text"
 }
 
 // binaryType reports whether a column holds bytes, which compare as hex.

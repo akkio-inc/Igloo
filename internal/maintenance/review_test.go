@@ -294,3 +294,43 @@ func TestPurgeDeletedIsNotRetried(t *testing.T) {
 		t.Errorf("rows: %v", got)
 	}
 }
+
+// iceberg-go cannot read deletion vectors yet: a table that has them is
+// left as it is, with a warning, rather than failing every pass.
+func TestDeletionVectorsAreSkipped(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var commits [][]string
+	for i := range 6 {
+		commits = append(commits, []string{fmt.Sprintf("p%d@example.com", i)})
+	}
+	cat := people(t, iceberg.Properties{"format-version": "3"}, commits...)
+	tasks, err := cat.tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes, cat.tbl.Location()+"/data/dv.puffin",
+		iceberg.PuffinFile, nil, nil, nil, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := cat.tbl.NewTransaction()
+	if err := tx.NewRowDelta(nil).AddDeletes(b.ReferencedDataFile(tasks[0].File.FilePath()).Build()).Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	head := cat.tbl.CurrentSnapshot().SnapshotID
+	time.Sleep(10 * time.Millisecond)
+	m := New(nil, "", Options{Retention: 7 * 24 * time.Hour}, log)
+	if _, err := m.purgeDeleted(ctx, cat.tbl, time.Millisecond, log); err != nil {
+		t.Errorf("purgeDeleted: %v", err)
+	}
+	if _, err := m.compact(ctx, cat.tbl, log); err != nil {
+		t.Errorf("compact: %v", err)
+	}
+	if got := cat.tbl.CurrentSnapshot().SnapshotID; got != head {
+		t.Errorf("the table was rewritten")
+	}
+}

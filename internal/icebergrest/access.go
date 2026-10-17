@@ -173,6 +173,8 @@ type tableUpdate struct {
 	// for the schema the commit added last.
 	Schema   *schemaJSON `json:"schema"`
 	SchemaID *int        `json:"schema-id"`
+	// FormatVersion is upgrade-format-version's.
+	FormatVersion *int `json:"format-version"`
 }
 
 // schemaJSON is a schema, with the fields Igloo reads.

@@ -19,6 +19,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -217,7 +219,9 @@ func (sub *Subject) hash(salt string) {
 		}
 	}
 	for _, id := range sub.ids {
-		add(plain, id.Normal)
+		for _, form := range id.forms() {
+			add(plain, form)
+		}
 		for name, digest := range digests {
 			if byDigest[name] == nil {
 				byDigest[name] = map[string]bool{}
@@ -235,6 +239,23 @@ func (sub *Subject) hash(salt string) {
 }
 
 func sorted(set map[string]bool) []string { return slices.Sorted(maps.Keys(set)) }
+
+// forms are what column values an identifier compares as: as it is, and,
+// for a UUID, as one in a binary column, whose values compare as hex,
+// holds it (6f9619ff8b86d011b42d00c04fc964ff), and as a UUID column does,
+// with dashes, whichever form it was given in.
+func (id identifier) forms() []string {
+	out := []string{id.Normal}
+	if u, err := uuid.Parse(id.Normal); err == nil {
+		dashed := u.String()
+		for _, f := range []string{dashed, strings.ReplaceAll(dashed, "-", "")} {
+			if !slices.Contains(out, f) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
+}
 
 // hashes are the salted hashes a column tagged with s's value and digest
 // holds.
@@ -335,7 +356,7 @@ func newRedactor(r *Request) *redactor {
 	var patterns []string
 	for _, s := range r.Subjects {
 		for _, id := range s.ids {
-			for _, form := range []string{id.Normal, r.fold.normal(id.Given)} {
+			for _, form := range append(id.forms(), r.fold.normal(id.Given)) {
 				patterns = append(patterns, form, strings.ReplaceAll(form, "'", "''"),
 					url.PathEscape(form), url.QueryEscape(form))
 			}
@@ -496,10 +517,40 @@ func (a *automaton) find(text []byte) [][2]int {
 var longHex = regexp.MustCompile(`[0-9a-fA-F]{16,}`)
 
 // scrub removes from a failed run's error what could identify the person:
-// the identifiers, and hashes, which DuckDB quotes from statements.
+// the identifiers, and the request's salt and hashes, which DuckDB quotes
+// from statements, whole or cut short, as runs of 16 hex digits or more
+// of one of them. Other long runs of digits stay: snapshot IDs, storage
+// request IDs and the like, which say what went wrong.
 func scrub(r *Request, msg string) string {
 	if len(r.Subjects) > 0 && r.Subjects[0].ids != nil {
 		msg, _ = newRedactor(r).Redact(msg)
 	}
-	return longHex.ReplaceAllString(msg, "***")
+	secrets := r.secrets()
+	return longHex.ReplaceAllStringFunc(msg, func(run string) string {
+		low := strings.ToLower(run)
+		for _, s := range secrets {
+			if strings.Contains(s, low) || len(s) >= 16 && strings.Contains(low, s[:16]) {
+				return "***"
+			}
+		}
+		return run
+	})
+}
+
+// secrets are the request's salts and hashes, in lower-case hex.
+func (r *Request) secrets() []string {
+	var out []string
+	for _, s := range []string{r.salt, r.Salt} {
+		if s != "" {
+			out = append(out, strings.ToLower(s))
+		}
+	}
+	for _, sub := range r.Subjects {
+		out = append(out, sub.plain...)
+		out = append(out, sub.prefixes...)
+		for _, hs := range sub.digests {
+			out = append(out, hs...)
+		}
+	}
+	return out
 }

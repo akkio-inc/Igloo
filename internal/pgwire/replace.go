@@ -74,7 +74,7 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 	}
 	// The new table, as made, keeps the columns with policies or tags,
 	// which the statement was checked for too.
-	have, err := queryStrings(ctx, sess, "SELECT column_name FROM (DESCRIBE "+quoteName(r.staging)+")")
+	have, err := describeTable(ctx, sess, quoteName(r.staging))
 	if err == nil {
 		err = s.checkReplaceKeeps(ctx, sess, r, have)
 	}

@@ -346,6 +346,8 @@ func arrowRows(t *testing.T, tbl *table.Table, rows ...[]any) arrow.Table {
 				b.Field(i).(*array.Int64Builder).Append(v)
 			case string:
 				b.Field(i).(*array.StringBuilder).Append(v)
+			case []byte:
+				b.Field(i).(*array.BinaryBuilder).Append(v)
 			case nil:
 				b.Field(i).AppendNull()
 			}

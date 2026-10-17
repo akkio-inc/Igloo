@@ -646,34 +646,6 @@ func TestRefMadeWhileExpiring(t *testing.T) {
 	f.clean(storedEmail)
 }
 
-// A table that cannot be loaded, which nothing could read anyway, does not
-// stop requests for other tables.
-type brokenCatalog struct {
-	*testCatalog
-	broken string
-}
-
-func (b brokenCatalog) Tables(ctx context.Context) ([]table.Identifier, error) {
-	ids, err := b.testCatalog.Tables(ctx)
-	return append(ids, ident(b.broken)), err
-}
-
-func (b brokenCatalog) LoadTable(ctx context.Context, id table.Identifier) (*table.Table, error) {
-	if tableName(id) == b.broken {
-		return nil, errors.New("read metadata file: 403 Forbidden")
-	}
-	return b.testCatalog.LoadTable(ctx, id)
-}
-
-func TestUnloadableTableIsLeftOut(t *testing.T) {
-	f := newFixture(t)
-	f.people("crm.people", [][]any{ann, subject})
-	f.svc.opts.Catalog = brokenCatalog{testCatalog: f.cat, broken: "junk.broken"}
-	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
-	f.completed(f.erase(byEmail))
-	f.clean(storedEmail)
-}
-
 // A file added without field IDs, which is read by column names, is erased
 // from too. (iceberg-go refuses to add one whose column is named in
 // another case than the table's.)

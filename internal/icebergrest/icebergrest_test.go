@@ -1628,6 +1628,10 @@ func TestTablesWithTags(t *testing.T) {
 	if w := updates(map[string]any{"action": "remove-schemas", "schema-ids": []int{0}}); w.Code != 403 || !strings.Contains(w.Body.String(), "schemas are not removed") {
 		t.Errorf("removing old schemas, which name the columns as they were: %d %s", w.Code, w.Body)
 	}
+	// Erasure requests cannot rewrite tables of format version 3 yet.
+	if w := updates(map[string]any{"action": "upgrade-format-version", "format-version": 3}); w.Code != 403 || !strings.Contains(w.Body.String(), "format version") {
+		t.Errorf("upgrading to format version 3: %d %s", w.Code, w.Body)
+	}
 	refused("renaming the table", h.request("POST", "/v1/tables/rename", ada, map[string]any{
 		"source":      map[string]any{"namespace": []string{"public"}, "name": "users"},
 		"destination": map[string]any{"namespace": []string{"public"}, "name": "people"},

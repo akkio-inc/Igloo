@@ -567,6 +567,13 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 	for _, g := range groups {
 		tasks = append(tasks, g.Tasks...)
 	}
+	// iceberg-go cannot read deletion vectors yet: rewriting would fail
+	// on every pass, so the table's files are left as they are.
+	if slices.ContainsFunc(tasks, func(t table.FileScanTask) bool { return len(t.DeletionVectorFiles) > 0 }) {
+		m.log.Warn("files with deletion vectors are not rewritten: Igloo cannot read deletion vectors yet",
+			"table", name(tbl.Identifier()), "operation", operation)
+		return tbl, res, nil
+	}
 	replaced := map[string]bool{}
 	for p := range rewrite {
 		replaced[p] = true
