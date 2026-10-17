@@ -123,8 +123,9 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 		}
 		return c, true, nil
 	case sc.keywords("CANCEL", "ERASURE", "REQUEST"), sc.keywords("CONFIRM", "ERASURE", "REQUEST"):
+		// The keyword the scanner read, after any comments, says which.
 		c.tag = tagCancelErase
-		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "CONFIRM") {
+		if strings.EqualFold(firstWord(query), "CONFIRM") {
 			c.tag = tagConfirmErase
 		}
 		lit, ok := sc.literal()
@@ -136,6 +137,7 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 	case sc.keywords("ALTER", "TABLE"):
 		c.tag = tagRetention
 		c.ifExists = sc.keywords("IF", "EXISTS")
+		sc.keywords("ONLY")
 		if c.table, ok = sc.name(); !ok {
 			return c, false, nil
 		}
@@ -162,6 +164,13 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 		return c, true, nil
 	}
 	return c, false, nil
+}
+
+// firstWord is the first word of query, after spaces and comments, as the
+// scanner reads it.
+func firstWord(query string) string {
+	sc := &scanner{s: query}
+	return sc.word()
 }
 
 // erasureText is what the history, the logs and the list of running

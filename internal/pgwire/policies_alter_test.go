@@ -57,6 +57,10 @@ func TestAlterCannotReadProtectedRows(t *testing.T) {
 	for _, sql := range []string{
 		"ALTER TABLE " + c + " ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
 		"ALTER TABLE " + c + " ALTER COLUMN spend TYPE BIGINT USING error(email)",
+		// ONLY, as PostgreSQL's grammar has it, names the same table.
+		"ALTER TABLE ONLY " + c + " ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		"ALTER TABLE IF EXISTS ONLY " + c + " ALTER COLUMN device_id SET DATA TYPE VARCHAR USING " +
+			"CASE WHEN client = 'globex' THEN error('hidden ' || email) ELSE device_id END",
 		"ALTER TABLE " + c + " ALTER COLUMN device_id SET DATA TYPE VARCHAR USING " +
 			"CASE WHEN client = 'globex' THEN error('hidden ' || device_id) ELSE device_id END",
 		"ALTER TABLE " + c + " ALTER COLUMN spend SET DATA TYPE INTEGER USING CAST(email AS INTEGER)",

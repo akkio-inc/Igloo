@@ -71,10 +71,10 @@ func (tf *tableFiles) current() int64 {
 
 // mentions reports whether snapshot id's manifests list any of paths,
 // live or deleted.
-func (tf *tableFiles) mentions(id int64, paths map[string]bool) bool {
+func (tf *tableFiles) mentions(id int64, paths pathSet) bool {
 	for _, m := range tf.manifests[id] {
 		for _, e := range tf.entries[m] {
-			if paths[e.file.FilePath()] {
+			if paths.has(e.file.FilePath()) {
 				return true
 			}
 		}
@@ -104,48 +104,49 @@ func (tf *tableFiles) live(onlyCurrent bool) map[string]iceberg.DataFile {
 // referenced is every file the table's metadata references, as orphan
 // cleanup counts them: metadata files, statistics, manifest lists,
 // manifests, and the files live in them.
-func (tf *tableFiles) referenced() map[string]bool {
+func (tf *tableFiles) referenced() pathSet {
 	meta := tf.tbl.Metadata()
-	out := map[string]bool{tf.tbl.MetadataLocation(): true}
+	out := pathSet{}
+	out.add(tf.tbl.MetadataLocation())
 	for e := range meta.PreviousFiles() {
-		out[e.MetadataFile] = true
+		out.add(e.MetadataFile)
 	}
 	for sf := range meta.Statistics() {
-		out[sf.StatisticsPath] = true
+		out.add(sf.StatisticsPath)
 	}
 	for sf := range meta.PartitionStatistics() {
-		out[sf.StatisticsPath] = true
+		out.add(sf.StatisticsPath)
 	}
 	for _, s := range meta.Snapshots() {
-		out[s.ManifestList] = true
+		out.add(s.ManifestList)
 	}
 	for m := range tf.entries {
-		out[m] = true
+		out.add(m)
 	}
 	for p := range tf.live(false) {
-		out[p] = true
+		out.add(p)
 	}
 	return out
 }
 
 // files are the files that snapshots ids reference, apart from the
 // metadata files of the table itself.
-func (tf *tableFiles) files(ids []int64) map[string]bool {
-	out := map[string]bool{}
+func (tf *tableFiles) files(ids []int64) pathSet {
+	out := pathSet{}
 	for _, id := range ids {
 		if s := tf.tbl.SnapshotByID(id); s != nil {
-			out[s.ManifestList] = true
+			out.add(s.ManifestList)
 		}
 		for _, m := range tf.manifests[id] {
-			out[m] = true
+			out.add(m)
 			for _, e := range tf.entries[m] {
-				out[e.file.FilePath()] = true
+				out.add(e.file.FilePath())
 			}
 		}
 	}
 	for sf := range tf.tbl.Metadata().Statistics() {
 		if slices.Contains(ids, sf.SnapshotID) {
-			out[sf.StatisticsPath] = true
+			out.add(sf.StatisticsPath)
 		}
 	}
 	return out
@@ -153,24 +154,24 @@ func (tf *tableFiles) files(ids []int64) map[string]bool {
 
 // kept are the files snapshots ids keep: their manifest lists, their
 // manifests and the files live in them, and their statistics.
-func (tf *tableFiles) kept(ids []int64) map[string]bool {
-	out := map[string]bool{}
+func (tf *tableFiles) kept(ids []int64) pathSet {
+	out := pathSet{}
 	for _, id := range ids {
 		if s := tf.tbl.SnapshotByID(id); s != nil {
-			out[s.ManifestList] = true
+			out.add(s.ManifestList)
 		}
 		for _, m := range tf.manifests[id] {
-			out[m] = true
+			out.add(m)
 			for _, e := range tf.entries[m] {
 				if e.live() {
-					out[e.file.FilePath()] = true
+					out.add(e.file.FilePath())
 				}
 			}
 		}
 	}
 	for sf := range tf.tbl.Metadata().Statistics() {
 		if slices.Contains(ids, sf.SnapshotID) {
-			out[sf.StatisticsPath] = true
+			out.add(sf.StatisticsPath)
 		}
 	}
 	return out
@@ -224,6 +225,21 @@ func fields(tbl *table.Table, t *Table) []field {
 		}
 	}
 	return out
+}
+
+// resolved checks that each of t's tagged columns is a field of its table,
+// as one of its schemas names it: a column that none has, as after the
+// table was replaced by one that names it otherwise, would leave its
+// values where they are while the request completed.
+func resolved(t *Table, flds []field) error {
+	for _, c := range t.Columns {
+		if !slices.ContainsFunc(flds, func(f field) bool { return f.Column == c }) {
+			return fmt.Errorf("%w: column %s of %s is tagged %s = '%s', but the table has no column of that name, and never had: "+
+				"if it was renamed, or the table replaced, tag the column that holds the identifiers now and unset the old tag",
+				ErrInvalid, c.Name, t.Name, c.Tag, c.Value)
+		}
+	}
+	return nil
 }
 
 // identifierType reports whether values of type t compare as identifiers do:
@@ -325,12 +341,6 @@ func identOf(t *Table) table.Identifier {
 	}
 	// Names of namespaces have no dots.
 	return strings.Split(t.Name, ".")
-}
-
-// within reports whether p is under dir.
-func within(p, dir string) bool {
-	dir = strings.TrimSuffix(dir, "/") + "/"
-	return strings.HasPrefix(p, dir)
 }
 
 // base is the file name of p, for logs.

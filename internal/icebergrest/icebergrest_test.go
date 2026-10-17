@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1605,6 +1606,27 @@ func TestTablesWithTags(t *testing.T) {
 	refused("changing its type", commit(field(1, "id", "long"), field(2, "email", "binary")))
 	if w := commit(field(1, "id", "long"), field(2, "email", "string"), field(3, "note", "string")); w.Code != 200 {
 		t.Errorf("adding another column: %d %s", w.Code, w.Body)
+	}
+	// Catalogs give an added schema the next ID, whatever add-schema says:
+	// set-current-schema can name it by an ID the commit never wrote.
+	// Every added schema is checked, and an ID no schema has is refused
+	// unless one was added.
+	updates := func(updates ...map[string]any) *httptest.ResponseRecorder {
+		list := make([]any, len(updates))
+		for i, u := range updates {
+			list[i] = u
+		}
+		return h.request("POST", "/v1/namespaces/public/tables/users", ada, map[string]any{"updates": list})
+	}
+	for _, sent := range []int{0, 7} {
+		refused(fmt.Sprintf("renaming it in a schema sent as %d, made current as 1", sent), updates(
+			map[string]any{"action": "add-schema", "schema": map[string]any{"type": "struct", "schema-id": sent,
+				"fields": []any{field(1, "id", "long"), field(2, "mail", "string")}}},
+			map[string]any{"action": "set-current-schema", "schema-id": 1}))
+	}
+	refused("making an unknown schema current", updates(map[string]any{"action": "set-current-schema", "schema-id": 5}))
+	if w := updates(map[string]any{"action": "remove-schemas", "schema-ids": []int{0}}); w.Code != 403 || !strings.Contains(w.Body.String(), "schemas are not removed") {
+		t.Errorf("removing old schemas, which name the columns as they were: %d %s", w.Code, w.Body)
 	}
 	refused("renaming the table", h.request("POST", "/v1/tables/rename", ada, map[string]any{
 		"source":      map[string]any{"namespace": []string{"public"}, "name": "users"},

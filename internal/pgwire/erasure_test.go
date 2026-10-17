@@ -77,6 +77,22 @@ func TestParseErasureCommand(t *testing.T) {
 			t.Errorf("history of %s: %s", sql, got)
 		}
 	}
+	// Comments before the keyword do not change which command it is.
+	for sql, tag := range map[string]string{
+		"CONFIRM ERASURE REQUEST 'r1'":                         tagConfirmErase,
+		"/* approved by legal */ CONFIRM ERASURE REQUEST 'r1'": tagConfirmErase,
+		"-- approved\nCONFIRM ERASURE REQUEST 'r1'":            tagConfirmErase,
+		"/* confirm */ CANCEL ERASURE REQUEST 'r1'":            tagCancelErase,
+		"  cancel erasure request 'r1'":                        tagCancelErase,
+	} {
+		if c, ok, err := parseErasureCommand(sql); !ok || err != nil || c.tag != tag || c.id != "r1" {
+			t.Errorf("%q: %s %q, %v, %v", sql, c.tag, c.id, ok, err)
+		}
+	}
+	if c, ok, _ := parseErasureCommand("(CONFIRM ERASURE REQUEST 'r1')"); ok && c.tag != tagConfirmErase {
+		t.Errorf("a parenthesized CONFIRM runs as %s", c.tag)
+	}
+
 	toks, _ := tokenize("GRANT ERASE ON ACCOUNT TO privacy_officer")
 	c, ok, err := parseACLCommand(toks)
 	if !ok || err != nil || c.targetKind != targetAccount || c.grantee != "privacy_officer" || c.privileges[0] != auth.PrivilegeErase {
@@ -151,9 +167,21 @@ func TestEraseSubject(t *testing.T) {
 	expectRefused(t, nora, "CONFIRM ERASURE REQUEST 'nope'", "42704")
 	expectDenied(t, cs.user(t, "otto", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol), "CANCEL ERASURE REQUEST '"+id+"'")
 
-	// A tagged column can be neither dropped nor renamed.
+	// A tagged column can be neither dropped nor renamed, however the
+	// statement names the table, nor left out of a table that replaces it.
 	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people DROP COLUMN email", "dropping")
 	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people DROP COLUMN IF EXISTS email", "dropping")
+	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people RENAME COLUMN email TO mail", "renaming")
+	expectDenied(t, cs.admin, "ALTER TABLE ONLY lake.public.people RENAME COLUMN email TO mail", "renaming")
+	expectDenied(t, cs.admin, "ALTER TABLE IF EXISTS ONLY lake.public.people DROP COLUMN email", "dropping")
+	expectDenied(t, cs.admin, "/* x */ ALTER TABLE ONLY lake.public.people RENAME email TO mail", "renaming")
+	expectDenied(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people AS SELECT id, email AS mail FROM lake.public.people", "keep the column")
+	expectDenied(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people (id INTEGER, mail VARCHAR, CHECK (id > 0))", "keep the column")
+	expectRows(t, cs.admin, "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' AND table_name = 'people' ORDER BY ordinal_position",
+		"id", "email")
+	mustExec(t, cs.admin, "CREATE OR REPLACE TABLE lake.public.people AS SELECT id, email, 'x' AS note FROM lake.public.people")
+	mustExec(t, nora, "CREATE OR REPLACE TABLE lake.public.fresh AS SELECT 1 AS x")
+	mustExec(t, nora, "CREATE OR REPLACE TABLE lake.public.fresh (y INTEGER)")
 
 	// Data retention, kept with tags and listed for everyone. Privacy
 	// officers set it on tables with tags, admins on any; a day at least.

@@ -121,9 +121,11 @@ tags](security-policies.md) describes them.
 every table whose columns are tagged with an identifier, and keep a record
 that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
 
-- Requests need `IGLOO_ERASURE_KEY` ([configuration](configuration.md)),
-  the same on every replica and kept out of the metadata database. Changing
-  it fails the requests that are open; they must be made again.
+- Requests need `IGLOO_ERASURE_KEY` or `IGLOO_ERASURE_KEY_FILE`
+  ([configuration](configuration.md)), the same on every replica and kept
+  out of the metadata database. A replica with another key, or none, leaves
+  open requests alone, logging at error level, until one with the right
+  key runs them; set it back rather than making the requests again.
 - Each request runs as a job on the [scheduler](#scheduled-work), one
   request at a time across replicas: a run that finds another running ends
   at once, so requests never take the scheduler's slots from tasks, pipes
@@ -137,7 +139,9 @@ that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
   request failed` at error level, raises the built-in alert, and counts in
   `igloo_erasure_requests_failed_total`. Alert on that metric, and on
   `igloo_erasure_requests_held_total`, which counts requests waiting for
-  `CONFIRM ERASURE REQUEST`.
+  `CONFIRM ERASURE REQUEST` by someone other than their requester. Runs
+  that lose to other writers' commits, as on a table appended to without
+  pause, do not count: the request tries again every minute until it wins.
 - Every replica checks every 15 seconds whether a request deleted files
   since it last emptied its read cache, and empties it whole; a request
   waits for the replicas seen in the last 2 minutes. A replica that was

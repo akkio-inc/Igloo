@@ -341,9 +341,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   comments, quoting), so `ALTER TABLE ONLY t ...` cannot slip the table past
   them; the target is read the same way wherever an ALTER is parsed, and a
   target that cannot be read is refused for non-admins.
-- Turned commit retries off for Igloo's own maintenance commits (compaction
-  and snapshot expiry). A table that sets `commit.retry.num-retries` above 0
-  (another engine may) would otherwise make iceberg-go rebuild a rewrite's
+- Turned commit retries off for Igloo's own maintenance commits (compaction,
+  snapshot expiry and the rewrite of deleted rows), and for every commit
+  that is not an append. A table that sets `commit.retry.num-retries` above
+  0 (another engine may) would otherwise make iceberg-go rebuild a rewrite's
   manifest list from the fresh parent on a conflict and reintroduce the files
   the rewrite replaced, duplicating rows. Maintenance now fails such a commit
   and retries next pass instead (see `third_party/iceberg-go/IGLOO_PATCHES.md`).
@@ -375,18 +376,30 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and columns tagged `:null` are set to NULL instead of deleting the row.
   Requests run in the background on the scheduler, survive restarts,
   resume after failures with growing waits, fail for good with a metric
-  and an alert after 10 failures, keep their identifiers sealed under
-  `IGLOO_ERASURE_KEY` only while they run, and are listed with what they
-  did per table and step in `SHOW ERASURE REQUESTS` and
+  and an alert after 10 failures (losing to other writers, or a replica
+  with another erasure key, does not count), keep their identifiers sealed
+  under `IGLOO_ERASURE_KEY` (or `IGLOO_ERASURE_KEY_FILE`'s) only while they
+  run, wait for snapshots staged by write-audit-publish to be published or
+  discarded, and are listed with what they did per table and step in
+  `SHOW ERASURE REQUESTS` and
   `igloo.erasure_requests`, with the tables history says were written from
   the erased ones, and tagged tables of connections, which they cannot
   erase from. `ERASE SUBJECT ... DRY RUN` previews a request; one that would
-  delete more than 1% of a table waits for `CONFIRM ERASURE REQUEST`, and
-  `CANCEL ERASURE REQUEST` cancels one before it deletes. Placeholder
-  identifiers, such as the all-zero advertising ID, are refused. Admins and
-  roles granted `ERASE ON ACCOUNT` make them. `iceberg-go`'s copy gains
+  delete more than 1% of a table, with what requests of the past day
+  deleted there, or all of it, waits for someone other than its requester
+  to `CONFIRM ERASURE REQUEST`, and `CANCEL ERASURE REQUEST` cancels one
+  before it sends a `DELETE`. Placeholder identifiers, such as the all-zero
+  advertising ID, and their digests, are refused. Admins and roles granted
+  `ERASE ON ACCOUNT` make them. `iceberg-go`'s copy gains
   `Transaction.ForgetFiles`, which rewrites the manifests that list removed
   files, and `WithMaxRefAge`, so expiring snapshots keeps branches and tags.
+- Compaction and the rewrite of deleted rows keep a position delete file
+  that also deletes rows of a file they do not rewrite, whose deleted rows
+  came back before.
+- Table maintenance reads `max-ref-age-ms` and
+  `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
+  ("forever") as forever; it overflowed into a negative age that dropped
+  every branch and tag.
 - Data retention for tables that hold personal data (`ALTER TABLE ... SET
   (data_retention_days = N)`, at least a day, `igloo.data_retention`): table
   maintenance keeps no older snapshot, whatever else the table keeps, but
@@ -394,7 +407,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   deleted longer ago. Privacy officers may set it on tables with tags.
 - Renaming a table with tags or a data retention, or renaming, dropping or
   changing the type of a tagged column, is refused even when no table has
-  policies, and through the Iceberg REST catalog too.
+  policies, and through the Iceberg REST catalog too, as is `CREATE OR
+  REPLACE TABLE` whose new table lacks a column with tags or a policy, and
+  removing a tagged table's old schemas through the REST catalog.
 - Table maintenance no longer drops branches and tags whose snapshots are
   older than the snapshot retention; they last as long as their own or the
   table's `max-ref-age-ms` says, forever by default.

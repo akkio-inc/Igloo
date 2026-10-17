@@ -670,11 +670,26 @@ func TestKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A replica with another key, as one deployed with a mistyped key, or
+	// none, leaves the request as it is, for one with the right key: as
+	// often as it runs it, it neither fails it nor forgets its
+	// identifiers, and the scheduler is told, for an alert.
 	other := New(Options{Store: f.store, Catalog: f.cat, Policies: f.policies.Load, Engine: f.eng, Key: []byte("another key of thirty-two bytes!"),
 		Warehouse: f.warehouse(), Rows: f.rows})
-	_ = other.Run(f.ctx, r.ID)
-	if got, _ := f.store.Get(f.ctx, r.ID); got.Status != StatusFailed || !strings.Contains(got.Error, "IGLOO_ERASURE_KEY") {
-		t.Errorf("status %s, error %q", got.Status, got.Error)
+	for _, replica := range []*Service{other, keyless, other} {
+		for range maxFailures + 1 {
+			err := replica.Run(f.ctx, r.ID)
+			if err == nil || !strings.Contains(err.Error(), "IGLOO_ERASURE_KEY") {
+				t.Fatalf("run with the wrong key: %v", err)
+			}
+		}
+	}
+	got, _ := f.store.Get(f.ctx, r.ID)
+	if got.Status != StatusRetrying || got.Sealed != r.Sealed || got.Salt == "" || got.Failures != 0 || !strings.Contains(got.Error, "IGLOO_ERASURE_KEY") {
+		t.Fatalf("after runs with the wrong key: status %s, failures %d, error %q, sealed kept %v", got.Status, got.Failures, got.Error, got.Sealed == r.Sealed)
+	}
+	if r = f.run(r.ID); r.Status != StatusCompleted {
+		t.Errorf("with the right key: status %s, error %q", r.Status, r.Error)
 	}
 }
 
@@ -852,15 +867,19 @@ func TestSharingCopiesOfReplacedTables(t *testing.T) {
 func TestMemoryHistoryRedaction(t *testing.T) {
 	ctx := context.Background()
 	h := audit.NewMemoryStore(10, 10)
-	_ = h.WriteQueries(ctx, []audit.Query{{ID: "q1", Text: "SELECT 1", QueryTag: "for " + storedEmail, ApplicationName: storedEmail}})
+	_ = h.WriteQueries(ctx, []audit.Query{{ID: "q1", Text: "SELECT 1", QueryTag: "for " + storedEmail, ApplicationName: storedEmail},
+		{ID: "q2", Text: "COPY t FROM 's3://landing/*.csv'", LocationsRead: []string{"s3://landing/a.csv", "s3://landing/Subject%40Example.com/b.csv"}}})
 	_ = h.WriteLogins(ctx, []audit.Login{{ID: "l1", ApplicationName: storedEmail}})
 	r := &Request{salt: "s", Subjects: []Subject{testSubject("s", "pii", "email", requestedEmail)}}
-	if n, err := h.Redact(ctx, newRedactor(r)); err != nil || n != 2 {
+	if n, err := h.Redact(ctx, newRedactor(r)); err != nil || n != 3 {
 		t.Errorf("redacted %d, %v", n, err)
 	}
 	q, _ := h.Queries(ctx, audit.Viewer{All: true}, audit.Page{})
 	l, _ := h.Logins(ctx, audit.Viewer{All: true}, audit.Page{})
-	if q[0].QueryTag != "for ***" || q[0].ApplicationName != "***" || l[0].ApplicationName != "***" {
+	i := slices.IndexFunc(q, func(q audit.Query) bool { return q.ID == "q1" })
+	j := slices.IndexFunc(q, func(q audit.Query) bool { return q.ID == "q2" })
+	if q[i].QueryTag != "for ***" || q[i].ApplicationName != "***" || l[0].ApplicationName != "***" ||
+		!slices.Equal(q[j].LocationsRead, []string{"s3://landing/a.csv", "s3://landing/***/b.csv"}) {
 		t.Errorf("queries %+v, logins %+v", q, l)
 	}
 }

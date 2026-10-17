@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -571,6 +572,21 @@ func TestErasure(t *testing.T) {
 	r2, err := svc.Submit(ctx, "privacy", []Wanted{{Tag: "pii", Value: "email:sha256",
 		Identifiers: []string{strings.ToUpper(sha256Hex("ann@other.com"))}}})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Run(ctx, r2.ID); err != nil {
+		t.Fatal(err)
+	}
+	// It matches the table's one row left: a request that would empty a
+	// table waits for someone other than its requester, whatever the
+	// table's size.
+	if got, _ := store.Get(ctx, r2.ID); got.Status != StatusHeld {
+		t.Fatalf("a request that empties a table: %s", got.Status)
+	}
+	if _, err := svc.Confirm(ctx, r2.ID, "privacy"); !errors.Is(err, ErrInvalid) {
+		t.Errorf("its requester confirmed it: %v", err)
+	}
+	if _, err := svc.Confirm(ctx, r2.ID, "pat"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.Run(ctx, r2.ID); err != nil {

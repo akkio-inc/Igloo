@@ -133,7 +133,7 @@ type Request struct {
 	Steps           []StepRecord  `json:"steps"`
 	Verification    *Verification `json:"verification,omitempty"`
 	// Error is why the last run failed, while Status is retrying or
-	// failed.
+	// failed, or what it waits for.
 	Error    string `json:"error,omitempty"`
 	Attempts int    `json:"attempts"`
 	// Failures counts the runs in a row that failed.
@@ -148,11 +148,16 @@ type Request struct {
 	DeletedThrough time.Time `json:"deleted_through,omitzero"`
 	// ConfirmedBy is who confirmed it after it was held.
 	ConfirmedBy string `json:"confirmed_by,omitempty"`
+	// DeleteStarted says it sent its first DELETE, which may have
+	// committed even if no answer came: it can no longer be canceled.
+	DeleteStarted bool `json:"delete_started,omitempty"`
 
 	// salt is the salt of the request's hashes, derived from Salt and the
 	// erasure key, and written the files it wrote, while it runs.
 	salt    string
 	written map[string]bool
+	// fold normalizes values as DuckDB does, for what Go compares.
+	fold *folding
 }
 
 // Subject is a tag value the request erases identifiers of.

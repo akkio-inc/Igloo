@@ -206,8 +206,11 @@ reference for every setting mentioned here.
   errors keep no identifier or hash. Requests read and change tables with
   Igloo's own access, not through policies, which would hide the values they
   look for, and are carried out whatever later happens to the account that
-  made them. They refuse placeholder identifiers, and wait for confirmation
-  before deleting more than 1% of a table. They delete files only in the
+  made them. They refuse placeholder identifiers and their digests, and
+  wait for confirmation by someone other than their requester before
+  deleting more than 1% of a table, counting other requests of the past
+  day, or all of one. A replica with another erasure key leaves requests
+  alone rather than failing them. They delete files only in the
   warehouse, only once no table in the catalog references them, holding the
   locks making a clone takes, and orphan files only after 3 days, as
   maintenance does. They do not reach backups, bucket versions,

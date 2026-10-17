@@ -2,6 +2,8 @@ package config
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -421,6 +423,39 @@ func TestPoolAndPrice(t *testing.T) {
 	} {
 		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", kv[0]: kv[1]})); err == nil {
 			t.Errorf("%s=%s should be refused", kv[0], kv[1])
+		}
+	}
+}
+
+// The erasure key comes from IGLOO_ERASURE_KEY or a file, as a Kubernetes
+// secret mounts one, without the spaces and line break around it: a key
+// that differs between replicas by a newline would keep their requests from
+// running.
+func TestErasureKey(t *testing.T) {
+	key := "an erasure key of thirty-two bytes"
+	file := filepath.Join(t.TempDir(), "erasure-key")
+	if err := os.WriteFile(file, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, vars := range []map[string]string{
+		{"IGLOO_ERASURE_KEY": key},
+		{"IGLOO_ERASURE_KEY": " " + key + "\n"},
+		{"IGLOO_ERASURE_KEY_FILE": file},
+	} {
+		vars["IGLOO_ADMIN_PASSWORD"] = "password"
+		cfg, err := Load(env(vars))
+		if err != nil || cfg.ErasureKey != key {
+			t.Errorf("%v: key %q, %v", vars, cfg.ErasureKey, err)
+		}
+	}
+	for _, vars := range []map[string]string{
+		{"IGLOO_ERASURE_KEY": key, "IGLOO_ERASURE_KEY_FILE": file},
+		{"IGLOO_ERASURE_KEY_FILE": file + ".missing"},
+		{"IGLOO_ERASURE_KEY": "short"},
+	} {
+		vars["IGLOO_ADMIN_PASSWORD"] = "password"
+		if _, err := Load(env(vars)); err == nil {
+			t.Errorf("%v: accepted", vars)
 		}
 	}
 }

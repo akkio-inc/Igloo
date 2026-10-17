@@ -15,7 +15,7 @@ import (
 func testSubject(salt, tag, value string, ids ...string) Subject {
 	sub := Subject{Tag: tag, Value: value, Count: len(ids)}
 	for _, id := range ids {
-		sub.ids = append(sub.ids, identifier{Given: id, Normal: goNormal(id)})
+		sub.ids = append(sub.ids, identifier{Given: id, Normal: (*folding)(nil).normal(id)})
 	}
 	sub.hash(salt)
 	return sub
@@ -73,10 +73,23 @@ func TestNormalizedByDuckDB(t *testing.T) {
 			t.Errorf("normalize(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	// Go's checks compare both forms: DuckDB lower-cases U+1C89 as itself,
-	// Go as U+1C8A.
-	if forms := (identifier{Given: "\u1c89x", Normal: "\u1c89x"}).forms(); len(forms) != 2 {
-		t.Errorf("forms: %q", forms)
+	// What Go compares, in history, manifest bounds and the rows a rewrite
+	// filters, is normalized by DuckDB's own tables: Go's differ for
+	// characters Unicode 16 added (U+A7CB, U+1C89, U+10D50), and in what
+	// they trim.
+	f, err := svc.folding(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"\u0130", "\u212a", "\u1e9e", "\u03a3", "\ua7cb", "\u1c89", "\U00010d50", "\u2c2f", "\u0345", "\u1fbc",
+		" x ", "\u3000x", "\u200bx", "\u180ex", "\u0085x", "\tx", "\u00a0x", "\ufeffx", "A\u00a0B", "\u1680Ann@Example.COM\u2003"} {
+		want, err := svc.normalize(ctx, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := f.normal(s); got != want {
+			t.Errorf("%+q: DuckDB %+q, Go with DuckDB's tables %+q", s, want, got)
+		}
 	}
 }
 
@@ -183,10 +196,31 @@ func TestRedact(t *testing.T) {
 	if got, _ := x.Redact("Ünïcødé ANN@EXAMPLE.COM ünd"); got != "Ünïcødé *** ünd" {
 		t.Errorf("non-ASCII: %s", got)
 	}
-	// Errors keep no identifier, nor hash.
-	msg := scrub(r, "Binder Error: sha256('"+salt+"' || x) IN ('"+r.Subjects[0].plain[0]+"') near 'ann@example.com'")
-	if strings.Contains(msg, "ann@example.com") || strings.Contains(msg, r.Subjects[0].plain[0]) {
+	// Errors keep no identifier, nor hash, even as DuckDB truncates one.
+	hash := r.Subjects[0].plain[0]
+	msg := scrub(r, "Binder Error: sha256('"+salt+"' || x) IN ('"+hash+"') near 'ann@example.com', ... '"+hash[:31]+"...'")
+	if strings.Contains(msg, "ann@example.com") || strings.Contains(msg, hash[:16]) {
 		t.Errorf("scrubbed error: %s", msg)
+	}
+}
+
+// History keeps identifiers as SQL quotes them in a string, and as URLs and
+// paths escape them: the redactor finds those too. An identifier split
+// across a concatenation of strings is not found: nothing short of
+// evaluating the SQL could tell.
+func TestRedactEscapedIdentifiers(t *testing.T) {
+	r := &Request{salt: "s", Subjects: []Subject{testSubject("s", "pii", "email", "O'Brien@Example.com")}}
+	x := newRedactor(r)
+	for _, c := range []struct{ in, want string }{
+		{"SELECT * FROM crm.people WHERE email = 'o''brien@example.com'", "SELECT * FROM crm.people WHERE email = '***'"},
+		{`{"email":"o'brien@example.com"}`, `{"email":"***"}`},
+		{"COPY people FROM 's3://landing/o%27brien%40example.com/part.parquet'", "COPY people FROM 's3://landing/***/part.parquet'"},
+		{"GET /export?email=O%27Brien%40Example.com&x=1", "GET /export?email=***&x=1"},
+	} {
+		got, changed := x.Redact(c.in)
+		if !changed || got != c.want {
+			t.Errorf("%s:\n got %s\nwant %s", c.in, got, c.want)
+		}
 	}
 }
 
@@ -240,14 +274,34 @@ func TestRecordHoldsNoIdentifiers(t *testing.T) {
 }
 
 func TestSentinels(t *testing.T) {
-	for _, s := range []string{"00000000-0000-0000-0000-000000000000", "null", "unknown", "0", "n/a", "-", "000", "00:00:00:00:00:00"} {
-		if !sentinel(goNormal(s)) {
+	var none *folding
+	for _, s := range []string{"00000000-0000-0000-0000-000000000000", "null", "unknown", "0", "n/a", "-", "000", "00:00:00:00:00:00",
+		// The second review's: braced zero GUIDs, -1, the all-F ID,
+		// placeholders in brackets, NaN, hex and exponent zeros, other
+		// scripts' zeros, and spaces and tabs around them.
+		"{00000000-0000-0000-0000-000000000000}", "-1", "ffffffff-ffff-ffff-ffff-ffffffffffff", "FFFFFFFFFFFFFFFF",
+		"(null)", "<null>", "[null]", "'null'", "nan", "NaN", "0x0", "0x00000000", "0e0", "00000000_0000",
+		"\uff10\uff10\uff10\uff10\uff10", " null ", "\tnull", "null\t", "\t null \n", "(not set)", "noemail@noemail.com"} {
+		if !sentinel(none.normal(s)) {
 			t.Errorf("%q is not refused", s)
 		}
 	}
-	for _, s := range []string{"ann@example.com", "6f9619ff-8b86-d011-b42d-00c04fc964ff", "15551234567", "1"} {
-		if sentinel(s) {
+	for _, s := range []string{"ann@example.com", "6f9619ff-8b86-d011-b42d-00c04fc964ff", "15551234567", "1", "e", "-2", "0x1f",
+		"fffffff", "nancy@example.com", "null@example.com", "{6f9619ff-8b86-d011-b42d-00c04fc964ff}", "10", "1e5"} {
+		if sentinel(none.normal(s)) {
 			t.Errorf("%q is refused", s)
 		}
+	}
+	// Digests of the empty string and of placeholders stand for no one:
+	// hashed tables hold sha256('') for every row without an email.
+	for _, s := range []string{"", "null", "NULL", "unknown"} {
+		for name := range digests {
+			if d := hexDigest(name, s); !sentinelDigest(d) {
+				t.Errorf("%s(%q) = %s is not refused", name, s, d)
+			}
+		}
+	}
+	if sentinelDigest(hexDigest("sha256", "ann@example.com")) {
+		t.Errorf("a person's digest is refused")
 	}
 }

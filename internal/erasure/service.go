@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/akkio-inc/igloo/internal/audit"
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
@@ -108,6 +109,13 @@ type Service struct {
 	lease func(ctx context.Context) (tasks.Lease, bool, error)
 	// mu stands in for the scheduler's locks without one.
 	mu sync.Mutex
+	// targets are what position delete files delete rows of.
+	targets *deletefiles.Targets
+	// cacheMu guards dirs.
+	cacheMu sync.Mutex
+	// dirs are the directories of the files tables reference, by
+	// metadata file (see dirsOf).
+	dirs map[string]*tableDirs
 }
 
 // New returns a Service.
@@ -118,7 +126,8 @@ func New(opts Options) *Service {
 	if opts.Schema == "" {
 		opts.Schema = "public"
 	}
-	s := &Service{opts: opts, engine: opts.Engine, rows: opts.Rows, log: opts.Log.With("component", "erasure"), now: time.Now}
+	s := &Service{opts: opts, engine: opts.Engine, rows: opts.Rows, log: opts.Log.With("component", "erasure"), now: time.Now,
+		targets: deletefiles.NewTargets(), dirs: map[string]*tableDirs{}}
 	if s.rows == nil {
 		s.rows = catalogRows{engine: opts.Engine, catalog: opts.CatalogName}
 	}
@@ -239,6 +248,9 @@ func (s *Service) Preview(ctx context.Context, wanted []Wanted) (*Request, error
 		return nil, err
 	}
 	r := &Request{Subjects: subjects, salt: hex.EncodeToString(b[:])}
+	if r.fold, err = s.folding(ctx); err != nil {
+		return nil, err
+	}
 	for i := range r.Subjects {
 		r.Subjects[i].hash(r.salt)
 	}
@@ -284,7 +296,7 @@ func (s *Service) prepare(ctx context.Context, wanted []Wanted) ([]Subject, erro
 			switch {
 			case normal == "":
 				return nil, fmt.Errorf("%w: an identifier is empty", ErrInvalid)
-			case sentinel(normal):
+			case sentinel(normal) || sentinelDigest(normal):
 				return nil, fmt.Errorf("%w: identifier %d of %s.%s stands for no one in particular, as a placeholder or an opted-out device's "+
 					"all-zero ID does; it would erase the rows of everyone it stands for", ErrInvalid, len(out[i].ids)+1, w.Tag, w.Value)
 			}
@@ -317,7 +329,11 @@ func (s *Service) prepare(ctx context.Context, wanted []Wanted) ([]Subject, erro
 			return nil, fmt.Errorf("%w: %s is tagged, but cannot be loaded (%v): if it was renamed, its tags stayed with its old name; "+
 				"tag it under its new name, or unset its tags if it was dropped", ErrInvalid, t.Name, err)
 		}
-		if err := checkFields(t, fields(tbl, t)); err != nil {
+		flds := fields(tbl, t)
+		if err := resolved(t, flds); err != nil {
+			return nil, err
+		}
+		if err := checkFields(t, flds); err != nil {
 			return nil, err
 		}
 	}
@@ -404,7 +420,7 @@ func (s *Service) Run(ctx context.Context, id string) error {
 	}
 	r.Status, r.Error, r.WaitUntil = StatusRunning, "", time.Time{}
 	r.Attempts++
-	runErr := s.open(r)
+	runErr := s.open(ctx, r)
 	if runErr == nil {
 		if runErr = s.save(ctx, r); runErr != nil {
 			return runErr
@@ -421,6 +437,7 @@ func (s *Service) Run(ctx context.Context, id string) error {
 		s.suspend(ctx, id)
 	default:
 		r.Status, r.Completed = StatusCompleted, s.now()
+		s.dropBranches(ctx, r)
 		s.end(ctx, r)
 		s.log.Info("erasure request completed", "request", id, "tables", len(r.Tables), "rows", r.rows())
 	}
@@ -430,7 +447,12 @@ func (s *Service) Run(ctx context.Context, id string) error {
 	if r.Status == StatusCompleted || r.Status == StatusFailed {
 		s.unschedule(ctx, id)
 	}
-	return runErr
+	if runErr != nil {
+		// The scheduler records, logs and alerts on what Run returns: only
+		// the scrubbed error goes there.
+		return errors.New(r.Error)
+	}
+	return nil
 }
 
 // terminalError is an error a request cannot get past by trying again.
@@ -440,14 +462,52 @@ func (e terminalError) Unwrap() error { return e.error }
 
 func terminal(err error) error { return terminalError{err} }
 
+// contentionError is a step that lost to other writers' commits more often
+// than it tries in one run: it tries again later, which does not count as
+// a failure, however long it takes.
+type contentionError struct{ error }
+
+func (e contentionError) Unwrap() error { return e.error }
+
+func contended(err error) error { return contentionError{err} }
+
+const (
+	// contentionWait is how long a request that lost to other writers
+	// waits before it tries again.
+	contentionWait = time.Minute
+	// keyWait is how long a request whose identifiers this replica cannot
+	// unseal waits: until a replica with the right key runs it.
+	keyWait = 10 * time.Minute
+)
+
 // failed records that a run of r failed, and has it run again later, or,
-// after too many failures or one it cannot get past, fail for good.
+// after too many failures or one it cannot get past, fail for good. A run
+// that lost to other writers, or on a replica whose erasure key is not the
+// one r's identifiers were sealed under, does not count: neither says
+// anything is wrong with the request, and failing it would forget its
+// identifiers for good.
 func (s *Service) failed(ctx context.Context, r *Request, err error) {
 	r.Error = scrub(r, err.Error())
+	var c contentionError
+	switch {
+	case errors.Is(err, errKey):
+		r.Status, r.WaitUntil = StatusRetrying, s.now().Add(keyWait)
+		s.log.Error("this replica cannot unseal an erasure request's identifiers: its IGLOO_ERASURE_KEY is not the key they were sealed under; "+
+			"set the same key on every replica", "request", r.ID, "in", keyWait)
+		s.wake(ctx, r.ID, r.WaitUntil)
+		return
+	case errors.As(err, &c):
+		r.Status, r.WaitUntil = StatusRetrying, s.now().Add(contentionWait)
+		s.log.Warn("erasure request lost to other writers' commits; it tries again", "request", r.ID, "step", r.Step,
+			"in", contentionWait, "err", r.Error)
+		s.wake(ctx, r.ID, r.WaitUntil)
+		return
+	}
 	r.Failures++
 	var t terminalError
-	if errors.As(err, &t) || errors.Is(err, errKey) || r.Failures >= maxFailures {
+	if errors.As(err, &t) || r.Failures >= maxFailures {
 		r.Status = StatusFailed
+		s.dropBranches(ctx, r)
 		s.end(ctx, r)
 		s.opts.Metrics.countFailed()
 		if s.opts.Failed != nil {
@@ -464,9 +524,9 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 }
 
 // open unseals r's identifiers and computes their hashes, for a run.
-func (s *Service) open(r *Request) error {
+func (s *Service) open(ctx context.Context, r *Request) error {
 	if s.sealer == nil {
-		return errors.New("requests need the erasure key, IGLOO_ERASURE_KEY")
+		return fmt.Errorf("%w (this replica has none)", errKey)
 	}
 	ids, err := s.sealer.unsealIDs(r.ID, r.Sealed)
 	if err != nil {
@@ -475,12 +535,52 @@ func (s *Service) open(r *Request) error {
 	if len(ids) != len(r.Subjects) {
 		return errKey
 	}
+	if r.fold, err = s.folding(ctx); err != nil {
+		return err
+	}
 	r.salt, r.written = s.sealer.hashSalt(r.Salt), map[string]bool{}
 	for i := range r.Subjects {
 		r.Subjects[i].ids = ids[i]
 		r.Subjects[i].hash(r.salt)
 	}
 	return nil
+}
+
+// folding returns DuckDB's normalization tables, read once.
+func (s *Service) folding(ctx context.Context) (*folding, error) {
+	folds.mu.Lock()
+	defer folds.mu.Unlock()
+	if folds.f == nil {
+		f, err := loadFolding(ctx, s.engine)
+		if err != nil {
+			return nil, fmt.Errorf("read DuckDB's lower() and trim(): %w", err)
+		}
+		folds.f = f
+	}
+	return folds.f, nil
+}
+
+// folds are DuckDB's normalization tables, the same for every connection
+// of the DuckDB this process links.
+var folds struct {
+	mu sync.Mutex
+	f  *folding
+}
+
+// dropBranches drops the branches r rewrote tags on, which a run that
+// stopped may have left: the request is over.
+func (s *Service) dropBranches(ctx context.Context, r *Request) {
+	ctx = context.WithoutCancel(ctx)
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if t.Remote {
+			continue
+		}
+		if err := s.sweep(ctx, r, t, true); err != nil {
+			s.log.Warn("could not drop an erasure request's branches; drop them by hand", "request", r.ID, "table", t.Name,
+				"prefix", tagBranch+strings.ToLower(r.ID), "err", err)
+		}
+	}
 }
 
 // end deletes what could tell whose data r erased: its sealed identifiers
@@ -567,11 +667,16 @@ func (s *Service) Cancel(ctx context.Context, id, by string) (*Request, error) {
 	})
 }
 
-// Confirm lets a held request go on.
+// Confirm lets a held request go on. Someone other than its requester
+// must: the hold is a second pair of eyes.
 func (s *Service) Confirm(ctx context.Context, id, by string) (*Request, error) {
 	return s.change(ctx, id, func(r *Request) error {
 		if r.Status != StatusHeld {
 			return fmt.Errorf("%w: request %s is %s, not held", ErrInvalid, id, r.Status)
+		}
+		if strings.EqualFold(by, r.Requester) {
+			return fmt.Errorf("%w: request %s was made by %s, who cannot confirm it too; another admin or privacy officer must",
+				ErrInvalid, id, r.Requester)
 		}
 		r.Status, r.ConfirmedBy = StatusQueued, by
 		s.log.Info("erasure request confirmed", "request", id, "by", by)
@@ -615,9 +720,10 @@ func (s *Service) change(ctx context.Context, id string, fn func(r *Request) err
 	return r, s.save(ctx, r)
 }
 
-// deleting reports whether r has begun deleting rows.
+// deleting reports whether r has begun deleting rows: once it sent a
+// DELETE, whose commit may have landed though its answer was lost.
 func deleting(r *Request) bool {
-	if r.Step != StepFind && r.Step != StepDelete {
+	if r.DeleteStarted || r.Step != StepFind && r.Step != StepDelete {
 		return true
 	}
 	return slices.ContainsFunc(r.Tables, func(t Table) bool { _, ok := t.Steps[StepDelete]; return ok })

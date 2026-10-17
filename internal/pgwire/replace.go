@@ -72,6 +72,16 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 	if err := exec(ctx, create); err != nil {
 		return err
 	}
+	// The new table, as made, keeps the columns with policies or tags,
+	// which the statement was checked for too.
+	have, err := queryStrings(ctx, sess, "SELECT column_name FROM (DESCRIBE "+quoteName(r.staging)+")")
+	if err == nil {
+		err = s.checkReplaceKeeps(ctx, sess, r, have)
+	}
+	if err != nil {
+		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(r.staging))
+		return err
+	}
 
 	// From here on, finish even if the client cancels: stopping between the
 	// drop and the rename would leave the table missing.
@@ -80,7 +90,6 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
 		return err
 	}
-	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = exec(ctx, rename); err == nil {
 			return nil

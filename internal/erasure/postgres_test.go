@@ -147,6 +147,8 @@ func TestPostgresRedaction(t *testing.T) {
 
 	now := time.Now()
 	email := "erase-" + audit.NewID(now)[:8] + "@example.com"
+	quoted := "o'brien-" + audit.NewID(now)[:8] + "@example.com"
+	escaped := strings.ReplaceAll(email, "@", "%40")
 	queries := []audit.Query{
 		{Text: "SELECT * FROM crm.people WHERE email = '" + strings.ToUpper(email) + "'"},
 		{Text: "SELECT * FROM crm.people WHERE email IN ('x@y.z', '  " + email + "')"},
@@ -154,6 +156,10 @@ func TestPostgresRedaction(t *testing.T) {
 		{Text: `SELECT '{"email":"` + email + `"}'::JSON`},
 		{Text: "SELECT 1", QueryTag: "campaign for " + email},
 		{Text: "SELECT 2", ApplicationName: email},
+		// Quoted as SQL quotes it, escaped in a path, and in the locations
+		// a COPY read.
+		{Text: "SELECT * FROM crm.people WHERE email = '" + strings.ReplaceAll(quoted, "'", "''") + "'"},
+		{Text: "COPY t FROM 's3://landing/x.csv'", LocationsRead: []string{"s3://landing/a.csv", "s3://landing/" + escaped + "/part.csv"}},
 		{Text: "SELECT * FROM crm.people WHERE email = 'someone-else@example.com'"},
 		{Text: "INSERT INTO crm.report SELECT * FROM crm.people", StatementType: "INSERT"},
 		{Text: "SELECT 1", StatementType: "INSERT", TablesRead: []string{"lake.crm.people"}, TablesWritten: []string{"lake.crm.copy"}},
@@ -174,11 +180,11 @@ func TestPostgresRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := &Request{salt: "pepper", Subjects: []Subject{testSubject("pepper", "pii", "email", email)}}
+	r := &Request{salt: "pepper", Subjects: []Subject{testSubject("pepper", "pii", "email", email, quoted)}}
 	x := newRedactor(r)
 	n, err := history.Redact(ctx, x)
-	if err != nil || n != 6 {
-		t.Errorf("query history: redacted %d, %v; want 6", n, err)
+	if err != nil || n != 8 {
+		t.Errorf("query history: redacted %d, %v; want 8", n, err)
 	}
 	if n, err := history.Redact(ctx, x); err != nil || n != 0 {
 		t.Errorf("redacting again: %d, %v", n, err)
@@ -191,7 +197,8 @@ func TestPostgresRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, q := range got {
-		if strings.Contains(strings.ToLower(q.Text+q.QueryTag+q.ApplicationName), email) {
+		text := strings.ToLower(q.Text + q.QueryTag + q.ApplicationName + strings.Join(q.LocationsRead, " "))
+		if strings.Contains(text, email) || strings.Contains(text, escaped) || strings.Contains(text, strings.ReplaceAll(quoted, "'", "''")) {
 			t.Errorf("history still holds the identifier: %+v", q)
 		}
 	}

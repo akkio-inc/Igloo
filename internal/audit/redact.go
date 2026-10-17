@@ -25,13 +25,19 @@ const redactBatch = 2000
 
 // RedactColumns redacts the text columns of every row of table, read in
 // order of the text key column key, a batch at a time, returning how many
-// rows it changed. Stores that keep history elsewhere in the metadata
-// database use it too.
+// rows it changed. A column whose name ends in [] is a text array, whose
+// elements are redacted. Stores that keep history elsewhere in the
+// metadata database use it too.
 func RedactColumns(ctx context.Context, pool *pgxpool.Pool, r Redactor, table, key string, columns ...string) (int64, error) {
 	var changed int64
 	after := ""
+	names := make([]string, len(columns))
+	arrays := make([]bool, len(columns))
+	for i, c := range columns {
+		names[i], arrays[i] = strings.CutSuffix(c, "[]")
+	}
 	for {
-		rows, err := pool.Query(ctx, `SELECT `+key+`, `+strings.Join(columns, ", ")+` FROM `+table+`
+		rows, err := pool.Query(ctx, `SELECT `+key+`, `+strings.Join(names, ", ")+` FROM `+table+`
 			WHERE `+key+` > $1 ORDER BY `+key+` LIMIT `+fmt.Sprint(redactBatch), after)
 		if err != nil {
 			return changed, err
@@ -39,12 +45,17 @@ func RedactColumns(ctx context.Context, pool *pgxpool.Pool, r Redactor, table, k
 		type record struct {
 			key    string
 			values []*string
+			lists  [][]string
 		}
 		batch, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (record, error) {
-			rec := record{values: make([]*string, len(columns))}
+			rec := record{values: make([]*string, len(columns)), lists: make([][]string, len(columns))}
 			dest := []any{&rec.key}
 			for i := range rec.values {
-				dest = append(dest, &rec.values[i])
+				if arrays[i] {
+					dest = append(dest, &rec.lists[i])
+				} else {
+					dest = append(dest, &rec.values[i])
+				}
 			}
 			return rec, row.Scan(dest...)
 		})
@@ -55,12 +66,19 @@ func RedactColumns(ctx context.Context, pool *pgxpool.Pool, r Redactor, table, k
 			var sets []string
 			args := []any{rec.key}
 			for i, v := range rec.values {
+				if arrays[i] {
+					if list, ok := redactAll(r, rec.lists[i]); ok {
+						args = append(args, list)
+						sets = append(sets, fmt.Sprintf("%s = $%d", names[i], len(args)))
+					}
+					continue
+				}
 				if v == nil {
 					continue
 				}
 				if text, ok := r.Redact(*v); ok {
 					args = append(args, text)
-					sets = append(sets, fmt.Sprintf("%s = $%d", columns[i], len(args)))
+					sets = append(sets, fmt.Sprintf("%s = $%d", names[i], len(args)))
 				}
 			}
 			if len(sets) == 0 {
@@ -78,11 +96,27 @@ func RedactColumns(ctx context.Context, pool *pgxpool.Pool, r Redactor, table, k
 	}
 }
 
+// redactAll redacts each of list, reporting whether any changed.
+func redactAll(r Redactor, list []string) ([]string, bool) {
+	var out []string
+	for i, v := range list {
+		if text, ok := r.Redact(v); ok {
+			if out == nil {
+				out = append([]string(nil), list...)
+			}
+			out[i] = text
+		}
+	}
+	return out, out != nil
+}
+
 // Redact removes r's identifiers from the history: from statements, the
-// query tags they ran under and the applications that sent them, and from
-// the applications that logged in.
+// query tags they ran under, the applications that sent them and the
+// locations outside the catalog they read, whose paths can hold them, and
+// from the applications that logged in.
 func (s *PostgresStore) Redact(ctx context.Context, r Redactor) (int64, error) {
-	n, err := RedactColumns(ctx, s.pool, r, "igloo_audit.query_history", "query_id", "query_text", "query_tag", "application_name")
+	n, err := RedactColumns(ctx, s.pool, r, "igloo_audit.query_history", "query_id", "query_text", "query_tag", "application_name",
+		"locations_read[]")
 	if err != nil {
 		return n, err
 	}
@@ -139,7 +173,11 @@ func (m *MemoryStore) Redact(_ context.Context, r Redactor) (int64, error) {
 	}
 	for i := range m.queries {
 		q := &m.queries[i]
-		redact(&q.Text, &q.QueryTag, &q.ApplicationName)
+		fields := []*string{&q.Text, &q.QueryTag, &q.ApplicationName}
+		for j := range q.LocationsRead {
+			fields = append(fields, &q.LocationsRead[j])
+		}
+		redact(fields...)
 	}
 	for i := range m.logins {
 		redact(&m.logins[i].ApplicationName)

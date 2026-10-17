@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -55,7 +56,10 @@ type Config struct {
 	// Empty means connections store their passwords.
 	ConnectionSecretsDir string
 	// ErasureKey seals open erasure requests' identifiers and salts their
-	// hashes; it is kept out of the metadata database on purpose.
+	// hashes; it is kept out of the metadata database on purpose. It is
+	// IGLOO_ERASURE_KEY, or the contents of the file IGLOO_ERASURE_KEY_FILE
+	// names, as a Kubernetes secret mounts one, without the spaces and line
+	// breaks around it.
 	ErasureKey string
 
 	// StatementTimeout cancels statements that run longer, unless a session
@@ -313,10 +317,21 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	cfg.ConnectionSecretsDir = get("IGLOO_CONNECTION_SECRETS_DIR", "")
-	cfg.ErasureKey = getenv("IGLOO_ERASURE_KEY")
+	cfg.ErasureKey = strings.TrimSpace(getenv("IGLOO_ERASURE_KEY"))
 
 	var errs []error
 	addErr := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+
+	if file := get("IGLOO_ERASURE_KEY_FILE", ""); file != "" {
+		switch b, err := os.ReadFile(file); {
+		case cfg.ErasureKey != "":
+			addErr("set IGLOO_ERASURE_KEY or IGLOO_ERASURE_KEY_FILE, not both")
+		case err != nil:
+			addErr("IGLOO_ERASURE_KEY_FILE: %v", err)
+		default:
+			cfg.ErasureKey = strings.TrimSpace(string(b))
+		}
+	}
 
 	if len(cfg.AdminPassword) < 8 {
 		addErr("IGLOO_ADMIN_PASSWORD must be set to at least 8 characters")
@@ -328,7 +343,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_CONNECTION_SECRETS_DIR %q must be an absolute path", cfg.ConnectionSecretsDir)
 	}
 	if cfg.ErasureKey != "" && len(cfg.ErasureKey) < 32 {
-		addErr("IGLOO_ERASURE_KEY must be at least 32 characters")
+		addErr("the erasure key, IGLOO_ERASURE_KEY or IGLOO_ERASURE_KEY_FILE's, must be at least 32 characters")
 	}
 
 	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {

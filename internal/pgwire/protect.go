@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -733,6 +734,14 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 			return "", nil, checked, err
 		}
 	}
+	if t == duckdb.STATEMENT_TYPE_CREATE && snap.Classified() {
+		if r, ok := parseTableReplace(query); ok {
+			checked = true
+			if err := s.checkReplaceKeeps(ctx, sess, r, nil); err != nil {
+				return "", nil, checked, err
+			}
+		}
+	}
 	if snap.Empty() {
 		return query, g, checked, nil
 	}
@@ -1034,8 +1043,7 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 	if !sc.keywords("ALTER", "TABLE") {
 		return nil
 	}
-	sc.keywords("IF", "EXISTS")
-	name, ok := sc.name()
+	name, ok := sc.alterTarget()
 	if !ok {
 		return nil
 	}
@@ -1074,6 +1082,107 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 		}
 	}
 	return nil
+}
+
+// checkReplaceKeeps refuses a CREATE OR REPLACE TABLE whose new table
+// lacks a column of the old one that has a policy or tags, or that its row
+// access policy reads: they follow names, so the column's values would be
+// left unmasked, or out of reach of erasure requests, under another name.
+// Keep the column, or unset them first. have are the new table's columns,
+// or nil to work them out from the statement: its query's, or its column
+// definitions'.
+func (s *Server) checkReplaceKeeps(ctx context.Context, sess *session, r tableReplace, have []string) error {
+	snap := s.gov.snapshot(ctx)
+	if !snap.Classified() {
+		return nil
+	}
+	objects, err := s.catalogCandidates(ctx, sess, r.target, false)
+	if err != nil {
+		return err
+	}
+	for _, o := range objects {
+		rules := snap.Tagged(o.Schema, o.Table)
+		if rules == nil {
+			continue
+		}
+		if have == nil {
+			if have, err = s.replacementColumns(ctx, sess, r); err != nil {
+				return denied("%s has policies or tags, whose columns a table replacing it must keep, and Igloo cannot tell the new table's columns: %v", o, err)
+			}
+		}
+		keep := slices.Collect(maps.Keys(rules.Columns))
+		if rules.Filter != nil {
+			keep = append(keep, rules.Filter.Columns...)
+		}
+		slices.Sort(keep)
+		for _, col := range keep {
+			if !slices.ContainsFunc(have, func(h string) bool { return strings.EqualFold(h, col) }) {
+				return denied("column %s of %s has a policy or tags, which stay with its name, and the table replacing it has no column %[1]s: "+
+					"keep the column, or unset them first", col, o)
+			}
+		}
+	}
+	return nil
+}
+
+// replacementColumns are the columns of the table a CREATE OR REPLACE TABLE
+// makes: those its query returns, as DuckDB describes it, or those its
+// column definitions name.
+func (s *Server) replacementColumns(ctx context.Context, sess *session, r tableReplace) ([]string, error) {
+	sc := &scanner{s: r.rest}
+	if sc.keywords("AS") {
+		return queryStrings(ctx, sess, "SELECT column_name FROM (DESCRIBE "+strings.TrimRight(strings.TrimSpace(sc.rest()), ";")+")")
+	}
+	if !sc.punct('(') {
+		return nil, errors.New("no column definitions or query")
+	}
+	var cols []string
+	for {
+		switch {
+		case sc.keywords("CONSTRAINT"), sc.keywords("PRIMARY"), sc.keywords("UNIQUE"), sc.keywords("CHECK"), sc.keywords("FOREIGN"):
+		default:
+			name, ok := sc.name()
+			if !ok || len(name) != 1 {
+				return nil, errors.New("cannot read the column definitions")
+			}
+			cols = append(cols, name[0])
+		}
+		last, err := skipDefinition(sc)
+		if err != nil || last {
+			return cols, err
+		}
+	}
+}
+
+// skipDefinition moves sc past the rest of a column or constraint
+// definition, nested parentheses and quoted text included, and its comma,
+// reporting whether it was the last, before the closing parenthesis.
+func skipDefinition(sc *scanner) (last bool, err error) {
+	depth := 0
+	for {
+		sc.skip()
+		if sc.i >= len(sc.s) {
+			return false, errors.New("unterminated column definitions")
+		}
+		switch c := sc.s[sc.i]; {
+		case c == '\'' || c == '"':
+			end := strings.IndexByte(sc.s[sc.i+1:], c)
+			if end < 0 {
+				return false, errors.New("unterminated quoted text")
+			}
+			sc.i += end + 1
+		case c == '(':
+			depth++
+		case c == ')' && depth == 0:
+			return true, nil
+		case c == ')':
+			depth--
+		case c == ',' && depth == 0:
+			sc.i++
+			return false, nil
+		}
+		sc.i++
+	}
 }
 
 // alterEvaluatesRows reports whether an ALTER TABLE action (the text after

@@ -2,14 +2,17 @@ package erasure
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"iter"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -21,6 +24,8 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/compaction"
+
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 )
 
 // The rewrite step removes matching rows from the files of every branch
@@ -29,16 +34,33 @@ import (
 // to NULL in them, and writes what is left in the same commit that
 // replaces the files: rows that arrived since the delete step, or that its
 // DELETE could not name, as in a column renamed by another engine, go too.
+//
+// Its commits are never retried by iceberg-go, which would bring the
+// replaced files back (see its IGLOO_PATCHES.md). A commit that loses to
+// appends is made again on the new head with the files already written; one
+// that loses to anything else is planned again. A table that other writers
+// keep changing faster than that makes the request wait and try again
+// later, without counting it as a failure.
 
 const (
 	// maxPasses bounds how often a ref is rewritten in one run: each pass
 	// rewrites what still matches, so more mean matching rows keep
 	// arriving.
 	maxPasses = 8
-	// tagBranch starts the name of the branch a request rewrites a tag's
-	// snapshot on.
+	// tagBranch starts the names of the branches requests rewrite tags'
+	// snapshots on.
 	tagBranch = "igloo-erasure-"
+	// rebaseAttempts bounds how often one commit is made again on a head
+	// that only appends moved, in one run: a table appended to more often
+	// than that makes the request try again later.
+	rebaseAttempts = 10
+	// maxMoves bounds how often, in one run, a tag is found moved or its
+	// branch gone while the request rewrites it.
+	maxMoves = 5
 )
+
+// errRefGone is a branch dropped while a request rewrote it.
+var errRefGone = errors.New("the branch was dropped")
 
 // refNames are tbl's refs: main, the other branches, then the tags, each
 // by name, but none of the requests' own branches, which come with their
@@ -63,6 +85,20 @@ func refNames(tbl *table.Table) []string {
 	return append(append(out, branches...), tags...)
 }
 
+// branchFor is the branch request r rewrites tag's snapshot id on. It is
+// named after the tag and the snapshot, so that a branch a stopped run
+// left is taken up again only for the same tag at the same snapshot.
+func branchFor(r *Request, tag string, id int64) string {
+	sum := sha256.Sum256([]byte(tag))
+	return tagBranch + strings.ToLower(r.ID) + "-" + hex.EncodeToString(sum[:4]) + "-" + strconv.FormatInt(id, 10)
+}
+
+// ownBranch reports whether ref name is one of r's branches.
+func ownBranch(r *Request, name string) bool {
+	own := tagBranch + strings.ToLower(r.ID)
+	return name == own || strings.HasPrefix(name, own+"-")
+}
+
 // at is tbl as a table whose current snapshot is snapshot id: what scans
 // and commits work from. iceberg-go builds a commit to any branch on the
 // current snapshot, so a commit to another branch is made on this.
@@ -85,38 +121,98 @@ func (s *Service) at(tbl *table.Table, id int64) (*table.Table, error) {
 	return table.New(tbl.Identifier(), meta, tbl.MetadataLocation(), fsF, s.opts.Catalog), nil
 }
 
-// onRef runs pass on ref name of t's table until it changes nothing: on
-// the branch, or for a tag, on a branch of the request's own at the tag's
-// snapshot, whose head then becomes the tag's. pass returns whether it
-// committed; with commit false it only says whether it would.
-func (s *Service) onRef(ctx context.Context, r *Request, t *Table, name string,
-	pass func(ctx context.Context, view *table.Table, branch string, commit bool) (bool, error)) error {
-	tbl, err := s.reload(ctx, t)
-	if err != nil {
-		return err
-	}
-	ref, ok := refs(tbl)[name]
-	if !ok {
-		return nil
-	}
-	branch := name
-	if ref.SnapshotRefType == table.TagRef {
-		branch = tagBranch + strings.ToLower(r.ID)
+// pass rewrites what view's current snapshot holds of a request, committing
+// to branch, and returns whether it committed; with commit false it only
+// says whether it would.
+type pass func(ctx context.Context, view *table.Table, branch string, commit bool) (bool, error)
+
+// onRef runs pass on ref name of t's table until it changes nothing: on a
+// branch itself, and for a tag, on a branch of the request's own at the
+// tag's snapshot, whose head then becomes the tag's. A tag moved or
+// dropped meanwhile is someone's choice, which stands: the branch goes,
+// and a moved tag is rewritten where it points now.
+func (s *Service) onRef(ctx context.Context, r *Request, t *Table, name string, p pass) error {
+	for moves := 0; ; moves++ {
+		if moves > maxMoves {
+			return contended(fmt.Errorf("tag %s of %s kept moving while the request rewrote it", name, t.Name))
+		}
+		tbl, err := s.reload(ctx, t)
+		if err != nil {
+			return err
+		}
+		ref, ok := refs(tbl)[name]
+		if !ok {
+			// Dropped meanwhile: nothing is left to rewrite but a branch
+			// of the request's for it.
+			return s.sweep(ctx, r, t, false)
+		}
+		if ref.SnapshotRefType != table.TagRef {
+			if err := s.passes(ctx, t, name, p); !errors.Is(err, errRefGone) {
+				return err
+			}
+			return nil
+		}
+		original := ref.SnapshotID
+		branch := branchFor(r, name, original)
 		if _, exists := refs(tbl)[branch]; !exists {
-			view, err := s.at(tbl, ref.SnapshotID)
+			view, err := s.at(tbl, original)
 			if err != nil {
 				return err
 			}
-			if needed, err := pass(ctx, view, branch, false); err != nil || !needed {
+			if needed, err := p(ctx, view, branch, false); err != nil || !needed {
 				return err
 			}
-			if err := s.commitRefs(ctx, tbl,
-				[]table.Requirement{table.AssertRefSnapshotID(name, &ref.SnapshotID), table.AssertRefSnapshotID(branch, nil)},
-				table.NewSetSnapshotRefUpdate(branch, ref.SnapshotID, table.BranchRef, 0, 0, 0)); err != nil {
+			err = s.commitRefs(ctx, tbl,
+				[]table.Requirement{table.AssertRefSnapshotID(name, &original), table.AssertRefSnapshotID(branch, nil)},
+				table.NewSetSnapshotRefUpdate(branch, original, table.BranchRef, 0, 0, 0))
+			if errors.Is(err, table.ErrCommitFailed) {
+				continue
+			}
+			if err != nil {
 				return fmt.Errorf("start rewriting tag %s: %w", name, err)
 			}
 		}
+		if err := s.passes(ctx, t, branch, p); errors.Is(err, errRefGone) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if tbl, err = s.reload(ctx, t); err != nil {
+			return err
+		}
+		tag, ok := refs(tbl)[name]
+		head, rewritten := refs(tbl)[branch]
+		if !ok || tag.SnapshotID != original || !rewritten {
+			if err := s.sweep(ctx, r, t, false); err != nil {
+				return err
+			}
+			continue
+		}
+		// The tag points at the rewritten snapshot, with its retention, if
+		// it still points where it did.
+		var maxAge int64
+		if tag.MaxRefAgeMs != nil {
+			maxAge = *tag.MaxRefAgeMs
+		}
+		err = s.commitRefs(ctx, tbl,
+			[]table.Requirement{table.AssertRefSnapshotID(name, &original), table.AssertRefSnapshotID(branch, &head.SnapshotID)},
+			table.NewSetSnapshotRefUpdate(name, head.SnapshotID, table.TagRef, maxAge, 0, 0), table.NewRemoveSnapshotRefUpdate(branch))
+		if errors.Is(err, table.ErrCommitFailed) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("move tag %s to its rewritten snapshot: %w", name, err)
+		}
+		if !slices.Contains(t.Refs, name) {
+			t.Refs = append(t.Refs, name)
+		}
+		return nil
 	}
+}
+
+// passes runs p on branch until it changes nothing. A commit that loses
+// to another is planned again, as often as commitAttempts.
+func (s *Service) passes(ctx context.Context, t *Table, branch string, p pass) error {
 	for n, conflicts := 1, 0; ; {
 		tbl, err := s.reload(ctx, t)
 		if err != nil {
@@ -124,50 +220,74 @@ func (s *Service) onRef(ctx context.Context, r *Request, t *Table, name string,
 		}
 		head, ok := refs(tbl)[branch]
 		if !ok {
-			return fmt.Errorf("branch %s of %s was dropped while the request rewrote it", branch, t.Name)
+			return errRefGone
 		}
 		view, err := s.at(tbl, head.SnapshotID)
 		if err != nil {
 			return err
 		}
-		changed, err := pass(ctx, view, branch, true)
-		if errors.Is(err, table.ErrCommitFailed) && conflicts < commitAttempts {
-			conflicts++
+		changed, err := p(ctx, view, branch, true)
+		var c contentionError
+		if errors.As(err, &c) {
+			return err
+		}
+		if errors.Is(err, table.ErrCommitFailed) {
+			if conflicts++; conflicts >= commitAttempts {
+				return contended(fmt.Errorf("rewrite %s of %s: other writers' commits kept coming first: %w", branch, t.Name, err))
+			}
 			continue
 		}
 		if err != nil {
 			return err
 		}
 		if !changed {
-			break
+			return nil
 		}
 		if n++; n > maxPasses {
-			return fmt.Errorf("matching rows keep arriving in %s, on %s: stop the writes that add them, and the request goes on", t.Name, name)
+			return fmt.Errorf("matching rows keep arriving in %s, on %s: stop the writes that add them, and the request goes on", t.Name, branch)
 		}
 	}
-	if branch == name {
+}
+
+// sweep drops r's branches of t's table that no tag needs any more: those
+// of tags dropped or moved, or, with all, every one.
+func (s *Service) sweep(ctx context.Context, r *Request, t *Table, all bool) error {
+	for attempt := 0; ; attempt++ {
+		tbl, err := s.reload(ctx, t)
+		if err != nil {
+			return err
+		}
+		current := refs(tbl)
+		needed := map[string]bool{}
+		for name, ref := range current {
+			if ref.SnapshotRefType == table.TagRef && !all {
+				needed[branchFor(r, name, ref.SnapshotID)] = true
+			}
+		}
+		var (
+			reqs    []table.Requirement
+			updates []table.Update
+		)
+		for name, ref := range current {
+			if ownBranch(r, name) && !needed[name] {
+				id := ref.SnapshotID
+				reqs = append(reqs, table.AssertRefSnapshotID(name, &id))
+				updates = append(updates, table.NewRemoveSnapshotRefUpdate(name))
+			}
+		}
+		if len(updates) == 0 {
+			return nil
+		}
+		err = s.commitRefs(ctx, tbl, reqs, updates...)
+		if errors.Is(err, table.ErrCommitFailed) && attempt < commitAttempts {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("drop the request's branches of %s: %w", t.Name, err)
+		}
+		s.log.Info("dropped branches an erasure request rewrote tags on", "request", r.ID, "table", t.Name, "branches", len(updates))
 		return nil
 	}
-	// The tag now points at the rewritten snapshot, with its retention.
-	tbl, err = s.reload(ctx, t)
-	if err != nil {
-		return err
-	}
-	head := refs(tbl)[branch].SnapshotID
-	tag := refs(tbl)[name]
-	var maxAge int64
-	if tag.MaxRefAgeMs != nil {
-		maxAge = *tag.MaxRefAgeMs
-	}
-	if err := s.commitRefs(ctx, tbl,
-		[]table.Requirement{table.AssertRefSnapshotID(name, &tag.SnapshotID), table.AssertRefSnapshotID(branch, &head)},
-		table.NewSetSnapshotRefUpdate(name, head, table.TagRef, maxAge, 0, 0), table.NewRemoveSnapshotRefUpdate(branch)); err != nil {
-		return fmt.Errorf("move tag %s to its rewritten snapshot: %w", name, err)
-	}
-	if !slices.Contains(t.Refs, name) {
-		t.Refs = append(t.Refs, name)
-	}
-	return nil
 }
 
 func (s *Service) commitRefs(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates ...table.Update) error {
@@ -207,8 +327,9 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	if err != nil {
 		return false, err
 	}
+	live := head.live(true)
 	deletes := map[string]iceberg.DataFile{}
-	for p, df := range head.live(true) {
+	for p, df := range live {
 		if df.ContentType() == iceberg.EntryContentEqDeletes && scannable(df) {
 			deletes[p] = df
 			paths = append(paths, p)
@@ -250,7 +371,7 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 		if !commit {
 			return true, nil
 		}
-		return true, s.rewriteFiles(ctx, r, t, view, branch, flds, selected, dangling)
+		return true, s.rewriteFiles(ctx, r, t, view, branch, flds, selected, dangling, live)
 	}
 	bad, err := s.matched(ctx, r)
 	if err != nil {
@@ -265,12 +386,22 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	return true, s.forget(ctx, view, branch, bad)
 }
 
+// batch is one commit of a rewrite: the data files it replaces and those
+// that replace them, and the delete files it removes.
+type batch struct {
+	old, added, removed []iceberg.DataFile
+	stats               filterStats
+}
+
 // rewriteFiles writes the tasks' data files again with their deletes
 // applied and without matching rows, a partition at a time and at most
-// maxRewriteBytes per commit, and removes the dead equality deletes and
-// those that apply to no file.
+// maxRewriteBytes per commit. Each commit removes the equality deletes
+// that apply to no file left, those that apply to no file at all, and
+// the position deletes that delete rows only of files it replaces or of
+// files no longer live (see package deletefiles); live are the files live
+// in view's current snapshot.
 func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *table.Table, branch string, flds []field,
-	tasks []table.FileScanTask, dangling []iceberg.DataFile) error {
+	tasks []table.FileScanTask, dangling []iceberg.DataFile, live map[string]iceberg.DataFile) error {
 	byPartition := map[string]*table.CompactionTaskGroup{}
 	for _, task := range tasks {
 		key := partitionKey(task.File)
@@ -293,6 +424,8 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 			groups []*table.CompactionTaskGroup
 			total  int64
 			paths  = map[string]struct{}{}
+			tasks  []table.FileScanTask
+			b      batch
 		)
 		for len(keys) > 0 && (len(groups) == 0 || total+byPartition[keys[0]].TotalSizeBytes <= maxRewriteBytes) {
 			g := byPartition[keys[0]]
@@ -300,20 +433,17 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 			for _, task := range g.Tasks {
 				paths[task.File.FilePath()] = struct{}{}
 			}
+			tasks = append(tasks, g.Tasks...)
 		}
-		tx := view.NewTransactionOnBranch(branch)
-		rw := tx.NewRewrite(operation)
-		var stats filterStats
 		for _, g := range groups {
-			added, err := s.rewriteGroup(ctx, view, g, filter, &stats)
+			added, err := s.rewriteGroup(ctx, view, g, filter, &b.stats)
 			if err != nil {
 				return err
 			}
-			var old []iceberg.DataFile
 			for _, task := range g.Tasks {
-				old = append(old, task.File)
+				b.old = append(b.old, task.File)
 			}
-			rw.Apply(old, added, table.CollectSafePositionDeletes(g.Tasks))
+			b.added = append(b.added, added...)
 			for _, df := range added {
 				r.written[df.FilePath()] = true
 			}
@@ -322,35 +452,102 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 		if err != nil {
 			return fmt.Errorf("find dead equality deletes: %w", err)
 		}
+		rewritten, current := deletefiles.Paths{}, deletefiles.Paths{}
+		for p := range paths {
+			rewritten.Add(p)
+		}
+		for p := range live {
+			current.Add(p)
+		}
+		safe, err := s.targets.Removable(ctx, fsys, tasks, rewritten, current)
+		if err != nil {
+			return fmt.Errorf("find the position deletes the rewrite may remove: %w", err)
+		}
 		removed := map[string]bool{}
-		for _, d := range append(dead, dangling...) {
+		for _, d := range slices.Concat(dead, dangling, safe) {
 			if !removed[d.FilePath()] {
 				removed[d.FilePath()] = true
-				rw.DeleteFile(d)
+				b.removed = append(b.removed, d)
 			}
 		}
 		dangling = nil
-		if err := rw.Commit(ctx); err != nil {
-			return err
-		}
-		committed, err := tx.Commit(ctx)
+		committed, err := s.commitBatch(ctx, t, view, branch, &b)
 		if err != nil {
 			return err
 		}
 		t.FilesRewritten += len(paths)
-		t.RowsDeleted += stats.dropped
-		t.ValuesNulled += stats.nulled
+		t.RowsDeleted += b.stats.dropped
+		t.ValuesNulled += b.stats.nulled
 		if branch != table.MainBranch && !strings.HasPrefix(branch, tagBranch) && !slices.Contains(t.Refs, branch) {
 			t.Refs = append(t.Refs, branch)
 		}
 		s.log.Info("rewrote files holding erased data", "request", r.ID, "table", t.Name, "branch", branch,
-			"files", len(paths), "rows", stats.dropped, "nulled", stats.nulled)
+			"files", len(paths), "rows", b.stats.dropped, "nulled", b.stats.nulled)
 		head := refs(committed)[branch]
 		if view, err = s.at(committed, head.SnapshotID); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// commitBatch commits b to branch on view's current snapshot. When
+// another commit came first and only appended to the branch since, it
+// commits b again on the new head, with the files it wrote: appends add
+// data files only, and none of them is one b replaces or a delete that
+// applies to one. Otherwise it returns table.ErrCommitFailed, and the
+// rewrite is planned again; after rebaseAttempts, a contention error, and
+// the request tries again later.
+func (s *Service) commitBatch(ctx context.Context, t *Table, view *table.Table, branch string, b *batch) (*table.Table, error) {
+	for attempt := 0; ; attempt++ {
+		tx := view.NewTransactionOnBranch(branch)
+		rw := tx.NewRewrite(operation)
+		rw.Apply(b.old, b.added, b.removed)
+		if err := rw.Commit(ctx); err != nil {
+			return nil, err
+		}
+		committed, err := tx.CommitWithoutRetry(ctx)
+		if err == nil || !errors.Is(err, table.ErrCommitFailed) {
+			return committed, err
+		}
+		if attempt+1 >= rebaseAttempts {
+			return nil, contended(fmt.Errorf("rewrite %s of %s: other writers' appends kept coming first: %w", branch, t.Name, err))
+		}
+		tbl, rerr := s.reload(ctx, t)
+		if rerr != nil {
+			return nil, rerr
+		}
+		head, ok := refs(tbl)[branch]
+		if !ok {
+			return nil, errRefGone
+		}
+		if !appendedSince(tbl, view.CurrentSnapshot().SnapshotID, head.SnapshotID) {
+			return nil, err
+		}
+		if view, err = s.at(tbl, head.SnapshotID); err != nil {
+			return nil, err
+		}
+		// A little jitter keeps the commit from meeting a steady writer's
+		// at the same moment each time.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(rand.Int64N(int64(10*time.Millisecond) << min(attempt, 4)))):
+		}
+	}
+}
+
+// appendedSince reports whether every snapshot from head back to base, in
+// tbl, is an append.
+func appendedSince(tbl *table.Table, base, head int64) bool {
+	for id := head; id != base; {
+		snap := tbl.SnapshotByID(id)
+		if snap == nil || snap.Summary == nil || snap.Summary.Operation != table.OpAppend || snap.ParentSnapshotID == nil {
+			return false
+		}
+		id = *snap.ParentSnapshotID
+	}
+	return true
 }
 
 // rewriteGroup writes a group's files again, filtered.
@@ -405,8 +602,9 @@ func partitionKey(df iceberg.DataFile) string {
 
 // forget writes view's current manifests again without the bad files,
 // which are no longer live there, so they no longer list them as
-// deleted, with their column bounds, committing to branch.
-func (s *Service) forget(ctx context.Context, view *table.Table, branch string, bad map[string]bool) error {
+// deleted, with their column bounds, committing to branch. The commit is
+// never retried by iceberg-go: one that loses is planned again.
+func (s *Service) forget(ctx context.Context, view *table.Table, branch string, bad pathSet) error {
 	tf, err := readCurrent(ctx, view)
 	if err != nil {
 		return err
@@ -414,7 +612,7 @@ func (s *Service) forget(ctx context.Context, view *table.Table, branch string, 
 	mentioned := map[string]struct{}{}
 	for _, m := range tf.manifests[tf.current()] {
 		for _, e := range tf.entries[m] {
-			if !bad[e.file.FilePath()] {
+			if !bad.has(e.file.FilePath()) {
 				continue
 			}
 			if e.live() {
@@ -430,7 +628,7 @@ func (s *Service) forget(ctx context.Context, view *table.Table, branch string, 
 	if err := tx.ForgetFiles(ctx, mentioned, operation); err != nil {
 		return err
 	}
-	_, err = tx.Commit(ctx)
+	_, err = tx.CommitWithoutRetry(ctx)
 	return err
 }
 
@@ -440,6 +638,7 @@ func (s *Service) forget(ctx context.Context, view *table.Table, branch string, 
 // lower-cased and trimmed.
 type rowFilter struct {
 	salt string
+	fold *folding
 	cols []filterColumn
 }
 
@@ -452,7 +651,7 @@ type filterColumn struct {
 type filterStats struct{ dropped, nulled int64 }
 
 func newRowFilter(r *Request, flds []field) *rowFilter {
-	f := &rowFilter{salt: r.salt}
+	f := &rowFilter{salt: r.salt, fold: r.fold}
 	for _, fl := range flds {
 		if fl.current == "" {
 			// A dropped column is not written again: its values go with it.
@@ -492,7 +691,7 @@ func (f *rowFilter) apply(ctx context.Context, rec arrow.RecordBatch, stats *fil
 			if err != nil {
 				return nil, fmt.Errorf("column %s: %w", c.name, err)
 			}
-			if c.hashes[salted(f.salt, goNormal(text))] {
+			if c.hashes[salted(f.salt, f.fold.normal(text))] {
 				hit[i], found = true, true
 			}
 		}

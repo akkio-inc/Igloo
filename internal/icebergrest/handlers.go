@@ -723,7 +723,7 @@ func (s *Server) recordOwner(c *call, o auth.Object) {
 // reach of its policies and of erasure requests.
 func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req commitRequest) error {
 	if s.opts.Classified == nil || !slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
-		return u.Action == "add-schema" || u.Action == "set-current-schema"
+		return u.Action == "add-schema" || u.Action == "set-current-schema" || u.Action == "remove-schemas"
 	}) {
 		return nil
 	}
@@ -756,32 +756,65 @@ func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req 
 		}
 		return nil
 	}
-	current, next := byID(loaded.Metadata.Current), byID(loaded.Metadata.Current)
-	for _, u := range req.Updates {
-		switch {
-		case u.Action == "add-schema" && u.Schema != nil:
-			schemas = append(schemas, *u.Schema)
-		case u.Action == "set-current-schema" && u.SchemaID != nil:
-			if *u.SchemaID == -1 {
-				next = &schemas[len(schemas)-1]
-			} else {
-				next = byID(*u.SchemaID)
-			}
-		}
-	}
-	if current == nil || next == nil || next == current {
+	current := byID(loaded.Metadata.Current)
+	if current == nil {
 		return nil
 	}
-	for _, name := range columns {
-		id, _, typ, ok := current.field(0, name)
-		if !ok {
-			continue
+	refuse := func(name string) error {
+		if name == "" {
+			name = strings.Join(columns, ", ")
 		}
-		_, newName, newTyp, found := next.field(id, "")
-		otherID, _, _, other := next.field(0, name)
-		if !found || !strings.EqualFold(newName, name) || newTyp != typ || other && otherID != id {
-			return c.who.deny(fmt.Sprintf("column %s of %s has a policy or tags, which stay with its name; "+
-				"unset them before renaming or dropping it or changing its type", name, o))
+		return c.who.deny(fmt.Sprintf("column %s of %s has a policy or tags, which stay with its name; "+
+			"unset them before renaming or dropping it or changing its type", name, o))
+	}
+	// lost is the first classified column of the current schema that next
+	// does not keep as the same field, by name and type, or "".
+	lost := func(next *schemaJSON) string {
+		for _, name := range columns {
+			id, _, typ, ok := current.field(0, name)
+			if !ok {
+				continue
+			}
+			_, newName, newTyp, found := next.field(id, "")
+			otherID, _, _, other := next.field(0, name)
+			if !found || !strings.EqualFold(newName, name) || newTyp != typ || other && otherID != id {
+				return name
+			}
+		}
+		return ""
+	}
+	// Every schema the commit adds is checked, whatever ID it claims:
+	// catalogs assign their own, so set-current-schema may name an added
+	// schema by an ID the request never wrote. An ID that names none of the
+	// table's schemas can only be one of those. Old schemas name the
+	// columns' fields as they were, which erasure requests find values by,
+	// so none is removed.
+	added := false
+	for _, u := range req.Updates {
+		switch u.Action {
+		case "remove-schemas":
+			return c.who.deny(fmt.Sprintf("%s has policies or tags, whose columns its old schemas name; its schemas are not removed", o))
+		case "add-schema":
+			if u.Schema == nil {
+				return refuse("")
+			}
+			if name := lost(u.Schema); name != "" {
+				return refuse(name)
+			}
+			added = true
+		case "set-current-schema":
+			switch {
+			case u.SchemaID == nil:
+				return refuse("")
+			case *u.SchemaID == -1 || byID(*u.SchemaID) == nil:
+				if !added {
+					return refuse("")
+				}
+			default:
+				if name := lost(byID(*u.SchemaID)); name != "" {
+					return refuse(name)
+				}
+			}
 		}
 	}
 	return nil

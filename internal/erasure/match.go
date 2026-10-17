@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -51,35 +52,80 @@ type identifier struct {
 	Normal string `json:"n"`
 }
 
-// goNormal is Go's approximation of DuckDB's lower(trim(...)), which trims
-// space separators (Unicode's Zs) and lower-cases by tables of its own.
-// Identifiers are normalized by DuckDB; checks made in Go compare both.
-func goNormal(s string) string {
-	return strings.ToLower(strings.TrimFunc(s, func(r rune) bool { return unicode.Is(unicode.Zs, r) }))
-}
-
-// forms are what values of an identifier compare as in checks made in Go.
-func (id identifier) forms() []string {
-	if g := goNormal(id.Given); g != id.Normal {
-		return []string{id.Normal, g}
-	}
-	return []string{id.Normal}
-}
-
 // sentinels are values that stand for no identifier at all, which systems
 // write by the million: an opted-out device's all-zero advertising ID, and
 // placeholders. A request for one would erase everyone it stands for.
-var sentinels = []string{"null", "nil", "none", "unknown", "undefined", "n/a", "na", "-", "--", "?",
-	"default", "anonymous", "not set", "(not set)", "notset", "unset", "empty", "blank", "test", "true", "false"}
+var sentinels = []string{"null", "nil", "none", "unknown", "undefined", "n/a", "na", "nan", "-", "--", "?",
+	"default", "anonymous", "not set", "notset", "unset", "empty", "blank", "test", "true", "false",
+	"noemail@noemail.com", "no@email.com", "none@none.com", "test@test.com", "email@email.com", "example@example.com"}
 
 // sentinel reports whether a normalized identifier is such a placeholder,
-// or made of zeros and separators alone.
+// whatever brackets, quotes or spaces are around it ({null}, <null>,
+// (not set), ' null '), or a number that stands for none: one made of
+// zeros (in any script's digits, with separators, a 0x prefix or an
+// exponent: 0, 0x0, 0e0, {00000000-0000-...}), -1, or the all-F ID.
 func sentinel(n string) bool {
-	if slices.Contains(sentinels, n) {
+	n = strings.TrimFunc(n, func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune(`{}[]()<>"'`+"`", r) })
+	n = strings.TrimFunc(n, unicode.IsSpace)
+	if slices.Contains(sentinels, n) || n == "" {
 		return true
 	}
-	return strings.Trim(n, "0-:._ ") == ""
+	var digits strings.Builder
+	for _, r := range n {
+		switch {
+		case unicode.IsDigit(r):
+			if v, ok := digitValue(r); ok {
+				r = '0' + v
+			}
+			digits.WriteRune(r)
+		case strings.ContainsRune("-:._ {}+", r) || unicode.IsSpace(r):
+		default:
+			digits.WriteRune(r)
+		}
+	}
+	d := strings.TrimPrefix(digits.String(), "0x")
+	switch {
+	case strings.Trim(d, "0") == "", strings.Contains(d, "0") && strings.Trim(strings.Replace(d, "e", "", 1), "0") == "":
+		return true
+	case n == "-1", n == "-01":
+		return true
+	case len(d) >= 8 && strings.Trim(d, "f") == "":
+		return true
+	}
+	return false
 }
+
+// digitValue is a decimal digit's value, in the scripts whose digits are
+// most used.
+func digitValue(r rune) (rune, bool) {
+	for _, zero := range []rune{'0', '٠', '۰', '߀', '०', '০', '੦', '૦', '୦', '௦', '౦', '೦', '൦', '෦', '๐', '໐', '༠', '၀', '႐', '០', '᠐', '０'} {
+		if r >= zero && r <= zero+9 {
+			return r - zero, true
+		}
+	}
+	return 0, false
+}
+
+// sentinelDigest reports whether a normalized identifier is the hex digest
+// of a placeholder: hashed tables hold the SHA-256 of the empty string for
+// every row without an email, and digests of "null" and the like as often.
+func sentinelDigest(n string) bool {
+	return placeholderDigests[n]
+}
+
+// placeholderDigests are the hex digests, by every algorithm in digests,
+// of the empty string and the placeholders, as they are and upper-cased.
+var placeholderDigests = func() map[string]bool {
+	out := map[string]bool{}
+	for _, p := range append([]string{"", " ", "0", "-1"}, sentinels...) {
+		for _, form := range []string{p, strings.ToUpper(p)} {
+			for _, digest := range digests {
+				out[hex.EncodeToString(digest([]byte(form)))] = true
+			}
+		}
+	}
+	return out
+}()
 
 // sealer seals and unseals requests' identifiers, and derives their
 // hashes' salts, under the erasure key.
@@ -120,8 +166,8 @@ func (k *sealer) sealIDs(id string, ids [][]identifier) (string, error) {
 
 // errKey means a request's identifiers cannot be unsealed: the erasure key
 // is not the one they were sealed under.
-var errKey = errors.New("the request's identifiers cannot be unsealed: IGLOO_ERASURE_KEY is not the key they were sealed under; " +
-	"set it back, or make the request again")
+var errKey = errors.New("this replica cannot unseal the request's identifiers: its erasure key, IGLOO_ERASURE_KEY, " +
+	"is not the key they were sealed under; set that key on every replica, and the request goes on")
 
 func (k *sealer) unsealIDs(id, sealed string) ([][]identifier, error) {
 	b, err := base64.StdEncoding.DecodeString(sealed)
@@ -171,9 +217,7 @@ func (sub *Subject) hash(salt string) {
 		}
 	}
 	for _, id := range sub.ids {
-		for _, f := range id.forms() {
-			add(plain, f)
-		}
+		add(plain, id.Normal)
 		for name, digest := range digests {
 			if byDigest[name] == nil {
 				byDigest[name] = map[string]bool{}
@@ -242,13 +286,14 @@ func truncations(s string) []string {
 // matcher answers whether values are a request's identifiers.
 type matcher struct {
 	salt string
+	fold *folding
 	// exact are the hashes of identifiers and their digests; prefixes of
 	// their truncations in bounds.
 	exact, prefixes map[string]bool
 }
 
 func newMatcher(r *Request) *matcher {
-	m := &matcher{salt: r.salt, exact: map[string]bool{}, prefixes: map[string]bool{}}
+	m := &matcher{salt: r.salt, fold: r.fold, exact: map[string]bool{}, prefixes: map[string]bool{}}
 	for _, s := range r.Subjects {
 		for _, h := range s.plain {
 			m.exact[h] = true
@@ -265,30 +310,35 @@ func newMatcher(r *Request) *matcher {
 	return m
 }
 
-func (m *matcher) matches(s string) bool { return m.exact[salted(m.salt, goNormal(s))] }
+func (m *matcher) matches(s string) bool { return m.exact[salted(m.salt, m.fold.normal(s))] }
 
 // matchesBound reports whether a manifest bound may hold an identifier: it
 // is one, or what one is truncated to.
 func (m *matcher) matchesBound(s string) bool {
-	h := salted(m.salt, goNormal(s))
+	h := salted(m.salt, m.fold.normal(s))
 	return m.exact[h] || m.prefixes[h]
 }
 
 // redactor removes a request's identifiers from history text, wherever
-// they are in it: every occurrence of an identifier, compared as its forms
-// are and without regard to case, or of a hex digest of it, that is not
-// part of a longer word (an identifier that starts or ends with a letter
-// or digit must not have one beside it there). It implements
-// audit.Redactor.
+// they are in it: every occurrence of an identifier, compared without
+// regard to case, as it is, with its quotes doubled as in an SQL string,
+// as URLs and paths escape it (o%27brien%40), or of a hex digest of it,
+// that is not part of a longer word (an identifier that starts or ends
+// with a letter or digit must not have one beside it there). It
+// implements audit.Redactor.
 type redactor struct {
-	ac *automaton
+	ac   *automaton
+	fold *folding
 }
 
 func newRedactor(r *Request) *redactor {
 	var patterns []string
 	for _, s := range r.Subjects {
 		for _, id := range s.ids {
-			patterns = append(patterns, id.forms()...)
+			for _, form := range []string{id.Normal, r.fold.normal(id.Given)} {
+				patterns = append(patterns, form, strings.ReplaceAll(form, "'", "''"),
+					url.PathEscape(form), url.QueryEscape(form))
+			}
 			for _, digest := range digests {
 				for _, form := range []string{id.Given, id.Normal} {
 					patterns = append(patterns, hex.EncodeToString(digest([]byte(form))))
@@ -296,9 +346,12 @@ func newRedactor(r *Request) *redactor {
 			}
 		}
 	}
+	for i, p := range patterns {
+		patterns[i] = r.fold.normal(p)
+	}
 	slices.Sort(patterns)
 	patterns = slices.Compact(slices.DeleteFunc(patterns, func(p string) bool { return p == "" }))
-	return &redactor{ac: newAutomaton(patterns)}
+	return &redactor{ac: newAutomaton(patterns), fold: r.fold}
 }
 
 // Redact implements audit.Redactor.
@@ -313,7 +366,7 @@ func (x *redactor) Redact(text string) (string, bool) {
 	start := make([]int, 0, len(text)+1)
 	for i, r := range text {
 		n := len(low)
-		low = utf8.AppendRune(low, unicode.ToLower(r))
+		low = x.fold.appendLower(low, r)
 		for range len(low) - n {
 			start = append(start, i)
 		}
@@ -438,8 +491,9 @@ func (a *automaton) find(text []byte) [][2]int {
 	return out
 }
 
-// longHex is how hashes look in error messages.
-var longHex = regexp.MustCompile(`[0-9a-fA-F]{32,}`)
+// longHex is how hashes look in error messages: DuckDB truncates long
+// values it quotes, so a hash can show as few as 16 of its digits.
+var longHex = regexp.MustCompile(`[0-9a-fA-F]{16,}`)
 
 // scrub removes from a failed run's error what could identify the person:
 // the identifiers, and hashes, which DuckDB quotes from statements.
