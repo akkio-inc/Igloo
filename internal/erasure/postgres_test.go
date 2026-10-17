@@ -2,6 +2,7 @@ package erasure
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -125,6 +126,20 @@ func testStore(t *testing.T, s Store) {
 	}
 	if c := cacheOf(); !c.Emptied.Equal(deleted) {
 		t.Errorf("emptied: %v, want %v", c.Emptied, deleted)
+	}
+
+	// A request that deleted at a time with nanoseconds, which PostgreSQL
+	// rounds to microseconds, down as often as not, is not left waiting for
+	// a cache that was emptied through it.
+	r.DeletedThrough = deleted.Add(time.Hour + 400*time.Nanosecond)
+	if err := s.Save(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewPurger(s, &readCache{}, cache, "replica-1", slog.New(slog.DiscardHandler)).Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, waiting, err := New(Options{Store: s}).caches(ctx, r); err != nil || slices.Contains(waiting, "replica-1") {
+		t.Errorf("waits for %q, %v; the cache was emptied through %v", waiting, err, cacheOf().Emptied)
 	}
 }
 

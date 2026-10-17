@@ -1134,8 +1134,10 @@ func (s *Service) delete(ctx context.Context, r *Request, tables []loaded, files
 	var paths []string
 	defer func() {
 		// Whatever happens, replicas must empty their caches of what went.
+		// The time is kept as the metadata database keeps times, to the
+		// microsecond (see caches).
 		if len(paths) > 0 {
-			r.DeletedThrough = s.now()
+			r.DeletedThrough = s.now().Truncate(time.Microsecond)
 		}
 	}()
 	for _, f := range files {
@@ -1340,10 +1342,14 @@ func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int,
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	// Replicas record that they emptied their caches through the latest
+	// deletion as the metadata database has it, to the microsecond: a
+	// request's own time, to the nanosecond, could be after it for ever.
+	through := r.DeletedThrough.Truncate(time.Microsecond)
 	now := s.now()
 	for _, c := range caches {
 		switch {
-		case !c.Emptied.Before(r.DeletedThrough):
+		case !c.Emptied.Before(through):
 			emptied++
 		case now.Sub(c.Seen) < liveWindow:
 			waiting = append(waiting, c.Host)
