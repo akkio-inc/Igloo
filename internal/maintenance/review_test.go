@@ -237,3 +237,60 @@ func TestRetentionForever(t *testing.T) {
 		t.Errorf("millis")
 	}
 }
+
+// A rewrite of the files an old delete hits keeps a newer position delete
+// file that also deletes rows of a file it does not rewrite: those rows
+// stay deleted.
+func TestPurgeDeletedKeepsDeletesOfOtherFiles(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cat := people(t, iceberg.Properties{}, []string{"ann@example.com", "bo@example.com"}, []string{"cy@example.com", "di@example.com"})
+	// An old delete: ann, in the first file.
+	if _, err := cat.tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("email"), "ann@example.com"), nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	// A recent one: bo (first file) and cy (second file), in one file.
+	if _, err := cat.tbl.Delete(ctx, iceberg.IsIn(iceberg.Reference("email"), "bo@example.com", "cy@example.com"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := emails(t, cat.tbl); !slices.Equal(got, []string{"di@example.com"}) {
+		t.Fatalf("rows before: %v", got)
+	}
+	m := New(nil, "", Options{Retention: 7 * 24 * time.Hour}, log)
+	tbl, err := m.purgeDeleted(ctx, cat.tbl, 150*time.Millisecond, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := emails(t, tbl); !slices.Equal(got, []string{"di@example.com"}) {
+		t.Errorf("rows after purgeDeleted: %v: a row a recent DELETE removed came back", got)
+	}
+}
+
+// The rewrite of rows deleted longer ago than a data retention is not
+// retried by iceberg-go either.
+func TestPurgeDeletedIsNotRetried(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cat := people(t, iceberg.Properties{table.CommitNumRetriesKey: "3"}, []string{"ann@example.com", "bo@example.com"}, []string{"cy@example.com"})
+	if _, err := cat.tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("email"), "ann@example.com"), nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	id, raced := int64(100), false
+	cat.before = func(updates []table.Update) {
+		if raced || !slices.ContainsFunc(updates, func(u table.Update) bool { return u.Action() == table.UpdateAddSnapshot }) {
+			return
+		}
+		raced = true
+		appendEmails(t, ctx, cat, &id, "zed@example.com")
+	}
+	m := New(nil, "", Options{Retention: 7 * 24 * time.Hour}, log)
+	_, err := m.purgeDeleted(ctx, cat.tbl, 100*time.Millisecond, log)
+	if !raced || !errors.Is(err, table.ErrCommitFailed) {
+		t.Fatalf("raced %v, err %v", raced, err)
+	}
+	if got := emails(t, cat.tbl); !slices.Equal(got, []string{"bo@example.com", "cy@example.com", "zed@example.com"}) {
+		t.Errorf("rows: %v", got)
+	}
+}

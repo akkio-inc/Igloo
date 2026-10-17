@@ -752,25 +752,13 @@ func (m *Maintainer) purgeDeleted(ctx context.Context, tbl *table.Table, limit t
 	if len(rewrite) == 0 {
 		return tbl, nil
 	}
-	deadDeletes, err := compaction.CollectDeadEqualityDeletes(ctx, fs, snap, rewrite)
-	if err != nil {
-		return tbl, fmt.Errorf("find dead equality deletes: %w", err)
+	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "purge-deleted")
+	if err != nil || res.removed == 0 {
+		return committed, err
 	}
-	tx := tbl.NewTransaction()
-	res, err := tx.RewriteDataFiles(ctx, groups, table.RewriteDataFilesOptions{
-		ExtraDeleteFilesToRemove: deadDeletes,
-		SnapshotProps:            map[string]string{"igloo.operation": "purge-deleted"},
-	})
-	if err != nil {
-		return tbl, err
-	}
-	committed, err := tx.Commit(ctx)
-	if err != nil {
-		return tbl, err
-	}
-	m.opts.Metrics.compacted(res.RemovedDataFiles, res.AddedDataFiles)
+	m.opts.Metrics.compacted(res.removed, res.added)
 	log.Info("rewrote files whose deleted rows are older than the data retention",
-		"files", res.RemovedDataFiles, "retention", limit)
+		"files", res.removed, "retention", limit)
 	return committed, nil
 }
 
