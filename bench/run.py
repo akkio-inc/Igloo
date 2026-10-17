@@ -126,6 +126,23 @@ def server_seconds(conn, platform: str, query_ids: list[str]) -> dict[str, float
     return {qid: times[qid] for qid in query_ids if qid in times}
 
 
+def snowflake_generation(conn) -> int | None:
+    """The hardware generation of the session's warehouse (1 or 2), which
+    sets its credits per hour. Warehouses made before Gen2 existed report
+    neither field and are Gen1."""
+    cur = conn.cursor()
+    cur.execute("SHOW WAREHOUSES LIKE %s", (os.environ["SNOWFLAKE_WAREHOUSE"],))
+    cols = [c[0] for c in cur.description]
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return None
+    info = dict(zip(cols, row))
+    if str(info.get("generation") or "").isdigit():
+        return int(info["generation"])
+    return 2 if str(info.get("resource_constraint") or "").endswith("GEN_2") else 1
+
+
 def databricks_seconds(query_ids: list[str]) -> dict[str, float]:
     """Statement durations from Databricks query history, which lags a
     little behind execution."""
@@ -156,6 +173,8 @@ def main() -> None:
     p.add_argument("--runs", type=int, default=3, help="warm runs after the cold one")
     p.add_argument("--out", type=pathlib.Path, help="results file (default bench/results/<platform>-<size>-sf<scale>.json)")
     p.add_argument("--storage", help="Igloo only: where table data lives, e.g. S3 or local disk, for the report")
+    p.add_argument("--disk", help="Igloo only: the machine's disk, a name from [igloo.disks] in pricing.toml "
+                                  "(default: the [igloo] disk setting)")
     p.add_argument("--scale-to-zero", action="store_true",
                    help="Igloo only: the client connects through the scale-to-zero gateway to a stopped machine, "
                         "so the connect time is the time to resume")
@@ -171,6 +190,13 @@ def main() -> None:
     cur.close()
     connect_seconds = time.perf_counter() - start
     print(f"{args.platform}: connected in {connect_seconds:.2f}s", flush=True)
+    # What the report needs to price the run beyond its size.
+    variant = {}
+    if args.platform == "snowflake":
+        variant["generation"] = snowflake_generation(conn)
+        print(f"snowflake: Gen{variant['generation']} warehouse", flush=True)
+    if args.platform == "igloo" and args.disk:
+        variant["disk"] = args.disk
 
     results = []
     for name, sql in load_queries(args.suite, args.platform):
@@ -215,6 +241,7 @@ def main() -> None:
         "connect_seconds": connect_seconds,
         "scale_to_zero": args.scale_to_zero,
         "storage": args.storage,
+        **variant,
         "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "queries": results,
     }, indent=2) + "\n")

@@ -7,6 +7,7 @@
   "connect_seconds": 17.584029806006583,
   "scale_to_zero": true,
   "storage": "S3, disk cache",
+  "disk": "bench-100gb",
   "started": "2026-10-17T02:24:15+00:00",
   "queries": [
     {

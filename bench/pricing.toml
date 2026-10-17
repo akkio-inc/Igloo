@@ -7,10 +7,11 @@
 [snowflake]
 # Edition prices per credit: Standard 2.00, Enterprise 3.00, Business Critical 4.00.
 price_per_credit = 3.00
-# Credits per hour for a standard (Gen1) warehouse, by size. Gen2 warehouses,
+# Credits per hour for a standard Gen1 warehouse, by size. Gen2 warehouses,
 # reportedly the default for new warehouses since mid-2026, use 1.35x as
-# many on AWS; set generation_factor = 1.35 for them.
-generation_factor = 1.0
+# many on AWS. run.py records each run's generation; runs without one
+# (before it did) were Gen1.
+generation_factor = { "1" = 1.0, "2" = 1.35 }
 credits_per_hour = { XS = 1, S = 2, M = 4, L = 8, XL = 16, "2XL" = 32, "3XL" = 64, "4XL" = 128 }
 # Billing: per second, with a 60-second minimum each time a warehouse
 # resumes; it then runs until AUTO_SUSPEND seconds of idleness (60 is the
@@ -30,18 +31,25 @@ minimum_seconds = 0
 [igloo]
 # EC2 on-demand, per hour, for the machine Igloo runs on.
 instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge" = 1.157, "c7g.16xlarge" = 2.32, "c7gd.4xlarge" = 0.726, "m7g.4xlarge" = 0.653, "r7g.4xlarge" = 0.857, "r7g.8xlarge" = 1.714 }
-# Costs that run all month whatever the machine does. The benchmark uses
-# Igloo's single-machine setup (deploy/single-vm), whose catalog database
-# lives on the machine's disk: 20 GB of gp3 at $0.08 per GB-month, enough
-# for the operating system, the images and the catalog. Table data belongs
-# in object storage, which is left out for every platform; the benchmark
-# machine kept TPC-H scale 10 (about 3 GB) on a larger disk, which this
-# does not charge for. A Kubernetes deployment pays for a managed PostgreSQL
-# instead, about 0.05 for RDS db.t4g.small with storage. At scale 100 the
-# read cache holds 27 GB, and the benchmark machine's disk was 100 GB of gp3
-# at 6,000 IOPS and 500 MB/s, about $38 a month: pass
-# --set igloo.fixed_per_hour=0.052 to charge for it.
-fixed_per_hour = 0.0022
+# The machine's disk, which costs the same all month whatever the machine
+# does. In Igloo's single-machine setup (deploy/single-vm) it holds the
+# operating system, the images, the catalog database and the read cache;
+# table data stays in object storage, which is left out for every
+# platform. Each run names its disk (run.py --disk); runs that do not used
+# `disk`. Every run so far used the benchmark machine's volume, 100 GB of
+# gp3 provisioned for 6,000 IOPS and 500 MB/s (about $38 a month): at scale
+# 100 its read cache holds 27 GB, which the first run after a resume reads
+# at the volume's 500 MB/s. "gp3-20gb" is the least that fits the system
+# and catalog, with gp3's baseline 3,000 IOPS and 125 MB/s. A Kubernetes
+# deployment pays for a managed PostgreSQL instead, about $0.05 an hour for
+# RDS db.t4g.small with storage.
+disk = "bench-100gb"
+disks = { "bench-100gb" = { gb = 100, iops = 6000, mbps = 500 }, "gp3-20gb" = { gb = 20, iops = 3000, mbps = 125 } }
+# gp3 per month: each GB, and each IOPS and MB/s provisioned above the
+# baseline of 3,000 and 125.
+gp3_per_gb_month = 0.08
+gp3_per_iops_month = 0.005
+gp3_per_mbps_month = 0.04
 # Scale to zero (docs/scale-to-zero.md): the always-on gateway machine
 # (t4g.nano); how long Igloo may idle before the gateway stops it
 # (IGLOO_GATEWAY_SUSPEND_AFTER, set to match Snowflake's auto_suspend

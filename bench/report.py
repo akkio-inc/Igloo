@@ -9,7 +9,8 @@ warm, and what that costs under each platform's billing:
 
 - Snowflake bills a warehouse per second while it runs, at least 60 seconds
   each time it resumes, and keeps it running until AUTO_SUSPEND seconds of
-  idleness.
+  idleness. Gen2 warehouses use more credits per hour than Gen1; the report
+  shows the two side by side where both were measured.
 - Databricks SQL Serverless bills a warehouse per second while it runs,
   until it auto-stops.
 - Igloo runs on a machine billed per second while it runs. Always on, its
@@ -18,7 +19,8 @@ warm, and what that costs under each platform's billing:
   --scale-to-zero), the gateway starts the machine for each burst and
   stops it SUSPEND_AFTER seconds after the burst; a burst costs the
   measured resume, the cold run and the idle tail, at least EC2's
-  one-minute minimum, and the gateway and disk run all month.
+  one-minute minimum, and the gateway and disk run all month. Each run's
+  disk (run.py --disk, or the default in pricing.toml) is priced as gp3.
 
 Several results for the same platform, size and scale (repeated bursts)
 are merged: per-query medians, and the median resume time.
@@ -44,20 +46,53 @@ def load_pricing(path: pathlib.Path, overrides: list[str]) -> dict:
     for item in overrides:
         key, _, value = item.partition("=")
         section, _, name = key.partition(".")
-        pricing.setdefault(section, {})[name] = float(value)
+        try:
+            pricing.setdefault(section, {})[name] = float(value)
+        except ValueError:  # a name, such as igloo.disk
+            pricing[section][name] = value
     return pricing
 
 
-def hourly_rate(pricing: dict, platform: str, size: str) -> float:
+def generation(result: dict) -> int | None:
+    """A Snowflake warehouse's generation; results from before run.py
+    recorded it were Gen1."""
+    return (result.get("generation") or 1) if result["platform"] == "snowflake" else None
+
+
+def credits_per_hour(pricing: dict, result: dict) -> float:
+    p = pricing["snowflake"]
+    factor = p["generation_factor"]
+    if isinstance(factor, dict):
+        factor = factor[str(generation(result))]
+    return p["credits_per_hour"][result["size"]] * factor
+
+
+def disk_name(pricing: dict, result: dict) -> str:
+    return result.get("disk") or pricing["igloo"]["disk"]
+
+
+def disk_per_month(pricing: dict, name: str) -> float:
+    p = pricing["igloo"]
+    d = p["disks"][name]
+    return (d["gb"] * p["gp3_per_gb_month"] + max(d["iops"] - 3000, 0) * p["gp3_per_iops_month"]
+            + max(d["mbps"] - 125, 0) * p["gp3_per_mbps_month"])
+
+
+def disk_per_hour(pricing: dict, result: dict) -> float:
+    return disk_per_month(pricing, disk_name(pricing, result)) / HOURS_PER_MONTH
+
+
+def hourly_rate(pricing: dict, result: dict) -> float:
+    """What the platform costs an hour while it runs; for Igloo, the machine
+    and its disk."""
+    platform, size = result["platform"], result["size"]
     if platform == "snowflake":
-        p = pricing["snowflake"]
-        return p["credits_per_hour"][size] * p["generation_factor"] * p["price_per_credit"]
+        return credits_per_hour(pricing, result) * pricing["snowflake"]["price_per_credit"]
     if platform == "databricks":
         p = pricing["databricks"]
         return p["dbu_per_hour"][size] * p["price_per_dbu"]
     if platform == "igloo":
-        p = pricing["igloo"]
-        return p["instance_per_hour"][size] + p["fixed_per_hour"]
+        return pricing["igloo"]["instance_per_hour"][size] + disk_per_hour(pricing, result)
     raise ValueError(platform)
 
 
@@ -80,7 +115,8 @@ def merge(results: list[dict]) -> list[dict]:
     median cold time per query, every warm time, the median resume."""
     groups: dict[tuple, list[dict]] = {}
     for r in results:
-        key = (r["platform"], r["size"], r["scale"], r["suite"], bool(r.get("scale_to_zero")), r.get("storage"))
+        key = (r["platform"], r["size"], r["scale"], r["suite"], bool(r.get("scale_to_zero")), r.get("storage"),
+               generation(r), r.get("disk"))
         groups.setdefault(key, []).append(r)
     merged = []
     for rs in groups.values():
@@ -137,16 +173,17 @@ def main() -> None:
     for result in merge([json.loads(path.read_text()) for path in args.results]):
         s = summarize(result)
         platform = result["platform"]
-        rate = hourly_rate(pricing, platform, result["size"])
+        rate = hourly_rate(pricing, result)
         resume = None
+        disk = disk_name(pricing, result) if platform == "igloo" else None
         if platform == "igloo" and result.get("scale_to_zero"):
             # The machine is billed only while it runs; the disk and the
             # gateway all month.
             prices = pricing["igloo"]
             resume = result["resume"]
-            rate -= prices["fixed_per_hour"]
+            rate -= disk_per_hour(pricing, result)
             burst = burst_seconds(pricing, platform, s["cold"], resume) * rate / 3600
-            always_on = (prices["fixed_per_hour"] + prices["gateway_per_hour"]) * HOURS_PER_MONTH
+            always_on = (disk_per_hour(pricing, result) + prices["gateway_per_hour"]) * HOURS_PER_MONTH
             monthly = always_on + burst * args.runs_per_day * DAYS_PER_MONTH
             platform = "igloo, scale to zero"
         elif platform == "igloo":
@@ -155,8 +192,12 @@ def main() -> None:
         else:
             burst = burst_seconds(pricing, platform, s["cold"]) * rate / 3600
             monthly = burst * args.runs_per_day * DAYS_PER_MONTH
-        size = result["size"] + (f" ({result['storage']})" if result.get("storage") else "")
-        rows.append({**result, **s, "platform": platform, "size": size, "rate": rate, "resume": resume,
+        label = result.get("storage")
+        if generation(result):
+            label = f"Gen{generation(result)}"
+        size = result["size"] + (f" ({label})" if label else "")
+        rows.append({**result, **s, "platform": platform, "size": size, "rate": rate, "resume": resume, "disk": disk,
+                     "generation": generation(result), "base_size": result["size"], "queries_ok": len(s["per_query"]),
                      "warm_cost": s["warm"] * rate / 3600, "burst_cost": burst, "monthly": monthly})
 
     out = sys.stdout
@@ -175,7 +216,42 @@ def main() -> None:
         out.write(f"\nScale to zero: resume is the median time from a client connecting to a stopped machine until Igloo"
                   f" answered, over every burst measured. A burst is billed for the resume, the cold run and"
                   f" {prices['suspend_after_seconds']:g}s of idleness; the gateway ({money(prices['gateway_per_hour'] * HOURS_PER_MONTH)}/month)"
-                  f" and disk ({money(prices['fixed_per_hour'] * HOURS_PER_MONTH)}/month) run all month.\n")
+                  f" and the machine's disk run all month.\n")
+    disks = sorted({r["disk"] for r in rows if r["disk"]})
+    if disks:
+        specs = "; ".join(f"{name}: {d['gb']} GB of gp3, {d['iops']:,} IOPS, {d['mbps']} MB/s,"
+                          f" {money(disk_per_month(pricing, name))}/month"
+                          for name in disks for d in [pricing["igloo"]["disks"][name]])
+        out.write(f"\nIgloo's disk, included in its $/hour and monthly figures: {specs}.\n")
+    if any(r["generation"] for r in rows):
+        factors = pricing["snowflake"]["generation_factor"]
+        if isinstance(factors, dict):
+            factors = ", ".join(f"Gen{g} {f:g}x" for g, f in sorted(factors.items()))
+        out.write(f"\nSnowflake credits per hour by generation: {factors} the Gen1 rate.\n")
+
+    gens = [r for r in rows if r["generation"]]
+    if len({r["generation"] for r in gens}) > 1:
+        out.write("\n## Snowflake Gen1 and Gen2\n\n"
+                  "Warm run and cost of the 22-query suite on the same warehouse at each generation; credits per warm"
+                  " run include the Gen2 factor, and $ per query is the warm run's cost over its queries.\n\n")
+        out.write("| Scale | Size | Gen1 warm run | Gen2 warm run | Gen2 speed-up | Gen1 credits | Gen2 credits"
+                  " | Gen1 $ per query | Gen2 $ per query | Gen1 $ per burst | Gen2 $ per burst |\n")
+        out.write("|---|---|---|---|---|---|---|---|---|---|---|\n")
+        columns = [
+            lambda r: f"{r['warm']:.1f}s",
+            lambda r: f"{r['warm_cost'] / pricing['snowflake']['price_per_credit']:.3f}",
+            lambda r: money(r["warm_cost"] / r["queries_ok"]),
+            lambda r: money(r["burst_cost"]),
+        ]
+        order = list(pricing["snowflake"]["credits_per_hour"])
+        for scale in scales:
+            for size in sorted({r["base_size"] for r in gens if r["scale"] == scale}, key=order.index):
+                by_gen = {r["generation"]: r for r in gens if r["scale"] == scale and r["base_size"] == size}
+                g1, g2 = by_gen.get(1), by_gen.get(2)
+                cells = [[("-" if r is None else col(r)) for r in (g1, g2)] for col in columns]
+                speedup = f"{g1['warm'] / g2['warm']:.2f}x" if g1 and g2 else "-"
+                out.write(f"| {scale:g} | {size} | {cells[0][0]} | {cells[0][1]} | {speedup} | {cells[1][0]} | {cells[1][1]}"
+                          f" | {cells[2][0]} | {cells[2][1]} | {cells[3][0]} | {cells[3][1]} |\n")
 
     for scale in scales:
         primary = [r for r in rows if r["scale"] == scale]

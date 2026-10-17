@@ -56,17 +56,19 @@ off on every platform, so warm runs measure the engine.
 
 **Sizes.** Each platform runs at the sizes a team would actually pick, and
 the report compares them at matched cost as well as matched speed: at scale
-10, Snowflake X-Small, Databricks 2X-Small and Igloo on a few EC2 machine
-types; at scale 100, Snowflake X-Small to X-Large (standard Gen1
-warehouses, query acceleration off), Databricks 2X-Small to X-Large and Igloo
-on c7g.4xlarge, c7g.8xlarge and c7g.16xlarge. Run every platform in the
-same region as its data.
+10, Snowflake X-Small and Small, Databricks 2X-Small and Igloo on a few EC2
+machine types; at scale 100, Snowflake X-Small to X-Large, Databricks
+2X-Small to X-Large and Igloo on c7g.4xlarge, c7g.8xlarge and c7g.16xlarge.
+Snowflake runs on standard warehouses of both hardware generations, Gen1
+and Gen2 (the default for new warehouses), with query acceleration off;
+`run.py` records the generation. Run every platform in the same region as
+its data.
 
 **Cost.** `report.py` prices each run with `pricing.toml`:
 
 | | Billed for | Minimum | Idle before it stops |
 |---|---|---|---|
-| Snowflake | credits per hour by warehouse size, per second | 60 s per resume | `AUTO_SUSPEND` (60 s here) |
+| Snowflake | credits per hour by warehouse size and generation (Gen2 1.35x), per second | 60 s per resume | `AUTO_SUSPEND` (60 s here) |
 | Databricks SQL Serverless | DBUs per hour by warehouse size, per second | none | auto-stop (5 min here) |
 | Igloo, always on | the EC2 machine and its disk, per second | none | never stops |
 | Igloo, [scale to zero](../docs/scale-to-zero.md) | the machine per second while it runs; the disk and a `t4g.nano` gateway all month | 60 s per start (EC2) | `IGLOO_GATEWAY_SUSPEND_AFTER` (60 s here) |
@@ -78,8 +80,11 @@ running all month. For scale to zero, run the client through the gateway
 with the machine stopped and pass `--scale-to-zero`: the connect time is
 then the measured time to resume, and `report.py` bills each burst for it.
 Repeat the burst a few times; `report.py` merges results for the same
-platform and size. Storage costs about the same everywhere (object storage)
-and is left out.
+platform and size. Igloo's disk is priced as gp3 from its size and
+provisioned IOPS and throughput: name it with `run.py --disk` (disks are
+listed in `pricing.toml`); runs that do not name one used the benchmark
+machine's 100 GB volume at 6,000 IOPS and 500 MB/s, about $38 a month.
+Object storage costs about the same everywhere and is left out.
 
 The list prices in `pricing.toml` are a starting point. Replace them with
 negotiated rates (`--set snowflake.price_per_credit=...`) before drawing
@@ -107,26 +112,32 @@ conclusions, and record which prices a published report used.
 Run in October 2026: Igloo d208dd2 (DuckDB 1.5.6) with tables in S3 and
 the read cache, scale-to-zero bursts as above (the first with an empty
 cache, three with the cache the first filled); Snowflake X-Small to
-X-Large; Databricks SQL Serverless 2X-Small to X-Large. All results are in
-`results/` and `results/report.md`.
+X-Large, on Gen1 and on Gen2; Databricks SQL Serverless 2X-Small to
+X-Large. All results are in `results/` and `results/report.md`.
 
-**Warm runs.** Every Igloo size is faster than Snowflake X-Small and
-Databricks 2X-Small, which cost more per hour than any of them, and Igloo is
-cheaper per warm run than every warehouse at every size. But the lead
-narrows, and c7g.4xlarge is slower than Databricks Medium and up and only
-ties Snowflake X-Large. From scale 10 to 100 Igloo's warm run grew about in
-line with the data (c7g.4xlarge: 5.5 s to 58.5 s), while Snowflake X-Small
-grew 5x (37 s to 185 s) and Databricks 2X-Small 4x (30 s to 127 s): at
-scale 10 much of their time is fixed per-query overhead. Igloo against each
+**Warm runs.** Every Igloo size is faster than Snowflake X-Small (either
+generation) and Databricks 2X-Small, which cost more per hour than any of
+them, and Igloo is cheaper per warm run than every warehouse at every size.
+But the lead narrows: c7g.4xlarge is slower than Databricks Medium and up
+and Snowflake Gen2 Large and up, and about ties Snowflake Gen1 X-Large and
+Gen2 Medium. From scale 10 to 100 Igloo's warm run grew about in line with
+the data (c7g.4xlarge: 5.5 s to 58.5 s), while Snowflake Gen1 X-Small grew
+5x (37 s to 185 s) and Databricks 2X-Small 4x (30 s to 127 s): at scale 10
+much of their time is fixed per-query overhead. Igloo against each
 warehouse, faster / cheaper per warm run (warm run in seconds):
 
 | | c7g.4xlarge, 58.5 s | c7g.8xlarge, 27.5 s | c7g.16xlarge, 17.8 s |
 |---|---|---|---|
-| Snowflake XS, 185 s | 3.2x / 16x | 6.7x / 18x | 10.4x / 13x |
-| Snowflake S, 113 s | 1.9x / 20x | 4.1x / 21x | 6.4x / 16x |
-| Snowflake M, 86 s | 1.5x / 30x | 3.1x / 32x | 4.8x / 25x |
-| Snowflake L, 66 s | 1.1x / 47x | 2.4x / 50x | 3.7x / 38x |
-| Snowflake XL, 57 s | 1.0x / 81x | 2.1x / 86x | 3.2x / 66x |
+| Snowflake XS Gen1, 185 s | 3.2x / 16x | 6.7x / 18x | 10.4x / 13x |
+| Snowflake XS Gen2, 128 s | 2.2x / 15x | 4.7x / 16x | 7.2x / 13x |
+| Snowflake S Gen1, 113 s | 1.9x / 20x | 4.1x / 21x | 6.4x / 16x |
+| Snowflake S Gen2, 83 s | 1.4x / 20x | 3.0x / 21x | 4.7x / 16x |
+| Snowflake M Gen1, 86 s | 1.5x / 30x | 3.1x / 32x | 4.8x / 25x |
+| Snowflake M Gen2, 62 s | 1.1x / 30x | 2.2x / 31x | 3.5x / 24x |
+| Snowflake L Gen1, 66 s | 1.1x / 47x | 2.4x / 50x | 3.7x / 38x |
+| Snowflake L Gen2, 53 s | 0.9x / 51x | 1.9x / 54x | 3.0x / 42x |
+| Snowflake XL Gen1, 57 s | 1.0x / 81x | 2.1x / 86x | 3.2x / 66x |
+| Snowflake XL Gen2, 44 s | 0.8x / 84x | 1.6x / 90x | 2.5x / 69x |
 | Databricks 2XS, 127 s | 2.2x / 10x | 4.6x / 11x | 7.1x / 9x |
 | Databricks S, 63 s | 1.1x / 16x | 2.3x / 17x | 3.5x / 13x |
 | Databricks M, 48 s | 0.8x / 24x | 1.8x / 25x | 2.7x / 20x |
@@ -134,12 +145,25 @@ warehouse, faster / cheaper per warm run (warm run in seconds):
 | Databricks XL, 43 s | 0.7x / 72x | 1.6x / 76x | 2.4x / 59x |
 
 With the pairing used at scale 10 (c7g.4xlarge against Snowflake X-Small
-and Databricks 2X-Small), Igloo is 3.2x and 2.2x faster and 16x and 10x
-cheaper per warm run, against 6.8x and 5.4x faster and 35x and 26x cheaper
-at scale 10. No pairing at scale 100 is both 5x faster and 25x cheaper; the
-nearest is c7g.16xlarge against Snowflake Medium (4.8x, 25x). Snowflake and
-Databricks gain little beyond Large: X-Large cuts the warm run by 14% and 2%
-for twice the price.
+and Databricks 2X-Small), Igloo is 3.2x faster and 16x cheaper per warm run
+than Gen1 X-Small, 2.2x and 15x than Gen2 X-Small, and 2.2x and 10x than
+Databricks 2X-Small; at scale 10 it was 6.8x and 35x against Gen1 X-Small,
+4.3x and 30x against Gen2 X-Small, and 5.4x and 26x against Databricks
+2X-Small. No pairing at scale 100 is both 5x faster and 25x cheaper; the
+nearest is c7g.16xlarge against Snowflake Gen1 Medium (4.8x, 25x).
+Snowflake and Databricks gain little beyond Large: X-Large cuts the warm
+run by 14% (Snowflake Gen1), 17% (Gen2) and 2% (Databricks) for twice the
+price.
+
+**Snowflake Gen2** runs the suite 1.25x to 1.45x faster than Gen1 at scale
+100 and about 1.5x faster at scale 10, for 1.35x the credits per hour. A
+warm run therefore costs about the same on either (from 13% less to 8%
+more), while a burst costs 2% to 35% more on Gen2, because the 60-second
+minimum and the idle tail are billed at the higher rate. Igloo's lead over
+Snowflake shrinks by Gen2's speed-up. The scale 10 Gen1 X-Small result is
+the earlier run on another warehouse (COMPUTE_WH, also Gen1); every other
+Snowflake run used one warehouse, BENCH_WH, switched between
+generations.
 
 **The first run after a resume** is where Igloo's lead goes. It waits about
 17 s for the machine to start, then reads table data from the disk cache
@@ -148,22 +172,25 @@ for twice the price.
 holds 27 GB at scale 100, and the volume is provisioned for 500 MB/s, so
 reading it takes about a minute on any machine. Snowflake resumes within
 its first query, and Databricks' serverless start (about 10 s, not counted
-here) is short, so their first runs (Snowflake 208 s at X-Small to 71 s at
-X-Large, Databricks 164 s to 65 s) beat c7g.4xlarge's (153 s with the
-start) from Snowflake Small and Databricks Small up, and match or beat
-c7g.16xlarge's (75 s) from Snowflake X-Large and Databricks Medium up. Igloo
-still costs less per burst at every pairing (2.6x to 166x), because the others
-bill a minimum and an idle tail: at 24 bursts a day, c7g.4xlarge with scale
-to zero comes to $30 a month, Snowflake X-Small to $163 and Databricks
-2X-Small to $263.
+here) is short, so their first runs (Snowflake Gen1 208 s at X-Small to
+71 s at X-Large, Gen2 154 s to 59 s, Databricks 164 s to 65 s) beat
+c7g.4xlarge's (153 s with the start) from Snowflake Small and Databricks
+Small up, and match or beat c7g.16xlarge's (75 s) from Snowflake Gen2
+Medium, Gen1 X-Large and Databricks Medium up. Igloo still costs less per
+burst at every pairing (2.6x to 166x), because the others bill a minimum
+and an idle tail: at 24 bursts a day, c7g.4xlarge with scale to zero comes
+to $66 a month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and
+Databricks 2X-Small to $263.
 
 **Caveats.**
 
-- The disk is priced too low for this scale. `pricing.toml` charges a 20 GB
-  volume ($1.61 a month); the machine used a 100 GB gp3 volume with 6,000
-  IOPS and 500 MB/s, about $38 a month, which the cached first runs depend
-  on. That adds about $36 to each Igloo scale-to-zero monthly figure at
-  scale 100, and nothing to the cost per run.
+- Igloo's monthly figures include the disk the runs used, 100 GB of gp3 at
+  6,000 IOPS and 500 MB/s ($38 a month), which the cached first runs depend
+  on. Earlier reports charged a 20 GB disk ($1.61); the real disk raises
+  every Igloo scale-to-zero month by $36, e.g. c7g.4xlarge from $14 to $51
+  at scale 10 (Snowflake X-Small: $85 on Gen1, $99 on Gen2; Databricks
+  2X-Small: $194) and from $30 to $66 at scale 100. Per-run costs do not
+  change.
 - Per query, Snowflake matches or beats Igloo on the date-range scans q06
   and q14 at most pairings (under a second on every Snowflake size, against
   0.9 s and 1.6 s on c7g.4xlarge): Snowflake's own copy of the data lets it
