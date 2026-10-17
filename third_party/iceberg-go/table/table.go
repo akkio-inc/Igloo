@@ -391,9 +391,12 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 	}
 
 	cfg := readRetryConfig(t.metadata.Properties())
-	if co.noRetry {
-		// A rewrite's manifest-list rebuild on retry can reintroduce files the
-		// rewrite replaced; the caller asked to fail instead and retry itself.
+	// Igloo: a retry rebuilds a snapshot by adding the new head's
+	// manifests to its own, and moves the branch requirements to the new
+	// head, which is right for a plain append only (see retriable); nor is
+	// a commit retried that the caller asked to fail instead and retry
+	// itself (CommitWithoutRetry). See IGLOO_PATCHES.md.
+	if co.noRetry || !retriable(updates, t.metadata.Properties()) {
 		cfg.numRetries = 0
 	}
 

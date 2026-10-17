@@ -53,18 +53,26 @@ the layout.
   prices and free text got dictionaries nearly as large as the data, which
   made DuckDB's scans slower without saving space.
 
-- `table/table.go` and `table/transaction.go`: a `commit.retry.num-retries`
-  greater than 0 makes a conflicting commit rebuild its manifest list from the
-  fresh parent. For a rewrite (compaction's `RewriteDataFiles`), that rebuild
-  concatenates the fresh parent's whole manifest set with the producer's own
-  manifests, and the overwrite producer's `processManifests` does not drop the
-  files the rewrite replaced, so a replaced file comes back live and its rows
-  duplicate. Until the rebuild drops replaced files, `Transaction` gains a
-  `CommitWithoutRetry` that forces retries off (a new unexported `noRetry`
-  commit option); Igloo's maintenance (compaction and snapshot expiry) uses it
-  and retries at its own level on `ErrCommitFailed`, so a table that sets
-  `commit.retry.num-retries` (for another engine) cannot make Igloo's
-  compaction duplicate rows.
+- `table/table.go`, `table/transaction.go` and
+  `table/igloo_commit_retries.go` (new): a `commit.retry.num-retries` greater
+  than 0 makes a conflicting commit rebuild its manifest list from the fresh
+  parent, by adding the fresh parent's whole manifest set to the producer's
+  own manifests, and move its requirement on the branch head to the fresh
+  head. That is right for a plain append. For a rewrite (compaction's
+  `RewriteDataFiles`), a delete or an overwrite, the fresh parent's manifests
+  still list the files the commit replaced, so a replaced file came back live
+  beside its replacement and its rows duplicated. A commit that adds no
+  snapshot (expiry, moving or dropping a ref, a rollback) would be applied to
+  refs it never saw, and an append to a table with
+  `commit.manifest-merge.enabled` can carry the parent's entries in its own
+  merged manifests, which the rebuild adds again. `doCommit` now retries only
+  commits that add snapshots, all of them appends, to tables that do not
+  merge manifests, and `Transaction` gains a `CommitWithoutRetry` that forces
+  retries off for any commit (a new unexported `noRetry` commit option).
+  Igloo's maintenance (compaction, snapshot expiry and the rewrite of deleted
+  rows) uses it, and retries at its own level on `ErrCommitFailed`, so a
+  table that sets `commit.retry.num-retries` (for another engine) cannot make
+  it duplicate rows.
 
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults and
