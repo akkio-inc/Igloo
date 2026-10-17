@@ -141,9 +141,9 @@ func TestDistributedCustomGrants(t *testing.T) {
 	leads := "SELECT count(*), sum(id)::BIGINT FROM lake.sales.leads"
 	expectAllowed(t, nina, orders)
 	expectAllowed(t, nils, leads)
-	for user, query := range map[string]string{"nina": orders, "nils": leads} {
-		if q := lastQuery(t, ds.catalogServer, user, query); q.Workers != 3 {
-			t.Errorf("%s's granted table: %d workers", user, q.Workers)
+	for user, query := range map[string][2]string{"nina": {orders, "lake.public.orders"}, "nils": {leads, "lake.sales.leads"}} {
+		if q := lastQuery(t, ds.catalogServer, user, query[0]); q.Workers != 3 || strings.Join(q.TablesRead, ",") != query[1] {
+			t.Errorf("%s's granted table: %d workers, read %q", user, q.Workers, q.TablesRead)
 		}
 	}
 	if got := texts(t, nils, leads); len(got) != 1 || got[0] != "2999|4498500" {
@@ -170,6 +170,7 @@ func TestDistributedConnections(t *testing.T) {
 	store := federation.NewMemoryStore()
 	c := federation.New("crm", federation.Postgres)
 	c.Host, c.Port, c.User, c.Password, c.Database = pg.host, pg.port, pg.user, pg.password, pg.database
+	c.TLS = federation.TLSDisable // the test databases have no TLS
 	c.Schemas = []string{schema}
 	if err := store.Create(context.Background(), c); err != nil {
 		t.Fatal(err)
@@ -312,6 +313,16 @@ func TestDistributedWorkload(t *testing.T) {
 	q := lastQuery(t, ds.catalogServer, "bea", query)
 	if q.Workers != 2 || q.Pool != "reporting" || q.QueryTag != "client:acme" || q.Outcome != audit.OutcomeOK {
 		t.Errorf("bea's distributed statement: workers %d, pool %q, tag %q, %s", q.Workers, q.Pool, q.QueryTag, q.Outcome)
+	}
+	// What it read is worked out from the statement she sent, as for any
+	// statement, in the background.
+	deadline = time.Now().Add(20 * time.Second)
+	for len(q.TablesRead) == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		q = lastQuery(t, ds.catalogServer, "bea", query)
+	}
+	if strings.Join(q.TablesRead, ",") != "lake.public.orders" || len(q.TablesWritten) != 0 {
+		t.Errorf("bea's distributed statement read %q and wrote %q", q.TablesRead, q.TablesWritten)
 	}
 
 	// statement_timeout ends the statement and its tasks.

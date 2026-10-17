@@ -200,6 +200,14 @@ parts on the workers.
   FROM igloo.query_history WHERE workers > 0 ORDER BY start_time DESC LIMIT 20;
   ```
 
+  Otherwise a distributed statement's row is like any other's: its query
+  tag and pool, the time it waited for its role's limits, and the tables
+  it read and wrote, worked out from the statement as sent, which the
+  [catalog](catalog.md)'s usage and lineage take up. `cpu_time_ms`,
+  `bytes_read` and `memory_allocated_bytes` are `NULL`: what the workers
+  used is not measured yet (`igloo_distributed_scanned_bytes_total` counts
+  the bytes they were given).
+
 - **Metrics** on port 8080 of the igloo pods:
 
   | Metric | Labels | Meaning |

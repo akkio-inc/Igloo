@@ -7,6 +7,7 @@
 #   - grants hold on the workers,
 #   - a worker killed in the middle of a statement does not fail it,
 #   - statement timeouts reach the workers,
+#   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
@@ -218,6 +219,18 @@ echo "statement timeout"
 got="$(psql_admin -v VERBOSITY=verbose -c "SET distributed_execution = 'on'" -c "SET statement_timeout = '1s'" \
   -c "SELECT l_returnflag, sum(length(repeat(l_comment, 3000))) FROM lineitem GROUP BY 1" || true)"
 if grep -q "57014" <<<"$got"; then pass "statement_timeout cancels a distributed statement"; else fail "timeout: $got"; fi
+
+echo "clones"
+# A clone's data files lie under its source's location; workers read the
+# files its metadata lists, wherever they are.
+psql_admin -c "CREATE SCHEMA clones" -c "CREATE TABLE clones.lineitem CLONE lineitem" >/dev/null
+query="SELECT l_returnflag, count(*), sum(l_quantity) FROM clones.lineitem GROUP BY 1 ORDER BY 1"
+want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$query" | grep -v '^SET$')"
+got="$(psql_admin -c "SET distributed_execution = 'on'" -c "/* clone */ $query" | grep -v '^SET$')"
+if [ -n "$want" ] && [ "$got" = "$want" ]; then pass "a clone returns its source's rows"; else fail "clone: [$got], want [$want]"; fi
+sleep 2
+got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* clone */%' ORDER BY start_time DESC LIMIT 1")"
+if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a clone ran on $got workers"; fi
 
 echo "snapshot isolation"
 # A statement reads one snapshot of each table, on the workers and in the
