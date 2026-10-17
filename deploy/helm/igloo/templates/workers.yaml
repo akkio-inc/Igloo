@@ -257,13 +257,18 @@ spec:
       ports:
         - port: worker
           protocol: TCP
+    # Health checks and metrics: from networkPolicy.metricsFrom, or, without
+    # it, from pods of this namespace only (kubelet probes are not pod
+    # traffic).
     - ports:
         - port: http
           protocol: TCP
-      {{- with .Values.networkPolicy.metricsFrom }}
       from:
+        {{- with .Values.networkPolicy.metricsFrom }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- else }}
+        - podSelector: {}
+        {{- end }}
 {{- end }}
 {{- end -}}
 

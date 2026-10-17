@@ -298,8 +298,14 @@ install (otherwise the first upgrade would restart every pod).
 {{- $url := printf "postgresql://igloo:%s@%s:5432/igloo" (b64dec $password) (include "igloo.postgresqlName" .) -}}
 {{- $_ := set $data "database-url" ($url | b64enc) -}}
 {{- end -}}
-{{- if and (include "igloo.anyWorkers" .) (not .Values.workers.existingSecret) -}}
+{{- if and .Values.workers.enabled (not .Values.workers.existingSecret) -}}
 {{- $_ := set $data "worker-secret" (get $existing "worker-secret" | default (randAlphaNum 48 | b64enc)) -}}
+{{- end -}}
+{{- range .Values.pools -}}
+{{- if and (include "igloo.poolRunsWorkers" (list $ .)) (not (dig "workers" "existingSecret" "" .)) -}}
+{{- $key := printf "worker-secret-%s" .name -}}
+{{- $_ := set $data $key (get $existing $key | default (randAlphaNum 48 | b64enc)) -}}
+{{- end -}}
 {{- end -}}
 {{- if .Values.objectStorage.enabled -}}
 {{- $_ := set $data "object-storage-access-key-id" (get $existing "object-storage-access-key-id" | default (randAlphaNum 20 | b64enc)) -}}

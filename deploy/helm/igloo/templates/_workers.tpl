@@ -16,11 +16,7 @@ own, which only its igloo pods use. */}}
 {{- define "igloo.anyWorkers" -}}
 {{- $any := .Values.workers.enabled -}}
 {{- range .Values.pools -}}
-{{- if and .workers (hasKey .workers "enabled") -}}
-{{- if .workers.enabled -}}{{- $any = true -}}{{- end -}}
-{{- else if $.Values.workers.enabled -}}
-{{- $any = true -}}
-{{- end -}}
+{{- if include "igloo.poolRunsWorkers" (list $ .) -}}{{- $any = true -}}{{- end -}}
 {{- end -}}
 {{- if $any -}}true{{- end -}}
 {{- end -}}
@@ -29,14 +25,37 @@ own, which only its igloo pods use. */}}
 {{- define "igloo.workerPort" -}}7433{{- end -}}
 
 {{/* Where the worker secret comes from, as YAML {name, key}. */}}
+{{/* Each compute pool's workers have a secret of their own, so a pool's
+igloo pods cannot use another pool's workers even where the network would
+let them: its own workers.existingSecret, or the generated
+worker-secret-<pool>. The release's existingSecret is the release's only. */}}
 {{- define "igloo.workerSecretRef" -}}
-{{- if .Values.workers.existingSecret -}}
+{{- $pool := get . "Pool" -}}
+{{- $own := "" -}}
+{{- if $pool -}}{{- $own = dig "workers" "existingSecret" "" $pool -}}{{- end -}}
+{{- if $own -}}
+name: {{ $own }}
+key: secret
+{{- else if $pool -}}
+name: {{ include "igloo.secretName" . }}
+key: {{ printf "worker-secret-%s" $pool.name }}
+{{- else if .Values.workers.existingSecret -}}
 name: {{ .Values.workers.existingSecret }}
 key: secret
 {{- else -}}
 name: {{ include "igloo.secretName" . }}
 key: worker-secret
 {{- end -}}
+{{- end -}}
+
+{{/* Whether a compute pool runs workers: its own workers.enabled, or the
+release's. Call with (list $root $pool). */}}
+{{- define "igloo.poolRunsWorkers" -}}
+{{- $root := index . 0 -}}
+{{- $pool := index . 1 -}}
+{{- if and $pool.workers (hasKey $pool.workers "enabled") -}}
+{{- if $pool.workers.enabled -}}true{{- end -}}
+{{- else if $root.Values.workers.enabled -}}true{{- end -}}
 {{- end -}}
 
 {{/*

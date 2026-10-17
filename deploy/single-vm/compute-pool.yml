@@ -23,8 +23,10 @@ services:
       IGLOO_MAINTENANCE: "false"
       # Workers belong to one pool (docs/distributed-execution.md): the
       # main service's workers are not this pool's. To give it its own, copy
-      # the worker service of docker-compose.yml as worker-reporting and set
-      # IGLOO_WORKERS: worker-reporting here.
+      # the worker service of docker-compose.yml as worker-reporting, give
+      # both it and this service an IGLOO_WORKER_SECRET of their own (Compose
+      # does not isolate containers from each other, so the secret is what
+      # keeps pools apart), and set IGLOO_WORKERS: worker-reporting here.
       IGLOO_WORKERS: ""
     ports: !override
       - "${IGLOO_BIND:-127.0.0.1}:${IGLOO_REPORTING_PORT:-5434}:5432"

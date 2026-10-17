@@ -326,12 +326,19 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
   (generated and kept, or `workers.existingSecret`); the NetworkPolicy also
   admits only igloo pods to the task port. Port 8080 serves health checks
   and metrics through `<fullname>-workers-metrics`, which the ServiceMonitor
-  scrapes too.
+  scrapes too; the NetworkPolicy admits pods of the namespace to it, or
+  `networkPolicy.metricsFrom` if set.
+- Give the warehouse's bucket a lifecycle rule that expires
+  `<warehouse>/_igloo_shuffle/` after a day
+  ([how](../../../docs/distributed-execution.md#deploying-workers)).
 - Every [compute pool](#compute-pools) gets workers of its own,
   `<fullname>-pool-<name>-workers`, used only by its igloo pods and admitted
   only from them; a pool can set `workers` (`maxReplicas`, `resources`,
   `nodeSelector` and the rest), or `workers.enabled: false` to run without.
-  The worker secret is the release's.
+  Each pool's workers have a secret of their own (generated as
+  `worker-secret-<name>`, or the pool's `workers.existingSecret`), so a
+  pool's igloo pods cannot use another pool's workers; with several pools,
+  run a CNI that enforces NetworkPolicies, which keep them apart too.
 - With `scaleToZero.enabled`, the gateway stops the workers along with the
   igloo pods.
 
