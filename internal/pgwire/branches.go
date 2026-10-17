@@ -79,7 +79,7 @@ func parseRefCommand(query string) (c refCommand, ok bool, err error) {
 	if !sc.keywords("ALTER", "TABLE") {
 		return c, false, nil
 	}
-	if c.table, ok = sc.name(); !ok {
+	if c.table, ok = sc.alterTarget(); !ok {
 		return c, false, nil
 	}
 	switch {

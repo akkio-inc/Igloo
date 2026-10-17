@@ -362,15 +362,25 @@ func (s *Server) ddlNeeds(ctx context.Context, sess *session, t duckdb.StmtType,
 
 	case duckdb.STATEMENT_TYPE_DROP, duckdb.STATEMENT_TYPE_ALTER:
 		sc := &scanner{s: query}
+		alter := false
 		switch {
 		case sc.keywords("DROP", "TABLE"), sc.keywords("DROP", "VIEW"):
 			sc.keywords("IF", "EXISTS")
 		case sc.keywords("ALTER", "TABLE"):
-			sc.keywords("IF", "EXISTS")
+			alter = true
 		default:
 			return nil, nil, errNoGrantPath
 		}
-		name, ok := sc.name()
+		var (
+			name []string
+			ok   bool
+		)
+		if alter {
+			// ALTER TABLE may carry IF EXISTS, ONLY and a trailing '*'.
+			name, ok = sc.alterTarget()
+		} else {
+			name, ok = sc.name()
+		}
 		if !ok {
 			return nil, nil, errNoGrantPath
 		}

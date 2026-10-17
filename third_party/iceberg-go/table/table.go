@@ -351,6 +351,13 @@ type commitOpts struct {
 	// validators runs once before cat.CommitTable on the first attempt
 	// only. Refresh-and-replay across retries is deferred to PR 2.5.
 	validators []conflictValidatorFunc
+
+	// noRetry forces commit.retry.num-retries to 0 for this commit, whatever
+	// the table property says. Igloo uses it for its own maintenance commits
+	// (compaction, snapshot expiry): the manifest-list rebuild on retry can
+	// reintroduce files that a rewrite replaced, so a conflict must fail and
+	// be retried by the caller rather than rebuilt here (see IGLOO_PATCHES.md).
+	noRetry bool
 }
 
 type commitOption func(*commitOpts)
@@ -371,6 +378,12 @@ func withCommitValidators(vs ...conflictValidatorFunc) commitOption {
 	return func(o *commitOpts) { o.validators = append(o.validators, vs...) }
 }
 
+// withoutRetry disables commit retries for this commit, whatever the table's
+// commit.retry.num-retries property is.
+func withoutRetry() commitOption {
+	return func(o *commitOpts) { o.noRetry = true }
+}
+
 func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requirement, opts ...commitOption) (*Table, error) {
 	var co commitOpts
 	for _, apply := range opts {
@@ -378,6 +391,11 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 	}
 
 	cfg := readRetryConfig(t.metadata.Properties())
+	if co.noRetry {
+		// A rewrite's manifest-list rebuild on retry can reintroduce files the
+		// rewrite replaced; the caller asked to fail instead and retry itself.
+		cfg.numRetries = 0
+	}
 
 	// Bound total retry time with a derived context so both the wait loop
 	// and the CommitTable call itself respect the deadline uniformly.

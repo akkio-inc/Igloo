@@ -499,7 +499,7 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 	if err != nil {
 		return tbl, err
 	}
-	committed, err := tx.Commit(ctx)
+	committed, err := tx.CommitWithoutRetry(ctx)
 	if err != nil {
 		return tbl, err
 	}
@@ -536,7 +536,9 @@ func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Log
 	if err := tx.ExpireSnapshots(table.WithOlderThan(maxAge), table.WithRetainLast(minKeep), table.WithPostCommit(false)); err != nil {
 		return tbl, nil, err
 	}
-	committed, err := tx.Commit(ctx)
+	// Without retry: on a conflict the rebuild could reintroduce replaced
+	// files, so maintenance fails and retries next pass (see IGLOO_PATCHES.md).
+	committed, err := tx.CommitWithoutRetry(ctx)
 	if err != nil {
 		return tbl, nil, err
 	}

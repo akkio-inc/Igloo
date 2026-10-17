@@ -53,7 +53,20 @@ func parseOwnerCommand(query string) (c ownerCommand, ok bool, err error) {
 		return c, false, nil
 	}
 	c.ifExists = sc.keywords("IF", "EXISTS")
-	if c.name, ok = sc.name(); !ok || !sc.keywords("OWNER", "TO") {
+	if c.kind == "TABLE" {
+		// ALTER TABLE may carry ONLY and a trailing '*' before OWNER TO.
+		sc.keywords("ONLY")
+	}
+	if c.name, ok = sc.name(); !ok {
+		return c, false, nil
+	}
+	if c.kind == "TABLE" {
+		sc.skip()
+		if sc.i < len(sc.s) && sc.s[sc.i] == '*' {
+			sc.i++
+		}
+	}
+	if !sc.keywords("OWNER", "TO") {
 		return c, false, nil
 	}
 	owner, ok := sc.name()

@@ -107,11 +107,48 @@ func TestAlterCannotReadProtectedRows(t *testing.T) {
 		}
 	}
 
+	// The ONLY modifier, a trailing '*', IF EXISTS, parentheses, comments and
+	// case variants must not slip the target past the check. Each would, on
+	// 993d860, read "only" as the table name and leak.
+	for _, sql := range []string{
+		"ALTER TABLE ONLY " + c + " ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		"ALTER TABLE " + c + " * ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		"ALTER TABLE IF EXISTS ONLY " + c + " ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		"ALTER TABLE ONLY (" + c + ") ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		"ALTER TABLE /* x */ ONLY /* y */ " + c + " ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		"ALTER TABLE ONLY LAKE.CRM.CONTACTS ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)",
+		`ALTER TABLE ONLY "lake"."crm"."contacts" ALTER COLUMN spend SET DATA TYPE BIGINT USING error(email)`,
+	} {
+		refused(sql)
+		expectRefused(t, cs.admin, sql, "42501", secrets...)
+	}
+	// DuckDB rejects CREATE INDEX ... ON ONLY at parse; it is denied with no
+	// leak. Igloo's check stands behind it should the grammar be accepted.
+	deniedNoLeak("CREATE INDEX leak_only ON ONLY " + c + " (id)")
+	// ONLY and '*' must not slip a rename of a protected column or table past
+	// the check either.
+	for _, sql := range []string{
+		"ALTER TABLE ONLY " + c + " RENAME COLUMN email TO e2",
+		"ALTER TABLE " + c + " * RENAME COLUMN email TO e2",
+		"ALTER TABLE ONLY " + c + " RENAME TO contacts_renamed",
+		"ALTER TABLE IF EXISTS ONLY " + c + " RENAME TO contacts_renamed",
+	} {
+		expectRefused(t, cs.admin, sql, "42501", secrets...)
+	}
+
 	// A table with no policy is unaffected: expression DDL on it is allowed.
 	mustExec(t, cs.admin, "CREATE TABLE lake.public.plain (id INTEGER, s VARCHAR)")
 	mustExec(t, cs.admin, "INSERT INTO lake.public.plain VALUES (1, '2')")
 	if _, err := w.Exec(context.Background(), "ALTER TABLE lake.public.plain ALTER COLUMN s SET DATA TYPE INTEGER USING CAST(s AS INTEGER)"); err != nil {
 		t.Errorf("type change on an unprotected table refused: %v", err)
+	}
+	// ONLY on an unprotected table still works, and renaming a non-protected
+	// column of a protected table (via ONLY) is still allowed.
+	if _, err := w.Exec(context.Background(), "ALTER TABLE ONLY lake.public.plain ADD COLUMN extra INTEGER"); err != nil {
+		t.Errorf("ALTER TABLE ONLY on an unprotected table refused: %v", err)
+	}
+	if _, err := w.Exec(context.Background(), "ALTER TABLE ONLY "+c+" RENAME COLUMN spend TO spend2"); err != nil {
+		t.Errorf("renaming a non-protected column via ONLY refused: %v", err)
 	}
 }
 

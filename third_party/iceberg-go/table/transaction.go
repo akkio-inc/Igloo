@@ -1756,6 +1756,20 @@ func (t *Transaction) StagedTable() (*StagedTable, error) {
 }
 
 func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
+	return t.commit(ctx)
+}
+
+// CommitWithoutRetry is Commit with commit retries disabled, whatever the
+// table's commit.retry.num-retries property. A conflicting commit fails with
+// ErrCommitFailed instead of being retried, because the manifest-list rebuild
+// on retry can reintroduce files a rewrite replaced (see IGLOO_PATCHES.md).
+// Callers that own the whole table lifecycle (Igloo's maintenance) use it and
+// retry at their own level.
+func (t *Transaction) CommitWithoutRetry(ctx context.Context) (*Table, error) {
+	return t.commit(ctx, withoutRetry())
+}
+
+func (t *Transaction) commit(ctx context.Context, opts ...commitOption) (*Table, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
@@ -1768,8 +1782,10 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	if len(t.meta.updates) > 0 {
 		t.reqs = append(t.reqs, AssertTableUUID(t.meta.uuid))
 		tbl, err := t.tbl.doCommit(ctx, t.meta.updates, t.reqs,
-			withCommitBranch(t.branch),
-			withCommitValidators(t.validators...),
+			append([]commitOption{
+				withCommitBranch(t.branch),
+				withCommitValidators(t.validators...),
+			}, opts...)...,
 		)
 		if err != nil {
 			return tbl, err

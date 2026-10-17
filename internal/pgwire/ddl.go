@@ -118,6 +118,35 @@ func (sc *scanner) literal() (*string, bool) {
 // rest returns everything not yet read.
 func (sc *scanner) rest() string { return sc.s[sc.i:] }
 
+// alterTarget reads the target of ALTER TABLE: the optional IF EXISTS and
+// ONLY modifiers, an optional parenthesis around the name (ONLY (t)), the
+// qualified name, and an optional trailing '*', as DuckDB and PostgreSQL
+// accept them. sc must be positioned right after "ALTER TABLE". It is the one
+// place these modifiers are handled, so no check mistakes ONLY or a name in
+// parentheses for the table (e.g. ALTER TABLE ONLY t ... would otherwise read
+// "only" as the name and skip the table's policies).
+func (sc *scanner) alterTarget() ([]string, bool) {
+	sc.keywords("IF", "EXISTS")
+	sc.keywords("ONLY")
+	sc.skip()
+	paren := sc.i < len(sc.s) && sc.s[sc.i] == '('
+	if paren {
+		sc.i++
+	}
+	name, ok := sc.name()
+	if !ok {
+		return nil, false
+	}
+	sc.skip()
+	switch {
+	case paren && sc.i < len(sc.s) && sc.s[sc.i] == ')':
+		sc.i++
+	case !paren && sc.i < len(sc.s) && sc.s[sc.i] == '*':
+		sc.i++
+	}
+	return name, true
+}
+
 // done reports whether only whitespace, comments and a final semicolon
 // remain.
 func (sc *scanner) done() bool {

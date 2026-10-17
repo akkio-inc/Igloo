@@ -280,6 +280,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   division by zero); they are refused like a rename, for writers and admins
   alike, until the policies are unset. The Iceberg REST endpoint also refuses
   dropping a table with data policies, consistent with its other operations.
+  The target of these checks is read with all of ALTER TABLE's optional
+  keywords handled (`IF EXISTS`, `ONLY`, a trailing `*`, parentheses,
+  comments, quoting), so `ALTER TABLE ONLY t ...` cannot slip the table past
+  them; the target is read the same way wherever an ALTER is parsed, and a
+  target that cannot be read is refused for non-admins.
+- Turned commit retries off for Igloo's own maintenance commits (compaction
+  and snapshot expiry). A table that sets `commit.retry.num-retries` above 0
+  (another engine may) would otherwise make iceberg-go rebuild a rewrite's
+  manifest list from the fresh parent on a conflict and reintroduce the files
+  the rewrite replaced, duplicating rows. Maintenance now fails such a commit
+  and retries next pass instead (see `third_party/iceberg-go/IGLOO_PATCHES.md`).
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in

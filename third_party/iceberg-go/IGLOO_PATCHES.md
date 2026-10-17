@@ -50,6 +50,19 @@ the layout.
   prices and free text got dictionaries nearly as large as the data, which
   made DuckDB's scans slower without saving space.
 
+- `table/table.go` and `table/transaction.go`: a `commit.retry.num-retries`
+  greater than 0 makes a conflicting commit rebuild its manifest list from the
+  fresh parent. For a rewrite (compaction's `RewriteDataFiles`), that rebuild
+  concatenates the fresh parent's whole manifest set with the producer's own
+  manifests, and the overwrite producer's `processManifests` does not drop the
+  files the rewrite replaced, so a replaced file comes back live and its rows
+  duplicate. Until the rebuild drops replaced files, `Transaction` gains a
+  `CommitWithoutRetry` that forces retries off (a new unexported `noRetry`
+  commit option); Igloo's maintenance (compaction and snapshot expiry) uses it
+  and retries at its own level on `ErrCommitFailed`, so a table that sets
+  `commit.retry.num-retries` (for another engine) cannot make Igloo's
+  compaction duplicate rows.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults and
 no longer needs an MPL-licensed dependency.

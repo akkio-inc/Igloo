@@ -966,10 +966,14 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 	if !sc.keywords("ALTER", "TABLE") {
 		return nil
 	}
-	sc.keywords("IF", "EXISTS")
-	name, ok := sc.name()
+	name, ok := sc.alterTarget()
 	if !ok {
-		return nil
+		// The target cannot be read: refuse for non-admins rather than run an
+		// ALTER whose policies could not be checked.
+		if admin {
+			return nil
+		}
+		return denied("cannot determine which table this ALTER changes; it is refused while policies exist")
 	}
 	action := sc.rest()
 	evaluates := alterEvaluatesRows(&scanner{s: action})
@@ -1106,9 +1110,21 @@ func (s *Server) checkCreateIndex(ctx context.Context, sess *session, snap *poli
 	if !sc.keywords("ON") {
 		return nil
 	}
+	sc.keywords("ONLY")
+	sc.skip()
+	paren := sc.i < len(sc.s) && sc.s[sc.i] == '('
+	if paren {
+		sc.i++
+	}
 	name, ok := sc.name()
 	if !ok {
-		return nil
+		if admin {
+			return nil
+		}
+		return denied("cannot determine which table this index is on; it is refused while policies exist")
+	}
+	if paren && sc.i < len(sc.s) && sc.s[sc.i] == ')' {
+		sc.i++
 	}
 	objects, err := s.catalogCandidates(ctx, sess, name, false)
 	if err != nil {

@@ -847,8 +847,7 @@ func (s *Server) ddlEffect(ctx context.Context, sess *session, query string) *gr
 		sc.keywords("IF", "EXISTS")
 		name, _ = sc.name()
 	case sc.keywords("ALTER", "TABLE"):
-		sc.keywords("IF", "EXISTS")
-		name, _ = sc.name()
+		name, _ = sc.alterTarget()
 		if !sc.keywords("RENAME", "TO") {
 			return nil
 		}
