@@ -86,6 +86,12 @@ branches and tags:
   Maintenance passes that property, which iceberg-go itself reads under
   another name.
 
+- `table/scanner.go`, `isDeletionVector`: only a Puffin file is a deletion
+  vector. iceberg-go took any position delete file with a referenced data
+  file for one, and refused to read it, but Java's Iceberg (1.7 and later)
+  writes Parquet position delete files scoped to one data file with it set,
+  as for Spark's deletes, and those are read as any position delete file.
+
 One addition serves the erasure of a person's data (`internal/erasure`):
 
 - `table/igloo_forget_files.go` (new): `Transaction.ForgetFiles` commits a

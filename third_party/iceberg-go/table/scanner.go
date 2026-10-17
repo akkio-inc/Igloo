@@ -179,8 +179,14 @@ func openManifest(io io.IO, manifest iceberg.ManifestFile,
 	return out, nil
 }
 
+// isDeletionVector reports whether df is a deletion vector: a Puffin
+// file. Igloo: iceberg-go took any delete file with a referenced data file
+// for one, but a Parquet position delete file scoped to one data file
+// names it too, as Java's Iceberg (1.7 and later) writes them for Spark's
+// deletes, and it is read as any position delete file is. See
+// IGLOO_PATCHES.md.
 func isDeletionVector(df iceberg.DataFile) bool {
-	return df.ReferencedDataFile() != nil
+	return df.ReferencedDataFile() != nil && strings.EqualFold(string(df.FileFormat()), string(iceberg.PuffinFile))
 }
 
 type Scan struct {
