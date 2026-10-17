@@ -186,7 +186,11 @@ func parseLocalTarget(query string) (t localTarget, ok bool) {
 		}
 	case sc.keywords("ALTER"):
 		switch {
-		case sc.keywords("TABLE"), sc.keywords("VIEW"):
+		case sc.keywords("TABLE"):
+			// ONLY, parentheses and a trailing * as everywhere else.
+			name, ok := sc.alterTarget()
+			return named(writesRelation, name, ok)
+		case sc.keywords("VIEW"):
 			ifExists()
 			name, ok := sc.name()
 			return named(writesRelation, name, ok)

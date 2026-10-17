@@ -36,6 +36,11 @@ func TestLocalDatabaseIsAdminsOnly(t *testing.T) {
 			"DELETE FROM adm",
 			"DROP TABLE adm",
 			"ALTER TABLE adm ADD COLUMN y INTEGER",
+			// ALTER's modifiers do not hide the target.
+			"ALTER TABLE ONLY adm ADD COLUMN y INTEGER",
+			"ALTER TABLE IF EXISTS ONLY memory.main.adm ADD COLUMN y INTEGER",
+			"ALTER TABLE /* x */ ONLY (memory.main.adm) ADD COLUMN y INTEGER",
+			"ALTER TABLE memory.main.adm * ADD COLUMN y INTEGER",
 			// By name.
 			"CREATE OR REPLACE VIEW memory.main.revenue AS SELECT 1 AS dept, 999999 AS amount",
 			"CREATE TABLE memory.t AS SELECT 1 AS x",
