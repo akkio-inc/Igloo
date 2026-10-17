@@ -115,7 +115,11 @@ reference for every setting mentioned here.
   checks the result (rewritten again, it must not change; DuckDB's plan of
   it must read exactly the tables its text names) and refuses statements it
   cannot rewrite with certainty, including several statements in one query
-  that name a protected table, and renames of protected tables and columns.
+  that name a protected table, renames of protected tables and columns, and
+  DDL that would evaluate an expression over the table's rows (a column type
+  change, `ALTER ... USING`, a non-constant `DEFAULT`, a generated column, a
+  `CHECK` constraint, or `CREATE INDEX`), which could otherwise read masked
+  values and hidden rows.
   Policy expressions are stored with their tables qualified and may not
   call macros, read files or depend on session state, and a statement is
   refused if a macro of its session replaces a function a policy calls, or

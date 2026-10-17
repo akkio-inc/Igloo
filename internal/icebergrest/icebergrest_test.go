@@ -1521,6 +1521,13 @@ func TestTablesWithDataPolicies(t *testing.T) {
 	}
 	refused("renaming a protected table away", rename("events", "events_raw"))
 	refused("renaming a table to a protected name", rename("users", "EVENTS"))
+	// Dropping a protected table (which would purge its files) is refused too,
+	// even for a user with CREATE on the schema, and never reaches the catalog.
+	h.grant("nora", auth.PrivilegeCreate, "public", "")
+	refused("dropping a protected table", h.request("DELETE", "/v1/namespaces/public/tables/events?purgeRequested=true", nora, nil))
+	if h.reached("DELETE " + prefix + "/namespaces/public/tables/events?purgeRequested=true") {
+		t.Errorf("a protected table's drop reached the catalog: %v", h.cat.requests)
+	}
 	if strings.Contains(strings.Join(h.vendor.calls, ","), "u-events") {
 		t.Errorf("credentials for a protected table: %v", h.vendor.calls)
 	}

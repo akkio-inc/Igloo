@@ -719,7 +719,13 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	}
 	if t == duckdb.STATEMENT_TYPE_ALTER {
 		ran = true
-		if err := s.checkAlter(ctx, sess, snap, query); err != nil {
+		if err := s.checkAlter(ctx, sess, snap, sens, query, admin); err != nil {
+			return "", nil, ran, err
+		}
+	}
+	if t == duckdb.STATEMENT_TYPE_CREATE && isCreateIndex(query) {
+		ran = true
+		if err := s.checkCreateIndex(ctx, sess, snap, sens, query, admin); err != nil {
 			return "", nil, ran, err
 		}
 	}
@@ -943,11 +949,19 @@ func (s *Server) countCatalogScans(plan any) (int, error) {
 	return n, visit(plan)
 }
 
-// checkAlter refuses renaming a table with policies or tags, or one of its
-// protected columns, or changing such a column's type: policies follow
-// names, and a renamed table would be readable unprotected under its new
-// name until every replica learned of it.
-func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Snapshot, query string) error {
+// checkAlter refuses an ALTER TABLE that would read a policied table's rows
+// or move a policy away from the name it is attached to:
+//   - renaming a table with policies or tags, or one of its protected
+//     columns, or changing such a column's type (policies follow names, and a
+//     renamed table would be readable unprotected under its new name until
+//     every replica learned of it);
+//   - any form that evaluates an expression over the existing rows
+//     (ALTER COLUMN ... [SET DATA] TYPE ... USING, ADD/SET a non-constant
+//     DEFAULT, a generated column, a CHECK constraint), which runs over every
+//     raw row, hidden ones included, so it can read masked values and the
+//     rows a row access policy hides. These are refused whether or not the
+//     user is exempt, like a rename: unset the policies first.
+func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Snapshot, sens *sensitivity, query string, admin bool) error {
 	sc := &scanner{s: query}
 	if !sc.keywords("ALTER", "TABLE") {
 		return nil
@@ -957,6 +971,9 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 	if !ok {
 		return nil
 	}
+	action := sc.rest()
+	evaluates := alterEvaluatesRows(&scanner{s: action})
+
 	var table, column bool
 	var col string
 	switch {
@@ -964,23 +981,21 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 		table = true
 	case sc.keywords("RENAME", "COLUMN"), sc.keywords("RENAME"),
 		sc.keywords("ALTER", "COLUMN"), sc.keywords("ALTER"):
-		c, ok := sc.name()
-		if !ok || len(c) != 1 {
-			return nil
+		if c, ok := sc.name(); ok && len(c) == 1 {
+			col, column = c[0], true
 		}
-		col, column = c[0], true
-	default:
-		return nil
 	}
 	objects, err := s.catalogCandidates(ctx, sess, name, false)
 	if err != nil {
 		return err
 	}
+	policied := false
 	for _, o := range objects {
 		rules := snap.Tagged(o.Schema, o.Table)
 		if rules == nil {
 			continue
 		}
+		policied = true
 		if table {
 			return denied("table %s has policies or tags, which stay with its name; unset them before renaming it", o)
 		}
@@ -988,6 +1003,124 @@ func (s *Server) checkAlter(ctx context.Context, sess *session, snap *policy.Sna
 		if column && (rules.Column(col) != nil || inFilter) {
 			return denied("column %s of %s has a policy or tags, which stay with its name; unset them before renaming it or changing its type", col, o)
 		}
+	}
+	// An expression over the rows is refused when the table is policied, or
+	// when the expression names another policied table (a subquery).
+	if evaluates && (policied || sens.triggers(action, admin)) {
+		return denied("this ALTER TABLE evaluates an expression over the table's rows, which a policy or tag protects; unset the policies before altering it this way")
+	}
+	return nil
+}
+
+// alterEvaluatesRows reports whether an ALTER TABLE action (the text after
+// the table name) evaluates an expression over the table's existing rows: a
+// type change (which casts every value), a non-constant DEFAULT, a generated
+// column, or a CHECK constraint. A constant DEFAULT reads no column, so it is
+// allowed; DROP COLUMN, DROP DEFAULT and NOT NULL changes read no values.
+func alterEvaluatesRows(sc *scanner) bool {
+	switch {
+	case sc.keywords("ADD"):
+		sc.keywords("COLUMN")
+		sc.keywords("IF", "NOT", "EXISTS")
+		if sc.keywords("CONSTRAINT") {
+			sc.name() //nolint:errcheck
+		}
+		switch {
+		case sc.keywords("CHECK"):
+			return true
+		case sc.keywords("PRIMARY", "KEY"), sc.keywords("UNIQUE"), sc.keywords("FOREIGN", "KEY"):
+			return false
+		}
+		return columnDefEvaluates(sc.rest())
+	case sc.keywords("ALTER"):
+		sc.keywords("COLUMN")
+		if _, ok := sc.name(); !ok {
+			return false
+		}
+		switch {
+		case sc.keywords("SET", "DATA", "TYPE"), sc.keywords("SET", "TYPE"), sc.keywords("TYPE"):
+			return true
+		case sc.keywords("SET", "DEFAULT"):
+			return !constantExpr(sc.rest())
+		}
+		return false
+	}
+	return false
+}
+
+// columnDefEvaluates reports whether a column definition (the text after
+// ADD [COLUMN] name) carries an expression evaluated over existing rows: a
+// generated column (AS / GENERATED), a CHECK constraint, or a DEFAULT that is
+// not a constant. The text after DEFAULT includes any trailing clause, so a
+// trailing CHECK makes it non-constant too.
+func columnDefEvaluates(def string) bool {
+	sc := &scanner{s: def}
+	for {
+		sc.skip()
+		if sc.i >= len(sc.s) {
+			return false
+		}
+		switch w := sc.word(); w {
+		case "":
+			sc.i++
+		case "AS", "GENERATED", "CHECK":
+			return true
+		case "DEFAULT":
+			sc.i += len(w)
+			return !constantExpr(sc.rest())
+		default:
+			sc.i += len(w)
+		}
+	}
+}
+
+// isCreateIndex reports whether query is CREATE [OR REPLACE] [UNIQUE] INDEX.
+func isCreateIndex(query string) bool {
+	sc := &scanner{s: query}
+	if !sc.keywords("CREATE") {
+		return false
+	}
+	sc.keywords("OR", "REPLACE")
+	sc.keywords("UNIQUE")
+	return sc.keywords("INDEX")
+}
+
+// checkCreateIndex refuses CREATE INDEX on a table with a policy or tag, or
+// on an expression that names one: building the index reads every row, and an
+// expression index evaluates over them, so it can read protected values and
+// hidden rows. Unset the policies first.
+func (s *Server) checkCreateIndex(ctx context.Context, sess *session, snap *policy.Snapshot, sens *sensitivity, query string, admin bool) error {
+	sc := &scanner{s: query}
+	if !sc.keywords("CREATE") {
+		return nil
+	}
+	sc.keywords("OR", "REPLACE")
+	sc.keywords("UNIQUE")
+	if !sc.keywords("INDEX") {
+		return nil
+	}
+	sc.keywords("IF", "NOT", "EXISTS")
+	if _, ok := sc.name(); !ok {
+		return nil
+	}
+	if !sc.keywords("ON") {
+		return nil
+	}
+	name, ok := sc.name()
+	if !ok {
+		return nil
+	}
+	objects, err := s.catalogCandidates(ctx, sess, name, false)
+	if err != nil {
+		return err
+	}
+	for _, o := range objects {
+		if snap.Tagged(o.Schema, o.Table) != nil {
+			return denied("cannot create an index on %s, which a policy or tag protects; unset the policies first", o)
+		}
+	}
+	if sens.triggers(sc.rest(), admin) {
+		return denied("this index evaluates an expression over a table that a policy or tag protects; unset the policies first")
 	}
 	return nil
 }

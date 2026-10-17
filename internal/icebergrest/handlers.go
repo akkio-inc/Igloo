@@ -537,6 +537,12 @@ func (s *Server) dropTable(c *call) error {
 	if err := c.who.require(auth.PrivilegeCreate, auth.Object{Schema: o.Schema}); err != nil {
 		return err
 	}
+	// A table with data policies is read and managed through Igloo, not other
+	// engines: dropping it here (and purging its files) would be a bypass, so
+	// it is refused for non-admins like the other operations on it.
+	if err := s.requireUnprotected(c, o); err != nil {
+		return err
+	}
 	// Purging deletes every file under the table's location, those that
 	// clones read included (see clones.go).
 	if purgeRequested(c) && s.opts.Clones != nil {

@@ -228,6 +228,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   validated and given a trailing slash at startup so a prefix cannot match a
   sibling. Without a policy, readers and writers may still read the
   warehouse's own files; admins are unchanged.
+- Refused DDL that would read a policied table's rows through an expression:
+  a column type change, `ALTER ... USING`, a non-constant `DEFAULT`, a
+  generated column, a `CHECK` constraint, or `CREATE INDEX`. These evaluate
+  over every raw row, hidden ones included, so they could read masked values
+  and rows a row access policy hides (through `error()`, a failing cast or
+  division by zero); they are refused like a rename, for writers and admins
+  alike, until the policies are unset. The Iceberg REST endpoint also refuses
+  dropping a table with data policies, consistent with its other operations.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in
