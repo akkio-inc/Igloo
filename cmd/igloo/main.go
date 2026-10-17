@@ -314,11 +314,11 @@ func serve() error {
 		}
 		defer erasureStore.Close()
 		// Requests hold the locks of tables' locations that making a clone
-		// takes while they delete files, and a request that fails for good
-		// raises the built-in alert for failed runs.
+		// takes while they delete files, and a request that fails for good,
+		// or is blocked, raises the built-in alert for failed runs.
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
-			Locks: cloneStore, Failed: notifier.ErasureFailed, Metrics: erasure.NewMetrics(reg), Log: log,
+			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
 		}, historyStore, taskStore)
 		if err != nil {
 			return err

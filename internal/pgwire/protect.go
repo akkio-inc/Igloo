@@ -209,6 +209,15 @@ func (s *Server) Classified(ctx context.Context, schema, table string) ([]string
 	return slices.Compact(columns), true
 }
 
+// Erasing reports whether an erasure request that is not over erases from
+// the catalog table schema.table (see erasure.Service.Erasing).
+func (s *Server) Erasing(ctx context.Context, schema, table string) (bool, error) {
+	if s.erasure == nil {
+		return false, nil
+	}
+	return s.erasure.Erasing(ctx, schema, table)
+}
+
 // ProtectedBy names, sorted, the policies that protect the catalog table
 // schema.table: its row access policy, and the masking policies of its
 // columns, set on them or through their tags. It is empty exactly when
@@ -729,6 +738,13 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	// Tags and data retentions follow names too, policies or not: a
 	// renamed table would escape erasure (see package erasure).
 	checked := false
+	if s.erasure != nil && formatVersion.MatchString(query) {
+		ran, err := s.checkErasingFormat(ctx, sess, t, query)
+		checked = checked || ran
+		if err != nil {
+			return "", nil, checked, err
+		}
+	}
 	if t == duckdb.STATEMENT_TYPE_ALTER && snap.Classified() {
 		checked = true
 		if err := s.checkAlterNames(ctx, sess, snap, query); err != nil {
@@ -1093,6 +1109,58 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 // formatVersion finds a change of a table's Iceberg format version in
 // what follows ALTER TABLE's name, or in CREATE TABLE's options.
 var formatVersion = regexp.MustCompile(`(?i)format[-_]version`)
+
+// propertyCall finds the table that a call of a table property function
+// names, as its first argument.
+var propertyCall = regexp.MustCompile(`(?i)\b(?:set|remove)_iceberg_table_properties\s*\(\s*([^,)]*)`)
+
+// checkErasingFormat refuses a statement that may change the Iceberg
+// format version of a table an erasure request erases from (see
+// erasure.Service.Erasing), whether its columns have tags or not: ALTER
+// TABLE, CREATE OR REPLACE TABLE, or a table property function. Erasure
+// requests cannot rewrite tables of version 3 yet, and one that has begun
+// deleting from the table could not go on. It reports whether it ran
+// statements on the session's connection.
+func (s *Server) checkErasingFormat(ctx context.Context, sess *session, t duckdb.StmtType, query string) (bool, error) {
+	var names [][]string
+	switch t {
+	case duckdb.STATEMENT_TYPE_ALTER:
+		sc := &scanner{s: query}
+		if sc.keywords("ALTER", "TABLE") {
+			if name, ok := sc.alterTarget(); ok && formatVersion.MatchString(sc.rest()) {
+				names = append(names, name)
+			}
+		}
+	case duckdb.STATEMENT_TYPE_CREATE:
+		if r, ok := parseTableReplace(query); ok && formatVersion.MatchString(r.rest) {
+			names = append(names, r.target)
+		}
+	}
+	for _, m := range propertyCall.FindAllStringSubmatch(query, -1) {
+		if name, ok := (&scanner{s: m[1]}).name(); ok {
+			names = append(names, name)
+		}
+	}
+	ran := false
+	for _, name := range names {
+		objects, err := s.catalogCandidates(ctx, sess, name, false)
+		ran = true
+		if err != nil {
+			return ran, err
+		}
+		for _, o := range objects {
+			erasing, err := s.erasure.Erasing(ctx, o.Schema, o.Table)
+			if err != nil {
+				return ran, fmt.Errorf("check whether an erasure request erases from %s: %w", o, err)
+			}
+			if erasing {
+				return ran, denied("an erasure request erases from %s; it stays at its Iceberg format version until the request is over, "+
+					"as erasure requests cannot rewrite tables of version 3 yet", o)
+			}
+		}
+	}
+	return ran, nil
+}
 
 // checkReplaceKeeps refuses a CREATE OR REPLACE TABLE whose new table
 // lacks a column of the old one that has a policy or tags, or that its row

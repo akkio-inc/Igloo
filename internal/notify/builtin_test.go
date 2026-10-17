@@ -151,6 +151,29 @@ func TestBuiltinAlerts(t *testing.T) {
 	}
 }
 
+// An erasure request that is blocked raises failed_runs, once an hour
+// however often it tries again.
+func TestErasureBlocked(t *testing.T) {
+	ctx := context.Background()
+	rc := newReceiver(t, false)
+	s := newTestService(t, Options{Jobs: tasks.NewMemoryStore()})
+	if err := s.Store().CreateIntegration(ctx, Integration{Name: "ops", Type: TypeWebhook, Enabled: true, URL: rc.URL,
+		Builtin: Builtin{FailedRuns: true}}, false); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		s.ErasureBlocked("01a14589", "delete", "crm.events is an Iceberg table of format version 3")
+	}
+	drain(ctx, s)
+	got := payloads(t, rc)
+	if len(got) != 1 || got[0]["name"] != BuiltinFailedRuns {
+		t.Fatalf("sent %v", got)
+	}
+	if d := got[0]["details"].(map[string]any); d["kind"] != "erasure" || d["name"] != "01a14589" || d["step"] != "delete" {
+		t.Errorf("details %v", d)
+	}
+}
+
 // TestLoginNoticesCannotFlood checks that failed-login notices, which
 // clients drive, are few per window, show names quoted, and leave the
 // integration's queue and rate limit to the other built-in alerts.

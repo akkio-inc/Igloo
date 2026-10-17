@@ -101,6 +101,9 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 			columns, classified := deps.sql.Classified(ctx, o.Schema, o.Table)
 			return columns, classified, nil
 		},
+		Erasing: func(ctx context.Context, o auth.Object) (bool, error) {
+			return deps.sql.Erasing(ctx, o.Schema, o.Table)
+		},
 		Key:         key,
 		Credentials: vendor,
 		TLS:         deps.tls != nil,

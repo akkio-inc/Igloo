@@ -57,12 +57,27 @@ ALTER TABLE crm.referrals ALTER COLUMN referrer_email SET TAG pii = 'email:null'
   one tag value is on columns of different kinds (text, UUIDs, bytes,
   integers): an identifier given in a form some of them do not hold finds
   nothing there.
-- **Tables of Iceberg format version 3**, which can hold deletion vectors
-  that Igloo cannot read yet, are refused, when a request is made and again
-  before it deletes anything: it could delete their rows but not rewrite
-  the files that hold them. A table with tags cannot be upgraded to version
-  3, through SQL or the REST catalog. Parquet position delete files scoped
-  to one data file, as Java's Iceberg writes Spark's, are read as any.
+- **What a request could not finish is refused before it deletes
+  anything.** A table it could not erase from with certainty is refused
+  when a request is made, and again before its first `DELETE`, when the
+  request fails having deleted nothing: a table of Iceberg format version
+  3, which can hold deletion vectors that Igloo cannot read yet; a table
+  with a data or delete file that is not Parquet, which Igloo can neither
+  search nor rewrite; and a table with a branch or tag whose schema
+  requires a value in a column tagged `:null`, or whose files Igloo could
+  not write again with a partition spec that schema has the columns of.
+  Each table is loaded and checked again just before each `DELETE` from
+  it, on every run, retries included, so no `DELETE` runs on a table
+  another engine changed so meanwhile. A table with tags cannot be
+  upgraded to version 3, through SQL or the REST catalog, and neither can
+  any table an open request erases from (its clones too) until the request
+  is over. Parquet position delete files scoped to one data file, as
+  Java's Iceberg writes Spark's, are read as any.
+- **Once it has sent a `DELETE`, a request never fails**: failing would
+  forget whose rows it deleted while files may still hold them. What
+  stops it then, as another engine upgrading one of its tables to version
+  3 by going around Igloo, makes it `blocked` (see
+  [below](#what-a-request-does)) until someone fixes it.
 - **Hashed identifiers**: a tag value with `:sha256`, `:sha1` or `:md5`
   after it marks a column of the identifier's hex digest, as ad platforms
   match on: of the identifier as given, or lower-cased and trimmed. A
@@ -147,7 +162,8 @@ Safeguards against erasing the wrong people:
 - **Large deletions wait to be confirmed.** A request that would delete
   more than 1% of a table's rows, and more than 100 of them, counting
   those that other requests made within 24 hours of it, before or after,
-  match in the table (but those canceled or confirmed), or that would
+  match in the table (but those canceled, confirmed, or that failed
+  before they deleted anything), or that would
   delete every row of a table however small, is `held` once it has counted
   them, before it deletes anything, until someone who may erase, other
   than its requester, runs `CONFIRM ERASURE REQUEST`. Whichever of such
@@ -175,7 +191,7 @@ Igloo while a request has work to do.
 |---|---|
 | `find` | Lists the tables with columns tagged with the request's tag values; the tables that share data files with them ([clones](#clones)); and the tables that the query history and the definitions of materialized views and tasks say were written from them. Tagged tables of [connections](federation.md) are listed, but nothing is erased from them. Counts their rows and those that match, and holds a request that would delete much of a table. |
 | `delete` | Deletes the matching rows, as a `DELETE` would: queries no longer see them. |
-| `rewrite` | On every branch and tag of every table, writes each data file that holds matching rows again with its deletes applied, leaving out the rows that match, or setting columns tagged `:null` to NULL in them, in the same commit that replaces the file: rows that arrived since the delete step go too. Equality delete files that hold matches go with the files they apply to, or at once if they apply to none; a position delete file goes only when every file it deletes rows of is replaced or gone, so rows deleted from files the commit keeps stay deleted. Then writes again the manifests that still list the old files: a manifest keeps a removed file's entry, with column bounds that can hold the value itself. A tag is rewritten on a branch of the request's (`igloo-erasure-...`) with its snapshot's own schema, as a tag is read, so a column dropped since it was made stays in it, and moved to the result, if it still points where it did: a tag moved meanwhile is rewritten where it points now, and the branch of a tag dropped meanwhile goes. Branches keep their unpublished rows. A position delete file that carries the rows it deletes, as the spec allows, and holds the person's, goes too, with the files it deletes rows of rewritten so that it can. |
+| `rewrite` | On every branch and tag of every table, writes each data file that holds matching rows again with its deletes applied, leaving out the rows that match, or setting columns tagged `:null` to NULL in them, in the same commit that replaces the file: rows that arrived since the delete step go too. Equality delete files that hold matches go with the files they apply to, or at once if they apply to none; a position delete file goes only when every file it deletes rows of is replaced or gone, so rows deleted from files the commit keeps stay deleted. Then writes again the manifests that still list the old files: a manifest keeps a removed file's entry, with column bounds that can hold the value itself. Every branch but main is rewritten with its head's own schema, and a tag with its snapshot's, as they are read (Igloo's `AT (BRANCH => ...)`, PyIceberg), so a column dropped since stays in them; main, with the table's current schema. Each file is written again with its own partition spec or, if the schema it is read with lacks a column that spec partitions by, with the table's default spec or another whose columns it has. A tag is rewritten on a branch of the request's (`igloo-erasure-...`), and moved to the result, if it still points where it did: a tag moved meanwhile is rewritten where it points now, and the branch of a tag dropped meanwhile goes. Branches keep their unpublished rows. A position delete file that carries the rows it deletes, as the spec allows, and holds the person's, goes too, with the files it deletes rows of rewritten so that it can, or at once if none of them is live any more, as after another engine rewrote them copy-on-write. |
 | `expire` | Expires the snapshots that reference a file that held matching rows, or whose bounds may, however recent, so time travel to them ends. Snapshots that reference none stay, older ones included, and so do the snapshots branches and tags point at, which the rewrite step made reference none. A snapshot staged by write-audit-publish (Spark's `wap.id`) that holds matching rows holds others' unpublished rows too: the request waits (`waiting`, with `error` saying which) for it to be published, by fast-forward or by cherry-pick (a snapshot with its `wap.id` as `published-wap-id`), and then rewrites the branch, or discarded. It waits from when the request was made, as long as maintenance keeps such a snapshot (7 days, or the table's `history.expire.max-snapshot-age-ms` if longer), and at most 21 days, so that it completes within the month the GDPR allows; then it expires the snapshot, unpublished rows and all. The commit asserts every branch and tag as the catalog has them just before it, so none made meanwhile at an expired snapshot is lost. |
 | `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. It deletes files only in the warehouse, and never one that another table references ([clones](#clones)). Paths compare without their scheme (`s3a://` and `s3://` name the same file, as `file://` and a local path do), unescaped, and a listed file that the table references under a spelling Igloo cannot tell the same, but whose name a referenced file has, is kept: if it holds matching rows, the request stops with an error that names it, for someone to check. |
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`, those of tables since replaced included; it writes them again from the files that remain. |
@@ -184,16 +200,26 @@ Igloo while a request has work to do.
 | `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; sharing copies; history. Anything found sends the request back to the step that removes it. |
 
 A failed run is tried again after a minute, then 2, 4 and so on up to an
-hour. A request fails for good (`failed`) when its runs fail 10 times in a
-row, as when matching rows keep arriving faster than it removes them, or
-when verification sends it back more than five times: it stops, forgets its
-identifiers, drops any branch of its own left, logs `erasure request
-failed` at error level, raises the built-in alert `FAILED_RUNS`
+hour. Before its first `DELETE`, a request fails for good (`failed`) when
+its runs fail 10 times in a row, or at once when it finds a table it could
+not erase from (see [above](#tag-the-columns-that-hold-identifiers)): it stops,
+forgets its identifiers, logs `erasure request failed` at error level,
+raises the built-in alert `FAILED_RUNS`
 ([alerts](alerts.md#built-in-operational-alerts)), and counts in
-`igloo_erasure_requests_failed_total`. What it erased stays erased; fix
-what `error` says and make the request again. Each failed run raises
-`FAILED_RUNS` for the request's job too, with the error, scrubbed of
-identifiers and hashes as everything the request logs is.
+`igloo_erasure_requests_failed_total`. It has deleted nothing; fix what
+`error` says and make the request again.
+
+Once it has sent a `DELETE`, which may have committed even when no answer
+came, a request never fails: what would fail it, as runs that keep failing
+because matching rows keep arriving faster than it removes them,
+verification that sends it back more than five times, or a table that
+another engine changed so that the request cannot erase from it any more,
+makes it `blocked` instead. A blocked request keeps its identifiers
+sealed, logs at error level, raises `FAILED_RUNS` (once an hour), counts in
+`igloo_erasure_requests_blocked_runs_total`, and tries again every hour;
+it goes on once what `error` says is fixed, and cannot be canceled. Each
+failed run raises `FAILED_RUNS` for the request's job too, with the error,
+scrubbed of identifiers and hashes as everything the request logs is.
 
 Three kinds of run never count, however often they happen, since none
 says anything is wrong with the request:
@@ -267,7 +293,7 @@ request, newest first, to admins and holders of `ERASE`:
 | Column | Is |
 |---|---|
 | `request_id`, `requester` | The request, and who made it |
-| `status` | `queued`, `running`, `held` (waits for `CONFIRM ERASURE REQUEST`), `waiting` (for replicas, for a recent file to be old enough to delete, or for a staged snapshot to be published or discarded), `retrying` (the last run failed; `error` says why), `completed`, `canceled` or `failed` |
+| `status` | `queued`, `running`, `held` (waits for `CONFIRM ERASURE REQUEST`), `waiting` (for replicas, for a recent file to be old enough to delete, or for a staged snapshot to be published or discarded), `retrying` (the last run failed; `error` says why), `blocked` (has begun deleting and cannot go on until what `error` says is fixed), `completed`, `canceled` or `failed` (before it deleted anything) |
 | `step` | The step it runs next, `done` once complete |
 | `created_at`, `updated_at`, `completed_at` | When |
 | `subjects` | JSON: the tag values, and how many identifiers of each |
@@ -285,7 +311,7 @@ FROM (SELECT *, unnest(json_extract(tables::JSON, '$[*]')) AS t FROM igloo.erasu
 
 Each run of a request is in `igloo.task_history`, as kind `erasure`. The
 log says `erasure requested`, `erasure request completed`, `erasure request
-held`, `confirmed`, `canceled` and `failed`, and why a run failed. Requests
+held`, `confirmed`, `canceled`, `failed` and `cannot go on` (blocked), and why a run failed. Requests
 are kept in the metadata database (schema `igloo_erasure`); without one, in
 memory, lost on restart.
 

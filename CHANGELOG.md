@@ -376,8 +376,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and columns tagged `:null` are set to NULL instead of deleting the row.
   Requests run in the background on the scheduler, survive restarts,
   resume after failures with growing waits, fail for good with a metric
-  and an alert after 10 failures (losing to other writers, or a replica
-  with another erasure key, does not count), keep their identifiers sealed
+  and an alert after 10 failures before their first `DELETE` (losing to
+  other writers, or a replica with another erasure key, does not count),
+  and once they have sent one never fail but are blocked, with a metric
+  and an alert, keeping their identifiers and trying again every hour
+  until what stops them is fixed; they keep their identifiers sealed
   under `IGLOO_ERASURE_KEY` (or `IGLOO_ERASURE_KEY_FILE`'s) only while they
   run, wait for snapshots staged by write-audit-publish to be published or
   discarded, and are listed with what they did per table and step in
@@ -389,11 +392,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   deleted there, or all of it, waits for someone other than its requester
   to `CONFIRM ERASURE REQUEST`, and `CANCEL ERASURE REQUEST` cancels one
   before it sends a `DELETE`. Placeholder identifiers, such as the all-zero
-  advertising ID, and their digests, are refused; so are tables of Iceberg
-  format version 3, whose deletion vectors Igloo cannot read yet, before
-  anything is deleted, and tables with tags cannot be upgraded to it. A
-  tag is rewritten with its own snapshot's schema, so columns dropped
-  since it was made stay in it. Admins and roles granted
+  advertising ID, and their digests, are refused; so are, when a request
+  is made, before its first `DELETE`, and again just before each `DELETE`
+  from each table, tables it could not erase from with certainty: of
+  Iceberg format version 3, whose deletion vectors Igloo cannot read yet,
+  with files other than Parquet, or with a branch or tag it could not
+  write again. Tables with tags, and every table an open request erases
+  from, cannot be upgraded to version 3. Every branch but main is
+  rewritten with its head's schema, and a tag with its snapshot's, so
+  columns dropped since stay in them, and each file is written again with
+  its own partition spec, or another whose columns that schema has. Admins
+  and roles granted
   `ERASE ON ACCOUNT` make them. `iceberg-go`'s copy gains
   `Transaction.ForgetFiles`, which rewrites the manifests that list removed
   files, and `WithMaxRefAge`, so expiring snapshots keeps branches and tags.

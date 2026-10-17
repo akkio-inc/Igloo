@@ -1,6 +1,7 @@
 package erasure
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -93,9 +94,9 @@ func branchFor(r *Request, tag string, id int64) string {
 	return tagBranch + strings.ToLower(r.ID) + "-" + hex.EncodeToString(sum[:4]) + "-" + strconv.FormatInt(id, 10)
 }
 
-// ownSchema reports whether branch is rewritten with its snapshots' own
-// schema: a branch a request rewrites a tag on is (see at).
-func ownSchema(branch string) bool { return strings.HasPrefix(branch, tagBranch) }
+// ownSchema reports whether branch is rewritten with its head's own schema
+// (see at): every branch but main is.
+func ownSchema(branch string) bool { return branch != table.MainBranch }
 
 // ownBranch reports whether ref name is one of r's branches.
 func ownBranch(r *Request, name string) bool {
@@ -107,13 +108,17 @@ func ownBranch(r *Request, name string) bool {
 // and commits work from. iceberg-go builds a commit to any branch on the
 // current snapshot, so a commit to another branch is made on this.
 //
-// With own, its current schema is the snapshot's own, as a tag reads its
-// snapshot (Java's SnapshotUtil.schemaFor: tags read with the snapshot's
-// schema, branches with the table's), so that a rewrite of a tag reads and
-// writes every column the snapshot has, and the snapshot that replaces it
-// keeps that schema, as iceberg-go gives a new snapshot the current one.
-// With the table's current schema, a column dropped since the tag was made
-// went from every row of the tag, the person's or not.
+// With own, its current schema is the snapshot's own, as a tag's snapshot
+// is read, and as Igloo (AT (BRANCH => ...) reads the branch's head) and
+// PyIceberg read a branch's, so that a rewrite of any ref but main reads
+// and writes every column its snapshot has, and the snapshot that replaces
+// it keeps that schema, as iceberg-go gives a new snapshot the current
+// one. With the table's current schema, a column dropped since the
+// snapshot was made went from every row of the ref, the person's or not.
+// Main is read with the table's current schema, as every engine reads it.
+//
+// The view's partition spec stays the table's default; a rewrite writes
+// each file with a spec its schema has every column of (see writeSpec).
 func (s *Service) at(tbl *table.Table, id int64, own bool) (*table.Table, error) {
 	current := tbl.Metadata().CurrentSchema().ID
 	schema := current
@@ -373,16 +378,12 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	if err != nil {
 		return false, err
 	}
-	targeted := map[string]bool{}
 	for p, n := range rowsHeld {
 		matched[p] += n
-		targets, err := s.targets.Of(ctx, fsys, live[p])
-		if err != nil {
-			return false, err
-		}
-		for t := range targets {
-			targeted[t] = true
-		}
+	}
+	targeted, gone, err := s.rowCopies(ctx, fsys, slices.Sorted(maps.Keys(rowsHeld)), live, tasks)
+	if err != nil {
+		return false, err
 	}
 	for p := range matched {
 		if r.written[p] {
@@ -396,12 +397,10 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	// A data file goes when it holds matches, or when an equality delete
 	// that does applies to it: once all of those are rewritten, the delete
 	// is dead and goes too. One that applies to no file goes at once.
-	var (
-		selected []table.FileScanTask
-		dangling []iceberg.DataFile
-	)
+	var selected []table.FileScanTask
+	dangling := gone
 	for _, task := range tasks {
-		if matched[task.File.FilePath()] > 0 || targeted[task.File.FilePath()] || slices.ContainsFunc(task.EqualityDeleteFiles, func(d iceberg.DataFile) bool {
+		if matched[task.File.FilePath()] > 0 || targeted.Has(task.File.FilePath()) || slices.ContainsFunc(task.EqualityDeleteFiles, func(d iceberg.DataFile) bool {
 			return matched[d.FilePath()] > 0
 		}) {
 			selected = append(selected, task)
@@ -410,13 +409,6 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	for p, df := range deletes {
 		if matched[p] > 0 && !attached[p] {
 			dangling = append(dangling, df)
-		}
-	}
-	for p := range rowsHeld {
-		if !slices.ContainsFunc(tasks, func(task table.FileScanTask) bool {
-			return slices.ContainsFunc(task.DeleteFiles, func(d iceberg.DataFile) bool { return d.FilePath() == p })
-		}) {
-			dangling = append(dangling, live[p])
 		}
 	}
 	if len(selected) > 0 || len(dangling) > 0 {
@@ -438,29 +430,94 @@ func (s *Service) rewriteRef(ctx context.Context, r *Request, t *Table, view *ta
 	return true, s.forget(ctx, view, branch, bad)
 }
 
+// rowCopies sorts the position delete files held, which hold matching
+// rows: targeted are the data files they delete rows of, which are
+// rewritten so that they can go with them (see rewriteFiles), and gone are
+// those that delete rows of no live data file, as when another engine
+// rewrote those files and left the deletes, as copy-on-write does, or that
+// apply to no file the scan planned: they delete nothing, and go at once.
+// Paths compare however spelled (see deletefiles.Paths), which can only
+// take a target for live, and keep its delete file until it is rewritten.
+func (s *Service) rowCopies(ctx context.Context, fsys iceio.IO, held []string, live map[string]iceberg.DataFile,
+	tasks []table.FileScanTask) (deletefiles.Paths, []iceberg.DataFile, error) {
+	data := deletefiles.Paths{}
+	for p, df := range live {
+		if df.ContentType() == iceberg.EntryContentData {
+			data.Add(p)
+		}
+	}
+	attached := map[string]bool{}
+	for _, task := range tasks {
+		for _, d := range task.DeleteFiles {
+			attached[d.FilePath()] = true
+		}
+	}
+	targeted := deletefiles.Paths{}
+	var gone []iceberg.DataFile
+	for _, p := range held {
+		targets, err := s.targets.Of(ctx, fsys, live[p])
+		if err != nil {
+			return nil, nil, err
+		}
+		applies := false
+		for t := range targets {
+			targeted.Add(t)
+			applies = applies || data.Has(t)
+		}
+		if !applies || !attached[p] {
+			gone = append(gone, live[p])
+		}
+	}
+	return targeted, gone, nil
+}
+
+// removable are the position delete files of tasks that a commit which
+// replaces the tasks' data files may remove (see
+// deletefiles.Targets.Removable): those that delete rows only of those
+// files, spelled as their manifests and the delete files spell them, or of
+// files that are not live, however spelled. live are the files live in the
+// snapshot the commit replaces them in.
+func (s *Service) removable(ctx context.Context, fsys iceio.IO, tasks []table.FileScanTask, live map[string]iceberg.DataFile) ([]iceberg.DataFile, error) {
+	current := deletefiles.Paths{}
+	for p := range live {
+		current.Add(p)
+	}
+	return s.targets.Removable(ctx, fsys, tasks, current)
+}
+
 // batch is one commit of a rewrite: the data files it replaces and those
-// that replace them, and the delete files it removes.
+// that replace them, written with partition spec spec, and the delete
+// files it removes.
 type batch struct {
 	old, added, removed []iceberg.DataFile
+	spec                int
 	stats               filterStats
 }
 
 // rewriteFiles writes the tasks' data files again with their deletes
 // applied and without matching rows, a partition at a time and at most
-// maxRewriteBytes per commit. Each commit removes the equality deletes
-// that apply to no file left, those that apply to no file at all, and
-// the position deletes that delete rows only of files it replaces or of
-// files no longer live (see package deletefiles); live are the files live
-// in view's current snapshot.
+// maxRewriteBytes per commit, each with a partition spec view's schema has
+// the columns of (see writeSpec), and one spec per commit: iceberg-go
+// lists the files a commit adds in manifests of the spec the table writes
+// with (see withSpec). Each commit removes the equality deletes that apply
+// to no file left, those that apply to no file at all, and the position
+// deletes that delete rows only of files it replaces or of files no longer
+// live (see removable); live are the files live in view's current
+// snapshot.
 func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *table.Table, branch string, flds []field,
 	tasks []table.FileScanTask, dangling []iceberg.DataFile, live map[string]iceberg.DataFile) error {
 	byPartition := map[string]*table.CompactionTaskGroup{}
+	specs := map[string]int{}
 	for _, task := range tasks {
 		key := partitionKey(task.File)
 		g := byPartition[key]
 		if g == nil {
+			spec, err := writeSpec(view, int(task.File.SpecID()))
+			if err != nil {
+				return terminal(fmt.Errorf("rewrite %s of %s: %w", branch, t.Name, err))
+			}
 			g = &table.CompactionTaskGroup{PartitionKey: key}
-			byPartition[key] = g
+			byPartition[key], specs[key] = g, spec
 		}
 		g.Tasks = append(g.Tasks, task)
 		g.TotalSizeBytes += task.File.FileSizeBytes()
@@ -469,17 +526,23 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 	if err != nil {
 		return err
 	}
+	live = maps.Clone(live)
 	filter := newRowFilter(r, flds)
-	keys := slices.Sorted(maps.Keys(byPartition))
+	keys := slices.SortedFunc(maps.Keys(byPartition), func(a, b string) int {
+		return cmp.Or(cmp.Compare(specs[a], specs[b]), strings.Compare(a, b))
+	})
 	for len(keys) > 0 || len(dangling) > 0 {
 		var (
 			groups []*table.CompactionTaskGroup
 			total  int64
 			paths  = map[string]struct{}{}
 			tasks  []table.FileScanTask
-			b      batch
+			b      = batch{spec: view.Metadata().DefaultPartitionSpec()}
 		)
-		for len(keys) > 0 && (len(groups) == 0 || total+byPartition[keys[0]].TotalSizeBytes <= maxRewriteBytes) {
+		if len(keys) > 0 {
+			b.spec = specs[keys[0]]
+		}
+		for len(keys) > 0 && specs[keys[0]] == b.spec && (len(groups) == 0 || total+byPartition[keys[0]].TotalSizeBytes <= maxRewriteBytes) {
 			g := byPartition[keys[0]]
 			groups, total, keys = append(groups, g), total+g.TotalSizeBytes, keys[1:]
 			for _, task := range g.Tasks {
@@ -487,8 +550,12 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 			}
 			tasks = append(tasks, g.Tasks...)
 		}
+		writing, err := s.withSpec(view, b.spec)
+		if err != nil {
+			return err
+		}
 		for _, g := range groups {
-			added, err := s.rewriteGroup(ctx, view, g, filter, &b.stats)
+			added, err := s.rewriteGroup(ctx, writing, g, filter, &b.stats)
 			if err != nil {
 				return err
 			}
@@ -504,14 +571,7 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 		if err != nil {
 			return fmt.Errorf("find dead equality deletes: %w", err)
 		}
-		rewritten, current := deletefiles.Paths{}, deletefiles.Paths{}
-		for p := range paths {
-			rewritten.Add(p)
-		}
-		for p := range live {
-			current.Add(p)
-		}
-		safe, err := s.targets.Removable(ctx, fsys, tasks, rewritten, current)
+		safe, err := s.removable(ctx, fsys, tasks, live)
 		if err != nil {
 			return fmt.Errorf("find the position deletes the rewrite may remove: %w", err)
 		}
@@ -535,12 +595,82 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 		}
 		s.log.Info("rewrote files holding erased data", "request", r.ID, "table", t.Name, "branch", branch,
 			"files", len(paths), "rows", b.stats.dropped, "nulled", b.stats.nulled)
+		// What the commit replaced and removed is no longer live for the
+		// next one, and what it added is.
+		for _, df := range slices.Concat(b.old, b.removed) {
+			delete(live, df.FilePath())
+		}
+		for _, df := range b.added {
+			live[df.FilePath()] = df
+		}
 		head := refs(committed)[branch]
 		if view, err = s.at(committed, head.SnapshotID, ownSchema(branch)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// writeSpec is the partition spec a rewrite of view writes the files of
+// spec id again with: their own, if view's schema has every column it
+// partitions by, or else the table's default spec, or else any other of
+// the table's specs, if the schema has their columns. A ref read with a
+// schema older than the table's (see at) can lack a column the table has
+// been partitioned by since, and iceberg-go cannot write files of a spec
+// without its columns.
+func writeSpec(view *table.Table, id int) (int, error) {
+	meta, schema := view.Metadata(), view.Schema()
+	candidates := []int{id, meta.DefaultPartitionSpec()}
+	for _, spec := range meta.PartitionSpecs() {
+		candidates = append(candidates, spec.ID())
+	}
+	for _, c := range candidates {
+		if spec := meta.PartitionSpecByID(c); spec != nil && specFits(*spec, schema) {
+			return c, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: its files of partition spec %d cannot be written again: no partition spec of the table "+
+		"partitions by columns that the schema it is read with (%d) has", ErrInvalid, id, schema.ID)
+}
+
+// specFits reports whether schema has every column spec partitions by, of
+// a type its transform applies to.
+func specFits(spec iceberg.PartitionSpec, schema *iceberg.Schema) bool {
+	if spec.IsUnpartitioned() {
+		return true
+	}
+	for _, f := range spec.Fields() {
+		for _, id := range f.SourceIDs {
+			src, ok := schema.FindFieldByID(id)
+			if !ok || !f.Transform.CanTransform(src.Type) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// withSpec is view writing new files with partition spec id: iceberg-go
+// writes files, and the manifests that list those a commit adds, with the
+// table's default spec. Only the commit's snapshot reaches the catalog,
+// not the default spec.
+func (s *Service) withSpec(view *table.Table, id int) (*table.Table, error) {
+	if view.Metadata().DefaultPartitionSpec() == id {
+		return view, nil
+	}
+	b, err := table.MetadataBuilderFromBase(view.Metadata(), view.MetadataLocation())
+	if err != nil {
+		return nil, err
+	}
+	if err := b.SetDefaultSpecID(id); err != nil {
+		return nil, err
+	}
+	meta, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+	fsF := func(ctx context.Context) (iceio.IO, error) { return view.FS(ctx) }
+	return table.New(view.Identifier(), meta, view.MetadataLocation(), fsF, s.opts.Catalog), nil
 }
 
 // commitBatch commits b to branch on view's current snapshot. When
@@ -552,7 +682,11 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 // the request tries again later.
 func (s *Service) commitBatch(ctx context.Context, t *Table, view *table.Table, branch string, b *batch) (*table.Table, error) {
 	for attempt := 0; ; attempt++ {
-		tx := view.NewTransactionOnBranch(branch)
+		writing, err := s.withSpec(view, b.spec)
+		if err != nil {
+			return nil, err
+		}
+		tx := writing.NewTransactionOnBranch(branch)
 		rw := tx.NewRewrite(operation)
 		rw.Apply(b.old, b.added, b.removed)
 		if err := rw.Commit(ctx); err != nil {

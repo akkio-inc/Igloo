@@ -197,17 +197,24 @@ func single(rg *metadata.RowGroupMetaData, col int) (string, bool) {
 }
 
 // Removable returns the position delete files attached to tasks that a
-// commit replacing the data files rewritten may remove: those that delete
+// commit replacing the tasks' data files may remove: those that delete
 // rows only of files it replaces, or of files not live in the snapshot it
 // commits on. One that deletes rows of a live file the commit keeps stays,
 // and applies to that file as before.
 //
-// A target counts as replaced only if rewritten has it spelled exactly as
-// the delete file spells it: two spellings Canonical takes for one file
-// could be two files, and taking a kept file for a replaced one would drop
-// deletes that still apply to it. A target counts as live if live has it
-// in any spelling, which only keeps a delete file.
-func (t *Targets) Removable(ctx context.Context, fs iceio.IO, tasks []table.FileScanTask, rewritten map[string]bool, live Paths) ([]iceberg.DataFile, error) {
+// A target counts as replaced only if a task's file is spelled exactly as
+// the delete file spells it, as the writer of both spelled it: two
+// spellings Canonical takes for one file could be two files, and taking a
+// kept file for a replaced one would drop deletes that still apply to it.
+// A target counts as live if live has it in any spelling, which only keeps
+// a delete file.
+func (t *Targets) Removable(ctx context.Context, fs iceio.IO, tasks []table.FileScanTask, live Paths) ([]iceberg.DataFile, error) {
+	rewritten := map[string]bool{}
+	for _, task := range tasks {
+		if task.File != nil {
+			rewritten[task.File.FilePath()] = true
+		}
+	}
 	seen := map[string]bool{}
 	var out []iceberg.DataFile
 	for _, task := range tasks {

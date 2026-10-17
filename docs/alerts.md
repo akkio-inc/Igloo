@@ -234,7 +234,7 @@ ALTER NOTIFICATION INTEGRATION analytics_slack
 
 | Alert | Sends when | At most |
 |---|---|---|
-| `FAILED_RUNS` | A scheduled run of a task, pipe or materialized view fails, or an [erasure request](privacy.md) fails for good | Once an hour per task, pipe or view |
+| `FAILED_RUNS` | A scheduled run of a task, pipe or materialized view fails, or an [erasure request](privacy.md) fails for good or is blocked | Once an hour per task, pipe, view or request |
 | `LOAD_ERRORS` | `COPY INTO`, or a pipe, could not load some files, or loaded them without some rows | Once an hour per table |
 | `IDLE_PIPES [= hours]` | A started pipe has loaded no file for that many hours (24 by default) since its last load, or since it was created | Once per that many hours per pipe |
 | `LONG_QUERIES [= minutes]` | A statement has run for that many minutes (60 by default) | Once per statement |

@@ -135,11 +135,16 @@ that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
   and, before it deletes files, the metadata of every table in the catalog,
   so it deletes none that another table references.
 - A failed run is tried again after a minute, then 2, 4, up to an hour; a
-  request that fails 10 times in a row fails for good: it logs `erasure
-  request failed` at error level, raises the built-in alert, and counts in
-  `igloo_erasure_requests_failed_total`. Alert on that metric, and on
-  `igloo_erasure_requests_held_total`, which counts requests waiting for
-  `CONFIRM ERASURE REQUEST` by someone other than their requester. Runs
+  request that fails 10 times in a row before its first `DELETE` fails for
+  good: it logs `erasure request failed` at error level, raises the
+  built-in alert, and counts in `igloo_erasure_requests_failed_total`. One
+  that has sent a `DELETE` never fails: it is `blocked`, keeps its
+  identifiers, logs `erasure request cannot go on` at error level, raises
+  the built-in alert, counts in `igloo_erasure_requests_blocked_runs_total`
+  and tries again every hour, until what its error says is fixed. Alert on
+  those metrics, and on `igloo_erasure_requests_held_total`, which counts
+  requests waiting for `CONFIRM ERASURE REQUEST` by someone other than
+  their requester. Runs
   that lose to other writers' commits, as on a table appended to without
   pause, do not count: the request tries again every minute until it wins.
 - Every replica checks every 15 seconds whether a request deleted files
@@ -478,7 +483,8 @@ events are logged at info level or above: `login`, `login failed`,
 (tasks, pipes, materialized views and alerts created, changed or dropped),
 `notification integration changed`, `erasure requested`, `erasure request
 completed`, `erasure request held`, `erasure request confirmed`, `erasure
-request canceled`, `erasure request failed`, `data retention changed`,
+request canceled`, `erasure request failed`, `erasure request cannot go
+on`, `data retention changed`,
 `statement denied`, `statement canceled` (from the web console's compute
 page), and refused connections.
 Failed scheduled runs log `scheduled run failed` (component `tasks`), and

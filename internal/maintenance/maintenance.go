@@ -574,11 +574,7 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 			"table", name(tbl.Identifier()), "operation", operation)
 		return tbl, res, nil
 	}
-	replaced := map[string]bool{}
-	for p := range rewrite {
-		replaced[p] = true
-	}
-	safe, err := m.targets.Removable(ctx, fs, tasks, replaced, live)
+	safe, err := m.targets.Removable(ctx, fs, tasks, live)
 	if err != nil {
 		return tbl, res, fmt.Errorf("find the position deletes the rewrite may remove: %w", err)
 	}

@@ -48,6 +48,17 @@ type testCatalog struct {
 	// io, if set, are the file IOs of tables, by name; others use the
 	// local file system.
 	io map[string]iceio.IO
+	// locals, if set, is where the files of locations on S3 are kept.
+	locals func(string) string
+}
+
+// local is where the file at p is kept: on the local file system, which
+// file:// URIs name too.
+func (c *testCatalog) local(p string) string {
+	if c.locals != nil && strings.HasPrefix(p, "s3://") {
+		return c.locals(p)
+	}
+	return strings.TrimPrefix(p, "file://")
 }
 
 func localFS(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
@@ -86,6 +97,7 @@ func (c *testCatalog) create(t *testing.T, dir, name string, schema *iceberg.Sch
 
 // write writes a table's metadata file, as a catalog does at each commit.
 func (c *testCatalog) write(t testing.TB, location string, meta table.Metadata) string {
+	location = c.local(location)
 	b, err := json.Marshal(meta)
 	if err != nil {
 		t.Fatal(err)

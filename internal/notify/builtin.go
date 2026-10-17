@@ -120,6 +120,21 @@ func (s *Service) ErasureFailed(id, step, err string) {
 	})
 }
 
+// ErasureBlocked raises failed_runs for an erasure request that has begun
+// deleting and cannot go on until someone fixes what err says: it keeps
+// its identifiers and tries again every hour. err holds no identifier.
+func (s *Service) ErasureBlocked(id, step, err string) {
+	s.emit(event{
+		builtin: BuiltinFailedRuns, key: "failed_runs/erasure-blocked/" + id, repeat: repeatFailedRun,
+		msg: Message{
+			Title: "Igloo: an erasure request cannot go on",
+			Body: []Part{Text("The erasure request "), Value(id), Text(" has begun deleting and is blocked at its " + step + " step: "),
+				Value(err), Text(". It keeps its identifiers and tries again every hour; fix this, and it goes on.")},
+			Details: map[string]string{"kind": "erasure", "name": id, "step": step, "error": err},
+		},
+	})
+}
+
 // LoadFailed raises load_errors for a COPY INTO, or a pipe's, that could not
 // load some files: failed of total, the first with firstError.
 func (s *Service) LoadFailed(table, user, pipe string, failed, total int, file, firstError string) {

@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -227,6 +228,70 @@ func TestEraseSubject(t *testing.T) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// While an erasure request erases from a table, its Iceberg format version
+// stays as it is, whether its columns still have tags or not, however a
+// statement would change it: the request could not rewrite a table of
+// version 3.
+func TestFormatVersionWhileErasing(t *testing.T) {
+	ctx := context.Background()
+	policies := policy.NewMemoryStore()
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connector.Close() })
+	eraser := erasure.New(erasure.Options{Store: erasure.NewMemoryStore(), Policies: policies.Load, Catalog: icebergPeople(t),
+		Engine: duckdbConnector{connector}, Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake",
+		Warehouse: t.TempDir() + "/", Rows: countRows(3)})
+	cs := startCatalogServer(t, func(o *Options) { o.Policies, o.Erasure = policies, eraser })
+	for _, sql := range []string{
+		"CREATE TABLE lake.public.people (id INTEGER, email VARCHAR)",
+		"CREATE TAG pii ALLOWED_VALUES 'email'",
+		"ALTER TABLE lake.public.people ALTER COLUMN email SET TAG pii = 'email'",
+	} {
+		mustExec(t, cs.admin, sql)
+	}
+	rows := texts(t, cs.admin, "ERASE SUBJECT WHERE pii.email = 'ann@example.com'")
+	if len(rows) != 1 || !strings.HasSuffix(rows[0], "|queued") {
+		t.Fatalf("ERASE SUBJECT: %q", rows)
+	}
+	id := strings.TrimSuffix(rows[0], "|queued")
+	// Its find step lists its tables; it would delete every row, so it is
+	// held, and stays open.
+	if err := eraser.Run(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	expectRows(t, cs.admin, "SELECT status FROM igloo.erasure_requests", "held")
+	mustExec(t, cs.admin, "ALTER TABLE lake.public.people ALTER COLUMN email UNSET TAG pii")
+	for _, sql := range []string{
+		"ALTER TABLE lake.public.people SET ('format-version' = '3')",
+		"ALTER TABLE IF EXISTS lake.public.people SET ('format_version' = '3')",
+	} {
+		expectDenied(t, cs.admin, sql, "an erasure request erases from")
+	}
+	// The table property functions name the table first (the stand-in
+	// catalog has no Iceberg extension to run them).
+	for sql, want := range map[string][]string{
+		"SELECT * FROM set_iceberg_table_properties(lake.public.people, {'format-version': '3'})":        {"lake", "public", "people"},
+		`SELECT * FROM SET_ICEBERG_TABLE_PROPERTIES ( "lake".public."People" , {'format-version': '3'})`: {"lake", "public", "People"},
+	} {
+		m := propertyCall.FindAllStringSubmatch(sql, -1)
+		if len(m) != 1 {
+			t.Errorf("%s: %q", sql, m)
+			continue
+		}
+		if name, ok := (&scanner{s: m[0][1]}).name(); !ok || !slices.Equal(name, want) {
+			t.Errorf("%s: names %q", sql, name)
+		}
+	}
+	if _, err := cs.admin.Exec(ctx, "CANCEL ERASURE REQUEST '"+id+"'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.admin.Exec(ctx, "ALTER TABLE lake.public.people SET ('format-version' = '3')"); err != nil && strings.Contains(err.Error(), "erasure") {
+		t.Errorf("once the request is over: %v", err)
 	}
 }
 

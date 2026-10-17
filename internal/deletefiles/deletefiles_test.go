@@ -52,16 +52,26 @@ func posDelete(t *testing.T, path, target string) iceberg.DataFile {
 	return b.Build()
 }
 
+// dataFile is a data file at path.
+func dataFile(t *testing.T, path string) iceberg.DataFile {
+	t.Helper()
+	b, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentData, path, iceberg.ParquetFile, nil, nil, nil, 2, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b.Build()
+}
+
 // A delete file's target counts as replaced only when the rewrite replaces
 // it as the delete file spells it: s3a:// and s3:// may name one object or,
 // with other endpoints configured, two, and taking a kept file for a
 // replaced one would drop deletes that still apply to it. Live, in any
-// spelling, keeps the delete file.
+// spelling, keeps the delete file. The files a rewrite replaces are its
+// tasks', as their manifests spell them, as the delete file's writer did.
 func TestRemovableMatchesReplacedFilesExactly(t *testing.T) {
 	ctx := context.Background()
 	kept := "s3a://bucket/wh/t/data/a.parquet"
 	d := posDelete(t, "s3://bucket/wh/t/data/delete.parquet", kept)
-	tasks := []table.FileScanTask{{DeleteFiles: []iceberg.DataFile{d}}}
 	live := Paths{}
 	live.Add(kept)
 	for _, c := range []struct {
@@ -72,7 +82,8 @@ func TestRemovableMatchesReplacedFilesExactly(t *testing.T) {
 		{"s3a://bucket//wh/t/data/a.parquet", false},
 		{kept, true},
 	} {
-		got, err := NewTargets().Removable(ctx, iceio.LocalFS{}, tasks, map[string]bool{c.rewritten: true}, live)
+		tasks := []table.FileScanTask{{File: dataFile(t, c.rewritten), DeleteFiles: []iceberg.DataFile{d}}}
+		got, err := NewTargets().Removable(ctx, iceio.LocalFS{}, tasks, live)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +94,8 @@ func TestRemovableMatchesReplacedFilesExactly(t *testing.T) {
 	// A target no longer live, however spelled, holds no delete back.
 	gone := Paths{}
 	gone.Add("s3://bucket/wh/t/data/other.parquet")
-	if got, err := NewTargets().Removable(ctx, iceio.LocalFS{}, tasks, map[string]bool{}, gone); err != nil || len(got) != 1 {
+	tasks := []table.FileScanTask{{File: dataFile(t, "s3://bucket/wh/t/data/other.parquet"), DeleteFiles: []iceberg.DataFile{d}}}
+	if got, err := NewTargets().Removable(ctx, iceio.LocalFS{}, tasks, gone); err != nil || len(got) != 1 {
 		t.Errorf("a delete of a file gone: %v, %v", got, err)
 	}
 }

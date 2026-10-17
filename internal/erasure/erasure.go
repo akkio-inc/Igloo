@@ -64,11 +64,18 @@ const (
 	// StatusHeld is a request that would delete much of a table, which
 	// waits for CONFIRM ERASURE REQUEST before it deletes anything.
 	StatusHeld = "held"
+	// StatusBlocked is a request that has begun deleting and cannot go on
+	// until someone fixes what Error says, as when another engine upgraded
+	// one of its tables to a format version Igloo cannot rewrite. It never
+	// fails: it keeps its identifiers sealed, alerts, and tries again every
+	// blockedWait, going on once the cause is gone.
+	StatusBlocked = "blocked"
 	// StatusCanceled is a request canceled before it deleted anything.
 	StatusCanceled  = "canceled"
 	StatusCompleted = "completed"
-	// StatusFailed is a request that failed too often to go on; Error
-	// says why. What it erased stays erased: make a new request.
+	// StatusFailed is a request that failed too often to go on, or that
+	// it could not carry out, before it sent a DELETE; Error says why.
+	// Make a new request once that is fixed.
 	StatusFailed = "failed"
 )
 

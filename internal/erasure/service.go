@@ -93,7 +93,11 @@ type Options struct {
 	// someone must make again: its ID, the step it stopped at, and why,
 	// without identifiers. It must not block.
 	Failed func(id, step, err string)
-	Log    *slog.Logger
+	// Blocked, if set, is told the same about a request that has begun
+	// deleting and cannot go on until someone fixes what err says, each
+	// time it tries again. It must not block.
+	Blocked func(id, step, err string)
+	Log     *slog.Logger
 }
 
 // Service accepts and carries out erasure requests.
@@ -169,7 +173,7 @@ const (
 // Metrics count requests that need someone's attention. A nil *Metrics
 // counts nothing.
 type Metrics struct {
-	failed, held prometheus.Counter
+	failed, held, blocked prometheus.Counter
 }
 
 // NewMetrics registers the erasure metrics with reg.
@@ -183,8 +187,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_erasure_requests_held_total",
 			Help: "Erasure requests held because they would delete much of a table, until CONFIRM ERASURE REQUEST.",
 		}),
+		blocked: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_erasure_requests_blocked_runs_total",
+			Help: "Runs of erasure requests that had begun deleting and could not go on until someone fixes what their error says.",
+		}),
 	}
-	reg.MustRegister(m.failed, m.held)
+	reg.MustRegister(m.failed, m.held, m.blocked)
 	return m
 }
 
@@ -336,7 +344,7 @@ func (s *Service) prepare(ctx context.Context, wanted []Wanted) ([]Subject, erro
 		if err := checkFields(t, flds); err != nil {
 			return nil, err
 		}
-		if err := rewritable(t, tbl); err != nil {
+		if err := s.erasable(ctx, t, tbl); err != nil {
 			return nil, err
 		}
 	}
@@ -392,6 +400,31 @@ func subjectNames(subjects []Subject) string {
 
 // List returns every request, newest first.
 func (s *Service) List(ctx context.Context) ([]*Request, error) { return s.opts.Store.List(ctx) }
+
+// Erasing reports whether a request that is not over (not completed,
+// canceled or failed) erases from the catalog's table schema.name, as its
+// find step found it: tagged, or sharing files with one that is. Such a
+// table must stay one the request can rewrite (see erasable): Igloo's SQL
+// and its Iceberg REST endpoint refuse to upgrade its format version.
+func (s *Service) Erasing(ctx context.Context, schema, name string) (bool, error) {
+	all, err := s.opts.Store.List(ctx)
+	if err != nil {
+		return false, err
+	}
+	want := schema + "." + name
+	for _, r := range all {
+		switch r.Status {
+		case StatusCompleted, StatusCanceled, StatusFailed:
+			continue
+		}
+		for i := range r.Tables {
+			if t := &r.Tables[i]; !t.Remote && strings.EqualFold(tableName(identOf(t)), want) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
 
 // Run carries the request id as far as it can go now. The scheduler runs it
 // every minute until it completes, as an erasure job. While another
@@ -484,14 +517,17 @@ const (
 	// keyWait is how long a request whose identifiers this replica cannot
 	// unseal waits: until a replica with the right key runs it.
 	keyWait = 10 * time.Minute
+	// blockedWait is how often a blocked request tries again.
+	blockedWait = time.Hour
 )
 
 // failed records that a run of r failed, and has it run again later, or,
-// after too many failures or one it cannot get past, fail for good. A run
-// that lost to other writers, or on a replica whose erasure key is not the
-// one r's identifiers were sealed under, does not count: neither says
-// anything is wrong with the request, and failing it would forget its
-// identifiers for good.
+// after too many failures or one it cannot get past, fail for good if it
+// has not sent a DELETE yet, and be blocked if it has. A run that lost to
+// other writers, or on a replica whose erasure key is not the one r's
+// identifiers were sealed under, does not count: neither says anything is
+// wrong with the request, and failing it would forget its identifiers for
+// good.
 func (s *Service) failed(ctx context.Context, r *Request, err error) {
 	r.Error = scrub(r, err.Error())
 	var c contentionError
@@ -511,7 +547,24 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 	}
 	r.Failures++
 	var t terminalError
-	if errors.As(err, &t) || r.Failures >= maxFailures {
+	final := errors.As(err, &t) || r.Failures >= maxFailures
+	if final && deleting(r) {
+		// Once it sent a DELETE, a request never fails: failing would
+		// forget whose rows it deleted while their files may still hold
+		// them. What stops it now arose since its checks before each
+		// DELETE, as another engine changing a table, or is for someone
+		// to fix: it waits, alerts, and goes on once that is done.
+		r.Status, r.WaitUntil = StatusBlocked, s.now().Add(blockedWait)
+		s.opts.Metrics.countBlocked()
+		if s.opts.Blocked != nil {
+			s.opts.Blocked(r.ID, r.Step, r.Error)
+		}
+		s.log.Error("erasure request cannot go on until what its error says is fixed; it has begun deleting, so it keeps its identifiers "+
+			"and tries again", "request", r.ID, "step", r.Step, "failures", r.Failures, "in", blockedWait, "err", r.Error)
+		s.wake(ctx, r.ID, r.WaitUntil)
+		return
+	}
+	if final {
 		r.Status = StatusFailed
 		s.dropBranches(ctx, r)
 		s.end(ctx, r)
@@ -519,7 +572,7 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 		if s.opts.Failed != nil {
 			s.opts.Failed(r.ID, r.Step, r.Error)
 		}
-		s.log.Error("erasure request failed; what it erased stays erased, but it will not go on: make a new request once the cause is fixed",
+		s.log.Error("erasure request failed before it deleted anything, and will not go on: make a new request once the cause is fixed",
 			"request", r.ID, "step", r.Step, "failures", r.Failures, "err", r.Error)
 		return
 	}
@@ -822,6 +875,12 @@ func (m *Metrics) countFailed() {
 func (m *Metrics) countHeld() {
 	if m != nil {
 		m.held.Inc()
+	}
+}
+
+func (m *Metrics) countBlocked() {
+	if m != nil {
+		m.blocked.Inc()
 	}
 }
 

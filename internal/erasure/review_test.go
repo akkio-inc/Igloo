@@ -564,8 +564,11 @@ func TestSafeguards(t *testing.T) {
 }
 
 // Runs do not wait for one another, failed runs wait longer each time,
-// and a request that keeps failing fails for good, forgets whose data it
-// was, and is counted, for an alert.
+// and a request that keeps failing before it sends a DELETE fails for
+// good, forgets whose data it was, and is counted, for an alert. One that
+// keeps failing once it has sent a DELETE, which may have committed, never
+// fails: it is blocked, keeps its identifiers, alerts and is counted each
+// time it tries again, every hour, and goes on once the cause is gone.
 func TestFailures(t *testing.T) {
 	f := newFixture(t)
 	f.people("crm.people", [][]any{ann, subject})
@@ -584,9 +587,10 @@ func TestFailures(t *testing.T) {
 	}
 	lease.Release()
 
-	f.svc.rows = failingRows{}
-	var alerts []string
+	f.svc.rows = failingRows{count: true}
+	var alerts, blocked []string
 	f.svc.opts.Failed = func(id, step, err string) { alerts = append(alerts, id+" "+step+": "+err) }
+	f.svc.opts.Blocked = func(id, step, err string) { blocked = append(blocked, id+" "+step+": "+err) }
 	now := time.Now()
 	f.svc.now = func() time.Time { return now }
 	var waits []time.Duration
@@ -602,23 +606,55 @@ func TestFailures(t *testing.T) {
 		t.Errorf("waits: %v", waits)
 	}
 	got, _ := f.store.Get(f.ctx, r.ID)
-	if got.Status != StatusFailed || got.Sealed != "" || got.Salt != "" || testutil.ToFloat64(f.metrics.failed) != 1 {
+	if got.Status != StatusFailed || got.DeleteStarted || got.Sealed != "" || got.Salt != "" || testutil.ToFloat64(f.metrics.failed) != 1 {
 		t.Errorf("failed: %+v", got)
 	}
-	if len(alerts) != 1 || !strings.HasPrefix(alerts[0], r.ID+" delete: ") || strings.Contains(alerts[0], "subject@") {
-		t.Errorf("alerts: %q", alerts)
+	if len(alerts) != 1 || !strings.HasPrefix(alerts[0], r.ID+" find: ") || strings.Contains(alerts[0], "subject@") || len(blocked) != 0 {
+		t.Errorf("alerts: %q, blocked: %q", alerts, blocked)
 	}
 	if err := f.svc.Run(f.ctx, r.ID); err != nil {
 		t.Errorf("a run of a failed request: %v", err)
 	}
+
+	// Its DELETE fails every time: it may have committed all the same.
+	r, err = f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.svc.rows = failingRows{}
+	alerts = nil
+	for range maxFailures + 1 {
+		_ = f.svc.Run(f.ctx, r.ID)
+	}
+	got, _ = f.store.Get(f.ctx, r.ID)
+	if got.Status != StatusBlocked || got.Step != StepDelete || !got.DeleteStarted || got.Sealed == "" || got.Salt == "" ||
+		!got.WaitUntil.Equal(now.Add(blockedWait)) || testutil.ToFloat64(f.metrics.blocked) != 2 || testutil.ToFloat64(f.metrics.failed) != 1 {
+		t.Errorf("blocked: %+v", got)
+	}
+	if len(alerts) != 0 || len(blocked) != 2 || !strings.HasPrefix(blocked[0], r.ID+" delete: ") || strings.Contains(blocked[0], "subject@") {
+		t.Errorf("alerts: %q, blocked: %q", alerts, blocked)
+	}
+	if _, err := f.svc.Cancel(f.ctx, r.ID, "pat"); !errors.Is(err, ErrInvalid) {
+		t.Errorf("a blocked request was canceled: %v", err)
+	}
+	f.svc.rows = f.rows
+	f.completed(f.run(r.ID))
+	f.clean(storedEmail)
 }
 
-type failingRows struct{}
+// failingRows fails every DELETE, and with count, every count.
+type failingRows struct{ count bool }
 
 func (failingRows) Delete(context.Context, *table.Table, string) (int64, error) {
 	return 0, errors.New("Binder Error: cannot delete")
 }
-func (failingRows) Count(context.Context, *table.Table, string) (int64, error) { return 0, nil }
+
+func (r failingRows) Count(context.Context, *table.Table, string) (int64, error) {
+	if r.count {
+		return 0, errors.New("IO Error: cannot count")
+	}
+	return 0, nil
+}
 
 // A run that loses its lock, as when its connection to the metadata
 // database dropped and another replica may have taken it, stops before

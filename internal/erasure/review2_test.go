@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -553,8 +554,9 @@ func TestTagDroppedWhileRewritten(t *testing.T) {
 	f.clean(storedEmail)
 }
 
-// A branch left by a request that failed for good goes with it.
-func TestFailedRequestDropsItsBranches(t *testing.T) {
+// A branch left by a run that stopped stays while the request is blocked,
+// which goes on from it, and goes when the request completes.
+func TestBlockedRequestKeepsItsBranches(t *testing.T) {
 	f := newFixture(t)
 	tbl := f.people("crm.people", [][]any{ann, subject})
 	if _, _, err := f.cat.CommitTable(f.ctx, ident("crm.people"), nil,
@@ -592,10 +594,18 @@ func TestFailedRequestDropsItsBranches(t *testing.T) {
 	}
 	got, _ := f.store.Get(f.ctx, r.ID)
 	f.svc.failed(f.ctx, got, terminal(errors.New("cannot go on")))
-	if got.Status != StatusFailed {
+	if err := f.store.Save(f.ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusBlocked || got.Sealed == "" {
 		t.Fatalf("status %s", got.Status)
 	}
+	if !slices.ContainsFunc(slices.Collect(maps.Keys(refs(f.load("crm.people")))), func(n string) bool { return strings.HasPrefix(n, tagBranch) }) {
+		t.Error("the blocked request's branch was dropped")
+	}
+	f.completed(f.run(r.ID))
 	noTempBranches(t, f.load("crm.people"))
+	f.clean(storedEmail)
 }
 
 var errStop = errors.New("stop")

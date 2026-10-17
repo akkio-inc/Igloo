@@ -1644,6 +1644,58 @@ func TestTablesWithTags(t *testing.T) {
 	}
 }
 
+// While an erasure request erases from a table, no engine may upgrade it to
+// Iceberg format version 3, by upgrade-format-version or by the property,
+// admins included, whether its columns have tags or not (as a clone of a
+// tagged table): the request could not rewrite it, and one that has begun
+// deleting from it could not go on.
+func TestFormatVersionWhileErasing(t *testing.T) {
+	h := newHarness(t)
+	var (
+		mu      sync.Mutex
+		erasing bool
+		failure error
+	)
+	h.srv.opts.Erasing = func(_ context.Context, o auth.Object) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return erasing && strings.EqualFold(o.String(), "public.events"), failure
+	}
+	set := func(e bool, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		erasing, failure = e, err
+	}
+	ada := h.login("ada", "ada-password")
+	commit := func(u map[string]any) *httptest.ResponseRecorder {
+		return h.request("POST", "/v1/namespaces/public/tables/events", ada, map[string]any{"updates": []any{u}})
+	}
+	upgrade := map[string]any{"action": "upgrade-format-version", "format-version": 3}
+	byProperty := map[string]any{"action": "set-properties", "updates": map[string]string{"Format-Version": "3"}}
+	if w := commit(upgrade); w.Code != 200 {
+		t.Errorf("upgrading a table no request erases from: %d %s", w.Code, w.Body)
+	}
+	set(true, nil)
+	for what, u := range map[string]map[string]any{"upgrade-format-version": upgrade, "the property": byProperty} {
+		if w := commit(u); w.Code != 403 || !strings.Contains(w.Body.String(), "an erasure request erases from public.events") {
+			t.Errorf("upgrading by %s while a request erases from the table: %d %s", what, w.Code, w.Body)
+		}
+	}
+	for what, u := range map[string]map[string]any{
+		"another property":   {"action": "set-properties", "updates": map[string]string{"comment": "events"}},
+		"format version 2":   {"action": "upgrade-format-version", "format-version": 2},
+		"the property, to 2": {"action": "set-properties", "updates": map[string]string{"format-version": "2"}},
+	} {
+		if w := commit(u); w.Code != 200 {
+			t.Errorf("%s while a request erases from the table: %d %s", what, w.Code, w.Body)
+		}
+	}
+	set(false, errors.New("database down"))
+	if w := commit(upgrade); w.Code != 503 {
+		t.Errorf("when requests cannot be checked: %d %s", w.Code, w.Body)
+	}
+}
+
 // Schema changes name the schema in the history.
 func TestSchemaChangesInHistory(t *testing.T) {
 	h := newHarness(t)

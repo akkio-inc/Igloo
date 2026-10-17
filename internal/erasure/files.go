@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"path"
 	"slices"
 	"strconv"
@@ -242,16 +243,74 @@ func resolved(t *Table, flds []field) error {
 	return nil
 }
 
-// rewritable refuses a table the request could not rewrite: one of
-// format version 3, whose deletion vectors iceberg-go cannot read. The
+// supported refuses a table of a format version the request could not
+// rewrite: version 3, whose deletion vectors iceberg-go cannot read, nor
+// the manifests of a table upgraded to it and written to since. The
 // request would delete its rows and then be unable to rewrite the files
-// that still hold them, nor be canceled, and after failing too often
-// forget whose rows they were, with them still in the files.
-func rewritable(t *Table, tbl *table.Table) error {
+// that still hold them.
+func supported(t *Table, tbl *table.Table) error {
 	if v := tbl.Metadata().Version(); v >= 3 {
 		return fmt.Errorf("%w: %s is an Iceberg table of format version %d, which can hold deletion vectors that Igloo cannot read yet, "+
 			"so it could delete the rows but not rewrite the files that hold them; erase from it in an engine that reads them, "+
 			"and untag it until then", ErrInvalid, t.Name, v)
+	}
+	return nil
+}
+
+// erasable refuses a table, as it is now, that the request could not
+// erase from with certainty: one of a format version it cannot rewrite
+// (see supported); one with a data or delete file that is not Parquet,
+// which it could neither search for identifiers nor rewrite; or one with a
+// branch or tag it could not rewrite, whose schema requires a value in a
+// column tagged to be nulled, or that it could not write files of again
+// with a partition spec that schema has the columns of (see writeSpec). A
+// request checks each of its tables before its first DELETE, while it can
+// still fail without having deleted anything, and each again, as loaded
+// just then, before each DELETE from it, and before it rewrites it.
+func (s *Service) erasable(ctx context.Context, t *Table, tbl *table.Table) error {
+	if err := supported(t, tbl); err != nil {
+		return err
+	}
+	tf, err := readFiles(ctx, tbl)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", t.Name, err)
+	}
+	live := tf.live(false)
+	for _, p := range slices.Sorted(maps.Keys(live)) {
+		if df := live[p]; !strings.EqualFold(string(df.FileFormat()), "PARQUET") {
+			return fmt.Errorf("%w: %s has a file of format %s (%s), and Igloo reads Parquet files only, so it could neither find "+
+				"identifiers in it nor rewrite it; erase from the table in an engine that reads it, and untag it until then",
+				ErrInvalid, t.Name, df.FileFormat(), base(p))
+		}
+	}
+	all := refs(tbl)
+	for _, name := range slices.Sorted(maps.Keys(all)) {
+		ref := all[name]
+		kind := "branch"
+		if ref.SnapshotRefType == table.TagRef {
+			kind = "tag"
+		}
+		view, err := s.at(tbl, ref.SnapshotID, ownSchema(name))
+		if err != nil {
+			return fmt.Errorf("%s %s of %s: %w", kind, name, t.Name, err)
+		}
+		if err := checkFields(t, fields(view, t)); err != nil {
+			return fmt.Errorf("%s %s of %s, as its snapshot's schema has it: %w", kind, name, t.Name, err)
+		}
+		specs := map[int]bool{}
+		for _, m := range tf.manifests[ref.SnapshotID] {
+			for _, e := range tf.entries[m] {
+				if e.live() && e.file.ContentType() == iceberg.EntryContentData {
+					specs[int(e.file.SpecID())] = true
+				}
+			}
+		}
+		for _, id := range slices.Sorted(maps.Keys(specs)) {
+			if _, err := writeSpec(view, id); err != nil {
+				return fmt.Errorf("%s %s of %s, as its snapshot's schema has it: %w; untag the table, or drop the %s, "+
+					"and make the request again", kind, name, t.Name, err, kind)
+			}
+		}
 	}
 	return nil
 }

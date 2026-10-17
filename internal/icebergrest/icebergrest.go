@@ -128,6 +128,11 @@ type Options struct {
 	// be renamed, nor those columns renamed, dropped or given another
 	// type, by anyone, as in SQL.
 	Classified func(ctx context.Context, o auth.Object) (columns []string, classified bool, err error)
+	// Erasing, if set, reports whether an erasure request that is not over
+	// erases from table o: such a table may not be upgraded to Iceberg
+	// format version 3, by anyone, until it is, whether its columns have
+	// tags or not.
+	Erasing func(ctx context.Context, o auth.Object) (bool, error)
 	// TLS says whether requests arrive over TLS. Without it, only clients
 	// on private networks are served, since tokens, passwords and storage
 	// credentials cross the connection.

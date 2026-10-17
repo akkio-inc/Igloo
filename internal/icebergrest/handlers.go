@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -504,6 +505,9 @@ func (s *Server) updateTable(c *call) error {
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
+	if err := s.checkErasing(c, o, req); err != nil {
+		return err
+	}
 	if err := s.checkClassifiedSchema(c, ns, o, req); err != nil {
 		return err
 	}
@@ -722,8 +726,8 @@ func (s *Server) recordOwner(c *call, o auth.Object) {
 // the column's name, and a column that changed under them would be out of
 // reach of its policies and of erasure requests.
 func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req commitRequest) error {
-	if s.opts.Classified == nil || !slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
-		return u.Action == "add-schema" || u.Action == "set-current-schema" || u.Action == "remove-schemas" || u.Action == "upgrade-format-version"
+	if s.opts.Classified == nil || !upgradesFormat(req) && !slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
+		return u.Action == "add-schema" || u.Action == "set-current-schema" || u.Action == "remove-schemas"
 	}) {
 		return nil
 	}
@@ -792,10 +796,10 @@ func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req 
 	added := false
 	for _, u := range req.Updates {
 		switch u.Action {
-		case "upgrade-format-version":
+		case "upgrade-format-version", "set-properties":
 			// Erasure requests cannot rewrite tables of format version 3,
 			// whose deletion vectors Igloo cannot read yet.
-			if u.FormatVersion == nil || *u.FormatVersion >= 3 {
+			if upgradesFormat(commitRequest{Updates: []tableUpdate{u}}) {
 				return c.who.deny(fmt.Sprintf("%s has policies or tags; it stays at Iceberg format version 2, as erasure requests "+
 					"cannot rewrite tables of version 3 yet", o))
 			}
@@ -823,6 +827,48 @@ func (s *Server) checkClassifiedSchema(c *call, ns []string, o auth.Object, req 
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// upgradesFormat reports whether req may upgrade a table to Iceberg format
+// version 3 or later: by upgrade-format-version, or by setting the
+// format-version property, as some catalogs take it, to a version that is
+// not below 3, or that cannot be told.
+func upgradesFormat(req commitRequest) bool {
+	return slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
+		switch u.Action {
+		case "upgrade-format-version":
+			return u.FormatVersion == nil || *u.FormatVersion >= 3
+		case "set-properties":
+			for k, v := range u.Updates {
+				if strings.EqualFold(k, "format-version") {
+					if n, err := strconv.Atoi(strings.TrimSpace(v)); err != nil || n >= 3 {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	})
+}
+
+// checkErasing refuses a commit that may upgrade table o to Iceberg format
+// version 3 while an erasure request erases from it, whether its columns
+// have tags or not (a clone of a tagged table, or one that shares its
+// files): requests cannot rewrite tables of version 3 yet, and one that has
+// begun deleting from the table could not go on.
+func (s *Server) checkErasing(c *call, o auth.Object, req commitRequest) error {
+	if s.opts.Erasing == nil || !upgradesFormat(req) {
+		return nil
+	}
+	erasing, err := s.opts.Erasing(c.ctx(), o)
+	if err != nil {
+		return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check whether an erasure request erases from the table; try again")
+	}
+	if erasing {
+		return c.who.deny(fmt.Sprintf("an erasure request erases from %s; it stays at its Iceberg format version until the request is over, "+
+			"as erasure requests cannot rewrite tables of version 3 yet", o))
 	}
 	return nil
 }

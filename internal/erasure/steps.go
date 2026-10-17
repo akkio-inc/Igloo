@@ -108,7 +108,11 @@ type loaded struct {
 	tbl *table.Table
 }
 
-// tables loads the request's tables, but connections'.
+// tables loads the request's tables, but connections'. One of a format
+// version the request cannot rewrite or read (see supported), which
+// another engine can upgrade a table to at any time, stops every step at
+// once: before the request's first DELETE, it fails; after it, it is
+// blocked (see failed).
 func (s *Service) tables(ctx context.Context, r *Request) ([]loaded, error) {
 	var out []loaded
 	for i := range r.Tables {
@@ -118,6 +122,9 @@ func (s *Service) tables(ctx context.Context, r *Request) ([]loaded, error) {
 		tbl, err := s.reload(ctx, &r.Tables[i])
 		if err != nil {
 			return nil, err
+		}
+		if err := supported(&r.Tables[i], tbl); err != nil {
+			return nil, terminal(err)
 		}
 		out = append(out, loaded{&r.Tables[i], tbl})
 	}
@@ -198,7 +205,9 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 }
 
 // recent are the requests other than r made within holdWindow of it,
-// before or after, but those canceled and those someone confirmed.
+// before or after, but those canceled, those someone confirmed, and those
+// that failed before they sent a DELETE: none of them deletes anything
+// unconfirmed, and one that failed at the find step never counts its rows.
 func (s *Service) recent(ctx context.Context, r *Request) ([]*Request, error) {
 	all, err := s.opts.Store.List(ctx)
 	if err != nil {
@@ -207,7 +216,8 @@ func (s *Service) recent(ctx context.Context, r *Request) ([]*Request, error) {
 	var out []*Request
 	for _, o := range all {
 		d := r.Created.Sub(o.Created)
-		if o.ID != r.ID && o.Status != StatusCanceled && o.ConfirmedBy == "" && d <= holdWindow && d >= -holdWindow {
+		over := o.Status == StatusCanceled || o.Status == StatusFailed && !deleting(o)
+		if o.ID != r.ID && !over && o.ConfirmedBy == "" && d <= holdWindow && d >= -holdWindow {
 			out = append(out, o)
 		}
 	}
@@ -294,22 +304,32 @@ func (s *Service) discover(ctx context.Context, r *Request) error {
 	if r.Downstream, err = s.downstream(ctx, r); err != nil {
 		return fmt.Errorf("lineage: %w", err)
 	}
-	if err := s.rewritables(ctx, r); err != nil {
+	if err := s.erasables(ctx, r); err != nil {
 		return err
 	}
 	return s.count(ctx, r)
 }
 
-// rewritables checks that every table of r can be rewritten (see
-// rewritable), as they are now, before the request deletes anything.
-func (s *Service) rewritables(ctx context.Context, r *Request) error {
+// refusal is err, from erasable, as a step returns it: a refusal, which
+// trying again cannot get past, stops the request at once (see failed);
+// reading the table can fail for a moment, and is tried again.
+func refusal(err error) error {
+	if errors.Is(err, ErrInvalid) {
+		return terminal(err)
+	}
+	return err
+}
+
+// erasables checks that the request can erase from every one of its
+// tables with certainty (see erasable), as they are now.
+func (s *Service) erasables(ctx context.Context, r *Request) error {
 	tables, err := s.tables(ctx, r)
 	if err != nil {
 		return err
 	}
 	for _, l := range tables {
-		if err := rewritable(l.t, l.tbl); err != nil {
-			return terminal(err)
+		if err := s.erasable(ctx, l.t, l.tbl); err != nil {
+			return refusal(err)
 		}
 	}
 	return nil
@@ -541,36 +561,53 @@ func sameFields(src loaded, other *table.Table) []Column {
 // deleteRows deletes the matching rows of every table, as a DELETE does:
 // queries no longer see them, but their files still hold them. Columns to
 // be nulled are nulled when the files are rewritten.
+//
+// What the request could not finish with certainty it refuses before its
+// first DELETE, on every run until it sends one: every table is checked
+// (see erasable), and one that became a table it cannot erase from since
+// the find step makes it fail, having deleted nothing. Each table is
+// loaded and checked again just before each DELETE from it, on every run,
+// retries included: another engine can change a table at any time, and no
+// DELETE may run on one the request could not then rewrite. A table that
+// fails that check after the request's first DELETE blocks it (see
+// failed), which keeps its identifiers.
 func (s *Service) deleteRows(ctx context.Context, r *Request) error {
-	tables, err := s.tables(ctx, r)
-	if err != nil {
-		return err
-	}
 	if !r.DeleteStarted {
-		// A table that became one the request cannot rewrite since it found
-		// its tables stops it while it can still be canceled.
-		if err := s.rewritables(ctx, r); err != nil {
-			return err
-		}
-		// A DELETE whose answer is lost may have committed: from here on,
-		// the request cannot be canceled.
-		r.DeleteStarted = true
-		if err := s.save(ctx, r); err != nil {
+		if err := s.erasables(ctx, r); err != nil {
 			return err
 		}
 	}
-	for _, l := range tables {
-		if cond := currentCondition(r.salt, fields(l.tbl, l.t), r.Subjects, false); cond != "" {
-			n, err := s.rows.Delete(ctx, l.tbl, cond)
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if t.Remote {
+			continue
+		}
+		tbl, err := s.reload(ctx, t)
+		if err != nil {
+			return err
+		}
+		if err := s.erasable(ctx, t, tbl); err != nil {
+			return refusal(err)
+		}
+		if cond := currentCondition(r.salt, fields(tbl, t), r.Subjects, false); cond != "" {
+			if !r.DeleteStarted {
+				// A DELETE whose answer is lost may have committed: from
+				// here on, the request can neither be canceled nor fail.
+				r.DeleteStarted = true
+				if err := s.save(ctx, r); err != nil {
+					return err
+				}
+			}
+			n, err := s.rows.Delete(ctx, tbl, cond)
 			if commitConflict(err) {
-				return contended(fmt.Errorf("delete from %s: other writers' commits kept coming first: %w", l.t.Name, err))
+				return contended(fmt.Errorf("delete from %s: other writers' commits kept coming first: %w", t.Name, err))
 			}
 			if err != nil {
-				return fmt.Errorf("delete from %s: %w", l.t.Name, err)
+				return fmt.Errorf("delete from %s: %w", t.Name, err)
 			}
-			l.t.RowsDeleted += n
+			t.RowsDeleted += n
 		}
-		l.t.done(StepDelete, s.now())
+		t.done(StepDelete, s.now())
 		if err := s.save(ctx, r); err != nil {
 			return err
 		}
@@ -588,6 +625,13 @@ func (s *Service) rewrite(ctx context.Context, r *Request) error {
 	}
 	for _, l := range tables {
 		t := l.t
+		// Another engine may have changed the table since its DELETE so
+		// that the request cannot rewrite it with certainty: the request is
+		// blocked until that is undone, rather than rewrite the table as it
+		// cannot.
+		if err := s.erasable(ctx, t, l.tbl); err != nil {
+			return refusal(err)
+		}
 		if err := s.sweep(ctx, r, t, false); err != nil {
 			return err
 		}
