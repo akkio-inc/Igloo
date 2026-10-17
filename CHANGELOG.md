@@ -339,6 +339,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   manifest list from the fresh parent on a conflict and reintroduce the files
   the rewrite replaced, duplicating rows. Maintenance now fails such a commit
   and retries next pass instead (see `third_party/iceberg-go/IGLOO_PATCHES.md`).
+  iceberg-go also retries no other commit but a plain append: not a rewrite,
+  delete or overwrite, not a commit without a new snapshot (expiry, ref
+  changes, a rollback), and not an append to a table that merges manifests.
+- Compaction no longer brings back rows that a `DELETE` removed. iceberg-go
+  removed every position delete file attached to the files it rewrote; a
+  partition-scoped one (as DuckDB, iceberg-go and Spark before Iceberg 1.6
+  write them) also deletes rows of files compaction keeps, and those rows
+  came back. A position delete file now goes only when every file it
+  deletes rows of, by exact path, is rewritten or no longer live. To tell,
+  compaction reads a delete file's bounds, then its row groups' statistics,
+  and only then its `file_path` column. Table maintenance also reads a
+  `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
+  ("forever") as forever; it overflowed into a negative age.
 - Query and login history: every statement and login attempt, with its
   outcome, duration, rows and the tables it used, in `igloo.query_history`
   and `igloo.login_history`, which records how each login signed in

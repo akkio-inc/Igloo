@@ -19,7 +19,9 @@ import (
 	"fmt"
 	iofs "io/fs"
 	"log/slog"
+	"math"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +33,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/clone"
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 )
 
 // Standard Iceberg table properties that override the retention defaults for
@@ -125,6 +128,8 @@ type Maintainer struct {
 	// lastOrphanScan is when each table's orphan files were last removed by
 	// this replica.
 	lastOrphanScan map[string]time.Time
+	// targets are the data files position delete files delete rows of.
+	targets *deletefiles.Targets
 }
 
 // New maintains the tables in cat. warehouse is the warehouse root, such as
@@ -136,6 +141,7 @@ func New(cat Catalog, warehouse string, opts Options, log *slog.Logger) *Maintai
 		log:            log.With("component", "maintenance"),
 		warehouse:      warehouse,
 		lastOrphanScan: map[string]time.Time{},
+		targets:        deletefiles.NewTargets(),
 	}
 }
 
@@ -482,33 +488,104 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 		}
 	}
 
+	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "compact")
+	if err != nil || res.removed == 0 {
+		return committed, err
+	}
+	m.opts.Metrics.compacted(res.removed, res.added)
+	log.Info("compacted",
+		"files_before", res.removed, "files_after", res.added, "delete_files_removed", res.deletes,
+		"bytes_before", res.bytesBefore, "bytes_after", res.bytesAfter)
+	return committed, nil
+}
+
+// rewritten counts what rewriteGroups did.
+type rewritten struct {
+	removed, added, deletes int
+	bytesBefore, bytesAfter int64
+}
+
+// rewriteGroups writes the files of groups, whose paths rewrite holds,
+// again with their deletes applied, and commits the new files in their
+// place. It removes the equality deletes that apply to no file left, and
+// the position deletes that delete rows only of files it replaces (see
+// package deletefiles): one that also deletes rows of a file it keeps
+// stays. iceberg-go's RewriteDataFiles removed every position delete file
+// attached to the files it rewrote, and a partition-scoped one (as Spark
+// before Iceberg 1.6, iceberg-go and DuckDB write them) also deletes rows
+// of the partition's other files, which came back. The commit is not
+// retried on a conflict, which would bring the replaced files back (see
+// iceberg-go's IGLOO_PATCHES.md): maintenance tries again on its next run.
+func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups []table.CompactionTaskGroup,
+	rewrite map[string]struct{}, operation string) (*table.Table, rewritten, error) {
+	var res rewritten
 	fs, err := tbl.FS(ctx)
 	if err != nil {
-		return tbl, err
+		return tbl, res, err
 	}
-	deadDeletes, err := compaction.CollectDeadEqualityDeletes(ctx, fs, tbl.CurrentSnapshot(), rewrite)
+	snap := tbl.CurrentSnapshot()
+	deadDeletes, err := compaction.CollectDeadEqualityDeletes(ctx, fs, snap, rewrite)
 	if err != nil {
-		return tbl, fmt.Errorf("find dead equality deletes: %w", err)
+		return tbl, res, fmt.Errorf("find dead equality deletes: %w", err)
 	}
-
+	live, err := deletefiles.Live(fs, snap)
+	if err != nil {
+		return tbl, res, err
+	}
+	var tasks []table.FileScanTask
+	for _, g := range groups {
+		tasks = append(tasks, g.Tasks...)
+	}
+	replaced := map[string]bool{}
+	for p := range rewrite {
+		replaced[p] = true
+	}
+	safe, err := m.targets.Removable(ctx, fs, tasks, replaced, live)
+	if err != nil {
+		return tbl, res, fmt.Errorf("find the position deletes the rewrite may remove: %w", err)
+	}
 	tx := tbl.NewTransaction()
-	res, err := tx.RewriteDataFiles(ctx, groups, table.RewriteDataFilesOptions{
-		ExtraDeleteFilesToRemove: deadDeletes,
-		SnapshotProps:            map[string]string{"igloo.operation": "compact"},
-	})
-	if err != nil {
-		return tbl, err
+	rw := tx.NewRewrite(map[string]string{"igloo.operation": operation})
+	for _, g := range groups {
+		if len(g.Tasks) == 0 {
+			continue
+		}
+		gr, err := table.ExecuteCompactionGroup(ctx, tbl, g)
+		if err != nil {
+			return tbl, res, err
+		}
+		if len(gr.OldDataFiles) == 0 && len(gr.NewDataFiles) == 0 {
+			continue
+		}
+		rw.Apply(gr.OldDataFiles, gr.NewDataFiles, nil)
+		res.removed += len(gr.OldDataFiles)
+		res.added += len(gr.NewDataFiles)
+		for _, df := range gr.OldDataFiles {
+			res.bytesBefore += df.FileSizeBytes()
+		}
+		for _, df := range gr.NewDataFiles {
+			res.bytesAfter += df.FileSizeBytes()
+		}
+	}
+	if res.removed == 0 && res.added == 0 {
+		return tbl, res, nil
+	}
+	removed := map[string]bool{}
+	for _, df := range slices.Concat(safe, deadDeletes) {
+		if !removed[df.FilePath()] {
+			removed[df.FilePath()] = true
+			rw.DeleteFile(df)
+		}
+	}
+	res.deletes = len(removed)
+	if err := rw.Commit(ctx); err != nil {
+		return tbl, res, fmt.Errorf("commit the rewrite: %w", err)
 	}
 	committed, err := tx.CommitWithoutRetry(ctx)
 	if err != nil {
-		return tbl, err
+		return tbl, res, err
 	}
-	m.opts.Metrics.compacted(res.RemovedDataFiles, res.AddedDataFiles)
-	log.Info("compacted",
-		"files_before", res.RemovedDataFiles, "files_after", res.AddedDataFiles,
-		"delete_files_removed", res.RemovedPositionDeleteFiles+res.RemovedEqualityDeleteFiles,
-		"bytes_before", res.BytesBefore, "bytes_after", res.BytesAfter)
-	return committed, nil
+	return committed, res, nil
 }
 
 // expire removes snapshots older than the table's retention, always keeping
@@ -566,12 +643,22 @@ func (m *Maintainer) retention(tbl *table.Table) (time.Duration, int) {
 	maxAge, minKeep := m.opts.Retention, 1
 	props := tbl.Properties()
 	if ms, err := strconv.ParseInt(props[maxSnapshotAgeProperty], 10, 64); err == nil && ms >= 0 {
-		maxAge = time.Duration(ms) * time.Millisecond
+		maxAge = millis(ms)
 	}
 	if n, err := strconv.Atoi(props[minSnapshotsToKeepProperty]); err == nil && n >= 1 {
 		minKeep = n
 	}
 	return maxAge, minKeep
+}
+
+// millis is ms milliseconds as a duration, which saturates: Java's Iceberg
+// writes Long.MAX_VALUE milliseconds for "forever", which overflows a
+// duration's nanoseconds into a negative age.
+func millis(ms int64) time.Duration {
+	if ms > math.MaxInt64/int64(time.Millisecond) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func name(ident table.Identifier) string {
