@@ -128,7 +128,10 @@ engines are kept from deleting them and from reading past them:
   `purgeRequested=true` (Spark's `DROP TABLE ... PURGE`) is refused with
   409, naming the clones: the catalog would delete every file under the
   table's location. Drop the clones first, or drop the table without
-  purging, which keeps its files, as SQL's `DROP TABLE` does.
+  purging, which keeps its files, as SQL's `DROP TABLE` does then. A table
+  in the warehouse whose files no clone reads is purged when it is
+  dropped, with `purgeRequested` or without, as in SQL: no one, and no
+  [erasure request](privacy.md), could reach what was left of it.
 - **Credentials for a clone.** Loading a clone with vended credentials, or
   refreshing them, is refused with 403: credentials reach one table's
   location, which holds none of the files the clone reads from its source,
@@ -426,6 +429,11 @@ without an authorizer Lakekeeper signs writes for readers too.
 - Storage credentials on Amazon S3 and S3-compatible stores only (see above).
 - Writing from an engine needs `INSERT`, `UPDATE` and `DELETE` on the table;
   narrower grants apply through Igloo's SQL only.
+- A snapshot committed to a table in the warehouse must have its manifest
+  list in the warehouse, written before the commit, as engines write it
+  under the table's location: one that is not there, or is outside the
+  warehouse, is refused with 400, since no engine, and no [erasure
+  request](privacy.md), could read the snapshot.
 - Credentials outlive a revoked grant by up to an hour.
 - Views, table registration and multi-table transactions are not served.
 - Trino and other shared engines sign in as one Igloo user each; Igloo cannot

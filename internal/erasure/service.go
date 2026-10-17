@@ -10,11 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	icecat "github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -70,6 +73,11 @@ type Options struct {
 	// Warehouse is the warehouse's root, with a trailing slash. Requests
 	// delete only files under it.
 	Warehouse string
+	// Storage, if set, opens the object store that holds a location in
+	// the warehouse with Igloo's own credentials, which a request reaches
+	// files through when none of its tables exists any more, as when
+	// every one was dropped.
+	Storage func(ctx context.Context, location string) (iceio.IO, error)
 	// Jobs runs requests. Without it they run only when Run is called.
 	Jobs *tasks.Scheduler
 	// History are the stores whose records requests redact; nil ones are
@@ -577,23 +585,31 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 		s.wake(ctx, r.ID, r.WaitUntil)
 		return
 	}
-	r.Failures++
 	var t terminalError
-	final := errors.As(err, &t) || r.Failures >= maxFailures
 	var te *tableError
-	if final && deleting(r) && errors.As(err, &te) {
-		// One table keeps failing: it is set aside (see block), and the
-		// others go on at once.
-		if i := slices.IndexFunc(r.Tables, func(t Table) bool { return t.Name == te.table && t.Blocked == "" }); i >= 0 {
-			if berr := s.block(ctx, r, &r.Tables[i], te.err); berr != nil {
-				s.log.Warn("could not save an erasure request", "request", r.ID, "err", berr)
+	if deleting(r) && errors.As(err, &te) {
+		// A run that failed with one table counts against that table
+		// alone: once its runs have failed as often as a request's may, it
+		// is set aside (see setAside), and the others go on at once.
+		if i := slices.IndexFunc(r.Tables, func(t Table) bool { return t.Name == te.table && t.active() }); i >= 0 {
+			tb := &r.Tables[i]
+			tb.Failures++
+			wait := min(time.Minute<<(tb.Failures-1), maxBackoff)
+			if errors.As(err, &t) || tb.Failures >= maxFailures {
+				if serr := s.setAside(ctx, r, tb, te.err); serr != nil {
+					s.log.Warn("could not save an erasure request", "request", r.ID, "err", serr)
+				}
+				tb.Failures, wait = 0, contentionWait
 			}
-			r.Failures = 0
-			r.Status, r.WaitUntil = StatusRetrying, s.now().Add(contentionWait)
+			r.Status, r.WaitUntil = StatusRetrying, s.now().Add(wait)
+			s.log.Warn("erasure request failed with a table; it runs again later", "request", r.ID, "table", tb.Name, "step", r.Step,
+				"failures", tb.Failures, "in", wait, "err", r.Error)
 			s.wake(ctx, r.ID, r.WaitUntil)
 			return
 		}
 	}
+	r.Failures++
+	final := errors.As(err, &t) || r.Failures >= maxFailures
 	if final && deleting(r) {
 		// Once it sent a DELETE, a request never fails: failing would
 		// forget whose rows it deleted while their files may still hold
@@ -768,32 +784,65 @@ func (s *Service) step(ctx context.Context, r *Request) (string, error) {
 
 // Close ends a blocked request without finishing it: the last resort, for
 // an admin who decides that what blocks it will not be fixed, as a table
-// another engine dropped or upgraded to format version 3, and that
-// keeping the person's identifiers sealed for it serves no one. What it
-// erased stays erased; each table it did not finish with records why
-// (Left), and who closed it is recorded; it forgets its identifiers, as a
-// completed request does, and the log says what it left. Its callers
-// allow admins only; requesters and holders of ERASE cannot close a
-// request, as they cannot cancel one that has begun deleting.
+// another engine upgraded to format version 3, and that keeping the
+// person's identifiers sealed for it serves no one.
+//
+// Before it forgets the identifiers, it does what needs no table: it
+// deletes the sharing copies that hold the person's rows, redacts the
+// identifiers from the history, and has every replica empty its read
+// cache of what the request deleted. If one of those cannot be done now,
+// it is not closed, and the error says why. The files the request
+// recorded of a table set aside that was dropped since go, unless a table
+// references them; each table it did not finish with records why, and
+// the files it leaves that may hold the person's rows (Left), with the
+// identifiers scrubbed from their paths. What it erased stays erased; who
+// closed it is recorded; it forgets its identifiers, as a completed
+// request does, and the log says what it left. Its callers allow admins
+// only; requesters and holders of ERASE cannot close a request, as they
+// cannot cancel one that has begun deleting.
 func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 	return s.change(ctx, id, func(r *Request) error {
 		if r.Status != StatusBlocked {
 			return fmt.Errorf("%w: request %s is %s; only a blocked request can be closed", ErrInvalid, id, r.Status)
 		}
 		why := r.Error
+		if err := s.open(ctx, r); err != nil {
+			return fmt.Errorf("%w: %v", ErrNotYet, err)
+		}
+		// What it deletes here, replicas empty their caches of too (see
+		// finish). Refused, the request keeps what it did meanwhile.
+		files, err := s.leave(ctx, r)
+		if err == nil {
+			err = s.finish(ctx, r)
+		}
+		if err != nil {
+			err = fmt.Errorf("%w: %s; it can be closed once that is done", ErrNotYet, scrub(r, err.Error()))
+			return errors.Join(err, s.save(ctx, r))
+		}
 		var left []string
 		for i := range r.Tables {
 			t := &r.Tables[i]
+			var why2 string
 			switch {
 			case t.Remote:
 				continue
 			case t.Blocked != "":
-				t.Left = t.Blocked
-			case t.Steps[StepVerify].IsZero():
-				t.Left = fmt.Sprintf("the request was closed at its %s step before it finished with the table: %s", r.Step, why)
-			default:
+				why2 = t.Blocked
+			case t.Gone && len(files[t.Name]) == 0:
 				continue
+			case t.Gone:
+				why2 = "it was dropped while the request ran"
+			case t.Steps[StepVerify].IsZero():
+				why2 = fmt.Sprintf("the request was closed at its %s step before it finished with the table: %s", r.Step, why)
+			case len(files[t.Name]) == 0:
+				continue
+			default:
+				why2 = "the request finished with the table, but not with files it recorded"
 			}
+			if fs := files[t.Name]; len(fs) > 0 {
+				why2 += fmt.Sprintf("; it leaves %d files that may hold the person's rows: %s", len(fs), strings.Join(fs, ", "))
+			}
+			t.Left = scrub(r, why2)
 			left = append(left, t.Name)
 		}
 		r.Status, r.ClosedBy, r.Completed = StatusClosed, by, s.now()
@@ -805,6 +854,136 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 			"request", id, "by", by, "step", r.Step, "tables_left", strings.Join(left, ", "), "err", why)
 		return nil
 	})
+}
+
+// finish runs, for a request that is to be closed, the steps that need no
+// table: sharing, history and cache. It fails if one cannot be done now,
+// as when a replica has yet to empty its read cache.
+func (s *Service) finish(ctx context.Context, r *Request) error {
+	if err := s.sharing(ctx, r); err != nil {
+		return fmt.Errorf("the request could not delete the Delta Sharing copies that hold the person's rows: %w", err)
+	}
+	if err := s.history(ctx, r); err != nil {
+		return fmt.Errorf("the request could not redact the identifiers from the history: %w", err)
+	}
+	status, until := r.Status, r.WaitUntil
+	err := s.cache(ctx, r)
+	waiting := r.Status == StatusWaiting
+	r.Status, r.WaitUntil = status, until
+	switch {
+	case err != nil:
+		return fmt.Errorf("the request could not have the replicas empty their read caches: %w", err)
+	case waiting:
+		return errors.New("replicas have yet to empty their read caches of the files the request deleted; try again in a minute")
+	}
+	return nil
+}
+
+// leave settles, for a request that is to be closed, the files it
+// recorded and has not deleted, and the files under the locations of its
+// tables dropped while it ran. A table set aside that was dropped since,
+// and not renamed, holds nothing any more: the files recorded for it go,
+// unless a table references them, as purge would delete them. It returns,
+// by table, the paths of the files left that may hold the person's rows:
+// those recorded and not deleted, and those under a dropped table's
+// location that hold matching rows and that no table references.
+func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, error) {
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if t.Remote || t.Blocked == "" || t.UUID == "" {
+			continue
+		}
+		_, err := s.opts.Catalog.LoadTable(ctx, identOf(t))
+		if !errors.Is(err, icecat.ErrNoSuchTable) {
+			continue
+		}
+		ident, err := s.renamedTo(ctx, t.UUID)
+		if err != nil {
+			return nil, err
+		}
+		if ident == nil {
+			s.log.Info("an erasure request being closed found a table it set aside dropped; it deletes the files it recorded for it",
+				"request", r.ID, "table", t.Name)
+			t.Blocked, t.BlockedAt, t.Gone = "", "", true
+			t.dropped(t.Location)
+		}
+	}
+	files, err := s.opts.Store.Files(ctx, r.ID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	tables, referenced, kept, err := s.referenced(ctx, r)
+	var c contentionError
+	switch {
+	case errors.As(err, &c):
+		return nil, err
+	case err != nil:
+		// Which files a table references cannot be told: none is deleted,
+		// and every one recorded, and any under a dropped table's
+		// location, is left.
+		s.log.Warn("an erasure request being closed could not read its tables; it lists every file it did not delete as left",
+			"request", r.ID, "err", scrub(r, err.Error()))
+		for _, f := range files {
+			if f.Deleted.IsZero() && f.Kind != fileOutside {
+				out[f.Table] = append(out[f.Table], f.Path)
+			}
+		}
+		for _, t := range r.Tables {
+			for _, loc := range t.Dropped {
+				out[t.Name] = append(out[t.Name], "any under "+loc)
+			}
+		}
+		return out, nil
+	}
+	var gone []File
+	for _, f := range files {
+		i := slices.IndexFunc(r.Tables, func(t Table) bool { return t.Name == f.Table })
+		if f.Deleted.IsZero() && f.Kind != fileOutside && i >= 0 && r.Tables[i].Gone && !referenced.has(f.Path) {
+			gone = append(gone, f)
+		}
+	}
+	if len(gone) > 0 {
+		release, err := s.lockLocations(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		more, err := s.unshared(ctx, r, tables, gone)
+		if err == nil {
+			err = s.delete(ctx, r, tables, keep(gone, append(kept, more...)))
+		}
+		release()
+		if err != nil {
+			s.log.Warn("an erasure request being closed could not delete the files it recorded for a table dropped since; it lists them as left",
+				"request", r.ID, "err", scrub(r, err.Error()))
+		}
+		if files, err = s.opts.Store.Files(ctx, r.ID); err != nil {
+			return nil, err
+		}
+	}
+	for _, f := range files {
+		if f.Deleted.IsZero() && f.Kind != fileOutside {
+			out[f.Table] = append(out[f.Table], f.Path)
+		}
+	}
+	fio := s.newFileIO(tables)
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		for _, loc := range s.droppedLocations(t, tables) {
+			o, err := s.droppedFiles(ctx, fio, t, loc, referenced)
+			if err != nil {
+				out[t.Name] = append(out[t.Name], fmt.Sprintf("any under %s (%v)", loc, err))
+				continue
+			}
+			paths := append(append(slices.Collect(maps.Keys(o.young)), o.old...), o.unsure...)
+			matched, err := s.matchingFiles(ctx, r.salt, parquet(paths), namedColumns(t, r.Subjects))
+			if err != nil {
+				return nil, err
+			}
+			out[t.Name] = append(out[t.Name], slices.Sorted(maps.Keys(matched))...)
+		}
+	}
+	return out, nil
 }
 
 // Cancel cancels a request that has not begun deleting.
@@ -917,14 +1096,33 @@ func (r *Request) resume() string {
 // takeUp has a blocked request take up the tables it set aside again,
 // from the step it goes on from (see resume), every blockedWait, so that
 // it goes on once someone fixed what blocked them. They get one try each
-// time: one that fails again is set aside again at once (see failed).
+// time: one that fails again is set aside again at once (see failed); the
+// others' failures count as before. Every table goes through the steps
+// from there again (see redo).
 func (r *Request) takeUp() {
 	r.Step = r.resume()
 	for i := range r.Tables {
-		if r.Tables[i].Blocked != "" {
-			r.Failures = max(r.Failures, maxFailures-1)
+		t := &r.Tables[i]
+		if t.Blocked != "" {
+			t.Failures = maxFailures - 1
 		}
-		r.Tables[i].Blocked, r.Tables[i].BlockedAt = "", ""
+		t.Blocked, t.BlockedAt = "", ""
+	}
+	r.redo(r.Step)
+}
+
+// redo forgets that r's tables went through step and the steps after it,
+// which they are to go through again: a table's verify step then says it
+// was verified since.
+func (r *Request) redo(step string) {
+	at := slices.Index(steps, step)
+	if at < 0 {
+		return
+	}
+	for i := range r.Tables {
+		for _, s := range steps[at:] {
+			delete(r.Tables[i].Steps, s)
+		}
 	}
 }
 
@@ -957,6 +1155,7 @@ func (t *Table) done(step string, at time.Time) {
 		t.Steps = map[string]time.Time{}
 	}
 	t.Steps[step] = at
+	t.Failures = 0
 }
 
 func (s *Service) schedule(ctx context.Context, r *Request) error {

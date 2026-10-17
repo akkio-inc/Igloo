@@ -156,9 +156,14 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer c.mu.Unlock()
 	switch p := parts[1:]; {
 	case len(p) == 1 && p[0] == "namespaces" && r.Method == http.MethodGet:
-		var list [][]string
+		// The children of parent, or the top-level namespaces.
+		parent := r.URL.Query().Get("parent")
+		list := [][]string{}
 		for ns := range c.namespaces {
-			list = append(list, strings.Split(ns, "\x1f"))
+			levels := strings.Split(ns, "\x1f")
+			if parent == "" && len(levels) == 1 || parent != "" && strings.HasPrefix(ns, parent+"\x1f") && !strings.Contains(ns[len(parent)+1:], "\x1f") {
+				list = append(list, levels)
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"namespaces": list})
 	case len(p) == 1 && p[0] == "namespaces" && r.Method == http.MethodPost:

@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 )
 
 // schemaOf names a namespace as grants do. Only admins may use nested
@@ -505,6 +506,9 @@ func (s *Server) updateTable(c *call) error {
 	if err := checkCloneProperties(append(req.propertyKeys(), req.removedKeys()...)); err != nil {
 		return err
 	}
+	if err := s.checkManifestLists(c, ns, o, req); err != nil {
+		return err
+	}
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
@@ -558,15 +562,26 @@ func (s *Server) dropTable(c *call) error {
 	}
 	// Purging deletes every file under the table's location, those that
 	// clones read included (see clones.go).
-	if purgeRequested(c) && s.opts.Clones != nil {
+	query := pick(c.r.URL.Query(), "purgeRequested")
+	switch {
+	case purgeRequested(c) && s.opts.Clones != nil:
 		release, err := s.holdForPurge(c, tablePathOf(ns, o.Table))
 		if err != nil {
 			return err
 		}
 		defer release()
 		c.detail = "purge"
+	case !purgeRequested(c):
+		// A dropped table's files go with it, as in SQL, unless clones
+		// may read them: what is left of a dropped table no one can reach
+		// to erase from.
+		if release, ok := s.holdUnread(c, tablePathOf(ns, o.Table)); ok {
+			defer release()
+			query.Set("purgeRequested", "true")
+			c.detail = "purge"
+		}
 	}
-	if _, err := s.cat.call(c.ctx(), http.MethodDelete, tablePathOf(ns, o.Table), pick(c.r.URL.Query(), "purgeRequested"), nil); err != nil {
+	if _, err := s.cat.call(c.ctx(), http.MethodDelete, tablePathOf(ns, o.Table), query, nil); err != nil {
 		return err
 	}
 	// A table created later under the name starts with no grants.
@@ -865,6 +880,55 @@ func upgradesFormat(req commitRequest) bool {
 		}
 		return false
 	})
+}
+
+// checkManifestLists refuses a commit to table o that adds a snapshot
+// whose manifest list is not in the warehouse's storage: no engine could
+// read the snapshot, and erasure requests, which read every snapshot of
+// the tables they erase from, could not. A catalog takes such a snapshot
+// (Lakekeeper does); Igloo does not, so that no writer can make a table
+// unreadable to erasure. A table in the warehouse keeps its manifest lists
+// there, however their paths spell it; one elsewhere is not Igloo's to
+// check.
+func (s *Server) checkManifestLists(c *call, ns []string, o auth.Object, req commitRequest) error {
+	if s.opts.Exists == nil || s.opts.StorageRoot == "" || !slices.ContainsFunc(req.Updates, func(u tableUpdate) bool {
+		return u.Action == "add-snapshot" && u.Snapshot != nil
+	}) {
+		return nil
+	}
+	root := deletefiles.Canonical(s.opts.StorageRoot) + "/"
+	inWarehouse := false
+	if r, err := s.cat.call(c.ctx(), http.MethodGet, tablePathOf(ns, o.Table), nil, nil); err == nil {
+		if t, err := parseLoadResult(r.body); err == nil {
+			inWarehouse = strings.HasPrefix(deletefiles.Canonical(t.location)+"/", root)
+		}
+	}
+	for _, u := range req.Updates {
+		// A snapshot of format version 1 may list its manifests instead.
+		if u.Action != "add-snapshot" || u.Snapshot == nil || u.Snapshot.ManifestList == "" {
+			continue
+		}
+		list := deletefiles.Canonical(u.Snapshot.ManifestList)
+		if !strings.HasPrefix(list, root) {
+			if inWarehouse {
+				return errorf(http.StatusBadRequest, errBadRequest, "snapshot %d's manifest list %s is outside the warehouse, "+
+					"which holds the table's files: write it under the table's location", u.Snapshot.ID, u.Snapshot.ManifestList)
+			}
+			continue
+		}
+		// As the warehouse's storage spells it.
+		list = strings.TrimSuffix(s.opts.StorageRoot, "/") + "/" + strings.TrimPrefix(list, root)
+		ok, err := s.opts.Exists(c.ctx(), list)
+		if err != nil {
+			s.log.Warn("could not check that a snapshot's manifest list exists", "snapshot", u.Snapshot.ID, "err", err)
+			return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check that snapshot %d's manifest list exists; try again", u.Snapshot.ID)
+		}
+		if !ok {
+			return errorf(http.StatusBadRequest, errBadRequest, "snapshot %d's manifest list %s does not exist: write it before committing the snapshot",
+				u.Snapshot.ID, u.Snapshot.ManifestList)
+		}
+	}
+	return nil
 }
 
 // checkErasing refuses a commit that may upgrade table o to Iceberg format

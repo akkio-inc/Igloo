@@ -39,6 +39,10 @@
 //     (which DuckDB does not retry, and Igloo reports as SQLSTATE 40003),
 //     and the commit's files must stay, since it may have landed. Files of
 //     commits that never landed are left for the orphan cleanup then.
+//
+// Before a change reaches the catalog, a Guard, if one is set, checks it
+// (see guard.go): the proxy is where every change Igloo's SQL makes to
+// the catalog passes, whatever the statement that made it.
 package catalogproxy
 
 import (
@@ -61,6 +65,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -126,6 +131,9 @@ type Proxy struct {
 	filesOnce sync.Once
 	files     iceio.IO
 	filesErr  error
+
+	// guard checks changes (see SetGuard).
+	guard atomic.Pointer[Guard]
 }
 
 // New starts a proxy to the catalog on a random loopback port.
@@ -279,6 +287,8 @@ type change struct {
 	commit *commit
 	done   chan struct{}
 	res    *result
+	// releases are called once the change is through (see Verdict).
+	releases []func()
 }
 
 // result is an answer for DuckDB.
@@ -322,7 +332,11 @@ func (p *Proxy) begin(r *http.Request, rest string, body []byte) *change {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		res := p.resolve(c)
+		res := p.check(c)
+		if res == nil {
+			res = p.resolve(c)
+			c.release()
+		}
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		c.res = res

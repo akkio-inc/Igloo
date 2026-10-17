@@ -2,7 +2,6 @@ package pgwire
 
 import (
 	"context"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -271,17 +270,6 @@ func TestFormatVersionWhileErasing(t *testing.T) {
 		"ALTER TABLE IF EXISTS lake.public.people SET ('format_version' = '3')",
 	} {
 		expectDenied(t, cs.admin, sql, "an erasure request erases from")
-	}
-	// The table property functions name the table first (the stand-in
-	// catalog has no Iceberg extension to run them).
-	for sql, want := range map[string][]string{
-		"SELECT * FROM set_iceberg_table_properties(lake.public.people, {'format-version': '3'})":        {"lake", "public", "people"},
-		`SELECT * FROM SET_ICEBERG_TABLE_PROPERTIES ( "lake".public."People" , {'format-version': '3'})`: {"lake", "public", "People"},
-	} {
-		calls := propertyCalls(sql)
-		if len(calls) != 1 || !slices.Equal(calls[0].table, want) || !calls[0].literal || !slices.Equal(calls[0].keys, []string{"format-version"}) {
-			t.Errorf("%s: %+v", sql, calls)
-		}
 	}
 	if _, err := cs.admin.Exec(ctx, "CANCEL ERASURE REQUEST '"+id+"'"); err != nil {
 		t.Fatal(err)

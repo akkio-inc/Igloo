@@ -189,6 +189,15 @@ func (e *Engine) Ping(ctx context.Context) error {
 	return err
 }
 
+// SetCatalogGuard has g check every change DuckDB asks of the catalog
+// from now on (see catalogproxy.Guard). Without a catalog it does
+// nothing.
+func (e *Engine) SetCatalogGuard(g catalogproxy.Guard) {
+	if e.proxy != nil {
+		e.proxy.SetGuard(g)
+	}
+}
+
 // Close shuts DuckDB down. Sessions must be closed first.
 func (e *Engine) Close() error {
 	e.stopCache()

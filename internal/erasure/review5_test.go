@@ -3,16 +3,19 @@ package erasure
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -54,25 +57,48 @@ func tableOf(t *testing.T, r *Request, name string) Table {
 	return r.Tables[i]
 }
 
-// One table of a request is dropped, or replaced by a table of format
-// version 3, by another engine once the request has deleted from it: it
-// is set aside, and the other table goes through every step, its
-// snapshots from before the DELETE expired and its files clean. The
-// request is then blocked, keeps the identifiers, and takes the table up
-// again every hour; it completes if the table comes back, and otherwise
-// an admin can close it, which records what it left and forgets the
-// identifiers.
-func TestOneTableSetAside(t *testing.T) {
-	for _, c := range []struct {
-		name string
-		v    int
-		back bool
-	}{{"dropped", 0, false}, {"dropped and made again", 0, true}, {"replaced by a version 3 table", 3, false}} {
-		t.Run(c.name, func(t *testing.T) {
+// settle runs request id until it completes, fails, is held or blocked,
+// at most runs times: an hour apart, or, while it waits, once it is done
+// waiting.
+func settle(f *fixture, id string, runs int) *Request {
+	f.t.Helper()
+	at := time.Now()
+	var r *Request
+	for range runs {
+		at = at.Add(time.Hour)
+		if r != nil && r.Status == StatusWaiting && r.WaitUntil.After(at) {
+			at = r.WaitUntil.Add(time.Minute)
+		}
+		now := at
+		f.svc.now = func() time.Time { return now }
+		_ = f.svc.Run(f.ctx, id)
+		var err error
+		if r, err = f.store.Get(f.ctx, id); err != nil {
+			f.t.Fatal(err)
+		}
+		switch r.Status {
+		case StatusCompleted, StatusFailed, StatusHeld, StatusBlocked:
+			return r
+		}
+	}
+	return r
+}
+
+// One table of a request is dropped by another engine once the request
+// has deleted from it, and may be made again, where it was or elsewhere,
+// as Lakekeeper puts each table (warehouse/<uuid>). Its files, which no
+// table references any more, can hold the person's rows: the request goes
+// on, deletes those under the dropped table's location once they are old
+// enough not to be another commit's (see purge), erases from a table made
+// again under the name, and completes, with no file holding the person's
+// rows.
+func TestDroppedTableFilesGo(t *testing.T) {
+	for _, again := range []string{"", "where it was", "elsewhere"} {
+		t.Run("made again "+again, func(t *testing.T) {
 			f := newFixture(t)
-			alpha := f.people("crm.alpha", [][]any{ann, subject})
-			before, alphaDir := alpha.CurrentSnapshot().SnapshotID, alpha.Location()
-			betaFile := filesByIDs(t, f, f.people("crm.beta", [][]any{carl, subject}))["2,3"]
+			f.people("crm.alpha", [][]any{ann, subject})
+			beta := f.people("crm.beta", [][]any{carl, subject})
+			oldBeta, betaFile := beta.Location(), filesByIDs(t, f, beta)["2,3"]
 			f.tag(policy.ColumnTag{Schema: "crm", Table: "alpha", Column: "email", Value: "email"},
 				policy.ColumnTag{Schema: "crm", Table: "beta", Column: "email", Value: "email"})
 			f.rows["crm.alpha"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
@@ -80,82 +106,140 @@ func TestOneTableSetAside(t *testing.T) {
 			rows := &hookRows{testRows: f.rows, f: f}
 			rows.after = func(name string) {
 				if name == "crm.beta" {
-					swapTable(t, f, name, c.v)
+					swapTable(t, f, name, 0)
 				}
 			}
 			f.svc.rows = rows
-			alerts := f.alerts()
 			r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Within the day, before the dropped table's file is old enough.
 			got := runFor(f, r.ID, 6)
 			rows.after = nil
-			f.blocked(got, StepRewrite, "set aside crm.beta", *alerts)
-			if beta := tableOf(t, got, "crm.beta"); beta.BlockedAt != StepRewrite || beta.Blocked == "" {
-				t.Errorf("crm.beta: %+v", beta)
+			b := tableOf(t, got, "crm.beta")
+			if got.Status != StatusWaiting || got.Step != StepPurge || !b.Gone || b.Blocked != "" || !slices.Contains(b.Dropped, oldBeta) {
+				t.Errorf("%s at %s, %q; crm.beta %+v", got.Status, got.Step, got.Error, b)
 			}
-			a := tableOf(t, got, "crm.alpha")
-			for _, step := range []string{StepRewrite, StepExpire, StepPurge, StepSharing, StepVerify} {
-				if a.Steps[step].IsZero() || a.Blocked != "" {
-					t.Errorf("crm.alpha did not go through its %s step: %+v", step, a)
-				}
-			}
-			if tbl := f.load("crm.alpha"); tbl.SnapshotByID(before) != nil || !slices.Equal(f.ids(tbl, 0), []string{"1"}) {
-				t.Errorf("crm.alpha still has its snapshot from before the DELETE, or rows %v", f.ids(tbl, 0))
-			}
-			if found := search(t, f.eng, alphaDir, []string{storedEmail}); len(found) > 0 {
-				t.Errorf("left in crm.alpha's files: %v", found)
-			}
-			if got = f.runTimes(r.ID, 3); got.Status != StatusBlocked || got.Sealed == "" {
-				t.Errorf("an hour later: %s, %q", got.Status, got.Error)
-			}
-			// The files the request recorded for the table it set aside
-			// stay until it takes the table up again: a table dropped can
-			// come back, as Lakekeeper's soft deletion allows.
 			if _, err := os.Stat(betaFile); err != nil {
-				t.Errorf("crm.beta's file went while it was set aside: %v", err)
+				t.Errorf("the dropped crm.beta's file went before it was old enough: %v", err)
 			}
-			if c.back {
-				// Made again, as the request's error suggests for a table
-				// renamed: the request takes it up again, and completes.
+			switch again {
+			case "where it was":
 				f.people("crm.beta", [][]any{carl})
-				f.completed(f.run(r.ID))
-				f.clean(storedEmail)
-				return
+			case "elsewhere":
+				loc := filepath.Join(f.dir, "warehouse", "made-again")
+				meta, err := table.NewMetadata(peopleSchema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, loc,
+					iceberg.Properties{table.WriteDeleteModeKey: table.WriteModeMergeOnRead, "format-version": "2"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				tbl := table.New(ident("crm.beta"), meta, f.cat.write(t, loc, meta), localFS, f.cat)
+				f.cat.mu.Lock()
+				f.cat.tables["crm.beta"] = tbl
+				f.cat.mu.Unlock()
+				appendRows(t, tbl, carl, subject)
 			}
-			if _, err := f.svc.Close(f.ctx, r.ID, "pat"); err != nil {
-				t.Fatal(err)
+			f.completed(settle(f, r.ID, 10))
+			if _, err := os.Stat(betaFile); !os.IsNotExist(err) {
+				t.Errorf("the dropped crm.beta's file is still there: %v", err)
 			}
-			closed, _ := f.store.Get(f.ctx, r.ID)
-			if closed.Status != StatusClosed || closed.ClosedBy != "pat" || closed.Sealed != "" || closed.Salt != "" ||
-				!strings.Contains(closed.Error, "closed by pat") {
-				t.Errorf("closed: %+v", closed)
+			if again != "" && !slices.Equal(f.ids(f.load("crm.beta"), 0), []string{"3"}) {
+				t.Errorf("crm.beta made again: %v", f.ids(f.load("crm.beta"), 0))
 			}
-			if beta, alpha := tableOf(t, closed, "crm.beta"), tableOf(t, closed, "crm.alpha"); beta.Left == "" || alpha.Left != "" {
-				t.Errorf("left: crm.beta %q, crm.alpha %q", beta.Left, alpha.Left)
-			}
-			if _, err := f.svc.Close(f.ctx, r.ID, "pat"); !errors.Is(err, ErrInvalid) {
-				t.Errorf("closed twice: %v", err)
-			}
-			if err := f.svc.Run(f.ctx, r.ID); err != nil {
-				t.Errorf("a run of a closed request: %v", err)
-			}
-			if erasing, err := f.svc.Erasing(f.ctx, "crm", "beta"); err != nil || erasing {
-				t.Errorf("a closed request erases from crm.beta: %v, %v", erasing, err)
-			}
+			f.clean(storedEmail)
 		})
 	}
 }
 
+// One table of a request is replaced by a table of format version 3,
+// which requests cannot rewrite yet, by another engine once the request
+// has deleted from it: it is set aside, and the other table goes through
+// every step, as do the replaced table's files, which no table references.
+// The request is then blocked, keeps the identifiers, and takes the table
+// up again every hour; an admin can close it, which records what it left
+// and forgets the identifiers.
+func TestReplacedByVersion3IsSetAside(t *testing.T) {
+	f := newFixture(t)
+	alpha := f.people("crm.alpha", [][]any{ann, subject})
+	before, alphaDir := alpha.CurrentSnapshot().SnapshotID, alpha.Location()
+	beta := f.people("crm.beta", [][]any{carl, subject})
+	oldBeta, betaFile := beta.Location(), filesByIDs(t, f, beta)["2,3"]
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "alpha", Column: "email", Value: "email"},
+		policy.ColumnTag{Schema: "crm", Table: "beta", Column: "email", Value: "email"})
+	f.rows["crm.alpha"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
+	f.rows["crm.beta"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
+	rows := &hookRows{testRows: f.rows, f: f}
+	rows.after = func(name string) {
+		if name == "crm.beta" {
+			swapTable(t, f, name, 3)
+		}
+	}
+	f.svc.rows = rows
+	alerts := f.alerts()
+	r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := settle(f, r.ID, 12)
+	rows.after = nil
+	f.blocked(got, StepRewrite, "set aside crm.beta", *alerts)
+	b := tableOf(t, got, "crm.beta")
+	if b.BlockedAt != StepRewrite || !strings.Contains(b.Blocked, "format version 3") || !slices.Contains(b.Dropped, oldBeta) {
+		t.Errorf("crm.beta: %+v", b)
+	}
+	a := tableOf(t, got, "crm.alpha")
+	for _, step := range []string{StepRewrite, StepExpire, StepPurge, StepSharing, StepVerify} {
+		if a.Steps[step].IsZero() || a.Blocked != "" {
+			t.Errorf("crm.alpha did not go through its %s step: %+v", step, a)
+		}
+	}
+	if tbl := f.load("crm.alpha"); tbl.SnapshotByID(before) != nil || !slices.Equal(f.ids(tbl, 0), []string{"1"}) {
+		t.Errorf("crm.alpha still has its snapshot from before the DELETE, or rows %v", f.ids(tbl, 0))
+	}
+	if found := search(t, f.eng, alphaDir, []string{storedEmail}); len(found) > 0 {
+		t.Errorf("left in crm.alpha's files: %v", found)
+	}
+	if found := search(t, f.eng, oldBeta, []string{storedEmail}); len(found) > 0 {
+		t.Errorf("left in the replaced crm.beta's files: %v", found)
+	}
+	if _, err := os.Stat(betaFile); !os.IsNotExist(err) {
+		t.Errorf("the replaced crm.beta's file is still there: %v", err)
+	}
+	if got = f.runTimes(r.ID, 3); got.Status != StatusBlocked || got.Sealed == "" {
+		t.Errorf("an hour later: %s, %q", got.Status, got.Error)
+	}
+	if _, err := f.svc.Close(f.ctx, r.ID, "pat"); err != nil {
+		t.Fatal(err)
+	}
+	closed, _ := f.store.Get(f.ctx, r.ID)
+	if closed.Status != StatusClosed || closed.ClosedBy != "pat" || closed.Sealed != "" || closed.Salt != "" ||
+		!strings.Contains(closed.Error, "closed by pat") {
+		t.Errorf("closed: %+v", closed)
+	}
+	if beta, alpha := tableOf(t, closed, "crm.beta"), tableOf(t, closed, "crm.alpha"); beta.Left == "" || alpha.Left != "" {
+		t.Errorf("left: crm.beta %q, crm.alpha %q", beta.Left, alpha.Left)
+	}
+	if _, err := f.svc.Close(f.ctx, r.ID, "pat"); !errors.Is(err, ErrInvalid) {
+		t.Errorf("closed twice: %v", err)
+	}
+	if err := f.svc.Run(f.ctx, r.ID); err != nil {
+		t.Errorf("a run of a closed request: %v", err)
+	}
+	if erasing, err := f.svc.Erasing(f.ctx, "crm", "beta"); err != nil || erasing {
+		t.Errorf("a closed request erases from crm.beta: %v, %v", erasing, err)
+	}
+}
+
 // A table set aside that exists but cannot be read, here one another
-// engine upgraded to version 3 whose manifest list is lost, may reference
-// any file: while it is set aside, the request deletes none, the other
-// table's included.
-func TestUnreadableTableSetAsideKeepsFiles(t *testing.T) {
+// engine upgraded to version 3 and whose manifest list is damaged, may
+// reference any file under its own location: those stay while it is set
+// aside, and the other table's go, so that no table stops the erasure of
+// another's rows.
+func TestUnreadableTableSetAsideKeepsItsFiles(t *testing.T) {
 	f := newFixture(t)
 	alphaFile := filesByIDs(t, f, f.people("crm.alpha", [][]any{ann, subject}))["1,2"]
-	f.people("crm.beta", [][]any{carl, subject})
+	betaFile := filesByIDs(t, f, f.people("crm.beta", [][]any{carl, subject}))["2,3"]
 	f.tag(policy.ColumnTag{Schema: "crm", Table: "alpha", Column: "email", Value: "email"},
 		policy.ColumnTag{Schema: "crm", Table: "beta", Column: "email", Value: "email"})
 	f.rows["crm.alpha"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
@@ -166,8 +250,10 @@ func TestUnreadableTableSetAsideKeepsFiles(t *testing.T) {
 			if _, _, err := f.cat.CommitTable(f.ctx, ident(name), nil, []table.Update{table.NewUpgradeFormatVersionUpdate(3)}); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Remove(f.load(name).CurrentSnapshot().ManifestList); err != nil {
-				t.Fatal(err)
+			for _, snap := range f.load(name).Metadata().Snapshots() {
+				if err := os.WriteFile(snap.ManifestList, []byte("damaged"), 0o644); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}
@@ -177,31 +263,36 @@ func TestUnreadableTableSetAsideKeepsFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := runFor(f, r.ID, 8)
+	got := settle(f, r.ID, 12)
 	f.blocked(got, got.Step, "crm.beta", *alerts)
-	if _, err := os.Stat(alphaFile); err != nil {
-		t.Errorf("crm.alpha's file went while a table that may reference it could not be read: %v", err)
-	}
 	if beta := tableOf(t, got, "crm.beta"); !strings.Contains(beta.Blocked, "format version 3") {
 		t.Errorf("crm.beta: %+v", beta)
 	}
-	// Closed so, it records that it did not finish with either table.
+	if _, err := os.Stat(alphaFile); !os.IsNotExist(err) {
+		t.Errorf("crm.alpha's file stayed while a table that cannot reference it could not be read: %v", err)
+	}
+	if a := tableOf(t, got, "crm.alpha"); a.Steps[StepVerify].IsZero() {
+		t.Errorf("crm.alpha: %+v", a)
+	}
+	if _, err := os.Stat(betaFile); err != nil {
+		t.Errorf("crm.beta's file went while it could not be read: %v", err)
+	}
+	// Closed so, it records that it did not finish with crm.beta only.
 	closed, err := f.svc.Close(f.ctx, r.ID, "ada")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"crm.alpha", "crm.beta"} {
-		if tableOf(t, closed, name).Left == "" {
-			t.Errorf("%s: nothing left, though its files are", name)
-		}
+	if beta, alpha := tableOf(t, closed, "crm.beta"), tableOf(t, closed, "crm.alpha"); beta.Left == "" || alpha.Left != "" {
+		t.Errorf("left: crm.beta %q, crm.alpha %q", beta.Left, alpha.Left)
 	}
 }
 
-// A table dropped once the request has rewritten its files is set aside;
-// the files the request recorded for it, which held the person's rows,
-// stay while it is: a table dropped can come back, as Lakekeeper's soft
-// deletion allows, and would then reference them.
-func TestFilesOfTableSetAsideStay(t *testing.T) {
+// A table dropped once the request has rewritten its files is not set
+// aside: the files the request recorded for it, which held the person's
+// rows and which no table references any more, go, and the request
+// completes. Igloo's warehouse uses Lakekeeper's hard deletion, in which a
+// dropped table does not come back.
+func TestFilesOfDroppedTableGo(t *testing.T) {
 	f := newFixture(t)
 	f.people("crm.alpha", [][]any{ann, subject})
 	betaFile := filesByIDs(t, f, f.people("crm.beta", [][]any{carl, subject}))["2,3"]
@@ -215,18 +306,145 @@ func TestFilesOfTableSetAsideStay(t *testing.T) {
 			swapTable(t, f, "crm.beta", 0)
 		}
 	}
+	r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := settle(f, r.ID, 12)
+	f.completed(got)
+	if beta := tableOf(t, got, "crm.beta"); !dropped || beta.FilesRewritten == 0 || !beta.Gone || beta.Blocked != "" {
+		t.Fatalf("crm.beta: dropped %v, %+v", dropped, beta)
+	}
+	if _, err := os.Stat(betaFile); !os.IsNotExist(err) {
+		t.Errorf("crm.beta's file is still there: %v", err)
+	}
+	f.clean(storedEmail)
+}
+
+// A request is closed with a table set aside (upgraded to version 3 once
+// the request rewrote it) whose old file, which held the person's row,
+// the request recorded and could not delete while the table might
+// reference it. If the table is still there, the closed request lists the
+// file as left; if it was dropped since, the file goes. Either way the
+// request forgets nothing that may hold the person's rows without
+// deleting it or saying so.
+func TestCloseSettlesFilesOfTableSetAside(t *testing.T) {
+	for _, dropped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dropped %v", dropped), func(t *testing.T) {
+			f := newFixture(t)
+			f.people("crm.alpha", [][]any{ann, subject})
+			betaFile := filesByIDs(t, f, f.people("crm.beta", [][]any{carl, subject}))["2,3"]
+			f.tag(policy.ColumnTag{Schema: "crm", Table: "alpha", Column: "email", Value: "email"},
+				policy.ColumnTag{Schema: "crm", Table: "beta", Column: "email", Value: "email"})
+			upgraded := false
+			f.cat.after = func(id table.Identifier, meta table.Metadata) {
+				if snap := meta.CurrentSnapshot(); !upgraded && tableName(id) == "crm.beta" && snap != nil && snap.Summary != nil &&
+					snap.Summary.Properties["igloo.operation"] == "erase" {
+					upgraded = true
+					if _, _, err := f.cat.CommitTable(f.ctx, id, nil, []table.Update{table.NewUpgradeFormatVersionUpdate(3)}); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			alerts := f.alerts()
+			r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := settle(f, r.ID, 12)
+			f.blocked(got, got.Step, "crm.beta", *alerts)
+			if _, err := os.Stat(betaFile); err != nil {
+				t.Fatalf("crm.beta's file went while it was set aside: %v", err)
+			}
+			if dropped {
+				swapTable(t, f, "crm.beta", 0)
+			}
+			closed, err := f.svc.Close(f.ctx, r.ID, "ada")
+			if err != nil {
+				t.Fatal(err)
+			}
+			beta := tableOf(t, closed, "crm.beta")
+			_, statErr := os.Stat(betaFile)
+			switch {
+			case dropped && !os.IsNotExist(statErr):
+				t.Errorf("the dropped crm.beta's file is still there: %v", statErr)
+			case dropped && strings.Contains(beta.Left, base(betaFile)):
+				t.Errorf("crm.beta: %q", beta.Left)
+			case !dropped && (statErr != nil || !strings.Contains(beta.Left, base(betaFile))):
+				t.Errorf("crm.beta's file (%v) is not listed as left: %q", statErr, beta.Left)
+			}
+			if strings.Contains(strings.ToLower(beta.Left), "subject") {
+				t.Errorf("an identifier in what the request left: %q", beta.Left)
+			}
+		})
+	}
+}
+
+// Before it forgets the identifiers, closing a request redacts them from
+// the history, what was recorded since its history step included, deletes
+// the sharing copies that hold the person's rows and has every replica
+// empty its read cache of the files it deleted; if one of those cannot be
+// done yet, as when a replica has yet to empty its cache, the request is
+// not closed, and the error says why.
+func TestCloseFinishesFirst(t *testing.T) {
+	f := newFixture(t)
+	f.people("crm.alpha", [][]any{ann, subject})
+	f.people("crm.beta", [][]any{carl, subject})
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "alpha", Column: "email", Value: "email"},
+		policy.ColumnTag{Schema: "crm", Table: "beta", Column: "email", Value: "email"})
+	f.rows["crm.alpha"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
+	f.rows["crm.beta"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
+	f.svc.rows = betaFails{f.rows}
+	queries := audit.NewMemoryStore(100, 100)
+	f.svc.opts.History = []History{queries}
 	alerts := f.alerts()
 	r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := runFor(f, r.ID, 6)
-	f.blocked(got, got.Step, "crm.beta", *alerts)
-	if beta := tableOf(t, got, "crm.beta"); !dropped || beta.FilesRewritten == 0 || beta.Blocked == "" {
-		t.Fatalf("crm.beta: dropped %v, %+v", dropped, beta)
+	got := runFor(f, r.ID, maxFailures+5)
+	f.blocked(got, StepDelete, "set aside crm.beta", *alerts)
+	if got.DeletedThrough.IsZero() {
+		t.Fatal("the request deleted no file")
 	}
-	if _, err := os.Stat(betaFile); err != nil {
-		t.Errorf("crm.beta's file went while it was set aside: %v", err)
+	// Recorded since the request's history step.
+	if err := queries.WriteQueries(f.ctx, []audit.Query{{ID: "q1", User: "ana", Start: time.Now(), Outcome: audit.OutcomeOK, StatementType: "SELECT",
+		Text: "SELECT * FROM crm.beta WHERE lower(email) = 'subject@example.com'"}}); err != nil {
+		t.Fatal(err)
+	}
+	// A replica that has yet to empty its read cache of what the request
+	// deleted: the request is not closed.
+	if err := f.store.Seen(f.ctx, "replica-2-cache", "replica-2", f.svc.now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.svc.Close(f.ctx, r.ID, "ada"); !errors.Is(err, ErrNotYet) || !strings.Contains(err.Error(), "read caches") {
+		t.Fatalf("closed while a replica's cache may hold what it deleted: %v", err)
+	}
+	if still, _ := f.store.Get(f.ctx, r.ID); still.Status != StatusBlocked || still.Sealed == "" {
+		t.Fatalf("after a refused close: %s, sealed %v", still.Status, still.Sealed != "")
+	}
+	if err := f.store.Emptied(f.ctx, "replica-2-cache", f.svc.now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := f.svc.Close(f.ctx, r.ID, "ada")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed.Status != StatusClosed {
+		t.Errorf("closed: %s", closed.Status)
+	}
+	// Redacted by the first try already, which got that far.
+	recorded, err := queries.Queries(f.ctx, audit.Viewer{All: true}, audit.Page{})
+	if err != nil || len(recorded) != 1 {
+		t.Fatalf("%d records, %v", len(recorded), err)
+	}
+	for _, q := range recorded {
+		if strings.Contains(strings.ToLower(q.Text), "subject@example.com") {
+			t.Errorf("the query history still has %q", q.Text)
+		}
+	}
+	if b, a := tableOf(t, closed, "crm.beta"), tableOf(t, closed, "crm.alpha"); !strings.Contains(b.Left, "Binder Error") || a.Left != "" {
+		t.Errorf("left: crm.beta %q, crm.alpha %q", b.Left, a.Left)
 	}
 }
 

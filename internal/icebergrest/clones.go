@@ -15,7 +15,10 @@ import (
 //     file under its location, so a table whose files clones read is not
 //     purged: the drop is refused, naming the clones, and the client may
 //     drop it without purging (its files stay, as SQL's DROP TABLE leaves
-//     them) or drop the clones first.
+//     them then) or drop the clones first. A table in the warehouse whose
+//     files no clone reads is purged when it is dropped, whatever the
+//     client asks, as in SQL: no one could reach what is left of it to
+//     erase from it.
 //   - Credentials reach one table's location (see Vendor), so they would
 //     not reach a clone's files under its source's. Igloo hands out none
 //     for clones, rather than credentials that cover the source too, which
@@ -105,6 +108,34 @@ func (s *Server) holdForPurge(c *call, path string) (release func(), err error) 
 			strings.Join(names, ", "))
 	}
 	return release, nil
+}
+
+// holdUnread reports whether the table at path, which is dropped without
+// purging, may be purged instead: it is in the warehouse (StorageRoot),
+// and no clone reads its files, which none will until release is called.
+// When that cannot be told, it is not.
+func (s *Server) holdUnread(c *call, path string) (release func(), ok bool) {
+	if s.opts.Clones == nil || s.opts.StorageRoot == "" {
+		return nil, false
+	}
+	r, err := s.cat.call(c.ctx(), http.MethodGet, path, nil, nil)
+	if err != nil {
+		return nil, false
+	}
+	t, err := parseLoadResult(r.body)
+	if err != nil || !strings.HasPrefix(strings.TrimSuffix(t.location, "/")+"/", strings.TrimSuffix(s.opts.StorageRoot, "/")+"/") {
+		return nil, false
+	}
+	names, release, err := s.opts.Clones.Readers(c.ctx(), t.location)
+	switch {
+	case err != nil:
+		s.log.Warn("could not tell whether clones read a dropped table's files; it is dropped without them", "location", t.location, "err", err)
+		return nil, false
+	case len(names) > 0:
+		release()
+		return nil, false
+	}
+	return release, true
 }
 
 // cloneCredentials refuses credentials for table o, loaded as t, if it is a

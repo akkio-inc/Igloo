@@ -379,11 +379,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and an alert after 10 failures before their first `DELETE` (losing to
   other writers, or a replica with another erasure key, does not count),
   and once they have sent one never fail: a table they cannot go on with
-  is set aside while the others go through every step, and the request
+  is set aside while the others go through every step (failures count
+  per table), and the request
   is then blocked, with a metric and an alert, keeping its identifiers and
   taking it up again every hour until what stops it is fixed, or an admin
-  closes it (`CLOSE ERASURE REQUEST`), which records what it left and
-  forgets the identifiers; they keep their identifiers sealed
+  closes it (`CLOSE ERASURE REQUEST`), which first deletes the sharing
+  copies, redacts the history and has the replicas empty their caches,
+  deletes what it recorded of tables dropped since, records what it left,
+  files included, and forgets the identifiers. A table dropped or
+  replaced while a request runs is not set aside: the request deletes the
+  files under its old location that no table references and that hold the
+  person's rows, and erases from a table that has its name now. A table
+  that cannot be read, or a snapshot whose manifest list is missing,
+  stops no one's request; they keep their identifiers sealed
   under `IGLOO_ERASURE_KEY` (or `IGLOO_ERASURE_KEY_FILE`'s) only while they
   run, wait for snapshots staged by write-audit-publish to be published or
   discarded, and are listed with what they did per table and step in
@@ -401,10 +409,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Iceberg format version 3, whose deletion vectors Igloo cannot read yet,
   with files other than Parquet, or with a branch or tag it could not
   write again. Igloo has Lakekeeper refuse tables of format version 3 in
-  its warehouse, and refuses itself to upgrade a table with tags, or one
+  its warehouse (and warns when `IGLOO_CATALOG_SETUP=false` skips that),
+  and refuses itself to upgrade a table with tags, or one
   an open request erases from, to version 3, or to make one of version 3
-  under its name, and to drop or rename a table an open request erases
-  from. Every branch but main is rewritten with its head's schema, and a
+  under its name, and to drop, replace or rename a table an open request
+  erases from: in SQL, for every change a statement makes to the catalog,
+  checked as DuckDB asks the catalog for it, whatever the statement's
+  text. No one but `CREATE TABLE ... CLONE` sets Igloo's clone
+  properties. A table dropped in the warehouse that no clone reads has
+  its files purged with it, through SQL and the Iceberg REST endpoint
+  alike, which also refuses snapshots whose manifest list is not in the
+  warehouse. Every branch but main is rewritten with its head's schema, and a
   tag with its snapshot's, so columns dropped since stay in them, and
   each file is written again with its own partition spec, or another
   whose columns that schema has. Admins and roles granted

@@ -73,25 +73,47 @@ ALTER TABLE crm.referrals ALTER COLUMN referrer_email SET TAG pii = 'email:null'
   table another engine changed so meanwhile.
 - **Tables stay within reach.** Igloo has its catalog (Lakekeeper 0.13 or
   later) refuse tables of format version 3 in its warehouse, whoever makes
-  or upgrades them; tables of version 3 made before stay writable. On top
+  or upgrades them, when it starts (with `IGLOO_CATALOG_SETUP=false` it
+  does not, and logs a warning: set the warehouse's format-version policy
+  yourself); tables of version 3 made before stay writable. Lakekeeper's
+  APIs have no authentication of their own, so this, and everything below,
+  holds only while nothing but Igloo reaches the catalog: keep it on a
+  private network, as the Helm chart's NetworkPolicy does. On top
   of that, and on any catalog, Igloo's SQL and its Iceberg REST endpoint
   refuse, to everyone, admins included: to upgrade a table with tags to
   version 3, or to make a table of version 3 under its name; and, while a
   request that is not over erases from a table (its clones too), to drop
-  it or its schema, to rename it or another table to its name, to upgrade
-  it, or to make a table of version 3 under its name. Table properties of
-  such tables, and of tables with tags, are set with
-  `set_iceberg_table_properties` by keys and values written as literals
-  only, none of them `format-version`. Parquet position delete files
-  scoped to one data file, as Java's Iceberg writes Spark's, are read as
-  any.
+  it or its schema, to replace it (`CREATE OR REPLACE TABLE`, with `AS
+  SELECT` or `CLONE` too), to rename it or another table to its name, to
+  upgrade it, or to make a table of version 3 under its name. In SQL these
+  rules hold for every change a statement makes to the catalog, as the
+  catalog would see it, however the statement says so: Igloo checks each
+  change DuckDB asks of the catalog before the catalog gets it, so
+  `EXPLAIN ANALYZE`, a statement among others, a prepared statement, or
+  `set_iceberg_table_properties` with a key computed at run time make no
+  difference. No one sets or removes Igloo's own clone properties
+  (`igloo.clone.*`) but `CREATE TABLE ... CLONE`, so no table can claim to
+  read a tagged table's files and be taken into requests for it. Parquet
+  position delete files scoped to one data file, as Java's Iceberg writes
+  Spark's, are read as any.
+- **Nothing a writer does stops anyone's erasure.** A snapshot whose
+  manifest list does not exist references nothing anyone can read: a
+  request passes over it (Igloo's Iceberg REST endpoint refuses such
+  snapshots, but a catalog takes them). A table of the catalog that cannot
+  be read at all, as one whose manifest list is damaged, nothing reads
+  either: a request keeps the files under its location, and those it says
+  it shares, which it may reference, and deletes the rest. A table dropped
+  in the warehouse has its files deleted with it (see [below](#what-a-request-does)).
 - **Once it has sent a `DELETE`, a request never fails**: failing would
   forget whose rows it deleted while files may still hold them. A table
-  it cannot go on with then, as one another engine dropped or upgraded to
+  it cannot go on with then, as one another engine renamed or upgraded to
   version 3 by going around Igloo, is set aside, and the request goes on
   with its other tables through every step; it is then `blocked` (see
   [below](#what-a-request-does)) until someone fixes it, or an admin
-  closes it.
+  closes it. A table another engine dropped, or replaced, as `CREATE OR
+  REPLACE TABLE` does, is not: the request deletes the files under the
+  old table's location that no table references and that hold the
+  person's rows, and erases from a table that has its name now.
 - **Hashed identifiers**: a tag value with `:sha256`, `:sha1` or `:md5`
   after it marks a column of the identifier's hex digest, as ad platforms
   match on: of the identifier as given, or lower-cased and trimmed. A
@@ -226,11 +248,30 @@ raises the built-in alert `FAILED_RUNS`
 
 Once it has sent a `DELETE`, which may have committed even when no answer
 came, a request never fails. A table it cannot go on with, as one another
-engine dropped, renamed or changed so that the request cannot erase from
-it any more, or whose runs fail 10 times in a row, is set aside: its
-`blocked` and `blocked_at` (in `tables`) say why and at which step, and
-the request goes on with its other tables through every step, so their
-old snapshots are expired and their files deleted. What would fail the
+engine renamed or changed so that the request cannot erase from it any
+more, or whose runs fail 10 times in a row, is set aside: its `blocked`
+and `blocked_at` (in `tables`) say why and at which step, and the request
+goes on with its other tables through every step, so their old snapshots
+are expired and their files deleted. Failures count per table: a run that
+fails with one table counts against that table alone, so one passing
+error of another does not set it aside. While a table set aside cannot
+be read, the files under its location stay, as it may reference them;
+the others' go.
+
+A table dropped while the request runs, by another engine or before
+Igloo refused it, is not set aside: it is gone, and so is anyone's way to
+its files, which can still hold the person's rows. The request records
+where it was (`dropped_locations` in `tables`), and deletes the files
+there that no table references: at once those it recorded as holding
+matching rows, the others once they are three days old, as orphan files
+are (one newer that holds matching rows makes the request wait until it
+is old enough), and verification looks there too. The same goes for a
+table replaced under its name, as `CREATE OR REPLACE TABLE` does: the
+request erases from the new table and cleans the old one's location. A
+table renamed rather than dropped still holds its rows, and is set aside
+for someone to tag it under its new name.
+
+What would fail the
 request itself, as verification that sends it back more than five times
 because matching rows keep coming back, or a table set aside, makes it
 `blocked`: it keeps its identifiers sealed, logs at error level, raises
@@ -244,16 +285,27 @@ error, scrubbed of identifiers and hashes as everything the request logs
 is.
 
 **The last resort.** When what blocks a request will not be fixed, as a
-table another engine dropped, or upgraded to version 3, which Igloo
-cannot rewrite yet, an admin can end it with `CLOSE ERASURE REQUEST`,
-once someone has erased what it could not in another way. What it erased
-stays erased; each table it did not finish with keeps why in `left` (in
-`tables`), the request records who closed it, as `closed` with `error`
-saying so, logs `erasure request closed` at warning level, and forgets its
-identifiers, as a completed request does. The statement is in the query
-history like any other. Only admins may close a request, and only a
-blocked one: privacy officers and the requester cannot, as they cannot
-cancel one that has begun deleting.
+table another engine upgraded to version 3, which Igloo cannot rewrite
+yet, an admin can end it with `CLOSE ERASURE REQUEST`, once someone has
+erased what it could not in another way. Before it forgets the
+identifiers, closing does what needs no table: it deletes the Delta
+Sharing copies that hold the person's rows, redacts the identifiers from
+the history, and has every replica empty its read cache of what the
+request deleted. If one of those cannot be done yet, as while a replica
+has yet to empty its cache, the request is not closed, and the error
+(SQLSTATE 55000) says why: try again. The files the request recorded for
+a table set aside that was dropped since go, unless a table references
+them. What it erased stays erased; each table it did not finish with
+keeps why in `left` (in `tables`), with the paths of the files it leaves
+that may hold the person's rows (its identifiers scrubbed from them): the
+files it recorded and did not delete, and those under a dropped table's
+location that hold matching rows. A table counts as finished only if the
+last verification found nothing, not an earlier one. The request records
+who closed it, as `closed` with `error` saying so, logs `erasure request
+closed` at warning level, and forgets its identifiers, as a completed
+request does. The statement is in the query history like any other. Only
+admins may close a request, and only a blocked one: privacy officers and
+the requester cannot, as they cannot cancel one that has begun deleting.
 
 Three kinds of run never count, however often they happen, since none
 says anything is wrong with the request:
@@ -298,10 +350,11 @@ is added to it. If a table the request does not erase from references a
 file it would delete, the request stops with an error that names the table
 instead of breaking it: tag that table's columns and ask again for the
 same identifiers, and the first request goes on once the second has erased
-from it. So does a table the request found that was dropped or renamed
-while it ran. A table of the catalog that the catalog refuses for good, which
-nothing can read either, is left out of the search, with a warning in the
-log, rather than stopping every request.
+from it. A table of the catalog that the catalog refuses for good, or
+whose metadata cannot be read, which nothing can read either, is left out
+of the search, with a warning in the log, rather than stopping every
+request; the files under its location, and those it says it shares, are
+kept, as it may reference them.
 
 ### What the record keeps
 
@@ -331,7 +384,7 @@ request, newest first, to admins and holders of `ERASE`:
 | `step` | The step it runs next, `done` once complete |
 | `created_at`, `updated_at`, `completed_at` | When |
 | `subjects` | JSON: the tag values, and how many identifiers of each |
-| `tables` | JSON: per table, its tagged columns, why it was included, rows that matched of how many, rows deleted, values nulled, files rewritten, snapshots expired, files deleted, files outside the warehouse it left, the branches and tags it rewrote, and when each step ended for it; `remote` for a table of a connection, which it did not erase from; `blocked` and `blocked_at` for a table it set aside, and `left`, once an admin closed it, for one it did not finish with |
+| `tables` | JSON: per table, its tagged columns, why it was included, rows that matched of how many, rows deleted, values nulled, files rewritten, snapshots expired, files deleted, files outside the warehouse it left, the branches and tags it rewrote, and when each step ended for it; `remote` for a table of a connection, which it did not erase from; `blocked` and `blocked_at` for a table it set aside, `failures` for one whose runs failed in a row, `location`, `dropped_locations` and `gone` for a table dropped or replaced while it ran (see above), and `left`, once an admin closed it, for one it did not finish with |
 | `downstream` | JSON: tables written from those, as history tells, and whether the request erased from them because they have the tags too |
 | `history_redacted` | History records redacted |
 | `steps` | JSON: when each step started and last finished, and how often it ran |
@@ -441,9 +494,18 @@ renaming such a table is refused.
   to erase. An engine that holds a table's metadata from before the
   request still lists the deleted files, and fails to read them once they
   are gone.
-- **Tables dropped before the request**, whose files the catalog may keep
-  for a while, and the definitions of tasks, pipes and materialized views,
-  which are SQL and not history.
+- **What is left of tables dropped before the request, where something
+  kept it.** A table dropped in Igloo's warehouse, through SQL or the
+  Iceberg REST endpoint, has its files deleted with it: the catalog purges
+  it, unless clones read its files, or Igloo cannot tell whether they do,
+  when they stay for the clones (a request erases from the clones). So
+  does a table dropped before this version of Igloo, or by an engine that
+  reaches the catalog without Igloo, or replaced by `CREATE OR REPLACE
+  TABLE ... CLONE` (which keeps the old table's files): its files stay in
+  the bucket, where no table, and so no request, reaches them. Delete
+  such leftovers with the bucket's own tools.
+- The definitions of tasks, pipes and materialized views, which are SQL
+  and not history.
 - **Tables partitioned by an identifier**, whose partition values are in
   file paths and manifests.
 - **Statements run after the request completes**, which are recorded as

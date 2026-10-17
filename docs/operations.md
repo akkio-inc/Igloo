@@ -609,17 +609,26 @@ it works on:
 - **Orphan cleanup** keeps them the same way.
 - **Compaction** deletes nothing itself; the files it replaces go with the
   snapshots that read them.
-- **`DROP TABLE`** never asks the catalog to purge the table, which would
-  delete everything under its location: a dropped table's files stay in the
-  bucket, clones keep reading theirs, and Igloo does not delete the rest.
-  The catalog deletes files only when asked to purge, and only Igloo can
-  reach it; other engines go through [Igloo's Iceberg REST
-  catalog](external-engines.md#clones), which refuses to purge a table
-  whose files clones read (409, naming the clones; dropping it without
-  purging works). Igloo's warehouse uses the catalog's default hard deletion, in
-  which a dropped table cannot be restored; with Lakekeeper's soft deletion
-  turned on instead, a clone restored after it was dropped may miss
-  files of its source that maintenance deleted meanwhile.
+- **`DROP TABLE`** asks the catalog to purge the table, which deletes
+  everything under its location, only when no clone may read its files:
+  Igloo takes the lock that making a clone of the table takes, checks that
+  no clone reads under the table's location (as the purge refusal below
+  does), and holds the lock until the drop is through. A table whose files
+  clones read, or may (Igloo cannot tell), is dropped without purging: its
+  files stay in the bucket, clones keep reading theirs, and Igloo does not
+  delete the rest. Purging a dropped table's files is what keeps them
+  within reach of [erasure requests](privacy.md#what-a-request-does): no
+  table references them any more, so no request would find them. Only
+  tables in the warehouse are purged. The catalog deletes files only when
+  asked to purge, and only Igloo can reach it; other engines go through
+  [Igloo's Iceberg REST catalog](external-engines.md#clones), which drops
+  tables the same way and refuses to purge a table whose files clones
+  read (409, naming the clones; dropping it without purging works). Igloo's
+  warehouse uses the catalog's default hard deletion, in which a dropped
+  table cannot be restored; with Lakekeeper's soft deletion turned on
+  instead, a table restored after it was dropped may miss its files, and a
+  clone restored after it was dropped may miss files of its source that
+  maintenance deleted meanwhile.
 
 Which tables share which files is recorded twice: in each clone's own
 metadata (the table property `igloo.clone.shares-files-of`, the locations

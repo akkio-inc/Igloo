@@ -15,6 +15,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/icebergrest"
@@ -103,6 +104,10 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 		},
 		Erasing: func(ctx context.Context, o auth.Object) (bool, error) {
 			return deps.sql.Erasing(ctx, o.Schema, o.Table)
+		},
+		StorageRoot: cfg.Storage.Root(),
+		Exists: func(ctx context.Context, path string) (bool, error) {
+			return catalog.Exists(ctx, cfg.Storage, path)
 		},
 		Key:         key,
 		Credentials: vendor,

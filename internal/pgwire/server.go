@@ -30,6 +30,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
@@ -154,6 +155,11 @@ type Options struct {
 	Lineage LineageSink
 	// Erasure carries out erasure requests. Nil without a catalog.
 	Erasure *erasure.Service
+	// CloneReaders, if set, names the clones that read files under a
+	// table's location, holding off new ones until release is called
+	// (clone.Guard.Readers): a table dropped that none reads has its files
+	// deleted with it (see catalogguard.go).
+	CloneReaders func(ctx context.Context, location string) (names []string, release func(), err error)
 
 	// Distributed, if set, runs statements that read large tables in
 	// parts on workers (docs/distributed-execution.md).
@@ -216,6 +222,8 @@ type Server struct {
 	notify      *notify.Service
 	clones      *clone.Manager
 	erasure     *erasure.Service
+	// cloneReaders is Options.CloneReaders (see catalogguard.go).
+	cloneReaders func(ctx context.Context, location string) ([]string, func(), error)
 	// gov holds the policies (see protect.go).
 	gov      *governance
 	settings auth.SettingStore
@@ -297,6 +305,8 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		dist:        opts.Distributed,
 		erasure:     opts.Erasure,
 		mockSecret:  mockSecret,
+
+		cloneReaders: opts.CloneReaders,
 
 		tokens:              opts.Tokens,
 		accounts:            opts.Accounts,
@@ -382,6 +392,13 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	if e, ok := engine.(catalogEngine); ok {
 		e.SetCatalogViewer(s.CatalogViewer)
+	}
+	// Every change DuckDB makes to the catalog is checked (see
+	// catalogguard.go).
+	if e, ok := engine.(interface {
+		SetCatalogGuard(catalogproxy.Guard)
+	}); ok {
+		e.SetCatalogGuard(s)
 	}
 	s.sessions.abandoned = s.releaseConn
 

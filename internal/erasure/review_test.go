@@ -46,7 +46,7 @@ func newFixture(t *testing.T) *fixture {
 		policies: policy.NewMemoryStore(), store: NewMemoryStore(), cache: &readCache{}, rows: testRows{},
 		metrics: NewMetrics(prometheus.NewRegistry())}
 	f.svc = New(Options{Store: f.store, Catalog: f.cat, Policies: f.policies.Load, Engine: f.eng, Key: testKey, CatalogName: "lake",
-		Warehouse: f.warehouse(), Rows: f.rows, Metrics: f.metrics,
+		Warehouse: f.warehouse(), Storage: localStorage, Rows: f.rows, Metrics: f.metrics,
 		Purger: NewPurger(f.store, f.cache, MemoryCache+"test", "test", slog.New(slog.DiscardHandler))})
 	return f
 }
@@ -234,9 +234,11 @@ func TestRewriteRemovesRowsTheDeleteMissed(t *testing.T) {
 		if erasing > maxPasses+1 {
 			t.Errorf("%d rewrites", erasing)
 		}
+		// The failure counts against the table (see failed).
 		got, _ := f.store.Get(f.ctx, r.ID)
-		if got.Status != StatusRetrying || got.Failures != 1 || strings.Contains(got.Error, "subject@") {
-			t.Errorf("request: %s, %d failures, %q", got.Status, got.Failures, got.Error)
+		if people := tableOf(t, got, "crm.people"); got.Status != StatusRetrying || people.Failures != 1 || got.Failures != 0 ||
+			strings.Contains(got.Error, "subject@") {
+			t.Errorf("request: %s, %d failures (table %d), %q", got.Status, got.Failures, people.Failures, got.Error)
 		}
 	})
 }

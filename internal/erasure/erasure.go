@@ -43,6 +43,7 @@ package erasure
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 )
 
@@ -115,6 +116,9 @@ var (
 	// ErrBusy means the request is being run on some replica; try again
 	// shortly.
 	ErrBusy = errors.New("the erasure request is running; try again in a moment")
+	// ErrNotYet means the request cannot be closed now (see Service.Close):
+	// what it must do first could not be done.
+	ErrNotYet = errors.New("the erasure request cannot be closed yet")
 )
 
 // Request is an erasure request and its progress. Its record never holds
@@ -240,9 +244,28 @@ type Table struct {
 	// blockedWait.
 	Blocked   string `json:"blocked,omitempty"`
 	BlockedAt string `json:"blocked_at,omitempty"`
+	// Failures counts the runs in a row that failed with this table, which
+	// is set aside after maxFailures of them.
+	Failures int `json:"failures,omitempty"`
 	// Left says why the request was closed (see Service.Close) without
 	// finishing with the table.
 	Left string `json:"left,omitempty"`
+	// Location is where the table keeps its files, as last loaded.
+	Location string `json:"location,omitempty"`
+	// Dropped are the locations of tables of this name that were dropped
+	// or replaced while the request ran: their files, which no table may
+	// reference any more, can still hold the person's rows, and the
+	// request deletes those of them that no table references (see purge).
+	// Gone says the table was dropped, and none has its name now.
+	Dropped []string `json:"dropped_locations,omitempty"`
+	Gone    bool     `json:"gone,omitempty"`
+}
+
+// dropped notes that the table at location loc was dropped or replaced.
+func (t *Table) dropped(loc string) {
+	if loc != "" && !slices.Contains(t.Dropped, loc) {
+		t.Dropped = append(t.Dropped, loc)
+	}
 }
 
 // Column is a column that holds identifiers.

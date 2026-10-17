@@ -237,6 +237,11 @@ func (s *Server) cloneTable(ctx context.Context, sess *session, user auth.User, 
 		return acc, nil
 	case exists && !c.replace:
 		return acc, pgerror.WithCode(fmt.Errorf("table %s already exists", dst), codes.DuplicateRelation)
+	case exists:
+		// Replacing drops the table (see catalogguard.go).
+		if err := s.refuseErasingReplace(ctx, dst); err != nil {
+			return acc, err
+		}
 	}
 	at, err := s.cloneAt(ctx, sess, user, c.at)
 	if err != nil {
@@ -306,6 +311,11 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 			exists: slices.ContainsFunc(had, func(h string) bool { return strings.EqualFold(h, t) })}
 		acc.read = append(acc.read, pairs[i].source)
 		acc.written = append(acc.written, pairs[i].target)
+		if pairs[i].exists {
+			if err := s.refuseErasingReplace(ctx, pairs[i].target); err != nil {
+				return acc, err
+			}
+		}
 	}
 	// Writers read every table; the check is for the history and in case
 	// that ever changes.

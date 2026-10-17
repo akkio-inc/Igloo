@@ -164,7 +164,9 @@ type tableUpdate struct {
 	// Snapshot is add-snapshot's, whose declared operation the history
 	// shows.
 	Snapshot *struct {
-		Summary map[string]string `json:"summary"`
+		ID           int64             `json:"snapshot-id"`
+		Summary      map[string]string `json:"summary"`
+		ManifestList string            `json:"manifest-list"`
 	} `json:"snapshot"`
 	// Updates are set-properties', and Removals remove-properties'.
 	Updates  map[string]string `json:"updates"`

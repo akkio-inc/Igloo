@@ -388,6 +388,8 @@ type harness struct {
 	vendor  *vendor
 	tokens  *tokens
 	history *audit.Log
+	// files are the files in the warehouse's storage (Options.Exists).
+	files sync.Map
 }
 
 func newHarness(t *testing.T) *harness {
@@ -416,6 +418,11 @@ func newHarness(t *testing.T) *harness {
 		Key:               bytes.Repeat([]byte("k"), 32),
 		Credentials:       h.vendor,
 		Audit:             h.history,
+		StorageRoot:       warehouse,
+		Exists: func(_ context.Context, path string) (bool, error) {
+			_, ok := h.files.Load(path)
+			return ok, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

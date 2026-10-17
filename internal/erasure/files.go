@@ -33,6 +33,11 @@ type entry struct {
 
 func (e entry) live() bool { return e.status != iceberg.EntryStatusDELETED }
 
+// readFiles reads what every snapshot of tbl references. A snapshot whose
+// manifest list does not exist, or a manifest that does not, references
+// nothing anyone can read: a writer can commit one (Igloo's Iceberg REST
+// endpoint refuses that, but a catalog takes it), and no engine reads
+// files through it, so it neither keeps a file nor stops a request.
 func readFiles(ctx context.Context, tbl *table.Table) (*tableFiles, error) {
 	fs, err := tbl.FS(ctx)
 	if err != nil {
@@ -41,22 +46,28 @@ func readFiles(ctx context.Context, tbl *table.Table) (*tableFiles, error) {
 	tf := &tableFiles{tbl: tbl, entries: map[string][]entry{}, manifests: map[int64][]string{}}
 	for _, snap := range tbl.Metadata().Snapshots() {
 		manifests, err := snap.Manifests(fs)
+		if notExist(err) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("read the manifests of snapshot %d: %w", snap.SnapshotID, err)
 		}
 		for _, m := range manifests {
-			tf.manifests[snap.SnapshotID] = append(tf.manifests[snap.SnapshotID], m.FilePath())
-			if _, ok := tf.entries[m.FilePath()]; ok {
-				continue
-			}
-			var es []entry
-			for e, err := range m.Entries(fs, false) {
-				if err != nil {
-					return nil, fmt.Errorf("read manifest %s: %w", m.FilePath(), err)
+			es, seen := tf.entries[m.FilePath()]
+			if !seen {
+				for e, err := range m.Entries(fs, false) {
+					if notExist(err) {
+						es = nil
+						break
+					}
+					if err != nil {
+						return nil, fmt.Errorf("read manifest %s: %w", m.FilePath(), err)
+					}
+					es = append(es, entry{status: e.Status(), file: e.DataFile()})
 				}
-				es = append(es, entry{status: e.Status(), file: e.DataFile()})
+				tf.entries[m.FilePath()] = es
 			}
-			tf.entries[m.FilePath()] = es
+			tf.manifests[snap.SnapshotID] = append(tf.manifests[snap.SnapshotID], m.FilePath())
 		}
 	}
 	return tf, nil

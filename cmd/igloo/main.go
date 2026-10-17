@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
@@ -130,10 +131,17 @@ func serve() error {
 	}
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
-	if cfg.Catalog.URI != "" && cfg.Catalog.Setup {
+	switch {
+	case cfg.Catalog.URI != "" && cfg.Catalog.Setup:
 		if err := catalog.Setup(startCtx, cfg, httpClient, log); err != nil {
 			return err
 		}
+	case cfg.Catalog.URI != "":
+		// Setup is what limits the warehouse's format versions.
+		log.Warn("IGLOO_CATALOG_SETUP is false, so Igloo does not limit the warehouse's Iceberg format versions to 1 and 2 in the catalog: "+
+			"it refuses version 3 itself for tables with tags and tables erasure requests erase from, but an engine that reaches the "+
+			"catalog without Igloo can make one; set the warehouse's format-version policy in the catalog yourself (see docs/privacy.md)",
+			"catalog", cfg.Catalog.URI)
 	}
 
 	// One for each server and the sharing proxy.
@@ -372,6 +380,11 @@ func serve() error {
 		Lineage:             lineage,
 		Distributed:         dist,
 		Erasure:             eraser,
+	}
+	if guard != nil {
+		// A table dropped that no clone reads has its files deleted with
+		// it (see pgwire's catalogguard.go).
+		opts.CloneReaders = guard.Readers
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single
@@ -712,6 +725,11 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 // cannot would keep identifiers the request is meant to erase.
 func newEraser(cfg config.Config, opts erasure.Options, history audit.Store, taskStore tasks.Store) (*erasure.Service, error) {
 	opts.CatalogName, opts.Schema, opts.Warehouse = cfg.Catalog.Name, cfg.Catalog.Schema, cfg.Storage.Root()
+	// The files of tables dropped while a request ran are reached with
+	// Igloo's own credentials.
+	opts.Storage = func(ctx context.Context, location string) (iceio.IO, error) {
+		return catalog.FS(ctx, cfg.Storage, location)
+	}
 	log := opts.Log
 	// The key that seals requests' identifiers is not in the metadata
 	// database. A replica without one keeps its requests in memory, where

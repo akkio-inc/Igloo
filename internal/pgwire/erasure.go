@@ -348,6 +348,8 @@ func (s *Server) runErasureCommand(ctx context.Context, sess *session, user auth
 		return pgerror.WithCode(fmt.Errorf("erasure request %s does not exist", c.id), codes.UndefinedObject)
 	case errors.Is(err, erasure.ErrBusy):
 		return pgerror.WithCode(err, codes.LockNotAvailable)
+	case errors.Is(err, erasure.ErrNotYet):
+		return pgerror.WithCode(err, codes.ObjectNotInPrerequisiteState)
 	case err != nil:
 		return err
 	}

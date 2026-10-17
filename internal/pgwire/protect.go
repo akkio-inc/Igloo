@@ -739,7 +739,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	// renamed table would escape erasure (see package erasure).
 	checked := false
 	ddl := t == duckdb.STATEMENT_TYPE_DROP || t == duckdb.STATEMENT_TYPE_ALTER || t == duckdb.STATEMENT_TYPE_CREATE
-	if (s.erasure != nil || snap.Classified()) && (ddl || propertyFunction.MatchString(query)) {
+	if (s.erasure != nil || snap.Classified()) && ddl {
 		ran, err := s.checkErasingDDL(ctx, sess, snap, t, query)
 		checked = checked || ran
 		if err != nil {
@@ -1111,85 +1111,6 @@ func (s *Server) checkAlterNames(ctx context.Context, sess *session, snap *polic
 // what follows ALTER TABLE's name, or in CREATE TABLE's options.
 var formatVersion = regexp.MustCompile(`(?i)format[-_]version`)
 
-// propertyFunction finds calls of set_iceberg_table_properties.
-var propertyFunction = regexp.MustCompile(`(?i)(?:\bset_iceberg_table_properties|"set_iceberg_table_properties")\s*\(`)
-
-// propertyCall is a call of set_iceberg_table_properties: the table its
-// first argument names, or nil if it names none Igloo can read, and the
-// properties it sets, if it gives them, and their values, as literals:
-// literal is false for a key or value computed, or bound as a parameter.
-type propertyCall struct {
-	table   []string
-	keys    []string
-	literal bool
-}
-
-// propertyCalls are query's calls of set_iceberg_table_properties.
-func propertyCalls(query string) []propertyCall {
-	var out []propertyCall
-	for _, m := range propertyFunction.FindAllStringIndex(query, -1) {
-		sc := &scanner{s: query, i: m[1]}
-		var c propertyCall
-		if name, ok := sc.name(); ok && sc.punct(',') {
-			c.table = name
-			c.keys, c.literal = sc.literalMap()
-			c.literal = c.literal && sc.punct(')')
-		}
-		out = append(out, c)
-	}
-	return out
-}
-
-// literalMap reads a map of literals, as {'key': 'value', ...} or MAP {...},
-// and returns its keys; ok is false for anything else.
-func (sc *scanner) literalMap() (keys []string, ok bool) {
-	sc.keywords("MAP")
-	if !sc.punct('{') {
-		return nil, false
-	}
-	if sc.punct('}') {
-		return nil, true
-	}
-	for {
-		k, ok := sc.literal()
-		if !ok || k == nil || !sc.punct(':') || !sc.literalValue() {
-			return nil, false
-		}
-		keys = append(keys, *k)
-		if sc.punct('}') {
-			return keys, true
-		}
-		if !sc.punct(',') {
-			return nil, false
-		}
-	}
-}
-
-// literalValue reads a string, a number, TRUE, FALSE or NULL.
-func (sc *scanner) literalValue() bool {
-	if _, ok := sc.literal(); ok {
-		return true
-	}
-	if sc.keywords("TRUE") || sc.keywords("FALSE") {
-		return true
-	}
-	sc.skip()
-	start := sc.i
-	if sc.i < len(sc.s) && (sc.s[sc.i] == '-' || sc.s[sc.i] == '+') {
-		sc.i++
-	}
-	digits := 0
-	for sc.i < len(sc.s) && (sc.s[sc.i] >= '0' && sc.s[sc.i] <= '9' || sc.s[sc.i] == '.') {
-		sc.i++
-		digits++
-	}
-	if digits == 0 {
-		sc.i = start
-		return false
-	}
-	return true
-}
-
 // catalogTarget is the catalog table a name written in a DDL statement
 // creates or drops, existing or not: as DuckDB resolves such a name, in
 // the session's current schema when it is not qualified. ok is false for a
@@ -1255,12 +1176,12 @@ func (s *Server) erasing(ctx context.Context, o auth.Object) (bool, error) {
 // from, or the schema that holds it; renaming it, or another table to its
 // name, which the request would take for it; upgrading it to Iceberg format
 // version 3 (ALTER TABLE, CREATE OR REPLACE TABLE), or creating a table of
-// version 3 under its name or a tagged table's; and setting properties of
-// it or of a tagged table, or of a table Igloo cannot tell, but by keys
-// and values written as literals, none of them format-version. The catalog
-// refuses version 3 too (see package catalog), but not every catalog
-// Igloo runs on does. It reports whether it ran statements on the
-// session's connection.
+// version 3 under its name or a tagged table's; and replacing it (CREATE
+// OR REPLACE TABLE), which drops it. Whatever a statement's text, the same
+// rules hold for every change it makes to the catalog, which Check sees
+// (see catalogguard.go), table properties set by set_iceberg_table_properties
+// included; the catalog refuses version 3 too (see package catalog). It
+// reports whether it ran statements on the session's connection.
 func (s *Server) checkErasingDDL(ctx context.Context, sess *session, snap *policy.Snapshot, t duckdb.StmtType, query string) (bool, error) {
 	ran := false
 	resolve := func(name []string) ([]auth.Object, error) {
@@ -1356,7 +1277,16 @@ func (s *Server) checkErasingDDL(ctx context.Context, sess *session, snap *polic
 		}
 		sc.keywords("IF", "NOT", "EXISTS")
 		name, ok := sc.name()
-		if !ok || !formatVersion.MatchString(sc.rest()) {
+		if !ok {
+			break
+		}
+		if replace {
+			// Replacing drops the table, as DROP TABLE does.
+			if err := refuse(name, "it cannot be replaced until the request is over"); err != nil {
+				return ran, err
+			}
+		}
+		if !formatVersion.MatchString(sc.rest()) {
 			break
 		}
 		objects, err := resolve(name)
@@ -1372,42 +1302,6 @@ func (s *Server) checkErasingDDL(ctx context.Context, sess *session, snap *polic
 				return ran, denied("%s has tags, or an erasure request erases from it; a table under its name stays at Iceberg format version 2, "+
 					"as erasure requests cannot rewrite tables of version 3 yet", o)
 			}
-		}
-	}
-	for _, c := range propertyCalls(query) {
-		version := slices.ContainsFunc(c.keys, func(k string) bool { return formatVersion.MatchString(k) })
-		if c.literal && !version {
-			continue
-		}
-		protected := c.table == nil
-		var target auth.Object
-		if c.table != nil {
-			objects, err := resolve(c.table)
-			if err != nil {
-				return ran, err
-			}
-			for _, o := range objects {
-				erasing, err := s.erasing(ctx, o)
-				if err != nil {
-					return ran, err
-				}
-				if erasing || snap.Tagged(o.Schema, o.Table) != nil {
-					protected, target = true, o
-					break
-				}
-			}
-		}
-		switch {
-		case !protected:
-		case c.table == nil:
-			return ran, denied("set_iceberg_table_properties must name its table directly, and its properties and values as literals, none of them format-version: " +
-				"Igloo checks that no table with tags, or that an erasure request erases from, changes its Iceberg format version")
-		case version:
-			return ran, denied("%s has tags, or an erasure request erases from it; it stays at Iceberg format version 2, "+
-				"as erasure requests cannot rewrite tables of version 3 yet", target)
-		default:
-			return ran, denied("%s has tags, or an erasure request erases from it: set_iceberg_table_properties must name its properties and values "+
-				"as literals, so that Igloo can tell that none changes its Iceberg format version", target)
 		}
 	}
 	return ran, nil

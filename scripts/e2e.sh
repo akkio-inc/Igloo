@@ -449,9 +449,16 @@ expect "leave every table in place" "4|3" igloo "$admin_password" \
    WHERE table_schema = 'renames' AND table_name IN ('t1', 't2', 't3', 't4')"
 
 echo "replace, views and comments"
+old_copy_files="$(psql_admin -c "SELECT string_agg(chr(39) || file_path || chr(39), ',') FROM iceberg_metadata(lake.public.e2e_copy)")"
+expect "the table's files are in the bucket" "t" igloo "$admin_password" \
+  "SELECT count(*) > 0 FROM glob('s3://$bucket/warehouse/**') WHERE file IN ($old_copy_files)"
 expect "writer replaces a table with a new schema" "CREATE TABLE" walt walt-password-1 \
   "CREATE OR REPLACE TABLE e2e_copy AS SELECT range AS n, chr(97 + range::INT) AS letter FROM range(3)"
 expect "replaced table has the new rows" "3|b" walt walt-password-1 "SELECT count(*), min(letter) FILTER (WHERE n = 1) FROM e2e_copy"
+# A table dropped, as the old one is, that no clone reads has its files
+# deleted with it: no table, and so no erasure request, reaches them.
+expect_soon "the replaced table's files go with it" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM glob('s3://$bucket/warehouse/**') WHERE file IN ($old_copy_files)" 120
 # In a transaction block, a change to the catalog commits the block first,
 # as in Snowflake; dbt builds tables so. Statement by statement, as psycopg2
 # sends them.
@@ -1090,9 +1097,13 @@ expect "writes after compaction" "INSERT 0 1
 echo "clones, branches and tags"
 psql_admin -c "CREATE SCHEMA dev" >/dev/null
 # The tables that have data files: a clone adds none, as it has no files
-# of its own until it is written to.
-tables_with_data="SELECT count(DISTINCT regexp_extract(file, '^(.*)/data/', 1)) FROM glob('s3://$bucket/warehouse/**/*.parquet')"
-data_tables="$(psql_admin -c "$tables_with_data")"
+# of its own until it is written to. (Tables dropped earlier can lose
+# theirs meanwhile, as the catalog purges them.)
+data_dirs="$(psql_admin -c "SELECT string_agg(DISTINCT chr(39) || regexp_extract(file, '^(.*)/data/', 1) || chr(39), ',')
+  FROM glob('s3://$bucket/warehouse/**/*.parquet')")"
+tables_with_data="SELECT count(DISTINCT regexp_extract(file, '^(.*)/data/', 1)) FROM glob('s3://$bucket/warehouse/**/*.parquet')
+  WHERE regexp_extract(file, '^(.*)/data/', 1) NOT IN ($data_dirs)"
+data_tables=0
 expect "clone a table" "CREATE TABLE" walt walt-password-1 "CREATE TABLE dev.lineitem CLONE lineitem"
 expect "the clone has every row" "600572" walt walt-password-1 "SELECT count(*) FROM dev.lineitem"
 expect "it reads the source's files" "t" igloo "$admin_password" \

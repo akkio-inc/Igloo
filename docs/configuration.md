@@ -134,7 +134,7 @@ other OpenLineage endpoint.
 | `IGLOO_CATALOG_WAREHOUSE` | `igloo` | Warehouse name in the catalog |
 | `IGLOO_CATALOG_NAME` | `lake` | Catalog name in SQL (`lake.public.events`) |
 | `IGLOO_CATALOG_SCHEMA` | `public` | Default schema for unqualified table names |
-| `IGLOO_CATALOG_SETUP` | `true` | On start, bootstrap the Lakekeeper catalog and create the warehouse if it does not exist. Safe with several replicas. |
+| `IGLOO_CATALOG_SETUP` | `true` | On start, bootstrap the Lakekeeper catalog, create the warehouse if it does not exist, and limit it to Iceberg format versions 1 and 2, which [erasure requests](privacy.md) can rewrite. Safe with several replicas. `false` does none of it, and logs a warning that the format-version limit is then the operator's to set. |
 
 ## Storage
 

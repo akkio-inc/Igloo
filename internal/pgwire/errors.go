@@ -37,6 +37,9 @@ func codedError(err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return pgerror.WithCode(err, codes.QueryCanceled)
 	}
+	if refused := catalogRefusal(err); refused != err {
+		return refused
+	}
 
 	var de *duckdb.Error
 	if !errors.As(err, &de) {

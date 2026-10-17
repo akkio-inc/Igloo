@@ -133,6 +133,13 @@ type Options struct {
 	// format version 3, by anyone, until it is, whether its columns have
 	// tags or not.
 	Erasing func(ctx context.Context, o auth.Object) (bool, error)
+	// StorageRoot is the root of the warehouse's storage, under which
+	// tables dropped are purged when no clone reads their files (see
+	// clones.go), and Exists reports whether a file under it is in
+	// storage: a commit that adds a snapshot whose manifest list there is
+	// not is refused. Without them, neither happens.
+	StorageRoot string
+	Exists      func(ctx context.Context, path string) (bool, error)
 	// TLS says whether requests arrive over TLS. Without it, only clients
 	// on private networks are served, since tokens, passwords and storage
 	// credentials cross the connection.

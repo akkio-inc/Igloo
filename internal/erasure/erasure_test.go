@@ -63,6 +63,9 @@ func (c *testCatalog) local(p string) string {
 
 func localFS(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
 
+// localStorage is the warehouse's storage (Options.Storage).
+func localStorage(context.Context, string) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+
 // fs is the file IO of table name.
 func (c *testCatalog) fs(name string) func(context.Context) (iceio.IO, error) {
 	if fsys, ok := c.io[name]; ok {
@@ -453,7 +456,7 @@ func TestErasure(t *testing.T) {
 	cache := &readCache{}
 	svc := New(Options{
 		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng, Key: testKey, CatalogName: "lake", Warehouse: warehouse,
-		History: []History{queries, loads}, Lineage: queries,
+		Storage: localStorage, History: []History{queries, loads}, Lineage: queries,
 		Purger: NewPurger(store, cache, MemoryCache+"test", "test", slog.New(slog.DiscardHandler)),
 		Rows: testRows{
 			"crm.people": iceberg.NewOr(iceberg.EqualTo(iceberg.Reference("email"), storedEmail),

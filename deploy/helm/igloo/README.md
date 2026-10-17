@@ -165,7 +165,12 @@ pass for each cloud.
   the page cache, which counts against the container.
 - **Startup**: on first start Igloo waits up to 3 minutes for PostgreSQL and
   the catalog, then bootstraps Lakekeeper and creates the warehouse; the
-  startup probe allows 5 minutes.
+  startup probe allows 5 minutes. On every start it also limits the
+  warehouse to Iceberg format versions 1 and 2, which [erasure
+  requests](../../../docs/privacy.md) can rewrite. With
+  `IGLOO_CATALOG_SETUP=false` (in `extraEnv`) it does neither and logs a
+  warning: set the warehouse's format-version policy in Lakekeeper
+  yourself.
 - **Scaling**: `replicaCount`, or `autoscaling.enabled` for a CPU-based HPA,
   and `scaleToZero.enabled` to stop igloo pods when idle (see
   [below](#scale-to-zero)). Replicas prefer different nodes.
@@ -183,7 +188,13 @@ pass for each cloud.
   credentials the Iceberg REST catalog hands them need
   `networkPolicy.objectStorageFrom`. With scale to zero, those ports apply to
   the gateway, and igloo's ports accept only the gateway. Egress is not
-  restricted.
+  restricted. Lakekeeper has no authentication: its management API, which
+  can lift the warehouse's limit on format versions, and its Iceberg REST
+  API, which does not check what Igloo checks, are closed to everyone but
+  igloo pods only by this policy. Keep it on, on a CNI that enforces
+  NetworkPolicies; otherwise any pod in the cluster can change the
+  catalog without Igloo, and what [erasure
+  requests](../../../docs/privacy.md) rely on no longer holds.
 - **Other engines**: Spark, Trino, PyIceberg and others use Igloo's tables
   through its [Iceberg REST catalog](../../../docs/external-engines.md) on
   port 8181 of the SQL Service (`iceberg.enabled`). On AWS, set
