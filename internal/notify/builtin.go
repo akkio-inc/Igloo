@@ -105,6 +105,21 @@ func (s *Service) RunEnded(j tasks.Job, r tasks.Run) {
 	})
 }
 
+// ErasureFailed raises failed_runs for an erasure request that failed for
+// good: it will not run again, and someone must make it again once what
+// err says is fixed. err holds no identifier.
+func (s *Service) ErasureFailed(id, step, err string) {
+	s.emit(event{
+		builtin: BuiltinFailedRuns, key: "failed_runs/erasure-failed/" + id, repeat: repeatFailedRun,
+		msg: Message{
+			Title: "Igloo: an erasure request failed for good",
+			Body: []Part{Text("The erasure request "), Value(id), Text(" failed at its " + step + " step and will not run again: "),
+				Value(err), Text(". What it erased stays erased; make the request again once this is fixed.")},
+			Details: map[string]string{"kind": "erasure", "name": id, "step": step, "error": err},
+		},
+	})
+}
+
 // LoadFailed raises load_errors for a COPY INTO, or a pipe's, that could not
 // load some files: failed of total, the first with firstError.
 func (s *Service) LoadFailed(table, user, pipe string, failed, total int, file, firstError string) {

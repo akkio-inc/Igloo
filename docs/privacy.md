@@ -154,7 +154,8 @@ hour. A request fails for good (`failed`) when its runs fail 10 times in a
 row, as when matching rows keep arriving faster than it removes them, when
 verification sends it back more than five times, or when the erasure key
 changed: it stops, forgets its identifiers, logs `erasure request failed`
-at error level, raises an alert, and counts in
+at error level, raises the built-in alert `FAILED_RUNS`
+([alerts](alerts.md#built-in-operational-alerts)), and counts in
 `igloo_erasure_requests_failed_total`. What it erased stays erased; fix
 what `error` says and make the request again.
 
@@ -172,7 +173,8 @@ make them, are found by their manifests, and their columns named like the
 tagged ones count as tagged.
 
 While a request deletes files, it holds the locks that making a clone of
-one of its tables takes, so no clone is made meanwhile; while one is being
+one of its tables takes (`CREATE TABLE ... CLONE`, see
+[SQL](sql.md#clones)), so no clone is made meanwhile; while one is being
 made, the request tries again later. A clone made after the request began
 is added to it. If a table the request does not erase from references a
 file it would delete, the request stops with an error that names the table
@@ -257,7 +259,7 @@ erasure request rewrite them.
 
 A retention is at least a day. Admins set and remove data retentions of any
 table, holders of `ERASE` of tables with tagged columns; everyone may list
-them. They are kept with policies and tags, stay with a table's name, and
+those of the tables they may see. They are kept with policies and tags, stay with a table's name, and
 renaming such a table is refused.
 
 ## What it does not cover

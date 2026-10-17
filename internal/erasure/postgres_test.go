@@ -2,7 +2,6 @@ package erasure
 
 import (
 	"context"
-	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -10,11 +9,12 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 func testDatabase(t *testing.T) string {
 	t.Helper()
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}
@@ -23,7 +23,7 @@ func testDatabase(t *testing.T) string {
 
 func TestStores(t *testing.T) {
 	stores := map[string]Store{"memory": NewMemoryStore()}
-	if url := os.Getenv("IGLOO_TEST_DATABASE_URL"); url != "" {
+	if url := testdb.URL(); url != "" {
 		pg, err := OpenPostgres(context.Background(), url)
 		if err != nil {
 			t.Fatal(err)

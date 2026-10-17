@@ -16,6 +16,8 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 
+	"github.com/akkio-inc/igloo/internal/clone"
+	"github.com/akkio-inc/igloo/internal/clone/clonetest"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -60,8 +62,8 @@ func (c *testCatalog) clone(t *testing.T, dir string, src *table.Table, name str
 			props[k] = v
 		}
 	}
-	props[sharesProperty] = string(shares)
-	props[sourceProperty] = tableName(src.Identifier())
+	props[clone.SharesProperty] = string(shares)
+	props[clone.SourceProperty] = tableName(src.Identifier())
 	set("table-uuid", id.String())
 	set("location", location)
 	set("properties", props)
@@ -265,5 +267,63 @@ func TestErasureClones(t *testing.T) {
 			t.Errorf("%s has %d rows, want %d", name, rows.NumRows(), want)
 		}
 		rows.Release()
+	}
+}
+
+// A clone made by package clone, as CREATE TABLE ... CLONE makes one, is
+// erased from with its source, while the request holds the clone locks:
+// the bytes go from the files of both.
+func TestErasureWithZeroCopyClones(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	eng := newEngine(t)
+	cat := clonetest.New(dir)
+	people, err := cat.Create(table.Identifier{"crm", "people"}, peopleSchema,
+		iceberg.Properties{table.WriteDeleteModeKey: table.WriteModeMergeOnRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendRows(t, people, ann, subject, carl)
+	locks := clone.NewMemoryStore()
+	log := slog.New(slog.DiscardHandler)
+	if _, err := clone.NewManager(cat, locks, log).Clone(ctx, clone.Request{
+		Source: table.Identifier{"crm", "people"}, Target: table.Identifier{"dev", "people"}}); err != nil {
+		t.Fatal(err)
+	}
+	appendRows(t, cat.Load(t, "dev", "people"), []any{int64(7), storedEmail, "dev-z", "the clone's own"})
+
+	policies := policy.NewMemoryStore()
+	err = policies.Update(ctx, func(c *policy.Catalog) error {
+		now := time.Now()
+		if err := c.PutTag(policy.Tag{Name: "pii"}, false, now); err != nil {
+			return err
+		}
+		return c.SetColumnTag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Tag: "pii", Value: "email"}, now)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMemoryStore()
+	svc := New(Options{Store: store, Catalog: cat, Policies: policies.Load, Engine: eng, Key: testKey, CatalogName: "lake",
+		Warehouse: dir + "/", Locks: locks, Rows: testRows{}})
+	r, err := svc.Submit(ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = svc.Run(ctx, r.ID)
+	got, _ := store.Get(ctx, r.ID)
+	if got.Status != StatusCompleted {
+		t.Fatalf("status %s at %s, error %q", got.Status, got.Step, got.Error)
+	}
+	if !slices.ContainsFunc(got.Tables, func(t Table) bool { return t.Name == "dev.people" && t.Reason == "a clone of crm.people" }) {
+		t.Errorf("tables: %+v", got.Tables)
+	}
+	for _, name := range [][2]string{{"crm", "people"}, {"dev", "people"}} {
+		if ids := clonetest.IDs(t, cat.Load(t, name[0], name[1])); !slices.Equal(ids, []int64{1, 3}) {
+			t.Errorf("%s.%s: %v", name[0], name[1], ids)
+		}
+	}
+	if found := search(t, eng, dir, []string{storedEmail}); len(found) > 0 {
+		t.Errorf("identifiers left in storage:\n%s", strings.Join(found, "\n"))
 	}
 }

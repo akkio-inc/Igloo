@@ -79,6 +79,7 @@ func TestBuiltinAlerts(t *testing.T) {
 	s.LoadFailed("lake.raw.dsp", "walt", "dsp_drops", 2, 5, "s3://landing/dsp/bad.csv", "unterminated quote")
 	s.LoginsBlocked("eve", true, 10, 15*time.Minute)
 	s.MaintenanceFailed("raw.dsp", errors.New("compact: 503 Slow Down"))
+	s.ErasureFailed("01a14588", "rewrite", "matching rows keep arriving in crm.events")
 	drain(ctx, s)
 
 	got := payloads(t, rc)
@@ -89,7 +90,7 @@ func TestBuiltinAlerts(t *testing.T) {
 			t.Errorf("type %v", p["type"])
 		}
 	}
-	if want := "failed_runs,load_errors,maintenance_failures,failed_logins"; strings.Join(names, ",") != want {
+	if want := "failed_runs,load_errors,maintenance_failures,failed_runs,failed_logins"; strings.Join(names, ",") != want {
 		t.Errorf("sent %v, want %s", names, want)
 	}
 	if len(got) > 0 {
@@ -122,7 +123,7 @@ func TestBuiltinAlerts(t *testing.T) {
 	s.pending.Wait()
 	s.check(ctx)
 	s.pending.Wait()
-	got = payloads(t, rc)[4:]
+	got = payloads(t, rc)[5:]
 	names = nil
 	for _, p := range got {
 		names = append(names, p["name"].(string))
@@ -142,7 +143,7 @@ func TestBuiltinAlerts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recs) != 6 || recs[0].Type != RecordBuiltin || recs[0].State != StateTriggered || recs[0].Integration != "ops" {
+	if len(recs) != 7 || recs[0].Type != RecordBuiltin || recs[0].State != StateTriggered || recs[0].Integration != "ops" {
 		t.Errorf("history: %+v", recs)
 	}
 	if recs, _ := store.Records(ctx, audit.Viewer{User: "walt"}, audit.Page{}); len(recs) != 0 {

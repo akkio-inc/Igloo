@@ -474,8 +474,9 @@ events are logged at info level or above: `login`, `login failed`,
 (tasks, pipes, materialized views and alerts created, changed or dropped),
 `notification integration changed`, `erasure requested`, `erasure request
 completed`, `erasure request held`, `erasure request confirmed`, `erasure
-request canceled`, `erasure request failed`, `data retention changed`, `statement denied`, `statement
-canceled` (from the web console's compute page), and refused connections.
+request canceled`, `erasure request failed`, `data retention changed`,
+`statement denied`, `statement canceled` (from the web console's compute
+page), and refused connections.
 Failed scheduled runs log `scheduled run failed` (component `tasks`), and
 notifications that could not be sent `notification failed` (component
 `notifications`), with the integration's host, never its URL. Sign-ins

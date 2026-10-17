@@ -81,14 +81,18 @@ type Options struct {
 	// once.
 	Purger *Purger
 	// Locks, if set, are the locks of tables' locations that making a
-	// zero-copy clone holds (clone.Store is one), which a request holds
-	// while it deletes files: a clone made meanwhile could reference one.
+	// zero-copy clone holds (clone.Store), which a request holds while it
+	// deletes files: a clone made meanwhile could reference one.
 	Locks Locks
 	// Rows deletes and counts rows. Nil means statements in DuckDB on the
 	// catalog's tables.
 	Rows    Rows
 	Metrics *Metrics
-	Log     *slog.Logger
+	// Failed, if set, is told about a request that failed for good, which
+	// someone must make again: its ID, the step it stopped at, and why,
+	// without identifiers. It must not block.
+	Failed func(id, step, err string)
+	Log    *slog.Logger
 }
 
 // Service accepts and carries out erasure requests.
@@ -446,6 +450,9 @@ func (s *Service) failed(ctx context.Context, r *Request, err error) {
 		r.Status = StatusFailed
 		s.end(ctx, r)
 		s.opts.Metrics.countFailed()
+		if s.opts.Failed != nil {
+			s.opts.Failed(r.ID, r.Step, r.Error)
+		}
 		s.log.Error("erasure request failed; what it erased stays erased, but it will not go on: make a new request once the cause is fixed",
 			"request", r.ID, "step", r.Step, "failures", r.Failures, "err", r.Error)
 		return

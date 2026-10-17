@@ -19,6 +19,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"gocloud.dev/gcerrors"
 
+	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -229,20 +230,12 @@ func rowCount(tbl *table.Table) int64 {
 	return max(n-d, 0)
 }
 
-// Properties of a zero-copy clone (see package clone): sharesProperty
-// lists, as a JSON array, the locations of other tables whose files its
-// metadata may reference, the table it was cloned from and those that one
-// shares files with in turn; sourceProperty names the table it was cloned
-// from, and stays once it references none of that table's files.
-const (
-	sharesProperty = "igloo.clone.shares-files-of"
-	sourceProperty = "igloo.clone.source"
-)
-
-// shares are the locations whose files tbl says it may reference.
+// shares are the locations whose files tbl, a zero-copy clone, says it may
+// reference: the table it was cloned from, and those that one shares files
+// with in turn (see package clone).
 func shares(tbl *table.Table) []string {
 	var locs []string
-	if v := tbl.Properties()[sharesProperty]; v != "" {
+	if v := tbl.Properties()[clone.SharesProperty]; v != "" {
 		_ = json.Unmarshal([]byte(v), &locs)
 	}
 	for i, l := range locs {
@@ -285,7 +278,7 @@ func (s *Service) others(ctx context.Context, ours map[string]bool) ([]*table.Ta
 // go: zero-copy clones of them, the tables they are clones of, and so on.
 // A clone says what it was made from and shares, and its columns are the
 // source's, by field ID; a clone that no longer shares files still holds
-// copies of its source's rows. Tables that reference another's files
+// copies of its source's rows, and still names its source. Tables that reference another's files
 // without saying so are found by their manifests, among those with a
 // column named like a tagged one, and their columns of those names are
 // taken to hold the same.
@@ -327,10 +320,10 @@ func (s *Service) related(ctx context.Context, src loaded, other *table.Table, r
 	t := &Table{Name: name, Ident: other.Identifier(), UUID: other.Metadata().TableUUID().String()}
 	srcLoc, otherLoc := strings.TrimRight(src.tbl.Location(), "/"), strings.TrimRight(other.Location(), "/")
 	switch {
-	case slices.Contains(shares(other), srcLoc) || strings.EqualFold(other.Properties()[sourceProperty], src.t.Name):
+	case slices.Contains(shares(other), srcLoc) || strings.EqualFold(other.Properties()[clone.SourceProperty], src.t.Name):
 		t.Columns, t.Reason = sameFields(src, other), "a clone of "+src.t.Name
 		return t, nil
-	case slices.Contains(shares(src.tbl), otherLoc) || strings.EqualFold(src.tbl.Properties()[sourceProperty], name):
+	case slices.Contains(shares(src.tbl), otherLoc) || strings.EqualFold(src.tbl.Properties()[clone.SourceProperty], name):
 		t.Columns, t.Reason = sameFields(src, other), src.t.Name+" is a clone of it"
 		return t, nil
 	}

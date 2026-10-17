@@ -583,6 +583,8 @@ func TestFailures(t *testing.T) {
 	lease.Release()
 
 	f.svc.rows = failingRows{}
+	var alerts []string
+	f.svc.opts.Failed = func(id, step, err string) { alerts = append(alerts, id+" "+step+": "+err) }
 	now := time.Now()
 	f.svc.now = func() time.Time { return now }
 	var waits []time.Duration
@@ -600,6 +602,9 @@ func TestFailures(t *testing.T) {
 	got, _ := f.store.Get(f.ctx, r.ID)
 	if got.Status != StatusFailed || got.Sealed != "" || got.Salt != "" || testutil.ToFloat64(f.metrics.failed) != 1 {
 		t.Errorf("failed: %+v", got)
+	}
+	if len(alerts) != 1 || !strings.HasPrefix(alerts[0], r.ID+" delete: ") || strings.Contains(alerts[0], "subject@") {
+		t.Errorf("alerts: %q", alerts)
 	}
 	if err := f.svc.Run(f.ctx, r.ID); err != nil {
 		t.Errorf("a run of a failed request: %v", err)

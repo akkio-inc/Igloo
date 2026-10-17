@@ -167,10 +167,11 @@ func serve() error {
 	}
 
 	var (
-		cat     *catalog.Client
-		objects *ddl.Manager
-		clones  *clone.Manager
-		guard   *clone.Guard
+		cat        *catalog.Client
+		objects    *ddl.Manager
+		clones     *clone.Manager
+		guard      *clone.Guard
+		cloneStore clone.Store
 	)
 	if cfg.Catalog.URI != "" {
 		if cat, err = catalog.Open(startCtx, cfg); err != nil {
@@ -181,8 +182,7 @@ func serve() error {
 		}
 		defer objects.Close() //nolint:errcheck
 		go objects.Run(ctx)
-		cloneStore, err := openCloneStore(startCtx, cfg)
-		if err != nil {
+		if cloneStore, err = openCloneStore(startCtx, cfg); err != nil {
 			return err
 		}
 		defer cloneStore.Close()
@@ -313,7 +313,14 @@ func serve() error {
 			return err
 		}
 		defer erasureStore.Close()
-		if eraser, err = newEraser(cfg, erasureStore, purger, cat, eng, policies, historyStore, taskStore, jobs, reg, log); err != nil {
+		// Requests hold the locks of tables' locations that making a clone
+		// takes while they delete files, and a request that fails for good
+		// raises the built-in alert for failed runs.
+		eraser, err = newEraser(cfg, erasure.Options{
+			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
+			Locks: cloneStore, Failed: notifier.ErasureFailed, Metrics: erasure.NewMetrics(reg), Log: log,
+		}, historyStore, taskStore)
+		if err != nil {
 			return err
 		}
 		// Every replica drops what requests delete from its read cache,
@@ -703,14 +710,9 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 // newEraser sets up erasure requests. They redact the query history and
 // the load and task history, so both stores must be able to: a store that
 // cannot would keep identifiers the request is meant to erase.
-func newEraser(cfg config.Config, store erasure.Store, purger *erasure.Purger, cat *catalog.Client, eng *engine.Engine,
-	policies policy.Store, history audit.Store, taskStore tasks.Store, jobs *tasks.Scheduler, reg prometheus.Registerer,
-	log *slog.Logger) (*erasure.Service, error) {
-	opts := erasure.Options{
-		Store: store, Catalog: cat, Policies: policies.Load, Engine: eng,
-		CatalogName: cfg.Catalog.Name, Schema: cfg.Catalog.Schema, Warehouse: cfg.Storage.Root(),
-		Jobs: jobs, Purger: purger, Metrics: erasure.NewMetrics(reg), Log: log,
-	}
+func newEraser(cfg config.Config, opts erasure.Options, history audit.Store, taskStore tasks.Store) (*erasure.Service, error) {
+	opts.CatalogName, opts.Schema, opts.Warehouse = cfg.Catalog.Name, cfg.Catalog.Schema, cfg.Storage.Root()
+	log := opts.Log
 	// The key that seals requests' identifiers is not in the metadata
 	// database. A replica without one keeps its requests in memory, where
 	// a key of its own does.
