@@ -393,7 +393,13 @@ for i in $(seq 1 10); do
   pids+=($!)
 done
 ok=0
-for pid in "${pids[@]}"; do wait "$pid" && ok=$((ok + 1)); done
+for i in "${!pids[@]}"; do
+  if wait "${pids[$i]}"; then
+    ok=$((ok + 1))
+  else
+    echo "  insert $((i + 1)) failed: $(tr '\n' ' ' <"$work/insert-$((i + 1)).out" | cut -c1-300)"
+  fi
+done
 expect "10 concurrent inserts all commit" "10" igloo "$admin_password" "SELECT count(*) FROM contended"
 
 echo "replace, views and comments"
