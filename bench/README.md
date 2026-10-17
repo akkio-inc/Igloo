@@ -149,7 +149,7 @@ and Databricks 2X-Small), Igloo is 3.2x faster and 16x cheaper per warm run
 than Gen1 X-Small, 2.2x and 15x than Gen2 X-Small, and 2.2x and 10x than
 Databricks 2X-Small; at scale 10 it was 6.8x and 35x against Gen1 X-Small,
 4.3x and 30x against Gen2 X-Small, and 5.4x and 26x against Databricks
-2X-Small. No pairing at scale 100 is both 5x faster and 25x cheaper; the
+2X-Small. No pairing at scale 100 is both 5x faster and 30x cheaper; the
 nearest is c7g.16xlarge against Snowflake Gen1 Medium (4.8x, 25x).
 Snowflake and Databricks gain little beyond Large: X-Large cuts the warm
 run by 14% (Snowflake Gen1), 17% (Gen2) and 2% (Databricks) for twice the
