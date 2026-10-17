@@ -53,7 +53,9 @@ check "the release's own Deployment is the default pool" "|\"true\"" \
   "$(env_of Deployment igloo IGLOO_POOL)|$(env_of Deployment igloo IGLOO_MAINTENANCE)"
 check "a pool's gateway scales the pool's Deployment" '"igloo-pool-acme"|"igloo-pool-acme-server:5432"' \
   "$(env_of Deployment igloo-pool-acme-gateway IGLOO_GATEWAY_K8S_DEPLOYMENT)|$(env_of Deployment igloo-pool-acme-gateway IGLOO_GATEWAY_BACKEND)"
-check "and only it" 'resourceNames: ["igloo-pool-acme"]' "$(doc Role igloo-pool-acme-gateway | grep -o 'resourceNames: .*')"
+# The names the gateway may scale, whether the list is written inline or one per line.
+check "and only it" '"igloo-pool-acme"' \
+  "$(doc Role igloo-pool-acme-gateway | sed -n '/resourceNames:/,/verbs:/p' | grep -v 'verbs:' | grep -o '"[^"]*"' | tr '\n' ' ' | sed 's/ $//')"
 check "a pool's Service leads to its gateway" "app.kubernetes.io/component: pool-acme-gateway" \
   "$(doc Service igloo-pool-acme | sed -n '/^  selector:/,/^  ports:/p' | grep -o 'app.kubernetes.io/component: .*')"
 check "a pool's Service has its own type" "  type: LoadBalancer" "$(doc Service igloo-pool-reporting | grep -E '^  type:')"
