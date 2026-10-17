@@ -185,7 +185,14 @@ explicit transactions, the coordinator plans it:
    a conservative rate for compressed Parquet from object storage), or a
    minute plus the expected start time when no worker is running, since
    started workers then run until idle. There is no threshold to tune; a
-   session can force the decision with `SET distributed_execution`.
+   session can force the decision with `SET distributed_execution`. Forced
+   by an admin, a statement may start workers and uses every one; forced
+   by anyone else, it uses only workers already running, no more than the
+   tables' sizes call for, so no user can start or occupy the fleet at
+   will. A part without aggregates is distributed only when it keeps few
+   rows (`DISTINCT`, or `ORDER BY ... LIMIT` up to a million rows); a plain
+   filter would only send every matching row through the coordinator's
+   disk.
 4. **Rewrite** the part into a worker fragment and a combine step:
 
    ```sql
@@ -344,10 +351,17 @@ result's columns must match the prepared statement's, or it falls back.
 
 ### Failures, cancellation and limits
 
-- A task that fails for any reason other than its data (connection lost,
-  worker stopped, out of memory) runs on another worker, up to three
-  tries; the failed worker is left out for 30 seconds. TCP keepalives
-  detect a worker whose machine vanished within about 25 seconds.
+- A task whose worker cannot be reached, breaks off its answer or fails as
+  a server (HTTP 5xx) runs on another worker, up to three tries, and the
+  worker is left out for 30 seconds. TCP keepalives detect a worker whose
+  machine vanished within about 25 seconds.
+- A worker that answers a task with an error (out of memory, a binder
+  error) ran it and is healthy, and another would answer the same: the
+  statement runs on the coordinator at once, and no worker is left out, so
+  one user's failing statement cannot take workers away from everyone.
+- Partial results wait on the coordinator's disk until every task has
+  answered; past 1 GiB for a statement, it stops its tasks and runs on the
+  coordinator.
 - If no worker can run a part, or the combine step fails before sending a
   row, the statement runs on the coordinator as usual
   (`igloo_distributed_fallbacks_total`).
@@ -378,9 +392,12 @@ Workers belong to one compute pool. Pools exist so that a client's queries
 do not compete with another's and its compute is billed to it; shared
 workers would undo both. So the chart gives each pool a worker Deployment
 of its own, which only its igloo pods reach (NetworkPolicy) and start, and
-which its gateway stops; the secret is shared, since the network policy,
-not the secret, separates pools. Docker Compose's example pool runs without
-workers.
+which its gateway stops, and a worker secret of its own, so that a pool's
+igloo pods cannot use another pool's workers even where the network lets
+them: the NetworkPolicy is defence in depth, effective only where the CNI
+enforces it. Docker Compose isolates no containers from each other; its
+example pool runs without workers, and gives its own a secret of their own
+if added.
 
 ## Partitioned joins
 
@@ -585,6 +602,15 @@ reports the cost per query on the EC2 runs.
   round-trip check catches printing that changes the tree, but a printer bug
   that keeps the tree yet changes meaning would not be caught. The
   differential tests are the guard.
+- **Exchanged rows at rest.** A partitioned join writes the columns it
+  joins on and reads, of rows that passed its filters, as plain Parquet
+  under `_igloo_shuffle/` in the warehouse, for the length of the
+  statement (and until a lifecycle rule expires them, if the coordinator
+  crashed). They are as protected as the tables' own files, by bucket
+  access and server-side encryption, and the Iceberg REST catalog vends no
+  credentials that reach them; encrypting them with a per-statement key
+  would protect them from holders of the warehouse's storage keys, who can
+  read the tables anyway.
 - **Deletes.** Tables with position deletes, equality deletes or deletion
   vectors run on one machine until maintenance merges them (hourly).
   Applying position deletes on workers is straightforward future work.

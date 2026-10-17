@@ -221,7 +221,8 @@ of a pool use that pool's workers and no other's, so one client's large
 statements never take another's workers, and a pool's workers stop with it.
 The chart gives every pool workers of its own while `workers.enabled` is
 set (a pool can set `workers` to change them, or `workers.enabled: false`
-to have none); in Docker Compose the example pool runs without workers. The
+to have none), each pool's with a secret of its own; in Docker Compose the
+example pool runs without workers. The
 history records a distributed statement with the pool of the replica that
 ran it, like any other; the workers' own machines are not in
 `igloo.usage`'s costs yet.

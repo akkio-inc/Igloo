@@ -195,7 +195,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   a table at the same snapshot as the workers.
 - Distributed statements count against their users' role limits and
   timeouts like any other. Workers belong to one compute pool: the chart
-  gives each pool its own.
+  gives each pool its own, with a secret of its own.
+- `SET distributed_execution = on` starts workers only for admins; for
+  other users it uses running workers, no more than a statement's size
+  calls for. A worker that answers with an error is never set aside, and a
+  statement whose partial results would pass 1 GiB of the coordinator's
+  disk, or that only filters rows, runs on the coordinator.
 - `igloo.query_history` has a `workers` column; `igloo_distributed_*` and
   `igloo_worker_*` metrics report statements, fallbacks, tasks and workers.
 

@@ -44,8 +44,10 @@ partial results; the coordinator combines them (sums of sums, counts of
 counts, minimums of minimums, and aggregates over `DISTINCT` values over the
 values the workers found) and runs the rest of the statement: `HAVING`,
 `ORDER BY`, `LIMIT`, window functions over the aggregates, other joins and
-subqueries. Selective queries without aggregation (`WHERE` filters, `ORDER
-BY ... LIMIT`) are divided the same way.
+subqueries. Queries without aggregation are divided the same way when they
+keep few rows: `SELECT DISTINCT`, and `ORDER BY ... LIMIT` of up to a
+million rows. A plain `SELECT ... WHERE` is not: every matching row would
+cross to the coordinator and wait on its disk before reaching the client.
 
 When the large table is joined to a second table too large for every
 worker to read (impressions to an identity graph, exposures to
@@ -125,6 +127,12 @@ SET distributed_execution = 'auto';  -- the default; RESET does the same
 SHOW distributed_execution;
 ```
 
+`on` lets admins start workers and use all of them for any statement. For
+other users it distributes whatever can be distributed, but only on
+workers already running and on no more of them than the automatic decision
+would use for the tables' sizes; it never starts a worker. So no user can
+start a fleet of machines, or keep one busy, by repeating a query.
+
 ## Same results as one machine
 
 Workers run the same DuckDB as the coordinator, on the same snapshot of
@@ -149,10 +157,14 @@ does a statement whose coordinator part reads a view, which could read a
 table at another snapshot. Tables may share files, as clones do: workers
 read the files the metadata lists, wherever they lie in the warehouse.
 
-If a worker fails or stops in the middle of a statement, its share runs on
-another worker. If no worker can run it, or the parts cannot be combined,
-the statement runs on the coordinator instead, so a client sees a slower
-statement, not an error. An error in the data itself, such as a failed cast
+If a worker cannot be reached or stops in the middle of a statement, its
+share runs on another worker, and the failed worker is left out for 30
+seconds. A worker that answers a task with an error ran it and is healthy:
+the statement then runs on the coordinator at once, without trying other
+workers or leaving any out. If no worker can run it, its partial results
+would take more than 1 GiB of the coordinator's disk, or the parts cannot
+be combined, the statement also runs on the coordinator, so a client sees a
+slower statement, not an error. An error in the data itself, such as a failed cast
 or a division by zero, is the statement's error, as it would be on one
 machine. Canceling a statement (`Ctrl-C`, `statement_timeout`) cancels its
 parts on the workers.
@@ -186,9 +198,24 @@ parts on the workers.
   not publish it. Workers' port 8080 serves only health checks and metrics,
   like the server's.
 - **What crosses the network.** Tasks carry the statement's SQL fragments
-  and file lists; results carry aggregated or filtered rows, encrypted.
+  and file lists, and results carry aggregated or filtered rows, over TLS.
   Partial results live in the spill directories of the workers and the
   coordinator while a statement runs, and are deleted when it ends.
+- **What partitioned joins leave in object storage.** The rows a
+  partitioned join exchanges are Parquet files, not encrypted by Igloo,
+  under `_igloo_shuffle/` in the warehouse, deleted when the statement ends.
+  They are protected as the tables' own files are: by access to the bucket
+  and its server-side encryption. No credentials the Iceberg REST catalog
+  hands out reach `_igloo_shuffle/`. Add a lifecycle rule that expires
+  `_igloo_shuffle/` after a day, for what a coordinator that crashed
+  mid-statement leaves behind.
+- **Pools are kept apart by secret and network.** Each compute pool's
+  workers have a secret of their own (the Helm chart generates one per
+  pool), so one pool's igloo pods cannot use another's workers; the
+  NetworkPolicy keeps them apart too, and is only as good as the cluster's
+  CNI enforcing it: with several pools, use one that does. Docker Compose
+  has no network isolation between its containers; give a pool's workers
+  their own `IGLOO_WORKER_SECRET`.
 
 ## Seeing it
 
@@ -238,6 +265,21 @@ the warehouse location and object storage credentials (the same
 settings as the server), `IGLOO_WORKER_SECRET`, a spill directory and,
 ideally, a disk for the [read cache](operations.md#read-cache). They need no
 catalog, database or users.
+
+Every deployment with workers needs a lifecycle rule on the warehouse's
+bucket that expires `_igloo_shuffle/` under the warehouse after a day:
+statements delete what their partitioned joins exchanged there, but not a
+coordinator that crashed mid-statement. On S3, for a warehouse at
+`s3://bucket/warehouse`:
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket bucket --lifecycle-configuration \
+  '{"Rules": [{"ID": "igloo-shuffle", "Status": "Enabled", "Filter": {"Prefix": "warehouse/_igloo_shuffle/"}, "Expiration": {"Days": 1}}]}'
+```
+
+(`mc ilm rule add --prefix warehouse/_igloo_shuffle/ --expire-days 1` on
+MinIO; an object lifecycle rule with `matchesPrefix` on Google Cloud
+Storage, a lifecycle management rule with `prefixMatch` on Azure.)
 
 ### Kubernetes
 
@@ -339,8 +381,8 @@ machine's memory run where that machine would run out of memory.
 - Partitioned joins write the columns they use to object storage and read
   them back: that costs request charges and adds a few seconds, and
   leftovers of a coordinator that crashed mid-statement stay under
-  `_igloo_shuffle/` (a lifecycle rule that expires it after a day cleans
-  them up).
+  `_igloo_shuffle/` until a lifecycle rule expires them, which every
+  deployment with workers needs.
 - The coordinator receives every partial result. A `GROUP BY` with billions
   of groups, or `count(DISTINCT x)` over billions of values, sends them all
   to it.

@@ -185,7 +185,9 @@ got="$(psql_as nora nora-password-1 -c "SET distributed_execution = 'on'" \
   -c "SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1 ORDER BY 1" | grep -v '^SET$' | head -1)"
 if [[ "$got" == A\|* ]]; then pass "a granted table runs distributed"; else fail "granted table: $got"; fi
 sleep 2
-expect "the history shows it ran on workers" "$workers" \
+# She is no admin: forcing it uses running workers only, as many as the
+# table's size calls for, one here.
+expect "the history shows it ran on one worker" "1" \
   "SELECT workers FROM igloo.query_history WHERE user_name = 'nora' AND query_text LIKE 'SELECT l_returnflag%' ORDER BY start_time DESC LIMIT 1"
 got="$(psql_as nora nora-password-1 -c "SET distributed_execution = 'on'" \
   -c "SELECT count(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey" || true)"

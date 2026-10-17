@@ -357,10 +357,22 @@ reference for every setting mentioned here.
   (HKDF-SHA256, Ed25519) and refuse a peer that does not prove it holds it
   (compared in constant time); there is no plain-text mode, on private
   networks either. Protect the secret like the object storage keys, since a
-  holder can make workers read any table's files. The task port is not
-  published in Docker Compose, and in Kubernetes a NetworkPolicy admits only
-  the igloo pods of the workers' own [compute pool](docs/workload-management.md#compute-pools);
-  workers' port 8080 serves health checks and metrics only, as above.
+  holder can make workers read any table's files. Each
+  [compute pool](docs/workload-management.md#compute-pools) has a secret
+  of its own (the Helm chart generates one per pool). The task port is not
+  published in Docker Compose, whose containers are not isolated from each
+  other; in Kubernetes a NetworkPolicy admits only the igloo pods of the
+  workers' own pool, which needs a CNI that enforces it. Workers' port 8080
+  serves health checks and metrics only, to pods of the namespace unless
+  `networkPolicy.metricsFrom` says otherwise. `SET distributed_execution =
+  on` starts workers only for admins; for others it uses workers already
+  running, no more than a statement's size calls for. A worker that answers
+  with an error is not set aside, so no statement can take workers out of
+  use for others. Partitioned joins exchange rows as Parquet files under
+  `_igloo_shuffle/` in the warehouse, not encrypted by Igloo but protected
+  by bucket access and server-side encryption like table files; the Iceberg
+  REST catalog never vends credentials that reach them, and a lifecycle
+  rule should expire them after a day.
 - **Web console.** Port 8443 serves the [web console](docs/console.md). Users
   sign in with their Igloo password, checked against the same SCRAM verifier,
   with the same failed-login delay, limits and logging as SQL logins, or
