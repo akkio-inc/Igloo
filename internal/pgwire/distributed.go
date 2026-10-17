@@ -90,7 +90,12 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		return 0, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
-	plan, err := s.dist.Plan(ctx, st.query, env, sess.mode())
+	mode := sess.mode()
+	if mode == distributed.ModeOn && user.Role != auth.RoleAdmin {
+		// Only admins start workers at will, or take every running one.
+		mode = distributed.ModeOnRunning
+	}
+	plan, err := s.dist.Plan(ctx, st.query, env, mode)
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, true, ctx.Err()

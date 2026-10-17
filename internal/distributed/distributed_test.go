@@ -67,10 +67,10 @@ func TestShapes(t *testing.T) {
 		`SELECT count(*) FROM lineitem l WHERE EXISTS (SELECT 1 FROM supplier s WHERE s.s_suppkey = l.l_suppkey AND s.s_acctbal > 5000)`,
 		`SELECT s.n, sum(s.q) FROM (SELECT n_name AS n, l_quantity AS q FROM lineitem, supplier, nation WHERE l_suppkey = s_suppkey AND s_nationkey = n_nationkey) AS s GROUP BY 1 ORDER BY 1`,
 		// Rows: filters, top-N, DISTINCT.
-		`SELECT l_orderkey, l_linenumber, l_comment FROM lineitem WHERE l_quantity = 50 AND l_discount = 0.1`,
+		`SELECT l_orderkey, l_linenumber, l_comment FROM lineitem WHERE l_quantity = 50 AND l_discount = 0.1 ORDER BY 1, 2 LIMIT 40`,
 		`SELECT l_orderkey, l_linenumber, l_extendedprice FROM lineitem ORDER BY l_extendedprice DESC, l_orderkey, l_linenumber LIMIT 7`,
 		`SELECT * FROM lineitem ORDER BY l_extendedprice DESC, l_orderkey, l_linenumber LIMIT 3 OFFSET 2`,
-		`SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey, l_linenumber`,
+		`SELECT DISTINCT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey`,
 		`SELECT DISTINCT l_shipmode FROM lineitem`,
 		// Time functions every machine must agree on.
 		`SELECT count(*) FROM lineitem WHERE l_shipdate < current_date AND l_commitdate < now()`,
@@ -198,7 +198,7 @@ func TestSchemaEvolution(t *testing.T) {
 
 	for _, q := range []string{
 		`SELECT count(*), count(added), sum(k), min(name), max(name), sum(added) FROM evolved`,
-		`SELECT k, name, added FROM evolved WHERE k % 250 = 0 ORDER BY k`,
+		`SELECT k, name, added FROM evolved WHERE k % 250 = 0 ORDER BY k LIMIT 100`,
 		`SELECT left(name, 1) AS f, count(*), count(added) FROM evolved GROUP BY 1 ORDER BY 1`,
 	} {
 		t.Run(short(q), func(t *testing.T) {
@@ -311,6 +311,10 @@ func TestLocal(t *testing.T) {
 		`SELECT count(*) FROM part LEFT JOIN lineitem ON p_partkey = l_partkey`,
 		`SELECT * FROM lineitem LIMIT 5`,
 		`SELECT l_quantity FROM lineitem`,
+		// Rows without DISTINCT or a top-N would only cross the coordinator's
+		// disk on their way to the client.
+		`SELECT l_orderkey, l_comment FROM lineitem WHERE l_quantity = 50`,
+		`SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey`,
 		`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`,
 		`SELECT string_agg(l_comment, ',' ORDER BY l_comment) FROM lineitem`,
 		`SELECT count(*) FROM lineitem, range(3)`,

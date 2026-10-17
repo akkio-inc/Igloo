@@ -90,15 +90,18 @@ func TestDistributedPolicies(t *testing.T) {
 		}
 	}
 
-	// Tables without policies still run on workers, for everyone.
+	// Tables without policies still run on workers, for everyone: forced by
+	// an admin, on every worker; by anyone else, on as many as the table's
+	// size calls for (one here).
 	orders := "SELECT amount, count(*) FROM lake.public.orders GROUP BY amount"
 	for _, c := range []struct {
-		conn *pgx.Conn
-		user string
-	}{{rita, "rita"}, {ds.admin, "igloo"}} {
+		conn    *pgx.Conn
+		user    string
+		workers int
+	}{{rita, "rita", 1}, {ds.admin, "igloo", 3}} {
 		expectAllowed(t, c.conn, orders)
-		if q := lastQuery(t, ds.catalogServer, c.user, orders); q.Workers != 3 {
-			t.Errorf("%s's statement over a table without policies: %d workers", c.user, q.Workers)
+		if q := lastQuery(t, ds.catalogServer, c.user, orders); q.Workers != c.workers {
+			t.Errorf("%s's statement over a table without policies: %d workers, want %d", c.user, q.Workers, c.workers)
 		}
 	}
 
@@ -142,7 +145,7 @@ func TestDistributedCustomGrants(t *testing.T) {
 	expectAllowed(t, nina, orders)
 	expectAllowed(t, nils, leads)
 	for user, query := range map[string][2]string{"nina": {orders, "lake.public.orders"}, "nils": {leads, "lake.sales.leads"}} {
-		if q := lastQuery(t, ds.catalogServer, user, query[0]); q.Workers != 3 || strings.Join(q.TablesRead, ",") != query[1] {
+		if q := lastQuery(t, ds.catalogServer, user, query[0]); q.Workers != 1 || strings.Join(q.TablesRead, ",") != query[1] {
 			t.Errorf("%s's granted table: %d workers, read %q", user, q.Workers, q.TablesRead)
 		}
 	}
@@ -280,8 +283,9 @@ func TestDistributedWorkload(t *testing.T) {
 	mustExec(t, bea, "SET query_tag = 'client:acme'")
 	query := "SELECT amount, count(*) AS n FROM orders GROUP BY amount"
 
-	// The workers hold bea's tasks; meanwhile her statement holds the
-	// role's one slot and her memory reservation.
+	// The workers hold bea's task (one: she is no admin, and the table is
+	// small); meanwhile her statement holds the role's one slot and her
+	// memory reservation.
 	release := ds.gate.hold()
 	var wg sync.WaitGroup
 	var beaErr error
@@ -291,7 +295,7 @@ func TestDistributedWorkload(t *testing.T) {
 		_, beaErr = bea.Exec(ctx, query)
 	}()
 	deadline := time.Now().Add(20 * time.Second)
-	for waiting, _ := ds.gate.counts(); waiting < 2 && time.Now().Before(deadline); waiting, _ = ds.gate.counts() {
+	for waiting, _ := ds.gate.counts(); waiting < 1 && time.Now().Before(deadline); waiting, _ = ds.gate.counts() {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if n := ctl.Running("role batch"); n != 1 {
@@ -311,7 +315,7 @@ func TestDistributedWorkload(t *testing.T) {
 		t.Fatal(beaErr)
 	}
 	q := lastQuery(t, ds.catalogServer, "bea", query)
-	if q.Workers != 2 || q.Pool != "reporting" || q.QueryTag != "client:acme" || q.Outcome != audit.OutcomeOK {
+	if q.Workers != 1 || q.Pool != "reporting" || q.QueryTag != "client:acme" || q.Outcome != audit.OutcomeOK {
 		t.Errorf("bea's distributed statement: workers %d, pool %q, tag %q, %s", q.Workers, q.Pool, q.QueryTag, q.Outcome)
 	}
 	// What it read is worked out from the statement she sent, as for any
@@ -334,10 +338,10 @@ func TestDistributedWorkload(t *testing.T) {
 		t.Errorf("a distributed statement past its timeout: %v after %s", err, time.Since(start))
 	}
 	deadline = time.Now().Add(10 * time.Second)
-	for _, canceled := ds.gate.counts(); canceled < 2 && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
+	for _, canceled := ds.gate.counts(); canceled < 1 && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if waiting, canceled := ds.gate.counts(); waiting != 0 || canceled < 2 {
+	if waiting, canceled := ds.gate.counts(); waiting != 0 || canceled < 1 {
 		t.Errorf("after the timeout, %d tasks still wait and %d were canceled", waiting, canceled)
 	}
 	if n := ctl.Running("role batch"); n != 0 {

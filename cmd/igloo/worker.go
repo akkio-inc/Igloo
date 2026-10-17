@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,12 +91,9 @@ func serveWorker() error {
 			}
 			_, _ = fmt.Fprintln(rw, "ok")
 		})
+		// Coordinators learn whether a worker is busy from its status, on
+		// the TLS port; nothing here says so.
 		mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-		mux.HandleFunc("GET /activity", func(rw http.ResponseWriter, r *http.Request) {
-			running, idle := w.Activity()
-			rw.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(rw).Encode(map[string]any{"running": running, "idle_seconds": idle.Seconds()})
-		})
 		httpSrv = &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {

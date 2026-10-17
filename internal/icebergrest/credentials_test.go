@@ -134,6 +134,8 @@ func TestS3Vendor(t *testing.T) {
 	for _, loc := range []string{
 		"s3://other/wh/t", "s3://bucket/elsewhere/t", "s3://bucket/wh", "s3://bucket/wh/*", "s3://bucket/wh/a/../../x",
 		"s3://bucket/wh/${aws:username}", "s3://bucket/wh/t?x=1", "gs://bucket/wh/t", "s3://bucket/wh//t", "s3://bucket/wh/t%2A",
+		// Distributed execution's exchange, whatever a table's metadata says.
+		"s3://bucket/wh/_igloo_shuffle", "s3://bucket/wh/_igloo_shuffle/q1/0",
 	} {
 		if _, err := v.Vend(ctx, loc, ReadFiles, "nora"); !errors.Is(err, ErrNoCredentials) {
 			t.Errorf("%s: got %v", loc, err)

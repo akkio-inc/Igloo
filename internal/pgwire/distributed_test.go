@@ -376,7 +376,8 @@ func TestDistributedGrants(t *testing.T) {
 		t.Errorf("got %d groups", got)
 	}
 	expectAllowed(t, nina, query)
-	if n := lastWorkers(t, ds.history, query); n != 2 {
+	// Not an admin: as many workers as the table's size calls for.
+	if n := lastWorkers(t, ds.history, query); n != 1 {
 		t.Errorf("history shows %d workers for a granted table", n)
 	}
 	expectDenied(t, nina, "SELECT o.amount, count(*) FROM orders o JOIN secrets s ON o.id = s.id GROUP BY 1", "SELECT on table public.secrets")

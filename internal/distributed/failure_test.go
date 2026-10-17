@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -180,5 +181,173 @@ func TestWorkerReadsOnlyItsViews(t *testing.T) {
 		if err := run(sql); !IsUnsupported(err) {
 			t.Errorf("%s: want it refused, got %v", sql, err)
 		}
+	}
+}
+
+// A worker that answers a task with an error ran it and is healthy: the
+// statement goes back to the coordinator after that one answer, no worker
+// is set aside, and no other worker is asked. (One user's statement that
+// fails the same way everywhere must not take every worker out for
+// everyone.)
+func TestExecutionErrorKeepsWorkers(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 3)
+	if n := len(h.co.pool.ready(t.Context())); n != 3 {
+		t.Fatalf("%d workers ready before, want 3", n)
+	}
+	var asked atomic.Int32
+	for _, w := range h.workers {
+		w.beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
+			asked.Add(1)
+			w.fail(rw, http.StatusUnprocessableEntity, &taskErr{Message: "Binder Error: something", Type: int(duckdb.ErrorTypeBinder)})
+			return false
+		}
+	}
+	h.co.pool.refresh(t.Context())
+	q := `SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1`
+	for range 3 {
+		_, _, _, _, err := h.run(t.Context(), q, ModeOn)
+		if err == nil || IsUnsupported(err) || dataError(err) {
+			t.Fatalf("want an error that sends the statement to the coordinator, got %v", err)
+		}
+		var te *transportError
+		if errors.As(err, &te) {
+			t.Fatalf("an answered error taken for a transport failure: %v", err)
+		}
+	}
+	if n := len(h.co.pool.ready(t.Context())); n != 3 {
+		t.Errorf("%d workers usable after statements that failed on them, want 3", n)
+	}
+	// Each statement asked as many workers as it has tasks, once each.
+	if n := asked.Load(); n > 9 {
+		t.Errorf("%d tasks sent for three statements of three tasks", n)
+	}
+	// A worker that fails as a server is retried elsewhere and set aside.
+	for _, w := range h.workers {
+		w.beforeTask = nil
+	}
+	h.workers[0].beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
+		http.Error(rw, "boom", http.StatusServiceUnavailable)
+		return false
+	}
+	if !h.check(q) {
+		t.Fatal("did not run distributed")
+	}
+	if n := len(h.co.pool.ready(t.Context())); n != 2 {
+		t.Errorf("%d workers usable after one failed as a server, want 2", n)
+	}
+}
+
+// LIMIT and OFFSET past what workers could be asked for, or past what the
+// coordinator should keep, run on one machine.
+func TestLimitOverflow(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	for _, q := range []string{
+		`SELECT l_orderkey, l_linenumber FROM lineitem WHERE l_quantity > 10 ORDER BY l_orderkey, l_linenumber LIMIT 9223372036854775807 OFFSET 5`,
+		`SELECT l_orderkey FROM lineitem ORDER BY 1 LIMIT 2000000`,
+	} {
+		if _, _, _, _, err := h.run(t.Context(), q, ModeOn); !IsUnsupported(err) {
+			t.Errorf("%s: want it to run on one machine, got %v", q, err)
+		}
+	}
+	if n := len(h.co.pool.ready(t.Context())); n != 2 {
+		t.Errorf("%d workers usable, want 2", n)
+	}
+}
+
+// Partial results wait on the coordinator's disk until every worker has
+// answered; past the spool's limit the statement runs on the coordinator
+// instead, and a plain filtered SELECT, which would send every row through
+// that disk for nothing, is not distributed at all.
+func TestSpoolLimit(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	if _, err := h.co.Plan(t.Context(), `SELECT * FROM lineitem WHERE true`, harnessEnv{h}, ModeOn); !IsUnsupported(err) {
+		t.Errorf("a plain filtered SELECT: %v", err)
+	}
+	h.co.opts.MaxSpoolBytes = 64 << 10
+	defer func() { h.co.opts.MaxSpoolBytes = 0 }()
+	plan, err := h.co.Plan(t.Context(), `SELECT DISTINCT l_orderkey, l_comment FROM lineitem`, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex, err := h.co.Execute(t.Context(), plan, h.settings(t.Context()))
+	if !IsUnsupported(err) {
+		if ex != nil {
+			ex.Close()
+		}
+		t.Fatalf("partial results past the spool's limit: %v", err)
+	}
+	if n := len(h.co.pool.ready(t.Context())); n != 2 {
+		t.Errorf("%d workers usable, want 2", n)
+	}
+	// Small partial results fit.
+	if !h.check(`SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1 ORDER BY 1`) {
+		t.Error("did not run distributed")
+	}
+}
+
+// fakeCompute records the worker counts asked for.
+type fakeCompute struct{ asked atomic.Int32 }
+
+func (f *fakeCompute) Scale(context.Context, int) error { f.asked.Add(1); return nil }
+
+// Forced by a user other than an admin, a statement runs only on workers
+// already running, on no more of them than its tables' sizes call for, and
+// never starts any; forced by an admin, it may.
+func TestForcedByNonAdmins(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 3)
+	compute := &fakeCompute{}
+	var addrs []string
+	for _, ln := range h.lns {
+		addrs = append(addrs, ln.Addr().String())
+	}
+	co, err := NewCoordinator(Options{
+		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Threads: 2,
+		Pool: PoolOptions{Addresses: addrs, Compute: compute, MaxWorkers: 8, StartTimeout: time.Second},
+	}, h.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer co.Close()
+	q := `SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1`
+	run := func(mode Mode) (*Execution, error) {
+		plan, err := co.Plan(t.Context(), q, harnessEnv{h}, mode)
+		if err != nil {
+			return nil, err
+		}
+		ex, err := co.Execute(t.Context(), plan, h.settings(t.Context()))
+		if ex != nil {
+			ex.Close()
+		}
+		return ex, err
+	}
+	ex, err := run(ModeOnRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex.Workers != 1 || compute.asked.Load() != 0 {
+		t.Errorf("forced by a non-admin: %d workers, %d starts", ex.Workers, compute.asked.Load())
+	}
+	if _, err := run(ModeOn); err != nil {
+		t.Fatal(err)
+	}
+	if compute.asked.Load() == 0 {
+		t.Error("forced by an admin, no workers were asked for")
+	}
+	// With no worker running, a non-admin's forced statement does not wait
+	// for one.
+	for i := range h.workers {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		_ = h.workers[i].Shutdown(ctx)
+		cancel()
+		h.lns[i].Close()
+	}
+	co.pool.refresh(t.Context())
+	before := compute.asked.Load()
+	if _, err := co.Plan(t.Context(), q, harnessEnv{h}, ModeOnRunning); !IsUnsupported(err) {
+		t.Errorf("no workers running: %v", err)
+	}
+	if compute.asked.Load() != before {
+		t.Error("a non-admin's statement asked for workers")
 	}
 }

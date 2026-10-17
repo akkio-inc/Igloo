@@ -91,8 +91,11 @@ type Plan struct {
 	// final is the statement with each job's SELECT replaced by its combine
 	// step, which reads a placeholder table until the job has run.
 	final node
-	// force uses every worker, whatever the tables' sizes.
-	force bool
+	// force distributes whatever the tables' sizes; with mayStart it uses
+	// every worker, starting them if need be, and without it only workers
+	// running, as many as the sizes call for.
+	force    bool
+	mayStart bool
 	// pins are the coordinator's own reads, in final, of tables that jobs
 	// read: by the name as written (lower case, parts joined by NUL), the
 	// table's key. Execute points them at the snapshot the workers read.

@@ -281,7 +281,7 @@ const maxPartitions = 64
 // runPartitioned runs a partitioned job: the tables' rows are written to
 // object storage by partition, then one task per partition runs the
 // fragment.
-func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *Job, ws []*worker, files map[string][]File, settings []setting) (*jobResult, error) {
+func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *Job, ws []*worker, files map[string][]File, settings []setting, sp *spool) (*jobResult, error) {
 	parts := min(maxPartitions, max(2, 2*len(ws)))
 	root := co.opts.Warehouse + config.ShuffleDir + "/" + qid + "/" + strconv.Itoa(j.ID)
 	defer func() {
@@ -316,7 +316,7 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 				bytes += f.Size
 			}
 			g.Go(func() error {
-				_, head, err := co.dispatch(gctx, task, ws, i, "")
+				_, head, err := co.dispatch(gctx, task, ws, i, "", nil)
 				if err != nil {
 					return err
 				}
@@ -369,7 +369,7 @@ func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *J
 			SQL: j.Fragment, Columns: j.Columns, Views: views}
 		out := filepath.Join(dir, fmt.Sprintf("%d-%d.parquet", j.ID, p))
 		g.Go(func() error {
-			w, head, err := co.dispatch(gctx, task, ws, p%len(ws), out)
+			w, head, err := co.dispatch(gctx, task, ws, p%len(ws), out, sp)
 			if err != nil {
 				return err
 			}

@@ -249,7 +249,9 @@ func (p *pool) ensure(ctx context.Context, want int, wait bool) ([]*worker, erro
 	if !wait {
 		return ws, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, p.opts.StartTimeout)
+	// The deadline bounds the wait, not the checks: a check cut short by
+	// it would find no worker at all.
+	deadline, cancel := context.WithTimeout(ctx, p.opts.StartTimeout)
 	defer cancel()
 	for {
 		ws = p.usable(p.refresh(ctx))
@@ -260,9 +262,12 @@ func (p *pool) ensure(ctx context.Context, want int, wait bool) ([]*worker, erro
 			return ws, nil
 		}
 		select {
-		case <-ctx.Done():
+		case <-deadline.Done():
 			if len(ws) > 0 {
 				return ws, nil
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
 			return nil, errors.New("workers did not start in time")
 		case <-time.After(time.Second):

@@ -125,9 +125,6 @@ func (w *Worker) Serve(ln net.Listener) error {
 // done.
 func (w *Worker) Shutdown(ctx context.Context) error { return w.srv.Shutdown(ctx) }
 
-// Activity reports running tasks and how long the worker has been idle.
-func (w *Worker) Activity() (int64, time.Duration) { return w.activity.Snapshot() }
-
 func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")

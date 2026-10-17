@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -34,6 +35,11 @@ const (
 	ModeAuto Mode = "auto"
 	ModeOn   Mode = "on"
 	ModeOff  Mode = "off"
+	// ModeOnRunning is on for users other than admins: whenever a statement
+	// can, but only on workers already running and on no more of them than
+	// the automatic decision would use, so that no user can start workers
+	// or occupy them all at will.
+	ModeOnRunning Mode = "on, running workers only"
 )
 
 // ParseMode parses a mode.
@@ -82,6 +88,10 @@ type Options struct {
 	// long a statement would take on it.
 	Threads int
 	Metrics *Metrics
+	// MaxSpoolBytes bounds what a statement's partial results may take on
+	// the coordinator's disk; past it, the statement runs on the
+	// coordinator instead. Zero means 1 GiB.
+	MaxSpoolBytes int64
 }
 
 // Coordinator splits statements into parts that workers run.
@@ -182,10 +192,12 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if mode == ModeOff {
 		return nil, unsupported("distributed execution is off for this session")
 	}
-	opts := planOptions{force: mode == ModeOn, now: time.Now(), maxBroadcast: defaultBroadcast}
+	opts := planOptions{force: mode == ModeOn || mode == ModeOnRunning, now: time.Now(), maxBroadcast: defaultBroadcast}
 	ws := co.pool.known(ctx)
 	rate := int64(co.opts.Threads) * scanRatePerThread
 	switch {
+	case mode == ModeOnRunning && len(ws) == 0:
+		return nil, unsupported("no workers are running, and only admins may start them at will")
 	case len(ws) > 0:
 		opts.minBytes = rate * warmSeconds
 		mem := int64(0)
@@ -218,7 +230,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if err != nil {
 		return nil, err
 	}
-	plan.force = opts.force
+	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
 	return plan, nil
 }
 
@@ -262,16 +274,23 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}()
 
 	// As many workers as the largest job has gigabytes to divide, or
-	// every one when forced.
+	// every one when an admin forces it. Forced by anyone else, only
+	// workers already running, and no more than the gigabytes call for.
 	var split int64
 	for _, j := range plan.Jobs {
 		split = max(split, j.Split.Bytes)
 	}
 	want := int(max(1, (split+bytesPerWorker-1)/bytesPerWorker))
-	if plan.force {
-		want = max(want, co.opts.Pool.MaxWorkers, len(co.pool.ready(ctx)))
+	var ws []*worker
+	var err error
+	if plan.mayStart {
+		if plan.force {
+			want = max(want, co.opts.Pool.MaxWorkers, len(co.pool.ready(ctx)))
+		}
+		ws, err = co.pool.ensure(ctx, want, true)
+	} else {
+		ws = co.pool.ready(ctx)
 	}
-	ws, err := co.pool.ensure(ctx, want, true)
 	if err != nil || len(ws) == 0 {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -279,7 +298,15 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		return nil, errors.Join(ErrNoWorkers, err)
 	}
 	slices.SortFunc(ws, func(a, b *worker) int { return strings.Compare(a.status.ID, b.status.ID) })
+	if !plan.mayStart && len(ws) > want {
+		ws = ws[:want]
+	}
 	co.pool.touch()
+	limit := co.opts.MaxSpoolBytes
+	if limit <= 0 {
+		limit = defaultMaxSpool
+	}
+	sp := &spool{limit: limit}
 
 	// Each table's current snapshot and its files, once per statement, so
 	// the statement sees every commit made before it.
@@ -333,9 +360,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			var r *jobResult
 			var err error
 			if j.Partition != nil {
-				r, err = co.runPartitioned(gctx, qid, ex.dir, j, ws, files, settings)
+				r, err = co.runPartitioned(gctx, qid, ex.dir, j, ws, files, settings, sp)
 			} else {
-				r, err = co.runJob(gctx, qid, ex.dir, j, ws, files, settings, plan.force)
+				r, err = co.runJob(gctx, qid, ex.dir, j, ws, files, settings, plan.force, sp)
 			}
 			if err != nil {
 				return err
@@ -435,7 +462,7 @@ type jobResult struct {
 
 // runJob divides the job's split table among the workers and runs a task
 // for each share.
-func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws []*worker, files map[string][]File, settings []setting, force bool) (*jobResult, error) {
+func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws []*worker, files map[string][]File, settings []setting, force bool, sp *spool) (*jobResult, error) {
 	split := files[j.Split.key()]
 	n := len(ws)
 	if want := int((j.Split.Bytes + bytesPerWorker - 1) / bytesPerWorker); want < n && !force {
@@ -470,7 +497,7 @@ func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws [
 		}
 		path := filepath.Join(dir, fmt.Sprintf("%d-%d.parquet", j.ID, i))
 		g.Go(func() error {
-			w, head, err := co.dispatch(gctx, task, ws, i, path)
+			w, head, err := co.dispatch(gctx, task, ws, i, path, sp)
 			if err != nil {
 				return err
 			}
@@ -572,11 +599,14 @@ func assign(files []File, ws []*worker) [][]File {
 }
 
 // dispatch runs a task, first on worker first (an index into ws), then on
-// other workers if that fails for any reason other than the data. It
-// returns the worker that ran it. The result goes to path; a shuffle task
-// writes each attempt to a directory of its own, so the files of a failed
-// attempt are never read.
-func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*worker, first int, path string) (*worker, *taskResult, error) {
+// other workers if that one cannot be reached or stops answering. It
+// returns the worker that ran it. A worker that answers with an error ran
+// the task and is healthy, and another would answer the same: the error
+// ends the job, without setting anyone's worker aside, and the statement
+// runs on the coordinator unless the error is in its data. The result goes
+// to path, within sp; a shuffle task writes each attempt to a directory of
+// its own, so the files of a failed attempt are never read.
+func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*worker, first int, path string, sp *spool) (*worker, *taskResult, error) {
 	var last error
 	for attempt := range min(maxAttempts, len(ws)) {
 		t := *task
@@ -588,7 +618,7 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 			return nil, nil, err
 		}
 		w := ws[(first+attempt)%len(ws)]
-		head, err := co.fetch(ctx, w, body, path)
+		head, err := co.fetch(ctx, w, body, path, sp)
 		if err == nil {
 			co.opts.Metrics.task("ok")
 			return w, head, nil
@@ -600,7 +630,8 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 			// Every worker would refuse it.
 			return nil, nil, err
 		}
-		if dataError(err) {
+		var te *transportError
+		if !errors.As(err, &te) {
 			co.opts.Metrics.task("failed")
 			return nil, nil, err
 		}
@@ -613,8 +644,16 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 	return nil, nil, fmt.Errorf("task %d failed on every worker tried: %w", task.Task, last)
 }
 
-// fetch sends a task to a worker and writes its result to path.
-func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path string) (*taskResult, error) {
+// transportError is a worker that could not be reached, broke off its
+// answer or failed as a server (HTTP 5xx), rather than one that ran a task
+// and answered with its error.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
+// fetch sends a task to a worker and writes its result to path, within sp.
+func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path string, sp *spool) (*taskResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+w.addr+tasksPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -622,10 +661,13 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := co.pool.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &transportError{err}
 	}
 	defer resp.Body.Close() //nolint:errcheck
 	br := bufio.NewReaderSize(resp.Body, 1<<16)
+	if resp.StatusCode >= 500 {
+		return nil, &transportError{fmt.Errorf("worker answered %s", resp.Status)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		var res taskResult
 		if err := json.NewDecoder(io.LimitReader(br, 1<<20)).Decode(&res); err != nil || res.Error == nil {
@@ -641,7 +683,7 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 	}
 	line, err := br.ReadBytes('\n')
 	if err != nil {
-		return nil, fmt.Errorf("read result header: %w", err)
+		return nil, &transportError{fmt.Errorf("read result header: %w", err)}
 	}
 	var head taskResult
 	if err := json.Unmarshal(line, &head); err != nil {
@@ -655,15 +697,52 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 	if err != nil {
 		return nil, err
 	}
-	n, err := io.Copy(f, br)
+	src := &spoolReader{r: br, sp: sp}
+	n, err := io.Copy(f, src)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
-	if err != nil {
+	switch {
+	case err == nil:
+	case IsUnsupported(err):
+		return nil, err
+	case src.err != nil:
+		return nil, &transportError{fmt.Errorf("receive result: %w", err)}
+	default:
 		return nil, fmt.Errorf("receive result: %w", err)
 	}
 	co.opts.Metrics.receive(n)
 	return &head, nil
+}
+
+// spool bounds the disk a statement's partial results take on the
+// coordinator, where they wait until every worker has answered.
+type spool struct {
+	limit int64
+	used  atomic.Int64
+}
+
+// defaultMaxSpool is the spool of a statement when Options say nothing.
+const defaultMaxSpool = 1 << 30
+
+// spoolReader reads a worker's result into the spool, and fails, with an
+// error that sends the statement back to the coordinator, once the spool
+// is full. err is the error reading from the worker, if any.
+type spoolReader struct {
+	r   io.Reader
+	sp  *spool
+	err error
+}
+
+func (s *spoolReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.err = err
+	}
+	if s.sp != nil && s.sp.used.Add(int64(n)) > s.sp.limit {
+		return n, unsupported("its partial results would take more than %d MiB of the coordinator's disk", s.sp.limit>>20)
+	}
+	return n, err
 }
 
 // partials returns the table reference that reads a job's partial

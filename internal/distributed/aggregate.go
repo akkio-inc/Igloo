@@ -3,6 +3,7 @@ package distributed
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -740,8 +741,15 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	if limit != nil && order == nil {
 		return nil, unsupported("LIMIT without ORDER BY, which one machine answers fastest")
 	}
-	if child(sel, "where_clause") == nil && distinct == nil && limit == nil {
-		return nil, unsupported("reading every row of %s, which the coordinator would receive anyway", c.split.table)
+	if distinct == nil && limit == nil {
+		// Every matching row would cross to the coordinator and wait on its
+		// disk before the first reached the client: a hop, not a saving.
+		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.split.table)
+	}
+	if limit != nil {
+		if total, ok := limitRows(limit); ok && total > maxTopN {
+			return nil, unsupported("LIMIT and OFFSET of more than %d rows", maxTopN)
+		}
 	}
 
 	items := list(sel, "select_list")
@@ -830,7 +838,7 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 		if str(mod["type"]) == "LIMIT_MODIFIER" {
 			total, ok := limitRows(mod)
 			if !ok {
-				return nil, unsupported("LIMIT or OFFSET that is not a number")
+				return nil, unsupported("LIMIT or OFFSET that is not a number, or too large")
 			}
 			l, err := pl.p.expr(strconv.FormatInt(total, 10))
 			if err != nil {
@@ -907,12 +915,17 @@ func limitRows(mod node) (int64, bool) {
 	}
 	if o := child(mod, "offset"); o != nil {
 		n, ok := intConstant(o)
-		if !ok || n < 0 {
+		if !ok || n < 0 || n > math.MaxInt64-total {
+			// Past what workers could be asked for.
 			return 0, false
 		}
 		total += n
 	}
 	return total, true
 }
+
+// maxTopN bounds LIMIT plus OFFSET of a distributed top-N: each worker
+// sends up to that many rows, which the coordinator keeps on disk.
+const maxTopN = 1_000_000
 
 func jsonInt(i int) any { return json.Number(strconv.Itoa(i)) }

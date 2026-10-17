@@ -306,6 +306,15 @@ func (v *S3Vendor) tablePrefix(location string) (string, error) {
 	if v.root != "" && !strings.HasPrefix(key, v.root+"/") {
 		return "", fmt.Errorf("not under the warehouse prefix %s", v.root)
 	}
+	// Distributed execution's exchange holds rows of any table a statement
+	// joined; no table's credentials reach it.
+	shuffle := config.ShuffleDir
+	if v.root != "" {
+		shuffle = v.root + "/" + shuffle
+	}
+	if key == shuffle || strings.HasPrefix(key, shuffle+"/") {
+		return "", fmt.Errorf("%s is distributed execution's exchange", config.ShuffleDir)
+	}
 	return key, nil
 }
 
