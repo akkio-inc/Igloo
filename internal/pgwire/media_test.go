@@ -268,6 +268,62 @@ func TestSpatialSandbox(t *testing.T) {
 	}
 }
 
+// TestRowidFilters checks the filters on rowid that DuckDB 1.5.6 cannot plan
+// with the spatial extension loaded (see rowidFilterFailure), on a DuckDB
+// table, as a server without a catalog has, on a temporary table and through
+// a view: the client is told what to write instead, the session carries on,
+// and the filters on rowid that DuckDB can plan still work. (Iceberg tables
+// have no rowid.) If DuckDB plans the failing ones, it has the fix: drop
+// rowidFilterFailure and check their rows here instead.
+func TestRowidFilters(t *testing.T) {
+	cs, _ := mediaServer(t)
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.events AS SELECT range AS id FROM range(1000)")
+	mustExec(t, cs.admin, "CREATE VIEW lake.public.even_events AS SELECT * FROM lake.public.events WHERE rowid % 2 = 0")
+	ctx := context.Background()
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			conn := cs.testServer.admin(t, mode)
+			mustExec(t, conn, "CREATE TEMP TABLE scratch AS SELECT range AS id FROM range(1000)")
+			for _, table := range []string{"lake.public.events", "scratch"} {
+				for filter, want := range map[string]int64{"rowid < 10": 10, "rowid IN (1, 2, 3)": 3} {
+					q := "SELECT count(*) FROM " + table + " WHERE " + filter
+					var got int64
+					if err := conn.QueryRow(ctx, q).Scan(&got); err != nil || got != want {
+						t.Errorf("%s: %d, %v; want %d", q, got, err, want)
+					}
+				}
+				for _, q := range []string{
+					"SELECT count(*) FROM " + table + " WHERE rowid % 3 = 0",
+					"SELECT id FROM " + table + " WHERE hash(rowid) % 3 = 0",
+				} {
+					expectRowidFilterError(t, conn, q)
+				}
+			}
+			expectRowidFilterError(t, conn, "SELECT count(*) FROM lake.public.even_events")
+			var one int
+			if err := conn.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil {
+				t.Errorf("the session after the errors: %v", err)
+			}
+		})
+	}
+}
+
+func expectRowidFilterError(t *testing.T, conn *pgx.Conn, q string) {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), q)
+	if err == nil {
+		for rows.Next() {
+		}
+		err = rows.Err()
+		rows.Close()
+	}
+	if pgCode(err) != "0A000" || !strings.Contains(err.Error(), "Compare rowid only with constants") {
+		t.Errorf("%s: want 0A000 saying what to write instead, got %v", q, err)
+	} else if strings.Contains(err.Error(), "Stack Trace") {
+		t.Errorf("%s: the error shows DuckDB's stack trace: %v", q, err)
+	}
+}
+
 // writeShapefile writes a shapefile of one point, at base.shp, .shx and
 // .dbf, with a text attribute name.
 func writeShapefile(t *testing.T, base, name string) {

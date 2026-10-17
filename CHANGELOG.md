@@ -106,7 +106,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   platforms and days; geometries, points in polygons and distances
   (spatial), with geometries sent to clients as WKT; and the H3 grid (h3).
   See docs/media-analytics.md for reach, overlap and frequency examples and
-  DuckDB's approximate, statistical and time zone functions.
+  DuckDB's approximate, statistical and time zone functions. With spatial
+  loaded, DuckDB 1.5.6 cannot plan some filters on a temporary table's
+  `rowid`, such as `rowid % 3 = 0`; they fail with SQLSTATE 0A000 and what
+  to write instead, not DuckDB's internal error and stack trace.
 - Connections to PostgreSQL and MySQL databases (`CREATE`, `ALTER`, `DROP`
   and `SHOW CONNECTIONS`): each replica attaches them read-only as catalogs
   of their own, such as `crm.public.customers`, which queries join with

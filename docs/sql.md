@@ -695,6 +695,13 @@ the same users and grants; see [other engines](external-engines.md).
   are refused for everyone too: GDAL opens files that a dataset names
   outside the sandbox. `ST_ReadSHP`, `ST_ReadOSM` and GeoParquet work; see
   [media analytics](media-analytics.md#loading-boundaries).
+- Temporary tables have DuckDB's `rowid` (Iceberg tables do not), but some
+  filters on it, such as `rowid % 3 = 0` or `hash(rowid) % 3 = 0`, fail with
+  SQLSTATE `0A000`, in views too: with the spatial extension loaded, DuckDB
+  1.5.6 cannot plan a filter that reads only `rowid` unless it compares it
+  with constants. `rowid < 1000`, `rowid BETWEEN 10 AND 20` and
+  `rowid IN (1, 2)` work. To split a table into parts, filter on its own
+  columns, as in `hash(id) % 3 = 0`.
 - `ALTER ROLE ... SET` and `ALTER USER ... SET` take Igloo's
   [workload settings](#query-tags-and-role-settings) only, not other
   PostgreSQL parameters. `SET query_tag` and Snowflake's `ALTER SESSION SET
