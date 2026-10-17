@@ -489,9 +489,11 @@ ALTER TABLE events DROP BRANCH audit;
   prepared, through the table's grants and policies. `AT (BRANCH => ...)`
   and `AT (TAG => ...)` follow a table's name, or its alias, in `FROM` or
   `JOIN`.
-- Branches and tags made in Igloo are kept until they are dropped. Table
-  maintenance keeps the snapshot each names, and a branch's history within
-  the snapshot retention.
+- Branches and tags are kept until they are dropped, however old, unless
+  a ref's own `max-ref-age-ms` or the table's
+  `history.expire.max-ref-age-ms` says otherwise. Table maintenance keeps
+  the snapshot each names, with the files it reads, a clone's included, and
+  a branch's history within the snapshot retention.
 - Making, moving and dropping them needs the writer role or `CREATE` on the
   table's schema; `SHOW BRANCHES` needs `SELECT` on the table. `main` cannot
   be dropped.

@@ -74,6 +74,18 @@ the layout.
   table that sets `commit.retry.num-retries` (for another engine) cannot make
   it duplicate rows.
 
+One more keeps table maintenance (`internal/maintenance`) from dropping
+branches and tags:
+
+- `table/transaction.go`, `ExpireSnapshots`: a `WithMaxRefAge` option
+  sets the age at which refs other than main are removed, for refs that do
+  not set their own. iceberg-go otherwise removes every ref whose snapshot
+  is older than `WithOlderThan`'s age, so expiring snapshots older than
+  seven days dropped all tags and branches older than that; Java's Iceberg
+  removes refs only by `history.expire.max-ref-age-ms`, forever by default.
+  Maintenance passes that property, which iceberg-go itself reads under
+  another name.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults and
 no longer needs an MPL-licensed dependency.

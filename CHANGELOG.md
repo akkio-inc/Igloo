@@ -49,6 +49,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   reading them with `AT (BRANCH => ...)` and `AT (TAG => ...)`, and `ALTER
   TABLE ... FAST FORWARD main TO branch`. Branches are read-only in Igloo,
   as DuckDB writes only to `main`; tags keep their snapshots from expiring.
+  Table maintenance keeps branches and tags until they are dropped, or as
+  long as their own or the table's `history.expire.max-ref-age-ms` says, as
+  Java's Iceberg does: iceberg-go dropped every one older than the snapshot
+  retention, seven days by default, a clone's too. A max-ref-age-ms of
+  Java's `Long.MAX_VALUE` reads as forever.
 
 ### Loading and scheduling
 

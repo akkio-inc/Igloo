@@ -42,6 +42,7 @@ import (
 const (
 	maxSnapshotAgeProperty     = "history.expire.max-snapshot-age-ms"
 	minSnapshotsToKeepProperty = "history.expire.min-snapshots-to-keep"
+	maxRefAgeProperty          = "history.expire.max-ref-age-ms"
 )
 
 const (
@@ -608,9 +609,20 @@ func (m *Maintainer) expire(ctx context.Context, tbl *table.Table, log *slog.Log
 
 	before := len(tbl.Metadata().Snapshots())
 	tx := tbl.NewTransaction()
-	// iceberg-go would delete the files itself, a clone's included and
-	// those of its source that a clone references.
-	if err := tx.ExpireSnapshots(table.WithOlderThan(maxAge), table.WithRetainLast(minKeep), table.WithPostCommit(false)); err != nil {
+	// Branches and tags are kept, with the snapshots they point at, as
+	// long as their own max-ref-age-ms or the table's
+	// history.expire.max-ref-age-ms says, forever by default, as Java's
+	// Iceberg keeps them: a tag is someone's reference point, such as an
+	// audit's, and a branch can hold unpublished writes. iceberg-go would
+	// otherwise drop every ref older than the snapshot retention. It would
+	// also delete the files itself, a clone's included and those of its
+	// source that a clone references.
+	refAge := time.Duration(math.MaxInt64)
+	if ms, err := strconv.ParseInt(tbl.Properties()[maxRefAgeProperty], 10, 64); err == nil && ms > 0 {
+		refAge = millis(ms)
+	}
+	if err := tx.ExpireSnapshots(table.WithOlderThan(maxAge), table.WithRetainLast(minKeep), table.WithMaxRefAge(refAge),
+		table.WithPostCommit(false)); err != nil {
 		return tbl, nil, err
 	}
 	// Without retry: on a conflict the rebuild could reintroduce replaced

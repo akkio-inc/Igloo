@@ -493,7 +493,10 @@ tables itself, so nobody has to schedule anything. Every hour
 2. **Snapshot expiry.** Snapshots older than `IGLOO_SNAPSHOT_RETENTION`
    (7 days by default) are removed, always keeping the current one, and the
    files that only they referenced are deleted. Files that compaction
-   replaced stay until the snapshots that read them expire.
+   replaced stay until the snapshots that read them expire. Branches and
+   tags stay, with the snapshots they name and the files those read, until
+   they are dropped, or for as long as their own `max-ref-age-ms` or the
+   table's `history.expire.max-ref-age-ms` says, as in Java's Iceberg.
 3. **Orphan file cleanup**, once a day per table. Files under the table's
    location that no snapshot references and that are more than 3 days old,
    such as the leftovers of failed writes, are deleted.

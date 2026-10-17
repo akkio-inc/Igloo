@@ -234,6 +234,7 @@ func (t *Transaction) UpdateSchema(caseSensitive bool, allowIncompatibleChanges 
 type expireSnapshotsCfg struct {
 	minSnapshotsToKeep *int
 	maxSnapshotAgeMs   *int64
+	maxRefAgeMs        *int64
 	postCommit         bool
 }
 
@@ -249,6 +250,16 @@ func WithOlderThan(t time.Duration) ExpireSnapshotsOpt {
 	return func(cfg *expireSnapshotsCfg) {
 		n := t.Milliseconds()
 		cfg.maxSnapshotAgeMs = &n
+	}
+}
+
+// WithMaxRefAge sets how old the snapshot a branch or tag other than main
+// points at may be before the ref is removed, for refs that do not set
+// their own. Without it, refs are removed by WithOlderThan's age.
+func WithMaxRefAge(t time.Duration) ExpireSnapshotsOpt {
+	return func(cfg *expireSnapshotsCfg) {
+		n := t.Milliseconds()
+		cfg.maxRefAgeMs = &n
 	}
 }
 
@@ -300,7 +311,7 @@ func (t *Transaction) ExpireSnapshots(opts ...ExpireSnapshotsOpt) error {
 			return err
 		}
 
-		maxRefAgeMs := cmp.Or(ref.MaxRefAgeMs, cfg.maxSnapshotAgeMs, &propMaxRefAgeMs)
+		maxRefAgeMs := cmp.Or(ref.MaxRefAgeMs, cfg.maxRefAgeMs, cfg.maxSnapshotAgeMs, &propMaxRefAgeMs)
 
 		refAge := nowMs - snap.TimestampMs
 		if refAge > *maxRefAgeMs && refName != MainBranch {
