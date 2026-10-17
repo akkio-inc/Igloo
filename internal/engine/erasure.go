@@ -33,6 +33,17 @@ func (e *Engine) SetErasure(list func(context.Context) ([]*erasure.Request, erro
 	e.erasure.Store(&erasureConfig{list: list, viewer: viewer})
 }
 
+// erasureViewer returns whether the statement prepared with ctx may list
+// erasure requests, asked when it runs: admins and holders of ERASE.
+func (e *Engine) erasureViewer(ctx context.Context) func() bool {
+	if c := e.erasure.Load(); c != nil && c.viewer != nil {
+		if v := c.viewer(ctx); v != nil {
+			return v
+		}
+	}
+	return func() bool { return false }
+}
+
 // registerErasure defines igloo_erasure_requests() and the view
 // igloo.erasure_requests over it: one row per request, with JSON columns
 // for what it did where, and no identifiers.
@@ -62,14 +73,7 @@ func (e *Engine) registerErasure(ctx context.Context) error {
 	}
 	err = duckdb.RegisterTableUDF(conn, "igloo_erasure_requests", duckdb.RowTableFunction{
 		BindArgumentsContext: func(ctx context.Context, _ map[string]any, _ ...any) (duckdb.RowTableSource, error) {
-			c := e.erasure.Load()
-			allowed := func() bool { return false }
-			if c != nil && c.viewer != nil {
-				if v := c.viewer(ctx); v != nil {
-					allowed = v
-				}
-			}
-			return &erasureSource{columns: columns, config: c, allowed: allowed}, nil
+			return &erasureSource{columns: columns, config: e.erasure.Load(), allowed: e.erasureViewer(ctx)}, nil
 		},
 	})
 	if err != nil {

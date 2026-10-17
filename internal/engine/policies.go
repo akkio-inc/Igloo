@@ -114,20 +114,24 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 	}
 	err = duckdb.RegisterTableUDF(conn, "igloo_data_retention", duckdb.RowTableFunction{
 		BindArgumentsContext: func(ctx context.Context, _ map[string]any, _ ...any) (duckdb.RowTableSource, error) {
-			source := e.catalogSource(ctx)
+			source, mayErase := e.catalogSource(ctx), e.erasureViewer(ctx)
 			return &lazySource{
 				columns: []duckdb.ColumnInfo{
 					column("table_catalog", varchar), column("table_schema", varchar), column("table_name", varchar),
 					column("data_retention_days", bigint), column("set_by", varchar), column("set_at", timestamp),
 				},
+				// Those of the tables the user may see; all of them to
+				// whoever may set them: privacy officers set them on
+				// tables they may not read.
 				fill: func() ([][]any, error) {
 					src, ok := source()
 					if !ok {
 						return nil, nil
 					}
+					all := mayErase()
 					var out [][]any
 					for _, r := range dataRetention(src.Catalog(), e.policySnapshot()) {
-						if schema, name := r[1].(string), r[2].(string); src.SeesTable(schema, name) {
+						if schema, name := r[1].(string), r[2].(string); all || src.SeesTable(schema, name) {
 							out = append(out, r)
 						}
 					}

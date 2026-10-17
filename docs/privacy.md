@@ -258,8 +258,9 @@ audit's. Drop the ones that must not outlive the retention, or let an
 erasure request rewrite them.
 
 A retention is at least a day. Admins set and remove data retentions of any
-table, holders of `ERASE` of tables with tagged columns; everyone may list
-those of the tables they may see. They are kept with policies and tags, stay with a table's name, and
+table, holders of `ERASE` of tables with tagged columns. Everyone may list
+those of the tables they may see; admins and holders of `ERASE`, all of
+them. They are kept with policies and tags, stay with a table's name, and
 renaming such a table is refused.
 
 ## What it does not cover

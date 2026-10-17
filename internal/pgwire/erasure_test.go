@@ -164,6 +164,10 @@ func TestEraseSubject(t *testing.T) {
 	mustExec(t, nora, "ALTER TABLE people SET (data_retention_days = 30)")
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
 	expectRows(t, rita, "SELECT table_schema, table_name, data_retention_days, set_by FROM igloo.data_retention", "public|people|30|nora")
+	// A privacy officer without a role of their own lists them too.
+	pat := cs.user(t, "pat", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, cs.admin, "GRANT privacy_officer TO pat")
+	expectRows(t, pat, "SELECT table_name, data_retention_days FROM igloo.data_retention", "people|30")
 	expectDenied(t, rita, "ALTER TABLE people RESET (data_retention_days)")
 	expectDenied(t, cs.admin, "ALTER TABLE lake.public.people RENAME TO folks", "data retention")
 	mustExec(t, nora, "ALTER TABLE people RESET (data_retention_days)")
