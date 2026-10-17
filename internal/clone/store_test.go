@@ -81,7 +81,14 @@ func testStore(t *testing.T, s, other clone.Store) {
 		t.Fatal("a canceled wait took the lock")
 	}
 	release()
-	if r, ok, err := other.Lock(ctx, []string{loc}, false); !ok || err != nil {
+	// The canceled wait's connection closes in the background, ending any
+	// lock the server granted it before it saw the cancellation.
+	r, ok, err := other.Lock(ctx, []string{loc}, false)
+	for deadline := time.Now().Add(5 * time.Second); err == nil && !ok && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+		r, ok, err = other.Lock(ctx, []string{loc}, false)
+	}
+	if !ok || err != nil {
 		t.Fatalf("lock after release: %v %v", ok, err)
 	} else {
 		r()

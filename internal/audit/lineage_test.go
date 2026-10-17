@@ -2,10 +2,11 @@ package audit
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // testLineage checks a Store's Lineage and TableUsage, from an empty store.
@@ -80,7 +81,7 @@ func TestMemoryLineage(t *testing.T) {
 // TestPostgresLineage runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresLineage(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

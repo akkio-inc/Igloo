@@ -3,9 +3,10 @@ package auth
 import (
 	"context"
 	"errors"
-	"os"
 	"slices"
 	"testing"
+
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 type ownerStore interface {
@@ -118,7 +119,7 @@ func TestMemoryOwners(t *testing.T) {
 // TestPostgresOwners runs against a real database when
 // IGLOO_TEST_DATABASE_URL is set.
 func TestPostgresOwners(t *testing.T) {
-	url := os.Getenv("IGLOO_TEST_DATABASE_URL")
+	url := testdb.URL()
 	if url == "" {
 		t.Skip("IGLOO_TEST_DATABASE_URL not set")
 	}

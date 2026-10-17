@@ -320,9 +320,17 @@ func (s *PostgresStore) Lock(ctx context.Context, locations []string, wait bool)
 		} else {
 			err = conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", k).Scan(&ok)
 		}
-		if err != nil || !ok {
-			release()
+		if err != nil {
+			// A wait cut short may still be granted before the server sees
+			// the cancellation; closing the connection ends its session,
+			// and with it any lock it got.
+			_ = conn.Conn().Close(context.Background())
+			conn.Release()
 			return nil, false, err
+		}
+		if !ok {
+			release()
+			return nil, false, nil
 		}
 		held = append(held, k)
 	}
