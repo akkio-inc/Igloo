@@ -182,3 +182,58 @@ func TestDataRetention(t *testing.T) {
 		t.Errorf("snapshots: %d before, %d after, want 1 despite min-snapshots-to-keep", snapshots, after)
 	}
 }
+
+// A data retention expires old snapshots, but not branches and tags,
+// which keep the snapshots they point at: a tag is someone's reference
+// point, such as an audit's.
+func TestDataRetentionKeepsRefs(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	schema := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64})
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := &localCatalog{}
+	cat.tbl = table.New(table.Identifier{"fin", "ledger"}, meta, "", func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, cat)
+	arrowSchema, err := table.SchemaToArrowSchema(schema, nil, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for i := range 3 {
+		b := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+		b.Field(0).(*array.Int64Builder).Append(int64(i))
+		rec := b.NewRecordBatch()
+		tbl := array.NewTableFromRecords(arrowSchema, []arrow.RecordBatch{rec})
+		if _, err := cat.tbl.AppendTable(ctx, tbl, 100, nil); err != nil {
+			t.Fatal(err)
+		}
+		tbl.Release()
+		rec.Release()
+		b.Release()
+		ids = append(ids, cat.tbl.CurrentSnapshot().SnapshotID)
+	}
+	if _, _, err := cat.CommitTable(ctx, cat.tbl.Identifier(), nil, []table.Update{
+		table.NewSetSnapshotRefUpdate("audit-2026-09", ids[0], table.TagRef, 0, 0, 0),
+		table.NewSetSnapshotRefUpdate("staging", ids[1], table.BranchRef, 0, 0, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	m := New(nil, "", Options{Retention: 7 * 24 * time.Hour}, log)
+	if _, _, err := m.expire(ctx, cat.tbl, log, time.Millisecond, true); err != nil {
+		t.Fatal(err)
+	}
+	var refs []string
+	for name, ref := range cat.tbl.Metadata().Refs() {
+		refs = append(refs, name)
+		if cat.tbl.Metadata().SnapshotByID(ref.SnapshotID) == nil {
+			t.Errorf("%s points at an expired snapshot", name)
+		}
+	}
+	slices.Sort(refs)
+	if !slices.Equal(refs, []string{"audit-2026-09", "main", "staging"}) {
+		t.Errorf("refs: %v", refs)
+	}
+}
