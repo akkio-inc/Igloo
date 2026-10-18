@@ -4,10 +4,10 @@ import { REPO_URL } from '../../docs-manifest.mjs';
 import Icon from './Icon.astro';
 ---
 
-<header class="site-header" data-header>
-	<div class="container header-inner">
+<header class="site-header">
+	<div class="header-inner">
 		<a class="brand" href="/" aria-label="Igloo home">
-			<img src={logo} alt="" width="32" height="32" />
+			<img src={logo} alt="" width="30" height="30" />
 			<span>Igloo</span>
 		</a>
 		<nav class="nav" aria-label="Main">
@@ -18,11 +18,11 @@ import Icon from './Icon.astro';
 		</nav>
 		<div class="actions">
 			<a class="icon-button" href={REPO_URL} aria-label="Igloo on GitHub">
-				<Icon name="github" size={20} />
+				<Icon name="github" size={18} />
 			</a>
 			<button class="icon-button" type="button" data-theme-toggle aria-label="Switch to light theme">
-				<Icon name="sun" class="theme-dark" size={20} />
-				<Icon name="moon" class="theme-light" size={20} />
+				<Icon name="sun" class="theme-dark" size={18} />
+				<Icon name="moon" class="theme-light" size={18} />
 			</button>
 		</div>
 	</div>
@@ -56,61 +56,51 @@ import Icon from './Icon.astro';
 		root.dataset.theme = event.matches ? 'light' : 'dark';
 		label();
 	});
-
-	// The header is solid over content, and transparent only at the very top,
-	// over the hero. Without this script it stays solid.
-	const header = document.querySelector<HTMLElement>('[data-header]');
-	const update = () => header?.toggleAttribute('data-at-top', window.scrollY <= 8);
-	update();
-	window.addEventListener('scroll', update, { passive: true });
 </script>
 
 <style>
+	/* A framed bar hanging from the top of the window: hairline sides and
+	   bottom, frosted over whatever scrolls beneath it. */
 	.site-header {
 		position: fixed;
 		inset: 0 0 auto;
 		z-index: 50;
-		height: var(--header-h);
-		/* Solid where backdrop-filter is missing; frosted where it is. */
-		background: var(--glass-solid);
-		border-bottom: 1px solid var(--glass-border);
-		box-shadow: var(--glass-highlight);
-		transition:
-			background-color 0.2s ease,
-			border-color 0.2s ease;
-	}
-	@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
-		.site-header {
-			background: color-mix(in srgb, var(--bg) 72%, transparent);
-			-webkit-backdrop-filter: blur(20px) saturate(1.8);
-			backdrop-filter: blur(20px) saturate(1.8);
-		}
-	}
-	.site-header[data-at-top] {
-		background: transparent;
-		border-bottom-color: transparent;
-		box-shadow: none;
-		-webkit-backdrop-filter: none;
-		backdrop-filter: none;
+		padding-inline: 16px;
+		pointer-events: none;
 	}
 	.header-inner {
+		pointer-events: auto;
 		display: flex;
 		align-items: center;
-		gap: 32px;
-		height: 100%;
+		height: var(--header-h);
+		max-width: calc(var(--container) + 2 * var(--gutter) + 48px);
+		margin-inline: auto;
+		padding-inline: calc(var(--gutter) + 23px) 16px;
+		border: 1px solid var(--border);
+		border-top: 0;
+		border-radius: 0 0 14px 14px;
+		background: rgb(var(--hero-scrim) / 0.94);
+	}
+	@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+		.header-inner {
+			background: rgb(var(--hero-scrim) / 0.6);
+			-webkit-backdrop-filter: blur(18px) saturate(1.5);
+			backdrop-filter: blur(18px) saturate(1.5);
+		}
 	}
 	.brand {
 		display: inline-flex;
 		align-items: center;
 		gap: 10px;
+		padding-right: 24px;
+		margin-right: 16px;
+		border-right: 1px solid var(--border);
 		color: var(--heading);
-		font-weight: 700;
-		font-size: 1.3125rem;
-		letter-spacing: -0.035em;
+		font-weight: 650;
+		font-size: 1.25rem;
+		letter-spacing: -0.03em;
 		text-decoration: none;
-	}
-	.site-header[data-at-top] .brand {
-		color: var(--hero-heading);
+		line-height: 32px;
 	}
 	.nav {
 		display: flex;
@@ -122,42 +112,58 @@ import Icon from './Icon.astro';
 		padding: 6px 12px;
 		border-radius: 8px;
 		color: var(--text);
-		font-weight: 500;
+		font-weight: 450;
 		font-size: 0.9375rem;
 		text-decoration: none;
-		transition: color 0.15s ease, background-color 0.15s ease;
-	}
-	.site-header[data-at-top] .nav a {
-		color: var(--hero-text);
+		transition:
+			color 0.15s ease,
+			background-color 0.15s ease;
 	}
 	.nav a:hover {
-		background: color-mix(in srgb, var(--hero-heading) 10%, transparent);
+		color: var(--heading);
+		background: var(--surface-2);
 	}
 	.actions {
 		display: flex;
 		align-items: center;
-		gap: 4px;
+		gap: 10px;
 	}
 	.icon-button {
 		display: inline-grid;
 		place-items: center;
-		width: 40px;
-		height: 40px;
-		border: 0;
-		border-radius: 10px;
+		width: 38px;
+		height: 38px;
+		border: 1px solid var(--border-strong);
+		border-radius: 50%;
 		background: transparent;
 		color: var(--heading);
 		cursor: pointer;
-	}
-	.site-header[data-at-top] .icon-button {
-		color: var(--hero-heading);
+		transition:
+			background-color 0.15s ease,
+			border-color 0.15s ease;
 	}
 	.icon-button:hover {
-		background: color-mix(in srgb, var(--hero-heading) 10%, transparent);
+		background: var(--surface-2);
+		border-color: var(--line);
 	}
 	@media (max-width: 720px) {
+		.site-header {
+			padding-inline: 0;
+		}
 		.header-inner {
-			gap: 12px;
+			padding-inline: var(--gutter) 12px;
+			border-inline: 0;
+			border-radius: 0;
+		}
+		.brand {
+			padding-right: 14px;
+			margin-right: 6px;
+		}
+		.nav a {
+			padding-inline: 8px;
+		}
+		.actions {
+			gap: 8px;
 		}
 		.wide-only {
 			display: none;

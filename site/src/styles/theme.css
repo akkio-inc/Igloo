@@ -1,68 +1,70 @@
 /*
- * Igloo's look for the Starlight docs, matching the landing page: calm
- * night navy, icy blues, the amber of the igloo's doorway, frosted glass.
+ * Igloo's look for the Starlight docs, matching the landing page: near-black
+ * (or near-white) surfaces, hairline borders, tight headings, and Igloo's
+ * icy blue and doorway amber as the accents.
  */
 
 :root {
 	--sl-font: 'Inter Variable', var(--sl-font-system);
+	--sl-nav-height: 4rem;
 
 	/* Dark mode (Starlight's default) */
 	--sl-color-white: #ffffff;
-	--sl-color-gray-1: #e4ecf7;
-	--sl-color-gray-2: #b9c5d8;
-	--sl-color-gray-3: #8b98af;
-	--sl-color-gray-4: #5a6a86;
-	--sl-color-gray-5: #233250;
-	--sl-color-gray-6: #111b2f;
-	--sl-color-black: #060c19;
+	--sl-color-gray-1: #e6e9ee;
+	--sl-color-gray-2: #c2c8d2;
+	--sl-color-gray-3: #8f96a3;
+	--sl-color-gray-4: #4b5160;
+	--sl-color-gray-5: #23262e;
+	--sl-color-gray-6: #121419;
+	--sl-color-black: #08090d;
 
-	--sl-color-accent-low: #12305a;
+	--sl-color-accent-low: #10233d;
 	--sl-color-accent: #4f9fe6;
 	--sl-color-accent-high: #a9d6fd;
 
-	--igloo-glass: rgb(255 255 255 / 0.035);
-	--igloo-glass-solid: rgb(13 21 38 / 0.94);
+	--igloo-glass: rgb(255 255 255 / 0.022);
+	--igloo-glass-solid: rgb(13 15 20 / 0.96);
 	--igloo-glass-border: rgb(255 255 255 / 0.08);
-	--igloo-glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.06);
-	--igloo-nav: rgb(6 12 25 / 0.72);
-	--igloo-glow-ice: rgb(79 159 230 / 0.1);
-	--igloo-glow-amber: rgb(245 180 74 / 0.05);
-	--igloo-current: rgb(255 255 255 / 0.08);
-	--igloo-scroll-shadow: rgb(169 214 253 / 0.28);
+	--igloo-glass-highlight: 0 0 #0000;
+	--igloo-nav: rgb(8 9 13 / 0.7);
+	--igloo-glow-ice: rgb(54 110 180 / 0.07);
+	--igloo-glow-amber: rgb(245 180 74 / 0.03);
+	--igloo-current: rgb(255 255 255 / 0.06);
+	--igloo-scroll-shadow: rgb(169 214 253 / 0.22);
 
 	--sl-color-bg-nav: var(--igloo-nav);
-	--sl-color-bg-sidebar: rgb(255 255 255 / 0.012);
+	--sl-color-bg-sidebar: var(--sl-color-black);
 	--sl-color-hairline-shade: var(--igloo-glass-border);
 	--sl-color-bg-inline-code: rgb(255 255 255 / 0.06);
 }
 
 :root[data-theme='light'] {
-	--sl-color-white: #0b1a33;
-	--sl-color-gray-1: #172d4d;
-	--sl-color-gray-2: #33455f;
-	--sl-color-gray-3: #4c6283;
-	--sl-color-gray-4: #8294b0;
-	--sl-color-gray-5: #d3deec;
-	--sl-color-gray-6: #eaf0f8;
-	--sl-color-gray-7: #f4f8fc;
-	--sl-color-black: #f8fafd;
+	--sl-color-white: #0b1426;
+	--sl-color-gray-1: #1b2130;
+	--sl-color-gray-2: #353c4a;
+	--sl-color-gray-3: #5a6476;
+	--sl-color-gray-4: #9aa1ad;
+	--sl-color-gray-5: #e1e4e9;
+	--sl-color-gray-6: #eef0f3;
+	--sl-color-gray-7: #f6f7f9;
+	--sl-color-black: #fcfcfd;
 
-	--sl-color-accent-low: #dcebfc;
+	--sl-color-accent-low: #e3eefb;
 	--sl-color-accent: #1b64b5;
 	--sl-color-accent-high: #123f78;
 
-	--igloo-glass: rgb(255 255 255 / 0.7);
+	--igloo-glass: #ffffff;
 	--igloo-glass-solid: rgb(255 255 255 / 0.97);
-	--igloo-glass-border: rgb(15 45 86 / 0.1);
-	--igloo-glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.9);
-	--igloo-nav: rgb(248 250 253 / 0.75);
-	--igloo-glow-ice: rgb(79 159 230 / 0.1);
-	--igloo-glow-amber: rgb(245 180 74 / 0.08);
-	--igloo-current: rgb(27 100 181 / 0.1);
-	--igloo-scroll-shadow: rgb(13 34 66 / 0.2);
+	--igloo-glass-border: rgb(13 20 38 / 0.09);
+	--igloo-glass-highlight: 0 0 #0000;
+	--igloo-nav: rgb(252 252 253 / 0.75);
+	--igloo-glow-ice: rgb(79 159 230 / 0.06);
+	--igloo-glow-amber: rgb(245 180 74 / 0.05);
+	--igloo-current: rgb(27 100 181 / 0.08);
+	--igloo-scroll-shadow: rgb(13 34 66 / 0.18);
 
-	--sl-color-bg-sidebar: rgb(255 255 255 / 0.4);
-	--sl-color-bg-inline-code: rgb(15 45 86 / 0.06);
+	--sl-color-bg-sidebar: var(--sl-color-black);
+	--sl-color-bg-inline-code: rgb(13 20 38 / 0.05);
 }
 
 body {
@@ -70,7 +72,7 @@ body {
 	font-optical-sizing: auto;
 }
 
-/* Soft glows behind the page, as on the landing page. */
+/* Faint glows behind the page, as on the landing page. */
 @media (min-width: 50rem) {
 	body {
 		background:
@@ -81,7 +83,7 @@ body {
 	}
 }
 
-/* Frosted header and mobile table of contents. Without backdrop-filter they
+/* Frosted header and mobile table of contents, edged by a hairline. Without backdrop-filter they
    fall back to a solid fill. */
 header.header,
 mobile-starlight-toc nav {
@@ -100,8 +102,8 @@ mobile-starlight-toc nav {
 
 /* Header: the wordmark. */
 .site-title {
-	font-weight: 700;
-	letter-spacing: -0.035em;
+	font-weight: 650;
+	letter-spacing: -0.03em;
 	color: var(--sl-color-white);
 	gap: 0.5rem;
 }
@@ -109,7 +111,7 @@ mobile-starlight-toc nav {
 	height: 2rem;
 }
 
-/* Search: a glass field, and a frosted dialog over a blurred page. */
+/* Search: a quiet field, and a frosted dialog over a blurred page. */
 site-search > button[data-open-modal] {
 	border-color: var(--igloo-glass-border);
 	background-color: var(--igloo-glass);
@@ -134,7 +136,7 @@ site-search dialog::backdrop {
 	backdrop-filter: blur(6px);
 }
 
-/* Sidebar: group labels, and the current page as a glass pill. */
+/* Sidebar: group labels, and the current page as an outlined pill. */
 .sidebar-content .group-label .large {
 	font-weight: 600;
 	font-size: var(--sl-text-sm);
@@ -157,30 +159,29 @@ site-search dialog::backdrop {
 
 /* Headings: large and tight. */
 h1 {
-	font-weight: 680;
+	font-weight: 600;
 	letter-spacing: -0.04em;
 }
 .sl-markdown-content :is(h2, h3, h4, h5) {
-	font-weight: 620;
-	letter-spacing: -0.03em;
+	font-weight: 590;
+	letter-spacing: -0.025em;
 }
 
 .sl-markdown-content code:not(:where(.not-content *)) {
 	border-radius: 0.375rem;
 }
 
-/* Code blocks as glass panes. */
+/* Code blocks: dark insets with a hairline edge, as on the landing page. */
 .expressive-code .frame pre {
-	--ec-codeBg: rgb(255 255 255 / 0.025);
-	box-shadow: var(--igloo-glass-highlight);
+	--ec-codeBg: rgb(0 0 0 / 0.3);
 }
 :root[data-theme='light'] .expressive-code .frame pre {
-	--ec-codeBg: rgb(255 255 255 / 0.8);
+	--ec-codeBg: #f6f7f9;
 }
 
 /*
  * Tables. Many in the docs are wide reference tables with code in their cells:
- * keep them scrollable (Starlight's default), as glass panes with a header row.
+ * keep them scrollable (Starlight's default), hairline-edged with a header row.
  */
 .sl-markdown-content table:not(:where(.not-content *)) {
 	border: 1px solid var(--igloo-glass-border);
@@ -237,7 +238,7 @@ h1 {
 	vertical-align: top;
 }
 
-/* Screenshots and banners, framed like glass. */
+/* Screenshots and banners, in a hairline frame. */
 .sl-markdown-content img:not(:where(.not-content *)) {
 	border-radius: 0.75rem;
 	border: 1px solid var(--igloo-glass-border);
@@ -247,7 +248,7 @@ h1 {
 	margin-top: 0;
 }
 
-/* Asides as tinted glass. */
+/* Asides, hairline-edged. */
 .starlight-aside {
 	border: 1px solid var(--igloo-glass-border);
 	border-inline-start: 3px solid var(--sl-color-asides-border);

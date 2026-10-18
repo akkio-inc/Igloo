@@ -33,11 +33,10 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 		<meta property="og:type" content="website" />
 		<meta property="og:title" content={title} />
 		<meta property="og:description" content={description} />
-		<meta name="theme-color" content="#060c19" />
+		<meta name="theme-color" content="#08090d" />
 		<script is:inline>
 			// Before the first paint, as Starlight does, so the page never flashes
-			// the other theme; and opt in to scroll reveals only when motion is
-			// welcome and they can be undone by the observer below.
+			// the other theme.
 			(() => {
 				let stored = null;
 				try {
@@ -45,9 +44,6 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 				} catch {}
 				const theme = stored || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 				document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
-				if ('IntersectionObserver' in window && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
-					document.documentElement.classList.add('motion');
-				}
 			})();
 		</script>
 	</head>
@@ -66,20 +62,5 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 			<Closing />
 		</main>
 		<Footer />
-		<script>
-			if (document.documentElement.classList.contains('motion')) {
-				const observer = new IntersectionObserver(
-					(entries) => {
-						for (const entry of entries) {
-							if (!entry.isIntersecting) continue;
-							entry.target.classList.add('is-visible');
-							observer.unobserve(entry.target);
-						}
-					},
-					{ rootMargin: '0px 0px -8% 0px' },
-				);
-				document.querySelectorAll('.reveal').forEach((el) => observer.observe(el));
-			}
-		</script>
 	</body>
 </html>

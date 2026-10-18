@@ -42,15 +42,15 @@ const pillars = [
 ] as const;
 ---
 
-<section class="section pillars" aria-labelledby="pillars-title">
+<section class="pillars" aria-labelledby="pillars-title">
 	<div class="container">
 		<h2 id="pillars-title" class="sr-only">Why Igloo</h2>
 		<div class="grid">
 			{
 				pillars.map((pillar) => (
-					<a class="pillar glass lift reveal" href={pillar.href}>
-						<span class="icon">
-							<Icon name={pillar.icon} size={20} />
+					<a class="pillar" href={pillar.href}>
+						<span class="icon-box">
+							<Icon name={pillar.icon} size={24} />
 						</span>
 						<h3>{pillar.title}</h3>
 						<p set:html={pillar.text} />
@@ -62,61 +62,105 @@ const pillars = [
 </section>
 
 <style>
+	/* Six cells ruled by hairlines between them, with no boxes around. */
 	.pillars {
-		padding-top: 96px;
-		padding-bottom: 32px;
-	}
-	.pillars::before {
-		display: none;
+		position: relative;
+		padding: 72px 0 40px;
 	}
 	.grid {
 		display: grid;
 		grid-template-columns: repeat(3, minmax(0, 1fr));
-		gap: 16px;
 	}
 	.pillar {
 		display: block;
-		padding: 24px 24px 28px;
+		padding: 40px 40px 48px;
 		color: inherit;
 		text-decoration: none;
+		transition: background-color 0.2s ease;
 	}
-	.icon {
-		display: inline-grid;
-		place-items: center;
-		width: 40px;
-		height: 40px;
-		margin-bottom: 24px;
+	.pillar:hover {
+		background: linear-gradient(180deg, var(--surface-hover), transparent);
+	}
+	.pillar:hover h3 {
+		color: var(--link);
+	}
+	.pillar:not(:nth-child(3n + 1)) {
+		border-left: 1px solid var(--border);
+	}
+	.pillar:nth-child(n + 4) {
+		border-top: 1px solid var(--border);
+	}
+	.icon-box {
+		width: 56px;
+		height: 56px;
 		border-radius: 12px;
-		border: 1px solid var(--glass-border);
-		background: linear-gradient(180deg, rgb(143 203 252 / 0.16), rgb(143 203 252 / 0.04));
-		box-shadow: var(--glass-highlight);
-		color: var(--ice);
+		margin-bottom: 32px;
 	}
 	h3 {
-		font-size: 1.0625rem;
-		font-weight: 600;
-		letter-spacing: -0.02em;
+		font-size: 1.375rem;
+		font-weight: 550;
+		letter-spacing: -0.022em;
+		transition: color 0.15s ease;
 	}
 	p {
-		margin: 8px 0 0;
+		margin: 12px 0 0;
 		color: var(--muted);
-		font-size: 0.9375rem;
-		line-height: 1.6;
+		font-size: 1.0625rem;
+		line-height: 1.65;
 	}
 	p :global(code) {
 		color: var(--heading);
+	}
+	/* Wide enough: let the cells' padding hang outside the column so their
+	   text lines up with the headings below. */
+	@media (min-width: 1360px) {
+		.grid {
+			margin-inline: -40px;
+		}
 	}
 	@media (max-width: 959px) {
 		.grid {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
 		}
+		.pillar {
+			padding: 32px 28px 40px;
+		}
+		.pillar:not(:nth-child(3n + 1)) {
+			border-left: 0;
+		}
+		.pillar:nth-child(n + 4) {
+			border-top: 0;
+		}
+		.pillar:nth-child(2n) {
+			border-left: 1px solid var(--border);
+		}
+		.pillar:nth-child(n + 3) {
+			border-top: 1px solid var(--border);
+		}
 	}
 	@media (max-width: 600px) {
+		.pillars {
+			padding-top: 40px;
+		}
 		.grid {
 			grid-template-columns: minmax(0, 1fr);
 		}
-		.pillars {
-			padding-top: 56px;
+		.pillar {
+			padding: 32px 0 36px;
+		}
+		.pillar:nth-child(2n) {
+			border-left: 0;
+		}
+		.pillar:nth-child(n + 2) {
+			border-top: 1px solid var(--border);
+		}
+		.icon-box {
+			width: 48px;
+			height: 48px;
+			margin-bottom: 24px;
+		}
+		h3 {
+			font-size: 1.25rem;
 		}
 	}
 </style>

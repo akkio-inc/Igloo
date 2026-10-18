@@ -10,6 +10,8 @@ const results = [
 		faster: '4.3–6.8×',
 		cheaper: '26–35×',
 		against: 'than a Snowflake X-Small (Gen1 or Gen2) or Databricks SQL Serverless 2X-Small warehouse',
+		cores: 16,
+		layers: 2,
 	},
 	{
 		scale: 'Scale factor 100',
@@ -17,6 +19,8 @@ const results = [
 		faster: '2.2–3.2×',
 		cheaper: '10–16×',
 		against: 'than those warehouses',
+		cores: 16,
+		layers: 6,
 	},
 	{
 		scale: 'Scale factor 100',
@@ -24,15 +28,72 @@ const results = [
 		faster: '2.4–3.2×',
 		cheaper: '59–69×',
 		against: 'than their X-Large sizes',
+		cores: 64,
+		layers: 6,
 	},
 ];
+
+// A small isometric line drawing of each run: the machine as a slab with
+// one square per core on top, over one plate per slice of data.
+const C = Math.cos(Math.PI / 6);
+const at = (x: number, y: number, z: number) => `${((x - y) * C).toFixed(1)},${((x + y) * 0.5 - z).toFixed(1)}`;
+const quad = (cls: string, pts: [number, number, number][]) =>
+	`<polygon class="${cls}" points="${pts.map((p) => at(...p)).join(' ')}"/>`;
+const slab = (size: number, zb: number, zt: number, topClass = 'face') =>
+	quad('face', [
+		[size, 0, zt],
+		[size, size, zt],
+		[size, size, zb],
+		[size, 0, zb],
+	]) +
+	quad('face', [
+		[0, size, zt],
+		[size, size, zt],
+		[size, size, zb],
+		[0, size, zb],
+	]) +
+	quad(topClass, [
+		[0, 0, zt],
+		[size, 0, zt],
+		[size, size, zt],
+		[0, size, zt],
+	]);
+const drawing = (cores: number, layers: number) => {
+	const size = 120;
+	const plate = 5;
+	const step = 12;
+	const top = 14;
+	let svg = '';
+	for (let i = 0; i < layers; i++) svg += slab(size, i * step, i * step + plate);
+	const zb = layers * step;
+	const zt = zb + top;
+	svg += slab(size, zb, zt, 'face face-top');
+	const n = Math.sqrt(cores);
+	const margin = 14;
+	const gap = n > 4 ? 4 : 6;
+	const cell = (size - 2 * margin - (n - 1) * gap) / n;
+	for (let r = 0; r < n; r++) {
+		for (let c = 0; c < n; c++) {
+			const x = margin + c * (cell + gap);
+			const y = margin + r * (cell + gap);
+			svg += quad('core', [
+				[x, y, zt],
+				[x + cell, y, zt],
+				[x + cell, y + cell, zt],
+				[x, y + cell, zt],
+			]);
+		}
+	}
+	const w = size * C;
+	return `<svg viewBox="${(-w - 2).toFixed(1)} ${-zt - 2} ${(2 * w + 4).toFixed(1)} ${size + zt + 4}" aria-hidden="true">${svg}</svg>`;
+};
 ---
 
 <section class="section section-alt" id="benchmark" aria-labelledby="bench-title">
 	<div class="container">
-		<div class="section-head reveal">
+		<div class="section-head">
 			<span class="eyebrow">Benchmark</span>
-			<h2 id="bench-title">Price-performance on TPC-H</h2>
+			<h2 id="bench-title" class="headline">Price-performance on TPC-H</h2>
 			<p>
 				The 22 TPC-H queries with tables in Amazon S3, against Snowflake and Databricks on the same data and queries:
 				speed, and cost per query at list prices. The margins vary with scale and size.
@@ -41,9 +102,10 @@ const results = [
 		<div class="results">
 			{
 				results.map((result) => (
-					<div class="result glass lift reveal">
+					<div class="result surface">
 						<div class="scale">{result.scale}</div>
 						<div class="machine">{result.machine}</div>
+						<div class="art" set:html={drawing(result.cores, result.layers)} />
 						<dl>
 							<div>
 								<dt>faster</dt>
@@ -70,43 +132,80 @@ const results = [
 		display: grid;
 		grid-template-columns: repeat(3, minmax(0, 1fr));
 		gap: 20px;
-		margin-bottom: 28px;
+		margin-bottom: 36px;
 	}
 	.result {
-		padding: 28px;
-		border-radius: 20px;
+		display: flex;
+		flex-direction: column;
+		padding: 32px 32px 36px;
 	}
 	.scale {
+		font-family: var(--font-mono);
 		font-size: 0.8125rem;
-		font-weight: 600;
-		letter-spacing: 0.04em;
+		letter-spacing: 0.1em;
 		text-transform: uppercase;
 		color: var(--muted);
 	}
 	.machine {
-		margin-top: 4px;
-		font-weight: 700;
+		margin-top: 8px;
+		font-size: 1.125rem;
+		font-weight: 500;
 		color: var(--heading);
+	}
+	.art {
+		height: 190px;
+		margin: 28px 0 32px;
+		color: var(--line);
+	}
+	.art :global(svg) {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+	.art :global(.face) {
+		fill: var(--bg-raised);
+		stroke: currentColor;
+		stroke-width: 1;
+		stroke-linejoin: round;
+	}
+	.art :global(.face-top) {
+		stroke: color-mix(in srgb, var(--heading) 45%, transparent);
+	}
+	.art :global(.core) {
+		fill: rgb(245 180 74 / 0.1);
+		stroke: rgb(245 180 74 / 0.6);
+		stroke-width: 0.75;
+	}
+	:global(:root[data-theme='light']) .art :global(.core) {
+		fill: rgb(245 180 74 / 0.12);
+		stroke: rgb(176 104 0 / 0.55);
 	}
 	dl {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 12px;
-		margin: 18px 0 0;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		margin: 0;
+		padding-top: 24px;
+		border-top: 1px solid var(--border);
 	}
 	dl div {
 		display: flex;
 		flex-direction: column-reverse;
+		justify-content: flex-end;
+	}
+	dl div + div {
+		padding-left: 24px;
+		border-left: 1px solid var(--border);
 	}
 	dt {
-		font-size: 0.875rem;
+		margin-top: 4px;
+		font-size: 0.9375rem;
 		color: var(--muted);
 	}
 	dd {
 		margin: 0;
-		font-size: clamp(1.75rem, 1.2rem + 1.4vw, 2.5rem);
-		font-weight: 650;
-		letter-spacing: -0.045em;
+		font-size: clamp(1.75rem, 1.1rem + 1.3vw, 2.5rem);
+		font-weight: 600;
+		letter-spacing: -0.04em;
 		line-height: 1.1;
 		color: var(--heading);
 		font-variant-numeric: tabular-nums;
@@ -116,9 +215,7 @@ const results = [
 		color: var(--amber);
 	}
 	.result p {
-		margin: 16px 0 0;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
+		margin: 24px 0 0;
 		font-size: 0.9375rem;
 		color: var(--muted);
 	}
@@ -126,11 +223,24 @@ const results = [
 	@media (min-width: 901px) and (max-width: 1180px) {
 		dl {
 			grid-template-columns: minmax(0, 1fr);
+			gap: 16px;
+		}
+		dl div + div {
+			padding-left: 0;
+			border-left: 0;
 		}
 	}
 	@media (max-width: 900px) {
 		.results {
 			grid-template-columns: minmax(0, 1fr);
+		}
+		.art {
+			height: 170px;
+		}
+	}
+	@media (max-width: 420px) {
+		.result {
+			padding: 24px 20px 28px;
 		}
 	}
 </style>

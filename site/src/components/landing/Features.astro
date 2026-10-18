@@ -178,9 +178,9 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 
 <section class="section section-alt" id="features" aria-labelledby="features-title">
 	<div class="container">
-		<div class="section-head reveal">
+		<div class="section-head">
 			<span class="eyebrow">Features</span>
-			<h2 id="features-title">What you get</h2>
+			<h2 id="features-title" class="headline">What you get</h2>
 			<p>
 				Tables, governance, loading, sharing and operations, each linked to its documentation. What 1.0 does not do yet
 				is listed under <a href="/docs/#limitations-in-10">Limitations in 1.0</a>.
@@ -190,10 +190,10 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		<div class="bento">
 			{
 				groups.map((group, i) => (
-					<div class:list={['tile', 'glass', 'lift', 'reveal', `tile-${i}`]}>
+					<div class:list={['tile', 'surface', `tile-${i}`]}>
 						<h3>
 							<span class="icon">
-								<Icon name={group.icon} size={18} />
+								<Icon name={group.icon} size={28} />
 							</span>
 							{group.title}
 						</h3>
@@ -247,11 +247,11 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 				))
 			}
 
-			<igloo-sql-tabs class="tile tile-sql glass reveal">
+			<igloo-sql-tabs class="tile tile-sql surface">
 				<div class="showcase-head">
 					<h3>
 						<span class="icon">
-							<Icon name="code" size={18} />
+							<Icon name="code" size={28} />
 						</span>
 						In SQL
 					</h3>
@@ -335,8 +335,8 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		gap: 16px;
 	}
 	.tile {
-		padding: 28px;
-		border-radius: 20px;
+		padding: 32px 32px 36px;
+		container-type: inline-size;
 	}
 	.tile-0 {
 		grid-area: a;
@@ -357,14 +357,14 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	.tile-0 ul {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 0 32px;
+		gap: 0 40px;
 	}
 	.tile-0 li + li {
 		margin-top: 0;
 	}
 	.tile-0 li:nth-child(n + 3) {
-		margin-top: 16px;
-		padding-top: 16px;
+		margin-top: 20px;
+		padding-top: 20px;
 		border-top: 1px solid var(--border);
 	}
 	.tile-0 li:nth-child(2) {
@@ -375,38 +375,28 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	h3 {
 		display: flex;
 		align-items: center;
-		gap: 12px;
-		font-size: 1.125rem;
-		font-weight: 600;
-		letter-spacing: -0.02em;
+		gap: 16px;
+		font-size: 1.375rem;
+		font-weight: 550;
+		letter-spacing: -0.022em;
 	}
 	.icon {
 		display: inline-grid;
 		place-items: center;
-		width: 32px;
-		height: 32px;
-		border-radius: 10px;
-		border: 1px solid var(--glass-border);
-		background: linear-gradient(180deg, rgb(143 203 252 / 0.16), rgb(143 203 252 / 0.04));
-		box-shadow: var(--glass-highlight);
 		color: var(--ice);
 	}
 
 	/* The small pictures. */
 	.frag {
-		margin: 24px 0 8px;
+		margin: 28px 0 8px;
 		padding: 14px 16px;
-		border: 1px solid var(--glass-border);
-		border-radius: 12px;
-		background: rgb(0 0 0 / 0.18);
-		box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04);
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		background: var(--inset);
 		font-family: var(--font-mono);
-		font-size: 0.8125rem;
-		line-height: 1.6;
+		font-size: 0.875rem;
+		line-height: 1.7;
 		color: var(--text);
-	}
-	:global(:root[data-theme='light']) .frag {
-		background: rgb(255 255 255 / 0.7);
 	}
 	.frag-code {
 		overflow-x: auto;
@@ -420,36 +410,40 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	}
 	.chip {
 		display: inline-block;
-		padding: 2px 10px;
-		border: 1px solid var(--glass-border-strong);
+		padding: 3px 12px;
+		border: 1px solid var(--border-strong);
 		border-radius: 999px;
-		background: var(--surface-2);
 		font-family: var(--font-mono);
-		font-size: 0.75rem;
+		font-size: 0.8125rem;
 		color: var(--heading);
 		white-space: nowrap;
 	}
 	.chip-hot {
-		border-color: rgb(245 180 74 / 0.55);
-		background: rgb(245 180 74 / 0.12);
+		border-color: rgb(245 180 74 / 0.6);
+		background: rgb(245 180 74 / 0.1);
+		box-shadow: 0 0 14px -4px rgb(245 180 74 / 0.45);
 	}
 	.frag-mask {
 		display: grid;
-		gap: 8px;
+		gap: 10px;
 		font-family: var(--font);
 	}
 	.frag-row {
 		display: grid;
-		grid-template-columns: 7.5rem 1fr;
+		grid-template-columns: minmax(0, 7.5rem) minmax(0, 1fr);
 		align-items: center;
-		gap: 12px;
+		gap: 14px;
+	}
+	.frag-mask .chip {
+		width: 100%;
 	}
 	.frag-head {
+		font-family: var(--font-mono);
 		font-size: 0.75rem;
 		color: var(--muted);
 	}
 	.frag-mask code {
-		font-size: 0.8125rem;
+		font-size: 0.875rem;
 		color: var(--heading);
 		overflow-wrap: anywhere;
 	}
@@ -459,8 +453,12 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	.frag-lineage {
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		gap: 8px;
 		font-family: var(--font);
+	}
+	.frag-lineage .chip {
+		padding: 2px 9px;
+		font-size: 0.75rem;
 	}
 	.sources {
 		display: grid;
@@ -469,8 +467,8 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	.arrow {
 		position: relative;
 		flex: 1;
-		min-width: 24px;
-		border-top: 1px dashed var(--border-strong);
+		min-width: 16px;
+		border-top: 1px dashed var(--line);
 	}
 	.arrow::after {
 		content: '';
@@ -478,43 +476,72 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		right: -1px;
 		top: -5px;
 		border: 5px solid transparent;
-		border-left: 7px solid var(--border-strong);
+		border-left: 7px solid var(--line);
 		border-right: 0;
+	}
+	/* Too narrow for sources, arrow and table in a row: stack them. */
+	@container (max-width: 318px) {
+		.frag-lineage {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+		.sources {
+			display: flex;
+			flex-wrap: wrap;
+		}
+		.arrow {
+			flex: none;
+			min-width: 0;
+			height: 16px;
+			margin-left: 24px;
+			border-top: 0;
+			border-left: 1px dashed var(--line);
+		}
+		.arrow::after {
+			right: auto;
+			top: auto;
+			left: -6px;
+			bottom: -1px;
+			border: 5px solid transparent;
+			border-top: 7px solid var(--line);
+			border-bottom: 0;
+		}
 	}
 	.frag-ops {
 		display: grid;
-		gap: 8px;
+		gap: 6px;
 	}
 	.frag-ops code {
-		font-size: 0.75rem;
+		font-size: 0.8125rem;
 		color: var(--heading);
 		overflow-wrap: anywhere;
 	}
 
 	ul {
-		margin: 24px 0 0;
+		margin: 28px 0 0;
 		padding: 0;
 		list-style: none;
 	}
 	li + li {
-		margin-top: 16px;
-		padding-top: 16px;
+		margin-top: 20px;
+		padding-top: 20px;
 		border-top: 1px solid var(--border);
 	}
 	li a {
-		font-weight: 600;
+		font-size: 1.0625rem;
+		font-weight: 550;
 		color: var(--heading);
 		text-decoration: none;
-		letter-spacing: -0.01em;
+		letter-spacing: -0.012em;
 	}
 	li a:hover {
 		color: var(--link);
 		text-decoration: underline;
 	}
 	li p {
-		margin: 4px 0 0;
-		font-size: 0.9375rem;
-		line-height: 1.55;
+		margin: 6px 0 0;
+		font-size: 1rem;
+		line-height: 1.6;
 		color: var(--muted);
 	}
 
@@ -529,41 +556,36 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	.tabs {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 4px;
+		gap: 2px;
 		padding: 4px;
-		border: 1px solid var(--glass-border);
+		border: 1px solid var(--border);
 		border-radius: 999px;
-		background: var(--surface-2);
+		background: var(--surface);
 	}
 	.tabs button {
-		padding: 6px 14px;
+		padding: 6px 16px;
 		border: 0;
 		border-radius: 999px;
 		background: transparent;
 		color: var(--muted);
 		font: inherit;
 		font-size: 0.875rem;
-		font-weight: 550;
+		font-weight: 500;
 		cursor: pointer;
 	}
 	.tabs button:hover {
 		color: var(--heading);
 	}
 	.tabs button[aria-selected='true'] {
-		background: rgb(255 255 255 / 0.1);
+		background: var(--surface-2);
 		color: var(--heading);
-		box-shadow:
-			inset 0 1px 0 rgb(255 255 255 / 0.12),
-			0 0 0 1px var(--glass-border);
-	}
-	:global(:root[data-theme='light']) .tabs button[aria-selected='true'] {
-		background: #ffffff;
+		box-shadow: 0 0 0 1px var(--border-strong);
 	}
 	igloo-sql-tabs:not(:defined) .tabs {
 		display: none;
 	}
 	.sql-panel .more-link {
-		margin-top: 16px;
+		margin-top: 20px;
 	}
 	igloo-sql-tabs:not(:defined) .sql-panel + .sql-panel {
 		margin-top: 24px;
@@ -585,15 +607,25 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 			grid-template-areas: 'a' 'b' 'c' 'd' 'e';
 		}
 		.tile {
-			padding: 20px;
+			padding: 24px 20px 28px;
+		}
+		h3 {
+			font-size: 1.25rem;
 		}
 		.tile-0 ul {
 			grid-template-columns: minmax(0, 1fr);
 		}
 		.tile-0 li:nth-child(2) {
-			margin-top: 16px;
-			padding-top: 16px;
+			margin-top: 20px;
+			padding-top: 20px;
 			border-top: 1px solid var(--border);
+		}
+		.frag {
+			padding: 14px 14px;
+		}
+		.frag-row {
+			grid-template-columns: minmax(0, 7.5rem) minmax(0, 1fr);
+			gap: 10px;
 		}
 	}
 </style>

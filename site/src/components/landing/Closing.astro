@@ -5,8 +5,8 @@ import Icon from './Icon.astro';
 
 <section class="closing" aria-labelledby="closing-title">
 	<div class="container">
-		<div class="panel glass glass-blur reveal">
-			<h2 id="closing-title">Open source SQL warehouse on Apache Iceberg</h2>
+		<div class="panel">
+			<h2 id="closing-title" class="headline">Open source SQL warehouse on Apache Iceberg</h2>
 			<p>Licensed under Apache 2.0. Runs in your own cloud account or on your own hardware.</p>
 			<div class="actions">
 				<a class="btn btn-primary" href="#quick-start">Get started <Icon name="arrow" /></a>
@@ -18,50 +18,49 @@ import Icon from './Icon.astro';
 </section>
 
 <style>
+	/* No box: a large heading, a line and the three ways in, over a faint
+	   glow. */
 	.closing {
 		position: relative;
 		isolation: isolate;
-		padding: 32px 0 128px;
+		padding: 152px 0 160px;
+		border-top: 1px solid var(--border);
 	}
 	.closing::before {
 		content: '';
 		position: absolute;
 		z-index: -1;
-		inset: -10% 0 0;
+		inset: 0;
 		pointer-events: none;
 		background:
-			radial-gradient(520px 240px at 30% 55%, var(--glow-ice), transparent 70%),
-			radial-gradient(520px 240px at 70% 45%, var(--glow-amber), transparent 70%);
+			radial-gradient(640px 320px at 10% 240px, var(--glow-amber), transparent 70%),
+			radial-gradient(900px 400px at 78% 300px, var(--glow-ice), transparent 70%);
 	}
 	.panel {
-		padding: 64px 32px;
-		border-radius: 24px;
-		text-align: center;
+		max-width: 900px;
 	}
 	h2 {
-		font-size: clamp(1.75rem, 1rem + 2.4vw, 2.75rem);
-		font-weight: 640;
-		letter-spacing: -0.04em;
+		font-size: clamp(2.25rem, 1.1rem + 3.6vw, 4.25rem);
 	}
 	p {
-		margin: 16px auto 0;
+		margin: 24px 0 0;
 		max-width: 40em;
-		font-size: 1.0625rem;
+		font-size: clamp(1.0625rem, 0.95rem + 0.35vw, 1.25rem);
+		line-height: 1.55;
 		color: var(--muted);
 	}
 	.actions {
 		display: flex;
 		flex-wrap: wrap;
-		justify-content: center;
-		gap: 12px;
-		margin-top: 32px;
+		gap: 14px;
+		margin-top: 40px;
 	}
 	@media (max-width: 720px) {
 		.closing {
-			padding-bottom: 80px;
+			padding: 96px 0 104px;
 		}
-		.panel {
-			padding: 48px 20px;
+		.actions .btn {
+			flex: 1 1 auto;
 		}
 	}
 </style>

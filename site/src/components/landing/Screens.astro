@@ -48,7 +48,7 @@ const screens = [
 
 const picture = {
 	widths: [640, 960, 1280, 1920],
-	sizes: '(min-width: 1208px) 1160px, calc(100vw - 32px)',
+	sizes: '(min-width: 1248px) 1200px, calc(100vw - 32px)',
 	format: 'webp' as const,
 	quality: 88,
 	loading: 'lazy' as const,
@@ -57,31 +57,33 @@ const picture = {
 
 <section class="section" id="screenshots" aria-labelledby="screens-title">
 	<div class="container">
-		<div class="section-head center reveal">
+		<div class="section-head">
 			<span class="eyebrow">See it</span>
-			<h2 id="screens-title">The console, and the tools you already use</h2>
+			<h2 id="screens-title" class="headline">The console, and the tools you already use</h2>
 			<p>
 				A web console for SQL, data and administration, and BI tools and notebooks connected through their PostgreSQL
 				drivers or Arrow Flight SQL.
 			</p>
 		</div>
 
-		<igloo-screens class="reveal">
-			<div class="tabs" role="tablist" aria-label="Screenshots">
-				{
-					screens.map((screen, i) => (
-						<button
-							type="button"
-							role="tab"
-							id={`tab-${screen.id}`}
-							aria-controls={`panel-${screen.id}`}
-							aria-selected={i === 0 ? 'true' : 'false'}
-							tabindex={i === 0 ? 0 : -1}
-						>
-							{screen.tab}
-						</button>
-					))
-				}
+		<igloo-screens>
+			<div class="tab-row">
+				<div class="tabs" role="tablist" aria-label="Screenshots">
+					{
+						screens.map((screen, i) => (
+							<button
+								type="button"
+								role="tab"
+								id={`tab-${screen.id}`}
+								aria-controls={`panel-${screen.id}`}
+								aria-selected={i === 0 ? 'true' : 'false'}
+								tabindex={i === 0 ? 0 : -1}
+							>
+								{screen.tab}
+							</button>
+						))
+					}
+				</div>
 			</div>
 
 			{
@@ -93,7 +95,7 @@ const picture = {
 						aria-labelledby={`tab-${screen.id}`}
 						data-first={i === 0 ? '' : undefined}
 					>
-						<div class="window glass glass-blur">
+						<div class="window">
 							<div class="window-bar" aria-hidden="true">
 								<span />
 								<span />
@@ -158,61 +160,66 @@ const picture = {
 		position: relative;
 		display: block;
 	}
-	/* A glow under the product shot. */
+	/* A faint glow under the product shot. */
 	igloo-screens::before {
 		content: '';
 		position: absolute;
 		z-index: -1;
-		inset: 10% 6% -4%;
+		inset: 20% 8% 0;
 		border-radius: 50%;
 		background:
-			radial-gradient(closest-side at 35% 55%, rgb(79 159 230 / 0.35), transparent),
-			radial-gradient(closest-side at 70% 60%, rgb(245 180 74 / 0.18), transparent);
-		filter: blur(40px);
+			radial-gradient(closest-side at 30% 55%, rgb(79 159 230 / 0.16), transparent),
+			radial-gradient(closest-side at 75% 60%, rgb(245 180 74 / 0.08), transparent);
+		filter: blur(48px);
+	}
+	/* A segmented control, with a hairline running on to the right edge. */
+	.tab-row {
+		display: flex;
+		align-items: center;
+		margin-bottom: 28px;
+	}
+	.tab-row::after {
+		content: '';
+		flex: 1;
+		min-width: 0;
+		border-top: 1px solid var(--border);
 	}
 	.tabs {
 		display: flex;
-		justify-content: center;
 		flex-wrap: wrap;
 		gap: 4px;
-		width: fit-content;
 		max-width: 100%;
-		margin: 0 auto 32px;
 		padding: 4px;
-		border: 1px solid var(--glass-border);
-		border-radius: 999px;
-		background: var(--glass);
-		box-shadow: var(--glass-highlight);
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		background: var(--surface);
 	}
 	.tabs button {
-		padding: 8px 16px;
-		border: 0;
-		border-radius: 999px;
+		padding: 9px 22px;
+		border: 1px solid transparent;
+		border-radius: 10px;
 		background: transparent;
 		color: var(--muted);
 		font: inherit;
 		font-size: 0.9375rem;
-		font-weight: 550;
+		font-weight: 500;
 		cursor: pointer;
-		transition: color 0.15s ease, background-color 0.15s ease;
+		transition:
+			color 0.15s ease,
+			background-color 0.15s ease,
+			border-color 0.15s ease;
 	}
 	.tabs button:hover {
 		color: var(--heading);
 	}
 	.tabs button[aria-selected='true'] {
-		background: var(--navy);
-		color: #fff;
-		box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.15);
-	}
-	:global(:root[data-theme='dark']) .tabs button[aria-selected='true'] {
-		background: rgb(255 255 255 / 0.1);
 		color: var(--heading);
-		box-shadow:
-			inset 0 1px 0 rgb(255 255 255 / 0.12),
-			0 0 0 1px rgb(255 255 255 / 0.1);
+		border-color: color-mix(in srgb, var(--ice) 45%, transparent);
+		background: color-mix(in srgb, var(--ice) 8%, transparent);
+		box-shadow: 0 0 16px -4px color-mix(in srgb, var(--ice) 35%, transparent);
 	}
 	/* Without JavaScript every screenshot shows, one under the other. */
-	igloo-screens:not(:defined) .tabs {
+	igloo-screens:not(:defined) .tab-row {
 		display: none;
 	}
 	.panel {
@@ -221,34 +228,24 @@ const picture = {
 	igloo-screens:not(:defined) .panel + .panel {
 		margin-top: 40px;
 	}
-	/* The product shot in a glass frame, tilted back a little; it settles flat
-	   on hover. */
+	/* The product shot in a quiet window frame. */
 	.window {
 		overflow: hidden;
-		padding: 0 8px 8px;
-		border-radius: 18px;
-		border-color: var(--glass-border-strong);
+		padding: 0 10px 10px;
+		border: 1px solid var(--border-strong);
+		border-radius: 16px;
+		background: var(--bg-raised);
 		box-shadow:
-			var(--glass-highlight),
-			0 2px 4px rgb(0 0 0 / 0.08),
-			0 40px 80px -24px rgb(2 10 30 / 0.55);
-		transform: perspective(2400px) rotateX(4deg);
-		transform-origin: 50% 0;
-		transition: transform 0.5s cubic-bezier(0.2, 0.7, 0.2, 1);
+			inset 0 1px 0 rgb(255 255 255 / 0.04),
+			0 48px 96px -40px rgb(0 0 0 / 0.7);
 	}
-	.window:hover {
-		transform: none;
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.window {
-			transform: none;
-			transition: none;
-		}
+	:global(:root[data-theme='light']) .window {
+		box-shadow: 0 1px 2px rgb(13 20 38 / 0.05), 0 40px 80px -36px rgb(13 20 38 / 0.28);
 	}
 	.window-bar {
 		display: flex;
-		gap: 7px;
-		padding: 12px 6px;
+		gap: 8px;
+		padding: 14px 8px;
 	}
 	.window-bar span {
 		width: 11px;
@@ -258,25 +255,27 @@ const picture = {
 	}
 	.window :global(img) {
 		width: 100%;
-		border-radius: 10px;
-		border: 1px solid var(--glass-border);
+		border-radius: 8px;
+		border: 1px solid var(--border);
 	}
 	figcaption {
 		margin-top: 24px;
-		text-align: center;
+		font-size: 1.0625rem;
 		color: var(--muted);
 	}
 	.synthetic {
-		margin: 28px auto 0;
-		max-width: 640px;
-		text-align: center;
-		font-size: 0.875rem;
+		margin: 16px 0 0;
+		max-width: 720px;
+		font-size: 0.9375rem;
 		color: var(--muted);
 	}
 	.synthetic a {
 		color: inherit;
 	}
 	@media (max-width: 720px) {
+		.tab-row::after {
+			display: none;
+		}
 		.tabs {
 			flex-wrap: nowrap;
 			gap: 2px;
