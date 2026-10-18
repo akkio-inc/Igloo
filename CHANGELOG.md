@@ -562,7 +562,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 ### Web console
 
 - A web console on port 8443 (`IGLOO_CONSOLE_ADDR`): SQL worksheets with
-  cancel and CSV download, a data browser, query history, tasks, pipes and
+  cancel and CSV download, a data browser, query history (the console's
+  own lookups, recorded under the application name `Igloo console lookup`,
+  shown only when asked), tasks, pipes and
   materialized views with their runs, the load history, and admin pages
   for users, roles and grants, and the replica's sessions. Users sign in
   with their Igloo password or single sign-on; statements run as them

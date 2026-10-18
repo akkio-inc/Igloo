@@ -769,6 +769,12 @@ pre.definition {
 .history-detail dt { color: var(--text-muted); }
 .history-detail dd { margin: 0; word-break: break-word; }
 .history-detail pre { margin: 0; padding: 10px; border-radius: var(--radius); background: var(--code-bg); border: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; }
+.filters .check {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 2px;
+  font-weight: 550; white-space: nowrap; cursor: pointer;
+}
+.filters .check input { width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer; }
 
 .segmented { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden; }
 .segmented button {

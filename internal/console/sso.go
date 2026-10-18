@@ -202,7 +202,7 @@ func (c *Console) ssoStatus(w http.ResponseWriter, r *http.Request, req *request
 		}
 		out["users"] = users
 	}
-	res, err := c.run(r.Context(), req.user, r, "SHOW SSO GROUPS")
+	res, err := c.lookup(r.Context(), req.user, r, "SHOW SSO GROUPS")
 	if err != nil {
 		e := toSQLError(err)
 		out["mappings"] = grantsResult{Error: e.Message, Code: e.Code}

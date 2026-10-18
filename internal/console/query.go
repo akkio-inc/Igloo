@@ -33,6 +33,40 @@ const (
 
 type queryRequest struct {
 	SQL string `json:"sql"`
+	// Lookup marks the console's own lookups, which pages make to show
+	// themselves, such as SHOW TASKS, rather than what the user ran.
+	Lookup bool `json:"lookup,omitempty"`
+}
+
+// The application names of the console's SQL sessions, which the query
+// history records: what users run in worksheets and the changes they make
+// on its pages, and the lookups the pages make to show themselves (a
+// catalog page's dozen reads of the catalog's views, the lists of tasks
+// and tokens, the history page's own queries). The history page leaves
+// lookups out unless asked; every statement is recorded either way. Any
+// client can name itself anything with SET application_name, so this
+// separates the console's noise, not who may see what.
+const (
+	appConsole = "Igloo console"
+	appLookup  = "Igloo console lookup"
+)
+
+// appFor names the session of a request that is a lookup or not.
+func appFor(lookup bool) string {
+	if lookup {
+		return appLookup
+	}
+	return appConsole
+}
+
+// open opens a session for user, named app in the history.
+func (c *Console) open(ctx context.Context, user auth.User, r *http.Request, app string) (*pgwire.EmbeddedSession, error) {
+	es, err := c.sql.OpenEmbedded(ctx, user, client(r))
+	if err != nil {
+		return nil, err
+	}
+	es.SetApplicationName(app)
+	return es, nil
 }
 
 // sqlError is an error as SQL clients see it.
@@ -90,7 +124,7 @@ func (c *Console) query(w http.ResponseWriter, r *http.Request, req *request) {
 		writeError(w, http.StatusBadRequest, "nothing to run")
 		return
 	}
-	es, err := c.sql.OpenEmbedded(r.Context(), req.user, client(r))
+	es, err := c.open(r.Context(), req.user, r, appFor(in.Lookup))
 	if err != nil {
 		e := toSQLError(err)
 		writeJSON(w, statusFor(e), map[string]any{"error": e.Message, "code": e.Code})
@@ -278,7 +312,7 @@ func (c *Console) download(w http.ResponseWriter, r *http.Request, req *request)
 		writeError(w, http.StatusBadRequest, "send exactly one query to download")
 		return
 	}
-	es, err := c.sql.OpenEmbedded(r.Context(), req.user, client(r))
+	es, err := c.open(r.Context(), req.user, r, appConsole)
 	if err != nil {
 		e := toSQLError(err)
 		writeJSON(w, statusFor(e), map[string]any{"error": e.Message, "code": e.Code})
@@ -382,9 +416,19 @@ func (c *collect) Complete(tag string) error {
 	return nil
 }
 
-// run runs one statement as user and returns its result.
+// run runs one statement as user and returns its result: a change the
+// user asked for on one of the console's pages.
 func (c *Console) run(ctx context.Context, user auth.User, r *http.Request, sql string) (result, error) {
-	es, err := c.sql.OpenEmbedded(ctx, user, client(r))
+	return c.runAs(ctx, user, r, appConsole, sql)
+}
+
+// lookup is run for a lookup a page makes to show itself.
+func (c *Console) lookup(ctx context.Context, user auth.User, r *http.Request, sql string) (result, error) {
+	return c.runAs(ctx, user, r, appLookup, sql)
+}
+
+func (c *Console) runAs(ctx context.Context, user auth.User, r *http.Request, app, sql string) (result, error) {
+	es, err := c.open(ctx, user, r, app)
 	if err != nil {
 		return result{}, err
 	}

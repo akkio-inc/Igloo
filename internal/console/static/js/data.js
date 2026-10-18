@@ -43,7 +43,7 @@ export function createData(app) {
   async function load() {
     clear(tree, h('div', { class: 'result-message', text: 'Loading…' }));
     try {
-      const res = await api.query(OBJECTS);
+      const res = await api.lookup(OBJECTS);
       schemas = new Map();
       for (const o of api.objects(res)) {
         if (!schemas.has(o.schema_name)) schemas.set(o.schema_name, []);
@@ -128,7 +128,7 @@ export function createData(app) {
     try {
       // One request: column details (with comments), the object's comment,
       // a view's definition, and the policies and tags of a table.
-      const results = await api.queryAll(`
+      const results = await api.lookupAll(`
 SELECT c.column_name, c.data_type, c.is_nullable, coalesce(m.comment, c.comment) AS comment
 FROM duckdb_columns() c
 LEFT JOIN igloo_comments() m ON m.table_schema = c.schema_name AND m.table_name = c.table_name

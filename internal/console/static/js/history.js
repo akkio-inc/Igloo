@@ -12,6 +12,12 @@ const MISSING = new Set(['42P01', '3F000', '42704', '0A000', '42601', '42883']);
 
 const LIMIT = 500;
 
+// LOOKUPS is the application name the console's own lookups run under
+// (see internal/console/query.go): what its pages read to show
+// themselves, such as a catalog page's reads of igloo.tables. The page
+// leaves them out unless asked.
+const LOOKUPS = 'Igloo console lookup';
+
 const SOURCES = {
   queries: {
     table: 'igloo.query_history',
@@ -23,6 +29,7 @@ const SOURCES = {
       user: ['user_name', 'username', 'user', 'usename'],
       outcome: ['outcome', 'status', 'execution_status', 'state', 'result'],
       text: ['query_text', 'query', 'statement', 'sql_text', 'sql', 'text'],
+      app: ['application_name'],
       duration: ['duration_ms', 'elapsed_ms', 'total_elapsed_time', 'duration', 'elapsed'],
       rows: ['rows', 'rows_produced', 'row_count', 'rows_returned', 'rows_affected'],
       code: ['sqlstate', 'error_code', 'code'],
@@ -76,13 +83,17 @@ export function createHistory(app) {
   const search = h('input', { type: 'search', placeholder: 'Text in the query', 'aria-label': 'Search query text' });
   const customFields = [h('div', { class: 'field' }, h('label', { text: 'From' }), from), h('div', { class: 'field' }, h('label', { text: 'To' }), to)];
   const searchField = h('div', { class: 'field grow' }, h('label', { text: 'Search' }), search);
+  const lookups = h('input', { type: 'checkbox', 'aria-label': 'Show the console\'s own lookups' });
+  const lookupsField = h('label', {
+    class: 'check', title: `Queries the console runs to show its pages, such as a catalog page's reads of igloo.tables (application_name '${LOOKUPS}')`,
+  }, lookups, 'Console lookups');
   const outcomeField = h('div', { class: 'field' }, h('label', { text: 'Outcome' }), outcome);
   const userField = h('div', { class: 'field' }, h('label', { text: 'User' }), userInput);
   const filters = h('form', {
     class: 'filters',
     onsubmit: (e) => { e.preventDefault(); refresh(); },
   }, userField, outcomeField, h('div', { class: 'field' }, h('label', { text: 'Time' }), range), customFields, searchField,
-  h('button', { class: 'btn primary', type: 'submit' }, icon('search'), 'Apply'));
+  lookupsField, h('button', { class: 'btn primary', type: 'submit' }, icon('search'), 'Apply'));
 
   const toggle = h('div', { class: 'segmented', role: 'group', 'aria-label': 'History' },
     Object.entries(SOURCES).map(([key, s]) => h('button', {
@@ -104,13 +115,14 @@ export function createHistory(app) {
     if (range.value !== 'custom') refresh();
   });
   outcome.addEventListener('change', () => refresh());
+  lookups.addEventListener('change', () => refresh());
   for (const f of customFields) f.hidden = true;
 
   async function probe(key) {
     if (shape[key]) return shape[key];
     const src = SOURCES[key];
     try {
-      const res = await api.query(`SELECT * FROM ${src.table} LIMIT 0`);
+      const res = await api.lookup(`SELECT * FROM ${src.table} LIMIT 0`);
       const names = res.columns.map((c) => c.name);
       const map = {};
       for (const [field, candidates] of Object.entries(src.fields)) {
@@ -140,6 +152,7 @@ export function createHistory(app) {
         parts.push(`${api.ident(m.time)} >= now() - INTERVAL ${Number(range.value)} HOUR`);
       }
     }
+    if (m.app && !lookups.checked) parts.push(`coalesce(${api.ident(m.app)}, '') <> ${api.literal(LOOKUPS)}`);
     const text = search.value.trim();
     if (text && m.text) parts.push(`contains(lower(${api.ident(m.text)}), lower(${api.literal(text)}))`);
     return parts.length ? `\nWHERE ${parts.join('\n  AND ')}` : '';
@@ -164,11 +177,12 @@ export function createHistory(app) {
       return;
     }
     searchField.hidden = !s.map.text;
+    lookupsField.hidden = !s.map.app;
     outcomeField.hidden = !s.map.outcome;
     userField.hidden = !s.map.user;
     const order = s.map.time ? `\nORDER BY ${api.ident(s.map.time)} DESC` : '';
     try {
-      const res = await api.query(`SELECT * FROM ${src.table}${where(s)}${order}\nLIMIT ${LIMIT}`);
+      const res = await api.lookup(`SELECT * FROM ${src.table}${where(s)}${order}\nLIMIT ${LIMIT}`);
       columns = res.columns;
       rows = api.objects(res);
     } catch (e) {

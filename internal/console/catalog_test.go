@@ -308,3 +308,41 @@ func TestLineageGraph(t *testing.T) {
 		}
 	}
 }
+
+// The console's own lookups, which its pages make to show themselves, run
+// under an application name of their own, so the history page can leave
+// them out; what a user runs and changes runs under the console's. Both
+// are in the history.
+func TestLookupsAreNamed(t *testing.T) {
+	tc := newCatalogConsole(t)
+	walt := tc.signedIn(t, "walt")
+	admin := tc.signedIn(t, "igloo")
+
+	walt.rows("SELECT count(*) FROM lake.public.orders")
+	if status, body := walt.get("/api/catalog/object?catalog=lake&schema=public&name=orders"); status != http.StatusOK {
+		t.Fatalf("catalog page: %d %s", status, body)
+	}
+	if status, body := walt.get("/api/catalog/search?q=orders"); status != http.StatusOK {
+		t.Fatalf("search: %d %s", status, body)
+	}
+	resp := walt.do("POST", "/api/query", map[string]any{"sql": "SHOW TASKS", "lookup": true}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a lookup: %s", resp.Status)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	// The stand-in catalog's main schema, as in TestCatalogComment.
+	resp = walt.do("POST", "/api/catalog/comment", map[string]any{"kind": "table", "schema": "lake", "name": "notes", "comment": "Notes"}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("comment: %s", resp.Status)
+	}
+
+	rows := admin.rows(`SELECT application_name, string_agg(DISTINCT statement_type, ',' ORDER BY statement_type)
+		FROM igloo.query_history WHERE user_name = 'walt' GROUP BY ALL ORDER BY 1`)
+	var got []string
+	for _, r := range rows {
+		got = append(got, *r[0]+"|"+*r[1])
+	}
+	if want := []string{"Igloo console|COMMENT,SELECT", "Igloo console lookup|SELECT,SHOW TASKS,WITH"}; strings.Join(got, ";") != strings.Join(want, ";") {
+		t.Errorf("walt's history by application:\n got %q\nwant %q", got, want)
+	}
+}

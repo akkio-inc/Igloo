@@ -95,7 +95,7 @@ export function createJobs(app) {
     clear(body, h('div', { class: 'result-message', text: 'Loading…' }));
     count.textContent = '';
     try {
-      jobs = api.objects(await api.query(k.show));
+      jobs = api.objects(await api.lookup(k.show));
     } catch (e) {
       clear(body, MISSING.has(e.code) ? unavailable(k.title, k.show) : errorView(e));
       return;
@@ -191,7 +191,7 @@ export function createJobs(app) {
       runs);
     try {
       if (kind === 'pipe') {
-        const res = api.objects(await api.query(`SELECT start_time, file, status, row_count, error_count, first_error
+        const res = api.objects(await api.lookup(`SELECT start_time, file, status, row_count, error_count, first_error
 FROM igloo.load_history WHERE pipe_name = ${api.literal(j.name)}
 ORDER BY start_time DESC LIMIT 50`));
         clear(runs, res.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
@@ -206,7 +206,7 @@ ORDER BY start_time DESC LIMIT 50`));
           ]))))
           : h('p', { class: 'muted', text: 'No files loaded yet. Checks that find nothing new are not recorded.' }));
       } else if (kind === 'alert') {
-        const res = api.objects(await api.query(`SELECT start_time, trigger, state, duration_ms, row_count, integration, error
+        const res = api.objects(await api.lookup(`SELECT start_time, trigger, state, duration_ms, row_count, integration, error
 FROM igloo.alert_history WHERE alert_type = 'alert' AND alert_name = ${api.literal(j.name)}
 ORDER BY start_time DESC LIMIT 50`));
         clear(runs, res.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
@@ -222,7 +222,7 @@ ORDER BY start_time DESC LIMIT 50`));
           ]))))
           : h('p', { class: 'muted', text: 'No runs yet.' }));
       } else {
-        const res = api.objects(await api.query(`SELECT start_time, trigger, outcome, duration_ms, row_count, error
+        const res = api.objects(await api.lookup(`SELECT start_time, trigger, outcome, duration_ms, row_count, error
 FROM igloo.task_history WHERE kind = ${api.literal(kind)} AND name = ${api.literal(j.name)}
 ORDER BY start_time DESC LIMIT 50`));
         clear(runs, res.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
@@ -300,7 +300,7 @@ export function createLoads(app) {
     clear(body, h('div', { class: 'result-message', text: 'Loading…' }));
     count.textContent = '';
     try {
-      rows = api.objects(await api.query(`SELECT * FROM igloo.load_history${where()}\nORDER BY start_time DESC\nLIMIT ${LIMIT}`));
+      rows = api.objects(await api.lookup(`SELECT * FROM igloo.load_history${where()}\nORDER BY start_time DESC\nLIMIT ${LIMIT}`));
     } catch (e) {
       clear(body, MISSING.has(e.code) ? unavailable('Load histories', 'igloo.load_history') : [filters, errorView(e)]);
       return;

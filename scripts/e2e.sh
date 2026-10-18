@@ -832,6 +832,10 @@ else
 fi
 code="$(curl -s -o /dev/null -w '%{http_code}' -b "$work/cleo.cookies" "$console/api/catalog/object?catalog=lake&schema=mart&name=secret_margin")"
 if [ "$code" = 404 ]; then pass "a table one may not see has no page"; else fail "console page of a hidden table: $code"; fi
+# The page's reads are in the history, under a name the history page
+# leaves out by default.
+expect_soon "the console's own lookups are recorded under their own name" "t" igloo "$admin_password" \
+  "SELECT count(*) >= 8 FROM igloo.query_history WHERE user_name = 'cleo' AND application_name = 'Igloo console lookup'"
 got="$(curl -sS -b "$work/cleo.cookies" -H 'Content-Type: application/json' -H "X-CSRF-Token: $cleo_csrf" \
   -d '{"kind":"column","schema":"mart","name":"daily","column":"day","comment":"The day spent"}' "$console/api/catalog/comment")"
 if grep -q '"tag":"COMMENT"' <<<"$got"; then pass "an owner describes a column in the console"; else fail "console comment: $got"; fi

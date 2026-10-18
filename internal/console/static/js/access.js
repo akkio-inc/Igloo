@@ -138,7 +138,7 @@ export function createTokens(app) {
   async function load() {
     let tokens;
     try {
-      tokens = api.objects(await api.query(`SHOW TOKENS FOR USER ${api.ident(app.user)}`));
+      tokens = api.objects(await api.lookup(`SHOW TOKENS FOR USER ${api.ident(app.user)}`));
     } catch (e) {
       clear(body, h('div', { class: 'stack' }, create, errorView(e)));
       return;
@@ -248,7 +248,7 @@ export function createServiceAccounts(app) {
     try {
       const res = await api.get('/api/admin/users');
       users = res.rows.map((r) => Object.fromEntries(res.columns.map((c, i) => [c, r[i]])));
-      tokens = api.objects(await api.query('SHOW TOKENS'));
+      tokens = api.objects(await api.lookup('SHOW TOKENS'));
     } catch (e) {
       clear(body, h('div', { class: 'stack' }, create, errorView(e)));
       return;

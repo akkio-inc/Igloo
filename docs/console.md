@@ -52,8 +52,14 @@ as "1 hidden upstream table", never named. Owners, writers and admins can
 edit descriptions there, which the console does with `COMMENT ON`.
 
 **Query history.** Queries and sign-ins, filtered by user, outcome, time and
-text, read from `igloo.query_history` and `igloo.login_history`. On a server
-without those views the page says that history is not available.
+text, read from `igloo.query_history` and `igloo.login_history`. The
+console's own lookups, which its pages run to show themselves (a catalog
+page reads `igloo.tables`, `igloo.columns`, `igloo.lineage` and more; the
+Tasks page runs `SHOW TASKS`), are left out unless **Console lookups** is
+ticked. They are recorded all the same, with `application_name` `Igloo
+console lookup`; what users run in worksheets and the changes they make on
+the console's pages, sample rows included, have `Igloo console`. On a
+server without those views the page says that history is not available.
 
 **Tasks.** [Tasks, pipes, materialized views](loading.md) and
 [alerts](alerts.md), each with its owner, state, schedule, next run and
@@ -119,7 +125,7 @@ directly.
 
 Each request runs in a SQL session of its own, which counts against
 `IGLOO_MAX_CONNECTIONS` while it lasts and shows on the compute page as
-`console <address>`. Settings such as `SET search_path` therefore last for
+`console <address>`, the session's `client_address` in the history. Settings such as `SET search_path` therefore last for
 one run of a worksheet, not across runs. Closing the browser tab or pressing
 Cancel cancels the running statement.
 

@@ -28,10 +28,10 @@ const (
 	maxComment = 16 << 10
 )
 
-// runAll runs statements one after another as user, in one session, and
+// lookupAll runs lookups one after another as user, in one session, and
 // returns their results.
-func (c *Console) runAll(ctx context.Context, user auth.User, r *http.Request, sqls ...string) ([]result, error) {
-	es, err := c.sql.OpenEmbedded(ctx, user, client(r))
+func (c *Console) lookupAll(ctx context.Context, user auth.User, r *http.Request, sqls ...string) ([]result, error) {
+	es, err := c.open(ctx, user, r, appLookup)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func searchTerms(q string) []string {
 // columns and tags: GET /api/catalog/search?q=words.
 func (c *Console) search(w http.ResponseWriter, r *http.Request, req *request) {
 	terms := searchTerms(r.URL.Query().Get("q"))
-	res, err := c.run(r.Context(), req.user, r, searchSQL(terms))
+	res, err := c.lookup(r.Context(), req.user, r, searchSQL(terms))
 	if err != nil {
 		writeSQLError(w, err)
 		return
@@ -360,7 +360,7 @@ func (c *Console) object(w http.ResponseWriter, r *http.Request, req *request) {
 	is := func(dbCol, schemaCol, nameCol string) string {
 		return "lower(" + dbCol + ") = lower(" + d + ") AND lower(" + schemaCol + ") = lower(" + s + ") AND lower(" + nameCol + ") = lower(" + n + ")"
 	}
-	results, err := c.runAll(r.Context(), req.user, r,
+	results, err := c.lookupAll(r.Context(), req.user, r,
 		`SELECT table_catalog, table_schema, table_name, table_type, table_owner, owner_type, comment, provider, row_count, bytes,
 			file_count, snapshot_count, last_altered FROM igloo.tables WHERE `+is("table_catalog", "table_schema", "table_name"),
 		"SELECT schema_owner, owner_type, comment FROM igloo.schemata WHERE lower(catalog_name) = lower("+d+") AND lower(schema_name) = lower("+s+")",
@@ -421,7 +421,7 @@ func (c *Console) mayComment(ctx context.Context, user auth.User, r *http.Reques
 	if user.Role == auth.RoleAdmin || user.Role == auth.RoleWriter || ownerType == auth.GranteeUser && owner == user.Name {
 		return true
 	}
-	results, err := c.runAll(ctx, user, r, "SHOW ROLES", "SHOW GRANTS")
+	results, err := c.lookupAll(ctx, user, r, "SHOW ROLES", "SHOW GRANTS")
 	if err != nil {
 		return false
 	}

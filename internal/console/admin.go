@@ -27,7 +27,7 @@ func writeSQLError(w http.ResponseWriter, err error) {
 }
 
 func (c *Console) listUsers(w http.ResponseWriter, r *http.Request, req *request) {
-	res, err := c.run(r.Context(), req.user, r, "SHOW USERS")
+	res, err := c.lookup(r.Context(), req.user, r, "SHOW USERS")
 	if err != nil {
 		writeSQLError(w, err)
 		return
@@ -136,7 +136,7 @@ func (c *Console) listGrants(w http.ResponseWriter, r *http.Request, req *reques
 	out := map[string]any{}
 	available := false
 	for key, sql := range map[string]string{"roles": "SHOW ROLES", "grants": "SHOW GRANTS"} {
-		res, err := c.run(r.Context(), req.user, r, sql)
+		res, err := c.lookup(r.Context(), req.user, r, sql)
 		if err != nil {
 			e := toSQLError(err)
 			out[key] = grantsResult{Error: e.Message, Code: e.Code}

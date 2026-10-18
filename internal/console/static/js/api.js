@@ -47,8 +47,11 @@ export async function post(path, body, { signal, raw = false } = {}) {
 
 // stream runs a script and calls onEvent with each event the server sends
 // (see internal/console/query.go). Aborting signal cancels the statement.
-export async function stream(sql, onEvent, signal) {
-  const res = await post('/api/query', { sql }, { signal, raw: true });
+// lookup marks a query a page makes to show itself, rather than one the
+// user ran: the history records it under its own application name, and
+// the history page leaves it out unless asked.
+export async function stream(sql, onEvent, signal, { lookup = false } = {}) {
+  const res = await post('/api/query', lookup ? { sql, lookup } : { sql }, { signal, raw: true });
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = '';
   for (;;) {
@@ -77,7 +80,7 @@ export class SQLError extends Error {
 // queryAll runs a script and resolves to the results of its statements:
 // {columns: [{name, type}], rows, tag}. The first failure rejects with a
 // SQLError.
-export async function queryAll(sql, signal) {
+export async function queryAll(sql, signal, opts) {
   const results = [];
   let failure = null;
   await stream(sql, (ev) => {
@@ -91,14 +94,24 @@ export async function queryAll(sql, signal) {
       cur.ms = ev.complete.ms;
     }
     else if (ev.error) failure = new SQLError(ev.error);
-  }, signal);
+  }, signal, opts);
   if (failure) throw failure;
   return results;
 }
 
-export async function query(sql, signal) {
-  const results = await queryAll(sql, signal);
+export async function query(sql, signal, opts) {
+  const results = await queryAll(sql, signal, opts);
   return results[results.length - 1];
+}
+
+// lookup and lookupAll are query and queryAll for a page's own lookups
+// (see stream).
+export function lookup(sql, signal) {
+  return query(sql, signal, { lookup: true });
+}
+
+export function lookupAll(sql, signal) {
+  return queryAll(sql, signal, { lookup: true });
 }
 
 // rowsAsObjects maps a result's rows to objects keyed by column name.
