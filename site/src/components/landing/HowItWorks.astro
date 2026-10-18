@@ -109,7 +109,8 @@ const backends = [
 		align-items: stretch;
 	}
 	.node {
-		border: 1px solid var(--border-strong);
+		border: 1px solid;
+		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
 		border-radius: 10px;
 		background: var(--bg-raised);
 		color: var(--heading);
@@ -159,7 +160,8 @@ const backends = [
 		padding: 8px 18px 8px 14px;
 		border-radius: 10px;
 		background: var(--bg-raised);
-		border: 1px solid var(--border);
+		border: 1px solid;
+		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
 		font-size: 0.875rem;
 		line-height: 1.4;
 		color: var(--muted);
@@ -231,7 +233,7 @@ const backends = [
 	}
 
 	.description {
-		max-width: 1080px;
+		max-width: 1112px;
 		margin-top: 48px;
 		font-size: 1.125rem;
 		line-height: 1.65;
@@ -239,7 +241,7 @@ const backends = [
 	.description :global(ul) {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 20px 64px;
+		gap: 20px clamp(40px, 10vw, 140px);
 		padding: 0;
 		list-style: none;
 	}

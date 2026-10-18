@@ -6,7 +6,7 @@ import { REPO_URL } from '../../docs-manifest.mjs';
 import Icon from './Icon.astro';
 ---
 
-<section class="section" id="quick-start" aria-labelledby="quick-title">
+<section class="section railed" id="quick-start" aria-labelledby="quick-title">
 	<div class="container layout">
 		<div class="intro">
 			<span class="eyebrow">Get started</span>
@@ -32,13 +32,12 @@ import Icon from './Icon.astro';
 </section>
 
 <style>
-	/* Set off from the sections above by a hairline. */
 	.section {
-		border-top: 1px solid var(--border);
+		padding-bottom: 72px;
 	}
 	.layout {
 		display: grid;
-		grid-template-columns: minmax(0, 5fr) minmax(0, 9fr);
+		grid-template-columns: minmax(0, 382fr) minmax(0, 762fr);
 		gap: 56px;
 		align-items: start;
 	}

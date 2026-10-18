@@ -131,8 +131,22 @@ const drawing = (cores: number, layers: number) => {
 	.results {
 		display: grid;
 		grid-template-columns: repeat(3, minmax(0, 1fr));
-		gap: 20px;
+		gap: 40px;
 		margin-bottom: 36px;
+	}
+	@media (min-width: 1360px) {
+		.results {
+			margin-inline: -16px;
+		}
+	}
+	/* A hairline down the middle of each gap between cards. */
+	.result + .result::before {
+		content: '';
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: -21px;
+		border-left: 1px solid var(--border);
 	}
 	.result {
 		display: flex;
@@ -153,8 +167,8 @@ const drawing = (cores: number, layers: number) => {
 		color: var(--heading);
 	}
 	.art {
-		height: 190px;
-		margin: 28px 0 32px;
+		height: 160px;
+		margin: 20px 0 24px;
 		color: var(--line);
 	}
 	.art :global(svg) {
@@ -185,7 +199,7 @@ const drawing = (cores: number, layers: number) => {
 		grid-template-columns: repeat(2, minmax(0, 1fr));
 		margin: 0;
 		padding-top: 24px;
-		border-top: 1px solid var(--border);
+		border-top: 1px solid var(--rule);
 	}
 	dl div {
 		display: flex;
@@ -194,7 +208,7 @@ const drawing = (cores: number, layers: number) => {
 	}
 	dl div + div {
 		padding-left: 24px;
-		border-left: 1px solid var(--border);
+		border-left: 1px solid var(--rule);
 	}
 	dt {
 		margin-top: 4px;
@@ -233,6 +247,10 @@ const drawing = (cores: number, layers: number) => {
 	@media (max-width: 900px) {
 		.results {
 			grid-template-columns: minmax(0, 1fr);
+			gap: 16px;
+		}
+		.result + .result::before {
+			display: none;
 		}
 		.art {
 			height: 170px;

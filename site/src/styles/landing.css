@@ -28,11 +28,19 @@
 	--surface-2: rgb(255 255 255 / 0.04);
 	--surface-hover: rgb(255 255 255 / 0.035);
 	--inset: rgb(0 0 0 / 0.28);
-	--border: rgb(255 255 255 / 0.08);
+	--border: rgb(220 228 240 / 0.09);
 	--border-strong: rgb(255 255 255 / 0.14);
+	/* Linear's lit edges: a surface's top edge catches the light, its sides
+	   less, its bottom least. Hairline rules between things sit in between. */
+	--edge-top: rgb(190 210 235 / 0.38);
+	--edge-side: rgb(200 214 232 / 0.23);
+	--edge-bottom: rgb(200 214 232 / 0.16);
+	--rule: rgb(220 228 240 / 0.11);
+	--rule-strong: rgb(205 218 235 / 0.17);
+	--surface-sheen: radial-gradient(100% 180px at 50% 0%, rgb(143 190 250 / 0.045), transparent);
 	--line: rgb(255 255 255 / 0.22);
 	--shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 24px 48px -24px rgb(0 0 0 / 0.6);
-	--glow-ice: rgb(54 110 180 / 0.12);
+	--glow-ice: rgb(54 110 180 / 0.1);
 	--glow-amber: rgb(245 180 74 / 0.05);
 
 	--headline: linear-gradient(180deg, #ffffff 30%, #b9dcfb 100%);
@@ -84,6 +92,12 @@
 	--inset: #f5f6f8;
 	--border: rgb(13 20 38 / 0.09);
 	--border-strong: rgb(13 20 38 / 0.16);
+	--edge-top: rgb(13 20 38 / 0.11);
+	--edge-side: rgb(13 20 38 / 0.1);
+	--edge-bottom: rgb(13 20 38 / 0.15);
+	--rule: rgb(13 20 38 / 0.09);
+	--rule-strong: rgb(13 20 38 / 0.12);
+	--surface-sheen: linear-gradient(transparent, transparent);
 	--line: rgb(13 20 38 / 0.24);
 	--shadow: 0 1px 2px rgb(13 20 38 / 0.04), 0 24px 48px -28px rgb(13 20 38 / 0.18);
 	--glow-ice: rgb(79 159 230 / 0.09);
@@ -217,9 +231,32 @@ h3 {
 /* A quiet surface: a faint fill and a hairline edge. */
 .surface {
 	position: relative;
-	background: var(--surface);
-	border: 1px solid var(--border);
+	background: var(--surface-sheen), var(--surface);
+	border: 1px solid;
+	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
 	border-radius: var(--radius);
+}
+/* The same edges for anything else that is boxed. */
+.lit-edge {
+	border: 1px solid;
+	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
+}
+
+/* Rails: hairlines along the top and down both sides of a section, just
+   outside the content column, where the window is wide enough for them. */
+.railed::after {
+	content: '';
+	position: absolute;
+	z-index: -1;
+	inset: 0;
+	pointer-events: none;
+	border-top: 1px solid var(--rule-strong);
+}
+@media (min-width: 1360px) {
+	.railed::after {
+		inset: 0 calc(50% - var(--container) / 2 - 57px);
+		border-inline: 1px solid var(--rule);
+	}
 }
 
 /* Buttons */
@@ -275,7 +312,7 @@ h3 {
 .section {
 	position: relative;
 	isolation: isolate;
-	padding-block: 136px;
+	padding-block: 112px;
 }
 .section::before {
 	content: '';
@@ -295,7 +332,7 @@ h3 {
 		radial-gradient(560px 320px at 6% 600px, var(--glow-amber), transparent 70%);
 }
 .section-head {
-	max-width: 820px;
+	max-width: 960px;
 	margin-bottom: 56px;
 }
 .eyebrow {
@@ -321,7 +358,7 @@ h3 {
 }
 /* Large, tight headings with a soft sheen. */
 .headline {
-	font-size: clamp(2.25rem, 1.2rem + 3.2vw, 4rem);
+	font-size: clamp(2.25rem, 1rem + 4vw, 4.75rem);
 	font-weight: 600;
 	letter-spacing: -0.04em;
 	line-height: 1.04;
@@ -357,7 +394,8 @@ h3 {
 	width: 48px;
 	height: 48px;
 	border-radius: 10px;
-	border: 1px solid var(--border-strong);
+	border: 1px solid;
+	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
 	background: linear-gradient(180deg, var(--surface-2), transparent);
 	color: var(--ice);
 }
@@ -387,7 +425,7 @@ h3 {
 	padding: 0.15em 0.4em;
 	border-radius: 6px;
 	background: var(--surface-2);
-	border: 1px solid var(--border);
+	border: 1px solid var(--edge-side);
 	color: var(--heading);
 	font-size: 0.85em;
 	overflow-wrap: anywhere;
@@ -395,15 +433,18 @@ h3 {
 
 /* Expressive Code blocks: dark insets with a hairline edge. */
 .expressive-code .frame {
-	--ec-brdCol: var(--border);
+	--ec-brdCol: var(--edge-side);
 }
 .expressive-code .frame pre {
 	--ec-codeBg: rgb(0 0 0 / 0.3);
-	border-color: var(--border) !important;
+	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom) !important;
+}
+.expressive-code .frame.is-terminal pre {
+	border-top-color: var(--rule) !important;
 }
 .expressive-code .frame.is-terminal .header {
 	--ec-frm-trmTtbBg: rgb(255 255 255 / 0.03);
-	border-color: var(--border) !important;
+	border-color: var(--edge-top) var(--edge-side) var(--rule) !important;
 }
 :root[data-theme='light'] .expressive-code .frame pre {
 	--ec-codeBg: #f6f7f9;

@@ -23,8 +23,7 @@ import Icon from './Icon.astro';
 	.closing {
 		position: relative;
 		isolation: isolate;
-		padding: 152px 0 160px;
-		border-top: 1px solid var(--border);
+		padding: 136px 0 96px;
 	}
 	.closing::before {
 		content: '';
@@ -39,8 +38,10 @@ import Icon from './Icon.astro';
 	.panel {
 		max-width: 900px;
 	}
-	h2 {
-		font-size: clamp(2.25rem, 1.1rem + 3.6vw, 4.25rem);
+	/* .panel raises this above .headline's size (scoped selectors carry no
+	   class weight). */
+	.panel h2 {
+		font-size: clamp(2.25rem, 1.1rem + 3.2vw, 4rem);
 	}
 	p {
 		margin: 24px 0 0;

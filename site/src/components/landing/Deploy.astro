@@ -24,7 +24,7 @@ const targets = [
 ] as const;
 ---
 
-<section class="section section-alt" id="deploy" aria-labelledby="deploy-title">
+<section class="section section-alt railed" id="deploy" aria-labelledby="deploy-title">
 	<div class="container">
 		<div class="section-head">
 			<span class="eyebrow">Deploy</span>
@@ -54,6 +54,9 @@ const targets = [
 </section>
 
 <style>
+	.section {
+		padding-top: 104px;
+	}
 	.targets {
 		display: grid;
 		grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -70,8 +73,7 @@ const targets = [
 			border-color 0.2s ease;
 	}
 	.target:hover {
-		background: var(--surface-hover);
-		border-color: var(--border-strong);
+		background: var(--surface-sheen), var(--surface-hover);
 	}
 	.icon-box {
 		margin-bottom: 28px;

@@ -182,7 +182,7 @@ const picture = {
 		content: '';
 		flex: 1;
 		min-width: 0;
-		border-top: 1px solid var(--border);
+		border-top: 1px solid var(--rule-strong);
 	}
 	.tabs {
 		display: flex;
@@ -190,7 +190,8 @@ const picture = {
 		gap: 4px;
 		max-width: 100%;
 		padding: 4px;
-		border: 1px solid var(--border);
+		border: 1px solid;
+		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
 		border-radius: 14px;
 		background: var(--surface);
 	}
@@ -232,7 +233,8 @@ const picture = {
 	.window {
 		overflow: hidden;
 		padding: 0 10px 10px;
-		border: 1px solid var(--border-strong);
+		border: 1px solid;
+		border-color: var(--edge-top) var(--window-side, var(--edge-side)) var(--edge-bottom);
 		border-radius: 16px;
 		background: var(--bg-raised);
 		box-shadow:
@@ -253,10 +255,13 @@ const picture = {
 		border-radius: 50%;
 		background: var(--border-strong);
 	}
+	:global(:root[data-theme='dark']) .window {
+		--window-side: rgb(190 210 235 / 0.26);
+	}
 	.window :global(img) {
 		width: 100%;
 		border-radius: 8px;
-		border: 1px solid var(--border);
+		border: 1px solid var(--rule);
 	}
 	figcaption {
 		margin-top: 24px;

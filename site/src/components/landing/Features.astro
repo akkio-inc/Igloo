@@ -365,7 +365,7 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	.tile-0 li:nth-child(n + 3) {
 		margin-top: 20px;
 		padding-top: 20px;
-		border-top: 1px solid var(--border);
+		border-top: 1px solid var(--rule);
 	}
 	.tile-0 li:nth-child(2) {
 		padding-top: 0;
@@ -390,7 +390,7 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	.frag {
 		margin: 28px 0 8px;
 		padding: 14px 16px;
-		border: 1px solid var(--border);
+		border: 1px solid var(--rule-strong);
 		border-radius: 10px;
 		background: var(--inset);
 		font-family: var(--font-mono);
@@ -525,7 +525,7 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	li + li {
 		margin-top: 20px;
 		padding-top: 20px;
-		border-top: 1px solid var(--border);
+		border-top: 1px solid var(--rule);
 	}
 	li a {
 		font-size: 1.0625rem;
@@ -558,7 +558,8 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		flex-wrap: wrap;
 		gap: 2px;
 		padding: 4px;
-		border: 1px solid var(--border);
+		border: 1px solid;
+		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
 		border-radius: 999px;
 		background: var(--surface);
 	}
@@ -591,6 +592,16 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		margin-top: 24px;
 	}
 
+	/* Wide enough: the tiles' padding hangs outside the column, so their
+	   text lines up with the heading above. */
+	@media (min-width: 1360px) {
+		.bento {
+			margin-inline: -48px;
+		}
+		.tile {
+			padding: 36px 48px 40px;
+		}
+	}
 	@media (max-width: 1080px) {
 		.bento {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
