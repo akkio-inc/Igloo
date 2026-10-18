@@ -123,17 +123,23 @@ on GitHub name files that exist. External links are not fetched.
 
 **Not indexed until launch.** By default every page carries
 `<meta name="robots" content="noindex, nofollow">`, `robots.txt` disallows
-everything, and `site/dist/_headers` makes Cloudflare Pages send
+everything, and `site/dist/_headers` makes Cloudflare send
 `X-Robots-Tag: noindex, nofollow`. Build with `make site SITE_PUBLIC=1` to
 drop all three when the site goes public; add
 `SITE_URL=https://<domain>` for canonical URLs and a sitemap.
 
-**Deploying.** The site is static and is deployed to Cloudflare Pages:
+**Deploying.** The site is static. It is deployed as a Cloudflare Worker
+that serves `site/dist` (what Cloudflare Pages became), configured in
+`site/wrangler.jsonc`, to the workers.dev address of the Cloudflare account
+wrangler is signed in to:
 
 ```sh
 make site
-npx wrangler pages deploy site/dist --project-name igloo   # project name to be confirmed
+cd site && npx wrangler@4.147.0 deploy
 ```
+
+`make site` replaces `site/node_modules` with Linux builds, so run
+`npx wrangler` through `npx` as above rather than from `site/node_modules`.
 
 ## Conventions
 

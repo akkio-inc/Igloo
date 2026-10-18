@@ -1,0 +1,11 @@
+// The website is a Cloudflare Worker that serves site/dist as static assets
+// (what Cloudflare Pages became). Deploy with `npx wrangler deploy` from this
+// directory after `make site`; see CONTRIBUTING.md.
+{
+  "name": "igloo",
+  "compatibility_date": "2026-10-01",
+  // Served at igloo.<account>.workers.dev. Preview URLs stay off.
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": { "directory": "./dist", "not_found_handling": "404-page" }
+}
