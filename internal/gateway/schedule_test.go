@@ -37,11 +37,15 @@ func TestScheduledWorkStartsIgloo(t *testing.T) {
 		ResumeTimeout: 5 * time.Second,
 		Compute:       compute,
 	})
+	// The first client starts Igloo; that start takes at most as long as
+	// the client waits for its first reply.
+	connecting := time.Now()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	roundTrip(t, conn, bufio.NewReader(conn), "hello")
+	firstStart := time.Since(connecting)
 	_ = conn.Close()
 
 	// Work is due in a while: Igloo stops, and starts again in time for
@@ -50,9 +54,10 @@ func TestScheduledWorkStartsIgloo(t *testing.T) {
 	due.Store(at.UnixNano())
 	waitFor(t, "suspend", func() bool { _, stops := compute.counts(); return stops == 1 })
 	waitFor(t, "a start for the work", func() bool { starts, _ := compute.counts(); return starts == 2 })
-	// Early by at most the last start's time, which was short here.
-	if early := time.Until(at); early > 500*time.Millisecond {
-		t.Errorf("started %s before the work was due", early)
+	// Early by at most the last start's time. A fixed bound failed on
+	// loaded machines, where that start itself took longer.
+	if early := time.Until(at); early > firstStart {
+		t.Errorf("started %s before the work was due, more than the last start's %s", early, firstStart)
 	}
 	// Once the work is done, it stops again until the next.
 	due.Store(time.Now().Add(time.Hour).UnixNano())
