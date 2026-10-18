@@ -1,0 +1,81 @@
+---
+// The README's quick start, rendered from README.md at build time.
+import { Code } from '@astrojs/starlight/components';
+import { Content as Steps } from '../../generated/quick-start.md';
+import { REPO_URL } from '../../docs-manifest.mjs';
+import Icon from './Icon.astro';
+---
+
+<section class="section" id="quick-start" aria-labelledby="quick-title">
+	<div class="container layout">
+		<div class="intro">
+			<span class="eyebrow">Get started</span>
+			<h2 id="quick-title">Quick start</h2>
+			<p>Clone the repository, then start the single-machine stack with Docker Compose.</p>
+			<Code code={`git clone ${REPO_URL}.git\ncd Igloo`} lang="sh" />
+			<ul class="next">
+				<li>
+					<a href="/docs/"><Icon name="book" size={18} /> Read the docs</a>
+				</li>
+				<li>
+					<a href="/docs/configuration/"><Icon name="terminal" size={18} /> Every setting</a>
+				</li>
+				<li>
+					<a href="#deploy"><Icon name="cloud" size={18} /> Deploy to Kubernetes or the cloud</a>
+				</li>
+			</ul>
+		</div>
+		<div class="prose steps">
+			<Steps />
+		</div>
+	</div>
+</section>
+
+<style>
+	.layout {
+		display: grid;
+		grid-template-columns: minmax(0, 4fr) minmax(0, 8fr);
+		gap: 48px;
+		align-items: start;
+	}
+	.intro {
+		position: sticky;
+		top: calc(var(--header-h) + 32px);
+	}
+	.intro h2 {
+		font-size: clamp(1.875rem, 1.3rem + 2vw, 2.625rem);
+		font-weight: 800;
+	}
+	.intro > p {
+		margin: 16px 0 20px;
+		font-size: 1.125rem;
+		color: var(--muted);
+	}
+	.next {
+		margin: 28px 0 0;
+		padding: 0;
+		list-style: none;
+	}
+	.next li + li {
+		margin-top: 10px;
+	}
+	.next a {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		font-weight: 650;
+		text-decoration: none;
+	}
+	.next a:hover {
+		text-decoration: underline;
+	}
+	@media (max-width: 900px) {
+		.layout {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 32px;
+		}
+		.intro {
+			position: static;
+		}
+	}
+</style>

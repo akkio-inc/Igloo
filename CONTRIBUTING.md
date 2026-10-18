@@ -28,6 +28,8 @@ its tools in containers.
 | `make engines-e2e` | Run Spark and Trino against an isolated copy of the stack's Iceberg REST catalog (`scripts/engines-e2e.sh`; pulls about 3 GB, not part of CI) |
 | `make sharing-e2e` | Test Delta Sharing with the official Python client and the reference sharing server (`scripts/sharing-e2e.sh`); slower, and not part of CI |
 | `make down`, `make reset` | Stop the stack; `reset` also deletes its data |
+| `make site` | Build the website and documentation into `site/dist` and check its links ([details](#website)) |
+| `make site-dev` | Serve the website at `http://localhost:4321`, updating as you edit the docs |
 
 `make help` lists every target.
 
@@ -57,6 +59,7 @@ Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 - `helm lint` and `helm template` for `deploy/helm/igloo`
 - `tofu fmt`, `tofu validate` and `tofu test` for `deploy/aws`, `deploy/gcp` and `deploy/azure`
 - ShellCheck on shell scripts and actionlint on the workflows
+- `make site`: the website builds and has no broken links
 
 [`.github/workflows/bi-tools.yml`](.github/workflows/bi-tools.yml) runs
 `make bi-e2e` weekly and on demand.
@@ -74,7 +77,62 @@ deploy/helm/igloo/       Helm chart
 deploy/aws, gcp, azure/  OpenTofu modules for each cloud
 docs/                    user documentation; configuration.md is the settings reference
 scripts/                 helper scripts, including the end-to-end test
+site/                    the website: landing page, and the docs built from the markdown above
 .github/                 CI and release workflows, issue and pull request templates
+```
+
+## Website
+
+`site/` is the website: a landing page and the documentation, built with
+[Astro](https://astro.build/) and [Starlight](https://starlight.astro.build/)
+into a static site in `site/dist`. The documentation pages are the
+repository's markdown, so there is nothing to keep in sync by hand: edit
+`docs/sql.md` and the site's SQL page changes with it.
+
+`make site` builds it in a pinned Node container and fails on a broken link;
+`make site-dev` serves it at `http://localhost:4321` and reloads as you edit
+the docs. With Node 22.12 or later installed, `npm ci` and then
+`npm run build` or `npm run dev` in `site/` do the same without Docker
+(`npm ci` again when switching between the two, since `node_modules` holds
+platform-specific binaries).
+
+**Which files are pages.** `site/src/docs-manifest.mjs` lists them, with
+their URL and sidebar group: the README (as the overview), `docs/*.md`,
+`docs/design/`, the Helm chart's and cloud modules' READMEs, the benchmark,
+and `SECURITY.md`, `CONTRIBUTING.md` and `CHANGELOG.md`. A new document
+needs an entry there to appear on the site. `docs/upstream/` (drafts of issues
+for upstream projects) is left out.
+
+**How the sync works.** `site/scripts/sync-docs.mjs` runs before every build.
+It copies each page into `site/src/content/docs/`, taking the page title from
+the first `# Heading`, and rewrites links: a link to another page
+(`flight-sql.md`, `../docs/sso.md#tokens`) becomes the page's URL on the site
+with its anchor, an image is copied into the site (as WebP), and a link to
+any other file or directory (Go code, scripts, compose files) goes to the
+file on GitHub at `main`. GitHub's `<picture>` with a dark-mode `<source>`
+becomes two images that follow the site's theme switch. A relative link to a
+file that does not exist fails the sync. Write links as you would for GitHub;
+they work in both places. The landing page (`site/src/pages/index.astro` and
+`site/src/components/landing/`) quotes the README; its quick start and "How
+it works" text are taken from the README at build time, the rest is written
+out, so update it when the README's features or benchmark summary change.
+
+**Link check.** After the build, `site/scripts/check-links.mjs` checks every
+link, image and `#anchor` in `site/dist`, and that links to this repository
+on GitHub name files that exist. External links are not fetched.
+
+**Not indexed until launch.** By default every page carries
+`<meta name="robots" content="noindex, nofollow">`, `robots.txt` disallows
+everything, and `site/dist/_headers` makes Cloudflare Pages send
+`X-Robots-Tag: noindex, nofollow`. Build with `make site SITE_PUBLIC=1` to
+drop all three when the site goes public; add
+`SITE_URL=https://<domain>` for canonical URLs and a sitemap.
+
+**Deploying.** The site is static and is deployed to Cloudflare Pages:
+
+```sh
+make site
+npx wrangler pages deploy site/dist --project-name igloo   # project name to be confirmed
 ```
 
 ## Conventions

@@ -1,0 +1,22 @@
+---
+// Replaces Starlight's 404 (disable404Route in astro.config.mjs) to offer a
+// way back to the docs and the home page.
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+---
+
+<StarlightPage
+	frontmatter={{
+		title: 'Page not found',
+		template: 'splash',
+		editUrl: false,
+		pagefind: false,
+		hero: {
+			title: 'Page not found',
+			tagline: 'Check the address, or search the documentation.',
+			actions: [
+				{ text: 'Read the docs', link: '/docs/', icon: 'right-arrow' },
+				{ text: 'Home', link: '/', variant: 'minimal' },
+			],
+		},
+	}}
+/>

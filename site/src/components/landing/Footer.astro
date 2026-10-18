@@ -1,0 +1,129 @@
+---
+import logo from '../../assets/logo.svg?url';
+import { REPO_URL } from '../../docs-manifest.mjs';
+
+const columns = [
+	{
+		title: 'Docs',
+		links: [
+			['Overview', '/docs/'],
+			['SQL and clients', '/docs/sql/'],
+			['Configuration', '/docs/configuration/'],
+			['Operating Igloo', '/docs/operations/'],
+			['Benchmark', '/docs/benchmark/'],
+		],
+	},
+	{
+		title: 'Deploy',
+		links: [
+			['Quick start', '/#quick-start'],
+			['Helm chart', '/docs/deploy/helm/'],
+			['AWS', '/docs/deploy/aws/'],
+			['Google Cloud', '/docs/deploy/gcp/'],
+			['Azure', '/docs/deploy/azure/'],
+		],
+	},
+	{
+		title: 'Project',
+		links: [
+			['GitHub', REPO_URL],
+			['Changelog', '/docs/changelog/'],
+			['Contributing', '/docs/contributing/'],
+			['Security', '/docs/security/'],
+			['License', `${REPO_URL}/blob/main/LICENSE`],
+		],
+	},
+];
+---
+
+<footer class="site-footer">
+	<div class="container inner">
+		<div class="about">
+			<a class="brand" href="/">
+				<img src={logo} alt="" width="28" height="28" />
+				<span>Igloo</span>
+			</a>
+			<p>Open source SQL warehouse on Apache Iceberg.</p>
+			<p class="license">
+				Licensed under the <a href={`${REPO_URL}/blob/main/LICENSE`}>Apache License 2.0</a>.
+			</p>
+		</div>
+		{
+			columns.map((column) => (
+				<nav aria-label={column.title}>
+					<h2>{column.title}</h2>
+					<ul>
+						{column.links.map(([label, href]) => (
+							<li>
+								<a href={href}>{label}</a>
+							</li>
+						))}
+					</ul>
+				</nav>
+			))
+		}
+	</div>
+</footer>
+
+<style>
+	.site-footer {
+		padding: 56px 0 64px;
+		border-top: 1px solid var(--border);
+		background: var(--bg);
+	}
+	.inner {
+		display: grid;
+		grid-template-columns: 2fr repeat(3, 1fr);
+		gap: 40px;
+	}
+	.brand {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		color: var(--heading);
+		font-weight: 800;
+		font-size: 1.25rem;
+		letter-spacing: -0.03em;
+		text-decoration: none;
+	}
+	.about p {
+		margin: 12px 0 0;
+		color: var(--muted);
+	}
+	.about .license {
+		font-size: 0.875rem;
+	}
+	h2 {
+		margin-bottom: 14px;
+		font-size: 0.8125rem;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--muted);
+	}
+	ul {
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	li + li {
+		margin-top: 8px;
+	}
+	nav a {
+		color: var(--text);
+		text-decoration: none;
+	}
+	nav a:hover {
+		color: var(--link);
+		text-decoration: underline;
+	}
+	@media (max-width: 720px) {
+		.inner {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+			gap: 32px 20px;
+		}
+		.about {
+			grid-column: 1 / -1;
+		}
+	}
+</style>

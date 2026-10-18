@@ -1,0 +1,193 @@
+---
+import { Image } from 'astro:assets';
+import heroDark from '../../generated/hero-dark.png';
+import heroLight from '../../generated/hero-light.png';
+import { REPO_URL } from '../../docs-manifest.mjs';
+import Icon from './Icon.astro';
+
+// The banner's illustration, cropped off its lettering by scripts/sync-docs.mjs.
+const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw', format: 'webp', quality: 85 } as const;
+---
+
+<section class="hero" aria-labelledby="hero-title">
+	<div class="hero-art" aria-hidden="true">
+		<Image src={heroLight} alt="" class="theme-light" loading="eager" fetchpriority="high" {...art} />
+		<Image src={heroDark} alt="" class="theme-dark" loading="eager" fetchpriority="high" {...art} />
+	</div>
+	<div class="stars" aria-hidden="true"></div>
+	<div class="container hero-inner">
+		<div class="hero-copy">
+			<h1 id="hero-title">Igloo</h1>
+			<p class="tagline">Open source SQL warehouse on Apache Iceberg</p>
+			<p class="claim"><span>5x faster</span> • <span>30x cheaper per query*</span></p>
+			<p class="note">*at 10GB query scale, exact speedup and cost reduction will vary</p>
+			<p class="lead">
+				Igloo is an open-source SQL data warehouse that runs in your own cloud account or on your own hardware.
+			</p>
+			<div class="cta">
+				<a class="btn btn-primary" href="#quick-start">Get started <Icon name="arrow" /></a>
+				<a class="btn btn-secondary" href={REPO_URL}><Icon name="github" /> GitHub</a>
+			</div>
+			<p class="stack">Apache 2.0 · PostgreSQL wire protocol · DuckDB · Apache Iceberg</p>
+		</div>
+	</div>
+</section>
+
+<style>
+	.hero {
+		--hero-h: clamp(600px, 50vw, 700px);
+		position: relative;
+		min-height: var(--hero-h);
+		background: var(--hero-sky);
+		overflow: hidden;
+		isolation: isolate;
+	}
+
+	/* The art fills the hero's height on the left and fades into the sky. */
+	.hero-art {
+		position: absolute;
+		z-index: -1;
+		top: 0;
+		bottom: 0;
+		left: max(-22vw, calc((100vw - 1700px) / 2));
+		aspect-ratio: 1056 / 800;
+		/* Fade the right edge into the sky, the bottom into the page, and the
+		   top a little under the header. */
+		--fade: linear-gradient(to right, #000 72%, transparent 99%), linear-gradient(to top, transparent 0%, #000 22%),
+			linear-gradient(to bottom, rgb(0 0 0 / 0.35) 0, #000 150px);
+		-webkit-mask-image: var(--fade);
+		-webkit-mask-composite: source-in;
+		mask-image: var(--fade);
+		mask-composite: intersect;
+	}
+	.hero-art :global(img) {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+
+	/* A few stars carry the dark banner's night sky across to the text. */
+	.stars {
+		position: absolute;
+		z-index: -1;
+		inset: calc(var(--header-h) + 24px) 0 32% 46%;
+		opacity: 0;
+		background-image:
+			radial-gradient(1.2px 1.2px at 12% 18%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 28% 62%, #fff 60%, transparent),
+			radial-gradient(1.4px 1.4px at 41% 9%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 55% 33%, #fff 60%, transparent),
+			radial-gradient(1.2px 1.2px at 67% 74%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 74% 15%, #fff 60%, transparent),
+			radial-gradient(1.5px 1.5px at 86% 44%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 93% 8%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 18% 88%, #fff 60%, transparent),
+			radial-gradient(1.2px 1.2px at 36% 40%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 61% 92%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 81% 63%, #fff 60%, transparent),
+			radial-gradient(1.3px 1.3px at 97% 30%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 47% 70%, #fff 60%, transparent),
+			radial-gradient(1px 1px at 5% 50%, #fff 60%, transparent);
+	}
+	:global(:root[data-theme='dark']) .stars {
+		opacity: 0.75;
+	}
+
+	.hero-inner {
+		position: relative;
+		display: flex;
+		justify-content: flex-end;
+		align-items: center;
+		min-height: var(--hero-h);
+		padding-top: var(--header-h);
+		padding-bottom: 48px;
+	}
+	.hero-copy {
+		width: min(660px, 56%);
+	}
+
+	h1 {
+		font-size: clamp(3.75rem, 2rem + 6vw, 6.5rem);
+		font-weight: 850;
+		line-height: 0.95;
+		letter-spacing: -0.045em;
+		color: var(--hero-heading);
+	}
+	.tagline {
+		margin: 18px 0 0;
+		font-size: clamp(1.25rem, 0.8rem + 1vw, 1.625rem);
+		font-weight: 550;
+		line-height: 1.25;
+		letter-spacing: -0.01em;
+		color: var(--hero-text);
+	}
+	.claim {
+		margin: 14px 0 0;
+		font-size: clamp(1.5rem, 1rem + 1.6vw, 2.25rem);
+		font-weight: 800;
+		line-height: 1.2;
+		letter-spacing: -0.015em;
+		color: var(--hero-claim);
+	}
+	.claim span {
+		white-space: nowrap;
+	}
+	.note {
+		margin: 8px 0 0;
+		font-size: 0.9375rem;
+		color: var(--hero-note);
+	}
+	.lead {
+		margin: 24px 0 0;
+		max-width: 34em;
+		font-size: 1.125rem;
+		color: var(--hero-text);
+	}
+	.cta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+		margin-top: 28px;
+	}
+	.stack {
+		margin: 22px 0 0;
+		font-size: 0.875rem;
+		font-weight: 600;
+		letter-spacing: 0.01em;
+		color: var(--hero-note);
+	}
+
+	/* Narrow screens: the art on top, the text below it. */
+	@media (max-width: 959px) {
+		.hero {
+			min-height: 0;
+		}
+		.hero-art {
+			position: relative;
+			left: 0;
+			width: 100%;
+			height: auto;
+			aspect-ratio: 16 / 10;
+			margin-top: var(--header-h);
+			-webkit-mask-image: linear-gradient(to top, transparent 0%, #000 30%);
+			mask-image: linear-gradient(to top, transparent 0%, #000 30%);
+		}
+		.hero-art :global(img) {
+			object-position: 40% 70%;
+		}
+		.stars {
+			display: none;
+		}
+		.hero-inner {
+			min-height: 0;
+			margin-top: -36px;
+			padding-top: 0;
+			padding-bottom: 56px;
+			justify-content: flex-start;
+		}
+		.hero-copy {
+			width: 100%;
+			max-width: 600px;
+		}
+	}
+</style>

@@ -647,6 +647,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Server), each able to pull Igloo from a mirror or private registry.
 - A price-performance benchmark (`bench/`) that runs the same TPC-H queries
   on Igloo, Snowflake and Databricks and prices them by each one's billing.
+- A website (`site/`): a landing page and the documentation, built from the
+  repository's markdown with search, light and dark themes, and a link check
+  in CI (`make site`).
 - Workload management and chargeback (docs/workload-management.md): query
   tags (`SET query_tag`, and defaults per user or role), recorded with each
   statement's compute pool, CPU time, bytes read, memory allocated and time

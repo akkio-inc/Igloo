@@ -1,0 +1,125 @@
+---
+import Icon from './Icon.astro';
+
+// The README's opening bullets, in its words.
+const pillars = [
+	{
+		icon: 'terminal',
+		title: 'Postgres-compatible',
+		text: 'Clients connect over the PostgreSQL wire protocol, so <code>psql</code>, JDBC, psycopg, pgx, dbt, BI tools and notebooks work without an Igloo driver.',
+		href: '/docs/sql/',
+	},
+	{
+		icon: 'zap',
+		title: 'Arrow-native extracts',
+		text: 'Arrow Flight SQL streams results to pandas, polars, Spark and BI tools as Arrow record batches, through ADBC or the Flight SQL JDBC driver, several times faster than the PostgreSQL protocol.',
+		href: '/docs/flight-sql/',
+	},
+	{
+		icon: 'layers',
+		title: 'Open table format',
+		text: "Tables are Apache Iceberg in object storage (S3, GCS, Azure Data Lake Storage, or any S3-compatible store), with no proprietary storage to migrate out of. Spark, Trino and PyIceberg read and write them through Igloo's Iceberg REST catalog.",
+		href: '/docs/external-engines/',
+	},
+	{
+		icon: 'cpu',
+		title: 'Fast on one machine, cheap to run',
+		text: 'Queries run on an embedded DuckDB. Most analytical workloads fit on a single node; you pay for your own VMs and storage, nothing else.',
+		href: '/docs/benchmark/',
+	},
+	{
+		icon: 'cloud',
+		title: 'Runs anywhere',
+		text: 'Docker Compose for one machine, a Helm chart for any Kubernetes cluster, and OpenTofu modules that stand up the whole stack on AWS, Google Cloud or Azure.',
+		href: '#deploy',
+	},
+	{
+		icon: 'code',
+		title: 'Open source',
+		text: 'Licensed under Apache 2.0. Every component uses a permissive open-source license (Apache 2.0, MIT or the PostgreSQL License), except two libraries under the LGPL 2.1 inside DuckDB\'s extensions.',
+		href: '#how-it-works',
+	},
+] as const;
+---
+
+<section class="section pillars" aria-labelledby="pillars-title">
+	<div class="container">
+		<h2 id="pillars-title" class="sr-only">Why Igloo</h2>
+		<div class="grid">
+			{
+				pillars.map((pillar) => (
+					<a class="pillar card" href={pillar.href}>
+						<span class="icon">
+							<Icon name={pillar.icon} />
+						</span>
+						<h3>{pillar.title}</h3>
+						<p set:html={pillar.text} />
+					</a>
+				))
+			}
+		</div>
+	</div>
+</section>
+
+<style>
+	.pillars {
+		padding-top: 72px;
+		padding-bottom: 32px;
+	}
+	.grid {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 20px;
+	}
+	.pillar {
+		display: block;
+		padding: 26px 26px 28px;
+		color: inherit;
+		text-decoration: none;
+		transition:
+			transform 0.15s ease,
+			border-color 0.15s ease;
+	}
+	.pillar:hover {
+		transform: translateY(-2px);
+		border-color: var(--border-strong);
+	}
+	.icon {
+		display: inline-grid;
+		place-items: center;
+		width: 44px;
+		height: 44px;
+		margin-bottom: 18px;
+		border-radius: 12px;
+		background: var(--surface-2);
+		color: var(--ice);
+		border: 1px solid var(--border);
+	}
+	h3 {
+		font-size: 1.1875rem;
+		font-weight: 750;
+		letter-spacing: -0.01em;
+	}
+	p {
+		margin: 10px 0 0;
+		color: var(--muted);
+		font-size: 0.9875rem;
+		line-height: 1.6;
+	}
+	p :global(code) {
+		color: var(--heading);
+	}
+	@media (max-width: 959px) {
+		.grid {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+	@media (max-width: 600px) {
+		.grid {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.pillars {
+			padding-top: 48px;
+		}
+	}
+</style>

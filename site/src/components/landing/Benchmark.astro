@@ -1,0 +1,135 @@
+---
+import Icon from './Icon.astro';
+
+// The README's benchmark summary, figure for figure. Do not add claims here
+// that README.md and bench/README.md do not make.
+const results = [
+	{
+		scale: 'Scale factor 10 (10 GB)',
+		machine: 'One 16-core machine',
+		faster: '4.3–6.8×',
+		cheaper: '26–35×',
+		against: 'than a Snowflake X-Small (Gen1 or Gen2) or Databricks SQL Serverless 2X-Small warehouse',
+	},
+	{
+		scale: 'Scale factor 100',
+		machine: 'The same machine',
+		faster: '2.2–3.2×',
+		cheaper: '10–16×',
+		against: 'than those warehouses',
+	},
+	{
+		scale: 'Scale factor 100',
+		machine: 'A 64-core machine',
+		faster: '2.4–3.2×',
+		cheaper: '59–69×',
+		against: 'than their X-Large sizes',
+	},
+];
+---
+
+<section class="section section-alt" id="benchmark" aria-labelledby="bench-title">
+	<div class="container">
+		<div class="section-head">
+			<span class="eyebrow">Benchmark</span>
+			<h2 id="bench-title">Price-performance on TPC-H</h2>
+			<p>
+				The 22 TPC-H queries with tables in Amazon S3, against Snowflake and Databricks on the same data and queries:
+				speed, and cost per query at list prices. The margins vary with scale and size.
+			</p>
+		</div>
+		<div class="results">
+			{
+				results.map((result) => (
+					<div class="result card">
+						<div class="scale">{result.scale}</div>
+						<div class="machine">{result.machine}</div>
+						<dl>
+							<div>
+								<dt>faster</dt>
+								<dd>{result.faster}</dd>
+							</div>
+							<div>
+								<dt>cheaper</dt>
+								<dd>{result.cheaper}</dd>
+							</div>
+						</dl>
+						<p>{result.against}</p>
+					</div>
+				))
+			}
+		</div>
+		<a class="more-link" href="/docs/benchmark/">
+			The method, every result and its caveats <Icon name="arrow" size={16} />
+		</a>
+	</div>
+</section>
+
+<style>
+	.results {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 20px;
+		margin-bottom: 28px;
+	}
+	.result {
+		padding: 24px 26px 26px;
+	}
+	.scale {
+		font-size: 0.8125rem;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--muted);
+	}
+	.machine {
+		margin-top: 4px;
+		font-weight: 700;
+		color: var(--heading);
+	}
+	dl {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+		margin: 18px 0 0;
+	}
+	dl div {
+		display: flex;
+		flex-direction: column-reverse;
+	}
+	dt {
+		font-size: 0.875rem;
+		color: var(--muted);
+	}
+	dd {
+		margin: 0;
+		font-size: clamp(1.75rem, 1.2rem + 1.4vw, 2.25rem);
+		font-weight: 800;
+		letter-spacing: -0.02em;
+		line-height: 1.1;
+		color: var(--heading);
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+	dl div:last-child dd {
+		color: var(--amber);
+	}
+	.result p {
+		margin: 16px 0 0;
+		padding-top: 14px;
+		border-top: 1px solid var(--border);
+		font-size: 0.9375rem;
+		color: var(--muted);
+	}
+	/* Three narrow cards: stack each card's two figures. */
+	@media (min-width: 901px) and (max-width: 1180px) {
+		dl {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+	@media (max-width: 900px) {
+		.results {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>

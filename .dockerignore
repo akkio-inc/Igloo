@@ -4,3 +4,4 @@ deploy
 docs
 **/.env
 *.md
+site

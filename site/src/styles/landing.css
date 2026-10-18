@@ -1,0 +1,344 @@
+/*
+ * The landing page. Colors come from the README banners: the light banner's
+ * icy sky and navy lettering, the dark banner's night sky, and the amber of
+ * the igloo's doorway as the one warm accent.
+ */
+
+:root {
+	color-scheme: dark;
+	--font: 'Figtree Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		sans-serif;
+	--font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+
+	--bg: #0b1528;
+	--bg-alt: #0d1930;
+	--surface: #111e37;
+	--surface-2: #16264a;
+	--border: #213153;
+	--border-strong: #2f4370;
+	--heading: #ffffff;
+	--text: #c2cee0;
+	--muted: #8d9cb6;
+	--link: #8cc8fb;
+	--amber: #f7ca7a;
+	--amber-fill-1: #ffdc95;
+	--amber-fill-2: #f5b44a;
+	--ice: #a9d6fd;
+	--navy: #0f2d56;
+	--igloo-node: linear-gradient(180deg, #1c2f57, #14254a);
+	--shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px -12px rgb(0 0 0 / 0.6);
+
+	--hero-sky: linear-gradient(180deg, #02163c 0%, #04183f 45%, #0a1f47 78%, #0b1528 100%);
+	--hero-heading: #ffffff;
+	--hero-text: #b7cdea;
+	--hero-claim: #f7ca7a;
+	--hero-note: #8aa8cf;
+
+	/* Expressive Code (the quick start's code blocks) reads Starlight's variables. */
+	--sl-color-white: #ffffff;
+	--sl-color-gray-1: #e4ecf7;
+	--sl-color-gray-2: #c2cee0;
+	--sl-color-gray-3: #8d9cb6;
+	--sl-color-gray-4: #5a6a86;
+	--sl-color-gray-5: #2c3b57;
+	--sl-color-gray-6: #142039;
+	--sl-color-gray-7: #101b31;
+	--sl-color-black: #0b1528;
+	--sl-color-accent: #4f9fe6;
+	--sl-color-accent-high: #a9d6fd;
+	--sl-color-text: var(--text);
+	--sl-text-code: 0.8125rem;
+	--sl-line-height: 1.7;
+	--__sl-font: var(--font);
+	--__sl-font-mono: var(--font-mono);
+
+	--container: 1160px;
+	--gutter: 24px;
+	--radius: 14px;
+	--header-h: 64px;
+}
+
+:root[data-theme='light'] {
+	color-scheme: light;
+	--bg: #ffffff;
+	--bg-alt: #f3f8fe;
+	--surface: #ffffff;
+	--surface-2: #eef5fd;
+	--border: #dbe6f3;
+	--border-strong: #c3d4ea;
+	--heading: #0d2242;
+	--text: #2c4263;
+	--muted: #4c6283;
+	--link: #1d6bbf;
+	--amber: #a8620a;
+	--ice: #1d6bbf;
+	--igloo-node: linear-gradient(180deg, #fff7e8, #ffffff);
+	--shadow: 0 1px 2px rgb(15 45 86 / 0.06), 0 12px 32px -14px rgb(15 45 86 / 0.22);
+
+	--hero-sky: linear-gradient(180deg, #9fd2fd 0%, #bfe2fd 40%, #d6ebfe 70%, #eef6ff 90%, #ffffff 100%);
+	--hero-heading: #0f2d56;
+	--hero-text: #123058;
+	--hero-claim: #b26a0c;
+	--hero-note: #3d5f86;
+
+	--sl-color-white: #0d2242;
+	--sl-color-gray-1: #172d4d;
+	--sl-color-gray-2: #2c4263;
+	--sl-color-gray-3: #4c6283;
+	--sl-color-gray-4: #8294b0;
+	--sl-color-gray-5: #c6d3e4;
+	--sl-color-gray-6: #e6eef8;
+	--sl-color-gray-7: #f3f7fc;
+	--sl-color-black: #ffffff;
+	--sl-color-accent: #1d6bbf;
+	--sl-color-accent-high: #123f78;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	scroll-behavior: smooth;
+	scroll-padding-top: calc(var(--header-h) + 16px);
+	-webkit-text-size-adjust: 100%;
+}
+@media (prefers-reduced-motion: reduce) {
+	html {
+		scroll-behavior: auto;
+	}
+}
+
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--text);
+	font-family: var(--font);
+	font-size: 1rem;
+	line-height: 1.6;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	overflow-x: clip;
+}
+
+img {
+	max-width: 100%;
+	height: auto;
+	display: block;
+}
+
+a {
+	color: var(--link);
+	text-underline-offset: 0.18em;
+}
+
+code {
+	font-family: var(--font-mono);
+	font-size: 0.9em;
+}
+
+h1,
+h2,
+h3 {
+	color: var(--heading);
+	margin: 0;
+	line-height: 1.15;
+	letter-spacing: -0.02em;
+	text-wrap: balance;
+}
+
+.container {
+	width: 100%;
+	max-width: calc(var(--container) + 2 * var(--gutter));
+	margin-inline: auto;
+	padding-inline: var(--gutter);
+}
+
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+.skip-link {
+	position: absolute;
+	left: 16px;
+	top: -100px;
+	z-index: 100;
+	padding: 8px 14px;
+	border-radius: 8px;
+	background: var(--surface);
+	color: var(--heading);
+}
+.skip-link:focus {
+	top: 12px;
+}
+
+:focus-visible {
+	outline: 2px solid var(--link);
+	outline-offset: 2px;
+}
+
+/* Images that exist in a light and a dark version. */
+:root[data-theme='light'] .theme-dark,
+:root[data-theme='dark'] .theme-light {
+	display: none !important;
+}
+
+/* Buttons */
+.btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 0.5rem;
+	height: 46px;
+	padding: 0 22px;
+	border-radius: 999px;
+	font-weight: 650;
+	font-size: 1rem;
+	text-decoration: none;
+	white-space: nowrap;
+	transition:
+		transform 0.15s ease,
+		box-shadow 0.15s ease,
+		background-color 0.15s ease;
+}
+.btn svg {
+	width: 18px;
+	height: 18px;
+	flex: none;
+}
+.btn-primary {
+	color: var(--navy);
+	background: linear-gradient(180deg, var(--amber-fill-1), var(--amber-fill-2));
+	box-shadow:
+		0 1px 0 rgb(255 255 255 / 0.6) inset,
+		0 8px 24px -8px rgb(245 180 74 / 0.75);
+}
+.btn-primary:hover {
+	transform: translateY(-1px);
+	box-shadow:
+		0 1px 0 rgb(255 255 255 / 0.6) inset,
+		0 12px 28px -8px rgb(245 180 74 / 0.9);
+}
+.btn-secondary {
+	color: var(--hero-heading);
+	background: rgb(255 255 255 / 0.06);
+	border: 1px solid rgb(255 255 255 / 0.22);
+	backdrop-filter: blur(6px);
+}
+:root[data-theme='light'] .btn-secondary {
+	background: rgb(255 255 255 / 0.6);
+	border-color: rgb(15 45 86 / 0.18);
+}
+.btn-secondary:hover {
+	transform: translateY(-1px);
+	background: rgb(255 255 255 / 0.12);
+}
+:root[data-theme='light'] .btn-secondary:hover {
+	background: rgb(255 255 255 / 0.9);
+}
+
+/* Sections */
+.section {
+	padding-block: 96px;
+}
+.section-alt {
+	background: var(--bg-alt);
+	border-block: 1px solid var(--border);
+}
+.section-head {
+	max-width: 760px;
+	margin-bottom: 48px;
+}
+.section-head.center {
+	max-width: 860px;
+	margin-inline: auto;
+	text-align: center;
+}
+.eyebrow {
+	display: inline-block;
+	margin-bottom: 12px;
+	font-size: 0.8125rem;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--amber);
+}
+.section-head h2 {
+	font-size: clamp(1.875rem, 1.3rem + 2vw, 2.625rem);
+	font-weight: 800;
+}
+.section-head p {
+	margin: 16px 0 0;
+	font-size: 1.125rem;
+	color: var(--muted);
+}
+.more-link {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-weight: 650;
+	text-decoration: none;
+}
+.more-link:hover {
+	text-decoration: underline;
+}
+
+/* Cards */
+.card {
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+}
+
+/* Prose rendered from the README (quick start, how it works) */
+.prose {
+	color: var(--text);
+	font-size: 1.0625rem;
+}
+.prose > * {
+	margin-block: 0;
+}
+.prose > * + * {
+	margin-top: 1.1em;
+}
+.prose ul {
+	padding-left: 1.25em;
+}
+.prose li + li {
+	margin-top: 0.6em;
+}
+.prose strong {
+	color: var(--heading);
+}
+.prose :not(pre) > code {
+	padding: 0.1em 0.35em;
+	border-radius: 5px;
+	background: var(--surface-2);
+	border: 1px solid var(--border);
+	color: var(--heading);
+	font-size: 0.85em;
+	overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+	:root {
+		--gutter: 16px;
+	}
+	.section {
+		padding-block: 64px;
+	}
+	.section-head {
+		margin-bottom: 32px;
+	}
+}

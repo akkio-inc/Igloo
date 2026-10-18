@@ -1,0 +1,404 @@
+---
+import { Code } from '@astrojs/starlight/components';
+import Icon from './Icon.astro';
+
+// "What you get" from the README, grouped, in its words. Each links to the
+// page that documents it.
+const groups = [
+	{
+		icon: 'database',
+		title: 'SQL and tables',
+		items: [
+			{
+				title: 'Iceberg tables',
+				text: 'CREATE TABLE, CREATE TABLE AS, INSERT, UPDATE, DELETE, MERGE, schemas, views, comments, and time travel.',
+				href: '/docs/sql/',
+			},
+			{
+				title: 'Zero-copy clones',
+				text: 'A full copy of production to develop and test against, made in seconds without copying data; and Iceberg branches and tags.',
+				href: '/docs/sql/#clones',
+			},
+			{
+				title: 'Media analytics',
+				text: 'HLL and theta sketches for deduplicated reach and audience overlap; geometry and H3 functions for DMA, zip code and store-radius reporting.',
+				href: '/docs/media-analytics/',
+			},
+			{
+				title: 'Connections to other databases',
+				text: 'Query PostgreSQL and MySQL databases in place, read-only, and join them with Iceberg tables.',
+				href: '/docs/federation/',
+			},
+		],
+	},
+	{
+		icon: 'shield',
+		title: 'Security and governance',
+		items: [
+			{
+				title: 'Users, roles and grants',
+				text: 'SCRAM-SHA-256 passwords, built-in roles, and custom roles with grants on schemas and tables, all managed in SQL.',
+				href: '/docs/sql/#roles-and-grants',
+			},
+			{
+				title: 'Single sign-on',
+				text: 'Okta, Microsoft Entra ID, Google Workspace or any OpenID Connect provider; access tokens and service accounts.',
+				href: '/docs/sso/',
+			},
+			{
+				title: 'Row access and masking policies, and tags',
+				text: "Show each team only its clients' rows, and mask identifiers for everyone not allowed to see them.",
+				href: '/docs/security-policies/',
+			},
+			{
+				title: 'Erasure of personal data',
+				text: "For GDPR and CCPA requests: one statement deletes a person's rows from every table whose columns are tagged with their identifiers.",
+				href: '/docs/privacy/',
+			},
+		],
+	},
+	{
+		icon: 'activity',
+		title: 'Data in and out',
+		items: [
+			{
+				title: 'Loading and scheduling',
+				text: 'COPY INTO, pipes that load new files as they land, tasks on a cron or interval schedule, and materialized views.',
+				href: '/docs/loading/',
+			},
+			{
+				title: 'Alerts and notifications',
+				text: 'Alerts run a query on a schedule and notify Slack, Microsoft Teams, email and webhooks when it returns rows.',
+				href: '/docs/alerts/',
+			},
+			{
+				title: 'Delta Sharing',
+				text: "Share tables with clients and partners through the open protocol, and query partners' shares as external tables.",
+				href: '/docs/sharing/',
+			},
+			{
+				title: 'Other engines',
+				text: "Spark, Trino, PyIceberg, Databricks and Snowflake through an Iceberg REST catalog, under Igloo's grants.",
+				href: '/docs/external-engines/',
+			},
+		],
+	},
+	{
+		icon: 'chart',
+		title: 'Operations',
+		items: [
+			{
+				title: 'Data catalog',
+				text: 'Search, owners and descriptions, size and freshness, usage and table-level lineage from the query history.',
+				href: '/docs/catalog/',
+			},
+			{
+				title: 'Workload management',
+				text: 'Query tags, per-client usage and estimated cost, per-role limits, and compute pools.',
+				href: '/docs/workload-management/',
+			},
+			{
+				title: 'Scale to zero',
+				text: "A small gateway stops Igloo's machines or pods when nobody uses them and starts them when a client connects.",
+				href: '/docs/scale-to-zero/',
+			},
+			{
+				title: 'Distributed execution',
+				text: 'A query over a very large table runs in parts on worker machines that Igloo starts when it needs them.',
+				href: '/docs/distributed-execution/',
+			},
+		],
+	},
+] as const;
+
+// Examples from the README, one per tab.
+const examples = [
+	{
+		id: 'clones',
+		label: 'Clones',
+		href: '/docs/sql/#clones',
+		code: `CREATE OR REPLACE SCHEMA dbt_ana CLONE analytics;
+CREATE TABLE dev.orders CLONE prod.orders AT (TIMESTAMP => now() - INTERVAL 1 DAY);
+ALTER TABLE prod.orders CREATE TAG q3_close;`,
+	},
+	{
+		id: 'policies',
+		label: 'Policies',
+		href: '/docs/security-policies/',
+		code: `CREATE ROW ACCESS POLICY client_rows AS (cid VARCHAR) RETURNS BOOLEAN ->
+  EXISTS (SELECT 1 FROM governance.client_access a
+          WHERE a.client_id = cid AND is_role_in_session(a.role_name));
+ALTER TABLE marts.impressions ADD ROW ACCESS POLICY client_rows ON (client_id);
+CREATE MASKING POLICY mask_pii AS (val VARCHAR) RETURNS VARCHAR ->
+  CASE WHEN is_role_in_session('pii_reader') THEN val ELSE sha256(val) END;
+CREATE TAG pii ALLOWED_VALUES 'email', 'device_id';
+ALTER TAG pii SET MASKING POLICY mask_pii;
+ALTER TABLE marts.impressions ALTER COLUMN email SET TAG pii = 'email';`,
+	},
+	{
+		id: 'sharing',
+		label: 'Sharing',
+		href: '/docs/sharing/',
+		code: `CREATE SHARE acme_reporting;
+ALTER SHARE acme_reporting ADD TABLE marts.campaign_daily;
+CREATE RECIPIENT acme;                       -- returns a one-time activation link
+GRANT SELECT ON SHARE acme_reporting TO RECIPIENT acme;
+CREATE EXTERNAL TABLE partners.viewership FROM SHARE tvco_ads.tv.viewing.daily;`,
+	},
+	{
+		id: 'loading',
+		label: 'Loading',
+		href: '/docs/loading/',
+		code: `COPY INTO sales FROM 's3://drops/sales/' (FORMAT csv, PATTERN '.*[.]csv[.]gz');
+CREATE TASK nightly SCHEDULE '0 6 * * *' TIMEZONE 'America/New_York' AS
+  CREATE OR REPLACE TABLE report AS SELECT day, sum(spend) FROM sales GROUP BY day;`,
+	},
+	{
+		id: 'alerts',
+		label: 'Alerts',
+		href: '/docs/alerts/',
+		code: `CREATE NOTIFICATION INTEGRATION ops_slack TYPE slack URL 'https://hooks.slack.com/services/...'
+  OPERATIONAL_ALERTS = (FAILED_RUNS, IDLE_PIPES = 26);
+GRANT USAGE ON INTEGRATION ops_slack TO ROLE analysts;
+CREATE ALERT pacing SCHEDULE '0 9 * * MON-FRI' IF (EXISTS (
+    SELECT campaign FROM marts.pacing WHERE abs(spend / planned - 1) > 0.2))
+  THEN NOTIFY ops_slack MESSAGE 'Pacing is off plan for {{campaign}}' WITH RESULT;`,
+	},
+	{
+		id: 'erasure',
+		label: 'Erasure',
+		href: '/docs/privacy/',
+		code: `GRANT ERASE ON ACCOUNT TO privacy_officer;
+ERASE SUBJECT WHERE pii.email = 'ann@example.com' OR pii.device_id = '6F9619FF-8B86-D011-B42D-00C04FC964FF';
+SELECT status, verification FROM igloo.erasure_requests;
+ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
+	},
+];
+---
+
+<section class="section section-alt" id="features" aria-labelledby="features-title">
+	<div class="container">
+		<div class="section-head">
+			<span class="eyebrow">Features</span>
+			<h2 id="features-title">What you get</h2>
+			<p>
+				Tables, governance, loading, sharing and operations, each linked to its documentation. What 1.0 does not do yet
+				is listed under <a href="/docs/#limitations-in-10">Limitations in 1.0</a>.
+			</p>
+		</div>
+
+		<div class="groups">
+			{
+				groups.map((group) => (
+					<div class="group">
+						<h3>
+							<span class="icon">
+								<Icon name={group.icon} size={20} />
+							</span>
+							{group.title}
+						</h3>
+						<ul>
+							{group.items.map((item) => (
+								<li>
+									<a href={item.href}>{item.title}</a>
+									<p>{item.text}</p>
+								</li>
+							))}
+						</ul>
+					</div>
+				))
+			}
+		</div>
+
+		<igloo-sql-tabs class="showcase">
+			<div class="showcase-head">
+				<h3>In SQL</h3>
+				<div class="tabs" role="tablist" aria-label="SQL examples">
+					{
+						examples.map((example, i) => (
+							<button
+								type="button"
+								role="tab"
+								id={`sql-tab-${example.id}`}
+								aria-controls={`sql-panel-${example.id}`}
+								aria-selected={i === 0 ? 'true' : 'false'}
+								tabindex={i === 0 ? 0 : -1}
+							>
+								{example.label}
+							</button>
+						))
+					}
+				</div>
+			</div>
+			{
+				examples.map((example) => (
+					<div
+						class="sql-panel"
+						role="tabpanel"
+						id={`sql-panel-${example.id}`}
+						aria-labelledby={`sql-tab-${example.id}`}
+					>
+						<Code code={example.code} lang="sql" />
+						<a class="more-link" href={example.href}>
+							Read the docs <Icon name="arrow" size={16} />
+						</a>
+					</div>
+				))
+			}
+		</igloo-sql-tabs>
+	</div>
+</section>
+
+<script>
+	class IglooSqlTabs extends HTMLElement {
+		connectedCallback() {
+			const tabs = [...this.querySelectorAll<HTMLButtonElement>('[role=tab]')];
+			const panels = [...this.querySelectorAll<HTMLElement>('[role=tabpanel]')];
+			const select = (index: number, focus = false) => {
+				tabs.forEach((tab, i) => {
+					const selected = i === index;
+					tab.setAttribute('aria-selected', String(selected));
+					tab.tabIndex = selected ? 0 : -1;
+					panels[i].hidden = !selected;
+					if (selected && focus) tab.focus();
+				});
+			};
+			tabs.forEach((tab, i) => {
+				tab.addEventListener('click', () => select(i));
+				tab.addEventListener('keydown', (event) => {
+					const step = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+					if (!step) return;
+					event.preventDefault();
+					select((i + step + tabs.length) % tabs.length, true);
+				});
+			});
+			select(0);
+		}
+	}
+	customElements.define('igloo-sql-tabs', IglooSqlTabs);
+</script>
+
+<style>
+	.groups {
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 20px;
+	}
+	.group {
+		padding: 24px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--surface);
+	}
+	.group h3 {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 14px;
+		font-size: 1.125rem;
+		font-weight: 800;
+	}
+	.group .icon {
+		display: inline-grid;
+		place-items: center;
+		width: 40px;
+		height: 40px;
+		border-radius: 11px;
+		border: 1px solid var(--border);
+		background: var(--surface-2);
+		color: var(--ice);
+	}
+	ul {
+		margin: 18px 0 0;
+		padding: 0;
+		list-style: none;
+	}
+	li + li {
+		margin-top: 16px;
+		padding-top: 16px;
+		border-top: 1px solid var(--border);
+	}
+	li a {
+		font-weight: 700;
+		color: var(--heading);
+		text-decoration: none;
+	}
+	li a:hover {
+		color: var(--link);
+		text-decoration: underline;
+	}
+	li p {
+		margin: 4px 0 0;
+		font-size: 0.9375rem;
+		line-height: 1.55;
+		color: var(--muted);
+	}
+
+	.showcase {
+		display: block;
+		margin-top: 48px;
+		padding: 28px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--surface);
+	}
+	.showcase-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		margin-bottom: 20px;
+	}
+	.showcase-head h3 {
+		font-size: 1.375rem;
+		font-weight: 800;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+	}
+	.tabs button {
+		padding: 7px 14px;
+		border: 1px solid transparent;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--muted);
+		font: inherit;
+		font-size: 0.9375rem;
+		font-weight: 650;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		color: var(--heading);
+	}
+	.tabs button[aria-selected='true'] {
+		border-color: var(--border-strong);
+		background: var(--surface-2);
+		color: var(--heading);
+	}
+	igloo-sql-tabs:not(:defined) .tabs {
+		display: none;
+	}
+	.sql-panel .more-link {
+		margin-top: 14px;
+	}
+	igloo-sql-tabs:not(:defined) .sql-panel + .sql-panel {
+		margin-top: 24px;
+	}
+
+	@media (max-width: 1080px) {
+		.groups {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+	@media (max-width: 600px) {
+		.groups {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.showcase {
+			padding: 18px;
+		}
+	}
+</style>

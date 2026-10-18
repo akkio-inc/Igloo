@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.astro/
+# npm's download cache when building in Docker (make site)
+.npm/
+
+# Generated from the repository by scripts/sync-docs.mjs
+src/content/docs/
+src/generated/
+public/files/

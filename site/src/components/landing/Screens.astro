@@ -1,0 +1,262 @@
+---
+import { Image } from 'astro:assets';
+import catalogDark from '../../generated/screenshots/console-catalog-dark.png';
+import catalog from '../../generated/screenshots/console-catalog.png';
+import worksheetDark from '../../generated/screenshots/console-worksheet-dark.png';
+import worksheet from '../../generated/screenshots/console-worksheet.png';
+import metabase from '../../generated/screenshots/metabase-dashboard.png';
+import notebook from '../../generated/screenshots/notebook.png';
+import { REPO_URL } from '../../docs-manifest.mjs';
+
+// Alt text and captions are the README's and docs/catalog.md's.
+const screens = [
+	{
+		id: 'worksheet',
+		tab: 'Worksheet',
+		caption: 'The web console: SQL worksheets, with the same users as SQL clients.',
+		href: '/docs/console/',
+		light: worksheet,
+		dark: worksheetDark,
+		alt: "Igloo's web console: a worksheet running a reach, frequency and spend query by advertiser over 21.9 million ad impressions, with its results below.",
+	},
+	{
+		id: 'catalog',
+		tab: 'Catalog',
+		caption: 'The data catalog: descriptions, owners, freshness, usage and lineage.',
+		href: '/docs/catalog/',
+		light: catalog,
+		dark: catalogDark,
+		alt: 'The catalog page of media.delivery: its description and owner, cards for rows, size, freshness, snapshots, reads, writes and users, and a lineage graph from raw.campaigns and raw.impressions through media.delivery to the tables made from it.',
+	},
+	{
+		id: 'metabase',
+		tab: 'Metabase',
+		caption: 'Metabase through the PostgreSQL driver.',
+		href: '/docs/integrations/',
+		light: metabase,
+		alt: 'A Metabase dashboard on Igloo: impressions, spend, daily delivery, reach and frequency by campaign, top advertisers and click-through rate by channel.',
+	},
+	{
+		id: 'notebook',
+		tab: 'Jupyter',
+		caption: 'Jupyter with SQLAlchemy and Arrow Flight SQL.',
+		href: '/docs/flight-sql/',
+		light: notebook,
+		alt: 'A Jupyter notebook on Igloo: a reach curve merged from stored HLL sketches and a frequency distribution pulled over Arrow Flight SQL, with their charts.',
+	},
+];
+
+const picture = {
+	widths: [640, 960, 1280, 1920],
+	sizes: '(min-width: 1208px) 1160px, calc(100vw - 32px)',
+	format: 'webp' as const,
+	quality: 88,
+	loading: 'lazy' as const,
+};
+---
+
+<section class="section" id="screenshots" aria-labelledby="screens-title">
+	<div class="container">
+		<div class="section-head center">
+			<span class="eyebrow">See it</span>
+			<h2 id="screens-title">The console, and the tools you already use</h2>
+			<p>
+				A web console for SQL, data and administration, and BI tools and notebooks connected through their PostgreSQL
+				drivers or Arrow Flight SQL.
+			</p>
+		</div>
+
+		<igloo-screens>
+			<div class="tabs" role="tablist" aria-label="Screenshots">
+				{
+					screens.map((screen, i) => (
+						<button
+							type="button"
+							role="tab"
+							id={`tab-${screen.id}`}
+							aria-controls={`panel-${screen.id}`}
+							aria-selected={i === 0 ? 'true' : 'false'}
+							tabindex={i === 0 ? 0 : -1}
+						>
+							{screen.tab}
+						</button>
+					))
+				}
+			</div>
+
+			{
+				screens.map((screen, i) => (
+					<figure
+						class="panel"
+						role="tabpanel"
+						id={`panel-${screen.id}`}
+						aria-labelledby={`tab-${screen.id}`}
+						data-first={i === 0 ? '' : undefined}
+					>
+						<div class="window">
+							<div class="window-bar" aria-hidden="true">
+								<span />
+								<span />
+								<span />
+							</div>
+							{screen.dark ? (
+								<>
+									<Image src={screen.light} alt={screen.alt} class="theme-light" {...picture} />
+									<Image src={screen.dark} alt={screen.alt} class="theme-dark" {...picture} />
+								</>
+							) : (
+								<Image src={screen.light} alt={screen.alt} {...picture} />
+							)}
+						</div>
+						<figcaption>
+							{screen.caption} <a href={screen.href}>Read more</a>
+						</figcaption>
+					</figure>
+				))
+			}
+		</igloo-screens>
+
+		<p class="synthetic">
+			Screenshots use synthetic ad-impression data from <a
+				href={`${REPO_URL}/blob/main/deploy/single-vm/sql/load-media.sql`}><code>deploy/single-vm/sql/load-media.sql</code></a
+			>; the advertisers are invented.
+		</p>
+	</div>
+</section>
+
+<script>
+	class IglooScreens extends HTMLElement {
+		connectedCallback() {
+			const tabs = [...this.querySelectorAll<HTMLButtonElement>('[role=tab]')];
+			const panels = [...this.querySelectorAll<HTMLElement>('[role=tabpanel]')];
+			const select = (index: number, focus = false) => {
+				tabs.forEach((tab, i) => {
+					const selected = i === index;
+					tab.setAttribute('aria-selected', String(selected));
+					tab.tabIndex = selected ? 0 : -1;
+					panels[i].hidden = !selected;
+					if (selected && focus) tab.focus();
+				});
+			};
+			tabs.forEach((tab, i) => {
+				tab.addEventListener('click', () => select(i));
+				tab.addEventListener('keydown', (event) => {
+					const step = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+					if (!step) return;
+					event.preventDefault();
+					select((i + step + tabs.length) % tabs.length, true);
+				});
+			});
+			select(0);
+		}
+	}
+	customElements.define('igloo-screens', IglooScreens);
+</script>
+
+<style>
+	igloo-screens {
+		display: block;
+	}
+	.tabs {
+		display: flex;
+		justify-content: center;
+		flex-wrap: wrap;
+		gap: 6px;
+		width: fit-content;
+		max-width: 100%;
+		margin: 0 auto 28px;
+		padding: 5px;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		background: var(--surface);
+	}
+	.tabs button {
+		padding: 8px 16px;
+		border: 0;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--muted);
+		font: inherit;
+		font-size: 0.9375rem;
+		font-weight: 650;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		color: var(--heading);
+	}
+	.tabs button[aria-selected='true'] {
+		background: var(--navy);
+		color: #fff;
+	}
+	:global(:root[data-theme='dark']) .tabs button[aria-selected='true'] {
+		background: var(--ice);
+		color: var(--navy);
+	}
+	/* Without JavaScript every screenshot shows, one under the other. */
+	igloo-screens:not(:defined) .tabs {
+		display: none;
+	}
+	.panel {
+		margin: 0;
+	}
+	igloo-screens:not(:defined) .panel + .panel {
+		margin-top: 40px;
+	}
+	.window {
+		overflow: hidden;
+		border: 1px solid var(--border-strong);
+		border-radius: 12px;
+		background: var(--surface);
+		box-shadow:
+			0 2px 4px rgb(0 0 0 / 0.06),
+			0 30px 60px -20px rgb(4 22 60 / 0.45);
+	}
+	.window-bar {
+		display: flex;
+		gap: 7px;
+		padding: 11px 14px;
+		border-bottom: 1px solid var(--border);
+		background: var(--surface-2);
+	}
+	.window-bar span {
+		width: 11px;
+		height: 11px;
+		border-radius: 50%;
+		background: var(--border-strong);
+	}
+	.window :global(img) {
+		width: 100%;
+	}
+	figcaption {
+		margin-top: 16px;
+		text-align: center;
+		color: var(--muted);
+	}
+	.synthetic {
+		margin: 28px auto 0;
+		max-width: 640px;
+		text-align: center;
+		font-size: 0.875rem;
+		color: var(--muted);
+	}
+	.synthetic a {
+		color: inherit;
+	}
+	@media (max-width: 720px) {
+		.tabs {
+			flex-wrap: nowrap;
+			gap: 2px;
+		}
+		.tabs button {
+			padding: 7px 11px;
+			font-size: 0.875rem;
+		}
+		.window-bar {
+			padding: 8px 10px;
+		}
+		.window-bar span {
+			width: 8px;
+			height: 8px;
+		}
+	}
+</style>

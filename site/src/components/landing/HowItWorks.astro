@@ -1,0 +1,271 @@
+---
+// The README's "How it works" diagram, drawn in HTML so it reflows on phones,
+// followed by the README's own description of each part.
+import { Content as Description } from '../../generated/how-it-works.md';
+
+const clients = [
+	{ title: 'psql · JDBC · BI tools', via: 'PostgreSQL wire protocol', detail: 'SCRAM, optional TLS' },
+	{ title: 'pandas · polars · Spark (ADBC) · Flight JDBC', via: 'Arrow Flight SQL', detail: 'TLS, or localhost only' },
+	{ title: 'Spark · Trino · PyIceberg · Databricks · Snowflake', via: 'Iceberg REST', detail: 'port 8181' },
+];
+
+const backends = [
+	{ title: 'Object storage', sub: 'S3, GCS, ADLS, S3-compatible', via: 'Parquet data and Iceberg metadata' },
+	{ title: 'Lakekeeper', sub: 'Iceberg REST catalog', via: 'Iceberg REST' },
+	{ title: 'PostgreSQL', sub: "Catalog metadata, and users and roles (schema igloo_auth)", via: 'Users and roles' },
+];
+---
+
+<section class="section" id="how-it-works" aria-labelledby="how-title">
+	<div class="container">
+		<div class="section-head">
+			<span class="eyebrow">Architecture</span>
+			<h2 id="how-title">How it works</h2>
+			<p>One Go server in front of an embedded DuckDB, with tables in Apache Iceberg on your object storage.</p>
+		</div>
+
+		<figure class="diagram" aria-label="Architecture diagram">
+			<div class="row">
+				{
+					clients.map((client) => (
+						<div class="cell">
+							<div class="node client">{client.title}</div>
+							<div class="edge down">
+								<span>
+									<strong>{client.via}</strong>
+									{client.detail}
+								</span>
+							</div>
+						</div>
+					))
+				}
+			</div>
+			<div class="mobile-arrow" aria-hidden="true"></div>
+			<div class="node igloo">
+				<span class="igloo-name">igloo</span>
+				<span class="igloo-sub">1..n replicas · DuckDB inside · users, roles and grants checked on every statement</span>
+			</div>
+			<div class="mobile-arrow" aria-hidden="true"></div>
+			<div class="row">
+				{
+					backends.map((backend, i) => (
+						<div class="cell">
+							<div class="edge down">
+								<span>
+									<strong>{backend.via}</strong>
+								</span>
+							</div>
+							<div class:list={['node', 'backend', { 'feeds-next': i === 1 }]}>
+								<span class="backend-title">{backend.title}</span>
+								<span class="backend-sub">{backend.sub}</span>
+							</div>
+						</div>
+					))
+				}
+			</div>
+		</figure>
+
+		<div class="prose description">
+			<Description />
+		</div>
+	</div>
+</section>
+
+<style>
+	.diagram {
+		margin: 0;
+		padding: 32px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background:
+			radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--muted) 22%, transparent) 1px, transparent 0) 0 0 /
+				22px 22px,
+			var(--bg-alt);
+	}
+	.row {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 20px;
+	}
+	.cell {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+	}
+	.node {
+		border: 1px solid var(--border-strong);
+		border-radius: 12px;
+		background: var(--surface);
+		box-shadow: var(--shadow);
+		color: var(--heading);
+	}
+	.client {
+		flex: 1;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 14px 16px;
+		font-weight: 650;
+		text-align: center;
+	}
+	.edge {
+		position: relative;
+		display: flex;
+		justify-content: center;
+		min-height: 64px;
+		padding: 10px 0;
+	}
+	/* A vertical line with an arrowhead, its label on a chip over the line. */
+	.edge::before {
+		content: '';
+		position: absolute;
+		top: 0;
+		bottom: 6px;
+		left: 50%;
+		border-left: 2px solid var(--border-strong);
+	}
+	.edge::after {
+		content: '';
+		position: absolute;
+		bottom: 0;
+		left: calc(50% - 6px);
+		border: 6px solid transparent;
+		border-top: 7px solid var(--border-strong);
+		border-bottom: 0;
+	}
+	.edge span {
+		position: relative;
+		align-self: center;
+		padding: 4px 10px;
+		border-radius: 8px;
+		background: var(--bg-alt);
+		font-size: 0.8125rem;
+		line-height: 1.4;
+		text-align: center;
+		color: var(--muted);
+	}
+	.edge strong {
+		display: block;
+		color: var(--text);
+		font-weight: 650;
+	}
+	.igloo {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 4px;
+		padding: 20px 24px;
+		text-align: center;
+		border-color: color-mix(in srgb, var(--amber-fill-2) 70%, transparent);
+		background: var(--igloo-node);
+		box-shadow:
+			0 0 0 4px color-mix(in srgb, var(--amber-fill-2) 14%, transparent),
+			var(--shadow);
+	}
+	.igloo-name {
+		font-family: var(--font-mono);
+		font-size: 1.375rem;
+		font-weight: 700;
+	}
+	.igloo-sub {
+		color: var(--muted);
+		font-size: 0.9375rem;
+	}
+	.backend {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 14px 16px;
+		text-align: center;
+		flex: 1;
+	}
+	.backend-title {
+		font-weight: 700;
+	}
+	.backend-sub {
+		color: var(--muted);
+		font-size: 0.875rem;
+	}
+	/* Lakekeeper keeps its metadata in PostgreSQL. */
+	.feeds-next::after {
+		content: '';
+		position: absolute;
+		top: 50%;
+		right: -20px;
+		width: 20px;
+		border-top: 2px solid var(--border-strong);
+	}
+
+	.description {
+		max-width: 880px;
+		margin-top: 40px;
+	}
+	.description :global(ul) {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 16px 40px;
+		padding: 0;
+		list-style: none;
+	}
+	.description :global(li + li) {
+		margin-top: 0;
+	}
+
+	.mobile-arrow {
+		display: none;
+	}
+
+	@media (max-width: 860px) {
+		.diagram {
+			padding: 20px;
+		}
+		.row {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 12px;
+		}
+		/* No lines between stacked boxes: each box names its protocol, and one
+		   arrow joins each row to igloo. */
+		.edge {
+			min-height: 0;
+			padding: 6px 0 0;
+		}
+		.row:last-child .edge {
+			padding: 0 0 6px;
+		}
+		.edge::before,
+		.edge::after,
+		.feeds-next::after {
+			display: none;
+		}
+		.edge span {
+			padding: 0;
+			background: transparent;
+		}
+		.mobile-arrow {
+			display: block;
+			position: relative;
+			height: 40px;
+		}
+		.mobile-arrow::before {
+			content: '';
+			position: absolute;
+			top: 6px;
+			bottom: 12px;
+			left: 50%;
+			border-left: 2px solid var(--border-strong);
+		}
+		.mobile-arrow::after {
+			content: '';
+			position: absolute;
+			bottom: 6px;
+			left: calc(50% - 6px);
+			border: 6px solid transparent;
+			border-top: 7px solid var(--border-strong);
+			border-bottom: 0;
+		}
+		.description :global(ul) {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>

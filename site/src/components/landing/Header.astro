@@ -1,0 +1,158 @@
+---
+import logo from '../../assets/logo.svg?url';
+import { REPO_URL } from '../../docs-manifest.mjs';
+import Icon from './Icon.astro';
+---
+
+<header class="site-header" data-header>
+	<div class="container header-inner">
+		<a class="brand" href="/" aria-label="Igloo home">
+			<img src={logo} alt="" width="32" height="32" />
+			<span>Igloo</span>
+		</a>
+		<nav class="nav" aria-label="Main">
+			<a href="/docs/">Docs</a>
+			<a class="wide-only" href="#quick-start">Quick start</a>
+			<a class="wide-only" href="/docs/benchmark/">Benchmark</a>
+			<a class="wide-only" href="/docs/changelog/">Changelog</a>
+		</nav>
+		<div class="actions">
+			<a class="icon-button" href={REPO_URL} aria-label="Igloo on GitHub">
+				<Icon name="github" size={20} />
+			</a>
+			<button class="icon-button" type="button" data-theme-toggle aria-label="Switch to light theme">
+				<Icon name="sun" class="theme-dark" size={20} />
+				<Icon name="moon" class="theme-light" size={20} />
+			</button>
+		</div>
+	</div>
+</header>
+
+<script>
+	// Same storage key and values as Starlight's theme picker, so a choice made
+	// here carries over to the docs and back.
+	const storageKey = 'starlight-theme';
+	const root = document.documentElement;
+	const toggle = document.querySelector<HTMLButtonElement>('[data-theme-toggle]');
+	const label = () => {
+		const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+		toggle?.setAttribute('aria-label', `Switch to ${next} theme`);
+	};
+	label();
+	toggle?.addEventListener('click', () => {
+		const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+		root.dataset.theme = next;
+		try {
+			localStorage.setItem(storageKey, next);
+		} catch {}
+		label();
+	});
+	matchMedia('(prefers-color-scheme: light)').addEventListener('change', (event) => {
+		let stored = null;
+		try {
+			stored = localStorage.getItem(storageKey);
+		} catch {}
+		if (stored) return;
+		root.dataset.theme = event.matches ? 'light' : 'dark';
+		label();
+	});
+
+	// The header is solid over content, and transparent only at the very top,
+	// over the hero. Without this script it stays solid.
+	const header = document.querySelector<HTMLElement>('[data-header]');
+	const update = () => header?.toggleAttribute('data-at-top', window.scrollY <= 8);
+	update();
+	window.addEventListener('scroll', update, { passive: true });
+</script>
+
+<style>
+	.site-header {
+		position: fixed;
+		inset: 0 0 auto;
+		z-index: 50;
+		height: var(--header-h);
+		background: var(--bg);
+		background: color-mix(in srgb, var(--bg) 92%, transparent);
+		border-bottom: 1px solid var(--border);
+		backdrop-filter: saturate(1.4) blur(14px);
+		-webkit-backdrop-filter: saturate(1.4) blur(14px);
+		transition:
+			background-color 0.2s ease,
+			border-color 0.2s ease;
+	}
+	.site-header[data-at-top] {
+		background: transparent;
+		border-bottom-color: transparent;
+		backdrop-filter: none;
+		-webkit-backdrop-filter: none;
+	}
+	.header-inner {
+		display: flex;
+		align-items: center;
+		gap: 32px;
+		height: 100%;
+	}
+	.brand {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		color: var(--heading);
+		font-weight: 800;
+		font-size: 1.375rem;
+		letter-spacing: -0.03em;
+		text-decoration: none;
+	}
+	.site-header[data-at-top] .brand {
+		color: var(--hero-heading);
+	}
+	.nav {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		margin-right: auto;
+	}
+	.nav a {
+		padding: 6px 12px;
+		border-radius: 8px;
+		color: var(--text);
+		font-weight: 600;
+		font-size: 0.9375rem;
+		text-decoration: none;
+	}
+	.site-header[data-at-top] .nav a {
+		color: var(--hero-text);
+	}
+	.nav a:hover {
+		background: color-mix(in srgb, var(--hero-heading) 10%, transparent);
+	}
+	.actions {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+	}
+	.icon-button {
+		display: inline-grid;
+		place-items: center;
+		width: 40px;
+		height: 40px;
+		border: 0;
+		border-radius: 10px;
+		background: transparent;
+		color: var(--heading);
+		cursor: pointer;
+	}
+	.site-header[data-at-top] .icon-button {
+		color: var(--hero-heading);
+	}
+	.icon-button:hover {
+		background: color-mix(in srgb, var(--hero-heading) 10%, transparent);
+	}
+	@media (max-width: 720px) {
+		.header-inner {
+			gap: 12px;
+		}
+		.wide-only {
+			display: none;
+		}
+	}
+</style>

@@ -34,6 +34,15 @@ updates:
       - dependency-name: postgres
         update-types: [version-update:semver-major]
 
+  # The website's build tools, pinned to exact versions in site/package.json.
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: weekly
+    groups:
+      site-minor-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
