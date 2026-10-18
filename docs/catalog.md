@@ -20,6 +20,11 @@ most used first, and has a page for each: its description, owner, columns
 with their descriptions, tags and masking policies, size and freshness,
 usage, a sample of its rows and its lineage.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/console-catalog-dark.png">
+  <img alt="The catalog page of media.delivery: its description and owner, cards for rows, size, freshness, snapshots, reads, writes and users, and a lineage graph from raw.campaigns and raw.impressions through media.delivery to the tables made from it." src="assets/screenshots/console-catalog.png" width="100%">
+</picture>
+
 In SQL, the same comes from views in the `igloo` schema:
 
 ```sql

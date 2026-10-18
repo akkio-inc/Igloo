@@ -40,6 +40,28 @@ caveats.
   Kubernetes cluster, and OpenTofu modules that stand up the whole stack on
   AWS, Google Cloud or Azure.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/console-worksheet-dark.png">
+    <img alt="Igloo's web console: a worksheet running a reach, frequency and spend query by advertiser over 21.9 million ad impressions, with its results below." src="docs/assets/screenshots/console-worksheet.png" width="100%">
+  </picture>
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img alt="A Metabase dashboard on Igloo: impressions, spend, daily delivery, reach and frequency by campaign, top advertisers and click-through rate by channel." src="docs/assets/screenshots/metabase-dashboard.png"></td>
+    <td width="50%"><img alt="A Jupyter notebook on Igloo: a reach curve merged from stored HLL sketches and a frequency distribution pulled over Arrow Flight SQL, with their charts." src="docs/assets/screenshots/notebook.png"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Metabase through the PostgreSQL driver</sub></td>
+    <td align="center"><sub>Jupyter with SQLAlchemy and Arrow Flight SQL</sub></td>
+  </tr>
+</table>
+
+<sub>Screenshots use synthetic ad-impression data from
+<code>deploy/single-vm/sql/load-media.sql</code>; the advertisers are
+invented.</sub>
+
 Licensed under [Apache 2.0](LICENSE).
 
 ## Quick start
