@@ -643,8 +643,22 @@ below has it yet; when the record names a clone that reads there, or may;
 and whenever Igloo cannot tell. Igloo checks the record under the lock
 that making a clone of the table takes, and holds it until the drop is
 through or the files are gone, so no clone starts reading them meanwhile.
-When the files stay, the log says why. Igloo knows which tables read
-another's files only through clones: files another engine added to a
+When the files stay, the log says why.
+
+What that costs: with a metadata database, the record below has every
+clone, as clones are recorded when they are made and only Igloo sets
+`igloo.clone.*`, and the catalog keeps live tables' locations apart, so a
+drop reads the record alone, and loads only the clones it names, to see
+that they are still there. Without a metadata database, until a
+maintenance pass since Igloo started has visited every table, a drop
+loads every table of the catalog to read what clones declare. A clone
+refresh loads every table once per statement, however many tables it
+replaces, to be sure none of them is still in the catalog under another
+name. After restoring the metadata database from a backup, let a
+maintenance pass run before dropping tables: until then the record may
+miss clones made since the backup, and their sources' files would go.
+
+Igloo knows which tables read another's files only through clones: files another engine added to a
 table from a second table's location (Spark's `add_files`, say) go when
 that second table is dropped. Whatever a drop leaves, as the files of a
 table whose clones read them once the clones are gone too, [erasure
@@ -669,7 +683,11 @@ A clone stops sharing once its own maintenance has replaced and expired
 everything it read of its source. The source's files that only clones
 needed are then orphans, which the orphan cleanup deletes once they are
 three days old. Until then a shared file counts once in the bucket, but a
-file the source no longer needs stays as long as a clone reads it.
+file the source no longer needs stays as long as a clone reads it. A
+clone made of a snapshot that the source's compaction wrote keeps one of
+the source's manifests for good, one that lists only the files the
+compaction removed, so it never stops sharing: dropping the source then
+keeps its files.
 
 To find every table that may hold a table's data, as erasing a person's
 data must, look up the table's location (the `location` of its Iceberg

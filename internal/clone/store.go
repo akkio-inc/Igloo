@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,13 @@ type Store interface {
 	// wait false, giving up (ok false) if another holds one. release must
 	// be called once ok.
 	Lock(ctx context.Context, locations []string, wait bool) (release func(), ok bool, err error)
+	// Authoritative reports whether the Store has every clone the catalog
+	// has, so that what clones read can be told from it alone, without
+	// reading every table's properties. Clones are recorded as they are
+	// made, and only Igloo sets the properties that make a table one, so
+	// a Postgres store always has; a memory store has once maintenance
+	// has rebuilt it since it started (MemoryStore.Rebuilt).
+	Authoritative() bool
 	Close()
 }
 
@@ -71,6 +79,9 @@ type MemoryStore struct {
 	mu     sync.Mutex
 	shares map[shareKey]Share
 	locks  map[int64]chan struct{}
+	// rebuilt says a maintenance pass has recorded what every table
+	// declares (see Rebuilt).
+	rebuilt atomic.Bool
 }
 
 type shareKey struct {
@@ -82,6 +93,14 @@ type shareKey struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{shares: map[shareKey]Share{}, locks: map[int64]chan struct{}{}}
 }
+
+// Rebuilt notes that a maintenance pass has recorded the shares every
+// table of the catalog declares: from then on the store has every clone,
+// as those made since are recorded as they are made.
+func (m *MemoryStore) Rebuilt() { m.rebuilt.Store(true) }
+
+// Authoritative implements Store: once Rebuilt.
+func (m *MemoryStore) Authoritative() bool { return m.rebuilt.Load() }
 
 func (m *MemoryStore) Add(_ context.Context, shares []Share) error {
 	m.mu.Lock()
@@ -336,6 +355,9 @@ func (s *PostgresStore) Lock(ctx context.Context, locations []string, wait bool)
 	}
 	return release, true, nil
 }
+
+// Authoritative implements Store: always.
+func (s *PostgresStore) Authoritative() bool { return true }
 
 func (s *PostgresStore) Close() {
 	s.pool.Close()

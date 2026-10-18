@@ -197,11 +197,22 @@ func (p *Pass) Failed() { p.failed = true }
 
 // Settle runs once every listed table was loaded. If some were gone, it
 // lists the tables again and loads those the pass has not seen, which
-// finds tables renamed during the pass.
+// finds tables renamed during the pass. A pass that saw every table has
+// recorded every clone's shares: a memory store is then rebuilt.
 func (p *Pass) Settle(ctx context.Context) {
-	if p.g == nil || !p.missing || p.failed {
+	if p.g == nil || p.failed {
 		return
 	}
+	if p.missing {
+		p.relist(ctx)
+	}
+	if r, ok := p.g.store.(interface{ Rebuilt() }); ok && !p.failed {
+		r.Rebuilt()
+	}
+}
+
+// relist loads the tables the pass has not seen, listing them again.
+func (p *Pass) relist(ctx context.Context) {
 	idents, err := p.g.cat.Tables(ctx)
 	if err != nil {
 		p.failed = true

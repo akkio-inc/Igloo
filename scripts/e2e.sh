@@ -1171,27 +1171,40 @@ else
 fi
 
 # A clone of a table maintenance compacts and expires, and the other way
-# round: neither loses a row, and dropping the source, which never purges,
-# leaves the clone whole.
+# round: neither loses a row. Once the clone's maintenance has replaced
+# all it read of the source, the clone stops sharing the source's files,
+# and dropping the source, which then purges its files, leaves the clone
+# whole. The clone is made while the source has too few files to compact
+# (5), so that it reads no manifest of the source's compaction, which
+# lists only files it removed: the clone would keep that manifest, and
+# share the source's files, for good.
 psql_admin -c "CREATE TABLE clone_src (id INTEGER, v VARCHAR)" >/dev/null
-for i in 1 2 3 4 5 6; do psql_admin -c "INSERT INTO clone_src VALUES ($i, 'v$i')" >/dev/null; done
+for i in 1 2 3 4; do psql_admin -c "INSERT INTO clone_src VALUES ($i, 'v$i')" >/dev/null; done
 psql_admin -c "CREATE TABLE dev.clone_dst CLONE clone_src" >/dev/null
+for i in 5 6; do psql_admin -c "INSERT INTO clone_src VALUES ($i, 'v$i')" >/dev/null; done
 psql_admin -c "INSERT INTO dev.clone_dst VALUES (7, 'v7')" >/dev/null
 psql_admin -c "DELETE FROM clone_src WHERE id = 2" >/dev/null
-expect "source and clone diverge" "1,3,4,5,6|1,2,3,4,5,6,7" walt walt-password-1 \
+expect "source and clone diverge" "1,3,4,5,6|1,2,3,4,7" walt walt-password-1 \
   "SELECT (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM clone_src), (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM dev.clone_dst)"
 psql_admin -c "SELECT * FROM set_iceberg_table_properties(lake.public.clone_src, {'history.expire.max-snapshot-age-ms': '0'})" >/dev/null
 compacted="SELECT (SELECT count(*) FROM iceberg_metadata(lake.public.clone_src) WHERE status <> 'DELETED' AND manifest_content = 'DATA') <= 2
   AND (SELECT count(*) FROM iceberg_snapshots(lake.public.clone_src)) = 1"
 expect_soon "the source is compacted and expired" "t" igloo "$admin_password" "$compacted"
-expect "the clone still reads every row" "1,2,3,4,5,6,7" walt walt-password-1 "SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM dev.clone_dst"
+expect "the clone still reads every row" "1,2,3,4,7" walt walt-password-1 "SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM dev.clone_dst"
 psql_admin -c "SELECT * FROM set_iceberg_table_properties(lake.dev.clone_dst, {'history.expire.max-snapshot-age-ms': '0'})" >/dev/null
 for i in 8 9 10 11; do psql_admin -c "INSERT INTO dev.clone_dst VALUES ($i, 'v$i')" >/dev/null; done
 expect_soon "the clone is compacted and expired" "t" igloo "$admin_password" \
-  "SELECT (SELECT count(*) FROM iceberg_snapshots(lake.dev.clone_dst)) = 1 AND (SELECT count(*) FROM dev.clone_dst) = 11"
+  "SELECT (SELECT count(*) FROM iceberg_snapshots(lake.dev.clone_dst)) = 1 AND (SELECT count(*) FROM dev.clone_dst) = 9"
 expect "the source still reads every row" "1,3,4,5,6" walt walt-password-1 "SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM clone_src"
+clone_shares() {
+  compose exec -T postgres psql -U lakekeeper -d lakekeeper -XAt \
+    -c "SELECT count(*) FROM igloo_clones.shares WHERE clone_schema = 'dev' AND clone_name = 'clone_dst'" 2>&1
+}
+deadline=$((SECONDS + 60))
+until [ "$(clone_shares)" = 0 ] || [ "$SECONDS" -ge "$deadline" ]; do sleep 2; done
+if [ "$(clone_shares)" = 0 ]; then pass "the clone stops sharing the source's files"; else fail "the clone still shares: $(clone_shares)"; fi
 expect "drop the source" "DROP TABLE" walt walt-password-1 "DROP TABLE clone_src"
-expect "the clone outlives it" "11" walt walt-password-1 "SELECT count(*) FROM dev.clone_dst"
+expect "the clone outlives it" "9" walt walt-password-1 "SELECT count(*) FROM dev.clone_dst"
 
 # A clone carries its source's policies and tags: nora, who may read the
 # contacts and create tables in team, sees no more of her clone than of the

@@ -13,6 +13,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/clone/clonetest"
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 // filesUnder lists the files in dir, a table's location on the local disk.
@@ -173,7 +174,13 @@ func TestPurgeKeepsWhatOthersNeed(t *testing.T) {
 	})
 
 	t.Run("the table is still in the catalog", func(t *testing.T) {
-		cat, m, old := setup(t)
+		// However complete the Store: it knows clones, not every table.
+		cat := clonetest.New(t.TempDir())
+		source(t, cat)
+		store := clone.NewMemoryStore()
+		store.Rebuilt()
+		m := clone.NewManager(cat, store, quiet())
+		old := devClone(t, m, cat)
 		m.Purging(cat.Dir+"/", nil)
 		before := filesUnder(t, old.Location())
 		cat.Rename(devEvents, table.Identifier{"dev", "moved"})
@@ -245,6 +252,15 @@ func TestPurgeDecisionForDrops(t *testing.T) {
 		return g
 	}
 
+	// done lets go of the lock a verdict that purges holds, so a check
+	// that fails leaves none held.
+	done := func(v clone.PurgeVerdict) clone.PurgeVerdict {
+		if v.Release != nil {
+			v.Release()
+		}
+		return v
+	}
+
 	// No clone reads prod.other: it goes, and no clone of it is made
 	// until the drop is through.
 	v := guard(store).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)
@@ -254,31 +270,31 @@ func TestPurgeDecisionForDrops(t *testing.T) {
 	v.Release()
 
 	for name, s := range map[string]clone.Store{"recorded": store, "only declared": clone.NewMemoryStore()} {
-		v := guard(s).MayPurge(ctx, "drop", prodEvents, src.Location(), true)
+		v := done(guard(s).MayPurge(ctx, "drop", prodEvents, src.Location(), true))
 		if v.Purge || !slices.Equal(v.Clones, []string{"dev.events"}) {
 			t.Errorf("a table a clone reads, %s: %+v", name, v)
 		}
 	}
-	v = guard(failingStore{clone.NewMemoryStore()}).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)
+	v = done(guard(failingStore{clone.NewMemoryStore()}).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true))
 	if v.Purge || !v.Unsure {
 		t.Errorf("clones that cannot be told: %+v", v)
 	}
 	// A table renamed is still where its files are.
-	v = guard(store).MayPurge(ctx, "drop", table.Identifier{"prod", "gone"}, other.Location(), true)
+	v = done(guard(store).MayPurge(ctx, "drop", table.Identifier{"prod", "gone"}, other.Location(), true))
 	if v.Purge {
 		t.Errorf("another table is at the location: %+v", v)
 	}
 	for _, loc := range []string{root + "/.igloo", root + "/.igloo/", root + "/.igloo/sharing/t", "/elsewhere/t", root, ""} {
-		if v := guard(clone.NewMemoryStore()).MayPurge(ctx, "drop", table.Identifier{"prod", "x"}, loc, false); v.Purge {
+		if v := done(guard(clone.NewMemoryStore()).MayPurge(ctx, "drop", table.Identifier{"prod", "x"}, loc, false)); v.Purge {
 			t.Errorf("location %q: %+v", loc, v)
 		}
 	}
-	if v := clone.NewGuard(cat, store, quiet()).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true); v.Purge {
+	if v := done(clone.NewGuard(cat, store, quiet()).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)); v.Purge {
 		t.Errorf("without a warehouse: %+v", v)
 	}
 	g := clone.NewGuard(unlistable{cat}, store, quiet())
 	g.SetWarehouse(root + "/")
-	if v := g.MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true); v.Purge || !v.Unsure {
+	if v := done(g.MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)); v.Purge || !v.Unsure {
 		t.Errorf("a catalog that cannot be read: %+v", v)
 	}
 }
@@ -288,4 +304,133 @@ type unlistable struct{ clone.Catalog }
 
 func (unlistable) Tables(context.Context) ([]table.Identifier, error) {
 	return nil, errors.New("catalog unavailable")
+}
+
+// counting counts how often the catalog's tables are listed and loaded.
+type counting struct {
+	clone.Catalog
+	lists, loads int
+}
+
+func (c *counting) Tables(ctx context.Context) ([]table.Identifier, error) {
+	c.lists++
+	return c.Catalog.Tables(ctx)
+}
+
+func (c *counting) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	c.loads++
+	return c.Catalog.LoadTable(ctx, ident)
+}
+
+// With a Store that has every clone (Authoritative), as a Postgres store
+// always does, a drop asks it alone: it neither lists nor loads the
+// catalog's tables, but the clones the Store names, to see that they are
+// still there.
+func TestDropsAskAnAuthoritativeStoreAlone(t *testing.T) {
+	stores := map[string]func(t *testing.T) clone.Store{
+		"rebuilt memory store": func(*testing.T) clone.Store {
+			s := clone.NewMemoryStore()
+			s.Rebuilt()
+			return s
+		},
+		"postgres store": func(t *testing.T) clone.Store {
+			url := testdb.URL()
+			if url == "" {
+				t.Skip("IGLOO_TEST_DATABASE_URL not set")
+			}
+			s, err := clone.OpenPostgres(context.Background(), url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Close)
+			return s
+		},
+	}
+	for name, open := range stores {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := open(t)
+			if !store.Authoritative() {
+				t.Fatal("the store is not authoritative")
+			}
+			root := t.TempDir()
+			cat := clonetest.New(filepath.Join(root, "tables"))
+			src := source(t, cat)
+			if _, err := clone.NewManager(cat, store, quiet()).Clone(ctx, clone.Request{Source: prodEvents, Target: devEvents}); err != nil {
+				t.Fatal(err)
+			}
+			other, err := cat.Create(table.Identifier{"prod", "other"}, clonetest.Schema, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &counting{Catalog: cat}
+			g := clone.NewGuard(c, store, quiet())
+			g.SetWarehouse(root + "/")
+
+			v := g.MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)
+			if v.Release != nil {
+				v.Release()
+			}
+			if !v.Purge {
+				t.Fatalf("a table no clone reads: %+v", v)
+			}
+			if c.lists != 0 || c.loads != 0 {
+				t.Errorf("dropping a table no clone reads listed the catalog %d times and loaded %d tables", c.lists, c.loads)
+			}
+			v = g.MayPurge(ctx, "drop", prodEvents, src.Location(), true)
+			if v.Release != nil {
+				v.Release()
+			}
+			if v.Purge || !slices.Equal(v.Clones, []string{"dev.events"}) {
+				t.Fatalf("a table a clone reads: %+v", v)
+			}
+			if c.lists != 0 || c.loads != 1 {
+				t.Errorf("dropping a table a clone reads listed the catalog %d times and loaded %d tables, want only the clone", c.lists, c.loads)
+			}
+		})
+	}
+}
+
+// A memory store has every clone once a maintenance pass has seen every
+// table, and not before: until then a drop reads what each table declares.
+func TestMemoryStoreRebuiltByAPass(t *testing.T) {
+	ctx := context.Background()
+	cat := clonetest.New(t.TempDir())
+	source(t, cat)
+	if _, err := clone.NewManager(cat, clone.NewMemoryStore(), quiet()).Clone(ctx, clone.Request{Source: prodEvents, Target: devEvents}); err != nil {
+		t.Fatal(err)
+	}
+	pass := func(store *clone.MemoryStore, fail, miss bool) {
+		p := clone.NewGuard(cat, store, quiet()).Begin()
+		idents, err := cat.Tables(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, ident := range idents {
+			if miss && i == 0 {
+				p.Missing() // renamed during the pass: Settle finds it
+				continue
+			}
+			p.Saw(ctx, cat.Load(t, ident[0], ident[1]))
+		}
+		if fail {
+			p.Failed()
+		}
+		p.Settle(ctx)
+	}
+	store := clone.NewMemoryStore()
+	if store.Authoritative() {
+		t.Fatal("a new memory store is authoritative")
+	}
+	pass(store, true, false)
+	if store.Authoritative() {
+		t.Fatal("a pass that failed to load a table rebuilt the store")
+	}
+	pass(store, false, true)
+	if !store.Authoritative() {
+		t.Fatal("a pass that saw every table did not rebuild the store")
+	}
+	if got, _ := store.Sharers(ctx, cat.Load(t, "prod", "events").Location()); len(got) != 1 {
+		t.Fatalf("the rebuilt store has %v", got)
+	}
 }

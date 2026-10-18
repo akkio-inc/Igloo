@@ -73,6 +73,14 @@ func (g *Guard) MayPurge(ctx context.Context, what string, name table.Identifier
 //   - Readers names a clone that reads there, or may, as one being made;
 //   - Igloo cannot tell any of these.
 //
+// Only the last two need nothing but the Store, which is what a drop
+// asks when the Store is Authoritative: it has every clone, and the
+// catalog (Lakekeeper) keeps live tables' locations apart, so no table
+// but the one dropped is at, within or around its location. Otherwise,
+// and for a table no longer in the catalog (a clone refresh's, which may
+// have been renamed in the moment before the clone took its name), Decide
+// loads every table of the catalog, once for all of p's decisions.
+//
 // Decide logs why it keeps them, naming what would have deleted them
 // (what: "drop", "clone refresh"). The catalog is read before the lock
 // is taken: a clone made since is in the Store, as making one records it
@@ -98,27 +106,8 @@ func (p *Purges) Decide(ctx context.Context, what string, name table.Identifier,
 	case Under(loc+"/", g.warehouse+iglooDir):
 		return keep(PurgeVerdict{Why: "they are among Igloo's own files (" + iglooDir + "/)"})
 	}
-	p.once.Do(func() { p.tables, p.err = g.catalogTables(ctx) })
-	if p.err != nil {
-		return keep(PurgeVerdict{Why: "the catalog's tables could not be read", Unsure: true}, "err", p.err)
-	}
-	overlaps := func(l string) bool {
-		return canonical(trimSlash(l)) == canonical(loc) || Under(l, loc) || Under(loc, l)
-	}
-	var clones []string
-	for _, t := range p.tables {
-		if inCatalog && t.name == tbl && canonical(t.own) == canonical(loc) {
-			continue
-		}
-		if overlaps(t.own) {
-			return keep(PurgeVerdict{Why: "another table of the catalog is where they are"}, "other", t.name)
-		}
-		if slices.ContainsFunc(t.reads, overlaps) {
-			clones = append(clones, t.name)
-		}
-	}
-	if len(clones) > 0 {
-		return keep(PurgeVerdict{Why: "clones read them", Clones: clones}, "clones", strings.Join(clones, ", "))
+	if v, ok := p.fromCatalog(ctx, tbl, loc, inCatalog); !ok {
+		return keep(v)
 	}
 	names, release, err := g.Readers(ctx, loc)
 	if err != nil {
@@ -129,6 +118,40 @@ func (p *Purges) Decide(ctx context.Context, what string, name table.Identifier,
 		return keep(PurgeVerdict{Why: "clones read them", Clones: names}, "clones", strings.Join(names, ", "))
 	}
 	return PurgeVerdict{Purge: true, Release: release}
+}
+
+// fromCatalog checks, when the Store alone cannot tell (see Decide), that
+// no table of the catalog but tbl itself (when inCatalog) is at, within
+// or around loc, and that none says it reads files there; ok is false,
+// and v says why, when one is or does, or the catalog cannot be read.
+func (p *Purges) fromCatalog(ctx context.Context, tbl, loc string, inCatalog bool) (v PurgeVerdict, ok bool) {
+	if inCatalog && p.g.store.Authoritative() {
+		return PurgeVerdict{}, true
+	}
+	p.once.Do(func() { p.tables, p.err = p.g.catalogTables(ctx) })
+	if p.err != nil {
+		p.g.log.Warn("could not read the catalog's tables", "err", p.err)
+		return PurgeVerdict{Why: "the catalog's tables could not be read", Unsure: true}, false
+	}
+	overlaps := func(l string) bool {
+		return canonical(trimSlash(l)) == canonical(loc) || Under(l, loc) || Under(loc, l)
+	}
+	var clones []string
+	for _, t := range p.tables {
+		if inCatalog && t.name == tbl && canonical(t.own) == canonical(loc) {
+			continue
+		}
+		if overlaps(t.own) {
+			return PurgeVerdict{Why: "another table of the catalog, " + t.name + ", is where they are"}, false
+		}
+		if slices.ContainsFunc(t.reads, overlaps) {
+			clones = append(clones, t.name)
+		}
+	}
+	if len(clones) > 0 {
+		return PurgeVerdict{Why: "clones read them (" + strings.Join(clones, ", ") + ")", Clones: clones}, false
+	}
+	return PurgeVerdict{}, true
 }
 
 // catalogTable is a table of the catalog: its name, where it is, and
