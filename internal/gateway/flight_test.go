@@ -12,14 +12,8 @@ import (
 func TestFlightConnectionWakesIgloo(t *testing.T) {
 	// The second port of twoPorts stands in for Flight SQL.
 	compute := newTwoPorts(t)
-	sqlLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	flightLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	sqlLn := listenFree(t)
+	flightLn := listenFree(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	gw := New(Options{
 		Backend: compute.sql, FlightBackend: compute.console,

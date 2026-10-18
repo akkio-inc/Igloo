@@ -93,12 +93,7 @@ func TestWorkDueSoonKeepsIglooRunning(t *testing.T) {
 func TestGatewayLearnsTheScheduleWhenItStarts(t *testing.T) {
 	// Igloo cannot be asked: the gateway starts it once to learn when its
 	// work is due.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closed := ln.Addr().String()
-	_ = ln.Close()
+	closed := reserveAddr(t)
 	compute := newFakeCompute(t)
 	startGateway(t, Options{
 		Backend:       compute.addr,

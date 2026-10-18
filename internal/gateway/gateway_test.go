@@ -34,14 +34,61 @@ type fakeCompute struct {
 	stops  int
 }
 
-func newFakeCompute(t *testing.T) *fakeCompute {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+// reserved holds the addresses fakes have picked but not yet listen on (they
+// open them only once "started"), so that no other listener in these tests
+// takes one in the meantime. A gateway listening on its own backend's port
+// forwards to itself: the cause of rare failures, an EOF or a hung round trip.
+var reserved = struct {
+	sync.Mutex
+	addrs map[string]bool
+}{addrs: map[string]bool{}}
+
+// reserveAddr picks a free address for a fake to listen on later, and keeps
+// the tests' own listeners off it until the test ends.
+func reserveAddr(t *testing.T) string {
+	ln := listenFree(t)
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	f := &fakeCompute{t: t, addr: addr, bootTime: 50 * time.Millisecond}
+	reserved.Lock()
+	reserved.addrs[addr] = true
+	reserved.Unlock()
+	t.Cleanup(func() {
+		reserved.Lock()
+		delete(reserved.addrs, addr)
+		reserved.Unlock()
+	})
+	return addr
+}
+
+// listenFree listens on a free loopback port that no fake has reserved.
+func listenFree(t *testing.T) net.Listener {
+	t.Helper()
+	var taken []net.Listener
+	defer func() {
+		for _, ln := range taken {
+			_ = ln.Close()
+		}
+	}()
+	for range 100 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserved.Lock()
+		clash := reserved.addrs[ln.Addr().String()]
+		reserved.Unlock()
+		if !clash {
+			return ln
+		}
+		// Hold it until another port is found, so it is not handed out again.
+		taken = append(taken, ln)
+	}
+	t.Fatal("no free port that a fake has not reserved")
+	return nil
+}
+
+func newFakeCompute(t *testing.T) *fakeCompute {
+	f := &fakeCompute{t: t, addr: reserveAddr(t), bootTime: 50 * time.Millisecond}
 	t.Cleanup(func() { _ = f.Stop(context.Background()) })
 	return f
 }
@@ -122,10 +169,7 @@ func startGateway(t *testing.T, opts Options) string {
 		// what the gateway did.
 		opts.Log = slog.New(slog.NewTextHandler(newTestLog(t), &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenFree(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- New(opts).Serve(ctx, ln) }()

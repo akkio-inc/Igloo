@@ -23,17 +23,8 @@ type twoPorts struct {
 	starts, stops    int
 }
 
-func freeAddr(t *testing.T) string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close() //nolint:errcheck
-	return ln.Addr().String()
-}
-
 func newTwoPorts(t *testing.T) *twoPorts {
-	c := &twoPorts{t: t, sql: freeAddr(t), console: freeAddr(t)}
+	c := &twoPorts{t: t, sql: reserveAddr(t), console: reserveAddr(t)}
 	t.Cleanup(func() { _ = c.Stop(context.Background()) })
 	return c
 }
@@ -109,14 +100,8 @@ func (c *twoPorts) counts() (starts, stops int) {
 // the addresses clients connect to.
 func startBoth(t *testing.T, opts Options) (sql, console string) {
 	t.Helper()
-	sqlLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	consoleLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	sqlLn := listenFree(t)
+	consoleLn := listenFree(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	gw := New(opts)
 	done := make(chan error, 2)
@@ -214,14 +199,8 @@ func TestIcebergConnectionWakesIgloo(t *testing.T) {
 	// The console's echo port stands in for the Iceberg REST port: the
 	// gateway forwards bytes, whatever they are.
 	compute := newTwoPorts(t)
-	icebergLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	icebergLn := listenFree(t)
+	sqlLn := listenFree(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	gw := New(Options{Backend: compute.sql, IcebergBackend: compute.console,
 		SuspendAfter: time.Minute, ResumeTimeout: 5 * time.Second, Compute: compute})
