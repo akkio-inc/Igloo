@@ -156,6 +156,15 @@
         }
       }
     },
+    "erasure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "$ref": "#/definitions/secretName"
+        }
+      }
+    },
     "metadataDatabase": {
       "type": "object",
       "additionalProperties": false,
