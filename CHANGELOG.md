@@ -390,8 +390,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   warehouse: the files under no table's or view's location, as those of
   tables dropped or replaced, before the request or during it, through
   Igloo or around it, while clones read them or not, go once three days
-  old, unread, and newer ones that hold matching rows are waited for, so
-  a request never completes while they do. A table dropped while a request
+  old, and newer ones are waited for, looked at again every hour, so a
+  request never completes while they are there; none is read. Drops and
+  replaces through Igloo, clone refreshes included, delete the old
+  table's files at once, so only those of a table clones still read, or
+  may, are left to wait for. A table dropped while a request
   runs is not set aside, and one replaced is erased from under its name.
   A table
   that cannot be read, or a snapshot whose manifest list is missing,
@@ -423,7 +426,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   properties. A table dropped in the warehouse that no clone reads has
   its files purged with it, through SQL and the Iceberg REST endpoint
   alike, which also refuses snapshots whose manifest list is not in the
-  warehouse. Every branch but main is rewritten with its head's schema, and a
+  warehouse; so does a table a clone replaces (`CREATE OR REPLACE TABLE |
+  SCHEMA ... CLONE`), whose location's files Igloo deletes, never those
+  of a source it read as a clone itself. Every branch but main is rewritten with its head's schema, and a
   tag with its snapshot's, so columns dropped since stay in them, and
   each file is written again with its own partition spec, or another
   whose columns that schema has. Admins and roles granted
@@ -614,7 +619,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   through a lock in the metadata database, and record passes there so a
   pass that is due runs soon after a start. A table's maintenance deletes
   only files inside its own location, and keeps those that clones still
-  read; `DROP TABLE` never asks the catalog to purge files.
+  read; `DROP TABLE` asks the catalog to purge files only when no clone
+  reads them.
 - Results reach clients in batches rather than one network write per row:
   large results arrive four to five times faster.
 

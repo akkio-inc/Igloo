@@ -34,7 +34,9 @@ it.
 Igloo, or recovered from storage, in any table Igloo manages.** That
 covers the tables' current data, their older snapshots (time travel),
 branches, tags and clones; what is left in the warehouse of tables
-dropped or replaced, however that happened; what Delta Sharing recipients
+dropped or replaced, however that happened (a request waits for those
+of such files that are less than 3 days old, [below](#what-is-left-of-dropped-tables));
+what Delta Sharing recipients
 and engines reading through Igloo's Iceberg REST catalog can reach; the
 read cache of every running replica (a stopped one empties its own when
 it next starts, see [Known limitations](#known-limitations)); and the
@@ -145,8 +147,8 @@ ALTER TABLE crm.referrals ALTER COLUMN referrer_email SET TAG pii = 'email:null'
   dropped or replaced, however that happened, whether clones read its
   files then or not, is under no table's location: every request deletes
   the warehouse's files under no table's or view's location that no table
-  references ([below](#what-is-left-of-dropped-tables)). Dropping a table
-  through Igloo also has the catalog delete its files at once, unless
+  references ([below](#what-is-left-of-dropped-tables)). Dropping or
+  replacing a table through Igloo also deletes its files at once, unless
   clones may read them, but the guarantee does not rest on that.
 - **Once it has sent a `DELETE`, a request never fails**: failing would
   forget whose rows it deleted while files may still hold them. A table
@@ -276,7 +278,7 @@ Igloo while a request has work to do.
 | `delete` | Deletes the matching rows, as a `DELETE` would: queries no longer see them. |
 | `rewrite` | On every branch and tag of every table, writes each data file that holds matching rows again with its deletes applied, leaving out the rows that match, or setting columns tagged `:null` to NULL in them, in the same commit that replaces the file: rows that arrived since the delete step go too. Equality delete files that hold matches go with the files they apply to, or at once if they apply to none; a position delete file goes only when every file it deletes rows of is replaced or gone, so rows deleted from files the commit keeps stay deleted. Then writes again the manifests that still list the old files: a manifest keeps a removed file's entry, with column bounds that can hold the value itself. Every branch but main is rewritten with its head's own schema, and a tag with its snapshot's, as they are read (Igloo's `AT (BRANCH => ...)`, PyIceberg), so a column dropped since stays in them; main, with the table's current schema. Each file is written again with its own partition spec or, if the schema it is read with lacks a column that spec partitions by, with the table's default spec or another whose columns it has. A tag is rewritten on a branch of the request's (`igloo-erasure-...`), and moved to the result, if it still points where it did: a tag moved meanwhile is rewritten where it points now, and the branch of a tag dropped meanwhile goes. Branches keep their unpublished rows. A position delete file that carries the rows it deletes, as the spec allows, and holds the person's, goes too, with the files it deletes rows of rewritten so that it can, or at once if none of them is live any more, as after another engine rewrote them copy-on-write. |
 | `expire` | Expires the snapshots that reference a file that held matching rows, or whose bounds may, however recent, so time travel to them ends. Snapshots that reference none stay, older ones included, and so do the snapshots branches and tags point at, which the rewrite step made reference none. A snapshot staged by write-audit-publish (Spark's `wap.id`) that holds matching rows holds others' unpublished rows too: the request waits (`waiting`, with `error` saying which) for it to be published, by fast-forward or by cherry-pick (a snapshot with its `wap.id` as `published-wap-id`), and then rewrites the branch, or discarded. It waits from when the request was made, as long as maintenance keeps such a snapshot (7 days, or the table's `history.expire.max-snapshot-age-ms` if longer), and at most 21 days, so that it completes within the month the GDPR allows; then it expires the snapshot, unpublished rows and all. The commit asserts every branch and tag as the catalog has them just before it, so none made meanwhile at an expired snapshot is lost. |
-| `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. It also deletes the warehouse's files under no table's or view's location ([below](#what-is-left-of-dropped-tables)): those at least 3 days old unread, and newer ones that hold matching rows once they are 3 days old. It deletes files only in the warehouse, and never one that another table references ([clones](#clones)). Paths compare without their scheme (`s3a://` and `s3://` name the same file, as `file://` and a local path do), unescaped, and a listed file that the table references under a spelling Igloo cannot tell the same, but whose name a referenced file has, is kept: if it holds matching rows, the request stops with an error that names it, for someone to check. |
+| `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. It also deletes the warehouse's files under no table's or view's location ([below](#what-is-left-of-dropped-tables)): all of them unread: those at least 3 days old at once, newer ones once they are 3 days old, which the request waits for. It deletes files only in the warehouse, and never one that another table references ([clones](#clones)). Paths compare without their scheme (`s3a://` and `s3://` name the same file, as `file://` and a local path do), unescaped, and a listed file that the table references under a spelling Igloo cannot tell the same, but whose name a referenced file has, is kept: if it holds matching rows, the request stops with an error that names it, for someone to check. |
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`, those of tables since replaced included; it writes them again from the files that remain. |
 | `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). |
 | `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. |
@@ -311,13 +313,24 @@ of the catalog is the only claim on a file in it. When it purges, and
 again when it verifies, every request lists the whole warehouse once, and
 deletes, as orphan files, the files under no table's or view's location:
 those of tables dropped or replaced, before the request or while it ran,
-through Igloo or around it, while clones read them or not (`CREATE OR
-REPLACE TABLE ... CLONE` included), and files written for tables never
-made. One at least 3 days old goes without being read. A newer one may be
-a file of a table being made (a staged `CREATE TABLE ... AS`, here or in
-another engine): if it holds matching rows, by the names of the request's
-tagged columns, the request waits until it is 3 days old, then deletes
-it; verification looks for such files too. A file another table
+through Igloo or around it, while clones read them or not, and files
+written for tables never made. None is read: what a dropped table's file
+holds can be under column names it no longer has, or in a manifest's
+bounds. One at least 3
+days old goes at once. A newer one may be a file of a table being made (a
+staged `CREATE TABLE ... AS`, here or in another engine), so the request
+waits until it is 3 days old, then deletes it, and verification counts it
+until then; meanwhile the request lists the warehouse again every hour,
+so a file the catalog has deleted, or that a table being made has come to
+own, stops counting. So a drop or replace that leaves files less than 3
+days old makes requests wait for them. Through Igloo, few do: dropping a
+table and replacing one, with `CREATE OR REPLACE TABLE ... AS` or a clone
+refresh (`CREATE OR REPLACE TABLE ... CLONE`, `CREATE OR REPLACE SCHEMA
+... CLONE`), delete the old table's files at once, as long as no clone
+reads them. Those of a table that clones read, or may (Igloo cannot
+tell), stay, and are under no table's location once the clones are gone
+too. A waiting request's `error` says how many files it waits for, and
+names one. A file another table
 references stays, as do the files under the location of a table that
 cannot be read and those it says it shares, and Igloo's own files
 (`.igloo/`). Which files are whose cannot be told while a table or view
@@ -360,7 +373,8 @@ stays erased; each table it did not finish with keeps why in `left` (in
 `tables`), with the paths of the files it leaves that may hold the
 person's rows (its identifiers scrubbed from them), those it recorded and
 did not delete; `error` lists the newer files under no table's location
-that hold matching rows. A table counts as finished only if the
+(the first 100 of them), which a later request deletes once they are 3
+days old. A table counts as finished only if the
 last verification found nothing, not an earlier one. The request records
 who closed it, as `closed` with `error` saying so, logs `erasure request
 closed` at warning level, and forgets its identifiers, as a completed
@@ -554,11 +568,13 @@ person by tagged columns and the identifiers as written. It leaves:
   it in `caches_pending`, for 30 days after the replica was last seen.
   Delete the cache volume of a replica that will not come back.
 - **The warehouse is Igloo's.** Files someone puts under the warehouse's
-  location, outside every table's and view's, are deleted by the next
-  request once they are 3 days old (see [above](#what-is-left-of-dropped-tables)):
-  keep other data elsewhere. With Lakekeeper's soft deletion turned on
-  instead of the hard deletion Igloo's warehouse uses, a dropped table can
-  be restored only until a request deletes its files.
+  location, outside every table's and view's, as a writer can with `COPY
+  ... TO`, are deleted by the next request once they are 3 days old (see
+  [above](#what-is-left-of-dropped-tables)), and until then make the
+  requests made meanwhile wait for them: keep other data elsewhere. With
+  Lakekeeper's soft deletion turned on instead of the hard deletion
+  Igloo's warehouse uses, a dropped table can be restored only until a
+  request deletes its files.
 - **The metadata database's own pages.** Redacted history rows leave old
   row versions in PostgreSQL's pages until they are vacuumed and reused,
   and in its write-ahead log. Lakekeeper's tables (also in PostgreSQL)
@@ -619,13 +635,18 @@ REQUEST`) once what it could not erase has been erased otherwise.
   rows again: after five rounds of verification finding them, the request
   is blocked, and goes on once the writes stop.
 - **Recent files that may be another commit's.** A file under a table's
-  location, or under no table's, that no table references and that holds
-  matching rows is deleted only once it is three days old, as orphan
-  cleanup does, since a commit under way may be about to reference it: the
-  request waits until then. A request made just after a table that held
-  the person's rows was dropped or replaced may wait so, unless the
-  catalog deleted the files first, as it does for a table Igloo drops that
-  no clone reads.
+  location that no table references and that holds matching rows, and
+  any file under no table's location, is deleted only once it is three
+  days old, as orphan cleanup does, since a commit under way may be about
+  to reference it: the request waits until then. So a drop or replace
+  that leaves recent files makes requests wait for them. Through Igloo
+  that is one of a table whose files clones still read, or may (Igloo
+  cannot tell): a source dropped while a dev clone reads it, say, or a
+  clone refreshed while a clone of it reads it, whose files stay once the
+  clones are gone too. A warehouse where such drops happen every day can
+  keep a request waiting until a day without one is three days past. An
+  admin who knows nothing references them can delete such files with the
+  bucket's own tools: the request looks again within the hour.
 - **A tagged table dropped**, through Igloo or not: its tags stay with its
   name, so that a table made again under it, as `CREATE OR REPLACE TABLE`
   does, is erased from too, and a request for that tag value is refused

@@ -512,7 +512,7 @@ func (s *Service) Run(ctx context.Context, id string) error {
 	case runErr != nil:
 		s.failed(ctx, r, runErr)
 	case r.Status == StatusWaiting:
-		s.wake(ctx, id, r.WaitUntil)
+		s.wake(ctx, id, r.nextRun())
 	case r.Status == StatusHeld:
 		s.opts.Metrics.countHeld()
 		s.suspend(ctx, id)
@@ -853,9 +853,15 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		r.Status, r.ClosedBy, r.Completed = StatusClosed, by, s.now()
 		r.Error = "closed by " + by + " while blocked: " + why
 		if fs := files[""]; len(fs) > 0 {
-			// Under no table's location: the request records them itself.
-			r.Error += scrub(r, fmt.Sprintf("; it leaves %d files in the warehouse under no table's location that may hold the person's rows: %s",
-				len(fs), strings.Join(fs, ", ")))
+			// Under no table's location: the request records them itself,
+			// the first maxListed by name. A later request deletes them
+			// once three days old.
+			shown, more := fs, ""
+			if len(fs) > maxListed {
+				shown, more = fs[:maxListed], fmt.Sprintf(" and %d more", len(fs)-maxListed)
+			}
+			r.Error += scrub(r, fmt.Sprintf("; it leaves %d recent files in the warehouse under no table's location, which may hold the person's rows: %s%s",
+				len(fs), strings.Join(shown, ", "), more))
 		}
 		s.dropBranches(ctx, r)
 		s.end(ctx, r)
@@ -865,6 +871,10 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		return nil
 	})
 }
+
+// maxListed bounds how many files under no table's location a closed
+// request names (see Close).
+const maxListed = 100
 
 // finish runs, for a request that is to be closed, the steps that need no
 // table: sharing, history and cache. It fails if one cannot be done now,
@@ -896,8 +906,8 @@ func (s *Service) finish(ctx context.Context, r *Request) error {
 // it go, unless a table references them, as purge would delete them; so
 // do the old files under no table's location. It returns, by table, the
 // paths of the files left that may hold the person's rows: those recorded
-// and not deleted, and, under "", those under no table's location that
-// hold matching rows, which purge would wait for.
+// and not deleted, and, under "", the recent ones under no table's
+// location, which purge would wait for.
 func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, error) {
 	for i := range r.Tables {
 		t := &r.Tables[i]
@@ -957,7 +967,7 @@ func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, e
 	u := &unownedFiles{young: map[string]time.Time{}}
 	sw, err := s.unowned(ctx, s.newFileIO(tables), referenced)
 	if err == nil {
-		u, err = s.unownedFiles(ctx, r, tables, sw, going)
+		u = sw.files(going)
 	}
 	switch {
 	case errors.As(err, &c):
@@ -1003,7 +1013,6 @@ func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, e
 	}
 	recorded()
 	out[""] = append(out[""], slices.Sorted(maps.Keys(u.young))...)
-	out[""] = append(out[""], u.unsure...)
 	return out, nil
 }
 

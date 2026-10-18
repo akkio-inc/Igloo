@@ -48,8 +48,8 @@ query that starts in the instant between drop and rename finds no table.
 The catalog records nothing that depends on a table, so `DROP TABLE ...
 CASCADE` drops just the table, like `DROP TABLE`: views that read it fail
 when they are next queried. A dropped table's files are deleted with it,
-as are those of a table `CREATE OR REPLACE TABLE` replaces, unless
-[clones](#clones) read them; `... CLONE` keeps them. What a drop leaves,
+as are those of a table `CREATE OR REPLACE TABLE` replaces, `... CLONE`
+included, unless [clones](#clones) read them. What a drop leaves,
 erasure requests delete ([privacy](privacy.md#what-is-left-of-dropped-tables)).
 A dropped table cannot be restored.
 
@@ -472,6 +472,8 @@ CREATE OR REPLACE SCHEMA dev CLONE prod;       -- make dev a fresh copy of prod
 - **Storage.** Table maintenance never deletes a file a clone still reads,
   whichever table is compacted, expires snapshots, loses orphan files or is
   dropped; a source's old files are deleted once no clone reads them either.
+  A clone made again under a name, with `OR REPLACE`, deletes the files of
+  the one it replaces, unless clones read them, and none of its source's.
   See [files that clones share](operations.md#files-that-clones-share).
 - **Other engines.** Through the [Iceberg REST
   catalog](external-engines.md#clones), engines get no storage credentials

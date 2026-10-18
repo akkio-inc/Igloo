@@ -630,6 +630,20 @@ it works on:
   instead, a table restored after it was dropped may miss its files, and a
   clone restored after it was dropped may miss files of its source that
   maintenance deleted meanwhile.
+- **`CREATE OR REPLACE TABLE ... CLONE`** and **`CREATE OR REPLACE SCHEMA
+  ... CLONE`** replace a table in the catalog without purging it, so Igloo
+  deletes its files itself, with its own credentials, once the clone is
+  made: everything under the replaced table's location, as the catalog's
+  purge does, and nothing elsewhere. A replaced clone's files go, and the
+  files of its source that it read stay, under the source's location. As
+  for a drop, it deletes them only when the location is in the warehouse
+  (outside Igloo's own `.igloo/`) and no clone reads under it, as the
+  clones' metadata declares or the record below says; Igloo checks that
+  under the lock that making a clone takes, and holds it until the files
+  are gone. It also keeps them while a table of the catalog is at that
+  location, as the replaced table is if it was renamed in the moment
+  before the clone took its name. Otherwise the files stay, and the log
+  says why.
 
 Which tables share which files is recorded twice: in each clone's own
 metadata (the table property `igloo.clone.shares-files-of`, the locations

@@ -180,6 +180,18 @@ type Request struct {
 	written map[string]bool
 	// fold normalizes values as DuckDB does, for what Go compares.
 	fold *folding
+	// recheck, if set, is when the request looks again at what it waits
+	// for, before WaitUntil (see purge).
+	recheck time.Time
+}
+
+// nextRun is when r, waiting, runs next: at WaitUntil, or at recheck if
+// that comes first.
+func (r *Request) nextRun() time.Time {
+	if !r.recheck.IsZero() && r.recheck.Before(r.WaitUntil) {
+		return r.recheck
+	}
+	return r.WaitUntil
 }
 
 // Subject is a tag value the request erases identifiers of.

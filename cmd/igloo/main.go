@@ -195,6 +195,11 @@ func serve() error {
 		}
 		defer cloneStore.Close()
 		clones, guard = clone.NewManager(cat, cloneStore, log), clone.NewGuard(cat, cloneStore, log)
+		// A table a clone replaces has its files deleted, with Igloo's
+		// own credentials, unless clones read them, as a drop does.
+		clones.Purging(warehouseRoot(cfg), func(ctx context.Context, location string) (iceio.IO, error) {
+			return catalog.FS(ctx, cfg.Storage, location)
+		})
 	}
 	policies, err := openPolicies(startCtx, cfg, log)
 	if err != nil {

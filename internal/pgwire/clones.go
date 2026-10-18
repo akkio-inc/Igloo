@@ -256,6 +256,8 @@ func (s *Server) cloneTable(ctx context.Context, sess *session, user auth.User, 
 		return acc, cloneError(err)
 	}
 	s.log.Info("table cloned", "source", src.String(), "target", dst.String(), "snapshot", snapshotID(res.Snapshot), "by", user.Name)
+	// The table replaced goes with its files, as a drop does.
+	s.clones.Purge(ctx, res.Replaced)
 	// The cloner owns the clone; one that replaced a table keeps its owner.
 	s.recordOwner(ctx, user, &createdObject{object: dst, keep: exists})
 	return acc, nil
@@ -340,11 +342,16 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 		return acc, err
 	}
 	defer s.ddlGen.Add(1)
+	// The tables replaced go with their files, as drops do, once the
+	// clones are made.
+	var replaced []*table.Table
+	defer func() { s.clones.Purge(ctx, replaced...) }()
 	for _, p := range pairs {
 		res, err := s.clones.Clone(ctx, clone.Request{Source: identOf(p.source), Target: identOf(p.target), At: at, Replace: p.exists})
 		if err != nil {
 			return acc, fmt.Errorf("clone %s: %w", p.source, cloneError(err))
 		}
+		replaced = append(replaced, res.Replaced)
 		s.log.Info("table cloned", "source", p.source.String(), "target", p.target.String(), "snapshot", snapshotID(res.Snapshot), "by", user.Name)
 		s.recordOwner(ctx, user, &createdObject{object: p.target, keep: p.exists})
 	}

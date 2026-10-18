@@ -94,6 +94,10 @@ type Manager struct {
 	cat   Catalog
 	store Store
 	log   *slog.Logger
+	// warehouse and storage are where the files of the tables clones
+	// replace are deleted, if anywhere (see Purging).
+	warehouse string
+	storage   func(ctx context.Context, location string) (iceio.IO, error)
 }
 
 // NewManager makes clones in cat, recording their shares in store.
@@ -202,6 +206,9 @@ type Result struct {
 	Table    *table.Table
 	// Shared are the locations whose files the clone may reference.
 	Shared []string
+	// Replaced is the table the clone replaced, as last loaded before,
+	// whose files are left until Purge deletes them; nil for none.
+	Replaced *table.Table
 }
 
 // Clone makes a clone. It holds the locks of the locations the clone will
@@ -317,6 +324,19 @@ func (m *Manager) cloneLocked(ctx context.Context, r Request, first *table.Table
 		undo()
 		return Result{}, false, fmt.Errorf("record the clone's shared files: %w", err)
 	}
+	// The table replaced, if any, as it is right before: the catalog
+	// leaves its files, for Purge.
+	var replaced *table.Table
+	if r.Replace {
+		replaced, err = m.cat.LoadTable(ctx, r.Target)
+		if err != nil && !errors.Is(err, icecat.ErrNoSuchTable) {
+			m.log.Warn("could not tell which table a clone replaces; it is replaced without its files",
+				"table", strings.Join(r.Target, "."), "err", err)
+		}
+		if err != nil {
+			replaced = nil
+		}
+	}
 	tbl, err := m.cat.Register(ctx, r.Target, metaLoc, r.Replace)
 	if err != nil {
 		undo()
@@ -328,7 +348,7 @@ func (m *Manager) cloneLocked(ctx context.Context, r Request, first *table.Table
 	}
 	m.log.Info("cloned table", "source", strings.Join(r.Source, "."), "target", strings.Join(r.Target, "."),
 		"snapshot", snapID, "location", loc)
-	return Result{Snapshot: snap, Table: tbl, Shared: shared}, false, nil
+	return Result{Snapshot: snap, Table: tbl, Shared: shared, Replaced: replaced}, false, nil
 }
 
 func writeFile(fs iceio.WriteFileIO, path string, body []byte) error {

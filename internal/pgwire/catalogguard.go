@@ -155,6 +155,8 @@ func (s *Server) purgeVerdict(ctx context.Context, c *catalogproxy.Change) (cata
 		return catalogproxy.Verdict{}, nil
 	case len(names) > 0:
 		release()
+		s.log.Info("a dropped table keeps its files: clones read them", "table", name, "location", c.Location,
+			"clones", strings.Join(names, ", "))
 		if c.Purge {
 			return catalogproxy.Verdict{}, catalogproxy.Refuse(fmt.Sprintf("the table is not purged: clones read its files (%s); drop them first, "+
 				"or drop the table without purging it", strings.Join(names, ", ")))

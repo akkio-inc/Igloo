@@ -1411,10 +1411,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	if err != nil {
 		return err
 	}
-	u, err := s.unownedFiles(ctx, r, tables, sw, going)
-	if err != nil {
-		return err
-	}
+	u := sw.files(going)
 	check := pathSet{}
 	for _, f := range gone {
 		check.add(f.Path)
@@ -1437,13 +1434,18 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 			"request", r.ID, "locations", strings.Join(kept, ", "))
 	}
 	u.leave(refs, kept)
-	if len(u.unsure) > 0 {
-		return fmt.Errorf("%s, in the warehouse under no table's location, holds matching rows, and no file of a table is spelled as it is, "+
-			"but one has its name: it may be that file, spelled otherwise, so the request does not delete it; if nothing references it, delete it",
-			base(u.unsure[0]))
-	}
-	for _, at := range u.young {
-		later(at)
+	if len(u.young) > 0 {
+		// Each may be a file of a table being made, which the table will
+		// own once it is, or one a drop left, which may hold the person's
+		// rows in whatever columns it had then: none is read. The request
+		// waits until the oldest is old enough to delete, and lists the
+		// warehouse again every hour meanwhile, as one a table claims
+		// stops counting.
+		oldest := slices.MinFunc(slices.Collect(maps.Keys(u.young)), func(a, b string) int { return u.young[a].Compare(u.young[b]) })
+		later(u.young[oldest])
+		r.recheck = s.now().Add(recheckWait)
+		r.Error = scrub(r, fmt.Sprintf("waits for %d recent files in the warehouse under no table's location, as %s, which may be a table's "+
+			"being made, or what a drop left: they go once three days old, and the request goes on", len(u.young), oldest))
 	}
 	for _, p := range u.old {
 		gone = append(gone, File{Path: p, Kind: fileUnowned})
@@ -1455,29 +1457,34 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 		l.t.done(StepPurge, s.now())
 	}
 	if !waitUntil.IsZero() {
-		s.log.Info("erasure waits until a recent unreferenced file with matching rows is old enough to delete",
+		s.log.Info("erasure waits until a recent unreferenced file is old enough to delete",
 			"request", r.ID, "until", waitUntil)
 		r.wait(waitUntil)
 	}
 	return nil
 }
 
+// recheckWait is how often a request that waits for recent files under no
+// table's location lists the warehouse again (see purge).
+const recheckWait = time.Hour
+
 // iglooDir is where Igloo keeps files of its own in the warehouse, as
 // Delta Sharing's copies (see sharing), which no table owns.
 const iglooDir = ".igloo/"
 
 // sweep is the warehouse's files, listed once: listed are all of them,
-// and unowned, sorted as orphan files are, those under no location the
-// catalog's tables and views own.
+// and unowned, with when each was written, those under no location the
+// catalog's tables and views own that r's tables do not reference.
 type sweep struct {
 	listed  pathSet
-	unowned *orphanFiles
+	unowned map[string]time.Time
+	at      time.Time
 }
 
 // unowned lists the warehouse's files, with Igloo's own credentials, and
-// sorts those under no location of a table or view of the catalog, and
-// not Igloo's own (iglooDir), as orphan files are (see sortOrphans),
-// leaving out those referenced, which r's tables reference. They are the
+// keeps those under no location of a table or view of the catalog, and
+// not Igloo's own (iglooDir), with when each was written, leaving out
+// those referenced, which r's tables reference. They are the
 // files of tables dropped or replaced, before the request or while it
 // ran, through Igloo or around it, while clones read them or not, as no
 // catalog keeps track of them any more, and files written for tables
@@ -1527,8 +1534,10 @@ func (s *Service) unowned(ctx context.Context, fio *fileIO, referenced pathSet) 
 		return nil, errors.New("the listing of the warehouse shows none of the files the request's tables reference there, as they spell them")
 	}
 	ours := s.opts.Warehouse + iglooDir
-	maps.DeleteFunc(listed, func(p string, _ time.Time) bool { return under(p, owned) || within(p, ours) })
-	sw.unowned = s.sortOrphans(listed, referenced)
+	maps.DeleteFunc(listed, func(p string, _ time.Time) bool {
+		return under(p, owned) || within(p, ours) || referenced.has(p)
+	})
+	sw.unowned, sw.at = listed, s.now()
 	return sw, nil
 }
 
@@ -1573,45 +1582,36 @@ func (s *Service) tableLocations(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// unownedFiles are the files of a sweep a request deletes, or waits for:
-// those old enough, whatever they hold, as nothing can be about to
-// reference them, and the newer ones that hold matching rows (young),
-// which may be files a staged table, being made by CREATE TABLE AS here or
-// in another engine, is about to reference; unsure are those that hold
-// matching rows and may be a table's file spelled otherwise.
+// unownedFiles are the files of a sweep a request deletes, or waits for,
+// by when they were written alone: none is read. Those old enough go, as
+// nothing can be about to reference them; newer ones (young) may be files
+// of a table being made, by CREATE TABLE AS here or in another engine, and
+// the request waits until they are old enough. What a file holds is not
+// looked at: the columns it had when it was written may have had other
+// names, and manifests can hold values in their bounds.
 type unownedFiles struct {
-	old    []string
-	young  map[string]time.Time
-	unsure []string
+	old   []string
+	young map[string]time.Time
 }
 
-// unownedFiles reads what it must of sw's unowned files, but those going
-// already: the newer ones and the unsure ones, by every tagged column of
-// the request's tables, by name (see anyColumns). Old ones it does not
-// read.
-func (s *Service) unownedFiles(ctx context.Context, r *Request, tables []loaded, sw *sweep, going pathSet) (*unownedFiles, error) {
-	o := sw.unowned
-	cols := anyColumns(r, tables)
-	u := &unownedFiles{old: slices.DeleteFunc(slices.Clone(o.old), going.has), young: map[string]time.Time{}}
-	young := maps.Clone(o.young)
-	maps.DeleteFunc(young, func(p string, _ time.Time) bool { return going.has(p) })
-	matched, err := s.matchingFiles(ctx, r.salt, parquet(slices.Collect(maps.Keys(young))), cols)
-	if err != nil {
-		return nil, err
+// files are sw's unowned files, but those going already.
+func (sw *sweep) files(going pathSet) *unownedFiles {
+	u := &unownedFiles{young: map[string]time.Time{}}
+	for p, mod := range sw.unowned {
+		switch {
+		case going.has(p):
+		case sw.at.Sub(mod) >= orphanAge:
+			u.old = append(u.old, p)
+		default:
+			u.young[p] = mod
+		}
 	}
-	for p := range matched {
-		u.young[p] = young[p]
-	}
-	unsure, err := s.matchingFiles(ctx, r.salt, parquet(slices.DeleteFunc(slices.Clone(o.unsure), going.has)), cols)
-	if err != nil {
-		return nil, err
-	}
-	u.unsure = slices.Sorted(maps.Keys(unsure))
-	return u, nil
+	slices.Sort(u.old)
+	return u
 }
 
 func (u *unownedFiles) all() []string {
-	return append(append(slices.Clone(u.old), slices.Collect(maps.Keys(u.young))...), u.unsure...)
+	return append(slices.Clone(u.old), slices.Collect(maps.Keys(u.young))...)
 }
 
 // leave leaves out of u the files a table the request does not erase from
@@ -1624,14 +1624,13 @@ func (u *unownedFiles) leave(refs map[string]string, kept []string) {
 	}
 	u.old = slices.DeleteFunc(u.old, left)
 	maps.DeleteFunc(u.young, func(p string, _ time.Time) bool { return left(p) })
-	u.unsure = slices.DeleteFunc(u.unsure, left)
 }
 
 // anyColumns are the columns to look for the identifiers in, by name, in
-// files no table of the request's references, which may be any dropped
-// table's: every tagged column of the request's tables, by every name it
-// has had, and those of its tables not loaded by the names they were
-// found by.
+// Delta Sharing's copies of tables the request did not load, as those
+// dropped or replaced (see sharedCopies): every tagged column of the
+// request's tables, by every name it has had, and those of its tables not
+// loaded by the names they were found by.
 func anyColumns(r *Request, tables []loaded) []scanColumn {
 	var out []scanColumn
 	for _, l := range tables {
@@ -2212,10 +2211,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	u, err := s.unownedFiles(ctx, r, tables, sw, pathSet{})
-	if err != nil {
-		return "", err
-	}
+	u := sw.files(pathSet{})
 	check := pathSet{}
 	for _, p := range u.all() {
 		check.add(p)

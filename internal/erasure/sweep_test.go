@@ -3,6 +3,7 @@ package erasure
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // Every request sweeps the warehouse (see unowned): the files under no
@@ -243,4 +245,93 @@ func TestSweepNeedsEveryLocation(t *testing.T) {
 	}
 	failing = false
 	f.completed(settle(f, r.ID, 12))
+}
+
+// A recent file under no table's location is not read: it may hold the
+// person's rows under a column of another name, as a file keeps the name
+// its column had when it was written, or in a manifest's bounds. Every one
+// makes the request wait until it is three days old, and then goes. The
+// request looks again on its next run, at most an hour later: one gone
+// meanwhile, as the catalog purges a dropped table's files, or that a
+// table being made now owns, stops counting.
+func TestSweepWaitsForRecentFilesUnread(t *testing.T) {
+	for _, purged := range []bool{false, true} {
+		t.Run(fmt.Sprintf("purged meanwhile %v", purged), func(t *testing.T) {
+			f := newFixture(t)
+			f.people("crm.people", [][]any{ann, subject})
+			f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
+			mailers := f.cat.create(t, f.dir, "sandbox.mailers", iceberg.NewSchema(0,
+				iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+				iceberg.NestedField{ID: 2, Name: "mail", Type: iceberg.PrimitiveTypes.String}))
+			mailers = appendRows(t, mailers, []any{int64(1), storedEmail})
+			tf, err := readFiles(f.ctx, mailers)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := slices.Collect(maps.Keys(tf.live(true)))[0]
+			manifest := slices.Collect(maps.Keys(tf.entries))[0]
+			left := []string{
+				plant(t, f, "01ff-left/data/x.parquet", data, time.Hour),
+				plant(t, f, "01ff-left/metadata/m.avro", manifest, time.Hour),
+			}
+			jobs := tasks.NewMemoryStore()
+			f.svc.opts.Jobs = tasks.NewScheduler(jobs, tasks.Options{})
+			r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.svc.Run(f.ctx, r.ID); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := f.store.Get(f.ctx, r.ID)
+			if got.Status != StatusWaiting || got.Step != StepPurge || got.WaitUntil.Before(time.Now().Add(70*time.Hour)) ||
+				!strings.Contains(got.Error, "2 recent files") {
+				t.Fatalf("%s at %s until %v: %q", got.Status, got.Step, got.WaitUntil, got.Error)
+			}
+			// It runs again within the hour, to look again.
+			job, err := jobs.Job(f.ctx, JobKind, r.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job.NextRun.After(time.Now().Add(recheckWait + time.Minute)) {
+				t.Errorf("runs again at %v", job.NextRun)
+			}
+			f.svc.opts.Jobs = nil
+			if purged {
+				for _, p := range left {
+					if err := os.Remove(p); err != nil {
+						t.Fatal(err)
+					}
+				}
+				hour := time.Now().Add(recheckWait + time.Minute)
+				f.svc.now = func() time.Time { return hour }
+				f.completed(f.run(r.ID))
+				return
+			}
+			f.completed(settle(f, r.ID, 12))
+			for _, p := range left {
+				if exists(p) {
+					t.Errorf("%s is still there", p)
+				}
+			}
+		})
+	}
+}
+
+// A waiting request runs again at its recheck, if that comes before what
+// it waits for.
+func TestNextRun(t *testing.T) {
+	at := time.Now()
+	r := &Request{WaitUntil: at.Add(72 * time.Hour)}
+	if r.nextRun() != r.WaitUntil {
+		t.Errorf("without a recheck: %v", r.nextRun())
+	}
+	r.recheck = at.Add(time.Hour)
+	if r.nextRun() != r.recheck {
+		t.Errorf("with one: %v", r.nextRun())
+	}
+	r.recheck = at.Add(100 * time.Hour)
+	if r.nextRun() != r.WaitUntil {
+		t.Errorf("with a later one: %v", r.nextRun())
+	}
 }
