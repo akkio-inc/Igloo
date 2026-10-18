@@ -1066,7 +1066,7 @@ func (s *Server) execDDL(ctx context.Context, sess *session, user auth.User, que
 	})
 	if isIcebergNoReplace(err) {
 		if r, ok := s.replaceable(sess, st); ok {
-			err = s.replaceTable(ctx, sess, r)
+			_, err = s.replaceTable(ctx, sess, r)
 		}
 	}
 	if err != nil {

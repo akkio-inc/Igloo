@@ -243,6 +243,14 @@ type ResultWriter interface {
 	Complete(tag string) error
 }
 
+// RowsWriter is a ResultWriter that also takes how many rows a statement
+// wrote when its command tag does not count them, as CREATE TABLE ... AS
+// completes with "CREATE TABLE". WroteRows is called before Complete.
+type RowsWriter interface {
+	ResultWriter
+	WroteRows(n int64)
+}
+
 // Run runs query as the session's user and sends its result to out. The
 // query goes through the same path as a simple-protocol query from a
 // network client; send one statement at a time, as psql does. A
@@ -396,6 +404,12 @@ func (w *embeddedWriter) Columns() wire.Columns { return w.columns }
 func (w *embeddedWriter) Complete(tag string) error {
 	w.tag = tag
 	return nil
+}
+
+func (w *embeddedWriter) tookRows(n int64) {
+	if rw, ok := w.out.(RowsWriter); ok {
+		rw.WroteRows(n)
+	}
 }
 
 func (w *embeddedWriter) CopyIn(wire.FormatCode) (*wire.CopyReader, error) {

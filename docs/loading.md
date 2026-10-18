@@ -272,7 +272,7 @@ FROM igloo.task_history WHERE outcome <> 'succeeded' ORDER BY start_time DESC LI
 | `start_time`, `end_time`, `duration_ms` | When it ran, and for how long |
 | `outcome` | `running`, `succeeded`, `failed`, or `skipped` (the previous run was still running) |
 | `error` | Why it failed |
-| `row_count` | Rows the run loaded, wrote or returned |
+| `row_count` | Rows the run loaded, wrote (`CREATE TABLE ... AS` included) or returned |
 
 Task history is kept for `IGLOO_AUDIT_RETENTION` (90 days by default).
 

@@ -293,7 +293,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `user_name`, `role` | Who ran it, and their built-in role then |
 | `start_time`, `end_time`, `duration_ms` | When it ran, and for how long, including sending results |
 | `outcome`, `sqlstate` | `ok`, `error`, `denied` or `canceled`, and the error's SQLSTATE |
-| `row_count` | Rows returned or changed, when known |
+| `row_count` | Rows returned or changed, or written by `CREATE TABLE ... AS`, when known |
 | `statement_type` | Such as `SELECT`, `CREATE TABLE` or `GRANT` |
 | `query_text` | The statement as sent, with passwords and secrets replaced by `'***'` |
 | `tables_read`, `tables_written` | Catalog tables the statement read and wrote, as `catalog.schema.table`, and in `tables_read` the [connections'](federation.md) tables it read, as `connection.schema.table`: for users with the role none, those their grants were checked for; for others, those its text names, views expanded, as worked out after it ran (see [lineage](catalog.md#lineage)); `NULL` when Igloo could not tell |

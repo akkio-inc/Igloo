@@ -104,6 +104,20 @@ func TestTasks(t *testing.T) {
 		t.Errorf("the run's statement is in the owner's query history: %d", n)
 	}
 
+	// A task that makes a table with CREATE TABLE ... AS records the rows
+	// it wrote, in the task history and the owner's query history, though
+	// the statement's command tag does not count them.
+	mustExec(t, walt, "CREATE TASK build SCHEDULE '1 hour' AS CREATE OR REPLACE TABLE lake.public.built AS SELECT range AS n FROM range(7)")
+	mustExec(t, walt, "EXECUTE TASK build")
+	if n := count(t, walt, "SELECT count(*) FROM igloo.task_history WHERE name = 'build' AND outcome = 'succeeded' AND row_count = 7"); n != 1 {
+		t.Errorf("task history of a CREATE TABLE AS: %d", n)
+	}
+	if n := count(t, ls.admin, "SELECT count(*) FROM igloo.query_history WHERE client_address = 'task build' "+
+		"AND statement_type = 'CREATE TABLE' AND row_count = 7"); n != 1 {
+		t.Errorf("query history of a CREATE TABLE AS: %d", n)
+	}
+	mustExec(t, walt, "DROP TASK build")
+
 	mustExec(t, walt, "ALTER TASK tick RESUME")
 	tick = showJobs(t, walt, "TASKS")["tick"]
 	if tick.state != "started" || tick.nextRun == nil || tick.nextRun.Before(time.Now().Add(59*time.Minute)) {

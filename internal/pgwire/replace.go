@@ -63,14 +63,22 @@ func (r tableReplace) statements() (create, drop, rename string) {
 	return create, drop, rename
 }
 
-func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace) error {
+// replaceTable carries out r and returns the rows the new table was
+// made with (0 without AS).
+func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace) (int64, error) {
 	create, drop, rename := r.statements()
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
 		return err
 	}
-	if err := exec(ctx, create); err != nil {
-		return err
+	res, err := sess.conn.QueryContext(ctx, create, nil)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := countOf(res)
+	if err != nil {
+		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(r.staging))
+		return 0, err
 	}
 	// The new table, as made, keeps the columns with policies or tags,
 	// which the statement was checked for too.
@@ -80,7 +88,7 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 	}
 	if err != nil {
 		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(r.staging))
-		return err
+		return 0, err
 	}
 
 	// From here on, finish even if the client cancels: stopping between the
@@ -88,18 +96,18 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 	ctx = context.WithoutCancel(ctx)
 	if err := exec(ctx, drop); err != nil {
 		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
-		return err
+		return 0, err
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = exec(ctx, rename); err == nil {
-			return nil
+			return rows, nil
 		}
 		// Another session may have replaced the table in between; the last
 		// replace wins.
 		_ = exec(ctx, drop)
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
-	return fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
+	return 0, fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
 		quoteName(r.staging), quoteName(r.target), err)
 }
 
@@ -126,8 +134,12 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	if !ok {
 		return err
 	}
-	if err := s.replaceTable(ctx, sess, r); err != nil {
+	rows, err := s.replaceTable(ctx, sess, r)
+	if err != nil {
 		return err
+	}
+	if createsTableAs(st.query) {
+		reportRows(w, rows)
 	}
 	return w.Complete("CREATE TABLE")
 }

@@ -1311,6 +1311,11 @@ expect_error "only its owner changes it" 42501 rita rita-password-1 "ALTER TASK 
 activity="$(curl -s "http://127.0.0.1:$http_port/activity")"
 if grep -q '"next_due":"' <<<"$activity"; then pass "/activity reports when work is next due"; else fail "/activity: $activity"; fi
 expect "ALTER TASK SUSPEND" "ALTER TASK" walt walt-password-1 "ALTER TASK e2e_task SUSPEND"
+expect "a task that rebuilds a table" "CREATE TASK" walt walt-password-1 \
+  "CREATE TASK e2e_rebuild SCHEDULE '1 hour' AS CREATE OR REPLACE TABLE e2e_rebuilt AS SELECT * FROM range(6)"
+expect "EXECUTE TASK" "EXECUTE TASK" walt walt-password-1 "EXECUTE TASK e2e_rebuild"
+expect_soon "records the rows its CREATE TABLE AS wrote" "succeeded|6" walt walt-password-1 \
+  "SELECT outcome, row_count FROM igloo.task_history WHERE name = 'e2e_rebuild'"
 
 expect "a materialized view" "CREATE MATERIALIZED VIEW" walt walt-password-1 \
   "CREATE MATERIALIZED VIEW e2e_sales_totals AS SELECT count(*) AS orders, sum(amount) AS total FROM e2e_sales"

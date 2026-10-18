@@ -724,6 +724,9 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		if err := es.Run(ctx, j.Statement, out); err != nil {
 			return -1, err
 		}
+		if out.took {
+			return out.wrote, nil
+		}
 		if n := tagRows(out.tag); n >= 0 {
 			return n, nil
 		}
@@ -788,14 +791,18 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 	return -1, fmt.Errorf("unknown kind of job %q", j.Kind)
 }
 
-// taskResult counts what a task's statement returns.
+// taskResult counts what a task's statement returns, or the rows a
+// CREATE TABLE ... AS wrote.
 type taskResult struct {
-	rows int64
-	tag  string
+	rows  int64
+	tag   string
+	wrote int64
+	took  bool
 }
 
 func (r *taskResult) Columns([]Column) error { return nil }
 func (r *taskResult) Row([]any) error        { r.rows++; return nil }
+func (r *taskResult) WroteRows(n int64)      { r.wrote, r.took = n, true }
 func (r *taskResult) Complete(tag string) error {
 	r.tag = tag
 	return nil

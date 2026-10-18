@@ -199,10 +199,19 @@ func (s *Server) audited(sess *session, text string, fn wire.PreparedStatementFn
 	}
 }
 
-// tagWriter remembers the command tag a statement completes with.
+// tagWriter remembers the command tag a statement completes with, and the
+// rows it wrote if the tag does not count them (see rowsTaker).
 type tagWriter struct {
 	wire.DataWriter
 	tag string
+	// wrote is the rows a CREATE TABLE ... AS wrote, if took.
+	wrote int64
+	took  bool
+}
+
+func (w *tagWriter) tookRows(n int64) {
+	w.wrote, w.took = n, true
+	reportRows(w.DataWriter, n)
 }
 
 func (w *tagWriter) Complete(tag string) error {
@@ -225,8 +234,12 @@ func (w *tagWriter) DefineColumns(columns wire.Columns) error {
 }
 
 // rows is the row count in the tag, such as 5 in "INSERT 0 5", or the rows
-// sent before a client stopped reading, or -1.
+// a CREATE TABLE ... AS wrote, or the rows sent before a client stopped
+// reading, or -1.
 func (w *tagWriter) rows() int64 {
+	if w.took {
+		return w.wrote
+	}
 	if n := tagRows(w.tag); n >= 0 || w.tag != "" || w.Written() == 0 {
 		return n
 	}

@@ -245,6 +245,18 @@ func classify(t duckdb.StmtType, columns []string) kind {
 // run executes the statement with args and streams the result to w.
 func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.DataWriter) error {
 	if st.kind == command {
+		if st.stmtType == duckdb.STATEMENT_TYPE_CREATE && createsTableAs(st.query) {
+			rows, err := st.stmt.QueryContext(ctx, args)
+			if err != nil {
+				return err
+			}
+			n, err := countOf(rows)
+			if err != nil {
+				return err
+			}
+			reportRows(w, n)
+			return w.Complete(commandTag(st.stmtType, st.query, n))
+		}
 		res, err := st.stmt.ExecContext(ctx, args)
 		if err != nil {
 			return err
@@ -341,6 +353,58 @@ func (b *rowBatcher) flush() error {
 
 func (st *statement) close() error {
 	return st.stmt.Close()
+}
+
+// rowsTaker is a writer that takes the rows a statement wrote when its
+// command tag does not count them. CREATE TABLE ... AS completes with
+// "CREATE TABLE" here, where PostgreSQL sends "SELECT n", and clients
+// (Arrow Flight SQL's update count among them) have always seen it so;
+// the query history and the task history record its rows all the same.
+type rowsTaker interface {
+	tookRows(n int64)
+}
+
+// reportRows tells w, if it takes them, that the statement wrote n rows.
+func reportRows(w wire.DataWriter, n int64) {
+	if t, ok := w.(rowsTaker); ok {
+		t.tookRows(n)
+	}
+}
+
+// countOf reads the count a CREATE TABLE ... AS returns, and closes rows.
+// DuckDB returns the rows it wrote as a one-row result, not as changed
+// rows, which RowsAffected reads (it is 0). 0 when there is no such row.
+func countOf(rows driver.Rows) (int64, error) {
+	defer rows.Close() //nolint:errcheck
+	if len(rows.Columns()) == 0 {
+		return 0, nil
+	}
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); errors.Is(err, io.EOF) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	n, _ := dest[0].(int64)
+	return n, nil
+}
+
+// createsTableAs reports whether query is CREATE [OR REPLACE] [TEMP]
+// TABLE ... AS: it writes rows, which its command tag does not count.
+func createsTableAs(query string) bool {
+	sc := &scanner{s: query}
+	if !sc.keywords("CREATE") {
+		return false
+	}
+	sc.keywords("OR", "REPLACE")
+	if !sc.keywords("TABLE") && !sc.keywords("TEMP", "TABLE") && !sc.keywords("TEMPORARY", "TABLE") {
+		return false
+	}
+	sc.keywords("IF", "NOT", "EXISTS")
+	if _, ok := sc.name(); !ok {
+		return false
+	}
+	return sc.keywords("AS")
 }
 
 // commandTag builds the Postgres command tag, e.g. "SELECT 3" or
