@@ -53,6 +53,9 @@ type Guard struct {
 	cat   Catalog
 	store Store
 	log   *slog.Logger
+	// warehouse is where the files are that may be deleted with their
+	// tables (see SetWarehouse).
+	warehouse string
 }
 
 // NewGuard guards the tables of cat, whose shares store keeps.

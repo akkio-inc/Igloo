@@ -212,3 +212,80 @@ func TestPurgeKeepsWhatOthersNeed(t *testing.T) {
 		})
 	}
 }
+
+// failingStore cannot say which clones read a location.
+type failingStore struct{ clone.Store }
+
+func (failingStore) Sharers(context.Context, string) ([]clone.Share, error) {
+	return nil, errors.New("metadata database unavailable")
+}
+
+// A drop decides as a clone refresh does (Guard.MayPurge): the table being
+// dropped is no reason to keep its own files, but a clone that reads them
+// is, recorded or only declared in its properties, as when a memory Store
+// has not been rebuilt since a restart; so are a location in Igloo's own
+// files, or at their root, one outside the warehouse, another table where
+// they are, and not being able to tell.
+func TestPurgeDecisionForDrops(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cat := clonetest.New(filepath.Join(root, "tables"))
+	src := source(t, cat)
+	store := clone.NewMemoryStore()
+	if _, err := clone.NewManager(cat, store, quiet()).Clone(ctx, clone.Request{Source: prodEvents, Target: devEvents}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := cat.Create(table.Identifier{"prod", "other"}, clonetest.Schema, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := func(store clone.Store) *clone.Guard {
+		g := clone.NewGuard(cat, store, quiet())
+		g.SetWarehouse(root + "/")
+		return g
+	}
+
+	// No clone reads prod.other: it goes, and no clone of it is made
+	// until the drop is through.
+	v := guard(store).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)
+	if !v.Purge || v.Release == nil {
+		t.Fatalf("a table no clone reads: %+v", v)
+	}
+	v.Release()
+
+	for name, s := range map[string]clone.Store{"recorded": store, "only declared": clone.NewMemoryStore()} {
+		v := guard(s).MayPurge(ctx, "drop", prodEvents, src.Location(), true)
+		if v.Purge || !slices.Equal(v.Clones, []string{"dev.events"}) {
+			t.Errorf("a table a clone reads, %s: %+v", name, v)
+		}
+	}
+	v = guard(failingStore{clone.NewMemoryStore()}).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true)
+	if v.Purge || !v.Unsure {
+		t.Errorf("clones that cannot be told: %+v", v)
+	}
+	// A table renamed is still where its files are.
+	v = guard(store).MayPurge(ctx, "drop", table.Identifier{"prod", "gone"}, other.Location(), true)
+	if v.Purge {
+		t.Errorf("another table is at the location: %+v", v)
+	}
+	for _, loc := range []string{root + "/.igloo", root + "/.igloo/", root + "/.igloo/sharing/t", "/elsewhere/t", root, ""} {
+		if v := guard(clone.NewMemoryStore()).MayPurge(ctx, "drop", table.Identifier{"prod", "x"}, loc, false); v.Purge {
+			t.Errorf("location %q: %+v", loc, v)
+		}
+	}
+	if v := clone.NewGuard(cat, store, quiet()).MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true); v.Purge {
+		t.Errorf("without a warehouse: %+v", v)
+	}
+	g := clone.NewGuard(unlistable{cat}, store, quiet())
+	g.SetWarehouse(root + "/")
+	if v := g.MayPurge(ctx, "drop", table.Identifier{"prod", "other"}, other.Location(), true); v.Purge || !v.Unsure {
+		t.Errorf("a catalog that cannot be read: %+v", v)
+	}
+}
+
+// unlistable is a catalog that cannot list its tables.
+type unlistable struct{ clone.Catalog }
+
+func (unlistable) Tables(context.Context) ([]table.Identifier, error) {
+	return nil, errors.New("catalog unavailable")
+}

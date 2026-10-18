@@ -327,9 +327,10 @@ days old makes requests wait for them. Through Igloo, few do: dropping a
 table and replacing one, with `CREATE OR REPLACE TABLE ... AS` or a clone
 refresh (`CREATE OR REPLACE TABLE ... CLONE`, `CREATE OR REPLACE SCHEMA
 ... CLONE`), delete the old table's files at once, as long as no clone
-reads them. Those of a table that clones read, or may (Igloo cannot
-tell), stay, and are under no table's location once the clones are gone
-too. A waiting request's `error` says how many files it waits for, and
+reads them, decided the same way for each ([files that clones
+share](operations.md#files-that-clones-share)). Those of a table that
+clones read, or may (Igloo cannot tell), stay, and are under no table's
+location once the clones are gone too. A waiting request's `error` says how many files it waits for, and
 names one. A file another table
 references stays, as do the files under the location of a table that
 cannot be read and those it says it shares, and Igloo's own files

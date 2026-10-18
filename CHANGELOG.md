@@ -428,7 +428,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   alike, which also refuses snapshots whose manifest list is not in the
   warehouse; so does a table a clone replaces (`CREATE OR REPLACE TABLE |
   SCHEMA ... CLONE`), whose location's files Igloo deletes, never those
-  of a source it read as a clone itself. Every branch but main is rewritten with its head's schema, and a
+  of a source it read as a clone itself. Every drop and refresh decides
+  the same way: the files stay when clones read them, as the clones'
+  metadata declares or Igloo's record of them says, when another table
+  is at their location, when they are outside the warehouse or in
+  `.igloo/`, or when Igloo cannot tell; a drop that asks to purge them
+  then is refused. Every branch but main is rewritten with its head's schema, and a
   tag with its snapshot's, so columns dropped since stay in them, and
   each file is written again with its own partition spec, or another
   whose columns that schema has. Admins and roles granted

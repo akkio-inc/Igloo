@@ -30,7 +30,15 @@ func withClones(t *testing.T, h *harness, store clone.Store) {
 		Location: h.cat.tables["public\x1fevents"], Schema: "dev", Table: "events"}}); err != nil {
 		t.Fatal(err)
 	}
-	h.srv.opts.Clones = clone.NewGuard(cat, store, slog.New(slog.DiscardHandler))
+	h.srv.opts.Clones = guardOf(cat, store)
+}
+
+// guardOf is a guard of the clones of cat, whose shares store records,
+// for the harness's warehouse.
+func guardOf(cat clone.Catalog, store clone.Store) *clone.Guard {
+	g := clone.NewGuard(cat, store, slog.New(slog.DiscardHandler))
+	g.SetWarehouse(warehouse + "/")
+	return g
 }
 
 func (h *harness) reached(request string) bool {
@@ -81,7 +89,7 @@ func TestPurgeAfterClonesAreGone(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	h.srv.opts.Clones = clone.NewGuard(clonetest.New(t.TempDir()), store, slog.New(slog.DiscardHandler))
+	h.srv.opts.Clones = guardOf(clonetest.New(t.TempDir()), store)
 
 	// A clone recorded moments ago that the catalog does not have may be
 	// being made: the purge waits.

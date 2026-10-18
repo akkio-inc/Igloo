@@ -36,10 +36,10 @@ import (
 //     read a tagged table's files would be taken into every erasure
 //     request for it. Igloo sets them itself, without DuckDB.
 //
-// A table dropped in the warehouse has its files deleted with it (the
-// catalog purges it) unless clones may read them, so that they do not
-// linger; erasure requests delete whatever a drop leaves (package
-// erasure).
+// A table dropped has its files deleted with it (the catalog purges it)
+// when they may go, as decided for every way Igloo deletes a table's
+// files (clone.Guard.MayPurge), so that they do not linger; erasure
+// requests delete whatever a drop leaves (package erasure).
 
 // cloneProperties are Igloo's clone properties (see package clone).
 const cloneProperties = "igloo.clone."
@@ -127,43 +127,30 @@ func (s *Server) refuseErasingReplace(ctx context.Context, o auth.Object) error 
 }
 
 // purgeVerdict decides whether the catalog deletes the files of the table
-// c drops: it does for a table in the warehouse whose files no clone may
-// read (Options.CloneReaders), which no clone is made of until the drop
-// is through. A drop that asks for the files to go while clones may read
-// them is refused, as Igloo's Iceberg REST catalog refuses it. This is
-// storage hygiene: erasure requests do not rely on it, as they delete the
-// warehouse's files that no table's location holds (package erasure).
+// c drops, as Options.ClonePurge decides for every way Igloo deletes a
+// table's files: it does for a table in the warehouse whose files no
+// clone reads, which no clone is made of until the drop is through. A
+// drop that asks for the files to go when they stay is refused, as Igloo's
+// Iceberg REST catalog refuses it. This is storage hygiene: erasure
+// requests do not rely on it, as they delete the warehouse's files that
+// no table's location holds (package erasure).
 func (s *Server) purgeVerdict(ctx context.Context, c *catalogproxy.Change) (catalogproxy.Verdict, error) {
-	name := strings.Join(append(slices.Clone(c.Namespace), c.Name), ".")
-	switch {
-	case s.cloneReaders == nil || s.gov.warehouse == "":
-		return catalogproxy.Verdict{}, nil
-	case c.Location == "":
-		s.log.Warn("could not tell where a dropped table keeps its files; it is dropped without them", "table", name)
-		return catalogproxy.Verdict{}, nil
-	case !strings.HasPrefix(withSlash(c.Location), s.gov.warehouse):
-		s.log.Info("a table dropped outside the warehouse keeps its files", "table", name, "location", c.Location)
+	if s.clonePurge == nil {
 		return catalogproxy.Verdict{}, nil
 	}
-	names, release, err := s.cloneReaders(ctx, c.Location)
+	v := s.clonePurge(ctx, "drop", append(slices.Clone(c.Namespace), c.Name), c.Location, true)
 	switch {
-	case err != nil && c.Purge:
-		return catalogproxy.Verdict{}, catalogproxy.Refuse("could not tell whether clones read the table's files, so it is not purged; try again")
-	case err != nil:
-		s.log.Warn("could not tell whether clones read a dropped table's files; the table is dropped without them",
-			"table", name, "err", err)
+	case v.Purge:
+		return catalogproxy.Verdict{Purge: true, Release: v.Release}, nil
+	case !c.Purge:
 		return catalogproxy.Verdict{}, nil
-	case len(names) > 0:
-		release()
-		s.log.Info("a dropped table keeps its files: clones read them", "table", name, "location", c.Location,
-			"clones", strings.Join(names, ", "))
-		if c.Purge {
-			return catalogproxy.Verdict{}, catalogproxy.Refuse(fmt.Sprintf("the table is not purged: clones read its files (%s); drop them first, "+
-				"or drop the table without purging it", strings.Join(names, ", ")))
-		}
-		return catalogproxy.Verdict{}, nil
+	case v.Unsure:
+		return catalogproxy.Verdict{}, catalogproxy.Refuse("could not tell whether the table's files may go, so it is not purged; try again")
+	case len(v.Clones) > 0:
+		return catalogproxy.Verdict{}, catalogproxy.Refuse(fmt.Sprintf("the table is not purged: clones read its files (%s); drop them first, "+
+			"or drop the table without purging it", strings.Join(v.Clones, ", ")))
 	}
-	return catalogproxy.Verdict{Purge: true, Release: release}, nil
+	return catalogproxy.Verdict{}, catalogproxy.Refuse("the table is not purged: " + v.Why + "; drop it without purging it")
 }
 
 // catalogRefusal reports err, a statement's error, as permission denied

@@ -7,8 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
+
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/clone"
+	"github.com/akkio-inc/igloo/internal/clone/clonetest"
 )
 
 // What erasure requests need of other engines' changes (see package
@@ -44,6 +48,37 @@ func TestDropPurgesWhatNoCloneReads(t *testing.T) {
 	if w := h.request("DELETE", "/v1/namespaces/public/tables/users", walt, nil); w.Code != 204 ||
 		h.reached("DELETE "+prefix+"/namespaces/public/tables/users?purgeRequested=true") {
 		t.Errorf("drop without knowing the clones: %d %s", w.Code, w.Body)
+	}
+}
+
+// A drop here decides as one in SQL does (clone.Guard.MayPurge): a clone
+// that only its properties say reads the table's files, as when a memory
+// store has not been rebuilt since a restart, keeps them, as does a table
+// in Igloo's own files (.igloo/); a drop that asks for them to go is
+// refused.
+func TestDropKeepsWhatOnlyMetadataSaysClonesRead(t *testing.T) {
+	h := newHarness(t)
+	cat := clonetest.New(t.TempDir())
+	if _, err := cat.Create(table.Identifier{"dev", "events"}, clonetest.Schema,
+		iceberg.Properties{clone.SharesProperty: `["` + h.cat.tables["public\x1fevents"] + `"]`}); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.opts.Clones = guardOf(cat, clone.NewMemoryStore())
+	walt := h.login("walt", "walt-password")
+	h.cat.mu.Lock()
+	h.cat.tables["public\x1figloo"] = warehouse + "/.igloo/sharing"
+	h.cat.mu.Unlock()
+	for _, name := range []string{"events", "igloo"} {
+		w := h.request("DELETE", "/v1/namespaces/public/tables/"+name+"?purgeRequested=true", walt, nil)
+		if kind, msg := errorType(t, w); w.Code != 409 || kind != errConflict {
+			t.Errorf("purge of %s: %d %s %s", name, w.Code, kind, msg)
+		}
+		if w := h.request("DELETE", "/v1/namespaces/public/tables/"+name, walt, nil); w.Code != 204 {
+			t.Fatalf("drop %s: %d %s", name, w.Code, w.Body)
+		}
+		if h.reached("DELETE " + prefix + "/namespaces/public/tables/" + name + "?purgeRequested=true") {
+			t.Errorf("%s purged", name)
+		}
 	}
 }
 

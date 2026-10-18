@@ -195,8 +195,10 @@ func serve() error {
 		}
 		defer cloneStore.Close()
 		clones, guard = clone.NewManager(cat, cloneStore, log), clone.NewGuard(cat, cloneStore, log)
+		// Every way Igloo deletes a table's files decides with guard.
+		guard.SetWarehouse(warehouseRoot(cfg))
 		// A table a clone replaces has its files deleted, with Igloo's
-		// own credentials, unless clones read them, as a drop does.
+		// own credentials, when a drop's would be.
 		clones.Purging(warehouseRoot(cfg), func(ctx context.Context, location string) (iceio.IO, error) {
 			return catalog.FS(ctx, cfg.Storage, location)
 		})
@@ -390,7 +392,7 @@ func serve() error {
 	if guard != nil {
 		// A table dropped that no clone reads has its files deleted with
 		// it (see pgwire's catalogguard.go).
-		opts.CloneReaders = guard.Readers
+		opts.ClonePurge = guard.MayPurge
 	}
 	if single != nil && single.AccessTokensEnabled() {
 		opts.AccessTokens = single

@@ -95,7 +95,9 @@ like), or use a dot in a namespace's name. The commit that creates a
 table, as in `CREATE TABLE AS`, restates the UUID and location the catalog
 gave it; Igloo leaves those out, so the table keeps them. A commit whose
 body names another table than its path is refused. Views, registering
-existing tables and multi-table transactions are not served yet.
+existing tables and multi-table transactions are not served yet. Igloo's
+SQL does not hold writers to the location rule yet: `CREATE TABLE ...
+WITH ('location' = ...)` takes the location an expression gives.
 
 ### Tables with data policies
 
@@ -124,13 +126,16 @@ A [clone](sql.md#clones) reads the data files and manifests of the table
 it was cloned from where they are, under that table's location, so other
 engines are kept from deleting them and from reading past them:
 
-- **Purging.** Dropping a table whose files clones read with
-  `purgeRequested=true` (Spark's `DROP TABLE ... PURGE`) is refused with
-  409, naming the clones: the catalog would delete every file under the
-  table's location. Drop the clones first, or drop the table without
-  purging, which keeps its files, as SQL's `DROP TABLE` does then. A table
-  in the warehouse whose files no clone reads is purged when it is
-  dropped, with `purgeRequested` or without, as in SQL; [erasure
+- **Purging.** Whether a dropped table's files go with it is decided as
+  in SQL ([files that clones
+  share](operations.md#files-that-clones-share)): a table in the warehouse
+  whose files no clone reads is purged when it is dropped, with
+  `purgeRequested` or without. Dropping one whose files stay with
+  `purgeRequested=true` (Spark's `DROP TABLE ... PURGE`) is refused: with
+  409, naming the clones, when clones read them, as the catalog would
+  delete every file under the table's location; with 409 for the other
+  reasons, and 503 when Igloo cannot tell. Drop the clones first, or drop
+  the table without purging, which keeps its files. [Erasure
   requests](privacy.md#what-is-left-of-dropped-tables) delete whatever a
   drop leaves.
 - **Credentials for a clone.** Loading a clone with vended credentials, or

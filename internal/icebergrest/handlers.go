@@ -561,24 +561,24 @@ func (s *Server) dropTable(c *call) error {
 		return err
 	}
 	// Purging deletes every file under the table's location, those that
-	// clones read included (see clones.go).
+	// clones read included (see clones.go). A dropped table's files go
+	// with it, as in SQL, when they may, so that they do not linger;
+	// erasure requests delete whatever a drop leaves (package erasure).
 	query := pick(c.r.URL.Query(), "purgeRequested")
-	switch {
-	case purgeRequested(c) && s.opts.Clones != nil:
-		release, err := s.holdForPurge(c, tablePathOf(ns, o.Table))
-		if err != nil {
+	if s.opts.Clones != nil {
+		v, err := s.purgeVerdict(c, tablePathOf(ns, o.Table), append(slices.Clone(ns), o.Table))
+		switch {
+		case err != nil && purgeRequested(c):
 			return err
-		}
-		defer release()
-		c.detail = "purge"
-	case !purgeRequested(c):
-		// A dropped table's files go with it, as in SQL, unless clones
-		// may read them, so that they do not linger; erasure requests
-		// delete whatever a drop leaves (package erasure).
-		if release, ok := s.holdUnread(c, tablePathOf(ns, o.Table)); ok {
-			defer release()
+		case err != nil:
+			s.log.Warn("could not load a dropped table to tell whether its files may go; it is dropped without them",
+				"table", o.String(), "err", err)
+		case v.Purge:
+			defer v.Release()
 			query.Set("purgeRequested", "true")
 			c.detail = "purge"
+		case purgeRequested(c):
+			return purgeRefusal(v)
 		}
 	}
 	if _, err := s.cat.call(c.ctx(), http.MethodDelete, tablePathOf(ns, o.Table), query, nil); err != nil {

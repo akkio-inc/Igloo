@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go/table"
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
+	"github.com/akkio-inc/igloo/internal/clone"
+	"github.com/akkio-inc/igloo/internal/clone/clonetest"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
@@ -46,20 +50,13 @@ func TestCatalogGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var readers []string
-	var readersErr error
-	asked, released := 0, 0
-	s := &Server{gov: gov, erasure: erasure.New(erasure.Options{Store: store}), log: log,
-		cloneReaders: func(context.Context, string) ([]string, func(), error) {
-			asked++
-			if readersErr != nil {
-				return nil, nil, readersErr
-			}
-			return readers, func() { released++ }, nil
-		}}
+	s := &Server{gov: gov, erasure: erasure.New(erasure.Options{Store: store}), log: log}
 	refused := func(c catalogproxy.Change, want string) {
 		t.Helper()
-		_, err := s.Check(ctx, &c)
+		v, err := s.Check(ctx, &c)
+		if v.Release != nil {
+			v.Release()
+		}
 		var r *catalogproxy.Refusal
 		if !errors.As(err, &r) || !strings.Contains(err.Error(), want) {
 			t.Errorf("%+v: %v, want a refusal that says %q", c, err, want)
@@ -92,37 +89,64 @@ func TestCatalogGuard(t *testing.T) {
 	allowed(catalogproxy.Change{Op: catalogproxy.OpCreate, Namespace: crm, Name: "other", FormatVersion: 3})
 	allowed(catalogproxy.Change{Op: catalogproxy.OpRename, Namespace: crm, Name: "other", To: &catalogproxy.TableName{Namespace: crm, Name: "else"}})
 
-	// Drops of other tables: purged unless clones may read their files.
-	inWarehouse := catalogproxy.Change{Op: catalogproxy.OpDrop, Namespace: crm, Name: "other", Location: "s3://bucket/wh/abc"}
-	if v := allowed(inWarehouse); !v.Purge || v.Release == nil {
+	// Drops of other tables: purged when their files may go, as decided
+	// for every way Igloo deletes a table's files (clone.Guard.MayPurge).
+	root := t.TempDir()
+	cat := clonetest.New(filepath.Join(root, "tables"))
+	src, err := cat.Create(table.Identifier{"crm", "events"}, clonetest.Schema, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src = clonetest.Append(t, src, 1)
+	other, err := cat.Create(table.Identifier{"crm", "other"}, clonetest.Schema, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shares := clone.NewMemoryStore()
+	if _, err := clone.NewManager(cat, shares, log).Clone(ctx, clone.Request{Source: table.Identifier{"crm", "events"},
+		Target: table.Identifier{"crm", "copy"}}); err != nil {
+		t.Fatal(err)
+	}
+	guard := func(shares clone.Store) {
+		g := clone.NewGuard(cat, shares, log)
+		g.SetWarehouse(root + "/")
+		s.clonePurge = g.MayPurge
+	}
+	guard(shares)
+	drop := func(name, location string, purge bool) catalogproxy.Change {
+		return catalogproxy.Change{Op: catalogproxy.OpDrop, Namespace: crm, Name: name, Location: location, Purge: purge}
+	}
+	// kept checks that a drop keeps the table's files.
+	kept := func(c catalogproxy.Change, why string) {
+		t.Helper()
+		if v := allowed(c); v.Purge || v.Release != nil {
+			t.Errorf("%s: %+v", why, v)
+			if v.Release != nil {
+				v.Release()
+			}
+		}
+	}
+	if v := allowed(drop("other", other.Location(), false)); !v.Purge || v.Release == nil {
 		t.Errorf("no clone reads it: %+v", v)
 	} else {
 		v.Release()
 	}
-	readers = []string{"crm.copy"}
-	if v := allowed(inWarehouse); v.Purge || released != 2 {
-		t.Errorf("a clone reads it: %+v, released %d", v, released)
+	// A clone reads crm.events: recorded, or, with a memory store not yet
+	// rebuilt since a restart, only declared in the clone's properties.
+	for _, st := range []clone.Store{shares, clone.NewMemoryStore()} {
+		guard(st)
+		kept(drop("events", src.Location(), false), "a clone reads it")
+		refused(drop("events", src.Location(), true), "clones read its files (crm.copy)")
 	}
-	purge := inWarehouse
-	purge.Purge = true
-	refused(purge, "clones read its files (crm.copy)")
-	readers, readersErr = nil, errors.New("down")
-	if v := allowed(inWarehouse); v.Purge {
-		t.Errorf("cannot tell whether clones read it: %+v", v)
+	guard(failing{shares})
+	kept(drop("other", other.Location(), false), "cannot tell whether clones read it")
+	refused(drop("other", other.Location(), true), "could not tell")
+	guard(shares)
+	for _, loc := range []string{root + "/.igloo", root + "/.igloo/sharing/t", "s3://bucket/elsewhere/abc", root, ""} {
+		kept(drop("other", loc, false), "location "+loc)
 	}
-	refused(purge, "could not tell")
-	readersErr = nil
-	before := asked
-	for _, loc := range []string{"s3://bucket/elsewhere/abc", "s3://bucket/whx/abc", ""} {
-		c := inWarehouse
-		c.Location = loc
-		if v := allowed(c); v.Purge {
-			t.Errorf("outside the warehouse (%q): %+v", loc, v)
-		}
-	}
-	if asked != before {
-		t.Errorf("asked about clones of a table outside the warehouse")
-	}
+	refused(drop("other", root+"/.igloo/t", true), "Igloo's own files")
+	refused(drop("other", "", true), "could not tell")
 
 	// Once the request is over, the table is anyone's.
 	r, err := store.Get(ctx, "01open")
@@ -134,6 +158,13 @@ func TestCatalogGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed(catalogproxy.Change{Op: catalogproxy.OpDrop, Namespace: crm, Name: "people"})
+}
+
+// failing is a clone Store that cannot say which clones read a location.
+type failing struct{ clone.Store }
+
+func (failing) Sharers(context.Context, string) ([]clone.Share, error) {
+	return nil, errors.New("metadata database unavailable")
 }
 
 // DuckDB's error for a change the catalog proxy refused is reported as

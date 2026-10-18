@@ -609,41 +609,48 @@ it works on:
 - **Orphan cleanup** keeps them the same way.
 - **Compaction** deletes nothing itself; the files it replaces go with the
   snapshots that read them.
-- **`DROP TABLE`** asks the catalog to purge the table, which deletes
-  everything under its location, only when no clone may read its files:
-  Igloo takes the lock that making a clone of the table takes, checks that
-  no clone reads under the table's location (as the purge refusal below
-  does), and holds the lock until the drop is through. A table whose files
-  clones read, or may (Igloo cannot tell), is dropped without purging: its
-  files stay in the bucket, and clones keep reading theirs. Only tables
-  in the warehouse are purged. Whatever a drop leaves, as the files of a
-  table whose clones read them once the clones are gone too, [erasure
-  requests](privacy.md#what-is-left-of-dropped-tables) delete with the
-  rest of the warehouse's files under no table's or view's location, once
-  three days old: the warehouse is Igloo's alone. The catalog deletes files only when
-  asked to purge, and only Igloo can reach it; other engines go through
-  [Igloo's Iceberg REST catalog](external-engines.md#clones), which drops
-  tables the same way and refuses to purge a table whose files clones
-  read (409, naming the clones; dropping it without purging works). Igloo's
-  warehouse uses the catalog's default hard deletion, in which a dropped
-  table cannot be restored; with Lakekeeper's soft deletion turned on
-  instead, a table restored after it was dropped may miss its files, and a
-  clone restored after it was dropped may miss files of its source that
-  maintenance deleted meanwhile.
+- **`DROP TABLE`**, and `CREATE OR REPLACE TABLE ... AS`, which drops the
+  old table, ask the catalog to purge the table, which deletes everything
+  under its location, only when its files may go (below); otherwise the
+  table is dropped without purging, and its files stay in the bucket. A
+  drop that asks for the files to go when they stay is refused: in SQL,
+  and through [Igloo's Iceberg REST catalog](external-engines.md#clones)
+  (409, naming the clones when they are why; 503 when Igloo cannot tell),
+  through which other engines drop tables the same way. The catalog
+  deletes files only when asked to purge, and only Igloo can reach it.
+  Igloo's warehouse uses the catalog's default hard deletion, in which a
+  dropped table cannot be restored; with Lakekeeper's soft deletion turned
+  on instead, a table restored after it was dropped may miss its files,
+  and a clone restored after it was dropped may miss files of its source
+  that maintenance deleted meanwhile.
 - **`CREATE OR REPLACE TABLE ... CLONE`** and **`CREATE OR REPLACE SCHEMA
   ... CLONE`** replace a table in the catalog without purging it, so Igloo
   deletes its files itself, with its own credentials, once the clone is
-  made: everything under the replaced table's location, as the catalog's
-  purge does, and nothing elsewhere. A replaced clone's files go, and the
-  files of its source that it read stay, under the source's location. As
-  for a drop, it deletes them only when the location is in the warehouse
-  (outside Igloo's own `.igloo/`) and no clone reads under it, as the
-  clones' metadata declares or the record below says; Igloo checks that
-  under the lock that making a clone takes, and holds it until the files
-  are gone. It also keeps them while a table of the catalog is at that
-  location, as the replaced table is if it was renamed in the moment
-  before the clone took its name. Otherwise the files stay, and the log
-  says why.
+  made, when they may go: everything under the replaced table's location,
+  as the catalog's purge does, and nothing elsewhere. A replaced clone's
+  files go, and the files of its source that it read stay, under the
+  source's location. The statement returns once they are deleted, so
+  replacing a table of many files takes that much longer.
+
+Whether a table's files may go is decided the same way for every drop
+and every clone refresh. They stay when the location is outside the
+warehouse or in Igloo's own files there (`.igloo/`); when another table of
+the catalog is at the location, within it or around it (as the table
+itself is, if it was renamed in the moment before it was dropped or
+replaced); when a table's metadata says it reads files there, as every
+clone's does (`igloo.clone.shares-files-of`), whether or not the record
+below has it yet; when the record names a clone that reads there, or may;
+and whenever Igloo cannot tell. Igloo checks the record under the lock
+that making a clone of the table takes, and holds it until the drop is
+through or the files are gone, so no clone starts reading them meanwhile.
+When the files stay, the log says why. Igloo knows which tables read
+another's files only through clones: files another engine added to a
+table from a second table's location (Spark's `add_files`, say) go when
+that second table is dropped. Whatever a drop leaves, as the files of a
+table whose clones read them once the clones are gone too, [erasure
+requests](privacy.md#what-is-left-of-dropped-tables) delete with the rest
+of the warehouse's files under no table's or view's location, once three
+days old: the warehouse is Igloo's alone.
 
 Which tables share which files is recorded twice: in each clone's own
 metadata (the table property `igloo.clone.shares-files-of`, the locations

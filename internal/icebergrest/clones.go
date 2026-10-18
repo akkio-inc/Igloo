@@ -6,19 +6,22 @@ import (
 	"strings"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/clone"
 )
 
 // Zero-copy clones (package clone) are tables whose metadata names files
 // under their sources' locations. Three things follow for other engines:
 //
 //   - Dropping a table with purgeRequested makes Lakekeeper delete every
-//     file under its location, so a table whose files clones read is not
-//     purged: the drop is refused, naming the clones, and the client may
-//     drop it without purging (its files stay, as SQL's DROP TABLE leaves
-//     them then) or drop the clones first. A table in the warehouse whose
-//     files no clone reads is purged when it is dropped, whatever the
-//     client asks, as in SQL, so that its files do not linger; erasure
-//     requests delete whatever a drop leaves (package erasure).
+//     file under its location, so whether a dropped table is purged is
+//     decided as for every way Igloo deletes a table's files
+//     (clone.Guard.MayPurge): a table in the warehouse whose files no
+//     clone reads is purged whatever the client asks, as in SQL, so that
+//     its files do not linger; otherwise its files stay, and a drop that
+//     asks for them to go is refused, naming the clones if that is why,
+//     so that the client may drop it without purging or drop the clones
+//     first. Erasure requests delete whatever a drop leaves (package
+//     erasure).
 //   - Credentials reach one table's location (see Vendor), so they would
 //     not reach a clone's files under its source's. Igloo hands out none
 //     for clones, rather than credentials that cover the source too, which
@@ -45,10 +48,10 @@ type Clones interface {
 	Sources(properties map[string]string) []string
 	// Shared reports whether clones may read files under location.
 	Shared(ctx context.Context, location string) (bool, error)
-	// Readers takes the lock of location, which making a clone of the
-	// table there takes too, and names the clones that read files under
-	// it, or may. release must be called.
-	Readers(ctx context.Context, location string) (names []string, release func(), err error)
+	// MayPurge decides whether the files of the table called name, at
+	// location, may go with it; inCatalog says the catalog has it still.
+	// The verdict's Release, when set, must be called.
+	MayPurge(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 }
 
 // errConflict is the error type of a drop refused because clones read the
@@ -83,59 +86,34 @@ func purgeRequested(c *call) bool {
 	return false
 }
 
-// holdForPurge refuses to purge the table at path if clones read its files.
-// Otherwise it holds them until release is called, so no clone of the table
-// is made before the drop is through.
-func (s *Server) holdForPurge(c *call, path string) (release func(), err error) {
+// purgeVerdict decides whether the table at path, called name, which is
+// about to be dropped, has its files purged with it (Clones.MayPurge).
+func (s *Server) purgeVerdict(c *call, path string, name []string) (clone.PurgeVerdict, error) {
 	r, err := s.cat.call(c.ctx(), http.MethodGet, path, nil, nil)
 	if err != nil {
-		return nil, err
+		return clone.PurgeVerdict{}, err
 	}
 	t, err := parseLoadResult(r.body)
 	if err != nil {
-		return nil, err
+		return clone.PurgeVerdict{}, err
 	}
-	names, release, err := s.opts.Clones.Readers(c.ctx(), t.location)
-	if err != nil {
-		s.log.Warn("could not tell whether clones read a table's files", "location", t.location, "err", err)
-		return nil, errorf(http.StatusServiceUnavailable, errUnavailable,
-			"could not tell whether clones read the table's files, so it is not purged; try again")
-	}
-	if len(names) > 0 {
-		release()
-		return nil, errorf(http.StatusConflict, errConflict,
-			"the table is not purged: clones read its files (%s); drop them first, or drop the table without purgeRequested, which keeps its files",
-			strings.Join(names, ", "))
-	}
-	return release, nil
+	return s.opts.Clones.MayPurge(c.ctx(), "drop", name, t.location, true), nil
 }
 
-// holdUnread reports whether the table at path, which is dropped without
-// purging, may be purged instead: it is in the warehouse (StorageRoot),
-// and no clone reads its files, which none will until release is called.
-// When that cannot be told, it is not.
-func (s *Server) holdUnread(c *call, path string) (release func(), ok bool) {
-	if s.opts.Clones == nil || s.opts.StorageRoot == "" {
-		return nil, false
-	}
-	r, err := s.cat.call(c.ctx(), http.MethodGet, path, nil, nil)
-	if err != nil {
-		return nil, false
-	}
-	t, err := parseLoadResult(r.body)
-	if err != nil || !strings.HasPrefix(strings.TrimSuffix(t.location, "/")+"/", strings.TrimSuffix(s.opts.StorageRoot, "/")+"/") {
-		return nil, false
-	}
-	names, release, err := s.opts.Clones.Readers(c.ctx(), t.location)
+// purgeRefusal refuses a drop that asks for the table's files to go when
+// v keeps them.
+func purgeRefusal(v clone.PurgeVerdict) error {
 	switch {
-	case err != nil:
-		s.log.Warn("could not tell whether clones read a dropped table's files; it is dropped without them", "location", t.location, "err", err)
-		return nil, false
-	case len(names) > 0:
-		release()
-		return nil, false
+	case v.Unsure:
+		return errorf(http.StatusServiceUnavailable, errUnavailable,
+			"could not tell whether the table's files may go, so it is not purged; try again")
+	case len(v.Clones) > 0:
+		return errorf(http.StatusConflict, errConflict,
+			"the table is not purged: clones read its files (%s); drop them first, or drop the table without purgeRequested, which keeps its files",
+			strings.Join(v.Clones, ", "))
 	}
-	return release, true
+	return errorf(http.StatusConflict, errConflict,
+		"the table is not purged: %s; drop it without purgeRequested, which keeps its files", v.Why)
 }
 
 // cloneCredentials refuses credentials for table o, loaded as t, if it is a

@@ -155,11 +155,9 @@ type Options struct {
 	Lineage LineageSink
 	// Erasure carries out erasure requests. Nil without a catalog.
 	Erasure *erasure.Service
-	// CloneReaders, if set, names the clones that read files under a
-	// table's location, holding off new ones until release is called
-	// (clone.Guard.Readers): a table dropped that none reads has its files
-	// deleted with it (see catalogguard.go).
-	CloneReaders func(ctx context.Context, location string) (names []string, release func(), err error)
+	// ClonePurge, if set, decides whether a table dropped has its files
+	// deleted with it (clone.Guard.MayPurge; see catalogguard.go).
+	ClonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 
 	// Distributed, if set, runs statements that read large tables in
 	// parts on workers (docs/distributed-execution.md).
@@ -222,8 +220,8 @@ type Server struct {
 	notify      *notify.Service
 	clones      *clone.Manager
 	erasure     *erasure.Service
-	// cloneReaders is Options.CloneReaders (see catalogguard.go).
-	cloneReaders func(ctx context.Context, location string) ([]string, func(), error)
+	// clonePurge is Options.ClonePurge (see catalogguard.go).
+	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
 	gov      *governance
 	settings auth.SettingStore
@@ -306,7 +304,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		erasure:     opts.Erasure,
 		mockSecret:  mockSecret,
 
-		cloneReaders: opts.CloneReaders,
+		clonePurge: opts.ClonePurge,
 
 		tokens:              opts.Tokens,
 		accounts:            opts.Accounts,
