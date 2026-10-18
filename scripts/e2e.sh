@@ -345,6 +345,19 @@ if [ "$deleted" -ge 1 ] 2>/dev/null; then
 else
   fail "deleting the file the writer put in the warehouse: $deleted"
 fi
+# The benchmark's generator (deploy/single-vm/sql/load-media.sql), small,
+# in a schema of its own. Its columns must be independent: they once came
+# from DuckDB's hash(i, k), which differ by the same constant for every i,
+# and every click landed on one channel and each campaign reached only the
+# devices of one residue modulo 16.
+if got="$(psql_admin -c "CREATE SCHEMA media_gen" -c "SET search_path = media_gen" -v rows=200000 -f - \
+  <"$root/deploy/single-vm/sql/load-media.sql")"; then
+  expect "load-media.sql: clicks on every channel, each campaign across the devices" "4|t" igloo "$admin_password" "
+    SELECT (SELECT count(DISTINCT c.channel) FROM media_gen.impressions i JOIN media_gen.campaigns c USING (campaign_id) WHERE i.clicked),
+      (SELECT min(r) > 8 FROM (SELECT count(DISTINCT device_id % 16) AS r FROM media_gen.impressions GROUP BY campaign_id))"
+else
+  fail "load-media.sql: $got"
+fi
 
 echo "client compatibility"
 got="$(psql_admin -c '\dt')"
