@@ -368,6 +368,13 @@ got="$(psql_admin -c '\dt')"
 if grep -q "public|e2e|table" <<<"$got"; then pass '\dt lists tables'; else fail "\\dt: $got"; fi
 got="$(psql_admin -c '\d e2e_copy')"
 if grep -q "amount|numeric(10,2)" <<<"$got"; then pass '\d shows columns'; else fail "\\d: $got"; fi
+# Superset sets the search path to the schema of every query, and
+# load-media.sql above set it to one without views: nothing to warn about.
+if compose logs --no-color igloo 2>&1 | grep -q "could not keep views"; then
+  fail "SET search_path to a schema without views logs a warning: $(compose logs --no-color igloo 2>&1 | grep -m1 "could not keep views")"
+else
+  pass "SET search_path to a schema without views logs no warning"
+fi
 
 echo "TPC-H"
 got="$(compose run --rm -T psql -X -v ON_ERROR_STOP=1 -v sf=0.1 -f /sql/load-tpch.sql 2>&1)"

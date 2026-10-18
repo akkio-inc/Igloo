@@ -243,8 +243,13 @@ func TestWithViewSchemas(t *testing.T) {
 		{"lake.public,memory.public", "lake", `"lake"."public","memory"."public"`, false},
 		{"other.main", "lake", `"other"."main"`, false},
 		{"public", "memory", `"public"`, false},
+		// A schema without views has no copies to add: Superset sets the
+		// path to every schema it queries.
+		{"media", "lake", `"media"`, false},
+		{"lake.media, lake.public", "lake", `"lake"."media","lake"."public","memory"."public"`, true},
 	} {
-		got, ok := withViewSchemas(c.setting, c.db, "public", "lake", "memory")
+		hasCopies := func(schema string) bool { return schema != "media" }
+		got, ok := withViewSchemas(c.setting, c.db, "public", "lake", "memory", hasCopies)
 		if got != c.want || ok != c.ok {
 			t.Errorf("withViewSchemas(%q, %q) = %q, %v; want %q, %v", c.setting, c.db, got, ok, c.want, c.ok)
 		}

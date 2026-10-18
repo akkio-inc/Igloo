@@ -124,14 +124,19 @@ var setsSearchPath = regexp.MustCompile(`(?is)^(SET|RESET)\s+(?:SESSION\s+|LOCAL
 // session's search path after a client set it, next to each catalog schema
 // there, as on the path sessions start with (lake.public,memory.public).
 // Superset's SQL Lab, for one, sets the path to the schema the analyst
-// picked, and its views would no longer resolve.
+// picked, and its views would no longer resolve. A schema without views
+// has no local copies and needs none on the path, where DuckDB refuses a
+// schema that does not exist.
 func (s *Server) keepViewsOnPath(ctx context.Context, sess *session) error {
+	local := s.engine.LocalDatabase()
 	rows, err := sess.conn.QueryContext(ctx,
-		"SELECT system.main.current_setting('search_path')::VARCHAR, system.main.current_database(), system.main.current_schema()", nil)
+		`SELECT system.main.current_setting('search_path')::VARCHAR, system.main.current_database(), system.main.current_schema(),
+			(SELECT system.main.string_agg(schema_name, chr(10)) FROM system.main.duckdb_schemas() WHERE database_name = $1)`,
+		[]driver.NamedValue{{Ordinal: 1, Value: local}})
 	if err != nil {
 		return err
 	}
-	dest := make([]driver.Value, 3)
+	dest := make([]driver.Value, 4)
 	err = rows.Next(dest)
 	_ = rows.Close()
 	if err != nil {
@@ -140,17 +145,23 @@ func (s *Server) keepViewsOnPath(ctx context.Context, sess *session) error {
 	setting, _ := dest[0].(string)
 	db, _ := dest[1].(string)
 	schema, _ := dest[2].(string)
-	if path, ok := withViewSchemas(setting, db, schema, s.catalogName(), s.engine.LocalDatabase()); ok {
+	schemas, _ := dest[3].(string)
+	copies := map[string]bool{}
+	for _, name := range strings.Split(schemas, "\n") {
+		copies[strings.ToLower(name)] = true
+	}
+	hasCopies := func(schema string) bool { return copies[strings.ToLower(schema)] }
+	if path, ok := withViewSchemas(setting, db, schema, s.catalogName(), local, hasCopies); ok {
 		_, err = sess.conn.ExecContext(ctx, "SET SESSION search_path = "+quoteLiteral(path), nil)
 	}
 	return err
 }
 
 // withViewSchemas returns the search path setting with local, the database
-// of views' local copies, after each schema of catalog on it. setting is
-// empty for the default path, schema of db. ok is false if nothing was
-// missing.
-func withViewSchemas(setting, db, schema, catalog, local string) (path string, ok bool) {
+// of views' local copies, after each schema of catalog on it whose views
+// have copies there, as hasCopies says. setting is empty for the default
+// path, schema of db. ok is false if nothing was missing.
+func withViewSchemas(setting, db, schema, catalog, local string, hasCopies func(schema string) bool) (path string, ok bool) {
 	entries := splitTopLevelQuoted(setting, ',')
 	if strings.TrimSpace(setting) == "" {
 		entries = []string{quoteName([]string{db, schema})}
@@ -180,7 +191,7 @@ func withViewSchemas(setting, db, schema, catalog, local string) (path string, o
 			continue
 		}
 		add(parts)
-		if views != nil {
+		if views != nil && hasCopies(views[1]) {
 			add(views)
 			ok = ok || !present[key(views)]
 		}
