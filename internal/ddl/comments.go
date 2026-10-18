@@ -66,6 +66,7 @@ func (m *Manager) Comment(ctx context.Context, t CommentTarget) error {
 func (m *Manager) setViewColumnComment(ctx context.Context, t CommentTarget) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.edit(keyOf(t.Schema, t.Name))
 	if err := m.cat.SetViewColumnComment(ctx, t.Schema, t.Name, t.Column, t.Text); err != nil {
 		return err
 	}

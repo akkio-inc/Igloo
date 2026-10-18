@@ -1052,6 +1052,10 @@ func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, tex
 // user's own.
 func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
 	fail := func(err error) (*statement, error) { return nil, err }
+	var viewGen uint64
+	if s.ddl != nil {
+		viewGen = s.ddl.Generation()
+	}
 	query, err := s.resolveRefReads(ctx, sess, s.rewrite(ctx, sess, user, text))
 	if err != nil {
 		return fail(err)
@@ -1129,8 +1133,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	st, err := prepare(ctx, sess.conn, query, oids)
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
-		// Perhaps a view another replica just created: sync and try again.
-		if changed, _ := s.ddl.SyncViews(ctx); changed {
+		// Perhaps a view another replica just created: sync and try again,
+		// also when this sync changed nothing because another one, of the
+		// background or another session, brought the view meanwhile.
+		if changed, _ := s.ddl.SyncViews(ctx); changed || s.ddl.Generation() != viewGen {
 			query = s.ddl.RewriteViewRefs(query)
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}

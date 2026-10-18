@@ -686,5 +686,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   renames or drops one of them at the same time. The background sync no
   longer looks; a copy that has gone missing is made again when a statement
   names it.
+- A view a session had just created, replaced, renamed or dropped could
+  seem unchanged on its own replica until the next sync, 30 seconds later:
+  dbt failed with `view "..._dbt_tmp" does not exist` or `already exists`,
+  left `__dbt_backup` views behind, or built a model from a view's previous
+  definition. A sync lists the catalog's views without holding up view
+  changes, and applied the list even when it was older than a change the
+  replica had made meanwhile. Syncs now leave the views their replica
+  changed meanwhile as those changes made them, and never apply a list older
+  than one already applied; a statement that names a view another replica
+  created finds it when any sync brought it, not only its own.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

@@ -104,8 +104,10 @@ DROP VIEW IF EXISTS recent_orders;
   tables of views that sessions with other search paths will read.
   Schema-qualified table names are stored with the catalog's name:
   `sales.orders` becomes `lake.sales.orders`.
-- A view created on one replica reaches the others within 30 seconds, or at
-  once when a query there names it.
+- Creating, replacing, renaming or dropping a view takes effect at once for
+  every session on the replica that does it. A view created on one replica
+  reaches the others within 30 seconds, or at once when a query there names
+  it.
 - Writers create, rename and drop views, as do users with `CREATE` on the
   view's schema. Other engines see the views in the catalog but cannot run
   their DuckDB SQL. `ALTER VIEW` supports only `RENAME TO`; a renamed view

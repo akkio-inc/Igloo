@@ -63,11 +63,20 @@ type Manager struct {
 	eng *engine.Engine
 	log *slog.Logger
 
-	// mu serializes view changes and syncs, and guards conn and views.
+	// mu serializes view changes and syncs applying what they listed, and
+	// guards the fields below up to known.
 	mu sync.Mutex
 	// conn runs syncs.
 	conn  *duckdb.Conn
 	views map[key]catalog.View
+	// edits counts this replica's changes to views. edited holds, for each
+	// view changed since the last sync applied began listing, edits as of
+	// its last change (see sync).
+	edits  uint64
+	edited map[key]uint64
+	// syncs counts the syncs begun, and applied is the number of the last
+	// begun of those that applied what they listed.
+	syncs, applied uint64
 	// known is the set of view keys, read without locking by IsView.
 	known atomic.Pointer[map[key]bool]
 	// gen counts changes to the local copies; see Generation.
@@ -94,8 +103,8 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, log: log.With("component", "ddl"),
-		touched: map[key]time.Time{}}
+	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, edited: map[key]uint64{},
+		log: log.With("component", "ddl"), touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
 	if _, err := m.SyncViews(ctx); err != nil {
 		m.log.Warn("could not load views", "err", err)
@@ -175,25 +184,49 @@ func (m *Manager) PollViews(ctx context.Context) (changed bool, err error) {
 }
 
 // sync is SyncViews, or PollViews without checkLocal.
+//
+// Listing the catalog's views takes a while, and is done without holding
+// up view changes or other syncs, so the list can be older than what the
+// local copies already show. Applied, it would undo that: a session would
+// not find the view it had just created, would find one it had just
+// dropped or renamed, or would read an earlier definition. So the views
+// this replica changed after listing began are left as those changes made
+// them, which is as new as the catalog has them or newer, for the next
+// sync to look at again. And a list is not applied at all once a sync that
+// began later has applied its own.
 func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err error) {
+	m.mu.Lock()
+	m.syncs++
+	this, since := m.syncs, m.edits
+	m.mu.Unlock()
 	defs, err := m.cat.DuckDBViews(ctx)
 	if err != nil {
 		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if this < m.applied {
+		return false, nil
+	}
+	m.applied = this
 	defer func() {
 		if changed {
 			m.gen.Add(1)
 		}
 	}()
+	listed := func(k key) bool { return m.edited[k] <= since }
+	for k, n := range m.edited {
+		if n <= since {
+			delete(m.edited, k)
+		}
+	}
 
 	want := map[key]catalog.View{}
 	for _, v := range defs {
 		want[keyOf(v.Schema, v.Name)] = v
 	}
 	for k, v := range m.views {
-		if _, ok := want[k]; !ok {
+		if _, ok := want[k]; !ok && listed(k) {
 			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(v.Schema, v.Name)); err != nil {
 				return changed, err
 			}
@@ -216,6 +249,9 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 	// what can be created, and repeat while that makes progress.
 	pending := map[key]catalog.View{}
 	for k, v := range want {
+		if !listed(k) {
+			continue
+		}
 		if cur, ok := m.views[k]; !ok || missing(k) || cur.Version != v.Version || cur.SQL != v.SQL {
 			pending[k] = v
 		}
@@ -243,6 +279,16 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 	return changed, nil
 }
 
+// edit records that this replica is changing the views keys, whose local
+// copies the change keeps up to date: syncs that are listing the
+// catalog's views now leave them alone. m.mu must be held.
+func (m *Manager) edit(keys ...key) {
+	m.edits++
+	for _, k := range keys {
+		m.edited[k] = m.edits
+	}
+}
+
 // publish updates the set IsView reads: the local views plus extra.
 func (m *Manager) publish(extra map[key]catalog.View) {
 	known := make(map[key]bool, len(m.views)+len(extra))
@@ -264,6 +310,7 @@ func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, nam
 	defer m.mu.Unlock()
 	defer m.gen.Add(1)
 	k := keyOf(schema, name)
+	m.edit(k)
 
 	exists, err := m.cat.CheckTableExists(ctx, catalog.Ident(schema, name))
 	if err != nil {
@@ -336,6 +383,7 @@ func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bo
 	defer m.mu.Unlock()
 	defer m.gen.Add(1)
 	k := keyOf(schema, name)
+	m.edit(k)
 
 	err := m.cat.DropView(ctx, catalog.Ident(schema, name))
 	_, local := m.views[k]
@@ -373,6 +421,7 @@ func (m *Manager) RenameView(ctx context.Context, schema, from, to string) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer m.gen.Add(1)
+	m.edit(keyOf(schema, from), keyOf(schema, to))
 	v, ok := m.views[keyOf(schema, from)]
 	if !ok {
 		return fmt.Errorf("view %q %w", from, ErrNotFound)
