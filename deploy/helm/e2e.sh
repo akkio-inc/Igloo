@@ -498,9 +498,13 @@ CONNECT_TIMEOUT=$RESUME_WAIT sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "INSERT INT
 
 log "The gateway scales igloo to zero after $SUSPEND_AFTER without traffic"
 wait_suspended
-metrics=$(gateway_metrics)
-suspends=$(metric_value "$metrics" igloo_gateway_suspends_total)
-((suspends >= 1)) || fail "igloo_gateway_suspends_total is $suspends"
+# The gateway counts a suspend once igloo's SQL port refuses connections,
+# which can trail the pods' deletion by a few seconds.
+deadline=$((SECONDS + 60))
+until metrics=$(gateway_metrics) && suspends=$(metric_value "$metrics" igloo_gateway_suspends_total) && ((suspends >= 1)); do
+  ((SECONDS < deadline)) || fail "igloo_gateway_suspends_total is still $suspends 60s after igloo's pods went"
+  sleep 2
+done
 pass "igloo_gateway_suspends_total = $suspends"
 resumes_before=$(metric_value "$metrics" 'igloo_gateway_resumes_total{result="success"}')
 
