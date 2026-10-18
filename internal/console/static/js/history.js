@@ -203,7 +203,7 @@ export function createHistory(app) {
       case 'outcome': return h('td', {}, v === null || v === undefined ? '' : h('span', { class: `badge ${outcomeClass(v)}`, text: outcomeLabel(v) }));
       case 'duration': return h('td', { class: 'num nowrap', text: durationText(col, v) });
       case 'rows': return h('td', { class: 'num', text: v === null || v === undefined ? '' : Number(v).toLocaleString() });
-      case 'text': return h('td', {}, h('div', { class: 'truncate mono', text: (v || '').replace(/\s+/g, ' ') }));
+      case 'text': return h('td', { class: 'fill' }, h('div', { class: 'truncate mono', text: (v || '').replace(/\s+/g, ' ') }));
       default: return h('td', { class: field === 'error' ? 'truncate' : '', text: v ?? '' });
     }
   }

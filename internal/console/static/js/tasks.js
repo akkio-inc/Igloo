@@ -7,7 +7,7 @@
 // failing.
 
 import * as api from './api.js';
-import { h, clear, icon, button, fmtMs, fmtTime, fmtAgo, plural, mark, toast, confirmDialog } from './dom.js';
+import { h, clear, icon, button, fmtMs, fmtTime, fmtShortTime, fmtAgo, plural, mark, toast, confirmDialog } from './dom.js';
 
 // SQLSTATEs meaning the statement or view is not there.
 const MISSING = new Set(['42P01', '3F000', '42704', '0A000', '42601', '42883']);
@@ -61,6 +61,13 @@ function unavailable(what, source) {
 
 function num(v) {
   return v === null || v === undefined ? '' : Number(v).toLocaleString();
+}
+
+// runWhen is when a run started, with what started it under the time, so
+// the runs table fits the details pane.
+function runWhen(start, trigger) {
+  return h('td', {}, h('div', { class: 'run-when', title: fmtTime(start) },
+    h('span', { text: fmtShortTime(start) }), trigger ? h('span', { class: 'sub', text: trigger }) : null));
 }
 
 // Tasks, pipes and materialized views.
@@ -198,7 +205,7 @@ ORDER BY start_time DESC LIMIT 50`));
           h('thead', {}, h('tr', {}, ['Time', 'File', 'Status', 'Rows'].map((t) => h('th', { text: t })))),
           h('tbody', {}, res.map((r) => [
             h('tr', {},
-              h('td', { class: 'nowrap muted', text: fmtTime(r.start_time) }),
+              runWhen(r.start_time),
               h('td', {}, h('div', { class: 'truncate mono', text: r.file.split('/').pop() })),
               h('td', {}, outcomeBadge(r.status)),
               h('td', { class: 'num', text: num(r.row_count) })),
@@ -210,15 +217,14 @@ ORDER BY start_time DESC LIMIT 50`));
 FROM igloo.alert_history WHERE alert_type = 'alert' AND alert_name = ${api.literal(j.name)}
 ORDER BY start_time DESC LIMIT 50`));
         clear(runs, res.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
-          h('thead', {}, h('tr', {}, ['Started', 'Trigger', 'State', 'Took', 'Rows'].map((t) => h('th', { text: t })))),
+          h('thead', {}, h('tr', {}, [['Started', ''], ['State', ''], ['Took', 'num'], ['Rows', 'num']].map(([t, c]) => h('th', { class: c, text: t })))),
           h('tbody', {}, res.map((r) => [
             h('tr', {},
-              h('td', { class: 'nowrap muted', text: fmtTime(r.start_time) }),
-              h('td', { text: r.trigger }),
+              runWhen(r.start_time, r.trigger),
               h('td', {}, outcomeBadge(r.state)),
               h('td', { class: 'num nowrap', text: r.duration_ms === null ? '' : fmtMs(Number(r.duration_ms)) }),
               h('td', { class: 'num', text: num(r.row_count) })),
-            r.error ? h('tr', {}, h('td', { colspan: '5' }, h('pre', { class: 'mono', text: r.error }))) : null,
+            r.error ? h('tr', {}, h('td', { colspan: '4' }, h('pre', { class: 'mono', text: r.error }))) : null,
           ]))))
           : h('p', { class: 'muted', text: 'No runs yet.' }));
       } else {
@@ -226,15 +232,14 @@ ORDER BY start_time DESC LIMIT 50`));
 FROM igloo.task_history WHERE kind = ${api.literal(kind)} AND name = ${api.literal(j.name)}
 ORDER BY start_time DESC LIMIT 50`));
         clear(runs, res.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'list' },
-          h('thead', {}, h('tr', {}, ['Started', 'Trigger', 'Outcome', 'Took', 'Rows'].map((t) => h('th', { text: t })))),
+          h('thead', {}, h('tr', {}, [['Started', ''], ['Outcome', ''], ['Took', 'num'], ['Rows', 'num']].map(([t, c]) => h('th', { class: c, text: t })))),
           h('tbody', {}, res.map((r) => [
             h('tr', {},
-              h('td', { class: 'nowrap muted', text: fmtTime(r.start_time) }),
-              h('td', { text: r.trigger }),
+              runWhen(r.start_time, r.trigger),
               h('td', {}, outcomeBadge(r.outcome)),
               h('td', { class: 'num nowrap', text: r.duration_ms === null ? '' : fmtMs(Number(r.duration_ms)) }),
               h('td', { class: 'num', text: num(r.row_count) })),
-            r.error ? h('tr', {}, h('td', { colspan: '5' }, h('pre', { class: 'mono', text: r.error }))) : null,
+            r.error ? h('tr', {}, h('td', { colspan: '4' }, h('pre', { class: 'mono', text: r.error }))) : null,
           ]))))
           : h('p', { class: 'muted', text: 'No runs yet.' }));
       }

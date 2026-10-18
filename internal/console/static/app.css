@@ -756,7 +756,7 @@ pre.definition {
   grid-template-columns: minmax(0, 1fr);
   border-top: 1px solid var(--border);
 }
-.history-layout.with-detail { grid-template-columns: minmax(0, 1fr) 420px; }
+.history-layout.with-detail { grid-template-columns: minmax(0, 1fr) clamp(380px, 34vw, 600px); }
 .history-list { min-height: 0; overflow: auto; background: var(--surface); }
 .history-detail {
   min-height: 0; overflow: auto;
@@ -769,6 +769,14 @@ pre.definition {
 .history-detail dt { color: var(--text-muted); }
 .history-detail dd { margin: 0; word-break: break-word; }
 .history-detail pre { margin: 0; padding: 10px; border-radius: var(--radius); background: var(--code-bg); border: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; }
+.history-detail table.list th, .history-detail table.list td { padding: 7px 8px; }
+.history-detail table.list td pre { white-space: pre-wrap; }
+.run-when { display: flex; flex-direction: column; white-space: nowrap; }
+.run-when .sub { font-size: 12px; color: var(--text-faint); }
+/* The query column takes the room the others leave, and cuts its text
+   there rather than at a fixed width. */
+table.list td.fill { width: 100%; max-width: 0; }
+table.list td.fill .truncate { max-width: none; min-width: 220px; }
 .filters .check {
   display: inline-flex; align-items: center; gap: 6px;
   height: 32px; padding: 0 2px;
@@ -824,6 +832,7 @@ td .statement { display: block; max-width: 520px; white-space: pre-wrap; word-br
 .catalog-description { display: flex; align-items: flex-start; gap: 10px; }
 .catalog-description .comment { flex: 1; white-space: pre-wrap; }
 .catalog-body { padding: 14px 24px 0; }
+.catalog-stats .stat { padding: 12px 14px; min-width: 0; }
 .catalog-stats .stat .value { font-size: 18px; }
 .badge-list { display: flex; flex-wrap: wrap; gap: 4px; }
 .lineage-block { display: flex; flex-direction: column; gap: 6px; }
@@ -921,6 +930,10 @@ dialog::backdrop { background: rgba(14, 21, 48, .45); }
   .tab-panel { padding: 12px 16px 16px; }
   .tab-panel.flush .results { margin: 12px 16px 16px; }
   .form-grid { grid-template-columns: minmax(0, 1fr); }
+  /* A table's page scrolls as a whole: its header alone can be taller
+     than the screen, and would leave its tabs no room. */
+  .catalog-object > .tab-panel { flex: none; overflow: visible; }
+  .catalog-object > .tab-panel.flush { height: 70vh; }
   .history-layout.with-detail { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
   .history-detail { border-left: 0; border-top: 1px solid var(--border); }
   .toolbar .hint { display: none; }

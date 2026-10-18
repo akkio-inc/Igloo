@@ -136,6 +136,16 @@ export function fmtTime(value) {
   return d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+// fmtShortTime is fmtTime without the year, when it is this year.
+export function fmtShortTime(value) {
+  if (!value) return '';
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const opts = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return d.toLocaleString(undefined, opts);
+}
+
 export function fmtAgo(value, now = Date.now()) {
   if (!value) return '';
   const d = value instanceof Date ? value : new Date(value);

@@ -56,6 +56,22 @@ function titleOf(type, catalog, schema, name) {
   return type === 'FOREIGN' ? `${catalog}.${schema}.${name}` : `${schema}.${name}`;
 }
 
+// balanceCards lays n stat cards out in as few rows as fit, at least
+// CARD_MIN wide, with the rows as even as can be: seven cards that do not
+// fit in one row make rows of four and three, not six and one.
+const CARD_MIN = 140;
+const CARD_GAP = 12;
+
+function balanceCards(grid, n) {
+  const fit = () => {
+    if (!grid.isConnected) return;
+    const perRow = Math.max(1, Math.floor((grid.clientWidth + CARD_GAP) / (CARD_MIN + CARD_GAP)));
+    const rows = Math.ceil(n / perRow);
+    grid.style.gridTemplateColumns = `repeat(${Math.ceil(n / rows)}, minmax(0, 1fr))`;
+  };
+  new ResizeObserver(fit).observe(grid);
+}
+
 // The lineage graph's geometry: node height, gaps between columns and
 // between nodes, padding, the width of a character of a node's name
 // (12.5px monospace), and the smallest the drawing shrinks to fit before
@@ -368,6 +384,7 @@ export function createCatalog(app) {
     const statCards = h('div', { class: 'grid-cards catalog-stats' }, stats.map(([label, value, note]) =>
       h('div', { class: 'card stat' }, h('div', { class: 'label', text: label }), h('div', { class: 'value', text: value }),
         note ? h('div', { class: 'note', text: note }) : null)));
+    balanceCards(statCards, stats.length);
 
     const panel = h('div', { class: 'tab-panel' });
     const tabs = h('div', { class: 'tabs', role: 'tablist' });
