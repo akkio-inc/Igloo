@@ -677,5 +677,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   when the catalog cannot be reached long enough that a write's outcome is
   unknown, the statement fails with SQLSTATE `40003` instead of `40001`, and
   its files are kept (docs/operations.md#writes-when-the-catalog-fails).
+- A dbt run could find a `__dbt_backup` table it had dropped still listed,
+  and DuckDB could crash, when the replica synced its copies of the
+  catalog's views at the time. Every 30 seconds the sync looked for copies
+  that had gone missing by listing the views of every database DuckDB has
+  attached, and DuckDB-Iceberg then lists the tables of each of the
+  catalog's schemas, a list it does not keep in step with a session that
+  renames or drops one of them at the same time. The background sync no
+  longer looks; a copy that has gone missing is made again when a statement
+  names it.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

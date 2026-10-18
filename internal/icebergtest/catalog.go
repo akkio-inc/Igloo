@@ -1,13 +1,16 @@
 // Package icebergtest provides an Iceberg REST catalog for tests, and a
 // proxy that injects faults in front of any catalog.
 //
-// The catalog keeps namespaces and tables in memory and handles commits as
-// Lakekeeper does: it checks a commit's requirements against the table,
-// applies its updates with iceberg-go, all tables of a transaction or none,
-// refuses a commit whose requirements fail with 409 CatalogCommitConflicts,
-// and honours Idempotency-Key headers, answering a repeat of an applied
-// change with success. Tables' files go wherever their locations say;
-// tests use a local directory.
+// The catalog keeps namespaces, tables and views in memory and handles
+// commits as Lakekeeper does: it checks a commit's requirements against the
+// table, applies its updates with iceberg-go, all tables of a transaction or
+// none, refuses a commit whose requirements fail with 409
+// CatalogCommitConflicts, and honours Idempotency-Key headers, answering a
+// repeat of an applied change with success. Tables' files go wherever their
+// locations say; tests use a local directory. Views are created, replaced,
+// renamed and dropped through the REST API's view endpoints, which it does
+// not list in its configuration, so DuckDB leaves them alone, as Igloo
+// expects of the catalogs it runs on.
 package icebergtest
 
 import (
@@ -41,9 +44,13 @@ type Catalog struct {
 	mu         sync.Mutex
 	namespaces map[string]map[string]string
 	tables     map[string]*tableState
+	views      map[string]*viewState
 	// keys are the idempotency keys of applied changes.
 	keys       map[string]bool
 	ignoreKeys bool
+	// holdViewLists, if set, runs between making a list of views and
+	// sending it.
+	holdViewLists func(namespace string)
 	// commits counts applied commits.
 	commits int
 }
@@ -67,6 +74,7 @@ func NewCatalog(location string) *Catalog {
 		location:   strings.TrimSuffix(location, "/"),
 		namespaces: map[string]map[string]string{},
 		tables:     map[string]*tableState{},
+		views:      map[string]*viewState{},
 		keys:       map[string]bool{},
 	}
 	c.srv = httptest.NewServer(c)
@@ -152,6 +160,11 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.Header.Get("Idempotency-Key")
 
+	if p := parts[1:]; len(p) == 3 && p[0] == "namespaces" && p[2] == "views" && r.Method == http.MethodGet {
+		c.listViews(w, r, p)
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	switch p := parts[1:]; {
@@ -206,7 +219,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusMethodNotAllowed, "BadRequestException", "bad method")
 		}
 	case len(p) == 3 && p[0] == "namespaces" && p[2] == "tables" && r.Method == http.MethodGet:
-		var ids []map[string]any
+		ids := []map[string]any{}
 		for _, t := range c.tables {
 			if strings.Join(t.ns, "\x1f") == p[1] {
 				ids = append(ids, map[string]any{"namespace": t.ns, "name": t.name})
@@ -277,7 +290,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case t == nil:
 			apiError(w, http.StatusNotFound, "NoSuchTableException", "no such table")
 			return
-		case c.tables[to] != nil:
+		case c.tables[to] != nil || c.views[to] != nil:
 			apiError(w, http.StatusConflict, "AlreadyExistsException", "table exists")
 			return
 		}
@@ -308,6 +321,9 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		c.remember(key)
 		w.WriteHeader(http.StatusNoContent)
+	case len(p) >= 3 && p[0] == "namespaces" && p[2] == "views",
+		len(p) == 2 && p[0] == "views" && p[1] == "rename":
+		c.serveView(w, r, p, body)
 	default:
 		apiError(w, http.StatusNotFound, "NotFoundException", "no such path: "+r.Method+" "+rest)
 	}
@@ -357,6 +373,10 @@ func (c *Catalog) createTable(w http.ResponseWriter, ns []string, body []byte, k
 			return
 		}
 		apiError(w, http.StatusConflict, "AlreadyExistsException", "table exists")
+		return
+	}
+	if c.views[k] != nil {
+		apiError(w, http.StatusConflict, "AlreadyExistsException", "a view of the name exists")
 		return
 	}
 	spec := iceberg.UnpartitionedSpec

@@ -110,7 +110,8 @@ func (m *Manager) Close() error {
 	return m.conn.Close()
 }
 
-// Run syncs views every syncInterval until ctx is canceled.
+// Run polls the catalog's views (see PollViews) every syncInterval until
+// ctx is canceled.
 func (m *Manager) Run(ctx context.Context) {
 	t := time.NewTicker(syncInterval)
 	defer t.Stop()
@@ -119,7 +120,7 @@ func (m *Manager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if _, err := m.SyncViews(ctx); err != nil && ctx.Err() == nil {
+			if _, err := m.PollViews(ctx); err != nil && ctx.Err() == nil {
 				m.log.Warn("could not sync views", "err", err)
 			}
 		}
@@ -154,9 +155,27 @@ func (m *Manager) Views(schema string) []catalog.View {
 // tables.
 func (m *Manager) Generation() uint64 { return m.gen.Load() }
 
-// SyncViews makes the local copies match the catalog's views. changed says
-// whether anything changed.
+// SyncViews makes the local copies match the catalog's views, and makes
+// again any that have gone missing, say because an admin dropped one.
+// changed says whether anything changed. Statements that name a relation
+// DuckDB does not have sync so before they fail.
 func (m *Manager) SyncViews(ctx context.Context) (changed bool, err error) {
+	return m.sync(ctx, true)
+}
+
+// PollViews is SyncViews except that it takes the local copies this
+// replica made to be there still. Finding those that are not lists the
+// views of every database DuckDB has attached, and DuckDB-Iceberg then
+// lists the tables of each of the catalog's schemas: a session that
+// renames or drops one of them at the same time, as dbt does all through a
+// run, can leave DuckDB listing a table the catalog no longer has, or crash
+// it.
+func (m *Manager) PollViews(ctx context.Context) (changed bool, err error) {
+	return m.sync(ctx, false)
+}
+
+// sync is SyncViews, or PollViews without checkLocal.
+func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err error) {
 	defs, err := m.cat.DuckDBViews(ctx)
 	if err != nil {
 		return false, err
@@ -185,16 +204,19 @@ func (m *Manager) SyncViews(ctx context.Context) (changed bool, err error) {
 
 	// Local copies can also go missing, say if an admin drops one; they are
 	// recreated too.
-	present, err := m.localViews(ctx)
-	if err != nil {
-		return changed, err
+	var present map[key]bool
+	if checkLocal {
+		if present, err = m.localViews(ctx); err != nil {
+			return changed, err
+		}
 	}
+	missing := func(k key) bool { return checkLocal && !present[k] }
 
 	// A view can read other views, which must exist locally first. Create
 	// what can be created, and repeat while that makes progress.
 	pending := map[key]catalog.View{}
 	for k, v := range want {
-		if cur, ok := m.views[k]; !ok || !present[k] || cur.Version != v.Version || cur.SQL != v.SQL {
+		if cur, ok := m.views[k]; !ok || missing(k) || cur.Version != v.Version || cur.SQL != v.SQL {
 			pending[k] = v
 		}
 	}
