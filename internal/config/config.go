@@ -45,7 +45,9 @@ type Config struct {
 	LogFormat string
 	LogLevel  slog.Level
 
-	// AdminUser and AdminPassword define the first administrator.
+	// AdminUser and AdminPassword define the first administrator. The
+	// password is used only to create the account, and must then pass
+	// CheckAdminPassword.
 	AdminUser     string
 	AdminPassword string
 	// MetadataDatabaseURL is the Postgres database that stores users. Empty
@@ -333,8 +335,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 	}
 
-	if len(cfg.AdminPassword) < 8 {
-		addErr("IGLOO_ADMIN_PASSWORD must be set to at least 8 characters")
+	// How strong it must be is checked only when Igloo creates the account
+	// (CheckAdminPassword): an account that exists does not use it.
+	if cfg.AdminPassword == "" {
+		addErr("IGLOO_ADMIN_PASSWORD must be set")
 	}
 	if !ValidName(cfg.AdminUser) {
 		addErr("IGLOO_ADMIN_USER %q must be a lowercase name of letters, digits and underscores", cfg.AdminUser)

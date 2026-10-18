@@ -8,7 +8,11 @@ and troubleshooting. Settings are described in [configuration.md](configuration.
 
 The first administrator comes from `IGLOO_ADMIN_USER` and
 `IGLOO_ADMIN_PASSWORD`. The password is used to create that account on first
-start only; afterwards, change it in SQL.
+start only; afterwards, change it in SQL. Igloo refuses to create the
+account with a password under 16 characters, a placeholder such as
+`change-me`, or an easily guessed one
+([details](configuration.md#users)); once the account exists, a weaker value
+only logs a warning.
 
 ```sql
 CREATE USER ana WITH PASSWORD 'a-long-password' ROLE writer;
@@ -40,7 +44,8 @@ Every user has one built-in role, which applies to the whole warehouse:
 `CREATE USER` without `ROLE` makes a reader. Settings a non-admin changes
 with `SET` apply to their own session only.
 
-- Passwords must be at least 8 characters. Igloo stores SCRAM-SHA-256
+- Passwords must be at least 8 characters (16 for `IGLOO_ADMIN_PASSWORD`
+  to create the first administrator). Igloo stores SCRAM-SHA-256
   verifiers, never passwords. psql's `\password` works and sends a verifier
   computed on the client (except for users with access tokens; see
   [access tokens](sso.md#access-tokens)).

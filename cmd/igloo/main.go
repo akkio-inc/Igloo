@@ -598,20 +598,54 @@ func openUsers(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.S
 		}
 	}
 
-	verifier, err := auth.NewVerifier(cfg.AdminPassword)
-	if err != nil {
+	if err := ensureAdmin(ctx, store, cfg.AdminUser, cfg.AdminPassword, log); err != nil {
 		store.Close()
-		return nil, fmt.Errorf("IGLOO_ADMIN_PASSWORD: %w", err)
-	}
-	created, err := store.EnsureAdmin(ctx, cfg.AdminUser, verifier)
-	if err != nil {
-		store.Close()
-		return nil, fmt.Errorf("create admin user: %w", err)
-	}
-	if created {
-		log.Info("created admin user", "user", cfg.AdminUser)
+		return nil, err
 	}
 	return store, nil
+}
+
+// ensureAdmin creates the bootstrap administrator, user, with password,
+// unless an account of that name exists. Only a password that passes
+// config.CheckAdminPassword creates one. A weaker one is refused when the
+// account is missing, but only warned about when it exists, since it is
+// not used then: installs made before the check keep starting.
+//
+// A weak password never reaches EnsureAdmin, which inserts the account
+// only if no user of that name exists, in one statement. So replicas
+// starting together cannot create the account with it, whichever of them
+// gets there first; a store without a metadata database creates the
+// account on every start, and so always checks.
+func ensureAdmin(ctx context.Context, store auth.Store, user, password string, log *slog.Logger) error {
+	weak := config.CheckAdminPassword(user, password)
+	if weak == nil {
+		verifier, err := auth.NewVerifier(password)
+		if err != nil {
+			return fmt.Errorf("IGLOO_ADMIN_PASSWORD: %w", err)
+		}
+		created, err := store.EnsureAdmin(ctx, user, verifier)
+		if err != nil {
+			return fmt.Errorf("create admin user: %w", err)
+		}
+		if created {
+			log.Info("created admin user", "user", user)
+		}
+		return nil
+	}
+	switch _, err := store.Get(ctx, user); {
+	case errors.Is(err, auth.ErrNotFound):
+		return weak
+	case err != nil:
+		return fmt.Errorf("look up admin user: %w", err)
+	}
+	// Which check failed is left out: the account's password may well be
+	// this value, and logs are read more widely than secrets.
+	log.Warn(fmt.Sprintf("IGLOO_ADMIN_PASSWORD is too weak to create the admin account with: it has fewer than %d characters, "+
+		"or is a placeholder or easily guessed. The account exists, so Igloo starts and does not use it. "+
+		"Give the account a long random password with ALTER USER and set IGLOO_ADMIN_PASSWORD to the same, "+
+		"or Igloo will refuse to start if it has to create the account again", config.MinAdminPasswordLength),
+		"user", user)
+	return nil
 }
 
 // openSSO sets up single sign-on, when IGLOO_OIDC_ISSUER is set. It needs

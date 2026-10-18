@@ -80,7 +80,9 @@ SELECT kind, count(*) FROM events GROUP BY kind;
 ```
 
 Any Postgres client can connect to `127.0.0.1:5433` as user `igloo` with the
-password `IGLOO_ADMIN_PASSWORD` from `deploy/single-vm/.env`:
+password `IGLOO_ADMIN_PASSWORD` from `deploy/single-vm/.env` (`make up`
+generates it; Igloo refuses to create the account with a placeholder such
+as `change-me` or fewer than 16 characters):
 
 ```sh
 psql "host=127.0.0.1 port=5433 user=igloo dbname=igloo"

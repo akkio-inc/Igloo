@@ -37,7 +37,9 @@ reference for every setting mentioned here.
 
 - **Authentication.** Clients sign in with SCRAM-SHA-256, the PostgreSQL
   default, so passwords are not sent over the connection. The first
-  administrator is created from `IGLOO_ADMIN_PASSWORD` on first start; users
+  administrator is created on first start from `IGLOO_ADMIN_PASSWORD`,
+  which must have at least 16 characters and not be a placeholder such as
+  `change-me` or easily guessed (the deployment files generate 32). Users
   and roles are stored in the PostgreSQL database named by
   `IGLOO_METADATA_DATABASE_URL`. After 10 failed logins for a user, or 50
   from an address, in 15 minutes, each replica refuses further ones for a
