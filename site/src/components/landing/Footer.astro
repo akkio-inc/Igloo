@@ -67,9 +67,9 @@ const columns = [
 
 <style>
 	.site-footer {
-		padding: 56px 0 64px;
-		border-top: 1px solid var(--border);
-		background: var(--bg);
+		padding: 64px 0 72px;
+		border-top: 1px solid var(--glass-border);
+		background: linear-gradient(180deg, rgb(255 255 255 / 0.02), transparent 60%);
 	}
 	.inner {
 		display: grid;
@@ -81,9 +81,9 @@ const columns = [
 		align-items: center;
 		gap: 10px;
 		color: var(--heading);
-		font-weight: 800;
+		font-weight: 700;
 		font-size: 1.25rem;
-		letter-spacing: -0.03em;
+		letter-spacing: -0.035em;
 		text-decoration: none;
 	}
 	.about p {
@@ -96,10 +96,9 @@ const columns = [
 	h2 {
 		margin-bottom: 14px;
 		font-size: 0.8125rem;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--muted);
+		font-weight: 600;
+		letter-spacing: 0.01em;
+		color: var(--heading);
 	}
 	ul {
 		margin: 0;
@@ -110,7 +109,8 @@ const columns = [
 		margin-top: 8px;
 	}
 	nav a {
-		color: var(--text);
+		color: var(--muted);
+		font-size: 0.9375rem;
 		text-decoration: none;
 	}
 	nav a:hover {

@@ -1,0 +1,67 @@
+---
+import { REPO_URL } from '../../docs-manifest.mjs';
+import Icon from './Icon.astro';
+---
+
+<section class="closing" aria-labelledby="closing-title">
+	<div class="container">
+		<div class="panel glass glass-blur reveal">
+			<h2 id="closing-title">Open source SQL warehouse on Apache Iceberg</h2>
+			<p>Licensed under Apache 2.0. Runs in your own cloud account or on your own hardware.</p>
+			<div class="actions">
+				<a class="btn btn-primary" href="#quick-start">Get started <Icon name="arrow" /></a>
+				<a class="btn btn-secondary" href="/docs/"><Icon name="book" /> Read the docs</a>
+				<a class="btn btn-secondary" href={REPO_URL}><Icon name="github" /> GitHub</a>
+			</div>
+		</div>
+	</div>
+</section>
+
+<style>
+	.closing {
+		position: relative;
+		isolation: isolate;
+		padding: 32px 0 128px;
+	}
+	.closing::before {
+		content: '';
+		position: absolute;
+		z-index: -1;
+		inset: -10% 0 0;
+		pointer-events: none;
+		background:
+			radial-gradient(520px 240px at 30% 55%, var(--glow-ice), transparent 70%),
+			radial-gradient(520px 240px at 70% 45%, var(--glow-amber), transparent 70%);
+	}
+	.panel {
+		padding: 64px 32px;
+		border-radius: 24px;
+		text-align: center;
+	}
+	h2 {
+		font-size: clamp(1.75rem, 1rem + 2.4vw, 2.75rem);
+		font-weight: 640;
+		letter-spacing: -0.04em;
+	}
+	p {
+		margin: 16px auto 0;
+		max-width: 40em;
+		font-size: 1.0625rem;
+		color: var(--muted);
+	}
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 12px;
+		margin-top: 32px;
+	}
+	@media (max-width: 720px) {
+		.closing {
+			padding-bottom: 80px;
+		}
+		.panel {
+			padding: 48px 20px;
+		}
+	}
+</style>

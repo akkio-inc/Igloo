@@ -53,13 +53,13 @@ export default defineConfig({
 			favicon: '/favicon.svg',
 			social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
 			sidebar,
-			customCss: ['@fontsource-variable/figtree', './src/styles/theme.css'],
+			customCss: ['@fontsource-variable/inter/opsz.css', './src/styles/theme.css'],
 			head: SITE_PUBLIC ? [] : [NOINDEX_META],
 			tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
 			// src/pages/404.astro instead.
 			disable404Route: true,
 			expressiveCode: {
-				styleOverrides: { borderRadius: '0.5rem' },
+				styleOverrides: { borderRadius: '0.75rem' },
 			},
 		}),
 		noindexHeaders(),

@@ -178,7 +178,7 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 
 <section class="section section-alt" id="features" aria-labelledby="features-title">
 	<div class="container">
-		<div class="section-head">
+		<div class="section-head reveal">
 			<span class="eyebrow">Features</span>
 			<h2 id="features-title">What you get</h2>
 			<p>
@@ -187,16 +187,54 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 			</p>
 		</div>
 
-		<div class="groups">
+		<div class="bento">
 			{
-				groups.map((group) => (
-					<div class="group">
+				groups.map((group, i) => (
+					<div class:list={['tile', 'glass', 'lift', 'reveal', `tile-${i}`]}>
 						<h3>
 							<span class="icon">
-								<Icon name={group.icon} size={20} />
+								<Icon name={group.icon} size={18} />
 							</span>
 							{group.title}
 						</h3>
+
+						{/* A small picture of each group, drawn from the README and docs. */}
+						{i === 0 && (
+							<pre class="frag frag-code" aria-hidden="true"><span class="k">CREATE TABLE</span> dev.orders <span class="k">CLONE</span> prod.orders{'\n'}  <span class="k">AT</span> (<span class="k">TIMESTAMP</span> =&gt; now() - <span class="k">INTERVAL</span> <span class="n">1</span> <span class="k">DAY</span>);</pre>
+						)}
+						{i === 1 && (
+							<div class="frag frag-mask" aria-hidden="true">
+								<div class="frag-row frag-head">
+									<span>role in session</span>
+									<span>email</span>
+								</div>
+								<div class="frag-row">
+									<span class="chip">pii_reader</span>
+									<code>ann@example.com</code>
+								</div>
+								<div class="frag-row">
+									<span class="chip">analyst</span>
+									<code class="masked">sha256(email)</code>
+								</div>
+							</div>
+						)}
+						{i === 2 && (
+							<div class="frag frag-lineage" aria-hidden="true">
+								<div class="sources">
+									<span class="chip">raw.campaigns</span>
+									<span class="chip">raw.impressions</span>
+								</div>
+								<span class="arrow" />
+								<span class="chip chip-hot">media.delivery</span>
+							</div>
+						)}
+						{i === 3 && (
+							<div class="frag frag-ops" aria-hidden="true">
+								<code>SET query_tag = 'client:acme'</code>
+								<code>ALTER ROLE analysts SET max_concurrent_statements = 4</code>
+							</div>
+						)}
+
 						<ul>
 							{group.items.map((item) => (
 								<li>
@@ -208,44 +246,49 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 					</div>
 				))
 			}
-		</div>
 
-		<igloo-sql-tabs class="showcase">
-			<div class="showcase-head">
-				<h3>In SQL</h3>
-				<div class="tabs" role="tablist" aria-label="SQL examples">
-					{
-						examples.map((example, i) => (
-							<button
-								type="button"
-								role="tab"
-								id={`sql-tab-${example.id}`}
-								aria-controls={`sql-panel-${example.id}`}
-								aria-selected={i === 0 ? 'true' : 'false'}
-								tabindex={i === 0 ? 0 : -1}
-							>
-								{example.label}
-							</button>
-						))
-					}
-				</div>
-			</div>
-			{
-				examples.map((example) => (
-					<div
-						class="sql-panel"
-						role="tabpanel"
-						id={`sql-panel-${example.id}`}
-						aria-labelledby={`sql-tab-${example.id}`}
-					>
-						<Code code={example.code} lang="sql" />
-						<a class="more-link" href={example.href}>
-							Read the docs <Icon name="arrow" size={16} />
-						</a>
+			<igloo-sql-tabs class="tile tile-sql glass reveal">
+				<div class="showcase-head">
+					<h3>
+						<span class="icon">
+							<Icon name="code" size={18} />
+						</span>
+						In SQL
+					</h3>
+					<div class="tabs" role="tablist" aria-label="SQL examples">
+						{
+							examples.map((example, i) => (
+								<button
+									type="button"
+									role="tab"
+									id={`sql-tab-${example.id}`}
+									aria-controls={`sql-panel-${example.id}`}
+									aria-selected={i === 0 ? 'true' : 'false'}
+									tabindex={i === 0 ? 0 : -1}
+								>
+									{example.label}
+								</button>
+							))
+						}
 					</div>
-				))
-			}
-		</igloo-sql-tabs>
+				</div>
+				{
+					examples.map((example) => (
+						<div
+							class="sql-panel"
+							role="tabpanel"
+							id={`sql-panel-${example.id}`}
+							aria-labelledby={`sql-tab-${example.id}`}
+						>
+							<Code code={example.code} lang="sql" />
+							<a class="more-link" href={example.href}>
+								Read the docs <Icon name="arrow" size={16} />
+							</a>
+						</div>
+					))
+				}
+			</igloo-sql-tabs>
+		</div>
 	</div>
 </section>
 
@@ -278,38 +321,178 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	customElements.define('igloo-sql-tabs', IglooSqlTabs);
 </script>
 
+
 <style>
-	.groups {
+	/* A bento grid: SQL wide, governance tall, then data and operations, and
+	   the SQL examples across the bottom. */
+	.bento {
 		display: grid;
-		grid-template-columns: repeat(4, minmax(0, 1fr));
-		gap: 20px;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		grid-template-areas:
+			'a a b'
+			'c d b'
+			'e e e';
+		gap: 16px;
 	}
-	.group {
-		padding: 24px;
-		border: 1px solid var(--border);
-		border-radius: var(--radius);
-		background: var(--surface);
+	.tile {
+		padding: 28px;
+		border-radius: 20px;
 	}
-	.group h3 {
+	.tile-0 {
+		grid-area: a;
+	}
+	.tile-1 {
+		grid-area: b;
+	}
+	.tile-2 {
+		grid-area: c;
+	}
+	.tile-3 {
+		grid-area: d;
+	}
+	.tile-sql {
+		grid-area: e;
+		display: block;
+	}
+	.tile-0 ul {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0 32px;
+	}
+	.tile-0 li + li {
+		margin-top: 0;
+	}
+	.tile-0 li:nth-child(n + 3) {
+		margin-top: 16px;
+		padding-top: 16px;
+		border-top: 1px solid var(--border);
+	}
+	.tile-0 li:nth-child(2) {
+		padding-top: 0;
+		border-top: 0;
+	}
+
+	h3 {
 		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 14px;
+		align-items: center;
+		gap: 12px;
 		font-size: 1.125rem;
-		font-weight: 800;
+		font-weight: 600;
+		letter-spacing: -0.02em;
 	}
-	.group .icon {
+	.icon {
 		display: inline-grid;
 		place-items: center;
-		width: 40px;
-		height: 40px;
-		border-radius: 11px;
-		border: 1px solid var(--border);
-		background: var(--surface-2);
+		width: 32px;
+		height: 32px;
+		border-radius: 10px;
+		border: 1px solid var(--glass-border);
+		background: linear-gradient(180deg, rgb(143 203 252 / 0.16), rgb(143 203 252 / 0.04));
+		box-shadow: var(--glass-highlight);
 		color: var(--ice);
 	}
+
+	/* The small pictures. */
+	.frag {
+		margin: 24px 0 8px;
+		padding: 14px 16px;
+		border: 1px solid var(--glass-border);
+		border-radius: 12px;
+		background: rgb(0 0 0 / 0.18);
+		box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04);
+		font-family: var(--font-mono);
+		font-size: 0.8125rem;
+		line-height: 1.6;
+		color: var(--text);
+	}
+	:global(:root[data-theme='light']) .frag {
+		background: rgb(255 255 255 / 0.7);
+	}
+	.frag-code {
+		overflow-x: auto;
+		white-space: pre;
+	}
+	.frag-code .k {
+		color: var(--ice);
+	}
+	.frag-code .n {
+		color: var(--amber);
+	}
+	.chip {
+		display: inline-block;
+		padding: 2px 10px;
+		border: 1px solid var(--glass-border-strong);
+		border-radius: 999px;
+		background: var(--surface-2);
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		color: var(--heading);
+		white-space: nowrap;
+	}
+	.chip-hot {
+		border-color: rgb(245 180 74 / 0.55);
+		background: rgb(245 180 74 / 0.12);
+	}
+	.frag-mask {
+		display: grid;
+		gap: 8px;
+		font-family: var(--font);
+	}
+	.frag-row {
+		display: grid;
+		grid-template-columns: 7.5rem 1fr;
+		align-items: center;
+		gap: 12px;
+	}
+	.frag-head {
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.frag-mask code {
+		font-size: 0.8125rem;
+		color: var(--heading);
+		overflow-wrap: anywhere;
+	}
+	.frag-mask code.masked {
+		color: var(--amber);
+	}
+	.frag-lineage {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		font-family: var(--font);
+	}
+	.sources {
+		display: grid;
+		gap: 8px;
+	}
+	.arrow {
+		position: relative;
+		flex: 1;
+		min-width: 24px;
+		border-top: 1px dashed var(--border-strong);
+	}
+	.arrow::after {
+		content: '';
+		position: absolute;
+		right: -1px;
+		top: -5px;
+		border: 5px solid transparent;
+		border-left: 7px solid var(--border-strong);
+		border-right: 0;
+	}
+	.frag-ops {
+		display: grid;
+		gap: 8px;
+	}
+	.frag-ops code {
+		font-size: 0.75rem;
+		color: var(--heading);
+		overflow-wrap: anywhere;
+	}
+
 	ul {
-		margin: 18px 0 0;
+		margin: 24px 0 0;
 		padding: 0;
 		list-style: none;
 	}
@@ -319,9 +502,10 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		border-top: 1px solid var(--border);
 	}
 	li a {
-		font-weight: 700;
+		font-weight: 600;
 		color: var(--heading);
 		text-decoration: none;
+		letter-spacing: -0.01em;
 	}
 	li a:hover {
 		color: var(--link);
@@ -334,71 +518,82 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		color: var(--muted);
 	}
 
-	.showcase {
-		display: block;
-		margin-top: 48px;
-		padding: 28px;
-		border: 1px solid var(--border);
-		border-radius: var(--radius);
-		background: var(--surface);
-	}
 	.showcase-head {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
 		justify-content: space-between;
 		gap: 16px;
-		margin-bottom: 20px;
-	}
-	.showcase-head h3 {
-		font-size: 1.375rem;
-		font-weight: 800;
+		margin-bottom: 24px;
 	}
 	.tabs {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 4px;
+		padding: 4px;
+		border: 1px solid var(--glass-border);
+		border-radius: 999px;
+		background: var(--surface-2);
 	}
 	.tabs button {
-		padding: 7px 14px;
-		border: 1px solid transparent;
+		padding: 6px 14px;
+		border: 0;
 		border-radius: 999px;
 		background: transparent;
 		color: var(--muted);
 		font: inherit;
-		font-size: 0.9375rem;
-		font-weight: 650;
+		font-size: 0.875rem;
+		font-weight: 550;
 		cursor: pointer;
 	}
 	.tabs button:hover {
 		color: var(--heading);
 	}
 	.tabs button[aria-selected='true'] {
-		border-color: var(--border-strong);
-		background: var(--surface-2);
+		background: rgb(255 255 255 / 0.1);
 		color: var(--heading);
+		box-shadow:
+			inset 0 1px 0 rgb(255 255 255 / 0.12),
+			0 0 0 1px var(--glass-border);
+	}
+	:global(:root[data-theme='light']) .tabs button[aria-selected='true'] {
+		background: #ffffff;
 	}
 	igloo-sql-tabs:not(:defined) .tabs {
 		display: none;
 	}
 	.sql-panel .more-link {
-		margin-top: 14px;
+		margin-top: 16px;
 	}
 	igloo-sql-tabs:not(:defined) .sql-panel + .sql-panel {
 		margin-top: 24px;
 	}
 
 	@media (max-width: 1080px) {
-		.groups {
+		.bento {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
+			grid-template-areas:
+				'a a'
+				'b c'
+				'd d'
+				'e e';
 		}
 	}
-	@media (max-width: 600px) {
-		.groups {
+	@media (max-width: 700px) {
+		.bento {
+			grid-template-columns: minmax(0, 1fr);
+			grid-template-areas: 'a' 'b' 'c' 'd' 'e';
+		}
+		.tile {
+			padding: 20px;
+		}
+		.tile-0 ul {
 			grid-template-columns: minmax(0, 1fr);
 		}
-		.showcase {
-			padding: 18px;
+		.tile-0 li:nth-child(2) {
+			margin-top: 16px;
+			padding-top: 16px;
+			border-top: 1px solid var(--border);
 		}
 	}
 </style>

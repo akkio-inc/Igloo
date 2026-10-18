@@ -18,13 +18,13 @@ const backends = [
 
 <section class="section" id="how-it-works" aria-labelledby="how-title">
 	<div class="container">
-		<div class="section-head">
+		<div class="section-head reveal">
 			<span class="eyebrow">Architecture</span>
 			<h2 id="how-title">How it works</h2>
 			<p>One Go server in front of an embedded DuckDB, with tables in Apache Iceberg on your object storage.</p>
 		</div>
 
-		<figure class="diagram" aria-label="Architecture diagram">
+		<figure class="diagram glass reveal" aria-label="Architecture diagram">
 			<div class="row">
 				{
 					clients.map((client) => (
@@ -65,7 +65,7 @@ const backends = [
 			</div>
 		</figure>
 
-		<div class="prose description">
+		<div class="prose description reveal">
 			<Description />
 		</div>
 	</div>
@@ -74,13 +74,12 @@ const backends = [
 <style>
 	.diagram {
 		margin: 0;
-		padding: 32px;
-		border: 1px solid var(--border);
-		border-radius: var(--radius);
+		padding: 40px;
+		border-radius: 24px;
 		background:
-			radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--muted) 22%, transparent) 1px, transparent 0) 0 0 /
-				22px 22px,
-			var(--bg-alt);
+			radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--muted) 20%, transparent) 1px, transparent 0) 0 0 /
+				24px 24px,
+			var(--glass);
 	}
 	.row {
 		display: grid;
@@ -93,10 +92,10 @@ const backends = [
 		align-items: stretch;
 	}
 	.node {
-		border: 1px solid var(--border-strong);
-		border-radius: 12px;
-		background: var(--surface);
-		box-shadow: var(--shadow);
+		border: 1px solid var(--glass-border-strong);
+		border-radius: 14px;
+		background: var(--glass-solid);
+		box-shadow: var(--glass-highlight), var(--shadow);
 		color: var(--heading);
 	}
 	.client {
@@ -122,7 +121,7 @@ const backends = [
 		top: 0;
 		bottom: 6px;
 		left: 50%;
-		border-left: 2px solid var(--border-strong);
+		border-left: 1px dashed var(--border-strong);
 	}
 	.edge::after {
 		content: '';
@@ -138,7 +137,8 @@ const backends = [
 		align-self: center;
 		padding: 4px 10px;
 		border-radius: 8px;
-		background: var(--bg-alt);
+		background: var(--glass-solid);
+		border: 1px solid var(--glass-border);
 		font-size: 0.8125rem;
 		line-height: 1.4;
 		text-align: center;
@@ -159,7 +159,9 @@ const backends = [
 		border-color: color-mix(in srgb, var(--amber-fill-2) 70%, transparent);
 		background: var(--igloo-node);
 		box-shadow:
-			0 0 0 4px color-mix(in srgb, var(--amber-fill-2) 14%, transparent),
+			var(--glass-highlight),
+			0 0 0 4px color-mix(in srgb, var(--amber-fill-2) 12%, transparent),
+			0 0 48px -8px color-mix(in srgb, var(--amber-fill-2) 40%, transparent),
 			var(--shadow);
 	}
 	.igloo-name {

@@ -1,55 +1,107 @@
 /*
- * Igloo's palette for Starlight, taken from the README banners: deep navy
- * night sky, icy blues, and the amber of the igloo's doorway.
+ * Igloo's look for the Starlight docs, matching the landing page: calm
+ * night navy, icy blues, the amber of the igloo's doorway, frosted glass.
  */
 
 :root {
-	--sl-font: 'Figtree Variable', var(--sl-font-system);
+	--sl-font: 'Inter Variable', var(--sl-font-system);
 
 	/* Dark mode (Starlight's default) */
 	--sl-color-white: #ffffff;
 	--sl-color-gray-1: #e4ecf7;
-	--sl-color-gray-2: #c2cee0;
-	--sl-color-gray-3: #8d9cb6;
+	--sl-color-gray-2: #b9c5d8;
+	--sl-color-gray-3: #8b98af;
 	--sl-color-gray-4: #5a6a86;
-	--sl-color-gray-5: #2c3b57;
-	--sl-color-gray-6: #142039;
-	--sl-color-black: #0b1528;
+	--sl-color-gray-5: #233250;
+	--sl-color-gray-6: #111b2f;
+	--sl-color-black: #060c19;
 
-	--sl-color-accent-low: #11305c;
+	--sl-color-accent-low: #12305a;
 	--sl-color-accent: #4f9fe6;
 	--sl-color-accent-high: #a9d6fd;
 
-	--igloo-amber: #f7ca7a;
-	--igloo-amber-strong: #f5b44a;
-	--igloo-navy: #0f2d56;
+	--igloo-glass: rgb(255 255 255 / 0.035);
+	--igloo-glass-solid: rgb(13 21 38 / 0.94);
+	--igloo-glass-border: rgb(255 255 255 / 0.08);
+	--igloo-glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.06);
+	--igloo-nav: rgb(6 12 25 / 0.72);
+	--igloo-glow-ice: rgb(79 159 230 / 0.1);
+	--igloo-glow-amber: rgb(245 180 74 / 0.05);
+	--igloo-current: rgb(255 255 255 / 0.08);
 	--igloo-scroll-shadow: rgb(169 214 253 / 0.28);
+
+	--sl-color-bg-nav: var(--igloo-nav);
+	--sl-color-bg-sidebar: rgb(255 255 255 / 0.012);
+	--sl-color-hairline-shade: var(--igloo-glass-border);
+	--sl-color-bg-inline-code: rgb(255 255 255 / 0.06);
 }
 
 :root[data-theme='light'] {
-	--sl-color-white: #0d2242;
+	--sl-color-white: #0b1a33;
 	--sl-color-gray-1: #172d4d;
-	--sl-color-gray-2: #2c4263;
+	--sl-color-gray-2: #33455f;
 	--sl-color-gray-3: #4c6283;
 	--sl-color-gray-4: #8294b0;
-	--sl-color-gray-5: #c6d3e4;
-	--sl-color-gray-6: #e6eef8;
-	--sl-color-gray-7: #f3f7fc;
-	--sl-color-black: #ffffff;
+	--sl-color-gray-5: #d3deec;
+	--sl-color-gray-6: #eaf0f8;
+	--sl-color-gray-7: #f4f8fc;
+	--sl-color-black: #f8fafd;
 
-	--sl-color-accent-low: #d9eafc;
-	--sl-color-accent: #1d6bbf;
+	--sl-color-accent-low: #dcebfc;
+	--sl-color-accent: #1b64b5;
 	--sl-color-accent-high: #123f78;
 
-	--igloo-amber: #9c5a00;
-	--igloo-amber-strong: #f2a93b;
+	--igloo-glass: rgb(255 255 255 / 0.7);
+	--igloo-glass-solid: rgb(255 255 255 / 0.97);
+	--igloo-glass-border: rgb(15 45 86 / 0.1);
+	--igloo-glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.9);
+	--igloo-nav: rgb(248 250 253 / 0.75);
+	--igloo-glow-ice: rgb(79 159 230 / 0.1);
+	--igloo-glow-amber: rgb(245 180 74 / 0.08);
+	--igloo-current: rgb(27 100 181 / 0.1);
 	--igloo-scroll-shadow: rgb(13 34 66 / 0.2);
+
+	--sl-color-bg-sidebar: rgb(255 255 255 / 0.4);
+	--sl-color-bg-inline-code: rgb(15 45 86 / 0.06);
 }
 
-/* Header: the wordmark in the banner's heavy geometric style. */
+body {
+	font-feature-settings: 'cv11', 'ss03';
+	font-optical-sizing: auto;
+}
+
+/* Soft glows behind the page, as on the landing page. */
+@media (min-width: 50rem) {
+	body {
+		background:
+			radial-gradient(900px 480px at 85% -10%, var(--igloo-glow-ice), transparent 70%),
+			radial-gradient(700px 420px at 10% 110%, var(--igloo-glow-amber), transparent 70%),
+			var(--sl-color-bg);
+		background-attachment: fixed;
+	}
+}
+
+/* Frosted header and mobile table of contents. Without backdrop-filter they
+   fall back to a solid fill. */
+header.header,
+mobile-starlight-toc nav {
+	background-color: var(--igloo-glass-solid);
+	border-bottom-color: var(--igloo-glass-border);
+	box-shadow: var(--igloo-glass-highlight);
+}
+@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+	header.header,
+	mobile-starlight-toc nav {
+		background-color: var(--igloo-nav);
+		-webkit-backdrop-filter: blur(20px) saturate(1.8);
+		backdrop-filter: blur(20px) saturate(1.8);
+	}
+}
+
+/* Header: the wordmark. */
 .site-title {
-	font-weight: 800;
-	letter-spacing: -0.02em;
+	font-weight: 700;
+	letter-spacing: -0.035em;
 	color: var(--sl-color-white);
 	gap: 0.5rem;
 }
@@ -57,58 +109,117 @@
 	height: 2rem;
 }
 
-h1,
-.sl-markdown-content :is(h2, h3, h4) {
-	letter-spacing: -0.015em;
+/* Search: a glass field, and a frosted dialog over a blurred page. */
+site-search > button[data-open-modal] {
+	border-color: var(--igloo-glass-border);
+	background-color: var(--igloo-glass);
+	box-shadow: var(--igloo-glass-highlight);
+	border-radius: 0.625rem;
 }
-.sl-markdown-content :is(h2, h3, h4, h5) {
-	font-weight: 700;
+site-search dialog {
+	border: 1px solid var(--igloo-glass-border);
+	background-color: var(--igloo-glass-solid);
+	box-shadow:
+		var(--igloo-glass-highlight),
+		0 24px 64px -16px rgb(0 0 0 / 0.6);
+}
+@media (min-width: 50rem) {
+	site-search dialog {
+		border-radius: 1rem;
+	}
+}
+site-search dialog::backdrop {
+	background-color: rgb(2 6 16 / 0.45);
+	-webkit-backdrop-filter: blur(6px);
+	backdrop-filter: blur(6px);
 }
 
-/* The sidebar's group labels. */
+/* Sidebar: group labels, and the current page as a glass pill. */
 .sidebar-content .group-label .large {
-	font-weight: 700;
+	font-weight: 600;
 	font-size: var(--sl-text-sm);
-	letter-spacing: 0.01em;
+	letter-spacing: -0.005em;
 	color: var(--sl-color-white);
+}
+.sidebar-content a {
+	border-radius: 0.5rem;
+}
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+	background-color: var(--igloo-current);
+	color: var(--sl-color-white);
+	font-weight: 600;
+	box-shadow:
+		var(--igloo-glass-highlight),
+		0 0 0 1px var(--igloo-glass-border);
+}
+
+/* Headings: large and tight. */
+h1 {
+	font-weight: 680;
+	letter-spacing: -0.04em;
+}
+.sl-markdown-content :is(h2, h3, h4, h5) {
+	font-weight: 620;
+	letter-spacing: -0.03em;
+}
+
+.sl-markdown-content code:not(:where(.not-content *)) {
+	border-radius: 0.375rem;
+}
+
+/* Code blocks as glass panes. */
+.expressive-code .frame pre {
+	--ec-codeBg: rgb(255 255 255 / 0.025);
+	box-shadow: var(--igloo-glass-highlight);
+}
+:root[data-theme='light'] .expressive-code .frame pre {
+	--ec-codeBg: rgb(255 255 255 / 0.8);
 }
 
 /*
  * Tables. Many in the docs are wide reference tables with code in their cells:
- * keep them scrollable (Starlight's default), but give them a frame and a
- * header row, and let long identifiers in code break instead of widening the
- * column without limit.
+ * keep them scrollable (Starlight's default), as glass panes with a header row.
  */
 .sl-markdown-content table:not(:where(.not-content *)) {
-	border: 1px solid var(--sl-color-gray-5);
-	border-radius: 0.5rem;
+	border: 1px solid var(--igloo-glass-border);
+	border-radius: 0.75rem;
 	border-collapse: separate;
 	border-spacing: 0;
 	font-size: var(--sl-text-sm);
 	line-height: 1.6;
-	/* Shadows at an edge that has more table beyond it (they scroll away with
-	   the content when there is none). */
-	background:
-		linear-gradient(to right, var(--sl-color-bg), var(--sl-color-bg)) left / 1.5rem 100% no-repeat local,
-		linear-gradient(to left, var(--sl-color-bg), var(--sl-color-bg)) right / 1.5rem 100% no-repeat local,
-		radial-gradient(farthest-side at 0 50%, var(--igloo-scroll-shadow), transparent) left / 0.75rem 100% no-repeat scroll,
-		radial-gradient(farthest-side at 100% 50%, var(--igloo-scroll-shadow), transparent) right / 0.75rem 100% no-repeat scroll;
+	box-shadow: var(--igloo-glass-highlight);
+}
+/* On phones, where wide tables scroll: shadows at an edge that has more table
+   beyond it (they scroll away with the content when there is none). The
+   covers match the page, which has no glows at this width. */
+@media (max-width: 49.99rem) {
+	.sl-markdown-content table:not(:where(.not-content *)) {
+		background:
+			linear-gradient(to right, var(--sl-color-bg), var(--sl-color-bg)) left / 1.5rem 100% no-repeat local,
+			linear-gradient(to left, var(--sl-color-bg), var(--sl-color-bg)) right / 1.5rem 100% no-repeat local,
+			radial-gradient(farthest-side at 0 50%, var(--igloo-scroll-shadow), transparent) left / 0.75rem 100%
+				no-repeat scroll,
+			radial-gradient(farthest-side at 100% 50%, var(--igloo-scroll-shadow), transparent) right / 0.75rem 100%
+				no-repeat scroll;
+	}
 }
 .sl-markdown-content :is(th, td):not(:where(.not-content *)) {
-	border-bottom: 1px solid var(--sl-color-gray-5);
+	border-bottom: 1px solid var(--igloo-glass-border);
 	padding: 0.5rem 0.75rem;
-}
-.sl-markdown-content :is(th, td) code:not(:where(.not-content *)) {
-	font-size: 0.75rem;
-	padding-inline: 0.25rem;
 }
 .sl-markdown-content tr:last-child > td:not(:where(.not-content *)) {
 	border-bottom: 0;
 }
 .sl-markdown-content th:not(:where(.not-content *)) {
-	background-color: var(--sl-color-gray-6);
+	background-color: rgb(127 160 200 / 0.08);
 	color: var(--sl-color-white);
 	font-weight: 600;
+}
+.sl-markdown-content :is(th, td) code:not(:where(.not-content *)) {
+	font-size: 0.75rem;
+	padding-inline: 0.25rem;
 }
 
 /* A table of images (the README's screenshots) lays them side by side. */
@@ -117,6 +228,8 @@ h1,
 	table-layout: fixed;
 	width: 100%;
 	border: 0;
+	background: none;
+	box-shadow: none;
 }
 .sl-markdown-content table:has(img) td:not(:where(.not-content *)) {
 	border: 0;
@@ -124,12 +237,22 @@ h1,
 	vertical-align: top;
 }
 
-/* Screenshots and banners. */
+/* Screenshots and banners, framed like glass. */
 .sl-markdown-content img:not(:where(.not-content *)) {
-	border-radius: 0.5rem;
+	border-radius: 0.75rem;
+	border: 1px solid var(--igloo-glass-border);
+	box-shadow: 0 16px 40px -20px rgb(0 0 0 / 0.5);
 }
 .sl-markdown-content p > img + img {
 	margin-top: 0;
+}
+
+/* Asides as tinted glass. */
+.starlight-aside {
+	border: 1px solid var(--igloo-glass-border);
+	border-inline-start: 3px solid var(--sl-color-asides-border);
+	border-radius: 0.75rem;
+	box-shadow: var(--igloo-glass-highlight);
 }
 
 /* Long words, URLs and identifiers in prose wrap instead of widening the page. */
@@ -143,10 +266,4 @@ h1,
  */
 .expressive-code pre[data-language='plaintext'] {
 	--ec-codeLineHt: 1.3;
-}
-
-/* The current page in the sidebar: a quieter highlight than Starlight's. */
-:root[data-theme='dark'] .sidebar-content a[aria-current='page'] {
-	background-color: #1c4277;
-	color: #ffffff;
 }

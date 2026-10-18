@@ -16,7 +16,7 @@ const art = { widths: [640, 960, 1440, 1920, 2400], sizes: '100vw', format: 'web
 		<Image src={heroDark} alt="" class="theme-dark" loading="eager" fetchpriority="high" {...art} />
 	</div>
 	<div class="hero-inner">
-		<div class="hero-copy">
+		<div class="hero-copy glass glass-blur">
 			<h1 id="hero-title">Igloo</h1>
 			<p class="tagline">Open source SQL warehouse on Apache Iceberg</p>
 			<p class="claim"><span>5x faster</span> • <span>30x cheaper per query*</span></p>
@@ -68,33 +68,42 @@ const art = { widths: [640, 960, 1440, 1920, 2400], sizes: '100vw', format: 'web
 		display: flex;
 		align-items: center;
 		min-height: var(--hero-h);
-		padding: var(--header-h) max(24px, calc((100vw - 1280px) / 2)) 48px calc(var(--igloo-end) + 40px);
+		padding: var(--header-h) max(24px, calc((100vw - 1280px) / 2)) 48px calc(var(--igloo-end) - 40px);
 	}
+	/* The text sits on frosted glass over the art, which keeps it legible
+	   over moonlit snow and bright sky alike. */
 	.hero-copy {
-		width: min(640px, 100%);
+		width: min(680px, 100%);
+		padding: 40px 44px 36px;
+		border-radius: 24px;
 	}
 
 	h1 {
 		font-size: clamp(3.75rem, 2rem + 6vw, 6.5rem);
-		font-weight: 850;
+		font-weight: 700;
 		line-height: 0.95;
-		letter-spacing: -0.045em;
+		letter-spacing: -0.055em;
 		color: var(--hero-heading);
+		background: var(--headline);
+		-webkit-background-clip: text;
+		background-clip: text;
+		-webkit-text-fill-color: transparent;
+		padding-bottom: 0.06em;
 	}
 	.tagline {
 		margin: 18px 0 0;
-		font-size: clamp(1.25rem, 0.8rem + 1vw, 1.625rem);
-		font-weight: 550;
+		font-size: clamp(1.25rem, 0.85rem + 0.8vw, 1.5rem);
+		font-weight: 500;
 		line-height: 1.25;
-		letter-spacing: -0.01em;
+		letter-spacing: -0.02em;
 		color: var(--hero-text);
 	}
 	.claim {
 		margin: 14px 0 0;
-		font-size: clamp(1.5rem, 1rem + 1.4vw, 2.125rem);
-		font-weight: 800;
+		font-size: clamp(1.5rem, 1rem + 1.1vw, 1.875rem);
+		font-weight: 680;
 		line-height: 1.2;
-		letter-spacing: -0.015em;
+		letter-spacing: -0.03em;
 		color: var(--hero-claim);
 	}
 	.claim span {
@@ -124,18 +133,9 @@ const art = { widths: [640, 960, 1440, 1920, 2400], sizes: '100vw', format: 'web
 		letter-spacing: 0.01em;
 		color: var(--hero-note);
 	}
-	/* At night the text's lower lines cross moonlit snow; a soft shadow keeps
-	   them legible. */
-	:global(:root[data-theme='dark']) .hero-copy :is(.tagline, .note, .lead, .stack) {
-		text-shadow: 0 1px 12px rgb(2 10 30 / 0.9), 0 0 2px rgb(2 10 30 / 0.6);
-	}
-	:global(:root[data-theme='dark']) .stack {
-		display: inline-block;
-		padding: 5px 12px;
-		border-radius: 999px;
-		background: rgb(2 12 34 / 0.55);
-		-webkit-backdrop-filter: blur(6px);
-		backdrop-filter: blur(6px);
+	.stack {
+		padding-top: 20px;
+		border-top: 1px solid var(--glass-border);
 	}
 
 	/* Narrower screens: the whole illustration on top, at its own 3:1 shape,
@@ -155,8 +155,8 @@ const art = { widths: [640, 960, 1440, 1920, 2400], sizes: '100vw', format: 'web
 		}
 		.hero-inner {
 			min-height: 0;
-			margin-top: -24px;
-			padding: 0 24px 56px;
+			margin-top: -72px;
+			padding: 0 24px 64px;
 			justify-content: center;
 		}
 		.hero-copy {
@@ -175,6 +175,12 @@ const art = { widths: [640, 960, 1440, 1920, 2400], sizes: '100vw', format: 'web
 		}
 		.hero-inner {
 			justify-content: flex-start;
+			margin-top: -48px;
+			padding-inline: 16px;
+		}
+		.hero-copy {
+			padding: 28px 22px 24px;
+			border-radius: 20px;
 		}
 	}
 </style>

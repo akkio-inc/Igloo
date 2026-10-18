@@ -30,7 +30,7 @@ const results = [
 
 <section class="section section-alt" id="benchmark" aria-labelledby="bench-title">
 	<div class="container">
-		<div class="section-head">
+		<div class="section-head reveal">
 			<span class="eyebrow">Benchmark</span>
 			<h2 id="bench-title">Price-performance on TPC-H</h2>
 			<p>
@@ -41,7 +41,7 @@ const results = [
 		<div class="results">
 			{
 				results.map((result) => (
-					<div class="result card">
+					<div class="result glass lift reveal">
 						<div class="scale">{result.scale}</div>
 						<div class="machine">{result.machine}</div>
 						<dl>
@@ -73,12 +73,13 @@ const results = [
 		margin-bottom: 28px;
 	}
 	.result {
-		padding: 24px 26px 26px;
+		padding: 28px;
+		border-radius: 20px;
 	}
 	.scale {
 		font-size: 0.8125rem;
-		font-weight: 700;
-		letter-spacing: 0.06em;
+		font-weight: 600;
+		letter-spacing: 0.04em;
 		text-transform: uppercase;
 		color: var(--muted);
 	}
@@ -103,9 +104,9 @@ const results = [
 	}
 	dd {
 		margin: 0;
-		font-size: clamp(1.75rem, 1.2rem + 1.4vw, 2.25rem);
-		font-weight: 800;
-		letter-spacing: -0.02em;
+		font-size: clamp(1.75rem, 1.2rem + 1.4vw, 2.5rem);
+		font-weight: 650;
+		letter-spacing: -0.045em;
 		line-height: 1.1;
 		color: var(--heading);
 		font-variant-numeric: tabular-nums;

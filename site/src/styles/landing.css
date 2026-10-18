@@ -1,49 +1,61 @@
 /*
- * The landing page. Colors come from the README banners: the light banner's
- * icy sky and navy lettering, the dark banner's night sky, and the amber of
- * the igloo's doorway as the one warm accent.
+ * The landing page: calm, dark-first, frosted glass. Colors are Igloo's own,
+ * from the README banners: night navy, icy blues, and the amber of the
+ * igloo's doorway as the one warm accent.
  */
 
 :root {
 	color-scheme: dark;
-	--font: 'Figtree Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
-		sans-serif;
+	--font: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 	--font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
 
-	--bg: #0b1528;
-	--bg-alt: #0d1930;
-	--surface: #111e37;
-	--surface-2: #16264a;
-	--border: #213153;
-	--border-strong: #2f4370;
-	--heading: #ffffff;
-	--text: #c2cee0;
-	--muted: #8d9cb6;
-	--link: #8cc8fb;
+	--bg: #060c19;
+	--bg-alt: #08101f;
+	--heading: #f3f6fb;
+	--text: #b6c2d6;
+	--muted: #8b98af;
+	--link: #8fcbfc;
+	--ice: #8fcbfc;
+	--ice-strong: #4f9fe6;
 	--amber: #f7ca7a;
 	--amber-fill-1: #ffdc95;
 	--amber-fill-2: #f5b44a;
-	--ice: #a9d6fd;
 	--navy: #0f2d56;
-	--igloo-node: linear-gradient(180deg, #1c2f57, #14254a);
-	--shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px -12px rgb(0 0 0 / 0.6);
 
-	--hero-sky: linear-gradient(180deg, #02163c 0%, #04183f 45%, #0a1f47 78%, #0b1528 100%);
+	/* Glass: a translucent fill, a hairline border, a highlight along the top
+	   edge and a soft shadow. --glass-solid is the fill where backdrop-filter
+	   is not supported. */
+	--glass: linear-gradient(180deg, rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.025));
+	--glass-solid: rgb(15 24 44 / 0.94);
+	--glass-blur-fill: rgb(10 18 36 / 0.55);
+	--glass-border: rgb(255 255 255 / 0.09);
+	--glass-border-strong: rgb(255 255 255 / 0.16);
+	--glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.07);
+	--shadow: 0 1px 2px rgb(0 0 0 / 0.35), 0 16px 40px -16px rgb(0 0 0 / 0.65);
+	--surface-2: rgb(255 255 255 / 0.05);
+	--border: rgb(255 255 255 / 0.08);
+	--border-strong: rgb(255 255 255 / 0.16);
+	--glow-ice: rgb(79 159 230 / 0.16);
+	--glow-amber: rgb(245 180 74 / 0.09);
+	--grid-line: rgb(255 255 255 / 0.035);
+
+	--hero-sky: linear-gradient(180deg, #02163c 0%, #04183f 45%, #0a1f47 78%, var(--bg) 100%);
 	--hero-heading: #ffffff;
-	--hero-text: #b7cdea;
+	--hero-text: #c3d5ee;
 	--hero-claim: #f7ca7a;
-	--hero-note: #8aa8cf;
+	--hero-note: #9db6d8;
+	--headline: linear-gradient(180deg, #ffffff 35%, #b9dcfb 100%);
 
-	/* Expressive Code (the quick start's code blocks) reads Starlight's variables. */
+	/* Expressive Code (the quick start and SQL examples) reads Starlight's variables. */
 	--sl-color-white: #ffffff;
 	--sl-color-gray-1: #e4ecf7;
 	--sl-color-gray-2: #c2cee0;
 	--sl-color-gray-3: #8d9cb6;
 	--sl-color-gray-4: #5a6a86;
-	--sl-color-gray-5: #2c3b57;
-	--sl-color-gray-6: #142039;
-	--sl-color-gray-7: #101b31;
-	--sl-color-black: #0b1528;
+	--sl-color-gray-5: #253450;
+	--sl-color-gray-6: #111b30;
+	--sl-color-gray-7: #0d1628;
+	--sl-color-black: #060c19;
 	--sl-color-accent: #4f9fe6;
 	--sl-color-accent-high: #a9d6fd;
 	--sl-color-text: var(--text);
@@ -54,43 +66,53 @@
 
 	--container: 1160px;
 	--gutter: 24px;
-	--radius: 14px;
+	--radius: 16px;
 	--header-h: 64px;
 }
 
 :root[data-theme='light'] {
 	color-scheme: light;
-	--bg: #ffffff;
-	--bg-alt: #f3f8fe;
-	--surface: #ffffff;
-	--surface-2: #eef5fd;
-	--border: #dbe6f3;
-	--border-strong: #c3d4ea;
-	--heading: #0d2242;
-	--text: #2c4263;
-	--muted: #4c6283;
-	--link: #1d6bbf;
-	--amber: #a8620a;
-	--ice: #1d6bbf;
-	--igloo-node: linear-gradient(180deg, #fff7e8, #ffffff);
-	--shadow: 0 1px 2px rgb(15 45 86 / 0.06), 0 12px 32px -14px rgb(15 45 86 / 0.22);
+	--bg: #f5f8fc;
+	--bg-alt: #eef3fa;
+	--heading: #0b1a33;
+	--text: #33455f;
+	--muted: #53647e;
+	--link: #1b64b5;
+	--ice: #1b64b5;
+	--ice-strong: #1b64b5;
+	--amber: #9a5800;
 
-	--hero-sky: linear-gradient(180deg, #9fd2fd 0%, #bfe2fd 40%, #d6ebfe 70%, #eef6ff 90%, #ffffff 100%);
+	--glass: linear-gradient(180deg, rgb(255 255 255 / 0.85), rgb(255 255 255 / 0.6));
+	--glass-solid: rgb(255 255 255 / 0.96);
+	--glass-blur-fill: rgb(255 255 255 / 0.55);
+	--glass-border: rgb(15 45 86 / 0.1);
+	--glass-border-strong: rgb(15 45 86 / 0.18);
+	--glass-highlight: inset 0 1px 0 rgb(255 255 255 / 0.95);
+	--shadow: 0 1px 2px rgb(15 45 86 / 0.06), 0 16px 40px -18px rgb(15 45 86 / 0.25);
+	--surface-2: rgb(15 45 86 / 0.04);
+	--border: rgb(15 45 86 / 0.09);
+	--border-strong: rgb(15 45 86 / 0.18);
+	--glow-ice: rgb(79 159 230 / 0.16);
+	--glow-amber: rgb(245 180 74 / 0.12);
+	--grid-line: rgb(15 45 86 / 0.045);
+
+	--hero-sky: linear-gradient(180deg, #9fd2fd 0%, #bfe2fd 40%, #d6ebfe 70%, #eef6ff 90%, var(--bg) 100%);
 	--hero-heading: #0f2d56;
 	--hero-text: #123058;
-	--hero-claim: #b26a0c;
-	--hero-note: #3d5f86;
+	--hero-claim: #9a5800;
+	--hero-note: #2f527b;
+	--headline: linear-gradient(180deg, #0f2d56 40%, #2b5f9e 100%);
 
-	--sl-color-white: #0d2242;
+	--sl-color-white: #0b1a33;
 	--sl-color-gray-1: #172d4d;
 	--sl-color-gray-2: #2c4263;
 	--sl-color-gray-3: #4c6283;
 	--sl-color-gray-4: #8294b0;
-	--sl-color-gray-5: #c6d3e4;
-	--sl-color-gray-6: #e6eef8;
-	--sl-color-gray-7: #f3f7fc;
+	--sl-color-gray-5: #d3deec;
+	--sl-color-gray-6: #eaf0f8;
+	--sl-color-gray-7: #f4f8fc;
 	--sl-color-black: #ffffff;
-	--sl-color-accent: #1d6bbf;
+	--sl-color-accent: #1b64b5;
 	--sl-color-accent-high: #123f78;
 }
 
@@ -118,9 +140,26 @@ body {
 	font-family: var(--font);
 	font-size: 1rem;
 	line-height: 1.6;
+	font-feature-settings: 'cv11', 'ss03';
+	font-optical-sizing: auto;
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
 	overflow-x: clip;
+}
+
+/* A faint grid behind everything, fading out down each screen. */
+body::before {
+	content: '';
+	position: fixed;
+	inset: 0;
+	z-index: -2;
+	pointer-events: none;
+	background-image:
+		linear-gradient(var(--grid-line) 1px, transparent 1px),
+		linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+	background-size: 64px 64px;
+	-webkit-mask-image: radial-gradient(ellipse 80% 70% at 50% 30%, #000 0%, transparent 75%);
+	mask-image: radial-gradient(ellipse 80% 70% at 50% 30%, #000 0%, transparent 75%);
 }
 
 img {
@@ -144,8 +183,8 @@ h2,
 h3 {
 	color: var(--heading);
 	margin: 0;
-	line-height: 1.15;
-	letter-spacing: -0.02em;
+	line-height: 1.1;
+	letter-spacing: -0.025em;
 	text-wrap: balance;
 }
 
@@ -175,7 +214,7 @@ h3 {
 	z-index: 100;
 	padding: 8px 14px;
 	border-radius: 8px;
-	background: var(--surface);
+	background: var(--glass-solid);
 	color: var(--heading);
 }
 .skip-link:focus {
@@ -193,17 +232,64 @@ h3 {
 	display: none !important;
 }
 
+/* Glass. Cards use the translucent gradient alone; surfaces with something
+   worth blurring behind them (the header, the hero panel, the screenshot
+   frame) add .glass-blur. */
+.glass {
+	position: relative;
+	background: var(--glass);
+	border: 1px solid var(--glass-border);
+	border-radius: var(--radius);
+	box-shadow: var(--glass-highlight), var(--shadow);
+}
+.glass-blur {
+	background: var(--glass-solid);
+}
+@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+	.glass-blur {
+		background: var(--glass-blur-fill);
+		-webkit-backdrop-filter: blur(20px) saturate(1.6);
+		backdrop-filter: blur(20px) saturate(1.6);
+	}
+}
+
+/* Cards that lift, with a sheen across the top edge on hover. */
+.lift {
+	transition:
+		transform 0.2s ease,
+		border-color 0.2s ease,
+		box-shadow 0.2s ease;
+}
+.lift::after {
+	content: '';
+	position: absolute;
+	inset: 0;
+	border-radius: inherit;
+	pointer-events: none;
+	background: radial-gradient(120% 60% at 50% 0%, rgb(143 203 252 / 0.1), transparent 60%);
+	opacity: 0;
+	transition: opacity 0.2s ease;
+}
+.lift:hover {
+	transform: translateY(-2px);
+	border-color: var(--glass-border-strong);
+}
+.lift:hover::after {
+	opacity: 1;
+}
+
 /* Buttons */
 .btn {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
-	gap: 0.5rem;
-	height: 46px;
-	padding: 0 22px;
+	gap: 8px;
+	height: 44px;
+	padding: 0 20px;
 	border-radius: 999px;
-	font-weight: 650;
-	font-size: 1rem;
+	font-weight: 600;
+	font-size: 0.9375rem;
+	letter-spacing: -0.005em;
 	text-decoration: none;
 	white-space: nowrap;
 	transition:
@@ -212,52 +298,70 @@ h3 {
 		background-color 0.15s ease;
 }
 .btn svg {
-	width: 18px;
-	height: 18px;
+	width: 17px;
+	height: 17px;
 	flex: none;
 }
 .btn-primary {
 	color: var(--navy);
 	background: linear-gradient(180deg, var(--amber-fill-1), var(--amber-fill-2));
 	box-shadow:
-		0 1px 0 rgb(255 255 255 / 0.6) inset,
-		0 8px 24px -8px rgb(245 180 74 / 0.75);
+		inset 0 1px 0 rgb(255 255 255 / 0.65),
+		0 0 0 1px rgb(245 180 74 / 0.5),
+		0 8px 28px -8px rgb(245 180 74 / 0.7);
 }
 .btn-primary:hover {
 	transform: translateY(-1px);
 	box-shadow:
-		0 1px 0 rgb(255 255 255 / 0.6) inset,
-		0 12px 28px -8px rgb(245 180 74 / 0.9);
+		inset 0 1px 0 rgb(255 255 255 / 0.65),
+		0 0 0 1px rgb(245 180 74 / 0.6),
+		0 12px 32px -8px rgb(245 180 74 / 0.85);
 }
 .btn-secondary {
-	color: var(--hero-heading);
+	color: var(--heading);
 	background: rgb(255 255 255 / 0.06);
-	border: 1px solid rgb(255 255 255 / 0.22);
-	backdrop-filter: blur(6px);
+	border: 1px solid var(--glass-border-strong);
+	box-shadow: var(--glass-highlight);
+	-webkit-backdrop-filter: blur(12px) saturate(1.4);
+	backdrop-filter: blur(12px) saturate(1.4);
 }
 :root[data-theme='light'] .btn-secondary {
-	background: rgb(255 255 255 / 0.6);
-	border-color: rgb(15 45 86 / 0.18);
+	background: rgb(255 255 255 / 0.7);
 }
 .btn-secondary:hover {
 	transform: translateY(-1px);
-	background: rgb(255 255 255 / 0.12);
+	background: rgb(255 255 255 / 0.1);
 }
 :root[data-theme='light'] .btn-secondary:hover {
-	background: rgb(255 255 255 / 0.9);
+	background: rgb(255 255 255 / 0.95);
 }
 
-/* Sections */
+/* Sections, on an 8px rhythm, each with soft glows behind it. */
 .section {
-	padding-block: 96px;
+	position: relative;
+	isolation: isolate;
+	padding-block: 128px;
 }
-.section-alt {
-	background: var(--bg-alt);
-	border-block: 1px solid var(--border);
+.section::before {
+	content: '';
+	position: absolute;
+	z-index: -1;
+	inset: 0;
+	pointer-events: none;
+	/* Centred far enough below the section's top that they have faded out
+	   before reaching it, so no edge shows between sections. */
+	background:
+		radial-gradient(640px 300px at 15% 340px, var(--glow-ice), transparent 70%),
+		radial-gradient(520px 260px at 88% 520px, var(--glow-amber), transparent 70%);
+}
+.section-alt::before {
+	background:
+		radial-gradient(640px 300px at 85% 340px, var(--glow-ice), transparent 70%),
+		radial-gradient(520px 260px at 10% 560px, var(--glow-amber), transparent 70%);
 }
 .section-head {
 	max-width: 760px;
-	margin-bottom: 48px;
+	margin-bottom: 56px;
 }
 .section-head.center {
 	max-width: 860px;
@@ -265,65 +369,74 @@ h3 {
 	text-align: center;
 }
 .eyebrow {
-	display: inline-block;
-	margin-bottom: 12px;
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 16px;
+	padding: 4px 12px;
+	border: 1px solid var(--glass-border);
+	border-radius: 999px;
+	background: var(--surface-2);
 	font-size: 0.8125rem;
-	font-weight: 700;
-	letter-spacing: 0.08em;
-	text-transform: uppercase;
-	color: var(--amber);
+	font-weight: 600;
+	letter-spacing: 0.01em;
+	color: var(--muted);
+}
+.eyebrow::before {
+	content: '';
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--amber-fill-2);
+	box-shadow: 0 0 10px var(--amber-fill-2);
 }
 .section-head h2 {
-	font-size: clamp(1.875rem, 1.3rem + 2vw, 2.625rem);
-	font-weight: 800;
+	font-size: clamp(2rem, 1.1rem + 2.8vw, 3.25rem);
+	font-weight: 640;
+	letter-spacing: -0.04em;
+	line-height: 1.05;
 }
 .section-head p {
 	margin: 16px 0 0;
 	font-size: 1.125rem;
+	line-height: 1.55;
 	color: var(--muted);
 }
 .more-link {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
-	font-weight: 650;
+	font-weight: 600;
 	text-decoration: none;
 }
 .more-link:hover {
 	text-decoration: underline;
 }
 
-/* Cards */
-.card {
-	background: var(--surface);
-	border: 1px solid var(--border);
-	border-radius: var(--radius);
-	box-shadow: var(--shadow);
-}
-
 /* Prose rendered from the README (quick start, how it works) */
 .prose {
 	color: var(--text);
-	font-size: 1.0625rem;
+	font-size: 1rem;
 }
 .prose > * {
 	margin-block: 0;
 }
 .prose > * + * {
-	margin-top: 1.1em;
+	margin-top: 16px;
 }
 .prose ul {
 	padding-left: 1.25em;
 }
 .prose li + li {
-	margin-top: 0.6em;
+	margin-top: 8px;
 }
 .prose strong {
 	color: var(--heading);
+	font-weight: 600;
 }
 .prose :not(pre) > code {
-	padding: 0.1em 0.35em;
-	border-radius: 5px;
+	padding: 0.1em 0.4em;
+	border-radius: 6px;
 	background: var(--surface-2);
 	border: 1px solid var(--border);
 	color: var(--heading);
@@ -331,14 +444,44 @@ h3 {
 	overflow-wrap: anywhere;
 }
 
+/* Expressive Code blocks as glass panes. */
+.expressive-code .frame pre {
+	--ec-codeBg: rgb(255 255 255 / 0.03);
+	box-shadow: var(--glass-highlight);
+}
+:root[data-theme='light'] .expressive-code .frame pre {
+	--ec-codeBg: rgb(255 255 255 / 0.75);
+}
+
+/* Fade and rise into view on scroll; only when motion is welcome and the
+   script that reveals them runs (it adds .motion to <html>). */
+.motion .reveal {
+	opacity: 0;
+	transform: translateY(16px);
+	transition:
+		opacity 0.6s ease,
+		transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.motion .reveal.is-visible {
+	opacity: 1;
+	transform: none;
+}
+@media (prefers-reduced-motion: reduce) {
+	.lift,
+	.lift:hover {
+		transform: none;
+		transition: none;
+	}
+}
+
 @media (max-width: 720px) {
 	:root {
 		--gutter: 16px;
 	}
 	.section {
-		padding-block: 64px;
+		padding-block: 80px;
 	}
 	.section-head {
-		margin-bottom: 32px;
+		margin-bottom: 40px;
 	}
 }

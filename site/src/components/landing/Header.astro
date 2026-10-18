@@ -71,20 +71,27 @@ import Icon from './Icon.astro';
 		inset: 0 0 auto;
 		z-index: 50;
 		height: var(--header-h);
-		background: var(--bg);
-		background: color-mix(in srgb, var(--bg) 92%, transparent);
-		border-bottom: 1px solid var(--border);
-		backdrop-filter: saturate(1.4) blur(14px);
-		-webkit-backdrop-filter: saturate(1.4) blur(14px);
+		/* Solid where backdrop-filter is missing; frosted where it is. */
+		background: var(--glass-solid);
+		border-bottom: 1px solid var(--glass-border);
+		box-shadow: var(--glass-highlight);
 		transition:
 			background-color 0.2s ease,
 			border-color 0.2s ease;
 	}
+	@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+		.site-header {
+			background: color-mix(in srgb, var(--bg) 72%, transparent);
+			-webkit-backdrop-filter: blur(20px) saturate(1.8);
+			backdrop-filter: blur(20px) saturate(1.8);
+		}
+	}
 	.site-header[data-at-top] {
 		background: transparent;
 		border-bottom-color: transparent;
-		backdrop-filter: none;
+		box-shadow: none;
 		-webkit-backdrop-filter: none;
+		backdrop-filter: none;
 	}
 	.header-inner {
 		display: flex;
@@ -97,9 +104,9 @@ import Icon from './Icon.astro';
 		align-items: center;
 		gap: 10px;
 		color: var(--heading);
-		font-weight: 800;
-		font-size: 1.375rem;
-		letter-spacing: -0.03em;
+		font-weight: 700;
+		font-size: 1.3125rem;
+		letter-spacing: -0.035em;
 		text-decoration: none;
 	}
 	.site-header[data-at-top] .brand {
@@ -115,9 +122,10 @@ import Icon from './Icon.astro';
 		padding: 6px 12px;
 		border-radius: 8px;
 		color: var(--text);
-		font-weight: 600;
+		font-weight: 500;
 		font-size: 0.9375rem;
 		text-decoration: none;
+		transition: color 0.15s ease, background-color 0.15s ease;
 	}
 	.site-header[data-at-top] .nav a {
 		color: var(--hero-text);

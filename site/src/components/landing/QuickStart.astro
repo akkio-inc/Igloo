@@ -8,7 +8,7 @@ import Icon from './Icon.astro';
 
 <section class="section" id="quick-start" aria-labelledby="quick-title">
 	<div class="container layout">
-		<div class="intro">
+		<div class="intro reveal">
 			<span class="eyebrow">Get started</span>
 			<h2 id="quick-title">Quick start</h2>
 			<p>Clone the repository, then start the single-machine stack with Docker Compose.</p>
@@ -25,7 +25,7 @@ import Icon from './Icon.astro';
 				</li>
 			</ul>
 		</div>
-		<div class="prose steps">
+		<div class="prose steps glass reveal">
 			<Steps />
 		</div>
 	</div>
@@ -43,8 +43,13 @@ import Icon from './Icon.astro';
 		top: calc(var(--header-h) + 32px);
 	}
 	.intro h2 {
-		font-size: clamp(1.875rem, 1.3rem + 2vw, 2.625rem);
-		font-weight: 800;
+		font-size: clamp(2rem, 1.1rem + 2.8vw, 3.25rem);
+		font-weight: 640;
+		letter-spacing: -0.04em;
+	}
+	.steps {
+		padding: 32px;
+		border-radius: 20px;
 	}
 	.intro > p {
 		margin: 16px 0 20px;
@@ -76,6 +81,9 @@ import Icon from './Icon.astro';
 		}
 		.intro {
 			position: static;
+		}
+		.steps {
+			padding: 20px 16px;
 		}
 	}
 </style>
