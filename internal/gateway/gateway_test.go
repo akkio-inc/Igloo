@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -115,6 +117,11 @@ func (f *fakeCompute) counts() (starts, stops int) {
 
 func startGateway(t *testing.T, opts Options) string {
 	t.Helper()
+	if opts.Log == nil {
+		// The gateway's log goes with the test's output, so a failure shows
+		// what the gateway did.
+		opts.Log = slog.New(slog.NewTextHandler(newTestLog(t), &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -131,10 +138,40 @@ func startGateway(t *testing.T, opts Options) string {
 	return ln.Addr().String()
 }
 
+// testLog writes the gateway's log lines to the test's output until the
+// test ends; the gateway's goroutines may still log after that, which
+// testing does not allow.
+type testLog struct {
+	t    *testing.T
+	mu   sync.Mutex
+	done bool
+}
+
+func newTestLog(t *testing.T) *testLog {
+	l := &testLog{t: t}
+	t.Cleanup(func() {
+		l.mu.Lock()
+		l.done = true
+		l.mu.Unlock()
+	})
+	return l
+}
+
+func (l *testLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.done {
+		l.t.Log(strings.TrimRight(string(p), "\n"))
+	}
+	return len(p), nil
+}
+
 // roundTrip sends a line through the gateway and expects it echoed.
 func roundTrip(t *testing.T, conn net.Conn, r *bufio.Reader, msg string) {
 	t.Helper()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// Long enough to wait out a loaded machine; a start that fails closes
+	// the client at once.
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := fmt.Fprintln(conn, msg); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -146,7 +183,7 @@ func roundTrip(t *testing.T, conn net.Conn, r *bufio.Reader, msg string) {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
