@@ -1,12 +1,13 @@
 ---
 import { Image } from 'astro:assets';
-import heroDark from '../../generated/hero-dark.png';
-import heroLight from '../../generated/hero-light.png';
+import heroDark from '../../assets/hero-dark.png';
+import heroLight from '../../assets/hero-light.png';
 import { REPO_URL } from '../../docs-manifest.mjs';
 import Icon from './Icon.astro';
 
-// The banner's illustration, cropped off its lettering by scripts/sync-docs.mjs.
-const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw', format: 'webp', quality: 85 } as const;
+// The README banners' illustration without their lettering, which is set in
+// HTML here. Wide screens show all of it behind the text.
+const art = { widths: [640, 960, 1440, 1920, 2400], sizes: '100vw', format: 'webp', quality: 85 } as const;
 ---
 
 <section class="hero" aria-labelledby="hero-title">
@@ -14,8 +15,7 @@ const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw',
 		<Image src={heroLight} alt="" class="theme-light" loading="eager" fetchpriority="high" {...art} />
 		<Image src={heroDark} alt="" class="theme-dark" loading="eager" fetchpriority="high" {...art} />
 	</div>
-	<div class="stars" aria-hidden="true"></div>
-	<div class="container hero-inner">
+	<div class="hero-inner">
 		<div class="hero-copy">
 			<h1 id="hero-title">Igloo</h1>
 			<p class="tagline">Open source SQL warehouse on Apache Iceberg</p>
@@ -35,7 +35,12 @@ const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw',
 
 <style>
 	.hero {
-		--hero-h: clamp(600px, 50vw, 700px);
+		--hero-h: clamp(600px, 44vw, 760px);
+		/* The art covers the hero, anchored at its left edge, so it is drawn at
+		   least as wide as the hero is high times its 3:1 shape. The igloo sits
+		   in its left 40%, and the text starts past it. */
+		--art-w: max(100vw, calc(var(--hero-h) * 3));
+		--igloo-end: calc(var(--art-w) * 0.4);
 		position: relative;
 		min-height: var(--hero-h);
 		background: var(--hero-sky);
@@ -43,67 +48,30 @@ const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw',
 		isolation: isolate;
 	}
 
-	/* The art fills the hero's height on the left and fades into the sky. */
 	.hero-art {
 		position: absolute;
 		z-index: -1;
-		top: 0;
-		bottom: 0;
-		left: max(-22vw, calc((100vw - 1700px) / 2));
-		aspect-ratio: 1056 / 800;
-		/* Fade the right edge into the sky, the bottom into the page, and the
-		   top a little under the header. */
-		--fade: linear-gradient(to right, #000 72%, transparent 99%), linear-gradient(to top, transparent 0%, #000 22%),
-			linear-gradient(to bottom, rgb(0 0 0 / 0.35) 0, #000 150px);
-		-webkit-mask-image: var(--fade);
-		-webkit-mask-composite: source-in;
-		mask-image: var(--fade);
-		mask-composite: intersect;
+		inset: 0;
+		/* Fade the bottom into the page. */
+		-webkit-mask-image: linear-gradient(to top, transparent 0%, #000 18%);
+		mask-image: linear-gradient(to top, transparent 0%, #000 18%);
 	}
 	.hero-art :global(img) {
 		width: 100%;
 		height: 100%;
 		object-fit: cover;
-	}
-
-	/* A few stars carry the dark banner's night sky across to the text. */
-	.stars {
-		position: absolute;
-		z-index: -1;
-		inset: calc(var(--header-h) + 24px) 0 32% 46%;
-		opacity: 0;
-		background-image:
-			radial-gradient(1.2px 1.2px at 12% 18%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 28% 62%, #fff 60%, transparent),
-			radial-gradient(1.4px 1.4px at 41% 9%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 55% 33%, #fff 60%, transparent),
-			radial-gradient(1.2px 1.2px at 67% 74%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 74% 15%, #fff 60%, transparent),
-			radial-gradient(1.5px 1.5px at 86% 44%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 93% 8%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 18% 88%, #fff 60%, transparent),
-			radial-gradient(1.2px 1.2px at 36% 40%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 61% 92%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 81% 63%, #fff 60%, transparent),
-			radial-gradient(1.3px 1.3px at 97% 30%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 47% 70%, #fff 60%, transparent),
-			radial-gradient(1px 1px at 5% 50%, #fff 60%, transparent);
-	}
-	:global(:root[data-theme='dark']) .stars {
-		opacity: 0.75;
+		object-position: left bottom;
 	}
 
 	.hero-inner {
 		position: relative;
 		display: flex;
-		justify-content: flex-end;
 		align-items: center;
 		min-height: var(--hero-h);
-		padding-top: var(--header-h);
-		padding-bottom: 48px;
+		padding: var(--header-h) max(24px, calc((100vw - 1280px) / 2)) 48px calc(var(--igloo-end) + 40px);
 	}
 	.hero-copy {
-		width: min(660px, 56%);
+		width: min(640px, 100%);
 	}
 
 	h1 {
@@ -123,7 +91,7 @@ const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw',
 	}
 	.claim {
 		margin: 14px 0 0;
-		font-size: clamp(1.5rem, 1rem + 1.6vw, 2.25rem);
+		font-size: clamp(1.5rem, 1rem + 1.4vw, 2.125rem);
 		font-weight: 800;
 		line-height: 1.2;
 		letter-spacing: -0.015em;
@@ -156,38 +124,57 @@ const art = { widths: [480, 760, 1056], sizes: '(min-width: 960px) 62vw, 100vw',
 		letter-spacing: 0.01em;
 		color: var(--hero-note);
 	}
+	/* At night the text's lower lines cross moonlit snow; a soft shadow keeps
+	   them legible. */
+	:global(:root[data-theme='dark']) .hero-copy :is(.tagline, .note, .lead, .stack) {
+		text-shadow: 0 1px 12px rgb(2 10 30 / 0.9), 0 0 2px rgb(2 10 30 / 0.6);
+	}
+	:global(:root[data-theme='dark']) .stack {
+		display: inline-block;
+		padding: 5px 12px;
+		border-radius: 999px;
+		background: rgb(2 12 34 / 0.55);
+		-webkit-backdrop-filter: blur(6px);
+		backdrop-filter: blur(6px);
+	}
 
-	/* Narrow screens: the art on top, the text below it. */
-	@media (max-width: 959px) {
+	/* Narrower screens: the whole illustration on top, at its own 3:1 shape,
+	   and the text below it. */
+	@media (max-width: 1279px) {
 		.hero {
 			min-height: 0;
 		}
 		.hero-art {
 			position: relative;
-			left: 0;
+			inset: auto;
 			width: 100%;
-			height: auto;
-			aspect-ratio: 16 / 10;
+			aspect-ratio: 3 / 1;
 			margin-top: var(--header-h);
-			-webkit-mask-image: linear-gradient(to top, transparent 0%, #000 30%);
-			mask-image: linear-gradient(to top, transparent 0%, #000 30%);
-		}
-		.hero-art :global(img) {
-			object-position: 40% 70%;
-		}
-		.stars {
-			display: none;
+			-webkit-mask-image: linear-gradient(to top, transparent 0%, #000 22%);
+			mask-image: linear-gradient(to top, transparent 0%, #000 22%);
 		}
 		.hero-inner {
 			min-height: 0;
-			margin-top: -36px;
-			padding-top: 0;
-			padding-bottom: 56px;
-			justify-content: flex-start;
+			margin-top: -24px;
+			padding: 0 24px 56px;
+			justify-content: center;
 		}
 		.hero-copy {
 			width: 100%;
-			max-width: 600px;
+			max-width: 720px;
+		}
+	}
+
+	/* Phones: a 3:1 strip would be tiny, so show the igloo up close. */
+	@media (max-width: 639px) {
+		.hero-art {
+			aspect-ratio: 16 / 10;
+		}
+		.hero-art :global(img) {
+			object-position: 4% 80%;
+		}
+		.hero-inner {
+			justify-content: flex-start;
 		}
 	}
 </style>

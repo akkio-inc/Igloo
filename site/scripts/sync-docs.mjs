@@ -20,9 +20,10 @@
 // Edits are made at the source offsets the markdown parser reports, so the
 // rest of each file is copied byte for byte.
 //
-// It also prepares the landing page's inputs in src/generated/: the hero art
-// cropped from the README banners, the screenshots, and the README's quick
-// start and "How it works" sections.
+// It also prepares the landing page's inputs in src/generated/: the
+// screenshots, and the README's quick start and "How it works" sections. The
+// hero's art is the banners' illustration without their lettering, in
+// src/assets/.
 //
 // Output goes to src/content/docs/, public/files/ and src/generated/, all
 // ignored by git. Files are rewritten only when their content changes, and
@@ -352,19 +353,6 @@ class Sync {
 	}
 
 	async landing() {
-		// The hero shows the banner's illustration and sets its text in HTML, so
-		// it is responsive and selectable: crop each banner to the left of its
-		// lettering, which starts about 1,075 px in on the dark one.
-		for (const theme of ['light', 'dark']) {
-			const from = path.join(repoDir, `docs/assets/banner-${theme}.png`);
-			const to = path.join(generatedDir, `hero-${theme}.png`);
-			this.outputs.add(to);
-			if (upToDate(from, to)) continue;
-			await mkdir(generatedDir, { recursive: true });
-			await sharp(from).extract({ left: 0, top: 0, width: 1056, height: 800 }).toFile(to);
-			this.changed++;
-		}
-
 		for (const name of LANDING_SCREENSHOTS) {
 			const from = path.join(repoDir, `docs/assets/screenshots/${name}.png`);
 			const to = path.join(generatedDir, `screenshots/${name}.png`);
