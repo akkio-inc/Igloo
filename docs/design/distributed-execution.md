@@ -9,9 +9,8 @@ costs some of 4, since distribution is a second moving part.
 ## The problem
 
 Igloo runs each query on one embedded DuckDB in one replica. That is fast
-and cheap for most analytical work, and it is the reason Igloo beats
-Snowflake and Databricks on price-performance at the sizes the benchmark
-measures. The analytics teams of large media agencies also have queries
+and cheap for most analytical work, and it is where Igloo's
+price-performance comes from. The analytics teams of large media agencies also have queries
 that one machine serves badly:
 
 - **Large scans with aggregation.** Log-level data runs to billions of

@@ -35,12 +35,11 @@ instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge
 # does. In Igloo's single-machine setup (deploy/single-vm) it holds the
 # operating system, the images, the catalog database and the read cache;
 # table data stays in object storage, which is left out for every
-# platform. Each run names its disk (run.py --disk); runs that do not used
-# `disk`. Every run so far used the benchmark machine's volume, 100 GB of
-# gp3 provisioned for 6,000 IOPS and 500 MB/s (about $38 a month): at scale
-# 100 its read cache holds 27 GB, which the first run after a resume reads
-# at the volume's 500 MB/s. "gp3-20gb" is the least that fits the system
-# and catalog, with gp3's baseline 3,000 IOPS and 125 MB/s. A Kubernetes
+# platform. Each run names its disk (run.py --disk); runs that do not use
+# `disk`. "bench-100gb" is 100 GB of gp3 provisioned for 6,000 IOPS and
+# 500 MB/s (about $38 a month), enough for the read cache to hold scale
+# 100's tables; "gp3-20gb" is the least that fits the system and catalog,
+# with gp3's baseline 3,000 IOPS and 125 MB/s. A Kubernetes
 # deployment pays for a managed PostgreSQL instead, about $0.05 an hour for
 # RDS db.t4g.small with storage.
 disk = "bench-100gb"
