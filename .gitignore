@@ -16,7 +16,4 @@ deploy/single-vm/tls/*
 
 # Binaries built in the repository root
 /igloo
-
-# Benchmark results stay on the machine that ran them (bench/README.md).
-bench/results/
 __pycache__/

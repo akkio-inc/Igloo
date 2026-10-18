@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img alt="Igloo: open source SQL warehouse on Apache Iceberg. Up to 6x faster and up to 35x cheaper per query than Snowflake and Databricks." src="docs/assets/banner-light.png" width="100%">
+    <img alt="Igloo: open source SQL warehouse on Apache Iceberg. 5x faster, 30x cheaper per query (at 10GB query scale; exact speedup and cost reduction will vary)." src="docs/assets/banner-light.png" width="100%">
   </picture>
 </p>
 
@@ -10,8 +10,15 @@
 Igloo is an open-source SQL data warehouse that runs in your own cloud
 account or on your own hardware.
 
-Igloo runs analytical SQL up to 6 times faster than Snowflake and
-Databricks, for up to 35 times less per query.
+On TPC-H at scale factor 10 (10 GB) with tables in Amazon S3, Igloo on one
+16-core machine ran the 22 queries 4.3 to 6.8 times faster than a Snowflake
+X-Small (Gen1 or Gen2) or Databricks SQL Serverless 2X-Small warehouse, and
+26 to 35 times cheaper per query at list prices. The margins vary with scale
+and size: at scale factor 100 the same machine was 2.2 to 3.2 times faster
+than those warehouses and 10 to 16 times cheaper, and a 64-core machine was
+2.4 to 3.2 times faster than their X-Large sizes and 59 to 69 times cheaper.
+See the [benchmark](bench/README.md) for the method, every result and its
+caveats.
 
 - **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
   so `psql`, JDBC, psycopg, pgx, dbt, BI tools and notebooks work without an
@@ -356,8 +363,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   databases in place, and governing them with grants
 - [Tools and integrations](docs/integrations.md): dbt, BI tools and
   notebooks, how to connect each and what to expect
-- [Benchmark](bench/README.md): tools to time and price the same queries on
-  Igloo and other warehouses, on your own account
+- [Benchmark](bench/README.md): price-performance against Snowflake and
+  Databricks on the same data and queries
 - [Security](SECURITY.md): the security model and how to report a
   vulnerability
 - [Contributing](CONTRIBUTING.md)
