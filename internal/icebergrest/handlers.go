@@ -573,8 +573,8 @@ func (s *Server) dropTable(c *call) error {
 		c.detail = "purge"
 	case !purgeRequested(c):
 		// A dropped table's files go with it, as in SQL, unless clones
-		// may read them: what is left of a dropped table no one can reach
-		// to erase from.
+		// may read them, so that they do not linger; erasure requests
+		// delete whatever a drop leaves (package erasure).
 		if release, ok := s.holdUnread(c, tablePathOf(ns, o.Table)); ok {
 			defer release()
 			query.Set("purgeRequested", "true")

@@ -98,7 +98,7 @@ func TestDroppedTableFilesGo(t *testing.T) {
 			f := newFixture(t)
 			f.people("crm.alpha", [][]any{ann, subject})
 			beta := f.people("crm.beta", [][]any{carl, subject})
-			oldBeta, betaFile := beta.Location(), filesByIDs(t, f, beta)["2,3"]
+			betaFile := filesByIDs(t, f, beta)["2,3"]
 			f.tag(policy.ColumnTag{Schema: "crm", Table: "alpha", Column: "email", Value: "email"},
 				policy.ColumnTag{Schema: "crm", Table: "beta", Column: "email", Value: "email"})
 			f.rows["crm.alpha"] = iceberg.EqualTo(iceberg.Reference("id"), int64(2))
@@ -118,7 +118,7 @@ func TestDroppedTableFilesGo(t *testing.T) {
 			got := runFor(f, r.ID, 6)
 			rows.after = nil
 			b := tableOf(t, got, "crm.beta")
-			if got.Status != StatusWaiting || got.Step != StepPurge || !b.Gone || b.Blocked != "" || !slices.Contains(b.Dropped, oldBeta) {
+			if got.Status != StatusWaiting || got.Step != StepPurge || !b.Gone || b.Blocked != "" {
 				t.Errorf("%s at %s, %q; crm.beta %+v", got.Status, got.Step, got.Error, b)
 			}
 			if _, err := os.Stat(betaFile); err != nil {
@@ -185,7 +185,7 @@ func TestReplacedByVersion3IsSetAside(t *testing.T) {
 	rows.after = nil
 	f.blocked(got, StepRewrite, "set aside crm.beta", *alerts)
 	b := tableOf(t, got, "crm.beta")
-	if b.BlockedAt != StepRewrite || !strings.Contains(b.Blocked, "format version 3") || !slices.Contains(b.Dropped, oldBeta) {
+	if b.BlockedAt != StepRewrite || !strings.Contains(b.Blocked, "format version 3") {
 		t.Errorf("crm.beta: %+v", b)
 	}
 	a := tableOf(t, got, "crm.alpha")

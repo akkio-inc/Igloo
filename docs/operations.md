@@ -615,11 +615,12 @@ it works on:
   no clone reads under the table's location (as the purge refusal below
   does), and holds the lock until the drop is through. A table whose files
   clones read, or may (Igloo cannot tell), is dropped without purging: its
-  files stay in the bucket, clones keep reading theirs, and Igloo does not
-  delete the rest. Purging a dropped table's files is what keeps them
-  within reach of [erasure requests](privacy.md#what-a-request-does): no
-  table references them any more, so no request would find them. Only
-  tables in the warehouse are purged. The catalog deletes files only when
+  files stay in the bucket, and clones keep reading theirs. Only tables
+  in the warehouse are purged. Whatever a drop leaves, as the files of a
+  table whose clones read them once the clones are gone too, [erasure
+  requests](privacy.md#what-is-left-of-dropped-tables) delete with the
+  rest of the warehouse's files under no table's or view's location, once
+  three days old: the warehouse is Igloo's alone. The catalog deletes files only when
   asked to purge, and only Igloo can reach it; other engines go through
   [Igloo's Iceberg REST catalog](external-engines.md#clones), which drops
   tables the same way and refuses to purge a table whose files clones

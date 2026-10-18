@@ -37,8 +37,9 @@ import (
 //     request for it. Igloo sets them itself, without DuckDB.
 //
 // A table dropped in the warehouse has its files deleted with it (the
-// catalog purges it) unless clones may read them: what is left of a
-// dropped table no one can reach to erase from.
+// catalog purges it) unless clones may read them, so that they do not
+// linger; erasure requests delete whatever a drop leaves (package
+// erasure).
 
 // cloneProperties are Igloo's clone properties (see package clone).
 const cloneProperties = "igloo.clone."
@@ -129,9 +130,19 @@ func (s *Server) refuseErasingReplace(ctx context.Context, o auth.Object) error 
 // c drops: it does for a table in the warehouse whose files no clone may
 // read (Options.CloneReaders), which no clone is made of until the drop
 // is through. A drop that asks for the files to go while clones may read
-// them is refused, as Igloo's Iceberg REST catalog refuses it.
+// them is refused, as Igloo's Iceberg REST catalog refuses it. This is
+// storage hygiene: erasure requests do not rely on it, as they delete the
+// warehouse's files that no table's location holds (package erasure).
 func (s *Server) purgeVerdict(ctx context.Context, c *catalogproxy.Change) (catalogproxy.Verdict, error) {
-	if s.cloneReaders == nil || c.Location == "" || s.gov.warehouse == "" || !strings.HasPrefix(withSlash(c.Location), s.gov.warehouse) {
+	name := strings.Join(append(slices.Clone(c.Namespace), c.Name), ".")
+	switch {
+	case s.cloneReaders == nil || s.gov.warehouse == "":
+		return catalogproxy.Verdict{}, nil
+	case c.Location == "":
+		s.log.Warn("could not tell where a dropped table keeps its files; it is dropped without them", "table", name)
+		return catalogproxy.Verdict{}, nil
+	case !strings.HasPrefix(withSlash(c.Location), s.gov.warehouse):
+		s.log.Info("a table dropped outside the warehouse keeps its files", "table", name, "location", c.Location)
 		return catalogproxy.Verdict{}, nil
 	}
 	names, release, err := s.cloneReaders(ctx, c.Location)
@@ -140,7 +151,7 @@ func (s *Server) purgeVerdict(ctx context.Context, c *catalogproxy.Change) (cata
 		return catalogproxy.Verdict{}, catalogproxy.Refuse("could not tell whether clones read the table's files, so it is not purged; try again")
 	case err != nil:
 		s.log.Warn("could not tell whether clones read a dropped table's files; the table is dropped without them",
-			"table", strings.Join(append(slices.Clone(c.Namespace), c.Name), "."), "err", err)
+			"table", name, "err", err)
 		return catalogproxy.Verdict{}, nil
 	case len(names) > 0:
 		release()

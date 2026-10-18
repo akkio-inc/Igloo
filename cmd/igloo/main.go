@@ -327,6 +327,7 @@ func serve() error {
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
+			Locations: cat.Locations,
 		}, historyStore, taskStore)
 		if err != nil {
 			return err
@@ -725,8 +726,8 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 // cannot would keep identifiers the request is meant to erase.
 func newEraser(cfg config.Config, opts erasure.Options, history audit.Store, taskStore tasks.Store) (*erasure.Service, error) {
 	opts.CatalogName, opts.Schema, opts.Warehouse = cfg.Catalog.Name, cfg.Catalog.Schema, cfg.Storage.Root()
-	// The files of tables dropped while a request ran are reached with
-	// Igloo's own credentials.
+	// The warehouse's files, those of tables dropped included, are listed
+	// and deleted with Igloo's own credentials.
 	opts.Storage = func(ctx context.Context, location string) (iceio.IO, error) {
 		return catalog.FS(ctx, cfg.Storage, location)
 	}

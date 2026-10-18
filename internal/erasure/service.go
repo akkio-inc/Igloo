@@ -78,6 +78,11 @@ type Options struct {
 	// files through when none of its tables exists any more, as when
 	// every one was dropped.
 	Storage func(ctx context.Context, location string) (iceio.IO, error)
+	// Locations, if set, returns the locations of every table and view of
+	// the catalog, which own the files under them: a request deletes the
+	// warehouse's files under none (see unowned). It must fail if one
+	// cannot be loaded. Without it, the tables' locations stand in.
+	Locations func(ctx context.Context) ([]string, error)
 	// Jobs runs requests. Without it they run only when Run is called.
 	Jobs *tasks.Scheduler
 	// History are the stores whose records requests redact; nil ones are
@@ -847,6 +852,11 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		}
 		r.Status, r.ClosedBy, r.Completed = StatusClosed, by, s.now()
 		r.Error = "closed by " + by + " while blocked: " + why
+		if fs := files[""]; len(fs) > 0 {
+			// Under no table's location: the request records them itself.
+			r.Error += scrub(r, fmt.Sprintf("; it leaves %d files in the warehouse under no table's location that may hold the person's rows: %s",
+				len(fs), strings.Join(fs, ", ")))
+		}
 		s.dropBranches(ctx, r)
 		s.end(ctx, r)
 		s.unschedule(ctx, id)
@@ -880,13 +890,14 @@ func (s *Service) finish(ctx context.Context, r *Request) error {
 }
 
 // leave settles, for a request that is to be closed, the files it
-// recorded and has not deleted, and the files under the locations of its
-// tables dropped while it ran. A table set aside that was dropped since,
-// and not renamed, holds nothing any more: the files recorded for it go,
-// unless a table references them, as purge would delete them. It returns,
-// by table, the paths of the files left that may hold the person's rows:
-// those recorded and not deleted, and those under a dropped table's
-// location that hold matching rows and that no table references.
+// recorded and has not deleted, and the warehouse's files under no table's
+// or view's location (see unowned). A table set aside that was dropped
+// since, and not renamed, holds nothing any more: the files recorded for
+// it go, unless a table references them, as purge would delete them; so
+// do the old files under no table's location. It returns, by table, the
+// paths of the files left that may hold the person's rows: those recorded
+// and not deleted, and, under "", those under no table's location that
+// hold matching rows, which purge would wait for.
 func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, error) {
 	for i := range r.Tables {
 		t := &r.Tables[i]
@@ -905,7 +916,6 @@ func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, e
 			s.log.Info("an erasure request being closed found a table it set aside dropped; it deletes the files it recorded for it",
 				"request", r.ID, "table", t.Name)
 			t.Blocked, t.BlockedAt, t.Gone = "", "", true
-			t.dropped(t.Location)
 		}
 	}
 	files, err := s.opts.Store.Files(ctx, r.ID)
@@ -913,76 +923,87 @@ func (s *Service) leave(ctx context.Context, r *Request) (map[string][]string, e
 		return nil, err
 	}
 	out := map[string][]string{}
-	tables, referenced, kept, err := s.referenced(ctx, r)
-	var c contentionError
-	switch {
-	case errors.As(err, &c):
-		return nil, err
-	case err != nil:
-		// Which files a table references cannot be told: none is deleted,
-		// and every one recorded, and any under a dropped table's
-		// location, is left.
-		s.log.Warn("an erasure request being closed could not read its tables; it lists every file it did not delete as left",
-			"request", r.ID, "err", scrub(r, err.Error()))
+	recorded := func() {
 		for _, f := range files {
 			if f.Deleted.IsZero() && f.Kind != fileOutside {
 				out[f.Table] = append(out[f.Table], f.Path)
 			}
 		}
-		for _, t := range r.Tables {
-			for _, loc := range t.Dropped {
-				out[t.Name] = append(out[t.Name], "any under "+loc)
-			}
-		}
+	}
+	var c contentionError
+	tables, referenced, kept, err := s.referenced(ctx, r)
+	switch {
+	case errors.As(err, &c):
+		return nil, err
+	case err != nil:
+		// Which files a table references cannot be told: none is deleted,
+		// and every one recorded, and any under no table's location, is
+		// left.
+		s.log.Warn("an erasure request being closed could not read its tables; it lists every file it did not delete as left",
+			"request", r.ID, "err", scrub(r, err.Error()))
+		recorded()
+		out[""] = append(out[""], "any in the warehouse under no table's location")
 		return out, nil
 	}
 	var gone []File
+	going := pathSet{}
 	for _, f := range files {
 		i := slices.IndexFunc(r.Tables, func(t Table) bool { return t.Name == f.Table })
 		if f.Deleted.IsZero() && f.Kind != fileOutside && i >= 0 && r.Tables[i].Gone && !referenced.has(f.Path) {
 			gone = append(gone, f)
+			going.add(f.Path)
 		}
 	}
-	if len(gone) > 0 {
+	u := &unownedFiles{young: map[string]time.Time{}}
+	sw, err := s.unowned(ctx, s.newFileIO(tables), referenced)
+	if err == nil {
+		u, err = s.unownedFiles(ctx, r, tables, sw, going)
+	}
+	switch {
+	case errors.As(err, &c):
+		return nil, err
+	case err != nil:
+		s.log.Warn("an erasure request being closed could not sweep the warehouse; it lists the files under no table's location as left",
+			"request", r.ID, "err", scrub(r, err.Error()))
+		out[""] = append(out[""], fmt.Sprintf("any in the warehouse under no table's location (%v)", err))
+		u = &unownedFiles{young: map[string]time.Time{}}
+	}
+	check := pathSet{}
+	for _, f := range gone {
+		check.add(f.Path)
+	}
+	for _, p := range u.all() {
+		check.add(p)
+	}
+	if len(check) > 0 {
 		release, err := s.lockLocations(ctx, r)
 		if err != nil {
 			return nil, err
 		}
-		more, err := s.unshared(ctx, r, tables, gone)
+		refs, more, err := s.othersReference(ctx, r, tables, check)
 		if err == nil {
-			err = s.delete(ctx, r, tables, keep(gone, append(kept, more...)))
+			kept = append(kept, more...)
+			// Files another table references stay, recorded: they are
+			// listed as left.
+			gone = slices.DeleteFunc(gone, func(f File) bool { _, ok := refs[canonical(f.Path)]; return ok })
+			u.leave(refs, kept)
+			for _, p := range u.old {
+				gone = append(gone, File{Path: p, Kind: fileUnowned})
+			}
+			err = s.delete(ctx, r, tables, keep(gone, kept))
 		}
 		release()
 		if err != nil {
-			s.log.Warn("an erasure request being closed could not delete the files it recorded for a table dropped since; it lists them as left",
+			s.log.Warn("an erasure request being closed could not delete the files it found no table needs; it lists them as left",
 				"request", r.ID, "err", scrub(r, err.Error()))
 		}
 		if files, err = s.opts.Store.Files(ctx, r.ID); err != nil {
 			return nil, err
 		}
 	}
-	for _, f := range files {
-		if f.Deleted.IsZero() && f.Kind != fileOutside {
-			out[f.Table] = append(out[f.Table], f.Path)
-		}
-	}
-	fio := s.newFileIO(tables)
-	for i := range r.Tables {
-		t := &r.Tables[i]
-		for _, loc := range s.droppedLocations(t, tables) {
-			o, err := s.droppedFiles(ctx, fio, t, loc, referenced)
-			if err != nil {
-				out[t.Name] = append(out[t.Name], fmt.Sprintf("any under %s (%v)", loc, err))
-				continue
-			}
-			paths := append(append(slices.Collect(maps.Keys(o.young)), o.old...), o.unsure...)
-			matched, err := s.matchingFiles(ctx, r.salt, parquet(paths), namedColumns(t, r.Subjects))
-			if err != nil {
-				return nil, err
-			}
-			out[t.Name] = append(out[t.Name], slices.Sorted(maps.Keys(matched))...)
-		}
-	}
+	recorded()
+	out[""] = append(out[""], slices.Sorted(maps.Keys(u.young))...)
+	out[""] = append(out[""], u.unsure...)
 	return out, nil
 }
 

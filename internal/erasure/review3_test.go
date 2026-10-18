@@ -501,16 +501,20 @@ func TestStagedSnapshotPublishing(t *testing.T) {
 }
 
 // A table the catalog cannot load for a moment stops the run, which tries
-// again without counting it a failure; one it refuses for good is left
-// out.
+// again without counting it a failure. One it refuses for good is left out
+// of the search for tables that share files, but, as which of the
+// warehouse's files are whose cannot be told while it does (see unowned),
+// the request does not complete: the run fails, saying so, and the request
+// goes on once the table loads.
 func TestUnloadableTables(t *testing.T) {
 	for _, c := range []struct {
-		err  error
-		want string
+		err      error
+		want     string
+		failures int
 	}{
-		{fmt.Errorf("%w: 503", rest.ErrServiceUnavailable), StatusRetrying},
-		{fmt.Errorf("%w: 500 lost its database connection", rest.ErrServerError), StatusRetrying},
-		{fmt.Errorf("%w: 403", rest.ErrForbidden), StatusCompleted},
+		{fmt.Errorf("%w: 503", rest.ErrServiceUnavailable), StatusRetrying, 0},
+		{fmt.Errorf("%w: 500 lost its database connection", rest.ErrServerError), StatusRetrying, 0},
+		{fmt.Errorf("%w: 403", rest.ErrForbidden), StatusRetrying, 1},
 	} {
 		t.Run(c.err.Error(), func(t *testing.T) {
 			f := newFixture(t)
@@ -524,13 +528,11 @@ func TestUnloadableTables(t *testing.T) {
 			}
 			_ = f.svc.Run(f.ctx, r.ID)
 			got, _ := f.store.Get(f.ctx, r.ID)
-			if got.Status != c.want || got.Failures != 0 {
+			if got.Status != c.want || got.Failures != c.failures || c.failures > 0 && !strings.Contains(got.Error, "junk.broken") {
 				t.Errorf("status %s, failures %d, error %q", got.Status, got.Failures, got.Error)
 			}
-			if c.want == StatusRetrying {
-				broken.err = nil
-				f.completed(f.run(r.ID))
-			}
+			broken.err = nil
+			f.completed(f.run(r.ID))
 		})
 	}
 }

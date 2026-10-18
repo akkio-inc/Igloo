@@ -71,9 +71,10 @@ const (
 	fileExpired = "expired"
 	fileOrphan  = "orphan"
 	fileSharing = "sharing"
-	// fileDropped are files of a table dropped or replaced while the
-	// request ran, which no table references.
-	fileDropped = "dropped"
+	// fileUnowned are files in the warehouse under no location of a table
+	// or view of the catalog, as those of tables dropped or replaced, which
+	// no table references (see unowned).
+	fileUnowned = "unowned"
 	// fileOutside are files outside the warehouse, which a request leaves:
 	// they are someone else's, as files added from a landing bucket are.
 	fileOutside = "outside"
@@ -92,9 +93,9 @@ var errGone = errors.New("does not exist any more")
 // reload loads a request's table. A table that has its name but not its
 // UUID replaced it, as CREATE OR REPLACE TABLE does, or was made after it
 // was dropped: the request erases from it, as what has the name now may
-// hold what the old table held, and from the old table's files, which no
-// table may reference any more (see Table.Dropped). A table that no
-// longer has its name was dropped or renamed (see gone).
+// hold what the old table held. The old table's files, under a location
+// no table has any more, go as any such files do (see unowned). A table
+// that no longer has its name was dropped or renamed (see gone).
 func (s *Service) reload(ctx context.Context, t *Table) (*table.Table, error) {
 	tbl, err := s.opts.Catalog.LoadTable(ctx, identOf(t))
 	if errors.Is(err, icecat.ErrNoSuchTable) {
@@ -107,13 +108,9 @@ func (s *Service) reload(ctx context.Context, t *Table) (*table.Table, error) {
 		if t.UUID != "" {
 			s.log.Info("an erasure request's table was replaced, or dropped and made again; it erases from the new one, "+
 				"and from the old one's files", "table", t.Name)
-			if t.Location != tbl.Location() {
-				t.dropped(t.Location)
-			}
 		}
 		t.UUID, t.Gone = id, false
 	}
-	t.Location = tbl.Location()
 	return tbl, nil
 }
 
@@ -147,9 +144,9 @@ func (s *Service) setAside(ctx context.Context, r *Request, t *Table, err error)
 // the catalog has its UUID, it was renamed, and still holds its rows: it
 // is set aside (see block), for someone to tag it under its new name. If
 // none has, it was dropped: the request goes on without it, and deletes
-// the files under its location that no table references (see purge),
-// which can hold the person's rows: Igloo's catalog keeps no dropped
-// table, and Igloo's own drops have it delete their files.
+// the files under its location that no table references, which can hold
+// the person's rows, as it does those of every table dropped (see
+// unowned).
 func (s *Service) gone(ctx context.Context, r *Request, t *Table) error {
 	if t.Gone {
 		return nil
@@ -163,9 +160,8 @@ func (s *Service) gone(ctx context.Context, r *Request, t *Table) error {
 			"and make a new request for it", t.Name, errGone, tableName(ident)))
 	}
 	t.Gone = true
-	t.dropped(t.Location)
 	s.log.Warn("an erasure request's table was dropped while it ran; the request deletes the dropped table's files that hold the person's rows",
-		"request", r.ID, "table", t.Name, "location", t.Location)
+		"request", r.ID, "table", t.Name)
 	return s.save(ctx, r)
 }
 
@@ -979,6 +975,20 @@ func (x *fileIO) forPath(ctx context.Context, p string) (iceio.IO, error) {
 	return fsys, nil
 }
 
+// warehouseIO is the IO to list the whole warehouse with: Igloo's own,
+// or a table's in the warehouse without it.
+func (x *fileIO) warehouseIO(ctx context.Context) (iceio.IO, error) {
+	if x.storage != nil {
+		return x.ownIO(ctx)
+	}
+	for _, l := range x.tables {
+		if within(l.tbl.Location(), x.warehouse) {
+			return x.forPath(ctx, l.tbl.Location())
+		}
+	}
+	return nil, errors.New("none of the request's tables exists to list the warehouse's files through")
+}
+
 // ownIO opens the warehouse's storage with Igloo's own credentials.
 func (x *fileIO) ownIO(ctx context.Context) (iceio.IO, error) {
 	if x.own == nil {
@@ -1323,16 +1333,15 @@ func (s *Service) expireTable(ctx context.Context, r *Request, t *Table, l *list
 // tables' locations meanwhile, which making a clone of one takes too, so
 // no clone that references a file it deletes is made.
 //
-// Under the location of a table dropped or replaced while the request ran
-// (Table.Dropped), every file no table references is an orphan too, as
-// none of them is any table's any more: those old enough go, and a newer
-// one that holds matching rows makes the request wait.
+// It also sweeps the warehouse (see unowned): the files under no table's
+// or view's location, as those of every table dropped or replaced, before
+// the request or while it ran, however it was, go as orphan files do.
 //
 // The files recorded for a table set aside (see block) are left until the
 // request takes it up again, and what such a table references is kept as
 // any table's is. Under the location of a table, set aside or not one of
 // the request's, that cannot be read, and under those it says it shares,
-// no file is deleted: it may reference any of them (see unshared).
+// no file is deleted: it may reference any of them (see othersReference).
 func (s *Service) purge(ctx context.Context, r *Request) error {
 	release, err := s.lockLocations(ctx, r)
 	if err != nil {
@@ -1362,16 +1371,23 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 		}
 	}
 	var waitUntil time.Time
-	// orphans adds the orphan files o under a location of t's to those to
-	// delete, and has the request wait for any newer one that holds
-	// matching rows in cols.
-	orphans := func(t *Table, o *orphanFiles, cols []scanColumn, kind string) error {
+	later := func(at time.Time) {
+		if at = at.Add(orphanAge); waitUntil.IsZero() || at.Before(waitUntil) {
+			waitUntil = at
+		}
+	}
+	for _, l := range tables {
+		o, err := s.orphans(ctx, l.tbl, referenced)
+		if err != nil {
+			return &tableError{l.t.Name, fmt.Errorf("orphan files of %s: %w", l.t.Name, err)}
+		}
 		for _, p := range o.old {
 			if !going.has(p) {
-				gone = append(gone, File{Path: p, Table: t.Name, Kind: kind})
+				gone = append(gone, File{Path: p, Table: l.t.Name, Kind: fileOrphan})
 				going.add(p)
 			}
 		}
+		cols := scanColumns(fields(l.tbl, l.t), r.Subjects)
 		young := o.young
 		maps.DeleteFunc(young, func(p string, _ time.Time) bool { return going.has(p) })
 		matched, err := s.matchingFiles(ctx, r.salt, parquet(slices.Collect(maps.Keys(young))), cols)
@@ -1379,20 +1395,7 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 			return err
 		}
 		for p := range matched {
-			if at := young[p].Add(orphanAge); waitUntil.IsZero() || at.Before(waitUntil) {
-				waitUntil = at
-			}
-		}
-		return nil
-	}
-	for _, l := range tables {
-		o, err := s.orphans(ctx, l.tbl, referenced)
-		if err != nil {
-			return &tableError{l.t.Name, fmt.Errorf("orphan files of %s: %w", l.t.Name, err)}
-		}
-		cols := scanColumns(fields(l.tbl, l.t), r.Subjects)
-		if err := orphans(l.t, o, cols, fileOrphan); err != nil {
-			return err
+			later(young[p])
 		}
 		unsure, err := s.matchingFiles(ctx, r.salt, parquet(slices.DeleteFunc(o.unsure, going.has)), cols)
 		if err != nil {
@@ -1404,37 +1407,46 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 				"it may be that file, spelled otherwise, so the request does not delete it; if nothing references it, delete it", base(p), l.t.Name)}
 		}
 	}
-	fio := s.newFileIO(tables)
-	for i := range r.Tables {
-		t := &r.Tables[i]
-		for _, loc := range s.droppedLocations(t, tables) {
-			o, err := s.droppedFiles(ctx, fio, t, loc, referenced)
-			if err != nil {
-				return err
-			}
-			cols := namedColumns(t, r.Subjects)
-			if err := orphans(t, o, cols, fileDropped); err != nil {
-				return err
-			}
-			unsure, err := s.matchingFiles(ctx, r.salt, parquet(slices.DeleteFunc(o.unsure, going.has)), cols)
-			if err != nil {
-				return err
-			}
-			if len(unsure) > 0 {
-				p := slices.Sorted(maps.Keys(unsure))[0]
-				return fmt.Errorf("%s, under %s, where %s was before it was dropped or replaced, holds matching rows, and no file "+
-					"is spelled as it is, but one has its name: it may be that file, spelled otherwise, so the request does not delete it; "+
-					"if nothing references it, delete it", base(p), loc, t.Name)
-			}
-		}
-	}
-	more, err := s.unshared(ctx, r, tables, gone)
+	sw, err := s.unowned(ctx, s.newFileIO(tables), referenced)
 	if err != nil {
 		return err
+	}
+	u, err := s.unownedFiles(ctx, r, tables, sw, going)
+	if err != nil {
+		return err
+	}
+	check := pathSet{}
+	for _, f := range gone {
+		check.add(f.Path)
+	}
+	for _, p := range u.all() {
+		check.add(p)
+	}
+	refs, more, err := s.othersReference(ctx, r, tables, check)
+	if err != nil {
+		return err
+	}
+	for _, f := range gone {
+		if name, ok := refs[canonical(f.Path)]; ok {
+			return fmt.Errorf("%s references %s, a file the request deletes, but the request does not erase from %[1]s: "+
+				"tag the columns of %[1]s that hold the identifiers and make a new request for them; this one goes on once that one is done", name, base(f.Path))
+		}
 	}
 	if kept = append(kept, more...); len(kept) > 0 {
 		s.log.Warn("an erasure request keeps the files under the locations of tables it cannot read, which may reference them",
 			"request", r.ID, "locations", strings.Join(kept, ", "))
+	}
+	u.leave(refs, kept)
+	if len(u.unsure) > 0 {
+		return fmt.Errorf("%s, in the warehouse under no table's location, holds matching rows, and no file of a table is spelled as it is, "+
+			"but one has its name: it may be that file, spelled otherwise, so the request does not delete it; if nothing references it, delete it",
+			base(u.unsure[0]))
+	}
+	for _, at := range u.young {
+		later(at)
+	}
+	for _, p := range u.old {
+		gone = append(gone, File{Path: p, Kind: fileUnowned})
 	}
 	if err := s.delete(ctx, r, tables, keep(gone, kept)); err != nil {
 		return err
@@ -1450,36 +1462,195 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// droppedLocations are the locations of tables dropped or replaced under
-// t's name while the request ran that are in the warehouse and that none
-// of tables now has: one a table has again holds its orphans.
-func (s *Service) droppedLocations(t *Table, tables []loaded) []string {
+// iglooDir is where Igloo keeps files of its own in the warehouse, as
+// Delta Sharing's copies (see sharing), which no table owns.
+const iglooDir = ".igloo/"
+
+// sweep is the warehouse's files, listed once: listed are all of them,
+// and unowned, sorted as orphan files are, those under no location the
+// catalog's tables and views own.
+type sweep struct {
+	listed  pathSet
+	unowned *orphanFiles
+}
+
+// unowned lists the warehouse's files, with Igloo's own credentials, and
+// sorts those under no location of a table or view of the catalog, and
+// not Igloo's own (iglooDir), as orphan files are (see sortOrphans),
+// leaving out those referenced, which r's tables reference. They are the
+// files of tables dropped or replaced, before the request or while it
+// ran, through Igloo or around it, while clones read them or not, as no
+// catalog keeps track of them any more, and files written for tables
+// never made: no table, and so no one reading through Igloo, reaches them,
+// but they can hold the person's rows. Every request deletes them, so the
+// guarantee rests on this sweep rather than on every way a table is
+// dropped.
+//
+// Igloo treats the warehouse as its own: a table's or view's location is
+// the only claim on a file in it. Every table and view must load, or which
+// files are whose cannot be told, and nothing is swept.
+func (s *Service) unowned(ctx context.Context, fio *fileIO, referenced pathSet) (*sweep, error) {
+	owned, err := s.ownedLocations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fsys, err := fio.warehouseIO(ctx)
+	if err != nil {
+		return nil, err
+	}
+	listed, err := listFiles(fsys, s.opts.Warehouse)
+	if err != nil {
+		return nil, fmt.Errorf("list the warehouse's files: %w", err)
+	}
+	sw := &sweep{listed: pathSet{}}
+	names := map[string]bool{}
+	for p := range listed {
+		sw.listed.add(p)
+		names[path.Base(p)] = true
+	}
+	// A listing that spelled paths otherwise than the tables' metadata, in
+	// a way canonical does not know, would make every file look unowned:
+	// refuse rather than delete tables' files.
+	in, seen := 0, 0
+	for _, p := range referenced {
+		switch {
+		case !within(p, s.opts.Warehouse):
+		case sw.listed.has(p):
+			in, seen = in+1, seen+1
+		case names[path.Base(p)]:
+			return nil, fmt.Errorf("the listing of the warehouse does not show %s, which a table references, as the table spells it", base(p))
+		default:
+			in++
+		}
+	}
+	if in > 0 && seen == 0 {
+		return nil, errors.New("the listing of the warehouse shows none of the files the request's tables reference there, as they spell them")
+	}
+	ours := s.opts.Warehouse + iglooDir
+	maps.DeleteFunc(listed, func(p string, _ time.Time) bool { return under(p, owned) || within(p, ours) })
+	sw.unowned = s.sortOrphans(listed, referenced)
+	return sw, nil
+}
+
+// ownedLocations are the locations of every table and view of the catalog
+// (Options.Locations), or, without that, of every table.
+func (s *Service) ownedLocations(ctx context.Context) ([]string, error) {
+	var (
+		locs []string
+		err  error
+	)
+	if s.opts.Locations != nil {
+		locs, err = s.opts.Locations(ctx)
+	} else {
+		locs, err = s.tableLocations(ctx)
+	}
+	switch {
+	case err == nil:
+		return locs, nil
+	case refused(err):
+		return nil, fmt.Errorf("which of the warehouse's files are a table's cannot be told, as the catalog refuses one: %w; "+
+			"make it load, or drop it", err)
+	}
+	return nil, unavailable(fmt.Errorf("find the locations of the catalog's tables and views: %w", err))
+}
+
+func (s *Service) tableLocations(ctx context.Context) ([]string, error) {
+	idents, err := s.opts.Catalog.Tables(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var out []string
-	for _, loc := range t.Dropped {
-		if within(loc, s.opts.Warehouse) && !slices.ContainsFunc(tables, func(l loaded) bool { return canonical(l.tbl.Location()) == canonical(loc) }) {
-			out = append(out, loc)
+	for _, id := range idents {
+		tbl, err := s.opts.Catalog.LoadTable(ctx, id)
+		if errors.Is(err, icecat.ErrNoSuchTable) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", tableName(id), err)
+		}
+		out = append(out, tbl.Location())
+	}
+	return out, nil
+}
+
+// unownedFiles are the files of a sweep a request deletes, or waits for:
+// those old enough, whatever they hold, as nothing can be about to
+// reference them, and the newer ones that hold matching rows (young),
+// which may be files a staged table, being made by CREATE TABLE AS here or
+// in another engine, is about to reference; unsure are those that hold
+// matching rows and may be a table's file spelled otherwise.
+type unownedFiles struct {
+	old    []string
+	young  map[string]time.Time
+	unsure []string
+}
+
+// unownedFiles reads what it must of sw's unowned files, but those going
+// already: the newer ones and the unsure ones, by every tagged column of
+// the request's tables, by name (see anyColumns). Old ones it does not
+// read.
+func (s *Service) unownedFiles(ctx context.Context, r *Request, tables []loaded, sw *sweep, going pathSet) (*unownedFiles, error) {
+	o := sw.unowned
+	cols := anyColumns(r, tables)
+	u := &unownedFiles{old: slices.DeleteFunc(slices.Clone(o.old), going.has), young: map[string]time.Time{}}
+	young := maps.Clone(o.young)
+	maps.DeleteFunc(young, func(p string, _ time.Time) bool { return going.has(p) })
+	matched, err := s.matchingFiles(ctx, r.salt, parquet(slices.Collect(maps.Keys(young))), cols)
+	if err != nil {
+		return nil, err
+	}
+	for p := range matched {
+		u.young[p] = young[p]
+	}
+	unsure, err := s.matchingFiles(ctx, r.salt, parquet(slices.DeleteFunc(slices.Clone(o.unsure), going.has)), cols)
+	if err != nil {
+		return nil, err
+	}
+	u.unsure = slices.Sorted(maps.Keys(unsure))
+	return u, nil
+}
+
+func (u *unownedFiles) all() []string {
+	return append(append(slices.Clone(u.old), slices.Collect(maps.Keys(u.young))...), u.unsure...)
+}
+
+// leave leaves out of u the files a table the request does not erase from
+// references (refs), and those under the locations in kept, which a
+// table that cannot be read may reference.
+func (u *unownedFiles) leave(refs map[string]string, kept []string) {
+	left := func(p string) bool {
+		_, ok := refs[canonical(p)]
+		return ok || under(p, kept)
+	}
+	u.old = slices.DeleteFunc(u.old, left)
+	maps.DeleteFunc(u.young, func(p string, _ time.Time) bool { return left(p) })
+	u.unsure = slices.DeleteFunc(u.unsure, left)
+}
+
+// anyColumns are the columns to look for the identifiers in, by name, in
+// files no table of the request's references, which may be any dropped
+// table's: every tagged column of the request's tables, by every name it
+// has had, and those of its tables not loaded by the names they were
+// found by.
+func anyColumns(r *Request, tables []loaded) []scanColumn {
+	var out []scanColumn
+	for _, l := range tables {
+		for _, c := range scanColumns(fields(l.tbl, l.t), r.Subjects) {
+			c.id = 0
+			out = append(out, c)
+		}
+	}
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if !t.Remote && !slices.ContainsFunc(tables, func(l loaded) bool { return l.t == t }) {
+			out = append(out, namedColumns(t, r.Subjects)...)
 		}
 	}
 	return out
 }
 
-// droppedFiles lists the files under loc, where a table of t's name was
-// before it was dropped or replaced, that referenced leaves out.
-func (s *Service) droppedFiles(ctx context.Context, fio *fileIO, t *Table, loc string, referenced pathSet) (*orphanFiles, error) {
-	fsys, err := fio.forPath(ctx, loc)
-	if err != nil {
-		return nil, fmt.Errorf("files under %s, where %s was before it was dropped or replaced: %w", loc, t.Name, err)
-	}
-	o, err := s.orphansAt(ctx, fsys, loc, referenced, nil)
-	if err != nil {
-		return nil, fmt.Errorf("files under %s, where %s was before it was dropped or replaced: %w", loc, t.Name, err)
-	}
-	return o, nil
-}
-
-// namedColumns are t's tagged columns, by name only: the columns to look
-// for identifiers in in the files of a table of t's name dropped since,
-// whose field IDs are not known any more.
+// namedColumns are t's tagged columns, by name only, for a table of the
+// request's that is not loaded, whose field IDs are not known.
 func namedColumns(t *Table, subjects []Subject) []scanColumn {
 	var out []scanColumn
 	for _, c := range t.Columns {
@@ -1491,42 +1662,43 @@ func namedColumns(t *Table, subjects []Subject) []scanColumn {
 	return out
 }
 
-// unshared checks that no table the request does not erase from
-// references one of files, as a table that shares files with one of its
-// tables without saying so, or by columns of other names, may: deleting
-// the file would break that table, which holds the rows too.
+// othersReference reads the tables of the catalog the request does not
+// erase from that reference files in the directories of paths, as a table
+// that shares files with one of the request's without saying so, or by
+// columns of other names, or a clone of a table dropped since, and returns
+// which of paths they reference, by canonical path, and the table that
+// does. Deleting such a file would break that table, which holds the rows
+// too.
 //
 // A table it cannot read, as one with a snapshot a writer committed that
 // cannot be read, nothing reads either, but it may reference files under
-// its own location and those it says it shares: those are kept (see
-// keep), and the request goes on with the rest, so that no one's table
-// stops anyone's erasure. It returns the locations whose files it keeps.
-func (s *Service) unshared(ctx context.Context, r *Request, tables []loaded, files []File) ([]string, error) {
-	if len(files) == 0 {
-		return nil, nil
+// its own location and those it says it shares: it returns those
+// locations, whose files are kept (see keep), so that no one's table stops
+// anyone's erasure.
+func (s *Service) othersReference(ctx context.Context, r *Request, tables []loaded, paths pathSet) (refs map[string]string, keep []string, err error) {
+	refs = map[string]string{}
+	if len(paths) == 0 {
+		return refs, nil, nil
 	}
-	paths, dirs := pathSet{}, dirSet{}
-	for _, f := range files {
-		paths.add(f.Path)
-		dirs.add(f.Path)
+	dirs := dirSet{}
+	for _, p := range paths {
+		dirs.add(p)
 	}
 	others, err := s.others(ctx, r, tables)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var keep []string
 	unreadable := func(tbl *table.Table, err error) {
 		s.log.Warn("an erasure request could not read a table of the catalog, to check whether it references files the request deletes; "+
 			"it keeps the files under the table's location", "table", tableName(tbl.Identifier()), "err", err)
 		keep = append(append(keep, tbl.Location()), shares(tbl)...)
 	}
 	for _, tbl := range others {
-		name := tableName(tbl.Identifier())
 		// Only a table that references files in the directories of those
 		// the request deletes needs its manifests read.
 		od, err := s.dirsOf(ctx, tbl)
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 		if err != nil {
 			unreadable(tbl, err)
@@ -1537,7 +1709,7 @@ func (s *Service) unshared(ctx context.Context, r *Request, tables []loaded, fil
 		}
 		tf, err := readFiles(ctx, tbl)
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 		if err != nil {
 			unreadable(tbl, err)
@@ -1545,12 +1717,11 @@ func (s *Service) unshared(ctx context.Context, r *Request, tables []loaded, fil
 		}
 		for _, p := range tf.referenced() {
 			if paths.has(p) {
-				return nil, fmt.Errorf("%s references %s, a file the request deletes, but the request does not erase from %[1]s: "+
-					"tag the columns of %[1]s that hold the identifiers and make a new request for them; this one goes on once that one is done", name, base(p))
+				refs[canonical(p)] = tableName(tbl.Identifier())
 			}
 		}
 	}
-	return keep, nil
+	return refs, keep, nil
 }
 
 // keep leaves out of files those under one of the locations.
@@ -1703,7 +1874,6 @@ func (s *Service) orphans(ctx context.Context, tbl *table.Table, referenced path
 // orphansAt lists the files under loc that referenced leaves out; live
 // are the files a table at loc has live now.
 func (s *Service) orphansAt(ctx context.Context, fsys iceio.IO, loc string, referenced pathSet, live map[string]iceberg.DataFile) (*orphanFiles, error) {
-	o := &orphanFiles{young: map[string]time.Time{}}
 	listed, err := listFiles(fsys, loc)
 	if err != nil {
 		return nil, err
@@ -1723,6 +1893,14 @@ func (s *Service) orphansAt(ctx context.Context, fsys iceio.IO, loc string, refe
 			return nil, fmt.Errorf("listing %s does not show %s, which the table references, as the table spells it", loc, base(p))
 		}
 	}
+	return s.sortOrphans(listed, referenced), nil
+}
+
+// sortOrphans sorts the files listed that referenced leaves out by how
+// old they are, and those that may be a referenced file spelled otherwise
+// (see orphanFiles).
+func (s *Service) sortOrphans(listed map[string]time.Time, referenced pathSet) *orphanFiles {
+	o := &orphanFiles{young: map[string]time.Time{}}
 	names := map[string]bool{}
 	for _, p := range referenced {
 		names[path.Base(p)] = true
@@ -1739,7 +1917,7 @@ func (s *Service) orphansAt(ctx context.Context, fsys iceio.IO, loc string, refe
 			o.young[p] = mod
 		}
 	}
-	return o, nil
+	return o
 }
 
 // parquet keeps the Parquet files of paths.
@@ -1865,16 +2043,9 @@ func (s *Service) sharedCopies(ctx context.Context, r *Request, tables []loaded)
 			byDir[dir] = append(byDir[dir], p)
 		}
 	}
-	var (
-		out     []sharedCopy
-		anyCols []scanColumn
-	)
+	var out []sharedCopy
 	for _, l := range tables {
 		cols := scanColumns(fields(l.tbl, l.t), r.Subjects)
-		for _, c := range cols {
-			c.id = 0
-			anyCols = append(anyCols, c)
-		}
 		id := l.tbl.Metadata().TableUUID().String()
 		matched, err := s.matchingFiles(ctx, r.salt, byDir[id], cols)
 		if err != nil {
@@ -1885,23 +2056,20 @@ func (s *Service) sharedCopies(ctx context.Context, r *Request, tables []loaded)
 		}
 		delete(byDir, id)
 	}
-	// Tables not loaded, as those dropped, are looked for by their tagged
-	// columns' names.
+	// The copies of tables not loaded, as those dropped, are looked in by
+	// every tagged column's name.
 	var owner string
 	if len(tables) > 0 {
 		owner = tables[0].t.Name
 	}
-	for i := range r.Tables {
-		t := &r.Tables[i]
-		if !t.Remote && !slices.ContainsFunc(tables, func(l loaded) bool { return l.t == t }) {
-			anyCols = append(anyCols, namedColumns(t, r.Subjects)...)
-		}
+	for _, t := range r.Tables {
 		if owner == "" && !t.Remote {
 			owner = t.Name
 		}
 	}
+	cols := anyColumns(r, tables)
 	for _, dir := range slices.Sorted(maps.Keys(byDir)) {
-		matched, err := s.matchingFiles(ctx, r.salt, byDir[dir], anyCols)
+		matched, err := s.matchingFiles(ctx, r.salt, byDir[dir], cols)
 		if err != nil {
 			return nil, err
 		}
@@ -2037,33 +2205,38 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 			return "", &tableError{lt.t.Name, fmt.Errorf("verify %s: %w", lt.t.Name, err)}
 		}
 	}
-	// What is left under the locations of tables dropped or replaced
-	// while the request ran, which no table references, is looked in as
-	// orphan files are.
-	for i := range r.Tables {
-		t := &r.Tables[i]
-		for _, loc := range s.droppedLocations(t, tables) {
-			l.locations = append(l.locations, loc)
-			o, err := s.droppedFiles(ctx, l.io, t, loc, referenced)
-			if err != nil {
-				return "", err
-			}
-			left := append(append(slices.Collect(maps.Keys(o.young)), o.old...), o.unsure...)
-			matched, err := s.matchingFiles(ctx, r.salt, parquet(slices.DeleteFunc(left, func(p string) bool { return under(p, kept) })),
-				namedColumns(t, r.Subjects))
-			if err != nil {
-				return "", err
-			}
-			v.Orphans += int64(len(matched))
-		}
+	// The warehouse's files under no table's or view's location, as those
+	// of tables dropped, are swept (see unowned): any that purge would
+	// delete, and any that holds matching rows, is still to go.
+	sw, err := s.unowned(ctx, l.io, referenced)
+	if err != nil {
+		return "", err
 	}
+	u, err := s.unownedFiles(ctx, r, tables, sw, pathSet{})
+	if err != nil {
+		return "", err
+	}
+	check := pathSet{}
+	for _, p := range u.all() {
+		check.add(p)
+	}
+	refs, more, err := s.othersReference(ctx, r, tables, check)
+	if err != nil {
+		return "", err
+	}
+	u.leave(refs, append(slices.Clone(kept), more...))
+	v.Orphans += int64(len(u.all()))
 	for _, f := range files {
 		if f.Deleted.IsZero() {
 			continue
 		}
-		if exists, err := l.exists(f.Path); err != nil {
-			return "", err
-		} else if exists {
+		exists := sw.listed.has(f.Path)
+		if !within(f.Path, s.opts.Warehouse) {
+			if exists, err = l.exists(f.Path); err != nil {
+				return "", err
+			}
+		}
+		if exists {
 			v.Storage++
 		}
 	}

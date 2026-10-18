@@ -386,10 +386,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   closes it (`CLOSE ERASURE REQUEST`), which first deletes the sharing
   copies, redacts the history and has the replicas empty their caches,
   deletes what it recorded of tables dropped since, records what it left,
-  files included, and forgets the identifiers. A table dropped or
-  replaced while a request runs is not set aside: the request deletes the
-  files under its old location that no table references and that hold the
-  person's rows, and erases from a table that has its name now. A table
+  files included, and forgets the identifiers. Every request sweeps the
+  warehouse: the files under no table's or view's location, as those of
+  tables dropped or replaced, before the request or during it, through
+  Igloo or around it, while clones read them or not, go once three days
+  old, unread, and newer ones that hold matching rows are waited for, so
+  a request never completes while they do. A table dropped while a request
+  runs is not set aside, and one replaced is erased from under its name.
+  A table
   that cannot be read, or a snapshot whose manifest list is missing,
   stops no one's request; they keep their identifiers sealed
   under `IGLOO_ERASURE_KEY` (or `IGLOO_ERASURE_KEY_FILE`'s) only while they

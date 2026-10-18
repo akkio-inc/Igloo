@@ -130,8 +130,9 @@ engines are kept from deleting them and from reading past them:
   table's location. Drop the clones first, or drop the table without
   purging, which keeps its files, as SQL's `DROP TABLE` does then. A table
   in the warehouse whose files no clone reads is purged when it is
-  dropped, with `purgeRequested` or without, as in SQL: no one, and no
-  [erasure request](privacy.md), could reach what was left of it.
+  dropped, with `purgeRequested` or without, as in SQL; [erasure
+  requests](privacy.md#what-is-left-of-dropped-tables) delete whatever a
+  drop leaves.
 - **Credentials for a clone.** Loading a clone with vended credentials, or
   refreshing them, is refused with 403: credentials reach one table's
   location, which holds none of the files the clone reads from its source,

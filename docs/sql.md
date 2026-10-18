@@ -48,9 +48,10 @@ query that starts in the instant between drop and rename finds no table.
 The catalog records nothing that depends on a table, so `DROP TABLE ...
 CASCADE` drops just the table, like `DROP TABLE`: views that read it fail
 when they are next queried. A dropped table's files are deleted with it,
-as are those of a table `CREATE OR REPLACE TABLE` replaces (not `... CLONE`,
-which keeps them), unless [clones](#clones) read them; a dropped table
-cannot be restored.
+as are those of a table `CREATE OR REPLACE TABLE` replaces, unless
+[clones](#clones) read them; `... CLONE` keeps them. What a drop leaves,
+erasure requests delete ([privacy](privacy.md#what-is-left-of-dropped-tables)).
+A dropped table cannot be restored.
 
 ### Transactions
 

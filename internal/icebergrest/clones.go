@@ -17,8 +17,8 @@ import (
 //     drop it without purging (its files stay, as SQL's DROP TABLE leaves
 //     them then) or drop the clones first. A table in the warehouse whose
 //     files no clone reads is purged when it is dropped, whatever the
-//     client asks, as in SQL: no one could reach what is left of it to
-//     erase from it.
+//     client asks, as in SQL, so that its files do not linger; erasure
+//     requests delete whatever a drop leaves (package erasure).
 //   - Credentials reach one table's location (see Vendor), so they would
 //     not reach a clone's files under its source's. Igloo hands out none
 //     for clones, rather than credentials that cover the source too, which

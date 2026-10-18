@@ -43,7 +43,6 @@ package erasure
 import (
 	"context"
 	"errors"
-	"slices"
 	"time"
 )
 
@@ -250,22 +249,11 @@ type Table struct {
 	// Left says why the request was closed (see Service.Close) without
 	// finishing with the table.
 	Left string `json:"left,omitempty"`
-	// Location is where the table keeps its files, as last loaded.
-	Location string `json:"location,omitempty"`
-	// Dropped are the locations of tables of this name that were dropped
-	// or replaced while the request ran: their files, which no table may
-	// reference any more, can still hold the person's rows, and the
-	// request deletes those of them that no table references (see purge).
-	// Gone says the table was dropped, and none has its name now.
-	Dropped []string `json:"dropped_locations,omitempty"`
-	Gone    bool     `json:"gone,omitempty"`
-}
-
-// dropped notes that the table at location loc was dropped or replaced.
-func (t *Table) dropped(loc string) {
-	if loc != "" && !slices.Contains(t.Dropped, loc) {
-		t.Dropped = append(t.Dropped, loc)
-	}
+	// Gone says the table was dropped while the request ran, and none has
+	// its name now: the request goes on without it, and its files, under
+	// a location no table has any more, go as any such files do (see
+	// unowned).
+	Gone bool `json:"gone,omitempty"`
 }
 
 // Column is a column that holds identifiers.

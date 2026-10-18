@@ -1498,6 +1498,42 @@ else
   fail "the bucket after erasing: $got"
 fi
 
+# What a drop leaves goes too: the files of a dev clone refreshed with
+# CREATE OR REPLACE ... CLONE (A), of a table dropped while a clone read
+# it, the clone dropped after (B), and of a schema refreshed with CREATE
+# OR REPLACE SCHEMA ... CLONE (F), which the catalog keeps, under no
+# table's location. Each holds a second person's row. A request for that
+# person sweeps the warehouse: those files are recent, so they may be a
+# table's being made, and it waits until they are three days old rather
+# than complete while they hold the person.
+second="second.person@subject.example"
+data_dirs() { psql_admin -c "SELECT DISTINCT regexp_extract(file_path, '^(.*)/data/', 1) FROM iceberg_metadata(lake.$1)" | sort; }
+own_dir() { comm -23 <(data_dirs "$1") <(data_dirs "$2") | head -1; } # own_dir CLONE SOURCE
+psql_admin -c "CREATE SCHEMA left_a" -c "CREATE SCHEMA left_b" -c "CREATE SCHEMA left_f" >/dev/null
+psql_as walt walt-password-1 -c "CREATE TABLE left_a.src (id INTEGER, email VARCHAR)" -c "INSERT INTO left_a.src VALUES (1, 'ann@other.example')" \
+  -c "CREATE TABLE left_b.src (id INTEGER, email VARCHAR)" -c "INSERT INTO left_b.src VALUES (1, 'ann@other.example'), (2, '$second')" \
+  -c "CREATE TABLE left_f.t (id INTEGER, email VARCHAR)" -c "INSERT INTO left_f.t VALUES (1, 'ann@other.example')" >/dev/null
+psql_admin -c "ALTER TABLE left_a.src ALTER COLUMN email SET TAG person = 'email'" \
+  -c "ALTER TABLE left_b.src ALTER COLUMN email SET TAG person = 'email'" -c "ALTER TABLE left_f.t ALTER COLUMN email SET TAG person = 'email'" >/dev/null
+psql_as walt walt-password-1 -c "CREATE TABLE left_a.dev CLONE left_a.src" -c "INSERT INTO left_a.dev VALUES (2, '$second')" \
+  -c "CREATE SCHEMA left_f2 CLONE left_f" -c "INSERT INTO left_f2.t VALUES (2, '$second')" >/dev/null
+left_a="$(own_dir left_a.dev left_a.src)"
+left_b="$(data_dirs left_b.src | head -1)"
+left_f="$(own_dir left_f2.t left_f.t)"
+psql_as walt walt-password-1 -c "CREATE OR REPLACE TABLE left_a.dev CLONE left_a.src" \
+  -c "CREATE TABLE left_b.cl CLONE left_b.src" -c "DROP TABLE left_b.src" -c "DROP TABLE left_b.cl" \
+  -c "CREATE OR REPLACE SCHEMA left_f2 CLONE left_f" >/dev/null
+# Tags stay with dropped tables' names, and refuse requests until unset.
+psql_admin -c "ALTER TABLE left_b.src ALTER COLUMN email UNSET TAG person" -c "ALTER TABLE left_b.cl ALTER COLUMN email UNSET TAG person" >/dev/null
+second_rows="SELECT (SELECT count(*) FROM read_parquet('$left_a/data/*.parquet') WHERE email = '$second') || '|' ||
+  (SELECT count(*) FROM read_parquet('$left_b/data/*.parquet') WHERE email = '$second') || '|' ||
+  (SELECT count(*) FROM read_parquet('$left_f/data/*.parquet') WHERE email = '$second')"
+expect "what the refreshes and drops leave holds the second person" "1|1|1" igloo "$admin_password" "$second_rows"
+second_request="$(psql_as pat pat-password-1 -c "ERASE SUBJECT WHERE person.email = '$second'" | cut -d'|' -f1)"
+expect_soon "a request waits for files no table owns that hold the person, rather than complete" "waiting|purge" pat pat-password-1 \
+  "SELECT status || '|' || step FROM igloo.erasure_requests WHERE request_id = '$second_request'" 180
+expect "while it waits, those files are still there" "1|1|1" igloo "$admin_password" "$second_rows"
+
 expect_error "writers cannot set a data retention" 42501 walt walt-password-1 "ALTER TABLE crm.people SET (data_retention_days = 1)"
 expect_error "a data retention is a day at least" 42601 pat pat-password-1 "ALTER TABLE crm.people SET (data_retention_days = 0)"
 expect "a privacy officer sets one on a table with tags" "ALTER TABLE" pat pat-password-1 "ALTER TABLE crm.people SET (data_retention_days = 1)"
