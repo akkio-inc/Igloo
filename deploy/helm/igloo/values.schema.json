@@ -151,8 +151,16 @@
         },
         "password": {
           "type": "string",
-          "pattern": "^$|^[\\s\\S]{8,}$",
-          "description": "At least 8 characters, or empty to generate one."
+          "anyOf": [
+            {
+              "maxLength": 0
+            },
+            {
+              "minLength": 16
+            }
+          ],
+          "description": "At least 16 characters, and not a placeholder such as change-me or easily guessed; empty generates one.",
+          "$comment": "Lengths rather than a pattern: Helm prints the value that fails a pattern."
         }
       }
     },

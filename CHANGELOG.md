@@ -295,6 +295,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`ALTER USER ... NOLOGIN`), which ends their sessions, and given an email
   (`EMAIL`) for single sign-on.
 - Limits on failed logins: 10 per user and 50 per address in 15 minutes.
+- Igloo creates the first administrator only with an `IGLOO_ADMIN_PASSWORD`
+  of at least 16 characters (was 8) that is not a placeholder such as
+  `change-me` or easily guessed; the error says how to make one. An
+  administrator that exists already keeps starting with a weaker value,
+  with a warning that never includes it. The Helm chart refuses an
+  `admin.password` that Igloo would; to upgrade a release with a shorter
+  one, move it to `admin.existingSecret`.
 - Masking policies, row access policies and tags, after Snowflake's:
   `CREATE [OR REPLACE] MASKING POLICY`, `CREATE [OR REPLACE] ROW ACCESS
   POLICY`, `ALTER TABLE ... SET | UNSET MASKING POLICY`, `ADD | DROP ROW ACCESS

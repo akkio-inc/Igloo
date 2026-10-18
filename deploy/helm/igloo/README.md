@@ -156,7 +156,13 @@ pass for each cloud.
   restart when an existing Secret changes; run
   `kubectl -n igloo rollout restart deployment` after rotating one. The admin
   password is used only to create the admin on first start; change it later
-  with `ALTER USER`.
+  with `ALTER USER`. Igloo creates the admin only with a password of 16 or
+  more characters that is not a placeholder or easily guessed, and the chart
+  refuses any other `admin.password`. Once the admin exists, a weaker
+  password from `admin.existingSecret` only logs a warning. To upgrade a
+  release whose `admin.password` is shorter than 16 characters, move it into
+  such a Secret, or give the admin a long password with `ALTER USER` and set
+  `admin.password` to it.
 - **Memory**: unless `duckdb.memoryLimit` is set, DuckDB gets 80% of
   `resources.limits.memory`, leaving at least 512Mi for the rest of the process
   (1Gi gives DuckDB 512MiB, 8Gi gives 6553MiB), and spills larger queries to
@@ -365,7 +371,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `replicaCount` | `2` | Igloo pods (ignored with `autoscaling.enabled`; with `scaleToZero.enabled`, what the gateway starts) |
 | `admin.user` | `igloo` | `IGLOO_ADMIN_USER` |
 | `admin.existingSecret` | `""` | Secret with key `password` for `IGLOO_ADMIN_PASSWORD` |
-| `admin.password` | `""` | Inline password (8+ characters); generated and kept when both are empty |
+| `admin.password` | `""` | Inline password: 16+ characters, not a placeholder such as `change-me` or easily guessed. Generated (32 characters) and kept when both are empty |
 | `metadataDatabase.existingSecret` | `""` | Secret with key `url` for `IGLOO_METADATA_DATABASE_URL` |
 | `metadataDatabase.url` | `""` | Inline `postgresql://` URL. Empty: `catalog.database`, or the bundled PostgreSQL. |
 | `storage.warehouseLocation` | `""` | `IGLOO_WAREHOUSE_LOCATION`; defaults to `s3://<objectStorage.bucket>/warehouse` with `objectStorage.enabled` |

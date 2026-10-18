@@ -33,8 +33,10 @@ admin:
   # admin.password.
   existingSecret: ""
   # Used when existingSecret is empty. If both are empty the chart generates a
-  # password and keeps it across upgrades. Igloo uses it only to create the
-  # account on first start; change it later with ALTER USER.
+  # password (32 characters) and keeps it across upgrades. Igloo uses it only
+  # to create the account on first start, and then refuses passwords under 16
+  # characters, placeholders such as change-me and easily guessed ones; change
+  # it later with ALTER USER.
   password: ""
 
 erasure:

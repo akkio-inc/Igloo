@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Renders the chart with compute pools and checks the objects it makes,
-# and that it refuses pools that cannot work. Needs only helm; without it,
+# and that it refuses pools that cannot work, and admin passwords Igloo
+# would refuse, without printing them. Needs only helm; without it,
 # run it through a container:
 #
-#   HELM='docker run --rm -v $PWD:/w -w /w alpine/helm:4.3.0' deploy/helm/template-test.sh
+#   HELM="docker run --rm -v $PWD/deploy/helm:/w -w /w alpine/helm:4.3.0" deploy/helm/template-test.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -79,6 +80,34 @@ for invalid in "pools[0].name=default" "pools[0].name=Acme" "pools[0].name=a,poo
     pass "refuses $invalid"
   else
     fail "refuses $invalid with a message about pools: $out"
+  fi
+done
+
+echo "the admin password"
+# A generated password is long enough for Igloo to create the account with.
+generated=$(render "${bundled[@]}" | sed -n 's/^  admin-password: //p' | base64 -d | wc -c | tr -d ' ')
+check "the chart generates 32 characters" "32" "$generated"
+if render "${bundled[@]}" --set admin.password=Kq7vT2mXz9LpR4wN >/dev/null 2>&1; then
+  pass "accepts 16 characters"
+else
+  fail "accepts 16 characters"
+fi
+# 15 characters fail the schema, the rest the chart's own check; neither
+# error may print the password.
+for invalid in Kq7vT2mXz9LpR4w change-me please-change-me-0123456789 Change_Me_Now_0123456789 \
+  qqqqqqqqqqqqqqqqqqqq "admin.user=warehouse_administrator,admin.password=warehouse_administrator"; do
+  case "$invalid" in
+    *=*) set_args=(--set "$invalid") password=${invalid##*=} ;;
+    *) set_args=(--set "admin.password=$invalid") password=$invalid ;;
+  esac
+  if out=$(render "${bundled[@]}" "${set_args[@]}" 2>&1); then
+    fail "refuses admin password $invalid"
+  elif grep -qF -- "$password" <<<"$out"; then
+    fail "refuses admin password $invalid without printing it: $out"
+  elif grep -q 'admin' <<<"$out"; then
+    pass "refuses admin password $invalid"
+  else
+    fail "refuses admin password $invalid with a message about it: $out"
   fi
 done
 

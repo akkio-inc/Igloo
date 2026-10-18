@@ -402,6 +402,16 @@ Outputs YAML comments describing what is missing in that case.
 {{- fail (printf "%ssso.issuer is set, so sso.clientId must be set too: the client ID Igloo is registered under at the identity provider" $prefix) -}}
 {{- end -}}
 
+{{- /* Igloo's own check (config.CheckAdminPassword) less the length, which
+the schema enforces. The message never includes the password. */ -}}
+{{- with $v.admin.password -}}
+{{- $word := lower (trim .) -}}
+{{- $guessable := list "password" "admin" "igloo" "secret" "default" (lower $v.admin.user) -}}
+{{- if or (contains "changeme" (regexReplaceAll `[^\p{L}\p{N}]` $word "")) (has $word $guessable) (eq (len (uniq (splitList "" .))) 1) -}}
+{{- fail (printf "%sadmin.password is a placeholder or easily guessed, and Igloo will not create the admin account with it. Leave it empty for the chart to generate one, or set a long random value, e.g. from `openssl rand -base64 24`" $prefix) -}}
+{{- end -}}
+{{- end -}}
+
 {{- if and $v.workers.enabled (lt (int $v.workers.maxReplicas) 1) -}}
 {{- fail (printf "%sworkers.maxReplicas must be at least 1 with workers.enabled" $prefix) -}}
 {{- end -}}
