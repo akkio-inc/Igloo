@@ -18,9 +18,9 @@ type Client struct {
 	// uri and warehouse are for the calls iceberg-go does not make (see
 	// register.go).
 	uri, warehouse string
-	// sizes caches the bytes of snapshots' data files, by manifest list
-	// (see dataBytes).
-	sizes sizeCache
+	// totals caches the bytes and rows of snapshots' data files, by
+	// manifest list (see manifestTotals).
+	totals totalsCache
 }
 
 // Open connects to the catalog Igloo serves.

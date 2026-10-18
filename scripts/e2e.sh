@@ -167,6 +167,10 @@ DELETE 1
   UPDATE e2e_copy SET amount = amount * 2 WHERE id = 2;
   DELETE FROM e2e_copy WHERE id = 1;
   SELECT * FROM e2e_copy;"
+# DuckDB updated and deleted with position deletes: the old rows stay in
+# the files, deleted, and the catalog does not count them.
+expect_soon "the catalog counts rows without deleted ones" "1" igloo "$admin_password" \
+  "SELECT row_count FROM igloo.tables WHERE table_schema = 'public' AND table_name = 'e2e_copy'"
 
 echo "users and roles"
 expect "create users" "CREATE ROLE
@@ -1314,6 +1318,8 @@ psql_as walt walt-password-1 -c "INSERT INTO e2e_sales VALUES (12, 'late', 1)" >
 expect "keeps its rows until refreshed" "7" rita rita-password-1 "SELECT orders FROM e2e_sales_totals"
 expect "REFRESH MATERIALIZED VIEW" "REFRESH MATERIALIZED VIEW" walt walt-password-1 "REFRESH MATERIALIZED VIEW e2e_sales_totals"
 expect "which replaces them" "8|44.50" rita rita-password-1 "SELECT orders, total FROM e2e_sales_totals"
+expect_soon "and the catalog counts its rows once" "1" igloo "$admin_password" \
+  "SELECT row_count FROM igloo.tables WHERE table_schema = 'public' AND table_name = 'e2e_sales_totals'"
 psql_admin -c "GRANT SELECT ON TABLE e2e_sales_totals TO nora" >/dev/null
 expect "reading it needs SELECT on it" "8" nora nora-password-1 "SELECT orders FROM e2e_sales_totals"
 expect_error "not on what it reads" 42501 nora nora-password-1 "SELECT count(*) FROM e2e_sales"

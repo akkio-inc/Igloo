@@ -530,7 +530,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - `COMMENT ON SCHEMA`, stored as the Iceberg namespace's `comment` property.
 - `igloo.schemata`, `igloo.tables` and `igloo.columns`: owners, comments,
   columns, rows, bytes, files, snapshots and when the data last changed,
-  read from the Iceberg metadata. `information_schema.tables` gains
+  read from the Iceberg metadata. Rows leave out those that updates,
+  deletes and materialized view refreshes deleted; they are unknown while a
+  table has equality deletes. `information_schema.tables` gains
   `table_owner`, `comment`, `row_count`, `bytes` and `last_altered`, as in
   Snowflake. `igloo.tables` and `igloo.columns` also list external tables,
   with their provider, and connections' tables, the latter to admins and

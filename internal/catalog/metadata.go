@@ -50,7 +50,8 @@ type TableMeta struct {
 	// Snapshots counts a table's snapshots, which time travel can read.
 	Snapshots int
 	// Rows, Bytes and Files describe a table's current snapshot, from its
-	// summary; -1 when it does not say.
+	// summary or else its manifests; -1 when they do not say. Rows are the
+	// rows a query reads: deleted rows are not counted (see liveRows).
 	Rows, Bytes, Files int64
 }
 
@@ -232,66 +233,124 @@ func (c *Client) TableMetadata(ctx context.Context, schema, name string, isView 
 	t.Snapshots = len(tbl.Metadata().Snapshots())
 	if snap := tbl.CurrentSnapshot(); snap != nil {
 		t.LastModified = time.UnixMilli(snap.TimestampMs)
+		var summary iceberg.Properties
 		if snap.Summary != nil {
-			t.Rows = summaryCount(snap.Summary.Properties["total-records"])
-			t.Bytes = summaryCount(snap.Summary.Properties["total-files-size"])
-			t.Files = summaryCount(snap.Summary.Properties["total-data-files"])
+			summary = snap.Summary.Properties
 		}
-		if t.Bytes < 0 {
-			t.Bytes = c.dataBytes(ctx, tbl, snap)
+		t.Rows = liveRows(summary)
+		t.Bytes = summaryCount(summary["total-files-size"])
+		t.Files = summaryCount(summary["total-data-files"])
+		if t.Bytes < 0 || t.Rows < 0 && summaryCount(summary["total-equality-deletes"]) <= 0 {
+			totals := c.manifestTotals(ctx, tbl, snap)
+			if t.Bytes < 0 {
+				t.Bytes = totals.bytes
+			}
+			if t.Rows < 0 {
+				t.Rows = totals.rows
+			}
 		}
 	}
 	return t, nil
 }
 
-// maxSizes bounds the snapshots whose sizes a Client keeps.
-const maxSizes = 100_000
-
-// sizeCache keeps what dataBytes worked out.
-type sizeCache struct {
-	mu    sync.Mutex
-	bytes map[string]int64
+// liveRows is how many rows a snapshot's summary says its table has: the
+// records of its data files less the rows its position deletes delete.
+// UPDATE, DELETE and MERGE that do not rewrite files (merge-on-read, which
+// DuckDB always does) add position deletes and leave the deleted rows in
+// total-records: a materialized view refresh, which deletes every row and
+// inserts the new ones, doubles it. -1 when the summary cannot say: when
+// it has delete files but does not count both kinds of deletes, as
+// DuckDB's do not count equality deletes (manifestTotals counts those
+// tables' rows), or when the table has equality deletes, whose rows only
+// a scan can count.
+//
+// Position deletes of a data file that a rewrite removed, which some
+// engines leave behind, are still subtracted until maintenance removes
+// them.
+func liveRows(summary iceberg.Properties) int64 {
+	records := summaryCount(summary["total-records"])
+	if records < 0 {
+		return -1
+	}
+	if summaryCount(summary["total-delete-files"]) == 0 {
+		return records
+	}
+	positions := summaryCount(summary["total-position-deletes"])
+	if positions < 0 || summaryCount(summary["total-equality-deletes"]) != 0 {
+		return -1
+	}
+	return max(records-positions, 0)
 }
 
-// dataBytes adds up the sizes of the data files of a table's snapshot
-// from its manifests, for snapshots whose summary does not say, as
-// DuckDB's do not; -1 when they cannot be read. The result is kept by
-// the snapshot's manifest list, which no other snapshot shares, so each
-// snapshot's manifests are read once.
-func (c *Client) dataBytes(ctx context.Context, tbl *table.Table, snap *table.Snapshot) int64 {
-	c.sizes.mu.Lock()
-	n, ok := c.sizes.bytes[snap.ManifestList]
-	c.sizes.mu.Unlock()
+// maxTotals bounds the snapshots whose totals a Client keeps.
+const maxTotals = 100_000
+
+// totalsCache keeps what manifestTotals worked out.
+type totalsCache struct {
+	mu     sync.Mutex
+	totals map[string]snapshotTotals
+}
+
+// snapshotTotals are the bytes of a snapshot's data files, and the rows
+// they hold less those its position deletes delete; -1 for what is not
+// known.
+type snapshotTotals struct {
+	bytes, rows int64
+}
+
+// manifestTotals works out a table's snapshot's totals from its
+// manifests, for snapshots whose summary does not say: DuckDB's give no
+// sizes, and other engines' may not count deletes. Rows are -1 when the
+// snapshot has equality deletes (see liveRows), and both are -1 when the
+// manifests cannot be read. The result is kept by the snapshot's manifest
+// list, which no other snapshot shares, so each snapshot's manifests are
+// read once.
+func (c *Client) manifestTotals(ctx context.Context, tbl *table.Table, snap *table.Snapshot) snapshotTotals {
+	c.totals.mu.Lock()
+	out, ok := c.totals.totals[snap.ManifestList]
+	c.totals.mu.Unlock()
 	if ok {
-		return n
+		return out
 	}
+	unknown := snapshotTotals{bytes: -1, rows: -1}
 	fs, err := tbl.FS(ctx)
 	if err != nil {
-		return -1
+		return unknown
 	}
 	manifests, err := snap.Manifests(fs)
 	if err != nil {
-		return -1
+		return unknown
 	}
+	equalityDeletes := false
 	for _, m := range manifests {
-		if m.ManifestContent() != iceberg.ManifestContentData {
-			continue
-		}
 		entries, err := m.FetchEntries(fs, true)
 		if err != nil {
-			return -1
+			return unknown
 		}
 		for _, e := range entries {
-			n += e.DataFile().FileSizeBytes()
+			f := e.DataFile()
+			switch f.ContentType() {
+			case iceberg.EntryContentData:
+				out.bytes += f.FileSizeBytes()
+				out.rows += f.Count()
+			case iceberg.EntryContentPosDeletes:
+				out.rows -= f.Count()
+			case iceberg.EntryContentEqDeletes:
+				equalityDeletes = true
+			}
 		}
 	}
-	c.sizes.mu.Lock()
-	defer c.sizes.mu.Unlock()
-	if c.sizes.bytes == nil || len(c.sizes.bytes) >= maxSizes {
-		c.sizes.bytes = map[string]int64{}
+	out.rows = max(out.rows, 0)
+	if equalityDeletes {
+		out.rows = -1
 	}
-	c.sizes.bytes[snap.ManifestList] = n
-	return n
+	c.totals.mu.Lock()
+	defer c.totals.mu.Unlock()
+	if c.totals.totals == nil || len(c.totals.totals) >= maxTotals {
+		c.totals.totals = map[string]snapshotTotals{}
+	}
+	c.totals.totals[snap.ManifestList] = out
+	return out
 }
 
 func describeView(t *TableMeta, v *view.View) {

@@ -258,6 +258,38 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case len(p) == 5 && p[0] == "namespaces" && p[2] == "tables" && p[4] == "metrics":
 		w.WriteHeader(http.StatusNoContent)
+	case len(p) == 2 && p[0] == "tables" && p[1] == "rename" && r.Method == http.MethodPost:
+		var req struct {
+			Source      identifier `json:"source"`
+			Destination identifier `json:"destination"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			apiError(w, http.StatusBadRequest, "BadRequestException", err.Error())
+			return
+		}
+		if c.replay(key) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		from, to := tableKey(req.Source.Namespace, req.Source.Name), tableKey(req.Destination.Namespace, req.Destination.Name)
+		t := c.tables[from]
+		switch {
+		case t == nil:
+			apiError(w, http.StatusNotFound, "NoSuchTableException", "no such table")
+			return
+		case c.tables[to] != nil:
+			apiError(w, http.StatusConflict, "AlreadyExistsException", "table exists")
+			return
+		}
+		if _, ok := c.namespaces[strings.Join(req.Destination.Namespace, "\x1f")]; !ok {
+			apiError(w, http.StatusNotFound, "NoSuchNamespaceException", "no such namespace")
+			return
+		}
+		delete(c.tables, from)
+		t.ns, t.name = req.Destination.Namespace, req.Destination.Name
+		c.tables[to] = t
+		c.remember(key)
+		w.WriteHeader(http.StatusNoContent)
 	case len(p) == 2 && p[0] == "transactions" && p[1] == "commit" && r.Method == http.MethodPost:
 		var req struct {
 			TableChanges []tableChange `json:"table-changes"`

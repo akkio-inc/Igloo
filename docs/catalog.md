@@ -112,7 +112,11 @@ Owners show in `igloo.tables` (`table_owner`, `owner_type`),
 metadata: `row_count`, `bytes` and `file_count` of its current snapshot,
 `snapshot_count`, the snapshots that time travel can read, and
 `last_altered`, when its data last changed. They cover tables other engines
-write too. Each replica reads every table's metadata when a query first
+write too. `row_count` is the rows a query reads: rows that updates,
+deletes and materialized view refreshes deleted are not counted, though
+they stay in the table's files until maintenance rewrites them. While a
+table has equality deletes, which some engines such as Flink write,
+`row_count` is `NULL`: which rows those delete, only a query can count. Each replica reads every table's metadata when a query first
 needs it, then again in the background every 30 seconds while queries use
 it; tables written on the replica are read again a couple of seconds after
 the write.
@@ -296,7 +300,7 @@ them. Like lineage, events need the query history on.
 | `table_owner`, `owner_type` | Its owner and whether that is a `user` or `role`; `NULL` without one |
 | `comment` | Its description |
 | `provider` | For an external table, the Delta Sharing provider it reads |
-| `row_count`, `bytes`, `file_count` | Of its current snapshot, for tables |
+| `row_count`, `bytes`, `file_count` | Of its current snapshot, for tables: the rows a query reads, without deleted rows (`NULL` while it has equality deletes), and its data files and their size |
 | `snapshot_count` | Snapshots time travel can read, for tables |
 | `last_altered` | When its data last changed, or a view was last replaced |
 
