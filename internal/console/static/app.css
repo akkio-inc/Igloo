@@ -826,8 +826,20 @@ td .statement { display: block; max-width: 520px; white-space: pre-wrap; word-br
 .catalog-body { padding: 14px 24px 0; }
 .catalog-stats .stat .value { font-size: 18px; }
 .badge-list { display: flex; flex-wrap: wrap; gap: 4px; }
-.lineage-wrap { overflow: auto; padding: 8px; }
-svg.lineage { display: block; }
+.lineage-block { display: flex; flex-direction: column; gap: 6px; }
+.lineage-card { position: relative; overflow: hidden; }
+.lineage-card::before, .lineage-card::after {
+  content: ""; position: absolute; top: 0; bottom: 0; width: 40px; z-index: 1;
+  pointer-events: none; opacity: 0; transition: opacity .15s;
+}
+.lineage-card::before { left: 0; background: linear-gradient(to right, var(--surface), transparent); }
+.lineage-card::after { right: 0; background: linear-gradient(to left, var(--surface), transparent); }
+.lineage-card.more-left::before, .lineage-card.more-right::after { opacity: 1; }
+.lineage-wrap { overflow-x: auto; overflow-y: hidden; padding: 8px; }
+svg.lineage { display: block; margin: 0 auto; }
+.lineage-hint { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 12.5px; }
+.lineage-hint .icon svg { transform: rotate(-90deg); }
+.lineage-node text.lineage-schema { fill: var(--text-muted); font-size: 11px; }
 .lineage-edge { fill: none; stroke: var(--border-strong); stroke-width: 1.5; }
 .lineage-arrow { fill: var(--border-strong); }
 .lineage-node rect { fill: var(--surface-2); stroke: var(--border-strong); }

@@ -56,6 +56,155 @@ function titleOf(type, catalog, schema, name) {
   return type === 'FOREIGN' ? `${catalog}.${schema}.${name}` : `${schema}.${name}`;
 }
 
+// The lineage graph's geometry: node height, gaps between columns and
+// between nodes, padding, the width of a character of a node's name
+// (12.5px monospace), and the smallest the drawing shrinks to fit before
+// it scrolls instead.
+const NODE_H = 44;
+const GAP_X = 56;
+const GAP_Y = 18;
+const PAD = 14;
+const CHAR_W = 7.6;
+const LINEAGE_MIN_SCALE = 0.75;
+
+// lineageLayout places the lineage graph g (see internal/console/catalog.go)
+// in columns: upstream tables left of the table, downstream ones right of
+// it. A node's column is its longest path to or from the table, not the
+// shortest, which the server's depths are, so every edge points right: a
+// table that feeds another table as far from the table as itself, as
+// raw.campaigns feeds media.advertisers when both feed media.campaigns,
+// sits a column left of it, not in its column. Edges between neighbouring
+// columns are curves; one that skips columns runs along a lane clear of
+// the boxes it passes; one that points back, as a cycle in the lineage
+// does, loops round the same way. In each column, nodes are ordered by
+// where their neighbours nearer the table are, so edges cross less.
+function lineageLayout(g) {
+  const byId = new Map(g.nodes.map((n) => [n.id, n]));
+  const root = byId.get(g.nodes.find((n) => n.depth === 0)?.id) || g.nodes[0];
+  const edges = g.edges.filter((e) => e.from !== e.to && byId.has(e.from) && byId.has(e.to));
+  const succ = new Map();
+  const pred = new Map();
+  for (const e of edges) {
+    if (!succ.has(e.from)) succ.set(e.from, []);
+    succ.get(e.from).push(e.to);
+    if (!pred.has(e.to)) pred.set(e.to, []);
+    pred.get(e.to).push(e.from);
+  }
+
+  // longest is the longest path from id to the table along next, over
+  // nodes on side (-1 upstream, 1 downstream); a cycle ends a path.
+  const memo = new Map();
+  const visiting = new Set();
+  const longest = (id, next, side) => {
+    if (id === root.id) return 0;
+    if (memo.has(id)) return memo.get(id);
+    if (visiting.has(id)) return -Infinity;
+    visiting.add(id);
+    let best = -Infinity;
+    for (const m of next.get(id) || []) {
+      if (m === root.id || Math.sign(byId.get(m).depth) === side) best = Math.max(best, longest(m, next, side) + 1);
+    }
+    visiting.delete(id);
+    if (best === -Infinity) best = Math.abs(byId.get(id).depth);
+    memo.set(id, best);
+    return best;
+  };
+  const nodes = g.nodes.map((n, index) => ({
+    ...n, index,
+    col: n.depth < 0 ? -longest(n.id, succ, -1) : n.depth > 0 ? longest(n.id, pred, 1) : 0,
+  }));
+  const pos = new Map(nodes.map((n) => [n.id, n]));
+
+  // Boxes are as wide as the longest name needs, within limits.
+  const chars = Math.max(...nodes.map((n) => {
+    if (n.kind === 'table' && n.name) return Math.max(n.name.length, (n.label.length - n.name.length - 1) * 0.88);
+    return n.kind === 'hidden' ? n.label.length * 0.8 : Math.min(n.label.length, 30);
+  }));
+  const W = Math.round(Math.min(260, Math.max(150, chars * CHAR_W + 26)));
+  const maxChars = Math.floor((W - 26) / CHAR_W);
+  const clip = (s) => (s.length > maxChars ? `${s.slice(0, maxChars - 1)}…` : s);
+
+  const columns = new Map();
+  for (const n of nodes) {
+    if (!columns.has(n.col)) columns.set(n.col, []);
+    columns.get(n.col).push(n);
+  }
+  const minCol = Math.min(...columns.keys());
+  const maxCol = Math.max(...columns.keys());
+  const tallest = Math.max(...[...columns.values()].map((c) => c.length));
+  const height = tallest * (NODE_H + GAP_Y) - GAP_Y + 2 * PAD;
+  // Edges that point back loop out past their columns' boxes.
+  const loops = edges.some((e) => pos.get(e.to).col <= pos.get(e.from).col);
+  const padX = loops ? GAP_X / 2 + 4 : PAD;
+  const width = (maxCol - minCol + 1) * (W + GAP_X) - GAP_X + 2 * padX;
+  const place = (col) => {
+    const list = columns.get(col) || [];
+    const offset = (tallest - list.length) * (NODE_H + GAP_Y) / 2;
+    list.forEach((n, i) => {
+      n.x = padX + (col - minCol) * (W + GAP_X);
+      n.y = PAD + offset + i * (NODE_H + GAP_Y);
+    });
+  };
+  const order = (col, nearer) => {
+    const key = (n) => {
+      const ys = (nearer.get(n.id) || []).map((id) => pos.get(id)).filter((m) => m.y !== undefined).map((m) => m.y);
+      return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Infinity;
+    };
+    const keyed = (columns.get(col) || []).map((n) => [key(n), n]);
+    keyed.sort((a, b) => (a[0] === b[0] ? 0 : a[0] < b[0] ? -1 : 1) || a[1].index - b[1].index);
+    columns.set(col, keyed.map((k) => k[1]));
+  };
+  place(0);
+  for (let c = -1; c >= minCol; c--) {
+    order(c, succ);
+    place(c);
+  }
+  for (let c = 1; c <= maxCol; c++) {
+    order(c, pred);
+    place(c);
+  }
+
+  // laneFor finds the height nearest ideal at which a line crosses the
+  // columns cols without touching a box.
+  const laneFor = (cols, ideal) => {
+    const boxes = cols.flatMap((c) => columns.get(c) || []);
+    const clear = (y) => boxes.every((n) => y < n.y - 3 || y > n.y + NODE_H + 3);
+    let best = null;
+    for (const y of [ideal, PAD / 2, height - PAD / 2, ...boxes.flatMap((n) => [n.y - GAP_Y / 2, n.y + NODE_H + GAP_Y / 2])]) {
+      if (y >= PAD / 2 && y <= height - PAD / 2 && clear(y) && (best === null || Math.abs(y - ideal) < Math.abs(best - ideal))) best = y;
+    }
+    return best ?? PAD / 2;
+  };
+  const g2 = GAP_X / 2;
+  const routed = edges.map((e) => {
+    const a = pos.get(e.from);
+    const b = pos.get(e.to);
+    const x1 = a.x + W;
+    const y1 = a.y + NODE_H / 2;
+    const x2 = b.x;
+    const y2 = b.y + NODE_H / 2;
+    let d;
+    if (b.col === a.col + 1) {
+      const mid = (x1 + x2) / 2;
+      d = `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2 - 6},${y2}`;
+    } else if (b.col > a.col) {
+      const cols = [];
+      for (let c = a.col + 1; c < b.col; c++) cols.push(c);
+      const lane = laneFor(cols, (y1 + y2) / 2);
+      d = `M${x1},${y1} C${x1 + g2},${y1} ${x1 + g2},${lane} ${x1 + GAP_X},${lane} L${x2 - GAP_X},${lane} `
+        + `C${x2 - g2},${lane} ${x2 - g2},${y2} ${x2 - 6},${y2}`;
+    } else {
+      const cols = [];
+      for (let c = b.col; c <= a.col; c++) cols.push(c);
+      const lane = laneFor(cols, Math.max(y1, y2) + NODE_H);
+      d = `M${x1},${y1} C${x1 + g2},${y1} ${x1 + g2},${lane} ${x1},${lane} L${x2},${lane} `
+        + `C${x2 - g2},${lane} ${x2 - g2},${y2} ${x2 - 6},${y2}`;
+    }
+    return { ...e, d };
+  });
+  return { nodes, edges: routed, W, H: NODE_H, width, height, root: pos.get(root.id), clip };
+}
+
 function errorView(e) {
   return h('div', { class: 'sql-error', role: 'alert' },
     h('div', { class: 'head' }, h('span', { text: 'Error' }), e.code ? h('span', { class: 'badge code error', text: e.code }) : null),
@@ -292,60 +441,74 @@ export function createCatalog(app) {
   }
 
   // lineageView draws the lineage around a table: upstream to the left,
-  // downstream to the right, one column per step.
+  // downstream to the right (see lineageLayout). The drawing shrinks to fit
+  // the page down to LINEAGE_MIN_SCALE; below that it scrolls sideways,
+  // starting at the table, with its edges faded and a hint that there is
+  // more.
   function lineageView(g) {
     if (!g || g.nodes.length <= 1) {
       return h('div', { class: 'empty' }, h('h2', { text: 'No lineage recorded' }),
         h('p', { text: 'Lineage comes from the query history: statements that read tables or files and wrote this table, or read this table and wrote another, in the history\'s retention.' }));
     }
-    const W = 210; const H = 38; const GAPX = 70; const GAPY = 16; const PAD = 12;
-    const depths = g.nodes.map((n) => n.depth);
-    const min = Math.min(...depths); const max = Math.max(...depths);
-    const columns = new Map();
-    for (const n of g.nodes) {
-      if (!columns.has(n.depth)) columns.set(n.depth, []);
-      columns.get(n.depth).push(n);
-    }
-    const tallest = Math.max(...[...columns.values()].map((c) => c.length));
-    const width = (max - min + 1) * (W + GAPX) - GAPX + 2 * PAD;
-    const height = tallest * (H + GAPY) - GAPY + 2 * PAD;
-    const pos = new Map();
-    for (const [depth, nodes] of columns) {
-      const offset = (tallest - nodes.length) * (H + GAPY) / 2;
-      nodes.forEach((n, i) => pos.set(n.id, { x: PAD + (depth - min) * (W + GAPX), y: PAD + offset + i * (H + GAPY) }));
-    }
-    const edges = g.edges.map((e) => {
-      const a = pos.get(e.from); const b = pos.get(e.to);
-      if (!a || !b) return null;
-      const x1 = a.x + W; const y1 = a.y + H / 2; const x2 = b.x; const y2 = b.y + H / 2; const mid = (x1 + x2) / 2;
+    const L = lineageLayout(g);
+    const edges = L.edges.map((e) => {
       const tip = [e.statements ? plural(Number(e.statements), 'statement') : '', e.last_seen ? `last ${fmtTime(e.last_seen)}` : '',
         e.job ? `by ${e.job}` : ''].filter(Boolean).join(', ');
-      return svg('path', { class: 'lineage-edge', d: `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2 - 6},${y2}`, 'marker-end': 'url(#lineage-arrow)' },
-        tip ? svg('title', { text: tip }) : null);
+      return svg('path', { class: 'lineage-edge', d: e.d, 'marker-end': 'url(#lineage-arrow)' }, tip ? svg('title', { text: tip }) : null);
     });
-    const label = (s) => (s.length > 28 ? `${s.slice(0, 27)}…` : s);
-    const nodes = g.nodes.map((n) => {
-      const p = pos.get(n.id);
+    const nodes = L.nodes.map((n) => {
       const link = n.kind === 'table' && n.depth !== 0;
       const open = () => { location.hash = hashFor(n.catalog, n.schema, n.name); };
+      // A table shows its schema small above its name; a location or a
+      // count of hidden tables, one line.
+      const lines = n.kind === 'table' && n.name
+        ? [svg('text', { class: 'lineage-schema', x: 12, y: 17, text: L.clip(n.label.slice(0, -n.name.length - 1)) }),
+          svg('text', { x: 12, y: 34, text: L.clip(n.name) })]
+        : [svg('text', { x: 12, y: L.H / 2 + 4, text: n.kind === 'hidden' ? n.label : L.clip(n.label) })];
       return svg('g', {
         class: `lineage-node ${n.kind}${n.depth === 0 ? ' root' : ''}${link ? ' link' : ''}`,
-        transform: `translate(${p.x},${p.y})`,
+        transform: `translate(${n.x},${n.y})`,
         tabindex: link ? 0 : null, role: link ? 'link' : null, 'aria-label': n.label,
         onclick: link ? open : null,
         onkeydown: link ? (e) => { if (e.key === 'Enter') open(); } : null,
       },
       svg('title', { text: n.kind === 'location' ? `Files loaded from ${n.label}` : n.label }),
-      svg('rect', { width: W, height: H, rx: 8 }),
-      svg('text', { x: 12, y: H / 2 + 4, text: label(n.label) }));
+      svg('rect', { width: L.W, height: L.H, rx: 8 }),
+      lines);
     });
-    const drawing = svg('svg', { class: 'lineage', width, height, viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': 'Lineage' },
+    const drawing = svg('svg', { class: 'lineage', width: L.width, height: L.height, viewBox: `0 0 ${L.width} ${L.height}`, role: 'img', 'aria-label': 'Lineage' },
       svg('defs', {}, svg('marker', { id: 'lineage-arrow', viewBox: '0 0 10 10', refX: 4, refY: 5, markerWidth: 8, markerHeight: 8, orient: 'auto-start-reverse' },
         svg('path', { class: 'lineage-arrow', d: 'M0,0 L10,5 L0,10 z' }))),
       edges, nodes);
+    const wrap = h('div', { class: 'lineage-wrap' }, drawing);
+    const card = h('div', { class: 'card lineage-card' }, wrap);
+    const hint = h('p', { class: 'lineage-hint muted', hidden: true }, icon('chevron'), 'Scroll sideways for the rest of the graph');
+    let centered = false;
+    const edgesShown = () => {
+      card.classList.toggle('more-left', wrap.scrollLeft > 2);
+      card.classList.toggle('more-right', wrap.scrollLeft + wrap.clientWidth < wrap.scrollWidth - 2);
+    };
+    const fit = () => {
+      if (!wrap.isConnected) return;
+      const style = getComputedStyle(wrap);
+      const room = wrap.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const scale = Math.max(LINEAGE_MIN_SCALE, Math.min(1, room / L.width));
+      drawing.setAttribute('width', String(Math.round(L.width * scale)));
+      drawing.setAttribute('height', String(Math.round(L.height * scale)));
+      const scrolls = L.width * scale > room + 1;
+      hint.hidden = !scrolls;
+      if (scrolls && !centered) {
+        // Start at the table, not at the far end of its upstream.
+        centered = true;
+        wrap.scrollLeft = Math.max(0, (L.root.x + L.W / 2) * scale - wrap.clientWidth / 2);
+      }
+      edgesShown();
+    };
+    wrap.addEventListener('scroll', edgesShown, { passive: true });
+    new ResizeObserver(fit).observe(wrap);
     return h('div', { class: 'stack' },
       h('p', { class: 'muted', text: 'Where this table\'s data came from (left) and what was made from it (right), from the query history. Tables you may not see are counted, not named. Select a table to open it.' }),
-      h('div', { class: 'card lineage-wrap' }, drawing));
+      h('div', { class: 'lineage-block' }, card, hint));
   }
 
   // route shows what the address asks for: a table's page, or the search.
