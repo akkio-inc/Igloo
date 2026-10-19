@@ -34,10 +34,16 @@
 	   less, its bottom least. Hairline rules between things sit in between. */
 	--edge-top: rgb(190 210 235 / 0.38);
 	--edge-side: rgb(200 214 232 / 0.3);
+	--edge-right: var(--edge-side);
+	--glow-blue: 110 150 210;
+	--glow-warm: 210 150 80;
+	--glow-k: 1;
 	--edge-bottom: rgb(200 214 232 / 0.21);
 	--rule: rgb(220 228 240 / 0.13);
 	--rule-strong: rgb(205 218 235 / 0.19);
-	--surface-sheen: radial-gradient(100% 180px at 50% 0%, rgb(143 190 250 / 0.045), transparent);
+	--rule-faint: rgb(205 218 235 / 0.04);
+	--code-bar-line: #22303e;
+	--surface-sheen: radial-gradient(100% 220px at 50% 0%, rgb(190 210 235 / 0.06), transparent);
 	--line: rgb(255 255 255 / 0.22);
 	--shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 24px 48px -24px rgb(0 0 0 / 0.6);
 	--glow-ice: rgb(54 110 180 / 0.1);
@@ -63,8 +69,8 @@
 	--sl-color-accent: #4f9fe6;
 	--sl-color-accent-high: #a9d6fd;
 	--sl-color-text: var(--text);
-	--sl-text-code: 0.84rem;
-	--sl-line-height: 1.85;
+	--sl-text-code: 0.875rem;
+	--sl-line-height: 1.8;
 	--__sl-font: var(--font);
 	--__sl-font-mono: var(--font-mono);
 
@@ -94,9 +100,15 @@
 	--border-strong: rgb(13 20 38 / 0.16);
 	--edge-top: rgb(13 20 38 / 0.11);
 	--edge-side: rgb(13 20 38 / 0.1);
+	--edge-right: var(--edge-side);
+	--glow-blue: 79 159 230;
+	--glow-warm: 245 180 74;
+	--glow-k: 0.6;
 	--edge-bottom: rgb(13 20 38 / 0.15);
 	--rule: rgb(13 20 38 / 0.09);
 	--rule-strong: rgb(13 20 38 / 0.12);
+	--rule-faint: rgb(13 20 38 / 0.03);
+	--code-bar-line: rgb(13 20 38 / 0.12);
 	--surface-sheen: linear-gradient(transparent, transparent);
 	--line: rgb(13 20 38 / 0.24);
 	--shadow: 0 1px 2px rgb(13 20 38 / 0.04), 0 24px 48px -28px rgb(13 20 38 / 0.18);
@@ -233,13 +245,13 @@ h3 {
 	position: relative;
 	background: var(--surface-sheen), var(--surface);
 	border: 1px solid;
-	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
+	border-color: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-side);
 	border-radius: var(--radius);
 }
 /* The same edges for anything else that is boxed. */
 .lit-edge {
 	border: 1px solid;
-	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
+	border-color: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-side);
 }
 
 /* Rails: hairlines along the top and down both sides of a section, just
@@ -250,12 +262,15 @@ h3 {
 	z-index: -1;
 	inset: 0;
 	pointer-events: none;
-	border-top: 1px solid var(--rule-strong);
+	background: linear-gradient(90deg, var(--rule-faint) 0%, var(--rule-strong) 45%) top / 100% 1px no-repeat;
 }
 @media (min-width: 1360px) {
 	.railed::after {
 		inset: 0 calc(50% - var(--container) / 2 - 50px);
-		border-inline: 1px solid var(--rule);
+		background:
+			linear-gradient(90deg, var(--rule-faint) 0%, var(--rule-strong) 45%) top / 100% 1px no-repeat,
+			linear-gradient(to bottom, var(--rule), var(--rail-end, var(--rule))) left / 1px 100% no-repeat,
+			linear-gradient(to bottom, var(--rule), var(--rail-end, var(--rule))) right / 1px 100% no-repeat;
 	}
 }
 
@@ -314,22 +329,19 @@ h3 {
 	isolation: isolate;
 	padding-block: 112px;
 }
-.section::before {
+/* Each section sets --section-glow: soft light from its top edge, placed
+   where its design has it. The mask fades it in over the first 28px, so it
+   is transparent at the boundary and no edge shows between sections. */
+.section::before,
+.top-glow::before {
 	content: '';
 	position: absolute;
 	z-index: -1;
 	inset: 0;
 	pointer-events: none;
-	/* Centred far enough below the section's top that they have faded out
-	   before reaching it, so no edge shows between sections. */
-	background:
-		radial-gradient(760px 360px at 12% 260px, var(--glow-ice), transparent 70%),
-		radial-gradient(560px 320px at 92% 560px, var(--glow-amber), transparent 70%);
-}
-.section-alt::before {
-	background:
-		radial-gradient(760px 360px at 88% 260px, var(--glow-ice), transparent 70%),
-		radial-gradient(560px 320px at 6% 600px, var(--glow-amber), transparent 70%);
+	background: var(--section-glow, none);
+	-webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
+	mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
 }
 .section-head {
 	max-width: 960px;
@@ -354,7 +366,6 @@ h3 {
 	height: 6px;
 	border-radius: 50%;
 	background: var(--amber-fill-2);
-	box-shadow: 0 0 8px rgb(245 180 74 / 0.7);
 }
 /* Large, tight headings with a soft sheen. */
 .headline {
@@ -437,15 +448,17 @@ h3 {
 	--ec-brdCol: var(--edge-side);
 }
 .expressive-code .frame pre {
-	--ec-codeBg: rgb(0 0 0 / 0.3);
+	--ec-codeBg: #0e1822;
 	/* Code blocks' edges measure +7..+14 in the concepts: dimmer than a card's. */
 	border-color: var(--rule-strong) var(--rule) var(--rule) !important;
 }
 .expressive-code .frame.is-terminal pre {
-	border-top-color: var(--rule) !important;
+	border-top-color: var(--code-bar-line) !important;
 }
 .expressive-code .frame.is-terminal .header {
-	--ec-frm-trmTtbBg: rgb(255 255 255 / 0.03);
+	--ec-frm-trmTtbBg: #080c11;
+	--ec-frm-trmTtbDotsFg: #2c3c4e;
+	--ec-frm-trmTtbDotsOpa: 1;
 	border-color: var(--rule-strong) var(--rule) var(--rule) !important;
 }
 :root[data-theme='light'] .expressive-code .frame pre {

@@ -42,7 +42,7 @@ const pillars = [
 ] as const;
 ---
 
-<section class="pillars" aria-labelledby="pillars-title">
+<section class="pillars top-glow" aria-labelledby="pillars-title">
 	<div class="container">
 		<h2 id="pillars-title" class="sr-only">Why Igloo</h2>
 		<div class="grid">
@@ -65,6 +65,8 @@ const pillars = [
 	/* Six cells ruled by hairlines between them, with no boxes around. */
 	.pillars {
 		position: relative;
+		isolation: isolate;
+		--section-glow: radial-gradient(234px 175px at calc(50% - 600px) 0, rgb(var(--glow-blue) / calc(0.1 * var(--glow-k))), transparent 70%);
 		padding: 59px 0 25px;
 	}
 	.grid {

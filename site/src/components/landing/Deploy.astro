@@ -56,6 +56,24 @@ const targets = [
 <style>
 	.section.railed {
 		padding-top: 87px;
+		--rail-end: transparent;
+		--section-glow:
+			radial-gradient(760px 360px at 88% 260px, var(--glow-ice), transparent 70%),
+			radial-gradient(560px 320px at 6% 600px, var(--glow-amber), transparent 70%);
+	}
+	.container {
+		position: relative;
+	}
+	@media (min-width: 1360px) {
+		.container::before {
+			content: '';
+			position: absolute;
+			top: -28px;
+			left: 555px;
+			width: 479px;
+			border-top: 1px solid transparent;
+			border-image: linear-gradient(90deg, transparent, var(--rule) 25%, var(--rule) 75%, transparent) 1;
+		}
 	}
 	.targets {
 		display: grid;
@@ -71,6 +89,14 @@ const targets = [
 		transition:
 			background-color 0.2s ease,
 			border-color 0.2s ease;
+	}
+	.target {
+		--edge-right: rgb(200 214 232 / 0.16);
+		--edge-bottom: rgb(200 214 232 / 0.1);
+	}
+	:global(:root[data-theme='light']) .target {
+		--edge-right: rgb(13 20 38 / 0.1);
+		--edge-bottom: rgb(13 20 38 / 0.15);
 	}
 	.target:hover {
 		background: var(--surface-sheen), var(--surface-hover);

@@ -31,9 +31,9 @@ import Icon from './Icon.astro';
 		z-index: -1;
 		inset: 0;
 		pointer-events: none;
-		background:
-			radial-gradient(640px 320px at 10% 240px, var(--glow-amber), transparent 70%),
-			radial-gradient(900px 400px at 78% 300px, var(--glow-ice), transparent 70%);
+		background: radial-gradient(229px 172px at calc(50% - 482px) 0, rgb(var(--glow-warm) / calc(0.12 * var(--glow-k))), transparent 70%);
+		-webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
+		mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
 	}
 	.panel {
 		max-width: 900px;

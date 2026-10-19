@@ -336,6 +336,7 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 	}
 	section.section {
 		padding-top: 101px;
+		/* --section-glow: radial-gradient(351px 260px at calc(50% - 204px) 0, rgb(var(--glow-blue) / calc(0.16 * var(--glow-k))), transparent 70%); */
 	}
 	.section .section-head {
 		margin-bottom: 34px;
@@ -568,7 +569,7 @@ ALTER TABLE marts.impressions SET (data_retention_days = 30);`,
 		gap: 2px;
 		padding: 4px;
 		border: 1px solid;
-		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
+		border-color: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-side);
 		border-radius: 999px;
 		background: var(--surface);
 	}

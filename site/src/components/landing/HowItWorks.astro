@@ -44,7 +44,7 @@ const backends = [
 							<div class="node client">{client.title}</div>
 							<div class="edge">
 								<span class="chip">
-									<Icon name={client.icon} size={20} />
+									<Icon name={client.icon} size={24} />
 									<span>
 										<strong>{client.via}</strong>
 										{client.detail}
@@ -67,7 +67,7 @@ const backends = [
 						<div class="cell">
 							<div class="edge">
 								<span class="chip">
-									<Icon name={backend.viaIcon} size={18} />
+									<Icon name={backend.viaIcon} size={20} />
 									<span>
 										<strong>{backend.via}</strong>
 									</span>
@@ -95,6 +95,9 @@ const backends = [
 <style>
 	section.section {
 		padding: 71px 0 63px;
+		--section-glow:
+			radial-gradient(760px 360px at 12% 260px, var(--glow-ice), transparent 70%),
+			radial-gradient(560px 320px at 92% 560px, var(--glow-amber), transparent 70%);
 	}
 	.diagram {
 		margin: 0 3px;
@@ -113,7 +116,7 @@ const backends = [
 	}
 	.node {
 		border: 1px solid;
-		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
+		border-color: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-side);
 		border-radius: 10px;
 		background: var(--bg-raised);
 		color: var(--heading);
@@ -162,8 +165,8 @@ const backends = [
 		position: relative;
 		display: inline-flex;
 		align-items: center;
-		gap: 14px;
-		padding: 8px 18px 8px 14px;
+		gap: 20px;
+		padding: 9px 19px 9px 18px;
 		border-radius: 10px;
 		background: var(--bg-raised);
 		border: 1px solid;
