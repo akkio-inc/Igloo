@@ -123,21 +123,6 @@
   overflow: visible;
   filter: drop-shadow(0 0 18px rgb(150 100 40 / 0.18));
 }
-.vx-benchmark .vx-bm-face {
-  fill: var(--surface);
-  stroke: currentColor;
-  stroke-width: 1;
-  stroke-linejoin: round;
-}
-.vx-benchmark .vx-bm-face--top {
-  fill: #1b1a1a;
-  stroke: rgb(244 245 248 / 0.4);
-}
-.vx-benchmark .vx-bm-core {
-  fill: rgb(249 187 45 / 0.1);
-  stroke: rgb(249 187 45 / 0.6);
-  stroke-width: 0.75;
-}
 
 .vx-benchmark .vx-bm-stats {
   display: grid;
@@ -220,14 +205,41 @@
   }
 }
 
-/* data plates: one per 10 GB, cool-toned so they read apart from the machine and its amber cores */
-.vx-benchmark .vx-bm-data {
-  fill: rgb(139 204 246 / 0.05);
-  stroke: rgb(139 204 246 / 0.42);
+/* machine: rack units (one per 16 cores) in amber; data: disk platters (one per 10 GB) in ice blue */
+.vx-benchmark .vx-bm-unit {
+  fill: #141210;
+  stroke: rgb(249 187 45 / 0.38);
   stroke-width: 0.9;
   stroke-linejoin: round;
 }
-.vx-benchmark .vx-bm-data--top {
-  fill: rgb(139 204 246 / 0.12);
-  stroke: rgb(185 226 255 / 0.7);
+.vx-benchmark .vx-bm-unit--front {
+  fill: #1a1610;
+  stroke: rgb(249 187 45 / 0.7);
+}
+.vx-benchmark .vx-bm-unit--top {
+  fill: #1f1a12;
+  stroke: rgb(255 214 130 / 0.6);
+}
+.vx-benchmark .vx-bm-vent {
+  stroke: rgb(249 187 45 / 0.35);
+  stroke-width: 0.8;
+  stroke-linecap: round;
+}
+.vx-benchmark .vx-bm-led {
+  fill: var(--amber);
+  filter: drop-shadow(0 0 2px rgb(249 187 45 / 0.9));
+}
+.vx-benchmark .vx-bm-disk {
+  fill: #0d141b;
+  stroke: rgb(139 204 246 / 0.55);
+  stroke-width: 0.8;
+}
+.vx-benchmark .vx-bm-disk--top {
+  fill: #101b25;
+  stroke: rgb(185 226 255 / 0.8);
+}
+.vx-benchmark .vx-bm-hub {
+  fill: rgb(185 226 255 / 0.18);
+  stroke: rgb(185 226 255 / 0.55);
+  stroke-width: 0.6;
 }
