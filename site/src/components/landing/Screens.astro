@@ -156,9 +156,17 @@ const picture = {
 </script>
 
 <style>
+	section.section {
+		padding-bottom: 56px;
+	}
 	igloo-screens {
 		position: relative;
 		display: block;
+	}
+	@media (min-width: 1360px) {
+		.window {
+			margin-inline: 25px;
+		}
 	}
 	/* A faint glow under the product shot. */
 	igloo-screens::before {
@@ -176,7 +184,7 @@ const picture = {
 	.tab-row {
 		display: flex;
 		align-items: center;
-		margin-bottom: 28px;
+		margin-bottom: 24.5px;
 	}
 	.tab-row::after {
 		content: '';
@@ -232,7 +240,7 @@ const picture = {
 	/* The product shot in a quiet window frame. */
 	.window {
 		overflow: hidden;
-		padding: 0 10px 10px;
+		padding: 0 17px 17px;
 		border: 1px solid;
 		border-color: var(--edge-top) var(--window-side, var(--edge-side)) var(--edge-bottom);
 		border-radius: 16px;
@@ -247,7 +255,7 @@ const picture = {
 	.window-bar {
 		display: flex;
 		gap: 8px;
-		padding: 14px 8px;
+		padding: 16px 1px 15px;
 	}
 	.window-bar span {
 		width: 11px;

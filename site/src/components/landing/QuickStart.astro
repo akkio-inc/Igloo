@@ -32,13 +32,20 @@ import Icon from './Icon.astro';
 </section>
 
 <style>
-	.section {
-		padding-bottom: 72px;
+	.section.railed {
+		padding-top: 126px;
+		padding-bottom: 69px;
+	}
+	.section.railed::after {
+		top: 72px;
+	}
+	.intro {
+		margin-top: 24px;
 	}
 	.layout {
 		display: grid;
-		grid-template-columns: minmax(0, 382fr) minmax(0, 762fr);
-		gap: 56px;
+		grid-template-columns: minmax(0, 400fr) minmax(0, 765fr);
+		gap: 51px;
 		align-items: start;
 	}
 	.intro {
@@ -46,9 +53,9 @@ import Icon from './Icon.astro';
 		top: calc(var(--header-h) + 32px);
 	}
 	.steps {
-		padding: 36px;
+		padding: 32px 29px 44px;
 		border-radius: 16px;
-		font-size: 1.0625rem;
+		font-size: 1.0375rem;
 		line-height: 1.65;
 	}
 	.intro > p {
@@ -83,6 +90,13 @@ import Icon from './Icon.astro';
 		}
 		.intro {
 			position: static;
+			margin-top: 0;
+		}
+		.section.railed {
+			padding-top: 88px;
+		}
+		.section.railed::after {
+			top: 0;
 		}
 		.steps {
 			padding: 20px 16px;

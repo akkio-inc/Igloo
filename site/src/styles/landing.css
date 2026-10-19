@@ -33,10 +33,10 @@
 	/* Linear's lit edges: a surface's top edge catches the light, its sides
 	   less, its bottom least. Hairline rules between things sit in between. */
 	--edge-top: rgb(190 210 235 / 0.38);
-	--edge-side: rgb(200 214 232 / 0.23);
-	--edge-bottom: rgb(200 214 232 / 0.16);
-	--rule: rgb(220 228 240 / 0.11);
-	--rule-strong: rgb(205 218 235 / 0.17);
+	--edge-side: rgb(200 214 232 / 0.3);
+	--edge-bottom: rgb(200 214 232 / 0.21);
+	--rule: rgb(220 228 240 / 0.13);
+	--rule-strong: rgb(205 218 235 / 0.19);
 	--surface-sheen: radial-gradient(100% 180px at 50% 0%, rgb(143 190 250 / 0.045), transparent);
 	--line: rgb(255 255 255 / 0.22);
 	--shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 24px 48px -24px rgb(0 0 0 / 0.6);
@@ -63,12 +63,12 @@
 	--sl-color-accent: #4f9fe6;
 	--sl-color-accent-high: #a9d6fd;
 	--sl-color-text: var(--text);
-	--sl-text-code: 0.8125rem;
-	--sl-line-height: 1.7;
+	--sl-text-code: 0.84rem;
+	--sl-line-height: 1.85;
 	--__sl-font: var(--font);
 	--__sl-font-mono: var(--font-mono);
 
-	--container: 1200px;
+	--container: 1216px;
 	--gutter: 24px;
 	--radius: 14px;
 	--header-h: 64px;
@@ -254,7 +254,7 @@ h3 {
 }
 @media (min-width: 1360px) {
 	.railed::after {
-		inset: 0 calc(50% - var(--container) / 2 - 57px);
+		inset: 0 calc(50% - var(--container) / 2 - 50px);
 		border-inline: 1px solid var(--rule);
 	}
 }
@@ -266,7 +266,7 @@ h3 {
 	justify-content: center;
 	gap: 10px;
 	height: 48px;
-	padding: 0 24px;
+	padding: 0 28px;
 	border-radius: 999px;
 	font-weight: 600;
 	font-size: 1rem;
@@ -333,7 +333,7 @@ h3 {
 }
 .section-head {
 	max-width: 960px;
-	margin-bottom: 56px;
+	margin-bottom: 34px;
 }
 .eyebrow {
 	display: inline-flex;
@@ -361,7 +361,7 @@ h3 {
 	font-size: clamp(2.25rem, 1rem + 4vw, 4.75rem);
 	font-weight: 600;
 	letter-spacing: -0.04em;
-	line-height: 1.04;
+	line-height: 0.98;
 	background: var(--heading-sheen);
 	-webkit-background-clip: text;
 	background-clip: text;
@@ -369,10 +369,10 @@ h3 {
 	padding-bottom: 0.08em;
 }
 .section-head p {
-	margin: 20px 0 0;
+	margin: 10px 0 0;
 	max-width: 46em;
-	font-size: clamp(1.0625rem, 0.95rem + 0.35vw, 1.25rem);
-	line-height: 1.55;
+	font-size: clamp(1.0625rem, 0.9rem + 0.5vw, 1.35rem);
+	line-height: 1.42;
 	color: var(--muted);
 }
 .more-link {
@@ -428,6 +428,7 @@ h3 {
 	border: 1px solid var(--edge-side);
 	color: var(--heading);
 	font-size: 0.85em;
+	line-height: 1;
 	overflow-wrap: anywhere;
 }
 
@@ -437,14 +438,15 @@ h3 {
 }
 .expressive-code .frame pre {
 	--ec-codeBg: rgb(0 0 0 / 0.3);
-	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom) !important;
+	/* Code blocks' edges measure +7..+14 in the concepts: dimmer than a card's. */
+	border-color: var(--rule-strong) var(--rule) var(--rule) !important;
 }
 .expressive-code .frame.is-terminal pre {
 	border-top-color: var(--rule) !important;
 }
 .expressive-code .frame.is-terminal .header {
 	--ec-frm-trmTtbBg: rgb(255 255 255 / 0.03);
-	border-color: var(--edge-top) var(--edge-side) var(--rule) !important;
+	border-color: var(--rule-strong) var(--rule) var(--rule) !important;
 }
 :root[data-theme='light'] .expressive-code .frame pre {
 	--ec-codeBg: #f6f7f9;

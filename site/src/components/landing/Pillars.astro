@@ -65,7 +65,7 @@ const pillars = [
 	/* Six cells ruled by hairlines between them, with no boxes around. */
 	.pillars {
 		position: relative;
-		padding: 72px 0 40px;
+		padding: 59px 0 25px;
 	}
 	.grid {
 		display: grid;
@@ -73,7 +73,7 @@ const pillars = [
 	}
 	.pillar {
 		display: block;
-		padding: 40px 40px 48px;
+		padding: 28px 36px 21px;
 		color: inherit;
 		text-decoration: none;
 		transition: background-color 0.2s ease;
@@ -89,12 +89,13 @@ const pillars = [
 	}
 	.pillar:nth-child(n + 4) {
 		border-top: 1px solid var(--rule);
+		padding-top: 31px;
 	}
 	.icon-box {
-		width: 56px;
-		height: 56px;
+		width: 58px;
+		height: 58px;
 		border-radius: 12px;
-		margin-bottom: 32px;
+		margin-bottom: 22px;
 	}
 	h3 {
 		font-size: 1.375rem;
@@ -103,10 +104,10 @@ const pillars = [
 		transition: color 0.15s ease;
 	}
 	p {
-		margin: 12px 0 0;
+		margin: 10px 0 0;
 		color: var(--muted);
 		font-size: 1.0625rem;
-		line-height: 1.65;
+		line-height: 1.51;
 	}
 	p :global(code) {
 		color: var(--heading);
@@ -115,7 +116,7 @@ const pillars = [
 	   text lines up with the headings below. */
 	@media (min-width: 1360px) {
 		.grid {
-			margin-inline: -40px;
+			margin-inline: -33px;
 		}
 	}
 	@media (max-width: 959px) {

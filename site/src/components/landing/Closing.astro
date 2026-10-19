@@ -23,7 +23,7 @@ import Icon from './Icon.astro';
 	.closing {
 		position: relative;
 		isolation: isolate;
-		padding: 136px 0 96px;
+		padding: 129px 0 83px;
 	}
 	.closing::before {
 		content: '';
@@ -42,11 +42,12 @@ import Icon from './Icon.astro';
 	   class weight). */
 	.panel h2 {
 		font-size: clamp(2.25rem, 1.1rem + 3.2vw, 4rem);
+		line-height: 0.94;
 	}
 	p {
-		margin: 24px 0 0;
-		max-width: 40em;
-		font-size: clamp(1.0625rem, 0.95rem + 0.35vw, 1.25rem);
+		margin: 10px 0 0;
+		max-width: 660px;
+		font-size: clamp(1.0625rem, 0.95rem + 0.3vw, 1.1875rem);
 		line-height: 1.55;
 		color: var(--muted);
 	}
@@ -54,7 +55,7 @@ import Icon from './Icon.astro';
 		display: flex;
 		flex-wrap: wrap;
 		gap: 14px;
-		margin-top: 40px;
+		margin-top: 31px;
 	}
 	@media (max-width: 720px) {
 		.closing {

@@ -93,15 +93,18 @@ const backends = [
 </section>
 
 <style>
+	section.section {
+		padding: 71px 0 63px;
+	}
 	.diagram {
-		margin: 0;
-		padding: 36px;
+		margin: 0 3px;
+		padding: 32px 35px 36px;
 		border-radius: 16px;
 	}
 	.row {
 		display: grid;
 		grid-template-columns: repeat(3, minmax(0, 1fr));
-		gap: 20px;
+		gap: 16px;
 	}
 	.cell {
 		display: flex;
@@ -120,7 +123,7 @@ const backends = [
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		min-height: 96px;
+		min-height: 87px;
 		padding: 16px 20px;
 		font-size: 1.0625rem;
 		font-weight: 550;
@@ -131,7 +134,10 @@ const backends = [
 		position: relative;
 		display: flex;
 		justify-content: center;
-		padding: 20px 0;
+		padding: 24.5px 0;
+	}
+	.row:last-child .edge {
+		padding: 27px 0;
 	}
 	/* A thin vertical line ending in an arrowhead, its label on a chip
 	   over the line. */
@@ -161,7 +167,7 @@ const backends = [
 		border-radius: 10px;
 		background: var(--bg-raised);
 		border: 1px solid;
-		border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
+		border-color: var(--rule-strong) var(--edge-side) var(--edge-bottom);
 		font-size: 0.875rem;
 		line-height: 1.4;
 		color: var(--muted);
@@ -180,7 +186,7 @@ const backends = [
 		flex-direction: column;
 		align-items: center;
 		gap: 6px;
-		padding: 22px 24px;
+		padding: 18px 24px;
 		text-align: center;
 		border-color: color-mix(in srgb, var(--amber-fill-2) 75%, transparent);
 		box-shadow:
@@ -203,7 +209,7 @@ const backends = [
 		display: flex;
 		align-items: center;
 		gap: 20px;
-		padding: 20px 24px;
+		padding: 15.5px 24px;
 	}
 	.backend :global(.backend-icon) {
 		flex: none;
@@ -234,9 +240,9 @@ const backends = [
 
 	.description {
 		max-width: 1112px;
-		margin-top: 48px;
-		font-size: 1.125rem;
-		line-height: 1.65;
+		margin-top: 44px;
+		font-size: 1.2rem;
+		line-height: 1.47;
 	}
 	.description :global(ul) {
 		display: grid;
@@ -249,7 +255,7 @@ const backends = [
 		margin-top: 0;
 	}
 	.description > :global(p) {
-		max-width: 64em;
+		max-width: 1000px;
 		color: var(--muted);
 	}
 
