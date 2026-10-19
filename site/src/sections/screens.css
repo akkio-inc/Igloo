@@ -260,3 +260,9 @@
 		transition: none;
 	}
 }
+
+/* section edges: fade */
+.vx-screens .vx-screens__glow {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}

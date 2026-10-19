@@ -243,3 +243,20 @@
   stroke: rgb(185 226 255 / 0.55);
   stroke-width: 0.6;
 }
+
+/* section edges: fade */
+.vx-benchmark {
+  position: relative;
+  isolation: isolate;
+  background: var(--bg);
+}
+.vx-benchmark::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(180deg, var(--bg), #06080b);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}

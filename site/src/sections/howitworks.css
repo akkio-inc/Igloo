@@ -237,3 +237,20 @@
 	.vx-howitworks .vx-howitworks__desc li:nth-child(3) { order: 2; }
 	.vx-howitworks .vx-howitworks__desc li:nth-child(4) { order: 4; }
 }
+
+/* section edges: fade */
+.vx-howitworks {
+  position: relative;
+  isolation: isolate;
+  background: var(--bg);
+}
+.vx-howitworks::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(ellipse 80% 300px at 50% 0, rgba(40, 46, 58, 0.25), transparent 70%), var(--bg);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}

@@ -246,3 +246,24 @@
 		transition: none;
 	}
 }
+
+/* section edges: fade */
+.vx-closing {
+  position: relative;
+  isolation: isolate;
+  background: var(--bg);
+}
+.vx-closing::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: #0a0d12;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}
+.vx-closing__glow {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}

@@ -392,3 +392,24 @@
 		transition: none;
 	}
 }
+
+/* section edges: fade */
+.vx-hero {
+  position: relative;
+  isolation: isolate;
+  background: var(--bg);
+}
+.vx-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--vx-ink);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}
+.vx-hero::before {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}

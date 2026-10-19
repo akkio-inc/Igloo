@@ -302,3 +302,22 @@
 @media (prefers-reduced-motion: no-preference) {
 	.vx-features .vx-features__tab { transition: color 0.15s ease; }
 }
+
+/* section edges: fade */
+.vx-features {
+  position: relative;
+  isolation: isolate;
+  background: var(--bg);
+}
+.vx-features::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(ellipse 70% 360px at 50% -80px, rgba(60, 80, 110, 0.22), transparent 70%),
+		radial-gradient(ellipse 30% 220px at 72% 360px, var(--glow-blue), transparent 70%) no-repeat,
+		var(--bg);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
+}
