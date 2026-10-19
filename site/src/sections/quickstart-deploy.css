@@ -1,0 +1,483 @@
+/* Quick start + deploy, Linear style. Tokens come from base-linear.css; every rule sits under .vx-quickstart or .vx-deploy. */
+.vx-quickstart,
+.vx-deploy {
+  --vx-rail: clamp(10px, 3.9vw, 56px);
+  --vx-inset: calc(var(--vx-rail) + clamp(10px, 1.8vw, 26px));
+  --vx-code: #0b111a;
+  --vx-code-bar: #070a10;
+  --vx-code-line: #1e2a38;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+.vx-quickstart .vx-qs-bg,
+.vx-deploy .vx-dp-bg {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+/* a warm glow on the left rail, a cool one at the panel's top right */
+.vx-quickstart .vx-qs-bg {
+  background:
+    radial-gradient(ellipse 520px 160px at 30% 0, rgb(40 80 140 / 0.18), transparent 75%),
+    radial-gradient(ellipse 300px 260px at calc(50% + min(50%, 720px)) 10%, rgb(40 80 140 / 0.2), transparent 70%);
+}
+.vx-deploy .vx-dp-bg {
+  background:
+    radial-gradient(ellipse 560px 180px at 40% 0, rgb(40 80 140 / 0.16), transparent 75%);
+}
+.vx-quickstart .vx-qs-frame,
+.vx-deploy .vx-dp-frame {
+  position: relative;
+  max-width: 1440px;
+  margin-inline: auto;
+}
+
+/* ---------------------------------------------------------------- frame: rules and rails */
+.vx-quickstart .vx-qs-deco,
+.vx-deploy .vx-dp-deco {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.vx-quickstart .vx-qs-deco > *,
+.vx-deploy .vx-dp-deco > * {
+  position: absolute;
+}
+.vx-quickstart .vx-qs-rule,
+.vx-deploy .vx-dp-rule {
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--line);
+}
+.vx-quickstart .vx-qs-rule--t {
+  top: var(--vx-top-rule);
+}
+.vx-quickstart .vx-qs-rule--p {
+  top: var(--vx-panel-top);
+  background: linear-gradient(90deg, transparent, var(--line) 20%, var(--line) 80%, transparent);
+}
+.vx-deploy .vx-dp-rule--t {
+  top: var(--vx-top-rule);
+}
+.vx-quickstart .vx-qs-rail,
+.vx-deploy .vx-dp-rail {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+.vx-quickstart .vx-qs-rail--l,
+.vx-deploy .vx-dp-rail--l {
+  left: var(--vx-rail);
+}
+.vx-quickstart .vx-qs-rail--r,
+.vx-deploy .vx-dp-rail--r {
+  right: var(--vx-rail);
+}
+
+/* ================================================================ quick start */
+.vx-quickstart {
+  --vx-top-rule: clamp(40px, 5vw, 71px);
+  --vx-panel-top: clamp(64px, 7.8vw, 112px);
+}
+.vx-quickstart .vx-qs-layout {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 35fr) minmax(0, 65fr);
+  gap: clamp(28px, 3vw, 40px);
+  align-items: start;
+  padding: var(--vx-panel-top) var(--vx-inset) clamp(48px, 5vw, 72px);
+}
+.vx-quickstart .vx-qs-intro {
+  position: sticky;
+  top: 24px;
+  padding-top: clamp(32px, 5.5vw, 80px);
+}
+.vx-quickstart .vx-qs-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.vx-quickstart .vx-qs-eyebrow,
+.vx-deploy .vx-dp-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 13px 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.vx-quickstart .vx-qs-led,
+.vx-deploy .vx-dp-led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 8px rgb(249 187 45 / 0.7);
+}
+.vx-quickstart .vx-qs-title,
+.vx-deploy .vx-dp-title {
+  font-size: clamp(2.5rem, 1.1rem + 3.9vw, 4.5rem);
+  font-weight: 600;
+  line-height: 1.04;
+  letter-spacing: -0.045em;
+}
+.vx-quickstart .vx-qs-title,
+.vx-deploy .vx-dp-title {
+  margin-top: clamp(16px, 1.8vw, 24px);
+}
+.vx-quickstart .vx-qs-lead,
+.vx-deploy .vx-dp-lead {
+  font-size: clamp(1.0625rem, 0.95rem + 0.45vw, 1.3125rem);
+  line-height: 1.5;
+  color: var(--text-2);
+  text-wrap: pretty;
+}
+.vx-quickstart .vx-qs-lead {
+  margin-top: clamp(14px, 1.6vw, 22px);
+  max-width: 26em;
+}
+
+/* ---------------------------------------------------------------- code blocks: frame, title bar with window dots, glow */
+.vx-quickstart .vx-qs-code {
+  position: relative;
+  border-radius: var(--radius-sm);
+  background: var(--vx-code);
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.4), 0 10px 30px -16px rgb(40 80 140 / 0.35);
+}
+.vx-quickstart .vx-qs-code::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, #2c3a4a 0%, var(--vx-code-line) 40%, var(--line) 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.vx-quickstart .vx-qs-bar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding-left: 18px;
+  border-bottom: 1px solid var(--vx-code-line);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  background: var(--vx-code-bar);
+}
+.vx-quickstart .vx-qs-bar i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2a3442;
+}
+.vx-quickstart .vx-qs-bar i:nth-child(3) {
+  background: #1c232d;
+}
+.vx-quickstart .vx-qs-code pre {
+  margin: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--vx-code-line) transparent;
+  padding: 14px 18px;
+  font-family: var(--font-mono);
+  font-size: clamp(0.8125rem, 0.76rem + 0.15vw, 0.875rem);
+  line-height: 1.75;
+  color: #b4cbe0;
+  tab-size: 4;
+}
+.vx-quickstart .vx-qs-code pre:focus-visible {
+  outline-offset: -2px;
+}
+.vx-quickstart .vx-qs-code code {
+  font: inherit;
+}
+.vx-quickstart .vx-qs-cmd { color: #6fb6f2; }
+.vx-quickstart .vx-qs-arg { color: #e6c27f; }
+.vx-quickstart .vx-qs-cm { color: #6b8599; }
+.vx-quickstart .vx-qs-br { color: #3e93e6; }
+.vx-quickstart .vx-qs-kw { color: #bf8fe6; }
+.vx-quickstart .vx-qs-fn { color: #e2cb80; }
+.vx-quickstart .vx-qs-str { color: #e3bd79; }
+.vx-quickstart .vx-qs-num { color: #bd88dd; }
+.vx-quickstart .vx-qs-pu { color: #9cb2c1; }
+/* the clone command beside the heading: brighter frame and dots */
+.vx-quickstart .vx-qs-code--intro {
+  margin-top: clamp(24px, 2.6vw, 36px);
+}
+.vx-quickstart .vx-qs-code--intro::after {
+  background: linear-gradient(180deg, #3a4a5c 0%, var(--vx-code-line) 50%, var(--line) 100%);
+}
+.vx-quickstart .vx-qs-code--intro pre {
+  padding-block: 18px;
+}
+/* copy buttons: quiet until the block is hovered or focused, always shown on touch screens */
+.vx-quickstart .vx-qs-copy {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: 0;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+}
+.vx-quickstart .vx-qs-copy svg {
+  width: 17px;
+  height: 17px;
+}
+.vx-quickstart .vx-qs-code:hover .vx-qs-copy,
+.vx-quickstart .vx-qs-copy:focus-visible,
+.vx-quickstart .vx-qs-copy[data-copied] {
+  opacity: 1;
+}
+.vx-quickstart .vx-qs-copy:hover {
+  color: var(--text);
+}
+.vx-quickstart .vx-qs-copy[data-copied] {
+  color: #8fe3b0;
+}
+@media (hover: none) {
+  .vx-quickstart .vx-qs-copy {
+    opacity: 0.75;
+  }
+}
+
+/* ---------------------------------------------------------------- next links */
+.vx-quickstart .vx-qs-next {
+  display: grid;
+  gap: 6px;
+  margin-top: clamp(24px, 2.6vw, 34px);
+  list-style: none;
+}
+.vx-quickstart .vx-qs-next a {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 44px;
+  font-size: clamp(1.0625rem, 0.98rem + 0.3vw, 1.25rem);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  color: var(--accent-2);
+  text-decoration: none;
+}
+.vx-quickstart .vx-qs-next a:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.vx-quickstart .vx-qs-nicon {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  color: var(--accent-2);
+}
+
+/* ---------------------------------------------------------------- steps panel: lit outer frame, a second outline inside */
+.vx-quickstart .vx-qs-panel {
+  position: relative;
+  border-radius: var(--radius);
+  background:
+    radial-gradient(ellipse 60% 30% at 70% 0, rgb(40 80 140 / 0.12), transparent 75%),
+    linear-gradient(180deg, var(--surface-2), var(--surface) 40%);
+  box-shadow: 0 30px 60px -36px rgb(0 0 0 / 0.9);
+}
+.vx-quickstart .vx-qs-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.vx-quickstart .vx-qs-panel::before {
+  background:
+    linear-gradient(180deg, #3a4654 0%, var(--line-strong) 30%, var(--line) 100%);
+}
+.vx-quickstart .vx-qs-steps {
+  position: relative;
+  padding: clamp(20px, 2.2vw, 34px) clamp(16px, 2.2vw, 32px);
+  border-radius: inherit;
+  font-size: clamp(1rem, 0.94rem + 0.25vw, 1.125rem);
+  line-height: 1.65;
+  color: var(--text);
+}
+
+.vx-quickstart .vx-qs-steps > * + * {
+  margin-top: 20px;
+}
+.vx-quickstart .vx-qs-chip {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+/* inline links grow their hit area without changing the line */
+.vx-quickstart .vx-qs-inl {
+  display: inline-block;
+  padding: 10px 0;
+  margin: -10px 0;
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* ================================================================ deploy */
+.vx-deploy {
+  --vx-top-rule: clamp(28px, 4vw, 60px);
+}
+.vx-deploy .vx-dp-inner {
+  position: relative;
+  padding: calc(var(--vx-top-rule) + clamp(40px, 4.4vw, 64px)) var(--vx-inset) clamp(64px, 7vw, 104px);
+}
+.vx-deploy .vx-dp-lead {
+  max-width: 42em;
+  margin-top: clamp(14px, 1.4vw, 20px);
+}
+.vx-deploy .vx-dp-cards {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: clamp(14px, 1.4vw, 20px);
+  margin-top: clamp(28px, 2.8vw, 36px);
+  list-style: none;
+}
+.vx-deploy .vx-dp-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: clamp(20px, 2vw, 28px) clamp(18px, 1.6vw, 24px) clamp(12px, 1.2vw, 18px);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+}
+.vx-deploy .vx-dp-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, #343b45 0%, var(--line-strong) 40%, var(--line) 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.vx-deploy .vx-dp-tile {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 46px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: radial-gradient(ellipse at 50% 0%, var(--tile), var(--surface));
+  color: var(--accent-2);
+}
+.vx-deploy .vx-dp-icon {
+  width: 28px;
+  height: 28px;
+  filter: drop-shadow(0 0 4px rgb(90 180 240 / 0.3));
+}
+.vx-deploy .vx-dp-name {
+  margin-top: 20px;
+  font-size: clamp(1.0625rem, 0.98rem + 0.3vw, 1.25rem);
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+}
+.vx-deploy .vx-dp-body {
+  margin: 8px 0 16px;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+.vx-deploy .vx-dp-mono {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.vx-deploy .vx-dp-link {
+  display: inline-block;
+  margin-top: auto;
+  padding-block: 11px;
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.375;
+  color: var(--accent-2);
+  text-decoration: none;
+}
+.vx-deploy .vx-dp-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.vx-deploy .vx-dp-arrow {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin-left: 4px;
+  vertical-align: -2px;
+}
+
+/* ================================================================ narrower */
+@media (max-width: 1199.98px) {
+  .vx-deploy .vx-dp-cards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+/* the intro stacks above the steps panel below 900px */
+@media (max-width: 899.98px) {
+  .vx-quickstart .vx-qs-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 36px;
+    padding-top: calc(var(--vx-top-rule) + 40px);
+  }
+  .vx-quickstart .vx-qs-intro {
+    position: static;
+    padding-top: 0;
+  }
+}
+@media (max-width: 767.98px) {
+  .vx-deploy .vx-dp-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (min-width: 520px) and (max-width: 767.98px) {
+  .vx-deploy .vx-dp-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vx-quickstart .vx-qs-copy {
+    transition: none;
+  }
+}

@@ -1,0 +1,31 @@
+<section class="vx-screens" id="screenshots" aria-labelledby="vx-screens-title">
+<div class="vx-screens__glow" aria-hidden="true"></div>
+<div class="vx-screens__col">
+<div class="vx-screens__head">
+
+  <p class="vx-screens__eyebrow"><span class="vx-screens__dot" aria-hidden="true"></span>See it</p>
+  <h2 class="vx-screens__title" id="vx-screens-title">The console, and the tools you already use</h2>
+  <p class="vx-screens__lead">A web console for SQL, data and administration, and BI tools and notebooks connected through their PostgreSQL drivers or Arrow Flight SQL.</p>
+  <div class="vx-screens__tabbar"><div class="vx-screens__track"><div class="vx-screens__tabs" role="tablist" aria-label="Screenshots"><button type="button" class="vx-screens__tab" role="tab" id="vx-screens-tab-worksheet" aria-controls="vx-screens-panel-worksheet" aria-selected="true" tabindex="0">Worksheet</button><button type="button" class="vx-screens__tab" role="tab" id="vx-screens-tab-catalog" aria-controls="vx-screens-panel-catalog" aria-selected="false" tabindex="-1">Catalog</button><button type="button" class="vx-screens__tab" role="tab" id="vx-screens-tab-metabase" aria-controls="vx-screens-panel-metabase" aria-selected="false" tabindex="-1">Metabase</button><button type="button" class="vx-screens__tab" role="tab" id="vx-screens-tab-notebook" aria-controls="vx-screens-panel-notebook" aria-selected="false" tabindex="-1">Jupyter</button></div></div><span class="vx-screens__ln vx-screens__ln--h488" aria-hidden="true"></span></div>
+</div>
+<div class="vx-screens__panels">
+<figure class="vx-screens__panel" role="tabpanel" id="vx-screens-panel-worksheet" aria-labelledby="vx-screens-tab-worksheet">
+  <div class="vx-screens__frame"><span class="vx-screens__chrome" aria-hidden="true"><span></span><span></span><span></span></span><div class="vx-screens__window"><img class="vx-screens__shot" src="{{asset:site/src/generated/screenshots/console-worksheet-dark.png}}" alt="Igloo&#39;s web console: a worksheet running a reach, frequency and spend query by advertiser over 21.9 million ad impressions, with its results below." width="1920" height="1200" loading="eager" decoding="async"></div></div>
+  <figcaption class="vx-screens__caption">The web console: SQL worksheets, with the same users as SQL clients. <a class="vx-screens__more" href="/docs/console/">Read more</a></figcaption>
+</figure>
+<figure class="vx-screens__panel" role="tabpanel" id="vx-screens-panel-catalog" aria-labelledby="vx-screens-tab-catalog" hidden>
+  <div class="vx-screens__frame"><span class="vx-screens__chrome" aria-hidden="true"><span></span><span></span><span></span></span><div class="vx-screens__window"><img class="vx-screens__shot" src="{{asset:site/src/generated/screenshots/console-catalog-dark.png}}" alt="The catalog page of media.delivery: its description and owner, cards for rows, size, freshness, snapshots, reads, writes and users, and a lineage graph from raw.campaigns and raw.impressions through media.delivery to the tables made from it." width="1920" height="1200" loading="lazy" decoding="async"></div></div>
+  <figcaption class="vx-screens__caption">The data catalog: descriptions, owners, freshness, usage and lineage. <a class="vx-screens__more" href="/docs/catalog/">Read more</a></figcaption>
+</figure>
+<figure class="vx-screens__panel" role="tabpanel" id="vx-screens-panel-metabase" aria-labelledby="vx-screens-tab-metabase" hidden>
+  <div class="vx-screens__frame"><span class="vx-screens__chrome" aria-hidden="true"><span></span><span></span><span></span></span><div class="vx-screens__window"><img class="vx-screens__shot" src="{{asset:site/src/generated/screenshots/metabase-dashboard.png}}" alt="A Metabase dashboard on Igloo: impressions, spend, daily delivery, reach and frequency by campaign, top advertisers and click-through rate by channel." width="1920" height="1200" loading="lazy" decoding="async"></div></div>
+  <figcaption class="vx-screens__caption">Metabase through the PostgreSQL driver. <a class="vx-screens__more" href="/docs/integrations/">Read more</a></figcaption>
+</figure>
+<figure class="vx-screens__panel" role="tabpanel" id="vx-screens-panel-notebook" aria-labelledby="vx-screens-tab-notebook" hidden>
+  <div class="vx-screens__frame"><span class="vx-screens__chrome" aria-hidden="true"><span></span><span></span><span></span></span><div class="vx-screens__window"><img class="vx-screens__shot" src="{{asset:site/src/generated/screenshots/notebook.png}}" alt="A Jupyter notebook on Igloo: a reach curve merged from stored HLL sketches and a frequency distribution pulled over Arrow Flight SQL, with their charts." width="1920" height="1200" loading="lazy" decoding="async"></div></div>
+  <figcaption class="vx-screens__caption">Jupyter with SQLAlchemy and Arrow Flight SQL. <a class="vx-screens__more" href="/docs/flight-sql/">Read more</a></figcaption>
+</figure>
+</div>
+<div class="vx-screens__foot"><p class="vx-screens__note">Screenshots use synthetic ad-impression data from <a class="vx-screens__code" href="https://github.com/akkio-inc/Igloo/blob/main/deploy/single-vm/sql/load-media.sql"><code>deploy/single-vm/sql/load-media.sql</code></a>; the advertisers are invented.</p></div>
+</div>
+</section>

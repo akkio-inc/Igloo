@@ -1,0 +1,221 @@
+/* Benchmark, Linear style. Tokens come from base-linear.css; every rule sits under .vx-benchmark. */
+.vx-benchmark {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--bg), #06080b);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+.vx-benchmark .vx-bm-inner {
+  width: min(100% - 2 * var(--gutter), var(--content) + 60px);
+  margin-inline: auto;
+  padding-block: clamp(64px, 6.5vw, 96px) clamp(56px, 5.5vw, 80px);
+}
+.vx-benchmark .vx-bm-head {
+  max-width: 56rem;
+  padding-left: clamp(0px, 0.8vw, 12px);
+}
+.vx-benchmark .vx-bm-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 13px 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.vx-benchmark .vx-bm-led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 8px rgb(249 187 45 / 0.7);
+}
+.vx-benchmark .vx-bm-title {
+  margin-top: clamp(16px, 1.8vw, 24px);
+  font-size: clamp(2.25rem, 1.2rem + 3.1vw, 3.75rem);
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+  text-wrap: balance;
+}
+.vx-benchmark .vx-bm-lead {
+  max-width: 44em;
+  margin-top: clamp(12px, 1.3vw, 18px);
+  font-size: clamp(1.0625rem, 0.95rem + 0.42vw, 1.3125rem);
+  line-height: 1.55;
+  color: var(--text-2);
+  text-wrap: pretty;
+}
+
+/* ---------------------------------------------------------------- cards: soft top glow, lit top edge, hairline dividers */
+.vx-benchmark .vx-bm-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: clamp(24px, 2.6vw, 42px);
+  margin-top: clamp(28px, 2.8vw, 36px);
+}
+.vx-benchmark .vx-bm-card {
+  position: relative;
+  container: vx-bm-card / inline-size;
+  display: flex;
+  flex-direction: column;
+  padding: clamp(24px, 2.2vw, 34px) clamp(20px, 2vw, 32px) clamp(22px, 2vw, 30px);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(ellipse 70% 38% at 50% 0%, rgb(40 80 140 / 0.22), transparent 75%),
+    linear-gradient(180deg, var(--surface-2), var(--surface) 60%);
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.5), 0 24px 48px -28px rgb(0 0 0 / 0.8);
+}
+.vx-benchmark .vx-bm-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, #3a414b 0%, var(--line-strong) 35%, var(--line) 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+/* hairline guide in the gutter between cards */
+.vx-benchmark .vx-bm-card + .vx-bm-card::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(-0.5 * clamp(24px, 2.6vw, 42px));
+  width: 1px;
+  background: linear-gradient(180deg, transparent, var(--line-strong) 20%, var(--line-strong) 80%, transparent);
+  pointer-events: none;
+}
+.vx-benchmark .vx-bm-scale {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.vx-benchmark .vx-bm-machine {
+  margin-top: 8px;
+  font-size: clamp(1.0625rem, 0.98rem + 0.3vw, 1.25rem);
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+/* the site's isometric drawing of each run, lit warm where the cores are */
+.vx-benchmark .vx-bm-art {
+  height: clamp(120px, 11vw, 160px);
+  margin: clamp(16px, 1.6vw, 22px) 0;
+  padding-bottom: clamp(16px, 1.6vw, 22px);
+  border-bottom: 1px solid var(--line-strong);
+  color: #3a4048;
+}
+.vx-benchmark .vx-bm-art svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  filter: drop-shadow(0 0 18px rgb(150 100 40 / 0.18));
+}
+.vx-benchmark .vx-bm-face {
+  fill: var(--surface);
+  stroke: currentColor;
+  stroke-width: 1;
+  stroke-linejoin: round;
+}
+.vx-benchmark .vx-bm-face--top {
+  fill: #1b1a1a;
+  stroke: rgb(244 245 248 / 0.4);
+}
+.vx-benchmark .vx-bm-core {
+  fill: rgb(249 187 45 / 0.1);
+  stroke: rgb(249 187 45 / 0.6);
+  stroke-width: 0.75;
+}
+
+.vx-benchmark .vx-bm-stats {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+.vx-benchmark .vx-bm-stats div {
+  display: flex;
+  flex-direction: column-reverse;
+  min-width: 0;
+}
+.vx-benchmark .vx-bm-stats dd {
+  margin: 0;
+  font-size: clamp(2rem, 1.2rem + 2.1vw, 2.75rem);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.035em;
+  white-space: nowrap;
+}
+.vx-benchmark .vx-bm-stats div + div dd {
+  color: #f6c477;
+}
+.vx-benchmark .vx-bm-stats dt {
+  margin-top: 4px;
+  font-size: 0.9375rem;
+  color: var(--text-3);
+}
+@container vx-bm-card (min-width: 330px) {
+  .vx-benchmark .vx-bm-stats {
+    grid-template-columns: repeat(2, minmax(0, auto));
+    justify-content: start;
+    column-gap: 0;
+  }
+  .vx-benchmark .vx-bm-stats div + div {
+    margin-left: clamp(18px, 7cqi, 28px);
+    padding-left: clamp(18px, 7cqi, 28px);
+    border-left: 1px solid var(--line-strong);
+  }
+  .vx-benchmark .vx-bm-stats dd {
+    font-size: min(2.75rem, 11.5cqi);
+  }
+}
+.vx-benchmark .vx-bm-against {
+  margin-top: 18px;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+.vx-benchmark .vx-bm-more {
+  display: inline-block;
+  margin-top: clamp(18px, 2vw, 28px);
+  margin-left: clamp(0px, 0.8vw, 12px);
+  padding-block: 11px;
+  font-size: 1.0625rem;
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--accent);
+  text-decoration: none;
+}
+.vx-benchmark .vx-bm-more:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.vx-benchmark .vx-bm-arrow {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  vertical-align: -3px;
+}
+
+@media (max-width: 767.98px) {
+  .vx-benchmark .vx-bm-cards {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .vx-benchmark .vx-bm-card + .vx-bm-card::after {
+    display: none;
+  }
+}

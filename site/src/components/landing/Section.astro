@@ -1,0 +1,66 @@
+---
+// Renders one landing section from its files in src/sections/: <name>.html (one or more top-level
+// elements; `part` picks one by position), <name>.css (every rule prefixed with the section's root classes)
+// and an optional <name>.js. Assets are written as {{asset:site/src/...}} and resolve to built URLs here.
+// A section whose markup is split across components (the hero's header, the closing section's footer)
+// brings its styles and script with the first part only.
+interface Props {
+	name: string;
+	part?: number;
+	styles?: boolean;
+}
+const { name, part = 0, styles = part === 0 } = Astro.props;
+const files = import.meta.glob<string>('/src/sections/*.{html,css,js}', { query: '?raw', import: 'default', eager: true });
+const file = (ext: string) => files[`/src/sections/${name}.${ext}`];
+const html = file('html');
+if (!html) throw new Error(`no section ${name}`);
+const assets = import.meta.glob<{ src: string }>(['/src/assets/**/*.{png,jpg,jpeg,webp,svg}', '/src/generated/**/*.{png,jpg,jpeg,webp,svg}'], {
+	eager: true,
+	import: 'default',
+});
+const resolve = (text: string) =>
+	text.replace(/\{\{asset:([^}]+)\}\}/g, (_, path: string) => {
+		const asset = assets['/' + path.replace(/^site\//, '')];
+		if (!asset) throw new Error(`section ${name}: no asset at ${path}`);
+		return asset.src;
+	});
+
+// Split the markup into its top-level elements (comments and whitespace between them are dropped).
+const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
+function topLevel(src: string): string[] {
+	const out: string[] = [];
+	const tag = /<!--[\s\S]*?-->|<\/?([a-zA-Z][\w-]*)\b[^>]*?(\/?)>/g;
+	let depth = 0;
+	let start = -1;
+	for (let m; (m = tag.exec(src)); ) {
+		if (m[0].startsWith('<!--') || !m[1]) continue;
+		const t = m[1].toLowerCase();
+		const closing = m[0].startsWith('</');
+		if (closing) {
+			depth--;
+			if (depth === 0 && start >= 0) {
+				out.push(src.slice(start, tag.lastIndex));
+				start = -1;
+			}
+		} else if (!VOID.has(t) && !m[2]) {
+			if (depth === 0) start = m.index;
+			depth++;
+			// raw-text elements: skip to their end tag
+			if (t === 'script' || t === 'style' || t === 'textarea') {
+				const end = src.indexOf(`</${t}`, tag.lastIndex);
+				tag.lastIndex = end < 0 ? src.length : end;
+			}
+		}
+	}
+	return out;
+}
+const parts = topLevel(html);
+if (!parts[part]) throw new Error(`section ${name} has no part ${part}`);
+const markup = resolve(parts[part]);
+const css = styles ? resolve(file('css') ?? '') : '';
+const js = styles ? (file('js') ?? '') : '';
+---
+
+{css && <style is:inline set:html={css} />}
+<Fragment set:html={markup} />
+{js && <script type="module" is:inline set:html={js} />}

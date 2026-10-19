@@ -1,0 +1,184 @@
+/* Pillars (Linear): six open cells on one surface, split only by inner hairlines that fade out at their ends;
+   each cell has a lit icon tile, a title and its text. A soft blue glow at the top left. Tokens: base-linear.css. */
+.vx-pillars {
+	--cols: 3;
+	position: relative;
+	overflow: hidden;
+	isolation: isolate;
+	background: var(--bg);
+	color: var(--text-2);
+	font-family: var(--font-sans);
+}
+.vx-pillars .vx-pillars__glow {
+	position: absolute;
+	inset: 0;
+	z-index: -1;
+	pointer-events: none;
+	background:
+		radial-gradient(clamp(260px, 32vw, 460px) clamp(200px, 24vw, 340px) at calc(50% - min(44vw, 640px)) 0, color-mix(in srgb, var(--glow-blue) 30%, transparent), transparent 75%),
+		radial-gradient(clamp(200px, 24vw, 340px) clamp(160px, 18vw, 260px) at calc(50% + min(46vw, 660px)) 100%, color-mix(in srgb, var(--glow-blue) 10%, transparent), transparent 75%);
+}
+.vx-pillars .vx-pillars__frame {
+	position: relative;
+	width: min(var(--content) + 120px, 100% - 2 * var(--gutter));
+	margin-inline: auto;
+	padding-block: clamp(32px, 4.2vw, 60px);
+}
+.vx-pillars .vx-pillars__grid {
+	position: relative;
+	display: grid;
+	grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+	grid-template-rows: auto auto;
+}
+.vx-pillars .vx-pillars__cell {
+	display: flex;
+	min-width: 0;
+}
+.vx-pillars .vx-pillars__card {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	min-width: 0;
+	padding: clamp(24px, 2.2vw, 32px) clamp(18px, 3vw, 44px) clamp(28px, 2.6vw, 40px);
+	border-radius: var(--radius-sm);
+	color: inherit;
+	text-decoration: none;
+	transition: background-color 0.15s ease;
+}
+.vx-pillars .vx-pillars__card:hover {
+	background-color: color-mix(in srgb, var(--surface-2) 70%, transparent);
+}
+.vx-pillars .vx-pillars__card:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px;
+}
+/* icon tile: a dark square with a hairline lit from the top */
+.vx-pillars .vx-pillars__tile {
+	display: grid;
+	place-items: center;
+	flex: none;
+	width: clamp(48px, 4vw, 58px);
+	aspect-ratio: 1;
+	margin-bottom: clamp(16px, 1.8vw, 24px);
+	border: 1px solid var(--line-strong);
+	border-top-color: color-mix(in srgb, var(--line-lit) 45%, var(--line-strong));
+	border-radius: var(--radius-sm);
+	color: var(--accent);
+	background: linear-gradient(180deg, var(--tile), var(--surface) 100%);
+	box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04), 0 1px 2px rgb(0 0 0 / 0.4);
+}
+.vx-pillars .vx-pillars__tile svg {
+	width: 50%;
+	height: 50%;
+	stroke-width: 1.75;
+}
+.vx-pillars .vx-pillars__title {
+	color: var(--text);
+	font-size: clamp(1.125rem, 0.95rem + 0.55vw, 1.4375rem);
+	font-weight: 600;
+	line-height: 1.2;
+	letter-spacing: -0.02em;
+	text-wrap: balance;
+}
+.vx-pillars .vx-pillars__text {
+	margin-top: clamp(8px, 0.9vw, 12px);
+	color: var(--text-2);
+	font-size: clamp(0.9375rem, 0.88rem + 0.22vw, 1.0625rem);
+	line-height: 1.6;
+	text-wrap: pretty;
+}
+.vx-pillars .vx-pillars__text code {
+	color: var(--text);
+	font-family: var(--font-mono);
+	font-size: max(0.9em, 15px);
+}
+/* inner hairlines: column lines run the grid's height, row lines its width; both fade at their ends */
+.vx-pillars .vx-pillars__rail,
+.vx-pillars .vx-pillars__rule {
+	position: absolute;
+	pointer-events: none;
+}
+.vx-pillars .vx-pillars__rail {
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	margin-left: -0.5px;
+	background: linear-gradient(180deg, transparent, var(--line) 12%, var(--line) 88%, transparent);
+}
+.vx-pillars .vx-pillars__rail--m1 {
+	left: calc(100% / var(--cols));
+}
+.vx-pillars .vx-pillars__rail--m2 {
+	left: calc(200% / var(--cols));
+}
+.vx-pillars .vx-pillars__rule {
+	left: 0;
+	right: 0;
+	top: -0.5px;
+	height: 1px;
+	grid-column: 1 / -1;
+	background: linear-gradient(90deg, transparent, var(--line) 8%, var(--line) 92%, transparent);
+}
+.vx-pillars .vx-pillars__rule--r2 {
+	grid-row: 2;
+}
+.vx-pillars .vx-pillars__rule--r3 {
+	grid-row: 3;
+}
+.vx-pillars .vx-pillars__rule--r4 {
+	grid-row: 4;
+}
+.vx-pillars .vx-pillars__rule--r5 {
+	grid-row: 5;
+}
+.vx-pillars .vx-pillars__rule--r6 {
+	grid-row: 6;
+}
+.vx-pillars .vx-pillars__rule--r3,
+.vx-pillars .vx-pillars__rule--r4,
+.vx-pillars .vx-pillars__rule--r5,
+.vx-pillars .vx-pillars__rule--r6 {
+	display: none;
+}
+@media (max-width: 1079.98px) {
+	.vx-pillars {
+		--cols: 2;
+	}
+	.vx-pillars .vx-pillars__grid {
+		grid-template-rows: repeat(3, auto);
+	}
+	.vx-pillars .vx-pillars__rail--m2 {
+		display: none;
+	}
+	.vx-pillars .vx-pillars__rule--r3 {
+		display: block;
+	}
+}
+@media (max-width: 639.98px) {
+	.vx-pillars {
+		--cols: 1;
+	}
+	.vx-pillars .vx-pillars__grid {
+		grid-template-rows: repeat(6, auto);
+	}
+	.vx-pillars .vx-pillars__rail--m1 {
+		display: none;
+	}
+	.vx-pillars .vx-pillars__rule--r4,
+	.vx-pillars .vx-pillars__rule--r5,
+	.vx-pillars .vx-pillars__rule--r6 {
+		display: block;
+	}
+	.vx-pillars .vx-pillars__card {
+		padding-inline: 4px;
+	}
+	.vx-pillars .vx-pillars__card:hover {
+		background-color: transparent;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.vx-pillars .vx-pillars__card {
+		transition: none;
+	}
+}

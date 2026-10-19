@@ -12,15 +12,6 @@ import HowItWorks from '../components/landing/HowItWorks.astro';
 import Pillars from '../components/landing/Pillars.astro';
 import QuickStart from '../components/landing/QuickStart.astro';
 import Screens from '../components/landing/Screens.astro';
-import Recreated from '../components/landing/Recreated.astro';
-import rc_hero from '../recreated/hero.html?raw';
-import rc_pillars from '../recreated/pillars.html?raw';
-import rc_screens from '../recreated/screens.html?raw';
-import rc_features from '../recreated/features.html?raw';
-import rc_howitworks from '../recreated/howitworks.html?raw';
-import rc_benchmark from '../recreated/benchmark.html?raw';
-import rc_quickstart_deploy from '../recreated/quickstart-deploy.html?raw';
-import rc_closing_footer from '../recreated/closing-footer.html?raw';
 import { SITE_PUBLIC } from '../site-config.mjs';
 
 const title = 'Igloo: open source SQL warehouse on Apache Iceberg';
@@ -38,38 +29,25 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 		<meta name="description" content={description} />
 		{!SITE_PUBLIC && <meta name="robots" content="noindex, nofollow" />}
 		{canonical && <link rel="canonical" href={canonical} />}
-		<!-- recreated-fonts --><link rel="preconnect" href="https://fonts.googleapis.com" /><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Albert+Sans:wght@300..600&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@500..600&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@300..700&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300..500&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400..500&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@600..700&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@300..700&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300..500&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@300..600&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Onest:wght@400..600&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400..700&display=swap" /><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@300..400&display=swap" /><!-- /recreated-fonts -->
 		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 		<meta property="og:type" content="website" />
 		<meta property="og:title" content={title} />
 		<meta property="og:description" content={description} />
 		<meta name="theme-color" content="#08090d" />
-		<script is:inline>
-			// Before the first paint, as Starlight does, so the page never flashes
-			// the other theme.
-			(() => {
-				let stored = null;
-				try {
-					stored = localStorage.getItem('starlight-theme');
-				} catch {}
-				const theme = stored || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-				document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
-			})();
-		</script>
 	</head>
 	<body>
 		<a class="skip-link" href="#main">Skip to content</a>
 		<Header />
 		<main id="main">
-			<Recreated html={rc_hero} width={1600} height={720} label="Introduction" replaces="header"><Hero /></Recreated>
-			<Recreated html={rc_pillars} width={1600} height={768} label="What Igloo is"><Pillars /></Recreated>
-			<Recreated html={rc_screens} width={1600} height={1664} label="Screenshots"><Screens /></Recreated>
-			<Recreated html={rc_features} width={1600} height={2176} label="Features"><Features /></Recreated>
-			<Recreated html={rc_howitworks} width={1600} height={1488} label="How it works"><HowItWorks /></Recreated>
-			<Recreated html={rc_benchmark} width={1600} height={960} label="Benchmark"><Benchmark /></Recreated>
-			<div id="quick-start" class="rc-anchor"></div>
-			<Recreated html={rc_quickstart_deploy} width={1600} height={2240} label="Quick start and deployment"><QuickStart /><Deploy /></Recreated>
-			<Recreated html={rc_closing_footer} width={1600} height={896} label="Get started" replaces="footer"><Closing /></Recreated>
+			<Hero />
+			<Pillars />
+			<Screens />
+			<Features />
+			<HowItWorks />
+			<Benchmark />
+			<QuickStart />
+			<Deploy />
+			<Closing />
 		</main>
 		<Footer />
 	</body>

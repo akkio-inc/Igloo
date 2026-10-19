@@ -1,0 +1,394 @@
+/*
+ * Igloo landing: site header and hero (Linear style, dark only).
+ * A frosted tray header floats over a full-bleed illustration; the copy sits on a dark scrim to its left.
+ * Below 768 px the illustration becomes a banner above the copy. Colours, widths and fonts come from the site tokens.
+ */
+.vx-header,
+.vx-hero {
+	--vx-hh: clamp(60px, 5vw, 72px);
+	--vx-ink: #0a0d12;
+	color: var(--text);
+	font-family: var(--font-sans);
+}
+
+/* ------------------------------------------------------------------ header: a frosted tray */
+.vx-header {
+	position: sticky;
+	top: 0;
+	z-index: 50;
+	height: var(--vx-hh);
+	padding: 0 clamp(8px, 2vw, 32px);
+}
+.vx-header__bar {
+	height: 100%;
+	border: 1px solid rgba(175, 195, 220, 0.145);
+	border-top: 0;
+	border-radius: 0 0 16px 16px;
+	background: rgba(9, 13, 19, 0.55);
+	-webkit-backdrop-filter: blur(12px) saturate(1.5);
+	backdrop-filter: blur(12px) saturate(1.5);
+	box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.02), 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+.vx-header__inner {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	height: 100%;
+	padding: 0 clamp(10px, 2.4vw, 38px);
+}
+.vx-header__brand {
+	display: flex;
+	align-items: center;
+	flex: none;
+	gap: 12px;
+	min-height: 44px;
+	padding-right: clamp(14px, 2vw, 28px);
+	border-right: 1px solid var(--line-strong);
+	color: var(--text);
+	font-size: 1.5rem;
+	font-weight: 600;
+	letter-spacing: -0.03em;
+	text-decoration: none;
+}
+.vx-header__brand img {
+	width: clamp(32px, 2.8vw, 40px);
+	height: auto;
+}
+.vx-header__nav {
+	display: flex;
+	align-items: center;
+	order: 1;
+	gap: 4px;
+	padding-left: clamp(4px, 1vw, 14px);
+}
+.vx-header__nav a {
+	display: flex;
+	align-items: center;
+	min-height: 44px;
+	padding: 0 14px;
+	border-radius: var(--radius-sm);
+	color: var(--text-2);
+	font-size: 1rem;
+	text-decoration: none;
+	transition: color 0.15s ease, background-color 0.15s ease;
+}
+.vx-header__nav a:hover {
+	color: var(--text);
+	background: rgba(255, 255, 255, 0.04);
+}
+.vx-header__github,
+.vx-header__menu {
+	display: grid;
+	place-items: center;
+	flex: none;
+	width: 46px;
+	height: 46px;
+	padding: 0;
+	border: 1px solid var(--line-strong);
+	border-radius: 50%;
+	background: rgba(13, 15, 18, 0.6);
+	color: var(--text);
+	cursor: pointer;
+	transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.vx-header__github:hover,
+.vx-header__menu:hover {
+	background: var(--surface-2);
+	border-color: #3a414b;
+}
+.vx-header__github {
+	order: 2;
+	margin-left: auto;
+}
+.vx-header__github svg {
+	width: 22px;
+	height: 22px;
+}
+.vx-header__menu {
+	display: none;
+	order: 3;
+}
+.vx-header__menu svg {
+	width: 22px;
+	height: 22px;
+}
+.vx-header__menu-close {
+	display: none;
+}
+.vx-header.is-open .vx-header__menu-open {
+	display: none;
+}
+.vx-header.is-open .vx-header__menu-close {
+	display: inline;
+}
+
+/* ------------------------------------------------------------------ hero */
+.vx-hero {
+	position: relative;
+	isolation: isolate;
+	overflow: hidden;
+	margin-top: calc(-1 * var(--vx-hh));
+	padding-top: var(--vx-hh);
+	min-height: clamp(560px, 45vw, 680px);
+	background: var(--vx-ink);
+}
+/* the illustration on the right, faded into the page at its edges */
+.vx-hero__art {
+	position: absolute;
+	z-index: -2;
+	left: 45.5%;
+	right: 0;
+	top: 12%;
+	bottom: 0;
+	-webkit-mask-image: linear-gradient(90deg, transparent 0, rgba(0, 0, 0, 0.6) 9%, #000 22%), linear-gradient(180deg, transparent 0, #000 36px, #000 calc(100% - 80px), transparent 100%);
+	-webkit-mask-composite: source-in;
+	mask-image: linear-gradient(90deg, transparent 0, rgba(0, 0, 0, 0.6) 9%, #000 22%), linear-gradient(180deg, transparent 0, #000 36px, #000 calc(100% - 80px), transparent 100%);
+	mask-composite: intersect;
+}
+.vx-hero__art img {
+	width: 100%;
+	height: 100%;
+	max-width: none;
+	object-fit: cover;
+	object-position: 0% 50%;
+	filter: brightness(0.85) saturate(0.74) contrast(1.045);
+}
+/* scrims: solid behind the copy, easing into the art; a blue night haze along the bottom */
+.vx-hero::before {
+	content: '';
+	position: absolute;
+	inset: 0;
+	z-index: -1;
+	pointer-events: none;
+	background:
+		linear-gradient(90deg, var(--vx-ink) 26%, rgba(10, 13, 18, 0.3) 36%, rgba(10, 13, 18, 0) 65%),
+		linear-gradient(0deg, rgba(14, 24, 39, 1) 0, rgba(14, 24, 39, 0.4) 75px, rgba(14, 24, 39, 0) 160px),
+		linear-gradient(90deg, rgba(6, 17, 30, 0) 7.5%, rgba(6, 17, 30, 0.9) 42.5%, rgba(6, 17, 30, 0) 52%);
+}
+.vx-hero__inner {
+	width: min(100% - 2 * var(--gutter), var(--content));
+	margin-inline: auto;
+	padding: clamp(40px, 5.5vw, 80px) 0 clamp(40px, 4vw, 64px);
+}
+.vx-hero__copy {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	max-width: 620px;
+}
+.vx-hero__title {
+	margin-left: -0.04em;
+	padding-bottom: 0.1em;
+	font-size: clamp(4.25rem, 2rem + 6vw, 7.5rem);
+	font-weight: 700;
+	line-height: 1;
+	letter-spacing: -0.05em;
+	color: var(--text);
+	background: linear-gradient(180deg, #fdfdfd 37%, #e8f1fc 52%, #d1e6fc 70%, #c0dcf9 84%, #bcdafa 100%);
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+}
+.vx-hero__tagline {
+	margin-top: 0.5rem;
+	font-size: clamp(1.25rem, 1rem + 0.7vw, 1.625rem);
+	line-height: 1.3;
+	color: var(--text);
+	text-wrap: balance;
+}
+.vx-hero__claim {
+	margin-top: 0.5rem;
+	font-size: clamp(1.5rem, 1.05rem + 1.3vw, 2.125rem);
+	font-weight: 700;
+	line-height: 1.2;
+	letter-spacing: -0.025em;
+	color: #f7c66f;
+}
+.vx-hero__claim span {
+	white-space: nowrap;
+}
+.vx-hero__note {
+	margin-top: 0.75rem;
+	font-size: 0.9375rem;
+	line-height: 1.45;
+	color: var(--text-2);
+	text-wrap: balance;
+}
+.vx-hero__lead {
+	max-width: 34em;
+	margin-top: 1.5rem;
+	font-size: clamp(1.0625rem, 0.95rem + 0.35vw, 1.25rem);
+	line-height: 1.5;
+	color: var(--text-2);
+	text-wrap: pretty;
+}
+.vx-hero__cta {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 14px;
+	margin: 28px 0 28px;
+}
+.vx-hero__btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 12px;
+	height: 52px;
+	padding: 0 26px;
+	border-radius: 999px;
+	font-size: 1.0625rem;
+	font-weight: 600;
+	line-height: 1;
+	text-decoration: none;
+	white-space: nowrap;
+	transition: filter 0.15s ease, background 0.15s ease;
+}
+.vx-hero__btn svg {
+	flex: none;
+	width: 20px;
+	height: 20px;
+}
+.vx-hero__btn--primary {
+	position: relative;
+	padding-right: 24px;
+	background: linear-gradient(180deg, #fbca7c, #f7b354);
+	color: #1a1307;
+	box-shadow: 0 6px 24px var(--glow-amber), 0 0 0 1px rgba(120, 80, 20, 0.25);
+}
+.vx-hero__btn--primary::before {
+	content: '';
+	position: absolute;
+	left: 16px;
+	right: 16px;
+	top: 0;
+	height: 1px;
+	border-radius: 1px;
+	background: rgba(255, 236, 190, 0.6);
+}
+.vx-hero__btn--primary:hover {
+	filter: brightness(1.05);
+}
+/* ghost pill with a gradient border */
+.vx-hero__btn--ghost {
+	padding-left: 24px;
+	border: 1px solid transparent;
+	background: linear-gradient(#0e1218, #0e1218) padding-box, linear-gradient(180deg, #3a4148, #252a33) border-box;
+	color: var(--text);
+	font-weight: 500;
+}
+.vx-hero__btn--ghost:hover {
+	background: linear-gradient(var(--surface-2), var(--surface-2)) padding-box, linear-gradient(180deg, #4a525b, #2c323b) border-box;
+}
+.vx-hero__stack {
+	align-self: stretch;
+	padding-top: 22px;
+	border-top: 1px solid var(--line-strong);
+	font-size: 0.9375rem;
+	line-height: 1.6;
+	color: var(--text-3);
+	text-wrap: balance;
+}
+
+/* ------------------------------------------------------------------ the nav collapses behind a menu button */
+@media (max-width: 899px) {
+	.vx-header.vx-js .vx-header__menu {
+		display: grid;
+	}
+	.vx-header.vx-js .vx-header__nav {
+		position: absolute;
+		top: calc(100% + 8px);
+		left: 0;
+		right: 0;
+		display: none;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 0;
+		padding: 8px;
+		border: 1px solid rgba(175, 195, 220, 0.145);
+		border-radius: var(--radius);
+		background: rgba(9, 13, 19, 0.96);
+		box-shadow: 0 18px 40px rgba(0, 0, 0, 0.6);
+	}
+	.vx-header.vx-js.is-open .vx-header__nav {
+		display: flex;
+	}
+	.vx-header.vx-js .vx-header__nav a {
+		min-height: 48px;
+	}
+	.vx-header:not(.vx-js) {
+		height: auto;
+	}
+	.vx-header:not(.vx-js) .vx-header__inner {
+		flex-wrap: wrap;
+		padding-block: 8px;
+	}
+	.vx-header:not(.vx-js) .vx-header__nav {
+		order: 4;
+		flex-basis: 100%;
+		flex-wrap: wrap;
+		padding: 0;
+	}
+	.vx-header__brand {
+		font-size: 1.375rem;
+	}
+	.vx-hero__art {
+		left: 38%;
+	}
+	.vx-hero::before {
+		background:
+			linear-gradient(90deg, var(--vx-ink) 40%, rgba(10, 13, 18, 0.55) 54%, rgba(10, 13, 18, 0) 75%),
+			linear-gradient(0deg, rgba(14, 24, 39, 1) 0, rgba(14, 24, 39, 0) 160px);
+	}
+	.vx-hero__copy {
+		max-width: 56%;
+	}
+}
+
+/* ------------------------------------------------------------------ phones: the illustration becomes a banner */
+@media (max-width: 767px) {
+	.vx-header__inner {
+		padding: 0 8px 0 14px;
+	}
+	.vx-header__brand {
+		padding-right: 0;
+		border-right: 0;
+	}
+	.vx-hero {
+		min-height: 0;
+	}
+	.vx-hero__art {
+		position: relative;
+		inset: auto;
+		z-index: -2;
+		height: auto;
+		aspect-ratio: 4 / 3;
+		margin-top: calc(-1 * var(--vx-hh));
+		-webkit-mask-image: linear-gradient(180deg, #000 70%, transparent);
+		mask-image: linear-gradient(180deg, #000 70%, transparent);
+	}
+	.vx-hero__art img {
+		object-position: 20% 78%;
+	}
+	.vx-hero::before {
+		background: linear-gradient(180deg, rgba(10, 13, 18, 0.55) 0, rgba(10, 13, 18, 0) 22%);
+	}
+	.vx-hero__inner {
+		margin-top: -48px;
+		padding-top: 0;
+	}
+	.vx-hero__copy {
+		max-width: none;
+	}
+	.vx-hero__title {
+		font-size: 4.5rem;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.vx-header__nav a,
+	.vx-header__github,
+	.vx-header__menu,
+	.vx-hero__btn {
+		transition: none;
+	}
+}

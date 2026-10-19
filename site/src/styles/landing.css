@@ -1,484 +1,106 @@
-/*
- * The landing page: restrained and dark-first. Near-black surfaces, hairline
- * borders, large tightly tracked headings and muted secondary text, with
- * Igloo's own colours as the accents: icy blue, deep navy, and the amber of
- * the igloo's doorway.
- */
-
+/* Design tokens: Linear style (dark only). Sections use these; they never define :root themselves. */
 :root {
-	color-scheme: dark;
-	--font: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-	--font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
-
-	--bg: #08090d;
-	--bg-raised: #0d0f14;
-	--heading: #f7f8f8;
-	--text: #c9cfd9;
-	--muted: #8f96a3;
-	--link: #8fcbfc;
-	--ice: #8fcbfc;
-	--ice-strong: #4f9fe6;
-	--amber: #f7ca7a;
-	--amber-fill-1: #ffdc95;
-	--amber-fill-2: #f5b44a;
-	--navy: #0f2d56;
-
-	/* Surfaces are a whisper of white over the page, edged by a hairline. */
-	--surface: rgb(255 255 255 / 0.022);
-	--surface-2: rgb(255 255 255 / 0.04);
-	--surface-hover: rgb(255 255 255 / 0.035);
-	--inset: rgb(0 0 0 / 0.28);
-	--border: rgb(220 228 240 / 0.09);
-	--border-strong: rgb(255 255 255 / 0.14);
-	/* Linear's lit edges: a surface's top edge catches the light, its sides
-	   less, its bottom least. Hairline rules between things sit in between. */
-	--edge-top: rgb(190 210 235 / 0.38);
-	--edge-side: rgb(200 214 232 / 0.3);
-	--edge-right: var(--edge-side);
-	--glow-blue: 110 150 210;
-	--glow-warm: 210 150 80;
-	--glow-k: 1;
-	--edge-bottom: rgb(200 214 232 / 0.21);
-	--rule: rgb(220 228 240 / 0.13);
-	--rule-strong: rgb(205 218 235 / 0.19);
-	--rule-faint: rgb(205 218 235 / 0.04);
-	--code-bar-line: #22303e;
-	--surface-sheen: radial-gradient(100% 220px at 50% 0%, rgb(190 210 235 / 0.06), transparent);
-	--line: rgb(255 255 255 / 0.22);
-	--shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 24px 48px -24px rgb(0 0 0 / 0.6);
-	--glow-ice: rgb(54 110 180 / 0.1);
-	--glow-amber: rgb(245 180 74 / 0.05);
-
-	--headline: linear-gradient(180deg, #ffffff 30%, #b9dcfb 100%);
-	--heading-sheen: linear-gradient(to right bottom, #ffffff 35%, rgb(247 248 248 / 0.66));
-	--hero-text: #dfe5ee;
-	--hero-claim: #f7ca7a;
-	--hero-note: #9aa3b2;
-	--hero-scrim: 8 9 13;
-
-	/* Expressive Code (the quick start and SQL examples) reads Starlight's variables. */
-	--sl-color-white: #ffffff;
-	--sl-color-gray-1: #e6e9ee;
-	--sl-color-gray-2: #c2c8d2;
-	--sl-color-gray-3: #8f96a3;
-	--sl-color-gray-4: #4b5160;
-	--sl-color-gray-5: #20232b;
-	--sl-color-gray-6: #121419;
-	--sl-color-gray-7: #0d0f14;
-	--sl-color-black: #08090d;
-	--sl-color-accent: #4f9fe6;
-	--sl-color-accent-high: #a9d6fd;
-	--sl-color-text: var(--text);
-	--sl-text-code: 0.875rem;
-	--sl-line-height: 1.8;
-	--__sl-font: var(--font);
-	--__sl-font-mono: var(--font-mono);
-
-	--container: 1216px;
-	--gutter: 24px;
+	--bg: #08090b;
+	--surface: #0d0f12;
+	--surface-2: #12151a;
+	--tile: #161a20;
+	--line: #1b1f25;
+	--line-strong: #2a2f37;
+	--line-lit: #6f90af;
+	--text: #f4f5f8;
+	--text-2: #a2acc1;
+	--text-3: #7c8596;
+	--accent: #8bccf6;
+	--accent-2: #b9e2ff;
+	--amber: #f9bb2d;
+	--amber-deep: #c8862a;
+	--glow-blue: rgba(40, 80, 140, 0.5);
+	--glow-amber: rgba(150, 100, 40, 0.45);
 	--radius: 14px;
-	--header-h: 64px;
+	--radius-sm: 8px;
+	--font-sans: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+	--content: 1240px;
+	--gutter: clamp(16px, 4vw, 56px);
 }
-
-:root[data-theme='light'] {
-	color-scheme: light;
-	--bg: #fcfcfd;
-	--bg-raised: #ffffff;
-	--heading: #0b1426;
-	--text: #364052;
-	--muted: #5a6476;
-	--link: #1b64b5;
-	--ice: #1b64b5;
-	--ice-strong: #1b64b5;
-	--amber: #9a5800;
-
-	--surface: #ffffff;
-	--surface-2: rgb(13 20 38 / 0.035);
-	--surface-hover: #f7f8fa;
-	--inset: #f5f6f8;
-	--border: rgb(13 20 38 / 0.09);
-	--border-strong: rgb(13 20 38 / 0.16);
-	--edge-top: rgb(13 20 38 / 0.11);
-	--edge-side: rgb(13 20 38 / 0.1);
-	--edge-right: var(--edge-side);
-	--glow-blue: 79 159 230;
-	--glow-warm: 245 180 74;
-	--glow-k: 0.6;
-	--edge-bottom: rgb(13 20 38 / 0.15);
-	--rule: rgb(13 20 38 / 0.09);
-	--rule-strong: rgb(13 20 38 / 0.12);
-	--rule-faint: rgb(13 20 38 / 0.03);
-	--code-bar-line: rgb(13 20 38 / 0.12);
-	--surface-sheen: linear-gradient(transparent, transparent);
-	--line: rgb(13 20 38 / 0.24);
-	--shadow: 0 1px 2px rgb(13 20 38 / 0.04), 0 24px 48px -28px rgb(13 20 38 / 0.18);
-	--glow-ice: rgb(79 159 230 / 0.09);
-	--glow-amber: rgb(245 180 74 / 0.07);
-
-	--headline: linear-gradient(180deg, #0f2d56 35%, #2b5f9e 100%);
-	--heading-sheen: linear-gradient(to right bottom, #0b1426 35%, #3a4a68);
-	--hero-text: #14284a;
-	--hero-claim: #8a4f00;
-	--hero-note: #3d5272;
-	--hero-scrim: 252 252 253;
-
-	--sl-color-white: #0b1426;
-	--sl-color-gray-1: #1b2130;
-	--sl-color-gray-2: #353c4a;
-	--sl-color-gray-3: #5a6476;
-	--sl-color-gray-4: #9aa1ad;
-	--sl-color-gray-5: #e1e4e9;
-	--sl-color-gray-6: #eef0f3;
-	--sl-color-gray-7: #f6f7f9;
-	--sl-color-black: #ffffff;
-	--sl-color-accent: #1b64b5;
-	--sl-color-accent-high: #123f78;
-}
-
+/* Base for the landing page (dark only). Every section brings its own CSS, prefixed with its root class. */
 *,
 *::before,
 *::after {
 	box-sizing: border-box;
 }
-
 html {
-	scroll-behavior: smooth;
-	scroll-padding-top: calc(var(--header-h) + 16px);
 	-webkit-text-size-adjust: 100%;
+	scroll-behavior: smooth;
+	background: var(--bg);
+	color-scheme: dark;
 }
 @media (prefers-reduced-motion: reduce) {
 	html {
 		scroll-behavior: auto;
 	}
 }
-
-/* `html body` outranks the docs theme's glows, whose stylesheet comes along
-   with Starlight's <Code> component. */
-html body {
+body {
 	margin: 0;
 	background: var(--bg);
 	color: var(--text);
-	font-family: var(--font);
-	font-size: 1rem;
-	line-height: 1.6;
-	font-feature-settings: 'cv11', 'ss03';
-	font-optical-sizing: auto;
+	font-family: var(--font-sans);
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
-	overflow-x: clip;
+	text-rendering: optimizeLegibility;
+	overflow-x: hidden;
 }
-
-img {
-	max-width: 100%;
-	height: auto;
+img,
+svg,
+video {
 	display: block;
+	max-width: 100%;
 }
-
-a {
-	color: var(--link);
-	text-underline-offset: 0.2em;
-	text-decoration-thickness: 1px;
-}
-
-code {
-	font-family: var(--font-mono);
-	font-size: 0.9em;
-}
-
 h1,
 h2,
-h3 {
-	color: var(--heading);
+h3,
+h4,
+p,
+figure,
+ul,
+ol,
+pre,
+blockquote {
 	margin: 0;
-	line-height: 1.1;
-	letter-spacing: -0.02em;
-	text-wrap: balance;
 }
-
-.container {
-	width: 100%;
-	max-width: calc(var(--container) + 2 * var(--gutter));
-	margin-inline: auto;
-	padding-inline: var(--gutter);
-}
-
-.sr-only {
-	position: absolute;
-	width: 1px;
-	height: 1px;
+ul,
+ol {
 	padding: 0;
-	margin: -1px;
-	overflow: hidden;
-	clip: rect(0, 0, 0, 0);
-	white-space: nowrap;
-	border: 0;
 }
-
+a {
+	color: inherit;
+}
+button {
+	font: inherit;
+	color: inherit;
+}
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
 .skip-link {
 	position: absolute;
-	left: 16px;
+	left: 12px;
 	top: -100px;
 	z-index: 100;
-	padding: 8px 14px;
+	padding: 10px 14px;
 	border-radius: 8px;
-	background: var(--bg-raised);
-	border: 1px solid var(--border-strong);
-	color: var(--heading);
+	background: var(--surface-2);
+	color: var(--text);
 }
 .skip-link:focus {
 	top: 12px;
 }
-
-:focus-visible {
-	outline: 2px solid var(--link);
-	outline-offset: 2px;
-}
-
-/* Images that exist in a light and a dark version. */
-:root[data-theme='light'] .theme-dark,
-:root[data-theme='dark'] .theme-light {
-	display: none !important;
-}
-
-/* A quiet surface: a faint fill and a hairline edge. */
-.surface {
-	position: relative;
-	background: var(--surface-sheen), var(--surface);
-	border: 1px solid;
-	border-color: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-side);
-	border-radius: var(--radius);
-}
-/* The same edges for anything else that is boxed. */
-.lit-edge {
-	border: 1px solid;
-	border-color: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-side);
-}
-
-/* Rails: hairlines along the top and down both sides of a section, just
-   outside the content column, where the window is wide enough for them. */
-.railed::after {
-	content: '';
-	position: absolute;
-	z-index: -1;
-	inset: 0;
-	pointer-events: none;
-	background: linear-gradient(90deg, var(--rule-faint) 0%, var(--rule-strong) 45%) top / 100% 1px no-repeat;
-}
-@media (min-width: 1360px) {
-	.railed::after {
-		inset: 0 calc(50% - var(--container) / 2 - 50px);
-		background:
-			linear-gradient(90deg, var(--rule-faint) 0%, var(--rule-strong) 45%) top / 100% 1px no-repeat,
-			linear-gradient(to bottom, var(--rule), var(--rail-end, var(--rule))) left / 1px 100% no-repeat,
-			linear-gradient(to bottom, var(--rule), var(--rail-end, var(--rule))) right / 1px 100% no-repeat;
-	}
-}
-
-/* Buttons */
-.btn {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	gap: 10px;
-	height: 48px;
-	padding: 0 28px;
-	border-radius: 999px;
-	font-weight: 600;
-	font-size: 1rem;
-	letter-spacing: -0.01em;
-	text-decoration: none;
+.visually-hidden {
+	position: absolute !important;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
 	white-space: nowrap;
-	transition:
-		background-color 0.15s ease,
-		border-color 0.15s ease,
-		box-shadow 0.15s ease;
-}
-.btn svg {
-	width: 18px;
-	height: 18px;
-	flex: none;
-}
-.btn-primary {
-	color: var(--navy);
-	background: linear-gradient(180deg, var(--amber-fill-1), var(--amber-fill-2));
-	box-shadow:
-		inset 0 1px 0 rgb(255 255 255 / 0.6),
-		0 0 0 1px rgb(245 180 74 / 0.45),
-		0 10px 30px -10px rgb(245 180 74 / 0.6);
-}
-.btn-primary:hover {
-	box-shadow:
-		inset 0 1px 0 rgb(255 255 255 / 0.6),
-		0 0 0 1px rgb(245 180 74 / 0.6),
-		0 12px 34px -8px rgb(245 180 74 / 0.75);
-}
-.btn-secondary {
-	color: var(--heading);
-	background: transparent;
-	border: 1px solid var(--border-strong);
-	font-weight: 500;
-}
-.btn-secondary:hover {
-	background: var(--surface-2);
-	border-color: var(--line);
-}
-
-/* Sections, on an 8px rhythm, each with a faint glow at its top. */
-.section {
-	position: relative;
-	isolation: isolate;
-	padding-block: 112px;
-}
-/* Each section sets --section-glow: soft light from its top edge, placed
-   where its design has it. The mask fades it in over the first 28px, so it
-   is transparent at the boundary and no edge shows between sections. */
-.section::before,
-.top-glow::before {
-	content: '';
-	position: absolute;
-	z-index: -1;
-	inset: 0;
-	pointer-events: none;
-	background: var(--section-glow, none);
-	-webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
-	mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
-}
-.section-head {
-	max-width: 960px;
-	margin-bottom: 34px;
-}
-.eyebrow {
-	display: inline-flex;
-	align-items: center;
-	gap: 10px;
-	margin-bottom: 24px;
-	padding: 5px 14px 5px 12px;
-	border: 1px solid var(--border-strong);
-	border-radius: 999px;
-	font-size: 0.875rem;
-	font-weight: 500;
-	letter-spacing: 0.005em;
-	color: var(--text);
-}
-.eyebrow::before {
-	content: '';
-	width: 6px;
-	height: 6px;
-	border-radius: 50%;
-	background: var(--amber-fill-2);
-}
-/* Large, tight headings with a soft sheen. */
-.headline {
-	font-size: clamp(2.25rem, 1rem + 4vw, 4.75rem);
-	font-weight: 600;
-	letter-spacing: -0.04em;
-	line-height: 0.98;
-	background: var(--heading-sheen);
-	-webkit-background-clip: text;
-	background-clip: text;
-	-webkit-text-fill-color: transparent;
-	padding-bottom: 0.08em;
-}
-.section-head p {
-	margin: 10px 0 0;
-	max-width: 46em;
-	font-size: clamp(1.0625rem, 0.9rem + 0.5vw, 1.35rem);
-	line-height: 1.42;
-	color: var(--muted);
-}
-.more-link {
-	display: inline-flex;
-	align-items: center;
-	gap: 8px;
-	font-weight: 500;
-	text-decoration: none;
-}
-.more-link:hover {
-	text-decoration: underline;
-}
-
-/* An outlined square holding an icon. */
-.icon-box {
-	display: inline-grid;
-	place-items: center;
-	flex: none;
-	width: 48px;
-	height: 48px;
-	border-radius: 10px;
-	border: 1px solid;
-	border-color: var(--edge-top) var(--edge-side) var(--edge-bottom);
-	background: linear-gradient(180deg, var(--surface-2), transparent);
-	color: var(--ice);
-}
-
-/* Prose rendered from the README (quick start, how it works) */
-.prose {
-	color: var(--text);
-	font-size: 1rem;
-}
-.prose > * {
-	margin-block: 0;
-}
-.prose > * + * {
-	margin-top: 16px;
-}
-.prose ul {
-	padding-left: 1.25em;
-}
-.prose li + li {
-	margin-top: 8px;
-}
-.prose strong {
-	color: var(--heading);
-	font-weight: 600;
-}
-.prose :not(pre) > code {
-	padding: 0.15em 0.4em;
-	border-radius: 6px;
-	background: var(--surface-2);
-	border: 1px solid var(--edge-side);
-	color: var(--heading);
-	font-size: 0.85em;
-	line-height: 1;
-	overflow-wrap: anywhere;
-}
-
-/* Expressive Code blocks: dark insets with a hairline edge. */
-.expressive-code .frame {
-	--ec-brdCol: var(--edge-side);
-}
-.expressive-code .frame pre {
-	--ec-codeBg: #0e1822;
-	/* Code blocks' edges measure +7..+14 in the concepts: dimmer than a card's. */
-	border-color: var(--rule-strong) var(--rule) var(--rule) !important;
-}
-.expressive-code .frame.is-terminal pre {
-	border-top-color: var(--code-bar-line) !important;
-}
-.expressive-code .frame.is-terminal .header {
-	--ec-frm-trmTtbBg: #080c11;
-	--ec-frm-trmTtbDotsFg: #2c3c4e;
-	--ec-frm-trmTtbDotsOpa: 1;
-	border-color: var(--rule-strong) var(--rule) var(--rule) !important;
-}
-:root[data-theme='light'] .expressive-code .frame pre {
-	--ec-codeBg: #f6f7f9;
-}
-:root[data-theme='light'] .expressive-code .frame.is-terminal .header {
-	--ec-frm-trmTtbBg: #eef0f3;
-}
-
-@media (max-width: 720px) {
-	:root {
-		--gutter: 16px;
-	}
-	.section {
-		padding-block: 88px;
-	}
-	.section-head {
-		margin-bottom: 40px;
-	}
-	.eyebrow {
-		margin-bottom: 18px;
-	}
 }

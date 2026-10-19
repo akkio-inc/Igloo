@@ -1,0 +1,248 @@
+/*
+ * Igloo landing: closing call to action and site footer (Linear style, dark only).
+ * The closing sits in a field of soft warm and cool glows; a single hairline separates it from the footer.
+ * Colours, widths and fonts come from the site tokens.
+ */
+.vx-closing,
+.vx-footer {
+	position: relative;
+	background: var(--bg);
+	color: var(--text);
+	font-family: var(--font-sans);
+}
+.vx-closing__inner,
+.vx-footer__inner {
+	width: min(100% - 2 * var(--gutter), var(--content));
+	margin-inline: auto;
+}
+
+/* ------------------------------------------------------------------ closing */
+.vx-closing {
+	isolation: isolate;
+	overflow: hidden;
+	padding: clamp(72px, 9vw, 136px) 0 clamp(64px, 6.5vw, 96px);
+	background: #0a0d12;
+}
+/* warm light from the top left, a cool haze on the right, darker in the middle */
+.vx-closing__glow {
+	position: absolute;
+	inset: 0;
+	z-index: -1;
+	pointer-events: none;
+	background:
+		radial-gradient(40% 55% at 6% 0%, rgba(35, 30, 26, 1), rgba(35, 30, 26, 0.5) 50%, rgba(35, 30, 26, 0) 100%),
+		radial-gradient(30% 20% at 92% 8%, rgba(14, 20, 29, 1), rgba(14, 20, 29, 0) 100%),
+		radial-gradient(45% 30% at 72% 45%, rgba(14, 21, 32, 1), rgba(14, 21, 32, 0.36) 52%, rgba(14, 21, 32, 0) 100%),
+		radial-gradient(60% 45% at 50% 85%, rgba(12, 16, 22, 1), rgba(12, 16, 22, 0) 100%),
+		radial-gradient(55% 50% at 28% 40%, rgba(9, 11, 15, 1), rgba(9, 11, 15, 0) 100%),
+		#0a0d12;
+}
+.vx-closing__panel {
+	max-width: 1040px;
+	padding-left: clamp(0px, 5vw, 70px);
+}
+.vx-closing__title {
+	font-size: clamp(2.375rem, 1rem + 3.8vw, 4.25rem);
+	font-weight: 600;
+	line-height: 1.02;
+	letter-spacing: -0.045em;
+	color: var(--text);
+	text-wrap: balance;
+	text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+.vx-closing__sub {
+	max-width: 42em;
+	margin-top: 1.25rem;
+	font-size: clamp(1.0625rem, 0.95rem + 0.4vw, 1.25rem);
+	line-height: 1.6;
+	color: var(--text-2);
+	text-wrap: pretty;
+}
+.vx-closing__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 14px;
+	margin-top: clamp(28px, 3vw, 40px);
+}
+.vx-closing__btn {
+	position: relative;
+	display: inline-flex;
+	align-items: center;
+	gap: 12px;
+	height: 52px;
+	padding: 0 26px;
+	border-radius: 999px;
+	font-size: 1.0625rem;
+	font-weight: 500;
+	line-height: 1;
+	text-decoration: none;
+	white-space: nowrap;
+	transition: filter 0.15s ease, background 0.15s ease;
+}
+.vx-closing__btn svg {
+	flex: none;
+	width: 20px;
+	height: 20px;
+}
+.vx-closing__btn--primary {
+	padding-right: 24px;
+	background: linear-gradient(180deg, #fbca7c, #f7b354);
+	color: #1a1307;
+	font-weight: 600;
+	box-shadow: 0 0 0 1px rgba(120, 80, 20, 0.25);
+}
+/* the amber bloom under the primary button */
+.vx-closing__btn--primary::before {
+	content: '';
+	position: absolute;
+	z-index: -1;
+	inset: -40px -70px;
+	pointer-events: none;
+	background: radial-gradient(closest-side, rgba(240, 166, 62, 0.4), rgba(240, 166, 62, 0.12) 55%, transparent);
+}
+.vx-closing__btn--primary::after {
+	content: '';
+	position: absolute;
+	left: 16px;
+	right: 16px;
+	top: 0;
+	height: 1px;
+	border-radius: 1px;
+	background: rgba(255, 236, 190, 0.6);
+}
+.vx-closing__btn--primary:hover {
+	filter: brightness(1.05);
+}
+.vx-closing__btn--ghost {
+	padding-left: 24px;
+	border: 1px solid transparent;
+	background: linear-gradient(#0e1218, #0e1218) padding-box, linear-gradient(180deg, #3a4148, #252a33) border-box;
+	color: var(--text);
+}
+.vx-closing__btn--ghost:hover {
+	background: linear-gradient(var(--surface-2), var(--surface-2)) padding-box, linear-gradient(180deg, #4a525b, #2c323b) border-box;
+}
+.vx-closing__actions {
+	position: relative;
+	z-index: 0;
+}
+
+/* ------------------------------------------------------------------ footer */
+.vx-footer {
+	padding: clamp(48px, 5vw, 72px) 0 clamp(56px, 6vw, 88px);
+	border-top: 1px solid #31363d;
+	box-shadow: inset 0 1px 0 rgba(120, 130, 145, 0.06);
+}
+.vx-footer__inner {
+	display: grid;
+	grid-template-columns: minmax(0, 1.9fr) repeat(3, minmax(0, 1fr));
+	gap: 32px;
+}
+.vx-footer__brand {
+	display: inline-flex;
+	align-items: center;
+	gap: 12px;
+	min-height: 44px;
+	color: var(--text);
+	font-size: 1.5rem;
+	font-weight: 500;
+	letter-spacing: -0.03em;
+	text-decoration: none;
+}
+.vx-footer__brand img {
+	width: 36px;
+	height: auto;
+}
+.vx-footer__tag,
+.vx-footer__lic {
+	font-size: 1rem;
+	line-height: 1.5;
+	color: var(--text-2);
+}
+.vx-footer__tag {
+	margin-top: 1.25rem;
+}
+.vx-footer__lic {
+	margin-top: 0.75rem;
+}
+.vx-footer__lic a {
+	margin: 0 -2px;
+	padding: 11px 2px;
+	color: var(--accent);
+	text-decoration: underline;
+	text-decoration-thickness: 1px;
+	text-underline-offset: 4px;
+}
+.vx-footer__col h2 {
+	font-size: 0.9375rem;
+	font-weight: 600;
+	line-height: 1.3;
+	color: var(--text);
+}
+.vx-footer__col ul {
+	margin-top: 1.1rem;
+	list-style: none;
+}
+.vx-footer__col li {
+	font-size: 1rem;
+	line-height: 1.4;
+}
+.vx-footer__col li + li {
+	margin-top: 0.8rem;
+}
+.vx-footer__col a {
+	margin: 0 -6px;
+	padding: 11px 6px;
+	color: var(--text-2);
+	text-decoration: none;
+	transition: color 0.15s ease;
+}
+.vx-footer__col a:hover {
+	color: var(--text);
+	text-decoration: underline;
+}
+
+@media (max-width: 1023px) {
+	.vx-footer__inner {
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		row-gap: 40px;
+	}
+	.vx-footer__about {
+		grid-column: 1 / -1;
+	}
+}
+@media (max-width: 767px) {
+	.vx-closing__glow {
+		background:
+			radial-gradient(80% 40% at 0% 0%, rgba(35, 30, 26, 1), rgba(35, 30, 26, 0) 100%),
+			radial-gradient(70% 40% at 100% 60%, rgba(14, 21, 32, 1), rgba(14, 21, 32, 0) 100%),
+			#0a0d12;
+	}
+	.vx-footer__inner {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 32px 20px;
+	}
+	.vx-footer__col li {
+		font-size: 1rem;
+		line-height: 44px;
+	}
+	.vx-footer__col li + li {
+		margin-top: 0;
+	}
+	.vx-footer__col ul {
+		margin-top: 0.5rem;
+	}
+	.vx-footer__col a {
+		display: inline-block;
+		min-width: 44px;
+		margin: 0;
+		padding: 0;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.vx-closing__btn,
+	.vx-footer__col a {
+		transition: none;
+	}
+}
