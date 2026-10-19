@@ -197,6 +197,10 @@ func (e duckdbEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
 	return c.(*duckdb.Conn), nil
 }
 
+// CatalogLock is a no-op here: the in-memory DuckDB the tests open has no
+// attached Iceberg catalog with a shared table set to serialize against.
+func (duckdbEngine) CatalogLock() func() { return func() {} }
+
 func newEngine(t *testing.T) duckdbEngine {
 	t.Helper()
 	c, err := duckdb.NewConnector("", nil)

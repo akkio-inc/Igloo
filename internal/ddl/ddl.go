@@ -106,7 +106,13 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, edited: map[key]uint64{},
 		log: log.With("component", "ddl"), touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
-	if _, err := m.SyncViews(ctx); err != nil {
+	// Loading the views reads and fills in the catalog's set of tables; hold
+	// the exclusive side (see Run). Nothing else runs yet, but this keeps the
+	// rule that every sync outside a statement holds the lock.
+	release := eng.CatalogLock()
+	_, err = m.SyncViews(ctx)
+	release()
+	if err != nil {
 		m.log.Warn("could not load views", "err", err)
 	}
 	return m, nil
@@ -129,7 +135,16 @@ func (m *Manager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if _, err := m.PollViews(ctx); err != nil && ctx.Err() == nil {
+			// Polling lists the catalog's views and binds their bodies, which
+			// reads and fills in its in-memory set of tables; hold the
+			// exclusive side so nothing else reaches the set on this instance
+			// while it does (see engine.Engine.CatalogLock). A statement's own
+			// SyncViews takes this lock at the pgwire layer, so sync itself
+			// does not.
+			release := m.eng.CatalogLock()
+			_, err := m.PollViews(ctx)
+			release()
+			if err != nil && ctx.Err() == nil {
 				m.log.Warn("could not sync views", "err", err)
 			}
 		}

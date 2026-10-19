@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -71,6 +72,9 @@ type Engine struct {
 	policies atomic.Pointer[func() *policy.Snapshot]
 	// erasure supplies igloo.erasure_requests; see SetErasure.
 	erasure atomic.Pointer[erasureConfig]
+	// catMu keeps binding, walking and changing the attached catalog's
+	// in-memory set of tables apart. See CatalogLock.
+	catMu sync.RWMutex
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -135,6 +139,70 @@ func (e *Engine) Catalog() string { return e.catalog }
 
 // LocalDatabase is the name of DuckDB's own database.
 func (e *Engine) LocalDatabase() string { return e.local }
+
+// CatalogLock keeps the embedded DuckDB from crashing when the attached
+// Iceberg catalog's tables are walked and changed at the same time. It takes
+// the lock exclusively; CatalogShare takes it shared.
+//
+// DuckDB-Iceberg keeps one in-memory set of the catalog's tables per schema
+// of the attached catalog, shared by every session's connection, and three
+// things reach it:
+//
+//   - Binding a statement looks each table it names up in the set and, under
+//     DuckDB-Iceberg's lock on the set, replaces the table's entry with a
+//     fresh one. DuckDB binds a statement that reads the catalog again each
+//     time it runs, not only when it is prepared.
+//   - A listing (duckdb_tables(), duckdb_views(), duckdb_columns(),
+//     information_schema, pg_catalog, SHOW, DESCRIBE, a missing-table
+//     suggestion) walks the set under that lock and reads the entries it
+//     found after letting go of it; its transaction keeps them alive, but
+//     only as the set had them at its latest walk, so when a bind replaces
+//     an entry between two walks of one listing, the second walk frees what
+//     the first one is still reading.
+//   - A rename or drop finds the table's entry and, when it commits, erases
+//     it from the set without that lock.
+//
+// So an erase alongside a bind or a walk, or a bind between a listing's
+// walks, on this instance corrupts the set or frees memory still in use:
+// the process segfaults, or a later listing loops forever, taking down every
+// session on the replica. A dbt run swapping tables (CTAS, rename, drop)
+// while a BI tool browses schemas or a dashboard refreshes hits this.
+//
+// So the steps that reach the set hold this lock while they run. DDL,
+// listings, and preparing a statement (Igloo's checks list the catalog) hold
+// it exclusively and run one at a time; binding a statement, which DuckDB
+// does again as each run starts, holds it shared, alongside other binds,
+// which DuckDB-Iceberg's own lock keeps apart. What does not reach the set —
+// reading table data once bound, and INSERT/UPDATE/DELETE writing and
+// committing a snapshot of the tables bound — holds nothing. The pgwire
+// layer decides which steps take it and how (see Server.catalogRunLock,
+// holdCatalog, shareCatalog, and the bind hold Server.openSession sets on
+// each session's connection). Callers outside a session take it
+// exclusively. DDL on another replica or engine reaches this replica only
+// through the Iceberg REST catalog, not this set, so it cannot crash this
+// instance and this lock does not cover it; a listing here may lag such a
+// change by a sync.
+//
+// It returns the func that releases it, for use with defer:
+//
+//	defer e.CatalogLock()()
+//
+// It is not reentrant (sync.RWMutex): the pgwire layer makes it reentrant
+// per session (see holdCatalog); a caller outside a session holds it at most
+// once, and never takes it from inside a DuckDB call on a connection whose
+// session holds it.
+func (e *Engine) CatalogLock() func() {
+	e.catMu.Lock()
+	return e.catMu.Unlock
+}
+
+// CatalogShare takes the catalog lock shared, for binding a statement
+// against the catalog's in-memory set (see CatalogLock), and returns the
+// func that releases it.
+func (e *Engine) CatalogShare() func() {
+	e.catMu.RLock()
+	return e.catMu.RUnlock
+}
 
 // LoadSchemas makes the catalog views (information_schema, pg_catalog,
 // duckdb_columns) show the real columns of every Iceberg table. DuckDB loads

@@ -271,6 +271,49 @@ them on a node pool or machines that are stopped while idle. The
 [design document](design/distributed-execution.md#evidence) has the
 measurements behind these numbers.
 
+## Concurrency on a replica
+
+A replica serves many sessions at once. Reads and writes of table data run
+fully in parallel — each uses DuckDB's threads, and any number run side by
+side — because none of them holds the catalog while it runs. What is
+serialized on each replica is only the short work that reaches the catalog's
+own structure, so that a table is never listed or resolved while it is being
+created, renamed or dropped there:
+
+- Preparing a statement (resolving the tables it names and checking it),
+  listing the catalog (`information_schema`, `pg_catalog`,
+  `duckdb_tables()`/`duckdb_views()`, `SHOW`, `DESCRIBE`, `PRAGMA`), and DDL
+  (creating, renaming, dropping or altering a table, view or schema) take the
+  catalog to themselves while they run.
+- Binding a statement again as it starts to run, which DuckDB does on every
+  run of a statement that reads the catalog, shares it with other sessions
+  doing the same, but not with the steps above.
+- Everything else — reading table data once the statement is bound, and
+  `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
+  snapshot of the tables bound — holds nothing.
+
+These serialized steps are brief (preparing or binding a statement, a
+listing, most DDL), and they do not wait for data queries to finish, nor data
+queries for them beyond their bind. So a `dbt` run swapping tables and a BI
+tool browsing schemas take turns with each other and with other sessions'
+statement preparation, for a moment each, while long reads and writes run
+alongside them undisturbed. DDL holds the catalog for its whole run, though:
+a `CREATE TABLE ... AS` that writes a large table keeps other sessions on the
+replica from starting statements until it commits.
+
+The turns cost throughput of short queries on a busy replica. On a shared
+18-core test machine, against the same build without them, 8 to 64 sessions
+of point lookups ran 18–25% fewer queries a second (with lower tail
+latency), one session and TPC-H queries at 1 and 8 sessions were within
+noise, and 8 sessions of point lookups ran about half as many queries while
+a `dbt`-style loop swapped a small table, and about a third as many while it
+rebuilt a 1.5-million-row table, as fast as it could — the loads in which
+the build without them crashed. This keeps the embedded engine's one shared
+view of the catalog consistent under concurrency. Changes made on another
+replica, or by another engine, reach this one through the Iceberg REST
+catalog within the 30-second view sync, and this serialization, which is per
+replica, does not cover them.
+
 ## Read cache
 
 Reading table files from object storage is far slower than reading them

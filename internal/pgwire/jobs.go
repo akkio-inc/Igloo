@@ -739,10 +739,14 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		}
 		start := time.Now()
 		var loads []tasks.Load
+		// COPY INTO reaches the catalog's in-memory set (see
+		// copyIntoStatement); hold the exclusive side.
+		releaseCatalog := s.holdCatalog(sess)
 		err = sess.runCancelable(ctx, j.Statement, func(ctx context.Context) error {
 			loads, _, err = s.copyInto(ctx, sess, owner, cp, j.Name)
 			return err
 		})
+		releaseCatalog()
 		if err == nil && len(loads) == 0 {
 			return 0, tasks.ErrIdle
 		}
@@ -840,6 +844,11 @@ func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, use
 	backoff := 20 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		var rows int64
+		// The DELETE and INSERT resolve the table and commit a new snapshot,
+		// which reach the catalog's in-memory set; hold the exclusive side
+		// around each attempt, releasing it before any backoff (see
+		// holdCatalog).
+		releaseCatalog := s.holdCatalog(sess)
 		_, err := exec(ctx, "BEGIN")
 		if err == nil {
 			_, err = exec(ctx, "DELETE FROM "+qualified)
@@ -849,10 +858,12 @@ func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, use
 		}
 		if err == nil {
 			if _, err = exec(ctx, "COMMIT"); err == nil {
+				releaseCatalog()
 				return rows, g.applied, nil
 			}
 		}
 		_, _ = exec(context.WithoutCancel(ctx), "ROLLBACK")
+		releaseCatalog()
 		if !commitConflict(err) || attempt == maxCommitRetries {
 			return -1, nil, pgError(err)
 		}

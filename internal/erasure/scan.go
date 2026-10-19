@@ -16,9 +16,14 @@ import (
 
 // Engine opens DuckDB connections that no policy applies to: an erasure
 // must see the values masking policies hide, and every row. *engine.Engine
-// is one.
+// is one. CatalogLock serializes
+// access to the attached catalog's in-memory set of tables, so an erasure's
+// DELETE or COUNT on a catalog table does not run while a user statement
+// reads that set on this instance (see engine.Engine.CatalogLock); the file
+// scans, which read Parquet by path and never touch the set, do not take it.
 type Engine interface {
 	Connect(ctx context.Context) (*duckdb.Conn, error)
+	CatalogLock() func()
 }
 
 // Rows deletes and counts a table's rows that match a condition, in SQL on
@@ -50,6 +55,7 @@ func (c catalogRows) name(tbl *table.Table) string {
 // Delete sends one DELETE: one that loses a commit race is sent again by
 // the delete step, on the table loaded and checked again (see deleteFrom).
 func (c catalogRows) Delete(ctx context.Context, tbl *table.Table, cond string) (int64, error) {
+	defer c.engine.CatalogLock()()
 	conn, err := c.engine.Connect(ctx)
 	if err != nil {
 		return 0, err
@@ -63,6 +69,7 @@ func (c catalogRows) Delete(ctx context.Context, tbl *table.Table, cond string) 
 }
 
 func (c catalogRows) Count(ctx context.Context, tbl *table.Table, cond string) (int64, error) {
+	defer c.engine.CatalogLock()()
 	conn, err := c.engine.Connect(ctx)
 	if err != nil {
 		return 0, err

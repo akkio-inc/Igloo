@@ -122,22 +122,29 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 		if err != nil {
 			return pgerror.WithCode(err, codes.InvalidTextRepresentation)
 		}
-		if err := s.recheck(ctx, sess, st); err != nil {
-			return err
+		// Rechecking and preparing the cursor's own statement both read and
+		// fill in the catalog's set (see holdCatalog).
+		relist := s.holdCatalog(sess)
+		err = s.recheck(ctx, sess, st)
+		var own *statement
+		if err == nil {
+			// The cursor gets a statement of its own, which lives as long as
+			// it does; the one prepared here is released with the DECLARE.
+			own, err = prepare(ctx, sess.conn, st.query, st.params)
 		}
-		// The cursor gets a statement of its own, which lives as long as
-		// it does; the one prepared here is released with the DECLARE.
-		own, err := prepare(ctx, sess.conn, st.query, st.params)
+		relist()
 		if err != nil {
 			return pgError(err)
 		}
 		start := time.Now()
 		var rows driver.Rows
+		releaseCatalog := s.catalogRunLock(sess, st)
 		err = sess.runCancelable(ctx, query, func(ctx context.Context) error {
 			var err error
 			rows, err = own.stmt.QueryContext(ctx, args)
 			return err
 		})
+		releaseCatalog()
 		s.metrics.query(start, err)
 		if err != nil {
 			_ = own.close()

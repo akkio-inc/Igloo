@@ -59,6 +59,12 @@ type statement struct {
 	// table or view in the Iceberg catalog, so it runs outside the
 	// session's transaction block (see outsideTransaction).
 	changesIceberg bool
+	// listsCatalog says the statement walks the catalog's in-memory set of
+	// tables or views (information_schema, pg_catalog,
+	// duckdb_tables/views/columns, SHOW, DESCRIBE), so it holds the catalog
+	// lock exclusively while it runs rather than only for its bind (see
+	// catalogRunLock).
+	listsCatalog bool
 	// unknown says DuckDB could not tell the type of a column of the result
 	// when it prepared the statement.
 	unknown bool

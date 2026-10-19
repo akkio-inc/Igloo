@@ -321,6 +321,10 @@ func (d duckdbConnector) Connect(ctx context.Context) (*duckdb.Conn, error) {
 	return c.(*duckdb.Conn), nil
 }
 
+// CatalogLock is a no-op here: these tests open DuckDB without an attached
+// Iceberg catalog whose shared table set would need serializing.
+func (duckdbConnector) CatalogLock() func() { return func() {} }
+
 // countRows counts n matching rows in every table, and deletes none.
 type countRows int64
 

@@ -656,6 +656,10 @@ func (s *Server) shareSource(ctx context.Context, sess *session, c *shareCommand
 	if err != nil {
 		return sharing.SharedTable{}, err
 	}
+	// duckdb_tables() walks the catalog's in-memory set; hold the exclusive
+	// side so it does not run while a table is renamed or dropped on this
+	// instance (reentrant; see holdCatalog).
+	defer s.holdCatalog(sess)()
 	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM system.main.duckdb_tables()
 		WHERE database_name = $1 AND schema_name = $2 AND table_name = $3`, s.catalogName(), o.Schema, o.Table)
 	if err != nil {

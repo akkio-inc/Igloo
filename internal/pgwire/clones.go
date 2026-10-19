@@ -177,6 +177,11 @@ func (s *Server) cloneStatement(sess *session, q wire.Query) (wire.PreparedState
 	return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 		start := time.Now()
 		var acc *access
+		// A clone creates and may replace catalog tables, and binds the
+		// views it copies; hold the exclusive side so listings do not run
+		// against it on this instance (see holdCatalog).
+		releaseCatalog := s.holdCatalog(sess)
+		defer releaseCatalog()
 		err := sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			var err error
 			acc, err = s.runClone(ctx, sess, c)

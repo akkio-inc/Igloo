@@ -733,6 +733,13 @@ func policyRules(t duckdb.StmtType, query string) error {
 // statements on the session's connection, after which statements prepared
 // earlier must be prepared again (see reprepare).
 func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32) (string, *guard, bool, error) {
+	// Applying policies resolves names and runs DESCRIBE and sensitivity
+	// checks, all of which walk the catalog's in-memory set. Most callers
+	// already hold the catalog (preparing or rechecking a statement); a
+	// materialized view's refresh calls this on its own. Hold the exclusive
+	// side so none of it runs while a table is renamed or dropped on this
+	// instance (reentrant; see holdCatalog).
+	defer s.holdCatalog(sess)()
 	snap := s.gov.snapshot(ctx)
 	g := &guard{policyGen: s.gov.gen.Load(), catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
 	// Tags and data retentions follow names too, policies or not: a
@@ -1127,7 +1134,13 @@ func (s *Server) catalogTarget(ctx context.Context, sess *session, parts []strin
 		}
 		return auth.Object{Schema: parts[0], Table: parts[1]}, true, nil
 	case 1:
-		if temp, err := isTemporary(ctx, sess.conn, parts[0]); err != nil || temp {
+		// isTemporary lists with duckdb_tables()/duckdb_views(), which walk
+		// the catalog's in-memory set; hold the exclusive side (reentrant;
+		// see holdCatalog).
+		release := s.holdCatalog(sess)
+		temp, err := isTemporary(ctx, sess.conn, parts[0])
+		release()
+		if err != nil || temp {
 			return auth.Object{}, false, err
 		}
 		db, current, err := currentSchema(ctx, sess.conn)

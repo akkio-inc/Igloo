@@ -57,6 +57,12 @@ type Engine interface {
 	LoadSchemas(ctx context.Context, conn *duckdb.Conn) error
 	// LocalDatabase is the name of DuckDB's own database.
 	LocalDatabase() string
+	// CatalogLock and CatalogShare take the lock that keeps changes to the
+	// structure of the catalog's in-memory set of tables from running
+	// alongside walks and binds of it, exclusively and shared; each returns the
+	// func that releases it. See engine.Engine.CatalogLock.
+	CatalogLock() func()
+	CatalogShare() func()
 }
 
 // Options configures the server.
@@ -501,6 +507,15 @@ type session struct {
 	settings *settingsCheck
 	// distMode is the session's distributed_execution; empty means auto.
 	distMode distributed.Mode
+	// catHolds are the holds on the engine's catalog lock this session's
+	// steps have taken and not released, catHeld how the engine lock is held
+	// for them, and catRelease what releases it, so the several steps that
+	// reach the catalog's in-memory set while one statement is handled can
+	// take it without deadlocking (see holdCatalog). Touched only by the
+	// goroutine handling the session's statements, which is serial.
+	catHolds   []*catalogHold
+	catHeld    catalogMode
+	catRelease func()
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -579,13 +594,26 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	if sess == nil {
 		return ctx, errors.New("session was not authenticated")
 	}
+	// Opening the connection selects the catalog's default schema, which
+	// binds against the catalog like any statement does (see the bind hold
+	// below), before that hold is set; hold the lock shared for it.
+	releaseCatalog := s.shareCatalog(sess)
 	conn, meter, err := s.engine.ConnectMetered(ctx)
+	releaseCatalog()
 	if err != nil {
 		s.sessions.remove(sess)
 		s.releaseConn()
 		return ctx, fmt.Errorf("open session: %w", err)
 	}
 	sess.conn, sess.wl.meter, sess.wl.controller = conn, meter, s.workload
+	// Binding a statement looks its tables up in the catalog's in-memory set
+	// and replaces their entries there, and DuckDB binds a statement that
+	// reads the catalog again each time it runs, not only when it is
+	// prepared. Hold the catalog lock shared for every bind on this
+	// connection, so none runs while DDL renames or drops a table or a
+	// listing walks the set (see shareCatalog); running the statement after
+	// that holds nothing more.
+	conn.SetBindHold(func() func() { return s.shareCatalog(sess) })
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			s.sessions.remove(sess)
@@ -763,6 +791,21 @@ func txStatus(ctx context.Context) types.ServerStatus {
 // that read table OIDs, because loading a schema gives the table a new OID
 // and clients such as psql look up an OID before listing its columns.
 var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_schema"?\s*\.\s*"?columns|pg_information_schema_columns|duckdb_columns)\b`)
+
+// listsCatalog matches a statement whose run walks the catalog's in-memory
+// set of tables and views and so, unlike a plain data read, holds the
+// catalog lock exclusively while it runs (see catalogRunLock). It covers
+// DuckDB's catalog listing functions and the pg_catalog, information_schema
+// and sqlite_master relations BI tools and drivers read, by the names the
+// statement is written with and the names Igloo rewrites them to, and SHOW,
+// DESCRIBE and PRAGMA. It over-approximates: a statement matched needlessly
+// only runs on its own when it could have run alongside others.
+var listsCatalog = regexp.MustCompile(`(?is)(^\s*(SHOW|DESCRIBE|DESC|PRAGMA)\b)|` +
+	`\b(sqlite_master|sqlite_schema|sqlite_temp_master|sqlite_temp_schema|` +
+	`duckdb_tables|duckdb_views|duckdb_columns|duckdb_constraints|duckdb_databases|duckdb_schemas|` +
+	`information_schema|information_schema_tables|information_schema_schemata|` +
+	`pg_catalog|pg_class|pg_attribute|pg_namespace|pg_tables|pg_views|pg_matviews|` +
+	`pg_information_schema_columns|pg_description|pg_type|pg_proc)\b`)
 
 var deallocateAll = regexp.MustCompile(`(?is)^\s*DEALLOCATE\s+(?:PREPARE\s+)?ALL\s*;?\s*$`)
 
@@ -953,7 +996,13 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		tw := &tagWriter{DataWriter: w}
 		err = sess.checkAborted(st.query)
 		if err == nil {
+			// Rechecking re-plans with EXPLAIN and may re-apply policies,
+			// both of which read and fill in the catalog's set; release
+			// before the run takes the side it needs (see holdCatalog,
+			// catalogRunLock).
+			relist := s.holdCatalog(sess)
 			err = s.recheck(ctx, sess, st)
+			relist()
 		}
 		if err != nil {
 			s.metrics.query(start, err)
@@ -961,6 +1010,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			return err
 		}
 		workers := 0
+		// Hold the catalog lock only while the statement runs, not through
+		// the metrics and ownership bookkeeping below, to keep the exclusive
+		// window short (see catalogRunLock, holdCatalog).
+		releaseCatalog := s.catalogRunLock(sess, st)
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			run := func() error {
 				n, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
@@ -980,6 +1033,7 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			}
 			return run()
 		})
+		releaseCatalog()
 		var used *audit.Resources
 		if err == nil {
 			used = sess.measure(st)
@@ -1014,6 +1068,143 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	return wire.Prepared(ps), nil
 }
 
+// catalogMode is how a step holds the engine's catalog lock.
+type catalogMode int
+
+const (
+	catalogFree catalogMode = iota
+	catalogShared
+	catalogExclusive
+)
+
+// catalogHold is one step's hold on the catalog lock (see holdCatalog).
+type catalogHold struct{ mode catalogMode }
+
+// holdCatalog takes the engine's catalog lock exclusively for one step of
+// handling a statement that reaches the catalog's in-memory set of tables
+// (see engine.Engine.CatalogLock and catalogRunLock). shareCatalog takes it
+// shared, for DuckDB binding a statement (the bind hold openSession sets):
+// binds are safe alongside each other, not alongside the rest. Holds are
+// reentrant per session: the several steps that reach the set while one
+// statement is handled (preparing it, binding it, rechecking it, running it,
+// and the commands that resolve or list catalog objects) each take one
+// without deadlocking, and the engine lock is held once, in the strongest
+// mode the session's holds need. A step that needs it exclusively inside one
+// that holds it shared has the session let go of it and take it exclusively,
+// and back once that step is done; that is safe because the session's steps
+// change holds only between DuckDB's calls, never during one, so nothing of
+// the session's is reaching the set while it holds no lock. The returned
+// func releases this step's hold. With no catalog attached there is no set
+// to guard, so they do nothing.
+func (s *Server) holdCatalog(sess *session) func() {
+	return s.catalogHold(sess, catalogExclusive)
+}
+
+// shareCatalog takes the catalog lock shared for one step; see holdCatalog.
+func (s *Server) shareCatalog(sess *session) func() {
+	return s.catalogHold(sess, catalogShared)
+}
+
+func (s *Server) catalogHold(sess *session, mode catalogMode) func() {
+	if s.catalogName() == "" {
+		return func() {}
+	}
+	h := &catalogHold{mode: mode}
+	sess.catHolds = append(sess.catHolds, h)
+	s.relockCatalog(sess)
+	return func() {
+		if i := slices.Index(sess.catHolds, h); i >= 0 {
+			sess.catHolds = slices.Delete(sess.catHolds, i, i+1)
+			s.relockCatalog(sess)
+		}
+	}
+}
+
+// relockCatalog holds the engine's catalog lock as the session's holds need:
+// exclusively if one of them is exclusive, shared if any is, else not.
+func (s *Server) relockCatalog(sess *session) {
+	want := catalogFree
+	for _, h := range sess.catHolds {
+		want = max(want, h.mode)
+	}
+	if want == sess.catHeld {
+		return
+	}
+	s.unlockCatalog(sess)
+	switch want {
+	case catalogExclusive:
+		sess.catRelease = s.engine.CatalogLock()
+	case catalogShared:
+		sess.catRelease = s.engine.CatalogShare()
+	}
+	sess.catHeld = want
+}
+
+// unlockCatalog lets go of the engine's catalog lock the session holds, if
+// any, keeping its holds.
+func (s *Server) unlockCatalog(sess *session) {
+	if sess.catRelease != nil {
+		sess.catRelease()
+		sess.catRelease = nil
+	}
+	sess.catHeld = catalogFree
+}
+
+// withoutCatalog runs wait, which waits for another goroutine that takes the
+// catalog lock itself, with the session's hold on the lock let go of, and
+// takes it back as the session's holds need once wait returns. Like the
+// changes of mode in relockCatalog, it must be called between DuckDB's
+// calls, never during one; it does not change the session's holds.
+func (s *Server) withoutCatalog(sess *session, wait func()) {
+	if sess == nil || sess.catRelease == nil {
+		wait()
+		return
+	}
+	s.unlockCatalog(sess)
+	defer s.relockCatalog(sess)
+	wait()
+}
+
+// catalogRunLock holds the catalog lock exclusively for a run that changes
+// the catalog or lists it, and not at all for any other run.
+//
+// DuckDB-Iceberg's one in-memory set of the catalog's tables is the shared
+// state that is not safe under concurrency (see engine.Engine.CatalogLock).
+// DDL that renames or drops a table removes entries from it without
+// DuckDB-Iceberg's own lock, and a listing walks it while a bind replaces
+// the entries of the tables it names, so the runs that do either take the
+// lock exclusively and run on their own: DDL, by its statement type (create,
+// drop, alter, attach, detach, whatever the database: the last statement of
+// several an admin sends may be one, and the Iceberg DDL Igloo recognizes,
+// changesIceberg, is always one), EXECUTE of a statement prepared in SQL,
+// which may be any of these, and listings (information_schema, pg_catalog,
+// duckdb_tables()/views()/columns(), SHOW, DESCRIBE, PRAGMA; see
+// listsCatalog). Preparing and rechecking any statement take it exclusively
+// too, since Igloo's checks list the catalog (see prepareChecked, recheck).
+//
+// The run of any other statement holds the lock only while DuckDB binds the
+// statement again to run it, which it does each time for a statement that
+// reads the catalog, replacing the entries of the tables it names (see the
+// bind hold openSession sets). Those binds hold it shared: they take
+// DuckDB-Iceberg's own lock, so they run alongside each other, just not
+// alongside DDL, a listing or a prepare.
+//
+// After that bind the run holds nothing: a data read scans the files of the
+// tables it bound, and a write (INSERT, UPDATE, DELETE, MERGE) commits a new
+// snapshot of them — neither changes the set or walks it. Holding nothing
+// lets reads and writes run concurrently and, as importantly, keeps a long
+// run from blocking another session that needs to prepare, list or change
+// the catalog, and a write from blocking a second writer whose commit it
+// must see to retry on a conflict. Statements that do not reach the catalog
+// (SET, transaction control) and sessions with no catalog attached hold
+// nothing either.
+func (s *Server) catalogRunLock(sess *session, st *statement) func() {
+	if st.changesIceberg || st.listsCatalog || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
+		return s.holdCatalog(sess)
+	}
+	return func() {}
+}
+
 // prepareStatement rewrites text for DuckDB, checks it against the user's
 // role and grants and prepares it on the session's connection. oids are
 // the parameter types the client declared. Errors carry PostgreSQL codes,
@@ -1041,7 +1232,7 @@ func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, tex
 		query = s.withoutIcebergCascade(ctx, sess, s.ddl.RewriteViewRefs(query))
 	}
 	if readsMetadata.MatchString(query) {
-		s.refreshMetadata(ctx)
+		s.refreshMetadata(ctx, sess)
 	}
 	return query
 }
@@ -1051,6 +1242,13 @@ func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, tex
 // (COPY INTO, materialized views): they are checked exactly like the
 // user's own.
 func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
+	// Preparing reads and fills in the catalog's in-memory set of tables:
+	// DuckDB binds the statement (and suggests names for a missing table),
+	// and Igloo resolves names, loads schemas and checks grants the same way,
+	// filling in each table it names on first use. Hold the exclusive side so
+	// no other statement reads the set while this changes it (see
+	// holdCatalog).
+	defer s.holdCatalog(sess)()
 	fail := func(err error) (*statement, error) { return nil, err }
 	var viewGen uint64
 	if s.ddl != nil {
@@ -1206,6 +1404,11 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if changesCatalog(st.stmtType) {
 		st.changesIceberg = s.changesIceberg(ctx, sess, st.stmtType, query)
 	}
+	// A statement that lists the catalog's tables or views walks the set and
+	// holds the catalog lock exclusively when it runs (see catalogRunLock);
+	// checked against the statement as written and as rewritten to the
+	// relations Igloo answers it with.
+	st.listsCatalog = listsCatalog.MatchString(text) || listsCatalog.MatchString(query)
 	if st.access != nil && st.access.ranStatements {
 		// Checking grants ran statements on the session's connection.
 		if err := st.reprepare(ctx, sess.conn); err != nil {

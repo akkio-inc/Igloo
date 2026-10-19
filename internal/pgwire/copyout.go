@@ -209,12 +209,17 @@ func (s *Server) copyToCommand(ctx context.Context, sess *session, user auth.Use
 		if q.SimpleQuery {
 			defer sess.release(ps) //nolint:errcheck
 		}
-		if err := s.recheck(ctx, sess, st); err != nil {
+		relist := s.holdCatalog(sess)
+		err := s.recheck(ctx, sess, st)
+		relist()
+		if err != nil {
 			return err
 		}
 		start := time.Now()
 		var n int64
-		err := sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
+		releaseCatalog := s.catalogRunLock(sess, st)
+		defer releaseCatalog()
+		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			var err error
 			n, err = c.write(ctx, st, w)
 			return err

@@ -277,7 +277,12 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		}
 	}
 	if isView && !view.drop {
-		if err := s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, sess, user, view.query)); err != nil {
+		// Authorizing a view's reads rewrites and analyzes its body, which
+		// reads and fills in the catalog's set (see holdCatalog).
+		relist := s.holdCatalog(sess)
+		err := s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, sess, user, view.query))
+		relist()
+		if err != nil {
 			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 			s.metrics.query(time.Now(), err)
 			s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: -1})
@@ -328,6 +333,11 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		if err := sess.checkAborted(query); err != nil {
 			return record(err)
 		}
+		// Creating or renaming a view binds its body, which reads and fills
+		// in the catalog's set; hold the exclusive side so nothing else
+		// reaches the set on this instance while it does (see holdCatalog).
+		releaseCatalog := s.holdCatalog(sess)
+		defer releaseCatalog()
 		err := sess.runCancelable(ctx, query, func(ctx context.Context) error {
 			return sess.outsideTransaction(ctx, func() error { return run(ctx) })
 		})
@@ -463,7 +473,13 @@ func (s *Server) resolveCatalogName(ctx context.Context, sess *session, parts []
 		return parts[0], parts[1], true, nil
 	case 1:
 		// As in DuckDB, an unqualified name means a temporary object first.
-		if temp, err := isTemporary(ctx, sess.conn, parts[0]); err != nil || temp {
+		// isTemporary lists with duckdb_tables()/duckdb_views(), which walk
+		// the catalog's in-memory set; hold the exclusive side (reentrant;
+		// see holdCatalog).
+		release := s.holdCatalog(sess)
+		temp, err := isTemporary(ctx, sess.conn, parts[0])
+		release()
+		if err != nil || temp {
 			return "", "", false, err
 		}
 		db, current, err := currentSchema(ctx, sess.conn)

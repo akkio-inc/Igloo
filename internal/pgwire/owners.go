@@ -257,7 +257,7 @@ func (s *Server) showObjects(ctx context.Context, sess *session, user auth.User,
 		return pgerror.WithCode(fmt.Errorf("%s is not a schema of the %s catalog", strings.Join(schema, "."), catalogName),
 			codes.FeatureNotSupported)
 	}
-	s.refreshMetadata(ctx)
+	s.refreshMetadata(ctx, sess)
 	access, err := s.metadataAccess(ctx, sess, user)
 	if err != nil {
 		return denied("could not load grants: %v", err)

@@ -98,8 +98,17 @@ func (s *Server) names(ctx context.Context, sess *session) (*sessionNames, error
 	n.schema, _ = rows[0][2].(string)
 	n.path = parseSearchPath(setting, n.db)
 	if sess.ddlCount > 0 {
+		// duckdb_tables()/duckdb_views() list every attached database,
+		// walking the catalog's in-memory set; hold the exclusive side so
+		// this does not run while a table is renamed or dropped on this
+		// instance. Reentrant: when this is reached while preparing a
+		// statement the hold is already held (see holdCatalog); when reached
+		// afterwards, recording what a statement read, it takes the hold
+		// itself.
+		release := s.holdCatalog(sess)
 		temp, err := queryStrings(ctx, sess, `SELECT system.main.lower(table_name) FROM system.main.duckdb_tables() WHERE temporary
 			UNION ALL SELECT system.main.lower(view_name) FROM system.main.duckdb_views() WHERE temporary`)
+		release()
 		if err != nil {
 			return nil, err
 		}
@@ -334,6 +343,12 @@ func (a *analyzer) snapshot(ctx context.Context) *objectSnapshot {
 		return a.snap
 	}
 	snap := &objectSnapshot{gen: gen, at: time.Now(), databases: map[string]string{}, byName: map[string][]object{}}
+	// This runs on the analyzer's own connection, off the statement that
+	// queued the work, so it takes the catalog lock itself: listing the
+	// catalog's tables and views walks its in-memory set, which must not
+	// happen while a table is renamed or dropped on this instance (see
+	// engine.Engine.CatalogLock).
+	releaseCatalog := a.s.engine.CatalogLock()
 	rows, err := queryRows(ctx, a.conn, `SELECT database_name, schema_name, table_name, false, '', false
 			FROM system.main.duckdb_tables() WHERE NOT temporary
 		UNION ALL SELECT database_name, schema_name, view_name, true, sql, internal
@@ -347,6 +362,7 @@ func (a *analyzer) snapshot(ctx context.Context) *objectSnapshot {
 			}
 		}
 	}
+	releaseCatalog()
 	if err != nil {
 		a.s.log.Warn("could not list the catalog's objects for the history", "err", err)
 		if a.snap != nil {

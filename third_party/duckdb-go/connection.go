@@ -24,6 +24,8 @@ type Conn struct {
 	closed bool
 	// True, if the connection has an open transaction.
 	tx bool
+	// Igloo patch: called around each bind step (see SetBindHold).
+	bindHold func() (release func())
 }
 
 func newConn(conn mapping.Connection, ctxStore *contextStore) *Conn {
@@ -203,7 +205,9 @@ func (conn *Conn) prepareExtractedStmt(ctx context.Context, extractedStmts mappi
 	}
 
 	var stmt mapping.PreparedStatement
+	release := conn.holdBind()
 	state := mapping.PrepareExtractedStatement(conn.conn, extractedStmts, i, &stmt)
+	release()
 	if state == mapping.StateError {
 		err := getDuckDBError(mapping.PrepareError(stmt))
 		mapping.DestroyPrepare(&stmt)

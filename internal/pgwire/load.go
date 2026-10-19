@@ -294,11 +294,17 @@ func (s *Server) copyIntoStatement(sess *session, query string, c copyCommand) w
 		)
 		err := s.inNoTransaction(sess, "COPY INTO")
 		if err == nil {
+			// COPY INTO creates its target table when missing, resolves it
+			// and commits new snapshots, all of which reach the catalog's
+			// in-memory set; hold the exclusive side so nothing else reaches
+			// the set on this instance while it does (see holdCatalog).
+			releaseCatalog := s.holdCatalog(sess)
 			err = sess.runCancelable(ctx, query, func(ctx context.Context) error {
 				var err error
 				loads, target, err = s.copyInto(ctx, sess, user, c, "")
 				return err
 			})
+			releaseCatalog()
 		}
 		var total int64
 		if err == nil {

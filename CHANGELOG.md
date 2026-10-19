@@ -706,5 +706,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   changed meanwhile as those changes made them, and never apply a list older
   than one already applied; a statement that names a view another replica
   created finds it when any sync brought it, not only its own.
+- A listing of the catalog (`information_schema`, `pg_catalog`,
+  `duckdb_tables()`/`duckdb_views()`, `SHOW`, `DESCRIBE`), or even a plain
+  read, could crash or wedge the whole replica, ending every session on it,
+  when a table was renamed or dropped at the same time on that replica — a BI
+  tool browsing schemas while a `dbt` run swapped tables, which any user with
+  read access could set off. The embedded engine keeps one in-memory set of
+  the catalog's tables, shared by every session and changed as tables are
+  created, renamed, dropped or used; reading it while it changed corrupted
+  it. Igloo now serializes the short steps that reach that set on each
+  replica — preparing a statement, listing the catalog, and DDL that
+  creates, renames, drops or alters a table, view or schema — and lets
+  DuckDB bind a statement again as it starts to run only alongside other
+  such binds, while reading and writing table data, which do not change the
+  set, run alongside each other and those steps without waiting
+  (docs/operations.md#concurrency-on-a-replica).
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

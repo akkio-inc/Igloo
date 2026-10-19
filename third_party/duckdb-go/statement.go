@@ -777,8 +777,12 @@ func interruptRoutine(mainDoneCh, bgDoneCh *chan struct{}, ctx context.Context, 
 
 func (s *Stmt) executeBound(ctx context.Context) (*mapping.Result, error) {
 	var pendingRes mapping.PendingResult
-	// Phase 1: create pending result
-	if mapping.PendingPrepared(*s.preparedStmt, &pendingRes) == mapping.StateError {
+	// Phase 1: create pending result. DuckDB binds the statement again here
+	// when it must (see SetBindHold).
+	release := s.conn.holdBind()
+	pendingState := mapping.PendingPrepared(*s.preparedStmt, &pendingRes)
+	release()
+	if pendingState == mapping.StateError {
 		dbErr := getDuckDBError(mapping.PendingError(pendingRes))
 		mapping.DestroyPending(&pendingRes)
 		return nil, dbErr

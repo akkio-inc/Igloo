@@ -517,6 +517,11 @@ func (s *Server) connectionObjects(ctx context.Context, sess *session, kind stri
 	if s.fed == nil || len(name) == 0 || len(name) == 1 && kind != targetConnection {
 		return nil, false, nil
 	}
+	// This resolves objects with duckdb_tables(), which walks the catalog's
+	// in-memory set; GRANT runs it off the statement lifecycle, so it takes
+	// the exclusive side so it does not run while a table is renamed or
+	// dropped on this instance (reentrant; see holdCatalog).
+	defer s.holdCatalog(sess)()
 	conn := strings.ToLower(name[0])
 	exists, err := s.fed.Exists(ctx, conn)
 	if err != nil {
@@ -642,6 +647,10 @@ func (s *Server) resolveGrantTable(ctx context.Context, sess *session, name []st
 
 // catalogSchema returns the catalog schema called name, in its own case.
 func (s *Server) catalogSchema(ctx context.Context, sess *session, name string) (string, bool, error) {
+	// duckdb_schemas() walks the catalog's schemas, which a table's drop
+	// looks up without DuckDB-Iceberg's lock; hold the catalog lock
+	// exclusively (reentrant; see holdCatalog).
+	defer s.holdCatalog(sess)()
 	names, err := queryStrings(ctx, sess, `SELECT schema_name FROM system.main.duckdb_schemas()
 		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2)`, s.catalogName(), name)
 	if err != nil || len(names) == 0 {
@@ -654,6 +663,10 @@ func (s *Server) catalogSchema(ctx context.Context, sess *session, name string) 
 // Views are the catalog's, whose copies live in the local database, and
 // external tables (package sharing) count as tables.
 func (s *Server) catalogRelations(ctx context.Context, sess *session, schema string) ([]string, error) {
+	// Listing with duckdb_tables()/duckdb_views() walks the catalog's
+	// in-memory set; hold the exclusive side so it does not run while a table
+	// is renamed or dropped on this instance (reentrant; see holdCatalog).
+	defer s.holdCatalog(sess)()
 	tables, err := queryStrings(ctx, sess, `SELECT table_name FROM system.main.duckdb_tables()
 		WHERE database_name = $1 AND system.main.lower(schema_name) = system.main.lower($2) ORDER BY 1`, s.catalogName(), schema)
 	if err == nil && s.external != nil {

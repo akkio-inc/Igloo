@@ -297,7 +297,13 @@ func (s *Server) runConnectionCommand(ctx context.Context, sess *session, c *con
 			changed = &conn
 		}
 	case c.refresh:
+		// Refreshing lists every database's tables with duckdb_tables() on a
+		// connection of its own, which walks the catalog's in-memory set
+		// too; hold the catalog lock exclusively so that does not run while
+		// a table is renamed or dropped on this instance (see holdCatalog).
+		release := s.holdCatalog(sess)
 		err = s.fed.Refresh(ctx, c.name)
+		release()
 	case c.verb == "ALTER":
 		var conn federation.Connection
 		conn, err = s.fed.Alter(ctx, c.name, func(conn *federation.Connection) error {
@@ -352,9 +358,28 @@ func (s *Server) createConnection(ctx context.Context, sess *session, me auth.Us
 		}
 	}
 	conn.CreatedBy = me.Name
-	taken, err := queryStrings(ctx, sess, "SELECT database_name FROM system.main.duckdb_databases()")
+	taken, err := s.takenNames(ctx, sess, conn.Name)
 	if err != nil {
 		return conn, false, err
+	}
+	err = s.fed.Create(ctx, conn, taken)
+	if errors.Is(err, federation.ErrExists) && c.ifNotExists {
+		return conn, false, nil
+	}
+	return conn, err == nil, err
+}
+
+// takenNames lists the names a new connection called name may not take:
+// the databases DuckDB has and the catalog. It fails with an
+// InvalidError when the catalog has a schema called name.
+func (s *Server) takenNames(ctx context.Context, sess *session, name string) ([]string, error) {
+	// Listing the catalog's schemas walks a set a table's drop looks up
+	// without DuckDB-Iceberg's lock; hold the catalog lock exclusively
+	// (reentrant; see holdCatalog).
+	defer s.holdCatalog(sess)()
+	taken, err := queryStrings(ctx, sess, "SELECT database_name FROM system.main.duckdb_databases()")
+	if err != nil {
+		return nil, err
 	}
 	if cat := s.catalogName(); cat != "" {
 		taken = append(taken, cat)
@@ -364,18 +389,14 @@ func (s *Server) createConnection(ctx context.Context, sess *session, me auth.Us
 		schemas, err := queryStrings(ctx, sess, `SELECT schema_name FROM system.main.duckdb_schemas()
 			WHERE system.main.lower(database_name) = system.main.lower($1)`, cat)
 		if err != nil {
-			return conn, false, err
+			return nil, err
 		}
-		if slices.ContainsFunc(schemas, func(n string) bool { return strings.EqualFold(n, conn.Name) }) {
-			return conn, false, &federation.InvalidError{Err: fmt.Errorf("the %s catalog has a schema named %s, and a connection named so too "+
-				"would make names such as %s.contacts ambiguous; choose another name", cat, conn.Name, conn.Name)}
+		if slices.ContainsFunc(schemas, func(n string) bool { return strings.EqualFold(n, name) }) {
+			return nil, &federation.InvalidError{Err: fmt.Errorf("the %s catalog has a schema named %s, and a connection named so too "+
+				"would make names such as %s.contacts ambiguous; choose another name", cat, name, name)}
 		}
 	}
-	err = s.fed.Create(ctx, conn, taken)
-	if errors.Is(err, federation.ErrExists) && c.ifNotExists {
-		return conn, false, nil
-	}
-	return conn, err == nil, err
+	return taken, nil
 }
 
 func (s *Server) showConnections(ctx context.Context, w wire.DataWriter) error {

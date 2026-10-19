@@ -3,7 +3,7 @@
 This is [duckdb-go](https://github.com/duckdb/duckdb-go) v2.10506.0 (MIT
 License, see LICENSE), used through a `replace` directive in Igloo's
 `go.mod`. Tests, test data, examples, documentation, scripts and CI files
-were removed; the code is otherwise unchanged except for this patch:
+were removed; the code is otherwise unchanged except for these patches:
 
 - `igloo_arrow.go` (new, built with the `duckdb_arrow` tag like upstream's
   `arrow.go`): `Stmt.ArrowSchema`, `Stmt.ParamArrowSchema` and
@@ -13,6 +13,21 @@ were removed; the code is otherwise unchanged except for this patch:
   endpoint authorizes a statement once, tells the client the Arrow schemas
   of its parameters and result before running it, and streams DuckDB's
   record batches from that same prepared statement.
+- `igloo_bind.go` (new), with a `bindHold` field on `Conn` in
+  `connection.go` and calls in `Conn.prepareExtractedStmt` and
+  `Stmt.executeBound` (`statement.go`): `Conn.SetBindHold`, a hook the
+  connection calls around each step in which DuckDB binds a statement,
+  preparing it or creating the pending result that runs it. DuckDB binds a
+  statement that reads an Iceberg REST catalog again on every run, and
+  binding looks its tables up in DuckDB-Iceberg's one in-memory set of the
+  catalog's tables and replaces their entries there, while a committed
+  rename or drop removes entries from that set without DuckDB-Iceberg's
+  lock, and a listing can free entries a bind replaced while it reads them.
+  Igloo holds its catalog lock shared over each bind, so binds run alongside
+  each other but never alongside such DDL or a listing, which hold it
+  exclusively (see `Server.catalogRunLock` in `internal/pgwire`); upstream
+  has no way to run code between binding a statement and running it.
 
 Drop this copy and the `replace` directive once a duckdb-go release can
-describe and run a prepared statement as Arrow.
+describe and run a prepared statement as Arrow and DuckDB-Iceberg's set of
+tables is safe to bind against, list and change at once.

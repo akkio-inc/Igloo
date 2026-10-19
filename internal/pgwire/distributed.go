@@ -294,8 +294,13 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		return nil, false, err
 	}
 	// Workers must read the columns as DuckDB does here. The statement was
-	// bound, so DuckDB has loaded them.
+	// bound, so DuckDB has loaded them. Listing them with duckdb_columns()
+	// walks the catalog's in-memory set; hold the exclusive side for that one
+	// scan so it does not run while a table is renamed or dropped on this
+	// instance (the read's run holds nothing; see catalogRunLock, holdCatalog).
+	release := e.s.holdCatalog(e.sess)
 	cols, err := tableColumns(ctx, e.sess, catalogName, o.schema, o.name)
+	release()
 	if err != nil {
 		return nil, false, err
 	}
