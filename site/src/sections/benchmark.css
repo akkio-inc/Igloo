@@ -111,7 +111,7 @@
 }
 /* the site's isometric drawing of each run, lit warm where the cores are */
 .vx-benchmark .vx-bm-art {
-  height: clamp(120px, 11vw, 160px);
+  height: clamp(160px, 15vw, 210px);
   margin: clamp(16px, 1.6vw, 22px) 0;
   padding-bottom: clamp(16px, 1.6vw, 22px);
   border-bottom: 1px solid var(--line-strong);
@@ -218,4 +218,16 @@
   .vx-benchmark .vx-bm-card + .vx-bm-card::after {
     display: none;
   }
+}
+
+/* data plates: one per 10 GB, cool-toned so they read apart from the machine and its amber cores */
+.vx-benchmark .vx-bm-data {
+  fill: rgb(139 204 246 / 0.05);
+  stroke: rgb(139 204 246 / 0.42);
+  stroke-width: 0.9;
+  stroke-linejoin: round;
+}
+.vx-benchmark .vx-bm-data--top {
+  fill: rgb(139 204 246 / 0.12);
+  stroke: rgb(185 226 255 / 0.7);
 }
