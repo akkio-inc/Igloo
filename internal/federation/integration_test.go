@@ -116,10 +116,16 @@ func randomName(prefix string) string {
 // startEngine opens an engine that attaches store's connections.
 func startEngine(t *testing.T, store Store) (*Manager, *engine.Engine) {
 	t.Helper()
+	return startEngineWithin(t, context.Background(), store)
+}
+
+// startEngineWithin starts an engine as startEngine does, within ctx.
+func startEngineWithin(t *testing.T, ctx context.Context, store Store) (*Manager, *engine.Engine) {
+	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := NewManager(store, Options{}, log)
 	cfg := config.Config{DuckDB: config.DuckDB{ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")}}
-	eng, err := engine.Open(context.Background(), cfg, log, engine.BeforeLockdown(m.Attach))
+	eng, err := engine.Open(ctx, cfg, log, engine.BeforeLockdown(m.Attach))
 	if err != nil {
 		t.Fatal(err)
 	}

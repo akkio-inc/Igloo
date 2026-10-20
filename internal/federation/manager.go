@@ -22,6 +22,10 @@ import (
 // replicas created, changed or dropped.
 const syncInterval = 15 * time.Second
 
+// attachMargin is how much of Igloo's startup time Attach leaves for the
+// steps after it: a database that has not answered by then is left out.
+const attachMargin = 30 * time.Second
+
 // Options configures a Manager.
 type Options struct {
 	// SecretsDir holds the files password_secret names; empty means
@@ -156,8 +160,8 @@ func (t Type) extension() string {
 // they would hold if connections were attached later too. A
 // connection whose database cannot be reached is left out, with the
 // reason, so one database being down never stops Igloo from starting; the
-// remote databases are tried all at once, so startup waits at most about
-// the longest connect_timeout.
+// remote databases are tried all at once, and those that have not answered
+// attachMargin before ctx's deadline are left out too.
 func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 	conns, err := m.store.List(ctx)
 	if err != nil {
@@ -186,9 +190,15 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 			loaded["postgres"] = err
 		}
 	}
+	wait := ctx
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		wait, cancel = context.WithDeadline(ctx, deadline.Add(-attachMargin))
+		defer cancel()
+	}
 	proxies := make([]endpoint, len(conns))
 	errs := make([]error, len(conns))
-	var wg sync.WaitGroup
+	probes := make([]chan error, len(conns))
 	for i, c := range conns {
 		if err := loaded[c.Type.extension()]; err != nil {
 			errs[i] = fmt.Errorf("DuckDB's %s extension: %w", c.Type.extension(), err)
@@ -197,13 +207,14 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 		if proxies[i], errs[i] = newEndpoint(c, m.token, m.secrets, m.log); errs[i] != nil {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs[i] = proxies[i].probe()
-		}()
+		probes[i] = make(chan error, 1)
+		go func() { probes[i] <- proxies[i].probe() }()
 	}
-	wg.Wait()
+	for i, probe := range probes {
+		if probe != nil {
+			errs[i] = awaitProbe(wait, probe)
+		}
+	}
 
 	for i, c := range conns {
 		err := errs[i]
@@ -222,6 +233,23 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 		m.log.Info("attached connection", "connection", c.Name, "type", c.Type, "host", c.ServerHost(), "database", c.Database)
 	}
 	return nil
+}
+
+// awaitProbe returns the result of a probe, or an error once ctx is done.
+// The probe goes on until its own timeout; closing its endpoint stops a
+// Snowflake gateway's at once.
+func awaitProbe(ctx context.Context, probe <-chan error) error {
+	select {
+	case err := <-probe:
+		return err
+	case <-ctx.Done():
+	}
+	select {
+	case err := <-probe:
+		return err
+	default:
+		return errors.New("no answer in the time Igloo gives connections at startup")
+	}
 }
 
 // attach attaches one connection through its proxy and loads its list of

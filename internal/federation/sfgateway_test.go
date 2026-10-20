@@ -21,6 +21,9 @@ type fakeSnowflake struct {
 	cat *sfCatalog
 	// down fails signing in, as an unreachable Snowflake would.
 	down error
+	// slow lists the tables until it is stopped, as a Snowflake slower
+	// than Igloo's startup would.
+	slow bool
 	// answer returns a query's result batches.
 	answer func(ctx context.Context, q string) ([][]arrow.Record, error)
 
@@ -30,7 +33,11 @@ type fakeSnowflake struct {
 
 func (f *fakeSnowflake) check(context.Context) error { return f.down }
 
-func (f *fakeSnowflake) loadCatalog(context.Context, func(string, ...any)) (*sfCatalog, error) {
+func (f *fakeSnowflake) loadCatalog(ctx context.Context, _ func(string, ...any)) (*sfCatalog, error) {
+	if f.slow {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return f.cat, nil
 }
 
@@ -296,6 +303,34 @@ func TestSnowflakeDown(t *testing.T) {
 	}
 	st, err := m.List(context.Background())
 	if err != nil || len(st) != 1 || st[0].State != "failed" || !strings.Contains(st[0].Detail, "no route to host") {
+		t.Errorf("%+v %v", st, err)
+	}
+	expect(t, eng, "SELECT 42", "42")
+}
+
+// TestSnowflakeSlow checks that a Snowflake that has not listed its tables
+// by shortly before the startup's deadline is left out, so that Igloo still
+// starts.
+func TestSnowflakeSlow(t *testing.T) {
+	installExtensions(t)
+	fake := &fakeSnowflake{cat: testCatalog(t), slow: true}
+	open := openSnowflake
+	openSnowflake = func(Connection, string) sfBackend { return fake }
+	t.Cleanup(func() { openSnowflake = open })
+	store := NewMemoryStore()
+	c := New("sf", Snowflake)
+	c.Account, c.User, c.Database, c.Password = "myorg-acct", "u", "db", "pw"
+	if err := store.Create(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), attachMargin+2*time.Second)
+	defer cancel()
+	m, eng := startEngineWithin(t, ctx, store)
+	if _, ok := m.Catalogs()["sf"]; ok {
+		t.Fatal("attached")
+	}
+	st, err := m.List(context.Background())
+	if err != nil || len(st) != 1 || st[0].State != "failed" || !strings.Contains(st[0].Detail, "no answer") {
 		t.Errorf("%+v %v", st, err)
 	}
 	expect(t, eng, "SELECT 42", "42")

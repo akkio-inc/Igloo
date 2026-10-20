@@ -332,9 +332,10 @@ from showing a password, and lets Igloo:
 
 Startup checks every connection's database at once, so it waits at most
 about the longest `connect_timeout` (for Snowflake, plus the time to read
-its list of tables, at most `query_timeout`); a connection whose database
-cannot be reached then is left out on that replica until it restarts, with
-the reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
+its list of tables), and never past 30 seconds before the end of the three
+minutes Igloo gives itself to start. A connection whose database cannot be
+reached by then is left out on that replica until it restarts, with the
+reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
 
 Snowflake has no protocol DuckDB speaks, so a Snowflake connection is
 attached at a gateway inside Igloo instead of a proxy; see
