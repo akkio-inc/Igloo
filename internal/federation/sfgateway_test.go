@@ -1,11 +1,14 @@
 package federation
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -353,6 +356,69 @@ func TestSnowflakeGateway(t *testing.T) {
 	expect(t, eng, "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'sf'", "1")
 	if len(fake.sent()) != n {
 		t.Errorf("listing sent %q", fake.sent()[n:])
+	}
+}
+
+// countingBatch is a batch of one record that counts its downloads.
+type countingBatch struct {
+	rec arrow.Record
+	n   *atomic.Int32
+}
+
+func (b countingBatch) fetch(context.Context) ([]arrow.Record, error) {
+	b.n.Add(1)
+	b.rec.Retain()
+	return []arrow.Record{b.rec}, nil
+}
+
+// TestSnowflakeSharedPrefetch checks that scans together download no more
+// than sharedPrefetch batches ahead of the ones they send: a batch can
+// take 160 MB, and every scan downloading eight ahead of the one it sends
+// made memory grow with nine times the number of scans.
+func TestSnowflakeSharedPrefetch(t *testing.T) {
+	// Rows larger than a session's buffer, so that a scan whose client
+	// reads nothing waits sending its first.
+	sb := array.NewStringBuilder(memory.NewGoAllocator())
+	sb.Append(strings.Repeat("x", 1<<20))
+	col := sb.NewArray()
+	rec := array.NewRecord(arrow.NewSchema([]arrow.Field{{Name: "C", Type: col.DataType()}}, nil), []arrow.Array{col}, 1)
+	typ, _, err := parseSnowflakeType(`{"type":"TEXT","length":16777216}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan := &sfScan{columns: []*sfColumn{{name: "C", pgName: "c", typ: typ}}}
+	var fetches atomic.Int32
+	res := &sfResult{}
+	for range 40 {
+		res.batches = append(res.batches, countingBatch{rec, &fetches})
+	}
+
+	const scans = 3
+	var wg sync.WaitGroup
+	var clients []net.Conn
+	for range scans {
+		server, client := net.Pipe()
+		clients = append(clients, client)
+		s := &sfSession{conn: server, out: bufio.NewWriterSize(server, 256<<10)}
+		wg.Go(func() {
+			_, _ = s.stream(context.Background(), res, scan, 0)
+			_ = server.Close()
+		})
+	}
+	want := int32(scans + sharedPrefetch)
+	for deadline := time.Now().Add(5 * time.Second); fetches.Load() < want && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := fetches.Load(); n != want {
+		t.Errorf("%d scans waiting to send downloaded %d batches, want %d", scans, n, want)
+	}
+	for _, c := range clients {
+		_ = c.Close()
+	}
+	wg.Wait()
+	if n := len(prefetchTokens); n != 0 {
+		t.Errorf("%d prefetch tokens not given back", n)
 	}
 }
 

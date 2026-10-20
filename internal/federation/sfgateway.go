@@ -57,8 +57,8 @@ import (
 // gatewayVersion is the server version the gateway reports.
 const gatewayVersion = "17.0"
 
-// scanPrefetch is how many result batches download ahead of the one being
-// sent to DuckDB.
+// scanPrefetch is how many result batches of one scan may be downloading,
+// downloaded or being sent to DuckDB at once (see sharedPrefetch).
 const scanPrefetch = 8
 
 // sfGateway serves DuckDB's sessions with one Snowflake connection.
@@ -988,14 +988,27 @@ func (s *sfSession) sendNulls(n int64) error {
 	return s.copyEnd(n, n > 0)
 }
 
-// fetched is a downloaded batch.
+// sharedPrefetch is how many result batches all scans together download
+// ahead of the ones they are sending. Each scan may always download the
+// batch it sends next, and more with these, up to scanPrefetch. A batch
+// takes up to about 160 MB once decompressed (Snowflake's largest parts,
+// which a few highly compressible values fill), so memory follows the
+// number of scans running, rather than nine times it.
+const sharedPrefetch = 8
+
+// prefetchTokens holds a token for each batch downloaded ahead.
+var prefetchTokens = make(chan struct{}, sharedPrefetch)
+
+// fetched is a downloaded batch; token says it holds one of
+// prefetchTokens.
 type fetched struct {
-	recs []arrow.Record
-	err  error
+	recs  []arrow.Record
+	err   error
+	token bool
 }
 
 // stream sends a result as COPY data, one row per message as PostgreSQL
-// does, downloading up to scanPrefetch batches ahead. It returns the
+// does, downloading batches ahead (see sharedPrefetch). It returns the
 // number of rows sent.
 func (s *sfSession) stream(ctx context.Context, res *sfResult, scan *sfScan, timeout time.Duration) (int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -1004,18 +1017,39 @@ func (s *sfSession) stream(ctx context.Context, res *sfResult, scan *sfScan, tim
 	for i := range results {
 		results[i] = make(chan fetched, 1)
 	}
-	slots := make(chan struct{}, scanPrefetch)
+	// outstanding counts the batches downloading, downloaded and being
+	// sent; consumed wakes the downloader when one is done with.
+	var outstanding atomic.Int32
+	consumed := make(chan struct{}, 1)
+	done := func(f fetched) {
+		release(f.recs)
+		if f.token {
+			<-prefetchTokens
+		}
+		outstanding.Add(-1)
+		select {
+		case consumed <- struct{}{}:
+		default:
+		}
+	}
 	go func() {
 		for i, b := range res.batches {
-			select {
-			case slots <- struct{}{}:
-			case <-ctx.Done():
+			token, ok := nextDownload(ctx, &outstanding, consumed)
+			if !ok {
+				outstanding.Add(1) // as done will count it off
 				results[i] <- fetched{err: ctx.Err()}
 				continue
 			}
 			go func() {
-				recs, err := fetchBatch(ctx, b, timeout)
-				results[i] <- fetched{recs, err}
+				f := fetched{token: token}
+				defer func() {
+					if r := recover(); r != nil {
+						release(f.recs)
+						f = fetched{err: fmt.Errorf("reading a part of Snowflake's result failed: %v", r), token: token}
+					}
+					results[i] <- f
+				}()
+				f.recs, f.err = fetchBatch(ctx, b, timeout)
 			}()
 		}
 	}()
@@ -1024,7 +1058,7 @@ func (s *sfSession) stream(ctx context.Context, res *sfResult, scan *sfScan, tim
 		cancel()
 		for _, ch := range results {
 			if f, ok := <-ch; ok {
-				release(f.recs)
+				done(f)
 			}
 		}
 	}()
@@ -1036,40 +1070,71 @@ func (s *sfSession) stream(ctx context.Context, res *sfResult, scan *sfScan, tim
 	for i := range res.batches {
 		f := <-results[i]
 		close(results[i])
-		<-slots
-		if f.err != nil {
-			release(f.recs)
-			return rows, f.err
+		err := f.err
+		if err == nil {
+			buf, err = s.sendRecords(ctx, f.recs, scan, buf, &rows, &sentHeader)
 		}
-		for _, rec := range f.recs {
-			encs, err := encoders(rec, scan.columns)
-			if err != nil {
-				release(f.recs)
-				return rows, err
-			}
-			n := int(rec.NumRows())
-			for r := 0; r < n; r++ {
-				buf = binary.BigEndian.AppendUint16(buf, uint16(len(encs)))
-				for _, enc := range encs {
-					if buf, err = enc(buf, r); err != nil {
-						release(f.recs)
-						return rows, err
-					}
-				}
-				if err := s.copyData(buf); err != nil {
-					release(f.recs)
-					return rows, err
-				}
-				sentHeader = true
-				buf = buf[:0]
-				rows++
-			}
-			if ctx.Err() != nil {
-				release(f.recs)
-				return rows, ctx.Err()
-			}
+		done(f)
+		if err != nil {
+			return rows, err
 		}
-		release(f.recs)
 	}
 	return rows, s.copyEnd(rows, sentHeader)
+}
+
+// nextDownload waits until a scan may download its next batch: at once
+// when it has none outstanding, else with one of prefetchTokens while it
+// has fewer than scanPrefetch. ok is false when ctx ended first.
+func nextDownload(ctx context.Context, outstanding *atomic.Int32, consumed <-chan struct{}) (token, ok bool) {
+	for {
+		n := outstanding.Load()
+		if n == 0 {
+			// The batch DuckDB waits for. Only the downloader adds to
+			// outstanding, so it is still 0.
+			outstanding.Add(1)
+			return false, true
+		}
+		var tokens chan<- struct{}
+		if n < scanPrefetch {
+			tokens = prefetchTokens
+		}
+		select {
+		case tokens <- struct{}{}:
+			outstanding.Add(1)
+			return true, true
+		case <-consumed:
+		case <-ctx.Done():
+			return false, false
+		}
+	}
+}
+
+// sendRecords sends a batch's rows as COPY data, counting them in rows;
+// buf is the start of the next message.
+func (s *sfSession) sendRecords(ctx context.Context, recs []arrow.Record, scan *sfScan, buf []byte, rows *int64, sentHeader *bool) ([]byte, error) {
+	for _, rec := range recs {
+		encs, err := encoders(rec, scan.columns)
+		if err != nil {
+			return buf, err
+		}
+		n := int(rec.NumRows())
+		for r := 0; r < n; r++ {
+			buf = binary.BigEndian.AppendUint16(buf, uint16(len(encs)))
+			for _, enc := range encs {
+				if buf, err = enc(buf, r); err != nil {
+					return buf, err
+				}
+			}
+			if err := s.copyData(buf); err != nil {
+				return buf, err
+			}
+			*sentHeader = true
+			buf = buf[:0]
+			*rows++
+		}
+		if ctx.Err() != nil {
+			return buf, ctx.Err()
+		}
+	}
+	return buf, nil
 }

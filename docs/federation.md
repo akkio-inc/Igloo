@@ -472,8 +472,10 @@ just enough of PostgreSQL's protocol for the extension and nothing more:
   as Snowflake spells them and constants converted to the column's type.
   No SQL a user wrote reaches Snowflake. It runs the query with Snowflake's
   Go driver, signed in with the connection's key or password, and streams
-  the result, in Snowflake's Arrow format, to DuckDB as it downloads, a
-  few parts at a time; nothing is held in memory whole. `count(*)` becomes
+  the result, in Snowflake's Arrow format, to DuckDB as it downloads;
+  nothing is held in memory whole. Each scan holds the part of the result
+  it is sending, and all scans together download at most eight parts
+  ahead, a part taking up to about 160 MB. `count(*)` becomes
   `COUNT(*)` in Snowflake, which Snowflake answers from its metadata
   without a warehouse when there is no filter.
 - **Timeouts.** Signing in is bounded by `connect_timeout`; Snowflake stops
