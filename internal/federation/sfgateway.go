@@ -871,21 +871,38 @@ func release(recs []arrow.Record) {
 	}
 }
 
-// fetchBatch downloads a batch of a result, within timeout.
+// fetchAttempts is how many times a batch of a result is downloaded before
+// its query fails.
+const fetchAttempts = 3
+
+// fetchBatch downloads a batch of a result, within timeout. A download that
+// fails, such as one cut off part way, is tried again: the batch is a file
+// Snowflake keeps for as long as the result, and nothing of it has been
+// sent yet.
 func fetchBatch(ctx context.Context, b sfBatch, timeout time.Duration) ([]arrow.Record, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	recs, err := b.fetch(ctx)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("Snowflake did not deliver a part of the result within query_timeout (%s)", timeout)
+	var err error
+	for attempt := 1; ; attempt++ {
+		var recs []arrow.Record
+		if recs, err = b.fetch(ctx); err == nil {
+			return recs, nil
 		}
-		return nil, snowflakeError("download the result", err)
+		if attempt == fetchAttempts || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+		}
 	}
-	return recs, nil
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("Snowflake did not deliver a part of the result within query_timeout (%s)", timeout)
+	}
+	return nil, snowflakeError("download the result", err)
 }
 
 // copyStart begins COPY data of n columns.

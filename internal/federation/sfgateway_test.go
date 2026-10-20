@@ -71,6 +71,36 @@ func (f *fakeSnowflake) sent() []string {
 
 type fakeBatch []arrow.Record
 
+// flakyBatch fails its first fails downloads, as one cut off part way would.
+type flakyBatch struct {
+	fails, calls int
+}
+
+func (b *flakyBatch) fetch(context.Context) ([]arrow.Record, error) {
+	b.calls++
+	if b.calls <= b.fails {
+		return nil, errors.New("decoding Arrow batch: arrow/ipc: could not read message body: unexpected EOF")
+	}
+	return nil, nil
+}
+
+func TestFetchBatchRetries(t *testing.T) {
+	b := &flakyBatch{fails: fetchAttempts - 1}
+	if _, err := fetchBatch(context.Background(), b, 0); err != nil || b.calls != fetchAttempts {
+		t.Errorf("err %v after %d downloads", err, b.calls)
+	}
+	b = &flakyBatch{fails: fetchAttempts}
+	if _, err := fetchBatch(context.Background(), b, 0); err == nil || !strings.Contains(err.Error(), "unexpected EOF") || b.calls != fetchAttempts {
+		t.Errorf("err %v after %d downloads", err, b.calls)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b = &flakyBatch{fails: fetchAttempts}
+	if _, err := fetchBatch(ctx, b, 0); err == nil || b.calls != 1 {
+		t.Errorf("err %v after %d downloads of a canceled query", err, b.calls)
+	}
+}
+
 func (b fakeBatch) fetch(context.Context) ([]arrow.Record, error) {
 	for _, r := range b {
 		r.Retain()
