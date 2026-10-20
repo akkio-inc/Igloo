@@ -195,24 +195,57 @@
 }
 .vx-hero__tagline {
 	margin-top: 0.75rem;
-	font-size: clamp(1.625rem, 1.1rem + 1.5vw, 2.625rem);
+	font-size: clamp(1.375rem, 0.9rem + 1.9vw, 2.625rem);
 	line-height: 1.15;
 	color: var(--text);
 	text-wrap: balance;
-	max-width: 15em;
 	font-weight: 500;
 	letter-spacing: -0.025em;
 }
 .vx-hero__claim {
-	margin-top: 0.3rem;
-	font-size: clamp(1.625rem, 1.1rem + 1.5vw, 2.625rem);
-	font-weight: 700;
-	line-height: 1.15;
-	letter-spacing: -0.025em;
+	margin-top: clamp(20px, 2vw, 28px);
 	color: #f7c66f;
+	display: flex;
 }
-.vx-hero__claim span {
+/* Snowflake and Databricks stay on one line; Snow and bricks take the wordmark's ice */
+.vx-hero__rivals {
 	white-space: nowrap;
+}
+@media (max-width: 379px) {
+	.vx-hero__rivals {
+		white-space: normal;
+	}
+}
+.vx-hero__ice {
+	background: linear-gradient(180deg, #f2f8ff 15%, #b9dafb 70%, #8fc3f2 100%);
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+}
+/* the claim as two figures with a label under each, divided by a hairline, as in the benchmark cards */
+.vx-hero__stat {
+	display: flex;
+	flex-direction: column;
+	padding: 0 clamp(20px, 2vw, 28px);
+}
+.vx-hero__stat:first-child {
+	padding-left: 0;
+}
+.vx-hero__stat + .vx-hero__stat {
+	border-left: 1px solid var(--line-strong);
+}
+.vx-hero__fig {
+	font-size: clamp(2.5rem, 1.7rem + 2vw, 3.25rem);
+	font-weight: 700;
+	line-height: 1;
+	letter-spacing: -0.04em;
+}
+.vx-hero__label {
+	margin-top: 8px;
+	font-size: 1rem;
+	font-weight: 400;
+	letter-spacing: 0;
+	color: var(--text-2);
 }
 .vx-hero__cta {
 	display: flex;
