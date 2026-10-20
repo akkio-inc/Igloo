@@ -19,6 +19,7 @@ its tools in containers.
 |---|---|
 | `make test` | Run the Go tests in a `golang` container, with a throwaway PostgreSQL for the user-store tests |
 | `make lint` | Check gofmt and run `go vet` |
+| `make migrate-test` | Run the [migration report's](migrate/README.md) unit tests in a Python container |
 | `make build` | Build the `igloo:dev` image |
 | `make up` | Start the single-machine stack: Igloo, the Lakekeeper catalog, PostgreSQL and local object storage |
 | `make psql` | Open a SQL shell on the running stack |
@@ -54,6 +55,7 @@ The first build links DuckDB and is slow; later builds are cached.
 Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 
 - gofmt, `go vet` and `go test`
+- `make migrate-test`
 - the container image, built natively for linux/amd64 and linux/arm64
 - `make e2e`
 - `helm lint` and `helm template` for `deploy/helm/igloo`
@@ -77,6 +79,8 @@ deploy/helm/igloo/       Helm chart
 deploy/aws, gcp, azure/  OpenTofu modules for each cloud
 docs/                    user documentation; configuration.md is the settings reference
 scripts/                 helper scripts, including the end-to-end test
+bench/                   the price-performance benchmark (Python)
+migrate/                 the migration report, python -m migrate (Python)
 site/                    the website: landing page, and the docs built from the markdown above
 .github/                 CI and release workflows, issue and pull request templates
 ```

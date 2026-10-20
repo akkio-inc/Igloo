@@ -5,8 +5,10 @@ GO_IMAGE := golang:1.27-bookworm
 NODE_IMAGE := node:24.19.0-trixie-slim@sha256:ab3eebe934147fee049b5eb83c570f68c849a13c930bdfa482de99fcdfa3b3de
 COMPOSE  := docker compose --project-directory deploy/single-vm
 VERSION  ?= dev
+# The Python the end-to-end tests' clients and the migration report run on.
+PYTHON_IMAGE := python:3.12-slim
 
-.PHONY: help test lint e2e e2e-distributed bi-e2e engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch site site-dev
+.PHONY: help test lint migrate-test e2e e2e-distributed bi-e2e engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch site site-dev
 
 help: ## List targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -17,6 +19,11 @@ test: ## Run the Go tests (starts a throwaway Postgres)
 lint: ## Check formatting and run go vet
 	docker run --rm -v "$(CURDIR)":/src -v igloo-go-mod:/go/pkg/mod -w /src $(GO_IMAGE) \
 		sh -c 'test -z "$$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }; go vet -tags duckdb_arrow ./...'
+
+migrate-test: ## Run the migration report's unit tests (migrate/; no warehouse needed)
+	docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$(CURDIR)":/src:ro -w /src $(PYTHON_IMAGE) sh -c \
+		'pip install -q --disable-pip-version-check --root-user-action=ignore "$$(grep ^sqlglot== migrate/requirements.txt)" \
+		&& python -W error::ResourceWarning -m unittest discover -s migrate/tests -t .'
 
 e2e: ## Run the end-to-end test against an isolated copy of the stack
 	scripts/e2e.sh

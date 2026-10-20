@@ -259,9 +259,8 @@ over the queries that ran distributed. Results go in `bench/results/`.
   platforms that add clusters automatically (Snowflake multi-cluster,
   Databricks serverless scaling); Igloo scales out with replicas.
 - **Loading and transformation.** Only queries are timed.
-- **A real workload.** TPC-H is a stand-in. The next step replays a
-  production query mix: export a week of query text and timings from
-  Snowflake (`SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`) and Databricks
-  (`system.query.history`), run the same statements against copies of the
-  same tables on each platform, and price them with the actual arrival
-  pattern instead of `--runs-per-day`.
+- **A real workload.** TPC-H is a stand-in. `python -m migrate report`
+  ([migrating](../docs/migrating.md)) now replays a production query mix
+  from Snowflake's or Databricks' history on Igloo and compares results,
+  time and cost; pricing the same statements on every platform with their
+  actual arrival pattern, instead of `--runs-per-day`, is still to do.

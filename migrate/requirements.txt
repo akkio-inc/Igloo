@@ -1,0 +1,9 @@
+# python -m migrate. sqlglot is newer than the benchmark's pin: it translates
+# Snowflake and Databricks SQL to DuckDB's better, and the benchmark keeps
+# its own so that its translated queries stay as they were.
+sqlglot==30.24.0
+psycopg[binary]==3.3.6
+# Only for the source you read:
+snowflake-connector-python==3.18.1
+databricks-sql-connector==4.5.0
+databricks-sdk==0.58.0

@@ -1,0 +1,19 @@
+[
+  {"query_id": "a1", "query_text": "SELECT nvl(spend, 0) FROM media.campaigns WHERE id = 7", "status": "QueryStatus.FINISHED",
+   "statement_type": "QueryStatementType.SELECT", "user_name": "ana@example.com", "warehouse_id": "abc123",
+   "duration": 1200, "rows_produced": 1, "query_start_time_ms": 1792500000000,
+   "metrics": {"execution_time_ms": 800, "read_bytes": 4096, "rows_produced_count": 1}},
+  {"query_id": "a2", "query_text": "SELECT nvl(spend, 0) FROM media.campaigns WHERE id = 9", "status": "FINISHED",
+   "statement_type": "SELECT", "user_name": "ana@example.com", "warehouse_id": "abc123",
+   "duration": 1000, "rows_produced": 1, "query_start_time_ms": 1792500060000,
+   "metrics": {"execution_time_ms": 700, "read_bytes": 4096, "rows_produced_count": 1}},
+  {"query_id": "a3", "query_text": "<REDACTED>", "status": "FINISHED", "statement_type": "SELECT",
+   "user_name": "someone-else", "warehouse_id": "other", "duration": 50, "rows_produced": 1,
+   "query_start_time_ms": 1792500120000, "metrics": {}},
+  {"query_id": "a4", "query_text": "SELECT 1", "status": "RUNNING", "statement_type": "SELECT",
+   "user_name": "ana@example.com", "warehouse_id": "abc123", "duration": null, "rows_produced": null,
+   "query_start_time_ms": 1792500180000, "metrics": {}},
+  {"query_id": "a5", "query_text": "/* igloo-migrate */ SELECT current_catalog()", "status": "FINISHED",
+   "statement_type": "SELECT", "user_name": "ana@example.com", "warehouse_id": "abc123", "duration": 10,
+   "rows_produced": 1, "query_start_time_ms": 1792500240000, "metrics": {}}
+]

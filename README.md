@@ -390,6 +390,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   notebooks, how to connect each and what to expect
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
+- [Migrating from Snowflake or Databricks](docs/migrating.md): a report on
+  how much of a real workload runs on Igloo, from its query history
 - [Security](SECURITY.md): the security model and how to report a
   vulnerability
 - [Contributing](CONTRIBUTING.md)
@@ -460,4 +462,6 @@ internal/workload/  query tags, role limits and their enforcement
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules
 docs/               documentation
 scripts/            test and end-to-end scripts
+bench/              price-performance benchmark against Snowflake and Databricks
+migrate/            migration report: a Snowflake or Databricks workload replayed on Igloo
 ```

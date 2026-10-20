@@ -1,0 +1,12 @@
+[
+  {
+    "query_id": "01b2c3d4-0000-1111-2222-333344445555",
+    "direct_objects_accessed": "[{\"objectDomain\": \"View\", \"objectName\": \"SHOP.SALES.ORDERS_V\", \"objectId\": 11, \"columns\": [{\"columnName\": \"REGION\"}]}, {\"objectDomain\": \"Table\", \"objectName\": \"SHOP.SALES.REGIONS\", \"objectId\": 12}, {\"objectDomain\": \"Stage\", \"objectName\": \"SHOP.SALES.LANDING\", \"objectId\": 13}]",
+    "objects_modified": "[]"
+  },
+  {
+    "query_id": "01b2c3d4-0000-1111-2222-333344447777",
+    "direct_objects_accessed": "[{\"objectDomain\": \"Table\", \"objectName\": \"SHOP.STAGING.NEW_CUSTOMERS\"}, {\"objectDomain\": \"Table\", \"objectName\": \"SHOP.SALES.CUSTOMERS\"}]",
+    "objects_modified": "[{\"objectDomain\": \"Table\", \"objectName\": \"SHOP.SALES.CUSTOMERS\", \"columns\": []}]"
+  }
+]

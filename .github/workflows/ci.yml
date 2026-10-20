@@ -81,6 +81,20 @@ jobs:
       - name: Test
         run: go test -tags duckdb_arrow ./...
 
+  migrate:
+    name: Migration report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # python -m migrate's unit tests, on synthetic fixtures: no warehouse
+      # and no Igloo.
+      - name: Test the migration report
+        run: make migrate-test
+
   image:
     name: Image (${{ matrix.arch }})
     # Each architecture builds on its own native runner: cross-compiling cgo

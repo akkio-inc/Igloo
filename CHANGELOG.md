@@ -225,6 +225,24 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Tools and integrations
 
+- A migration report, `python -m migrate report --source snowflake|databricks`
+  ([docs/migrating.md](docs/migrating.md)): reads the source's query history
+  (Snowflake's `ACCOUNT_USAGE`, or `INFORMATION_SCHEMA.QUERY_HISTORY()`
+  without it; Databricks' `system.query.history`, or the Query History
+  API), groups it into query shapes, finds the workload's tables in Igloo
+  (`--map` rules and connections), replays the queries on Igloo as written,
+  in Igloo's own dialect of the source's SQL where there is one, and
+  translated by sqlglot, and compares results with the history's row counts
+  and, within a cost budget, with re-runs on the source. Its HTML, Markdown
+  and JSON report gives the shares of shapes and executions that run
+  unchanged, run after translation, fail (by error class, with examples) or
+  lack data, the result match rate, timing, the most-used tables and
+  whether Igloo has them, and the source's spend against an Igloo estimate,
+  each figure labeled measured or estimated. Read-only on both sides by
+  default: writes replay only with `--replay-writes`, into clones in a
+  scratch schema. Literals are redacted from the report, and extracts and
+  reports are written only under `--out`. Its unit tests run in CI
+  (`make migrate-test`).
 - dbt with the standard dbt-postgres adapter: seeds, views, tables,
   incremental models (`append`, `merge`, `delete+insert`), snapshots, tests,
   `persist_docs`, `docs generate` and `source freshness`, tested on every

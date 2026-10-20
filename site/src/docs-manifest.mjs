@@ -21,6 +21,7 @@ export const groups = [
 		pages: [
 			{ source: 'README.md', slug: 'docs', title: 'Overview', label: 'Overview' },
 			{ source: 'docs/principles.md', label: 'Product principles' },
+			{ source: 'docs/migrating.md', label: 'Migrating from Snowflake or Databricks' },
 		],
 	},
 	{
