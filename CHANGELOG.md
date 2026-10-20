@@ -759,7 +759,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   creates, renames, drops or alters a table, view or schema — and lets
   DuckDB bind a statement again as it starts to run only alongside other
   such binds, while reading and writing table data, which do not change the
-  set, run alongside each other and those steps without waiting
+  set, run alongside each other and those steps without waiting. `CREATE
+  [OR REPLACE] TABLE ... AS` runs in steps, so that only creating and
+  renaming the new table are serialized, not filling it
   (docs/operations.md#concurrency-on-a-replica).
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

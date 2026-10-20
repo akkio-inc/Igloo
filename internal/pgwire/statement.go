@@ -59,6 +59,10 @@ type statement struct {
 	// table or view in the Iceberg catalog, so it runs outside the
 	// session's transaction block (see outsideTransaction).
 	changesIceberg bool
+	// staged is set for CREATE [OR REPLACE] TABLE ... AS of an Iceberg
+	// table, which Igloo carries out in steps so that filling the table
+	// does not hold the catalog lock (see runStagedCreate).
+	staged *stagedCreate
 	// listsCatalog says the statement walks the catalog's in-memory set of
 	// tables or views (information_schema, pg_catalog,
 	// duckdb_tables/views/columns, SHOW, DESCRIBE), so it holds the catalog

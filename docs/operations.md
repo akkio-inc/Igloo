@@ -297,9 +297,13 @@ listing, most DDL), and they do not wait for data queries to finish, nor data
 queries for them beyond their bind. So a `dbt` run swapping tables and a BI
 tool browsing schemas take turns with each other and with other sessions'
 statement preparation, for a moment each, while long reads and writes run
-alongside them undisturbed. DDL holds the catalog for its whole run, though:
-a `CREATE TABLE ... AS` that writes a large table keeps other sessions on the
-replica from starting statements until it commits.
+alongside them undisturbed. `CREATE [OR REPLACE] TABLE ... AS` of a catalog
+table runs in steps for that reason: it creates the new table, empty, under
+a temporary name, fills it with an `INSERT`, which holds nothing, and renames
+it into place, so only the create and the rename take the catalog, and the
+table appears under its name once it is complete. Other DDL holds the catalog
+for its whole run, and so does `CREATE TABLE ... AS` inside a transaction
+block or with parameters.
 
 The turns cost throughput of short queries on a busy replica. On a shared
 18-core test machine, against the same build without them, 8 to 64 sessions
@@ -308,7 +312,9 @@ latency), one session and TPC-H queries at 1 and 8 sessions were within
 noise, and 8 sessions of point lookups ran about half as many queries while
 a `dbt`-style loop swapped a small table, and about a third as many while it
 rebuilt a 1.5-million-row table, as fast as it could — the loads in which
-the build without them crashed. This keeps the embedded engine's one shared
+the build without them crashed. (That last was measured while `CREATE TABLE
+... AS` held the catalog for its whole run; it now holds it only to create
+and rename.) This keeps the embedded engine's one shared
 view of the catalog consistent under concurrency. Changes made on another
 replica, or by another engine, reach this one through the Iceberg REST
 catalog within the 30-second view sync, and this serialization, which is per

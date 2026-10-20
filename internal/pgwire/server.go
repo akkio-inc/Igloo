@@ -1198,7 +1198,14 @@ func (s *Server) withoutCatalog(sess *session, wait func()) {
 // must see to retry on a conflict. Statements that do not reach the catalog
 // (SET, transaction control) and sessions with no catalog attached hold
 // nothing either.
+//
+// CREATE TABLE ... AS of an Iceberg table outside a transaction block is
+// carried out in steps that take the lock themselves, exclusively only to
+// change the catalog (see runStagedCreate).
 func (s *Server) catalogRunLock(sess *session, st *statement) func() {
+	if st.staged != nil && !sess.inTx {
+		return func() {}
+	}
 	if st.changesIceberg || st.listsCatalog || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
 		return s.holdCatalog(sess)
 	}
@@ -1403,6 +1410,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	if changesCatalog(st.stmtType) {
 		st.changesIceberg = s.changesIceberg(ctx, sess, st.stmtType, query)
+	}
+	if st.changesIceberg && st.stmtType == duckdb.STATEMENT_TYPE_CREATE && len(st.params) == 0 {
+		st.staged = s.stagedCreateOf(ctx, sess, st.query)
 	}
 	// A statement that lists the catalog's tables or views walks the set and
 	// holds the catalog lock exclusively when it runs (see catalogRunLock);

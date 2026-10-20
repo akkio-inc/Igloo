@@ -15,6 +15,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -66,7 +67,7 @@ func (r tableReplace) statements() (create, drop, rename string) {
 // replaceTable carries out r and returns the rows the new table was
 // made with (0 without AS).
 func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace) (int64, error) {
-	create, drop, rename := r.statements()
+	create, _, _ := r.statements()
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
 		return err
@@ -93,28 +94,183 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 
 	// From here on, finish even if the client cancels: stopping between the
 	// drop and the rename would leave the table missing.
-	ctx = context.WithoutCancel(ctx)
-	if err := exec(ctx, drop); err != nil {
-		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
+	if err := s.swapIn(context.WithoutCancel(ctx), sess, r); err != nil {
 		return 0, err
 	}
+	return rows, nil
+}
+
+// swapIn drops the table r replaces and renames the new one into place.
+func (s *Server) swapIn(ctx context.Context, sess *session, r tableReplace) error {
+	_, drop, rename := r.statements()
+	exec := func(ctx context.Context, q string) error {
+		_, err := sess.conn.ExecContext(ctx, q, nil)
+		return err
+	}
+	if err := exec(ctx, drop); err != nil {
+		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
+		return err
+	}
+	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = exec(ctx, rename); err == nil {
-			return rows, nil
+			return nil
 		}
 		// Another session may have replaced the table in between; the last
 		// replace wins.
 		_ = exec(ctx, drop)
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
-	return 0, fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
+	return fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
 		quoteName(r.staging), quoteName(r.target), err)
+}
+
+// stagedCreate is CREATE [OR REPLACE] TABLE name AS query of an Iceberg
+// table, carried out in steps: create the new table, empty, under a
+// temporary name; fill it with INSERT INTO it query; rename it into place,
+// after dropping the table it replaces. DuckDB runs CREATE TABLE ... AS as
+// one statement that holds the catalog lock exclusively (see
+// catalogRunLock) for as long as it writes, so a long one, such as a copy
+// of a table of a connection's database, stopped every other session on
+// the replica from preparing any statement, a SELECT 42 included, or from
+// signing in. In steps, only creating, dropping and renaming hold it
+// exclusively; filling runs like any INSERT. As with a replace, the table
+// appears under its name only once it is complete.
+type stagedCreate struct {
+	tableReplace
+	replace bool
+	// target is the table, to check that it does not exist yet.
+	target auth.Object
+	// query is the query after AS.
+	query string
+}
+
+// stagedCreateOf returns how to carry out query in steps, or nil when it is
+// not CREATE [OR REPLACE] TABLE [IF NOT EXISTS] name AS query of an Iceberg
+// table (with no column list, not TEMP and not WITH NO DATA) on its own.
+func (s *Server) stagedCreateOf(ctx context.Context, sess *session, query string) *stagedCreate {
+	if !createsTableAs(query) {
+		return nil
+	}
+	if n, err := s.engine.CountStatements(query); err != nil || n != 1 {
+		return nil
+	}
+	c, ok := parseCreateTable(query)
+	if !ok || c.temporary || c.query == "" || topLevelKeyword(query, "WITH", "NO", "DATA") >= 0 {
+		return nil
+	}
+	target, err := s.newTableTarget(ctx, sess, c.name)
+	if err != nil {
+		return nil
+	}
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	staging := append(append([]string{}, c.name[:len(c.name)-1]...),
+		c.name[len(c.name)-1]+policy.StagingMark+hex.EncodeToString(b[:]))
+	return &stagedCreate{
+		tableReplace: tableReplace{target: c.name, staging: staging, rest: " AS " + c.query},
+		replace:      c.replace, target: target, query: c.query,
+	}
+}
+
+// runStagedCreate carries out c, holding the catalog lock exclusively only
+// while it changes the catalog. done is false when c is CREATE TABLE of a
+// table or view that exists: the statement then runs as written, under the
+// lock, for DuckDB's own error or, with IF NOT EXISTS, its notice.
+func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCreate) (rows int64, done bool, err error) {
+	exec := func(ctx context.Context, q string) error {
+		_, err := sess.conn.ExecContext(ctx, q, nil)
+		return err
+	}
+	dropStaging := func() {
+		release := s.holdCatalog(sess)
+		defer release()
+		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
+	}
+
+	release := s.holdCatalog(sess)
+	if !c.replace {
+		if exists, err := s.relationExists(ctx, sess, c.target); err != nil || exists {
+			release()
+			return 0, false, nil
+		}
+	}
+	// On a line of its own, after a query that may end in a comment.
+	err = exec(ctx, "CREATE TABLE "+quoteName(c.staging)+" AS "+c.query+"\nWITH NO DATA")
+	if err == nil && c.replace {
+		// The new table keeps the columns with policies or tags, which the
+		// statement was checked for too.
+		var have []columnType
+		if have, err = describeTable(ctx, sess, quoteName(c.staging)); err == nil {
+			err = s.checkReplaceKeeps(ctx, sess, c.tableReplace, have)
+		}
+		if err != nil {
+			_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		}
+	}
+	release()
+	if err != nil {
+		return 0, true, err
+	}
+
+	res, err := sess.conn.QueryContext(ctx, "INSERT INTO "+quoteName(c.staging)+"\n"+c.query, nil)
+	if err == nil {
+		rows, err = countOf(res)
+	}
+	if err != nil {
+		dropStaging()
+		return 0, true, err
+	}
+
+	// From here on, finish even if the client cancels: stopping between the
+	// drop and the rename would leave the table missing.
+	ctx = context.WithoutCancel(ctx)
+	release = s.holdCatalog(sess)
+	defer release()
+	if c.replace {
+		return rows, true, s.swapIn(ctx, sess, c.tableReplace)
+	}
+	_, _, rename := c.statements()
+	if err := exec(ctx, rename); err != nil {
+		// A table of that name was created in the meantime.
+		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		return 0, true, err
+	}
+	return rows, true, nil
+}
+
+// relationExists reports whether the catalog has a table or view named o,
+// matching names as DuckDB does, whatever their case. The caller holds the
+// catalog lock exclusively: it lists the catalog's set.
+func (s *Server) relationExists(ctx context.Context, sess *session, o auth.Object) (bool, error) {
+	if s.ddl != nil && s.ddl.IsView(o.Schema, o.Table) {
+		return true, nil
+	}
+	found, err := queryStrings(ctx, sess, `SELECT table_name FROM duckdb_tables()
+		WHERE database_name = $1 AND lower(schema_name) = lower($2) AND lower(table_name) = lower($3)
+		UNION ALL SELECT view_name FROM duckdb_views()
+		WHERE database_name = $1 AND lower(schema_name) = lower($2) AND lower(view_name) = lower($3)`,
+		s.catalogName(), o.Schema, o.Table)
+	return len(found) > 0, err
 }
 
 // runStatement runs st, retrying lost Iceberg commits (see
 // runWithCommitRetry), and carries out CREATE OR REPLACE TABLE on an
-// Iceberg table, which DuckDB refuses.
+// Iceberg table, which DuckDB refuses, and CREATE TABLE ... AS of one in
+// steps (see stagedCreate).
 func (s *Server) runStatement(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
+	if st.staged != nil && !sess.inTx {
+		rows, done, err := s.runStagedCreate(ctx, sess, st.staged)
+		if done {
+			if err != nil {
+				return err
+			}
+			reportRows(w, rows)
+			return w.Complete("CREATE TABLE")
+		}
+		// It exists: run it as written, under the lock it would have held.
+		defer s.holdCatalog(sess)()
+	}
 	err := runWithCommitRetry(ctx, sess, st, func() error {
 		return sess.profiled(ctx, st, func() error { return st.run(ctx, args, w) })
 	})
