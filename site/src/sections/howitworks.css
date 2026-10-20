@@ -179,27 +179,9 @@
 .vx-howitworks .vx-howitworks__igloo-sub { color: var(--text-2); font-size: clamp(0.875rem, 0.8rem + 0.3vw, 1.125rem); line-height: 1.4; }
 
 /* ---- notes */
-.vx-howitworks .vx-howitworks__notes { padding: clamp(32px, 3.4vw, 48px) 0 0; }
-.vx-howitworks .vx-howitworks__desc {
-	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 34em));
-	justify-content: space-between;
-	gap: 20px clamp(32px, 8vw, 120px);
-	margin: 0;
-	padding: 0;
-	list-style: none;
-	font-size: clamp(0.9375rem, 0.9rem + 0.25vw, 1.25rem);
-	line-height: 1.55;
-}
-.vx-howitworks .vx-howitworks__desc li:nth-child(1) { grid-area: 1 / 1; }
-.vx-howitworks .vx-howitworks__desc li:nth-child(2) { grid-area: 1 / 2; }
-.vx-howitworks .vx-howitworks__desc li:nth-child(3) { grid-area: 2 / 1; }
-.vx-howitworks .vx-howitworks__desc li:nth-child(4) { grid-area: 2 / 2; }
 .vx-howitworks strong { color: var(--text); font-weight: 600; }
 .vx-howitworks a { padding-block: 12px; color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 4px; }
 .vx-howitworks a strong { color: inherit; }
-.vx-howitworks .vx-howitworks__license { max-width: 60em; margin-top: clamp(28px, 3vw, 40px); font-size: clamp(0.9375rem, 0.9rem + 0.2vw, 1.1875rem); line-height: 1.6; text-wrap: pretty; }
-.vx-howitworks .vx-howitworks__license a { white-space: nowrap; }
 .vx-howitworks code {
 	padding: 1px 0.35em 2px;
 	border-radius: 5px;
@@ -237,11 +219,6 @@
 	.vx-howitworks .vx-howitworks__chip--l1 { --gap-above: 26px; }
 	.vx-howitworks .vx-howitworks__chip--l2::before,
 	.vx-howitworks .vx-howitworks__chip--l3::before { content: none; }
-	.vx-howitworks .vx-howitworks__desc { grid-template-columns: minmax(0, 1fr); }
-	.vx-howitworks .vx-howitworks__desc li:nth-child(n) { grid-area: auto; }
-	.vx-howitworks .vx-howitworks__desc li:nth-child(2) { order: 3; }
-	.vx-howitworks .vx-howitworks__desc li:nth-child(3) { order: 2; }
-	.vx-howitworks .vx-howitworks__desc li:nth-child(4) { order: 4; }
 }
 
 /* section edges: fade */

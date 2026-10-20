@@ -192,8 +192,6 @@
 	-webkit-background-clip: text;
 	background-clip: text;
 	-webkit-text-fill-color: transparent;
-	padding-right: 0.06em;
-	margin-right: -0.06em;
 }
 .vx-hero__tagline {
 	margin-top: 0.75rem;

@@ -1,7 +1,8 @@
-/* Pillars (Linear): six open cells on one surface, split only by inner hairlines that fade out at their ends;
-   each cell has a lit icon tile, a title and its text. A soft blue glow at the top left. Tokens: base-linear.css. */
+/* Pillars (Linear): four open cells on one surface, split only by inner hairlines that fade out at their ends: one
+   row on wide screens, two by two below 1080 px, one column on phones. Each cell has a lit icon tile, a title and
+   its text. A soft blue glow at the top left. Tokens: base-linear.css. */
 .vx-pillars {
-	--cols: 3;
+	--cols: 4;
 	position: relative;
 	overflow: hidden;
 	isolation: isolate;
@@ -29,7 +30,7 @@
 	position: relative;
 	display: grid;
 	grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
-	grid-template-rows: auto auto;
+	grid-template-rows: auto;
 }
 .vx-pillars .vx-pillars__cell {
 	display: flex;
@@ -113,6 +114,9 @@
 .vx-pillars .vx-pillars__rail--m2 {
 	left: calc(200% / var(--cols));
 }
+.vx-pillars .vx-pillars__rail--m3 {
+	left: calc(300% / var(--cols));
+}
 .vx-pillars .vx-pillars__rule {
 	left: 0;
 	right: 0;
@@ -130,16 +134,10 @@
 .vx-pillars .vx-pillars__rule--r4 {
 	grid-row: 4;
 }
-.vx-pillars .vx-pillars__rule--r5 {
-	grid-row: 5;
-}
-.vx-pillars .vx-pillars__rule--r6 {
-	grid-row: 6;
-}
+/* one row on wide screens: no row lines */
+.vx-pillars .vx-pillars__rule--r2,
 .vx-pillars .vx-pillars__rule--r3,
-.vx-pillars .vx-pillars__rule--r4,
-.vx-pillars .vx-pillars__rule--r5,
-.vx-pillars .vx-pillars__rule--r6 {
+.vx-pillars .vx-pillars__rule--r4 {
 	display: none;
 }
 @media (max-width: 1079.98px) {
@@ -147,12 +145,13 @@
 		--cols: 2;
 	}
 	.vx-pillars .vx-pillars__grid {
-		grid-template-rows: repeat(3, auto);
+		grid-template-rows: repeat(2, auto);
 	}
-	.vx-pillars .vx-pillars__rail--m2 {
+	.vx-pillars .vx-pillars__rail--m2,
+	.vx-pillars .vx-pillars__rail--m3 {
 		display: none;
 	}
-	.vx-pillars .vx-pillars__rule--r3 {
+	.vx-pillars .vx-pillars__rule--r2 {
 		display: block;
 	}
 }
@@ -160,16 +159,15 @@
 	.vx-pillars {
 		--cols: 1;
 		--pl-pad: 0px;
-}
+	}
 	.vx-pillars .vx-pillars__grid {
-		grid-template-rows: repeat(6, auto);
+		grid-template-rows: repeat(4, auto);
 	}
 	.vx-pillars .vx-pillars__rail--m1 {
 		display: none;
 	}
-	.vx-pillars .vx-pillars__rule--r4,
-	.vx-pillars .vx-pillars__rule--r5,
-	.vx-pillars .vx-pillars__rule--r6 {
+	.vx-pillars .vx-pillars__rule--r3,
+	.vx-pillars .vx-pillars__rule--r4 {
 		display: block;
 	}
 	.vx-pillars .vx-pillars__card:hover {

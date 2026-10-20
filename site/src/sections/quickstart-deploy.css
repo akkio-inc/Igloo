@@ -489,6 +489,37 @@
   }
 }
 
+/* ---------------------------------------------------------------- start with the data you already have: three points
+   under the heading, each a short title and its sentence, on a hairline */
+.vx-migrate .vx-mg-points {
+  display: grid;
+  gap: 18px;
+  margin: clamp(24px, 2.6vw, 34px) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.vx-migrate .vx-mg-points li {
+  padding-left: 16px;
+  border-left: 1px solid var(--line-strong);
+}
+.vx-migrate .vx-mg-points li:first-child {
+  border-left-color: color-mix(in srgb, var(--amber) 60%, var(--line-strong));
+}
+.vx-migrate .vx-mg-points h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.vx-migrate .vx-mg-points p {
+  max-width: 34em;
+  margin: 6px 0 0;
+  color: var(--text-2);
+  font-size: 0.9375rem;
+  line-height: 1.55;
+}
+
 /* section edges: fade */
 .vx-quickstart .vx-qs-bg {
   -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);

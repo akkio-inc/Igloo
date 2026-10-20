@@ -11,6 +11,7 @@ import Hero from '../components/landing/Hero.astro';
 import HowItWorks from '../components/landing/HowItWorks.astro';
 import Pillars from '../components/landing/Pillars.astro';
 import QuickStart from '../components/landing/QuickStart.astro';
+import Migrate from '../components/landing/Migrate.astro';
 import Screens from '../components/landing/Screens.astro';
 import { SITE_PUBLIC } from '../site-config.mjs';
 
@@ -41,10 +42,11 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 		<main id="main">
 			<Hero />
 			<Pillars />
+			<Benchmark />
 			<Screens />
+			<Migrate />
 			<Features />
 			<HowItWorks />
-			<Benchmark />
 			<QuickStart />
 			<Deploy />
 			<Closing />

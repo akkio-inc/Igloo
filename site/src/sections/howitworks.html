@@ -20,14 +20,5 @@
 <div class="vx-howitworks__chip vx-howitworks__chip--down vx-howitworks__chip--l3"><svg class="vx-howitworks__icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg><span class="vx-howitworks__chip-text"><span class="vx-howitworks__chip-title">Users and roles</span></span></div>
 <div class="vx-howitworks__node vx-howitworks__node--b3"><svg class="vx-howitworks__icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="2.5"/><path d="M4 5.5v13c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-13"/><path d="M4 12c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5"/></svg><span><span class="vx-howitworks__node-title">PostgreSQL</span><span class="vx-howitworks__node-sub">Catalog metadata, and users and roles (schema <code>igloo_auth</code>)</span></span></div>
 </figure>
-<div class="vx-howitworks__notes">
-<ul class="vx-howitworks__desc" role="list">
-<li><strong>igloo</strong> (this repository, Go) accepts Postgres and Arrow Flight SQL connections, checks each statement against the user’s role and grants, and runs it on an embedded DuckDB attached to the catalog. On start it sets up the catalog and warehouse itself, so every deployment works the same way.</li>
-<li><a href="https://github.com/lakekeeper/lakekeeper"><strong>Lakekeeper</strong></a> is the Iceberg REST catalog: it tracks tables, schemas and snapshots. Only Igloo talks to it; other engines use Igloo’s own Iceberg REST endpoint (port 8181), which checks their requests against the same users and grants and passes them on.</li>
-<li><strong>PostgreSQL</strong> stores the catalog’s metadata and Igloo’s users.</li>
-<li><strong>Object storage</strong> holds the table data as Parquet files.</li>
-</ul>
-<p class="vx-howitworks__license">Every component uses a permissive open-source license (Apache 2.0, MIT or the PostgreSQL License), except two libraries under the LGPL 2.1 inside DuckDB’s extensions: GEOS in the spatial extension (see <a href="/docs/media-analytics/#security">media analytics</a>), and MariaDB Connector/C, the MySQL client library, in the <code>mysql</code> extension.</p>
-</div>
 </div>
 </section>
