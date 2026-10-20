@@ -44,6 +44,9 @@ WORKDIR /
 # 7433: distributed-execution workers (igloo worker), TLS keyed by
 # IGLOO_WORKER_SECRET.
 EXPOSE 5432 7433 8080 8181 8443 8444 31337
-HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
+# Igloo takes up to 3 minutes to start (waiting for its databases, the
+# catalog and its connections' databases); the first check that passes ends
+# the start period early.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=3m --retries=5 \
     CMD ["/usr/local/bin/igloo", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/igloo"]
