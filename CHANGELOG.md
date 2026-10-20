@@ -128,8 +128,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   warehouse cost, and each scan becomes a Snowflake `SELECT` of the columns
   it needs, with its filters and `LIMIT`, whose Arrow result streams into
   DuckDB as it downloads, so `CREATE TABLE AS` copies large tables into
-  Iceberg without holding them in memory. `count(*)` is counted in
-  Snowflake. `query_timeout` stops queries on Snowflake too. Grants,
+  Iceberg without holding them in memory. Filters compare strings byte by
+  byte, as DuckDB does, whatever a column's Snowflake collation, so row
+  access policies hold. `count(*)` is counted in Snowflake.
+  `query_timeout` stops queries on Snowflake too. Grants,
   policies, the query history and `ALTER CONNECTION ... REFRESH` work as for
   other connections; credentials stay in Igloo, encrypted or in files.
 

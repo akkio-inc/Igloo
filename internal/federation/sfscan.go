@@ -606,7 +606,14 @@ func comparisonSQL(c *sfColumn, cmp string, v scanValue) (string, error) {
 		}
 		return col + " " + cmp + " TO_BINARY('" + strings.ToUpper(hex.EncodeToString(b)) + "', 'HEX')", nil
 	case sfText:
-		return col + " " + cmp + " " + sfString(v.text), nil
+		// DuckDB compares strings byte by byte. Snowflake compares a column
+		// with a collation (such as en-ci, which an account's
+		// DEFAULT_DDL_COLLATION gives every new column) as the collation
+		// says, so that 'EU' would match 'eu' and a row access policy's
+		// pushed filter would keep rows it hides. Under the utf8 collation
+		// Snowflake compares as DuckDB does, whatever the column's, and
+		// still prunes micro-partitions by the filter.
+		return "COLLATE(" + col + ", 'utf8') " + cmp + " " + sfString(v.text), nil
 	case sfJSON, sfAsText:
 		// DuckDB compares the text the gateway selected.
 		expr, _ := c.typ.selectExpr(col)

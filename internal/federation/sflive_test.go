@@ -91,6 +91,11 @@ func TestSnowflakeLive(t *testing.T) {
 		"Nation data as defined by TPC-H")
 	expect(t, eng, "SELECT count(*) FROM sf.tpch_sf1.lineitem", "6001215")
 	expect(t, eng, "SELECT n_name FROM sf.tpch_sf1.nation WHERE n_nationkey = 7", "GERMANY")
+	// Strings compare byte by byte, under Snowflake's utf8 collation.
+	expect(t, eng, "SELECT n_nationkey::VARCHAR FROM sf.tpch_sf1.nation WHERE n_name = 'GERMANY'", "7")
+	expect(t, eng, "SELECT count(*) FROM sf.tpch_sf1.nation WHERE n_name IN ('germany', 'France')", "0")
+	expect(t, eng, "SELECT string_agg(n_name, ',' ORDER BY n_name) FROM sf.tpch_sf1.nation WHERE n_name LIKE 'UNITED%'",
+		"UNITED KINGDOM,UNITED STATES")
 	expect(t, eng, "SELECT r_regionkey::VARCHAR, r_name FROM sf.tpch_sf1.region ORDER BY 1",
 		"0|AFRICA\n1|AMERICA\n2|ASIA\n3|EUROPE\n4|MIDDLE EAST")
 	expect(t, eng, "SELECT l_orderkey::VARCHAR, l_linenumber::VARCHAR, l_extendedprice::VARCHAR, l_shipdate::VARCHAR FROM sf.tpch_sf1.lineitem "+

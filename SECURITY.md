@@ -183,7 +183,10 @@ reference for every setting mentioned here.
   signs in to the database. Snowflake is reached through a gateway inside
   Igloo instead, in the same way, which answers DuckDB's scans by running
   SELECTs it writes itself, from a strict parse of each scan, with
-  Snowflake's Go driver; no SQL a user wrote reaches Snowflake. Stored
+  Snowflake's Go driver; no SQL a user wrote reaches Snowflake. The
+  filters it passes on, row access policies' conditions among them, keep
+  exactly the rows they would in DuckDB, which does not check them again:
+  strings compare byte by byte whatever a column's collation. Stored
   passwords and Snowflake private keys are encrypted (AES-256-GCM, bound to
   the connection's name, and a key to being one) under a key in the
   metadata database, so they are safe from a copy of the connections table

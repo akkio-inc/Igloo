@@ -96,11 +96,15 @@ func TestPlanScan(t *testing.T) {
 	for _, tc := range []struct{ scan, want string }{
 		{`COPY (SELECT "id", "amt" FROM "tpch"."t1" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid AND "amt" >= '1.50') TO STDOUT (FORMAT "binary");`,
 			`SELECT "ID", "AMT" FROM "DB"."TPCH"."T1" WHERE "AMT" >= 1.50`},
-		// Snowflake reads a backslash in a string as an escape.
+		// Snowflake reads a backslash in a string as an escape. Strings
+		// compare byte by byte, as in DuckDB, whatever the column's
+		// collation.
 		{`COPY (SELECT "name" FROM "tpch"."t1" WHERE "name" = 'it''s a\b' COLLATE "C") TO STDOUT (FORMAT "binary");`,
-			`SELECT "NAME" FROM "DB"."TPCH"."T1" WHERE "NAME" = 'it''s a\\b'`},
+			`SELECT "NAME" FROM "DB"."TPCH"."T1" WHERE COLLATE("NAME", 'utf8') = 'it''s a\\b'`},
 		{`COPY (SELECT "Mixed Case" FROM "tpch"."t1" WHERE "Mixed Case" IN ('a', 'b')) TO STDOUT (FORMAT "binary");`,
-			`SELECT "Mixed Case" FROM "DB"."TPCH"."T1" WHERE ("Mixed Case" = 'a' OR "Mixed Case" = 'b')`},
+			`SELECT "Mixed Case" FROM "DB"."TPCH"."T1" WHERE (COLLATE("Mixed Case", 'utf8') = 'a' OR COLLATE("Mixed Case", 'utf8') = 'b')`},
+		{`COPY (SELECT "name" FROM "tpch"."t1" WHERE ("name" >= 'EU' COLLATE "C" AND "name" < 'EV' COLLATE "C")) TO STDOUT (FORMAT "binary");`,
+			`SELECT "NAME" FROM "DB"."TPCH"."T1" WHERE COLLATE("NAME", 'utf8') >= 'EU' AND COLLATE("NAME", 'utf8') < 'EV'`},
 		{`COPY (SELECT "f", "flag" FROM "tpch"."t1" WHERE ("f" > 'inf' OR "f" < '1e+300') AND "flag" = 'true') TO STDOUT (FORMAT "binary");`,
 			`SELECT "F", "FLAG" FROM "DB"."TPCH"."T1" WHERE ("F" > CAST('inf' AS FLOAT) OR "F" < CAST('1e+300' AS FLOAT)) AND "FLAG" = TRUE`},
 		{`COPY (SELECT "d" FROM "tpch"."t1" WHERE "d" >= '2020-01-01' AND "d" < 'infinity') TO STDOUT (FORMAT "binary");`,

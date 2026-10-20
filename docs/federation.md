@@ -528,6 +528,15 @@ are cut to the microsecond, and filters on them compare what DuckDB sees:
 `ts = TIMESTAMP '2026-01-02 03:04:05.123456'` matches every value within
 that microsecond.
 
+Filters on strings compare them byte by byte, as DuckDB does, whatever
+collation a Snowflake column has: Igloo passes them on under Snowflake's
+`utf8` collation, with which Snowflake still skips the micro-partitions
+they rule out. In a column created with `en-ci`, say, `region = 'EU'`
+keeps only `EU`, not `eu`. DuckDB passes on the conditions of
+[row access policies](#masking-and-row-access-policies) too, and does not
+check again what Snowflake returns, so this is what keeps a policy from
+letting rows through.
+
 ### Cost
 
 Snowflake bills the warehouse by the second, with a minute's minimum each
@@ -575,9 +584,6 @@ anything.
   sign in with an unencrypted key or a password.
 - `TIMESTAMP_TZ`'s offsets, and fractions of a second finer than a
   microsecond, are not kept (see [names and types](#names-and-types)).
-  Filters Igloo passes on compare a column that has a Snowflake collation
-  (such as `en-ci`) as Snowflake collates it, not byte by byte as DuckDB
-  does, so they can keep rows DuckDB would have dropped.
 - Tables created in Snowflake since the replica started appear after
   `ALTER CONNECTION ... REFRESH` on that replica, or its restart.
 

@@ -235,9 +235,9 @@ func TestSnowflakeGateway(t *testing.T) {
 	var blocked sync.WaitGroup
 	fake.answer = func(ctx context.Context, q string) ([][]arrow.Record, error) {
 		switch {
-		case strings.Contains(q, `"NAME" = 'boom'`):
+		case strings.Contains(q, `COLLATE("NAME", 'utf8') = 'boom'`):
 			return nil, errors.New("SQL compilation error: something Snowflake said")
-		case strings.Contains(q, `"NAME" = 'slow'`):
+		case strings.Contains(q, `COLLATE("NAME", 'utf8') = 'slow'`):
 			// Waits for the query_timeout, as a long query would.
 			blocked.Add(1)
 			defer blocked.Done()
@@ -295,7 +295,7 @@ func TestSnowflakeGateway(t *testing.T) {
 	// Filters, columns and limits go to Snowflake; count(*) is counted
 	// there.
 	expect(t, eng, "SELECT id FROM sf.tpch.t1 WHERE amt < 0 AND name = 'it''s a\\b' LIMIT 1", "1")
-	if q := last(); q != `SELECT "AMT", "NAME", "ID" FROM "DB"."TPCH"."T1" WHERE "AMT" < 0.00 AND "NAME" = 'it''s a\\b' LIMIT 1` {
+	if q := last(); q != `SELECT "AMT", "NAME", "ID" FROM "DB"."TPCH"."T1" WHERE "AMT" < 0.00 AND COLLATE("NAME", 'utf8') = 'it''s a\\b' LIMIT 1` {
 		t.Errorf("Snowflake was sent %s", q)
 	}
 	expect(t, eng, "SELECT count(*) FROM sf.tpch.t1", "4")
@@ -303,6 +303,22 @@ func TestSnowflakeGateway(t *testing.T) {
 		t.Errorf("Snowflake was sent %s", q)
 	}
 	expect(t, eng, "SELECT count(*), sum(id)::VARCHAR FROM sf.tpch.t1 WHERE id = 1", "3|3")
+
+	// DuckDB does not check the rows of a scan against the filters it
+	// pushed into it, a row access policy's among them (this is the shape
+	// of Igloo's policy rewrite), and counts every row Snowflake returns:
+	// Snowflake must compare strings as DuckDB does, byte by byte, even in
+	// a column whose collation ignores case, or the count includes rows the
+	// policy hides (which other queries return with every column NULL).
+	expect(t, eng, `SELECT count(*) FROM (SELECT CASE WHEN t.ok THEN t.id END AS id
+		FROM (SELECT t.id, (t.name = 'EU') AS ok FROM sf.tpch.t1 AS t) AS t WHERE t.ok) AS p`, "2")
+	if q := last(); q != `SELECT "NAME" FROM "DB"."TPCH"."T1" WHERE COLLATE("NAME", 'utf8') = 'EU'` {
+		t.Errorf("Snowflake was sent %s", q)
+	}
+	expect(t, eng, "SELECT count(*) FROM sf.tpch.t1 WHERE name LIKE 'EU%'", "2")
+	if q := last(); q != `SELECT "NAME" FROM "DB"."TPCH"."T1" WHERE COLLATE("NAME", 'utf8') >= 'EU' AND COLLATE("NAME", 'utf8') < 'EV'` {
+		t.Errorf("Snowflake was sent %s", q)
+	}
 
 	// Joined with DuckDB's own tables.
 	expect(t, eng, "SELECT t.name, x.label FROM sf.tpch.t1 t JOIN (VALUES (1, 'one')) x(id, label) ON t.id = x.id", "it's a\\b|one")
