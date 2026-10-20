@@ -1,6 +1,7 @@
 package sharing
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -27,7 +28,8 @@ import (
 // table, under keys derived from a secret, and forwards each request to that
 // file's URL: SQL gains no way to reach any other URL. Providers' URLs
 // expire, so when one has, the proxy lists the table's files again and
-// retries.
+// retries. It also serves, from memory, the files Igloo makes for external
+// tables' views: the rows that deletion vectors delete (see vectors.go).
 
 // Proxy serves external tables' data files to DuckDB.
 type Proxy struct {
@@ -57,7 +59,14 @@ type proxyFile struct {
 	added time.Time
 	// used is when DuckDB last read the file, in Unix nanoseconds.
 	used int64
+	// data is the file itself, for a file Igloo made (see serve), which
+	// the proxy serves instead of fetching url.
+	data []byte
 }
+
+// madeFileGrace is how long a file Igloo made stays servable after a newer
+// one replaced it, for queries that started before.
+const madeFileGrace = 10 * time.Minute
 
 // NewProxy listens on a random loopback port. Its Prefix must be among
 // DuckDB's allowed directories before the sandbox is locked.
@@ -120,18 +129,15 @@ func (p *Proxy) fileKey(table, fileID string) string {
 // register makes a table's files servable, with their current URLs, and
 // returns the URL DuckDB reads each from. Keys of files the table no longer
 // lists stay until their URLs expire, for queries that started before.
-// partitions are the table's partition columns, which go into the URL as
-// Hive-style directories, as read_parquet expects.
-func (p *Proxy) register(table string, files []remoteFile, partitions []string) []string {
+// dirs, if not nil, returns the Hive-style directories (see hiveDirs) that
+// go before the i-th file's name in its URL, for read_parquet to read as
+// columns.
+func (p *Proxy) register(table string, files []remoteFile, dirs func(i int) string) []string {
 	urls := make([]string, len(files))
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for k, f := range p.files {
-		if now.After(f.expires) {
-			delete(p.files, k)
-		}
-	}
+	p.expire(now)
 	tableKey := p.fileKey(table, "")[:16]
 	for i, f := range files {
 		key := p.fileKey(table, f.ID)
@@ -141,19 +147,62 @@ func (p *Proxy) register(table string, files []remoteFile, partitions []string) 
 			added = old.added
 		}
 		p.files[key] = &proxyFile{table: table, url: f.URL, size: f.Size, expires: f.Expires, added: added}
-		var dirs strings.Builder
-		for _, col := range partitions {
-			// The protocol writes a null partition value as "".
-			v := f.PartitionValues[col]
-			value := "__HIVE_DEFAULT_PARTITION__"
-			if v != nil && *v != "" {
-				value = hiveEscape(*v)
-			}
-			dirs.WriteString(hiveEscape(col) + "=" + value + "/")
+		var d string
+		if dirs != nil {
+			d = dirs(i)
 		}
-		urls[i] = p.prefix + tableKey + "/" + dirs.String() + key + ".parquet"
+		urls[i] = p.prefix + tableKey + "/" + d + key + ".parquet"
 	}
 	return urls
+}
+
+// serve makes data, a Parquet file Igloo made for a table's view, servable
+// until expires, and returns its URL. The URL follows from the data, so
+// the same file keeps its URL. Other files made for the table stay for
+// madeFileGrace at most.
+func (p *Proxy) serve(table string, data []byte, expires time.Time) string {
+	sum := sha256.Sum256(data)
+	key := p.fileKey(table, "made\x00"+hex.EncodeToString(sum[:]))
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expire(now)
+	for k, f := range p.files {
+		if f.table == table && f.data != nil && k != key && f.expires.After(now.Add(madeFileGrace)) {
+			f.expires = now.Add(madeFileGrace)
+		}
+	}
+	added := now
+	if old, ok := p.files[key]; ok {
+		added = old.added
+	}
+	p.files[key] = &proxyFile{table: table, size: int64(len(data)), expires: expires, added: added, data: data}
+	return p.prefix + p.fileKey(table, "")[:16] + "/" + key + ".parquet"
+}
+
+// expire forgets files whose URLs have expired. p.mu must be held.
+func (p *Proxy) expire(now time.Time) {
+	for k, f := range p.files {
+		if now.After(f.expires) {
+			delete(p.files, k)
+		}
+	}
+}
+
+// hiveDirs returns the Hive-style directories that give a file's values of
+// the partition columns cols (named as in values) in its URL.
+func hiveDirs(cols []string, values map[string]*string) string {
+	var dirs strings.Builder
+	for _, col := range cols {
+		// The protocol writes a null partition value as "".
+		v := values[col]
+		value := "__HIVE_DEFAULT_PARTITION__"
+		if v != nil && *v != "" {
+			value = hiveEscape(*v)
+		}
+		dirs.WriteString(hiveEscape(col) + "=" + value + "/")
+	}
+	return dirs.String()
 }
 
 // hiveEscape escapes a partition column or value for a Hive-style
@@ -214,6 +263,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Last-Modified", f.added.UTC().Format(http.TimeFormat))
 	h.Set("Accept-Ranges", "bytes")
 	h.Set("Content-Type", "application/octet-stream")
+	if f.data != nil {
+		http.ServeContent(w, r, "", f.added, bytes.NewReader(f.data))
+		return
+	}
 	if r.Method == http.MethodHead {
 		h.Set("Content-Length", strconv.FormatInt(f.size, 10))
 		return

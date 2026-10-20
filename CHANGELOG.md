@@ -530,6 +530,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   SHARE provider.share.schema.table` makes a shared table queryable, and
   grantable, like any table. Queries read the partner's current version
   through a proxy that is the only address the sandbox gains.
+- External tables read Delta Sharing's `delta` response format, in which
+  Databricks shares every table with deletion vectors enabled: Igloo
+  applies deletion vectors, so deleted rows never show, and column mapping
+  (modes `name` and `id`), so columns have the table's names. A table that
+  needs a Delta reader feature Igloo does not apply is refused, naming it.
+  Providers that speak only the `parquet` format are read as before.
+- External tables have the shared table's columns in its order: columns
+  the files hold that the table does not, such as Delta's row tracking
+  columns, are left out, and columns no file holds yet read as NULL.
 - Delta Sharing and policies: tables with masking or row access policies
   cannot be shared, and a shared table that gains one is refused to
   recipients, downloads of files listed before included, with each refusal

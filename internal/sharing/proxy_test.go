@@ -104,9 +104,31 @@ func TestProxy(t *testing.T) {
 
 	// Partition values go into Hive-style directories, escaped.
 	value, empty := "a/b=c d", ""
-	urls = p.register("t", []remoteFile{{ID: "x", URL: upstream.URL, Size: 1, Expires: time.Now().Add(time.Hour),
-		PartitionValues: map[string]*string{"day": &value, "c": &empty}}}, []string{"day", "c", "missing"})
+	values := map[string]*string{"day": &value, "c": &empty}
+	urls = p.register("t", []remoteFile{{ID: "x", URL: upstream.URL, Size: 1, Expires: time.Now().Add(time.Hour), PartitionValues: values}},
+		func(int) string { return hiveDirs([]string{"day", "c", "missing"}, values) })
 	if !strings.Contains(urls[0], "/day=a%2Fb%3Dc%20d/c=__HIVE_DEFAULT_PARTITION__/missing=__HIVE_DEFAULT_PARTITION__/") {
 		t.Errorf("partitioned URL %q", urls[0])
+	}
+
+	// Files Igloo makes are served from memory, ranges too, under a URL
+	// that follows from their contents.
+	made := p.serve("t", []byte("PAR1 made PAR1"), time.Now().Add(time.Hour))
+	if again := p.serve("t", []byte("PAR1 made PAR1"), time.Now().Add(time.Hour)); again != made || !strings.HasPrefix(made, p.Prefix()) {
+		t.Errorf("made file URLs %q, %q", made, again)
+	}
+	if status, _, body := get("GET", made, "Range", "bytes=5-8"); status != http.StatusPartialContent || body != "made" {
+		t.Errorf("a made file: %d %q", status, body)
+	}
+	if status, h, _ := get("HEAD", made); status != 200 || h.Get("Content-Length") != "14" {
+		t.Errorf("HEAD of a made file: %d %v", status, h)
+	}
+	// A newer file of the table's leaves the older one a while.
+	newer := p.serve("t", []byte("PAR1 newer PAR1"), time.Now().Add(time.Hour))
+	p.mu.RLock()
+	older := p.files[strings.TrimSuffix(made[strings.LastIndexByte(made, '/')+1:], ".parquet")]
+	p.mu.RUnlock()
+	if newer == made || older == nil || time.Until(older.expires) > madeFileGrace {
+		t.Errorf("an older made file: %+v", older)
 	}
 }

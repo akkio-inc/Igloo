@@ -362,11 +362,16 @@ func duckType(t any) (string, error) {
 
 // remoteSchema is a Delta schema as a provider sends it.
 type remoteSchema struct {
-	Type   string `json:"type"`
-	Fields []struct {
-		Name string `json:"name"`
-		Type any    `json:"type"`
-	} `json:"fields"`
+	Type   string        `json:"type"`
+	Fields []remoteField `json:"fields"`
+}
+
+// remoteField is a field of a Delta schema. Under column mapping its
+// metadata holds its physical name and ID.
+type remoteField struct {
+	Name     string         `json:"name"`
+	Type     any            `json:"type"`
+	Metadata map[string]any `json:"metadata"`
 }
 
 func parseRemoteSchema(s string) (remoteSchema, error) {

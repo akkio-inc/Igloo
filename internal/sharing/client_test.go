@@ -109,7 +109,7 @@ func TestGuardedDialer(t *testing.T) {
 	g.allow(endpointHostPort(target.URL))
 	g.allow(endpointHostPort(redirect.URL))
 	cl := &client{endpoint: redirect.URL, token: "secret", http: c}
-	if resp, err := cl.do(context.Background(), http.MethodGet, "/x", nil); err == nil {
+	if resp, err := cl.do(context.Background(), http.MethodGet, "/x", nil, ""); err == nil {
 		resp.Body.Close() //nolint:errcheck
 	}
 	if sawAuth != "" {

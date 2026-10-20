@@ -259,17 +259,45 @@ through a view is kept current while it is in use.
 
 How it works, and its limits:
 
-- Igloo asks for the protocol's `parquet` response format, which every
-  sharing server supports. Tables a provider can share only in the `delta`
-  format (with deletion vectors or column mapping) cannot be read until
-  the provider shares them without those features.
+- **Response formats.** A provider answers in the protocol's `parquet`
+  format, which every sharing server speaks, or in its `delta` format,
+  which carries Delta features the `parquet` format cannot. Igloo offers
+  both and reads the files in the one the provider picks for the table.
+  Databricks picks `delta` for every table with deletion vectors enabled,
+  even when nothing was deleted, and a workspace can enable them on every
+  new table. In the `delta` format Igloo applies:
+  - **Deletion vectors**, which mark rows deleted from a data file that
+    still holds them. Igloo downloads a table's vectors when it lists its
+    files, and the external table leaves those rows out. A query holds the
+    deleted rows of the files it reads in memory, and DuckDB spills them
+    to disk when they do not fit; files without deletion vectors are read
+    as they are. A table whose vectors delete more than 20 million
+    separate runs of rows is refused; the provider can purge them with
+    `REORG TABLE ... APPLY (PURGE)`. Only external tables apply the
+    vectors: a data file read directly through the proxy (`read_parquet`)
+    still has its deleted rows.
+  - **Column mapping**, modes `name` and `id`, under which the files name
+    columns differently from the table. Igloo reads them by the files'
+    names and shows the table's, nested fields too. In mode `id`, Igloo
+    checks that every file's field IDs agree with those names, and refuses
+    a file where they do not.
+  - **`timestamp_ntz`** columns, as `TIMESTAMP`.
+
+  A table that needs another Delta reader feature, such as type widening
+  or variants, is refused, and the error names the feature.
+- **Columns.** An external table has the shared table's columns, in its
+  order, partition columns too. A column that only some files hold reads
+  as NULL in the others; columns the files hold that the table does not
+  have, such as dropped columns under column mapping or Delta's row
+  tracking, are left out.
 - Profiles with a bearer token are supported; OAuth client-credential
   profiles are not yet.
 - The provider's endpoint must use HTTPS, unless it is on this machine or
   a private network (a loopback or private address, or a host name without
   dots, such as a Docker or Kubernetes service).
-- Files are read when queries need them, as DuckDB reads the warehouse,
-  through a proxy inside Igloo. Nothing is copied ahead of time.
+- Data files are read when queries need them, as DuckDB reads the
+  warehouse, through a proxy inside Igloo. Nothing but deletion vectors is
+  downloaded ahead of time.
 - **Policies.** Masking and row access policies and tags attach only to
   the catalog's tables, so `ALTER TABLE` refuses to attach them to an
   external table and says so; to protect a partner's rows, copy what users
@@ -317,10 +345,12 @@ How it works, and its limits:
   with the rest of `CREATE PROVIDER`.
 - **The query sandbox** gains one address: a proxy on the loopback
   interface, under a random path, that serves only files a provider listed
-  for an external table. SQL cannot reach any other URL through it. The
-  proxy does not connect to loopback, link-local (cloud metadata) or
-  multicast addresses, other than the provider's own endpoint, so a hostile
-  provider cannot point Igloo at internal services, and it never forwards
-  the bearer token to a redirect.
+  for an external table, and the lists of deleted rows Igloo makes from
+  their deletion vectors. SQL cannot reach any other URL through it. The
+  proxy, and Igloo when it downloads deletion vectors, do not connect to
+  loopback, link-local (cloud metadata) or multicast addresses, other than
+  the provider's own endpoint, so a hostile provider cannot point Igloo at
+  internal services; neither sends the bearer token with a file download
+  or to a redirect.
 - **History.** Every recipient request is recorded, and failed tokens in
   the login history.

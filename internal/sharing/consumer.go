@@ -19,12 +19,12 @@ import (
 
 // External tables. Each is a view in DuckDB's own database (memory.s.t for
 // the external table s.t) over the shared table's Parquet files, read
-// through the Proxy. Before a statement that names one runs, Igloo makes
-// sure the view lists the table's current version: it asks the provider
-// for the version at most every checkInterval, and lists the files again
-// when the version changed or the provider's URLs are about to expire. A
-// table read only through views, whose statements do not name it, is kept
-// current in the background while DuckDB reads it.
+// through the Proxy (see view.go). Before a statement that names one runs,
+// Igloo makes sure the view lists the table's current version: it asks the
+// provider for the version at most every checkInterval, and lists the files
+// again when the version changed or the provider's URLs are about to
+// expire. A table read only through views, whose statements do not name
+// it, is kept current in the background while DuckDB reads it.
 
 // Engine is the part of the query engine external tables need;
 // *engine.Engine implements it.
@@ -89,6 +89,15 @@ type external struct {
 	tableKey string
 	// columns are the view's, for the data catalog.
 	columns atomic.Pointer[[]catalog.ColumnMeta]
+
+	// What the last listing found, for the next (see view): the columns
+	// of each scan of files by its SQL, the serialized deletion vectors
+	// by key, and the file of deleted rows made from them, with the sum
+	// of the vectors' keys.
+	shapes     map[string]map[string]*duckShape
+	vectors    map[string][]byte
+	deletes    []byte
+	deletesSum string
 }
 
 func tableKey(schema, name string) string {
@@ -225,8 +234,13 @@ func (c *Consumer) refresh(ctx context.Context, t *external, force bool) error {
 	if err != nil {
 		return err
 	}
-	urls := c.proxy.register(t.key, snap.files, snap.partitionColumns)
-	sql, scans, err := viewSQL(snap, urls)
+	expires := now.Add(24 * time.Hour)
+	for _, f := range snap.files {
+		if f.Expires.Before(expires) {
+			expires = f.Expires
+		}
+	}
+	sql, scans, err := c.view(ctx, t, snap, expires)
 	if err != nil {
 		return err
 	}
@@ -241,90 +255,8 @@ func (c *Consumer) refresh(ctx context.Context, t *external, force bool) error {
 			t.columns.Store(&cols)
 		}
 	}
-	t.version, t.checked = snap.version, now
-	t.expires = now.Add(24 * time.Hour)
-	for _, f := range snap.files {
-		if f.Expires.Before(t.expires) {
-			t.expires = f.Expires
-		}
-	}
+	t.version, t.checked, t.expires = snap.version, now, expires
 	return nil
-}
-
-// viewSQL is the query of an external table's view: read_parquet over its
-// files, or for a table without files an empty query with its columns.
-func viewSQL(snap *remoteSnapshot, urls []string) (string, int, error) {
-	rs, err := parseRemoteSchema(snap.schema)
-	if err != nil {
-		return "", 0, err
-	}
-	if len(rs.Fields) == 0 {
-		return "", 0, errors.New("the shared table has no columns")
-	}
-	if len(urls) == 0 {
-		cols := make([]string, len(rs.Fields))
-		for i, f := range rs.Fields {
-			t, err := duckType(f.Type)
-			if err != nil {
-				return "", 0, fmt.Errorf("column %s: %w", f.Name, err)
-			}
-			cols[i] = "CAST(NULL AS " + t + ") AS " + quoteIdent(f.Name)
-		}
-		return "SELECT " + strings.Join(cols, ", ") + " LIMIT 0", 0, nil
-	}
-	quoted := make([]string, len(urls))
-	for i, u := range urls {
-		quoted[i] = quoteLiteral(u)
-	}
-	opts := ", union_by_name = true, hive_partitioning = false"
-	if len(snap.partitionColumns) > 0 {
-		types := make([]string, 0, len(snap.partitionColumns))
-		for _, col := range snap.partitionColumns {
-			t := "VARCHAR"
-			for _, f := range rs.Fields {
-				if f.Name == col {
-					t, err = hiveType(f.Type)
-					if err != nil {
-						return "", 0, fmt.Errorf("partition column %s: %w", col, err)
-					}
-				}
-			}
-			types = append(types, quoteLiteral(col)+": "+t)
-		}
-		opts = ", union_by_name = true, hive_partitioning = true, hive_types = {" + strings.Join(types, ", ") + "}"
-	}
-	return "SELECT * FROM read_parquet([" + strings.Join(quoted, ", ") + "]" + opts + ")", 1, nil
-}
-
-// remoteColumns are the columns of a shared table's view (see viewSQL),
-// with their DuckDB types: read_parquet puts partition columns, which the
-// files lack, last.
-func remoteColumns(snap *remoteSnapshot) ([]catalog.ColumnMeta, error) {
-	rs, err := parseRemoteSchema(snap.schema)
-	if err != nil {
-		return nil, err
-	}
-	var cols, partitions []catalog.ColumnMeta
-	for _, f := range rs.Fields {
-		partition := len(snap.files) > 0 && slices.Contains(snap.partitionColumns, f.Name)
-		typeOf := duckType
-		if partition {
-			typeOf = hiveType
-		}
-		t, err := typeOf(f.Type)
-		if err != nil {
-			return nil, err
-		}
-		if partition {
-			partitions = append(partitions, catalog.ColumnMeta{Name: f.Name, Type: t})
-		} else {
-			cols = append(cols, catalog.ColumnMeta{Name: f.Name, Type: t})
-		}
-	}
-	slices.SortStableFunc(partitions, func(a, b catalog.ColumnMeta) int {
-		return slices.Index(snap.partitionColumns, a.Name) - slices.Index(snap.partitionColumns, b.Name)
-	})
-	return append(cols, partitions...), nil
 }
 
 // hiveType is the type of a partition column's values, which the protocol
