@@ -15,8 +15,9 @@ approximate and statistical functions are described in
 Tables live in the Iceberg catalog, named `lake` in SQL (`IGLOO_CATALOG_NAME`),
 and the default schema is `public`. Unqualified names resolve to
 `lake.public`, so `events` and `lake.public.events` are the same table.
-[Connections](#connections-to-other-databases) to PostgreSQL and MySQL
-databases are catalogs of their own, such as `crm.public.customers`.
+[Connections](#connections-to-other-databases) to PostgreSQL, MySQL and
+Snowflake databases are catalogs of their own, such as
+`crm.public.customers`.
 
 ## Tables
 
@@ -368,8 +369,8 @@ and the security model.
 
 ## Connections to other databases
 
-Admins connect PostgreSQL and MySQL databases, which Igloo then queries in
-place, read-only, alongside its Iceberg tables; see
+Admins connect PostgreSQL, MySQL and Snowflake databases, which Igloo then
+queries in place, read-only, alongside its Iceberg tables; see
 [connections](federation.md) for everything about them.
 
 ```sql

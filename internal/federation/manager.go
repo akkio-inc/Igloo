@@ -66,8 +66,37 @@ type Manager struct {
 
 // attachment is a connection DuckDB attached.
 type attachment struct {
-	conn  Connection
-	proxy *proxy
+	conn Connection
+	ep   endpoint
+}
+
+// endpoint is what DuckDB attaches a connection at: a proxy to a
+// PostgreSQL or MySQL database, or the gateway to Snowflake.
+type endpoint interface {
+	// port is the loopback port DuckDB connects to.
+	port() int
+	// probe signs in to the remote database: a check that it can be
+	// reached, which also teaches the endpoint what it needs to serve
+	// DuckDB.
+	probe() error
+	// update applies new settings.
+	update(Connection)
+	close()
+	// lastError says why the last sign-in failed, or "".
+	lastError() string
+	// settings are the connection's current settings, with the database
+	// and schemas it was attached with.
+	settings() Connection
+	// attachedConn is the connection as DuckDB attached it.
+	attachedConn() Connection
+}
+
+// newEndpoint listens for DuckDB's connections for c.
+func newEndpoint(c Connection, token, secrets string, log *slog.Logger) (endpoint, error) {
+	if c.Type == Snowflake {
+		return newSnowflakeGateway(c, token, secrets, log)
+	}
+	return newProxy(c, token, secrets, log)
 }
 
 // NewManager returns a manager for the connections in store.
@@ -111,7 +140,8 @@ func (m *Manager) Exists(ctx context.Context, name string) (bool, error) {
 	return slices.ContainsFunc(conns, func(c Connection) bool { return strings.EqualFold(c.Name, name) }), nil
 }
 
-// extension is the DuckDB extension that attaches a type.
+// extension is the DuckDB extension that attaches a type. Snowflake
+// connections are attached as PostgreSQL databases, at the gateway.
 func (t Type) extension() string {
 	if t == MySQL {
 		return "mysql"
@@ -140,31 +170,31 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 		return nil
 	}
 
-	loaded := map[Type]error{}
+	loaded := map[string]error{}
 	for _, c := range conns {
-		if _, ok := loaded[c.Type]; !ok {
-			loaded[c.Type] = exec(ctx, conn, "LOAD "+c.Type.extension())
+		if _, ok := loaded[c.Type.extension()]; !ok {
+			loaded[c.Type.extension()] = exec(ctx, conn, "LOAD "+c.Type.extension())
 		}
 	}
-	if loaded[Postgres] == nil {
+	if err, ok := loaded["postgres"]; ok && err == nil {
 		// By default the postgres extension asks the remote database
 		// whether its tables changed every time it lists them, so listing
 		// any catalog's tables would fail while one database is down. The
 		// lists are read once instead, and again on ALTER CONNECTION ...
 		// REFRESH; a table created since is still found when named.
 		if err := exec(ctx, conn, "SET GLOBAL pg_staleness_query_enabled = false"); err != nil {
-			loaded[Postgres] = err
+			loaded["postgres"] = err
 		}
 	}
-	proxies := make([]*proxy, len(conns))
+	proxies := make([]endpoint, len(conns))
 	errs := make([]error, len(conns))
 	var wg sync.WaitGroup
 	for i, c := range conns {
-		if err := loaded[c.Type]; err != nil {
+		if err := loaded[c.Type.extension()]; err != nil {
 			errs[i] = fmt.Errorf("DuckDB's %s extension: %w", c.Type.extension(), err)
 			continue
 		}
-		if proxies[i], errs[i] = newProxy(c, m.token, m.secrets, m.log); errs[i] != nil {
+		if proxies[i], errs[i] = newEndpoint(c, m.token, m.secrets, m.log); errs[i] != nil {
 			continue
 		}
 		wg.Add(1)
@@ -189,7 +219,7 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 			m.mu.Unlock()
 			continue
 		}
-		m.log.Info("attached connection", "connection", c.Name, "type", c.Type, "host", c.Host, "database", c.Database)
+		m.log.Info("attached connection", "connection", c.Name, "type", c.Type, "host", c.ServerHost(), "database", c.Database)
 	}
 	return nil
 }
@@ -197,7 +227,7 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 // attach attaches one connection through its proxy and loads its list of
 // tables, so that listing tables (information_schema, psql's \dt) never
 // waits on that database again, even while it is down.
-func (m *Manager) attach(ctx context.Context, conn *duckdb.Conn, c Connection, p *proxy) error {
+func (m *Manager) attach(ctx context.Context, conn *duckdb.Conn, c Connection, p endpoint) error {
 	for _, stmt := range attachStatements(c, m.token, p.port()) {
 		if err := exec(ctx, conn, stmt); err != nil {
 			p.close()
@@ -206,7 +236,7 @@ func (m *Manager) attach(ctx context.Context, conn *duckdb.Conn, c Connection, p
 		}
 	}
 	m.mu.Lock()
-	m.attached[c.Name] = &attachment{conn: c, proxy: p}
+	m.attached[c.Name] = &attachment{conn: c, ep: p}
 	m.mu.Unlock()
 	m.gen.Add(1)
 	return nil
@@ -226,7 +256,9 @@ func attachStatements(c Connection, token string, port int) []string {
 		path = fmt.Sprintf("host=127.0.0.1 port=%d user=igloo dbname=%s sslmode=disable", port, c.Name)
 	}
 	opts := "TYPE " + c.Type.extension() + ", SECRET " + secret + ", READ_ONLY"
-	if len(c.Schemas) > 0 {
+	// A Snowflake connection's gateway lists only its schemas itself, as
+	// Snowflake names them.
+	if len(c.Schemas) > 0 && c.Type != Snowflake {
 		quoted := make([]string, len(c.Schemas))
 		for i, s := range c.Schemas {
 			quoted[i] = literal(s)
@@ -247,7 +279,12 @@ func mysqlDSNValue(s string) string {
 }
 
 // signIn checks that Igloo can sign in to c's database, without DuckDB.
-func (m *Manager) signIn(c Connection) error {
+func (m *Manager) signIn(ctx context.Context, c Connection) error {
+	if c.Type == Snowflake {
+		cl := openSnowflake(c, m.secrets)
+		defer cl.close()
+		return cl.check(ctx)
+	}
 	p := &proxy{name: c.Name, secrets: m.secrets, log: m.log, attached: c, current: c}
 	return p.probe()
 }
@@ -289,7 +326,7 @@ func (m *Manager) Sync(ctx context.Context) error {
 			gone = append(gone, name)
 		case !c.UpdatedAt.Equal(a.conn.UpdatedAt):
 			a.conn = c
-			a.proxy.update(c)
+			a.ep.update(c)
 			m.gen.Add(1)
 		}
 	}
@@ -317,7 +354,7 @@ func (m *Manager) detach(ctx context.Context, name string) error {
 		return nil
 	}
 	m.gen.Add(1)
-	a.proxy.close()
+	a.ep.close()
 	return m.withConn(ctx, func(conn *duckdb.Conn) error {
 		err := exec(ctx, conn, "DETACH DATABASE IF EXISTS "+ident(name))
 		if err == nil {
@@ -344,7 +381,7 @@ func (m *Manager) closeAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, a := range m.attached {
-		a.proxy.close()
+		a.ep.close()
 	}
 }
 
@@ -357,7 +394,7 @@ func (m *Manager) Create(ctx context.Context, c Connection, taken []string) erro
 	if err := m.validate(ctx, c, taken); err != nil {
 		return err
 	}
-	if err := m.signIn(c); err != nil {
+	if err := m.signIn(ctx, c); err != nil {
 		return &UnreachableError{c.Name, err}
 	}
 	return m.store.Create(ctx, c)
@@ -380,7 +417,7 @@ func (m *Manager) Alter(ctx context.Context, name string, set func(*Connection) 
 		return c, err
 	}
 	c.Unusable = ""
-	if err := m.signIn(c); err != nil {
+	if err := m.signIn(ctx, c); err != nil {
 		return c, &UnreachableError{c.Name, err}
 	}
 	if err := m.store.Update(ctx, c); err != nil {
@@ -395,7 +432,7 @@ func (m *Manager) validate(ctx context.Context, c Connection, taken []string) er
 	if err := c.Validate(taken); err != nil {
 		return &InvalidError{err}
 	}
-	if p, ok := reachesProtected(ctx, m.protected, c.Host, c.Port); ok {
+	if p, ok := reachesProtected(ctx, m.protected, c.ServerHost(), c.Port); ok {
 		return &InvalidError{fmt.Errorf("%s is the server of Igloo's metadata database (%s), which a connection must not reach",
 			c.Address(), net.JoinHostPort(p.host, strconv.Itoa(p.port)))}
 	}
@@ -413,16 +450,19 @@ func (m *Manager) Drop(ctx context.Context, name string) error {
 
 // Refresh makes DuckDB read again which tables the connection's database
 // has. DuckDB's extensions keep one list for all databases of a type, so
-// the lists of every attached connection of the same type are read again;
-// to keep one that is down from losing its list, Refresh first checks that
-// all of them can be reached.
+// the lists of every attached connection of the same extension are read
+// again; to keep one that is down from losing its list, Refresh first
+// checks that all of them can be reached. Snowflake connections, attached
+// with the postgres extension, are listed by their gateways from what they
+// read of Snowflake: a refreshed one reads Snowflake again first (keeping
+// its list if it cannot), the others list what they have.
 func (m *Manager) Refresh(ctx context.Context, name string) error {
 	m.mu.Lock()
 	a := m.attached[name]
 	var same []Connection
 	for _, other := range m.attached {
-		if a != nil && other.conn.Type == a.conn.Type {
-			same = append(same, other.proxy.settings())
+		if a != nil && other.conn.Type.extension() == a.conn.Type.extension() {
+			same = append(same, other.ep.settings())
 		}
 	}
 	m.mu.Unlock()
@@ -433,8 +473,16 @@ func (m *Manager) Refresh(ctx context.Context, name string) error {
 		return fmt.Errorf("connection %s is not attached on this replica; it is attached when Igloo restarts", name)
 	}
 	for _, c := range same {
-		if err := m.signIn(c); err != nil {
+		if c.Type == Snowflake {
+			continue
+		}
+		if err := m.signIn(ctx, c); err != nil {
 			return &UnreachableError{c.Name, fmt.Errorf("refreshing would drop the list of its tables while it is down: %w", err)}
+		}
+	}
+	if g, ok := a.ep.(*sfGateway); ok {
+		if err := g.refresh(ctx); err != nil {
+			return &UnreachableError{name, err}
 		}
 	}
 	clearCache := "pg_clear_cache"
@@ -491,11 +539,11 @@ func (m *Manager) List(ctx context.Context) ([]Status, error) {
 		s := Status{Connection: c}
 		a := m.attached[c.Name]
 		switch {
-		case a != nil && a.proxy.attached.attachedFields() != c.attachedFields():
+		case a != nil && a.ep.attachedConn().attachedFields() != c.attachedFields():
 			s.State, s.Detail = "attached", "restart to apply the new database or schema"
 		case a != nil:
 			s.State = "attached"
-			if err := a.proxy.lastError(); err != "" {
+			if err := a.ep.lastError(); err != "" {
 				s.Detail = "the last sign-in to the database failed: " + err
 			}
 		case m.failed[c.Name] != "":

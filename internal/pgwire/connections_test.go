@@ -289,7 +289,7 @@ func TestConnectionStatements(t *testing.T) {
 	var state, detail, password, timeout string
 	if err := admin.QueryRow(context.Background(), "SHOW CONNECTIONS").Scan(new(string), new(string), new(string), new(int32),
 		new(string), new(string), &password, new(string), new(string), new(string), &timeout, &state, &detail, new(string),
-		new(time.Time), new(time.Time)); err != nil {
+		new(time.Time), new(time.Time), new(string)); err != nil {
 		t.Fatal(err)
 	}
 	if state != "not attached" || !strings.Contains(detail, "restart") || password != "stored" || timeout != "30s" {

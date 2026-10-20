@@ -123,7 +123,25 @@ var migrations = []string{
 		created_at         timestamptz NOT NULL DEFAULT now(),
 		updated_at         timestamptz NOT NULL DEFAULT now()
 	)`,
+	// The types are checked where connections are made (Validate), which
+	// knows every type of this version; a CHECK listing them would have to
+	// be replaced whenever one is added.
+	`ALTER TABLE igloo_auth.connections DROP CONSTRAINT IF EXISTS connections_type_check`,
+	// Snowflake's settings. A private key is sealed like a password, bound
+	// to the connection's name and to being a private key (see
+	// privateKeyAD).
+	`ALTER TABLE igloo_auth.connections
+		ADD COLUMN IF NOT EXISTS account            text NOT NULL DEFAULT '',
+		ADD COLUMN IF NOT EXISTS warehouse          text NOT NULL DEFAULT '',
+		ADD COLUMN IF NOT EXISTS role_name          text NOT NULL DEFAULT '',
+		ADD COLUMN IF NOT EXISTS private_key        bytea,
+		ADD COLUMN IF NOT EXISTS private_key_secret text NOT NULL DEFAULT ''`,
 }
+
+// privateKeyAD is what a stored private key is sealed with, besides the
+// connection's name, so that it cannot be moved into the password column
+// or the other way round.
+func privateKeyAD(name string) string { return name + "\x00private_key" }
 
 // PostgresStore keeps connections in igloo_auth.connections of the
 // metadata database, shared by every replica.
@@ -170,7 +188,8 @@ func OpenPostgresStore(ctx context.Context, url string, key []byte) (*PostgresSt
 func (s *PostgresStore) Close() { s.pool.Close() }
 
 const columns = `name, id, type, host, port, database_name, user_name, password, password_secret, tls, tls_ca,
-	schemas, connect_timeout_ms, query_timeout_ms, created_by, created_at, updated_at`
+	schemas, connect_timeout_ms, query_timeout_ms, account, warehouse, role_name, private_key, private_key_secret,
+	created_by, created_at, updated_at`
 
 func (s *PostgresStore) List(ctx context.Context) ([]Connection, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+columns+` FROM igloo_auth.connections ORDER BY name`)
@@ -181,21 +200,27 @@ func (s *PostgresStore) List(ctx context.Context) ([]Connection, error) {
 		var (
 			c                  Connection
 			typ, tls           string
-			sealed             []byte
+			sealed, sealedKey  []byte
 			connectMS, queryMS int64
 		)
 		err := row.Scan(&c.Name, &c.ID, &typ, &c.Host, &c.Port, &c.Database, &c.User, &sealed, &c.PasswordSecret,
-			&tls, &c.TLSCA, &c.Schemas, &connectMS, &queryMS, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
+			&tls, &c.TLSCA, &c.Schemas, &connectMS, &queryMS, &c.Account, &c.Warehouse, &c.Role, &sealedKey, &c.PrivateKeySecret,
+			&c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
 		if err != nil {
 			return c, err
 		}
 		c.Type, c.TLS = Type(typ), TLSMode(tls)
 		c.ConnectTimeout, c.QueryTimeout = time.Duration(connectMS)*time.Millisecond, time.Duration(queryMS)*time.Millisecond
+		// A password or key that does not decrypt leaves the connection
+		// unable to sign in, rather than hiding every connection.
 		if sealed != nil {
-			// A password that does not decrypt leaves the connection
-			// unable to sign in, rather than hiding every connection.
 			if c.Password, err = s.sealer.open(c.Name, sealed); err != nil {
 				c.Password, c.Unusable = "", err.Error()
+			}
+		}
+		if sealedKey != nil {
+			if c.PrivateKey, err = s.sealer.open(privateKeyAD(c.Name), sealedKey); err != nil {
+				c.PrivateKey, c.Unusable = "", strings.Replace(err.Error(), "password", "private key", 1)
 			}
 		}
 		return c, nil
@@ -210,12 +235,21 @@ func (s *PostgresStore) sealPassword(c Connection) []byte {
 	return s.sealer.seal(c.Name, c.Password)
 }
 
+// sealPrivateKey returns the stored form of c's private key, or nil.
+func (s *PostgresStore) sealPrivateKey(c Connection) []byte {
+	if c.PrivateKey == "" {
+		return nil
+	}
+	return s.sealer.seal(privateKeyAD(c.Name), c.PrivateKey)
+}
+
 func (s *PostgresStore) Create(ctx context.Context, c Connection) error {
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO igloo_auth.connections (`+columns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), now())`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, now(), now())`,
 			c.Name, newID(), string(c.Type), c.Host, c.Port, c.Database, c.User, s.sealPassword(c), c.PasswordSecret,
-			string(c.TLS), c.TLSCA, nonNil(c.Schemas), c.ConnectTimeout.Milliseconds(), c.QueryTimeout.Milliseconds(), c.CreatedBy)
+			string(c.TLS), c.TLSCA, nonNil(c.Schemas), c.ConnectTimeout.Milliseconds(), c.QueryTimeout.Milliseconds(),
+			c.Account, c.Warehouse, c.Role, s.sealPrivateKey(c), c.PrivateKeySecret, c.CreatedBy)
 		if err != nil {
 			return err
 		}
@@ -233,10 +267,12 @@ func (s *PostgresStore) Create(ctx context.Context, c Connection) error {
 func (s *PostgresStore) Update(ctx context.Context, c Connection) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE igloo_auth.connections SET type = $2, host = $3, port = $4,
 			database_name = $5, user_name = $6, password = $7, password_secret = $8, tls = $9, tls_ca = $10,
-			schemas = $11, connect_timeout_ms = $12, query_timeout_ms = $13, updated_at = now()
+			schemas = $11, connect_timeout_ms = $12, query_timeout_ms = $13, account = $14, warehouse = $15,
+			role_name = $16, private_key = $17, private_key_secret = $18, updated_at = now()
 		WHERE name = $1`,
 		c.Name, string(c.Type), c.Host, c.Port, c.Database, c.User, s.sealPassword(c), c.PasswordSecret,
-		string(c.TLS), c.TLSCA, nonNil(c.Schemas), c.ConnectTimeout.Milliseconds(), c.QueryTimeout.Milliseconds())
+		string(c.TLS), c.TLSCA, nonNil(c.Schemas), c.ConnectTimeout.Milliseconds(), c.QueryTimeout.Milliseconds(),
+		c.Account, c.Warehouse, c.Role, s.sealPrivateKey(c), c.PrivateKeySecret)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}

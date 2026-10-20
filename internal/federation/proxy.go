@@ -155,6 +155,9 @@ func listenLoopback() (net.Listener, error) {
 // port is the port DuckDB connects to.
 func (p *proxy) port() int { return p.ln.Addr().(*net.TCPAddr).Port }
 
+// attachedConn is the connection as DuckDB attached it.
+func (p *proxy) attachedConn() Connection { return p.attached }
+
 // settings returns the connection's current settings, with its attached
 // type and database.
 func (p *proxy) settings() Connection {

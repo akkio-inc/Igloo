@@ -178,9 +178,10 @@ the official TPC-H answers.
   CREATE EXTERNAL TABLE partners.viewership FROM SHARE tvco_ads.tv.viewing.daily;
   ```
 - **[Connections to other databases](docs/federation.md)**: query
-  PostgreSQL and MySQL databases in place, read-only, and join them with
-  Iceberg tables, with filters pushed down to them and their tables
-  governed by the same grants and policies.
+  PostgreSQL, MySQL and Snowflake databases in place, read-only, and join
+  them with Iceberg tables, with filters pushed down to them and their
+  tables governed by the same grants and policies, or copy them into
+  Iceberg tables with `CREATE TABLE AS`.
 
   ```sql
   CREATE CONNECTION crm TYPE postgres WITH (host 'crm.example.com', database 'crm', user 'igloo_ro', password '...');

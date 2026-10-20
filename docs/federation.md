@@ -1,8 +1,8 @@
 # Connections to other databases
 
-Igloo can query PostgreSQL and MySQL databases where they are, next to its
-Iceberg tables: a client's CRM, an operational database, a database being
-migrated. An admin registers a connection once; every replica attaches it,
+Igloo can query PostgreSQL, MySQL and Snowflake databases where they are,
+next to its Iceberg tables: a client's CRM, an operational database, a
+warehouse being migrated. An admin registers a connection once; every replica attaches it,
 read-only, as a catalog of the same name, and anyone granted its tables
 queries them like any other:
 
@@ -30,33 +30,37 @@ use `CREATE TABLE ... AS SELECT` from the connection.
 |---|---|---|
 | `postgres` | PostgreSQL, and managed services that run it (Amazon RDS and Aurora, Google Cloud SQL, Azure Database). Tested with PostgreSQL 17. | DuckDB's `postgres` extension |
 | `mysql` | MySQL 5.7 and later. Tested with MySQL 8.4. MariaDB speaks the same protocol (`TYPE mariadb` is the same) but is not tested yet. | DuckDB's `mysql` extension |
+| `snowflake` | Snowflake, on any cloud and region. Its tables, views, external, dynamic and Iceberg tables. | Igloo's gateway to Snowflake, with Snowflake's Go driver (see [Snowflake](#snowflake)) |
 
 Both extensions are DuckDB's own core extensions, built for linux/amd64 and
 linux/arm64 and baked into the image like the others; Igloo loads them only
 when a connection needs them. The extensions are MIT-licensed. The
 `postgres` extension links libpq (PostgreSQL License); the `mysql` extension
-links MariaDB Connector/C, which is LGPL-2.1.
+links MariaDB Connector/C, which is LGPL-2.1. Snowflake's Go driver,
+[gosnowflake](https://github.com/snowflakedb/gosnowflake), is under the
+Apache License 2.0.
 
 MySQL users must sign in with `caching_sha2_password` (the default since
 MySQL 8), `mysql_native_password` or `sha256_password`. MariaDB's `ed25519`
 and the PAM and GSSAPI methods are not supported.
 
-**Not supported yet.** BigQuery and Snowflake have DuckDB community
-extensions, but they sign in with Google's and Snowflake's credentials and
-talk to those services from inside DuckDB, where Igloo cannot keep the
-credentials out of SQL's reach or enforce timeouts the way it does for
-connections (see [how it works](#how-it-works)); Snowflake's also needs
-Snowflake's ADBC driver installed beside it. Until they are, copy their data
-into Iceberg tables, or share it as Iceberg and read it in place. SQLite
-databases are files on the server, which the [sandbox](../SECURITY.md) keeps
-SQL away from.
+**Not supported yet.** BigQuery has a DuckDB community extension, but it
+signs in with Google's credentials and talks to BigQuery from inside
+DuckDB, where Igloo cannot keep the credentials out of SQL's reach or
+enforce timeouts the way it does for connections (see
+[how it works](#how-it-works)); Snowflake's community extension, which
+Igloo does not use for the same reasons, is described under
+[Snowflake](#how-igloo-reads-snowflake). Until BigQuery is supported, copy
+its data into Iceberg tables, or share it as Iceberg and read it in place.
+SQLite databases are files on the server, which the
+[sandbox](../SECURITY.md) keeps SQL away from.
 
 ## Creating, changing and dropping connections
 
 Only admins manage connections.
 
 ```sql
-CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres | mysql WITH (option value, ...);
+CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres | mysql | snowflake WITH (option value, ...);
 ALTER CONNECTION name SET (option value, ...);
 ALTER CONNECTION name REFRESH;
 DROP CONNECTION [IF EXISTS] name;
@@ -85,10 +89,15 @@ connection.
 | `query_timeout` | `5m` | How long the remote database may work on one statement (its `statement_timeout`, `max_execution_time` or `max_statement_time`) and how long it may leave Igloo waiting for the next part of a result before Igloo gives up; `0` for no limit |
 | `read_only` | `true` | Connections are read-only; `false` is refused |
 
+Snowflake connections take the options listed under
+[Snowflake](#snowflake) instead.
+
 `CREATE CONNECTION` checks that Igloo can sign in before it stores
 anything. `SHOW CONNECTIONS` lists every connection's settings, never its
-password (`password` shows `stored`, `secret <name>` or `none`), with its
-state on the replica that answers: `attached`, `not attached` with the
+password (`password` shows `stored`, `secret <name>` or `none`, and for
+Snowflake `private key stored` or `private key in secret <name>`), its
+type's own settings (`settings`: a Snowflake connection's account,
+warehouse and role), and its state on the replica that answers: `attached`, `not attached` with the
 reason, or `failed` with the error.
 
 ### TLS
@@ -169,6 +178,11 @@ Igloo reads the file every time it signs in to the database, so rotating
 the password there (Kubernetes updates mounted Secrets in place) needs no
 change in Igloo. A trailing newline is ignored. `password_secret` takes a
 file name, not a path; nothing outside that directory can be read.
+
+A Snowflake connection's private key (`private_key`, or a file named by
+`private_key_secret`) is kept the same way: sealed in the metadata
+database, bound to the connection's name and to being a private key, or
+read from its file at every sign-in, and never shown.
 
 To rotate a stored password: change it on the database, then run `ALTER
 CONNECTION name SET (password '...')`; Igloo checks the new one works before
@@ -264,7 +278,9 @@ ALTER TABLE crm.public.customers ALTER COLUMN phone SET TAG pii = 'phone';
 - **Write to a connection.** Connections are attached read-only, and every
   session Igloo opens on the remote database is read-only too
   (`default_transaction_read_only` on PostgreSQL, `SET SESSION TRANSACTION
-  READ ONLY` on MySQL), so not even an admin writes through Igloo.
+  READ ONLY` on MySQL), so not even an admin writes through Igloo. Igloo
+  sends Snowflake only SELECTs it writes itself (see
+  [Snowflake](#how-igloo-reads-snowflake)).
 - **Run SQL on the remote database.** The extensions' `postgres_query`,
   `postgres_execute`, `mysql_query` and `mysql_execute`, which run SQL given
   as a string there, and `postgres_scan`, `postgres_scan_pushdown` and
@@ -315,9 +331,14 @@ from showing a password, and lets Igloo:
 - make every remote session read-only, and refuse requests for local files.
 
 Startup checks every connection's database at once, so it waits at most
-about the longest `connect_timeout`; a connection whose database cannot be
-reached then is left out on that replica until it restarts, with the
-reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
+about the longest `connect_timeout` (for Snowflake, plus the time to read
+its list of tables, at most `query_timeout`); a connection whose database
+cannot be reached then is left out on that replica until it restarts, with
+the reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
+
+Snowflake has no protocol DuckDB speaks, so a Snowflake connection is
+attached at a gateway inside Igloo instead of a proxy; see
+[how Igloo reads Snowflake](#how-igloo-reads-snowflake).
 
 ## Performance
 
@@ -335,6 +356,229 @@ reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
   nothing.
 - Each query reads the remote database as it is then: there is no cache of
   rows.
+
+## Snowflake
+
+```sql
+CREATE CONNECTION wh TYPE snowflake WITH (
+  account 'myorg-myaccount', user 'IGLOO_READER', private_key_secret 'wh-key.p8',
+  warehouse 'IGLOO_WH', role 'IGLOO_READER', database 'ANALYTICS',
+  schema 'PUBLIC, MARTS', query_timeout '15m');
+
+-- after the next restart of each replica
+GRANT SELECT ON SCHEMA wh.marts TO analysts;
+SELECT c.region, sum(o.amount)
+FROM wh.marts.orders o JOIN lake.public.customers c ON c.id = o.customer_id
+WHERE o.order_date >= DATE '2026-01-01'
+GROUP BY ALL;
+
+-- a copy in Igloo, as an Iceberg table
+CREATE TABLE lake.public.orders AS SELECT * FROM wh.marts.orders;
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `account` | (required) | The [account identifier](https://docs.snowflake.com/en/user-guide/admin-account-identifier), `orgname-accountname`, or an account locator with its region (`xy12345.us-east-2.aws`) |
+| `user` | (required) | The Snowflake user Igloo signs in as |
+| `private_key_secret` | | The name of a file in `IGLOO_CONNECTION_SECRETS_DIR` holding the user's private key, read at every sign-in (see [key pairs](#key-pairs)) |
+| `private_key` | | Instead: the private key itself, in PEM, stored encrypted |
+| `password_secret`, `password` | | Instead of a key: a password, as for other connections. Snowflake is phasing out sign-in with a password alone; prefer a key pair. |
+| `warehouse` | the user's default | The warehouse that runs Igloo's queries |
+| `role` | the user's default | The role they run as |
+| `database` | (required) | The database whose schemas become the connection's |
+| `schema` | all but `INFORMATION_SCHEMA` | Comma-separated schemas to attach |
+| `host`, `port` | the account's, `443` | Another address of the account, such as its PrivateLink one |
+| `connect_timeout` | `10s` | How long signing in may take |
+| `query_timeout` | `5m` | How long Snowflake may run one of Igloo's queries (Snowflake's `STATEMENT_TIMEOUT_IN_SECONDS`, which stops the warehouse working on it), and how long one part of a result may take to download; `0` for no limit |
+
+Exactly one of `private_key_secret`, `private_key`, `password_secret` and
+`password` is needed; setting one replaces another. Names in `database`,
+`schema`, `warehouse` and `role` are read as Snowflake reads names written
+without quotes, in any case; write a name Snowflake keeps in mixed case in
+double quotes, as in `database '"Analytics"'`. Snowflake connections always
+use HTTPS and check Snowflake's certificate; `tls` and `tls_ca` do not
+apply. `account`, `user`, the key or password, `warehouse`, `role`, `host`
+and the timeouts apply without a restart, as for other connections;
+`ALTER CONNECTION ... REFRESH` reads the list of tables again.
+
+### Key pairs
+
+Snowflake users that sign in from programs use a
+[key pair](https://docs.snowflake.com/en/user-guide/key-pair-auth): an RSA
+key whose public half Snowflake holds. Create one, unencrypted, and give
+Snowflake the public key:
+
+```sh
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out wh-key.p8 -nocrypt
+openssl rsa -in wh-key.p8 -pubout -out wh-key.pub
+```
+
+```sql
+-- in Snowflake, as a user administrator; the key without its BEGIN and END lines
+ALTER USER IGLOO_READER SET RSA_PUBLIC_KEY = 'MIIBIjANBgkqh...';
+```
+
+Put `wh-key.p8` in `IGLOO_CONNECTION_SECRETS_DIR` (a mounted Kubernetes
+Secret, say) and name it with `private_key_secret`. Igloo reads it at every
+sign-in, so a new key takes effect there without a change in Igloo:
+Snowflake holds two public keys per user (`RSA_PUBLIC_KEY_2`) for rotating
+without a gap. Encrypted private keys are not supported. A key given with
+`private_key` is stored like a password (see [credentials](#credentials)),
+and the statement that sets it reaches the history and the logs with the
+key replaced by `'***'`.
+
+### What Snowflake needs
+
+Give Igloo a user and role that can read only what it should, with a
+warehouse of its own so its cost is visible:
+
+```sql
+CREATE ROLE IGLOO_READER;
+GRANT USAGE ON WAREHOUSE IGLOO_WH TO ROLE IGLOO_READER;
+GRANT USAGE ON DATABASE ANALYTICS TO ROLE IGLOO_READER;
+GRANT USAGE ON ALL SCHEMAS IN DATABASE ANALYTICS TO ROLE IGLOO_READER;
+GRANT SELECT ON ALL TABLES IN DATABASE ANALYTICS TO ROLE IGLOO_READER;
+GRANT SELECT ON ALL VIEWS IN DATABASE ANALYTICS TO ROLE IGLOO_READER;
+GRANT SELECT ON FUTURE TABLES IN DATABASE ANALYTICS TO ROLE IGLOO_READER;
+CREATE USER IGLOO_READER TYPE = SERVICE DEFAULT_ROLE = IGLOO_READER DEFAULT_WAREHOUSE = IGLOO_WH;
+GRANT ROLE IGLOO_READER TO USER IGLOO_READER;
+```
+
+A database shared with the account, such as `SNOWFLAKE_SAMPLE_DATA`, needs
+`GRANT IMPORTED PRIVILEGES ON DATABASE ... TO ROLE ...` instead. Igloo sees
+the tables, views and columns the role can see; the role needs nothing but
+`USAGE` and `SELECT`, since Igloo never writes.
+
+### How Igloo reads Snowflake
+
+DuckDB attaches a Snowflake connection as a PostgreSQL database, with its
+`postgres` extension, at a gateway inside Igloo on the loopback interface,
+which it signs in to with a random per-process token. The gateway speaks
+just enough of PostgreSQL's protocol for the extension and nothing more:
+
+- **Listing tables.** When a replica attaches the connection, the gateway
+  reads the database's schemas, tables, views and columns, with their
+  comments, using Snowflake's `SHOW` commands, which run without a
+  warehouse. It serves DuckDB's listings (`information_schema`,
+  `duckdb_tables()`, the [data catalog](catalog.md), the grant checks)
+  from that list, so they cost nothing and work while Snowflake is down.
+  `ALTER CONNECTION ... REFRESH` reads it again.
+- **Scans.** For each scan of a table DuckDB plans, the extension asks for
+  its columns, with the filters and any `LIMIT` DuckDB pushed down. The
+  gateway parses exactly that request, refusing anything else, and writes
+  a Snowflake query of its own from it: `SELECT` of those columns of that
+  one table, with the filters and limit in Snowflake's SQL, names quoted
+  as Snowflake spells them and constants converted to the column's type.
+  No SQL a user wrote reaches Snowflake. It runs the query with Snowflake's
+  Go driver, signed in with the connection's key or password, and streams
+  the result, in Snowflake's Arrow format, to DuckDB as it downloads, a
+  few parts at a time; nothing is held in memory whole. `count(*)` becomes
+  `COUNT(*)` in Snowflake, which Snowflake answers from its metadata
+  without a warehouse when there is no filter.
+- **Timeouts.** Signing in is bounded by `connect_timeout`; Snowflake stops
+  a query at `query_timeout` itself (its `STATEMENT_TIMEOUT_IN_SECONDS`),
+  and Igloo cancels it there too, so the warehouse does not go on working
+  for nothing. The sessions are tagged `QUERY_TAG = 'igloo connection
+  <name>'`, so Snowflake's query history shows each query Igloo sent:
+
+  ```sql
+  SELECT start_time, query_text, execution_status, total_elapsed_time
+  FROM TABLE(ANALYTICS.INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER(USER_NAME => 'IGLOO_READER'))
+  WHERE query_tag LIKE 'igloo connection %' ORDER BY start_time DESC;
+  ```
+
+That is why Igloo does not use DuckDB's community Snowflake extension: it
+signs in with Snowflake's credentials from inside DuckDB, where SQL can
+reach them and Igloo cannot bound or cancel what it runs, and needs
+Snowflake's ADBC driver beside it. Attaching through the `postgres`
+extension also gives Snowflake's tables everything other connections'
+have: DuckDB's filter and limit pushdown, its catalog, and plans that name
+each scan's table, which [grants](#grants) and
+[policies](#masking-and-row-access-policies) are checked against.
+
+### Names and types
+
+A name Snowflake keeps in upper case, as it keeps every name written
+without quotes, is shown in lower case, as PostgreSQL shows unquoted names:
+`ANALYTICS.MARTS.ORDERS` is `wh.marts.orders`, and `CREATE TABLE AS SELECT
+*` makes lower-case columns. Any other name is shown as it is (`"Order
+Lines"` stays `Order Lines`). Two names that would then look alike keep
+their own spellings; two columns of a table whose names differ only in
+case, which DuckDB cannot hold, are shown with a suffix (`_2`) on the
+second, and Igloo logs a warning.
+
+| Snowflake | DuckDB |
+|---|---|
+| `NUMBER(p,s)`, `INT` and the like | `DECIMAL(p,s)`: `NUMBER(38,0)` is `DECIMAL(38,0)` |
+| `FLOAT`, `DOUBLE`, `REAL` | `DOUBLE` |
+| `VARCHAR`, `STRING`, `TEXT`, `CHAR` | `VARCHAR` |
+| `BINARY` | `BLOB` |
+| `BOOLEAN` | `BOOLEAN` |
+| `DATE` | `DATE` |
+| `TIME` | `TIME`, to the microsecond |
+| `TIMESTAMP_NTZ` | `TIMESTAMP`, to the microsecond |
+| `TIMESTAMP_LTZ`, `TIMESTAMP_TZ` | `TIMESTAMP WITH TIME ZONE`, to the microsecond; `TIMESTAMP_TZ`'s offset is not kept, only the instant |
+| `VARIANT`, `OBJECT`, `ARRAY`, `MAP`, `VECTOR` | `VARCHAR` holding the value as JSON, as Snowflake's `TO_JSON` writes it; cast to `JSON` to query it |
+| `GEOGRAPHY`, `GEOMETRY` | `VARCHAR`, as well-known text |
+| others | `VARCHAR`, as Snowflake's `TO_VARCHAR` writes them |
+
+Times and timestamps with more than six digits of fractions of a second
+are cut to the microsecond, and filters on them compare what DuckDB sees:
+`ts = TIMESTAMP '2026-01-02 03:04:05.123456'` matches every value within
+that microsecond.
+
+### Cost
+
+Snowflake bills the warehouse by the second, with a minute's minimum each
+time it resumes. Igloo's queries use it as any client's would:
+
+- Listing tables, `ALTER CONNECTION ... REFRESH`, signing in and `count(*)`
+  of a whole table cost no warehouse time.
+- A query reads only the columns it needs, and only the rows its filters
+  keep where DuckDB pushes them down: comparisons of a column with
+  constants, `IN` lists, `IS NULL`, `BETWEEN`, prefix `LIKE`, and `AND` and
+  `OR` of those on one column. Snowflake then skips the micro-partitions
+  they rule out. Joins, aggregates, `ORDER BY` and other filters run in
+  Igloo, on the rows Snowflake sent. `EXPLAIN` shows what a scan
+  (`POSTGRES_SCAN`) passes on.
+- A `LIMIT` reaches Snowflake when it applies to the scan itself, with all
+  of the query's filters passed on, as in `SELECT * FROM wh.marts.orders
+  WHERE order_date > DATE '2026-01-01' LIMIT 100`.
+- Snowflake serves a query it answered in the last day from its result
+  cache, without the warehouse, unless the table changed.
+- Every query of a statement is its own Snowflake query: join large
+  Snowflake tables in Snowflake, or copy them into Iceberg tables with
+  `CREATE TABLE AS` and query the copies.
+
+### Copying into Igloo
+
+`CREATE TABLE lake.public.orders AS SELECT * FROM wh.marts.orders` copies a
+table in one Snowflake query, streamed into the new Iceberg table as it
+downloads. The download is usually what takes longest: run Igloo in the
+same cloud region as the Snowflake account, or expect a copy to go at the
+speed of the network between them. To copy part of a table, filter it
+(`WHERE updated_at >= ...`), which Snowflake applies before sending
+anything.
+
+### Limits
+
+- Canceling a statement in Igloo, or its `statement_timeout`, does not
+  cancel a Snowflake query that is still running: DuckDB's `postgres`
+  extension waits for its first rows and cannot be interrupted before
+  then. The query stops at `query_timeout`, which bounds what it can cost;
+  set it to what the longest query should take.
+- A scan of a Snowflake table runs on one of DuckDB's threads (the
+  downloads run in parallel); scans of PostgreSQL tables can be split by
+  page range, but Snowflake's results cannot be split that way yet.
+- Encrypted private keys, OAuth and single sign-on are not supported;
+  sign in with an unencrypted key or a password.
+- `TIMESTAMP_TZ`'s offsets, and fractions of a second finer than a
+  microsecond, are not kept (see [names and types](#names-and-types)).
+  Filters Igloo passes on compare a column that has a Snowflake collation
+  (such as `en-ci`) as Snowflake collates it, not byte by byte as DuckDB
+  does, so they can keep rows DuckDB would have dropped.
+- Tables created in Snowflake since the replica started appear after
+  `ALTER CONNECTION ... REFRESH` on that replica, or its restart.
 
 ## Limitations
 

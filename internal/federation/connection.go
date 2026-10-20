@@ -1,8 +1,8 @@
 // Package federation lets Igloo query other databases where they are. An
-// admin registers a connection to a PostgreSQL or MySQL database with
-// CREATE CONNECTION, and every replica attaches it, read-only, as a catalog
-// of the same name, so that crm.public.customers can be joined with Iceberg
-// tables without copying it first.
+// admin registers a connection to a PostgreSQL, MySQL or Snowflake database
+// with CREATE CONNECTION, and every replica attaches it, read-only, as a
+// catalog of the same name, so that crm.public.customers can be joined with
+// Iceberg tables without copying it first.
 //
 // DuckDB's postgres and mysql extensions do the reading and push filters
 // and column lists down to the remote database. They never see the remote
@@ -12,6 +12,13 @@
 // That is how a connection's host and credentials change without a
 // restart, how a remote database that stops answering is cut off, and why
 // the credentials appear nowhere DuckDB could show them.
+//
+// Snowflake speaks neither protocol. A Snowflake connection is attached
+// with the postgres extension too, through a gateway (sfgateway.go) that
+// speaks just enough of PostgreSQL's protocol to answer the extension: it
+// serves the list of tables from what it read from Snowflake, and turns
+// each scan into a Snowflake query, run with Snowflake's Go driver, whose
+// Arrow results it streams back to DuckDB.
 //
 // DuckDB attaches databases only until Igloo locks down its sandbox at
 // startup (see engine.lockDown), so a replica attaches the connections that
@@ -39,13 +46,14 @@ import (
 type Type string
 
 const (
-	Postgres Type = "postgres"
-	MySQL    Type = "mysql"
+	Postgres  Type = "postgres"
+	MySQL     Type = "mysql"
+	Snowflake Type = "snowflake"
 )
 
 // Types are the connection types Igloo supports, in the order docs list
 // them.
-var Types = []Type{Postgres, MySQL}
+var Types = []Type{Postgres, MySQL, Snowflake}
 
 // ParseType validates a connection type.
 func ParseType(s string) (Type, error) {
@@ -54,14 +62,19 @@ func ParseType(s string) (Type, error) {
 		return Postgres, nil
 	case MySQL, "mariadb":
 		return MySQL, nil
+	case Snowflake:
+		return Snowflake, nil
 	}
-	return "", fmt.Errorf("unsupported connection type %q; use postgres or mysql", s)
+	return "", fmt.Errorf("unsupported connection type %q; use postgres, mysql or snowflake", s)
 }
 
 // defaultPort is the usual port of each type.
 func (t Type) defaultPort() int {
-	if t == MySQL {
+	switch t {
+	case MySQL:
 		return 3306
+	case Snowflake:
+		return 443
 	}
 	return 5432
 }
@@ -152,6 +165,21 @@ type Connection struct {
 	// up on it. Zero means no limit.
 	QueryTimeout time.Duration
 
+	// Account is a Snowflake account identifier, such as myorg-myaccount;
+	// Host defaults to its address. Snowflake connections only.
+	Account string
+	// Warehouse is the Snowflake warehouse that runs Igloo's queries, and
+	// Role the role they run as; empty means the user's defaults.
+	Warehouse string
+	Role      string
+	// PrivateKey is the PEM private key of a Snowflake user that signs in
+	// with a key pair, stored encrypted like Password; PrivateKeySecret
+	// names a file in IGLOO_CONNECTION_SECRETS_DIR holding one instead. A
+	// connection has at most one of Password, PasswordSecret, PrivateKey
+	// and PrivateKeySecret.
+	PrivateKey       string
+	PrivateKeySecret string
+
 	// Unusable says why Igloo cannot sign in with this connection, such as
 	// a stored password that does not decrypt; empty normally.
 	Unusable string
@@ -185,12 +213,22 @@ var optionNames = map[string]string{
 	"schema": "schema", "schemas": "schema",
 	"connect_timeout": "connect_timeout", "query_timeout": "query_timeout",
 	"read_only": "read_only",
+	"account":   "account", "warehouse": "warehouse", "role": "role",
+	"private_key": "private_key", "private_key_secret": "private_key_secret",
 }
+
+// snowflakeOnly are the options only Snowflake connections take, and
+// sqlOnly those Snowflake connections do not.
+var (
+	snowflakeOnly = []string{"account", "warehouse", "role", "private_key", "private_key_secret"}
+	sqlOnly       = []string{"tls_ca"}
+)
 
 // liveOptions take effect on a replica at once. The others change what
 // DuckDB attached, so a replica applies them when it restarts.
 var liveOptions = []string{"host", "port", "user", "password", "password_secret", "tls", "tls_ca",
-	"connect_timeout", "query_timeout", "read_only"}
+	"connect_timeout", "query_timeout", "read_only",
+	"account", "warehouse", "role", "private_key", "private_key_secret"}
 
 // CanonicalOption returns the option a name stands for, or "".
 func CanonicalOption(name string) string { return optionNames[strings.ToLower(name)] }
@@ -203,6 +241,12 @@ func IsLiveOption(option string) bool { return slices.Contains(liveOptions, opti
 // string literal, or a number or word.
 func (c *Connection) Set(name, value string) error {
 	option := CanonicalOption(name)
+	switch {
+	case c.Type == Snowflake && slices.Contains(sqlOnly, option):
+		return fmt.Errorf("option %s does not apply to Snowflake connections", option)
+	case c.Type != Snowflake && slices.Contains(snowflakeOnly, option):
+		return fmt.Errorf("option %s applies to Snowflake connections only", option)
+	}
 	switch option {
 	case "host":
 		c.Host = value
@@ -216,10 +260,25 @@ func (c *Connection) Set(name, value string) error {
 		c.Database = value
 	case "user":
 		c.User = value
-	case "password":
-		c.Password, c.PasswordSecret = value, ""
-	case "password_secret":
-		c.PasswordSecret, c.Password = value, ""
+	case "password", "password_secret", "private_key", "private_key_secret":
+		// One way to sign in replaces the others.
+		c.Password, c.PasswordSecret, c.PrivateKey, c.PrivateKeySecret = "", "", "", ""
+		switch option {
+		case "password":
+			c.Password = value
+		case "password_secret":
+			c.PasswordSecret = value
+		case "private_key":
+			c.PrivateKey = value
+		default:
+			c.PrivateKeySecret = value
+		}
+	case "account":
+		c.Account = value
+	case "warehouse":
+		c.Warehouse = value
+	case "role":
+		c.Role = value
 	case "tls":
 		m, err := parseTLSMode(value)
 		if err != nil {
@@ -250,6 +309,10 @@ func (c *Connection) Set(name, value string) error {
 			return errors.New("connections are read-only; read_only must be true")
 		}
 	default:
+		if c.Type == Snowflake {
+			return fmt.Errorf("unknown connection option %q; use account, user, private_key, private_key_secret, password, password_secret, "+
+				"warehouse, role, database, schema, host, port, connect_timeout or query_timeout", name)
+		}
 		return fmt.Errorf("unknown connection option %q; use host, port, database, user, password, password_secret, tls, tls_ca, schema, connect_timeout or query_timeout", name)
 	}
 	return nil
@@ -278,8 +341,12 @@ func (c *Connection) Validate(taken []string) error {
 		return fmt.Errorf("invalid connection name %q: use lowercase letters, digits and underscores", c.Name)
 	case slices.Contains(reservedNames, c.Name) || slices.ContainsFunc(taken, func(t string) bool { return strings.EqualFold(t, c.Name) }):
 		return fmt.Errorf("%q is already the name of a database; choose another name", c.Name)
+	case c.Type == Snowflake:
+		return c.validateSnowflake()
 	case c.Type != Postgres && c.Type != MySQL:
 		return fmt.Errorf("unsupported connection type %q", c.Type)
+	case c.Account != "" || c.Warehouse != "" || c.Role != "" || c.PrivateKey != "" || c.PrivateKeySecret != "":
+		return errors.New("account, warehouse, role, private_key and private_key_secret apply to Snowflake connections only")
 	case c.Host == "":
 		return errors.New("a connection needs a host")
 	case !validHost(c.Host):
@@ -341,23 +408,52 @@ func validSecretName(s string) bool {
 
 // Address is host:port.
 func (c *Connection) Address() string {
-	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+	return net.JoinHostPort(c.ServerHost(), strconv.Itoa(c.Port))
 }
 
-// PasswordSource describes where the password comes from, for SHOW
-// CONNECTIONS: never the password itself.
+// ServerHost is the host Igloo connects to: Host, or for a Snowflake
+// connection without one, its account's.
+func (c *Connection) ServerHost() string {
+	if c.Type == Snowflake && c.Host == "" {
+		return snowflakeHost(c.Account)
+	}
+	return c.Host
+}
+
+// PasswordSource describes where the password or private key comes from,
+// for SHOW CONNECTIONS: never the secret itself.
 func (c *Connection) PasswordSource() string {
 	switch {
 	case c.PasswordSecret != "":
 		return "secret " + c.PasswordSecret
 	case c.Password != "":
 		return "stored"
+	case c.PrivateKeySecret != "":
+		return "private key in secret " + c.PrivateKeySecret
+	case c.PrivateKey != "":
+		return "private key stored"
 	}
 	return "none"
 }
 
+// Settings describes the settings particular to c's type, for SHOW
+// CONNECTIONS.
+func (c *Connection) Settings() string {
+	if c.Type != Snowflake {
+		return ""
+	}
+	parts := []string{"account " + c.Account}
+	if c.Warehouse != "" {
+		parts = append(parts, "warehouse "+c.Warehouse)
+	}
+	if c.Role != "" {
+		parts = append(parts, "role "+c.Role)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // attachedFields are the settings fixed when a replica attaches the
 // connection; see liveOptions.
-func (c *Connection) attachedFields() string {
+func (c Connection) attachedFields() string {
 	return strings.Join([]string{string(c.Type), c.Database, strings.Join(c.Schemas, ",")}, "\x00")
 }

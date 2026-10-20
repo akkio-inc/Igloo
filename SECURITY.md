@@ -150,7 +150,8 @@ reference for every setting mentioned here.
   engines reading the Iceberg tables directly. Policy changes reach other
   replicas within 30 seconds.
 - **Connections to other databases.** Only admins create, change and drop
-  [connections](docs/federation.md) to PostgreSQL and MySQL databases. A
+  [connections](docs/federation.md) to PostgreSQL, MySQL and Snowflake
+  databases. A
   connection's tables need a `SELECT` grant (on the table, its schema or the
   connection) for everyone but admins: the built-in roles `reader` and
   `writer` do not cover them. Whenever connections are attached, every
@@ -179,15 +180,23 @@ reference for every setting mentioned here.
   is not a connection. DuckDB never sees a connection's credentials: it
   reaches each database through a proxy inside Igloo on the loopback
   interface, signing in with a random per-process token, and the proxy
-  signs in to the database. Stored passwords are encrypted (AES-256-GCM,
-  bound to the connection's name) under a key in the metadata database, so
-  they are safe from a copy of the connections table but not from someone
-  with the whole metadata database; `password_secret` keeps them in files
-  of `IGLOO_CONNECTION_SECRETS_DIR` instead. Passwords never appear in
-  `SHOW CONNECTIONS`, the history or the logs. The proxy refuses a MySQL
+  signs in to the database. Snowflake is reached through a gateway inside
+  Igloo instead, in the same way, which answers DuckDB's scans by running
+  SELECTs it writes itself, from a strict parse of each scan, with
+  Snowflake's Go driver; no SQL a user wrote reaches Snowflake. Stored
+  passwords and Snowflake private keys are encrypted (AES-256-GCM, bound to
+  the connection's name, and a key to being one) under a key in the
+  metadata database, so they are safe from a copy of the connections table
+  but not from someone with the whole metadata database; `password_secret`
+  and `private_key_secret` keep them in files of
+  `IGLOO_CONNECTION_SECRETS_DIR` instead. Passwords and keys never appear
+  in `SHOW CONNECTIONS`, the history or the logs, nor do the URLs of
+  Snowflake's results in errors. Snowflake's driver runs with its logging
+  off, and without its probes of cloud metadata endpoints and its native
+  library. The proxy refuses a MySQL
   server's request for a local file. Connections use TLS and verify their
   server's certificate and host name unless an admin chooses otherwise,
-  which draws a warning. A connection to the server of the metadata
+  which draws a warning; Snowflake connections always do. A connection to the server of the metadata
   database, by any spelling of its name or by the address it resolves to,
   is refused, as a guard against mistakes; do not connect the catalog's
   database or other internal services either. Give each connection a

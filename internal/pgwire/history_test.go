@@ -85,17 +85,18 @@ func TestBackgroundAnalysis(t *testing.T) {
 
 func TestRedactQuery(t *testing.T) {
 	cases := map[string]string{
-		"CREATE USER ana WITH PASSWORD 'it''s secret' ROLE writer":                                    "CREATE USER ana WITH PASSWORD '***' ROLE writer",
-		"ALTER USER ana PASSWORD 'SCRAM-SHA-256$4096:x$y:z'":                                          "ALTER USER ana PASSWORD '***'",
-		"CREATE USER ana PASSWORD unquoted-secret ROLE writer":                                        "CREATE USER ana PASSWORD ***",
-		"alter user ana password $$dollar$$":                                                          "alter user ana password '***'",
-		`ALTER USER ana PASSWORD "quoted" ROLE reader`:                                                "ALTER USER ana PASSWORD *** ROLE reader",
-		"CREATE SECRET s (TYPE s3, KEY_ID 'AKIA', SECRET 'x')":                                        "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')",
-		"SET s3_secret_access_key = 'abc'":                                                            "SET s3_secret_access_key = '***'",
-		"SELECT 'password' AS word":                                                                   "SELECT 'password' AS word",
-		"SELECT * FROM t WHERE name = 'ana'":                                                          "SELECT * FROM t WHERE name = 'ana'",
-		"CREATE NOTIFICATION INTEGRATION ops TYPE slack URL 'https://hooks.slack.com/services/T/B/x'": "CREATE NOTIFICATION INTEGRATION ops TYPE slack URL '***'",
-		"ALTER NOTIFICATION INTEGRATION ops SET HEADERS = ('Authorization' = 'Bearer x')":             "ALTER NOTIFICATION INTEGRATION ops SET HEADERS = ('***' = '***')",
+		"CREATE USER ana WITH PASSWORD 'it''s secret' ROLE writer":                                             "CREATE USER ana WITH PASSWORD '***' ROLE writer",
+		"ALTER USER ana PASSWORD 'SCRAM-SHA-256$4096:x$y:z'":                                                   "ALTER USER ana PASSWORD '***'",
+		"CREATE USER ana PASSWORD unquoted-secret ROLE writer":                                                 "CREATE USER ana PASSWORD ***",
+		"alter user ana password $$dollar$$":                                                                   "alter user ana password '***'",
+		`ALTER USER ana PASSWORD "quoted" ROLE reader`:                                                         "ALTER USER ana PASSWORD *** ROLE reader",
+		"CREATE SECRET s (TYPE s3, KEY_ID 'AKIA', SECRET 'x')":                                                 "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')",
+		"SET s3_secret_access_key = 'abc'":                                                                     "SET s3_secret_access_key = '***'",
+		"SELECT 'password' AS word":                                                                            "SELECT 'password' AS word",
+		"SELECT * FROM t WHERE name = 'ana'":                                                                   "SELECT * FROM t WHERE name = 'ana'",
+		"CREATE NOTIFICATION INTEGRATION ops TYPE slack URL 'https://hooks.slack.com/services/T/B/x'":          "CREATE NOTIFICATION INTEGRATION ops TYPE slack URL '***'",
+		"ALTER NOTIFICATION INTEGRATION ops SET HEADERS = ('Authorization' = 'Bearer x')":                      "ALTER NOTIFICATION INTEGRATION ops SET HEADERS = ('***' = '***')",
+		"ALTER CONNECTION sf SET (private_key '-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----')": "ALTER CONNECTION sf SET (private_key '***')",
 	}
 	for in, want := range cases {
 		if got := redactQuery(in); got != want {

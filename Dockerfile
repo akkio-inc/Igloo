@@ -10,8 +10,11 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 ARG VERSION=dev
 COPY . .
 # duckdb_arrow: DuckDB's Arrow results, for Arrow Flight SQL.
+# minicore_disabled: leaves out the native library Snowflake's Go driver
+# would otherwise embed, and write out and load at runtime, only to report
+# its version to Snowflake (Igloo turns it off at runtime too).
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    go build -tags duckdb_arrow -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/igloo ./cmd/igloo
+    go build -tags duckdb_arrow,minicore_disabled -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/igloo ./cmd/igloo
 
 # Bake DuckDB's extensions into the image so the server never downloads code
 # at runtime.

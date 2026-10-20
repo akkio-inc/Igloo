@@ -121,6 +121,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   server's certificate and host name by default (`tls 'verify-full'`);
   the modes that do not are explicit choices that draw a warning, and
   `require` checks the certificate's chain.
+- Connections to Snowflake (`CREATE CONNECTION ... TYPE snowflake`), signed
+  in with a key pair (`private_key_secret`, `private_key`) or a password,
+  with a warehouse and role. Igloo reads them through a gateway of its own,
+  with Snowflake's Go driver: tables are listed with `SHOW` commands, at no
+  warehouse cost, and each scan becomes a Snowflake `SELECT` of the columns
+  it needs, with its filters and `LIMIT`, whose Arrow result streams into
+  DuckDB as it downloads, so `CREATE TABLE AS` copies large tables into
+  Iceberg without holding them in memory. `count(*)` is counted in
+  Snowflake. `query_timeout` stops queries on Snowflake too. Grants,
+  policies, the query history and `ALTER CONNECTION ... REFRESH` work as for
+  other connections; credentials stay in Igloo, encrypted or in files.
 
 ### Alerts and notifications
 

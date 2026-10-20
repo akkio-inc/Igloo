@@ -389,7 +389,7 @@ not writable, Igloo logs a warning and runs without it.
 
 ## Connections to other databases
 
-[Connections](federation.md) to PostgreSQL and MySQL databases are kept in
+[Connections](federation.md) to PostgreSQL, MySQL and Snowflake databases are kept in
 the metadata database and attached by each replica when it starts, so after
 `CREATE CONNECTION`, restart the replicas (`docker compose restart igloo`,
 or `kubectl rollout restart deployment/igloo`); changes to credentials,

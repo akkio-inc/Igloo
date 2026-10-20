@@ -23,15 +23,15 @@ import (
 // Connections to other databases (package federation). DuckDB has no such
 // statements, so Igloo handles them itself, for admins only:
 //
-//	CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres|mysql
+//	CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres|mysql|snowflake
 //	    WITH (host 'h', port 5432, database 'db', user 'u', password 'p', ...)
 //	ALTER CONNECTION name SET (option value, ...)
 //	ALTER CONNECTION name REFRESH
 //	DROP CONNECTION [IF EXISTS] name
 //	SHOW CONNECTIONS
 //
-// Options may also be written option = value. Passwords are stored
-// encrypted and never shown again.
+// Options may also be written option = value. Passwords and private keys
+// are stored encrypted and never shown again.
 
 type connCommand struct {
 	verb        string // CREATE, ALTER, DROP or SHOW
@@ -68,6 +68,7 @@ var connectionColumns = wire.Columns{
 	{Name: "created_by", Oid: pgtype.TextOID, Width: -1},
 	{Name: "created_at", Oid: pgtype.TimestamptzOID, Width: 8},
 	{Name: "updated_at", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "settings", Oid: pgtype.TextOID, Width: -1},
 }
 
 func (c *connCommand) columns() wire.Columns {
@@ -217,7 +218,7 @@ func parseConnectionCommand(query string) (c *connCommand, ok bool, err error) {
 		rest = rest[1:]
 	case "CREATE":
 		if len(rest) < 2 || rest[0].upper() != "TYPE" {
-			return nil, true, syntaxError("expected CREATE CONNECTION %s TYPE postgres|mysql WITH (...)", c.name)
+			return nil, true, syntaxError("expected CREATE CONNECTION %s TYPE postgres|mysql|snowflake WITH (...)", c.name)
 		}
 		if c.typ, err = federation.ParseType(rest[1].text); err != nil {
 			return nil, true, pgerror.WithCode(err, codes.FeatureNotSupported)
@@ -411,9 +412,9 @@ func (s *Server) showConnections(ctx context.Context, w wire.DataWriter) error {
 			}
 			return d.String()
 		}
-		row := []any{st.Name, string(st.Type), st.Host, int32(st.Port), st.Database, st.User, st.PasswordSource(),
+		row := []any{st.Name, string(st.Type), st.ServerHost(), int32(st.Port), st.Database, st.User, st.PasswordSource(),
 			string(st.TLS), strings.Join(st.Schemas, ", "), timeout(st.ConnectTimeout), timeout(st.QueryTimeout),
-			st.State, st.Detail, st.CreatedBy, st.CreatedAt, st.UpdatedAt}
+			st.State, st.Detail, st.CreatedBy, st.CreatedAt, st.UpdatedAt, st.Settings()}
 		if err := w.Row(row); err != nil {
 			return err
 		}
