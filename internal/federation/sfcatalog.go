@@ -191,8 +191,14 @@ type sfColumn struct {
 }
 
 // schema returns the schema DuckDB calls name, which it compares without
-// case.
+// case: the one of that spelling when two differ only in case (see
+// pgNames), as for tables.
 func (c *sfCatalog) schema(name string) *sfSchema {
+	for _, s := range c.schemas {
+		if s.pgName == name {
+			return s
+		}
+	}
 	for _, s := range c.schemas {
 		if strings.EqualFold(s.pgName, name) {
 			return s

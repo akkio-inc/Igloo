@@ -337,6 +337,13 @@ func TestSnowflakeGateway(t *testing.T) {
 	// The gateway answers nothing but the extension's own statements.
 	expectError(t, eng, "SELECT * FROM postgres_query('sf', 'SELECT 1')", "not supported")
 	expectError(t, eng, "CREATE TABLE sf.tpch.x (i int)", "read-only")
+	// A name in a user's statement reaches the extension's catalog query
+	// as a string literal; it does not change which query the gateway
+	// takes it for (a version check, here, which made DuckDB fail with an
+	// internal error).
+	for _, name := range []string{"VERSION() LIMIT 0", "PG_EXPORT_SNAPSHOT()", "PG_CLASS.XMIN", "x' OR relname = 't1"} {
+		expectError(t, eng, `SELECT * FROM sf.tpch."`+name+`"`, "does not exist")
+	}
 
 	// Listing tables never asks Snowflake.
 	n := len(fake.sent())

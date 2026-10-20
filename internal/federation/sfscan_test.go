@@ -178,6 +178,35 @@ func TestPlanScan(t *testing.T) {
 	}
 }
 
+// TestPlanScanSchemaCase checks that a scan reads the schema DuckDB named
+// when Snowflake has two whose names differ only in case, which keep
+// their own spellings (see pgNames).
+func TestPlanScanSchemaCase(t *testing.T) {
+	typ, _, err := parseSnowflakeType(`{"type":"TEXT","length":10}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"SALES", "sales"}
+	cat := &sfCatalog{database: "DB"}
+	for i, pg := range pgNames(names, false, nil) {
+		table := &sfTable{name: "T", pgName: "t", columns: []*sfColumn{{name: "C", pgName: "c", typ: typ}}}
+		cat.schemas = append(cat.schemas, &sfSchema{name: names[i], pgName: pg, oid: 16384 + i, tables: []*sfTable{table}})
+	}
+	for schema, want := range map[string]string{
+		"SALES": `SELECT "C" FROM "DB"."SALES"."T"`,
+		"sales": `SELECT "C" FROM "DB"."sales"."T"`,
+	} {
+		q, err := parseScan(`COPY (SELECT "c" FROM "` + schema + `"."t") TO STDOUT (FORMAT "binary");`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scan, err := planScan(cat, q)
+		if err != nil || scan.sql != want {
+			t.Errorf("%s: %v %+v, want %s", schema, err, scan, want)
+		}
+	}
+}
+
 func TestPgNames(t *testing.T) {
 	got := pgNames([]string{"LINEITEM", "MixedCase", "Foo", "FOO", "_X1", "日本"}, false, nil)
 	want := []string{"lineitem", "MixedCase", "Foo", "FOO", "_x1", "日本"}

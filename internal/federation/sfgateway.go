@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
 // The gateway between DuckDB and Snowflake.
@@ -235,9 +238,15 @@ func (g *sfGateway) serve() {
 	}
 }
 
-// handle signs DuckDB in with the token and runs its session.
+// handle signs DuckDB in with the token and runs its session. A panic
+// ends the session, not Igloo.
 func (g *sfGateway) handle(conn net.Conn) {
 	defer conn.Close() //nolint:errcheck
+	defer func() {
+		if r := recover(); r != nil {
+			g.log.Error("gateway session failed", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	be := pgproto3.NewBackend(conn, conn)
 	var startup *pgproto3.StartupMessage
@@ -521,7 +530,11 @@ func (s *sfSession) statement(ctx context.Context, st string) error {
 	case strings.HasPrefix(u, "COPY ("):
 		return s.copyOut(ctx, st)
 	case strings.HasPrefix(u, "SELECT "):
-		return s.query(st, u)
+		// The extension's queries are told apart by their SQL alone: the
+		// string literals in them hold names from users' statements (a
+		// table looked up by name), which must not make one query pass
+		// for another.
+		return s.query(st, strings.TrimSpace(strings.ToUpper(spaces.ReplaceAllString(sqllex.CodeOnly(st), " "))))
 	default:
 		return failf("0A000", "statement not supported by Igloo's Snowflake gateway")
 	}
@@ -567,27 +580,27 @@ var (
 )
 
 // query answers the extension's SELECTs: health checks, server checks and
-// catalog queries.
-func (s *sfSession) query(st, u string) error {
+// catalog queries. code is st's SQL, upper-cased, without its literals.
+func (s *sfSession) query(st, code string) error {
 	switch {
-	case pingQuery.MatchString(u):
+	case pingQuery.MatchString(code):
 		s.send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
 			{Name: []byte("?column?"), DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1}}})
-		s.row(str(strings.TrimPrefix(u, "SELECT ")))
+		s.row(str(strings.TrimPrefix(code, "SELECT ")))
 		s.complete("SELECT 1")
-	case strings.Contains(u, "VERSION()"):
+	case strings.Contains(code, "VERSION()"):
 		s.send(textColumns("version", "count"))
 		s.row(str("PostgreSQL "+gatewayVersion+" (Igloo's gateway to Snowflake)"), str("0"))
 		s.complete("SELECT 1")
-	case strings.Contains(u, "TO_REGCLASS("):
+	case strings.Contains(code, "TO_REGCLASS("):
 		s.send(textColumns("to_regclass"))
 		s.row(nil)
 		s.complete("SELECT 1")
-	case strings.Contains(u, "PG_EXPORT_SNAPSHOT()"):
+	case strings.Contains(code, "PG_EXPORT_SNAPSHOT()"):
 		var b [8]byte
 		_, _ = rand.Read(b[:])
 		id := hex.EncodeToString(b[:])
-		if strings.Contains(u, "PG_IS_IN_RECOVERY()") {
+		if strings.Contains(code, "PG_IS_IN_RECOVERY()") {
 			s.send(textColumns("pg_is_in_recovery", "pg_export_snapshot"))
 			s.row(str("f"), &id)
 		} else {
@@ -595,27 +608,27 @@ func (s *sfSession) query(st, u string) error {
 			s.row(&id)
 		}
 		s.complete("SELECT 1")
-	case strings.Contains(u, "PG_MY_TEMP_SCHEMA()"):
+	case strings.Contains(code, "PG_MY_TEMP_SCHEMA()"):
 		s.send(textColumns("nspname"))
 		s.complete("SELECT 0")
-	case strings.Contains(u, "FROM PG_ENUM"):
+	case strings.Contains(code, "FROM PG_ENUM"):
 		s.send(textColumns("oid", "enumtypid", "typname", "enumlabel"))
 		s.complete("SELECT 0")
-	case strings.Contains(u, "T.TYPTYPE='C'"):
+	case strings.Contains(code, "T.TYPTYPE="):
 		s.send(textColumns("oid", "id", "type", "attname", "typname", "sub_type_schema"))
 		s.complete("SELECT 0")
-	case strings.Contains(u, "FROM PG_INDEXES"):
+	case strings.Contains(code, "FROM PG_INDEXES"):
 		s.send(textColumns("oid", "tablename", "indexname"))
 		s.complete("SELECT 0")
-	case strings.Contains(u, "PG_ATTRIBUTE.ATTNDIMS"):
+	case strings.Contains(code, "PG_ATTRIBUTE.ATTNDIMS"):
 		return s.tables(st)
-	case strings.Contains(u, "PG_CLASS.XMIN"):
+	case strings.Contains(code, "PG_CLASS.XMIN"):
 		return s.relations(st)
-	case strings.Contains(u, "FROM PG_NAMESPACE") && strings.Contains(u, "ORDER BY OID"):
+	case strings.Contains(code, "FROM PG_NAMESPACE") && strings.Contains(code, "ORDER BY OID"):
 		return s.schemas(st)
-	case strings.HasSuffix(u, " LIMIT 0"):
+	case strings.HasSuffix(code, " LIMIT 0"):
 		// The extension's empty results of a given shape.
-		cols := strings.Count(strings.TrimSuffix(strings.SplitN(u, " FROM ", 2)[0], " LIMIT 0"), ",") + 1
+		cols := strings.Count(strings.TrimSuffix(strings.SplitN(code, " FROM ", 2)[0], " LIMIT 0"), ",") + 1
 		names := make([]string, cols)
 		for i := range names {
 			names[i] = "?column?"
@@ -696,7 +709,10 @@ func (s *sfSession) relations(st string) error {
 	if err != nil {
 		return err
 	}
-	m := quotedString.FindAllStringSubmatch(st[strings.LastIndex(strings.ToLower(st), "nspname"):], 1)
+	var m [][]string
+	if i := strings.LastIndex(strings.ToLower(st), "nspname"); i >= 0 {
+		m = quotedString.FindAllStringSubmatch(st[i:], 1)
+	}
 	s.send(textColumns("oid", "relname", "xmin"))
 	n := 0
 	if m != nil {
