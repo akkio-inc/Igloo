@@ -519,6 +519,10 @@
   font-size: 0.9375rem;
   line-height: 1.55;
 }
+/* beside the taller list of points, the example sits in the middle */
+.vx-migrate .vx-qs-panel {
+  align-self: center;
+}
 
 /* section edges: fade */
 .vx-quickstart .vx-qs-bg {

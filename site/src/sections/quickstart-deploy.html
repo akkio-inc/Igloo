@@ -93,11 +93,12 @@
       <div class="vx-qs-intro">
         <p class="vx-qs-eyebrow"><span class="vx-qs-led" aria-hidden="true"></span>Migrate</p>
         <h2 class="vx-qs-title" id="vx-migrate-title">Start with the data you already have</h2>
-        <p class="vx-qs-lead">Query your Snowflake tables where they are, join them with Igloo&#x27;s, and copy them over one statement at a time.</p>
+        <p class="vx-qs-lead">Query your Snowflake tables and Databricks shares where they are, join them with Igloo&#x27;s, and copy them over one table at a time.</p>
         <ul class="vx-mg-points">
           <li><h3>Read Snowflake in place</h3><p>Only the columns and rows a query needs come back from Snowflake, and Igloo's grants and policies apply to them.</p></li>
+          <li><h3>Read Databricks shares in place</h3><p>Tables shared from Databricks over Delta Sharing are read where they live, including tables with deletion vectors.</p></li>
           <li><h3>Copy one table at a time</h3><p>CREATE TABLE AS streams a table into Iceberg without holding it in memory. PostgreSQL and MySQL databases work the same way.</p></li>
-          <li><h3>Keep your other engines</h3><p>Spark, Trino, Databricks and Snowflake read and write Igloo's tables through its Iceberg REST catalog.</p></li>
+          <li><h3>Know what runs before you move</h3><p>A migration report replays your Snowflake or Databricks query history on Igloo and shows what runs, whether the answers match, and what it would cost.</p></li>
         </ul>
       </div>
       <div class="vx-qs-panel">
@@ -119,6 +120,7 @@
 <span class="vx-qs-kw">CREATE TABLE</span> lake.marts.orders <span class="vx-qs-kw">AS</span>
   <span class="vx-qs-kw">SELECT</span> * <span class="vx-qs-kw">FROM</span> wh.marts.orders;</code></pre></div>
           <p><a class="vx-qs-inl" href="/docs/federation/">Connections to Snowflake, PostgreSQL and MySQL</a></p>
+          <p><a class="vx-qs-inl" href="/docs/migrating/">Migrating from Snowflake or Databricks</a></p>
         </div>
       </div>
     </div>
