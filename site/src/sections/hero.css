@@ -133,7 +133,6 @@
 	min-height: var(--hero-h);
 	background: var(--vx-ink);
 	--hero-h: max(clamp(520px, 40vw, 640px), 100vw / 3 + 72px);
-	--panel-w: min(640px, 52vw);
 }
 /* the whole illustration (3:1) across the hero's bottom; its sky fades into the page above, its snow below */
 .vx-hero__art {
@@ -171,15 +170,16 @@
 	display: flex;
 	align-items: center;
 	min-height: calc(var(--hero-h) - var(--vx-hh));
+	justify-content: center;
+	padding-inline: 34vw 12vw;
 }
-/* a frosted panel like the header's tray, centred between the igloo (left third) and the moon */
+/* a frosted panel like the header's tray, as wide as its copy, centred between the igloo (left third) and the moon */
 .vx-hero__copy {
 	display: flex;
 	flex-direction: column;
 	align-items: flex-start;
-	max-width: none;
-	width: var(--panel-w);
-	margin-left: max(34vw, 60vw - var(--panel-w) / 2);
+	max-width: 100%;
+	width: fit-content;
 	padding: clamp(28px, 3vw, 44px);
 	border: 1px solid rgba(175, 195, 220, 0.145);
 	border-radius: 20px;
@@ -208,6 +208,7 @@
 	line-height: 1.15;
 	color: var(--text);
 	text-wrap: balance;
+	max-width: 14.5em;
 	font-weight: 500;
 	letter-spacing: -0.025em;
 }
@@ -329,7 +330,6 @@
 	.vx-hero__copy {
 		max-width: 40rem;
 		width: auto;
-		margin-left: 0;
 		padding: 0;
 		border: 0;
 		border-radius: 0;
