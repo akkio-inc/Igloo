@@ -20,7 +20,7 @@
 .vx-closing {
 	isolation: isolate;
 	overflow: hidden;
-	padding: clamp(72px, 9vw, 136px) 0 clamp(64px, 6.5vw, 96px);
+	padding: calc(var(--section-y) * 1.5) 0;
 	background: #0a0d12;
 }
 /* warm light from the top left, a cool haze on the right, darker in the middle */
@@ -39,22 +39,21 @@
 }
 .vx-closing__panel {
 	max-width: 1040px;
-	padding-left: clamp(0px, 5vw, 70px);
 }
 .vx-closing__title {
-	font-size: clamp(2.375rem, 1rem + 3.8vw, 4.25rem);
+	font-size: var(--h2-size);
 	font-weight: 600;
-	line-height: 1.02;
-	letter-spacing: -0.045em;
+	line-height: 1.05;
+	letter-spacing: -0.04em;
 	color: var(--text);
 	text-wrap: balance;
 	text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 .vx-closing__sub {
-	max-width: 42em;
+	max-width: 40em;
 	margin-top: 1.25rem;
-	font-size: clamp(1.0625rem, 0.95rem + 0.4vw, 1.25rem);
-	line-height: 1.6;
+	font-size: var(--lead-size);
+	line-height: 1.5;
 	color: var(--text-2);
 	text-wrap: pretty;
 }

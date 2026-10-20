@@ -23,8 +23,10 @@
       <div class="vx-qs-panel">
         <div class="vx-qs-steps">
           <p>Requires Docker with Compose v2.20 or later.</p>
-          <div class="vx-qs-code vx-qs-code--bar"><div class="vx-qs-bar" aria-hidden="true"><i></i><i></i><i></i></div><button class="vx-qs-copy" type="button" aria-label="Copy the make commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><pre tabindex="0" aria-label="the make commands"><code><span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> up</span><span class="vx-qs-cm">      # generates deploy/single-vm/.env with random secrets and starts the stack</span>
-<span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> psql</span><span class="vx-qs-cm">    # SQL shell as the admin user</span></code></pre></div>
+          <div class="vx-qs-code vx-qs-code--bar"><div class="vx-qs-bar" aria-hidden="true"><i></i><i></i><i></i></div><button class="vx-qs-copy" type="button" aria-label="Copy the make commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><pre tabindex="0" aria-label="the make commands"><code><span class="vx-qs-cm"># generates deploy/single-vm/.env with random secrets and starts the stack</span>
+<span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> up</span>
+<span class="vx-qs-cm"># SQL shell as the admin user</span>
+<span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> psql</span></code></pre></div>
           <div class="vx-qs-code"><button class="vx-qs-copy" type="button" aria-label="Copy the SQL example"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><pre tabindex="0" aria-label="the SQL example"><code><span class="vx-qs-kw">CREATE TABLE</span> events (id <span class="vx-qs-kw">INTEGER</span>, kind <span class="vx-qs-kw">VARCHAR</span>, at_time <span class="vx-qs-kw">TIMESTAMP</span>);
 <span class="vx-qs-kw">INSERT INTO</span> events <span class="vx-qs-kw">VALUES</span> (<span class="vx-qs-num">1</span>, <span class="vx-qs-str">&#x27;signup&#x27;</span>, <span class="vx-qs-fn">now</span>()), (<span class="vx-qs-num">2</span>, <span class="vx-qs-str">&#x27;login&#x27;</span>, <span class="vx-qs-fn">now</span>());
 <span class="vx-qs-kw">SELECT</span> kind, <span class="vx-qs-fn">count</span><span class="vx-qs-pu">(*) </span><span class="vx-qs-kw">FROM</span> events <span class="vx-qs-kw">GROUP BY</span> kind;</code></pre></div>
@@ -33,13 +35,18 @@
           <p>Or open the <a class="vx-qs-inl" href="/docs/console/">web console</a> at <code class="vx-qs-chip">http://127.0.0.1:8443</code> and sign in with the same user and password, or fetch results as Arrow over <a class="vx-qs-inl" href="/docs/flight-sql/">Flight SQL</a> at <code class="vx-qs-chip">grpc://localhost:31337</code>:</p>
           <div class="vx-qs-code"><button class="vx-qs-copy" type="button" aria-label="Copy the Python example"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><pre tabindex="0" aria-label="the Python example"><code><span class="vx-qs-kw">import</span> adbc_driver_flightsql.dbapi <span class="vx-qs-kw">as</span> flightsql
 
-<span class="vx-qs-kw">with</span> flightsql.connect(<span class="vx-qs-str">&quot;grpc://localhost:31337&quot;</span>,
-                       db_kwargs=<span class="vx-qs-br">{</span><span class="vx-qs-str">&quot;username&quot;</span>: <span class="vx-qs-str">&quot;igloo&quot;</span>, <span class="vx-qs-str">&quot;password&quot;</span>: <span class="vx-qs-str">&quot;...&quot;</span><span class="vx-qs-br">}</span>) <span class="vx-qs-kw">as</span> conn, conn.cursor() <span class="vx-qs-kw">as</span> cur:
+<span class="vx-qs-kw">with</span> flightsql.connect(
+    <span class="vx-qs-str">&quot;grpc://localhost:31337&quot;</span>,
+    db_kwargs=<span class="vx-qs-br">{</span><span class="vx-qs-str">&quot;username&quot;</span>: <span class="vx-qs-str">&quot;igloo&quot;</span>, <span class="vx-qs-str">&quot;password&quot;</span>: <span class="vx-qs-str">&quot;...&quot;</span><span class="vx-qs-br">}</span>,
+) <span class="vx-qs-kw">as</span> conn, conn.cursor() <span class="vx-qs-kw">as</span> cur:
     cur.execute(<span class="vx-qs-str">&quot;SELECT * FROM events&quot;</span>)
-    df = cur.fetch_df()  <span class="vx-qs-cm"># or fetch_arrow_table(), or polars.read_database(query, conn)</span></code></pre></div>
+    <span class="vx-qs-cm"># or fetch_arrow_table(), or polars.read_database(query, conn)</span>
+    df = cur.fetch_df()</code></pre></div>
           <p>Load the TPC-H benchmark data and run its 22 queries:</p>
-          <div class="vx-qs-code vx-qs-code--bar"><div class="vx-qs-bar" aria-hidden="true"><i></i><i></i><i></i></div><button class="vx-qs-copy" type="button" aria-label="Copy the benchmark commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><pre tabindex="0" aria-label="the benchmark commands"><code><span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> load-tpch</span><span class="vx-qs-cm">    # scale factor 1: 6 million lineitem rows</span>
-<span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> tpch</span><span class="vx-qs-cm">         # runs and times all 22 TPC-H queries</span></code></pre></div>
+          <div class="vx-qs-code vx-qs-code--bar"><div class="vx-qs-bar" aria-hidden="true"><i></i><i></i><i></i></div><button class="vx-qs-copy" type="button" aria-label="Copy the benchmark commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><pre tabindex="0" aria-label="the benchmark commands"><code><span class="vx-qs-cm"># scale factor 1: 6 million lineitem rows</span>
+<span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> load-tpch</span>
+<span class="vx-qs-cm"># runs and times all 22 TPC-H queries</span>
+<span class="vx-qs-cmd">make</span><span class="vx-qs-arg"> tpch</span></code></pre></div>
           <p>On a laptop, the scale factor 1 load takes about 20 seconds and the 22 queries take about 4 seconds in total with warm caches; their results match the official TPC-H answers.</p>
         </div>
       </div>

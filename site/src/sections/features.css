@@ -9,7 +9,7 @@
 	--fx-mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
 	position: relative;
 	overflow: hidden;
-	padding: clamp(72px, 8vw, 112px) var(--gutter) clamp(64px, 7vw, 96px);
+	padding: var(--section-y) var(--gutter);
 	background:
 		radial-gradient(ellipse 70% 360px at 50% -80px, rgba(60, 80, 110, 0.22), transparent 70%),
 		radial-gradient(ellipse 30% 220px at 72% 360px, var(--glow-blue), transparent 70%) no-repeat,
@@ -23,19 +23,22 @@
 }
 
 /* ---- header */
-.vx-features .vx-features__head { padding: 0 0 clamp(28px, 3vw, 40px) clamp(0px, 3vw, 44px); }
+.vx-features .vx-features__head {
+	padding: 0 0 var(--head-gap);
+}
 .vx-features .vx-features__eyebrow {
 	position: relative;
 	display: inline-flex;
 	align-items: center;
-	gap: 10px;
-	min-height: 34px;
-	padding: 0 16px 0 14px;
+	gap: 8px;
+	padding: 0 14px 0 12px;
 	border-radius: 999px;
 	background: var(--surface);
 	color: var(--text-2);
-	font-size: 0.9375rem;
+	font-size: 0.875rem;
 	line-height: 1;
+	height: 32px;
+	font-weight: 500;
 }
 .vx-features .vx-features__eyebrow::before {
 	content: "";
@@ -47,22 +50,29 @@
 	-webkit-mask: var(--fx-mask);
 	mask: var(--fx-mask);
 }
-.vx-features .vx-features__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 8px var(--glow-amber); }
+.vx-features .vx-features__dot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--amber);
+	box-shadow: 0 0 8px var(--glow-amber);
+}
 .vx-features .vx-features__title {
 	margin-top: 20px;
 	color: var(--text);
-	font-size: clamp(2.5rem, 1.4rem + 3.4vw, 4.5rem);
+	font-size: var(--h2-size);
 	font-weight: 600;
-	letter-spacing: -0.035em;
-	line-height: 1.02;
-	text-shadow: 0 2px 24px rgba(160, 180, 220, 0.12);
+	letter-spacing: -0.04em;
+	line-height: 1.05;
+	text-wrap: balance;
 }
 .vx-features .vx-features__lead {
-	max-width: 46em;
+	max-width: 40em;
 	margin-top: 18px;
-	font-size: clamp(1.0625rem, 0.98rem + 0.4vw, 1.3125rem);
+	font-size: var(--lead-size);
 	line-height: 1.5;
 	text-wrap: pretty;
+	color: var(--text-2);
 }
 .vx-features .vx-features__lead a {
 	padding-block: 10px;
@@ -134,9 +144,10 @@
 	font-family: var(--font-mono);
 	font-size: clamp(0.8125rem, 0.76rem + 0.2vw, 0.9375rem);
 	line-height: 1.7;
-	white-space: pre;
+	white-space: pre-wrap;
 	scrollbar-width: thin;
 	scrollbar-color: var(--line-strong) transparent;
+	overflow-wrap: break-word;
 }
 .vx-features .vx-features__code code { font: inherit; }
 .vx-features .vx-features__k { color: var(--fx-code-kw); }

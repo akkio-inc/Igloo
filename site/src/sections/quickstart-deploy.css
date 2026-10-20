@@ -1,8 +1,7 @@
 /* Quick start + deploy, Linear style. Tokens come from base-linear.css; every rule sits under .vx-quickstart or .vx-deploy. */
 .vx-quickstart,
 .vx-deploy {
-  --vx-rail: clamp(10px, 3.9vw, 56px);
-  --vx-inset: calc(var(--vx-rail) + clamp(10px, 1.8vw, 26px));
+  --vx-rail: max(0px, 50% - var(--content) / 2 - 44px);
   --vx-code: #0b111a;
   --vx-code-bar: #070a10;
   --vx-code-line: #1e2a38;
@@ -53,17 +52,18 @@
   left: 0;
   right: 0;
   height: 1px;
-  background: var(--line);
+  background: linear-gradient(90deg, transparent, var(--line) 8%, var(--line) 92%, transparent);
 }
 .vx-quickstart .vx-qs-rule--t {
-  top: var(--vx-top-rule);
+  top: 0;
 }
 .vx-quickstart .vx-qs-rule--p {
   top: var(--vx-panel-top);
   background: linear-gradient(90deg, transparent, var(--line) 20%, var(--line) 80%, transparent);
+  display: none;
 }
 .vx-deploy .vx-dp-rule--t {
-  top: var(--vx-top-rule);
+  top: 0;
 }
 .vx-quickstart .vx-qs-rail,
 .vx-deploy .vx-dp-rail {
@@ -89,34 +89,32 @@
 .vx-quickstart .vx-qs-layout {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 35fr) minmax(0, 65fr);
+  grid-template-columns: minmax(0, 36fr) minmax(0, 64fr);
   gap: clamp(28px, 3vw, 40px);
   align-items: start;
-  padding: var(--vx-panel-top) var(--vx-inset) clamp(48px, 5vw, 72px);
+  padding: var(--section-y) 0;
+  width: min(100% - 2 * var(--gutter), var(--content));
+  margin-inline: auto;
 }
 .vx-quickstart .vx-qs-intro {
   position: sticky;
   top: 24px;
-  padding-top: clamp(32px, 5.5vw, 80px);
-}
-.vx-quickstart .vx-qs-eyebrow {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  padding-top: 0;
 }
 .vx-quickstart .vx-qs-eyebrow,
 .vx-deploy .vx-dp-eyebrow {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  height: 30px;
-  padding: 0 13px 0 12px;
+  height: 32px;
+  padding: 0 14px 0 12px;
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: var(--surface);
   font-size: 0.875rem;
   font-weight: 500;
   color: var(--text-2);
+  line-height: 1;
 }
 .vx-quickstart .vx-qs-led,
 .vx-deploy .vx-dp-led {
@@ -128,24 +126,22 @@
 }
 .vx-quickstart .vx-qs-title,
 .vx-deploy .vx-dp-title {
-  font-size: clamp(2.5rem, 1.1rem + 3.9vw, 4.5rem);
+  font-size: var(--h2-size);
   font-weight: 600;
-  line-height: 1.04;
-  letter-spacing: -0.045em;
-}
-.vx-quickstart .vx-qs-title,
-.vx-deploy .vx-dp-title {
-  margin-top: clamp(16px, 1.8vw, 24px);
+  line-height: 1.05;
+  letter-spacing: -0.04em;
+  margin-top: 20px;
+  text-wrap: balance;
 }
 .vx-quickstart .vx-qs-lead,
 .vx-deploy .vx-dp-lead {
-  font-size: clamp(1.0625rem, 0.95rem + 0.45vw, 1.3125rem);
+  font-size: var(--lead-size);
   line-height: 1.5;
   color: var(--text-2);
   text-wrap: pretty;
 }
 .vx-quickstart .vx-qs-lead {
-  margin-top: clamp(14px, 1.6vw, 22px);
+  margin-top: 18px;
   max-width: 26em;
 }
 
@@ -224,6 +220,8 @@
 }
 .vx-quickstart .vx-qs-code--intro pre {
   padding-block: 18px;
+  padding-inline: 16px;
+  font-size: 0.8125rem;
 }
 /* copy buttons: quiet until the block is hovered or focused, always shown on touch screens */
 .vx-quickstart .vx-qs-copy {
@@ -360,17 +358,19 @@
 }
 .vx-deploy .vx-dp-inner {
   position: relative;
-  padding: calc(var(--vx-top-rule) + clamp(40px, 4.4vw, 64px)) var(--vx-inset) clamp(64px, 7vw, 104px);
+  padding: var(--section-y) 0;
+  width: min(100% - 2 * var(--gutter), var(--content));
+  margin-inline: auto;
 }
 .vx-deploy .vx-dp-lead {
-  max-width: 42em;
-  margin-top: clamp(14px, 1.4vw, 20px);
+  max-width: 40em;
+  margin-top: 18px;
 }
 .vx-deploy .vx-dp-cards {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: clamp(14px, 1.4vw, 20px);
-  margin-top: clamp(28px, 2.8vw, 36px);
+  margin-top: var(--head-gap);
   list-style: none;
 }
 .vx-deploy .vx-dp-card {
@@ -454,12 +454,11 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
-/* the intro stacks above the steps panel below 900px */
-@media (max-width: 899.98px) {
+/* the intro stacks above the steps panel below 1280px */
+@media (max-width: 1279.98px) {
   .vx-quickstart .vx-qs-layout {
     grid-template-columns: minmax(0, 1fr);
     gap: 36px;
-    padding-top: calc(var(--vx-top-rule) + 40px);
   }
   .vx-quickstart .vx-qs-intro {
     position: static;
@@ -479,6 +478,14 @@
 @media (prefers-reduced-motion: reduce) {
   .vx-quickstart .vx-qs-copy {
     transition: none;
+  }
+}
+
+/* phones: no rails, the content already runs to the gutter */
+@media (max-width: 767.98px) {
+  .vx-quickstart .vx-qs-rail,
+  .vx-deploy .vx-dp-rail {
+    display: none;
   }
 }
 

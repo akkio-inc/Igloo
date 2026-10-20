@@ -8,28 +8,28 @@
   font-family: var(--font-sans);
 }
 .vx-benchmark .vx-bm-inner {
-  width: min(100% - 2 * var(--gutter), var(--content) + 60px);
+  width: min(100% - 2 * var(--gutter), var(--content));
   margin-inline: auto;
-  padding-block: clamp(64px, 6.5vw, 96px) clamp(56px, 5.5vw, 80px);
+  padding-block: var(--section-y);
 }
 .vx-benchmark .vx-bm-head {
   max-width: 56rem;
-  padding-left: clamp(0px, 0.8vw, 12px);
 }
 .vx-benchmark .vx-bm-eyebrow {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  height: 30px;
-  padding: 0 13px 0 12px;
+  height: 32px;
+  padding: 0 14px 0 12px;
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: var(--surface);
   font-size: 0.875rem;
   font-weight: 500;
   color: var(--text-2);
+  line-height: 1;
 }
-.vx-benchmark .vx-bm-led {
+.vx-benchmark .vx-bm-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -37,18 +37,18 @@
   box-shadow: 0 0 8px rgb(249 187 45 / 0.7);
 }
 .vx-benchmark .vx-bm-title {
-  margin-top: clamp(16px, 1.8vw, 24px);
-  font-size: clamp(2.25rem, 1.2rem + 3.1vw, 3.75rem);
+  margin-top: 20px;
+  font-size: var(--h2-size);
   font-weight: 600;
-  line-height: 1.08;
+  line-height: 1.05;
   letter-spacing: -0.04em;
   text-wrap: balance;
 }
 .vx-benchmark .vx-bm-lead {
-  max-width: 44em;
-  margin-top: clamp(12px, 1.3vw, 18px);
-  font-size: clamp(1.0625rem, 0.95rem + 0.42vw, 1.3125rem);
-  line-height: 1.55;
+  max-width: 40em;
+  margin-top: 18px;
+  font-size: var(--lead-size);
+  line-height: 1.5;
   color: var(--text-2);
   text-wrap: pretty;
 }
@@ -58,7 +58,7 @@
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: clamp(24px, 2.6vw, 42px);
-  margin-top: clamp(28px, 2.8vw, 36px);
+  margin-top: var(--head-gap);
 }
 .vx-benchmark .vx-bm-card {
   position: relative;
@@ -175,7 +175,6 @@
 .vx-benchmark .vx-bm-more {
   display: inline-block;
   margin-top: clamp(18px, 2vw, 28px);
-  margin-left: clamp(0px, 0.8vw, 12px);
   padding-block: 11px;
   font-size: 1.0625rem;
   font-weight: 500;
