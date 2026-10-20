@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/pgwire"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -36,6 +37,8 @@ func (c *Console) lookupAll(ctx context.Context, user auth.User, r *http.Request
 		return nil, err
 	}
 	defer es.Close() //nolint:errcheck
+	// The console's own SQL, see runAs.
+	ctx = pgwire.WithIglooSQL(ctx)
 	out := make([]result, len(sqls))
 	for i, sql := range sqls {
 		var res collect

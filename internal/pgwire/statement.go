@@ -72,6 +72,9 @@ type statement struct {
 	// unknown says DuckDB could not tell the type of a column of the result
 	// when it prepared the statement.
 	unknown bool
+	// names, when set, are the names clients see for the result's columns,
+	// as the Snowflake dialect names them; columns keeps DuckDB's.
+	names []string
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

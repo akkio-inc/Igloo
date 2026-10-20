@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
@@ -491,7 +492,7 @@ func rewriteSystemSchemaRefs(query, catalog string) string {
 // empty. user owns everything, as far as clients can tell.
 func sessionCatalogSetup(user string, superuser bool, version string) []string {
 	name := "'" + strings.ReplaceAll(user, "'", "''") + "'"
-	return []string{
+	return append([]string{
 		"CREATE OR REPLACE TEMP MACRO pg_get_userbyid(id) AS " + name,
 		// Tools parse version() for "PostgreSQL <major>.<minor>"; 15 matches
 		// the server_version Igloo reports at login.
@@ -647,7 +648,10 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 		toCharMacro,
 		`CREATE OR REPLACE TEMP MACRO pg_get_viewdef(oid) AS (SELECT sql FROM duckdb_views() WHERE view_oid = oid),
 			(oid, pretty) AS (SELECT sql FROM duckdb_views() WHERE view_oid = oid)`,
-	}
+		// The sf_ macros that statements translated from Snowflake's
+		// dialect call, in every session: views, tasks and the like
+		// created in that dialect keep calling them.
+	}, snowflake.Macros()...)
 }
 
 // showSetting matches SHOW of one setting, SHOW TRANSACTION ISOLATION LEVEL

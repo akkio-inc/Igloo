@@ -27,7 +27,7 @@ type encoder func(any) (any, error)
 // alias is DuckDB's logical type alias, such as "JSON".
 func wireType(t duckdb.Type, alias string) (uint32, encoder) {
 	if alias == "JSON" {
-		return pgtype.JSONOID, toJSON
+		return pgtype.JSONOID, fromJSON
 	}
 
 	switch t {
@@ -201,6 +201,17 @@ func toJSON(v any) (any, error) {
 	if s, ok := v.(string); ok {
 		return s, nil
 	}
+	b, err := json.Marshal(jsonValue(v))
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+// fromJSON renders a value of a JSON column as JSON. duckdb-go decodes
+// JSON values (a JSON string becomes a Go string), so every value, a
+// string included, is marshalled back.
+func fromJSON(v any) (any, error) {
 	b, err := json.Marshal(jsonValue(v))
 	if err != nil {
 		return nil, err

@@ -31,10 +31,13 @@ const (
 	// MemoryLimit is the memory each statement reserves from the replica's
 	// query memory before it starts.
 	MemoryLimit = "memory_limit"
+	// SQLDialect is the SQL dialect of sessions that choose none of their
+	// own: duckdb or snowflake.
+	SQLDialect = "sql_dialect"
 )
 
 // Names lists the settings.
-var Names = []string{QueryTag, StatementTimeout, MaxConcurrentStatements, MemoryLimit}
+var Names = []string{QueryTag, StatementTimeout, MaxConcurrentStatements, MemoryLimit, SQLDialect}
 
 // MaxQueryTag bounds a query tag's length in bytes, as Snowflake's does.
 const MaxQueryTag = 2000
@@ -65,6 +68,12 @@ func Normalize(name, value string) (string, error) {
 			return "", fmt.Errorf("memory_limit must be a size such as 4GB or 512MiB, got %q", value)
 		}
 		return strings.TrimSpace(value), nil
+	case SQLDialect:
+		switch d := strings.ToLower(strings.TrimSpace(value)); d {
+		case "duckdb", "snowflake":
+			return d, nil
+		}
+		return "", fmt.Errorf("sql_dialect must be duckdb or snowflake, got %q", value)
 	}
 	return "", fmt.Errorf("unknown setting %q; use %s", name, strings.Join(Names, ", "))
 }
@@ -125,6 +134,9 @@ type Limits struct {
 	Slots Slots
 	// Memory is what each statement reserves, in bytes; zero means none.
 	Memory int64
+	// SQLDialect is the dialect of sessions that choose none; "" means
+	// DuckDB's.
+	SQLDialect string
 }
 
 // Slots is a limit on statements running at once, shared by everyone
@@ -145,7 +157,8 @@ func (l Limits) Limited() bool { return l.Slots.Max > 0 || l.Memory > 0 }
 // target that sets it wins: the user, then their custom roles, then their
 // built-in role. Where several custom roles set one, the most generous
 // applies (the longest timeout, the most statements at once, the smallest
-// reservation), and for the query tag the first role by name. Values that
+// reservation), and for the query tag and SQL dialect the first role by
+// name. Values that
 // do not parse are ignored; they were checked when set.
 func Resolve(user auth.User, roles []string, settings []auth.Setting) Limits {
 	var l Limits
@@ -169,6 +182,8 @@ func Resolve(user auth.User, roles []string, settings []auth.Setting) Limits {
 		switch name {
 		case QueryTag:
 			l.QueryTag = level[0].Value
+		case SQLDialect:
+			l.SQLDialect = level[0].Value
 		case StatementTimeout:
 			// Zero, no limit, is the most generous of all.
 			for _, s := range level {

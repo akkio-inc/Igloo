@@ -166,6 +166,16 @@ func (s *Server) loginAccepted(ctx context.Context, writer *buffer.Writer, user 
 	}
 	s.limiter.succeeded(user.Name)
 
+	// The connection may choose its SQL dialect, as a startup parameter.
+	dialect, err := startupDialect(wire.ClientParameters(ctx))
+	if err != nil {
+		err = pgerror.WithSeverity(err, pgerror.LevelFatal)
+		if werr := wire.WriteUnterminatedError(writer, err); werr != nil {
+			return ctx, werr
+		}
+		return ctx, err
+	}
+
 	if !s.acquireConn() {
 		err := pgerror.WithSeverity(pgerror.WithCode(
 			errors.New("sorry, too many clients already"), codes.TooManyConnections), pgerror.LevelFatal)
@@ -185,6 +195,8 @@ func (s *Server) loginAccepted(ctx context.Context, writer *buffer.Writer, user 
 		activity: s.activity,
 		open:     make(map[*wire.PreparedStatement]*statement),
 		appName:  wire.ClientParameters(ctx)[wire.ParamApplicationName],
+
+		startDialect: dialect,
 	}
 	if addr != nil {
 		sess.client = addr.String()

@@ -47,7 +47,8 @@ unless asked (see [privacy](#privacy)).
 4. **Replays the queries** whose tables are all in Igloo, up to `--sample`
    (200 by default, the most source time first): first as written, with only
    their table names changed to Igloo's; if that fails, in Igloo's own
-   dialect of the source's SQL where Igloo has one (`SET sql_dialect`), and
+   dialect of the source's SQL where Igloo has one
+   ([`SET sql_dialect`](snowflake-sql.md)), and
    translated to DuckDB's dialect by [sqlglot](https://github.com/tobymao/sqlglot).
    Each run is recorded with its outcome, error, rows and time. Writes are
    replayed only with `--replay-writes`, into a scratch schema.

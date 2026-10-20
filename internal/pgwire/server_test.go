@@ -305,6 +305,9 @@ func TestTypes(t *testing.T) {
 		{"{'a': 1}", `{"a":1}`},
 		{"MAP {'k': 'v'}", `{"k":"v"}`},
 		{`'{"x": 1}'::JSON`, `{"x":1}`},
+		// A JSON string is sent with its quotes, a JSON text like any other.
+		{`'"abc"'::JSON`, `"abc"`},
+		{`'[1, "a"]'::JSON`, `[1,"a"]`},
 	}
 
 	numerics := []struct{ expr, want string }{

@@ -8,6 +8,11 @@ which is close to PostgreSQL's. Everyday SQL (joins, window functions, CTEs,
 aggregates, `GROUP BY ALL`, `QUALIFY`) works as written; DuckDB's function
 library applies.
 
+A session can choose [Snowflake's dialect](snowflake-sql.md) instead, with
+`SET sql_dialect = 'snowflake'`, a connection option or a role setting:
+Igloo then translates Snowflake SQL (`IFF`, `DATEADD`, `v:path::type`,
+`FLATTEN` and the rest) to DuckDB's before it checks and runs it.
+
 Sketches for deduplicated reach, geometry and H3 functions, and DuckDB's
 approximate and statistical functions are described in
 [media analytics](media-analytics.md).
@@ -343,8 +348,9 @@ SHOW ROLE SETTINGS;
 
 `ALTER ROLE` takes a custom role, a built-in role (`reader` means every
 reader) or a user, and only admins may run it. The settings are
-`query_tag`, `statement_timeout`, `max_concurrent_statements` and
-`memory_limit`; [workload management](workload-management.md) says how
+`query_tag`, `statement_timeout`, `max_concurrent_statements`,
+`memory_limit` and `sql_dialect` (the [SQL dialect](snowflake-sql.md) its
+sessions start in); [workload management](workload-management.md) says how
 they combine and how they are enforced.
 
 ## Delta Sharing

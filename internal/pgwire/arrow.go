@@ -60,6 +60,9 @@ func (st *statement) runArrow(ctx context.Context, args []driver.NamedValue, w w
 	if err != nil {
 		return err
 	}
+	if st.names != nil {
+		rdr = &renamedReader{RecordReader: rdr, schema: renameSchema(rdr.Schema(), st.names)}
+	}
 	defer rdr.Release()
 	n, err := aw.Records(rdr)
 	if err != nil {
@@ -153,7 +156,11 @@ func (p *PreparedStatement) ArrowSchema() (*arrow.Schema, error) {
 		return arrow.NewSchema(nil, nil), nil
 	}
 	if st, ok := p.e.sess.open[p.ps]; ok && st.kind == returnsRows {
-		return st.stmt.ArrowSchema()
+		schema, err := st.stmt.ArrowSchema()
+		if err != nil {
+			return nil, err
+		}
+		return renameSchema(schema, st.names), nil
 	}
 	return TextSchema(p.Columns()), nil
 }

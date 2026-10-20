@@ -40,6 +40,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sharing"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
 	"github.com/akkio-inc/igloo/internal/workload"
@@ -507,6 +508,9 @@ type session struct {
 	settings *settingsCheck
 	// distMode is the session's distributed_execution; empty means auto.
 	distMode distributed.Mode
+	// dialect is the session's own sql_dialect, startDialect the one its
+	// connection asked for; empty means not set (see sqlDialect).
+	dialect, startDialect string
 	// catHolds are the holds on the engine's catalog lock this session's
 	// steps have taken and not released, catHeld how the engine lock is held
 	// for them, and catRelease what releases it, so the several steps that
@@ -825,6 +829,71 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	}
 
 	s.refreshLimits(ctx, sess, user)
+	if ps, ok := s.dialectCommand(sess, q.Query); ok {
+		return ps, nil
+	}
+	// In the Snowflake dialect the statement is translated first, so that
+	// all that follows, the checks of the user's role, grants and policies
+	// above all, sees only the DuckDB statement Igloo will run.
+	var tr *translation
+	if sess.sqlDialect() == dialectSnowflake && !isIglooSQL(ctx) {
+		if parts := snowflake.Split(q.Query); q.SimpleQuery && len(parts) > 1 {
+			return s.snowflakeScript(ctx, sess, q, parts)
+		}
+		if tr, err = s.translate(ctx, sess, q.Query); err != nil {
+			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+			return nil, err
+		}
+		if tr.Command != "" {
+			// A statement that changes nothing in Igloo, such as USE
+			// WAREHOUSE.
+			tag := tr.Command
+			ps := wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+				return w.Complete(tag)
+			})))
+			return withNotices(ps, tr.Notices), nil
+		}
+		if !tr.Untranslated {
+			q.Query = tr.SQL
+		}
+		// The translation decodes Snowflake's string escapes, which could
+		// spell a NUL; the translator refuses them, and this checks again.
+		if strings.IndexByte(q.Query, 0) >= 0 {
+			return nil, pgerror.WithCode(errors.New(`invalid byte sequence for encoding "UTF8": 0x00`), codes.CharacterNotInRepertoire)
+		}
+	}
+	ps, err := s.parseDuckDB(ctx, sess, user, q, tr)
+	if err != nil || tr == nil {
+		return ps, err
+	}
+	return withNotices(ps, tr.Notices), nil
+}
+
+// withNotices has each of stmts send notices, as warnings, before it runs.
+func withNotices(stmts wire.PreparedStatements, notices []string) wire.PreparedStatements {
+	if len(notices) == 0 {
+		return stmts
+	}
+	for _, ps := range stmts {
+		ps.WrapFn(func(fn wire.PreparedStatementFn) wire.PreparedStatementFn {
+			return func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
+				if n, ok := w.(wire.Noticer); ok {
+					for _, msg := range notices {
+						if err := n.Notice("01000", msg); err != nil {
+							return err
+						}
+					}
+				}
+				return fn(ctx, w, params)
+			}
+		})
+	}
+	return stmts
+}
+
+// parseDuckDB parses q, a statement or simple query in DuckDB's dialect,
+// for parse; tr is how it was translated from Snowflake's, or nil.
+func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User, q wire.Query, tr *translation) (wire.PreparedStatements, error) {
 	// User statements, alone or together, go to parseUserCommands below.
 	if parts := sqllex.Split(q.Query); q.SimpleQuery && len(parts) > 1 {
 		if _, users, _ := parseUserCommands(q.Query); !users {
@@ -1062,7 +1131,13 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
 		return pgError(err)
-	}, wire.WithColumns(st.columns), wire.WithParameters(st.params))
+	}, wire.WithColumns(tr.columns(st.columns)), wire.WithParameters(st.params))
+	if tr != nil && !tr.Untranslated {
+		st.names = make([]string, len(st.columns))
+		for i, c := range tr.columns(st.columns) {
+			st.names[i] = c.Name
+		}
+	}
 
 	sess.open[ps] = st
 	return wire.Prepared(ps), nil

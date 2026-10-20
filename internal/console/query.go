@@ -135,13 +135,18 @@ func (c *Console) query(w http.ResponseWriter, r *http.Request, req *request) {
 	out := newStream(w)
 	defer out.stop()
 	began := time.Now()
+	ctx := r.Context()
+	if in.Lookup {
+		// A page's lookup is the console's own SQL, see runAs.
+		ctx = pgwire.WithIglooSQL(ctx)
+	}
 	for i, stmt := range stmts {
 		if err := out.send(map[string]any{"statement": map[string]any{"index": i, "offset": stmt.Offset, "text": stmt.Text}}); err != nil {
 			return
 		}
 		start := time.Now()
 		res := &gridWriter{out: out}
-		err := es.Run(r.Context(), stmt.Text, res)
+		err := es.Run(ctx, stmt.Text, res)
 		if err == nil {
 			err = res.flush()
 		}
@@ -433,6 +438,9 @@ func (c *Console) runAs(ctx context.Context, user auth.User, r *http.Request, ap
 		return result{}, err
 	}
 	defer es.Close() //nolint:errcheck
+	// The pages' statements are the console's own, in DuckDB's dialect,
+	// whatever sql_dialect the user's role gives their sessions.
+	ctx = pgwire.WithIglooSQL(ctx)
 	var out collect
 	err = es.Run(ctx, sql, &out)
 	if out.Rows == nil {

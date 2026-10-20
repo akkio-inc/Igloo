@@ -26,6 +26,9 @@ otherwise unchanged except for these patches:
 - `row.go`, `Column.Define`: a RowDescription carries the column's
   `TypeModifier` when it is set, instead of always -1, so clients learn a
   numeric's precision and scale.
+- `igloo_wrap.go` (new): `PreparedStatement.WrapFn` wraps a prepared
+  statement's function in place, so Igloo can have every run of a statement
+  it translated from Snowflake's dialect send the translation's notices.
 - `igloo_writer.go` (new): `DefineColumns`, so a statement of a simple query
   can describe its rows when it runs rather than when the query is parsed
   (Igloo prepares each statement of a multi-statement query only once the

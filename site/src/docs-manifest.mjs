@@ -28,6 +28,7 @@ export const groups = [
 		label: 'SQL',
 		pages: [
 			{ source: 'docs/sql.md', label: 'SQL and clients' },
+			{ source: 'docs/snowflake-sql.md', label: 'Snowflake SQL' },
 			{ source: 'docs/media-analytics.md', label: 'Media analytics' },
 		],
 	},

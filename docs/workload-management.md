@@ -149,11 +149,13 @@ SHOW ROLE SETTINGS;                                  -- admins see all; others, 
 | `max_concurrent_statements` | How many statements may run at once on a replica. On a user, it counts that user's statements; on a custom or built-in role, all its members' together. Further statements wait in line. |
 | `memory_limit` | The memory each statement reserves out of the replica's query memory (DuckDB's memory limit) before it starts. A statement whose reservation does not fit next to those already running waits in line. |
 | `query_tag` | The default [query tag](#query-tags) |
+| `sql_dialect` | The SQL dialect sessions start in, `duckdb` or `snowflake` ([Snowflake SQL](snowflake-sql.md)) |
 
 Which setting applies to a user: their own, if they have one; otherwise
 their custom roles' (where several set it, the most generous: the longest
 timeout, the most statements, the smallest reservation; for the tag, the
-first role by name); otherwise their built-in role's. A concurrency limit
+first role by name, and so for the dialect); otherwise their built-in
+role's. A concurrency limit
 counts against the user or role it came from.
 
 How limits are enforced:

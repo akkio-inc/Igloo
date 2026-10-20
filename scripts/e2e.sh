@@ -383,6 +383,80 @@ for q in 1 6 18; do
   if psql_admin -c "PRAGMA tpch($q)" >/dev/null; then pass "TPC-H Q$q"; else fail "TPC-H Q$q"; fi
 done
 
+echo "Snowflake SQL"
+# Per session: a statement in Snowflake's dialect, with its functions,
+# string escapes and result column names.
+got="$(psql_as rita rita-password-1 -P tuples_only=off -P footer=off -c "SET sql_dialect = 'snowflake'" \
+  -c "SELECT IFF(true, 1, 2) AS flag, DATEADD(month, 1, '2024-01-31'::date) AS \"next\", 'it\\'s' AS s, NVL(NULL, 'x')")"
+if [ "$got" = "SET
+FLAG|next|S|NVL(NULL, 'X')
+1|2024-02-29|it's|x" ]; then
+  pass "SET sql_dialect = 'snowflake' in a session, as a reader"
+else
+  fail "Snowflake dialect in a session: [$got]"
+fi
+expect "a session starts in DuckDB's dialect" "duckdb" rita rita-password-1 "SHOW sql_dialect"
+# Per connection, from the startup options; RESET goes back to it.
+got="$(docker run --rm -i --network "$network" -e PGPASSWORD=rita-password-1 -e PGOPTIONS='-c sql_dialect=snowflake' postgres:17 \
+  psql -h "${psql_host:-igloo}" -U rita -d igloo -X -At -v ON_ERROR_STOP=1 \
+  -c "SELECT ZEROIFNULL(NULL), SPLIT_PART('a,b', ',', 2)" -c "SET sql_dialect = 'duckdb'" -c "RESET sql_dialect" -c "SHOW sql_dialect" 2>&1)" || true
+if [ "$got" = "0|b
+SET
+RESET
+snowflake" ]; then
+  pass "sql_dialect in the connection's options"
+else
+  fail "sql_dialect in the connection's options: [$got]"
+fi
+# Per user, set by an admin.
+expect "sql_dialect as a user's setting" "ALTER USER" igloo "$admin_password" "ALTER USER walt SET sql_dialect = 'snowflake'"
+expect "a user's sessions start in their dialect" "snowflake
+2" walt walt-password-1 "SHOW sql_dialect; SELECT LEN('ab')"
+expect "and SET overrides it" "SET
+duckdb" walt walt-password-1 "SET sql_dialect = 'duckdb'; SHOW sql_dialect"
+psql_admin -c "ALTER USER walt RESET sql_dialect" >/dev/null
+# same_as_duckdb NAME SNOWFLAKE_SQL DUCKDB_SQL: the query in Snowflake's
+# dialect must return what its DuckDB counterpart returns.
+same_as_duckdb() {
+  local got_sf got_duck
+  got_sf="$(psql_admin -c "SET sql_dialect = 'snowflake'" -c "$2" | tail -n +2)" || true
+  got_duck="$(psql_admin -c "$3")" || true
+  if [ -n "$got_duck" ] && [ "$got_sf" = "$got_duck" ]; then pass "$1"; else fail "$1: [$got_sf], DuckDB's: [$got_duck]"; fi
+}
+same_as_duckdb "TPC-H Q1 in Snowflake's dialect" \
+  "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
+    FROM lineitem WHERE l_shipdate <= DATEADD(day, -90, '1998-12-01'::date)
+    GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus" \
+  "SELECT l_returnflag, l_linestatus, sum(l_quantity), avg(l_discount), count(*)
+    FROM lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL 90 DAY
+    GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
+same_as_duckdb "TPC-H Q3 in Snowflake's dialect" \
+  "SELECT o_orderkey, SUM(l_extendedprice * (1 - l_discount)) AS revenue, TO_CHAR(o_orderdate, 'YYYY-MM-DD') AS d
+    FROM customer, orders, lineitem
+    WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey AND l_orderkey = o_orderkey
+      AND o_orderdate < '1995-03-15'::date AND l_shipdate > '1995-03-15'::date
+    GROUP BY o_orderkey, o_orderdate
+    QUALIFY ROW_NUMBER() OVER (ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC, o_orderdate) <= 5
+    ORDER BY revenue DESC, o_orderdate" \
+  "SELECT o_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue, strftime(o_orderdate, '%Y-%m-%d')
+    FROM customer, orders, lineitem
+    WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey AND l_orderkey = o_orderkey
+      AND o_orderdate < DATE '1995-03-15' AND l_shipdate > DATE '1995-03-15'
+    GROUP BY o_orderkey, o_orderdate ORDER BY revenue DESC, o_orderdate LIMIT 5"
+expect "semi-structured data and FLATTEN" "SET
+a|0
+b|1" rita rita-password-1 "SET sql_dialect = 'snowflake'; SELECT f.value:name::string, f.index FROM TABLE(FLATTEN(input => PARSE_JSON('[{\"name\": \"a\"}, {\"name\": \"b\"}]'))) f"
+expect_error "a construct it cannot translate is refused" 0A000 rita rita-password-1 "SET sql_dialect = 'snowflake'; SELECT * FROM @my_stage"
+# A translation reaches only what its user may: a reader cannot write.
+expect_error "a translated write is checked as written in DuckDB's dialect" 42501 rita rita-password-1 \
+  "SET sql_dialect = 'snowflake'; CREATE OR REPLACE TRANSIENT TABLE sf_e2e AS SELECT IFF(true, 1, 2) AS x"
+# A view created in Snowflake's dialect works in every session.
+expect "a view in Snowflake's dialect" "SET
+CREATE VIEW" igloo "$admin_password" \
+  "SET sql_dialect = 'snowflake'; CREATE OR REPLACE VIEW sf_e2e_view AS SELECT DATE_TRUNC('month', '2024-03-14'::date) AS m, ARRAY_SIZE(ARRAY_CONSTRUCT(1, 2)) AS n"
+expect "read from DuckDB's dialect" "2024-03-01|2" rita rita-password-1 "SELECT m, n FROM sf_e2e_view"
+psql_admin -c "DROP VIEW sf_e2e_view" >/dev/null
+
 echo "drivers"
 pgjdbc_version=42.7.14
 if docker run --rm --network "$network" -e PGHOST=igloo -e PGUSER=igloo -e PGPASSWORD="$admin_password" \

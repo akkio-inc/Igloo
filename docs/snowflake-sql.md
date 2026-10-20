@@ -1,0 +1,315 @@
+# Snowflake SQL
+
+Igloo's SQL is DuckDB's (see [SQL and clients](sql.md#dialect)). A session
+can choose Snowflake's dialect instead: Igloo then translates each statement
+into DuckDB's dialect before it checks and runs it, so queries, dashboards
+and dbt models written for Snowflake run without being rewritten.
+
+```sql
+SET sql_dialect = 'snowflake';
+
+SELECT IFF(amount > 100, 'large', 'small') AS size,
+       DATEADD(month, 1, order_date)       AS next_month,
+       payload:customer.email::string      AS email
+FROM orders
+QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) = 1;
+```
+
+The translation covers the functions, syntax and types that analytics SQL
+uses most. What it cannot translate faithfully it refuses with an error
+that names the construct; where DuckDB cannot reproduce Snowflake's
+behaviour exactly, the translation is the closest one and the difference is
+listed under [known differences](#known-differences).
+
+## Turning it on
+
+The dialect is a setting, `sql_dialect`, with two values: `duckdb`, the
+default, and `snowflake`. Any user may change it for their own sessions; it
+changes how their SQL is read, never what they may do.
+
+| Where | How |
+|---|---|
+| A session | `SET sql_dialect = 'snowflake'`, or `ALTER SESSION SET sql_dialect = 'snowflake'`; `SET sql_dialect = 'duckdb'` turns it off, `RESET sql_dialect` returns to the connection's or the user's default, `SHOW sql_dialect` says which applies |
+| A connection | The startup option `-c sql_dialect=snowflake`: `PGOPTIONS='-c sql_dialect=snowflake'` for psql and libpq, `options=-c%20sql_dialect=snowflake` in a JDBC URL, `options='-c sql_dialect=snowflake'` for psycopg. A startup parameter named `sql_dialect` works too. An unknown value fails the login with SQLSTATE `22023` |
+| A user or role | `ALTER USER ana SET sql_dialect = 'snowflake'` or `ALTER ROLE analysts SET sql_dialect = 'snowflake'` (admins), a [role setting](workload-management.md#role-limits) like `query_tag`: the user's own, otherwise their custom roles' (the first role by name), otherwise their built-in role's |
+
+A session's own `SET` wins over its connection's option, which wins over
+the user's or role's setting.
+
+- **Arrow Flight SQL** sessions take `SET sql_dialect` and the user's or
+  role's setting. **The web console** takes the setting, and a worksheet
+  can start with `SET sql_dialect = 'snowflake';`. The console's own pages
+  and Flight SQL's catalog calls are always read as DuckDB's.
+- **Drivers' and BI tools' catalog queries**, which name `pg_catalog`,
+  `pg_` functions and tables or use PostgreSQL's `E'...'` strings, pass
+  untranslated whatever the dialect. Other statements a tool writes for
+  PostgreSQL are read as Snowflake's in a Snowflake session; give a role the
+  setting only when its clients send Snowflake SQL.
+- **Views, tasks, pipes, alerts and materialized views** created in
+  Snowflake's dialect store their translation, which is DuckDB SQL: they run
+  the same in every session, and `DESCRIBE` and `duckdb_views()` show the
+  translation. Translations call macros named `sf_...` (such as
+  `sf_add_days`) that every session has.
+- **Scripts** sent as one query are split as Snowflake splits them, so a
+  `;` inside a `'it\'s; fine'` string or after a `//` comment does not end
+  a statement. A statement that changes `sql_dialect` applies to the ones
+  after it.
+
+## What Igloo checks
+
+Translation is not a security boundary. Igloo checks the translated
+statement (the user's role, grants, masking and row access policies, file
+access, workload limits) exactly as it checks a statement sent in DuckDB's
+dialect, so a statement in Snowflake's dialect reaches only what its
+DuckDB translation would. `IDENTIFIER('name')` and `IDENTIFIER($variable)`
+are resolved before the checks. The [query history](sql.md#query-history)
+records the translated statement.
+
+Errors use SQLSTATE codes:
+
+| Code | Meaning |
+|---|---|
+| `0A000` | The construct is valid Snowflake SQL that Igloo does not translate. The message names it, and the hint says what to write instead where there is an alternative |
+| `42601` | The statement is not valid SQL as Snowflake reads it, or a function has the wrong number of arguments |
+| `22023` | A value is not valid, such as an unknown format element or a session variable that is not set |
+
+Statements that Igloo accepts but that change nothing, or translates with a
+caveat, send a notice (SQLSTATE `01000`), which psql and most drivers show:
+`CLUSTER BY` on a table, `USE WAREHOUSE`, `HASH` (whose values are not
+Snowflake's) and the like. The web console and Flight SQL do not show
+notices.
+
+## Names
+
+- Unquoted identifiers are case-insensitive, as in Snowflake.
+- Result columns are named as Snowflake names them: an unquoted alias in
+  upper case (`AS total` gives `TOTAL`), a quoted one as written, an
+  expression after its text in upper case (`COUNT(*)`,
+  `DATEADD(DAY, 1, D)`), and a table's column after its name in the
+  catalog, in upper case unless it has upper-case letters or the statement
+  quotes it.
+- `CREATE TABLE ... AS` and views keep their columns' names as written
+  (`AS total` stores `total`); reading them in Snowflake's dialect shows
+  `TOTAL`.
+- `IDENTIFIER('db.schema.table')`, `IDENTIFIER($name)`, `TABLE('name')` and
+  `TABLE($name)` name an object.
+- A three-part name's database is the catalog's name, `lake` unless
+  `IGLOO_CATALOG_NAME` sets another: give the catalog the name of the
+  Snowflake database whose SQL you run, or use two-part names.
+
+## What is translated
+
+### Literals and lexical rules
+
+- Strings with Snowflake's backslash escapes (`'it\'s'`, `'\n'`,
+  `'\u00e9'`), `$$...$$` strings, `//` comments, `X'...'` binary literals.
+- Session variables: `SET x = 10` (or `SET x = (SELECT ...)`), `$x`,
+  `UNSET x`, `SHOW VARIABLES`. `SET` of one of Igloo's or PostgreSQL's
+  settings (such as `search_path` or `statement_timeout`) sets the setting.
+- Typed literals such as `TIMESTAMP_LTZ '2024-01-01 10:00'`, `{'a': 1}`
+  object constants and `[1, 2]` array constants.
+
+### Semi-structured data
+
+`VARIANT`, `OBJECT` and `ARRAY` are JSON.
+
+- Paths: `v:a.b[0]`, `v['a']`, `v:"Quoted Key"`, `x::VARIANT[0]`, with casts
+  (`v:a::string`, `v:n::number(10,2)`). A path compared with a string, used
+  in a string function or cast to a string reads the value as a string; one
+  compared with a number or used in arithmetic reads it as a number.
+- `PARSE_JSON`, `TRY_PARSE_JSON`, `CHECK_JSON`, `TO_JSON`, `TO_VARIANT`,
+  `TO_OBJECT`, `TO_ARRAY`, `GET`, `GET_PATH`, `TYPEOF`, `IS_*` and `AS_*`,
+  `STRIP_NULL_VALUE`.
+- `OBJECT_CONSTRUCT`, `OBJECT_CONSTRUCT_KEEP_NULL`, `OBJECT_INSERT`,
+  `OBJECT_KEYS`, `OBJECT_AGG`.
+- `ARRAY_CONSTRUCT`, `ARRAY_CONSTRUCT_COMPACT`, `ARRAY_AGG` (with `WITHIN
+  GROUP` and `DISTINCT`), `ARRAY_UNIQUE_AGG`, `ARRAY_SIZE`,
+  `ARRAY_CONTAINS`, `ARRAY_POSITION`, `ARRAY_TO_STRING`, `ARRAY_SLICE`,
+  `ARRAY_APPEND`, `ARRAY_PREPEND`, `ARRAY_CAT`, `ARRAY_COMPACT`,
+  `ARRAY_DISTINCT`, `ARRAY_INTERSECTION`, `ARRAYS_OVERLAP`,
+  `ARRAY_GENERATE_RANGE`, `SPLIT`, `STRTOK_TO_ARRAY`.
+- `[LATERAL] FLATTEN(input => ..., path => ..., outer => ..., recursive =>
+  ..., mode => ...)` and `TABLE(FLATTEN(...))`, with the columns `SEQ`,
+  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`.
+
+### Functions
+
+| Kind | Functions |
+|---|---|
+| Conditional | `IFF`, `NVL`, `IFNULL`, `NVL2`, `ZEROIFNULL`, `NULLIFZERO`, `DECODE`, `EQUAL_NULL`, `DIV0`, `DIV0NULL`, `GREATEST`, `LEAST` (NULL if any argument is), `GREATEST_IGNORE_NULLS`, `LEAST_IGNORE_NULLS`, `BOOLAND`, `BOOLOR`, `BOOLXOR`, `BOOLNOT` |
+| Dates and times | `DATEADD`, `TIMEADD`, `TIMESTAMPADD`, `DATEDIFF`, `TIMEDIFF`, `TIMESTAMPDIFF`, `DATE_TRUNC`, `TRUNC` of a date, `DATE_PART` and `EXTRACT` (including `DAYOFWEEK`, `DAYOFWEEKISO`, `WEEKISO`, `YEAROFWEEK`, `EPOCH_SECOND` and the other parts), `LAST_DAY`, `NEXT_DAY`, `PREVIOUS_DAY`, `DAYNAME`, `MONTHNAME`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `TIME_SLICE`, `DATE_FROM_PARTS`, `TIME_FROM_PARTS`, `TIMESTAMP_FROM_PARTS`, `CONVERT_TIMEZONE`, `SYSDATE`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` |
+| Conversion | `TO_DATE`, `TO_TIMESTAMP`, `TO_TIMESTAMP_NTZ`, `_LTZ`, `_TZ`, `TO_TIME`, `TO_CHAR`, `TO_VARCHAR`, `TO_NUMBER`, `TO_DECIMAL`, `TO_NUMERIC`, `TO_DOUBLE`, `TO_BOOLEAN`, `TO_BINARY`, their `TRY_` forms, `CAST` and `::` to Snowflake's types; date, time and number formats such as `'YYYY-MM-DD HH24:MI:SS.FF3'`, `'MON DD, YYYY'` and `'999,999.00'`; epoch seconds and milliseconds |
+| Strings | `LEN`, `LENGTH`, `CHARINDEX`, `POSITION`, `CONTAINS`, `STARTSWITH`, `ENDSWITH`, `LEFT`, `RIGHT`, `SUBSTR` (position 0 as 1), `SPLIT_PART` (part 0 as 1), `STRTOK`, `CONCAT`, `CONCAT_WS`, `LPAD`, `RPAD`, `REPLACE`, `INITCAP` (Snowflake's delimiters), `SPACE`, `CHR`, `EDITDISTANCE`, `JAROWINKLER_SIMILARITY`, `ILIKE`, `LIKE ANY`/`ALL`, `ILIKE ANY`/`ALL`, `RLIKE`, `REGEXP_LIKE`, `REGEXP_SUBSTR`, `REGEXP_SUBSTR_ALL`, `REGEXP_REPLACE`, `REGEXP_COUNT`, `REGEXP_INSTR` (with Snowflake's `c`, `i`, `m`, `e` and `s` parameters), `SEARCH` |
+| Binary and hashes | `MD5`, `MD5_HEX`, `SHA1`, `SHA1_HEX`, `SHA2` (256 bits), `HASH` (see below), `HEX_ENCODE`, `HEX_DECODE_STRING`, `HEX_DECODE_BINARY`, `BASE64_ENCODE`, `BASE64_DECODE_STRING`, `BASE64_DECODE_BINARY`, `UUID_STRING` |
+| Numbers | `SQUARE`, `TRUNC`, `ROUND`, `CEIL` and `FLOOR` with a scale, `DIV0`, `WIDTH_BUCKET`, `RANDOM`, `UNIFORM`, `NORMAL`, `BITAND`, `BITOR`, `BITXOR`, `BITNOT`, `BITSHIFTLEFT`, `BITSHIFTRIGHT`, `GETBIT` |
+| Aggregates | `LISTAGG` (with `WITHIN GROUP` and `DISTINCT`), `COUNT(DISTINCT a, b)`, `MEDIAN`, `MODE`, `APPROX_COUNT_DISTINCT` and `HLL` (of one or more values), `HLL_ACCUMULATE`, `HLL_COMBINE`, `HLL_ESTIMATE`, `APPROX_PERCENTILE`, `APPROX_TOP_K`, `BOOLAND_AGG`, `BOOLOR_AGG`, `BITAND_AGG`, `BITOR_AGG`, `BITXOR_AGG`, `SKEW`, `VARIANCE_POP`, `VARIANCE_SAMP` |
+| Windows | `RATIO_TO_REPORT`, `CONDITIONAL_TRUE_EVENT`, `IGNORE NULLS` after `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` |
+| Generators | `SEQ1`, `SEQ2`, `SEQ4`, `SEQ8` with `TABLE(GENERATOR(ROWCOUNT => n))`, `TABLE(SPLIT_TO_TABLE(s, sep))` |
+| Context | `CURRENT_USER`, `CURRENT_ROLE`, `CURRENT_DATABASE`, `CURRENT_SCHEMA`, `CURRENT_VERSION`; `CURRENT_WAREHOUSE`, `CURRENT_ACCOUNT`, `CURRENT_SESSION`, `CURRENT_REGION` and similar return `NULL` |
+
+Functions not listed whose name and meaning DuckDB shares (`ABS`, `UPPER`,
+`COALESCE`, `SUM`, `ROW_NUMBER` and most others) pass as written.
+
+### Syntax
+
+- `QUALIFY`, `MINUS` (as `EXCEPT`), `SELECT TOP n`, `FROM VALUES (...)`
+  with columns `COLUMN1`, `COLUMN2`..., `SAMPLE` and `TABLESAMPLE` (`BERNOULLI`,
+  `ROW`, `SYSTEM`, `BLOCK`, `n ROWS`, `SEED`/`REPEATABLE`), `PIVOT` with a
+  list of values and `UNPIVOT`, named as Snowflake names their columns,
+  `* EXCLUDE`, `* RENAME`, `* REPLACE`, `* ILIKE`.
+- `ASOF JOIN ... MATCH_CONDITION (...) [ON ...]`, which keeps the left
+  rows without a match, as Snowflake does. `DIRECTED` joins.
+- `WITH` whose CTE refers to itself, without `RECURSIVE`.
+- `ORDER BY` puts NULLs last ascending and first descending, as Snowflake
+  does, in queries, windows and `WITHIN GROUP`.
+- Time travel with `AT (TIMESTAMP => ...)` and `AT (OFFSET => -seconds)`,
+  the table's alias written after it as Snowflake does.
+
+### Types
+
+| Snowflake | Igloo |
+|---|---|
+| `NUMBER`, `DECIMAL`, `NUMERIC` (default `(38,0)`) | `DECIMAL(p,s)` |
+| `INT`, `INTEGER`, `BIGINT`, `SMALLINT`, `TINYINT`, `BYTEINT` | `BIGINT` |
+| `FLOAT`, `FLOAT4`, `FLOAT8`, `DOUBLE`, `DOUBLE PRECISION`, `REAL` | `DOUBLE` |
+| `VARCHAR(n)`, `STRING`, `TEXT`, `CHAR(n)` | `VARCHAR` |
+| `BINARY`, `VARBINARY` | `BLOB` |
+| `DATE`, `TIME` | `DATE`, `TIME` |
+| `TIMESTAMP`, `TIMESTAMP_NTZ`, `DATETIME` | `TIMESTAMP` |
+| `TIMESTAMP_LTZ`, `TIMESTAMP_TZ` | `TIMESTAMPTZ` |
+| `VARIANT`, `OBJECT`, `ARRAY` | `JSON` |
+| `GEOGRAPHY`, `GEOMETRY` | `GEOMETRY` |
+
+### Statements
+
+- `CREATE [OR REPLACE] [TRANSIENT | TEMPORARY | VOLATILE] TABLE`, with
+  Snowflake's types; `CLUSTER BY`, `DATA_RETENTION_TIME_IN_DAYS` and similar
+  options are accepted and ignored with a notice, `COPY GRANTS` silently
+  (Igloo keeps a replaced table's grants as Snowflake's `COPY GRANTS`
+  would). `COMMENT = '...'` is ignored with a notice: use `COMMENT ON`.
+- `CREATE [OR REPLACE] [SECURE] VIEW` (`SECURE` ignored with a notice),
+  `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `ALTER TABLE ...
+  CLUSTER BY` (ignored), `DESC[RIBE] TABLE`, `USE DATABASE`, `USE SCHEMA`.
+- `USE WAREHOUSE`, `USE ROLE` and `GRANT USAGE ON DATABASE | SCHEMA |
+  WAREHOUSE` change nothing and say so in a notice. `GRANT ... TO ROLE r`
+  and `GRANT ROLE r TO USER u` are Igloo's `GRANT`.
+- `ALTER SESSION SET`: `TIMEZONE` and `STATEMENT_TIMEOUT_IN_SECONDS` set
+  Igloo's settings, `QUERY_TAG` the [query tag](sql.md#query-tags-and-role-settings);
+  `WEEK_START`, `WEEK_OF_YEAR_POLICY`, `TIMESTAMP_TYPE_MAPPING` and the
+  input formats are accepted at the values Igloo follows (`0`,
+  `TIMESTAMP_NTZ`, `AUTO`) and refused at others; parameters about
+  clients, caching and queuing change nothing. `ALTER SESSION UNSET`
+  resets them.
+
+## Known differences
+
+What Igloo cannot reproduce exactly, and what it does instead.
+
+**Numbers**
+
+- `/` returns `DOUBLE`. Snowflake returns a `NUMBER` with up to 6 more
+  decimal digits, rounded: `1/3*3` is `1` in Igloo, `0.999999` in
+  Snowflake. Cast to `NUMBER(p,s)` where the scale matters.
+- Division by zero returns `Infinity` (`NULL` for `//`); Snowflake fails.
+  Use `DIV0` or `DIV0NULL` to get the same result in both.
+- Integer types are `BIGINT`, not `NUMBER(38,0)`: arithmetic that leaves
+  64 bits fails with an overflow error where Snowflake's 38 digits would
+  hold it.
+
+**Semi-structured data**
+
+- A JSON `null` read by a path is SQL `NULL` when sent to a client;
+  Snowflake shows `null`. `ARRAY_CONSTRUCT(1, NULL)` shows `[1,null]`,
+  where Snowflake shows `[1, undefined]`.
+- A path's value used where a string is expected (`v:a = 'x'`, `UPPER(v:a)`)
+  is the string itself; Snowflake compares the variant. The result is the
+  same except for strings that hold JSON numbers or booleans.
+- `ORDER BY`, `MIN` and `MAX` of a path order numbers before strings, each
+  by value; Snowflake orders variants by type, then value, which differs
+  for mixed types.
+- `GROUP BY` a path groups `1` and `1.0` apart.
+- Objects list their keys in alphabetical order, as Snowflake shows them;
+  `OBJECT_CONSTRUCT_KEEP_NULL` and `OBJECT_INSERT` keep `null` values.
+- `ARRAY_INTERSECTION` returns each common value once, without Snowflake's
+  multiset counts.
+- `FLATTEN`'s `SEQ` is `NULL`.
+
+**Dates and times**
+
+- Sessions start in UTC; Snowflake's in `America/Los_Angeles` unless the
+  account sets another. `ALTER SESSION SET TIMEZONE = '...'` sets it.
+- `TIMESTAMP_TZ` is stored as an instant (`TIMESTAMPTZ`) and shown in the
+  session's time zone: the offset it was written with is not kept.
+- `CONVERT_TIMEZONE(target, ts)` with two arguments returns the wall-clock
+  time in `target` without a zone (`TIMESTAMP`), not a `TIMESTAMP_TZ`.
+- Times and timestamps have microseconds; nanoseconds are truncated.
+- `DATEADD`, `DATE_TRUNC` and similar keep a `DATE` a `DATE`, as Snowflake
+  does, except when the date is an aggregate or window function other than
+  `MIN`, `MAX`, `ANY_VALUE`, `FIRST_VALUE`, `LAST_VALUE`, `LAG` and `LEAD`,
+  or a statement parameter: then the result is a `TIMESTAMP` at midnight.
+- Weeks start on Monday and `DAYOFWEEK` counts from Sunday = 0, as with
+  Snowflake's defaults (`WEEK_START = 0`); other `WEEK_START` values are
+  refused.
+
+**Other functions**
+
+- `HASH` returns DuckDB's 64-bit hash: as well distributed as Snowflake's,
+  but different values. Do not compare them with hashes Snowflake stored.
+- `RANDOM(seed)` and `UNIFORM(..., RANDOM(seed))` ignore the seed (with a
+  notice); `SAMPLE ... SEED (n)` repeats.
+- `APPROX_COUNT_DISTINCT`, `HLL` and `APPROX_PERCENTILE` are approximate
+  with DuckDB's algorithms, so their results differ from Snowflake's within
+  the error of each. `APPROX_TOP_K` counts exactly.
+- `MODE` chooses among equally frequent values differently.
+- `CURRENT_ROLE()` returns the user's name; `CURRENT_WAREHOUSE()`,
+  `CURRENT_ACCOUNT()` and the like return `NULL`.
+
+**Performance**
+
+- A statement whose translation calls one of the `sf_` macros (`DATEADD`,
+  `DATE_TRUNC`, `TO_DATE`, `TIME_SLICE` and others that keep a date's type)
+  runs on one machine: [distributed
+  execution](distributed-execution.md#what-runs-distributed) does not
+  split statements that call macros.
+
+**Names and catalog**
+
+- Identifiers are case-insensitive even when quoted: `"col"` and `COL` name
+  the same column, where Snowflake would see two.
+- Views run with their reader's privileges, as Igloo's always do; `SECURE`
+  does not hide their definition.
+- `information_schema` and `SHOW` are DuckDB's: their columns and rows
+  differ from Snowflake's. Igloo's own [catalog views](catalog.md) list
+  tables, columns and their usage.
+
+## Refused
+
+These fail with SQLSTATE `0A000` and a hint:
+
+- Stages (`@stage`, `CREATE STAGE`, `PUT`, `GET`, `LIST`, `REMOVE`): load
+  files with `COPY INTO` from a location in `IGLOO_ALLOWED_LOCATIONS` (see
+  [loading data](loading.md)).
+- Snowflake Scripting (`BEGIN ... END`, `DECLARE`, `EXECUTE IMMEDIATE`,
+  `CALL`) and `CREATE FUNCTION` or `PROCEDURE`: send the statements one at a
+  time; admins can create DuckDB macros.
+- `INSERT OVERWRITE`, `INSERT ALL` and `INSERT FIRST`; `ALTER TABLE ... SWAP
+  WITH`; `UNDROP`; `CREATE DATABASE`, `WAREHOUSE`, `SEQUENCE`, `STREAM` and
+  `DYNAMIC TABLE`; `AUTOINCREMENT` and `IDENTITY` columns; `COLLATE`.
+- `CONNECT BY`, the `(+)` outer join, `MATCH_RECOGNIZE`, `CHANGES`,
+  `BEFORE (...)` and `AT (STATEMENT => ...)`, `RESULT_SCAN`, `SEMANTIC_VIEW`
+  and model methods (`model!PREDICT`).
+- `PIVOT ... IN (ANY)`, `IN (SELECT ...)` and `DEFAULT ON NULL`: list the
+  values.
+- `OBJECT_CONSTRUCT(*)` and `{*}`: name the keys and values.
+- Functions without a faithful translation, such as `OBJECT_DELETE`,
+  `OBJECT_PICK`, `ARRAY_SORT`, `ARRAY_FLATTEN`, `PARSE_XML`, `SOUNDEX`,
+  `CONDITIONAL_CHANGE_EVENT`, `ENCRYPT` and `DECRYPT`, `REGEXP_REPLACE`
+  of one occurrence after the first, `SHA2` of other than 256 bits, and
+  arguments Igloo must know when it translates (a format, a date part or a
+  scale) given as expressions rather than literals.
+- `VECTOR` columns: store embeddings as `ARRAY` or `FLOAT` columns.
+- Session parameters at values Igloo does not follow (`WEEK_START = 1`,
+  `TIMESTAMP_TYPE_MAPPING = TIMESTAMP_LTZ` and the like).
+
+Functions Igloo does not know at all pass through, and DuckDB reports them
+as unknown (SQLSTATE `42883`).

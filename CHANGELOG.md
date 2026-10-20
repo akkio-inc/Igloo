@@ -54,6 +54,25 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Java's Iceberg does: iceberg-go dropped every one older than the snapshot
   retention, seven days by default, a clone's too. A max-ref-age-ms of
   Java's `Long.MAX_VALUE` reads as forever.
+- Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
+  'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
+  `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...
+  SET sql_dialect`). Igloo translates each statement to DuckDB's dialect
+  before it checks and runs it, so the checks of grants and policies see
+  only the DuckDB statement: Snowflake's string escapes, `$$` strings and
+  `//` comments, session variables (`SET x = ...`, `$x`), `IDENTIFIER()`,
+  semi-structured paths (`v:a.b[0]::string`), `FLATTEN`, `SPLIT_TO_TABLE`,
+  `GENERATOR`, `QUALIFY`, `MINUS`, `TOP`, `SAMPLE`, `PIVOT`, `ASOF JOIN ...
+  MATCH_CONDITION`, `LIKE ANY`, Snowflake's types, `CREATE OR REPLACE
+  TRANSIENT TABLE ... CLUSTER BY` (ignored with a notice), `ALTER SESSION`
+  parameters, NULL ordering, result column names in upper case, and some
+  200 functions (`IFF`, `NVL`, `DECODE`, `DATEADD`, `DATEDIFF`,
+  `DATE_TRUNC` keeping dates dates, `TO_CHAR` and `TO_DATE` with
+  Snowflake's formats, `TRY_` conversions, `LISTAGG`, `ARRAY_AGG`,
+  `OBJECT_CONSTRUCT`, `PARSE_JSON`, the `REGEXP_` family, `TIME_SLICE` and
+  more). Constructs it cannot translate faithfully are refused with
+  SQLSTATE `0A000` and a hint; docs/snowflake-sql.md lists what is
+  translated, the known differences and what is refused.
 
 ### Loading and scheduling
 
@@ -714,6 +733,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A `JSON` value that is a string, such as `'"abc"'::JSON` or
+  `json_extract(v, '$.name')`, reached PostgreSQL clients without its
+  quotes (`abc`), so a client could not tell it from a number or `true`.
+  It is now sent as JSON text (`"abc"`).
 - A write could land twice, with the first copy's data file deleted, when
   the catalog applied a commit but answered with an error or not at all
   (seen under heavy load as a 503). DuckDB sent the commit again, the

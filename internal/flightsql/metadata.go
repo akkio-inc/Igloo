@@ -166,6 +166,7 @@ func (sess *session) tableSchemas(ctx context.Context, cols [][]any) (map[[3]any
 // arrowTypes returns the Arrow types DuckDB gives values of the SQL types
 // named in types.
 func (sess *session) arrowTypes(ctx context.Context, types []string) ([]arrow.DataType, error) {
+	ctx = pgwire.WithIglooSQL(ctx) // DuckDB's type names, whatever the session's dialect
 	out := make([]arrow.DataType, len(types))
 	for i := range out {
 		out[i] = arrow.BinaryTypes.String
@@ -304,6 +305,8 @@ func (f *filter) where() string {
 // query runs a metadata query in the session and returns its rows, each
 // value a string in PostgreSQL's text format or nil.
 func (sess *session) query(ctx context.Context, sql string, args ...any) ([][]any, error) {
+	// Igloo's own SQL, read as DuckDB's whatever the session's sql_dialect.
+	ctx = pgwire.WithIglooSQL(ctx)
 	var out collect
 	err := sess.metadata(ctx, func(es *pgwire.EmbeddedSession) error {
 		ps, err := es.Prepare(ctx, sql)
