@@ -132,7 +132,9 @@ reaching other servers). So:
 - **A new connection** is attached by each replica when it next starts.
   Restart the replicas after `CREATE CONNECTION`: `docker compose restart
   igloo` on one machine, `kubectl rollout restart deployment/igloo` on
-  Kubernetes. A replica scaled to zero attaches it when it resumes.
+  Kubernetes. A replica scaled to zero attaches it when it resumes. A
+  replica of an older version leaves out a connection of a type it does
+  not know, such as `snowflake`; upgrade every replica before creating one.
 - **Host, port, user, password, TLS and timeouts** (`ALTER CONNECTION ...
   SET`) apply at once on the replica that ran it and within 15 seconds on the
   others, without a restart. Sessions with the database are signed in again

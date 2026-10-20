@@ -437,12 +437,45 @@ func TestSnowflakeDown(t *testing.T) {
 	if err := store.Create(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
+	// A connection of a type this version does not know, as a newer Igloo
+	// sharing the metadata database could make now that the table no
+	// longer limits the types, is left out too, without signing in to its
+	// host as if it were a PostgreSQL database (as replicas of the version
+	// before Snowflake leave out a Snowflake connection).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close() //nolint:errcheck
+	dialed := make(chan struct{}, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			dialed <- struct{}{}
+			_ = c.Close()
+		}
+	}()
+	future := New("future", Type("bigquery"))
+	future.Host, future.Port, future.Database, future.User, future.Password = "127.0.0.1", ln.Addr().(*net.TCPAddr).Port, "db", "u", "pw"
+	future.TLS = TLSDisable
+	if err := store.Create(context.Background(), future); err != nil {
+		t.Fatal(err)
+	}
+
 	m, eng := startEngine(t, store)
 	if _, ok := m.Catalogs()["sf"]; ok {
 		t.Fatal("attached")
 	}
+	if _, ok := m.Catalogs()["future"]; ok {
+		t.Fatal("a connection of an unknown type was attached")
+	}
+	select {
+	case <-dialed:
+		t.Error("Igloo connected to the host of a connection of an unknown type")
+	case <-time.After(200 * time.Millisecond):
+	}
 	st, err := m.List(context.Background())
-	if err != nil || len(st) != 1 || st[0].State != "failed" || !strings.Contains(st[0].Detail, "no route to host") {
+	if err != nil || len(st) != 2 || st[0].State != "failed" || !strings.Contains(st[0].Detail, `unsupported type "bigquery"`) ||
+		st[1].State != "failed" || !strings.Contains(st[1].Detail, "no route to host") {
 		t.Errorf("%+v %v", st, err)
 	}
 	expect(t, eng, "SELECT 42", "42")
