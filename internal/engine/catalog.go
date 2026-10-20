@@ -193,14 +193,15 @@ func (e *Engine) registerCatalog(ctx context.Context) error {
 	// information_schema.schemata and information_schema.tables with the
 	// owners, comments and sizes DuckDB does not know of, and the columns
 	// Snowflake has for them; queries of those views read these instead.
-	// The catalog's views are listed under the local database.
+	// The catalog's views are listed under the local database. The catalog's
+	// comment comes first: a comment DuckDB holds can be one replaced since.
 	stmts = append(stmts,
 		"CREATE OR REPLACE VIEW "+schema+"."+ident(InformationSchemaView("schemata"))+` AS
 			SELECT s.* REPLACE (coalesce(o.schema_owner, s.schema_owner) AS schema_owner), o.comment
 			FROM system.information_schema.schemata s
 			LEFT JOIN system.main.igloo_schemata() o ON o.catalog_name = s.catalog_name AND o.schema_name = s.schema_name`,
 		"CREATE OR REPLACE VIEW "+schema+"."+ident(InformationSchemaView("tables"))+` AS
-			SELECT t.* REPLACE (coalesce(t.TABLE_COMMENT, o.comment) AS TABLE_COMMENT),
+			SELECT t.* REPLACE (coalesce(o.comment, t.TABLE_COMMENT) AS TABLE_COMMENT),
 				o.table_owner, o.comment, o.row_count, o.bytes, o.last_altered
 			FROM system.information_schema.tables t
 			LEFT JOIN system.main.igloo_tables() o ON o.table_schema = t.table_schema AND o.table_name = t.table_name

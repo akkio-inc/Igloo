@@ -602,9 +602,16 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 			true AS indisvalid, false AS indcheckxmin, true AS indisready, true AS indislive, false AS indisreplident,
 			[]::SMALLINT[] AS indkey, []::BIGINT[] AS indcollation, []::BIGINT[] AS indclass,
 			[]::SMALLINT[] AS indoption, NULL::VARCHAR AS indexprs, NULL::VARCHAR AS indpred WHERE false`,
-		`CREATE OR REPLACE TEMP VIEW pg_information_schema_columns AS SELECT * REPLACE (
-			'pg_catalog' AS udt_schema, (SELECT typname FROM pg_type WHERE oid = (` + pgTypeOID + `)) AS udt_name)
-			FROM information_schema.columns`,
+		// Column comments too, which DuckDB does not read from Iceberg
+		// metadata, as information_schema.tables has table comments (see
+		// engine.InformationSchemaView). The catalog's comment comes first:
+		// a comment DuckDB holds can be one replaced since.
+		`CREATE OR REPLACE TEMP VIEW pg_information_schema_columns AS SELECT c.* REPLACE (
+			'pg_catalog' AS udt_schema, (SELECT typname FROM pg_type WHERE oid = (` + pgTypeOID + `)) AS udt_name,
+			coalesce(k.comment, c.column_comment) AS column_comment)
+			FROM information_schema.columns c
+			LEFT JOIN system.main.igloo_comments() k ON k.table_catalog = c.table_catalog AND k.table_schema = c.table_schema
+				AND k.table_name = c.table_name AND k.column_name = c.column_name`,
 		// Metabase's row count estimates; Iceberg tables have none here.
 		`CREATE OR REPLACE TEMP VIEW pg_stat_user_tables AS SELECT 0::BIGINT AS relid, ''::VARCHAR AS schemaname,
 			''::VARCHAR AS relname, 0::BIGINT AS seq_scan, 0::BIGINT AS idx_scan, 0::BIGINT AS n_live_tup,

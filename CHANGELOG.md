@@ -27,8 +27,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   stored as Iceberg views and kept in sync across replicas. Replacing a view
   may change its columns and the tables it reads.
 - `COMMENT ON TABLE`, `VIEW` and `COLUMN`, stored as Iceberg metadata and
-  shown through `obj_description`, `col_description`, `pg_description` and
-  `igloo_comments()`.
+  shown through `obj_description`, `col_description`, `pg_description`,
+  `igloo_comments()`, and `information_schema.tables` and `.columns`.
 - SQL cursors (`DECLARE`, `FETCH`, `CLOSE`) and array parameters, so
   psycopg's server-side cursors and Ibis's PostgreSQL backend work.
 - Zero-copy clones, with Snowflake's syntax: `CREATE [OR REPLACE] TABLE

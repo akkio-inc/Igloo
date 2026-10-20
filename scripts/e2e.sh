@@ -552,6 +552,10 @@ expect_error "reader cannot comment" 42501 rita rita-password-1 "COMMENT ON TABL
 expect "comments in obj_description and col_description" "Test rows | :tag:e2e|In dollars" rita rita-password-1 \
   "SELECT obj_description(c.oid, 'pg_class'), col_description(c.oid, a.attnum)
    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'e2e' AND a.attname = 'amount'"
+expect "and in information_schema, for every session" "Test rows | :tag:e2e|In dollars" rita rita-password-1 \
+  "SELECT t.table_comment, c.column_comment FROM information_schema.tables t
+   JOIN information_schema.columns c USING (table_catalog, table_schema, table_name)
+   WHERE t.table_name = 'e2e' AND c.column_name = 'amount'"
 
 echo "grants"
 expect "a user with no role of their own, and a custom role" "CREATE ROLE
