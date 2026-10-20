@@ -14,6 +14,15 @@ type Option func(*options)
 type options struct {
 	beforeLockdown []func(context.Context, *duckdb.Conn) error
 	catalogProxy   []func(*catalogproxy.Options)
+	sandbox        []func() []string
+}
+
+// SandboxDirectories adds the locations f returns, when the sandbox is
+// locked, to those SQL may read: the locations of the tables of the Iceberg
+// REST catalogs attached as connections (package federation), which
+// BeforeLockdown found. Each must end in a slash.
+func SandboxDirectories(f func() []string) Option {
+	return func(o *options) { o.sandbox = append(o.sandbox, f) }
 }
 
 // BeforeLockdown runs f on the setup connection once storage and the
@@ -37,4 +46,13 @@ func beforeLockdown(ctx context.Context, conn *duckdb.Conn, o options) error {
 		}
 	}
 	return nil
+}
+
+// sandboxDirs returns the locations SandboxDirectories added.
+func (o options) sandboxDirs() []string {
+	var out []string
+	for _, f := range o.sandbox {
+		out = append(out, f()...)
+	}
+	return out
 }

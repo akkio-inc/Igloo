@@ -46,6 +46,83 @@ var connectionScanNodes = map[string]string{"postgres_scan": "postgres", "mysql_
 // type and its table's name, lower-cased.
 type connectionScan struct{ kind, table string }
 
+// icebergKind is the kind of the scans of tables of connections to Iceberg
+// REST catalogs. DuckDB's plan shows them as ICEBERG_SCAN, as it shows the
+// catalog's own tables and iceberg_scan calls, without the table's name:
+// those are counted together (see splitScans), and grants decide which
+// tables the names in the statement may mean.
+const icebergKind = "iceberg"
+
+// splitScans returns the scans of connections' tables that the plan names,
+// and how many of Iceberg REST catalogs' tables there are besides.
+func splitScans(scans []connectionScan) (named []connectionScan, iceberg int) {
+	for _, s := range scans {
+		if s.kind == icebergKind {
+			iceberg++
+		} else {
+			named = append(named, s)
+		}
+	}
+	return named, iceberg
+}
+
+// icebergConnections reports whether a connection to an Iceberg REST
+// catalog is attached.
+func (s *Server) icebergConnections() bool {
+	for _, t := range s.connectionCatalogs() {
+		if t == icebergKind {
+			return true
+		}
+	}
+	return false
+}
+
+// tableArgCalls checks the table functions that take a table, such as
+// iceberg_metadata(crm.public.t), for a user whose role reads the catalog:
+// those that name a table of a connection are refused, since they would
+// read it without its grants being checked, and iceberg_scan calls are
+// counted, as their scans look like those of tables (see readSet.lake).
+func (r *resolver) tableArgCalls(calls []fnRef, view *object, rs *readSet) error {
+	for _, f := range calls {
+		name := strings.ToLower(f.name)
+		if !tableArgFunctions[name] || f.schema != "" && !strings.EqualFold(f.schema, "main") {
+			continue
+		}
+		if name == "iceberg_scan" {
+			rs.icebergFns++
+		}
+		if len(f.args) == 0 {
+			continue
+		}
+		arg, _ := f.args[0].(map[string]any)
+		if str(arg["class"]) != "COLUMN_REF" {
+			// A file, which the checks of files confine.
+			continue
+		}
+		var parts []string
+		for _, p := range asList(arg["column_names"]) {
+			parts = append(parts, str(p))
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		if len(parts) == 1 && r.isConnection(parts[0]) {
+			return denied("%s on connection %s needs the admin role", f.name, parts[0])
+		}
+		res, err := r.resolve(tableRef{parts: parts}, view)
+		if err != nil {
+			return err
+		}
+		for _, o := range res.all {
+			if r.isConnection(o.db) {
+				return denied("%s on %s, a table of connection %s, needs the admin role; query the table instead", f.name,
+					strings.Join(parts, "."), strings.ToLower(o.db))
+			}
+		}
+	}
+	return nil
+}
+
 // sameScans reports whether two lists hold the same scans, in any order.
 func sameScans(a, b []connectionScan) bool {
 	key := func(s connectionScan) string { return s.kind + "\x00" + s.table }
@@ -208,7 +285,10 @@ func (s *Server) connectionReads(ctx context.Context, sess *session, planText, p
 	if err != nil {
 		return nil, err
 	}
-	if len(scans.connections) == 0 {
+	// With connections to Iceberg REST catalogs, a scan of Iceberg may be
+	// one of theirs, and a table function may name one of their tables.
+	iceberg := s.icebergConnections()
+	if len(scans.connections) == 0 && (!iceberg || scans.iceberg == 0 && scans.tableFns == 0 && !mentionsTableArgFunction(parseText)) {
 		return nil, nil
 	}
 	if parseText == "" {
@@ -223,11 +303,52 @@ func (s *Server) connectionReads(ctx context.Context, sess *session, planText, p
 	if err != nil {
 		return nil, err
 	}
-	if !sameScans(reads.connScans, scans.connections) {
+	named, ice := splitScans(reads.connScans)
+	if !sameScans(named, scans.connections) {
 		return nil, denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
-			len(scans.connections), len(reads.connScans))
+			len(scans.connections), len(named))
+	}
+	if iceberg && reads.lake+reads.icebergFns+ice != scans.iceberg+len(scans.named) {
+		return nil, denied("cannot verify which tables of connections this statement reads (the plan scans %d Iceberg tables, the statement names %d)",
+			scans.iceberg+len(scans.named), reads.lake+reads.icebergFns+ice)
 	}
 	return reads.connObjects, nil
+}
+
+// guardTableArgs refuses, before DuckDB prepares a statement of a user who
+// is not an admin, a call of a table function that takes a table
+// (iceberg_scan, iceberg_metadata, iceberg_snapshots) on a table of a
+// connection: DuckDB reads the table's metadata, through the connection,
+// while it prepares the call. The statement's checks after it is prepared
+// find such calls in the views it reads too (see tableArgCalls).
+func (s *Server) guardTableArgs(ctx context.Context, sess *session, user auth.User, query string) error {
+	if user.Role == auth.RoleAdmin || len(s.connectionCatalogs()) == 0 || !mentionsTableArgFunction(query) {
+		return nil
+	}
+	r, err := s.newResolver(ctx, sess)
+	if err != nil {
+		return err
+	}
+	ast, err := r.serialize(query)
+	if err != nil {
+		// Not a query DuckDB serializes; its checks after preparing apply.
+		return nil
+	}
+	w := &astWalk{}
+	w.walk(ast, nil)
+	var rs readSet
+	return r.tableArgCalls(w.tableFunctions, nil, &rs)
+}
+
+// mentionsTableArgFunction reports whether text may call a table function
+// that takes a table (see tableArgFunctions).
+func mentionsTableArgFunction(text string) bool {
+	for _, w := range sqllex.CodeWords(text) {
+		if tableArgFunctions[strings.ToLower(w)] {
+			return true
+		}
+	}
+	return false
 }
 
 // connectionTexts decides what to EXPLAIN for a statement's reads and what to

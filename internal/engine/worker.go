@@ -64,7 +64,7 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if err := e.setupCache(exec, cfg, log); err != nil {
 		return err
 	}
-	return e.lockDown(exec, cfg)
+	return e.lockDown(exec, cfg, nil)
 }
 
 // Threads returns the number of threads DuckDB runs queries on.

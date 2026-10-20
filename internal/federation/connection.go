@@ -1,8 +1,9 @@
 // Package federation lets Igloo query other databases where they are. An
-// admin registers a connection to a PostgreSQL, MySQL or Snowflake database
-// with CREATE CONNECTION, and every replica attaches it, read-only, as a
-// catalog of the same name, so that crm.public.customers can be joined with
-// Iceberg tables without copying it first.
+// admin registers a connection to a PostgreSQL, MySQL or Snowflake database,
+// or to another Iceberg REST catalog, with CREATE CONNECTION, and every
+// replica attaches it, read-only, as a catalog of the same name, so that
+// crm.public.customers can be joined with Iceberg tables without copying it
+// first.
 //
 // DuckDB's postgres and mysql extensions do the reading and push filters
 // and column lists down to the remote database. They never see the remote
@@ -11,7 +12,10 @@
 // connection's current settings whenever DuckDB opens a connection to it.
 // That is how a connection's host and credentials change without a
 // restart, how a remote database that stops answering is cut off, and why
-// the credentials appear nowhere DuckDB could show them.
+// the credentials appear nowhere DuckDB could show them. Connections to
+// Iceberg REST catalogs work the same way through an HTTP proxy of their
+// own (iceberg.go), which also decides which storage locations DuckDB's
+// sandbox lets their tables be read from.
 //
 // Snowflake speaks neither protocol. A Snowflake connection is attached
 // with the postgres extension too, through a gateway (sfgateway.go) that
@@ -49,11 +53,15 @@ const (
 	Postgres  Type = "postgres"
 	MySQL     Type = "mysql"
 	Snowflake Type = "snowflake"
+	// Iceberg is another Iceberg REST catalog: Snowflake's Horizon
+	// Catalog, Databricks' Iceberg shares and Unity Catalog, Apache
+	// Polaris, AWS Glue and S3 Tables, another Lakekeeper.
+	Iceberg Type = "iceberg"
 )
 
 // Types are the connection types Igloo supports, in the order docs list
 // them.
-var Types = []Type{Postgres, MySQL, Snowflake}
+var Types = []Type{Postgres, MySQL, Snowflake, Iceberg}
 
 // ParseType validates a connection type.
 func ParseType(s string) (Type, error) {
@@ -64,8 +72,10 @@ func ParseType(s string) (Type, error) {
 		return MySQL, nil
 	case Snowflake:
 		return Snowflake, nil
+	case Iceberg:
+		return Iceberg, nil
 	}
-	return "", fmt.Errorf("unsupported connection type %q; use postgres, mysql or snowflake", s)
+	return "", fmt.Errorf("unsupported connection type %q; use postgres, mysql, snowflake or iceberg", s)
 }
 
 // defaultPort is the usual port of each type.
@@ -98,6 +108,20 @@ const (
 // verify-full.
 func (c Connection) TLSWarning() string {
 	const use = "; use tls 'verify-full', with tls_ca if the server's certificate is not signed by an authority the system trusts"
+	if c.Type == Iceberg {
+		switch c.TLS {
+		case TLSDisable:
+			return fmt.Sprintf("connection %s does not use TLS: its credentials, the storage credentials the catalog hands out "+
+				"and the tables' metadata cross the network unencrypted; use an https endpoint", c.Name)
+		case TLSPrefer:
+			return fmt.Sprintf("connection %s does not check the catalog's certificate: anyone on the network path could pose as the catalog "+
+				"and read its credentials%s", c.Name, use)
+		case TLSRequire, TLSVerifyCA:
+			return fmt.Sprintf("connection %s checks that the catalog's certificate is signed by a trusted authority, but not that it was issued "+
+				"for %s: a server with another certificate from that authority could pose as it%s", c.Name, c.Host, use)
+		}
+		return ""
+	}
 	switch c.TLS {
 	case TLSDisable:
 		return fmt.Sprintf("connection %s does not use TLS: its password and data cross the network unencrypted%s", c.Name, use)
@@ -132,6 +156,11 @@ const (
 	defaultConnectTimeout = 10 * time.Second
 	defaultQueryTimeout   = 5 * time.Minute
 	maxConnectTimeout     = 5 * time.Minute
+	// defaultCatalogTimeout is how long an Iceberg REST catalog may take
+	// to answer one request. DuckDB gives up on a request after 30
+	// seconds (http_timeout) and sends it again, so the proxy answers
+	// first.
+	defaultCatalogTimeout = 25 * time.Second
 )
 
 // Connection is a registered connection to another database.
@@ -139,6 +168,8 @@ type Connection struct {
 	// Name is what the database is called in SQL: its catalog name.
 	Name string
 	Type Type
+	// Host and Port are the database server's, or for TYPE iceberg the
+	// catalog endpoint's (see IcebergSettings.Endpoint).
 	Host string
 	Port int
 	// Database is the remote database. For MySQL it is the default schema.
@@ -180,6 +211,10 @@ type Connection struct {
 	PrivateKey       string
 	PrivateKeySecret string
 
+	// Iceberg holds the settings of connections of TYPE iceberg, and is
+	// empty for the others.
+	Iceberg IcebergSettings
+
 	// Unusable says why Igloo cannot sign in with this connection, such as
 	// a stored password that does not decrypt; empty normally.
 	Unusable string
@@ -194,15 +229,20 @@ type Connection struct {
 
 // New returns a connection called name of type t with the defaults set.
 func New(name string, t Type) Connection {
-	return Connection{
+	c := Connection{
 		Name: name, Type: t, Port: t.defaultPort(), TLS: TLSVerifyFull,
 		ConnectTimeout: defaultConnectTimeout, QueryTimeout: defaultQueryTimeout,
 	}
+	if t == Iceberg {
+		c.Port, c.QueryTimeout = 0, defaultCatalogTimeout
+	}
+	return c
 }
 
 // Options are the names CREATE and ALTER CONNECTION accept in WITH (...),
-// with the libpq and MySQL spellings people are used to. readOnly is only
-// accepted as true.
+// with the libpq and MySQL spellings people are used to, and for Iceberg
+// REST catalogs the names Spark and PyIceberg give their catalog
+// properties. readOnly is only accepted as true.
 var optionNames = map[string]string{
 	"host": "host", "port": "port",
 	"database": "database", "dbname": "database", "db": "database",
@@ -210,11 +250,18 @@ var optionNames = map[string]string{
 	"password": "password", "password_secret": "password_secret",
 	"tls": "tls", "sslmode": "tls", "ssl_mode": "tls",
 	"tls_ca": "tls_ca",
-	"schema": "schema", "schemas": "schema",
+	"schema": "schema", "schemas": "schema", "namespace": "schema", "namespaces": "schema",
 	"connect_timeout": "connect_timeout", "query_timeout": "query_timeout",
 	"read_only": "read_only",
 	"account":   "account", "warehouse": "warehouse", "role": "role",
 	"private_key": "private_key", "private_key_secret": "private_key_secret",
+
+	"endpoint": "endpoint", "uri": "endpoint",
+	"token": "token", "token_secret": "token_secret",
+	"credential": "credential", "credential_secret": "credential_secret",
+	"oauth2_server_uri": "oauth2_server_uri", "scope": "scope", "signing_name": "signing_name",
+	"storage_credential": "storage_credential", "storage_credential_secret": "storage_credential_secret",
+	"storage_endpoint": "storage_endpoint", "storage_url_style": "storage_url_style", "region": "region",
 }
 
 // snowflakeOnly are the options only Snowflake connections take, and
@@ -224,11 +271,31 @@ var (
 	sqlOnly       = []string{"tls_ca"}
 )
 
+// typeOptions are the options each type takes; the others are refused.
+// warehouse is Snowflake's compute warehouse for TYPE snowflake and the
+// catalog's warehouse for TYPE iceberg.
+var typeOptions = map[Type][]string{
+	Postgres: {"host", "port", "database", "user", "password", "password_secret", "tls", "tls_ca", "schema",
+		"connect_timeout", "query_timeout", "read_only"},
+	MySQL: {"host", "port", "database", "user", "password", "password_secret", "tls", "tls_ca", "schema",
+		"connect_timeout", "query_timeout", "read_only"},
+	Snowflake: {"account", "user", "private_key", "private_key_secret", "password", "password_secret", "warehouse", "role",
+		"database", "schema", "host", "port", "tls", "connect_timeout", "query_timeout", "read_only"},
+	Iceberg: {"endpoint", "warehouse", "token", "token_secret", "credential", "credential_secret", "oauth2_server_uri", "scope", "signing_name",
+		"storage_credential", "storage_credential_secret", "storage_endpoint", "storage_url_style", "region",
+		"tls", "tls_ca", "schema", "connect_timeout", "query_timeout", "read_only"},
+}
+
+// SecretOptions hold credentials, which SQL must write as string literals
+// so that the history's redaction finds them.
+var SecretOptions = []string{"password", "private_key", "token", "credential", "storage_credential"}
+
 // liveOptions take effect on a replica at once. The others change what
 // DuckDB attached, so a replica applies them when it restarts.
 var liveOptions = []string{"host", "port", "user", "password", "password_secret", "tls", "tls_ca",
 	"connect_timeout", "query_timeout", "read_only",
-	"account", "warehouse", "role", "private_key", "private_key_secret"}
+	"account", "warehouse", "role", "private_key", "private_key_secret",
+	"token", "token_secret", "credential", "credential_secret", "oauth2_server_uri", "scope", "signing_name", "region"}
 
 // CanonicalOption returns the option a name stands for, or "".
 func CanonicalOption(name string) string { return optionNames[strings.ToLower(name)] }
@@ -244,8 +311,15 @@ func (c *Connection) Set(name, value string) error {
 	switch {
 	case c.Type == Snowflake && slices.Contains(sqlOnly, option):
 		return fmt.Errorf("option %s does not apply to Snowflake connections", option)
-	case c.Type != Snowflake && slices.Contains(snowflakeOnly, option):
+	case c.Type != Snowflake && c.Type != Iceberg && slices.Contains(snowflakeOnly, option):
 		return fmt.Errorf("option %s applies to Snowflake connections only", option)
+	case option != "" && typeOptions[c.Type] != nil && !slices.Contains(typeOptions[c.Type], option):
+		return fmt.Errorf("option %s does not apply to connections of TYPE %s; use %s", name, c.Type, strings.Join(typeOptions[c.Type], ", "))
+	}
+	if c.Type == Iceberg {
+		if ok, err := c.Iceberg.set(c, option, value); ok {
+			return err
+		}
 	}
 	switch option {
 	case "host":
@@ -313,7 +387,11 @@ func (c *Connection) Set(name, value string) error {
 			return fmt.Errorf("unknown connection option %q; use account, user, private_key, private_key_secret, password, password_secret, "+
 				"warehouse, role, database, schema, host, port, connect_timeout or query_timeout", name)
 		}
-		return fmt.Errorf("unknown connection option %q; use host, port, database, user, password, password_secret, tls, tls_ca, schema, connect_timeout or query_timeout", name)
+		opts := typeOptions[c.Type]
+		if opts == nil {
+			opts = typeOptions[Postgres]
+		}
+		return fmt.Errorf("unknown connection option %q; use %s", name, strings.Join(opts, ", "))
 	}
 	return nil
 }
@@ -343,6 +421,8 @@ func (c *Connection) Validate(taken []string) error {
 		return fmt.Errorf("%q is already the name of a database; choose another name", c.Name)
 	case c.Type == Snowflake:
 		return c.validateSnowflake()
+	case c.Type == Iceberg:
+		return c.validateIceberg()
 	case c.Type != Postgres && c.Type != MySQL:
 		return fmt.Errorf("unsupported connection type %q", c.Type)
 	case c.Account != "" || c.Warehouse != "" || c.Role != "" || c.PrivateKey != "" || c.PrivateKeySecret != "":
@@ -421,8 +501,12 @@ func (c *Connection) ServerHost() string {
 }
 
 // PasswordSource describes where the password or private key comes from,
-// for SHOW CONNECTIONS: never the secret itself.
+// for SHOW CONNECTIONS: never the secret itself. For TYPE iceberg it
+// describes each credential the connection has.
 func (c *Connection) PasswordSource() string {
+	if c.Type == Iceberg {
+		return c.Iceberg.sources()
+	}
 	switch {
 	case c.PasswordSecret != "":
 		return "secret " + c.PasswordSecret
@@ -439,6 +523,9 @@ func (c *Connection) PasswordSource() string {
 // Settings describes the settings particular to c's type, for SHOW
 // CONNECTIONS.
 func (c *Connection) Settings() string {
+	if c.Type == Iceberg {
+		return c.Iceberg.Options()
+	}
 	if c.Type != Snowflake {
 		return ""
 	}
@@ -455,5 +542,10 @@ func (c *Connection) Settings() string {
 // attachedFields are the settings fixed when a replica attaches the
 // connection; see liveOptions.
 func (c Connection) attachedFields() string {
-	return strings.Join([]string{string(c.Type), c.Database, strings.Join(c.Schemas, ",")}, "\x00")
+	fields := []string{string(c.Type), c.Database, strings.Join(c.Schemas, ",")}
+	if c.Type == Iceberg {
+		s := c.Iceberg
+		fields = append(fields, s.Endpoint, s.Warehouse, s.StorageCredential, s.StorageCredentialSecret, s.StorageEndpoint, s.StorageURLStyle)
+	}
+	return strings.Join(fields, "\x00")
 }

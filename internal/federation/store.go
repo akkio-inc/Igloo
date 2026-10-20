@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -136,6 +137,9 @@ var migrations = []string{
 		ADD COLUMN IF NOT EXISTS role_name          text NOT NULL DEFAULT '',
 		ADD COLUMN IF NOT EXISTS private_key        bytea,
 		ADD COLUMN IF NOT EXISTS private_key_secret text NOT NULL DEFAULT ''`,
+	// Settings of TYPE iceberg kept in the clear (storedSettings); their
+	// credentials are sealed in password, as JSON (secretValues).
+	`ALTER TABLE igloo_auth.connections ADD COLUMN IF NOT EXISTS settings jsonb NOT NULL DEFAULT '{}'::jsonb`,
 }
 
 // privateKeyAD is what a stored private key is sealed with, besides the
@@ -189,7 +193,7 @@ func (s *PostgresStore) Close() { s.pool.Close() }
 
 const columns = `name, id, type, host, port, database_name, user_name, password, password_secret, tls, tls_ca,
 	schemas, connect_timeout_ms, query_timeout_ms, account, warehouse, role_name, private_key, private_key_secret,
-	created_by, created_at, updated_at`
+	created_by, created_at, updated_at, settings`
 
 func (s *PostgresStore) List(ctx context.Context) ([]Connection, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+columns+` FROM igloo_auth.connections ORDER BY name`)
@@ -201,11 +205,12 @@ func (s *PostgresStore) List(ctx context.Context) ([]Connection, error) {
 			c                  Connection
 			typ, tls           string
 			sealed, sealedKey  []byte
+			settings           []byte
 			connectMS, queryMS int64
 		)
 		err := row.Scan(&c.Name, &c.ID, &typ, &c.Host, &c.Port, &c.Database, &c.User, &sealed, &c.PasswordSecret,
 			&tls, &c.TLSCA, &c.Schemas, &connectMS, &queryMS, &c.Account, &c.Warehouse, &c.Role, &sealedKey, &c.PrivateKeySecret,
-			&c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
+			&c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &settings)
 		if err != nil {
 			return c, err
 		}
@@ -213,9 +218,10 @@ func (s *PostgresStore) List(ctx context.Context) ([]Connection, error) {
 		c.ConnectTimeout, c.QueryTimeout = time.Duration(connectMS)*time.Millisecond, time.Duration(queryMS)*time.Millisecond
 		// A password or key that does not decrypt leaves the connection
 		// unable to sign in, rather than hiding every connection.
+		var plain string
 		if sealed != nil {
-			if c.Password, err = s.sealer.open(c.Name, sealed); err != nil {
-				c.Password, c.Unusable = "", err.Error()
+			if plain, err = s.sealer.open(c.Name, sealed); err != nil {
+				plain, c.Unusable = "", err.Error()
 			}
 		}
 		if sealedKey != nil {
@@ -223,16 +229,41 @@ func (s *PostgresStore) List(ctx context.Context) ([]Connection, error) {
 				c.PrivateKey, c.Unusable = "", strings.Replace(err.Error(), "password", "private key", 1)
 			}
 		}
+		if c.Type != Iceberg {
+			c.Password = plain
+			return c, nil
+		}
+		// TYPE iceberg: its credentials sealed together, as JSON.
+		var st storedSettings
+		var secrets secretValues
+		if err := json.Unmarshal(settings, &st); err != nil {
+			c.Unusable = "its stored settings are damaged"
+		}
+		if plain != "" && json.Unmarshal([]byte(plain), &secrets) != nil {
+			c.Unusable = "its stored credentials are damaged"
+		}
+		c.Iceberg = st.settings(secrets)
 		return c, nil
 	})
 }
 
-// sealPassword returns the stored form of c's password, or nil.
-func (s *PostgresStore) sealPassword(c Connection) []byte {
-	if c.Password == "" {
-		return nil
+// sealPassword returns the stored form of c's password, or for TYPE
+// iceberg of its credentials, or nil; and the settings kept in the clear.
+func (s *PostgresStore) sealPassword(c Connection) ([]byte, []byte) {
+	plain := c.Password
+	settings := []byte("{}")
+	if c.Type == Iceberg {
+		st, secrets := c.Iceberg.stored()
+		settings, _ = json.Marshal(st)
+		if secrets != (secretValues{}) {
+			b, _ := json.Marshal(secrets)
+			plain = string(b)
+		}
 	}
-	return s.sealer.seal(c.Name, c.Password)
+	if plain == "" {
+		return nil, settings
+	}
+	return s.sealer.seal(c.Name, plain), settings
 }
 
 // sealPrivateKey returns the stored form of c's private key, or nil.
@@ -244,12 +275,13 @@ func (s *PostgresStore) sealPrivateKey(c Connection) []byte {
 }
 
 func (s *PostgresStore) Create(ctx context.Context, c Connection) error {
+	sealed, settings := s.sealPassword(c)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO igloo_auth.connections (`+columns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, now(), now())`,
-			c.Name, newID(), string(c.Type), c.Host, c.Port, c.Database, c.User, s.sealPassword(c), c.PasswordSecret,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, now(), now(), $21)`,
+			c.Name, newID(), string(c.Type), c.Host, c.Port, c.Database, c.User, sealed, c.PasswordSecret,
 			string(c.TLS), c.TLSCA, nonNil(c.Schemas), c.ConnectTimeout.Milliseconds(), c.QueryTimeout.Milliseconds(),
-			c.Account, c.Warehouse, c.Role, s.sealPrivateKey(c), c.PrivateKeySecret, c.CreatedBy)
+			c.Account, c.Warehouse, c.Role, s.sealPrivateKey(c), c.PrivateKeySecret, c.CreatedBy, settings)
 		if err != nil {
 			return err
 		}
@@ -265,14 +297,15 @@ func (s *PostgresStore) Create(ctx context.Context, c Connection) error {
 }
 
 func (s *PostgresStore) Update(ctx context.Context, c Connection) error {
+	sealed, settings := s.sealPassword(c)
 	tag, err := s.pool.Exec(ctx, `UPDATE igloo_auth.connections SET type = $2, host = $3, port = $4,
 			database_name = $5, user_name = $6, password = $7, password_secret = $8, tls = $9, tls_ca = $10,
 			schemas = $11, connect_timeout_ms = $12, query_timeout_ms = $13, account = $14, warehouse = $15,
-			role_name = $16, private_key = $17, private_key_secret = $18, updated_at = now()
+			role_name = $16, private_key = $17, private_key_secret = $18, settings = $19, updated_at = now()
 		WHERE name = $1`,
-		c.Name, string(c.Type), c.Host, c.Port, c.Database, c.User, s.sealPassword(c), c.PasswordSecret,
+		c.Name, string(c.Type), c.Host, c.Port, c.Database, c.User, sealed, c.PasswordSecret,
 		string(c.TLS), c.TLSCA, nonNil(c.Schemas), c.ConnectTimeout.Milliseconds(), c.QueryTimeout.Milliseconds(),
-		c.Account, c.Warehouse, c.Role, s.sealPrivateKey(c), c.PrivateKeySecret)
+		c.Account, c.Warehouse, c.Role, s.sealPrivateKey(c), c.PrivateKeySecret, settings)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}

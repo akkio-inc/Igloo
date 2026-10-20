@@ -204,6 +204,23 @@ reference for every setting mentioned here.
   is refused, as a guard against mistakes; do not connect the catalog's
   database or other internal services either. Give each connection a
   database user that can read only what Igloo should.
+  Connections to other Iceberg REST catalogs (`TYPE iceberg`) work the
+  same way through an HTTP proxy on the loopback interface, under a random
+  path, which holds the catalog's token or OAuth2 client, forwards nothing
+  but loads of the tables found when the replica started, answers the rest
+  itself or refuses it, and bounds each request by the connection's
+  timeouts. DuckDB gets from the catalog only storage credentials, their
+  expiry and region, never a storage endpoint or plain HTTP of the
+  catalog's choosing, and keeps them as secrets scoped to each table's
+  location. The sandbox, locked at startup, opens to the locations of those
+  tables, which must be in an object store, below a bucket, and apart from
+  the warehouse and the allowed locations, and refuses a table whose
+  location changed since; Igloo's own storage credentials cover only the
+  warehouse and the allowed locations. A remote table's manifests can still
+  name files in the warehouse or the allowed locations, which DuckDB would
+  then read with Igloo's credentials for those who may read that table, or
+  in another connection's tables' locations, read with credentials that
+  catalog handed out for another statement while DuckDB keeps them.
 - **Erasure** ([details](docs/privacy.md)). Admins and holders of `ERASE ON
   ACCOUNT` ask for, preview, confirm and cancel erasures and set data
   retentions of tables with tags (admins of any table); others see no

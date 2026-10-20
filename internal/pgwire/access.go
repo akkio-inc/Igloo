@@ -572,13 +572,16 @@ func (s *Server) readTables(ctx context.Context, sess *session, st *statement, q
 	if err != nil {
 		return nil, err
 	}
-	if reads.scans != scans.catalogTotal() {
+	// The plan shows the scans of Iceberg REST catalogs' tables as it shows
+	// the catalog's.
+	connScans, iceberg := splitScans(reads.connScans)
+	if reads.scans+iceberg != scans.catalogTotal() {
 		return nil, denied("cannot verify which tables this statement reads (the plan scans %d catalog tables, the statement names %d)",
-			scans.catalogTotal(), reads.scans)
+			scans.catalogTotal(), reads.scans+iceberg)
 	}
-	if !sameScans(reads.connScans, scans.connections) {
+	if !sameScans(connScans, scans.connections) {
 		return nil, denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
-			len(scans.connections), len(reads.connScans))
+			len(scans.connections), len(connScans))
 	}
 	for _, named := range scans.named {
 		if !slices.ContainsFunc(slices.Concat(reads.tables, reads.policyTables), func(o auth.Object) bool { return o.Equal(named) }) {
@@ -935,6 +938,9 @@ type planScans struct {
 	external int
 	// connections are scans of connections' tables (see connreads.go).
 	connections []connectionScan
+	// tableFns counts calls of table functions that take a table other
+	// than iceberg_scan, such as iceberg_metadata (see tableArgCalls).
+	tableFns int
 }
 
 // catalogTotal counts the scans that are not of connections' tables: of
@@ -1004,6 +1010,9 @@ func (s *Server) scansOf(ctx context.Context, sess *session, plan any, strict bo
 			fn := strings.ToLower(strings.TrimSpace(name))
 			extra, _ := n["extra_info"].(map[string]any)
 			table, hasTable := extra["Table"].(string)
+			if tableArgFunctions[fn] && fn != "iceberg_scan" {
+				scans.tableFns++
+			}
 			switch {
 			case fn == "iceberg_scan":
 				scans.iceberg++
@@ -1012,11 +1021,11 @@ func (s *Server) scansOf(ctx context.Context, sess *session, plan any, strict bo
 			case fn == "seq_scan":
 				parts := splitQualified(table)
 				switch {
+				case len(parts) == 3 && strings.EqualFold(parts[0], catalogName):
+					scans.named = append(scans.named, auth.Object{Schema: parts[1], Table: parts[2]})
 				case !strict:
 				case len(parts) != 3:
 					return denied("cannot tell which table a scan reads (%q)", table)
-				case strings.EqualFold(parts[0], catalogName):
-					scans.named = append(scans.named, auth.Object{Schema: parts[1], Table: parts[2]})
 				case strings.EqualFold(parts[0], "temp") || strings.EqualFold(parts[0], local) ||
 					strings.EqualFold(parts[0], "system"):
 				default:

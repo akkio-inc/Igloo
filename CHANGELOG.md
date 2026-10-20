@@ -153,6 +153,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `query_timeout` stops queries on Snowflake too. Grants,
   policies, the query history and `ALTER CONNECTION ... REFRESH` work as for
   other connections; credentials stay in Igloo, encrypted or in files.
+- Connections to other Iceberg REST catalogs (`CREATE CONNECTION ... TYPE
+  iceberg`): Snowflake-managed Iceberg tables through Snowflake's Horizon
+  Catalog, Databricks Delta Shares served to Iceberg clients and Unity
+  Catalog's UniForm tables, Apache Polaris, AWS Glue and S3 Tables, other
+  Lakekeepers, read in place, read-only, with the same grants, policies and
+  history as other connections. Igloo signs in with a bearer token, an
+  OAuth2 client (programmatic access tokens included) or AWS Signature
+  Version 4, with credentials stored like passwords, and reads files with
+  the storage credentials the catalog hands out, or a static one. DuckDB
+  never sees the catalog's credentials, reaches no other endpoint than
+  Igloo's proxy, and may read only the locations of the tables found when
+  the replica started, which must not overlap the warehouse or the allowed
+  locations. Igloo's own storage credentials now apply only to the
+  warehouse and the allowed locations.
 
 ### Alerts and notifications
 

@@ -331,7 +331,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 		if err := beforeLockdown(ctx, conn, o); err != nil {
 			return err
 		}
-		return e.lockDown(exec, cfg)
+		return e.lockDown(exec, cfg, o.sandboxDirs())
 	}
 
 	for _, stmt := range storageStatements(cfg.Storage) {
@@ -405,7 +405,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if err := beforeLockdown(ctx, conn, o); err != nil {
 		return err
 	}
-	if err := e.lockDown(exec, cfg); err != nil {
+	if err := e.lockDown(exec, cfg, o.sandboxDirs()); err != nil {
 		return err
 	}
 
@@ -429,7 +429,7 @@ func queryString(ctx context.Context, conn *duckdb.Conn, query string) (string, 
 	return v, nil
 }
 
-func (e *Engine) lockDown(exec func(string) error, cfg config.Config) error {
+func (e *Engine) lockDown(exec func(string) error, cfg config.Config, extra []string) error {
 	// DuckDB sets up its secret manager on first use and cannot once
 	// external access is off, so make sure it is set up now.
 	if err := exec("SELECT count(*) FROM duckdb_secrets()"); err != nil {
@@ -439,7 +439,7 @@ func (e *Engine) lockDown(exec func(string) error, cfg config.Config) error {
 	if e.cache != nil {
 		cacheDir = e.cache.dir
 	}
-	for _, stmt := range lockdownStatements(cfg, cacheDir) {
+	for _, stmt := range lockdownStatements(cfg, cacheDir, extra...) {
 		if err := exec(stmt); err != nil {
 			return fmt.Errorf("lock down duckdb (%s): %w", stmt, err)
 		}
@@ -477,10 +477,11 @@ func settingStatements(d config.DuckDB) []string {
 // loaded here: after lockdown DuckDB cannot read extension files.
 func storageStatements(s config.Storage) []string {
 	stmts := extensionStatements()
+	scope := storageScope(s)
 
 	switch s.Type {
 	case config.StorageGCS:
-		stmts = append(stmts, secret(
+		stmts = append(stmts, secret(scope,
 			"TYPE gcs",
 			"KEY_ID "+literal(s.GCS.HMACKeyID),
 			"SECRET "+literal(s.GCS.HMACSecret),
@@ -491,9 +492,9 @@ func storageStatements(s config.Storage) []string {
 		if s.Azure.AccountKey != "" {
 			conn := fmt.Sprintf("DefaultEndpointsProtocol=https;AccountName=%s;AccountKey=%s;EndpointSuffix=%s",
 				s.Azure.Account, s.Azure.AccountKey, strings.TrimPrefix(s.Azure.Host, s.Azure.Account+".dfs."))
-			stmts = append(stmts, secret("TYPE azure", "CONNECTION_STRING "+literal(conn)))
+			stmts = append(stmts, secret(scope, "TYPE azure", "CONNECTION_STRING "+literal(conn)))
 		} else {
-			stmts = append(stmts, secret(
+			stmts = append(stmts, secret(scope,
 				"TYPE azure",
 				"PROVIDER credential_chain",
 				"CHAIN 'workload_identity;managed_identity;env'",
@@ -520,7 +521,7 @@ func storageStatements(s config.Storage) []string {
 			stmts = append(stmts, "LOAD aws")
 			opts = append(opts, "PROVIDER credential_chain", "REFRESH auto")
 		}
-		stmts = append(stmts, secret(opts...))
+		stmts = append(stmts, secret(scope, opts...))
 	}
 
 	return stmts
@@ -531,8 +532,32 @@ func extensionStatements() []string {
 	return append([]string{"LOAD httpfs", "LOAD iceberg", "LOAD avro", "LOAD tpch"}, mediaStatements()...)
 }
 
-func secret(opts ...string) string {
+// secret registers Igloo's storage credentials, for the paths of scope.
+func secret(scope string, opts ...string) string {
+	if scope != "" {
+		opts = append(opts, scope)
+	}
 	return "CREATE OR REPLACE SECRET igloo_storage (" + strings.Join(opts, ", ") + ")"
+}
+
+// storageScope limits Igloo's storage credentials to the warehouse and the
+// allowed locations, the object storage Igloo reads and writes for itself.
+// DuckDB then uses them for no other path: the tables of Iceberg REST
+// catalogs attached as connections (package federation) are read with the
+// credentials their catalogs hand out, or none, wherever their catalogs say
+// their files are, never with Igloo's.
+func storageScope(s config.Storage) string {
+	var scopes []string
+	if s.Location != "" {
+		scopes = append(scopes, s.Root())
+	}
+	for _, loc := range s.AllowedLocations {
+		scopes = append(scopes, strings.TrimSuffix(loc, "/")+"/")
+	}
+	if len(scopes) == 0 {
+		return ""
+	}
+	return "SCOPE " + list(scopes)
 }
 
 // attachStatement attaches the Iceberg REST catalog at endpoint, the
@@ -555,8 +580,10 @@ func attachStatement(c config.Catalog, endpoint string) string {
 }
 
 // lockdownStatements stop SQL from reading or writing anything but the
-// warehouse, the allowed locations, the spill directory and the read cache
-// (cacheDir, if any): no local files, no other buckets, no arbitrary URLs.
+// warehouse, the allowed locations, the spill directory, the read cache
+// (cacheDir, if any) and extra, the locations of the tables of Iceberg REST
+// catalogs attached as connections: no local files, no other buckets, no
+// arbitrary URLs.
 // DuckDB refuses to loosen these settings once external access is off, so
 // they hold for every session. They apply without a catalog too, so a
 // development server is no more open than a production one.
@@ -566,7 +593,7 @@ func attachStatement(c config.Catalog, endpoint string) string {
 // than it has: the cache holds copies of warehouse files, which SQL can
 // read anyway, and a writer able to plant a block there (with COPY TO) can
 // already overwrite the warehouse file itself.
-func lockdownStatements(cfg config.Config, cacheDir string) []string {
+func lockdownStatements(cfg config.Config, cacheDir string, extra ...string) []string {
 	var dirs []string
 	// Every entry ends in a slash so a directory is a strict prefix: land/
 	// does not match landing-private/. The config validates and normalises
@@ -584,6 +611,9 @@ func lockdownStatements(cfg config.Config, cacheDir string) []string {
 	}
 	add(cfg.DuckDB.TempDir)
 	add(cacheDir)
+	for _, dir := range extra {
+		add(dir)
+	}
 
 	return []string{
 		"SET allowed_directories = " + list(dirs),

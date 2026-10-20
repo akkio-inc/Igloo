@@ -1766,10 +1766,36 @@ expect_error "and never to Igloo's own metadata database" 22023 igloo "$admin_pa
   "CREATE CONNECTION meta TYPE postgres WITH (host 'postgres', port 5432, database 'igloo', user 'igloo')"
 expect_error "however its name is written" 22023 igloo "$admin_password" \
   "CREATE CONNECTION meta TYPE postgres WITH (host 'POSTGRES.', port 5432, database 'igloo', user 'igloo', tls 'disable')"
+# Another team's Iceberg catalog: a second warehouse of the stack's
+# Lakekeeper, in the same bucket but apart from Igloo's, written with
+# PyIceberg. It hands out no storage credentials, so the connection brings
+# its own.
+s3_secret="$(grep '^S3_SECRET_ACCESS_KEY=' "$env_file" | cut -d= -f2)"
+s3_region="$(grep '^S3_REGION=' "$env_file" | cut -d= -f2)"
+if docker run --rm --network "$network" -e LAKEKEEPER=http://lakekeeper:8181 -e BUCKET="$bucket" -e S3_ENDPOINT=http://storage:9000 \
+  -e S3_REGION="$s3_region" -e S3_ACCESS_KEY_ID="$s3_key" -e S3_SECRET_ACCESS_KEY="$s3_secret" \
+  -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
+    pip install -q --disable-pip-version-check --root-user-action=ignore 'pyiceberg[pyarrow,s3fs]==$pyiceberg_version' >/dev/null &&
+    python /clients/write_remote_iceberg.py" >"$work/remote-iceberg.out" 2>&1; then
+  pass "another catalog's warehouse, written with PyIceberg"
+else
+  fail "another catalog's warehouse: $(tail -5 "$work/remote-iceberg.out")"
+fi
+expect_error "an Iceberg REST catalog's endpoint must use TLS unless told not to" 22023 igloo "$admin_password" \
+  "CREATE CONNECTION partner TYPE iceberg WITH (endpoint 'http://lakekeeper:8181/catalog', warehouse 'partner')"
+expect_error "its credentials must be quoted" 42601 igloo "$admin_password" \
+  "CREATE CONNECTION partner TYPE iceberg WITH (endpoint 'http://lakekeeper:8181/catalog', tls 'disable', token abcdef)"
+warned "admins register an Iceberg REST catalog" partner \
+  "CREATE CONNECTION partner TYPE iceberg WITH (endpoint 'http://lakekeeper:8181/catalog', warehouse 'partner', tls 'disable',
+     storage_credential '$s3_key:$s3_secret', storage_endpoint 'http://storage:9000', region '$s3_region')"
+# Igloo's own warehouse, attached as a connection, has no table that may be
+# read: they all overlap the warehouse.
+warned "Igloo's own warehouse too, as a mistake" mine \
+  "CREATE CONNECTION mine TYPE iceberg WITH (endpoint 'http://lakekeeper:8181/catalog', warehouse 'igloo', tls 'disable')"
 # connections prints each connection's name, state and password column.
 connections() { psql_admin -c "SHOW CONNECTIONS" | cut -d'|' -f1,12,7 | awk -F'|' '{print $1 "|" $3 "|" $2}' | sort; }
 got="$(connections)"
-if [ "$got" = "$(printf 'crmdb|not attached|stored\nops|not attached|stored')" ]; then
+if [ "$got" = "$(printf 'crmdb|not attached|stored\nmine|not attached|none\nops|not attached|stored\npartner|not attached|storage_credential stored')" ]; then
   pass "connections attach when Igloo next starts"
 else
   fail "SHOW CONNECTIONS before the restart: $got"
@@ -1817,11 +1843,49 @@ expect "erasure requests and data retentions survive a restart" "completed|1" pa
 
 echo "connections after the restart"
 got="$(connections)"
-if [ "$got" = "$(printf 'crmdb|attached|stored\nops|attached|stored')" ]; then
-  pass "both connections are attached, and their passwords never shown again"
+if [ "$got" = "$(printf 'crmdb|attached|stored\nmine|attached|none\nops|attached|stored\npartner|attached|storage_credential stored')" ]; then
+  pass "the connections are attached, and their passwords never shown again"
 else
   fail "SHOW CONNECTIONS after the restart: $got"
 fi
+
+echo "connections to Iceberg REST catalogs"
+got="$(psql_admin -c "SHOW CONNECTIONS" | grep '^mine|' | cut -d'|' -f13)"
+if grep -q "^0 tables attached; .* left out: .*overlaps Igloo's warehouse" <<<"$got"; then
+  pass "a catalog's tables in Igloo's warehouse are left out"
+else
+  fail "Igloo's own warehouse as a connection: $got"
+fi
+expect_error "and cannot be read" 42P01 igloo "$admin_password" "SELECT count(*) FROM mine.public.e2e"
+expect "admins read another catalog's tables in place" "1000|24500" igloo "$admin_password" \
+  "SELECT count(*), sum(spend)::INTEGER FROM partner.campaigns.spend"
+expect "and join them with Iceberg tables" "3" igloo "$admin_password" \
+  "SELECT count(*) FROM e2e i JOIN partner.campaigns.spend s ON s.id = i.id"
+if got="$(psql_admin -c "INSERT INTO partner.campaigns.spend VALUES (5000, 'x', 1)")"; then
+  fail "an admin wrote to another catalog"
+elif grep -qi "read-only" <<<"$got"; then
+  pass "which no one writes to"
+else
+  fail "write to another catalog: $got"
+fi
+expect_error "nor drops" 42501 igloo "$admin_password" "DETACH partner"
+expect_error "readers need a grant on another catalog's tables" 42501 rita rita-password-1 "SELECT count(*) FROM partner.campaigns.spend"
+expect_error "and cannot read its files" 42501 rita rita-password-1 "SELECT count(*) FROM read_parquet('s3://$bucket/partner/**/*.parquet')"
+expect_error "nor its metadata" 42501 rita rita-password-1 "SELECT count(*) FROM iceberg_snapshots(partner.campaigns.spend)"
+expect "a grant on another catalog's schema" "GRANT" igloo "$admin_password" "GRANT SELECT ON SCHEMA partner.campaigns TO analysts"
+expect "lets a user with no role join it with Iceberg tables" "3" nora nora-password-1 \
+  "SELECT count(*) FROM e2e i JOIN partner.campaigns.spend s ON s.id = i.id"
+expect_error "a writer may not copy it without a grant" 42501 walt walt-password-1 \
+  "CREATE TABLE e2e_spend AS SELECT channel, sum(spend) AS spend FROM partner.campaigns.spend GROUP BY 1"
+expect "a grant on one table" "GRANT" igloo "$admin_password" "GRANT SELECT ON TABLE partner.campaigns.spend TO walt"
+expect "lets a writer copy it into the warehouse" "CREATE TABLE" walt walt-password-1 \
+  "CREATE TABLE e2e_spend AS SELECT channel, sum(spend) AS spend FROM partner.campaigns.spend GROUP BY 1"
+expect_error "but not the catalog's other tables" 42501 walt walt-password-1 "SELECT count(*) FROM partner.campaigns.private"
+if psql_admin -c "SHOW CONNECTIONS" | grep -q -e "$s3_secret"; then fail "a storage credential is shown"; else pass "storage credentials are never shown"; fi
+expect "nor recorded" "0" igloo "$admin_password" "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '%$s3_secret%'"
+if compose logs igloo 2>&1 | grep -q -e "$s3_secret"; then fail "a storage credential is in the logs"; else pass "nor logged"; fi
+expect_error "its tables are found when Igloo starts, so REFRESH is refused" 22023 igloo "$admin_password" "ALTER CONNECTION partner REFRESH"
+expect "dropping one detaches it" "DROP CONNECTION" igloo "$admin_password" "DROP CONNECTION mine"
 expect "admins join PostgreSQL, MySQL and Iceberg tables" "3|600" igloo "$admin_password" \
   "SELECT count(*), sum(o.budget) FROM e2e i JOIN crmdb.sales.customers c ON c.id = i.id JOIN ops.ops.campaigns o ON o.customer_id = c.id"
 expect "filters reach the remote database" "500" igloo "$admin_password" \

@@ -117,6 +117,22 @@ func TestEveryExtensionLoadsBeforeLockdown(t *testing.T) {
 	}
 }
 
+func TestStorageCredentialsCoverOnlyIgloosLocations(t *testing.T) {
+	// Tables of Iceberg REST catalogs attached as connections are never
+	// read with Igloo's own credentials, wherever they are.
+	for _, s := range []config.Storage{
+		{Type: config.StorageS3, Location: "s3://bucket/warehouse", AllowedLocations: []string{"s3://landing/"}, S3: config.S3{AccessKeyID: "k"}},
+		{Type: config.StorageS3, Location: "s3://bucket/warehouse", AllowedLocations: []string{"s3://landing"}},
+		{Type: config.StorageGCS, Location: "s3://bucket/warehouse", AllowedLocations: []string{"s3://landing/"}},
+		{Type: config.StorageAzure, Location: "s3://bucket/warehouse", AllowedLocations: []string{"s3://landing/"}, Azure: config.Azure{Account: "a", AccountKey: "k"}},
+	} {
+		got := joined(storageStatements(s))
+		if want := "SCOPE ['s3://bucket/warehouse/', 's3://landing/'])"; !strings.Contains(got, want) {
+			t.Errorf("%s: missing %q in\n%s", s.Type, want, got)
+		}
+	}
+}
+
 func TestLockdown(t *testing.T) {
 	got := joined(lockdownStatements(config.Config{
 		DuckDB: config.DuckDB{TempDir: "/var/lib/igloo/tmp"},
@@ -124,8 +140,8 @@ func TestLockdown(t *testing.T) {
 			Location:         "s3://bucket/warehouse",
 			AllowedLocations: []string{"s3://landing/"},
 		},
-	}, "/var/lib/igloo/cache/blocks"))
-	want := "SET allowed_directories = ['s3://bucket/warehouse/', 's3://landing/', '/var/lib/igloo/tmp/', '/var/lib/igloo/cache/blocks/']"
+	}, "/var/lib/igloo/cache/blocks", "s3://remote/tables/t1/"))
+	want := "SET allowed_directories = ['s3://bucket/warehouse/', 's3://landing/', '/var/lib/igloo/tmp/', '/var/lib/igloo/cache/blocks/', 's3://remote/tables/t1/']"
 	if !strings.Contains(got, want) {
 		t.Errorf("missing %q in\n%s", want, got)
 	}

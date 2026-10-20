@@ -161,8 +161,10 @@ func serve() error {
 	defer closeFederation()
 	var engineOpts []engine.Option
 	if fed != nil {
-		// Connections are attached before DuckDB's sandbox is locked.
-		engineOpts = append(engineOpts, engine.BeforeLockdown(fed.Attach))
+		// Connections are attached before DuckDB's sandbox is locked, which
+		// then lets SQL read the files of the tables of the Iceberg REST
+		// catalogs among them.
+		engineOpts = append(engineOpts, engine.BeforeLockdown(fed.Attach), engine.SandboxDirectories(fed.SandboxDirectories))
 	}
 	eng, err := engine.Open(startCtx, cfg, log, engineOpts...)
 	if err != nil {

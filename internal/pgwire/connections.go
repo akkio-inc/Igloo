@@ -25,13 +25,15 @@ import (
 //
 //	CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres|mysql|snowflake
 //	    WITH (host 'h', port 5432, database 'db', user 'u', password 'p', ...)
+//	CREATE CONNECTION [IF NOT EXISTS] name TYPE iceberg
+//	    WITH (endpoint 'https://...', warehouse 'w', token 't' | credential 'id:secret', ...)
 //	ALTER CONNECTION name SET (option value, ...)
 //	ALTER CONNECTION name REFRESH
 //	DROP CONNECTION [IF EXISTS] name
 //	SHOW CONNECTIONS
 //
-// Options may also be written option = value. Passwords and private keys
-// are stored encrypted and never shown again.
+// Options may also be written option = value. Passwords, private keys,
+// tokens and credentials are stored encrypted and never shown again.
 
 type connCommand struct {
 	verb        string // CREATE, ALTER, DROP or SHOW
@@ -68,6 +70,8 @@ var connectionColumns = wire.Columns{
 	{Name: "created_by", Oid: pgtype.TextOID, Width: -1},
 	{Name: "created_at", Oid: pgtype.TimestamptzOID, Width: 8},
 	{Name: "updated_at", Oid: pgtype.TimestamptzOID, Width: 8},
+	// The settings only some types have, such as a Snowflake account or an
+	// Iceberg REST catalog's scope; never a credential.
 	{Name: "settings", Oid: pgtype.TextOID, Width: -1},
 }
 
@@ -218,7 +222,7 @@ func parseConnectionCommand(query string) (c *connCommand, ok bool, err error) {
 		rest = rest[1:]
 	case "CREATE":
 		if len(rest) < 2 || rest[0].upper() != "TYPE" {
-			return nil, true, syntaxError("expected CREATE CONNECTION %s TYPE postgres|mysql|snowflake WITH (...)", c.name)
+			return nil, true, syntaxError("expected CREATE CONNECTION %s TYPE postgres|mysql|snowflake|iceberg WITH (...)", c.name)
 		}
 		if c.typ, err = federation.ParseType(rest[1].text); err != nil {
 			return nil, true, pgerror.WithCode(err, codes.FeatureNotSupported)
@@ -254,8 +258,14 @@ func parseConnectionOptions(toks []connToken) ([][2]string, error) {
 		if len(toks) == 0 || toks[0].kind != 's' && toks[0].kind != 'n' && toks[0].kind != 'w' {
 			return nil, syntaxError("option %s needs a value", name)
 		}
-		if federation.CanonicalOption(name) == "" {
+		option := federation.CanonicalOption(name)
+		if option == "" {
 			return nil, pgerror.WithCode(fmt.Errorf("unknown connection option %q", name), codes.InvalidParameterValue)
+		}
+		if option != "password" && slices.Contains(federation.SecretOptions, option) && toks[0].kind != 's' {
+			// The history keeps a statement's string literals out, not
+			// its words.
+			return nil, syntaxError("write the value of %s as a string literal, in single quotes", name)
 		}
 		out = append(out, [2]string{name, toks[0].text})
 		toks = toks[1:]
@@ -412,7 +422,12 @@ func (s *Server) showConnections(ctx context.Context, w wire.DataWriter) error {
 			}
 			return d.String()
 		}
-		row := []any{st.Name, string(st.Type), st.ServerHost(), int32(st.Port), st.Database, st.User, st.PasswordSource(),
+		host, database := st.ServerHost(), st.Database
+		if st.Type == federation.Iceberg {
+			// The catalog's endpoint and warehouse.
+			host, database = st.Iceberg.Endpoint, st.Iceberg.Warehouse
+		}
+		row := []any{st.Name, string(st.Type), host, int32(st.Port), database, st.User, st.PasswordSource(),
 			string(st.TLS), strings.Join(st.Schemas, ", "), timeout(st.ConnectTimeout), timeout(st.QueryTimeout),
 			st.State, st.Detail, st.CreatedBy, st.CreatedAt, st.UpdatedAt, st.Settings()}
 		if err := w.Row(row); err != nil {

@@ -34,8 +34,21 @@ func openFederation(ctx context.Context, cfg config.Config, users auth.Store, lo
 	m := federation.NewManager(store, federation.Options{
 		SecretsDir: cfg.ConnectionSecretsDir,
 		Protected:  metadataServers(cfg.MetadataDatabaseURL),
+		Reserved:   reservedLocations(cfg),
 	}, log)
 	return m, store.Close, nil
+}
+
+// reservedLocations are the locations Igloo reads and writes with its own
+// storage credentials: the warehouse and the allowed locations (the sharing
+// proxy's among them, once it started). No table of an Iceberg REST catalog
+// attached as a connection may be in one.
+func reservedLocations(cfg config.Config) []string {
+	var out []string
+	if cfg.Storage.Location != "" {
+		out = append(out, cfg.Storage.Root())
+	}
+	return append(out, cfg.Storage.AllowedLocations...)
 }
 
 // metadataServers returns the host:port addresses of the metadata

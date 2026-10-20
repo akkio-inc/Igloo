@@ -41,6 +41,13 @@ type Options struct {
 	// changed (see reachesProtected). It guards against mistakes, not a
 	// determined admin, who can reach the server another way.
 	Protected []string
+	// Reserved are the locations Igloo reads with its own credentials,
+	// the warehouse and the allowed locations, which no table of an
+	// Iceberg REST catalog may be in (see locationRules).
+	Reserved []string
+	// LocalLocations lets Iceberg REST catalogs' tables be in directories
+	// of the server, for tests.
+	LocalLocations bool
 }
 
 // Manager attaches connections to DuckDB and keeps them in step with the
@@ -49,8 +56,12 @@ type Manager struct {
 	store     Store
 	secrets   string
 	protected []server
+	locs      locationRules
 	log       *slog.Logger
 	token     string
+	// vended tracks the storage credentials DuckDB keeps for connections
+	// of TYPE iceberg; see sweep.
+	vended map[string]time.Time
 
 	connect atomic.Pointer[func(context.Context) (*duckdb.Conn, error)]
 	// gen counts changes to what is attached; see Generation.
@@ -75,7 +86,8 @@ type attachment struct {
 }
 
 // endpoint is what DuckDB attaches a connection at: a proxy to a
-// PostgreSQL or MySQL database, or the gateway to Snowflake.
+// PostgreSQL or MySQL database, the gateway to Snowflake, or a proxy to an
+// Iceberg REST catalog (*icebergProxy).
 type endpoint interface {
 	// port is the loopback port DuckDB connects to.
 	port() int
@@ -107,7 +119,8 @@ func newEndpoint(c Connection, token, secrets string, log *slog.Logger) (endpoin
 func NewManager(store Store, opts Options, log *slog.Logger) *Manager {
 	m := &Manager{
 		store: store, secrets: opts.SecretsDir, protected: parseServers(opts.Protected), log: log, token: newToken(),
-		attached: map[string]*attachment{}, failed: map[string]string{},
+		locs:     newLocationRules(opts.Reserved, opts.LocalLocations),
+		attached: map[string]*attachment{}, failed: map[string]string{}, vended: map[string]time.Time{},
 	}
 	if opts.Connect != nil {
 		m.SetConnect(opts.Connect)
@@ -147,10 +160,30 @@ func (m *Manager) Exists(ctx context.Context, name string) (bool, error) {
 // extension is the DuckDB extension that attaches a type. Snowflake
 // connections are attached as PostgreSQL databases, at the gateway.
 func (t Type) extension() string {
-	if t == MySQL {
+	switch t {
+	case MySQL:
 		return "mysql"
+	case Iceberg:
+		return "iceberg"
 	}
 	return "postgres"
+}
+
+// SandboxDirectories returns the locations the attached Iceberg REST
+// catalogs' tables keep their files in, each ending in a slash, for DuckDB's
+// sandbox to allow (see engine.SandboxDirectories). It is read once, when
+// the sandbox is locked, after Attach.
+func (m *Manager) SandboxDirectories() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, a := range m.attached {
+		if ip, ok := a.ep.(*icebergProxy); ok {
+			out = append(out, ip.roots()...)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // Attach attaches every registered connection on conn, the engine's setup
@@ -178,6 +211,10 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 	for _, c := range conns {
 		if _, ok := loaded[c.Type.extension()]; !ok {
 			loaded[c.Type.extension()] = exec(ctx, conn, "LOAD "+c.Type.extension())
+			if c.Type == Iceberg && loaded["iceberg"] == nil {
+				// DuckDB reaches the catalog and the files over HTTP.
+				loaded["iceberg"] = exec(ctx, conn, "LOAD httpfs")
+			}
 		}
 	}
 	if err, ok := loaded["postgres"]; ok && err == nil {
@@ -202,6 +239,22 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 	for i, c := range conns {
 		if err := loaded[c.Type.extension()]; err != nil {
 			errs[i] = fmt.Errorf("DuckDB's %s extension: %w", c.Type.extension(), err)
+			continue
+		}
+		if c.Type == Iceberg {
+			// Finding the catalog's tables is its probe: the sandbox
+			// opens to their locations before it is locked.
+			ip, err := newIcebergProxy(c, m.secrets, m.locs, m.log)
+			if err == nil {
+				err = ip.listen()
+			}
+			if err != nil {
+				errs[i] = err
+				continue
+			}
+			proxies[i] = ip
+			probes[i] = make(chan error, 1)
+			go func() { probes[i] <- ip.discover(wait) }()
 			continue
 		}
 		if proxies[i], errs[i] = newEndpoint(c, m.token, m.secrets, m.log); errs[i] != nil {
@@ -230,7 +283,11 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 			m.mu.Unlock()
 			continue
 		}
-		m.log.Info("attached connection", "connection", c.Name, "type", c.Type, "host", c.ServerHost(), "database", c.Database)
+		database := c.Database
+		if c.Type == Iceberg {
+			database = c.Iceberg.Warehouse
+		}
+		m.log.Info("attached connection", "connection", c.Name, "type", c.Type, "host", c.ServerHost(), "database", database)
 	}
 	return nil
 }
@@ -255,16 +312,44 @@ func awaitProbe(ctx context.Context, probe <-chan error) error {
 // attach attaches one connection through its proxy and loads its list of
 // tables, so that listing tables (information_schema, psql's \dt) never
 // waits on that database again, even while it is down.
-func (m *Manager) attach(ctx context.Context, conn *duckdb.Conn, c Connection, p endpoint) error {
-	for _, stmt := range attachStatements(c, m.token, p.port()) {
+func (m *Manager) attach(ctx context.Context, conn *duckdb.Conn, c Connection, rp endpoint) error {
+	var stmts []string
+	if p, ok := rp.(*icebergProxy); ok {
+		var err error
+		if stmts, err = icebergAttachStatements(c, p); err != nil {
+			rp.close()
+			return errors.New(Scrub(err.Error()))
+		}
+	} else {
+		stmts = attachStatements(c, m.token, rp.port())
+	}
+	for _, stmt := range stmts {
 		if err := exec(ctx, conn, stmt); err != nil {
-			p.close()
+			rp.close()
 			_ = exec(ctx, conn, "DETACH DATABASE IF EXISTS "+ident(c.Name))
+			_ = exec(ctx, conn, "DROP SECRET IF EXISTS "+ident("igloo_connection_"+c.Name))
 			return errors.New(Scrub(err.Error()))
 		}
 	}
+	if ip, ok := rp.(*icebergProxy); ok {
+		// Load the tables' columns, which DuckDB otherwise lists as a
+		// placeholder until a table is first read, so that tools browsing
+		// the catalog see them. The answers from finding the tables serve.
+		names, err := queryRows(ctx, conn, `SELECT DISTINCT schema_name, table_name FROM duckdb_columns()
+			WHERE database_name = `+literal(c.Name)+` AND column_name = '__'`)
+		if err == nil {
+			for _, n := range names {
+				schema, _ := n[0].(string)
+				table, _ := n[1].(string)
+				if err := exec(ctx, conn, "DESCRIBE "+ident(c.Name)+"."+ident(schema)+"."+ident(table)); err != nil {
+					m.log.Warn("could not load the columns of a table", "connection", c.Name, "table", schema+"."+table, "err", Scrub(err.Error()))
+				}
+			}
+		}
+		m.log.Info("found the tables of a remote Iceberg catalog", "connection", c.Name, "detail", ip.summary())
+	}
 	m.mu.Lock()
-	m.attached[c.Name] = &attachment{conn: c, ep: p}
+	m.attached[c.Name] = &attachment{conn: c, ep: rp}
 	m.mu.Unlock()
 	m.gen.Add(1)
 	return nil
@@ -300,6 +385,62 @@ func attachStatements(c Connection, token string, port int) []string {
 	}
 }
 
+// icebergAttachStatements attach c, an Iceberg REST catalog, through its
+// proxy, read-only. DuckDB attaches it with no credentials (the proxy adds
+// them) and, unless the connection has a storage credential of its own,
+// asks for the storage credentials the catalog hands out with each table.
+// A storage credential of the connection's own goes into a secret scoped
+// to the locations of the tables found, which the sandbox allows anyway.
+func icebergAttachStatements(c Connection, p *icebergProxy) ([]string, error) {
+	var stmts []string
+	delegation := "vended_credentials"
+	if c.Iceberg.staticStorage() {
+		delegation = "none"
+		cred, err := p.secretValue(c, c.Iceberg.StorageCredential, c.Iceberg.StorageCredentialSecret, "storage_credential")
+		if err != nil {
+			return nil, err
+		}
+		id, key, err := splitStorageCredential(cred)
+		if err != nil {
+			return nil, err
+		}
+		tokens.Store(key, true)
+		if roots := p.roots(); len(roots) > 0 {
+			opts := []string{"TYPE s3", "KEY_ID " + literal(id), "SECRET " + literal(key)}
+			region := c.Iceberg.Region
+			if region == "" {
+				region = "us-east-1"
+			}
+			opts = append(opts, "REGION "+literal(region))
+			if c.Iceberg.StorageEndpoint != "" {
+				hostport, useSSL, _ := parseStorageEndpoint(c.Iceberg.StorageEndpoint)
+				style := "path"
+				if c.Iceberg.StorageURLStyle == "vhost" {
+					style = "vhost"
+				}
+				opts = append(opts, "ENDPOINT "+literal(hostport), fmt.Sprintf("USE_SSL %t", useSSL), "URL_STYLE "+literal(style))
+			}
+			quoted := make([]string, len(roots))
+			for i, r := range roots {
+				quoted[i] = literal(r)
+			}
+			opts = append(opts, "SCOPE ["+strings.Join(quoted, ", ")+"]")
+			stmts = append(stmts, "CREATE OR REPLACE SECRET "+ident("igloo_connection_"+c.Name)+" ("+strings.Join(opts, ", ")+")")
+		}
+	}
+	warehouse := c.Iceberg.Warehouse
+	if warehouse == "" {
+		warehouse = c.Name
+	}
+	stmts = append(stmts,
+		fmt.Sprintf("ATTACH %s AS %s (TYPE iceberg, ENDPOINT %s, AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE %s, READ_ONLY, "+
+			"SUPPORT_NESTED_NAMESPACES false, PURGE_REQUESTED false, REMOVE_FILES_ON_DELETE false)",
+			literal(warehouse), ident(c.Name), literal(p.url()), literal(delegation)),
+		"SELECT count(*) FROM duckdb_tables() WHERE database_name = "+literal(c.Name),
+	)
+	return stmts, nil
+}
+
 // mysqlDSNValue quotes a value for the MySQL extension's key=value
 // connection string, which escapes \ and " with a backslash.
 func mysqlDSNValue(s string) string {
@@ -307,11 +448,21 @@ func mysqlDSNValue(s string) string {
 }
 
 // signIn checks that Igloo can sign in to c's database, without DuckDB.
+// For an Iceberg REST catalog it reads its configuration and namespaces.
 func (m *Manager) signIn(ctx context.Context, c Connection) error {
-	if c.Type == Snowflake {
+	switch c.Type {
+	case Snowflake:
 		cl := openSnowflake(c, m.secrets)
 		defer cl.close()
 		return cl.check(ctx)
+	case Iceberg:
+		ip, err := newIcebergProxy(c, m.secrets, m.locs, m.log)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
+		defer cancel()
+		return ip.check(ctx)
 	}
 	p := &proxy{name: c.Name, secrets: m.secrets, log: m.log, attached: c, current: c}
 	return p.probe()
@@ -330,8 +481,63 @@ func (m *Manager) Run(ctx context.Context) {
 			if err := m.Sync(ctx); err != nil {
 				m.log.Warn("could not sync connections", "err", err)
 			}
+			if err := m.sweep(ctx, time.Now()); err != nil {
+				m.log.Warn("could not drop expired storage credentials", "err", Scrub(err.Error()))
+			}
 		}
 	}
+}
+
+// vendedLifetime is how long DuckDB keeps storage credentials an Iceberg
+// REST catalog handed out. Catalogs hand them out for an hour, and DuckDB
+// renews a set that expires during a read under the same name.
+const vendedLifetime = 2 * time.Hour
+
+// sweep drops storage credentials catalogs handed out that are older than
+// vendedLifetime. DuckDB's iceberg extension (1.5.6) keeps every set it is
+// handed, one or more for each read of a table, as a temporary secret and
+// never drops it, so without this they pile up, and every read of object
+// storage, the warehouse's too, looks through them all for its own. A
+// statement still reading a table after vendedLifetime can fail.
+func (m *Manager) sweep(ctx context.Context, now time.Time) error {
+	m.mu.Lock()
+	iceberg := false
+	for _, a := range m.attached {
+		iceberg = iceberg || a.conn.Type == Iceberg
+	}
+	m.mu.Unlock()
+	if !iceberg && len(m.vended) == 0 {
+		return nil
+	}
+	return m.withConn(ctx, func(conn *duckdb.Conn) error {
+		rows, err := queryRows(ctx, conn, `SELECT name FROM duckdb_secrets() WHERE NOT persistent AND starts_with(name, '__internal_ic_')`)
+		if err != nil {
+			return err
+		}
+		seen := map[string]bool{}
+		var errs []error
+		for _, r := range rows {
+			name, _ := r[0].(string)
+			seen[name] = true
+			first, ok := m.vended[name]
+			switch {
+			case !ok:
+				m.vended[name] = now
+			case now.Sub(first) >= vendedLifetime:
+				if err := exec(ctx, conn, "DROP TEMPORARY SECRET IF EXISTS "+ident(name)); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				delete(m.vended, name)
+			}
+		}
+		for name := range m.vended {
+			if !seen[name] {
+				delete(m.vended, name)
+			}
+		}
+		return errors.Join(errs...)
+	})
 }
 
 // Sync applies changes made to the store since the last sync: new settings
@@ -500,6 +706,11 @@ func (m *Manager) Refresh(ctx context.Context, name string) error {
 		}
 		return fmt.Errorf("connection %s is not attached on this replica; it is attached when Igloo restarts", name)
 	}
+	if a.conn.Type == Iceberg {
+		// Its tables' locations went into DuckDB's sandbox at startup.
+		return &InvalidError{fmt.Errorf("connection %s attaches the tables its catalog had when this replica started, "+
+			"whose locations DuckDB's sandbox was then opened to; restart the replica to attach tables created since", name)}
+	}
 	for _, c := range same {
 		if c.Type == Snowflake {
 			continue
@@ -569,9 +780,17 @@ func (m *Manager) List(ctx context.Context) ([]Status, error) {
 		switch {
 		case a != nil && a.ep.attachedConn().attachedFields() != c.attachedFields():
 			s.State, s.Detail = "attached", "restart to apply the new database or schema"
+			if c.Type == Iceberg {
+				s.Detail = "restart to apply the new endpoint, warehouse, schema or storage settings"
+			}
 		case a != nil:
 			s.State = "attached"
-			if err := a.ep.lastError(); err != "" {
+			if ip, ok := a.ep.(*icebergProxy); ok {
+				s.Detail = ip.summary()
+				if err := a.ep.lastError(); err != "" {
+					s.Detail += "; the last request to the catalog failed: " + err
+				}
+			} else if err := a.ep.lastError(); err != "" {
 				s.Detail = "the last sign-in to the database failed: " + err
 			}
 		case m.failed[c.Name] != "":
@@ -621,6 +840,26 @@ func exec(ctx context.Context, conn *duckdb.Conn, stmt string) error {
 			}
 			return err
 		}
+	}
+}
+
+// queryRows runs a query and returns its rows.
+func queryRows(ctx context.Context, conn *duckdb.Conn, query string) ([][]driver.Value, error) {
+	rows, err := conn.QueryContext(ctx, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var out [][]driver.Value
+	for {
+		dest := make([]driver.Value, len(rows.Columns()))
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		out = append(out, dest)
 	}
 }
 

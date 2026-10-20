@@ -44,14 +44,22 @@ const keepAlive = 15 * time.Second
 const silenceGrace = 10 * time.Second
 
 // tokens are the proxy tokens of this process, which Scrub removes from
-// messages. DuckDB's extensions quote the whole connection string, password
+// messages, and the credentials of connections to Iceberg REST catalogs.
+// DuckDB's extensions quote the whole connection string, password
 // included, when they fail to connect.
 var tokens sync.Map
 
-// Scrub replaces proxy tokens in s with ***.
+// Scrub replaces proxy tokens and credentials in s with ***, and the URLs
+// of catalog proxies with their catalogs' endpoints.
 func Scrub(s string) string {
 	tokens.Range(func(k, _ any) bool {
-		s = strings.ReplaceAll(s, k.(string), "***")
+		if t := k.(string); len(t) >= 8 {
+			s = strings.ReplaceAll(s, t, "***")
+		}
+		return true
+	})
+	proxyURLs.Range(func(k, v any) bool {
+		s = strings.ReplaceAll(s, k.(string), v.(string))
 		return true
 	})
 	return s

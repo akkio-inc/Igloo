@@ -310,6 +310,9 @@ func redactQuery(query string) string {
 		return erasureHidden
 	}
 	sensitive := slices.ContainsFunc(words, func(w string) bool { return slices.Contains(secretWords, w) || w == "ERASE" })
+	// A connection's options can be credentials under any name, such as
+	// an Iceberg REST catalog's storage_credential.
+	sensitive = sensitive || len(words) > 1 && (words[0] == "CREATE" || words[0] == "ALTER") && words[1] == "CONNECTION"
 	if !sensitive && len(words) > 1 && (words[0] == "SET" || words[0] == "RESET") {
 		sensitive = slices.ContainsFunc(words[1:min(len(words), 4)], func(w string) bool { return sensitiveSetting.MatchString(w) })
 	}

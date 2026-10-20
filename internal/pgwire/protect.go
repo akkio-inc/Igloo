@@ -913,9 +913,12 @@ func (rw *rewriter) verify(t duckdb.StmtType, query, text string, oids []uint32)
 	if err != nil {
 		return err
 	}
-	if reads.scans != scans {
+	// The plan shows the scans of Iceberg REST catalogs' tables as it shows
+	// the catalog's, which countCatalogScans counts.
+	connScans, iceberg := splitScans(reads.connScans)
+	if reads.scans+iceberg != scans {
 		return denied("cannot verify which tables this statement reads (the plan scans %d catalog tables, the statement names %d)",
-			scans, reads.scans)
+			scans, reads.scans+iceberg)
 	}
 	if rw.snap.ProtectsConnections() && len(rw.s.connectionCatalogs()) > 0 {
 		// Tables of connections, which policies protect too: the plan
@@ -925,9 +928,9 @@ func (rw *rewriter) verify(t duckdb.StmtType, query, text string, oids []uint32)
 		if err != nil {
 			return err
 		}
-		if !sameScans(ps.connections, reads.connScans) {
+		if !sameScans(ps.connections, connScans) {
 			return denied("cannot verify which tables of connections this statement reads (the plan scans %d, the statement names %d)",
-				len(ps.connections), len(reads.connScans))
+				len(ps.connections), len(connScans))
 		}
 	}
 	return nil

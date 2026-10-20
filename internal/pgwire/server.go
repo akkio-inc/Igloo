@@ -1391,6 +1391,12 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		s.metrics.query(time.Now(), err)
 		return fail(pgError(err))
 	}
+	// Likewise the table functions that read a connection's table by name.
+	if err := s.guardTableArgs(ctx, sess, user, query); err != nil {
+		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
+		s.metrics.query(time.Now(), err)
+		return fail(pgError(err))
+	}
 	// What a CREATE makes, whose owner its user becomes, is worked out
 	// before it is prepared, since afterwards that could make preparing
 	// it again necessary (see reprepare).

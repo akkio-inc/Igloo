@@ -2,9 +2,12 @@
 
 Igloo can query PostgreSQL, MySQL and Snowflake databases where they are,
 next to its Iceberg tables: a client's CRM, an operational database, a
-warehouse being migrated. An admin registers a connection once; every replica attaches it,
-read-only, as a catalog of the same name, and anyone granted its tables
-queries them like any other:
+warehouse being migrated. It reads the Iceberg tables of other Iceberg REST
+catalogs in place the same way: Snowflake-managed Iceberg tables,
+Databricks shares, another team's Polaris (see [Iceberg REST
+catalogs](#iceberg-rest-catalogs)). An admin registers a connection once;
+every replica attaches it, read-only, as a catalog of the same name, and
+anyone granted its tables queries them like any other:
 
 ```sql
 CREATE CONNECTION crm TYPE postgres
@@ -31,8 +34,9 @@ use `CREATE TABLE ... AS SELECT` from the connection.
 | `postgres` | PostgreSQL, and managed services that run it (Amazon RDS and Aurora, Google Cloud SQL, Azure Database). Tested with PostgreSQL 17. | DuckDB's `postgres` extension |
 | `mysql` | MySQL 5.7 and later. Tested with MySQL 8.4. MariaDB speaks the same protocol (`TYPE mariadb` is the same) but is not tested yet. | DuckDB's `mysql` extension |
 | `snowflake` | Snowflake, on any cloud and region. Its tables, views, external, dynamic and Iceberg tables. | Igloo's gateway to Snowflake, with Snowflake's Go driver (see [Snowflake](#snowflake)) |
+| `iceberg` | Iceberg REST catalogs: Snowflake's Horizon Catalog, Databricks' Iceberg shares and Unity Catalog, Apache Polaris and Snowflake Open Catalog, AWS Glue and S3 Tables, Lakekeeper. Tested with a Databricks share, Snowflake's Horizon Catalog (signing in) and Lakekeeper 0.14. | DuckDB's `iceberg` extension, as for Igloo's own catalog (see [Iceberg REST catalogs](#iceberg-rest-catalogs)) |
 
-Both extensions are DuckDB's own core extensions, built for linux/amd64 and
+The extensions are DuckDB's own core extensions, built for linux/amd64 and
 linux/arm64 and baked into the image like the others; Igloo loads them only
 when a connection needs them. The extensions are MIT-licensed. The
 `postgres` extension links libpq (PostgreSQL License); the `mysql` extension
@@ -51,16 +55,16 @@ enforce timeouts the way it does for connections (see
 [how it works](#how-it-works)); Snowflake's community extension, which
 Igloo does not use for the same reasons, is described under
 [Snowflake](#how-igloo-reads-snowflake). Until BigQuery is supported, copy
-its data into Iceberg tables, or share it as Iceberg and read it in place.
-SQLite databases are files on the server, which the
-[sandbox](../SECURITY.md) keeps SQL away from.
+its data into Iceberg tables, or share it as Iceberg and read it in place
+with a connection of `TYPE iceberg`. SQLite databases are files on the
+server, which the [sandbox](../SECURITY.md) keeps SQL away from.
 
 ## Creating, changing and dropping connections
 
 Only admins manage connections.
 
 ```sql
-CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres | mysql | snowflake WITH (option value, ...);
+CREATE CONNECTION [IF NOT EXISTS] name TYPE postgres | mysql | snowflake | iceberg WITH (option value, ...);
 ALTER CONNECTION name SET (option value, ...);
 ALTER CONNECTION name REFRESH;
 DROP CONNECTION [IF EXISTS] name;
@@ -90,15 +94,18 @@ connection.
 | `read_only` | `true` | Connections are read-only; `false` is refused |
 
 Snowflake connections take the options listed under
-[Snowflake](#snowflake) instead.
+[Snowflake](#snowflake) instead, and Iceberg REST catalogs
+[their own](#options-of-iceberg-rest-catalogs).
 
 `CREATE CONNECTION` checks that Igloo can sign in before it stores
 anything. `SHOW CONNECTIONS` lists every connection's settings, never its
-password (`password` shows `stored`, `secret <name>` or `none`, and for
-Snowflake `private key stored` or `private key in secret <name>`), its
-type's own settings (`settings`: a Snowflake connection's account,
-warehouse and role), and its state on the replica that answers: `attached`, `not attached` with the
-reason, or `failed` with the error.
+password (`password` shows `stored`, `secret <name>` or `none`, for
+Snowflake `private key stored` or `private key in secret <name>`, and for an
+Iceberg REST catalog each credential it has), its type's own settings
+(`settings`: a Snowflake connection's account, warehouse and role, an
+Iceberg REST catalog's scope, region and storage endpoint), and its state
+on the replica that answers: `attached`, `not attached` with the reason, or
+`failed` with the error.
 
 ### TLS
 
@@ -142,6 +149,10 @@ reaching other servers). So:
   queries are not interrupted.
 - **The database and schemas** apply when each replica restarts;
   `SHOW CONNECTIONS` says so until then.
+- **Of an Iceberg REST catalog**, the token, credential, scope, token
+  endpoint, region, TLS and timeouts apply at once, like a password; the
+  endpoint, warehouse, schemas and storage settings when each replica
+  restarts.
 - **Dropping** a connection detaches it at once on the replica that ran it
   and within 15 seconds on the others, and removes its grants.
 
@@ -153,7 +164,193 @@ replicas at their next restart), so new tables appear in listings and new
 MySQL tables can be queried. Because DuckDB keeps one list for all
 connections of a type, `REFRESH` first checks that every connection of that
 type can be reached, and refuses rather than lose a list while a database is
-down.
+down. An Iceberg REST catalog's tables are the ones it had when the replica
+started, whose locations the sandbox was opened to then: a table created
+since is attached when each replica restarts, and `REFRESH` is refused. New
+snapshots of the attached tables are read as they come.
+
+## Iceberg REST catalogs
+
+A connection of `TYPE iceberg` attaches another Iceberg REST catalog's
+tables, which Igloo reads where they are, through the catalog, with the
+storage credentials the catalog hands out for each table. Nothing is
+copied, and the tables stay the catalog's: Igloo never writes to them.
+
+```sql
+CREATE CONNECTION partner TYPE iceberg
+  WITH (endpoint 'https://catalog.example.com/api/catalog', warehouse 'shared',
+        credential 'client-id:client-secret', scope 'PRINCIPAL_ROLE:ALL');
+
+-- after the next restart of each replica
+GRANT SELECT ON SCHEMA partner.campaigns TO analysts;
+SELECT * FROM partner.campaigns.spend s JOIN lake.public.audiences a USING (campaign_id);
+```
+
+The catalog's namespaces are the connection's schemas (only top-level
+ones), and their tables its tables. Grants, masking and row access
+policies, views, `CREATE TABLE ... AS SELECT` and the query history work
+as for [other connections](#grants); time travel works as for Iceberg
+tables (`AT (VERSION => snapshot_id)`).
+
+### Options of Iceberg REST catalogs
+
+| Option | Default | Meaning |
+|---|---|---|
+| `endpoint` (`uri`) | (required) | The catalog's base URL, below which it answers `/v1/config`: what Spark calls `uri`. `https`, unless `tls 'disable'`. |
+| `warehouse` | none | The warehouse to attach, as the catalog names it: a Snowflake database, a Databricks share, a Polaris catalog. |
+| `token` | | A bearer token sent with every request, stored encrypted |
+| `token_secret` | | Instead of `token`: the name of a file in `IGLOO_CONNECTION_SECRETS_DIR` holding it, read at every request |
+| `credential` | | An OAuth2 client's `client_id:client_secret`, or the secret alone, exchanged for access tokens (the client credentials grant), stored encrypted |
+| `credential_secret` | | Instead of `credential`: the name of a file holding it, read at every exchange |
+| `oauth2_server_uri` | `endpoint` + `/v1/oauth/tokens` | Where the credential is exchanged |
+| `scope` | `catalog` | The scope asked for with it |
+| `signing_name` | | Instead of a token or OAuth2: sign requests with AWS's Signature Version 4 for this service (`glue`, `s3tables`) in `region`, with `credential` as an access key (`key_id:secret`) or, without one, AWS's default credentials (the environment, the instance's or the pod's role) |
+| `schema` (`namespace`) | all | Comma-separated namespaces to attach |
+| `tls` | `verify-full` | As for [other connections](#tls), for the catalog and the token endpoint. `disable` needs an `http` endpoint. |
+| `tls_ca` | the system's | PEM certificates of the authorities that may sign the catalog's certificate |
+| `region` | | The storage's region, for catalogs that hand out credentials without one |
+| `storage_credential` | | `key_id:secret` of S3-compatible storage, for catalogs that hand out no storage credentials; stored encrypted |
+| `storage_credential_secret` | | Instead of `storage_credential`: the name of a file holding it |
+| `storage_endpoint` | Amazon S3 | The S3-compatible endpoint the tables' files are read from, as `host:port` or an `http(s)` URL, for storage other than Amazon S3 |
+| `storage_url_style` | `path` | `path` or `vhost`, with `storage_endpoint`; an `http` endpoint needs `path` |
+| `connect_timeout` | `10s` | How long connecting to the catalog, and getting a token, may take |
+| `query_timeout` | `25s` | How long the catalog may take to answer one request (DuckDB itself gives up after 30 seconds and asks again) |
+| `read_only` | `true` | Connections are read-only; `false` is refused |
+
+Write `token`, `credential` and `storage_credential` as string literals,
+in single quotes: the history keeps the string literals of every `CREATE`
+and `ALTER CONNECTION` out, not unquoted words. Credentials are never shown
+again (`password` in `SHOW CONNECTIONS` says which kinds the connection has
+and where they come from).
+
+`CREATE CONNECTION` reads the catalog's configuration and lists its
+namespaces before it stores anything. Each replica, when it starts, lists
+the catalog's tables and loads each to learn where its files are; that
+takes at most two minutes per catalog, all catalogs at once, after which
+the connection is left out (`failed` in `SHOW CONNECTIONS`) and Igloo starts
+anyway. A table is left out, with why, when:
+
+- the catalog will not load it, as Databricks answers for a shared table
+  that is not readable as Iceberg;
+- its files are not in an object store (`s3`, `gs`, `az`, `abfss`, `r2`),
+  or are at a bucket's root (but for the bucket S3 Tables makes for each
+  table);
+- its location, its `write.data.path` or `write.metadata.path`, or the
+  prefix the catalog scopes its storage credentials to, overlaps the
+  warehouse or `IGLOO_ALLOWED_LOCATIONS`, which Igloo reads with its own
+  credentials.
+
+`SHOW CONNECTIONS` says how many tables were attached and which were left
+out. Nested namespaces are not attached, and a catalog with more than 5000
+tables in the namespaces attached is not attached at all: name the
+namespaces to attach with `schema`.
+
+### Snowflake Horizon Catalog
+
+Snowflake serves its Snowflake-managed Iceberg tables to other engines
+through the Horizon Catalog's Iceberg REST API, at
+`https://<org>-<account>.snowflakecomputing.com/polaris/api/catalog`. The
+warehouse is the database's name (in capitals, if it was created without
+quotes), and its schemas are the connection's. Igloo signs in as a service
+user with a programmatic access token, exchanged for access tokens with the
+role to use:
+
+```sql
+CREATE CONNECTION snow TYPE iceberg
+  WITH (endpoint 'https://myorg-myaccount.snowflakecomputing.com/polaris/api/catalog',
+        warehouse 'ANALYTICS', credential_secret 'snowflake-pat', scope 'session:role:IGLOO_READER');
+```
+
+The role needs `USAGE` on the database and its schemas and `SELECT` on the
+tables; the tables' owner keeps `USAGE` on their external volume. Snowflake
+hands out storage credentials for Amazon S3, Google Cloud Storage and
+Azure. A programmatic access token needs a network policy that lets Igloo's
+addresses in. Horizon serves only Snowflake-managed Iceberg tables, not
+Snowflake's native tables nor Iceberg tables another catalog manages. A
+connection of `TYPE snowflake` (see [Snowflake](#snowflake)) reads those,
+running its queries on a Snowflake warehouse; through Horizon, Igloo reads
+the tables' files itself, and no warehouse runs.
+
+### Databricks
+
+A Databricks open sharing profile (`config.share`) of a share whose tables
+are readable as Iceberg (UniForm, `delta.universalFormat.enabledFormats =
+'iceberg'`) has an `icebergEndpoint`. The warehouse is the share's name, the
+token the profile's `bearerToken`:
+
+```sql
+CREATE CONNECTION dbx TYPE iceberg
+  WITH (endpoint 'https://<workspace>.cloud.databricks.com/api/2.0/opensharing/metastores/<id>/iceberg',
+        warehouse 'my_share', token_secret 'dbx-share-token');
+```
+
+The share's other tables are left out; Delta Sharing's own protocol, for
+tables that are not readable as Iceberg, is [another
+feature](sharing.md#reading-partners-shares). Unity Catalog's own Iceberg
+REST endpoint, `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`,
+takes the catalog's name as the warehouse and a personal access token
+(`token`) or an OAuth2 service principal (`credential 'client-id:secret'`,
+`scope 'all-apis'`, `oauth2_server_uri 'https://<workspace>/oidc/v1/token'`);
+it needs the metastore's external data access turned on and `EXTERNAL USE
+SCHEMA` granted, and is not tested yet.
+
+Databricks writes the tables' Iceberg metadata after each change. On a
+partitioned table with row tracking (`delta.enableRowTracking`), the files
+an `UPDATE`, `DELETE` or `MERGE` rewrites keep row tracking's columns,
+without Iceberg field IDs, before the partition columns, and DuckDB 1.5.6
+reads the partition columns of those files as `NULL`: turn row tracking
+off on partitioned tables shared with Igloo.
+
+### Other catalogs
+
+Apache Polaris and Snowflake Open Catalog take an OAuth2 client
+(`credential`) with `scope 'PRINCIPAL_ROLE:ALL'` or a principal role's.
+AWS Glue's endpoint, `https://glue.<region>.amazonaws.com/iceberg`, with
+the account's ID as the warehouse, and S3 Tables',
+`https://s3tables.<region>.amazonaws.com/iceberg`, with the table bucket's
+ARN, take requests signed with AWS's Signature Version 4 (`signing_name
+'glue'` or `'s3tables'`, and `region`); Glue hands out storage credentials
+for tables Lake Formation manages, and otherwise needs `storage_credential`.
+Signing is checked against a stand-in, not AWS itself, so far. A catalog
+that hands out no storage credentials, such as a Lakekeeper warehouse
+without STS, needs `storage_credential`:
+
+```sql
+CREATE CONNECTION other TYPE iceberg
+  WITH (endpoint 'http://lakekeeper.internal:8181/catalog', warehouse 'analytics', tls 'disable',
+        storage_credential 'AKIA...:...', storage_endpoint 'https://minio.internal:9000', region 'us-east-1');
+```
+
+### How Iceberg REST catalogs are read
+
+DuckDB's iceberg extension attaches the catalog through a proxy inside
+Igloo on the loopback interface, under a random path, as it attaches
+Igloo's own catalog. The proxy:
+
+- adds the catalog's credentials, getting OAuth2 tokens and new ones when
+  they expire or the catalog refuses one, so DuckDB never sees them;
+- answers the lists of namespaces and tables itself, from what the replica
+  found at startup, so listing tables never waits on the catalog;
+- forwards only the loading of a table, with the connection's timeouts, and
+  answers anything that would change the catalog with an error, so not even
+  an admin changes the catalog through Igloo (the catalog is also attached
+  `READ_ONLY`);
+- refuses a table whose files are no longer where they were at startup;
+- hands DuckDB only the storage credentials, their expiry and the region
+  from the catalog's answer, never the catalog's choice of storage endpoint
+  or of plain HTTP: the connection's `storage_endpoint` and the storage
+  provider's own endpoints are the only ones reached.
+
+DuckDB's sandbox, locked at startup, lets SQL read the files of the tables
+found then, besides the warehouse and the allowed locations. Users other
+than admins never name those files themselves (file functions read only
+the warehouse and the allowed locations); admins can. Igloo's own storage
+credentials apply only to the warehouse and the allowed locations, so a
+table is read with the credentials its catalog hands out, or the
+connection's `storage_credential`, never Igloo's. DuckDB 1.5.6 keeps the
+storage credentials it is handed, one set for each read of a table; Igloo
+drops each set two hours after it appears, so a statement reading a table
+for longer than that can fail.
 
 ## Credentials
 
@@ -191,6 +388,18 @@ CONNECTION name SET (password '...')`; Igloo checks the new one works before
 storing it. Sessions already signed in with the old password, which
 PostgreSQL and MySQL let finish, sign in again with the new one once they
 are idle.
+
+An Iceberg REST catalog's `token`, `credential` and `storage_credential` are
+stored the same way, sealed together under the connection's name, and
+`token_secret`, `credential_secret` and `storage_credential_secret` name
+files of `IGLOO_CONNECTION_SECRETS_DIR` instead (a `credential_secret` file
+holds the credential as `credential` would, `client_id:client_secret` or
+the secret alone). Igloo reads a token's file at every request to the
+catalog and a credential's whenever it gets an access token, so rotating
+them there needs nothing more; a storage credential's file is read when the
+replica starts. The storage credentials the catalog hands out for a table
+are DuckDB secrets, scoped to the table's location, which only admins can
+list, with their secret parts redacted.
 
 ## Grants
 
@@ -231,6 +440,11 @@ SHOW GRANTS ON CONNECTION crm;
   [data catalog](catalog.md#external-tables-and-connections) (`igloo.tables`,
   its lineage and usage, the console's catalog) shows a connection's
   tables only to admins and to those with a grant that covers them.
+- An Iceberg REST catalog's tables are looked up as the catalog names them,
+  in their own case: `partner.campaigns.Spend` is not
+  `partner.campaigns.spend`. `iceberg_scan`, `iceberg_metadata` and
+  `iceberg_snapshots` on a connection's table, which read it without naming
+  it as a table, are refused to everyone but admins; query the table.
 
 How the check works: whenever connections are attached, Igloo has DuckDB
 plan every statement of a user who is not an admin. DuckDB's plan shows each
@@ -240,7 +454,12 @@ search path and with views expanded, says which connection, schema and
 table each name means. The two must agree scan for scan, and every table a
 name could mean must be granted; otherwise the statement is refused with
 SQLSTATE `42501`. A scan the check cannot account for, such as one through
-a macro an admin defined, is refused. Every prepared statement of a user
+a macro an admin defined, is refused. The plan shows the scans of an
+Iceberg REST catalog's tables as `ICEBERG_SCAN`, as it shows those of the
+Iceberg catalog's own tables and of `iceberg_scan` calls, without the
+table's name; whenever such a connection is attached, those scans are
+counted together, and the plan must have as many as the parse's tables
+and calls of either kind. Every prepared statement of a user
 who is not an admin, whatever their role, is checked again before it runs
 when grants, views, connections or the session's search path changed since
 it was checked, including statements prepared before a connection was
@@ -282,7 +501,11 @@ ALTER TABLE crm.public.customers ALTER COLUMN phone SET TAG pii = 'phone';
   (`default_transaction_read_only` on PostgreSQL, `SET SESSION TRANSACTION
   READ ONLY` on MySQL), so not even an admin writes through Igloo. Igloo
   sends Snowflake only SELECTs it writes itself (see
-  [Snowflake](#how-igloo-reads-snowflake)).
+  [Snowflake](#how-igloo-reads-snowflake)). An Iceberg REST catalog gets
+  only reads from Igloo (see [how they are
+  read](#how-iceberg-rest-catalogs-are-read)), and Igloo's maintenance,
+  erasure, Delta Sharing, distributed execution and its own Iceberg REST
+  catalog for other engines work on Igloo's catalog only.
 - **Run SQL on the remote database.** The extensions' `postgres_query`,
   `postgres_execute`, `mysql_query` and `mysql_execute`, which run SQL given
   as a string there, and `postgres_scan`, `postgres_scan_pushdown` and
@@ -334,14 +557,17 @@ from showing a password, and lets Igloo:
 
 Startup checks every connection's database at once, so it waits at most
 about the longest `connect_timeout` (for Snowflake, plus the time to read
-its list of tables), and never past 30 seconds before the end of the three
-minutes Igloo gives itself to start. A connection whose database cannot be
-reached by then is left out on that replica until it restarts, with the
-reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
+its list of tables; for an Iceberg REST catalog, the time to find its
+tables, at most two minutes), and never past 30 seconds before the end of
+the three minutes Igloo gives itself to start. A connection whose database
+cannot be reached by then is left out on that replica until it restarts,
+with the reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
 
 Snowflake has no protocol DuckDB speaks, so a Snowflake connection is
 attached at a gateway inside Igloo instead of a proxy; see
-[how Igloo reads Snowflake](#how-igloo-reads-snowflake).
+[how Igloo reads Snowflake](#how-igloo-reads-snowflake). Iceberg REST
+catalogs go through an HTTP proxy of their own; see [how they are
+read](#how-iceberg-rest-catalogs-are-read).
 
 ## Performance
 
@@ -594,8 +820,22 @@ anything.
 ## Limitations
 
 - New connections, and changes to a connection's database or schemas, need
-  a restart of each replica (see [when changes take effect](#when-changes-take-effect)).
+  a restart of each replica (see [when changes take effect](#when-changes-take-effect)),
+  as do tables an Iceberg REST catalog created since a replica started.
 - Read-only: no writes to connections, not even by admins.
+- Iceberg REST catalogs: no remote signing of storage requests, no nested
+  namespaces, no Iceberg views, and no storage credentials from AWS's
+  default credentials (only from the catalog or `storage_credential`). A
+  remote table's metadata decides which
+  files DuckDB reads for it. Igloo opens the sandbox only to the tables'
+  locations, apart from the warehouse, but a remote catalog's manifests can
+  still name files in the warehouse or the allowed locations, which DuckDB
+  would read with Igloo's credentials for whoever may read that remote
+  table, or files of another connection's tables, read with credentials
+  that catalog handed out for another statement (DuckDB keeps them for up
+  to two hours). File paths hold random IDs and are shown only to those who
+  may read the table; connect only catalogs whose writers you trust that
+  far.
 - Not served to other engines: the [Iceberg REST catalog](external-engines.md)
   and [Delta Sharing](sharing.md) serve Iceberg tables only. To share a
   connection's data, copy it into an Iceberg table first.

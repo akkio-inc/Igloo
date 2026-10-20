@@ -227,6 +227,9 @@ type resolver struct {
 	connectionsOnly bool
 	// schemas caches the schemas of connections, by lower-cased name.
 	schemas map[string][]string
+	// conns caches the attached connections, by lower-cased name (see
+	// isConnection).
+	conns map[string]string
 	// lookup and parse, when set, stand in for the session's connection:
 	// lookup returns the objects called a lower-cased name, and parse
 	// parses a statement (see objects.go).
@@ -254,9 +257,22 @@ func (s *Server) newResolver(ctx context.Context, sess *session) (*resolver, err
 }
 
 // isConnection reports whether db is a connection, or any other database
-// that is neither DuckDB's own nor the Iceberg catalog.
+// that is neither DuckDB's own nor the Iceberg catalog. Connections to
+// Iceberg REST catalogs are databases of DuckDB's type iceberg, as the
+// catalog is, so they are told by name.
 func (r *resolver) isConnection(db string) bool {
-	return isConnectionType(r.databases[strings.ToLower(db)])
+	db = strings.ToLower(db)
+	if isConnectionType(r.databases[db]) {
+		return true
+	}
+	if r.conns == nil {
+		r.conns = r.s.connectionCatalogs()
+		if r.conns == nil {
+			r.conns = map[string]string{}
+		}
+	}
+	_, ok := r.conns[db]
+	return ok && !strings.EqualFold(db, r.catalog)
 }
 
 // load fetches the tables and views called any of names that are not
@@ -418,8 +434,15 @@ func (r *resolver) resolve(ref tableRef, view *object) (resolution, error) {
 // connections.
 type readSet struct {
 	// scans is how many catalog table scans DuckDB plans for it.
-	scans  int
-	tables []auth.Object
+	scans int
+	// lake counts the catalog's tables among scans, which DuckDB's plan
+	// shows as ICEBERG_SCAN (as SEQ_SCAN when the catalog is a DuckDB
+	// database, in tests), and icebergFns the calls of iceberg_scan, whose
+	// scans the plan shows the same way. Checks for users whose role reads
+	// the catalog count them with the scans of Iceberg REST catalogs'
+	// tables, which the plan shows the same way too (see connreads.go).
+	lake, icebergFns int
+	tables           []auth.Object
 	// policyTables are the tables that policies read (see
 	// resolver.policyMarker).
 	policyTables []auth.Object
@@ -470,6 +493,11 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 			return rs, err
 		}
 	}
+	if r.connectionsOnly {
+		if err := r.tableArgCalls(w.tableFunctions, view, &rs); err != nil {
+			return rs, err
+		}
+	}
 
 	names := make([]string, len(w.refs))
 	for i, ref := range w.refs {
@@ -504,6 +532,8 @@ func (r *resolver) analyze(text string, view *object, depth int) (readSet, error
 		}
 		if first != nil {
 			rs.scans += first.scans
+			rs.lake += first.lake
+			rs.icebergFns += first.icebergFns
 			rs.connScans = append(rs.connScans, first.connScans...)
 		}
 		if r.policyMarker != "" && strings.HasPrefix(ref.alias, r.policyMarker) {
@@ -561,7 +591,7 @@ func (r *resolver) reads(o object, depth int) (readSet, error) {
 			return rs, err
 		}
 	case strings.EqualFold(o.db, r.catalog):
-		rs = readSet{scans: 1, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
+		rs = readSet{scans: 1, lake: 1, tables: []auth.Object{{Schema: o.schema, Table: o.name}}}
 	case r.isConnection(o.db):
 		// The history's analysis (r.lookup) refuses nothing.
 		if r.lookup == nil {
@@ -720,8 +750,12 @@ func viewBody(sql string) string {
 	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sc.rest()), ";"))
 }
 
-// fnRef is a function a query calls.
-type fnRef struct{ schema, name string }
+// fnRef is a function a query calls, and for a table function its
+// arguments, as DuckDB parsed them.
+type fnRef struct {
+	schema, name string
+	args         []any
+}
 
 // astWalk collects the table references and function calls of a parsed
 // query. References to common table expressions are followed into their
@@ -806,7 +840,7 @@ func (w *astWalk) walk(n any, sc *cteScope) {
 			}
 		case "TABLE_FUNCTION":
 			if f, ok := n["function"].(map[string]any); ok {
-				w.tableFunctions = append(w.tableFunctions, fnRef{schema: str(f["schema"]), name: str(f["function_name"])})
+				w.tableFunctions = append(w.tableFunctions, fnRef{schema: str(f["schema"]), name: str(f["function_name"]), args: asList(f["children"])})
 			}
 		}
 		if str(n["class"]) == "FUNCTION" && n["is_operator"] != true {

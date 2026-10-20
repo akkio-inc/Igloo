@@ -371,6 +371,9 @@ func (a *analyzer) snapshot(ctx context.Context) *objectSnapshot {
 		return snap
 	}
 	known := map[string]bool{}
+	// Connections to Iceberg REST catalogs are databases of type iceberg,
+	// as the catalog is; they are known by name.
+	conns := a.s.connectionCatalogs()
 	for _, row := range rows {
 		o := object{}
 		o.db, _ = row[0].(string)
@@ -385,7 +388,9 @@ func (a *analyzer) snapshot(ctx context.Context) *objectSnapshot {
 		}
 		k := strings.ToLower(o.name)
 		snap.byName[k] = append(snap.byName[k], o)
-		if strings.EqualFold(o.db, a.s.catalogName()) || o.catalogView || o.external || isConnectionType(snap.databases[strings.ToLower(o.db)]) {
+		_, connection := conns[strings.ToLower(o.db)]
+		if strings.EqualFold(o.db, a.s.catalogName()) || o.catalogView || o.external || connection ||
+			isConnectionType(snap.databases[strings.ToLower(o.db)]) {
 			known[k] = true
 		}
 	}

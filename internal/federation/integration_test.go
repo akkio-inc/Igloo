@@ -530,6 +530,42 @@ func TestPostgresStore(t *testing.T) {
 		t.Errorf("decrypted with the wrong key: %+v", x)
 	}
 
+	// An Iceberg REST catalog: its credentials sealed together, its other
+	// settings in the clear.
+	ice := New(randomName("ice_"), Iceberg)
+	for k, v := range map[string]string{"endpoint": "https://catalog.example.com/api", "warehouse": "wh", "credential": "id:s3cret-client",
+		"scope": "PRINCIPAL_ROLE:ALL", "storage_credential": "AKIA:s3cret-storage", "region": "eu-west-1"} {
+		if err := ice.Set(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Create(ctx, ice); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Delete(ctx, ice.Name) })
+	var sealedRow []byte
+	var settings string
+	if err := s.pool.QueryRow(ctx, "SELECT password, settings::text FROM igloo_auth.connections WHERE name = $1", ice.Name).Scan(&sealedRow, &settings); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"s3cret-client", "s3cret-storage"} {
+		if bytes.Contains(sealedRow, []byte(secret)) || strings.Contains(settings, secret) {
+			t.Errorf("%s is stored in the clear", secret)
+		}
+	}
+	listed, err := s.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range listed {
+		if x.Name == ice.Name && (x.Iceberg != ice.Iceberg || x.Type != Iceberg || x.Host != "catalog.example.com" || x.Unusable != "") {
+			t.Errorf("listed: %+v", x)
+		}
+	}
+	if err := s.Delete(ctx, ice.Name); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := s.Delete(ctx, name); err != nil {
 		t.Fatal(err)
 	}
