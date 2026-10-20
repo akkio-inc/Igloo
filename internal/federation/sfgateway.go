@@ -875,22 +875,34 @@ func release(recs []arrow.Record) {
 // its query fails.
 const fetchAttempts = 3
 
+// fetchAttemptTimeout bounds each download of a batch but the last, so that
+// one that stalls, as one did for 5.5 minutes before it was cut off, is
+// tried again sooner; the last is bounded by query_timeout only, so that a
+// slow network still gets the batch. A variable for tests.
+var fetchAttemptTimeout = 2 * time.Minute
+
 // fetchBatch downloads a batch of a result, within timeout. A download that
-// fails, such as one cut off part way, is tried again: the batch is a file
-// Snowflake keeps for as long as the result, and nothing of it has been
-// sent yet.
+// fails or stalls, such as one cut off part way, is tried again: the batch
+// is a file Snowflake keeps for as long as the result, and nothing of it has
+// been sent yet.
 func fetchBatch(ctx context.Context, b sfBatch, timeout time.Duration) ([]arrow.Record, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	var err error
+	var last error
 	for attempt := 1; ; attempt++ {
-		var recs []arrow.Record
-		if recs, err = b.fetch(ctx); err == nil {
+		actx, cancel := ctx, context.CancelFunc(func() {})
+		if attempt < fetchAttempts {
+			actx, cancel = context.WithTimeout(ctx, fetchAttemptTimeout)
+		}
+		recs, err := b.fetch(actx)
+		cancel()
+		if err == nil {
 			return recs, nil
 		}
+		last = err
 		if attempt == fetchAttempts || ctx.Err() != nil {
 			break
 		}
@@ -902,7 +914,7 @@ func fetchBatch(ctx context.Context, b sfBatch, timeout time.Duration) ([]arrow.
 	if ctx.Err() == context.DeadlineExceeded {
 		return nil, fmt.Errorf("Snowflake did not deliver a part of the result within query_timeout (%s)", timeout)
 	}
-	return nil, snowflakeError("download the result", err)
+	return nil, snowflakeError("download the result", last)
 }
 
 // copyStart begins COPY data of n columns.

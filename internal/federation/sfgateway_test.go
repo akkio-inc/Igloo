@@ -71,13 +71,18 @@ func (f *fakeSnowflake) sent() []string {
 
 type fakeBatch []arrow.Record
 
-// flakyBatch fails its first fails downloads, as one cut off part way would.
+// flakyBatch fails its first fails downloads, as one cut off part way would,
+// after stalling its first stalls until it is stopped.
 type flakyBatch struct {
-	fails, calls int
+	fails, stalls, calls int
 }
 
-func (b *flakyBatch) fetch(context.Context) ([]arrow.Record, error) {
+func (b *flakyBatch) fetch(ctx context.Context) ([]arrow.Record, error) {
 	b.calls++
+	if b.calls <= b.stalls {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if b.calls <= b.fails {
 		return nil, errors.New("decoding Arrow batch: arrow/ipc: could not read message body: unexpected EOF")
 	}
@@ -98,6 +103,22 @@ func TestFetchBatchRetries(t *testing.T) {
 	b = &flakyBatch{fails: fetchAttempts}
 	if _, err := fetchBatch(ctx, b, 0); err == nil || b.calls != 1 {
 		t.Errorf("err %v after %d downloads of a canceled query", err, b.calls)
+	}
+
+	// A stalled download is tried again after fetchAttemptTimeout, and the
+	// last attempt waits for as long as the query may.
+	attempt := fetchAttemptTimeout
+	fetchAttemptTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { fetchAttemptTimeout = attempt })
+	b = &flakyBatch{stalls: fetchAttempts - 1, fails: fetchAttempts - 1}
+	if _, err := fetchBatch(context.Background(), b, 0); err != nil || b.calls != fetchAttempts {
+		t.Errorf("err %v after %d downloads", err, b.calls)
+	}
+	b = &flakyBatch{stalls: fetchAttempts, fails: fetchAttempts}
+	start := time.Now()
+	_, err := fetchBatch(context.Background(), b, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "within query_timeout") || time.Since(start) < time.Second {
+		t.Errorf("err %v after %s", err, time.Since(start))
 	}
 }
 
