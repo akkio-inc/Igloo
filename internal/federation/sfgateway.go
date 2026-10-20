@@ -273,6 +273,7 @@ func (g *sfGateway) handle(conn net.Conn) {
 	if be.Flush() != nil || be.SetAuthType(pgproto3.AuthTypeCleartextPassword) != nil {
 		return
 	}
+	be.SetMaxBodyLen(maxPasswordMessage)
 	msg, err := be.Receive()
 	if err != nil {
 		return

@@ -47,6 +47,11 @@ import (
 // their parameters.
 const maxMessage = 1 << 30
 
+// maxPasswordMessage bounds the message that carries the token. Anyone on
+// the host can connect to the loopback port and claim a body of any length,
+// which would otherwise be allocated before the token is checked.
+const maxPasswordMessage = 1024
+
 // servePostgres signs DuckDB in with the token and runs its session.
 func (p *proxy) servePostgres(client net.Conn, c Connection) error {
 	// DuckDB has as long as the remote database to finish signing in.
@@ -84,6 +89,7 @@ func (p *proxy) servePostgres(client net.Conn, c Connection) error {
 	if err := be.SetAuthType(pgproto3.AuthTypeCleartextPassword); err != nil {
 		return err
 	}
+	be.SetMaxBodyLen(maxPasswordMessage)
 	msg, err := be.Receive()
 	if err != nil {
 		return errClientGone
