@@ -1,7 +1,7 @@
 /*
  * Igloo landing: site header and hero (Linear style, dark only).
- * A frosted tray header floats over a full-bleed illustration; the copy sits on a dark scrim to its left.
- * Below 768 px the illustration becomes a banner above the copy. Colours, widths and fonts come from the site tokens.
+ * A frosted tray header floats over the whole illustration, which spans the hero; the copy sits on a frosted
+ * panel between the igloo and the moon. Below 900 px the illustration becomes a banner above the copy. Colours, widths and fonts come from the site tokens.
  */
 .vx-header,
 .vx-hero {
@@ -130,55 +130,63 @@
 	overflow: hidden;
 	margin-top: calc(-1 * var(--vx-hh));
 	padding-top: var(--vx-hh);
-	min-height: clamp(560px, 45vw, 680px);
+	min-height: var(--hero-h);
 	background: var(--vx-ink);
+	--hero-h: max(clamp(520px, 40vw, 640px), 100vw / 3 + 72px);
+	--panel-w: min(640px, 52vw);
 }
-/* the illustration on the right, faded into the page at its edges */
+/* the whole illustration (3:1) across the hero's bottom; its sky fades into the page above, its snow below */
 .vx-hero__art {
 	position: absolute;
 	z-index: -2;
-	left: 45.5%;
+	left: 0;
 	right: 0;
-	top: 12%;
+	top: auto;
 	bottom: 0;
-	-webkit-mask-image: linear-gradient(90deg, transparent 0, rgba(0, 0, 0, 0.6) 9%, #000 22%), linear-gradient(180deg, transparent 0, #000 36px, #000 calc(100% - 80px), transparent 100%);
-	-webkit-mask-composite: source-in;
-	mask-image: linear-gradient(90deg, transparent 0, rgba(0, 0, 0, 0.6) 9%, #000 22%), linear-gradient(180deg, transparent 0, #000 36px, #000 calc(100% - 80px), transparent 100%);
-	mask-composite: intersect;
+	-webkit-mask-image: linear-gradient(180deg, transparent 0, #000 16%, #000 84%, transparent 100%);
+	mask-image: linear-gradient(180deg, transparent 0, #000 16%, #000 84%, transparent 100%);
+	aspect-ratio: 3 / 1;
 }
 .vx-hero__art img {
 	width: 100%;
 	height: 100%;
 	max-width: none;
 	object-fit: cover;
-	object-position: 0% 50%;
-	filter: brightness(0.85) saturate(0.74) contrast(1.045);
+	object-position: 50% 50%;
+	filter: brightness(0.9) saturate(0.82) contrast(1.04);
 }
-/* scrims: solid behind the copy, easing into the art; a blue night haze along the bottom */
+/* no scrim: the copy brings its own frosted panel, so the igloo and the moon stay clear */
 .vx-hero::before {
 	content: '';
 	position: absolute;
 	inset: 0;
 	z-index: -1;
 	pointer-events: none;
-	background:
-		linear-gradient(90deg, var(--vx-ink) 26%, rgba(10, 13, 18, 0.3) 36%, rgba(10, 13, 18, 0) 65%),
-		linear-gradient(0deg, rgba(14, 24, 39, 1) 0, rgba(14, 24, 39, 0.4) 75px, rgba(14, 24, 39, 0) 160px),
-		linear-gradient(90deg, rgba(6, 17, 30, 0) 7.5%, rgba(6, 17, 30, 0.9) 42.5%, rgba(6, 17, 30, 0) 52%);
+	background: none;
 }
 .vx-hero__inner {
-	width: min(100% - 2 * var(--gutter), var(--content));
-	margin-inline: auto;
-	padding: clamp(40px, 5.5vw, 80px) 0 clamp(40px, 4vw, 64px);
+	width: 100%;
+	margin-inline: 0;
+	padding: clamp(24px, 3vw, 40px) 0 clamp(48px, 5vw, 72px);
 	display: flex;
 	align-items: center;
-	min-height: calc(clamp(560px, 45vw, 680px) - var(--vx-hh));
+	min-height: calc(var(--hero-h) - var(--vx-hh));
 }
+/* a frosted panel like the header's tray, centred between the igloo (left third) and the moon */
 .vx-hero__copy {
 	display: flex;
 	flex-direction: column;
 	align-items: flex-start;
-	max-width: 620px;
+	max-width: none;
+	width: var(--panel-w);
+	margin-left: max(34vw, 60vw - var(--panel-w) / 2);
+	padding: clamp(28px, 3vw, 44px);
+	border: 1px solid rgba(175, 195, 220, 0.145);
+	border-radius: 20px;
+	background: rgba(9, 13, 19, 0.55);
+	-webkit-backdrop-filter: blur(14px) saturate(1.4);
+	backdrop-filter: blur(14px) saturate(1.4);
+	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 24px 60px rgba(0, 0, 0, 0.35);
 }
 .vx-hero__title {
 	margin-left: -0.04em;
@@ -295,6 +303,43 @@
 	background: linear-gradient(var(--surface-2), var(--surface-2)) padding-box, linear-gradient(180deg, #4a525b, #2c323b) border-box;
 }
 /* ------------------------------------------------------------------ the nav collapses behind a menu button */
+/* ------------------------------------------------------------------ below 1200 px the whole illustration is a banner
+   above the copy: narrower, the 3:1 picture is too short to hold the panel */
+@media (max-width: 1199px) {
+	.vx-hero__art {
+		position: relative;
+		inset: auto;
+		width: 100%;
+		-webkit-mask-image: linear-gradient(180deg, transparent 0, #000 12%, #000 80%, transparent 100%);
+		mask-image: linear-gradient(180deg, transparent 0, #000 12%, #000 80%, transparent 100%);
+	}
+	.vx-hero::before {
+		background: none;
+	}
+	.vx-hero {
+		min-height: 0;
+	}
+	.vx-hero__inner {
+		display: block;
+		width: min(100% - 2 * var(--gutter), var(--content));
+		min-height: 0;
+		margin-inline: auto;
+		padding: 8px 0 48px;
+	}
+	.vx-hero__copy {
+		max-width: 40rem;
+		width: auto;
+		margin-left: 0;
+		padding: 0;
+		border: 0;
+		border-radius: 0;
+		background: none;
+		-webkit-backdrop-filter: none;
+		backdrop-filter: none;
+		box-shadow: none;
+	}
+}
+
 @media (max-width: 899px) {
 	.vx-header.vx-js .vx-header__menu {
 		display: grid;
@@ -336,20 +381,9 @@
 	.vx-header__brand {
 		font-size: 1.375rem;
 	}
-	.vx-hero__art {
-		left: 38%;
-	}
-	.vx-hero::before {
-		background:
-			linear-gradient(90deg, var(--vx-ink) 40%, rgba(10, 13, 18, 0.55) 54%, rgba(10, 13, 18, 0) 75%),
-			linear-gradient(0deg, rgba(14, 24, 39, 1) 0, rgba(14, 24, 39, 0) 160px);
-	}
-	.vx-hero__copy {
-		max-width: 56%;
-	}
 }
 
-/* ------------------------------------------------------------------ phones: the illustration becomes a banner */
+/* ------------------------------------------------------------------ phones */
 @media (max-width: 767px) {
 	.vx-header__inner {
 		padding: 0 8px 0 14px;
@@ -359,27 +393,6 @@
 		border-right: 0;
 	}
 	.vx-hero {
-		min-height: 0;
-	}
-	.vx-hero__art {
-		position: relative;
-		inset: auto;
-		z-index: -2;
-		height: auto;
-		aspect-ratio: 4 / 3;
-		margin-top: calc(-1 * var(--vx-hh));
-		-webkit-mask-image: linear-gradient(180deg, #000 70%, transparent);
-		mask-image: linear-gradient(180deg, #000 70%, transparent);
-	}
-	.vx-hero__art img {
-		object-position: 20% 78%;
-	}
-	.vx-hero::before {
-		background: linear-gradient(180deg, rgba(10, 13, 18, 0.55) 0, rgba(10, 13, 18, 0) 22%);
-	}
-	.vx-hero__inner {
-		margin-top: -48px;
-		padding-top: 0;
 		min-height: 0;
 	}
 	.vx-hero__copy {
