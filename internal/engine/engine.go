@@ -73,8 +73,10 @@ type Engine struct {
 	// erasure supplies igloo.erasure_requests; see SetErasure.
 	erasure atomic.Pointer[erasureConfig]
 	// catMu keeps binding, walking and changing the attached catalog's
-	// in-memory set of tables apart. See CatalogLock.
-	catMu sync.RWMutex
+	// in-memory set of tables apart. See CatalogLock. catLocked is when it
+	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
+	catMu     sync.RWMutex
+	catLocked atomic.Int64
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -193,7 +195,11 @@ func (e *Engine) LocalDatabase() string { return e.local }
 // session holds it.
 func (e *Engine) CatalogLock() func() {
 	e.catMu.Lock()
-	return e.catMu.Unlock
+	e.catLocked.Store(time.Now().UnixNano())
+	return func() {
+		e.catLocked.Store(0)
+		e.catMu.Unlock()
+	}
 }
 
 // CatalogShare takes the catalog lock shared, for binding a statement
@@ -202,6 +208,42 @@ func (e *Engine) CatalogLock() func() {
 func (e *Engine) CatalogShare() func() {
 	e.catMu.RLock()
 	return e.catMu.RUnlock
+}
+
+// CatalogShareContext is CatalogShare that stops waiting, and returns ctx's
+// error, when ctx ends. A sync.RWMutex cannot stop waiting, so a goroutine
+// waits in its place in the lock's queue, as RLock does, behind writers that
+// came first and ahead of those that come later, and hands the lock over;
+// if ctx ended first, it lets go of the lock as soon as it gets it.
+func (e *Engine) CatalogShareContext(ctx context.Context) (func(), error) {
+	if e.catMu.TryRLock() {
+		return e.catMu.RUnlock, nil
+	}
+	got, gaveUp := make(chan struct{}), make(chan struct{})
+	go func() {
+		e.catMu.RLock()
+		select {
+		case got <- struct{}{}:
+		case <-gaveUp:
+			e.catMu.RUnlock()
+		}
+	}()
+	select {
+	case <-got:
+		return e.catMu.RUnlock, nil
+	case <-ctx.Done():
+		close(gaveUp)
+		return nil, ctx.Err()
+	}
+}
+
+// CatalogLockedFor is how long the catalog lock has been held exclusively,
+// or 0 if it is not.
+func (e *Engine) CatalogLockedFor() time.Duration {
+	if at := e.catLocked.Load(); at != 0 {
+		return time.Since(time.Unix(0, at))
+	}
+	return 0
 }
 
 // CatalogChanged says the catalog changed other than through DuckDB (a view

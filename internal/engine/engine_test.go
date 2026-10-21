@@ -3,10 +3,12 @@ package engine
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akkio-inc/igloo/internal/config"
 )
@@ -233,5 +235,43 @@ func TestSettingStatements(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
 		}
+	}
+}
+
+func TestCatalogShareContext(t *testing.T) {
+	var e Engine
+	if e.CatalogLockedFor() != 0 {
+		t.Error("an unlocked catalog counts as locked")
+	}
+	unlock := e.CatalogLock()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := e.CatalogShareContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shared while held exclusively: %v", err)
+	}
+	if held := e.CatalogLockedFor(); held < 50*time.Millisecond {
+		t.Errorf("held for %s", held)
+	}
+	// A login waiting for it gets it once it is released.
+	got := make(chan error, 1)
+	go func() {
+		release, err := e.CatalogShareContext(context.Background())
+		if err == nil {
+			release()
+		}
+		got <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	unlock()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("still waiting after the lock was released")
+	}
+	if e.CatalogLockedFor() != 0 {
+		t.Error("a released catalog lock counts as held")
 	}
 }

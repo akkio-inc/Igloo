@@ -65,6 +65,10 @@ type Engine interface {
 	// func that releases it. See engine.Engine.CatalogLock.
 	CatalogLock() func()
 	CatalogShare() func()
+	// CatalogShareContext is CatalogShare that gives up when ctx ends, and
+	// CatalogLockedFor is how long the lock has been held exclusively.
+	CatalogShareContext(ctx context.Context) (func(), error)
+	CatalogLockedFor() time.Duration
 	// CatalogChanged says the catalog changed other than through DuckDB's
 	// own requests, so that DuckDB's next listings of it ask the catalog
 	// again (see catalogproxy's listings); ListingsGeneration changes
@@ -229,6 +233,7 @@ type Server struct {
 	sessions    *registry
 	roleRefresh time.Duration
 	timeout     time.Duration
+	loginWait   time.Duration
 	maxConns    int
 	conns       atomic.Int32
 	version     string
@@ -319,6 +324,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		timeout:     opts.StatementTimeout,
 		maxConns:    opts.MaxConnections,
 		version:     opts.Version,
+		loginWait:   loginCatalogWait,
 		ddl:         opts.DDL,
 		activity:    opts.Activity,
 		grants:      opts.Grants,
@@ -634,17 +640,29 @@ func (s *Server) cancelRequest(_ context.Context, pid, secret int32) error {
 	return nil
 }
 
+// loginCatalogWait bounds how long opening a session waits for the catalog
+// lock (see openSession); it is Server.loginWait, which tests shorten.
+const loginCatalogWait = 30 * time.Second
+
 func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	sess := sessionFrom(ctx)
 	if sess == nil {
 		return ctx, errors.New("session was not authenticated")
 	}
-	// Opening the connection selects the catalog's default schema, which
-	// binds against the catalog like any statement does (see the bind hold
-	// below), before that hold is set; hold the lock shared for it.
-	releaseCatalog := s.shareCatalog(sess)
+	// Opening the connection selects the catalog's default schema, and the
+	// session's setup below defines its macros and views; both bind against
+	// the catalog like any statement does (see the bind hold below), so the
+	// session holds the lock shared through both. A listing or DDL holds it
+	// exclusively while it runs, and one that runs long would keep every
+	// login waiting with it, so a login waits at most loginWait for it.
+	releaseCatalog, err := s.shareCatalogForLogin(ctx, sess)
+	if err != nil {
+		s.sessions.remove(sess)
+		s.releaseConn()
+		return ctx, err
+	}
+	defer releaseCatalog()
 	conn, meter, err := s.engine.ConnectMetered(ctx)
-	releaseCatalog()
 	if err != nil {
 		s.sessions.remove(sess)
 		s.releaseConn()
@@ -1282,6 +1300,33 @@ func (s *Server) withoutCatalog(sess *session, wait func()) {
 	s.unlockCatalog(sess)
 	defer s.relockCatalog(sess)
 	wait()
+}
+
+// shareCatalogForLogin is shareCatalog for opening a session, which waits
+// at most loginWait for the engine's lock and then fails, saying how long a
+// listing or DDL has held it.
+func (s *Server) shareCatalogForLogin(ctx context.Context, sess *session) (func(), error) {
+	if s.catalogName() == "" || sess.catHeld != catalogFree {
+		return s.shareCatalog(sess), nil
+	}
+	wctx, cancel := context.WithTimeout(ctx, s.loginWait)
+	defer cancel()
+	release, err := s.engine.CatalogShareContext(wctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		held := s.engine.CatalogLockedFor().Round(time.Second)
+		s.log.Warn("login refused: the catalog lock is busy", "user", sess.user.Name, "waited", s.loginWait, "held_for", held)
+		msg := fmt.Sprintf("cannot open a session: waited %s for the catalog lock", s.loginWait)
+		if held > 0 {
+			msg += fmt.Sprintf(", which a statement listing or changing the catalog has held for %s", held)
+		}
+		return nil, pgerror.WithCode(errors.New(msg+"; try again later"), codes.CannotConnectNow)
+	}
+	// The session holds the lock now: the hold below takes it no further.
+	sess.catRelease, sess.catHeld = release, catalogShared
+	return s.shareCatalog(sess), nil
 }
 
 // catalogRunLock holds the catalog lock exclusively for a run that changes

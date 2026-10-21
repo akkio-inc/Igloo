@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 )
@@ -297,6 +298,8 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 
 	ctx, err = srv.Session(ctx)
 	if err != nil {
+		// Tell the client why, as a failed authentication does.
+		_ = WriteUnterminatedError(writer, psqlerr.WithSeverity(err, psqlerr.LevelFatal))
 		return err
 	}
 

@@ -102,6 +102,7 @@ func serve() error {
 	}
 	log := newLogger(cfg)
 	log.Info("starting igloo", "version", version)
+	engine.ExitOnCrash(log)
 
 	tlsConfig, err := loadTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
 	if err != nil {

@@ -89,16 +89,36 @@ func (m *Meter) Last(query string) *audit.Resources {
 // ExplainAnalyze runs fn, which runs an EXPLAIN ANALYZE, with DuckDB's own
 // profiling settings, since the plan it prints shows only the metrics they
 // collect, and then puts Igloo's back.
+//
+// The profiler covers only SELECTs (which EXPLAIN ANALYZE is profiled as
+// either way) while the metrics change. In DuckDB 1.5.6, a statement that
+// changes the metrics while the profiler covers it, after a query the
+// profiler measured with the old ones, leaves the profiler stuck on that
+// statement: the EXPLAIN ANALYZE then writes its operators' measurements
+// into the stuck profile and segfaults (QueryProfiler::Flush), on a DuckDB
+// worker thread as often as not.
 func (m *Meter) ExplainAnalyze(ctx context.Context, fn func() error) error {
 	if m == nil {
 		return fn()
 	}
-	if _, err := m.conn.ExecContext(ctx, "RESET custom_profiling_settings"); err != nil {
-		return err
+	for _, stmt := range []string{"SET profiling_coverage = 'SELECT'", "RESET custom_profiling_settings"} {
+		if _, err := m.conn.ExecContext(ctx, stmt); err != nil {
+			return errors.Join(err, m.restore(ctx))
+		}
 	}
-	err := fn()
-	_, restore := m.conn.ExecContext(context.WithoutCancel(ctx), profilingStatements[len(profilingStatements)-1])
-	return errors.Join(err, restore)
+	return errors.Join(fn(), m.restore(ctx))
+}
+
+// restore puts Igloo's profiling settings back after ExplainAnalyze: the
+// metrics first, while the profiler still covers only SELECTs.
+func (m *Meter) restore(ctx context.Context) error {
+	ctx = context.WithoutCancel(ctx)
+	var errs []error
+	for _, stmt := range []string{profilingStatements[2], profilingStatements[1]} {
+		_, err := m.conn.ExecContext(ctx, stmt)
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // sameQuery compares statement texts, ignoring the whitespace and

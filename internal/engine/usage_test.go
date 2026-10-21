@@ -155,3 +155,68 @@ func TestMeter(t *testing.T) {
 		t.Error("closing the meter left the connection open")
 	}
 }
+
+// TestMeterExplainAnalyze runs EXPLAIN ANALYZE as a session does: prepared,
+// then a query of Igloo's checks (measured with Igloo's metrics, as every
+// statement on the connection is), then run with DuckDB's own metrics. The
+// query is large enough for DuckDB's worker threads to run parts of it.
+// DuckDB 1.5.6 segfaulted here when the metrics changed while the profiler
+// covered the statement changing them, and as the container's first process
+// Igloo then hung instead of exiting.
+func TestMeterExplainAnalyze(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close() //nolint:errcheck
+	conn, meter, err := e.ConnectMetered(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meter.Close() //nolint:errcheck
+	const query = "SELECT count(*) FROM range(10000000) t(i) WHERE i % 7 = 0"
+	for range 5 {
+		st, err := conn.PrepareContext(ctx, "EXPLAIN ANALYZE "+query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rowsOf(t, ctx, conn, "SELECT count(*) FROM duckdb_functions()")
+		var plan string
+		err = meter.ExplainAnalyze(ctx, func() error {
+			rows, err := st.(*duckdb.Stmt).QueryContext(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer rows.Close() //nolint:errcheck
+			dest := make([]driver.Value, 2)
+			if err := rows.Next(dest); err != nil {
+				return err
+			}
+			plan, _ = dest[1].(string)
+			return nil
+		})
+		if err := errors.Join(err, st.Close()); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(plan, query) || !strings.Contains(plan, "FILTER") {
+			t.Fatalf("the plan is not the statement's:\n%s", plan)
+		}
+		// Igloo's settings are back: statements are measured again, with
+		// Igloo's metrics only.
+		if got := rowsOf(t, ctx, conn, "SELECT current_setting('profiling_coverage')"); got[0] != "ALL" {
+			t.Errorf("profiling coverage %s", got[0])
+		}
+		rowsOf(t, ctx, conn, query)
+		if used := meter.Last(query); used == nil || used.CPUTime <= 0 {
+			t.Errorf("measured %+v", used)
+		}
+		info, err := duckdb.GetProfilingInfo(meter.conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := info.Metrics["LATENCY"]; ok || info.Metrics["QUERY_NAME"] != query {
+			t.Errorf("the profiler measured %v", info.Metrics)
+		}
+	}
+}

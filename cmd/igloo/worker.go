@@ -33,6 +33,7 @@ func serveWorker() error {
 	}
 	log := newLogger(cfg).With("role", "worker")
 	log.Info("starting igloo worker", "version", version)
+	engine.ExitOnCrash(log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

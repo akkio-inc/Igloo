@@ -18,6 +18,10 @@ otherwise unchanged except for these patches:
 - `igloo_tls.go` (new) and `wire.go`, `serve`: `IsTLS` reports whether a
   connection negotiated TLS, so authentication can ask for a clear-text
   password (an identity provider's access token) only inside TLS.
+- `wire.go`, `serve`: an error from the `Session` handler, which opens the
+  session once the client has signed in, reaches the client as a FATAL
+  error, as an authentication failure does. The connection used to close
+  without one.
 - `igloo_notice.go` (new): the `Noticer` interface, which a statement's
   `DataWriter` implements, sends the client a warning as a NoticeResponse,
   as PostgreSQL does, for statements that succeed but leave something open

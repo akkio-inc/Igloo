@@ -301,6 +301,11 @@ created, renamed or dropped there:
   `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
   snapshot of the tables bound — holds nothing.
 
+Opening a session shares the catalog too, as a bind does: it selects the
+catalog's default schema. A login waits at most 30 seconds for a listing or
+DDL that has the catalog to itself, and then fails with SQLSTATE `57P03`,
+saying how long the catalog has been held, rather than waiting with it.
+
 These serialized steps are brief (preparing or binding a statement, a
 listing, most DDL), and they do not wait for data queries to finish, nor data
 queries for them beyond their bind. So a `dbt` run swapping tables and a BI
@@ -897,6 +902,8 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |
 | `CREATE TABLE` fails with `schema: data did not match any variant` | The table has a column the catalog cannot store, such as a `GEOMETRY`; store `ST_AsWKB(geom)` instead ([media analytics](media-analytics.md#loading-boundaries)). |
 | SQLSTATE `53300` | The replica is at `IGLOO_MAX_CONNECTIONS`. Use a connection pool, raise the limit, or add replicas. |
+| SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | A listing or DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |
+| Log says `crashed outside Go code, in DuckDB or an extension; exiting`, and the replica restarts | DuckDB crashed on one of its own threads. Igloo exits with status 2 so that Docker or Kubernetes restarts it, rather than keep a session that will never finish; the goroutine dump that follows in the log shows the statements that were running. |
 | Startup fails with `warehouse already exists in bucket ...` | `IGLOO_WAREHOUSE_LOCATION` does not match the existing warehouse. Point it at the existing data or use a different `IGLOO_CATALOG_WAREHOUSE`. |
 | Startup retries `catalog not reachable yet` | The catalog or its database is not up. Igloo waits up to 3 minutes. |
 | `/readyz` returns 503 | The body names the failing dependency: engine, metadata database or catalog. |
