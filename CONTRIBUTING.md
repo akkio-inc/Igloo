@@ -187,24 +187,6 @@ cd site && npx wrangler@4.147.0 deploy
   under [Known limitations](docs/privacy.md#known-limitations), with what an
   admin can do about it.
 
-## Sign-off
-
-Igloo uses the [Developer Certificate of Origin](https://developercertificate.org/)
-(DCO) instead of a Contributor License Agreement. There is nothing to sign
-before you contribute. Instead, every commit carries a `Signed-off-by` line,
-which certifies that you wrote the change or otherwise have the right to submit
-it under the project's license, Apache 2.0.
-
-`git commit -s` adds the line from your `user.name` and `user.email`:
-
-```
-Signed-off-by: Jane Doe <jane@example.com>
-```
-
-To sign off commits you have already made, run `git commit --amend -s --no-edit`
-for the last one, or `git rebase --signoff main` for a whole branch, then force-push.
-Pull requests with commits that are not signed off cannot be merged.
-
 ## Releasing
 
 For maintainers:

@@ -8,7 +8,6 @@
 
 ## Checklist
 
-- [ ] Every commit is signed off (`git commit -s`); see [CONTRIBUTING.md](https://github.com/akkio-inc/Igloo/blob/main/CONTRIBUTING.md#sign-off).
 - [ ] `make test` passes, and new behavior has tests.
 - [ ] User-visible changes are in `CHANGELOG.md` under Unreleased.
 - [ ] New or changed settings are documented in `docs/configuration.md`.
