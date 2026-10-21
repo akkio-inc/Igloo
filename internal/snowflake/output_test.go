@@ -2,8 +2,10 @@ package snowflake
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -102,7 +104,7 @@ func TestApproxCountDistinctSketches(t *testing.T) {
 		}
 	}
 
-	// As a window function, per partition.
+	// As a window function, per partition, exactly.
 	rows, err := conn.QueryContext(ctx, translate(`select distinct g, approx_count_distinct(c2) over (partition by g) from t order by g`))
 	if err != nil {
 		t.Fatal(err)
@@ -114,11 +116,74 @@ func TestApproxCountDistinctSketches(t *testing.T) {
 			t.Fatal(err)
 		}
 		// i % 7246 of even and of odd i: 3,623 values each.
-		if math.Abs(float64(n)/3623-1) > 0.03 {
+		if n != 3623 {
 			t.Errorf("partition %d: %d, exact 3623", g, n)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestApproxCountDistinctGroupedCountsExactly checks that APPROX_COUNT_DISTINCT
+// and HLL count exactly in selects with GROUP BY and as window functions,
+// where a sketch per group is slower than COUNT(DISTINCT), and with the
+// sketch elsewhere, a subquery of a grouped select included.
+func TestApproxCountDistinctGroupedCountsExactly(t *testing.T) {
+	for _, c := range []struct {
+		sql           string
+		exact, sketch int
+	}{
+		{`select approx_count_distinct(x) from t`, 0, 1},
+		{`select g, approx_count_distinct(x) from t group by g`, 1, 0},
+		{`select g, hll(x, y) from t group by all`, 1, 0},
+		{`select g, round(approx_count_distinct(x) / 2) from t group by rollup (g) having hll(x) > 1`, 2, 0},
+		{`select approx_count_distinct(x) over (partition by g) from t`, 1, 0},
+		{`select g, (select approx_count_distinct(x) from t) from t group by g`, 0, 1},
+		{`select approx_count_distinct(n) from (select g, approx_count_distinct(x) as n from t group by g)`, 1, 1},
+		{`with c as (select g, hll(x) as n from t group by g) select approx_count_distinct(n) from c`, 1, 1},
+		{`select approx_count_distinct(x) from t union all select approx_count_distinct(x) from t group by g`, 1, 1},
+		{`select listagg(x) within group (order by x), approx_count_distinct(x) from t`, 0, 1},
+	} {
+		res, err := Translate(c.sql, Options{Sketches: true})
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		if exact, sketch := strings.Count(res.SQL, "count(DISTINCT "), strings.Count(res.SQL, "datasketch_hll("); exact != c.exact || sketch != c.sketch {
+			t.Errorf("%s: %d exact and %d sketched, want %d and %d\n%s", c.sql, exact, sketch, c.exact, c.sketch, res.SQL)
+		}
+	}
+
+	conn := session(t)
+	ctx := context.Background()
+	for q, want := range map[string]string{
+		`select g, approx_count_distinct(x), hll(x, y) from (values (1, 1, 1), (1, 1, 2), (1, 2, null), (2, null, 1)) v(g, x, y) group by g order by g`: "1 2 2;2 0 0",
+		`select distinct g, approx_count_distinct(x) over (partition by g) from (values (1, 1), (1, 2), (1, 2), (2, 3)) v(g, x) order by g`:             "1 2;2 1",
+	} {
+		res, err := Translate(q, Options{Sketches: true})
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		rows, err := conn.QueryContext(ctx, res.SQL)
+		if err != nil {
+			t.Fatalf("%s: %v", res.SQL, err)
+		}
+		cols, _ := rows.Columns()
+		var got []string
+		for rows.Next() {
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, strings.TrimSuffix(strings.TrimPrefix(fmt.Sprint(vals), "["), "]"))
+		}
+		rows.Close()
+		if strings.Join(got, ";") != want {
+			t.Errorf("%s: %q, want %q", q, strings.Join(got, ";"), want)
+		}
 	}
 }

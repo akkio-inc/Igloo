@@ -997,6 +997,36 @@ func stripComments(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
+// collectGrouped notes, before anything is translated, the
+// APPROX_COUNT_DISTINCT and HLL calls of selects with GROUP BY, which count
+// exactly (see approxCountDistinct): a call is translated before the select
+// around it is seen. grouped says nodes are in such a select.
+func (t *translator) collectGrouped(nodes []*node, grouped bool) {
+	for i, n := range nodes {
+		switch w := n.word(); {
+		case w == "SELECT":
+			// Its clauses run to the next SELECT at this level, after UNION
+			// and the like.
+			grouped = false
+			for j := i + 1; j < len(nodes) && nodes[j].word() != "SELECT"; j++ {
+				if nodes[j].word() == "GROUP" && nodes[nextSigOr(nodes, j)].isWord("BY") {
+					grouped = true
+					break
+				}
+			}
+		case w == "APPROX_COUNT_DISTINCT" || w == "HLL":
+			if grouped {
+				t.grouped[n] = true
+			}
+		case n.kind == kGroup:
+			// A subquery is a select of its own.
+			idx := sig(n.kids)
+			sub := len(idx) > 0 && (n.kids[idx[0]].word() == "SELECT" || n.kids[idx[0]].word() == "WITH")
+			t.collectGrouped(n.kids, grouped && !sub)
+		}
+	}
+}
+
 // collectFlattens notes the aliases of the statement's FLATTENs before
 // anything is translated, since the select list that reads their columns
 // comes before them.

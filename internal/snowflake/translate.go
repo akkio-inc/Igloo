@@ -54,6 +54,9 @@ type translator struct {
 	// without an alias, whose columns are reached unqualified.
 	flatten map[string]bool
 	anon    int
+	// grouped holds the APPROX_COUNT_DISTINCT and HLL calls, by their
+	// names' nodes, of selects with GROUP BY (see collectGrouped).
+	grouped map[*node]bool
 	// gen numbers the names the translation makes up.
 	gen int
 }
@@ -85,13 +88,14 @@ func Translate(sql string, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}}
+	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true
 		}
 	}
 	t.collectFlattens(nodes)
+	t.collectGrouped(nodes, false)
 	out, cmd, err := t.statement(nodes)
 	if err != nil {
 		return Result{}, err

@@ -2058,12 +2058,19 @@ func countFn(c *call) (*node, error) {
 // extension they count with its HLL sketch of 4,096 registers, as many as
 // Snowflake's, whose error is Snowflake's (about 1.6%); the hash of the
 // values makes it count values of any type. DuckDB's approx_count_distinct
-// has 64 registers, and errs by about 13%.
+// has 64 registers, and errs by about 13%. In a select with GROUP BY (see
+// collectGrouped) and as window functions they count exactly: a sketch per
+// group or partition is slower than COUNT(DISTINCT), by 25 times with
+// millions of groups, and up to twice as fast with a few hundred.
 func approxCountDistinct(c *call) (*node, error) {
 	if err := c.argc(1, -1); err != nil {
 		return nil, err
 	}
-	if c.t.opts.Sketches {
+	fn := "approx_count_distinct("
+	switch {
+	case c.t.grouped[c.span[0]] || len(c.over) > 0:
+		fn = "count(DISTINCT "
+	case c.t.opts.Sketches:
 		parts := []any{"CAST(coalesce(round(datasketch_hll_estimate(datasketch_hll(12, CASE WHEN "}
 		for k := range c.args {
 			if k > 0 {
@@ -2071,13 +2078,13 @@ func approxCountDistinct(c *call) (*node, error) {
 			}
 			parts = append(parts, c.op(k), " IS NOT NULL")
 		}
-		parts = append(parts, " THEN hash(", c.list(0), ") END)", c.over, ")), 0) AS BIGINT)")
+		parts = append(parts, " THEN hash(", c.list(0), ") END))), 0) AS BIGINT)")
 		return c.out(parts...), nil
 	}
 	if len(c.args) == 1 {
-		return c.out("approx_count_distinct(", c.arg(0), ")", c.over), nil
+		return c.out(fn, c.arg(0), ")", c.over), nil
 	}
-	parts := []any{"approx_count_distinct(CASE WHEN "}
+	parts := []any{fn + "CASE WHEN "}
 	for k := range c.args {
 		if k > 0 {
 			parts = append(parts, " AND ")

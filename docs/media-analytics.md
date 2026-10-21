@@ -155,8 +155,9 @@ is fast but rough: its HyperLogLog has 64 registers and errs by about 13%
 (one standard deviation, measured from 1,000 to 10 million values), by
 over 50% in the worst of 200 draws. For an approximate count within about
 1.6%, use `datasketch_hll_estimate(datasketch_hll(12, user_id))`, which
-Snowflake SQL's `APPROX_COUNT_DISTINCT` becomes; it is as fast ungrouped
-and slower with many groups.
+Snowflake SQL's `APPROX_COUNT_DISTINCT` becomes when ungrouped; it is as
+fast ungrouped and much slower with many groups, where Snowflake SQL's
+`APPROX_COUNT_DISTINCT` counts exactly instead.
 
 ## Geospatial
 

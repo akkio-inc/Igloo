@@ -886,8 +886,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   counted 1,336 values where there were 1,099 and Snowflake counted 1,102,
   and Acme decides from these counts which columns are categories. They
   now count with DataSketches' HyperLogLog of 4,096 registers, as many as
-  Snowflake's, within about 1.6%, and exactly up to about 300 values.
-  Ungrouped they are as fast as before; grouped by many groups they are
-  slower (docs/snowflake-sql.md#known-differences).
+  Snowflake's, within about 1.6%, and exactly up to about 300 values,
+  as fast as before. In a select with `GROUP BY` and as window functions
+  they count exactly, since a sketch per group is 25 times slower than
+  `COUNT(DISTINCT)` with millions of groups; with a few hundred groups
+  that takes up to three times as long as before.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
