@@ -804,6 +804,7 @@ func TestStatusCodes(t *testing.T) {
 		"42501": codes.PermissionDenied, "57014": codes.Canceled, "42P01": codes.NotFound, "42601": codes.InvalidArgument,
 		"0A000": codes.Unimplemented, "40001": codes.Aborted, "40003": codes.Unknown, "53300": codes.ResourceExhausted, "28P01": codes.Unauthenticated,
 		"23505": codes.AlreadyExists, "25P02": codes.FailedPrecondition, "XX000": codes.Internal,
+		"42883": codes.NotFound, "42704": codes.NotFound, "3F000": codes.NotFound, "3D000": codes.NotFound,
 	} {
 		if got := grpcCode(pgcodes.Code(state)); got != want {
 			t.Errorf("%s: %s, want %s", state, got, want)

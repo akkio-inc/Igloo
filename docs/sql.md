@@ -765,7 +765,21 @@ the same users and grants; see [other engines](external-engines.md).
   ([distributed execution](distributed-execution.md#when)). `SHOW` and
   `current_setting()` answer the PostgreSQL settings drivers read, such as
   `transaction_isolation` (`repeatable read`: DuckDB transactions see a
-  snapshot), `server_version` and `standard_conforming_strings`.
+  snapshot), `server_version` and `standard_conforming_strings`. Any other
+  `SHOW name` describes the table `name`, as in DuckDB; with no such table,
+  it fails as PostgreSQL's does for a setting it does not have (SQLSTATE
+  `42704`, `unrecognized configuration parameter "name"`). `SET` and
+  `RESET` of a parameter neither DuckDB nor Igloo has fail the same way,
+  for every user, before any check of the user's role.
+- Errors carry PostgreSQL's SQLSTATE for what is missing: `42P01` for a
+  table, view or sequence, `42883` for a function (`no_such_function(1)`),
+  `42704` for a type (`1::NUMBER`), `3F000` for a schema in which a table
+  is created, `42703` for a column.
+- `current_user`, `session_user` and `current_role` (also written with
+  parentheses) are the signed-in user's name. As a select list's item of
+  its own they name their column as in PostgreSQL (`current_user`), and in
+  the [Snowflake dialect](snowflake-sql.md) as in Snowflake
+  (`CURRENT_USER()`).
 - Transaction blocks behave as in PostgreSQL, except that changes to the
   catalog commit the block first, and `ROLLBACK TO SAVEPOINT` cannot undo
   changes (see [transactions](#transactions)).

@@ -263,12 +263,16 @@ var (
 // isSetting reports whether name, lower-cased, is a setting rather than
 // a session variable.
 func (s *Server) isSetting(ctx context.Context, sess *session, name string) bool {
-	if settingNames[name] {
-		return true
-	}
+	return settingNames[name] || s.isDuckDBSetting(ctx, sess, name)
+}
+
+// isDuckDBSetting reports whether name, lower-cased, is one of DuckDB's
+// settings, as they were when it was first asked.
+func (s *Server) isDuckDBSetting(ctx context.Context, sess *session, name string) bool {
 	duckdbSettingsOnce.Do(func() {
 		names := map[string]bool{}
-		rows, err := sess.conn.QueryContext(ctx, "SELECT lower(name) FROM duckdb_settings()", nil)
+		// Qualified, so that no session's temporary macro stands in.
+		rows, err := sess.conn.QueryContext(ctx, "SELECT system.main.lower(name) FROM system.main.duckdb_settings()", nil)
 		if err == nil {
 			dest := make([]driver.Value, 1)
 			for rows.Next(dest) == nil {

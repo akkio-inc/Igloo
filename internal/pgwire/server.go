@@ -1440,6 +1440,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	if err != nil {
 		sess.observe(nil, err)
+		err = shownParameterError(query, err, func(name string) bool { return s.isDuckDBSetting(ctx, sess, name) })
 		return fail(pgError(s.connectionHint(ctx, err)))
 	}
 	if pivot && st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
@@ -1464,6 +1465,13 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		return fail(pgError(err))
 	}
 	st.guard = g
+	if user.Role != auth.RoleAdmin && st.stmtType == duckdb.STATEMENT_TYPE_SET {
+		// A parameter no one has is not one only admins may set.
+		if err := s.unknownParameter(ctx, sess, query); err != nil {
+			_ = st.close()
+			return fail(err)
+		}
+	}
 	err = authorize(user.Role, st.stmtType, query)
 	if err != nil {
 		// The built-in role does not allow it; grants may.

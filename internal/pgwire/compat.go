@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"slices"
@@ -8,6 +9,9 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/snowflake"
@@ -337,7 +341,10 @@ var pgRegclassMacro = func() string {
 var sessionUser = regexp.MustCompile(`(?i)\b(current_user|session_user|current_role)\b(\s*\(\s*\))?`)
 
 // rewriteSessionUser replaces current_user and friends, in SQL code only,
-// with the logged-in user's name.
+// with the logged-in user's name. One that is a whole item of a select
+// list keeps the name PostgreSQL gives its column, current_user,
+// session_user or current_role, which DuckDB would otherwise take from the
+// literal ('ana'); clients read the column by that name.
 func rewriteSessionUser(query, user string) string {
 	lower := strings.ToLower(query)
 	if !strings.Contains(lower, "current_user") && !strings.Contains(lower, "session_user") &&
@@ -345,9 +352,93 @@ func rewriteSessionUser(query, user string) string {
 		return query
 	}
 	name := "'" + strings.ReplaceAll(user, "'", "''") + "'"
-	return sqllex.MapCode(query, func(code string) string {
-		return sessionUser.ReplaceAllLiteralString(code, name)
-	})
+	columns := sessionUserItems(query)
+	var out strings.Builder
+	pos := 0
+	for _, seg := range sqllex.Segments(query) {
+		start := pos
+		pos += len(seg.Text)
+		if seg.Kind != sqllex.Code {
+			out.WriteString(seg.Text)
+			continue
+		}
+		last := 0
+		for _, m := range sessionUser.FindAllStringIndex(seg.Text, -1) {
+			out.WriteString(seg.Text[last:m[0]])
+			out.WriteString(name)
+			if column, ok := columns[start+m[0]]; ok {
+				out.WriteString(` AS "` + column + `"`)
+			}
+			last = m[1]
+		}
+		out.WriteString(seg.Text[last:])
+	}
+	return out.String()
+}
+
+// selectListEnd are the words that end a select list.
+var selectListEnd = map[string]bool{
+	"FROM": true, "WHERE": true, "GROUP": true, "HAVING": true, "WINDOW": true, "QUALIFY": true, "ORDER": true,
+	"LIMIT": true, "OFFSET": true, "FETCH": true, "UNION": true, "INTERSECT": true, "EXCEPT": true, "INTO": true,
+	"ON": true, "RETURNING": true, "USING": true,
+}
+
+// sessionUserItems finds the current_user, session_user and current_role
+// (with or without parentheses) in query's code that are whole items of a
+// select list, as in SELECT current_user or SELECT a, current_role() FROM t,
+// and returns, by where each starts, the name PostgreSQL gives its column.
+// One with an alias, or in an expression, is left out.
+func sessionUserItems(query string) map[int]string {
+	var toks []nameTok
+	for _, t := range nameTokens(query) {
+		if text := query[t.start:t.end]; !strings.HasPrefix(text, "--") && !strings.HasPrefix(text, "/*") {
+			toks = append(toks, t)
+		}
+	}
+	word := func(i int) string {
+		if i < 0 || i >= len(toks) || toks[i].name == "" || query[toks[i].start] == '"' {
+			return ""
+		}
+		return strings.ToUpper(toks[i].name)
+	}
+	punct := func(i int) byte {
+		if i < 0 || i >= len(toks) || toks[i].name != "" || toks[i].end-toks[i].start != 1 {
+			return 0
+		}
+		return query[toks[i].start]
+	}
+	out := map[int]string{}
+	// inList says, for each level of brackets, whether the tokens are in a
+	// select list there.
+	inList := []bool{false}
+	for i := 0; i < len(toks); i++ {
+		top := len(inList) - 1
+		switch w := word(i); {
+		case punct(i) == '(' || punct(i) == '[' || punct(i) == '{':
+			inList = append(inList, false)
+		case punct(i) == ')' || punct(i) == ']' || punct(i) == '}':
+			if top > 0 {
+				inList = inList[:top]
+			}
+		case w == "SELECT":
+			inList[top] = true
+		case selectListEnd[w]:
+			inList[top] = false
+		case w == "CURRENT_USER" || w == "SESSION_USER" || w == "CURRENT_ROLE":
+			end := i
+			if punct(i+1) == '(' && punct(i+2) == ')' {
+				end = i + 2
+			}
+			before, after := word(i-1), word(end+1)
+			starts := before == "SELECT" || before == "DISTINCT" || before == "ALL" || punct(i-1) == ','
+			ends := end+1 == len(toks) || selectListEnd[after] || punct(end+1) == ',' || punct(end+1) == ')' || punct(end+1) == ';'
+			if inList[top] && starts && ends {
+				out[toks[i].start] = strings.ToLower(w)
+			}
+			i = end
+		}
+	}
+	return out
 }
 
 // historyViews are the views of the history, the usage, the policies and
@@ -657,6 +748,66 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 // showSetting matches SHOW of one setting, SHOW TRANSACTION ISOLATION LEVEL
 // included.
 var showSetting = regexp.MustCompile(`(?is)^\s*SHOW\s+(TRANSACTION\s+ISOLATION\s+LEVEL|"?[a-z_]+"?)\s*;?\s*$`)
+
+// showName matches SHOW of one name, which PostgreSQL reads as a setting
+// to show and DuckDB as a table to describe.
+var showName = regexp.MustCompile(`(?is)^SHOW\s+("(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)\s*;?\s*$`)
+
+// setParameter matches SET name = value, SET name TO value and RESET name,
+// with or without a scope, and gives the name.
+var setParameter = regexp.MustCompile(`(?is)^(?:SET\s+(?:(?:SESSION|LOCAL|GLOBAL)\s+)?("(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)\s*(?:=|\bTO\b)|` +
+	`RESET\s+(?:(?:SESSION|LOCAL|GLOBAL)\s+)?("(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)\s*;?\s*$)`)
+
+// unrecognizedParameter is PostgreSQL's error for a setting it does not
+// have.
+func unrecognizedParameter(name string) error {
+	return pgerror.WithCode(fmt.Errorf("unrecognized configuration parameter %q", name), codes.UndefinedObject)
+}
+
+// shownParameterError turns DuckDB's error for SHOW name, when there is no
+// table called name to describe, into PostgreSQL's for a setting it does
+// not have (42704), rather than a missing table's (42P01). Igloo answers
+// SHOW of the PostgreSQL settings it knows itself (showCommand). isSetting
+// says whether DuckDB has a setting of the name, read with
+// current_setting instead.
+func shownParameterError(query string, err error, isSetting func(name string) bool) error {
+	m := showName.FindStringSubmatch(stripComments(query))
+	if m == nil || err == nil {
+		return err
+	}
+	name := unquoteName(m[1])
+	if !strings.Contains(strings.ToLower(err.Error()), "table with name "+strings.ToLower(name)+" does not exist") {
+		return err
+	}
+	out := unrecognizedParameter(name)
+	if isSetting(strings.ToLower(name)) {
+		out = pgerror.WithHint(out, fmt.Sprintf("SHOW %s describes a table called %[1]s, as in DuckDB; "+
+			"read DuckDB's setting with SELECT current_setting(%s)", name, quoteLiteral(name)))
+	}
+	return out
+}
+
+// unknownParameter refuses SET or RESET of a parameter that neither DuckDB
+// nor Igloo has, with PostgreSQL's error (42704). It runs before the check
+// of the user's role, which would otherwise refuse it as needing admin,
+// the role that may change DuckDB's settings other than sessionSettings.
+// Igloo's own parameters, such as sql_dialect, are handled before.
+func (s *Server) unknownParameter(ctx context.Context, sess *session, query string) error {
+	m := setParameter.FindStringSubmatch(stripComments(query))
+	if m == nil {
+		return nil
+	}
+	name := unquoteName(m[1] + m[2])
+	lower := strings.ToLower(name)
+	if lower == "all" || settingNames[lower] {
+		return nil
+	}
+	known, err := queryStrings(ctx, sess, "SELECT name FROM system.main.duckdb_settings() WHERE system.main.lower(name) = $1", lower)
+	if err != nil || len(known) > 0 {
+		return nil
+	}
+	return unrecognizedParameter(name)
+}
 
 // pgSettings are the PostgreSQL settings that drivers and tools read with
 // SHOW, as SQLAlchemy and JDBC do the isolation level, under PostgreSQL's

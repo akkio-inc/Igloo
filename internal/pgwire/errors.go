@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -77,6 +78,41 @@ const rowidFilterMessage = "DuckDB could not plan this statement (optional_idx c
 	"in views too. Compare rowid only with constants, as in rowid < 1000 or rowid IN (1, 2), " +
 	"or filter on the table's own columns, as in hash(id) % 3 = 0"
 
+// missingEntry matches DuckDB's catalog errors for a name it found nothing
+// called, in lower case, with the kind of entry it looked for
+// (CatalogTypeToString): "scalar function with name f does not exist!",
+// "type with name number does not exist!", "table function with name "x"
+// is not in the catalog, but it exists in the ... extension". A name
+// qualified with a schema that does not exist is a table's: "table with name
+// "s.t" does not exist because schema "s" does not exist".
+var missingEntry = regexp.MustCompile(`\b((?:scalar|aggregate|table|pragma|copy|table macro|macro|secret) function|` +
+	`table|view|sequence|schema|database|column|type|collation|index|prepared statement|secret type|secret|coordinate system)` +
+	` with name .*(?:does not exist|is not in the catalog)`)
+
+// missingEntryCode is PostgreSQL's code for a missing entry of a kind
+// missingEntry names: undefined_function for functions and macros,
+// undefined_table for tables, views and sequences (which PostgreSQL counts
+// as relations), invalid_schema_name, invalid_catalog_name,
+// undefined_column, invalid_sql_statement_name, and undefined_object for
+// types and everything else.
+func missingEntryCode(kind string) codes.Code {
+	switch {
+	case strings.HasSuffix(kind, " function") && kind != "copy function" && kind != "secret function":
+		return codes.UndefinedFunction
+	case kind == "table", kind == "view", kind == "sequence":
+		return codes.UndefinedTable
+	case kind == "schema":
+		return codes.InvalidSchemaName
+	case kind == "database":
+		return codes.InvalidCatalogName
+	case kind == "column":
+		return codes.UndefinedColumn
+	case kind == "prepared statement":
+		return codes.InvalidSQLStatementName
+	}
+	return codes.UndefinedObject
+}
+
 func sqlState(err *duckdb.Error) codes.Code {
 	msg := strings.ToLower(err.Msg)
 
@@ -94,6 +130,8 @@ func sqlState(err *duckdb.Error) codes.Code {
 		switch {
 		case strings.Contains(msg, "already exists"):
 			return codes.DuplicateObject
+		case missingEntry.MatchString(msg):
+			return missingEntryCode(missingEntry.FindStringSubmatch(msg)[1])
 		case strings.Contains(msg, "does not exist"):
 			return codes.UndefinedTable
 		}

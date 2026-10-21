@@ -57,7 +57,7 @@ func grpcCode(state pgcodes.Code) codes.Code {
 		// The wrong number of parameters, not a broken connection.
 		return codes.InvalidArgument
 	case pgcodes.UndefinedTable, pgcodes.UndefinedColumn, pgcodes.UndefinedFunction, pgcodes.UndefinedObject,
-		pgcodes.InvalidSQLStatementName, pgcodes.InvalidCursorName:
+		pgcodes.InvalidSchemaName, pgcodes.InvalidCatalogName, pgcodes.InvalidSQLStatementName, pgcodes.InvalidCursorName:
 		return codes.NotFound
 	case pgcodes.DuplicateObject, pgcodes.DuplicateSchema, pgcodes.DuplicateColumn, pgcodes.UniqueViolation, "42P07":
 		return codes.AlreadyExists

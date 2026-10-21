@@ -194,7 +194,7 @@ role or an INSERT grant (SQLSTATE 42501)`, and map to gRPC status codes:
 | `42501` (insufficient privilege) | `PERMISSION_DENIED` |
 | `28xxx` (authorization) | `UNAUTHENTICATED` |
 | `57014` (canceled) | `CANCELLED`, or `DEADLINE_EXCEEDED` for the statement timeout |
-| `42P01`, `42703`, `42883`, `42704` (undefined object) | `NOT_FOUND` |
+| `42P01`, `42703`, `42883`, `42704`, `3F000`, `3D000` (undefined object) | `NOT_FOUND` |
 | `42P07`, `42710`, `23505` (duplicate) | `ALREADY_EXISTS` |
 | other `42xxx`, `22xxx` (syntax, data) | `INVALID_ARGUMENT` |
 | `0Axxx` (not supported) | `UNIMPLEMENTED` |

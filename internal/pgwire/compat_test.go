@@ -9,6 +9,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -146,10 +147,26 @@ func TestParseStatementTimeout(t *testing.T) {
 
 func TestRewriteSessionUser(t *testing.T) {
 	cases := map[string]string{
-		"SELECT current_user":                     "SELECT 'ana'",
-		"select CURRENT_USER, session_user()":     "select 'ana', 'ana'",
+		"SELECT current_user":                     `SELECT 'ana' AS "current_user"`,
+		"select CURRENT_USER, session_user()":     `select 'ana' AS "current_user", 'ana' AS "session_user"`,
 		"SELECT 'current_user', \"current_user\"": "SELECT 'current_user', \"current_user\"",
 		"SELECT current_users FROM t":             "SELECT current_users FROM t",
+		// Whole items of a select list keep PostgreSQL's column names.
+		"SELECT a, current_role() FROM t WHERE b = current_user": `SELECT a, 'ana' AS "current_role" FROM t WHERE b = 'ana'`,
+		"SELECT DISTINCT current_role\n-- who\nFROM t":           `SELECT DISTINCT 'ana' AS "current_role"` + "\n-- who\nFROM t",
+		"SELECT * FROM (SELECT current_user) s":                  `SELECT * FROM (SELECT 'ana' AS "current_user") s`,
+		"SELECT 1 UNION ALL SELECT session_user;":                `SELECT 1 UNION ALL SELECT 'ana' AS "session_user";`,
+		"CREATE TABLE t AS SELECT current_user ORDER BY 1":       `CREATE TABLE t AS SELECT 'ana' AS "current_user" ORDER BY 1`,
+		// Others are left as they were: with an alias, in an expression,
+		// an argument or a list, and outside select lists.
+		"SELECT current_user AS who, current_user u":             "SELECT 'ana' AS who, 'ana' u",
+		`SELECT current_user() AS "CURRENT_USER()"`:              `SELECT 'ana' AS "CURRENT_USER()"`,
+		"SELECT upper(current_user), current_user = 'ana'":       "SELECT upper('ana'), 'ana' = 'ana'",
+		"SELECT coalesce(a, current_user), [1, current_user]":    "SELECT coalesce(a, 'ana'), [1, 'ana']",
+		"SELECT current_user::VARCHAR, (current_user)":           "SELECT 'ana'::VARCHAR, ('ana')",
+		"INSERT INTO t VALUES (current_user)":                    "INSERT INTO t VALUES ('ana')",
+		"SELECT x FROM t GROUP BY current_user, x":               "SELECT x FROM t GROUP BY 'ana', x",
+		"SELECT CASE WHEN a THEN current_user END, current_user": `SELECT CASE WHEN a THEN 'ana' END, 'ana' AS "current_user"`,
 	}
 	for in, want := range cases {
 		if got := rewriteSessionUser(in, "ana"); got != want {
@@ -289,5 +306,128 @@ func TestTimestamptzText(t *testing.T) {
 	got := []string{string(res.Rows[0][0]), string(res.Rows[0][1])}
 	if !slices.Equal(got, []string{"2026-10-14 10:00:00.25+00", "2026-10-14 12:00:00+00"}) {
 		t.Errorf("got %q", got)
+	}
+}
+
+// TestMissingNameCodes checks that statements naming what does not exist
+// fail with PostgreSQL's SQLSTATE for what is missing, a function, a type,
+// a table or a setting, for admins and for other users.
+func TestMissingNameCodes(t *testing.T) {
+	ts := startServer(t)
+	ctx := context.Background()
+	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
+	codes := map[string]string{
+		"SELECT no_such_function(1)":             "42883",
+		"SELECT * FROM no_such_table_function()": "42883",
+		"SELECT 1::NUMBER":                       "42704",
+		"SELECT CAST(1 AS no_such_type)":         "42704",
+		"SELECT * FROM no_such_table":            "42P01",
+		"SELECT * FROM no_such_schema.t":         "42P01",
+		"SELECT nextval('no_such_sequence')":     "42P01",
+		"SELECT no_such_column FROM (SELECT 1)":  "42703",
+		"SHOW no_such_setting":                   "42704",
+		"SET no_such_setting = 1":                "42704",
+		"SET SESSION no_such_setting TO 1":       "42704",
+		`SET "No_Such_Setting" = 1`:              "42704",
+		"RESET no_such_setting":                  "42704",
+	}
+	for name, mode := range modes {
+		rita := connect(t, ts.url("rita", "rita-password"), mode)
+		for _, conn := range []*pgx.Conn{rita, ts.admin(t, mode)} {
+			user := userName(t, conn)
+			for sql, want := range codes {
+				_, err := conn.Exec(ctx, sql)
+				if got := pgCode(err); got != want {
+					t.Errorf("%s, %s: %s: %s (%v), want %s", name, user, sql, got, err, want)
+				}
+			}
+			// PostgreSQL's message for a setting it does not have.
+			var pgErr *pgconn.PgError
+			if _, err := conn.Exec(ctx, "SHOW no_such_setting"); !asPgError(err, &pgErr) ||
+				pgErr.Message != `unrecognized configuration parameter "no_such_setting"` || pgErr.Hint != "" {
+				t.Errorf("%s, %s: SHOW no_such_setting: %v", name, user, err)
+			}
+			// DuckDB's own setting, which SHOW does not read: a hint says
+			// how to.
+			if _, err := conn.Exec(ctx, "SHOW threads"); !asPgError(err, &pgErr) || pgErr.Code != "42704" ||
+				!strings.Contains(pgErr.Hint, "current_setting('threads')") {
+				t.Errorf("%s, %s: SHOW threads: %v", name, user, err)
+			}
+			// SHOW of a table still describes it, as in DuckDB.
+			mustExec(t, conn, "SHOW information_schema.tables")
+		}
+		// A setting that exists is still only for admins, and the dialect
+		// and the session's own settings are for anyone.
+		if _, err := rita.Exec(ctx, "SET threads = 1"); pgCode(err) != "42501" {
+			t.Errorf("%s: SET threads: %v", name, err)
+		}
+		if _, err := rita.Exec(ctx, "SET no_such_setting = 1"); err == nil || !strings.Contains(err.Error(), `unrecognized configuration parameter "no_such_setting"`) {
+			t.Errorf("%s: SET of an unknown setting: %v", name, err)
+		}
+		for _, sql := range []string{"SET sql_dialect = 'snowflake'", "RESET sql_dialect", "SET search_path = 'main'", "RESET search_path",
+			"SET TimeZone = 'UTC'", "SET application_name = 'x'"} {
+			mustExec(t, rita, sql)
+		}
+		if _, err := rita.Exec(ctx, "CREATE TABLE no_such_schema.t (x INTEGER)"); err == nil {
+			t.Errorf("%s: a reader created a table", name)
+		}
+		if _, err := ts.admin(t, mode).Exec(ctx, "CREATE TABLE no_such_schema.t (x INTEGER)"); pgCode(err) != "3F000" {
+			t.Errorf("%s: a table in a schema that does not exist: %v", name, err)
+		}
+	}
+}
+
+// TestSessionUserColumns checks the names of the columns of current_user,
+// session_user and current_role: PostgreSQL's, which clients read them
+// by, and in the Snowflake dialect Snowflake's.
+func TestSessionUserColumns(t *testing.T) {
+	ts := startServer(t)
+	ctx := context.Background()
+	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
+	for name, mode := range modes {
+		rita := connect(t, ts.url("rita", "rita-password"), mode)
+		for sql, want := range map[string]string{
+			"SELECT current_user":   "current_user",
+			"SELECT session_user":   "session_user",
+			"SELECT current_role":   "current_role",
+			"SELECT current_role()": "current_role",
+			"SELECT 1 AS n, current_user, session_user FROM range(1)":    "n,current_user,session_user",
+			"SELECT * FROM (SELECT current_user) t":                      "current_user",
+			"SELECT current_user AS who":                                 "who",
+			"SELECT current_user FROM range(2) WHERE current_user <> ''": "current_user",
+		} {
+			if got := strings.Join(resultColumns(t, rita, sql), ","); got != want {
+				t.Errorf("%s: %s: columns %q, want %q", name, sql, got, want)
+			}
+		}
+		var user, session, role string
+		if err := rita.QueryRow(ctx, "SELECT current_user, session_user, current_role").Scan(&user, &session, &role); err != nil ||
+			user != "rita" || session != "rita" || role != "rita" {
+			t.Errorf("%s: %q %q %q %v", name, user, session, role, err)
+		}
+		// Snowflake names CURRENT_USER() after its text, and an unquoted
+		// name in upper case.
+		mustExec(t, rita, "SET sql_dialect = 'snowflake'")
+		for sql, want := range map[string]string{
+			"SELECT CURRENT_USER(), CURRENT_ROLE()": "CURRENT_USER(),CURRENT_ROLE()",
+			"SELECT CURRENT_USER() AS who":          "WHO",
+			"SELECT CURRENT_USER":                   "CURRENT_USER",
+		} {
+			if got := strings.Join(resultColumns(t, rita, sql), ","); got != want {
+				t.Errorf("%s: snowflake: %s: columns %q, want %q", name, sql, got, want)
+			}
+		}
+		if err := rita.QueryRow(ctx, "SELECT CURRENT_USER()").Scan(&user); err != nil || user != "rita" {
+			t.Errorf("%s: snowflake: CURRENT_USER(): %q %v", name, user, err)
+		}
+		mustExec(t, rita, "RESET sql_dialect")
+	}
+	// A table made from it has the column too.
+	mustExec(t, admin, "CREATE TEMP TABLE who AS SELECT current_user")
+	var user string
+	if err := admin.QueryRow(ctx, `SELECT "current_user" FROM who`).Scan(&user); err != nil || user != "igloo" {
+		t.Errorf("CREATE TABLE AS: %q %v", user, err)
 	}
 }

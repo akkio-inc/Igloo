@@ -847,5 +847,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   looks for a schema-qualified one in the view's own database first and for
   an unqualified one not in that database's `main` schema; some statements
   that read views were refused as unverifiable before.
+- Errors and column names that PostgreSQL clients rely on differed from
+  PostgreSQL's. Every name DuckDB found nothing called failed with SQLSTATE
+  `42P01` (undefined table): a missing function (`SELECT
+  no_such_function(1)`) now fails with `42883`, a type (`1::NUMBER`) with
+  `42704`, a schema with `3F000`. `SHOW no_such_setting` failed as a
+  missing table (DuckDB's `SHOW` describes a table); it now fails as
+  PostgreSQL's does, `42704` `unrecognized configuration parameter
+  "no_such_setting"`. A non-admin's `SET` or `RESET` of a parameter no one
+  has was refused as needing admin (`42501`); it now fails with `42704` as
+  an admin's does. And `SELECT current_user` named its column `'igloo'`, the
+  user's name quoted, so a client reading the column `current_user` found
+  nothing; `current_user`, `session_user` and `current_role` that are a
+  select list's items of their own now name their columns as PostgreSQL
+  does, while the Snowflake dialect keeps Snowflake's names, such as
+  `CURRENT_USER()`. Over Flight SQL, a missing schema or database is
+  `NOT_FOUND`.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
