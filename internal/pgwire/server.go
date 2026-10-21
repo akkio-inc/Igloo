@@ -270,6 +270,11 @@ type Server struct {
 	// analyzer works out what statements read and wrote, for the
 	// history; nil without one.
 	analyzer *analyzer
+	// sketches says DuckDB has the datasketches extension's functions,
+	// once sketchesKnown (see hasSketches).
+	sketchesMu    sync.Mutex
+	sketchesKnown bool
+	sketches      bool
 }
 
 // New builds a server that runs queries on engine.

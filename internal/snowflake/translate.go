@@ -16,6 +16,10 @@ type Options struct {
 	// Variable returns the value, as text, of the session variable name
 	// (lower-cased), for IDENTIFIER($name). Nil means none are known.
 	Variable func(name string) (value string, ok bool, err error)
+	// Sketches says the session has DuckDB's datasketches extension, with
+	// which APPROX_COUNT_DISTINCT and HLL count as accurately as in
+	// Snowflake; without it they are DuckDB's approx_count_distinct.
+	Sketches bool
 }
 
 // Result is a translated statement.

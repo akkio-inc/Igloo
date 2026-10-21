@@ -875,5 +875,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   format write the offset as Snowflake does; and `ALTER SESSION` accepts the
   output format parameters at their defaults and refuses others. Profiling
   four columns of 37 million rows takes 12% longer.
+- In Snowflake's dialect, `APPROX_COUNT_DISTINCT` and `HLL` were DuckDB's
+  `approx_count_distinct`, a HyperLogLog of 64 registers that errs by about
+  13% and by over 50% at worst. On an Acme table of 1.25 million rows it
+  counted 1,336 values where there were 1,099 and Snowflake counted 1,102,
+  and Acme decides from these counts which columns are categories. They
+  now count with DataSketches' HyperLogLog of 4,096 registers, as many as
+  Snowflake's, within about 1.6%, and exactly up to about 300 values.
+  Ungrouped they are as fast as before; grouped by many groups they are
+  slower (docs/snowflake-sql.md#known-differences).
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

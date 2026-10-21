@@ -2054,10 +2054,25 @@ func countFn(c *call) (*node, error) {
 }
 
 // approxCountDistinct translates APPROX_COUNT_DISTINCT and HLL, which take
-// several values as COUNT(DISTINCT a, b) does.
+// several values as COUNT(DISTINCT a, b) does. With the datasketches
+// extension they count with its HLL sketch of 4,096 registers, as many as
+// Snowflake's, whose error is Snowflake's (about 1.6%); the hash of the
+// values makes it count values of any type. DuckDB's approx_count_distinct
+// has 64 registers, and errs by about 13%.
 func approxCountDistinct(c *call) (*node, error) {
 	if err := c.argc(1, -1); err != nil {
 		return nil, err
+	}
+	if c.t.opts.Sketches {
+		parts := []any{"CAST(coalesce(round(datasketch_hll_estimate(datasketch_hll(12, CASE WHEN "}
+		for k := range c.args {
+			if k > 0 {
+				parts = append(parts, " AND ")
+			}
+			parts = append(parts, c.op(k), " IS NOT NULL")
+		}
+		parts = append(parts, " THEN hash(", c.list(0), ") END)", c.over, ")), 0) AS BIGINT)")
+		return c.out(parts...), nil
 	}
 	if len(c.args) == 1 {
 		return c.out("approx_count_distinct(", c.arg(0), ")", c.over), nil

@@ -279,15 +279,26 @@ What Igloo cannot reproduce exactly, and what it does instead.
   but different values. Do not compare them with hashes Snowflake stored.
 - `RANDOM(seed)` and `UNIFORM(..., RANDOM(seed))` ignore the seed (with a
   notice); `SAMPLE ... SEED (n)` repeats.
-- `APPROX_COUNT_DISTINCT`, `HLL` and `APPROX_PERCENTILE` are approximate
-  with DuckDB's algorithms, so their results differ from Snowflake's within
-  the error of each. `APPROX_TOP_K` counts exactly.
+- `APPROX_COUNT_DISTINCT` and `HLL` count with
+  [DataSketches](media-analytics.md)' HyperLogLog of 4,096 registers, as
+  many as Snowflake's, so their error is Snowflake's: about 1.6% (one
+  standard deviation), exact up to about 300 values. Their results
+  differ from Snowflake's within that error. DuckDB's own
+  `approx_count_distinct` has 64 registers and errs by about 13%.
+  `APPROX_PERCENTILE` is DuckDB's `approx_quantile`, approximate within its
+  own error. `APPROX_TOP_K` counts exactly.
 - `MODE` chooses among equally frequent values differently.
 - `CURRENT_ROLE()` returns the user's name; `CURRENT_WAREHOUSE()`,
   `CURRENT_ACCOUNT()` and the like return `NULL`.
 
 **Performance**
 
+- `APPROX_COUNT_DISTINCT` and `HLL` build a sketch per group. Ungrouped,
+  as when profiling columns, they are as fast as DuckDB's
+  `approx_count_distinct`; grouped, slower: on 37 million rows, 0.65 s
+  rather than 0.18 s for 5,000 groups, and 13 s rather than 0.6 s for 7.9
+  million groups. For many small groups, `COUNT(DISTINCT x)` counts
+  exactly and as fast as DuckDB's approximation (0.6 s).
 - A statement whose translation calls one of the `sf_` macros (`DATEADD`,
   `DATE_TRUNC`, `TO_DATE`, `TIME_SLICE` and others that keep a date's type)
   runs on one machine: [distributed

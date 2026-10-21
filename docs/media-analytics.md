@@ -149,9 +149,14 @@ FROM (SELECT user_id, count(*) AS frequency
       FROM impressions WHERE campaign_id = 101 GROUP BY user_id);
 ```
 
-For an exact distinct count of one ad hoc set, `count(DISTINCT user_id)`,
-and DuckDB's own `approx_count_distinct(user_id)` (HyperLogLog, about 2%
-error, not mergeable) are faster than building a sketch.
+For an exact distinct count of one ad hoc set, use `count(DISTINCT
+user_id)`; it needs no sketch. DuckDB's own `approx_count_distinct(user_id)`
+is fast but rough: its HyperLogLog has 64 registers and errs by about 13%
+(one standard deviation, measured from 1,000 to 10 million values), by
+over 50% in the worst of 200 draws. For an approximate count within about
+1.6%, use `datasketch_hll_estimate(datasketch_hll(12, user_id))`, which
+Snowflake SQL's `APPROX_COUNT_DISTINCT` becomes; it is as fast ungrouped
+and slower with many groups.
 
 ## Geospatial
 
@@ -257,7 +262,7 @@ These are DuckDB's own and need no extension. Every user can call them.
 
 | Need | Functions |
 |---|---|
-| Distinct counts | `count(DISTINCT x)`, `approx_count_distinct(x)` |
+| Distinct counts | `count(DISTINCT x)`, `approx_count_distinct(x)` (about 13% error; see [above](#reach-and-frequency-with-sketches) for 1.6%) |
 | Quantiles and medians | `quantile_cont(x, 0.5)`, `median(x)`, `approx_quantile(x, [0.5, 0.9, 0.99])` (t-digest), `reservoir_quantile(x, 0.9)` |
 | Top values and distributions | `approx_top_k(x, 10)`, `mode(x)`, `histogram(x)` |
 | Samples | `FROM t USING SAMPLE 10 PERCENT (bernoulli)`, `USING SAMPLE reservoir(10000 ROWS) REPEATABLE (42)`, `TABLESAMPLE 1%` |

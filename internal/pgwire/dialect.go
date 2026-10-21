@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -222,6 +223,7 @@ func (s *Server) translate(ctx context.Context, sess *session, text string) (*tr
 	res, err := snowflake.Translate(text, snowflake.Options{
 		IsSetting: func(name string) bool { return s.isSetting(ctx, sess, name) },
 		Variable:  func(name string) (string, bool, error) { return sessionVariable(ctx, sess, name) },
+		Sketches:  s.hasSketches(),
 	})
 	if err != nil {
 		var te *snowflake.Error
@@ -235,6 +237,31 @@ func (s *Server) translate(ctx context.Context, sess *session, text string) (*tr
 		return nil, err
 	}
 	return &translation{Result: res}, nil
+}
+
+// hasSketches reports whether DuckDB has the datasketches extension's
+// functions, which every deployment loads (see engine.mediaExtensions),
+// for the translations of Snowflake's APPROX_COUNT_DISTINCT and HLL. It
+// asks on a connection of its own, so that a session's state (an aborted
+// transaction, a canceled statement) cannot decide it, and asks again
+// next time if it could not connect.
+func (s *Server) hasSketches() bool {
+	s.sketchesMu.Lock()
+	defer s.sketchesMu.Unlock()
+	if s.sketchesKnown {
+		return s.sketches
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := s.engine.Connect(ctx)
+	if err != nil {
+		s.log.Warn("could not check for the datasketches extension", "err", err)
+		return false
+	}
+	defer conn.Close() //nolint:errcheck
+	_, err = conn.ExecContext(ctx, "SELECT system.main.datasketch_hll_estimate(system.main.datasketch_hll(12, 1))", nil)
+	s.sketches, s.sketchesKnown = err == nil, true
+	return s.sketches
 }
 
 // settingNames are the settings Igloo handles itself or accepts from

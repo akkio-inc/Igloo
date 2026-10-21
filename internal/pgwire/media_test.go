@@ -188,6 +188,33 @@ func TestSketches(t *testing.T) {
 		SELECT datasketch_theta_estimate(datasketch_theta_intersect(a.s, b.s)) FROM p a, p b WHERE a.platform = 0 AND b.platform = 1`, exact)
 }
 
+// TestSnowflakeApproxCountDistinct checks that Snowflake's
+// APPROX_COUNT_DISTINCT counts with the datasketches extension, within
+// Snowflake's error, where the server has it, and with DuckDB's
+// approx_count_distinct where it has not.
+func TestSnowflakeApproxCountDistinct(t *testing.T) {
+	cs, _ := mediaServer(t)
+	ctx := context.Background()
+	mustExec(t, cs.admin, "CREATE TABLE acd AS SELECT i % 41356 AS v FROM range(1252858) t(i)")
+	mustExec(t, cs.admin, "SET sql_dialect = 'snowflake'")
+	var n int64
+	if err := cs.admin.QueryRow(ctx, "SELECT APPROX_COUNT_DISTINCT(v) FROM acd").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, cs.admin, "SET sql_dialect = 'duckdb'")
+	if math.Abs(float64(n)/41356-1) > 0.03 {
+		t.Errorf("APPROX_COUNT_DISTINCT of 41,356 values: %d", n)
+	}
+	lastQuery(t, cs, "igloo", "SELECT CAST(coalesce(round(datasketch_hll_estimate(datasketch_hll(12, ")
+
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+	if err := conn.QueryRow(ctx, "SELECT APPROX_COUNT_DISTINCT(x) FROM (VALUES (1), (2), (2)) t(x)").Scan(&n); err != nil || n != 2 {
+		t.Errorf("without the extension: %d %v", n, err)
+	}
+}
+
 func TestSpatialSandbox(t *testing.T) {
 	cs, dir := mediaServer(t)
 	ctx := context.Background()
