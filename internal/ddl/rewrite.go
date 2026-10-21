@@ -2,7 +2,16 @@ package ddl
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"io"
+	"slices"
+	"sort"
 	"strings"
+
+	"github.com/apache/iceberg-go/table"
+	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -70,6 +79,127 @@ func (m *Manager) qualifyTables(ctx context.Context, query string) (string, erro
 	return qualifyNames(query, func(schema, name string) bool {
 		return tables[key{schema, name}]
 	}, quoteIdent(m.Catalog())), nil
+}
+
+// qualifyOwnSchema puts the view's schema before the unqualified names in
+// query, a view's SQL, of the tables and views in schema, the view's own:
+// a view in sales that reads orders reads sales.orders, as in Snowflake and
+// as the view's Iceberg default namespace (its schema) says, wherever it is
+// loaded. Tables get the catalog's name too, as qualifyTables gives them.
+// Without this a view created by a session whose search path found orders
+// in sales could not be loaded anywhere else: replicas load their local
+// copies of views on a connection whose search path is the default schema.
+// The names of the query's CTEs are left alone, and so are names schema has
+// no table or view of, which resolve as before. conn parses query.
+func (m *Manager) qualifyOwnSchema(ctx context.Context, conn *duckdb.Conn, schema, query string) (string, error) {
+	refs, err := unqualifiedTables(ctx, conn, query)
+	if err != nil || len(refs) == 0 {
+		return query, err
+	}
+	tables := map[string]bool{}
+	for ident, err := range m.cat.ListTables(ctx, table.Identifier{schema}) {
+		if err != nil {
+			return query, err
+		}
+		tables[strings.ToLower(ident[len(ident)-1])] = true
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].at > refs[j].at })
+	for _, r := range refs {
+		var prefix string
+		switch {
+		case tables[strings.ToLower(r.name)]:
+			prefix = quoteIdent(m.Catalog()) + "." + quoteIdent(schema) + "."
+		case m.IsView(schema, r.name):
+			prefix = quoteIdent(schema) + "."
+		default:
+			continue
+		}
+		query = query[:r.at] + prefix + query[r.at:]
+	}
+	return query, nil
+}
+
+// tableRef is a table name as written in a query, and its byte offset.
+type tableRef struct {
+	name string
+	at   int
+}
+
+// unqualifiedTables returns the tables a query reads that it names without
+// a schema, other than its CTEs, as DuckDB's parser finds them. A query
+// DuckDB cannot parse has none: running it reports why.
+func unqualifiedTables(ctx context.Context, conn *duckdb.Conn, query string) ([]tableRef, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT json_serialize_sql($1::VARCHAR)", []driver.NamedValue{{Ordinal: 1, Value: query}})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var tree any
+	switch v := dest[0].(type) {
+	case string:
+		err = json.Unmarshal([]byte(v), &tree)
+	case []byte:
+		err = json.Unmarshal(v, &tree)
+	default:
+		tree = v
+	}
+	if err != nil {
+		return nil, err
+	}
+	if t, ok := tree.(map[string]any); ok && t["error"] == true {
+		return nil, nil
+	}
+	ctes := map[string]bool{}
+	var refs []tableRef
+	var walk func(any)
+	walk = func(n any) {
+		switch n := n.(type) {
+		case map[string]any:
+			if ctm, ok := n["cte_map"].(map[string]any); ok {
+				entries, _ := ctm["map"].([]any)
+				for _, e := range entries {
+					if e, ok := e.(map[string]any); ok {
+						if name, ok := e["key"].(string); ok {
+							ctes[strings.ToLower(name)] = true
+						}
+					}
+				}
+			}
+			if n["type"] == "BASE_TABLE" && n["catalog_name"] == "" && n["schema_name"] == "" {
+				name, _ := n["table_name"].(string)
+				at, ok := n["query_location"].(float64)
+				if name != "" && ok && at >= 0 && int(at) < len(query) && namedAt(query, int(at), name) {
+					refs = append(refs, tableRef{name: name, at: int(at)})
+				}
+			}
+			for _, v := range n {
+				walk(v)
+			}
+		case []any:
+			for _, v := range n {
+				walk(v)
+			}
+		}
+	}
+	walk(tree)
+	refs = slices.DeleteFunc(refs, func(r tableRef) bool { return ctes[strings.ToLower(r.name)] })
+	return refs, nil
+}
+
+// namedAt reports whether query has name, quoted or not, at byte at.
+func namedAt(query string, at int, name string) bool {
+	rest := query[at:]
+	if strings.HasPrefix(rest, `"`) {
+		return strings.HasPrefix(rest, quoteIdent(name))
+	}
+	return len(rest) >= len(name) && strings.EqualFold(rest[:len(name)], name)
 }
 
 // qualifyNames puts prefix and a dot before every two-part name

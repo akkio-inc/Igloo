@@ -105,11 +105,18 @@ DROP VIEW IF EXISTS recent_orders;
   tables: after `SET search_path = sales`, `v` is `sales.v`. Only admins
   may change `memory`, and so only they may put it first on the search
   path.
-- Unqualified table names in a view resolve when the view is queried,
-  against the querying session's search path, as in DuckDB. Qualify the
-  tables of views that sessions with other search paths will read.
-  Schema-qualified table names are stored with the catalog's name:
-  `sales.orders` becomes `lake.sales.orders`.
+- An unqualified name in a view is the view's own schema's table or view
+  of that name, if it has one, as in Snowflake and as the view's Iceberg
+  default namespace (its schema) says: a view in `sales` that reads
+  `orders` reads `sales.orders`, whatever the search path of the session
+  that created it or reads it. Igloo stores such names qualified
+  (`lake.sales.orders`). Other unqualified names resolve when the view is
+  queried, against the querying session's search path, as in DuckDB; a
+  CTE keeps its name. Schema-qualified table names are stored with the
+  catalog's name: `sales.orders` becomes `lake.sales.orders`.
+- A view that a replica cannot load, because a table it reads is missing,
+  say, fails when read with the reason (`view sales.v could not be loaded:
+  ...`), and loads at the next sync after the cause is fixed.
 - Creating, replacing, renaming or dropping a view takes effect at once for
   every session on the replica that does it. A view created on one replica
   reaches the others within 30 seconds, or at once when a query there names

@@ -77,6 +77,10 @@ type Manager struct {
 	// syncs counts the syncs begun, and applied is the number of the last
 	// begun of those that applied what they listed.
 	syncs, applied uint64
+	// failed are the catalog's views whose local copies could not be made,
+	// with why: each has a stub that fails with that when read (see
+	// stubLocal), and syncs try it again.
+	failed map[key]error
 	// known is the set of view keys, read without locking by IsView.
 	known atomic.Pointer[map[key]bool]
 	// gen counts changes to the local copies; see Generation.
@@ -104,7 +108,7 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 		return nil, err
 	}
 	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, edited: map[key]uint64{},
-		log: log.With("component", "ddl"), touched: map[key]time.Time{}}
+		failed: map[key]error{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
 	// Loading the views reads and fills in the catalog's set of tables; hold
 	// the exclusive side (see Run). Nothing else runs yet, but this keeps the
@@ -249,6 +253,15 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 			changed = true
 		}
 	}
+	for k := range m.failed {
+		if _, ok := want[k]; !ok && listed(k) {
+			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(k.schema, k.name)); err != nil {
+				return changed, err
+			}
+			delete(m.failed, k)
+			changed = true
+		}
+	}
 
 	// Local copies can also go missing, say if an admin drops one; they are
 	// recreated too.
@@ -273,19 +286,29 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 	}
 	for len(pending) > 0 {
 		var errs []error
+		why := map[key]error{}
 		progress := false
 		for k, v := range pending {
 			// Let names in v resolve against other pending views too.
 			m.publish(pending)
 			if err := m.createLocal(ctx, m.conn, v); err != nil {
 				errs = append(errs, fmt.Errorf("view %s.%s: %w", v.Schema, v.Name, err))
+				why[k] = err
 				continue
 			}
 			m.views[k] = v
+			delete(m.failed, k)
 			delete(pending, k)
 			progress, changed = true, true
 		}
 		if !progress {
+			for k, v := range pending {
+				m.stubLocal(ctx, v, why[k])
+				if _, ok := m.failed[k]; !ok {
+					changed = true
+				}
+				m.failed[k] = why[k]
+			}
 			m.publish(nil)
 			return changed, errors.Join(errs...)
 		}
@@ -306,8 +329,11 @@ func (m *Manager) edit(keys ...key) {
 
 // publish updates the set IsView reads: the local views plus extra.
 func (m *Manager) publish(extra map[key]catalog.View) {
-	known := make(map[key]bool, len(m.views)+len(extra))
+	known := make(map[key]bool, len(m.views)+len(m.failed)+len(extra))
 	for k := range m.views {
+		known[k] = true
+	}
+	for k := range m.failed {
 		known[k] = true
 	}
 	for k := range extra {
@@ -338,6 +364,9 @@ func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, nam
 		return fmt.Errorf("view %q %w", name, ErrExists)
 	}
 	if query, err = m.qualifyTables(ctx, query); err != nil {
+		return err
+	}
+	if query, err = m.qualifyOwnSchema(ctx, conn, schema, query); err != nil {
 		return err
 	}
 
@@ -375,6 +404,7 @@ func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, nam
 		v = catalog.View{Schema: schema, Name: name, SQL: query, Columns: cols}
 	}
 	m.views[k] = v
+	delete(m.failed, k)
 	m.publish(nil)
 	m.reloadTable(ctx, schema, name, true)
 	return nil
@@ -402,6 +432,9 @@ func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bo
 
 	err := m.cat.DropView(ctx, catalog.Ident(schema, name))
 	_, local := m.views[k]
+	if _, stub := m.failed[k]; stub {
+		local = true
+	}
 	switch {
 	case errors.Is(err, icecat.ErrNoSuchView):
 		// Without a local copy of a catalog view, the local database's
@@ -419,6 +452,7 @@ func (m *Manager) DropView(ctx context.Context, schema, name string, ifExists bo
 		return err
 	}
 	delete(m.views, k)
+	delete(m.failed, k)
 	m.publish(nil)
 	m.reloadTable(ctx, schema, name, true)
 	return nil
@@ -493,7 +527,50 @@ func (m *Manager) createLocal(ctx context.Context, conn *duckdb.Conn, v catalog.
 		}
 		stmt += " (" + quoteList(names) + ")"
 	}
-	return m.exec(ctx, conn, stmt+" AS "+m.rewrite(v.SQL))
+	// Views created before CreateView qualified their own schema's names,
+	// or by another engine, may still name its tables bare.
+	query := v.SQL
+	if q, err := m.qualifyOwnSchema(ctx, conn, v.Schema, query); err == nil {
+		query = q
+	}
+	return m.exec(ctx, conn, stmt+" AS "+m.rewrite(query))
+}
+
+// stubLocal makes the local copy of v, a catalog view whose copy could not
+// be made, a view with v's columns that fails with why when read: a session
+// that reads it learns what is wrong, rather than that it does not exist.
+func (m *Manager) stubLocal(ctx context.Context, v catalog.View, why error) {
+	msg := fmt.Sprintf("view %s.%s could not be loaded: %s", v.Schema, v.Name, firstLine(why))
+	fail := "error(" + quoteLiteral(msg) + ")"
+	cols := make([]string, len(v.Columns))
+	for i, c := range v.Columns {
+		value := "NULL"
+		if i == 0 {
+			value = fail
+		}
+		cols[i] = "CAST(" + value + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
+	}
+	if err := m.exec(ctx, m.conn, "CREATE SCHEMA IF NOT EXISTS "+quoteIdent(m.eng.LocalDatabase())+"."+quoteIdent(v.Schema)); err != nil {
+		return
+	}
+	stmt := "CREATE OR REPLACE VIEW " + m.localName(v.Schema, v.Name) + " AS SELECT "
+	if len(cols) == 0 || m.exec(ctx, m.conn, stmt+strings.Join(cols, ", ")) != nil {
+		_ = m.exec(ctx, m.conn, stmt+fail+" AS error")
+	}
+}
+
+// firstLine is the first line of err's message, without DuckDB's excerpt
+// of the SQL.
+func firstLine(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	line, _, _ := strings.Cut(err.Error(), "\n")
+	return line
+}
+
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 // localViews returns the views in the local database.

@@ -25,7 +25,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and creates its warehouse on start.
 - Views on the Iceberg catalog (`CREATE [OR REPLACE] VIEW`, `DROP VIEW`),
   stored as Iceberg views and kept in sync across replicas. Replacing a view
-  may change its columns and the tables it reads.
+  may change its columns and the tables it reads. An unqualified name in a
+  view is the view's own schema's table or view, as in Snowflake, whatever
+  the search path of the session that created or reads it; a view a replica
+  cannot load fails with the reason when read.
 - `COMMENT ON TABLE`, `VIEW` and `COLUMN`, stored as Iceberg metadata and
   shown through `obj_description`, `col_description`, `pg_description`,
   `igloo_comments()`, and `information_schema.tables` and `.columns`.
