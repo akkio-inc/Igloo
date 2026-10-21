@@ -723,6 +723,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   reads them.
 - Results reach clients in batches rather than one network write per row:
   large results arrive four to five times faster.
+- `COUNT(*) OVER ()` beside a query's rows, as in Acme's table previews, no
+  longer makes DuckDB hold every row before it returns the first: where it
+  is the number of rows the `FROM` and `WHERE` produce, Igloo counts those
+  once instead, in either dialect. Previewing 50 rows of a 37-million-row
+  table with its row count took 7.9 s and takes 1.0 s (docs/sql.md#dialect).
 
 ### Operations and deployment
 

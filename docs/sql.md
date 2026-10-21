@@ -17,6 +17,17 @@ Sketches for deduplicated reach, geometry and H3 functions, and DuckDB's
 approximate and statistical functions are described in
 [media analytics](media-analytics.md).
 
+`COUNT(*) OVER ()`, the number of rows of the result beside each row (as in
+a table preview), makes DuckDB hold every row before it returns the first.
+Where it is the number of rows the `FROM` and `WHERE` produce, Igloo counts
+those once instead, as `(SELECT count(*) FROM ... WHERE ...)`, in either
+dialect: in a `SELECT` without `GROUP BY`, aggregates, `DISTINCT`,
+`QUALIFY` or another window function, whose other items are columns,
+constants and operators, and whose `FROM`, `WHERE` and common table
+expressions read the same rows each time (no sample, `LIMIT`, window
+function, `random()` or parameter). Previewing 50 rows of a table of 37
+million rows with its row count takes 1 s instead of 8.
+
 Tables live in the Iceberg catalog, named `lake` in SQL (`IGLOO_CATALOG_NAME`),
 and the default schema is `public`. Unqualified names resolve to
 `lake.public`, so `events` and `lake.public.events` are the same table.
