@@ -831,7 +831,7 @@ func (s *Server) createExternalTable(ctx context.Context, sess *session, me auth
 		CreatedBy: me.Name,
 	}
 	err = s.shares.Consumer().CreateExternalTable(ctx, def)
-	s.ddlGen.Add(1)
+	s.catalogChanged()
 	s.sessions.expireAll()
 	if err != nil {
 		return sharingError(err, fmt.Sprintf("provider %q", c.name))
@@ -861,7 +861,7 @@ func (s *Server) dropExternalTable(ctx context.Context, sess *session, c *shareC
 	if ferr := s.grants.ForgetObject(ctx, auth.Object{Schema: schema, Table: name}); ferr != nil {
 		s.log.Warn("could not remove a dropped external table's grants", "table", schema+"."+name, "err", ferr)
 	}
-	s.ddlGen.Add(1)
+	s.catalogChanged()
 	s.sessions.expireAll()
 	s.log.Info("external table dropped", "table", schema+"."+name, "by", sess.currentUser().Name)
 	return w.Complete(c.tag)

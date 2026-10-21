@@ -231,7 +231,7 @@ func (s *Server) runRefCommand(ctx context.Context, sess *session, c refCommand,
 		}
 	case "FAST FORWARD":
 		err := s.clones.FastForward(ctx, ident, c.name, c.to)
-		s.ddlGen.Add(1)
+		s.catalogChanged()
 		if err != nil {
 			return acc, cloneError(err)
 		}

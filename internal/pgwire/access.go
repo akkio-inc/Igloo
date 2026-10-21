@@ -979,7 +979,7 @@ var allowedFunctions = map[string]bool{
 // catalog and connection scans in its unoptimized plan, refusing scans of
 // anything else that needs a grant.
 func (s *Server) planScans(ctx context.Context, sess *session, text string) (planScans, error) {
-	plan, err := explainLogical(ctx, sess.conn, text)
+	plan, err := s.explain(ctx, sess, text)
 	if err != nil {
 		return planScans{}, denied("cannot analyze this statement: %v", err)
 	}
@@ -1062,6 +1062,9 @@ func isLeaf(n map[string]any) bool {
 
 // tableFunctions returns the names of every table function, lower-cased.
 func (s *Server) tableFunctions(ctx context.Context, sess *session) (map[string]bool, error) {
+	if m := sess.memo; m != nil && m.tableFns != nil {
+		return m.tableFns, nil
+	}
 	names, err := queryStrings(ctx, sess, `SELECT DISTINCT system.main.lower(function_name) FROM system.main.duckdb_functions()
 		WHERE function_type IN ('table', 'table_macro')`)
 	if err != nil {
@@ -1071,7 +1074,39 @@ func (s *Server) tableFunctions(ctx context.Context, sess *session) (map[string]
 	for _, n := range names {
 		m[n] = true
 	}
+	if sess.memo != nil {
+		sess.memo.tableFns = m
+	}
 	return m, nil
+}
+
+// checkMemo is what the checks of one statement work out once and use
+// again: the catalog check of a user with the none role and the check of
+// connections' tables both read the statement's plan and DuckDB's table
+// functions, and neither changes while the statement is prepared (see
+// prepareChecked).
+type checkMemo struct {
+	// plans are explainLogical's plans, by the text explained. They are
+	// only read.
+	plans    map[string]any
+	tableFns map[string]bool
+}
+
+// explain is explainLogical on the session's connection, once for each
+// text while a statement is prepared (see checkMemo).
+func (s *Server) explain(ctx context.Context, sess *session, text string) (any, error) {
+	m := sess.memo
+	if m == nil {
+		return explainLogical(ctx, sess.conn, text)
+	}
+	if p, ok := m.plans[text]; ok {
+		return p, nil
+	}
+	p, err := explainLogical(ctx, sess.conn, text)
+	if err == nil {
+		m.plans[text] = p
+	}
+	return p, err
 }
 
 // explainLogical returns DuckDB's unoptimized plan for text, which has one

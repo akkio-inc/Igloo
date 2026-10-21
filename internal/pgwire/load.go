@@ -1079,7 +1079,7 @@ func (s *Server) execDDL(ctx context.Context, sess *session, user auth.User, que
 		return pgError(err)
 	}
 	if changesCatalog(st.stmtType) {
-		s.ddlGen.Add(1)
+		s.catalogChanged()
 	}
 	if st.effect != nil {
 		s.applyEffect(ctx, sess, st.effect)

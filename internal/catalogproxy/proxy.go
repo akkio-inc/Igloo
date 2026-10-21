@@ -108,6 +108,10 @@ type Options struct {
 	// kept for DuckDB's repeats of it. Zero means the default; tests
 	// shorten them.
 	AttemptTimeout, Patience, Remember time.Duration
+	// ListTTL is how long the proxy keeps the catalog's answers to
+	// listings (see listings.go): zero means the default, a negative value
+	// that it keeps none.
+	ListTTL time.Duration
 }
 
 // Proxy forwards DuckDB's catalog requests.
@@ -134,6 +138,9 @@ type Proxy struct {
 
 	// guard checks changes (see SetGuard).
 	guard atomic.Pointer[Guard]
+
+	// lists are the listings the proxy keeps.
+	lists *listings
 }
 
 // New starts a proxy to the catalog on a random loopback port.
@@ -153,6 +160,9 @@ func New(opts Options) (*Proxy, error) {
 	}
 	if opts.Remember <= 0 {
 		opts.Remember = defaultRemember
+	}
+	if opts.ListTTL == 0 {
+		opts.ListTTL = defaultListTTL
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// DuckDB loads many tables at once.
@@ -176,6 +186,7 @@ func New(opts Options) (*Proxy, error) {
 		ctx:     ctx,
 		cancel:  cancel,
 		changes: map[[sha256.Size]byte]*change{},
+		lists:   newListings(opts.ListTTL),
 	}
 	p.url = "http://" + ln.Addr().String() + "/" + p.secret
 	p.reads = &httputil.ReverseProxy{
@@ -257,7 +268,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
-		p.reads.ServeHTTP(w, r)
+		if r.Method == http.MethodGet && p.opts.ListTTL > 0 && listPath.MatchString(rest) {
+			p.serveListing(w, r, rest)
+			return
+		}
+		sw := &statusWriter{ResponseWriter: w}
+		p.reads.ServeHTTP(sw, r)
+		p.lists.loaded(rest, sw.status)
 		return
 	}
 
@@ -266,13 +283,48 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "BadRequestException", "the request is too large")
 		return
 	}
+	// A change makes the listings kept stale: forgotten before it, so no
+	// listing begun before it is kept, and after it, so none answered
+	// while it was under way is.
+	p.lists.forget()
 	c := p.begin(r, rest, body)
 	select {
 	case <-c.done:
+		p.lists.forget()
 		c.res.write(w)
 	case <-r.Context().Done():
 		// DuckDB gave up waiting; it sends the change again, which joins
 		// this one.
+		go func() {
+			<-c.done
+			p.lists.forget()
+		}()
+	}
+}
+
+// statusWriter notes the status a read was answered with.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 

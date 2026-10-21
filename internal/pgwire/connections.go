@@ -343,7 +343,7 @@ func (s *Server) runConnectionCommand(ctx context.Context, sess *session, c *con
 	if err != nil {
 		return connectionError(err, c.name)
 	}
-	s.ddlGen.Add(1)
+	s.catalogChanged()
 	s.log.Info("connection changed", "action", strings.ToLower(c.verb), "connection", c.name, "by", me.Name)
 	if changed != nil {
 		if warning := changed.TLSWarning(); warning != "" {

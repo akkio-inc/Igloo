@@ -42,6 +42,9 @@ type icebergDeps struct {
 	tls     *tls.Config
 	// clones keeps the files clones share; nil without a catalog.
 	clones *clone.Guard
+	// changed says other engines changed the catalog (see
+	// engine.Engine.CatalogChanged).
+	changed func()
 }
 
 // serveIceberg serves the Iceberg REST catalog for other engines on ln,
@@ -66,6 +69,7 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 	owners, _ := deps.grants.(auth.OwnerStore)
 	handler, err := icebergrest.New(icebergrest.Options{
 		Clones:      clones,
+		Changed:     deps.changed,
 		CatalogURI:  cfg.Catalog.URI,
 		Warehouse:   cfg.Catalog.Warehouse,
 		CatalogName: cfg.Catalog.Name,

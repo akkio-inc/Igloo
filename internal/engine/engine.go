@@ -204,6 +204,17 @@ func (e *Engine) CatalogShare() func() {
 	return e.catMu.RUnlock
 }
 
+// CatalogChanged says the catalog changed other than through DuckDB (a view
+// Igloo wrote, a clone, a table another engine created through Igloo's
+// Iceberg REST endpoint), so that DuckDB's next listings of it ask the
+// catalog again rather than take the catalog proxy's (see catalogproxy's
+// listings).
+func (e *Engine) CatalogChanged() { e.proxy.Invalidate() }
+
+// ListingsGeneration changes whenever what DuckDB's listings of the
+// catalog list may have changed (see catalogproxy.Proxy.Generation).
+func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
+
 // LoadSchemas makes the catalog views (information_schema, pg_catalog,
 // duckdb_columns) show the real columns of every Iceberg table. DuckDB loads
 // an Iceberg table's schema the first time the table is used and until then
@@ -214,37 +225,119 @@ func (e *Engine) LoadSchemas(ctx context.Context, conn *duckdb.Conn) error {
 	if e.catalog == "" {
 		return nil
 	}
+	tables, err := e.placeholders(ctx, conn)
+	if err != nil {
+		return err
+	}
+	return e.loadSchemas(ctx, conn, tables, nil)
+}
+
+// WarmSchemas loads, in the background of a replica that has just started,
+// the schemas LoadSchemas would load for the first statement that lists
+// columns, so that statement does not wait for them all. It takes the
+// catalog lock as statements do: exclusively to list what is still to
+// load, and shared for each table it loads, one at a time, so DDL and
+// listings wait for no more than one table.
+func (e *Engine) WarmSchemas(ctx context.Context) error {
+	if e.catalog == "" {
+		return nil
+	}
+	c, err := e.connector.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close() //nolint:errcheck
+	conn := c.(*duckdb.Conn)
+	release := e.CatalogLock()
+	tables, err := e.placeholders(ctx, conn)
+	release()
+	if err != nil {
+		return err
+	}
+	return e.loadSchemas(ctx, conn, tables, e.CatalogShare)
+}
+
+// placeholders lists the Iceberg tables whose schemas DuckDB has not loaded
+// yet, as schema and name.
+func (e *Engine) placeholders(ctx context.Context, conn *duckdb.Conn) ([][2]string, error) {
 	rows, err := conn.QueryContext(ctx, `SELECT DISTINCT schema_name, table_name FROM duckdb_columns()
 		WHERE database_name = $1 AND column_name = '__' AND data_type = 'UNKNOWN'`,
 		[]driver.NamedValue{{Ordinal: 1, Value: e.catalog}})
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer rows.Close() //nolint:errcheck
 	var tables [][2]string
 	dest := make([]driver.Value, 2)
 	for {
 		if err := rows.Next(dest); err != nil {
 			if !errors.Is(err, io.EOF) {
-				rows.Close() //nolint:errcheck
-				return err
+				return nil, err
 			}
-			break
+			return tables, nil
 		}
 		tables = append(tables, [2]string{dest[0].(string), dest[1].(string)})
 	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
+}
 
-	var errs []error
-	for _, t := range tables {
-		stmt := "DESCRIBE " + ident(e.catalog) + "." + ident(t[0]) + "." + ident(t[1])
-		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
-			errs = append(errs, fmt.Errorf("load schema of %s.%s: %w", t[0], t[1], err))
+// loadSchemas loads tables' schemas. hold, if set, is taken around each
+// load (see WarmSchemas); otherwise the caller keeps the rest of Igloo off
+// the catalog meanwhile (see CatalogLock).
+func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2]string, hold func() func()) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	// Each load waits on the catalog and on object storage, so they run
+	// side by side, on conn and connections of their own: a catalog of
+	// hundreds of tables took seconds one at a time. Loading binds the
+	// table, which DuckDB-Iceberg's own lock keeps safe alongside other
+	// binds.
+	jobs := make(chan [2]string)
+	var (
+		mu   sync.Mutex
+		errs []error
+		wg   sync.WaitGroup
+	)
+	load := func(c *duckdb.Conn) {
+		for t := range jobs {
+			if ctx.Err() != nil {
+				continue
+			}
+			stmt := "DESCRIBE " + ident(e.catalog) + "." + ident(t[0]) + "." + ident(t[1])
+			release := func() {}
+			if hold != nil {
+				release = hold()
+			}
+			_, err := c.ExecContext(ctx, stmt, nil)
+			release()
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("load schema of %s.%s: %w", t[0], t[1], err))
+				mu.Unlock()
+			}
 		}
 	}
+	wg.Go(func() { load(conn) })
+	for range min(len(tables), schemaLoaders) - 1 {
+		c, err := e.connector.Connect(ctx)
+		if err != nil {
+			break
+		}
+		wg.Go(func() {
+			defer c.Close() //nolint:errcheck
+			load(c.(*duckdb.Conn))
+		})
+	}
+	for _, t := range tables {
+		jobs <- t
+	}
+	close(jobs)
+	wg.Wait()
 	return errors.Join(errs...)
 }
+
+// schemaLoaders bounds how many tables' schemas LoadSchemas loads at once.
+const schemaLoaders = 16
 
 // Ping checks that DuckDB can run a query.
 func (e *Engine) Ping(ctx context.Context) error {

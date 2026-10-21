@@ -715,6 +715,22 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
+  tables again for every statement that looks one up, and Igloo's checks of
+  a user without the reader role listed every attached database's tables
+  for each statement besides. The catalog proxy now keeps listings for up to
+  10 seconds (changes through Igloo apply at once; a table made elsewhere is
+  found at once by name, and listed within 10 seconds), the checks resolve
+  names against an index of tables built again whenever that may have
+  changed, and they plan a statement once rather than twice. On a catalog of
+  753 tables plus a Snowflake connection of 812, small queries of a user
+  with a schema grant went from 95–150 ms to 30–38 ms, and an admin's from
+  35–45 ms to 21–25 ms.
+- Iceberg tables' schemas, which the first statement that lists columns
+  loads, load side by side and, after a start, in the background: on the
+  same catalog that took 5 seconds instead of 11, and a first
+  `information_schema.columns` lookup made once it is done takes 0.13
+  seconds.
 - Scale to zero: `igloo gateway` accepts client connections in Igloo's
   place, starts Igloo's EC2 instances, Kubernetes Deployment or (through
   commands) any VM when a client connects, and stops them after

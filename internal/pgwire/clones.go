@@ -260,7 +260,7 @@ func (s *Server) cloneTable(ctx context.Context, sess *session, user auth.User, 
 		return acc, err
 	}
 	res, err := s.clones.Clone(ctx, clone.Request{Source: identOf(src), Target: identOf(dst), At: at, Replace: c.replace})
-	s.ddlGen.Add(1)
+	s.catalogChanged()
 	if err != nil {
 		return acc, cloneError(err)
 	}
@@ -359,7 +359,7 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 	if err := s.copySchemaGrants(ctx, user, src, dst); err != nil {
 		return acc, err
 	}
-	defer s.ddlGen.Add(1)
+	defer s.catalogChanged()
 	// The tables replaced go with their files, as drops do, once the
 	// clones are made.
 	var replaced []*table.Table

@@ -147,6 +147,11 @@ type Options struct {
 	TLS bool
 	// HTTP calls Lakekeeper. Nil means a client with a timeout.
 	HTTP *http.Client
+	// Changed, if set, is called after each change other engines ask of the
+	// catalog here (a namespace, a table created, committed to, dropped or
+	// renamed), so that Igloo's SQL sees it at once (see catalogproxy's
+	// listings).
+	Changed func()
 	// Audit, Activity and Metrics may be nil.
 	Audit    *audit.Log
 	Activity *activity.Tracker
@@ -184,7 +189,7 @@ func New(opts Options) (*Server, error) {
 	log := opts.Log.With("component", "iceberg")
 	s := &Server{
 		opts:    opts,
-		cat:     &upstream{base: strings.TrimSuffix(opts.CatalogURI, "/"), warehouse: opts.Warehouse, http: opts.HTTP, log: log},
+		cat:     &upstream{base: strings.TrimSuffix(opts.CatalogURI, "/"), warehouse: opts.Warehouse, http: opts.HTTP, log: log, changed: opts.Changed},
 		tokens:  tokens,
 		log:     log,
 		mux:     http.NewServeMux(),

@@ -25,6 +25,8 @@ type upstream struct {
 	warehouse string
 	http      *http.Client
 	log       *slog.Logger
+	// changed is Options.Changed.
+	changed func()
 
 	mu sync.Mutex
 	// prefix is the warehouse's path prefix in Lakekeeper's API, from its
@@ -50,7 +52,12 @@ func (u *upstream) call(ctx context.Context, method, path string, query url.Valu
 	if len(query) > 0 {
 		target += "?" + query.Encode()
 	}
-	return u.do(ctx, method, target, body)
+	r, err := u.do(ctx, method, target, body)
+	if method != http.MethodGet && method != http.MethodHead && u.changed != nil {
+		// Refused or not, as a change whose answer was lost may have landed.
+		u.changed()
+	}
+	return r, err
 }
 
 func (u *upstream) do(ctx context.Context, method, target string, body []byte) (*reply, error) {

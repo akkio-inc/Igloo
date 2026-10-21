@@ -471,6 +471,16 @@ outcome confirmed after an error. Catalogs that ignore `Idempotency-Key`
 get the same guarantee for writes that change rows; a schema change whose
 answer was lost may then fail even though it was applied.
 
+The proxy also keeps the catalog's answers to listings (of its namespaces,
+and of their tables and views) for up to 10 seconds. DuckDB lists the
+catalog again for every statement that looks a table up, and with hundreds
+of tables each listing cost tens of milliseconds; so did the checks of
+every statement of a user without the reader role. Changes made through
+this replica, and through its Iceberg REST endpoint, apply at once. A table
+another replica or engine creates or drops is found at once by a query that
+names it, since DuckDB looks up a name its listing lacks; listings
+(`SHOW TABLES`, `information_schema`) show it within 10 seconds.
+
 ## Workload management
 
 [Workload management](workload-management.md) covers attributing and

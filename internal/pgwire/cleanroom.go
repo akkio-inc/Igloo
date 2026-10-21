@@ -904,7 +904,7 @@ func (s *Server) runRoomCommand(ctx context.Context, sess *session, c *roomComma
 			err = fmt.Errorf("dataset %s of collaborator %s in clean room %s %w", c.name, c.of, c.room, err)
 		}
 		if err == nil {
-			s.ddlGen.Add(1)
+			s.catalogChanged()
 		}
 		return done(err)
 	case crRemoveDataset:
@@ -913,7 +913,7 @@ func (s *Server) runRoomCommand(ctx context.Context, sess *session, c *roomComma
 			err = fmt.Errorf("dataset %s of clean room %s %w", c.name, c.room, err)
 		}
 		if err == nil {
-			s.ddlGen.Add(1)
+			s.catalogChanged()
 		}
 		return done(err)
 	case crPutTemplate:
@@ -1228,7 +1228,7 @@ func (s *Server) roomSource(ctx context.Context, sess *session, name []string) (
 // Confined applies a change of clean rooms' confinements on this replica
 // at once.
 func (s *Server) Confined(ctx context.Context) error {
-	defer s.ddlGen.Add(1)
+	defer s.catalogChanged()
 	return s.gov.reload(ctx)
 }
 
@@ -1506,7 +1506,7 @@ func (s *Server) writeResult(ctx context.Context, sess *session, query string, t
 		}
 	}
 	release()
-	s.ddlGen.Add(1)
+	s.catalogChanged()
 	err = s.grants.Grant(ctx, []auth.Grant{{Grantee: t.Grantee, GranteeType: t.GranteeType, Privilege: auth.PrivilegeSelect,
 		Object: auth.Object{Schema: t.Schema, Table: t.Table}, GrantedBy: sess.currentUser().Name}})
 	// Sessions here read their grants again, as after GRANT.
@@ -1543,7 +1543,7 @@ func (s *Server) DropResult(ctx context.Context, schema, table string) error {
 		if _, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+quoteName([]string{s.catalogName(), schema, table}), nil); err != nil {
 			return err
 		}
-		s.ddlGen.Add(1)
+		s.catalogChanged()
 	}
 	return s.grants.ForgetObject(ctx, auth.Object{Schema: schema, Table: table})
 }

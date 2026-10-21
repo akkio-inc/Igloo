@@ -304,5 +304,9 @@ func (e *recordingEngine) CatalogShare() func() {
 	return func() { e.events = append(e.events, "runlock"); e.mu.RUnlock() }
 }
 
+func (e *recordingEngine) CatalogChanged() {}
+
+func (e *recordingEngine) ListingsGeneration() uint64 { return 0 }
+
 // (helpers newViewCatalog, viewReplica, syncing, dbtRun, dbtTable, connect,
 // mustExec live in viewsync_test.go.)

@@ -10,10 +10,13 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
 // Working out which tables a query reads from DuckDB's parse of it: table
@@ -307,10 +310,25 @@ func (r *resolver) load(names []string) error {
 		quoted[i] = quoteLiteral(n)
 	}
 	in := strings.Join(quoted, ", ")
-	rows, err := r.sess.conn.QueryContext(r.ctx, `SELECT database_name, schema_name, table_name, false, '', false
-			FROM system.main.duckdb_tables() WHERE system.main.lower(table_name) IN (`+in+`)
+	query := `SELECT database_name, schema_name, table_name, false, '', false
+			FROM system.main.duckdb_tables() WHERE system.main.lower(table_name) IN (` + in + `)
 		UNION ALL SELECT database_name, schema_name, view_name, true, sql, internal
-			FROM system.main.duckdb_views() WHERE system.main.lower(view_name) IN (`+in+`)`, nil)
+			FROM system.main.duckdb_views() WHERE system.main.lower(view_name) IN (` + in + `)`
+	if !r.sess.temps {
+		// A session with no temporary tables sees the tables every session
+		// sees, which the server keeps an index of (see indexedTables), so
+		// only views, cheap to list, are listed here.
+		idx, err := r.s.indexedTables(r.ctx, r.sess)
+		if err != nil {
+			return err
+		}
+		for _, n := range missing {
+			r.objects[n] = append(r.objects[n], idx[n]...)
+		}
+		query = `SELECT database_name, schema_name, view_name, true, sql, internal
+			FROM system.main.duckdb_views() WHERE system.main.lower(view_name) IN (` + in + `)`
+	}
+	rows, err := r.sess.conn.QueryContext(r.ctx, query, nil)
 	if err != nil {
 		return err
 	}
@@ -895,4 +913,84 @@ func (w *astWalk) walk(n any, sc *cteScope) {
 func str(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// tableIndexTTL bounds how long the server's index of tables is used. It is
+// the catalog proxy's for listings, which the index is built from.
+const tableIndexTTL = 10 * time.Second
+
+// tableIndex is the tables of every database but temp, which is each
+// session's own, by lower-cased name (see indexedTables).
+type tableIndex struct {
+	mu sync.Mutex
+	// gen is the generations it was built at (see indexedTables), and at
+	// when.
+	gen    uint64
+	at     time.Time
+	byName map[string][]object
+}
+
+// indexedTables returns the server's index of the tables of every database
+// but temp, by lower-cased name, from one listing of them shared by every
+// session's checks: DuckDB lists the Iceberg catalog's tables, and those
+// of connections, again in each statement, which a statement's checks
+// would otherwise pay for each name they resolve. The index is built again
+// whenever what it was built from may have changed: DDL here, local copies
+// of views and connections (catalogGeneration), the Iceberg catalog's
+// listings as DuckDB sees them (engine.ListingsGeneration, which changes
+// when a table DuckDB loads by name was not in them, so that the checks of
+// a statement that bound a table made elsewhere see it), and after
+// tableIndexTTL. Callers hold the catalog lock (see holdCatalog), as for
+// any listing. The map returned is never changed.
+func (s *Server) indexedTables(ctx context.Context, sess *session) (map[string][]object, error) {
+	gen := s.catalogGeneration() + s.engine.ListingsGeneration()
+	s.tables.mu.Lock()
+	if s.tables.byName != nil && s.tables.gen == gen && time.Since(s.tables.at) < tableIndexTTL {
+		m := s.tables.byName
+		s.tables.mu.Unlock()
+		return m, nil
+	}
+	s.tables.mu.Unlock()
+	rows, err := sess.conn.QueryContext(ctx, `SELECT database_name, schema_name, table_name
+		FROM system.main.duckdb_tables() WHERE database_name <> 'temp'`, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	m := map[string][]object{}
+	dest := make([]driver.Value, 3)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			break
+		}
+		o := object{}
+		o.db, _ = dest[0].(string)
+		o.schema, _ = dest[1].(string)
+		o.name, _ = dest[2].(string)
+		k := strings.ToLower(o.name)
+		m[k] = append(m[k], o)
+	}
+	s.tables.mu.Lock()
+	s.tables.gen, s.tables.at, s.tables.byName = gen, time.Now(), m
+	s.tables.mu.Unlock()
+	return m, nil
+}
+
+// mayCreateTemporary reports whether a statement may make a temporary
+// table or view: one that creates anything and mentions TEMP, TEMPORARY or
+// the temp database.
+func mayCreateTemporary(query string) bool {
+	creates, temp := false, false
+	for _, w := range sqllex.CodeWords(query) {
+		switch strings.ToLower(w) {
+		case "create":
+			creates = true
+		case "temp", "temporary":
+			temp = true
+		}
+	}
+	return creates && temp
 }

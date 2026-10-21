@@ -277,7 +277,7 @@ func (s *Server) authorizeViewReads(ctx context.Context, sess *session, user aut
 // read, or an error when that cannot be worked out. policyMarker marks the
 // tables that policies read in a statement they rewrote.
 func (s *Server) connectionReads(ctx context.Context, sess *session, planText, parseText, policyMarker string) ([]auth.Object, error) {
-	plan, err := explainLogical(ctx, sess.conn, planText)
+	plan, err := s.explain(ctx, sess, planText)
 	if err != nil {
 		return nil, denied("cannot analyze which tables of connections this statement reads: %v", err)
 	}

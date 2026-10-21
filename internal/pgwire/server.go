@@ -65,6 +65,12 @@ type Engine interface {
 	// func that releases it. See engine.Engine.CatalogLock.
 	CatalogLock() func()
 	CatalogShare() func()
+	// CatalogChanged says the catalog changed other than through DuckDB's
+	// own requests, so that DuckDB's next listings of it ask the catalog
+	// again (see catalogproxy's listings); ListingsGeneration changes
+	// whenever what those listings list may have.
+	CatalogChanged()
+	ListingsGeneration() uint64
 }
 
 // Options configures the server.
@@ -257,8 +263,11 @@ type Server struct {
 	rooms    *cleanroom.Service
 	partners partnerDirectory
 	// ddlGen counts statements run here that may change the catalog; see
-	// catalogGeneration.
+	// catalogGeneration. catalogChanged adds to it.
 	ddlGen atomic.Uint64
+	// tables is the index of tables the checks resolve names with (see
+	// indexedTables).
+	tables tableIndex
 	// mockSecret derives the credentials a login for an unknown user runs
 	// against (see mockCredentials).
 	mockSecret []byte
@@ -480,6 +489,12 @@ type session struct {
 	pid, secret int32
 	added       time.Time
 	conn        *duckdb.Conn
+	// memo keeps what the checks of the statement being prepared would
+	// otherwise ask DuckDB more than once; nil outside prepareChecked.
+	memo *checkMemo
+	// temps says the session may have temporary tables or views, which
+	// the server's index of tables leaves out (see indexedTables).
+	temps bool
 	// open holds every DuckDB statement prepared for this client, keyed by
 	// the wire statement that owns it, so none outlive the connection.
 	open     map[*wire.PreparedStatement]*statement
@@ -1142,7 +1157,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		if err == nil {
 			switch {
 			case changesCatalog(st.stmtType):
-				s.ddlGen.Add(1)
+				s.catalogChanged()
 				sess.ddlCount++
 			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
 				sess.settingGen++
@@ -1361,6 +1376,13 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// no other statement reads the set while this changes it (see
 	// holdCatalog).
 	defer s.holdCatalog(sess)()
+	if sess.memo == nil {
+		sess.memo = &checkMemo{plans: map[string]any{}}
+		defer func() { sess.memo = nil }()
+	}
+	if !sess.temps && mayCreateTemporary(text) {
+		sess.temps = true
+	}
 	fail := func(err error) (*statement, error) { return nil, err }
 	var viewGen uint64
 	if s.ddl != nil {
@@ -1401,7 +1423,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	} else if strings.Contains(strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"), ";") {
 		// Preparing may run statements that change the catalog or the
 		// session's settings; count it as doing both.
-		s.ddlGen.Add(1)
+		s.catalogChanged()
 		sess.settingGen++
 		sess.ddlCount++
 	}
@@ -1876,4 +1898,14 @@ func (h minLevel) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h minLevel) WithGroup(name string) slog.Handler {
 	return minLevel{h.Handler.WithGroup(name), h.level}
+}
+
+// catalogChanged notes a change to the catalog's objects made here: for the
+// rechecks of prepared statements (catalogGeneration), and for DuckDB's
+// listings of the catalog, which the engine's catalog proxy keeps for a few
+// seconds and forgets on the changes DuckDB makes itself, but not on those
+// Igloo makes another way.
+func (s *Server) catalogChanged() {
+	s.ddlGen.Add(1)
+	s.engine.CatalogChanged()
 }

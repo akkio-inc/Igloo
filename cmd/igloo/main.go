@@ -525,7 +525,8 @@ func serve() error {
 		if err != nil {
 			return fmt.Errorf("iceberg: %w", err)
 		}
-		deps := icebergDeps{sql: srv, users: users, grants: grants, history: history, work: work, reg: reg, tls: tlsConfig, clones: guard}
+		deps := icebergDeps{sql: srv, users: users, grants: grants, history: history, work: work, reg: reg, tls: tlsConfig, clones: guard,
+			changed: eng.CatalogChanged}
 		if icebergSrv, err = serveIceberg(ctx, icebergLn, cfg, deps, errc, log); err != nil {
 			_ = icebergLn.Close()
 			return err
@@ -559,6 +560,26 @@ func serve() error {
 	}
 	log.Info("igloo is ready", "sql", ln.Addr().String(), "http", cfg.HTTPAddr, "console", cfg.ConsoleAddr,
 		"flight_sql", cfg.FlightAddr, "iceberg", icebergAddr, "sharing", sharingAddr(shares, cfg), "pool", cfg.Pool)
+
+	// The first statement that lists columns would load every Iceberg
+	// table's schema, seconds with hundreds of tables; begin now, in the
+	// background (see engine.Engine.WarmSchemas). It stops before DuckDB
+	// does.
+	warmCtx, stopWarm := context.WithCancel(ctx)
+	warmDone := make(chan struct{})
+	go func() {
+		defer close(warmDone)
+		start := time.Now()
+		if err := eng.WarmSchemas(warmCtx); err != nil && warmCtx.Err() == nil {
+			log.Warn("could not load every table's schema in the background", "err", err)
+			return
+		}
+		log.Info("table schemas loaded", "took", time.Since(start).Round(time.Millisecond))
+	}()
+	defer func() {
+		stopWarm()
+		<-warmDone
+	}()
 
 	select {
 	case err := <-errc:

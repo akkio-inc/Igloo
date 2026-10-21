@@ -195,6 +195,9 @@ func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.T
 		activity: s.activity,
 		open:     make(map[*wire.PreparedStatement]*statement),
 		client:   client,
+		// Igloo's own work in these sessions (clean room runs, say) makes
+		// temporary tables other than through statements it prepares.
+		temps: true,
 	}
 	if token != nil {
 		sess.method = audit.MethodToken
