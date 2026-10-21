@@ -139,6 +139,9 @@ type Maintenance struct {
 	// Retention is how long snapshots, and so time travel, are kept for
 	// tables that do not set history.expire.max-snapshot-age-ms.
 	Retention time.Duration
+	// Memory is how many bytes compaction may hold. Zero sizes it from the
+	// memory Go has (see package memlimit).
+	Memory int64
 }
 
 // DuckDB tunes the embedded query engine.
@@ -439,6 +442,13 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_MAINTENANCE_INTERVAL must be a positive duration such as 1h, got %q", get("IGLOO_MAINTENANCE_INTERVAL", ""))
 	} else {
 		cfg.Maintenance.Interval = d
+	}
+	if v := get("IGLOO_MAINTENANCE_MEMORY", ""); v != "" {
+		if n, err := ParseSize(v); err != nil || n <= 0 {
+			addErr("IGLOO_MAINTENANCE_MEMORY must be a size such as 2GB or 512MiB, got %q", v)
+		} else {
+			cfg.Maintenance.Memory = n
+		}
 	}
 	if d, err := parseDays(get("IGLOO_SNAPSHOT_RETENTION", "7d")); err != nil || d < 0 {
 		addErr("IGLOO_SNAPSHOT_RETENTION must be a duration such as 7d or 36h, got %q", get("IGLOO_SNAPSHOT_RETENTION", ""))

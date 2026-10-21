@@ -51,6 +51,7 @@ func serveWorker() error {
 	if memory == 0 {
 		log.Warn("could not read DuckDB's memory limit")
 	}
+	limitMemory(memory, log)
 	cancel()
 
 	reg := prometheus.NewRegistry()

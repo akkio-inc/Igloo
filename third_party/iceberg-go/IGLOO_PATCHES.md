@@ -112,6 +112,22 @@ One addition serves the erasure of a person's data (`internal/erasure`):
   manifests into every later snapshot. Java Iceberg has no such operation
   either; `RewriteManifests` comes closest.
 
+Two bound the memory that writing Arrow records to Parquet takes, which
+table maintenance (`internal/maintenance`, see `budget.go`) relies on to
+compact large tables within `IGLOO_MAINTENANCE_MEMORY`:
+
+- `table/rolling_data_writer.go`, `newRollingDataWriter`: the queue of
+  record batches waiting for a data file writer holds 2 batches instead of
+  64. Reading is faster than writing Parquet, so the queue was always full,
+  and 64 batches of a wide table's rows took gigabytes: with iceberg-go's
+  reader running ahead too, compacting 255 MiB of DuckDB-written Parquet
+  peaked at 6 GiB of Go heap.
+- `table/internal/parquet_files.go`, `NewFileWriter`: the Parquet writer's
+  own buffers (each column's pages, and a whole row group's encoded pages
+  until the row group is flushed) come from the context's allocator, as the
+  Arrow side's already did, instead of Arrow's default allocator, so a
+  caller that counts memory through the context sees them.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults,
 no longer needs an MPL-licensed dependency and can rewrite manifests.

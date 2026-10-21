@@ -380,7 +380,11 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 
 	counter := &internal.CountingWriter{W: fw}
 	mem := compute.GetAllocator(ctx)
-	props := info.WriteProps.([]parquet.WriterProperty)
+	// The Parquet writer's buffers, a row group's encoded pages among them,
+	// come from the context's allocator too, so a caller that counts or
+	// limits memory with one sees them. (Patched in Igloo's copy; see
+	// IGLOO_PATCHES.md.)
+	props := append(slices.Clone(info.WriteProps.([]parquet.WriterProperty)), parquet.WithAllocator(mem))
 	writerProps := parquet.NewWriterProperties(props...)
 	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
 

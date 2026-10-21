@@ -103,16 +103,20 @@ func TestMaintenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m := cfg.Maintenance; m.Enabled || m.Interval != 10*time.Second || m.Retention != 30*24*time.Hour {
+	if m := cfg.Maintenance; m.Enabled || m.Interval != 10*time.Second || m.Retention != 30*24*time.Hour || m.Memory != 0 {
 		t.Errorf("got %+v", m)
 	}
 	if cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_SNAPSHOT_RETENTION": "0"})); err != nil || cfg.Maintenance.Retention != 0 {
 		t.Errorf("retention 0: %v %s", err, cfg.Maintenance.Retention)
 	}
+	if cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_MAINTENANCE_MEMORY": "2GiB"})); err != nil || cfg.Maintenance.Memory != 2<<30 {
+		t.Errorf("memory 2GiB: %v %d", err, cfg.Maintenance.Memory)
+	}
 	for k, v := range map[string]string{
 		"IGLOO_MAINTENANCE":          "sometimes",
 		"IGLOO_MAINTENANCE_INTERVAL": "0s",
 		"IGLOO_SNAPSHOT_RETENTION":   "a week",
+		"IGLOO_MAINTENANCE_MEMORY":   "0",
 	} {
 		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", k: v})); err == nil {
 			t.Errorf("%s=%s accepted", k, v)

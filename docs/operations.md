@@ -230,7 +230,16 @@ using all of its cores.
 - **Memory** is what matters most. DuckDB uses up to 80% of the memory it
   sees, or `IGLOO_DUCKDB_MEMORY_LIMIT`. Under Kubernetes, set the limit to
   about 80% of the container's memory limit (the Helm chart does this) so the
-  kernel does not kill the process.
+  kernel does not kill the process. The rest of Igloo (the SQL endpoints,
+  the catalog proxy, [table maintenance](#compaction-memory)) runs in the
+  same process, in Go. Igloo limits Go's memory to what the container's
+  memory limit, or else the machine's memory, leaves after DuckDB's limit
+  and a reserve of a twentieth (at least 256 MiB), but to no less than
+  256 MiB; it logs the division at startup (`memory`), and warns when the
+  limits add up to more than there is. Set `GOMEMLIMIT` to choose Go's
+  limit yourself. If other services share the machine, as the bundled
+  Postgres, catalog and object store of the single-machine stack do, lower
+  `IGLOO_DUCKDB_MEMORY_LIMIT` by what they use.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk with
   room for your largest sorts and joins.
@@ -594,7 +603,8 @@ tables itself, so nobody has to schedule anything. Every hour
 
 1. **Compaction.** Small files, and files with many deletes, are rewritten
    into files of the table's target size (`write.target-file-size-bytes`,
-   512 MB by default), with deletes applied. A pass rewrites at most 8 GB per
+   512 MB by default), with deletes applied, one table at a time and within
+   a [memory budget](#compaction-memory). A pass rewrites at most 8 GB per
    table; larger backlogs finish over several passes. The new files are laid
    out the way DuckDB writes Parquet, so compaction does not make scans
    slower: row groups of 122,880 rows, Snappy compression, decimals stored as
@@ -647,7 +657,41 @@ the interval. Without `IGLOO_METADATA_DATABASE_URL`, run a single replica.
 
 Watch `igloo_maintenance_last_success_timestamp_seconds`: if it stops
 advancing, the logs (component `maintenance`) say which table failed and why.
-Set `IGLOO_MAINTENANCE=false` only if another tool maintains the tables.
+Each table's compaction is logged as it starts (`compacting`, with the
+files, bytes and memory budget) and ends (`compacted`). Set
+`IGLOO_MAINTENANCE=false` only if another tool maintains the tables.
+
+### Compaction memory
+
+Compaction decodes the files it rewrites into memory, where a row takes far
+more room than in Parquet: a repetitive string that Parquet stores in a byte
+or two takes its full length, so a 30 MB file can take 300 MB. Igloo
+compacts a table's files one at a time and sizes the batches it reads and
+the row groups it writes from how much memory a row of the table takes, so
+compaction holds no more than `IGLOO_MAINTENANCE_MEMORY` at once: by default
+a quarter of Go's memory limit (see [sizing](#sizing)), between 256 MiB (or
+half of Go's limit, if less) and 4 GiB, or 1 GiB when Igloo cannot tell how
+much memory it has. Rows wide enough to need it, such as those of a table of
+thousands of columns, get row groups smaller than DuckDB's 122,880 rows, down
+to 8,192.
+
+A table that cannot be compacted within the budget, because a row group of
+8,192 of its rows (or one of its files' compressed row groups) does not fit,
+is left as it is: maintenance reports it as a failure and tries again once
+the table has changed, or after a restart. Raise `IGLOO_MAINTENANCE_MEMORY`
+to compact it.
+
+If Igloo dies while it rewrites a table's files (compaction, or the rewrite
+that enforces a data retention), because the kernel killed it for its memory
+or the machine went down, maintenance leaves that table's files alone for a
+day, so the pass that starts soon after the restart cannot kill Igloo again;
+the table's snapshots are still expired, and the failure is reported. Igloo
+tells by recording in the metadata database, in `igloo_maintenance.runs`,
+when each table's rewrite starts and ends (jobs
+`rewrite/started/<schema>.<table>` and `rewrite/ended/<schema>.<table>`);
+delete a table's two rows to let the next pass rewrite it sooner. A rewrite
+that Igloo stops itself, as when it shuts down, counts as ended. Without
+`IGLOO_METADATA_DATABASE_URL` there is no such record.
 
 ### Files that clones share
 

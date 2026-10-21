@@ -45,6 +45,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/maintenance"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/openlineage"
 	"github.com/akkio-inc/igloo/internal/pgwire"
@@ -171,6 +172,7 @@ func serve() error {
 		return err
 	}
 	defer eng.Close() //nolint:errcheck
+	memory := limitMemory(eng.MemoryLimit(startCtx), log)
 	if fed != nil {
 		fed.SetConnect(eng.Connect)
 		go fed.Run(ctx)
@@ -454,7 +456,7 @@ func serve() error {
 	maintains := cat != nil && cfg.Maintenance.Enabled
 	var schedule maintenance.Schedule
 	if maintains {
-		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, reg, work, notifier.MaintenanceFailed, log)
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, memory, reg, work, notifier.MaintenanceFailed, log)
 		if err != nil {
 			return err
 		}
@@ -832,12 +834,25 @@ func openCloneStore(ctx context.Context, cfg config.Config) (clone.Store, error)
 // startMaintenance compacts and expires tables in the background until ctx is
 // canceled. Replicas sharing a metadata database take turns, through lock,
 // which also records when passes ran; it is nil without one. guard keeps
-// the files clones share, and policies have the tables' data retentions.
+// the files clones share, policies have the tables' data retentions, and
+// memory says how much memory Go has, of which compaction gets a share.
 func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
-	reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+	memory memlimit.Plan, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+	budget := cfg.Maintenance.Memory
+	if budget == 0 {
+		budget = memory.Maintenance()
+	}
+	if budget == 0 {
+		budget = maintenance.DefaultMemory
+	}
+	if memory.Go > 0 && budget > memory.Go/2 {
+		log.Warn("IGLOO_MAINTENANCE_MEMORY is more than half of Go's memory limit; compaction may leave too little for the rest of Igloo",
+			"maintenance_memory", memlimit.Format(budget), "go_memory_limit", memlimit.Format(memory.Go))
+	}
 	opts := maintenance.Options{
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
+		Memory:    budget,
 		Metrics:   maintenance.NewMetrics(reg),
 		Activity:  work,
 		Failed:    failed,
@@ -867,7 +882,8 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		defer close(done)
 		m.Run(ctx)
 	}()
-	log.Info("table maintenance is on", "interval", cfg.Maintenance.Interval, "snapshot_retention", cfg.Maintenance.Retention)
+	log.Info("table maintenance is on", "interval", cfg.Maintenance.Interval, "snapshot_retention", cfg.Maintenance.Retention,
+		"memory", memlimit.Format(budget))
 	return func() {
 		cancel()
 		<-done
@@ -875,6 +891,33 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 			lock.Close()
 		}
 	}, lock, nil
+}
+
+// limitMemory gives Go a memory limit that, with DuckDB's (duckdb bytes),
+// fits in the memory this process may use (see package memlimit), unless
+// GOMEMLIMIT sets one, and logs how the memory is divided.
+func limitMemory(duckdb int64, log *slog.Logger) memlimit.Plan {
+	p := memlimit.Apply(duckdb)
+	size := func(n int64) string {
+		if n <= 0 {
+			return "unknown"
+		}
+		return memlimit.Format(n)
+	}
+	goLimit := size(p.Go)
+	switch {
+	case p.FromEnv:
+		goLimit += " (GOMEMLIMIT)"
+	case p.Go == 0:
+		goLimit = "none"
+	}
+	log.Info("memory", "total", size(p.Total), "from", p.Source, "duckdb", size(p.DuckDB), "go", goLimit)
+	if p.Overcommitted() {
+		log.Warn("DuckDB's and Go's memory limits add up to more than this process may use, so the kernel may kill Igloo "+
+			"when both are busy; lower IGLOO_DUCKDB_MEMORY_LIMIT (or GOMEMLIMIT)",
+			"total", size(p.Total), "duckdb", size(p.DuckDB), "go", size(p.Go), "reserve", size(memlimit.Reserve(p.Total)))
+	}
+	return p
 }
 
 func newLogger(cfg config.Config) *slog.Logger {

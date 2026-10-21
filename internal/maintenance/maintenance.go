@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -63,12 +64,25 @@ const (
 	// is overdue. It is short because Igloo may only run for a burst of
 	// queries before the scale-to-zero gateway stops it again.
 	resumeDelay = 10 * time.Second
+	// interruptedBackoff is how long a table whose rewrite (compaction, or
+	// the rewrite of rows deleted longer ago than its data retention) was
+	// interrupted, most likely because Igloo was killed while running it,
+	// is not rewritten again. Its snapshots are still expired.
+	interruptedBackoff = 24 * time.Hour
+	// recordTimeout bounds recording that a rewrite ended, which also
+	// happens while Igloo stops.
+	recordTimeout = 5 * time.Second
 )
 
 // Jobs recorded in a Schedule.
 const (
 	passJob         = "pass"
 	orphanJobPrefix = "orphans/"
+	// When the rewrite of a table (namespace.table) last started and
+	// ended. One that started after it last ended was interrupted.
+	rewriteJobPrefix  = "rewrite/"
+	rewriteStartedJob = rewriteJobPrefix + "started/"
+	rewriteEndedJob   = rewriteJobPrefix + "ended/"
 )
 
 // Options controls the maintenance loop.
@@ -101,6 +115,10 @@ type Options struct {
 	// = N)): how long tables that hold personal data keep old versions of
 	// their rows, whatever their own retention properties say.
 	DataRetention func(ctx context.Context) (map[string]time.Duration, error)
+	// Memory is how many bytes of memory compaction may hold while it
+	// rewrites a table's files. Zero means DefaultMemory. A table that
+	// cannot be compacted within it is left as it is.
+	Memory int64
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -137,6 +155,13 @@ type Maintainer struct {
 	lastOrphanScan map[string]time.Time
 	// targets are the data files position delete files delete rows of.
 	targets *deletefiles.Targets
+	// rewrites are the rewriteJobPrefix jobs of the Schedule, as the pass
+	// began.
+	rewrites map[string]time.Time
+	// tooBig holds the tables whose compaction needed more memory than
+	// Options.Memory, with the snapshot it was tried at: they are not
+	// compacted again until they change.
+	tooBig map[string]int64
 }
 
 // New maintains the tables in cat. warehouse is the warehouse root, such as
@@ -149,7 +174,17 @@ func New(cat Catalog, warehouse string, opts Options, log *slog.Logger) *Maintai
 		warehouse:      warehouse,
 		lastOrphanScan: map[string]time.Time{},
 		targets:        deletefiles.NewTargets(),
+		rewrites:       map[string]time.Time{},
+		tooBig:         map[string]int64{},
 	}
+}
+
+// memory is the memory compaction may hold.
+func (m *Maintainer) memory() int64 {
+	if m.opts.Memory > 0 {
+		return m.opts.Memory
+	}
+	return DefaultMemory
 }
 
 // Run maintains tables every Interval until ctx is canceled.
@@ -211,6 +246,10 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 			if at.After(m.lastOrphanScan[key]) {
 				m.lastOrphanScan[key] = at
 			}
+		}
+		if m.rewrites, err = m.opts.Schedule.LastRuns(ctx, rewriteJobPrefix); err != nil {
+			m.log.Warn("could not read the maintenance schedule", "err", err)
+			m.rewrites = map[string]time.Time{}
 		}
 	}
 
@@ -314,25 +353,14 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 	log := m.log.With("table", name(ident))
 	var errs []error
 
-	switch compacted, err := m.compact(ctx, tbl, log); {
-	case err == nil:
-		tbl = compacted
-	case errors.Is(err, table.ErrCommitFailed):
-		log.Debug("compaction lost a race with a writer; retrying next pass")
-	default:
-		errs = append(errs, fmt.Errorf("compact: %w", err))
-	}
-	if limited {
-		if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
-			return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
-		}
-		switch _, err := m.purgeDeleted(ctx, tbl, limit, log); {
-		case err == nil:
-		case errors.Is(err, table.ErrCommitFailed):
-			log.Debug("rewriting files with old deletes lost a race with a writer; retrying next pass")
-		default:
-			errs = append(errs, fmt.Errorf("rewrite files with old deletes: %w", err))
-		}
+	if at, interrupted := m.interrupted(name(ident)); interrupted {
+		// Most likely the rewrite needed more memory than Igloo had, and
+		// starting it again would only kill Igloo again.
+		errs = append(errs, fmt.Errorf("the last rewrite of the table's files, started %s, never ended, most likely "+
+			"because Igloo was killed while running it; its files are not rewritten again until %s",
+			at.UTC().Format(time.RFC3339), at.Add(interruptedBackoff).UTC().Format(time.RFC3339)))
+	} else {
+		errs = append(errs, m.rewrite(ctx, ident, tbl, limit, limited, log)...)
 	}
 	if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
 		return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
@@ -356,6 +384,87 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 		c = nil
 	}
 	return c, errors.Join(errs...)
+}
+
+// rewrite compacts tbl and, for a table with a data retention (limited),
+// rewrites the files with rows deleted longer ago than limit. It returns
+// what failed.
+func (m *Maintainer) rewrite(ctx context.Context, ident table.Identifier, tbl *table.Table, limit time.Duration, limited bool, log *slog.Logger) []error {
+	var errs []error
+	switch _, err := m.compact(ctx, tbl, log); {
+	case err == nil:
+	case errors.Is(err, table.ErrCommitFailed):
+		log.Debug("compaction lost a race with a writer; retrying next pass")
+	case errors.Is(err, errOverBudget):
+		// Trying again before the table changes would fail the same way.
+		m.tooBig[name(ident)] = tbl.CurrentSnapshot().SnapshotID
+		errs = append(errs, fmt.Errorf("compact: %w; the table is not compacted again until it changes", err))
+	default:
+		errs = append(errs, fmt.Errorf("compact: %w", err))
+	}
+	if !limited {
+		return errs
+	}
+	tbl, err := m.catalog.LoadTable(ctx, ident)
+	if err != nil {
+		return append(errs, fmt.Errorf("load: %w", err))
+	}
+	switch _, err := m.purgeDeleted(ctx, tbl, limit, log); {
+	case err == nil:
+	case errors.Is(err, table.ErrCommitFailed):
+		log.Debug("rewriting files with old deletes lost a race with a writer; retrying next pass")
+	default:
+		errs = append(errs, fmt.Errorf("rewrite files with old deletes: %w", err))
+	}
+	return errs
+}
+
+// interrupted reports whether the last rewrite of table, which started at,
+// never ended, less than interruptedBackoff ago.
+func (m *Maintainer) interrupted(table string) (at time.Time, ok bool) {
+	at = m.rewrites[rewriteStartedJob+table]
+	return at, at.After(m.rewrites[rewriteEndedJob+table]) && time.Since(at) < interruptedBackoff
+}
+
+// rewriting records that a rewrite of table starts, and returns a function
+// that records that it ended. It ends too when ctx is canceled, as when
+// Igloo stops: only a rewrite that kills Igloo is left without an end.
+func (m *Maintainer) rewriting(ctx context.Context, table string) (ended func()) {
+	if m.opts.Schedule == nil {
+		return func() {}
+	}
+	// Recorded times only move forward, and replicas' clocks differ: the
+	// end is recorded no earlier than the latest start.
+	started := later(time.Now(), m.rewrites[rewriteStartedJob+table])
+	m.rewrites[rewriteStartedJob+table] = started
+	if err := m.opts.Schedule.Ran(ctx, rewriteStartedJob+table, started); err != nil {
+		m.log.Warn("could not record maintenance", "job", rewriteStartedJob+table, "err", err)
+	}
+	var once sync.Once
+	end := func() {
+		once.Do(func() {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
+			defer cancel()
+			job, at := rewriteEndedJob+table, later(time.Now(), started)
+			if err := m.opts.Schedule.Ran(ctx, job, at); err != nil {
+				m.log.Warn("could not record maintenance", "job", job, "err", err)
+			}
+		})
+	}
+	stop := context.AfterFunc(ctx, end)
+	return func() {
+		stop()
+		end()
+		m.rewrites[rewriteEndedJob+table] = later(time.Now(), started)
+	}
+}
+
+// later returns the later of a and b.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // orphansDue reports whether to look for the table's orphan files, which
@@ -490,6 +599,13 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 	if tbl.CurrentSnapshot() == nil {
 		return tbl, nil
 	}
+	if id, ok := m.tooBig[name(tbl.Identifier())]; ok {
+		if id == tbl.CurrentSnapshot().SnapshotID {
+			log.Debug("not compacting the table: it needed more memory than compaction may use, and has not changed since")
+			return tbl, nil
+		}
+		delete(m.tooBig, name(tbl.Identifier()))
+	}
 	cfg := compaction.DefaultConfig()
 	if target, err := strconv.ParseInt(tbl.Properties()[table.WriteTargetFileSizeBytesKey], 10, 64); err == nil && target > 0 {
 		cfg.TargetFileSizeBytes = target
@@ -519,6 +635,10 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 		}
 	}
 
+	// Before it starts, so the log says what a pass was doing if it never
+	// finishes.
+	log.Info("compacting", "files", len(rewrite), "bytes", total, "groups", len(groups), "memory_limit", m.memory())
+	start := time.Now()
 	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "compact")
 	if err != nil || res.removed == 0 {
 		return committed, err
@@ -526,7 +646,8 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 	m.opts.Metrics.compacted(res.removed, res.added)
 	log.Info("compacted",
 		"files_before", res.removed, "files_after", res.added, "delete_files_removed", res.deletes,
-		"bytes_before", res.bytesBefore, "bytes_after", res.bytesAfter)
+		"bytes_before", res.bytesBefore, "bytes_after", res.bytesAfter,
+		"took", time.Since(start).Round(time.Millisecond), "peak_memory", res.peak)
 	return committed, nil
 }
 
@@ -534,6 +655,8 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 type rewritten struct {
 	removed, added, deletes int
 	bytesBefore, bytesAfter int64
+	// peak is the most memory the rewrite held at once.
+	peak int64
 }
 
 // rewriteGroups writes the files of groups, whose paths rewrite holds,
@@ -547,6 +670,9 @@ type rewritten struct {
 // of the partition's other files, which came back. The commit is not
 // retried on a conflict, which would bring the replaced files back (see
 // iceberg-go's IGLOO_PATCHES.md): maintenance tries again on its next run.
+// The groups are rewritten one after another within the memory of
+// Options.Memory (see rewriteGroup); one that needs more fails with
+// errOverBudget.
 func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups []table.CompactionTaskGroup,
 	rewrite map[string]struct{}, operation string) (*table.Table, rewritten, error) {
 	var res rewritten
@@ -580,24 +706,32 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 	}
 	tx := tbl.NewTransaction()
 	rw := tx.NewRewrite(map[string]string{"igloo.operation": operation})
+	defer m.rewriting(ctx, name(tbl.Identifier()))()
+	budget := m.memory()
+	rctx, meter, stop := metered(ctx, budget)
+	defer stop(nil)
 	for _, g := range groups {
 		if len(g.Tasks) == 0 {
 			continue
 		}
-		gr, err := table.ExecuteCompactionGroup(ctx, tbl, g)
+		added, lay, err := rewriteGroup(rctx, tbl, fs, g, budget)
+		res.peak = meter.peak.Load()
 		if err != nil {
 			return tbl, res, err
 		}
-		if len(gr.OldDataFiles) == 0 && len(gr.NewDataFiles) == 0 {
-			continue
+		m.log.Debug("rewrote files", "table", name(tbl.Identifier()), "operation", operation, "files", len(g.Tasks),
+			"files_written", len(added), "batch_rows", lay.batchRows, "row_group_rows", lay.rowGroupRows, "peak_memory", res.peak)
+		old := make([]iceberg.DataFile, len(g.Tasks))
+		for i, task := range g.Tasks {
+			old[i] = task.File
 		}
-		rw.Apply(gr.OldDataFiles, gr.NewDataFiles, nil)
-		res.removed += len(gr.OldDataFiles)
-		res.added += len(gr.NewDataFiles)
-		for _, df := range gr.OldDataFiles {
+		rw.Apply(old, added, nil)
+		res.removed += len(old)
+		res.added += len(added)
+		for _, df := range old {
 			res.bytesBefore += df.FileSizeBytes()
 		}
-		for _, df := range gr.NewDataFiles {
+		for _, df := range added {
 			res.bytesAfter += df.FileSizeBytes()
 		}
 	}
@@ -755,6 +889,8 @@ func (m *Maintainer) purgeDeleted(ctx context.Context, tbl *table.Table, limit t
 	if len(rewrite) == 0 {
 		return tbl, nil
 	}
+	log.Info("rewriting files whose deleted rows are older than the data retention", "files", len(rewrite), "bytes", total,
+		"memory_limit", m.memory())
 	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "purge-deleted")
 	if err != nil || res.removed == 0 {
 		return committed, err

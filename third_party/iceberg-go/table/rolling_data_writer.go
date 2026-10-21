@@ -249,10 +249,13 @@ type RollingDataWriter struct {
 func (w *writerFactory) newRollingDataWriter(ctx context.Context, concurrentWriter *concurrentDataFileWriter, partition string, partitionValues map[int]any, outputDataFilesCh chan<- iceberg.DataFile) *RollingDataWriter {
 	ctx, cancel := context.WithCancel(ctx)
 	partitionID := int(w.partitionIDCounter.Add(1) - 1)
+	// recordCh holds two batches, not 64: reading is faster than writing
+	// Parquet, so the queue fills, and 64 batches of wide rows took
+	// gigabytes. (Patched in Igloo's copy; see IGLOO_PATCHES.md.)
 	writer := &RollingDataWriter{
 		partitionKey:     partition,
 		partitionID:      partitionID,
-		recordCh:         make(chan arrow.RecordBatch, 64),
+		recordCh:         make(chan arrow.RecordBatch, 2),
 		errorCh:          make(chan error, 1),
 		factory:          w,
 		partitionValues:  partitionValues,

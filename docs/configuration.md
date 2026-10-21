@@ -189,6 +189,7 @@ Azure identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AZURE_SYSTEM_CREDENTIALS
 | Variable | Default | Meaning |
 |---|---|---|
 | `IGLOO_DUCKDB_MEMORY_LIMIT` | 80% of memory | e.g. `8GB`. Larger queries spill to disk. |
+| `GOMEMLIMIT` | what DuckDB's limit leaves | Go's soft memory limit for the rest of Igloo, e.g. `4GiB`. By default, the container's memory limit (or the machine's memory) less `IGLOO_DUCKDB_MEMORY_LIMIT` and a twentieth in reserve (at least 256 MiB), but at least 256 MiB; see [sizing](operations.md#sizing). |
 | `IGLOO_DUCKDB_THREADS` | one per core | |
 | `IGLOO_DUCKDB_TEMP_DIR` | `/var/lib/igloo/tmp` in the image | Spill directory. Give it fast local disk. |
 | `IGLOO_DUCKDB_MAX_TEMP_SIZE` | 90% of the spill disk's free space | Cap on spill files, e.g. `40GiB`. Queries that need more fail. |
@@ -215,6 +216,7 @@ files on its own; see [table maintenance](operations.md#table-maintenance).
 | `IGLOO_MAINTENANCE` | `true` | Run table maintenance. Turn it off only if another tool maintains the tables. |
 | `IGLOO_SNAPSHOT_RETENTION` | `7d` | How long old snapshots are kept, and so how far back time travel reaches, e.g. `1d` or `36h`. A table's `history.expire.max-snapshot-age-ms` property overrides it. |
 | `IGLOO_MAINTENANCE_INTERVAL` | `1h` | Time between passes over every table |
+| `IGLOO_MAINTENANCE_MEMORY` | a quarter of Go's memory limit | Memory compaction may hold, e.g. `2GB`: by default between 256 MiB (or half of Go's limit, if less) and 4 GiB, or 1 GiB when Igloo cannot tell how much memory it has. A table that cannot be compacted within it is left as it is; see [compaction memory](operations.md#compaction-memory). |
 
 ## Distributed execution
 

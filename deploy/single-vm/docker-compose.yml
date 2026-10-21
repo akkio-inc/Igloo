@@ -50,6 +50,7 @@ services:
       IGLOO_LOG_FORMAT: ${IGLOO_LOG_FORMAT:-text}
       IGLOO_SNAPSHOT_RETENTION: ${IGLOO_SNAPSHOT_RETENTION:-7d}
       IGLOO_MAINTENANCE_INTERVAL: ${IGLOO_MAINTENANCE_INTERVAL:-1h}
+      IGLOO_MAINTENANCE_MEMORY: ${IGLOO_MAINTENANCE_MEMORY:-}
       # Single sign-on to the console and access tokens (docs/sso.md). An
       # empty issuer turns single sign-on off.
       IGLOO_OIDC_ISSUER: ${IGLOO_OIDC_ISSUER:-}

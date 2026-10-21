@@ -800,5 +800,25 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   [OR REPLACE] TABLE ... AS` runs in steps, so that only creating and
   renaming the new table are serialized, not filling it
   (docs/operations.md#concurrency-on-a-replica).
+- Table maintenance could run Igloo out of memory, and then kill it again
+  after every restart. Compaction read a group's files all at once, one per
+  core, in batches of 131,072 rows however wide, and queued 64 batches for
+  the Parquet writer, so its memory grew with the width of the rows and the
+  number of files: DuckDB stores a repetitive string in a byte or two, and
+  Arrow in full. After 760 tables were mirrored from Snowflake, the first
+  pass grew Igloo to 30 GB on a 30 GB machine, the kernel killed it, and the
+  overdue pass killed it again about 35 seconds after each restart.
+  Compaction now reads a group's files one at a time, in batches and row
+  groups sized from how much memory a row of the table takes, and holds at
+  most `IGLOO_MAINTENANCE_MEMORY` (by default a quarter of Go's memory
+  limit, between 256 MiB and 4 GiB); a table that cannot be compacted within
+  it is left as it is and reported. Compacting 255 MiB of DuckDB-written
+  Parquet took 6.1 GiB of Go heap and now takes about 1.2 GiB, in half the
+  time. Igloo also gives Go a memory limit, unless `GOMEMLIMIT` sets one,
+  of what the container's or machine's memory leaves after DuckDB's limit;
+  logs each table as it starts compacting it; and, if it died while
+  rewriting a table's files, leaves that table's files alone for a day
+  instead of rewriting them again within seconds of starting
+  (docs/operations.md#compaction-memory).
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
