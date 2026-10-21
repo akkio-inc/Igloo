@@ -338,7 +338,7 @@ func serve() error {
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
-			Locations: cat.Locations,
+			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory),
 		}, historyStore, taskStore)
 		if err != nil {
 			return err
@@ -836,8 +836,10 @@ func openCloneStore(ctx context.Context, cfg config.Config) (clone.Store, error)
 // which also records when passes ran; it is nil without one. guard keeps
 // the files clones share, policies have the tables' data retentions, and
 // memory says how much memory Go has, of which compaction gets a share.
-func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
-	memory memlimit.Plan, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+// rewriteMemory is what rewriting a table's files may hold at once, for
+// compaction and erasure alike: IGLOO_MAINTENANCE_MEMORY, or a share of Go's
+// memory limit.
+func rewriteMemory(cfg config.Config, memory memlimit.Plan) int64 {
 	budget := cfg.Maintenance.Memory
 	if budget == 0 {
 		budget = memory.Maintenance()
@@ -845,6 +847,12 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 	if budget == 0 {
 		budget = maintenance.DefaultMemory
 	}
+	return budget
+}
+
+func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
+	memory memlimit.Plan, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+	budget := rewriteMemory(cfg, memory)
 	if memory.Go > 0 && budget > memory.Go/2 {
 		log.Warn("IGLOO_MAINTENANCE_MEMORY is more than half of Go's memory limit; compaction may leave too little for the rest of Igloo",
 			"maintenance_memory", memlimit.Format(budget), "go_memory_limit", memlimit.Format(memory.Go))

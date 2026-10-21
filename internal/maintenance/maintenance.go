@@ -715,12 +715,12 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 			continue
 		}
 		added, lay, err := rewriteGroup(rctx, tbl, fs, g, budget)
-		res.peak = meter.peak.Load()
+		res.peak = meter.Peak()
 		if err != nil {
 			return tbl, res, err
 		}
 		m.log.Debug("rewrote files", "table", name(tbl.Identifier()), "operation", operation, "files", len(g.Tasks),
-			"files_written", len(added), "batch_rows", lay.batchRows, "row_group_rows", lay.rowGroupRows, "peak_memory", res.peak)
+			"files_written", len(added), "batch_rows", lay.BatchRows, "row_group_rows", lay.RowGroupRows, "peak_memory", res.peak)
 		old := make([]iceberg.DataFile, len(g.Tasks))
 		for i, task := range g.Tasks {
 			old[i] = task.File

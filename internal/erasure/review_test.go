@@ -923,3 +923,28 @@ func TestMemoryHistoryRedaction(t *testing.T) {
 		t.Errorf("queries %+v, logins %+v", q, l)
 	}
 }
+
+// TestErasureRewriteStaysWithinItsMemory checks that rewriting a table's
+// files for a request holds no more than Options.Memory, as compaction does
+// (see package filerewrite), and that a request whose rows do not fit stops
+// for good with the reason, never claiming it completed.
+func TestErasureRewriteStaysWithinItsMemory(t *testing.T) {
+	f := newFixture(t)
+	f.people("crm.people", [][]any{ann, subject, carl})
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
+	f.svc.opts.Memory = 1
+	r := f.erase(byEmail)
+	if r.Status == StatusCompleted || !strings.Contains(r.Error, "IGLOO_MAINTENANCE_MEMORY") {
+		t.Errorf("a request whose rows do not fit: status %s at %s, error %q", r.Status, r.Step, r.Error)
+	}
+
+	f = newFixture(t)
+	f.people("crm.people", [][]any{ann, subject, carl})
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
+	f.svc.opts.Memory = 64 << 20
+	r = f.erase(byEmail)
+	f.completed(r)
+	if got := f.ids(f.load("crm.people"), 0); !slices.Equal(got, []string{"1", "3"}) {
+		t.Errorf("rows: %v", got)
+	}
+}

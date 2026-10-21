@@ -23,6 +23,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	_ "github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/filerewrite"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
@@ -153,37 +154,37 @@ func (w wideTable) digest(t testing.TB, db *sql.DB, files []string) string {
 }
 
 // unmetered counts what is allocated through it without limiting it.
-func unmetered() *meter {
-	return &meter{Allocator: memory.NewGoAllocator(), limit: math.MaxInt64}
+func unmetered() *filerewrite.Meter {
+	return filerewrite.NewMeter(memory.NewGoAllocator(), math.MaxInt64, nil)
 }
 
 func TestPlan(t *testing.T) {
 	const budget = 1 << 30
-	fits := func(lay layout, rowBytes, fixed int64) {
+	fits := func(lay filerewrite.Layout, rowBytes, fixed int64) {
 		t.Helper()
-		if used := fixed + 8*rowBytes*lay.rowGroupRows; used > budget || lay.batchRows > lay.rowGroupRows/4 || lay.batchRows < 1 {
+		if used := fixed + 8*rowBytes*lay.RowGroupRows; used > budget || lay.BatchRows > lay.RowGroupRows/4 || lay.BatchRows < 1 {
 			t.Errorf("%+v of %d-byte rows takes %d", lay, rowBytes, used)
 		}
 	}
 	// Narrow rows: DuckDB's row groups.
-	lay, err := plan(budget, 100, 10<<20, rowGroupRows)
-	if err != nil || lay != (layout{batchRows: rowGroupRows / 4, rowGroupRows: rowGroupRows}) {
+	lay, err := filerewrite.Plan(budget, 100, 10<<20, filerewrite.DefaultRowGroupRows)
+	if err != nil || lay != (filerewrite.Layout{BatchRows: filerewrite.DefaultRowGroupRows / 4, RowGroupRows: filerewrite.DefaultRowGroupRows}) {
 		t.Errorf("narrow rows: %+v, %v", lay, err)
 	}
 	// Wide rows (thousands of columns): smaller row groups.
-	lay, err = plan(budget, 10_000, 64<<20, rowGroupRows)
-	if err != nil || lay.rowGroupRows >= rowGroupRows || lay.rowGroupRows < minRowGroupRows {
+	lay, err = filerewrite.Plan(budget, 10_000, 64<<20, filerewrite.DefaultRowGroupRows)
+	if err != nil || lay.RowGroupRows >= filerewrite.DefaultRowGroupRows || lay.RowGroupRows < filerewrite.MinRowGroupRows {
 		t.Errorf("wide rows: %+v, %v", lay, err)
 	}
 	fits(lay, 10_000, 64<<20)
 	// A table's own smaller row groups are kept.
-	if lay, err := plan(budget, 100, 0, 5000); err != nil || lay.rowGroupRows != 5000 {
+	if lay, err := filerewrite.Plan(budget, 100, 0, 5000); err != nil || lay.RowGroupRows != 5000 {
 		t.Errorf("row-group-limit 5000: %+v, %v", lay, err)
 	}
 	// Rows too wide for the smallest row group, or reading that alone takes
 	// the budget: no compaction.
 	for _, c := range [][2]int64{{100_000, 0}, {100, budget}} {
-		if _, err := plan(budget, c[0], c[1], rowGroupRows); !errors.Is(err, errOverBudget) {
+		if _, err := filerewrite.Plan(budget, c[0], c[1], filerewrite.DefaultRowGroupRows); !errors.Is(err, errOverBudget) {
 			t.Errorf("rows of %d bytes, %d fixed: %v", c[0], c[1], err)
 		}
 	}
@@ -214,13 +215,13 @@ func TestCompactionStaysWithinMemory(t *testing.T) {
 	if got := w.digest(t, db, after); got != want {
 		t.Errorf("rows changed: %s, want %s", got, want)
 	}
-	if peak := outer.peak.Load(); peak > budget {
+	if peak := outer.Peak(); peak > budget {
 		t.Errorf("compaction held %s at once, more than its %s", memlimit.Format(peak), memlimit.Format(budget))
 	} else {
 		t.Logf("compaction held at most %s of %s", memlimit.Format(peak), memlimit.Format(budget))
 	}
-	if outer.live.Load() != 0 {
-		t.Errorf("%d bytes still allocated after compaction", outer.live.Load())
+	if outer.Live() != 0 {
+		t.Errorf("%d bytes still allocated after compaction", outer.Live())
 	}
 
 	// The rows are too wide for 160 MiB to hold DuckDB's row groups of
@@ -235,7 +236,7 @@ func TestCompactionStaysWithinMemory(t *testing.T) {
 	}
 	defer rdr.Close() //nolint:errcheck
 	for i := range rdr.NumRowGroups() {
-		if n := rdr.MetaData().RowGroup(i).NumRows(); n > rowGroupRows/2 || (n < minRowGroupRows && i < rdr.NumRowGroups()-1) {
+		if n := rdr.MetaData().RowGroup(i).NumRows(); n > filerewrite.DefaultRowGroupRows/2 || (n < filerewrite.MinRowGroupRows && i < rdr.NumRowGroups()-1) {
 			t.Errorf("row group %d has %d rows", i, n)
 		}
 	}
@@ -255,7 +256,7 @@ func TestCompactionOverBudgetLeavesTheTable(t *testing.T) {
 		Failed: func(table string, err error) { failures = append(failures, table+": "+err.Error()) }}, quiet)
 
 	m.RunOnce(context.Background())
-	if len(failures) != 1 || !strings.Contains(failures[0], "mirror.wide: compact: compaction needs more memory than IGLOO_MAINTENANCE_MEMORY allows") {
+	if len(failures) != 1 || !strings.Contains(failures[0], "mirror.wide: compact: rewriting the files needs more memory than IGLOO_MAINTENANCE_MEMORY allows") {
 		t.Fatalf("failures: %q", failures)
 	}
 	if after := dataFiles(t, cat.tbl); len(after) != len(before) {
@@ -389,6 +390,6 @@ func TestCompactionMemoryRepro(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("compacted %d files into %d in %v: peak Arrow memory %s, peak Go heap %s (GOMAXPROCS %d, memory limit %s)",
-		len(tasks), len(dataFiles(t, cat.tbl)), time.Since(start).Round(time.Second), memlimit.Format(outer.peak.Load()),
+		len(tasks), len(dataFiles(t, cat.tbl)), time.Since(start).Round(time.Second), memlimit.Format(outer.Peak()),
 		memlimit.Format(int64(heap)), runtime.GOMAXPROCS(0), memlimit.Format(m.memory()))
 }

@@ -102,6 +102,10 @@ type Options struct {
 	// catalog's tables.
 	Rows    Rows
 	Metrics *Metrics
+	// Memory is what rewriting a table's files may hold at once (see
+	// package filerewrite), as compaction's IGLOO_MAINTENANCE_MEMORY; zero
+	// means filerewrite.DefaultMemory.
+	Memory int64
 	// Failed, if set, is told about a request that failed for good, which
 	// someone must make again: its ID, the step it stopped at, and why,
 	// without identifiers. It must not block.

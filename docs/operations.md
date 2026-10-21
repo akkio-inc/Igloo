@@ -681,6 +681,13 @@ is left as it is: maintenance reports it as a failure and tries again once
 the table has changed, or after a restart. Raise `IGLOO_MAINTENANCE_MEMORY`
 to compact it.
 
+[Erasure requests](privacy.md) rewrite the files that hold a subject's rows
+the same way, within the same `IGLOO_MAINTENANCE_MEMORY`. A request that
+cannot rewrite a table's files within it stops for good with that reason
+(`rewriting the files needs more memory than IGLOO_MAINTENANCE_MEMORY
+allows`), raising the alert for failed or blocked requests, and is never
+reported as completed; raise the setting and make the request again.
+
 If Igloo dies while it rewrites a table's files (compaction, or the rewrite
 that enforces a data retention), because the kernel killed it for its memory
 or the machine went down, maintenance leaves that table's files alone for a

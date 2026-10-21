@@ -143,6 +143,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   server's certificate and host name by default (`tls 'verify-full'`);
   the modes that do not are explicit choices that draw a warning, and
   `require` checks the certificate's chain.
+- Erasure requests rewrite a table's files within `IGLOO_MAINTENANCE_MEMORY`,
+  one file at a time, as compaction does, instead of reading them all at
+  once in full-size batches; a request whose rows do not fit stops with the
+  reason rather than running Igloo out of memory.
 - A connection whose database cannot be reached when a replica starts (no
   route, refused, timed out, name not resolved), as when the machine's
   network is not up yet after a restart, is tried again for up to 30

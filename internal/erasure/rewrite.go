@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"iter"
 	"maps"
 	"math/rand/v2"
 	"slices"
@@ -27,6 +26,7 @@ import (
 	"github.com/apache/iceberg-go/table/compaction"
 
 	"github.com/akkio-inc/igloo/internal/deletefiles"
+	"github.com/akkio-inc/igloo/internal/filerewrite"
 )
 
 // The rewrite step removes matching rows from the files of every branch
@@ -555,7 +555,7 @@ func (s *Service) rewriteFiles(ctx context.Context, r *Request, t *Table, view *
 			return err
 		}
 		for _, g := range groups {
-			added, err := s.rewriteGroup(ctx, writing, g, filter, &b.stats)
+			added, err := s.rewriteGroup(ctx, writing, fsys, g, filter, &b.stats)
 			if err != nil {
 				return err
 			}
@@ -737,42 +737,30 @@ func appendedSince(tbl *table.Table, base, head int64) bool {
 }
 
 // rewriteGroup writes a group's files again, filtered.
-func (s *Service) rewriteGroup(ctx context.Context, view *table.Table, g *table.CompactionTaskGroup, filter *rowFilter, stats *filterStats) ([]iceberg.DataFile, error) {
-	schema, records, err := view.Scan().ReadTasks(ctx, g.Tasks)
+// rewriteGroup writes g's files again without the rows filter takes out,
+// reading one file at a time within Options.Memory, as compaction does (see
+// package filerewrite). A group that needs more fails the request for good:
+// trying again fails the same way until IGLOO_MAINTENANCE_MEMORY is raised.
+func (s *Service) rewriteGroup(ctx context.Context, view *table.Table, fsys iceio.IO, g *table.CompactionTaskGroup, filter *rowFilter, stats *filterStats) ([]iceberg.DataFile, error) {
+	budget := cmp.Or(s.opts.Memory, filerewrite.DefaultMemory)
+	ctx, _, stop := filerewrite.Metered(ctx, budget)
+	defer stop(nil)
+	added, _, err := filerewrite.Rewrite(ctx, view, fsys, g.Tasks, budget, func(rec arrow.RecordBatch) (arrow.RecordBatch, error) {
+		out, err := filter.apply(ctx, rec, stats)
+		rec.Release()
+		if err != nil || out.NumRows() > 0 {
+			return out, err
+		}
+		out.Release()
+		return nil, nil
+	})
+	if errors.Is(err, filerewrite.ErrOverBudget) {
+		return nil, terminal(fmt.Errorf("rewrite %d files: %w", len(g.Tasks), err))
+	}
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", g.PartitionKey, err)
+		return nil, err
 	}
-	var filterErr error
-	filtered := func(yield func(arrow.RecordBatch, error) bool) {
-		for rec, err := range records {
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			out, err := filter.apply(ctx, rec, stats)
-			rec.Release()
-			if err != nil {
-				filterErr = err
-				yield(nil, err)
-				return
-			}
-			if out.NumRows() == 0 {
-				out.Release()
-				continue
-			}
-			if !yield(out, nil) {
-				return
-			}
-		}
-	}
-	var added []iceberg.DataFile
-	for df, err := range table.WriteRecords(ctx, view, schema, iter.Seq2[arrow.RecordBatch, error](filtered), table.WithClusteredWrite()) {
-		if err != nil {
-			return nil, errors.Join(err, filterErr)
-		}
-		added = append(added, df)
-	}
-	return added, filterErr
+	return added, nil
 }
 
 // partitionKey groups files of one partition, as compaction does.
