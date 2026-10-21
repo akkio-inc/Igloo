@@ -418,3 +418,18 @@
   -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
   mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
 }
+
+/* "Up to" sits over the two figures, in the labels' voice */
+.vx-hero__claim {
+	flex-direction: column;
+	align-items: flex-start;
+}
+.vx-hero__upto {
+	margin-bottom: 10px;
+	font-size: 1rem;
+	font-weight: 400;
+	color: var(--text-2);
+}
+.vx-hero__stats {
+	display: flex;
+}
