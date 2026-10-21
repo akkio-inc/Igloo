@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -25,6 +26,12 @@ const syncInterval = 15 * time.Second
 // attachMargin is how much of Igloo's startup time Attach leaves for the
 // steps after it: a database that has not answered by then is left out.
 const attachMargin = 30 * time.Second
+
+// attachRetry is how long Attach keeps trying a database it cannot reach
+// yet, as when the machine has just started and its network or DNS is not
+// up: a refused sign-in or a wrong setting is not tried again, and a
+// mistyped host delays startup by no more than this. A variable for tests.
+var attachRetry = 30 * time.Second
 
 // Options configures a Manager.
 type Options struct {
@@ -193,8 +200,9 @@ func (m *Manager) SandboxDirectories() []string {
 // they would hold if connections were attached later too. A
 // connection whose database cannot be reached is left out, with the
 // reason, so one database being down never stops Igloo from starting; the
-// remote databases are tried all at once, and those that have not answered
-// attachMargin before ctx's deadline are left out too.
+// remote databases are tried all at once, those that cannot be reached yet
+// again for up to attachRetry (see retryUnreachable), and those that have
+// not answered attachMargin before ctx's deadline are left out too.
 func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 	conns, err := m.store.List(ctx)
 	if err != nil {
@@ -254,14 +262,14 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 			}
 			proxies[i] = ip
 			probes[i] = make(chan error, 1)
-			go func() { probes[i] <- ip.discover(wait) }()
+			go func() { probes[i] <- m.retryUnreachable(wait, c.Name, func() error { return ip.discover(wait) }) }()
 			continue
 		}
 		if proxies[i], errs[i] = newEndpoint(c, m.token, m.secrets, m.log); errs[i] != nil {
 			continue
 		}
 		probes[i] = make(chan error, 1)
-		go func() { probes[i] <- proxies[i].probe() }()
+		go func() { probes[i] <- m.retryUnreachable(wait, c.Name, proxies[i].probe) }()
 	}
 	for i, probe := range probes {
 		if probe != nil {
@@ -290,6 +298,53 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 		m.log.Info("attached connection", "connection", c.Name, "type", c.Type, "host", c.ServerHost(), "database", database)
 	}
 	return nil
+}
+
+// retryUnreachable runs probe, and again while it fails because the
+// database cannot be reached yet (see unreachable), for up to attachRetry
+// or until ctx is done, backing off from 1 s to 10 s between tries.
+func (m *Manager) retryUnreachable(ctx context.Context, name string, probe func() error) error {
+	until := time.Now().Add(attachRetry)
+	wait := time.Second
+	for {
+		err := probe()
+		if err == nil || !unreachable(err) || ctx.Err() != nil || time.Now().Add(wait).After(until) {
+			return err
+		}
+		m.log.Info("connection's database not reachable yet; trying again", "connection", name, "in", wait, "err", Scrub(err.Error()))
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, 10*time.Second)
+	}
+}
+
+// unreachable reports whether err says the database could not be reached
+// (no route, refused, reset, timed out, name not resolved), which waiting
+// may cure, rather than that it refused the sign-in or a setting is wrong.
+func unreachable(err error) bool {
+	var dns *net.DNSError
+	var op *net.OpError
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &dns) || errors.As(err, &op) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return true
+	}
+	// Drivers do not all keep the network error; their text does.
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{"connection refused", "no such host", "i/o timeout", "network is unreachable",
+		"no route to host", "tls handshake timeout", "context deadline exceeded", "connection reset"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // awaitProbe returns the result of a probe, or an error once ctx is done.

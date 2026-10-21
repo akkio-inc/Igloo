@@ -143,6 +143,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   server's certificate and host name by default (`tls 'verify-full'`);
   the modes that do not are explicit choices that draw a warning, and
   `require` checks the certificate's chain.
+- A connection whose database cannot be reached when a replica starts (no
+  route, refused, timed out, name not resolved), as when the machine's
+  network is not up yet after a restart, is tried again for up to 30
+  seconds before it is left out until the next restart.
 - Connections to Snowflake (`CREATE CONNECTION ... TYPE snowflake`), signed
   in with a key pair (`private_key_secret`, `private_key`) or a password,
   with a warehouse and role. Igloo reads them through a gateway of its own,

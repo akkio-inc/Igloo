@@ -293,6 +293,10 @@ func TestPostgresConnection(t *testing.T) {
 	}
 	down := pg.connection("down", Postgres)
 	down.Host, down.Port, down.ConnectTimeout = "127.0.0.1", 1, time.Second
+	// A database that is down is tried again for attachRetry; briefly here.
+	retry := attachRetry
+	attachRetry = 2 * time.Second
+	t.Cleanup(func() { attachRetry = retry })
 	if err := store.Create(ctx, down); err != nil {
 		t.Fatal(err)
 	}

@@ -559,9 +559,13 @@ Startup checks every connection's database at once, so it waits at most
 about the longest `connect_timeout` (for Snowflake, plus the time to read
 its list of tables; for an Iceberg REST catalog, the time to find its
 tables, at most two minutes), and never past 30 seconds before the end of
-the three minutes Igloo gives itself to start. A connection whose database
-cannot be reached by then is left out on that replica until it restarts,
-with the reason in `SHOW CONNECTIONS`, and Igloo starts regardless.
+the three minutes Igloo gives itself to start. A database that cannot be
+reached yet (no route, refused, timed out, name not resolved), as when the
+machine has just started and its network is not up, is tried again for up
+to 30 seconds; a refused sign-in or a wrong setting is not. A connection
+whose database cannot be reached by then is left out on that replica until
+it restarts, with the reason in `SHOW CONNECTIONS`, and Igloo starts
+regardless.
 
 Snowflake has no protocol DuckDB speaks, so a Snowflake connection is
 attached at a gateway inside Igloo instead of a proxy; see

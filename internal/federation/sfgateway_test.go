@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"regexp"
 	"strings"
@@ -24,6 +25,9 @@ type fakeSnowflake struct {
 	cat *sfCatalog
 	// down fails signing in, as an unreachable Snowflake would.
 	down error
+	// refusals is how many sign-ins fail as a network that is not up yet
+	// refuses them, before signing in works; checks counts sign-ins.
+	refusals, checks atomic.Int32
 	// slow lists the tables until it is stopped, as a Snowflake slower
 	// than Igloo's startup would.
 	slow bool
@@ -34,7 +38,13 @@ type fakeSnowflake struct {
 	queries []string
 }
 
-func (f *fakeSnowflake) check(context.Context) error { return f.down }
+func (f *fakeSnowflake) check(context.Context) error {
+	f.checks.Add(1)
+	if f.refusals.Add(-1) >= 0 {
+		return errors.New("dial tcp 10.0.0.1:443: connect: connection refused")
+	}
+	return f.down
+}
 
 func (f *fakeSnowflake) loadCatalog(ctx context.Context, _ func(string, ...any)) (*sfCatalog, error) {
 	if f.slow {
@@ -427,6 +437,9 @@ func TestSnowflakeSharedPrefetch(t *testing.T) {
 // starts.
 func TestSnowflakeDown(t *testing.T) {
 	installExtensions(t)
+	retry := attachRetry
+	attachRetry = 2 * time.Second
+	t.Cleanup(func() { attachRetry = retry })
 	fake := &fakeSnowflake{cat: testCatalog(t), down: errors.New("dial tcp: no route to host")}
 	open := openSnowflake
 	openSnowflake = func(Connection, string) sfBackend { return fake }
@@ -507,4 +520,49 @@ func TestSnowflakeSlow(t *testing.T) {
 		t.Errorf("%+v %v", st, err)
 	}
 	expect(t, eng, "SELECT 42", "42")
+}
+
+// TestSnowflakeReachedAfterAWhile checks that a Snowflake that cannot be
+// reached when Igloo starts, as when the machine's network is not up yet,
+// is tried again and attached once it answers, and that a refused sign-in
+// is not tried again.
+func TestSnowflakeReachedAfterAWhile(t *testing.T) {
+	installExtensions(t)
+	fake := &fakeSnowflake{cat: testCatalog(t)}
+	fake.refusals.Store(2)
+	open := openSnowflake
+	openSnowflake = func(Connection, string) sfBackend { return fake }
+	t.Cleanup(func() { openSnowflake = open })
+	store := NewMemoryStore()
+	c := New("sf", Snowflake)
+	c.Account, c.User, c.Database, c.Password = "myorg-acct", "u", "db", "pw"
+	if err := store.Create(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := startEngine(t, store)
+	if _, ok := m.Catalogs()["sf"]; !ok || fake.checks.Load() != 3 {
+		t.Errorf("attached %v after %d sign-ins, want attached after 3", ok, fake.checks.Load())
+	}
+
+	refused := &fakeSnowflake{cat: testCatalog(t), down: errors.New("Incorrect username or password was specified.")}
+	openSnowflake = func(Connection, string) sfBackend { return refused }
+	m, _ = startEngine(t, store)
+	if _, ok := m.Catalogs()["sf"]; ok || refused.checks.Load() != 1 {
+		t.Errorf("a refused sign-in: attached %v after %d sign-ins, want 1 and not attached", ok, refused.checks.Load())
+	}
+}
+
+func TestUnreachable(t *testing.T) {
+	for err, want := range map[error]bool{
+		errors.New("dial tcp 10.0.0.1:443: connect: connection refused"):                true,
+		fmt.Errorf("sign in: %w", context.DeadlineExceeded):                             true,
+		&net.DNSError{Err: "no such host", Name: "x.snowflakecomputing.com"}:            true,
+		errors.New("Snowflake: sign in: Incorrect username or password was specified."): false,
+		errors.New(`password authentication failed for user "igloo" (SQLSTATE 28P01)`):  false,
+		errors.New("database \"crm\" does not exist (SQLSTATE 3D000)"):                  false,
+	} {
+		if got := unreachable(err); got != want {
+			t.Errorf("unreachable(%q) = %v, want %v", err, got, want)
+		}
+	}
 }
