@@ -54,6 +54,8 @@ func TestRequiredRole(t *testing.T) {
 		{duckdb.STATEMENT_TYPE_SET, "SET search_path = 'x'", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_SET, "SET SESSION TimeZone = 'UTC'", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_SET, "RESET schema", auth.RoleReader},
+		{duckdb.STATEMENT_TYPE_SET, "USE lake.sales", auth.RoleReader},
+		{duckdb.STATEMENT_TYPE_SET, "/* c */ use\nsales", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_SET, "SET GLOBAL search_path = 'x'", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_SET, "SET LOCAL search_path = 'x'", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_SET, "SET /*x*/ search_path = 'x'", auth.RoleAdmin},

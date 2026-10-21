@@ -350,11 +350,11 @@ func localHasRoutine(ctx context.Context, conn *duckdb.Conn, local, name string)
 	return n > 0, nil
 }
 
-// runSetting runs st, a SET or RESET, and keeps the session's search path
-// in order: the local copies of views next to the catalog's schemas on it
-// (see keepViewsOnPath), and, for non-admins, the local database not the
-// current one, where unqualified CREATE and DROP would change it. Such a
-// SET is undone and refused.
+// runSetting runs st, a SET, RESET or USE, and keeps the session's search
+// path in order: the local copies of views next to the catalog's schemas
+// on it (see keepViewsOnPath), and, for non-admins, the local database not
+// the current one, where unqualified CREATE and DROP would change it. Such
+// a SET is undone and refused.
 func (s *Server) runSetting(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
 	guard := s.catalogName() != "" && sess.currentUser().Role != auth.RoleAdmin
 	var before string
@@ -368,7 +368,7 @@ func (s *Server) runSetting(ctx context.Context, sess *session, st *statement, a
 	if err := s.runStatement(ctx, sess, st, args, held); err != nil {
 		return err
 	}
-	if s.ddl != nil && setsSearchPath.MatchString(stripComments(st.query)) {
+	if q := stripComments(st.query); s.ddl != nil && (setsSearchPath.MatchString(q) || useStatement.MatchString(q)) {
 		if err := s.keepViewsOnPath(ctx, sess); err != nil {
 			s.log.Warn("could not keep views on the search path", "err", err)
 		}

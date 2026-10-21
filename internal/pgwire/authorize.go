@@ -378,10 +378,18 @@ var sessionSettings = map[string]bool{
 // keywords, after leading comments are stripped.
 var settingStatement = regexp.MustCompile(`(?is)^(SET|RESET)\s+(?:(SESSION|LOCAL|GLOBAL)\s+)?(VARIABLE\s+)?"?([a-z_]+)"?(\s|=|;|$)`)
 
-// sessionSetting reports whether a SET or RESET may be run by any user: it
-// names a SQL variable or one of sessionSettings, at session scope or no
-// scope.
+// useStatement matches USE, which DuckDB runs as a SET of the session's
+// current schema, and so of its search path. Snowflake's USE SCHEMA and
+// USE DATABASE arrive translated to it.
+var useStatement = regexp.MustCompile(`(?is)^USE\s`)
+
+// sessionSetting reports whether a SET, RESET or USE may be run by any
+// user: it is a USE, like a SET of schema, or names a SQL variable or one
+// of sessionSettings, at session scope or no scope.
 func sessionSetting(query string) bool {
+	if useStatement.MatchString(stripComments(query)) {
+		return true
+	}
 	m := settingStatement.FindStringSubmatch(stripComments(query))
 	if m == nil || (m[2] != "" && !strings.EqualFold(m[2], "SESSION")) {
 		return false
