@@ -288,15 +288,26 @@ var sessionParameters = map[string]sessionParameter{
 	"DATE_INPUT_FORMAT":              {accept: []string{"AUTO"}, why: "give the format to TO_DATE instead"},
 	"TIMESTAMP_INPUT_FORMAT":         {accept: []string{"AUTO"}, why: "give the format to TO_TIMESTAMP instead"},
 	"TIME_INPUT_FORMAT":              {accept: []string{"AUTO"}, why: "give the format to TO_TIME instead"},
+	"TIMESTAMP_OUTPUT_FORMAT":        {accept: []string{"YYYY-MM-DD HH24:MI:SS.FF3 TZHTZM"}, why: outputFormatWhy},
+	"TIMESTAMP_LTZ_OUTPUT_FORMAT":    {accept: []string{"", "YYYY-MM-DD HH24:MI:SS.FF3 TZHTZM"}, why: outputFormatWhy},
+	"TIMESTAMP_TZ_OUTPUT_FORMAT":     {accept: []string{"", "YYYY-MM-DD HH24:MI:SS.FF3 TZHTZM"}, why: outputFormatWhy},
+	"TIMESTAMP_NTZ_OUTPUT_FORMAT":    {accept: []string{"YYYY-MM-DD HH24:MI:SS.FF3"}, why: outputFormatWhy},
+	"TIME_OUTPUT_FORMAT":             {accept: []string{"HH24:MI:SS"}, why: outputFormatWhy},
+	"DATE_OUTPUT_FORMAT":             {accept: []string{"YYYY-MM-DD"}, why: outputFormatWhy},
+	"BINARY_OUTPUT_FORMAT":           {accept: []string{"HEX"}, why: outputFormatWhy},
 	"QUOTED_IDENTIFIERS_IGNORE_CASE": {accept: []string{"FALSE", "TRUE"}},
 	"AUTOCOMMIT":                     {accept: []string{"TRUE"}, why: "use BEGIN and COMMIT for transactions"},
 	"USE_CACHED_RESULT":              {}, "STATEMENT_QUEUED_TIMEOUT_IN_SECONDS": {}, "ROWS_PER_RESULTSET": {},
 	"ABORT_DETACHED_QUERY": {}, "LOCK_TIMEOUT": {}, "JSON_INDENT": {}, "MULTI_STATEMENT_COUNT": {},
 	"TRANSACTION_DEFAULT_ISOLATION_LEVEL": {}, "TIMESTAMP_DAY_IS_ALWAYS_24H": {}, "ERROR_ON_NONDETERMINISTIC_MERGE": {},
-	"ERROR_ON_NONDETERMINISTIC_UPDATE": {}, "BINARY_INPUT_FORMAT": {}, "BINARY_OUTPUT_FORMAT": {}, "GEOGRAPHY_OUTPUT_FORMAT": {},
+	"ERROR_ON_NONDETERMINISTIC_UPDATE": {}, "BINARY_INPUT_FORMAT": {}, "GEOGRAPHY_OUTPUT_FORMAT": {},
 	"ENABLE_UNLOAD_PHYSICAL_TYPE_OPTIMIZATION": {}, "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT": {},
 	"CLIENT_RESULT_CHUNK_SIZE": {}, "CLIENT_TIMESTAMP_TYPE_MAPPING": {}, "SEARCH_PATH": {},
 }
+
+// outputFormatWhy explains refusing an output format: TO_VARCHAR writes
+// values in Snowflake's default output formats.
+const outputFormatWhy = "Igloo writes values in Snowflake's default output formats; give TO_CHAR a format instead"
 
 // alterSession translates ALTER SESSION SET and UNSET.
 func (t *translator) alterSession(nodes []*node, idx []int) ([]*node, string, error) {

@@ -196,6 +196,23 @@ var snowflakeCases = []runCase{
 	{name: "time_from_parts", sql: `select time_from_parts(12, 34, 56, 987654321), time_from_parts(0, 100, 0), time_from_parts(25, 0, 0)`,
 		want: []string{"12:34:56.987654|01:40:00|01:00:00"}},
 	{name: "approx_count_distinct", sql: `select hll(a, b), approx_count_distinct(a) from (values (1, 2), (1, 2), (1, 3), (null, 1)) t(a, b)`, want: []string{"2|1"}},
+
+	// TO_VARCHAR without a format, in Snowflake's default output formats.
+	// A FLOAT has up to 12 significant digits: 999.889980465 and 9244 are
+	// what Snowflake returned for Acme's columns (October 21, 2026), where
+	// DuckDB would print 999.8899804651736 and 9244.0.
+	{name: "to_varchar floats", sql: `select to_varchar(999.8899804651736::float), to_varchar(9244::float), to_varchar(1::float / 3), to_char(1e20::float), to_varchar('nan'::float), to_varchar('-inf'::float), to_varchar(1e3), (-0.0001234)::float::varchar, to_varchar(123456789012::float), to_varchar(1234567890123::float)`,
+		want: []string{"999.889980465|9244|0.333333333333|1e+20|NaN|-inf|1000|-0.0001234|123456789012|1.23456789012e+12"}},
+	// TIMESTAMP_OUTPUT_FORMAT (LTZ and TZ) is YYYY-MM-DD HH24:MI:SS.FF3
+	// TZHTZM, TIMESTAMP_NTZ_OUTPUT_FORMAT the same without the offset,
+	// TIME_OUTPUT_FORMAT HH24:MI:SS.
+	{name: "to_varchar timestamps", sql: `select to_varchar('2026-10-07 15:58:37.862 +00:00'::timestamp_ltz), to_varchar('2026-10-07 15:58:37.862'::timestamp_ntz), '2026-10-07 15:58:37.862123 +00:00'::timestamp_tz::varchar, to_varchar('08:58:37.862'::time), to_varchar('2026-10-07'::date)`,
+		want: []string{"2026-10-07 15:58:37.862 +0000|2026-10-07 15:58:37.862|2026-10-07 15:58:37.862 +0000|08:58:37|2026-10-07"}},
+	// NUMBER keeps its scale; BINARY_OUTPUT_FORMAT is HEX.
+	{name: "to_varchar numbers and binary", sql: `select to_varchar(-0.5::number(10,2)), to_varchar(12345678901234567890::number(38,0)), to_varchar(42), 1.50::varchar, to_varchar(x'0a0b'), to_varchar(true)`,
+		want: []string{"-0.50|12345678901234567890|42|1.50|0A0B|true"}},
+	{name: "to_char offsets", sql: `select to_char('2026-10-07 15:58:37.862 +00:00'::timestamp_ltz, 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), to_char('2026-10-07 15:58:37'::timestamp_ltz, 'TZHTZM'), to_char('2026-10-07 15:58:37'::timestamp_ltz, 'HH24 "TZH" tzh')`,
+		want: []string{"2026-10-07 15:58:37 +00:00|+0000|15 TZH +00"}},
 	{name: "date_part from", sql: `select date_part(year from '2024-04-08'::date), extract('month', '2024-04-08'::date)`, want: []string{"2024|4"}},
 	{name: "path of a cast", sql: `select parse_json('[{"a": 1}]')::variant[0]:a, '{"b": "x"}'::variant:b`, want: []string{`1|NULL`},
 		cols: []string{`PARSE_JSON('[{"A": 1}]')::VARIANT[0]:A`, `'{"B": "X"}'::VARIANT:B`}},

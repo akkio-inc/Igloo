@@ -150,6 +150,22 @@ notices.
 Functions not listed whose name and meaning DuckDB shares (`ABS`, `UPPER`,
 `COALESCE`, `SUM`, `ROW_NUMBER` and most others) pass as written.
 
+`TO_VARCHAR`, `TO_CHAR` and `::VARCHAR` without a format write values in
+Snowflake's default output formats, so text compared or stored is the same
+in both:
+
+| Type | Text |
+|---|---|
+| `FLOAT` | Up to 12 significant digits, without trailing zeros: `9244`, `999.889980465`, `0.333333333333`, in scientific notation from `1e+12` and below `0.0001`; `NaN`, `inf`, `-inf` |
+| `NUMBER` | With its scale: `1.50` |
+| `TIMESTAMP_NTZ` | `YYYY-MM-DD HH24:MI:SS.FF3`: `2026-10-07 15:58:37.862` |
+| `TIMESTAMP_LTZ`, `TIMESTAMP_TZ` | `YYYY-MM-DD HH24:MI:SS.FF3 TZHTZM`, in the session's time zone: `2026-10-07 08:58:37.862 -0700` |
+| `TIME`, `DATE` | `HH24:MI:SS`, `YYYY-MM-DD` |
+| `BINARY` | Hex: `0A0B` |
+
+A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
+`+05:30`, `TZHTZM` is `+0530`).
+
 ### Syntax
 
 - `QUALIFY`, `MINUS` (as `EXCEPT`), `SELECT TOP n`, `FROM VALUES (...)`
@@ -195,9 +211,10 @@ Functions not listed whose name and meaning DuckDB shares (`ABS`, `UPPER`,
   and `GRANT ROLE r TO USER u` are Igloo's `GRANT`.
 - `ALTER SESSION SET`: `TIMEZONE` and `STATEMENT_TIMEOUT_IN_SECONDS` set
   Igloo's settings, `QUERY_TAG` the [query tag](sql.md#query-tags-and-role-settings);
-  `WEEK_START`, `WEEK_OF_YEAR_POLICY`, `TIMESTAMP_TYPE_MAPPING` and the
-  input formats are accepted at the values Igloo follows (`0`,
-  `TIMESTAMP_NTZ`, `AUTO`) and refused at others; parameters about
+  `WEEK_START`, `WEEK_OF_YEAR_POLICY`, `TIMESTAMP_TYPE_MAPPING`, the
+  input formats and the output formats are accepted at the values Igloo
+  follows (`0`, `TIMESTAMP_NTZ`, `AUTO`, the default output formats above)
+  and refused at others; parameters about
   clients, caching and queuing change nothing. `ALTER SESSION UNSET`
   resets them.
 
@@ -215,6 +232,9 @@ What Igloo cannot reproduce exactly, and what it does instead.
 - Integer types are `BIGINT`, not `NUMBER(38,0)`: arithmetic that leaves
   64 bits fails with an overflow error where Snowflake's 38 digits would
   hold it.
+- A `FLOAT` or timestamp that becomes text without `TO_VARCHAR` or a cast,
+  as in `x || 'a'` or `CONCAT(x, 'a')`, is DuckDB's text (`9244.0`, an
+  offset of `+00`); `TO_VARCHAR(x)` and `x::VARCHAR` give Snowflake's.
 
 **Semi-structured data**
 
@@ -238,6 +258,8 @@ What Igloo cannot reproduce exactly, and what it does instead.
 
 - Sessions start in UTC; Snowflake's in `America/Los_Angeles` unless the
   account sets another. `ALTER SESSION SET TIMEZONE = '...'` sets it.
+  Until it does, a `TIMESTAMP_LTZ` shows as `2026-10-07 15:58:37.862 +0000`
+  where Snowflake shows `2026-10-07 08:58:37.862 -0700`.
 - `TIMESTAMP_TZ` is stored as an instant (`TIMESTAMPTZ`) and shown in the
   session's time zone: the offset it was written with is not kept.
 - `CONVERT_TIMEZONE(target, ts)` with two arguments returns the wall-clock

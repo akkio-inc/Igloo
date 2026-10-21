@@ -863,5 +863,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   does, while the Snowflake dialect keeps Snowflake's names, such as
   `CURRENT_USER()`. Over Flight SQL, a missing schema or database is
   `NOT_FOUND`.
+- In Snowflake's dialect, `TO_VARCHAR`, `TO_CHAR` and `::VARCHAR` without a
+  format wrote DuckDB's text rather than Snowflake's: a `FLOAT` as
+  `999.8899804651736` or `9244.0` where Snowflake writes `999.889980465`
+  and `9244`, a `TIMESTAMP_LTZ` with the offset `+00` rather than `+0000`, a
+  `TIME` with fractions of a second and `BINARY` as escapes. Acme's column
+  profiles compare these strings. They now follow Snowflake's default output
+  formats (a `FLOAT` with up to 12 significant digits;
+  `TIMESTAMP_OUTPUT_FORMAT`, `TIME_OUTPUT_FORMAT` and `BINARY_OUTPUT_FORMAT`
+  at their defaults), in the session's time zone; `TZH` and `TZM` in a
+  format write the offset as Snowflake does; and `ALTER SESSION` accepts the
+  output format parameters at their defaults and refuses others. Profiling
+  four columns of 37 million rows takes 12% longer.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

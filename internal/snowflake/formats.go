@@ -55,6 +55,34 @@ func dateFormat(f string) (string, error) {
 	return b.String(), nil
 }
 
+// splitOffsets cuts a date and time format into the elements TZH and TZM,
+// each a piece of its own, and the text between them; text in double
+// quotes is literal.
+func splitOffsets(f string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(f); i++ {
+		if f[i] == '"' {
+			if j := strings.IndexByte(f[i+1:], '"'); j >= 0 {
+				i += j + 1
+			}
+			continue
+		}
+		if el := strings.ToUpper(f[i:min(i+3, len(f))]); el == "TZH" || el == "TZM" {
+			if i > start {
+				out = append(out, f[start:i])
+			}
+			out = append(out, el)
+			start = i + 3
+			i += 2
+		}
+	}
+	if start < len(f) {
+		out = append(out, f[start:])
+	}
+	return out
+}
+
 // looksLikeDateFormat reports whether a TO_CHAR format formats dates
 // rather than numbers.
 func looksLikeDateFormat(f string) bool {

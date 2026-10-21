@@ -406,25 +406,78 @@ func castExpr(x []*node, typ sqlType, try bool) *node {
 var tzOffsetSpace = regexp.MustCompile(`\s+([+-]\d{1,2}(:?\d{2})?)$`)
 
 // varcharCast casts x to VARCHAR as Snowflake does: a semi-structured
-// value without quotes around a string, and timestamps in Snowflake's
-// default output format. typeof(x) is a constant DuckDB folds, so only one
-// branch remains.
+// value without quotes around a string, and floating-point numbers, times,
+// timestamps and binary values in Snowflake's default output formats
+// (NUMBER, DATE and BOOLEAN print the same in both). typeof(x) is a
+// constant DuckDB folds, so only one branch remains.
 func varcharCast(x []*node) *node {
 	x = trim(x)
 	if len(x) == 1 {
 		if x[0].kind == kString || x[0].str {
 			return x[0]
 		}
-		if x[0].kind == kNumber {
+		// A number without an exponent is a NUMBER; 1e3 is a FLOAT.
+		if x[0].kind == kNumber && !strings.ContainsAny(x[0].tok.text, "eE") {
 			return seq(x, raw("CAST("), x[0], raw(" AS VARCHAR)"))
 		}
 	}
-	e := operand(x)
-	return seq(x, raw("CASE WHEN typeof("), e, raw(") = 'JSON' THEN json_extract_string(CAST("), e,
-		raw(" AS JSON), '$') WHEN typeof("), e, raw(") = 'TIMESTAMP' THEN strftime(CAST("), e,
-		raw(" AS TIMESTAMP), '%Y-%m-%d %H:%M:%S.%g') WHEN typeof("), e,
-		raw(") = 'TIMESTAMP WITH TIME ZONE' THEN strftime(CAST("), e,
-		raw(" AS TIMESTAMPTZ), '%Y-%m-%d %H:%M:%S.%g %z') ELSE CAST("), e, raw(" AS VARCHAR) END"))
+	return seq(x, fill(defaultText, operand(x))...)
+}
+
+// defaultText is TO_VARCHAR of {x} without a format, by x's type:
+//   - FLOAT: up to 12 significant digits without trailing zeros, in
+//     scientific notation from 1e12 or below 1e-4, as Snowflake prints
+//     them (999.889980465, 9244, 1e+20, NaN, inf);
+//   - TIMESTAMP_NTZ: TIMESTAMP_NTZ_OUTPUT_FORMAT's default, YYYY-MM-DD
+//     HH24:MI:SS.FF3;
+//   - TIMESTAMP_LTZ and _TZ: TIMESTAMP_OUTPUT_FORMAT's, YYYY-MM-DD
+//     HH24:MI:SS.FF3 TZHTZM, in the session's time zone;
+//   - TIME: TIME_OUTPUT_FORMAT's, HH24:MI:SS;
+//   - BINARY: BINARY_OUTPUT_FORMAT's, HEX.
+var defaultText = "CASE WHEN typeof({x}) = 'JSON' THEN json_extract_string(CAST({x} AS JSON), '$')" +
+	" WHEN typeof({x}) IN ('DOUBLE', 'FLOAT') THEN " + floatText("CAST({x} AS DOUBLE)") +
+	" WHEN typeof({x}) IN ('TIMESTAMP', 'TIMESTAMP_S', 'TIMESTAMP_MS', 'TIMESTAMP_NS') THEN strftime(CAST({x} AS TIMESTAMP), '%Y-%m-%d %H:%M:%S.%g')" +
+	" WHEN typeof({x}) = 'TIMESTAMP WITH TIME ZONE' THEN " + tzhtzm("strftime(CAST({x} AS TIMESTAMPTZ), '%Y-%m-%d %H:%M:%S.%g %z')") +
+	" WHEN typeof({x}) = 'TIME' THEN strftime(DATE '1970-01-01' + CAST({x} AS TIME), '%H:%M:%S')" +
+	" WHEN typeof({x}) = 'BLOB' THEN hex(CAST({x} AS BLOB))" +
+	" ELSE CAST({x} AS VARCHAR) END"
+
+// floatText formats v, a DOUBLE, as Snowflake prints a FLOAT.
+func floatText(v string) string {
+	return "CASE WHEN isnan(" + v + ") THEN 'NaN' ELSE format('{:.12g}', " + v + ") END"
+}
+
+// The offset from UTC of a timestamp in the session's time zone, which
+// strftime's %z writes as +00, -07 or +05:30 (and +HH:MM:SS for the local
+// mean times of the 19th century), as Snowflake's TZHTZM (+0000, -0700,
+// +0530), TZH (+05) and TZM (30). Asking strftime once is several times
+// faster than date_part('timezone', ...).
+
+// tzhtzm turns s, text that ends with %z, into text that ends with TZHTZM.
+func tzhtzm(s string) string {
+	return "regexp_replace(" + s + ` || '00', ':(\d\d)(:\d\d)?00$', '\1')`
+}
+
+// tzHours and tzMinutes are TZH and TZM of ts.
+func tzHours(ts string) string { return "left(strftime(" + ts + ", '%z'), 3)" }
+
+func tzMinutes(ts string) string {
+	return "rpad(substring(strftime(" + ts + ", '%z'), 5, 2), 2, '0')"
+}
+
+// fill returns the nodes of tmpl, DuckDB text, with x for each {x}.
+func fill(tmpl string, x *node) []*node {
+	parts := strings.Split(tmpl, "{x}")
+	out := make([]*node, 0, 2*len(parts))
+	for i, p := range parts {
+		if i > 0 {
+			out = append(out, x)
+		}
+		if p != "" {
+			out = append(out, raw(p))
+		}
+	}
+	return out
 }
 
 // comparisonOps are the operators after which a semi-structured value is

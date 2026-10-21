@@ -1204,11 +1204,32 @@ func toChar(c *call) (*node, error) {
 		return nil, unsupported(c.name+" with a computed format", "give the format as a string literal")
 	}
 	if looksLikeDateFormat(s) {
-		f, err := dateFormat(s)
-		if err != nil {
-			return nil, err
+		// strftime has no offset as Snowflake writes one (+05:30, +0530,
+		// -08), so TZH and TZM are formatted apart.
+		var parts []any
+		x := c.tsArg(0)
+		pieces := splitOffsets(s)
+		for i, p := range pieces {
+			if i > 0 {
+				parts = append(parts, " || ")
+			}
+			switch strings.ToUpper(p) {
+			case "TZH":
+				parts = append(parts, fill(tzHours("{x}"), x))
+			case "TZM":
+				parts = append(parts, fill(tzMinutes("{x}"), x))
+			default:
+				f, err := dateFormat(p)
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, "strftime(", x, ", "+quoteString(f)+")")
+			}
 		}
-		n := c.out("strftime(", c.tsArg(0), ", "+quoteString(f)+")")
+		n := c.out(parts...)
+		if len(pieces) > 1 {
+			n = c.out("(", n, ")")
+		}
 		n.str = true
 		return n, nil
 	}

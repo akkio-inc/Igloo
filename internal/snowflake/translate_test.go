@@ -129,6 +129,7 @@ func TestTranslateNoticesAndCommands(t *testing.T) {
 	}{
 		{`ALTER SESSION SET USE_CACHED_RESULT = FALSE`, "ALTER SESSION", nil},
 		{`ALTER SESSION SET WEEK_START = 0, WEEK_OF_YEAR_POLICY = 0`, "ALTER SESSION", nil},
+		{`ALTER SESSION SET TIMESTAMP_OUTPUT_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3 TZHTZM', TIMESTAMP_LTZ_OUTPUT_FORMAT = '', BINARY_OUTPUT_FORMAT = 'hex'`, "ALTER SESSION", nil},
 		{`USE WAREHOUSE wh`, "USE", []string{"USE WAREHOUSE changes nothing"}},
 		{`USE ROLE analyst`, "USE", []string{"USE ROLE changes nothing"}},
 		{`GRANT USAGE ON DATABASE db TO ROLE r`, "GRANT", []string{"GRANT USAGE on a database changes nothing"}},
@@ -160,6 +161,8 @@ func TestRefusals(t *testing.T) {
 		{`SET (a, b) = (1, 2)`, CodeUnsupported, "SET (a, b)"},
 		{`ALTER SESSION SET WEEK_START = 1`, CodeUnsupported, "WEEK_START = 1"},
 		{`ALTER SESSION SET TIMESTAMP_TYPE_MAPPING = TIMESTAMP_LTZ`, CodeUnsupported, "TIMESTAMP_TYPE_MAPPING"},
+		{`ALTER SESSION SET TIMESTAMP_NTZ_OUTPUT_FORMAT = 'YYYY-MM-DD'`, CodeUnsupported, "TIMESTAMP_NTZ_OUTPUT_FORMAT"},
+		{`ALTER SESSION SET BINARY_OUTPUT_FORMAT = 'BASE64'`, CodeUnsupported, "BINARY_OUTPUT_FORMAT"},
 		{`ALTER SESSION SET NO_SUCH_PARAMETER = 1`, CodeUnsupported, "NO_SUCH_PARAMETER"},
 		{`INSERT OVERWRITE INTO t SELECT 1`, CodeUnsupported, "INSERT OVERWRITE"},
 		{`INSERT ALL INTO t VALUES (1) SELECT 1`, CodeUnsupported, "INSERT ALL"},
