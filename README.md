@@ -203,6 +203,18 @@ the official TPC-H answers.
   SELECT status, verification FROM igloo.erasure_requests;
   ALTER TABLE marts.impressions SET (data_retention_days = 30);
   ```
+- **[Clean rooms](docs/clean-rooms.md)** with publishers, retailers and TV
+  makers: audience overlap, reach and frequency, and conversion lift on
+  data joined by hashed emails or device IDs, through templates every party
+  approves, with thresholds on every result row, and neither side seeing
+  the other's rows. Partners take part over HTTP with their Delta Sharing
+  token.
+
+  ```sql
+  ALTER CLEAN ROOM tv ADD TEMPLATE overlap
+    FROM BUILTIN audience_overlap (left => crm.email_sha256, right => exposures.email_sha256, by => crm.segment) RUN BY (agency);
+  RUN CLEAN ROOM tv TEMPLATE overlap;
+  ```
 - **Query and login history** in `igloo.query_history` and
   `igloo.login_history`: every statement and login, kept for 90 days, with
   each statement's CPU time, bytes and memory.
@@ -388,6 +400,9 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   databases in place, and governing them with grants
 - [Tools and integrations](docs/integrations.md): dbt, BI tools and
   notebooks, how to connect each and what to expect
+- [Clean rooms](docs/clean-rooms.md): measuring with partners on joined
+  data neither sees, templates and approvals, thresholds, and what they
+  protect against
 - [Benchmark](bench/README.md): price-performance against Snowflake and
   Databricks on the same data and queries
 - [Migrating from Snowflake or Databricks](docs/migrating.md): a report on
@@ -444,6 +459,7 @@ internal/erasure/   erasure of people's data across the warehouse
 internal/scim/      SCIM 2.0 provisioning of users and groups
 internal/sso/       single sign-on with OpenID Connect
 internal/catalog/   catalog and warehouse setup
+internal/cleanroom/ clean rooms: templates, policies, runs, the partner API
 internal/clone/     zero-copy clones, the files they share, branches and tags
 internal/config/    environment-variable configuration
 internal/distributed/ queries in parts on workers: planner, coordinator, worker

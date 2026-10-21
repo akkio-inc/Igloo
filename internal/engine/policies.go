@@ -160,7 +160,8 @@ func (e *Engine) registerPolicies(ctx context.Context) error {
 
 // policyReferences lists where each policy applies: one row per masked
 // column, per column masked through a tag, and per table with a row
-// access policy.
+// access policy; and one per clean room that confines a table, named by
+// the room.
 func policyReferences(catalog string, snap *policy.Snapshot) [][]any {
 	if snap == nil {
 		return nil
@@ -171,6 +172,9 @@ func policyReferences(catalog string, snap *policy.Snapshot) [][]any {
 		if t.Catalog != "" {
 			// A table of a connection to another database.
 			db = t.Catalog
+		}
+		for _, room := range t.Rooms() {
+			rows = append(rows, []any{room, string(policy.CleanRoom), db, t.Schema, t.Table, "TABLE", nil, nil, nil})
 		}
 		if t.Filter != nil {
 			cols := make([]string, len(t.Filter.Columns))

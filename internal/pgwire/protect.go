@@ -23,6 +23,7 @@ import (
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -190,9 +191,9 @@ func (s *Server) Protected(ctx context.Context, schema, table string) bool {
 }
 
 // Classified reports whether the catalog table schema.table has policies,
-// tags or a data retention, which stay with its name, and names its
-// columns with policies or tags, which stay with theirs, as checkAlter
-// guards them.
+// tags, a data retention or a clean room's confinement, which stay with
+// its name, and names its columns with policies or tags, which stay with
+// theirs, as checkAlter guards them.
 func (s *Server) Classified(ctx context.Context, schema, table string) ([]string, bool) {
 	rules := s.gov.snapshot(ctx).Tagged(schema, table)
 	if rules == nil {
@@ -218,17 +219,191 @@ func (s *Server) Erasing(ctx context.Context, schema, table string) (bool, error
 	return s.erasure.Erasing(ctx, schema, table)
 }
 
+// ProtectedFor reports whether the catalog table schema.table must be read
+// through Igloo only, for user: policies protect it, or a clean room keeps
+// it to others than user (see policy.Confinement). The Iceberg REST
+// catalog refuses such a table to everyone but admins.
+func (s *Server) ProtectedFor(ctx context.Context, user auth.User, schema, table string) (bool, error) {
+	r := s.gov.snapshot(ctx).Rules(schema, table)
+	if r == nil {
+		return false, nil
+	}
+	if r.Policies() {
+		return true, nil
+	}
+	privs, err := s.grants.UserPrivileges(ctx, user.Name)
+	if err != nil {
+		return true, err
+	}
+	return !r.Admits(user.Name, append(privs.Roles, string(user.Role))), nil
+}
+
+// keptFrom refuses user the first of tables, of the catalog, that clean
+// rooms keep to another party, as reading it would be refused. Statements
+// that reach a table other than through DuckDB, such as CLONE, check it
+// with this.
+func (s *Server) keptFrom(ctx context.Context, sess *session, user auth.User, tables []auth.Object) error {
+	snap := s.gov.snapshot(ctx)
+	var roles []string
+	for _, o := range tables {
+		r := snap.Rules(o.Schema, o.Table)
+		if o.Catalog != "" || r == nil || len(r.Confined) == 0 {
+			continue
+		}
+		if roles == nil {
+			privs, err := s.privileges(ctx, sess, user)
+			if err != nil {
+				return denied("could not load roles: %v", err)
+			}
+			roles = append(slices.Clone(privs.Roles), string(user.Role))
+		}
+		if !r.Admits(user.Name, roles) {
+			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "table", o.String(), "rooms", r.Rooms())
+			return keptError(o.Schema, o.Table, r)
+		}
+	}
+	return nil
+}
+
+// mayWrite reports whether a session of user, with roles, may change a
+// table that clean rooms keep (r): a dataset, by its own party; a result,
+// by its room's runs alone.
+func mayWrite(r *policy.TableRules, user string, roles []string) bool {
+	if strings.EqualFold(r.Schema, cleanroom.ResultSchema) {
+		return slices.ContainsFunc(r.Rooms(), func(room string) bool { return user == policy.RoomUser(room) })
+	}
+	return r.Admits(user, roles)
+}
+
+// writeGuard says which tables clean rooms keep from user's changes (see
+// mayWrite), and refuses them; nil means none.
+type writeGuard struct {
+	s     *Server
+	snap  *policy.Snapshot
+	user  auth.User
+	roles []string
+}
+
+func (s *Server) writeGuard(ctx context.Context, sess *session, user auth.User) (*writeGuard, error) {
+	snap := s.gov.snapshot(ctx)
+	if !snap.Confines() || s.catalogName() == "" {
+		return nil, nil
+	}
+	privs, err := s.privileges(ctx, sess, user)
+	if err != nil {
+		return nil, denied("could not load roles: %v", err)
+	}
+	return &writeGuard{s: s, snap: snap, user: user, roles: append(slices.Clone(privs.Roles), string(user.Role))}, nil
+}
+
+func (g *writeGuard) kept(r *policy.TableRules) bool {
+	return r != nil && r.Catalog == "" && len(r.Confined) > 0 && !mayWrite(r, g.user.Name, g.roles)
+}
+
+func (g *writeGuard) refuse(r *policy.TableRules) error {
+	g.s.log.Info("statement denied", "user", g.user.Name, "role", g.user.Role, "table", r.Schema+"."+r.Table, "rooms", r.Rooms())
+	return denied("%s.%s is in clean room %s, which keeps it from changes but by its own party, and a result's but by its runs",
+		r.Schema, r.Table, strings.Join(r.Rooms(), ", "))
+}
+
+// tables refuses changes to any of tables, of the catalog, that are kept.
+func (g *writeGuard) tables(tables []auth.Object) error {
+	for _, o := range tables {
+		if r := g.snap.Rules(o.Schema, o.Table); o.Catalog == "" && g.kept(r) {
+			return g.refuse(r)
+		}
+	}
+	return nil
+}
+
+// keptChanges refuses user changes to any of tables that clean rooms keep
+// from them, as CLONE onto them would make.
+func (s *Server) keptChanges(ctx context.Context, sess *session, user auth.User, tables []auth.Object) error {
+	g, err := s.writeGuard(ctx, sess, user)
+	if g == nil || err != nil {
+		return err
+	}
+	return g.tables(tables)
+}
+
+// tableWrites are the kinds of statement that may change a table's rows or
+// the table itself.
+var tableWrites = []duckdb.StmtType{duckdb.STATEMENT_TYPE_INSERT, duckdb.STATEMENT_TYPE_UPDATE, duckdb.STATEMENT_TYPE_DELETE,
+	statementTypeMergeInto, duckdb.STATEMENT_TYPE_COPY, duckdb.STATEMENT_TYPE_CREATE, duckdb.STATEMENT_TYPE_DROP, duckdb.STATEMENT_TYPE_ALTER}
+
+// keptWrites refuses a statement, of type t, that writes to, replaces,
+// drops, alters or renames a table that clean rooms keep from user (see
+// mayWrite): otherwise someone else could change what a party contributes,
+// which its runs then read, or a result. A write Igloo cannot place is
+// refused when it names such a table at all, and dropping a schema when the
+// schema holds one. It reports whether it ran statements on the session's
+// connection, which the statement must then be prepared again after.
+func (s *Server) keptWrites(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string) (bool, error) {
+	if !slices.Contains(tableWrites, t) {
+		return false, nil
+	}
+	g, err := s.writeGuard(ctx, sess, user)
+	if g == nil || err != nil {
+		return false, err
+	}
+	_, written, err := s.writeNeeds(ctx, sess, t, query)
+	switch {
+	case errors.Is(err, errNoGrantPath):
+		if schema, ok := droppedSchema(query); ok {
+			for _, r := range g.snap.Tables() {
+				if g.kept(r) && strings.EqualFold(r.Schema, schema) {
+					return true, g.refuse(r)
+				}
+			}
+			return true, nil
+		}
+		if t == duckdb.STATEMENT_TYPE_CREATE {
+			// Not a table of the catalog: a view, macro, schema, sequence
+			// or temporary table, none of which changes another table.
+			return true, nil
+		}
+		tokens := tokensOf(query)
+		for _, r := range g.snap.Tables() {
+			if g.kept(r) && tokens.mentions(map[string]bool{strings.ToLower(r.Table): true}) {
+				return true, g.refuse(r)
+			}
+		}
+		return true, nil
+	case err != nil:
+		return true, err
+	}
+	return true, g.tables(written)
+}
+
+// droppedSchema is the schema DROP SCHEMA drops.
+func droppedSchema(query string) (string, bool) {
+	sc := &scanner{s: query}
+	if !sc.keywords("DROP", "SCHEMA") {
+		return "", false
+	}
+	sc.keywords("IF", "EXISTS")
+	name, ok := sc.name()
+	if !ok || len(name) == 0 {
+		return "", false
+	}
+	return name[len(name)-1], true
+}
+
 // ProtectedBy names, sorted, the policies that protect the catalog table
 // schema.table: its row access policy, and the masking policies of its
-// columns, set on them or through their tags. It is empty exactly when
-// Protected reports false. Delta Sharing refuses to share or serve such a
-// table (package sharing).
+// columns, set on them or through their tags, and the clean rooms that
+// keep it, as "clean room name". It is empty exactly when Protected
+// reports false. Delta Sharing refuses to share or serve such a table
+// (package sharing).
 func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string {
 	r := s.gov.snapshot(ctx).Rules(schema, table)
 	if r == nil {
 		return nil
 	}
 	var names []string
+	for _, room := range r.Rooms() {
+		names = append(names, "clean room "+room)
+	}
 	if r.FilterPolicy != nil {
 		names = append(names, r.FilterPolicy.Name)
 	}
@@ -1725,6 +1900,11 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 		original = st.query
 	}
 	text, ng, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, original, st.clientOIDs)
+	if err == nil {
+		var ranWrites bool
+		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, original)
+		ran = ran || ranWrites
+	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		return false, err

@@ -12,6 +12,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -29,7 +30,9 @@ import (
 // nothing, not even names: an edge of the lineage with one end they may not
 // see shows that end without a name, and one with neither end is left out.
 // Which statement made an edge, and who ran it, shows only to those who may
-// see that statement in the query history: its user and admins.
+// see that statement in the query history: its user and admins. A table a
+// clean room keeps to a party shows to that party alone, whatever the
+// role, and no edge to or from it shows to anyone else.
 
 // MetadataSource keeps the catalog's metadata for the catalog functions;
 // *ddl.Manager is one.
@@ -259,23 +262,24 @@ type metadataAccess struct {
 	admin bool
 	user  string
 	roles []string
-	// privs are the user's grants; nil for admins, and for readers and
-	// writers whose grants could not be read.
+	// privs are the user's grants; nil for readers, writers and admins
+	// whose grants could not be read.
 	privs *auth.Privileges
 	// owners are every owner recorded.
 	owners []auth.Ownership
+	// policies say which tables clean rooms keep to a party: those of
+	// other parties are not seen, whatever the role.
+	policies *policy.Snapshot
 }
 
 // metadataAccess works out what user may see, with the session's grants.
 func (s *Server) metadataAccess(ctx context.Context, sess *session, user auth.User) (*metadataAccess, error) {
 	a := &metadataAccess{
-		all:    rank[user.Role] >= rank[auth.RoleReader],
-		admin:  user.Role == auth.RoleAdmin,
-		user:   user.Name,
-		owners: s.objectOwners(ctx),
-	}
-	if a.admin {
-		return a, nil
+		all:      rank[user.Role] >= rank[auth.RoleReader],
+		admin:    user.Role == auth.RoleAdmin,
+		user:     user.Name,
+		owners:   s.objectOwners(ctx),
+		policies: s.gov.snapshot(ctx),
 	}
 	privs, err := s.privileges(ctx, sess, user)
 	switch {
@@ -283,12 +287,22 @@ func (s *Server) metadataAccess(ctx context.Context, sess *session, user auth.Us
 		return nil, err
 	case err != nil:
 		// Readers and writers need grants only for connections' tables,
-		// which they then do not see.
+		// which they then do not see, and roles only for the tables clean
+		// rooms keep to them, which they then do not see either.
 		s.log.Warn("could not load grants", "user", user.Name, "err", err)
 	default:
 		a.privs, a.roles = privs, privs.Roles
 	}
 	return a, nil
+}
+
+// kept reports whether a clean room keeps the catalog's table schema.name
+// to another party than the user (see policy.Confinement): its name,
+// description, columns, tags, size, usage and lineage show to that party
+// alone, as reading it is theirs alone.
+func (a *metadataAccess) kept(schema, name string) bool {
+	r := a.policies.Rules(schema, name)
+	return r != nil && len(r.Confined) > 0 && !r.Admits(a.user, a.roles)
 }
 
 // grants are the user's grants on the catalog's schemas and tables.
@@ -312,9 +326,13 @@ func (a *metadataAccess) owns(o auth.Object) bool {
 }
 
 // SeesTable reports whether the user may see the table or view
-// schema.name of the catalog, or the external table: they may read every
-// table, or have a grant on it or its schema, or own it or its schema.
+// schema.name of the catalog, or the external table: no clean room keeps
+// it to another party, and they may read every table, or have a grant on
+// it or its schema, or own it or its schema.
 func (a *metadataAccess) SeesTable(schema, name string) bool {
+	if a.kept(schema, name) {
+		return false
+	}
 	if a.all {
 		return true
 	}
@@ -348,6 +366,14 @@ func (a *metadataAccess) seesSchema(schema string, md *catalog.Metadata) bool {
 	}) || md != nil && slices.ContainsFunc(md.Tables, func(t catalog.TableMeta) bool {
 		return t.Catalog == "" && strings.EqualFold(t.Schema, schema) && a.SeesTable(t.Schema, t.Name)
 	})
+}
+
+// keptHistoryName reports whether a table the history names is one a clean
+// room keeps to another party (see kept).
+func (a *metadataAccess) keptHistoryName(catalogName, name string) bool {
+	db, rest, _ := strings.Cut(name, ".")
+	i := strings.LastIndexByte(rest, '.')
+	return i > 0 && strings.EqualFold(db, catalogName) && a.kept(rest[:i], rest[i+1:])
 }
 
 // seesHistoryName reports whether the user may see a table the history
@@ -457,9 +483,6 @@ func (v *catalogView) Metadata() *catalog.Metadata {
 
 // Owners returns the owners of what the user may see.
 func (v *catalogView) Owners() []auth.Ownership {
-	if v.access.all {
-		return v.access.owners
-	}
 	var out []auth.Ownership
 	for _, w := range v.access.owners {
 		if w.Object.IsSchema() && v.access.seesSchema(w.Object.Schema, v.Metadata()) ||
@@ -484,6 +507,11 @@ func (v *catalogView) Lineage(ctx context.Context) ([]audit.Edge, error) {
 	catalogName := v.s.catalogName()
 	out := make([]audit.Edge, 0, len(edges))
 	for _, e := range edges {
+		// Not even that data flows to or from a table a clean room keeps
+		// to another party.
+		if !e.FromLocation && v.access.keptHistoryName(catalogName, e.From) || v.access.keptHistoryName(catalogName, e.To) {
+			continue
+		}
 		from := e.FromLocation && v.access.all || !e.FromLocation && v.access.seesHistoryName(catalogName, e.From)
 		to := v.access.seesHistoryName(catalogName, e.To)
 		if !from && !to {
@@ -514,13 +542,17 @@ func (v *catalogView) TableUsage(ctx context.Context) ([]audit.TableUsage, error
 		return nil, nil
 	}
 	usage, err := v.s.audit.TableUsage(ctx)
-	if err != nil || v.access.admin {
-		return usage, err
+	if err != nil {
+		return nil, err
 	}
 	catalogName := v.s.catalogName()
 	out := make([]audit.TableUsage, 0, len(usage))
 	for _, u := range usage {
-		if v.access.seesHistoryName(catalogName, u.Table) {
+		sees := v.access.seesHistoryName(catalogName, u.Table)
+		if v.access.admin {
+			sees = !v.access.keptHistoryName(catalogName, u.Table)
+		}
+		if sees {
 			out = append(out, u)
 		}
 	}

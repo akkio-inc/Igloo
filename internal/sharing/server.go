@@ -292,6 +292,22 @@ func (s *Server) authenticate(r *http.Request) (*call, error) {
 	return &call{recipient: tok.Recipient, tokenID: tok.ID}, nil
 }
 
+// Recipient checks the recipient's bearer token a request carries, for
+// another API recipients use with the same token: the clean rooms they
+// collaborate in (package cleanroom). It answers and records failures as
+// the sharing endpoint does.
+func (s *Server) Recipient(r *http.Request) (string, error) {
+	c, err := s.authenticate(r)
+	if err != nil {
+		return "", err
+	}
+	return c.recipient, nil
+}
+
+// Secure reports whether a request came over TLS, or to localhost: the
+// only requests that may carry a bearer token or data.
+func Secure(r *http.Request) bool { return r.TLS != nil || loopback(r.Host) }
+
 // bearer looks up a bearer token, through a short-lived cache.
 func (s *Server) bearer(ctx context.Context, id string) (bearerToken, error) {
 	now := s.now()

@@ -34,8 +34,8 @@ import (
 // DuckDB writes only to main, so Igloo's branches are read-only: other
 // engines can write to them, and FAST FORWARD then moves main ahead to what
 // they wrote. Reading a branch or tag is reading the snapshot it names
-// (DuckDB's AT (VERSION => id)), so grants and policies apply as to the
-// table.
+// (DuckDB's AT (VERSION => id)), so grants, policies and clean rooms apply
+// as to the table.
 
 // refCommand is a statement on a table's branches and tags.
 type refCommand struct {
@@ -180,6 +180,11 @@ func (s *Server) runRefCommand(ctx context.Context, sess *session, c refCommand,
 		return nil, err
 	}
 	ident := identOf(o)
+	// A table a clean room keeps to a party has its branches and tags,
+	// its snapshots, for that party alone.
+	if err := s.keptFrom(ctx, sess, user, []auth.Object{o}); err != nil {
+		return nil, err
+	}
 	if c.verb == "SHOW" {
 		acc := &access{read: []auth.Object{o}}
 		if err := s.authorizeReads(ctx, sess, user, acc.read); err != nil {
@@ -405,6 +410,10 @@ func (s *Server) resolveRefReads(ctx context.Context, sess *session, query strin
 	for _, r := range reads {
 		o, err := s.cloneSource(ctx, sess, r.table)
 		if err != nil {
+			return "", err
+		}
+		// The read is refused anyway; nor does it learn the table's refs.
+		if err := s.keptFrom(ctx, sess, sess.currentUser(), []auth.Object{o}); err != nil {
 			return "", err
 		}
 		id, err := s.clones.Resolve(ctx, identOf(o), r.at)

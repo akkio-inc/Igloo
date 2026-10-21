@@ -339,7 +339,13 @@ How it works, and its limits:
   (`dsa_...`) are kept apart from Igloo's access tokens (`igloo_...`): they
   have different forms and are stored and checked separately. A
   recipient's token signs in to nothing else (SQL, Flight SQL, the web
-  console, SCIM), and an Igloo access token reads no share.
+  console, SCIM), and an Igloo access token reads no share. The one other
+  thing a recipient's token reaches is the API of the
+  [clean rooms](clean-rooms.md#partners) its recipient takes part in, at
+  `/clean-rooms` on this endpoint.
+- **Clean rooms.** A clean room's datasets and result tables are never
+  shared or served, as tables with policies are not: recipients get a
+  room's results through its API instead.
 - **Providers' tokens** are stored encrypted with a key kept in the
   metadata database, never shown again, and removed from the query history
   with the rest of `CREATE PROVIDER`.

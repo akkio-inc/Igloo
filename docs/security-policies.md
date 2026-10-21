@@ -177,6 +177,13 @@ own. Only admins see policies' expressions. The web console's data browser
 and catalog show a table's row access policy and each column's masking
 policy and tags.
 
+`igloo.policy_references` also lists, to their own party, the tables
+[clean rooms](clean-rooms.md) keep to it, with `policy_kind` `CLEAN ROOM`
+and the room's name. Igloo protects them as it protects tables with
+policies, and refuses them to everyone else, who do not see them in the
+catalog either. A clean room's dataset cannot have policies of its own: a
+dataset whose table gains one stops running.
+
 ## How they apply
 
 - **Statements.** Igloo rewrites each statement that reads a protected

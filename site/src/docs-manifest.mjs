@@ -57,6 +57,7 @@ export const groups = [
 			{ source: 'docs/alerts.md', label: 'Alerts and notifications' },
 			{ source: 'docs/catalog.md', label: 'Data catalog' },
 			{ source: 'docs/sharing.md', label: 'Delta Sharing' },
+			{ source: 'docs/clean-rooms.md', label: 'Clean rooms' },
 			{ source: 'docs/federation.md', label: 'Connections' },
 		],
 	},

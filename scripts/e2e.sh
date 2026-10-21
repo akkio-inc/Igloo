@@ -10,7 +10,12 @@
 # tests an image built already instead of building one.
 #
 #   scripts/e2e.sh
-set -euo pipefail
+# -E: the ERR trap below fires for failures inside functions too, such as a
+# psql_admin step, not only at the top level.
+set -Eeuo pipefail
+# The run's own output and errors, for the ERR trap and cleanup, which may
+# run while a step's output goes to /dev/null.
+exec 3>&1 4>&2
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 project="${E2E_PROJECT:-igloo-e2e}"
@@ -39,8 +44,8 @@ compose_pools() {
 cleanup() {
   status=$?
   if [ "$status" -ne 0 ]; then
-    echo "--- igloo logs"
-    compose logs --no-color --tail 80 igloo || true
+    echo "--- igloo logs" >&3
+    compose logs --no-color --tail 80 igloo >&3 2>&4 || true
   fi
   if [ "${KEEP_E2E:-}" != 1 ]; then
     # The receivers are on the stack's network, which cannot go while they are.
@@ -48,13 +53,17 @@ cleanup() {
     compose_pools --profile local-storage --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$work"
   else
-    echo "kept the stack: docker compose -p $project --env-file $env_file ..."
+    echo "kept the stack: docker compose -p $project --env-file $env_file ..." >&3
   fi
   exit "$status"
 }
 trap cleanup EXIT
-# A command outside the checks that fails ends the run; say which.
-trap 'echo "e2e.sh: line $LINENO failed with status $?: $BASH_COMMAND" >&2' ERR
+# A command outside the checks that fails ends the run; say which. A
+# failure inside a command substitution is its caller's to handle, as in
+# got="$(psql_as ...)" || true, so only the run's own shell says so.
+# failed keeps the status past the test of the subshell.
+failed=0
+trap 'failed=$?; [ "$BASH_SUBSHELL" -gt 0 ] || echo "e2e.sh: line $LINENO failed with status $failed: $BASH_COMMAND" >&4' ERR
 
 failures=0
 pass() { printf '  ok    %s\n' "$1"; }
@@ -1179,6 +1188,118 @@ expect "and its provider" "DROP PROVIDER" igloo "$admin_password" "DROP PROVIDER
 psql_admin -c "DROP RECIPIENT e2e_partner" >/dev/null
 status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$sharing/shares")"
 if [ "$status" = 401 ]; then pass "a dropped recipient's token stops working"; else fail "dropped recipient: $status"; fi
+
+echo "clean rooms"
+# Two parties: an agency, whose analysts are a role here, and a TV maker,
+# which sends its viewing log through a Delta Share (Igloo shares a table
+# with itself here, standing in for the partner's own server) and takes
+# part over the room's API with its recipient's token. Both hash emails
+# the same way: the agency's CRM has 1500 loyal viewers, 1500 lapsed
+# people of whom 500 watch, and 40 others, too few to show.
+rooms="http://127.0.0.1:$sharing_port/clean-rooms"
+psql_admin -c "CREATE SCHEMA tv_maker; CREATE SCHEMA agency; CREATE SCHEMA tvco_in;
+  CREATE TABLE tv_maker.viewing AS SELECT 'h' || md5((i % 3000)::VARCHAR) AS email_sha256,
+    CASE WHEN i % 3 = 0 THEN 'news' ELSE 'sports' END AS genre, DATE '2026-10-01' + CAST(i % 7 AS INTEGER) AS day,
+    'c' || (i % 2) AS campaign FROM range(6000) r(i);
+  CREATE TABLE agency.crm AS SELECT 'h' || md5(i::VARCHAR) AS email_sha256,
+    CASE WHEN i < 2500 THEN 'loyal' WHEN i < 4000 THEN 'lapsed' ELSE 'tiny' END AS segment FROM range(1000, 4040) r(i)" >/dev/null
+psql_admin -c "CREATE ROLE agency_analysts; GRANT agency_analysts TO walt;
+  CREATE SHARE tv_share; ALTER SHARE tv_share ADD TABLE tv_maker.viewing" >/dev/null
+recipient="$(psql_admin -c "CREATE RECIPIENT tvco_ads")" || true
+code="${recipient#*/activate/}"
+code="${code%%|*}"
+psql_admin -c "GRANT SELECT ON SHARE tv_share TO RECIPIENT tvco_ads" >/dev/null
+partner="$(curl -sS -X POST "$sharing/activate/$code" | sed -n 's/.*"bearerToken": "\([^"]*\)".*/\1/p')" || true
+psql_admin -c "CREATE PROVIDER tvco FROM '{\"shareCredentialsVersion\": 1, \"endpoint\": \"http://localhost:8444/delta-sharing\", \"bearerToken\": \"$partner\"}';
+  CREATE EXTERNAL TABLE tvco_in.viewing FROM SHARE tvco.tv_share.tv_maker.viewing" >/dev/null
+tvco() { curl -sS -H "Authorization: Bearer $partner" -H 'Content-Type: application/json' "$@"; }
+expect "an admin sets up a room for both parties" "CREATE CLEAN ROOM
+ALTER CLEAN ROOM
+ALTER CLEAN ROOM
+ALTER CLEAN ROOM" igloo "$admin_password" "
+  CREATE CLEAN ROOM tv COMMENT 'Agency and TVCo Ads';
+  ALTER CLEAN ROOM tv ADD COLLABORATOR agency ROLE agency_analysts;
+  ALTER CLEAN ROOM tv ADD COLLABORATOR tvco RECIPIENT tvco_ads PROVIDER tvco;
+  ALTER CLEAN ROOM tv ADD DATASET viewing OF tvco FROM tvco_in.viewing JOIN ON (email_sha256) GROUP BY (genre, day, campaign);"
+expect "the agency has a view of its CRM" "CREATE VIEW" walt walt-password-1 \
+  "CREATE VIEW agency.loyal AS SELECT * FROM lake.agency.crm WHERE segment = 'loyal'"
+expect_error "but a view is no dataset: its rows are its tables'" 0A000 walt walt-password-1 \
+  "ALTER CLEAN ROOM tv ADD DATASET loyal OF agency FROM agency.loyal JOIN ON (email_sha256)"
+expect_error "only its owner puts a table in a room, not its readers" 42501 walt walt-password-1 \
+  "ALTER CLEAN ROOM tv ADD DATASET crm OF agency FROM agency.crm JOIN ON (email_sha256) GROUP BY (segment)"
+psql_admin -c "ALTER TABLE agency.crm OWNER TO agency_analysts" >/dev/null
+expect "the agency contributes its CRM" "ALTER CLEAN ROOM" walt walt-password-1 \
+  "ALTER CLEAN ROOM tv ADD DATASET crm OF agency FROM agency.crm JOIN ON (email_sha256) GROUP BY (segment)"
+expect "its own users read it as before" "3040" walt walt-password-1 "SELECT count(*) FROM agency.crm"
+expect_error "nobody else does" 42501 rita rita-password-1 "SELECT count(*) FROM agency.crm"
+expect_error "admins included" 42501 igloo "$admin_password" "SELECT count(*) FROM agency.crm"
+expect_error "nor clones it" 42501 igloo "$admin_password" "CREATE TABLE public.crm_copy CLONE agency.crm"
+expect_error "nor changes it" 42501 igloo "$admin_password" "INSERT INTO agency.crm VALUES ('h0', 'planted')"
+expect_error "nor drops it" 42501 igloo "$admin_password" "DROP TABLE agency.crm"
+expect "the catalog shows it to the agency" "1" walt walt-password-1 "SELECT count(*) FROM igloo.tables WHERE table_schema = 'agency' AND table_name = 'crm'"
+expect "and to nobody else" "0" rita rita-password-1 "SELECT count(*) FROM igloo.tables WHERE table_schema = 'agency' AND table_name = 'crm'"
+expect_error "nobody here reads the partner's data" 42501 walt walt-password-1 "SELECT count(*) FROM tvco_in.viewing"
+got="$(curl -s -H "Authorization: Bearer $(catalog_token -d client_id=rita -d client_secret=rita-password-1)" \
+  "$iceberg/v1/namespaces/agency/tables/crm")"
+if grep -q "clean room" <<<"$got"; then pass "nor do other engines through the Iceberg REST catalog"; else fail "a dataset over Iceberg REST: $got"; fi
+code="$(catalog_get "$(catalog_token -d client_id=walt -d client_secret=walt-password-1)" /v1/namespaces/agency/tables/crm)"
+if [ "$code" = 200 ]; then pass "but the agency's own users do"; else fail "the agency's dataset over Iceberg REST for its users: $code"; fi
+expect_error "nor can it be shared" 0A000 igloo "$admin_password" "ALTER SHARE tv_share ADD TABLE agency.crm"
+expect_error "templates that could show an identifier are refused" 22023 walt walt-password-1 \
+  "ALTER CLEAN ROOM tv ADD TEMPLATE leak RUN BY (agency) AS SELECT c.segment, max(c.email_sha256) AS id FROM crm c GROUP BY 1"
+expect "built-in templates" "overlap|1
+reach|1" walt walt-password-1 "
+  ALTER CLEAN ROOM tv ADD TEMPLATE overlap
+    FROM BUILTIN audience_overlap (left => crm.email_sha256, right => viewing.email_sha256, by => crm.segment) RUN BY (agency);
+  ALTER CLEAN ROOM tv ADD TEMPLATE reach FROM BUILTIN reach_frequency
+    (exposures => viewing.email_sha256, campaign => viewing.campaign, time => viewing.day, audience => crm.email_sha256) RUN BY (agency, tvco);"
+expect_error "a template runs only once every party approved it" 42501 walt walt-password-1 "RUN CLEAN ROOM tv TEMPLATE overlap"
+psql_as walt walt-password-1 -c "ALTER CLEAN ROOM tv APPROVE TEMPLATE overlap VERSION 1; ALTER CLEAN ROOM tv APPROVE TEMPLATE reach VERSION 1" >/dev/null
+got="$(tvco -X POST -d '{"version": 1}' "$rooms/tv/templates/overlap/approval")" || true
+if grep -q '"approved_by":"tvco"' <<<"$got"; then pass "the partner approves over the room's API"; else fail "partner approval: $got"; fi
+got="$(psql_as walt walt-password-1 -c "RUN CLEAN ROOM tv TEMPLATE overlap")" || true
+if grep -qx '[0-9]*|succeeded|2|f|clean_rooms.tv__overlap__agency' <<<"$got"; then
+  pass "an overlap run leaves out the group of too few people"
+else
+  fail "overlap run: $got"
+fi
+expect "its result is the agency's to read" "lapsed|1500|500|33.33
+loyal|1500|1500|100" walt walt-password-1 "SELECT * FROM clean_rooms.tv__overlap__agency ORDER BY 1"
+expect_error "and nobody else's" 42501 rita rita-password-1 "SELECT * FROM clean_rooms.tv__overlap__agency"
+expect_error "which only the room's runs write" 42501 walt walt-password-1 "INSERT INTO clean_rooms.tv__overlap__agency VALUES ('forged', 1, 1, 100)"
+status="$(curl -s -o "$work/room.json" -w '%{http_code}' -X POST -H "Authorization: Bearer $partner" -d '{}' "$rooms/tv/templates/overlap/runs")"
+if [ "$status" = 403 ]; then pass "the partner cannot run a template not given to it"; else fail "partner ran the agency's template: $status"; fi
+got="$(tvco -X POST -d '{"parameters": {"start_date": "2026-10-01", "end_date": "2026-10-07"}}' "$rooms/tv/templates/reach/runs")" || true
+if grep -q '"errorCode":"PERMISSION_DENIED"' <<<"$got" && grep -q 'tvco approve' <<<"$got"; then
+  pass "nor one it has not approved"
+else
+  fail "a run before the partner approved: $got"
+fi
+tvco -X POST -d '{"version": 1}' "$rooms/tv/templates/reach/approval" >/dev/null || true
+got="$(tvco -X POST -d '{"parameters": {"start_date": "2026-10-01", "end_date": "2026-10-07"}}' "$rooms/tv/templates/reach/runs")" || true
+if grep -q '"status":"succeeded"' <<<"$got" && grep -q '"row_count":14' <<<"$got" && grep -q '"requester":"tvco"' <<<"$got"; then
+  pass "the partner runs reach and frequency over HTTP and gets the result"
+else
+  fail "partner run: $got"
+fi
+got="$(tvco "$rooms/tv/runs")" || true
+if [ "$(grep -o '"id":' <<<"$got" | wc -l | tr -d ' ')" = 2 ] && ! grep -q '"result"' <<<"$got"; then
+  pass "every party sees the run history, results aside"
+else
+  fail "partner history: $got"
+fi
+got="$(psql_as walt walt-password-1 -c "SHOW RUNS IN CLEAN ROOM tv")" || true
+if grep -q '|reach|1|tvco|recipient:tvco_ads|{"end_date":"2026-10-07","start_date":"2026-10-01"}|agency, tvco|succeeded||14|' <<<"$got" &&
+  grep -q '|overlap|1|agency|walt|{}|agency, tvco|succeeded||2|f|' <<<"$got"; then
+  pass "the agency sees the partner's run, its parameters and approvals"
+else
+  fail "SHOW RUNS: $got"
+fi
+expect_soon "partners' requests are in the query history" "t" igloo "$admin_password" \
+  "SELECT count(*) > 0 FROM igloo.query_history WHERE user_name = 'recipient:tvco_ads' AND statement_type = 'CLEAN ROOM'"
+expect "dropping the room gives the tables back" "DROP CLEAN ROOM" igloo "$admin_password" "DROP CLEAN ROOM tv"
+expect "as they were" "3040" rita rita-password-1 "SELECT count(*) FROM agency.crm"
+psql_admin -c "DROP EXTERNAL TABLE tvco_in.viewing; DROP PROVIDER tvco; DROP RECIPIENT tvco_ads; DROP SHARE tv_share" >/dev/null
 
 echo "table maintenance"
 psql_admin -c "CREATE TABLE fragmented (id INTEGER, v VARCHAR, amount DECIMAL(15,2))" >/dev/null

@@ -37,7 +37,8 @@ import (
 // so no statement on any replica reads it unprotected; otherwise cloning a
 // table would be a way around them. It gets none of its source's grants: a
 // table's grants follow its name. A schema's clone keeps the source
-// schema's own grants, which cover tables created in it later.
+// schema's own grants, which cover tables created in it later. A table a
+// clean room keeps to a party is cloned by that party alone (keptFrom).
 
 // cloneCommand is a CREATE TABLE or CREATE SCHEMA ... CLONE.
 type cloneCommand struct {
@@ -231,6 +232,9 @@ func (s *Server) cloneTable(ctx context.Context, sess *session, user auth.User, 
 	if dst.Equal(src) {
 		return acc, pgerror.WithCode(fmt.Errorf("%s cannot be cloned onto itself", src), codes.DuplicateRelation)
 	}
+	if err := s.keptChanges(ctx, sess, user, acc.written); err != nil {
+		return acc, err
+	}
 	if s.ddl != nil && s.ddl.IsView(dst.Schema, dst.Table) {
 		return acc, pgerror.WithCode(fmt.Errorf("a view named %s exists", dst), codes.DuplicateRelation)
 	}
@@ -324,9 +328,18 @@ func (s *Server) cloneSchema(ctx context.Context, sess *session, user auth.User,
 			}
 		}
 	}
-	// Writers read every table; the check is for the history and in case
-	// that ever changes.
+	// Writers read every table but those clean rooms keep to other
+	// parties; the check is for those, the history, and in case that ever
+	// changes.
 	if err := s.authorizeClone(ctx, sess, user, acc.read, dst, true); err != nil {
+		return acc, err
+	}
+	// What it replaces, and what it drops of the schema it replaces.
+	changed := slices.Clone(acc.written)
+	for _, h := range had {
+		changed = append(changed, auth.Object{Schema: dst, Table: h})
+	}
+	if err := s.keptChanges(ctx, sess, user, changed); err != nil {
 		return acc, err
 	}
 	at, err := s.cloneAt(ctx, sess, user, c.at)
@@ -469,7 +482,12 @@ func (s *Server) authorizeClone(ctx context.Context, sess *session, user auth.Us
 			return deny(err)
 		}
 	}
-	return s.authorizeReads(ctx, sess, user, reads)
+	if err := s.authorizeReads(ctx, sess, user, reads); err != nil {
+		return err
+	}
+	// A clone carries no confinement, which belongs to its room: only the
+	// party a clean room keeps a table to may copy it, as it may read it.
+	return s.keptFrom(ctx, sess, user, reads)
 }
 
 // cloneAt works out the snapshot AT picks. A TIMESTAMP's expression runs as

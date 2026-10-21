@@ -37,6 +37,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/ddl"
@@ -295,6 +296,18 @@ func serve() error {
 			_ = shares.Close()
 		}()
 	}
+	// Clean rooms need what Delta Sharing needs; partners are recipients.
+	var rooms *cleanroom.Service
+	if shares != nil {
+		roomsCtx, cancelRooms := context.WithTimeout(ctx, startupTimeout)
+		var closeRooms func()
+		rooms, closeRooms, err = openCleanRooms(roomsCtx, cfg, eng, policies, log)
+		cancelRooms()
+		if err != nil {
+			return fmt.Errorf("clean rooms: %w", err)
+		}
+		defer closeRooms()
+	}
 
 	// Statements that read large tables run in parts on workers.
 	var dist *distributed.Coordinator
@@ -392,6 +405,7 @@ func serve() error {
 		Lineage:             lineage,
 		Distributed:         dist,
 		Erasure:             eraser,
+		CleanRooms:          rooms,
 	}
 	if guard != nil {
 		// A table dropped that no clone reads has its files deleted with
@@ -414,6 +428,15 @@ func serve() error {
 	}
 	if eraser != nil {
 		eng.SetErasure(eraser.List, srv.ErasureViewer)
+	}
+	if rooms != nil {
+		// Runs execute through the SQL server, as each room's identity.
+		// Each start writes the rooms' confinements again, in case a
+		// change stopped halfway.
+		rooms.SetEngine(srv)
+		if err := rooms.Reconcile(ctx); err != nil {
+			log.Warn("could not check the clean rooms' confinements", "err", err)
+		}
 	}
 	provisioning, err := openSCIM(users, single, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
@@ -516,7 +539,7 @@ func serve() error {
 		if err != nil {
 			return fmt.Errorf("delta sharing: %w", err)
 		}
-		sharingSrv = serveSharing(sharingLn, shares.Handler(), tlsConfig, errc, log)
+		sharingSrv = serveSharing(sharingLn, sharingHandler(shares, rooms, cfg, history, log), tlsConfig, errc, log)
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)

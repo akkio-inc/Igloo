@@ -473,6 +473,33 @@ func TestServerAccess(t *testing.T) {
 	f.expect("GET", "/shares", p.BearerToken, "", 401, "")
 }
 
+// TestRecipient checks recipients' tokens for another API, as the clean
+// rooms' (package cleanroom) is: the same tokens, checked the same way.
+func TestRecipient(t *testing.T) {
+	f := newFixture(t)
+	ask := func(header string) (string, error) {
+		r := httptest.NewRequest("GET", "/clean-rooms", nil)
+		if header != "" {
+			r.Header.Set("Authorization", header)
+		}
+		return f.server.Recipient(r)
+	}
+	if name, err := ask("Bearer " + f.token); err != nil || name != "acme" {
+		t.Errorf("a recipient's token: %q, %v", name, err)
+	}
+	other, _ := newToken(tokenPrefix)
+	for _, header := range []string{"", "Bearer " + f.token + "x", "Bearer " + other.Text,
+		"Bearer igloo_0123456789abcdef_0123456789abcdef0123456789abcdef0123456789abcd", "Basic " + f.token} {
+		if name, err := ask(header); err == nil {
+			t.Errorf("%q signed in as %q", header, name)
+		}
+	}
+	if !Secure(httptest.NewRequest("GET", "http://localhost:8444/clean-rooms", nil)) ||
+		Secure(httptest.NewRequest("GET", "http://data.example.com/clean-rooms", nil)) {
+		t.Error("Secure: only TLS or localhost")
+	}
+}
+
 // TestClient reads Igloo's own endpoint with the consumer's client.
 func TestClient(t *testing.T) {
 	f := newFixture(t)

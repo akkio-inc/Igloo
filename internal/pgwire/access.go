@@ -199,8 +199,11 @@ func (s *Server) catalogName() string {
 // loaded stay in force, as the role does.
 func (s *Server) privileges(ctx context.Context, sess *session, user auth.User) (*auth.Privileges, error) {
 	sess.mu.Lock()
-	snap := sess.privs
+	snap, fixed := sess.privs, sess.fixed
 	sess.mu.Unlock()
+	if fixed != nil {
+		return fixed, nil
+	}
 	if snap.privs != nil && time.Since(snap.loaded) < s.roleRefresh {
 		return snap.privs, nil
 	}

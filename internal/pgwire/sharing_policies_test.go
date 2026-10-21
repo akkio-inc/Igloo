@@ -48,6 +48,14 @@ func (f fakeExternal) CatalogTables() []catalog.TableMeta {
 func (fakeExternal) Prepare(_ context.Context, query string) (string, error) { return query, nil }
 func (fakeExternal) Sync(context.Context) (bool, error)                      { return false, nil }
 
+// ProviderOf says every fake external table is the "partner" provider's.
+func (f fakeExternal) ProviderOf(schema, name string) string {
+	if f[strings.ToLower(schema+"."+name)] {
+		return "partner"
+	}
+	return ""
+}
+
 func TestProtectedBy(t *testing.T) {
 	cs := startPolicyServer(t)
 	ctx := context.Background()

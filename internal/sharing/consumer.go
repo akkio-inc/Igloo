@@ -161,6 +161,15 @@ func (c *Consumer) CatalogTables() []catalog.TableMeta {
 	return out
 }
 
+// ProviderOf names the provider the external table schema.name reads
+// from, or is empty when there is no such table.
+func (c *Consumer) ProviderOf(schema, name string) string {
+	if t := (*c.known.Load())[tableKey(schema, name)]; t != nil {
+		return t.def.Provider
+	}
+	return ""
+}
+
 // TableNames lists the external tables in schema.
 func (c *Consumer) TableNames(schema string) []string {
 	var out []string

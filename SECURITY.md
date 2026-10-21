@@ -507,7 +507,55 @@ reference for every setting mentioned here.
   other than admins cannot read external tables' files through the proxy,
   nor the copies of shared files in the warehouse. Recipients' tokens
   (`dst_`) and Igloo's access tokens (`igloo_`) are distinct: neither
-  signs in where the other does.
+  signs in where the other does. A recipient's token also reaches, at
+  `/clean-rooms` on the same endpoint, the clean rooms its recipient is a
+  collaborator of.
+- **Clean rooms.** ([details](docs/clean-rooms.md)) A clean room's
+  datasets are confined: only their own party's users (a collaborator's
+  user, or the holders of its role) read them, as before, and the room's
+  runs; everyone else is refused, admins included, in every position and
+  through any view, over SQL, Flight SQL and the web console. A partner's
+  dataset, an external table, is read by no local user. Confined tables
+  count as protected: users other than admins cannot read the warehouse's
+  or external tables' files directly, the Iceberg REST catalog refuses them
+  to everyone but admins and their own party, and Delta Sharing neither
+  shares nor serves them; confinements reach other replicas as policies do,
+  within 30 seconds, and result tables are confined from the moment their
+  template exists. Only a dataset's party writes, replaces, drops or alters
+  it, and only a room's runs write its results. A dataset is a table or a
+  partner's external table, without masking or row access policies, which
+  only its owner in the catalog (or the owning role's members) or an admin
+  puts in a room: reading a table is not enough to take it from others; the
+  catalog shows it to its own party alone, and only that party clones it.
+  Templates are checked on DuckDB's parse of them, with anything unknown
+  refused, so that identifiers appear only in joins between datasets and
+  in counts, and aggregates take bare columns; they run only after every
+  party whose data they read approved that version, whose number is never
+  used again, and its digest, which covers the datasets it reads, their
+  sources and their policies, so replacing one needs every approval again.
+  Runs execute as the room's own identity
+  (`clean_room:<room>`, which no user can be called), with `SELECT` on the
+  run's datasets alone and every check a user's statements take, never with
+  the requester's grants or policies. Result rows that count fewer than a
+  dataset's threshold of distinct identifiers (50 by default), in the whole
+  group, in each `FILTER` and in each combination of them, are dropped
+  inside the run's own session without a trace, and results go only to the
+  requester's party. Parameter values that keep or leave out fewer than a
+  threshold of a dataset are refused, each party has a run budget per
+  dataset (10 runs a day with noise), and datasets may ask for Laplace
+  noise on counts, the same for every copy of a count in a run. Across
+  parties, a template sums a measure only within the bounds its policy
+  gives per person, which include 0, each person's total clamped to them,
+  with noise scaled to them, and takes no minimum, maximum, median or
+  spread of one. These sums, and counts that are not `DISTINCT`, are under
+  review: do not rely on them for privacy. A run that fails once it reads
+  the datasets ends as refused, without its error, which could depend on
+  another party's rows. A party that controls the groups of its own data
+  can still learn whether one known person is in another's, as the
+  details say. The host's admins can read everything on their own system:
+  clean rooms protect collaborators from each other, not from the host.
+  Partners who need protection from the host should host the room
+  themselves, or use Delta Sharing both ways.
 
 ## Verifying release images
 

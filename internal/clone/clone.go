@@ -105,6 +105,16 @@ func NewManager(cat Catalog, store Store, log *slog.Logger) *Manager {
 	return &Manager{cat: cat, store: store, log: log.With("component", "clone")}
 }
 
+// TableUUID returns the UUID of the table called ident, which a table made
+// again under its name does not keep.
+func (m *Manager) TableUUID(ctx context.Context, ident table.Identifier) (string, error) {
+	t, err := m.cat.LoadTable(ctx, ident)
+	if err != nil {
+		return "", err
+	}
+	return t.Metadata().TableUUID().String(), nil
+}
+
 // Exists reports whether the catalog has a table called ident.
 func (m *Manager) Exists(ctx context.Context, ident table.Identifier) (bool, error) {
 	_, err := m.cat.LoadTable(ctx, ident)

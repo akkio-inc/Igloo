@@ -287,7 +287,7 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		}
 	}
 	if e.s.Protected(ctx, o.schema, o.name) {
-		return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies apply to it"}, true, nil
+		return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies, or a clean room, apply to it"}, true, nil
 	}
 	t, err := e.s.dist.Table(ctx, o.schema, o.name)
 	if err != nil {

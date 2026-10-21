@@ -106,13 +106,16 @@ that loads a table gets its metadata and credentials for its files, and
 reading those files directly would bypass every policy. So, as Unity
 Catalog does for engines outside it, Igloo refuses everyone but admins
 loading a table with a masking policy on any column or a row access
-policy, refreshing its credentials, and committing to it, with 403 and a
-message to read it through Igloo's SQL or Flight SQL. Creating or renaming
-a table to the name of a protected table, or renaming a protected one, is
-refused too, since policies name the tables they protect. Listings still
-show such tables. Igloo checks for policies on every request, so attaching
-one stops new loads at once; credentials an engine got for the table
-before still work until they expire, at most an hour later.
+policy, refreshing its credentials, committing to it and dropping it, with
+403 and a message to read it through Igloo's SQL or Flight SQL. Creating or
+renaming a table to the name of a protected table, or renaming a protected
+one, is refused too, since policies name the tables they protect. Listings
+still show such tables. Igloo checks for policies on every request, so
+attaching one stops new loads at once; credentials an engine got for the
+table before still work until they expire, at most an hour later.
+
+A [clean room](clean-rooms.md)'s datasets and result tables are refused the
+same way, except to their own party's users, who load them as before.
 
 Tags and [data retentions](privacy.md#data-retention) name tables and
 columns too, for [erasure requests](privacy.md): no one, admins included,

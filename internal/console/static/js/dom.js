@@ -87,6 +87,7 @@ const ICONS = {
   shield: 'M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6zM9 12l2 2 4-4',
   copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
   catalog: 'M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5zM5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3M9 7h6M9 11h6',
+  room: 'M3 21V9l9-6 9 6v12zM9 21v-7h6v7M3 13h4M17 13h4',
 };
 
 export function icon(name) {

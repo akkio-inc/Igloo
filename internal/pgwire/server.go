@@ -31,6 +31,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
+	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
@@ -138,6 +139,9 @@ type Options struct {
 	// Sharing carries out Delta Sharing statements and keeps external
 	// tables. Nil when it is not set up.
 	Sharing *sharing.Service
+	// CleanRooms carries out clean room statements; the server runs their
+	// templates (see Execute). Nil when they are not set up.
+	CleanRooms *cleanroom.Service
 
 	// Federation keeps the connections to other databases. Nil means
 	// there are none and CREATE CONNECTION is unavailable.
@@ -171,9 +175,11 @@ type Options struct {
 	Distributed *distributed.Coordinator
 
 	// external and externalFiles stand in for Sharing's external tables
-	// and the prefix of their files, in tests.
+	// and the prefix of their files, and partners for its recipients and
+	// providers, in tests.
 	external      externalCatalog
 	externalFiles string
+	partners      partnerDirectory
 }
 
 // externalCatalog is what statements need of Delta Sharing's external
@@ -192,6 +198,8 @@ type externalCatalog interface {
 	Prepare(ctx context.Context, query string) (string, error)
 	// Sync loads external tables created on other replicas.
 	Sync(ctx context.Context) (bool, error)
+	// ProviderOf names the provider an external table reads from.
+	ProviderOf(schema, name string) string
 }
 
 // serverParameters are reported to clients at login. Drivers use them to
@@ -244,6 +252,10 @@ type Server struct {
 	fed     *federation.Manager
 	remotes connectionSource
 	dist    *distributed.Coordinator
+	// rooms carries out clean room statements; partners are Delta
+	// Sharing's recipients and providers, which partners are.
+	rooms    *cleanroom.Service
+	partners partnerDirectory
 	// ddlGen counts statements run here that may change the catalog; see
 	// catalogGeneration.
 	ddlGen atomic.Uint64
@@ -314,6 +326,8 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		clones:      opts.Clones,
 		dist:        opts.Distributed,
 		erasure:     opts.Erasure,
+		rooms:       opts.CleanRooms,
+		partners:    opts.partners,
 		mockSecret:  mockSecret,
 
 		clonePurge: opts.ClonePurge,
@@ -384,6 +398,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	externalFiles := opts.externalFiles
 	if opts.Sharing != nil {
 		s.external, externalFiles = opts.Sharing.Consumer(), opts.Sharing.ProxyPrefix()
+		if s.partners == nil {
+			s.partners = sharingPartners{opts.Sharing}
+		}
 	}
 	if s.gov, err = newGovernance(context.Background(), policies, s.roleRefresh, log, engine.Connect,
 		opts.AllowedLocations, opts.Warehouse, externalFiles); err != nil {
@@ -537,6 +554,10 @@ type session struct {
 	started   time.Time
 	// privs are the user's grants, loaded when first needed.
 	privs privilegeSnapshot
+	// fixed, when set, are the session's grants for good, and its user is
+	// never read again: it runs a clean room's template as the room's
+	// identity, which no store knows (see openRoomSession).
+	fixed *auth.Privileges
 	// id identifies the session in the history; see sessionID.
 	id string
 	// appName is the client's application_name.
@@ -666,7 +687,7 @@ func (sess *session) release(ps *wire.PreparedStatement) error {
 // tokens take effect on open connections.
 func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, error) {
 	sess.mu.Lock()
-	user, fresh := sess.user, time.Since(sess.checked) < s.roleRefresh
+	user, fresh := sess.user, time.Since(sess.checked) < s.roleRefresh || sess.fixed != nil
 	sess.mu.Unlock()
 	ended := func(format string, args ...any) (auth.User, error) {
 		return user, pgerror.WithSeverity(pgerror.WithCode(
@@ -972,6 +993,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 	}
 
 	if ps, ok, err := s.notificationCommand(sess, q.Query); ok || err != nil {
+		return ps, err
+	}
+	if ps, ok, err := s.roomStatement(sess, q); ok || err != nil {
 		return ps, err
 	}
 
@@ -1491,6 +1515,11 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		// record that has it checked again when they change.
 		st.access, err = s.authorizeConnectionReads(ctx, sess, user, st, st.access)
 	}
+	ranWrites := false
+	if err == nil {
+		// What it changes of the tables clean rooms keep, whatever the role.
+		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, query)
+	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		_ = st.close()
@@ -1514,7 +1543,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// checked against the statement as written and as rewritten to the
 	// relations Igloo answers it with.
 	st.listsCatalog = listsCatalog.MatchString(text) || listsCatalog.MatchString(query)
-	if st.access != nil && st.access.ranStatements {
+	if ranWrites || st.access != nil && st.access.ranStatements {
 		// Checking grants ran statements on the session's connection.
 		if err := st.reprepare(ctx, sess.conn); err != nil {
 			_ = st.close()

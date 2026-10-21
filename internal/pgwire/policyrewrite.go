@@ -126,10 +126,14 @@ func (p *tablePlan) noop() bool {
 	return p.filter == nil && !slices.ContainsFunc(p.masks, func(m *maskPlan) bool { return m != nil })
 }
 
-// plan works out how the session reads the protected table o.
+// plan works out how the session reads the protected table o. A table a
+// clean room confines is refused to sessions the room does not admit.
 func (rw *rewriter) plan(o object, rules *policy.TableRules) (*tablePlan, error) {
 	if p, ok := rw.plans[o.key()]; ok {
 		return p, nil
+	}
+	if err := rw.confined(o, rules); err != nil {
+		return nil, err
 	}
 	cols, err := describeTable(rw.ctx, rw.sess, quoteName([]string{o.db, o.schema, o.name}))
 	if err != nil {
@@ -233,6 +237,22 @@ func (rw *rewriter) plan(o object, rules *policy.TableRules) (*tablePlan, error)
 	}
 	rw.plans[o.key()] = plan
 	return plan, nil
+}
+
+// confined refuses a table, view or external table that clean rooms keep
+// to other readers than the session: a dataset of another party, or a
+// result another collaborator received (see policy.Confinement).
+func (rw *rewriter) confined(o object, rules *policy.TableRules) error {
+	if rules.Admits(rw.pc.user, rw.pc.roles) {
+		return nil
+	}
+	return keptError(o.schema, o.name, rules)
+}
+
+// keptError refuses schema.table, which clean rooms keep to another party.
+func keptError(schema, table string, rules *policy.TableRules) error {
+	return denied("%s.%s is in clean room %s, which keeps it to its own party: read it there, through the room's approved templates",
+		schema, table, strings.Join(rules.Rooms(), ", "))
 }
 
 // prepareBody returns p's template and whether p is a no-op for pc. It
@@ -445,7 +465,13 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 	case o.external:
 		// Igloo's own view of an external table (Delta Sharing), over
 		// files only its proxy serves; policies cannot be attached to
-		// one (see policyTable).
+		// one (see policyTable), but a clean room can confine it.
+		if rules := rw.snap.Rules(o.schema, o.name); rules != nil {
+			rw.touched = true
+			if err := rw.confined(o, rules); err != nil {
+				return nil, err
+			}
+		}
 	case rw.rules(o) != nil:
 		rw.touched = true
 		plan, err := rw.plan(o, rw.rules(o))

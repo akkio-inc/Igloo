@@ -553,7 +553,8 @@ func (s *Server) dropTable(c *call) error {
 	}
 	// A table with data policies is read and managed through Igloo, not other
 	// engines: dropping it here (and purging its files) would be a bypass, so
-	// it is refused for non-admins like the other operations on it.
+	// it is refused for non-admins like the other operations on it; a clean
+	// room's dataset is its party's.
 	if err := s.requireUnprotected(c, o); err != nil {
 		return err
 	}
@@ -713,23 +714,24 @@ func (s *Server) unlessMissing(c *call, ns []string, table string, refusal error
 	return refusal
 }
 
-// requireUnprotected refuses non-admins table o if it has data policies.
-// Igloo enforces masking and row access policies by rewriting the SQL it
-// runs; an engine with the table's metadata and files reads the raw data,
-// so such tables are read through Igloo, as Unity Catalog does for engines
-// outside it. Admins, whom policies do not bind, are not refused.
+// requireUnprotected refuses non-admins table o if it has data policies,
+// or a clean room keeps it to others. Igloo enforces masking and row
+// access policies by rewriting the SQL it runs; an engine with the table's
+// metadata and files reads the raw data, so such tables are read through
+// Igloo, as Unity Catalog does for engines outside it. Admins, whom
+// policies do not bind, are not refused.
 func (s *Server) requireUnprotected(c *call, o auth.Object) error {
 	if s.opts.Protected == nil || c.who.admin() {
 		return nil
 	}
-	protected, err := s.opts.Protected(c.ctx(), o)
+	protected, err := s.opts.Protected(c.ctx(), c.who.user, o)
 	if err != nil {
 		s.log.Warn("could not check a table's data policies", "table", o.String(), "err", err)
 		return errorf(http.StatusServiceUnavailable, errUnavailable, "could not check the table's data policies; try again")
 	}
 	if protected {
-		return c.who.deny(fmt.Sprintf("table %s has data policies (masking or row access) that other engines would bypass; "+
-			"read it through Igloo's SQL or Flight SQL", o))
+		return c.who.deny(fmt.Sprintf("table %s has data policies (masking or row access), or a clean room keeps it to its party, "+
+			"which other engines would bypass; read it through Igloo's SQL or Flight SQL", o))
 	}
 	return nil
 }

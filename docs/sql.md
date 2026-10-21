@@ -422,6 +422,27 @@ masking and row access policies apply to them as to Iceberg tables. The
 functions that run SQL on the remote database (`postgres_query`,
 `mysql_query` and the like) are refused for everyone.
 
+## Clean rooms
+
+An agency and its partners measure overlap, reach and conversions on their
+joined people-level data without seeing each other's rows, through
+templates every party approves:
+
+```sql
+CREATE CLEAN ROOM tv;
+ALTER CLEAN ROOM tv ADD COLLABORATOR agency ROLE agency_analysts;
+ALTER CLEAN ROOM tv ADD COLLABORATOR tvco RECIPIENT tvco_ads PROVIDER tvco;
+ALTER CLEAN ROOM tv ADD DATASET crm OF agency FROM marts.crm JOIN ON (email_sha256) GROUP BY (segment);
+ALTER CLEAN ROOM tv ADD TEMPLATE overlap
+  FROM BUILTIN audience_overlap (left => crm.email_sha256, right => exposures.email_sha256, by => crm.segment) RUN BY (agency);
+ALTER CLEAN ROOM tv APPROVE TEMPLATE overlap VERSION 1;
+RUN CLEAN ROOM tv TEMPLATE overlap;
+SHOW RUNS IN CLEAN ROOM tv;
+```
+
+[Clean rooms](clean-rooms.md) describes every statement, what templates may
+do, how runs protect the data, and what they cannot protect.
+
 ## Time travel
 
 Every write creates an Iceberg snapshot, and you can query earlier ones:
@@ -495,6 +516,9 @@ CREATE OR REPLACE SCHEMA dev CLONE prod;       -- make dev a fresh copy of prod
   name, as a development copy is every day, does not wait. A table of the
   clone's name that has a different policy or tag value of its own is not
   replaced: an admin decides which applies first.
+- **Clean rooms.** A table a [clean room](clean-rooms.md) keeps to a party,
+  or a schema holding one, is cloned by that party alone, and only that
+  party reads its branches, tags and snapshots or changes them.
 - **Readers.** Like a table made with `CREATE TABLE AS`, a clone may be read
   by whoever may read its schema. Unlike one, it holds every row of the
   source behind the source's policies, so a user whose roles a row access

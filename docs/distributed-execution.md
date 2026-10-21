@@ -186,7 +186,8 @@ parts on the workers.
 - **Policies keep a statement on one machine.** A statement that masking
   or row access policies apply to, or that names anything they concern,
   runs on the replica, where Igloo applies them. Workers never see a masked
-  column's raw values or a hidden row.
+  column's raw values or a hidden row. So does one that reads a table a
+  [clean room](clean-rooms.md) keeps to its party, a room's runs included.
 - **Workers accept no one but Igloo.** Coordinators and workers talk TLS 1.3
   and authenticate each other with keys derived from `IGLOO_WORKER_SECRET`;
   without the secret, neither SQL users nor anything else on the network

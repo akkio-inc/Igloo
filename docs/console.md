@@ -76,6 +76,15 @@ status, rows and first error, from `igloo.load_history`, filtered by table,
 status, time and file name. Admins see every load; other users the files
 they and their pipes loaded.
 
+**Clean rooms.** The [clean rooms](clean-rooms.md) you take part in (every
+room for admins): each room's templates with their SQL and who has approved
+the current version, its run history, its datasets with their policies, and
+its collaborators. Buttons approve a template for the collaborators you act
+for and run it, asking for its parameters, and the latest result of yours
+opens in a grid or a worksheet. They send `ALTER CLEAN ROOM ... APPROVE
+TEMPLATE` and `RUN CLEAN ROOM`, which the server allows as it would from any
+SQL client.
+
 **Access tokens.** Create, list and revoke your own
 [access tokens](sso.md#access-tokens), which SQL clients such as dbt and BI
 tools send instead of a password. A new token is shown once, with a copy

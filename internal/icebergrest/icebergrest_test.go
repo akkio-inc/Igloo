@@ -1494,12 +1494,18 @@ func TestTablesWithDataPolicies(t *testing.T) {
 	var (
 		mu        sync.Mutex
 		protected = map[string]bool{"public.events": true, "team.masked": true}
-		failure   error
+		// keptTo are tables a clean room keeps to one user's party.
+		keptTo  = map[string]string{}
+		failure error
 	)
-	h.srv.opts.Protected = func(_ context.Context, o auth.Object) (bool, error) {
+	h.srv.opts.Protected = func(_ context.Context, user auth.User, o auth.Object) (bool, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		return protected[strings.ToLower(o.String())], failure
+		key := strings.ToLower(o.String())
+		if party, ok := keptTo[key]; ok && party != user.Name {
+			return true, failure
+		}
+		return protected[key], failure
 	}
 	for _, p := range append(slices.Clone(rowChanges), auth.PrivilegeSelect) {
 		h.grant("nora", p, "public", "events")
@@ -1560,6 +1566,19 @@ func TestTablesWithDataPolicies(t *testing.T) {
 	if w := h.request("GET", "/v1/namespaces/public/tables/users", rita, nil, vended...); w.Code != 200 || !strings.Contains(w.Body.String(), "scoped-read") {
 		t.Errorf("an unprotected table: %d %s", w.Code, w.Body)
 	}
+	// A clean room's dataset is its own party's, as before, and nobody
+	// else's.
+	mu.Lock()
+	keptTo["public.users"] = "rita"
+	mu.Unlock()
+	if w := h.request("GET", "/v1/namespaces/public/tables/users", rita, nil, vended...); w.Code != 200 {
+		t.Errorf("a dataset for its own party: %d %s", w.Code, w.Body)
+	}
+	refused("another party's dataset", h.request("GET", "/v1/namespaces/public/tables/users", walt, nil, vended...))
+	refused("dropping another party's dataset", h.request("DELETE", "/v1/namespaces/public/tables/users", walt, nil))
+	mu.Lock()
+	delete(keptTo, "public.users")
+	mu.Unlock()
 	// Policies are checked on every request.
 	mu.Lock()
 	protected["public.events"] = false

@@ -95,8 +95,8 @@ func serveIceberg(ctx context.Context, ln net.Listener, cfg config.Config, deps 
 		Tokens: tokens,
 		// Policies reach every replica within the refresh interval; each
 		// request asks this replica's current ones.
-		Protected: func(ctx context.Context, o auth.Object) (bool, error) {
-			return deps.sql.Protected(ctx, o.Schema, o.Table), nil
+		Protected: func(ctx context.Context, user auth.User, o auth.Object) (bool, error) {
+			return deps.sql.ProtectedFor(ctx, user, o.Schema, o.Table)
 		},
 		Classified: func(ctx context.Context, o auth.Object) ([]string, bool, error) {
 			columns, classified := deps.sql.Classified(ctx, o.Schema, o.Table)

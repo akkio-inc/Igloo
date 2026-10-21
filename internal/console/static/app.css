@@ -783,6 +783,9 @@ table.list td.fill .truncate { max-width: none; min-width: 220px; }
   font-weight: 550; white-space: nowrap; cursor: pointer;
 }
 .filters .check input { width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer; }
+/* Clean rooms: a narrow list of rooms, and the room beside it. */
+.history-layout.with-detail.room-detail { grid-template-columns: minmax(0, 320px) minmax(0, 1fr); }
+.room-detail .tab-panel { padding: 12px 0 0; gap: 12px; }
 
 .segmented { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden; }
 .segmented button {
@@ -935,6 +938,7 @@ dialog::backdrop { background: rgba(14, 21, 48, .45); }
   .catalog-object > .tab-panel { flex: none; overflow: visible; }
   .catalog-object > .tab-panel.flush { height: 70vh; }
   .history-layout.with-detail { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .history-layout.with-detail.room-detail { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 30%) minmax(0, 1fr); }
   .history-detail { border-left: 0; border-top: 1px solid var(--border); }
   .toolbar .hint { display: none; }
 }

@@ -9,6 +9,7 @@ import { createHistory } from './history.js';
 import { createJobs, createLoads } from './tasks.js';
 import { createUsers, createRoles, createCompute } from './admin.js';
 import { createTokens, createServiceAccounts, createSSO } from './access.js';
+import { createCleanRooms } from './cleanrooms.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -117,6 +118,7 @@ const ROUTES = {
   history: { make: createHistory, title: 'Query history' },
   tasks: { make: createJobs, title: 'Tasks' },
   loads: { make: createLoads, title: 'Load history' },
+  'clean-rooms': { make: createCleanRooms, title: 'Clean rooms' },
   tokens: { make: createTokens, title: 'Access tokens' },
   'admin/users': { make: createUsers, title: 'Users', admin: true },
   'admin/services': { make: createServiceAccounts, title: 'Service accounts', admin: true },

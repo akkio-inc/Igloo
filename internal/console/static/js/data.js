@@ -163,6 +163,12 @@ WHERE object_database = ${d} AND lower(object_schema) = lower(${s}) AND lower(ob
         title: 'Rows are filtered by this row access policy for every user, as it decides',
       }));
     }
+    for (const p of info.policies.filter((p) => p.policy_kind === 'CLEAN ROOM')) {
+      head.querySelector('.title .spacer').before(h('span', {
+        class: 'badge warn', text: `clean room: ${p.policy_name}`,
+        title: 'A clean room keeps this table to its own party; others reach it only through the room\'s approved templates',
+      }));
+    }
 
     const views = {
       columns: () => columnsView(info.columns, info.policies, info.tags),

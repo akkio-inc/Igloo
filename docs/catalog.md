@@ -248,6 +248,9 @@ read or change:
   many statements made the flow, but not which ones.
 - Sample rows run as the user, through their grants and
   [policies](security-policies.md): masked columns stay masked.
+- A [clean room](clean-rooms.md)'s datasets and result tables show only to
+  their own party, whatever anyone else's role, admins included, and no
+  edge to or from one shows to anyone else, not even without its name.
 
 Table and column names stay visible to every user through the system
 catalogs (`information_schema`, `pg_catalog`, `duckdb_tables()`), as before;

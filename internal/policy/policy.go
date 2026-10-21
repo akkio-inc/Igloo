@@ -28,6 +28,9 @@ const (
 	Masking Kind = "MASKING POLICY"
 	// RowAccess policies hide the rows their expression is not true for.
 	RowAccess Kind = "ROW ACCESS POLICY"
+	// CleanRoom is how igloo.policy_references lists a confinement,
+	// which is not a policy but protects a table like one.
+	CleanRoom Kind = "CLEAN ROOM"
 )
 
 var (
@@ -146,6 +149,26 @@ type DataRetention struct {
 	SetAt  time.Time `json:"set_at"`
 }
 
+// Confinement keeps a table, view or external table to a few readers: it
+// is a dataset of a clean room, or a run's result there (package
+// cleanroom). Only its users, sessions with one of its roles, and the runs
+// of its room read it, admins included; nobody else does, whatever their
+// grants. A table with several confinements is read only by sessions that
+// all of them admit, or by a run of one of their rooms.
+type Confinement struct {
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+	// Room is the clean room the table is in.
+	Room string `json:"room"`
+	// Users and Roles may read the table.
+	Users []string `json:"users,omitempty"`
+	Roles []string `json:"roles,omitempty"`
+}
+
+// RoomUser is the user a clean room's runs run as: no user can have the
+// name, since user names have no colons.
+func RoomUser(room string) string { return "clean_room:" + room }
+
 // Catalog is every policy, tag and attachment. Attachments name tables and
 // columns, which compare case-insensitively as DuckDB resolves them. They
 // stay when a table or column is dropped, so one created again under the
@@ -157,6 +180,9 @@ type Catalog struct {
 	RowFilters []RowFilter     `json:"row_filters,omitempty"`
 	ColumnTags []ColumnTag     `json:"column_tags,omitempty"`
 	Retentions []DataRetention `json:"retentions,omitempty"`
+	// Confinements are kept by package cleanroom, which replaces a room's
+	// whole set at once (SetConfinements).
+	Confinements []Confinement `json:"confinements,omitempty"`
 }
 
 func (c *Catalog) clone() Catalog {
@@ -489,6 +515,19 @@ func (c *Catalog) UnsetRetention(schema, table string) error {
 	return nil
 }
 
+// SetConfinements replaces the confinements of room with entries, which
+// must all be room's.
+func (c *Catalog) SetConfinements(room string, entries []Confinement) error {
+	for _, e := range entries {
+		if e.Room != room || e.Schema == "" || e.Table == "" {
+			return fmt.Errorf("confinement of %s.%s for room %q: %w", e.Schema, e.Table, e.Room, ErrInvalid)
+		}
+	}
+	c.Confinements = slices.DeleteFunc(c.Confinements, func(e Confinement) bool { return e.Room == room })
+	c.Confinements = append(c.Confinements, entries...)
+	return nil
+}
+
 func quoteList(values []string) string {
 	q := make([]string, len(values))
 	for i, v := range values {
@@ -532,11 +571,30 @@ type TableRules struct {
 	Columns map[string]*ColumnRules
 	// Retention is the table's data retention, if any.
 	Retention *DataRetention
+	// Confined are the table's confinements (clean rooms).
+	Confined []Confinement
 }
 
 // Protected reports whether a policy applies to the table: a row access
-// policy, or a masking policy on a column.
+// policy, a masking policy on a column, or a confinement.
 func (r *TableRules) Protected() bool {
+	if r == nil {
+		return false
+	}
+	if r.Filter != nil || len(r.Confined) > 0 {
+		return true
+	}
+	for _, c := range r.Columns {
+		if c.Masked() {
+			return true
+		}
+	}
+	return false
+}
+
+// Policies reports whether a masking or row access policy applies to the
+// table, apart from its confinements.
+func (r *TableRules) Policies() bool {
 	if r == nil {
 		return false
 	}
@@ -549,6 +607,39 @@ func (r *TableRules) Protected() bool {
 		}
 	}
 	return false
+}
+
+// Admits reports whether a session of user, with roles, may read the
+// table despite its confinements: every confinement admits it, or it is
+// a run of one of the table's rooms.
+func (r *TableRules) Admits(user string, roles []string) bool {
+	if r == nil {
+		return true
+	}
+	for _, c := range r.Confined {
+		if user == RoomUser(c.Room) {
+			return true
+		}
+	}
+	for _, c := range r.Confined {
+		if !slices.Contains(c.Users, user) && !slices.ContainsFunc(c.Roles, func(role string) bool { return slices.Contains(roles, role) }) {
+			return false
+		}
+	}
+	return true
+}
+
+// Rooms names the clean rooms that confine the table, sorted.
+func (r *TableRules) Rooms() []string {
+	if r == nil {
+		return nil
+	}
+	var out []string
+	for _, c := range r.Confined {
+		out = append(out, c.Room)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // Column returns the rules for a column, or nil.
@@ -622,6 +713,10 @@ func NewSnapshot(version int64, c Catalog) *Snapshot {
 	for _, r := range c.Retentions {
 		table("", r.Schema, r.Table).Retention = &r
 	}
+	for _, cf := range c.Confinements {
+		t := table("", cf.Schema, cf.Table)
+		t.Confined = append(t.Confined, cf)
+	}
 	for k, t := range s.tables {
 		if t.Protected() {
 			s.names[k.table] = true
@@ -631,6 +726,9 @@ func NewSnapshot(version int64, c Catalog) *Snapshot {
 	return s
 }
 
+// Confines reports whether a clean room keeps any table to a party.
+func (s *Snapshot) Confines() bool { return s != nil && len(s.Catalog.Confinements) > 0 }
+
 // ProtectsConnections reports whether a policy protects a table of a
 // connection to another database.
 func (s *Snapshot) ProtectsConnections() bool { return s != nil && s.connections }
@@ -638,8 +736,8 @@ func (s *Snapshot) ProtectsConnections() bool { return s != nil && s.connections
 // Empty reports whether no policy protects anything.
 func (s *Snapshot) Empty() bool { return s == nil || len(s.names) == 0 }
 
-// Classified reports whether any table has policies, tags or a data
-// retention, which all stay with tables' names.
+// Classified reports whether any table has policies, tags, a data
+// retention or a confinement, which all stay with tables' names.
 func (s *Snapshot) Classified() bool { return s != nil && len(s.tables) > 0 }
 
 // StagingMark is in the name of the table that CREATE OR REPLACE TABLE

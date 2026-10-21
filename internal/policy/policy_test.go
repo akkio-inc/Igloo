@@ -266,3 +266,62 @@ func TestRetention(t *testing.T) {
 		t.Errorf("unset twice: %v", err)
 	}
 }
+
+func TestConfinements(t *testing.T) {
+	s := NewMemoryStore()
+	ctx := context.Background()
+	set := func(room string, entries ...Confinement) error {
+		return s.Update(ctx, func(c *Catalog) error { return c.SetConfinements(room, entries) })
+	}
+	if err := set("tv", Confinement{Schema: "marts", Table: "crm", Room: "tv", Roles: []string{"agency"}},
+		Confinement{Schema: "partners", Table: "viewing", Room: "tv"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := set("radio", Confinement{Schema: "marts", Table: "crm", Room: "radio", Roles: []string{"agency"}, Users: []string{"nora"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := set("tv", Confinement{Schema: "marts", Table: "crm", Room: "radio"}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("another room's confinement: %v", err)
+	}
+	snap, err := s.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crm := snap.Rules("MARTS", "crm")
+	if snap.Empty() || crm == nil || !crm.Protected() || crm.Policies() || !snap.ProtectedNames()["viewing"] {
+		t.Fatalf("confined tables are protected without policies: %+v", crm)
+	}
+	if got := crm.Rooms(); len(got) != 2 || got[0] != "radio" || got[1] != "tv" {
+		t.Errorf("rooms: %v", got)
+	}
+	for _, c := range []struct {
+		user  string
+		roles []string
+		want  bool
+	}{
+		{"ana", []string{"agency", "reader"}, true},
+		// Every confinement must admit a session: nora is in radio's
+		// readers but not tv's.
+		{"nora", []string{"reader"}, false},
+		{"igloo", []string{"admin"}, false},
+		{RoomUser("tv"), nil, true},
+		{RoomUser("radio"), nil, true},
+		{RoomUser("other"), nil, false},
+	} {
+		if got := crm.Admits(c.user, c.roles); got != c.want {
+			t.Errorf("Admits(%s, %v) = %v", c.user, c.roles, got)
+		}
+	}
+	if viewing := snap.Rules("partners", "viewing"); viewing.Admits("ana", []string{"agency"}) || !viewing.Admits(RoomUser("tv"), nil) {
+		t.Error("a partner's dataset admits only its room's runs")
+	}
+	if err := set("tv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := set("radio"); err != nil {
+		t.Fatal(err)
+	}
+	if snap, _ = s.Load(ctx); !snap.Empty() {
+		t.Errorf("rooms without confinements leave nothing protected: %v", snap.ProtectedNames())
+	}
+}

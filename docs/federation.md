@@ -848,7 +848,9 @@ anything.
   far.
 - Not served to other engines: the [Iceberg REST catalog](external-engines.md)
   and [Delta Sharing](sharing.md) serve Iceberg tables only. To share a
-  connection's data, copy it into an Iceberg table first.
+  connection's data, copy it into an Iceberg table first; the same goes for
+  a [clean room](clean-rooms.md)'s datasets, which Igloo must keep to one
+  party.
 - Grants stop at tables, as for Iceberg tables; masking and row access
   policies restrict columns and rows (see above). Restrict what the
   connection's database user can see on the database itself as well.

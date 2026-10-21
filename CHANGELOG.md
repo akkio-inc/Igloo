@@ -609,6 +609,23 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and its policies in the query history. Policies and tags do not attach
   to external tables, and while tables have policies only admins read
   external tables' files or the copies of shared files directly.
+- Clean rooms (`CREATE CLEAN ROOM`, `ALTER CLEAN ROOM ... ADD COLLABORATOR |
+  DATASET | TEMPLATE`, `APPROVE TEMPLATE`, `RUN CLEAN ROOM`, `SHOW ... IN
+  CLEAN ROOM`): an agency and its partners measure audience overlap, reach
+  and frequency, and conversion lift on data joined by hashed identifiers
+  that neither sees. Datasets carry policies of identifiers (join and count
+  only), dimensions and allowed aggregates; templates are checked on
+  DuckDB's parse and run only after every data owner approved that version,
+  as the room's own identity, with each result row counting at least a
+  threshold of each dataset's people (50 by default). Datasets are tables
+  and partners' external tables, which their owners or admins put in a
+  room, readable, changeable, clonable and shown in the catalog only to
+  their own party, through every front end, the Iceberg REST catalog and
+  Delta Sharing. Results go to the requester alone; every
+  run is in the room's history. Parameter checks, run budgets and optional
+  Laplace noise defend against differencing. Built-in templates, and a
+  partner API on the sharing endpoint with the recipient's token. See
+  [docs/clean-rooms.md](docs/clean-rooms.md).
 
 ### Data catalog
 

@@ -117,11 +117,12 @@ type Options struct {
 	// table's files (see clones.go). Nil means no table is a clone.
 	Clones Clones
 	// Protected reports whether a table has data policies (masking or row
-	// access), which Igloo applies to the SQL it runs: an engine reading the
-	// table's files would bypass them, so non-admins may neither load nor
-	// change such a table here. It is asked on every request, since
-	// policies change. Nil means no table has any.
-	Protected func(ctx context.Context, o auth.Object) (bool, error)
+	// access), which Igloo applies to the SQL it runs, or is a clean room's
+	// that the user is not of the party of: an engine reading the table's
+	// files would bypass them, so non-admins may neither load nor change
+	// such a table here. It is asked on every request, since policies
+	// change. Nil means no table has any.
+	Protected func(ctx context.Context, user auth.User, o auth.Object) (bool, error)
 	// Classified, if set, reports whether table o has policies, tags or a
 	// data retention, which stay with its name, and names its columns
 	// with policies or tags, which stay with theirs: such a table may not
