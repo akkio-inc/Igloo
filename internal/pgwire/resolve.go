@@ -48,15 +48,22 @@ func (o object) key() string { return strings.ToLower(o.db + "." + o.schema + ".
 // resolution is what a table name may mean.
 type resolution struct {
 	// first are the objects DuckDB binds the name to, as far as Igloo can
-	// tell: those at the first place on the search path with any.
+	// tell: those at the first place DuckDB looks that has any.
 	first []object
-	// all are every object the name could mean, including ones the first
-	// hide. Grants are checked for all of them, so a mistake in modelling
-	// DuckDB's search order can only refuse a statement, never allow one.
+	// all are every object at the places DuckDB looks for the name,
+	// including ones the first hide. Grants are checked for all of them, so
+	// a mistake in modelling the order DuckDB looks in can only refuse a
+	// statement, never allow one, and so can a prepared statement that
+	// DuckDB binds again after the first is dropped. Objects at places
+	// DuckDB does not look for the name, such as a table of a connection's
+	// schema named like one of the catalog's that is not on the search
+	// path, are not among them: DuckDB cannot bind the name to those.
 	all []object
 }
 
-// pathEntry is a database and schema on the search path.
+// pathEntry is a database and schema on the search path. In the places
+// DuckDB looks for a name (see searchPath), db is "" for the session's
+// current database and schema "" for any schema of db.
 type pathEntry struct{ db, schema string }
 
 type searchPath struct {
@@ -332,100 +339,131 @@ func (r *resolver) load(names []string) error {
 	}
 }
 
-// positions is the search path for a name in the body of view, or at the
-// top level when view is nil: temporary objects first, then the view's own
-// schema, then the session's path and the system catalogs.
-func (r *resolver) positions(view *object) []pathEntry {
+// searchPath is DuckDB's search path for a name in the body of view, or at
+// the top level when view is nil, as its binder walks it (DuckDB 1.5's
+// CatalogSearchPath, and Binder::GetSearchPath for views): temporary
+// objects first; in a view, the view's own schema and then its database
+// with any schema, which only names qualified with a schema look in; the
+// session's path; the current database's main schema; and the system
+// catalog's schemas. A temporary view's names resolve as at the top level
+// (CatalogEntryRetriever::SetSearchPath skips the temporary database).
+func (r *resolver) searchPath(view *object) []pathEntry {
 	ps := []pathEntry{{"temp", "main"}}
-	if view != nil {
-		ps = append(ps, pathEntry{view.db, view.schema})
-		if !strings.EqualFold(view.schema, "main") {
-			ps = append(ps, pathEntry{view.db, "main"})
-		}
+	if view != nil && !strings.EqualFold(view.db, "temp") && !strings.EqualFold(view.db, "system") {
+		ps = append(ps, pathEntry{view.db, view.schema}, pathEntry{view.db, ""})
 	}
 	ps = append(ps, r.path.entries...)
-	return append(ps, pathEntry{r.path.defaultDB, "main"}, pathEntry{"system", "main"}, pathEntry{"system", "pg_catalog"})
+	return append(ps, pathEntry{"", "main"}, pathEntry{"system", "main"}, pathEntry{"system", "pg_catalog"})
+}
+
+// positions returns where DuckDB looks, in order, for a table or view whose
+// name is qualified with qualifier (none, a schema or a database, or both),
+// in the body of view or at the top level when view is nil
+// (Binder::BindSchemaOrCatalog and GetCatalogEntries in DuckDB 1.5). anyOf
+// is set instead when DuckDB looks in the default schema of a database
+// other than DuckDB's own, which Igloo does not know: then any schema of
+// anyOf may be the one.
+//
+//   - name: every database and schema on the search path.
+//   - schema.name: that schema, in each database on the search path with
+//     it, and in a view's database; else in the current database. Never in
+//     a database that is not on the path with the schema, even when it has
+//     a schema of that name.
+//   - db.name, when db is an attached database: its schemas on the search
+//     path, else its default schema. (If a database DuckDB would look in
+//     for a schema called db says it has one, DuckDB refuses the name as
+//     ambiguous, and the statement fails to prepare.)
+//   - db.schema.name: exactly that.
+func (r *resolver) positions(qualifier []string, view *object) (positions []pathEntry, anyOf string) {
+	path := r.searchPath(view)
+	db := func(name string) string {
+		if name == "" {
+			return r.path.defaultDB
+		}
+		return name
+	}
+	switch len(qualifier) {
+	case 2:
+		return []pathEntry{{qualifier[0], qualifier[1]}}, ""
+	case 1:
+		a := qualifier[0]
+		if _, ok := r.databases[strings.ToLower(a)]; ok {
+			for _, p := range path {
+				// The current database's main schema is not on the path
+				// under its name, so it is not one of its schemas there.
+				if p.db != "" && p.schema != "" && strings.EqualFold(p.db, a) {
+					positions = append(positions, pathEntry{p.db, p.schema})
+				}
+			}
+			switch {
+			case len(positions) > 0:
+				return positions, ""
+			case strings.EqualFold(r.databases[strings.ToLower(a)], "duckdb"):
+				return []pathEntry{{a, "main"}}, ""
+			}
+			return nil, a
+		}
+		if slices.Contains(systemSchemas, strings.ToLower(a)) {
+			// DuckDB looks for these only in the system catalog
+			// (DefaultSchemaGenerator::IsDefaultSchema).
+			return []pathEntry{{"system", a}}, ""
+		}
+		for _, p := range path {
+			if p.schema == "" || strings.EqualFold(p.schema, a) {
+				positions = append(positions, pathEntry{db(p.db), a})
+			}
+		}
+		if len(positions) == 0 {
+			positions = []pathEntry{{r.path.defaultDB, a}}
+		}
+		return positions, ""
+	}
+	for _, p := range path {
+		if p.schema != "" {
+			positions = append(positions, pathEntry{db(p.db), p.schema})
+		}
+	}
+	return positions, ""
 }
 
 // resolve works out what ref, written in the body of view (or at the top
-// level when view is nil), may mean.
+// level when view is nil), may mean: the objects of its name at the places
+// DuckDB looks for it.
 func (r *resolver) resolve(ref tableRef, view *object) (resolution, error) {
 	parts := ref.parts
 	if err := r.load([]string{parts[len(parts)-1]}); err != nil {
 		return resolution{}, err
 	}
 	objs := r.objects[strings.ToLower(parts[len(parts)-1])]
-	at := func(db, schema string) []object {
-		var out []object
-		for _, o := range objs {
-			if strings.EqualFold(o.db, db) && strings.EqualFold(o.schema, schema) {
-				out = append(out, o)
-			}
-		}
-		return out
-	}
 	var res resolution
-	firstOf := func(positions []pathEntry) {
-		for _, p := range positions {
-			if m := at(p.db, p.schema); len(m) > 0 {
-				res.first = m
-				return
-			}
+	add := func(m []object) {
+		if res.first == nil && len(m) > 0 {
+			res.first = m
 		}
-	}
-
-	switch len(parts) {
-	case 3:
-		res.first = at(parts[0], parts[1])
-		res.all = res.first
-	case 2:
-		a := parts[0]
-		var positions []pathEntry
-		if _, ok := r.databases[strings.ToLower(a)]; ok {
-			// db.name: the database's schemas on the path, else any.
-			for _, p := range r.positions(view) {
-				if strings.EqualFold(p.db, a) {
-					positions = append(positions, p)
-				}
-			}
-			for _, o := range objs {
-				if strings.EqualFold(o.db, a) {
-					res.all = append(res.all, o)
-				}
-			}
-			if len(positions) == 0 {
-				res.first = res.all
-			}
-		}
-		// schema.name: that schema in the databases on the path, else in
-		// the default database or the system catalog.
-		var schemaPositions []pathEntry
-		for _, p := range r.positions(view) {
-			if strings.EqualFold(p.schema, a) {
-				schemaPositions = append(schemaPositions, p)
-			}
-		}
-		if len(schemaPositions) == 0 {
-			schemaPositions = []pathEntry{{r.path.defaultDB, a}, {"system", a}}
-		}
-		for _, o := range objs {
-			if strings.EqualFold(o.schema, a) && !slices.Contains(res.all, o) {
+		for _, o := range m {
+			if !slices.Contains(res.all, o) {
 				res.all = append(res.all, o)
 			}
 		}
-		if res.first == nil {
-			firstOf(append(positions, schemaPositions...))
-		}
-	case 1:
-		positions := r.positions(view)
-		firstOf(positions)
-		for _, p := range positions {
-			for _, o := range at(p.db, p.schema) {
-				if !slices.Contains(res.all, o) {
-					res.all = append(res.all, o)
-				}
+	}
+	positions, anyOf := r.positions(parts[:len(parts)-1], view)
+	for _, p := range positions {
+		var m []object
+		for _, o := range objs {
+			if strings.EqualFold(o.db, p.db) && strings.EqualFold(o.schema, p.schema) {
+				m = append(m, o)
 			}
 		}
+		add(m)
+	}
+	if anyOf != "" {
+		var m []object
+		for _, o := range objs {
+			if strings.EqualFold(o.db, anyOf) {
+				m = append(m, o)
+			}
+		}
+		add(m)
 	}
 	return res, nil
 }

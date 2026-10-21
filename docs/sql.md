@@ -215,6 +215,14 @@ works and what it means:
   `iceberg_scan`, `iceberg_metadata`, `glob`, `COPY ... FROM` and similar
   functions could read any table's files directly. Statements Igloo cannot
   analyze, such as `PRAGMA`, are refused for them with SQLSTATE `42501`.
+- Grants are checked for the table a name means as DuckDB binds it. A name
+  with no schema, or with a schema such as `sales.orders`, is looked for
+  along the session's search path; `sales.orders` only in the databases
+  whose `sales` is on the path, or in the current database if none's is,
+  never in a [connection](#connections-to-other-databases) whose schema of
+  that name is not on the path. Where a name is found in several places on
+  the path, users with role `none` need grants on each, as the statement
+  would read the next if the first were dropped.
 - Views run with the querying user's privileges: reading a view needs
   `SELECT` on the tables it reads. Owner's-rights views are not available.
   To show users only some rows or masked columns of a table, use

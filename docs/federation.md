@@ -453,7 +453,13 @@ table's name); DuckDB's parse of the statement, resolved along the session's
 search path and with views expanded, says which connection, schema and
 table each name means. The two must agree scan for scan, and every table a
 name could mean must be granted; otherwise the statement is refused with
-SQLSTATE `42501`. A scan the check cannot account for, such as one through
+SQLSTATE `42501`. A name could mean the tables of that name where DuckDB
+looks for it, as it binds names: `media_demo.audit` means the table of
+schema `media_demo` in each database that has that schema on the search
+path, or in the current database if none does. A connection whose schema
+has the name of one of the catalog's, as a Snowflake connection's
+`MEDIA_DEMO` may, is not read, and needs no grant, unless its schema is on
+the search path. A scan the check cannot account for, such as one through
 a macro an admin defined, is refused. The plan shows the scans of an
 Iceberg REST catalog's tables as `ICEBERG_SCAN`, as it shows those of the
 Iceberg catalog's own tables and of `iceberg_scan` calls, without the

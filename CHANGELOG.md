@@ -831,5 +831,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   rewriting a table's files, leaves that table's files alone for a day
   instead of rewriting them again within seconds of starting
   (docs/operations.md#compaction-memory).
+- A name qualified with a schema, such as `media_demo."AUDIT_EVENTS"`, was
+  checked against every database with a schema of that name, not just the
+  one DuckDB reads. With a Snowflake connection that has a schema
+  `MEDIA_DEMO` too, a user with role `none` and `SELECT` on the catalog's
+  `media_demo` was refused (`SELECT on table sf.media_demo.audit_events needs
+  a SELECT grant`) though DuckDB reads the catalog's table; so were their
+  `EXPLAIN`, writes and DDL by grants, a reader's join of the table with a
+  connection's table granted to them, every user's read of it once the
+  connection's table had a row access policy, and a policy that read it.
+  Names now mean, for these checks, the tables at the places DuckDB looks
+  for them, as DuckDB 1.5 binds names: a schema-qualified name in the
+  databases whose schema of that name is on the search path, or else in the
+  current database. Names in views' bodies follow DuckDB 1.5 too, which
+  looks for a schema-qualified one in the view's own database first and for
+  an unqualified one not in that database's `main` schema; some statements
+  that read views were refused as unverifiable before.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
