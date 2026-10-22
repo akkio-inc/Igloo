@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -909,56 +910,142 @@ func (w *Worker) viewStatement(v viewDef, deleted string) (string, error) {
 	}
 
 	// Files without deletes are read as they are; the others with each
-	// row's file and position, which the deleted rows are left out by.
+	// row's file and position, which the rows that position deletes and
+	// deletion vectors delete are left out by, and in groups by the
+	// equality delete files that apply to them, without the rows those
+	// delete.
 	for _, c := range v.Columns {
 		if strings.EqualFold(c.Name, "file_row_number") || strings.EqualFold(c.Name, "__igloo_file") {
 			return "", unsupported("%s has a column called %s, and delete files", v.Name, c.Name)
 		}
 	}
-	withDeletes := map[string]int64{}
-	for _, d := range v.Deletes {
-		withDeletes[d.File] = d.Rows
+	type group struct {
+		files    []string
+		rows     int64
+		equality []EqualityDelete
 	}
-	var plain, other []string
-	plainRows, otherRows := v.Rows, int64(0)
+	deletes := map[string]fileDeletes{}
+	for _, d := range v.Deletes {
+		deletes[d.File] = d
+	}
+	groups := map[string]*group{}
+	var order []string
+	var plain []string
+	plainRows := v.Rows
 	for _, f := range v.Files {
-		rows, ok := withDeletes[f]
+		d, ok := deletes[f]
 		if !ok {
 			plain = append(plain, f)
 			continue
 		}
-		other = append(other, f)
-		otherRows += rows
-		plainRows -= rows
+		var keys []string
+		for _, e := range d.Equality {
+			keys = append(keys, fmt.Sprint(e.Path, e.IDs))
+		}
+		slices.Sort(keys)
+		key := strings.Join(keys, "\x00")
+		g := groups[key]
+		if g == nil {
+			g = &group{equality: d.Equality}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.files = append(g.files, f)
+		g.rows += d.Rows
+		plainRows -= d.Rows
 	}
-	if v.Rows == 0 || otherRows == 0 {
-		plainRows, otherRows = 0, 0
+	known := func(rows int64) int64 {
+		if v.Rows == 0 {
+			return 0
+		}
+		return max(rows, 0)
 	}
 	var parts []string
 	if len(plain) > 0 {
-		parts = append(parts, scan(plain, max(plainRows, 0), ""))
+		parts = append(parts, scan(plain, known(plainRows), ""))
 	}
-	if len(other) > 0 {
-		parts = append(parts, scan(other, otherRows, ", filename = '__igloo_file', file_row_number = true")+
-			" ANTI JOIN "+quoteIdent(deleted)+" AS __x ON __x.f = __d.__igloo_file AND __x.r = __d.file_row_number")
+	for _, key := range order {
+		g := groups[key]
+		sel := scan(g.files, known(g.rows), ", filename = '__igloo_file', file_row_number = true") +
+			" ANTI JOIN " + quoteIdent(deleted) + " AS __x ON __x.f = __d.__igloo_file AND __x.r = __d.file_row_number"
+		eq, err := w.equalityJoins(v, g.equality)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, sel+eq)
 	}
 	return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS " + strings.Join(parts, " UNION ALL "), nil
 }
 
+// equalityJoins returns the anti joins that leave out of a view's rows,
+// read as __d, those that equality delete files delete: one join for each
+// set of columns some of the files compare, over those files, read by
+// field ID. Iceberg's equality deletes match NULL to NULL.
+func (w *Worker) equalityJoins(v viewDef, deletes []EqualityDelete) (string, error) {
+	type set struct {
+		ids   []int
+		files []string
+	}
+	var sets []*set
+	for _, d := range deletes {
+		if !w.allowed(d.Path) {
+			return "", fmt.Errorf("file %s is outside the warehouse", d.Path)
+		}
+		ids := slices.Sorted(slices.Values(d.IDs))
+		i := slices.IndexFunc(sets, func(s *set) bool { return slices.Equal(s.ids, ids) })
+		if i < 0 {
+			sets = append(sets, &set{ids: ids})
+			i = len(sets) - 1
+		}
+		if !slices.Contains(sets[i].files, d.Path) {
+			sets[i].files = append(sets[i].files, d.Path)
+		}
+	}
+	var b strings.Builder
+	for k, s := range sets {
+		var schema, conds []string
+		alias := fmt.Sprintf("__e%d", k)
+		for _, id := range s.ids {
+			i := slices.IndexFunc(v.Columns, func(c Column) bool { return c.ID == id })
+			if i < 0 || v.Columns[i].Nested != nil {
+				return "", unsupported("equality deletes of %s compare field %d, which is not one of its columns", v.Name, id)
+			}
+			c := v.Columns[i]
+			name := fmt.Sprintf("__c%d", id)
+			schema = append(schema, fmt.Sprintf("%d: {name: %s, type: %s, default_value: NULL}", id, quoteLiteral(name), quoteLiteral(c.Type)))
+			conds = append(conds, "__d."+quoteIdent(c.Name)+" IS NOT DISTINCT FROM "+alias+"."+quoteIdent(name))
+		}
+		files := make([]string, len(s.files))
+		for i, f := range s.files {
+			files[i] = quoteLiteral(f)
+		}
+		fmt.Fprintf(&b, " ANTI JOIN read_parquet([%s], schema = MAP {%s}, hive_partitioning = false) AS %s ON %s",
+			strings.Join(files, ", "), strings.Join(schema, ", "), alias, strings.Join(conds, " AND "))
+	}
+	return b.String(), nil
+}
+
 // deletedRows creates the temporary table name of the rows that the
-// position delete files of v's files delete: (f, r), a data file as the
-// view reads it, and the position of a deleted row in it. A position delete
-// file lists the rows it deletes by the path of their data file, which it
-// may spell otherwise than the table's metadata, as after a migration from
-// another engine; the paths are compared as deletefiles.Canonical spells
-// them. Each delete file deletes rows only of the data files it applies
-// to, as the scan's planning matched them.
+// position delete files and deletion vectors of v's files delete: (f, r),
+// a data file as the view reads it, and the position of a deleted row in
+// it. A position delete file lists the rows it deletes by the path of
+// their data file, which it may spell otherwise than the table's metadata,
+// as after a migration from another engine; the paths are compared as
+// deletefiles.Canonical spells them. Each delete file deletes rows only of
+// the data files it applies to, as the scan's planning matched them.
 func (w *Worker) deletedRows(ctx context.Context, conn *duckdb.Conn, v viewDef, name string) error {
+	exec := func(stmt string) error {
+		_, err := conn.ExecContext(ctx, stmt, nil)
+		return err
+	}
+	if err := exec("CREATE TEMP TABLE " + quoteIdent(name) + " (f VARCHAR, r BIGINT)"); err != nil {
+		return err
+	}
 	inView := map[string]bool{}
 	for _, f := range v.Files {
 		inView[f] = true
 	}
-	// The data files of the view each delete file applies to.
+	// The data files of the view each position delete file applies to.
 	applies := map[string][]string{}
 	for _, d := range v.Deletes {
 		if !inView[d.File] {
@@ -973,48 +1060,118 @@ func (w *Worker) deletedRows(ctx context.Context, conn *duckdb.Conn, v viewDef, 
 			}
 		}
 	}
-	files := slices.Sorted(maps.Keys(applies))
-	exec := func(stmt string) error {
-		_, err := conn.ExecContext(ctx, stmt, nil)
-		return err
-	}
-	if len(files) == 0 {
-		return exec("CREATE TEMP TABLE " + quoteIdent(name) + " (f VARCHAR, r BIGINT)")
-	}
-	quoted := make([]string, len(files))
-	for i, f := range files {
-		quoted[i] = quoteLiteral(f)
-	}
-	read := "read_parquet([" + strings.Join(quoted, ", ") + "], filename = '__igloo_delete_file', hive_partitioning = false, union_by_name = true)"
-
-	// The data files each delete file names, as it spells them.
-	rows, err := conn.QueryContext(ctx, "SELECT DISTINCT __igloo_delete_file, file_path FROM "+read, nil)
-	if err != nil {
-		return fmt.Errorf("read position delete files: %w", err)
-	}
-	var mapping []string
-	dest := make([]driver.Value, 2)
-	for {
-		if err := rows.Next(dest); err != nil {
-			_ = rows.Close()
-			if errors.Is(err, io.EOF) {
-				break
-			}
+	if len(applies) > 0 {
+		files := slices.Sorted(maps.Keys(applies))
+		quoted := make([]string, len(files))
+		for i, f := range files {
+			quoted[i] = quoteLiteral(f)
+		}
+		read := "read_parquet([" + strings.Join(quoted, ", ") + "], filename = '__igloo_delete_file', hive_partitioning = false, union_by_name = true)"
+		// The data files each delete file names, as it spells them.
+		rows, err := conn.QueryContext(ctx, "SELECT DISTINCT __igloo_delete_file, file_path FROM "+read, nil)
+		if err != nil {
 			return fmt.Errorf("read position delete files: %w", err)
 		}
-		dfile, _ := dest[0].(string)
-		path, _ := dest[1].(string)
-		for _, data := range applies[dfile] {
-			if deletefiles.Canonical(path) == deletefiles.Canonical(data) {
-				mapping = append(mapping, "("+quoteLiteral(dfile)+", "+quoteLiteral(path)+", "+quoteLiteral(data)+")")
+		var mapping []string
+		dest := make([]driver.Value, 2)
+		for {
+			if err := rows.Next(dest); err != nil {
+				_ = rows.Close()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return fmt.Errorf("read position delete files: %w", err)
+			}
+			dfile, _ := dest[0].(string)
+			path, _ := dest[1].(string)
+			for _, data := range applies[dfile] {
+				if deletefiles.Canonical(path) == deletefiles.Canonical(data) {
+					mapping = append(mapping, "("+quoteLiteral(dfile)+", "+quoteLiteral(path)+", "+quoteLiteral(data)+")")
+				}
+			}
+		}
+		if len(mapping) > 0 {
+			if err := exec("INSERT INTO " + quoteIdent(name) + " SELECT m.data, CAST(p.pos AS BIGINT) FROM " + read +
+				" AS p JOIN (VALUES " + strings.Join(mapping, ", ") + ") AS m(dfile, path, data) ON p.__igloo_delete_file = m.dfile AND p.file_path = m.path"); err != nil {
+				return err
 			}
 		}
 	}
-	if len(mapping) == 0 {
-		return exec("CREATE TEMP TABLE " + quoteIdent(name) + " (f VARCHAR, r BIGINT)")
+	return w.vectorRows(ctx, conn, v, name)
+}
+
+// vectorRows adds the rows that the deletion vectors of v's files delete
+// to the table name. A vector is a blob of a Puffin file, framed and
+// serialized as package deletefiles reads it.
+func (w *Worker) vectorRows(ctx context.Context, conn *duckdb.Conn, v viewDef, name string) error {
+	blobs := map[string][]byte{}
+	var runs []string
+	flush := func() error {
+		if len(runs) == 0 {
+			return nil
+		}
+		_, err := conn.ExecContext(ctx, "INSERT INTO "+quoteIdent(name)+" SELECT f, unnest(range(s, e)) FROM (VALUES "+
+			strings.Join(runs, ", ")+") AS t(f, s, e)", nil)
+		runs = runs[:0]
+		return err
 	}
-	return exec("CREATE TEMP TABLE " + quoteIdent(name) + " AS SELECT m.data AS f, CAST(p.pos AS BIGINT) AS r FROM " + read +
-		" AS p JOIN (VALUES " + strings.Join(mapping, ", ") + ") AS m(dfile, path, data) ON p.__igloo_delete_file = m.dfile AND p.file_path = m.path")
+	for _, d := range v.Deletes {
+		for _, vec := range d.Vectors {
+			if !w.allowed(vec.Path) {
+				return fmt.Errorf("file %s is outside the warehouse", vec.Path)
+			}
+			content, ok := blobs[vec.Path]
+			if !ok {
+				var err error
+				if content, err = readBlob(ctx, conn, vec.Path); err != nil {
+					return fmt.Errorf("read deletion vectors: %w", err)
+				}
+				blobs[vec.Path] = content
+			}
+			if vec.Offset < 0 || vec.Size < 8 || vec.Offset+vec.Size > int64(len(content)) {
+				return unsupported("a deletion vector of %s lies outside its file", d.File)
+			}
+			data, err := deletefiles.StoredVector(content[vec.Offset:vec.Offset+vec.Size], vec.Size-8)
+			if err != nil {
+				return unsupported("a deletion vector of %s: %v", d.File, err)
+			}
+			n, err := deletefiles.VectorRuns(data, func(start, stop uint64) error {
+				if stop > math.MaxInt64 {
+					return deletefiles.ErrCorruptVector
+				}
+				runs = append(runs, fmt.Sprintf("(%s, %d, %d)", quoteLiteral(d.File), start, stop))
+				if len(runs) == 4096 {
+					return flush()
+				}
+				return nil
+			})
+			if err != nil {
+				return unsupported("a deletion vector of %s: %v", d.File, err)
+			}
+			if vec.Rows > 0 && n != uint64(vec.Rows) {
+				return unsupported("a deletion vector of %s deletes %d rows where the table's metadata says %d", d.File, n, vec.Rows)
+			}
+		}
+	}
+	return flush()
+}
+
+// readBlob returns the contents of a file.
+func readBlob(ctx context.Context, conn *duckdb.Conn, path string) ([]byte, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT content FROM read_blob("+quoteLiteral(path)+")", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		return nil, err
+	}
+	b, ok := dest[0].([]byte)
+	if !ok {
+		return nil, fmt.Errorf("%s has no contents", path)
+	}
+	return b, nil
 }
 
 // allowed reports whether a data file lies under the warehouse or an

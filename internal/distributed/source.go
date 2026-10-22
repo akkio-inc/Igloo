@@ -45,11 +45,34 @@ type File struct {
 }
 
 // Deletes are the delete files that apply to a data file, as the scan's
-// planning matched them to it by partition and sequence number.
+// planning matched them to it: by partition and sequence number, and
+// deletion vectors by the data file they name.
 type Deletes struct {
 	// Positions are position delete files: Parquet files whose file_path
 	// and pos columns list the deleted rows of this and other data files.
 	Positions []string `json:"positions,omitempty"`
+	// Vectors are deletion vectors (Iceberg format version 3): blobs of
+	// Puffin files that mark the positions of the file's deleted rows.
+	Vectors []Vector `json:"vectors,omitempty"`
+	// Equality are equality delete files: a row is deleted if one of
+	// their rows has its values in the columns they compare.
+	Equality []EqualityDelete `json:"equality,omitempty"`
+}
+
+// Vector is a deletion vector: Size bytes at Offset of a Puffin file,
+// which delete Rows rows.
+type Vector struct {
+	Path   string `json:"path"`
+	Offset int64  `json:"offset"`
+	Size   int64  `json:"size"`
+	Rows   int64  `json:"rows"`
+}
+
+// EqualityDelete is an equality delete file and the field IDs of the
+// columns it compares, columns of the table's.
+type EqualityDelete struct {
+	Path string `json:"path"`
+	IDs  []int  `json:"ids"`
 }
 
 // Iceberg is the Source for Igloo's Iceberg catalog. Every statement loads
@@ -162,11 +185,6 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	if snap.Summary != nil {
 		props = snap.Summary.Properties
 	}
-	// Workers apply position deletes (see Files); equality deletes keep the
-	// table on one machine until maintenance merges them.
-	if n, _ := strconv.ParseInt(props["total-equality-deletes"], 10, 64); n > 0 && t.Unsupported == "" {
-		t.Unsupported = "it has equality delete files; table maintenance merges them"
-	}
 	if size, err := strconv.ParseInt(props["total-files-size"], 10, 64); err == nil {
 		t.Bytes = size
 		return t, nil
@@ -205,24 +223,42 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	}
 	files = make([]File, 0, len(tasks))
 	for _, task := range tasks {
-		switch {
-		case len(task.EqualityDeleteFiles) > 0:
-			return nil, unsupported("%s has equality delete files", t)
-		case len(task.DeletionVectorFiles) > 0:
-			return nil, unsupported("%s has deletion vectors", t)
-		}
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
 		f := File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes(), Rows: task.File.Count()}
+		if n := len(task.DeleteFiles) + len(task.DeletionVectorFiles) + len(task.EqualityDeleteFiles); n > 0 {
+			f.Deletes = &Deletes{}
+		}
 		for _, d := range task.DeleteFiles {
 			if format := strings.ToUpper(string(d.FileFormat())); format != "PARQUET" {
 				return nil, unsupported("%s has %s delete files", t, format)
 			}
-			if f.Deletes == nil {
-				f.Deletes = &Deletes{}
-			}
 			f.Deletes.Positions = append(f.Deletes.Positions, d.FilePath())
+		}
+		for _, d := range task.DeletionVectorFiles {
+			off, size := d.ContentOffset(), d.ContentSizeInBytes()
+			if format := strings.ToUpper(string(d.FileFormat())); format != "PUFFIN" || off == nil || size == nil || *off < 0 || *size < 8 {
+				return nil, unsupported("%s has a deletion vector Igloo cannot read (%s)", t, d.FilePath())
+			}
+			f.Deletes.Vectors = append(f.Deletes.Vectors, Vector{Path: d.FilePath(), Offset: *off, Size: *size, Rows: d.Count()})
+		}
+		for _, d := range task.EqualityDeleteFiles {
+			if format := strings.ToUpper(string(d.FileFormat())); format != "PARQUET" {
+				return nil, unsupported("%s has %s delete files", t, format)
+			}
+			ids := d.EqualityFieldIDs()
+			if len(ids) == 0 {
+				return nil, unsupported("%s has an equality delete file without columns", t)
+			}
+			for _, id := range ids {
+				// Fields nested in structs may be compared too; workers compare
+				// columns of the table only.
+				if !slices.ContainsFunc(t.Columns, func(c Column) bool { return c.ID == id && c.Nested == nil }) {
+					return nil, unsupported("%s has equality deletes by field %d, which is not one of its columns", t, id)
+				}
+			}
+			f.Deletes.Equality = append(f.Deletes.Equality, EqualityDelete{Path: d.FilePath(), IDs: slices.Clone(ids)})
 		}
 		files = append(files, f)
 	}

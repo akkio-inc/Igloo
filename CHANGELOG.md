@@ -313,7 +313,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   small tables to it distribute as their queries do.
 - Tables with rows deleted or updated by `DELETE`, `UPDATE` and `MERGE`
   run distributed without waiting for maintenance: workers apply the
-  position delete files those write.
+  position delete files those write, and the equality delete files and
+  deletion vectors of other engines.
 
 ### Tools and integrations
 

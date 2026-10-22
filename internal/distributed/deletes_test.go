@@ -1,24 +1,30 @@
 package distributed
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 )
 
 // positionDeleteIDs are the field IDs Iceberg gives a position delete
 // file's columns.
 const positionDeleteIDs = "file_path: 2147483546, pos: 2147483545"
 
-// TestPositionDeletes checks that workers leave out the rows that position
-// delete files delete, as UPDATE, DELETE and MERGE write them: a file of
-// deletes of one data file, one of a partition's, which names several data
-// files, one that spells a data file's path otherwise than the table's
-// metadata, and one that names a data file it does not apply to, which
-// must delete nothing there.
-func TestPositionDeletes(t *testing.T) {
+// TestDeletes checks that workers leave out the rows that delete files
+// delete. Position delete files, as UPDATE, DELETE and MERGE write them: a
+// file of deletes of one data file, one of a partition's, which names
+// several data files, one that spells a data file's path otherwise than
+// the table's metadata, and one that names a data file it does not apply
+// to, which must delete nothing there. Deletion vectors in a Puffin file.
+// Equality delete files, by one column and by two, one of them written
+// before its column was renamed.
+func TestDeletes(t *testing.T) {
 	h := newHarness(t, 0.01, 2, 3)
 	h.addTable("events", `(SELECT i AS id, i % 13 AS kind, 'e' || i AS name FROM range(40000) t(i))`, 5)
 	tbl := h.tables["events"]
@@ -61,20 +67,70 @@ func TestPositionDeletes(t *testing.T) {
 	d4 := write("d4", span(fs[4].Path, 0, 1000, 1), same)
 	gone = append(append(append(gone, one...), part...), other...)
 
-	fs[0].Deletes = &Deletes{Positions: []string{d1, d4}}
-	fs[1].Deletes = &Deletes{Positions: []string{d2}}
-	fs[2].Deletes = &Deletes{Positions: []string{d2}}
-	fs[3].Deletes = &Deletes{Positions: []string{d3}}
+	// Deletion vectors of files 4 and 2, in one Puffin file.
+	var vecPositions [][]uint32
+	for _, step := range []uint32{5, 11} {
+		var ps []uint32
+		for p := uint32(1); p < 4000; p += step {
+			ps = append(ps, p)
+		}
+		vecPositions = append(vecPositions, ps)
+	}
+	puffin := []byte("PFA1")
+	var vectors []Vector
+	dvPath := filepath.Join(dir, "dv.puffin")
+	for _, ps := range vecPositions {
+		blob := deletionVector(ps)
+		vectors = append(vectors, Vector{Path: dvPath, Offset: int64(len(puffin)), Size: int64(len(blob)), Rows: int64(len(ps))})
+		puffin = append(puffin, blob...)
+	}
+	puffin = append(puffin, []byte("footer")...)
+	if err := os.WriteFile(dvPath, puffin, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range vecPositions[0] {
+		gone = append(gone, deleted{fs[4].Path, int64(p)})
+	}
+	for _, p := range vecPositions[1] {
+		gone = append(gone, deleted{fs[2].Path, int64(p)})
+	}
+
+	// Equality deletes: kinds 3 and 5 of files 1 and 2; ids of file 0, by
+	// id and kind together, NULL matching NULL; kind 7 of file 3, written
+	// when the column had another name.
+	eqWrite := func(name, query, ids string) string {
+		path := filepath.Join(dir, name+".parquet")
+		h.exec(fmt.Sprintf("COPY (%s) TO %s (FORMAT parquet, FIELD_IDS {%s})", query, quoteLiteral(path), ids))
+		return path
+	}
+	e1 := eqWrite("e1", `SELECT * FROM (VALUES (3), (5)) t(kind)`, "kind: 2")
+	e2 := eqWrite("e2", `SELECT * FROM (VALUES (100, 9), (101, 10), (102, NULL)) t(id, kind)`, "id: 1, kind: 2")
+	e3 := eqWrite("e3", `SELECT 7 AS old_kind`, "old_kind: 2")
+	excluded := []string{
+		fmt.Sprintf("d.__f IN (%s, %s) AND kind IN (3, 5)", quoteLiteral(fs[1].Path), quoteLiteral(fs[2].Path)),
+		fmt.Sprintf("d.__f = %s AND (id, kind) IN ((100, 9), (101, 10))", quoteLiteral(fs[0].Path)),
+		fmt.Sprintf("d.__f = %s AND kind = 7", quoteLiteral(fs[3].Path)),
+	}
+
+	fs[0].Deletes = &Deletes{Positions: []string{d1, d4}, Equality: []EqualityDelete{{Path: e2, IDs: []int{2, 1}}}}
+	fs[1].Deletes = &Deletes{Positions: []string{d2}, Equality: []EqualityDelete{{Path: e1, IDs: []int{2}}}}
+	fs[2].Deletes = &Deletes{Positions: []string{d2}, Vectors: vectors[1:], Equality: []EqualityDelete{{Path: e1, IDs: []int{2}}}}
+	fs[3].Deletes = &Deletes{Positions: []string{d3}, Equality: []EqualityDelete{{Path: e3, IDs: []int{2}}}}
+	fs[4].Deletes = &Deletes{Vectors: vectors[:1]}
 
 	var values []string
 	for _, g := range gone {
 		values = append(values, fmt.Sprintf("(%s, %d)", quoteLiteral(g.file), g.pos))
 	}
 	h.exec(fmt.Sprintf(`CREATE OR REPLACE VIEW main.events AS SELECT id, kind, name FROM read_parquet([%s], filename = '__f', file_row_number = true) AS d
-		ANTI JOIN (VALUES %s) AS x(f, r) ON x.f = d.__f AND x.r = d.file_row_number`, strings.Join(quoted(paths(fs)), ", "), strings.Join(values, ", ")))
-	var n int64
-	if err := h.session.QueryRowContext(t.Context(), "SELECT count(*) FROM events").Scan(&n); err != nil || n != 40000-int64(len(gone)) {
-		t.Fatalf("the table has %d rows (%v), want %d", n, err, 40000-len(gone))
+		ANTI JOIN (VALUES %s) AS x(f, r) ON x.f = d.__f AND x.r = d.file_row_number WHERE NOT (%s)`,
+		strings.Join(quoted(paths(fs)), ", "), strings.Join(values, ", "), strings.Join(excluded, ") AND NOT (")))
+	var n, left int64
+	if err := h.session.QueryRowContext(t.Context(), "SELECT count(*) FROM events").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.session.QueryRowContext(t.Context(), "SELECT count(*) FROM events WHERE kind IN (3, 5, 7)").Scan(&left); err != nil || left == 0 || n > 40000-int64(len(gone)) {
+		t.Fatalf("the table has %d rows, %d of kinds 3, 5 and 7 (%v)", n, left, err)
 	}
 
 	for _, q := range []string{
@@ -121,4 +177,40 @@ func TestPositionDeletes(t *testing.T) {
 	if err := w.deletedRows(t.Context(), conn, v, "__igloo_deleted_9"); err == nil || !strings.Contains(err.Error(), "outside the warehouse") {
 		t.Errorf("a delete file outside the warehouse: %v", err)
 	}
+}
+
+// deletionVector serializes positions (ascending, fewer than 4096 in any
+// 65536) as an Iceberg deletion-vector-v1 blob: framed by its length and
+// CRC-32, the magic number and a 64-bit Roaring bitmap of one 32-bit
+// bitmap of array containers, in Roaring's portable format.
+func deletionVector(positions []uint32) []byte {
+	type container struct {
+		key  uint16
+		vals []uint16
+	}
+	var cs []container
+	for _, p := range positions {
+		if len(cs) == 0 || cs[len(cs)-1].key != uint16(p>>16) {
+			cs = append(cs, container{key: uint16(p >> 16)})
+		}
+		cs[len(cs)-1].vals = append(cs[len(cs)-1].vals, uint16(p))
+	}
+	v := binary.LittleEndian.AppendUint32(nil, deletefiles.PortableBitmapMagic)
+	v = binary.LittleEndian.AppendUint64(v, 1)
+	v = binary.LittleEndian.AppendUint32(v, 0)
+	v = binary.LittleEndian.AppendUint32(v, deletefiles.RoaringCookieNoRun)
+	v = binary.LittleEndian.AppendUint32(v, uint32(len(cs)))
+	for _, c := range cs {
+		v = binary.LittleEndian.AppendUint16(v, c.key)
+		v = binary.LittleEndian.AppendUint16(v, uint16(len(c.vals)-1))
+	}
+	v = append(v, make([]byte, 4*len(cs))...)
+	for _, c := range cs {
+		for _, x := range c.vals {
+			v = binary.LittleEndian.AppendUint16(v, x)
+		}
+	}
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(v)))
+	out = append(out, v...)
+	return binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(v))
 }

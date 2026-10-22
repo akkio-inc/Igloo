@@ -113,9 +113,11 @@ In detail, a part runs distributed when:
   them, or joins small tables to them, distributes like its query. A view
   that groups, sorts or limits, or has common table expressions, keeps the
   part on one machine.
-- Its tables may have rows deleted by position delete files, as
-  `UPDATE`, `DELETE` and `MERGE` write them: workers leave those rows out,
-  so a table distributes without waiting for maintenance to merge them.
+- Its tables may have deleted rows: workers leave out the rows that
+  position delete files delete, as `UPDATE`, `DELETE` and `MERGE` write
+  them, and those of the equality delete files and deletion vectors other
+  engines write, so a table distributes without waiting for maintenance
+  to merge them.
 - Its tables' columns may be nested: lists, maps and structs, Snowflake's
   `ARRAY` (`VARCHAR[]`) and `OBJECT` (`MAP(VARCHAR, VARCHAR)`) columns
   among them. Workers read them, and the fields nested in them, by their
@@ -131,8 +133,7 @@ window functions over rows, a large table joined to
 itself or read again in a subquery (TPC-H Q17, Q18, Q20, Q21), three large
 tables joined on different keys, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
-equality delete files or deletion vectors, which other engines write
-(maintenance merges them within the hour), with
+equality deletes of fields nested in structs, with
 data files that have no Iceberg field IDs (files added from outside and
 read through a name mapping) or that nest a struct's fields otherwise
 than the table does now (a field renamed, or dropped and added again,
@@ -444,10 +445,8 @@ machine's memory run where that machine would run out of memory.
   top rows are kept: a `GROUP BY` with billions of groups sends every
   worker's groups to it. (`count(DISTINCT x)` over billions of values sends
   it one row per group and partition.)
-- Tables with equality delete files or deletion vectors, which engines
-  other than Igloo write, data files without field IDs, views that group,
-  sort or limit, and time travel run on one machine. Workers apply
-  position delete files, which `UPDATE`, `DELETE` and `MERGE` write.
+- Tables with data files without field IDs, views that group, sort or
+  limit, and time travel run on one machine.
 - Workers read each table's files directly and do not use Iceberg partition
   statistics to skip files; DuckDB skips row groups by their Parquet
   statistics instead.
