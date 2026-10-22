@@ -1,6 +1,8 @@
 package distributed
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -298,6 +300,54 @@ func TestSharedFiles(t *testing.T) {
 	h.exec("CREATE OR REPLACE VIEW main.lineitem_clone AS SELECT * FROM lineitem")
 	if !h.check(`SELECT l_returnflag, count(*), sum(l_quantity) FROM lineitem_clone GROUP BY 1 ORDER BY 1`) {
 		t.Error("did not run distributed")
+	}
+}
+
+// instantSource lists tables' files from memory, at once.
+type instantSource struct{ files map[string][]File }
+
+func (s instantSource) Table(context.Context, string, string) (*Table, error) {
+	return nil, errors.New("not a catalog")
+}
+
+func (s instantSource) Files(_ context.Context, t *Table) ([]File, error) {
+	return s.files[t.key()], nil
+}
+
+func (s instantSource) Refresh(context.Context, *Table) error { return nil }
+
+func (s instantSource) RemoveAll(context.Context, *Table, string) error { return nil }
+
+// TestLoadTableReadTwice checks that a table several stages read keeps the
+// files listed for it, however soon its listing finishes. When the listing
+// finished before the coordinator came to the table's second read, which
+// many other tables' reads between the two make likely, the statement once
+// read the table as empty.
+func TestLoadTableReadTwice(t *testing.T) {
+	read := func(tb *Table) *Stage {
+		return &Stage{Inputs: []Input{{View: "__igloo_split", Table: tb, Split: true}}}
+	}
+	src := instantSource{files: map[string][]File{}}
+	var tables []*Table
+	var stages []*Stage
+	for i := range 100 {
+		tb := &Table{Schema: "main", Name: fmt.Sprintf("t%d", i)}
+		src.files[tb.key()] = []File{{Path: tb.Name + ".parquet", Rows: 1}}
+		tables = append(tables, tb)
+		stages = append(stages, read(tb))
+	}
+	stages = append(stages, read(tables[0]))
+	co := &Coordinator{opts: Options{Source: src}}
+	for range 20 {
+		snapshots, files, err := co.load(t.Context(), stages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tb := range tables {
+			if snapshots[tb.key()] != tb || len(files[tb.key()]) != 1 {
+				t.Fatalf("%s: snapshot %v, files %v", tb, snapshots[tb.key()], files[tb.key()])
+			}
+		}
 	}
 }
 

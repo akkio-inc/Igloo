@@ -336,42 +336,14 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 
 	// Each table's current snapshot and its files, once per statement, so
 	// the statement sees every commit made before it.
-	files := map[string][]File{}
-	snapshots := map[string]*Table{}
-	var mu sync.Mutex
-	g, gctx := errgroup.WithContext(ctx)
-	var anyTable *Table
-	for _, s := range plan.Stages {
-		for _, in := range s.Inputs {
-			t := in.Table
-			if t == nil {
-				continue
-			}
-			anyTable = t
-			mu.Lock()
-			_, seen := files[t.key()]
-			files[t.key()] = nil
-			if !seen {
-				snapshots[t.key()] = t
-			}
-			mu.Unlock()
-			if seen {
-				continue
-			}
-			g.Go(func() error {
-				if err := co.opts.Source.Refresh(gctx, t); err != nil {
-					return err
-				}
-				fs, err := co.opts.Source.Files(gctx, t)
-				mu.Lock()
-				files[t.key()] = fs
-				mu.Unlock()
-				return err
-			})
-		}
-	}
-	if err := g.Wait(); err != nil {
+	snapshots, files, err := co.load(ctx, plan.Stages)
+	if err != nil {
 		return nil, err
+	}
+	var anyTable *Table
+	for _, t := range snapshots {
+		anyTable = t
+		break
 	}
 	for _, key := range plan.pins {
 		if t := snapshots[key]; t.Versioned && t.Snapshot == 0 {
@@ -443,6 +415,43 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	co.opts.Metrics.query("ok", start)
 	ok = true
 	return ex, nil
+}
+
+// load brings every table the stages read to its current snapshot and lists
+// its data files, once per table: the tables and their files, by key. The
+// tables are all collected before any listing starts, so that nothing but
+// its listing writes a table's files, however many inputs read it.
+func (co *Coordinator) load(ctx context.Context, stages []*Stage) (map[string]*Table, map[string][]File, error) {
+	tables := map[string]*Table{}
+	for _, s := range stages {
+		for _, in := range s.Inputs {
+			if t := in.Table; t != nil && tables[t.key()] == nil {
+				tables[t.key()] = t
+			}
+		}
+	}
+	files := make(map[string][]File, len(tables))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	for key, t := range tables {
+		g.Go(func() error {
+			if err := co.opts.Source.Refresh(gctx, t); err != nil {
+				return err
+			}
+			fs, err := co.opts.Source.Files(gctx, t)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			files[key] = fs
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
+	}
+	return tables, files, nil
 }
 
 // pin points the coordinator's own reads, in final, of tables the jobs
