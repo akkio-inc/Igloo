@@ -277,7 +277,7 @@ func (t *translator) paths(nodes []*node) ([]*node, error) {
 		case t.isFlattenColumn(nodes, i):
 			start = qualifiedStart(nodes, i)
 			base = nodes[start : i+1]
-			v = &variant{base: seq(base, base...), json: true, obj: t.structReads[nodes[i]]}
+			v = &variant{base: seq(base, base...), json: true, obj: t.structReads[nodes[i]], elem: t.elemReads[nodes[i]]}
 			i++
 		default:
 			continue

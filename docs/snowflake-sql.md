@@ -156,12 +156,18 @@ JSON and JSON text alike.
   `FLATTEN(INPUT => f.value:items)` unnests an `ARRAY` column's list from
   the struct without writing it as JSON text, parsing it back or a
   dependent join (over 29 million elements of 2 million rows' five lists,
-  0.4 s instead of 1.6 s). A `WHERE` there stays out of the joins: its
+  0.4 s instead of 1.6 s). When the objects are built from one `FROM` item's
+  columns and the select reads only their keys, that item's select list
+  unnests them, and a second select list around it unnests a second
+  `FLATTEN`'s key, with no lateral join at all. DuckDB makes a lateral
+  `FLATTEN` of string columns a dependent join, and one of structs too once
+  it pushes a filter down onto it, such as a BI tool's outer `WHERE` on a key
+  the report groups by. Otherwise a `WHERE` there stays out of the joins: its
   conditions on the tables go into the `ON` of the first `FLATTEN`'s join,
   which DuckDB pushes down to the tables, those on the objects' keys filter
-  the objects, and those on a second `FLATTEN`'s elements filter the
-  elements when the statement reads nothing of that `FLATTEN` but its
-  `VALUE`. Any other read of `VALUE`, a star at that level, a subquery that
+  the objects, and those on a second `FLATTEN`'s elements filter the elements
+  when the statement reads nothing of that `FLATTEN` but its `VALUE`. Any
+  other read of `VALUE`, a star at that level, a subquery that
   names the alias, or a second `FLATTEN` of it with `OUTER`, `PATH` or a
   longer path keeps the objects JSON; so do, when a second `FLATTEN` reads
   them, a `WHERE` that cannot stay out of the joins (a condition on another

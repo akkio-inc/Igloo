@@ -849,7 +849,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   A `FLATTEN`'s `KEY`, `PATH`, `INDEX` and `THIS` count as read only where
   its own select names them, so a column of one of those names elsewhere,
   as reports name an `INDEX`, no longer keeps a second `FLATTEN`'s elements
-  unfiltered and the objects JSON.
+  unfiltered and the objects JSON. Objects built from one `FROM` item's
+  columns, and a second `FLATTEN` of one of their keys, are unnested in
+  that item's select list rather than in lateral joins, and still run
+  distributed: DuckDB pushes a filter, such as a BI tool's outer `WHERE`
+  on a key a report groups by, down onto a lateral `FLATTEN`, which made
+  it a dependent join, and one over structs of lists cost more than over
+  JSON text, so reports' behaviors and signals ran slower on real data
+  than as JSON. With such a filter, objects of three lists took 1.8 s for
+  2 million rows and take 0.4 s; objects of strings 0.8 s and 0.4 s.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

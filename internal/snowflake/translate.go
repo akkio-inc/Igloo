@@ -63,6 +63,12 @@ type translator struct {
 	structs     map[*node]*structFlatten
 	structReads map[*node]*structFlatten
 	onlyValues  map[*node]bool
+	// hoists holds the FLATTENs hoisted into their FROM items' select
+	// lists, and their readers, by argument groups, and elemReads the reads
+	// of those readers' VALUE, by VALUE's nodes, with what they read (see
+	// hoistOf).
+	hoists      map[*node]*hoist
+	elemReads   map[*node]string
 	flattenOuts map[*node]string
 	structOuts  map[*node]*structOut
 	folds       map[*node]*structFold
@@ -102,7 +108,7 @@ func Translate(sql string, opts Options) (Result, error) {
 	}
 	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{},
 		names: map[string]int{}, columnNames: map[string]int{}, structs: map[*node]*structFlatten{},
-		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
+		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, hoists: map[*node]*hoist{}, elemReads: map[*node]string{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
 		folds: map[*node]*structFold{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {

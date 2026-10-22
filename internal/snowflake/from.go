@@ -151,6 +151,8 @@ var joinEndWords = map[string]bool{
 // GENERATOR, and TABLE(f(...)) of other table functions.
 func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 	var flats []flattened
+	removed := map[*node]bool{}
+	var hoists []*hoist
 	for i := 0; i < len(nodes); i++ {
 		n := nodes[i]
 		w := n.word()
@@ -216,6 +218,19 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		switch fn {
 		case "FLATTEN":
 			st := t.structs[call]
+			if h := t.hoists[call]; h != nil {
+				// Hoisted into its FROM item's select list (see hoistOf).
+				if call != h.reader {
+					if h.list, err = t.hoistList(call, h); err != nil {
+						return nil, err
+					}
+					hoists = append(hoists, h)
+				}
+				out = raw("")
+				removed[out] = true
+				flats = append(flats, flattened{alias: alias, out: out, structs: true})
+				break
+			}
 			if alias == "" {
 				t.gen++
 				alias = "flatten"
@@ -246,6 +261,12 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		out.pos, out.end = nodes[start].pos, nodes[end-1].end
 		nodes = replace(nodes, start, end, out)
 		i = start
+	}
+	if len(hoists) > 0 {
+		var err error
+		if nodes, err = hoistStructs(nodes, removed, hoists); err != nil {
+			return nil, err
+		}
 	}
 	return whereOn(jsonAhead(nodes, flats), flats), nil
 }

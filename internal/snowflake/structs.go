@@ -34,6 +34,10 @@ type structFlatten struct {
 	// which of them have a value other than a string literal.
 	keys    []string
 	general []bool
+	// base, when set, is the struct that reads of its VALUE read in place
+	// of alias._sf_fields: the column of the select list it is hoisted into
+	// (see hoistOf).
+	base string
 }
 
 // objectParts are the keys and values of an OBJECT_CONSTRUCT whose keys are
@@ -152,19 +156,214 @@ func (t *translator) collectStructs(nodes []*node) {
 			t.onlyValues[f.args] = true
 		}
 	}
+	hoisted := map[*node]bool{} // the FROM items' alias nodes
 	for _, f := range flats {
 		s := structInput(f.args)
-		if s == nil || f.up == "VALUE" || selectsStar(f.level) || !valueKept(f.cols) || !readInPlace(f.level, f.i, f.up) ||
-			t.filters(f.level, f.i, f.up) {
+		if s == nil || f.up == "VALUE" || selectsStar(f.level) || !valueKept(f.cols) || !readInPlace(f.level, f.i, f.up) {
 			continue
 		}
-		if reads, ok := readsOnlyByKey(f.level, f.alias, f.up, colLists); ok {
-			t.structs[f.args] = s
-			for _, r := range reads {
-				t.structReads[r] = s
+		reads, ok := readsOnlyByKey(f.level, f.alias, f.up, colLists)
+		if !ok {
+			continue
+		}
+		h := t.hoistOf(f.level, f.i, f.up, f.args, reads, s, colLists)
+		if h != nil && hoisted[h.item] {
+			h = nil // one unnest a select list can zip, not two
+		}
+		if h == nil && t.filters(f.level, f.i, f.up) {
+			continue
+		}
+		t.structs[f.args] = s
+		for r := range reads {
+			t.structReads[r] = s
+		}
+		if h == nil {
+			continue
+		}
+		hoisted[h.item] = true
+		s.base = h.alias + "._sf_t"
+		t.hoists[f.args] = h
+		if h.reader != nil {
+			t.hoists[h.reader] = h
+			for _, r := range h.elems {
+				t.elemReads[r] = h.alias + "._sf_e"
 			}
 		}
 	}
+}
+
+// hoist is a FLATTEN of structs that its FROM item's select list unnests
+// (see hoistStructs): the item's alias as written and upper-cased, and the
+// alias's node; the FLATTEN's keys and its list of structs; and the index
+// of the key that a second FLATTEN unnests, a reader, with its arguments,
+// MODE and the nodes of its VALUE's reads.
+type hoist struct {
+	alias  string
+	up     string
+	item   *node
+	s      *structFlatten
+	key    int
+	reader *node
+	mode   string
+	elems  []*node
+	list   *node
+}
+
+// hoistOf decides whether the FLATTEN of structs at nodes[i], aliased up
+// (upper case), with arguments args and its VALUE's reads (and their keys)
+// reads, is hoisted into its FROM item's select list. DuckDB plans a FLATTEN
+// as a dependent join when a filter is pushed onto its output, as reports'
+// outer queries filter by the keys they group by (2.3 s against 1.8 s as
+// JSON for 3 million rows of three lists), and when it reads a string or
+// number column; an unnest in a select list is neither (0.48 s), and DuckDB
+// distributes it. The FLATTEN must read the columns of one FROM item before
+// it at that level, qualified, and be joined plainly; its select must name
+// it only by its VALUE's keys; and at most one later FLATTEN, which must
+// flatten one key of it and be read only by its VALUE, may read it, which
+// a second select list around the first unnests: as fast as DuckDB's
+// unnests of laterals where nothing is pushed onto them (0.24 s), where an
+// unnest of (object, element) pairs built in one select list took 0.28 s.
+func (t *translator) hoistOf(nodes []*node, i int, up string, args *node, reads map[*node]string, s *structFlatten,
+	colLists map[*node]bool) *hoist {
+	if _, _, _, _, ok := whereClause(nodes); !ok || !t.onlyValues[args] || !onlyValue(nodes, up) || !plainlyJoined(nodes, i) {
+		return nil
+	}
+	q := qualifiers(args.kids)
+	if len(q) != 1 || q[up] || unqualified(args.kids) {
+		return nil
+	}
+	var item string
+	for name := range q {
+		item = name
+	}
+	_, end, alias, ok := fromItem(nodes, item)
+	if !ok || end > i {
+		return nil
+	}
+	h := &hoist{alias: alias, up: item, item: nodes[end-1], s: s, key: -1}
+	rs := readers(nodes, i, up)
+	switch len(rs) {
+	case 0:
+		return h
+	case 1:
+	default:
+		return nil
+	}
+	vArgs, after, _ := flattenAt(nodes, rs[0])
+	a := aliasIndex(nodes, after)
+	if a < 0 || !t.onlyValues[vArgs] || !plainlyJoined(nodes, rs[0]) {
+		return nil
+	}
+	name, _, _ := nodes[a].name()
+	v := strings.ToUpper(name)
+	if !onlyValue(nodes, v) {
+		return nil
+	}
+	// The key it flattens.
+	key := ""
+	for r, k := range reads {
+		walk(vArgs, func(n *node) {
+			if n == r {
+				key = k
+			}
+		})
+	}
+	h.key = s.key(key)
+	if h.key < 0 {
+		return nil
+	}
+	h.reader, h.mode = vArgs, "BOTH"
+	for _, a := range splitArgs(vArgs.kids) {
+		if idx := sig(a); len(idx) >= 3 && a[idx[0]].word() == "MODE" && a[idx[1]].isOp("=>") {
+			m, _ := a[idx[2]].stringValue()
+			h.mode = strings.ToUpper(m)
+		}
+	}
+	h.elems = valueReads(nodes, v, colLists)
+	return h
+}
+
+// plainlyJoined reports whether the FROM item at nodes[i] is joined by a
+// comma or a JOIN without ON or USING.
+func plainlyJoined(nodes []*node, i int) bool {
+	p := prevSig(nodes, i)
+	if p >= 0 && nodes[p].word() == "LATERAL" {
+		p = prevSig(nodes, p)
+	}
+	if p < 0 || !nodes[p].isOp(",") && nodes[p].word() != "JOIN" {
+		return false
+	}
+	if p := prevSig(nodes, p); p >= 0 && (nodes[p].word() == "LEFT" || nodes[p].word() == "RIGHT" || nodes[p].word() == "FULL" ||
+		nodes[p].word() == "OUTER" || nodes[p].word() == "NATURAL") {
+		return false
+	}
+	_, after, _ := flattenAt(nodes, i)
+	a := aliasIndex(nodes, after)
+	if a < 0 {
+		return false
+	}
+	end := a
+	if k := nextSig(nodes, a); k >= 0 && nodes[k].isGroup('(') {
+		end = k
+	}
+	q := nextSig(nodes, end)
+	return q < 0 || nodes[q].word() != "ON" && nodes[q].word() != "USING"
+}
+
+// unqualified reports whether nodes, an expression as written, may name a
+// column unqualified: a word that is not a keyword, a call, a qualifier, a
+// type after AS or ::, or a named argument.
+func unqualified(nodes []*node) bool {
+	found := false
+	var walk func(nodes []*node)
+	walk = func(nodes []*node) {
+		for i, n := range nodes {
+			if n.kind == kGroup {
+				walk(n.kids)
+			}
+			if n.kind != kWord && n.kind != kQuoted {
+				continue
+			}
+			p, q := prevSig(nodes, i), nextSig(nodes, i)
+			switch w := n.word(); {
+			case q >= 0 && (nodes[q].isOp(".") || nodes[q].isGroup('(') || nodes[q].isOp("=>")):
+			case p >= 0 && (nodes[p].isOp(".") || nodes[p].isOp("::") || nodes[p].isOp(":") || nodes[p].word() == "AS"):
+			case nonOperandWords[w], w == "NULL", w == "TRUE", w == "FALSE", w == "END":
+			default:
+				found = true
+			}
+		}
+	}
+	walk(nodes)
+	return found
+}
+
+// valueReads returns the nodes of the reads of alias.VALUE (alias upper
+// case) in nodes and what they nest, outside FLATTENs' column lists.
+func valueReads(nodes []*node, alias string, colLists map[*node]bool) []*node {
+	var out []*node
+	var walk func(nodes []*node)
+	walk = func(nodes []*node) {
+		for i, n := range nodes {
+			if n.kind == kGroup && !colLists[n] {
+				walk(n.kids)
+			}
+			if n.word() != "VALUE" {
+				continue
+			}
+			p := prevSig(nodes, i)
+			if p < 0 || !nodes[p].isOp(".") {
+				continue
+			}
+			if q := prevSig(nodes, p); q >= 0 {
+				if name, _, ok := nodes[q].name(); ok && strings.ToUpper(name) == alias {
+					out = append(out, n)
+				}
+			}
+		}
+	}
+	walk(nodes)
+	return out
 }
 
 // otherColumnsRead reports whether a select, nodes, or what it nests may
@@ -232,8 +431,9 @@ func otherColumnsRead(nodes []*node, alias string, cols *node, colLists map[*nod
 // the VALUE of the FLATTEN aliased by the node alias (upper-cased up) only
 // by a key (see readsByKey), name the alias only to qualify columns, and
 // name no VALUE unqualified, outside FLATTENs' column lists (colLists), nor
-// the alias in a subquery; it returns the reads' VALUE nodes.
-func readsOnlyByKey(nodes []*node, alias *node, up string, colLists map[*node]bool) (reads []*node, ok bool) {
+// the alias in a subquery; it returns the reads' VALUE nodes and their keys.
+func readsOnlyByKey(nodes []*node, alias *node, up string, colLists map[*node]bool) (reads map[*node]string, ok bool) {
+	reads = map[*node]string{}
 	ok = true
 	var check func(nodes []*node, call string, nested bool)
 	check = func(nodes []*node, call string, nested bool) {
@@ -275,10 +475,11 @@ func readsOnlyByKey(nodes []*node, alias *node, up string, colLists map[*node]bo
 				case !isCol:
 					ok = false
 				case strings.ToUpper(col) == "VALUE":
-					if !readsByKey(nodes, i, r, call) {
+					key, byKey := readKey(nodes, i, r, call)
+					if !byKey {
 						ok = false
 					}
-					reads = append(reads, nodes[r])
+					reads[nodes[r]] = key
 				}
 			}
 		}
@@ -633,42 +834,55 @@ func valueKept(cols *node) bool {
 }
 
 // readsByKey reports whether alias.VALUE, nodes[a] to nodes[r], is read by
-// a key: followed by :key or ['key'], or the first argument of GET_PATH of
-// a path that starts with a key, or of GET of a key, where call is the
-// function whose arguments nodes are.
+// a key (see readKey).
 func readsByKey(nodes []*node, a, r int, call string) bool {
+	_, ok := readKey(nodes, a, r, call)
+	return ok
+}
+
+// readKey returns the key that alias.VALUE, nodes[a] to nodes[r], is read
+// by: the key after it, :key or ['key'], or the first of the path of
+// GET_PATH of it, or the key of GET of it, where call is the function whose
+// arguments nodes are.
+func readKey(nodes []*node, a, r int, call string) (string, bool) {
 	if nodes[r].kind != kWord {
-		return false
+		return "", false
 	}
 	if r+1 < len(nodes) && nodes[r+1].isGroup('[') {
 		k := trim(nodes[r+1].kids)
 		if len(k) != 1 {
-			return false
+			return "", false
 		}
-		_, ok := k[0].stringValue()
-		return ok
+		return k[0].stringValue()
 	}
 	if q := nextSig(nodes, r); q >= 0 && nodes[q].isOp(":") {
 		k := nextSig(nodes, q)
-		return k >= 0 && (nodes[k].kind == kWord || nodes[k].kind == kQuoted)
+		if k < 0 || nodes[k].kind != kWord && nodes[k].kind != kQuoted {
+			return "", false
+		}
+		name, _, _ := nodes[k].name()
+		return name, true
 	}
 	if call != "GET_PATH" && call != "GET" {
-		return false
+		return "", false
 	}
 	args := splitArgs(nodes)
 	if len(args) != 2 || len(sig(args[0])) != 3 || trim(args[0])[0] != nodes[a] {
-		return false
+		return "", false
 	}
 	lit := trim(args[1])
 	if len(lit) != 1 {
-		return false
+		return "", false
 	}
 	s, ok := lit[0].stringValue()
 	if !ok || call == "GET" {
-		return ok
+		return s, ok
 	}
 	segs, err := parsePath(s)
-	return err == nil && len(segs) > 0 && !segs[0].isIndex
+	if err != nil || len(segs) == 0 || segs[0].isIndex {
+		return "", false
+	}
+	return segs[0].key, true
 }
 
 // structInput reads a FLATTEN's arguments, as written, for flattenStructs:
@@ -840,6 +1054,73 @@ func structOf(s *structFlatten, o *objectParts, k int) *node {
 	return seq(nil, append(kids, raw("}"))...)
 }
 
+// hoistList is the list of structs that the select list of a hoisted
+// FLATTEN's FROM item unnests (see hoistOf), from the FLATTEN's argument
+// group g.
+func (t *translator) hoistList(g *node, h *hoist) (*node, error) {
+	pos, named := t.tableArgs(g)
+	input := named["INPUT"]
+	if input == nil && len(pos) > 0 {
+		input = pos[0]
+	}
+	in := flattenInput(input)
+	kids := []*node{raw("[")}
+	for k, e := range in.elems {
+		if e.obj == nil {
+			return nil, &Error{Code: CodeSyntax, Message: "expected OBJECT_CONSTRUCT in FLATTEN's INPUT"}
+		}
+		if k > 0 {
+			kids = append(kids, raw(", "))
+		}
+		kids = append(kids, structOf(h.s, e.obj, k))
+	}
+	return seq(nil, append(kids, raw("]"))...), nil
+}
+
+// hoistStructs takes out of a level of a statement its hoisted FLATTENs,
+// what tableFunctions left of them (removed), and the comma or JOIN before
+// each, and makes each FROM item they read a subquery whose select list
+// unnests their list as _sf_t: FROM m, LATERAL FLATTEN(...) t becomes FROM
+// (SELECT m.*, unnest([...]) AS _sf_t FROM m) AS m; with a reader, another
+// around that unnests the key it flattens as _sf_e.
+func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*node, error) {
+	for k := 0; k < len(nodes); k++ {
+		if !removed[nodes[k]] {
+			continue
+		}
+		start := k
+		if p := prevSig(nodes, k); p >= 0 && nodes[p].isOp(",") {
+			start = p
+		} else if p >= 0 && nodes[p].word() == "JOIN" {
+			start = p
+			if c := prevSig(nodes, p); c >= 0 && (nodes[c].word() == "CROSS" || nodes[c].word() == "INNER") {
+				start = c
+			}
+		}
+		for start > 0 && nodes[start-1].kind == kSpace {
+			start--
+		}
+		nodes = replace(nodes, start, k+1)
+		k = start - 1
+	}
+	for _, h := range hoists {
+		start, end, alias, ok := fromItem(nodes, h.up)
+		if !ok {
+			return nil, &Error{Code: CodeSyntax, Message: "FLATTEN reads a FROM item that is not there: " + h.alias}
+		}
+		item := nodes[start:end]
+		out := seq(item, append(append([]*node{raw("(SELECT " + alias + ".*, unnest("), h.list, raw(") AS _sf_t FROM ")}, item...),
+			raw(") AS "+alias))...)
+		if h.reader != nil {
+			l, _, j := h.s.parts(alias+"._sf_t", h.key)
+			out = seq(item, raw("(SELECT "+alias+".*, unnest(sf_parts_values("+l+", "+j+", "+quoteString(h.mode)+")) AS _sf_e FROM "), out,
+				raw(") AS "+alias))
+		}
+		nodes = replace(nodes, start, end, out)
+	}
+	return nodes, nil
+}
+
 // structParts are the list, string and JSON parts of an object's value x
 // (nil for none): a string literal as the string, a constant list of
 // strings as the list, and anything else as the one of the three that its
@@ -903,6 +1184,9 @@ func (v *variant) structRead() (string, bool) {
 		return "", false
 	}
 	x := structColumn(v.base)
+	if v.obj.base != "" {
+		x = v.obj.base
+	}
 	if v.elem != "" {
 		x = v.elem
 	}
