@@ -762,6 +762,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- When Igloo is about to run out of memory, it cancels the statement that
+  has run longest (SQLSTATE `53200`) instead of being killed by the kernel
+  with every session. DuckDB keeps to its memory limit only for the memory
+  its buffer manager tracks: a reservoir sample of 600,000 rows of 60 text
+  columns took 7.8 GB under a 500 MB limit, and one of a million rows of a
+  384-column table took a replica down on a 32 GB machine. See
+  [operations](docs/operations.md#sizing).
 - A statement with thousands of casts, such as a column profile of a wide
   table in Snowflake's dialect, is prepared in time that grows with its
   length rather than its square: Igloo's rewrite of catalog casts lexed the

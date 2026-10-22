@@ -38,6 +38,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sharing"
@@ -570,9 +571,11 @@ type session struct {
 	user    auth.User
 	checked time.Time
 	running context.CancelFunc
-	// statement and started describe the running statement.
+	// statement and started describe the running statement; shed says
+	// ShedMemory canceled it.
 	statement string
 	started   time.Time
+	shed      bool
 	// privs are the user's grants, loaded when first needed.
 	privs privilegeSnapshot
 	// fixed, when set, are the session's grants for good, and its user is
@@ -774,6 +777,10 @@ func (s *Server) releaseConn() { s.conns.Add(-1) }
 // errStatementTimeout matches PostgreSQL's message for the same event.
 var errStatementTimeout = pgerror.WithCode(errors.New("canceling statement due to statement timeout"), codes.QueryCanceled)
 
+// errMemoryShed is what a statement ShedMemory canceled fails with.
+var errMemoryShed = pgerror.WithCode(errors.New("canceling statement: the server was running out of memory, "+
+	"and this statement had run the longest; run it again, or on less data at a time"), codes.OutOfMemory)
+
 // runCancelable runs fn with a context that a cancel request, or the
 // session's statement timeout, can end. query is the statement as the
 // client sent it, which the console lists while it runs.
@@ -786,7 +793,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started = cancel, redactQuery(query), time.Now()
+	sess.running, sess.statement, sess.started, sess.shed = cancel, redactQuery(query), time.Now(), false
 	sess.mu.Unlock()
 
 	defer func() {
@@ -807,7 +814,54 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errStatementTimeout
 	}
+	if err != nil && ctx.Err() != nil {
+		sess.mu.Lock()
+		shed := sess.shed
+		sess.mu.Unlock()
+		if shed {
+			return errMemoryShed
+		}
+	}
 	return err
+}
+
+// ShedMemory cancels the statement that has run longest on this replica,
+// for memlimit.Watch, when the process is about to run out of memory:
+// DuckDB keeps to its memory limit only for what its buffer manager
+// tracks, and the kernel would otherwise kill the process, and every
+// session with it. The statement fails with SQLSTATE 53200
+// (out_of_memory). It reports whether a statement was running.
+func (s *Server) ShedMemory(available int64) bool {
+	r := s.sessions
+	r.mu.Lock()
+	all := make([]*session, 0, len(r.byPID))
+	for _, sess := range r.byPID {
+		all = append(all, sess)
+	}
+	r.mu.Unlock()
+	var longest *session
+	var since time.Time
+	for _, sess := range all {
+		sess.mu.Lock()
+		if sess.running != nil && (longest == nil || sess.started.Before(since)) {
+			longest, since = sess, sess.started
+		}
+		sess.mu.Unlock()
+	}
+	if longest == nil {
+		s.log.Warn("memory is running out, and no statement is running to cancel", "available", memlimit.Format(available))
+		return false
+	}
+	longest.mu.Lock()
+	defer longest.mu.Unlock()
+	if longest.running == nil {
+		return false
+	}
+	longest.shed = true
+	longest.running()
+	s.log.Warn("memory is running out; canceled the statement that had run longest", "available", memlimit.Format(available),
+		"user", longest.user.Name, "pid", longest.pid, "running_for", time.Since(longest.started).Round(time.Millisecond))
+	return true
 }
 
 // observe updates transaction state after a statement runs, so ReadyForQuery

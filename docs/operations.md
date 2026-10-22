@@ -240,6 +240,18 @@ using all of its cores.
   limit yourself. If other services share the machine, as the bundled
   Postgres, catalog and object store of the single-machine stack do, lower
   `IGLOO_DUCKDB_MEMORY_LIMIT` by what they use.
+- **Running out of memory.** DuckDB keeps to its limit only for the memory
+  its buffer manager tracks; some of its work does not (a reservoir sample,
+  `USING SAMPLE 1000000 ROWS`, of a wide table can take many times the
+  limit). So Igloo watches what it can still allocate, five times a
+  second: what the container's memory limit leaves of its working set, and
+  the machine's available memory. When that falls below a thirty-second of
+  Igloo's memory (at least 256 MiB), Igloo cancels the statement that has
+  run longest, which fails with SQLSTATE `53200` (`out_of_memory`), rather
+  than let the kernel kill the process and every session with it. It logs
+  `memory is running out; canceled the statement that had run longest`
+  with the user and session, and cancels another only if memory has not
+  come back within 15 seconds, or keeps running out meanwhile.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk, local
   NVMe where the machine has it ([spill on local NVMe](#spill-on-local-nvme)),

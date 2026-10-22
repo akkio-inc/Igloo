@@ -422,6 +422,13 @@ func serve() error {
 	if srv, err = pgwire.New(eng, opts, log); err != nil {
 		return err
 	}
+	// Some of DuckDB's work ignores its memory limit; rather than let the
+	// kernel kill the process, cancel the statement that has run longest
+	// when memory runs low (see memlimit.Watch).
+	if memory.Total > 0 {
+		go memlimit.Watch(ctx, memory.Total, srv.ShedMemory)
+		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(memory.Total)))
+	}
 	if shares != nil {
 		// Tables with masking or row access policies are neither shared
 		// nor served; until now the sharing endpoint served none.
