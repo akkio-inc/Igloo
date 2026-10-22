@@ -246,7 +246,7 @@ func TestFlattenShapes(t *testing.T) {
 		{`select m.a, v.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g, lateral flatten(input => g.value) v`,
 			`from tab m, LATERAL`, `REPLACE`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g, lateral flatten(input => g.value) v where m.a is not null`,
-			`from tab m, LATERAL`, `REPLACE`},
+			`from tab m CROSS JOIN LATERAL`, `REPLACE`},
 		{`select g.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g`, `from tab m, LATERAL`, `REPLACE`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g, lateral flatten(input => g.value) v union all select m.a from tab2 m`,
 			`from tab m, LATERAL`, `REPLACE`},
@@ -309,6 +309,11 @@ func TestFlattenShapes(t *testing.T) {
 			`from t  join LATERAL (SELECT`, `cross`},
 		{`select count(*) from t inner join u on u.id = t.id, lateral flatten(input => t.a) as f(seq, key, path, index, value, this) where u.k = 'x'`,
 			`inner join u on u.id = t.id JOIN LATERAL`, `where`},
+		{`select v.value from t, lateral flatten(input => t.a) f, lateral flatten(input => f.value) v where t.id > 1`,
+			`from t CROSS JOIN LATERAL (SELECT`, `where`},
+		{`select v.value from t join u on u.id = t.id, lateral flatten(input => t.a) f, lateral flatten(input => f.value) v where t.id > 1`,
+			`from t join u on u.id = t.id CROSS JOIN LATERAL (SELECT`, `where`},
+		{`select v.value from t, u join w on w.id = u.id, lateral flatten(input => t.a) f where t.id > 1`, `where t.id > 1`, `ON (`},
 		{`select t.id + 1 as n, f.value from t, lateral flatten(input => t.a) f where n > 1`, `where n > 1`, `ON (`},
 		{`select f.value from t left join u on u.id = t.id, lateral flatten(input => t.a) f where t.id > 1`, `where t.id > 1`, `ON (`},
 		{`select f.value from t, lateral flatten(input => t.a) f where t.id in (select id from u)`, `where t.id in`, `ON (`},
@@ -381,6 +386,11 @@ func TestFlattenWhere(t *testing.T) {
 			"1|1\n2|1"},
 		{`select t.id, f.value::string as v from t, lateral flatten(input => t.a, outer => true) f where t.id > 2 order by 1`,
 			"3|NULL\n4|NULL"},
+		// A FLATTEN of an earlier one's elements, with a WHERE on the table.
+		{`select t.id, f.index, g.value::string from t, lateral flatten(input => [t.a, t.a]) f, lateral flatten(input => f.value) g where t.id <> 2 order by 1, 2, 3`,
+			"1|0|a\n1|0|b\n1|1|a\n1|1|b"},
+		{`select t.id, v.value::string from t, lateral flatten(input => [object_construct('l', t.a)]) g, lateral flatten(input => g.value:l) v where t.id < 3 order by 1, 2`,
+			"1|a\n1|b\n2|c"},
 	} {
 		if got := nativeRows(t, conn, c.q); got != c.want {
 			t.Errorf("%s\n got %q\nwant %q", c.q, got, c.want)

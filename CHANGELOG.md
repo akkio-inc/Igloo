@@ -847,6 +847,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A statement in Snowflake's dialect with a `FLATTEN` of an earlier
+  `FLATTEN`'s elements and a `WHERE` on the table they flatten, such as
+  `FROM t, LATERAL FLATTEN(t.a) f, LATERAL FLATTEN(f.value) g WHERE t.id >
+  1`, failed with DuckDB's "Non-inner join on correlated columns not
+  supported": the `WHERE` became the `ON` of the last `FLATTEN`'s join,
+  which a comma kept from reading the table. Commas before that `FLATTEN`
+  are now `CROSS JOIN`s, which nest from the left.
 - A `JSON` value that is a string, such as `'"abc"'::JSON` or
   `json_extract(v, '$.name')`, reached PostgreSQL clients without its
   quotes (`abc`), so a client could not tell it from a number or `true`.

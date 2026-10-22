@@ -259,10 +259,15 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 // select it plans a dependent join instead, which holds those rows' lists
 // or maps in a hash table: flattening a map of seven strings in 30 million
 // rows ran out of 18 GiB that way, and 5 million took 3.6 s rather than
-// 0.6 s. It is left as it is when the select has another FROM or WHERE,
-// a set operation, an outer, natural, ASOF, positional, semi or anti join,
-// a subquery in its WHERE, or a WHERE that names a select item's alias,
-// which an ON cannot see.
+// 0.6 s. Commas before that FLATTEN become CROSS JOINs, so that the joins
+// nest from the left and the ON sees every FROM item before it: FROM a, b,
+// LATERAL f would become a, (b JOIN LATERAL f ON (p)), whose p cannot read
+// a, which DuckDB refuses when f reads b ("Non-inner join on correlated
+// columns not supported"). It is left as it is when the select has another
+// FROM or WHERE, a set operation, an outer, natural, ASOF, positional, semi
+// or anti join, an ON after such a comma (whose unqualified names would see
+// more items), a subquery in its WHERE, or a WHERE that names a select
+// item's alias, which an ON cannot see.
 func whereOn(nodes []*node, flats []flattened) []*node {
 	if len(flats) == 0 {
 		return nodes
@@ -303,6 +308,15 @@ func whereOn(nodes []*node, flats []flattened) []*node {
 	if join < 0 || !nodes[join].isOp(",") && nodes[join].word() != "JOIN" {
 		return nodes
 	}
+	var commas []int
+	for k := from + 1; k < join; k++ {
+		switch {
+		case nodes[k].isOp(","):
+			commas = append(commas, k)
+		case nodes[k].word() == "ON" && len(commas) > 0:
+			return nodes
+		}
+	}
 	end := len(nodes)
 	for j := where + 1; j < len(nodes); j++ {
 		if whereEnds[nodes[j].word()] || nodes[j].isOp(";") {
@@ -330,6 +344,9 @@ func whereOn(nodes []*node, flats []flattened) []*node {
 		return nodes
 	}
 	out := append([]*node{}, nodes[:last+1]...)
+	for _, k := range commas {
+		out[k] = raw(" CROSS JOIN")
+	}
 	if out[join].isOp(",") {
 		out[join] = raw(" JOIN")
 	} else if c := prevSig(out, join); c >= 0 && out[c].word() == "CROSS" {
