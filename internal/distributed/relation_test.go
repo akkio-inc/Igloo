@@ -207,6 +207,9 @@ func TestRelations(t *testing.T) {
 				FROM lineitem AS l INNER JOIN urgent AS u ON u.o_orderkey = l.l_orderkey)
 			SELECT l_shipmode, first_ship, last_ship, n, returned, count(DISTINCT l_orderkey) AS orders, sum(l_quantity), sum(share)
 			FROM base GROUP BY ALL ORDER BY 1`, 1},
+		// Common table expressions of a set operation, read by its branches.
+		{`WITH x AS (SELECT l_returnflag AS f, l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1, 2)
+			SELECT 'q' AS m, f, sum(q) FROM x GROUP BY 1, 2 UNION ALL SELECT 'n', f, count(*) FROM x GROUP BY 1, 2 ORDER BY 1, 2`, 1},
 		// A relation of one row every task reads; lineitem is split.
 		{`SELECT l_returnflag, count(*) FROM lineitem, (SELECT avg(l_quantity) AS a FROM lineitem) AS s
 			WHERE l_quantity > s.a GROUP BY 1 ORDER BY 1`, 2},

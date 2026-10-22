@@ -420,54 +420,69 @@ func (pl *planner) query(n node, top bool, ctes cteScope) (node, error) {
 		if err := pl.fromSubqueries(child(n, "from_table"), inner); err != nil {
 			return nil, err
 		}
-		own := inner[len(ctes):]
-		for i := len(own) - 1; i >= 0; i-- {
-			d := own[i]
-			// Read by the statement, or by a common table expression after
-			// it that is.
-			body := clone(n).(node)
-			body["cte_map"] = node{"map": []any{}}
-			read := references(body, d.name) > 0
-			for _, later := range own[i+1:] {
-				if references(later.entry, d.name) > 0 && pl.read(later) {
-					read = true
-				}
-			}
-			pl.setRead(d, read)
-			if !read {
-				continue
-			}
-			q := child(d.entry, "query")
-			if d.first != nil {
-				// Distributed parts write its rows to an exchange: the
-				// coordinator reads them from there.
-				r, err := pl.gather(d)
-				if err != nil {
-					return nil, err
-				}
-				q["node"] = r
-				continue
-			}
-			if sub := child(q, "node"); sub != nil {
-				r, err := pl.query(sub, false, d.scope)
-				if err != nil {
-					return nil, err
-				}
-				q["node"] = r
-			}
+		if err := pl.withClause(n, ctes, inner); err != nil {
+			return nil, err
 		}
 	case "SET_OPERATION_NODE":
+		// Its branches, which read its common table expressions, then them.
+		inner := ctes.with(n)
 		for _, side := range []string{"left", "right"} {
 			if c := child(n, side); c != nil {
-				r, err := pl.query(c, false, ctes)
+				r, err := pl.query(c, false, inner)
 				if err != nil {
 					return nil, err
 				}
 				n[side] = r
 			}
 		}
+		if err := pl.withClause(n, ctes, inner); err != nil {
+			return nil, err
+		}
 	}
 	return n, nil
+}
+
+// withClause looks for jobs in the common table expressions of query node
+// n, whose readers in n were planned already, last first: inner is the
+// scope inside n, ctes the one around it.
+func (pl *planner) withClause(n node, ctes, inner cteScope) error {
+	own := inner[len(ctes):]
+	for i := len(own) - 1; i >= 0; i-- {
+		d := own[i]
+		// Read by the statement, or by a common table expression after it
+		// that is.
+		body := clone(n).(node)
+		body["cte_map"] = node{"map": []any{}}
+		read := references(body, d.name) > 0
+		for _, later := range own[i+1:] {
+			if references(later.entry, d.name) > 0 && pl.read(later) {
+				read = true
+			}
+		}
+		pl.setRead(d, read)
+		if !read {
+			continue
+		}
+		q := child(d.entry, "query")
+		if d.first != nil {
+			// Distributed parts write its rows to an exchange: the
+			// coordinator reads them from there.
+			r, err := pl.gather(d)
+			if err != nil {
+				return err
+			}
+			q["node"] = r
+			continue
+		}
+		if sub := child(q, "node"); sub != nil {
+			r, err := pl.query(sub, false, d.scope)
+			if err != nil {
+				return err
+			}
+			q["node"] = r
+		}
+	}
+	return nil
 }
 
 func (pl *planner) fromSubqueries(ref node, ctes cteScope) error {
