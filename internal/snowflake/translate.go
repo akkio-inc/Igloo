@@ -62,6 +62,7 @@ type translator struct {
 	// structWhere).
 	structs     map[*node]*structFlatten
 	structReads map[*node]*structFlatten
+	onlyValues  map[*node]bool
 	flattenOuts map[*node]string
 	structOuts  map[*node]*structOut
 	folds       map[*node]*structFold
@@ -101,7 +102,7 @@ func Translate(sql string, opts Options) (Result, error) {
 	}
 	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{},
 		names: map[string]int{}, columnNames: map[string]int{}, structs: map[*node]*structFlatten{},
-		structReads: map[*node]*structFlatten{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
+		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
 		folds: map[*node]*structFold{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {

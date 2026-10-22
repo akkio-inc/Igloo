@@ -839,6 +839,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   objects of a dimension and a row's string filtered on the strings, took
   3.9 s for 5 million rows and take 1.2 s, and objects of a dimension and
   a list whose elements are filtered 3.1 s for 3 million rows and 1.2 s.
+  A `FLATTEN`'s `KEY`, `PATH`, `INDEX` and `THIS` count as read only where
+  its own select names them, so a column of one of those names elsewhere,
+  as reports name an `INDEX`, no longer keeps a second `FLATTEN`'s elements
+  unfiltered and the objects JSON.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

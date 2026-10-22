@@ -323,6 +323,15 @@ func TestFlattenShapes(t *testing.T) {
 			`unnest(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH')) AS _sf_value, unnest(sf_parts_keys(`, ``},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) as g(seq, key, path, index, value, this), lateral flatten(input => g.value:l) as v(a, b, c, i, value, d) order by v.i`,
 			`unnest(sf_parts_indexes(`, ``},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v order by index`,
+			`unnest(sf_parts_indexes(`, ``},
+		// A column of the same name elsewhere is another's: of a table, or in
+		// another select, as reports name an INDEX.
+		{`with a as (select v.value as x, u."INDEX", u.key from tab m join u on u.id = m.id, lateral flatten(input => [object_construct('l', m.a)]) as g(seq, key, path, index, value, this),
+					lateral flatten(input => g.value:l) as v(seq, key, path, index, value, this) where v.value::string <> ''),
+				b as (select r.index, r."INDEX", r.s as index, r.path from ranks r)
+				select * from a, b order by index`,
+			`unnest(list_filter(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH'), lambda _sf_e: (json_extract_string(_sf_e, '$') <> ''))) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key`, ``},
 		// A key's strings, a string's column and any other string a
 		// VARCHAR, read as itself.
 		{`select g.value:n::string, g.value:n, g.value:n = 'x' from tab m, lateral flatten(input => [object_construct('n', m.s), object_construct('n', iff(m.b, 'y', 'z')), object_construct('n', 'w')]) g`,

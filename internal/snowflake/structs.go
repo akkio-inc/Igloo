@@ -112,15 +112,16 @@ func (s *structFlatten) text(x string, i int) string {
 // structWhere keeps out of the joins (see filters) stays JSON. Selects
 // apart, such as the CTEs of reports that each flatten objects AS t, are
 // apart: t.structs and t.structReads hold the FLATTENs found, by their
-// argument groups, and the reads of their VALUE, by VALUE's nodes.
+// argument groups, and the reads of their VALUE, by VALUE's nodes, and
+// t.onlyValues every FLATTEN whose select reads only its VALUE and SEQ.
 func (t *translator) collectStructs(nodes []*node) {
-	type candidate struct {
-		alias, args *node
-		up          string
-		level       []*node
-		s           *structFlatten
+	type flat struct {
+		alias, args, cols *node
+		up                string
+		level             []*node
+		i                 int
 	}
-	var found []candidate
+	var flats []flat
 	colLists := map[*node]bool{}
 	var find func(nodes []*node)
 	find = func(nodes []*node) {
@@ -133,7 +134,7 @@ func (t *translator) collectStructs(nodes []*node) {
 				continue
 			}
 			a := aliasIndex(nodes, after)
-			if a < 0 {
+			if a < 0 || args == nil {
 				continue
 			}
 			var cols *node
@@ -142,22 +143,89 @@ func (t *translator) collectStructs(nodes []*node) {
 				colLists[cols] = true
 			}
 			name, _, _ := nodes[a].name()
-			up := strings.ToUpper(name)
-			if s := structInput(args); s != nil && up != "VALUE" && !selectsStar(nodes) && valueKept(cols) && readInPlace(nodes, i, up) &&
-				!t.filters(nodes, i, up) {
-				found = append(found, candidate{alias: nodes[a], args: args, up: up, level: nodes, s: s})
-			}
+			flats = append(flats, flat{alias: nodes[a], args: args, cols: cols, up: strings.ToUpper(name), level: nodes, i: i})
 		}
 	}
 	find(nodes)
-	for _, c := range found {
-		if reads, ok := readsOnlyByKey(c.level, c.alias, c.up, colLists); ok {
-			t.structs[c.args] = c.s
+	for _, f := range flats {
+		if !otherColumnsRead(f.level, f.up, f.cols, colLists) {
+			t.onlyValues[f.args] = true
+		}
+	}
+	for _, f := range flats {
+		s := structInput(f.args)
+		if s == nil || f.up == "VALUE" || selectsStar(f.level) || !valueKept(f.cols) || !readInPlace(f.level, f.i, f.up) ||
+			t.filters(f.level, f.i, f.up) {
+			continue
+		}
+		if reads, ok := readsOnlyByKey(f.level, f.alias, f.up, colLists); ok {
+			t.structs[f.args] = s
 			for _, r := range reads {
-				t.structReads[r] = c.s
+				t.structReads[r] = s
 			}
 		}
 	}
+}
+
+// otherColumnsRead reports whether a select, nodes, or what it nests may
+// read the KEY, PATH, INDEX or THIS of the FLATTEN aliased alias (upper
+// case) whose columns are named cols (or nil): with a star at its level, or
+// by their names, qualified by the alias or not, but not as an alias, a
+// path's key, a qualifier, a call or a named argument, nor in FLATTENs'
+// column lists (colLists). A column of that name in another select, such as
+// a report's INDEX, is another's.
+func otherColumnsRead(nodes []*node, alias string, cols *node, colLists map[*node]bool) bool {
+	if selectsStar(nodes) {
+		return true
+	}
+	names := map[string]bool{}
+	defaults := []string{"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"}
+	var list [][]*node
+	if cols != nil {
+		list = splitArgs(cols.kids)
+	}
+	for _, pos := range []int{1, 2, 3, 5} {
+		name := defaults[pos]
+		if pos < len(list) {
+			n := trim(list[pos])
+			if len(n) != 1 {
+				return true
+			}
+			var ok bool
+			if name, _, ok = n[0].name(); !ok {
+				return true
+			}
+		}
+		names[strings.ToUpper(name)] = true
+	}
+	read := false
+	var walk func(nodes []*node)
+	walk = func(nodes []*node) {
+		for i, n := range nodes {
+			if n.kind == kGroup && !colLists[n] {
+				walk(n.kids)
+			}
+			name, _, ok := n.name()
+			if !ok || !names[strings.ToUpper(name)] {
+				continue
+			}
+			p, q := prevSig(nodes, i), nextSig(nodes, i)
+			switch {
+			case q >= 0 && (nodes[q].isOp(".") || nodes[q].isGroup('(') || nodes[q].isOp("=>")):
+			case p >= 0 && (nodes[p].isOp(":") || nodes[p].word() == "AS"):
+			case p >= 0 && nodes[p].isOp("."):
+				if r := prevSig(nodes, p); r >= 0 {
+					if qual, _, ok := nodes[r].name(); ok && strings.ToUpper(qual) == alias {
+						read = true
+					}
+				}
+			default:
+				read = true
+			}
+		}
+	}
+	walk(nodes)
+	return read
 }
 
 // readsOnlyByKey reports whether a select, nodes, and what it nests read
@@ -301,8 +369,8 @@ func readers(nodes []*node, i int, alias string) []int {
 // each of its conditions (see whereTerms) names, of the FLATTENs, only the
 // FLATTEN's VALUE, which filters its objects, and the last FLATTEN's VALUE,
 // which filters that one's elements, when that one flattens one key of the
-// FLATTEN's VALUE (see readsOneKey) and the statement reads none of its
-// columns but VALUE and SEQ.
+// FLATTEN's VALUE (see readsOneKey) and its select reads none of its
+// columns but VALUE and SEQ (see otherColumnsRead).
 func (t *translator) whereFits(nodes []*node, i int, alias string) bool {
 	sel, from, where, end, ok := whereClause(nodes)
 	if !ok || where < 0 || i < from || i > where {
@@ -350,12 +418,6 @@ func (t *translator) whereFits(nodes []*node, i int, alias string) bool {
 		name, _, _ := nodes[a].name()
 		last = strings.ToUpper(name)
 	}
-	var cols *node
-	if a := aliasIndex(nodes, after); a >= 0 {
-		if k := nextSig(nodes, a); k >= 0 && nodes[k].isGroup('(') {
-			cols = nodes[k]
-		}
-	}
 	for _, term := range whereTerms(cond) {
 		q := qualifiers(term)
 		for name := range q {
@@ -365,7 +427,7 @@ func (t *translator) whereFits(nodes []*node, i int, alias string) bool {
 		}
 		switch {
 		case last != "" && q[last]:
-			if lastArgs == nil || !readsOneKey(lastArgs, alias) || t.listsWanted(nodes, cols) || t.thisWanted(nodes, cols) ||
+			if lastArgs == nil || !readsOneKey(lastArgs, alias) || !t.onlyValues[lastArgs] ||
 				!onlyValue(term, last) || q[alias] && !onlyValue(term, alias) {
 				return false
 			}

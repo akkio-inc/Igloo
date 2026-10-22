@@ -223,7 +223,7 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 					alias = "flatten_" + itoa(t.gen)
 				}
 			}
-			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols), t.listsWanted(nodes, cols), st)
+			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols), t.onlyValues[call], st)
 			flats = append(flats, flattened{alias: alias, out: out, structs: st != nil})
 			t.flattenOuts[out] = alias
 		case "SPLIT_TO_TABLE":
@@ -721,9 +721,9 @@ func aliasClause(alias string, cols *node) string {
 // elements (see flattenUnnest), or with OUTER or RECURSIVE over DuckDB's
 // json_each or json_tree. SEQ is NULL: a lateral subquery cannot number the
 // rows it is joined to. st, when set, says its elements are structs (see
-// flattenStructs); wantLists, that the statement may read KEY, PATH or
-// INDEX.
-func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, wantLists bool, st *structFlatten) (*node, error) {
+// flattenStructs); onlyValues, that its select reads only its VALUE and
+// SEQ (see otherColumnsRead).
+func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, onlyValues bool, st *structFlatten) (*node, error) {
 	pos, named := t.tableArgs(g)
 	input := named["INPUT"]
 	if input == nil && len(pos) > 0 {
@@ -781,7 +781,7 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, w
 		return t.flattenStructs(st, in, alias, cols, wantThis)
 	}
 	if !recursive && !outer {
-		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis, wantLists)
+		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis, onlyValues)
 		if fold != nil {
 			fold.alias = alias
 			t.folds[out] = fold
@@ -846,12 +846,12 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, w
 // elements, without building the array and reading it back: three times
 // faster where each row builds objects to flatten. A key of objects that
 // flattenStructs made structs is unnested from the struct's field, which
-// DuckDB too unnests where it reads it, and when the statement reads none
-// of KEY, PATH, INDEX and THIS (wantLists, wantThis), only its elements,
-// which a lone unnest gives faster than three together (0.9 s against 1.4 s
-// for 3 million rows of three lists), in a node of their own, fold, that
+// DuckDB too unnests where it reads it, and when its select reads none of
+// KEY, PATH, INDEX and THIS (onlyValues), only its elements, which a lone
+// unnest gives faster than three together (0.9 s against 1.4 s for 3
+// million rows of three lists), in a node of their own, fold, that
 // structWhere may filter.
-func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, wantLists bool) (out *node, fold *structFold) {
+func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, onlyValues bool) (out *node, fold *structFold) {
 	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
 	path := rel
 	if prefix != "" {
@@ -878,7 +878,7 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, w
 			this = "_sf_flatten._sf_this"
 			lists = append(lists, raw(", unnest(repeat(["), in, raw("], "+n+")) AS _sf_this"))
 		}
-	case field && prefix == "" && !wantThis && !wantLists:
+	case field && prefix == "" && onlyValues:
 		// A key of objects flattened as structs (see flattenStructs), of
 		// which the statement reads only the elements.
 		fold = &structFold{values: seq(nil, raw("sf_parts_values("+l+", "+j+", "+m+")"))}
@@ -945,37 +945,6 @@ func (t *translator) thisWanted(nodes []*node, cols *node) bool {
 		name = strings.ToUpper(name)
 	}
 	return t.names[name] > t.columnNames[name]
-}
-
-// columnWanted reports whether a statement may read the column at position
-// pos (0 for SEQ) of a FLATTEN whose columns are named cols (or nil), named
-// name unless cols names it, at level nodes: by that name anywhere but in
-// FLATTEN's column lists, or with a star at that level, as thisWanted tells
-// for THIS.
-func (t *translator) columnWanted(nodes []*node, cols *node, pos int, name string) bool {
-	if selectsStar(nodes) {
-		return true
-	}
-	if cols != nil {
-		if names := splitArgs(cols.kids); len(names) > pos {
-			n := trim(names[pos])
-			if len(n) != 1 {
-				return true
-			}
-			var ok bool
-			if name, _, ok = n[0].name(); !ok {
-				return true
-			}
-			name = strings.ToUpper(name)
-		}
-	}
-	return t.names[name] > t.columnNames[name]
-}
-
-// listsWanted reports whether a statement may read the KEY, PATH or INDEX of
-// a FLATTEN (see columnWanted).
-func (t *translator) listsWanted(nodes []*node, cols *node) bool {
-	return t.columnWanted(nodes, cols, 1, "KEY") || t.columnWanted(nodes, cols, 2, "PATH") || t.columnWanted(nodes, cols, 3, "INDEX")
 }
 
 // selectsStar reports whether nodes, one level of a statement, select
