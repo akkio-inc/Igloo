@@ -41,6 +41,9 @@ type variant struct {
 	mode vmode
 	// try reads a number with TRY_CAST, NULL for what is not one.
 	try bool
+	// column says base is a column, which may be one of Igloo's ARRAY or
+	// OBJECT columns, a list or map of strings (see render).
+	column bool
 }
 
 var plainKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -72,10 +75,19 @@ func (v *variant) path() string {
 	return strings.Join(parts, " || ")
 }
 
-// render writes the variant in DuckDB SQL for its mode.
+// render writes the variant in DuckDB SQL for its mode. A path into a
+// column goes through sf_get and sf_get_string, which read Igloo's ARRAY
+// and OBJECT columns (lists and maps of strings) as Snowflake's values and
+// any other column as DuckDB's JSON functions do, JSON text included; one
+// into any other value, which is JSON (the translations of Snowflake's
+// functions and FLATTEN's VALUE and THIS are), through those functions.
 func (v *variant) render() string {
 	base := v.base.String()
-	str := "json_extract_string(" + base + ", " + v.path() + ")"
+	extract, extractString := "json_extract(", "json_extract_string("
+	if v.column {
+		extract, extractString = "sf_get(", "sf_get_string("
+	}
+	str := extractString + base + ", " + v.path() + ")"
 	switch v.mode {
 	case vString:
 		return str
@@ -88,5 +100,5 @@ func (v *variant) render() string {
 	if v.json && len(v.segs) == 0 {
 		return base
 	}
-	return "json_extract(" + base + ", " + v.path() + ")"
+	return extract + base + ", " + v.path() + ")"
 }

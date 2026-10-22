@@ -18,6 +18,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -836,6 +837,12 @@ func (s *Server) checkPolicy(ctx context.Context, sess *session, user auth.User,
 		}
 	}
 	p.Body = strings.TrimSpace(b.String())
+	if p.Kind == policy.Masking && sess.sqlDialect() == dialectSnowflake {
+		// Snowflake converts what the expression returns to the policy's
+		// type, as from the JSON OBJECT_CONSTRUCT gives to an OBJECT
+		// column's map.
+		p.Body = "CAST((" + p.Body + ") AS " + p.Returns + ")"
+	}
 	if err := forbidden(p.Body); err != nil {
 		return p, err
 	}
@@ -942,10 +949,16 @@ func (s *Server) checkPolicy(ctx context.Context, sess *session, user auth.User,
 }
 
 // normalizeType returns a type as DuckDB names it, such as VARCHAR for
-// TEXT.
+// TEXT; in Snowflake's dialect, a Snowflake type as a column of it is
+// (VARCHAR[] for ARRAY).
 func normalizeType(ctx context.Context, sess *session, typ string) (string, error) {
 	if strings.ContainsAny(sqllex.CodeOnly(typ), ";") || strings.Contains(typ, "--") || strings.Contains(typ, "/*") {
 		return "", errors.New("not a type")
+	}
+	if sess.sqlDialect() == dialectSnowflake {
+		if t, ok := snowflake.ColumnType(typ); ok {
+			typ = t
+		}
 	}
 	rows, err := sess.conn.QueryContext(ctx, "SELECT system.main.typeof(CAST(NULL AS "+typ+"))", nil)
 	if err != nil {

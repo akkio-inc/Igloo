@@ -35,7 +35,7 @@ SELECT sf_to_date(s) AS "TO_DATE(S)", CAST(strptime(s, '%m/%d/%Y') AS DATE) AS "
 SELECT sf_to_timestamp(s) AS "TO_TIMESTAMP(S)", to_timestamp(ms / 1e3) AS "TO_TIMESTAMP_LTZ(MS, 3)", CAST(strptime(s, '%Y-%m-%d %H:%M:%S') AS TIMESTAMP) AS "TO_TIMESTAMP_NTZ(S, 'YYYY-MM-DD HH24:MI:SS')" FROM t
 
 -- SELECT TO_CHAR(d, 'YYYY-MM-DD'), TO_VARCHAR(n), TO_NUMBER(s, 10, 2) FROM t
-SELECT strftime(d, '%Y-%m-%d') AS "TO_CHAR(D, 'YYYY-MM-DD')", CASE WHEN typeof(n) = 'JSON' THEN json_extract_string(CAST(n AS JSON), '$') WHEN typeof(n) IN ('DOUBLE', 'FLOAT') THEN CASE WHEN isnan(CAST(n AS DOUBLE)) THEN 'NaN' ELSE format('{:.12g}', CAST(n AS DOUBLE)) END WHEN typeof(n) IN ('TIMESTAMP', 'TIMESTAMP_S', 'TIMESTAMP_MS', 'TIMESTAMP_NS') THEN strftime(CAST(n AS TIMESTAMP), '%Y-%m-%d %H:%M:%S.%g') WHEN typeof(n) = 'TIMESTAMP WITH TIME ZONE' THEN regexp_replace(strftime(CAST(n AS TIMESTAMPTZ), '%Y-%m-%d %H:%M:%S.%g %z') || '00', ':(\d\d)(:\d\d)?00$', '\1') WHEN typeof(n) = 'TIME' THEN strftime(DATE '1970-01-01' + CAST(n AS TIME), '%H:%M:%S') WHEN typeof(n) = 'BLOB' THEN hex(CAST(n AS BLOB)) ELSE CAST(n AS VARCHAR) END AS "TO_VARCHAR(N)", CAST(s AS DECIMAL(10,2)) AS "TO_NUMBER(S, 10, 2)" FROM t
+SELECT strftime(d, '%Y-%m-%d') AS "TO_CHAR(D, 'YYYY-MM-DD')", CASE WHEN typeof(n) = 'JSON' THEN json_extract_string(CAST(n AS JSON), '$') WHEN typeof(n) IN ('DOUBLE', 'FLOAT') THEN CASE WHEN isnan(CAST(n AS DOUBLE)) THEN 'NaN' ELSE format('{:.12g}', CAST(n AS DOUBLE)) END WHEN typeof(n) IN ('TIMESTAMP', 'TIMESTAMP_S', 'TIMESTAMP_MS', 'TIMESTAMP_NS') THEN strftime(CAST(n AS TIMESTAMP), '%Y-%m-%d %H:%M:%S.%g') WHEN typeof(n) = 'TIMESTAMP WITH TIME ZONE' THEN regexp_replace(strftime(CAST(n AS TIMESTAMPTZ), '%Y-%m-%d %H:%M:%S.%g %z') || '00', ':(\d\d)(:\d\d)?00$', '\1') WHEN typeof(n) = 'TIME' THEN strftime(DATE '1970-01-01' + CAST(n AS TIME), '%H:%M:%S') WHEN typeof(n) = 'BLOB' THEN hex(CAST(n AS BLOB)) WHEN typeof(n) LIKE '%[]' OR typeof(n) LIKE 'MAP(%' OR typeof(n) LIKE 'STRUCT(%' THEN CAST(sf_json(n) AS VARCHAR) ELSE CAST(n AS VARCHAR) END AS "TO_VARCHAR(N)", CAST(s AS DECIMAL(10,2)) AS "TO_NUMBER(S, 10, 2)" FROM t
 
 -- SELECT CONVERT_TIMEZONE('UTC', 'America/New_York', ts), CONVERT_TIMEZONE('Europe/Paris', ts) FROM t
 SELECT timezone('America/New_York', timezone('UTC', CAST(ts AS TIMESTAMP))) AS "CONVERT_TIMEZONE('UTC', 'AMERICA/NEW_YORK', TS)", timezone('Europe/Paris', CAST(ts AS TIMESTAMPTZ)) AS "CONVERT_TIMEZONE('EUROPE/PARIS', TS)" FROM t
@@ -47,22 +47,22 @@ SELECT sf_time_slice(ts, to_minutes(CAST(15 AS BIGINT)), '1970-01-01') AS "TIME_
 SELECT coalesce(string_agg(DISTINCT x, ',' ORDER BY x NULLS LAST), '') AS "LISTAGG(DISTINCT X, ',') WITHIN GROUP (ORDER BY X)" FROM t
 
 -- SELECT ARRAY_AGG(x) WITHIN GROUP (ORDER BY y DESC) FROM t
-SELECT coalesce(to_json(list(x ORDER BY y DESC NULLS FIRST) FILTER (WHERE x IS NOT NULL)), CAST('[]' AS JSON)) AS "ARRAY_AGG(X) WITHIN GROUP (ORDER BY Y DESC)" FROM t
+SELECT coalesce(to_json(list(sf_to_json(x) ORDER BY y DESC NULLS FIRST) FILTER (WHERE sf_to_json(x) IS NOT NULL)), CAST('[]' AS JSON)) AS "ARRAY_AGG(X) WITHIN GROUP (ORDER BY Y DESC)" FROM t
 
 -- SELECT OBJECT_CONSTRUCT('k', k, 'v', v), ARRAY_CONSTRUCT(1, 2) FROM t
-SELECT to_json(map_from_entries(list_sort(list_filter([{'k': CAST('k' AS VARCHAR), 'v': to_json(k)}, {'k': CAST('v' AS VARCHAR), 'v': to_json(v)}], lambda e: e.v IS NOT NULL)))) AS "OBJECT_CONSTRUCT('K', K, 'V', V)", json_array(1, 2) AS "ARRAY_CONSTRUCT(1, 2)" FROM t
+SELECT to_json(map_from_entries(list_sort(list_filter([{'k': CAST('k' AS VARCHAR), 'v': to_json(sf_to_json(k))}, {'k': CAST('v' AS VARCHAR), 'v': to_json(sf_to_json(v))}], lambda e: e.v IS NOT NULL)))) AS "OBJECT_CONSTRUCT('K', K, 'V', V)", json_array(1, 2) AS "ARRAY_CONSTRUCT(1, 2)" FROM t
 
 -- SELECT PARSE_JSON(s), TRY_PARSE_JSON(s) FROM t
 SELECT json(s) AS "PARSE_JSON(S)", CASE WHEN json_valid(s) THEN json(s) END AS "TRY_PARSE_JSON(S)" FROM t
 
 -- SELECT v:a.b[0]::string, v:c, v['d'] FROM t WHERE v:type = 'click' AND v:n > 5
-SELECT json_extract_string(v, '$.a.b[0]') AS "V:A.B[0]::STRING", json_extract(v, '$.c') AS "V:C", json_extract(v, '$.d') AS "V['D']" FROM t WHERE json_extract_string(v, '$.type') = 'click' AND CAST(json_extract_string(v, '$.n') AS DOUBLE) > 5
+SELECT sf_get_string(v, '$.a.b[0]') AS "V:A.B[0]::STRING", sf_get(v, '$.c') AS "V:C", sf_get(v, '$.d') AS "V['D']" FROM t WHERE sf_get_string(v, '$.type') = 'click' AND CAST(sf_get_string(v, '$.n') AS DOUBLE) > 5
 
 -- SELECT GET(v, 'a'), GET_PATH(v, 'a.b[0]'), ARRAY_SIZE(v:items), ARRAY_CONTAINS(1::variant, arr) FROM t
-SELECT json_extract(v, '$.a') AS "GET(V, 'A')", json_extract(v, '$.a.b[0]') AS "GET_PATH(V, 'A.B[0]')", CASE WHEN json_type(CAST(json_extract(v, '$.items') AS JSON)) = 'ARRAY' THEN CAST(json_array_length(CAST(json_extract(v, '$.items') AS JSON)) AS BIGINT) END AS "ARRAY_SIZE(V:ITEMS)", list_contains(CAST(CAST(arr AS JSON) AS JSON[]), to_json(to_json(1))) AS "ARRAY_CONTAINS(1::VARIANT, ARR)" FROM t
+SELECT sf_get(v, '$.a') AS "GET(V, 'A')", sf_get(v, '$.a.b[0]') AS "GET_PATH(V, 'A.B[0]')", CASE WHEN json_type(CAST(sf_get(v, '$.items') AS JSON)) = 'ARRAY' THEN CAST(json_array_length(CAST(sf_get(v, '$.items') AS JSON)) AS BIGINT) END AS "ARRAY_SIZE(V:ITEMS)", list_contains(CAST(CAST(sf_json(arr) AS JSON) AS JSON[]), to_json(to_json(1))) AS "ARRAY_CONTAINS(1::VARIANT, ARR)" FROM t
 
 -- SELECT f.value:name::string, f.index FROM t, LATERAL FLATTEN(input => t.items) f
-SELECT json_extract_string(f.value, '$.name') AS "F.VALUE:NAME::STRING", f.index FROM t, LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_flatten._sf_key AS "KEY", coalesce(CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END, '') AS "PATH", _sf_flatten._sf_index AS "INDEX", _sf_flatten._sf_value AS "VALUE", _sf_flatten._sf_this AS "THIS" FROM (SELECT _sf_this, unnest(CASE json_type(_sf_this) WHEN 'ARRAY' THEN json_extract(_sf_this, '$[*]') WHEN 'OBJECT' THEN json_extract(_sf_this, '$.*') END) AS _sf_value, unnest(CASE json_type(_sf_this) WHEN 'OBJECT' THEN json_keys(_sf_this) END) AS _sf_key, unnest(CASE json_type(_sf_this) WHEN 'ARRAY' THEN range(CAST(json_array_length(_sf_this) AS BIGINT)) END) AS _sf_index FROM (SELECT CAST(t.items AS JSON) AS _sf_this) AS _sf_flatten_input) AS _sf_flatten) AS "f"
+SELECT json_extract_string(f.value, '$.name') AS "F.VALUE:NAME::STRING", f.index FROM t, LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_flatten._sf_key AS "KEY", coalesce(CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END, '') AS "PATH", _sf_flatten._sf_index AS "INDEX", _sf_flatten._sf_value AS "VALUE", CAST(NULL AS JSON) AS "THIS" FROM (SELECT unnest(sf_flatten_values(t.items, 'BOTH')) AS _sf_value, unnest(sf_flatten_keys(t.items, 'BOTH')) AS _sf_key, unnest(sf_flatten_indexes(t.items, 'BOTH')) AS _sf_index) AS _sf_flatten) AS "f"
 
 -- SELECT s.value FROM TABLE(SPLIT_TO_TABLE('a,b', ',')) s
 SELECT s.value FROM LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_i AS "INDEX", _sf_split._sf_parts[_sf_i] AS "VALUE" FROM (SELECT string_split('a,b', ',') AS _sf_parts) AS _sf_split, range(1, len(_sf_split._sf_parts) + 1) AS _sf_range(_sf_i) ORDER BY _sf_i) AS "s"
@@ -117,7 +117,7 @@ WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SE
 SELECT * FROM db.sch.tbl
 
 -- SELECT AT.total, at.n, LEFT.x, gt.y, t.at, v:at.left FROM a AS AT, b AS left, c AS gt
-SELECT "AT".total, "AT".n, "LEFT".x, gt.y, t.at, json_extract(v, '$.at.left') AS "V:AT.LEFT" FROM a AS "AT", b AS "LEFT", c AS gt
+SELECT "AT".total, "AT".n, "LEFT".x, gt.y, t.at, sf_get(v, '$.at.left') AS "V:AT.LEFT" FROM a AS "AT", b AS "LEFT", c AS gt
 
 -- SET x = 10
 SET VARIABLE "x" = 10
@@ -150,7 +150,7 @@ NOTICE: COMMENT = ... is ignored; set the comment with COMMENT ON
 ALTER TABLE t ADD COLUMN c TIMESTAMPTZ
 
 -- SELECT x::number(10,2), y::int, z::float, w::variant, CAST(q AS TIMESTAMP_TZ) FROM t
-SELECT CAST(x AS DECIMAL(10,2)) AS "X::NUMBER(10,2)", CAST(y AS BIGINT) AS "Y::INT", CAST(z AS DOUBLE) AS "Z::FLOAT", to_json(w) AS "W::VARIANT", CAST(q AS TIMESTAMPTZ) AS "CAST(Q AS TIMESTAMP_TZ)" FROM t
+SELECT CAST(x AS DECIMAL(10,2)) AS "X::NUMBER(10,2)", CAST(y AS BIGINT) AS "Y::INT", CAST(z AS DOUBLE) AS "Z::FLOAT", sf_to_json(w) AS "W::VARIANT", CAST(q AS TIMESTAMPTZ) AS "CAST(Q AS TIMESTAMP_TZ)" FROM t
 
 -- SELECT 'it\'s', $$raw\string$$ // comment
 SELECT 'it''s' AS "'IT\'S'", 'raw\string' AS "$$RAW\STRING$$" -- comment
@@ -181,7 +181,7 @@ SELECT (CAST(a AS VARCHAR) || CAST(b AS VARCHAR)) AS "CONCAT(A, B)", (CAST(a AS 
 SELECT unhex('002A') AS "X'002A'", CASE WHEN 0 = 0 THEN lower(hex(unhex('0A0b'))) ELSE hex(unhex('0A0b')) END AS "HEX_ENCODE(X'0A0B', 0)" FROM t
 
 -- SELECT PARSE_JSON(s)::VARIANT[0], s::OBJECT:a::string FROM t
-SELECT json_extract(to_json(json(s)), '$[0]') AS "PARSE_JSON(S)::VARIANT[0]", json_extract_string(to_json(s), '$.a') AS "S::OBJECT:A::STRING" FROM t
+SELECT json_extract(to_json(json(s)), '$[0]') AS "PARSE_JSON(S)::VARIANT[0]", json_extract_string(sf_to_json(s), '$.a') AS "S::OBJECT:A::STRING" FROM t
 
 -- SELECT * EXCLUDE (a) REPLACE (b + 1 AS b) FROM t
 SELECT * EXCLUDE (a) REPLACE (b + 1 AS b) FROM t

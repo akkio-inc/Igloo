@@ -48,15 +48,15 @@ func TestTranslate(t *testing.T) {
 		{`SELECT LISTAGG(DISTINCT x, ',') WITHIN GROUP (ORDER BY x) AS l FROM t`,
 			`SELECT coalesce(string_agg(DISTINCT x, ',' ORDER BY x NULLS LAST), '') AS "L" FROM t`},
 		{`SELECT ARRAY_AGG(x) WITHIN GROUP (ORDER BY y DESC) AS a FROM t`,
-			`SELECT coalesce(to_json(list(x ORDER BY y DESC NULLS FIRST) FILTER (WHERE x IS NOT NULL)), CAST('[]' AS JSON)) AS "A" FROM t`},
+			`SELECT coalesce(to_json(list(sf_to_json(x) ORDER BY y DESC NULLS FIRST) FILTER (WHERE sf_to_json(x) IS NOT NULL)), CAST('[]' AS JSON)) AS "A" FROM t`},
 		{`SELECT x, RATIO_TO_REPORT(x) OVER (PARTITION BY g) AS r FROM t`,
 			`SELECT x, (x / nullif(sum(x) OVER (PARTITION BY g), 0)) AS "R" FROM t`},
 		{`SELECT lag(x) IGNORE NULLS OVER (ORDER BY o) AS l FROM t`, `SELECT lag(x IGNORE NULLS) OVER (ORDER BY o NULLS LAST) AS "L" FROM t`},
 		// Semi-structured data.
 		{`SELECT v:a.b[0]::string AS s, v:c AS c FROM t WHERE v:type = 'click' AND v:n > 5`,
-			`SELECT json_extract_string(v, '$.a.b[0]') AS "S", json_extract(v, '$.c') AS "C" FROM t WHERE json_extract_string(v, '$.type') = 'click' AND CAST(json_extract_string(v, '$.n') AS DOUBLE) > 5`},
-		{`SELECT v['a b']:"C" AS x FROM t`, `SELECT json_extract(v, '$."a b".C') AS "X" FROM t`},
-		{`SELECT GET(v, 'a') AS a, GET_PATH(v, 'a.b[0]') AS b FROM t`, `SELECT json_extract(v, '$.a') AS "A", json_extract(v, '$.a.b[0]') AS "B" FROM t`},
+			`SELECT sf_get_string(v, '$.a.b[0]') AS "S", sf_get(v, '$.c') AS "C" FROM t WHERE sf_get_string(v, '$.type') = 'click' AND CAST(sf_get_string(v, '$.n') AS DOUBLE) > 5`},
+		{`SELECT v['a b']:"C" AS x FROM t`, `SELECT sf_get(v, '$."a b".C') AS "X" FROM t`},
+		{`SELECT GET(v, 'a') AS a, GET_PATH(v, 'a.b[0]') AS b FROM t`, `SELECT sf_get(v, '$.a') AS "A", sf_get(v, '$.a.b[0]') AS "B" FROM t`},
 		{`SELECT PARSE_JSON(s) AS j FROM t`, `SELECT json(s) AS "J" FROM t`},
 		{`SELECT ARRAY_CONSTRUCT(1, 2) AS a, [1, 2] AS b, {'k': 1} AS o FROM t`,
 			`SELECT json_array(1, 2) AS "A", json_array(1, 2) AS "B", to_json(map_from_entries(list_sort(list_filter([{'k': CAST('k' AS VARCHAR), 'v': to_json(1)}], lambda e: e.v IS NOT NULL)))) AS "O" FROM t`},
@@ -78,7 +78,7 @@ func TestTranslate(t *testing.T) {
 		{`UNSET x`, `RESET VARIABLE "x"`},
 		// Types.
 		{`SELECT x::number(10,2) AS a, y::int AS b, z::float AS c, w::variant AS d, CAST(q AS TIMESTAMP_LTZ) AS e FROM t`,
-			`SELECT CAST(x AS DECIMAL(10,2)) AS "A", CAST(y AS BIGINT) AS "B", CAST(z AS DOUBLE) AS "C", to_json(w) AS "D", CAST(q AS TIMESTAMPTZ) AS "E" FROM t`},
+			`SELECT CAST(x AS DECIMAL(10,2)) AS "A", CAST(y AS BIGINT) AS "B", CAST(z AS DOUBLE) AS "C", sf_to_json(w) AS "D", CAST(q AS TIMESTAMPTZ) AS "E" FROM t`},
 		{`SELECT TIMESTAMP_TZ '2024-01-01 10:00 +02:00' AS ts`, `SELECT CAST('2024-01-01 10:00 +02:00' AS TIMESTAMPTZ) AS "TS"`},
 		// Clauses.
 		{`SELECT a FROM t MINUS SELECT a FROM u`, `SELECT a FROM t EXCEPT SELECT a FROM u`},

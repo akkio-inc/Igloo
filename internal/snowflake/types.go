@@ -13,13 +13,38 @@ const (
 	classScalar typeClass = iota // any other type
 	classString                  // VARCHAR and its synonyms
 	classJSON                    // VARIANT, OBJECT, ARRAY
+	classNested                  // ARRAY(type), OBJECT(name type, ...), MAP(type, type)
 )
 
 // sqlType is a Snowflake type written in a statement, as DuckDB names it.
 type sqlType struct {
 	duck  string
 	class typeClass
+	// column, when set, is DuckDB's type for a column of the type, where
+	// it differs from duck: a value of the semi-structured ARRAY or
+	// OBJECT is JSON, but a column of one is a list of strings or a map
+	// of strings (see docs/snowflake-sql.md), which Iceberg tables hold
+	// and engines read natively.
+	column string
 }
+
+// columnType is DuckDB's type for a column of t.
+func (t sqlType) columnType() string {
+	if t.column != "" {
+		return t.column
+	}
+	return t.duck
+}
+
+// Igloo's columns of Snowflake's ARRAY and OBJECT: a list of strings and a
+// map of strings, each element or value as Snowflake's TO_VARCHAR writes
+// it, a string as itself and anything else as its JSON text. Snowflake
+// converts a semi-structured value to its ARRAY(VARCHAR) and MAP(VARCHAR,
+// VARCHAR) the same way. The macros read them back (see sf_elem).
+const (
+	arrayColumn  = "VARCHAR[]"
+	objectColumn = "MAP(VARCHAR, VARCHAR)"
+)
 
 // parseType reads the Snowflake type that starts at nodes[i] (significant)
 // and returns it and the index just past it. ok is false when nodes[i] does
@@ -131,9 +156,25 @@ func parseType(nodes []*node, i int) (t sqlType, end int, ok bool, err error) {
 	case "TIME":
 		skipParams()
 		return sqlType{duck: "TIME"}, end, true, nil
-	case "VARIANT", "OBJECT", "ARRAY":
-		skipParams()
+	case "VARIANT":
 		return sqlType{duck: "JSON", class: classJSON}, end, true, nil
+	case "ARRAY", "OBJECT", "MAP":
+		if j := nextSig(nodes, end-1); j >= 0 && nodes[j].isGroup('(') && len(sig(nodes[j].kids)) > 0 {
+			duck, err := structuredType(first, nodes[j].kids)
+			if err != nil {
+				return sqlType{}, 0, false, err
+			}
+			return sqlType{duck: duck, class: classNested}, j + 1, true, nil
+		}
+		switch first {
+		case "ARRAY":
+			skipParams()
+			return sqlType{duck: "JSON", class: classJSON, column: arrayColumn}, end, true, nil
+		case "OBJECT":
+			skipParams()
+			return sqlType{duck: "JSON", class: classJSON, column: objectColumn}, end, true, nil
+		}
+		return sqlType{}, 0, false, nil
 	case "GEOGRAPHY", "GEOMETRY":
 		skipParams()
 		return sqlType{duck: "GEOMETRY"}, end, true, nil
@@ -141,6 +182,88 @@ func parseType(nodes []*node, i int) (t sqlType, end int, ok bool, err error) {
 		return sqlType{}, 0, false, unsupported("The VECTOR type", "store embeddings as ARRAY (JSON) or FLOAT columns")
 	}
 	return sqlType{}, 0, false, nil
+}
+
+// structuredType maps a structured type, kind ARRAY, OBJECT or MAP with
+// the nodes inside its parentheses, to DuckDB's list, struct or map: an
+// ARRAY(VARCHAR) is a VARCHAR[], an OBJECT(city VARCHAR, zip NUMBER) a
+// STRUCT("city" VARCHAR, "zip" DECIMAL(38,0)), a MAP(VARCHAR, NUMBER) a
+// MAP(VARCHAR, DECIMAL(38,0)). Keys of an OBJECT keep the case they are
+// written in, as Snowflake compares them; NOT NULL after a type is
+// dropped, as Iceberg's nested fields are all optional to DuckDB.
+func structuredType(kind string, kids []*node) (string, error) {
+	invalid := &Error{Code: CodeSyntax, Message: "invalid " + kind + "(...) type",
+		Hint: "ARRAY(type), OBJECT(name type, ...) or MAP(key type, value type)"}
+	// elem reads a type and an optional NOT NULL, which must be all of def.
+	elem := func(def []*node) (string, error) {
+		idx := sig(def)
+		if len(idx) == 0 {
+			return "", invalid
+		}
+		t, end, ok, err := parseType(def, idx[0])
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", &Error{Code: CodeUnsupported, Message: "type " + render(trim(def)) + " in " + kind + "(...) is not supported"}
+		}
+		rest := sig(def[end:])
+		if len(rest) == 2 && def[end+rest[0]].word() == "NOT" && def[end+rest[1]].word() == "NULL" {
+			rest = nil
+		}
+		if len(rest) > 0 {
+			return "", invalid
+		}
+		return t.columnType(), nil
+	}
+	args := splitArgs(kids)
+	switch kind {
+	case "ARRAY":
+		if len(args) != 1 {
+			return "", invalid
+		}
+		e, err := elem(args[0])
+		return e + "[]", err
+	case "MAP":
+		if len(args) != 2 {
+			return "", invalid
+		}
+		k, err := elem(args[0])
+		if err != nil {
+			return "", err
+		}
+		v, err := elem(args[1])
+		return "MAP(" + k + ", " + v + ")", err
+	}
+	fields := make([]string, len(args))
+	for i, a := range args {
+		idx := sig(a)
+		if len(idx) < 2 {
+			return "", invalid
+		}
+		name, _, ok := a[idx[0]].name()
+		if !ok {
+			return "", invalid
+		}
+		t, err := elem(a[idx[1]:])
+		if err != nil {
+			return "", err
+		}
+		fields[i] = quoteIdent(name) + " " + t
+	}
+	return "STRUCT(" + strings.Join(fields, ", ") + ")", nil
+}
+
+// ColumnType maps a Snowflake type written as text, such as a masking
+// policy's, to DuckDB's type for a column of it: VARCHAR for STRING,
+// VARCHAR[] for ARRAY. ok is false for text that is not one of the types
+// Igloo maps, which may be DuckDB's own.
+func ColumnType(s string) (string, bool) {
+	t, ok := typeName(s)
+	if !ok {
+		return "", false
+	}
+	return t.columnType(), true
 }
 
 // typeName maps a type written as text, as in a format or a TRY_CAST
@@ -172,7 +295,7 @@ func isTypeWord(w string) bool {
 		"FLOAT", "FLOAT4", "FLOAT8", "REAL", "DOUBLE", "VARCHAR", "STRING", "TEXT", "NVARCHAR", "NVARCHAR2",
 		"CHAR", "CHARACTER", "NCHAR", "BINARY", "VARBINARY", "BOOLEAN", "BOOL", "DATE", "DATETIME",
 		"TIMESTAMP_NTZ", "TIMESTAMPNTZ", "TIMESTAMP_LTZ", "TIMESTAMPLTZ", "TIMESTAMP_TZ", "TIMESTAMPTZ",
-		"TIMESTAMP", "TIME", "VARIANT", "OBJECT", "ARRAY", "GEOGRAPHY", "GEOMETRY", "VECTOR":
+		"TIMESTAMP", "TIME", "VARIANT", "OBJECT", "ARRAY", "MAP", "GEOGRAPHY", "GEOMETRY", "VECTOR":
 		return true
 	}
 	return false

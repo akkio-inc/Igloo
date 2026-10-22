@@ -24,6 +24,13 @@ type node struct {
 	json, str, num, notNull bool
 	// sel, when set, says the node is a call of MIN or MAX (see typed).
 	sel *selector
+	// elems, when set, are the elements of the array constant the node
+	// builds, [a, b] or ARRAY_CONSTRUCT(a, b), each as the JSON functions
+	// take it (see jsonArg), which FLATTEN unnests without building the
+	// array.
+	elems []*node
+	// column says the node reads a column (see semiArg).
+	column bool
 }
 
 // closer is the bracket that closes open.

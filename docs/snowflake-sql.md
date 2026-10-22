@@ -111,7 +111,13 @@ notices.
 
 ### Semi-structured data
 
-`VARIANT`, `OBJECT` and `ARRAY` are JSON.
+`VARIANT`, `OBJECT` and `ARRAY` values are JSON. Columns of them are
+Iceberg's own types where Iceberg has one, so that other engines read them
+and Igloo reads them without parsing text (see [columns](#semi-structured-columns)
+below): an `ARRAY` column is a list of strings (`VARCHAR[]`), an `OBJECT`
+column a map of strings (`MAP(VARCHAR, VARCHAR)`), and a `VARIANT` column
+the JSON text of its values (`VARCHAR`). Everything below reads all three,
+JSON and JSON text alike.
 
 - Paths: `v:a.b[0]`, `v['a']`, `v:"Quoted Key"`, `x::VARIANT[0]`, with casts
   (`v:a::string`, `v:n::number(10,2)`). A path compared with a string, used
@@ -130,7 +136,41 @@ notices.
   `ARRAY_GENERATE_RANGE`, `SPLIT`, `STRTOK_TO_ARRAY`.
 - `[LATERAL] FLATTEN(input => ..., path => ..., outer => ..., recursive =>
   ..., mode => ...)` and `TABLE(FLATTEN(...))`, with the columns `SEQ`,
-  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`.
+  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`. `FLATTEN` of an `ARRAY` or
+  `OBJECT` column unnests its list or map directly, and `FLATTEN` of an
+  array constant (`[OBJECT_CONSTRUCT(...), ...]`, `ARRAY_CONSTRUCT(...)`)
+  unnests its elements without building the array: over 15 million
+  elements, 0.3 s instead of 1 s from JSON text.
+
+#### Semi-structured columns
+
+Iceberg tables of the format versions Igloo's catalog allows (1 and 2) have
+no semi-structured type; Iceberg's `variant` needs version 3, which
+[erasure requests](privacy.md) cannot rewrite yet. Igloo stores Snowflake's
+types as follows, in `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN` and
+tables copied from [Snowflake connections](federation.md#snowflake):
+
+| Snowflake | Iceberg | DuckDB | What it holds |
+|---|---|---|---|
+| `ARRAY` | `list<string>` | `VARCHAR[]` | Each element as Snowflake's `TO_VARCHAR` writes it: a string as itself, any other value as its JSON text (`1`, `true`, `{"k":"v"}`); JSON `null` as `NULL` |
+| `OBJECT` | `map<string, string>` | `MAP(VARCHAR, VARCHAR)` | Each value likewise |
+| `VARIANT` | `string` | `VARCHAR` | The value's JSON text |
+| `ARRAY(type)`, `OBJECT(name type, ...)`, `MAP(type, type)` | `list`, `struct`, `map` of the types | `type[]`, `STRUCT(...)`, `MAP(...)` | The values as typed |
+
+This is how Snowflake itself converts semi-structured values to
+`ARRAY(VARCHAR)` and `MAP(VARCHAR, VARCHAR)`, so `INSERT INTO t SELECT
+ARRAY_CONSTRUCT(...)` and `PARSE_JSON(...)` store them that way. Reading
+them back, an element or value that is the JSON text of an object or an
+array reads as that object or array, so paths into an `ARRAY` of objects
+(`f.value:name`) work; one that is a number or a boolean reads as a string,
+which compares, casts and sums as the number (see [known
+differences](#known-differences)). A `VARIANT` column, or JSON text in any
+`VARCHAR` column, reads as the JSON it holds.
+
+`CREATE TABLE ... AS SELECT` of semi-structured values (`ARRAY_AGG(...)`,
+`OBJECT_CONSTRUCT(...)`, `PARSE_JSON(...)`) makes `VARCHAR` columns of
+their JSON text, as for `VARIANT`; cast to `ARRAY(VARCHAR)` or
+`MAP(VARCHAR, VARCHAR)` in the `SELECT` for lists and maps.
 
 ### Functions
 
@@ -193,7 +233,8 @@ A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
 | `DATE`, `TIME` | `DATE`, `TIME` |
 | `TIMESTAMP`, `TIMESTAMP_NTZ`, `DATETIME` | `TIMESTAMP` |
 | `TIMESTAMP_LTZ`, `TIMESTAMP_TZ` | `TIMESTAMPTZ` |
-| `VARIANT`, `OBJECT`, `ARRAY` | `JSON` |
+| `VARIANT`, `OBJECT`, `ARRAY` | `JSON`; columns of them as [above](#semi-structured-columns) |
+| `ARRAY(type)`, `OBJECT(name type, ...)`, `MAP(type, type)` | `type[]`, `STRUCT(name type, ...)`, `MAP(type, type)` |
 | `GEOGRAPHY`, `GEOMETRY` | `GEOMETRY` |
 
 ### Statements
@@ -250,6 +291,16 @@ What Igloo cannot reproduce exactly, and what it does instead.
 - `GROUP BY` a path groups `1` and `1.0` apart.
 - Objects list their keys in alphabetical order, as Snowflake shows them;
   `OBJECT_CONSTRUCT_KEEP_NULL` and `OBJECT_INSERT` keep `null` values.
+- An `ARRAY` or `OBJECT` column holds numbers and booleans as their text
+  (`["1","true"]`): `TYPEOF(a[0])` is `VARCHAR` and `TO_JSON(a)` shows
+  them quoted, where Snowflake shows `INTEGER` and `[1,true]`. Comparing,
+  casting and summing them gives the number. Selecting such a column
+  shows objects and arrays inside it as their JSON text in quotes;
+  `TO_JSON(a)` and `a::VARIANT` show them as objects and arrays. Store a
+  value whose types matter in a `VARIANT` column.
+- A masking policy on an `ARRAY` or `OBJECT` column returns its type, as
+  the column holds it: Igloo casts what its expression returns, so
+  `OBJECT_CONSTRUCT(...)` works.
 - `ARRAY_INTERSECTION` returns each common value once, without Snowflake's
   multiset counts.
 - `FLATTEN`'s `SEQ` is `NULL`.

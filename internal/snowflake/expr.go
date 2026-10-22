@@ -108,15 +108,19 @@ func (t *translator) literals(nodes []*node) ([]*node, error) {
 			}
 			elems := splitArgs(n.kids)
 			kids := []*node{raw("json_array(")}
+			var args []*node
 			for k, e := range elems {
 				if k > 0 {
 					kids = append(kids, raw(", "))
 				}
-				kids = append(kids, jsonArg(e))
+				a := jsonArg(e)
+				kids = append(kids, a)
+				args = append(args, a)
 			}
 			kids = append(kids, raw(")"))
 			nodes[i] = seq([]*node{n}, kids...)
 			nodes[i].json = true
+			nodes[i].elems = args
 		case n.kind == kWord:
 			// TIMESTAMP_LTZ '2024-01-01 10:00' and the like.
 			j := nextSig(nodes, i)
@@ -157,16 +161,75 @@ func (t *translator) objectConstant(g *node) (*node, error) {
 }
 
 // jsonArg makes an argument a JSON value, for functions that build JSON:
-// a variant as JSON, anything else as itself.
+// a variant as JSON, a column through sf_to_json (see semiArg), anything
+// else as itself.
 func jsonArg(arg []*node) *node {
 	arg = trim(arg)
 	if len(arg) == 1 {
 		if arg[0].kind == kVariant {
 			arg[0].v.mode = vJSON
 		}
-		return arg[0]
 	}
-	return seq(arg, arg...)
+	return semiArg(arg, "sf_to_json(")
+}
+
+// readArg makes an argument a semi-structured value to read, for
+// functions that take an ARRAY or OBJECT: a column through sf_json, which
+// reads text as JSON text and Igloo's ARRAY and OBJECT columns as theirs,
+// anything else as itself, for CAST(... AS JSON).
+func readArg(arg []*node) *node {
+	arg = trim(arg)
+	if len(arg) == 1 && arg[0].kind == kVariant {
+		arg[0].v.mode = vJSON
+	}
+	return semiArg(arg, "sf_json(")
+}
+
+// semiArg is x through macro fn when x is a column, which may be one of
+// Igloo's ARRAY or OBJECT columns, a list or map of strings (see sf_json and
+// sf_to_json); any other expression as itself. Only columns can be such
+// lists: the translations of Snowflake's functions return JSON.
+func semiArg(x []*node, fn string) *node {
+	x = trim(x)
+	if isColumnRef(x) {
+		n := seq(x, raw(fn), seq(x, x...), raw(")"))
+		n.column = true
+		return n
+	}
+	if len(x) == 1 {
+		return x[0]
+	}
+	return seq(x, x...)
+}
+
+// isColumnRef reports whether nodes are a column's name: name, or names
+// joined by dots.
+func isColumnRef(nodes []*node) bool {
+	idx := sig(nodes)
+	if len(idx) == 0 || len(idx)%2 == 0 || len(idx) > 7 {
+		return false
+	}
+	for k, i := range idx {
+		n := nodes[i]
+		if k%2 == 1 {
+			if !n.isOp(".") {
+				return false
+			}
+			continue
+		}
+		switch n.kind {
+		case kQuoted:
+		case kWord:
+			switch n.word() {
+			case "NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME",
+				"LOCALTIMESTAMP", "SYSDATE", "DEFAULT":
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // paths translates access to semi-structured values: v:a.b[0], v['a'],
@@ -207,7 +270,7 @@ func (t *translator) paths(nodes []*node) ([]*node, error) {
 					p, start = s, s
 				}
 				base = nodes[start : p+1]
-				v = &variant{base: seq(base, base...)}
+				v = &variant{base: seq(base, base...), column: isColumnRef(base)}
 			}
 		case t.isFlattenColumn(nodes, i):
 			start = qualifiedStart(nodes, i)
@@ -383,6 +446,12 @@ func castExpr(x []*node, typ sqlType, try bool) *node {
 		case classString:
 			v.mode = vString
 			return seq(x, x[0])
+		case classNested:
+			// A structured type converts the value's elements as
+			// Snowflake does: DuckDB's casts of JSON to lists, structs
+			// and maps.
+			v.mode = vJSON
+			return seq(x, raw(fn), x[0], raw(" AS "+typ.duck+")"))
 		}
 		v.mode = vString
 		if d := decimalCast(x[0], fn, typ.duck); d != nil {
@@ -392,11 +461,17 @@ func castExpr(x []*node, typ sqlType, try bool) *node {
 	}
 	switch typ.class {
 	case classJSON:
-		n := seq(x, raw("to_json("), operand(x), raw(")"))
+		n := seq(x, raw("to_json("), seq(x, x...), raw(")"))
+		if isColumnRef(x) {
+			n = semiArg(x, "sf_to_json(")
+		}
 		n.json = true
 		return n
 	case classString:
 		return varcharCast(x)
+	case classNested:
+		// Text is JSON text, as for paths; see sf_json.
+		return seq(x, raw(fn+"sf_json("), seq(x, x...), raw(") AS "+typ.duck+")"))
 	}
 	if s, ok := x[0].stringValue(); ok && len(x) == 1 && typ.duck == "TIMESTAMPTZ" {
 		// Snowflake reads '2024-01-01 10:00:00 +05:00', with a space
@@ -465,13 +540,15 @@ func varcharCast(x []*node) *node {
 //   - TIMESTAMP_LTZ and _TZ: TIMESTAMP_OUTPUT_FORMAT's, YYYY-MM-DD
 //     HH24:MI:SS.FF3 TZHTZM, in the session's time zone;
 //   - TIME: TIME_OUTPUT_FORMAT's, HH24:MI:SS;
-//   - BINARY: BINARY_OUTPUT_FORMAT's, HEX.
+//   - BINARY: BINARY_OUTPUT_FORMAT's, HEX;
+//   - ARRAY and OBJECT (lists, maps and structs): their JSON text.
 var defaultText = "CASE WHEN typeof({x}) = 'JSON' THEN json_extract_string(CAST({x} AS JSON), '$')" +
 	" WHEN typeof({x}) IN ('DOUBLE', 'FLOAT') THEN " + floatText("CAST({x} AS DOUBLE)") +
 	" WHEN typeof({x}) IN ('TIMESTAMP', 'TIMESTAMP_S', 'TIMESTAMP_MS', 'TIMESTAMP_NS') THEN strftime(CAST({x} AS TIMESTAMP), '%Y-%m-%d %H:%M:%S.%g')" +
 	" WHEN typeof({x}) = 'TIMESTAMP WITH TIME ZONE' THEN " + tzhtzm("strftime(CAST({x} AS TIMESTAMPTZ), '%Y-%m-%d %H:%M:%S.%g %z')") +
 	" WHEN typeof({x}) = 'TIME' THEN strftime(DATE '1970-01-01' + CAST({x} AS TIME), '%H:%M:%S')" +
 	" WHEN typeof({x}) = 'BLOB' THEN hex(CAST({x} AS BLOB))" +
+	" WHEN typeof({x}) LIKE '%[]' OR typeof({x}) LIKE 'MAP(%' OR typeof({x}) LIKE 'STRUCT(%' THEN CAST(sf_json({x}) AS VARCHAR)" +
 	" ELSE CAST({x} AS VARCHAR) END"
 
 // floatText formats v, a DOUBLE, as Snowflake prints a FLOAT.
@@ -778,7 +855,7 @@ func orderItem(item []*node) []*node {
 	if len(expr) == 1 && expr[0].kind == kVariant {
 		v := expr[0].v
 		v.mode = vString
-		num := &variant{base: v.base, segs: v.segs, json: v.json, mode: vNumber, try: true}
+		num := &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, mode: vNumber, try: true}
 		d := " ASC"
 		if desc {
 			d = " DESC"

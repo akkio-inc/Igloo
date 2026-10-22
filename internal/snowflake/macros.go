@@ -116,6 +116,85 @@ var macros = []string{
 			+ CASE WHEN opt = 1 THEN length(regexp_extract_all(substring(s, pos), p)[occ]) ELSE 0 END END`,
 	// SEARCH's tokens: runs of letters and digits, in lower case.
 	`CREATE OR REPLACE TEMP MACRO sf_search_tokens(s) AS list_filter(regexp_split_to_array(lower(s), '[^\p{L}\p{N}]+'), lambda t: t <> '')`,
+
+	// Semi-structured values. A VARIANT, ARRAY or OBJECT value is JSON, as
+	// are the columns of views and of connections' tables that hold one;
+	// a VARCHAR holding JSON text, as tables loaded from text hold them,
+	// reads as that JSON. Igloo's ARRAY and OBJECT columns are a list of
+	// strings (VARCHAR[]) and a map of strings (MAP(VARCHAR, VARCHAR)),
+	// which Iceberg tables hold and other engines read: each element or
+	// value as Snowflake's TO_VARCHAR writes it, a string as itself and
+	// anything else as its JSON text. These macros read each kind. Those
+	// that choose by typeof(x) choose when DuckDB binds the call, since
+	// typeof is a constant, so a view keeps working, and is as fast, when
+	// its table's column changes from JSON text to a list.
+	//
+	// sf_elem reads an element or value of such a list or map: the JSON
+	// text of an object or array as that object or array, so that objects
+	// in an ARRAY keep their paths, anything else as a string, and NULL
+	// as JSON null.
+	`CREATE OR REPLACE TEMP MACRO sf_elem(e) AS CASE WHEN e IS NULL THEN CAST('null' AS JSON)
+		WHEN (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e) THEN CAST(e AS JSON) ELSE to_json(e) END`,
+	// A list or a map of strings as JSON, read by sf_elem; when no element
+	// is an object's or an array's text, to_json alone, three times faster.
+	`CREATE OR REPLACE TEMP MACRO sf_strings_json(x) AS
+		CASE WHEN list_bool_or(list_transform(x, lambda e: starts_with(e, '{') OR starts_with(e, '[')))
+		THEN to_json(list_transform(x, lambda e: sf_elem(e))) ELSE to_json(x) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_map_json(x) AS
+		CASE WHEN list_bool_or(list_transform(map_values(x), lambda e: starts_with(e, '{') OR starts_with(e, '[')))
+		THEN to_json(map(map_keys(x), list_transform(map_values(x), lambda e: sf_elem(e)))) ELSE to_json(x) END`,
+	// sf_json is any value as JSON: a list or map of strings as above, text
+	// as the JSON it holds.
+	`CREATE OR REPLACE TEMP MACRO sf_json(x) AS CASE
+		WHEN typeof(x) = 'VARCHAR[]' THEN sf_strings_json(CAST(x AS VARCHAR[]))
+		WHEN typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN sf_map_json(CAST(x AS MAP(VARCHAR, VARCHAR)))
+		ELSE CAST(x AS JSON) END`,
+	// sf_to_json is a column passed to a function that builds JSON (an
+	// OBJECT_CONSTRUCT's value, an ARRAY_CONSTRUCT's element), as JSON the
+	// way those functions take it: a list or map of strings as above, text
+	// as a string, JSON as itself.
+	`CREATE OR REPLACE TEMP MACRO sf_to_json(x) AS CASE
+		WHEN typeof(x) = 'VARCHAR[]' THEN sf_strings_json(CAST(x AS VARCHAR[]))
+		WHEN typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN sf_map_json(CAST(x AS MAP(VARCHAR, VARCHAR)))
+		WHEN typeof(x) = 'VARIANT' THEN CAST(x AS JSON)
+		ELSE to_json(x) END`,
+	// sf_get and sf_get_string read path p of x, as json_extract and
+	// json_extract_string do.
+	`CREATE OR REPLACE TEMP MACRO sf_get(x, p) AS CASE
+		WHEN typeof(x) IN ('VARCHAR[]', 'MAP(VARCHAR, VARCHAR)', 'VARIANT') THEN json_extract(sf_json(x), p)
+		ELSE json_extract(x, p) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_get_string(x, p) AS CASE
+		WHEN typeof(x) IN ('VARCHAR[]', 'MAP(VARCHAR, VARCHAR)', 'VARIANT') THEN json_extract_string(sf_json(x), p)
+		ELSE json_extract_string(x, p) END`,
+	// FLATTEN's values, keys and indexes of x, with MODE m: lists that
+	// FLATTEN unnests side by side (see flattenUnnest). A list of strings
+	// and a map of strings give theirs as they are; text, JSON and any
+	// other type those of the JSON they are or hold.
+	`CREATE OR REPLACE TEMP MACRO sf_flatten_values(x, m) AS CASE
+		WHEN typeof(x) IN ('VARCHAR', 'JSON') THEN CASE json_type(CAST(x AS VARCHAR))
+			WHEN 'ARRAY' THEN CASE WHEN m <> 'OBJECT' THEN json_extract(CAST(x AS VARCHAR), '$[*]') END
+			WHEN 'OBJECT' THEN CASE WHEN m <> 'ARRAY' THEN json_extract(CAST(x AS VARCHAR), '$.*') END END
+		WHEN typeof(x) = 'VARCHAR[]' THEN CASE WHEN m <> 'OBJECT' THEN list_transform(CAST(x AS VARCHAR[]), lambda e: sf_elem(e)) END
+		WHEN typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN
+			CASE WHEN m <> 'ARRAY' THEN list_transform(map_values(CAST(x AS MAP(VARCHAR, VARCHAR))), lambda e: sf_elem(e)) END
+		ELSE CASE json_type(sf_json(x))
+			WHEN 'ARRAY' THEN CASE WHEN m <> 'OBJECT' THEN json_extract(sf_json(x), '$[*]') END
+			WHEN 'OBJECT' THEN CASE WHEN m <> 'ARRAY' THEN json_extract(sf_json(x), '$.*') END END END`,
+	`CREATE OR REPLACE TEMP MACRO sf_flatten_keys(x, m) AS CASE
+		WHEN m = 'ARRAY' OR typeof(x) = 'VARCHAR[]' THEN CAST(NULL AS VARCHAR[])
+		WHEN typeof(x) IN ('VARCHAR', 'JSON') THEN CASE WHEN json_type(CAST(x AS VARCHAR)) = 'OBJECT' THEN json_keys(CAST(x AS VARCHAR)) END
+		WHEN typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN map_keys(CAST(x AS MAP(VARCHAR, VARCHAR)))
+		ELSE CASE WHEN json_type(sf_json(x)) = 'OBJECT' THEN json_keys(sf_json(x)) END END`,
+	// THIS, x as JSON, once for each of FLATTEN's rows: DuckDB 1.5 cannot
+	// plan an unnest of a lateral subquery next to another expression of
+	// the rows it is joined to.
+	`CREATE OR REPLACE TEMP MACRO sf_flatten_this(x, m) AS repeat([sf_json(x)], len(sf_flatten_values(x, m)))`,
+	`CREATE OR REPLACE TEMP MACRO sf_flatten_indexes(x, m) AS CASE
+		WHEN m = 'OBJECT' OR typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN CAST(NULL AS BIGINT[])
+		WHEN typeof(x) IN ('VARCHAR', 'JSON') THEN
+			CASE WHEN json_type(CAST(x AS VARCHAR)) = 'ARRAY' THEN range(CAST(json_array_length(CAST(x AS VARCHAR)) AS BIGINT)) END
+		WHEN typeof(x) = 'VARCHAR[]' THEN range(CAST(len(CAST(x AS VARCHAR[])) AS BIGINT))
+		ELSE CASE WHEN json_type(sf_json(x)) = 'ARRAY' THEN range(CAST(json_array_length(sf_json(x)) AS BIGINT)) END END`,
 }
 
 // Macros returns the statements that define, in a session, the macros

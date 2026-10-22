@@ -1968,8 +1968,8 @@ func minMax(c *call) (*node, error) {
 		return n, nil
 	}
 	v := c.args[0][0].v
-	str := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, mode: vString}}
-	num := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, mode: vNumber, try: true}}
+	str := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, mode: vString}}
+	num := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, mode: vNumber, try: true}}
 	v.mode = vJSON
 	fn := "arg_min"
 	if c.name == "MAX" {
@@ -2262,14 +2262,17 @@ func arrayConstruct(c *call) (*node, error) {
 		return n, nil
 	}
 	parts := []any{"json_array("}
+	var elems []*node
 	for k, a := range c.args {
 		if k > 0 {
 			parts = append(parts, ", ")
 		}
-		parts = append(parts, jsonArg(a))
+		e := jsonArg(a)
+		parts = append(parts, e)
+		elems = append(elems, e)
 	}
 	n := c.out(append(parts, ")")...)
-	n.json, n.notNull = true, true
+	n.json, n.notNull, n.elems = true, true, elems
 	return n, nil
 }
 
@@ -2289,7 +2292,7 @@ func arrayConstructCompact(c *call) (*node, error) {
 
 // jsonList is argument i, an ARRAY, as a DuckDB list of JSON values.
 func (c *call) jsonList(i int) *node {
-	return c.out("CAST(CAST(", jsonArg(c.args[i]), " AS JSON) AS JSON[])")
+	return c.out("CAST(CAST(", readArg(c.args[i]), " AS JSON) AS JSON[])")
 }
 
 // arraySize translates ARRAY_SIZE, NULL for what is not an ARRAY.
@@ -2297,7 +2300,7 @@ func arraySize(c *call) (*node, error) {
 	if err := c.argc(1, 1); err != nil {
 		return nil, err
 	}
-	x := jsonArg(c.args[0])
+	x := readArg(c.args[0])
 	return c.out("CASE WHEN json_type(CAST(", x, " AS JSON)) = 'ARRAY' THEN CAST(json_array_length(CAST(", x,
 		" AS JSON)) AS BIGINT) END"), nil
 }
@@ -2398,7 +2401,7 @@ func objectInsert(c *call) (*node, error) {
 	if err := c.argc(3, 4); err != nil {
 		return nil, err
 	}
-	n := c.out("json_merge_patch(CAST(", jsonArg(c.args[0]), " AS JSON), json_object(", c.arg(1), ", ", jsonArg(c.args[2]), "))")
+	n := c.out("json_merge_patch(CAST(", readArg(c.args[0]), " AS JSON), json_object(", c.arg(1), ", ", jsonArg(c.args[2]), "))")
 	n.json = true
 	return n, nil
 }
@@ -2424,10 +2427,10 @@ func variantOf(c *call, segs []pathSeg) *node {
 	base := c.args[0]
 	if len(base) == 1 && base[0].kind == kVariant {
 		v := base[0].v
-		return &node{kind: kVariant, v: &variant{base: v.base, segs: append(append([]pathSeg{}, v.segs...), segs...), json: v.json},
+		return &node{kind: kVariant, v: &variant{base: v.base, segs: append(append([]pathSeg{}, v.segs...), segs...), json: v.json, column: v.column},
 			pos: c.span[0].pos, end: c.span[len(c.span)-1].end}
 	}
-	return &node{kind: kVariant, v: &variant{base: c.arg(0), segs: segs}, pos: c.span[0].pos, end: c.span[len(c.span)-1].end}
+	return &node{kind: kVariant, v: &variant{base: c.arg(0), segs: segs, column: isColumnRef(c.args[0])}, pos: c.span[0].pos, end: c.span[len(c.span)-1].end}
 }
 
 // getPath translates GET_PATH(value, 'path').
@@ -2489,7 +2492,7 @@ func typeOf(c *call) (*node, error) {
 	if err := c.argc(1, 1); err != nil {
 		return nil, err
 	}
-	x := jsonArg(c.args[0])
+	x := readArg(c.args[0])
 	n := c.out("CASE json_type(CAST(", x, " AS JSON)) WHEN 'UBIGINT' THEN 'INTEGER' WHEN 'BIGINT' THEN 'INTEGER' "+
 		"WHEN 'DOUBLE' THEN 'DECIMAL' WHEN 'NULL' THEN 'NULL_VALUE' ELSE json_type(CAST(", x, " AS JSON)) END")
 	n.str = true

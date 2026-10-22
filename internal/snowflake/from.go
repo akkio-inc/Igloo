@@ -220,7 +220,9 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 					alias = "flatten_" + itoa(t.gen)
 				}
 			}
-			out, err = t.flattenTable(call, alias, cols)
+			// THIS is computed only where the statement could read it: by
+			// name, or with a star at this level.
+			out, err = t.flattenTable(call, alias, cols, t.mentionsThis || selectsStar(nodes))
 		case "SPLIT_TO_TABLE":
 			if alias == "" {
 				alias = "split_to_table"
@@ -289,7 +291,7 @@ func aliasClause(alias string, cols *node) string {
 // elements (see flattenUnnest), or with OUTER or RECURSIVE over DuckDB's
 // json_each or json_tree. SEQ is NULL: a lateral subquery cannot number the
 // rows it is joined to.
-func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, error) {
+func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bool) (*node, error) {
 	pos, named := t.tableArgs(g)
 	input := named["INPUT"]
 	if input == nil && len(pos) > 0 {
@@ -329,7 +331,7 @@ func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, err
 		}
 	}
 	prefix := ""
-	this := []*node{raw("CAST("), jsonArg(input), raw(" AS JSON)")}
+	in := flattenInput(input)
 	if a, ok := named["PATH"]; ok {
 		s, lit := (&call{args: [][]*node{a}}).literal(0)
 		if !lit {
@@ -341,10 +343,10 @@ func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, err
 		}
 		v := &variant{segs: segs}
 		prefix = s
-		this = []*node{raw("json_extract(CAST("), jsonArg(input), raw(" AS JSON), " + v.path() + ")")}
+		in = seq(nil, raw("json_extract(sf_json("), in, raw("), "+v.path()+")"))
 	}
 	if !recursive && !outer {
-		return flattenUnnest(this, prefix, mode, alias, cols), nil
+		return flattenUnnest(in, prefix, mode, alias, cols, wantThis), nil
 	}
 	parent := "_sf_flatten_input._sf_this"
 	tableFn := "json_each"
@@ -374,12 +376,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, err
 		"CASE WHEN json_type(" + parent + ") = 'OBJECT' THEN _sf_flatten.key END AS \"KEY\", " +
 		"coalesce(" + path + ", '') AS \"PATH\", " +
 		"CASE WHEN json_type(" + parent + ") = 'ARRAY' THEN CAST(_sf_flatten.key AS BIGINT) END AS \"INDEX\", " +
-		"_sf_flatten.value AS \"VALUE\", " + parent + " AS \"THIS\" FROM (SELECT "
-	kids := []*node{raw(sql)}
-	kids = append(kids, this...)
-	tail := " AS _sf_this) AS _sf_flatten_input" + elements + " ORDER BY _sf_flatten.id)"
-	kids = append(kids, raw(tail+aliasClause(alias, cols)))
-	return seq(nil, kids...), nil
+		"_sf_flatten.value AS \"VALUE\", " + parent + " AS \"THIS\" FROM (SELECT sf_json("
+	tail := ") AS _sf_this) AS _sf_flatten_input" + elements + " ORDER BY _sf_flatten.id)"
+	return seq(nil, raw(sql), in, raw(tail+aliasClause(alias, cols))), nil
 }
 
 // flattenUnnest is FLATTEN without OUTER or RECURSIVE: the elements of an
@@ -393,29 +392,116 @@ func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, err
 // way. Unnests in one select list are zipped, the shorter padded with NULL,
 // so an array's elements have no key and an object's members no index;
 // MODE leaves out the others' lists. JSON nulls stay JSON, as in json_each.
-func flattenUnnest(this []*node, prefix, mode, alias string, cols *node) *node {
-	values, keys, indexes := "CASE json_type(_sf_this)", "NULL", "NULL"
-	if mode != "OBJECT" {
-		values += " WHEN 'ARRAY' THEN json_extract(_sf_this, '$[*]')"
-		indexes = "CASE json_type(_sf_this) WHEN 'ARRAY' THEN range(CAST(json_array_length(_sf_this) AS BIGINT)) END"
-	}
-	if mode != "ARRAY" {
-		values += " WHEN 'OBJECT' THEN json_extract(_sf_this, '$.*')"
-		keys = "CASE json_type(_sf_this) WHEN 'OBJECT' THEN json_keys(_sf_this) END"
-	}
-	values += " END"
+//
+// The lists come from the sf_flatten_ macros, which take the input as it
+// is: JSON or JSON text, or a list or map of strings, Igloo's ARRAY and
+// OBJECT columns, whose elements they unnest without going through JSON
+// text. An input that is a column is unnested where it is read: DuckDB
+// plans an unnest of a lateral subquery without FROM as an unnest of the
+// rows it is joined to, where one with FROM takes a dependent join, which
+// costs as much again as unnesting (0.3 s against 1 s for 15 million
+// elements of 3 million lists). Any other input is computed once, in a
+// subquery of its own, since the unnests would each compute it. An array
+// constant, [a, b] or ARRAY_CONSTRUCT(a, b), is unnested from a list of its
+// elements, without building the array and reading it back: three times
+// faster where each row builds objects to flatten.
+func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bool) *node {
 	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
 	path := rel
 	if prefix != "" {
 		path = quoteString(prefix) + " || CASE WHEN _sf_flatten._sf_key IS NULL THEN '' ELSE '.' END || " + rel
 	}
-	kids := []*node{raw("LATERAL (SELECT CAST(NULL AS BIGINT) AS \"SEQ\", _sf_flatten._sf_key AS \"KEY\", " +
+	key := "_sf_flatten._sf_key"
+	this := "CAST(NULL AS JSON)"
+	m := quoteString(mode)
+	var lists []*node
+	switch {
+	case in.elems != nil && prefix == "" && mode != "OBJECT":
+		key, path = "CAST(NULL AS VARCHAR)", "'[' || _sf_flatten._sf_index || ']'"
+		lists = append(lists, raw("unnest(["))
+		for k, e := range in.elems {
+			if k > 0 {
+				lists = append(lists, raw(", "))
+			}
+			lists = append(lists, raw("coalesce(to_json("), e, raw("), CAST('null' AS JSON))"))
+		}
+		n := itoa(len(in.elems))
+		lists = append(lists, raw("]) AS _sf_value, unnest(range("+n+")) AS _sf_index"))
+		if wantThis {
+			this = "_sf_flatten._sf_this"
+			lists = append(lists, raw(", unnest(repeat(["), in, raw("], "+n+")) AS _sf_this"))
+		}
+	case isColumnNode(in):
+		x := in.String()
+		lists = append(lists, raw("unnest(sf_flatten_values("+x+", "+m+")) AS _sf_value, unnest(sf_flatten_keys("+x+", "+m+
+			")) AS _sf_key, unnest(sf_flatten_indexes("+x+", "+m+")) AS _sf_index"))
+		if wantThis {
+			this = "_sf_flatten._sf_this"
+			lists = append(lists, raw(", unnest(sf_flatten_this("+x+", "+m+")) AS _sf_this"))
+		}
+	default:
+		if wantThis {
+			this = "sf_json(_sf_flatten._sf_this)"
+		}
+		lists = append(lists, raw("_sf_this, unnest(sf_flatten_values(_sf_this, "+m+")) AS _sf_value, unnest(sf_flatten_keys(_sf_this, "+m+
+			")) AS _sf_key, unnest(sf_flatten_indexes(_sf_this, "+m+")) AS _sf_index FROM (SELECT "), in,
+			raw(" AS _sf_this) AS _sf_flatten_input"))
+	}
+	kids := []*node{raw("LATERAL (SELECT CAST(NULL AS BIGINT) AS \"SEQ\", " + key + " AS \"KEY\", " +
 		"coalesce(" + path + ", '') AS \"PATH\", _sf_flatten._sf_index AS \"INDEX\", _sf_flatten._sf_value AS \"VALUE\", " +
-		"_sf_flatten._sf_this AS \"THIS\" FROM (SELECT _sf_this, unnest(" + values + ") AS _sf_value, unnest(" + keys +
-		") AS _sf_key, unnest(" + indexes + ") AS _sf_index FROM (SELECT ")}
-	kids = append(kids, this...)
-	kids = append(kids, raw(" AS _sf_this) AS _sf_flatten_input) AS _sf_flatten)"+aliasClause(alias, cols)))
+		this + " AS \"THIS\" FROM (SELECT ")}
+	kids = append(kids, lists...)
+	kids = append(kids, raw(") AS _sf_flatten)"+aliasClause(alias, cols)))
 	return seq(nil, kids...)
+}
+
+// selectsStar reports whether nodes, one level of a statement, select
+// columns with a star (*, t.*), which would take a FLATTEN's THIS.
+func selectsStar(nodes []*node) bool {
+	for i, n := range nodes {
+		if !n.isOp("*") {
+			continue
+		}
+		p := prevSig(nodes, i)
+		if p < 0 {
+			continue
+		}
+		switch w := nodes[p].word(); {
+		case nodes[p].isOp(","), nodes[p].isOp("."), w == "SELECT", w == "DISTINCT", w == "ALL", nodes[p].kind == kNumber:
+			return true
+		}
+	}
+	return false
+}
+
+// flattenInput is FLATTEN's input as the sf_ macros take it: a column as
+// it is, a list or map included, rather than through sf_semi.
+func flattenInput(input []*node) *node {
+	x := trim(input)
+	if len(x) == 1 && x[0].kind == kVariant {
+		x[0].v.mode = vJSON
+	}
+	if len(x) == 1 && x[0].word() == "NULL" {
+		return seq(x, raw("CAST(NULL AS JSON)"))
+	}
+	if isColumnRef(x) {
+		n := seq(x, x...)
+		n.column = true
+		return n
+	}
+	if len(x) == 1 {
+		return x[0]
+	}
+	return seq(x, x...)
+}
+
+// isColumnNode reports whether n, an argument as jsonArg made it, reads a
+// column: a table's (see semiArg), or a FLATTEN's VALUE or THIS.
+func isColumnNode(n *node) bool {
+	if n.kind == kVariant {
+		return n.v.json && len(n.v.segs) == 0
+	}
+	return n.column
 }
 
 // splitToTable translates SPLIT_TO_TABLE(s, delimiter): a row for each

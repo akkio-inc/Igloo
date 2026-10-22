@@ -59,6 +59,8 @@ type translator struct {
 	grouped map[*node]bool
 	// gen numbers the names the translation makes up.
 	gen int
+	// mentionsThis says the statement names THIS, a FLATTEN's column.
+	mentionsThis bool
 }
 
 func (t *translator) notice(format string, args ...any) {
@@ -88,6 +90,9 @@ func Translate(sql string, opts Options) (Result, error) {
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true
+		}
+		if tok.kind == kWord && strings.EqualFold(tok.text, "THIS") || tok.kind == kQuoted && strings.EqualFold(tok.val, "THIS") {
+			t.mentionsThis = true
 		}
 	}
 	quoteKeywordQualifiers(toks)
@@ -594,13 +599,14 @@ func isConstraintWord(w string) bool {
 	return false
 }
 
-// mapTypeAt replaces the Snowflake type at nodes[i] by DuckDB's.
+// mapTypeAt replaces the Snowflake type at nodes[i], a column's, by
+// DuckDB's for the column.
 func (t *translator) mapTypeAt(nodes []*node, i int) error {
 	typ, end, ok, err := parseType(nodes, i)
 	if err != nil || !ok {
 		return err
 	}
-	nodes[i] = &node{kind: kRaw, text: typ.duck, pos: nodes[i].pos, end: nodes[end-1].end}
+	nodes[i] = &node{kind: kRaw, text: typ.columnType(), pos: nodes[i].pos, end: nodes[end-1].end}
 	for j := i + 1; j < end; j++ {
 		nodes[j] = &node{kind: kRaw}
 	}

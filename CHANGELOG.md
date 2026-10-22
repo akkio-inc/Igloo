@@ -720,6 +720,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   length rather than its square: Igloo's rewrite of catalog casts lexed the
   whole statement again for each cast. A profile of 449 columns took 4.3
   seconds to prepare and run on an empty table, and now takes 0.43.
+- Faster `FLATTEN` in Snowflake's dialect. `FLATTEN` of a column unnests it
+  where it is read, without the dependent join a subquery of its own took,
+  and unnests an `ARRAY` or `OBJECT` column's list or map without going
+  through JSON text: 0.3 s instead of 1 s for 15 million elements of 3
+  million rows. `FLATTEN` of an array constant, as reports build from each
+  row's columns (`[OBJECT_CONSTRUCT(...), ...]`), unnests its elements
+  without building the array and parsing it back, three times faster.
+  `THIS` is computed only where a statement can read it.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables
