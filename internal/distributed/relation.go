@@ -466,7 +466,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 		}
 	}
 	x := pl.exchange("relation", xkeys, casts)
-	if err := pl.produce(r.q, r.scope, x, r.columns); err != nil {
+	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
 		return nil, err
 	}
 	if r.def != nil {
@@ -477,8 +477,9 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 
 // produce plans the stages that write the rows of query node q, as scope
 // sees it, to out, with the columns cols (names and types): a SELECT, or a
-// UNION ALL whose branches all write to out.
-func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column) error {
+// UNION ALL whose branches all write to out. The last stage applies wraps,
+// innermost first, to its rows before it writes them.
+func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
 	switch str(q["type"]) {
 	case "SET_OPERATION_NODE":
 		if str(q["setop_type"]) != "UNION" || q["setop_all"] != true {
@@ -489,7 +490,7 @@ func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column)
 		}
 		sc := scope.with(q)
 		for _, side := range []string{"left", "right"} {
-			if err := pl.produce(child(q, side), sc, out, cols); err != nil {
+			if err := pl.produce(child(q, side), sc, out, cols, wraps); err != nil {
 				return err
 			}
 		}
@@ -500,9 +501,9 @@ func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column)
 			if err != nil {
 				return err
 			}
-			return pl.produceSelect(outer, sc, out, cols)
+			return pl.produceSelect(outer, sc, out, cols, wraps)
 		}
-		return pl.produceSelect(q, scope, out, cols)
+		return pl.produceSelect(q, scope, out, cols, wraps)
 	}
 	return unsupported("%s in a relation", strings.ToLower(str(q["type"])))
 }
@@ -650,7 +651,16 @@ func stripAliases(e node) node {
 }
 
 // produceSelect plans the stages that write the rows of a SELECT to out.
-func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols []Column) error {
+func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
+	if w, r, err := pl.projection(sel, scope); err != nil {
+		return err
+	} else if w != nil {
+		// It filters and projects a relation nothing else reads: the
+		// relation's last stage does that too, rather than a stage of its
+		// own reading what that one wrote.
+		w.want = cols
+		return pl.produce(r.q, r.scope, out, r.columns, append([]*wrapper{w}, wraps...))
+	}
 	for _, m := range list(sel, "modifiers") {
 		if t := str(m.(node)["type"]); t != "DISTINCT_MODIFIER" {
 			return unsupported("%s in a relation", strings.ToLower(t))
@@ -698,23 +708,127 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 		return err
 	}
 	// The last stage writes the relation's columns, named and typed as
-	// the consumers read them.
+	// the consumers read them, through the projections it computes too.
+	last := &b.fragment
 	if b.second != nil {
-		if err := pl.checkFunctions(b.second.fragment); err != nil {
-			return err
-		}
-		if b.second.fragment, err = pl.conform(b.second.fragment, c.columns, cols); err != nil {
-			return err
-		}
-		b.second.columns = names(cols)
-	} else {
-		if b.fragment, err = pl.conform(b.fragment, c.columns, cols); err != nil {
-			return err
-		}
-		b.columns = names(cols)
+		last = &b.second.fragment
 	}
+	f, err := pl.conform(*last, c.columns, cols)
+	if err != nil {
+		return err
+	}
+	have := cols
+	for _, w := range wraps {
+		if f, err = pl.conform(w.apply(f, have), w.have, w.want); err != nil {
+			return err
+		}
+		have = w.want
+	}
+	if b.second != nil {
+		if err := pl.checkFragment(f); err != nil {
+			return err
+		}
+		b.second.columns = names(have)
+	} else {
+		if len(wraps) > 0 {
+			if err := pl.checkFragment(f); err != nil {
+				return err
+			}
+		}
+		b.columns = names(have)
+	}
+	*last = f
 	_, err = pl.emit(j, b, out)
 	return err
+}
+
+// wrapper is a SELECT that filters and projects the rows of a relation it
+// reads alone, which the relation's last stage computes (projection).
+type wrapper struct {
+	sel node
+	// ref is the relation's reference in sel's FROM.
+	ref node
+	// have are sel's result columns; want are those it writes.
+	have, want []Column
+	// template is SELECT * FROM (SELECT 1) AS x, for the subquery that
+	// reads the relation's rows.
+	template node
+}
+
+// apply returns w's SELECT over f, whose result columns are inner.
+func (w *wrapper) apply(f node, inner []Column) node {
+	out := clone(w.sel).(node)
+	out["cte_map"] = node{"map": []any{}}
+	sub := clone(w.template).(node)
+	child(sub, "subquery")["node"] = f
+	alias := str(w.ref["alias"])
+	if alias == "" {
+		alias = str(w.ref["table_name"])
+	}
+	if alias == "" {
+		alias = "__igloo_r"
+	}
+	sub["alias"] = alias
+	var aliases []any
+	for i, c := range inner {
+		name := c.Name
+		if renamed := list(w.ref, "column_name_alias"); i < len(renamed) {
+			name = str(renamed[i])
+		}
+		aliases = append(aliases, name)
+	}
+	sub["column_name_alias"] = aliases
+	out["from_table"] = sub
+	return out
+}
+
+// projection reports whether sel only filters and projects one relation,
+// a subquery or a common table expression nothing else reads, and if so
+// returns the wrapper that computes it over the relation's rows.
+func (pl *planner) projection(sel node, scope cteScope) (*wrapper, *relUse, error) {
+	if len(list(sel, "modifiers")) > 0 || len(list(sel, "group_expressions")) > 0 || child(sel, "having") != nil ||
+		child(sel, "qualify") != nil || child(sel, "sample") != nil || str(sel["aggregate_handling"]) != "STANDARD_HANDLING" ||
+		pl.hasAggregate(sel["select_list"]) || hasClass(clauses(sel), "WINDOW") || hasClass(clauses(sel), "SUBQUERY") {
+		return nil, nil, nil
+	}
+	ref := child(sel, "from_table")
+	if child(ref, "sample") != nil || child(ref, "at_clause") != nil {
+		return nil, nil, nil
+	}
+	sc := scope.with(sel)
+	r := &relUse{ref: ref}
+	switch str(ref["type"]) {
+	case "SUBQUERY":
+		r.q, r.scope = subqueryNode(ref), sc
+	case "BASE_TABLE":
+		parts := tableParts(ref)
+		if len(parts) != 1 {
+			return nil, nil, nil
+		}
+		d := sc.find(parts[0])
+		if d == nil || d.first != nil || references(pl.root, d.name) != 1 {
+			return nil, nil, nil
+		}
+		r.q, r.scope, r.def = d.query(), d.scope, d
+	default:
+		return nil, nil, nil
+	}
+	var aliases []any
+	if r.def != nil {
+		aliases = list(r.def.entry, "aliases")
+	}
+	var err error
+	if r.columns, err = pl.relationColumns(r.q, r.scope, aliases); err != nil {
+		return nil, nil, err
+	}
+	w := &wrapper{sel: sel, ref: ref}
+	if w.have, err = pl.describe(sel, scope); err != nil {
+		return nil, nil, err
+	}
+	if w.template, err = pl.p.fromRef("SELECT * FROM (SELECT 1) AS x"); err != nil {
+		return nil, nil, err
+	}
+	return w, r, nil
 }
 
 // distinctAsGroups returns a SELECT DISTINCT as the aggregation it is,

@@ -207,6 +207,8 @@ type planner struct {
 	// overs numbers the relations rewritten for window functions over all
 	// rows (overAll).
 	overs int
+	// root is the statement being planned.
+	root node
 	// reasons say why candidates were not distributed, for logs.
 	reasons []string
 	// tables caches resolved names.
@@ -234,6 +236,7 @@ func newPlanner(ctx context.Context, env Env, p *parser, aggs map[string]bool, o
 // errUnsupported error when no part of it can run distributed.
 func (pl *planner) plan(stmt node) (*Plan, error) {
 	root := clone(stmt).(node)
+	pl.root = root
 	out, err := pl.query(root, true, nil)
 	if err != nil {
 		return nil, err

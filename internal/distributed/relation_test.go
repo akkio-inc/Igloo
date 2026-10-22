@@ -110,11 +110,12 @@ func TestAudienceReport(t *testing.T) {
 		t.Fatal("did not run distributed")
 	}
 	p := h.planOf(audienceReport)
-	// audience, aud_cohort, population, population_cohort, the
-	// browsing subquery, and memberships, written once by both branches of
-	// its UNION ALL.
-	if n, scans := relationExchanges(p, "people"); n != 6 || scans != 2 {
-		t.Errorf("%d relation exchanges and %d scans of people, want 6 and 2:\n%s", n, scans, p.describe())
+	// audience and population, read by the cohorts' DISTINCTs, which write
+	// memberships, once, through both branches of its UNION ALL; and the
+	// browsing subquery. The branches' labels are computed by the
+	// DISTINCTs' own stages.
+	if n, scans := relationExchanges(p, "people"); n != 4 || scans != 2 {
+		t.Errorf("%d relation exchanges and %d scans of people, want 4 and 2:\n%s", n, scans, p.describe())
 	}
 	// The sizes and three kinds of signals, the distinct people of each
 	// counted in place, in partitions keyed by person.
@@ -124,10 +125,17 @@ func TestAudienceReport(t *testing.T) {
 	if n := p.exchanges("aggregate"); n != 0 {
 		t.Errorf("%d stages wrote partial results to an exchange, want none:\n%s", n, p.describe())
 	}
+	// memberships: the exchange both branches write.
+	writers := map[int]int{}
+	for _, s := range p.Stages {
+		if s.Out != nil {
+			writers[s.Out.ID]++
+		}
+	}
 	readers := 0
 	for _, s := range p.Stages {
 		for _, in := range s.Inputs {
-			if in.Exchange != nil && in.Exchange.ID == p.Stages[2].Out.ID {
+			if in.Exchange != nil && writers[in.Exchange.ID] == 2 {
 				readers++
 			}
 		}
