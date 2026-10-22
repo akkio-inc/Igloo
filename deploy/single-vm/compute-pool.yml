@@ -31,7 +31,8 @@ services:
     ports: !override
       - "${IGLOO_BIND:-127.0.0.1}:${IGLOO_REPORTING_PORT:-5434}:5432"
     volumes: !override
-      - igloo-reporting-spill:/var/lib/igloo/tmp
+      # Its own spill directory; never IGLOO_SPILL_DIR, which igloo uses.
+      - ${IGLOO_REPORTING_SPILL_DIR:-igloo-reporting-spill}:/var/lib/igloo/tmp
       - igloo-reporting-cache:/var/lib/igloo/cache
       - ./tls:/tls:ro
     depends_on:

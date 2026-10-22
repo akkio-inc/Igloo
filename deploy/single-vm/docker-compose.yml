@@ -116,7 +116,9 @@ services:
       # (docs/sharing.md).
       - "${IGLOO_SHARING_BIND:-127.0.0.1}:${IGLOO_SHARING_PORT:-8444}:8444"
     volumes:
-      - igloo-spill:/var/lib/igloo/tmp
+      # DuckDB's spill files: the igloo-spill volume, or a host directory
+      # set in IGLOO_SPILL_DIR, e.g. on local NVMe (see .env).
+      - ${IGLOO_SPILL_DIR:-igloo-spill}:/var/lib/igloo/tmp
       # Copies of table files read from object storage, kept across
       # restarts (docs/operations.md#read-cache).
       - igloo-cache:/var/lib/igloo/cache

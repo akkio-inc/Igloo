@@ -169,6 +169,15 @@ pass for each cloud.
   `/var/lib/igloo/tmp` (`duckdb.spillVolume`). Keep a memory limit set: DuckDB
   allocates somewhat beyond its own limit, and spill files are written through
   the page cache, which counts against the container.
+- **Spill disk**: the spill `emptyDir` lives in kubelet's directory on the
+  node, so queries that spill run at the speed of the disk under it. Put
+  that on local NVMe where the cloud offers it: on EKS, instance-store types
+  (`r7gd`, `m7gd`, `c7gd`) with nodeadm's `localStorage` strategy `RAID0`;
+  on GKE, Local SSD-backed ephemeral storage; on AKS, an ephemeral OS disk on
+  a size with a local disk (`Standard_E4pds_v6`). The OpenTofu modules set
+  this up ([spill on local NVMe](../../../docs/operations.md#spill-on-local-nvme)).
+  Keep `duckdb.spillVolume.sizeLimit`, times the igloo pods per node, within
+  what that disk holds.
 - **Startup**: on first start Igloo waits up to 3 minutes for PostgreSQL and
   the catalog, then bootstraps Lakekeeper and creates the warehouse; the
   startup probe allows 5 minutes. On every start it also limits the
@@ -388,7 +397,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `duckdb.threads` | `null` | `IGLOO_DUCKDB_THREADS`; null: one per core |
 | `duckdb.maxTempSize` | `""` | `IGLOO_DUCKDB_MAX_TEMP_SIZE`; empty: 90% of `duckdb.spillVolume.sizeLimit`, so an oversized query fails instead of the pod being evicted |
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |
-| `duckdb.spillVolume.medium` | `""` | `""` (node disk) or `Memory` |
+| `duckdb.spillVolume.medium` | `""` | `""` (node disk, kubelet's directory; see **Spill disk** above) or `Memory` |
 | `tls.existingSecret` | `""` | `kubernetes.io/tls` Secret; sets `IGLOO_TLS_CERT_FILE` / `IGLOO_TLS_KEY_FILE` |
 | `statementTimeout` | `""` | `IGLOO_STATEMENT_TIMEOUT`, e.g. `30m`; empty: no limit |
 | `maxConnections` | `100` | `IGLOO_MAX_CONNECTIONS` per pod |

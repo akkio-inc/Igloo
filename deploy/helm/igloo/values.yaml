@@ -102,7 +102,8 @@ duckdb:
   spillVolume:
     # emptyDir for DuckDB spill files at /var/lib/igloo/tmp.
     sizeLimit: 50Gi
-    # "" (node disk) or "Memory".
+    # "" (node disk: kubelet's directory, local NVMe on nodes set up for it;
+    # see README) or "Memory".
     medium: ""
 
 # kubernetes.io/tls Secret (tls.crt, tls.key) -> IGLOO_TLS_CERT_FILE and
