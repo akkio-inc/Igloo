@@ -290,6 +290,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   disk, or that only filters rows, runs on the coordinator.
 - `igloo.query_history` has a `workers` column; `igloo_distributed_*` and
   `igloo_worker_*` metrics report statements, fallbacks, tasks and workers.
+- Tables with lists, maps and structs, Snowflake's `ARRAY` and `OBJECT`
+  columns among them, run distributed: workers read nested fields by their
+  Iceberg field IDs, and a data file written before a struct's field was
+  renamed, or dropped and added again, runs on one machine.
 
 ### Tools and integrations
 

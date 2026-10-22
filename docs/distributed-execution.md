@@ -87,6 +87,10 @@ In detail, a part runs distributed when:
   compressed size); or all but the largest of them fit, and that one is
   joined to the large table directly, by an inner `JOIN ... ON` or `WHERE`,
   on equal columns of the same type (integer types may mix).
+- Its tables' columns may be nested: lists, maps and structs, Snowflake's
+  `ARRAY` (`VARCHAR[]`) and `OBJECT` (`MAP(VARCHAR, VARCHAR)`) columns
+  among them. Workers read them, and the fields nested in them, by their
+  Iceberg field IDs, as one machine does.
 - It runs outside an explicit transaction, so it reads the tables' latest
   snapshots, and does not use time travel.
 
@@ -97,8 +101,10 @@ itself or read again in a subquery (TPC-H Q17, Q18, Q20, Q21), three large
 tables joined on different keys, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
 pending delete files (maintenance merges them within the hour), with
-nested columns or with data files that have no Iceberg field IDs (files
-added from outside and read through a name mapping), tables with
+data files that have no Iceberg field IDs (files added from outside and
+read through a name mapping) or that nest a struct's fields otherwise
+than the table does now (a field renamed, or dropped and added again,
+since they were written), tables with
 [masking or row access policies](security-policies.md) and statements those
 policies rewrite (directly or through a view), views (name the tables they
 read to distribute them), [connections](federation.md)' tables and Delta
@@ -387,9 +393,8 @@ machine's memory run where that machine would run out of memory.
 - The coordinator receives every partial result. A `GROUP BY` with billions
   of groups, or `count(DISTINCT x)` over billions of values, sends them all
   to it.
-- Tables with delete files (from `UPDATE`, `DELETE` or `MERGE`), nested
-  columns or data files without field IDs, views, and time travel run on
-  one machine.
+- Tables with delete files (from `UPDATE`, `DELETE` or `MERGE`) or data
+  files without field IDs, views, and time travel run on one machine.
 - Workers read each table's files directly and do not use Iceberg partition
   statistics to skip files; DuckDB skips row groups by their Parquet
   statistics instead.

@@ -9,6 +9,7 @@
 #   - statement timeouts reach the workers,
 #   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
+#   - tables with lists, maps and structs run distributed,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
@@ -264,6 +265,37 @@ case "$got" in
   *) fail "the snapshot check did not run distributed: [$got]" ;;
 esac
 
+echo "nested columns"
+# Lists, maps and structs, as Igloo writes them (ARRAY and OBJECT columns of
+# Snowflake's dialect are lists and maps of strings): workers read the
+# fields nested in them by their field IDs.
+{
+  echo "CREATE TABLE people AS SELECT c_custkey AS person_id, [c_mktsegment, 'n' || c_nationkey] AS segments,
+    MAP {'nation': c_nationkey::VARCHAR, 'tier': (c_custkey % 4)::VARCHAR} AS attrs,
+    {'name': c_name, 'phone': c_phone} AS contact FROM customer WHERE false;"
+  for part in 0 1 2 3 4 5; do
+    echo "INSERT INTO people SELECT c_custkey, [c_mktsegment, 'n' || c_nationkey],
+      MAP {'nation': c_nationkey::VARCHAR, 'tier': (c_custkey % 4)::VARCHAR}, {'name': c_name, 'phone': c_phone}
+      FROM customer WHERE hash(c_custkey) % 6 = $part;"
+  done
+} | psql_admin -q >/dev/null
+nested_query="SELECT attrs['tier'] AS tier, count(*), count(DISTINCT contact.name), sum(len(segments)),
+  count(*) FILTER (WHERE list_contains(segments, 'BUILDING')) FROM people GROUP BY 1 ORDER BY 1"
+check_distributed() {
+  local name=$1 tag=$2 query=$3 want got
+  want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$query" | grep -v '^SET$')"
+  got="$(psql_admin -c "SET distributed_execution = 'on'" -c "/* $tag */ $query" | grep -v '^SET$')"
+  if [ -n "$want" ] && ! grep -q ERROR <<<"$want" && [ "$got" = "$want" ]; then
+    pass "$name returns the same rows"
+  else
+    fail "$name: [$got], want [$want]"
+  fi
+  sleep 2
+  got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
+  if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "$name ran on $got workers"; fi
+}
+check_distributed "a table with lists, maps and structs" nested "$nested_query"
+
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
 # it compacts a name mapping (for files without field IDs, which these are
@@ -285,6 +317,8 @@ if [ "$got" = "$want" ]; then pass "a compacted table returns the same rows"; el
 sleep 2
 got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* compacted */%' ORDER BY start_time DESC LIMIT 1")"
 if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a compacted table ran on $got workers"; fi
+# Compaction writes the nested columns' files anew.
+check_distributed "a compacted table with nested columns" nested_compacted "$nested_query"
 
 echo "policies"
 # Workers read table files and could not apply masking or row access

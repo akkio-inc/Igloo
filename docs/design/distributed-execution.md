@@ -271,6 +271,19 @@ coordinator. (iceberg-go gives every table it compacts a name mapping, but
 its files have field IDs, so the mapping alone does not keep a table on
 one machine.)
 
+Nested columns (lists, maps and structs) are found in each file by their
+field IDs too, but DuckDB finds the fields nested in them by name, case
+aside, and a list's element and a map's key and value by where they are.
+So each task carries the nested field IDs of the table's columns, and the
+worker checks every file's footer against them: a list's element and a
+map's key and value must have the table's field IDs, and a struct field
+found by its ID must have its current name. A field added since a file was
+written is not in the file and reads as `NULL`, as Iceberg says; one
+renamed since, or dropped and added again under its old name, would read
+as `NULL` or as the old field's values, so such a file, like one whose
+nested fields have no IDs, makes the worker refuse the task, and the
+statement runs on the coordinator.
+
 Column types Parquet would change (HUGEINT, INTERVAL, TIME WITH TIME ZONE)
 cross as text and are cast back. The coordinator then runs the rest of the
 statement on the session's own connection, with the part replaced by a
@@ -482,7 +495,9 @@ fractions are indicative only.
   shapes (aggregates, grouping sets, `DISTINCT`, windows over aggregates,
   top-N, semi and anti joins, time functions, `UNION ALL`); session time
   zones and `integer_division`; files written under older schemas
-  (renamed, added, dropped and re-added, widened columns); a worker that
+  (renamed, added, dropped and re-added, widened columns, and struct
+  fields added, renamed and re-added); lists, maps and structs, grouped,
+  filtered and returned; a worker that
   dies mid-task or is gone, every worker failing (the statement runs on
   the coordinator), cancellation and errors in the data; and, through the
   PostgreSQL protocol (`internal/pgwire`), grants, parameters and

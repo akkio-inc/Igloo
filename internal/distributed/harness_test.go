@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -167,6 +168,14 @@ func (h *harness) exec(query string) {
 // the session with a view over them.
 func (h *harness) addTable(name, source string, files int) {
 	h.t.Helper()
+	h.addNestedTable(name, source, files, nil)
+}
+
+// addNestedTable is addTable for a table whose columns' field IDs, nested
+// ones included, are nested's (ID and Nested; the types are the
+// source's). Without nested, columns are numbered from 1.
+func (h *harness) addNestedTable(name, source string, files int, nested []Column) {
+	h.t.Helper()
 	ctx := context.Background()
 	dir := filepath.Join(h.dir, "warehouse", name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -177,10 +186,16 @@ func (h *harness) addTable(name, source string, files int) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	if nested != nil && len(nested) != len(cols) {
+		h.t.Fatalf("%d columns for %d", len(nested), len(cols))
+	}
 	var ids []string
 	for i := range cols {
 		cols[i].ID = i + 1
-		ids = append(ids, fmt.Sprintf("%s: %d", quoteIdent(cols[i].Name), cols[i].ID))
+		if nested != nil {
+			cols[i].ID, cols[i].Nested = nested[i].ID, nested[i].Nested
+		}
+		ids = append(ids, quoteIdent(cols[i].Name)+": "+fieldIDs(cols[i].ID, cols[i].Nested))
 	}
 	tbl := &Table{Schema: "main", Name: name, Columns: cols}
 	var fs []File
@@ -204,6 +219,18 @@ func (h *harness) addTable(name, source string, files int) {
 	h.exec(fmt.Sprintf("CREATE OR REPLACE VIEW main.%s AS SELECT * FROM read_parquet([%s])", quoteIdent(name), strings.Join(quoted(paths(fs)), ", ")))
 	h.tables[strings.ToLower(name)] = tbl
 	h.files[tbl.key()] = fs
+}
+
+// fieldIDs is a column's field IDs as COPY's FIELD_IDS option takes them.
+func fieldIDs(id int, nest *Nesting) string {
+	if nest == nil {
+		return strconv.Itoa(id)
+	}
+	parts := []string{"__duckdb_field_id: " + strconv.Itoa(id)}
+	for _, f := range nest.Fields {
+		parts = append(parts, quoteIdent(f.Name)+": "+fieldIDs(f.ID, f.Nested))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 func quoted(ss []string) []string {

@@ -447,6 +447,8 @@ type footer struct {
 	// are read through the table's name mapping, which workers do not
 	// apply.
 	ids bool
+	// top are the file's columns, with the elements nested in them.
+	top []*schemaNode
 }
 
 // fileColumn is a column of a data file as its footer declares it.
@@ -459,11 +461,24 @@ type fileColumn struct {
 	n int
 }
 
+// schemaNode is an element of a data file's schema: a column, or a field
+// nested in one.
+type schemaNode struct {
+	name string
+	id   int64 // 0 without a field ID
+	// annotation is LIST or MAP for a group that holds one, as its
+	// converted or logical type says.
+	annotation string
+	repeated   bool
+	children   []*schemaNode
+}
+
 // maxFooters bounds the data files whose footers a worker remembers.
 const maxFooters = 10000
 
 // readByName reports whether a view's files can be read by column name,
-// and refuses files without field IDs, for which the statement runs on
+// and refuses files without field IDs, or that nest a column otherwise
+// than the table does (see checkNested), for which the statement runs on
 // the coordinator.
 //
 // Files that hold each of the view's columns under its current name and
@@ -484,6 +499,10 @@ func (w *Worker) readByName(ctx context.Context, conn *duckdb.Conn, v viewDef) (
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
+		if slices.ContainsFunc(v.Columns, func(c Column) bool { return c.Nested != nil }) {
+			// Nested fields are read by name; see checkNested.
+			return false, unsupported("could not check how %s's data files nest its columns: %v", v.Name, err)
+		}
 		// Reading the files fails the same way, or succeeds by field ID.
 		w.log.Debug("could not read data file footers; reading by field ID", "view", v.Name, "err", err)
 		return false, nil
@@ -494,7 +513,7 @@ func (w *Worker) readByName(ctx context.Context, conn *duckdb.Conn, v viewDef) (
 		}
 	}
 	if slices.ContainsFunc(v.Columns, func(c Column) bool { return nestedType(c.Type) }) {
-		return false, nil
+		return false, checkNested(v, footers)
 	}
 	types := make([]string, len(v.Columns))
 	for _, f := range v.Files {
@@ -519,10 +538,14 @@ func (w *Worker) footers(ctx context.Context, conn *duckdb.Conn, files []string)
 	out := make(map[string]*footer, len(files))
 	var missing []string
 	w.footersMu.Lock()
+	// Each file once: parquet_schema lists a file's elements as often as
+	// it is named.
+	seen := map[string]bool{}
 	for _, f := range files {
 		if ft, ok := w.footerCache[f]; ok {
 			out[f] = ft
-		} else {
+		} else if !seen[f] {
+			seen[f] = true
 			missing = append(missing, quoteLiteral(f))
 		}
 	}
@@ -530,15 +553,17 @@ func (w *Worker) footers(ctx context.Context, conn *duckdb.Conn, files []string)
 	if len(missing) == 0 {
 		return out, nil
 	}
-	// Element 0 is the schema's root.
+	// Element 0 is the schema's root; the others follow it depth first.
 	rows, err := conn.QueryContext(ctx, "SELECT file_name, name, coalesce(field_id, 0), coalesce(duckdb_type, ''), "+
-		"coalesce(num_children, 0) FROM parquet_schema(["+strings.Join(missing, ", ")+"]) WHERE column_id > 0", nil)
+		"coalesce(num_children, 0), coalesce(converted_type, ''), coalesce(logical_type, ''), repetition_type = 'REPEATED' "+
+		"FROM parquet_schema(["+strings.Join(missing, ", ")+"]) WHERE column_id > 0 ORDER BY file_name, column_id", nil)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close() //nolint:errcheck
 	read := map[string]*footer{}
-	dest := make([]driver.Value, 5)
+	elems := map[string][]schemaElem{}
+	dest := make([]driver.Value, 8)
 	for {
 		if err := rows.Next(dest); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -561,6 +586,23 @@ func (w *Worker) footers(ctx context.Context, conn *duckdb.Conn, files []string)
 		c.n++
 		ft.cols[name] = c
 		ft.ids = ft.ids || c.id != 0
+		converted, _ := dest[5].(string)
+		logical, _ := dest[6].(string)
+		repeated, _ := dest[7].(bool)
+		e := schemaElem{schemaNode: schemaNode{name: name, id: c.id, repeated: repeated}, children: int(children)}
+		logical = strings.ToUpper(logical)
+		switch {
+		case converted == "LIST" || strings.Contains(logical, "LIST"):
+			e.annotation = "LIST"
+		case converted == "MAP" || converted == "MAP_KEY_VALUE" || strings.Contains(logical, "MAP"):
+			e.annotation = "MAP"
+		}
+		elems[file] = append(elems[file], e)
+	}
+	for file, ft := range read {
+		if ft.top, err = schemaTree(elems[file]); err != nil {
+			return nil, fmt.Errorf("data file %s: %w", file, err)
+		}
 	}
 	w.footersMu.Lock()
 	if w.footerCache == nil || len(w.footerCache)+len(read) > maxFooters {
@@ -572,6 +614,182 @@ func (w *Worker) footers(ctx context.Context, conn *duckdb.Conn, files []string)
 	}
 	w.footersMu.Unlock()
 	return out, nil
+}
+
+// schemaElem is a schema element as parquet_schema lists it: a node and
+// how many elements, following it, are its children.
+type schemaElem struct {
+	schemaNode
+	children int
+}
+
+// schemaTree rebuilds a file's columns from its schema elements, depth
+// first.
+func schemaTree(elems []schemaElem) ([]*schemaNode, error) {
+	var build func(i int) (*schemaNode, int, error)
+	build = func(i int) (*schemaNode, int, error) {
+		if i >= len(elems) {
+			return nil, i, errors.New("its schema ends early")
+		}
+		n := elems[i].schemaNode
+		n.children = nil
+		next := i + 1
+		for range elems[i].children {
+			c, after, err := build(next)
+			if err != nil {
+				return nil, next, err
+			}
+			n.children = append(n.children, c)
+			next = after
+		}
+		return &n, next, nil
+	}
+	var top []*schemaNode
+	for i := 0; i < len(elems); {
+		n, next, err := build(i)
+		if err != nil {
+			return nil, err
+		}
+		top, i = append(top, n), next
+	}
+	return top, nil
+}
+
+// checkNested makes sure that every data file of a view nests the view's
+// nested columns as the table does. DuckDB finds a column in a file by its
+// field ID, but the fields nested in it by name, case aside: a struct's
+// field renamed since a file was written, or dropped and added again under
+// its old name, would read as NULL or as the old field's values. Lists'
+// and maps' elements are read where they are, whatever their names. A
+// file that nests a column otherwise, or without field IDs, keeps the
+// statement on the coordinator, which reads it as Iceberg says.
+func checkNested(v viewDef, footers map[string]*footer) error {
+	for _, f := range v.Files {
+		ft, ok := footers[f]
+		if !ok {
+			return unsupported("could not check how data file %s nests its columns", f)
+		}
+		for _, c := range v.Columns {
+			if c.Nested == nil {
+				if nestedType(c.Type) {
+					return unsupported("column %s of %s is nested, and the task does not say how", c.Name, v.Name)
+				}
+				continue
+			}
+			var found *schemaNode
+			for _, n := range ft.top {
+				if n.id == int64(c.ID) {
+					if found != nil {
+						return unsupported("data file %s has two columns with field ID %d", f, c.ID)
+					}
+					found = n
+				}
+			}
+			if found == nil {
+				// Written before the column was added: it reads as NULL.
+				continue
+			}
+			if err := matchNested(c.Nested, found); err != nil {
+				return unsupported("data file %s nests column %s otherwise than the table: %v", f, c.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// matchNested checks that file element n nests its fields as nest says,
+// or is a value when nest is nil.
+func matchNested(nest *Nesting, n *schemaNode) error {
+	if nest == nil {
+		if len(n.children) > 0 {
+			return fmt.Errorf("%s is a group, not a value", n.name)
+		}
+		return nil
+	}
+	switch nest.Kind {
+	case "list":
+		e, err := listElement(n)
+		if err != nil {
+			return err
+		}
+		if len(nest.Fields) != 1 {
+			return errors.New("a list has one element")
+		}
+		return matchField(nest.Fields[0], e)
+	case "map":
+		if n.annotation != "MAP" || len(n.children) != 1 || !n.children[0].repeated || len(n.children[0].children) != 2 {
+			return fmt.Errorf("%s is not a map", n.name)
+		}
+		if len(nest.Fields) != 2 {
+			return errors.New("a map has a key and a value")
+		}
+		kv := n.children[0].children
+		if err := matchField(nest.Fields[0], kv[0]); err != nil {
+			return err
+		}
+		return matchField(nest.Fields[1], kv[1])
+	case "struct":
+		if n.annotation != "" || n.repeated || len(n.children) == 0 {
+			return fmt.Errorf("%s is not a struct", n.name)
+		}
+		names := map[string]bool{}
+		for _, ch := range n.children {
+			if ch.id == 0 {
+				return fmt.Errorf("field %s has no field ID", ch.name)
+			}
+			k := strings.ToLower(ch.name)
+			if names[k] {
+				return fmt.Errorf("%s has two fields called %s", n.name, ch.name)
+			}
+			names[k] = true
+		}
+		for _, f := range nest.Fields {
+			var found *schemaNode
+			for _, ch := range n.children {
+				if ch.id == int64(f.ID) {
+					found = ch
+				}
+			}
+			switch {
+			case found != nil && !strings.EqualFold(found.name, f.Name):
+				return fmt.Errorf("field %d is called %s, not %s", f.ID, found.name, f.Name)
+			case found == nil && names[strings.ToLower(f.Name)]:
+				return fmt.Errorf("field %s has another field ID", f.Name)
+			case found != nil:
+				if err := matchNested(f.Nested, found); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown kind %s", nest.Kind)
+}
+
+// matchField checks a list's element or a map's key or value: it must have
+// the table's field ID.
+func matchField(f Field, n *schemaNode) error {
+	if n.id != int64(f.ID) {
+		return fmt.Errorf("%s has field ID %d, not %d", n.name, n.id, f.ID)
+	}
+	return matchNested(f.Nested, n)
+}
+
+// listElement returns the element of a list: the one child of the list's
+// repeated group, as Iceberg's writers nest it (three levels), or the
+// repeated field itself (two levels, as older writers do).
+func listElement(n *schemaNode) (*schemaNode, error) {
+	if n.annotation != "LIST" || len(n.children) != 1 || !n.children[0].repeated {
+		return nil, fmt.Errorf("%s is not a list", n.name)
+	}
+	r := n.children[0]
+	switch {
+	case len(r.children) == 0, r.id != 0:
+		return r, nil
+	case len(r.children) == 1:
+		return r.children[0], nil
+	}
+	return nil, fmt.Errorf("%s is not a list", n.name)
 }
 
 // nestedType reports whether a DuckDB type is a struct, list, map or union.

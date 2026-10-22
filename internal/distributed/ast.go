@@ -31,6 +31,8 @@ type parser struct {
 
 	mu        sync.Mutex
 	templates map[string]node
+	// types are type names as DuckDB prints them (see typeName).
+	types map[string]string
 }
 
 func newParser() (*parser, error) {
@@ -45,7 +47,7 @@ func newParser() (*parser, error) {
 			return nil, errors.Join(fmt.Errorf("set up parser: %w", err), db.Close())
 		}
 	}
-	return &parser{db: db, templates: map[string]node{}}, nil
+	return &parser{db: db, templates: map[string]node{}, types: map[string]string{}}, nil
 }
 
 func (p *parser) close() error { return p.db.Close() }
@@ -130,6 +132,26 @@ func normalize(v any) any {
 		}
 		return normalize(from).(node), true
 	})
+}
+
+// typeName returns a type as DuckDB prints it, which quotes a struct's
+// field names only where they need it (keywords, other characters).
+func (p *parser) typeName(t string) (string, error) {
+	p.mu.Lock()
+	name, ok := p.types[t]
+	p.mu.Unlock()
+	if ok {
+		return name, nil
+	}
+	if err := p.db.QueryRow("SELECT typeof(CAST(NULL AS " + t + "))").Scan(&name); err != nil {
+		return "", err
+	}
+	p.mu.Lock()
+	if len(p.types) < 4096 {
+		p.types[t] = name
+	}
+	p.mu.Unlock()
+	return name, nil
 }
 
 // expr returns a fresh copy of the expression that SQL text parses to, for

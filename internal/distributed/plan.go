@@ -57,6 +57,25 @@ type Column struct {
 	Type string `json:"type"`
 	// ID is the Iceberg field ID of a table column.
 	ID int `json:"id,omitempty"`
+	// Nested says how a nested column of a table nests its fields, so that
+	// workers can check that a data file nests them as the table does.
+	Nested *Nesting `json:"nested,omitempty"`
+}
+
+// Nesting is how a list, map or struct column nests its fields.
+type Nesting struct {
+	// Kind is list, map or struct.
+	Kind string `json:"kind"`
+	// Fields are a list's element, a map's key and value, or a struct's
+	// fields.
+	Fields []Field `json:"fields"`
+}
+
+// Field is a field of a nested column.
+type Field struct {
+	Name   string   `json:"name"`
+	ID     int      `json:"id"`
+	Nested *Nesting `json:"nested,omitempty"`
 }
 
 // Table is a catalog table at one of its snapshots.

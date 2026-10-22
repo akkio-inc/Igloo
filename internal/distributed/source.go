@@ -133,11 +133,11 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	}
 	t := &Table{Schema: schema, Name: name, Versioned: true}
 	for _, f := range tbl.Schema().Fields() {
-		typ, ok := duckType(f.Type)
+		c, ok := icebergColumn(f.Name, f.ID, f.Type)
 		if !ok && t.Unsupported == "" {
 			t.Unsupported = fmt.Sprintf("column %s has type %s", f.Name, f.Type)
 		}
-		t.Columns = append(t.Columns, Column{Name: f.Name, Type: typ, ID: f.ID})
+		t.Columns = append(t.Columns, c)
 	}
 	// A name mapping (schema.name-mapping.default) applies only to files
 	// without field IDs, which workers refuse; iceberg-go adds one to every
@@ -255,8 +255,57 @@ func (s *Iceberg) RemoveAll(ctx context.Context, t *Table, dir string) error {
 	return errors.Join(errs...)
 }
 
-// duckType returns the DuckDB type DuckDB reads an Iceberg type as.
-// Nested types are left to one machine for now.
+// icebergColumn returns a column of Iceberg type t as DuckDB reads it: a
+// list as T[], a map as MAP(K, V), a struct as STRUCT(name T, ...), with
+// the nested fields' names and IDs. Struct fields' names are all quoted
+// here; the coordinator prints the type as DuckDB does (see
+// Coordinator.Table).
+func icebergColumn(name string, id int, t iceberg.Type) (Column, bool) {
+	c := Column{Name: name, ID: id}
+	field := func(c Column) Field { return Field{Name: c.Name, ID: c.ID, Nested: c.Nested} }
+	switch t := t.(type) {
+	case *iceberg.ListType:
+		e, ok := icebergColumn("element", t.ElementID, t.Element)
+		if !ok {
+			return c, false
+		}
+		c.Type = e.Type + "[]"
+		c.Nested = &Nesting{Kind: "list", Fields: []Field{field(e)}}
+	case *iceberg.MapType:
+		k, ok := icebergColumn("key", t.KeyID, t.KeyType)
+		v, vok := icebergColumn("value", t.ValueID, t.ValueType)
+		if !ok || !vok {
+			return c, false
+		}
+		c.Type = "MAP(" + k.Type + ", " + v.Type + ")"
+		c.Nested = &Nesting{Kind: "map", Fields: []Field{field(k), field(v)}}
+	case *iceberg.StructType:
+		if len(t.FieldList) == 0 {
+			return c, false
+		}
+		c.Nested = &Nesting{Kind: "struct"}
+		parts := make([]string, len(t.FieldList))
+		for i, f := range t.FieldList {
+			fc, ok := icebergColumn(f.Name, f.ID, f.Type)
+			if !ok {
+				return c, false
+			}
+			parts[i] = quoteIdent(f.Name) + " " + fc.Type
+			c.Nested.Fields = append(c.Nested.Fields, field(fc))
+		}
+		c.Type = "STRUCT(" + strings.Join(parts, ", ") + ")"
+	default:
+		typ, ok := duckType(t)
+		if !ok {
+			return c, false
+		}
+		c.Type = typ
+	}
+	return c, true
+}
+
+// duckType returns the DuckDB type DuckDB reads an Iceberg primitive type
+// as.
 func duckType(t iceberg.Type) (string, bool) {
 	switch t := t.(type) {
 	case iceberg.BooleanType:

@@ -170,9 +170,27 @@ func (co *Coordinator) Close() error {
 	return co.parser.close()
 }
 
-// Table returns a catalog table at its current snapshot.
+// Table returns a catalog table at its current snapshot, its nested
+// columns' types printed as DuckDB prints them.
 func (co *Coordinator) Table(ctx context.Context, schema, name string) (*Table, error) {
-	return co.opts.Source.Table(ctx, schema, name)
+	t, err := co.opts.Source.Table(ctx, schema, name)
+	if err != nil || t == nil {
+		return t, err
+	}
+	for i, c := range t.Columns {
+		if c.Nested == nil {
+			continue
+		}
+		typ, err := co.parser.typeName(c.Type)
+		if err != nil {
+			if t.Unsupported == "" {
+				t.Unsupported = fmt.Sprintf("column %s has type %s", c.Name, c.Type)
+			}
+			continue
+		}
+		t.Columns[i].Type = typ
+	}
+	return t, nil
 }
 
 // Metrics returns the coordinator's metrics, which may be nil.
