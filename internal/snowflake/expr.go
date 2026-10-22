@@ -1173,10 +1173,21 @@ func (t *translator) collectFlattens(nodes []*node) {
 		default:
 			continue
 		}
-		if alias, _, _ := tableAlias(nodes, after); alias != "" {
+		alias, _, cols := tableAlias(nodes, after)
+		if alias != "" {
 			t.flatten[strings.ToLower(alias)] = true
 		} else {
 			t.anon++
+		}
+		// The names of its columns, which are not reads of them.
+		if cols != nil {
+			for _, c := range splitArgs(cols.kids) {
+				if c = trim(c); len(c) == 1 {
+					if name, _, ok := c[0].name(); ok {
+						t.columnNames[strings.ToUpper(name)]++
+					}
+				}
+			}
 		}
 	}
 }

@@ -59,8 +59,10 @@ type translator struct {
 	grouped map[*node]bool
 	// gen numbers the names the translation makes up.
 	gen int
-	// mentionsThis says the statement names THIS, a FLATTEN's column.
-	mentionsThis bool
+	// names counts the statement's identifiers, upper-cased, and
+	// columnNames those of them that name FLATTEN's columns, to tell
+	// whether it reads a FLATTEN's THIS (see thisWanted).
+	names, columnNames map[string]int
 }
 
 func (t *translator) notice(format string, args ...any) {
@@ -86,13 +88,17 @@ func Translate(sql string, opts Options) (Result, error) {
 	if readsPostgresCatalog(toks) {
 		return Result{SQL: sql, Untranslated: true}, nil
 	}
-	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{}}
+	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{},
+		names: map[string]int{}, columnNames: map[string]int{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true
 		}
-		if tok.kind == kWord && strings.EqualFold(tok.text, "THIS") || tok.kind == kQuoted && strings.EqualFold(tok.val, "THIS") {
-			t.mentionsThis = true
+		switch tok.kind {
+		case kWord:
+			t.names[strings.ToUpper(tok.text)]++
+		case kQuoted:
+			t.names[strings.ToUpper(tok.val)]++
 		}
 	}
 	quoteKeywordQualifiers(toks)

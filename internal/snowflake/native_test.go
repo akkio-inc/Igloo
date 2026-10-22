@@ -163,6 +163,14 @@ func TestFlattenShapes(t *testing.T) {
 			`unnest(sf_flatten_values(_sf_this, 'BOTH')) AS _sf_value`, `sf_flatten_values(json(`},
 		{`select f.value from t, lateral flatten(input => [1, 2], mode => 'OBJECT') f`,
 			`FROM (SELECT json_array(1, 2) AS _sf_this) AS _sf_flatten_input`, `unnest([`},
+		// THIS only where the statement reads it.
+		{`select f.value from t, lateral flatten(input => t.a) as f(seq, key, path, index, value, this), lateral flatten(input => f.value) as g(seq, key, path, index, value, this)`,
+			`CAST(NULL AS JSON) AS "THIS"`, `sf_flatten_this`},
+		{`select f.this from t, lateral flatten(input => t.a) as f(seq, key, path, index, value, this)`,
+			`unnest(sf_flatten_this(t.a, 'BOTH')) AS _sf_this`, `CAST(NULL AS JSON) AS "THIS"`},
+		{`select f.whole from t, lateral flatten(input => [1, 2]) as f(s, k, p, i, v, whole)`,
+			`unnest(repeat([json_array(1, 2)], 2)) AS _sf_this`, `CAST(NULL AS JSON) AS "THIS"`},
+		{`select * from t, lateral flatten(input => t.a) f`, `unnest(sf_flatten_this(t.a, 'BOTH'))`, `CAST(NULL AS JSON) AS "THIS"`},
 	} {
 		res, err := Translate(c.sql, Options{})
 		if err != nil {

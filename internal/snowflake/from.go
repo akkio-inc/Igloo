@@ -220,9 +220,7 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 					alias = "flatten_" + itoa(t.gen)
 				}
 			}
-			// THIS is computed only where the statement could read it: by
-			// name, or with a star at this level.
-			out, err = t.flattenTable(call, alias, cols, t.mentionsThis || selectsStar(nodes))
+			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols))
 		case "SPLIT_TO_TABLE":
 			if alias == "" {
 				alias = "split_to_table"
@@ -453,6 +451,36 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bo
 	kids = append(kids, lists...)
 	kids = append(kids, raw(") AS _sf_flatten)"+aliasClause(alias, cols)))
 	return seq(nil, kids...)
+}
+
+// thisWanted reports whether a statement may read the THIS of a FLATTEN
+// whose columns are named cols (or nil), at level nodes: by name, THIS or
+// the sixth of cols, anywhere but in FLATTEN's column lists (which reports
+// write in full, naming THIS without reading it), or with a star at that
+// level. THIS, the whole input once for each element, is computed only
+// then: computed for every FLATTEN of a report that flattened arrays of
+// objects built from each row, it ran out of 75 GiB of disk.
+func (t *translator) thisWanted(nodes []*node, cols *node) bool {
+	if selectsStar(nodes) {
+		return true
+	}
+	name := "THIS"
+	if cols != nil {
+		names := splitArgs(cols.kids)
+		if len(names) < 6 {
+			return false
+		}
+		n := trim(names[5])
+		if len(n) != 1 {
+			return true
+		}
+		var ok bool
+		if name, _, ok = n[0].name(); !ok {
+			return true
+		}
+		name = strings.ToUpper(name)
+	}
+	return t.names[name] > t.columnNames[name]
 }
 
 // selectsStar reports whether nodes, one level of a statement, select
