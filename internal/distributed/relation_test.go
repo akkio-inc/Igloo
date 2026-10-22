@@ -3,6 +3,8 @@ package distributed
 import (
 	"context"
 	"testing"
+
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 // planOf plans query distributed.
@@ -210,6 +212,11 @@ func TestRelations(t *testing.T) {
 		// Common table expressions of a set operation, read by its branches.
 		{`WITH x AS (SELECT l_returnflag AS f, l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1, 2)
 			SELECT 'q' AS m, f, sum(q) FROM x GROUP BY 1, 2 UNION ALL SELECT 'n', f, count(*) FROM x GROUP BY 1, 2 ORDER BY 1, 2`, 1},
+		// A filter's subquery that reads the table the part divides: a
+		// relation of one row every task reads.
+		{`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`, 2},
+		{`SELECT l_returnflag, count(*) FROM lineitem WHERE l_suppkey IN (SELECT max(l_suppkey) FROM lineitem WHERE l_shipmode = 'RAIL')
+			AND l_quantity > (SELECT avg(l_quantity) FROM lineitem WHERE l_shipmode = 'AIR') GROUP BY 1 ORDER BY 1`, 3},
 		// A relation of one row every task reads; lineitem is split.
 		{`SELECT l_returnflag, count(*) FROM lineitem, (SELECT avg(l_quantity) AS a FROM lineitem) AS s
 			WHERE l_quantity > s.a GROUP BY 1 ORDER BY 1`, 2},
@@ -240,6 +247,91 @@ func TestRelations(t *testing.T) {
 					t.Errorf("%d stages read lineitem's files, want %d:\n%s", scans, tc.scans, p.describe())
 				}
 			}
+		})
+	}
+}
+
+// TestSnowflakeAudienceReport runs the audience report of
+// scripts/e2e-distributed.sh, in Snowflake's dialect as BI tools send it:
+// cohorts from an audience's latest version and from a view of people,
+// signals from FLATTEN of array columns read through views, distinct
+// people per signal and cohort, and a ranking. It runs on workers up to
+// the comparisons, alone and twice over in one statement.
+func TestSnowflakeAudienceReport(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	for _, stmt := range snowflake.Macros() {
+		h.exec(stmt)
+	}
+	list := func(id int) []Column {
+		return []Column{{ID: id, Nested: &Nesting{Kind: "list", Fields: []Field{{Name: "element", ID: id + 10}}}}}
+	}
+	h.addTable("aud_people", `(SELECT 'p' || i AS person_id, 'h' || (i // 3) AS household_id, CASE WHEN i % 2 = 0 THEN 'F' ELSE 'M' END AS gender,
+		CAST(i % 7 + 1 AS INTEGER) AS age_bucket FROM range(9000) r(i))`, 4)
+	h.addNestedTable("aud_media_daily", `(SELECT 'p' || (i % 9000) AS person_id, DATE '2026-09-01' + CAST(i % 30 AS INTEGER) AS day,
+		list_transform(range(1 + i % 4), x -> 'net' || ((i * 7 + x * 13) % 40)) AS network_array,
+		list_transform(range(1 + i % 3), x -> 'genre' || ((i * 3 + x * 5) % 12)) AS genre_array FROM range(27000) r(i))`, 4,
+		append(append([]Column{{ID: 1}, {ID: 2}}, list(3)...), list(4)...))
+	h.addNestedTable("aud_browsing_daily", `(SELECT 'p' || ((i * 7) % 9000) AS person_id, DATE '2026-09-01' + CAST(i % 30 AS INTEGER) AS day,
+		list_transform(range(1 + i % 5), x -> 'cat' || ((i * 5 + x * 11) % 60)) AS category_array FROM range(27000) r(i))`, 4,
+		append([]Column{{ID: 1}, {ID: 2}}, list(3)...))
+	h.addTable("aud_members", `(SELECT 'a1' AS audience_id, 1 AS ver, 'p' || i AS person_id FROM range(9000) r(i) WHERE i % 5 = 0
+		UNION ALL SELECT 'a1', 2, 'p' || i FROM range(9000) r(i) WHERE i % 6 = 0 AND i % 4 <> 2)`, 3)
+	h.addView("v_aud_people", `SELECT * FROM aud_people`)
+	h.addView("v_aud_media_daily", `SELECT * FROM aud_media_daily`)
+	h.addView("v_aud_browsing_daily", `SELECT * FROM aud_browsing_daily`)
+	h.co.maxBroadcast = 1
+
+	const report = `WITH AUDIENCE AS (
+    SELECT PERSON_ID FROM AUD_MEMBERS WHERE AUDIENCE_ID = 'a1'
+      AND VER = (SELECT MAX(VER) FROM AUD_MEMBERS WHERE AUDIENCE_ID = 'a1')),
+  BASE_POPULATION AS (SELECT PERSON_ID FROM V_AUD_PEOPLE),
+  COHORT_MEMBERS AS (
+    SELECT PERSON_ID, 'AUDIENCE' AS COHORT FROM AUDIENCE
+    UNION ALL SELECT PERSON_ID, 'POPULATION' AS COHORT FROM BASE_POPULATION),
+  COHORT_TOTALS AS (SELECT COHORT, COUNT(DISTINCT PERSON_ID) AS COHORT_SIZE FROM COHORT_MEMBERS GROUP BY COHORT),
+  MEDIA_COUNTS AS (
+    SELECT M.PERSON_ID, 'NETWORK' AS DIMENSION, F.VALUE::STRING AS SIGNAL
+    FROM V_AUD_MEDIA_DAILY M, LATERAL FLATTEN(INPUT => M.NETWORK_ARRAY) F),
+  GENRE_COUNTS AS (
+    SELECT M.PERSON_ID, 'GENRE' AS DIMENSION, F.VALUE::STRING AS SIGNAL
+    FROM V_AUD_MEDIA_DAILY M, LATERAL FLATTEN(INPUT => M.GENRE_ARRAY) F),
+  BROWSING_COUNTS AS (
+    SELECT B.PERSON_ID, 'CATEGORY' AS DIMENSION, F.VALUE::STRING AS SIGNAL
+    FROM V_AUD_BROWSING_DAILY B, LATERAL FLATTEN(INPUT => B.CATEGORY_ARRAY) F),
+  ALL_COUNTS AS (
+    SELECT * FROM MEDIA_COUNTS UNION ALL SELECT * FROM GENRE_COUNTS UNION ALL SELECT * FROM BROWSING_COUNTS),
+  ITEM_METRICS AS (
+    SELECT C.COHORT, S.DIMENSION, S.SIGNAL, COUNT(DISTINCT S.PERSON_ID) AS PEOPLE
+    FROM ALL_COUNTS S JOIN COHORT_MEMBERS C ON C.PERSON_ID = S.PERSON_ID
+    GROUP BY C.COHORT, S.DIMENSION, S.SIGNAL),
+  COMPARISONS AS (
+    SELECT A.DIMENSION, A.SIGNAL, A.PEOPLE AS DISTINCT_PEOPLE,
+      ROUND(A.PEOPLE / ASZ.COHORT_SIZE, 6) AS AUDIENCE_RATE,
+      ROUND(P.PEOPLE / PSZ.COHORT_SIZE, 6) AS POPULATION_RATE,
+      ROUND((A.PEOPLE / ASZ.COHORT_SIZE) / NULLIF(P.PEOPLE / PSZ.COHORT_SIZE, 0), 6) AS INDEX_RATIO
+    FROM ITEM_METRICS A
+    JOIN ITEM_METRICS P ON P.DIMENSION = A.DIMENSION AND P.SIGNAL = A.SIGNAL AND P.COHORT = 'POPULATION'
+    JOIN COHORT_TOTALS ASZ ON ASZ.COHORT = 'AUDIENCE'
+    JOIN COHORT_TOTALS PSZ ON PSZ.COHORT = 'POPULATION'
+    WHERE A.COHORT = 'AUDIENCE'),
+  RANKED AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY DIMENSION ORDER BY INDEX_RATIO DESC, SIGNAL) AS RN FROM COMPARISONS)
+  SELECT DIMENSION, SIGNAL, DISTINCT_PEOPLE, AUDIENCE_RATE, POPULATION_RATE, INDEX_RATIO FROM RANKED`
+	twice := `SELECT * FROM (SELECT * FROM (` + report + `) ORDER BY INDEX_RATIO DESC, SIGNAL LIMIT 5)
+  UNION ALL SELECT * FROM (SELECT * FROM (` + report + `) ORDER BY INDEX_RATIO ASC, SIGNAL LIMIT 5)
+  ORDER BY INDEX_RATIO DESC, SIGNAL`
+	for _, q := range []string{report, twice} {
+		r, err := snowflake.Translate(`SELECT * FROM (`+q+`) ORDER BY DIMENSION, INDEX_RATIO DESC, SIGNAL`, snowflake.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(r.SQL) {
+				t.Fatal("did not run distributed")
+			}
+			p := h.planOf(r.SQL)
+			t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
 		})
 	}
 }

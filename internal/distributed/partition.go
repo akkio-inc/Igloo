@@ -139,8 +139,8 @@ func (pl *planner) keyInputs(c *candidate) error {
 	var largest int64
 	for _, r := range c.rels {
 		largest = max(largest, r.bytes)
-		if r.bytes == 0 {
-			// One row: every task reads it.
+		if r.bytes == 0 || r.query {
+			// One row, or a filter's subquery: every task reads it.
 			c.whole = append(c.whole, r)
 			continue
 		}

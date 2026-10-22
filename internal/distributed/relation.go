@@ -83,6 +83,8 @@ func (s cteScope) names() []string {
 type reads struct {
 	uses []*tableUse
 	rels []*relUse
+	// subs are the subquery expressions of its filters.
+	subs []node
 }
 
 // relUse is a relation a candidate reads.
@@ -104,6 +106,44 @@ type relUse struct {
 	splittable bool
 	sc         *scope
 	item       *fromItem
+	// query says ref is a subquery expression's query, which every task
+	// reads in full.
+	query bool
+}
+
+// subqueryRelations makes the subquery expressions of a candidate's
+// filters that read a table its FROM reads too, or a table too large for
+// every worker to read, relations every task reads whole, when they bind
+// on their own (are not correlated) and are small, as
+// ver = (SELECT max(ver) FROM t WHERE ...) is.
+func (pl *planner) subqueryRelations(c *candidate) {
+	for i, sub := range c.subs {
+		conflict := false
+		for _, u := range c.uses {
+			if u.sub != i+1 {
+				continue
+			}
+			if u.table.Bytes > pl.opts.maxBroadcast ||
+				slices.ContainsFunc(c.uses, func(v *tableUse) bool { return v.sub == 0 && v.table.key() == u.table.key() }) {
+				conflict = true
+			}
+		}
+		if !conflict {
+			continue
+		}
+		q := subqueryNode(sub)
+		cols, err := pl.relationColumns(q, c.ctes, nil)
+		if err != nil {
+			continue
+		}
+		bytes, err := pl.estimate(q, c.ctes)
+		if err != nil || bytes > pl.opts.maxBroadcast {
+			continue
+		}
+		c.uses = slices.DeleteFunc(c.uses, func(u *tableUse) bool { return u.sub == i+1 })
+		c.rels = append(c.rels, &relUse{ref: q, q: q, scope: c.ctes, columns: cols, bytes: bytes, query: true,
+			item: &fromItem{name: "subquery"}})
+	}
 }
 
 // --- describing and sizing relations ----------------------------------------
@@ -268,14 +308,13 @@ func (pl *planner) estimate(q node, scope cteScope) (int64, error) {
 				t, err := pl.table(parts)
 				if IsUnsupported(err) {
 					// A view: the size of what its query reads.
-					sub, ok, verr := pl.expandView(clone(ref).(node), parts)
+					n, ok, verr := pl.viewBytes(parts, 0)
 					if verr != nil {
 						return verr
 					}
 					if ok {
-						n, err := pl.estimate(subqueryNode(sub), sc)
 						total += n
-						return err
+						return nil
 					}
 				}
 				if err != nil {
@@ -291,6 +330,52 @@ func (pl *planner) estimate(q node, scope cteScope) (int64, error) {
 		return total, nil
 	}
 	return 0, unsupported("%s", strings.ToLower(str(q["type"])))
+}
+
+// viewBytes estimates the size of what a view reads: the catalog tables
+// its query names, as the view resolves them, and other views' alike.
+func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
+	if depth > maxViewDepth {
+		return 0, false, unsupported("views nest too deep")
+	}
+	def, ok, err := pl.env.ViewDefinition(pl.ctx, parts)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	body, err := pl.p.parse(def.Query)
+	if err != nil {
+		return 0, false, unsupported("view %s: %v", strings.Join(parts, "."), err)
+	}
+	var total int64
+	walk(body, func(n node) bool {
+		if err != nil || str(n["type"]) != "BASE_TABLE" {
+			return err == nil
+		}
+		q, ok, rerr := def.Resolve(pl.ctx, tableParts(n))
+		switch {
+		case rerr != nil:
+			err = rerr
+			return false
+		case !ok:
+			err = unsupported("view %s reads %s, which may mean more than one relation", strings.Join(parts, "."), strings.Join(tableParts(n), "."))
+			return false
+		}
+		t, terr := pl.table(q)
+		if IsUnsupported(terr) {
+			var b int64
+			if b, ok, terr = pl.viewBytes(q, depth+1); terr == nil && ok {
+				total += b
+				return false
+			}
+		}
+		if terr != nil {
+			err = terr
+			return false
+		}
+		total += t.Bytes
+		return false
+	})
+	return total, err == nil, err
 }
 
 // relation adds a relation that a FROM clause reads, ref, to sc and rd.
@@ -591,8 +676,11 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 	if err := pl.chooseInputs(c); err != nil {
 		return err
 	}
-	j := pl.views(c)
 	defer unmark(c)
+	j, err := pl.views(c)
+	if err != nil {
+		return err
+	}
 	if err := pl.sides(c); err != nil {
 		return err
 	}
@@ -718,7 +806,7 @@ func names(cols []Column) []string {
 // savepoint is how far planning had come: a candidate that turns out not
 // to qualify takes back the stages and exchanges it planned, and puts back
 // the views it read as their queries.
-type savepoint struct{ stages, exchanges, memo, undo int }
+type savepoint struct{ stages, exchanges, memo, undo, expanded int }
 
 // memoEntry records an exchange remembered for a common table expression.
 type memoEntry struct {
@@ -728,7 +816,7 @@ type memoEntry struct {
 }
 
 func (pl *planner) save() savepoint {
-	return savepoint{stages: len(pl.stages), exchanges: pl.exchanges, memo: len(pl.memo), undo: len(pl.undo)}
+	return savepoint{stages: len(pl.stages), exchanges: pl.exchanges, memo: len(pl.memo), undo: len(pl.undo), expanded: pl.expanded}
 }
 
 func (pl *planner) restore(sp savepoint) {
@@ -746,6 +834,7 @@ func (pl *planner) restore(sp savepoint) {
 		pl.undo[len(pl.undo)-1]()
 		pl.undo = pl.undo[:len(pl.undo)-1]
 	}
+	pl.expanded = sp.expanded
 }
 
 // remember records that a common table expression's rows are written to x.

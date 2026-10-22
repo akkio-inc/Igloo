@@ -577,8 +577,11 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	// Mark each table reference with the view the fragment will read it
 	// as; the fragment is built from copies of the references, which keep
 	// the mark.
-	j := pl.views(c)
 	defer unmark(c)
+	j, err := pl.views(c)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := pl.sides(c); err != nil {
 		return nil, nil, err
 	}
@@ -620,6 +623,7 @@ func unmark(c *candidate) {
 	}
 	for _, r := range c.rels {
 		delete(r.ref, viewMark)
+		delete(r.ref, viewQuery)
 	}
 }
 
@@ -678,6 +682,9 @@ type tableUse struct {
 	// item there; nil for tables read by subquery expressions.
 	scope *scope
 	item  *fromItem
+	// sub, for a table a subquery expression in a filter reads, is that
+	// subquery's number in the candidate's subs, plus one.
+	sub int
 }
 
 // hasColumn reports whether some item of sc has a column called name
@@ -1165,7 +1172,12 @@ func (pl *planner) filterSubqueries(v any, ctes cteScope, rd *reads) error {
 			return false
 		}
 		if str(n["class"]) == "SUBQUERY" {
+			before := len(rd.uses)
 			err = pl.fullRead(subqueryNode(n), ctes.names(), nil, rd)
+			rd.subs = append(rd.subs, n)
+			for _, u := range rd.uses[before:] {
+				u.sub = len(rd.subs)
+			}
 			return false
 		}
 		return true
@@ -1333,7 +1345,8 @@ func (pl *planner) table(parts []string) (*Table, error) {
 // table divided among the workers by file and the others in full, or its
 // large inputs by partition.
 func (pl *planner) chooseInputs(c *candidate) error {
-	if slices.ContainsFunc(c.rels, func(r *relUse) bool { return r.bytes > 0 }) {
+	pl.subqueryRelations(c)
+	if slices.ContainsFunc(c.rels, func(r *relUse) bool { return r.bytes > 0 && !r.query }) {
 		return pl.chooseKeyed(c)
 	}
 	// Relations of one row, if any, every task reads.
@@ -1405,15 +1418,19 @@ type jobBuild struct {
 }
 
 // viewMark is the key that marks a table reference with the view a
-// fragment reads it as, while the fragment is built.
-const viewMark = "__igloo_view"
+// fragment reads it as, while the fragment is built; viewQuery marks a
+// subquery expression's query, which then reads its view.
+const (
+	viewMark  = "__igloo_view"
+	viewQuery = "__igloo_view_query"
+)
 
 // views names the views a job's fragment reads its inputs as, and marks
 // the candidate's references with them. Every use of a table read in full
 // reads the same view; the split table's view each worker defines over its
 // own share of the files, and each input read by partition has one of its
 // own.
-func (pl *planner) views(c *candidate) *job {
+func (pl *planner) views(c *candidate) (*job, error) {
 	j := &job{splitView: "__igloo_split", keyed: c.keyed}
 	if c.split != nil {
 		j.split = c.split.table
@@ -1425,7 +1442,16 @@ func (pl *planner) views(c *candidate) *job {
 	for i, r := range c.whole {
 		v := fmt.Sprintf("__igloo_w%d", i)
 		j.whole = append(j.whole, wholeRel{view: v, rel: r})
-		r.ref[viewMark] = v
+		if r.query {
+			// A subquery expression's query: it reads the view instead.
+			q, err := pl.p.parse("SELECT * FROM " + quoteIdent(v))
+			if err != nil {
+				return nil, err
+			}
+			r.ref[viewQuery] = q
+		} else {
+			r.ref[viewMark] = v
+		}
 	}
 	names := map[string]string{}
 	for _, u := range c.uses {
@@ -1444,7 +1470,7 @@ func (pl *planner) views(c *candidate) *job {
 		}
 		u.ref[viewMark] = name
 	}
-	return j
+	return j, nil
 }
 
 // pointAtViews makes the marked references of a fragment read their
@@ -1453,6 +1479,9 @@ func (pl *planner) views(c *candidate) *job {
 // view.
 func pointAtViews(fragment node) {
 	rewrite(fragment, func(n node) (node, bool) {
+		if q, ok := n[viewQuery].(node); ok {
+			return clone(q).(node), true
+		}
 		v := str(n[viewMark])
 		if v == "" {
 			return nil, false
@@ -1481,6 +1510,7 @@ func unmarked(v any) any {
 	c := clone(v)
 	walk(c, func(n node) bool {
 		delete(n, viewMark)
+		delete(n, viewQuery)
 		return true
 	})
 	return c

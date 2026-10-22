@@ -608,6 +608,12 @@ as a relation that workers compute (`internal/distributed/relation.go`):
   part reads too is sent to it from the exchange by a stage that reads it,
   and common table expressions nothing reads any more are dropped from the
   coordinator's statement.
+- **Filters' subqueries.** A subquery expression in a filter that reads a
+  table the part divides, or one too large for every worker, is a
+  relation too when it binds on its own (it is not correlated) and is
+  small (an aggregate without `GROUP BY`): workers compute its row first,
+  and every task reads it in the subquery's place, as an audience's
+  `ver = (SELECT max(ver) FROM members WHERE ...)` needs.
 - **Where the coordinator takes over.** A part is distributed only if it
   reads something large; a relation's size is estimated as the compressed
   size of the tables it reads, or nothing for an aggregation without

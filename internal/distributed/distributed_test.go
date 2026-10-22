@@ -315,7 +315,8 @@ func TestLocal(t *testing.T) {
 		// disk on their way to the client.
 		`SELECT l_orderkey, l_comment FROM lineitem WHERE l_quantity = 50`,
 		`SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey`,
-		`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`,
+		// Correlated: a large table read again per row.
+		`SELECT count(*) FROM lineitem l WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = l.l_partkey)`,
 		`SELECT string_agg(l_comment, ',' ORDER BY l_comment) FROM lineitem`,
 		`SELECT count(*) FROM lineitem, range(3)`,
 		`SELECT count(DISTINCT l_partkey), count(DISTINCT l_suppkey) FROM lineitem`,
