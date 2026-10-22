@@ -248,6 +248,12 @@ func rewriteCatalogQuery(query string) string {
 // rewriteRegclassCasts replaces CAST(x AS REGCLASS) in SQL code with
 // pg_regclass(x).
 func rewriteRegclassCasts(query string) string {
+	// Finding a cast's end and whether it is code lexes the query; a query
+	// with thousands of other casts, such as a column profile, would be
+	// lexed thousands of times.
+	if !strings.Contains(strings.ToLower(query), "regclass") {
+		return query
+	}
 	for from := 0; ; {
 		loc := castStart.FindStringIndex(query[from:])
 		if loc == nil {
@@ -255,13 +261,13 @@ func rewriteRegclassCasts(query string) string {
 		}
 		start, open := from+loc[0], from+loc[1]-1
 		close, ok := closingParen(query, open)
-		if !ok || !inCode(query, start) {
+		if !ok {
 			from = open + 1
 			continue
 		}
 		inner := query[open+1 : close]
 		m := castToRegclass.FindStringIndex(inner)
-		if m == nil {
+		if m == nil || !inCode(query, start) {
 			from = open + 1
 			continue
 		}

@@ -715,6 +715,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- A statement with thousands of casts, such as a column profile of a wide
+  table in Snowflake's dialect, is prepared in time that grows with its
+  length rather than its square: Igloo's rewrite of catalog casts lexed the
+  whole statement again for each cast. A profile of 449 columns took 4.3
+  seconds to prepare and run on an empty table, and now takes 0.43.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

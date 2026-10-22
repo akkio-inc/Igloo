@@ -28,12 +28,12 @@ type catalogServer struct {
 	admin   *pgx.Conn
 }
 
-func startCatalogServer(t *testing.T, configure ...func(*Options)) *catalogServer {
+func startCatalogServer(t testing.TB, configure ...func(*Options)) *catalogServer {
 	t.Helper()
 	return startCatalogServerWithConfig(t, config.Config{}, configure...)
 }
 
-func startCatalogServerWithConfig(t *testing.T, cfg config.Config, configure ...func(*Options)) *catalogServer {
+func startCatalogServerWithConfig(t testing.TB, cfg config.Config, configure ...func(*Options)) *catalogServer {
 	t.Helper()
 	cs := &catalogServer{history: audit.NewMemoryStore(1000, 1000)}
 	setup := func(o *Options) {

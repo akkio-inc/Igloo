@@ -204,11 +204,11 @@ func (ts *testServer) url(user, password string) string {
 	return u.String()
 }
 
-func (ts *testServer) admin(t *testing.T, mode pgx.QueryExecMode) *pgx.Conn {
+func (ts *testServer) admin(t testing.TB, mode pgx.QueryExecMode) *pgx.Conn {
 	return connect(t, ts.url("igloo", adminPassword), mode)
 }
 
-func connect(t *testing.T, connURL string, mode pgx.QueryExecMode) *pgx.Conn {
+func connect(t testing.TB, connURL string, mode pgx.QueryExecMode) *pgx.Conn {
 	t.Helper()
 	conn, err := tryConnect(connURL, mode)
 	if err != nil {
@@ -259,7 +259,7 @@ func numericEqual(a, b pgtype.Numeric) bool {
 	return a.Int.Cmp(new(big.Int).Mul(b.Int, pow10(b.Exp-a.Exp))) == 0
 }
 
-func mustExec(t *testing.T, conn *pgx.Conn, sql string) {
+func mustExec(t testing.TB, conn *pgx.Conn, sql string) {
 	t.Helper()
 	if _, err := conn.Exec(context.Background(), sql); err != nil {
 		t.Fatalf("%s: %v", sql, err)
