@@ -13,22 +13,28 @@ import (
 )
 
 // OpenWorker starts DuckDB for a distributed-execution worker (igloo
-// worker): object storage credentials, the read cache and the sandbox are
-// set up as for the server, and no catalog is attached, since a worker
-// reads only the data files its tasks name.
+// worker): the spill directory, object storage credentials, the read cache
+// and the sandbox are set up as for the server, and no catalog is attached,
+// since a worker reads only the data files its tasks name.
 func OpenWorker(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engine, error) {
+	release := claimTempDir(cfg.DuckDB.TempDir, log)
 	connector, err := duckdb.NewConnector(cfg.DuckDB.Path, nil)
 	if err != nil {
+		release()
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	p, err := newParser()
 	if err != nil {
-		return nil, errors.Join(err, connector.Close())
+		err = errors.Join(err, connector.Close())
+		release()
+		return nil, err
 	}
-	e := &Engine{connector: connector, parser: p, log: log}
+	e := &Engine{connector: connector, parser: p, releaseTempDir: release, log: log}
 	if err := e.setupWorker(ctx, cfg, log); err != nil {
 		p.close()
-		return nil, errors.Join(err, connector.Close())
+		err = errors.Join(err, connector.Close())
+		release()
+		return nil, err
 	}
 	if e.cache != nil {
 		e.startCache(log)

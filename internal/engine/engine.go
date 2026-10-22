@@ -77,34 +77,43 @@ type Engine struct {
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
 	catMu     sync.RWMutex
 	catLocked atomic.Int64
-	log       *slog.Logger
+	// releaseTempDir lets go of the spill directory; see claimTempDir.
+	releaseTempDir func()
+	log            *slog.Logger
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
 // retrying the attach until ctx is done. Once set up, DuckDB is locked down
-// so SQL cannot reach files or URLs outside the warehouse.
+// so SQL cannot reach files or URLs outside the warehouse. First it deletes
+// the files an earlier process left in the spill directory (see
+// claimTempDir).
 func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Option) (*Engine, error) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
+	release := claimTempDir(cfg.DuckDB.TempDir, log)
 	connector, err := duckdb.NewConnector(cfg.DuckDB.Path, nil)
 	if err != nil {
+		release()
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 
 	p, err := newParser()
 	if err != nil {
-		return nil, errors.Join(err, connector.Close())
+		err = errors.Join(err, connector.Close())
+		release()
+		return nil, err
 	}
 
-	e := &Engine{connector: connector, parser: p, log: log}
+	e := &Engine{connector: connector, parser: p, releaseTempDir: release, log: log}
 	if err := e.setup(ctx, cfg, log, o); err != nil {
 		p.close()
 		err = errors.Join(err, connector.Close())
 		if e.proxy != nil {
 			err = errors.Join(err, e.proxy.Close())
 		}
+		release()
 		return nil, err
 	}
 	if e.cache != nil {
@@ -414,6 +423,9 @@ func (e *Engine) Close() error {
 	err := e.connector.Close()
 	if e.proxy != nil {
 		err = errors.Join(err, e.proxy.Close())
+	}
+	if e.releaseTempDir != nil {
+		e.releaseTempDir()
 	}
 	return err
 }

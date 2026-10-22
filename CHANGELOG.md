@@ -978,5 +978,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the catalog spells it, and looks it up again by the catalog's name before
   anything lists the catalog, so listings always show the catalog's name.
   Reading a table by its name in any case works as before.
+- DuckDB's spill files outlived the Igloo process that wrote them when it
+  stopped, cleanly or killed, while data was spilled, and the next start
+  did not delete them: on a single machine whose replica restarted during
+  large queries, 59 GB of them filled the spill volume, and later queries
+  failed with
+  `No space left on device` or `failed to offload data block`. Igloo now
+  deletes them when it starts, before it runs any query, and logs the bytes
+  freed. It deletes only DuckDB's own files in `IGLOO_DUCKDB_TEMP_DIR`
+  (`duckdb_temp_storage_*`, `duckdb_temp_block-*`), and none while another
+  Igloo process uses the directory, which it tells by a lock that each
+  process holds there (docs/operations.md#spill-directory).
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

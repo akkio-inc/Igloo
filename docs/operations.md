@@ -242,7 +242,8 @@ using all of its cores.
   `IGLOO_DUCKDB_MEMORY_LIMIT` by what they use.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk with
-  room for your largest sorts and joins.
+  room for your largest sorts and joins, and give each Igloo process its
+  own ([spill directory](#spill-directory)).
 - **CPU.** DuckDB parallelizes each query across `IGLOO_DUCKDB_THREADS`
   threads (default: one per core).
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
@@ -253,6 +254,28 @@ A memory-optimized machine with 4 to 8 cores and 32 to 64 GB handles most
 datasets up to a few hundred GB of compressed Parquet comfortably. To size
 one client's or team's compute apart from everyone else's, give them a
 [compute pool](workload-management.md#compute-pools).
+
+### Spill directory
+
+Spill files stay in the directory when Igloo stops while DuckDB has data
+spilled there, whether it stops cleanly, is killed (for running out of
+memory, or by Docker or Kubernetes after the stop grace period) or crashes.
+Igloo deletes them the next time it starts, before it runs any query. The
+log says
+`deleted DuckDB temporary files an earlier run left in the spill directory`,
+with how many files and `bytes_freed`. Igloo deletes only the files DuckDB
+spills to, named `duckdb_temp_storage_*` and `duckdb_temp_block-*`, at the
+top of the directory, and leaves everything else.
+
+Give each Igloo process (each replica, compute pool and worker) a spill
+directory of its own, as the single-machine stack and the Helm chart do.
+DuckDB gives its files the same names in every process, so two processes
+spilling to one directory would write to the same files, and neither
+could tell the other's files from those of a run that has ended. While
+it runs, an Igloo process holds a lock on `igloo.lock` in the directory
+(an `flock(2)` lock, which holds between containers on one machine that
+mount the same volume). One that starts while another holds it deletes
+nothing and logs `another process is using the spill directory`.
 
 ### When one machine is not enough
 
@@ -909,6 +932,7 @@ and the catalog runs its database migrations before it serves. Read
 | `/readyz` returns 503 | The body names the failing dependency: engine, metadata database or catalog. |
 | Log says `read cache off: cannot load the cache_httpfs extension ... Read-only file system` | The root filesystem is read-only and `/tmp` is not writable. Mount a small writable volume at `/tmp`. |
 | Log says `read cache off: its directory is not writable` | Make the volume at `IGLOO_CACHE_DIR` writable by the container's user (UID 65532), e.g. with `fsGroup: 65532` on Kubernetes. |
+| `IO Error: Could not write file ".../duckdb_temp_storage_DEFAULT-4.tmp": No space left on device`, or `Out of Memory Error: failed to offload data block` | The spill disk is full, or the statements running at once spilled `IGLOO_DUCKDB_MAX_TEMP_SIZE` between them. Give the [spill directory](#spill-directory) more room, or run the largest statements on [workers](distributed-execution.md) or a [compute pool](workload-management.md#compute-pools) of their own. Igloo deletes earlier runs' spill files when it starts, but not other files on the disk. |
 | Log says `read cache paused` | Less than 5% of the cache's disk is free. Free space or give the cache its own volume; it resumes on its own. |
 | A task, pipe or `COPY INTO` does not do what you expect | See [loading troubleshooting](loading.md#troubleshooting). |
 | A large query did not run on workers | `SET distributed_execution = 'on'` and run it again with `IGLOO_LOG_LEVEL=debug`: the log says why it ran on the replica (for example a table with delete files, or an aggregate that does not combine). See [what runs distributed](distributed-execution.md#what-runs-distributed). |

@@ -191,7 +191,7 @@ Azure identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AZURE_SYSTEM_CREDENTIALS
 | `IGLOO_DUCKDB_MEMORY_LIMIT` | 80% of memory | e.g. `8GB`. Larger queries spill to disk. |
 | `GOMEMLIMIT` | what DuckDB's limit leaves | Go's soft memory limit for the rest of Igloo, e.g. `4GiB`. By default, the container's memory limit (or the machine's memory) less `IGLOO_DUCKDB_MEMORY_LIMIT` and a twentieth in reserve (at least 256 MiB), but at least 256 MiB; see [sizing](operations.md#sizing). |
 | `IGLOO_DUCKDB_THREADS` | one per core | |
-| `IGLOO_DUCKDB_TEMP_DIR` | `/var/lib/igloo/tmp` in the image | Spill directory. Give it fast local disk. |
+| `IGLOO_DUCKDB_TEMP_DIR` | `/var/lib/igloo/tmp` in the image | Spill directory. Give it fast local disk, and each Igloo process its own ([spill directory](operations.md#spill-directory)). |
 | `IGLOO_DUCKDB_MAX_TEMP_SIZE` | 90% of the spill disk's free space | Cap on spill files, e.g. `40GiB`. Queries that need more fail. |
 | `IGLOO_DUCKDB_EXTENSION_DIR` | set in the image | Pre-installed DuckDB extensions |
 
