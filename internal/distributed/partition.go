@@ -95,7 +95,7 @@ func (pl *planner) partition(c *candidate, other *tableUse) (*partitionPlan, err
 		}
 		if strings.HasPrefix(tf, "VARCHAR") {
 			// Values equal under a collation do not hash alike.
-			collation, err := pl.env.Setting(pl.ctx, "default_collation")
+			collation, err := pl.collation()
 			if err != nil {
 				return nil, err
 			}

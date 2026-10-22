@@ -35,27 +35,77 @@ type aggregation struct {
 	// aggs are the distinct aggregate calls, by canonical form.
 	aggs    []*aggCall
 	aggKeys map[string]*aggCall
-	// distinct is the argument of the aggregates over DISTINCT values, if
-	// any; the workers group by it too.
-	distinct    node
-	distinctKey string
-	// partials are the fragment's partial aggregate expressions.
+	// distincts are the arguments of the aggregates over DISTINCT values,
+	// by canonical form. Unless the stage's partitions keep each value
+	// apart (aggInPlace), workers group by them too, as __dk columns.
+	distincts    []node
+	distinctKeys []string
+	// partials are the fragment's partial aggregate expressions, as __a
+	// columns. dk[i] is, for a partial over the DISTINCT values of an
+	// argument, that argument's index in distincts; -1 for the others.
 	partials []node
+	dk       []int
+	// mode says how the groups are completed (see the agg* constants).
+	mode string
+	// final says the coordinator reads whole groups, as __f columns,
+	// rather than partial aggregates.
+	final bool
 }
 
 // aggCall is one aggregate call and how it is computed in two steps.
 type aggCall struct {
 	call node
+	// name is the function's name, lower case.
+	name string
+	// distinct is the index of its argument in distincts, for an aggregate
+	// over DISTINCT values; -1 otherwise.
+	distinct int
 	// partials are the indexes of its partial aggregates.
 	partials []int
 	// kind says how the coordinator combines them.
 	kind string
 	// typ is the call's result type, for casting the combined value back.
 	typ string
+	// final is the index of its __f column, when a stage computes it whole.
+	final int
+}
+
+// How an aggregation's groups are completed. Workers always aggregate their
+// share of the rows first, into partial results.
+const (
+	// aggGather sends the partial results to the coordinator, which
+	// combines them; aggregates over DISTINCT values it computes over the
+	// values the workers grouped their rows by.
+	aggGather = "gather"
+	// aggInPlace is for a stage whose partitions keep each value of every
+	// DISTINCT argument in one partition, as a partitioned join on that
+	// value does: aggregates over DISTINCT values that add up (count, sum,
+	// min, max, ...) are computed by the stage, and the coordinator adds
+	// up their partitions' results like any partial aggregates.
+	aggInPlace = "in place"
+	// aggByValue writes the partial results, grouped by the DISTINCT
+	// arguments too, to an exchange keyed by the groups and a DISTINCT
+	// argument that fixes the others; a stage then aggregates each
+	// partition as in aggInPlace.
+	aggByValue = "by value"
+	// aggByGroup writes the partial results to an exchange keyed by the
+	// groups; a stage then completes the groups of each partition, every
+	// aggregate included, and the coordinator only concatenates them.
+	aggByGroup = "by group"
+)
+
+// additiveDistinct are the aggregates over DISTINCT values that combine
+// over disjoint sets of values, by the function in combinable (avg by its
+// sum and count).
+var additiveDistinct = map[string]bool{
+	"count": true, "sum": true, "min": true, "max": true, "avg": true, "mean": true,
+	"bool_and": true, "bool_or": true, "bit_and": true, "bit_or": true, "bit_xor": true,
+	"any_value": true, "product": true, "fsum": true, "sumkahan": true, "kahan_sum": true,
 }
 
 // aggregateJob builds a job for a candidate that aggregates: workers group
-// and aggregate their rows, the coordinator combines their groups.
+// and aggregate their rows; the coordinator, or a second stage, completes
+// the groups.
 func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	a := &aggregation{pl: pl, c: c, aliases: map[string]int{}, aggKeys: map[string]*aggCall{}}
 	for i, item := range list(c.sel, "select_list") {
@@ -80,6 +130,12 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	if err := a.collect(); err != nil {
 		return nil, err
 	}
+	if err := a.choose(); err != nil {
+		return nil, err
+	}
+	if err := a.plan(); err != nil {
+		return nil, err
+	}
 	if err := a.types(); err != nil {
 		return nil, err
 	}
@@ -87,11 +143,20 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	if err != nil {
 		return nil, err
 	}
-	combine, err := a.combine()
+	b := &jobBuild{fragment: fragment}
+	switch a.mode {
+	case aggByValue:
+		b.second, err = a.valueStage()
+	case aggByGroup:
+		b.second, err = a.groupStage()
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &jobBuild{fragment: fragment, combine: combine}, nil
+	if b.combine, err = a.combine(); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // groupBy resolves the GROUP BY clause: positions and aliases name select
@@ -330,7 +395,7 @@ func (a *aggregation) collect() error {
 	return err
 }
 
-// add plans one aggregate call.
+// add records one aggregate call.
 func (a *aggregation) add(call node) error {
 	key := a.key(call)
 	if _, ok := a.aggKeys[key]; ok {
@@ -347,10 +412,8 @@ func (a *aggregation) add(call node) error {
 	if a.pl.hasAggregate(args) || hasClass(args, "WINDOW") {
 		return unsupported("nested aggregates")
 	}
-	ac := &aggCall{call: call}
-
-	switch {
-	case call["distinct"] == true:
+	ac := &aggCall{call: call, name: name, distinct: -1}
+	if call["distinct"] == true {
 		if len(args) != 1 || child(call, "filter") != nil {
 			return unsupported("%s(DISTINCT ...) with several arguments or a FILTER", name)
 		}
@@ -358,49 +421,260 @@ func (a *aggregation) add(call node) error {
 		if err != nil {
 			return err
 		}
+		arg = namedRows(arg)
 		k := a.key(arg)
-		if a.distinct == nil {
-			a.distinct, a.distinctKey = arg, k
-		} else if k != a.distinctKey {
-			return unsupported("DISTINCT aggregates over different expressions")
+		ac.distinct = slices.Index(a.distinctKeys, k)
+		if ac.distinct < 0 {
+			ac.distinct = len(a.distincts)
+			a.distincts, a.distinctKeys = append(a.distincts, arg), append(a.distinctKeys, k)
 		}
-		ac.kind = combineDistinct
-
-	case name == "avg" || name == "mean":
-		if len(args) != 1 {
-			return unsupported("%s with %d arguments", name, len(args))
-		}
-		ac.kind = combineAvg
-		ac.partials = []int{a.partial(call, "sum"), a.partial(call, "count")}
-
-	default:
-		if _, ok := combinable[name]; !ok {
-			return unsupported("%s() cannot be computed in parts", name)
-		}
-		if (name == "min" || name == "max") && len(args) != 1 {
-			return unsupported("%s with %d arguments", name, len(args))
-		}
-		ac.kind = combineSame
-		if name == "count" || name == "count_star" || name == "count_if" || name == "countif" {
-			ac.kind = combineCount
-		}
-		ac.partials = []int{a.partial(call, "")}
+	} else if err := partialArgs(name, len(args)); err != nil {
+		return err
 	}
 	a.aggKeys[key] = ac
 	a.aggs = append(a.aggs, ac)
 	return nil
 }
 
-// partial adds a partial aggregate: call itself, or call's arguments and
-// FILTER with another function.
-func (a *aggregation) partial(call node, function string) int {
-	p := clone(call).(node)
+// namedRows makes the rows an expression builds, as in count(DISTINCT
+// (a, b)), structs with named fields, which are equal where the rows are:
+// the type of a row, STRUCT(BIGINT, BIGINT), cannot be written in a cast.
+func namedRows(e node) node {
+	return rewrite(e, func(n node) (node, bool) {
+		if str(n["class"]) != "FUNCTION" || !strings.EqualFold(str(n["function_name"]), "row") || n["is_operator"] == true {
+			return nil, false
+		}
+		r := clone(n).(node)
+		r["function_name"] = "struct_pack"
+		for i, c := range list(r, "children") {
+			c.(node)["alias"] = "v" + strconv.Itoa(i+1)
+		}
+		for i, c := range list(r, "children") {
+			list(r, "children")[i] = namedRows(c.(node))
+		}
+		return r, true
+	}).(node)
+}
+
+// partialArgs checks that an aggregate computes in parts, given its
+// arguments.
+func partialArgs(name string, args int) error {
+	switch {
+	case name == "avg" || name == "mean":
+		if args != 1 {
+			return unsupported("%s with %d arguments", name, args)
+		}
+	case combinable[name] == "":
+		return unsupported("%s() cannot be computed in parts", name)
+	case (name == "min" || name == "max") && args != 1:
+		return unsupported("%s with %d arguments", name, args)
+	}
+	return nil
+}
+
+// choose decides how the groups are completed (see the agg* constants).
+func (a *aggregation) choose() error {
+	// One grouping set of every group expression, or none: grouping sets
+	// are applied by the coordinator, over the finest groups.
+	single := len(a.sets) == 0 || (len(a.sets) == 1 && len(a.sets[0].([]any)) == len(a.groups))
+	additive := true
+	for _, ac := range a.aggs {
+		if ac.distinct >= 0 && !additiveDistinct[ac.name] {
+			additive = false
+		}
+	}
+	anchor := a.anchor()
+	// Under a collation, values equal to GROUP BY and DISTINCT, such as 'a'
+	// and 'A', hash apart: partitions would split their groups.
+	collation, err := a.pl.collation()
+	if err != nil {
+		return err
+	}
+	switch {
+	case collation != "":
+		a.mode = aggGather
+	case len(a.distincts) == 0:
+		a.mode = aggGather
+		if single && len(a.groups) > 0 && (a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && a.manyGroups()) {
+			a.mode = aggByGroup
+		}
+	case !single:
+		a.mode = aggGather
+	case additive && a.inPlace():
+		a.mode = aggInPlace
+	case a.pl.opts.aggregation == aggGather:
+		a.mode = aggGather
+	case additive && anchor >= 0 && a.pl.opts.aggregation != aggByGroup:
+		a.mode = aggByValue
+	case len(a.groups) > 0:
+		a.mode = aggByGroup
+	default:
+		a.mode = aggGather
+	}
+	if a.mode == aggGather && len(a.distincts) > 1 && anchor < 0 {
+		// The workers would send every combination of the values.
+		return unsupported("DISTINCT aggregates over different expressions")
+	}
+	return nil
+}
+
+// plan works out how each aggregate call is computed in two steps.
+func (a *aggregation) plan() error {
+	for _, ac := range a.aggs {
+		if ac.distinct >= 0 && (a.mode == aggGather || a.mode == aggByGroup) {
+			ac.kind = combineDistinct
+			continue
+		}
+		switch ac.name {
+		case "avg", "mean":
+			ac.kind = combineAvg
+			ac.partials = []int{a.partial(ac, "sum"), a.partial(ac, "count")}
+		default:
+			ac.kind = combineSame
+			if ac.name == "count" || ac.name == "count_star" || ac.name == "count_if" || ac.name == "countif" {
+				ac.kind = combineCount
+			}
+			ac.partials = []int{a.partial(ac, "")}
+		}
+	}
+	return nil
+}
+
+// partial adds a partial aggregate: the call itself, or the call's
+// arguments, DISTINCT and FILTER with another function.
+func (a *aggregation) partial(ac *aggCall, function string) int {
+	p := clone(ac.call).(node)
 	p["alias"] = ""
 	if function != "" {
 		p["function_name"] = function
 	}
 	a.partials = append(a.partials, p)
+	a.dk = append(a.dk, ac.distinct)
 	return len(a.partials) - 1
+}
+
+// anchor returns the index of a DISTINCT argument whose value every
+// DISTINCT argument's non-NULL value fixes, so that partitioning by it
+// keeps every argument's values apart; -1 if there is none.
+func (a *aggregation) anchor() int {
+	for i, d := range a.distincts {
+		if str(d["class"]) != "COLUMN_REF" && len(a.distincts) > 1 {
+			continue
+		}
+		col := resolveColumn(d, a.c.scope)
+		ok := true
+		for j, e := range a.distincts {
+			if j != i && (col == nil || !slices.Contains(determined(e, a.c.scope), itemColumn{col, strings.ToLower(lastName(d))})) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// inPlace reports whether the candidate's stage reads partitions that keep
+// each value of every DISTINCT argument in one partition: a partitioned
+// join whose key, on one side, every argument's value fixes.
+func (a *aggregation) inPlace() bool {
+	p := a.c.partition
+	if p == nil {
+		return false
+	}
+	for _, d := range a.distincts {
+		fixed := determined(d, a.c.scope)
+		ok := false
+		for side, item := range []*fromItem{a.c.split.item, p.other.item} {
+			all := true
+			for _, k := range p.keys {
+				if !slices.Contains(fixed, itemColumn{item, strings.ToLower(k[side])}) {
+					all = false
+				}
+			}
+			ok = ok || all
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// itemColumn is a column of a FROM item, by lower-case name.
+type itemColumn struct {
+	item *fromItem
+	name string
+}
+
+// determined returns the columns whose values a non-NULL value of e fixes:
+// a column itself, the fields of a row or struct, and what the branches of
+// a CASE without ELSE fix when they are all the same expression.
+func determined(e node, sc *scope) []itemColumn {
+	switch str(e["class"]) {
+	case "COLUMN_REF":
+		if it := resolveColumn(e, sc); it != nil {
+			return []itemColumn{{it, strings.ToLower(lastName(e))}}
+		}
+	case "FUNCTION":
+		switch strings.ToLower(str(e["function_name"])) {
+		case "row", "struct_pack":
+			var out []itemColumn
+			for _, c := range list(e, "children") {
+				out = append(out, determined(c.(node), sc)...)
+			}
+			return out
+		}
+	case "CASE":
+		if el := child(e, "else_expr"); el != nil && !(str(el["class"]) == "CONSTANT" && child(el, "value")["is_null"] == true) {
+			return nil
+		}
+		// Branches that differ could give equal values from different
+		// columns: CASE WHEN p THEN (a, b) ELSE (b, a) END.
+		checks := list(e, "case_checks")
+		for _, c := range checks[min(1, len(checks)):] {
+			if canonical(child(c.(node), "then_expr")) != canonical(child(checks[0].(node), "then_expr")) {
+				return nil
+			}
+		}
+		if len(checks) > 0 {
+			return determined(child(checks[0].(node), "then_expr"), sc)
+		}
+	}
+	return nil
+}
+
+// manyGroups guesses whether the groups are too many to send every
+// worker's to the coordinator: the top of an aggregation by a column of a
+// table the workers divide, such as spend per device, top ten. Then each
+// partition's top groups are all the coordinator needs.
+func (a *aggregation) manyGroups() bool {
+	if _, ok := a.topN(); !ok {
+		return false
+	}
+	small := map[*fromItem]bool{}
+	for _, u := range a.c.uses {
+		if u.scope == a.c.scope && u != a.c.split && (a.c.partition == nil || u != a.c.partition.other) {
+			small[u.item] = true
+		}
+	}
+	for _, g := range a.groups {
+		large := false
+		walk(g, func(n node) bool {
+			if str(n["class"]) == "COLUMN_REF" {
+				if it := resolveColumn(n, a.c.scope); it == nil || !small[it] {
+					large = true
+				}
+			}
+			return !large
+		})
+		if large {
+			return true
+		}
+	}
+	return false
 }
 
 // types works out the result type of each aggregate call, which its
@@ -443,11 +717,15 @@ func (a *aggregation) types() error {
 
 // fragment builds the SELECT workers run: the candidate's FROM and WHERE,
 // grouped by its group expressions (all grouping sets' columns at once)
-// and the DISTINCT argument, with the partial aggregates.
+// and, unless the stage keeps their values apart, the DISTINCT arguments,
+// with the partial aggregates.
 //
-//	SELECT <group> AS __g0, ..., <distinct arg> AS __dk, <partial> AS __a0, ...
+//	SELECT <group> AS __g0, ..., <distinct arg> AS __dk0, ..., <partial> AS __a0, ...
 //	FROM <the candidate's FROM> WHERE <its WHERE>
-//	GROUP BY <group>, ..., <distinct arg>
+//	GROUP BY <group>, ..., <distinct arg>, ...
+//
+// Partials over DISTINCT values are left to the second stage when it
+// computes them (aggByValue).
 func (a *aggregation) fragment() (node, error) {
 	f, err := a.pl.p.template("SELECT 1")
 	if err != nil {
@@ -460,12 +738,17 @@ func (a *aggregation) fragment() (node, error) {
 		groups = append(groups, clone(g))
 		set = append(set, jsonInt(i))
 	}
-	if a.distinct != nil {
-		items = append(items, aliased(a.distinct, "__dk"))
-		groups = append(groups, clone(a.distinct))
-		set = append(set, jsonInt(len(a.groups)))
+	if a.mode != aggInPlace {
+		for i, d := range a.distincts {
+			items = append(items, aliased(d, "__dk"+strconv.Itoa(i)))
+			groups = append(groups, clone(d))
+			set = append(set, jsonInt(len(set)))
+		}
 	}
 	for i, p := range a.partials {
+		if a.dk[i] >= 0 && a.mode == aggByValue {
+			continue
+		}
 		q, err := a.substituteAliasesInArgs(p)
 		if err != nil {
 			return nil, err
@@ -484,6 +767,217 @@ func (a *aggregation) fragment() (node, error) {
 		f["group_sets"] = []any{set}
 	}
 	return f, nil
+}
+
+// secondStage is the stage that completes an aggregation's groups from
+// the partial results, partition by partition.
+type secondStage struct {
+	fragment node
+	// keys are the partial results' columns the exchange is keyed by.
+	keys []string
+}
+
+// partialsView is the view a second stage reads its partition of the
+// partial results as.
+const partialsView = "__igloo_partials"
+
+// valueStage builds the second stage of an aggregation by value: each
+// partition's partial results aggregated again by group, with the
+// aggregates over DISTINCT values computed over the partition's values,
+// which no other partition holds.
+//
+//	SELECT __g0, ..., sum(__a0) AS __a0, ..., count(DISTINCT __dk0) AS __a3, ...
+//	FROM __igloo_partials GROUP BY __g0, ...
+func (a *aggregation) valueStage() (*secondStage, error) {
+	f, err := a.partialsSelect()
+	if err != nil {
+		return nil, err
+	}
+	items := list(f, "select_list")
+	for i, p := range a.partials {
+		var e node
+		if d := a.dk[i]; d >= 0 {
+			e = clone(p).(node)
+			ref, err := a.pl.p.expr(quoteIdent("__dk" + strconv.Itoa(d)))
+			if err != nil {
+				return nil, err
+			}
+			e["children"] = []any{ref}
+		} else {
+			name := strings.ToLower(str(p["function_name"]))
+			text := combinable[name] + "(" + quoteIdent("__a"+strconv.Itoa(i)) + ")"
+			if combinable[name] == "sum" && name != "sum" {
+				// Counts stay BIGINT, as one machine has them.
+				text = "CAST(" + text + " AS BIGINT)"
+			}
+			if e, err = a.pl.p.expr(text); err != nil {
+				return nil, err
+			}
+		}
+		items = append(items, aliased(e, "__a"+strconv.Itoa(i)))
+	}
+	f["select_list"] = items
+	keys := a.groupColumns()
+	keys = append(keys, "__dk"+strconv.Itoa(a.anchor()))
+	return &secondStage{fragment: f, keys: keys}, nil
+}
+
+// groupStage builds the second stage of an aggregation by group: each
+// partition holds whole groups, which it completes as the coordinator
+// would, every aggregate included, keeping only the groups HAVING keeps
+// and, under ORDER BY ... LIMIT, its first rows. The coordinator then reads
+// the completed aggregates (final).
+//
+//	SELECT __g0, ..., coalesce(sum(__a0), 0) AS __f0, count(DISTINCT __dk0) AS __f1, ...
+//	FROM __igloo_partials GROUP BY __g0, ... HAVING ... ORDER BY ... LIMIT ...
+func (a *aggregation) groupStage() (*secondStage, error) {
+	f, err := a.partialsSelect()
+	if err != nil {
+		return nil, err
+	}
+	items := list(f, "select_list")
+	for k, ac := range a.aggs {
+		e, err := a.combined(ac)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, aliased(e, "__f"+strconv.Itoa(k)))
+		ac.final = k
+	}
+	f["select_list"] = items
+	// HAVING and the first rows are worth applying early, when they can be
+	// said in terms of the partial results alone; the coordinator applies
+	// them again.
+	if h := child(a.c.sel, "having"); h != nil {
+		if e, err := a.rewrite(clone(h).(node), "having"); err == nil && overPartials(e) {
+			f["having"] = e
+		}
+	}
+	if mods, ok := a.firstRows(); ok {
+		f["modifiers"] = mods
+	}
+	a.final = true
+	return &secondStage{fragment: f, keys: a.groupColumns()}, nil
+}
+
+// partialsSelect starts a second stage's SELECT: the group columns, over
+// the partial results, grouped by them.
+func (a *aggregation) partialsSelect() (node, error) {
+	f, err := a.pl.p.template("SELECT 1 FROM " + quoteIdent(partialsView))
+	if err != nil {
+		return nil, err
+	}
+	var items, groups, set []any
+	for i, g := range a.groupColumns() {
+		ref, err := a.pl.p.expr(quoteIdent(g))
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, aliased(ref, g))
+		groups = append(groups, clone(ref))
+		set = append(set, jsonInt(i))
+	}
+	f["select_list"] = items
+	if len(groups) > 0 {
+		f["group_expressions"] = groups
+		f["group_sets"] = []any{set}
+	}
+	return f, nil
+}
+
+func (a *aggregation) groupColumns() []string {
+	var out []string
+	for i := range a.groups {
+		out = append(out, "__g"+strconv.Itoa(i))
+	}
+	return out
+}
+
+// overPartials reports whether e reads nothing but partial results'
+// columns.
+func overPartials(e node) bool {
+	ok := true
+	walk(e, func(n node) bool {
+		switch str(n["class"]) {
+		case "COLUMN_REF":
+			parts := columnNames(n)
+			if len(parts) != 1 || !strings.HasPrefix(parts[0], "__") {
+				ok = false
+			}
+		case "SUBQUERY", "WINDOW", "PARAMETER", "LAMBDA", "STAR":
+			ok = false
+		}
+		return ok
+	})
+	return ok
+}
+
+// topN returns LIMIT plus OFFSET of a candidate whose result is its first
+// rows by ORDER BY: no DISTINCT, window function or QUALIFY, which would
+// need every group first.
+func (a *aggregation) topN() (int64, bool) {
+	sel := a.c.sel
+	if child(sel, "qualify") != nil || hasClass(sel["select_list"], "WINDOW") || hasClass(sel["modifiers"], "WINDOW") {
+		return 0, false
+	}
+	var order, limit bool
+	var total int64
+	for _, m := range list(sel, "modifiers") {
+		switch mod := m.(node); str(mod["type"]) {
+		case "ORDER_MODIFIER":
+			order = true
+		case "LIMIT_MODIFIER":
+			n, ok := limitRows(mod)
+			if !ok || child(mod, "limit") == nil {
+				return 0, false
+			}
+			limit, total = true, n
+		default:
+			return 0, false
+		}
+	}
+	return total, order && limit && total <= maxTopN
+}
+
+// firstRows returns the ORDER BY and LIMIT that keep a partition's first
+// groups, in terms of the partial results.
+func (a *aggregation) firstRows() ([]any, bool) {
+	total, ok := a.topN()
+	if !ok {
+		return nil, false
+	}
+	var mods []any
+	for _, m := range list(a.c.sel, "modifiers") {
+		mod := clone(m).(node)
+		switch str(mod["type"]) {
+		case "ORDER_MODIFIER":
+			for _, o := range list(mod, "orders") {
+				ord := o.(node)
+				e := child(ord, "expression")
+				part := "order"
+				if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
+					e, part = bare(a.items[k-1]), "select"
+				} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+					if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
+						e, part = bare(a.items[i]), "select"
+					}
+				}
+				r, err := a.rewrite(clone(e).(node), part)
+				if err != nil || !overPartials(r) {
+					return nil, false
+				}
+				ord["expression"] = r
+			}
+		case "LIMIT_MODIFIER":
+			l, err := a.pl.p.expr(strconv.FormatInt(total, 10))
+			if err != nil {
+				return nil, false
+			}
+			mod["limit"], mod["offset"] = l, nil
+		}
+		mods = append(mods, mod)
+	}
+	return mods, true
 }
 
 // substituteAliasesInArgs substitutes aliases in a partial aggregate's
@@ -671,21 +1165,24 @@ func (a *aggregation) rewrite(e node, part string) (node, error) {
 }
 
 // combined is the expression that computes an aggregate call from the
-// partial results, cast to the call's own type.
+// partial results, cast to the call's own type; or, once a second stage
+// completed the groups, that reads its result.
 func (a *aggregation) combined(ac *aggCall) (node, error) {
 	col := func(i int) string { return quoteIdent("__a" + strconv.Itoa(ac.partials[i])) }
-	name := strings.ToLower(str(ac.call["function_name"]))
 	var text string
-	switch ac.kind {
-	case combineCount:
+	switch {
+	case a.final:
+		// One row per group: any of its values is the value.
+		text = "any_value(" + quoteIdent("__f"+strconv.Itoa(ac.final)) + ")"
+	case ac.kind == combineCount:
 		text = "coalesce(sum(" + col(0) + "), 0)"
-	case combineAvg:
+	case ac.kind == combineAvg:
 		text = "CAST(sum(" + col(0) + ") AS DOUBLE) / CAST(sum(" + col(1) + ") AS DOUBLE)"
-	case combineSame:
-		text = combinable[name] + "(" + col(0) + ")"
-	case combineDistinct:
+	case ac.kind == combineSame:
+		text = combinable[ac.name] + "(" + col(0) + ")"
+	case ac.kind == combineDistinct:
 		c := clone(ac.call).(node)
-		ref, err := a.pl.p.expr(quoteIdent("__dk"))
+		ref, err := a.pl.p.expr(quoteIdent("__dk" + strconv.Itoa(ac.distinct)))
 		if err != nil {
 			return nil, err
 		}

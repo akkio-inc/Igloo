@@ -69,6 +69,23 @@ partition of the key's hash; then each worker joins and aggregates one
 partition of both, and the coordinator combines the results as before. The
 exchanged rows are deleted when the statement ends.
 
+Aggregations whose partial results would be large complete their groups on
+workers the same way. For an aggregate over `DISTINCT` values, such as the
+reach `count(DISTINCT device_id)` above, each worker groups its rows by the
+values too and writes them to object storage, partitioned by group and
+value; then a worker per partition counts each group's values, which no
+other partition holds, and the coordinator adds up the partitions' counts,
+one row per group and partition, instead of receiving every value. `sum`,
+`min`, `max` and `avg` over `DISTINCT` values add up the same way; other
+aggregates over `DISTINCT` values (`median(DISTINCT x)`) are partitioned by
+group alone, and each partition computes its groups whole. When the part is
+a partitioned join on the counted value (devices reached, joining
+impressions to a device table on the device), each partition of the join
+already holds every row of its values, and counts them without a second
+exchange. The top groups of an aggregation by a column of the large table
+(`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are partitioned by
+group, and each partition sends the coordinator only its first groups.
+
 In detail, a part runs distributed when:
 
 - It is a `SELECT` (in the statement itself, a subquery in `FROM`, a common
@@ -79,7 +96,9 @@ In detail, a part runs distributed when:
 - Its aggregates are `count`, `sum`, `min`, `max`, `avg`, `count_if`,
   `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `any_value`,
   `fsum` and `product`, with or without `FILTER`, and any aggregate over
-  `DISTINCT` values of one expression (`count(DISTINCT user_id)`).
+  `DISTINCT` values of one expression (`count(DISTINCT user_id)`), or of
+  several when one of them is a column that each of the others fixes
+  (`count(DISTINCT user_id)` with `count(DISTINCT (user_id, day))`).
   `GROUP BY` may use positions, aliases, `ALL`, `ROLLUP`, `CUBE` and
   `GROUPING SETS`.
 - The large table appears once in it, and the other tables it reads
@@ -96,7 +115,9 @@ In detail, a part runs distributed when:
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list`, `stddev`), window functions over rows, a large table joined to
+`list`, `stddev`), aggregates over `DISTINCT` values of unrelated
+expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
+window functions over rows, a large table joined to
 itself or read again in a subquery (TPC-H Q17, Q18, Q20, Q21), three large
 tables joined on different keys, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
@@ -208,9 +229,12 @@ parts on the workers.
   and file lists, and results carry aggregated or filtered rows, over TLS.
   Partial results live in the spill directories of the workers and the
   coordinator while a statement runs, and are deleted when it ends.
-- **What partitioned joins leave in object storage.** The rows a
-  partitioned join exchanges are Parquet files, not encrypted by Igloo,
-  under `_igloo_shuffle/` in the warehouse, deleted when the statement ends.
+- **What exchanges leave in object storage.** The rows partitioned joins
+  and aggregations exchange (the columns a join uses, of rows that passed
+  the statement's filters; an aggregation's groups, the values its
+  aggregates over `DISTINCT` values count, and partial aggregates) are
+  Parquet files, not encrypted by Igloo, under `_igloo_shuffle/` in the
+  warehouse, deleted when the statement ends.
   They are protected as the tables' own files are: by access to the bucket
   and its server-side encryption. No credentials the Iceberg REST catalog
   hands out reach `_igloo_shuffle/`. Add a lifecycle rule that expires
@@ -385,14 +409,16 @@ machine's memory run where that machine would run out of memory.
   large table on another key, a large table joined to itself, and a large
   table read again in a subquery run on one machine; give that machine a
   lot of memory and fast spill disk.
-- Partitioned joins write the columns they use to object storage and read
-  them back: that costs request charges and adds a few seconds, and
+- Partitioned joins and aggregations write what they exchange to object
+  storage and read it back: that costs request charges and adds a few
+  seconds, and
   leftovers of a coordinator that crashed mid-statement stay under
   `_igloo_shuffle/` until a lifecycle rule expires them, which every
   deployment with workers needs.
-- The coordinator receives every partial result. A `GROUP BY` with billions
-  of groups, or `count(DISTINCT x)` over billions of values, sends them all
-  to it.
+- The coordinator receives every group of an aggregation, unless only its
+  top rows are kept: a `GROUP BY` with billions of groups sends every
+  worker's groups to it. (`count(DISTINCT x)` over billions of values sends
+  it one row per group and partition.)
 - Tables with delete files (from `UPDATE`, `DELETE` or `MERGE`) or data
   files without field IDs, views, and time travel run on one machine.
 - Workers read each table's files directly and do not use Iceberg partition

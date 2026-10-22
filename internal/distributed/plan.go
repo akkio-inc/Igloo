@@ -158,6 +158,9 @@ type planOptions struct {
 	// now is what the statement's now() and current_date stand for, so
 	// every machine sees the same time.
 	now time.Time
+	// aggregation, if set, overrides how aggregations complete their groups
+	// where there is a choice (aggGather or aggByGroup), for tests.
+	aggregation string
 }
 
 // planner plans one statement.
@@ -176,6 +179,9 @@ type planner struct {
 	reasons []string
 	// tables caches resolved names.
 	tables map[string]tableResult
+	// defaultCollation caches the session's default_collation; nil until
+	// read.
+	defaultCollation *string
 }
 
 type tableResult struct {
@@ -296,6 +302,18 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 		return nil, err
 	}
 	return pins, nil
+}
+
+// collation returns the session's default_collation.
+func (pl *planner) collation() (string, error) {
+	if pl.defaultCollation == nil {
+		c, err := pl.env.Setting(pl.ctx, "default_collation")
+		if err != nil {
+			return "", err
+		}
+		pl.defaultCollation = &c
+	}
+	return *pl.defaultCollation, nil
 }
 
 // skip records why a candidate was not distributed.
@@ -927,6 +945,9 @@ type jobBuild struct {
 	combine node
 	// columns rename the fragment's result columns positionally.
 	columns []string
+	// second, if set, completes an aggregation's groups partition by
+	// partition, before the combine step.
+	second *secondStage
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -1007,6 +1028,12 @@ func (pl *planner) finish(j *job, b *jobBuild) node {
 		last.Inputs = append(last.Inputs, in)
 	}
 	pl.stage(last)
+	if b.second != nil {
+		// The partial results go to an exchange, which a second stage reads
+		// partition by partition.
+		last.Out = pl.exchange("aggregate", b.second.keys, make([]string, len(b.second.keys)))
+		last = pl.stage(&Stage{fragment: b.second.fragment, Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: true}}})
+	}
 	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
 	b.combine["from_table"] = node{
 		"type": "BASE_TABLE", "alias": "__igloo_p", "sample": nil, "query_location": queryLocationNone,

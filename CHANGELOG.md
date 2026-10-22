@@ -261,6 +261,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   storage. Results are those of one machine. Igloo decides by itself when
   to distribute; `SET distributed_execution` forces it on or off for a
   session.
+- Aggregates over `DISTINCT` values complete on workers: their partial
+  results are partitioned by group and value through object storage, a
+  worker per partition counts its values, and the coordinator adds up one
+  row per group and partition instead of receiving every distinct value.
+  Several at once work when one argument fixes the others, as
+  `count(DISTINCT user_id)` next to `count(DISTINCT (user_id, day))`; in a
+  join partitioned on the counted value no exchange is needed. The top
+  groups of an aggregation by a column of a divided table
+  (`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are completed and cut
+  on workers too.
 - Workers start on demand and stop when idle: on Kubernetes the chart's
   `workers.enabled` adds a worker Deployment that Igloo scales between zero
   and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`

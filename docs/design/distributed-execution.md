@@ -1,8 +1,8 @@
 # Design: queries larger than one machine
 
 Status: implemented in 1.0: scatter-gather with partial aggregation and
-broadcast joins, and partitioned joins of two large tables through object
-storage. Serves principles 1 (price-performance), 2 (no knobs) and 4
+broadcast joins, partitioned joins of two large tables and partitioned
+aggregation through object storage. Serves principles 1 (price-performance), 2 (no knobs) and 4
 (performance through fewer moving parts, distribution as the escape hatch);
 costs some of 4, since distribution is a second moving part.
 
@@ -218,10 +218,11 @@ explicit transactions, the coordinator plans it:
    by their parse trees with columns qualified, as DuckDB's binder matches
    them. Each aggregate is computed in two steps: `count` as the sum of
    counts, `sum`/`min`/`max`/`bool_*`/`bit_*` by themselves, `avg` as the
-   sum of sums over the sum of counts. Aggregates over `DISTINCT` values,
-   which must all take the same argument, group the workers' rows by that
-   argument too and are computed whole on the coordinator over the distinct
-   values. Every combined value is cast to the type DuckDB gives the
+   sum of sums over the sum of counts. Aggregates over `DISTINCT` values
+   group the workers' rows by their arguments too, and are computed whole
+   over the distinct values, on the coordinator or, partition by partition,
+   on workers ([Partitioned aggregation](#partitioned-aggregation)).
+   Every combined value is cast to the type DuckDB gives the
    original, found by binding the aggregates in the session. Grouping sets
    group the workers' rows by all of their columns and are applied by the
    coordinator. `now()` and `current_date` become the statement's planning
@@ -412,6 +413,25 @@ enforces it. Docker Compose isolates no containers from each other; its
 example pool runs without workers, and gives its own a secret of their own
 if added.
 
+## Stages and exchanges
+
+A plan is a list of stages (`internal/distributed/stage.go`). A stage is
+a set of tasks that run one fragment each, over a share of the data files
+of its split table, over one partition of the exchanges it reads, or, with
+neither, once; and every task reads in full whatever else the stage reads.
+Its rows go to the coordinator, as partial results that the statement's
+final query reads, or to an exchange: Parquet files under
+`_igloo_shuffle/<statement>/s<stage>/<task>/a<attempt>/__b=<p>/` in the
+warehouse, written with `COPY ... (PARTITION_BY (__b))`, where
+`__b = hash(key columns) % partitions`. Every exchange of a statement has
+the same number of partitions, twice the workers' (at most 64), and hashes
+integer keys as `BIGINT`, so a stage can read several exchanges keyed on
+equal values partition by partition. Columns that Parquet would change
+(`HUGEINT`, `INTERVAL`, `TIME WITH TIME ZONE`) cross exchanges as text and
+are cast back, as results do. The coordinator runs each stage once every
+exchange it reads is complete, and deletes the statement's directory when
+it ends.
+
 ## Partitioned joins
 
 When the tables a part reads besides the split table are too large for
@@ -423,11 +443,8 @@ partitioned by a hash of the key (`internal/distributed/partition.go`):
 1. **Stage one.** Workers read shares of each table's data files, apply the
    statement's conjuncts that read only that table, keep the columns the
    statement names anywhere (all of them after a `*` or a `NATURAL` join),
-   and write the rows to object storage under the warehouse
-   (`_igloo_shuffle/<statement>/<job>/<side>/<task>/a<attempt>/__b=<p>/`)
-   with `COPY ... (PARTITION_BY (__b))`, where
-   `__b = hash(key columns) % partitions`, with twice as many partitions as
-   workers. Each response lists the files written.
+   and write the rows to an exchange keyed by the table's side of the join
+   key. Each response lists the files written.
 2. **Stage two.** One task per partition runs the job's unchanged fragment,
    with F's and G's views defined over that partition's files (read by
    column name) and the other tables read in full as before. Partial
@@ -447,6 +464,53 @@ statement's directory when it ends. The cost is a write and a read of the
 partitioned columns, at object-storage request prices, and the latency of
 both; worker-to-worker Arrow Flight is the later optimization. The read
 cache never keeps these files.
+
+## Partitioned aggregation
+
+Workers aggregate their share of the rows into partial results grouped by
+the group expressions and, for aggregates over `DISTINCT` values, by their
+arguments too. Sent to the coordinator, those are a row per group per
+worker, and a row per group and distinct value: for `count(DISTINCT
+device_id)` every device each worker saw, which made the media benchmark's
+reach query (m02) slower distributed than on one machine. So when the
+partial results may be large, they go to an exchange instead, and a second
+stage completes the groups (`internal/distributed/aggregate.go`):
+
+- **By value.** Partial results of aggregates over `DISTINCT` values that
+  add up over disjoint sets of values (`count`, `sum`, `avg` as their
+  ratio, and the idempotent `min`, `max`, `bool_*`, `bit_*`, `any_value`)
+  are keyed by the groups and a distinct argument, so each value of it
+  lies in one partition. A task per partition aggregates its rows by group,
+  the other partial aggregates again (sums of sums) and the aggregates over
+  `DISTINCT` values over its values; the coordinator combines the
+  partitions' rows like any partial results, adding up the counts. Several
+  `DISTINCT` arguments are allowed when one is a column that every other
+  one's value fixes (the column itself, a row or struct holding it, or a
+  `CASE` whose every branch does with no `ELSE`), as in Snowflake's
+  `COUNT(DISTINCT user_id, day)` next to `COUNT(DISTINCT user_id)`;
+  partitioning by that column keeps every argument's values apart.
+- **By group.** Other aggregates over `DISTINCT` values (`median`,
+  `string_agg`, arguments none of which fixes the others), and the top
+  groups of an aggregation by a column of a divided table
+  (`ORDER BY ... LIMIT`), are keyed by the groups alone. Each partition
+  holds whole groups, which its task completes as the coordinator would,
+  every aggregate included, keeps those `HAVING` keeps and, under
+  `ORDER BY ... LIMIT n`, its first `n`; the coordinator reads one row per
+  group and applies the rest of the statement (windows, `QUALIFY`, the
+  final order and limit) as before.
+- **In place.** A partitioned join already holds every row of a join key's
+  value in one partition. Aggregates over `DISTINCT` values of the key
+  (or of what fixes it, as above) that add up are computed by the join's
+  own stage and added up by the coordinator: no second exchange.
+
+Grouping sets keep the partial results on the coordinator, which applies
+them over the finest groups; distinct counts of different sets do not add
+up. Partial results go to the coordinator as before for aggregations
+without `DISTINCT` and without a top-N over a divided table's columns:
+their groups are usually few, and the exchange would add a write, a read
+and a second round of tasks. Exactness is unchanged: each partial
+aggregate is combined once, sums of integers and decimals stay exact, and
+counts are cast back to `BIGINT`.
 
 ## Evidence
 
@@ -608,11 +672,13 @@ reports the cost per query on the EC2 runs.
 - **Planner gaps fall back silently.** Statements the planner does not
   recognize run on one machine; that is safe but may surprise. The debug
   log and `igloo_distributed_*` metrics say why.
-- **Coordinator bottleneck.** Every partial result goes to the coordinator.
-  High-cardinality `GROUP BY` and `count(DISTINCT)` over huge value sets
-  move a lot of data to one machine; partitioned aggregation (each worker
-  owning a range of groups) is the fix, using the same exchange as
-  partitioned joins.
+- **Coordinator bottleneck.** Aggregates over `DISTINCT` values and top
+  groups complete on workers ([Partitioned
+  aggregation](#partitioned-aggregation)), but a high-cardinality `GROUP BY`
+  whose every group the statement returns still sends every worker's
+  groups to the coordinator. Whether to exchange is decided without
+  knowing how many groups there are; Iceberg's statistics do not count
+  distinct values.
 - **DuckDB's printer.** Fragments go through `json_deserialize_sql`; the
   round-trip check catches printing that changes the tree, but a printer bug
   that keeps the tree yet changes meaning would not be caught. The

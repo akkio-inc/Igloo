@@ -101,12 +101,15 @@ type Coordinator struct {
 	// maxBroadcast, if set, overrides what every worker may read in full,
 	// for tests.
 	maxBroadcast int64
-	parser       *parser
-	aggs         map[string]bool
-	dir          string
-	log          *slog.Logger
-	stop         context.CancelFunc
-	done         chan struct{}
+	// aggregation, if set, overrides how aggregations complete their
+	// groups, for tests (see planOptions).
+	aggregation string
+	parser      *parser
+	aggs        map[string]bool
+	dir         string
+	log         *slog.Logger
+	stop        context.CancelFunc
+	done        chan struct{}
 }
 
 // NewCoordinator returns a coordinator for the workers opts.Pool names.
@@ -237,6 +240,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if co.maxBroadcast > 0 {
 		opts.maxBroadcast = co.maxBroadcast
 	}
+	opts.aggregation = co.aggregation
 	stmt, err := co.parser.parse(query)
 	if err != nil {
 		if IsUnsupported(err) {
@@ -700,7 +704,12 @@ func (s *spoolReader) Read(p []byte) (int, error) {
 func (co *Coordinator) partials(r *jobResult) (node, error) {
 	cols := make([]string, len(r.columns))
 	for i, c := range r.columns {
-		cols[i] = "CAST(" + quoteIdent(c.Name) + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
+		cols[i] = quoteIdent(c.Name)
+		if _, err := co.parser.expr("CAST(NULL AS " + c.Type + ")"); err == nil {
+			cols[i] = "CAST(" + quoteIdent(c.Name) + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
+		}
+		// Otherwise a type DuckDB prints but cannot read, such as a row's
+		// STRUCT(BIGINT, BIGINT), which Parquet keeps as it is.
 	}
 	files := make([]string, len(r.files))
 	for i, f := range r.files {

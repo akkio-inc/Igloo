@@ -337,7 +337,21 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 			return nil, err
 		}
 	}
-	res, err := conn.ExecContext(ctx, "COPY ("+query+") TO "+quoteLiteral(dir)+" (FORMAT parquet, PARTITION_BY (__b))", nil)
+	// Columns Parquet would change cross as text, as results do; the views
+	// that read them cast them back.
+	sel := make([]string, len(cols))
+	for i, c := range cols {
+		t, err := transferType(c.Type)
+		if err != nil {
+			return nil, err
+		}
+		sel[i] = quoteIdent(c.Name)
+		if t != c.Type {
+			sel[i] = "CAST(" + quoteIdent(c.Name) + " AS " + t + ") AS " + quoteIdent(c.Name)
+		}
+	}
+	res, err := conn.ExecContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+quoteLiteral(dir)+
+		" (FORMAT parquet, PARTITION_BY (__b))", nil)
 	if err != nil {
 		return nil, err
 	}
