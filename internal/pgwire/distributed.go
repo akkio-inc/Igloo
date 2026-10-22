@@ -80,6 +80,11 @@ func (sess *session) mode() distributed.Mode {
 	return sess.distMode
 }
 
+// errWorkerMemory is what a statement fails with when a worker, about to
+// run out of memory, canceled its part (distributed.ErrWorkerMemory).
+var errWorkerMemory = pgerror.WithCode(errors.New("canceling statement: a worker was running out of memory, "+
+	"and this statement's part had run the longest there; run it again, or on less data at a time"), codes.OutOfMemory)
+
 // distParts is what running a statement in parts took, for the history:
 // how many workers ran them, how many stages, and how many exchanges the
 // stages wrote.
@@ -126,6 +131,11 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			return parts, true, ctx.Err()
 		case distributed.DataError(err):
 			return parts, true, err
+		case distributed.OutOfMemory(err):
+			// Another worker, or this replica, would run out the same way.
+			s.log.Warn("a worker ran out of memory running part of a statement; the statement fails rather than run again",
+				"user", user.Name, "err", err)
+			return parts, true, errWorkerMemory
 		case distributed.IsUnsupported(err):
 			// The workers found what planning could not, such as data
 			// files without field IDs.

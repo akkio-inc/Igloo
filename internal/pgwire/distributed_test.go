@@ -172,7 +172,7 @@ func (g *taskGate) counts() (waiting, canceled int) {
 
 // startTestWorker starts a worker that may read dir, and returns its
 // address and a function that stops it.
-func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, func()) {
+func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, *distributed.Worker, func()) {
 	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "worker")
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
@@ -217,13 +217,14 @@ func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, f
 		stop()
 		c.Close()
 	})
-	return ln.Addr().String(), stop
+	return ln.Addr().String(), w, stop
 }
 
 type distServer struct {
 	*catalogServer
-	source *lakeSource
-	stops  []func()
+	source  *lakeSource
+	workers []*distributed.Worker
+	stops   []func()
 	// gate holds the workers' tasks back when a test asks it to.
 	gate *taskGate
 }
@@ -240,8 +241,9 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 	ds := &distServer{source: &lakeSource{dir: dir, files: map[string][]distributed.File{}}, gate: newTaskGate()}
 	var addrs []string
 	for i := range workers {
-		addr, stop := startTestWorker(t, dir, i, ds.gate)
+		addr, w, stop := startTestWorker(t, dir, i, ds.gate)
 		addrs = append(addrs, addr)
+		ds.workers = append(ds.workers, w)
 		ds.stops = append(ds.stops, stop)
 	}
 	// Partial results go to the server's spill directory, which its
@@ -389,6 +391,46 @@ func TestDistributedGrants(t *testing.T) {
 		t.Errorf("history shows %d workers for a granted table", n)
 	}
 	expectDenied(t, nina, "SELECT o.amount, count(*) FROM orders o JOIN secrets s ON o.id = s.id GROUP BY 1", "SELECT on table public.secrets")
+}
+
+// A worker about to run out of memory cancels its task (ShedMemory): the
+// statement fails with SQLSTATE 53200 (out_of_memory), rather than run
+// again on another worker or here, either of which would run out the same
+// way.
+func TestDistributedOutOfMemory(t *testing.T) {
+	ds := startDistServer(t, 2)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	mustExec(t, conn, "SET distributed_execution = on")
+	ctx := context.Background()
+	query := "SELECT amount, count(*) FROM orders GROUP BY amount"
+	release := sync.OnceFunc(ds.gate.hold())
+	defer release()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(ctx, query)
+		errc <- err
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for waiting, _ := ds.gate.counts(); waiting < 1 && time.Now().Before(deadline); waiting, _ = ds.gate.counts() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	shed := false
+	for _, w := range ds.workers {
+		shed = w.ShedMemory(64<<20) || shed
+	}
+	if !shed {
+		t.Fatal("no worker had a task to shed")
+	}
+	// Were the task run again, it would now complete.
+	release()
+	err := <-errc
+	if pgCode(err) != "53200" || !strings.Contains(err.Error(), "out of memory") {
+		t.Fatalf("want 53200 for a worker out of memory, got %v", err)
+	}
+	if q := lastRun(t, ds.history, query); q.SQLState != "53200" {
+		t.Errorf("history: %s %s", q.Outcome, q.SQLState)
+	}
 }
 
 // When the workers are gone, statements run here.

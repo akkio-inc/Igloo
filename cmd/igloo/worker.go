@@ -21,6 +21,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/gateway"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
 // serveWorker runs a distributed-execution worker
@@ -52,7 +53,7 @@ func serveWorker() error {
 	if memory == 0 {
 		log.Warn("could not read DuckDB's memory limit")
 	}
-	limitMemory(memory, log)
+	plan := limitMemory(memory, log)
 	cancel()
 
 	reg := prometheus.NewRegistry()
@@ -72,6 +73,13 @@ func serveWorker() error {
 	}
 	errc := make(chan error, 2)
 	go func() { errc <- w.Serve(ln) }()
+	// Cancel the task that has run longest when memory runs low (see
+	// memlimit.Watch), rather than let the kernel kill the worker and every
+	// task on it; its statement fails as out of memory.
+	if plan.Total > 0 {
+		go memlimit.Watch(ctx, plan.Total, w.ShedMemory)
+		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(plan.Total)))
+	}
 
 	// Health, readiness and metrics, unauthenticated as on the server; tasks
 	// are accepted only on the TLS port.

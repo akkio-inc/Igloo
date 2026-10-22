@@ -332,6 +332,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   calls for. A worker that answers with an error is never set aside, and a
   statement whose partial results would pass 1 GiB of the coordinator's
   disk, or that only filters rows, runs on the coordinator.
+- Workers watch their memory as the server does: when one is about to run
+  out, it cancels the task that has run longest instead of being killed by
+  the kernel with every task on it, and the statement fails with SQLSTATE
+  `53200` (`out_of_memory`) rather than run again on another worker or on
+  the coordinator, which would run out the same way.
 - `igloo.query_history` has `workers`, `stages` and `exchanges` columns;
   `igloo_distributed_*` and `igloo_worker_*` metrics report statements,
   fallbacks, tasks and workers.

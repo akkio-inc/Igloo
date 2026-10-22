@@ -380,6 +380,8 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			return nil, ctx.Err()
 		case dataError(err):
 			co.opts.Metrics.query("error", start)
+		case OutOfMemory(err):
+			co.opts.Metrics.query("out_of_memory", start)
 		}
 		return nil, err
 	}
@@ -648,6 +650,9 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 		}
 		if res.Error.Unsupported {
 			return nil, &errUnsupported{reason: strings.TrimPrefix(res.Error.Message, "cannot distribute: ")}
+		}
+		if res.Error.OutOfMemory {
+			return nil, fmt.Errorf("%w: %s, and canceled a task of the statement, which had run the longest there", ErrWorkerMemory, w.addr)
 		}
 		if res.Error.Type != 0 {
 			return nil, &duckdb.Error{Type: duckdb.ErrorType(res.Error.Type), Msg: res.Error.Message}

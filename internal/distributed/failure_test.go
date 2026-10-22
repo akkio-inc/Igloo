@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
 const failureQuery = `SELECT l_returnflag, l_linestatus, sum(l_quantity), count(*), avg(l_discount)
@@ -69,6 +71,43 @@ func TestAllWorkersFail(t *testing.T) {
 	_, _, _, _, err := h.run(t.Context(), failureQuery, ModeOn)
 	if err == nil || IsUnsupported(err) || dataError(err) {
 		t.Fatalf("want a worker failure, got %v", err)
+	}
+}
+
+// A worker about to run out of memory cancels the task that has run longest
+// there (memlimit.Watch, Worker.ShedMemory), and the statement fails as out
+// of memory: run again on another worker, the task would run out the same
+// way.
+func TestWorkerShedsMemory(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	if h.workers[0].ShedMemory(64 << 20) {
+		t.Fatal("shed a task with none running")
+	}
+	started := make(chan struct{}, 4)
+	h.workers[0].beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
+		// A task that runs until it is canceled.
+		started <- struct{}{}
+		<-r.Context().Done()
+		return true
+	}
+	// Memory runs low once the worker runs a task.
+	var low atomic.Bool
+	go func() {
+		<-started
+		low.Store(true)
+	}()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	const total = 32 << 30
+	go memlimit.WatchFunc(ctx, total, time.Millisecond, func() (int64, bool) {
+		if low.Load() {
+			return memlimit.Low(total) / 2, true
+		}
+		return total / 2, true
+	}, h.workers[0].ShedMemory)
+	_, _, _, _, err := h.run(ctx, failureQuery, ModeOn)
+	if !OutOfMemory(err) || IsUnsupported(err) || dataError(err) {
+		t.Fatalf("want the worker's out of memory, got %v", err)
 	}
 }
 

@@ -253,6 +253,18 @@ or a division by zero, is the statement's error, as it would be on one
 machine. Canceling a statement (`Ctrl-C`, `statement_timeout`) cancels its
 parts on the workers.
 
+Workers watch their memory as the server does (see
+[operations](operations.md#sizing)): DuckDB keeps to its limit only for the
+memory its buffer manager tracks, and when what a worker can still allocate
+falls below a sixteenth of its memory (at least 256 MiB), it cancels the
+task that has run longest there rather than let the kernel kill it, and
+every task on it. It logs `memory is running out; canceled the task that had
+run longest` with the statement and task. That statement fails with SQLSTATE
+`53200` (`out_of_memory`), and the server logs `a worker ran out of memory
+running part of a statement`: run on another worker or on the coordinator,
+the part would run out of memory the same way, so neither is tried. Run it
+on less data at a time, or give the workers more memory.
+
 ## Security
 
 - **Grants and the sandbox hold.** A statement is checked against the
@@ -334,7 +346,7 @@ parts on the workers.
 
   | Metric | Labels | Meaning |
   |---|---|---|
-  | `igloo_distributed_queries_total` | `outcome` = `ok`, `error`, `canceled`, `fallback` | Statements whose parts ran on workers (`error`: an error in the data), and statements that started to and ran on the coordinator instead |
+  | `igloo_distributed_queries_total` | `outcome` = `ok`, `error`, `out_of_memory`, `canceled`, `fallback` | Statements whose parts ran on workers (`error`: an error in the data; `out_of_memory`: a worker canceled a part as it ran out of memory), and statements that started to and ran on the coordinator instead |
   | `igloo_distributed_fallbacks_total` | `reason` = `no_workers`, `worker_error`, `combine_error` | Why a statement ran on the coordinator after all |
   | `igloo_distributed_query_seconds` | | Time to run a statement's parts and combine them, before results are sent |
   | `igloo_distributed_tasks_total` | `result` = `ok`, `retried`, `failed` | Parts sent to workers |
@@ -343,7 +355,8 @@ parts on the workers.
   | `igloo_distributed_received_bytes_total` | | Partial results received |
   | `igloo_distributed_worker_starts_total` | `action` = `start`, `stop`; `result` | Workers started and stopped |
 
-  and on the workers' port 8080: `igloo_worker_tasks_total{outcome}`,
+  and on the workers' port 8080: `igloo_worker_tasks_total{outcome}`
+  (`out_of_memory` counting tasks a worker canceled as it ran out),
   `igloo_worker_task_seconds`, `igloo_worker_sent_bytes_total`, and the read
   cache's `igloo_cache_*`.
 - **Logs.** The coordinator logs `distributed execution is on` at start,

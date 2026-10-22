@@ -42,6 +42,12 @@ func Watch(ctx context.Context, total int64, shed func(available int64) bool) {
 	watch(ctx, total, 200*time.Millisecond, Available, shed)
 }
 
+// WatchFunc is Watch with what the process can still allocate read from
+// available every interval, for tests of what shed cancels.
+func WatchFunc(ctx context.Context, total int64, every time.Duration, available func() (int64, bool), shed func(available int64) bool) {
+	watch(ctx, total, every, available, shed)
+}
+
 func watch(ctx context.Context, total int64, every time.Duration, available func() (int64, bool), shed func(int64) bool) {
 	if total <= 0 {
 		return

@@ -28,6 +28,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -73,8 +74,12 @@ type Worker struct {
 	activity  *activity.Tracker
 	srv       *http.Server
 	// beforeTask, if set, runs before each task; tests use it to make a
-	// worker fail or hang.
+	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
+
+	// running are the tasks running, which ShedMemory may cancel.
+	runningMu sync.Mutex
+	running   map[*runningTask]bool
 
 	// footerCache holds data files' footers by path; see footers.
 	footersMu   sync.Mutex
@@ -141,8 +146,70 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 // maxTaskRequest bounds a task's JSON: the file lists of large tables.
 const maxTaskRequest = 256 << 20
 
+// runningTask is a task while it runs, for ShedMemory.
+type runningTask struct {
+	query   string
+	task    int
+	started time.Time
+	cancel  context.CancelCauseFunc
+}
+
+// errTaskMemory is what ShedMemory cancels a task with.
+var errTaskMemory = errors.New("the worker was running out of memory, and this task had run the longest there")
+
+// ShedMemory cancels the task that has run longest on this worker, for
+// memlimit.Watch, when the process is about to run out of memory: DuckDB
+// keeps to its memory limit only for what its buffer manager tracks, and
+// the kernel would otherwise kill the worker, and every task on it with it.
+// The task fails with an out-of-memory error, which fails its statement
+// (OutOfMemory). It reports whether a task was running.
+func (w *Worker) ShedMemory(available int64) bool {
+	w.runningMu.Lock()
+	var longest *runningTask
+	for t := range w.running {
+		if longest == nil || t.started.Before(longest.started) {
+			longest = t
+		}
+	}
+	if longest == nil {
+		w.runningMu.Unlock()
+		w.log.Warn("memory is running out, and no task is running to cancel", "available", memlimit.Format(available))
+		return false
+	}
+	// The next shed, if memory keeps running out, picks another.
+	delete(w.running, longest)
+	t := *longest
+	w.runningMu.Unlock()
+	t.cancel(errTaskMemory)
+	w.log.Warn("memory is running out; canceled the task that had run longest", "available", memlimit.Format(available),
+		"query", t.query, "task", t.task, "running_for", time.Since(t.started).Round(time.Millisecond))
+	return true
+}
+
+// begin records a task as running, until the function it returns is
+// called.
+func (w *Worker) begin(t *runningTask) func() {
+	w.runningMu.Lock()
+	if w.running == nil {
+		w.running = map[*runningTask]bool{}
+	}
+	w.running[t] = true
+	w.runningMu.Unlock()
+	return func() {
+		w.runningMu.Lock()
+		delete(w.running, t)
+		w.runningMu.Unlock()
+	}
+}
+
 func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	defer w.activity.Begin()()
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	rt := &runningTask{started: time.Now(), cancel: cancel}
+	done := w.begin(rt)
+	defer done()
+	r = r.WithContext(ctx)
 	if w.beforeTask != nil && !w.beforeTask(rw, r) {
 		return
 	}
@@ -160,9 +227,21 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log := w.log.With("query", req.Query, "task", req.Task)
-	path, res, err := w.run(r.Context(), &req)
+	w.runningMu.Lock()
+	rt.query, rt.task = req.Query, req.Task
+	w.runningMu.Unlock()
+	path, res, err := w.run(ctx, &req)
+	done()
 	if path != "" {
 		defer os.Remove(path) //nolint:errcheck
+	}
+	if err != nil && errors.Is(context.Cause(ctx), errTaskMemory) {
+		// Another worker would run out of memory the same way: the
+		// coordinator fails the statement rather than run it again.
+		log.Warn("task canceled for memory", "err", err)
+		w.opts.Metrics.task("out_of_memory", start)
+		w.fail(rw, http.StatusUnprocessableEntity, &taskErr{Message: errTaskMemory.Error(), OutOfMemory: true})
+		return
 	}
 	if err != nil {
 		te := &taskErr{Message: err.Error()}

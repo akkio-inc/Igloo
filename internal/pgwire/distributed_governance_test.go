@@ -182,7 +182,7 @@ func TestDistributedConnections(t *testing.T) {
 	source := &lakeSource{dir: dir, files: map[string][]distributed.File{}}
 	var addrs []string
 	for i := range 2 {
-		addr, _ := startTestWorker(t, dir, i, nil)
+		addr, _, _ := startTestWorker(t, dir, i, nil)
 		addrs = append(addrs, addr)
 	}
 	co, err := distributed.NewCoordinator(distributed.Options{
