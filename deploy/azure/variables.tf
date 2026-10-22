@@ -182,9 +182,9 @@ variable "system_node_max_count" {
 }
 
 variable "igloo_node_vm_size" {
-  description = "VM size of the node pool that runs the Igloo query engine. Default: 4 vCPU / 32 GiB memory-optimized Arm64 (Azure Cobalt 100), one Igloo pod per node. Igloo images are multi-arch, so x86 sizes such as Standard_E4as_v5 work too."
+  description = "VM size of the node pool that runs the Igloo query engine. Default: 4 vCPU / 32 GiB memory-optimized Arm64 (Azure Cobalt 100) with a 220 GiB local NVMe disk, one Igloo pod per node. Igloo images are multi-arch, so x86 sizes such as Standard_E4ads_v5 work too. Sizes with a local disk (a \"d\" in the name) get an ephemeral OS disk on it; see igloo_node_os_disk_type."
   type        = string
-  default     = "Standard_E4ps_v6"
+  default     = "Standard_E4pds_v6"
 
   validation {
     condition     = can(regex("^Standard_[A-Za-z0-9_]+$", var.igloo_node_vm_size))
@@ -214,14 +214,25 @@ variable "igloo_node_max_count" {
   }
 }
 
-variable "igloo_node_os_disk_size_gb" {
-  description = "OS disk size of Igloo nodes in GB. Query spill (an emptyDir of igloo_spill_size) lives on this disk."
-  type        = number
-  default     = 128
+variable "igloo_node_os_disk_type" {
+  description = "OS disk of Igloo nodes: Ephemeral, on the VM's local disk (NVMe on v6 sizes), or Managed, a remote Premium SSD. Query spill (an emptyDir of igloo_spill_size) lives on the OS disk, so Ephemeral puts it on local disk. Null picks Ephemeral for sizes with a local disk (a \"d\" after the vCPU count, as in Standard_E4pds_v6) and Managed for the rest. Ephemeral needs a local disk at least as large as the OS disk, 128 GiB unless igloo_node_os_disk_size_gb says otherwise."
+  type        = string
+  default     = null
 
   validation {
-    condition     = var.igloo_node_os_disk_size_gb >= 64 && var.igloo_node_os_disk_size_gb <= 2048
-    error_message = "igloo_node_os_disk_size_gb must be between 64 and 2048."
+    condition     = var.igloo_node_os_disk_type == null || contains(["Ephemeral", "Managed"], coalesce(var.igloo_node_os_disk_type, "Managed"))
+    error_message = "igloo_node_os_disk_type must be null, Ephemeral or Managed."
+  }
+}
+
+variable "igloo_node_os_disk_size_gb" {
+  description = "OS disk size of Igloo nodes in GB. Query spill (an emptyDir of igloo_spill_size) lives on this disk. Null lets AKS choose: an ephemeral OS disk takes the whole local disk (220 GiB on Standard_E4pds_v6), a managed one 128 GB on sizes with up to 7 vCPUs."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.igloo_node_os_disk_size_gb == null || (coalesce(var.igloo_node_os_disk_size_gb, 64) >= 64 && coalesce(var.igloo_node_os_disk_size_gb, 64) <= 2048)
+    error_message = "igloo_node_os_disk_size_gb must be null or between 64 and 2048."
   }
 }
 
@@ -518,7 +529,7 @@ variable "igloo_memory" {
 }
 
 variable "igloo_spill_size" {
-  description = "Size limit of each Igloo pod's spill directory (an emptyDir on the node's OS disk)."
+  description = "Size limit of each Igloo pod's spill directory (an emptyDir on the node's OS disk, which is the local NVMe disk on the default nodes)."
   type        = string
   default     = "50Gi"
 

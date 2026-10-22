@@ -82,7 +82,7 @@ documented in [variables.tf](variables.tf).
 | Virtual network | `10.42.0.0/16` | Subnet `aks-nodes` (`/20`, service endpoint for Storage) and subnet `postgres` (`/24`, delegated to PostgreSQL). |
 | AKS cluster | Free tier, Azure CNI Overlay with Cilium | OIDC issuer and workload identity on, automatic patch upgrades, Kubernetes RBAC. |
 | System node pool | `Standard_D2ps_v6` × 1-3 | Cluster add-ons and the Lakekeeper catalog. |
-| Igloo node pool | `Standard_E4ps_v6` × 2-4 | Label `igloo/pool=query`; Igloo pods select it. Spot when `spot_enabled`. |
+| Igloo node pool | `Standard_E4pds_v6` × 2-4 | Ephemeral OS disk on each VM's local NVMe disk, which holds the spill directory. Label `igloo/pool=query`; Igloo pods select it. Spot when `spot_enabled`. |
 | Storage account | StorageV2, ZRS, hierarchical namespace | TLS 1.2, HTTPS only, no public blob access, shared keys off, firewall default deny, 7-day soft delete. |
 | ADLS Gen2 filesystem | `igloo` | Warehouse at `abfss://igloo@<account>.dfs.core.windows.net/warehouse`. |
 | Managed identities | `<name>-igloo`, `<name>-catalog`, `<name>-aks` | Federated credentials bind the first two to the `igloo` and `igloo-catalog` service accounts. |
@@ -166,27 +166,66 @@ protected by SCRAM, but queries and results cross the internet unencrypted;
 Igloo images are multi-arch (amd64 and arm64), so both node pools default to
 Arm64 VMs on Azure Cobalt 100, which cost less than comparable x86 sizes. Each
 Igloo pod is a complete DuckDB engine and benefits more from memory than from
-cores, so Igloo nodes are memory-optimized: one `Standard_E4ps_v6` (4 vCPU,
-32 GiB) per pod, with the pod requesting 2 CPUs and 24 GiB (`igloo_cpu`,
-`igloo_memory`) and free to use idle cores. DuckDB uses about 80% of the
-memory limit before spilling to `igloo_spill_size` of the node's OS disk.
+cores, so Igloo nodes are memory-optimized: one `Standard_E4pds_v6` (4 vCPU,
+32 GiB, 220 GiB local NVMe disk) per pod, with the pod requesting 2 CPUs and
+24 GiB (`igloo_cpu`, `igloo_memory`) and free to use idle cores. DuckDB uses
+about 80% of the memory limit before spilling to `igloo_spill_size` of the
+node's OS disk, which is on that NVMe disk ([Spill on local NVMe](#spill-on-local-nvme)).
 
 To change sizes, keep the pod's memory a few GiB below the node's: AKS reserves
 about 2.5 GiB per node and the system daemons need a little more. Examples:
 
 | Igloo node | `igloo_memory` | Notes |
 |---|---|---|
-| `Standard_E4ps_v6` (4 vCPU, 32 GiB) | `24Gi` | Default |
-| `Standard_E8ps_v6` (8 vCPU, 64 GiB) | `52Gi` | Larger queries |
-| `Standard_E4ps_v5` (4 vCPU, 32 GiB) | `24Gi` | Ampere Altra; wider regional availability |
-| `Standard_E4as_v5` (4 vCPU, 32 GiB) | `24Gi` | x86 (AMD) fallback |
+| `Standard_E4pds_v6` (4 vCPU, 32 GiB, 220 GiB NVMe) | `24Gi` | Default |
+| `Standard_E8pds_v6` (8 vCPU, 64 GiB, 440 GiB NVMe) | `52Gi` | Larger queries |
+| `Standard_E4pds_v5` (4 vCPU, 32 GiB, 150 GiB local SSD) | `24Gi` | Ampere Altra; wider regional availability |
+| `Standard_E4ads_v5` (4 vCPU, 32 GiB, 150 GiB local SSD) | `24Gi` | x86 (AMD) fallback |
+| `Standard_E4ps_v6` (4 vCPU, 32 GiB) | `24Gi` | No local disk: spill on a managed Premium SSD of `igloo_node_os_disk_size_gb` (AKS picks 128 GB) |
 
 If a size is not offered in your region, `tofu apply` fails creating the node
-pool. Check with `az vm list-skus --location <region> --size Standard_E4ps --output table`.
+pool. Check with `az vm list-skus --location <region> --size Standard_E4pds --output table`.
 
 With `spot_enabled = true` the Igloo pool runs on Spot VMs. Azure can evict
 them at any time, which interrupts running queries and briefly reduces capacity
 until the autoscaler replaces them; the catalog stays on regular nodes.
+
+### Spill on local NVMe
+
+DuckDB writes queries larger than memory (big joins, aggregations and sorts)
+to its spill directory and reads them back; heavy reports spill tens to
+hundreds of GiB. The directory is an `emptyDir` of `igloo_spill_size`, which
+kubelet keeps on the node's OS disk. A managed OS disk is a remote Premium
+SSD: 128 GiB gives 500 IOPS and 100 MB/s. The local NVMe disk of a
+`Standard_E4pds_v6` is rated at 75,000 read and 30,000 write IOPS.
+
+So the module gives Igloo nodes an [ephemeral OS
+disk](https://learn.microsoft.com/azure/virtual-machines/ephemeral-os-disks)
+on their local disk whenever the size has one: `igloo_node_os_disk_type`
+defaults to `Ephemeral` for sizes with a `d` after the vCPU count
+(`Standard_E4pds_v6`, `Standard_E8pds_v6`, `Standard_E4ads_v5`) and to
+`Managed` for the rest. With `igloo_node_os_disk_size_gb` unset, AKS sizes an
+ephemeral OS disk to the whole local disk (220 GiB on `Standard_E4pds_v6`);
+what the operating system and container images leave of it holds the spill.
+For reports that spill around 100 GiB, set `igloo_spill_size = "120Gi"`;
+DuckDB stops at 90% of it, so a query that needs more fails instead of
+filling the disk. For more, use a larger size (`Standard_E8pds_v6` has
+440 GiB).
+
+An ephemeral OS disk is lost when a node is reimaged, upgraded or replaced.
+AKS nodes keep no state there, and spill files only live for a query. Sizes
+with less than 128 GiB of local disk (the 2-vCPU ones) need
+`igloo_node_os_disk_size_gb` set to fit, or `igloo_node_os_disk_type =
+"Managed"`. AKS's other way to put `emptyDir` volumes on the temp disk,
+`kubelet_disk_type = "Temporary"`, is a preview feature (`KubeletDisk`) that
+must be registered on the subscription, so the module does not use it.
+
+Changing `igloo_node_vm_size`, `igloo_node_os_disk_type` or
+`igloo_node_os_disk_size_gb` replaces the Igloo nodes: the provider cycles the
+pool through a temporary one (`iglootmp`) without draining it first, so
+queries running on the old nodes end. A deployment made with the earlier
+default size keeps its nodes, and its managed OS disks, with
+`igloo_node_vm_size = "Standard_E4ps_v6"`.
 
 ## Cost of the defaults
 
@@ -198,11 +237,11 @@ for your region and any discounts.
 |---|---|
 | AKS control plane, Free tier | $0 (Standard tier with SLA: ~$73) |
 | System node: 1 × `Standard_D2ps_v6` + 64 GiB Premium SSD | ~$65 |
-| Igloo nodes: 2 × `Standard_E4ps_v6` + 128 GiB Premium SSD each | ~$330 |
+| Igloo nodes: 2 × `Standard_E4pds_v6`, ephemeral OS disks (no disk charge) | ~$340 |
 | Standard load balancer and its outbound IP | ~$22 |
 | PostgreSQL `B_Standard_B2s` + 32 GiB storage (backups included up to that size) | ~$30 |
 | Private DNS zone | ~$0.50 |
-| **Total before data** | **~$450** |
+| **Total before data** | **~$460** |
 | ADLS Gen2 (Hot, ZRS) | ~$23 per TB stored, plus operations |
 | SQL public IP (`expose_sql`) | ~$4 |
 

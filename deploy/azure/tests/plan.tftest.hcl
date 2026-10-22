@@ -465,6 +465,54 @@ run "spot_node_pool" {
   }
 }
 
+run "igloo_nodes_spill_to_local_nvme" {
+  command = plan
+
+  assert {
+    condition = (
+      azurerm_kubernetes_cluster_node_pool.igloo.vm_size == "Standard_E4pds_v6" &&
+      azurerm_kubernetes_cluster_node_pool.igloo.os_disk_type == "Ephemeral"
+    )
+    error_message = "Igloo nodes must default to a size with local NVMe and an ephemeral OS disk on it, where the spill emptyDir lives."
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).duckdb.spillVolume.sizeLimit == "50Gi"
+    error_message = "The spill volume must default to 50Gi."
+  }
+}
+
+run "managed_os_disk_without_local_disk" {
+  command = plan
+
+  variables {
+    igloo_node_vm_size         = "Standard_E4ps_v6"
+    igloo_node_os_disk_size_gb = 128
+  }
+
+  assert {
+    condition = (
+      azurerm_kubernetes_cluster_node_pool.igloo.os_disk_type == "Managed" &&
+      azurerm_kubernetes_cluster_node_pool.igloo.os_disk_size_gb == 128
+    )
+    error_message = "Sizes without a local disk must keep a managed OS disk."
+  }
+}
+
+run "os_disk_type_override" {
+  command = plan
+
+  variables {
+    igloo_node_vm_size      = "Standard_E8pds_v6"
+    igloo_node_os_disk_type = "Managed"
+  }
+
+  assert {
+    condition     = azurerm_kubernetes_cluster_node_pool.igloo.os_disk_type == "Managed"
+    error_message = "An explicit igloo_node_os_disk_type must win over the size's local disk."
+  }
+}
+
 run "infrastructure_only" {
   command = plan
 
@@ -649,4 +697,14 @@ run "rejects_bad_memory_quantity" {
   }
 
   expect_failures = [var.igloo_memory]
+}
+
+run "rejects_bad_os_disk_type" {
+  command = plan
+
+  variables {
+    igloo_node_os_disk_type = "Premium_LRS"
+  }
+
+  expect_failures = [var.igloo_node_os_disk_type]
 }

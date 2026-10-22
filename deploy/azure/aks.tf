@@ -107,8 +107,9 @@ resource "azurerm_kubernetes_cluster" "this" {
   depends_on = [azurerm_role_assignment.aks_network]
 }
 
-# Igloo's query engines run here. Memory-optimized Arm64 nodes by default;
-# optionally Spot. AKS adds the Spot label and taint itself; they are repeated
+# Igloo's query engines run here. Memory-optimized Arm64 nodes by default,
+# with an ephemeral OS disk on their local NVMe disk, which holds the spill
+# emptyDir; optionally Spot. AKS adds the Spot label and taint itself; they are repeated
 # below so plans stay clean.
 resource "azurerm_kubernetes_cluster_node_pool" "igloo" {
   # Switching spot_enabled replaces the pool (Azure cannot change priority in
@@ -124,6 +125,7 @@ resource "azurerm_kubernetes_cluster_node_pool" "igloo" {
   min_count                   = var.igloo_node_min_count
   max_count                   = var.igloo_node_max_count
   max_pods                    = 110
+  os_disk_type                = local.igloo_node_os_disk_type
   os_disk_size_gb             = var.igloo_node_os_disk_size_gb
   tags                        = local.tags
 
@@ -148,6 +150,13 @@ resource "azurerm_kubernetes_cluster_node_pool" "igloo" {
 }
 
 locals {
+  # Kubelet's directory, and with it the Igloo pods' spill emptyDir, is on the
+  # OS disk. Sizes with a local temp disk have a "d" among the letters after
+  # the vCPU count (Standard_E4pds_v6, Standard_E4ads_v5); on them the OS disk
+  # is ephemeral, on that local disk (NVMe on v6 sizes).
+  igloo_node_local_disk   = can(regex("^Standard_[A-Z]+[0-9]+[a-z]*d[a-z]*(_v[0-9]+)?$", var.igloo_node_vm_size))
+  igloo_node_os_disk_type = coalesce(var.igloo_node_os_disk_type, local.igloo_node_local_disk ? "Ephemeral" : "Managed")
+
   spot_key        = "kubernetes.azure.com/scalesetpriority"
   spot_node_label = { (local.spot_key) = "spot" }
 
