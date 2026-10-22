@@ -1,18 +1,8 @@
 package distributed
 
 import (
-	"context"
-	"fmt"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
-
-	"golang.org/x/sync/errgroup"
-
-	"github.com/akkio-inc/igloo/internal/config"
 )
 
 // Partitioned joins. When the split table is joined to a second table too
@@ -29,8 +19,8 @@ import (
 // Every row of either table that can join a row of the other has the same
 // key, so lands in the same partition: each task sees every pair of rows the
 // join can produce, once, and the partial results combine as for any job.
-// Workers stay stateless: a task that fails runs again elsewhere over the
-// same files, and only the files of tasks that succeeded are read.
+// In stages (stage.go), that is a stage per table writing an exchange
+// keyed by its side of the join key, and a stage reading both by partition.
 
 // partitionPlan is how a candidate's two largest tables are partitioned.
 type partitionPlan struct {
@@ -41,22 +31,22 @@ type partitionPlan struct {
 	casts []string
 }
 
-// Partition says how a job partitions its two largest tables.
-type Partition struct {
-	// Sides are the split table and the other.
-	Sides [2]Side
+// partition says how a job partitions its two largest tables.
+type partition struct {
+	// sides are the split table and the other.
+	sides [2]side
 }
 
-// Side is one of a partitioned job's tables.
-type Side struct {
-	// View is the name the fragment reads the table as.
-	View  string
-	Table *Table
-	// SQL selects the rows to partition: the columns the statement uses,
-	// and __h, the hash of the join key, after the statement's filters on
-	// this table alone.
-	SQL   string
+// side is one of a partitioned job's tables.
+type side struct {
+	// view is the name the fragment reads the table as.
+	view  string
+	table *Table
+	// stage selects the rows to partition: the columns the statement uses,
+	// after the statement's filters on this table alone.
 	stage node
+	// keys are its join key columns, hashed as casts say.
+	keys, casts []string
 }
 
 // partition plans a partitioned join of the candidate's split table and
@@ -173,20 +163,16 @@ func hashType(a, b string) (string, bool) {
 	return "", false
 }
 
-// stages builds the queries that select each partitioned table's rows.
-func (pl *planner) stages(c *candidate, j *Job) (*Partition, error) {
+// sides builds the queries that select each partitioned table's rows.
+func (pl *planner) sides(c *candidate) (*partition, error) {
 	p := c.partition
 	refs := referencedNames(c.sel)
-	part := &Partition{}
+	part := &partition{}
 	for i, u := range []*tableUse{c.split, p.other} {
 		view := str(u.ref[viewMark])
 		var keys []string
-		for k, pair := range p.keys {
-			e := quoteIdent(pair[i])
-			if p.casts[k] != "" {
-				e = "CAST(" + e + " AS " + p.casts[k] + ")"
-			}
-			keys = append(keys, e)
+		for _, pair := range p.keys {
+			keys = append(keys, pair[i])
 		}
 		var cols []string
 		for _, col := range u.table.Columns {
@@ -198,8 +184,7 @@ func (pl *planner) stages(c *candidate, j *Job) (*Partition, error) {
 		if alias == "" {
 			alias = str(u.ref["table_name"])
 		}
-		stage, err := pl.p.parse("SELECT " + strings.Join(append(cols, "hash("+strings.Join(keys, ", ")+") AS __h"), ", ") +
-			" FROM " + quoteIdent(view) + " AS " + quoteIdent(alias))
+		stage, err := pl.p.parse("SELECT " + strings.Join(cols, ", ") + " FROM " + quoteIdent(view) + " AS " + quoteIdent(alias))
 		if err != nil {
 			return nil, err
 		}
@@ -223,7 +208,7 @@ func (pl *planner) stages(c *candidate, j *Job) (*Partition, error) {
 			w["children"] = filters
 			stage["where_clause"] = w
 		}
-		part.Sides[i] = Side{View: view, Table: u.table, stage: stage}
+		part.sides[i] = side{view: view, table: u.table, stage: stage, keys: keys, casts: p.casts}
 	}
 	return part, nil
 }
@@ -271,122 +256,4 @@ func onlyColumnsOf(cond node, item *fromItem, sc *scope) bool {
 		return ok
 	})
 	return ok && any
-}
-
-// --- running a partitioned job ----------------------------------------------
-
-// maxPartitions caps a partitioned job's partitions, and so its tasks.
-const maxPartitions = 64
-
-// runPartitioned runs a partitioned job: the tables' rows are written to
-// object storage by partition, then one task per partition runs the
-// fragment.
-func (co *Coordinator) runPartitioned(ctx context.Context, qid, dir string, j *Job, ws []*worker, files map[string][]File, settings []setting, sp *spool) (*jobResult, error) {
-	parts := min(maxPartitions, max(2, 2*len(ws)))
-	root := co.opts.Warehouse + config.ShuffleDir + "/" + qid + "/" + strconv.Itoa(j.ID)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-		defer cancel()
-		if err := co.opts.Source.RemoveAll(ctx, j.Split, root); err != nil {
-			co.log.Warn("could not remove partitioned rows", "dir", root, "err", err)
-		}
-	}()
-
-	// Stage one: both tables, partitioned.
-	type sideResult struct {
-		columns []Column
-		files   [][]string
-		rows    int64
-	}
-	var sides [2]sideResult
-	var mu sync.Mutex
-	g, gctx := errgroup.WithContext(ctx)
-	for s, side := range j.Partition.Sides {
-		sides[s].files = make([][]string, parts)
-		shares := assign(files[side.Table.key()], ws)
-		for i, share := range shares {
-			task := &taskRequest{
-				Query: qid, Task: j.ID*10000 + 1000*(s+1) + i, Version: co.opts.Version, Settings: settings,
-				SQL:     fmt.Sprintf("SELECT * EXCLUDE (__h), CAST(__h %% %d AS INTEGER) AS __b FROM (%s)", parts, side.SQL),
-				Views:   []viewDef{{Name: side.View, Columns: side.Table.Columns, Files: paths(share), Rows: rowCount(share)}},
-				Shuffle: root + "/" + strconv.Itoa(s) + "/" + strconv.Itoa(i),
-			}
-			var bytes int64
-			for _, f := range share {
-				bytes += f.Size
-			}
-			g.Go(func() error {
-				_, head, err := co.dispatch(gctx, task, ws, i, "", nil)
-				if err != nil {
-					return err
-				}
-				co.opts.Metrics.scan(bytes)
-				mu.Lock()
-				defer mu.Unlock()
-				sides[s].rows += head.Rows
-				if sides[s].columns == nil {
-					sides[s].columns = head.Columns
-				} else if !slices.Equal(sides[s].columns, head.Columns) {
-					return fmt.Errorf("workers partitioned %s with different columns", side.Table)
-				}
-				for _, f := range head.Files {
-					if f.Partition < 0 || f.Partition >= parts || !strings.HasPrefix(f.Path, task.Shuffle+"/") {
-						return fmt.Errorf("a worker wrote an unexpected file %s", f.Path)
-					}
-					sides[s].files[f.Partition] = append(sides[s].files[f.Partition], f.Path)
-				}
-				return nil
-			})
-		}
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
-	// Stage two: a task per partition, over that partition of both tables
-	// and all of the others.
-	var others []viewDef
-	for _, v := range j.Views {
-		if v.Name == j.Partition.Sides[0].View || v.Name == j.Partition.Sides[1].View {
-			continue
-		}
-		def := viewDef{Name: v.Name, Columns: v.Table.Columns, Rows: rowCount(files[v.Table.key()])}
-		for _, f := range files[v.Table.key()] {
-			def.Files = append(def.Files, f.Path)
-		}
-		others = append(others, def)
-	}
-	res := &jobResult{files: make([]string, parts), workers: map[string]bool{}}
-	g, gctx = errgroup.WithContext(ctx)
-	for p := range parts {
-		views := slices.Clone(others)
-		for s, side := range j.Partition.Sides {
-			// The hash spreads rows evenly over the partitions.
-			views = append(views, viewDef{Name: side.View, Columns: sides[s].columns, Files: sides[s].files[p], ByName: true,
-				Rows: max(1, sides[s].rows/int64(parts))})
-		}
-		task := &taskRequest{Query: qid, Task: j.ID*10000 + p, Version: co.opts.Version, Settings: settings,
-			SQL: j.Fragment, Columns: j.Columns, Views: views}
-		out := filepath.Join(dir, fmt.Sprintf("%d-%d.parquet", j.ID, p))
-		g.Go(func() error {
-			w, head, err := co.dispatch(gctx, task, ws, p%len(ws), out, sp)
-			if err != nil {
-				return err
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			res.files[p] = out
-			res.workers[w.addr] = true
-			if res.columns == nil {
-				res.columns = head.Columns
-			} else if !slices.Equal(res.columns, head.Columns) {
-				return fmt.Errorf("workers returned different columns for job %d", j.ID)
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return res, nil
 }

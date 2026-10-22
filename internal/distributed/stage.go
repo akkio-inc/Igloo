@@ -1,0 +1,385 @@
+package distributed
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/akkio-inc/igloo/internal/config"
+)
+
+// A plan runs as stages. A stage is a set of tasks that each run the
+// stage's fragment over their part of its inputs, and send the rows either
+// to the coordinator, as partial results its part of the statement reads,
+// or to an exchange: Parquet files in object storage, under the
+// warehouse's _igloo_shuffle/, one directory per partition of a hash of
+// some of the rows' columns. Later stages read an exchange one partition
+// per task, so that rows with equal keys meet in one task, or all of it in
+// every task.
+//
+// A stage's tasks are:
+//
+//   - one per share of the data files of its split input, a catalog table
+//     divided among the workers;
+//   - otherwise one per partition, when it reads exchanges by partition;
+//   - otherwise one.
+//
+// Every exchange of a statement has the same number of partitions, and
+// hashes its keys the same way (see Exchange), so stages may read several
+// exchanges partitioned on equal keys together. Workers stay stateless: a
+// task that fails runs again elsewhere over the same files, and each
+// attempt of a task that writes an exchange writes a directory of its own,
+// whose files are read only if it succeeded.
+
+// Stage is a step of a plan: tasks that run one fragment each.
+type Stage struct {
+	ID int
+	// SQL is the fragment every task runs.
+	SQL string
+	// Columns rename the fragment's result columns positionally, when the
+	// fragment's own names may clash, as in SELECT * of a join.
+	Columns []string
+	// Inputs are the relations the fragment reads, by view name.
+	Inputs []Input
+	// Out is the exchange the stage writes its rows to. Without one, the
+	// rows go to the coordinator, where the statement's final query reads
+	// them in place of placeholder.
+	Out *Exchange
+
+	fragment    node
+	placeholder string
+}
+
+// Input is a relation a stage's fragment reads under a view name: a
+// catalog table, or an exchange.
+type Input struct {
+	View string
+	// Table is a catalog table. Split divides its data files among the
+	// stage's tasks; otherwise every task reads all of them.
+	Table *Table
+	Split bool
+	// Exchange is the rows earlier stages wrote. Partitioned gives each task
+	// one partition; otherwise every task reads all of them.
+	Exchange    *Exchange
+	Partitioned bool
+}
+
+// Exchange is rows that stages write to object storage, partitioned by a
+// hash of their key columns, for later stages to read.
+type Exchange struct {
+	ID int
+	// Keys are the columns of the producers' rows that decide a row's
+	// partition, by name; with none, every row goes to partition 0.
+	Keys []string
+	// Casts are the types the keys are hashed as, or "" for their own:
+	// integers of every width are hashed as BIGINT, so that equal values of
+	// different types land in the same partition.
+	Casts []string
+	// purpose says what the exchange is for, in logs and tests.
+	purpose string
+}
+
+// String describes a stage for logs.
+func (s *Stage) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "stage %d", s.ID)
+	for _, in := range s.Inputs {
+		switch {
+		case in.Table != nil && in.Split:
+			fmt.Fprintf(&b, " split %s", in.Table)
+		case in.Exchange != nil && in.Partitioned:
+			fmt.Fprintf(&b, " partitions of exchange %d", in.Exchange.ID)
+		case in.Exchange != nil:
+			fmt.Fprintf(&b, " all of exchange %d", in.Exchange.ID)
+		}
+	}
+	if s.Out != nil {
+		fmt.Fprintf(&b, " to exchange %d (%s)", s.Out.ID, s.Out.purpose)
+	} else {
+		b.WriteString(" to the coordinator")
+	}
+	return b.String()
+}
+
+// split returns the stage's split input, if it has one.
+func (s *Stage) split() *Input {
+	for i := range s.Inputs {
+		if s.Inputs[i].Table != nil && s.Inputs[i].Split {
+			return &s.Inputs[i]
+		}
+	}
+	return nil
+}
+
+// partitioned reports whether the stage reads an exchange by partition.
+func (s *Stage) partitioned() bool {
+	return slices.ContainsFunc(s.Inputs, func(in Input) bool { return in.Exchange != nil && in.Partitioned })
+}
+
+// hashKey returns the expression a key column is hashed by.
+func hashKey(name, cast string) string {
+	e := quoteIdent(name)
+	if cast != "" {
+		e = "CAST(" + e + " AS " + cast + ")"
+	}
+	return e
+}
+
+// exchangeSQL wraps a stage's fragment for writing to its exchange: the
+// fragment's rows, renamed, with __b, the partition of each.
+func exchangeSQL(s *Stage, parts int) string {
+	inner := s.SQL
+	if len(s.Columns) > 0 {
+		names := make([]string, len(s.Columns))
+		for i, c := range s.Columns {
+			names[i] = quoteIdent(c)
+		}
+		inner = "SELECT * FROM (" + inner + ") AS __igloo_f(" + strings.Join(names, ", ") + ")"
+	}
+	b := "CAST(0 AS INTEGER)"
+	if len(s.Out.Keys) > 0 {
+		keys := make([]string, len(s.Out.Keys))
+		for i, k := range s.Out.Keys {
+			keys[i] = hashKey(k, s.Out.Casts[i])
+		}
+		b = fmt.Sprintf("CAST(hash(%s) %% %d AS INTEGER)", strings.Join(keys, ", "), parts)
+	}
+	return "SELECT *, " + b + " AS __b FROM (" + inner + ") AS __igloo_x"
+}
+
+// --- running stages ---------------------------------------------------------
+
+// maxPartitions caps the partitions of a statement's exchanges, and so the
+// tasks of a stage that reads them by partition.
+const maxPartitions = 64
+
+// execution runs one statement's stages.
+type execution struct {
+	co       *Coordinator
+	qid, dir string
+	ws       []*worker
+	files    map[string][]File
+	settings []setting
+	force    bool
+	sp       *spool
+	// parts is how many partitions every exchange has.
+	parts int
+	// root is the statement's directory in object storage for exchanges.
+	root      string
+	exchanges map[int]*exchangeRun
+	results   map[int]*jobResult
+
+	mu   sync.Mutex
+	used map[string]bool
+}
+
+// exchangeRun is an exchange while its producers run.
+type exchangeRun struct {
+	// producers counts the stages that still write to it; done is closed
+	// when none does.
+	producers int
+	done      chan struct{}
+
+	mu      sync.Mutex
+	columns []Column
+	files   [][]string
+	rows    int64
+}
+
+// jobResult is where a coordinator-bound stage's partial results are.
+type jobResult struct {
+	files   []string
+	columns []Column
+	workers map[string]bool
+}
+
+// run runs every stage, each once the exchanges it reads are complete.
+func (e *execution) run(ctx context.Context, stages []*Stage) error {
+	for _, s := range stages {
+		if s.Out == nil {
+			continue
+		}
+		x := e.exchanges[s.Out.ID]
+		if x == nil {
+			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts)}
+			e.exchanges[s.Out.ID] = x
+		}
+		x.producers++
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	for _, s := range stages {
+		g.Go(func() error {
+			for _, in := range s.Inputs {
+				if in.Exchange == nil {
+					continue
+				}
+				x := e.exchanges[in.Exchange.ID]
+				if x == nil {
+					return fmt.Errorf("stage %d reads exchange %d, which no stage writes", s.ID, in.Exchange.ID)
+				}
+				select {
+				case <-x.done:
+				case <-gctx.Done():
+					return gctx.Err()
+				}
+			}
+			start := time.Now()
+			if err := e.stage(gctx, s); err != nil {
+				return err
+			}
+			e.co.log.Debug("ran a stage", "query", e.qid, "stage", s.String(), "seconds", time.Since(start).Seconds())
+			if s.Out != nil {
+				x := e.exchanges[s.Out.ID]
+				x.mu.Lock()
+				x.producers--
+				if x.producers == 0 {
+					close(x.done)
+				}
+				x.mu.Unlock()
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// stage runs one stage's tasks.
+func (e *execution) stage(ctx context.Context, s *Stage) error {
+	// The tasks, and each one's share of the split input.
+	tasks := 1
+	var shares [][]File
+	if in := s.split(); in != nil {
+		split := e.files[in.Table.key()]
+		n := len(e.ws)
+		if want := int((in.Table.Bytes + bytesPerWorker - 1) / bytesPerWorker); want < n && !e.force {
+			n = max(want, min(2, n))
+		}
+		n = max(1, min(n, len(split)))
+		shares = assign(split, e.ws[:n])
+		tasks = len(shares)
+	} else if s.partitioned() {
+		tasks = e.parts
+	}
+
+	// What every task reads in full.
+	whole := map[string]viewDef{}
+	for _, in := range s.Inputs {
+		switch {
+		case in.Table != nil && !in.Split:
+			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
+			def.Files = paths(e.files[in.Table.key()])
+			whole[in.View] = def
+		case in.Exchange != nil && !in.Partitioned:
+			x := e.exchanges[in.Exchange.ID]
+			def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: max(1, x.rows)}
+			for _, fs := range x.files {
+				def.Files = append(def.Files, fs...)
+			}
+			whole[in.View] = def
+		}
+	}
+
+	var res *jobResult
+	if s.Out == nil {
+		res = &jobResult{files: make([]string, tasks), workers: map[string]bool{}}
+	}
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	for i := range tasks {
+		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings}
+		var bytes int64
+		for _, in := range s.Inputs {
+			switch {
+			case in.Table != nil && in.Split:
+				share := shares[i]
+				for _, f := range share {
+					bytes += f.Size
+				}
+				task.Views = append(task.Views, viewDef{Name: in.View, Columns: in.Table.Columns, Files: paths(share), Rows: rowCount(share)})
+			case in.Exchange != nil && in.Partitioned:
+				x := e.exchanges[in.Exchange.ID]
+				// The hash spreads rows evenly over the partitions.
+				task.Views = append(task.Views, viewDef{Name: in.View, Columns: x.columns, Files: x.files[i], ByName: true,
+					Rows: max(1, x.rows/int64(e.parts))})
+			default:
+				task.Views = append(task.Views, whole[in.View])
+			}
+		}
+		out := ""
+		if s.Out == nil {
+			task.SQL, task.Columns = s.SQL, s.Columns
+			out = filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, i))
+		} else {
+			task.SQL = exchangeSQL(s, e.parts)
+			task.Shuffle = e.root + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
+		}
+		g.Go(func() error {
+			var sp *spool
+			if s.Out == nil {
+				sp = e.sp
+			}
+			w, head, err := e.co.dispatch(gctx, task, e.ws, i%len(e.ws), out, sp)
+			if err != nil {
+				return err
+			}
+			e.co.opts.Metrics.scan(bytes)
+			e.mu.Lock()
+			e.used[w.addr] = true
+			e.mu.Unlock()
+			if s.Out != nil {
+				return e.received(s, task, head)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			res.files[i] = out
+			res.workers[w.addr] = true
+			if res.columns == nil {
+				res.columns = head.Columns
+			} else if !slices.Equal(res.columns, head.Columns) {
+				return fmt.Errorf("workers returned different columns for stage %d", s.ID)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if res != nil {
+		e.mu.Lock()
+		e.results[s.ID] = res
+		e.mu.Unlock()
+	}
+	return nil
+}
+
+// received records the files a task wrote to its stage's exchange.
+func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) error {
+	x := e.exchanges[s.Out.ID]
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.rows += head.Rows
+	if x.columns == nil {
+		x.columns = head.Columns
+	} else if !slices.Equal(x.columns, head.Columns) {
+		return fmt.Errorf("stages wrote different columns to exchange %d", s.Out.ID)
+	}
+	for _, f := range head.Files {
+		if f.Partition < 0 || f.Partition >= e.parts || !strings.HasPrefix(f.Path, task.Shuffle+"/") {
+			return fmt.Errorf("a worker wrote an unexpected file %s", f.Path)
+		}
+		x.files[f.Partition] = append(x.files[f.Partition], f.Path)
+	}
+	return nil
+}
+
+// shuffleRoot is a statement's directory for exchanges in object storage.
+func shuffleRoot(warehouse, qid string) string {
+	return warehouse + config.ShuffleDir + "/" + qid
+}

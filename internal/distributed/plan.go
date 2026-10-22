@@ -85,52 +85,46 @@ func (t *Table) key() string { return strings.ToLower(t.Schema + "." + t.Name) }
 
 func (t *Table) String() string { return t.Schema + "." + t.Name }
 
-// Plan is a statement split into jobs.
+// Plan is a statement split into stages that workers run (see stage.go).
 type Plan struct {
-	Jobs []*Job
-	// final is the statement with each job's SELECT replaced by its combine
-	// step, which reads a placeholder table until the job has run.
+	// Stages are in an order in which each comes after the stages whose
+	// exchanges it reads.
+	Stages []*Stage
+	// final is the statement with each distributed part replaced by its
+	// combine step, which reads a placeholder table until the stage whose
+	// rows it combines has run.
 	final node
 	// force distributes whatever the tables' sizes; with mayStart it uses
 	// every worker, starting them if need be, and without it only workers
 	// running, as many as the sizes call for.
 	force    bool
 	mayStart bool
-	// pins are the coordinator's own reads, in final, of tables that jobs
+	// pins are the coordinator's own reads, in final, of tables that stages
 	// read: by the name as written (lower case, parts joined by NUL), the
 	// table's key. Execute points them at the snapshot the workers read.
 	pins map[string]string
 }
 
-// Job is one part of a statement that workers run in parallel.
-type Job struct {
-	ID int
-	// Split is the table whose files are divided among the workers.
-	Split *Table
-	// Views are the tables the fragment reads, by the names it reads them
-	// as. Split is among them, as SplitView.
-	Views     []View
-	SplitView string
-	// Fragment is the SQL each worker runs over its share of Split.
-	Fragment string
-	// Columns renames the fragment's result columns positionally, when the
-	// fragment's own names may clash, as in SELECT * of a join.
-	Columns []string
-	// Broadcast is the size of the tables every worker reads in full.
-	Broadcast int64
-	// Partition, if set, says how the split table and a second large table
+// job is a candidate on its way to stages: the tables its fragment reads,
+// by the names it reads them as.
+type job struct {
+	// split is the table whose files are divided among the workers; the
+	// fragment reads it as splitView.
+	split     *Table
+	splitView string
+	views     []view
+	// broadcast is the size of the tables every worker reads in full.
+	broadcast int64
+	// partition, if set, says how the split table and a second large table
 	// are partitioned by their join key, so that each task reads matching
 	// partitions of both.
-	Partition *Partition
-
-	fragment    node
-	placeholder string
+	partition *partition
 }
 
-// View is a table a fragment reads under a generated name.
-type View struct {
-	Name  string
-	Table *Table
+// view is a table a fragment reads under a generated name.
+type view struct {
+	name  string
+	table *Table
 }
 
 // planOptions decide when a statement is worth distributing.
@@ -156,7 +150,9 @@ type planner struct {
 	// aggs are the names of DuckDB's aggregate functions.
 	aggs map[string]bool
 
-	jobs []*Job
+	stages []*Stage
+	// exchanges counts the exchanges planned.
+	exchanges int
 	// reasons say why candidates were not distributed, for logs.
 	reasons []string
 	// tables caches resolved names.
@@ -180,7 +176,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(pl.jobs) == 0 {
+	if len(pl.stages) == 0 {
 		reason := "no part reads a large enough table"
 		if len(pl.reasons) > 0 {
 			reason = strings.Join(pl.reasons, "; ")
@@ -196,42 +192,33 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	if err := pl.fixTime(out); err != nil {
 		return nil, err
 	}
-	for _, j := range pl.jobs {
-		if err := pl.fixTime(j.fragment); err != nil {
+	for _, s := range pl.stages {
+		if err := pl.fixTime(s.fragment); err != nil {
 			return nil, err
 		}
-		if j.Fragment, err = pl.p.print(j.fragment); err != nil {
+		if s.SQL, err = pl.p.print(s.fragment); err != nil {
 			return nil, unsupported("%v", err)
-		}
-		if j.Partition != nil {
-			for i := range j.Partition.Sides {
-				s := &j.Partition.Sides[i]
-				if err := pl.fixTime(s.stage); err != nil {
-					return nil, err
-				}
-				if s.SQL, err = pl.p.print(s.stage); err != nil {
-					return nil, unsupported("%v", err)
-				}
-			}
 		}
 	}
 	pins, err := pl.pinReads(out)
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{Jobs: pl.jobs, final: out, pins: pins}, nil
+	return &Plan{Stages: pl.stages, final: out, pins: pins}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
-// jobs read too: Execute points those reads at the snapshot the workers
+// stages read too: Execute points those reads at the snapshot the workers
 // read, so the statement sees one snapshot of each table, as on one
 // machine. A view there could read such a table at another snapshot, so
 // a statement whose coordinator part reads a view is not distributed.
 func (pl *planner) pinReads(final node) (map[string]string, error) {
 	jobTables := map[string]bool{}
-	for _, j := range pl.jobs {
-		for _, v := range j.Views {
-			jobTables[v.Table.key()] = true
+	for _, s := range pl.stages {
+		for _, in := range s.Inputs {
+			if in.Table != nil {
+				jobTables[in.Table.key()] = true
+			}
 		}
 	}
 	ctes := map[string]bool{}
@@ -395,7 +382,7 @@ func (pl *planner) job(sel node, top bool, ctes []string) (node, error) {
 	return pl.finish(j, b), nil
 }
 
-func (pl *planner) build(c *candidate, top bool, ctes []string) (*Job, *jobBuild, error) {
+func (pl *planner) build(c *candidate, top bool, ctes []string) (*job, *jobBuild, error) {
 	if err := pl.analyze(c, ctes); err != nil {
 		return nil, nil, err
 	}
@@ -420,7 +407,7 @@ func (pl *planner) build(c *candidate, top bool, ctes []string) (*Job, *jobBuild
 		}
 	}()
 	if c.partition != nil {
-		if j.Partition, err = pl.stages(c, j); err != nil {
+		if j.partition, err = pl.sides(c); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -931,22 +918,22 @@ const viewMark = "__igloo_view"
 // the candidate's table references with them. Every use of a table reads
 // the same view, except the split table's, whose view each worker defines
 // over its own share of the files.
-func (pl *planner) views(c *candidate) *Job {
-	j := &Job{ID: len(pl.jobs), Split: c.split.table, SplitView: "__igloo_split"}
+func (pl *planner) views(c *candidate) *job {
+	j := &job{split: c.split.table, splitView: "__igloo_split"}
 	names := map[string]string{}
 	for _, u := range c.uses {
-		name := j.SplitView
+		name := j.splitView
 		if u != c.split {
 			if name = names[u.table.key()]; name == "" {
 				name = fmt.Sprintf("__igloo_t%d", len(names))
 				names[u.table.key()] = name
 				if c.partition == nil || u != c.partition.other {
-					j.Broadcast += u.table.Bytes
+					j.broadcast += u.table.Bytes
 				}
 			}
 		}
-		if !slices.ContainsFunc(j.Views, func(v View) bool { return v.Name == name }) {
-			j.Views = append(j.Views, View{Name: name, Table: u.table})
+		if !slices.ContainsFunc(j.views, func(v view) bool { return v.name == name }) {
+			j.views = append(j.views, view{name: name, table: u.table})
 		}
 		u.ref[viewMark] = name
 	}
@@ -979,18 +966,47 @@ func unmarked(v any) any {
 	return c
 }
 
-// finish registers a job: the combine step reads the job's partial
-// results.
-func (pl *planner) finish(j *Job, b *jobBuild) node {
-	j.Columns = b.columns
-	j.fragment = b.fragment
-	j.placeholder = fmt.Sprintf("__igloo_partials_%d", j.ID)
+// finish turns a job into stages: the combine step reads the partial
+// results of the last.
+func (pl *planner) finish(j *job, b *jobBuild) node {
+	last := &Stage{fragment: b.fragment, Columns: b.columns}
+	sides := map[string]*Exchange{}
+	if j.partition != nil {
+		// A stage per partitioned table, writing its rows to an exchange
+		// keyed by its side of the join key.
+		for _, sd := range j.partition.sides {
+			x := pl.exchange("join", sd.keys, sd.casts)
+			pl.stage(&Stage{fragment: sd.stage, Inputs: []Input{{View: sd.view, Table: sd.table, Split: true}}, Out: x})
+			sides[sd.view] = x
+		}
+	}
+	for _, v := range j.views {
+		in := Input{View: v.name, Table: v.table, Split: v.name == j.splitView}
+		if x := sides[v.name]; x != nil {
+			in = Input{View: v.name, Exchange: x, Partitioned: true}
+		}
+		last.Inputs = append(last.Inputs, in)
+	}
+	pl.stage(last)
+	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
 	b.combine["from_table"] = node{
 		"type": "BASE_TABLE", "alias": "__igloo_p", "sample": nil, "query_location": queryLocationNone,
-		"schema_name": "", "table_name": j.placeholder, "column_name_alias": []any{}, "catalog_name": "", "at_clause": nil,
+		"schema_name": "", "table_name": last.placeholder, "column_name_alias": []any{}, "catalog_name": "", "at_clause": nil,
 	}
-	pl.jobs = append(pl.jobs, j)
 	return b.combine
+}
+
+// stage adds a stage to the plan.
+func (pl *planner) stage(s *Stage) *Stage {
+	s.ID = len(pl.stages)
+	pl.stages = append(pl.stages, s)
+	return s
+}
+
+// exchange plans an exchange keyed by keys, hashed as casts say.
+func (pl *planner) exchange(purpose string, keys, casts []string) *Exchange {
+	pl.exchanges++
+	return &Exchange{ID: pl.exchanges - 1, Keys: keys, Casts: casts, purpose: purpose}
 }
 
 // queryLocationNone is DuckDB's position for a node with no place in the

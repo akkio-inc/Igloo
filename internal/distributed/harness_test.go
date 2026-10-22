@@ -362,9 +362,29 @@ func (h *harness) check(query string) bool {
 	}
 	ordered := hasOrderBy(query)
 	if msg := compareRows(want, got, ordered); msg != "" {
-		h.t.Errorf("%s\n%s\nfragment: %s", short(query), msg, plan.Jobs[0].Fragment)
+		h.t.Errorf("%s\n%s\n%s", short(query), msg, plan.describe())
 	}
 	return true
+}
+
+// describe lists a plan's stages and their SQL, for test failures.
+func (p *Plan) describe() string {
+	var b strings.Builder
+	for _, s := range p.Stages {
+		fmt.Fprintf(&b, "%s: %s\n", s, s.SQL)
+	}
+	return b.String()
+}
+
+// exchanges counts a plan's exchanges for purpose.
+func (p *Plan) exchanges(purpose string) int {
+	n := 0
+	for _, s := range p.Stages {
+		if s.Out != nil && s.Out.purpose == purpose {
+			n++
+		}
+	}
+	return n
 }
 
 func short(q string) string {

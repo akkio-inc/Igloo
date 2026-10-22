@@ -273,12 +273,14 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 	}()
 
-	// As many workers as the largest job has gigabytes to divide, or
-	// every one when an admin forces it. Forced by anyone else, only
+	// As many workers as the largest split table has gigabytes to divide,
+	// or every one when an admin forces it. Forced by anyone else, only
 	// workers already running, and no more than the gigabytes call for.
 	var split int64
-	for _, j := range plan.Jobs {
-		split = max(split, j.Split.Bytes)
+	for _, s := range plan.Stages {
+		if in := s.split(); in != nil {
+			split = max(split, in.Table.Bytes)
+		}
 	}
 	want := int(max(1, (split+bytesPerWorker-1)/bytesPerWorker))
 	var ws []*worker
@@ -306,7 +308,6 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	if limit <= 0 {
 		limit = defaultMaxSpool
 	}
-	sp := &spool{limit: limit}
 
 	// Each table's current snapshot and its files, once per statement, so
 	// the statement sees every commit made before it.
@@ -314,25 +315,31 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	snapshots := map[string]*Table{}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
-	for _, j := range plan.Jobs {
-		for _, v := range j.Views {
+	var anyTable *Table
+	for _, s := range plan.Stages {
+		for _, in := range s.Inputs {
+			t := in.Table
+			if t == nil {
+				continue
+			}
+			anyTable = t
 			mu.Lock()
-			_, seen := files[v.Table.key()]
-			files[v.Table.key()] = nil
+			_, seen := files[t.key()]
+			files[t.key()] = nil
 			if !seen {
-				snapshots[v.Table.key()] = v.Table
+				snapshots[t.key()] = t
 			}
 			mu.Unlock()
 			if seen {
 				continue
 			}
 			g.Go(func() error {
-				if err := co.opts.Source.Refresh(gctx, v.Table); err != nil {
+				if err := co.opts.Source.Refresh(gctx, t); err != nil {
 					return err
 				}
-				fs, err := co.opts.Source.Files(gctx, v.Table)
+				fs, err := co.opts.Source.Files(gctx, t)
 				mu.Lock()
-				files[v.Table.key()] = fs
+				files[t.key()] = fs
 				mu.Unlock()
 				return err
 			})
@@ -351,32 +358,21 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 
 	loaded := time.Since(start)
 	qid := filepath.Base(ex.dir)
-	results := make([]*jobResult, len(plan.Jobs))
-	used := map[string]bool{}
-	var usedMu sync.Mutex
-	g, gctx = errgroup.WithContext(ctx)
-	for i, j := range plan.Jobs {
-		g.Go(func() error {
-			var r *jobResult
-			var err error
-			if j.Partition != nil {
-				r, err = co.runPartitioned(gctx, qid, ex.dir, j, ws, files, settings, sp)
-			} else {
-				r, err = co.runJob(gctx, qid, ex.dir, j, ws, files, settings, plan.force, sp)
-			}
-			if err != nil {
-				return err
-			}
-			results[i] = r
-			usedMu.Lock()
-			for a := range r.workers {
-				used[a] = true
-			}
-			usedMu.Unlock()
-			return nil
-		})
+	run := &execution{
+		co: co, qid: qid, dir: ex.dir, ws: ws, files: files, settings: settings, force: plan.force,
+		sp: &spool{limit: limit}, parts: min(maxPartitions, max(2, 2*len(ws))), root: shuffleRoot(co.opts.Warehouse, qid),
+		exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 	}
-	if err := g.Wait(); err != nil {
+	if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if err := co.opts.Source.RemoveAll(ctx, anyTable, run.root); err != nil {
+				co.log.Warn("could not remove exchanged rows", "dir", run.root, "err", err)
+			}
+		}()
+	}
+	if err := run.run(ctx, plan.Stages); err != nil {
 		switch {
 		case ctx.Err() != nil:
 			co.opts.Metrics.query("canceled", start)
@@ -388,21 +384,24 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 
 	final := clone(plan.final).(node)
-	for i, j := range plan.Jobs {
-		ref, err := co.partials(results[i])
+	for _, s := range plan.Stages {
+		if s.Out != nil {
+			continue
+		}
+		ref, err := co.partials(run.results[s.ID])
 		if err != nil {
 			return nil, err
 		}
 		replaced := false
 		rewrite(final, func(n node) (node, bool) {
-			if str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == j.placeholder {
+			if str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == s.placeholder {
 				replaced = true
 				return clone(ref).(node), true
 			}
 			return nil, false
 		})
 		if !replaced {
-			return nil, fmt.Errorf("job %d has no place in the statement", j.ID)
+			return nil, fmt.Errorf("stage %d has no place in the statement", s.ID)
 		}
 	}
 	if err := co.pin(final, plan.pins, snapshots); err != nil {
@@ -411,9 +410,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	if ex.SQL, err = co.parser.print(final); err != nil {
 		return nil, err
 	}
-	ex.Workers = len(used)
+	ex.Workers = len(run.used)
 	co.pool.touch()
-	co.log.Debug("ran a statement's parts", "query", qid, "jobs", len(plan.Jobs), "workers", ex.Workers,
+	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers,
 		"snapshots_seconds", loaded.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true
@@ -451,73 +450,6 @@ func (co *Coordinator) pin(final node, pins map[string]string, tables map[string
 		return n, true
 	})
 	return err
-}
-
-// jobResult is where a job's partial results are.
-type jobResult struct {
-	files   []string
-	columns []Column
-	workers map[string]bool
-}
-
-// runJob divides the job's split table among the workers and runs a task
-// for each share.
-func (co *Coordinator) runJob(ctx context.Context, qid, dir string, j *Job, ws []*worker, files map[string][]File, settings []setting, force bool, sp *spool) (*jobResult, error) {
-	split := files[j.Split.key()]
-	n := len(ws)
-	if want := int((j.Split.Bytes + bytesPerWorker - 1) / bytesPerWorker); want < n && !force {
-		n = max(want, min(2, n))
-	}
-	n = max(1, min(n, len(split)))
-	shares := assign(split, ws[:n])
-
-	var views []viewDef
-	for _, v := range j.Views {
-		if v.Name == j.SplitView {
-			continue
-		}
-		def := viewDef{Name: v.Name, Columns: v.Table.Columns, Rows: rowCount(files[v.Table.key()])}
-		for _, f := range files[v.Table.key()] {
-			def.Files = append(def.Files, f.Path)
-		}
-		views = append(views, def)
-	}
-
-	res := &jobResult{files: make([]string, len(shares)), workers: map[string]bool{}}
-	var mu sync.Mutex
-	g, gctx := errgroup.WithContext(ctx)
-	for i, share := range shares {
-		task := &taskRequest{
-			Query: qid, Task: j.ID*10000 + i, Version: co.opts.Version, Settings: settings, SQL: j.Fragment, Columns: j.Columns,
-			Views: append([]viewDef{{Name: j.SplitView, Columns: j.Split.Columns, Files: paths(share), Rows: rowCount(share)}}, views...),
-		}
-		var bytes int64
-		for _, f := range share {
-			bytes += f.Size
-		}
-		path := filepath.Join(dir, fmt.Sprintf("%d-%d.parquet", j.ID, i))
-		g.Go(func() error {
-			w, head, err := co.dispatch(gctx, task, ws, i, path, sp)
-			if err != nil {
-				return err
-			}
-			co.opts.Metrics.scan(bytes)
-			mu.Lock()
-			defer mu.Unlock()
-			res.files[i] = path
-			res.workers[w.addr] = true
-			if res.columns == nil {
-				res.columns = head.Columns
-			} else if !slices.Equal(res.columns, head.Columns) {
-				return fmt.Errorf("workers returned different columns for job %d", j.ID)
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return res, nil
 }
 
 // rowCount adds up the files' record counts.

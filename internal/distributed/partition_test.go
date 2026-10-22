@@ -20,12 +20,7 @@ func (h *harness) partitioned(query string) bool {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	for _, j := range plan.Jobs {
-		if j.Partition != nil {
-			return true
-		}
-	}
-	return false
+	return plan.exchanges("join") > 0
 }
 
 // TestPartitionedJoins makes orders too large for every worker to read, so
