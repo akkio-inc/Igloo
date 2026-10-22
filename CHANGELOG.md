@@ -863,6 +863,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `pools` in the Helm chart (a Deployment, Services and optional gateway per
   pool), and `deploy/single-vm/compute-pool.yml` for Docker Compose.
   `IGLOO_POOL` names a replica's pool in the history and usage.
+- DuckDB's spill directory on local NVMe where the cloud offers it
+  (docs/operations.md#spill-on-local-nvme), instead of network block
+  storage. The AWS module defaults to `r7gd.xlarge` nodes and, for node
+  types with instance store, has nodeadm RAID0 it under kubelet, so the
+  spill `emptyDir` is on NVMe. The Azure module defaults to
+  `Standard_E4pds_v6` Igloo nodes with an ephemeral OS disk on their local
+  NVMe disk (`igloo_node_os_disk_type`). The Google Cloud module's
+  `local_ssd_machine_family` runs the igloo pods on Local SSD-backed
+  ephemeral storage. The single-machine stack's `IGLOO_SPILL_DIR` puts spill
+  files in a host directory, such as one on an instance store. AWS and Azure
+  deployments that relied on the earlier node defaults get new nodes on
+  their next apply; `node_instance_types = ["r7g.xlarge"]` and
+  `igloo_node_vm_size = "Standard_E4ps_v6"` keep the old ones.
 
 ### Fixed
 

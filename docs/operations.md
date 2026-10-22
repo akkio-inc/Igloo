@@ -241,8 +241,9 @@ using all of its cores.
   Postgres, catalog and object store of the single-machine stack do, lower
   `IGLOO_DUCKDB_MEMORY_LIMIT` by what they use.
 - **Spill disk.** Queries that need more memory than the limit write
-  temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk with
-  room for your largest sorts and joins, and give each Igloo process its
+  temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk, local
+  NVMe where the machine has it ([spill on local NVMe](#spill-on-local-nvme)),
+  with room for your largest sorts and joins, and give each Igloo process its
   own ([spill directory](#spill-directory)).
 - **CPU.** DuckDB parallelizes each query across `IGLOO_DUCKDB_THREADS`
   threads (default: one per core).
@@ -276,6 +277,39 @@ it runs, an Igloo process holds a lock on `igloo.lock` in the directory
 (an `flock(2)` lock, which holds between containers on one machine that
 mount the same volume). One that starts while another holds it deletes
 nothing and logs `another process is using the spill directory`.
+
+### Spill on local NVMe
+
+Queries larger than DuckDB's memory limit, such as the big joins,
+aggregations and sorts of heavy reports, write spill files and read them
+back: often tens of GiB, sometimes hundreds. The disk under
+`IGLOO_DUCKDB_TEMP_DIR` then sets the query's speed. Network block storage
+is slow at this: a gp3 volume gives 3,000 IOPS and 125 MB/s unless you buy
+more, a 128 GiB Azure Premium SSD 500 IOPS and 100 MB/s, and a Google
+Cloud persistent disk's throughput grows only with its size. A local NVMe
+SSD on the host is many times faster and costs little or nothing extra, so
+put the spill directory on one wherever the machine has one.
+
+Spill files are temporary. Each lives for one query, and Igloo deletes any
+an earlier run left when it starts. Disks that are emptied when the machine
+stops or is replaced (an EC2 instance store, a Local SSD, an Azure temp disk
+or ephemeral OS disk) are therefore fine for them.
+
+| Cloud | Machines with local NVMe | How the deployments use it |
+|---|---|---|
+| AWS | Types with a `d` after the generation (`r7gd`, `m7gd`, `c7gd`, `r8gd`, `m6id`) and storage-optimized types (`i4i`, `i4g`, `i8g`) | [deploy/aws](../deploy/aws/README.md#spill-on-local-nvme) defaults to `r7gd.xlarge`. For node types with instance store it sets nodeadm's `localStorage` strategy to `RAID0`, which moves kubelet's and containerd's directories onto the disks, so the spill `emptyDir` is on NVMe. |
+| Google Cloud | Series with Local SSD: C3, C3D, C4, C4A and C4D (their `-lssd` machine types) and Z3; N2, N2D and N1 with Local SSDs attached | GKE Standard node pools with Local SSD-backed ephemeral storage (`--ephemeral-storage-local-ssd`) keep `emptyDir` volumes on it. [deploy/gcp](../deploy/gcp/README.md#spill-on-local-ssd) runs Autopilot, whose general-purpose class has none: `local_ssd_machine_family = "c3"` runs the igloo pods on that series with Local SSD-backed ephemeral storage, billed per node. |
+| Azure | Sizes with a `d` after the vCPU count: a local NVMe disk on v6 sizes such as `Standard_E4pds_v6`, a local SSD on v5 sizes such as `Standard_E4ads_v5`; the L-series | [deploy/azure](../deploy/azure/README.md#spill-on-local-nvme) defaults to `Standard_E4pds_v6` and gives sizes with a local disk an ephemeral OS disk on it, which holds kubelet's directory and so the spill `emptyDir`. |
+| One machine | Any of the above, formatted and mounted, e.g. at `/mnt/nvme` | Docker Compose keeps spill files in the `igloo-spill` volume, in Docker's data directory. Set `IGLOO_SPILL_DIR` in `.env` to a directory on the local disk owned by the user Igloo runs as (`sudo install -d -o 65532 -g 65532 /mnt/nvme/igloo-spill`), and `IGLOO_REPORTING_SPILL_DIR` to another one for the second compute pool of `compute-pool.yml`. An instance store comes back blank after the machine stops, so format and mount it and create the directories at boot, before Docker starts the stack (a systemd unit or cloud-init can). |
+
+On Kubernetes the chart's spill volume, and the workers' spill and read
+cache volumes, are `emptyDir` volumes, which kubelet keeps in its own
+directory on the node: the node's setup decides the disk, not the chart.
+Size the disk for every Igloo process that shares it, and on Kubernetes
+for the container images too: each process spills up to
+`IGLOO_DUCKDB_MAX_TEMP_SIZE` (in the chart, 90% of
+`duckdb.spillVolume.sizeLimit`), and a query that would need more fails
+with an error instead of filling the disk.
 
 ### When one machine is not enough
 

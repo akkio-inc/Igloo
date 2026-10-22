@@ -397,6 +397,19 @@ nodes (a minute or two on most clouds), which is why Igloo starts them only
 for statements that would take longer than that. Statements that already
 fit one replica gain little and are not distributed.
 
+Fast local disk means local NVMe: instance-store types on AWS (`r7gd`,
+`m7gd`, `c7gd`), Local SSD-backed ephemeral storage on Google Cloud, and on
+Azure a size with a local disk and an ephemeral OS disk on it. Workers'
+spill and read cache are `emptyDir` volumes, so they land on that disk when
+the node keeps kubelet's directory there, as the OpenTofu modules set up
+([spill on local NVMe](operations.md#spill-on-local-nvme)). A distributed
+statement's partial results also live in the spill directories, of the
+workers and of the coordinator, while it runs. Size each worker's
+`workers.duckdb.spillVolume.sizeLimit` and `workers.cacheVolume.sizeLimit`,
+together, within its node's local disk, and expect both to be empty after
+the node stops: spill files only live for a statement, and the read cache
+refills from object storage.
+
 Distributing does not make a statement cheaper: the same work runs on more
 machines for less time, plus the start and the idle tail. It makes a
 statement that would take many minutes on one machine finish in a fraction
