@@ -284,10 +284,11 @@ func aliasClause(alias string, cols *node) string {
 }
 
 // flattenTable translates FLATTEN(input => ..., path => ..., outer => ...,
-// recursive => ..., mode => ...) into a lateral subquery over DuckDB's
-// json_each or json_tree, with FLATTEN's columns SEQ, KEY, PATH, INDEX,
-// VALUE and THIS. SEQ is NULL: a lateral subquery cannot number the rows
-// it is joined to.
+// recursive => ..., mode => ...) into a lateral subquery, with FLATTEN's
+// columns SEQ, KEY, PATH, INDEX, VALUE and THIS: over unnested lists of the
+// elements (see flattenUnnest), or with OUTER or RECURSIVE over DuckDB's
+// json_each or json_tree. SEQ is NULL: a lateral subquery cannot number the
+// rows it is joined to.
 func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, error) {
 	pos, named := t.tableArgs(g)
 	input := named["INPUT"]
@@ -342,6 +343,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, err
 		prefix = s
 		this = []*node{raw("json_extract(CAST("), jsonArg(input), raw(" AS JSON), " + v.path() + ")")}
 	}
+	if !recursive && !outer {
+		return flattenUnnest(this, prefix, mode, alias, cols), nil
+	}
 	parent := "_sf_flatten_input._sf_this"
 	tableFn := "json_each"
 	cond := "json_type(_sf_flatten_input._sf_this) IN ('ARRAY', 'OBJECT')"
@@ -376,6 +380,42 @@ func (t *translator) flattenTable(g *node, alias string, cols *node) (*node, err
 	tail := " AS _sf_this) AS _sf_flatten_input" + elements + " ORDER BY _sf_flatten.id)"
 	kids = append(kids, raw(tail+aliasClause(alias, cols)))
 	return seq(nil, kids...), nil
+}
+
+// flattenUnnest is FLATTEN without OUTER or RECURSIVE: the elements of an
+// array or the members of an object, unnested from lists of their values,
+// keys and indexes, in their order in the document. DuckDB unnests lists a
+// vector at a time, where json_each, a table function, takes one document
+// at a time, and a lateral json_each inside the lateral subquery needed a
+// second dependent join and a sort of every element to keep the order: a
+// query that flattened arrays of objects built from a million rows' columns,
+// and their arrays in turn, ran out of 18 GiB that way, and finishes this
+// way. Unnests in one select list are zipped, the shorter padded with NULL,
+// so an array's elements have no key and an object's members no index;
+// MODE leaves out the others' lists. JSON nulls stay JSON, as in json_each.
+func flattenUnnest(this []*node, prefix, mode, alias string, cols *node) *node {
+	values, keys, indexes := "CASE json_type(_sf_this)", "NULL", "NULL"
+	if mode != "OBJECT" {
+		values += " WHEN 'ARRAY' THEN json_extract(_sf_this, '$[*]')"
+		indexes = "CASE json_type(_sf_this) WHEN 'ARRAY' THEN range(CAST(json_array_length(_sf_this) AS BIGINT)) END"
+	}
+	if mode != "ARRAY" {
+		values += " WHEN 'OBJECT' THEN json_extract(_sf_this, '$.*')"
+		keys = "CASE json_type(_sf_this) WHEN 'OBJECT' THEN json_keys(_sf_this) END"
+	}
+	values += " END"
+	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
+	path := rel
+	if prefix != "" {
+		path = quoteString(prefix) + " || CASE WHEN _sf_flatten._sf_key IS NULL THEN '' ELSE '.' END || " + rel
+	}
+	kids := []*node{raw("LATERAL (SELECT CAST(NULL AS BIGINT) AS \"SEQ\", _sf_flatten._sf_key AS \"KEY\", " +
+		"coalesce(" + path + ", '') AS \"PATH\", _sf_flatten._sf_index AS \"INDEX\", _sf_flatten._sf_value AS \"VALUE\", " +
+		"_sf_flatten._sf_this AS \"THIS\" FROM (SELECT _sf_this, unnest(" + values + ") AS _sf_value, unnest(" + keys +
+		") AS _sf_key, unnest(" + indexes + ") AS _sf_index FROM (SELECT ")}
+	kids = append(kids, this...)
+	kids = append(kids, raw(" AS _sf_this) AS _sf_flatten_input) AS _sf_flatten)"+aliasClause(alias, cols)))
+	return seq(nil, kids...)
 }
 
 // splitToTable translates SPLIT_TO_TABLE(s, delimiter): a row for each

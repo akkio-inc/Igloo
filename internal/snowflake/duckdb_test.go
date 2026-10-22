@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -247,4 +248,95 @@ func TestWideDecimalCasts(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestFlattenMatchesJSONEach checks that FLATTEN, which unnests lists of a
+// document's elements (see flattenUnnest), gives the rows DuckDB's json_each
+// gives, as the translation did before: keys, paths, indexes, values (JSON
+// nulls staying JSON) and THIS, each document's in its order, for arrays,
+// objects, nested and empty ones, scalars, NULL and JSON in text, with each
+// MODE and with a PATH.
+func TestFlattenMatchesJSONEach(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE docs AS SELECT * FROM (VALUES
+		(1, '[1, null, "x", {"k": [2, 3]}, [4, null]]'), (2, '{"b": 1, "a": null, "c d": {"e": [5]}, "": "empty key"}'),
+		(3, '[]'), (4, '{}'), (5, '5'), (6, '"s"'), (7, 'null'), (8, NULL), (9, '[[], {}, [[1]]]'),
+		(10, '{"a": {"b": [7, 8, {"c": 9}]}}')) t(id, doc)`); err != nil {
+		t.Fatal(err)
+	}
+	rows := func(q string) string {
+		r, err := conn.QueryContext(ctx, q)
+		if err != nil {
+			t.Fatalf("%v\n%s", err, q)
+		}
+		defer r.Close()
+		var out []string
+		for r.Next() {
+			var id, key, path, index, value, this any
+			if err := r.Scan(&id, &key, &path, &index, &value, &this); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, fmt.Sprintf("%v|%v|%v|%v|%v|%v", id, key, path, index, value, this))
+		}
+		if err := r.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(out, "\n")
+	}
+	for _, c := range []struct{ args, mode, path string }{
+		{"input => parse_json(d.doc)", "", ""},
+		{"input => d.doc", "", ""},
+		{"parse_json(d.doc), mode => 'ARRAY'", "ARRAY", ""},
+		{"input => parse_json(d.doc), mode => 'OBJECT'", "OBJECT", ""},
+		{"input => parse_json(d.doc), path => 'a.b'", "", "a.b"},
+	} {
+		res, err := Translate("select d.id as i, f.key as k, f.path as p, f.index as x, f.value as v, f.this as th "+
+			"from docs d, lateral flatten("+c.args+") f", Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(res.SQL, "json_each") {
+			t.Errorf("FLATTEN(%s) still reads json_each: %s", c.args, res.SQL)
+		}
+		this := "CAST(doc AS JSON)"
+		prefix := "''"
+		if c.path != "" {
+			this = "json_extract(CAST(doc AS JSON), '$." + c.path + "')"
+			prefix = "'" + c.path + "' || CASE WHEN starts_with(rel, '[') THEN '' ELSE '.' END"
+		}
+		cond := "json_type(j) IN ('ARRAY', 'OBJECT')"
+		if c.mode != "" {
+			cond += " AND json_type(j) = '" + c.mode + "'"
+		}
+		want := rows(`SELECT d.id, CASE WHEN json_type(j) = 'OBJECT' THEN e.key END, ` + prefix + ` || rel,
+			CASE WHEN json_type(j) = 'ARRAY' THEN CAST(e.key AS BIGINT) END, CAST(json(e.value) AS VARCHAR), CAST(json(j) AS VARCHAR)
+			FROM (SELECT id, ` + this + ` AS j FROM docs) d, LATERAL (SELECT *, regexp_replace(substring(fullkey, 2), '^\.', '') AS rel
+			FROM json_each(d.j)) e WHERE ` + cond + ` ORDER BY d.id, e.id`)
+		got := rows("SELECT i, k, p, x, CAST(json(v) AS VARCHAR), CAST(json(th) AS VARCHAR) FROM (" + res.SQL + ")")
+		if perDoc(got) != want {
+			t.Errorf("FLATTEN(%s):\n got\n%s\nwant\n%s\nDuckDB: %s", c.args, perDoc(got), want, res.SQL)
+		}
+	}
+}
+
+// perDoc lists each document's rows in the order they came, documents in
+// order of their id.
+func perDoc(s string) string {
+	by := map[int][]string{}
+	var ids []int
+	for _, l := range strings.Split(s, "\n") {
+		f, _, _ := strings.Cut(l, "|")
+		id, _ := strconv.Atoi(f)
+		if _, ok := by[id]; !ok {
+			ids = append(ids, id)
+		}
+		by[id] = append(by[id], l)
+	}
+	slices.Sort(ids)
+	var out []string
+	for _, id := range ids {
+		out = append(out, by[id]...)
+	}
+	return strings.Join(out, "\n")
 }
