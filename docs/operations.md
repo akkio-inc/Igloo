@@ -245,7 +245,7 @@ using all of its cores.
   `USING SAMPLE 1000000 ROWS`, of a wide table can take many times the
   limit). So Igloo watches what it can still allocate, five times a
   second: what the container's memory limit leaves of its working set, and
-  the machine's available memory. When that falls below a thirty-second of
+  the machine's available memory. When that falls below a sixteenth of
   Igloo's memory (at least 256 MiB), Igloo cancels the statement that has
   run longest, which fails with SQLSTATE `53200` (`out_of_memory`), rather
   than let the kernel kill the process and every session with it. It logs

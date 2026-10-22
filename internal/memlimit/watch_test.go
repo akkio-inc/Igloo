@@ -55,7 +55,7 @@ func TestAvailable(t *testing.T) {
 // not again while the canceled statement's memory comes back, unless
 // memory keeps running out.
 func TestWatch(t *testing.T) {
-	const total = 32 << 30 // Low is 1 GiB
+	const total = 32 << 30 // Low is 2 GiB
 	var mu sync.Mutex
 	left := int64(4 << 30)
 	set := func(n int64) {
@@ -83,7 +83,7 @@ func TestWatch(t *testing.T) {
 		}
 	}
 	quiet("with plenty left")
-	set(900 << 20)
+	set(1800 << 20)
 	select {
 	case <-sheds:
 	case <-time.After(time.Second):
@@ -92,7 +92,7 @@ func TestWatch(t *testing.T) {
 	// Memory stays low while the canceled statement lets go of it.
 	quiet("while the memory comes back")
 	// Another statement keeps eating it: shed again.
-	set(300 << 20)
+	set(500 << 20)
 	select {
 	case <-sheds:
 	case <-time.After(time.Second):

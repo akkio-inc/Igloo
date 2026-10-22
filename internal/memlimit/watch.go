@@ -20,11 +20,12 @@ import (
 // the process, and every session with it.
 
 // Low is the memory left, of total, below which Watch sheds work: a
-// thirty-second of it, at least 256 MiB. Memory runs out at hundreds of
-// megabytes a second when it does, so this leaves several of Watch's
-// checks to act in.
+// sixteenth of it, at least 256 MiB. Memory runs out at hundreds of
+// megabytes a second when it does: on a 61 GiB machine, a statement that
+// took DuckDB 8.5 GiB past its limit was canceled with 1.6 GiB left, under
+// a second before it would have run out, when Low was a thirty-second.
 func Low(total int64) int64 {
-	return max(total/32, 256<<20)
+	return max(total/16, 256<<20)
 }
 
 // settle is how long Watch gives a canceled statement to let go of its
