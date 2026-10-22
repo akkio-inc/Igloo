@@ -88,21 +88,25 @@ func (s *structFlatten) json(x string, i int) string {
 // flattenStructs translates: those of an array constant, [...] or
 // ARRAY_CONSTRUCT(...), of OBJECT_CONSTRUCT or OBJECT_CONSTRUCT_KEEP_NULL
 // calls with string literals for keys, without PATH, OUTER or RECURSIVE or
-// with a MODE other than 'OBJECT', and with an alias that the statement
-// names nothing else by and uses only to qualify columns. Their VALUE, not
-// renamed, must be read only by a key: alias.VALUE:key or
-// alias.VALUE['key'], GET_PATH(alias.VALUE, 'key...') or GET(alias.VALUE,
-// 'key'), whatever path or cast follows, a later FLATTEN's INPUT included.
-// A FLATTEN at a level that selects a star or filters its rows other than
-// by a WHERE that structWhere keeps out of the joins (see filters), or in a
-// statement that names VALUE unqualified, stays JSON.
+// with a MODE other than 'OBJECT', and with an alias that their select, and
+// what it nests, names nothing else by and uses only to qualify columns.
+// Their VALUE, not renamed, must be read only by a key there:
+// alias.VALUE:key or alias.VALUE['key'], GET_PATH(alias.VALUE, 'key...')
+// or GET(alias.VALUE, 'key'), whatever path or cast follows, a later
+// FLATTEN's INPUT included. A FLATTEN whose select selects a star, names
+// VALUE unqualified or filters its rows other than by a WHERE that
+// structWhere keeps out of the joins (see filters) stays JSON. Selects
+// apart, such as the CTEs of reports that each flatten objects AS t, are
+// apart: t.structs and t.structReads hold the FLATTENs found, by their
+// argument groups, and the reads of their VALUE, by VALUE's nodes.
 func (t *translator) collectStructs(nodes []*node) {
 	type candidate struct {
-		alias    *node
-		s        *structFlatten
-		rejected bool
+		alias, args *node
+		up          string
+		level       []*node
+		s           *structFlatten
 	}
-	byAlias := map[string]*candidate{}
+	var found []candidate
 	colLists := map[*node]bool{}
 	var find func(nodes []*node)
 	find = func(nodes []*node) {
@@ -125,25 +129,35 @@ func (t *translator) collectStructs(nodes []*node) {
 			}
 			name, _, _ := nodes[a].name()
 			up := strings.ToUpper(name)
-			if have := byAlias[up]; have != nil {
-				have.rejected = true
-				continue
-			}
-			c := &candidate{alias: nodes[a], s: structInput(args)}
-			byAlias[up] = c
-			if c.s == nil || up == "VALUE" || selectsStar(nodes) || !valueKept(cols) || filters(nodes, i, up) {
-				c.rejected = true
+			if s := structInput(args); s != nil && up != "VALUE" && !selectsStar(nodes) && valueKept(cols) && !filters(nodes, i, up) {
+				found = append(found, candidate{alias: nodes[a], args: args, up: up, level: nodes, s: s})
 			}
 		}
 	}
 	find(nodes)
-	if len(byAlias) == 0 {
-		return
+	for _, c := range found {
+		if reads, ok := readsOnlyByKey(c.level, c.alias, c.up, colLists); ok {
+			t.structs[c.args] = c.s
+			for _, r := range reads {
+				t.structReads[r] = c.s
+			}
+		}
 	}
-	unqualified := false
+}
+
+// readsOnlyByKey reports whether a select, nodes, and what it nests read
+// the VALUE of the FLATTEN aliased by the node alias (upper-cased up) only
+// by a key (see readsByKey), name the alias only to qualify columns, and
+// name no VALUE unqualified, outside FLATTENs' column lists (colLists); it
+// returns the reads' VALUE nodes.
+func readsOnlyByKey(nodes []*node, alias *node, up string, colLists map[*node]bool) (reads []*node, ok bool) {
+	ok = true
 	var check func(nodes []*node, call string)
 	check = func(nodes []*node, call string) {
 		for i, n := range nodes {
+			if !ok {
+				return
+			}
 			if n.kind == kGroup && !colLists[n] {
 				fn := ""
 				if p := prevSig(nodes, i); p >= 0 {
@@ -151,45 +165,39 @@ func (t *translator) collectStructs(nodes []*node) {
 				}
 				check(n.kids, fn)
 			}
-			name, _, ok := n.name()
-			if !ok {
-				continue
-			}
-			up := strings.ToUpper(name)
+			name, _, isName := n.name()
 			p := prevSig(nodes, i)
-			if up == "VALUE" && (p < 0 || !nodes[p].isOp(".") && !nodes[p].isOp(":") && nodes[p].word() != "AS") {
-				unqualified = true
+			if !isName || n == alias || p >= 0 && nodes[p].isOp(":") {
+				continue // a path's key, v:value, is neither
 			}
-			c := byAlias[up]
-			if c == nil || n == c.alias {
-				continue
-			}
-			// A qualifier: alias.column, but not schema.alias.column.
-			q := nextSig(nodes, i)
-			if p >= 0 && nodes[p].isOp(".") || q < 0 || !nodes[q].isOp(".") {
-				c.rejected = true
-				continue
-			}
-			r := nextSig(nodes, q)
-			if r < 0 {
-				c.rejected = true
-				continue
-			}
-			if col, _, ok := nodes[r].name(); !ok || strings.ToUpper(col) == "VALUE" && !readsByKey(nodes, i, r, call) {
-				c.rejected = true
+			switch strings.ToUpper(name) {
+			case "VALUE":
+				if p < 0 || !nodes[p].isOp(".") && nodes[p].word() != "AS" {
+					ok = false
+				}
+			case up:
+				// A qualifier, alias.column, not schema.alias.column.
+				q := nextSig(nodes, i)
+				r := nextSig(nodes, q)
+				if p >= 0 && nodes[p].isOp(".") || q < 0 || !nodes[q].isOp(".") || r < 0 {
+					ok = false
+					continue
+				}
+				col, _, isCol := nodes[r].name()
+				switch {
+				case !isCol:
+					ok = false
+				case strings.ToUpper(col) == "VALUE":
+					if !readsByKey(nodes, i, r, call) {
+						ok = false
+					}
+					reads = append(reads, nodes[r])
+				}
 			}
 		}
 	}
 	check(nodes, "")
-	if unqualified {
-		return
-	}
-	for _, c := range byAlias {
-		if !c.rejected {
-			name, _, _ := c.alias.name()
-			t.structs[strings.ToLower(name)] = c.s
-		}
-	}
+	return reads, ok
 }
 
 // filters reports whether the level of a FLATTEN at nodes[i], with the

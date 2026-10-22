@@ -153,6 +153,15 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 				table(flatten(input => [object_construct('l', t.a, 'k', 'x'), object_construct('k', 'y')])) g,
 				lateral flatten(input => g.value:l, outer => true) v %[2]s order by 1, 2, 4`, builds: true,
 			asJSON: `where g.value is not null`},
+		// CTEs that each flatten objects of their own keys AS g and v.
+		{q: `with a as (select t.id, 'a' as src, g.index as gi, g.value:k::string as k, v.value::string as x from %[1]s t,
+					lateral flatten(input => [object_construct('k', 'x', 'l', t.a), object_construct('l', t.o)]) g,
+					lateral flatten(input => g.value:l) v %[2]s),
+				b as (select t.id, 'b' as src, g.index as gi, g.value:k::string as k, v.value::string as x from %[1]s t,
+					lateral flatten(input => [object_construct('l', t.a, 'k', t.id), object_construct_keep_null('k', 'y')]) g,
+					lateral flatten(input => get_path(g.value, 'l')) v %[2]s)
+				select * from a union all select * from b order by 1, 2, 3, 5`, builds: true,
+			asJSON: `where g.value is not null`},
 		// A WHERE on the table, on the objects' keys, or both, which the
 		// translation keeps out of the joins (see structWhere).
 		{q: `select t.id, g.index, v.index, v.value::string from %[1]s t,
@@ -306,6 +315,29 @@ func TestFlattenShapes(t *testing.T) {
 		{`select g.value:k from tab m, lateral flatten(input => [object_construct('k', 'a')]) g where exists (select 1 from u as g where g.value:k = 'a')`,
 			`unnest([coalesce(`, `_sf_fields`},
 		{`select g.value:k from tab m, lateral flatten(input => [object_construct('k', 'a')]) g, lateral flatten(input => m.a) as g`, `unnest([coalesce(`, `_sf_fields`},
+		// Selects apart, such as CTEs that each flatten objects AS g, are
+		// apart, each with the keys of its own objects; a select nested in
+		// one that names g again keeps the outer one JSON.
+		{`with a as (select v.value as x, g.value:k::string as k from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v),
+				b as (select v.value as x, g.value:k as k from tab m, lateral flatten(input => [object_construct('l', m.b, 'k', m.n)]) g, lateral flatten(input => g.value:l) v)
+				select * from a union all select * from b`,
+			`g._sf_fields._sf_k1 as k from tab m, LATERAL`, `unnest([coalesce(`},
+		{`with a as (select v.value as x, g.value:k::string as k from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v),
+				b as (select v.value as x, g.value:k as k from tab m, lateral flatten(input => [object_construct('l', m.b, 'k', m.n)]) g, lateral flatten(input => g.value:l) v)
+				select * from a union all select * from b`,
+			`sf_parts_json(g._sf_fields._sf_l2, g._sf_fields._sf_j2) as k from tab m, LATERAL`, `unnest([coalesce(`},
+		{`with a as (select v.value as x, g.value:k::string as k from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v),
+				b as (select v.value as x, g.value:k as k from tab m, lateral flatten(input => [object_construct('l', m.b, 'k', m.n)]) g, lateral flatten(input => g.value:l) v)
+				select * from a union all select * from b`,
+			`unnest(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH'))`, `unnest([coalesce(`},
+		{`with a as (select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v),
+				b as (select g.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g)
+				select * from a, b`,
+			`unnest(sf_parts_values(g._sf_fields._sf_l1`, ``},
+		{`select g.value:k, (select max(g.value:k::string) from table(flatten(input => [object_construct('k', 'b')])) g) from tab m, lateral flatten(input => [object_construct('k', 'a')]) g`,
+			`(select max(g._sf_fields._sf_k1) from LATERAL`, ``},
+		{`select g.value:k, (select max(g.value:k::string) from table(flatten(input => [object_construct('k', 'b')])) g) from tab m, lateral flatten(input => [object_construct('k', 'a')]) g`,
+			`select json_extract(g.value, '$.k') AS "G.VALUE:K"`, ``},
 		// A WHERE stays out of the joins, which DuckDB would make dependent
 		// ones: a condition on the tables goes into the first FLATTEN's ON,
 		// one on its keys into the parts the last FLATTEN unnests.
@@ -386,8 +418,9 @@ func TestFlattenShapes(t *testing.T) {
 // TestFlattenStructsPlan checks that DuckDB plans FLATTEN of objects built
 // from a row's ARRAY columns, and a FLATTEN of their lists after it, as
 // reports write them, without a dependent join, which an earlier FLATTEN's
-// JSON VALUE takes (see flattenStructs): with no WHERE, and with WHEREs on
-// the tables and the objects' keys (see structWhere).
+// JSON VALUE takes (see flattenStructs): with no WHERE, with WHEREs on the
+// tables and the objects' keys (see structWhere), and in CTEs that reuse
+// the FLATTENs' aliases.
 func TestFlattenStructsPlan(t *testing.T) {
 	conn := session(t)
 	ctx := context.Background()
@@ -412,6 +445,20 @@ func TestFlattenStructsPlan(t *testing.T) {
 		if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
 			t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
 		}
+	}
+	cte := `select cast(get_path(g.value, 'kind') as text) as kind, cast(v.value as text) as item, m.id from t as m
+		cross join lateral flatten(input => [object_construct('kind', 'all', 'items', ['every']), object_construct_keep_null('kind', 'a', 'items', m.a)]) as g(seq, key, path, index, value, this)
+		cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)`
+	res, err := Translate(`with x as (`+cte+`), y as (`+strings.ReplaceAll(cte, "m.a", "m.b")+`)
+		select kind, item, count(distinct id) from (select * from x union all select * from y) group by 1, 2`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(res.SQL, "AS _sf_fields") != 2 {
+		t.Errorf("not both CTEs' objects are structs:\n%s", res.SQL)
+	}
+	if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
+		t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
 	}
 }
 

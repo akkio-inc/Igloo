@@ -759,7 +759,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   it builds objects from are turned into JSON before the join (a report
   that took 481 s that way takes 266 s). A `FLATTEN` of objects built with
   literal keys (`[OBJECT_CONSTRUCT('kind', 'genre', 'items', m.genres),
-  ...]`), whose `VALUE` the statement reads only by a key, as reports that
+  ...]`), whose `VALUE` its select reads only by a key, as reports that
   flatten one member of each object do (`FLATTEN(INPUT =>
   GET_PATH(t.value, 'items'))`), keeps the objects as DuckDB structs rather
   than JSON, so their `ARRAY` columns are flattened from their lists

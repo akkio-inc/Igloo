@@ -149,9 +149,10 @@ JSON and JSON text alike.
   lists or maps in a dependent join, at several times the cost.
   `FLATTEN` of an array constant of `OBJECT_CONSTRUCT` and
   `OBJECT_CONSTRUCT_KEEP_NULL` calls with string literals for keys, whose
-  `VALUE` the statement reads only by a key (`f.value:k`, `f.value['k']`,
+  `VALUE` its select reads only by a key (`f.value:k`, `f.value['k']`,
   `GET_PATH(f.value, 'k')`, `GET(f.value, 'k')`, with any cast or path
-  after), makes its objects DuckDB structs rather than JSON, so that a
+  after; CTEs that reuse the alias count apart), makes its objects DuckDB
+  structs rather than JSON, so that a
   later `FLATTEN(INPUT => f.value:items)` unnests an `ARRAY` column's list
   from the struct without writing it as JSON text, parsing it back or a
   dependent join: over 29 million elements of 2 million rows' five lists,

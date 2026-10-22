@@ -277,7 +277,7 @@ func (t *translator) paths(nodes []*node) ([]*node, error) {
 		case t.isFlattenColumn(nodes, i):
 			start = qualifiedStart(nodes, i)
 			base = nodes[start : i+1]
-			v = &variant{base: seq(base, base...), json: true, obj: t.structOfValue(nodes, i)}
+			v = &variant{base: seq(base, base...), json: true, obj: t.structReads[nodes[i]]}
 			i++
 		default:
 			continue
@@ -360,17 +360,6 @@ func (t *translator) isFlattenColumn(nodes []*node, i int) bool {
 		return false
 	}
 	return t.anon > 0
-}
-
-// structOfValue returns the structFlatten whose VALUE nodes[i], a column of
-// a FLATTEN, is: alias.VALUE for a FLATTEN that collectStructs found.
-func (t *translator) structOfValue(nodes []*node, i int) *structFlatten {
-	p := prevSig(nodes, i)
-	if nodes[i].word() != "VALUE" || p < 0 || !nodes[p].isOp(".") {
-		return nil
-	}
-	alias, _, _ := nodes[prevSig(nodes, p)].name()
-	return t.structs[strings.ToLower(alias)]
 }
 
 // elementSeg reads [key] or [index] after a semi-structured value.

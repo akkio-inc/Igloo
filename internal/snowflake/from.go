@@ -215,15 +215,13 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		var err error
 		switch fn {
 		case "FLATTEN":
-			var st *structFlatten
+			st := t.structs[call]
 			if alias == "" {
 				t.gen++
 				alias = "flatten"
 				if t.gen > 1 {
 					alias = "flatten_" + itoa(t.gen)
 				}
-			} else {
-				st = t.structs[strings.ToLower(alias)]
 			}
 			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols), st)
 			flats = append(flats, flattened{alias: alias, out: out, structs: st != nil})
