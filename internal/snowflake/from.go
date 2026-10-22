@@ -1,6 +1,7 @@
 package snowflake
 
 import (
+	"slices"
 	"strings"
 )
 
@@ -149,6 +150,7 @@ var joinEndWords = map[string]bool{
 // [LATERAL] FLATTEN(...), TABLE(FLATTEN(...)), SPLIT_TO_TABLE and
 // GENERATOR, and TABLE(f(...)) of other table functions.
 func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
+	var flats []flattened
 	for i := 0; i < len(nodes); i++ {
 		n := nodes[i]
 		w := n.word()
@@ -221,6 +223,7 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 				}
 			}
 			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols))
+			flats = append(flats, flattened{alias: alias, out: out})
 		case "SPLIT_TO_TABLE":
 			if alias == "" {
 				alias = "split_to_table"
@@ -242,7 +245,380 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		nodes = replace(nodes, start, end, out)
 		i = start
 	}
-	return nodes, nil
+	return whereOn(jsonAhead(nodes, flats), flats), nil
+}
+
+// whereOn moves the WHERE of a select whose last FROM item is a FLATTEN
+// into the ON of that FLATTEN's join: FROM t, LATERAL (...) AS f WHERE p
+// becomes FROM t JOIN LATERAL (...) AS f ON (p), the same rows when every
+// join is an inner one. DuckDB unnests a list or map column of the rows a
+// lateral subquery is joined to where it reads it, but with a WHERE in the
+// select it plans a dependent join instead, which holds those rows' lists
+// or maps in a hash table: flattening a map of seven strings in 30 million
+// rows ran out of 18 GiB that way, and 5 million took 3.6 s rather than
+// 0.6 s. It is left as it is when the select has another FROM or WHERE,
+// a set operation, an outer, natural, ASOF, positional, semi or anti join,
+// a subquery in its WHERE, or a WHERE that names a select item's alias,
+// which an ON cannot see.
+func whereOn(nodes []*node, flats []flattened) []*node {
+	if len(flats) == 0 {
+		return nodes
+	}
+	sel, from, where := -1, -1, -1
+	for i, n := range nodes {
+		switch n.word() {
+		case "SELECT":
+			if from < 0 {
+				sel = i
+			}
+		case "FROM":
+			if from >= 0 {
+				return nodes
+			}
+			from = i
+		case "WHERE":
+			if where >= 0 || from < 0 {
+				return nodes
+			}
+			where = i
+		case "UNION", "EXCEPT", "INTERSECT", "MINUS":
+			return nodes
+		case "LEFT", "RIGHT", "FULL", "OUTER", "NATURAL", "ASOF", "POSITIONAL", "ANTI", "SEMI", "USING":
+			if from >= 0 && where < 0 {
+				return nodes
+			}
+		}
+	}
+	if sel < 0 || where < 0 {
+		return nodes
+	}
+	last := prevSig(nodes, where)
+	if last < 0 || !slices.ContainsFunc(flats, func(f flattened) bool { return f.out == nodes[last] }) {
+		return nodes
+	}
+	join := prevSig(nodes, last)
+	if join < 0 || !nodes[join].isOp(",") && nodes[join].word() != "JOIN" {
+		return nodes
+	}
+	end := len(nodes)
+	for j := where + 1; j < len(nodes); j++ {
+		if whereEnds[nodes[j].word()] || nodes[j].isOp(";") {
+			end = j
+			break
+		}
+	}
+	cond := nodes[where+1 : end]
+	aliases := map[string]bool{}
+	start := sel + 1
+	if q := nextSig(nodes, sel); q >= 0 && (nodes[q].word() == "DISTINCT" || nodes[q].word() == "ALL") {
+		start = q + 1
+	}
+	for _, item := range splitArgs(nodes[start:from]) {
+		idx := sig(item)
+		if len(idx) < 2 {
+			continue
+		}
+		alias, before := item[idx[len(idx)-1]], item[idx[len(idx)-2]]
+		if name, _, ok := alias.name(); ok && (before.word() == "AS" || endsOperand(before) && !before.isOp(".")) {
+			aliases[strings.ToUpper(name)] = true
+		}
+	}
+	if !movable(cond, aliases) {
+		return nodes
+	}
+	out := append([]*node{}, nodes[:last+1]...)
+	if out[join].isOp(",") {
+		out[join] = raw(" JOIN")
+	} else if c := prevSig(out, join); c >= 0 && out[c].word() == "CROSS" {
+		out[c] = raw("")
+	}
+	out = append(out, raw(" ON ("))
+	out = append(out, trim(cond)...)
+	out = append(out, raw(") "))
+	return append(out, nodes[end:]...)
+}
+
+// whereEnds are the words that end a WHERE clause.
+var whereEnds = map[string]bool{
+	"GROUP": true, "HAVING": true, "QUALIFY": true, "ORDER": true, "LIMIT": true, "WINDOW": true, "OFFSET": true,
+	"FETCH": true,
+}
+
+// movable reports whether a WHERE condition can be an ON condition: it has
+// no subquery and names none of aliases (upper case) unqualified.
+func movable(nodes []*node, aliases map[string]bool) bool {
+	for i, n := range nodes {
+		if n.kind == kGroup || n.kind == kSeq {
+			if k := sig(n.kids); n.kind == kGroup && len(k) > 0 && (n.kids[k[0]].word() == "SELECT" || n.kids[k[0]].word() == "WITH") {
+				return false
+			}
+			if !movable(n.kids, aliases) {
+				return false
+			}
+			continue
+		}
+		name, _, ok := n.name()
+		if !ok || !aliases[strings.ToUpper(name)] {
+			continue
+		}
+		p, q := prevSig(nodes, i), nextSig(nodes, i)
+		if (p < 0 || !nodes[p].isOp(".")) && (q < 0 || !nodes[q].isOp(".") && !nodes[q].isGroup('(')) {
+			return false
+		}
+	}
+	return true
+}
+
+// flattened is a FLATTEN that tableFunctions translated: its alias and
+// what it became.
+type flattened struct {
+	alias string
+	out   *node
+}
+
+// jsonAhead turns, ahead of the FLATTENs of one level that a later FLATTEN
+// there reads (FLATTEN(INPUT => [OBJECT_CONSTRUCT('k', m.list), ...]) AS f,
+// then FLATTEN(INPUT => f.value:k)), the columns that their inputs give to
+// the functions that build JSON (sf_to_json(m.c), see semiArg) into that
+// JSON, in a subquery over their table: (SELECT * REPLACE (sf_to_json(m.c)
+// AS c) FROM t AS m) AS m. DuckDB joins such a FLATTEN to its rows with a
+// dependent join, which holds each row's columns that the FLATTEN reads in
+// a hash table; lists of strings, Igloo's ARRAY columns, cost several times
+// as much there as JSON text (6.3 s against 2.6 s for 2 million rows of five
+// lists; 480 s against 265 s for a report that flattened objects built from
+// a table's ARRAY columns). sf_to_json of JSON is that JSON, so the inputs
+// read the same. A column is turned only when every mention of its name at
+// that level is such an argument, so nothing else there sees the change,
+// and only in a table, view or subquery that is the one FROM item with that
+// alias, written plainly ([schema.]name [AS] alias or (SELECT ...) [AS]
+// alias).
+func jsonAhead(nodes []*node, flats []flattened) []*node {
+	if len(flats) < 2 {
+		return nodes
+	}
+	// The columns to turn, by table alias, in the order first met.
+	turn := map[string][]*node{}
+	var aliases []string
+	for i, f := range flats[:len(flats)-1] {
+		read := false
+		for _, g := range flats[i+1:] {
+			if mentionsQualifier(g.out.String(), f.alias) {
+				read = true
+				break
+			}
+		}
+		if !read {
+			continue
+		}
+		walk(f.out, func(n *node) {
+			q, c, ok := builtColumn(n)
+			if !ok {
+				return
+			}
+			key := strings.ToUpper(q)
+			for _, have := range turn[key] {
+				if strings.EqualFold(have.String(), c.String()) {
+					return
+				}
+			}
+			if turn[key] == nil {
+				aliases = append(aliases, key)
+			}
+			turn[key] = append(turn[key], c)
+		})
+	}
+	if len(aliases) == 0 {
+		return nodes
+	}
+	text := render(nodes)
+	built := map[string]int{}
+	for _, n := range nodes {
+		walk(n, func(n *node) {
+			if _, c, ok := builtColumn(n); ok {
+				name, _, _ := c.name()
+				built[strings.ToUpper(name)]++
+			}
+		})
+	}
+	for _, a := range aliases {
+		var cols []string
+		for _, c := range turn[a] {
+			name, _, _ := c.name()
+			if wordCount(text, name) == built[strings.ToUpper(name)] {
+				cols = append(cols, c.String())
+			}
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		start, end, alias, ok := fromItem(nodes, a)
+		if !ok {
+			continue
+		}
+		list := make([]string, len(cols))
+		for k, c := range cols {
+			list[k] = "sf_to_json(" + alias + "." + c + ") AS " + c
+		}
+		item := nodes[start:end]
+		out := seq(item, append(append([]*node{raw("(SELECT * REPLACE (" + strings.Join(list, ", ") + ") FROM ")},
+			item...), raw(") AS "+alias))...)
+		nodes = replace(nodes, start, end, out)
+	}
+	return nodes
+}
+
+// walk calls fn for n and every node inside it.
+func walk(n *node, fn func(*node)) {
+	fn(n)
+	for _, k := range n.kids {
+		walk(k, fn)
+	}
+}
+
+// builtColumn reports whether n is sf_to_json(q.c), a column given to a
+// function that builds JSON (see semiArg), and returns its qualifier's name
+// and the column's node.
+func builtColumn(n *node) (q string, c *node, ok bool) {
+	if !n.column || n.kind != kSeq || len(n.kids) != 3 || n.kids[0].kind != kRaw || n.kids[0].text != "sf_to_json(" {
+		return "", nil, false
+	}
+	ref := n.kids[1].kids
+	idx := sig(ref)
+	if len(idx) != 3 || !ref[idx[1]].isOp(".") {
+		return "", nil, false
+	}
+	q, _, ok = ref[idx[0]].name()
+	if !ok {
+		return "", nil, false
+	}
+	if _, _, ok = ref[idx[2]].name(); !ok {
+		return "", nil, false
+	}
+	return q, ref[idx[2]], true
+}
+
+// wordCount counts the words in DuckDB text that are name, in any case,
+// quoted or not; string literals and names inside others count too, which
+// errs toward more.
+func wordCount(text, name string) int {
+	n := 0
+	up, w := strings.ToUpper(text), strings.ToUpper(name)
+	for i := strings.Index(up, w); i >= 0; {
+		before := i == 0 || !identByte(up[i-1])
+		after := i+len(w) == len(up) || !identByte(up[i+len(w)])
+		if before && after {
+			n++
+		}
+		next := strings.Index(up[i+1:], w)
+		if next < 0 {
+			break
+		}
+		i += 1 + next
+	}
+	return n
+}
+
+// mentionsQualifier reports whether DuckDB text names a column of alias:
+// alias. or "alias". in any case.
+func mentionsQualifier(text, alias string) bool {
+	up, a := strings.ToUpper(text), strings.ToUpper(alias)
+	for _, w := range []string{a, `"` + a + `"`} {
+		for i := strings.Index(up, w); i >= 0; {
+			end := i + len(w)
+			if (i == 0 || !identByte(up[i-1]) && up[i-1] != '.') && strings.HasPrefix(strings.TrimLeft(up[end:], " \t\r\n"), ".") &&
+				(w[0] == '"' || end == len(up) || !identByte(up[end])) {
+				return true
+			}
+			next := strings.Index(up[i+1:], w)
+			if next < 0 {
+				break
+			}
+			i += 1 + next
+		}
+	}
+	return false
+}
+
+// fromItem finds, at one level of a statement, the FROM item that alias
+// (upper case) names, written [schema.]name [AS] alias, (SELECT ...) [AS]
+// alias or a bare name: the one name there that is alias and not part of a
+// dotted name, after FROM, JOIN or a comma and before what may end an item.
+// It returns the item's span and the alias as written.
+func fromItem(nodes []*node, alias string) (start, end int, as string, ok bool) {
+	found := -1
+	for i, n := range nodes {
+		name, _, isName := n.name()
+		if !isName || strings.ToUpper(name) != alias {
+			continue
+		}
+		if p := prevSig(nodes, i); p >= 0 && nodes[p].isOp(".") {
+			continue
+		}
+		if q := nextSig(nodes, i); q >= 0 && nodes[q].isOp(".") {
+			continue
+		}
+		if found >= 0 {
+			return 0, 0, "", false
+		}
+		found = i
+	}
+	if found < 0 {
+		return 0, 0, "", false
+	}
+	if q := nextSig(nodes, found); q >= 0 && !nodes[q].isOp(",") && !itemEnds[nodes[q].word()] {
+		return 0, 0, "", false
+	}
+	startsItem := func(i int) bool {
+		p := prevSig(nodes, i)
+		if p < 0 || nodes[p].word() != "FROM" && nodes[p].word() != "JOIN" && !nodes[p].isOp(",") {
+			return false
+		}
+		// In a FROM clause, not a select list.
+		for j := p; j >= 0; j-- {
+			switch nodes[j].word() {
+			case "FROM":
+				return true
+			case "SELECT", "WHERE", "GROUP", "HAVING", "QUALIFY", "ORDER", "WINDOW", "LIMIT":
+				return false
+			}
+		}
+		return false
+	}
+	if startsItem(found) && nodes[found].kind == kWord && !notAliasWords[nodes[found].word()] {
+		return found, found + 1, nodes[found].String(), true // a bare name
+	}
+	r := prevSig(nodes, found)
+	if r >= 0 && nodes[r].word() == "AS" {
+		r = prevSig(nodes, r)
+	}
+	if r < 0 {
+		return 0, 0, "", false
+	}
+	switch {
+	case nodes[r].isGroup('('):
+		k := sig(nodes[r].kids)
+		if len(k) == 0 || nodes[r].kids[k[0]].word() != "SELECT" && nodes[r].kids[k[0]].word() != "WITH" {
+			return 0, 0, "", false
+		}
+		start = r
+	case nodes[r].kind == kWord && !notAliasWords[nodes[r].word()] && nodes[r].word() != "FROM" && nodes[r].word() != "JOIN",
+		nodes[r].kind == kQuoted:
+		start = qualifiedStart(nodes, r)
+	default:
+		return 0, 0, "", false
+	}
+	if !startsItem(start) {
+		return 0, 0, "", false
+	}
+	return start, found + 1, nodes[found].String(), true
+}
+
+// itemEnds are the words that may follow a FROM item.
+var itemEnds = map[string]bool{
+	"INNER": true, "LEFT": true, "RIGHT": true, "FULL": true, "CROSS": true, "NATURAL": true, "JOIN": true,
+	"ON": true, "USING": true, "WHERE": true, "GROUP": true, "HAVING": true, "QUALIFY": true, "ORDER": true,
+	"LIMIT": true, "WINDOW": true, "UNION": true, "EXCEPT": true, "MINUS": true, "INTERSECT": true,
+	"ASOF": true, "POSITIONAL": true, "ANTI": true, "SEMI": true,
 }
 
 // tableArgs reads a table function's arguments: positional ones, and

@@ -108,6 +108,13 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 			lateral flatten(input => [object_construct('facet_type', 'all', 'facet_values', ['every']),
 				object_construct_keep_null('facet_type', 'array', 'facet_values', t.a)]) g,
 			lateral flatten(input => get_path(g.value, 'facet_values')) v order by 1, 2, 3`, builds: true},
+		{q: `select cast(g.value:facet_type as text) as bt, cast(v.value as text) as bv, count(distinct t.id), count(*)
+			from %s as t inner join (select 1 as id union all select 2 union all select 4 union all select 9) as u on u.id = t.id
+			cross join lateral flatten(input => [object_construct('facet_type', 'all', 'facet_values', ['every']),
+				object_construct_keep_null('facet_type', 'array', 'facet_values', t.a),
+				object_construct_keep_null('facet_type', 'object', 'facet_values', t.o)]) as g(seq, key, path, index, value, this)
+			cross join lateral flatten(input => get_path(g.value, 'facet_values')) as v(seq, key, path, index, value, this)
+			group by 1, 2 order by 1, 2`, builds: true},
 		{q: `select t.id, f.key, f.value::string, count(*) over (partition by f.key) from %s t, lateral flatten(input => t.o) f order by 1, 2`},
 		{q: `select t.id, f.index, g.key, g.index, g.value, g.this from %s t, lateral flatten(input => t.a) f, lateral flatten(input => f.value) g order by 1, 2, 3, 4`},
 		{q: `select t.id, f.index, g.value from %s t, lateral flatten(input => t.a) f, lateral flatten(input => f.value:y) g order by 1, 2, 3`},
@@ -171,13 +178,64 @@ func TestFlattenShapes(t *testing.T) {
 		{`select f.whole from t, lateral flatten(input => [1, 2]) as f(s, k, p, i, v, whole)`,
 			`unnest(repeat([json_array(1, 2)], 2)) AS _sf_this`, `CAST(NULL AS JSON) AS "THIS"`},
 		{`select * from t, lateral flatten(input => t.a) f`, `unnest(sf_flatten_this(t.a, 'BOTH'))`, `CAST(NULL AS JSON) AS "THIS"`},
+		// A FLATTEN that another reads gets the columns it builds JSON
+		// from as that JSON, unless something else reads them.
+		{`select v.value from t, lateral flatten(input => [object_construct('k', t.a)]) g, lateral flatten(input => g.value:k) v`,
+			`from (SELECT * REPLACE (sf_to_json(t.a) AS a) FROM t) AS t, LATERAL`, ``},
+		{`select v.value from s.tab as m, lateral flatten(input => [object_construct('k', m.a, 'l', m.b), object_construct('k', m.a)]) g, lateral flatten(input => g.value:k) v`,
+			`from (SELECT * REPLACE (sf_to_json(m.a) AS a, sf_to_json(m.b) AS b) FROM s.tab as m) AS m, LATERAL`, ``},
+		{`select count(distinct m.id) from tab m inner join c on c.id = m.id cross join lateral flatten(input => [object_construct('k', m.a)]) as g(seq, key, path, index, value, this) cross join lateral flatten(input => get_path(g.value, 'k')) as v(seq, key, path, index, value, this)`,
+			`from (SELECT * REPLACE (sf_to_json(m.a) AS a) FROM tab m) AS m inner join c`, ``},
+		{`select m.a, v.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g, lateral flatten(input => g.value:k) v`,
+			`from tab m, LATERAL`, `REPLACE`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g, lateral flatten(input => g.value:k) v where m.a is not null`,
+			`from tab m, LATERAL`, `REPLACE`},
+		{`select g.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g`, `from tab m, LATERAL`, `REPLACE`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('k', m.a)]) g, lateral flatten(input => g.value:k) v union all select m.a from tab2 m`,
+			`from tab m, LATERAL`, `REPLACE`},
+		// A WHERE becomes the ON of a last FLATTEN's join, which DuckDB
+		// then unnests where it reads the column.
+		{`select f.value from t, lateral flatten(input => t.a) f where t.id > 1 and f.index < 2 group by 1`,
+			`) AS "f" ON (t.id > 1 and f.index < 2) group by 1`, `where`},
+		{`select f.value from t cross join lateral flatten(input => t.a) f where t.id > 1`,
+			`from t  join LATERAL (SELECT`, `cross`},
+		{`select count(*) from t inner join u on u.id = t.id, lateral flatten(input => t.a) as f(seq, key, path, index, value, this) where u.k = 'x'`,
+			`inner join u on u.id = t.id JOIN LATERAL`, `where`},
+		{`select t.id + 1 as n, f.value from t, lateral flatten(input => t.a) f where n > 1`, `where n > 1`, `ON (`},
+		{`select f.value from t left join u on u.id = t.id, lateral flatten(input => t.a) f where t.id > 1`, `where t.id > 1`, `ON (`},
+		{`select f.value from t, lateral flatten(input => t.a) f where t.id in (select id from u)`, `where t.id in`, `ON (`},
+		{`select f.value from t, lateral flatten(input => t.a) f, u where u.id = t.id`, `where u.id = t.id`, `ON (`},
 	} {
 		res, err := Translate(c.sql, Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(res.SQL, c.has) || strings.Contains(res.SQL, c.hasNot) {
+		if !strings.Contains(res.SQL, c.has) || c.hasNot != "" && strings.Contains(res.SQL, c.hasNot) {
 			t.Errorf("%s:\n%s\nwant %q and not %q", c.sql, res.SQL, c.has, c.hasNot)
+		}
+	}
+}
+
+// TestFlattenWhere checks the rows of FLATTENs whose WHERE becomes their
+// join's ON (see whereOn), against the rows Snowflake returns.
+func TestFlattenWhere(t *testing.T) {
+	conn := session(t)
+	if _, err := conn.ExecContext(context.Background(), `CREATE TABLE t AS SELECT * FROM (VALUES
+		(1, ['a', 'b'], MAP {'k': '1', 'l': '0'}), (2, ['c'], MAP {'k': '0'}), (3, [], MAP {}), (4, NULL, NULL)) v(id, a, o)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ q, want string }{
+		{`select t.id, f.value::string from t, lateral flatten(input => t.a) f where t.id < 3 and f.index >= 0 order by 1, 2`,
+			"1|a\n1|b\n2|c"},
+		{`select f.key, sum(f.value::int) from t cross join lateral flatten(input => t.o) f where t.id <> 2 group by 1 order by 1`,
+			"k|1\nl|0"},
+		{`select t.id, count(*) as n from t, lateral flatten(input => t.a) f where f.value::string <> 'b' group by t.id having count(*) > 0 order by n desc, 1`,
+			"1|1\n2|1"},
+		{`select t.id, f.value::string as v from t, lateral flatten(input => t.a, outer => true) f where t.id > 2 order by 1`,
+			"3|NULL\n4|NULL"},
+	} {
+		if got := nativeRows(t, conn, c.q); got != c.want {
+			t.Errorf("%s\n got %q\nwant %q", c.q, got, c.want)
 		}
 	}
 }

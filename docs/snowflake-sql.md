@@ -140,7 +140,13 @@ JSON and JSON text alike.
   `OBJECT` column unnests its list or map directly, and `FLATTEN` of an
   array constant (`[OBJECT_CONSTRUCT(...), ...]`, `ARRAY_CONSTRUCT(...)`)
   unnests its elements without building the array: over 15 million
-  elements, 0.3 s instead of 1 s from JSON text.
+  elements, 0.3 s instead of 1 s from JSON text. A `WHERE` in the select
+  of a `FLATTEN` that is its last `FROM` item becomes the `ON` of that
+  join when every join is an inner one, and when a second `FLATTEN` reads
+  the first's elements, the `ARRAY` and `OBJECT` columns the first builds
+  them from are turned into JSON before the join, unless the select reads
+  them elsewhere: in both cases DuckDB would otherwise hold each row's
+  lists or maps in a dependent join, at several times the cost.
 
 #### Semi-structured columns
 

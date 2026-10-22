@@ -749,7 +749,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   million rows. `FLATTEN` of an array constant, as reports build from each
   row's columns (`[OBJECT_CONSTRUCT(...), ...]`), unnests its elements
   without building the array and parsing it back, three times faster.
-  `THIS` is computed only where a statement can read it.
+  `THIS` is computed only where a statement can read it. DuckDB plans a
+  dependent join, which holds the rows' lists and maps at several times
+  the cost of JSON text, for a `FLATTEN` in a select with a `WHERE`, whose
+  `WHERE` is now the `ON` of the `FLATTEN`'s join when every join is an
+  inner one (flattening an `OBJECT` column of 30 million rows ran out of
+  18 GiB, and takes 14 s), and for one that a second `FLATTEN` reads
+  (`FLATTEN(INPUT => f.value:items)`), whose `ARRAY` and `OBJECT` columns
+  it builds objects from are turned into JSON before the join (a report
+  that took 481 s that way takes 266 s).
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables
