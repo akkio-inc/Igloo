@@ -291,7 +291,9 @@ func (s *Iceberg) RemoveAll(ctx context.Context, t *Table, dir string) error {
 		return errors.New("the warehouse's storage cannot list files")
 	}
 	var files []string
-	err = lister.WalkDir(strings.TrimSuffix(dir, "/")+"/", func(path string, d iofs.DirEntry, err error) error {
+	// A directory's path, without a trailing slash: the blob stores walk
+	// their buckets as an fs.FS, whose paths have none.
+	err = lister.WalkDir(strings.TrimSuffix(dir, "/"), func(path string, d iofs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
