@@ -343,8 +343,10 @@ result's columns must match the prepared statement's, or it falls back.
   so a commit made while the workers run, by Igloo or by another engine
   through the Iceberg REST catalog, adding rows or delete files or changing
   the schema, is seen by neither part. A view in the coordinator's part
-  could read a table at another snapshot, so a statement with one is not
-  distributed; nor is a table whose columns changed since planning, or one
+  reads as its query, whose reads are pinned in turn; one that cannot
+  (with common table expressions, say) could read a table at another
+  snapshot, so a statement with one is not distributed; nor is a table
+  whose columns changed since planning, or one
   with snapshots but none yet (empty, it could be filled meanwhile). Data
   files are listed from metadata, so files that several tables share, as
   clones do, read like any others.

@@ -257,8 +257,10 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 // pinReads finds the tables the coordinator reads itself, in final, that
 // stages read too: Execute points those reads at the snapshot the workers
 // read, so the statement sees one snapshot of each table, as on one
-// machine. A view there could read such a table at another snapshot, so
-// a statement whose coordinator part reads a view is not distributed.
+// machine. A view there reads as its query (see expandView), whose reads
+// are pinned in turn; a view that cannot could read such a table at
+// another snapshot, so a statement whose coordinator part reads one is not
+// distributed.
 func (pl *planner) pinReads(final node) (map[string]string, error) {
 	jobTables := map[string]bool{}
 	for _, s := range pl.stages {
@@ -302,7 +304,19 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 			return false
 		}
 		if view {
-			err = unsupported("the coordinator's part reads %s, which may be a view", strings.Join(parts, "."))
+			// Read as its query, it reads its tables at the workers'
+			// snapshots like any other read here.
+			sub, ok, xerr := pl.expandView(n, parts)
+			switch {
+			case xerr != nil && !IsUnsupported(xerr):
+				err = xerr
+			case !ok:
+				err = unsupported("the coordinator's part reads %s, which may be a view", strings.Join(parts, "."))
+			default:
+				clear(n)
+				maps.Copy(n, sub)
+				return true
+			}
 			return false
 		}
 		t, ok, terr := pl.env.Table(pl.ctx, parts)

@@ -69,9 +69,9 @@ func TestViews(t *testing.T) {
 		`SELECT count(*) FROM v_other`,
 		`SELECT count(*) FROM v_cte`,
 		`SELECT sum(n) FROM v_grouped`,
-		// The coordinator's part reads the view: it could read the table at
-		// another snapshot.
-		`SELECT x.c, (SELECT sum(n) FROM v_grouped) AS s FROM (SELECT count(*) AS c FROM v_people_latest) AS x`,
+		// The coordinator's part reads a view it cannot read as its query,
+		// which could read a table at another snapshot.
+		`SELECT x.c, (SELECT count(*) FROM v_cte) AS s FROM (SELECT count(*) AS c FROM v_people_latest) AS x`,
 	} {
 		t.Run("local "+short(q), func(t *testing.T) {
 			_, _, _, _, err := h.run(t.Context(), q, ModeOn)
@@ -80,11 +80,37 @@ func TestViews(t *testing.T) {
 			}
 		})
 	}
-	// A view that a refused part read as its query is a view again for the
-	// rest of the statement: here the coordinator's part, which then reads
-	// a view, so that the statement runs on one machine.
-	q := `SELECT x.c, y.s FROM (SELECT count(*) AS c FROM lineitem) x, (SELECT sum(n) AS s FROM v_grouped) y`
-	if _, err := h.co.Plan(t.Context(), q, harnessEnv{h}, ModeOn); !IsUnsupported(err) || !strings.Contains(err.Error(), "may be a view") {
-		t.Errorf("a view in the coordinator's part: %v", err)
+	// A view in the coordinator's part reads as its query there, its reads
+	// pinned to the workers' snapshots: one that groups, and one that a
+	// refused part read as its query first.
+	for _, q := range []string{
+		`SELECT x.c, (SELECT sum(n) FROM v_grouped) AS s FROM (SELECT count(*) AS c FROM v_people_latest) AS x`,
+		`SELECT x.c, y.s FROM (SELECT count(*) AS c FROM lineitem) x, (SELECT sum(n) AS s FROM v_grouped) y`,
+	} {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Error("did not run distributed")
+			}
+		})
+	}
+	h.t = t
+	// The table the workers read, read again through a view, is read at
+	// their snapshot.
+	people := h.tables["people"]
+	defer func() { people.Versioned, people.Snapshot = false, 0 }()
+	people.Versioned, people.Snapshot = true, 77
+	q := `SELECT x.c, (SELECT count(*) FROM v_people_latest) AS n FROM (SELECT count(DISTINCT person_id) AS c FROM people) AS x`
+	plan, err := h.co.Plan(t.Context(), q, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex, err := h.co.Execute(t.Context(), plan, h.settings(t.Context()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex.Close()
+	if !strings.Contains(ex.SQL, "AT (VERSION => 77)") || strings.Contains(ex.SQL, "FROM v_people_latest") {
+		t.Errorf("want the view read as its query, at the workers' snapshot:\n%s", ex.SQL)
 	}
 }

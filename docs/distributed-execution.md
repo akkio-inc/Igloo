@@ -192,8 +192,10 @@ made meanwhile, by Igloo or by other engines through the
 [Iceberg REST catalog](external-engines.md), are not seen by either part,
 whether they add rows or delete files or change the schema. A table whose
 columns changed between planning and the start runs on one machine, as
-does a statement whose coordinator part reads a view, which could read a
-table at another snapshot. Tables may share files, as clones do: workers
+does a statement whose coordinator part reads a view it cannot read as
+its query (one with common table expressions, say), which could read a
+table at another snapshot; other views read as their queries there too,
+at the workers' snapshots. Tables may share files, as clones do: workers
 read the files the metadata lists, wherever they lie in the warehouse.
 
 If a worker cannot be reached or stops in the middle of a statement, its
