@@ -147,6 +147,19 @@ JSON and JSON text alike.
   them from are turned into JSON before the join, unless the select reads
   them elsewhere: in both cases DuckDB would otherwise hold each row's
   lists or maps in a dependent join, at several times the cost.
+  `FLATTEN` of an array constant of `OBJECT_CONSTRUCT` and
+  `OBJECT_CONSTRUCT_KEEP_NULL` calls with string literals for keys, whose
+  `VALUE` the statement reads only by a key (`f.value:k`, `f.value['k']`,
+  `GET_PATH(f.value, 'k')`, `GET(f.value, 'k')`, with any cast or path
+  after), makes its objects DuckDB structs rather than JSON, so that a
+  later `FLATTEN(INPUT => f.value:items)` unnests an `ARRAY` column's list
+  from the struct without writing it as JSON text, parsing it back or a
+  dependent join: over 29 million elements of 2 million rows' five lists,
+  0.4 s instead of 1.6 s. Any other read of `VALUE` or a star at that
+  level keeps the objects JSON, and so does a `WHERE`, an `ON` after the
+  `FLATTEN` or a `HAVING` on the groups' keys there, where DuckDB plans a
+  dependent join, which holds structs of lists at a higher cost than JSON
+  text.
 
 #### Semi-structured columns
 

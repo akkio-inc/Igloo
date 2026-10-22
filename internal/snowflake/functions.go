@@ -1981,8 +1981,8 @@ func minMax(c *call) (*node, error) {
 		return n, nil
 	}
 	v := c.args[0][0].v
-	str := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, mode: vString}}
-	num := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, mode: vNumber, try: true}}
+	str := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, mode: vString}}
+	num := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, mode: vNumber, try: true}}
 	v.mode = vJSON
 	fn := "arg_min"
 	if c.name == "MAX" {
@@ -2250,12 +2250,20 @@ func objectConstruct(span []*node, keys, values [][]*node, keepNull bool) *node 
 		kids = append(kids, raw("list_filter("))
 	}
 	kids = append(kids, raw("["))
+	obj := &objectParts{keepNull: keepNull}
 	for k := range keys {
 		if k > 0 {
 			kids = append(kids, raw(", "))
 		}
-		kids = append(kids, raw("{'k': CAST("), seq(keys[k], trim(keys[k])...), raw(" AS VARCHAR), 'v': to_json("),
-			jsonArg(values[k]), raw(")}"))
+		v := jsonArg(values[k])
+		kids = append(kids, raw("{'k': CAST("), seq(keys[k], trim(keys[k])...), raw(" AS VARCHAR), 'v': to_json("), v, raw(")}"))
+		if key := trim(keys[k]); obj != nil && len(key) == 1 {
+			if s, ok := key[0].stringValue(); ok {
+				obj.keys, obj.values = append(obj.keys, s), append(obj.values, v)
+				continue
+			}
+		}
+		obj = nil
 	}
 	kids = append(kids, raw("]"))
 	if !keepNull {
@@ -2263,7 +2271,7 @@ func objectConstruct(span []*node, keys, values [][]*node, keepNull bool) *node 
 	}
 	kids = append(kids, raw(")))"))
 	n := seq(span, kids...)
-	n.json, n.notNull = true, true
+	n.json, n.notNull, n.obj = true, true, obj
 	return n
 }
 
@@ -2440,7 +2448,7 @@ func variantOf(c *call, segs []pathSeg) *node {
 	base := c.args[0]
 	if len(base) == 1 && base[0].kind == kVariant {
 		v := base[0].v
-		return &node{kind: kVariant, v: &variant{base: v.base, segs: append(append([]pathSeg{}, v.segs...), segs...), json: v.json, column: v.column},
+		return &node{kind: kVariant, v: &variant{base: v.base, segs: append(append([]pathSeg{}, v.segs...), segs...), json: v.json, column: v.column, obj: v.obj},
 			pos: c.span[0].pos, end: c.span[len(c.span)-1].end}
 	}
 	return &node{kind: kVariant, v: &variant{base: c.arg(0), segs: segs, column: isColumnRef(c.args[0])}, pos: c.span[0].pos, end: c.span[len(c.span)-1].end}

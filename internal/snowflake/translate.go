@@ -54,6 +54,9 @@ type translator struct {
 	// without an alias, whose columns are reached unqualified.
 	flatten map[string]bool
 	anon    int
+	// structs holds the FLATTENs that the translation keeps as structs, by
+	// lower-cased alias (see collectStructs).
+	structs map[string]*structFlatten
 	// grouped holds the APPROX_COUNT_DISTINCT and HLL calls, by their
 	// names' nodes, of selects with GROUP BY (see collectGrouped).
 	grouped map[*node]bool
@@ -89,7 +92,7 @@ func Translate(sql string, opts Options) (Result, error) {
 		return Result{SQL: sql, Untranslated: true}, nil
 	}
 	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{},
-		names: map[string]int{}, columnNames: map[string]int{}}
+		names: map[string]int{}, columnNames: map[string]int{}, structs: map[string]*structFlatten{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true
@@ -107,6 +110,7 @@ func Translate(sql string, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	t.collectFlattens(nodes)
+	t.collectStructs(nodes)
 	t.collectGrouped(nodes, false)
 	out, cmd, err := t.statement(nodes)
 	if err != nil {

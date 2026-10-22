@@ -44,6 +44,9 @@ type variant struct {
 	// column says base is a column, which may be one of Igloo's ARRAY or
 	// OBJECT columns, a list or map of strings (see render).
 	column bool
+	// obj, when set, says base is the VALUE of a FLATTEN of objects that
+	// the translation keeps as structs (see structRead).
+	obj *structFlatten
 }
 
 var plainKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -82,6 +85,9 @@ func (v *variant) path() string {
 // into any other value, which is JSON (the translations of Snowflake's
 // functions and FLATTEN's VALUE and THIS are), through those functions.
 func (v *variant) render() string {
+	if s, ok := v.structRead(); ok {
+		return s
+	}
 	base := v.base.String()
 	extract, extractString := "json_extract(", "json_extract_string("
 	if v.column {

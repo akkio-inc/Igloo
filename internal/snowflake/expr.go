@@ -277,7 +277,7 @@ func (t *translator) paths(nodes []*node) ([]*node, error) {
 		case t.isFlattenColumn(nodes, i):
 			start = qualifiedStart(nodes, i)
 			base = nodes[start : i+1]
-			v = &variant{base: seq(base, base...), json: true}
+			v = &variant{base: seq(base, base...), json: true, obj: t.structOfValue(nodes, i)}
 			i++
 		default:
 			continue
@@ -360,6 +360,17 @@ func (t *translator) isFlattenColumn(nodes []*node, i int) bool {
 		return false
 	}
 	return t.anon > 0
+}
+
+// structOfValue returns the structFlatten whose VALUE nodes[i], a column of
+// a FLATTEN, is: alias.VALUE for a FLATTEN that collectStructs found.
+func (t *translator) structOfValue(nodes []*node, i int) *structFlatten {
+	p := prevSig(nodes, i)
+	if nodes[i].word() != "VALUE" || p < 0 || !nodes[p].isOp(".") {
+		return nil
+	}
+	alias, _, _ := nodes[prevSig(nodes, p)].name()
+	return t.structs[strings.ToLower(alias)]
 }
 
 // elementSeg reads [key] or [index] after a semi-structured value.
@@ -858,7 +869,7 @@ func orderItem(item []*node) []*node {
 	if len(expr) == 1 && expr[0].kind == kVariant {
 		v := expr[0].v
 		v.mode = vString
-		num := &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, mode: vNumber, try: true}
+		num := &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, mode: vNumber, try: true}
 		d := " ASC"
 		if desc {
 			d = " DESC"
@@ -1147,30 +1158,8 @@ func (t *translator) collectFlattens(nodes []*node) {
 		if n.kind == kGroup {
 			t.collectFlattens(n.kids)
 		}
-		var after int
-		switch {
-		case n.word() == "FLATTEN":
-			g := nextSig(nodes, i)
-			if g < 0 || !nodes[g].isGroup('(') {
-				continue
-			}
-			after = g
-			// Inside TABLE(...), the alias follows TABLE's group, which the
-			// parent list holds; see tableAlias.
-			if p := prevSig(nodes, i); p < 0 && nextSig(nodes, g) < 0 {
-				continue
-			}
-		case n.word() == "TABLE":
-			g := nextSig(nodes, i)
-			if g < 0 || !nodes[g].isGroup('(') {
-				continue
-			}
-			inner := sig(nodes[g].kids)
-			if len(inner) == 0 || nodes[g].kids[inner[0]].word() != "FLATTEN" {
-				continue
-			}
-			after = g
-		default:
+		_, after, ok := flattenAt(nodes, i)
+		if !ok {
 			continue
 		}
 		alias, _, cols := tableAlias(nodes, after)
@@ -1192,6 +1181,35 @@ func (t *translator) collectFlattens(nodes []*node) {
 	}
 }
 
+// flattenAt reports whether nodes[i] starts a FLATTEN, FLATTEN(...) or
+// TABLE(FLATTEN(...)), and returns its argument group (nil if TABLE's has
+// none) and the index of the group its alias follows.
+func flattenAt(nodes []*node, i int) (args *node, after int, ok bool) {
+	g := nextSig(nodes, i)
+	if g < 0 || !nodes[g].isGroup('(') {
+		return nil, 0, false
+	}
+	switch nodes[i].word() {
+	case "FLATTEN":
+		// Inside TABLE(...), the alias follows TABLE's group, which the
+		// parent list holds; see tableAlias.
+		if p := prevSig(nodes, i); p < 0 && nextSig(nodes, g) < 0 {
+			return nil, 0, false
+		}
+		return nodes[g], g, true
+	case "TABLE":
+		inner := sig(nodes[g].kids)
+		if len(inner) == 0 || nodes[g].kids[inner[0]].word() != "FLATTEN" {
+			return nil, 0, false
+		}
+		if len(inner) == 2 && nodes[g].kids[inner[1]].isGroup('(') {
+			args = nodes[g].kids[inner[1]]
+		}
+		return args, g, true
+	}
+	return nil, 0, false
+}
+
 // notAliasWords may follow a table reference in its place of an alias.
 var notAliasWords = map[string]bool{
 	"WHERE": true, "ON": true, "JOIN": true, "LEFT": true, "RIGHT": true, "INNER": true, "OUTER": true,
@@ -1206,23 +1224,30 @@ var notAliasWords = map[string]bool{
 // nodes[i]: [AS] name [(columns)]. It returns the alias, the index just
 // past it (and its columns), and the column list group if any.
 func tableAlias(nodes []*node, i int) (alias string, end int, cols *node) {
-	j := nextSig(nodes, i)
+	j := aliasIndex(nodes, i)
 	if j < 0 {
 		return "", i + 1, nil
 	}
-	if nodes[j].word() == "AS" {
-		j = nextSig(nodes, j)
-		if j < 0 {
-			return "", i + 1, nil
-		}
-	}
-	name, _, ok := nodes[j].name()
-	if !ok || notAliasWords[nodes[j].word()] {
-		return "", i + 1, nil
-	}
+	name, _, _ := nodes[j].name()
 	end = j + 1
 	if k := nextSig(nodes, j); k >= 0 && nodes[k].isGroup('(') {
 		cols, end = nodes[k], k+1
 	}
 	return name, end, cols
+}
+
+// aliasIndex returns the index of the alias after the table reference
+// ending at nodes[i], [AS] name, or -1.
+func aliasIndex(nodes []*node, i int) int {
+	j := nextSig(nodes, i)
+	if j >= 0 && nodes[j].word() == "AS" {
+		j = nextSig(nodes, j)
+	}
+	if j < 0 {
+		return -1
+	}
+	if _, _, ok := nodes[j].name(); !ok || notAliasWords[nodes[j].word()] {
+		return -1
+	}
+	return j
 }

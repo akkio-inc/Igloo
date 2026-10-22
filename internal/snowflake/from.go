@@ -215,15 +215,18 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		var err error
 		switch fn {
 		case "FLATTEN":
+			var st *structFlatten
 			if alias == "" {
 				t.gen++
 				alias = "flatten"
 				if t.gen > 1 {
 					alias = "flatten_" + itoa(t.gen)
 				}
+			} else {
+				st = t.structs[strings.ToLower(alias)]
 			}
-			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols))
-			flats = append(flats, flattened{alias: alias, out: out})
+			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols), st)
+			flats = append(flats, flattened{alias: alias, out: out, structs: st != nil})
 		case "SPLIT_TO_TABLE":
 			if alias == "" {
 				alias = "split_to_table"
@@ -369,11 +372,12 @@ func movable(nodes []*node, aliases map[string]bool) bool {
 	return true
 }
 
-// flattened is a FLATTEN that tableFunctions translated: its alias and
-// what it became.
+// flattened is a FLATTEN that tableFunctions translated: its alias, what
+// it became, and whether its elements are structs (see flattenStructs).
 type flattened struct {
-	alias string
-	out   *node
+	alias   string
+	out     *node
+	structs bool
 }
 
 // jsonAhead turns, ahead of the FLATTENs of one level that a later FLATTEN
@@ -391,7 +395,8 @@ type flattened struct {
 // that level is such an argument, so nothing else there sees the change,
 // and only in a table, view or subquery that is the one FROM item with that
 // alias, written plainly ([schema.]name [AS] alias or (SELECT ...) [AS]
-// alias).
+// alias). A FLATTEN whose elements are structs keeps its columns, which a
+// later FLATTEN reads without a dependent join.
 func jsonAhead(nodes []*node, flats []flattened) []*node {
 	if len(flats) < 2 {
 		return nodes
@@ -400,6 +405,9 @@ func jsonAhead(nodes []*node, flats []flattened) []*node {
 	turn := map[string][]*node{}
 	var aliases []string
 	for i, f := range flats[:len(flats)-1] {
+		if f.structs {
+			continue
+		}
 		read := false
 		for _, g := range flats[i+1:] {
 			if mentionsQualifier(g.out.String(), f.alias) {
@@ -479,10 +487,11 @@ func walk(n *node, fn func(*node)) {
 // function that builds JSON (see semiArg), and returns its qualifier's name
 // and the column's node.
 func builtColumn(n *node) (q string, c *node, ok bool) {
-	if !n.column || n.kind != kSeq || len(n.kids) != 3 || n.kids[0].kind != kRaw || n.kids[0].text != "sf_to_json(" {
+	col := jsonArgColumn(n)
+	if col == nil {
 		return "", nil, false
 	}
-	ref := n.kids[1].kids
+	ref := col.kids
 	idx := sig(ref)
 	if len(idx) != 3 || !ref[idx[1]].isOp(".") {
 		return "", nil, false
@@ -495,6 +504,15 @@ func builtColumn(n *node) (q string, c *node, ok bool) {
 		return "", nil, false
 	}
 	return q, ref[idx[2]], true
+}
+
+// jsonArgColumn returns the column that n reads when n is a column given to
+// a function that builds JSON, sf_to_json(c) (see jsonArg), or nil.
+func jsonArgColumn(n *node) *node {
+	if !n.column || n.kind != kSeq || len(n.kids) != 3 || n.kids[0].kind != kRaw || n.kids[0].text != "sf_to_json(" {
+		return nil
+	}
+	return n.kids[1]
 }
 
 // wordCount counts the words in DuckDB text that are name, in any case,
@@ -664,8 +682,9 @@ func aliasClause(alias string, cols *node) string {
 // columns SEQ, KEY, PATH, INDEX, VALUE and THIS: over unnested lists of the
 // elements (see flattenUnnest), or with OUTER or RECURSIVE over DuckDB's
 // json_each or json_tree. SEQ is NULL: a lateral subquery cannot number the
-// rows it is joined to.
-func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bool) (*node, error) {
+// rows it is joined to. st, when set, says its elements are structs (see
+// flattenStructs).
+func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bool, st *structFlatten) (*node, error) {
 	pos, named := t.tableArgs(g)
 	input := named["INPUT"]
 	if input == nil && len(pos) > 0 {
@@ -718,6 +737,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bo
 		v := &variant{segs: segs}
 		prefix = s
 		in = seq(nil, raw("json_extract(sf_json("), in, raw("), "+v.path()+")"))
+	}
+	if st != nil {
+		return flattenStructs(st, in, alias, cols, wantThis)
 	}
 	if !recursive && !outer {
 		return flattenUnnest(in, prefix, mode, alias, cols, wantThis), nil
@@ -778,7 +800,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bo
 // subquery of its own, since the unnests would each compute it. An array
 // constant, [a, b] or ARRAY_CONSTRUCT(a, b), is unnested from a list of its
 // elements, without building the array and reading it back: three times
-// faster where each row builds objects to flatten.
+// faster where each row builds objects to flatten. A key of objects that
+// flattenStructs made structs is unnested from the struct's field, which
+// DuckDB too unnests where it reads it.
 func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bool) *node {
 	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
 	path := rel
@@ -789,6 +813,7 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bo
 	this := "CAST(NULL AS JSON)"
 	m := quoteString(mode)
 	var lists []*node
+	l, j, field := structField(in)
 	switch {
 	case in.elems != nil && prefix == "" && mode != "OBJECT":
 		key, path = "CAST(NULL AS VARCHAR)", "'[' || _sf_flatten._sf_index || ']'"
@@ -804,6 +829,16 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bo
 		if wantThis {
 			this = "_sf_flatten._sf_this"
 			lists = append(lists, raw(", unnest(repeat(["), in, raw("], "+n+")) AS _sf_this"))
+		}
+	case field && prefix == "":
+		// A key of objects flattened as structs (see flattenStructs): its
+		// list or JSON, which DuckDB unnests where it reads the struct.
+		args := l + ", " + j + ", " + m
+		lists = append(lists, raw("unnest(sf_parts_values("+args+")) AS _sf_value, unnest(sf_parts_keys("+args+
+			")) AS _sf_key, unnest(sf_parts_indexes("+args+")) AS _sf_index"))
+		if wantThis {
+			this = "_sf_flatten._sf_this"
+			lists = append(lists, raw(", unnest(sf_parts_this("+args+")) AS _sf_this"))
 		}
 	case isColumnNode(in):
 		x := in.String()

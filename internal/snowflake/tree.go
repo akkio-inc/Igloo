@@ -31,6 +31,9 @@ type node struct {
 	elems []*node
 	// column says the node reads a column (see semiArg).
 	column bool
+	// obj, when set, are the keys and values of the OBJECT_CONSTRUCT the
+	// node builds, when its keys are string literals (see flattenStructs).
+	obj *objectParts
 	// semi is 'A' for a node known to be an ARRAY and 'O' for one known to
 	// be an OBJECT, which CREATE TABLE ... AS stores as such columns (see
 	// semiColumns).

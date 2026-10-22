@@ -195,6 +195,26 @@ var macros = []string{
 			CASE WHEN json_type(CAST(x AS VARCHAR)) = 'ARRAY' THEN range(CAST(json_array_length(CAST(x AS VARCHAR)) AS BIGINT)) END
 		WHEN typeof(x) = 'VARCHAR[]' THEN range(CAST(len(CAST(x AS VARCHAR[])) AS BIGINT))
 		ELSE CASE WHEN json_type(sf_json(x)) = 'ARRAY' THEN range(CAST(json_array_length(sf_json(x)) AS BIGINT)) END END`,
+	// FLATTEN of objects as structs (see flattenStructs) holds the value of
+	// a key in two parts: a list of strings when it is one, as Igloo's
+	// ARRAY columns are, and JSON otherwise, as OBJECT_CONSTRUCT takes it
+	// (see sf_to_json). Both are NULL when an object lacks the key, which
+	// OBJECT_CONSTRUCT leaves out when its value is NULL, where
+	// OBJECT_CONSTRUCT_KEEP_NULL keeps JSON null.
+	`CREATE OR REPLACE TEMP MACRO sf_list_part(x) AS CASE WHEN typeof(x) = 'VARCHAR[]' THEN CAST(x AS VARCHAR[]) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_json_part(x) AS CASE WHEN typeof(x) <> 'VARCHAR[]' THEN sf_to_json(x) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_json_part_keep_null(x) AS CASE
+		WHEN typeof(x) <> 'VARCHAR[]' THEN coalesce(sf_to_json(x), CAST('null' AS JSON))
+		WHEN x IS NULL THEN CAST('null' AS JSON) END`,
+	// The value of list part l and JSON part j as JSON, and FLATTEN's
+	// lists of it with MODE m, as the sf_flatten_ macros give them.
+	`CREATE OR REPLACE TEMP MACRO sf_parts_json(l, j) AS CASE WHEN l IS NULL THEN j ELSE sf_strings_json(l) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_parts_values(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_values(j, m)
+		WHEN m <> 'OBJECT' THEN list_transform(l, lambda e: sf_elem(e)) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_parts_keys(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_keys(j, m) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_parts_indexes(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_indexes(j, m)
+		WHEN m <> 'OBJECT' THEN range(CAST(len(l) AS BIGINT)) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_parts_this(l, j, m) AS repeat([sf_parts_json(l, j)], len(sf_parts_values(l, j, m)))`,
 }
 
 // Macros returns the statements that define, in a session, the macros

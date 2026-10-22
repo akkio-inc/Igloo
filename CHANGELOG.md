@@ -757,7 +757,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   18 GiB, and takes 14 s), and for one that a second `FLATTEN` reads
   (`FLATTEN(INPUT => f.value:items)`), whose `ARRAY` and `OBJECT` columns
   it builds objects from are turned into JSON before the join (a report
-  that took 481 s that way takes 266 s).
+  that took 481 s that way takes 266 s). A `FLATTEN` of objects built with
+  literal keys (`[OBJECT_CONSTRUCT('kind', 'genre', 'items', m.genres),
+  ...]`), whose `VALUE` the statement reads only by a key, as reports that
+  flatten one member of each object do (`FLATTEN(INPUT =>
+  GET_PATH(t.value, 'items'))`), keeps the objects as DuckDB structs rather
+  than JSON, so their `ARRAY` columns are flattened from their lists
+  without JSON text or a dependent join: 0.4 s instead of 1.6 s for 29
+  million elements of 2 million rows' five lists. A `WHERE` at that level,
+  where DuckDB plans a dependent join anyway, keeps the objects JSON.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables
