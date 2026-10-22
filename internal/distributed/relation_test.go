@@ -178,37 +178,38 @@ func TestRelations(t *testing.T) {
 	h.co.maxBroadcast = h.tables["customer"].Bytes
 	for _, tc := range []struct {
 		query string
-		// scans is how many stages read lineitem's files, if not 0.
-		scans int
+		// scans is how many stages read lineitem's files, and stages how
+		// many the plan has, if not 0.
+		scans, stages int
 	}{
 		// A large table joined to itself: both sides partitioned.
-		{`SELECT count(*), sum(a.l_quantity - b.l_quantity) FROM lineitem a JOIN lineitem b ON a.l_orderkey = b.l_orderkey AND a.l_linenumber < b.l_linenumber`, 2},
+		{`SELECT count(*), sum(a.l_quantity - b.l_quantity) FROM lineitem a JOIN lineitem b ON a.l_orderkey = b.l_orderkey AND a.l_linenumber < b.l_linenumber`, 2, 0},
 		// Joins of large intermediate results, on the key one groups by.
 		{`WITH x AS (SELECT l_orderkey, sum(l_quantity) AS q, count(*) AS n FROM lineitem GROUP BY 1),
 			y AS (SELECT o_orderkey, o_custkey, o_orderpriority FROM orders WHERE o_totalprice > 1000)
-			SELECT o_orderpriority, count(*), sum(q), max(n) FROM x JOIN y ON x.l_orderkey = y.o_orderkey GROUP BY 1 ORDER BY 1`, 1},
+			SELECT o_orderpriority, count(*), sum(q), max(n) FROM x JOIN y ON x.l_orderkey = y.o_orderkey GROUP BY 1 ORDER BY 1`, 1, 0},
 		{`SELECT o_orderpriority, count(*), sum(q) FROM (SELECT l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1) AS x
-			JOIN orders ON o_orderkey = x.k WHERE o_orderstatus = 'F' GROUP BY 1 ORDER BY 1`, 1},
+			JOIN orders ON o_orderkey = x.k WHERE o_orderstatus = 'F' GROUP BY 1 ORDER BY 1`, 1, 0},
 		// As scripts/e2e-distributed.sh runs it.
 		{`WITH s AS (SELECT l_orderkey AS k, sum(l_quantity) AS q, count(DISTINCT l_suppkey) AS sups FROM lineitem GROUP BY 1),
 			u AS (SELECT o_orderkey AS k FROM orders WHERE o_orderpriority = '1-URGENT'
 				UNION ALL SELECT o_orderkey FROM orders WHERE o_orderpriority = '2-HIGH')
-			SELECT count(*), sum(q), sum(sups) FROM s JOIN u ON s.k = u.k`, 1},
+			SELECT count(*), sum(q), sum(sups) FROM s JOIN u ON s.k = u.k`, 1, 0},
 		// UNION ALL of large branches feeding one aggregation.
-		{`SELECT k % 10 AS b, count(*), count(DISTINCT k) FROM (SELECT l_partkey AS k FROM lineitem UNION ALL SELECT ps_partkey FROM partsupp) GROUP BY 1 ORDER BY 1`, 1},
+		{`SELECT k % 10 AS b, count(*), count(DISTINCT k) FROM (SELECT l_partkey AS k FROM lineitem UNION ALL SELECT ps_partkey FROM partsupp) GROUP BY 1 ORDER BY 1`, 1, 0},
 		{`WITH u AS (SELECT l_suppkey AS s, l_quantity AS q FROM lineitem WHERE l_shipmode = 'AIR'
 			UNION ALL SELECT ps_suppkey, ps_availqty FROM partsupp WHERE ps_supplycost > 500)
-			SELECT s % 7 AS k, count(DISTINCT s), sum(q), count(*) FROM u GROUP BY 1 ORDER BY 1`, 1},
+			SELECT s % 7 AS k, count(DISTINCT s), sum(q), count(*) FROM u GROUP BY 1 ORDER BY 1`, 1, 0},
 		// Aggregates that do not compute in parts, over a relation keyed by
 		// the groups, whose partitions hold them whole.
 		{`WITH items AS (SELECT 'lines' AS section, l_shipmode AS name, l_quantity::DOUBLE AS v FROM lineitem
 				UNION ALL SELECT 'supplies', CAST(ps_suppkey % 7 AS VARCHAR), ps_supplycost::DOUBLE FROM partsupp)
 			SELECT section, name, median(v) AS m, quantile_cont(v, 0.9) AS q, count(*) AS n, avg(v) AS a,
 				string_agg(DISTINCT CAST(v::INTEGER % 3 AS VARCHAR), ',' ORDER BY CAST(v::INTEGER % 3 AS VARCHAR)) AS s
-			FROM items GROUP BY section, name ORDER BY 1, 2`, 1},
+			FROM items GROUP BY section, name ORDER BY 1, 2`, 1, 0},
 		{`WITH items AS (SELECT l_shipmode AS name, l_extendedprice AS v FROM lineitem WHERE l_quantity > 10),
 				stats AS (SELECT name, median(v) AS m, count(DISTINCT v) AS d FROM items GROUP BY 1)
-			SELECT name, m, d, rank() OVER (ORDER BY m DESC) AS r FROM stats ORDER BY name`, 1},
+			SELECT name, m, d, rank() OVER (ORDER BY m DESC) AS r FROM stats ORDER BY name`, 1, 0},
 		// Aggregates over all of a relation's rows, as the reports' period
 		// start and end: the relation's rows joined to the aggregates' row.
 		{`WITH urgent AS (SELECT o_orderkey FROM orders WHERE o_orderpriority = '1-URGENT'),
@@ -217,39 +218,40 @@ func TestRelations(t *testing.T) {
 				l.l_quantity / max(l.l_quantity) OVER () AS share
 				FROM lineitem AS l INNER JOIN urgent AS u ON u.o_orderkey = l.l_orderkey)
 			SELECT l_shipmode, first_ship, last_ship, n, returned, count(DISTINCT l_orderkey) AS orders, sum(l_quantity), sum(share)
-			FROM base GROUP BY ALL ORDER BY 1`, 1},
+			FROM base GROUP BY ALL ORDER BY 1`, 1, 0},
 		// Common table expressions of a set operation, read by its branches.
 		{`WITH x AS (SELECT l_returnflag AS f, l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1, 2)
-			SELECT 'q' AS m, f, sum(q) FROM x GROUP BY 1, 2 UNION ALL SELECT 'n', f, count(*) FROM x GROUP BY 1, 2 ORDER BY 1, 2`, 1},
+			SELECT 'q' AS m, f, sum(q) FROM x GROUP BY 1, 2 UNION ALL SELECT 'n', f, count(*) FROM x GROUP BY 1, 2 ORDER BY 1, 2`, 1, 0},
 		// x IN (SELECT y ...) too large for every worker: a semi join to a
 		// relation keyed by y.
 		{`SELECT o_orderpriority, count(*), sum(o_totalprice) FROM orders WHERE o_orderstatus <> 'X' AND o_orderkey IN
-			(SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250) GROUP BY 1 ORDER BY 1`, 1},
+			(SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250) GROUP BY 1 ORDER BY 1`, 1, 0},
 		{`SELECT count(*), count(DISTINCT l_suppkey) FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders WHERE o_orderpriority = '1-URGENT')
-			AND l_partkey IN (SELECT p_partkey FROM part WHERE p_size < 10)`, 1},
+			AND l_partkey IN (SELECT p_partkey FROM part WHERE p_size < 10)`, 1, 0},
 		// A filter's subquery that reads the table the part divides: a
-		// relation of one row every task reads.
-		{`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`, 2},
+		// relation of one row, which every task combines from the partial
+		// results itself.
+		{`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`, 2, 2},
 		{`SELECT l_returnflag, count(*) FROM lineitem WHERE l_suppkey IN (SELECT max(l_suppkey) FROM lineitem WHERE l_shipmode = 'RAIL')
-			AND l_quantity > (SELECT avg(l_quantity) FROM lineitem WHERE l_shipmode = 'AIR') GROUP BY 1 ORDER BY 1`, 3},
+			AND l_quantity > (SELECT avg(l_quantity) FROM lineitem WHERE l_shipmode = 'AIR') GROUP BY 1 ORDER BY 1`, 3, 3},
 		// A relation of one row every task reads; lineitem is split.
 		{`SELECT l_returnflag, count(*) FROM lineitem, (SELECT avg(l_quantity) AS a FROM lineitem) AS s
-			WHERE l_quantity > s.a GROUP BY 1 ORDER BY 1`, 2},
+			WHERE l_quantity > s.a GROUP BY 1 ORDER BY 1`, 2, 2},
 		// TPC-H Q18 with its subquery as a common table expression: three
 		// inputs partitioned by order.
 		{`WITH big AS (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250)
 			SELECT c_name, o_orderkey, o_totalprice, sum(lineitem.l_quantity) FROM customer, orders, lineitem, big
 			WHERE o_orderkey = big.l_orderkey AND c_custkey = o_custkey AND o_orderkey = lineitem.l_orderkey
-			GROUP BY c_name, o_orderkey, o_totalprice ORDER BY o_totalprice DESC, o_orderkey LIMIT 20`, 2},
+			GROUP BY c_name, o_orderkey, o_totalprice ORDER BY o_totalprice DESC, o_orderkey LIMIT 20`, 2, 0},
 		// A common table expression read twice by one part: computed once.
 		{`WITH s AS (SELECT l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1)
 			SELECT o_orderpriority, count(*), sum(a.q), sum(b.q) FROM s a JOIN orders o ON o.o_orderkey = a.k JOIN s b ON b.k = o.o_orderkey
-			GROUP BY 1 ORDER BY 1`, 1},
+			GROUP BY 1 ORDER BY 1`, 1, 0},
 		// Read by a distributed part and by the coordinator: computed once,
 		// and the coordinator reads what workers wrote.
 		{`WITH s AS (SELECT l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1),
 			t AS (SELECT o_orderpriority, sum(q) AS total, count(*) AS n FROM s JOIN orders ON o_orderkey = k GROUP BY 1)
-			SELECT (SELECT count(*) FROM s WHERE q > 100) AS heavy, o_orderpriority, total, n FROM t ORDER BY 2`, 1},
+			SELECT (SELECT count(*) FROM s WHERE q > 100) AS heavy, o_orderpriority, total, n FROM t ORDER BY 2`, 1, 0},
 	} {
 		t.Run(short(tc.query), func(t *testing.T) {
 			h.t = t
@@ -260,6 +262,9 @@ func TestRelations(t *testing.T) {
 				p := h.planOf(tc.query)
 				if _, scans := relationExchanges(p, "lineitem"); scans != tc.scans {
 					t.Errorf("%d stages read lineitem's files, want %d:\n%s", scans, tc.scans, p.describe())
+				}
+				if tc.stages > 0 && len(p.Stages) != tc.stages {
+					t.Errorf("%d stages, want %d:\n%s", len(p.Stages), tc.stages, p.describe())
 				}
 			}
 		})

@@ -256,6 +256,9 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		}
 		return nil, unsupported("%s", reason)
 	}
+	if err := pl.fuseRows(); err != nil {
+		return nil, err
+	}
 
 	// Every machine must see the same now(): the time the statement was
 	// planned, as DuckDB fixes it for a whole statement.
@@ -1644,6 +1647,140 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 	}
 	last.Out = out
 	return last, nil
+}
+
+// fuseRows takes out the stages that only combine the partial results of
+// an aggregation without GROUP BY into its one row, which later stages
+// read in full, as a filter's subquery's (ver = (SELECT max(ver) ...)) is:
+// each task of a stage that reads the row combines the partial results,
+// a row per task that wrote them, itself, rather than the plan waiting for
+// a round of tasks that writes the row to an exchange first.
+func (pl *planner) fuseRows() error {
+	writers, readers := map[*Exchange]int{}, map[*Exchange]int{}
+	partitioned := map[*Exchange]bool{}
+	for _, s := range pl.stages {
+		if s.Out != nil {
+			writers[s.Out]++
+		}
+		for _, in := range s.Inputs {
+			if in.Exchange != nil {
+				readers[in.Exchange]++
+				partitioned[in.Exchange] = partitioned[in.Exchange] || in.Partitioned
+			}
+		}
+	}
+	// Every reader must read the row by its view's name.
+	named := func(x *Exchange) bool {
+		for _, c := range pl.stages {
+			for _, in := range c.Inputs {
+				if in.Exchange != x {
+					continue
+				}
+				found := false
+				walk(c.fragment, func(n node) bool {
+					found = found || isView(n, in.View)
+					return !found
+				})
+				if !found {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	var rows []*Stage
+	for _, s := range pl.stages {
+		if x := s.Out; x != nil && writers[x] == 1 && readers[x] > 0 && !partitioned[x] && len(s.Inputs) == 1 && named(x) {
+			in := s.Inputs[0]
+			if in.Exchange != nil && !in.Partitioned && in.Exchange.purpose == "aggregate" && len(in.Exchange.Keys) == 0 {
+				rows = append(rows, s)
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	ref, err := pl.p.fromRef("SELECT * FROM (SELECT 1) AS v")
+	if err != nil {
+		return err
+	}
+	wrap, err := pl.p.template("SELECT * FROM (SELECT 1) AS __igloo_f")
+	if err != nil {
+		return err
+	}
+	gone := map[*Stage]bool{}
+	for _, p := range rows {
+		row, partials := p.fragment, p.Inputs[0]
+		if len(p.Columns) > 0 {
+			// The names the exchange's rows have.
+			w := clone(wrap).(node)
+			from := child(w, "from_table")
+			child(from, "subquery")["node"] = row
+			names := make([]any, len(p.Columns))
+			for i, c := range p.Columns {
+				names[i] = c
+			}
+			from["column_name_alias"] = names
+			row = w
+		}
+		for _, c := range pl.stages {
+			for i := range c.Inputs {
+				in := &c.Inputs[i]
+				if in.Exchange != p.Out {
+					continue
+				}
+				// The row's query over the partial results, which the reader
+				// reads under the row's view name, in place of the row.
+				q := clone(row).(node)
+				renameView(q, partials.View, in.View)
+				c.fragment = rewrite(c.fragment, func(n node) (node, bool) {
+					if !isView(n, in.View) {
+						return nil, false
+					}
+					sub := clone(ref).(node)
+					child(sub, "subquery")["node"] = clone(q)
+					sub["alias"] = str(n["alias"])
+					if sub["alias"] == "" {
+						sub["alias"] = in.View
+					}
+					if aliases := list(n, "column_name_alias"); aliases != nil {
+						sub["column_name_alias"] = aliases
+					}
+					return sub, true
+				}).(node)
+				in.Exchange = partials.Exchange
+			}
+		}
+		gone[p] = true
+	}
+	var stages []*Stage
+	for _, s := range pl.stages {
+		if !gone[s] {
+			s.ID = len(stages)
+			stages = append(stages, s)
+		}
+	}
+	pl.stages = stages
+	return nil
+}
+
+// isView reports whether n is a reference to the view called name.
+func isView(n node, name string) bool {
+	return str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == name && str(n["schema_name"]) == "" && str(n["catalog_name"]) == ""
+}
+
+// renameView makes the references to view from in q read view to, under
+// the name their columns are qualified with.
+func renameView(q node, from, to string) {
+	walk(q, func(n node) bool {
+		if isView(n, from) {
+			if str(n["alias"]) == "" {
+				n["alias"] = from
+			}
+			n["table_name"] = to
+		}
+		return true
+	})
 }
 
 // stage adds a stage to the plan.
