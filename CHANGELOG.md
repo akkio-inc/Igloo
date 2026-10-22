@@ -298,9 +298,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   large tables, as semi joins partitioned by `y`, run on workers too, and so do aggregates that do not compute in parts (`median`,
   `quantile_cont`, `string_agg`) over a step partitioned by their groups.
   A common table expression one part reads that only filters tables is
-  read in that part's place, and the tasks that read a one-row subquery
-  combine its partial results themselves, so no stage only copies rows
-  from one exchange to another.
+  read in that part's place, the tasks that read a one-row subquery
+  combine its partial results themselves, and a step computed partition
+  by partition that keeps its rows' partitions is computed by the one step
+  that reads it, so no stage only copies rows from one exchange to
+  another.
   Cohort reports (distinct people per cohort, joined to their events and
   counted per signal) run on workers up to the signal-level tail.
 - Workers start on demand and stop when idle: on Kubernetes the chart's

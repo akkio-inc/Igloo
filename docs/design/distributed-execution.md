@@ -625,6 +625,19 @@ as a relation that workers compute (`internal/distributed/relation.go`):
   expression, so a statement that holds a report twice, each copy with
   common table expressions of the same names, plans each copy as the
   report alone.
+- **Fused partitions.** A stage that reads exchanges partition by
+  partition and writes an exchange that one later stage alone reads
+  partition by partition is computed by that stage, from the same
+  partitions of what it read, when every row it writes lands in the
+  partition it was computed from: the written exchange's key columns are
+  the key columns of one exchange it reads, passed through as select items
+  that name them and nothing else, and neither exchange hashes them
+  through a cast. An aggregation by person over a relation keyed by
+  person, before the stage that reads its groups, or a semi join's rows
+  joined to a table on the semi join's key, then take one round of tasks
+  instead of two. A key computed on the way, a cast included, and integer
+  keys, which exchanges hash as `BIGINT`, keep both stages: a row could
+  then hash elsewhere than the partition it was read from.
 - **Filters' subqueries.** A subquery expression in a filter that reads a
   table the part divides, or one too large for every worker, is a
   relation too when it binds on its own (it is not correlated) and is

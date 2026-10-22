@@ -2,6 +2,8 @@ package distributed
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/akkio-inc/igloo/internal/snowflake"
@@ -310,6 +312,61 @@ func TestInlinedRelations(t *testing.T) {
 			if tc.stages > 0 && len(p.Stages) != tc.stages || tc.scans > 0 && scans != tc.scans {
 				t.Errorf("%d stages, %d reading lineitem's files; want %d and %d:\n%s", len(p.Stages), scans, tc.stages, tc.scans, p.describe())
 			}
+		})
+	}
+}
+
+// TestFusedPartitions checks that a stage that computes, partition by
+// partition, rows keyed as it read them is computed by the one stage that
+// reads them, and returns what one machine returns, for keys of several
+// types: an aggregation by key over a relation keyed by it, and a semi
+// join's rows joined to a table on its key. A key cast on its way, or an
+// integer one, which exchanges hash as BIGINT, keeps its stage: read in
+// place of it, the semi join's partitions would not be the table's.
+func TestFusedPartitions(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	keys := `(i % 5000)::BIGINT AS kb, (i % 5000)::DECIMAL(38,0) AS kd, 'k' || (i % 5000) AS ks, DATE '2020-01-01' + (i % 5000)::INTEGER AS kt`
+	h.addTable("facts", `(SELECT i AS id, `+keys+`, (i % 97)::DOUBLE AS v FROM range(60000) t(i))`, 3)
+	h.addTable("dims", `(SELECT `+strings.ReplaceAll(keys, "i % 5000", "i * 3 % 6000")+` FROM range(4000) t(i))`, 2)
+	h.addTable("others", `(SELECT `+strings.ReplaceAll(keys, "i % 5000", "i % 7000")+`, CAST(i % 7000 AS VARCHAR) AS kc,
+		(i % 13)::BIGINT AS w FROM range(30000) t(i))`, 2)
+	h.co.maxBroadcast = 1
+	grouped := func(key, out, on string) string {
+		return `WITH s AS (SELECT ` + key + ` AS k, v FROM facts WHERE ` + key + ` IN (SELECT ` + key + ` FROM dims)),
+			per AS (SELECT ` + out + ` AS k, sum(v) AS total, count(*) AS n FROM s GROUP BY 1)
+			SELECT count(*), sum(per.total), sum(per.n), sum(o.w) FROM per JOIN others AS o ON o.` + on + ` = per.k`
+	}
+	joined := func(key, out, on string) string {
+		return `WITH s AS (SELECT ` + out + ` AS k, f.v FROM facts AS f WHERE f.` + key + ` IN (SELECT ` + key + ` FROM dims))
+			SELECT count(*), sum(s.v), sum(o.w), count(DISTINCT o.w) FROM s JOIN others AS o ON o.` + on + ` = s.k`
+	}
+	for _, tc := range []struct {
+		query string
+		fused bool
+	}{
+		{grouped("kb", "k", "kb"), false},
+		{grouped("kd", "k", "kd"), true},
+		{grouped("ks", "k", "ks"), true},
+		{grouped("kt", "k", "kt"), true},
+		{grouped("kb", "CAST(k AS VARCHAR)", "kc"), false},
+		{joined("kb", "f.kb", "kb"), false},
+		{joined("kd", "f.kd", "kd"), true},
+		{joined("ks", "f.ks", "ks"), true},
+		{joined("kt", "f.kt", "kt"), true},
+		{joined("kb", "CAST(f.kb AS VARCHAR)", "kc"), false},
+		{joined("ks", "CAST(f.ks AS VARCHAR)", "ks"), false},
+	} {
+		t.Run(short(tc.query), func(t *testing.T) {
+			h.t = t
+			if !h.check(tc.query) {
+				t.Fatal("did not run distributed")
+			}
+			p := h.planOf(tc.query)
+			fused := slices.ContainsFunc(p.Stages, func(s *Stage) bool { return strings.Contains(s.SQL, "__igloo_x") })
+			if fused != tc.fused {
+				t.Errorf("fused: %v, want %v:\n%s", fused, tc.fused, p.describe())
+			}
+			t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
 		})
 	}
 }

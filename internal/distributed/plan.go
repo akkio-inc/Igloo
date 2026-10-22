@@ -218,6 +218,8 @@ type planner struct {
 	inlined  map[uintptr]bool
 	inlines  int
 	noInline bool
+	// fused numbers the views of stages fusePartitions took out.
+	fused int
 	// reasons say why candidates were not distributed, for logs.
 	reasons []string
 	// tables caches resolved names.
@@ -257,6 +259,9 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		return nil, unsupported("%s", reason)
 	}
 	if err := pl.fuseRows(); err != nil {
+		return nil, err
+	}
+	if err := pl.fusePartitions(); err != nil {
 		return nil, err
 	}
 
@@ -1732,7 +1737,7 @@ func (pl *planner) fuseRows() error {
 				// The row's query over the partial results, which the reader
 				// reads under the row's view name, in place of the row.
 				q := clone(row).(node)
-				renameView(q, partials.View, in.View)
+				renameViews(q, map[string]string{partials.View: in.View})
 				c.fragment = rewrite(c.fragment, func(n node) (node, bool) {
 					if !isView(n, in.View) {
 						return nil, false
@@ -1764,23 +1769,249 @@ func (pl *planner) fuseRows() error {
 	return nil
 }
 
-// isView reports whether n is a reference to the view called name.
-func isView(n node, name string) bool {
-	return str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == name && str(n["schema_name"]) == "" && str(n["catalog_name"]) == ""
+// fusePartitions takes out the stages that write, partition by partition,
+// an exchange that one later stage alone reads partition by partition,
+// when each row they write lands in the partition it was computed from:
+// that stage then computes their rows itself, from the same partition of
+// what they read, rather than waiting for a round of tasks that writes
+// them first, as an aggregation by person over a relation keyed by person
+// does before the stage that reads its groups. See passesKey for when rows
+// stay in their partition; any other stage stays.
+func (pl *planner) fusePartitions() error {
+	ref, err := pl.p.fromRef("SELECT * FROM (SELECT 1) AS v")
+	if err != nil {
+		return err
+	}
+	wrap, err := pl.p.template("SELECT * FROM (SELECT 1) AS __igloo_f")
+	if err != nil {
+		return err
+	}
+	for {
+		p, c, at := pl.passThrough()
+		if p == nil {
+			return nil
+		}
+		// p's views, under names of their own in c.
+		names := map[string]string{}
+		for _, in := range p.Inputs {
+			pl.fused++
+			names[in.View] = fmt.Sprintf("__igloo_x%d", pl.fused)
+		}
+		row := clone(p.fragment).(node)
+		renameViews(row, names)
+		if len(p.Columns) > 0 {
+			w := clone(wrap).(node)
+			from := child(w, "from_table")
+			child(from, "subquery")["node"] = row
+			cols := make([]any, len(p.Columns))
+			for i, col := range p.Columns {
+				cols[i] = col
+			}
+			from["column_name_alias"] = cols
+			row = w
+		}
+		view := c.Inputs[at].View
+		c.fragment = rewrite(c.fragment, func(n node) (node, bool) {
+			if !isView(n, view) {
+				return nil, false
+			}
+			sub := clone(ref).(node)
+			child(sub, "subquery")["node"] = clone(row)
+			sub["alias"] = str(n["alias"])
+			if sub["alias"] == "" {
+				sub["alias"] = view
+			}
+			if aliases := list(n, "column_name_alias"); aliases != nil {
+				sub["column_name_alias"] = aliases
+			}
+			return sub, true
+		}).(node)
+		inputs := slices.Delete(slices.Clone(c.Inputs), at, at+1)
+		for _, in := range p.Inputs {
+			in.View = names[in.View]
+			inputs = append(inputs, in)
+		}
+		c.Inputs = inputs
+		var stages []*Stage
+		for _, s := range pl.stages {
+			if s != p {
+				s.ID = len(stages)
+				stages = append(stages, s)
+			}
+		}
+		pl.stages = stages
+	}
 }
 
-// renameView makes the references to view from in q read view to, under
-// the name their columns are qualified with.
-func renameView(q node, from, to string) {
-	walk(q, func(n node) bool {
-		if isView(n, from) {
-			if str(n["alias"]) == "" {
-				n["alias"] = from
+// passThrough finds a stage p that fusePartitions takes out: one that
+// reads exchanges partition by partition and no divided table, writes an
+// exchange that only c reads, as its input at, partition by partition,
+// and passes its key through (passesKey).
+func (pl *planner) passThrough() (p, c *Stage, at int) {
+	writers := map[*Exchange]int{}
+	type use struct {
+		s  *Stage
+		at int
+	}
+	readers := map[*Exchange][]use{}
+	for _, s := range pl.stages {
+		if s.Out != nil {
+			writers[s.Out]++
+		}
+		for i, in := range s.Inputs {
+			if in.Exchange != nil {
+				readers[in.Exchange] = append(readers[in.Exchange], use{s, i})
 			}
-			n["table_name"] = to
+		}
+	}
+	for _, s := range pl.stages {
+		x := s.Out
+		if x == nil || writers[x] != 1 || len(readers[x]) != 1 || s.split() != nil || !s.partitioned() {
+			continue
+		}
+		r := readers[x][0]
+		if r.s == s || !r.s.Inputs[r.at].Partitioned || !passesKey(s, x) {
+			continue
+		}
+		named := false
+		walk(r.s.fragment, func(n node) bool {
+			named = named || isView(n, r.s.Inputs[r.at].View)
+			return !named
+		})
+		if named {
+			return s, r.s, r.at
+		}
+	}
+	return nil, nil, 0
+}
+
+// passesKey reports whether stage s writes each row to the partition of x
+// that the row was computed from. x's key columns must be, in order, the
+// key columns of one exchange s reads partition by partition, each a
+// select item that refers to that exchange's view and column and nothing
+// else (and so of the column's type, as the view casts it to the type its
+// writers wrote), and neither exchange may hash a key through a cast: the
+// hash of each row's key is then the hash it was read by. A key computed
+// in any way, a cast included, is not, nor an integer key, which
+// exchanges hash as BIGINT.
+func passesKey(s *Stage, x *Exchange) bool {
+	sel := s.fragment
+	if str(sel["type"]) != "SELECT_NODE" || len(x.Keys) == 0 || len(x.Casts) != len(x.Keys) {
+		return false
+	}
+	refs := map[string]node{}
+	if !viewRefs(child(sel, "from_table"), refs) {
+		return false
+	}
+	items := list(sel, "select_list")
+	var keyed *Input
+	for i, key := range x.Keys {
+		// The select item that writes the key column.
+		item := -1
+		for j, it := range items {
+			e := it.(node)
+			name := str(e["alias"])
+			switch {
+			case len(s.Columns) > 0:
+				if j < len(s.Columns) {
+					name = s.Columns[j]
+				}
+			case str(e["class"]) == "STAR":
+				return false
+			case name == "" && str(e["class"]) == "COLUMN_REF":
+				parts := columnNames(e)
+				name = parts[len(parts)-1]
+			}
+			if strings.EqualFold(name, key) {
+				if item >= 0 {
+					return false
+				}
+				item = j
+			}
+		}
+		if item < 0 {
+			return false
+		}
+		e := items[item].(node)
+		if str(e["class"]) != "COLUMN_REF" {
+			return false
+		}
+		parts := columnNames(e)
+		var ref node
+		switch {
+		case len(parts) == 2:
+			ref = refs[strings.ToLower(parts[0])]
+		case len(parts) == 1 && len(refs) == 1:
+			for _, r := range refs {
+				ref = r
+			}
+		}
+		if ref == nil || len(list(ref, "column_name_alias")) > 0 {
+			return false
+		}
+		var in *Input
+		for k := range s.Inputs {
+			if s.Inputs[k].View == str(ref["table_name"]) && s.Inputs[k].Exchange != nil && s.Inputs[k].Partitioned {
+				in = &s.Inputs[k]
+			}
+		}
+		if in == nil || keyed != nil && keyed != in {
+			return false
+		}
+		keyed = in
+		ix := in.Exchange
+		if len(ix.Keys) != len(x.Keys) || len(ix.Casts) != len(ix.Keys) || !strings.EqualFold(ix.Keys[i], parts[len(parts)-1]) ||
+			ix.Casts[i] != "" || x.Casts[i] != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// viewRefs adds the view references of a FROM clause to refs, by the name
+// their columns are qualified with, and reports whether it holds nothing
+// else: only views and joins of them, under distinct names.
+func viewRefs(ref node, refs map[string]node) bool {
+	switch str(ref["type"]) {
+	case "BASE_TABLE":
+		if str(ref["schema_name"]) != "" || str(ref["catalog_name"]) != "" || !strings.HasPrefix(str(ref["table_name"]), "__igloo_") {
+			return false
+		}
+		name := str(ref["alias"])
+		if name == "" {
+			name = str(ref["table_name"])
+		}
+		name = strings.ToLower(name)
+		if refs[name] != nil {
+			return false
+		}
+		refs[name] = ref
+		return true
+	case "JOIN":
+		return viewRefs(child(ref, "left"), refs) && viewRefs(child(ref, "right"), refs)
+	}
+	return false
+}
+
+// renameViews makes the references to the views names maps in q read the
+// views they map to, under the names their columns are qualified with.
+func renameViews(q node, names map[string]string) {
+	walk(q, func(n node) bool {
+		if str(n["type"]) == "BASE_TABLE" && str(n["schema_name"]) == "" && str(n["catalog_name"]) == "" {
+			if to, ok := names[str(n["table_name"])]; ok {
+				if str(n["alias"]) == "" {
+					n["alias"] = str(n["table_name"])
+				}
+				n["table_name"] = to
+			}
 		}
 		return true
 	})
+}
+
+// isView reports whether n is a reference to the view called name.
+func isView(n node, name string) bool {
+	return str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == name && str(n["schema_name"]) == "" && str(n["catalog_name"]) == ""
 }
 
 // stage adds a stage to the plan.
