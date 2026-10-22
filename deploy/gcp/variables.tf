@@ -155,6 +155,17 @@ variable "node_selector" {
   default     = {}
 }
 
+variable "local_ssd_machine_family" {
+  description = "Machine series whose Local SSD holds the igloo pods' spill directory, e.g. \"c3\", \"c3d\", \"c4\" or \"c4a\". Autopilot then runs the pods on nodes of that series with Local SSD-backed ephemeral storage, billed per node (the whole VM plus Autopilot's premium) instead of per pod. Empty keeps the general-purpose class, whose ephemeral storage is the node's boot disk."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.local_ssd_machine_family == "" || can(regex("^[a-z][a-z0-9]{1,7}$", var.local_ssd_machine_family))
+    error_message = "local_ssd_machine_family must be empty or a machine series name such as \"c3\" or \"c4a\"."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Igloo
 # ---------------------------------------------------------------------------
@@ -238,7 +249,7 @@ variable "igloo_memory" {
 }
 
 variable "spill_size" {
-  description = "Local disk per igloo pod for queries larger than memory. Requested as ephemeral storage, which Autopilot provisions per pod (122 GiB at most on the general-purpose class)."
+  description = "Local disk per igloo pod for queries larger than memory. Requested as ephemeral storage, which Autopilot provisions per pod: on the node's boot disk, 122 GiB at most, on the general-purpose class; on Local SSD, up to its capacity less what GKE reserves, with local_ssd_machine_family."
   type        = string
   default     = "50Gi"
 

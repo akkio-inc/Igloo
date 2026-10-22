@@ -12,6 +12,9 @@ region     = "us-central1"
 # igloo_memory  = "8Gi"   # DuckDB uses ~80% of it
 # spill_size    = "50Gi"  # local disk per pod for larger-than-memory queries
 # spot          = true    # ~60-70% cheaper igloo pods; preemptible
+# Spill to Local SSD (NVMe) instead of the boot disk, for queries that spill a
+# lot; billed per node of that series instead of per pod:
+# local_ssd_machine_family = "c3"
 
 # --- Reaching the SQL endpoint ----------------------------------------------
 # Default: private; use `kubectl port-forward` (see the next_steps output).

@@ -49,11 +49,12 @@ Autopilot and about $290 on an equivalent regional Standard cluster.
 
 Standard becomes the cheaper choice for a large, steady fleet packed above
 roughly 75% utilization. It also allows shapes Autopilot's general-purpose
-class does not: very high memory per vCPU (Autopilot allows 1 to 6.5 GiB per
-vCPU) and local NVMe SSD for DuckDB's spill directory. Before switching modes,
-try Autopilot compute classes: `node_selector = { "cloud.google.com/compute-class" = "Balanced" }`
-(or `Performance`, or a custom compute class) selects other machine families
-while keeping per-pod billing.
+class does not, such as very high memory per vCPU (Autopilot allows 1 to 6.5
+GiB per vCPU). Before switching modes, try Autopilot compute classes:
+`node_selector = { "cloud.google.com/compute-class" = "Balanced" }` (or a
+custom compute class) selects other machine families while keeping per-pod
+billing. Local NVMe SSD for DuckDB's spill directory is available on Autopilot
+too, with `local_ssd_machine_family` ([Spill on Local SSD](#spill-on-local-ssd)).
 
 ## Prerequisites
 
@@ -158,6 +159,7 @@ psql "host=sql.example.com port=5432 user=igloo dbname=igloo sslmode=verify-full
 | `replica_count` | `2` | igloo pods |
 | `igloo_cpu`, `igloo_memory` | `2`, `8Gi` | Requests per igloo pod (memory is also the limit) |
 | `spill_size` | `50Gi` | Local disk per pod for larger-than-memory queries |
+| `local_ssd_machine_family` | `""` | Machine series, e.g. `c3`, whose Local SSD holds the spill directory; empty: the general-purpose class's boot disk |
 | `duckdb_memory_limit` | `""` | Empty: about 80% of `igloo_memory` |
 | `spot` | `false` | Run igloo pods on Spot capacity |
 | `node_selector` | `{}` | Extra node selector, e.g. an Autopilot compute class |
@@ -191,6 +193,38 @@ Traffic between the pods and a bucket in the same region is free. Logging
 (including VPC flow logs) usually stays within the free 50 GiB per project.
 Turning on `bucket_versioning` or keeping soft delete means deleted table data
 is billed until it expires.
+
+## Spill on Local SSD
+
+DuckDB writes queries larger than memory (big joins, aggregations and sorts)
+to its spill directory, an `emptyDir` of `spill_size` on the node, and reads
+them back; heavy reports spill tens to hundreds of GiB. On Autopilot's
+general-purpose class that is the node's boot disk, a network persistent disk
+whose throughput is a fraction of a local NVMe SSD's.
+
+For workloads that spill a lot, put it on Local SSD:
+
+```hcl
+local_ssd_machine_family = "c3"     # or c3d, c4, c4a, c4d: series with Local SSD
+spill_size               = "120Gi"  # DuckDB stops at 90% of it
+```
+
+The igloo pods then get the node selectors
+`cloud.google.com/machine-family: c3` and
+`cloud.google.com/gke-ephemeral-storage-local-ssd: "true"`, and Autopilot
+runs them on nodes of that series whose ephemeral storage, and so every
+`emptyDir`, is on Local SSD. The pods' ephemeral-storage request
+(`spill_size`) may then exceed the general-purpose class's 122 GiB, up to the
+machine type's Local SSD less what GKE reserves; Autopilot picks a machine
+type with enough. It works with `spot = true`.
+
+It is not the default because it changes how the pods are billed: Autopilot
+charges for the whole VM of a selected machine series, plus a premium, rather
+than for the pods' requests, so size `igloo_cpu` and `igloo_memory` to fill
+the machine types of that series. Local SSD is emptied when a node is
+deleted or repaired; spill files only live for a query, so nothing is lost.
+Check that the series is offered in your region with Local SSD, and that your
+GKE version supports it (C4D needs 1.32.9-gke.1711000 or later).
 
 ## Storage access
 

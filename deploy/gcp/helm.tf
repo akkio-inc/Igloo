@@ -3,6 +3,13 @@
 
 locals {
   spot_node_selector = var.spot ? { "cloud.google.com/gke-spot" = "true" } : {}
+
+  # Nodes of this series with Local SSD-backed ephemeral storage, so the
+  # spill emptyDir is on local NVMe rather than the boot disk.
+  local_ssd_node_selector = var.local_ssd_machine_family == "" ? {} : {
+    "cloud.google.com/machine-family"                  = var.local_ssd_machine_family
+    "cloud.google.com/gke-ephemeral-storage-local-ssd" = "true"
+  }
   spot_tolerations = var.spot ? [{
     key      = "cloud.google.com/gke-spot"
     operator = "Equal"
@@ -59,7 +66,7 @@ locals {
       }
     }
 
-    nodeSelector = merge(var.node_selector, local.spot_node_selector)
+    nodeSelector = merge(local.local_ssd_node_selector, var.node_selector, local.spot_node_selector)
     tolerations  = local.spot_tolerations
 
     # Autopilot sizes each pod from its requests and caps emptyDir volumes at

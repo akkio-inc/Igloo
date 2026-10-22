@@ -201,3 +201,11 @@ run "rejects_short_soft_delete" {
   }
   expect_failures = [var.bucket_soft_delete_days]
 }
+
+run "rejects_bad_local_ssd_machine_family" {
+  command = plan
+  variables {
+    local_ssd_machine_family = "c3-standard-4-lssd"
+  }
+  expect_failures = [var.local_ssd_machine_family]
+}

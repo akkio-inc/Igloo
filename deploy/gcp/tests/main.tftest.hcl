@@ -417,6 +417,34 @@ run "spot" {
   }
 }
 
+run "spill_on_local_ssd" {
+  command = plan
+
+  variables {
+    local_ssd_machine_family = "c3"
+    spill_size               = "200Gi"
+    spot                     = true
+  }
+
+  assert {
+    condition = yamldecode(helm_release.igloo[0].values[0]).nodeSelector == {
+      "cloud.google.com/machine-family"                  = "c3"
+      "cloud.google.com/gke-ephemeral-storage-local-ssd" = "true"
+      "cloud.google.com/gke-spot"                        = "true"
+    }
+    error_message = "local_ssd_machine_family must select that series with Local SSD-backed ephemeral storage, alongside Spot."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).resources.requests["ephemeral-storage"] == "200Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).resources.limits["ephemeral-storage"] == "200Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).duckdb.spillVolume.sizeLimit == "200Gi"
+    )
+    error_message = "The spill volume and the ephemeral-storage request must both be spill_size."
+  }
+}
+
 run "tls" {
   command = plan
 
