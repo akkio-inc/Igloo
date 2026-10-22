@@ -13,6 +13,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A prepared `CREATE TABLE ... AS` a client runs again makes the table it
+  says. DuckDB 1.5.6 runs a prepared CREATE as written only the first time,
+  and from the second on makes the table with no columns, so that the next
+  statement to read it fails with "the FROM clause is missing". Clients run
+  a prepared statement again whenever they reuse one: psycopg does with any
+  statement it has run five times, and so do JDBC drivers. Igloo prepares a
+  CREATE statement afresh each time it runs again.
 - A schema created after a statement looked for it can be used. DuckDB's
   Iceberg catalog remembers a schema as missing once a lookup of a table in
   it found neither, until it restarts, in every session and whoever creates

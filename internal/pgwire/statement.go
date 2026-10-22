@@ -75,6 +75,8 @@ type statement struct {
 	// names, when set, are the names clients see for the result's columns,
 	// as the Snowflake dialect names them; columns keeps DuckDB's.
 	names []string
+	// ran says the statement has run, for freshForRun.
+	ran bool
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client
@@ -165,6 +167,26 @@ func (st *statement) reprepare(ctx context.Context, conn *duckdb.Conn) error {
 	old := st.stmt
 	st.stmt, st.encoders = fresh.stmt, fresh.encoders
 	return old.Close()
+}
+
+// freshForRun prepares st again, on conn, if it is a CREATE statement that
+// has run before. DuckDB 1.5.6 runs a prepared CREATE as written only the
+// first time: CREATE TABLE ... AS run again makes the table with no
+// columns, so that the next statement to read it fails to bind ("the FROM
+// clause is missing"). Clients run a prepared statement again whenever
+// they reuse one, as psycopg does with a statement it has run five times,
+// and as JDBC drivers do.
+func (st *statement) freshForRun(ctx context.Context, conn *duckdb.Conn) error {
+	if st.stmtType != duckdb.STATEMENT_TYPE_CREATE {
+		return nil
+	}
+	if st.ran {
+		if err := st.reprepare(ctx, conn); err != nil {
+			return err
+		}
+	}
+	st.ran = true
+	return nil
 }
 
 // sameShape reports whether a and b have the same type, result columns

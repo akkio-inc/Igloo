@@ -272,6 +272,9 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		defer s.holdCatalog(sess)()
 	}
 	err := runWithCommitRetry(ctx, sess, st, func() error {
+		if err := st.freshForRun(ctx, sess.conn); err != nil {
+			return err
+		}
 		return sess.profiled(ctx, st, func() error { return st.run(ctx, args, w) })
 	})
 	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
