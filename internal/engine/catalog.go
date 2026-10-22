@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -104,13 +103,11 @@ func CatalogViews() []string {
 // The functions take no arguments: duckdb-go aborts the process when a
 // table function is passed NULL.
 func (e *Engine) registerCatalog(ctx context.Context) error {
-	// Not closed: closing a DB closes its connector.
-	db := sql.OpenDB(e.connector)
-	conn, err := db.Conn(ctx)
+	conn, release, err := e.sqlConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close() //nolint:errcheck
+	defer release()
 
 	t, err := newHistoryTypes()
 	if err != nil {

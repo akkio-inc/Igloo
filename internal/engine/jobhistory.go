@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
@@ -38,13 +37,11 @@ func (e *Engine) SetJobHistory(source JobHistory, viewer HistoryViewer) {
 // igloo.load_history over them, as registerHistory does for the query
 // history.
 func (e *Engine) registerJobHistory(ctx context.Context) error {
-	// Not closed: closing a DB closes its connector.
-	db := sql.OpenDB(e.connector)
-	conn, err := db.Conn(ctx)
+	conn, release, err := e.sqlConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close() //nolint:errcheck
+	defer release()
 
 	t, err := newHistoryTypes()
 	if err != nil {

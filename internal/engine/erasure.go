@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -48,13 +47,11 @@ func (e *Engine) erasureViewer(ctx context.Context) func() bool {
 // igloo.erasure_requests over it: one row per request, with JSON columns
 // for what it did where, and no identifiers.
 func (e *Engine) registerErasure(ctx context.Context) error {
-	// Not closed: closing a DB closes its connector.
-	db := sql.OpenDB(e.connector)
-	conn, err := db.Conn(ctx)
+	conn, release, err := e.sqlConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close() //nolint:errcheck
+	defer release()
 
 	t, err := newHistoryTypes()
 	if err != nil {

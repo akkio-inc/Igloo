@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"slices"
 	"strings"
@@ -33,13 +32,11 @@ func (e *Engine) policySnapshot() *policy.Snapshot {
 // tables they may see (see CatalogSource), as igloo.data_retention lists
 // their data retentions.
 func (e *Engine) registerPolicies(ctx context.Context) error {
-	// Not closed: closing a DB closes its connector.
-	db := sql.OpenDB(e.connector)
-	conn, err := db.Conn(ctx)
+	conn, release, err := e.sqlConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close() //nolint:errcheck
+	defer release()
 
 	varchar, err := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
 	if err != nil {

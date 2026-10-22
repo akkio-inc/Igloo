@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
@@ -53,13 +52,11 @@ const historyPage = 1000
 // The functions take no arguments: duckdb-go aborts the process when a
 // table function is passed NULL.
 func (e *Engine) registerHistory(ctx context.Context) error {
-	// Not closed: closing a DB closes its connector.
-	db := sql.OpenDB(e.connector)
-	conn, err := db.Conn(ctx)
+	conn, release, err := e.sqlConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close() //nolint:errcheck
+	defer release()
 
 	types, err := newHistoryTypes()
 	if err != nil {

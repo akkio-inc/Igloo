@@ -257,9 +257,9 @@ one client's or team's compute apart from everyone else's, give them a
 
 ### Spill directory
 
-Spill files stay in the directory when Igloo stops while DuckDB has data
-spilled there, whether it stops cleanly, is killed (for running out of
-memory, or by Docker or Kubernetes after the stop grace period) or crashes.
+DuckDB deletes its spill files as Igloo stops. When it does not get to,
+because Igloo is killed (for running out of memory, or by Docker or
+Kubernetes after the stop grace period) or crashes, the files stay, and
 Igloo deletes them the next time it starts, before it runs any query. The
 log says
 `deleted DuckDB temporary files an earlier run left in the spill directory`,

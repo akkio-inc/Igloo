@@ -164,8 +164,7 @@ func TestOpenDeletesAKilledProcessesSpillFiles(t *testing.T) {
 
 // TestOpenLeavesALiveEnginesSpillFiles opens a second engine on the spill
 // directory of one that has spilled, and checks that the first one's data
-// is still there to read, and that the next engine to open once both have
-// closed deletes the files.
+// is still there to read.
 func TestOpenLeavesALiveEnginesSpillFiles(t *testing.T) {
 	dir := t.TempDir()
 	first := spillingEngine(t, dir)
@@ -199,13 +198,25 @@ func TestOpenLeavesALiveEnginesSpillFiles(t *testing.T) {
 	if err := errors.Join(conn.Close(), second.Close(), first.Close()); err != nil {
 		t.Fatal(err)
 	}
-	third, err := Open(ctx, config.Config{DuckDB: config.DuckDB{TempDir: dir}}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
+}
+
+// TestCloseDeletesSpillFiles checks that closing an engine closes DuckDB's
+// database, which deletes its spill files, so a replica that stops cleanly
+// leaves none. Connections the engine opened for itself and kept, such as
+// those it registers its table functions through, would keep the database
+// open.
+func TestCloseDeletesSpillFiles(t *testing.T) {
+	dir := t.TempDir()
+	e := spillingEngine(t, dir)
+	spillTable(t, e)
+	if spilled := names(t, dir); !slices.ContainsFunc(spilled, isTempFile) {
+		t.Fatalf("DuckDB did not spill: %q", spilled)
+	}
+	if err := e.Close(); err != nil {
 		t.Fatal(err)
 	}
-	defer third.Close() //nolint:errcheck
 	if got := names(t, dir); !slices.Equal(got, []string{tempLockName}) {
-		t.Errorf("the engine opened after the others closed left %q", got)
+		t.Errorf("closing the engine left %q", got)
 	}
 }
 

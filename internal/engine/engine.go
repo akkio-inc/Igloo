@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -145,6 +146,25 @@ func (e *Engine) Connect(ctx context.Context) (*duckdb.Conn, error) {
 
 	return conn, nil
 }
+
+// sqlConn opens a database/sql connection to DuckDB, which duckdb-go
+// registers table functions through, and returns the func that closes it
+// and its pool. The functions stay: they belong to the database, not the
+// connection. Left open, the pool's idle connection would keep the database
+// open after Close, and DuckDB deletes its spill files only as the database
+// closes.
+func (e *Engine) sqlConn(ctx context.Context) (*sql.Conn, func(), error) {
+	db := sql.OpenDB(keepOpen{e.connector})
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, nil, errors.Join(err, db.Close())
+	}
+	return conn, func() { _, _ = conn.Close(), db.Close() }, nil
+}
+
+// keepOpen hides the engine's connector's Close from database/sql, which
+// closes the connector a pool was opened on along with the pool.
+type keepOpen struct{ driver.Connector }
 
 // Catalog is the Iceberg catalog's name in SQL, or "" without one.
 func (e *Engine) Catalog() string { return e.catalog }
@@ -416,7 +436,8 @@ func (e *Engine) SetCatalogGuard(g catalogproxy.Guard) {
 	}
 }
 
-// Close shuts DuckDB down. Sessions must be closed first.
+// Close shuts DuckDB down. Sessions must be closed first: DuckDB's database
+// closes, deleting its spill files, as the last connection to it closes.
 func (e *Engine) Close() error {
 	e.stopCache()
 	e.parser.close()

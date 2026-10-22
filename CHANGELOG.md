@@ -997,10 +997,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   stopped, cleanly or killed, while data was spilled, and the next start
   did not delete them: on a single machine whose replica restarted during
   large queries, 59 GB of them filled the spill volume, and later queries
-  failed with
-  `No space left on device` or `failed to offload data block`. Igloo now
-  deletes them when it starts, before it runs any query, and logs the bytes
-  freed. It deletes only DuckDB's own files in `IGLOO_DUCKDB_TEMP_DIR`
+  failed with `No space left on device` or `failed to offload data block`.
+  DuckDB deletes them only as its database closes, and Igloo kept its
+  database open until the process exited, through connections it had
+  opened to register its functions. Igloo now closes those connections, so
+  a clean stop deletes the files, and when it starts it deletes those a
+  killed or crashed process left, before it runs any query, and logs the
+  bytes freed.
+  It deletes only DuckDB's own files in `IGLOO_DUCKDB_TEMP_DIR`
   (`duckdb_temp_storage_*`, `duckdb_temp_block-*`), and none while another
   Igloo process uses the directory, which it tells by a lock that each
   process holds there (docs/operations.md#spill-directory).

@@ -1,14 +1,12 @@
 package engine
 
 // DuckDB spills to IGLOO_DUCKDB_TEMP_DIR (temp_directory) when a query needs
-// more memory than its limit, and deletes its files there only when its
-// database closes. Igloo's never does before the process exits: the
-// database/sql pools the engine registers its table functions through keep
-// connections open. So a replica that stops while data is spilled, cleanly
-// or killed, leaves the files behind, and the next process does not delete
-// them: one restarted while large queries spilled kept tens of GB it could
-// not use, until its spill disk filled up. The engine deletes them as it
-// opens, before DuckDB writes any.
+// more memory than its limit, and deletes its files there as its database
+// closes, which Close leads to once every connection is closed. A process
+// that is killed or crashes leaves them behind, and the next one does not
+// delete them: a replica restarted while large queries spilled kept tens of
+// GB it could not use, until its spill disk filled up. The engine deletes
+// them as it opens, before DuckDB writes any.
 //
 // It may do so only when no other process uses the directory: DuckDB names
 // its files the same in every process, so a live process's files look just
