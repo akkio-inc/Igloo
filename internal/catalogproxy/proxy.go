@@ -295,6 +295,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "BadRequestException", "the request is too large")
 		return
 	}
+	body = withDefaults(rest, body)
 	// A change makes the listings kept stale: forgotten before it, so no
 	// listing begun before it is kept, and after it, so none answered
 	// while it was under way is.

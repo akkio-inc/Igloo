@@ -698,6 +698,12 @@ tables itself, so nobody has to schedule anything. Every hour
    properties override the codec and row group size. File size does not
    limit parallelism: DuckDB divides a scan by row group, so a table in a few
    large files still uses every core.
+   A table Igloo creates gets that target from the start (Igloo sets
+   `write.target-file-size-bytes` when it creates the table, unless the
+   statement did), so a large insert writes files of about that size.
+   Without one, DuckDB writes a file per row group, a few megabytes each for
+   narrow rows. Tables made by other engines keep what those engines set;
+   change one with `set_iceberg_table_properties`.
 2. **Snapshot expiry.** Snapshots older than `IGLOO_SNAPSHOT_RETENTION`
    (7 days by default) are removed, always keeping the current one, and the
    files that only they referenced are deleted. Files that compaction

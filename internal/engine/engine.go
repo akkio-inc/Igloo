@@ -534,6 +534,12 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if e.proxy, err = catalogproxy.New(proxyOpts); err != nil {
 		return err
 	}
+	// The proxy gives tables Igloo creates a target file size, which
+	// DuckDB refuses to write a partitioned table with unless told to
+	// ignore it there, as it does when a table has none.
+	if err := exec("SET GLOBAL ignore_target_file_size_for_partitioned_tables = true"); err != nil {
+		return fmt.Errorf("configure iceberg writes: %w", err)
+	}
 	attach := attachStatement(cfg.Catalog, e.proxy.URL())
 	for {
 		err := exec(attach)

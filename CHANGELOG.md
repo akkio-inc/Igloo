@@ -762,6 +762,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Tables Igloo creates are written in files of 512 MB, Iceberg's default
+  target, rather than a file per row group: DuckDB's Iceberg writer aims
+  for 8 MB when a table sets no `write.target-file-size-bytes`, so 1.3 GB of
+  narrow rows came to 288 files, each read with its own requests, until
+  compaction caught up at 8 GB a table an hour. Igloo now sets the property
+  when it creates a table, unless the statement did. See
+  [operations](docs/operations.md#table-maintenance).
 - When Igloo is about to run out of memory, it cancels the statement that
   has run longest (SQLSTATE `53200`) instead of being killed by the kernel
   with every session. DuckDB keeps to its memory limit only for the memory
