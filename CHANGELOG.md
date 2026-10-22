@@ -764,8 +764,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   GET_PATH(t.value, 'items'))`), keeps the objects as DuckDB structs rather
   than JSON, so their `ARRAY` columns are flattened from their lists
   without JSON text or a dependent join: 0.4 s instead of 1.6 s for 29
-  million elements of 2 million rows' five lists. A `WHERE` at that level,
-  where DuckDB plans a dependent join anyway, keeps the objects JSON.
+  million elements of 2 million rows' five lists. A `WHERE` there stays
+  out of the joins, which DuckDB would plan as dependent joins: conditions
+  on the tables go into the first `FLATTEN`'s `ON`, which DuckDB pushes
+  down to them, and conditions on the objects' keys into the lists the
+  second `FLATTEN` unnests (1.5 s, 1.9 s and 1.4 s, with conditions on the
+  table, the keys and both, became 0.42 s, 0.62 s and 0.44 s); one on the
+  second `FLATTEN`'s elements keeps the objects JSON.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

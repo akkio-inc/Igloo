@@ -153,6 +153,23 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 				table(flatten(input => [object_construct('l', t.a, 'k', 'x'), object_construct('k', 'y')])) g,
 				lateral flatten(input => g.value:l, outer => true) v %[2]s order by 1, 2, 4`, builds: true,
 			asJSON: `where g.value is not null`},
+		// A WHERE on the table, on the objects' keys, or both, which the
+		// translation keeps out of the joins (see structWhere).
+		{q: `select t.id, g.index, v.index, v.value::string from %[1]s t,
+				lateral flatten(input => [object_construct('k', 'a', 'l', t.a), object_construct_keep_null('k', 'b', 'l', t.o),
+					object_construct('l', ['p', 'q'])]) g,
+				lateral flatten(input => g.value:l) v
+				where t.id <> 3 and (g.value:k <> 'b' or g.value:k is null) and t.id between 1 and 9 %[2]s order by 1, 2, 3`, builds: true,
+			asJSON: `and g.value is not null`},
+		{q: `select cast(g.value:facet_type as text) as bt, cast(v.value as text) as bv, count(distinct t.id), count(*)
+			from %[1]s as t cross join lateral flatten(input => [object_construct('facet_type', 'all', 'facet_values', ['every']),
+				object_construct_keep_null('facet_type', 'array', 'facet_values', t.a)]) as g(seq, key, path, index, value, this)
+			cross join lateral flatten(input => get_path(g.value, 'facet_values')) as v(seq, key, path, index, value, this)
+			where t.id in (1, 2, 4, 9) and get_path(g.value, 'facet_type')::string <> 'none' %[2]s group by 1, 2 order by 1, 2`, builds: true,
+			asJSON: `and g.value is not null`},
+		{q: `select t.id, g.index, g.value:l from %[1]s t, lateral flatten(input => [object_construct('l', t.a), object_construct('l', t.o)]) g
+				where t.id < 3 %[2]s order by 1, 2`, builds: true,
+			asJSON: `and g.value is not null`},
 		{q: `select t.id, v.index, v.value from %[1]s t, lateral flatten(input => [object_construct('l', t.a)]) g,
 				lateral flatten(input => get_path(g.value, 'l[2].y')) v, lateral flatten(input => g.value:l, path => '[3]') w
 				%[2]s order by 1, 2`, builds: true,
@@ -289,9 +306,46 @@ func TestFlattenShapes(t *testing.T) {
 		{`select g.value:k from tab m, lateral flatten(input => [object_construct('k', 'a')]) g where exists (select 1 from u as g where g.value:k = 'a')`,
 			`unnest([coalesce(`, `_sf_fields`},
 		{`select g.value:k from tab m, lateral flatten(input => [object_construct('k', 'a')]) g, lateral flatten(input => m.a) as g`, `unnest([coalesce(`, `_sf_fields`},
-		// So does one at a level that filters its rows, where DuckDB joins it
-		// with a dependent join.
+		// A WHERE stays out of the joins, which DuckDB would make dependent
+		// ones: a condition on the tables goes into the first FLATTEN's ON,
+		// one on its keys into the parts the last FLATTEN unnests.
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id > 1`,
+			`) AS "g" ON ((m.id > 1)), LATERAL (SELECT`, `where`},
+		{`select v.value from tab m cross join lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g cross join lateral flatten(input => g.value:l) v where g.value:k = 'a' group by 1`,
+			`FROM (SELECT unnest(sf_parts_values(CASE WHEN (g._sf_fields._sf_k1 = 'a') THEN g._sf_fields._sf_l2 END, CASE WHEN (g._sf_fields._sf_k1 = 'a') THEN g._sf_fields._sf_j2 END, 'BOTH')) AS _sf_value`,
+			`where`},
+		{`select v.value from tab m inner join u on u.id = m.id, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) as g(seq, key, path, index, value, this), lateral flatten(input => get_path(g.value, 'l')) v
+				where m.id between 1 and 9 and (g.value:k = 'a' or m.id = 1) and case when m.a is null and m.id > 0 then false else true end order by 1`,
+			`) AS "g"(seq, key, path, index, value, this) ON ((m.id between 1 and 9) AND (case when m.a is null and m.id > 0 then false else true end)), LATERAL`,
+			`where`},
+		{`select v.value from tab m inner join u on u.id = m.id, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) as g(seq, key, path, index, value, this), lateral flatten(input => get_path(g.value, 'l')) v
+				where m.id between 1 and 9 and (g.value:k = 'a' or m.id = 1)`,
+			`unnest(sf_parts_values(CASE WHEN ((g._sf_fields._sf_k1 = 'a' or m.id = 1)) THEN g._sf_fields._sf_l2 END`, `where`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v where g.value:k = 'a' or m.id > 1`,
+			`CASE WHEN (g._sf_fields._sf_k1 = 'a' or m.id > 1) THEN`, `ON (`},
+		// Other WHEREs, and other filters, keep the objects JSON: DuckDB
+		// joins structs with a dependent join there.
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where v.value::string <> 'x'`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id > 1 and v.index > 0`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id in (select id from u)`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select m.id + 1 as n, v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where n > 1`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, u, lateral flatten(input => g.value:l) v where u.id = m.id`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l, outer => true) v where g.value:l is not null`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l[0]) v where g.value:l is not null`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v, lateral flatten(input => v.value) w where g.value:l is not null`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v, lateral flatten(input => v.value) w where m.id > 1`,
+			`) AS "g" ON ((m.id > 1)), LATERAL`, `where`},
+		{`select g.value:l from tab m, lateral flatten(input => [object_construct('l', m.a)]) g where m.id > 1`,
+			`) AS "g" ON ((m.id > 1))`, `where`},
+		{`select g.value:l from tab m, lateral flatten(input => [object_construct('l', m.a)]) g where g.value:l is not null`,
 			`unnest([coalesce(`, `_sf_fields`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g join lateral flatten(input => g.value:l) v on v.index > 0`,
 			`unnest([coalesce(`, `_sf_fields`},
@@ -332,25 +386,41 @@ func TestFlattenShapes(t *testing.T) {
 // TestFlattenStructsPlan checks that DuckDB plans FLATTEN of objects built
 // from a row's ARRAY columns, and a FLATTEN of their lists after it, as
 // reports write them, without a dependent join, which an earlier FLATTEN's
-// JSON VALUE takes (see flattenStructs).
+// JSON VALUE takes (see flattenStructs): with no WHERE, and with WHEREs on
+// the tables and the objects' keys (see structWhere).
 func TestFlattenStructsPlan(t *testing.T) {
 	conn := session(t)
 	ctx := context.Background()
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE t AS SELECT * FROM (VALUES (1, ['a', 'b'], ['c']), (2, NULL, [])) v(id, a, b)`); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Translate(`select cast(get_path(g.value, 'kind') as text), cast(v.value as text), count(distinct m.id)
-		from t as m inner join (select 1 as id union all select 2) as u on u.id = m.id
-		cross join lateral flatten(input => [object_construct('kind', 'all', 'items', ['every']), object_construct_keep_null('kind', 'a', 'items', m.a),
-			object_construct_keep_null('kind', 'b', 'items', m.b)]) as g(seq, key, path, index, value, this)
-		cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)
-		group by 1, 2`, Options{})
-	if err != nil {
-		t.Fatal(err)
+	for _, where := range []string{
+		"",
+		"where m.id > 1",
+		"where cast(get_path(g.value, 'kind') as text) <> 'b'",
+		"where m.id > 1 and g.value:kind <> 'b' and m.a is not null",
+	} {
+		res, err := Translate(`select cast(get_path(g.value, 'kind') as text), cast(v.value as text), count(distinct m.id)
+			from t as m inner join (select 1 as id union all select 2) as u on u.id = m.id
+			cross join lateral flatten(input => [object_construct('kind', 'all', 'items', ['every']), object_construct_keep_null('kind', 'a', 'items', m.a),
+				object_construct_keep_null('kind', 'b', 'items', m.b)]) as g(seq, key, path, index, value, this)
+			cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)
+			`+where+` group by 1, 2`, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
+			t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
+		}
 	}
-	rows, err := conn.QueryContext(ctx, "EXPLAIN "+res.SQL)
+}
+
+// explain returns DuckDB's plan of a statement.
+func explain(t *testing.T, conn *sql.Conn, statement string) string {
+	t.Helper()
+	rows, err := conn.QueryContext(context.Background(), "EXPLAIN "+statement)
 	if err != nil {
-		t.Fatalf("%v\n%s", err, res.SQL)
+		t.Fatalf("%v\n%s", err, statement)
 	}
 	defer rows.Close()
 	var plan strings.Builder
@@ -364,9 +434,7 @@ func TestFlattenStructsPlan(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(plan.String(), "DELIM_JOIN") {
-		t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan.String())
-	}
+	return plan.String()
 }
 
 // TestFlattenWhere checks the rows of FLATTENs whose WHERE becomes their

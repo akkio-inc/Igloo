@@ -227,6 +227,9 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 			}
 			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols), st)
 			flats = append(flats, flattened{alias: alias, out: out, structs: st != nil})
+			if st != nil {
+				t.structOuts[out] = alias
+			}
 		case "SPLIT_TO_TABLE":
 			if alias == "" {
 				alias = "split_to_table"
@@ -267,37 +270,14 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 // FROM or WHERE, a set operation, an outer, natural, ASOF, positional, semi
 // or anti join, an ON after such a comma (whose unqualified names would see
 // more items), a subquery in its WHERE, or a WHERE that names a select
-// item's alias, which an ON cannot see.
+// item's alias, which an ON cannot see. The WHERE of a select with FLATTENs
+// of structs is structWhere's.
 func whereOn(nodes []*node, flats []flattened) []*node {
-	if len(flats) == 0 {
-		return nodes
+	if len(flats) == 0 || slices.ContainsFunc(flats, func(f flattened) bool { return f.structs }) {
+		return nodes // structWhere's
 	}
-	sel, from, where := -1, -1, -1
-	for i, n := range nodes {
-		switch n.word() {
-		case "SELECT":
-			if from < 0 {
-				sel = i
-			}
-		case "FROM":
-			if from >= 0 {
-				return nodes
-			}
-			from = i
-		case "WHERE":
-			if where >= 0 || from < 0 {
-				return nodes
-			}
-			where = i
-		case "UNION", "EXCEPT", "INTERSECT", "MINUS":
-			return nodes
-		case "LEFT", "RIGHT", "FULL", "OUTER", "NATURAL", "ASOF", "POSITIONAL", "ANTI", "SEMI", "USING":
-			if from >= 0 && where < 0 {
-				return nodes
-			}
-		}
-	}
-	if sel < 0 || where < 0 {
+	sel, from, where, end, ok := whereClause(nodes)
+	if !ok || where < 0 {
 		return nodes
 	}
 	last := prevSig(nodes, where)
@@ -317,30 +297,8 @@ func whereOn(nodes []*node, flats []flattened) []*node {
 			return nodes
 		}
 	}
-	end := len(nodes)
-	for j := where + 1; j < len(nodes); j++ {
-		if whereEnds[nodes[j].word()] || nodes[j].isOp(";") {
-			end = j
-			break
-		}
-	}
 	cond := nodes[where+1 : end]
-	aliases := map[string]bool{}
-	start := sel + 1
-	if q := nextSig(nodes, sel); q >= 0 && (nodes[q].word() == "DISTINCT" || nodes[q].word() == "ALL") {
-		start = q + 1
-	}
-	for _, item := range splitArgs(nodes[start:from]) {
-		idx := sig(item)
-		if len(idx) < 2 {
-			continue
-		}
-		alias, before := item[idx[len(idx)-1]], item[idx[len(idx)-2]]
-		if name, _, ok := alias.name(); ok && (before.word() == "AS" || endsOperand(before) && !before.isOp(".")) {
-			aliases[strings.ToUpper(name)] = true
-		}
-	}
-	if !movable(cond, aliases) {
+	if !movable(cond, selectAliases(nodes, sel, from)) {
 		return nodes
 	}
 	out := append([]*node{}, nodes[:last+1]...)
@@ -356,6 +314,73 @@ func whereOn(nodes []*node, flats []flattened) []*node {
 	out = append(out, trim(cond)...)
 	out = append(out, raw(") "))
 	return append(out, nodes[end:]...)
+}
+
+// whereClause finds, at one level of a statement, a select's SELECT, FROM
+// and WHERE, and the end of the WHERE's condition (where is -1 for a select
+// without one); ok is false when the level has another FROM or WHERE, a set
+// operation, or an outer, natural, ASOF, positional, semi or anti join or
+// USING, where a WHERE cannot move into the joins.
+func whereClause(nodes []*node) (sel, from, where, end int, ok bool) {
+	sel, from, where = -1, -1, -1
+	for i, n := range nodes {
+		switch n.word() {
+		case "SELECT":
+			if from < 0 {
+				sel = i
+			}
+		case "FROM":
+			if from >= 0 {
+				return 0, 0, 0, 0, false
+			}
+			from = i
+		case "WHERE":
+			if where >= 0 || from < 0 {
+				return 0, 0, 0, 0, false
+			}
+			where = i
+		case "UNION", "EXCEPT", "INTERSECT", "MINUS":
+			return 0, 0, 0, 0, false
+		case "LEFT", "RIGHT", "FULL", "OUTER", "NATURAL", "ASOF", "POSITIONAL", "ANTI", "SEMI", "USING":
+			if from >= 0 && where < 0 {
+				return 0, 0, 0, 0, false
+			}
+		}
+	}
+	if sel < 0 || from < 0 {
+		return 0, 0, 0, 0, false
+	}
+	end = len(nodes)
+	if where >= 0 {
+		for j := where + 1; j < len(nodes); j++ {
+			if whereEnds[nodes[j].word()] || nodes[j].isOp(";") {
+				end = j
+				break
+			}
+		}
+	}
+	return sel, from, where, end, true
+}
+
+// selectAliases are the upper-cased aliases of a select's items, from its
+// SELECT at nodes[sel] to its FROM at nodes[from].
+func selectAliases(nodes []*node, sel, from int) map[string]bool {
+	aliases := map[string]bool{}
+	start := sel + 1
+	if q := nextSig(nodes, sel); q >= 0 && (nodes[q].word() == "DISTINCT" || nodes[q].word() == "ALL") {
+		start = q + 1
+	}
+	for _, item := range splitArgs(nodes[start:from]) {
+		idx := sig(item)
+		if len(idx) < 2 {
+			continue
+		}
+		alias, before := item[idx[len(idx)-1]], item[idx[len(idx)-2]]
+		if name, _, ok := alias.name(); ok && (before.word() == "AS" || endsOperand(before) && !before.isOp(".")) {
+			aliases[strings.ToUpper(name)] = true
+		}
+	}
+	return aliases
 }
 
 // whereEnds are the words that end a WHERE clause.
@@ -759,7 +784,12 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bo
 		return flattenStructs(st, in, alias, cols, wantThis)
 	}
 	if !recursive && !outer {
-		return flattenUnnest(in, prefix, mode, alias, cols, wantThis), nil
+		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis)
+		if fold != nil {
+			fold.alias = alias
+			t.folds[out] = fold
+		}
+		return out, nil
 	}
 	parent := "_sf_flatten_input._sf_this"
 	tableFn := "json_each"
@@ -819,8 +849,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis bo
 // elements, without building the array and reading it back: three times
 // faster where each row builds objects to flatten. A key of objects that
 // flattenStructs made structs is unnested from the struct's field, which
-// DuckDB too unnests where it reads it.
-func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bool) *node {
+// DuckDB too unnests where it reads it; the field's parts are then nodes of
+// their own, fold, which structWhere may make conditional.
+func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bool) (out *node, fold *structFold) {
 	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
 	path := rel
 	if prefix != "" {
@@ -850,12 +881,13 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bo
 	case field && prefix == "":
 		// A key of objects flattened as structs (see flattenStructs): its
 		// list or JSON, which DuckDB unnests where it reads the struct.
-		args := l + ", " + j + ", " + m
-		lists = append(lists, raw("unnest(sf_parts_values("+args+")) AS _sf_value, unnest(sf_parts_keys("+args+
-			")) AS _sf_key, unnest(sf_parts_indexes("+args+")) AS _sf_index"))
+		fold = &structFold{l: l, j: j, list: seq(nil, raw(l)), json: seq(nil, raw(j))}
+		args := func() *node { return seq(nil, fold.list, raw(", "), fold.json, raw(", "+m)) }
+		lists = append(lists, raw("unnest(sf_parts_values("), args(), raw(")) AS _sf_value, unnest(sf_parts_keys("), args(),
+			raw(")) AS _sf_key, unnest(sf_parts_indexes("), args(), raw(")) AS _sf_index"))
 		if wantThis {
 			this = "_sf_flatten._sf_this"
-			lists = append(lists, raw(", unnest(sf_parts_this("+args+")) AS _sf_this"))
+			lists = append(lists, raw(", unnest(sf_parts_this("), args(), raw(")) AS _sf_this"))
 		}
 	case isColumnNode(in):
 		x := in.String()
@@ -878,7 +910,7 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis bo
 		this + " AS \"THIS\" FROM (SELECT ")}
 	kids = append(kids, lists...)
 	kids = append(kids, raw(") AS _sf_flatten)"+aliasClause(alias, cols)))
-	return seq(nil, kids...)
+	return seq(nil, kids...), fold
 }
 
 // thisWanted reports whether a statement may read the THIS of a FLATTEN

@@ -155,11 +155,16 @@ JSON and JSON text alike.
   later `FLATTEN(INPUT => f.value:items)` unnests an `ARRAY` column's list
   from the struct without writing it as JSON text, parsing it back or a
   dependent join: over 29 million elements of 2 million rows' five lists,
-  0.4 s instead of 1.6 s. Any other read of `VALUE` or a star at that
-  level keeps the objects JSON, and so does a `WHERE`, an `ON` after the
-  `FLATTEN` or a `HAVING` on the groups' keys there, where DuckDB plans a
-  dependent join, which holds structs of lists at a higher cost than JSON
-  text.
+  0.4 s instead of 1.6 s. A `WHERE` there stays out of the joins, where
+  DuckDB would plan dependent joins: its conditions on the tables go into
+  the `ON` of the first `FLATTEN`'s join, which DuckDB pushes down to the
+  tables, and those on the objects' keys into the lists the second
+  `FLATTEN` unnests. Any other read of `VALUE` or a star at that level
+  keeps the objects JSON, and so do a `WHERE` with a condition on the
+  second `FLATTEN`'s elements, a subquery or a select item's alias, a
+  table after the first `FLATTEN`, an `ON` after it, and a `HAVING` on
+  the groups' keys: DuckDB plans a dependent join there, which holds
+  structs of lists at a higher cost than JSON text.
 
 #### Semi-structured columns
 

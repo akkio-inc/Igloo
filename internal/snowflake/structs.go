@@ -1,6 +1,7 @@
 package snowflake
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -92,8 +93,9 @@ func (s *structFlatten) json(x string, i int) string {
 // renamed, must be read only by a key: alias.VALUE:key or
 // alias.VALUE['key'], GET_PATH(alias.VALUE, 'key...') or GET(alias.VALUE,
 // 'key'), whatever path or cast follows, a later FLATTEN's INPUT included.
-// A FLATTEN at a level that selects a star or filters its rows (see
-// filters), or in a statement that names VALUE unqualified, stays JSON.
+// A FLATTEN at a level that selects a star or filters its rows other than
+// by a WHERE that structWhere keeps out of the joins (see filters), or in a
+// statement that names VALUE unqualified, stays JSON.
 func (t *translator) collectStructs(nodes []*node) {
 	type candidate struct {
 		alias    *node
@@ -129,7 +131,7 @@ func (t *translator) collectStructs(nodes []*node) {
 			}
 			c := &candidate{alias: nodes[a], s: structInput(args)}
 			byAlias[up] = c
-			if c.s == nil || up == "VALUE" || selectsStar(nodes) || !valueKept(cols) || filters(nodes, i) {
+			if c.s == nil || up == "VALUE" || selectsStar(nodes) || !valueKept(cols) || filters(nodes, i, up) {
 				c.rejected = true
 			}
 		}
@@ -190,18 +192,22 @@ func (t *translator) collectStructs(nodes []*node) {
 	}
 }
 
-// filters reports whether the level of a FLATTEN at nodes[i] filters the
-// rows it joins: a WHERE, an ON or USING after the FLATTEN, or a HAVING with
-// a condition on the groups' keys, which DuckDB pushes below the grouping.
-// DuckDB then joins a FLATTEN to its rows with a dependent join, whose hash
-// table holds each row's structs of lists at a higher cost than JSON text:
-// 2.9 s against 1.8 s for 2 million rows of five lists with a WHERE on the
-// elements, 2.3 s against 2 s with a HAVING on the keys.
-func filters(nodes []*node, i int) bool {
+// filters reports whether the level of a FLATTEN at nodes[i], with the
+// upper-cased alias alias, filters the rows it joins: a WHERE that
+// structWhere cannot keep out of the joins (see whereFits), an ON or USING
+// after the FLATTEN, or a HAVING with a condition on the groups' keys,
+// which DuckDB pushes below the grouping. DuckDB then joins a FLATTEN to its
+// rows with a dependent join, whose hash table holds each row's structs of
+// lists at a higher cost than JSON text: 2.9 s against 1.8 s for 2 million
+// rows of five lists with a WHERE on the elements, 2.3 s against 2 s with a
+// HAVING on the keys.
+func filters(nodes []*node, i int, alias string) bool {
 	for k, n := range nodes {
 		switch n.word() {
 		case "WHERE":
-			return true
+			if !whereFits(nodes, i, alias) {
+				return true
+			}
 		case "ON", "USING":
 			if k > i {
 				return true
@@ -225,6 +231,190 @@ func filters(nodes []*node, i int) bool {
 				start = j + 1
 			}
 		}
+	}
+	return false
+}
+
+// whereFits reports whether structWhere can keep the WHERE at the level of
+// the FLATTEN at nodes[i], aliased alias (upper case), out of the joins: the
+// FLATTEN is the first FROM item that is one, not the first item, and every
+// item after it is one, the WHERE could move into an ON (see whereOn), and
+// none of its
+// conditions (see whereTerms) names a later FLATTEN. A condition that names
+// the FLATTEN needs a second FLATTEN, the last item, of one key of its VALUE
+// (see readsOneKey).
+func whereFits(nodes []*node, i int, alias string) bool {
+	sel, from, where, end, ok := whereClause(nodes)
+	if !ok || where < 0 || i < from || i > where {
+		return false
+	}
+	var flats []int
+	for k := from + 1; k < where; k++ {
+		if _, _, ok := flattenAt(nodes, k); ok {
+			flats = append(flats, k)
+		}
+	}
+	// An item before it, whose join takes the ON.
+	p := prevSig(nodes, i)
+	if p >= 0 && nodes[p].word() == "LATERAL" {
+		p = prevSig(nodes, p)
+	}
+	if flats[0] != i || p < 0 || !nodes[p].isOp(",") && nodes[p].word() != "JOIN" {
+		return false
+	}
+	later := map[string]bool{}
+	for k := i + 1; k < where; k++ {
+		if nodes[k].isOp(",") || nodes[k].word() == "JOIN" {
+			q := nextSig(nodes, k)
+			if q >= 0 && nodes[q].word() == "LATERAL" {
+				q = nextSig(nodes, q)
+			}
+			if q < 0 || !slices.Contains(flats, q) {
+				return false
+			}
+			_, after, _ := flattenAt(nodes, q)
+			if a := aliasIndex(nodes, after); a >= 0 {
+				name, _, _ := nodes[a].name()
+				later[strings.ToUpper(name)] = true
+			}
+		}
+	}
+	cond := nodes[where+1 : end]
+	if !movable(cond, selectAliases(nodes, sel, from)) {
+		return false
+	}
+	keys := false
+	for _, term := range whereTerms(cond) {
+		for q := range qualifiers(term) {
+			if later[q] {
+				return false
+			}
+			keys = keys || q == alias
+		}
+	}
+	if !keys {
+		return true
+	}
+	last, _, _ := flattenAt(nodes, flats[len(flats)-1])
+	return len(flats) == 2 && last != nil && readsOneKey(last, alias)
+}
+
+// whereTerms splits a WHERE's condition into the conditions ANDed at its
+// top, unless an OR is there too, which binds less tightly. The AND of a
+// BETWEEN, and those inside a CASE, are not.
+func whereTerms(cond []*node) [][]*node {
+	var terms [][]*node
+	start, between, cases := 0, false, 0
+	for k, n := range cond {
+		switch n.word() {
+		case "OR":
+			if cases == 0 {
+				return [][]*node{cond}
+			}
+		case "CASE":
+			cases++
+		case "END":
+			cases--
+		case "BETWEEN":
+			between = true
+		case "AND":
+			switch {
+			case cases > 0:
+			case between:
+				between = false
+			default:
+				terms = append(terms, cond[start:k])
+				start = k + 1
+			}
+		}
+	}
+	return append(terms, cond[start:])
+}
+
+// qualifiers are the upper-cased names that nodes qualify columns with: the
+// first of a dotted name.
+func qualifiers(nodes []*node) map[string]bool {
+	out := map[string]bool{}
+	var walk func(nodes []*node)
+	walk = func(nodes []*node) {
+		for i, n := range nodes {
+			if n.kind == kGroup {
+				walk(n.kids)
+			}
+			name, _, ok := n.name()
+			if !ok {
+				continue
+			}
+			p, q := prevSig(nodes, i), nextSig(nodes, i)
+			if (p < 0 || !nodes[p].isOp(".")) && q >= 0 && nodes[q].isOp(".") {
+				out[strings.ToUpper(name)] = true
+			}
+		}
+	}
+	walk(nodes)
+	return out
+}
+
+// readsOneKey reports whether a FLATTEN's arguments, g as written, flatten
+// one key of alias.VALUE (alias upper case), as flattenUnnest unnests a
+// struct's field: INPUT alias.VALUE:key, alias.VALUE['key'],
+// GET_PATH(alias.VALUE, 'key') or GET(alias.VALUE, 'key'), and no PATH,
+// OUTER or RECURSIVE.
+func readsOneKey(g *node, alias string) bool {
+	var input []*node
+	for _, a := range splitArgs(g.kids) {
+		a = trim(a)
+		idx := sig(a)
+		if len(idx) < 2 || !a[idx[1]].isOp("=>") {
+			input = a
+			continue
+		}
+		switch a[idx[0]].word() {
+		case "INPUT":
+			input = trim(a[idx[1]+1:])
+		case "MODE":
+		default:
+			return false
+		}
+	}
+	idx := sig(input)
+	isValue := func(k int) bool {
+		name, _, ok := input[idx[k]].name()
+		return ok && strings.ToUpper(name) == alias && input[idx[k+1]].isOp(".") && input[idx[k+2]].word() == "VALUE"
+	}
+	switch {
+	case len(idx) == 5 && isValue(0) && input[idx[3]].isOp(":"):
+		return input[idx[4]].kind == kWord || input[idx[4]].kind == kQuoted
+	case len(idx) == 4 && isValue(0) && input[idx[3]].isGroup('[') && idx[3] == idx[2]+1:
+		k := trim(input[idx[3]].kids)
+		if len(k) != 1 {
+			return false
+		}
+		_, ok := k[0].stringValue()
+		return ok
+	case len(idx) == 2 && (input[idx[0]].word() == "GET_PATH" || input[idx[0]].word() == "GET") && input[idx[1]].isGroup('('):
+		args := splitArgs(input[idx[1]].kids)
+		if len(args) != 2 {
+			return false
+		}
+		first, lit := trim(args[0]), trim(args[1])
+		fi := sig(first)
+		if len(fi) != 3 || len(lit) != 1 {
+			return false
+		}
+		name, _, ok := first[fi[0]].name()
+		if !ok || strings.ToUpper(name) != alias || !first[fi[1]].isOp(".") || first[fi[2]].word() != "VALUE" {
+			return false
+		}
+		s, ok := lit[0].stringValue()
+		if !ok {
+			return false
+		}
+		if input[idx[0]].word() == "GET" {
+			return true
+		}
+		segs, err := parsePath(s)
+		return err == nil && len(segs) == 1 && !segs[0].isIndex
 	}
 	return false
 }
@@ -566,6 +756,84 @@ func structColumn(base *node) string {
 		}
 	}
 	return "_sf_fields"
+}
+
+// structFold is what a FLATTEN of a key of a structFlatten's objects unnests
+// (see flattenUnnest): the key's list and JSON parts as SQL, l and j, and
+// the nodes that render them, list and json, which structWhere may make
+// conditional.
+type structFold struct {
+	alias      string
+	l, j       string
+	list, json *node
+}
+
+// structWhere keeps the WHERE of a select whose first FLATTEN flattenStructs
+// made out of its joins, which DuckDB would otherwise plan as dependent
+// joins (see whereFits): conditions that name none of the FLATTENs go into
+// the ON of the first FLATTEN's join, which DuckDB pushes down to the
+// tables, and conditions that name the first FLATTEN into the parts that
+// the last FLATTEN unnests, NULL for rows that fail them, which then join
+// no elements, as the WHERE would have left none. Over 2 million rows of
+// five lists, a WHERE on the table took 1.5 s as JSON and takes 0.42 s, one
+// on the keys 1.9 s and 0.62 s.
+func (t *translator) structWhere(nodes []*node) ([]*node, error) {
+	_, from, where, end, ok := whereClause(nodes)
+	if !ok || where < 0 {
+		return nodes, nil
+	}
+	first, last := -1, -1
+	for k := from + 1; k < where; k++ {
+		if _, ok := t.structOuts[nodes[k]]; ok && first < 0 {
+			first = k
+		}
+		if t.folds[nodes[k]] != nil {
+			last = k
+		}
+	}
+	if first < 0 {
+		return nodes, nil
+	}
+	alias := t.structOuts[nodes[first]]
+	var table, keys []*node
+	for _, term := range whereTerms(nodes[where+1 : end]) {
+		text := render(term)
+		cond := append(append([]*node{raw("(")}, trim(term)...), raw(")"))
+		switch {
+		case last >= 0 && mentionsQualifier(text, t.folds[nodes[last]].alias):
+			return nodes, nil // see whereFits
+		case mentionsQualifier(text, alias):
+			if last < 0 {
+				return nodes, nil
+			}
+			if len(keys) > 0 {
+				keys = append(keys, raw(" AND "))
+			}
+			keys = append(keys, cond...)
+		default:
+			if len(table) > 0 {
+				table = append(table, raw(" AND "))
+			}
+			table = append(table, cond...)
+		}
+	}
+	if len(keys) > 0 {
+		fold := t.folds[nodes[last]]
+		when := seq(nil, keys...)
+		fold.list.kids = []*node{raw("CASE WHEN "), when, raw(" THEN " + fold.l + " END")}
+		fold.json.kids = []*node{raw("CASE WHEN "), when, raw(" THEN " + fold.j + " END")}
+	}
+	out := append([]*node{}, trimRight(nodes[:where])...)
+	if len(table) > 0 {
+		if join := prevSig(out, first); out[join].isOp(",") {
+			out[join] = raw(" JOIN")
+		} else if c := prevSig(out, join); c >= 0 && out[c].word() == "CROSS" {
+			out[c] = raw("")
+		}
+		on := append(append([]*node{raw(" ON (")}, table...), raw(")"))
+		out = append(out[:first+1], append(on, out[first+1:]...)...)
+	}
+	return append(append(out, raw(" ")), nodes[end:]...), nil
 }
 
 // structField is FLATTEN's input in when it reads a structFlatten's VALUE by
