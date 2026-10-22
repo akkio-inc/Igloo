@@ -611,6 +611,20 @@ as a relation that workers compute (`internal/distributed/relation.go`):
   part reads too is sent to it from the exchange by a stage that reads it,
   and common table expressions nothing reads any more are dropped from the
   coordinator's statement.
+- **Read once.** A common table expression that one reference reads is
+  not written for that reader alone. One that only filters and projects
+  tables reads as a subquery in the reference's place, so its reader
+  divides, partitions or broadcasts the tables itself and aggregates
+  their rows where it reads them (a `GROUP BY` over it runs in one stage,
+  and a `DISTINCT` over it writes each worker's distinct rows); a part
+  that needs the relation after all (`median` over a relation keyed by its
+  groups) is planned again reading it as one. A `SELECT` that only filters
+  and projects one that groups or is a `UNION ALL` is computed by that
+  relation's last stage, rather than by a stage that copies one exchange
+  into another. References count only where the name means that
+  expression, so a statement that holds a report twice, each copy with
+  common table expressions of the same names, plans each copy as the
+  report alone.
 - **Filters' subqueries.** A subquery expression in a filter that reads a
   table the part divides, or one too large for every worker, is a
   relation too when it binds on its own (it is not correlated) and is

@@ -207,13 +207,17 @@ type planner struct {
 	// overs numbers the relations rewritten for window functions over all
 	// rows (overAll).
 	overs int
-	// root is the statement being planned.
-	root node
 	// forced are subqueries in FROM to read as relations, though they pass
 	// their rows through: those IN subqueries become (semiJoins).
 	forced map[uintptr]bool
 	// ins numbers them.
 	ins int
+	// inlined are the entries of common table expressions read as their
+	// queries in their one reader's place (inline); inlines counts those
+	// reads, and noInline turns them off.
+	inlined  map[uintptr]bool
+	inlines  int
+	noInline bool
 	// reasons say why candidates were not distributed, for logs.
 	reasons []string
 	// tables caches resolved names.
@@ -240,9 +244,7 @@ func newPlanner(ctx context.Context, env Env, p *parser, aggs map[string]bool, o
 // plan splits stmt, a parsed SELECT, into jobs. It returns an
 // errUnsupported error when no part of it can run distributed.
 func (pl *planner) plan(stmt node) (*Plan, error) {
-	root := clone(stmt).(node)
-	pl.root = root
-	out, err := pl.query(root, true, nil)
+	out, err := pl.query(clone(stmt).(node), true, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -555,11 +557,21 @@ type candidate struct {
 // that replaces it, or nil if it does not qualify.
 func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 	sp := pl.save()
+	inlines := pl.inlines
 	c := &candidate{sel: sel}
 	j, b, err := pl.build(c, top, ctes)
 	var combine node
 	if err == nil {
 		combine, err = pl.finish(j, b)
+	}
+	if err != nil && IsUnsupported(err) && pl.inlines > inlines && !pl.noInline {
+		// Some parts need a common table expression's rows in an exchange:
+		// median() computes over a relation keyed by its groups, not over
+		// a divided table. Plan it again reading each as a relation.
+		pl.restore(sp)
+		pl.noInline = true
+		defer func() { pl.noInline = false }()
+		return pl.job(sel, top, ctes)
 	}
 	if err != nil {
 		pl.restore(sp)
@@ -856,6 +868,14 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		parts := tableParts(ref)
 		if len(parts) == 1 {
 			if d := ctes.find(parts[0]); d != nil {
+				ok, err := pl.inline(ref, d, ctes)
+				if err != nil {
+					return err
+				}
+				if ok {
+					// Its query, in place of its name.
+					return pl.from(ref, splittable, ctes, sc, rd)
+				}
 				// A relation workers compute.
 				return pl.relation(ref, d.query(), d.scope, d, splittable, sc, rd)
 			}

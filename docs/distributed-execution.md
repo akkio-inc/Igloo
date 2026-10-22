@@ -111,7 +111,9 @@ other partition holds, and so for the cohorts' sizes. The coordinator gets
 a row per genre, cohort and partition, and runs the final join itself. A
 common table expression is computed once, however many parts read it,
 and a part the coordinator runs that reads it too reads what the workers
-wrote. Joins of large intermediate results, `UNION ALL` of large branches
+wrote. One that only one part reads and that only filters tables is read
+as that part's subquery, with no step of its own. Joins of large
+intermediate results, `UNION ALL` of large branches
 feeding one aggregation, and a large table joined to itself on equal
 columns run the same way.
 

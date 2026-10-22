@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
@@ -27,6 +28,10 @@ type cteDef struct {
 	// scope is what its query sees: the expressions before it, and those
 	// of the statement around it.
 	scope cteScope
+	// owner is the query node whose WITH clause defines it, at index; nil
+	// for those the planner makes up.
+	owner node
+	index int
 	// columns are its result columns, once described.
 	columns []Column
 	// outs are the exchanges its rows were written to, by keys and casts;
@@ -50,13 +55,61 @@ func (s cteScope) with(n node) cteScope {
 	}
 	out := make(cteScope, len(s), len(s)+len(entries))
 	copy(out, s)
-	for _, e := range entries {
+	for i, e := range entries {
 		e := e.(node)
 		name := str(e["key"])
-		d := &cteDef{name: name, key: strings.ToLower(name), entry: child(e, "value"), scope: out[:len(out):len(out)]}
+		d := &cteDef{name: name, key: strings.ToLower(name), entry: child(e, "value"), scope: out[:len(out):len(out)], owner: n, index: i}
 		out = append(out, d)
 	}
 	return out
+}
+
+// uses counts the references that read d: those to its name in the body of
+// the query that defines it and in the expressions after it, except where
+// an inner WITH clause defines the name again. Another query that defines
+// a common table expression of the same name, as a statement holding a
+// report twice does, does not count; nor does one that reads d through a
+// common table expression read as its query in its reader's place
+// (inline). It returns -1 for a common table expression the planner made
+// up.
+func (pl *planner) uses(d *cteDef) int {
+	if d.owner == nil {
+		return -1
+	}
+	body := maps.Clone(d.owner)
+	body["cte_map"] = node{"map": []any{}}
+	n := pl.visible(body, d.name)
+	for _, e := range list(child(d.owner, "cte_map"), "map")[d.index+1:] {
+		n += pl.visible(e, d.name)
+	}
+	return n
+}
+
+// visible counts the references to a one-part name in v that mean what
+// the name means around v: under a query node whose WITH clause defines
+// the name, only those in the expressions up to that definition.
+func (pl *planner) visible(v any, name string) int {
+	n := 0
+	walk(v, func(m node) bool {
+		if pl.inlined[identity(m)] {
+			return false
+		}
+		if str(m["type"]) == "BASE_TABLE" && str(m["schema_name"]) == "" && str(m["catalog_name"]) == "" &&
+			strings.EqualFold(str(m["table_name"]), name) {
+			n++
+		}
+		entries := list(child(m, "cte_map"), "map")
+		for i, e := range entries {
+			if strings.EqualFold(str(e.(node)["key"]), name) {
+				for _, before := range entries[:i+1] {
+					n += pl.visible(before, name)
+				}
+				return false
+			}
+		}
+		return true
+	})
+	return n
 }
 
 // find returns the common table expression a one-part name means, or nil.
@@ -488,6 +541,75 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 	return nil
 }
 
+// inline reads a common table expression as the subquery it is, in place
+// of ref, when ref is the only reference that reads it and its query only
+// filters and projects tables: its reader then divides, partitions or
+// reads in full those tables itself, as it would a subquery's, and
+// aggregates their rows where it reads them, rather than workers writing
+// every row to an exchange first. Every name the query reads must mean in
+// ref's scope, ctes, what it means in its own, and it must call no
+// volatile function, which each task that reads a table in full would
+// call again. A candidate that does not qualify puts ref back, and job
+// plans it again reading every common table expression as a relation.
+func (pl *planner) inline(ref node, d *cteDef, ctes cteScope) (bool, error) {
+	q := d.query()
+	if pl.noInline || d.first != nil || str(q["type"]) != "SELECT_NODE" || pl.opaque(q) != "" || rowQuery(q) ||
+		child(ref, "sample") != nil || child(ref, "at_clause") != nil || pl.uses(d) != 1 {
+		return false, nil
+	}
+	same := true
+	walk(q, func(m node) bool {
+		switch {
+		case str(m["class"]) == "FUNCTION" && volatileFunctions[strings.ToLower(str(m["function_name"]))]:
+			same = false
+		case str(m["type"]) == "BASE_TABLE" && str(m["schema_name"]) == "" && str(m["catalog_name"]) == "":
+			a, b := d.scope.find(str(m["table_name"])), ctes.find(str(m["table_name"]))
+			same = a == b || a != nil && b != nil && identity(a.entry) == identity(b.entry)
+		}
+		return same
+	})
+	if !same {
+		return false, nil
+	}
+	sub, err := pl.p.fromRef("SELECT * FROM (SELECT 1) AS v")
+	if err != nil {
+		return false, err
+	}
+	child(sub, "subquery")["node"] = clone(q)
+	sub["alias"] = str(ref["alias"])
+	if sub["alias"] == "" {
+		sub["alias"] = d.name
+	}
+	// The reference's column names, then the expression's.
+	aliases := slices.Clone(list(d.entry, "aliases"))
+	for i, a := range list(ref, "column_name_alias") {
+		if i < len(aliases) {
+			aliases[i] = a
+		} else {
+			aliases = append(aliases, a)
+		}
+	}
+	if aliases == nil {
+		aliases = []any{}
+	}
+	sub["column_name_alias"] = aliases
+	original := clone(ref).(node)
+	key := identity(d.entry)
+	if pl.inlined == nil {
+		pl.inlined = map[uintptr]bool{}
+	}
+	pl.inlined[key] = true
+	pl.inlines++
+	pl.undo = append(pl.undo, func() {
+		clear(ref)
+		maps.Copy(ref, original)
+		delete(pl.inlined, key)
+	})
+	clear(ref)
+	maps.Copy(ref, sub)
+	return true, nil
+}
+
 // opaque says why a SELECT in FROM is not transparent, passing its rows
 // through one by one, or "" if it is.
 func (pl *planner) opaque(sel node) string {
@@ -880,7 +1002,7 @@ func (pl *planner) projection(sel node, scope cteScope) (*wrapper, *relUse, erro
 			return nil, nil, nil
 		}
 		d := sc.find(parts[0])
-		if d == nil || d.first != nil || references(pl.root, d.name) != 1 {
+		if d == nil || d.first != nil || pl.uses(d) != 1 {
 			return nil, nil, nil
 		}
 		r.q, r.scope, r.def = d.query(), d.scope, d

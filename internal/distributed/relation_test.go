@@ -110,20 +110,21 @@ func TestAudienceReport(t *testing.T) {
 		t.Fatal("did not run distributed")
 	}
 	p := h.planOf(audienceReport)
-	// audience and population, read by the cohorts' DISTINCTs, which write
-	// memberships, once, through both branches of its UNION ALL; and the
-	// browsing subquery. The branches' labels are computed by the
-	// DISTINCTs' own stages.
-	if n, scans := relationExchanges(p, "people"); n != 4 || scans != 2 {
-		t.Errorf("%d relation exchanges and %d scans of people, want 4 and 2:\n%s", n, scans, p.describe())
+	// memberships, written once, through both branches of its UNION ALL,
+	// and the browsing subquery. audience and population, read once each
+	// and only filtering tables, are read as their queries by the cohorts'
+	// DISTINCTs, whose stages write each worker's distinct people, and
+	// whose second stages complete them and add the branches' labels.
+	if n, scans := relationExchanges(p, "people"); n != 2 || scans != 2 {
+		t.Errorf("%d relation exchanges and %d scans of people, want 2 and 2:\n%s", n, scans, p.describe())
+	}
+	if n := p.exchanges("aggregate"); n != 2 {
+		t.Errorf("%d stages wrote partial results to an exchange, want the 2 DISTINCTs':\n%s", n, p.describe())
 	}
 	// The sizes and three kinds of signals, the distinct people of each
 	// counted in place, in partitions keyed by person.
 	if n := coordinatorStages(p); n != 4 {
 		t.Errorf("%d stages send rows to the coordinator, want 4:\n%s", n, p.describe())
-	}
-	if n := p.exchanges("aggregate"); n != 0 {
-		t.Errorf("%d stages wrote partial results to an exchange, want none:\n%s", n, p.describe())
 	}
 	// memberships: the exchange both branches write.
 	writers := map[int]int{}
@@ -265,12 +266,57 @@ func TestRelations(t *testing.T) {
 	}
 }
 
+// TestInlinedRelations checks that a common table expression read once,
+// which only filters and projects tables, is read as its query: its reader
+// divides the table itself and aggregates where it reads it, with no stage
+// of the expression's own. One read twice is a relation still, computed
+// once.
+func TestInlinedRelations(t *testing.T) {
+	h := newHarness(t, 0.02, 5, 3)
+	h.co.maxBroadcast = h.tables["customer"].Bytes
+	for _, tc := range []struct {
+		query string
+		// stages and scans, if not 0, are how many stages the plan has and
+		// how many of them read lineitem's files.
+		stages, scans int
+	}{
+		{`WITH air AS (SELECT l_returnflag AS f, l_quantity AS q FROM lineitem WHERE l_shipmode = 'AIR')
+			SELECT f, sum(q), count(*) FROM air GROUP BY 1 ORDER BY 1`, 1, 1},
+		// Columns named by the expression, and by the reference.
+		{`WITH x(f) AS (SELECT l_returnflag, l_quantity AS q FROM lineitem) SELECT f, sum(q) FROM x GROUP BY 1 ORDER BY 1`, 1, 1},
+		{`WITH x(f, q) AS (SELECT l_returnflag, l_quantity FROM lineitem) SELECT y.a, sum(y.b) FROM x AS y(a, b) GROUP BY 1 ORDER BY 1`, 1, 1},
+		// Distinct values of each task's rows, completed by value.
+		{`WITH big AS (SELECT l_orderkey, l_suppkey FROM lineitem WHERE l_quantity > 20)
+			SELECT l_orderkey % 7 AS k, count(DISTINCT l_suppkey) FROM big GROUP BY 1 ORDER BY 1`, 0, 1},
+		// Read twice: computed once.
+		{`WITH s AS (SELECT l_orderkey AS k, l_quantity AS q FROM lineitem WHERE l_quantity > 10)
+			SELECT count(*), sum(a.q) FROM s a JOIN s b ON a.k = b.k`, 0, 1},
+		// One read as its query reads another, read once there.
+		{`WITH a AS (SELECT * FROM lineitem WHERE l_quantity > 5), b AS (SELECT l_returnflag AS f, l_quantity AS q FROM a WHERE l_shipmode <> 'AIR')
+			SELECT f, sum(q) FROM b GROUP BY 1 ORDER BY 1`, 1, 1},
+	} {
+		t.Run(short(tc.query), func(t *testing.T) {
+			h.t = t
+			if !h.check(tc.query) {
+				t.Fatal("did not run distributed")
+			}
+			p := h.planOf(tc.query)
+			_, scans := relationExchanges(p, "lineitem")
+			if tc.stages > 0 && len(p.Stages) != tc.stages || tc.scans > 0 && scans != tc.scans {
+				t.Errorf("%d stages, %d reading lineitem's files; want %d and %d:\n%s", len(p.Stages), scans, tc.stages, tc.scans, p.describe())
+			}
+		})
+	}
+}
+
 // TestSnowflakeAudienceReport runs the audience report of
 // scripts/e2e-distributed.sh, in Snowflake's dialect as BI tools send it:
 // cohorts from an audience's latest version and from a view of people,
 // signals from FLATTEN of array columns read through views, distinct
 // people per signal and cohort, and a ranking. It runs on workers up to
-// the comparisons, alone and twice over in one statement.
+// the comparisons, alone and twice over in one statement; each copy of
+// the report, whose common table expressions have the names of the
+// other's, is planned as the report alone is.
 func TestSnowflakeAudienceReport(t *testing.T) {
 	h := newHarness(t, 0.01, 2, 3)
 	for _, stmt := range snowflake.Macros() {
@@ -334,6 +380,7 @@ func TestSnowflakeAudienceReport(t *testing.T) {
 	twice := `SELECT * FROM (SELECT * FROM (` + report + `) ORDER BY INDEX_RATIO DESC, SIGNAL LIMIT 5)
   UNION ALL SELECT * FROM (SELECT * FROM (` + report + `) ORDER BY INDEX_RATIO ASC, SIGNAL LIMIT 5)
   ORDER BY INDEX_RATIO DESC, SIGNAL`
+	var stages []int
 	for _, q := range []string{report, twice} {
 		r, err := snowflake.Translate(`SELECT * FROM (`+q+`) ORDER BY DIMENSION, INDEX_RATIO DESC, SIGNAL`, snowflake.Options{})
 		if err != nil {
@@ -345,8 +392,12 @@ func TestSnowflakeAudienceReport(t *testing.T) {
 				t.Fatal("did not run distributed")
 			}
 			p := h.planOf(r.SQL)
+			stages = append(stages, len(p.Stages))
 			t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
 		})
+	}
+	if len(stages) == 2 && stages[1] != 2*stages[0] {
+		t.Errorf("the report twice over runs in %d stages, the report in %d", stages[1], stages[0])
 	}
 }
 

@@ -87,6 +87,18 @@ func TestUnnest(t *testing.T) {
 		`SELECT home.city, v.day, sum(v.n) AS n FROM people, unnest(visits) AS u(v) GROUP BY ALL ORDER BY ALL LIMIT 20`,
 		`SELECT list_transform(segments, lambda x: upper(x)) AS up, count(*) AS n FROM people GROUP BY 1 ORDER BY 2 DESC, 1 NULLS FIRST LIMIT 5`,
 		`SELECT count(*) FROM people WHERE len(list_filter(segments, lambda x: x LIKE 'seg_1%')) > 0`,
+		// FLATTENs of lists of structs as Snowflake's translation writes
+		// them: unnest in the select list of a subquery over the table, a
+		// second one over the first's items, and a common table expression
+		// read once as its query beneath them.
+		`SELECT x.item, count(DISTINCT x.person_id) AS n FROM (SELECT m.*, unnest(m._sf_t.items) AS item
+			FROM (SELECT p.*, unnest(list_transform(p.visits, lambda v: {'day': v.day, 'items': [v.n, v.n + 1]})) AS _sf_t FROM people AS p) AS m) AS x
+			GROUP BY 1 ORDER BY 1`,
+		`WITH base AS (SELECT person_id, visits FROM people WHERE person_id % 3 <> 0),
+			cohorts AS (SELECT DISTINCT person_id, CASE WHEN person_id % 2 = 0 THEN 'even' ELSE 'odd' END AS cohort FROM people)
+			SELECT m._sf_t.day AS day, c.cohort, count(DISTINCT m.person_id) AS n
+			FROM (SELECT m.*, unnest(list_transform(m.visits, lambda v: {'day': v.day, 'items': [v.n]})) AS _sf_t FROM base AS m) AS m
+			JOIN cohorts AS c ON c.person_id = m.person_id GROUP BY 1, 2 ORDER BY 1, 2`,
 	}
 	for _, q := range []string{
 		`SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS people FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1`,
