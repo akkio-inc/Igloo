@@ -1278,7 +1278,13 @@ func toNumber(c *call, try bool) (*node, error) {
 	if try {
 		cast = "TRY_CAST("
 	}
-	n := c.out(cast, x, fmt.Sprintf(" AS DECIMAL(%d,%d))", p, s))
+	typ := fmt.Sprintf("DECIMAL(%d,%d)", p, s)
+	var n *node
+	if d := decimalCast(x, cast, typ); d != nil {
+		n = c.out(seq(nil, d...))
+	} else {
+		n = c.out(cast, x, " AS "+typ+")")
+	}
 	n.num = true
 	return n, nil
 }

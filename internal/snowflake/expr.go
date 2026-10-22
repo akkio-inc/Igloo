@@ -385,6 +385,9 @@ func castExpr(x []*node, typ sqlType, try bool) *node {
 			return seq(x, x[0])
 		}
 		v.mode = vString
+		if d := decimalCast(x[0], fn, typ.duck); d != nil {
+			return seq(x, d...)
+		}
 		return seq(x, raw(fn), x[0], raw(" AS "+typ.duck+")"))
 	}
 	switch typ.class {
@@ -400,7 +403,36 @@ func castExpr(x []*node, typ sqlType, try bool) *node {
 		// before the offset, which DuckDB would take for a zone's name.
 		x = []*node{{kind: kRaw, text: quoteString(tzOffsetSpace.ReplaceAllString(s, "$1")), pos: x[0].pos, end: x[0].end}}
 	}
+	if d := decimalCast(operand(x), fn, typ.duck); d != nil {
+		return seq(x, d...)
+	}
 	return seq(x, raw(fn), seq(x, x...), raw(" AS "+typ.duck+")"))
+}
+
+var wideDecimal = regexp.MustCompile(`^DECIMAL\((\d+),(\d+)\)$`)
+
+// decimalCast casts x to typ with fn ("CAST(" or "TRY_CAST(") when typ is
+// a DECIMAL of more than 18 digits, such as NUMBER's DECIMAL(38,0), and
+// returns nil for other types. DuckDB 1.5 reads text as such a DECIMAL,
+// which it keeps as a 128-bit integer, some 40 times slower than as one of
+// up to 18 digits (61 s against 1.5 s for 40 million ten-digit strings):
+// text goes through DECIMAL(18,s) first, and through typ only where that
+// fails, too large or not a number, to give typ's value or error. Both read
+// a string alike, so the value is the same. typeof(x) is a constant DuckDB
+// folds, so other types cast as before.
+func decimalCast(x *node, fn, typ string) []*node {
+	m := wideDecimal.FindStringSubmatch(typ)
+	if m == nil {
+		return nil
+	}
+	p, _ := strconv.Atoi(m[1])
+	s, _ := strconv.Atoi(m[2])
+	if p <= 18 || s > 18 {
+		return nil
+	}
+	narrow := "DECIMAL(18," + strconv.Itoa(s) + ")"
+	return fill("CASE WHEN typeof({x}) = 'VARCHAR' THEN CAST(coalesce(TRY_CAST({x} AS "+narrow+"), "+fn+"{x} AS "+typ+")) AS "+typ+")"+
+		" ELSE "+fn+"{x} AS "+typ+") END", x)
 }
 
 var tzOffsetSpace = regexp.MustCompile(`\s+([+-]\d{1,2}(:?\d{2})?)$`)
