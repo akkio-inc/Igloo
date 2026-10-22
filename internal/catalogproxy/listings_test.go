@@ -136,36 +136,38 @@ func TestListingsKept(t *testing.T) {
 	// before it gives up on a name its listing lacks.
 	e.createTable(t, e.direct, "v")
 	check("a table made around the proxy, not yet loaded", []string{"t", "u"}, 2)
+	// Loading it, the proxy also lists the namespace itself, once, to learn
+	// how the catalog spells its tables' names (see names.go).
 	e.must(t, e.proxy.URL(), http.MethodGet, "namespaces/public/tables/v", "")
-	check("after loading it", []string{"t", "u", "v"}, 3)
+	check("after loading it", []string{"t", "u", "v"}, 4)
 	// Loading a listed table changes nothing.
 	e.must(t, e.proxy.URL(), http.MethodGet, "namespaces/public/tables/t", "")
 	if status, _ := e.call(t, e.proxy.URL(), http.MethodHead, "namespaces/public/tables/u", ""); status != http.StatusNoContent && status != http.StatusOK {
 		t.Errorf("HEAD of a table: %d", status)
 	}
-	check("after loading listed tables", []string{"t", "u", "v"}, 3)
+	check("after loading listed tables", []string{"t", "u", "v"}, 4)
 
 	// A table dropped around the proxy: a load that finds none.
 	e.must(t, e.direct, http.MethodDelete, "namespaces/public/tables/u", "")
 	if status, _ := e.call(t, e.proxy.URL(), http.MethodGet, "namespaces/public/tables/u", ""); status != http.StatusNotFound {
 		t.Errorf("loading a dropped table: %d", status)
 	}
-	check("after a table dropped around the proxy", []string{"t", "v"}, 4)
+	check("after a table dropped around the proxy", []string{"t", "v"}, 5)
 	// Loading a name that is in no listing and in no catalog changes
 	// nothing.
 	e.call(t, e.proxy.URL(), http.MethodGet, "namespaces/public/tables/nope", "")
-	check("after loading a missing name", []string{"t", "v"}, 4)
+	check("after loading a missing name", []string{"t", "v"}, 5)
 
 	e.createTable(t, e.direct, "w")
 	e.proxy.Invalidate()
-	check("after Invalidate", []string{"t", "v", "w"}, 5)
+	check("after Invalidate", []string{"t", "v", "w"}, 6)
 
 	// Namespaces: a listing of them, and one made around the proxy.
 	nsList := func() string { return e.must(t, e.proxy.URL(), http.MethodGet, "namespaces", "") }
 	nsList()
 	nsList()
-	if got := e.lists.Load(); got != 6 {
-		t.Errorf("namespaces listed twice: %d listings reached the catalog, want 6", got)
+	if got := e.lists.Load(); got != 7 {
+		t.Errorf("namespaces listed twice: %d listings reached the catalog, want 7", got)
 	}
 	e.must(t, e.direct, http.MethodPost, "namespaces", `{"namespace": ["sales"]}`)
 	e.must(t, e.proxy.URL(), http.MethodGet, "namespaces/sales", "")

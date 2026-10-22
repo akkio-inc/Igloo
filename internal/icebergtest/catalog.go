@@ -48,6 +48,9 @@ type Catalog struct {
 	// keys are the idempotency keys of applied changes.
 	keys       map[string]bool
 	ignoreKeys bool
+	// ignoreCase finds tables and views by name whatever its case (see
+	// IgnoreNameCase).
+	ignoreCase bool
 	// holdViewLists, if set, runs between making a list of views and
 	// sending it.
 	holdViewLists func(namespace string)
@@ -96,7 +99,7 @@ func (c *Catalog) Commits() int {
 func (c *Catalog) Metadata(ns, name string) table.Metadata {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if t := c.tables[tableKey([]string{ns}, name)]; t != nil {
+	if t := c.tables[c.tableKey([]string{ns}, name)]; t != nil {
 		return t.meta
 	}
 	return nil
@@ -230,7 +233,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.createTable(w, strings.Split(p[1], "\x1f"), body, key)
 	case len(p) == 4 && p[0] == "namespaces" && p[2] == "tables":
 		ns := strings.Split(p[1], "\x1f")
-		t := c.tables[tableKey(ns, p[3])]
+		t := c.tables[c.tableKey(ns, p[3])]
 		switch r.Method {
 		case http.MethodHead:
 			if t == nil {
@@ -249,7 +252,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				apiError(w, http.StatusNotFound, "NoSuchTableException", "no such table")
 				return
 			}
-			delete(c.tables, tableKey(ns, p[3]))
+			delete(c.tables, c.tableKey(ns, p[3]))
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodPost:
 			var change tableChange
@@ -259,7 +262,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			change.Identifier = &identifier{Namespace: ns, Name: p[3]}
 			if c.replay(key) {
-				writeJSON(w, http.StatusOK, commitResponse(c.tables[tableKey(ns, p[3])]))
+				writeJSON(w, http.StatusOK, commitResponse(c.tables[c.tableKey(ns, p[3])]))
 				return
 			}
 			if status, typ, err := c.commit([]tableChange{change}); err != nil {
@@ -267,7 +270,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			c.remember(key)
-			writeJSON(w, http.StatusOK, commitResponse(c.tables[tableKey(ns, p[3])]))
+			writeJSON(w, http.StatusOK, commitResponse(c.tables[c.tableKey(ns, p[3])]))
 		}
 	case len(p) == 5 && p[0] == "namespaces" && p[2] == "tables" && p[4] == "metrics":
 		w.WriteHeader(http.StatusNoContent)
@@ -284,7 +287,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		from, to := tableKey(req.Source.Namespace, req.Source.Name), tableKey(req.Destination.Namespace, req.Destination.Name)
+		from, to := c.tableKey(req.Source.Namespace, req.Source.Name), c.tableKey(req.Destination.Namespace, req.Destination.Name)
 		t := c.tables[from]
 		switch {
 		case t == nil:
@@ -337,6 +340,17 @@ func (c *Catalog) IgnoreIdempotencyKeys() {
 	c.ignoreKeys = true
 }
 
+// IgnoreNameCase makes the catalog find tables and views by name whatever
+// the case it is spelled in, as Lakekeeper does: a table created as ORDERS
+// is loaded, changed, renamed or dropped as orders too, and keeps the name
+// it was created with. Call it before making any whose name is not lower
+// case.
+func (c *Catalog) IgnoreNameCase() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ignoreCase = true
+}
+
 // replay reports whether a change with key was applied already.
 func (c *Catalog) replay(key string) bool {
 	return key != "" && !c.ignoreKeys && c.keys[key]
@@ -366,7 +380,7 @@ func (c *Catalog) createTable(w http.ResponseWriter, ns []string, body []byte, k
 		apiError(w, http.StatusBadRequest, "BadRequestException", fmt.Sprintf("bad table: %v", err))
 		return
 	}
-	k := tableKey(ns, req.Name)
+	k := c.tableKey(ns, req.Name)
 	if t := c.tables[k]; t != nil {
 		if c.replay(key) {
 			writeJSON(w, http.StatusOK, loadResult(t))
@@ -442,7 +456,7 @@ func (c *Catalog) commit(changes []tableChange) (int, string, error) {
 		if ch.Identifier == nil {
 			return http.StatusBadRequest, "BadRequestException", errors.New("a table change names no table")
 		}
-		k := tableKey(ch.Identifier.Namespace, ch.Identifier.Name)
+		k := c.tableKey(ch.Identifier.Namespace, ch.Identifier.Name)
 		old := c.tables[k]
 		var base table.Metadata
 		if old != nil {
@@ -459,7 +473,8 @@ func (c *Catalog) commit(changes []tableChange) (int, string, error) {
 		}
 		t := &tableState{ns: ch.Identifier.Namespace, name: ch.Identifier.Name, meta: meta}
 		if old != nil {
-			t.versions = old.versions
+			// A commit naming the table in another case leaves its name.
+			t.ns, t.name, t.versions = old.ns, old.name, old.versions
 		}
 		t.metaLoc = t.nextMetadataLocation()
 		results = append(results, result{k, t})
@@ -546,7 +561,11 @@ func commitResponse(t *tableState) map[string]any {
 	return map[string]any{"metadata-location": t.metaLoc, "metadata": t.meta}
 }
 
-func tableKey(ns []string, name string) string {
+// tableKey is the key of the table or view ns.name. c.mu is held.
+func (c *Catalog) tableKey(ns []string, name string) string {
+	if c.ignoreCase {
+		name = strings.ToLower(name)
+	}
 	return path.Join(strings.Join(ns, "\x1f"), name)
 }
 

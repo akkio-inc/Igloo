@@ -141,6 +141,8 @@ type Proxy struct {
 
 	// lists are the listings the proxy keeps.
 	lists *listings
+	// names are how the catalog spells its tables' names (see names.go).
+	names *names
 }
 
 // New starts a proxy to the catalog on a random loopback port.
@@ -187,6 +189,7 @@ func New(opts Options) (*Proxy, error) {
 		cancel:  cancel,
 		changes: map[[sha256.Size]byte]*change{},
 		lists:   newListings(opts.ListTTL),
+		names:   newNames(opts.ListTTL),
 	}
 	p.url = "http://" + ln.Addr().String() + "/" + p.secret
 	p.reads = &httputil.ReverseProxy{
@@ -273,6 +276,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sw := &statusWriter{ResponseWriter: w}
+		if r.Method == http.MethodGet {
+			// Before DuckDB has a table it loaded, note whether it asked for
+			// it by another name than the catalog's (see names.go).
+			sw.before = func(status int) {
+				if status == http.StatusOK {
+					p.checkSpelling(r, rest)
+				}
+			}
+		}
 		p.reads.ServeHTTP(sw, r)
 		p.lists.loaded(rest, sw.status)
 		return
@@ -302,22 +314,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// statusWriter notes the status a read was answered with.
+// statusWriter notes the status a read was answered with, and calls before,
+// if set, with it before the answer goes out.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	before func(status int)
 }
 
 func (w *statusWriter) WriteHeader(status int) {
-	if w.status == 0 {
+	if w.status == 0 && status >= http.StatusOK {
 		w.status = status
+		if w.before != nil {
+			w.before(status)
+		}
 	}
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
-		w.status = http.StatusOK
+		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(b)
 }
@@ -389,6 +406,7 @@ func (p *Proxy) begin(r *http.Request, rest string, body []byte) *change {
 			res = p.resolve(c)
 			c.release()
 		}
+		p.names.changed(c.method, c.rest, c.body, res.status)
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		c.res = res

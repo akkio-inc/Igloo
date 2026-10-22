@@ -77,6 +77,7 @@ type Engine struct {
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
 	catMu     sync.RWMutex
 	catLocked atomic.Int64
+	log       *slog.Logger
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -97,7 +98,7 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		return nil, errors.Join(err, connector.Close())
 	}
 
-	e := &Engine{connector: connector, parser: p}
+	e := &Engine{connector: connector, parser: p, log: log}
 	if err := e.setup(ctx, cfg, log, o); err != nil {
 		p.close()
 		err = errors.Join(err, connector.Close())
@@ -185,6 +186,10 @@ func (e *Engine) LocalDatabase() string { return e.local }
 // instance and this lock does not cover it; a listing here may lag such a
 // change by a sync.
 //
+// Once it has the lock, it gives back the catalog's names to the tables
+// that binds named in another case (see respell), before the holder lists
+// anything.
+//
 // It returns the func that releases it, for use with defer:
 //
 //	defer e.CatalogLock()()
@@ -196,6 +201,7 @@ func (e *Engine) LocalDatabase() string { return e.local }
 func (e *Engine) CatalogLock() func() {
 	e.catMu.Lock()
 	e.catLocked.Store(time.Now().UnixNano())
+	e.respell()
 	return func() {
 		e.catLocked.Store(0)
 		e.catMu.Unlock()

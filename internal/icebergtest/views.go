@@ -107,7 +107,7 @@ func (c *Catalog) serveView(w http.ResponseWriter, r *http.Request, p []string, 
 		apiError(w, http.StatusNotFound, "NotFoundException", "no such path")
 		return
 	}
-	k := tableKey(ns, p[3])
+	k := c.tableKey(ns, p[3])
 	v := c.views[k]
 	if v == nil {
 		apiError(w, http.StatusNotFound, "NoSuchViewException", "no such view")
@@ -173,7 +173,7 @@ func (c *Catalog) createView(w http.ResponseWriter, ns []string, body []byte) {
 		apiError(w, http.StatusBadRequest, "BadRequestException", fmt.Sprintf("bad view: %v", err))
 		return
 	}
-	k := tableKey(ns, req.Name)
+	k := c.tableKey(ns, req.Name)
 	if c.views[k] != nil || c.tables[k] != nil {
 		apiError(w, http.StatusConflict, "AlreadyExistsException", "a view or table of the name exists")
 		return
@@ -205,7 +205,7 @@ func (c *Catalog) renameView(w http.ResponseWriter, body []byte) {
 		apiError(w, http.StatusBadRequest, "BadRequestException", err.Error())
 		return
 	}
-	from, to := tableKey(req.Source.Namespace, req.Source.Name), tableKey(req.Destination.Namespace, req.Destination.Name)
+	from, to := c.tableKey(req.Source.Namespace, req.Source.Name), c.tableKey(req.Destination.Namespace, req.Destination.Name)
 	v := c.views[from]
 	switch {
 	case v == nil:

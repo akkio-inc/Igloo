@@ -929,5 +929,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   they count exactly, since a sketch per group is 25 times slower than
   `COUNT(DISTINCT)` with millions of groups; with a few hundred groups
   that takes up to three times as long as before.
+- A table whose name the catalog spells with capitals, such as one copied
+  from Snowflake as `ORDERS`, was listed in whatever case a statement or
+  view had last named it in: once a view read it as `orders`, every replica
+  that loaded the view listed `orders` in `duckdb_tables()`,
+  `information_schema.tables` and `SHOW TABLES`. The catalog finds a table
+  by its name in any case, and the embedded engine names its entry for a
+  table as it was last looked up; the catalog's own name never changed.
+  Igloo now notes, as it loads a table, when it was named otherwise than
+  the catalog spells it, and looks it up again by the catalog's name before
+  anything lists the catalog, so listings always show the catalog's name.
+  Reading a table by its name in any case works as before.
 
 [Unreleased]: https://github.com/akkio-inc/Igloo/commits/main

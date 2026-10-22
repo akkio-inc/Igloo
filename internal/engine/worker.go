@@ -25,7 +25,7 @@ func OpenWorker(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engi
 	if err != nil {
 		return nil, errors.Join(err, connector.Close())
 	}
-	e := &Engine{connector: connector, parser: p}
+	e := &Engine{connector: connector, parser: p, log: log}
 	if err := e.setupWorker(ctx, cfg, log); err != nil {
 		p.close()
 		return nil, errors.Join(err, connector.Close())
