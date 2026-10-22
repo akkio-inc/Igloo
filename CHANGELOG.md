@@ -801,8 +801,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   on the tables go into the first `FLATTEN`'s `ON`, which DuckDB pushes
   down to them, and conditions on the objects' keys into the lists the
   second `FLATTEN` unnests (1.5 s, 1.9 s and 1.4 s, with conditions on the
-  table, the keys and both, became 0.42 s, 0.62 s and 0.44 s); one on the
-  second `FLATTEN`'s elements keeps the objects JSON.
+  table, the keys and both, became 0.42 s, 0.62 s and 0.44 s). A string in
+  such an object reads as itself, conditions on the objects' keys filter
+  the objects, and conditions on a second `FLATTEN`'s elements filter
+  those when the statement reads nothing of that `FLATTEN` but its
+  `VALUE`, which is then all it unnests. Objects that no second `FLATTEN`
+  reads stay structs whatever filters the select, since DuckDB's dependent
+  join then holds the table's columns, as for JSON. Reports' signals,
+  objects of a dimension and a row's string filtered on the strings, took
+  3.9 s for 5 million rows and take 1.2 s, and objects of a dimension and
+  a list whose elements are filtered 3.1 s for 3 million rows and 1.2 s.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

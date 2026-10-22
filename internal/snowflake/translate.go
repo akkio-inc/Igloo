@@ -56,12 +56,14 @@ type translator struct {
 	anon    int
 	// structs holds the FLATTENs that the translation keeps as structs, by
 	// their argument groups, and structReads the reads of their VALUE, by
-	// VALUE's nodes (see collectStructs); structOuts holds what they became,
-	// with their aliases, and folds what the FLATTENs of their keys became
-	// (see structWhere).
+	// VALUE's nodes (see collectStructs); flattenOuts holds what each
+	// FLATTEN became, with its alias, structOuts what those of structs
+	// became, and folds what FLATTENs of their keys became (see
+	// structWhere).
 	structs     map[*node]*structFlatten
 	structReads map[*node]*structFlatten
-	structOuts  map[*node]string
+	flattenOuts map[*node]string
+	structOuts  map[*node]*structOut
 	folds       map[*node]*structFold
 	// grouped holds the APPROX_COUNT_DISTINCT and HLL calls, by their
 	// names' nodes, of selects with GROUP BY (see collectGrouped).
@@ -99,7 +101,8 @@ func Translate(sql string, opts Options) (Result, error) {
 	}
 	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{},
 		names: map[string]int{}, columnNames: map[string]int{}, structs: map[*node]*structFlatten{},
-		structReads: map[*node]*structFlatten{}, structOuts: map[*node]string{}, folds: map[*node]*structFold{}}
+		structReads: map[*node]*structFlatten{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
+		folds: map[*node]*structFold{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true

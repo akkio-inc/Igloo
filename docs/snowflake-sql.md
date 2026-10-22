@@ -152,20 +152,23 @@ JSON and JSON text alike.
   `VALUE` its select reads only by a key (`f.value:k`, `f.value['k']`,
   `GET_PATH(f.value, 'k')`, `GET(f.value, 'k')`, with any cast or path
   after; CTEs that reuse the alias count apart), makes its objects DuckDB
-  structs rather than JSON, so that a
-  later `FLATTEN(INPUT => f.value:items)` unnests an `ARRAY` column's list
-  from the struct without writing it as JSON text, parsing it back or a
-  dependent join: over 29 million elements of 2 million rows' five lists,
-  0.4 s instead of 1.6 s. A `WHERE` there stays out of the joins, where
-  DuckDB would plan dependent joins: its conditions on the tables go into
-  the `ON` of the first `FLATTEN`'s join, which DuckDB pushes down to the
-  tables, and those on the objects' keys into the lists the second
-  `FLATTEN` unnests. Any other read of `VALUE` or a star at that level
-  keeps the objects JSON, and so do a `WHERE` with a condition on the
-  second `FLATTEN`'s elements, a subquery or a select item's alias, a
-  table after the first `FLATTEN`, an `ON` after it, and a `HAVING` on
-  the groups' keys: DuckDB plans a dependent join there, which holds
-  structs of lists at a higher cost than JSON text.
+  structs rather than JSON: a string reads as itself, and a later
+  `FLATTEN(INPUT => f.value:items)` unnests an `ARRAY` column's list from
+  the struct without writing it as JSON text, parsing it back or a
+  dependent join (over 29 million elements of 2 million rows' five lists,
+  0.4 s instead of 1.6 s). A `WHERE` there stays out of the joins: its
+  conditions on the tables go into the `ON` of the first `FLATTEN`'s join,
+  which DuckDB pushes down to the tables, those on the objects' keys filter
+  the objects, and those on a second `FLATTEN`'s elements filter the
+  elements when the statement reads nothing of that `FLATTEN` but its
+  `VALUE`. Any other read of `VALUE`, a star at that level, a subquery that
+  names the alias, or a second `FLATTEN` of it with `OUTER`, `PATH` or a
+  longer path keeps the objects JSON; so do, when a second `FLATTEN` reads
+  them, a `WHERE` that cannot stay out of the joins (a condition on another
+  of the `FLATTEN`s' columns, a subquery or a select item's alias, or a
+  table after the first `FLATTEN`), an `ON` after the `FLATTEN` and a
+  `HAVING` on the groups' keys: DuckDB then plans a dependent join, which
+  holds structs of lists at a higher cost than JSON text.
 
 #### Semi-structured columns
 

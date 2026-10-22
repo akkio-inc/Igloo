@@ -68,17 +68,19 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 		{`[{"name":"n1"},{"name":"n2","tags":["t"]}]`, `{"nested":{"a":{"b":"c"}}}`},
 	}
 	var values []string
+	strs := []string{"'s1'", "''", "NULL", "' s4 '"}
 	for i, d := range docs {
-		values = append(values, fmt.Sprintf("(%d, '%s', '%s')", i+1, d.array, d.object))
+		values = append(values, fmt.Sprintf("(%d, '%s', '%s', %s)", i+1, d.array, d.object, strs[i]))
 	}
-	values = append(values, "(9, NULL, NULL)")
+	values = append(values, "(9, NULL, NULL, NULL)")
 	// t_text holds them as JSON text, as tables loaded from text do; t_json
 	// as JSON, as VARIANT columns and views that parse text do; t_native as
-	// Igloo stores Snowflake's ARRAY and OBJECT.
+	// Igloo stores Snowflake's ARRAY and OBJECT. Each has a column of plain
+	// strings, s, too.
 	for _, stmt := range []string{
-		"CREATE TABLE t_text AS SELECT * FROM (VALUES " + strings.Join(values, ", ") + ") v(id, a, o)",
-		"CREATE TABLE t_json AS SELECT id, CAST(a AS JSON) AS a, CAST(o AS JSON) AS o FROM t_text",
-		"CREATE TABLE t_native AS SELECT id, CAST(a AS VARCHAR[]) AS a, CAST(o AS MAP(VARCHAR, VARCHAR)) AS o FROM t_json",
+		"CREATE TABLE t_text AS SELECT * FROM (VALUES " + strings.Join(values, ", ") + ") v(id, a, o, s)",
+		"CREATE TABLE t_json AS SELECT id, CAST(a AS JSON) AS a, CAST(o AS JSON) AS o, s FROM t_text",
+		"CREATE TABLE t_native AS SELECT id, CAST(a AS VARCHAR[]) AS a, CAST(o AS MAP(VARCHAR, VARCHAR)) AS o, s FROM t_json",
 	} {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -151,8 +153,35 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 			asJSON: `where g.value is not null`},
 		{q: `select t.id, g.index, g.this, v.index, v.value from %[1]s t,
 				table(flatten(input => [object_construct('l', t.a, 'k', 'x'), object_construct('k', 'y')])) g,
-				lateral flatten(input => g.value:l, outer => true) v %[2]s order by 1, 2, 4`, builds: true,
-			asJSON: `where g.value is not null`},
+				lateral flatten(input => g.value:l, outer => true) v order by 1, 2, 4`, builds: true},
+		// Reports' signals: objects of a dimension and a row's string or
+		// other value, filtered by those values, with no FLATTEN after;
+		// objects of a group, a dimension, a name and a metric, filtered by
+		// all of them; and objects of a dimension and a list, whose elements
+		// are filtered.
+		{q: `select cast(get_path(d.value, 'dim') as text) as dim, cast(get_path(d.value, 'name') as text) as name, count(distinct t.id), d.index, d.path
+			from %[1]s as t cross join lateral flatten(input => [object_construct('dim', 'S', 'name', t.s), object_construct('dim', 'FIRST', 'name', t.a[0]::string),
+				object_construct('dim', 'ID', 'name', iff(t.id > 2, 'big', null)), object_construct_keep_null('dim', 'KEPT', 'name', t.s),
+				object_construct('dim', 'ALL', 'name', 'any')]) as d(seq, key, path, index, value, this)
+			where not cast(get_path(d.value, 'name') as text) is null and trim(cast(get_path(d.value, 'name') as text)) <> '' %[2]s
+			group by 1, 2, 4, 5 order by 1, 2, 4`, builds: true,
+			asJSON: `and d.value is not null`},
+		{q: `select iff(cast(get_path(x.value, 'grp') as text) = 'R', 'R', 'I') as grp, cast(get_path(x.value, 'dim') as text) as dim,
+				cast(get_path(x.value, 'name') as text) as name, count(distinct t.id), avg(cast(get_path(x.value, 'metric') as float))
+			from %[1]s as t inner join (select 1 as id union all select 3 union all select 4) as u on u.id = t.id
+			cross join lateral flatten(input => [object_construct('grp', 'R', 'dim', 'S', 'name', t.s),
+				object_construct('grp', 'I', 'dim', 'A', 'name', 'first', 'metric', array_size(t.a)), object_construct('grp', 'I', 'dim', 'B', 'name', 'id', 'metric', t.id - 2)]) as x(seq, key, path, index, value, this)
+			where not cast(get_path(x.value, 'name') as text) is null and trim(cast(get_path(x.value, 'name') as text)) <> ''
+				and (cast(get_path(x.value, 'grp') as text) = 'R' or (cast(get_path(x.value, 'grp') as text) = 'I' and cast(get_path(x.value, 'metric') as float) > 0)) %[2]s
+			group by 1, 2, 3 order by 1, 2, 3`, builds: true,
+			asJSON: `and x.value is not null`},
+		{q: `select cast(get_path(b.value, 'dim') as text) as dim, cast(i.value as text) as name, count(distinct t.id), count(*)
+			from %[1]s as t cross join lateral flatten(input => [object_construct('dim', 'A', 'items', t.a), object_construct('dim', 'O', 'items', t.o),
+				object_construct('dim', 'ACT', 'items', ['active', ''])]) as b(seq, key, path, index, value, this)
+			cross join lateral flatten(input => get_path(b.value, 'items')) as i(seq, key, path, index, value, this)
+			where not cast(i.value as text) is null and trim(cast(i.value as text)) <> '' and t.id <> 3 %[2]s
+			group by 1, 2 order by 1, 2`, builds: true,
+			asJSON: `and b.value is not null`},
 		// CTEs that each flatten objects of their own keys AS g and v.
 		{q: `with a as (select t.id, 'a' as src, g.index as gi, g.value:k::string as k, v.value::string as x from %[1]s t,
 					lateral flatten(input => [object_construct('k', 'x', 'l', t.a), object_construct('l', t.o)]) g,
@@ -181,8 +210,7 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 			asJSON: `and g.value is not null`},
 		{q: `select t.id, v.index, v.value from %[1]s t, lateral flatten(input => [object_construct('l', t.a)]) g,
 				lateral flatten(input => get_path(g.value, 'l[2].y')) v, lateral flatten(input => g.value:l, path => '[3]') w
-				%[2]s order by 1, 2`, builds: true,
-			asJSON: `where g.value is not null`},
+				order by 1, 2`, builds: true},
 		{q: `select t.id, f.key, f.value::string, count(*) over (partition by f.key) from %s t, lateral flatten(input => t.o) f order by 1, 2`},
 		{q: `select t.id, f.index, g.key, g.index, g.value, g.this from %s t, lateral flatten(input => t.a) f, lateral flatten(input => f.value) g order by 1, 2, 3, 4`},
 		{q: `select t.id, f.index, g.value from %s t, lateral flatten(input => t.a) f, lateral flatten(input => f.value:y) g order by 1, 2, 3`},
@@ -281,18 +309,36 @@ func TestFlattenShapes(t *testing.T) {
 		// and a JSON part; a later FLATTEN of a key unnests the struct's,
 		// and their columns are not turned into JSON ahead.
 		{`select g.value:k::string, v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a), object_construct_keep_null('k', 'b', 'l', m.b)]) g, lateral flatten(input => get_path(g.value, 'l')) v`,
-			`unnest([{'_sf_k1': CAST('a' AS VARCHAR), '_sf_l2': CAST(sf_list_part(m.a) AS VARCHAR[]), '_sf_j2': CAST(sf_json_part(m.a) AS JSON)}, ` +
-				`{'_sf_k1': CAST('b' AS VARCHAR), '_sf_l2': CAST(sf_list_part(m.b) AS VARCHAR[]), '_sf_j2': CAST(sf_json_part_keep_null(m.b) AS JSON)}]) AS _sf_value`, `REPLACE`},
+			`unnest([{'_sf_i': CAST(0 AS BIGINT), '_sf_k1': CAST('a' AS VARCHAR), '_sf_l2': CAST(sf_list_part(m.a) AS VARCHAR[]), ` +
+				`'_sf_s2': CAST(sf_string_part(m.a) AS VARCHAR), '_sf_j2': CAST(sf_other_part(m.a) AS JSON)}, {'_sf_i': CAST(1 AS BIGINT), '_sf_k1': CAST('b' AS VARCHAR), ` +
+				`'_sf_l2': CAST(sf_list_part(m.b) AS VARCHAR[]), '_sf_s2': CAST(sf_string_part(m.b) AS VARCHAR), '_sf_j2': CAST(sf_other_part_keep_null(m.b) AS JSON)}]) AS _sf_value`,
+			`REPLACE`},
 		{`select g.value:k::string, v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => get_path(g.value, 'l')) v`,
 			`select g._sf_fields._sf_k1 AS "G.VALUE:K::STRING", v.value from tab m, LATERAL`, `json_extract`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v`,
-			`FROM (SELECT unnest(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH')) AS _sf_value`, `REPLACE`},
+			`FROM (SELECT unnest(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH')) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index)`,
+			`REPLACE`},
+		// Its KEY, PATH, INDEX or THIS read, the last FLATTEN unnests them too.
+		{`select v.index, v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v`,
+			`unnest(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH')) AS _sf_value, unnest(sf_parts_keys(`, ``},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) as g(seq, key, path, index, value, this), lateral flatten(input => g.value:l) as v(a, b, c, i, value, d) order by v.i`,
+			`unnest(sf_parts_indexes(`, ``},
+		// A key's strings, a string's column and any other string a
+		// VARCHAR, read as itself.
+		{`select g.value:n::string, g.value:n, g.value:n = 'x' from tab m, lateral flatten(input => [object_construct('n', m.s), object_construct('n', iff(m.b, 'y', 'z')), object_construct('n', 'w')]) g`,
+			`select sf_fields_string(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1) AS "G.VALUE:N::STRING", sf_fields_json(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1) AS "G.VALUE:N", ` +
+				`sf_fields_string(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1) = 'x'`, ``},
+		{`select g.value:n from tab m, lateral flatten(input => [object_construct('n', m.s), object_construct('n', iff(m.b, 'y', 'z')), object_construct('n', 'w')]) g`,
+			`'_sf_s1': CAST(sf_string_part(CASE WHEN (m.b) THEN 'y' ELSE 'z' END) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(CASE WHEN (m.b) THEN 'y' ELSE 'z' END) AS JSON)}, ` +
+				`{'_sf_i': CAST(2 AS BIGINT), '_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST('w' AS VARCHAR), '_sf_j1': CAST(NULL AS JSON)}`, ``},
 		{`select g.value:l, g.value:l[0]::string, g.value:none from tab m, lateral flatten(input => [object_construct('l', ['x', 'y'], 'n', null), object_construct_keep_null('l', null, 'n', 1)]) g`,
-			`select sf_parts_json(g._sf_fields._sf_l1, g._sf_fields._sf_j1) AS "G.VALUE:L", ` +
-				`json_extract_string(sf_parts_json(g._sf_fields._sf_l1, g._sf_fields._sf_j1), '$[0]') AS "G.VALUE:L[0]::STRING", CAST(NULL AS JSON) AS "G.VALUE:NONE" from`, `json_extract(`},
+			`select sf_fields_json(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1) AS "G.VALUE:L", ` +
+				`json_extract_string(sf_fields_json(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1), '$[0]') AS "G.VALUE:L[0]::STRING", CAST(NULL AS JSON) AS "G.VALUE:NONE" from`, `json_extract(`},
 		{`select g.value:l from tab m, lateral flatten(input => [object_construct('l', ['x', 'y'], 'n', null), object_construct_keep_null('l', null, 'n', 1)]) g`,
-			`{'_sf_l1': CAST(['x', 'y'] AS VARCHAR[]), '_sf_j1': CAST(NULL AS JSON), '_sf_l2': CAST(NULL AS VARCHAR[]), '_sf_j2': CAST(NULL AS JSON)}, ` +
-				`{'_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_j1': CAST(CAST('null' AS JSON) AS JSON), '_sf_l2': CAST(NULL AS VARCHAR[]), '_sf_j2': CAST(coalesce(to_json(1), CAST('null' AS JSON)) AS JSON)}`, ``},
+			`{'_sf_i': CAST(0 AS BIGINT), '_sf_l1': CAST(['x', 'y'] AS VARCHAR[]), '_sf_s1': CAST(NULL AS VARCHAR), '_sf_j1': CAST(NULL AS JSON), ` +
+				`'_sf_l2': CAST(NULL AS VARCHAR[]), '_sf_s2': CAST(NULL AS VARCHAR), '_sf_j2': CAST(NULL AS JSON)}, {'_sf_i': CAST(1 AS BIGINT), '_sf_l1': CAST(NULL AS VARCHAR[]), ` +
+				`'_sf_s1': CAST(NULL AS VARCHAR), '_sf_j1': CAST(CAST('null' AS JSON) AS JSON), '_sf_l2': CAST(NULL AS VARCHAR[]), '_sf_s2': CAST(sf_string_part(1) AS VARCHAR), ` +
+				`'_sf_j2': CAST(sf_expr_part_keep_null(1) AS JSON)}`, ``},
 		{`select g.value:k from tab m, table(flatten(input => array_construct(object_construct('k', 'a')))) as g(seq, key, path, index, value, this)`,
 			`select to_json(g._sf_fields._sf_k1) AS "G.VALUE:K" from`, ``},
 		// VALUE is JSON, which DuckDB computes only where it is read, and
@@ -325,7 +371,7 @@ func TestFlattenShapes(t *testing.T) {
 		{`with a as (select v.value as x, g.value:k::string as k from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v),
 				b as (select v.value as x, g.value:k as k from tab m, lateral flatten(input => [object_construct('l', m.b, 'k', m.n)]) g, lateral flatten(input => g.value:l) v)
 				select * from a union all select * from b`,
-			`sf_parts_json(g._sf_fields._sf_l2, g._sf_fields._sf_j2) as k from tab m, LATERAL`, `unnest([coalesce(`},
+			`sf_fields_json(g._sf_fields._sf_l2, g._sf_fields._sf_s2, g._sf_fields._sf_j2) as k from tab m, LATERAL`, `unnest([coalesce(`},
 		{`with a as (select v.value as x, g.value:k::string as k from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v),
 				b as (select v.value as x, g.value:k as k from tab m, lateral flatten(input => [object_construct('l', m.b, 'k', m.n)]) g, lateral flatten(input => g.value:l) v)
 				select * from a union all select * from b`,
@@ -344,22 +390,27 @@ func TestFlattenShapes(t *testing.T) {
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id > 1`,
 			`) AS "g" ON ((m.id > 1)), LATERAL (SELECT`, `where`},
 		{`select v.value from tab m cross join lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g cross join lateral flatten(input => g.value:l) v where g.value:k = 'a' group by 1`,
-			`FROM (SELECT unnest(sf_parts_values(CASE WHEN (g._sf_fields._sf_k1 = 'a') THEN g._sf_fields._sf_l2 END, CASE WHEN (g._sf_fields._sf_k1 = 'a') THEN g._sf_fields._sf_j2 END, 'BOTH')) AS _sf_value`,
-			`where`},
+			`}], lambda _sf_e: (_sf_e._sf_k1 = 'a'))) AS _sf_value) AS _sf_flatten) AS "g" cross join LATERAL`, `where`},
 		{`select v.value from tab m inner join u on u.id = m.id, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) as g(seq, key, path, index, value, this), lateral flatten(input => get_path(g.value, 'l')) v
 				where m.id between 1 and 9 and (g.value:k = 'a' or m.id = 1) and case when m.a is null and m.id > 0 then false else true end order by 1`,
 			`) AS "g"(seq, key, path, index, value, this) ON ((m.id between 1 and 9) AND (case when m.a is null and m.id > 0 then false else true end)), LATERAL`,
 			`where`},
 		{`select v.value from tab m inner join u on u.id = m.id, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) as g(seq, key, path, index, value, this), lateral flatten(input => get_path(g.value, 'l')) v
 				where m.id between 1 and 9 and (g.value:k = 'a' or m.id = 1)`,
-			`unnest(sf_parts_values(CASE WHEN ((g._sf_fields._sf_k1 = 'a' or m.id = 1)) THEN g._sf_fields._sf_l2 END`, `where`},
+			`}], lambda _sf_e: ((_sf_e._sf_k1 = 'a' or m.id = 1)))) AS _sf_value`, `where`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v where g.value:k = 'a' or m.id > 1`,
-			`CASE WHEN (g._sf_fields._sf_k1 = 'a' or m.id > 1) THEN`, `ON (`},
+			`}], lambda _sf_e: (_sf_e._sf_k1 = 'a' or m.id > 1))) AS _sf_value`, `ON (`},
 		// Other WHEREs, and other filters, keep the objects JSON: DuckDB
 		// joins structs with a dependent join there.
-		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where v.value::string <> 'x'`,
-			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where v.value::string <> 'x' and m.id > 1`,
+			`) AS "g" ON ((m.id > 1)), LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_flatten._sf_key AS "KEY", coalesce(CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END, '') AS "PATH", _sf_flatten._sf_index AS "INDEX", _sf_flatten._sf_value AS "VALUE", CAST(NULL AS JSON) AS "THIS" FROM (SELECT ` +
+				`unnest(list_filter(sf_parts_values(g._sf_fields._sf_l1, g._sf_fields._sf_j1, 'BOTH'), lambda _sf_e: (json_extract_string(_sf_e, '$') <> 'x'))) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key`,
+			`where`},
+		{`select v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v where trim(v.value::string) <> g.value:k`,
+			`lambda _sf_e: (trim(json_extract_string(_sf_e, '$')) <> g._sf_fields._sf_k1))) AS _sf_value`, `where`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id > 1 and v.index > 0`,
+			`unnest([coalesce(`, `_sf_fields`},
+		{`select v.index, v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where v.value::string <> 'x'`,
 			`unnest([coalesce(`, `_sf_fields`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id in (select id from u)`,
 			`unnest([coalesce(`, `_sf_fields`},
@@ -372,13 +423,21 @@ func TestFlattenShapes(t *testing.T) {
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l[0]) v where g.value:l is not null`,
 			`unnest([coalesce(`, `_sf_fields`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v, lateral flatten(input => v.value) w where g.value:l is not null`,
-			`unnest([coalesce(`, `_sf_fields`},
+			`lambda _sf_e: (sf_fields_json(_sf_e._sf_l1, _sf_e._sf_s1, _sf_e._sf_j1) is not null)`, `where`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v, lateral flatten(input => v.value) w where m.id > 1`,
 			`) AS "g" ON ((m.id > 1)), LATERAL`, `where`},
 		{`select g.value:l from tab m, lateral flatten(input => [object_construct('l', m.a)]) g where m.id > 1`,
 			`) AS "g" ON ((m.id > 1))`, `where`},
+		// With no FLATTEN of its keys, any filter leaves the objects
+		// structs: a dependent join holds the tables' columns, as for JSON.
 		{`select g.value:l from tab m, lateral flatten(input => [object_construct('l', m.a)]) g where g.value:l is not null`,
-			`unnest([coalesce(`, `_sf_fields`},
+			`lambda _sf_e: (sf_fields_json(_sf_e._sf_l1, _sf_e._sf_s1, _sf_e._sf_j1) is not null))) AS _sf_value`, `where`},
+		{`select g.value:n from tab m, lateral flatten(input => [object_construct('n', m.s)]) g where g.index > 0 and m.id in (select id from u)`,
+			`where g.index > 0 and m.id in`, ``},
+		{`select g.value:n from tab m, lateral flatten(input => [object_construct('n', m.s)]) g where g.index > 0 and m.id in (select id from u)`,
+			`unnest([{'_sf_i'`, ``},
+		{`select g.value:n from tab m join u on g.value:n = u.n, lateral flatten(input => [object_construct('n', m.s)]) g`, `_sf_fields`, ``},
+		{`select g.value:n, count(*) from tab m, lateral flatten(input => [object_construct('n', m.s)]) g group by 1 having g.value:n <> 'x'`, `_sf_fields`, ``},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g join lateral flatten(input => g.value:l) v on v.index > 0`,
 			`unnest([coalesce(`, `_sf_fields`},
 		{`select v.value from tab m join u on u.id = m.id, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v`,
@@ -446,10 +505,23 @@ func TestFlattenStructsPlan(t *testing.T) {
 			t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
 		}
 	}
+	res, err := Translate(`select cast(get_path(g.value, 'kind') as text), cast(v.value as text), count(distinct m.id) from t as m
+		cross join lateral flatten(input => [object_construct('kind', 'a', 'items', m.a), object_construct('kind', 'b', 'items', m.b)]) as g(seq, key, path, index, value, this)
+		cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)
+		where not cast(v.value as text) is null and trim(cast(v.value as text)) <> '' and g.value:kind <> 'c' and m.id > 0 group by 1, 2`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.SQL, "list_filter(sf_parts_values(") {
+		t.Errorf("the elements are not filtered:\n%s", res.SQL)
+	}
+	if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
+		t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
+	}
 	cte := `select cast(get_path(g.value, 'kind') as text) as kind, cast(v.value as text) as item, m.id from t as m
 		cross join lateral flatten(input => [object_construct('kind', 'all', 'items', ['every']), object_construct_keep_null('kind', 'a', 'items', m.a)]) as g(seq, key, path, index, value, this)
 		cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)`
-	res, err := Translate(`with x as (`+cte+`), y as (`+strings.ReplaceAll(cte, "m.a", "m.b")+`)
+	res, err = Translate(`with x as (`+cte+`), y as (`+strings.ReplaceAll(cte, "m.a", "m.b")+`)
 		select kind, item, count(distinct id) from (select * from x union all select * from y) group by 1, 2`, Options{})
 	if err != nil {
 		t.Fatal(err)

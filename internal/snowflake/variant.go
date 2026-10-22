@@ -47,6 +47,10 @@ type variant struct {
 	// obj, when set, says base is the VALUE of a FLATTEN of objects that
 	// the translation keeps as structs (see structRead).
 	obj *structFlatten
+	// elem, when set, is what the variant reads in place of base: the
+	// element of a lambda that filters a FLATTEN's elements (see
+	// structWhere).
+	elem string
 }
 
 var plainKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -89,6 +93,9 @@ func (v *variant) render() string {
 		return s
 	}
 	base := v.base.String()
+	if v.elem != "" {
+		base = v.elem
+	}
 	extract, extractString := "json_extract(", "json_extract_string("
 	if v.column {
 		extract, extractString = "sf_get(", "sf_get_string("

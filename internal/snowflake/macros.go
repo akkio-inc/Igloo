@@ -215,6 +215,22 @@ var macros = []string{
 	`CREATE OR REPLACE TEMP MACRO sf_parts_indexes(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_indexes(j, m)
 		WHEN m <> 'OBJECT' THEN range(CAST(len(l) AS BIGINT)) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_parts_this(l, j, m) AS repeat([sf_parts_json(l, j)], len(sf_parts_values(l, j, m)))`,
+	// A key's value as three parts: a list of strings l as above, a string s,
+	// which a VARCHAR is in OBJECT_CONSTRUCT, and JSON j otherwise, of a
+	// column as sf_to_json takes it (sf_other_part) or of any other value
+	// as to_json does (sf_expr_part). sf_fields_json and sf_fields_string
+	// read the three as JSON and as text.
+	`CREATE OR REPLACE TEMP MACRO sf_string_part(x) AS CASE WHEN typeof(x) = 'VARCHAR' THEN CAST(x AS VARCHAR) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_other_part(x) AS CASE WHEN typeof(x) NOT IN ('VARCHAR[]', 'VARCHAR') THEN sf_to_json(x) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_other_part_keep_null(x) AS CASE
+		WHEN typeof(x) NOT IN ('VARCHAR[]', 'VARCHAR') THEN coalesce(sf_to_json(x), CAST('null' AS JSON))
+		WHEN x IS NULL THEN CAST('null' AS JSON) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_expr_part(x) AS CASE WHEN typeof(x) <> 'VARCHAR' THEN to_json(x) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_expr_part_keep_null(x) AS CASE
+		WHEN typeof(x) <> 'VARCHAR' THEN coalesce(to_json(x), CAST('null' AS JSON))
+		WHEN x IS NULL THEN CAST('null' AS JSON) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_fields_json(l, s, j) AS CASE WHEN s IS NOT NULL THEN to_json(s) ELSE sf_parts_json(l, j) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_fields_string(l, s, j) AS coalesce(s, json_extract_string(sf_parts_json(l, j), '$'))`,
 }
 
 // Macros returns the statements that define, in a session, the macros
