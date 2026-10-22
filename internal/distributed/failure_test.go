@@ -138,12 +138,12 @@ func TestWorkerRefusesStrangers(t *testing.T) {
 
 	w := h.workers[0]
 	for _, path := range []string{"/etc/passwd", h.dir + "/warehouse/../secret.parquet", "s3://elsewhere/x.parquet"} {
-		_, err := w.viewStatement(viewDef{Name: "__igloo_t0", Columns: []Column{{Name: "a", Type: "INTEGER", ID: 1}}, Files: []string{path}})
+		_, err := w.viewStatement(viewDef{Name: "__igloo_t0", Columns: []Column{{Name: "a", Type: "INTEGER", ID: 1}}, Files: []string{path}}, "")
 		if err == nil {
 			t.Errorf("view over %s was accepted", path)
 		}
 	}
-	if _, err := w.viewStatement(viewDef{Name: "x; DROP TABLE y", Columns: []Column{{Name: "a", Type: "INTEGER", ID: 1}}}); err == nil {
+	if _, err := w.viewStatement(viewDef{Name: "x; DROP TABLE y", Columns: []Column{{Name: "a", Type: "INTEGER", ID: 1}}}, ""); err == nil {
 		t.Error("a view with a bad name was accepted")
 	}
 }

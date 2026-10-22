@@ -274,7 +274,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		switch {
 		case in.Table != nil && !in.Split:
 			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
-			def.Files = paths(e.files[in.Table.key()])
+			def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
 			whole[in.View] = def
 		case in.Exchange != nil && !in.Partitioned:
 			x := e.exchanges[in.Exchange.ID]
@@ -302,7 +302,8 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				for _, f := range share {
 					bytes += f.Size
 				}
-				task.Views = append(task.Views, viewDef{Name: in.View, Columns: in.Table.Columns, Files: paths(share), Rows: rowCount(share)})
+				task.Views = append(task.Views, viewDef{Name: in.View, Columns: in.Table.Columns, Files: paths(share), Rows: rowCount(share),
+					Deletes: deletesOf(share)})
 			case in.Exchange != nil && in.Partitioned:
 				x := e.exchanges[in.Exchange.ID]
 				// The hash spreads rows evenly over the partitions.

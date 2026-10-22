@@ -10,7 +10,8 @@
 #   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
 #   - tables with lists, maps and structs run distributed, unnests and
-#     Snowflake's FLATTEN of them too, and so do views over them,
+#     Snowflake's FLATTEN of them too, and so do views over them and
+#     tables with deleted rows,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
@@ -328,6 +329,14 @@ check_distributed "a view that joins a small table" view_join \
 check_distributed "FLATTEN over a view" view_flatten \
   "SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS n FROM mirror.v_people_latest p,
    LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%v_people_latest%sf_flatten_values%'
+
+echo "deleted rows"
+# DELETE and UPDATE write position delete files, which workers apply.
+psql_admin -c "DELETE FROM people WHERE person_id % 5 = 0" \
+  -c "UPDATE people SET segments = ['UPDATED'] WHERE person_id % 7 = 0" >/dev/null
+check_distributed "a table with deleted and updated rows" deleted "$nested_query"
+check_distributed "a table another session deleted rows of" iso_deleted \
+  "SELECT o_orderstatus, count(*), sum(o_totalprice) FROM iso GROUP BY 1 ORDER BY 1"
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table

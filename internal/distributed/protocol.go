@@ -65,6 +65,28 @@ type viewDef struct {
 	// in 8 files for 8,000 and ordered TPC-H Q5's joins so that it ran eight
 	// times as long.
 	Rows int64 `json:"rows,omitempty"`
+	// Deletes are the delete files of those of Files that have any, which
+	// the worker applies.
+	Deletes []fileDeletes `json:"deletes,omitempty"`
+}
+
+// fileDeletes are the delete files of one data file of a view.
+type fileDeletes struct {
+	File string `json:"file"`
+	// Rows is the data file's record count, deleted rows included.
+	Rows int64 `json:"rows,omitempty"`
+	Deletes
+}
+
+// deletesOf returns the delete files of files, for a view over them.
+func deletesOf(files []File) []fileDeletes {
+	var out []fileDeletes
+	for _, f := range files {
+		if f.Deletes != nil {
+			out = append(out, fileDeletes{File: f.Path, Rows: f.Rows, Deletes: *f.Deletes})
+		}
+	}
+	return out
 }
 
 // taskResult heads a task's response.

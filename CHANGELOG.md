@@ -311,6 +311,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Views run distributed: a view reads as its query, its names resolved as
   in the view, so views that pass a large table through, filter it or join
   small tables to it distribute as their queries do.
+- Tables with rows deleted or updated by `DELETE`, `UPDATE` and `MERGE`
+  run distributed without waiting for maintenance: workers apply the
+  position delete files those write.
 
 ### Tools and integrations
 

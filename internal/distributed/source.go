@@ -40,6 +40,16 @@ type File struct {
 	Size int64  `json:"size"`
 	// Rows is the file's record count.
 	Rows int64 `json:"rows"`
+	// Deletes, if set, are the delete files that apply to it.
+	Deletes *Deletes `json:"deletes,omitempty"`
+}
+
+// Deletes are the delete files that apply to a data file, as the scan's
+// planning matched them to it by partition and sequence number.
+type Deletes struct {
+	// Positions are position delete files: Parquet files whose file_path
+	// and pos columns list the deleted rows of this and other data files.
+	Positions []string `json:"positions,omitempty"`
 }
 
 // Iceberg is the Source for Igloo's Iceberg catalog. Every statement loads
@@ -152,10 +162,10 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	if snap.Summary != nil {
 		props = snap.Summary.Properties
 	}
-	for _, k := range []string{"total-delete-files", "total-position-deletes", "total-equality-deletes"} {
-		if n, _ := strconv.ParseInt(props[k], 10, 64); n > 0 && t.Unsupported == "" {
-			t.Unsupported = "it has delete files; table maintenance merges them"
-		}
+	// Workers apply position deletes (see Files); equality deletes keep the
+	// table on one machine until maintenance merges them.
+	if n, _ := strconv.ParseInt(props["total-equality-deletes"], 10, 64); n > 0 && t.Unsupported == "" {
+		t.Unsupported = "it has equality delete files; table maintenance merges them"
 	}
 	if size, err := strconv.ParseInt(props["total-files-size"], 10, 64); err == nil {
 		t.Bytes = size
@@ -195,13 +205,26 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	}
 	files = make([]File, 0, len(tasks))
 	for _, task := range tasks {
-		if len(task.DeleteFiles)+len(task.EqualityDeleteFiles)+len(task.DeletionVectorFiles) > 0 {
-			return nil, unsupported("%s has delete files", t)
+		switch {
+		case len(task.EqualityDeleteFiles) > 0:
+			return nil, unsupported("%s has equality delete files", t)
+		case len(task.DeletionVectorFiles) > 0:
+			return nil, unsupported("%s has deletion vectors", t)
 		}
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
-		files = append(files, File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes(), Rows: task.File.Count()})
+		f := File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes(), Rows: task.File.Count()}
+		for _, d := range task.DeleteFiles {
+			if format := strings.ToUpper(string(d.FileFormat())); format != "PARQUET" {
+				return nil, unsupported("%s has %s delete files", t, format)
+			}
+			if f.Deletes == nil {
+				f.Deletes = &Deletes{}
+			}
+			f.Deletes.Positions = append(f.Deletes.Positions, d.FilePath())
+		}
+		files = append(files, f)
 	}
 
 	s.mu.Lock()

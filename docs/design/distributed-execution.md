@@ -285,6 +285,20 @@ coordinator. (iceberg-go gives every table it compacts a name mapping, but
 its files have field IDs, so the mapping alone does not keep a table on
 one machine.)
 
+Rows deleted by position delete files, which Igloo's `UPDATE`, `DELETE`
+and `MERGE` write, are left out by the workers. The scan's planning
+matches delete files to data files (by partition and sequence number), and
+each task lists the delete files of its data files. The worker reads the
+`file_path` and `pos` columns of those files into a temporary table of the
+deleted rows of its own data files, and its view reads files that have
+deletes with each row's file name and position (`filename`,
+`file_row_number`), leaving out the deleted ones by an anti join; files
+without deletes read as before. A delete file may spell a data file's path
+otherwise than the table's metadata, as after a migration from another
+engine; paths are compared as `deletefiles.Canonical` spells them, and a
+delete file deletes rows only of the data files the planning matched it
+to.
+
 Nested columns (lists, maps and structs) are found in each file by their
 field IDs too, but DuckDB finds the fields nested in them by name, case
 aside, and a list's element and a map's key and value by where they are.
@@ -578,7 +592,9 @@ fractions are indicative only.
   zones and `integer_division`; files written under older schemas
   (renamed, added, dropped and re-added, widened columns, and struct
   fields added, renamed and re-added); lists, maps and structs, grouped,
-  filtered and returned; a worker that
+  filtered and returned; position deletes of one data file and of a
+  partition's, paths spelled otherwise, and delete files that apply to
+  other data files only; a worker that
   dies mid-task or is gone, every worker failing (the statement runs on
   the coordinator), cancellation and errors in the data; and, through the
   PostgreSQL protocol (`internal/pgwire`), grants, parameters and
@@ -709,9 +725,10 @@ reports the cost per query on the EC2 runs.
   credentials that reach them; encrypting them with a per-statement key
   would protect them from holders of the warehouse's storage keys, who can
   read the tables anyway.
-- **Deletes.** Tables with position deletes, equality deletes or deletion
-  vectors run on one machine until maintenance merges them (hourly).
-  Applying position deletes on workers is straightforward future work.
+- **Deletes.** Workers apply position delete files (see
+  [Running it](#running-it)); tables with equality deletes or deletion
+  vectors, which only other engines write, run on one machine until
+  maintenance merges them (hourly).
 - **Files without identity-partition columns.** The Iceberg spec lets a
   data file omit a column that an identity partition holds, to be read from
   the file's partition value. Workers would read such a column as `NULL`.

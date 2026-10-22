@@ -186,7 +186,7 @@ func TestSchemaEvolution(t *testing.T) {
 		t.Errorf("lineitem's files are not read by name: %v", err)
 	}
 	// DuckDB is told the row count the coordinator knows.
-	if stmt, err := w.viewStatement(viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{b}, Rows: 2000}); err != nil ||
+	if stmt, err := w.viewStatement(viewDef{Name: "__igloo_t0", Columns: tbl.Columns, Files: []string{b}, Rows: 2000}, ""); err != nil ||
 		!strings.Contains(stmt, "explicit_cardinality = 2000") {
 		t.Errorf("a view of 2000 rows: %s, %v", stmt, err)
 	}

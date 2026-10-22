@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -271,7 +273,7 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	}
 	start := time.Now()
 	var byID []string
-	for _, v := range req.Views {
+	for i, v := range req.Views {
 		if !v.ByName && len(v.Files) > 0 {
 			if v.ByName, err = w.readByName(ctx, conn, v); err != nil {
 				return "", nil, err
@@ -280,7 +282,14 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 				byID = append(byID, v.Name)
 			}
 		}
-		stmt, err := w.viewStatement(v)
+		deleted := ""
+		if len(v.Deletes) > 0 {
+			deleted = fmt.Sprintf("__igloo_deleted_%d", i)
+			if err := w.deletedRows(ctx, conn, v, deleted); err != nil {
+				return "", nil, err
+			}
+		}
+		stmt, err := w.viewStatement(v, deleted)
 		if err != nil {
 			return "", nil, err
 		}
@@ -840,8 +849,10 @@ func nestedType(t string) bool {
 // for files that readByName found to name the table's columns, and for
 // shuffled files. Paths are never read as Hive partitions, and DuckDB is
 // told how many rows the files hold when the coordinator knows. A table
-// without files is empty.
-func (w *Worker) viewStatement(v viewDef) (string, error) {
+// without files is empty. Files with deletes leave out the rows listed in
+// deleted, a table of (f, r): a file as the view reads it, and a row's
+// position in it (see deletedRows).
+func (w *Worker) viewStatement(v viewDef, deleted string) (string, error) {
 	if !strings.HasPrefix(v.Name, "__igloo_") {
 		return "", fmt.Errorf("view name %q", v.Name)
 	}
@@ -855,34 +866,155 @@ func (w *Worker) viewStatement(v viewDef) (string, error) {
 		}
 		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT " + strings.Join(cols, ", ") + " WHERE false", nil
 	}
-	files := make([]string, len(v.Files))
-	for i, f := range v.Files {
+	for _, f := range v.Files {
 		if !w.allowed(f) {
 			return "", fmt.Errorf("file %s is outside the warehouse", f)
 		}
-		files[i] = quoteLiteral(f)
 	}
-	options := "hive_partitioning = false"
-	if v.Rows > 0 {
-		options += ", explicit_cardinality = " + strconv.FormatInt(v.Rows, 10)
+	var schema []string
+	if !v.ByName {
+		for _, c := range v.Columns {
+			if c.ID <= 0 {
+				return "", fmt.Errorf("column %s of %s has no field ID", c.Name, v.Name)
+			}
+			schema = append(schema, fmt.Sprintf("%d: {name: %s, type: %s, default_value: NULL}", c.ID, quoteLiteral(c.Name), quoteLiteral(c.Type)))
+		}
 	}
-	if v.ByName {
+	// scan selects the view's columns from files, of rows rows, with more
+	// read_parquet options.
+	scan := func(files []string, rows int64, more string) string {
+		quoted := make([]string, len(files))
+		for i, f := range files {
+			quoted[i] = quoteLiteral(f)
+		}
+		options := "hive_partitioning = false"
+		if rows > 0 {
+			options += ", explicit_cardinality = " + strconv.FormatInt(rows, 10)
+		}
+		if !v.ByName {
+			options = "schema = MAP {" + strings.Join(schema, ", ") + "}, " + options
+		}
 		cols := make([]string, len(v.Columns))
 		for i, c := range v.Columns {
-			cols[i] = "CAST(" + quoteIdent(c.Name) + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
+			cols[i] = "__d." + quoteIdent(c.Name)
+			if v.ByName {
+				cols[i] = "CAST(" + cols[i] + " AS " + c.Type + ") AS " + quoteIdent(c.Name)
+			}
 		}
-		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT " + strings.Join(cols, ", ") +
-			" FROM read_parquet([" + strings.Join(files, ", ") + "], " + options + ")", nil
+		return "SELECT " + strings.Join(cols, ", ") + " FROM read_parquet([" + strings.Join(quoted, ", ") + "], " +
+			options + more + ") AS __d"
 	}
-	schema := make([]string, len(v.Columns))
-	for i, c := range v.Columns {
-		if c.ID <= 0 {
-			return "", fmt.Errorf("column %s of %s has no field ID", c.Name, v.Name)
+	if deleted == "" {
+		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS " + scan(v.Files, v.Rows, ""), nil
+	}
+
+	// Files without deletes are read as they are; the others with each
+	// row's file and position, which the deleted rows are left out by.
+	for _, c := range v.Columns {
+		if strings.EqualFold(c.Name, "file_row_number") || strings.EqualFold(c.Name, "__igloo_file") {
+			return "", unsupported("%s has a column called %s, and delete files", v.Name, c.Name)
 		}
-		schema[i] = fmt.Sprintf("%d: {name: %s, type: %s, default_value: NULL}", c.ID, quoteLiteral(c.Name), quoteLiteral(c.Type))
 	}
-	return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT * FROM read_parquet([" + strings.Join(files, ", ") +
-		"], schema = MAP {" + strings.Join(schema, ", ") + "}, " + options + ")", nil
+	withDeletes := map[string]int64{}
+	for _, d := range v.Deletes {
+		withDeletes[d.File] = d.Rows
+	}
+	var plain, other []string
+	plainRows, otherRows := v.Rows, int64(0)
+	for _, f := range v.Files {
+		rows, ok := withDeletes[f]
+		if !ok {
+			plain = append(plain, f)
+			continue
+		}
+		other = append(other, f)
+		otherRows += rows
+		plainRows -= rows
+	}
+	if v.Rows == 0 || otherRows == 0 {
+		plainRows, otherRows = 0, 0
+	}
+	var parts []string
+	if len(plain) > 0 {
+		parts = append(parts, scan(plain, max(plainRows, 0), ""))
+	}
+	if len(other) > 0 {
+		parts = append(parts, scan(other, otherRows, ", filename = '__igloo_file', file_row_number = true")+
+			" ANTI JOIN "+quoteIdent(deleted)+" AS __x ON __x.f = __d.__igloo_file AND __x.r = __d.file_row_number")
+	}
+	return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS " + strings.Join(parts, " UNION ALL "), nil
+}
+
+// deletedRows creates the temporary table name of the rows that the
+// position delete files of v's files delete: (f, r), a data file as the
+// view reads it, and the position of a deleted row in it. A position delete
+// file lists the rows it deletes by the path of their data file, which it
+// may spell otherwise than the table's metadata, as after a migration from
+// another engine; the paths are compared as deletefiles.Canonical spells
+// them. Each delete file deletes rows only of the data files it applies
+// to, as the scan's planning matched them.
+func (w *Worker) deletedRows(ctx context.Context, conn *duckdb.Conn, v viewDef, name string) error {
+	inView := map[string]bool{}
+	for _, f := range v.Files {
+		inView[f] = true
+	}
+	// The data files of the view each delete file applies to.
+	applies := map[string][]string{}
+	for _, d := range v.Deletes {
+		if !inView[d.File] {
+			return fmt.Errorf("deletes of %s, which is not a file of %s", d.File, v.Name)
+		}
+		for _, p := range d.Positions {
+			if !w.allowed(p) {
+				return fmt.Errorf("file %s is outside the warehouse", p)
+			}
+			if !slices.Contains(applies[p], d.File) {
+				applies[p] = append(applies[p], d.File)
+			}
+		}
+	}
+	files := slices.Sorted(maps.Keys(applies))
+	exec := func(stmt string) error {
+		_, err := conn.ExecContext(ctx, stmt, nil)
+		return err
+	}
+	if len(files) == 0 {
+		return exec("CREATE TEMP TABLE " + quoteIdent(name) + " (f VARCHAR, r BIGINT)")
+	}
+	quoted := make([]string, len(files))
+	for i, f := range files {
+		quoted[i] = quoteLiteral(f)
+	}
+	read := "read_parquet([" + strings.Join(quoted, ", ") + "], filename = '__igloo_delete_file', hive_partitioning = false, union_by_name = true)"
+
+	// The data files each delete file names, as it spells them.
+	rows, err := conn.QueryContext(ctx, "SELECT DISTINCT __igloo_delete_file, file_path FROM "+read, nil)
+	if err != nil {
+		return fmt.Errorf("read position delete files: %w", err)
+	}
+	var mapping []string
+	dest := make([]driver.Value, 2)
+	for {
+		if err := rows.Next(dest); err != nil {
+			_ = rows.Close()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("read position delete files: %w", err)
+		}
+		dfile, _ := dest[0].(string)
+		path, _ := dest[1].(string)
+		for _, data := range applies[dfile] {
+			if deletefiles.Canonical(path) == deletefiles.Canonical(data) {
+				mapping = append(mapping, "("+quoteLiteral(dfile)+", "+quoteLiteral(path)+", "+quoteLiteral(data)+")")
+			}
+		}
+	}
+	if len(mapping) == 0 {
+		return exec("CREATE TEMP TABLE " + quoteIdent(name) + " (f VARCHAR, r BIGINT)")
+	}
+	return exec("CREATE TEMP TABLE " + quoteIdent(name) + " AS SELECT m.data AS f, CAST(p.pos AS BIGINT) AS r FROM " + read +
+		" AS p JOIN (VALUES " + strings.Join(mapping, ", ") + ") AS m(dfile, path, data) ON p.__igloo_delete_file = m.dfile AND p.file_path = m.path")
 }
 
 // allowed reports whether a data file lies under the warehouse or an
