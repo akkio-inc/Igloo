@@ -382,11 +382,11 @@ What Igloo cannot reproduce exactly, and what it does instead.
   counting exactly takes up to three times as long as DuckDB's
   approximation (0.8 s rather than 0.24 s for 270 groups of 37 million
   rows).
-- A statement whose translation calls one of the `sf_` macros (`DATEADD`,
-  `DATE_TRUNC`, `TO_DATE`, `TIME_SLICE` and others that keep a date's type)
-  runs on one machine: [distributed
-  execution](distributed-execution.md#what-runs-distributed) does not
-  split statements that call macros.
+- Statements whose translations call the `sf_` macros (`FLATTEN`,
+  `DATEADD`, `DATE_TRUNC`, `TO_DATE`, `TIME_SLICE` and others) run on
+  [workers](distributed-execution.md#what-runs-distributed) like any
+  other: workers define the same macros. A session that redefines one of
+  them runs such statements on one machine.
 
 **Names and catalog**
 
