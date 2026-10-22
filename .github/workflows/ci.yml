@@ -6,6 +6,8 @@ on:
     branches: [main]
   # The release workflow runs these checks before publishing anything.
   workflow_call:
+  # To run them on a branch by hand, as when a push's run never started.
+  workflow_dispatch:
 
 permissions:
   contents: read
