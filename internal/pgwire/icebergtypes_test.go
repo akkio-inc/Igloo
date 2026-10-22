@@ -128,7 +128,7 @@ func TestSemiStructuredIcebergColumns(t *testing.T) {
 		WHERE attrelid = 'sf_types'::regclass AND attnum > 0`), "a json, o json, v text, s json, st json, m json")
 	check(query(conn, `SELECT a, o, st FROM sf_types`), `["x","1","{\"k\":\"v\"}"]|{"a":"1","b":"c"}|{"city":"Paris","zip":75001}`)
 	mustExec(t, sf, `create table sf_ctas as select array_construct('a', 'b') as a, parse_json('{"k":[1]}') as v, object_construct('x', 1) as o`)
-	check(types("sf_ctas"), "a string, v string, o string")
+	check(types("sf_ctas"), "a list<string>, v string, o map<string, string>")
 	check(query(sf, `select a[1]::string, v:k[0]::int, o:x::int from sf_ctas`), "b|1|1")
 }
 

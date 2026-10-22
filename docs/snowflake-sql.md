@@ -167,10 +167,13 @@ which compares, casts and sums as the number (see [known
 differences](#known-differences)). A `VARIANT` column, or JSON text in any
 `VARCHAR` column, reads as the JSON it holds.
 
-`CREATE TABLE ... AS SELECT` of semi-structured values (`ARRAY_AGG(...)`,
-`OBJECT_CONSTRUCT(...)`, `PARSE_JSON(...)`) makes `VARCHAR` columns of
-their JSON text, as for `VARIANT`; cast to `ARRAY(VARCHAR)` or
-`MAP(VARCHAR, VARCHAR)` in the `SELECT` for lists and maps.
+`CREATE TABLE ... AS SELECT` makes `ARRAY` and `OBJECT` columns of what is
+known to be one: `ARRAY_AGG`, `ARRAY_CONSTRUCT`, `[...]`, `SPLIT`,
+`::ARRAY` and the other functions that return an `ARRAY`, and
+`OBJECT_CONSTRUCT`, `OBJECT_AGG`, `{...}` and `::OBJECT`, as columns of the
+query's `SELECT` (not of a `UNION`'s). Any other semi-structured value,
+`PARSE_JSON(...)` among them, makes a `VARIANT` column, the JSON text of its
+values; cast it to `ARRAY` or `OBJECT` for a list or a map.
 
 ### Functions
 

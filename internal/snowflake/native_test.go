@@ -109,6 +109,9 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 				object_construct_keep_null('facet_type', 'array', 'facet_values', t.a)]) g,
 			lateral flatten(input => get_path(g.value, 'facet_values')) v order by 1, 2, 3`, builds: true},
 		{q: `select t.id, f.key, f.value::string, count(*) over (partition by f.key) from %s t, lateral flatten(input => t.o) f order by 1, 2`},
+		{q: `select t.id, f.index, g.key, g.index, g.value, g.this from %s t, lateral flatten(input => t.a) f, lateral flatten(input => f.value) g order by 1, 2, 3, 4`},
+		{q: `select t.id, f.index, g.value from %s t, lateral flatten(input => t.a) f, lateral flatten(input => f.value:y) g order by 1, 2, 3`},
+		{q: `select id, (select count(*) from table(flatten(input => s.a)) f) from %s s order by id`},
 	} {
 		want := nativeRows(t, conn, fmt.Sprintf(c.q, "t_json"))
 		got := nativeRows(t, conn, fmt.Sprintf(c.q, "t_native"))
@@ -183,6 +186,12 @@ func TestSemiStructuredColumnTypes(t *testing.T) {
 			`SELECT CAST(sf_json(x) AS VARCHAR[]) AS "A", CAST(sf_get(v, '$.items') AS DECIMAL(38,0)[]) AS "B", CAST(sf_json(x) AS MAP(VARCHAR, BIGINT)) AS "C" FROM t`},
 		{`SELECT x::ARRAY AS a, CAST(x AS OBJECT) AS o, PARSE_JSON(s)::VARIANT AS v FROM t`,
 			`SELECT sf_to_json(x) AS "A", sf_to_json(x) AS "O", to_json(json(s)) AS "V" FROM t`},
+		{`CREATE TABLE c AS SELECT ARRAY_AGG(x) AS a, OBJECT_CONSTRUCT('k', x) o, PARSE_JSON(s) AS v, [x] AS l, x::ARRAY AS xa, 1 AS n FROM t GROUP BY s`,
+			`CREATE TABLE c AS SELECT CAST(coalesce(to_json(list(sf_to_json(x)) FILTER (WHERE sf_to_json(x) IS NOT NULL)), CAST('[]' AS JSON)) AS VARCHAR[]) AS a, ` +
+				`CAST(to_json(map_from_entries(list_sort(list_filter([{'k': CAST('k' AS VARCHAR), 'v': to_json(sf_to_json(x))}], lambda e: e.v IS NOT NULL)))) AS MAP(VARCHAR, VARCHAR)) o, ` +
+				`json(s) AS v, CAST(json_array(sf_to_json(x)) AS VARCHAR[]) AS l, CAST(sf_to_json(x) AS VARCHAR[]) AS xa, 1 AS n FROM t GROUP BY s`},
+		{`CREATE TABLE c AS SELECT ARRAY_CONSTRUCT(1) AS a UNION ALL SELECT ARRAY_CONSTRUCT(2)`,
+			`CREATE TABLE c AS SELECT json_array(1) AS a UNION ALL SELECT json_array(2)`},
 	} {
 		if got := translate(t, c.in).SQL; got != c.want {
 			t.Errorf("%s\n got %s\nwant %s", c.in, got, c.want)

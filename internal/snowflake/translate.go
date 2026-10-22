@@ -727,7 +727,79 @@ func (t *translator) createTable(nodes []*node, idx []int, k int, drop map[int]b
 	if err := t.tableClauses(nodes, idx, j, drop); err != nil {
 		return nil, "", err
 	}
-	return t.expressions(dropNodes(nodes, drop))
+	out, cmd, err := t.expressions(dropNodes(nodes, drop))
+	if err == nil && cmd == "" {
+		out = semiColumns(out)
+	}
+	return out, cmd, err
+}
+
+// semiColumns casts the columns of CREATE TABLE ... AS that are an ARRAY
+// or an OBJECT, as the translations of ARRAY_AGG, OBJECT_CONSTRUCT, [...]
+// and the like are, to the types of such columns (a list and a map of
+// strings), so the table has them as Snowflake's would; the translations
+// are JSON, which Iceberg tables would hold as text. Only the columns of a
+// query's one SELECT are known.
+func semiColumns(nodes []*node) []*node {
+	idx := sig(nodes)
+	as, sel := -1, -1
+	for k, i := range idx {
+		switch w := nodes[i].word(); {
+		case w == "AS" && as < 0:
+			as = k
+		case w == "SELECT" && as >= 0 && sel < 0:
+			sel = k
+		case (w == "UNION" || w == "INTERSECT" || w == "EXCEPT" || w == "MINUS") && sel >= 0:
+			return nodes
+		}
+	}
+	if sel < 0 {
+		return nodes
+	}
+	start := idx[sel] + 1
+	if k := nextSig(nodes, start-1); k >= 0 && (nodes[k].word() == "DISTINCT" || nodes[k].word() == "ALL") {
+		start = k + 1
+	}
+	end := len(nodes)
+	for k := start; k < len(nodes); k++ {
+		switch nodes[k].word() {
+		case "FROM", "WHERE", "GROUP", "HAVING", "QUALIFY", "WINDOW", "ORDER", "LIMIT":
+			end = k
+		}
+		if end < len(nodes) {
+			break
+		}
+	}
+	// The items, between commas (which resultNames writes as raw text).
+	comma := func(n *node) bool { return n.isOp(",") || n.kind == kRaw && strings.TrimSpace(n.text) == "," }
+	itemStart := start
+	for k := start; k <= end; k++ {
+		if k < end && !comma(nodes[k]) {
+			continue
+		}
+		item := nodes[itemStart:k]
+		itemStart = k + 1
+		ii := sig(item)
+		exprEnd := len(item)
+		switch last := len(ii) - 1; {
+		case len(ii) >= 3 && item[ii[last-1]].word() == "AS":
+			exprEnd = ii[last-1]
+		case len(ii) == 2 && (item[ii[last]].kind == kWord || item[ii[last]].kind == kQuoted):
+			exprEnd = ii[last] // a bare alias
+		}
+		e := sig(item[:exprEnd])
+		if len(e) != 1 {
+			continue
+		}
+		n := item[e[0]]
+		switch n.semi {
+		case 'A':
+			item[e[0]] = seq([]*node{n}, raw("CAST("), n, raw(" AS "+arrayColumn+")"))
+		case 'O':
+			item[e[0]] = seq([]*node{n}, raw("CAST("), n, raw(" AS "+objectColumn+")"))
+		}
+	}
+	return nodes
 }
 
 // tableClauses marks the options after a table's or view's columns that

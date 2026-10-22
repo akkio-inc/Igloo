@@ -45,7 +45,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`MAP(VARCHAR, VARCHAR)`), each element as Snowflake's `TO_VARCHAR`
   writes it, as Snowflake converts them to `ARRAY(VARCHAR)` and
   `MAP(VARCHAR, VARCHAR)`; structured `ARRAY(type)`, `OBJECT(name type,
-  ...)` and `MAP(type, type)` are lists, structs and maps of their types.
+  ...)` and `MAP(type, type)` are lists, structs and maps of their types,
+  and `CREATE TABLE ... AS` makes `ARRAY` and `OBJECT` columns of
+  `ARRAY_AGG`, `OBJECT_CONSTRUCT` and the like.
   Paths, `FLATTEN`, `GET`, `TO_JSON`, `OBJECT_CONSTRUCT`, casts and the
   other semi-structured functions read them as Snowflake's values, objects
   inside arrays included, and read JSON text as before; masking policies

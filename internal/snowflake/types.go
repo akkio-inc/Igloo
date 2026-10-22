@@ -28,6 +28,17 @@ type sqlType struct {
 	column string
 }
 
+// semi is 'A' for ARRAY and 'O' for OBJECT (see node.semi).
+func (t sqlType) semi() byte {
+	switch t.column {
+	case arrayColumn:
+		return 'A'
+	case objectColumn:
+		return 'O'
+	}
+	return 0
+}
+
 // columnType is DuckDB's type for a column of t.
 func (t sqlType) columnType() string {
 	if t.column != "" {

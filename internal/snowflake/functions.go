@@ -262,9 +262,22 @@ func (t *translator) calls(nodes []*node) ([]*node, error) {
 		if out == nil {
 			continue
 		}
+		if k := semiResults[name]; k != 0 {
+			out.semi = k
+		}
 		nodes = replace(nodes, i, end, out)
 	}
 	return nodes, nil
+}
+
+// semiResults are the functions that return an ARRAY ('A') or an OBJECT
+// ('O').
+var semiResults = map[string]byte{
+	"ARRAY_CONSTRUCT": 'A', "ARRAY_CONSTRUCT_COMPACT": 'A', "ARRAY_AGG": 'A', "ARRAYAGG": 'A', "ARRAY_UNIQUE_AGG": 'A',
+	"TO_ARRAY": 'A', "SPLIT": 'A', "STRTOK_TO_ARRAY": 'A', "REGEXP_SUBSTR_ALL": 'A', "REGEXP_EXTRACT_ALL": 'A',
+	"ARRAY_SLICE": 'A', "ARRAY_APPEND": 'A', "ARRAY_PREPEND": 'A', "ARRAY_CAT": 'A', "ARRAY_INTERSECTION": 'A',
+	"ARRAY_DISTINCT": 'A', "ARRAY_COMPACT": 'A', "ARRAY_GENERATE_RANGE": 'A', "OBJECT_KEYS": 'A',
+	"OBJECT_CONSTRUCT": 'O', "OBJECT_CONSTRUCT_KEEP_NULL": 'O', "OBJECT_AGG": 'O', "TO_OBJECT": 'O', "OBJECT_INSERT": 'O',
 }
 
 func distinctPrefix(c *call) string {

@@ -31,6 +31,10 @@ type node struct {
 	elems []*node
 	// column says the node reads a column (see semiArg).
 	column bool
+	// semi is 'A' for a node known to be an ARRAY and 'O' for one known to
+	// be an OBJECT, which CREATE TABLE ... AS stores as such columns (see
+	// semiColumns).
+	semi byte
 }
 
 // closer is the bracket that closes open.

@@ -101,6 +101,7 @@ func (t *translator) literals(nodes []*node) ([]*node, error) {
 			if err != nil {
 				return nil, err
 			}
+			obj.semi = 'O'
 			nodes[i] = obj
 		case n.isGroup('['):
 			if p := prevSig(nodes, i); p >= 0 && endsOperand(nodes[p]) {
@@ -121,6 +122,7 @@ func (t *translator) literals(nodes []*node) ([]*node, error) {
 			nodes[i] = seq([]*node{n}, kids...)
 			nodes[i].json = true
 			nodes[i].elems = args
+			nodes[i].semi = 'A'
 		case n.kind == kWord:
 			// TIMESTAMP_LTZ '2024-01-01 10:00' and the like.
 			j := nextSig(nodes, i)
@@ -466,6 +468,7 @@ func castExpr(x []*node, typ sqlType, try bool) *node {
 			n = semiArg(x, "sf_to_json(")
 		}
 		n.json = true
+		n.semi = typ.semi()
 		return n
 	case classString:
 		return varcharCast(x)
