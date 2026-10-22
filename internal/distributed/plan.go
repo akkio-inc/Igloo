@@ -1058,6 +1058,17 @@ func (pl *planner) fullRead(n node, outer, local []string, uses *[]*tableUse) er
 			var t *Table
 			if t, err = pl.table(parts); err == nil {
 				*uses = append(*uses, &tableUse{ref: m, table: t})
+			} else if IsUnsupported(err) {
+				// A view reads as its query here too.
+				sub, ok, verr := pl.expandView(m, parts)
+				switch {
+				case verr != nil:
+					err = verr
+				case ok:
+					clear(m)
+					maps.Copy(m, sub)
+					err = pl.fullRead(subqueryNode(m), outer, local, uses)
+				}
 			}
 			return false
 		case "TABLE_FUNCTION":

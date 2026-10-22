@@ -17,14 +17,15 @@ func TestViews(t *testing.T) {
 	for _, stmt := range snowflake.Macros() {
 		h.exec(stmt)
 	}
-	h.addTable("survey", `(SELECT i::DECIMAL(38,0) AS survey_household_id, 'band_' || (i % 4) AS income
+	h.addTable("survey", `(SELECT i::DECIMAL(18,0) AS survey_household_id, 'band_' || (i % 4) AS income
 		FROM range(0, 7000, 2) t(i))`, 1)
 	// As Snowflake's views mirrored into Igloo read: one table of another
 	// schema, whole, and a left join to a small table on a cast key.
 	h.addView("v_people_latest", `SELECT * FROM people`)
 	h.addView("v_people_attrs", `SELECT s.person_id, s.segments, s.home, sv.income FROM people s
-		LEFT JOIN survey sv ON TRY_CAST(s.household_id AS DECIMAL(38,0)) = sv.survey_household_id`)
+		LEFT JOIN survey sv ON TRY_CAST(s.household_id AS DECIMAL(18,0)) = sv.survey_household_id`)
 	h.addView("v_nested", `SELECT person_id, segments FROM v_people_latest WHERE person_id > 100`)
+	h.addView("v_survey", `SELECT * FROM survey WHERE income <> 'band_0'`)
 	h.exec(`CREATE VIEW main.v_cols(pid, segs) AS SELECT person_id, segments FROM people WHERE person_id % 3 <> 0`)
 	h.views["v_cols"] = `SELECT person_id, segments FROM people WHERE person_id % 3 <> 0`
 
@@ -37,6 +38,10 @@ func TestViews(t *testing.T) {
 		`SELECT count(DISTINCT p2) FROM main.v_cols AS x(p2) WHERE x.segs IS NOT NULL`,
 		`SELECT seg, count(*) AS n FROM v_nested, unnest(segments) AS u(seg) GROUP BY 1 ORDER BY 1`,
 		`SELECT v.person_id, v.income FROM v_people_attrs v ORDER BY v.person_id DESC LIMIT 5`,
+		// Views read in full by every worker, in subqueries.
+		`SELECT count(*) FROM people p WHERE TRY_CAST(p.household_id AS DECIMAL(18,0)) IN (SELECT survey_household_id FROM v_survey WHERE income = 'band_1')`,
+		`SELECT home.city AS city, count(*) AS n FROM v_people_latest p WHERE EXISTS (SELECT 1 FROM v_survey s
+			WHERE s.survey_household_id = TRY_CAST(p.household_id AS DECIMAL(18,0))) GROUP BY 1 ORDER BY 1`,
 	}
 	r, err := snowflake.Translate(`SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS n
 		FROM v_people_latest p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1`, snowflake.Options{})
