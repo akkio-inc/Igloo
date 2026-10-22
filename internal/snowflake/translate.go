@@ -84,15 +84,16 @@ func Translate(sql string, opts Options) (Result, error) {
 	if readsPostgresCatalog(toks) {
 		return Result{SQL: sql, Untranslated: true}, nil
 	}
-	nodes, err := build(toks)
-	if err != nil {
-		return Result{}, err
-	}
 	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true
 		}
+	}
+	quoteKeywordQualifiers(toks)
+	nodes, err := build(toks)
+	if err != nil {
+		return Result{}, err
 	}
 	t.collectFlattens(nodes)
 	t.collectGrouped(nodes, false)
@@ -131,6 +132,68 @@ func readsPostgresCatalog(toks []token) bool {
 		}
 	}
 	return false
+}
+
+// duckdbNotColID are the words DuckDB 1.5 reserves and its type and
+// function keywords (duckdb_keywords()), which its grammar does not read as
+// the first part of a column's name: AT.X and LEFT.X are syntax errors
+// there. Snowflake reserves fewer, and a table alias such as AT is common in
+// generated SQL.
+var duckdbNotColID = func() map[string]bool {
+	m := map[string]bool{}
+	for _, w := range strings.Fields(`all analyse analyze and any array as asc asymmetric both case cast check
+		collate column constraint create default deferrable desc describe distinct do else end except false fetch
+		for foreign from group having in initially intersect into lambda lateral leading limit not null offset on
+		only or order pivot pivot_longer pivot_wider placing primary qualify references returning select show some
+		summarize symmetric table then to trailing true union unique unpivot using variadic when where window with
+		anti asof at authorization binary by collation columns concurrently cross freeze full generated glob ilike
+		inner is isnull join left like map natural notnull outer overlaps positional right semi similar struct
+		tablesample try_cast unpack verbose`) {
+		m[w] = true
+	}
+	return m
+}()
+
+// quoteKeywordQualifiers quotes, in place, a table alias that DuckDB cannot
+// read unquoted (see duckdbNotColID) as the identifier Snowflake reads it
+// as: FROM t AS AT ... AT.TOTAL becomes FROM t AS "AT" ... "AT".TOTAL. Such
+// a word is taken for an alias where it starts a qualified name, and then
+// quoted there and after each AS; words after a dot, and the keys of a path
+// into semi-structured data (v:at.x), are left as they are, as DuckDB reads
+// those and a path's keys are not identifiers.
+func quoteKeywordQualifiers(toks []token) {
+	sigAt := func(i, step int) int {
+		for i += step; i >= 0 && i < len(toks) && (toks[i].kind == kSpace || toks[i].kind == kComment); i += step {
+		}
+		return i
+	}
+	qualifies := func(i int) bool {
+		if n := sigAt(i, 1); n >= len(toks) || toks[n].kind != kOp || toks[n].text != "." {
+			return false
+		}
+		p := sigAt(i, -1)
+		return p < 0 || toks[p].kind != kOp || toks[p].text != "." && toks[p].text != ":"
+	}
+	aliases := map[string]bool{}
+	for i, tok := range toks {
+		if w := strings.ToLower(tok.text); tok.kind == kWord && duckdbNotColID[w] && qualifies(i) {
+			aliases[w] = true
+		}
+	}
+	if len(aliases) == 0 {
+		return
+	}
+	for i, tok := range toks {
+		if tok.kind != kWord || !aliases[strings.ToLower(tok.text)] {
+			continue
+		}
+		p := sigAt(i, -1)
+		if !qualifies(i) && (p < 0 || toks[p].kind != kWord || !strings.EqualFold(toks[p].text, "AS")) {
+			continue
+		}
+		name := strings.ToUpper(tok.text)
+		toks[i] = token{kind: kQuoted, text: `"` + name + `"`, val: name, pos: tok.pos, end: tok.end}
+	}
 }
 
 // statement translates a statement's nodes. A non-empty command means the

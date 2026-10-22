@@ -116,6 +116,9 @@ WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SE
 -- SELECT * FROM IDENTIFIER('db.sch.tbl')
 SELECT * FROM db.sch.tbl
 
+-- SELECT AT.total, at.n, LEFT.x, gt.y, t.at, v:at.left FROM a AS AT, b AS left, c AS gt
+SELECT "AT".total, "AT".n, "LEFT".x, gt.y, t.at, json_extract(v, '$.at.left') AS "V:AT.LEFT" FROM a AS "AT", b AS "LEFT", c AS gt
+
 -- SET x = 10
 SET VARIABLE "x" = 10
 

@@ -180,6 +180,10 @@ var snowflakeCases = []runCase{
 	{name: "top distinct", sql: `select distinct top 2 x from (values (1),(1),(2),(3)) t(x) order by x`, want: []string{"1", "2"}},
 	{name: "recursive", sql: `with r (n) as (select 1 union all select n + 1 from r where n < 3) select * from r`, want: []string{"1", "2", "3"}},
 	{name: "star", sql: `select * exclude (cd) rename (ab as xy) from (select 1 as ab, 2 as cd, 3 as ef)`, want: []string{"1|3"}, cols: []string{"XY", "EF"}},
+	// Snowflake lets a table alias be a word DuckDB reserves (AT, LEFT, MAP);
+	// as a column's qualifier DuckDB reads it only quoted.
+	{name: "keyword aliases", sql: `select at.x, left.y, map.z, AT.x + Left.y, at.* from (select 1 x) as at, (select 2 y) as left, (select parse_json('{"at": 3}') z) as map where map.z:at = 3`,
+		want: []string{`1|2|{"at":3}|3|1`}, cols: []string{"X", "Y", "Z", "AT.X + LEFT.Y", "X"}},
 	{name: "group by alias", sql: `select x + 1 as y, count(*) from (values (1),(2)) t(x) group by y order by y`, want: []string{"2|1", "3|1"}, cols: []string{"Y", "COUNT(*)"}},
 	{name: "sample rows", sql: `select count(*) from (select * from range(100) t(x) sample (10 rows))`, want: []string{"10"}},
 	{name: "column names", sql: `select x as y, x as "y", x as "Mixed", x::varchar, iff(x > 0, 'a', 'b'), upper('q'), x   +   1, "X" from (select 1 as x)`,

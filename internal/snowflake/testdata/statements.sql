@@ -37,6 +37,7 @@ SELECT TOP 10 * FROM t ORDER BY a
 SELECT * FROM VALUES (1, 'a'), (2, 'b')
 WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
 SELECT * FROM IDENTIFIER('db.sch.tbl')
+SELECT AT.total, at.n, LEFT.x, gt.y, t.at, v:at.left FROM a AS AT, b AS left, c AS gt
 SET x = 10
 SELECT $x
 UNSET x
