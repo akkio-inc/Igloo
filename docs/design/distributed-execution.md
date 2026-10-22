@@ -570,9 +570,12 @@ large; the last steps, over a few thousand signals, are not. A part whose
 filter of tables (it groups, is `DISTINCT`, or is a `UNION ALL`) reads it
 as a relation that workers compute (`internal/distributed/relation.go`):
 
-- **Inputs by partition.** A part that reads relations runs as a stage
-  over partitions. Its large inputs (every relation but those of one row,
-  and its tables until the rest fit every worker) must all be joined to
+- **Inputs by partition.** Relations estimated small enough for every
+  worker to read, beside a larger table the part divides, every task
+  reads in full, as it reads small tables. Otherwise a part that reads
+  relations runs as a stage over partitions. Its large inputs (every
+  relation but those of one row, and its tables until the rest fit every
+  worker) must all be joined to
   each other, by inner joins or `WHERE` of the same `SELECT`, on equal
   columns; the classes of columns its equalities make equal give the key.
   Each table is scanned by a stage of its own into an exchange keyed by

@@ -377,3 +377,27 @@ func TestSemiJoinReport(t *testing.T) {
 	}
 	t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
 }
+
+// TestSmallRelation checks that a relation small enough for every worker
+// to read is read in full beside the table the workers divide, rather
+// than the table partitioned through object storage.
+func TestSmallRelation(t *testing.T) {
+	h := newHarness(t, 0.02, 5, 3)
+	h.co.maxBroadcast = h.tables["customer"].Bytes
+	for _, q := range []string{
+		`SELECT l_shipmode, count(*), sum(c) FROM lineitem JOIN (SELECT n_regionkey AS r, count(*) AS c FROM nation GROUP BY 1) AS s
+			ON s.r = l_suppkey % 5 GROUP BY 1 ORDER BY 1`,
+		`WITH s AS (SELECT n_regionkey AS r, count(*) AS c FROM nation GROUP BY 1)
+			SELECT l_shipmode, count(*), sum(c) FROM lineitem, s WHERE s.r = l_partkey % 5 GROUP BY 1 ORDER BY 1`,
+	} {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Fatal("did not run distributed")
+			}
+			if p := h.planOf(q); p.exchanges("join") != 0 {
+				t.Errorf("lineitem was partitioned:\n%s", p.describe())
+			}
+		})
+	}
+}

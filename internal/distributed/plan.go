@@ -534,6 +534,8 @@ type candidate struct {
 	keyed    []*keyed
 	keyScope *scope
 	whole    []*relUse
+	// wholeBytes is the estimated size of the relations in whole.
+	wholeBytes int64
 	// tooDeep is a table that must be partitioned but lies in a subquery,
 	// which then becomes a relation.
 	tooDeep *tableUse
@@ -1375,12 +1377,21 @@ func (pl *planner) table(parts []string) (*Table, error) {
 // large inputs by partition.
 func (pl *planner) chooseInputs(c *candidate) error {
 	pl.subqueryRelations(c)
-	if slices.ContainsFunc(c.rels, func(r *relUse) bool { return r.bytes > 0 && !r.query }) {
-		return pl.chooseKeyed(c)
+	// Relations small enough for every worker to read, beside a larger
+	// table the workers divide, every task reads in full, as tables: their
+	// rows cross once per task, where partitioning would send the table's
+	// through object storage. Relations of one row are always read so.
+	c.whole, c.wholeBytes = c.rels, 0
+	for _, r := range c.rels {
+		c.wholeBytes += r.bytes
 	}
-	// Relations of one row, if any, every task reads.
-	c.whole = c.rels
-	return pl.chooseSplit(c)
+	if c.wholeBytes == 0 || c.wholeBytes <= pl.opts.maxBroadcast {
+		err := pl.chooseSplit(c)
+		if err == nil || c.wholeBytes == 0 || len(c.keyed) > 0 {
+			return err
+		}
+	}
+	return pl.chooseKeyed(c)
 }
 
 func (pl *planner) chooseSplit(c *candidate) error {
@@ -1420,7 +1431,13 @@ func (pl *planner) chooseSplit(c *candidate) error {
 	if !pl.opts.force && !c.relation && c.split.table.Bytes < pl.opts.minBytes {
 		return unsupported("%s is small (%d bytes)", c.split.table, c.split.table.Bytes)
 	}
-	if broadcast <= pl.opts.maxBroadcast {
+	if broadcast+c.wholeBytes <= pl.opts.maxBroadcast {
+		for _, r := range c.whole {
+			if r.bytes > c.split.table.Bytes {
+				// The relation is the larger: partition instead.
+				return unsupported("relation %s is larger than %s", r.item.name, c.split.table)
+			}
+		}
 		return nil
 	}
 	// Too much for every worker to read: partition the largest tables by

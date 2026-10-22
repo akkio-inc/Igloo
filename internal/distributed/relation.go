@@ -526,7 +526,9 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 		if x := d.outs[sig]; x != nil {
 			return x, nil
 		}
-		if d.first != nil {
+		if d.first != nil && len(d.first.Keys) > 0 {
+			// Partitioned otherwise: partition it again. (Written whole, it
+			// is small, and computed again.)
 			x := pl.exchange("relation", xkeys, casts)
 			f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_r"))
 			if err != nil {
