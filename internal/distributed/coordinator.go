@@ -264,6 +264,9 @@ type Execution struct {
 	// Workers is how many workers ran tasks.
 	Workers int
 	dir     string
+	// exchanges describes what the statement's exchanges held, for tests'
+	// failures and debug logs.
+	exchanges string
 }
 
 // Close removes the partial results. Call it once SQL has run.
@@ -433,8 +436,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		return nil, err
 	}
 	ex.Workers = len(run.used)
+	ex.exchanges = run.describe()
 	co.pool.touch()
-	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers,
+	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers, "exchanges", ex.exchanges,
 		"snapshots_seconds", loaded.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true

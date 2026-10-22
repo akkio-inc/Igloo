@@ -275,6 +275,11 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	start := time.Now()
 	var byID []string
 	for i, v := range req.Views {
+		if v.Exact {
+			if err := checkRows(ctx, conn, v.Files, v.Rows); err != nil {
+				return "", nil, fmt.Errorf("view %s: %w", v.Name, err)
+			}
+		}
 		if !v.ByName && len(v.Files) > 0 {
 			if v.ByName, err = w.readByName(ctx, conn, v); err != nil {
 				return "", nil, err
@@ -387,6 +392,11 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 	if err != nil {
 		return nil, fmt.Errorf("list shuffle files: %w", err)
 	}
+	counts, err := fileRows(ctx, conn, files)
+	if err != nil {
+		return nil, fmt.Errorf("count shuffle files' rows: %w", err)
+	}
+	var listed int64
 	for _, f := range files {
 		rest, ok := strings.CutPrefix(f, dir+"/__b=")
 		part, _, _ := strings.Cut(rest, "/")
@@ -394,9 +404,63 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 		if !ok || err != nil {
 			return nil, fmt.Errorf("unexpected shuffle file %s", f)
 		}
-		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n})
+		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n, Rows: counts[f]})
+		listed += counts[f]
+	}
+	if listed != rows {
+		return nil, fmt.Errorf("shuffle files hold %d rows, the task wrote %d", listed, rows)
 	}
 	return out, nil
+}
+
+// fileRows returns how many rows each of Parquet files holds, from their
+// footers.
+func fileRows(ctx context.Context, conn *duckdb.Conn, files []string) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(files) == 0 {
+		return out, nil
+	}
+	quoted := make([]string, len(files))
+	for i, f := range files {
+		quoted[i] = quoteLiteral(f)
+	}
+	rows, err := conn.QueryContext(ctx, "SELECT file_name, num_rows FROM parquet_file_metadata(["+strings.Join(quoted, ", ")+"])", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, 2)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		name, _ := dest[0].(string)
+		n, _ := dest[1].(int64)
+		out[name] += n
+	}
+}
+
+// checkRows checks that files hold rows rows in all.
+func checkRows(ctx context.Context, conn *duckdb.Conn, files []string, rows int64) error {
+	counts, err := fileRows(ctx, conn, files)
+	if err != nil {
+		return err
+	}
+	var n int64
+	for _, f := range files {
+		c, ok := counts[f]
+		if !ok {
+			return fmt.Errorf("file %s has no footer", f)
+		}
+		n += c
+	}
+	if n != rows {
+		return fmt.Errorf("its files hold %d rows, not the %d written", n, rows)
+	}
+	return nil
 }
 
 func globFiles(ctx context.Context, conn *duckdb.Conn, pattern string) ([]string, error) {

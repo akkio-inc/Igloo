@@ -405,7 +405,7 @@ func (h *harness) check(query string) bool {
 	if err != nil {
 		h.t.Fatalf("%s\nlocal: %v", short(query), err)
 	}
-	got, gotCols, plan, _, err := h.run(ctx, query, ModeOn)
+	got, gotCols, plan, ex, err := h.run(ctx, query, ModeOn)
 	if IsUnsupported(err) {
 		h.t.Logf("ran locally: %s: %v", short(query), err)
 		return false
@@ -418,7 +418,7 @@ func (h *harness) check(query string) bool {
 	}
 	ordered := hasOrderBy(query)
 	if msg := compareRows(want, got, ordered); msg != "" {
-		h.t.Errorf("%s\n%s\n%s", short(query), msg, plan.describe())
+		h.t.Errorf("%s\n%s\n%s%s", short(query), msg, plan.describe(), ex.exchanges)
 	}
 	return true
 }

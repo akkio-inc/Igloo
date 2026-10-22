@@ -65,6 +65,10 @@ type viewDef struct {
 	// in 8 files for 8,000 and ordered TPC-H Q5's joins so that it ran eight
 	// times as long.
 	Rows int64 `json:"rows,omitempty"`
+	// Exact says the files hold exactly Rows rows, as the files of an
+	// exchange do, which the worker checks before it reads them: a file
+	// lost or read twice fails the task rather than its result.
+	Exact bool `json:"exact,omitempty"`
 	// Deletes are the delete files of those of Files that have any, which
 	// the worker applies.
 	Deletes []fileDeletes `json:"deletes,omitempty"`
@@ -103,6 +107,8 @@ type taskResult struct {
 type shuffleFile struct {
 	Path      string `json:"path"`
 	Partition int    `json:"partition"`
+	// Rows is how many rows the file holds.
+	Rows int64 `json:"rows"`
 }
 
 // taskErr is a failed task.

@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -190,7 +191,9 @@ type exchangeRun struct {
 	mu      sync.Mutex
 	columns []Column
 	files   [][]string
-	rows    int64
+	// rows counts the rows written, in all and by partition.
+	rows     int64
+	partRows []int64
 }
 
 // jobResult is where a coordinator-bound stage's partial results are.
@@ -208,7 +211,7 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 		}
 		x := e.exchanges[s.Out.ID]
 		if x == nil {
-			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts)}
+			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts), partRows: make([]int64, e.parts)}
 			e.exchanges[s.Out.ID] = x
 		}
 		x.producers++
@@ -278,7 +281,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			whole[in.View] = def
 		case in.Exchange != nil && !in.Partitioned:
 			x := e.exchanges[in.Exchange.ID]
-			def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: max(1, x.rows)}
+			def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: x.rows, Exact: true}
 			for _, fs := range x.files {
 				def.Files = append(def.Files, fs...)
 			}
@@ -306,9 +309,8 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 					Deletes: deletesOf(share)})
 			case in.Exchange != nil && in.Partitioned:
 				x := e.exchanges[in.Exchange.ID]
-				// The hash spreads rows evenly over the partitions.
 				task.Views = append(task.Views, viewDef{Name: in.View, Columns: x.columns, Files: x.files[i], ByName: true,
-					Rows: max(1, x.rows/int64(e.parts))})
+					Rows: x.partRows[i], Exact: true})
 			default:
 				task.Views = append(task.Views, whole[in.View])
 			}
@@ -360,6 +362,21 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	return nil
 }
 
+// describe says what each exchange held: rows and files by partition.
+func (e *execution) describe() string {
+	ids := slices.Sorted(maps.Keys(e.exchanges))
+	var b strings.Builder
+	for _, id := range ids {
+		x := e.exchanges[id]
+		fmt.Fprintf(&b, "exchange %d: %d rows;", id, x.rows)
+		for p := range x.files {
+			fmt.Fprintf(&b, " %d:%d/%d", p, x.partRows[p], len(x.files[p]))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // received records the files a task wrote to its stage's exchange.
 func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) error {
 	x := e.exchanges[s.Out.ID]
@@ -371,11 +388,17 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) erro
 	} else if !slices.Equal(x.columns, head.Columns) {
 		return fmt.Errorf("stages wrote different columns to exchange %d", s.Out.ID)
 	}
+	var listed int64
 	for _, f := range head.Files {
 		if f.Partition < 0 || f.Partition >= e.parts || !strings.HasPrefix(f.Path, task.Shuffle+"/") {
 			return fmt.Errorf("a worker wrote an unexpected file %s", f.Path)
 		}
 		x.files[f.Partition] = append(x.files[f.Partition], f.Path)
+		x.partRows[f.Partition] += f.Rows
+		listed += f.Rows
+	}
+	if listed != head.Rows {
+		return fmt.Errorf("a worker listed files of %d rows for the %d it wrote to exchange %d", listed, head.Rows, s.Out.ID)
 	}
 	return nil
 }
