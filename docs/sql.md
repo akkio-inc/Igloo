@@ -28,6 +28,23 @@ expressions read the same rows each time (no sample, `LIMIT`, window
 function, `random()` or parameter). Previewing 50 rows of a table of 37
 million rows with its row count takes 1 s instead of 8.
 
+A statement that repeats a subquery in `FROM`, as generated reports do when
+they take a top 10 and a bottom 5 of the same report, has DuckDB compute the
+subquery once per copy. Igloo computes it once, in either dialect, as a
+common table expression marked `MATERIALIZED` (named `_igloo_shared_1`, ...,
+as `EXPLAIN` shows) that the copies read. Copies compare ignoring case
+outside literals and quoted names, white space and comments. A subquery
+stays as written when computing it once could change what a copy reads or
+shows: when it calls a volatile function (`random()`, `uuid()`,
+`nextval()`, or a macro that calls one) or samples, names a common table
+expression defined outside it, refers to the columns of the query around it,
+or is read by a `SELECT` that neither sorts nor groups its rows again or has
+a window function (a materialized subquery does not keep its rows' order),
+and in statements with `?` parameters. Checks, policies and grants apply to
+the statement as it runs; query history shows it as sent. A report that
+selected twice from one subquery of 17 common table expressions took 597 s
+on an 8-core machine and takes 128 s.
+
 Tables live in the Iceberg catalog, named `lake` in SQL (`IGLOO_CATALOG_NAME`),
 and the default schema is `public`. Unqualified names resolve to
 `lake.public`, so `events` and `lake.public.events` are the same table.

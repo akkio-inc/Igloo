@@ -1516,7 +1516,21 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	// Columns Iceberg has no type for become strings (see icebergTypes).
 	query = s.icebergTypes(ctx, sess, query)
-	st, err := prepare(ctx, sess.conn, query, oids)
+	// A subquery the statement repeats is computed once (see shared.go). If
+	// DuckDB cannot prepare that, say because the subquery refers to the
+	// query around it, the statement runs as written.
+	var st *statement
+	if shared := s.shareSubqueries(ctx, sess, query); shared != "" {
+		if st, err = prepare(ctx, sess.conn, shared, oids); err == nil {
+			query = shared
+		} else {
+			s.log.Debug("statement runs with its repeated subqueries as written", "err", err)
+			st = nil
+		}
+	}
+	if st == nil {
+		st, err = prepare(ctx, sess.conn, query, oids)
+	}
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created: sync and try again,
 		// also when this sync changed nothing because another one, of the

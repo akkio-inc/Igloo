@@ -842,6 +842,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   is the number of rows the `FROM` and `WHERE` produce, Igloo counts those
   once instead, in either dialect. Previewing 50 rows of a 37-million-row
   table with its row count took 7.9 s and takes 1.0 s (docs/sql.md#dialect).
+- A subquery a statement repeats in `FROM`, as in a report's top and bottom
+  selections from the same report, is computed once, as a materialized
+  common table expression the copies read, in either dialect, where that
+  cannot change the result (docs/sql.md#dialect). A report that selected
+  twice from one subquery of 17 common table expressions took 597 s and
+  needed over 98 GiB of spill on an 8-core, 32 GiB machine; it takes 128 s,
+  the time of one report.
 
 ### Operations and deployment
 
