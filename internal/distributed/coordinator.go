@@ -416,6 +416,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	ex.exchanges = run.describe()
 	co.pool.touch()
 	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers, "exchanges", ex.exchanges,
+		"local", strings.Join(plan.local, "; "),
 		"snapshots_seconds", loaded.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true

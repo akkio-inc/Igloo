@@ -140,6 +140,9 @@ type Plan struct {
 	// read: by the name as written (lower case, parts joined by NUL), the
 	// table's key. Execute points them at the snapshot the workers read.
 	pins map[string]string
+	// local says why parts of the statement stay on the coordinator, for
+	// logs: the first few reasons.
+	local []string
 }
 
 // job is a candidate on its way to stages: the tables its fragment reads,
@@ -285,7 +288,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{Stages: pl.stages, final: out, pins: pins}, nil
+	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
@@ -669,6 +672,9 @@ func (c *candidate) largest() string {
 	for _, r := range c.rels {
 		if r.bytes > size {
 			name, size = r.item.name, r.bytes
+			if name == "" {
+				name = "a subquery"
+			}
 		}
 	}
 	return name

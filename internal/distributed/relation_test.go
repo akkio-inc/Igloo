@@ -456,6 +456,12 @@ func TestSnowflakeAudienceReport(t *testing.T) {
 			p := h.planOf(r.SQL)
 			stages = append(stages, len(p.Stages))
 			t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
+			// The ranking and the comparisons stay on the coordinator, and
+			// the plan says why, for the logs.
+			if len(p.local) == 0 {
+				t.Error("no reasons for the parts the coordinator runs")
+			}
+			t.Logf("on the coordinator: %s", strings.Join(p.local, "; "))
 		})
 	}
 	if len(stages) == 2 && stages[1] != 2*stages[0] {
