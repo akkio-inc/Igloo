@@ -762,7 +762,7 @@ func (s *sfSession) tables(st string) error {
 					notNull = "t"
 				}
 				s.row(str(strconv.Itoa(sc.oid)), str(t.pgName), str("0"), str(c.pgName), str(typ), str(strconv.Itoa(mod)),
-					str("0"), str(strconv.Itoa(i+1)), str(notNull), nil, nil, nil, str("pg_catalog"),
+					str(strconv.Itoa(c.typ.dims())), str(strconv.Itoa(i+1)), str(notNull), nil, nil, nil, str("pg_catalog"),
 					optional(c.comment), optional(t.comment))
 				n++
 			}

@@ -180,7 +180,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   access policies hold. `count(*)` is counted in Snowflake.
   `query_timeout` stops queries on Snowflake too. Grants,
   policies, the query history and `ALTER CONNECTION ... REFRESH` work as for
-  other connections; credentials stay in Igloo, encrypted or in files.
+  other connections; credentials stay in Igloo, encrypted or in files. An
+  `ARRAY` column reads as a `VARCHAR[]`, so `CREATE TABLE AS SELECT *` copies
+  it into an Iceberg `list<string>`; `VARIANT` and `OBJECT` read as their JSON
+  text.
 - Connections to other Iceberg REST catalogs (`CREATE CONNECTION ... TYPE
   iceberg`): Snowflake-managed Iceberg tables through Snowflake's Horizon
   Catalog, Databricks Delta Shares served to Iceberg clients and Unity

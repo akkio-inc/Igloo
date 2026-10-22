@@ -38,7 +38,8 @@ const (
 	sfTimestamp                  // TIMESTAMP_NTZ: timestamp, to microseconds
 	sfTimestampLTZ               // TIMESTAMP_LTZ: timestamptz
 	sfTimestampTZ                // TIMESTAMP_TZ: timestamptz, the instant (its offset is not kept)
-	sfJSON                       // VARIANT, OBJECT, ARRAY, MAP, VECTOR: json, VARCHAR in DuckDB, as TO_JSON writes it
+	sfJSON                       // VARIANT, OBJECT, MAP, VECTOR: json, VARCHAR in DuckDB, as TO_JSON writes it
+	sfArray                      // ARRAY: text[], VARCHAR[] in DuckDB, as Igloo stores Snowflake's ARRAY (see sfcopy.go)
 	sfAsText                     // GEOGRAPHY, GEOMETRY and other types: text
 )
 
@@ -99,7 +100,9 @@ func parseSnowflakeType(dataType string) (sfType, bool, error) {
 		t.kind = sfTimestampLTZ
 	case "TIMESTAMP_TZ":
 		t.kind = sfTimestampTZ
-	case "VARIANT", "OBJECT", "ARRAY", "MAP", "VECTOR":
+	case "ARRAY":
+		t.kind = sfArray
+	case "VARIANT", "OBJECT", "MAP", "VECTOR":
 		t.kind = sfJSON
 	default:
 		t.kind = sfAsText
@@ -132,8 +135,19 @@ func (t sfType) pgType() (string, int) {
 		return "timestamptz", -1
 	case sfJSON:
 		return "json", -1
+	case sfArray:
+		return "_text", -1
 	}
 	return "text", -1
+}
+
+// dims is the number of dimensions of the PostgreSQL type the gateway
+// reports for t: 1 for an array.
+func (t sfType) dims() int {
+	if t.kind == sfArray {
+		return 1
+	}
+	return 0
 }
 
 // selectExpr is what the gateway selects from Snowflake for a column, col
@@ -152,6 +166,9 @@ func (t sfType) selectExpr(col string) (expr string, sameAsColumn bool) {
 			return "TO_JSON(CAST(" + col + " AS ARRAY))", false
 		}
 		return "TO_JSON(CAST(" + col + " AS VARIANT))", false
+	case sfArray:
+		// A structured ARRAY(type) too, as its semi-structured ARRAY.
+		return "TO_JSON(CAST(" + col + " AS ARRAY))", false
 	case sfAsText:
 		if t.name == "GEOGRAPHY" || t.name == "GEOMETRY" {
 			return "ST_ASWKT(" + col + ")", false

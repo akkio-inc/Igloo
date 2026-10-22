@@ -22,6 +22,7 @@ func testCatalog(t *testing.T) *sfCatalog {
 		{"LTZ", `{"type":"TIMESTAMP_LTZ","scale":9,"nullable":true}`},
 		{"TZ", `{"type":"TIMESTAMP_TZ","scale":9,"nullable":true}`},
 		{"V", `{"type":"VARIANT","nullable":true}`},
+		{"A", `{"type":"ARRAY","nullable":true}`},
 		{"B", `{"type":"BINARY","length":8,"nullable":true}`},
 		{"G", `{"type":"GEOGRAPHY","nullable":true}`},
 		{"Mixed Case", `{"type":"TEXT","length":10,"nullable":true}`},

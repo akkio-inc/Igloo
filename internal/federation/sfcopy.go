@@ -1,7 +1,9 @@
 package federation
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -121,6 +123,14 @@ func columnEncoder(a arrow.Array, t sfType, scale int) (fieldEncoder, error) {
 			}
 			return append(dst, 0), nil
 		}), nil
+	case sfArray:
+		switch s := a.(type) {
+		case *array.String:
+			return withLength(a, func(dst []byte, i int) ([]byte, error) { return appendTextArray(dst, s.Value(i)) }), nil
+		case *array.LargeString:
+			return withLength(a, func(dst []byte, i int) ([]byte, error) { return appendTextArray(dst, s.Value(i)) }), nil
+		}
+		return unexpected()
 	case sfText, sfJSON, sfAsText:
 		switch s := a.(type) {
 		case *array.String:
@@ -173,6 +183,61 @@ func columnEncoder(a arrow.Array, t sfType, scale int) (fieldEncoder, error) {
 		}), nil
 	}
 	return unexpected()
+}
+
+// textOID is PostgreSQL's text, the elements' type of an ARRAY's text[].
+const textOID = 25
+
+// appendTextArray appends doc, an ARRAY as Snowflake's TO_JSON writes it,
+// as PostgreSQL's binary text[], which DuckDB reads as a VARCHAR[]: each
+// element as Snowflake's TO_VARCHAR writes it, a string as itself and
+// anything else as its JSON text, as Igloo stores Snowflake's ARRAY (see
+// package snowflake), and JSON null (or undefined) as NULL.
+func appendTextArray(dst []byte, doc string) ([]byte, error) {
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(doc), &elems); err != nil {
+		return dst, fmt.Errorf("unexpected ARRAY value: %w", err)
+	}
+	hasNull := uint32(0)
+	for _, e := range elems {
+		if string(e) == "null" {
+			hasNull = 1
+		}
+	}
+	if len(elems) == 0 {
+		// No dimensions.
+		dst = binary.BigEndian.AppendUint32(dst, 0)
+		dst = binary.BigEndian.AppendUint32(dst, 0)
+		return binary.BigEndian.AppendUint32(dst, textOID), nil
+	}
+	dst = binary.BigEndian.AppendUint32(dst, 1)
+	dst = binary.BigEndian.AppendUint32(dst, hasNull)
+	dst = binary.BigEndian.AppendUint32(dst, textOID)
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(elems)))
+	dst = binary.BigEndian.AppendUint32(dst, 1) // the lower bound
+	for _, e := range elems {
+		switch {
+		case string(e) == "null":
+			dst = binary.BigEndian.AppendUint32(dst, math.MaxUint32)
+		case e[0] == '"':
+			var s string
+			if err := json.Unmarshal(e, &s); err != nil {
+				return dst, fmt.Errorf("unexpected ARRAY value: %w", err)
+			}
+			dst = binary.BigEndian.AppendUint32(dst, uint32(len(s)))
+			dst = append(dst, s...)
+		default:
+			at := len(dst)
+			dst = append(dst, 0, 0, 0, 0)
+			buf := bytes.NewBuffer(dst)
+			if err := json.Compact(buf, e); err != nil {
+				return dst[:at], fmt.Errorf("unexpected ARRAY value: %w", err)
+			}
+			dst = buf.Bytes()
+			binary.BigEndian.PutUint32(dst[at:], uint32(len(dst)-at-4))
+		}
+	}
+	return dst, nil
 }
 
 // intValues returns the values of an integer array as int64s.

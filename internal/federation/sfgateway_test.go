@@ -158,9 +158,10 @@ func t1Columns(t *testing.T) map[string]arrow.Array {
 	i16.Append(-1050)
 	i16.AppendNull()
 	out["AMT"] = i16.NewArray()
-	for _, name := range []string{"NAME", "Mixed Case", "V", "G"} {
+	for _, name := range []string{"NAME", "Mixed Case", "V", "A", "G"} {
 		s := array.NewStringBuilder(pool)
-		s.Append(map[string]string{"NAME": `it's a\b`, "Mixed Case": "x", "V": `{"a":[1,2]}`, "G": "POINT(1 2)"}[name])
+		s.Append(map[string]string{"NAME": `it's a\b`, "Mixed Case": "x", "V": `{"a":[1,2]}`, "A": `["x",1,{"k":"v"},null,"",[2]]`,
+			"G": "POINT(1 2)"}[name])
 		s.AppendNull()
 		out[name] = s.NewArray()
 	}
@@ -287,21 +288,21 @@ func TestSnowflakeGateway(t *testing.T) {
 	expect(t, eng, "SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'sf'", "tpch|t1")
 	expect(t, eng, "SELECT string_agg(column_name || ' ' || data_type, ', ' ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'sf'",
 		"id DECIMAL(38,0), amt DECIMAL(12,2), name VARCHAR, f DOUBLE, flag BOOLEAN, d DATE, tm TIME, ts TIMESTAMP, ts3 TIMESTAMP, "+
-			"ltz TIMESTAMP WITH TIME ZONE, tz TIMESTAMP WITH TIME ZONE, v VARCHAR, b BLOB, g VARCHAR, Mixed Case VARCHAR")
+			"ltz TIMESTAMP WITH TIME ZONE, tz TIMESTAMP WITH TIME ZONE, v VARCHAR, a VARCHAR[], b BLOB, g VARCHAR, Mixed Case VARCHAR")
 	expect(t, eng, "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'sf'", "1")
 
 	// Every value as Snowflake sent it.
 	expect(t, eng, `SELECT id::VARCHAR, amt::VARCHAR, name, f, flag, d::VARCHAR, tm::VARCHAR, ts::VARCHAR, ts3::VARCHAR,
-		timezone('UTC', ltz)::VARCHAR, timezone('UTC', tz)::VARCHAR, v::VARCHAR, hex(b), g, "Mixed Case" FROM sf.tpch.t1 ORDER BY id`,
+		timezone('UTC', ltz)::VARCHAR, timezone('UTC', tz)::VARCHAR, v::VARCHAR, to_json(a)::VARCHAR, hex(b), g, "Mixed Case" FROM sf.tpch.t1 ORDER BY id`,
 		`1|-10.50|it's a\b|1.5|true|2020-01-02|03:04:05.123456|2020-01-02 03:04:05.123456|2020-01-02 03:04:05.123|`+
-			`2020-01-02 03:04:05.123456|2020-01-02 03:04:05.123456|{"a":[1,2]}|0AFF|POINT(1 2)|x`+"\n"+
-			"NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL")
+			`2020-01-02 03:04:05.123456|2020-01-02 03:04:05.123456|{"a":[1,2]}|["x","1","{\"k\":\"v\"}",null,"","[2]"]|0AFF|POINT(1 2)|x`+"\n"+
+			"NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL")
 	last := func() string {
 		q := fake.sent()
 		return q[len(q)-1]
 	}
 	if q := last(); q != `SELECT "ID", "AMT", "NAME", "F", "FLAG", "D", CAST("TM" AS TIME(9)), "TS", "TS3", "LTZ", "TZ", `+
-		`TO_JSON(CAST("V" AS VARIANT)), "B", ST_ASWKT("G"), "Mixed Case" FROM "DB"."TPCH"."T1"` {
+		`TO_JSON(CAST("V" AS VARIANT)), TO_JSON(CAST("A" AS ARRAY)), "B", ST_ASWKT("G"), "Mixed Case" FROM "DB"."TPCH"."T1"` {
 		t.Errorf("Snowflake was sent %s", q)
 	}
 

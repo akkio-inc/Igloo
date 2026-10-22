@@ -2,6 +2,8 @@ package federation
 
 import (
 	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"math"
 	"math/big"
 	"testing"
@@ -140,5 +142,29 @@ func TestEncoders(t *testing.T) {
 				t.Errorf("%s row %d: got %x, want %x", tc.name, i, got[4:], want)
 			}
 		}
+	}
+}
+
+// TestTextArray checks an ARRAY as PostgreSQL's binary text[]: strings as
+// themselves, other elements as their JSON text, null as NULL.
+func TestTextArray(t *testing.T) {
+	u32 := func(n uint32) string { return fmt.Sprintf("%08x", n) }
+	elem := func(s string) string { return u32(uint32(len(s))) + hex.EncodeToString([]byte(s)) }
+	for _, c := range []struct{ doc, want string }{
+		{`[]`, u32(0) + u32(0) + u32(25)},
+		{`["a", 1, {"k": [true]}, null, ""]`, u32(1) + u32(1) + u32(25) + u32(5) + u32(1) +
+			elem("a") + elem("1") + elem(`{"k":[true]}`) + "ffffffff" + elem("")},
+		{`["\u00e9\"x"]`, u32(1) + u32(0) + u32(25) + u32(1) + u32(1) + elem(`é"x`)},
+	} {
+		got, err := appendTextArray(nil, c.doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hex.EncodeToString(got) != c.want {
+			t.Errorf("%s:\n got %x\nwant %s", c.doc, got, c.want)
+		}
+	}
+	if _, err := appendTextArray(nil, `{"a": 1}`); err == nil {
+		t.Error("an object is not an ARRAY")
 	}
 }

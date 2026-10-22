@@ -759,7 +759,8 @@ second, and Igloo logs a warning.
 | `TIME` | `TIME`, to the microsecond |
 | `TIMESTAMP_NTZ` | `TIMESTAMP`, to the microsecond |
 | `TIMESTAMP_LTZ`, `TIMESTAMP_TZ` | `TIMESTAMP WITH TIME ZONE`, to the microsecond; `TIMESTAMP_TZ`'s offset is not kept, only the instant |
-| `VARIANT`, `OBJECT`, `ARRAY`, `MAP`, `VECTOR` | `VARCHAR` holding the value as JSON, as Snowflake's `TO_JSON` writes it; cast to `JSON` to query it |
+| `ARRAY` | `VARCHAR[]`, each element as Snowflake's `TO_VARCHAR` writes it (a string as itself, anything else as its JSON text), as Igloo's tables keep Snowflake's `ARRAY` ([Snowflake SQL](snowflake-sql.md#semi-structured-columns)), so `CREATE TABLE AS SELECT *` makes an Iceberg `list<string>` |
+| `VARIANT`, `OBJECT`, `MAP`, `VECTOR` | `VARCHAR` holding the value as JSON, as Snowflake's `TO_JSON` writes it; cast to `JSON` to query it in DuckDB's dialect (Snowflake's reads it as JSON by itself); to copy an `OBJECT` as a map, cast it in Snowflake's dialect (`o::MAP(VARCHAR, VARCHAR)`) or through JSON in DuckDB's (`CAST(CAST(o AS JSON) AS MAP(VARCHAR, VARCHAR))`) |
 | `GEOGRAPHY`, `GEOMETRY` | `VARCHAR`, as well-known text |
 | others | `VARCHAR`, as Snowflake's `TO_VARCHAR` writes them |
 
