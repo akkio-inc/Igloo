@@ -12,6 +12,9 @@
 #   - tables with lists, maps and structs run distributed, unnests and
 #     Snowflake's FLATTEN of them too, and so do views over them and
 #     tables with deleted rows,
+#   - an audience report in Snowflake's dialect (cohorts, FLATTEN of array
+#     columns through views, distinct people per signal, ranking) returns
+#     the same rows with and without workers,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
@@ -337,6 +340,98 @@ psql_admin -c "DELETE FROM people WHERE person_id % 5 = 0" \
 check_distributed "a table with deleted and updated rows" deleted "$nested_query"
 check_distributed "a table another session deleted rows of" iso_deleted \
   "SELECT o_orderstatus, count(*), sum(o_totalprice) FROM iso GROUP BY 1 ORDER BY 1"
+
+echo "an audience report in Snowflake's dialect"
+# Shaped like the audience-insight reports BI tools generate: an audience
+# and the general population as cohorts, signals from FLATTEN of array
+# columns read through views, distinct people per signal and cohort, and a
+# ranking of the signals by how much more common they are in the audience.
+{
+  echo "CREATE TABLE aud_people (person_id VARCHAR, household_id VARCHAR, gender VARCHAR, age_bucket INTEGER);"
+  echo "CREATE TABLE aud_media_daily (person_id VARCHAR, day DATE, network_array VARCHAR[], genre_array VARCHAR[]);"
+  echo "CREATE TABLE aud_browsing_daily (person_id VARCHAR, day DATE, category_array VARCHAR[]);"
+  echo "CREATE TABLE aud_members (audience_id VARCHAR, ver INTEGER, person_id VARCHAR);"
+  for part in 0 1 2 3 4 5; do
+    echo "INSERT INTO aud_people SELECT 'p' || i, 'h' || (i // 3), CASE WHEN i % 2 = 0 THEN 'F' ELSE 'M' END, i % 7 + 1
+      FROM range(30000) r(i) WHERE i % 6 = $part;"
+    echo "INSERT INTO aud_media_daily SELECT 'p' || (i % 30000), DATE '2026-09-01' + CAST(i % 30 AS INTEGER),
+      list_transform(range(1 + i % 4), x -> 'net' || ((i * 7 + x * 13) % 40)),
+      list_transform(range(1 + i % 3), x -> 'genre' || ((i * 3 + x * 5) % 12))
+      FROM range(90000) r(i) WHERE i % 6 = $part;"
+    echo "INSERT INTO aud_browsing_daily SELECT 'p' || ((i * 7) % 30000), DATE '2026-09-01' + CAST(i % 30 AS INTEGER),
+      list_transform(range(1 + i % 5), x -> 'cat' || ((i * 5 + x * 11) % 60))
+      FROM range(90000) r(i) WHERE i % 6 = $part;"
+  done
+  echo "INSERT INTO aud_members SELECT 'a1', 1, 'p' || i FROM range(30000) r(i) WHERE i % 5 = 0;"
+  echo "INSERT INTO aud_members SELECT 'a1', 2, 'p' || i FROM range(30000) r(i) WHERE i % 6 = 0 AND i % 4 <> 2;"
+  echo "CREATE VIEW v_aud_people AS SELECT * FROM aud_people;"
+  echo "CREATE VIEW v_aud_media_daily AS SELECT * FROM aud_media_daily;"
+  echo "CREATE VIEW v_aud_browsing_daily AS SELECT * FROM aud_browsing_daily;"
+} | psql_admin -q >/dev/null
+report="WITH AUDIENCE AS (
+    SELECT PERSON_ID FROM AUD_MEMBERS WHERE AUDIENCE_ID = 'a1'
+      AND VER = (SELECT MAX(VER) FROM AUD_MEMBERS WHERE AUDIENCE_ID = 'a1')),
+  BASE_POPULATION AS (SELECT PERSON_ID FROM V_AUD_PEOPLE),
+  COHORT_MEMBERS AS (
+    SELECT PERSON_ID, 'AUDIENCE' AS COHORT FROM AUDIENCE
+    UNION ALL SELECT PERSON_ID, 'POPULATION' AS COHORT FROM BASE_POPULATION),
+  COHORT_TOTALS AS (SELECT COHORT, COUNT(DISTINCT PERSON_ID) AS COHORT_SIZE FROM COHORT_MEMBERS GROUP BY COHORT),
+  MEDIA_COUNTS AS (
+    SELECT M.PERSON_ID, 'NETWORK' AS DIMENSION, F.VALUE::STRING AS SIGNAL
+    FROM V_AUD_MEDIA_DAILY M, LATERAL FLATTEN(INPUT => M.NETWORK_ARRAY) F),
+  GENRE_COUNTS AS (
+    SELECT M.PERSON_ID, 'GENRE' AS DIMENSION, F.VALUE::STRING AS SIGNAL
+    FROM V_AUD_MEDIA_DAILY M, LATERAL FLATTEN(INPUT => M.GENRE_ARRAY) F),
+  BROWSING_COUNTS AS (
+    SELECT B.PERSON_ID, 'CATEGORY' AS DIMENSION, F.VALUE::STRING AS SIGNAL
+    FROM V_AUD_BROWSING_DAILY B, LATERAL FLATTEN(INPUT => B.CATEGORY_ARRAY) F),
+  ALL_COUNTS AS (
+    SELECT * FROM MEDIA_COUNTS UNION ALL SELECT * FROM GENRE_COUNTS UNION ALL SELECT * FROM BROWSING_COUNTS),
+  ITEM_METRICS AS (
+    SELECT C.COHORT, S.DIMENSION, S.SIGNAL, COUNT(DISTINCT S.PERSON_ID) AS PEOPLE
+    FROM ALL_COUNTS S JOIN COHORT_MEMBERS C ON C.PERSON_ID = S.PERSON_ID
+    GROUP BY C.COHORT, S.DIMENSION, S.SIGNAL),
+  COMPARISONS AS (
+    SELECT A.DIMENSION, A.SIGNAL, A.PEOPLE AS DISTINCT_PEOPLE,
+      ROUND(A.PEOPLE / ASZ.COHORT_SIZE, 6) AS AUDIENCE_RATE,
+      ROUND(P.PEOPLE / PSZ.COHORT_SIZE, 6) AS POPULATION_RATE,
+      ROUND((A.PEOPLE / ASZ.COHORT_SIZE) / NULLIF(P.PEOPLE / PSZ.COHORT_SIZE, 0), 6) AS INDEX_RATIO
+    FROM ITEM_METRICS A
+    JOIN ITEM_METRICS P ON P.DIMENSION = A.DIMENSION AND P.SIGNAL = A.SIGNAL AND P.COHORT = 'POPULATION'
+    JOIN COHORT_TOTALS ASZ ON ASZ.COHORT = 'AUDIENCE'
+    JOIN COHORT_TOTALS PSZ ON PSZ.COHORT = 'POPULATION'
+    WHERE A.COHORT = 'AUDIENCE'),
+  RANKED AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY DIMENSION ORDER BY INDEX_RATIO DESC, SIGNAL) AS RN FROM COMPARISONS)
+  SELECT DIMENSION, SIGNAL, DISTINCT_PEOPLE, AUDIENCE_RATE, POPULATION_RATE, INDEX_RATIO FROM RANKED"
+# As generated: the top and bottom signals, each over its own copy of the
+# report.
+report_twice="SELECT * FROM (SELECT * FROM ($report) ORDER BY INDEX_RATIO DESC, SIGNAL LIMIT 5)
+  UNION ALL SELECT * FROM (SELECT * FROM ($report) ORDER BY INDEX_RATIO ASC, SIGNAL LIMIT 5)
+  ORDER BY INDEX_RATIO DESC, SIGNAL"
+# check_report NAME TAG QUERY: the same rows with and without workers.
+# Whether it runs on workers is reported, not yet required: statements
+# like these stay on one replica until multi-stage plans distribute them.
+check_report() {
+  local name=$1 tag=$2 query=$3 want got
+  want="$(psql_admin -c "SET sql_dialect = 'snowflake'" -c "SET distributed_execution = 'off'" \
+    -c "$query ORDER BY DIMENSION, INDEX_RATIO DESC, SIGNAL" | grep -v '^SET$')"
+  got="$(psql_admin -c "SET sql_dialect = 'snowflake'" -c "SET distributed_execution = 'on'" \
+    -c "/* $tag */ $query ORDER BY DIMENSION, INDEX_RATIO DESC, SIGNAL" | grep -v '^SET$')"
+  if [ -z "$want" ] || grep -q ERROR <<<"$want$got"; then
+    fail "$name: $(grep -h ERROR <<<"$want$got" | head -1)"
+  elif same <(echo "$want") <(echo "$got"); then
+    pass "$name returns the same rows ($(wc -l <<<"$want" | tr -d ' '))"
+  else
+    fail "$name results differ"
+    diff <(echo "$want") <(echo "$got") | head -6
+  fi
+  sleep 2
+  got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
+  printf '  info  %s ran on %s workers\n' "$name" "${got:-?}"
+}
+check_report "the report" report "SELECT * FROM ($report)"
+check_report "the report as generated, twice over" report_twice "SELECT * FROM ($report_twice)"
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
