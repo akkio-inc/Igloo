@@ -85,6 +85,8 @@ func TestUnnest(t *testing.T) {
 		`SELECT seg, count(*) FROM (SELECT person_id, unnest(segments) AS seg FROM people) GROUP BY 1 ORDER BY 1`,
 		`SELECT DISTINCT unnest(segments) AS seg FROM people ORDER BY 1`,
 		`SELECT home.city, v.day, sum(v.n) AS n FROM people, unnest(visits) AS u(v) GROUP BY ALL ORDER BY ALL LIMIT 20`,
+		`SELECT list_transform(segments, lambda x: upper(x)) AS up, count(*) AS n FROM people GROUP BY 1 ORDER BY 2 DESC, 1 NULLS FIRST LIMIT 5`,
+		`SELECT count(*) FROM people WHERE len(list_filter(segments, lambda x: x LIKE 'seg_1%')) > 0`,
 	}
 	for _, q := range []string{
 		`SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS people FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1`,
@@ -95,6 +97,10 @@ func TestUnnest(t *testing.T) {
 		`SELECT p.home:city::string AS city, f.value::string AS seg, COUNT(*) AS n FROM people p, LATERAL FLATTEN(p.segments) f
 			WHERE p.attrs:gender::string = 'f' GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2 LIMIT 10`,
 		`SELECT TRY_TO_NUMBER(p.household_id) % 3 AS h, COUNT(*) AS n FROM people p GROUP BY 1 ORDER BY 1`,
+		// Objects built with literal keys flatten as structs, through lambdas.
+		`SELECT f.value:k::string AS k, COUNT(DISTINCT p.person_id) AS n FROM people p, LATERAL FLATTEN(input =>
+			ARRAY_CONSTRUCT(OBJECT_CONSTRUCT('k', p.home:city, 'v', p.person_id), OBJECT_CONSTRUCT('k', 'x', 'v', 1))) f GROUP BY 1 ORDER BY 1`,
+		`SELECT ARRAY_TO_STRING(p.segments, ',') AS s, COUNT(*) AS n FROM people p GROUP BY 1 ORDER BY 1 NULLS FIRST`,
 	} {
 		r, err := snowflake.Translate(q, snowflake.Options{})
 		if err != nil {
@@ -118,6 +124,10 @@ func TestUnnest(t *testing.T) {
 		`SELECT count(*) FROM people, range(3)`,
 		`SELECT count(*) FROM people, LATERAL (SELECT * FROM people AS q WHERE q.person_id = people.person_id)`,
 		`SELECT count(*) FROM people, unnest((SELECT list(person_id) FROM people LIMIT 1))`,
+		// A lambda parameter named like a select alias, which planning would
+		// put in place of the parameter in GROUP BY.
+		`SELECT list_transform(segments, lambda seg: upper(seg)) AS x, count(*) AS seg FROM people GROUP BY 1`,
+		`SELECT list_transform(segments, lambda current_date: upper(current_date)) AS x, count(*) FROM people GROUP BY 1`,
 	} {
 		t.Run("local "+short(q), func(t *testing.T) {
 			if _, _, _, _, err := h.run(t.Context(), q, ModeOn); !IsUnsupported(err) {

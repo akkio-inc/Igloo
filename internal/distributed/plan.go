@@ -613,10 +613,48 @@ func (pl *planner) analyze(c *candidate, ctes []string) error {
 			return unsupported("a subquery outside WHERE")
 		}
 	}
-	if hasClass(sel, "LAMBDA") {
-		return unsupported("a lambda function")
+	return checkLambdas(sel)
+}
+
+// checkLambdas refuses lambda functions whose parameters planning could
+// take for something else: a parameter named like an alias of the select
+// list, which planning puts in place of bare names in WHERE and GROUP BY,
+// as DuckDB resolves them, or like now() and its relatives (see fixTime).
+// Otherwise a lambda is an expression like any, which workers compute as
+// the coordinator would; translations of Snowflake's array functions and
+// FLATTENs of objects call them.
+func checkLambdas(sel node) error {
+	aliases := map[string]bool{}
+	for _, item := range list(sel, "select_list") {
+		if a := strings.ToLower(str(item.(node)["alias"])); a != "" {
+			aliases[a] = true
+		}
 	}
-	return nil
+	var err error
+	walk(sel, func(n node) bool {
+		if err != nil || str(n["class"]) != "LAMBDA" {
+			return err == nil
+		}
+		params := 0
+		walk(n["lhs"], func(p node) bool {
+			if str(p["class"]) != "COLUMN_REF" {
+				return true
+			}
+			for _, name := range columnNames(p) {
+				params++
+				l := strings.ToLower(name)
+				if _, t := timeFunctions[l]; aliases[l] || t {
+					err = unsupported("a lambda parameter called %s", name)
+				}
+			}
+			return err == nil
+		})
+		if err == nil && params == 0 {
+			err = unsupported("a lambda function without parameters it names")
+		}
+		return err == nil
+	})
+	return err
 }
 
 // from analyzes a table reference in FROM, adding its items to sc and the
