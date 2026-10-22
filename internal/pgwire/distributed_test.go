@@ -250,6 +250,8 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: ds.source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Threads: 1,
 		Pool: distributed.PoolOptions{Addresses: addrs},
+		// Exchanges between stages go under the warehouse, which here is dir.
+		Warehouse: dir + "/",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -412,9 +414,14 @@ func TestDistributedFlatten(t *testing.T) {
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
-	query := `SELECT f.value::string AS tag, COUNT(DISTINCT e.id) AS n FROM events e, LATERAL FLATTEN(input => e.tags) f GROUP BY 1 ORDER BY 1`
-	read := func() string {
-		rows, err := conn.Query(ctx, query)
+	// Each run's query is its own, to find its history record by: the
+	// history records statements as translated, in the background.
+	query := func(run int) string {
+		return fmt.Sprintf(`SELECT f.value::string AS tag, COUNT(DISTINCT e.id) AS n, %d AS run FROM events e,
+			LATERAL FLATTEN(input => e.tags) f GROUP BY 1 ORDER BY 1`, run)
+	}
+	read := func(run int) string {
+		rows, err := conn.Query(ctx, query(run))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -424,38 +431,44 @@ func TestDistributedFlatten(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fmt.Fprintln(&b, vals...)
+			fmt.Fprintln(&b, vals[:2]...)
 		}
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
 		return b.String()
 	}
-	newest := func() int {
-		time.Sleep(50 * time.Millisecond)
-		qs, err := ds.history.Queries(ctx, audit.Viewer{All: true}, audit.Page{Limit: 1})
-		if err != nil || len(qs) == 0 {
-			t.Fatalf("history: %v", err)
+	workers := func(run int) int {
+		marker := fmt.Sprintf(`%d AS "RUN"`, run)
+		for range 100 {
+			qs, err := ds.history.Queries(ctx, audit.Viewer{All: true}, audit.Page{Limit: 10})
+			if err != nil {
+				t.Fatalf("history: %v", err)
+			}
+			for _, q := range qs {
+				if strings.Contains(q.Text, "sf_flatten_values") && strings.Contains(q.Text, marker) {
+					return q.Workers
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		if !strings.Contains(qs[0].Text, "sf_flatten_values") {
-			t.Fatalf("newest history record: %q", qs[0].Text)
-		}
-		return qs[0].Workers
+		t.Fatalf("no history record of run %d", run)
+		return 0
 	}
 
 	mustExec(t, conn, "SET distributed_execution = off")
 	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
-	local := read()
+	local := read(1)
 	if !strings.Contains(local, "a0 1000") || strings.Count(local, "\n") != 8 {
 		t.Fatalf("local result:\n%s", local)
 	}
 	mustExec(t, conn, "RESET sql_dialect")
 	mustExec(t, conn, "SET distributed_execution = on")
 	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
-	if got := read(); got != local {
+	if got := read(2); got != local {
 		t.Errorf("distributed result differs:\n%s\nlocal:\n%s", got, local)
 	}
-	if n := newest(); n != 2 {
+	if n := workers(2); n != 2 {
 		t.Errorf("FLATTEN ran on %d workers, want 2", n)
 	}
 
@@ -463,11 +476,10 @@ func TestDistributedFlatten(t *testing.T) {
 	// Only each array's first element.
 	mustExec(t, conn, "CREATE OR REPLACE TEMP MACRO sf_flatten_values(x, m) AS [json_extract(CAST(x AS VARCHAR), '$[0]')]")
 	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
-	changed := read()
-	if changed == local {
+	if read(3) == local {
 		t.Fatal("redefining sf_flatten_values changed nothing")
 	}
-	if n := newest(); n != 0 {
+	if n := workers(3); n != 0 {
 		t.Errorf("with a session's own sf_flatten_values, FLATTEN ran on %d workers", n)
 	}
 }
