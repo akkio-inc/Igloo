@@ -74,11 +74,16 @@ func (pl *planner) chooseKeyed(c *candidate) error {
 	err := pl.keyInputs(c)
 	if u := c.tooDeep; u != nil && IsUnsupported(err) {
 		// A large table inside a subquery that passes rows through: the
-		// subquery is a relation, written by its own stages.
-		if rerr := pl.asRelation(c, u.scope); rerr != nil {
+		// subquery of the candidate's FROM it is in is a relation, written
+		// by its own stages.
+		sc := u.scope
+		for sc.outer != nil && sc.outer != c.scope {
+			sc = sc.outer
+		}
+		if rerr := pl.asRelation(c, sc); rerr != nil {
 			return err
 		}
-		return pl.keyInputs(c)
+		return pl.chooseKeyed(c)
 	}
 	return err
 }

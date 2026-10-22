@@ -409,9 +409,9 @@ report="WITH AUDIENCE AS (
 report_twice="SELECT * FROM (SELECT * FROM ($report) ORDER BY INDEX_RATIO DESC, SIGNAL LIMIT 5)
   UNION ALL SELECT * FROM (SELECT * FROM ($report) ORDER BY INDEX_RATIO ASC, SIGNAL LIMIT 5)
   ORDER BY INDEX_RATIO DESC, SIGNAL"
-# check_report NAME TAG QUERY: the same rows with and without workers.
-# Whether it runs on workers is reported, not yet required: statements
-# like these stay on one replica until multi-stage plans distribute them.
+# check_report NAME TAG QUERY: the same rows with and without workers, and
+# workers ran its steps: the cohorts, the signals and the distinct people
+# per signal and cohort.
 check_report() {
   local name=$1 tag=$2 query=$3 want got
   want="$(psql_admin -c "SET sql_dialect = 'snowflake'" -c "SET distributed_execution = 'off'" \
@@ -428,7 +428,7 @@ check_report() {
   fi
   sleep 2
   got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
-  printf '  info  %s ran on %s workers\n' "$name" "${got:-?}"
+  if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "$name ran on $got workers"; fi
 }
 check_report "the report" report "SELECT * FROM ($report)"
 check_report "the report as generated, twice over" report_twice "SELECT * FROM ($report_twice)"
@@ -442,6 +442,13 @@ check_distributed "a join of two common table expressions" relations "WITH s AS 
   u AS (SELECT o_orderkey AS k FROM orders WHERE o_orderpriority = '1-URGENT'
     UNION ALL SELECT o_orderkey FROM orders WHERE o_orderpriority = '2-HIGH')
   SELECT count(*), sum(q), sum(sups) FROM s JOIN u ON s.k = u.k"
+
+# Every statement deletes what it exchanged through object storage.
+if compose logs --no-color igloo | grep -q "could not remove exchanged rows"; then
+  fail "exchanged rows were left in object storage: $(compose logs --no-color igloo | grep -m1 "could not remove exchanged rows")"
+else
+  pass "statements removed what they exchanged"
+fi
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table

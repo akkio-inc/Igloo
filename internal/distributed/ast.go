@@ -93,6 +93,10 @@ func (p *parser) parse(query string) (node, error) {
 // that SQL into the same tree, so a construct DuckDB cannot print
 // faithfully is caught before anything runs.
 func (p *parser) print(n node) (string, error) {
+	n, err := p.crossAsInner(n)
+	if err != nil {
+		return "", err
+	}
 	doc := node{"error": false, "statements": []any{node{"node": n, "named_param_map": []any{}}}}
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -110,6 +114,41 @@ func (p *parser) print(n node) (string, error) {
 		return "", errors.New("the generated query does not parse back to the planned one")
 	}
 	return text, nil
+}
+
+// crossAsInner returns a copy of n with its cross joins written as inner
+// joins ON true, which mean the same. DuckDB 1.5 prints a cross join as a
+// comma, which binds less tightly than JOIN: (a CROSS JOIN b) JOIN c ON x
+// comes back as a, (b JOIN c ON x), as Snowflake's FLATTENs chained with
+// conditions become.
+func (p *parser) crossAsInner(n node) (node, error) {
+	if len(collect(n, func(m node) bool { return str(m["ref_type"]) == "CROSS" })) == 0 {
+		return n, nil
+	}
+	t, err := p.expr("true")
+	if err != nil {
+		return nil, err
+	}
+	out := clone(n).(node)
+	walk(out, func(m node) bool {
+		if str(m["type"]) == "JOIN" && str(m["ref_type"]) == "CROSS" {
+			m["ref_type"], m["join_type"], m["condition"] = "REGULAR", "INNER", clone(t)
+		}
+		return true
+	})
+	return out, nil
+}
+
+// collect returns the nodes under v that match.
+func collect(v any, match func(node) bool) []node {
+	var out []node
+	walk(v, func(m node) bool {
+		if match(m) {
+			out = append(out, m)
+		}
+		return true
+	})
+	return out
 }
 
 // normalize undoes the one change DuckDB 1.5 makes to a statement it prints

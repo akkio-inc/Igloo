@@ -386,10 +386,13 @@ func (e *sessionEnv) ViewDefinition(ctx context.Context, parts []string) (*distr
 	}, true, nil
 }
 
-// tableColumns lists a table's columns as DuckDB has them.
+// tableColumns lists a table's columns as DuckDB has them. Names match as
+// DuckDB matches them, whatever their case: a statement in Snowflake's
+// dialect names lower-case tables in upper case.
 func tableColumns(ctx context.Context, sess *session, db, schema, table string) ([]distributed.Column, error) {
 	rows, err := sess.conn.QueryContext(ctx, `SELECT column_name, data_type FROM duckdb_columns()
-		WHERE database_name = $1 AND schema_name = $2 AND table_name = $3 ORDER BY column_index`,
+		WHERE lower(database_name) = lower($1) AND lower(schema_name) = lower($2) AND lower(table_name) = lower($3)
+		ORDER BY column_index`,
 		[]driver.NamedValue{{Ordinal: 1, Value: db}, {Ordinal: 2, Value: schema}, {Ordinal: 3, Value: table}})
 	if err != nil {
 		return nil, err
