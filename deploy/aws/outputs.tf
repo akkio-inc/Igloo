@@ -40,7 +40,7 @@ output "kubeconfig_command" {
 }
 
 output "node_group" {
-  description = "Settings of the EKS managed node group: instance types, capacity type (ON_DEMAND or SPOT), AMI type and sizes."
+  description = "Settings of the EKS managed node group: instance types, capacity type (ON_DEMAND or SPOT), AMI type, sizes, and local_storage: RAID0 when the instance store holds pods' emptyDir volumes (and so DuckDB's spill files), none when they are on the root volume."
   value       = local.node_group
 }
 

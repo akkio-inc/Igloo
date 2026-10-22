@@ -13,7 +13,7 @@ module from other code, because it configures its own providers.
 | Component | Details |
 |---|---|
 | VPC | New VPC (`10.0.0.0/16` by default) across up to three availability zones: public subnets (NAT gateway, load balancer), private subnets (nodes), database subnets (RDS). One NAT gateway by default. A free S3 gateway endpoint keeps table reads and writes off the NAT gateway. |
-| EKS | Cluster with the VPC CNI (NetworkPolicy enforcement on), kube-proxy and CoreDNS add-ons. Kubernetes secrets are encrypted with a KMS key. One managed node group: 2 x `r7g.xlarge` (Graviton, 4 vCPU, 32 GiB), 150 GiB encrypted gp3 root volume each, Amazon Linux 2023. |
+| EKS | Cluster with the VPC CNI (NetworkPolicy enforcement on), kube-proxy and CoreDNS add-ons. Kubernetes secrets are encrypted with a KMS key. One managed node group: 2 x `r7gd.xlarge` (Graviton, 4 vCPU, 32 GiB, 237 GB local NVMe SSD), 150 GiB encrypted gp3 root volume each, Amazon Linux 2023. The NVMe instance store holds kubelet's and containerd's directories, and with them DuckDB's spill files ([Spill on local NVMe](#spill-on-local-nvme)). |
 | S3 | Private bucket for Iceberg data, tables under `s3://<bucket>/warehouse`. All public access blocked, SSE-S3 encryption (or your KMS key), a policy that rejects requests without TLS, a lifecycle rule that removes abandoned multipart uploads. Versioning optional. |
 | RDS | PostgreSQL 17, `db.t4g.small`, 20 GiB gp3 (autoscaling to 100 GiB), encrypted, private, reachable only from the cluster, TLS required, 7 days of backups, deletion protection on. One database, `igloo`, holds the catalog (schema `public`) and Igloo's users (schema `igloo_auth`). |
 | IAM | Two roles for service accounts (IRSA): one for the igloo pods and one for the Lakekeeper catalog. Each can be assumed only by its own Kubernetes service account and can only list, read, write and delete objects under `warehouse/` in the bucket. A third, `<name_prefix>-engines`, with the same access, can be assumed only by the igloo role: Igloo assumes it, with a session policy for one table, to hand [other engines](../../docs/external-engines.md) credentials for that table for an hour. |
@@ -135,12 +135,12 @@ prices, before data transfer and S3 usage. Other regions differ; check the
 | Item | Rate | Per month |
 |---|---|---|
 | EKS control plane | $0.10/hour | $73 |
-| 2 x r7g.xlarge nodes | $0.2142/hour each | $313 |
+| 2 x r7gd.xlarge nodes | $0.2722/hour each | $397 |
 | 2 x 150 GiB gp3 node volumes | $0.08/GB-month | $24 |
 | NAT gateway + its public IPv4 address | $0.045 + $0.005/hour | $37, plus $0.045/GB through it |
 | RDS db.t4g.small, single-AZ, 20 GiB gp3 | $0.032/hour + $0.115/GB-month | $26 |
 | KMS key, CloudWatch control-plane logs | | $2 to $10 |
-| **Total** | | **about $475** |
+| **Total** | | **about $560** |
 | S3 storage and requests | $0.023/GB-month, $0.005 per 1,000 writes | depends on data |
 | With `expose_sql`: NLB + 3 public IPv4 addresses | $0.0225/hour + capacity units | about $30 more |
 
@@ -149,9 +149,14 @@ Ways to spend less:
 - `node_use_spot = true` usually cuts the node line by 60 to 70%. Spot nodes
   can be reclaimed with two minutes' notice, which ends queries running on
   them. List several types, e.g.
-  `node_instance_types = ["r7g.xlarge", "r6g.xlarge", "r8g.xlarge"]`.
-- `node_instance_types = ["m7g.xlarge"]` (16 GiB) with `igloo_memory = "6Gi"`
-  costs about $75 less, at half the memory per query engine.
+  `node_instance_types = ["r7gd.xlarge", "r6gd.xlarge", "r8gd.xlarge"]`.
+- `node_instance_types = ["r7g.xlarge"]`, the same machine without the
+  instance store, costs about $85 less, and DuckDB then spills to the gp3
+  root volume, which is far slower (see below).
+- `node_instance_types = ["m7gd.xlarge"]` (16 GiB) with `igloo_memory = "6Gi"`
+  also costs about $85 less, at half the memory per query engine.
+- With instance store, `node_disk_size_gib = 30` saves about $19: the root
+  volume then holds only the operating system.
 - Keep `db_multi_az = false` (the default) unless you need a database standby.
 
 Why these defaults: DuckDB's speed depends mostly on memory, so the nodes are
@@ -159,11 +164,57 @@ memory-optimized Graviton instances, which cost less than x86 for the same
 work. Each node fits two igloo pods (1.5 CPU requested, 12 GiB), so two nodes
 run the two replicas with room for a rolling update. Pods have no CPU limit
 and use idle cores. DuckDB gets about 80% of the pod's memory and spills
-larger queries to the node's disk (`duckdb_spill_size`, 50 GiB per pod).
+larger queries to the node's disk (`duckdb_spill_size`, 50 GiB per pod),
+which is why the nodes are the `d` variant with a local NVMe disk.
 
 No cluster autoscaler is installed. To add capacity, raise `node_min_size`
 (`node_desired_size` is ignored after the node group exists) or scale the node
 group in the EKS console, and raise `igloo_replicas`.
+
+### Spill on local NVMe
+
+Queries larger than memory (big joins, aggregations and sorts) write and read
+back DuckDB's spill files, tens to hundreds of GiB for heavy reports, so the
+disk under the spill directory sets their speed. The gp3 root volume gives
+3,000 IOPS and 125 MB/s unless you pay for more; the instance store of an
+`r7gd.xlarge` is a 237 GB NVMe SSD on the host, rated at about 67,000 read
+and 33,000 write IOPS, and costs nothing extra beyond the instance.
+
+When any type in `node_instance_types` has an instance store (the `d` types
+such as `r7gd`, `m7gd`, `c7gd`, `r8gd`, and storage-optimized types such as
+`i4i`), the module adds a nodeadm `NodeConfig` to the node group's user data:
+
+```yaml
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  instance:
+    localStorage:
+      strategy: RAID0
+```
+
+At boot, nodeadm puts the instance store disks in a RAID0 array, mounts it
+under `/mnt/k8s-disks/0`, and bind-mounts `/var/lib/kubelet`,
+`/var/lib/containerd` and `/var/log/pods` onto it. Every `emptyDir`,
+including the chart's spill volume at `/var/lib/igloo/tmp`, is then on NVMe,
+and the node's allocatable ephemeral storage is the array's size. Nodes of a
+listed type without instance store skip this, and spill to the root volume.
+`tofu output node_group` shows `local_storage = "RAID0"` when it is on.
+
+The instance store is emptied when an instance stops or is replaced; spill
+files only live for a query, so nothing is lost. It cannot be resized: the
+igloo pods on a node share it with the container images. On an
+`r7gd.xlarge` (237 GB), two pods with the default 50 GiB spill limit fit with
+room to spare. For reports that spill around 100 GiB, set
+`duckdb_spill_size = "120Gi"` and use `r7gd.2xlarge` (474 GB, 64 GiB of
+memory), which holds two such pods. DuckDB stops at 90% of
+`duckdb_spill_size`, so a query that needs more fails instead of filling the
+disk.
+
+Types without instance store (`node_instance_types = ["r7g.xlarge"]`) keep
+the node group's user data empty, as before, and spill to the gp3 root
+volume: leave `node_disk_size_gib` room for `duckdb_spill_size` times the
+igloo pods per node.
 
 ## Common settings
 
@@ -174,7 +225,7 @@ group in the EKS console, and raise `igloo_replicas`.
 | `igloo_image_repository` | chart default | Igloo image repository, for a mirror or private registry |
 | `igloo_replicas`, `igloo_cpu_request`, `igloo_memory` | `2`, `1500m`, `12Gi` | Query engine pods |
 | `duckdb_memory_limit`, `duckdb_threads`, `duckdb_spill_size` | 80% of pod, cores, `50Gi` | DuckDB tuning |
-| `node_instance_types`, `node_use_spot`, `node_min_size`/`node_max_size`/`node_desired_size`, `node_disk_size_gib` | `["r7g.xlarge"]`, `false`, 2/4/2, 150 | Nodes |
+| `node_instance_types`, `node_use_spot`, `node_min_size`/`node_max_size`/`node_desired_size`, `node_disk_size_gib` | `["r7gd.xlarge"]`, `false`, 2/4/2, 150 | Nodes; spill goes to the instance store of types that have one |
 | `db_instance_class`, `db_multi_az`, `db_backup_retention_days`, `db_deletion_protection` | `db.t4g.small`, `false`, 7, `true` | Database |
 | `bucket_name`, `bucket_versioning`, `bucket_kms_key_arn`, `bucket_force_destroy` | generated, `false`, SSE-S3, `false` | Table bucket |
 | `expose_sql`, `sql_allowed_cidrs`, `sql_load_balancer_internal` | `false`, none, `false` | SQL access from outside the cluster |
@@ -287,4 +338,5 @@ private and encrypted, each IAM role trusts only its own service account and
 reaches only the warehouse prefix, only the igloo role may assume the engines
 role (whose ARN the chart gets as `storage.s3.stsRoleArn`), the Helm values carry the warehouse
 location and `systemCredentials: aws`, the SQL service stays ClusterIP unless
-exposed, and bad input is rejected.
+exposed, node types with instance store get the RAID0 `NodeConfig` and others
+none, and bad input is rejected.

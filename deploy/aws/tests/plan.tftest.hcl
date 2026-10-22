@@ -31,6 +31,12 @@ mock_provider "aws" {
       dns_suffix = "amazonaws.com"
     }
   }
+  # Each run that looks at node local storage overrides this.
+  mock_data "aws_ec2_instance_type" {
+    defaults = {
+      instance_storage_supported = false
+    }
+  }
   mock_data "aws_iam_policy_document" {
     defaults = {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
@@ -108,6 +114,12 @@ variables {
 
 run "defaults" {
   command = plan
+
+  # r7gd.xlarge has a 237 GB NVMe instance store.
+  override_data {
+    target = data.aws_ec2_instance_type.node
+    values = { instance_storage_supported = true }
+  }
 
   # Distinct role ARNs, so the test can tell which role each service account gets.
   override_resource {
@@ -396,9 +408,14 @@ run "defaults" {
     condition = (
       output.node_group.ami_type == "AL2023_ARM_64_STANDARD" &&
       output.node_group.capacity_type == "ON_DEMAND" &&
-      output.node_group.instance_types == tolist(["r7g.xlarge"])
+      output.node_group.instance_types == tolist(["r7gd.xlarge"])
     )
-    error_message = "Default nodes must be on-demand Graviton (r7g.xlarge) on the arm64 AMI."
+    error_message = "Default nodes must be on-demand Graviton (r7gd.xlarge) on the arm64 AMI."
+  }
+
+  assert {
+    condition     = output.node_group.local_storage == "RAID0" && output.node_group.disk_size_gib == 150
+    error_message = "Nodes with instance store must RAID0 it under kubelet, so DuckDB spills to local NVMe."
   }
 
   assert {
@@ -551,9 +568,20 @@ run "spot_x86_without_chart" {
     install_chart       = false
   }
 
+  # Neither type has instance store.
+  override_data {
+    target = data.aws_ec2_instance_type.node
+    values = { instance_storage_supported = false }
+  }
+
   assert {
     condition     = output.node_group.ami_type == "AL2023_x86_64_STANDARD" && output.node_group.capacity_type == "SPOT"
     error_message = "x86 Spot instance types must select the x86_64 AMI and SPOT capacity."
+  }
+
+  assert {
+    condition     = output.node_group.local_storage == "none"
+    error_message = "Types without instance store must keep the node group's user data as it was (no localStorage setting)."
   }
 
   assert {

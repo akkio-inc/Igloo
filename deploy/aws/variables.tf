@@ -106,9 +106,9 @@ variable "cluster_admin_arns" {
 }
 
 variable "node_instance_types" {
-  description = "EC2 instance types for the node group. All must share one CPU architecture; Graviton (arm64) types such as r7g.xlarge select the arm64 AMI automatically. On-demand nodes use the first type; Spot nodes may use any of them, so list several when node_use_spot is true."
+  description = "EC2 instance types for the node group. All must share one CPU architecture; Graviton (arm64) types such as r7gd.xlarge select the arm64 AMI automatically. Types with local NVMe instance store (the \"d\" types such as r7gd, m7gd, c7gd) get it RAID0ed under kubelet, so DuckDB spills to it instead of the root EBS volume. On-demand nodes use the first type; Spot nodes may use any of them, so list several when node_use_spot is true."
   type        = list(string)
-  default     = ["r7g.xlarge"]
+  default     = ["r7gd.xlarge"]
 
   validation {
     condition     = length(var.node_instance_types) > 0 && alltrue([for t in var.node_instance_types : can(regex("^[a-z][a-z0-9-]*\\.[a-z0-9]+$", t))])
@@ -161,7 +161,7 @@ variable "node_desired_size" {
 }
 
 variable "node_disk_size_gib" {
-  description = "Root EBS volume (gp3, encrypted) per node in GiB. DuckDB spills large queries to it, so leave room for duckdb_spill_size times the igloo pods per node."
+  description = "Root EBS volume (gp3, encrypted) per node in GiB. On types without instance store, DuckDB spills large queries to it, so leave room for duckdb_spill_size times the igloo pods per node. On types with instance store, pods and images live on the instance store and this volume holds only the operating system, so 30 is enough."
   type        = number
   default     = 150
 
@@ -349,7 +349,7 @@ variable "igloo_replicas" {
 }
 
 variable "igloo_cpu_request" {
-  description = "CPU request per igloo pod. There is no CPU limit, so pods use idle cores on their node. The default fits two pods, plus room for a rolling update, on two r7g.xlarge nodes."
+  description = "CPU request per igloo pod. There is no CPU limit, so pods use idle cores on their node. The default fits two pods, plus room for a rolling update, on two r7gd.xlarge nodes."
   type        = string
   default     = "1500m"
 
@@ -393,7 +393,7 @@ variable "duckdb_threads" {
 }
 
 variable "duckdb_spill_size" {
-  description = "Size limit of each igloo pod's spill directory (an emptyDir on the node's root volume)."
+  description = "Size limit of each igloo pod's spill directory, an emptyDir: on the node's instance store with types that have one, else on its root volume. The igloo pods on a node share that disk (237 GB of NVMe on r7gd.xlarge)."
   type        = string
   default     = "50Gi"
 

@@ -19,9 +19,10 @@ name_prefix = "igloo"
 # expose_sql        = true
 # sql_allowed_cidrs = ["203.0.113.0/24"]
 
-# Cheaper, interruptible nodes. List several Graviton types for Spot capacity.
+# Cheaper, interruptible nodes. List several Graviton types for Spot capacity;
+# "d" types keep DuckDB's spill files on their local NVMe.
 # node_use_spot       = true
-# node_instance_types = ["r7g.xlarge", "r6g.xlarge", "r8g.xlarge"]
+# node_instance_types = ["r7gd.xlarge", "r6gd.xlarge", "r8gd.xlarge"]
 
 tags = {
   Team = "data"

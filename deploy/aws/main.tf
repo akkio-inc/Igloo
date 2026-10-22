@@ -13,6 +13,13 @@ locals {
   # Graviton families have a "g" after the generation digit: r7g, m7gd, c7gn, t4g.
   node_arm64 = can(regex("^[a-z]+[0-9]+[a-z]*g[a-z]*\\.", var.node_instance_types[0]))
 
+  # Types with local NVMe instance store (r7gd, m7gd, c7gd, i4i, ...). On
+  # them nodeadm puts the disks in a RAID0 array and moves kubelet's and
+  # containerd's directories onto it, so pods' emptyDir volumes, DuckDB's
+  # spill directory among them, are on local NVMe rather than the root EBS
+  # volume. Nodes of a listed type without instance store skip it.
+  node_instance_store = anytrue([for t in data.aws_ec2_instance_type.node : t.instance_storage_supported])
+
   node_group = {
     ami_type       = local.node_arm64 ? "AL2023_ARM_64_STANDARD" : "AL2023_x86_64_STANDARD"
     instance_types = var.node_instance_types
@@ -21,6 +28,8 @@ locals {
     max_size       = var.node_max_size
     desired_size   = var.node_desired_size
     disk_size_gib  = var.node_disk_size_gib
+    # nodeadm's spec.instance.localStorage.strategy, or "none".
+    local_storage = local.node_instance_store ? "RAID0" : "none"
   }
 
   # Up to three availability zones. EKS needs at least two; so does RDS.
@@ -55,6 +64,12 @@ data "aws_availability_zones" "available" {
 }
 
 data "aws_partition" "current" {}
+
+data "aws_ec2_instance_type" "node" {
+  for_each = toset(var.node_instance_types)
+
+  instance_type = each.value
+}
 
 resource "random_id" "suffix" {
   byte_length = 4
@@ -179,6 +194,21 @@ module "eks" {
       min_size     = local.node_group.min_size
       max_size     = local.node_group.max_size
       desired_size = local.node_group.desired_size
+
+      # Merged with the NodeConfig EKS supplies. Without instance store
+      # there is no user data, as before.
+      cloudinit_pre_nodeadm = local.node_group.local_storage == "RAID0" ? [{
+        content_type = "application/node.eks.aws"
+        content      = <<-EOT
+          ---
+          apiVersion: node.eks.aws/v1alpha1
+          kind: NodeConfig
+          spec:
+            instance:
+              localStorage:
+                strategy: RAID0
+        EOT
+      }] : null
 
       block_device_mappings = {
         xvda = {
