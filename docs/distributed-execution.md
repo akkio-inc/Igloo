@@ -92,7 +92,9 @@ In detail, a part runs distributed when:
   table expression or a branch of `UNION`) whose `FROM` clause reads catalog
   tables, through inner, cross, `LEFT` (keeping the large table's rows),
   `SEMI`, `ANTI` and `ASOF` joins and subqueries that only filter and
-  compute columns.
+  compute columns. It may unnest its rows' values: `unnest`, `json_each`
+  and `json_tree` of them, and lateral subqueries that read no table, which
+  is what Snowflake's `FLATTEN` becomes (with `OUTER` and `RECURSIVE` too).
 - Its aggregates are `count`, `sum`, `min`, `max`, `avg`, `count_if`,
   `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `any_value`,
   `fsum` and `product`, with or without `FILTER`, and any aggregate over
@@ -207,8 +209,9 @@ parts on the workers.
   storage: each task lists the data files to read, which Igloo took from
   the tables' Iceberg metadata, never from a path a user wrote. A worker
   refuses files outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`, and a
-  task whose SQL reads anything but the files it lists (a table function, a
-  table by name). Their DuckDB is locked down as the server's is: no local
+  task whose SQL reads anything but the files it lists (a table function
+  other than `unnest`, `json_each` and `json_tree` of values, a table by
+  name). Their DuckDB is locked down as the server's is: no local
   files, no other locations, no SQL from strings.
 - **Policies keep a statement on one machine.** A statement that masking
   or row access policies apply to, or that names anything they concern,

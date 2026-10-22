@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/apache/iceberg-go"
+
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 // peopleColumns are the field IDs of the people table: a person table
@@ -58,6 +60,68 @@ func TestNestedColumns(t *testing.T) {
 			h.t = t
 			if !h.check(q) {
 				t.Error("did not run distributed")
+			}
+		})
+	}
+}
+
+// TestUnnest checks lateral unnests of a split table's lists and maps, in
+// DuckDB's forms and as Snowflake's FLATTEN becomes them, which call
+// Igloo's sf_ macros: each row's elements are computed from the row alone,
+// so they run on workers like a filter.
+func TestUnnest(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	h.addPeople(20000, 6)
+	for _, stmt := range snowflake.Macros() {
+		h.exec(stmt)
+	}
+	queries := []string{
+		`SELECT seg, count(DISTINCT person_id) AS people FROM people, unnest(segments) AS u(seg) GROUP BY seg ORDER BY seg`,
+		`SELECT count(*) FROM people CROSS JOIN LATERAL (SELECT unnest(segments) AS seg) s WHERE s.seg <> 'seg_0'`,
+		`SELECT s.seg, count(*) AS n FROM people p JOIN LATERAL (SELECT unnest(p.segments) AS seg) s ON s.seg LIKE 'seg_1%' GROUP BY 1 ORDER BY 1`,
+		`SELECT k, count(*) AS n FROM people, LATERAL (SELECT unnest(map_keys(attrs)) AS k) GROUP BY 1 ORDER BY 1`,
+		`SELECT j.key, j.value, count(DISTINCT person_id) AS n FROM people, json_each(to_json(attrs)) AS j GROUP BY 1, 2 ORDER BY 1, 2`,
+		`SELECT count(*) FROM people p WHERE EXISTS (SELECT 1 FROM unnest(p.segments) AS u(s) WHERE s = 'seg_2')`,
+		`SELECT seg, count(*) FROM (SELECT person_id, unnest(segments) AS seg FROM people) GROUP BY 1 ORDER BY 1`,
+		`SELECT DISTINCT unnest(segments) AS seg FROM people ORDER BY 1`,
+		`SELECT home.city, v.day, sum(v.n) AS n FROM people, unnest(visits) AS u(v) GROUP BY ALL ORDER BY ALL LIMIT 20`,
+	}
+	for _, q := range []string{
+		`SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS people FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1`,
+		`SELECT f.key AS k, f.value::string AS v, COUNT(DISTINCT p.person_id) AS n FROM people p, TABLE(FLATTEN(p.attrs)) f GROUP BY 1, 2 ORDER BY 1, 2`,
+		`SELECT COUNT(DISTINCT p.person_id) AS n FROM people p, LATERAL FLATTEN(input => p.segments) f WHERE f.value::string IN ('seg_1', 'seg_2')`,
+		`SELECT f.index AS i, f.this IS NULL AS t, COUNT(*) AS n FROM people p, LATERAL FLATTEN(input => p.segments, outer => true) f GROUP BY 1, 2 ORDER BY 1, 2`,
+		`SELECT v.value:n::int AS n, COUNT(*) AS c FROM people p, LATERAL FLATTEN(input => p.visits) v GROUP BY 1 ORDER BY 1`,
+		`SELECT p.home:city::string AS city, f.value::string AS seg, COUNT(*) AS n FROM people p, LATERAL FLATTEN(p.segments) f
+			WHERE p.attrs:gender::string = 'f' GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2 LIMIT 10`,
+		`SELECT TRY_TO_NUMBER(p.household_id) % 3 AS h, COUNT(*) AS n FROM people p GROUP BY 1 ORDER BY 1`,
+	} {
+		r, err := snowflake.Translate(q, snowflake.Options{})
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		queries = append(queries, r.SQL)
+	}
+	for _, q := range queries {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Error("did not run distributed")
+			}
+		})
+	}
+	h.t = t
+	for _, q := range []string{
+		// Computed once on one machine, and once per worker.
+		`SELECT count(*) FROM people, (SELECT random() < 2 AS r) x WHERE x.r`,
+		// Not a function of the row's values.
+		`SELECT count(*) FROM people, range(3)`,
+		`SELECT count(*) FROM people, LATERAL (SELECT * FROM people AS q WHERE q.person_id = people.person_id)`,
+		`SELECT count(*) FROM people, unnest((SELECT list(person_id) FROM people LIMIT 1))`,
+	} {
+		t.Run("local "+short(q), func(t *testing.T) {
+			if _, _, _, _, err := h.run(t.Context(), q, ModeOn); !IsUnsupported(err) {
+				t.Errorf("want it to run on one machine, got %v", err)
 			}
 		})
 	}

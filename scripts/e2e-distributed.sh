@@ -9,7 +9,8 @@
 #   - statement timeouts reach the workers,
 #   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
-#   - tables with lists, maps and structs run distributed,
+#   - tables with lists, maps and structs run distributed, unnests and
+#     Snowflake's FLATTEN of them too,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
@@ -281,20 +282,33 @@ echo "nested columns"
 } | psql_admin -q >/dev/null
 nested_query="SELECT attrs['tier'] AS tier, count(*), count(DISTINCT contact.name), sum(len(segments)),
   count(*) FILTER (WHERE list_contains(segments, 'BUILDING')) FROM people GROUP BY 1 ORDER BY 1"
+# check_distributed NAME TAG QUERY [DIALECT [HISTORY_PATTERN]]: QUERY returns
+# the same rows with and without workers, and its history record (found by
+# its leading /* TAG */ comment, or by HISTORY_PATTERN, for statements the
+# history records as translated) shows that workers ran it.
 check_distributed() {
-  local name=$1 tag=$2 query=$3 want got
-  want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$query" | grep -v '^SET$')"
-  got="$(psql_admin -c "SET distributed_execution = 'on'" -c "/* $tag */ $query" | grep -v '^SET$')"
+  local name=$1 tag=$2 query=$3 dialect=${4:-duckdb} pattern=${5:-"/* $2 */%"} want got
+  want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SET sql_dialect = '$dialect'" -c "$query" | grep -v '^SET$')"
+  got="$(psql_admin -c "SET distributed_execution = 'on'" -c "SET sql_dialect = '$dialect'" -c "/* $tag */ $query" | grep -v '^SET$')"
   if [ -n "$want" ] && ! grep -q ERROR <<<"$want" && [ "$got" = "$want" ]; then
     pass "$name returns the same rows"
   else
     fail "$name: [$got], want [$want]"
   fi
   sleep 2
-  got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
+  got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '$pattern' ORDER BY start_time DESC LIMIT 1")"
   if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "$name ran on $got workers"; fi
 }
 check_distributed "a table with lists, maps and structs" nested "$nested_query"
+check_distributed "an unnest of a list column" unnest \
+  "SELECT seg, count(DISTINCT person_id) FROM people, unnest(segments) AS u(seg) GROUP BY 1 ORDER BY 1"
+# FLATTEN becomes unnests of Igloo's sf_ macros, which workers define too.
+check_distributed "Snowflake's FLATTEN" flatten \
+  "SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS people, COUNT(*) AS n
+   FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%sf_flatten_values(p.segments%'
+check_distributed "Snowflake's FLATTEN of an OBJECT column" flatten_object \
+  "SELECT f.key AS k, f.value::string AS v, COUNT(*) AS n FROM people p, TABLE(FLATTEN(p.attrs)) f
+   WHERE p.person_id % 2 = 0 GROUP BY 1, 2 ORDER BY 1, 2" snowflake '%sf_flatten_values(p.attrs%'
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table

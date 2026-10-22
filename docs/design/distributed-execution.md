@@ -175,7 +175,12 @@ explicit transactions, the coordinator plans it:
    reads catalog tables through joins that keep the largest table's rows
    whole (inner and cross joins, `LEFT`/`SEMI`/`ANTI`/`ASOF` with the large
    table on the kept side, and subqueries that only filter and project) and
-   whose aggregates can be computed in parts. The largest table, by its
+   whose aggregates can be computed in parts. Items of `FROM` that read no
+   table compute their rows from the row they are lateral to alone, as a
+   filter does, so they may run anywhere: `unnest`, `json_each` and
+   `json_tree` of values, and subqueries without tables, which is what
+   Snowflake's `FLATTEN` becomes, unless they call a volatile function
+   (`random()`), which one machine might call once for all rows. The largest table, by its
    snapshot's file size in Iceberg metadata, is the split table; it must
    appear once. Every other table must be a catalog table small enough for
    every worker to read (an eighth of the smallest worker's memory, in
@@ -226,7 +231,11 @@ explicit transactions, the coordinator plans it:
    original, found by binding the aggregates in the session. Grouping sets
    group the workers' rows by all of their columns and are applied by the
    coordinator. `now()` and `current_date` become the statement's planning
-   time everywhere.
+   time everywhere. Statements translated from Snowflake's dialect call
+   Igloo's own macros (`sf_flatten_values` and the like, plain expressions
+   that every session defines); workers define the same macros for a
+   fragment that calls them, and the planner counts them as built in only
+   while the session's definitions are exactly Igloo's.
 5. **Check the rewrite**: each generated query is printed with
    `json_deserialize_sql` and parsed again, and must give back the planned
    tree, so a construct DuckDB cannot print faithfully falls back instead
@@ -348,9 +357,10 @@ result's columns must match the prepared statement's, or it falls back.
   with only the warehouse, the allowed locations, its spill directory and
   its cache allowed, no extensions loaded at run time. A worker parses a
   task's SQL and refuses it unless it reads only the task's views: no table
-  function, no table by name. The planner never distributes a part that
-  reads a table function, a view, a temporary table, a connection's table
-  or an external table.
+  function but `unnest`, `json_each` and `json_tree` of values, no table by
+  name. The planner never distributes a part that reads another table
+  function, a view, a temporary table, a connection's table or an external
+  table.
 - **No new endpoint is open.** Workers accept tasks only over TLS 1.3 with a
   client certificate whose key is derived (HKDF-SHA256, Ed25519) from
   `IGLOO_WORKER_SECRET`, and coordinators accept results only from servers

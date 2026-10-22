@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 // Distributed execution (docs/distributed-execution.md): a SELECT that
@@ -406,17 +408,106 @@ func (e *sessionEnv) Describe(ctx context.Context, query string) ([]distributed.
 }
 
 // UserFunction reports whether name is a function or macro someone
-// defined, rather than one built into DuckDB or its extensions.
+// defined, rather than one built into DuckDB or its extensions. Igloo's
+// own macros for Snowflake's functions (snowflake.Macros), which workers
+// define too, count as built in while the session's are exactly those:
+// redefining any of them makes them all the session's own.
 func (e *sessionEnv) UserFunction(ctx context.Context, name string) (bool, error) {
 	if e.userFns == nil {
-		names, err := queryStrings(ctx, e.sess, `SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal`)
+		defs, err := macroDefinitions(ctx, e.sess.conn, `NOT internal`)
 		if err != nil {
 			return false, err
 		}
+		standard, err := e.s.snowflakeMacros(ctx)
+		if err != nil {
+			return false, err
+		}
+		var sf []string
 		e.userFns = map[string]bool{}
-		for _, n := range names {
-			e.userFns[n] = true
+		for _, d := range defs {
+			e.userFns[d.name] = true
+			if strings.HasPrefix(d.name, "sf_") {
+				sf = append(sf, d.key)
+			}
+		}
+		slices.Sort(sf)
+		if slices.Equal(sf, standard) {
+			for n := range e.userFns {
+				if strings.HasPrefix(n, "sf_") {
+					delete(e.userFns, n)
+				}
+			}
 		}
 	}
 	return e.userFns[strings.ToLower(name)], nil
+}
+
+// macroDefinition is a function or macro overload as duckdb_functions()
+// lists it.
+type macroDefinition struct {
+	// name is lower case; key is everything that defines the overload.
+	name, key string
+}
+
+// macroDefinitions lists the functions and macros duckdb_functions() has
+// where cond holds.
+func macroDefinitions(ctx context.Context, conn *duckdb.Conn, cond string) ([]macroDefinition, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT lower(function_name), function_type || chr(31) || database_name || chr(31) ||
+		coalesce(schema_name, '') || chr(31) || function_name || chr(31) || coalesce(parameters::VARCHAR, '') || chr(31) ||
+		coalesce(macro_definition, '') FROM duckdb_functions() WHERE `+cond, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var out []macroDefinition
+	dest := make([]driver.Value, 2)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		name, _ := dest[0].(string)
+		key, _ := dest[1].(string)
+		out = append(out, macroDefinition{name: name, key: key})
+	}
+}
+
+var (
+	sfMacrosMu sync.Mutex
+	// sfMacros are the keys of Igloo's macros for Snowflake's functions as
+	// a session defines them, sorted.
+	sfMacros []string
+)
+
+// snowflakeMacros returns the keys (see macroDefinitions) of the macros
+// snowflake.Macros defines, as a fresh connection lists them.
+func (s *Server) snowflakeMacros(ctx context.Context) ([]string, error) {
+	sfMacrosMu.Lock()
+	defer sfMacrosMu.Unlock()
+	if sfMacros != nil {
+		return sfMacros, nil
+	}
+	conn, err := s.engine.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close() //nolint:errcheck
+	for _, stmt := range snowflake.Macros() {
+		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+			return nil, err
+		}
+	}
+	defs, err := macroDefinitions(ctx, conn, `NOT internal AND lower(function_name) LIKE 'sf\_%' ESCAPE '\'`)
+	if err != nil {
+		return nil, err
+	}
+	keys := []string{}
+	for _, d := range defs {
+		keys = append(keys, d.key)
+	}
+	slices.Sort(keys)
+	sfMacros = keys
+	return keys, nil
 }

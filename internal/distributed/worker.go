@@ -25,6 +25,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 // A worker runs fragments for coordinators. It is an Igloo process with a
@@ -255,8 +256,18 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			return "", nil, fmt.Errorf("set %s: %w", s.Name, err)
 		}
 	}
-	if err := checkTaskSQL(ctx, conn, req); err != nil {
+	sfMacros, err := checkTaskSQL(ctx, conn, req)
+	if err != nil {
 		return "", nil, err
+	}
+	if sfMacros {
+		// Igloo's own macros, which statements translated from Snowflake's
+		// dialect call (FLATTEN among them), as every session has them.
+		for _, stmt := range snowflake.Macros() {
+			if err := exec(stmt); err != nil {
+				return "", nil, fmt.Errorf("define Snowflake's functions: %w", err)
+			}
+		}
 	}
 	start := time.Now()
 	var byID []string
@@ -400,31 +411,33 @@ func globFiles(ctx context.Context, conn *duckdb.Conn, pattern string) ([]string
 
 // checkTaskSQL refuses a task whose SQL could read anything but the views
 // the task defines over the files it lists: a table of any database, a
-// table function (read_parquet of a path, say) or a statement over a table
-// by name (SUMMARIZE). Coordinators never send such a task, since their
-// planner distributes only statements over catalog tables; this keeps a
-// worker to the files a task lists all the same. Only a holder of the
-// worker secret can send a task at all.
-func checkTaskSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest) error {
+// table function other than unnest, json_each and json_tree of values
+// (read_parquet of a path, say) or a statement over a table by name
+// (SUMMARIZE). Coordinators never send such a task, since their planner
+// distributes only statements over catalog tables; this keeps a worker to
+// the files a task lists all the same. Only a holder of the worker secret
+// can send a task at all. sfMacros says the SQL calls Igloo's macros for
+// Snowflake's functions, which the worker then defines.
+func checkTaskSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest) (sfMacros bool, err error) {
 	rows, err := conn.QueryContext(ctx, "SELECT json_serialize_sql("+quoteLiteral(req.SQL)+")::VARCHAR", nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	dest := make([]driver.Value, 1)
 	err = rows.Next(dest)
 	_ = rows.Close()
 	if err != nil {
-		return err
+		return false, err
 	}
 	text, _ := dest[0].(string)
 	doc, err := decodeJSON(text)
 	if err != nil {
-		return err
+		return false, err
 	}
 	tree, _ := doc.(node)
 	stmts := list(tree, "statements")
 	if tree == nil || tree["error"] == true || len(stmts) != 1 {
-		return unsupported("a task's SQL must be one statement that parses")
+		return false, unsupported("a task's SQL must be one statement that parses")
 	}
 	names := map[string]bool{}
 	for _, v := range req.Views {
@@ -445,12 +458,21 @@ func checkTaskSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest) erro
 			if str(n["catalog_name"]) != "" || str(n["schema_name"]) != "" || !names[strings.ToLower(str(n["table_name"]))] {
 				err = unsupported("a task's SQL reads %s, which is not one of its views", str(n["table_name"]))
 			}
-		case "TABLE_FUNCTION", "SHOW_REF":
-			err = unsupported("a task's SQL may read only its views, not a %s", strings.ToLower(strings.ReplaceAll(t, "_", " ")))
+		case "TABLE_FUNCTION":
+			// unnest, json_each and json_tree read their arguments, which the
+			// walk checks too.
+			if rowFunction(n) != nil {
+				err = unsupported("a task's SQL may read only its views, not a table function")
+			}
+		case "SHOW_REF":
+			err = unsupported("a task's SQL may read only its views, not a show ref")
+		}
+		if str(n["class"]) == "FUNCTION" && strings.HasPrefix(strings.ToLower(str(n["function_name"])), "sf_") {
+			sfMacros = true
 		}
 		return err == nil
 	})
-	return err
+	return sfMacros, err
 }
 
 // footer is what a data file's footer says of its columns.

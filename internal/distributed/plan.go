@@ -640,8 +640,38 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		}
 		return pl.filterSubqueries(child(ref, "condition"), ctes, uses)
 
+	case "TABLE_FUNCTION":
+		// unnest(t.list) and the like: rows of the row's own values.
+		if err := rowFunction(ref); err != nil {
+			return err
+		}
+		f := child(ref, "function")
+		item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
+		if item.name == "" {
+			item.name = strings.ToLower(str(f["function_name"]))
+		}
+		// unnest of one list is one column, named by the alias list.
+		if aliases := list(ref, "column_name_alias"); strings.EqualFold(str(f["function_name"]), "unnest") &&
+			len(list(f, "children")) == 1 && len(aliases) == 1 && str(ref["with_ordinality"]) != "WITH_ORDINALITY" {
+			item.columns = []string{strings.ToLower(str(aliases[0]))}
+		}
+		sc.items = append(sc.items, item)
+		return nil
+
 	case "SUBQUERY":
 		sub := subqueryNode(ref)
+		item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
+		if rowQuery(sub) {
+			// It reads no table: for each row of the items before it, which a
+			// lateral subquery may read, its rows depend on that row alone,
+			// as FLATTEN's do. Its columns are known if it names them all.
+			if str(sub["type"]) == "SELECT_NODE" && !hasClass(sub["select_list"], "STAR") {
+				item.columns = outputColumns(sub, &scope{})
+			}
+			renameColumns(item, list(ref, "column_name_alias"))
+			sc.items = append(sc.items, item)
+			return nil
+		}
 		if str(sub["type"]) != "SELECT_NODE" {
 			return unsupported("a set operation in FROM")
 		}
@@ -649,13 +679,62 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		if err := pl.transparent(sub, splittable, ctes, inner, uses); err != nil {
 			return err
 		}
-		item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
 		item.columns = outputColumns(sub, inner)
 		renameColumns(item, list(ref, "column_name_alias"))
 		sc.items = append(sc.items, item)
 		return nil
 	}
 	return unsupported("%s in FROM", strings.ToLower(str(ref["type"])))
+}
+
+// rowFunctions are the table functions whose rows depend on their
+// arguments alone: unnest of a list, json_each and json_tree of a JSON
+// value. Snowflake's FLATTEN becomes one of them, in a lateral subquery
+// (see internal/snowflake). Over the columns of a row, they are computed
+// for each row, as a filter is, so they may run on workers.
+var rowFunctions = map[string]bool{"unnest": true, "json_each": true, "json_tree": true}
+
+// rowFunction checks that a table function in FROM is one of rowFunctions,
+// over expressions that read no table.
+func rowFunction(ref node) error {
+	f := child(ref, "function")
+	name := strings.ToLower(str(f["function_name"]))
+	switch {
+	case !rowFunctions[name] || str(f["schema"]) != "" || str(f["catalog"]) != "":
+		return unsupported("table function %s in FROM", name)
+	case child(ref, "sample") != nil:
+		return unsupported("TABLESAMPLE")
+	case hasClass(f["children"], "SUBQUERY"):
+		return unsupported("a subquery in %s()", name)
+	}
+	return nil
+}
+
+// volatileFunctions return something else each time they are called, so
+// a query that calls them computes something else on each worker.
+var volatileFunctions = map[string]bool{
+	"random": true, "uuid": true, "gen_random_uuid": true, "uuidv4": true, "uuidv7": true,
+}
+
+// rowQuery reports whether query node n reads no table, and so computes,
+// in FROM, rows that depend on the row it may be lateral to alone: its
+// FROM clauses hold only rowFunctions, other such queries, VALUES and
+// nothing, and it calls no volatile function, which one machine might
+// call once for every row.
+func rowQuery(n node) bool {
+	ok := true
+	walk(n, func(m node) bool {
+		switch t := str(m["type"]); {
+		case t == "BASE_TABLE", t == "PIVOT", t == "SHOW_REF", t == "COLUMN_DATA":
+			ok = false
+		case t == "TABLE_FUNCTION":
+			ok = rowFunction(m) == nil
+		case str(m["class"]) == "FUNCTION" && volatileFunctions[strings.ToLower(str(m["function_name"]))]:
+			ok = false
+		}
+		return ok
+	})
+	return ok
 }
 
 // joinSides says which sides of a join keep their rows whole: the sides
@@ -787,7 +866,15 @@ func (pl *planner) fullRead(n node, outer, local []string, uses *[]*tableUse) er
 				*uses = append(*uses, &tableUse{ref: m, table: t})
 			}
 			return false
-		case "TABLE_FUNCTION", "PIVOT", "SHOW_REF", "EXPRESSION_LIST", "COLUMN_DATA":
+		case "TABLE_FUNCTION":
+			// unnest of a list of the row, as in EXISTS (SELECT 1 FROM
+			// unnest(t.tags) ...), reads no table.
+			if rowFunction(m) == nil {
+				return true
+			}
+			err = unsupported("table_function in a subquery")
+			return false
+		case "PIVOT", "SHOW_REF", "EXPRESSION_LIST", "COLUMN_DATA":
 			err = unsupported("%s in a subquery", strings.ToLower(str(m["type"])))
 			return false
 		}

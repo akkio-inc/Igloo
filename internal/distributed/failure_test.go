@@ -169,8 +169,14 @@ func TestWorkerReadsOnlyItsViews(t *testing.T) {
 	if err := run("WITH x AS (SELECT * FROM __igloo_split) SELECT count(*) FROM x"); err != nil {
 		t.Errorf("a fragment with a common table expression: %v", err)
 	}
+	if err := run("SELECT count(*) FROM __igloo_split, unnest([l_orderkey, l_partkey]) AS u(k), json_each(to_json([l_comment]))"); err != nil {
+		t.Errorf("a fragment that unnests its rows' values: %v", err)
+	}
 	for _, sql := range []string{
 		"SELECT count(*) FROM read_parquet(" + quoteLiteral(file) + ")",
+		"SELECT count(*) FROM __igloo_split, unnest((SELECT list(l_orderkey) FROM read_parquet(" + quoteLiteral(file) + ")))",
+		"SELECT count(*) FROM __igloo_split, main.unnest([1])",
+		"SELECT count(*) FROM __igloo_split, range(2)",
 		"SELECT count(*) FROM " + quoteLiteral(file),
 		"SELECT count(*) FROM __igloo_split WHERE l_orderkey IN (SELECT l_orderkey FROM read_parquet(" + quoteLiteral(file) + "))",
 		"SELECT count(*) FROM main.lineitem",

@@ -304,6 +304,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   columns among them, run distributed: workers read nested fields by their
   Iceberg field IDs, and a data file written before a struct's field was
   renamed, or dropped and added again, runs on one machine.
+- Unnests run distributed: `unnest`, `json_each` and `json_tree` of a
+  row's values in `FROM`, lateral subqueries that read no table, and so
+  Snowflake's `FLATTEN` of `ARRAY`, `OBJECT` and JSON text columns, whose
+  `sf_` macros workers define too.
 
 ### Tools and integrations
 
