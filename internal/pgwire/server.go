@@ -1197,16 +1197,16 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
 			return err
 		}
-		workers := 0
+		var parts distParts
 		// Hold the catalog lock only while the statement runs, not through
 		// the metrics and ownership bookkeeping below, to keep the exclusive
 		// window short (see catalogRunLock, holdCatalog).
 		releaseCatalog := s.catalogRunLock(sess, st)
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			run := func() error {
-				n, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
+				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
 				if done {
-					workers = n
+					parts = p
 					return err
 				}
 				return s.runStatement(ctx, sess, st, args, tw)
@@ -1245,7 +1245,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			}
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
-			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, workers: workers})
+			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}

@@ -75,6 +75,9 @@ type Query struct {
 	// Workers is how many workers ran parts of the statement; 0 when it ran
 	// on one replica alone.
 	Workers int
+	// Stages is how many stages of tasks ran those parts, and Exchanges how
+	// many exchanges of rows between stages they wrote.
+	Stages, Exchanges int
 }
 
 // Resources is what DuckDB's profiler measured while a statement ran.

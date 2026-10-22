@@ -263,7 +263,11 @@ type Execution struct {
 	SQL string
 	// Workers is how many workers ran tasks.
 	Workers int
-	dir     string
+	// Stages is how many stages ran, and Exchanges how many exchanges they
+	// wrote, rows that later stages read.
+	Stages, Exchanges int
+
+	dir string
 	// exchanges describes what the statement's exchanges held, for tests'
 	// failures and debug logs.
 	exchanges string
@@ -408,6 +412,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		return nil, err
 	}
 	ex.Workers = len(run.used)
+	ex.Stages, ex.Exchanges = len(plan.Stages), len(run.exchanges)
 	ex.exchanges = run.describe()
 	co.pool.touch()
 	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers, "exchanges", ex.exchanges,

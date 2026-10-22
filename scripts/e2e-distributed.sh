@@ -411,9 +411,9 @@ report_twice="SELECT * FROM (SELECT * FROM ($report) ORDER BY INDEX_RATIO DESC, 
   ORDER BY INDEX_RATIO DESC, SIGNAL"
 # check_report NAME TAG QUERY: the same rows with and without workers, and
 # workers ran its steps: the cohorts, the signals and the distinct people
-# per signal and cohort.
+# per signal and cohort, in stages that the history counts.
 check_report() {
-  local name=$1 tag=$2 query=$3 want got
+  local name=$1 tag=$2 query=$3 want got workers stages exchanges
   want="$(psql_admin -c "SET sql_dialect = 'snowflake'" -c "SET distributed_execution = 'off'" \
     -c "$query ORDER BY DIMENSION, INDEX_RATIO DESC, SIGNAL" | grep -v '^SET$')"
   got="$(psql_admin -c "SET sql_dialect = 'snowflake'" -c "SET distributed_execution = 'on'" \
@@ -427,8 +427,14 @@ check_report() {
     diff <(echo "$want") <(echo "$got") | head -6
   fi
   sleep 2
-  got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
-  if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "$name ran on $got workers"; fi
+  got="$(psql_admin -c "SELECT workers, stages, exchanges FROM igloo.query_history
+    WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
+  IFS='|' read -r workers stages exchanges <<<"$got"
+  if [ "${workers:-0}" -ge 1 ] && [ "${stages:-0}" -ge 2 ]; then
+    pass "and runs on workers, in $stages stages and $exchanges exchanges"
+  else
+    fail "$name ran on ${workers:-no} workers in ${stages:-no} stages"
+  fi
 }
 check_report "the report" report "SELECT * FROM ($report)"
 check_report "the report as generated, twice over" report_twice "SELECT * FROM ($report_twice)"

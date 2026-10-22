@@ -297,6 +297,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`ver = (SELECT max(ver) FROM t ...)`) and `x IN (SELECT y ...)` over
   large tables, as semi joins partitioned by `y`, run on workers too, and so do aggregates that do not compute in parts (`median`,
   `quantile_cont`, `string_agg`) over a step partitioned by their groups.
+  A common table expression one part reads that only filters tables is
+  read in that part's place, and the tasks that read a one-row subquery
+  combine its partial results themselves, so no stage only copies rows
+  from one exchange to another.
   Cohort reports (distinct people per cohort, joined to their events and
   counted per signal) run on workers up to the signal-level tail.
 - Workers start on demand and stop when idle: on Kubernetes the chart's
@@ -326,8 +330,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   calls for. A worker that answers with an error is never set aside, and a
   statement whose partial results would pass 1 GiB of the coordinator's
   disk, or that only filters rows, runs on the coordinator.
-- `igloo.query_history` has a `workers` column; `igloo_distributed_*` and
-  `igloo_worker_*` metrics report statements, fallbacks, tasks and workers.
+- `igloo.query_history` has `workers`, `stages` and `exchanges` columns;
+  `igloo_distributed_*` and `igloo_worker_*` metrics report statements,
+  fallbacks, tasks and workers.
 - Tables with lists, maps and structs, Snowflake's `ARRAY` and `OBJECT`
   columns among them, run distributed: workers read nested fields by their
   Iceberg field IDs, and a data file written before a struct's field was

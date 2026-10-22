@@ -311,10 +311,14 @@ parts on the workers.
 ## Seeing it
 
 - **Query history.** `igloo.query_history` has a `workers` column: how many
-  workers ran parts of the statement, 0 when it ran on one replica.
+  workers ran parts of the statement, 0 when it ran on one replica; and
+  `stages` and `exchanges`: how many stages of tasks those parts took, and
+  how many exchanges of rows, in object storage, the stages wrote for later
+  ones. A statement built in steps waits for each stage that reads what an
+  earlier one wrote.
 
   ```sql
-  SELECT start_time, duration_ms, workers, query_text
+  SELECT start_time, duration_ms, workers, stages, exchanges, query_text
   FROM igloo.query_history WHERE workers > 0 ORDER BY start_time DESC LIMIT 20;
   ```
 

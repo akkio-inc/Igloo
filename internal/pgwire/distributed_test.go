@@ -277,17 +277,23 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 // query text.
 func lastWorkers(t *testing.T, h *audit.MemoryStore, text string) int {
 	t.Helper()
+	return lastRun(t, h, text).Workers
+}
+
+// lastRun returns the history's latest statement of text.
+func lastRun(t *testing.T, h *audit.MemoryStore, text string) audit.Query {
+	t.Helper()
 	qs, err := h.Queries(context.Background(), audit.Viewer{All: true}, audit.Page{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, q := range qs {
 		if q.Text == text {
-			return q.Workers
+			return q
 		}
 	}
 	t.Fatalf("no history for %q", text)
-	return 0
+	return audit.Query{}
 }
 
 func TestDistributedStatements(t *testing.T) {
@@ -330,8 +336,8 @@ func TestDistributedStatements(t *testing.T) {
 			if got := read(); got != local {
 				t.Errorf("distributed result differs:\n%s\nlocal:\n%s", got, local)
 			}
-			if n := lastWorkers(t, ds.history, query); n != 2 {
-				t.Errorf("history shows %d workers, want 2", n)
+			if q := lastRun(t, ds.history, query); q.Workers != 2 || q.Stages != 1 || q.Exchanges != 0 {
+				t.Errorf("history shows %d workers, %d stages and %d exchanges, want 2, 1 and 0", q.Workers, q.Stages, q.Exchanges)
 			}
 
 			// Parameters are bound where the combined result is computed.

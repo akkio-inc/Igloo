@@ -80,16 +80,21 @@ func (sess *session) mode() distributed.Mode {
 	return sess.distMode
 }
 
+// distParts is what running a statement in parts took, for the history:
+// how many workers ran them, how many stages, and how many exchanges the
+// stages wrote.
+type distParts struct{ workers, stages, exchanges int }
+
 // runDistributed runs st on workers if it qualifies and writes its rows to
 // w. done is false when st did not run, and should run on this replica;
-// workers is how many workers ran parts of it.
-func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.User, st *statement, args []driver.NamedValue, w *tagWriter) (workers int, done bool, err error) {
+// parts is what running it took.
+func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.User, st *statement, args []driver.NamedValue, w *tagWriter) (parts distParts, done bool, err error) {
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || sess.mode() == distributed.ModeOff {
-		return 0, false, nil
+		return parts, false, nil
 	}
 	if reason := policyReason(st); reason != "" {
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", reason)
-		return 0, false, nil
+		return parts, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
 	mode := sess.mode()
@@ -100,32 +105,32 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	plan, err := s.dist.Plan(ctx, st.query, env, mode)
 	if err != nil {
 		if ctx.Err() != nil {
-			return 0, true, ctx.Err()
+			return parts, true, ctx.Err()
 		}
 		if !distributed.IsUnsupported(err) {
 			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
 		} else {
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 		}
-		return 0, false, nil
+		return parts, false, nil
 	}
 	settings, err := s.distributedSettings(ctx, sess)
 	if err != nil {
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-		return 0, false, nil
+		return parts, false, nil
 	}
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:
-			return 0, true, ctx.Err()
+			return parts, true, ctx.Err()
 		case distributed.DataError(err):
-			return 0, true, err
+			return parts, true, err
 		case distributed.IsUnsupported(err):
 			// The workers found what planning could not, such as data
 			// files without field IDs.
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-			return 0, false, nil
+			return parts, false, nil
 		}
 		reason := "worker_error"
 		if errors.Is(err, distributed.ErrNoWorkers) {
@@ -133,18 +138,19 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		s.dist.Metrics().Fallback(reason)
 		s.log.Warn("workers could not run a statement; running it here", "user", user.Name, "err", err)
-		return 0, false, nil
+		return parts, false, nil
 	}
 	defer ex.Close()
+	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges}
 	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
 		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) {
-			return ex.Workers, true, err
+			return parts, true, err
 		}
 		s.dist.Metrics().Fallback("combine_error")
 		s.log.Warn("could not combine a distributed statement's results; running it here", "user", user.Name, "err", err)
-		return 0, false, nil
+		return distParts{}, false, nil
 	}
-	return ex.Workers, true, nil
+	return parts, true, nil
 }
 
 // policyReason says why masking and row access policies keep st on this
