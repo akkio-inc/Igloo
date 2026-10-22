@@ -70,6 +70,31 @@ included, unless [clones](#clones) read them. What a drop leaves,
 erasure requests delete ([privacy](privacy.md#what-is-left-of-dropped-tables)).
 A dropped table cannot be restored.
 
+### Column types
+
+Tables take DuckDB's types that Iceberg has: numbers, text, dates and
+times, `BLOB`, `UUID`, and lists (`VARCHAR[]`), maps (`MAP(VARCHAR,
+BIGINT)`) and structs (`STRUCT(city VARCHAR, zip VARCHAR)`) of them, nested
+as deep as you like, which Iceberg holds as its own `list`, `map` and
+`struct`, so that Spark, Trino and PyIceberg read them as such.
+
+Iceberg tables of format versions 1 and 2, the ones Igloo's catalog allows,
+have no type for JSON, and Iceberg's `variant` needs version 3, which
+[erasure requests](privacy.md) cannot rewrite yet. A `JSON` or `VARIANT`
+column is therefore a `VARCHAR` column holding each value's JSON text, in
+`CREATE TABLE`, `ALTER TABLE ... ADD COLUMN` and `CREATE TABLE ... AS`
+alike; JSON inside a list, map or struct is a string holding the value's
+JSON text (`JSON[]` becomes `VARCHAR[]`). Cast to `JSON` to query them as
+JSON; Snowflake's dialect reads JSON text as JSON by itself, and keeps
+[its `ARRAY` and `OBJECT`](snowflake-sql.md#semi-structured-columns) as
+lists and maps of strings.
+
+```sql
+CREATE TABLE events (id BIGINT, payload JSON, tags VARCHAR[], attrs MAP(VARCHAR, VARCHAR));
+INSERT INTO events VALUES (1, '{"page": "/home"}', ['new', 'mobile'], MAP {'plan': 'pro'});
+SELECT payload::JSON ->> '$.page', tags[1], attrs['plan'] FROM events;
+```
+
 ### Transactions
 
 Writes are transactional. `BEGIN ... COMMIT` groups statements, and as in
@@ -685,7 +710,7 @@ Values go to clients as these PostgreSQL types:
 | `DATE`, `TIME` | `date`, `time` |
 | `TIMESTAMP` (any precision), `TIMESTAMPTZ` | `timestamp`, `timestamptz` |
 | `INTERVAL` | `interval` |
-| `JSON`, `LIST`, `ARRAY`, `STRUCT`, `MAP`, `UNION` | `json` |
+| `JSON`, `LIST`, `ARRAY`, `STRUCT`, `MAP`, `UNION`, `VARIANT` | `json` |
 | `GEOMETRY` | `text`, as WKT such as `POINT (-73.98 40.75)` |
 | others (`TIMETZ`, `BIT`, ...) | `text` |
 

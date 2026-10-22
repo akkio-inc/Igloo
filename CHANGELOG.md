@@ -34,6 +34,23 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `igloo_comments()`, and `information_schema.tables` and `.columns`.
 - SQL cursors (`DECLARE`, `FETCH`, `CLOSE`) and array parameters, so
   psycopg's server-side cursors and Ibis's PostgreSQL backend work.
+- Semi-structured columns. Lists, maps and structs are Iceberg's own
+  `list`, `map` and `struct`, which Spark, Trino and PyIceberg read. A `JSON`
+  or `VARIANT` column, which Iceberg tables of format version 1 and 2 cannot
+  hold ("Type JSON is not a valid Iceberg Type"), is a `VARCHAR` column of
+  its values' JSON text, in `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN` and
+  `CREATE TABLE ... AS` alike; JSON inside a list, map or struct is a string
+  of its JSON text. In Snowflake's dialect an `ARRAY` column is a list of
+  strings (`VARCHAR[]`) and an `OBJECT` column a map of strings
+  (`MAP(VARCHAR, VARCHAR)`), each element as Snowflake's `TO_VARCHAR`
+  writes it, as Snowflake converts them to `ARRAY(VARCHAR)` and
+  `MAP(VARCHAR, VARCHAR)`; structured `ARRAY(type)`, `OBJECT(name type,
+  ...)` and `MAP(type, type)` are lists, structs and maps of their types.
+  Paths, `FLATTEN`, `GET`, `TO_JSON`, `OBJECT_CONSTRUCT`, casts and the
+  other semi-structured functions read them as Snowflake's values, objects
+  inside arrays included, and read JSON text as before; masking policies
+  written in Snowflake's dialect may return `OBJECT_CONSTRUCT(...)` for an
+  `OBJECT` column.
 - Zero-copy clones, with Snowflake's syntax: `CREATE [OR REPLACE] TABLE
   ... CLONE source [AT (TIMESTAMP | SNAPSHOT | BRANCH | TAG => ...)]` and
   `CREATE [OR REPLACE] SCHEMA ... CLONE source`, its tables and views. A

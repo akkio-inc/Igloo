@@ -1514,6 +1514,8 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		}
 		query = external
 	}
+	// Columns Iceberg has no type for become strings (see icebergTypes).
+	query = s.icebergTypes(ctx, sess, query)
 	st, err := prepare(ctx, sess.conn, query, oids)
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created: sync and try again,

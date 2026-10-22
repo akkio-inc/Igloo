@@ -204,20 +204,27 @@ var ErrViewExists = errors.New("view already exists")
 
 // icebergSchema describes columns for the catalog. Other engines cannot run
 // DuckDB SQL anyway, so types Iceberg has no direct equivalent for are
-// recorded as strings.
+// recorded as strings. Lists, maps and structs are Iceberg's, their fields
+// numbered after the columns.
 func icebergSchema(id int, cols []Column) *iceberg.Schema {
 	fields := make([]iceberg.NestedField, len(cols))
+	next := len(cols)
 	for i, c := range cols {
-		fields[i] = iceberg.NestedField{ID: i + 1, Name: c.Name, Type: icebergType(c.Type), Doc: c.Doc}
+		fields[i] = iceberg.NestedField{ID: i + 1, Name: c.Name, Type: icebergType(c.Type, &next), Doc: c.Doc}
 	}
 	return iceberg.NewSchema(id, fields...)
 }
 
 var decimalType = regexp.MustCompile(`^DECIMAL\((\d+),\s*(\d+)\)$`)
 
-// icebergType maps a DuckDB type name to the closest Iceberg type.
-func icebergType(t string) iceberg.Type {
-	switch t = strings.ToUpper(strings.TrimSpace(t)); t {
+// icebergType maps a DuckDB type name to the closest Iceberg type. The
+// fields of lists, maps and structs take IDs after *next.
+func icebergType(t string, next *int) iceberg.Type {
+	t = strings.TrimSpace(t)
+	if n := nestedType(t, next); n != nil {
+		return n
+	}
+	switch t = strings.ToUpper(t); t {
 	case "BOOLEAN":
 		return iceberg.PrimitiveTypes.Bool
 	case "TINYINT", "SMALLINT", "INTEGER", "UTINYINT", "USMALLINT":
@@ -249,6 +256,85 @@ func icebergType(t string) iceberg.Type {
 	return iceberg.PrimitiveTypes.String
 }
 
+// nestedType maps DuckDB's T[], MAP(K, V) and STRUCT(name T, ...) to
+// Iceberg's list, map and struct, or returns nil for any other type.
+func nestedType(t string, next *int) iceberg.Type {
+	id := func() int { *next++; return *next }
+	switch {
+	case strings.HasSuffix(t, "[]"):
+		elemID := id()
+		return &iceberg.ListType{ElementID: elemID, Element: icebergType(strings.TrimSuffix(t, "[]"), next)}
+	case !strings.HasSuffix(t, ")"):
+		return nil
+	}
+	open := strings.IndexByte(t, '(')
+	if open < 0 {
+		return nil
+	}
+	args := splitTypeArgs(t[open+1 : len(t)-1])
+	switch strings.ToUpper(strings.TrimSpace(t[:open])) {
+	case "MAP":
+		if len(args) != 2 {
+			return nil
+		}
+		keyID, valueID := id(), id()
+		return &iceberg.MapType{KeyID: keyID, KeyType: icebergType(args[0], next), ValueID: valueID, ValueType: icebergType(args[1], next)}
+	case "STRUCT":
+		fields := make([]iceberg.NestedField, len(args))
+		ids := make([]int, len(args))
+		for i := range args {
+			ids[i] = id()
+		}
+		for i, a := range args {
+			name, typ := fieldNameType(a)
+			fields[i] = iceberg.NestedField{ID: ids[i], Name: name, Type: icebergType(typ, next)}
+		}
+		return &iceberg.StructType{FieldList: fields}
+	}
+	return nil
+}
+
+// splitTypeArgs splits a type's parameters at the commas outside
+// parentheses and quotes.
+func splitTypeArgs(s string) []string {
+	var out []string
+	depth, quoted, start := 0, false, 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case c == ',' && depth == 0:
+			out = append(out, strings.TrimSpace(s[start:i]))
+			start = i + 1
+		}
+	}
+	return append(out, strings.TrimSpace(s[start:]))
+}
+
+// fieldNameType splits a struct's field, name and type, the name perhaps
+// quoted.
+func fieldNameType(f string) (string, string) {
+	if strings.HasPrefix(f, `"`) {
+		for i := 1; i < len(f); i++ {
+			if f[i] != '"' {
+				continue
+			}
+			if i+1 < len(f) && f[i+1] == '"' {
+				i++
+				continue
+			}
+			return strings.ReplaceAll(f[1:i], `""`, `"`), strings.TrimSpace(f[i+1:])
+		}
+	}
+	name, typ, _ := strings.Cut(f, " ")
+	return name, strings.TrimSpace(typ)
+}
+
 // duckDBType maps an Iceberg type back to a DuckDB type name.
 func duckDBType(t iceberg.Type) string {
 	switch t := t.(type) {
@@ -276,6 +362,16 @@ func duckDBType(t iceberg.Type) string {
 		return "BLOB"
 	case iceberg.DecimalType:
 		return fmt.Sprintf("DECIMAL(%d,%d)", t.Precision(), t.Scale())
+	case *iceberg.ListType:
+		return duckDBType(t.Element) + "[]"
+	case *iceberg.MapType:
+		return "MAP(" + duckDBType(t.KeyType) + ", " + duckDBType(t.ValueType) + ")"
+	case *iceberg.StructType:
+		fields := make([]string, len(t.FieldList))
+		for i, f := range t.FieldList {
+			fields[i] = `"` + strings.ReplaceAll(f.Name, `"`, `""`) + `" ` + duckDBType(f.Type)
+		}
+		return "STRUCT(" + strings.Join(fields, ", ") + ")"
 	}
 	return "VARCHAR"
 }

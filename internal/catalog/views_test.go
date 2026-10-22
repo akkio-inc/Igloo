@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go/view"
@@ -86,5 +87,29 @@ func TestReplaceView(t *testing.T) {
 	}
 	if n := len(meta.VersionLog()); n != 5 {
 		t.Errorf("version log has %d entries, want 5", n)
+	}
+}
+
+// TestNestedViewColumns checks that a view's lists, maps and structs are
+// Iceberg's in its schema, with field IDs after the columns', and read
+// back as DuckDB's types.
+func TestNestedViewColumns(t *testing.T) {
+	cols := []Column{{Name: "id", Type: "INTEGER"}, {Name: "tags", Type: "VARCHAR[]"},
+		{Name: "attrs", Type: "MAP(VARCHAR, VARCHAR)"},
+		{Name: "loc", Type: `STRUCT(city VARCHAR, "Zip Code" DECIMAL(38,0), pts STRUCT(x DOUBLE)[])`},
+		{Name: "j", Type: "JSON"}}
+	s := icebergSchema(0, cols)
+	want := "table {\n\t1: id: optional int\n\t2: tags: optional list<string>\n\t3: attrs: optional map<string, string>\n" +
+		"\t4: loc: optional struct<9: city: optional string, 10: Zip Code: optional decimal(38, 0), 11: pts: optional list<struct<13: x: optional double>>>\n" +
+		"\t5: j: optional string\n}"
+	if got := s.String(); got != want {
+		t.Errorf("schema:\n%s\nwant\n%s", got, want)
+	}
+	var back []string
+	for _, f := range s.Fields() {
+		back = append(back, duckDBType(f.Type))
+	}
+	if got := strings.Join(back, ", "); got != `INTEGER, VARCHAR[], MAP(VARCHAR, VARCHAR), STRUCT("city" VARCHAR, "Zip Code" DECIMAL(38,0), "pts" STRUCT("x" DOUBLE)[]), VARCHAR` {
+		t.Errorf("DuckDB types: %s", got)
 	}
 }
