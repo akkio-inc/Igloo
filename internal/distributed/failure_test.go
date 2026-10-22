@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -394,5 +397,58 @@ func TestForcedByNonAdmins(t *testing.T) {
 	}
 	if compute.asked.Load() != before {
 		t.Error("a non-admin's statement asked for workers")
+	}
+}
+
+// scaleLog records what workers a pool asked for.
+type scaleLog struct {
+	mu    sync.Mutex
+	asked []int
+}
+
+func (s *scaleLog) Scale(_ context.Context, n int) error {
+	s.mu.Lock()
+	s.asked = append(s.asked, n)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *scaleLog) stops() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(slices.DeleteFunc(slices.Clone(s.asked), func(n int) bool { return n != 0 }))
+}
+
+// Workers a coordinator has just started stay up while they boot, though
+// it has run no task yet and none answers: they stop only once it has
+// neither used them nor started them for IdleAfter, and they report as
+// long without tasks.
+func TestIdleWorkers(t *testing.T) {
+	tr, err := newTransport(testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compute := &scaleLog{}
+	p := newPool(PoolOptions{Compute: compute, MaxWorkers: 4, IdleAfter: time.Minute}, tr, "test", nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.scale(t.Context(), 4); err != nil {
+		t.Fatal(err)
+	}
+	p.stopIdle(t.Context(), nil)
+	if n := compute.stops(); n != 0 {
+		t.Fatalf("stopped the workers it had just started, %d times", n)
+	}
+	// They answer, just started.
+	booted := []*worker{{addr: "a", status: workerStatus{IdleSeconds: 1}}}
+	p.stopIdle(t.Context(), booted)
+	if n := compute.stops(); n != 0 {
+		t.Fatalf("stopped workers that had just booted, %d times", n)
+	}
+	// A minute on, with no task, they stop.
+	p.mu.Lock()
+	p.scaledAt = time.Now().Add(-2 * time.Minute)
+	p.mu.Unlock()
+	p.stopIdle(t.Context(), []*worker{{addr: "a", status: workerStatus{IdleSeconds: 120}}})
+	if n := compute.stops(); n != 1 {
+		t.Fatalf("idle workers: %d stops, want 1", n)
 	}
 }

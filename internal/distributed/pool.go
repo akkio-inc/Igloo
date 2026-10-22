@@ -306,10 +306,8 @@ func (p *pool) touch() {
 }
 
 // run checks the workers every few seconds, so statements decide from a
-// recent view of them without waiting, and stops idle workers until ctx is
-// done: once this coordinator has not used them for IdleAfter and every
-// worker reports as long without tasks, so workers another coordinator
-// uses keep running.
+// recent view of them without waiting, and stops idle workers (stopIdle)
+// until ctx is done.
 func (p *pool) run(ctx context.Context) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
@@ -319,36 +317,48 @@ func (p *pool) run(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		ws := p.refresh(ctx)
-		if !p.canStart() {
-			continue
-		}
-		p.mu.Lock()
-		idle := time.Since(p.used) >= p.opts.IdleAfter
-		p.mu.Unlock()
-		if !idle {
-			continue
-		}
-		busy := slices.ContainsFunc(ws, func(w *worker) bool {
-			return w.status.Running > 0 || time.Duration(w.status.IdleSeconds*float64(time.Second)) < p.opts.IdleAfter
-		})
-		p.mu.Lock()
-		scaled := p.scaled
-		p.mu.Unlock()
-		if busy || (len(ws) == 0 && scaled == 0) {
-			continue
-		}
-		err := p.opts.Compute.Scale(ctx, 0)
-		p.metrics.compute("stop", err)
-		if err != nil {
-			p.log.Warn("could not stop idle workers", "err", err)
-			continue
-		}
-		p.log.Info("stopped idle workers", "idle", p.opts.IdleAfter)
-		p.mu.Lock()
-		p.scaled, p.workers, p.refreshed = 0, nil, time.Time{}
-		p.mu.Unlock()
+		p.stopIdle(ctx, p.refresh(ctx))
 	}
+}
+
+// stopIdle stops the workers, ws being those that answered, once this
+// coordinator has neither used them nor asked for them for IdleAfter, and
+// every worker reports as long without tasks, so workers another
+// coordinator uses keep running. Workers it has just asked for are about
+// to be used, though none may answer yet: counting from its last task
+// alone, a coordinator that had run none, or none for IdleAfter, stopped
+// the workers it had started for a statement while they booted.
+func (p *pool) stopIdle(ctx context.Context, ws []*worker) {
+	if !p.canStart() {
+		return
+	}
+	p.mu.Lock()
+	last := p.used
+	if p.scaledAt.After(last) {
+		last = p.scaledAt
+	}
+	idle := time.Since(last) >= p.opts.IdleAfter
+	scaled := p.scaled
+	p.mu.Unlock()
+	if !idle {
+		return
+	}
+	busy := slices.ContainsFunc(ws, func(w *worker) bool {
+		return w.status.Running > 0 || time.Duration(w.status.IdleSeconds*float64(time.Second)) < p.opts.IdleAfter
+	})
+	if busy || (len(ws) == 0 && scaled == 0) {
+		return
+	}
+	err := p.opts.Compute.Scale(ctx, 0)
+	p.metrics.compute("stop", err)
+	if err != nil {
+		p.log.Warn("could not stop idle workers", "err", err)
+		return
+	}
+	p.log.Info("stopped idle workers", "idle", p.opts.IdleAfter)
+	p.mu.Lock()
+	p.scaled, p.workers, p.refreshed = 0, nil, time.Time{}
+	p.mu.Unlock()
 }
 
 // ParseAddresses splits a comma-separated list of worker addresses,
