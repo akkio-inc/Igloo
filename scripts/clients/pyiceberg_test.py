@@ -4,7 +4,9 @@ creates the users and tables first:
 
   ice_events (id INTEGER, kind VARCHAR) with rows 1 and 2
   ice_private (id INTEGER)
-  ivy   role none, SELECT on ice_events
+  ice_semi (id INTEGER, tags VARCHAR[], attrs MAP(VARCHAR, VARCHAR),
+    place STRUCT(city VARCHAR, zip VARCHAR), payload JSON) with row 1
+  ivy   role none, SELECT on ice_events and ice_semi
   ian   role none, SELECT, INSERT, UPDATE, DELETE on ice_events
   walt  role writer
 """
@@ -16,7 +18,7 @@ from pyarrow import fs
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import ForbiddenError, OAuthError
 from pyiceberg.schema import Schema
-from pyiceberg.types import IntegerType, NestedField, StringType
+from pyiceberg.types import IntegerType, ListType, MapType, NestedField, StringType, StructType
 
 URI = os.environ["ICEBERG_URI"]
 
@@ -68,6 +70,17 @@ warehouse = location.rsplit("/", 2)[0]
 assert refused(lambda: s3.get_file_info(fs.FileSelector(warehouse, recursive=True)), OSError)
 assert refused(lambda: s3.open_output_stream(location + "/data/forged.parquet").close(), OSError)
 print("  pyiceberg: vended credentials reach only the table's files, read-only")
+
+# Lists, maps and structs are Iceberg's own; JSON is the JSON text.
+semi = ivy.load_table("public.ice_semi")
+types = {f.name: f.field_type for f in semi.schema().fields}
+assert isinstance(types["tags"], ListType) and types["tags"].element_type == StringType(), types
+assert isinstance(types["attrs"], MapType) and types["attrs"].value_type == StringType(), types
+assert isinstance(types["place"], StructType) and types["payload"] == StringType(), types
+row = semi.scan().to_arrow().to_pylist()[0]
+assert row["tags"] == ["a", "b"] and dict(row["attrs"]) == {"k": "v"}, row
+assert row["place"] == {"city": "Paris", "zip": "75001"} and row["payload"] == '{"n":[1]}', row
+print("  pyiceberg: reads lists, maps, structs and JSON text")
 
 assert refused(lambda: ivy.load_table("public.ice_private"), ForbiddenError)
 print("  pyiceberg: a table without a grant is refused")

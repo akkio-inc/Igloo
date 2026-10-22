@@ -774,14 +774,18 @@ psql_admin -c "DROP MATERIALIZED VIEW crm.contact_mv" >/dev/null 2>&1 || true
 psql_admin -c "REVOKE acme_team FROM walt" >/dev/null 2>&1 || true
 echo "Iceberg REST catalog for other engines"
 psql_admin -c "CREATE TABLE ice_events (id INTEGER, kind VARCHAR); INSERT INTO ice_events VALUES (1, 'signup'), (2, 'login');
-  CREATE TABLE ice_private (id INTEGER)" >/dev/null
+  CREATE TABLE ice_private (id INTEGER);
+  CREATE TABLE ice_semi (id INTEGER, tags VARCHAR[], attrs MAP(VARCHAR, VARCHAR), place STRUCT(city VARCHAR, zip VARCHAR), payload JSON);
+  INSERT INTO ice_semi VALUES (1, ['a', 'b'], MAP {'k': 'v'}, {'city': 'Paris', 'zip': '75001'}, '{\"n\":[1]}')" >/dev/null
 expect "users for other engines" "CREATE ROLE
 CREATE ROLE
+GRANT
 GRANT
 GRANT" igloo "$admin_password" "
   CREATE USER ivy WITH PASSWORD 'ivy-password-1' ROLE none;
   CREATE USER ian WITH PASSWORD 'ian-password-1' ROLE none;
   GRANT SELECT ON ice_events TO ivy;
+  GRANT SELECT ON ice_semi TO ivy;
   GRANT SELECT, INSERT, UPDATE, DELETE ON ice_events TO ian;"
 iceberg="http://127.0.0.1:$iceberg_port"
 code="$(curl -s -o /dev/null -w '%{http_code}' "$iceberg/v1/config")"
