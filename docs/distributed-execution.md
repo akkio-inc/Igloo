@@ -124,6 +124,10 @@ In detail, a part runs distributed when:
   compute columns. It may unnest its rows' values: `unnest`, `json_each`
   and `json_tree` of them, and lateral subqueries that read no table, which
   is what Snowflake's `FLATTEN` becomes (with `OUTER` and `RECURSIVE` too).
+  Its filters' subqueries that stand on their own may read large tables:
+  `x IN (SELECT y ...)` is a semi join to a relation workers compute,
+  partitioned by `y`, and a subquery of one row
+  (`ver = (SELECT max(ver) FROM t WHERE ...)`) one that every task reads.
   It may also read relations workers compute: common table expressions
   and subqueries in `FROM` that are themselves such `SELECT`s, with
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
@@ -166,11 +170,8 @@ not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
 partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
-window functions over rows, a large table read again in a subquery
-expression (`IN`, `EXISTS`, a scalar subquery: TPC-H Q17, Q18, Q20, Q21)
-unless the subquery stands on its own and returns one row
-(`ver = (SELECT max(ver) FROM t WHERE ...)`), which workers then compute
-for every part to read,
+window functions over rows, a large table read again in a correlated
+subquery expression (`EXISTS`, a scalar subquery: TPC-H Q17, Q20, Q21),
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
 equality deletes of fields nested in structs, with
@@ -477,10 +478,9 @@ machine's memory run where that machine would run out of memory.
 
 - The large inputs of one `SELECT` are partitioned by one key. Large tables
   joined on different keys need a step each: a common table expression or
-  subquery per key. A large table read again in a subquery expression
-  (`IN`, `EXISTS`, a scalar subquery) that is correlated or returns more
-  than a row runs on one machine; written as a join to a common table
-  expression, it runs distributed. Give the
+  subquery per key. A large table read again in a correlated subquery
+  expression (`EXISTS`, a scalar subquery) runs on one machine; written as
+  a join to a common table expression, it runs distributed. Give the
   machines that run such statements a lot of memory and fast spill disk.
 - Partitioned joins, aggregations and every step of a multi-stage plan
   write what they exchange to object storage and read it back: that costs

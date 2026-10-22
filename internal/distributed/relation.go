@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -109,6 +110,77 @@ type relUse struct {
 	// query says ref is a subquery expression's query, which every task
 	// reads in full.
 	query bool
+	// semi is as for tables.
+	semi bool
+}
+
+// identity is a node's identity, for sets of nodes.
+func identity(n node) uintptr { return reflect.ValueOf(n).Pointer() }
+
+// semiJoins rewrites the conjuncts x IN (SELECT y ...) of a SELECT's WHERE
+// clause whose subquery stands on its own (is not correlated) and is too
+// large for every worker to read, as an audience's members are, as SEMI
+// JOINs to the subquery: FROM ... SEMI JOIN (SELECT y ...) AS
+// __igloo_inN(__igloo_k) ON x = __igloo_inN.__igloo_k, which keep the same
+// rows. Workers then compute the subquery as a relation keyed by y, and
+// read the rest partitioned by x. A candidate that does not qualify puts
+// the statement back as it was.
+func (pl *planner) semiJoins(sel node, ctes cteScope) error {
+	var keep, ins []node
+	for _, cond := range conjuncts(child(sel, "where_clause")) {
+		if str(cond["class"]) == "SUBQUERY" && str(cond["subquery_type"]) == "ANY" &&
+			str(cond["comparison_type"]) == "COMPARE_EQUAL" && str(child(cond, "child")["class"]) == "COLUMN_REF" {
+			q := subqueryNode(cond)
+			cols, err := pl.relationColumns(q, ctes, nil)
+			if err == nil && len(cols) == 1 {
+				if bytes, err := pl.estimate(q, ctes); err == nil && bytes > pl.opts.maxBroadcast {
+					ins = append(ins, cond)
+					continue
+				}
+			}
+		}
+		keep = append(keep, cond)
+	}
+	if len(ins) == 0 {
+		return nil
+	}
+	from, where := sel["from_table"], sel["where_clause"]
+	pl.undo = append(pl.undo, func() { sel["from_table"], sel["where_clause"] = from, where })
+	switch len(keep) {
+	case 0:
+		sel["where_clause"] = nil
+	case 1:
+		sel["where_clause"] = keep[0]
+	default:
+		w := clone(child(sel, "where_clause")).(node)
+		children := make([]any, len(keep))
+		for i, k := range keep {
+			children[i] = k
+		}
+		w["children"] = children
+		sel["where_clause"] = w
+	}
+	for _, in := range ins {
+		join, err := pl.p.fromRef("SELECT 1 FROM a SEMI JOIN (SELECT 1) AS b(k) ON a.x = b.k")
+		if err != nil {
+			return err
+		}
+		alias := "__igloo_in" + strconv.Itoa(pl.ins)
+		pl.ins++
+		right := child(join, "right")
+		child(right, "subquery")["node"] = clone(subqueryNode(in))
+		right["alias"], right["column_name_alias"] = alias, []any{"__igloo_k"}
+		cond := child(join, "condition")
+		cond["left"] = clone(child(in, "child"))
+		child(cond, "right")["column_names"] = []any{alias, "__igloo_k"}
+		join["left"] = sel["from_table"]
+		sel["from_table"] = join
+		if pl.forced == nil {
+			pl.forced = map[uintptr]bool{}
+		}
+		pl.forced[identity(right)] = true
+	}
+	return nil
 }
 
 // subqueryRelations makes the subquery expressions of a candidate's

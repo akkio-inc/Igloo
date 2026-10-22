@@ -209,6 +209,11 @@ type planner struct {
 	overs int
 	// root is the statement being planned.
 	root node
+	// forced are subqueries in FROM to read as relations, though they pass
+	// their rows through: those IN subqueries become (semiJoins).
+	forced map[uintptr]bool
+	// ins numbers them.
+	ins int
 	// reasons say why candidates were not distributed, for logs.
 	reasons []string
 	// tables caches resolved names.
@@ -655,6 +660,9 @@ type scope struct {
 	// conds hold for every row the SELECT's FROM and WHERE produce: the
 	// conjuncts of its WHERE clause and of its inner joins' conditions.
 	conds []node
+	// semiConds are the conjuncts of its semi joins' conditions, which hold
+	// for every pair of rows a semi join matches.
+	semiConds []node
 	// For the FROM clause of a subquery that passes its rows through: the
 	// subquery's reference, the FROM clause it is in, its item there, and
 	// whether its rows may be divided among workers.
@@ -688,6 +696,9 @@ type tableUse struct {
 	// sub, for a table a subquery expression in a filter reads, is that
 	// subquery's number in the candidate's subs, plus one.
 	sub int
+	// semi says it is on the right side of a semi join that keeps the
+	// candidate's rows whole: it may be partitioned by the join's key.
+	semi bool
 }
 
 // hasColumn reports whether some item of sc has a column called name
@@ -733,6 +744,9 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	// what workers compute of them through exchanges.
 	ctes = ctes.with(sel)
 	c.ctes = ctes
+	if err := pl.semiJoins(sel, ctes); err != nil {
+		return err
+	}
 	if child(sel, "sample") != nil {
 		return unsupported("USING SAMPLE")
 	}
@@ -880,11 +894,23 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, rd); err != nil {
 			return err
 		}
+		uses, rels := len(rd.uses), len(rd.rels)
 		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, rd); err != nil {
 			return err
 		}
-		if str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF" {
+		switch {
+		case str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF":
 			sc.conds = append(sc.conds, conjuncts(child(ref, "condition"))...)
+		case str(ref["join_type"]) == "SEMI" && str(ref["ref_type"]) == "REGULAR" && splittable:
+			// Its right side's rows may be partitioned by the join's key: a
+			// row on the left meets all of its matches in one partition.
+			sc.semiConds = append(sc.semiConds, conjuncts(child(ref, "condition"))...)
+			for _, u := range rd.uses[uses:] {
+				u.semi = true
+			}
+			for _, r := range rd.rels[rels:] {
+				r.semi = true
+			}
 		}
 		return pl.filterSubqueries(child(ref, "condition"), ctes, rd)
 
@@ -920,7 +946,7 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 			sc.items = append(sc.items, item)
 			return nil
 		}
-		if str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" {
+		if str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" || pl.forced[identity(ref)] {
 			// A relation workers compute.
 			return pl.relation(ref, sub, ctes, nil, splittable, sc, rd)
 		}

@@ -613,7 +613,16 @@ as a relation that workers compute (`internal/distributed/relation.go`):
   relation too when it binds on its own (it is not correlated) and is
   small (an aggregate without `GROUP BY`): workers compute its row first,
   and every task reads it in the subquery's place, as an audience's
-  `ver = (SELECT max(ver) FROM members WHERE ...)` needs.
+  `ver = (SELECT max(ver) FROM members WHERE ...)` needs. A conjunct
+  `x IN (SELECT y ...)` of a part's `WHERE` whose subquery stands on its
+  own and is larger than every worker may read becomes
+  `SEMI JOIN (SELECT y ...) ON x = y`, which keeps the same rows (`NULL`s
+  match nothing either way): the subquery is a relation keyed by `y`, and
+  the part partitioned by `x`. A semi join's right side may be keyed
+  though its rows cannot be divided arbitrarily, since each row on the
+  left meets all of its matches in one partition; an anti or outer join's
+  may not, where a row of a side every task reads would come back from
+  every partition.
 - **Where the coordinator takes over.** A part is distributed only if it
   reads something large; a relation's size is estimated as the compressed
   size of the tables it reads, or nothing for an aggregation without

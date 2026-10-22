@@ -220,6 +220,12 @@ func TestRelations(t *testing.T) {
 		// Common table expressions of a set operation, read by its branches.
 		{`WITH x AS (SELECT l_returnflag AS f, l_orderkey AS k, sum(l_quantity) AS q FROM lineitem GROUP BY 1, 2)
 			SELECT 'q' AS m, f, sum(q) FROM x GROUP BY 1, 2 UNION ALL SELECT 'n', f, count(*) FROM x GROUP BY 1, 2 ORDER BY 1, 2`, 1},
+		// x IN (SELECT y ...) too large for every worker: a semi join to a
+		// relation keyed by y.
+		{`SELECT o_orderpriority, count(*), sum(o_totalprice) FROM orders WHERE o_orderstatus <> 'X' AND o_orderkey IN
+			(SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250) GROUP BY 1 ORDER BY 1`, 1},
+		{`SELECT count(*), count(DISTINCT l_suppkey) FROM lineitem WHERE l_orderkey IN (SELECT o_orderkey FROM orders WHERE o_orderpriority = '1-URGENT')
+			AND l_partkey IN (SELECT p_partkey FROM part WHERE p_size < 10)`, 1},
 		// A filter's subquery that reads the table the part divides: a
 		// relation of one row every task reads.
 		{`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`, 2},
@@ -342,4 +348,32 @@ func TestSnowflakeAudienceReport(t *testing.T) {
 			t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
 		})
 	}
+}
+
+// TestSemiJoinReport runs a report shaped like the travel-interest ones:
+// a large table of people's interests filtered by membership of an
+// audience, x IN (SELECT DISTINCT ...), read by two aggregations, one
+// through a subquery that groups by person.
+func TestSemiJoinReport(t *testing.T) {
+	h := audienceHarness(t)
+	q := `WITH audience AS (
+		SELECT person_id, state, income FROM people
+		WHERE person_id IN (SELECT DISTINCT person_id FROM ((SELECT person_id FROM lookup
+			WHERE audience_id = 2 AND ver = (SELECT max(ver) FROM meta WHERE audience_id = 2))))),
+	by_state AS (SELECT state, count(1) AS n, sum(income) AS w, sum(count(1)) OVER () AS total FROM audience GROUP BY state),
+	fill AS (SELECT 1 - (CAST(count(CASE WHEN v = 0 THEN 1 END) AS DOUBLE) / NULLIF(count(1), 0)) AS fill_rate
+		FROM (SELECT person_id, sum(income) AS v FROM audience GROUP BY person_id))
+	SELECT state, n, w, total, (SELECT fill_rate FROM fill) AS fill_rate FROM by_state ORDER BY state NULLS FIRST`
+	if !h.check(q) {
+		t.Fatal("did not run distributed")
+	}
+	p := h.planOf(q)
+	// people and the audience's members are scanned once each.
+	if _, scans := relationExchanges(p, "people"); scans != 1 {
+		t.Errorf("%d scans of people, want 1:\n%s", scans, p.describe())
+	}
+	if _, scans := relationExchanges(p, "lookup"); scans != 1 {
+		t.Errorf("%d scans of lookup, want 1:\n%s", scans, p.describe())
+	}
+	t.Logf("%d stages:\n%s", len(p.Stages), p.describe())
 }

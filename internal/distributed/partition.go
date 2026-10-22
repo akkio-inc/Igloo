@@ -149,7 +149,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 			c.whole = append(c.whole, r)
 			continue
 		}
-		if !r.splittable || !inScope(r.sc) {
+		if !(r.splittable || r.semi) || !inScope(r.sc) {
 			return unsupported("%s is read where its rows cannot be divided", r.item.name)
 		}
 		c.keyed = append(c.keyed, &keyed{rel: r, item: r.item})
@@ -165,7 +165,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 		if rest <= pl.opts.maxBroadcast && (len(c.keyed) > 0 || u.table.Bytes < pl.opts.minBytes) {
 			break
 		}
-		if !u.splittable || !inScope(u.scope) {
+		if !(u.splittable || u.semi) || !inScope(u.scope) {
 			if u.splittable && u.scope != nil && u.scope.ref != nil {
 				c.tooDeep = u
 			}
@@ -251,7 +251,7 @@ func joinKeys(sc *scope) [][]itemColumn {
 		parent[x] = r
 		return r
 	}
-	for _, cond := range sc.conds {
+	for _, cond := range append(slices.Clone(sc.conds), sc.semiConds...) {
 		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" {
 			continue
 		}

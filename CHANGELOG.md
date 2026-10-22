@@ -285,9 +285,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   intermediate results, `UNION ALL` of large branches feeding one
   aggregation, and a large table joined to itself run distributed; a
   common table expression is computed once, however many parts read it.
-  Aggregates over all of a step's rows (`min(day) OVER ()`) and
+  Aggregates over all of a step's rows (`min(day) OVER ()`),
   uncorrelated one-row subqueries in filters over a divided table
-  (`ver = (SELECT max(ver) FROM t ...)`) run on workers too, and so do aggregates that do not compute in parts (`median`,
+  (`ver = (SELECT max(ver) FROM t ...)`) and `x IN (SELECT y ...)` over
+  large tables, as semi joins partitioned by `y`, run on workers too, and so do aggregates that do not compute in parts (`median`,
   `quantile_cont`, `string_agg`) over a step partitioned by their groups.
   Cohort reports (distinct people per cohort, joined to their events and
   counted per signal) run on workers up to the signal-level tail.
