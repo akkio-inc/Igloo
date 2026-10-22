@@ -10,7 +10,7 @@
 #   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
 #   - tables with lists, maps and structs run distributed, unnests and
-#     Snowflake's FLATTEN of them too,
+#     Snowflake's FLATTEN of them too, and so do views over them,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
@@ -309,6 +309,25 @@ check_distributed "Snowflake's FLATTEN" flatten \
 check_distributed "Snowflake's FLATTEN of an OBJECT column" flatten_object \
   "SELECT f.key AS k, f.value::string AS v, COUNT(*) AS n FROM people p, TABLE(FLATTEN(p.attrs)) f
    WHERE p.person_id % 2 = 0 GROUP BY 1, 2 ORDER BY 1, 2" snowflake '%sf_flatten_values(p.attrs%'
+
+echo "views"
+# A view reads as its query on the workers: one that passes a table of
+# another schema through, and one that joins a small table to it.
+{
+  echo "CREATE SCHEMA mirror;"
+  echo "CREATE TABLE mirror.survey AS SELECT DISTINCT n_nationkey::DECIMAL(38,0) AS survey_household_id,
+    'band_' || (n_nationkey % 4) AS income FROM nation WHERE n_nationkey % 3 <> 0;"
+  echo "CREATE VIEW mirror.v_people_latest (person_id, segments, attrs, contact) AS SELECT * FROM public.people;"
+  echo "CREATE VIEW mirror.v_people_attrs AS SELECT s.person_id, s.segments, sv.income FROM mirror.v_people_latest s
+    LEFT JOIN mirror.survey sv ON TRY_CAST(s.attrs['nation'] AS DECIMAL(38,0)) = sv.survey_household_id;"
+} | psql_admin -q >/dev/null
+check_distributed "a view that passes a table through" view \
+  "SELECT count(*), count(DISTINCT person_id), sum(len(segments)) FROM mirror.v_people_latest"
+check_distributed "a view that joins a small table" view_join \
+  "SELECT income, count(*), count(DISTINCT person_id) FROM mirror.v_people_attrs GROUP BY 1 ORDER BY 1"
+check_distributed "FLATTEN over a view" view_flatten \
+  "SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS n FROM mirror.v_people_latest p,
+   LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%v_people_latest%sf_flatten_values%'
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table

@@ -344,6 +344,48 @@ func (e *sessionEnv) View(ctx context.Context, parts []string) (bool, error) {
 	return res.first[0].view, nil
 }
 
+// ViewDefinition returns the query of the view a name means in this
+// session, if it means exactly one: a view of the catalog's (a local copy
+// of one), or a temporary view of the session's. Names in the query are
+// resolved as DuckDB resolves them in the view's body. The grant check
+// expanded the view the same way for users who read only what grants
+// allow, so the tables it reads are among those it allowed (see Table).
+func (e *sessionEnv) ViewDefinition(ctx context.Context, parts []string) (*distributed.ViewDefinition, bool, error) {
+	if e.resolver == nil {
+		r, err := e.s.newResolver(ctx, e.sess)
+		if err != nil {
+			return nil, false, err
+		}
+		e.resolver = r
+	}
+	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(res.all) != 1 || len(res.first) != 1 {
+		return nil, false, nil
+	}
+	o := res.first[0]
+	if !o.view || o.internal || o.external || !e.resolver.ownDatabase(o.db) {
+		return nil, false, nil
+	}
+	body := viewBody(o.sql)
+	if body == "" {
+		return nil, false, nil
+	}
+	return &distributed.ViewDefinition{
+		Query: body,
+		Resolve: func(_ context.Context, parts []string) ([]string, bool, error) {
+			res, err := e.resolver.resolve(tableRef{parts: parts}, &o)
+			if err != nil || len(res.all) != 1 || len(res.first) != 1 {
+				return nil, false, err
+			}
+			t := res.first[0]
+			return []string{t.db, t.schema, t.name}, true, nil
+		},
+	}, true, nil
+}
+
 // tableColumns lists a table's columns as DuckDB has them.
 func tableColumns(ctx context.Context, sess *session, db, schema, table string) ([]distributed.Column, error) {
 	rows, err := sess.conn.QueryContext(ctx, `SELECT column_name, data_type FROM duckdb_columns()

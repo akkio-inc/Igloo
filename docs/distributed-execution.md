@@ -108,6 +108,11 @@ In detail, a part runs distributed when:
   compressed size); or all but the largest of them fit, and that one is
   joined to the large table directly, by an inner `JOIN ... ON` or `WHERE`,
   on equal columns of the same type (integer types may mix).
+- It may read views: a view reads as its query, its names resolved as in
+  the view, so a view that passes a large table's rows through, filters
+  them, or joins small tables to them, distributes like its query. A view
+  that groups, sorts or limits, or has common table expressions, keeps the
+  part on one machine.
 - Its tables' columns may be nested: lists, maps and structs, Snowflake's
   `ARRAY` (`VARCHAR[]`) and `OBJECT` (`MAP(VARCHAR, VARCHAR)`) columns
   among them. Workers read them, and the fields nested in them, by their
@@ -129,8 +134,8 @@ read through a name mapping) or that nest a struct's fields otherwise
 than the table does now (a field renamed, or dropped and added again,
 since they were written), tables with
 [masking or row access policies](security-policies.md) and statements those
-policies rewrite (directly or through a view), views (name the tables they
-read to distribute them), [connections](federation.md)' tables and Delta
+policies rewrite (directly or through a view), views that group, sort or
+limit, [connections](federation.md)' tables and Delta
 Sharing's [external tables](sharing.md). Workers read table files
 directly and could not apply policies; a connection's table or an external
 table may still be read in the part of a statement the coordinator runs
@@ -436,7 +441,8 @@ machine's memory run where that machine would run out of memory.
   worker's groups to it. (`count(DISTINCT x)` over billions of values sends
   it one row per group and partition.)
 - Tables with delete files (from `UPDATE`, `DELETE` or `MERGE`) or data
-  files without field IDs, views, and time travel run on one machine.
+  files without field IDs, views that group, sort or limit, and time
+  travel run on one machine.
 - Workers read each table's files directly and do not use Iceberg partition
   statistics to skip files; DuckDB skips row groups by their Parquet
   statistics instead.

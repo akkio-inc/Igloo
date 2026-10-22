@@ -175,7 +175,11 @@ explicit transactions, the coordinator plans it:
    reads catalog tables through joins that keep the largest table's rows
    whole (inner and cross joins, `LEFT`/`SEMI`/`ANTI`/`ASOF` with the large
    table on the kept side, and subqueries that only filter and project) and
-   whose aggregates can be computed in parts. Items of `FROM` that read no
+   whose aggregates can be computed in parts. A view reads as its query,
+   with every table name in it qualified as DuckDB resolves names in the
+   view's body, if that query describes as the view does in the session:
+   a view that passes a table through, filters it or joins small tables to
+   it distributes as its query would. Items of `FROM` that read no
    table compute their rows from the row they are lateral to alone, as a
    filter does, so they may run anywhere: `unnest`, `json_each` and
    `json_tree` of values, and subqueries without tables, which is what
@@ -336,9 +340,12 @@ result's columns must match the prepared statement's, or it falls back.
   it was checked against the user's role and grants and prepared. The
   planner resolves each table name through the same resolver the grant
   check uses; a name that could mean anything but exactly one catalog table
-  (a view, a temporary table, an ambiguous name) is not distributed. For
-  users with role `none`, a table must be one the grant check found and
-  allowed, or the part runs on one machine.
+  or view (a temporary table, an ambiguous name) is not distributed. A view
+  reads as its query, every name in it resolved as DuckDB resolves names
+  in the view's body, and only if the query describes as the view does; the
+  grant check expands views the same way. For users with role `none`, a
+  table must be one the grant check found and allowed, or the part runs on
+  one machine.
 - **Policies keep statements on one machine.** Masking and row access
   policies are applied by rewriting statements, for the requesting user,
   on the replica; workers read table files directly and know nothing of
@@ -359,8 +366,8 @@ result's columns must match the prepared statement's, or it falls back.
   task's SQL and refuses it unless it reads only the task's views: no table
   function but `unnest`, `json_each` and `json_tree` of values, no table by
   name. The planner never distributes a part that reads another table
-  function, a view, a temporary table, a connection's table or an external
-  table.
+  function, a temporary table, a connection's table or an external table,
+  or a view that reads one.
 - **No new endpoint is open.** Workers accept tasks only over TLS 1.3 with a
   client certificate whose key is derived (HKDF-SHA256, Ed25519) from
   `IGLOO_WORKER_SECRET`, and coordinators accept results only from servers

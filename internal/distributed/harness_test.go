@@ -42,6 +42,8 @@ type harness struct {
 	log     *slog.Logger
 	// removed are the directories the coordinator removed.
 	removed []string
+	// views are the queries of the views addView made.
+	views map[string]string
 }
 
 // fileSource serves the harness's tables.
@@ -97,6 +99,22 @@ func (e harnessEnv) Describe(ctx context.Context, query string) ([]Column, error
 }
 
 func (e harnessEnv) UserFunction(context.Context, string) (bool, error) { return false, nil }
+
+// ViewDefinition returns the views addView made. Names in them mean the
+// harness's tables and views.
+func (e harnessEnv) ViewDefinition(_ context.Context, parts []string) (*ViewDefinition, bool, error) {
+	q, ok := e.h.views[strings.ToLower(parts[len(parts)-1])]
+	if !ok || len(parts) > 1 && !strings.EqualFold(parts[len(parts)-2], "main") {
+		return nil, false, nil
+	}
+	return &ViewDefinition{Query: q, Resolve: func(_ context.Context, parts []string) ([]string, bool, error) {
+		name := strings.ToLower(parts[len(parts)-1])
+		if _, ok := e.h.tables[name]; ok || e.h.views[name] != "" {
+			return []string{"memory", "main", name}, true, nil
+		}
+		return nil, false, nil
+	}}, true, nil
+}
 
 // View reports views the session has besides the tables' own, which the
 // harness defines as views over their files.
@@ -231,6 +249,17 @@ func fieldIDs(id int, nest *Nesting) string {
 		parts = append(parts, quoteIdent(f.Name)+": "+fieldIDs(f.ID, f.Nested))
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// addView creates a view in the session, which the planner may read as
+// its query.
+func (h *harness) addView(name, query string) {
+	h.t.Helper()
+	h.exec(fmt.Sprintf("CREATE OR REPLACE VIEW main.%s AS %s", quoteIdent(name), query))
+	if h.views == nil {
+		h.views = map[string]string{}
+	}
+	h.views[strings.ToLower(name)] = query
 }
 
 func quoted(ss []string) []string {

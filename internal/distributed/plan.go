@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -48,6 +49,22 @@ type Env interface {
 	// view in this session: a view, or a name that does not resolve to
 	// exactly one relation.
 	View(ctx context.Context, parts []string) (bool, error)
+	// ViewDefinition returns the definition of the view a name, as a
+	// statement writes it, means in this session. ok is false when the name
+	// does not mean exactly one view whose query the planner may read in
+	// its place: one of Igloo's catalog, of its local copies of those or of
+	// the session's temporary ones.
+	ViewDefinition(ctx context.Context, parts []string) (def *ViewDefinition, ok bool, err error)
+}
+
+// ViewDefinition is a view's query and how to read the names in it.
+type ViewDefinition struct {
+	// Query is the view's SELECT.
+	Query string
+	// Resolve returns the database, schema and name of the one relation a
+	// name written in Query means there, as DuckDB resolves names in the
+	// body of the view; ok is false when that is not one relation.
+	Resolve func(ctx context.Context, parts []string) (qualified []string, ok bool, err error)
 }
 
 // Column is a column of a table or a result.
@@ -182,6 +199,11 @@ type planner struct {
 	// defaultCollation caches the session's default_collation; nil until
 	// read.
 	defaultCollation *string
+	// undo puts back the views a candidate that did not qualify read as
+	// their queries, so that the rest of the statement reads them as views.
+	undo []func()
+	// expanded counts the views read as their queries.
+	expanded int
 }
 
 type tableResult struct {
@@ -408,8 +430,13 @@ type candidate struct {
 // that replaces it, or nil if it does not qualify.
 func (pl *planner) job(sel node, top bool, ctes []string) (node, error) {
 	c := &candidate{sel: sel}
+	undo := len(pl.undo)
 	j, b, err := pl.build(c, top, ctes)
 	if err != nil {
+		for len(pl.undo) > undo {
+			pl.undo[len(pl.undo)-1]()
+			pl.undo = pl.undo[:len(pl.undo)-1]
+		}
 		if IsUnsupported(err) {
 			pl.skip(err)
 			return nil, nil
@@ -609,6 +636,18 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 			return unsupported("a common table expression in a distributed part")
 		}
 		tbl, err := pl.table(parts)
+		if IsUnsupported(err) {
+			// A view reads as its query, in place of its name.
+			sub, ok, verr := pl.expandView(ref, parts)
+			if verr != nil {
+				return verr
+			}
+			if ok {
+				clear(ref)
+				maps.Copy(ref, sub)
+				return pl.from(ref, splittable, ctes, sc, uses)
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -685,6 +724,123 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		return nil
 	}
 	return unsupported("%s in FROM", strings.ToLower(str(ref["type"])))
+}
+
+// maxViewDepth bounds views read through other views.
+const maxViewDepth = 16
+
+// expandView returns the subquery a reference to a view reads as: the
+// view's query, every table name in it qualified as DuckDB resolves it in
+// the view's body, aliased as the reference was (or by the view's name),
+// with the view's column names. It is used only when it describes as the
+// view itself does in the session, column for column. Masking and row
+// access policies, which views may hide, kept the statement from the
+// planner if they concern anything it reads (see pgwire's policyReason),
+// and the tables of the query are checked as any are.
+func (pl *planner) expandView(ref node, parts []string) (node, bool, error) {
+	if child(ref, "sample") != nil || child(ref, "at_clause") != nil {
+		return nil, false, nil
+	}
+	def, ok, err := pl.env.ViewDefinition(pl.ctx, parts)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	name := strings.Join(parts, ".")
+	if pl.expanded++; pl.expanded > maxViewDepth*4 {
+		return nil, false, unsupported("views nest too deep")
+	}
+	body, err := pl.p.parse(def.Query)
+	if err != nil {
+		return nil, false, unsupported("view %s: %v", name, err)
+	}
+	var qerr error
+	walk(body, func(n node) bool {
+		if qerr != nil {
+			return false
+		}
+		if len(cteNames(n)) > 0 {
+			// A name could mean a common table expression or a table.
+			qerr = unsupported("view %s has common table expressions", name)
+			return false
+		}
+		if str(n["type"]) != "BASE_TABLE" {
+			return true
+		}
+		q, ok, err := def.Resolve(pl.ctx, tableParts(n))
+		switch {
+		case err != nil:
+			qerr = err
+		case !ok || len(q) != 3:
+			qerr = unsupported("view %s reads %s, which may mean more than one relation", name, strings.Join(tableParts(n), "."))
+		default:
+			if str(n["alias"]) == "" {
+				n["alias"] = str(n["table_name"])
+			}
+			n["catalog_name"], n["schema_name"], n["table_name"] = q[0], q[1], q[2]
+		}
+		return qerr == nil
+	})
+	if qerr != nil {
+		return nil, false, qerr
+	}
+
+	// The view's columns, as the statement reads them, name the subquery's.
+	probe, err := pl.p.fromRef("SELECT * FROM t")
+	if err != nil {
+		return nil, false, err
+	}
+	for _, k := range []string{"catalog_name", "schema_name", "table_name", "alias", "column_name_alias"} {
+		probe[k] = clone(ref[k])
+	}
+	asView, err := pl.describeFrom(probe)
+	if err != nil {
+		return nil, false, err
+	}
+	sub, err := pl.p.fromRef("SELECT * FROM (SELECT 1) AS v")
+	if err != nil {
+		return nil, false, err
+	}
+	child(sub, "subquery")["node"] = body
+	sub["alias"] = str(ref["alias"])
+	if sub["alias"] == "" {
+		sub["alias"] = parts[len(parts)-1]
+	}
+	var aliases []any
+	for _, c := range asView {
+		aliases = append(aliases, c.Name)
+	}
+	sub["column_name_alias"] = aliases
+	asQuery, err := pl.describeFrom(sub)
+	if err != nil {
+		return nil, false, err
+	}
+	if !slices.Equal(asView, asQuery) {
+		return nil, false, unsupported("view %s does not read as its query", name)
+	}
+	original := clone(ref).(node)
+	pl.undo = append(pl.undo, func() {
+		clear(ref)
+		maps.Copy(ref, original)
+	})
+	return sub, true, nil
+}
+
+// describeFrom returns the columns of SELECT * FROM ref in the session.
+func (pl *planner) describeFrom(ref node) ([]Column, error) {
+	sel, err := pl.p.template("SELECT * FROM t")
+	if err != nil {
+		return nil, err
+	}
+	sel["from_table"] = clone(ref)
+	text, err := pl.p.print(sel)
+	if err != nil {
+		return nil, unsupported("%v", err)
+	}
+	cols, err := pl.env.Describe(pl.ctx, text)
+	if err != nil {
+		return nil, unsupported("describe: %v", err)
+	}
+	return cols, nil
 }
 
 // rowFunctions are the table functions whose rows depend on their

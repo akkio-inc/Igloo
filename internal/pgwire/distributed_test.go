@@ -471,3 +471,61 @@ func TestDistributedFlatten(t *testing.T) {
 		t.Errorf("with a session's own sf_flatten_values, FLATTEN ran on %d workers", n)
 	}
 }
+
+// A statement over a view reads the view's query on the workers, with the
+// view's names resolved as in its body, and grants hold: a user who reads
+// only what grants allow reads through a view what the grant check found
+// it reads, and nothing else.
+func TestDistributedViews(t *testing.T) {
+	ds := startDistServer(t, 2)
+	mustExec(t, ds.admin, "CREATE VIEW lake.public.v_orders (order_id, amount) AS SELECT id, amount FROM orders WHERE amount > 0")
+	mustExec(t, ds.admin, "CREATE VIEW lake.sales.v_orders_codes AS SELECT o.id, o.amount, s.code FROM public.orders o LEFT JOIN public.secrets s ON o.id = s.id")
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	for _, query := range []string{
+		"SELECT amount, count(*) AS n, sum(order_id) AS s FROM v_orders GROUP BY amount ORDER BY amount",
+		"SELECT amount, count(code) AS n FROM lake.sales.v_orders_codes GROUP BY amount ORDER BY amount",
+	} {
+		mustExec(t, conn, "SET distributed_execution = off")
+		local := rowsOf(t, conn, query)
+		mustExec(t, conn, "SET distributed_execution = on")
+		if got := rowsOf(t, conn, query); got != local || local == "" {
+			t.Errorf("%s: distributed\n%s\nlocal\n%s", query, got, local)
+		}
+		if n := lastWorkers(t, ds.history, query); n != 2 {
+			t.Errorf("%s ran on %d workers, want 2", query, n)
+		}
+	}
+
+	nina := ds.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, ds.admin, "GRANT SELECT ON TABLE lake.public.orders TO nina")
+	mustExec(t, nina, "SET search_path = 'lake.public,memory.main'")
+	mustExec(t, nina, "SET distributed_execution = on")
+	query := "SELECT amount, count(*) FROM v_orders GROUP BY amount"
+	expectAllowed(t, nina, query)
+	if n := lastWorkers(t, ds.history, query); n != 1 {
+		t.Errorf("a view over a granted table ran on %d workers, want 1", n)
+	}
+	expectDenied(t, nina, "SELECT amount, count(code) FROM lake.sales.v_orders_codes GROUP BY amount", "SELECT on table public.secrets")
+}
+
+// rowsOf returns a query's rows, one line each.
+func rowsOf(t *testing.T, conn *pgx.Conn, query string) string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintln(&b, vals...)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
