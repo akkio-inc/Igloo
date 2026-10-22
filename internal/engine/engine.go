@@ -292,6 +292,47 @@ func (e *Engine) CatalogChanged() { e.proxy.Invalidate() }
 // catalog list may have changed (see catalogproxy.Proxy.Generation).
 func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
 
+// ForgetMissingSchema makes DuckDB forget that schema, of the catalog, is
+// missing, if the catalog has it, and reports whether it did: a statement
+// that failed for want of the schema then binds when prepared again.
+// DuckDB remembers a schema as missing once a lookup of a table in it found
+// neither, until it stops, whoever creates the schema afterwards (see
+// catalogproxy's namespaces.go).
+func (e *Engine) ForgetMissingSchema(ctx context.Context, schema string) bool {
+	if e.catalog == "" || schema == "" {
+		return false
+	}
+	ns := strings.Split(schema, ".")
+	if exists, ok := e.proxy.NamespaceExists(ctx, ns); !ok || !exists {
+		return false
+	}
+	c, err := e.connector.Connect(ctx)
+	if err != nil {
+		return false
+	}
+	defer c.Close() //nolint:errcheck
+	conn := c.(*duckdb.Conn)
+	exec := func(q string) error {
+		_, err := conn.ExecContext(ctx, q, nil)
+		return err
+	}
+	// With the lock held no session binds, so the existence check the
+	// proxy answers with 404 is the DROP's: DuckDB then forgets the
+	// schema, and asks the catalog to drop nothing. Should it have found
+	// the schema anyway, the drop it put off to the commit is rolled back.
+	release := e.CatalogLock()
+	defer release()
+	defer e.proxy.HideNamespace(ns)()
+	if err := exec("BEGIN"); err != nil {
+		return false
+	}
+	err = exec("DROP SCHEMA IF EXISTS " + ident(e.catalog) + "." + ident(schema))
+	if rerr := exec("ROLLBACK"); err == nil {
+		err = rerr
+	}
+	return err == nil
+}
+
 // LoadSchemas makes the catalog views (information_schema, pg_catalog,
 // duckdb_columns) show the real columns of every Iceberg table. DuckDB loads
 // an Iceberg table's schema the first time the table is used and until then

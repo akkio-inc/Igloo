@@ -532,3 +532,18 @@ func currentSchema(ctx context.Context, conn *duckdb.Conn) (db, schema string, e
 // missingRelation matches DuckDB's error for an unknown table or view: one
 // created on another replica, perhaps, that this one has not synced yet.
 var missingRelation = regexp.MustCompile(`Catalog Error: (Table|View) with name \S+ does not exist`)
+
+// missingSchema matches DuckDB's errors for a schema it did not find, its
+// name in group 1 or 2.
+var missingSchema = regexp.MustCompile(`[Ss]chema (?:with name )?"([^"]+)" (?:not found|does not exist)|` +
+	`namespace by the name of '([^']+)' does not exist`)
+
+// missingSchemaOf returns the schema an error of DuckDB's says it did not
+// find, or "".
+func missingSchemaOf(msg string) string {
+	m := missingSchema.FindStringSubmatch(msg)
+	if m == nil {
+		return ""
+	}
+	return m[1] + m[2]
+}

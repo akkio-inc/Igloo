@@ -76,6 +76,9 @@ type Engine interface {
 	// whenever what those listings list may have.
 	CatalogChanged()
 	ListingsGeneration() uint64
+	// ForgetMissingSchema makes DuckDB forget a schema of the catalog it
+	// took for missing, if the catalog has it, and reports whether it did.
+	ForgetMissingSchema(ctx context.Context, schema string) bool
 }
 
 // Options configures the server.
@@ -1603,6 +1606,18 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 			}
 			query = external
 			st, err = prepare(ctx, sess.conn, query, oids)
+		}
+	}
+	if err != nil && s.catalogName() != "" {
+		// Or a schema DuckDB took for missing before this replica or
+		// another created it, which it goes on taking for missing (see
+		// Engine.ForgetMissingSchema).
+		if schema := missingSchemaOf(err.Error()); schema != "" {
+			forgot := false
+			s.withoutCatalog(sess, func() { forgot = s.engine.ForgetMissingSchema(ctx, schema) })
+			if forgot {
+				st, err = prepare(ctx, sess.conn, query, oids)
+			}
 		}
 	}
 	if err != nil {

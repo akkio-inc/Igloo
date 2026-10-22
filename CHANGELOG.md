@@ -13,6 +13,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A schema created after a statement looked for it can be used. DuckDB's
+  Iceberg catalog remembers a schema as missing once a lookup of a table in
+  it found neither, until it restarts, in every session and whoever creates
+  the schema afterwards: `SELECT * FROM lake.staging.t`, then `CREATE SCHEMA
+  lake.staging`, left `staging` missing on that replica for good. When a
+  statement fails for want of a schema the catalog has, Igloo now makes
+  DuckDB forget it and prepares the statement again.
 - SQL endpoint that speaks the PostgreSQL wire protocol (simple and extended
   query protocols, prepared statements, transactions, query cancel), so
   `psql`, JDBC, psycopg, pgx and BI tools connect unchanged. Compatibility

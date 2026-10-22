@@ -143,6 +143,12 @@ type Proxy struct {
 	lists *listings
 	// names are how the catalog spells its tables' names (see names.go).
 	names *names
+
+	// prefix is the warehouse prefix DuckDB uses, and hide the namespaces
+	// whose next existence check the proxy answers with 404 (see
+	// namespaces.go), keyed by their names joined by \x1f; mu guards it.
+	prefix atomic.Pointer[string]
+	hide   map[string]bool
 }
 
 // New starts a proxy to the catalog on a random loopback port.
@@ -188,6 +194,7 @@ func New(opts Options) (*Proxy, error) {
 		ctx:     ctx,
 		cancel:  cancel,
 		changes: map[[sha256.Size]byte]*change{},
+		hide:    map[string]bool{},
 		lists:   newListings(opts.ListTTL),
 		names:   newNames(opts.ListTTL),
 	}
@@ -269,8 +276,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	p.notePrefix(rest)
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		if p.hidden(r, rest) {
+			writeError(w, http.StatusNotFound, "NoSuchNamespaceException", "the namespace does not exist")
+			return
+		}
 		if r.Method == http.MethodGet && p.opts.ListTTL > 0 && listPath.MatchString(rest) {
 			p.serveListing(w, r, rest)
 			return

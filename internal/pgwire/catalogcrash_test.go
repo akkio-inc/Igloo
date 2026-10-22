@@ -308,5 +308,7 @@ func (e *recordingEngine) CatalogChanged() {}
 
 func (e *recordingEngine) ListingsGeneration() uint64 { return 0 }
 
+func (e *recordingEngine) ForgetMissingSchema(context.Context, string) bool { return false }
+
 // (helpers newViewCatalog, viewReplica, syncing, dbtRun, dbtTable, connect,
 // mustExec live in viewsync_test.go.)
