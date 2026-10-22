@@ -86,6 +86,35 @@ exchange. The top groups of an aggregation by a column of the large table
 (`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are partitioned by
 group, and each partition sends the coordinator only its first groups.
 
+Statements built in steps, with common table expressions or subqueries,
+run step by step on workers, each step's rows written to object storage
+for the next, keyed by the column the next step joins or groups on. A
+cohort report, say:
+
+```sql
+WITH cohorts AS (
+  SELECT 'audience' AS cohort, person_id FROM (SELECT DISTINCT person_id FROM audience_members WHERE audience_id = 42)
+  UNION ALL
+  SELECT 'everyone', person_id FROM (SELECT DISTINCT person_id FROM people)),
+genres AS (
+  SELECT m.genre, c.cohort, count(DISTINCT m.person_id) AS people
+  FROM media_events m JOIN cohorts c ON c.person_id = m.person_id GROUP BY 1, 2),
+sizes AS (SELECT cohort, count(DISTINCT person_id) AS size FROM cohorts GROUP BY 1)
+SELECT g.genre, g.cohort, g.people / s.size AS reach FROM genres g JOIN sizes s USING (cohort);
+```
+
+Workers compute both cohorts' distinct people, write them once, keyed by
+person, to an exchange that both branches of the `UNION ALL` fill, and
+partition the media events by person as well; then each worker joins one
+partition of both and counts its people per genre and cohort, which no
+other partition holds, and so for the cohorts' sizes. The coordinator gets
+a row per genre, cohort and partition, and runs the final join itself. A
+common table expression is computed once, however many parts read it,
+and a part the coordinator runs that reads it too reads what the workers
+wrote. Joins of large intermediate results, `UNION ALL` of large branches
+feeding one aggregation, and a large table joined to itself on equal
+columns run the same way.
+
 In detail, a part runs distributed when:
 
 - It is a `SELECT` (in the statement itself, a subquery in `FROM`, a common
@@ -95,6 +124,11 @@ In detail, a part runs distributed when:
   compute columns. It may unnest its rows' values: `unnest`, `json_each`
   and `json_tree` of them, and lateral subqueries that read no table, which
   is what Snowflake's `FLATTEN` becomes (with `OUTER` and `RECURSIVE` too).
+  It may also read relations workers compute: common table expressions
+  and subqueries in `FROM` that are themselves such `SELECT`s, with
+  grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
+  functions but aggregates over all their rows (`min(day) OVER ()`), or a
+  `UNION ALL` of them.
 - Its aggregates are `count`, `sum`, `min`, `max`, `avg`, `count_if`,
   `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `any_value`,
   `fsum` and `product`, with or without `FILTER`, and any aggregate over
@@ -105,14 +139,15 @@ In detail, a part runs distributed when:
   `GROUPING SETS`.
 - The large table appears once in it, and the other tables it reads
   together fit comfortably in a worker's memory (an eighth of it, in
-  compressed size); or all but the largest of them fit, and that one is
-  joined to the large table directly, by an inner `JOIN ... ON` or `WHERE`,
-  on equal columns of the same type (integer types may mix).
+  compressed size); or the tables too large for that, and the relations it
+  reads, are all joined to each other, by inner `JOIN ... ON` or `WHERE`
+  conditions of the same `SELECT`, on equal columns of the same type
+  (integer types may mix).
 - It may read views: a view reads as its query, its names resolved as in
   the view, so a view that passes a large table's rows through, filters
-  them, or joins small tables to them, distributes like its query. A view
-  that groups, sorts or limits, or has common table expressions, keeps the
-  part on one machine.
+  them, or joins small tables to them, distributes like its query, and one
+  that groups is a relation workers compute. A view that sorts or limits,
+  or has common table expressions, keeps the part on one machine.
 - Its tables may have deleted rows: workers leave out the rows that
   position delete files delete, as `UPDATE`, `DELETE` and `MERGE` write
   them, and those of the equality delete files and deletion vectors other
@@ -127,11 +162,13 @@ In detail, a part runs distributed when:
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list`, `stddev`), aggregates over `DISTINCT` values of unrelated
+`list`, `stddev`), except over a relation workers compute, which is then
+partitioned by the groups so that each worker computes whole groups;
+aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
-window functions over rows, a large table joined to
-itself or read again in a subquery (TPC-H Q17, Q18, Q20, Q21), three large
-tables joined on different keys, statements that call user-defined macros
+window functions over rows, a large table read again in a subquery
+expression (`IN`, `EXISTS`, a scalar subquery: TPC-H Q17, Q18, Q20, Q21),
+large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
 equality deletes of fields nested in structs, with
 data files that have no Iceberg field IDs (files added from outside and
@@ -244,10 +281,12 @@ parts on the workers.
   and file lists, and results carry aggregated or filtered rows, over TLS.
   Partial results live in the spill directories of the workers and the
   coordinator while a statement runs, and are deleted when it ends.
-- **What exchanges leave in object storage.** The rows partitioned joins
-  and aggregations exchange (the columns a join uses, of rows that passed
-  the statement's filters; an aggregation's groups, the values its
-  aggregates over `DISTINCT` values count, and partial aggregates) are
+- **What exchanges leave in object storage.** The rows partitioned joins,
+  aggregations and the steps of multi-stage plans exchange (the columns a
+  join uses, of rows that passed the statement's filters; an aggregation's
+  groups, the values its aggregates over `DISTINCT` values count, and
+  partial aggregates; the rows of the common table expressions and
+  subqueries workers compute) are
   Parquet files, not encrypted by Igloo, under `_igloo_shuffle/` in the
   warehouse, deleted when the statement ends.
   They are protected as the tables' own files are: by access to the bucket
@@ -433,13 +472,15 @@ machine's memory run where that machine would run out of memory.
 
 ## Limitations
 
-- Partitioned joins cover two large tables joined on equal columns. A third
-  large table on another key, a large table joined to itself, and a large
-  table read again in a subquery run on one machine; give that machine a
-  lot of memory and fast spill disk.
-- Partitioned joins and aggregations write what they exchange to object
-  storage and read it back: that costs request charges and adds a few
-  seconds, and
+- The large inputs of one `SELECT` are partitioned by one key. Large tables
+  joined on different keys need a step each: a common table expression or
+  subquery per key. A large table read again in a subquery expression
+  (`IN`, `EXISTS`, a scalar subquery) runs on one machine; written as a
+  join to a common table expression, it runs distributed. Give the
+  machines that run such statements a lot of memory and fast spill disk.
+- Partitioned joins, aggregations and every step of a multi-stage plan
+  write what they exchange to object storage and read it back: that costs
+  request charges and adds a few seconds per step, and
   leftovers of a coordinator that crashed mid-statement stay under
   `_igloo_shuffle/` until a lifecycle rule expires them, which every
   deployment with workers needs.

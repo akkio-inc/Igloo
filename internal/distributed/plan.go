@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -145,16 +146,21 @@ type Plan struct {
 // by the names it reads them as.
 type job struct {
 	// split is the table whose files are divided among the workers; the
-	// fragment reads it as splitView.
+	// fragment reads it as splitView. A job whose inputs are keyed has none.
 	split     *Table
 	splitView string
-	views     []view
-	// broadcast is the size of the tables every worker reads in full.
-	broadcast int64
-	// partition, if set, says how the split table and a second large table
-	// are partitioned by their join key, so that each task reads matching
-	// partitions of both.
-	partition *partition
+	// views are the tables every task reads in full, and the split table.
+	views []view
+	// keyed are the inputs each task reads a partition of.
+	keyed []*keyed
+	// whole are the relations of one row every task reads.
+	whole []wholeRel
+}
+
+// wholeRel is a relation every task reads in full, under a view name.
+type wholeRel struct {
+	view string
+	rel  *relUse
 }
 
 // view is a table a fragment reads under a generated name.
@@ -192,6 +198,15 @@ type planner struct {
 	stages []*Stage
 	// exchanges counts the exchanges planned.
 	exchanges int
+	// memo records the exchanges remembered for common table expressions,
+	// for taking them back (see savepoint).
+	memo []memoEntry
+	// unread are the common table expressions nothing on the coordinator
+	// reads any more.
+	unread map[*cteDef]bool
+	// overs numbers the relations rewritten for window functions over all
+	// rows (overAll).
+	overs int
 	// reasons say why candidates were not distributed, for logs.
 	reasons []string
 	// tables caches resolved names.
@@ -223,6 +238,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	prune(out)
 	if len(pl.stages) == 0 {
 		reason := "no part reads a large enough table"
 		if len(pl.reasons) > 0 {
@@ -352,6 +368,34 @@ func (pl *planner) collation() (string, error) {
 	return *pl.defaultCollation, nil
 }
 
+// gather plans a stage that sends the coordinator the rows a common table
+// expression's exchange holds, and returns the query that reads them.
+func (pl *planner) gather(d *cteDef) (node, error) {
+	f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_g"))
+	if err != nil {
+		return nil, err
+	}
+	g := pl.stage(&Stage{fragment: f, Inputs: []Input{{View: "__igloo_g", Exchange: d.first, Partitioned: true}}})
+	g.placeholder = fmt.Sprintf("__igloo_partials_%d", g.ID)
+	q, err := pl.p.template("SELECT * FROM t")
+	if err != nil {
+		return nil, err
+	}
+	q["from_table"] = placeholderRef(g.placeholder)
+	return q, nil
+}
+
+// read reports whether the statement reads a common table expression, as
+// decided when its readers were planned.
+func (pl *planner) read(d *cteDef) bool { return pl.unread == nil || !pl.unread[d] }
+
+func (pl *planner) setRead(d *cteDef, read bool) {
+	if pl.unread == nil {
+		pl.unread = map[*cteDef]bool{}
+	}
+	pl.unread[d] = !read
+}
+
 // skip records why a candidate was not distributed.
 func (pl *planner) skip(err error) {
 	if len(pl.reasons) < 8 {
@@ -360,29 +404,57 @@ func (pl *planner) skip(err error) {
 }
 
 // query looks for jobs in a query node and returns the node with each job
-// replaced. ctes are the names of the common table expressions in scope.
-func (pl *planner) query(n node, top bool, ctes []string) (node, error) {
+// replaced. ctes are the common table expressions in scope.
+func (pl *planner) query(n node, top bool, ctes cteScope) (node, error) {
 	switch str(n["type"]) {
 	case "SELECT_NODE":
 		replaced, err := pl.job(n, top, ctes)
 		if err != nil || replaced != nil {
 			return replaced, err
 		}
-		// Not a job itself; look inside its common table expressions and
-		// the subqueries of its FROM clause.
-		inner := append(slices.Clone(ctes), cteNames(n)...)
-		for _, e := range list(child(n, "cte_map"), "map") {
-			q := child(child(e.(node), "value"), "query")
+		// Not a job itself; look inside the subqueries of its FROM clause
+		// and its common table expressions, readers before what they read,
+		// so that a common table expression that distributed parts read is
+		// computed once, for them.
+		inner := ctes.with(n)
+		if err := pl.fromSubqueries(child(n, "from_table"), inner); err != nil {
+			return nil, err
+		}
+		own := inner[len(ctes):]
+		for i := len(own) - 1; i >= 0; i-- {
+			d := own[i]
+			// Read by the statement, or by a common table expression after
+			// it that is.
+			body := clone(n).(node)
+			body["cte_map"] = node{"map": []any{}}
+			read := references(body, d.name) > 0
+			for _, later := range own[i+1:] {
+				if references(later.entry, d.name) > 0 && pl.read(later) {
+					read = true
+				}
+			}
+			pl.setRead(d, read)
+			if !read {
+				continue
+			}
+			q := child(d.entry, "query")
+			if d.first != nil {
+				// Distributed parts write its rows to an exchange: the
+				// coordinator reads them from there.
+				r, err := pl.gather(d)
+				if err != nil {
+					return nil, err
+				}
+				q["node"] = r
+				continue
+			}
 			if sub := child(q, "node"); sub != nil {
-				r, err := pl.query(sub, false, inner)
+				r, err := pl.query(sub, false, d.scope)
 				if err != nil {
 					return nil, err
 				}
 				q["node"] = r
 			}
-		}
-		if err := pl.fromSubqueries(child(n, "from_table"), inner); err != nil {
-			return nil, err
 		}
 	case "SET_OPERATION_NODE":
 		for _, side := range []string{"left", "right"} {
@@ -398,7 +470,7 @@ func (pl *planner) query(n node, top bool, ctes []string) (node, error) {
 	return n, nil
 }
 
-func (pl *planner) fromSubqueries(ref node, ctes []string) error {
+func (pl *planner) fromSubqueries(ref node, ctes cteScope) error {
 	switch str(ref["type"]) {
 	case "JOIN":
 		for _, side := range []string{"left", "right"} {
@@ -431,63 +503,69 @@ func cteNames(n node) []string {
 type candidate struct {
 	sel   node
 	scope *scope
-	uses  []*tableUse
+	reads
 	split *tableUse
-	// partition, if set, divides the split table and a second large table
-	// by their join key instead of reading the second in full.
-	partition *partitionPlan
+	// keyed, if set, are the inputs its stage reads by partition, with no
+	// split table, all items of keyScope; whole are relations of one row
+	// every task reads.
+	keyed    []*keyed
+	keyScope *scope
+	whole    []*relUse
+	// tooDeep is a table that must be partitioned but lies in a subquery,
+	// which then becomes a relation.
+	tooDeep *tableUse
 	// columns are its result columns.
 	columns []Column
+	// ctes are the common table expressions its FROM sees, its own among
+	// them.
+	ctes cteScope
+	// relation says the candidate computes a relation for other stages to
+	// read, which its consumer decided to distribute; want are the result
+	// columns the relation is to be written by.
+	relation bool
+	want     []string
 }
 
 // job turns sel into a job if it qualifies and returns the combine step
 // that replaces it, or nil if it does not qualify.
-func (pl *planner) job(sel node, top bool, ctes []string) (node, error) {
+func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
+	sp := pl.save()
 	c := &candidate{sel: sel}
-	undo := len(pl.undo)
 	j, b, err := pl.build(c, top, ctes)
+	var combine node
+	if err == nil {
+		combine, err = pl.finish(j, b)
+	}
 	if err != nil {
-		for len(pl.undo) > undo {
-			pl.undo[len(pl.undo)-1]()
-			pl.undo = pl.undo[:len(pl.undo)-1]
-		}
+		pl.restore(sp)
 		if IsUnsupported(err) {
 			pl.skip(err)
 			return nil, nil
 		}
 		return nil, err
 	}
-	return pl.finish(j, b), nil
+	return combine, nil
 }
 
-func (pl *planner) build(c *candidate, top bool, ctes []string) (*job, *jobBuild, error) {
+func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild, error) {
 	if err := pl.analyze(c, ctes); err != nil {
 		return nil, nil, err
 	}
-	if err := pl.chooseSplit(c); err != nil {
+	if err := pl.chooseInputs(c); err != nil {
 		return nil, nil, err
 	}
-	text, err := pl.p.print(c.sel)
-	if err != nil {
-		return nil, nil, unsupported("%v", err)
-	}
-	if c.columns, err = pl.env.Describe(pl.ctx, text); err != nil {
-		return nil, nil, unsupported("describe: %v", err)
+	var err error
+	if c.columns, err = pl.describe(c.sel, ctes); err != nil {
+		return nil, nil, err
 	}
 
 	// Mark each table reference with the view the fragment will read it
 	// as; the fragment is built from copies of the references, which keep
 	// the mark.
 	j := pl.views(c)
-	defer func() {
-		for _, u := range c.uses {
-			delete(u.ref, viewMark)
-		}
-	}()
-	if c.partition != nil {
-		if j.partition, err = pl.sides(c); err != nil {
-			return nil, nil, err
-		}
+	defer unmark(c)
+	if err := pl.sides(c); err != nil {
+		return nil, nil, err
 	}
 	var b *jobBuild
 	switch {
@@ -496,19 +574,55 @@ func (pl *planner) build(c *candidate, top bool, ctes []string) (*job, *jobBuild
 	case top:
 		b, err = pl.rowsJob(c)
 	default:
-		err = unsupported("a subquery without aggregation reads %s", c.split.table)
+		err = unsupported("a subquery without aggregation reads %s", c.largest())
 	}
 	if err != nil {
 		return nil, nil, err
 	}
-	if hasClass(b.fragment, "PARAMETER") {
-		return nil, nil, unsupported("a parameter in a distributed part")
-	}
-	if err := pl.checkFunctions(b.fragment); err != nil {
+	if err := pl.checkFragment(b.fragment); err != nil {
 		return nil, nil, err
 	}
-	pointAtViews(b.fragment)
 	return j, b, nil
+}
+
+// checkFragment refuses a fragment that workers could not run as the
+// coordinator would, and points its table references at their views.
+func (pl *planner) checkFragment(f node) error {
+	if hasClass(f, "PARAMETER") {
+		return unsupported("a parameter in a distributed part")
+	}
+	if err := pl.checkFunctions(f); err != nil {
+		return err
+	}
+	pointAtViews(f)
+	return nil
+}
+
+// unmark removes the view marks of a candidate's references.
+func unmark(c *candidate) {
+	for _, u := range c.uses {
+		delete(u.ref, viewMark)
+	}
+	for _, r := range c.rels {
+		delete(r.ref, viewMark)
+	}
+}
+
+// largest names the largest table or relation a candidate reads, for
+// messages.
+func (c *candidate) largest() string {
+	name, size := "", int64(-1)
+	for _, u := range c.uses {
+		if u.table.Bytes > size {
+			name, size = u.table.String(), u.table.Bytes
+		}
+	}
+	for _, r := range c.rels {
+		if r.bytes > size {
+			name, size = r.item.name, r.bytes
+		}
+	}
+	return name
 }
 
 // --- the FROM clause --------------------------------------------------------
@@ -519,6 +633,13 @@ type scope struct {
 	// conds hold for every row the SELECT's FROM and WHERE produce: the
 	// conjuncts of its WHERE clause and of its inner joins' conditions.
 	conds []node
+	// For the FROM clause of a subquery that passes its rows through: the
+	// subquery's reference, the FROM clause it is in, its item there, and
+	// whether its rows may be divided among workers.
+	ref        node
+	outer      *scope
+	item       *fromItem
+	splittable bool
 }
 
 // fromItem is a table or subquery in a FROM clause.
@@ -581,11 +702,12 @@ func (sc *scope) owner(name string) *fromItem {
 
 // analyze checks the shape of a candidate SELECT and collects what it
 // reads.
-func (pl *planner) analyze(c *candidate, ctes []string) error {
+func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	sel := c.sel
-	if len(list(child(sel, "cte_map"), "map")) > 0 {
-		return unsupported("WITH inside a distributed part")
-	}
+	// Its own common table expressions are in scope; the fragments read
+	// what workers compute of them through exchanges.
+	ctes = ctes.with(sel)
+	c.ctes = ctes
 	if child(sel, "sample") != nil {
 		return unsupported("USING SAMPLE")
 	}
@@ -612,10 +734,10 @@ func (pl *planner) analyze(c *candidate, ctes []string) error {
 		return unsupported("no FROM clause")
 	}
 	c.scope = &scope{}
-	if err := pl.from(from, true, ctes, c.scope, &c.uses); err != nil {
+	if err := pl.from(from, true, ctes, c.scope, &c.reads); err != nil {
 		return err
 	}
-	if err := pl.filterSubqueries(child(sel, "where_clause"), ctes, &c.uses); err != nil {
+	if err := pl.filterSubqueries(child(sel, "where_clause"), ctes, &c.reads); err != nil {
 		return err
 	}
 	c.scope.conds = append(c.scope.conds, conjuncts(child(sel, "where_clause"))...)
@@ -671,10 +793,17 @@ func checkLambdas(sel node) error {
 	return err
 }
 
+// clauses returns a SELECT's clauses, leaving out its common table
+// expressions.
+func clauses(sel node) []any {
+	return []any{sel["select_list"], sel["from_table"], sel["where_clause"], sel["group_expressions"], sel["having"],
+		sel["qualify"], sel["modifiers"]}
+}
+
 // from analyzes a table reference in FROM, adding its items to sc and the
 // catalog tables it reads to uses. splittable says whether rows of the
 // tables reached here may be divided among workers.
-func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, uses *[]*tableUse) error {
+func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd *reads) error {
 	switch t := str(ref["type"]); t {
 	case "BASE_TABLE":
 		if child(ref, "sample") != nil {
@@ -684,8 +813,11 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 			return unsupported("time travel")
 		}
 		parts := tableParts(ref)
-		if len(parts) == 1 && slices.Contains(ctes, strings.ToLower(parts[0])) {
-			return unsupported("a common table expression in a distributed part")
+		if len(parts) == 1 {
+			if d := ctes.find(parts[0]); d != nil {
+				// A relation workers compute.
+				return pl.relation(ref, d.query(), d.scope, d, splittable, sc, rd)
+			}
 		}
 		tbl, err := pl.table(parts)
 		if IsUnsupported(err) {
@@ -697,7 +829,7 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 			if ok {
 				clear(ref)
 				maps.Copy(ref, sub)
-				return pl.from(ref, splittable, ctes, sc, uses)
+				return pl.from(ref, splittable, ctes, sc, rd)
 			}
 		}
 		if err != nil {
@@ -712,7 +844,7 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		}
 		renameColumns(item, list(ref, "column_name_alias"))
 		sc.items = append(sc.items, item)
-		*uses = append(*uses, &tableUse{ref: ref, table: tbl, splittable: splittable, scope: sc, item: item})
+		rd.uses = append(rd.uses, &tableUse{ref: ref, table: tbl, splittable: splittable, scope: sc, item: item})
 		return nil
 
 	case "JOIN":
@@ -720,16 +852,16 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 		if err != nil {
 			return err
 		}
-		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, uses); err != nil {
+		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, rd); err != nil {
 			return err
 		}
-		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, uses); err != nil {
+		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, rd); err != nil {
 			return err
 		}
 		if str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF" {
 			sc.conds = append(sc.conds, conjuncts(child(ref, "condition"))...)
 		}
-		return pl.filterSubqueries(child(ref, "condition"), ctes, uses)
+		return pl.filterSubqueries(child(ref, "condition"), ctes, rd)
 
 	case "TABLE_FUNCTION":
 		// unnest(t.list) and the like: rows of the row's own values.
@@ -763,16 +895,18 @@ func (pl *planner) from(ref node, splittable bool, ctes []string, sc *scope, use
 			sc.items = append(sc.items, item)
 			return nil
 		}
-		if str(sub["type"]) != "SELECT_NODE" {
-			return unsupported("a set operation in FROM")
+		if str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" {
+			// A relation workers compute.
+			return pl.relation(ref, sub, ctes, nil, splittable, sc, rd)
 		}
-		inner := &scope{}
-		if err := pl.transparent(sub, splittable, ctes, inner, uses); err != nil {
+		inner := &scope{ref: ref, outer: sc, splittable: splittable}
+		if err := pl.transparent(sub, splittable, ctes, inner, rd); err != nil {
 			return err
 		}
 		item.columns = outputColumns(sub, inner)
 		renameColumns(item, list(ref, "column_name_alias"))
 		sc.items = append(sc.items, item)
+		inner.item = item
 		return nil
 	}
 	return unsupported("%s in FROM", strings.ToLower(str(ref["type"])))
@@ -978,27 +1112,18 @@ func joinSides(ref node) (left, right bool, err error) {
 // transparent analyzes a subquery in FROM that passes rows through: no
 // aggregation, DISTINCT, LIMIT, window functions or ordering, so each of
 // its rows comes from one row of its own FROM clause.
-func (pl *planner) transparent(sel node, splittable bool, ctes []string, sc *scope, uses *[]*tableUse) error {
-	if len(list(child(sel, "cte_map"), "map")) > 0 || child(sel, "sample") != nil || child(sel, "qualify") != nil ||
-		child(sel, "having") != nil || len(list(sel, "group_expressions")) > 0 || len(list(sel, "modifiers")) > 0 ||
-		str(sel["aggregate_handling"]) != "STANDARD_HANDLING" {
-		return unsupported("a subquery in FROM that groups, sorts or limits")
+func (pl *planner) transparent(sel node, splittable bool, ctes cteScope, sc *scope, rd *reads) error {
+	if reason := pl.opaque(sel); reason != "" {
+		return unsupported("%s", reason)
 	}
-	if pl.hasAggregate(sel["select_list"]) || hasClass(sel["select_list"], "WINDOW") {
-		return unsupported("a subquery in FROM that aggregates")
-	}
-	from := child(sel, "from_table")
-	if from == nil || str(from["type"]) == "EMPTY" {
-		return unsupported("a subquery without FROM")
-	}
-	if err := pl.from(from, splittable, ctes, sc, uses); err != nil {
+	if err := pl.from(child(sel, "from_table"), splittable, ctes, sc, rd); err != nil {
 		return err
 	}
-	if err := pl.filterSubqueries(sel["select_list"], ctes, uses); err != nil {
+	if err := pl.filterSubqueries(sel["select_list"], ctes, rd); err != nil {
 		return err
 	}
 	sc.conds = append(sc.conds, conjuncts(child(sel, "where_clause"))...)
-	return pl.filterSubqueries(child(sel, "where_clause"), ctes, uses)
+	return pl.filterSubqueries(child(sel, "where_clause"), ctes, rd)
 }
 
 // conjuncts splits a condition at its top-level ANDs.
@@ -1018,14 +1143,14 @@ func conjuncts(e node) []node {
 
 // filterSubqueries adds the tables that subquery expressions in v read to
 // uses, as tables every worker reads in full.
-func (pl *planner) filterSubqueries(v any, ctes []string, uses *[]*tableUse) error {
+func (pl *planner) filterSubqueries(v any, ctes cteScope, rd *reads) error {
 	var err error
 	walk(v, func(n node) bool {
 		if err != nil {
 			return false
 		}
 		if str(n["class"]) == "SUBQUERY" {
-			err = pl.fullRead(subqueryNode(n), ctes, nil, uses)
+			err = pl.fullRead(subqueryNode(n), ctes.names(), nil, rd)
 			return false
 		}
 		return true
@@ -1038,7 +1163,7 @@ func (pl *planner) filterSubqueries(v any, ctes []string, uses *[]*tableUse) err
 // table or a common table expression of its own (local); the common table
 // expressions of the statement around the job (outer) are not available
 // to workers.
-func (pl *planner) fullRead(n node, outer, local []string, uses *[]*tableUse) error {
+func (pl *planner) fullRead(n node, outer, local []string, rd *reads) error {
 	if n == nil {
 		return nil
 	}
@@ -1049,7 +1174,7 @@ func (pl *planner) fullRead(n node, outer, local []string, uses *[]*tableUse) er
 			return false
 		}
 		if strings.HasSuffix(str(m["type"]), "_NODE") {
-			err = pl.fullRead(m, outer, local, uses)
+			err = pl.fullRead(m, outer, local, rd)
 			return false
 		}
 		switch str(m["type"]) {
@@ -1071,7 +1196,7 @@ func (pl *planner) fullRead(n node, outer, local []string, uses *[]*tableUse) er
 			}
 			var t *Table
 			if t, err = pl.table(parts); err == nil {
-				*uses = append(*uses, &tableUse{ref: m, table: t})
+				rd.uses = append(rd.uses, &tableUse{ref: m, table: t})
 			} else if IsUnsupported(err) {
 				// A view reads as its query here too.
 				sub, ok, verr := pl.expandView(m, parts)
@@ -1081,7 +1206,7 @@ func (pl *planner) fullRead(n node, outer, local []string, uses *[]*tableUse) er
 				case ok:
 					clear(m)
 					maps.Copy(m, sub)
-					err = pl.fullRead(subqueryNode(m), outer, local, uses)
+					err = pl.fullRead(subqueryNode(m), outer, local, rd)
 				}
 			}
 			return false
@@ -1189,6 +1314,18 @@ func (pl *planner) table(parts []string) (*Table, error) {
 // chooseSplit picks the largest table the candidate may divide among
 // workers, and checks that the rest are small enough for every worker to
 // read in full.
+// chooseInputs decides how the candidate's stage reads its inputs: one
+// table divided among the workers by file and the others in full, or its
+// large inputs by partition.
+func (pl *planner) chooseInputs(c *candidate) error {
+	if slices.ContainsFunc(c.rels, func(r *relUse) bool { return r.bytes > 0 }) {
+		return pl.chooseKeyed(c)
+	}
+	// Relations of one row, if any, every task reads.
+	c.whole = c.rels
+	return pl.chooseSplit(c)
+}
+
 func (pl *planner) chooseSplit(c *candidate) error {
 	var largest *tableUse
 	for _, u := range c.uses {
@@ -1212,6 +1349,10 @@ func (pl *planner) chooseSplit(c *candidate) error {
 			continue
 		}
 		if u.table.key() == c.split.table.key() {
+			if u.splittable && u.scope == c.scope {
+				// Joined to itself: both sides by partition.
+				return pl.chooseKeyed(c)
+			}
 			return unsupported("%s is read more than once", c.split.table)
 		}
 		broadcast += u.table.Bytes
@@ -1219,23 +1360,15 @@ func (pl *planner) chooseSplit(c *candidate) error {
 			second = u
 		}
 	}
-	if !pl.opts.force && c.split.table.Bytes < pl.opts.minBytes {
+	if !pl.opts.force && !c.relation && c.split.table.Bytes < pl.opts.minBytes {
 		return unsupported("%s is small (%d bytes)", c.split.table, c.split.table.Bytes)
 	}
 	if broadcast <= pl.opts.maxBroadcast {
 		return nil
 	}
-	// Too much for every worker to read: partition the two largest tables
-	// by their join key, if the rest fits.
-	if broadcast-second.table.Bytes > pl.opts.maxBroadcast {
-		return unsupported("the tables joined to %s are too large for every worker to read (%d bytes)", c.split.table, broadcast)
-	}
-	p, err := pl.partition(c, second)
-	if err != nil {
-		return err
-	}
-	c.partition = p
-	return nil
+	// Too much for every worker to read: partition the largest tables by
+	// their join key, if the rest fits.
+	return pl.chooseKeyed(c)
 }
 
 // --- finishing a job --------------------------------------------------------
@@ -1260,22 +1393,35 @@ type jobBuild struct {
 // fragment reads it as, while the fragment is built.
 const viewMark = "__igloo_view"
 
-// views names the views a job's fragment reads its tables as, and marks
-// the candidate's table references with them. Every use of a table reads
-// the same view, except the split table's, whose view each worker defines
-// over its own share of the files.
+// views names the views a job's fragment reads its inputs as, and marks
+// the candidate's references with them. Every use of a table read in full
+// reads the same view; the split table's view each worker defines over its
+// own share of the files, and each input read by partition has one of its
+// own.
 func (pl *planner) views(c *candidate) *job {
-	j := &job{split: c.split.table, splitView: "__igloo_split"}
+	j := &job{splitView: "__igloo_split", keyed: c.keyed}
+	if c.split != nil {
+		j.split = c.split.table
+	}
+	for i, k := range c.keyed {
+		k.view = fmt.Sprintf("__igloo_k%d", i)
+		k.ref()[viewMark] = k.view
+	}
+	for i, r := range c.whole {
+		v := fmt.Sprintf("__igloo_w%d", i)
+		j.whole = append(j.whole, wholeRel{view: v, rel: r})
+		r.ref[viewMark] = v
+	}
 	names := map[string]string{}
 	for _, u := range c.uses {
+		if slices.ContainsFunc(c.keyed, func(k *keyed) bool { return k.use == u }) {
+			continue
+		}
 		name := j.splitView
 		if u != c.split {
 			if name = names[u.table.key()]; name == "" {
 				name = fmt.Sprintf("__igloo_t%d", len(names))
 				names[u.table.key()] = name
-				if c.partition == nil || u != c.partition.other {
-					j.broadcast += u.table.Bytes
-				}
 			}
 		}
 		if !slices.ContainsFunc(j.views, func(v view) bool { return v.name == name }) {
@@ -1286,19 +1432,32 @@ func (pl *planner) views(c *candidate) *job {
 	return j
 }
 
-// pointAtViews makes the marked table references of a fragment read their
+// pointAtViews makes the marked references of a fragment read their
 // views. A reference keeps the name its columns are qualified with: its
-// alias, else the table's name.
+// alias, else the table's name; a subquery becomes a reference to its
+// view.
 func pointAtViews(fragment node) {
-	walk(fragment, func(n node) bool {
-		if v := str(n[viewMark]); v != "" {
-			if str(n["alias"]) == "" {
-				n["alias"] = str(n["table_name"])
-			}
-			n["table_name"], n["schema_name"], n["catalog_name"] = v, "", ""
-			delete(n, viewMark)
+	rewrite(fragment, func(n node) (node, bool) {
+		v := str(n[viewMark])
+		if v == "" {
+			return nil, false
 		}
-		return true
+		if str(n["type"]) == "SUBQUERY" {
+			alias := str(n["alias"])
+			if alias == "" {
+				alias = v
+			}
+			return node{
+				"type": "BASE_TABLE", "alias": alias, "sample": nil, "query_location": json.Number(queryLocationNone), "schema_name": "",
+				"table_name": v, "column_name_alias": n["column_name_alias"], "catalog_name": "", "at_clause": nil,
+			}, true
+		}
+		if str(n["alias"]) == "" {
+			n["alias"] = str(n["table_name"])
+		}
+		n["table_name"], n["schema_name"], n["catalog_name"] = v, "", ""
+		delete(n, viewMark)
+		return nil, false
 	})
 }
 
@@ -1314,38 +1473,66 @@ func unmarked(v any) any {
 
 // finish turns a job into stages: the combine step reads the partial
 // results of the last.
-func (pl *planner) finish(j *job, b *jobBuild) node {
+func (pl *planner) finish(j *job, b *jobBuild) (node, error) {
+	last, err := pl.emit(j, b, nil)
+	if err != nil {
+		return nil, err
+	}
+	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
+	b.combine["from_table"] = placeholderRef(last.placeholder)
+	return b.combine, nil
+}
+
+// placeholderRef is a reference to a coordinator-bound stage's partial
+// results, which Execute replaces with a read of them.
+func placeholderRef(name string) node {
+	return node{
+		"type": "BASE_TABLE", "alias": "__igloo_p", "sample": nil, "query_location": json.Number(queryLocationNone),
+		"schema_name": "", "table_name": name, "column_name_alias": []any{}, "catalog_name": "", "at_clause": nil,
+	}
+}
+
+// emit adds a job's stages to the plan: a stage per partitioned table, the
+// stages of the relations it reads, its own stage and, for an aggregation
+// completed on workers, a second; the last writes to out, or to the
+// coordinator without one.
+func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 	last := &Stage{fragment: b.fragment, Columns: b.columns}
-	sides := map[string]*Exchange{}
-	if j.partition != nil {
-		// A stage per partitioned table, writing its rows to an exchange
-		// keyed by its side of the join key.
-		for _, sd := range j.partition.sides {
-			x := pl.exchange("join", sd.keys, sd.casts)
-			pl.stage(&Stage{fragment: sd.stage, Inputs: []Input{{View: sd.view, Table: sd.table, Split: true}}, Out: x})
-			sides[sd.view] = x
+	for _, k := range j.keyed {
+		var x *Exchange
+		if k.use != nil {
+			// A stage per partitioned table, writing its rows to an exchange
+			// keyed by its side of the join key.
+			x = pl.exchange("join", k.keys, k.casts)
+			pl.stage(&Stage{fragment: k.stage, Inputs: []Input{{View: k.view, Table: k.use.table, Split: true}}, Out: x})
+		} else {
+			var err error
+			if x, err = pl.relationExchange(k.rel, k.keys, k.casts); err != nil {
+				return nil, err
+			}
 		}
+		last.Inputs = append(last.Inputs, Input{View: k.view, Exchange: x, Partitioned: true})
+	}
+	for _, w := range j.whole {
+		x, err := pl.relationExchange(w.rel, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		last.Inputs = append(last.Inputs, Input{View: w.view, Exchange: x})
 	}
 	for _, v := range j.views {
-		in := Input{View: v.name, Table: v.table, Split: v.name == j.splitView}
-		if x := sides[v.name]; x != nil {
-			in = Input{View: v.name, Exchange: x, Partitioned: true}
-		}
-		last.Inputs = append(last.Inputs, in)
+		last.Inputs = append(last.Inputs, Input{View: v.name, Table: v.table, Split: v.name == j.splitView})
 	}
 	pl.stage(last)
 	if b.second != nil {
 		// The partial results go to an exchange, which a second stage reads
-		// partition by partition.
+		// partition by partition (or, with no groups, whole).
 		last.Out = pl.exchange("aggregate", b.second.keys, make([]string, len(b.second.keys)))
-		last = pl.stage(&Stage{fragment: b.second.fragment, Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: true}}})
+		last = pl.stage(&Stage{fragment: b.second.fragment, Columns: b.second.columns,
+			Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: !b.second.whole}}})
 	}
-	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
-	b.combine["from_table"] = node{
-		"type": "BASE_TABLE", "alias": "__igloo_p", "sample": nil, "query_location": queryLocationNone,
-		"schema_name": "", "table_name": last.placeholder, "column_name_alias": []any{}, "catalog_name": "", "at_clause": nil,
-	}
-	return b.combine
+	last.Out = out
+	return last, nil
 }
 
 // stage adds a stage to the plan.

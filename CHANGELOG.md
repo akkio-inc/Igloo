@@ -271,6 +271,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   groups of an aggregation by a column of a divided table
   (`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are completed and cut
   on workers too.
+- Statements built in steps run step by step on workers: a part may read
+  common table expressions and subqueries that workers compute (grouping,
+  `DISTINCT` and `UNION ALL` included), whose rows go to object storage
+  keyed by the column the reader joins or groups on. Joins of large
+  intermediate results, `UNION ALL` of large branches feeding one
+  aggregation, and a large table joined to itself run distributed; a
+  common table expression is computed once, however many parts read it.
+  Aggregates over all of a step's rows (`min(day) OVER ()`) run on workers
+  too, and so do aggregates that do not compute in parts (`median`,
+  `quantile_cont`, `string_agg`) over a step partitioned by their groups.
+  Cohort reports (distinct people per cohort, joined to their events and
+  counted per signal) run on workers up to the signal-level tail.
 - Workers start on demand and stop when idle: on Kubernetes the chart's
   `workers.enabled` adds a worker Deployment that Igloo scales between zero
   and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`

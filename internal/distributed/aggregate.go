@@ -68,6 +68,9 @@ type aggCall struct {
 	typ string
 	// final is the index of its __f column, when a stage computes it whole.
 	final int
+	// whole, if set, says why it cannot be computed in parts, only by a
+	// stage that holds whole groups.
+	whole error
 }
 
 // How an aggregation's groups are completed. Workers always aggregate their
@@ -92,6 +95,11 @@ const (
 	// groups; a stage then completes the groups of each partition, every
 	// aggregate included, and the coordinator only concatenates them.
 	aggByGroup = "by group"
+	// aggComplete is for a stage whose partitions hold whole groups, as one
+	// keyed by the group columns does: the stage computes every aggregate
+	// of its groups, any aggregate at all, and the coordinator only
+	// concatenates them.
+	aggComplete = "complete"
 )
 
 // additiveDistinct are the aggregates over DISTINCT values that combine
@@ -157,6 +165,72 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// relationAggregate builds the stages of a relation that aggregates. When
+// its stage's partitions hold whole groups, the stage computes the
+// relation as written; otherwise the partial results go to an exchange
+// keyed by the groups, and a second stage runs the combine step on each
+// partition.
+func (pl *planner) relationAggregate(c *candidate) (*jobBuild, error) {
+	var raw []node
+	for _, g := range list(c.sel, "group_expressions") {
+		raw = append(raw, g.(node))
+	}
+	if len(list(c.sel, "group_sets")) <= 1 && c.wholeGroups(raw) {
+		f := clone(c.sel).(node)
+		f["cte_map"] = node{"map": []any{}}
+		return &jobBuild{fragment: f}, nil
+	}
+	a := &aggregation{pl: pl, c: c, aliases: map[string]int{}, aggKeys: map[string]*aggCall{}}
+	for i, item := range list(c.sel, "select_list") {
+		e := item.(node)
+		if str(e["class"]) == "STAR" {
+			return nil, unsupported("* in an aggregation")
+		}
+		a.items = append(a.items, e)
+		if al := strings.ToLower(str(e["alias"])); al != "" {
+			if _, dup := a.aliases[al]; dup {
+				return nil, unsupported("two select items called %s", al)
+			}
+			a.aliases[al] = i
+		}
+	}
+	if len(a.items) != len(c.columns) {
+		return nil, unsupported("the select list has %d items for %d columns", len(a.items), len(c.columns))
+	}
+	for _, step := range []func() error{a.groupBy, a.collect, a.choose, a.plan, a.types} {
+		if err := step(); err != nil {
+			return nil, err
+		}
+	}
+	fragment, err := a.fragment()
+	if err != nil {
+		return nil, err
+	}
+	combine, err := a.combine()
+	if err != nil {
+		return nil, err
+	}
+	combine["from_table"], err = a.pl.p.fromRef("SELECT 1 FROM " + quoteIdent(partialsView))
+	if err != nil {
+		return nil, err
+	}
+	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0}}, nil
+}
+
+// wholeGroups reports whether the partitions the candidate's stage reads
+// hold whole groups: the group expressions' values fix the key of one of
+// its inputs read by partition.
+func (c *candidate) wholeGroups(groups []node) bool {
+	if len(c.keyed) == 0 {
+		return false
+	}
+	var fixed []itemColumn
+	for _, g := range groups {
+		fixed = append(fixed, determined(g, c.scope)...)
+	}
+	return len(fixed) > 0 && c.fixesKey(fixed)
 }
 
 // groupBy resolves the GROUP BY clause: positions and aliases name select
@@ -406,17 +480,16 @@ func (a *aggregation) add(call node) error {
 	if call["export_state"] == true {
 		return unsupported("EXPORT_STATE")
 	}
-	if len(list(child(call, "order_bys"), "orders")) > 0 {
-		return unsupported("ORDER BY inside %s()", name)
-	}
 	if a.pl.hasAggregate(args) || hasClass(args, "WINDOW") {
 		return unsupported("nested aggregates")
 	}
 	ac := &aggCall{call: call, name: name, distinct: -1}
-	if call["distinct"] == true {
-		if len(args) != 1 || child(call, "filter") != nil {
-			return unsupported("%s(DISTINCT ...) with several arguments or a FILTER", name)
-		}
+	switch {
+	case len(list(child(call, "order_bys"), "orders")) > 0:
+		ac.whole = unsupported("ORDER BY inside %s()", name)
+	case call["distinct"] == true && (len(args) != 1 || child(call, "filter") != nil):
+		ac.whole = unsupported("%s(DISTINCT ...) with several arguments or a FILTER", name)
+	case call["distinct"] == true:
 		arg, err := a.substituteAliases(clone(args[0]).(node))
 		if err != nil {
 			return err
@@ -428,8 +501,8 @@ func (a *aggregation) add(call node) error {
 			ac.distinct = len(a.distincts)
 			a.distincts, a.distinctKeys = append(a.distincts, arg), append(a.distinctKeys, k)
 		}
-	} else if err := partialArgs(name, len(args)); err != nil {
-		return err
+	default:
+		ac.whole = partialArgs(name, len(args))
 	}
 	a.aggKeys[key] = ac
 	a.aggs = append(a.aggs, ac)
@@ -490,7 +563,26 @@ func (a *aggregation) choose() error {
 	if err != nil {
 		return err
 	}
+	if !a.c.relation && single && collation == "" && a.c.wholeGroups(a.groups) {
+		a.mode = aggComplete
+		return nil
+	}
+	for _, ac := range a.aggs {
+		if ac.whole != nil {
+			return ac.whole
+		}
+	}
 	switch {
+	case a.c.relation:
+		// The coordinator's combine step runs on workers, over whole groups.
+		a.mode = aggGather
+		if len(a.distincts) > 0 && additive && a.inPlace() {
+			a.mode = aggInPlace
+		}
+		if !single {
+			return unsupported("grouping sets in a relation")
+		}
+		return nil
 	case collation != "":
 		a.mode = aggGather
 	case len(a.distincts) == 0:
@@ -520,6 +612,9 @@ func (a *aggregation) choose() error {
 
 // plan works out how each aggregate call is computed in two steps.
 func (a *aggregation) plan() error {
+	if a.mode == aggComplete {
+		return nil
+	}
 	for _, ac := range a.aggs {
 		if ac.distinct >= 0 && (a.mode == aggGather || a.mode == aggByGroup) {
 			ac.kind = combineDistinct
@@ -577,30 +672,49 @@ func (a *aggregation) anchor() int {
 }
 
 // inPlace reports whether the candidate's stage reads partitions that keep
-// each value of every DISTINCT argument in one partition: a partitioned
-// join whose key, on one side, every argument's value fixes.
+// each value of every DISTINCT argument in one partition: inputs read by
+// partition whose key, for one of them, every argument's value fixes.
 func (a *aggregation) inPlace() bool {
-	p := a.c.partition
-	if p == nil {
+	if len(a.c.keyed) == 0 {
 		return false
 	}
 	for _, d := range a.distincts {
-		fixed := determined(d, a.c.scope)
-		ok := false
-		for side, item := range []*fromItem{a.c.split.item, p.other.item} {
-			all := true
-			for _, k := range p.keys {
-				if !slices.Contains(fixed, itemColumn{item, strings.ToLower(k[side])}) {
-					all = false
-				}
-			}
-			ok = ok || all
-		}
-		if !ok {
+		if !a.c.fixesKey(determined(d, a.c.scope)) {
 			return false
 		}
 	}
 	return true
+}
+
+// fixesKey reports whether values of the columns fixed fix every key
+// column of one of the candidate's inputs read by partition, directly or
+// through the equalities its joins and WHERE clause hold.
+func (c *candidate) fixesKey(fixed []itemColumn) bool {
+	if c.keyScope != c.scope {
+		// The partitioned inputs are inside a subquery, out of sight.
+		return false
+	}
+	for _, class := range joinKeys(c.scope) {
+		if slices.ContainsFunc(class, func(ic itemColumn) bool { return slices.Contains(fixed, ic) }) {
+			for _, ic := range class {
+				if !slices.Contains(fixed, ic) {
+					fixed = append(fixed, ic)
+				}
+			}
+		}
+	}
+	for _, k := range c.keyed {
+		all := true
+		for _, key := range k.keys {
+			if !slices.Contains(fixed, itemColumn{k.item, key}) {
+				all = false
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
 }
 
 // itemColumn is a column of a FROM item, by lower-case name.
@@ -656,7 +770,7 @@ func (a *aggregation) manyGroups() bool {
 	}
 	small := map[*fromItem]bool{}
 	for _, u := range a.c.uses {
-		if u.scope == a.c.scope && u != a.c.split && (a.c.partition == nil || u != a.c.partition.other) {
+		if u.scope == a.c.scope && u != a.c.split && !slices.ContainsFunc(a.c.keyed, func(k *keyed) bool { return k.use == u }) {
 			small[u.item] = true
 		}
 	}
@@ -693,13 +807,9 @@ func (a *aggregation) types() error {
 	}
 	probe["select_list"] = items
 	probe["from_table"] = unmarked(child(a.c.sel, "from_table"))
-	text, err := a.pl.p.print(probe)
+	cols, err := a.pl.describe(probe, a.c.ctes)
 	if err != nil {
-		return unsupported("%v", err)
-	}
-	cols, err := a.pl.env.Describe(a.pl.ctx, text)
-	if err != nil {
-		return unsupported("describe aggregates: %v", err)
+		return err
 	}
 	if len(cols) != len(a.aggs) {
 		return unsupported("aggregate types")
@@ -738,6 +848,28 @@ func (a *aggregation) fragment() (node, error) {
 		groups = append(groups, clone(g))
 		set = append(set, jsonInt(i))
 	}
+	if a.mode == aggComplete {
+		// Every aggregate, whole.
+		for k, ac := range a.aggs {
+			q, err := a.substituteAliasesInArgs(ac.call)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, aliased(q, "__f"+strconv.Itoa(k)))
+			ac.final = k
+		}
+		a.final = true
+		f["select_list"] = items
+		f["from_table"] = clone(child(a.c.sel, "from_table"))
+		if w := child(a.c.sel, "where_clause"); w != nil {
+			if f["where_clause"], err = a.substituteAliases(clone(w).(node)); err != nil {
+				return nil, err
+			}
+		}
+		f["group_expressions"] = groups
+		f["group_sets"] = []any{set}
+		return f, nil
+	}
 	if a.mode != aggInPlace {
 		for i, d := range a.distincts {
 			items = append(items, aliased(d, "__dk"+strconv.Itoa(i)))
@@ -775,6 +907,11 @@ type secondStage struct {
 	fragment node
 	// keys are the partial results' columns the exchange is keyed by.
 	keys []string
+	// whole says the stage reads every partition in one task: the groups of
+	// an aggregation without GROUP BY, which has one.
+	whole bool
+	// columns rename the stage's result columns positionally.
+	columns []string
 }
 
 // partialsView is the view a second stage reads its partition of the
@@ -1241,7 +1378,7 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	if distinct == nil && limit == nil {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
-		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.split.table)
+		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())
 	}
 	if limit != nil {
 		if total, ok := limitRows(limit); ok && total > maxTopN {
@@ -1259,6 +1396,7 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 		}
 	}
 	f := clone(sel).(node)
+	f["cte_map"] = node{"map": []any{}}
 	var err error
 	if w := child(f, "where_clause"); w != nil {
 		var plain []node

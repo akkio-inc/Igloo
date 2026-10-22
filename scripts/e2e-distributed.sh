@@ -433,6 +433,16 @@ check_report() {
 check_report "the report" report "SELECT * FROM ($report)"
 check_report "the report as generated, twice over" report_twice "SELECT * FROM ($report_twice)"
 
+echo "multi-stage plans"
+# Common table expressions computed by workers into exchanges in object
+# storage, read by a join partitioned by order; distinct suppliers counted
+# per order where each order's rows meet.
+check_distributed "a join of two common table expressions" relations "WITH s AS (SELECT l_orderkey AS k, sum(l_quantity) AS q,
+    count(DISTINCT l_suppkey) AS sups FROM lineitem GROUP BY 1),
+  u AS (SELECT o_orderkey AS k FROM orders WHERE o_orderpriority = '1-URGENT'
+    UNION ALL SELECT o_orderkey FROM orders WHERE o_orderpriority = '2-HIGH')
+  SELECT count(*), sum(q), sum(sups) FROM s JOIN u ON s.k = u.k"
+
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
 # it compacts a name mapping (for files without field IDs, which these are

@@ -65,10 +65,16 @@ func TestViews(t *testing.T) {
 	h.views["v_other"] = `SELECT person_id, 1 AS extra FROM people`
 	h.addView("v_cte", `WITH x AS (SELECT * FROM people) SELECT * FROM x`)
 	h.addView("v_grouped", `SELECT person_id % 10 AS g, count(*) AS n FROM people GROUP BY 1`)
+	h.addView("v_top", `SELECT person_id, segments FROM people ORDER BY person_id DESC LIMIT 50`)
+	// A view that groups is a relation workers compute.
+	h.t = t
+	if !h.check(`SELECT sum(n), count(*) FROM v_grouped`) {
+		t.Error("a view that groups did not run distributed")
+	}
 	for _, q := range []string{
 		`SELECT count(*) FROM v_other`,
 		`SELECT count(*) FROM v_cte`,
-		`SELECT sum(n) FROM v_grouped`,
+		`SELECT count(*) FROM v_top`,
 		// The coordinator's part reads a view it cannot read as its query,
 		// which could read a table at another snapshot.
 		`SELECT x.c, (SELECT count(*) FROM v_cte) AS s FROM (SELECT count(*) AS c FROM v_people_latest) AS x`,

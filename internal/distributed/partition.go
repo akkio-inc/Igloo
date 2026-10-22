@@ -1,73 +1,252 @@
 package distributed
 
 import (
+	"cmp"
 	"slices"
 	"strings"
 )
 
-// Partitioned joins. When the split table is joined to a second table too
-// large for every worker to read, both are partitioned by a hash of their
-// join key instead, through object storage:
+// Partitioned inputs. When the tables a candidate reads besides the split
+// table are too large for every worker to read, or it reads relations that
+// workers compute (relation.go), its stage reads its large inputs by
+// partition instead, keyed by a column they are joined on:
 //
-//  1. Workers read shares of each table's files, keep the rows the
-//     statement's filters on that table alone let through, and write the
-//     columns the statement uses to <warehouse>/_igloo_shuffle/..., one
-//     directory per partition (COPY ... PARTITION_BY).
-//  2. One task per partition then runs the job's fragment, unchanged, with
-//     the two tables' views defined over that partition's files.
+//  1. A table is read by a stage of its own: workers read shares of its
+//     files, keep the rows the statement's filters on that table alone let
+//     through, and write the columns the statement uses to an exchange
+//     keyed by its join key (stage.go). A relation's stages write its rows
+//     to an exchange keyed by its join key.
+//  2. The candidate's stage then runs one task per partition, with each
+//     input's view defined over that partition's files, and the other
+//     tables read in full as before.
 //
-// Every row of either table that can join a row of the other has the same
-// key, so lands in the same partition: each task sees every pair of rows the
-// join can produce, once, and the partial results combine as for any job.
-// In stages (stage.go), that is a stage per table writing an exchange
-// keyed by its side of the join key, and a stage reading both by partition.
+// Every row of an input that can join a row of another has an equal key,
+// so lands in the same partition: each task sees every combination of rows
+// the joins can produce, once, and the partial results combine as for any
+// job.
 
-// partitionPlan is how a candidate's two largest tables are partitioned.
-type partitionPlan struct {
-	other *tableUse
-	// keys pair the split table's key columns with the other's.
-	keys [][2]string
-	// casts are the types both sides of each key are hashed as, or "".
-	casts []string
-}
-
-// partition says how a job partitions its two largest tables.
-type partition struct {
-	// sides are the split table and the other.
-	sides [2]side
-}
-
-// side is one of a partitioned job's tables.
-type side struct {
-	// view is the name the fragment reads the table as.
-	view  string
-	table *Table
-	// stage selects the rows to partition: the columns the statement uses,
-	// after the statement's filters on this table alone.
-	stage node
-	// keys are its join key columns, hashed as casts say.
+// keyed is an input a candidate's stage reads by partition.
+type keyed struct {
+	// use is a table, or rel a relation.
+	use  *tableUse
+	rel  *relUse
+	item *fromItem
+	// keys are its key columns, lower case, as the candidate names them;
+	// casts are the types they are hashed as, or "".
 	keys, casts []string
+	// view is the name the fragment reads it as.
+	view string
+	// stage, for a table, selects the rows its own stage partitions.
+	stage node
 }
 
-// partition plans a partitioned join of the candidate's split table and
-// other, which must be joined to it directly on equal columns.
-func (pl *planner) partition(c *candidate, other *tableUse) (*partitionPlan, error) {
-	f := c.split
-	if !other.splittable || other.scope == nil || other.scope != f.scope {
-		return nil, unsupported("%s and %s, both too large to read in full, are not joined directly", f.table, other.table)
+func (k *keyed) String() string {
+	if k.use != nil {
+		return k.use.table.String()
+	}
+	return k.item.name
+}
+
+// ref is the input's reference in FROM.
+func (k *keyed) ref() node {
+	if k.use != nil {
+		return k.use.ref
+	}
+	return k.rel.ref
+}
+
+// columnType returns the type of a key column of the input.
+func (k *keyed) columnType(name string) string {
+	if k.use != nil {
+		return columnType(k.use.table, name)
+	}
+	if i := slices.Index(k.item.columns, name); i >= 0 {
+		return k.rel.columns[i].Type
+	}
+	return ""
+}
+
+// chooseKeyed plans a candidate whose stage reads its large inputs by
+// partition: every relation but those of one row, and the largest tables
+// until the rest fit every worker; all of them must be joined, directly
+// and by inner joins or WHERE, on equal columns, which become their keys.
+func (pl *planner) chooseKeyed(c *candidate) error {
+	err := pl.keyInputs(c)
+	if u := c.tooDeep; u != nil && IsUnsupported(err) {
+		// A large table inside a subquery that passes rows through: the
+		// subquery is a relation, written by its own stages.
+		if rerr := pl.asRelation(c, u.scope); rerr != nil {
+			return err
+		}
+		return pl.keyInputs(c)
+	}
+	return err
+}
+
+// asRelation makes a subquery in the candidate's FROM that passes its
+// rows through, whose FROM clause is sc, a relation the candidate reads,
+// rather than a window on the tables it reads.
+func (pl *planner) asRelation(c *candidate, sc *scope) error {
+	if sc.ref == nil || sc.outer != c.scope {
+		return unsupported("a subquery inside a subquery")
+	}
+	q := subqueryNode(sc.ref)
+	cols, err := pl.relationColumns(q, c.ctes, nil)
+	if err != nil {
+		return err
+	}
+	bytes, err := pl.estimate(q, c.ctes)
+	if err != nil {
+		return err
+	}
+	// The tables it reads, in its FROM or WHERE, are read by its stages.
+	c.uses = slices.DeleteFunc(c.uses, func(u *tableUse) bool { return contains(q, u.ref) })
+	sc.item.columns = nil
+	for _, col := range cols {
+		sc.item.columns = append(sc.item.columns, strings.ToLower(col.Name))
+	}
+	renameColumns(sc.item, list(sc.ref, "column_name_alias"))
+	c.rels = append(c.rels, &relUse{ref: sc.ref, q: q, scope: c.ctes, columns: cols, bytes: bytes, splittable: sc.splittable,
+		sc: c.scope, item: sc.item})
+	return nil
+}
+
+// contains reports whether n is a node of tree v.
+func contains(v any, n node) bool {
+	const probe = "__igloo_probe"
+	n[probe] = true
+	defer delete(n, probe)
+	found := false
+	walk(v, func(m node) bool {
+		found = found || m[probe] == true
+		return !found
+	})
+	return found
+}
+
+// keyInputs chooses the inputs the candidate's stage reads by partition
+// and their keys.
+func (pl *planner) keyInputs(c *candidate) error {
+	c.split, c.keyed, c.whole, c.keyScope, c.tooDeep = nil, nil, nil, nil, nil
+	// Every partitioned input must be an item of one FROM clause, whose
+	// joins and WHERE say what they are joined on.
+	inScope := func(sc *scope) bool {
+		if c.keyScope == nil {
+			c.keyScope = sc
+		}
+		return sc != nil && sc == c.keyScope
+	}
+	var largest int64
+	for _, r := range c.rels {
+		largest = max(largest, r.bytes)
+		if r.bytes == 0 {
+			// One row: every task reads it.
+			c.whole = append(c.whole, r)
+			continue
+		}
+		if !r.splittable || !inScope(r.sc) {
+			return unsupported("%s is read where its rows cannot be divided", r.item.name)
+		}
+		c.keyed = append(c.keyed, &keyed{rel: r, item: r.item})
+	}
+	uses := slices.Clone(c.uses)
+	slices.SortStableFunc(uses, func(a, b *tableUse) int { return cmp.Compare(b.table.Bytes, a.table.Bytes) })
+	var rest int64
+	for _, u := range uses {
+		rest += u.table.Bytes
+		largest = max(largest, u.table.Bytes)
+	}
+	for _, u := range uses {
+		if rest <= pl.opts.maxBroadcast && (len(c.keyed) > 0 || u.table.Bytes < pl.opts.minBytes) {
+			break
+		}
+		if !u.splittable || !inScope(u.scope) {
+			if u.splittable && u.scope != nil && u.scope.ref != nil {
+				c.tooDeep = u
+			}
+			return unsupported("%s, too large for every worker to read, is read where its rows cannot be divided", u.table)
+		}
+		if len(list(u.ref, "column_name_alias")) > 0 {
+			return unsupported("%s with renamed columns", u.table)
+		}
+		c.keyed = append(c.keyed, &keyed{use: u, item: u.item})
+		rest -= u.table.Bytes
+	}
+	if !pl.opts.force && !c.relation && largest < pl.opts.minBytes {
+		return unsupported("its inputs are small (%d bytes)", largest)
+	}
+	if len(c.keyed) == 0 {
+		return unsupported("nothing to divide among workers")
 	}
 	for _, u := range c.uses {
-		if u != other && u.table.key() == other.table.key() {
-			return nil, unsupported("%s is read more than once", other.table)
+		if !u.splittable && u.scope == nil && slices.ContainsFunc(c.keyed, func(k *keyed) bool { return k.use != nil && k.use.table.key() == u.table.key() }) {
+			return unsupported("%s is read again in a subquery", u.table)
 		}
 	}
-	for _, u := range []*tableUse{f, other} {
-		if len(list(u.ref, "column_name_alias")) > 0 {
-			return nil, unsupported("%s with renamed columns", u.table)
+
+	var keys [][]itemColumn
+	if len(c.keyed) == 1 {
+		k := c.keyed[0]
+		for _, name := range pl.preferredKeys(c, k) {
+			keys = append(keys, []itemColumn{{k.item, name}})
+		}
+	} else {
+		keys = joinKeys(c.keyScope)
+	}
+	for _, class := range keys {
+		var cols []itemColumn
+		for _, k := range c.keyed {
+			i := slices.IndexFunc(class, func(ic itemColumn) bool { return ic.item == k.item })
+			if i < 0 {
+				cols = nil
+				break
+			}
+			cols = append(cols, class[i])
+		}
+		if cols == nil {
+			continue
+		}
+		cast, err := pl.hashCast(c, cols)
+		if err != nil {
+			return err
+		}
+		for i, k := range c.keyed {
+			k.keys = append(k.keys, cols[i].name)
+			k.casts = append(k.casts, cast)
 		}
 	}
-	p := &partitionPlan{other: other}
-	for _, cond := range f.scope.conds {
+	if len(c.keyed[0].keys) == 0 {
+		names := make([]string, len(c.keyed))
+		for i, k := range c.keyed {
+			names[i] = k.String()
+		}
+		return unsupported("%s, too large to read in full, are not joined on equal columns", strings.Join(names, " and "))
+	}
+	return nil
+}
+
+// joinKeys returns the classes of columns of the candidate's FROM items
+// that its inner joins and WHERE clause make equal (a.x = b.y), in the
+// order they appear.
+func joinKeys(sc *scope) [][]itemColumn {
+	parent := map[itemColumn]itemColumn{}
+	var order []itemColumn
+	var find func(x itemColumn) itemColumn
+	find = func(x itemColumn) itemColumn {
+		p, ok := parent[x]
+		if !ok {
+			parent[x] = x
+			order = append(order, x)
+			return x
+		}
+		if p == x {
+			return x
+		}
+		r := find(p)
+		parent[x] = r
+		return r
+	}
+	for _, cond := range sc.conds {
 		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" {
 			continue
 		}
@@ -75,38 +254,158 @@ func (pl *planner) partition(c *candidate, other *tableUse) (*partitionPlan, err
 		if str(l["class"]) != "COLUMN_REF" || str(r["class"]) != "COLUMN_REF" {
 			continue
 		}
-		li, ri := resolveColumn(l, f.scope), resolveColumn(r, f.scope)
-		ln, rn := lastName(l), lastName(r)
-		switch {
-		case li == f.item && ri == other.item:
-			p.keys = append(p.keys, [2]string{ln, rn})
-		case li == other.item && ri == f.item:
-			p.keys = append(p.keys, [2]string{rn, ln})
+		li, ri := resolveColumn(l, sc), resolveColumn(r, sc)
+		if li == nil || ri == nil {
+			continue
+		}
+		a, b := find(itemColumn{li, strings.ToLower(lastName(l))}), find(itemColumn{ri, strings.ToLower(lastName(r))})
+		if a != b {
+			parent[b] = a
 		}
 	}
-	if len(p.keys) == 0 {
-		return nil, unsupported("%s and %s, both too large to read in full, are not joined on equal columns", f.table, other.table)
-	}
-	for _, k := range p.keys {
-		tf, tg := columnType(f.table, k[0]), columnType(other.table, k[1])
-		cast, ok := hashType(tf, tg)
+	var classes [][]itemColumn
+	index := map[itemColumn]int{}
+	for _, x := range order {
+		root := find(x)
+		i, ok := index[root]
 		if !ok {
-			return nil, unsupported("join key %s (%s) = %s (%s) of different types", k[0], tf, k[1], tg)
+			i = len(classes)
+			index[root] = i
+			classes = append(classes, nil)
 		}
-		if strings.HasPrefix(tf, "VARCHAR") {
-			// Values equal under a collation do not hash alike.
-			collation, err := pl.collation()
-			if err != nil {
-				return nil, err
-			}
-			if collation != "" {
-				return nil, unsupported("a text join key under collation %s", collation)
-			}
-		}
-		p.casts = append(p.casts, cast)
+		classes[i] = append(classes[i], x)
 	}
-	return p, nil
+	var out [][]itemColumn
+	for _, cl := range classes {
+		if len(cl) > 1 {
+			out = append(out, cl)
+		}
+	}
+	return out
 }
+
+// preferredKeys chooses the key columns of a candidate's only partitioned
+// input: those it was written by already, for a relation; the argument of
+// its aggregates over DISTINCT values, which partitions then keep apart; its
+// group columns, which partitions then keep whole; the columns it is asked
+// to be written by; or its first column.
+func (pl *planner) preferredKeys(c *candidate, k *keyed) []string {
+	if k.rel != nil && k.rel.def != nil && k.rel.def.first != nil {
+		var names []string
+		for _, key := range k.rel.def.first.Keys {
+			i := slices.IndexFunc(k.rel.columns, func(col Column) bool { return strings.EqualFold(col.Name, key) })
+			if i < 0 {
+				names = nil
+				break
+			}
+			names = append(names, k.item.columns[i])
+		}
+		if len(names) > 0 {
+			return names
+		}
+	}
+	own := func(e node) string {
+		if str(e["class"]) == "COLUMN_REF" && resolveColumn(e, c.scope) == k.item {
+			return strings.ToLower(lastName(e))
+		}
+		return ""
+	}
+	var distinct []string
+	inParts := true
+	walk([]any{c.sel["select_list"], c.sel["having"]}, func(n node) bool {
+		if !pl.isAggregate(n) {
+			return true
+		}
+		name := strings.ToLower(str(n["function_name"]))
+		args := list(n, "children")
+		switch {
+		case len(list(child(n, "order_bys"), "orders")) > 0:
+			inParts = false
+		case n["distinct"] == true:
+			if !additiveDistinct[name] {
+				inParts = false
+			}
+			if len(args) == 1 {
+				if col := own(args[0].(node)); col != "" && !slices.Contains(distinct, col) {
+					distinct = append(distinct, col)
+				}
+			}
+		case partialArgs(name, len(args)) != nil:
+			inParts = false
+		}
+		return false
+	})
+	// An aggregate that does not compute in parts needs whole groups.
+	if len(distinct) == 1 && inParts {
+		return distinct
+	}
+	var groups []string
+	for _, g := range list(c.sel, "group_expressions") {
+		if name := own(g.(node)); name != "" && !slices.Contains(groups, name) {
+			groups = append(groups, name)
+		}
+	}
+	if len(groups) > 0 && len(list(c.sel, "group_sets")) <= 1 {
+		return groups
+	}
+	for _, want := range c.want {
+		for _, item := range list(c.sel, "select_list") {
+			e := item.(node)
+			name := strings.ToLower(str(e["alias"]))
+			if name == "" && str(e["class"]) == "COLUMN_REF" {
+				name = strings.ToLower(lastName(e))
+			}
+			if name == strings.ToLower(want) {
+				if col := own(e); col != "" {
+					return []string{col}
+				}
+			}
+		}
+	}
+	return k.item.columns[:1]
+}
+
+// hashCast returns the type a class of key columns is hashed as: BIGINT
+// for integers of any width, whose values DuckDB hashes alike; otherwise
+// their own type, which must be the same.
+func (pl *planner) hashCast(c *candidate, cols []itemColumn) (string, error) {
+	var types []string
+	for i, ic := range cols {
+		types = append(types, c.keyed[i].columnType(ic.name))
+	}
+	cast, ok := "", true
+	for _, t := range types {
+		switch {
+		case t == "":
+			ok = false
+		case slices.Contains(intTypes, t):
+			cast = "BIGINT"
+		}
+	}
+	for _, t := range types[1:] {
+		if t != types[0] && !(slices.Contains(intTypes, t) && slices.Contains(intTypes, types[0])) {
+			ok = false
+		}
+	}
+	if !ok {
+		return "", unsupported("join keys of different types (%s)", strings.Join(types, ", "))
+	}
+	if strings.HasPrefix(types[0], "VARCHAR") {
+		// Values equal under a collation do not hash alike.
+		collation, err := pl.collation()
+		if err != nil {
+			return "", err
+		}
+		if collation != "" {
+			return "", unsupported("a text join key under collation %s", collation)
+		}
+	}
+	return cast, nil
+}
+
+// intTypes are the integer types DuckDB hashes by value, alike whatever
+// their width.
+var intTypes = []string{"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 
 // resolveColumn returns the FROM item a column reference names, or nil
 // when that is not certain.
@@ -147,32 +446,14 @@ func columnType(t *Table, name string) string {
 	return ""
 }
 
-// hashType returns the type both sides of a join key are hashed as, ""
-// when they already share one. DuckDB hashes the integer types by value,
-// so they mix; other types must match.
-func hashType(a, b string) (string, bool) {
-	ints := []string{"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
-	switch {
-	case a == "" || b == "":
-		return "", false
-	case a == b:
-		return "", true
-	case slices.Contains(ints, a) && slices.Contains(ints, b):
-		return "BIGINT", true
-	}
-	return "", false
-}
-
-// sides builds the queries that select each partitioned table's rows.
-func (pl *planner) sides(c *candidate) (*partition, error) {
-	p := c.partition
+// sides builds the queries that select the rows of each partitioned table:
+// the columns the statement uses, after its filters on that table alone.
+func (pl *planner) sides(c *candidate) error {
 	refs := referencedNames(c.sel)
-	part := &partition{}
-	for i, u := range []*tableUse{c.split, p.other} {
-		view := str(u.ref[viewMark])
-		var keys []string
-		for _, pair := range p.keys {
-			keys = append(keys, pair[i])
+	for _, k := range c.keyed {
+		u := k.use
+		if u == nil {
+			continue
 		}
 		var cols []string
 		for _, col := range u.table.Columns {
@@ -184,14 +465,14 @@ func (pl *planner) sides(c *candidate) (*partition, error) {
 		if alias == "" {
 			alias = str(u.ref["table_name"])
 		}
-		stage, err := pl.p.parse("SELECT " + strings.Join(cols, ", ") + " FROM " + quoteIdent(view) + " AS " + quoteIdent(alias))
+		stage, err := pl.p.parse("SELECT " + strings.Join(cols, ", ") + " FROM " + quoteIdent(k.view) + " AS " + quoteIdent(alias))
 		if err != nil {
-			return nil, err
+			return err
 		}
 		// The statement's filters on this table alone, so less crosses.
 		var filters []any
-		for _, cond := range c.split.scope.conds {
-			if onlyColumnsOf(cond, u.item, c.split.scope) {
+		for _, cond := range u.scope.conds {
+			if onlyColumnsOf(cond, u.item, u.scope) {
 				filters = append(filters, clone(cond))
 			}
 		}
@@ -202,15 +483,15 @@ func (pl *planner) sides(c *candidate) (*partition, error) {
 		default:
 			and, err := pl.p.template("SELECT 1 WHERE true AND true")
 			if err != nil {
-				return nil, err
+				return err
 			}
 			w := child(and, "where_clause")
 			w["children"] = filters
 			stage["where_clause"] = w
 		}
-		part.sides[i] = side{view: view, table: u.table, stage: stage, keys: keys, casts: p.casts}
+		k.stage = stage
 	}
-	return part, nil
+	return nil
 }
 
 // referencedNames returns every name a column reference in n uses, lower
@@ -218,7 +499,7 @@ func (pl *planner) sides(c *candidate) (*partition, error) {
 func referencedNames(n node) map[string]bool {
 	names := map[string]bool{}
 	all := false
-	walk(n, func(m node) bool {
+	walk(clauses(n), func(m node) bool {
 		switch {
 		case str(m["class"]) == "STAR", str(m["ref_type"]) == "NATURAL":
 			all = true

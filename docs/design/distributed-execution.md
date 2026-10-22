@@ -1,8 +1,8 @@
 # Design: queries larger than one machine
 
 Status: implemented in 1.0: scatter-gather with partial aggregation and
-broadcast joins, partitioned joins of two large tables and partitioned
-aggregation through object storage. Serves principles 1 (price-performance), 2 (no knobs) and 4
+broadcast joins, partitioned joins, partitioned aggregation and
+multi-stage plans through object storage. Serves principles 1 (price-performance), 2 (no knobs) and 4
 (performance through fewer moving parts, distribution as the escape hatch);
 costs some of 4, since distribution is a second moving part.
 
@@ -540,6 +540,12 @@ stage completes the groups (`internal/distributed/aggregate.go`):
   `ORDER BY ... LIMIT n`, its first `n`; the coordinator reads one row per
   group and applies the rest of the statement (windows, `QUALIFY`, the
   final order and limit) as before.
+- **Complete.** A stage whose partitions hold whole groups (the group
+  expressions fix the key of an input it reads by partition) computes
+  every aggregate of its groups itself, any aggregate at all (`median`,
+  `quantile_cont`, `string_agg ... ORDER BY`), and the coordinator reads
+  one row per group. A part that reads one relation and has such
+  aggregates has the relation keyed by its group columns for that.
 - **In place.** A partitioned join already holds every row of a join key's
   value in one partition. Aggregates over `DISTINCT` values of the key
   (or of what fixes it, as above) that add up are computed by the join's
@@ -553,6 +559,75 @@ their groups are usually few, and the exchange would add a write, a read
 and a second round of tasks. Exactness is unchanged: each partial
 aggregate is combined once, sums of integers and decimals stay exact, and
 counts are cast back to `BIGINT`.
+
+## Multi-stage plans
+
+Reports are built in steps: common table expressions that define cohorts,
+explode signals and count people per signal and cohort, read by later
+ones, some more than once. The steps over people and their events are
+large; the last steps, over a few thousand signals, are not. A part whose
+`FROM` reads a common table expression or a subquery that is not a mere
+filter of tables (it groups, is `DISTINCT`, or is a `UNION ALL`) reads it
+as a relation that workers compute (`internal/distributed/relation.go`):
+
+- **Inputs by partition.** A part that reads relations runs as a stage
+  over partitions. Its large inputs (every relation but those of one row,
+  and its tables until the rest fit every worker) must all be joined to
+  each other, by inner joins or `WHERE` of the same `SELECT`, on equal
+  columns; the classes of columns its equalities make equal give the key.
+  Each table is scanned by a stage of its own into an exchange keyed by
+  its column of the key, as for a partitioned join; each relation is
+  written by its own stages to an exchange keyed by its column of the
+  key; the part's stage reads partition `p` of all of them. A part that
+  reads one relation and nothing large is keyed by the argument of its
+  aggregates over `DISTINCT` values, else its group columns, so that
+  counts add up or groups are whole in each partition. A subquery that
+  only filters a large table but must be partitioned is computed as a
+  relation too (its rows keyed by the join key), as a report's browsing
+  events wrapped in `SELECT * REPLACE (...)` are.
+- **Writing a relation.** A `SELECT` is planned like any part (its own
+  inputs split, broadcast or by partition) and its rows go to the
+  exchange instead of the coordinator. Without grouping, its stage runs it
+  as written. With grouping, when its partitions hold whole groups (every
+  group expression fixes the key of an input read by partition), its stage
+  runs it as written too; otherwise its partial results go to an exchange
+  keyed by the groups and a second stage runs the coordinator's combine
+  step on each partition, `HAVING` included. `SELECT DISTINCT` is grouping
+  by its items. A `UNION ALL`'s branches each write to the one exchange,
+  their columns cast to the union's types. Aggregates over all of a
+  relation's rows (`min(day) OVER () AS period_start`, as the reports
+  compute for every source) make it the join of its rows, a relation of
+  their own, to the one row of those aggregates, a relation over that one.
+  `ORDER BY`, `LIMIT`, other window functions and grouping sets need every
+  row, and keep the part that reads such a relation off the workers.
+- **Computed once.** A common table expression's exchange is remembered by
+  its key: every part that reads it by that key reads the same files, and
+  one keyed otherwise reads it partitioned again rather than computed
+  again. The planner visits a `WITH` clause's expressions readers first,
+  so readers decide how a relation is keyed; one the coordinator's own
+  part reads too is sent to it from the exchange by a stage that reads it,
+  and common table expressions nothing reads any more are dropped from the
+  coordinator's statement.
+- **Where the coordinator takes over.** A part is distributed only if it
+  reads something large; a relation's size is estimated as the compressed
+  size of the tables it reads, or nothing for an aggregation without
+  `GROUP BY`. The signal-level tail of a report joins aggregates on
+  expressions (`upper(a.cohort) = upper(b.cohort)`), ranks them and picks
+  the top ones; those parts run on the coordinator over the aggregates'
+  combined rows.
+- **Taking back.** A part that turns out not to qualify halfway (a
+  relation of it with a window function, say) takes back the stages and
+  exchanges it planned, and its readers run as before.
+
+The behaviors and signals reports thus run in about a dozen stages: the
+audience's and everyone's distinct people, written once to an exchange
+keyed by person that both branches of the cohorts' `UNION ALL` fill; the
+media, browsing (exploded by `unnest`) and attribute rows, each scanned
+into an exchange keyed by person; and a stage per signal source and one
+for the cohorts' sizes, which join one partition of each and count
+distinct people per signal and cohort in place. Every step reads and
+writes object storage, a few seconds each: about three levels of stages
+before the coordinator's tail.
 
 ## Evidence
 
@@ -611,6 +686,18 @@ fractions are indicative only.
   the coordinator), cancellation and errors in the data; and, through the
   PostgreSQL protocol (`internal/pgwire`), grants, parameters and
   fallbacks.
+- **Partitioned aggregation and multi-stage plans, in process**: the 22
+  TPC-H queries with every aggregation completing its groups on workers;
+  aggregates over `DISTINCT` values by value, by group and in place, with
+  several arguments, `HAVING`, windows over them, top groups, and sums
+  past 2^53; a report shaped like the behaviors and signals reports
+  (cohorts in a `UNION ALL` of `DISTINCT`s, media, exploded browsing and
+  attribute signals counted per cohort, compared and ranked), checked to
+  compute the cohorts once and count distinct people in place; self-joins,
+  joins of aggregated common table expressions, `UNION ALL` of tables
+  feeding an aggregation, TPC-H Q18 written with a common table
+  expression, and a common table expression read by workers and by the
+  coordinator.
 - **Governance, in process**: statements that policies apply to stay on
   one machine (and returned workers' raw values when the check was taken
   out); users of the `none` role read through grants of their own and of
@@ -717,6 +804,13 @@ reports the cost per query on the EC2 runs.
 - **Planner gaps fall back silently.** Statements the planner does not
   recognize run on one machine; that is safe but may surprise. The debug
   log and `igloo_distributed_*` metrics say why.
+- **Steps cost a round trip each.** A multi-stage plan writes and reads
+  every step's rows through object storage, and a step that only projects
+  a relation (a `UNION ALL` branch that adds a label) is a stage of its
+  own. Running such steps in the stage that reads them, and worker-to-worker
+  transfer, are the next optimizations. Relations' sizes are estimated
+  from the tables they read, so a small aggregate joined to a large table
+  is partitioned with it rather than sent to every worker.
 - **Coordinator bottleneck.** Aggregates over `DISTINCT` values and top
   groups complete on workers ([Partitioned
   aggregation](#partitioned-aggregation)), but a high-cardinality `GROUP BY`
