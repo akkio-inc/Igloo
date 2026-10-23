@@ -41,6 +41,10 @@ type Result struct {
 	// Untranslated says the statement was passed on as written: it reads
 	// PostgreSQL's catalog, as drivers and BI tools do to list tables.
 	Untranslated bool
+	// After are Igloo statements, in DuckDB's dialect, to run once SQL has
+	// succeeded, as part of it: the clustering key of CREATE TABLE ...
+	// CLUSTER BY, ALTER TABLE ... SET SORTED BY (...).
+	After []string
 }
 
 // translator holds the state of one statement's translation.
@@ -48,7 +52,15 @@ type translator struct {
 	src     string
 	opts    Options
 	notices []string
-	quoted  map[string]bool
+	// after is Result.After; temporary says the statement creates a
+	// temporary table, which has no clustering key.
+	after     []string
+	temporary bool
+	// table is the name CREATE TABLE creates, as written, and
+	// tableIfNotExists whether it says IF NOT EXISTS.
+	table            string
+	tableIfNotExists bool
+	quoted           map[string]bool
 	// flatten holds the lower-cased aliases of the statement's FLATTENs,
 	// whose VALUE and THIS columns are semi-structured; anon counts those
 	// without an alias, whose columns are reached unqualified.
@@ -135,7 +147,7 @@ func Translate(sql string, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted}
+	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after}
 	if cmd == "" {
 		res.SQL = strings.TrimRight(render(out), " \t\r\n")
 	}
@@ -572,8 +584,22 @@ func (t *translator) alterTable(nodes []*node, idx []int) ([]*node, string, erro
 	}
 	for k := 3; k < len(words); k++ {
 		switch words[k] {
-		case "CLUSTER", "RECLUSTER", "CLUSTERING":
-			t.notice("%s is ignored: Igloo does not cluster tables", strings.Join(words[3:min(k+2, len(words))], " "))
+		case "CLUSTER":
+			// The clustering key is the table's sort order, which table
+			// maintenance clusters its files by.
+			if k+2 < len(words) && words[k+1] == "BY" {
+				if cols, ok := clusterColumns(nodes[idx[k+2]]); ok && k+3 == len(words) {
+					return []*node{raw(strings.TrimRight(render(nodes[:idx[k]]), " \t\r\n") + " SET SORTED BY (" + cols + ")")}, "", nil
+				}
+			}
+			t.notice("ALTER TABLE ... CLUSTER BY is ignored: Igloo clusters tables by columns, not expressions")
+			return nil, "ALTER TABLE", nil
+		case "DROP":
+			if k+2 < len(words) && words[k+1] == "CLUSTERING" && words[k+2] == "KEY" && k+3 == len(words) {
+				return []*node{raw(strings.TrimRight(render(nodes[:idx[k]]), " \t\r\n") + " RESET SORTED BY")}, "", nil
+			}
+		case "RECLUSTER", "CLUSTERING":
+			t.notice("%s is ignored: table maintenance clusters the tables that have a clustering key", strings.Join(words[3:min(k+2, len(words))], " "))
 			return nil, "ALTER TABLE", nil
 		case "SWAP":
 			return nil, "", unsupported("ALTER TABLE ... SWAP WITH", "rename the tables one at a time with ALTER TABLE ... RENAME TO")
@@ -588,7 +614,7 @@ func (t *translator) alterTable(nodes []*node, idx []int) ([]*node, string, erro
 			}
 		}
 		if k == 3 && (words[k] == "SUSPEND" || words[k] == "RESUME") {
-			t.notice("ALTER TABLE ... %s RECLUSTER is ignored: Igloo does not cluster tables", words[k])
+			t.notice("ALTER TABLE ... %s RECLUSTER is ignored: table maintenance clusters the tables that have a clustering key", words[k])
 			return nil, "ALTER TABLE", nil
 		}
 	}
@@ -618,6 +644,45 @@ func (t *translator) alterTable(nodes []*node, idx []int) ([]*node, string, erro
 		}
 	}
 	return t.expressions(out)
+}
+
+// clusterColumns returns the columns of a CLUSTER BY list, g, as DuckDB
+// writes them, or false when an item is an expression rather than a column.
+func clusterColumns(g *node) (string, bool) {
+	if !g.isGroup('(') {
+		return "", false
+	}
+	var cols []string
+	for _, item := range splitArgs(g.kids) {
+		ii := sig(item)
+		if len(ii) != 1 || item[ii[0]].kind != kWord && item[ii[0]].kind != kQuoted {
+			return "", false
+		}
+		cols = append(cols, item[ii[0]].String())
+	}
+	return strings.Join(cols, ", "), len(cols) > 0
+}
+
+// qualifiedName renders the name that starts at nodes[idx[j]], parts and
+// the dots between them, and returns the index in idx past it; "" and j
+// when no name starts there.
+func qualifiedName(nodes []*node, idx []int, j int) (string, int) {
+	var parts []string
+	k := j
+	for ; k < len(idx); k += 2 {
+		n := nodes[idx[k]]
+		if n.kind != kWord && n.kind != kQuoted {
+			return "", j
+		}
+		parts = append(parts, n.String())
+		if k+1 >= len(idx) || !nodes[idx[k+1]].isOp(".") {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return "", j
+	}
+	return strings.Join(parts, "."), k + 1
 }
 
 func isConstraintWord(w string) bool {
@@ -673,6 +738,7 @@ func (t *translator) createStatement(nodes []*node, idx []int) ([]*node, string,
 			k++
 			continue
 		case "TEMPORARY", "TEMP", "RECURSIVE", "MATERIALIZED":
+			t.temporary = t.temporary || word(k) == "TEMPORARY" || word(k) == "TEMP"
 			k++
 			continue
 		}
@@ -741,10 +807,15 @@ var tableOptions = map[string]bool{
 func (t *translator) createTable(nodes []*node, idx []int, k int, drop map[int]bool) ([]*node, string, error) {
 	// The name: k+1, after IF NOT EXISTS.
 	j := k + 1
+	ifNotExists := false
 	if j+2 < len(idx) && nodes[idx[j]].word() == "IF" {
 		j += 3
+		ifNotExists = true
 	}
-	j++ // past the name
+	var next int
+	t.table, next = qualifiedName(nodes, idx, j)
+	t.tableIfNotExists = ifNotExists
+	j = max(next, j+1) // past the name
 	// Column definitions.
 	if j < len(idx) && nodes[idx[j]].isGroup('(') {
 		g := nodes[idx[j]]
@@ -844,7 +915,21 @@ func (t *translator) tableClauses(nodes []*node, idx []int, j int, drop map[int]
 			}
 			return nil
 		case w == "CLUSTER" && j+2 < len(idx) && nodes[idx[j+1]].word() == "BY":
-			t.notice("CLUSTER BY is ignored: Igloo does not cluster tables")
+			// The clustering key is the table's sort order, set once it is
+			// created (see Result.After).
+			cols, ok := clusterColumns(nodes[idx[j+2]])
+			switch {
+			case !ok:
+				t.notice("CLUSTER BY is ignored: Igloo clusters tables by columns, not expressions")
+			case t.temporary:
+				t.notice("CLUSTER BY is ignored for a temporary table")
+			case t.tableIfNotExists:
+				t.notice("CLUSTER BY is ignored with IF NOT EXISTS; set it with ALTER TABLE ... CLUSTER BY")
+			case t.table == "":
+				t.notice("CLUSTER BY is ignored")
+			default:
+				t.after = append(t.after, "ALTER TABLE "+t.table+" SET SORTED BY ("+cols+")")
+			}
 			drop[idx[j]], drop[idx[j+1]], drop[idx[j+2]] = true, true, true
 			j += 3
 		case w == "COPY" && j+1 < len(idx) && nodes[idx[j+1]].word() == "GRANTS":

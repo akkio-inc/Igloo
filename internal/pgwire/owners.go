@@ -87,6 +87,7 @@ var objectColumns = wire.Columns{
 	{Name: "row_count", Oid: pgtype.Int8OID, Width: 8},
 	{Name: "bytes", Oid: pgtype.Int8OID, Width: 8},
 	{Name: "last_altered", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "cluster_by", Oid: pgtype.TextOID, Width: -1},
 }
 
 // parseShowObjects recognizes SHOW OBJECTS [IN SCHEMA name].
@@ -250,7 +251,8 @@ func (s *Server) mayComment(ctx context.Context, sess *session, user auth.User, 
 }
 
 // showObjects lists the schemas, tables and views user may see, with
-// their owners, comments and sizes; in one schema, if schema is set.
+// their owners, comments, sizes and tables' clustering keys (as Snowflake's
+// SHOW TABLES has them in cluster_by); in one schema, if schema is set.
 func (s *Server) showObjects(ctx context.Context, sess *session, user auth.User, schema []string, w wire.DataWriter) error {
 	catalogName := s.catalogName()
 	if len(schema) == 2 && !strings.EqualFold(schema[0], catalogName) {
@@ -276,7 +278,7 @@ func (s *Server) showObjects(ctx context.Context, sess *session, user auth.User,
 	for _, sc := range md.Schemas {
 		if in(sc.Name) {
 			owner, kind := ownerValues(owners, auth.Object{Schema: sc.Name})
-			rows = append(rows, row{sc.Name, "", "SCHEMA", []any{sc.Name, nil, "SCHEMA", owner, kind, nullText(sc.Comment), nil, nil, nil}})
+			rows = append(rows, row{sc.Name, "", "SCHEMA", []any{sc.Name, nil, "SCHEMA", owner, kind, nullText(sc.Comment), nil, nil, nil, nil}})
 		}
 	}
 	for _, t := range md.Tables {
@@ -285,7 +287,8 @@ func (s *Server) showObjects(ctx context.Context, sess *session, user auth.User,
 			continue
 		}
 		owner, kind := ownerValues(owners, auth.Object{Schema: t.Schema, Table: t.Name})
-		values := []any{t.Schema, t.Name, "TABLE", owner, kind, nullText(t.Comment), nullCount(t.Rows), nullCount(t.Bytes), nullTime(t.LastModified)}
+		values := []any{t.Schema, t.Name, "TABLE", owner, kind, nullText(t.Comment), nullCount(t.Rows), nullCount(t.Bytes), nullTime(t.LastModified),
+			nullText(t.ClusteringKey)}
 		switch {
 		case t.View:
 			values[2], values[6], values[7] = "VIEW", nil, nil

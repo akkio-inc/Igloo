@@ -982,7 +982,33 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if err != nil || tr == nil {
 		return ps, err
 	}
+	if after := tr.After; len(after) > 0 {
+		// Such as the clustering key of CREATE TABLE ... CLUSTER BY, set
+		// once the table is created and before the client hears it is.
+		for _, p := range ps {
+			p.WrapFn(func(fn wire.PreparedStatementFn) wire.PreparedStatementFn {
+				return func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
+					return fn(ctx, afterWriter{DataWriter: w, run: func() error { return pgError(s.runAfter(ctx, sess, after)) }}, params)
+				}
+			})
+		}
+	}
 	return withNotices(ps, tr.Notices), nil
+}
+
+// afterWriter runs what a statement leaves for after it (see
+// snowflake.Result.After) when the statement completes, before the client
+// hears that it did; if that fails, the client gets the error instead.
+type afterWriter struct {
+	wire.DataWriter
+	run func() error
+}
+
+func (a afterWriter) Complete(tag string) error {
+	if err := a.run(); err != nil {
+		return err
+	}
+	return a.DataWriter.Complete(tag)
 }
 
 // withNotices has each of stmts send notices, as warnings, before it runs.
@@ -1131,6 +1157,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 	}
 
 	if ps, ok, err := s.refStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
+	if ps, ok, err := s.sortStatement(sess, q); ok || err != nil {
 		return ps, err
 	}
 

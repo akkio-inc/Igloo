@@ -133,9 +133,13 @@ func TestTranslateNoticesAndCommands(t *testing.T) {
 		{`USE WAREHOUSE wh`, "USE", []string{"USE WAREHOUSE changes nothing"}},
 		{`USE ROLE analyst`, "USE", []string{"USE ROLE changes nothing"}},
 		{`GRANT USAGE ON DATABASE db TO ROLE r`, "GRANT", []string{"GRANT USAGE on a database changes nothing"}},
-		{`ALTER TABLE t CLUSTER BY (a)`, "ALTER TABLE", []string{"ignored"}},
+		{`ALTER TABLE t CLUSTER BY (to_date(ts))`, "ALTER TABLE", []string{"columns, not expressions"}},
+		{`ALTER TABLE t RECLUSTER`, "ALTER TABLE", []string{"table maintenance clusters"}},
+		{`ALTER TABLE t SUSPEND RECLUSTER`, "ALTER TABLE", []string{"table maintenance clusters"}},
 		{`ALTER TABLE t SET DATA_RETENTION_TIME_IN_DAYS = 0`, "ALTER TABLE", []string{"DATA_RETENTION_TIME_IN_DAYS is ignored"}},
-		{`CREATE TABLE t (a INT) CLUSTER BY (a)`, "", []string{"CLUSTER BY is ignored"}},
+		{`CREATE TABLE t (a INT) CLUSTER BY (a + 1)`, "", []string{"CLUSTER BY is ignored: Igloo clusters tables by columns"}},
+		{`CREATE TEMPORARY TABLE t (a INT) CLUSTER BY (a)`, "", []string{"CLUSTER BY is ignored for a temporary table"}},
+		{`CREATE TABLE IF NOT EXISTS t (a INT) CLUSTER BY (a)`, "", []string{"CLUSTER BY is ignored with IF NOT EXISTS"}},
 		{`CREATE TABLE t (a INT COMMENT 'x')`, "", []string{"column comments"}},
 		{`CREATE SECURE VIEW v AS SELECT 1 AS a`, "", []string{"SECURE is ignored"}},
 		{`SELECT HASH(a) FROM t`, "", []string{"HASH computes DuckDB's hash"}},
@@ -239,6 +243,30 @@ func TestTranslatedStringsStayStrings(t *testing.T) {
 		if strings.Contains(out, "DROP TABLE x;") && !strings.Contains(out, "'a''; DROP TABLE x; --'") &&
 			!strings.Contains(out, "'''; DROP TABLE x; --'") {
 			t.Errorf("%s became %s", in, out)
+		}
+	}
+}
+
+// TestTranslateClusterBy checks the translations of a clustering key: the
+// table's sort order, set by ALTER TABLE ... SET SORTED BY, after CREATE
+// TABLE has created the table.
+func TestTranslateClusterBy(t *testing.T) {
+	for _, c := range []struct {
+		in, want string
+		after    []string
+	}{
+		{`ALTER TABLE t CLUSTER BY (a, "Mixed")`, `ALTER TABLE t SET SORTED BY (a, "Mixed")`, nil},
+		{`ALTER TABLE IF EXISTS db.s.t CLUSTER BY (day)`, `ALTER TABLE IF EXISTS db.s.t SET SORTED BY (day)`, nil},
+		{`ALTER TABLE s.t DROP CLUSTERING KEY`, `ALTER TABLE s.t RESET SORTED BY`, nil},
+		{`CREATE TABLE db.s.t (a INT, b STRING) CLUSTER BY (b, a)`, `CREATE TABLE db.s.t (a BIGINT, b VARCHAR)`,
+			[]string{`ALTER TABLE db.s.t SET SORTED BY (b, a)`}},
+		{`CREATE OR REPLACE TABLE "My Table" CLUSTER BY (a) AS SELECT 1 AS a`, `CREATE OR REPLACE TABLE "My Table" AS SELECT 1 AS a`,
+			[]string{`ALTER TABLE "My Table" SET SORTED BY (a)`}},
+		{`CREATE TABLE t (a INT) CLUSTER BY (a + 1)`, `CREATE TABLE t (a BIGINT)`, nil},
+	} {
+		res := translate(t, c.in)
+		if res.SQL != c.want || !slices.Equal(res.After, c.after) || res.Command != "" {
+			t.Errorf("%s\n got: %s %q %q\nwant: %s %q", c.in, res.SQL, res.After, res.Command, c.want, c.after)
 		}
 	}
 }

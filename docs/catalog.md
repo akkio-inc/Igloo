@@ -311,6 +311,7 @@ them. Like lineage, events need the query history on.
 | `row_count`, `bytes`, `file_count` | Of its current snapshot, for tables: the rows a query reads, without deleted rows (`NULL` while it has equality deletes), and its data files and their size |
 | `snapshot_count` | Snapshots time travel can read, for tables |
 | `last_altered` | When its data last changed, or a view was last replaced |
+| `clustering_key` | Its [sort order](sql.md#sort-orders-and-clustering), as Snowflake shows a clustering key: `LINEAR(customer_id, day DESC)`; `NULL` for unsorted tables |
 
 | View | Columns |
 |---|---|
@@ -320,7 +321,8 @@ them. Like lineage, events need the query history on.
 | `igloo.lineage` | `upstream_type` (`TABLE` or `LOCATION`), `upstream_database`, `upstream_schema`, `upstream_name`, `downstream_database`, `downstream_schema`, `downstream_name`, `first_seen`, `last_seen`, `statements`, `last_query_id`, `last_user`, `last_statement_type`, `last_job` |
 
 `information_schema.tables` has, besides its own columns, `table_owner`,
-`comment`, `row_count`, `bytes` and `last_altered`, as in Snowflake, and
+`comment`, `row_count`, `bytes`, `last_altered` and `clustering_key`, as in
+Snowflake, and
 its `TABLE_COMMENT` is filled in for Iceberg tables;
 `information_schema.schemata` has the real `schema_owner` and `comment`.
 Their own columns, rows and table types are DuckDB's, connections'
@@ -329,8 +331,9 @@ SQL clients' `GetTables`, see what they did before.
 
 `SHOW OBJECTS [IN SCHEMA name]` lists the catalog's schemas, tables, views
 and external tables (`kind` `EXTERNAL TABLE`) with `schema_name`, `name`,
-`kind`, `owner`, `owner_type`, `comment`, `row_count`, `bytes` and
-`last_altered`; connections' tables, which are not in the catalog's
+`kind`, `owner`, `owner_type`, `comment`, `row_count`, `bytes`,
+`last_altered` and `cluster_by` (a table's clustering key, as in Snowflake's
+`SHOW TABLES`); connections' tables, which are not in the catalog's
 schemas, show in `igloo.tables` only.
 
 ## Cost

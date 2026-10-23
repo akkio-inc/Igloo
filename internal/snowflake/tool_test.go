@@ -33,6 +33,9 @@ func TestStatements(t *testing.T) {
 		default:
 			b.WriteString(res.SQL + "\n")
 		}
+		for _, a := range res.After {
+			b.WriteString("AFTER: " + a + "\n")
+		}
 		for _, n := range res.Notices {
 			b.WriteString("NOTICE: " + n + "\n")
 		}

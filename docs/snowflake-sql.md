@@ -75,7 +75,7 @@ Errors use SQLSTATE codes:
 
 Statements that Igloo accepts but that change nothing, or translates with a
 caveat, send a notice (SQLSTATE `01000`), which psql and most drivers show:
-`CLUSTER BY` on a table, `USE WAREHOUSE`, `HASH` (whose values are not
+`CLUSTER BY` of expressions, `USE WAREHOUSE`, `HASH` (whose values are not
 Snowflake's) and the like. The web console and Flight SQL do not show
 notices.
 
@@ -282,13 +282,21 @@ A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
 ### Statements
 
 - `CREATE [OR REPLACE] [TRANSIENT | TEMPORARY | VOLATILE] TABLE`, with
-  Snowflake's types; `CLUSTER BY`, `DATA_RETENTION_TIME_IN_DAYS` and similar
-  options are accepted and ignored with a notice, `COPY GRANTS` silently
-  (Igloo keeps a replaced table's grants as Snowflake's `COPY GRANTS`
-  would). `COMMENT = '...'` is ignored with a notice: use `COMMENT ON`.
+  Snowflake's types; `DATA_RETENTION_TIME_IN_DAYS` and similar options are
+  accepted and ignored with a notice, `COPY GRANTS` silently (Igloo keeps a
+  replaced table's grants as Snowflake's `COPY GRANTS` would). `COMMENT =
+  '...'` is ignored with a notice: use `COMMENT ON`.
+- Clustering keys: `CLUSTER BY (a, b)` on `CREATE TABLE` (once the table is
+  created) and `ALTER TABLE ... CLUSTER BY (a, b)` set the table's [sort
+  order](sql.md#sort-orders-and-clustering), and `ALTER TABLE ... DROP
+  CLUSTERING KEY` resets it; table maintenance then clusters the table's
+  files, as Snowflake's automatic clustering does. Keys must be columns:
+  `CLUSTER BY` of expressions (`to_date(ts)`), on a temporary table or with
+  `IF NOT EXISTS` is ignored with a notice. `ALTER TABLE ... RECLUSTER` and
+  `SUSPEND | RESUME RECLUSTER` change nothing and say so.
 - `CREATE [OR REPLACE] [SECURE] VIEW` (`SECURE` ignored with a notice),
-  `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `ALTER TABLE ...
-  CLUSTER BY` (ignored), `DESC[RIBE] TABLE`, `USE DATABASE`, `USE SCHEMA`.
+  `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `DESC[RIBE] TABLE`,
+  `USE DATABASE`, `USE SCHEMA`.
 - `USE WAREHOUSE`, `USE ROLE` and `GRANT USAGE ON DATABASE | SCHEMA |
   WAREHOUSE` change nothing and say so in a notice. `GRANT ... TO ROLE r`
   and `GRANT ROLE r TO USER u` are Igloo's `GRANT`.

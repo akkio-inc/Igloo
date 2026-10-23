@@ -53,6 +53,9 @@ type TableMeta struct {
 	// summary or else its manifests; -1 when they do not say. Rows are the
 	// rows a query reads: deleted rows are not counted (see liveRows).
 	Rows, Bytes, Files int64
+	// ClusteringKey is the table's default sort order as Snowflake shows a
+	// clustering key, or "" (see ClusteringKey).
+	ClusteringKey string
 }
 
 // ColumnMeta is a column of a table or view.
@@ -227,6 +230,7 @@ func (c *Client) TableMetadata(ctx context.Context, schema, name string, isView 
 		return t, err
 	}
 	t.Comment = tbl.Properties()[commentProperty]
+	t.ClusteringKey = ClusteringKey(tbl.Metadata())
 	for _, f := range tbl.Schema().Fields() {
 		t.Columns = append(t.Columns, ColumnMeta{Name: f.Name, Type: duckDBType(f.Type), Comment: f.Doc})
 	}

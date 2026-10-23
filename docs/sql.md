@@ -70,6 +70,7 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
 | `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
 | `ALTER TABLE ... CREATE BRANCH`, `CREATE TAG`, `DROP BRANCH`, `DROP TAG`, `FAST FORWARD` | Yes, outside transactions; see [branches and tags](#branches-and-tags) |
+| `ALTER TABLE ... SET SORTED BY (...)`, `RESET SORTED BY` | Yes, outside transactions; see [sort orders](#sort-orders-and-clustering) |
 | `CREATE TASK`, `CREATE PIPE` | Yes; see [tasks](loading.md#tasks) and [pipes](loading.md#pipes) |
 | `PRIMARY KEY`, `UNIQUE` | Accepted but not enforced |
 | `NOT NULL` | Enforced |
@@ -86,6 +87,37 @@ as are those of a table `CREATE OR REPLACE TABLE` replaces, `... CLONE`
 included, unless [clones](#clones) read them. What a drop leaves,
 erasure requests delete ([privacy](privacy.md#what-is-left-of-dropped-tables)).
 A dropped table cannot be restored.
+
+### Sort orders and clustering
+
+A table's sort order says how its rows should be ordered in its files.
+Table maintenance [clusters](operations.md#clustering) a table that has one:
+it rewrites the files whose ranges of the order's first column overlap,
+sorted, so a filter on that column, such as a customer's id, reads a few
+files instead of all of them. Writes stay as fast as before; their files are
+clustered on the next maintenance pass.
+
+```sql
+ALTER TABLE lake.public.visits SET SORTED BY (customer_id, day DESC);
+ALTER TABLE lake.public.visits RESET SORTED BY;      -- unsorted again
+SELECT table_name, clustering_key FROM igloo.tables;  -- LINEAR(customer_id, day DESC)
+```
+
+- The order is the table's default Iceberg sort order (`add-sort-order` and
+  `set-default-sort-order` through the catalog), so other engines see it.
+  `igloo.tables`, `information_schema.tables` (`clustering_key`) and `SHOW
+  OBJECTS` (`cluster_by`) show it as Snowflake shows a clustering key.
+- Each column takes `ASC` (the default) or `DESC`, and `NULLS FIRST` or
+  `NULLS LAST` (by default first when ascending, last when descending).
+  Columns must be top-level columns of a primitive type: not lists, maps or
+  structs. Setting the order a table already has changes nothing.
+- It needs what `ALTER TABLE` needs: the writer role or `CREATE` on the
+  table's schema. It runs outside transaction blocks, on its own in a
+  query of several statements, and only on tables of the Iceberg catalog
+  (not views or temporary tables).
+- In Snowflake's dialect, `CLUSTER BY (a, b)` on `CREATE TABLE` or `ALTER
+  TABLE`, and `ALTER TABLE ... DROP CLUSTERING KEY`, set and reset it; see
+  [Snowflake SQL](snowflake-sql.md#statements).
 
 ### Column types
 

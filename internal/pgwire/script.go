@@ -77,6 +77,8 @@ func aloneError(text string) error {
 		what = "CLONE"
 	} else if _, ok, _ := parseRefCommand(text); ok {
 		what = "statements on branches and tags"
+	} else if _, ok, _ := parseSortCommand(text); ok {
+		what = "ALTER TABLE ... SORTED BY"
 	} else {
 		return nil
 	}

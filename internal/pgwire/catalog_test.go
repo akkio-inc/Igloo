@@ -128,8 +128,8 @@ func TestCatalogShowsOnlyWhatTheUserMaySee(t *testing.T) {
 		t.Errorf("nora sees the policies of a table she may not see: %q", got)
 	}
 	if got, want := texts(t, nora, "SHOW OBJECTS"), []string{
-		"public|NULL|SCHEMA|igloo|user|Shared tables|NULL|NULL|NULL",
-		"public|orders|TABLE|igloo|user|One row per order|2|1000|2026-10-01 12:00:00 +0000 UTC",
+		"public|NULL|SCHEMA|igloo|user|Shared tables|NULL|NULL|NULL|NULL",
+		"public|orders|TABLE|igloo|user|One row per order|2|1000|2026-10-01 12:00:00 +0000 UTC|NULL",
 	}; !slices.Equal(got, want) {
 		t.Errorf("nora's SHOW OBJECTS: %q, want %q", got, want)
 	}
@@ -283,8 +283,8 @@ func TestExternalTablesInTheCatalog(t *testing.T) {
 	expectRows(t, nora, "SELECT column_name, data_type FROM igloo.columns WHERE table_name = 'viewing'", "id|INTEGER")
 	expectRows(t, nora, "SELECT table_catalog, table_type, table_owner FROM information_schema.tables WHERE table_name = 'viewing'",
 		"memory|VIEW|nora")
-	expectRows(t, nora, "SHOW OBJECTS", "public|NULL|SCHEMA|igloo|user|Shared tables|NULL|NULL|NULL",
-		"public|viewing|EXTERNAL TABLE|nora|user|NULL|NULL|NULL|NULL")
+	expectRows(t, nora, "SHOW OBJECTS", "public|NULL|SCHEMA|igloo|user|Shared tables|NULL|NULL|NULL|NULL",
+		"public|viewing|EXTERNAL TABLE|nora|user|NULL|NULL|NULL|NULL|NULL")
 	sameAsInformationSchema(t, nora)
 
 	// Reading it is reading the table, not its files.

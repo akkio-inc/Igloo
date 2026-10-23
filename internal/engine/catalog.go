@@ -92,9 +92,10 @@ func CatalogViews() []string {
 // catalog functions with their views:
 //
 //   - igloo.schemata: each schema's owner and comment
-//   - igloo.tables: each table's and view's owner, comment, size and when
-//     its data last changed; also external tables, with their provider,
-//     and connections' tables
+//   - igloo.tables: each table's and view's owner, comment, size, when
+//     its data last changed and its clustering key (its default sort
+//     order); also external tables, with their provider, and connections'
+//     tables
 //   - igloo.columns: each column with its DuckDB type and comment
 //   - igloo.lineage: where tables' data came from, from the query history
 //   - igloo.table_usage: how often tables were read and written in the last
@@ -141,7 +142,7 @@ func (e *Engine) registerCatalog(ctx context.Context) error {
 			columns: append(varchars("table_catalog", "table_schema", "table_name", "table_type", "table_owner", "owner_type", "comment",
 				"provider"),
 				col("row_count", t.bigint), col("bytes", t.bigint), col("file_count", t.bigint), col("snapshot_count", t.bigint),
-				col("last_altered", t.timestamp)),
+				col("last_altered", t.timestamp), col("clustering_key", t.varchar)),
 			rows: e.tableRows,
 		},
 		"igloo_columns": {
@@ -199,7 +200,7 @@ func (e *Engine) registerCatalog(ctx context.Context) error {
 			LEFT JOIN system.main.igloo_schemata() o ON o.catalog_name = s.catalog_name AND o.schema_name = s.schema_name`,
 		"CREATE OR REPLACE VIEW "+schema+"."+ident(InformationSchemaView("tables"))+` AS
 			SELECT t.* REPLACE (coalesce(o.comment, t.TABLE_COMMENT) AS TABLE_COMMENT),
-				o.table_owner, o.comment, o.row_count, o.bytes, o.last_altered
+				o.table_owner, o.comment, o.row_count, o.bytes, o.last_altered, o.clustering_key
 			FROM system.information_schema.tables t
 			LEFT JOIN system.main.igloo_tables() o ON o.table_schema = t.table_schema AND o.table_name = t.table_name
 				AND (o.table_catalog = t.table_catalog OR t.table_type = 'VIEW' AND t.table_catalog = `+literal(e.local)+`)`)
@@ -270,7 +271,8 @@ func (e *Engine) tableRows(_ context.Context, src CatalogSource) ([][]any, error
 			typ = "FOREIGN"
 		}
 		row := []any{db, t.Schema, t.Name, typ, owner, kind, nullString(t.Comment), nullString(t.Provider),
-			nullCount(t.Rows), nullCount(t.Bytes), nullCount(t.Files), nullCount(int64(t.Snapshots)), nullTime(t.LastModified)}
+			nullCount(t.Rows), nullCount(t.Bytes), nullCount(t.Files), nullCount(int64(t.Snapshots)), nullTime(t.LastModified),
+			nullString(t.ClusteringKey)}
 		if t.View || t.Catalog != "" || t.Provider != "" {
 			// Only the catalog's own tables have files and snapshots.
 			row[8], row[9], row[10], row[11] = nil, nil, nil, nil
