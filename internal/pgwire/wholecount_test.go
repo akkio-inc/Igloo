@@ -82,6 +82,20 @@ func TestWholeCounts(t *testing.T) {
 		"SELECT count(*) OVER () AS n, id FROM t AS \"FROM\" WHERE \"FROM\".x = 1",
 		"SELECT id, count(*) OVER () AS n FROM t WHERE x = 1 AND s IN ('row 1', 'row 14') ORDER BY id",
 		"SELECT t.id, count(*) OVER () AS n FROM t, u WHERE t.id = u.id;",
+		// Other aggregates over the whole result.
+		"SELECT id, min(x) OVER () AS lo, max(x) OVER () AS hi FROM t WHERE id > 10",
+		"SELECT id, MAX ( s ) over ( ) AS hi, count(t.x) OVER () AS n FROM t",
+		"SELECT a.id, min(a.x) OVER () AS lo, count(*) OVER () AS n FROM t AS a, u WHERE a.id = u.id ORDER BY a.id LIMIT 4",
+		// NULLs count and compare as in the window: none, and none at all.
+		"SELECT id, count(CASE WHEN x > 5 THEN x END) OVER () AS n, min(CASE WHEN x > 50 THEN s END) OVER () AS m FROM t",
+		// A report's period: a join with a common table expression.
+		"WITH a AS (SELECT DISTINCT id FROM t WHERE x < 5), m AS (SELECT u.id, u.v, min(u.x) OVER () AS first_x, " +
+			"max(u.x) OVER () AS last_x FROM u INNER JOIN a ON a.id = u.id) SELECT * FROM m",
+		// A common table expression with a window function that the FROM
+		// does not read does not keep the statement as written.
+		"WITH r AS (SELECT id, row_number() OVER (ORDER BY x, id) AS rn FROM t), " +
+			"b AS (SELECT u.id, min(u.x) OVER () AS lo, max(u.v) OVER () AS hi FROM u JOIN t ON t.id = u.id) " +
+			"SELECT * FROM b JOIN r USING (id) WHERE rn < 30",
 	}
 	kept := []string{
 		"SELECT x, count(*) OVER () FROM t GROUP BY x",
@@ -108,6 +122,22 @@ func TestWholeCounts(t *testing.T) {
 		"SELECT (SELECT max(x) FROM u), count(*) OVER () FROM t",
 		"WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n, count(*) OVER () FROM r",
 		"SELECT 'count(*) over ()' FROM t",
+		// Sums and averages, which may differ in their last digits with the
+		// order rows are added in; aggregates without an alias, whose column
+		// name would change; DISTINCT, FILTER, a partition, a function, a
+		// select item's alias or another query's column in the argument.
+		"SELECT id, sum(x) OVER () AS total FROM t",
+		"SELECT id, avg(x) OVER () AS mean FROM t",
+		"SELECT id, min(x) OVER () FROM t",
+		"SELECT id, min(DISTINCT x) OVER () AS m FROM t",
+		"SELECT id, max(x) FILTER (WHERE x > 3) OVER () AS m FROM t",
+		"SELECT id, min(x) OVER (PARTITION BY s) AS m FROM t",
+		"SELECT id, min(upper(s)) OVER () AS m FROM t",
+		"SELECT x + 1 AS y, max(y) OVER () AS m FROM t",
+		"SELECT (SELECT max(u.x) OVER () AS m FROM t LIMIT 1) AS z FROM u",
+		// A FROM that reads a common table expression with a window
+		// function, which may number ties either way in each copy.
+		"WITH r AS (SELECT id, row_number() OVER (ORDER BY x) AS rn FROM t) SELECT id, min(rn) OVER () AS lo FROM r",
 	}
 	for _, q := range rewritten {
 		got := wholeCounts(q, parse)

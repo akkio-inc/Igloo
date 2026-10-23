@@ -8,22 +8,32 @@ import (
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
-// Whole counts. A table preview such as Acme's
+// Whole counts and other whole aggregates. A table preview such as Acme's
 //
 //	SELECT * FROM (SELECT *, COUNT(*) OVER () AS total FROM t) SAMPLE (50 ROWS)
 //
 // makes DuckDB hold every row of t before it hands on the first: a window
 // function's input is materialized whole, and COUNT(*) OVER () needs all
-// of it. In a SELECT that groups nothing, aggregates nothing and has no
-// other window function, COUNT(*) OVER () is on every row the number of
-// rows that the SELECT's FROM and WHERE produce, so Igloo writes it as
-// that number, (SELECT count(*) FROM ... WHERE ...), which DuckDB counts
-// once, without holding the rows. FROM and WHERE are the client's text,
-// copied, so names resolve as before; Igloo's checks and policies see both
-// copies. Where the copy could produce other rows than the original (a
-// sample, random(), LIMIT or a window function in the FROM, WHERE or a
-// common table expression, a parameter), or the SELECT is anything else,
-// the statement is left as written.
+// of it. Reports do the same with the period their rows cover,
+//
+//	SELECT m.id, m.genres, min(m.day) OVER () AS first_day, max(m.day) OVER () AS last_day FROM media AS m JOIN ...
+//
+// where DuckDB holds every row, wide list columns and all, and spills them
+// when memory is short. In a SELECT that groups nothing, aggregates nothing
+// and has no other window function, an aggregate OVER () is on every row
+// the aggregate of the rows that the SELECT's FROM and WHERE produce, so
+// Igloo writes it as that, (SELECT count(*) FROM ... WHERE ...) or
+// (SELECT min(m.day) FROM ... WHERE ...), which DuckDB computes once,
+// reading only the columns it needs and without holding the rows. The
+// aggregates are COUNT(*) and count, sum, min, max and avg of an expression
+// of columns, constants and operators, with no DISTINCT, FILTER or frame;
+// all but COUNT(*) only in a select item with an alias, which names the
+// column as before. FROM and WHERE are the client's text, copied, so names
+// resolve as before; Igloo's checks and policies see both copies. Where the
+// copy could produce other rows than the original (a sample, random(),
+// LIMIT or a window function in the FROM, WHERE or a common table
+// expression they read, a parameter), or the SELECT is anything else, the
+// statement is left as written.
 
 // emptyOver finds OVER () in SQL code, before parsing.
 var emptyOver = regexp.MustCompile(`(?i)\bover\s*\(\s*\)`)
@@ -32,7 +42,8 @@ var emptyOver = regexp.MustCompile(`(?i)\bover\s*\(\s*\)`)
 // rewritten, one a pass.
 const wholeCountPasses = 8
 
-// rewriteWholeCounts rewrites the whole counts of a SELECT statement.
+// rewriteWholeCounts rewrites the whole counts and other whole aggregates
+// of a SELECT statement.
 func (s *Server) rewriteWholeCounts(ctx context.Context, sess *session, text string) string {
 	if sess == nil || sess.conn == nil {
 		return text
@@ -40,10 +51,10 @@ func (s *Server) rewriteWholeCounts(ctx context.Context, sess *session, text str
 	return wholeCounts(text, func(q string) (any, error) { return parseStatement(ctx, sess.conn, q) })
 }
 
-// wholeCounts rewrites the whole counts of text, a SELECT statement,
-// which parse parses as json_serialize_sql does.
+// wholeCounts rewrites the whole counts and other whole aggregates of
+// text, a SELECT statement, which parse parses as json_serialize_sql does.
 func wholeCounts(text string, parse func(string) (any, error)) string {
-	if !strings.Contains(strings.ToLower(text), "count") || !emptyOver.MatchString(maskCode(text)) {
+	if !emptyOver.MatchString(maskCode(text)) {
 		return text
 	}
 	for range wholeCountPasses {
@@ -68,13 +79,15 @@ func rewriteWholeCount(text string, tree any) (string, bool) {
 	if stmt == nil || hasNode(stmt, func(m map[string]any) bool { return str(m["type"]) == "RECURSIVE_CTE_NODE" }) {
 		return "", false
 	}
-	// Common table expressions, wherever they are, may be read by a FROM.
-	var ctes []any
+	// Common table expressions, wherever they are, by lower-cased name: a
+	// FROM may read them.
+	ctes := map[string][]any{}
 	walkMaps(stmt, func(m map[string]any) {
 		if cm, ok := m["cte_map"].(map[string]any); ok {
 			for _, e := range asList(cm["map"]) {
 				em, _ := e.(map[string]any)
-				ctes = append(ctes, em["value"])
+				name := strings.ToLower(str(em["key"]))
+				ctes[name] = append(ctes[name], em["value"])
 			}
 		}
 	})
@@ -98,14 +111,13 @@ func rewriteWholeCount(text string, tree any) (string, bool) {
 			continue
 		}
 		// Each copy ends a line, in case it ends with a -- comment.
-		count := "(SELECT count(*) FROM " + strings.TrimSpace(text[wc.fromBody:wc.fromEnd]) + "\n"
+		rows := " FROM " + strings.TrimSpace(text[wc.fromBody:wc.fromEnd]) + "\n"
 		if wc.where >= 0 {
-			count += "WHERE " + strings.TrimSpace(text[wc.where:wc.end]) + "\n"
+			rows += "WHERE " + strings.TrimSpace(text[wc.where:wc.end]) + "\n"
 		}
-		count += ")"
 		var edits []edit
 		for _, w := range wc.windows {
-			e := edit{w.start, w.end, count}
+			e := edit{w.start, w.end, "(SELECT " + w.aggregate + rows + ")"}
 			if w.name != "" {
 				e.text += " AS " + quoteIdent(w.name)
 			}
@@ -117,7 +129,8 @@ func rewriteWholeCount(text string, tree any) (string, bool) {
 	return "", false
 }
 
-// wholeCount is a SELECT whose COUNT(*) OVER () Igloo rewrites.
+// wholeCount is a SELECT whose whole counts and other whole aggregates
+// Igloo rewrites.
 type wholeCount struct {
 	windows []countSpan
 	// from is where FROM is; the FROM clause's body is fromBody to
@@ -125,16 +138,18 @@ type wholeCount struct {
 	from, fromBody, fromEnd, where, end int
 }
 
-// countSpan is one COUNT(*) OVER () in a text. name, when the select item
-// has no alias, is the column name DuckDB gives it.
+// countSpan is one aggregate OVER () in a text, start to end; aggregate is
+// the aggregate without OVER (), as the copy computes it. name, when the
+// select item has no alias, is the column name DuckDB gives it.
 type countSpan struct {
 	start, end int
+	aggregate  string
 	name       string
 }
 
-// findWholeCount returns the whole counts of the SELECT node n, or nil
-// when it has none or they must stay as written.
-func findWholeCount(text, masked string, n map[string]any, ctes []any) *wholeCount {
+// findWholeCount returns the whole counts and other whole aggregates of
+// the SELECT node n, or nil when it has none or they must stay as written.
+func findWholeCount(text, masked string, n map[string]any, ctes map[string][]any) *wholeCount {
 	from, _ := n["from_table"].(map[string]any)
 	if from == nil || strings.HasPrefix(str(from["type"]), "EMPTY") ||
 		len(asList(n["group_expressions"])) > 0 || len(asList(n["group_sets"])) > 0 ||
@@ -149,13 +164,46 @@ func findWholeCount(text, masked string, n map[string]any, ctes []any) *wholeCou
 		if alias := str(m["alias"]); alias != "" {
 			aliases[strings.ToLower(alias)] = true
 		}
+	}
+	// A qualified column an aggregate reads must be one of this FROM's.
+	relations := fromNames(from)
+	readsAlias := func(part any) bool {
+		return hasNode(part, func(m map[string]any) bool {
+			if str(m["class"]) != "COLUMN_REF" {
+				return false
+			}
+			names := asList(m["column_names"])
+			switch len(names) {
+			case 1:
+				return aliases[strings.ToLower(str(names[0]))]
+			case 2:
+				return !relations[strings.ToLower(str(names[0]))]
+			}
+			return true
+		})
+	}
+	for _, item := range asList(n["select_list"]) {
+		m, _ := item.(map[string]any)
 		if isWholeCount(m) {
 			span, ok := countAt(masked, location(m["query_location"]))
 			if !ok {
 				return nil
 			}
+			span.aggregate = "count(*)"
 			if str(m["alias"]) == "" {
 				span.name = strings.ToLower(str(m["function_name"])) + "() OVER ()"
+			}
+			wc.windows = append(wc.windows, span)
+			continue
+		}
+		if isWholeAggregate(m) {
+			arg, _ := asList(m["children"])[0].(map[string]any)
+			if readsAlias(arg) {
+				return nil
+			}
+			span, ok := aggregateAt(text, masked, location(m["query_location"]), str(m["function_name"]))
+			if !ok {
+				return nil
 			}
 			wc.windows = append(wc.windows, span)
 			continue
@@ -184,8 +232,9 @@ func findWholeCount(text, masked string, n map[string]any, ctes []any) *wholeCou
 	}
 	where, _ := n["where_clause"].(map[string]any)
 	// The rows FROM and WHERE produce must be the same each time they are
-	// read.
-	for _, part := range append([]any{from, where}, ctes...) {
+	// read, and so the common table expressions they read, directly or
+	// through others.
+	for _, part := range append([]any{from, where}, readCTEs(ctes, from, where)...) {
 		if !repeatable(part) {
 			return nil
 		}
@@ -223,13 +272,98 @@ func findWholeCount(text, masked string, n map[string]any, ctes []any) *wholeCou
 // nothing in the parentheses.
 func isWholeCount(m map[string]any) bool {
 	name := strings.ToLower(str(m["function_name"]))
+	return wholeWindow(m) && (name == "count" || name == "count_star") && len(asList(m["children"])) == 0
+}
+
+// wholeAggregates are the aggregates other than COUNT(*) that Igloo
+// computes once for a whole OVER (): those whose result does not depend on
+// the order of the rows. A sum or average of floating-point numbers may
+// differ in its last digits with the order the rows are added in.
+var wholeAggregates = map[string]bool{"count": true, "min": true, "max": true}
+
+// isWholeAggregate reports whether a select item is count, min or max of an
+// expression of columns, constants and operators OVER (), with nothing in
+// the parentheses, and has an alias that names its column.
+func isWholeAggregate(m map[string]any) bool {
+	args := asList(m["children"])
+	if !wholeWindow(m) || !wholeAggregates[strings.ToLower(str(m["function_name"]))] || len(args) != 1 || str(m["alias"]) == "" {
+		return false
+	}
+	arg, _ := args[0].(map[string]any)
+	return arg != nil && plainItem(arg) && !hasNode(arg, func(m map[string]any) bool { return str(m["class"]) == "STAR" })
+}
+
+// wholeWindow reports whether a window expression is an aggregate over the
+// whole result, OVER (), with no DISTINCT, FILTER, IGNORE NULLS or ORDER
+// BY of its own.
+func wholeWindow(m map[string]any) bool {
 	return str(m["class"]) == "WINDOW" && str(m["type"]) == "WINDOW_AGGREGATE" &&
-		(name == "count" || name == "count_star") && str(m["schema"]) == "" && str(m["catalog"]) == "" &&
-		len(asList(m["children"])) == 0 && len(asList(m["partitions"])) == 0 && len(asList(m["orders"])) == 0 &&
+		str(m["schema"]) == "" && str(m["catalog"]) == "" &&
+		len(asList(m["partitions"])) == 0 && len(asList(m["orders"])) == 0 &&
 		len(asList(m["arg_orders"])) == 0 && m["filter_expr"] == nil && m["distinct"] != true && m["ignore_nulls"] != true &&
 		str(m["start"]) == "UNBOUNDED_PRECEDING" && str(m["end"]) == "CURRENT_ROW_RANGE" &&
 		(m["exclude_clause"] == nil || str(m["exclude_clause"]) == "NO_OTHER") &&
 		m["start_expr"] == nil && m["end_expr"] == nil && m["offset_expr"] == nil && m["default_expr"] == nil
+}
+
+// fromNames returns the names a FROM's relations go by, lower-cased: each
+// table's alias, or its name when it has none.
+func fromNames(from map[string]any) map[string]bool {
+	out := map[string]bool{}
+	var walk func(t map[string]any)
+	walk = func(t map[string]any) {
+		if t == nil {
+			return
+		}
+		switch str(t["type"]) {
+		case "JOIN":
+			l, _ := t["left"].(map[string]any)
+			r, _ := t["right"].(map[string]any)
+			walk(l)
+			walk(r)
+			return
+		case "BASE_TABLE":
+			if a := str(t["alias"]); a != "" {
+				out[strings.ToLower(a)] = true
+			} else {
+				out[strings.ToLower(str(t["table_name"]))] = true
+			}
+			return
+		}
+		if a := str(t["alias"]); a != "" {
+			out[strings.ToLower(a)] = true
+		}
+	}
+	walk(from)
+	return out
+}
+
+// readCTEs returns the queries of the common table expressions that parts
+// of a parse read: the one-part table names they name, and the names those
+// queries name in turn.
+func readCTEs(ctes map[string][]any, parts ...any) []any {
+	var out []any
+	seen := map[string]bool{}
+	queue := parts
+	for len(queue) > 0 {
+		part := queue[0]
+		queue = queue[1:]
+		walkMaps(part, func(m map[string]any) {
+			if str(m["type"]) != "BASE_TABLE" || str(m["schema_name"]) != "" || str(m["catalog_name"]) != "" {
+				return
+			}
+			name := strings.ToLower(str(m["table_name"]))
+			if seen[name] {
+				return
+			}
+			seen[name] = true
+			for _, q := range ctes[name] {
+				out = append(out, q)
+				queue = append(queue, q)
+			}
+		})
+	}
+	return out
 }
 
 // plainItem reports whether an expression is made of columns, constants,
@@ -312,6 +446,60 @@ func countAt(masked string, start int) (countSpan, bool) {
 		return countSpan{}, false
 	}
 	return countSpan{start: start, end: i}, true
+}
+
+// aggregateAt reads name(argument) OVER () at start in a masked text; the
+// span's aggregate is name(argument) as text has it.
+func aggregateAt(text, masked string, start int, name string) (countSpan, bool) {
+	if start < 0 || start >= len(masked) {
+		return countSpan{}, false
+	}
+	i := start
+	j := i
+	for j < len(masked) && sqllex.IdentByte(masked[j]) {
+		j++
+	}
+	if !strings.EqualFold(masked[i:j], name) {
+		return countSpan{}, false
+	}
+	i = skipSpace(masked, j)
+	if i >= len(masked) || masked[i] != '(' {
+		return countSpan{}, false
+	}
+	depth, end := 0, -1
+	for k := i; k < len(masked) && end < 0; k++ {
+		switch masked[k] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = k + 1
+			}
+		}
+	}
+	if end < 0 {
+		return countSpan{}, false
+	}
+	span := countSpan{start: start, aggregate: text[start:end]}
+	i = skipSpace(masked, end)
+	j = i
+	for j < len(masked) && sqllex.IdentByte(masked[j]) {
+		j++
+	}
+	if !strings.EqualFold(masked[i:j], "over") {
+		return countSpan{}, false
+	}
+	i = skipSpace(masked, j)
+	if i >= len(masked) || masked[i] != '(' {
+		return countSpan{}, false
+	}
+	i = skipSpace(masked, i+1)
+	if i >= len(masked) || masked[i] != ')' {
+		return countSpan{}, false
+	}
+	span.end = i + 1
+	return span, true
 }
 
 // keywordAfter returns where the word kw is in masked SQL code at the
