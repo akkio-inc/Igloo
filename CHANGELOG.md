@@ -305,6 +305,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   another.
   Cohort reports (distinct people per cohort, joined to their events and
   counted per signal) run on workers up to the signal-level tail.
+  A join of large inputs inside a subquery that passes its rows through to
+  an aggregation (`SELECT ... FROM (SELECT ... FROM a JOIN b ON ...) AS x
+  GROUP BY ...`) is partitioned where it is, and aggregated where its rows
+  are made.
 - Workers start on demand and stop when idle: on Kubernetes the chart's
   `workers.enabled` adds a worker Deployment that Igloo scales between zero
   and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`
@@ -914,6 +918,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   as fit in `IGLOO_MAINTENANCE_MEMORY` over DuckDB's threads; a large insert
   into such a table holds more memory than before. A size set on a table
   is left alone. See [operations](docs/operations.md#row-groups).
+- A `UNION ALL` of SELECTs over the same rows, as reports write to compare
+  several measures of one audience, scans and joins those rows once: when
+  the union is aggregated, Igloo makes each row of the branches' shared
+  `FROM` and `WHERE` once per branch, in either dialect, instead of DuckDB
+  scanning and joining once per branch. A report of 16 branches over 40
+  million rows took 45 to 99 s and takes 2.3 to 2.6 s on one machine (over
+  100 million, 177 s and 4.7 s); on
+  workers it runs in 3 steps instead of 34, and exchanges the joined rows
+  once instead of the union's 16 copies (docs/sql.md#dialect).
 - When memory runs low, Igloo lowers DuckDB's memory limit, so that DuckDB
   spills more and gives memory back, and raises it again once memory has
   stayed plentiful: under heavy work DuckDB keeps the memory it tracks at

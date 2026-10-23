@@ -149,7 +149,9 @@ In detail, a part runs distributed when:
   together fit comfortably in a worker's memory (an eighth of it, in
   compressed size); or the tables too large for that, and the relations it
   reads, are all joined to each other, by inner `JOIN ... ON` or `WHERE`
-  conditions of the same `SELECT`, on equal columns of the same type
+  conditions of the same `SELECT`, or of a subquery in its `FROM` that
+  passes the join's rows through (`SELECT ... FROM (SELECT ... FROM a JOIN
+  b ON ...) AS x GROUP BY ...`), on equal columns of the same type
   (integer types may mix).
 - It may read views: a view reads as its query, its names resolved as in
   the view, so a view that passes a large table's rows through, filters

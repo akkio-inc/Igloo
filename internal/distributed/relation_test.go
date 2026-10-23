@@ -566,6 +566,48 @@ func TestRelationColumns(t *testing.T) {
 	}
 }
 
+// TestFactoredUnion checks the form pgwire gives a UNION ALL whose branches
+// select from one join (see pgwire's unionfactor.go): one SELECT over the
+// join, made once per branch by a series, in a subquery the aggregate
+// reads. The join is partitioned where it is, inside the subquery, and its
+// rows are aggregated where they are made, not written to an exchange.
+func TestFactoredUnion(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	h.co.maxBroadcast = 1
+	for _, q := range []string{
+		`WITH g AS (SELECT l_orderkey FROM lineitem)
+		SELECT x.f, count(*), count(CASE WHEN x.late THEN x.k END) FROM (
+			SELECT a.l_orderkey AS k, CASE _igloo_branch WHEN 0 THEN a.l_returnflag WHEN 1 THEN a.l_linestatus END AS f,
+				CASE _igloo_branch WHEN 0 THEN a.l_receiptdate > a.l_commitdate WHEN 1 THEN a.l_shipdate > a.l_commitdate END AS late
+			FROM (SELECT * FROM (SELECT * FROM lineitem) AS l) AS a JOIN g ON g.l_orderkey = a.l_orderkey
+			CROSS JOIN range(2) AS _igloo_branches(_igloo_branch)
+		) AS x GROUP BY 1 ORDER BY 1`,
+		// The same without the series: a subquery over a join.
+		`WITH g AS (SELECT l_orderkey FROM lineitem)
+		SELECT x.f, count(*) FROM (
+			SELECT a.l_orderkey AS k, a.l_returnflag AS f
+			FROM (SELECT * FROM (SELECT * FROM lineitem) AS l) AS a JOIN g ON g.l_orderkey = a.l_orderkey
+		) AS x GROUP BY 1 ORDER BY 1`,
+	} {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Fatal("did not run distributed")
+			}
+			p := h.planOf(q)
+			for _, s := range p.Stages {
+				if s.Out != nil && s.split() == nil {
+					t.Errorf("a stage writes rows it read by partition:\n%s", p.describe())
+					break
+				}
+			}
+			if len(p.Stages) != 3 {
+				t.Errorf("%d stages, want 3:\n%s", len(p.Stages), p.describe())
+			}
+		})
+	}
+}
+
 // TestScalarSubqueryRelation checks a relation whose select list has a
 // scalar subquery that stands on its own, as pgwire writes min(x) OVER ()
 // for one machine: the subquery is a relation of one row that every task

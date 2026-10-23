@@ -74,13 +74,22 @@ func (pl *planner) chooseKeyed(c *candidate) error {
 	err := pl.keyInputs(c)
 	if u := c.tooDeep; u != nil && IsUnsupported(err) {
 		// A large table inside a subquery that passes rows through: the
-		// subquery of the candidate's FROM it is in is a relation, written
-		// by its own stages.
+		// subquery it is in is a relation, written by its own stages. That
+		// is the subquery of the FROM clause whose items the stage reads by
+		// partition: the candidate's own, or one inside a subquery that
+		// passes rows through, as one over a join whose rows are made once
+		// per branch of a union pgwire factored is.
+		top := c.scope
+		for sc := u.scope; sc != nil; sc = sc.outer {
+			if sc == c.keyScope && sc != u.scope {
+				top = sc
+			}
+		}
 		sc := u.scope
-		for sc.outer != nil && sc.outer != c.scope {
+		for sc.outer != nil && sc.outer != top {
 			sc = sc.outer
 		}
-		if rerr := pl.asRelation(c, sc); rerr != nil {
+		if rerr := pl.asRelation(c, sc, top); rerr != nil {
 			return err
 		}
 		return pl.chooseKeyed(c)
@@ -88,11 +97,12 @@ func (pl *planner) chooseKeyed(c *candidate) error {
 	return err
 }
 
-// asRelation makes a subquery in the candidate's FROM that passes its
-// rows through, whose FROM clause is sc, a relation the candidate reads,
-// rather than a window on the tables it reads.
-func (pl *planner) asRelation(c *candidate, sc *scope) error {
-	if sc.ref == nil || sc.outer != c.scope {
+// asRelation makes a subquery that passes its rows through, whose FROM
+// clause is sc, a relation the candidate reads, rather than a window on
+// the tables it reads: one of the FROM clause top, the candidate's or one
+// inside a subquery of it.
+func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
+	if sc.ref == nil || sc.outer != top {
 		return unsupported("a subquery inside a subquery")
 	}
 	q := subqueryNode(sc.ref)
@@ -100,8 +110,10 @@ func (pl *planner) asRelation(c *candidate, sc *scope) error {
 	if err != nil {
 		return err
 	}
-	// The tables it reads, in its FROM or WHERE, are read by its stages.
+	// The tables and relations it reads, in its FROM or WHERE, are read by
+	// its stages.
 	c.uses = slices.DeleteFunc(c.uses, func(u *tableUse) bool { return contains(q, u.ref) })
+	c.rels = slices.DeleteFunc(c.rels, func(r *relUse) bool { return contains(q, r.ref) })
 	sc.item.columns = nil
 	for _, col := range cols {
 		sc.item.columns = append(sc.item.columns, strings.ToLower(col.Name))
@@ -127,7 +139,7 @@ func (pl *planner) asRelation(c *candidate, sc *scope) error {
 		return err
 	}
 	c.rels = append(c.rels, &relUse{ref: sc.ref, q: q, scope: c.ctes, columns: cols, bytes: bytes, splittable: sc.splittable,
-		sc: c.scope, item: sc.item})
+		sc: top, item: sc.item})
 	return nil
 }
 

@@ -45,6 +45,26 @@ the statement as it runs; query history shows it as sent. A report that
 selected twice from one subquery of 17 common table expressions took 597 s
 on an 8-core machine and takes 128 s.
 
+A `UNION ALL` whose branches select from the same rows, as reports write to
+compare several measures of one audience (`SELECT v.id, 'email' AS
+channel, ... FROM v JOIN g ON g.id = v.id UNION ALL SELECT v.id, 'video',
+... FROM v JOIN g ON g.id = v.id ...`), has DuckDB scan and join once per
+branch. When such a union is a subquery in the `FROM` of a `SELECT` that
+groups or aggregates its rows, Igloo computes the shared `FROM` and `WHERE`
+once instead, in either dialect, and makes each of their rows once per
+branch (`CROSS JOIN range(n) AS _igloo_branches(_igloo_branch)`), each
+column that differs between branches a `CASE` on the branch. The union stays
+as written unless its branches have the same `FROM` and `WHERE` and select
+only columns, constants and operators (no functions, subqueries,
+`DISTINCT`, `GROUP BY` or `LIMIT`); every column that differs has a name in
+the first branch; the `FROM` and `WHERE` read the same rows each time (no
+sample, `LIMIT`, window function, volatile function or parameter); the
+`SELECT` that reads the union has no window function or aggregate that
+depends on the order of its rows (`list`, `string_agg`, `first`, ...); and
+DuckDB describes the factored rows with the union's column names and types.
+A report of 16 such branches over 40 million rows took 45 to 99 s on one
+machine and takes 2.3 to 2.6 s; over 100 million, 177 s and 4.7 s.
+
 Tables live in the Iceberg catalog, named `lake` in SQL (`IGLOO_CATALOG_NAME`),
 and the default schema is `public`. Unqualified names resolve to
 `lake.public`, so `events` and `lake.public.events` are the same table.
