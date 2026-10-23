@@ -125,6 +125,12 @@ SELECT table_name, clustering_key FROM igloo.tables;  -- LINEAR(customer_id, day
 - In Snowflake's dialect, `CLUSTER BY (a, b)` on `CREATE TABLE` or `ALTER
   TABLE`, and `ALTER TABLE ... DROP CLUSTERING KEY`, set and reset it; see
   [Snowflake SQL](snowflake-sql.md#statements).
+- `SELECT SYSTEM$CLUSTERING_DEPTH('lake.public.visits')`, in either
+  dialect, returns how deep the table's files stack by its key's first
+  column, from its manifests: 1 when no two files overlap (see
+  [clustering](operations.md#clustering)). `SYSTEM$CLUSTERING_DEPTH('t',
+  '(column)')` measures by a column instead, as for a table without a key.
+  It needs `SELECT` on the table and runs on its own.
 
 ### Column types
 

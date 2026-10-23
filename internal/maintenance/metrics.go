@@ -13,6 +13,8 @@ type Metrics struct {
 	clusteredIn    prometheus.Counter
 	clusteredOut   prometheus.Counter
 	fellBack       prometheus.Counter
+	depth          *prometheus.GaugeVec
+	maxDepth       *prometheus.GaugeVec
 }
 
 // NewMetrics registers the maintenance metrics with reg.
@@ -54,8 +56,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_maintenance_clustering_fallbacks_total",
 			Help: "Times a table's clustering needed more memory than maintenance may use, and the table was compacted unsorted instead.",
 		}),
+		depth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "igloo_maintenance_clustering_depth",
+			Help: "Average clustering depth of each table with a sort order, as its last pass found it: how many files hold a value of the order's first column where a file's range stacks deepest, 1 when no files overlap.",
+		}, []string{"table"}),
+		maxDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "igloo_maintenance_clustering_max_depth",
+			Help: "Largest clustering depth of any file of each table with a sort order, as its last pass found it.",
+		}, []string{"table"}),
 	}
-	reg.MustRegister(m.passes, m.lastSuccess, m.filesRewritten, m.filesWritten, m.snapshots, m.orphans, m.clusteredIn, m.clusteredOut, m.fellBack)
+	reg.MustRegister(m.passes, m.lastSuccess, m.filesRewritten, m.filesWritten, m.snapshots, m.orphans, m.clusteredIn, m.clusteredOut, m.fellBack,
+		m.depth, m.maxDepth)
 	return m
 }
 
@@ -88,6 +99,13 @@ func (m *Metrics) clustered(before, after int) {
 func (m *Metrics) clusteringFellBack() {
 	if m != nil {
 		m.fellBack.Inc()
+	}
+}
+
+func (m *Metrics) clusteringDepth(table string, depth float64, top int) {
+	if m != nil {
+		m.depth.WithLabelValues(table).Set(depth)
+		m.maxDepth.WithLabelValues(table).Set(float64(top))
 	}
 }
 

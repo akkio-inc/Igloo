@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/filerewrite"
@@ -213,8 +216,20 @@ func TestClusteringMakesRangesDisjoint(t *testing.T) {
 		t.Error("a clustered table was rewritten again")
 	}
 
-	// New rows, written unsorted, overlap the clustered files; the next pass
-	// clusters them in, and touches only the files they overlap.
+	// New rows, written unsorted, overlap every clustered file: a sixth of
+	// the table, enough to sort at once, they are sorted into a run of their
+	// own, and the clustered files of full size are left as they are (a
+	// small one, the last of the sorted rewrite, is sorted with them).
+	var clustered []string
+	tasks, err := cat.tbl.Scan().PlanFiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range tasks {
+		if task.File.FileSizeBytes() >= (4<<20)*3/4 {
+			clustered = append(clustered, task.File.FilePath())
+		}
+	}
 	tx := cat.tbl.NewTransaction()
 	if err := tx.AddFiles(context.Background(), u.write(t, db, filepath.Join(dir, "data"), u.files, 1), nil, false); err != nil {
 		t.Fatal(err)
@@ -226,10 +241,16 @@ func TestClusteringMakesRangesDisjoint(t *testing.T) {
 	if _, err := m.compactOrCluster(ctx, cat.tbl, quiet); err != nil {
 		t.Fatal(err)
 	}
-	if n := overlaps(t, cat.tbl); n != 0 {
-		t.Errorf("after an insert: %d files overlap", n)
+	now := dataFiles(t, cat.tbl)
+	for _, f := range clustered {
+		if !slices.Contains(now, f) {
+			t.Errorf("after an insert: clustered file %s was rewritten", filepath.Base(f))
+		}
 	}
-	if got := u.digest(t, db, dataFiles(t, cat.tbl)); got != want {
+	if n := unsortedRows(t, db, now); n != 0 {
+		t.Errorf("after an insert: %d rows out of order", n)
+	}
+	if got := u.digest(t, db, now); got != want {
 		t.Errorf("after an insert: rows changed: %s, want %s", got, want)
 	}
 }
@@ -263,6 +284,23 @@ func withTarget(t testing.TB, cat listedCatalog, target int64) *table.Table {
 	t.Helper()
 	tx := cat.tbl.NewTransaction()
 	if err := tx.SetProperties(iceberg.Properties{table.WriteTargetFileSizeBytesKey: fmt.Sprint(target)}); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := tx.Commit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tbl
+}
+
+// withLayout gives the catalog's table a target file size of target bytes
+// and row groups of at most rowGroup rows, so that the writer can cut small
+// files near the target, as it cuts files of a real table.
+func withLayout(t testing.TB, cat listedCatalog, target int64, rowGroup int) *table.Table {
+	t.Helper()
+	tx := cat.tbl.NewTransaction()
+	if err := tx.SetProperties(iceberg.Properties{table.WriteTargetFileSizeBytesKey: fmt.Sprint(target),
+		table.ParquetRowGroupLimitKey: fmt.Sprint(rowGroup)}); err != nil {
 		t.Fatal(err)
 	}
 	tbl, err := tx.Commit(context.Background())
@@ -363,7 +401,7 @@ func TestClusteringBacklogTakesPasses(t *testing.T) {
 	}
 	m := New(nil, dir+"/", Options{SpillDir: t.TempDir()}, quiet)
 	m.maxRewrite = size / 3
-	withTarget(t, cat, size/16)
+	withLayout(t, cat, size/16, 1000)
 	passes := 0
 	for ; passes < 20; passes++ {
 		before := cat.tbl.CurrentSnapshot()
@@ -578,5 +616,159 @@ func TestClusterFieldsFromProperty(t *testing.T) {
 	}
 	if got := catalog.ClusteringKey(meta); got != "LINEAR(site DESC, id)" {
 		t.Errorf("clustering key %q", got)
+	}
+}
+
+// TestClusteringDefersScatteredInserts inserts into a clustered table small
+// files whose keys are spread over the whole table. One is left as it is,
+// though it overlaps every file, rather than having the table rewritten
+// around it; once inserts take freshShare of the table they are sorted
+// together, alone, into runs, without rewriting the clustered files; once
+// runs stack deeper than clusterMaxDepth, passes merge everything, and no
+// files overlap. An insert of one audience is clustered in at once. The
+// depth gauges follow.
+func TestClusteringDefersScatteredInserts(t *testing.T) {
+	db := openDuckDB(t)
+	dir := t.TempDir()
+	u := unsortedTable{files: 8, rows: 6000, keys: 6000}
+	cat := u.table(t, db, dir, byAudience(t))
+	var size int64
+	for _, f := range dataFiles(t, cat.tbl) {
+		st, err := os.Stat(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		size += st.Size()
+	}
+	withLayout(t, cat, size/24, 250)
+	reg := prometheus.NewRegistry()
+	metrics := NewMetrics(reg)
+	m := New(nil, dir+"/", Options{SpillDir: t.TempDir(), Metrics: metrics}, quiet)
+	ctx := context.Background()
+	pass := func() []string {
+		t.Helper()
+		before := dataFiles(t, cat.tbl)
+		if _, err := m.compactOrCluster(ctx, cat.tbl, quiet); err != nil {
+			t.Fatal(err)
+		}
+		var replaced []string
+		now := dataFiles(t, cat.tbl)
+		for _, f := range before {
+			if !slices.Contains(now, f) {
+				replaced = append(replaced, f)
+			}
+		}
+		return replaced
+	}
+	depth := func() float64 {
+		return testutil.ToFloat64(metrics.depth.WithLabelValues(name(cat.tbl.Identifier())))
+	}
+	for range 20 {
+		if len(pass()) == 0 {
+			break
+		}
+	}
+	if n := overlaps(t, cat.tbl); n != 0 {
+		t.Fatalf("%d files overlap once clustered", n)
+	}
+	pass()
+	if d := depth(); d != 1 {
+		t.Errorf("a clustered table's depth is %v", d)
+	}
+	// The clustered files of full size: small ones, such as the last of a
+	// sorted rewrite, are sorted again with fresh files that overlap them.
+	var body []string
+	tasks, err := cat.tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range tasks {
+		if task.File.FileSizeBytes() >= size/24*3/4 {
+			body = append(body, task.File.FilePath())
+		}
+	}
+
+	// Inserts of 600 rows, a 1/80 of the table each, keys from all of it.
+	next := 100
+	insert := func() {
+		t.Helper()
+		small := unsortedTable{rows: 600, keys: 6000}
+		tx := cat.tbl.NewTransaction()
+		if err := tx.AddFiles(ctx, small.write(t, db, filepath.Join(dir, "data"), next, 1), nil, false); err != nil {
+			t.Fatal(err)
+		}
+		next++
+		if _, err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert()
+	if replaced := pass(); len(replaced) != 0 {
+		t.Fatalf("one small insert had %d files rewritten", len(replaced))
+	}
+	if d := depth(); d != 2 {
+		t.Errorf("with one insert over every file, the depth is %v, want 2", d)
+	}
+
+	// More, until they are sorted into runs and the runs are merged.
+	merged, runs := false, 0
+	for round := 0; round < 60 && !merged; round++ {
+		insert()
+		want := u.digest(t, db, dataFiles(t, cat.tbl))
+		replaced := pass()
+		touchedBody := false
+		for _, f := range replaced {
+			touchedBody = touchedBody || slices.Contains(body, f)
+		}
+		switch {
+		case len(replaced) == 0:
+		case !touchedBody:
+			runs++
+		default:
+			// The merge: passes until nothing overlaps.
+			for range 20 {
+				if len(pass()) == 0 {
+					break
+				}
+			}
+			merged = true
+			if runs < clusterMaxDepth-1 {
+				t.Errorf("merged after %d runs", runs)
+			}
+		}
+		if got := u.digest(t, db, dataFiles(t, cat.tbl)); got != want {
+			t.Fatalf("round %d: rows changed: %s, want %s", round, got, want)
+		}
+	}
+	if !merged {
+		t.Fatalf("runs were never merged; %d made", runs)
+	}
+	if n := overlaps(t, cat.tbl); n != 0 {
+		t.Errorf("%d files overlap after the merge", n)
+	}
+	if n := unsortedRows(t, db, dataFiles(t, cat.tbl)); n != 0 {
+		t.Errorf("%d rows out of order", n)
+	}
+	t.Logf("%d runs, then merged", runs)
+
+	// An insert of one audience falls within a file or two, and is
+	// clustered in at once.
+	path := filepath.Join(dir, "data", "one-audience.parquet")
+	if _, err := db.Exec(fmt.Sprintf(`COPY (SELECT 1000000 + i AS id, md5('4321') AS audience, 9 AS ver, 'payload' AS payload
+		FROM range(300) t(i)) TO '%s' (FORMAT parquet)`, path)); err != nil {
+		t.Fatal(err)
+	}
+	tx := cat.tbl.NewTransaction()
+	if err := tx.AddFiles(ctx, []string{path}, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if replaced := pass(); len(replaced) < 2 || len(replaced) > 3 {
+		t.Errorf("an insert of one audience had %d files rewritten, want it and a file or two", len(replaced))
+	}
+	if n := overlaps(t, cat.tbl); n != 0 {
+		t.Errorf("%d files overlap after an insert of one audience", n)
 	}
 }

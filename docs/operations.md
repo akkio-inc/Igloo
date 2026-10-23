@@ -787,6 +787,22 @@ new files overlap none of those it left. A clustered table is not rewritten
 again until writes add files that overlap it. A pass rewrites at most 8 GB
 per table, island by island.
 
+Rewriting an island rewrites every file in it, so a pass does so only when
+that is cheap next to the bytes in it that overlap (at most 4 times as many,
+or two files of the target size): a table written unsorted, or an insert
+that falls within a file or two, as an insert of one audience does. An
+insert whose keys are spread over the whole table overlaps every file, and
+rewriting the table around it would rewrite all of it for a few new rows.
+Such fresh files (files clustering did not write, and small files) wait
+instead. Once they take 5% of the table or 4 GB, whichever is less, or
+number 100, they are sorted together, alone, into a run of their own, which
+overlaps the clustered files but not itself; each run deepens the table by
+one, and a filter on the key reads one file more per run. Once the
+clustered files stack more than 4 deep, passes merge them, island by
+island. Clustering puts the files it writes in a directory of their own
+under the table's data (`data/clustered-<hash of the key>/`), which is how
+it knows them.
+
 Sorting does not need the table in memory. Clustering samples the order's
 columns, splits their values into ranges small enough to sort within the
 [memory budget](#compaction-memory), and reads the rows once, appending each
@@ -805,10 +821,18 @@ tables without a clustering key, so that small files and deletes do not pile up;
 it tries clustering again once the table changes, or six hours later.
 `igloo_maintenance_clustering_fallbacks_total` counts these passes.
 
+A table's clustering depth is the average, over its files, of how many
+files hold a value of the key's first column where the file's range stacks
+deepest: 1 when no two files overlap. `igloo_maintenance_clustering_depth`
+and `igloo_maintenance_clustering_max_depth` give each clustered table's
+average and largest, as its last pass found them, and `SELECT
+SYSTEM$CLUSTERING_DEPTH('table')` works it out when asked (see
+[SQL](sql.md#sort-orders-and-clustering)).
+
 Each table's clustering is logged as it starts (`clustering`, with the
-files, bytes, islands and `overlapping_files`) and ends (`clustered`, with
-`overlapping_files_before` and `overlapping_files_after`);
-`igloo_maintenance_clustered_files_total` and
+files, bytes, groups, `overlapping_files`, `depth` and `max_depth`) and
+ends (`clustered`, with `overlapping_files_before` and
+`overlapping_files_after`); `igloo_maintenance_clustered_files_total` and
 `igloo_maintenance_clustering_output_files_total` count the files replaced
 and written. Partitioned tables, and sort orders with transforms (`bucket`,
 `day`, ...) or nested columns, which other engines can set, are compacted as

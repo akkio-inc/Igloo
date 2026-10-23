@@ -270,6 +270,30 @@ func withProperties(tbl *table.Table, props iceberg.Properties) (*table.Table, e
 	return table.New(tbl.Identifier(), meta, tbl.MetadataLocation(), tbl.FS, nil), nil
 }
 
+// unsorted returns tbl with no default sort order, so that the files written
+// through it record none.
+func unsorted(tbl *table.Table) (*table.Table, error) {
+	if tbl.Metadata().SortOrder().IsUnsorted() {
+		return tbl, nil
+	}
+	b, err := table.MetadataBuilderFromBase(tbl.Metadata(), tbl.MetadataLocation())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := b.GetSortOrderByID(table.UnsortedSortOrderID); err != nil {
+		// A table without the unsorted order cannot say so.
+		return tbl, nil
+	}
+	if err := b.SetDefaultSortOrderID(table.UnsortedSortOrderID); err != nil {
+		return nil, err
+	}
+	meta, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+	return table.New(tbl.Identifier(), meta, tbl.MetadataLocation(), tbl.FS, nil), nil
+}
+
 // Rewrite writes the rows of tasks' files, with their deletes applied and,
 // with transform, as transform returns them, into new files of tbl's
 // target size, and returns them. It reads the files in order, one at a
@@ -297,6 +321,11 @@ func Rewrite(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.F
 		table.ParquetBatchSizeKey:     strconv.FormatInt(lay.BatchRows, 10),
 		table.ParquetRowGroupLimitKey: strconv.FormatInt(lay.RowGroupRows, 10),
 	})
+	if err == nil {
+		// The files are not sorted, whatever the table's order: they say so,
+		// so that clustering knows them for files to sort.
+		view, err = unsorted(view)
+	}
 	if err != nil {
 		return nil, lay, err
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	icecat "github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 )
@@ -26,4 +27,13 @@ func (m *Manager) SetSortOrder(ctx context.Context, schema, name string, cols []
 	}
 	m.reloadTable(ctx, schema, name, false)
 	return nil
+}
+
+// LoadTable loads the catalog's table schema.name.
+func (m *Manager) LoadTable(ctx context.Context, schema, name string) (*table.Table, error) {
+	tbl, err := m.cat.LoadTable(ctx, catalog.Ident(schema, name))
+	if errors.Is(err, icecat.ErrNoSuchTable) {
+		return nil, fmt.Errorf("table %q %w", name, ErrNotFound)
+	}
+	return tbl, err
 }

@@ -297,6 +297,9 @@ A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
   `CLUSTER BY` of expressions (`to_date(ts)`), on a temporary table or with
   `IF NOT EXISTS` is ignored with a notice. `ALTER TABLE ... RECLUSTER` and
   `SUSPEND | RESUME RECLUSTER` change nothing and say so.
+  `SYSTEM$CLUSTERING_DEPTH('t' [, '(columns)'])` returns the table's average
+  clustering depth, by the first column given or its key's; a predicate as a
+  third argument is not supported, nor is `SYSTEM$CLUSTERING_INFORMATION`.
 - `CREATE [OR REPLACE] [SECURE] VIEW` (`SECURE` ignored with a notice),
   `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `DESC[RIBE] TABLE`,
   `USE DATABASE`, `USE SCHEMA`.

@@ -857,7 +857,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Iceberg sort order, which DuckDB cannot write to: `INSERT`, `UPDATE` and
   `MERGE` into a table another engine gave a sort order fail with an error
   that says to `SET SORTED BY` or `RESET SORTED BY`, which moves the order
-  out of the table's Iceberg metadata.
+  out of the table's Iceberg metadata. Inserts whose keys are spread over a
+  clustered table do not have the whole table rewritten around them: they
+  wait until they take 5% of the table (or 4 GB, or 100 files), are sorted
+  into a run of their own, and the runs are merged once they stack more
+  than 4 deep, while an insert that falls within a file or two is clustered
+  in at once. `igloo_maintenance_clustering_depth` and
+  `SYSTEM$CLUSTERING_DEPTH('t')` show how deep a table's files stack.
   Table maintenance then rewrites, sorted, the files whose ranges of the
   order's first column overlap, within its memory budget, sorting range by
   range and spilling to local disk, so a filter on that column reads few

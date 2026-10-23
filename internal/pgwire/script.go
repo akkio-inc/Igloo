@@ -79,6 +79,8 @@ func aloneError(text string) error {
 		what = "statements on branches and tags"
 	} else if _, ok, _ := parseSortCommand(text); ok {
 		what = "ALTER TABLE ... SORTED BY"
+	} else if _, ok, _ := parseDepthCall(text); ok {
+		what = "calls of SYSTEM$CLUSTERING_DEPTH"
 	} else {
 		return nil
 	}

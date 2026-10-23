@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"time"
 
@@ -26,8 +27,9 @@ import (
 // or Snowflake's CLUSTER BY; see catalog.ClusteringOrder) is clustered
 // instead of compacted: its files whose ranges of the key's first column
 // overlap are written again, sorted, so that a filter on that column reads
-// few files and Iceberg's manifests skip the rest. On a table of 1.4 billion rows written unsorted,
-// a filter on one value read 140 files; clustered, it read 3.
+// few files and Iceberg's manifests skip the rest. On a table of 1.4
+// billion rows written unsorted, a filter on one value read 140 files;
+// clustered, it read 3.
 //
 // Which files are rewritten, from the manifests' bounds of the first column:
 //
@@ -42,6 +44,11 @@ import (
 // between them in the order, each into its own sorted files, so the new
 // files overlap none of the files left as they were. A pass rewrites up to
 // maxCompactBytes, island by island; larger backlogs take several passes.
+// An island whose rewrite would cost much more than what overlaps in it,
+// such as the whole table around an insert whose keys are spread over it,
+// waits: its fresh files are sorted into runs of their own once enough
+// have gathered, and the runs merged once they stack too deep (see
+// deferredGroups and depth.go).
 // Each island is sorted within Options.Memory, range by range, spilling to
 // Options.SpillDir (see filerewrite.Sorted), and committed as compaction
 // commits: deletes applied, position and equality deletes that no file needs
@@ -230,6 +237,166 @@ func countTrue(bs []bool) int {
 	return n
 }
 
+// What clustering waits for (see deferredGroups); variables so that tests
+// can set them.
+var (
+	// clusterMaxDepth is the depth of a table's settled files past which
+	// passes merge them island by island.
+	clusterMaxDepth = 4
+	// cheapFactor and cheapTargets: an island is rewritten at once when that
+	// rewrites at most cheapFactor times the bytes in it that overlap, or
+	// cheapTargets files of the target size.
+	cheapFactor  int64 = 4
+	cheapTargets int64 = 2
+	// Fresh files that wait are sorted together once they take freshShare
+	// of the table or freshMaxBytes, whichever is less, or number
+	// freshMaxFiles.
+	freshShare          = 0.05
+	freshMaxBytes int64 = 4 << 30
+	freshMaxFiles       = 100
+)
+
+// sortedBy reports whether clustering wrote f sorted by fields.
+func sortedBy(f iceberg.DataFile, fields []filerewrite.SortField) bool {
+	return filerewrite.WrittenSorted(f.FilePath(), fields)
+}
+
+// islandGroups returns the islands of s's picked files, runs of them with no
+// other file between them in the order, that take accepts (all, if take is
+// nil), in the order, up to limit bytes in all. An island gets two files
+// however large, so that each pass merges something; one file with too few
+// deletes to rewrite for is left out, as it is already as sorted as
+// rewriting it alone would make it.
+func islandGroups(s []fileSpan, pick []bool, limit int64, take func(a, b int) bool) []table.CompactionTaskGroup {
+	var (
+		groups []table.CompactionTaskGroup
+		total  int64
+	)
+	for i, full := 0, false; i < len(s) && !full; {
+		if !pick[i] {
+			i++
+			continue
+		}
+		end := i
+		for end < len(s) && pick[end] {
+			end++
+		}
+		if take != nil && !take(i, end) {
+			i = end
+			continue
+		}
+		var g table.CompactionTaskGroup
+		for ; i < end; i++ {
+			if (len(groups) > 0 && len(g.Tasks) == 0 || len(g.Tasks) >= 2) && total+g.TotalSizeBytes+s[i].task.File.FileSizeBytes() > limit {
+				full = true
+				break
+			}
+			g.Tasks = append(g.Tasks, s[i].task)
+			g.TotalSizeBytes += s[i].task.File.FileSizeBytes()
+		}
+		i = end
+		if len(g.Tasks) == 0 {
+			break
+		}
+		if len(g.Tasks) > 1 || hasDeletes(g.Tasks[0]) {
+			groups = append(groups, g)
+			total += g.TotalSizeBytes
+		}
+	}
+	return groups
+}
+
+// hasDeletes reports whether a file has deletes to apply.
+func hasDeletes(t table.FileScanTask) bool {
+	return len(t.DeleteFiles)+len(t.EqualityDeleteFiles) > 0
+}
+
+// deferredGroups returns the groups a pass rewrites while the table's
+// settled files (sorted, of full size) stack no deeper than clusterMaxDepth.
+// An island of overlapping files is rewritten when that is cheap next to
+// the bytes in it that overlap (its bytes less those of the largest set of
+// its files that overlap none of each other): a table written unsorted,
+// runs about as large as what they overlap, an insert of one audience that
+// falls within a file or two. So are islands picked for deletes or small
+// neighbors. In the other islands, such as one an insert whose keys are
+// spread over the whole table makes of it, the fresh files (not sorted, or
+// small) wait, as rewriting them in would rewrite every file they overlap,
+// and once enough have gathered (see freshShare) they are sorted together,
+// alone, into a run of their own; each such run deepens the table by one,
+// until the runs stack deeper than clusterMaxDepth and are merged.
+func deferredGroups(s []fileSpan, pick, over, sorted, settled []bool, target, limit int64) []table.CompactionTaskGroup {
+	var tableBytes int64
+	for _, f := range s {
+		tableBytes += f.task.File.FileSizeBytes()
+	}
+	var fresh []int
+	var freshBytes int64
+	groups := islandGroups(s, pick, limit, func(a, b int) bool {
+		var bytes int64
+		overlaps := false
+		for i := a; i < b; i++ {
+			bytes += s[i].task.File.FileSizeBytes()
+			overlaps = overlaps || over[i]
+		}
+		if !overlaps || bytes <= max(cheapFactor*(bytes-apartBytes(s[a:b])), cheapTargets*target) {
+			return true
+		}
+		for i := a; i < b; i++ {
+			if !settled[i] && over[i] {
+				fresh = append(fresh, i)
+				freshBytes += s[i].task.File.FileSizeBytes()
+			}
+		}
+		return false
+	})
+	enough := min(int64(freshShare*float64(tableBytes)), freshMaxBytes)
+	if len(fresh) == 0 || freshBytes < enough && len(fresh) < freshMaxFiles {
+		return groups
+	}
+	var total int64
+	for _, g := range groups {
+		total += g.TotalSizeBytes
+	}
+	var g table.CompactionTaskGroup
+	unsorted := false
+	for _, i := range fresh {
+		size := s[i].task.File.FileSizeBytes()
+		if (len(groups) > 0 || len(g.Tasks) >= 2) && total+g.TotalSizeBytes+size > limit {
+			break
+		}
+		g.Tasks = append(g.Tasks, s[i].task)
+		g.TotalSizeBytes += size
+		unsorted = unsorted || !sorted[i]
+	}
+	// One file sorted already is as sorted as rewriting it would make it.
+	if len(g.Tasks) >= 2 || len(g.Tasks) == 1 && (unsorted || hasDeletes(g.Tasks[0])) {
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+// apartBytes returns the bytes of the largest set of files of s (sorted by
+// spans) whose ranges overlap none of each other's (they may touch). Files
+// without bounds are left out.
+func apartBytes(s []fileSpan) int64 {
+	var idx []int
+	for i, f := range s {
+		if f.bounded {
+			idx = append(idx, i)
+		}
+	}
+	cmpLit := func(a, b iceberg.Literal) int { c, _ := compareLiterals(a, b); return c }
+	slices.SortStableFunc(idx, func(a, b int) int { return cmpLit(s[a].hi, s[b].hi) })
+	// best[k] is the most bytes of files apart among the first k by end.
+	best := make([]int64, len(idx)+1)
+	for k, i := range idx {
+		// The files that end at or before this one starts.
+		j := sort.Search(k, func(j int) bool { return cmpLit(s[idx[j]].hi, s[i].lo) > 0 })
+		best[k+1] = max(best[k], best[j]+s[i].task.File.FileSizeBytes())
+	}
+	return best[len(idx)]
+}
+
 // cluster rewrites tbl's files as the comment at the top says, ordered by
 // fields, whose first column has field id first. It returns the table as
 // committed.
@@ -271,49 +438,41 @@ func (m *Maintainer) cluster(ctx context.Context, tbl *table.Table, fields []fil
 		i = max(j, i+1)
 	}
 
-	// Islands of picked files, up to maxCompactBytes.
-	var (
-		groups  []table.CompactionTaskGroup
-		total   int64
-		rewrite = map[string]struct{}{}
-	)
+	// Settled files are sorted by the table's order and of full size; the
+	// others are fresh (see deferredGroups).
+	everyFile, sorted, settled := make([]bool, len(s)), make([]bool, len(s)), make([]bool, len(s))
+	for i, f := range s {
+		everyFile[i] = true
+		sorted[i] = sortedBy(f.task.File, fields)
+		settled[i] = sorted[i] && f.task.File.FileSizeBytes() >= cfg.MinFileSizeBytes
+	}
+	depth, maxDepth := depthOf(s, everyFile)
+	_, settledDepth := depthOf(s, settled)
+	m.opts.Metrics.clusteringDepth(name(tbl.Identifier()), depth, maxDepth)
+
 	limit := m.rewriteLimit()
-	for i, full := 0, false; i < len(s) && !full; {
-		if !pick[i] {
-			i++
-			continue
-		}
-		var g table.CompactionTaskGroup
-		for ; i < len(s) && pick[i]; i++ {
-			// An island gets two files, however large, so that each pass
-			// merges something; past those, the limit holds.
-			if (len(groups) > 0 && len(g.Tasks) == 0 || len(g.Tasks) >= 2) && total+g.TotalSizeBytes+s[i].task.File.FileSizeBytes() > limit {
-				full = true
-				break
-			}
-			g.Tasks = append(g.Tasks, s[i].task)
-			g.TotalSizeBytes += s[i].task.File.FileSizeBytes()
-		}
-		if len(g.Tasks) == 0 {
-			break
-		}
-		// One file with too few deletes to rewrite for is already as
-		// sorted as rewriting it alone would make it.
-		if len(g.Tasks) > 1 || len(g.Tasks[0].DeleteFiles)+len(g.Tasks[0].EqualityDeleteFiles) > 0 {
-			groups = append(groups, g)
-			total += g.TotalSizeBytes
-			for _, t := range g.Tasks {
-				rewrite[t.File.FilePath()] = struct{}{}
-			}
-		}
+	var groups []table.CompactionTaskGroup
+	if settledDepth > clusterMaxDepth {
+		// Sorted runs stack too deep: merge them, island by island.
+		groups = islandGroups(s, pick, limit, nil)
+	} else {
+		groups = deferredGroups(s, pick, over, sorted, settled, cfg.TargetFileSizeBytes, limit)
 	}
 	if len(groups) == 0 {
 		return tbl, nil
 	}
+	var total int64
+	rewrite := map[string]struct{}{}
+	for _, g := range groups {
+		total += g.TotalSizeBytes
+		for _, t := range g.Tasks {
+			rewrite[t.File.FilePath()] = struct{}{}
+		}
+	}
 
 	before := countTrue(over)
-	log.Info("clustering", "files", len(rewrite), "bytes", total, "islands", len(groups), "overlapping_files", before,
-		"sorted_by", fields[0].Name, "memory_limit", m.memory())
+	log.Info("clustering", "files", len(rewrite), "bytes", total, "groups", len(groups), "overlapping_files", before,
+		"depth", fmt.Sprintf("%.2f", depth), "max_depth", maxDepth, "sorted_by", fields[0].Name, "memory_limit", m.memory())
 	start := time.Now()
 	write := m.sortedWriter(fields)
 	if m.sorted != nil {

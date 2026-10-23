@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -45,6 +47,26 @@ import (
 // several ranges in a row, and its rows are dealt out among them in turn:
 // rows with equal values may come in any order, so the ranges still follow
 // each other in the order, and none holds more than its share.
+
+// sortedDir names the directory, under the table's data, of the files
+// Sorted writes sorted by fields: clustered- and a hash of the fields.
+func sortedDir(fields []SortField) string {
+	h := fnv.New32a()
+	for _, f := range fields {
+		fmt.Fprintf(h, "%s\x00%t\x00%t\x00", f.Name, f.Descending, f.NullsFirst)
+	}
+	return fmt.Sprintf("clustered-%08x", h.Sum32())
+}
+
+// WrittenSorted reports whether the data file at path was written by Sorted,
+// sorted by fields. Iceberg records a sort order in data files, but writers
+// (iceberg-go's among them) record the table's default order in files they
+// write unsorted too, and Igloo keeps clustering keys out of the table's
+// order (see catalog.ClusteringKeyProperty), so Sorted marks its files by
+// where it puts them.
+func WrittenSorted(path string, fields []SortField) bool {
+	return len(fields) > 0 && strings.Contains(path, "/"+sortedDir(fields)+"/")
+}
 
 // SortField is a column of a sort order, as a rewrite orders rows by it.
 type SortField struct {
@@ -93,10 +115,17 @@ func Sorted(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.Fi
 	rangeRows := max(int64(MinRowGroupRows), budget/2/(3*max(rowBytes, 1)))
 	// The first column's bounds in the new files are exact, so that files
 	// whose ranges only touch are not taken for overlapping.
+	// The files go to a directory of their own, which tells clustering they
+	// are sorted (see WrittenSorted).
+	data := tbl.Properties()[table.WriteDataPathKey]
+	if data == "" {
+		data = strings.TrimSuffix(tbl.Location(), "/") + "/data"
+	}
 	view, err := withProperties(tbl, iceberg.Properties{
 		table.ParquetBatchSizeKey:                                strconv.FormatInt(lay.BatchRows, 10),
 		table.ParquetRowGroupLimitKey:                            strconv.FormatInt(lay.RowGroupRows, 10),
 		table.MetricsModeColumnConfPrefix + "." + fields[0].Name: "full",
+		table.WriteDataPathKey:                                   strings.TrimSuffix(data, "/") + "/" + sortedDir(fields),
 	})
 	if err != nil {
 		return nil, lay, err

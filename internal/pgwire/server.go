@@ -1201,6 +1201,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		return ps, err
 	}
 
+	if ps, ok, err := s.depthStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
 	if ps, ok, err := s.policyCommand(ctx, sess, q); ok || err != nil {
 		return ps, err
 	}
