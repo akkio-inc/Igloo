@@ -207,7 +207,9 @@ explicit transactions, the coordinator plans it:
    read as the coordinator's read cache can hold, and at its cold rate for
    the rest (16 MB/s per core at four threads a core, about 11 at two,
    about as the threads' 0.6th power), times its working set over 70% of
-   its memory limit when it would run short of memory; and
+   its memory limit, up to twice, when it would run short of memory (the
+   working set is guessed from whole tables' sizes, where reports read a
+   few columns of some and a filtered audience of others); and
    on n workers at 16 MB/s per worker core from object storage, plus 4 s
    for each level of stages (a round of tasks that waits for the one before
    it) and the start time of workers not running; it uses the fewest

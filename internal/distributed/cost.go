@@ -46,6 +46,12 @@ const (
 	memoryShare      = 0.7
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// spillFactor bounds how much longer one machine short of memory is
+	// estimated to take. The working set is guessed from the sizes of the
+	// tables its stages read, whole, where a report reads a few columns of
+	// some and a filtered audience of others: two reports that ran in 15 s
+	// on one machine at 10x were guessed at 7 times its memory.
+	spillFactor = 2
 	// workerThreadsPerCore are the threads a core coldRate is measured at
 	// (see engine's thread defaults).
 	workerThreadsPerCore = 4
@@ -97,7 +103,8 @@ type fleet struct {
 // estimateTimes estimates a plan's times on the coordinator, m, and on
 // workers. The coordinator reads warm what its cache can hold, and the
 // rest cold at its threads a core; short of memory, it takes longer by
-// as much as its working set is over its share of memory, spilling.
+// as much as its working set is over its share of memory, spilling, up to
+// spillFactor times.
 func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 	var e estimate
 	read, exchanged := map[string]int64{}, map[string]int64{}
@@ -125,7 +132,7 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 	e.oneMachine = float64(warm)/(cores*localRate) + float64(e.bytes-warm)/(cores*coldRateAt(threadsPerCore))
 	if set := float64(workingSetFactor * e.exchanged); m.memory > 0 && set > memoryShare*float64(m.memory) {
 		e.memory = true
-		e.oneMachine *= set / (memoryShare * float64(m.memory))
+		e.oneMachine *= min(set/(memoryShare*float64(m.memory)), spillFactor)
 	}
 	// The fewest workers within a fifth of the fastest time.
 	e.onWorkers = math.Inf(1)

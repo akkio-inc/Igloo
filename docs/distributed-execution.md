@@ -211,8 +211,8 @@ worker core from object storage plus about 4 seconds for each round of
 tasks that waits for the one before it, plus the time to start workers that
 are stopped. A replica that would run short of memory (the rows its joins
 and distinct counts hold, estimated at three times what feeds them, over
-70% of its memory limit) is estimated to take that many times longer,
-spilling. It runs the statement on workers only if the replica would take
+70% of its memory limit) is estimated to take as many times longer,
+spilling, up to twice as long. It runs the statement on workers only if the replica would take
 longer than `IGLOO_WORKER_THRESHOLD` (a minute), or would run short of
 memory, and the workers are estimated to be at least 1.5 times faster. It uses the fewest workers
 estimated within a fifth of the fastest time.

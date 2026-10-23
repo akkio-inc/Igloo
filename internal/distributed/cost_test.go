@@ -67,8 +67,8 @@ func TestEstimateTimes(t *testing.T) {
 	if e.levels != 3 || e.bytes != 300e9+1e6 || e.exchanged != 300e9+1e6 || !e.memory {
 		t.Errorf("levels %d, bytes %d, exchanged %d, memory %v", e.levels, e.bytes, e.exchanged, e.memory)
 	}
-	// Short of memory by its working set over its share: spilling.
-	if want := (300e9 + 1e6) / (16 * localRate) * 3 * (300e9 + 1e6) / (0.7 * 50e9); math.Abs(e.oneMachine-want) > 1 {
+	// Short of memory: spilling, up to twice as long.
+	if want := (300e9 + 1e6) / (16 * localRate) * spillFactor; math.Abs(e.oneMachine-want) > 1 {
 		t.Errorf("one machine: %.1f s, want %.1f", e.oneMachine, want)
 	}
 	// 16 workers: 12 + 300e9/(16*8*16e6) + 30 = 188.5 s, starting more
@@ -95,8 +95,9 @@ func TestEstimateTimes(t *testing.T) {
 // TestScaleReports checks auto mode's first choice for the shapes of the
 // scale environment's reports: a coordinator of 16 cores, 32 threads and
 // a 49 GiB memory limit with a 100 GiB read cache, and up to 16 workers
-// of 8 cores. At 1x they run on one machine; at 100x, where one machine
-// read for an hour and ran out of memory, on workers.
+// of 8 cores. At 1x they run on one machine, and so does one that ran in
+// 15 s on one machine at 10x and for 917 s on four workers; at 100x, where
+// one machine read for an hour and ran out of memory, on workers.
 func TestScaleReports(t *testing.T) {
 	coordinator := machine{cores: 16, threads: 32, memory: 49 << 30, cache: 100 << 30}
 	workers := fleet{cores: 8, running: 0, most: 16, start: time.Minute}
@@ -125,6 +126,9 @@ func TestScaleReports(t *testing.T) {
 		{"E3 at 1x", []int64{lookup, households, attributes}, 1, false},
 		{"E2 at 100x", []int64{lookup, attributes, segments}, 100, true},
 		{"E3 at 100x", []int64{lookup, households, attributes}, 100, true},
+		// The s universe's lookup and media detail, which a report that
+		// ran in 15 s on one machine at 10x reads a few columns of.
+		{"F5 at 10x", []int64{7.57e9, 1.28e9, 0.12e9}, 10, false},
 	} {
 		e := estimateTimes(shape(c.scale, c.tables...), coordinator, workers)
 		got, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
