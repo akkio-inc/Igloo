@@ -952,15 +952,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   million rows and take 0.18 s. The objects are built in that select list
   for each row of the item joined to the range of their indexes,
   `CROSS JOIN range(n)`, rather than unnested from a list of them, and a
-  filter in the `WHERE` on their text stays above that select list: DuckDB,
-  which takes an unnest for as many rows as it reads and a filtered one for
-  a fifth of those, then estimates the objects at their number, and a join
-  of them with a smaller table, as reports join their signals to cohorts,
-  builds its hash table on that table. A signals report had built one on
-  90.7 million browsing elements rather than 1.0 million cohort members
-  (94 s of 465 s thread time); in a lab at those proportions every such join
-  now builds on the cohorts, and the signals take 1.29 s of thread time
-  instead of 1.86 s.
+  filter in the `WHERE` on their text, a key's of string literals included,
+  stays above that select list, where DuckDB would otherwise derive from its
+  ORs a condition joining the item to the range, and take that join for a
+  fraction of the objects: DuckDB, which takes an unnest for as many rows as
+  it reads and a filtered one for a fifth of those, then estimates the
+  objects at their number, and a join of them with a smaller table, as
+  reports join their signals to cohorts, builds its hash table on that
+  table. A signals report had built one on 90.7 million browsing elements
+  rather than 1.0 million cohort members (94 s of 465 s thread time); in a
+  lab at those proportions every such join now builds on the cohorts, and
+  the signals take 1.29 s of thread time instead of 1.86 s.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

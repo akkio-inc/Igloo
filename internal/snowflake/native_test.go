@@ -383,7 +383,12 @@ func TestFlattenShapes(t *testing.T) {
 		{`select cast(get_path(g.value, 'n') as text), try_cast(get(g.value, 'n') as float), g.value['n']::string from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`,
 			`select m._sf_t._sf_t1 AS "CAST(GET_PATH(G.VALUE, 'N') AS TEXT)", TRY_CAST(m._sf_t._sf_t1 AS DOUBLE) AS "TRY_CAST(GET(G.VALUE, 'N') AS FLOAT)", m._sf_t._sf_t1 AS`, `_sf_l1`},
 		// Their reads in a WHERE go through sf_text_read, which keeps
-		// DuckDB's filter on them above the select list that unnests them.
+		// DuckDB's filter on them above the select list that unnests them,
+		// a key of string literals' too.
+		{`select cast(g.value:k as text) from tab m, lateral flatten(input => [object_construct('k', 'a', 'n', m.s), object_construct('k', 'b', 'n', 'x')]) g where cast(g.value:k as text) = 'a' or (cast(g.value:k as text) = 'b' and cast(g.value:n as text) <> '')`,
+			`select m._sf_t._sf_k1 AS "CAST(G.VALUE:K AS TEXT)" from (SELECT m.*, CASE _sf_k.i WHEN 0 THEN`, `json_extract`},
+		{`select cast(g.value:k as text) from tab m, lateral flatten(input => [object_construct('k', 'a', 'n', m.s), object_construct('k', 'b', 'n', 'x')]) g where cast(g.value:k as text) = 'a' or (cast(g.value:k as text) = 'b' and cast(g.value:n as text) <> '')`,
+			`AS _sf_k(i)) AS m where sf_text_read(m._sf_t._sf_k1) = 'a' or (sf_text_read(m._sf_t._sf_k1) = 'b' and sf_text_read(m._sf_t._sf_t2) <> '')`, ``},
 		{`select cast(g.value:n as text), cast(v.value as text) from tab m, lateral flatten(input => [object_construct('n', m.s, 'l', m.a)]) g, lateral flatten(input => g.value:l) v where cast(v.value as text) <> '' and cast(g.value:n as text) <> 'x' group by 1, 2`,
 			`select m._sf_t._sf_t1 AS "CAST(G.VALUE:N AS TEXT)", m._sf_e AS "CAST(V.VALUE AS TEXT)" from`,
 			`json_extract`},
@@ -487,7 +492,7 @@ func TestFlattenShapes(t *testing.T) {
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id > 1`,
 			`AS _sf_t FROM tab m) AS m) AS m where m.id > 1`, `LATERAL`},
 		{`select v.value from tab m cross join lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g cross join lateral flatten(input => g.value:l) v where g.value:k = 'a' group by 1`,
-			`AS _sf_t FROM tab m) AS m) AS m where m._sf_t._sf_k1 = 'a' group by 1`, `LATERAL`},
+			`AS _sf_t FROM tab m) AS m) AS m where sf_text_read(m._sf_t._sf_k1) = 'a' group by 1`, `LATERAL`},
 		{`select g.index, v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v where m.id > 1`,
 			`) AS "g" ON ((m.id > 1)), LATERAL (SELECT`, `where`},
 		{`select g.index, v.value from tab m cross join lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g cross join lateral flatten(input => g.value:l) v where g.value:k = 'a' group by 1, 2`,
@@ -697,6 +702,25 @@ func TestFlattenStructsPlan(t *testing.T) {
 	}
 	if builtOn(t, conn, res.SQL)["tb"] {
 		t.Errorf("a join builds its hash table on the objects:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
+	}
+	// And one on a key of string literals in ORs, as reports filter their
+	// attribute signals by group, from which DuckDB would derive a condition
+	// that joins the table to the range of the objects' indexes and is taken
+	// for a third of their rows, fewer than the other table's.
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE td AS SELECT i AS id, 'c' || (i % 3) AS cohort FROM range(1500) r(i)`); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Translate(`select cast(get_path(d.value, 'grp') as text), cast(get_path(d.value, 'name') as text), c.cohort, count(distinct m.id)
+		from tb as m inner join td as c on c.id = m.id
+		cross join lateral flatten(input => [object_construct('grp', 'R', 'name', m.s), object_construct('grp', 'I', 'name', 'x', 'metric', m.id % 3),
+			object_construct('grp', 'O', 'name', 'y')]) as d(seq, key, path, index, value, this)
+		where cast(get_path(d.value, 'grp') as text) = 'R' or (cast(get_path(d.value, 'grp') as text) = 'I' and cast(get_path(d.value, 'metric') as float) > 0)
+		group by 1, 2, 3`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan := explain(t, conn, res.SQL); builtOn(t, conn, res.SQL)["tb"] || strings.Contains(plan, "NL_JOIN") {
+		t.Errorf("a join builds its hash table on the objects, or joins them to their indexes' range by a condition:\n%s\n%s", res.SQL, plan)
 	}
 }
 

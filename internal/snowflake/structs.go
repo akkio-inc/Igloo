@@ -1403,8 +1403,14 @@ func (v *variant) structRead() (string, bool) {
 	rest := &variant{segs: v.segs[1:]}
 	json := v.obj.json(x, i)
 	str := v.obj.text(x, i)
-	if v.guard && v.obj.textOnly(i) {
-		str = "sf_text_read(" + str + ")"
+	if v.guard && i >= 0 && (!v.obj.general[i] || v.obj.textOnly(i)) {
+		// A field of text, a key of string literals' too: else DuckDB
+		// derives from a WHERE's ORs on it a condition that it pushes below
+		// the select list, as a join of the FROM item and the range of the
+		// objects' indexes, which it takes for a fraction of their rows.
+		_, st, _ := v.obj.parts(x, i)
+		str = "sf_text_read(" + st + ")"
+		json = "to_json(" + str + ")"
 	}
 	if len(rest.segs) > 0 {
 		str = "json_extract_string(" + json + ", " + rest.path() + ")"
