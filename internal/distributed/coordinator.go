@@ -528,7 +528,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 		var err error
 		ex.Probes = nil
-		run, plan, err = co.runProbing(ctx, planned, newRun(aqid), newRun, &ex.Probes)
+		run, plan, err = co.runProbing(ctx, planned, newRun(aqid), newRun, func(stages []*Stage) error {
+			return co.loadMore(ctx, stages, snapshots, files)
+		}, &ex.Probes)
 		if err == nil {
 			break
 		}
@@ -634,6 +636,30 @@ func (co *Coordinator) load(ctx context.Context, stages []*Stage) (map[string]*T
 		return nil, nil, err
 	}
 	return tables, files, nil
+}
+
+// loadMore loads, as load does, the tables stages read that tables and
+// files do not hold yet, into them.
+func (co *Coordinator) loadMore(ctx context.Context, stages []*Stage, tables map[string]*Table, files map[string][]File) error {
+	var missing []*Stage
+	for _, s := range stages {
+		if slices.ContainsFunc(s.Inputs, func(in Input) bool { return in.Table != nil && tables[in.Table.key()] == nil }) {
+			missing = append(missing, s)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	more, moreFiles, err := co.load(ctx, missing)
+	if err != nil {
+		return err
+	}
+	for k, t := range more {
+		if tables[k] == nil {
+			tables[k], files[k] = t, moreFiles[k]
+		}
+	}
+	return nil
 }
 
 // pin points the coordinator's own reads, in final, of tables the jobs

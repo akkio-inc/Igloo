@@ -287,6 +287,15 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	tasks := 1
 	var shares [][]File
 	var owners []int
+	for _, in := range s.Inputs {
+		if in.Table == nil {
+			continue
+		}
+		if _, ok := e.files[in.Table.key()]; !ok {
+			// Read as empty, its rows would be missing from the results.
+			return fmt.Errorf("stage %d reads table %s, whose files were not listed", s.ID, in.Table)
+		}
+	}
 	if in := s.split(); in != nil {
 		split := e.files[in.Table.key()]
 		n := len(e.ws)

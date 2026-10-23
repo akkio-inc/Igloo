@@ -147,4 +147,39 @@ func TestMeasuredSize(t *testing.T) {
 	if b, known := pl.measured("other", 1<<40, cols); known || b != 1<<40 {
 		t.Errorf("unmeasured: %d %v", b, known)
 	}
+	// Few bytes for what every worker may read, but 2.5 KB a row of
+	// strings: in a hash table, far more than a task's memory.
+	pl.opts.sizes["long"] = knownSize{bytes: 500 << 20, rows: 200_000}
+	if b, known := pl.measured("long", 1<<40, cols); !known || b <= pl.opts.maxBroadcast {
+		t.Errorf("long strings: %d %v", b, known)
+	}
+}
+
+// TestProbeGuards checks what keeps a probe from reading what is not
+// there: a relation whose exchange no stage writes, fused into its reader,
+// is not measured; a table a new plan reads is listed before its stages
+// run; and a stage never reads a table whose files were not listed as
+// empty.
+func TestProbeGuards(t *testing.T) {
+	x, y := &Exchange{ID: 0}, &Exchange{ID: 1}
+	stages := []*Stage{{ID: 0, Out: x}}
+	if got := written([]uncertain{{name: "a", out: x}, {name: "b", out: y}}, stages); len(got) != 1 || got[0].name != "a" {
+		t.Errorf("written: %v", got)
+	}
+
+	e := &execution{files: map[string][]File{}}
+	s := &Stage{ID: 3, Inputs: []Input{{View: "t", Table: &Table{Schema: "main", Name: "unlisted"}, Split: true}}}
+	if err := e.stage(t.Context(), s); err == nil || !strings.Contains(err.Error(), "not listed") {
+		t.Errorf("a table not listed: %v", err)
+	}
+
+	h := newHarness(t, 0.01, 2, 3)
+	p := h.planOf(`SELECT o_orderpriority, count(*) FROM orders GROUP BY 1`)
+	tables, files := map[string]*Table{}, map[string][]File{}
+	if err := h.co.loadMore(t.Context(), p.Stages, tables, files); err != nil {
+		t.Fatal(err)
+	}
+	if fs, ok := files["main.orders"]; !ok || len(fs) == 0 || tables["main.orders"] == nil {
+		t.Errorf("listed %v", files)
+	}
 }

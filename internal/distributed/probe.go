@@ -79,6 +79,16 @@ func (o *outcomes) large(now time.Time) map[string]outcome {
 	return out
 }
 
+// written returns the relations of u whose exchanges stages write: a stage
+// that writes one may have been fused into the stage that reads it (see
+// fusePartitions), which then computes its rows itself, and there is
+// nothing to measure.
+func written(u []uncertain, stages []*Stage) []uncertain {
+	return slices.DeleteFunc(slices.Clone(u), func(r uncertain) bool {
+		return !slices.ContainsFunc(stages, func(s *Stage) bool { return s.Out == r.out })
+	})
+}
+
 // knownSize is a relation's size as measured: its exchange's bytes and
 // rows.
 type knownSize struct{ bytes, rows int64 }
@@ -115,10 +125,22 @@ func (pl *planner) measured(key string, est int64, cols []Column) (int64, bool) 
 		return est, false
 	}
 	bytes := k.bytes
-	if pl.opts.taskMemory > 0 && k.rows*rowMemory(cols) > pl.opts.taskMemory {
+	if pl.opts.taskMemory > 0 && k.rows*measuredRowMemory(k, cols) > pl.opts.taskMemory {
 		bytes = max(bytes, pl.opts.maxBroadcast+1)
 	}
 	return bytes, true
+}
+
+// measuredRowMemory is the memory a row of a measured relation of columns
+// cols takes in a hash table: as rowMemory guesses from their types, or
+// from four times its compressed bytes a row if that is more, as for long
+// strings, which the types' guess counts at 32 bytes whatever their length.
+func measuredRowMemory(k knownSize, cols []Column) int64 {
+	m := rowMemory(cols)
+	if k.rows > 0 {
+		m = max(m, 2*4*(k.bytes/k.rows)+64)
+	}
+	return m
 }
 
 // uncertainSize reports whether a relation's estimate may be far too
@@ -187,7 +209,8 @@ func uncertainOf(c *candidate) []uncertain {
 // newRun that reads what the first wrote of it. A plan that comes out the
 // same runs on in run, so that measuring costs only the wait for those
 // stages. probes says how each relation came out.
-func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *execution, newRun func(id string) *execution, probes *[]string) (*execution, *Plan, error) {
+func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *execution, newRun func(id string) *execution, load func([]*Stage) error,
+	probes *[]string) (*execution, *Plan, error) {
 	if len(plan.uncertain) == 0 || plan.replan == nil {
 		return run, plan, run.run(ctx, plan.Stages)
 	}
@@ -200,14 +223,26 @@ func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *executio
 		return run, plan, err
 	}
 	sizes := map[string]knownSize{}
-	byKey := map[string]*exchangeRun{}
-	written := map[string]*Exchange{}
 	for _, u := range plan.uncertain {
 		x := run.exchanges[u.out.ID]
+		if x == nil {
+			return run, plan, fmt.Errorf("no stage wrote relation %s, of uncertain size", u.name)
+		}
 		sizes[u.key] = knownSize{bytes: x.bytes, rows: x.rows}
-		byKey[u.key], written[u.key] = x, u.out
+	}
+	// Every relation the first stages wrote, to read again.
+	byKey := map[string]*exchangeRun{}
+	written := map[string]*Exchange{}
+	for _, s := range first {
+		if key := plan.relKeys[s.Out.ID]; key != "" && run.exchanges[s.Out.ID] != nil {
+			byKey[key], written[key] = run.exchanges[s.Out.ID], s.Out
+		}
 	}
 	next, err := plan.replan(sizes)
+	if err == nil {
+		// The tables only the new plan reads, at their current snapshots.
+		err = load(next.Stages)
+	}
 	if err != nil || sameStages(next, plan) {
 		if err != nil {
 			co.log.Warn("could not plan a statement again with the sizes of its relations; it runs as planned", "query", run.qid, "err", err)
@@ -224,6 +259,8 @@ func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *executio
 	// for it where the new plan reads it whole, or partitioned alike.
 	again := newRun(run.qid + "-m")
 	again.parts = run.parts
+	// The workers the first stages ran on count as the statement's too.
+	maps.Copy(again.used, run.used)
 	exchanges := map[int]*Exchange{}
 	readWhole := map[int]bool{}
 	for _, s := range next.Stages {

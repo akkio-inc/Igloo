@@ -328,7 +328,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	for x, k := range pl.relKeys {
 		keys[x.ID] = k
 	}
-	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: pl.uncertain, relKeys: keys}, nil
+	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
