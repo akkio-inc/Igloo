@@ -135,6 +135,11 @@ var macros = []string{
 	// as JSON null.
 	`CREATE OR REPLACE TEMP MACRO sf_elem(e) AS CASE WHEN e IS NULL THEN CAST('null' AS JSON)
 		WHEN (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e) THEN CAST(e AS JSON) ELSE to_json(e) END`,
+	// sf_elem_string reads it as text, as json_extract_string reads what
+	// sf_elem makes of it: an object's or an array's JSON text as DuckDB
+	// writes it, anything else as itself, without making JSON of a string.
+	`CREATE OR REPLACE TEMP MACRO sf_elem_string(e) AS
+		CASE WHEN (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e) THEN json_extract_string(e, '$') ELSE e END`,
 	// A list or a map of strings as JSON, read by sf_elem; when no element
 	// is an object's or an array's text, to_json alone, three times faster.
 	`CREATE OR REPLACE TEMP MACRO sf_strings_json(x) AS
@@ -211,6 +216,11 @@ var macros = []string{
 	`CREATE OR REPLACE TEMP MACRO sf_parts_json(l, j) AS CASE WHEN l IS NULL THEN j ELSE sf_strings_json(l) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_parts_values(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_values(j, m)
 		WHEN m <> 'OBJECT' THEN list_transform(l, lambda e: sf_elem(e)) END`,
+	// sf_parts_strings is sf_parts_values as text, as json_extract_string
+	// reads each value, for a FLATTEN whose values are read only as text.
+	`CREATE OR REPLACE TEMP MACRO sf_parts_strings(l, j, m) AS CASE
+		WHEN l IS NULL THEN list_transform(sf_flatten_values(j, m), lambda x: json_extract_string(x, '$'))
+		WHEN m <> 'OBJECT' THEN list_transform(l, lambda e: sf_elem_string(e)) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_parts_keys(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_keys(j, m) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_parts_indexes(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_indexes(j, m)
 		WHEN m <> 'OBJECT' THEN range(CAST(len(l) AS BIGINT)) END`,

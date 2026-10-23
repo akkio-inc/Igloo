@@ -886,7 +886,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   it a dependent join, and one over structs of lists cost more than over
   JSON text, so reports' behaviors and signals ran slower on real data
   than as JSON. With such a filter, objects of three lists took 1.8 s for
-  2 million rows and take 0.4 s; objects of strings 0.8 s and 0.4 s.
+  2 million rows and take 0.4 s; objects of strings 0.8 s and 0.4 s. A
+  second `FLATTEN` whose elements every read casts to a type that is not
+  semi-structured, as reports cast them `AS TEXT`, unnests their text
+  instead of making JSON of each string and reading it back, which took
+  20 to 24% of the behaviors reports' time on data shaped like real data:
+  counting people by each element of 2 million rows' five lists took
+  0.22 s and takes 0.13 s, and a behaviors report over them 0.15 s and
+  0.09 s.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

@@ -189,6 +189,23 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 			where not cast(i.value as text) is null and trim(cast(i.value as text)) <> '' and t.id <> 3 %[2]s
 			group by 1, 2 order by 1, 2`, builds: true,
 			asJSON: `and b.value is not null`},
+		// Elements that every read casts, which are unnested as text: of
+		// lists, maps, JSON of each type and constants, one of which holds
+		// an object's text as a string; and elements read otherwise, by
+		// MIN and MAX, a path or ORDER BY.
+		{q: `select t.id, cast(g.value:k as text) as k, cast(v.value as text) as x, try_cast(v.value as float) as f, v.value::string as y
+			from %[1]s t, lateral flatten(input => [object_construct('k', 'a', 'l', t.a), object_construct_keep_null('k', 'o', 'l', t.o),
+				object_construct('k', 'j', 'l', parse_json('[1, 2.5, true, null, "x", {"a": [1, "b"]}, " y "]')),
+				object_construct('k', 'c', 'l', ['p', '{"q": 1}', '']), object_construct('k', 's', 'l', 'text')]) g,
+			lateral flatten(input => g.value:l) v %[2]s order by 1, 2, 3, 4, 5`, builds: true,
+			asJSON: `where g.value is not null`},
+		{q: `select cast(g.value:k as text) as k, min(v.value), max(v.value), max(get_path(v.value, 'name')::string), count(*)
+			from %[1]s t, lateral flatten(input => [object_construct('k', 'a', 'l', t.a), object_construct('k', 'c', 'l', ['p', 'q'])]) g,
+			lateral flatten(input => g.value:l) v %[2]s group by 1 order by 1`, builds: true,
+			asJSON: `where g.value is not null`},
+		{q: `select t.id, v.value from %[1]s t, lateral flatten(input => [object_construct('l', t.a)]) g, lateral flatten(input => g.value:l) v
+			%[2]s order by v.value, 1`, builds: true,
+			asJSON: `where g.value is not null`},
 		// CTEs that each flatten objects of their own keys AS g and v.
 		{q: `with a as (select t.id, 'a' as src, g.index as gi, g.value:k::string as k, v.value::string as x from %[1]s t,
 					lateral flatten(input => [object_construct('k', 'x', 'l', t.a), object_construct('l', t.o)]) g,
@@ -334,6 +351,17 @@ func TestFlattenShapes(t *testing.T) {
 				`'_sf_s2': CAST(sf_string_part(m.a) AS VARCHAR), '_sf_j2': CAST(sf_other_part(m.a) AS JSON)}, {'_sf_i': CAST(1 AS BIGINT), '_sf_k1': CAST('b' AS VARCHAR), ` +
 				`'_sf_l2': CAST(sf_list_part(m.b) AS VARCHAR[]), '_sf_s2': CAST(sf_string_part(m.b) AS VARCHAR), '_sf_j2': CAST(sf_other_part_keep_null(m.b) AS JSON)}]) AS _sf_t ` +
 				`FROM tab m) AS m) AS m`, `LATERAL`},
+		// Elements that every read casts are unnested as text; one read
+		// otherwise keeps them JSON.
+		{`select cast(g.value:k as text), cast(v.value as text), v.value::float from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
+			`select m._sf_t._sf_k1 AS "CAST(G.VALUE:K AS TEXT)", m._sf_e AS "CAST(V.VALUE AS TEXT)", CAST(m._sf_e AS DOUBLE) AS "V.VALUE::FLOAT" ` +
+				`from (SELECT m.*, unnest(sf_parts_strings(m._sf_t._sf_l2, m._sf_t._sf_j2, 'BOTH')) AS _sf_e FROM`, `json_extract`},
+		{`select cast(v.value as text), v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
+			`select json_extract_string(m._sf_e, '$') AS "CAST(V.VALUE AS TEXT)", m._sf_e from (SELECT m.*, unnest(sf_parts_values(`, `sf_parts_strings`},
+		{`select v.value:x::string from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v`,
+			`unnest(sf_parts_values(`, `sf_parts_strings`},
+		{`select g.value:k::string from tab m, lateral flatten(input => [object_construct('k', ['p', '{"q": 1}'])]) g`,
+			`'_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST(sf_string_part(json_array('p', '{"q": 1}')) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(json_array('p', '{"q": 1}')) AS JSON)`, ``},
 		{`select g.value:n::string from tab m inner join u on u.id = m.id cross join lateral flatten(input => [object_construct('n', m.s), object_construct('n', 'x')]) as g(seq, key, path, index, value, this) where m.id > 1`,
 			`from (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), '_sf_l1': CAST(sf_list_part(m.s) AS VARCHAR[]), '_sf_s1': CAST(sf_string_part(m.s) AS VARCHAR), ` +
 				`'_sf_j1': CAST(sf_other_part(m.s) AS JSON)}, {'_sf_i': CAST(1 AS BIGINT), '_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST('x' AS VARCHAR), '_sf_j1': CAST(NULL AS JSON)}]) AS _sf_t FROM tab m) AS m ` +

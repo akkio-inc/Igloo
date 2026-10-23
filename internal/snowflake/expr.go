@@ -277,7 +277,8 @@ func (t *translator) paths(nodes []*node) ([]*node, error) {
 		case t.isFlattenColumn(nodes, i):
 			start = qualifiedStart(nodes, i)
 			base = nodes[start : i+1]
-			v = &variant{base: seq(base, base...), json: true, obj: t.structReads[nodes[i]], elem: t.elemReads[nodes[i]]}
+			v = &variant{base: seq(base, base...), json: true, obj: t.structReads[nodes[i]], elem: t.elemReads[nodes[i]],
+				text: t.elemTexts[nodes[i]]}
 			i++
 		default:
 			continue
@@ -858,7 +859,8 @@ func orderItem(item []*node) []*node {
 	if len(expr) == 1 && expr[0].kind == kVariant {
 		v := expr[0].v
 		v.mode = vString
-		num := &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, mode: vNumber, try: true}
+		num := &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, elem: v.elem, text: v.text,
+			mode: vNumber, try: true}
 		d := " ASC"
 		if desc {
 			d = " DESC"

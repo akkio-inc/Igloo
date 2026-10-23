@@ -49,8 +49,12 @@ type variant struct {
 	obj *structFlatten
 	// elem, when set, is what the variant reads in place of base: the
 	// element of a lambda that filters a FLATTEN's elements (see
-	// structWhere).
+	// structWhere), or the column of the select list that a hoisted
+	// FLATTEN's elements are unnested as (see hoistOf), and text says that
+	// column holds their text, which every read of it casts (see
+	// readsText).
 	elem string
+	text bool
 }
 
 var plainKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -95,6 +99,17 @@ func (v *variant) render() string {
 	base := v.base.String()
 	if v.elem != "" {
 		base = v.elem
+		if v.text && len(v.segs) == 0 {
+			switch v.mode {
+			case vString:
+				return base
+			case vNumber:
+				if v.try {
+					return "TRY_CAST(" + base + " AS DOUBLE)"
+				}
+				return "CAST(" + base + " AS DOUBLE)"
+			}
+		}
 	}
 	extract, extractString := "json_extract(", "json_extract_string("
 	if v.column {

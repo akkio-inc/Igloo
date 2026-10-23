@@ -187,6 +187,7 @@ func (t *translator) collectStructs(nodes []*node) {
 			t.hoists[h.reader] = h
 			for _, r := range h.elems {
 				t.elemReads[r] = h.alias + "._sf_e"
+				t.elemTexts[r] = h.text
 			}
 		}
 	}
@@ -196,7 +197,8 @@ func (t *translator) collectStructs(nodes []*node) {
 // (see hoistStructs): the item's alias as written and upper-cased, and the
 // alias's node; the FLATTEN's keys and its list of structs; and the index
 // of the key that a second FLATTEN unnests, a reader, with its arguments,
-// MODE and the nodes of its VALUE's reads.
+// MODE and the nodes of its VALUE's reads, and whether those all read text,
+// which the select list then unnests rather than JSON (see readsText).
 type hoist struct {
 	alias  string
 	up     string
@@ -206,6 +208,7 @@ type hoist struct {
 	reader *node
 	mode   string
 	elems  []*node
+	text   bool
 	list   *node
 }
 
@@ -280,6 +283,7 @@ func (t *translator) hoistOf(nodes []*node, i int, up string, args *node, reads 
 		}
 	}
 	h.elems = valueReads(nodes, v, colLists)
+	h.text = readsText(nodes, v, colLists)
 	return h
 }
 
@@ -364,6 +368,67 @@ func valueReads(nodes []*node, alias string, colLists map[*node]bool) []*node {
 	}
 	walk(nodes)
 	return out
+}
+
+// readsText reports whether every read of alias.VALUE (alias upper case)
+// in nodes and what they nest, outside FLATTENs' column lists, is cast to
+// a type that is not semi-structured, as CAST(alias.VALUE AS type),
+// TRY_CAST(alias.VALUE AS type) or alias.VALUE::type, which read the
+// value's text (see castExpr). Reports read a FLATTEN's elements so, and
+// unnesting their text spares making JSON of each string and reading it
+// back (0.65 s against 1.05 s for 3 million rows of four lists).
+func readsText(nodes []*node, alias string, colLists map[*node]bool) bool {
+	text := true
+	var walk func(nodes []*node, cast bool)
+	walk = func(nodes []*node, cast bool) {
+		for i, n := range nodes {
+			if n.kind == kGroup && !colLists[n] {
+				p := prevSig(nodes, i)
+				walk(n.kids, n.isGroup('(') && p >= 0 && (nodes[p].word() == "CAST" || nodes[p].word() == "TRY_CAST"))
+			}
+			if n.word() != "VALUE" {
+				continue
+			}
+			p := prevSig(nodes, i)
+			if p < 0 || !nodes[p].isOp(".") {
+				continue
+			}
+			q := prevSig(nodes, p)
+			if q < 0 {
+				continue
+			}
+			if name, _, ok := nodes[q].name(); !ok || strings.ToUpper(name) != alias {
+				continue
+			}
+			k := nextSig(nodes, i)
+			switch {
+			case k >= 0 && nodes[k].isOp("::"):
+				end, ok := scalarType(nodes, nextSig(nodes, k))
+				if r := nextSig(nodes, end-1); !ok || r >= 0 && (nodes[r].isOp(":") || nodes[r].isOp(".") || nodes[r].isGroup('[')) {
+					text = false
+				}
+			case cast && prevSig(nodes, q) < 0 && k >= 0 && nodes[k].word() == "AS":
+				end, ok := scalarType(nodes, nextSig(nodes, k))
+				if !ok || nextSig(nodes, end-1) >= 0 {
+					text = false
+				}
+			default:
+				text = false
+			}
+		}
+	}
+	walk(nodes, false)
+	return text
+}
+
+// scalarType reports whether a type that is not semi-structured starts at
+// nodes[i], and the index just past it.
+func scalarType(nodes []*node, i int) (int, bool) {
+	if i < 0 {
+		return 0, false
+	}
+	typ, end, ok, err := parseType(nodes, i)
+	return end, err == nil && ok && typ.class != classJSON && typ.class != classNested
 }
 
 // otherColumnsRead reports whether a select, nodes, or what it nests may
@@ -1082,7 +1147,8 @@ func (t *translator) hoistList(g *node, h *hoist) (*node, error) {
 // each, and makes each FROM item they read a subquery whose select list
 // unnests their list as _sf_t: FROM m, LATERAL FLATTEN(...) t becomes FROM
 // (SELECT m.*, unnest([...]) AS _sf_t FROM m) AS m; with a reader, another
-// around that unnests the key it flattens as _sf_e.
+// around that unnests the key it flattens as _sf_e, as text when its reads
+// all read text (see readsText).
 func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*node, error) {
 	for k := 0; k < len(nodes); k++ {
 		if !removed[nodes[k]] {
@@ -1113,7 +1179,11 @@ func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*no
 			raw(") AS "+alias))...)
 		if h.reader != nil {
 			l, _, j := h.s.parts(alias+"._sf_t", h.key)
-			out = seq(item, raw("(SELECT "+alias+".*, unnest(sf_parts_values("+l+", "+j+", "+quoteString(h.mode)+")) AS _sf_e FROM "), out,
+			values := "sf_parts_values("
+			if h.text {
+				values = "sf_parts_strings("
+			}
+			out = seq(item, raw("(SELECT "+alias+".*, unnest("+values+l+", "+j+", "+quoteString(h.mode)+")) AS _sf_e FROM "), out,
 				raw(") AS "+alias))
 		}
 		nodes = replace(nodes, start, end, out)
@@ -1161,13 +1231,15 @@ func structParts(x *node, keep bool) (list, str, json *node) {
 	return raw("NULL"), seq(nil, raw("sf_string_part("), x, raw(")")), seq(nil, raw("sf_expr_part"+suffix), x, raw(")"))
 }
 
-// stringList reports whether x is an array constant of string literals.
+// stringList reports whether x is an array constant of string literals,
+// none of which a list part would read as an object or an array's JSON
+// text (see sf_elem).
 func stringList(x *node) bool {
 	if len(x.elems) == 0 {
 		return false
 	}
 	for _, e := range x.elems {
-		if _, ok := e.stringValue(); !ok {
+		if s, ok := e.stringValue(); !ok || strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
 			return false
 		}
 	}
