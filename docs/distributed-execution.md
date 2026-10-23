@@ -239,6 +239,18 @@ within its estimate, stays there, and one that ran only on workers stays
 there if it beat its estimates. The server logs each choice, `chose where a statement
 runs`, with both estimates and the reason.
 
+A statement whose parts would partition large tables to join them to a
+relation whose size Igloo cannot estimate stays on the replica, unless it
+ran faster on workers before or ran out of memory on the replica: a
+relation filtered by a constant, a subquery's value or `IN`, as an audience
+taken from a lookup of every audience is, is estimated at the size of the
+table it filters, though it may hold a thousandth of it. Distributed, every
+table joined to it is partitioned through object storage (465 GB for one
+report at a hundred times the data, in 925 s); the replica filters each
+table by the audience as it reads it (17 s at ten times the data, where 16
+workers took 517 s). `EXPLAIN DISTRIBUTED` lists such relations as
+`uncertain size`.
+
 A statement that auto mode ran on the replica and that runs out of memory
 there (DuckDB's out-of-memory error, or the replica's memory watch
 canceling it) before it sends a row runs again on workers, and the client

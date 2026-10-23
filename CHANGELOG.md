@@ -334,6 +334,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   out of it before, fails at once, where it ran on the coordinator for half
   an hour at a hundred times the data and ran out of memory there too. Its
   workers stay up while it runs on the coordinator.
+- Auto mode keeps on the replica a statement whose parts would partition
+  large tables to join them to a relation of uncertain size, one filtered
+  by a constant, a subquery's value or `IN`, as an audience is, unless it
+  ran faster on workers or ran out of memory on the replica: an audience
+  report took 17 s on the replica and 517 s on 16 workers at ten times the
+  data.
 - `EXPLAIN DISTRIBUTED <query>` says how a query would run without running
   it: where (workers or the replica) and why, auto mode's estimates, the
   partitions its exchanges would have, its stages with their SQL, what the

@@ -48,6 +48,9 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 	if final, err := co.parser.print(plan.final); err == nil {
 		rows = append(rows, [2]string{"the coordinator", final})
 	}
+	for _, u := range plan.uncertain {
+		rows = append(rows, [2]string{"uncertain size", u.name + ", read by partition, with large inputs partitioned to meet it"})
+	}
 	for _, reason := range plan.local {
 		rows = append(rows, [2]string{"stays on the coordinator", reason})
 	}

@@ -153,6 +153,9 @@ type Plan struct {
 	// memory: its working set is over its share (estimateTimes), or it ran
 	// out of memory there before.
 	shortOfMemory bool
+	// uncertain are relations of uncertain size its stages read by
+	// partition, with large tables partitioned to meet them.
+	uncertain []uncertain
 }
 
 // ShortOfMemory reports whether the statement would not fit in the
@@ -250,6 +253,9 @@ type planner struct {
 	undo []func()
 	// expanded counts the views read as their queries.
 	expanded int
+	// uncertain are the relations of uncertain size that stages read by
+	// partition, with other large inputs partitioned to meet them.
+	uncertain []uncertain
 }
 
 type tableResult struct {
@@ -303,7 +309,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons}, nil
+	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: pl.uncertain}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
@@ -589,6 +595,9 @@ func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 	var combine node
 	if err == nil {
 		combine, err = pl.finish(j, b)
+	}
+	if err == nil {
+		pl.uncertain = append(pl.uncertain, uncertainOf(c)...)
 	}
 	if err != nil && IsUnsupported(err) && pl.inlines > inlines && !pl.noInline {
 		// Some parts need a common table expression's rows in an exchange:

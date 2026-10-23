@@ -340,6 +340,7 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	now := time.Now()
 	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
+	onWorkers, explore, reason = keepUncertainLocal(plan.uncertain, r, found, onWorkers, explore, reason)
 	d.onWorkers, d.reason = onWorkers, reason
 	if dry {
 		return plan, d, nil

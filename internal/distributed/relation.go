@@ -934,7 +934,9 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 		b.columns = names(have)
 	}
 	*last = f
-	_, err = pl.emit(j, b, out)
+	if _, err = pl.emit(j, b, out); err == nil {
+		pl.uncertain = append(pl.uncertain, uncertainOf(c)...)
+	}
 	return err
 }
 
@@ -1116,7 +1118,7 @@ func names(cols []Column) []string {
 // savepoint is how far planning had come: a candidate that turns out not
 // to qualify takes back the stages and exchanges it planned, and puts back
 // the views it read as their queries.
-type savepoint struct{ stages, exchanges, memo, undo, expanded int }
+type savepoint struct{ stages, exchanges, memo, undo, expanded, uncertain int }
 
 // memoEntry records an exchange remembered for a common table expression.
 type memoEntry struct {
@@ -1126,7 +1128,8 @@ type memoEntry struct {
 }
 
 func (pl *planner) save() savepoint {
-	return savepoint{stages: len(pl.stages), exchanges: pl.exchanges, memo: len(pl.memo), undo: len(pl.undo), expanded: pl.expanded}
+	return savepoint{stages: len(pl.stages), exchanges: pl.exchanges, memo: len(pl.memo), undo: len(pl.undo), expanded: pl.expanded,
+		uncertain: len(pl.uncertain)}
 }
 
 func (pl *planner) restore(sp savepoint) {
@@ -1145,6 +1148,7 @@ func (pl *planner) restore(sp savepoint) {
 		pl.undo = pl.undo[:len(pl.undo)-1]
 	}
 	pl.expanded = sp.expanded
+	pl.uncertain = pl.uncertain[:sp.uncertain]
 }
 
 // remember records that a common table expression's rows are written to x.
