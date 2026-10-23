@@ -657,7 +657,7 @@ func checkTaskSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest) (sfM
 			}
 		case "TABLE_FUNCTION":
 			// unnest, json_each and json_tree read their arguments, which the
-			// walk checks too.
+			// walk checks too, and series of integer literals nothing.
 			if rowFunction(n) != nil {
 				err = unsupported("a task's SQL may read only its views, not a table function")
 			}

@@ -297,11 +297,15 @@ func TestWorkerReadsOnlyItsViews(t *testing.T) {
 	if err := run("SELECT count(*) FROM __igloo_split, unnest([l_orderkey, l_partkey]) AS u(k), json_each(to_json([l_comment]))"); err != nil {
 		t.Errorf("a fragment that unnests its rows' values: %v", err)
 	}
+	if err := run("SELECT count(*) FROM __igloo_split, range(2), generate_series(1, 3)"); err != nil {
+		t.Errorf("a fragment joined to series of literals: %v", err)
+	}
 	for _, sql := range []string{
 		"SELECT count(*) FROM read_parquet(" + quoteLiteral(file) + ")",
 		"SELECT count(*) FROM __igloo_split, unnest((SELECT list(l_orderkey) FROM read_parquet(" + quoteLiteral(file) + ")))",
 		"SELECT count(*) FROM __igloo_split, main.unnest([1])",
-		"SELECT count(*) FROM __igloo_split, range(2)",
+		"SELECT count(*) FROM __igloo_split, range(100000)",
+		"SELECT count(*) FROM __igloo_split, range(l_orderkey)",
 		"SELECT count(*) FROM " + quoteLiteral(file),
 		"SELECT count(*) FROM __igloo_split WHERE l_orderkey IN (SELECT l_orderkey FROM read_parquet(" + quoteLiteral(file) + "))",
 		"SELECT count(*) FROM main.lineitem",

@@ -99,6 +99,17 @@ func TestUnnest(t *testing.T) {
 			SELECT m._sf_t.day AS day, c.cohort, count(DISTINCT m.person_id) AS n
 			FROM (SELECT m.*, unnest(list_transform(m.visits, lambda v: {'day': v.day, 'items': [v.n]})) AS _sf_t FROM base AS m) AS m
 			JOIN cohorts AS c ON c.person_id = m.person_id GROUP BY 1, 2 ORDER BY 1, 2`,
+		// Series of integer literals are the same rows on every worker. An
+		// object of a few keys flattens as a CASE per row of range(n),
+		// which DuckDB estimates at n times the table's rows.
+		`SELECT count(*), sum(i) FROM people, range(3) AS r(i)`,
+		`SELECT g, count(DISTINCT person_id) AS n FROM people CROSS JOIN generate_series(1, 3) AS s(g) WHERE person_id % g = 0 GROUP BY 1 ORDER BY 1`,
+		`WITH base AS (SELECT person_id, home, attrs FROM people WHERE person_id % 3 <> 0),
+			cohorts AS (SELECT DISTINCT person_id, CASE WHEN person_id % 2 = 0 THEN 'even' ELSE 'odd' END AS cohort FROM people)
+			SELECT m._sf_t.key AS k, m._sf_t.value AS v, c.cohort, count(DISTINCT m.person_id) AS n
+			FROM (SELECT b.*, CASE k.i WHEN 0 THEN {'key': 'city', 'value': b.home.city} WHEN 1 THEN {'key': 'gender', 'value': b.attrs['gender']} END AS _sf_t
+				FROM base AS b CROSS JOIN range(2) AS k(i)) AS m
+			JOIN cohorts AS c ON c.person_id = m.person_id GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
 	}
 	for _, q := range []string{
 		`SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS people FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1`,
@@ -132,8 +143,11 @@ func TestUnnest(t *testing.T) {
 	for _, q := range []string{
 		// Computed once on one machine, and once per worker.
 		`SELECT count(*) FROM people, (SELECT random() < 2 AS r) x WHERE x.r`,
-		// Not a function of the row's values.
-		`SELECT count(*) FROM people, range(3)`,
+		// Series too large, or not of literals.
+		`SELECT count(*) FROM people, range(1001)`,
+		`SELECT count(*) FROM people, range((SELECT 3))`,
+		`SELECT count(*) FROM people, range(0, 3, 0)`,
+		`SELECT count(*) FROM people, range(TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-03', INTERVAL 1 DAY)`,
 		`SELECT count(*) FROM people, LATERAL (SELECT * FROM people AS q WHERE q.person_id = people.person_id)`,
 		`SELECT count(*) FROM people, unnest((SELECT list(person_id) FROM people LIMIT 1))`,
 		// A lambda parameter named like a select alias, which planning would

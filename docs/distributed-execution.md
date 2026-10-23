@@ -126,6 +126,8 @@ In detail, a part runs distributed when:
   compute columns. It may unnest its rows' values: `unnest`, `json_each`
   and `json_tree` of them, and lateral subqueries that read no table, which
   is what Snowflake's `FLATTEN` becomes (with `OUTER` and `RECURSIVE` too).
+  It may join `range` and `generate_series` of integer literals, up to
+  1,000 rows, which are the same rows on every worker.
   Its filters' subqueries that stand on their own may read large tables:
   `x IN (SELECT y ...)` is a semi join to a relation workers compute,
   partitioned by `y`, and a subquery of one row
@@ -301,8 +303,8 @@ on less data at a time, or give the workers more memory.
   the tables' Iceberg metadata, never from a path a user wrote. A worker
   refuses files outside the warehouse and `IGLOO_ALLOWED_LOCATIONS`, and a
   task whose SQL reads anything but the files it lists (a table function
-  other than `unnest`, `json_each` and `json_tree` of values, a table by
-  name). Their DuckDB is locked down as the server's is: no local
+  other than `unnest`, `json_each` and `json_tree` of values and `range`
+  and `generate_series` of literals, a table by name). Their DuckDB is locked down as the server's is: no local
   files, no other locations, no SQL from strings.
 - **Policies keep a statement on one machine.** A statement that masking
   or row access policies apply to, or that names anything they concern,

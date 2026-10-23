@@ -965,10 +965,19 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if item.name == "" {
 			item.name = strings.ToLower(str(f["function_name"]))
 		}
-		// unnest of one list is one column, named by the alias list.
-		if aliases := list(ref, "column_name_alias"); strings.EqualFold(str(f["function_name"]), "unnest") &&
-			len(list(f, "children")) == 1 && len(aliases) == 1 && str(ref["with_ordinality"]) != "WITH_ORDINALITY" {
+		// unnest of one list is one column, named by the alias list, and
+		// so is a series, else named after its function.
+		aliases := list(ref, "column_name_alias")
+		name := strings.ToLower(str(f["function_name"]))
+		switch {
+		case str(ref["with_ordinality"]) == "WITH_ORDINALITY":
+		case name == "unnest" && len(list(f, "children")) == 1 && len(aliases) == 1:
 			item.columns = []string{strings.ToLower(str(aliases[0]))}
+		case constantSeries[name] && len(aliases) <= 1:
+			item.columns = []string{name}
+			if len(aliases) == 1 {
+				item.columns = []string{strings.ToLower(str(aliases[0]))}
+			}
 		}
 		sc.items = append(sc.items, item)
 		return nil
@@ -1128,18 +1137,73 @@ func (pl *planner) describeFrom(ref node) ([]Column, error) {
 // for each row, as a filter is, so they may run on workers.
 var rowFunctions = map[string]bool{"unnest": true, "json_each": true, "json_tree": true}
 
+// constantSeries are the table functions whose rows, of integer literals,
+// are the same wherever they are computed: range and generate_series.
+// Joined to a split table, each worker joins its share of the table to all
+// of them, as one machine joins the whole table: Snowflake's FLATTEN of an
+// object of a few keys becomes CROSS JOIN range(n) with a CASE per key,
+// which DuckDB estimates at n times the table's rows, where it estimates
+// an unnest at the table's rows alone.
+var constantSeries = map[string]bool{"range": true, "generate_series": true}
+
+// maxSeriesRows bounds the rows of such a series: a large one multiplies
+// every worker's rows, and is no FLATTEN.
+const maxSeriesRows = 1000
+
 // rowFunction checks that a table function in FROM is one of rowFunctions,
-// over expressions that read no table.
+// over expressions that read no table, or a series of integer literals
+// (constantSeries).
 func rowFunction(ref node) error {
 	f := child(ref, "function")
 	name := strings.ToLower(str(f["function_name"]))
 	switch {
-	case !rowFunctions[name] || str(f["schema"]) != "" || str(f["catalog"]) != "":
+	case str(f["schema"]) != "" || str(f["catalog"]) != "":
 		return unsupported("table function %s in FROM", name)
 	case child(ref, "sample") != nil:
 		return unsupported("TABLESAMPLE")
+	case constantSeries[name]:
+		return seriesRows(name, list(f, "children"))
+	case !rowFunctions[name]:
+		return unsupported("table function %s in FROM", name)
 	case hasClass(f["children"], "SUBQUERY"):
 		return unsupported("a subquery in %s()", name)
+	}
+	return nil
+}
+
+// seriesRows checks that range or generate_series of args yields at most
+// maxSeriesRows rows, from integer literals: range(stop), range(start,
+// stop) and range(start, stop, step), and generate_series likewise but
+// including stop.
+func seriesRows(name string, args []any) error {
+	vals := make([]int64, len(args))
+	for i, a := range args {
+		n, ok := a.(node)
+		v, isInt := intConstant(n)
+		if !ok || !isInt || v < -1<<40 || v > 1<<40 {
+			return unsupported("%s() of something other than small integer literals", name)
+		}
+		vals[i] = v
+	}
+	start, stop, step := int64(0), int64(0), int64(1)
+	switch len(vals) {
+	case 1:
+		stop = vals[0]
+	case 2:
+		start, stop = vals[0], vals[1]
+	case 3:
+		start, stop, step = vals[0], vals[1], vals[2]
+	default:
+		return unsupported("%s() of %d arguments", name, len(vals))
+	}
+	if step <= 0 {
+		return unsupported("%s() with a step of %d", name, step)
+	}
+	if name == "generate_series" {
+		stop++
+	}
+	if rows := (stop - start + step - 1) / step; stop > start && rows > maxSeriesRows {
+		return unsupported("%s() of %d rows, more than %d", name, rows, maxSeriesRows)
 	}
 	return nil
 }
@@ -1161,11 +1225,16 @@ func rowQuery(n node) bool {
 		switch t := str(m["type"]); {
 		case t == "BASE_TABLE", t == "PIVOT", t == "SHOW_REF", t == "COLUMN_DATA":
 			ok = false
-		case t == "TABLE_FUNCTION":
-			ok = rowFunction(m) == nil
+		case t == "TABLE_FUNCTION" && rowFunction(m) != nil:
+			ok = false
 		case str(m["class"]) == "FUNCTION" && volatileFunctions[strings.ToLower(str(m["function_name"]))]:
 			ok = false
 		}
+		// Once false, it stays so: the walk goes on to the siblings of the
+		// node that made it false, in no set order. A row function there
+		// set it back to true, so a subquery joining a table to unnest()
+		// sometimes read as reading no table, and its table went to the
+		// workers unplanned.
 		return ok
 	})
 	return ok

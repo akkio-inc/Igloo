@@ -184,7 +184,12 @@ explicit transactions, the coordinator plans it:
    filter does, so they may run anywhere: `unnest`, `json_each` and
    `json_tree` of values, and subqueries without tables, which is what
    Snowflake's `FLATTEN` becomes, unless they call a volatile function
-   (`random()`), which one machine might call once for all rows. The largest table, by its
+   (`random()`), which one machine might call once for all rows. So may
+   `range` and `generate_series` of integer literals, up to 1,000 rows:
+   their rows are the same on every worker, and an object of a few keys
+   flattens as a `CASE` per row of `range(n)`, which DuckDB estimates at
+   n times the table's rows where it estimates an `unnest` at the table's
+   rows alone. The largest table, by its
    snapshot's file size in Iceberg metadata, is the split table; it must
    appear once. Every other table must be a catalog table small enough for
    every worker to read (an eighth of the smallest worker's memory, in
@@ -408,8 +413,8 @@ result's columns must match the prepared statement's, or it falls back.
   with only the warehouse, the allowed locations, its spill directory and
   its cache allowed, no extensions loaded at run time. A worker parses a
   task's SQL and refuses it unless it reads only the task's views: no table
-  function but `unnest`, `json_each` and `json_tree` of values, no table by
-  name. The planner never distributes a part that reads another table
+  function but `unnest`, `json_each` and `json_tree` of values and series
+  of literals, no table by name. The planner never distributes a part that reads another table
   function, a temporary table, a connection's table or an external table,
   or a view that reads one.
 - **No new endpoint is open.** Workers accept tasks only over TLS 1.3 with a

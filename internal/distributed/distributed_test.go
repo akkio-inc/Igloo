@@ -366,7 +366,7 @@ func TestLocal(t *testing.T) {
 		// Correlated: a large table read again per row.
 		`SELECT count(*) FROM lineitem l WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = l.l_partkey)`,
 		`SELECT string_agg(l_comment, ',' ORDER BY l_comment) FROM lineitem`,
-		`SELECT count(*) FROM lineitem, range(3)`,
+		`SELECT count(*) FROM lineitem, range(100000)`,
 		`SELECT count(DISTINCT l_partkey), count(DISTINCT l_suppkey) FROM lineitem`,
 		`SELECT getvariable('x'), count(*) FROM lineitem WHERE l_quantity > getvariable('y')`,
 		`SELECT count(*) FROM lineitem WHERE l_quantity > $1`,

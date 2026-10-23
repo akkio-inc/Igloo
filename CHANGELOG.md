@@ -360,7 +360,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Unnests run distributed: `unnest`, `json_each` and `json_tree` of a
   row's values in `FROM`, lateral subqueries that read no table, and so
   Snowflake's `FLATTEN` of `ARRAY`, `OBJECT` and JSON text columns, whose
-  `sf_` macros workers define too.
+  `sf_` macros workers define too. So do joins to `range` and
+  `generate_series` of integer literals (up to 1,000 rows). A subquery in
+  `FROM` that joins a table to an unnest no longer, now and then, reads as
+  one that reads no table and runs on one machine.
 - Views run distributed: a view reads as its query, its names resolved as
   in the view, so views that pass a large table through, filter it or join
   small tables to it distribute as their queries do.
