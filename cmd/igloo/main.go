@@ -920,10 +920,13 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
 		Memory:    budget,
-		Metrics:   maintenance.NewMetrics(reg),
-		Activity:  work,
-		Failed:    failed,
-		Clones:    guard,
+		// Clustering spills where DuckDB does, on local disk where it
+		// is set (IGLOO_DUCKDB_TEMP_DIR).
+		SpillDir: cfg.DuckDB.TempDir,
+		Metrics:  maintenance.NewMetrics(reg),
+		Activity: work,
+		Failed:   failed,
+		Clones:   guard,
 		DataRetention: func(ctx context.Context) (map[string]time.Duration, error) {
 			snap, err := policies.Load(ctx)
 			if err != nil {

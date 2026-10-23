@@ -815,6 +815,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Tables can be clustered. `ALTER TABLE ... SET SORTED BY (a, b)` (and
+  Snowflake's `CLUSTER BY`, `ALTER TABLE ... CLUSTER BY`, `DROP CLUSTERING
+  KEY`) sets a table's default Iceberg sort order, which `igloo.tables`,
+  `information_schema.tables` and `SHOW OBJECTS` show as its clustering key.
+  Table maintenance then rewrites, sorted, the files whose ranges of the
+  order's first column overlap, within its memory budget, sorting range by
+  range and spilling to local disk, so a filter on that column reads few
+  files: on 1.4 billion rows written unsorted, a filter on one value read
+  140 files, and 3 once clustered (0.65 s instead of 2.3 s with nothing
+  cached). A clustered table is not rewritten again until new files overlap
+  it. See [SQL](docs/sql.md#sort-orders-and-clustering) and
+  [operations](docs/operations.md#clustering).
+- `CREATE TABLE` in Snowflake's dialect translates the column types of a
+  table named with its schema (`db.schema.t`) too.
 - Tables Igloo creates are written in files of 512 MB, Iceberg's default
   target, rather than a file per row group: DuckDB's Iceberg writer aims
   for 8 MB when a table sets no `write.target-file-size-bytes`, so 1.3 GB of

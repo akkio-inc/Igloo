@@ -119,6 +119,10 @@ type Options struct {
 	// rewrites a table's files. Zero means DefaultMemory. A table that
 	// cannot be compacted within it is left as it is.
 	Memory int64
+	// SpillDir is where clustering spills the rows it sorts (see
+	// cluster), in a directory of its own that it removes; empty means the
+	// system's temporary directory.
+	SpillDir string
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -391,7 +395,12 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 // what failed.
 func (m *Maintainer) rewrite(ctx context.Context, ident table.Identifier, tbl *table.Table, limit time.Duration, limited bool, log *slog.Logger) []error {
 	var errs []error
-	switch _, err := m.compact(ctx, tbl, log); {
+	compact := func() (*table.Table, error) { return m.compact(ctx, tbl, log) }
+	if fields, first, ok := clusterFields(tbl); ok {
+		// A table with a sort order is clustered instead (see cluster).
+		compact = func() (*table.Table, error) { return m.cluster(ctx, tbl, fields, first, log) }
+	}
+	switch _, err := compact(); {
 	case err == nil:
 	case errors.Is(err, table.ErrCommitFailed):
 		log.Debug("compaction lost a race with a writer; retrying next pass")
@@ -639,7 +648,7 @@ func (m *Maintainer) compact(ctx context.Context, tbl *table.Table, log *slog.Lo
 	// finishes.
 	log.Info("compacting", "files", len(rewrite), "bytes", total, "groups", len(groups), "memory_limit", m.memory())
 	start := time.Now()
-	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "compact")
+	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "compact", rewriteGroup)
 	if err != nil || res.removed == 0 {
 		return committed, err
 	}
@@ -670,11 +679,11 @@ type rewritten struct {
 // of the partition's other files, which came back. The commit is not
 // retried on a conflict, which would bring the replaced files back (see
 // iceberg-go's IGLOO_PATCHES.md): maintenance tries again on its next run.
-// The groups are rewritten one after another within the memory of
-// Options.Memory (see rewriteGroup); one that needs more fails with
+// The groups are rewritten one after another, each by write, within the
+// memory of Options.Memory (see rewriteGroup); one that needs more fails with
 // errOverBudget.
 func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups []table.CompactionTaskGroup,
-	rewrite map[string]struct{}, operation string) (*table.Table, rewritten, error) {
+	rewrite map[string]struct{}, operation string, write groupWriter) (*table.Table, rewritten, error) {
 	var res rewritten
 	fs, err := tbl.FS(ctx)
 	if err != nil {
@@ -714,7 +723,7 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 		if len(g.Tasks) == 0 {
 			continue
 		}
-		added, lay, err := rewriteGroup(rctx, tbl, fs, g, budget)
+		added, lay, err := write(rctx, tbl, fs, g, budget)
 		res.peak = meter.Peak()
 		if err != nil {
 			return tbl, res, err
@@ -891,7 +900,7 @@ func (m *Maintainer) purgeDeleted(ctx context.Context, tbl *table.Table, limit t
 	}
 	log.Info("rewriting files whose deleted rows are older than the data retention", "files", len(rewrite), "bytes", total,
 		"memory_limit", m.memory())
-	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "purge-deleted")
+	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "purge-deleted", rewriteGroup)
 	if err != nil || res.removed == 0 {
 		return committed, err
 	}

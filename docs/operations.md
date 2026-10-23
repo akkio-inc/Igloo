@@ -712,6 +712,8 @@ tables itself, so nobody has to schedule anything. Every hour
    Without one, DuckDB writes a file per row group, a few megabytes each for
    narrow rows. Tables made by other engines keep what those engines set;
    change one with `set_iceberg_table_properties`.
+   A table with a [sort order](sql.md#sort-orders-and-clustering) is
+   [clustered](#clustering) instead.
 2. **Snapshot expiry.** Snapshots older than `IGLOO_SNAPSHOT_RETENTION`
    (7 days by default) are removed, always keeping the current one, and the
    files that only they referenced are deleted. Files that compaction
@@ -756,8 +758,51 @@ the interval. Without `IGLOO_METADATA_DATABASE_URL`, run a single replica.
 Watch `igloo_maintenance_last_success_timestamp_seconds`: if it stops
 advancing, the logs (component `maintenance`) say which table failed and why.
 Each table's compaction is logged as it starts (`compacting`, with the
-files, bytes and memory budget) and ends (`compacted`). Set
+files, bytes and memory budget) and ends (`compacted`); clustering logs
+`clustering` and `clustered`. Set
 `IGLOO_MAINTENANCE=false` only if another tool maintains the tables.
+
+### Clustering
+
+A table with a sort order (`ALTER TABLE ... SET SORTED BY`, or Snowflake's
+`CLUSTER BY`) is clustered instead of compacted, so that a filter on the
+order's first column reads few files: Iceberg's manifests record each file's
+range of every column, and a scan skips the files whose range cannot hold
+the value. On 1.4 billion rows written unsorted, a filter on one value of
+the first column read 140 files; clustered, 3, and it took 0.65 s instead
+of 2.3 s with nothing cached.
+
+Each pass rewrites, sorted by the whole order and with deletes applied:
+
+- the files whose ranges of the first column overlap another file's (ranges
+  that only share a bound, as a sorted rewrite leaves them, do not count);
+- runs of small files (under 3/4 of the target size) that are next to each
+  other in the order, which merging keeps apart from the rest;
+- files with many deletes, as compaction rewrites them.
+
+It rewrites them in islands, runs of such files with no other file between
+them in the order, each into its own sorted files of the target size, so the
+new files overlap none of those it left. A clustered table is not rewritten
+again until writes add files that overlap it. A pass rewrites at most 8 GB
+per table, island by island.
+
+Sorting does not need the table in memory. Clustering samples the first
+column, splits its values into ranges small enough to sort within the
+[memory budget](#compaction-memory), and reads the rows once, appending each
+to its range's spill file (compressed Arrow) under `IGLOO_DUCKDB_TEMP_DIR`
+(or the system's temporary directory); then it sorts the ranges one at a
+time, in order, into files of the target size. The spill takes about as much
+disk as the files it rewrites, and is deleted as each range is written. The
+new files record exact bounds of the first column.
+
+Each table's clustering is logged as it starts (`clustering`, with the
+files, bytes, islands and `overlapping_files`) and ends (`clustered`, with
+`overlapping_files_before` and `overlapping_files_after`);
+`igloo_maintenance_clustered_files_total` and
+`igloo_maintenance_clustering_output_files_total` count the files replaced
+and written. Partitioned tables, and sort orders with transforms (`bucket`,
+`day`, ...) or nested columns, which other engines can set, are compacted as
+before.
 
 ### Compaction memory
 

@@ -20,6 +20,10 @@ var (
 	metered       = filerewrite.Metered
 )
 
+// groupWriter writes the rows of a group's files into new files and returns
+// them, as rewriteGroup and the writer of clustering do.
+type groupWriter func(ctx context.Context, tbl *table.Table, fs iceio.IO, g table.CompactionTaskGroup, budget int64) ([]iceberg.DataFile, filerewrite.Layout, error)
+
 // rewriteGroup writes the rows of g's files, with their deletes applied, into
 // new files of the table's target size, and returns them, holding no more
 // than budget bytes as counted by the allocator of ctx (see metered).

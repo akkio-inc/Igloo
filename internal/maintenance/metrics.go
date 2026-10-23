@@ -10,6 +10,8 @@ type Metrics struct {
 	filesWritten   prometheus.Counter
 	snapshots      prometheus.Counter
 	orphans        prometheus.Counter
+	clusteredIn    prometheus.Counter
+	clusteredOut   prometheus.Counter
 }
 
 // NewMetrics registers the maintenance metrics with reg.
@@ -39,8 +41,16 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_maintenance_orphan_files_deleted_total",
 			Help: "Files deleted because no snapshot referenced them.",
 		}),
+		clusteredIn: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_maintenance_clustered_files_total",
+			Help: "Data files of tables with a sort order replaced by clustering.",
+		}),
+		clusteredOut: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_maintenance_clustering_output_files_total",
+			Help: "Sorted data files written by clustering.",
+		}),
 	}
-	reg.MustRegister(m.passes, m.lastSuccess, m.filesRewritten, m.filesWritten, m.snapshots, m.orphans)
+	reg.MustRegister(m.passes, m.lastSuccess, m.filesRewritten, m.filesWritten, m.snapshots, m.orphans, m.clusteredIn, m.clusteredOut)
 	return m
 }
 
@@ -60,6 +70,13 @@ func (m *Metrics) compacted(before, after int) {
 	if m != nil {
 		m.filesRewritten.Add(float64(before))
 		m.filesWritten.Add(float64(after))
+	}
+}
+
+func (m *Metrics) clustered(before, after int) {
+	if m != nil {
+		m.clusteredIn.Add(float64(before))
+		m.clusteredOut.Add(float64(after))
 	}
 }
 
