@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -505,7 +506,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 		return err
 	}
 
-	for _, stmt := range settingStatements(cfg.DuckDB) {
+	for _, stmt := range settingStatements(withThreads(cfg, serverThreadsPerCore)) {
 		if err := exec(stmt); err != nil {
 			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)
 		}
@@ -666,6 +667,35 @@ func (e *Engine) lockDown(exec func(string) error, cfg config.Config, extra []st
 		}
 	}
 	return nil
+}
+
+// Threads per core when the warehouse is in object storage and
+// IGLOO_DUCKDB_THREADS is unset. Reading object storage cold waits on
+// requests, not on cores: a thread reads a row group at a time, and row
+// groups are often small (DuckDB writes 122,880 rows to one), so at one
+// thread a core the cores sit idle. On a machine of 8 cores, a scan of
+// 23 GB cold read 64 MB/s on 8 threads, 100 on 16, 172 on 32 and 265 on
+// 64; a report spent 66 s on 8 threads, 33 on 16 and 30 on 32, and 12 s
+// warm on all three. Workers read cold more than the server, which keeps
+// a warm cache and needs room for the memory more threads take.
+const (
+	serverThreadsPerCore = 2
+	workerThreadsPerCore = 4
+)
+
+// withThreads returns cfg's DuckDB settings with Threads set to perCore
+// threads a core, if unset and the warehouse is in object storage.
+func withThreads(cfg config.Config, perCore int) config.DuckDB {
+	d := cfg.DuckDB
+	switch cfg.Storage.Type {
+	case config.StorageS3, config.StorageGCS, config.StorageAzure:
+		if d.Threads == 0 {
+			// The cores this process may use: a container's CPU limit, if
+			// it has one.
+			d.Threads = perCore * runtime.GOMAXPROCS(0)
+		}
+	}
+	return d
 }
 
 func settingStatements(d config.DuckDB) []string {

@@ -135,7 +135,7 @@ type workerStatus struct {
 	// the same files go to the same worker and its read cache.
 	ID          string  `json:"id"`
 	Version     string  `json:"version"`
-	Threads     int     `json:"threads"`
+	Cores       int     `json:"cores"`
 	MemoryBytes int64   `json:"memory_bytes"`
 	Running     int     `json:"running"`
 	IdleSeconds float64 `json:"idle_seconds"`

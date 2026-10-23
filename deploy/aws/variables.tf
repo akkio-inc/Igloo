@@ -382,7 +382,7 @@ variable "duckdb_memory_limit" {
 }
 
 variable "duckdb_threads" {
-  description = "DuckDB worker threads per pod. Null uses one per CPU core on the node."
+  description = "DuckDB worker threads per pod. Null uses two per CPU core on the node."
   type        = number
   default     = null
 

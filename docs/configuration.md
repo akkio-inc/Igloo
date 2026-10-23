@@ -190,7 +190,7 @@ Azure identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AZURE_SYSTEM_CREDENTIALS
 |---|---|---|
 | `IGLOO_DUCKDB_MEMORY_LIMIT` | 80% of memory | e.g. `8GB`. Larger queries spill to disk. |
 | `GOMEMLIMIT` | what DuckDB's limit leaves | Go's soft memory limit for the rest of Igloo, e.g. `4GiB`. By default, the container's memory limit (or the machine's memory) less `IGLOO_DUCKDB_MEMORY_LIMIT` and a twentieth in reserve (at least 256 MiB), but at least 256 MiB; see [sizing](operations.md#sizing). |
-| `IGLOO_DUCKDB_THREADS` | one per core | |
+| `IGLOO_DUCKDB_THREADS` | two per core, four on workers | DuckDB's threads. With the warehouse in object storage, two per core on the server and four on [workers](distributed-execution.md); without one, one per core. Reading object storage cold waits on requests more than on cores: on 8 cores, a cold scan read 64 MB/s on 8 threads, 100 MB/s on 16 and 172 MB/s on 32. The cores are those the container's CPU limit allows, or the machine's. |
 | `IGLOO_DUCKDB_TEMP_DIR` | `/var/lib/igloo/tmp` in the image | Spill directory. Give it fast local disk, local NVMe where there is one ([spill on local NVMe](operations.md#spill-on-local-nvme)), and each Igloo process its own ([spill directory](operations.md#spill-directory)). |
 | `IGLOO_DUCKDB_MAX_TEMP_SIZE` | 90% of the spill disk's free space | Cap on spill files, e.g. `40GiB`. Queries that need more fail. |
 | `IGLOO_DUCKDB_EXTENSION_DIR` | set in the image | Pre-installed DuckDB extensions |

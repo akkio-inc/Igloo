@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -56,14 +57,14 @@ func ParseMode(s string) (Mode, bool) {
 // When a statement is worth distributing. Igloo estimates how long the
 // statement would take on the coordinator from the size of the table it
 // would divide: DuckDB scans, filters and aggregates compressed Parquet
-// from object storage at roughly 64 MiB/s per thread or better. Running
+// from object storage at roughly 64 MiB/s per core or better. Running
 // workers are used for statements of a few seconds; workers are started
 // only for statements of a minute or more, since a start takes a while and
 // started workers run until they have been idle for a while.
 const (
-	scanRatePerThread = 64 << 20
-	warmSeconds       = 4
-	coldSeconds       = 60
+	scanRatePerCore = 64 << 20
+	warmSeconds     = 4
+	coldSeconds     = 60
 	// bytesPerWorker is how much of the divided table each worker should
 	// get at least; smaller statements use fewer workers.
 	bytesPerWorker = 1 << 30
@@ -86,9 +87,10 @@ type Options struct {
 	// Warehouse is the warehouse root, with a trailing slash. Partitioned
 	// joins exchange rows under it.
 	Warehouse string
-	// Threads are the coordinator's DuckDB threads, for estimating how
-	// long a statement would take on it.
-	Threads int
+	// Cores are the coordinator's cores, for estimating how long a
+	// statement would take on it; zero means those Go may use
+	// (runtime.GOMAXPROCS).
+	Cores   int
 	Metrics *Metrics
 	// MaxSpoolBytes bounds what a statement's partial results may take on
 	// the coordinator's disk; past it, the statement runs on the
@@ -135,8 +137,8 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 	if len(opts.Pool.Addresses) == 0 {
 		return nil, errors.New("no worker addresses")
 	}
-	if opts.Threads <= 0 {
-		opts.Threads = 1
+	if opts.Cores <= 0 {
+		opts.Cores = runtime.GOMAXPROCS(0)
 	}
 	p, err := newParser()
 	if err != nil {
@@ -226,7 +228,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	opts := planOptions{force: mode == ModeOn || mode == ModeOnRunning, now: time.Now(), maxBroadcast: defaultBroadcast}
 	ws := co.pool.known(ctx)
-	rate := int64(co.opts.Threads) * scanRatePerThread
+	rate := int64(co.opts.Cores) * scanRatePerCore
 	switch {
 	case mode == ModeOnRunning && len(ws) == 0:
 		return nil, unsupported("no workers are running, and only admins may start them at will")
@@ -265,7 +267,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
 	plan.Key = planKey(stmt, plan.Stages)
-	e := estimateTimes(plan.Stages, co.opts.Threads, co.opts.MemoryBytes, co.fleet(ws, plan.mayStart))
+	e := estimateTimes(plan.Stages, co.opts.Cores, co.opts.MemoryBytes, co.fleet(ws, plan.mayStart))
 	plan.workers = e.workers
 	if mode != ModeAuto {
 		return plan, nil
@@ -292,10 +294,10 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 // fleet describes the workers for an estimate: ws, those that answer, and
 // as many more as Compute may start if mayStart.
 func (co *Coordinator) fleet(ws []*worker, mayStart bool) fleet {
-	f := fleet{threads: co.opts.Threads, running: len(ws), most: len(ws)}
+	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws)}
 	for i, w := range ws {
-		if i == 0 || w.status.Threads > f.threads {
-			f.threads = w.status.Threads
+		if i == 0 || w.status.Cores > f.cores {
+			f.cores = w.status.Cores
 		}
 	}
 	if mayStart && co.pool.canStart() {

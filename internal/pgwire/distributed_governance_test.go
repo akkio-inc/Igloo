@@ -186,7 +186,7 @@ func TestDistributedConnections(t *testing.T) {
 		addrs = append(addrs, addr)
 	}
 	co, err := distributed.NewCoordinator(distributed.Options{
-		Source: source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Threads: 1,
+		Source: source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1,
 		Pool: distributed.PoolOptions{Addresses: addrs},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

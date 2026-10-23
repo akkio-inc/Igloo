@@ -266,7 +266,8 @@ using all of its cores.
   with room for your largest sorts and joins, and give each Igloo process its
   own ([spill directory](#spill-directory)).
 - **CPU.** DuckDB parallelizes each query across `IGLOO_DUCKDB_THREADS`
-  threads (default: one per core).
+  threads (default: two per core, four on workers, since reading object
+  storage waits on requests more than on cores).
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
   disk. Size the disk so your frequently read tables fit in half of its free
   space, or set `IGLOO_CACHE_SIZE`.

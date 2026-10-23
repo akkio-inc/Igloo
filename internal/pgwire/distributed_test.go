@@ -197,7 +197,7 @@ func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, *
 	setup.Close()
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: workerEngine{c, gate}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
-		Locations: []string{dir}, Threads: 1, MemoryBytes: 1 << 30,
+		Locations: []string{dir}, Cores: 1, MemoryBytes: 1 << 30,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 	// DuckDB may read.
 	spill := filepath.Join(t.TempDir(), "spill")
 	co, err := distributed.NewCoordinator(distributed.Options{
-		Source: ds.source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Threads: 1,
+		Source: ds.source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1,
 		Pool: distributed.PoolOptions{Addresses: addrs},
 		// Exchanges between stages go under the warehouse, which here is dir.
 		Warehouse: dir + "/",

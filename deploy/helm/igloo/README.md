@@ -394,7 +394,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `storage.gcs.existingSecret` | `""` | Keys `hmac-key-id`, `hmac-secret` for `IGLOO_GCS_HMAC_*`; required for `gs://` |
 | `storage.azure.existingSecret` | `""` | Key `account-key` for `IGLOO_AZURE_ACCOUNT_KEY`. Empty: workload identity. |
 | `duckdb.memoryLimit` | `""` | `IGLOO_DUCKDB_MEMORY_LIMIT`, e.g. `6GB`. Empty: 80% of `resources.limits.memory`, leaving at least 512Mi. |
-| `duckdb.threads` | `null` | `IGLOO_DUCKDB_THREADS`; null: one per core |
+| `duckdb.threads` | `null` | `IGLOO_DUCKDB_THREADS`; null: two per core |
 | `duckdb.maxTempSize` | `""` | `IGLOO_DUCKDB_MAX_TEMP_SIZE`; empty: 90% of `duckdb.spillVolume.sizeLimit`, so an oversized query fails instead of the pod being evicted |
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |
 | `duckdb.spillVolume.medium` | `""` | `""` (node disk, kubelet's directory; see **Spill disk** above) or `Memory` |
@@ -460,7 +460,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `workers.idleAfter` | `10m` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks |
 | `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |
 | `workers.existingSecret` | `""` | Secret with key `secret` (32+ characters) for `IGLOO_WORKER_SECRET`; generated and kept when empty |
-| `workers.duckdb.memoryLimit`, `threads` | `""`, `null` | As `duckdb.*`, from `workers.resources` |
+| `workers.duckdb.memoryLimit`, `threads` | `""`, `null` | As `duckdb.*`, from `workers.resources`; null threads: four per core |
 | `workers.duckdb.spillVolume.sizeLimit` / `medium` | `100Gi` / `""` | Workers' spill `emptyDir`; `IGLOO_DUCKDB_MAX_TEMP_SIZE` is 90% of it |
 | `workers.cacheVolume.sizeLimit` | `50Gi` | Workers' read cache `emptyDir`; the cache may use 90% of it |
 | `workers.resources` | requests `4` CPU / `16Gi`, limit `16Gi` | Worker container |

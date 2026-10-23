@@ -340,8 +340,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   take 37 to 176 s. Each replica remembers what statements took each way,
   by `query_history.plan_key` (the text without literals and the tables'
   sizes), and runs a statement run again where it was faster.
-- Workers run as many tasks at once as their threads and memory allow (a
-  task per 4 threads and 8 GiB), and exchanges have more partitions as the
+- Workers run as many tasks at once as their cores and memory allow (a
+  task per 4 cores and 8 GiB), and exchanges have more partitions as the
   divided tables grow, so the stages of a report that run side by side no
   longer spill or run out of memory on workers that one machine's memory
   would have held.
@@ -815,6 +815,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- DuckDB runs two threads per core on the server and four on workers when
+  the warehouse is in object storage and `IGLOO_DUCKDB_THREADS` is unset,
+  instead of one. Reading object storage cold waits on requests, not on
+  cores: on 8 cores, a cold scan of 23 GB read 64 MB/s on 8 threads and
+  172 MB/s on 32, and a report that took 66 s cold took 33 s on 16 threads
+  (12 s warm either way). Auto mode's estimates of distributed execution
+  count cores rather than threads.
 - Tables can be clustered. `ALTER TABLE ... SET SORTED BY (a, b)` (and
   Snowflake's `CLUSTER BY`, `ALTER TABLE ... CLUSTER BY`, `DROP CLUSTERING
   KEY`) sets a table's default Iceberg sort order, which `igloo.tables`,

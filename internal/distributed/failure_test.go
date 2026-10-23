@@ -111,18 +111,18 @@ func TestWorkerShedsMemory(t *testing.T) {
 	}
 }
 
-// A worker runs as many tasks at once as its threads and memory allow
+// A worker runs as many tasks at once as its cores and memory allow
 // (taskSlots), one for the harness's, and the others wait: two stages that
 // scan lineitem side by side, then a join's stage of a task per partition,
 // run one task at a time, and the statement returns what one machine does.
 func TestWorkerTaskSlots(t *testing.T) {
 	for _, c := range []struct {
-		threads int
-		memory  int64
-		want    int
+		cores  int
+		memory int64
+		want   int
 	}{{2, 4 << 30, 1}, {8, 25 << 30, 2}, {16, 49 << 30, 4}, {64, 16 << 30, 2}, {8, 0, 2}} {
-		if got := taskSlots(c.threads, c.memory); got != c.want {
-			t.Errorf("taskSlots(%d, %d) = %d, want %d", c.threads, c.memory, got, c.want)
+		if got := taskSlots(c.cores, c.memory); got != c.want {
+			t.Errorf("taskSlots(%d, %d) = %d, want %d", c.cores, c.memory, got, c.want)
 		}
 	}
 	h := newHarness(t, 0.01, 3, 1)
@@ -426,7 +426,7 @@ func TestForcedByNonAdmins(t *testing.T) {
 	}
 	co, err := NewCoordinator(Options{
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
-		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Threads: 2,
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2,
 		Pool: PoolOptions{Addresses: addrs, Compute: compute, MaxWorkers: 8, StartTimeout: time.Second},
 	}, h.log)
 	if err != nil {

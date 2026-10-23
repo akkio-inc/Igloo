@@ -17,16 +17,18 @@ import (
 // estimates both times from what the statement's parts read, and corrects
 // the estimates with what the same statement took before (see history).
 //
-// The rates are rough, from the first scale runs: the coordinator scans
-// its warm cache at about 150 MB/s a thread; a worker reads object storage
-// cold at about 50 MB/s a thread; and each level of stages, a round of
-// tasks that waits for the round before it, costs about 4 s of writing and
-// reading object storage and of waiting for its slowest task. At 1x on
-// four workers, reports that took 6 to 56 s on one machine took 37 to
-// 176 s on workers.
+// The rates are rough, from the first scale runs, and per core, since
+// DuckDB runs several threads a core on object storage: the coordinator
+// scans its warm cache at about 150 MB/s a core; a worker reads object
+// storage cold at about 16 MB/s a core, at four threads a core (a machine
+// of 8 cores read 131 MB/s through the read cache on 32 threads); and each
+// level of stages, a round of tasks that waits for the round before it,
+// costs about 4 s of writing and reading object storage and of waiting for
+// its slowest task. At 1x on four workers, reports that took 6 to 56 s on
+// one machine took 37 to 176 s on workers.
 const (
 	localRate = 150e6
-	coldRate  = 50e6
+	coldRate  = 16e6
 	levelCost = 4.0
 	// DefaultThreshold is how long a statement must take on one machine,
 	// by its estimate or its last run there, before auto mode runs it on
@@ -65,15 +67,15 @@ type estimate struct {
 
 // fleet is what the coordinator knows of its workers for an estimate.
 type fleet struct {
-	// threads is a worker's threads; running how many workers run; most
-	// how many may run; start how long starting more takes.
-	threads, running, most int
-	start                  time.Duration
+	// cores are a worker's cores; running how many workers run; most how
+	// many may run; start how long starting more takes.
+	cores, running, most int
+	start                time.Duration
 }
 
-// estimateTimes estimates a plan's times on a coordinator of threads
-// threads and memory bytes of memory, and on workers.
-func estimateTimes(stages []*Stage, threads int, memory int64, f fleet) estimate {
+// estimateTimes estimates a plan's times on a coordinator of cores cores
+// and memory bytes of memory, and on workers.
+func estimateTimes(stages []*Stage, cores int, memory int64, f fleet) estimate {
 	var e estimate
 	read, exchanged := map[string]int64{}, map[string]int64{}
 	for _, s := range stages {
@@ -94,14 +96,14 @@ func estimateTimes(stages []*Stage, threads int, memory int64, f fleet) estimate
 		e.exchanged += b
 	}
 	e.levels = levels(stages)
-	e.oneMachine = float64(e.bytes) / (float64(max(threads, 1)) * localRate)
+	e.oneMachine = float64(e.bytes) / (float64(max(cores, 1)) * localRate)
 	e.memory = memory > 0 && float64(workingSetFactor*e.exchanged) > memoryShare*float64(memory)
 	// The fewest workers within a fifth of the fastest time.
 	e.onWorkers = math.Inf(1)
 	times := make([]float64, f.most+1)
 	best := math.Inf(1)
 	for n := 1; n <= f.most; n++ {
-		t := float64(e.levels)*levelCost + float64(e.bytes)/(float64(n*max(f.threads, 1))*coldRate)
+		t := float64(e.levels)*levelCost + float64(e.bytes)/(float64(n*max(f.cores, 1))*coldRate)
 		if n > f.running {
 			t += f.start.Seconds()
 		}

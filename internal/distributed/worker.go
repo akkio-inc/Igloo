@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,12 +61,14 @@ type WorkerOptions struct {
 	// Locations are the prefixes data files may have: the warehouse and
 	// the allowed locations.
 	Locations []string
-	// Threads and MemoryBytes are reported to coordinators, which size the
-	// tables every worker reads in full by the smallest worker.
-	Threads     int
+	// Cores and MemoryBytes are reported to coordinators, which estimate
+	// how long workers take from their cores and size the tables every
+	// worker reads in full by the smallest worker's memory. Zero cores
+	// means those Go may use (runtime.GOMAXPROCS).
+	Cores       int
 	MemoryBytes int64
 	// Tasks is how many tasks run at once; others wait. Zero means as many
-	// as Threads and MemoryBytes allow (taskSlots).
+	// as Cores and MemoryBytes allow (taskSlots).
 	Tasks   int
 	Metrics *WorkerMetrics
 }
@@ -107,6 +110,9 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	if opts.ID == "" {
 		opts.ID, _ = os.Hostname()
 	}
+	if opts.Cores <= 0 {
+		opts.Cores = runtime.GOMAXPROCS(0)
+	}
 	dir := filepath.Join(opts.TempDir, "igloo-worker")
 	// Results of tasks that were running when the worker stopped.
 	_ = os.RemoveAll(dir)
@@ -115,7 +121,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	}
 	opts.TempDir = dir
 	w := &Worker{opts: opts, transport: t, log: log.With("component", "worker"), activity: activity.New(),
-		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Threads, opts.MemoryBytes)))}
+		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes)))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
@@ -145,7 +151,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
-		ID: w.opts.ID, Version: w.opts.Version, Threads: w.opts.Threads, MemoryBytes: w.opts.MemoryBytes,
+		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 	})
 }
@@ -159,10 +165,11 @@ const maxTaskRequest = 256 << 20
 // a task per partition on every worker. Three workers of 500 MB running a
 // cohort report each spilled 1.9 GB with every task at once, and 0.9 GB
 // one at a time; with four times the partitions, all at once ran out of
-// memory and one at a time spilled nothing. A task gets at least 4 threads
-// and 8 GiB of the memory limit, and waits for them.
-func taskSlots(threads int, memory int64) int {
-	n := max(1, threads/4)
+// memory and one at a time spilled nothing. A task gets at least 4 cores
+// and 8 GiB of the memory limit, and waits for them. Cores, not threads:
+// a worker reading object storage runs several threads a core.
+func taskSlots(cores int, memory int64) int {
+	n := max(1, cores/4)
 	if memory > 0 {
 		n = min(n, max(1, int(memory/(8<<30))))
 	}

@@ -64,7 +64,7 @@ func serveWorker() error {
 	locations := append([]string{cfg.Storage.Root()}, cfg.Storage.AllowedLocations...)
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: eng, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
-		Locations: locations, Threads: threads, MemoryBytes: memory, Metrics: distributed.NewWorkerMetrics(reg),
+		Locations: locations, MemoryBytes: memory, Metrics: distributed.NewWorkerMetrics(reg),
 	}, log)
 	if err != nil {
 		return err
@@ -139,13 +139,9 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	if err != nil {
 		return nil, err
 	}
-	threads, err := eng.Threads(ctx)
-	if err != nil {
-		return nil, err
-	}
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: source, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
-		Warehouse: cfg.Storage.Root(), Threads: threads, Metrics: distributed.NewMetrics(reg),
+		Warehouse: cfg.Storage.Root(), Metrics: distributed.NewMetrics(reg),
 		MemoryBytes: eng.MemoryLimit(ctx), Threshold: cfg.Workers.Threshold,
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,

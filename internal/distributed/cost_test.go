@@ -47,7 +47,7 @@ func TestChoose(t *testing.T) {
 }
 
 // TestEstimateTimes checks the estimates of a plan: one machine's from
-// the coordinator's threads, the workers' from theirs, the rounds of tasks
+// the coordinator's cores, the workers' from theirs, the rounds of tasks
 // and starting workers, and the fewest workers within a fifth of the
 // fastest.
 func TestEstimateTimes(t *testing.T) {
@@ -59,16 +59,16 @@ func TestEstimateTimes(t *testing.T) {
 		{Inputs: []Input{{Exchange: x, Partitioned: true}, {Table: small}}, Out: y},
 		{Inputs: []Input{{Exchange: y, Partitioned: true}}},
 	}
-	e := estimateTimes(stages, 16, 50e9, fleet{threads: 8, running: 2, most: 16, start: 30 * time.Second})
+	e := estimateTimes(stages, 16, 50e9, fleet{cores: 8, running: 2, most: 16, start: 30 * time.Second})
 	if e.levels != 3 || e.bytes != 300e9+1e6 || e.exchanged != 300e9+1e6 || !e.memory {
 		t.Errorf("levels %d, bytes %d, exchanged %d, memory %v", e.levels, e.bytes, e.exchanged, e.memory)
 	}
 	if want := (300e9 + 1e6) / (16 * localRate); e.oneMachine != want {
 		t.Errorf("one machine: %.1f s, want %.1f", e.oneMachine, want)
 	}
-	// 16 workers: 12 + 300e9/(16*8*50e6) + 30 = 89 s, starting more than
-	// the 2 running; the fewest within a fifth of that: 12, at 104.5 s.
-	if e.workers != 12 || e.onWorkers > 89*1.2 {
+	// 16 workers: 12 + 300e9/(16*8*16e6) + 30 = 188.5 s, starting more
+	// than the 2 running; the fewest within a fifth of that: 13, at 222.3 s.
+	if e.workers != 13 || e.onWorkers > 188.5*1.2 {
 		t.Errorf("%d workers, %.1f s", e.workers, e.onWorkers)
 	}
 	if e := estimateTimes(stages, 16, 0, fleet{}); e.workers != 0 || e.memory {
@@ -158,8 +158,8 @@ func TestAutoMode(t *testing.T) {
 	ex.Close()
 
 	// Workers estimated faster: a table of a terabyte, a coordinator of
-	// one thread.
-	h.co.opts.Threads = 1
+	// one core.
+	h.co.opts.Cores = 1
 	li.Bytes = 1 << 40
 	if _, err := h.co.Plan(t.Context(), join, harnessEnv{h}, ModeAuto); err != nil {
 		t.Fatalf("estimated faster on workers: %v", err)

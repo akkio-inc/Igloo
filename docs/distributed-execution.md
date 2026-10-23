@@ -199,11 +199,11 @@ only for statements that take a while: at 1x, the audience reports that
 took 6 to 56 seconds on one replica took 37 to 176 seconds on four workers.
 
 So Igloo considers a statement for workers only when its largest table is
-more than the replica scans in about four seconds (4 GiB for a 16-thread
+more than the replica scans in about four seconds (4 GiB for a 16-core
 replica; workers that are stopped are started only for a minute's worth).
 For such a statement it estimates two times: the replica's, at 150 MB/s per
-thread over the tables the statement reads, and the workers', at 50 MB/s per
-worker thread from object storage plus about 4 seconds for each round of
+core over the tables the statement reads, and the workers', at 16 MB/s per
+worker core from object storage plus about 4 seconds for each round of
 tasks that waits for the one before it, plus the time to start workers that
 are stopped. It runs the statement on workers only if the replica would
 take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or would run short of

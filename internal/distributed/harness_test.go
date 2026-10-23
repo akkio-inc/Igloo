@@ -280,7 +280,7 @@ func (h *harness) startWorkers(n int) {
 	}
 	co, err := NewCoordinator(Options{
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator"),
-		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Threads: 2, Pool: PoolOptions{Addresses: addrs},
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: addrs},
 	}, h.log)
 	if err != nil {
 		h.t.Fatal(err)
@@ -318,7 +318,7 @@ func (h *harness) startWorker(i int) {
 	h.t.Cleanup(func() { c.Close() })
 	w, err := NewWorker(WorkerOptions{
 		Engine: connector{c}, Secret: testSecret, Version: "test", ID: fmt.Sprintf("worker-%d", i), TempDir: tmp,
-		Locations: []string{filepath.Join(h.dir, "warehouse")}, Threads: 2, MemoryBytes: 4 << 30,
+		Locations: []string{filepath.Join(h.dir, "warehouse")}, Cores: 8, MemoryBytes: 4 << 30,
 	}, h.log)
 	if err != nil {
 		h.t.Fatal(err)

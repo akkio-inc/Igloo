@@ -190,7 +190,7 @@ explicit transactions, the coordinator plans it:
    every worker to read (an eighth of the smallest worker's memory, in
    compressed bytes).
 3. **Decide.** A part is a candidate when the split table is more than the
-   coordinator scans in about four seconds (64 MiB/s per thread), or a
+   coordinator scans in about four seconds (64 MiB/s per core), or a
    minute plus the expected start time when no worker is running. A part
    without aggregates is a candidate only when it keeps few rows
    (`DISTINCT`, or `ORDER BY ... LIMIT` up to a million rows); a plain
@@ -198,8 +198,8 @@ explicit transactions, the coordinator plans it:
    disk. A statement with candidates then runs on workers, in auto mode,
    only when that should be faster than the coordinator alone
    (`internal/distributed/cost.go`). Its time on the coordinator is
-   estimated at 150 MB/s per thread over the tables its stages read, and
-   on n workers at 50 MB/s per worker thread from object storage, plus 4 s
+   estimated at 150 MB/s per core over the tables its stages read, and
+   on n workers at 16 MB/s per worker core from object storage, plus 4 s
    for each level of stages (a round of tasks that waits for the one before
    it) and the start time of workers not running; it uses the fewest
    workers within a fifth of the fastest. It goes to workers if the
@@ -500,9 +500,11 @@ partitions. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
 results do. The coordinator runs each stage once every exchange it reads
 is complete, and deletes the statement's directory when it ends.
 
-A worker runs a task per 4 threads and 8 GiB of its memory limit at once
+A worker runs a task per 4 cores and 8 GiB of its memory limit at once
 (at least one), and the others wait. DuckDB runs each task on all of the
-worker's threads, so more at once add little speed and much memory, and
+worker's threads (four a core on object storage, see
+[configuration](../configuration.md#query-engine)), so more at once add
+little speed and much memory, and
 the stages of a report that run side by side, each with a task per
 partition on every worker, otherwise spill or run out of memory: three
 2-thread workers of 500 MB running a cohort report spilled 1.9 GB each

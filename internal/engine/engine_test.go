@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -234,6 +235,26 @@ func TestSettingStatements(t *testing.T) {
 	for _, want := range []string{"SET memory_limit = '6GB'", "SET max_temp_directory_size = '45GiB'", "SET threads = 4"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
+		}
+	}
+}
+
+// TestWithThreads checks DuckDB's threads: several a core when the
+// warehouse is in object storage, unless IGLOO_DUCKDB_THREADS says
+// otherwise, and DuckDB's own default without a warehouse.
+func TestWithThreads(t *testing.T) {
+	s3 := config.Storage{Type: config.StorageS3}
+	cores := runtime.GOMAXPROCS(0)
+	for _, c := range []struct {
+		cfg  config.Config
+		want int
+	}{
+		{config.Config{Storage: s3}, 4 * cores},
+		{config.Config{Storage: s3, DuckDB: config.DuckDB{Threads: 3}}, 3},
+		{config.Config{}, 0},
+	} {
+		if got := withThreads(c.cfg, 4).Threads; got != c.want {
+			t.Errorf("%+v: %d threads, want %d", c.cfg.Storage, got, c.want)
 		}
 	}
 }
