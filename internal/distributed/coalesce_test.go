@@ -154,16 +154,16 @@ func TestWriterPartitions(t *testing.T) {
 		}
 		return ws
 	}
-	if most := writerPartitions(stagesOf(narrow), workers(16, 24_500<<20, 3)); most < maxPartitions {
+	if most := writerPartitions(stagesOf(narrow), workers(16, 24_500<<20, 3), uploadBuffer); most < maxPartitions {
 		t.Errorf("narrow rows on 24.5 GiB workers: at most %d partitions", most)
 	}
-	if most := writerPartitions(stagesOf(wide), workers(1, 3e9, 1)); most != 28 {
+	if most := writerPartitions(stagesOf(wide), workers(1, 3e9, 1), 0); most != 28 {
 		t.Errorf("400 strings on a 3 GB worker: at most %d partitions, want 28", most)
 	}
-	if n := exchangePartitions(stagesOf(wide), workers(1, 3e9, 1), 1); n != 28 {
+	if n := exchangePartitions(stagesOf(wide), workers(1, 3e9, 1), 1, 0); n != 28 {
 		t.Errorf("400 strings: %d partitions", n)
 	}
-	if n := exchangePartitions(stagesOf(wide), workers(16, 3e9, 1), 16); n < 16 {
+	if n := exchangePartitions(stagesOf(wide), workers(16, 3e9, 1), 16, 0); n < 16 {
 		t.Errorf("%d partitions for 16 workers", n)
 	}
 	cols := []Column{{Type: "BIGINT"}, {Type: "VARCHAR"}}
@@ -186,12 +186,20 @@ func TestWriterPartitions(t *testing.T) {
 type stageTasks struct {
 	mu    sync.Mutex
 	tasks map[string]int64
+	// seq are the stages in the order they started, and "measured" where
+	// relations of uncertain size were measured.
+	seq []string
 }
 
 func (s *stageTasks) Enabled(context.Context, slog.Level) bool { return true }
 func (s *stageTasks) WithAttrs([]slog.Attr) slog.Handler       { return s }
 func (s *stageTasks) WithGroup(string) slog.Handler            { return s }
 func (s *stageTasks) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "measured relations of uncertain size" {
+		s.mu.Lock()
+		s.seq = append(s.seq, "measured")
+		s.mu.Unlock()
+	}
 	if r.Message != "running a stage" {
 		return nil
 	}
@@ -208,6 +216,7 @@ func (s *stageTasks) Handle(_ context.Context, r slog.Record) error {
 	})
 	s.mu.Lock()
 	s.tasks[stage] = tasks
+	s.seq = append(s.seq, stage)
 	s.mu.Unlock()
 	return nil
 }
@@ -260,5 +269,59 @@ func TestCoalescedPartitions(t *testing.T) {
 	}
 	if !strings.Contains(p.describe(), "partitions of exchange") {
 		t.Errorf("nothing read by partition:\n%s", p.describe())
+	}
+}
+
+// TestUploadBuffers checks that writers to object storage leave room for
+// each file's upload buffer: DuckDB's default parts of 76.5 MiB took 18
+// GiB a task over 243 partitions; at uploadBuffer, a small worker's
+// writers get fewer partitions, and those on local disk as many as before.
+func TestUploadBuffers(t *testing.T) {
+	for dir, want := range map[string]bool{"s3://b/w/_igloo_shuffle/q": true, "gs://b/w/": true, "/var/lib/igloo/w/": false, "az://c/w/": false} {
+		if uploadsInParts(dir) != want {
+			t.Errorf("%s: uploads in parts %v", dir, !want)
+		}
+	}
+	stages := []*Stage{{ID: 0, Inputs: []Input{{View: "t", Table: &Table{Name: "t", Rows: 4e9,
+		Columns: []Column{{Name: "id", Type: "VARCHAR"}}}, Split: true}}, Out: &Exchange{ID: 0}}}
+	small := []*worker{{status: workerStatus{MemoryBytes: 2e9, Slots: 1, Cores: 4}}}
+	local, remote := writerPartitions(stages, small, 0), writerPartitions(stages, small, uploadBytes("s3://b/w/"))
+	if remote >= local || int64(remote)*uploadBuffer > taskMemory(small)/2 {
+		t.Errorf("a 2 GB worker writes %d partitions to object storage, %d to disk", remote, local)
+	}
+	big := []*worker{{status: workerStatus{MemoryBytes: 26_400_000_000, Slots: 2, Cores: 8}}}
+	if n := writerPartitions(stages, big, uploadBuffer); n < maxPartitions {
+		t.Errorf("a 24.6 GiB worker writes at most %d partitions to object storage", n)
+	}
+}
+
+// TestPatternPartitions checks a report's shape at ten times the data, on
+// 16 workers of 24.6 GiB: people's attributes joined to their segments,
+// 8.3 billion rows of which LIKE 'SEG_HH_%' keeps 400 million. Taken
+// whole, the segments called for 243 partitions, whose writers took a
+// third longer than at the 128 the workers need; at a fifth, 128.
+func TestPatternPartitions(t *testing.T) {
+	ids := []Column{{Name: "PERSON_ID", Type: "VARCHAR"}}
+	segments := &Table{Name: "PERSON_SEGMENTS", Rows: 8_330_000_000, Bytes: 60e9,
+		Columns: append([]Column{{Name: "SEGMENT_NAME", Type: "VARCHAR"}}, ids...)}
+	attributes := &Table{Name: "PERSON_ATTRIBUTES", Rows: 400e6, Bytes: 15e9, Columns: ids}
+	like := node{"where_clause": node{"class": "FUNCTION", "function_name": "~~", "children": []any{
+		node{"class": "COLUMN_REF", "column_names": []any{"S", "SEGMENT_NAME"}}, node{"class": "CONSTANT"}}}}
+	x, y := &Exchange{ID: 0}, &Exchange{ID: 1}
+	stages := []*Stage{
+		{ID: 0, Inputs: []Input{{View: "g", Table: attributes, Split: true}}, Out: x},
+		{ID: 1, Inputs: []Input{{View: "s", Table: segments, Split: true}}, Out: y, fragment: like},
+		{ID: 2, Inputs: []Input{{View: "g", Exchange: x, Partitioned: true}, {View: "s", Exchange: y, Partitioned: true}}},
+	}
+	var ws []*worker
+	for range 16 {
+		ws = append(ws, &worker{status: workerStatus{MemoryBytes: 26_400_000_000, Cores: 8}})
+	}
+	if n := exchangePartitions(stages, ws, len(ws), uploadBuffer); n != 128 {
+		t.Errorf("%d partitions, want 128", n)
+	}
+	stages[1].fragment = nil
+	if n := exchangePartitions(stages, ws, len(ws), uploadBuffer); n != 243 {
+		t.Errorf("unfiltered: %d partitions, want 243", n)
 	}
 }

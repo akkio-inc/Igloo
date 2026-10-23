@@ -520,17 +520,29 @@ table the statement divides if that is more, up to eight times the
 workers (and 256), so that a task's hash tables (the distinct people of a
 share of the cohorts) fit a worker's memory; and more, up to 256, when the
 exchanges' rows as estimated (`partitionsFor`: the tables' rows, a
-hundredth where a filter compares a column to a constant, at the memory a
-row of the columns read takes in a hash table) need them to fit half a
-task's share of a worker's memory. A task writes one file per
+hundredth where a filter compares a column to a constant and a fifth where
+`LIKE`, `ILIKE` or `GLOB` matches one against a constant pattern, at the
+memory a row of the columns read takes in a hash table) need them to fit
+half a task's share of a worker's memory. (Counted whole, the 8.3 billion
+segment rows of which a report's `LIKE 'SEG_HH_%'` kept 400 million
+called for 243 partitions at ten times the data, where 128 did; their
+writers took a third longer.) A task writes one file per
 partition: DuckDB keeps only 100 of a partitioned `COPY`'s files open and
 starts new ones past that, which at 256 partitions made a task write
 17,275 files of 24 KB for 23 minutes, so workers raise that limit; the
 coordinator warns of an exchange with more files than its tasks times its
-partitions. The writer also holds a row group of every partition's rows,
-as they are, until it fills: 128 partitions of rows of 264 bytes held 3 GB
-in DuckDB's row groups of 122,880 rows, and at a hundred times the data
-took workers of 24.6 GiB out of memory. So a task's row groups have as
+partitions. DuckDB writes each file to object storage as a multipart
+upload, holding a buffer of a part per open file, and sizes parts for the
+largest file it allows over 10,000 parts: 76.5 MiB at its default of 800
+GB. At 243 partitions a task held 18 GiB of buffers for files of a few
+megabytes, and workers of 24.6 GiB running two tasks ran out of memory,
+again in smaller tasks, where at 128 they had fit. So shuffle tasks allow
+files of 50 GB, the least DuckDB takes, in parts of 5.25 MiB: in a lab of
+two tasks of 25 million IDs each against a 12 GB limit, 128 and 243
+partitions ran out of memory at the default and peaked at 2.2 and 4.7 GiB
+so, on 32 threads or 12. The writer also holds a row group of every
+partition's rows, as they are, until it fills: 128 partitions of rows of
+264 bytes held 3 GB in DuckDB's row groups of 122,880 rows. So a task's row groups have as
 many rows as keep those of all partitions within a quarter of its share of
 the worker's memory, at the width of the rows' types (8,192 rows held 0.4
 GB, and took no longer to write), between 2,048 and 122,880. Each of the
@@ -540,8 +552,9 @@ writers, 524,288 by default, which held every row of a task of rows of
 quarter, but no fewer than 16,384 rows each, as fewer took longer. And
 since even groups of 2,048 rows of 400 strings over 128 partitions took a
 3 GB writer out of memory, a statement's exchanges get no more partitions
-than leave room for groups that size at the width of its widest exchange
-(`writerPartitions`), and still one a worker: 28 for that worker, which
+than leave room for groups that size at the width of its widest exchange,
+and for the uploads' buffers in object storage (`writerPartitions`), and
+still one a worker: 28 for that worker, which
 wrote them in 76 s within 1.3 GB, where 32 and 64 partitions took 123 and
 194 s at its limit. Narrow exchanges, of IDs and flags, are not held back. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
 `TIME WITH TIME ZONE`) cross exchanges as text and are cast back, as
@@ -612,26 +625,45 @@ machine filters each table by the audience as it reads it
 The planner records such relations: those a stage reads by partition, with
 other large inputs partitioned to meet them, whose query or a common table
 expression it reads compares a column to a constant or to a subquery's
-value, with `=` or `IN`. A plan with any runs the stages that write them
-first (all the writers of each exchange they read, and no others), and is
-planned again with their sizes, each relation known by its query with the
-common table expressions it reads, as SQL. A relation whose bytes are
-within what every worker may read, and whose rows, at the memory a row
-takes in a hash table, fit half of a task's share of a worker's memory, is
+value, with `=` or `IN`. A plan with any is planned again with their sizes
+once the stages that write them are done, each relation known by its
+query with the common table expressions it reads, as SQL. A relation is
 read whole by the tasks that read the tables' shares, which are then not
-partitioned. The new plan runs in an execution of its own, which reads what
-the first stages wrote of each relation it reads whole, or partitioned
-alike. A plan that comes out the same goes on in the first execution, so
-that measuring costs only the wait for the relations' stages before the
-rest start, about the time the relation's stages take: on a cohort report
-that kept its relations partitioned, about half a second of 5 s with two
-tasks at a time (medians of 4.9 s and 5.45 s), none with one. The coordinator remembers how each relation
-came out, by key: one read by partition all the same is planned as such,
-without the wait, for a day, while the tables it reads stay within a factor
-of two of their size then, so that a report run again pays for measuring
-once a day; one read whole is measured every time, as its readers wait for
-it anyway. `EXPLAIN DISTRIBUTED` lists the relations, and the coordinator
-logs how each came out.
+partitioned, when its bytes are within what every worker may read, its
+rows at the memory a row takes in a hash table (`rowMemory`, or four
+times its compressed bytes a row if more) fit a quarter of what a task may
+plan on, and building its hash table in each task, about one a worker,
+goes through fewer rows than writing the rows of the table the stage
+divides to an exchange and reading them back. Every task that reads a
+relation whole builds that table beside its own work, and stages that read
+it run side by side: at ten times the data on 16 workers of 24.6 GiB, an
+audience of 45.9 million IDs (453 MB) read whole within half a task's
+share took a report from 84 s to 608 s and another from 22 s to 73 s, and a
+cohort of 10 million (316 MB) took two from 176 and 188 s to 260 and 253
+s, while 189,400 people read whole took another from 517 s to 161 s. (DuckDB 1.5.6
+built a join's hash table of 36-character IDs in 72 bytes a row, and
+peaked at 110 bytes a row in all; `rowMemory` counts 128.) The new plan
+runs in an execution of its own, which reads what the first wrote of each
+relation it reads whole, or partitioned alike.
+
+Meanwhile the first plan runs too, but for the stages that read the
+relations, which wait for the decision: a plan that comes out the same goes
+on in the first execution, without having waited, and one that changes
+cancels the first's stages under way, whose files go with the statement's
+exchanges, and whose workers do not count as the statement's. Waiting for
+the relations before starting the rest added the relations' 9 s to a
+report of 44 s, and 25 s to one of 125 s, at ten times the data, whose
+relations came out large. The coordinator remembers how each relation came
+out, by key, while the tables it reads stay within a factor of two of their
+size then: one read by partition all the same is planned as such, without
+measuring, for a day; one read whole is measured every time, but once it
+was, alone first, as at a hundred times the data an audience took 377 s
+beside the stages partitioning the tables to meet it. So a report run again
+pays nothing either way, and only a relation's first run of the day bets.
+A statement that runs out of memory on a worker after its relations were
+measured runs again in smaller tasks as planned with their sizes, without
+measuring them again. `EXPLAIN DISTRIBUTED` lists the relations, and the
+coordinator logs how each came out.
 
 ## Partitioned joins
 

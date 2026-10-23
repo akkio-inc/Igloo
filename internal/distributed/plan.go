@@ -215,6 +215,9 @@ type planOptions struct {
 	// check that a measured relation every task reads fits it.
 	sizes      map[string]knownSize
 	taskMemory int64
+	// workers are the workers the statement may run on, for weighing
+	// what every task reads whole.
+	workers int
 	// large are relations measured large lately, by key, with what they
 	// were estimated at then (see outcomes).
 	large map[string]outcome
@@ -1573,6 +1576,11 @@ func (pl *planner) table(parts []string) (*Table, error) {
 // large inputs by partition.
 func (pl *planner) chooseInputs(c *candidate) error {
 	pl.subqueryRelations(c)
+	for _, r := range c.rels {
+		if r.known && r.bytes <= pl.opts.maxBroadcast && !pl.wholeCheaper(r, c) {
+			r.bytes = pl.opts.maxBroadcast + 1
+		}
+	}
 	// Relations small enough for every worker to read, beside a larger
 	// table the workers divide, every task reads in full, as tables: their
 	// rows cross once per task, where partitioning would send the table's

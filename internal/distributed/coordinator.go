@@ -315,7 +315,7 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		opts.maxBroadcast = co.maxBroadcast
 	}
 	opts.aggregation = co.aggregation
-	opts.sizes, opts.taskMemory = sizes, taskMemory(ws)
+	opts.sizes, opts.taskMemory, opts.workers = sizes, taskMemory(ws), len(ws)
 	if sizes == nil {
 		// Relations measured large lately are planned as such at once.
 		opts.large = co.outcomes.large(time.Now())
@@ -501,7 +501,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			f()
 		}
 	}()
-	parts := exchangePartitions(plan.Stages, ws, len(ws))
+	parts := exchangePartitions(plan.Stages, ws, len(ws), uploadBytes(co.opts.Warehouse))
 	var run *execution
 	planned := plan
 	for attempt := 0; ; attempt++ {
@@ -527,7 +527,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			return r
 		}
 		var err error
-		ex.Probes = nil
+		if len(planned.uncertain) > 0 {
+			ex.Probes = nil
+		}
 		run, plan, err = co.runProbing(ctx, planned, newRun(aqid), newRun, func(stages []*Stage) error {
 			return co.loadMore(ctx, stages, snapshots, files)
 		}, &ex.Probes)
@@ -539,12 +541,17 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			// divided table halved, and half the memory to group
 			// partitions in (see groups).
 			next := min(2*parts, maxPartitions)
-			if most := writerPartitions(planned.Stages, ws); most > 0 {
+			if most := writerPartitions(planned.Stages, ws, uploadBytes(co.opts.Warehouse)); most > 0 {
 				next = min(next, max(most, len(ws), parts))
 			}
 			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",
 				"query", qid, "attempt", attempt+1, "partitions", next, "err", err)
 			parts = next
+			if len(plan.uncertain) == 0 {
+				// Its relations measured, the plan made with their sizes
+				// runs again, rather than measuring them again.
+				planned = plan
+			}
 			continue
 		}
 		switch {

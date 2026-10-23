@@ -249,18 +249,23 @@ larger than every worker may read, it would be partitioned, and so would
 every large table joined to it: 465 GB of tables for one report at a
 hundred times the data, in 925 s, where the replica filters each table by
 the audience as it reads it. So workers write and measure such a relation
-first, before they partition anything to meet it, and the statement is
-planned again with its size: a relation every task can hold (in bytes, and
-at the memory its rows take in a hash table, within half of a task's share
-of a worker's memory) is read whole beside each table's shares, and the
-tables are not partitioned at all; a larger one is read by partition as
-planned, from what was written of it. A relation that came out too large
-is planned as such, without measuring it first, for a day, while the
-tables it reads stay within a factor of two of their size then; one that
-came out small is measured each time, as the tasks that read it whole wait
-for it anyway. `EXPLAIN DISTRIBUTED` lists such relations as `uncertain
-size`, and the server logs how each came out (`measured relations of
-uncertain size`).
+before anything reads it, and the statement is planned again with its
+size: a relation whose hash table fits comfortably in every task (at the
+memory its rows take in one, within a quarter of what a task may plan
+on), and that costs less to build in every task than partitioning the
+table it meets, is read whole beside each table's shares, and the tables
+are not partitioned at all; a larger one is read by partition as planned,
+from what was written of it. At ten times the data, an audience of 45.9
+million IDs is partitioned and one of 189,400 people read whole. While
+the relation is measured the rest of the plan starts, but for what reads
+the relation, and what started is canceled if the plan changes, so a
+relation that comes out large costs no wait. A relation that came out too
+large is planned as such, without measuring it first, for a day, while
+the tables it reads stay within a factor of two of their size then; one
+that came out small is measured each time, first, with the workers to
+itself. `EXPLAIN DISTRIBUTED` lists such relations as `uncertain size`, and
+the server logs how each came out (`measured relations of uncertain
+size`).
 
 A statement that auto mode ran on the replica and that runs out of memory
 there (DuckDB's out-of-memory error, or the replica's memory watch

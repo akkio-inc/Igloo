@@ -317,11 +317,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   in full ran 32 tasks each, and read those tables 448 times. A statement
   whose exchanges' rows, as estimated, would not fit a task's memory over
   eight times the workers' partitions gets more, up to 256.
-  Workers writing an exchange keep its row groups small enough for one of
-  every partition to fit a quarter of a task's share of their memory: a
-  partitioned write holds a row group of each partition until it fills,
-  and 128 partitions of wide rows in groups of 122,880 took workers of 24.6
-  GiB out of memory at a hundred times the data. Their threads gather fewer
+  Workers writing an exchange to object storage upload its files in parts
+  of 5.25 MiB: DuckDB holds a part's buffer for every open file, 76.5 MiB
+  by default, and a task over 243 partitions held 18 GiB for files of a few
+  megabytes, so that workers of 24.6 GiB running two such tasks ran out of
+  memory at ten times the data, and again in smaller tasks. A filter that
+  matches a column against a constant pattern (`LIKE`, `ILIKE`, `GLOB`)
+  counts in the estimates exchanges' partitions are sized by, as a fifth of
+  the table's rows. Workers keep an exchange's row groups small enough for
+  one of every partition to fit a quarter of a task's share of their
+  memory: a partitioned write holds a row group of each partition until it
+  fills, and 128 partitions of 400 strings a row in groups of 122,880 took
+  a 3 GB worker out of memory. Their threads gather fewer
   rows before writing them when rows are wide, and a statement whose
   exchanges' rows are very wide (hundreds of columns) gets no more
   partitions than its writers have room for.
@@ -337,12 +344,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A relation of uncertain size, one filtered by a constant, a subquery's
   value or `IN`, as an audience is, is written and measured on workers
   before any table is partitioned to meet it, and the statement is planned
-  again with its size: small enough for every task to hold, it is read
-  whole beside the tables' shares, and the tables are not partitioned; a
-  larger one is read by partition as planned, from what was written of it.
-  An audience report partitioned 465 GB of tables to meet its audience at
-  a hundred times the data, in 925 s on 16 workers. A relation that came
-  out large is planned as large, without measuring it first, for a day.
+  again with its size: if its hash table fits a quarter of what a task may
+  plan on, and building it in every task costs less than partitioning the
+  table it meets, it is read whole beside the tables' shares, and the
+  tables are not partitioned; otherwise it is read by partition as
+  planned, from what was written of it. An audience report partitioned 465
+  GB of tables to meet its audience at a hundred times the data, in 925 s
+  on 16 workers. The rest of the plan runs while the relation is measured,
+  but for what reads it, and what started is canceled if the plan changes.
+  A relation that came out large is planned as large, without measuring it
+  first, for a day; one that came out small is measured first, with the
+  workers to itself, and read whole. A statement that runs out of memory on
+  a worker after measuring runs again with the sizes measured.
 - Auto mode's history counts runs on workers with runs on about as many
   workers: a statement measured on a quarter of the workers it would run on
   now, as in an earlier session on a smaller fleet, is tried on all of them

@@ -166,9 +166,11 @@ type relUse struct {
 	// semi is as for tables.
 	semi bool
 	// key identifies the relation across plans of the statement (see
-	// relationKey); known says its size was measured.
+	// relationKey); known says its size was measured, and rows are the
+	// rows it was measured at.
 	key   string
 	known bool
+	rows  int64
 	// out is the exchange its rows are written to, once planned.
 	out *Exchange
 }
@@ -534,7 +536,7 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 		return err
 	}
 	key := pl.relationKey(q, qscope)
-	bytes, known := pl.measured(key, bytes, cols)
+	bytes, rows, known := pl.measured(key, bytes, cols)
 	item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
 	if item.name == "" && def != nil {
 		item.name = def.key
@@ -545,7 +547,7 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 	renameColumns(item, list(ref, "column_name_alias"))
 	sc.items = append(sc.items, item)
 	rd.rels = append(rd.rels, &relUse{ref: ref, q: q, scope: qscope, def: def, columns: cols, bytes: bytes,
-		splittable: splittable, sc: sc, item: item, key: key, known: known})
+		splittable: splittable, sc: sc, item: item, key: key, known: known, rows: rows})
 	return nil
 }
 

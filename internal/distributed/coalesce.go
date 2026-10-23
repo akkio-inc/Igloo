@@ -169,7 +169,7 @@ func taskMemory(ws []*worker) int64 {
 // task's memory (partitionsFor), at a hundred times the data, but no more
 // than their writers have memory for with wide rows (writerPartitions),
 // and still one a worker.
-func exchangePartitions(stages []*Stage, ws []*worker, n int) int {
+func exchangePartitions(stages []*Stage, ws []*worker, n int, upload int64) int {
 	var split int64
 	for _, s := range stages {
 		if in := s.split(); in != nil {
@@ -177,7 +177,7 @@ func exchangePartitions(stages []*Stage, ws []*worker, n int) int {
 		}
 	}
 	parts := max(partitions(n, split, partitionBytes), min(partitionsFor(stages, taskMemory(ws)), maxPartitions))
-	if most := writerPartitions(stages, ws); most > 0 {
+	if most := writerPartitions(stages, ws, upload); most > 0 {
 		parts = min(parts, max(most, n))
 	}
 	return parts
@@ -214,11 +214,7 @@ func exchangeEstimates(stages []*Stage) (rows map[*Exchange]float64, width map[*
 		for _, i := range s.Inputs {
 			switch {
 			case i.Table != nil:
-				r := float64(max(i.Table.Rows, 0))
-				if filtersByConstant(s.fragment, i.Table) {
-					r *= filterSelectivity
-				}
-				in += r
+				in += rowsRead(s.fragment, i.Table)
 				cols := columnsRead(s.fragment, i.Table)
 				for _, c := range i.Table.Columns {
 					if cols == nil || cols[strings.ToLower(c.Name)] {
@@ -238,15 +234,74 @@ func exchangeEstimates(stages []*Stage) (rows map[*Exchange]float64, width map[*
 	return rows, width
 }
 
+// patternSelectivity is the share of a table's rows that matching one of
+// its columns against a constant pattern, with LIKE, ILIKE or GLOB, is
+// taken to keep, as DuckDB takes a filter it cannot estimate. At ten
+// times the data, a report's 8.3 billion segment rows, of which LIKE
+// 'SEG_HH_%' kept 400 million, were estimated whole, and exchanges
+// partitioned to fit them got 243 partitions where 128 had done; their
+// writers took a third longer.
+const patternSelectivity = 0.2
+
+// rowsRead estimates the rows fragment reads of table t: a hundredth where
+// it compares a column of t to a constant, a fifth where it matches one
+// against a constant pattern.
+func rowsRead(fragment node, t *Table) float64 {
+	r := float64(max(t.Rows, 0))
+	switch {
+	case filtersByConstant(fragment, t):
+		r *= filterSelectivity
+	case matchesPattern(fragment, t):
+		r *= patternSelectivity
+	}
+	return r
+}
+
+// matchesPattern reports whether fragment matches a column of t against a
+// constant pattern in a WHERE clause.
+func matchesPattern(fragment node, t *Table) bool {
+	cols := map[string]bool{}
+	for _, c := range t.Columns {
+		cols[strings.ToLower(c.Name)] = true
+	}
+	found := false
+	walk(fragment, func(m node) bool {
+		if found {
+			return false
+		}
+		for _, c := range conjuncts(child(m, "where_clause")) {
+			switch strings.ToLower(str(c["function_name"])) {
+			case "~~", "~~*", "~~~", "prefix", "starts_with":
+			default:
+				continue
+			}
+			kids := list(c, "children")
+			if len(kids) != 2 {
+				continue
+			}
+			col, _ := kids[0].(node)
+			pat, _ := kids[1].(node)
+			names := list(col, "column_names")
+			if str(col["class"]) == "COLUMN_REF" && str(pat["class"]) == "CONSTANT" && len(names) > 0 &&
+				cols[strings.ToLower(str(names[len(names)-1]))] {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
 // writerPartitions is the most partitions the stages' tasks can write an
 // exchange of: each holds a row group of each partition (see
 // shuffleRowGroup), of at least minShuffleRowGroup rows, which those of
 // all partitions must fit a quarter of a task's share of the worker's
 // memory in, at the width of the widest exchange's rows. Rows of 400
 // strings took a writer of 3 GB out of memory over 128 partitions and 256,
-// even in row groups of 2,048 rows. It is 0 when the workers' memory is not
-// known or no stage writes an exchange.
-func writerPartitions(stages []*Stage, ws []*worker) int {
+// even in row groups of 2,048 rows. A file in object storage takes upload
+// bytes more, its upload's buffer (see uploadBuffer). It is 0 when the
+// workers' memory is not known or no stage writes an exchange.
+func writerPartitions(stages []*Stage, ws []*worker, upload int64) int {
 	budget := taskMemory(ws) / 2
 	_, width := exchangeEstimates(stages)
 	var widest int64
@@ -256,7 +311,16 @@ func writerPartitions(stages []*Stage, ws []*worker) int {
 	if budget <= 0 || widest <= 0 {
 		return 0
 	}
-	return int(budget / (minShuffleRowGroup * widest))
+	return int(budget / (minShuffleRowGroup*widest + upload))
+}
+
+// uploadBytes is what a shuffle task's file takes beside its rows while
+// it is written under the warehouse: an upload's buffer in object storage.
+func uploadBytes(warehouse string) int64 {
+	if uploadsInParts(warehouse) {
+		return uploadBuffer
+	}
+	return 0
 }
 
 // groups returns the partitions each task of stage s, which reads

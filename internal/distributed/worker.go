@@ -475,9 +475,10 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 // DuckDB's partitioned COPY holds a row group of every partition's rows, as
 // they are, until it fills: 128 partitions of rows of 264 bytes held 3 GB,
 // as much as DuckDB's limit, in its row groups of 122,880 rows, and 0.4 GB
-// in groups of 8,192, which took no longer to write; at a hundred times the
-// data, wide rows over 128 partitions took workers of 24.6 GiB out of
-// memory. The row groups of all partitions get a quarter of the task's
+// in groups of 8,192, which took no longer to write. (Workers of 24.6 GiB
+// that ran out of memory over 128 partitions at a hundred times the data
+// were short of it for the uploads' buffers: see uploadBuffer.) The row
+// groups of all partitions get a quarter of the task's
 // share of the worker's memory (the limit over its slots), at the width of
 // the rows' types, between 2,048 rows and DuckDB's 122,880.
 func shuffleRowGroup(memory int64, slots, parts int, cols []Column) int64 {
@@ -510,6 +511,30 @@ func shuffleFlush(memory int64, slots, threads int, cols []Column) int64 {
 	}
 	n := memory / int64(max(slots, 1)) / 4 / int64(max(threads, 1)) / max(rowWidth(cols), 1)
 	return min(max(n, least), most)
+}
+
+// DuckDB writes a file to object storage as a multipart upload, holding a
+// buffer of a part for every file it has open, and sizes parts for the
+// largest file it allows over its 10,000 parts: 76.5 MiB at its default of
+// 800 GB. A shuffle task has a file a partition open: at 243 partitions a
+// task held 18 GiB of buffers for files of a few megabytes, and workers of
+// 24.6 GiB running two tasks ran out of memory, as at 128 they had not.
+// Shuffle tasks allow files of 50 GB, the least DuckDB takes, in parts of
+// uploadBuffer; no partition's file of a task comes near that.
+const (
+	maxUploadFile = "50GB"
+	uploadBuffer  = 5_505_024
+)
+
+// uploadsInParts reports whether DuckDB writes files under dir as
+// multipart uploads, with a buffer of a part each.
+func uploadsInParts(dir string) bool {
+	for _, scheme := range []string{"s3://", "s3a://", "s3n://", "gs://", "gcs://", "r2://"} {
+		if strings.HasPrefix(dir, scheme) {
+			return true
+		}
+	}
+	return false
 }
 
 // threadsOf returns DuckDB's threads on conn, or 1 if it cannot tell.
@@ -576,6 +601,11 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_flush_threshold = %d",
 		shuffleFlush(w.opts.MemoryBytes, cap(w.slots), threadsOf(ctx, conn), cols)), nil); err != nil {
 		return nil, err
+	}
+	if uploadsInParts(dir) {
+		if _, err := conn.ExecContext(ctx, "SET s3_uploader_max_filesize = "+quoteLiteral(maxUploadFile), nil); err != nil {
+			return nil, err
+		}
 	}
 	// RETURN_STATS says what the COPY wrote, file by file: listing the
 	// files and reading their footers back took requests one after

@@ -201,9 +201,17 @@ type execution struct {
 	root      string
 	exchanges map[int]*exchangeRun
 	results   map[int]*jobResult
+	// held are stages, by ID, that wait for their channel to close once
+	// what they read is complete: those that read relations being
+	// measured, until the statement is planned again or not (see
+	// runProbing).
+	held map[int]<-chan struct{}
 
-	mu   sync.Mutex
-	used map[string]bool
+	mu sync.Mutex
+	// used are the workers that ran its tasks, and usedBy those of each
+	// stage, by ID.
+	used   map[string]bool
+	usedBy map[int]map[string]bool
 }
 
 // exchangeRun is an exchange while its producers run.
@@ -233,6 +241,12 @@ type jobResult struct {
 
 // run runs every stage, each once the exchanges it reads are complete.
 func (e *execution) run(ctx context.Context, stages []*Stage) error {
+	return e.start(ctx, stages)()
+}
+
+// start starts running stages as run does, and returns what waits for them
+// to finish. The exchanges they write are in e.exchanges when it returns.
+func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() error) {
 	for _, s := range stages {
 		if s.Out == nil {
 			continue
@@ -261,6 +275,13 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 					return gctx.Err()
 				}
 			}
+			if held := e.held[s.ID]; held != nil {
+				select {
+				case <-held:
+				case <-gctx.Done():
+					return gctx.Err()
+				}
+			}
 			start := time.Now()
 			if err := e.stage(gctx, s); err != nil {
 				return err
@@ -278,7 +299,7 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 			return nil
 		})
 	}
-	return g.Wait()
+	return g.Wait
 }
 
 // stage runs one stage's tasks.
@@ -386,6 +407,13 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			e.co.opts.Metrics.scan(bytes)
 			e.mu.Lock()
 			e.used[w.addr] = true
+			if e.usedBy == nil {
+				e.usedBy = map[int]map[string]bool{}
+			}
+			if e.usedBy[s.ID] == nil {
+				e.usedBy[s.ID] = map[string]bool{}
+			}
+			e.usedBy[s.ID][w.addr] = true
 			e.mu.Unlock()
 			if s.Out != nil {
 				return e.received(s, task, head)
