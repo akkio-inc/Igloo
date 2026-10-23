@@ -15,10 +15,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/config"
 )
 
 // The harness runs distributed execution in one process: tables are
@@ -40,8 +44,9 @@ type harness struct {
 	workers []*Worker
 	lns     []net.Listener
 	log     *slog.Logger
-	// removed are the directories the coordinator removed.
-	removed []string
+	// removed are the directories of exchanges the coordinator removed.
+	removedMu sync.Mutex
+	removed   []string
 	// views are the queries of the views addView made.
 	views map[string]string
 }
@@ -63,9 +68,20 @@ func (s fileSource) Files(_ context.Context, t *Table) ([]File, error) {
 
 func (s fileSource) Refresh(context.Context, *Table) error { return nil }
 
-func (s fileSource) RemoveAll(_ context.Context, _ *Table, dir string) error {
-	s.h.removed = append(s.h.removed, dir)
-	return os.RemoveAll(dir)
+// recordingStorage is the harness's warehouse storage, which records the
+// directories of statements' exchanges the coordinator removes.
+type recordingStorage struct {
+	Storage
+	h *harness
+}
+
+func (s recordingStorage) List(ctx context.Context, dir string, fn func(string, time.Time) error) error {
+	if strings.Contains(dir, "/"+config.ShuffleDir+"/") {
+		s.h.removedMu.Lock()
+		s.h.removed = append(s.h.removed, dir)
+		s.h.removedMu.Unlock()
+	}
+	return s.Storage.List(ctx, dir, fn)
 }
 
 // harnessEnv resolves names in the harness's session.
@@ -281,6 +297,7 @@ func (h *harness) startWorkers(n int) {
 	co, err := NewCoordinator(Options{
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator"),
 		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: addrs},
+		Storage: recordingStorage{NewStorage(icebergio.LocalFS{}), h},
 	}, h.log)
 	if err != nil {
 		h.t.Fatal(err)

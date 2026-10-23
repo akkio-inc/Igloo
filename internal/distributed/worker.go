@@ -498,41 +498,62 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_max_open_files = %d", 4*maxPartitions), nil); err != nil {
 		return nil, err
 	}
-	res, err := conn.ExecContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+quoteLiteral(dir)+
-		" (FORMAT parquet, PARTITION_BY (__b))", nil)
+	// RETURN_STATS says what the COPY wrote, file by file: listing the
+	// files and reading their footers back took requests one after
+	// another, a listing and two per file, after the files were written.
+	res, err := conn.QueryContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+quoteLiteral(dir)+
+		" (FORMAT parquet, PARTITION_BY (__b), RETURN_STATS)", nil)
 	if err != nil {
 		return nil, err
 	}
-	rows, _ := res.RowsAffected()
-	out := &taskResult{Rows: rows, Files: []shuffleFile{}}
+	defer res.Close() //nolint:errcheck
+	out := &taskResult{Files: []shuffleFile{}}
 	for _, c := range cols {
 		if c.Name != "__b" {
 			out.Columns = append(out.Columns, c)
 		}
 	}
-	files, err := globFiles(ctx, conn, dir+"/*/*.parquet")
-	if err != nil {
-		return nil, fmt.Errorf("list shuffle files: %w", err)
+	// filename, count, file_size_bytes, footer_size_bytes,
+	// column_statistics, partition_keys.
+	dest := make([]driver.Value, len(res.Columns()))
+	if len(dest) < 3 {
+		return nil, fmt.Errorf("COPY returned %d columns of statistics", len(dest))
 	}
-	counts, err := fileRows(ctx, conn, files)
-	if err != nil {
-		return nil, fmt.Errorf("count shuffle files' rows: %w", err)
-	}
-	var listed int64
-	for _, f := range files {
+	for {
+		if err := res.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		f, _ := dest[0].(string)
+		rows, rok := asInt64(dest[1])
+		size, sok := asInt64(dest[2])
 		rest, ok := strings.CutPrefix(f, dir+"/__b=")
 		part, _, _ := strings.Cut(rest, "/")
 		n, err := strconv.Atoi(part)
-		if !ok || err != nil {
+		if !ok || err != nil || !rok || !sok {
 			return nil, fmt.Errorf("unexpected shuffle file %s", f)
 		}
-		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n, Rows: counts[f]})
-		listed += counts[f]
-	}
-	if listed != rows {
-		return nil, fmt.Errorf("shuffle files hold %d rows, the task wrote %d", listed, rows)
+		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n, Rows: rows, Size: size})
+		out.Rows += rows
 	}
 	return out, nil
+}
+
+// asInt64 returns v, an integer DuckDB returned, as an int64.
+func asInt64(v driver.Value) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case uint64:
+		return int64(n), n <= math.MaxInt64
+	case int32:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // fileRows returns how many rows each of Parquet files holds, from their
@@ -583,26 +604,6 @@ func checkRows(ctx context.Context, conn *duckdb.Conn, files []string, rows int6
 		return fmt.Errorf("its files hold %d rows, not the %d written", n, rows)
 	}
 	return nil
-}
-
-func globFiles(ctx context.Context, conn *duckdb.Conn, pattern string) ([]string, error) {
-	rows, err := conn.QueryContext(ctx, "SELECT file FROM glob("+quoteLiteral(pattern)+") ORDER BY file", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close() //nolint:errcheck
-	var out []string
-	dest := make([]driver.Value, 1)
-	for {
-		if err := rows.Next(dest); err != nil {
-			if errors.Is(err, io.EOF) {
-				return out, nil
-			}
-			return nil, err
-		}
-		s, _ := dest[0].(string)
-		out = append(out, s)
-	}
 }
 
 // checkTaskSQL refuses a task whose SQL could read anything but the views

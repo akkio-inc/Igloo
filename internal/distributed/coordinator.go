@@ -103,6 +103,9 @@ type Options struct {
 	// auto mode runs it on workers, unless it would run short of memory.
 	// Zero means DefaultThreshold.
 	Threshold time.Duration
+	// Storage is the warehouse's object storage, where the coordinator
+	// removes exchanges (see sweep).
+	Storage Storage
 }
 
 // Coordinator splits statements into parts that workers run.
@@ -120,9 +123,22 @@ type Coordinator struct {
 	dir         string
 	log         *slog.Logger
 	stop        context.CancelFunc
-	done        chan struct{}
+	// background are the pool's checks and the sweeps, until stop.
+	background sync.WaitGroup
 	// history is what statements took before, for auto mode (see choose).
 	history *history
+
+	// running are the statements whose exchanges are in use, by ID, which
+	// sweeps leave (see hold); heartbeat is how often they write under
+	// them.
+	runningMu sync.Mutex
+	running   map[string]bool
+	heartbeat time.Duration
+	// removals remove statements' exchanges in the background until
+	// removeCtx is done.
+	removals       sync.WaitGroup
+	removeCtx      context.Context
+	cancelRemovals context.CancelFunc
 }
 
 // NewCoordinator returns a coordinator for the workers opts.Pool names.
@@ -136,6 +152,9 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 	}
 	if len(opts.Pool.Addresses) == 0 {
 		return nil, errors.New("no worker addresses")
+	}
+	if opts.Storage == nil {
+		return nil, errors.New("distributed execution needs the warehouse's storage for exchanges")
 	}
 	if opts.Cores <= 0 {
 		opts.Cores = runtime.GOMAXPROCS(0)
@@ -168,21 +187,34 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 	}
 	log = log.With("component", "distributed")
 	ctx, stop := context.WithCancel(context.Background())
+	removeCtx, cancelRemovals := context.WithCancel(context.Background())
 	co := &Coordinator{
-		opts: opts, parser: p, aggs: aggs, dir: dir, log: log, stop: stop, done: make(chan struct{}),
+		opts: opts, parser: p, aggs: aggs, dir: dir, log: log, stop: stop,
 		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log), history: newHistory(),
+		running: map[string]bool{}, heartbeat: heartbeatEvery, removeCtx: removeCtx, cancelRemovals: cancelRemovals,
 	}
-	go func() {
-		defer close(co.done)
-		co.pool.run(ctx)
-	}()
+	co.background.Go(func() { co.pool.run(ctx) })
+	co.background.Go(func() { co.sweepLoop(ctx) })
 	return co, nil
 }
 
-// Close stops the coordinator's background work.
+// Close stops the coordinator's background work. It waits closeGrace for
+// the removal of exchanges, which sweeps finish otherwise.
 func (co *Coordinator) Close() error {
 	co.stop()
-	<-co.done
+	co.background.Wait()
+	removed := make(chan struct{})
+	go func() {
+		co.removals.Wait()
+		close(removed)
+	}()
+	select {
+	case <-removed:
+	case <-time.After(closeGrace):
+		co.cancelRemovals()
+		<-removed
+	}
+	co.cancelRemovals()
 	return co.parser.close()
 }
 
@@ -395,11 +427,6 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	if err != nil {
 		return nil, err
 	}
-	var anyTable *Table
-	for _, t := range snapshots {
-		anyTable = t
-		break
-	}
 	for _, key := range plan.pins {
 		if t := snapshots[key]; t.Versioned && t.Snapshot == 0 {
 			// No snapshot to read it at: it is empty, but a commit could
@@ -416,12 +443,12 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 	}
 	if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {
+		// The exchanges are read only by the stages: once they have run,
+		// the statement's rows need not wait for their removal.
+		release := co.hold(qid, run.root)
 		defer func() {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-			defer cancel()
-			if err := co.opts.Source.RemoveAll(ctx, anyTable, run.root); err != nil {
-				co.log.Warn("could not remove exchanged rows", "dir", run.root, "err", err)
-			}
+			release()
+			co.removeLater(qid, run.root)
 		}()
 	}
 	if err := run.run(ctx, plan.Stages); err != nil {

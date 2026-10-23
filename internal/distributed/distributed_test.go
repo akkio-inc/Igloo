@@ -316,8 +316,6 @@ func (s instantSource) Files(_ context.Context, t *Table) ([]File, error) {
 
 func (s instantSource) Refresh(context.Context, *Table) error { return nil }
 
-func (s instantSource) RemoveAll(context.Context, *Table, string) error { return nil }
-
 // TestLoadTableReadTwice checks that a table several stages read keeps the
 // files listed for it, however soon its listing finishes. When the listing
 // finished before the coordinator came to the table's second read, which

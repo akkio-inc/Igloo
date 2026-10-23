@@ -2,9 +2,7 @@ package distributed
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	iofs "io/fs"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,7 +10,6 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
-	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -29,9 +26,6 @@ type Source interface {
 	Refresh(ctx context.Context, t *Table) error
 	// Files lists the data files of t's snapshot.
 	Files(ctx context.Context, t *Table) ([]File, error)
-	// RemoveAll deletes the files under dir, with the storage access t is
-	// read with.
-	RemoveAll(ctx context.Context, t *Table, dir string) error
 }
 
 // File is a data file.
@@ -274,46 +268,6 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	}
 	s.mu.Unlock()
 	return files, nil
-}
-
-// RemoveAll deletes the files under dir.
-func (s *Iceberg) RemoveAll(ctx context.Context, t *Table, dir string) error {
-	h, ok := t.source.(*icebergHandle)
-	if !ok {
-		return fmt.Errorf("table %s was not loaded from the catalog", t)
-	}
-	fs, err := h.tbl.FS(ctx)
-	if err != nil {
-		return err
-	}
-	lister, ok := fs.(icebergio.ListableIO)
-	if !ok {
-		return errors.New("the warehouse's storage cannot list files")
-	}
-	var files []string
-	// A directory's path, without a trailing slash: the blob stores walk
-	// their buckets as an fs.FS, whose paths have none.
-	err = lister.WalkDir(strings.TrimSuffix(dir, "/"), func(path string, d iofs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			files = append(files, path)
-		}
-		return nil
-	})
-	if err != nil && !errors.Is(err, iofs.ErrNotExist) {
-		return err
-	}
-	if bulk, ok := fs.(icebergio.BulkRemovableIO); ok && len(files) > 0 {
-		_, err := bulk.DeleteFiles(ctx, files)
-		return err
-	}
-	var errs []error
-	for _, f := range files {
-		errs = append(errs, fs.Remove(f))
-	}
-	return errors.Join(errs...)
 }
 
 // icebergColumn returns a column of Iceberg type t as DuckDB reads it: a

@@ -107,8 +107,9 @@ type taskResult struct {
 type shuffleFile struct {
 	Path      string `json:"path"`
 	Partition int    `json:"partition"`
-	// Rows is how many rows the file holds.
+	// Rows is how many rows the file holds, and Size its bytes.
 	Rows int64 `json:"rows"`
+	Size int64 `json:"size"`
 }
 
 // taskErr is a failed task.

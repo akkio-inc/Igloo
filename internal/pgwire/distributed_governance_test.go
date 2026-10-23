@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/audit"
@@ -186,7 +187,7 @@ func TestDistributedConnections(t *testing.T) {
 		addrs = append(addrs, addr)
 	}
 	co, err := distributed.NewCoordinator(distributed.Options{
-		Source: source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1,
+		Source: source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1, Storage: distributed.NewStorage(icebergio.LocalFS{}),
 		Pool: distributed.PoolOptions{Addresses: addrs},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

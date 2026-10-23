@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
 
@@ -93,10 +94,6 @@ func (s *lakeSource) Files(_ context.Context, t *distributed.Table) ([]distribut
 
 // Refresh does nothing: Table wrote the table's current rows.
 func (s *lakeSource) Refresh(context.Context, *distributed.Table) error { return nil }
-
-func (s *lakeSource) RemoveAll(_ context.Context, _ *distributed.Table, dir string) error {
-	return os.RemoveAll(dir)
-}
 
 // workerEngine is a test worker's DuckDB. While gate holds them, tasks
 // wait to begin.
@@ -250,7 +247,7 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 	// DuckDB may read.
 	spill := filepath.Join(t.TempDir(), "spill")
 	co, err := distributed.NewCoordinator(distributed.Options{
-		Source: ds.source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1,
+		Source: ds.source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1, Storage: distributed.NewStorage(icebergio.LocalFS{}),
 		Pool: distributed.PoolOptions{Addresses: addrs},
 		// Exchanges between stages go under the warehouse, which here is dir.
 		Warehouse: dir + "/",

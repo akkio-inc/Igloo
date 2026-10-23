@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/config"
@@ -426,7 +427,7 @@ func TestForcedByNonAdmins(t *testing.T) {
 	}
 	co, err := NewCoordinator(Options{
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
-		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2,
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Storage: NewStorage(icebergio.LocalFS{}),
 		Pool: PoolOptions{Addresses: addrs, Compute: compute, MaxWorkers: 8, StartTimeout: time.Second},
 	}, h.log)
 	if err != nil {

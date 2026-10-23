@@ -47,6 +47,8 @@ func TestPartitionedJoins(t *testing.T) {
 			}
 		})
 	}
+	// Removed in the background once each statement's stages had run.
+	h.co.removals.Wait()
 	if len(h.removed) == 0 {
 		t.Error("no partitioned rows were removed")
 	}

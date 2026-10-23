@@ -497,8 +497,25 @@ starts new ones past that, which at 256 partitions made a task write
 coordinator warns of an exchange with more files than its tasks times its
 partitions. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
 `TIME WITH TIME ZONE`) cross exchanges as text and are cast back, as
-results do. The coordinator runs each stage once every exchange it reads
-is complete, and deletes the statement's directory when it ends.
+results do. A task learns the files it wrote, their rows and their sizes
+from `COPY ... (RETURN_STATS)`, rather than listing them and reading their
+footers back, a listing and two requests per file. The coordinator runs
+each stage once every exchange it reads is complete.
+
+Once a statement's stages have run, the coordinator removes its exchanges
+in the background (`internal/distributed/exchanges.go`), so that its rows
+do not wait: it lists the statement's directory flat, a request per
+thousand files, and deletes 32 files at a time. Walking the directory as a
+tree took a request per directory and then one per file, one after
+another, while the statement waited: 333 requests for a report whose two
+exchanges had 32 partitions, which spent 11 s after its stages had run. A
+statement whose replica stopped first leaves its exchanges, so every
+replica sweeps `_igloo_shuffle/` a minute after it starts and hourly, with
+one flat listing, and removes the files of each statement that none of
+its own statements holds and under which nothing was written for six
+hours. A statement writes `_igloo_shuffle/<statement>/running` every half
+hour while it runs, however long its last stages take, so the sweeps of
+other replicas, which cannot know it runs, never take its exchanges.
 
 A worker runs a task per 4 cores and 8 GiB of its memory limit at once
 (at least one), and the others wait. DuckDB runs each task on all of the

@@ -67,7 +67,7 @@ each table alone, and write the columns the statement uses to object
 storage, under `_igloo_shuffle/` in the warehouse, one directory per
 partition of the key's hash; then each worker joins and aggregates one
 partition of both, and the coordinator combines the results as before. The
-exchanged rows are deleted when the statement ends.
+exchanged rows are deleted in the background once those steps have run.
 
 Aggregations whose partial results would be large complete their groups on
 workers the same way. For an aggregate over `DISTINCT` values, such as the
@@ -330,12 +330,11 @@ on less data at a time, or give the workers more memory.
   partial aggregates; the rows of the common table expressions and
   subqueries workers compute) are
   Parquet files, not encrypted by Igloo, under `_igloo_shuffle/` in the
-  warehouse, deleted when the statement ends.
+  warehouse, deleted once the statement's steps have run.
   They are protected as the tables' own files are: by access to the bucket
   and its server-side encryption. No credentials the Iceberg REST catalog
-  hands out reach `_igloo_shuffle/`. Add a lifecycle rule that expires
-  `_igloo_shuffle/` after a day, for what a coordinator that crashed
-  mid-statement leaves behind.
+  hands out reach `_igloo_shuffle/`. What a coordinator that stopped
+  mid-statement leaves behind, the replicas remove [within hours](#lifecycle-rule).
 - **Pools are kept apart by secret and network.** Each compute pool's
   workers have a secret of their own (the Helm chart generates one per
   pool), so one pool's igloo pods cannot use another's workers; the
@@ -398,10 +397,15 @@ settings as the server), `IGLOO_WORKER_SECRET`, a spill directory and,
 ideally, a disk for the [read cache](operations.md#read-cache). They need no
 catalog, database or users.
 
-Every deployment with workers needs a lifecycle rule on the warehouse's
-bucket that expires `_igloo_shuffle/` under the warehouse after a day:
-statements delete what their partitioned joins exchanged there, but not a
-coordinator that crashed mid-statement. On S3, for a warehouse at
+### Lifecycle rule
+
+Statements delete what they exchanged under `_igloo_shuffle/`, but a
+coordinator that stops mid-statement cannot. Every replica sweeps
+`_igloo_shuffle/` a minute after it starts and hourly, and removes the
+files of statements under which nothing was written for six hours (a
+statement that still runs writes there every half hour). A lifecycle rule
+on the warehouse's bucket that expires `_igloo_shuffle/` after a day is a
+backstop for when no replica runs for that long. On S3, for a warehouse at
 `s3://bucket/warehouse`:
 
 ```sh
@@ -530,8 +534,8 @@ machine's memory run where that machine would run out of memory.
   write what they exchange to object storage and read it back: that costs
   request charges and adds a few seconds per step, and
   leftovers of a coordinator that crashed mid-statement stay under
-  `_igloo_shuffle/` until a lifecycle rule expires them, which every
-  deployment with workers needs.
+  `_igloo_shuffle/` for six hours or more, until a replica's sweep removes
+  them.
 - The coordinator receives every group of an aggregation, unless only its
   top rows are kept: a `GROUP BY` with billions of groups sends every
   worker's groups to it. (`count(DISTINCT x)` over billions of values sends

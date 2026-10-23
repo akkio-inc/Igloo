@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/akkio-inc/igloo/internal/audit"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
@@ -139,10 +140,16 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	if err != nil {
 		return nil, err
 	}
+	// The file system keeps its context for every request, long after
+	// startup.
+	files, err := catalog.FS(context.WithoutCancel(ctx), cfg.Storage, cfg.Storage.Location)
+	if err != nil {
+		return nil, fmt.Errorf("distributed execution: open the warehouse: %w", err)
+	}
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: source, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
 		Warehouse: cfg.Storage.Root(), Metrics: distributed.NewMetrics(reg),
-		MemoryBytes: eng.MemoryLimit(ctx), Threshold: cfg.Workers.Threshold,
+		MemoryBytes: eng.MemoryLimit(ctx), Threshold: cfg.Workers.Threshold, Storage: distributed.NewStorage(files),
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, StartTimeout: cfg.Workers.StartTimeout,
