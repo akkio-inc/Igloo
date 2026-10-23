@@ -55,6 +55,9 @@ type variant struct {
 	// readsText).
 	elem string
 	text bool
+	// guard says the read is in a WHERE, where text that a hoisted
+	// FLATTEN's select list unnested or built is read through sf_text_read.
+	guard bool
 }
 
 var plainKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -100,7 +103,9 @@ func (v *variant) render() string {
 	if v.elem != "" {
 		base = v.elem
 		if v.text && len(v.segs) == 0 {
-			base = "sf_text_read(" + base + ")"
+			if v.guard {
+				base = "sf_text_read(" + base + ")"
+			}
 			switch v.mode {
 			case vString:
 				return base

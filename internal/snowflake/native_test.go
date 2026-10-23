@@ -365,7 +365,7 @@ func TestFlattenShapes(t *testing.T) {
 		// Elements that every read casts are unnested as text; one read
 		// otherwise keeps them JSON.
 		{`select cast(g.value:k as text), cast(v.value as text), v.value::float from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
-			`select m._sf_t._sf_k1 AS "CAST(G.VALUE:K AS TEXT)", sf_text_read(m._sf_e) AS "CAST(V.VALUE AS TEXT)", CAST(sf_text_read(m._sf_e) AS DOUBLE) AS "V.VALUE::FLOAT" ` +
+			`select m._sf_t._sf_k1 AS "CAST(G.VALUE:K AS TEXT)", m._sf_e AS "CAST(V.VALUE AS TEXT)", CAST(m._sf_e AS DOUBLE) AS "V.VALUE::FLOAT" ` +
 				`from (SELECT m.*, unnest(sf_parts_strings(m._sf_t._sf_l2, m._sf_t._sf_j2, 'BOTH')) AS _sf_e FROM`, `json_extract`},
 		{`select cast(v.value as text), v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
 			`select json_extract_string(m._sf_e, '$') AS "CAST(V.VALUE AS TEXT)", m._sf_e from (SELECT m.*, unnest(sf_parts_values(`, `sf_parts_strings`},
@@ -374,14 +374,21 @@ func TestFlattenShapes(t *testing.T) {
 		{`select g.value:k::string from tab m, lateral flatten(input => [object_construct('k', ['p', '{"q": 1}'])]) g`,
 			`'_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST(sf_string_part(json_array('p', '{"q": 1}')) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(json_array('p', '{"q": 1}')) AS JSON)`, ``},
 		{`select g.value:n::string from tab m inner join u on u.id = m.id cross join lateral flatten(input => [object_construct('n', m.s), object_construct('n', 'x')]) as g(seq, key, path, index, value, this) where m.id > 1`,
-			`select sf_text_read(m._sf_t._sf_t1) AS "G.VALUE:N::STRING" from (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), ` +
+			`select m._sf_t._sf_t1 AS "G.VALUE:N::STRING" from (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), ` +
 				`'_sf_t1': CAST(sf_fields_string(sf_list_part(m.s), sf_string_part(m.s), sf_other_part(m.s)) AS VARCHAR)}, ` +
 				`{'_sf_i': CAST(1 AS BIGINT), '_sf_t1': CAST(sf_fields_string(NULL, 'x', NULL) AS VARCHAR)}]) AS _sf_t FROM tab m) AS m ` +
 				`inner join u on u.id = m.id where m.id > 1`, `LATERAL`},
 		// A key that every read casts is its text alone; one read otherwise
 		// keeps its parts.
 		{`select cast(get_path(g.value, 'n') as text), try_cast(get(g.value, 'n') as float), g.value['n']::string from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`,
-			`select sf_text_read(m._sf_t._sf_t1) AS "CAST(GET_PATH(G.VALUE, 'N') AS TEXT)", TRY_CAST(sf_text_read(m._sf_t._sf_t1) AS DOUBLE) AS "TRY_CAST(GET(G.VALUE, 'N') AS FLOAT)", sf_text_read(m._sf_t._sf_t1) AS`, `_sf_l1`},
+			`select m._sf_t._sf_t1 AS "CAST(GET_PATH(G.VALUE, 'N') AS TEXT)", TRY_CAST(m._sf_t._sf_t1 AS DOUBLE) AS "TRY_CAST(GET(G.VALUE, 'N') AS FLOAT)", m._sf_t._sf_t1 AS`, `_sf_l1`},
+		// Their reads in a WHERE go through sf_text_read, which keeps
+		// DuckDB's filter on them above the select list that unnests them.
+		{`select cast(g.value:n as text), cast(v.value as text) from tab m, lateral flatten(input => [object_construct('n', m.s, 'l', m.a)]) g, lateral flatten(input => g.value:l) v where cast(v.value as text) <> '' and cast(g.value:n as text) <> 'x' group by 1, 2`,
+			`select m._sf_t._sf_t1 AS "CAST(G.VALUE:N AS TEXT)", m._sf_e AS "CAST(V.VALUE AS TEXT)" from`,
+			`json_extract`},
+		{`select cast(g.value:n as text), cast(v.value as text) from tab m, lateral flatten(input => [object_construct('n', m.s, 'l', m.a)]) g, lateral flatten(input => g.value:l) v where cast(v.value as text) <> '' and cast(g.value:n as text) <> 'x' group by 1, 2`,
+			`FROM tab m) AS m) AS m where sf_text_read(m._sf_e) <> '' and sf_text_read(m._sf_t._sf_t1) <> 'x' group by 1, 2`, `json_extract`},
 		{`select cast(g.value:n as text), g.value:n from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`,
 			`'_sf_l1': CAST(sf_list_part(m.s) AS VARCHAR[])`, `_sf_t1`},
 		{`select cast(g.value:n.x as text) from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`, `'_sf_l1'`, `_sf_t1`},

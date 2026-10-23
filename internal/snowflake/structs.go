@@ -108,10 +108,7 @@ func (s *structFlatten) json(x string, i int) string {
 
 func (s *structFlatten) text(x string, i int) string {
 	l, st, j := s.parts(x, i)
-	switch {
-	case s.textOnly(i):
-		return "sf_text_read(" + st + ")"
-	case i < 0 || !s.general[i]:
+	if i < 0 || !s.general[i] || s.textOnly(i) {
 		return st
 	}
 	return "sf_fields_string(" + l + ", " + st + ", " + j + ")"
@@ -194,6 +191,13 @@ func (t *translator) collectStructs(nodes []*node) {
 		}
 		if h == nil {
 			continue
+		}
+		// Its reads in the WHERE, whose text DuckDB is to filter above the
+		// select list (see sf_text_read).
+		if _, _, where, end, _ := whereClause(f.level); where >= 0 {
+			for _, n := range f.level[where+1 : end] {
+				walk(n, func(n *node) { t.guarded[n] = true })
+			}
 		}
 		hoisted[h.item] = true
 		s.base = h.alias + "._sf_t"
@@ -1383,6 +1387,9 @@ func (v *variant) structRead() (string, bool) {
 	rest := &variant{segs: v.segs[1:]}
 	json := v.obj.json(x, i)
 	str := v.obj.text(x, i)
+	if v.guard && v.obj.textOnly(i) {
+		str = "sf_text_read(" + str + ")"
+	}
 	if len(rest.segs) > 0 {
 		str = "json_extract_string(" + json + ", " + rest.path() + ")"
 	}

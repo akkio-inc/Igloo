@@ -1982,9 +1982,9 @@ func minMax(c *call) (*node, error) {
 	}
 	v := c.args[0][0].v
 	str := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, elem: v.elem,
-		text: v.text, mode: vString}}
+		text: v.text, guard: v.guard, mode: vString}}
 	num := &node{kind: kVariant, v: &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, elem: v.elem,
-		text: v.text, mode: vNumber, try: true}}
+		text: v.text, guard: v.guard, mode: vNumber, try: true}}
 	v.mode = vJSON
 	fn := "arg_min"
 	if c.name == "MAX" {
@@ -2451,7 +2451,7 @@ func variantOf(c *call, segs []pathSeg) *node {
 	if len(base) == 1 && base[0].kind == kVariant {
 		v := base[0].v
 		return &node{kind: kVariant, v: &variant{base: v.base, segs: append(append([]pathSeg{}, v.segs...), segs...), json: v.json, column: v.column, obj: v.obj,
-			elem: v.elem, text: v.text},
+			elem: v.elem, text: v.text, guard: v.guard},
 			pos: c.span[0].pos, end: c.span[len(c.span)-1].end}
 	}
 	return &node{kind: kVariant, v: &variant{base: c.arg(0), segs: segs, column: isColumnRef(c.args[0])}, pos: c.span[0].pos, end: c.span[len(c.span)-1].end}

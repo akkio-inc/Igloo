@@ -222,7 +222,8 @@ var macros = []string{
 		WHEN l IS NULL THEN list_transform(sf_flatten_values(j, m), lambda x: json_extract_string(x, '$'))
 		WHEN m <> 'OBJECT' THEN list_transform(l, lambda e: sf_elem_string(e)) END`,
 	// sf_text_read is text that a select list unnested, x, as it is, read
-	// where DuckDB keeps a filter on it above that select list: it does not
+	// in a WHERE, where DuckDB keeps a filter on it above that select list
+	// (a select list or GROUP BY reads it plainly, as cheaper): it does not
 	// push an expression that may raise an error through a projection, and
 	// a filter pushed onto an unnest counts as filtering that relation, which
 	// DuckDB then estimates at a fifth of its input's rows, where it reckons

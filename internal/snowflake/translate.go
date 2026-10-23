@@ -79,9 +79,12 @@ type translator struct {
 	// lists, and their readers, by argument groups, and elemReads the reads
 	// of those readers' VALUE, by VALUE's nodes, with what they read, and
 	// elemTexts whether that is text (see hoistOf).
-	hoists      map[*node]*hoist
-	elemReads   map[*node]string
-	elemTexts   map[*node]bool
+	hoists    map[*node]*hoist
+	elemReads map[*node]string
+	elemTexts map[*node]bool
+	// guarded holds the nodes of the WHEREs of selects that hoist FLATTENs,
+	// where reads of their text go through sf_text_read.
+	guarded     map[*node]bool
 	flattenOuts map[*node]string
 	structOuts  map[*node]*structOut
 	folds       map[*node]*structFold
@@ -122,7 +125,7 @@ func Translate(sql string, opts Options) (Result, error) {
 	t := &translator{src: sql, opts: opts, quoted: map[string]bool{}, flatten: map[string]bool{}, grouped: map[*node]bool{},
 		names: map[string]int{}, columnNames: map[string]int{}, structs: map[*node]*structFlatten{},
 		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, hoists: map[*node]*hoist{}, elemReads: map[*node]string{},
-		elemTexts: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
+		elemTexts: map[*node]bool{}, guarded: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
 		folds: map[*node]*structFold{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {

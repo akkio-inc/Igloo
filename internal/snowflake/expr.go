@@ -278,7 +278,7 @@ func (t *translator) paths(nodes []*node) ([]*node, error) {
 			start = qualifiedStart(nodes, i)
 			base = nodes[start : i+1]
 			v = &variant{base: seq(base, base...), json: true, obj: t.structReads[nodes[i]], elem: t.elemReads[nodes[i]],
-				text: t.elemTexts[nodes[i]]}
+				text: t.elemTexts[nodes[i]], guard: t.guarded[nodes[i]]}
 			i++
 		default:
 			continue
@@ -860,7 +860,7 @@ func orderItem(item []*node) []*node {
 		v := expr[0].v
 		v.mode = vString
 		num := &variant{base: v.base, segs: v.segs, json: v.json, column: v.column, obj: v.obj, elem: v.elem, text: v.text,
-			mode: vNumber, try: true}
+			guard: v.guard, mode: vNumber, try: true}
 		d := " ASC"
 		if desc {
 			d = " DESC"
