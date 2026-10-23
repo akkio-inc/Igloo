@@ -19,13 +19,15 @@ import (
 //
 // The rates are rough, from the first scale runs, and per core, since
 // DuckDB runs several threads a core on object storage: the coordinator
-// scans its warm cache at about 150 MB/s a core; a worker reads object
-// storage cold at about 16 MB/s a core, at four threads a core (a machine
-// of 8 cores read 131 MB/s through the read cache on 32 threads); and each
-// level of stages, a round of tasks that waits for the round before it,
-// costs about 4 s of writing and reading object storage and of waiting for
-// its slowest task. At 1x on four workers, reports that took 6 to 56 s on
-// one machine took 37 to 176 s on workers.
+// scans its warm cache at about 150 MB/s a core; a machine reads object
+// storage cold at about 16 MB/s a core at four threads a core, the
+// workers' default, and less at fewer (coldRateAt); and each level of
+// stages, a round of tasks that waits for the round before it, costs about
+// 4 s of writing and reading object storage and of waiting for its slowest
+// task. At 1x on four workers, reports that took 6 to 56 s on one machine
+// took 37 to 176 s on workers. The coordinator reads warm only what its
+// read cache can hold: at 100x, a report's tables are several terabytes
+// against a cache of under one.
 const (
 	localRate = 150e6
 	coldRate  = 16e6
@@ -44,6 +46,9 @@ const (
 	memoryShare      = 0.7
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// workerThreadsPerCore are the threads a core coldRate is measured at
+	// (see engine's thread defaults).
+	workerThreadsPerCore = 4
 	// exploreEvery is how seldom auto mode runs a statement on workers
 	// against the estimates, to learn how long it takes there (see choose).
 	exploreEvery = 24 * time.Hour
@@ -65,6 +70,22 @@ type estimate struct {
 	memory bool
 }
 
+// coldRateAt is how fast a core reads object storage cold at
+// threadsPerCore threads a core. A machine of 8 cores read through its read
+// cache at 56 MB/s on 8 threads, 91 on 16 and 131 on 32: 7, 11.4 and
+// 16.4 MB/s a core, about as the 0.6th power of the threads.
+func coldRateAt(threadsPerCore float64) float64 {
+	return coldRate * math.Min(1, math.Pow(math.Max(threadsPerCore, 0.25)/workerThreadsPerCore, 0.6))
+}
+
+// machine is what the coordinator knows of itself for an estimate: its
+// cores and DuckDB threads, its memory limit and what its read cache may
+// hold, zero for unknown or none.
+type machine struct {
+	cores, threads int
+	memory, cache  int64
+}
+
 // fleet is what the coordinator knows of its workers for an estimate.
 type fleet struct {
 	// cores are a worker's cores; running how many workers run; most how
@@ -73,9 +94,11 @@ type fleet struct {
 	start                time.Duration
 }
 
-// estimateTimes estimates a plan's times on a coordinator of cores cores
-// and memory bytes of memory, and on workers.
-func estimateTimes(stages []*Stage, cores int, memory int64, f fleet) estimate {
+// estimateTimes estimates a plan's times on the coordinator, m, and on
+// workers. The coordinator reads warm what its cache can hold, and the
+// rest cold at its threads a core; short of memory, it takes longer by
+// as much as its working set is over its share of memory, spilling.
+func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 	var e estimate
 	read, exchanged := map[string]int64{}, map[string]int64{}
 	for _, s := range stages {
@@ -96,8 +119,14 @@ func estimateTimes(stages []*Stage, cores int, memory int64, f fleet) estimate {
 		e.exchanged += b
 	}
 	e.levels = levels(stages)
-	e.oneMachine = float64(e.bytes) / (float64(max(cores, 1)) * localRate)
-	e.memory = memory > 0 && float64(workingSetFactor*e.exchanged) > memoryShare*float64(memory)
+	cores := float64(max(m.cores, 1))
+	warm := min(e.bytes, max(m.cache, 0))
+	threadsPerCore := float64(max(m.threads, m.cores)) / cores
+	e.oneMachine = float64(warm)/(cores*localRate) + float64(e.bytes-warm)/(cores*coldRateAt(threadsPerCore))
+	if set := float64(workingSetFactor * e.exchanged); m.memory > 0 && set > memoryShare*float64(m.memory) {
+		e.memory = true
+		e.oneMachine *= set / (memoryShare * float64(m.memory))
+	}
 	// The fewest workers within a fifth of the fastest time.
 	e.onWorkers = math.Inf(1)
 	times := make([]float64, f.most+1)

@@ -203,7 +203,11 @@ explicit transactions, the coordinator plans it:
    disk. A statement with candidates then runs on workers, in auto mode,
    only when that should be faster than the coordinator alone
    (`internal/distributed/cost.go`). Its time on the coordinator is
-   estimated at 150 MB/s per core over the tables its stages read, and
+   estimated at 150 MB/s per core over as much of the tables its stages
+   read as the coordinator's read cache can hold, and at its cold rate for
+   the rest (16 MB/s per core at four threads a core, about 11 at two,
+   about as the threads' 0.6th power), times its working set over 70% of
+   its memory limit when it would run short of memory; and
    on n workers at 16 MB/s per worker core from object storage, plus 4 s
    for each level of stages (a round of tasks that waits for the one before
    it) and the start time of workers not running; it uses the fewest

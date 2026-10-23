@@ -223,6 +223,15 @@ func (e *Engine) stopCache() {
 	}
 }
 
+// CacheLimit returns what the read cache may grow to, as of its last
+// measurement, or 0 without one.
+func (e *Engine) CacheLimit() int64 {
+	if e.cache == nil {
+		return 0
+	}
+	return int64(e.cache.limit.Load())
+}
+
 // measureCache measures the cache and its disk and moves the extension's
 // free-space reserve to match.
 //

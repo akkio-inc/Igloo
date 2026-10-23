@@ -443,8 +443,9 @@ func TestDistributedOutOfMemory(t *testing.T) {
 // directly. So does one the memory watch cancels (ShedMemory).
 func TestDistributedAfterOutOfMemory(t *testing.T) {
 	ds := startDistServer(t, 2)
-	// Large enough for auto mode to weigh, small enough for one machine.
-	ds.source.size = 1 << 30
+	// Large enough for auto mode to weigh, small enough for one machine,
+	// which reads it cold in about 45 s.
+	ds.source.size = 300 << 20
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
 	ctx := context.Background()

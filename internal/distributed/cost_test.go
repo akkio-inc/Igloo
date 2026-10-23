@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,7 @@ func TestChoose(t *testing.T) {
 // and starting workers, and the fewest workers within a fifth of the
 // fastest.
 func TestEstimateTimes(t *testing.T) {
+	warm := machine{cores: 16, threads: 32, memory: 50e9, cache: 1 << 50}
 	big := &Table{Schema: "main", Name: "big", Bytes: 300e9}
 	small := &Table{Schema: "main", Name: "small", Bytes: 1e6}
 	x, y := &Exchange{ID: 0}, &Exchange{ID: 1}
@@ -61,11 +63,12 @@ func TestEstimateTimes(t *testing.T) {
 		{Inputs: []Input{{Exchange: x, Partitioned: true}, {Table: small}}, Out: y},
 		{Inputs: []Input{{Exchange: y, Partitioned: true}}},
 	}
-	e := estimateTimes(stages, 16, 50e9, fleet{cores: 8, running: 2, most: 16, start: 30 * time.Second})
+	e := estimateTimes(stages, warm, fleet{cores: 8, running: 2, most: 16, start: 30 * time.Second})
 	if e.levels != 3 || e.bytes != 300e9+1e6 || e.exchanged != 300e9+1e6 || !e.memory {
 		t.Errorf("levels %d, bytes %d, exchanged %d, memory %v", e.levels, e.bytes, e.exchanged, e.memory)
 	}
-	if want := (300e9 + 1e6) / (16 * localRate); e.oneMachine != want {
+	// Short of memory by its working set over its share: spilling.
+	if want := (300e9 + 1e6) / (16 * localRate) * 3 * (300e9 + 1e6) / (0.7 * 50e9); math.Abs(e.oneMachine-want) > 1 {
 		t.Errorf("one machine: %.1f s, want %.1f", e.oneMachine, want)
 	}
 	// 16 workers: 12 + 300e9/(16*8*16e6) + 30 = 188.5 s, starting more
@@ -73,8 +76,62 @@ func TestEstimateTimes(t *testing.T) {
 	if e.workers != 13 || e.onWorkers > 188.5*1.2 {
 		t.Errorf("%d workers, %.1f s", e.workers, e.onWorkers)
 	}
-	if e := estimateTimes(stages, 16, 0, fleet{}); e.workers != 0 || e.memory {
+	if e := estimateTimes(stages, machine{cores: 16, cache: 1 << 50}, fleet{}); e.workers != 0 || e.memory {
 		t.Errorf("no workers: %d workers, memory %v", e.workers, e.memory)
+	}
+	// What the cache cannot hold, it reads cold at its threads a core.
+	cold := machine{cores: 16, threads: 32, cache: 100e9}
+	if e, want := estimateTimes(stages, cold, fleet{}), 100e9/(16*localRate)+200.001e9/(16*coldRateAt(2)); math.Abs(e.oneMachine-want) > 1 {
+		t.Errorf("one machine, partly cold: %.1f s, want %.1f", e.oneMachine, want)
+	}
+	if r := coldRateAt(4); r != coldRate {
+		t.Errorf("cold rate at 4 threads a core: %.0f", r)
+	}
+	if r := coldRateAt(2) / 1e6; r < 10 || r > 12 {
+		t.Errorf("cold rate at 2 threads a core: %.1f MB/s", r)
+	}
+}
+
+// TestScaleReports checks auto mode's first choice for the shapes of the
+// scale environment's reports: a coordinator of 16 cores, 32 threads and
+// a 49 GiB memory limit with a 100 GiB read cache, and up to 16 workers
+// of 8 cores. At 1x they run on one machine; at 100x, where one machine
+// read for an hour and ran out of memory, on workers.
+func TestScaleReports(t *testing.T) {
+	coordinator := machine{cores: 16, threads: 32, memory: 49 << 30, cache: 100 << 30}
+	workers := fleet{cores: 8, running: 0, most: 16, start: time.Minute}
+	// Table sizes at 1x: the audience lookup, the attributes, the
+	// segments, the household aggregate.
+	lookup, attributes, segments, households := int64(13e9), int64(7.6e9), int64(2.45e9), int64(1.8e9)
+	shape := func(scale int64, tables ...int64) []*Stage {
+		var stages []*Stage
+		x := &Exchange{ID: 0}
+		var ins []Input
+		for i, b := range tables {
+			out := &Exchange{ID: i + 1}
+			stages = append(stages, &Stage{Inputs: []Input{{Table: &Table{Name: fmt.Sprint("t", i), Bytes: b * scale}, Split: true}}, Out: out})
+			ins = append(ins, Input{Exchange: out, Partitioned: true})
+		}
+		stages = append(stages, &Stage{Inputs: ins, Out: x}, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}})
+		return stages
+	}
+	for _, c := range []struct {
+		name    string
+		tables  []int64
+		scale   int64
+		workers bool
+	}{
+		{"E2 at 1x", []int64{lookup, attributes, segments}, 1, false},
+		{"E3 at 1x", []int64{lookup, households, attributes}, 1, false},
+		{"E2 at 100x", []int64{lookup, attributes, segments}, 100, true},
+		{"E3 at 100x", []int64{lookup, households, attributes}, 100, true},
+	} {
+		e := estimateTimes(shape(c.scale, c.tables...), coordinator, workers)
+		got, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
+		t.Logf("%s: %s (short of memory: %v)", c.name, reason, e.memory)
+		if got != c.workers {
+			t.Errorf("%s: workers %v (%s); one machine %.0f s, workers %.0f s on %d", c.name, got, reason, e.oneMachine, e.onWorkers, e.workers)
+		}
 	}
 }
 

@@ -87,11 +87,14 @@ type Options struct {
 	// Warehouse is the warehouse root, with a trailing slash. Partitioned
 	// joins exchange rows under it.
 	Warehouse string
-	// Cores are the coordinator's cores, for estimating how long a
-	// statement would take on it; zero means those Go may use
-	// (runtime.GOMAXPROCS).
-	Cores   int
-	Metrics *Metrics
+	// Cores are the coordinator's cores, and Threads its DuckDB threads,
+	// for estimating how long a statement would take on it; zero cores
+	// means those Go may use (runtime.GOMAXPROCS), zero threads one a
+	// core. CacheBytes, if set, says what its read cache may hold.
+	Cores      int
+	Threads    int
+	CacheBytes func() int64
+	Metrics    *Metrics
 	// MaxSpoolBytes bounds what a statement's partial results may take on
 	// the coordinator's disk; past it, the statement runs on the
 	// coordinator instead. Zero means 1 GiB.
@@ -299,7 +302,12 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
 	plan.Key = planKey(stmt, plan.Stages)
-	e := estimateTimes(plan.Stages, co.opts.Cores, co.opts.MemoryBytes, co.fleet(ws, plan.mayStart))
+	var cache int64
+	if co.opts.CacheBytes != nil {
+		cache = co.opts.CacheBytes()
+	}
+	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes, cache: cache}
+	e := estimateTimes(plan.Stages, m, co.fleet(ws, plan.mayStart))
 	plan.workers = e.workers
 	if mode != ModeAuto {
 		return plan, nil

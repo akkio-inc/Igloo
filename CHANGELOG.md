@@ -339,7 +339,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   go to workers whatever the time, which made 1x reports of 6 to 56 s
   take 37 to 176 s. Each replica remembers what statements took each way,
   by `query_history.plan_key` (the text without literals and the tables'
-  sizes), and runs a statement run again where it was faster. A statement
+  sizes), and runs a statement run again where it was faster. The
+  replica's estimate prices at its warm rate only what its read cache can
+  hold, and the rest at its cold rate, and grows with how far its working
+  set is over its share of memory: at 100x, where one machine ran reports
+  for an hour and ran out of memory, they go to workers the first time.
+  A statement
   auto mode ran on the replica that runs out of memory there before it
   sends a row runs again on workers, and the client gets its rows; it runs
   on workers from then on.

@@ -204,14 +204,17 @@ So Igloo considers a statement for workers only when its largest table is
 more than the replica scans in about four seconds (4 GiB for a 16-core
 replica; workers that are stopped are started only for a minute's worth).
 For such a statement it estimates two times: the replica's, at 150 MB/s per
-core over the tables the statement reads, and the workers', at 16 MB/s per
+core over as much of the tables the statement reads as its read cache can
+hold and at what it reads from object storage cold per core for the rest
+(about 11 MB/s at two threads a core), and the workers', at 16 MB/s per
 worker core from object storage plus about 4 seconds for each round of
 tasks that waits for the one before it, plus the time to start workers that
-are stopped. It runs the statement on workers only if the replica would
-take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or would run short of
-memory (the rows its joins and distinct counts hold, estimated at three
-times what feeds them, over 70% of its memory limit), and the workers are
-estimated to be at least 1.5 times faster. It uses the fewest workers
+are stopped. A replica that would run short of memory (the rows its joins
+and distinct counts hold, estimated at three times what feeds them, over
+70% of its memory limit) is estimated to take that many times longer,
+spilling. It runs the statement on workers only if the replica would take
+longer than `IGLOO_WORKER_THRESHOLD` (a minute), or would run short of
+memory, and the workers are estimated to be at least 1.5 times faster. It uses the fewest workers
 estimated within a fifth of the fastest time.
 
 Estimates are rough, so Igloo corrects them with what the same statement
