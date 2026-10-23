@@ -515,6 +515,14 @@ func TestErrorCodes(t *testing.T) {
 		}
 	}
 	mustExec(t, conn, "SELECT 1")
+	// Division by zero fails in Snowflake's dialect, as in Snowflake.
+	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+	for _, sql := range []string{"SELECT 1 / 0", "SELECT 1::FLOAT / 0"} {
+		if _, err := conn.Exec(context.Background(), sql); pgCode(err) != "22012" {
+			t.Errorf("%s: code %q, want 22012 (%v)", sql, pgCode(err), err)
+		}
+	}
+	mustExec(t, conn, "SET sql_dialect = 'duckdb'")
 }
 
 func TestPostgresOnlySettingsAreAccepted(t *testing.T) {

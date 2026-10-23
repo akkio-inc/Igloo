@@ -92,6 +92,25 @@ var snowflakeCases = []runCase{
 		want: []string{"NULL|NULL|NULL|NULL|NULL|1a|1|a12.5"}},
 	{name: "concat types", sql: `select concat(1, 2), concat('2024-01-01'::date, 'x'), 'x' || 1.50::number(5,2), concat('a', 'b', 'c')`,
 		want: []string{"12|2024-01-01x|x1.50|abc"}},
+	// Division of two NUMBERs is a NUMBER of the dividend's scale plus 6
+	// (at least 6, at most 12), rounded half away from zero. Igloo's is
+	// that value as a DOUBLE: Snowflake's 0.064063 and 3.500000.
+	{name: "division", sql: `select 1/3, 41/640, -41/640, 41/-640, -1/2000000, 3/2000000, 1/3*3, 7/2, cast(0.41 as number(10,2))/640, cast(1 as number(38,0))/7, 10/2.5, 1.5/0.7, 2*3/4, 2*(3/4), -3/4*2, cast(1.12345678 as number(20,8))/3, cast(1 as float)/4`,
+		want:  []string{"0.333333|0.064063|-0.064063|-0.064063|-0.000001|0.000002|0.999999|3.5|0.00064063|0.142857|4|2.1428571|1.5|1.5|-1.5|0.374485593333|0.25"},
+		types: []string{"DOUBLE", "DOUBLE"}},
+	// A FLOAT on either side gives a FLOAT, not rounded.
+	{name: "division of floats", sql: `select 1::float/3, 1/3::float, cast(1.5 as number(10,1))/7::float, 1::float/3::float`,
+		want:  []string{"0.3333333333333333|0.3333333333333333|0.21428571428571427|0.3333333333333333"},
+		types: []string{"DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE"}},
+	// Dividing by zero fails, FLOATs too, unless the dividend is NULL;
+	// DIV0 and DIV0NULL give 0 (Snowflake: 0.000000 and 0E-7).
+	{name: "division by zero", sql: `select 1/0`, wantErr: "Division by zero"},
+	{name: "float division by zero", sql: `select 1::float/0`, wantErr: "Division by zero"},
+	{name: "division of a column by zero", sql: `select x/y from (values (1, 2), (0, 0)) t(x, y)`, wantErr: "Division by zero"},
+	{name: "division by zero of null", sql: `select null/0, 1/nullif(0, 0), div0(1, 0), div0(1.5, 0), x/y from (values (1, 0), (1, 2)) t(x, y) where y <> 0`,
+		want: []string{"NULL|NULL|0|0|0.5"}},
+	{name: "division of aggregates", sql: `select sum(x) / count(*), sum(x) over () / count(*) over (), div0(1, 3), div0null(2, 3), 1 / (select count(*) from (values (1), (2), (3))) from (values (1), (2), (2)) t(x) group by x order by 1`,
+		want: []string{"1|1.5|0.333333|0.666667|0.333333", "2|1.5|0.333333|0.666667|0.333333"}},
 	{name: "conditionals", sql: `select equal_null(null, null), decode(null, null, 'x', 'y'), div0(1, 0), div0null(1, null), zeroifnull(null), nullifzero(0), nvl2(null, 1, 2), iff(null, 1, 2), square(3)`,
 		// Snowflake's DIV0 results are NUMBER(.., 6): 0.000000.
 		want: []string{"true|x|0|0|0|NULL|2|2|9"}},
@@ -110,9 +129,9 @@ var snowflakeCases = []runCase{
 		want: []string{"x|x,y", "y|x,y", "z|z"}},
 	{name: "median and mode", sql: `select median(x), mode(x) from (values (1),(2),(3),(4)) t(x)`, want: []string{"2.5|1"}},
 	{name: "count distinct", sql: `select count(distinct a, b) from (values (1, 1), (1, null), (null, null), (1, 1), (2, 1)) t(a, b)`, want: []string{"2"}},
-	{name: "ratio_to_report", sql: `select x, ratio_to_report(x) over () from (values (1),(3)) t(x) order by x`,
-		// Snowflake: 0.250000 and 0.750000 (NUMBER).
-		want: []string{"1|0.25", "3|0.75"}},
+	{name: "ratio_to_report", sql: `select x, ratio_to_report(x) over () from (values (1),(2)) t(x) order by x`,
+		// Snowflake: 0.333333 and 0.666667 (NUMBER).
+		want: []string{"1|0.333333", "2|0.666667"}},
 	{name: "object_agg", sql: `select object_agg(k, v) from (values ('a', 1), ('b', null), (null, 2)) t(k, v)`, want: []string{`{"a":1}`}},
 	{name: "array_agg of objects", sql: `select array_agg(object_construct('k', k, 'v', v)) within group (order by k) from (values ('a', 1), ('b', null)) t(k, v)`,
 		want: []string{`[{"k":"a","v":1},{"k":"b"}]`}},

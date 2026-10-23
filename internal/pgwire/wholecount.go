@@ -379,11 +379,16 @@ func plainItem(e map[string]any) bool {
 		case "", "STAR", "COLUMN_REF", "CONSTANT", "CAST", "OPERATOR", "COMPARISON", "CONJUNCTION", "CASE", "BETWEEN", "COLLATE":
 			return false
 		case "FUNCTION":
-			return m["is_operator"] != true
+			return m["is_operator"] != true && !operatorMacros[strings.ToLower(str(m["function_name"]))]
 		}
 		return true
 	})
 }
+
+// operatorMacros are the macros Igloo writes for an operator, which the
+// rewrites take for one: sf_div is Snowflake's / (see snowflake.Macros).
+// What they apply to is looked at as an operator's operands are.
+var operatorMacros = map[string]bool{"sf_div": true}
 
 // volatile are DuckDB's functions whose result differs from one call to
 // the next.

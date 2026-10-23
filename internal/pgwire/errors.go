@@ -161,6 +161,11 @@ func sqlState(err *duckdb.Error) codes.Code {
 		}
 		return codes.SyntaxErrorOrAccessRuleViolation
 	case duckdb.ErrorTypeConversion, duckdb.ErrorTypeInvalidInput:
+		// Snowflake's division by zero, which sf_div raises with error()
+		// (see snowflake.Macros).
+		if strings.HasSuffix(msg, "division by zero") {
+			return codes.DivisionByZero
+		}
 		return codes.InvalidTextRepresentation
 	case duckdb.ErrorTypeOutOfRange:
 		return codes.NumericValueOutOfRange

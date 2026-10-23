@@ -250,6 +250,41 @@ var macros = []string{
 		WHEN x IS NULL THEN CAST('null' AS JSON) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_fields_json(l, s, j) AS CASE WHEN s IS NOT NULL THEN to_json(s) ELSE sf_parts_json(l, j) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_fields_string(l, s, j) AS coalesce(s, json_extract_string(sf_parts_json(l, j), '$'))`,
+	// Division (see divisions). Snowflake divides two NUMBERs into a NUMBER
+	// whose scale is the dividend's plus 6, at least 6 and at most 12 (or
+	// the dividend's own, if larger), rounded half away from zero: 1/3 is
+	// 0.333333, 41/640 is 0.064063. A FLOAT on either side gives a FLOAT.
+	// Dividing anything but NULL by zero fails, FLOATs too. DuckDB's typeof
+	// is a constant for any argument, aggregates and windows included, so
+	// the scale and the branch are chosen when the statement is bound; the
+	// result is a DOUBLE, as DuckDB's / gives. sf_num_scale is the scale of
+	// a NUMBER of DuckDB type t (0 for an integer), NULL for any other type.
+	`CREATE OR REPLACE TEMP MACRO sf_num_scale(t) AS CASE
+		WHEN t IN ('TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT', 'UTINYINT', 'USMALLINT', 'UINTEGER') THEN 0
+		WHEN t LIKE 'DECIMAL(%' THEN CAST(regexp_extract(t, ',(\d+)\)', 1) AS INTEGER) END`,
+	// Integers are divided exactly, in BIGINT while it holds the operands
+	// (about 1 ns a row more than DuckDB's /), else in HUGEINT; q is
+	// DuckDB's quotient, for operands of more than 30 digits.
+	`CREATE OR REPLACE TEMP MACRO sf_div_int(a, b, q) AS CASE
+		WHEN abs(a) < 4000000000000 AND abs(b) < 1000000000000000000 THEN CAST(sign(a) * sign(b) *
+			((2 * abs(CAST(a AS BIGINT)) * 1000000 + abs(CAST(b AS BIGINT))) // (2 * abs(CAST(b AS BIGINT)))) AS DOUBLE) / 1000000
+		WHEN abs(a) < 1000000000000000000000000000000 AND abs(b) < 10000000000000000000000000000000000000 THEN CAST(sign(a) * sign(b) *
+			((2 * abs(CAST(a AS HUGEINT)) * 1000000 + abs(CAST(b AS HUGEINT))) // (2 * abs(CAST(b AS HUGEINT)))) AS DOUBLE) / 1000000
+		ELSE round(q * (1 + 1e-15), 6) END`,
+	// A decimal side: the DOUBLE quotient, moved away from zero by more
+	// than its own error (a few units in the last place) and rounded, which
+	// is exact while the quotient's digits, scale included, number fewer
+	// than about 14.
+	`CREATE OR REPLACE TEMP MACRO sf_div_scaled(a, b, s1, s2) AS CASE
+		WHEN b = 0 AND a IS NOT NULL THEN error('Division by zero')
+		WHEN s1 IS NULL OR s2 IS NULL THEN a / b
+		WHEN s1 = 0 AND s2 = 0 THEN sf_div_int(a, b, a / b)
+		ELSE round(CAST(a AS DOUBLE) / CAST(b AS DOUBLE) * (1 + 1e-15), greatest(s1, least(s1 + 6, 12))) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_div(a, b) AS sf_div_scaled(a, b, sf_num_scale(typeof(a)), sf_num_scale(typeof(b)))`,
+	// sf_div names each argument several times, and DuckDB computes a
+	// subquery or a volatile function as many times as it is named; this
+	// computes each once.
+	`CREATE OR REPLACE TEMP MACRO sf_div_once(a, b) AS list_transform([{'a': a, 'b': b}], lambda s: sf_div(s.a, s.b))[1]`,
 }
 
 // Macros returns the statements that define, in a session, the macros

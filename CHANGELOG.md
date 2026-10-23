@@ -1306,6 +1306,22 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   format write the offset as Snowflake does; and `ALTER SESSION` accepts the
   output format parameters at their defaults and refuses others. Profiling
   four columns of 37 million rows takes 12% longer.
+- In Snowflake's dialect, `/` gave DuckDB's `DOUBLE` quotient, where
+  Snowflake divides two `NUMBER`s into a `NUMBER` of the dividend's scale
+  plus 6 digits (at least 6, at most 12), rounded half away from zero:
+  `1/3` is `0.333333`, `41/640` is `0.064063` and `1/3*3` is `0.999999`.
+  A report that takes a share as a ratio of two counts and then scales or
+  compares it differed from Snowflake's in the sixth significant digit (a
+  reach of 7.354377% where Snowflake's is 7.354400%, and an index of
+  1.843202 against 1.843208), and could order or filter rows otherwise.
+  Division of integers and decimals now gives Snowflake's value, as a
+  `DOUBLE`; so do `DIV0`, `DIV0NULL` and `RATIO_TO_REPORT`. Integers are
+  divided exactly, for about 1 ns a row more than before. A quotient
+  divided again is not rounded again, since a `DOUBLE` does not carry its
+  scale, and a `FLOAT` on either side still gives a `FLOAT`, unrounded.
+  Dividing by zero, which gave `Infinity`, fails with SQLSTATE 22012 as in
+  Snowflake, `FLOAT`s too; a `NULL` divided by zero is `NULL`, and `DIV0`
+  and `DIV0NULL` still give 0.
 - In Snowflake's dialect, `APPROX_COUNT_DISTINCT` and `HLL` were DuckDB's
   `approx_count_distinct`, a HyperLogLog of 64 registers that errs by about
   13% and by over 50% at worst. On an Acme table of 1.25 million rows it

@@ -367,12 +367,14 @@ func pairCountSelect(pieces pieceText, masked string, m map[string]any) (string,
 
 // isAggregateCall reports whether an expression is a call of an aggregate
 // the rewrite knows, or of another function that might be one: any
-// function but operators and the scalar functions in pairScalars.
+// function but operators, operatorMacros and the scalar functions in
+// pairScalars.
 func isAggregateCall(e map[string]any) bool {
 	if str(e["class"]) != "FUNCTION" || e["is_operator"] == true {
 		return false
 	}
-	return !pairScalars[strings.ToLower(str(e["function_name"]))]
+	name := strings.ToLower(str(e["function_name"]))
+	return !pairScalars[name] && !operatorMacros[name]
 }
 
 // pairScalars are the scalar functions an item may apply to its
@@ -417,7 +419,7 @@ func outsideAggregates(n any) bool {
 			switch str(n["class"]) {
 			case "", "CONSTANT", "CAST", "OPERATOR", "COMPARISON", "CONJUNCTION", "CASE", "BETWEEN":
 			case "FUNCTION":
-				if n["is_operator"] != true && !pairScalars[strings.ToLower(str(n["function_name"]))] {
+				if name := strings.ToLower(str(n["function_name"])); n["is_operator"] != true && !pairScalars[name] && !operatorMacros[name] {
 					ok = false
 				}
 			default:

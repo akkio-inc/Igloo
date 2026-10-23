@@ -321,11 +321,13 @@ What Igloo cannot reproduce exactly, and what it does instead.
 
 **Numbers**
 
-- `/` returns `DOUBLE`. Snowflake returns a `NUMBER` with up to 6 more
-  decimal digits, rounded: `1/3*3` is `1` in Igloo, `0.999999` in
-  Snowflake. Cast to `NUMBER(p,s)` where the scale matters.
-- Division by zero returns `Infinity` (`NULL` for `//`); Snowflake fails.
-  Use `DIV0` or `DIV0NULL` to get the same result in both.
+- `/` of two `NUMBER`s gives Snowflake's quotient, rounded half away from
+  zero to the dividend's scale plus 6 digits (at least 6, at most 12):
+  `1/3*3` is `0.999999` in both. It is a `DOUBLE`, though, not a
+  `NUMBER(p,s)`, so a quotient divided again is not rounded to Snowflake's
+  scale: `(1/3)/(2/3)` is `0.499999250000375` in Igloo, `0.499999250000`
+  in Snowflake. Cast to `NUMBER(p,s)` where the scale matters. A `FLOAT`
+  on either side gives a `FLOAT`, as in Snowflake.
 - Integer types are `BIGINT`, not `NUMBER(38,0)`: arithmetic that leaves
   64 bits fails with an overflow error where Snowflake's 38 digits would
   hold it.

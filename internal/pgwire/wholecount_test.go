@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 // wholeCountDB is a DuckDB database with the tables the whole-count tests
@@ -20,10 +21,11 @@ func wholeCountDB(t *testing.T) (*sql.DB, func(string) (any, error)) {
 	}
 	t.Cleanup(func() { db.Close() })
 	db.SetMaxOpenConns(1)
-	for _, s := range []string{
+	// Igloo's macros, which translations from Snowflake's dialect call.
+	for _, s := range append(snowflake.Macros(),
 		"CREATE TABLE t AS SELECT i AS id, i % 13 AS x, 'row ' || i AS s FROM range(1, 101) r(i)",
 		"CREATE TABLE u AS SELECT i * 2 AS id, i % 7 AS x, 'u' || i AS v FROM range(1, 41) r(i)",
-	} {
+	) {
 		if _, err := db.Exec(s); err != nil {
 			t.Fatal(err)
 		}
@@ -85,6 +87,8 @@ func TestWholeCounts(t *testing.T) {
 		// Other aggregates over the whole result.
 		"SELECT id, min(x) OVER () AS lo, max(x) OVER () AS hi FROM t WHERE id > 10",
 		"SELECT id, MAX ( s ) over ( ) AS hi, count(t.x) OVER () AS n FROM t",
+		// Snowflake's division, as its translation writes it.
+		"SELECT id, sf_div(id, x) AS r, count(*) OVER () AS n FROM t WHERE x > 0",
 		"SELECT a.id, min(a.x) OVER () AS lo, count(*) OVER () AS n FROM t AS a, u WHERE a.id = u.id ORDER BY a.id LIMIT 4",
 		// NULLs count and compare as in the window: none, and none at all.
 		"SELECT id, count(CASE WHEN x > 5 THEN x END) OVER () AS n, min(CASE WHEN x > 50 THEN s END) OVER () AS m FROM t",
@@ -119,6 +123,7 @@ func TestWholeCounts(t *testing.T) {
 		"SELECT count(*) OVER ()",
 		"SELECT (count(*) OVER ()) AS n FROM t",
 		"SELECT upper(s), count(*) OVER () FROM t",
+		"SELECT sf_div(sum(x), 2), count(*) OVER () FROM t",
 		"SELECT (SELECT max(x) FROM u), count(*) OVER () FROM t",
 		"WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n, count(*) OVER () FROM r",
 		"SELECT 'count(*) over ()' FROM t",

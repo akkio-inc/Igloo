@@ -26,7 +26,16 @@ func TestTranslate(t *testing.T) {
 			`SELECT coalesce(a, 0) "N", CASE WHEN a IS NOT NULL THEN 1 ELSE 2 END "N2", coalesce(a, 0) "Z", nullif(a, 0) "NZ", (a IS NOT DISTINCT FROM b) "E" FROM t`},
 		{`SELECT DECODE(x, 1, 'one', NULL, 'none', 'other') AS d FROM t`,
 			`SELECT CASE WHEN x IS NOT DISTINCT FROM 1 THEN 'one' WHEN x IS NOT DISTINCT FROM NULL THEN 'none' ELSE 'other' END AS "D" FROM t`},
-		{`SELECT DIV0(a, b) AS q FROM t`, `SELECT CASE WHEN b = 0 THEN 0 ELSE a / b END AS "Q" FROM t`},
+		{`SELECT DIV0(a, b) AS q FROM t`, `SELECT CASE WHEN b = 0 THEN 0 ELSE sf_div(a, b) END AS "Q" FROM t`},
+		// Division: the dividend is the operands that *, / and % before it
+		// join, from the left, with their unary signs.
+		{`SELECT a / b, a * b / c % d / e AS m, x - a / -b + 1 AS s, x * -a / b AS u, -a / 2 AS n, 1 / 3 * 3 AS t FROM t ORDER BY a / b DESC`,
+			`SELECT sf_div(a, b) AS "A / B", sf_div(sf_div(a * b, c) % d, e) AS "M", x - sf_div(a, -b) + 1 AS "S", sf_div(x * -a, b) AS "U", sf_div(-a, 2) AS "N", sf_div(1, 3) * 3 AS "T" FROM t ORDER BY sf_div(a, b) DESC NULLS FIRST`},
+		{`SELECT sum(x) / nullif(count(DISTINCT y), 0) AS a, sum(x) OVER (PARTITION BY g) / count(*) OVER () AS b, t.a / u."B" AS c, CASE WHEN a THEN 1 ELSE 2 END / CASE WHEN b THEN 3 END AS d, percentile_cont(0.5) WITHIN GROUP (ORDER BY x) / 2 AS e, (a + b) / 2 AS f FROM t, u`,
+			`SELECT sf_div(sum(x), nullif(count(DISTINCT y), 0)) AS "A", sf_div(sum(x) OVER (PARTITION BY g), count(*) OVER ()) AS "B", sf_div(t.a, u."B") AS "C", sf_div(CASE WHEN a THEN 1 ELSE 2 END, CASE WHEN b THEN 3 END) AS "D", sf_div(percentile_cont(0.5) WITHIN GROUP (ORDER BY x NULLS LAST), 2) AS "E", sf_div((a + b), 2) AS "F" FROM t, u`},
+		// A subquery or a volatile function is computed once.
+		{`SELECT count(*) / (SELECT count(*) FROM u) AS a, RANDOM() / 2 AS b FROM t`,
+			`SELECT sf_div_once(count(*), (SELECT count(*) FROM u)) AS "A", sf_div_once(CAST((random() - 0.5) * 18446744073709549568.0 AS BIGINT), 2) AS "B" FROM t`},
 		{`SELECT GREATEST(a, b) AS g FROM t`, `SELECT CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE greatest(a, b) END AS "G" FROM t`},
 		// Dates and times.
 		{`SELECT DATEADD(day, 1, d) AS a, DATEADD('month', -1, d) AS b, TIMESTAMPADD(hour, 2, ts) AS c FROM t`,
@@ -50,7 +59,7 @@ func TestTranslate(t *testing.T) {
 		{`SELECT ARRAY_AGG(x) WITHIN GROUP (ORDER BY y DESC) AS a FROM t`,
 			`SELECT coalesce(to_json(list(sf_to_json(x) ORDER BY y DESC NULLS FIRST) FILTER (WHERE sf_to_json(x) IS NOT NULL)), CAST('[]' AS JSON)) AS "A" FROM t`},
 		{`SELECT x, RATIO_TO_REPORT(x) OVER (PARTITION BY g) AS r FROM t`,
-			`SELECT x, (x / nullif(sum(x) OVER (PARTITION BY g), 0)) AS "R" FROM t`},
+			`SELECT x, sf_div(x, nullif(sum(x) OVER (PARTITION BY g), 0)) AS "R" FROM t`},
 		{`SELECT lag(x) IGNORE NULLS OVER (ORDER BY o) AS l FROM t`, `SELECT lag(x IGNORE NULLS) OVER (ORDER BY o NULLS LAST) AS "L" FROM t`},
 		// Semi-structured data.
 		{`SELECT v:a.b[0]::string AS s, v:c AS c FROM t WHERE v:type = 'click' AND v:n > 5`,

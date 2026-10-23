@@ -417,8 +417,8 @@ func init() {
 	add(tmpl(1, "coalesce(", 0, ", 0)"), "ZEROIFNULL")
 	add(tmpl(1, "nullif(", 0, ", 0)"), "NULLIFZERO")
 	add(tmpl(2, "(", 0, " IS NOT DISTINCT FROM ", 1, ")"), "EQUAL_NULL")
-	add(tmpl(2, "CASE WHEN ", 1, " = 0 THEN 0 ELSE ", 0, " / ", 1, " END"), "DIV0")
-	add(tmpl(2, "CASE WHEN ", 1, " = 0 OR ", 1, " IS NULL THEN 0 ELSE ", 0, " / ", 1, " END"), "DIV0NULL")
+	add(tmpl(2, "CASE WHEN ", 1, " = 0 THEN 0 ELSE sf_div(", 0, ", ", 1, ") END"), "DIV0")
+	add(tmpl(2, "CASE WHEN ", 1, " = 0 OR ", 1, " IS NULL THEN 0 ELSE sf_div(", 0, ", ", 1, ") END"), "DIV0NULL")
 	add(simple(decode), "DECODE")
 	add(simple(greatestLeast), "GREATEST", "LEAST")
 	add(rename("greatest", 1, -1), "GREATEST_IGNORE_NULLS")
@@ -1942,7 +1942,7 @@ func ratioToReport(c *call) (*node, error) {
 	if c.over == nil {
 		return nil, &Error{Code: CodeSyntax, Message: "RATIO_TO_REPORT needs OVER (...)"}
 	}
-	return c.out("(", c.op(0), " / nullif(sum(", c.arg(0), ")", c.over, ", 0))"), nil
+	return c.out("sf_div(", c.arg(0), ", nullif(sum(", c.arg(0), ")", c.over, ", 0))"), nil
 }
 
 // conditionalTrueEvent translates CONDITIONAL_TRUE_EVENT(condition) OVER

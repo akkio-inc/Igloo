@@ -8,7 +8,7 @@ SELECT coalesce(a, 0) AS "NVL(A, 0)", CASE WHEN a IS NOT NULL THEN 1 ELSE 2 END 
 SELECT CASE WHEN x IS NOT DISTINCT FROM 1 THEN 'one' WHEN x IS NOT DISTINCT FROM 2 THEN 'two' ELSE 'other' END AS "DECODE(X, 1, 'ONE', 2, 'TWO', 'OTHER')" FROM t
 
 -- SELECT DIV0(a, b), DIV0NULL(a, b) FROM t
-SELECT CASE WHEN b = 0 THEN 0 ELSE a / b END AS "DIV0(A, B)", CASE WHEN b = 0 OR b IS NULL THEN 0 ELSE a / b END AS "DIV0NULL(A, B)" FROM t
+SELECT CASE WHEN b = 0 THEN 0 ELSE sf_div(a, b) END AS "DIV0(A, B)", CASE WHEN b = 0 OR b IS NULL THEN 0 ELSE sf_div(a, b) END AS "DIV0NULL(A, B)" FROM t
 
 -- SELECT GREATEST(a, b), LEAST(a, b) FROM t
 SELECT CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE greatest(a, b) END AS "GREATEST(A, B)", CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE least(a, b) END AS "LEAST(A, B)" FROM t
@@ -84,7 +84,7 @@ NOTICE: HASH computes DuckDB's hash, not Snowflake's: the values differ from Sno
 SELECT MEDIAN(x) AS "MEDIAN(X)", MODE(x) AS "MODE(X)", approx_count_distinct(x) AS "APPROX_COUNT_DISTINCT(X)", approx_count_distinct(x) AS "HLL(X)" FROM t
 
 -- SELECT x, RATIO_TO_REPORT(x) OVER (PARTITION BY g) FROM t
-SELECT x, (x / nullif(sum(x) OVER (PARTITION BY g), 0)) AS "RATIO_TO_REPORT(X) OVER (PARTITION BY G)" FROM t
+SELECT x, sf_div(x, nullif(sum(x) OVER (PARTITION BY g), 0)) AS "RATIO_TO_REPORT(X) OVER (PARTITION BY G)" FROM t
 
 -- SELECT SEQ4() FROM TABLE(GENERATOR(ROWCOUNT => 10))
 SELECT (row_number() OVER () - 1) AS "SEQ4()" FROM range(CAST(10 AS BIGINT)) AS "generator"(_sf_row)

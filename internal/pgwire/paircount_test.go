@@ -79,6 +79,10 @@ func TestPairCounts(t *testing.T) {
 		"SELECT 'X' AS c, CAST(NULL AS DOUBLE) AS d, k AS k, min(v) AS lo, max(s) AS hi, count(*) AS n, count(b) AS nb, count(DISTINCT p.a) AS people, " +
 			"count(DISTINCT CASE WHEN p.a IS NOT NULL AND p.b IS NOT NULL THEN (p.a, p.b) END) / NULLIF(count(DISTINCT p.a), 0) AS per " +
 			"FROM p WHERE id > 20 GROUP BY k",
+		// The same with Snowflake's division, as its translation writes it.
+		"SELECT k AS k, count(DISTINCT p.a) AS people, sf_div(count(DISTINCT CASE WHEN p.a IS NOT NULL AND p.b IS NOT NULL THEN (p.a, p.b) END), " +
+			"NULLIF(count(DISTINCT p.a), 0)) AS per, " +
+			"sf_div(max(v), count(*)) AS share FROM p WHERE id > 20 GROUP BY k",
 		// A key expression, an alias named like a column, the WHEN in
 		// another order than the tuple, a count of the other value.
 		"SELECT upper(k) AS a, count(DISTINCT CASE WHEN b IS NOT NULL AND a IS NOT NULL THEN (a, b) END) AS pairs, count(DISTINCT b) AS days " +
