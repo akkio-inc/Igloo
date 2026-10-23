@@ -98,6 +98,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Workers:         r.parts.workers,
 		Stages:          r.parts.stages,
 		Exchanges:       r.parts.exchanges,
+		PlanKey:         r.parts.key,
 	}
 	if r.err != nil && q.Outcome != audit.OutcomeOK {
 		q.SQLState = string(pgerror.GetCode(pgError(r.err)))

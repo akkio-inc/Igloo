@@ -1205,8 +1205,8 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			run := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
+				parts = p
 				if done {
-					parts = p
 					return err
 				}
 				return s.runStatement(ctx, sess, st, args, tw)
@@ -1243,6 +1243,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			for _, c := range st.created {
 				s.recordOwner(ctx, user, c)
 			}
+		}
+		if err == nil && parts.key != "" {
+			// How long it took where it ran, for where it runs next time.
+			s.dist.Observe(parts.key, parts.workers, time.Since(start))
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts})

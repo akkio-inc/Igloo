@@ -192,13 +192,37 @@ worker.
 
 ### When
 
-With workers running, Igloo distributes a part when its large table is more
-data than the replica scans in about four seconds: 4 seconds at 64 MiB/s
-per thread, so 4 GiB for a 16-thread replica. Workers that are stopped are
-started only for a part that would take over a minute, since a start takes a
-while and the workers then run until they have been idle. Each worker is
-given at least a gigabyte of the large table, so smaller statements use
-fewer workers.
+A statement never runs on workers when the replica alone would be faster.
+Workers read cold data from object storage, and a statement built in steps
+waits for each step to be written there and read back, so workers pay off
+only for statements that take a while: at 1x, the audience reports that
+took 6 to 56 seconds on one replica took 37 to 176 seconds on four workers.
+
+So Igloo considers a statement for workers only when its largest table is
+more than the replica scans in about four seconds (4 GiB for a 16-thread
+replica; workers that are stopped are started only for a minute's worth).
+For such a statement it estimates two times: the replica's, at 150 MB/s per
+thread over the tables the statement reads, and the workers', at 50 MB/s per
+worker thread from object storage plus about 4 seconds for each round of
+tasks that waits for the one before it, plus the time to start workers that
+are stopped. It runs the statement on workers only if the replica would
+take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or would run short of
+memory (the rows its joins and distinct counts hold, estimated at three
+times what feeds them, over 70% of its memory limit), and the workers are
+estimated to be at least 1.5 times faster. It uses the fewest workers
+estimated within a fifth of the fastest time.
+
+Estimates are rough, so Igloo corrects them with what the same statement
+took before. It recognizes a statement run again, as BI tools run theirs, by
+its text without its literals (other than integers) and the sizes of its
+tables to a factor of two: `query_history.plan_key`. Each replica remembers
+the last 4,096 such statements, and reads the past week's from the query
+history when it starts. A statement that ran both ways runs where it was
+faster. One that ran only on the replica, within the threshold or well
+within its estimate, stays there; one that ran longer there is tried on
+workers at most once a day. One that ran only on workers stays there if it
+beat its estimates. The server logs each choice, `chose where a statement
+runs`, with both estimates and the reason.
 
 A session can change that for testing and benchmarks:
 
@@ -209,10 +233,10 @@ SET distributed_execution = 'auto';  -- the default; RESET does the same
 SHOW distributed_execution;
 ```
 
-`on` lets admins start workers and use all of them for any statement. For
-other users it distributes whatever can be distributed, but only on
-workers already running and on no more of them than the automatic decision
-would use for the tables' sizes; it never starts a worker. So no user can
+`on` lets admins start workers and use all of them for any statement,
+whatever the estimates. For other users it distributes whatever can be
+distributed, but only on workers already running and on no more of them
+than the automatic decision would use; it never starts a worker. So no user can
 start a fleet of machines, or keep one busy, by repeating a query.
 
 ## Same results as one machine
@@ -451,6 +475,7 @@ On the Igloo server:
 | `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
 | `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
+| `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [where a statement runs](#where-a-statement-runs)) |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |

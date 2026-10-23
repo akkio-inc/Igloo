@@ -78,6 +78,10 @@ type Query struct {
 	// Stages is how many stages of tasks ran those parts, and Exchanges how
 	// many exchanges of rows between stages they wrote.
 	Stages, Exchanges int
+	// PlanKey identifies a statement that could run on workers across its
+	// runs (distributed.Plan.Key), so that where it ran faster decides where
+	// it runs next, after a restart too; empty for others.
+	PlanKey string
 }
 
 // Resources is what DuckDB's profiler measured while a statement ran.

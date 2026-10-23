@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
@@ -142,6 +144,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: source, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
 		Warehouse: cfg.Storage.Root(), Threads: threads, Metrics: distributed.NewMetrics(reg),
+		MemoryBytes: eng.MemoryLimit(ctx), Threshold: cfg.Workers.Threshold,
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, StartTimeout: cfg.Workers.StartTimeout,
@@ -152,6 +155,36 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	}
 	log.Info("distributed execution is on", "workers", cfg.Workers.Addresses, "compute", cfg.Workers.Compute, "max_workers", cfg.Workers.Max)
 	return co, nil
+}
+
+// seedRuns tells co how long statements that could run on workers took in
+// the past week, by their plan keys, from the query history, so that auto
+// mode keeps choosing the faster after a restart (see distributed.Run).
+func seedRuns(ctx context.Context, co interface{ Seed([]distributed.Run) }, store audit.Store, log *slog.Logger) {
+	const pageSize, most = 1000, 20000
+	page := audit.Page{Since: time.Now().Add(-7 * 24 * time.Hour), Limit: pageSize}
+	var rs []distributed.Run
+	for read := 0; read < most; read += pageSize {
+		qs, err := store.Queries(ctx, audit.Viewer{All: true}, page)
+		if err != nil {
+			log.Warn("could not read past statements' runs for distributed execution", "err", err)
+			break
+		}
+		for _, q := range qs {
+			if q.PlanKey != "" && q.Outcome == audit.OutcomeOK {
+				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Duration: q.Duration})
+			}
+		}
+		if len(qs) < pageSize {
+			break
+		}
+		last := qs[len(qs)-1]
+		page.AfterTime, page.AfterID = last.Start, last.ID
+	}
+	// Newest first: oldest first, so the last run weighs most.
+	slices.Reverse(rs)
+	co.Seed(rs)
+	log.Debug("read past statements' runs for distributed execution", "runs", len(rs))
 }
 
 // workerCompute returns the driver that starts and stops workers, or nil

@@ -381,6 +381,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `locations_read` | Locations outside the catalog that it read files from: `COPY INTO`'s, and the files a function such as `read_parquet` names; never external tables' files, which are read through the tables |
 | `job` | The task, pipe or materialized view it ran for, such as `task nightly`; `NULL` for a session's own statements |
 | `workers`, `stages`, `exchanges` | How many workers ran parts of the statement ([distributed execution](distributed-execution.md)), in how many stages of tasks, and how many exchanges of rows from one stage to later ones the stages wrote; 0 when it ran on one replica |
+| `plan_key` | For a statement that could run on workers, what identifies it across runs: its text without literals other than integers, and its tables' sizes to a factor of two; `auto` mode runs it where it was faster before ([distributed execution](distributed-execution.md#when)); `NULL` for others |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,

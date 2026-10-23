@@ -3,6 +3,7 @@ package distributed
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -92,6 +94,13 @@ type Options struct {
 	// the coordinator's disk; past it, the statement runs on the
 	// coordinator instead. Zero means 1 GiB.
 	MaxSpoolBytes int64
+	// MemoryBytes is the coordinator's DuckDB memory limit, for estimating
+	// whether a statement fits it (see choose); zero for unknown.
+	MemoryBytes int64
+	// Threshold is how long a statement must take on one machine before
+	// auto mode runs it on workers, unless it would run short of memory.
+	// Zero means DefaultThreshold.
+	Threshold time.Duration
 }
 
 // Coordinator splits statements into parts that workers run.
@@ -110,6 +119,8 @@ type Coordinator struct {
 	log         *slog.Logger
 	stop        context.CancelFunc
 	done        chan struct{}
+	// history is what statements took before, for auto mode (see choose).
+	history *history
 }
 
 // NewCoordinator returns a coordinator for the workers opts.Pool names.
@@ -157,7 +168,7 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 	ctx, stop := context.WithCancel(context.Background())
 	co := &Coordinator{
 		opts: opts, parser: p, aggs: aggs, dir: dir, log: log, stop: stop, done: make(chan struct{}),
-		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log),
+		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log), history: newHistory(),
 	}
 	go func() {
 		defer close(co.done)
@@ -253,7 +264,45 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, err
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
+	plan.Key = planKey(stmt, plan.Stages)
+	e := estimateTimes(plan.Stages, co.opts.Threads, co.opts.MemoryBytes, co.fleet(ws, plan.mayStart))
+	plan.workers = e.workers
+	if mode != ModeAuto {
+		return plan, nil
+	}
+	r, found := co.history.get(plan.Key)
+	now := time.Now()
+	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
+	where := "one machine"
+	if onWorkers {
+		where = "workers"
+	}
+	co.log.Info("chose where a statement runs", "on", where, "reason", reason, "key", plan.Key,
+		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers,
+		"levels", e.levels, "bytes", e.bytes, "short_of_memory", e.memory)
+	if !onWorkers {
+		return nil, &errUnsupported{reason: "one machine is faster: " + reason, key: plan.Key}
+	}
+	if explore {
+		co.history.update(plan.Key, func(r *runs) { r.explored = now })
+	}
 	return plan, nil
+}
+
+// fleet describes the workers for an estimate: ws, those that answer, and
+// as many more as Compute may start if mayStart.
+func (co *Coordinator) fleet(ws []*worker, mayStart bool) fleet {
+	f := fleet{threads: co.opts.Threads, running: len(ws), most: len(ws)}
+	for i, w := range ws {
+		if i == 0 || w.status.Threads > f.threads {
+			f.threads = w.status.Threads
+		}
+	}
+	if mayStart && co.pool.canStart() {
+		f.most = max(f.most, co.opts.Pool.MaxWorkers)
+		f.start = co.pool.startEstimate()
+	}
+	return f
 }
 
 // Execution is a statement whose distributed parts have run.
@@ -302,16 +351,16 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 	}()
 
-	// As many workers as the largest split table has gigabytes to divide,
-	// or every one when an admin forces it. Forced by anyone else, only
-	// workers already running, and no more than the gigabytes call for.
+	// As many workers as the estimates call for (see estimateTimes), or
+	// every one when an admin forces it. Forced by anyone else, only
+	// workers already running, and no more than the estimates call for.
 	var split int64
 	for _, s := range plan.Stages {
 		if in := s.split(); in != nil {
 			split = max(split, in.Table.Bytes)
 		}
 	}
-	want := int(max(1, (split+bytesPerWorker-1)/bytesPerWorker))
+	want := max(1, plan.workers)
 	var ws []*worker
 	var err error
 	if plan.mayStart {

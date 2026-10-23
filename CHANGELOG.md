@@ -332,6 +332,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   calls for. A worker that answers with an error is never set aside, and a
   statement whose partial results would pass 1 GiB of the coordinator's
   disk, or that only filters rows, runs on the coordinator.
+- In `auto` mode a statement runs on workers only when they should be
+  faster than the replica alone: when the replica would take over
+  `IGLOO_WORKER_THRESHOLD` (a minute) or run short of memory, and workers
+  are estimated at least 1.5 times faster. Statements over 4 GiB used to
+  go to workers whatever the time, which made 1x reports of 6 to 56 s
+  take 37 to 176 s. Each replica remembers what statements took each way,
+  by `query_history.plan_key` (the text without literals and the tables'
+  sizes), and runs a statement run again where it was faster.
 - Workers run as many tasks at once as their threads and memory allow (a
   task per 4 threads and 8 GiB), and exchanges have more partitions as the
   divided tables grow, so the stages of a report that run side by side no

@@ -320,6 +320,9 @@ func serve() error {
 			return err
 		}
 		defer dist.Close() //nolint:errcheck
+		if historyStore != nil {
+			go seedRuns(ctx, dist, historyStore, log)
+		}
 	}
 
 	// srv is set before it serves anyone; single sign-on tells it about

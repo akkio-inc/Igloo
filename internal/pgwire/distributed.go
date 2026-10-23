@@ -87,8 +87,13 @@ var errWorkerMemory = pgerror.WithCode(errors.New("canceling statement: a worker
 
 // distParts is what running a statement in parts took, for the history:
 // how many workers ran them, how many stages, and how many exchanges the
-// stages wrote.
-type distParts struct{ workers, stages, exchanges int }
+// stages wrote. key is the statement's plan key (distributed.Plan.Key)
+// when it ran on workers or auto mode chose one machine for it, so that
+// how long it took informs that choice next time.
+type distParts struct {
+	workers, stages, exchanges int
+	key                        string
+}
 
 // runDistributed runs st on workers if it qualifies and writes its rows to
 // w. done is false when st did not run, and should run on this replica;
@@ -112,6 +117,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		if ctx.Err() != nil {
 			return parts, true, ctx.Err()
 		}
+		parts.key = distributed.PlanKey(err)
 		if !distributed.IsUnsupported(err) {
 			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
 		} else {
@@ -151,7 +157,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		return parts, false, nil
 	}
 	defer ex.Close()
-	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges}
+	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
 	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
 		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) {
 			return parts, true, err

@@ -415,12 +415,27 @@ func quoteLiteral(s string) string {
 
 // errUnsupported marks a statement that cannot run distributed, which then
 // runs on one machine as usual.
-type errUnsupported struct{ reason string }
+type errUnsupported struct {
+	reason string
+	// key is the statement's plan key when auto mode chose one machine
+	// for a statement that could run on workers (PlanKey).
+	key string
+}
 
 func (e *errUnsupported) Error() string { return "cannot distribute: " + e.reason }
 
 func unsupported(format string, args ...any) error {
 	return &errUnsupported{reason: fmt.Sprintf(format, args...)}
+}
+
+// PlanKey returns the plan key (Plan.Key) of a statement auto mode chose
+// to run on one machine, for Coordinator.Observe; "" for other errors.
+func PlanKey(err error) string {
+	var u *errUnsupported
+	if errors.As(err, &u) {
+		return u.key
+	}
+	return ""
 }
 
 // IsUnsupported reports whether err only says that a statement cannot run

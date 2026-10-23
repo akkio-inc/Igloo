@@ -28,6 +28,9 @@ type Workers struct {
 	IdleAfter time.Duration
 	// StartTimeout bounds how long a statement waits for workers to start.
 	StartTimeout time.Duration
+	// Threshold is how long a statement must take on one machine before
+	// auto mode runs it on workers, unless it would run short of memory.
+	Threshold time.Duration
 
 	K8sNamespace   string
 	K8sDeployment  string
@@ -102,6 +105,7 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 	}
 	w.IdleAfter = duration("IGLOO_WORKER_IDLE_AFTER", "10m")
 	w.StartTimeout = duration("IGLOO_WORKER_START_TIMEOUT", "3m")
+	w.Threshold = duration("IGLOO_WORKER_THRESHOLD", "1m")
 
 	if len(w.Addresses) == 0 {
 		return w

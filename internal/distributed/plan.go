@@ -143,6 +143,11 @@ type Plan struct {
 	// local says why parts of the statement stay on the coordinator, for
 	// logs: the first few reasons.
 	local []string
+	// Key identifies the statement in the history of its runs, for
+	// Coordinator.Observe (see planKey).
+	Key string
+	// workers is how many workers the estimates call for (estimateTimes).
+	workers int
 }
 
 // job is a candidate on its way to stages: the tables its fragment reads,

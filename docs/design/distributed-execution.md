@@ -189,19 +189,38 @@ explicit transactions, the coordinator plans it:
    appear once. Every other table must be a catalog table small enough for
    every worker to read (an eighth of the smallest worker's memory, in
    compressed bytes).
-3. **Decide.** The part is worth distributing when the split table is more
-   than the coordinator scans in about four seconds (64 MiB/s per thread,
-   a conservative rate for compressed Parquet from object storage), or a
-   minute plus the expected start time when no worker is running, since
-   started workers then run until idle. There is no threshold to tune; a
-   session can force the decision with `SET distributed_execution`. Forced
-   by an admin, a statement may start workers and uses every one; forced
-   by anyone else, it uses only workers already running, no more than the
-   tables' sizes call for, so no user can start or occupy the fleet at
-   will. A part without aggregates is distributed only when it keeps few
-   rows (`DISTINCT`, or `ORDER BY ... LIMIT` up to a million rows); a plain
+3. **Decide.** A part is a candidate when the split table is more than the
+   coordinator scans in about four seconds (64 MiB/s per thread), or a
+   minute plus the expected start time when no worker is running. A part
+   without aggregates is a candidate only when it keeps few rows
+   (`DISTINCT`, or `ORDER BY ... LIMIT` up to a million rows); a plain
    filter would only send every matching row through the coordinator's
-   disk.
+   disk. A statement with candidates then runs on workers, in auto mode,
+   only when that should be faster than the coordinator alone
+   (`internal/distributed/cost.go`). Its time on the coordinator is
+   estimated at 150 MB/s per thread over the tables its stages read, and
+   on n workers at 50 MB/s per worker thread from object storage, plus 4 s
+   for each level of stages (a round of tasks that waits for the one before
+   it) and the start time of workers not running; it uses the fewest
+   workers within a fifth of the fastest. It goes to workers if the
+   coordinator would take over `IGLOO_WORKER_THRESHOLD` (a minute) or run
+   short of memory (three times what its exchanges are fed, over 70% of the
+   memory limit), and workers are estimated 1.5 times faster. The rates are
+   from the first scale runs, where the old rule (anything over the four
+   seconds' worth) made 1x reports of 6 to 56 s take 37 to 176 s on four
+   workers. What a statement took before overrides the estimates: each
+   replica keeps, by plan key (the parse tree without non-integer literals,
+   and its tables' sizes to a factor of two), the running averages of its
+   times on one machine and on workers, for the last 4,096 statements, and
+   reads the past week's from the query history at start. A statement that
+   ran both ways runs where it was faster; one that ran on one machine
+   within the threshold, or within half its estimate, stays there; one that
+   ran longer there is tried on workers at most once a day; one that ran on
+   workers stays there if it beat its estimates. A session can force the
+   decision with `SET distributed_execution`. Forced by an admin, a
+   statement may start workers and uses every one; forced by anyone else,
+   it uses only workers already running, no more than the estimates call
+   for, so no user can start or occupy the fleet at will.
 4. **Rewrite** the part into a worker fragment and a combine step:
 
    ```sql
