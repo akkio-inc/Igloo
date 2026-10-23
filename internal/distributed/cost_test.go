@@ -38,6 +38,8 @@ func TestChoose(t *testing.T) {
 		{"ran long on one machine, tried workers today", close, runs{local: 400, explored: now.Add(-time.Hour)}, true, false, false},
 		{"ran on workers within their estimate", close, runs{dist: 200}, true, true, false},
 		{"ran on workers slower than one machine's estimate", slow, runs{dist: 500}, true, false, false},
+		{"ran out of memory on one machine", short, runs{local: 10, outOfMemory: true}, true, true, false},
+		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
 	} {
 		workers, explore, reason := choose(c.e, c.r, c.found, DefaultThreshold, now)
 		if workers != c.workers || explore != c.explore || reason == "" {
@@ -123,6 +125,21 @@ func TestHistory(t *testing.T) {
 	}
 	if _, ok := h.get("k1"); !ok {
 		t.Error("lost a key used since")
+	}
+
+	// Out of memory on one machine until it runs there again.
+	co := &Coordinator{history: newHistory()}
+	co.Seed([]Run{{Key: "m", Workers: 0, Duration: time.Minute}, {Key: "m", OutOfMemory: true}})
+	if r, _ := co.history.get("m"); !r.outOfMemory || r.local != 60 {
+		t.Errorf("runs of m: %+v", r)
+	}
+	co.Observe("m", 4, 30*time.Second)
+	if r, _ := co.history.get("m"); !r.outOfMemory {
+		t.Error("a run on workers forgot one machine ran out of memory")
+	}
+	co.Observe("m", 0, 50*time.Second)
+	if r, _ := co.history.get("m"); r.outOfMemory {
+		t.Error("a run on one machine left it out of memory")
 	}
 }
 

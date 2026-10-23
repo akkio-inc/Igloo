@@ -226,6 +226,13 @@ workers at most once a day. One that ran only on workers stays there if it
 beat its estimates. The server logs each choice, `chose where a statement
 runs`, with both estimates and the reason.
 
+A statement that auto mode ran on the replica and that runs out of memory
+there (DuckDB's out-of-memory error, or the replica's memory watch
+canceling it) before it sends a row runs again on workers, and the client
+gets its rows. The replica remembers that it ran out of memory, as it reads
+statements that failed so on the replica from the query history at start,
+and runs it on workers from then on.
+
 A session can change that for testing and benchmarks:
 
 ```sql

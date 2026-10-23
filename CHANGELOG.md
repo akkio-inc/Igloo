@@ -339,7 +339,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   go to workers whatever the time, which made 1x reports of 6 to 56 s
   take 37 to 176 s. Each replica remembers what statements took each way,
   by `query_history.plan_key` (the text without literals and the tables'
-  sizes), and runs a statement run again where it was faster.
+  sizes), and runs a statement run again where it was faster. A statement
+  auto mode ran on the replica that runs out of memory there before it
+  sends a row runs again on workers, and the client gets its rows; it runs
+  on workers from then on.
 - Workers run as many tasks at once as their cores and memory allow (a
   task per 4 cores and 8 GiB), and exchanges have more partitions as the
   divided tables grow, so the stages of a report that run side by side no

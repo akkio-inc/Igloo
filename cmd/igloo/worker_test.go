@@ -28,13 +28,15 @@ func TestSeedRuns(t *testing.T) {
 		{ID: "3", Start: now.Add(-2 * time.Hour), PlanKey: "k", Outcome: audit.OutcomeOK, Workers: 4, Duration: 30 * time.Second},
 		{ID: "4", Start: now.Add(-time.Hour), PlanKey: "k", Outcome: audit.OutcomeError, Duration: time.Second},
 		{ID: "5", Start: now.Add(-time.Minute), Outcome: audit.OutcomeOK, Duration: time.Second},
+		{ID: "6", Start: now.Add(-30 * time.Second), PlanKey: "m", Outcome: audit.OutcomeError, SQLState: "53200", Duration: time.Hour},
 	}
 	if err := store.WriteQueries(context.Background(), qs); err != nil {
 		t.Fatal(err)
 	}
 	var got seeds
 	seedRuns(context.Background(), &got, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	want := []distributed.Run{{Key: "k", Duration: 90 * time.Second}, {Key: "k", Workers: 4, Duration: 30 * time.Second}}
+	want := []distributed.Run{{Key: "k", Duration: 90 * time.Second}, {Key: "k", Workers: 4, Duration: 30 * time.Second},
+		{Key: "m", OutOfMemory: true}}
 	if !slices.Equal(got.runs, want) {
 		t.Errorf("seeded %+v, want %+v", got.runs, want)
 	}

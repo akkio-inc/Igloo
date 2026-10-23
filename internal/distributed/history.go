@@ -23,11 +23,13 @@ const maxHistory = 4096
 // runs are what a statement took: averages of its runs' seconds on one
 // machine and on workers, zero for none, weighing the last run as much as
 // all the earlier ones, and when it last ran on workers against the
-// estimates.
+// estimates. outOfMemory says its last run on one machine ran out of
+// memory.
 type runs struct {
 	key         string
 	local, dist float64
 	explored    time.Time
+	outOfMemory bool
 }
 
 func newHistory() *history {
@@ -71,6 +73,8 @@ func (h *history) observe(key string, onWorkers bool, seconds float64) {
 		avg := &r.local
 		if onWorkers {
 			avg = &r.dist
+		} else {
+			r.outOfMemory = false
 		}
 		if *avg == 0 {
 			*avg = seconds
@@ -82,11 +86,12 @@ func (h *history) observe(key string, onWorkers bool, seconds float64) {
 
 // Run is a statement's past run, for auto mode's choice of where it runs
 // next: its plan key (Plan.Key), the workers it ran on (0 for one
-// machine) and how long it took.
+// machine) and how long it took, or that it ran out of memory.
 type Run struct {
-	Key      string
-	Workers  int
-	Duration time.Duration
+	Key         string
+	Workers     int
+	Duration    time.Duration
+	OutOfMemory bool
 }
 
 // Observe records how long a statement whose plan key is key (Plan.Key,
@@ -97,10 +102,23 @@ func (co *Coordinator) Observe(key string, workers int, d time.Duration) {
 	}
 }
 
+// ObserveOutOfMemory records that a statement whose plan key is key ran
+// out of memory on one machine, so that auto mode runs it on workers next
+// time (see choose).
+func (co *Coordinator) ObserveOutOfMemory(key string) {
+	if key != "" {
+		co.history.update(key, func(r *runs) { r.outOfMemory = true })
+	}
+}
+
 // Seed records past runs, oldest first, as from the query history when
 // the server starts.
 func (co *Coordinator) Seed(rs []Run) {
 	for _, r := range rs {
+		if r.OutOfMemory {
+			co.ObserveOutOfMemory(r.Key)
+			continue
+		}
 		co.Observe(r.Key, r.Workers, r.Duration)
 	}
 }

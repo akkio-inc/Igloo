@@ -38,6 +38,9 @@ type lakeSource struct {
 	// conn is the engine's, set once the server runs.
 	conn  *duckdb.Conn
 	files map[string][]distributed.File
+	// size, if set, is the size every table claims, so that auto mode
+	// weighs it as a large one.
+	size int64
 }
 
 func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distributed.Table, error) {
@@ -81,6 +84,9 @@ func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distribut
 		}
 		files = append(files, distributed.File{Path: path, Size: info.Size()})
 		t.Bytes += info.Size()
+	}
+	if s.size > 0 {
+		t.Bytes = s.size
 	}
 	s.files[schema+"."+name] = files
 	return t, nil
@@ -428,6 +434,90 @@ func TestDistributedOutOfMemory(t *testing.T) {
 	}
 	if q := lastRun(t, ds.history, query); q.SQLState != "53200" {
 		t.Errorf("history: %s %s", q.Outcome, q.SQLState)
+	}
+}
+
+// A statement that auto mode runs here, and that runs out of memory here
+// before it sends a row, runs again on workers, and the client gets its
+// rows as if nothing had happened; the next time, it runs on workers
+// directly. So does one the memory watch cancels (ShedMemory).
+func TestDistributedAfterOutOfMemory(t *testing.T) {
+	ds := startDistServer(t, 2)
+	// Large enough for auto mode to weigh, small enough for one machine.
+	ds.source.size = 1 << 30
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	ctx := context.Background()
+	read := func(query string) string {
+		t.Helper()
+		rows, err := conn.Query(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b strings.Builder
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprintln(&b, vals...)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		return b.String()
+	}
+	for _, c := range []struct {
+		name, query string
+		fail        func(ctx context.Context) error
+	}{
+		{"DuckDB out of memory", "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount",
+			func(context.Context) error {
+				return &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to pin block of size 256.0 KiB"}
+			}},
+		{"canceled by the memory watch", "SELECT amount, sum(id) AS s FROM orders GROUP BY amount ORDER BY amount",
+			func(ctx context.Context) error {
+				if !ds.srv.ShedMemory(64 << 20) {
+					return errors.New("nothing to shed")
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mustExec(t, conn, "SET distributed_execution = off")
+			want := read(c.query)
+			mustExec(t, conn, "RESET distributed_execution")
+			var mu sync.Mutex
+			failed := 0
+			ds.srv.failLocal = func(ctx context.Context, st *statement) error {
+				if !strings.Contains(st.query, "FROM orders GROUP BY amount") {
+					return nil
+				}
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return c.fail(ctx)
+			}
+			defer func() { ds.srv.failLocal = nil }()
+			if got := read(c.query); got != want {
+				t.Errorf("after running out of memory here:\n%s\nwant:\n%s", got, want)
+			}
+			if q := lastRun(t, ds.history, c.query); q.Workers == 0 || q.Outcome != audit.OutcomeOK || q.PlanKey == "" {
+				t.Errorf("history: %d workers, %s %s, plan key %q", q.Workers, q.Outcome, q.SQLState, q.PlanKey)
+			}
+			if got := read(c.query); got != want {
+				t.Errorf("run again:\n%s\nwant:\n%s", got, want)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if failed != 1 {
+				t.Errorf("ran here %d times, want once", failed)
+			}
+			if q := lastRun(t, ds.history, c.query); q.Workers == 0 {
+				t.Error("run again, it ran here")
+			}
+		})
 	}
 }
 

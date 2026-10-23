@@ -221,7 +221,11 @@ explicit transactions, the coordinator plans it:
    ran both ways runs where it was faster; one that ran on one machine
    within the threshold, or within half its estimate, stays there; one that
    ran longer there is tried on workers at most once a day; one that ran on
-   workers stays there if it beat its estimates. A session can force the
+   workers stays there if it beat its estimates. One that ran out of memory
+   on one machine runs on workers: when it does, before it has sent a row,
+   it runs again on workers at once, as an admin's forced statement would,
+   from a fresh context if the memory watch's cancel ended the first.
+   A session can force the
    decision with `SET distributed_execution`. Forced by an admin, a
    statement may start workers and uses every one; forced by anyone else,
    it uses only workers already running, no more than the estimates call

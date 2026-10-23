@@ -3,10 +3,12 @@
 package pgwire
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -267,6 +269,10 @@ type Server struct {
 	fed     *federation.Manager
 	remotes connectionSource
 	dist    *distributed.Coordinator
+	// failLocal, if set, runs before a statement runs on this replica, and
+	// fails it with its error; tests use it to make a statement run out of
+	// memory here.
+	failLocal func(ctx context.Context, st *statement) error
 	// rooms carries out clean room statements; partners are Delta
 	// Sharing's recipients and providers, which partners are.
 	rooms    *cleanroom.Service
@@ -784,6 +790,37 @@ var errStatementTimeout = pgerror.WithCode(errors.New("canceling statement due t
 var errMemoryShed = pgerror.WithCode(errors.New("canceling statement: the server was running out of memory, "+
 	"and this statement had run the longest; run it again, or on less data at a time"), codes.OutOfMemory)
 
+// runLocal runs st on this replica, unless failLocal, a test's, fails it.
+func (s *Server) runLocal(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
+	if s.failLocal != nil {
+		if err := s.failLocal(ctx, st); err != nil {
+			return err
+		}
+	}
+	return s.runStatement(ctx, sess, st, args, w)
+}
+
+// rearm returns the context to run a statement again under after ctx, the
+// one runCancelable gave it, ended because the memory watch canceled it:
+// one under outer that a cancel request or the memory watch can end, with
+// what is left of the statement timeout. While ctx lasts, it is ctx.
+func (sess *session) rearm(outer, ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	var again context.Context
+	var cancel context.CancelFunc
+	if d, ok := ctx.Deadline(); ok {
+		again, cancel = context.WithDeadline(outer, d)
+	} else {
+		again, cancel = context.WithCancel(outer)
+	}
+	sess.mu.Lock()
+	sess.running, sess.shed = cancel, false
+	sess.mu.Unlock()
+	return again, cancel
+}
+
 // runCancelable runs fn with a context that a cancel request, or the
 // session's statement timeout, can end. query is the statement as the
 // client sent it, which the console lists while it runs.
@@ -1232,14 +1269,19 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		// the metrics and ownership bookkeeping below, to keep the exclusive
 		// window short (see catalogRunLock, holdCatalog).
 		releaseCatalog := s.catalogRunLock(sess, st)
+		outer := ctx
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			run := func() error {
-				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw)
+				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
 				parts = p
 				if done {
 					return err
 				}
-				return s.runStatement(ctx, sess, st, args, tw)
+				err = s.runLocal(ctx, sess, st, args, tw)
+				if err != nil && parts.key != "" && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
+					return s.afterOutOfMemory(outer, ctx, sess, st, args, tw, &parts, err)
+				}
+				return err
 			}
 			switch {
 			case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
@@ -1276,7 +1318,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		}
 		if err == nil && parts.key != "" {
 			// How long it took where it ran, for where it runs next time.
-			s.dist.Observe(parts.key, parts.workers, time.Since(start))
+			s.dist.Observe(parts.key, parts.workers, time.Since(cmp.Or(parts.since, start)))
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts})

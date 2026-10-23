@@ -176,8 +176,13 @@ func seedRuns(ctx context.Context, co interface{ Seed([]distributed.Run) }, stor
 			break
 		}
 		for _, q := range qs {
-			if q.PlanKey != "" && q.Outcome == audit.OutcomeOK {
+			switch {
+			case q.PlanKey == "":
+			case q.Outcome == audit.OutcomeOK:
 				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Duration: q.Duration})
+			case q.Workers == 0 && q.SQLState == "53200":
+				// It ran out of memory on one machine.
+				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true})
 			}
 		}
 		if len(qs) < pageSize {

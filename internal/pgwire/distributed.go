@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -89,17 +90,30 @@ var errWorkerMemory = pgerror.WithCode(errors.New("canceling statement: a worker
 // how many workers ran them, how many stages, and how many exchanges the
 // stages wrote. key is the statement's plan key (distributed.Plan.Key)
 // when it ran on workers or auto mode chose one machine for it, so that
-// how long it took informs that choice next time.
+// how long it took informs that choice next time. since, if set, is when
+// it began to run on workers after running out of memory here.
 type distParts struct {
 	workers, stages, exchanges int
 	key                        string
+	since                      time.Time
 }
 
-// runDistributed runs st on workers if it qualifies and writes its rows to
-// w. done is false when st did not run, and should run on this replica;
-// parts is what running it took.
-func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.User, st *statement, args []driver.NamedValue, w *tagWriter) (parts distParts, done bool, err error) {
-	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || sess.mode() == distributed.ModeOff {
+// sessionMode is the mode user's statements run distributed in: the
+// session's, but only admins start workers at will, or take every running
+// one.
+func sessionMode(sess *session, user auth.User) distributed.Mode {
+	mode := sess.mode()
+	if mode == distributed.ModeOn && user.Role != auth.RoleAdmin {
+		mode = distributed.ModeOnRunning
+	}
+	return mode
+}
+
+// runDistributed runs st on workers if it qualifies in mode and writes its
+// rows to w. done is false when st did not run, and should run on this
+// replica; parts is what running it took.
+func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.User, st *statement, args []driver.NamedValue, w *tagWriter, mode distributed.Mode) (parts distParts, done bool, err error) {
+	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || mode == distributed.ModeOff {
 		return parts, false, nil
 	}
 	if reason := policyReason(st); reason != "" {
@@ -107,11 +121,6 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		return parts, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
-	mode := sess.mode()
-	if mode == distributed.ModeOn && user.Role != auth.RoleAdmin {
-		// Only admins start workers at will, or take every running one.
-		mode = distributed.ModeOnRunning
-	}
 	plan, err := s.dist.Plan(ctx, st.query, env, mode)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -167,6 +176,51 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		return distParts{}, false, nil
 	}
 	return parts, true, nil
+}
+
+// ranOutOfMemory says whether err, from running a statement on this
+// replica under ctx (see runCancelable), is its running out of memory:
+// DuckDB's own error, or the memory watch canceling it (ShedMemory).
+func (sess *session) ranOutOfMemory(ctx context.Context, err error) bool {
+	var de *duckdb.Error
+	if errors.As(err, &de) && de.Type == duckdb.ErrorTypeOutOfMemory {
+		return true
+	}
+	if err == nil || !errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.shed
+}
+
+// afterOutOfMemory runs st on workers after it ran out of memory on this
+// replica, where auto mode had chosen to run it (parts.key), before it
+// sent the client a row: the client gets the rows as if it had run there,
+// and the history marks it so that it runs on workers next time. It
+// returns cause, the error here, if workers cannot run it. outer is the
+// context runCancelable ran st under, which a shed does not end; ctx the
+// one it gave st.
+func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st *statement, args []driver.NamedValue,
+	w *tagWriter, parts *distParts, cause error) error {
+	user := sess.currentUser()
+	s.dist.ObserveOutOfMemory(parts.key)
+	retry, release := sess.rearm(outer, ctx)
+	defer release()
+	s.log.Warn("a statement ran out of memory on this replica; running it on workers", "user", user.Name, "key", parts.key, "err", cause)
+	since := time.Now()
+	// As an admin's forced statement runs: auto mode chose this replica
+	// for it, and nothing else would run it.
+	p, done, err := s.runDistributed(retry, sess, user, st, args, w, distributed.ModeOn)
+	if !done {
+		return cause
+	}
+	if errors.Is(retry.Err(), context.DeadlineExceeded) {
+		return errStatementTimeout
+	}
+	p.since = since
+	*parts = p
+	return err
 }
 
 // policyReason says why masking and row access policies keep st on this
