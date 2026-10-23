@@ -593,6 +593,45 @@ hours. A statement writes `_igloo_shuffle/<statement>/running` every half
 hour while it runs, however long its last stages take, so the sweeps of
 other replicas, which cannot know it runs, never take its exchanges.
 
+With `IGLOO_EXCHANGES=local` (`internal/distributed/localx.go`), a shuffle
+task writes its partitions under its worker's spill directory,
+`exchanges/<statement>/s<stage>/<task>/a<attempt>/__b=<p>/`, if what it
+reads (taken for what it will write), twice over for the copies readers
+fetch, with what the worker's other tasks reserved, fits a quarter of that
+disk's free space, and otherwise to object storage as above (a reading task
+reserves what it fetches the same way until it has fetched it, waits while
+other tasks' reservations keep it out, and fails rather than fill the
+disk); the coordinator lists a
+file on a worker's disk to readers as `igloo-worker://<worker>/<statement>/
+<file>?size=<bytes>`. A reading task fetches the files of others, whole,
+eight at a time, to a directory of its own on its worker's disk, removed
+when it ends, and reads its own in place: in a lab, fetching whole files
+beat DuckDB reading them over HTTP by range (6.6 s against 8.2 s for a
+stage of 770 MB), and both beat object storage (23 s) by its requests'
+latency. Workers serve those files over the task port's mutual TLS, only
+names they gave files they wrote (a registry by statement, the names
+matched against their pattern, the path resolved to itself and opened
+without following links, the size as written), 32 at a time with 512
+waiting, answering 503 past those or when no slot frees up within five
+seconds, which readers ask again for up to five minutes; a worker or reader
+that makes no progress sending or receiving a file for a minute gives up,
+and the reader counts the worker as lost. A reader fetches only from the statement's workers, which its task
+lists, and follows no redirect. What a lost worker wrote is lost: a reader
+that cannot fetch a file (any transport error, not found, cut short; not
+its own disk failing) fails its task as lost, naming the worker, and if
+that worker answers none of three status requests over ten seconds, or
+answers with another boot ID, Execute removes
+the attempt's exchanges and runs the statement's parts again, once, without
+that worker, as a new attempt whose exchanges are its own; a worker that
+answers as the same run, or a second loss, fails the statement
+(`ErrExchangeLost`). Recomputing only what the lost worker wrote is left
+for later. The coordinator removes a statement's files from its workers
+(DELETE) once its stages have run, and tells them every half hour while it
+runs that it does (keep); a worker sweeps every ten minutes the files of
+statements nothing wrote, served or kept for six hours, and the
+directories of tasks that failed before they listed theirs, and removes
+all of them when it starts.
+
 A worker runs a task per 4 cores and 8 GiB of its memory limit at once
 (at least one), and the others wait. DuckDB runs each task on all of the
 worker's threads (four a core on object storage, see

@@ -97,6 +97,18 @@ type Worker struct {
 	// footerCache holds data files' footers by path; see footers.
 	footersMu   sync.Mutex
 	footerCache map[string]*footer
+
+	// local are the exchange files it wrote to its disk, peers what fetches
+	// those of other workers, into fetchRoot (see localx.go); stopSweep
+	// ends their sweeps.
+	local     *localExchanges
+	peers     *http.Client
+	fetchRoot string
+	stopSweep chan struct{}
+	stopOnce  sync.Once
+	// boot tells this run of the worker from others at its address: one
+	// that restarted holds no exchange files.
+	boot string
 }
 
 // NewWorker returns a worker; call Serve to accept tasks.
@@ -124,11 +136,31 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 		return nil, fmt.Errorf("create result directory: %w", err)
 	}
 	opts.TempDir = dir
+	local, err := newLocalExchanges(filepath.Join(dir, "exchanges"))
+	if err != nil {
+		return nil, err
+	}
+	fetchRoot := filepath.Join(dir, "fetched")
+	if err := os.MkdirAll(fetchRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("create directory for fetched exchanges: %w", err)
+	}
 	w := &Worker{opts: opts, transport: t, log: log.With("component", "worker"), activity: activity.New(),
-		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes)))}
+		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes))),
+		local: local, fetchRoot: filepath.Clean(fetchRoot), stopSweep: make(chan struct{}),
+		peers: &http.Client{
+			Transport: &http.Transport{TLSClientConfig: t.client.Clone(), MaxIdleConnsPerHost: fetchesPerTask, IdleConnTimeout: time.Minute,
+				// A worker answers at once, if only that it is busy.
+				ResponseHeaderTimeout: stallTimeout},
+			// A peer answers with the file or not at all.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		boot: newID()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
+	mux.HandleFunc("GET "+exchangesPath+"{qid}/{file...}", w.serveExchangeFile)
+	mux.HandleFunc("POST "+exchangesPath+"{qid}/keep", w.serveExchangeKeep)
+	mux.HandleFunc("DELETE "+exchangesPath+"{qid}", w.serveExchangeRemove)
 	w.srv = &http.Server{
 		Handler:           mux,
 		TLSConfig:         t.server,
@@ -140,6 +172,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 
 // Serve accepts coordinators' connections on ln until Shutdown.
 func (w *Worker) Serve(ln net.Listener) error {
+	go w.sweepLoop(w.stopSweep)
 	err := w.srv.ServeTLS(ln, "", "")
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -149,13 +182,17 @@ func (w *Worker) Serve(ln net.Listener) error {
 
 // Shutdown stops accepting tasks and waits for running ones until ctx is
 // done.
-func (w *Worker) Shutdown(ctx context.Context) error { return w.srv.Shutdown(ctx) }
+func (w *Worker) Shutdown(ctx context.Context) error {
+	w.stopOnce.Do(func() { close(w.stopSweep) })
+	return w.srv.Shutdown(ctx)
+}
 
 func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
 		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
+		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 	})
 }
@@ -284,6 +321,14 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		te := &taskErr{Message: err.Error()}
+		var lost *lostError
+		if errors.As(err, &lost) && r.Context().Err() == nil {
+			log.Warn("task could not fetch exchanged rows from a worker", "worker", lost.worker, "err", err)
+			w.opts.Metrics.task("error", start)
+			te.Lost = lost.worker
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
 		var de *duckdb.Error
 		if errors.As(err, &de) {
 			te.Type, te.Message, te.Data = int(de.Type), de.Msg, dataError(err)
@@ -401,6 +446,11 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		}
 	}
 	start := time.Now()
+	release, err := w.fetchExchanges(ctx, req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer release()
 	var byID []string
 	for i, v := range req.Views {
 		if v.Exact {
@@ -445,6 +495,10 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	cols, err := describe(ctx, conn, query)
 	if err != nil {
 		return "", nil, err
+	}
+	if req.Shuffle != "" && req.Local != "" {
+		res, err := w.shuffleLocal(ctx, conn, req, query, cols)
+		return "", res, err
 	}
 	if req.Shuffle != "" {
 		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions)
@@ -566,11 +620,17 @@ func rowWidth(cols []Column) int64 {
 }
 
 // shuffle writes the rows of query, partitioned by its __b column, under
-// dir, and lists the files written.
+// dir in the warehouse's exchanges, and lists the files written.
 func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
 	if !w.allowed(dir+"/") || !strings.Contains(dir, "/"+config.ShuffleDir+"/") {
 		return nil, fmt.Errorf("shuffle directory %s is outside the warehouse's %s", dir, config.ShuffleDir)
 	}
+	return w.writePartitions(ctx, conn, dir, query, cols, parts)
+}
+
+// writePartitions writes the rows of query, partitioned by its __b column,
+// under dir, and lists the files written.
+func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
 	if !slices.ContainsFunc(cols, func(c Column) bool { return c.Name == "__b" }) {
 		return nil, errors.New("a shuffle task's rows have no __b column")
 	}
@@ -835,7 +895,7 @@ const maxFooters = 10000
 // again, or widened since some file was written, or a nested column) reads
 // by field ID.
 func (w *Worker) readByName(ctx context.Context, conn *duckdb.Conn, v viewDef) (bool, error) {
-	if slices.ContainsFunc(v.Files, func(f string) bool { return !w.allowed(f) }) ||
+	if slices.ContainsFunc(v.Files, func(f string) bool { return !w.allowed(f) && !v.lent[f] }) ||
 		slices.ContainsFunc(v.Columns, func(c Column) bool { return c.ID <= 0 }) {
 		// viewStatement refuses them.
 		return false, nil
@@ -1168,7 +1228,7 @@ func (w *Worker) viewStatement(v viewDef, deleted string) (string, error) {
 		return "CREATE TEMP VIEW " + quoteIdent(v.Name) + " AS SELECT " + strings.Join(cols, ", ") + " WHERE false", nil
 	}
 	for _, f := range v.Files {
-		if !w.allowed(f) {
+		if !w.allowed(f) && !v.lent[f] {
 			return "", fmt.Errorf("file %s is outside the warehouse", f)
 		}
 	}

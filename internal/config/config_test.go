@@ -463,3 +463,21 @@ func TestErasureKey(t *testing.T) {
 		}
 	}
 }
+
+// IGLOO_EXCHANGES says where workers exchange rows: object storage unless
+// set to local.
+func TestExchanges(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil || cfg.Workers.Exchanges != "object" {
+		t.Fatalf("default: %q %v", cfg.Workers.Exchanges, err)
+	}
+	cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_EXCHANGES": "local"}))
+	if err != nil || cfg.Workers.Exchanges != "local" {
+		t.Fatalf("local: %q %v", cfg.Workers.Exchanges, err)
+	}
+	for _, v := range []string{"nvme", "Local", "s3"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_EXCHANGES": v})); err == nil {
+			t.Errorf("IGLOO_EXCHANGES=%s should be refused", v)
+		}
+	}
+}

@@ -31,6 +31,9 @@ type Workers struct {
 	// Threshold is how long a statement must take on one machine before
 	// auto mode runs it on workers, unless it would run short of memory.
 	Threshold time.Duration
+	// Exchanges is where workers write the rows they exchange: object (the
+	// warehouse's object storage) or local (their own disks).
+	Exchanges string
 
 	K8sNamespace   string
 	K8sDeployment  string
@@ -69,6 +72,10 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		StartCommand:  get("IGLOO_WORKER_START_COMMAND", ""),
 		StopCommand:   get("IGLOO_WORKER_STOP_COMMAND", ""),
 		ListenAddr:    get("IGLOO_WORKER_LISTEN_ADDR", ":"+WorkerPort),
+		Exchanges:     get("IGLOO_EXCHANGES", "object"),
+	}
+	if w.Exchanges != "object" && w.Exchanges != "local" {
+		addErr("IGLOO_EXCHANGES must be object or local, got %q", w.Exchanges)
 	}
 	for _, a := range strings.Split(get("IGLOO_WORKERS", ""), ",") {
 		if a = strings.TrimSpace(a); a == "" {

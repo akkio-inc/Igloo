@@ -356,6 +356,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   first, for a day; one that came out small is measured first, with the
   workers to itself, and read whole. A statement that runs out of memory on
   a worker after measuring runs again with the sizes measured.
+- `IGLOO_EXCHANGES=local` makes workers exchange rows through their own
+  disks rather than the warehouse's object storage: a task writes its
+  partitions to its worker's spill disk, room allowing (twice what it
+  expects to write, with what other tasks reserved, within a quarter of
+  the free space), and the tasks that read them fetch the files from that
+  worker over the task port, whole. In a lab, a stage of 3 GB over 128
+  partitions took 17.5 s instead of 54 s through an object store answering
+  in 25 ms. A worker serves only the files it wrote, to holders of the
+  worker secret, and readers fetch only from the statement's workers; a
+  worker lost with files on its disk (not answering, or restarted) makes
+  the statement's parts run again, once, without it; files are removed
+  when the statement is done, or after six hours unused. The default stays
+  `object`.
 - Auto mode's estimates are measured against the scale environment's
   reports at 1x, 10x and 100x. A table filtered by a subquery's value, as an
   audience's latest version is, counts as filtered, and a filtered table a

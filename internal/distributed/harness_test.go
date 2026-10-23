@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +50,44 @@ type harness struct {
 	removed   []string
 	// views are the queries of the views addView made.
 	views map[string]string
+	// hook, if set, sees every record the coordinator and workers log.
+	hook atomic.Pointer[func(slog.Record)]
+}
+
+// hookHandler passes records to the harness's hook, and on to its handler.
+type hookHandler struct {
+	h *harness
+	slog.Handler
+}
+
+func (hh hookHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (hh hookHandler) Handle(ctx context.Context, r slog.Record) error {
+	if f := hh.h.hook.Load(); f != nil {
+		(*f)(r)
+	}
+	if hh.Handler.Enabled(ctx, r.Level) {
+		return hh.Handler.Handle(ctx, r)
+	}
+	return nil
+}
+func (hh hookHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return hookHandler{hh.h, hh.Handler.WithAttrs(as)}
+}
+func (hh hookHandler) WithGroup(name string) slog.Handler {
+	return hookHandler{hh.h, hh.Handler.WithGroup(name)}
+}
+
+// attr returns the value of record r's attribute key, as a string.
+func attr(r slog.Record, key string) string {
+	var v string
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			v = a.Value.String()
+			return false
+		}
+		return true
+	})
+	return v
 }
 
 // fileSource serves the harness's tables.
@@ -165,11 +204,12 @@ func (c connector) Connect(ctx context.Context) (*duckdb.Conn, error) {
 // Parquet files, and starts n workers.
 func newHarness(t *testing.T, sf float64, files, n int) *harness {
 	t.Helper()
-	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{},
-		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}}
+	var base slog.Handler = slog.NewTextHandler(io.Discard, nil)
 	if testing.Verbose() {
-		h.log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		base = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	}
+	h.log = slog.New(hookHandler{h, base})
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +337,6 @@ func (h *harness) startWorkers(n int) {
 	co, err := NewCoordinator(Options{
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator"),
 		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: addrs},
-		// A cache that holds whatever the tests read: one machine reads warm.
 		Storage: recordingStorage{NewStorage(icebergio.LocalFS{}), h},
 	}, h.log)
 	if err != nil {

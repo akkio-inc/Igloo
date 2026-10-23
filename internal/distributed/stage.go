@@ -225,11 +225,13 @@ type exchangeRun struct {
 	columns []Column
 	files   [][]string
 	// rows counts the rows written, in all and by partition, and bytes
-	// the bytes of their files; tasks counts the tasks that wrote them.
-	rows     int64
-	partRows []int64
-	bytes    int64
-	tasks    int
+	// the bytes of their files, in all and by partition; tasks counts the
+	// tasks that wrote them.
+	rows      int64
+	partRows  []int64
+	bytes     int64
+	partBytes []int64
+	tasks     int
 }
 
 // jobResult is where a coordinator-bound stage's partial results are.
@@ -253,7 +255,8 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 		}
 		x := e.exchanges[s.Out.ID]
 		if x == nil {
-			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts), partRows: make([]int64, e.parts)}
+			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts), partRows: make([]int64, e.parts),
+				partBytes: make([]int64, e.parts)}
 			e.exchanges[s.Out.ID] = x
 		}
 		x.producers++
@@ -334,14 +337,18 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	}
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
-	// What every task reads in full.
+	// What every task reads in full, and its bytes.
 	whole := map[string]viewDef{}
+	var wholeBytes int64
 	for _, in := range s.Inputs {
 		switch {
 		case in.Table != nil && !in.Split:
 			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
 			def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
 			whole[in.View] = def
+			for _, f := range e.files[in.Table.key()] {
+				wholeBytes += f.Size
+			}
 		case in.Exchange != nil && !in.Partitioned:
 			x := e.exchanges[in.Exchange.ID]
 			def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: x.rows, Exact: true}
@@ -349,6 +356,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				def.Files = append(def.Files, fs...)
 			}
 			whole[in.View] = def
+			wholeBytes += x.bytes
 		}
 	}
 
@@ -360,7 +368,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	g, gctx := errgroup.WithContext(ctx)
 	for i := range tasks {
 		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings}
+		// bytes are what it reads of a table's share, reads all it reads.
 		var bytes int64
+		reads := wholeBytes
 		for _, in := range s.Inputs {
 			switch {
 			case in.Table != nil && in.Split:
@@ -376,6 +386,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				for _, p := range groups[i] {
 					def.Files = append(def.Files, x.files[p]...)
 					def.Rows += x.partRows[p]
+					reads += x.partBytes[p]
 				}
 				task.Views = append(task.Views, def)
 			default:
@@ -390,6 +401,16 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			task.SQL = exchangeSQL(s, e.parts)
 			task.Shuffle = e.root + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
 			task.Partitions = e.parts
+			if e.co.opts.LocalExchanges {
+				// What it writes is taken to be at most what it reads.
+				task.Local = e.qid + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
+				task.Expect = reads + bytes
+			}
+		}
+		if e.co.opts.LocalExchanges {
+			for _, w := range e.ws {
+				task.Peers = append(task.Peers, w.addr)
+			}
 		}
 		g.Go(func() error {
 			var sp *spool
@@ -416,7 +437,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			e.usedBy[s.ID][w.addr] = true
 			e.mu.Unlock()
 			if s.Out != nil {
-				return e.received(s, task, head)
+				return e.received(s, task, head, w)
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -474,7 +495,7 @@ func (e *execution) overfull() []string {
 }
 
 // received records the files a task wrote to its stage's exchange.
-func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) error {
+func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *worker) error {
 	x := e.exchanges[s.Out.ID]
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -487,11 +508,20 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) erro
 	}
 	var listed int64
 	for _, f := range head.Files {
-		if f.Partition < 0 || f.Partition >= e.parts || !strings.HasPrefix(f.Path, task.Shuffle+"/") {
+		path := f.Path
+		switch {
+		case f.Partition < 0 || f.Partition >= e.parts:
+			return fmt.Errorf("a worker wrote an unexpected file %s", f.Path)
+		case strings.HasPrefix(f.Path, task.Shuffle+"/"):
+		case task.Local != "" && strings.HasPrefix(f.Path, task.Local+"/"):
+			// On the worker's disk: readers fetch it from there.
+			path = localRef(w.addr, f.Path, f.Size)
+		default:
 			return fmt.Errorf("a worker wrote an unexpected file %s", f.Path)
 		}
-		x.files[f.Partition] = append(x.files[f.Partition], f.Path)
+		x.files[f.Partition] = append(x.files[f.Partition], path)
 		x.partRows[f.Partition] += f.Rows
+		x.partBytes[f.Partition] += f.Size
 		x.bytes += f.Size
 		listed += f.Rows
 	}

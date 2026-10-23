@@ -409,6 +409,9 @@ give the workers more memory.
   and its server-side encryption. No credentials the Iceberg REST catalog
   hands out reach `_igloo_shuffle/`. What a coordinator that stopped
   mid-statement leaves behind, the replicas remove [within hours](#lifecycle-rule).
+  With `IGLOO_EXCHANGES=local` they are instead files on the workers'
+  disks, which workers send each other over the task port: see
+  [exchanges on workers' disks](#exchanges-on-workers-disks).
 - **Pools are kept apart by secret and network.** Each compute pool's
   workers have a secret of their own (the Helm chart generates one per
   pool), so one pool's igloo pods cannot use another's workers; the
@@ -416,6 +419,52 @@ give the workers more memory.
   CNI enforcing it: with several pools, use one that does. Docker Compose
   has no network isolation between its containers; give a pool's workers
   their own `IGLOO_WORKER_SECRET`.
+
+## Exchanges on workers' disks
+
+By default workers exchange rows through the warehouse's object storage,
+which costs a request a file to write and several to read, tens of
+milliseconds each, and keeps what they wrote if a worker is lost. With
+`IGLOO_EXCHANGES=local` on the server, a worker writes them to its own disk
+(`IGLOO_DUCKDB_TEMP_DIR`, with spill), and the workers that read them fetch
+the files from it, whole, to their own disks first. In a lab of four
+writers and four readers of 3 GB over 128 partitions, a stage that took 54 s
+through an object store answering in 25 ms took 17.5 s through the writers'
+disks, and the writers needed 0.9 GB of memory rather than 1.6.
+
+- **Room.** A task writes to its disk only if twice what it is expected to
+  write (what it reads; twice, for the copies its readers fetch), with what
+  the worker's other tasks reserved, fits a quarter of the disk's free
+  space, which spill and the read cache share; otherwise it writes to object
+  storage, and readers read both. A task that fetches waits while other
+  tasks hold the room it needs, and fails rather than fill the disk. What a
+  task writes is taken to be at most what it reads, which a join that
+  multiplies rows can exceed.
+- **A worker lost.** What a worker wrote to its disk goes with it. A task
+  that cannot fetch a file fails; if the worker no longer answers, or
+  answers as a new run of itself, the statement's parts run again, once, on
+  the other workers. Otherwise, or if another is lost, the statement fails
+  (and runs on the server if it fits there). A worker too busy to send a
+  file says so within five seconds and is asked again for up to five
+  minutes; one that stops sending for a minute counts as lost. A statement
+  never returns
+  rows short of a lost file: a task checks that the files it reads hold the
+  rows written.
+- **Security.** Workers send exchange files only to peers that hold
+  `IGLOO_WORKER_SECRET` (the task port's TLS), and only the files they wrote
+  themselves, by the names they gave them: no other path, no symbolic link,
+  no file of another size. They send a few at a time and refuse past a
+  queue. A reader fetches only from the statement's own workers, and
+  follows no redirect. The files are not encrypted by Igloo on the disk, as
+  spill is not.
+- **Cleanup.** The server removes a statement's files from its workers'
+  disks when the statement is done, and tells them it still runs every 30
+  minutes; a worker removes files nothing used for six hours, as after the
+  server stopped, and all of them when it restarts.
+- **Networks.** Workers must reach each other's task port (7433). The Helm
+  chart's NetworkPolicy lets only igloo pods reach it, so keep the default
+  on Kubernetes for now; Docker Compose and virtual machines on one network
+  need nothing more.
 
 ## Seeing it
 
@@ -573,6 +622,7 @@ On the Igloo server:
 | `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [when](#when)) |
+| `IGLOO_EXCHANGES` | `object` | Where workers exchange rows: `object` storage, or `local` disks (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |

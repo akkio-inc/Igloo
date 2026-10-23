@@ -108,6 +108,10 @@ type Options struct {
 	// Storage is the warehouse's object storage, where the coordinator
 	// removes exchanges (see sweep).
 	Storage Storage
+	// LocalExchanges makes workers write exchanges to their own disks,
+	// where their room allows, rather than to object storage
+	// (IGLOO_EXCHANGES=local; see localx.go).
+	LocalExchanges bool
 }
 
 // Coordinator splits statements into parts that workers run.
@@ -500,9 +504,25 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	parts := exchangePartitions(plan.Stages, ws, len(ws), uploadBytes(co.opts.Warehouse))
 	var run *execution
 	planned := plan
+	// smaller counts the runs again in smaller tasks, and lostOnce says the
+	// statement ran again without a worker lost with exchanges on its disk.
+	smaller, lostOnce := 0, false
 	for attempt := 0; ; attempt++ {
 		// Each attempt's tasks and exchanges are its own, so that what a
-		// canceled task of the last one still writes is not read.
+		// canceled task of the last one still writes is not read; with
+		// exchanges on workers' disks, a failed attempt's are removed before
+		// the next runs, so that they do not take its room there.
+		mark := len(cleanups)
+		dropAttempt := func() {
+			if !co.opts.LocalExchanges {
+				// Object storage has room: they go at the end, as ever.
+				return
+			}
+			for _, f := range cleanups[mark:] {
+				f()
+			}
+			cleanups = cleanups[:mark]
+		}
 		aqid := qid
 		if attempt > 0 {
 			aqid += "-" + strconv.Itoa(attempt)
@@ -510,15 +530,23 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		newRun := func(id string) *execution {
 			r := &execution{
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, force: planned.force,
-				sp: &spool{limit: limit}, parts: parts, smaller: attempt, root: shuffleRoot(co.opts.Warehouse, id),
+				sp: &spool{limit: limit}, parts: parts, smaller: smaller, root: shuffleRoot(co.opts.Warehouse, id),
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 			}
 			// The exchanges are read only by the stages: once they have run,
 			// the statement's rows need not wait for their removal.
 			release := co.hold(id, r.root)
+			releaseLocal := func() {}
+			if co.opts.LocalExchanges {
+				releaseLocal = co.holdLocal(id, r.ws)
+			}
 			cleanups = append(cleanups, func() {
 				release()
+				releaseLocal()
 				co.removeLater(id, r.root)
+				if co.opts.LocalExchanges {
+					co.removeLocalLater(id, r.ws)
+				}
 			})
 			return r
 		}
@@ -543,12 +571,32 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",
 				"query", qid, "attempt", attempt+1, "partitions", next, "err", err)
 			parts = next
+			smaller++
+			dropAttempt()
 			if len(plan.uncertain) == 0 {
 				// Its relations measured, the plan made with their sizes
 				// runs again, rather than measuring them again.
 				planned = plan
 			}
 			continue
+		}
+		var lost *lostError
+		if errors.As(err, &lost) && ctx.Err() == nil && !lostOnce && co.confirmLost(ctx, ws, lost.worker) {
+			// What the lost worker wrote to its disk is gone, and readers
+			// cannot have it: the statement's parts run again, once, on the
+			// other workers.
+			rest := slices.DeleteFunc(slices.Clone(ws), func(w *worker) bool { return w.addr == lost.worker })
+			if len(rest) > 0 && len(rest) < len(ws) {
+				co.log.Warn("a worker holding exchanged rows on its disk was lost; running the statement's parts again without it",
+					"query", qid, "attempt", attempt+1, "worker", lost.worker, "err", err)
+				co.pool.markDown(lost.worker)
+				ws, lostOnce = rest, true
+				dropAttempt()
+				if len(plan.uncertain) == 0 {
+					planned = plan
+				}
+				continue
+			}
 		}
 		switch {
 		case ctx.Err() != nil:
@@ -791,11 +839,15 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 		if t.Shuffle != "" {
 			t.Shuffle += "/a" + strconv.Itoa(attempt)
 		}
+		if t.Local != "" {
+			t.Local += "/a" + strconv.Itoa(attempt)
+		}
+		w := ws[(first+attempt)%len(ws)]
+		t.Worker = w.addr
 		body, err := json.Marshal(&t)
 		if err != nil {
 			return nil, nil, err
 		}
-		w := ws[(first+attempt)%len(ws)]
 		head, err := co.fetch(ctx, w, body, path, sp)
 		if err == nil {
 			co.opts.Metrics.task("ok")
@@ -853,6 +905,9 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 		}
 		if res.Error.Unsupported {
 			return nil, &errUnsupported{reason: strings.TrimPrefix(res.Error.Message, "cannot distribute: ")}
+		}
+		if res.Error.Lost != "" {
+			return nil, &lostError{worker: res.Error.Lost, err: fmt.Errorf("a task on %s: %s", w.addr, res.Error.Message)}
 		}
 		switch {
 		case duckdb.ErrorType(res.Error.Type) == duckdb.ErrorTypeOutOfMemory:

@@ -15,6 +15,13 @@ import (
 //	                 (taskResult), then the result as a Parquet file
 //	GET  /v1/status  the worker's version, size and activity (workerStatus)
 //
+// and, for exchanges on workers' disks (see localx.go), workers and
+// coordinators talk to workers over the same connections:
+//
+//	GET    /v1/exchanges/{qid}/{file}  a file of an exchange the worker wrote
+//	POST   /v1/exchanges/{qid}/keep    the statement still runs
+//	DELETE /v1/exchanges/{qid}         the statement is done with them
+//
 // A task is self-contained: the session settings that change what SQL
 // means, the views the fragment reads (data files and the table's columns
 // by Iceberg field ID) and the fragment itself. Workers keep nothing
@@ -44,6 +51,17 @@ type taskRequest struct {
 	// partitions there are, a row group of each of which the writer holds.
 	Shuffle    string `json:"shuffle,omitempty"`
 	Partitions int    `json:"partitions,omitempty"`
+	// Local, if set, makes a shuffle task write its partitions under this
+	// directory of the worker's own disk instead, {qid}/s{stage}/{task}/a
+	// {attempt}, if Expect, the bytes it is expected to write, fit its share
+	// of the free space; otherwise it writes to Shuffle.
+	Local  string `json:"local,omitempty"`
+	Expect int64  `json:"expect,omitempty"`
+	// Worker is the address the coordinator reached the worker at, which
+	// tells it which of the exchanges' files on workers' disks are its own;
+	// Peers are the workers whose disks those files may be on.
+	Worker string   `json:"worker,omitempty"`
+	Peers  []string `json:"peers,omitempty"`
 }
 
 // setting is a session setting the fragment runs with.
@@ -74,6 +92,10 @@ type viewDef struct {
 	// Deletes are the delete files of those of Files that have any, which
 	// the worker applies.
 	Deletes []fileDeletes `json:"deletes,omitempty"`
+	// lent are files on the worker's own disk that stand for exchange files
+	// of workers' disks (see fetchExchanges), which it may read though they
+	// are outside the warehouse; never from a task.
+	lent map[string]bool
 }
 
 // fileDeletes are the delete files of one data file of a view.
@@ -128,6 +150,9 @@ type taskErr struct {
 	// OutOfMemory says the task ran out of memory: DuckDB's memory limit,
 	// or the worker canceled it because it was running out (ShedMemory).
 	OutOfMemory bool `json:"out_of_memory,omitempty"`
+	// Lost is the worker whose exchange files the task could not fetch:
+	// it stopped, or restarted without them.
+	Lost string `json:"lost,omitempty"`
 }
 
 func (e *taskErr) Error() string { return e.Message }
@@ -143,8 +168,10 @@ type workerStatus struct {
 	// Slots are the tasks it runs at once (see taskSlots), which share its
 	// memory, and Threads its DuckDB threads; zero from a worker that does
 	// not say.
-	Slots       int     `json:"slots,omitempty"`
-	Threads     int     `json:"threads,omitempty"`
+	Slots   int `json:"slots,omitempty"`
+	Threads int `json:"threads,omitempty"`
+	// Boot is random to each run of the worker.
+	Boot        string  `json:"boot,omitempty"`
 	Running     int     `json:"running"`
 	IdleSeconds float64 `json:"idle_seconds"`
 }
@@ -165,6 +192,22 @@ func knownSetting(name string) bool {
 // DataError reports whether err is an error in the data a statement
 // computes on, which it would have raised on one machine too.
 func DataError(err error) bool { return dataError(err) }
+
+// ErrExchangeLost is what a statement fails with when a worker that held
+// files of its exchanges on its disk was lost before every reader had
+// them, also after running again without that worker (see Execute).
+var ErrExchangeLost = errors.New("a worker holding exchanged rows on its disk was lost")
+
+// lostError is a worker lost with exchange files on its disk.
+type lostError struct {
+	worker string
+	err    error
+}
+
+func (e *lostError) Error() string {
+	return fmt.Sprintf("%v: %s: %v", ErrExchangeLost, e.worker, e.err)
+}
+func (e *lostError) Unwrap() []error { return []error{ErrExchangeLost, e.err} }
 
 // ErrWorkerMemory is what a statement fails with when a task of it ran out
 // of memory on a worker, in DuckDB or canceled by the worker's memory watch

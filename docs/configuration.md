@@ -233,6 +233,7 @@ to deploy workers. On the Igloo server:
 | `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before running on the server |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone, by its estimate or its last run there, before it may run on workers (unless it would run short of memory), and then only if workers are estimated, or were measured, to be faster |
+| `IGLOO_EXCHANGES` | `object` | Where workers write the rows they exchange between a statement's stages: `object`, the warehouse's object storage, or `local`, their own disks (`IGLOO_DUCKDB_TEMP_DIR`), from which the workers that read them fetch them; a worker whose disk is short of room writes to object storage instead |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not Igloo's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances, comma separated |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop every worker |
