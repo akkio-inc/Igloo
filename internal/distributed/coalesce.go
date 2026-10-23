@@ -41,12 +41,41 @@ func rowMemory(columns []Column) int64 {
 
 // typeWidth guesses the bytes a value of a DuckDB type takes in memory, in
 // a row: more than typeBytes's guess at its compressed size, for strings
-// and nested values above all.
+// and nested values above all. A list or map counts as listLength of its
+// elements, and a struct as its fields together: a report's relation of
+// structs of lists of strings, which FLATTEN builds, wrote rows of
+// kilobytes, not of a nested value's 64 bytes.
 func typeWidth(t string) int64 {
 	t = strings.ToUpper(strings.TrimSpace(t))
 	switch {
-	case strings.HasSuffix(t, "]"), strings.HasPrefix(t, "MAP"), strings.HasPrefix(t, "STRUCT"), strings.HasPrefix(t, "UNION"):
-		return 64
+	case strings.HasSuffix(t, "[]"):
+		return 16 + listLength*typeWidth(t[:len(t)-2])
+	case strings.HasSuffix(t, "]"):
+		// A fixed-size array, T[n].
+		if open := strings.LastIndexByte(t, '['); open > 0 {
+			if n, err := strconv.Atoi(t[open+1 : len(t)-1]); err == nil {
+				return int64(n) * typeWidth(t[:open])
+			}
+		}
+		return 16 + listLength*32
+	case strings.HasPrefix(t, "MAP("), strings.HasPrefix(t, "STRUCT("), strings.HasPrefix(t, "UNION("):
+		var fields int64
+		var most int64
+		for _, f := range splitTopLevel(t[strings.IndexByte(t, '(')+1 : len(t)-1]) {
+			w := typeWidth(f)
+			if !strings.HasPrefix(t, "MAP(") {
+				w = typeWidth(fieldType(f))
+			}
+			fields += w
+			most = max(most, w)
+		}
+		switch {
+		case strings.HasPrefix(t, "MAP("):
+			return 16 + listLength*fields
+		case strings.HasPrefix(t, "UNION("):
+			return 8 + most
+		}
+		return fields
 	case strings.HasPrefix(t, "DECIMAL"):
 		if open, close := strings.IndexByte(t, '('), strings.IndexByte(t, ','); open >= 0 && close > open {
 			if p, err := strconv.Atoi(strings.TrimSpace(t[open+1 : close])); err == nil && p <= 18 {
@@ -72,6 +101,46 @@ func typeWidth(t string) int64 {
 	// Strings, blobs and the rest: a short string inline, a long one out of
 	// line.
 	return 32
+}
+
+// listLength is how many elements typeWidth counts a list or map as.
+const listLength = 8
+
+// splitTopLevel splits a nested type's parameters at the commas outside
+// parentheses and quotes.
+func splitTopLevel(s string) []string {
+	var out []string
+	depth, start, quoted := 0, 0, false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case c == ',' && depth == 0:
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(out, s[start:])
+}
+
+// fieldType is the type of a struct's or union's field, "name TYPE", the
+// name perhaps quoted.
+func fieldType(f string) string {
+	f = strings.TrimSpace(f)
+	if strings.HasPrefix(f, `"`) {
+		if end := strings.Index(f[1:], `"`); end >= 0 {
+			return f[end+2:]
+		}
+	}
+	if sp := strings.IndexByte(f, ' '); sp >= 0 {
+		return f[sp+1:]
+	}
+	return f
 }
 
 // taskMemory is the memory a task may plan on: half of the smallest share

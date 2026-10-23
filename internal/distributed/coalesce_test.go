@@ -59,6 +59,20 @@ func TestGroupPartitions(t *testing.T) {
 		}
 	}
 
+	// Nested values count their elements and fields.
+	for typ, want := range map[string]int64{
+		"VARCHAR[]":                            16 + 8*32,
+		"INTEGER[3]":                           12,
+		"MAP(VARCHAR, BIGINT)":                 16 + 8*40,
+		"STRUCT(a VARCHAR[], \"b c\" INTEGER)": 16 + 8*32 + 4,
+		"STRUCT(_sf_l2 VARCHAR[], _sf_j2 VARCHAR[])[]": 16 + 8*(2*(16+8*32)),
+		"UNION(n BIGINT, s VARCHAR)":                   8 + 32,
+	} {
+		if got := typeWidth(typ); got != want {
+			t.Errorf("%s: %d bytes, want %d", typ, got, want)
+		}
+	}
+
 	// A row's memory: at least 64 bytes, more for wider rows.
 	if m := rowMemory(nil); m != 64 {
 		t.Errorf("an empty row takes %d", m)
