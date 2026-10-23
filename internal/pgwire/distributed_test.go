@@ -624,6 +624,61 @@ func TestDistributedNoFallbackShortOfMemory(t *testing.T) {
 	}
 }
 
+// EXPLAIN DISTRIBUTED says where a statement would run and why, its
+// estimates, partitions and stages, without running a task; and why one
+// that cannot run on workers runs here.
+func TestDistributedExplain(t *testing.T) {
+	ds := startDistServer(t, 2)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	explain := func(query string) map[string]string {
+		t.Helper()
+		rows, err := conn.Query(context.Background(), "EXPLAIN DISTRIBUTED "+query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				t.Fatal(err)
+			}
+			out[k] += v
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	release := ds.gate.hold()
+	defer release()
+	mustExec(t, conn, "SET distributed_execution = on")
+	got := explain("SELECT amount, count(*) FROM orders GROUP BY amount")
+	stage := ""
+	for k, v := range got {
+		if strings.HasPrefix(k, "stage 0 split ") && strings.Contains(v, "count_star()") {
+			stage = k
+		}
+	}
+	if got["runs on"] != "workers" || stage == "" || got["partitions"] == "" || !strings.Contains(got["estimate"], "workers") {
+		t.Errorf("forced: %v", got)
+	}
+	if waiting, _ := ds.gate.counts(); waiting != 0 {
+		t.Errorf("%d tasks ran for an EXPLAIN", waiting)
+	}
+	// Auto mode keeps a table this small here, and says why.
+	mustExec(t, conn, "RESET distributed_execution")
+	if got := explain("SELECT amount, count(*) FROM orders GROUP BY amount"); got["runs on"] != "this replica" || got["reason"] == "" {
+		t.Errorf("auto: %v", got)
+	}
+	if got := explain("CREATE TABLE lake.public.never AS SELECT 1 AS x"); got["runs on"] != "this replica" || !strings.Contains(got["reason"], "only queries") {
+		t.Errorf("a CREATE: %v", got)
+	}
+	if n := count(t, conn, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'never'"); n != 0 {
+		t.Errorf("EXPLAIN DISTRIBUTED created the table")
+	}
+}
+
 // Snowflake's FLATTEN, translated to unnests of Igloo's sf_ macros, runs
 // on workers, which define the same macros; a session that redefines one
 // of them computes something else, and runs such statements here.

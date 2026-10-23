@@ -377,6 +377,25 @@ give the workers more memory.
 
 ## Seeing it
 
+- **`EXPLAIN DISTRIBUTED`** before a query says how it would run, without
+  running it or starting workers, as rows of `explain_key` and
+  `explain_value`: where it would run (`runs on`: `workers` or `this
+  replica`) and why (`reason`: auto mode's choice, the session's
+  `distributed_execution`, or what keeps it here); the `estimate` auto mode
+  weighs (one machine's seconds, workers' seconds and how many, the stages'
+  levels, what they read and exchange, the rows they go through, and
+  whether it is too large for the replica's memory); the `partitions` its
+  exchanges would have with the workers running now; each stage (`stage 0
+  split public.events to exchange 1 (join)`) with the SQL its tasks
+  run; what `the coordinator` runs over their results; and why parts of it
+  `stay on the coordinator`. The query is checked as it would be when run,
+  grants and policies included, and the same rewrites apply.
+
+  ```sql
+  EXPLAIN DISTRIBUTED
+  SELECT campaign_id, count(DISTINCT device_id) FROM impressions GROUP BY 1;
+  ```
+
 - **Query history.** `igloo.query_history` has a `workers` column: how many
   workers ran parts of the statement, 0 when it ran on one replica; and
   `stages` and `exchanges`: how many stages of tasks those parts took, and

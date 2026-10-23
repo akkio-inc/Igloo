@@ -258,15 +258,38 @@ func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.rea
 // last background check, and tables' sizes may be a few seconds old.
 // Execute reads the tables' current snapshots.
 func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode) (*Plan, error) {
+	plan, d, err := co.plan(ctx, query, env, mode, false)
+	if err != nil {
+		return nil, err
+	}
+	if !d.onWorkers {
+		return nil, &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key}
+	}
+	return plan, nil
+}
+
+// decision is where a statement runs and why, with the estimates that
+// decided it.
+type decision struct {
+	onWorkers bool
+	reason    string
+	e         estimate
+	ws        []*worker
+}
+
+// plan plans query as Plan does, and says where it runs: on workers unless
+// auto mode chooses one machine. A dry run, as EXPLAIN DISTRIBUTED's,
+// leaves the history and the log alone.
+func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mode, dry bool) (*Plan, *decision, error) {
 	if mode == ModeOff {
-		return nil, unsupported("distributed execution is off for this session")
+		return nil, nil, unsupported("distributed execution is off for this session")
 	}
 	opts := planOptions{force: mode == ModeOn || mode == ModeOnRunning, now: time.Now(), maxBroadcast: defaultBroadcast}
 	ws := co.pool.known(ctx)
 	rate := int64(co.opts.Cores) * scanRatePerCore
 	switch {
 	case mode == ModeOnRunning && len(ws) == 0:
-		return nil, unsupported("no workers are running, and only admins may start them at will")
+		return nil, nil, unsupported("no workers are running, and only admins may start them at will")
 	case len(ws) > 0:
 		opts.minBytes = rate * warmSeconds
 		if mem := smallestMemory(ws); mem > 0 {
@@ -283,7 +306,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 			opts.maxBroadcast = mem / 8
 		}
 	default:
-		return nil, unsupported("no workers are running")
+		return nil, nil, unsupported("no workers are running")
 	}
 	if co.maxBroadcast > 0 {
 		opts.maxBroadcast = co.maxBroadcast
@@ -292,13 +315,13 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	stmt, err := co.parser.parse(query)
 	if err != nil {
 		if IsUnsupported(err) {
-			return nil, err
+			return nil, nil, err
 		}
-		return nil, unsupported("%v", err)
+		return nil, nil, unsupported("%v", err)
 	}
 	plan, err := newPlanner(ctx, env, co.parser, co.aggs, opts).plan(stmt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
 	plan.Key = planKey(stmt, plan.Stages)
@@ -311,11 +334,16 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	plan.workers = e.workers
 	r, found := co.history.get(plan.Key)
 	plan.shortOfMemory = e.memory || found && r.outOfMemory
+	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws}
 	if mode != ModeAuto {
-		return plan, nil
+		return plan, d, nil
 	}
 	now := time.Now()
 	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
+	d.onWorkers, d.reason = onWorkers, reason
+	if dry {
+		return plan, d, nil
+	}
 	where := "one machine"
 	if onWorkers {
 		where = "workers"
@@ -326,10 +354,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if explore {
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
 	}
-	if !onWorkers {
-		return nil, &errUnsupported{reason: "one machine is faster: " + reason, key: plan.Key}
-	}
-	return plan, nil
+	return plan, d, nil
 }
 
 // fleet describes the workers for an estimate: ws, those that answer, and

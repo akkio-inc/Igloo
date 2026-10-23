@@ -326,6 +326,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   out of it before, fails at once, where it ran on the coordinator for half
   an hour at a hundred times the data and ran out of memory there too. Its
   workers stay up while it runs on the coordinator.
+- `EXPLAIN DISTRIBUTED <query>` says how a query would run without running
+  it: where (workers or the replica) and why, auto mode's estimates, the
+  partitions its exchanges would have, its stages with their SQL, what the
+  coordinator runs over their results, and what keeps parts of it on the
+  coordinator. See [distributed execution](docs/distributed-execution.md#seeing-it).
 - Workers start on demand and stop when idle: on Kubernetes the chart's
   `workers.enabled` adds a worker Deployment that Igloo scales between zero
   and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`

@@ -35,6 +35,8 @@ var (
 	setDistributed   = regexp.MustCompile(`(?is)^\s*SET\s+(?:SESSION\s+)?distributed_execution\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$`)
 	resetDistributed = regexp.MustCompile(`(?is)^\s*RESET\s+distributed_execution\s*;?\s*$`)
 	showDistributed  = regexp.MustCompile(`(?is)^\s*SHOW\s+distributed_execution\s*;?\s*$`)
+	// explainDistributed is EXPLAIN DISTRIBUTED and the query it explains.
+	explainDistributed = regexp.MustCompile(`(?is)^\s*EXPLAIN\s+DISTRIBUTED\s+(.+?)\s*;?\s*$`)
 )
 
 // distributedCommand handles SET, RESET and SHOW distributed_execution,
@@ -63,6 +65,20 @@ func (s *Server) distributedCommand(sess *session, query string) (wire.PreparedS
 			return w.Complete("RESET")
 		})
 	}
+	if m := explainDistributed.FindStringSubmatch(query); m != nil {
+		return respond(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			rows, err := s.explainDistributed(ctx, sess, m[1])
+			if err != nil {
+				return err
+			}
+			for _, r := range rows {
+				if err := w.Row([]any{r[0], r[1]}); err != nil {
+					return err
+				}
+			}
+			return w.Complete("EXPLAIN")
+		}, wire.WithColumns(wire.Columns{{Name: "explain_key", Oid: pgtype.TextOID, Width: -1}, {Name: "explain_value", Oid: pgtype.TextOID, Width: -1}}))
+	}
 	if showDistributed.MatchString(query) {
 		return respond(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 			if err := w.Row([]any{string(sess.mode())}); err != nil {
@@ -72,6 +88,41 @@ func (s *Server) distributedCommand(sess *session, query string) (wire.PreparedS
 		}, wire.WithColumns(wire.Columns{{Name: "distributed_execution", Oid: pgtype.TextOID, Width: -1}}))
 	}
 	return nil, false
+}
+
+// explainDistributed says how query would run, without running it (see
+// distributed.Coordinator.Explain): checked as the statement would be, by
+// the session's user, and with the reason it runs on this replica when it
+// cannot run on workers.
+func (s *Server) explainDistributed(ctx context.Context, sess *session, query string) ([][2]string, error) {
+	// Preparing several statements runs all but the last.
+	if n, err := s.engine.CountStatements(query); err != nil || n != 1 {
+		return nil, pgerror.WithCode(errors.New("EXPLAIN DISTRIBUTED explains one statement"), codes.Syntax)
+	}
+	user := sess.currentUser()
+	st, err := s.prepareChecked(ctx, sess, user, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer st.close() //nolint:errcheck
+	here := func(reason string) ([][2]string, error) {
+		return [][2]string{{"runs on", "this replica"}, {"reason", reason}}, nil
+	}
+	mode := sessionMode(sess, user)
+	switch {
+	case s.dist == nil:
+		return here("this replica has no workers")
+	case st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows:
+		return here("only queries run on workers")
+	case sess.inTx:
+		return here("it is in a transaction, which reads its own snapshots")
+	case mode == distributed.ModeOff:
+		return here("distributed_execution is off")
+	}
+	if reason := policyReason(st); reason != "" {
+		return here(reason)
+	}
+	return s.dist.Explain(ctx, st.query, &sessionEnv{s: s, sess: sess, user: user, st: st}, mode)
 }
 
 func (sess *session) mode() distributed.Mode {
