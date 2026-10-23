@@ -202,9 +202,12 @@ explicit transactions, the coordinator plans it:
    filter would only send every matching row through the coordinator's
    disk. A statement with candidates then runs on workers, in auto mode,
    only when that should be faster than the coordinator alone
-   (`internal/distributed/cost.go`). Its time on the coordinator is
-   estimated at 150 MB/s per core over as much of the tables its stages
-   read as the coordinator's read cache can hold, and at its cold rate for
+   (`internal/distributed/cost.go`), over what its stages read of their
+   tables: each table's size times the share of its columns, weighed by
+   type, that the stages' fragments name (a star in a view passes columns
+   through; one in a fragment's select list reads them all). Its time on
+   the coordinator is estimated at 150 MB/s per core over as much of that
+   as the coordinator's read cache can hold, and at its cold rate for
    the rest (16 MB/s per core at four threads a core, about 11 at two,
    about as the threads' 0.6th power), times its working set over 70% of
    its memory limit, up to twice, when it would run short of memory (the
@@ -225,9 +228,11 @@ explicit transactions, the coordinator plans it:
    times on one machine and on workers, for the last 4,096 statements, and
    reads the past week's from the query history at start. A statement that
    ran both ways runs where it was faster; one that ran on one machine
-   within the threshold, or within half its estimate, stays there; one that
-   ran longer there is tried on workers at most once a day; one that ran on
-   workers stays there if it beat its estimates. One that ran out of memory
+   within the threshold stays there; one that ran only one way in under ten
+   minutes is tried the other way once a day, whatever the estimates say;
+   past that, one that ran on one machine within half its estimate stays
+   there, and one that ran on workers stays there if it beat its
+   estimates. One that ran out of memory
    on one machine runs on workers: when it does, before it has sent a row,
    it runs again on workers at once, as an admin's forced statement would,
    from a fresh context if the memory watch's cancel ended the first.

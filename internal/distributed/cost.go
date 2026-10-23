@@ -8,6 +8,8 @@ import (
 	"math"
 	"math/bits"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -55,9 +57,12 @@ const (
 	// workerThreadsPerCore are the threads a core coldRate is measured at
 	// (see engine's thread defaults).
 	workerThreadsPerCore = 4
-	// exploreEvery is how seldom auto mode runs a statement on workers
-	// against the estimates, to learn how long it takes there (see choose).
+	// exploreEvery is how seldom auto mode runs a statement where it has
+	// not run, against the estimates, to learn how long it takes there
+	// (see choose); exploreUnder is how short its runs where it has must
+	// be for that to be worth a try.
 	exploreEvery = 24 * time.Hour
+	exploreUnder = 10 * time.Minute
 )
 
 // estimate is how long a planned statement would take on one machine and
@@ -107,23 +112,29 @@ type fleet struct {
 // spillFactor times.
 func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 	var e estimate
-	read, exchanged := map[string]int64{}, map[string]int64{}
+	// What the stages read of each table, and what those that write
+	// exchanges read: the columns their fragments refer to.
+	tables := map[string]*Table{}
+	read, exchanged := map[string]columnSet{}, map[string]columnSet{}
 	for _, s := range stages {
 		for _, in := range s.Inputs {
 			if in.Table == nil {
 				continue
 			}
-			read[in.Table.key()] = in.Table.Bytes
+			k := in.Table.key()
+			tables[k] = in.Table
+			cols := columnsRead(s.fragment, in.Table)
+			read[k] = union(read, k, cols)
 			if s.Out != nil {
-				exchanged[in.Table.key()] = in.Table.Bytes
+				exchanged[k] = union(exchanged, k, cols)
 			}
 		}
 	}
-	for _, b := range read {
-		e.bytes += b
+	for k, cols := range read {
+		e.bytes += cols.bytes(tables[k])
 	}
-	for _, b := range exchanged {
-		e.exchanged += b
+	for k, cols := range exchanged {
+		e.exchanged += cols.bytes(tables[k])
 	}
 	e.levels = levels(stages)
 	cores := float64(max(m.cores, 1))
@@ -155,6 +166,111 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 	return e
 }
 
+// columnSet is the columns of a table a plan reads, by lower-case name;
+// nil means all of them.
+type columnSet map[string]bool
+
+// columnsRead returns the columns of t that a stage's fragment refers to:
+// every column if its select list has a star, which it writes out, and
+// otherwise those it names anywhere, under any qualifier. A star in a
+// subquery, as a view's s.* is, passes columns through for the names
+// around it to pick. A stage without a fragment, as in tests, reads all.
+func columnsRead(fragment node, t *Table) columnSet {
+	if fragment == nil {
+		return nil
+	}
+	for _, item := range list(fragment, "select_list") {
+		if n, ok := item.(node); ok && str(n["class"]) == "STAR" {
+			return nil
+		}
+	}
+	named := map[string]bool{}
+	walk(fragment, func(n node) bool {
+		if str(n["class"]) == "COLUMN_REF" {
+			for _, part := range list(n, "column_names") {
+				named[strings.ToLower(str(part))] = true
+			}
+		}
+		return true
+	})
+	cols := columnSet{}
+	for _, c := range t.Columns {
+		if name := strings.ToLower(c.Name); named[name] {
+			cols[name] = true
+		}
+	}
+	if len(cols) == 0 && len(t.Columns) > 0 {
+		// count(*): DuckDB reads a column all the same.
+		cols[strings.ToLower(t.Columns[0].Name)] = true
+	}
+	return cols
+}
+
+// union returns sets[k], if any, with cols; nil, as either, is all
+// columns.
+func union(sets map[string]columnSet, k string, cols columnSet) columnSet {
+	prev, ok := sets[k]
+	switch {
+	case !ok:
+		return cols
+	case prev == nil || cols == nil:
+		return nil
+	}
+	out := maps.Clone(prev)
+	maps.Copy(out, cols)
+	return out
+}
+
+// bytes estimates what reading the columns s of t takes: t's size times
+// the columns' share of its columns, weighed by their types (typeBytes).
+func (s columnSet) bytes(t *Table) int64 {
+	if s == nil {
+		return t.Bytes
+	}
+	var all, some float64
+	for _, c := range t.Columns {
+		w := typeBytes(c.Type)
+		all += w
+		if s[strings.ToLower(c.Name)] {
+			some += w
+		}
+	}
+	if all == 0 {
+		return t.Bytes
+	}
+	return int64(float64(t.Bytes) * some / all)
+}
+
+// typeBytes guesses how many compressed bytes a value of type typ takes,
+// to weigh a table's columns, whose sizes Igloo does not know: a report
+// that reads three of the 420 columns of a table of 77 GB reads a few of
+// its gigabytes, not all of them.
+func typeBytes(typ string) float64 {
+	t := strings.ToUpper(strings.TrimSpace(typ))
+	switch {
+	case strings.HasSuffix(t, "]"), strings.HasPrefix(t, "MAP"), strings.HasPrefix(t, "STRUCT"), strings.HasPrefix(t, "UNION"):
+		return 32
+	case t == "BOOLEAN", t == "TINYINT", t == "UTINYINT":
+		return 1
+	case t == "SMALLINT", t == "USMALLINT":
+		return 2
+	case t == "INTEGER", t == "UINTEGER", t == "FLOAT", t == "DATE":
+		return 4
+	case t == "HUGEINT", t == "UHUGEINT", t == "UUID", t == "INTERVAL", t == "BLOB":
+		return 16
+	case strings.HasPrefix(t, "DECIMAL"):
+		if p, _, ok := strings.Cut(strings.TrimPrefix(t, "DECIMAL("), ","); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil && n > 18 {
+				return 16
+			}
+		}
+		return 8
+	case strings.HasPrefix(t, "VARCHAR"):
+		return 16
+	}
+	return 8
+}
+
 // levels is the length of the longest chain of stages each of which reads
 // what the one before it wrote: the rounds of tasks a statement waits for.
 func levels(stages []*Stage) int {
@@ -178,15 +294,22 @@ func levels(stages []*Stage) int {
 
 // choose decides whether a statement whose plan key is key and whose
 // estimates are e runs on workers, from e and what the statement took
-// before (r, if found), and says why. It may run a statement on workers
-// against the estimates (explore), at most once in exploreEvery, to learn
-// how long it takes there, but never one that ran on one machine within
-// threshold.
+// before (r, if found), and says why. It may run a statement where it has
+// not run, against the estimates (explore), at most once in exploreEvery,
+// to learn how long it takes there, but never one that ran on one machine
+// within threshold on workers.
 func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Time) (workers, explore bool, reason string) {
 	limit := threshold.Seconds()
 	worth := func(oneMachine float64) bool {
 		return e.workers > 0 && (oneMachine > limit || e.memory) && e.onWorkers < oneMachine/speedup
 	}
+	// Measured on one side only, a statement that took under exploreUnder
+	// there is tried once a day on the other, whatever the estimates say,
+	// so that the history comes to compare runs with runs: an estimate
+	// that is wrong would otherwise keep it on the slower side for good,
+	// as a run on workers that beat an estimate of one machine far too
+	// high would.
+	mayExplore := now.Sub(r.explored) >= exploreEvery
 	switch {
 	case found && r.outOfMemory && e.workers > 0:
 		return true, false, "it ran out of memory on one machine"
@@ -199,16 +322,21 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 		switch {
 		case r.local < limit:
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit)
+		case e.workers > 0 && mayExplore && r.local < exploreUnder.Seconds():
+			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers once, estimated at %.0f s", r.local, e.onWorkers)
 		case r.local < e.oneMachine/2:
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, well under the %.0f s estimated", r.local, e.oneMachine)
 		case worth(r.local):
 			return true, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
-		case e.workers > 0 && now.Sub(r.explored) >= exploreEvery:
+		case e.workers > 0 && mayExplore:
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers, estimated at %.0f s", r.local, e.onWorkers)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
 	case found && r.dist > 0:
-		if r.dist <= e.onWorkers/2 || r.dist < e.oneMachine/speedup {
+		switch {
+		case mayExplore && r.dist < exploreUnder.Seconds():
+			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
+		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine/speedup:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)

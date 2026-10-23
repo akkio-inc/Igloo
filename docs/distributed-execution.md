@@ -203,8 +203,10 @@ took 6 to 56 seconds on one replica took 37 to 176 seconds on four workers.
 So Igloo considers a statement for workers only when its largest table is
 more than the replica scans in about four seconds (4 GiB for a 16-core
 replica; workers that are stopped are started only for a minute's worth).
-For such a statement it estimates two times: the replica's, at 150 MB/s per
-core over as much of the tables the statement reads as its read cache can
+For such a statement it estimates two times, over what it reads of its
+tables (each table's size times the share of its columns, weighed by type,
+that the statement's parts name): the replica's, at 150 MB/s per
+core over as much of that as its read cache can
 hold and at what it reads from object storage cold per core for the rest
 (about 11 MB/s at two threads a core), and the workers', at 16 MB/s per
 worker core from object storage plus about 4 seconds for each round of
@@ -223,10 +225,12 @@ its text without its literals (other than integers) and the sizes of its
 tables to a factor of two: `query_history.plan_key`. Each replica remembers
 the last 4,096 such statements, and reads the past week's from the query
 history when it starts. A statement that ran both ways runs where it was
-faster. One that ran only on the replica, within the threshold or well
-within its estimate, stays there; one that ran longer there is tried on
-workers at most once a day. One that ran only on workers stays there if it
-beat its estimates. The server logs each choice, `chose where a statement
+faster. One that ran only on the replica within the threshold stays there.
+One that ran only one way, in under ten minutes, is tried once the other
+way, at most once a day, whatever the estimates say, so that runs come to
+be compared with runs; past that, one that ran only on the replica, well
+within its estimate, stays there, and one that ran only on workers stays
+there if it beat its estimates. The server logs each choice, `chose where a statement
 runs`, with both estimates and the reason.
 
 A statement that auto mode ran on the replica and that runs out of memory

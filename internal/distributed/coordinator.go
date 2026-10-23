@@ -322,11 +322,11 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	co.log.Info("chose where a statement runs", "on", where, "reason", reason, "key", plan.Key,
 		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers,
 		"levels", e.levels, "bytes", e.bytes, "short_of_memory", e.memory)
-	if !onWorkers {
-		return nil, &errUnsupported{reason: "one machine is faster: " + reason, key: plan.Key}
-	}
 	if explore {
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
+	}
+	if !onWorkers {
+		return nil, &errUnsupported{reason: "one machine is faster: " + reason, key: plan.Key}
 	}
 	return plan, nil
 }

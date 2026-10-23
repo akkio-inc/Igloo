@@ -33,12 +33,17 @@ func TestChoose(t *testing.T) {
 		{"faster on workers before", close, runs{local: 300, dist: 100}, true, true, false},
 		{"faster on one machine before", slow, runs{local: 100, dist: 300}, true, false, false},
 		{"ran on one machine within the threshold", slow, runs{local: 30}, true, false, false},
-		{"ran on one machine well within its estimate", slow, runs{local: 250}, true, false, false},
-		{"ran long on one machine, workers estimated faster", estimate{oneMachine: 100, onWorkers: 60, workers: 4}, runs{local: 120}, true, true, false},
+		{"ran on one machine for minutes: try workers once", slow, runs{local: 250}, true, true, true},
+		{"ran on one machine, tried workers today, well within its estimate", slow, runs{local: 250, explored: now.Add(-time.Hour)}, true, false, false},
+		{"ran long on one machine, tried workers today, workers estimated faster", estimate{oneMachine: 100, onWorkers: 60, workers: 4},
+			runs{local: 120, explored: now.Add(-time.Hour)}, true, true, false},
 		{"ran long on one machine: try workers", close, runs{local: 400}, true, true, true},
 		{"ran long on one machine, tried workers today", close, runs{local: 400, explored: now.Add(-time.Hour)}, true, false, false},
-		{"ran on workers within their estimate", close, runs{dist: 200}, true, true, false},
-		{"ran on workers slower than one machine's estimate", slow, runs{dist: 500}, true, false, false},
+		{"ran for an hour on one machine, workers estimated faster", close, runs{local: 3600, explored: now.Add(-time.Hour)}, true, true, false},
+		{"ran on workers for minutes: try one machine once", close, runs{dist: 200}, true, false, true},
+		{"ran on workers within their estimate, tried one machine today", close, runs{dist: 200, explored: now.Add(-time.Hour)}, true, true, false},
+		{"ran on workers slower than one machine's estimate, tried today", slow, runs{dist: 500, explored: now.Add(-time.Hour)}, true, false, false},
+		{"ran on workers for an hour, not estimated faster there", close, runs{dist: 3600}, true, false, false},
 		{"ran out of memory on one machine", short, runs{local: 10, outOfMemory: true}, true, true, false},
 		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
 	} {
@@ -95,47 +100,90 @@ func TestEstimateTimes(t *testing.T) {
 // TestScaleReports checks auto mode's first choice for the shapes of the
 // scale environment's reports: a coordinator of 16 cores, 32 threads and
 // a 49 GiB memory limit with a 100 GiB read cache, and up to 16 workers
-// of 8 cores. At 1x they run on one machine, and so does one that ran in
-// 15 s on one machine at 10x and for 917 s on four workers; at 100x, where
-// one machine read for an hour and ran out of memory, on workers.
+// of 8 cores. The bytes are what the reports' stages read of their
+// tables' columns, as the planner estimates them from their plans (see
+// columnsRead). At 1x and 10x they run on one machine (at 10x, E2 ran in
+// 174 s there and 249 s on four workers; F5 in 15 s there and 917 s on
+// four workers); at 100x, where one machine read for an hour and ran out
+// of memory, on workers.
 func TestScaleReports(t *testing.T) {
 	coordinator := machine{cores: 16, threads: 32, memory: 49 << 30, cache: 100 << 30}
-	workers := fleet{cores: 8, running: 0, most: 16, start: time.Minute}
-	// Table sizes at 1x: the audience lookup, the attributes, the
-	// segments, the household aggregate.
-	lookup, attributes, segments, households := int64(13e9), int64(7.6e9), int64(2.45e9), int64(1.8e9)
-	shape := func(scale int64, tables ...int64) []*Stage {
-		var stages []*Stage
+	shape := func(levels int, bytes float64) []*Stage {
 		x := &Exchange{ID: 0}
-		var ins []Input
-		for i, b := range tables {
-			out := &Exchange{ID: i + 1}
-			stages = append(stages, &Stage{Inputs: []Input{{Table: &Table{Name: fmt.Sprint("t", i), Bytes: b * scale}, Split: true}}, Out: out})
-			ins = append(ins, Input{Exchange: out, Partitioned: true})
+		stages := []*Stage{{Inputs: []Input{{Table: &Table{Name: "t", Bytes: int64(bytes)}, Split: true}}, Out: x}}
+		for range levels - 2 {
+			y := &Exchange{ID: x.ID + 1}
+			stages = append(stages, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}, Out: y})
+			x = y
 		}
-		stages = append(stages, &Stage{Inputs: ins, Out: x}, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}})
-		return stages
+		return append(stages, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}})
 	}
 	for _, c := range []struct {
 		name    string
-		tables  []int64
-		scale   int64
+		levels  int
+		bytes   float64
 		workers bool
 	}{
-		{"E2 at 1x", []int64{lookup, attributes, segments}, 1, false},
-		{"E3 at 1x", []int64{lookup, households, attributes}, 1, false},
-		{"E2 at 100x", []int64{lookup, attributes, segments}, 100, true},
-		{"E3 at 100x", []int64{lookup, households, attributes}, 100, true},
-		// The s universe's lookup and media detail, which a report that
-		// ran in 15 s on one machine at 10x reads a few columns of.
-		{"F5 at 10x", []int64{7.57e9, 1.28e9, 0.12e9}, 10, false},
+		{"E2 at 1x", 2, 9.0e9, false},
+		{"E3 at 1x", 5, 7.8e9, false},
+		{"F5 at 1x", 7, 3.8e9, false},
+		{"E2 at 10x", 2, 90.2e9, false},
+		{"E3 at 10x", 5, 77.5e9, false},
+		{"F4 at 10x", 7, 35.3e9, false},
+		{"F5 at 10x", 7, 37.6e9, false},
+		{"E2 at 100x", 2, 895e9, true},
+		{"E3 at 100x", 5, 775e9, true},
 	} {
-		e := estimateTimes(shape(c.scale, c.tables...), coordinator, workers)
-		got, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
-		t.Logf("%s: %s (short of memory: %v)", c.name, reason, e.memory)
-		if got != c.workers {
-			t.Errorf("%s: workers %v (%s); one machine %.0f s, workers %.0f s on %d", c.name, got, reason, e.oneMachine, e.onWorkers, e.workers)
+		for _, f := range []fleet{{cores: 8, running: 4, most: 4}, {cores: 8, most: 16, start: time.Minute}} {
+			e := estimateTimes(shape(c.levels, c.bytes), coordinator, f)
+			got, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
+			t.Logf("%s, %d running of %d: %s (short of memory: %v)", c.name, f.running, f.most, reason, e.memory)
+			if got != c.workers {
+				t.Errorf("%s, %d running of %d: workers %v (%s)", c.name, f.running, f.most, got, reason)
+			}
 		}
+	}
+
+	// Run on workers first, as an estimate too high for one machine would
+	// have sent it, a statement is tried on one machine once, and stays on
+	// the faster side.
+	now := time.Now()
+	e := estimateTimes(shape(2, 90.2e9), coordinator, fleet{cores: 8, running: 4, most: 4})
+	if workers, explore, reason := choose(e, runs{dist: 249}, true, DefaultThreshold, now); workers || !explore {
+		t.Errorf("run on workers only: workers %v, explore %v (%s)", workers, explore, reason)
+	}
+	if workers, _, reason := choose(e, runs{dist: 249, local: 174, explored: now}, true, DefaultThreshold, now); workers {
+		t.Errorf("faster on one machine: workers (%s)", reason)
+	}
+}
+
+// TestColumnsRead checks what a stage reads of a table: the columns its
+// fragment names, under any qualifier and through a view's star, weighed
+// by their types, and the whole table for a star in its select list.
+func TestColumnsRead(t *testing.T) {
+	h := newHarness(t, 0.01, 1, 1)
+	wide := &Table{Name: "wide", Bytes: 400e9, Columns: []Column{{Name: "id", Type: "VARCHAR"}}}
+	for i := range 399 {
+		wide.Columns = append(wide.Columns, Column{Name: fmt.Sprint("c", i), Type: "VARCHAR"})
+	}
+	for _, c := range []struct {
+		sql  string
+		want int64
+	}{
+		{`SELECT v.id, v.c1, c2 FROM (SELECT s.* FROM __igloo_split AS s) AS v`, 3e9},
+		{`SELECT count(*) FROM __igloo_split`, 1e9},
+		{`SELECT * FROM __igloo_split WHERE c3 = 'x'`, 400e9},
+	} {
+		f, err := h.co.parser.parse(c.sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := columnsRead(f, wide).bytes(wide); got != c.want {
+			t.Errorf("%s: %d bytes, want %d", c.sql, got, c.want)
+		}
+	}
+	if typeBytes("BOOLEAN") >= typeBytes("VARCHAR") || typeBytes("DECIMAL(38,0)") != 16 || typeBytes("VARCHAR[]") != 32 {
+		t.Error("type weights")
 	}
 }
 

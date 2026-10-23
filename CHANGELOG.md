@@ -339,7 +339,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   go to workers whatever the time, which made 1x reports of 6 to 56 s
   take 37 to 176 s. Each replica remembers what statements took each way,
   by `query_history.plan_key` (the text without literals and the tables'
-  sizes), and runs a statement run again where it was faster. The
+  sizes), and runs a statement run again where it was faster; one that
+  ran only one way, in under ten minutes, is tried the other way once a
+  day, so that runs are compared with runs. Both estimates count what the
+  statement's parts read of each table: its size times the share of its
+  columns, weighed by type, that they name, so a report that reads three
+  of a table's 420 columns is not priced at all of them. The
   replica's estimate prices at its warm rate only what its read cache can
   hold, and the rest at its cold rate, and grows with how far its working
   set is over its share of memory: at 100x, where one machine ran reports
