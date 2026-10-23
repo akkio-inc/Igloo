@@ -101,16 +101,21 @@ func TestEstimateTimes(t *testing.T) {
 // scale environment's reports: a coordinator of 16 cores, 32 threads and
 // a 49 GiB memory limit with a 100 GiB read cache, and up to 16 workers
 // of 8 cores. The bytes are what the reports' stages read of their
-// tables' columns, as the planner estimates them from their plans (see
-// columnsRead). At 1x and 10x they run on one machine (at 10x, E2 ran in
-// 174 s there and 249 s on four workers; F5 in 15 s there and 917 s on
-// four workers); at 100x, where one machine read for an hour and ran out
-// of memory, on workers.
+// tables' columns, and the rows what they go through, as the planner
+// estimates them from their plans (see columnsRead and rowWork). At 1x
+// and 10x they run on one machine (at 10x, E2 ran in 174 s there and 249 s
+// on four workers; F5 in 15 s there and 917 s on four workers); at 100x,
+// where one machine read for an hour and ran out of memory, on workers,
+// and so does E1, which reads little but joins 4 billion rows to
+// themselves 16 times.
 func TestScaleReports(t *testing.T) {
 	coordinator := machine{cores: 16, threads: 32, memory: 49 << 30, cache: 100 << 30}
-	shape := func(levels int, bytes float64) []*Stage {
+	// shape is a plan of levels levels over a table of bytes and of rows
+	// that its stages go through rows times in all.
+	shape := func(levels int, bytes, rows float64) []*Stage {
 		x := &Exchange{ID: 0}
-		stages := []*Stage{{Inputs: []Input{{Table: &Table{Name: "t", Bytes: int64(bytes)}, Split: true}}, Out: x}}
+		table := &Table{Name: "t", Bytes: int64(bytes), Rows: int64(rows / float64(levels))}
+		stages := []*Stage{{Inputs: []Input{{Table: table, Split: true}}, Out: x}}
 		for range levels - 2 {
 			y := &Exchange{ID: x.ID + 1}
 			stages = append(stages, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}, Out: y})
@@ -119,23 +124,26 @@ func TestScaleReports(t *testing.T) {
 		return append(stages, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}})
 	}
 	for _, c := range []struct {
-		name    string
-		levels  int
-		bytes   float64
-		workers bool
+		name        string
+		levels      int
+		bytes, rows float64
+		workers     bool
 	}{
-		{"E2 at 1x", 2, 9.0e9, false},
-		{"E3 at 1x", 5, 7.8e9, false},
-		{"F5 at 1x", 7, 3.8e9, false},
-		{"E2 at 10x", 2, 90.2e9, false},
-		{"E3 at 10x", 5, 77.5e9, false},
-		{"F4 at 10x", 7, 35.3e9, false},
-		{"F5 at 10x", 7, 37.6e9, false},
-		{"E2 at 100x", 2, 895e9, true},
-		{"E3 at 100x", 5, 775e9, true},
+		{"E1 at 1x", 3, 0.2e9, 6.77e9, false},
+		{"E2 at 1x", 2, 9.0e9, 8.66e9, false},
+		{"E3 at 1x", 5, 7.8e9, 4.42e8, false},
+		{"F5 at 1x", 7, 3.8e9, 1.35e10, false},
+		{"E1 at 10x", 3, 1.9e9, 6.77e10, false},
+		{"E2 at 10x", 2, 90.2e9, 1.2e11, false},
+		{"E3 at 10x", 5, 77.5e9, 4.82e9, false},
+		{"F4 at 10x", 7, 35.3e9, 1.08e11, false},
+		{"F5 at 10x", 7, 37.6e9, 1.34e11, false},
+		{"E1 at 100x", 3, 19.2e9, 6.77e11, true},
+		{"E2 at 100x", 2, 901.6e9, 1.2e12, true},
+		{"E3 at 100x", 5, 775.2e9, 4.82e10, true},
 	} {
 		for _, f := range []fleet{{cores: 8, running: 4, most: 4}, {cores: 8, most: 16, start: time.Minute}} {
-			e := estimateTimes(shape(c.levels, c.bytes), coordinator, f)
+			e := estimateTimes(shape(c.levels, c.bytes, c.rows), coordinator, f)
 			got, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
 			t.Logf("%s, %d running of %d: %s (short of memory: %v)", c.name, f.running, f.most, reason, e.memory)
 			if got != c.workers {
@@ -148,7 +156,7 @@ func TestScaleReports(t *testing.T) {
 	// have sent it, a statement is tried on one machine once, and stays on
 	// the faster side.
 	now := time.Now()
-	e := estimateTimes(shape(2, 90.2e9), coordinator, fleet{cores: 8, running: 4, most: 4})
+	e := estimateTimes(shape(2, 90.2e9, 1.2e11), coordinator, fleet{cores: 8, running: 4, most: 4})
 	if workers, explore, reason := choose(e, runs{dist: 249}, true, DefaultThreshold, now); workers || !explore {
 		t.Errorf("run on workers only: workers %v, explore %v (%s)", workers, explore, reason)
 	}
@@ -184,6 +192,34 @@ func TestColumnsRead(t *testing.T) {
 	}
 	if typeBytes("BOOLEAN") >= typeBytes("VARCHAR") || typeBytes("DECIMAL(38,0)") != 16 || typeBytes("VARCHAR[]") != 32 {
 		t.Error("type weights")
+	}
+}
+
+// TestRowWork checks the rows a plan's stages go through: a table's rows,
+// a hundredth of them when filtered by a constant, once for the scan and
+// again for each join and grouping, and an exchange's as the rows that fed
+// it.
+func TestRowWork(t *testing.T) {
+	h := newHarness(t, 0.01, 1, 1)
+	parse := func(sql string) node {
+		f, err := h.co.parser.parse(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	people := &Table{Name: "people", Rows: 1e9, Columns: []Column{{Name: "id", Type: "BIGINT"}, {Name: "audience", Type: "VARCHAR"}}}
+	events := &Table{Name: "events", Rows: 4e9, Columns: []Column{{Name: "person", Type: "BIGINT"}, {Name: "kind", Type: "VARCHAR"}}}
+	x := &Exchange{ID: 0}
+	stages := []*Stage{
+		{fragment: parse(`SELECT id FROM __igloo_t0 WHERE audience = 'a'`), Inputs: []Input{{Table: people}}, Out: x},
+		{fragment: parse(`SELECT e.kind, count(*) FROM __igloo_split AS e JOIN __igloo_k0 AS p ON p.id = e.person GROUP BY 1`),
+			Inputs: []Input{{Table: events, Split: true}, {Exchange: x, Partitioned: true}}},
+	}
+	// 1e7 people for the filter; (4e9 + 1e7) rows, scanned, joined and
+	// grouped.
+	if got, want := rowWork(stages), 1e7+3*(4e9+1e7); got != want {
+		t.Errorf("%.3g rows, want %.3g", got, want)
 	}
 }
 

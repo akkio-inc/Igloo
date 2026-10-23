@@ -48,6 +48,18 @@ const (
 	memoryShare      = 0.7
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// rowRate is how many rows a core goes through a second for each pass
+	// over them (see rowWork). It is the fastest of the scale environment's
+	// reports on one machine of 16 cores: two that went through 1.1 and
+	// 1.35e10 such rows at 1x took 3 to 6 s, as filters the estimate does
+	// not see cut their rows; one that joins a 400-million-row table to
+	// itself 16 times went through 6.8e10 at 10x in 1,073 s. So the rows
+	// set a floor under one machine's time, which only plans with far more
+	// rows than bytes rise above.
+	rowRate = 1.5e8
+	// filterSelectivity is the share of a table's rows a filter on one of
+	// its columns by a constant is taken to keep (see rowWork).
+	filterSelectivity = 0.01
 	// spillFactor bounds how much longer one machine short of memory is
 	// estimated to take. The working set is guessed from the sizes of the
 	// tables its stages read, whole, where a report reads a few columns of
@@ -69,9 +81,11 @@ const (
 // on workers.
 type estimate struct {
 	// bytes are what its stages read of tables; exchanged what the stages
-	// that write exchanges read of them; levels its stages' longest chain.
+	// that write exchanges read of them; levels its stages' longest chain;
+	// rows the rows its stages go through (see rowWork).
 	bytes, exchanged int64
 	levels           int
+	rows             float64
 	// oneMachine is the coordinator's time, onWorkers that of workers,
 	// as many as workers says, in seconds.
 	oneMachine, onWorkers float64
@@ -137,10 +151,15 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 		e.exchanged += cols.bytes(tables[k])
 	}
 	e.levels = levels(stages)
+	e.rows = rowWork(stages)
 	cores := float64(max(m.cores, 1))
 	warm := min(e.bytes, max(m.cache, 0))
 	threadsPerCore := float64(max(m.threads, m.cores)) / cores
 	e.oneMachine = float64(warm)/(cores*localRate) + float64(e.bytes-warm)/(cores*coldRateAt(threadsPerCore))
+	// What it reads, or what it computes over the rows, whichever takes
+	// longer: a report that reads 2 GB of a table but joins its 400 million
+	// rows to themselves 16 times is no 1-second statement.
+	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate))
 	if set := float64(workingSetFactor * e.exchanged); m.memory > 0 && set > memoryShare*float64(m.memory) {
 		e.memory = true
 		e.oneMachine *= min(set/(memoryShare*float64(m.memory)), spillFactor)
@@ -150,7 +169,8 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 	times := make([]float64, f.most+1)
 	best := math.Inf(1)
 	for n := 1; n <= f.most; n++ {
-		t := float64(e.levels)*levelCost + float64(e.bytes)/(float64(n*max(f.cores, 1))*coldRate)
+		cores := float64(n * max(f.cores, 1))
+		t := float64(e.levels)*levelCost + max(float64(e.bytes)/(cores*coldRate), e.rows/(cores*rowRate))
 		if n > f.running {
 			t += f.start.Seconds()
 		}
@@ -164,6 +184,96 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 		}
 	}
 	return e
+}
+
+// rowWork estimates the rows a plan's stages go through: each stage's
+// tables' rows and the rows of the exchanges it reads, taken as the rows
+// that fed them, once for the scan and once more for each join and for
+// grouping in its fragment. A table its fragment compares a column of to
+// a constant, as a report picks one audience out of every audience's
+// members, counts filterSelectivity of its rows.
+func rowWork(stages []*Stage) float64 {
+	fed := map[*Exchange]float64{}
+	var work float64
+	for _, s := range stages {
+		var in float64
+		for _, i := range s.Inputs {
+			switch {
+			case i.Table != nil:
+				rows := float64(max(i.Table.Rows, 0))
+				if filtersByConstant(s.fragment, i.Table) {
+					rows *= filterSelectivity
+				}
+				in += rows
+			case i.Exchange != nil:
+				in += fed[i.Exchange]
+			}
+		}
+		work += in * float64(1+operators(s.fragment))
+		if s.Out != nil {
+			fed[s.Out] += in
+		}
+	}
+	return work
+}
+
+// filtersByConstant reports whether fragment compares a column of t to a
+// constant, with = or IN, in a WHERE clause.
+func filtersByConstant(fragment node, t *Table) bool {
+	cols := map[string]bool{}
+	for _, c := range t.Columns {
+		cols[strings.ToLower(c.Name)] = true
+	}
+	found := false
+	walk(fragment, func(m node) bool {
+		where := child(m, "where_clause")
+		if found || where == nil {
+			return !found
+		}
+		for _, c := range conjuncts(where) {
+			var col, val node
+			switch str(c["type"]) {
+			case "COMPARE_EQUAL":
+				col, val = child(c, "left"), child(c, "right")
+				if str(col["class"]) != "COLUMN_REF" {
+					col, val = val, col
+				}
+			case "COMPARE_IN":
+				kids := list(c, "children")
+				if len(kids) < 2 {
+					continue
+				}
+				col, _ = kids[0].(node)
+				val, _ = kids[1].(node)
+			default:
+				continue
+			}
+			if str(col["class"]) != "COLUMN_REF" || str(val["class"]) != "CONSTANT" {
+				continue
+			}
+			names := list(col, "column_names")
+			if len(names) > 0 && cols[strings.ToLower(str(names[len(names)-1]))] {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// operators counts the joins in a fragment, and its grouping.
+func operators(fragment node) int {
+	n := 0
+	walk(fragment, func(m node) bool {
+		if str(m["type"]) == "JOIN" {
+			n++
+		}
+		if len(list(m, "group_expressions")) > 0 {
+			n++
+		}
+		return true
+	})
+	return n
 }
 
 // columnSet is the columns of a table a plan reads, by lower-case name;

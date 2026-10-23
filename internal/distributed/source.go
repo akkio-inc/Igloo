@@ -179,6 +179,9 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	if snap.Summary != nil {
 		props = snap.Summary.Properties
 	}
+	if records, err := strconv.ParseInt(props["total-records"], 10, 64); err == nil {
+		t.Rows = records
+	}
 	if size, err := strconv.ParseInt(props["total-files-size"], 10, 64); err == nil {
 		t.Bytes = size
 		return t, nil

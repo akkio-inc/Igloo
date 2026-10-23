@@ -213,8 +213,13 @@ explicit transactions, the coordinator plans it:
    the rest (16 MB/s per core at four threads a core, about 11 at two,
    about as the threads' 0.6th power), times its working set over 70% of
    its memory limit, up to twice, when it would run short of memory (the
-   working set is guessed from whole tables' sizes, where reports read a
-   few columns of some and a filtered audience of others); and
+   working set is a rough guess, from what its exchanges are fed), and
+   never less
+   than its rows take: the rows its stages go through (tables' record
+   counts, a hundredth where a stage filters one by a constant, exchanges'
+   as the rows that fed them, once for the scan and again for each join
+   and grouping) at 150 million a second per core, the fastest the reports
+   went; and
    on n workers at 16 MB/s per worker core from object storage, plus 4 s
    for each level of stages (a round of tasks that waits for the one before
    it) and the start time of workers not running; it uses the fewest

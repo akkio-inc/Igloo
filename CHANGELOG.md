@@ -344,7 +344,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   day, so that runs are compared with runs. Both estimates count what the
   statement's parts read of each table: its size times the share of its
   columns, weighed by type, that they name, so a report that reads three
-  of a table's 420 columns is not priced at all of them. The
+  of a table's 420 columns is not priced at all of them. Neither is less
+  than the rows the parts go through take, once for the scan and again for
+  each join and grouping, so a report that reads 19 GB but joins 4 billion
+  rows to themselves 16 times goes to workers. The
   replica's estimate prices at its warm rate only what its read cache can
   hold, and the rest at its cold rate, and grows with how far its working
   set is over its share of memory: at 100x, where one machine ran reports

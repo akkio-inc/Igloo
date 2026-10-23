@@ -102,8 +102,9 @@ type Table struct {
 	// Columns are the table's columns as DuckDB sees them, with their
 	// Iceberg field IDs.
 	Columns []Column
-	// Bytes is the size of the table's data files.
-	Bytes int64
+	// Bytes is the size of the table's data files, and Rows its records,
+	// zero if unknown.
+	Bytes, Rows int64
 	// Unsupported, if set, says why workers cannot read the table, such as
 	// delete files they cannot apply.
 	Unsupported string

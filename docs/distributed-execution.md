@@ -209,7 +209,11 @@ that the statement's parts name): the replica's, at 150 MB/s per
 core over as much of that as its read cache can
 hold and at what it reads from object storage cold per core for the rest
 (about 11 MB/s at two threads a core), and the workers', at 16 MB/s per
-worker core from object storage plus about 4 seconds for each round of
+worker core from object storage; each no less than the rows its parts go
+through take at 150 million rows a second per core, once for the scan and
+again for each join and grouping (a hundredth of a table's rows where a
+part filters it by a constant), for a statement that reads little but
+joins much; plus about 4 seconds for each round of
 tasks that waits for the one before it, plus the time to start workers that
 are stopped. A replica that would run short of memory (the rows its joins
 and distinct counts hold, estimated at three times what feeds them, over
