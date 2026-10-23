@@ -158,8 +158,28 @@ func exchangeSQL(s *Stage, parts int) string {
 // --- running stages ---------------------------------------------------------
 
 // maxPartitions caps the partitions of a statement's exchanges, and so the
-// tasks of a stage that reads them by partition.
-const maxPartitions = 64
+// tasks of a stage that reads them by partition; partitionBytes is how much
+// of the largest divided table a partition is for (see partitions).
+const (
+	maxPartitions  = 256
+	partitionBytes = 256 << 20
+)
+
+// partitions is how many partitions a statement's exchanges have: twice
+// the workers, so that a stage that reads them by partition keeps every
+// worker busy, and more as the divided tables grow, one for each per bytes
+// of the largest, so that each task's hash tables (the distinct people of
+// a share of the cohorts, say) hold a share of the rows that fits a
+// worker's memory: a report's hash tables held several times its tables'
+// compressed bytes. The more partitions, the more files an exchange is: as
+// many as the tasks that write it times its partitions.
+func partitions(workers int, largest, per int64) int {
+	n := max(2, 2*workers)
+	if per > 0 {
+		n = max(n, int(min((largest+per-1)/per, maxPartitions)))
+	}
+	return min(n, maxPartitions)
+}
 
 // execution runs one statement's stages.
 type execution struct {

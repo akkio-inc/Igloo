@@ -466,13 +466,24 @@ final query reads, or to an exchange: Parquet files under
 `_igloo_shuffle/<statement>/s<stage>/<task>/a<attempt>/__b=<p>/` in the
 warehouse, written with `COPY ... (PARTITION_BY (__b))`, where
 `__b = hash(key columns) % partitions`. Every exchange of a statement has
-the same number of partitions, twice the workers' (at most 64), and hashes
-integer keys as `BIGINT`, so a stage can read several exchanges keyed on
-equal values partition by partition. Columns that Parquet would change
-(`HUGEINT`, `INTERVAL`, `TIME WITH TIME ZONE`) cross exchanges as text and
-are cast back, as results do. The coordinator runs each stage once every
-exchange it reads is complete, and deletes the statement's directory when
-it ends.
+the same number of partitions, and hashes integer keys as `BIGINT`, so a
+stage can read several exchanges keyed on equal values partition by
+partition: twice the workers, or one for every 256 MiB of the largest
+table the statement divides if that is more, up to 256, so that a task's
+hash tables (the distinct people of a share of the cohorts) fit a
+worker's memory. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
+`TIME WITH TIME ZONE`) cross exchanges as text and are cast back, as
+results do. The coordinator runs each stage once every exchange it reads
+is complete, and deletes the statement's directory when it ends.
+
+A worker runs a task per 4 threads and 8 GiB of its memory limit at once
+(at least one), and the others wait. DuckDB runs each task on all of the
+worker's threads, so more at once add little speed and much memory, and
+the stages of a report that run side by side, each with a task per
+partition on every worker, otherwise spill or run out of memory: three
+2-thread workers of 500 MB running a cohort report spilled 1.9 GB each
+with every task at once, 0.9 GB one at a time, and nothing one at a time
+with four times the partitions.
 
 ## Partitioned joins
 

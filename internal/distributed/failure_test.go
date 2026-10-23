@@ -87,12 +87,7 @@ func TestWorkerShedsMemory(t *testing.T) {
 		t.Fatal("shed a task with none running")
 	}
 	started := make(chan struct{}, 4)
-	h.workers[0].beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
-		// A task that runs until it is canceled.
-		started <- struct{}{}
-		<-r.Context().Done()
-		return true
-	}
+	h.workers[0].opts.Engine = hangingEngine{started}
 	// Memory runs low once the worker runs a task.
 	var low atomic.Bool
 	go func() {
@@ -112,6 +107,61 @@ func TestWorkerShedsMemory(t *testing.T) {
 	if !OutOfMemory(err) || IsUnsupported(err) || dataError(err) {
 		t.Fatalf("want the worker's out of memory, got %v", err)
 	}
+}
+
+// A worker runs as many tasks at once as its threads and memory allow
+// (taskSlots), one for the harness's, and the others wait: two stages that
+// scan lineitem side by side, then a join's stage of a task per partition,
+// run one task at a time, and the statement returns what one machine does.
+func TestWorkerTaskSlots(t *testing.T) {
+	for _, c := range []struct {
+		threads int
+		memory  int64
+		want    int
+	}{{2, 4 << 30, 1}, {8, 25 << 30, 2}, {16, 49 << 30, 4}, {64, 16 << 30, 2}, {8, 0, 2}} {
+		if got := taskSlots(c.threads, c.memory); got != c.want {
+			t.Errorf("taskSlots(%d, %d) = %d, want %d", c.threads, c.memory, got, c.want)
+		}
+	}
+	h := newHarness(t, 0.01, 3, 1)
+	h.co.maxBroadcast = h.tables["customer"].Bytes
+	w := h.workers[0]
+	var most atomic.Int32
+	w.opts.Engine = countingEngine{Connector: w.opts.Engine, w: w, most: &most}
+	if !h.check(`SELECT count(*), sum(a.l_quantity - b.l_quantity) FROM lineitem a JOIN lineitem b ON a.l_orderkey = b.l_orderkey AND a.l_linenumber < b.l_linenumber`) {
+		t.Fatal("did not run distributed")
+	}
+	if n := most.Load(); n != 1 {
+		t.Errorf("%d tasks ran at once, want 1", n)
+	}
+}
+
+// countingEngine records the most tasks its worker ran at once.
+type countingEngine struct {
+	Connector
+	w    *Worker
+	most *atomic.Int32
+}
+
+func (e countingEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
+	e.w.runningMu.Lock()
+	n := int32(len(e.w.running))
+	e.w.runningMu.Unlock()
+	for m := e.most.Load(); n > m && !e.most.CompareAndSwap(m, n); m = e.most.Load() {
+	}
+	// Long enough for the other tasks to arrive.
+	time.Sleep(20 * time.Millisecond)
+	return e.Connector.Connect(ctx)
+}
+
+// hangingEngine runs tasks until they are canceled, saying when each
+// starts.
+type hangingEngine struct{ started chan<- struct{} }
+
+func (e hangingEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
+	e.started <- struct{}{}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 // Canceling a statement stops its tasks on the workers.

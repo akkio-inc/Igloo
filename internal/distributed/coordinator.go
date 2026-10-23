@@ -361,7 +361,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	qid := filepath.Base(ex.dir)
 	run := &execution{
 		co: co, qid: qid, dir: ex.dir, ws: ws, files: files, settings: settings, force: plan.force,
-		sp: &spool{limit: limit}, parts: min(maxPartitions, max(2, 2*len(ws))), root: shuffleRoot(co.opts.Warehouse, qid),
+		sp: &spool{limit: limit}, parts: partitions(len(ws), split, partitionBytes), root: shuffleRoot(co.opts.Warehouse, qid),
 		exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 	}
 	if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {

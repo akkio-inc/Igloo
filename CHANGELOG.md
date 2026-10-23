@@ -332,6 +332,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   calls for. A worker that answers with an error is never set aside, and a
   statement whose partial results would pass 1 GiB of the coordinator's
   disk, or that only filters rows, runs on the coordinator.
+- Workers run as many tasks at once as their threads and memory allow (a
+  task per 4 threads and 8 GiB), and exchanges have more partitions as the
+  divided tables grow, so the stages of a report that run side by side no
+  longer spill or run out of memory on workers that one machine's memory
+  would have held.
 - Workers watch their memory as the server does: when one is about to run
   out, it cancels the task that has run longest instead of being killed by
   the kernel with every task on it, and the statement fails with SQLSTATE

@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql/driver"
@@ -63,7 +64,10 @@ type WorkerOptions struct {
 	// tables every worker reads in full by the smallest worker.
 	Threads     int
 	MemoryBytes int64
-	Metrics     *WorkerMetrics
+	// Tasks is how many tasks run at once; others wait. Zero means as many
+	// as Threads and MemoryBytes allow (taskSlots).
+	Tasks   int
+	Metrics *WorkerMetrics
 }
 
 // Worker serves tasks.
@@ -77,7 +81,9 @@ type Worker struct {
 	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
 
-	// running are the tasks running, which ShedMemory may cancel.
+	// slots bound the tasks that run at once (see taskSlots); running are
+	// those running, which ShedMemory may cancel.
+	slots     chan struct{}
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
 
@@ -108,7 +114,8 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 		return nil, fmt.Errorf("create result directory: %w", err)
 	}
 	opts.TempDir = dir
-	w := &Worker{opts: opts, transport: t, log: log.With("component", "worker"), activity: activity.New()}
+	w := &Worker{opts: opts, transport: t, log: log.With("component", "worker"), activity: activity.New(),
+		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Threads, opts.MemoryBytes)))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
@@ -145,6 +152,22 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 
 // maxTaskRequest bounds a task's JSON: the file lists of large tables.
 const maxTaskRequest = 256 << 20
+
+// taskSlots is how many tasks a worker runs at once. DuckDB runs each on
+// all of its threads, so more at once add little speed and much memory,
+// which they share: the stages of a report that run side by side each have
+// a task per partition on every worker. Three workers of 500 MB running a
+// cohort report each spilled 1.9 GB with every task at once, and 0.9 GB
+// one at a time; with four times the partitions, all at once ran out of
+// memory and one at a time spilled nothing. A task gets at least 4 threads
+// and 8 GiB of the memory limit, and waits for them.
+func taskSlots(threads int, memory int64) int {
+	n := max(1, threads/4)
+	if memory > 0 {
+		n = min(n, max(1, int(memory/(8<<30))))
+	}
+	return n
+}
 
 // runningTask is a task while it runs, for ShedMemory.
 type runningTask struct {
@@ -206,9 +229,6 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	defer w.activity.Begin()()
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
-	rt := &runningTask{started: time.Now(), cancel: cancel}
-	done := w.begin(rt)
-	defer done()
 	r = r.WithContext(ctx)
 	if w.beforeTask != nil && !w.beforeTask(rw, r) {
 		return
@@ -227,9 +247,17 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log := w.log.With("query", req.Query, "task", req.Task)
-	w.runningMu.Lock()
-	rt.query, rt.task = req.Query, req.Task
-	w.runningMu.Unlock()
+	// Wait for a slot (see taskSlots); the coordinator's task waits with it.
+	select {
+	case w.slots <- struct{}{}:
+	case <-ctx.Done():
+		log.Debug("task canceled while it waited to run")
+		w.opts.Metrics.task("canceled", start)
+		return
+	}
+	defer func() { <-w.slots }()
+	done := w.begin(&runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel})
+	defer done()
 	path, res, err := w.run(ctx, &req)
 	done()
 	if path != "" {
