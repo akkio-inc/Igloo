@@ -17,6 +17,7 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/filerewrite"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 )
@@ -554,5 +555,28 @@ func TestClusteringFallsBackToCompaction(t *testing.T) {
 	}
 	if len(m.clusterFailed) != 0 {
 		t.Error("the table is still taken for one clustering does not fit")
+	}
+}
+
+// TestClusterFieldsFromProperty checks that a table's clustering key in its
+// table property, with no Iceberg sort order, is the order clustering uses.
+func TestClusterFieldsFromProperty(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "site", Type: iceberg.PrimitiveTypes.String},
+	)
+	key := `[{"source-id":2,"transform":"identity","direction":"desc","null-order":"nulls-last"},{"source-id":1,"transform":"identity","direction":"asc","null-order":"nulls-first"}]`
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.TempDir(),
+		iceberg.Properties{catalog.ClusteringKeyProperty: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := table.New(table.Identifier{"s", "t"}, meta, "", nil, nil)
+	fields, first, ok := clusterFields(tbl)
+	if !ok || first != 2 || len(fields) != 2 || fields[0].Name != "site" || !fields[0].Descending || fields[1].Name != "id" {
+		t.Errorf("%v %d %+v", ok, first, fields)
+	}
+	if got := catalog.ClusteringKey(meta); got != "LINEAR(site DESC, id)" {
+		t.Errorf("clustering key %q", got)
 	}
 }

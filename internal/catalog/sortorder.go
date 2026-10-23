@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,12 +11,24 @@ import (
 	"github.com/apache/iceberg-go/table"
 )
 
-// Sort orders. A table's default Iceberg sort order is how its rows should
-// be ordered in its files: Snowflake's clustering key (CLUSTER BY), DuckDB's
-// SORTED BY. Igloo's maintenance rewrites the files of a table that has one
-// so that their ranges of the order's first column do not overlap, which
-// lets a filter on it skip most files (see package maintenance). Other
-// engines read the order from the table's metadata too.
+// Clustering keys. A table's clustering key is how its rows should be
+// ordered in its files: Snowflake's CLUSTER BY, DuckDB's SORTED BY. Igloo's
+// maintenance rewrites the files of a table that has one so that their
+// ranges of the key's first column do not overlap, which lets a filter on
+// it skip most files (see package maintenance).
+//
+// Igloo keeps the key in the table property ClusteringKeyProperty, as the
+// fields of an Iceberg sort order, and leaves the table's default Iceberg
+// sort order unsorted: DuckDB 1.5.6, which writes Igloo's tables, refuses
+// INSERT, UPDATE and MERGE on a table with a sort order. A table another
+// engine gave a sort order is clustered by it, but DuckDB cannot write to
+// it until SET SORTED BY (or RESET SORTED BY) moves the key into the
+// property.
+
+// ClusteringKeyProperty is the table property that holds a table's
+// clustering key: a JSON array of Iceberg sort fields, as a sort order has
+// them in a table's metadata.
+const ClusteringKeyProperty = "igloo.clustering-key"
 
 // SortColumn is a column of a sort order.
 type SortColumn struct {
@@ -35,9 +48,10 @@ var (
 	ErrNoSuchColumn = errors.New("no such column")
 )
 
-// SetSortOrder makes cols, in order, the default sort order of the table
-// schema.name, or with no cols makes the table unsorted. Column names match
-// case-insensitively, as in DuckDB.
+// SetSortOrder makes cols, in order, the clustering key of the table
+// schema.name, or with no cols leaves the table without one. Either way the
+// table's default Iceberg sort order becomes unsorted, so that DuckDB can
+// write to it. Column names match case-insensitively, as in DuckDB.
 func (c *Client) SetSortOrder(ctx context.Context, schema, name string, cols []SortColumn) error {
 	tbl, err := c.LoadTable(ctx, Ident(schema, name))
 	if err != nil {
@@ -48,86 +62,86 @@ func (c *Client) SetSortOrder(ctx context.Context, schema, name string, cols []S
 		table.AssertTableUUID(meta.TableUUID()),
 		table.AssertDefaultSortOrderID(meta.SortOrder().OrderID()),
 	}
+	var updates []table.Update
+	if !meta.SortOrder().IsUnsorted() {
+		updates = append(updates, table.NewSetDefaultSortOrderUpdate(table.UnsortedSortOrderID))
+	}
+	current, has := meta.Properties()[ClusteringKeyProperty]
 	if len(cols) == 0 {
-		if meta.SortOrder().IsUnsorted() {
-			return nil
+		if has {
+			updates = append(updates, table.NewRemovePropertiesUpdate([]string{ClusteringKeyProperty}))
 		}
-		_, _, err = c.CommitTable(ctx, tbl.Identifier(), reqs, []table.Update{table.NewSetDefaultSortOrderUpdate(table.UnsortedSortOrderID)})
-		return err
-	}
-	fields := make([]table.SortField, 0, len(cols))
-	seen := map[int]bool{}
-	for _, col := range cols {
-		f, ok := tbl.Schema().FindFieldByNameCaseInsensitive(col.Name)
-		if !ok {
-			return fmt.Errorf("%w: column %q of table %q does not exist", ErrNoSuchColumn, col.Name, name)
-		}
-		if _, ok := f.Type.(iceberg.PrimitiveType); !ok {
-			return fmt.Errorf("%w: %s is %s", ErrNotSortable, f.Name, f.Type)
-		}
-		if seen[f.ID] {
-			return fmt.Errorf("column %s is in the sort order twice", f.Name)
-		}
-		seen[f.ID] = true
-		sf := table.SortField{SourceIDs: []int{f.ID}, Transform: iceberg.IdentityTransform{}, Direction: table.SortASC, NullOrder: table.NullsFirst}
-		if col.Descending {
-			sf.Direction, sf.NullOrder = table.SortDESC, table.NullsLast
-		}
-		if col.NullsFirst != nil {
-			sf.NullOrder = table.NullsLast
-			if *col.NullsFirst {
-				sf.NullOrder = table.NullsFirst
+	} else {
+		fields := make([]table.SortField, 0, len(cols))
+		seen := map[int]bool{}
+		for _, col := range cols {
+			f, ok := tbl.Schema().FindFieldByNameCaseInsensitive(col.Name)
+			if !ok {
+				return fmt.Errorf("%w: column %q of table %q does not exist", ErrNoSuchColumn, col.Name, name)
 			}
-		}
-		fields = append(fields, sf)
-	}
-	// An order the table had before is made the default again; a new one
-	// gets the next id.
-	next := table.UnsortedSortOrderID + 1
-	for _, o := range meta.SortOrders() {
-		if sameFields(o, fields) {
-			if o.OrderID() == meta.SortOrder().OrderID() {
-				return nil
+			if _, ok := f.Type.(iceberg.PrimitiveType); !ok {
+				return fmt.Errorf("%w: %s is %s", ErrNotSortable, f.Name, f.Type)
 			}
-			_, _, err = c.CommitTable(ctx, tbl.Identifier(), reqs, []table.Update{table.NewSetDefaultSortOrderUpdate(o.OrderID())})
+			if seen[f.ID] {
+				return fmt.Errorf("column %s is in the sort order twice", f.Name)
+			}
+			seen[f.ID] = true
+			sf := table.SortField{SourceIDs: []int{f.ID}, Transform: iceberg.IdentityTransform{}, Direction: table.SortASC, NullOrder: table.NullsFirst}
+			if col.Descending {
+				sf.Direction, sf.NullOrder = table.SortDESC, table.NullsLast
+			}
+			if col.NullsFirst != nil {
+				sf.NullOrder = table.NullsLast
+				if *col.NullsFirst {
+					sf.NullOrder = table.NullsFirst
+				}
+			}
+			fields = append(fields, sf)
+		}
+		key, err := json.Marshal(fields)
+		if err != nil {
 			return err
 		}
-		next = max(next, o.OrderID()+1)
+		if !has || current != string(key) {
+			updates = append(updates, table.NewSetPropertiesUpdate(iceberg.Properties{ClusteringKeyProperty: string(key)}))
+		}
 	}
-	order, err := table.NewSortOrder(next, fields)
-	if err != nil {
-		return err
+	if len(updates) == 0 {
+		return nil
 	}
-	_, _, err = c.CommitTable(ctx, tbl.Identifier(), reqs,
-		[]table.Update{table.NewAddSortOrderUpdate(&order), table.NewSetDefaultSortOrderUpdate(-1)})
+	_, _, err = c.CommitTable(ctx, tbl.Identifier(), reqs, updates)
 	return err
 }
 
-// sameFields reports whether a sort order has exactly fields.
-func sameFields(o table.SortOrder, fields []table.SortField) bool {
-	if o.Len() != len(fields) {
-		return false
-	}
-	for i, f := range o.Fields() {
-		if !f.Equals(fields[i]) {
-			return false
+// ClusteringOrder returns the fields of a table's clustering key: those of
+// its ClusteringKeyProperty, or else of its default Iceberg sort order, or
+// none.
+func ClusteringOrder(meta table.Metadata) []table.SortField {
+	if key, ok := meta.Properties()[ClusteringKeyProperty]; ok {
+		var fields []table.SortField
+		if err := json.Unmarshal([]byte(key), &fields); err == nil && len(fields) > 0 {
+			return fields
 		}
 	}
-	return true
+	var fields []table.SortField
+	for _, f := range meta.SortOrder().Fields() {
+		fields = append(fields, f)
+	}
+	return fields
 }
 
-// ClusteringKey describes a table's default sort order as Snowflake shows a
-// clustering key, LINEAR(a, b DESC), or "" when the table is unsorted. A
-// field with a transform other than identity, which other engines can
-// write, shows as the transform of its column, such as bucket[16](id).
+// ClusteringKey describes a table's clustering key (see ClusteringOrder) as
+// Snowflake shows one, LINEAR(a, b DESC), or "" when it has none. A field
+// with a transform other than identity, which other engines can write,
+// shows as the transform of its column, such as bucket[16](id).
 func ClusteringKey(meta table.Metadata) string {
-	order := meta.SortOrder()
-	if order.IsUnsorted() {
+	fields := ClusteringOrder(meta)
+	if len(fields) == 0 {
 		return ""
 	}
 	schema := meta.CurrentSchema()
 	var parts []string
-	for _, f := range order.Fields() {
+	for _, f := range fields {
 		col := fmt.Sprint(f.SourceID())
 		if field, ok := schema.FindFieldByID(f.SourceID()); ok {
 			col = field.Name

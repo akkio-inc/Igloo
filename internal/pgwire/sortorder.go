@@ -22,11 +22,13 @@ import (
 //	ALTER TABLE [IF EXISTS] t SET SORTED BY (a [ASC | DESC] [NULLS FIRST | LAST], ...)
 //	ALTER TABLE [IF EXISTS] t RESET SORTED BY
 //
-// The order is the table's default Iceberg sort order, which maintenance
-// clusters its files by (see package maintenance) and which other engines
-// read; Snowflake's CLUSTER BY and DROP CLUSTERING KEY translate to these.
-// DuckDB has the syntax but cannot carry it out for Iceberg tables. Changing
-// a table's order needs what ALTER TABLE needs.
+// The order is the table's clustering key, which maintenance clusters its
+// files by (see package maintenance), kept in a table property rather than
+// as its Iceberg sort order, which DuckDB cannot write to (see
+// catalog.ClusteringKeyProperty); Snowflake's CLUSTER BY and DROP
+// CLUSTERING KEY translate to these. DuckDB has the syntax but cannot carry
+// it out for Iceberg tables. Changing a table's order needs what ALTER
+// TABLE needs.
 
 // sortCommand is ALTER TABLE ... SET SORTED BY or RESET SORTED BY.
 type sortCommand struct {

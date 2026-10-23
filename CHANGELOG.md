@@ -851,8 +851,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   count cores rather than threads.
 - Tables can be clustered. `ALTER TABLE ... SET SORTED BY (a, b)` (and
   Snowflake's `CLUSTER BY`, `ALTER TABLE ... CLUSTER BY`, `DROP CLUSTERING
-  KEY`) sets a table's default Iceberg sort order, which `igloo.tables`,
-  `information_schema.tables` and `SHOW OBJECTS` show as its clustering key.
+  KEY`) sets a table's clustering key, which `igloo.tables`,
+  `information_schema.tables` and `SHOW OBJECTS` show. Igloo keeps it in
+  the table property `igloo.clustering-key` rather than as the table's
+  Iceberg sort order, which DuckDB cannot write to: `INSERT`, `UPDATE` and
+  `MERGE` into a table another engine gave a sort order fail with an error
+  that says to `SET SORTED BY` or `RESET SORTED BY`, which moves the order
+  out of the table's Iceberg metadata.
   Table maintenance then rewrites, sorted, the files whose ranges of the
   order's first column overlap, within its memory budget, sorting range by
   range and spilling to local disk, so a filter on that column reads few

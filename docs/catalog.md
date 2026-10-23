@@ -311,7 +311,7 @@ them. Like lineage, events need the query history on.
 | `row_count`, `bytes`, `file_count` | Of its current snapshot, for tables: the rows a query reads, without deleted rows (`NULL` while it has equality deletes), and its data files and their size |
 | `snapshot_count` | Snapshots time travel can read, for tables |
 | `last_altered` | When its data last changed, or a view was last replaced |
-| `clustering_key` | Its [sort order](sql.md#sort-orders-and-clustering), as Snowflake shows a clustering key: `LINEAR(customer_id, day DESC)`; `NULL` for unsorted tables |
+| `clustering_key` | Its [clustering key](sql.md#sort-orders-and-clustering), as Snowflake shows one: `LINEAR(customer_id, day DESC)`; `NULL` for tables without one |
 
 | View | Columns |
 |---|---|

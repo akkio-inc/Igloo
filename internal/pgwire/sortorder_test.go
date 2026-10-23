@@ -1,9 +1,12 @@
 package pgwire
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	"github.com/jackc/pgx/v5"
 
@@ -70,8 +73,13 @@ func TestSortOrders(t *testing.T) {
 	order := func() (out []string) {
 		t.Helper()
 		meta := vc.fake.Metadata("public", "visits")
+		// The key is a table property; the Iceberg sort order, which DuckDB
+		// cannot write to, stays unsorted.
+		if !meta.SortOrder().IsUnsorted() {
+			t.Errorf("the table has an Iceberg sort order: %v", meta.SortOrder())
+		}
 		schema := meta.CurrentSchema()
-		for _, f := range meta.SortOrder().Fields() {
+		for _, f := range catalog.ClusteringOrder(meta) {
 			field, _ := schema.FindFieldByID(f.SourceID())
 			out = append(out, field.Name+" "+string(f.Direction)+" "+string(f.NullOrder))
 		}
@@ -127,14 +135,10 @@ func TestSortOrders(t *testing.T) {
 	if meta := vc.fake.Metadata("public", "sites"); catalog.ClusteringKey(meta) != "LINEAR(site)" {
 		t.Errorf("CREATE TABLE ... CLUSTER BY: %q", catalog.ClusteringKey(meta))
 	}
-	// An order the table had before is made the default again.
 	mustExec(t, admin, "ALTER TABLE lake.public.visits SET SORTED BY (site, day DESC)")
-	if n := len(vc.fake.Metadata("public", "visits").SortOrders()); n != 3 {
-		t.Errorf("%d sort orders, want the unsorted one and two more", n)
-	}
 	mustExec(t, admin, "ALTER TABLE lake.public.visits RESET SORTED BY")
-	if vc.fake.Metadata("public", "visits").SortOrder().OrderID() != table.UnsortedSortOrderID {
-		t.Error("RESET SORTED BY left a sort order")
+	if meta := vc.fake.Metadata("public", "visits"); meta.SortOrder().OrderID() != table.UnsortedSortOrderID || meta.Properties()[catalog.ClusteringKeyProperty] != "" {
+		t.Errorf("RESET SORTED BY left a key: %v %q", meta.SortOrder(), meta.Properties()[catalog.ClusteringKeyProperty])
 	}
 
 	// What is refused.
@@ -152,4 +156,104 @@ func TestSortOrders(t *testing.T) {
 	if len(order()) != 0 {
 		t.Errorf("a refused statement changed the sort order: %q", order())
 	}
+}
+
+// setIcebergOrder gives the catalog's table schema.name the default Iceberg
+// sort order column ASC, as another engine would.
+func setIcebergOrder(t *testing.T, vc *viewCatalog, schema, name, column string) {
+	t.Helper()
+	ctx := context.Background()
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := cat.LoadTable(ctx, catalog.Ident(schema, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, ok := tbl.Schema().FindFieldByName(column)
+	if !ok {
+		t.Fatalf("no column %s", column)
+	}
+	order, err := table.NewSortOrder(1, []table.SortField{{SourceIDs: []int{f.ID}, Transform: iceberg.IdentityTransform{},
+		Direction: table.SortASC, NullOrder: table.NullsFirst}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cat.CommitTable(ctx, tbl.Identifier(), []table.Requirement{table.AssertTableUUID(tbl.Metadata().TableUUID())},
+		[]table.Update{table.NewAddSortOrderUpdate(&order), table.NewSetDefaultSortOrderUpdate(-1)}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWritesToClusteredTables writes to tables given a clustering key in
+// every way Igloo has, in both dialects, through sessions: INSERT, UPDATE,
+// DELETE and MERGE work, as DuckDB, which cannot write to a table with an
+// Iceberg sort order, never sees one. A table another engine gave a sort
+// order refuses writes with an error that says what to do, and takes them
+// once SET SORTED BY makes the order Igloo's key.
+func TestWritesToClusteredTables(t *testing.T) {
+	vc := newViewCatalog(t)
+	a := vc.replica(t)
+	admin := a.admin(t, pgx.QueryExecModeSimpleProtocol)
+	round := 0
+	writes := func(name, dialect string) {
+		t.Helper()
+		round++
+		base := fmt.Sprint(1000 * round)
+		mustExec(t, admin, "SET sql_dialect = '"+dialect+"'")
+		defer mustExec(t, admin, "SET sql_dialect = 'duckdb'")
+		for _, q := range []string{
+			"INSERT INTO " + name + " VALUES (" + base + ", 'site9')",
+			"INSERT INTO " + name + " SELECT id + " + base + " + 500, site FROM " + name + " WHERE id < 5",
+			"UPDATE " + name + " SET site = 'site8' WHERE id = " + base,
+			"DELETE FROM " + name + " WHERE id = " + base + " + 500",
+			"MERGE INTO " + name + " AS t USING (SELECT " + base + " AS id, 'site7' AS site UNION ALL SELECT " + base + " + 900, 'site6') AS s " +
+				"ON t.id = s.id WHEN MATCHED THEN UPDATE SET site = s.site WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.site)",
+		} {
+			mustExec(t, admin, q)
+		}
+		got := texts(t, admin, "SELECT count(*) FILTER (WHERE id = "+base+" AND site = 'site7') || ' ' || count(*) FILTER (WHERE id = "+base+
+			" + 900) || ' ' || count(*) FILTER (WHERE id = "+base+" + 500) || ' ' || count(*) FILTER (WHERE id BETWEEN "+base+" + 501 AND "+base+" + 504) FROM "+name)
+		if len(got) != 1 || got[0] != "1 1 0 4" {
+			t.Errorf("%s (%s): after the writes %q, want 1 1 0 4", name, dialect, got)
+		}
+		key := texts(t, admin, "SELECT coalesce(clustering_key, '') FROM igloo.tables WHERE table_schema = 'public' AND table_name = '"+
+			name[strings.LastIndex(name, ".")+1:]+"'")
+		if len(key) != 1 || !strings.HasPrefix(key[0], "LINEAR(") {
+			t.Errorf("%s: clustering key %q", name, key)
+		}
+	}
+	mustExec(t, admin, "CREATE SCHEMA IF NOT EXISTS lake.public")
+	// DuckDB's dialect: a key set after CREATE TABLE ... AS.
+	mustExec(t, admin, "CREATE TABLE lake.public.a AS SELECT i AS id, 'site' || (i % 5) AS site FROM range(100) r(i)")
+	mustExec(t, admin, "ALTER TABLE lake.public.a SET SORTED BY (site)")
+	writes("lake.public.a", "duckdb")
+	writes("lake.public.a", "snowflake")
+
+	// Snowflake's: CREATE TABLE ... CLUSTER BY, with columns and AS, and
+	// ALTER TABLE ... CLUSTER BY.
+	mustExec(t, admin, "SET sql_dialect = 'snowflake'")
+	for _, q := range []string{
+		"CREATE TABLE lake.public.b (id INTEGER, site STRING) CLUSTER BY (site)",
+		"INSERT INTO lake.public.b SELECT SEQ4(), 'site' || (SEQ4() % 5) FROM TABLE(GENERATOR(ROWCOUNT => 100))",
+		"CREATE TABLE lake.public.c CLUSTER BY (site) AS SELECT id, site FROM lake.public.b",
+		"CREATE TABLE lake.public.d AS SELECT id, site FROM lake.public.b",
+		"ALTER TABLE lake.public.d CLUSTER BY (site, id)",
+	} {
+		mustExec(t, admin, q)
+	}
+	mustExec(t, admin, "SET sql_dialect = 'duckdb'")
+	for _, name := range []string{"lake.public.b", "lake.public.c", "lake.public.d"} {
+		writes(name, "snowflake")
+		writes(name, "duckdb")
+	}
+
+	// A table another engine sorted: DuckDB refuses to write to it, and the
+	// error says how to move the order into Igloo's key.
+	mustExec(t, admin, "CREATE TABLE lake.public.e AS SELECT i AS id, 'site' || (i % 5) AS site FROM range(100) r(i)")
+	setIcebergOrder(t, vc, "public", "e", "site")
+	expectCode(t, admin, "INSERT INTO lake.public.e VALUES (1000, 'site9')", "0A000", "SET SORTED BY")
+	mustExec(t, admin, "ALTER TABLE lake.public.e SET SORTED BY (site)")
+	writes("lake.public.e", "duckdb")
 }

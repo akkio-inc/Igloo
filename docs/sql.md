@@ -90,23 +90,30 @@ A dropped table cannot be restored.
 
 ### Sort orders and clustering
 
-A table's sort order says how its rows should be ordered in its files.
-Table maintenance [clusters](operations.md#clustering) a table that has one:
-it rewrites the files whose ranges of the order's first column overlap,
-sorted, so a filter on that column, such as a customer's id, reads a few
-files instead of all of them. Writes stay as fast as before; their files are
-clustered on the next maintenance pass.
+A table's sort order, its clustering key, says how its rows should be
+ordered in its files. Table maintenance [clusters](operations.md#clustering)
+a table that has one: it rewrites the files whose ranges of the key's first
+column overlap, sorted, so a filter on that column, such as a customer's id,
+reads a few files instead of all of them. Writes stay as fast as before;
+their files are clustered on the next maintenance pass.
 
 ```sql
 ALTER TABLE lake.public.visits SET SORTED BY (customer_id, day DESC);
-ALTER TABLE lake.public.visits RESET SORTED BY;      -- unsorted again
+ALTER TABLE lake.public.visits RESET SORTED BY;      -- no key again
 SELECT table_name, clustering_key FROM igloo.tables;  -- LINEAR(customer_id, day DESC)
 ```
 
-- The order is the table's default Iceberg sort order (`add-sort-order` and
-  `set-default-sort-order` through the catalog), so other engines see it.
-  `igloo.tables`, `information_schema.tables` (`clustering_key`) and `SHOW
-  OBJECTS` (`cluster_by`) show it as Snowflake shows a clustering key.
+- Igloo keeps the key in the table property `igloo.clustering-key` (the
+  fields of an Iceberg sort order, as JSON), not as the table's default
+  Iceberg sort order: DuckDB, which writes Igloo's tables, cannot insert
+  into, update or merge into a table with an Iceberg sort order. `igloo.tables`,
+  `information_schema.tables` (`clustering_key`) and `SHOW OBJECTS`
+  (`cluster_by`) show the key as Snowflake shows one.
+- A table another engine gave an Iceberg sort order is clustered by it, but
+  Igloo cannot write to it: `INSERT`, `UPDATE` and `MERGE` fail and say so.
+  `SET SORTED BY` (with the same columns, to keep the order) or `RESET
+  SORTED BY` moves the order out of the table's Iceberg metadata, after
+  which Igloo writes to it.
 - Each column takes `ASC` (the default) or `DESC`, and `NULLS FIRST` or
   `NULLS LAST` (by default first when ascending, last when descending).
   Columns must be top-level columns of a primitive type: not lists, maps or

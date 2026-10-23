@@ -53,8 +53,8 @@ type TableMeta struct {
 	// summary or else its manifests; -1 when they do not say. Rows are the
 	// rows a query reads: deleted rows are not counted (see liveRows).
 	Rows, Bytes, Files int64
-	// ClusteringKey is the table's default sort order as Snowflake shows a
-	// clustering key, or "" (see ClusteringKey).
+	// ClusteringKey is the table's clustering key as Snowflake shows one,
+	// or "" (see ClusteringKey).
 	ClusteringKey string
 }
 

@@ -713,7 +713,7 @@ tables itself, so nobody has to schedule anything. Every hour
    Without one, DuckDB writes a file per row group, a few megabytes each for
    narrow rows. Tables made by other engines keep what those engines set;
    change one with `set_iceberg_table_properties`.
-   A table with a [sort order](sql.md#sort-orders-and-clustering) is
+   A table with a [clustering key](sql.md#sort-orders-and-clustering) is
    [clustered](#clustering) instead.
 2. **Snapshot expiry.** Snapshots older than `IGLOO_SNAPSHOT_RETENTION`
    (7 days by default) are removed, always keeping the current one, and the
@@ -765,9 +765,9 @@ files, bytes and memory budget) and ends (`compacted`); clustering logs
 
 ### Clustering
 
-A table with a sort order (`ALTER TABLE ... SET SORTED BY`, or Snowflake's
-`CLUSTER BY`) is clustered instead of compacted, so that a filter on the
-order's first column reads few files: Iceberg's manifests record each file's
+A table with a clustering key (`ALTER TABLE ... SET SORTED BY`, or
+Snowflake's `CLUSTER BY`) is clustered instead of compacted, so that a
+filter on the key's first column reads few files: Iceberg's manifests record each file's
 range of every column, and a scan skips the files whose range cannot hold
 the value. On 1.4 billion rows written unsorted, a filter on one value of
 the first column read 140 files; clustered, 3, and it took 0.65 s instead
@@ -801,7 +801,7 @@ the first column.
 
 If clustering a table still needs more memory than the budget, maintenance
 logs a warning and compacts the table unsorted for that pass, as it compacts
-tables without a sort order, so that small files and deletes do not pile up;
+tables without a clustering key, so that small files and deletes do not pile up;
 it tries clustering again once the table changes, or six hours later.
 `igloo_maintenance_clustering_fallbacks_total` counts these passes.
 

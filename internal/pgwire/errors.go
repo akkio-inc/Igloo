@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -49,6 +50,9 @@ func codedError(err error) error {
 	if de.Type == duckdb.ErrorTypeInternal && strings.Contains(de.Msg, rowidFilterFailure) {
 		return pgerror.WithCode(errors.New(rowidFilterMessage), codes.FeatureNotSupported)
 	}
+	if strings.Contains(de.Msg, sortedTableFailure) {
+		return pgerror.WithCode(fmt.Errorf("%s: %s", de.Msg, sortedTableMessage), codes.FeatureNotSupported)
+	}
 	return pgerror.WithCode(err, sqlState(de))
 }
 
@@ -72,6 +76,18 @@ func codedError(err error) error {
 // trace. docs/upstream/duckdb-spatial-rowid-filter.md is the report for
 // DuckDB; drop this once Igloo's DuckDB has the fix.
 const rowidFilterFailure = "optional_idx cannot be initialized with an invalid index"
+
+// sortedTableFailure is how DuckDB 1.5.6 refuses INSERT, UPDATE and MERGE
+// on an Iceberg table with a default sort order, which another engine (or
+// an Igloo from before clustering keys were table properties) set. Igloo
+// keeps clustering keys out of the sort order for this reason (see
+// catalog.ClusteringKeyProperty), and tells the client how to move the
+// order there.
+const sortedTableFailure = "sorted iceberg table is not supported yet"
+
+const sortedTableMessage = "the table has an Iceberg sort order, which DuckDB cannot write to. " +
+	"ALTER TABLE ... SET SORTED BY (its columns) keeps that order as Igloo's clustering key and lets Igloo write to the table; " +
+	"ALTER TABLE ... RESET SORTED BY drops it. Either leaves the table without an Iceberg sort order"
 
 const rowidFilterMessage = "DuckDB could not plan this statement (optional_idx cannot be initialized with an invalid index): " +
 	"with the spatial extension loaded, DuckDB 1.5.6 fails this way on filters on rowid such as rowid % 3 = 0 or hash(rowid) % 3 = 0, " +

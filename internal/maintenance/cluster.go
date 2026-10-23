@@ -18,14 +18,15 @@ import (
 	"github.com/apache/iceberg-go/table/compaction"
 	"github.com/google/uuid"
 
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/filerewrite"
 )
 
-// Clustering. A table with a default sort order (ALTER TABLE ... SET SORTED
-// BY, or Snowflake's CLUSTER BY) is clustered instead of compacted: its
-// files whose ranges of the order's first column overlap are written again,
-// sorted, so that a filter on that column reads few files and Iceberg's
-// manifests skip the rest. On a table of 1.4 billion rows written unsorted,
+// Clustering. A table with a clustering key (ALTER TABLE ... SET SORTED BY,
+// or Snowflake's CLUSTER BY; see catalog.ClusteringOrder) is clustered
+// instead of compacted: its files whose ranges of the key's first column
+// overlap are written again, sorted, so that a filter on that column reads
+// few files and Iceberg's manifests skip the rest. On a table of 1.4 billion rows written unsorted,
 // a filter on one value read 140 files; clustered, it read 3.
 //
 // Which files are rewritten, from the manifests' bounds of the first column:
@@ -106,19 +107,19 @@ func snapshotID(tbl *table.Table) int64 {
 }
 
 // clusterFields returns the order maintenance clusters tbl by, or false:
-// the table's default sort order, when the table is not partitioned and
-// every field of the order is a top-level column of a primitive type, as it
-// is.
+// the table's clustering key (see catalog.ClusteringOrder), when the table
+// is not partitioned and every field of the key is a top-level column of a
+// primitive type, as it is.
 func clusterFields(tbl *table.Table) ([]filerewrite.SortField, int, bool) {
 	meta := tbl.Metadata()
-	order := meta.SortOrder()
-	if order.IsUnsorted() || !meta.PartitionSpec().IsUnpartitioned() {
+	order := catalog.ClusteringOrder(meta)
+	if len(order) == 0 || !meta.PartitionSpec().IsUnpartitioned() {
 		return nil, 0, false
 	}
 	schema := tbl.Schema()
 	var fields []filerewrite.SortField
 	firstID := 0
-	for i, f := range order.Fields() {
+	for i, f := range order {
 		if _, ok := f.Transform.(iceberg.IdentityTransform); !ok || len(f.SourceIDs) > 1 {
 			return nil, 0, false
 		}

@@ -290,9 +290,9 @@ A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
   replaced table's grants as Snowflake's `COPY GRANTS` would). `COMMENT =
   '...'` is ignored with a notice: use `COMMENT ON`.
 - Clustering keys: `CLUSTER BY (a, b)` on `CREATE TABLE` (once the table is
-  created) and `ALTER TABLE ... CLUSTER BY (a, b)` set the table's [sort
-  order](sql.md#sort-orders-and-clustering), and `ALTER TABLE ... DROP
-  CLUSTERING KEY` resets it; table maintenance then clusters the table's
+  created) and `ALTER TABLE ... CLUSTER BY (a, b)` set the table's
+  [clustering key](sql.md#sort-orders-and-clustering), and `ALTER TABLE ...
+  DROP CLUSTERING KEY` drops it; table maintenance then clusters the table's
   files, as Snowflake's automatic clustering does. Keys must be columns:
   `CLUSTER BY` of expressions (`to_date(ts)`), on a temporary table or with
   `IF NOT EXISTS` is ignored with a notice. `ALTER TABLE ... RECLUSTER` and
