@@ -221,6 +221,14 @@ var macros = []string{
 	`CREATE OR REPLACE TEMP MACRO sf_parts_strings(l, j, m) AS CASE
 		WHEN l IS NULL THEN list_transform(sf_flatten_values(j, m), lambda x: json_extract_string(x, '$'))
 		WHEN m <> 'OBJECT' THEN list_transform(l, lambda e: sf_elem_string(e)) END`,
+	// sf_text_read is text that a select list unnested, x, as it is, read
+	// where DuckDB keeps a filter on it above that select list: it does not
+	// push an expression that may raise an error through a projection, and
+	// a filter pushed onto an unnest counts as filtering that relation, which
+	// DuckDB then estimates at a fifth of its input's rows, where it reckons
+	// an unnest gives as many rows as it reads. A join would then build its
+	// hash table on the unnest's rows, often far more than the other side's.
+	`CREATE OR REPLACE TEMP MACRO sf_text_read(x) AS CASE WHEN strlen(x) < 0 THEN error('') ELSE x END`,
 	`CREATE OR REPLACE TEMP MACRO sf_parts_keys(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_keys(j, m) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_parts_indexes(l, j, m) AS CASE WHEN l IS NULL THEN sf_flatten_indexes(j, m)
 		WHEN m <> 'OBJECT' THEN range(CAST(len(l) AS BIGINT)) END`,

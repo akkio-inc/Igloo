@@ -893,7 +893,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   20 to 24% of the behaviors reports' time on data shaped like real data:
   counting people by each element of 2 million rows' five lists took
   0.22 s and takes 0.13 s, and a behaviors report over them 0.15 s and
-  0.09 s.
+  0.09 s. A filter on that text stays above the select list that unnests
+  it, as one through `json_extract_string` did, so that DuckDB, which takes
+  a filtered unnest for a fifth of the rows it reads, builds a join's hash
+  table on the other side, as reports join their signals to cohorts: it
+  had built one on 90 million browsing elements.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

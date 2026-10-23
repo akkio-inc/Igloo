@@ -3,6 +3,7 @@ package snowflake
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -354,7 +355,7 @@ func TestFlattenShapes(t *testing.T) {
 		// Elements that every read casts are unnested as text; one read
 		// otherwise keeps them JSON.
 		{`select cast(g.value:k as text), cast(v.value as text), v.value::float from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
-			`select m._sf_t._sf_k1 AS "CAST(G.VALUE:K AS TEXT)", m._sf_e AS "CAST(V.VALUE AS TEXT)", CAST(m._sf_e AS DOUBLE) AS "V.VALUE::FLOAT" ` +
+			`select m._sf_t._sf_k1 AS "CAST(G.VALUE:K AS TEXT)", sf_text_read(m._sf_e) AS "CAST(V.VALUE AS TEXT)", CAST(sf_text_read(m._sf_e) AS DOUBLE) AS "V.VALUE::FLOAT" ` +
 				`from (SELECT m.*, unnest(sf_parts_strings(m._sf_t._sf_l2, m._sf_t._sf_j2, 'BOTH')) AS _sf_e FROM`, `json_extract`},
 		{`select cast(v.value as text), v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
 			`select json_extract_string(m._sf_e, '$') AS "CAST(V.VALUE AS TEXT)", m._sf_e from (SELECT m.*, unnest(sf_parts_values(`, `sf_parts_strings`},
@@ -630,6 +631,91 @@ func TestFlattenStructsPlan(t *testing.T) {
 	if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
 		t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
 	}
+	// A filter on unnested text, as reports filter their signals' names,
+	// leaves a join with a smaller table building its hash table on that
+	// table, not on the unnest's rows (see sf_text_read).
+	for _, stmt := range []string{
+		`CREATE TABLE tb AS SELECT i AS id, ['x' || (i % 7), 'y'] AS a, 'n' || (i % 5) AS s FROM range(1000) r(i)`,
+		`CREATE TABLE tc AS SELECT i AS id, 'c' || (i % 3) AS cohort FROM range(500) r(i)`,
+	} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err = Translate(`select cast(get_path(g.value, 'kind') as text), cast(v.value as text), c.cohort, count(distinct m.id)
+		from tb as m inner join tc as c on c.id = m.id
+		cross join lateral flatten(input => [object_construct('kind', 'a', 'items', m.a), object_construct('kind', 'b', 'items', ['z'])]) as g(seq, key, path, index, value, this)
+		cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)
+		where not cast(v.value as text) is null and trim(cast(v.value as text)) <> '' group by 1, 2, 3`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.SQL, "sf_parts_strings(") {
+		t.Errorf("elements not unnested as text:\n%s", res.SQL)
+	}
+	if unnestBuilt(t, conn, res.SQL) {
+		t.Errorf("a join builds its hash table on unnested rows:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
+	}
+}
+
+// unnestBuilt reports whether a hash join in DuckDB's plan of a statement
+// builds its hash table, on its second child, from an unnest's rows.
+func unnestBuilt(t *testing.T, conn *sql.Conn, statement string) bool {
+	t.Helper()
+	type planNode struct {
+		Name     string     `json:"name"`
+		Children []planNode `json:"children"`
+	}
+	rows, err := conn.QueryContext(context.Background(), "EXPLAIN (FORMAT JSON) "+statement)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, statement)
+	}
+	defer rows.Close()
+	var plans []planNode
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			t.Fatal(err)
+		}
+		var p []planNode
+		if err := json.Unmarshal([]byte(value), &p); err != nil {
+			t.Fatalf("%v\n%s", err, value)
+		}
+		plans = append(plans, p...)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	var unnests func(n planNode) bool
+	unnests = func(n planNode) bool {
+		if n.Name == "UNNEST" {
+			return true
+		}
+		for _, c := range n.Children {
+			if unnests(c) {
+				return true
+			}
+		}
+		return false
+	}
+	var built func(n planNode) bool
+	built = func(n planNode) bool {
+		if n.Name == "HASH_JOIN" && len(n.Children) == 2 && unnests(n.Children[1]) {
+			return true
+		}
+		for _, c := range n.Children {
+			if built(c) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, p := range plans {
+		if built(p) {
+			return true
+		}
+	}
+	return false
 }
 
 // explain returns DuckDB's plan of a statement.

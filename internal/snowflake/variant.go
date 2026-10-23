@@ -100,6 +100,7 @@ func (v *variant) render() string {
 	if v.elem != "" {
 		base = v.elem
 		if v.text && len(v.segs) == 0 {
+			base = "sf_text_read(" + base + ")"
 			switch v.mode {
 			case vString:
 				return base
