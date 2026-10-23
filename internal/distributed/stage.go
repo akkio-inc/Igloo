@@ -301,7 +301,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		groups = e.groups(s)
 		tasks = len(groups)
 	}
-	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks)
+	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
 	// What every task reads in full.
 	whole := map[string]viewDef{}

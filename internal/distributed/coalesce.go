@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"cmp"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,7 +39,9 @@ func rowMemory(columns []Column) int64 {
 	return 2*width + 64
 }
 
-// typeWidth guesses the bytes a value of a DuckDB type takes in a row.
+// typeWidth guesses the bytes a value of a DuckDB type takes in memory, in
+// a row: more than typeBytes's guess at its compressed size, for strings
+// and nested values above all.
 func typeWidth(t string) int64 {
 	t = strings.ToUpper(strings.TrimSpace(t))
 	switch {
@@ -89,6 +92,55 @@ func taskMemory(ws []*worker) int64 {
 		}
 	}
 	return share / 2
+}
+
+// partitionsFor returns how many partitions the exchanges of stages need
+// for a task that reads one partition of each to hold its rows within
+// budget, as far as estimates tell: an exchange's rows are those of the
+// tables its stages read (a hundredth where a filter compares a column to
+// a constant) and of the exchanges they read, each taking the memory of a
+// row of the columns they read (rowMemory). Partitions that turn out
+// small are read several to a task (see groups); a partition that turns
+// out large is not divided, so its task spills. Without a budget it is 0.
+func partitionsFor(stages []*Stage, budget int64) int {
+	if budget <= 0 {
+		return 0
+	}
+	rows := map[*Exchange]float64{}
+	width := map[*Exchange]int64{}
+	for _, s := range stages {
+		var in float64
+		var w int64
+		for _, i := range s.Inputs {
+			switch {
+			case i.Table != nil:
+				r := float64(max(i.Table.Rows, 0))
+				if filtersByConstant(s.fragment, i.Table) {
+					r *= filterSelectivity
+				}
+				in += r
+				cols := columnsRead(s.fragment, i.Table)
+				for _, c := range i.Table.Columns {
+					if cols == nil || cols[strings.ToLower(c.Name)] {
+						w += typeWidth(c.Type)
+					}
+				}
+			case i.Exchange != nil:
+				in += rows[i.Exchange]
+				w += width[i.Exchange]
+			}
+		}
+		if s.Out != nil {
+			rows[s.Out] += in
+			width[s.Out] = max(width[s.Out], w)
+		}
+	}
+	need := 0
+	for x, r := range rows {
+		mem := r * float64(2*width[x]+64)
+		need = max(need, int(math.Ceil(mem/float64(budget))))
+	}
+	return need
 }
 
 // groups returns the partitions each task of stage s, which reads

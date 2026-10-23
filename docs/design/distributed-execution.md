@@ -518,7 +518,11 @@ stage can read several exchanges keyed on equal values partition by
 partition: twice the workers, or one for every 256 MiB of the largest
 table the statement divides if that is more, up to eight times the
 workers (and 256), so that a task's hash tables (the distinct people of a
-share of the cohorts) fit a worker's memory. A task writes one file per
+share of the cohorts) fit a worker's memory; and more, up to 256, when the
+exchanges' rows as estimated (`partitionsFor`: the tables' rows, a
+hundredth where a filter compares a column to a constant, at the memory a
+row of the columns read takes in a hash table) need them to fit half a
+task's share of a worker's memory. A task writes one file per
 partition: DuckDB keeps only 100 of a partitioned `COPY`'s files open and
 starts new ones past that, which at 256 partitions made a task write
 17,275 files of 24 KB for 23 minutes, so workers raise that limit; the

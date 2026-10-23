@@ -314,7 +314,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   memory at the memory their rows take in hash tables (by their columns'
   types, at least 64 bytes a row), and at least one a worker: a report's
   stages that joined an audience of 189,000 rows to tables every task read
-  in full ran 32 tasks each, and read those tables 448 times.
+  in full ran 32 tasks each, and read those tables 448 times. A statement
+  whose exchanges' rows, as estimated, would not fit a task's memory over
+  eight times the workers' partitions gets more, up to 256.
   A task that runs out of DuckDB's memory on a worker counts as the memory
   watch's cancel does, not as a broken worker: the statement's parts run
   again in smaller tasks (twice the partitions, half of each task's share),

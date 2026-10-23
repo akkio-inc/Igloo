@@ -456,7 +456,10 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 
 	loaded := time.Since(start)
 	qid := filepath.Base(ex.dir)
-	parts := partitions(len(ws), split, partitionBytes)
+	// Partitions enough for the workers and the largest table, and more if
+	// the exchanges' rows need more to fit a task's memory, at a hundred
+	// times the data.
+	parts := max(partitions(len(ws), split, partitionBytes), min(partitionsFor(plan.Stages, taskMemory(ws)), maxPartitions))
 	var run *execution
 	for attempt := 0; ; attempt++ {
 		// Each attempt's tasks and exchanges are its own, so that what a

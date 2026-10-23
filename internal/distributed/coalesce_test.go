@@ -67,6 +67,29 @@ func TestGroupPartitions(t *testing.T) {
 	}
 }
 
+// TestPartitionsFor checks the partitions exchanges need for a task's rows
+// to fit its memory: a billion rows of two BIGINTs, 96 bytes each in hash
+// tables, need 90 partitions of 1 GiB, and an exchange fed by it as many.
+func TestPartitionsFor(t *testing.T) {
+	big := &Table{Name: "events", Rows: 1e9, Columns: []Column{{Name: "a", Type: "BIGINT"}, {Name: "b", Type: "BIGINT"}}}
+	x, y := &Exchange{ID: 0}, &Exchange{ID: 1}
+	stages := []*Stage{
+		{ID: 0, Inputs: []Input{{View: "t", Table: big, Split: true}}, Out: x},
+		{ID: 1, Inputs: []Input{{View: "k", Exchange: x, Partitioned: true}}, Out: y},
+		{ID: 2, Inputs: []Input{{View: "k", Exchange: y, Partitioned: true}}},
+	}
+	if n := partitionsFor(stages, 1<<30); n != 90 {
+		t.Errorf("%d partitions, want 90", n)
+	}
+	if n := partitionsFor(stages, 0); n != 0 {
+		t.Errorf("%d partitions without a budget", n)
+	}
+	big.Rows = 1000
+	if n := partitionsFor(stages, 1<<30); n != 1 {
+		t.Errorf("%d partitions for a thousand rows", n)
+	}
+}
+
 // stageTasks records how many tasks each stage ran, from the coordinator's
 // log.
 type stageTasks struct {
