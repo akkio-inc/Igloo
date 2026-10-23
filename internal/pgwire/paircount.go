@@ -27,7 +27,7 @@ import (
 //
 //	SELECT _igloo_g1 AS k, count(DISTINCT _igloo_d1) AS people,
 //	       count(*) FILTER (WHERE _igloo_d1 IS NOT NULL AND _igloo_d2 IS NOT NULL) AS person_days
-//	FROM (SELECT k AS _igloo_g1, a AS _igloo_d1, d AS _igloo_d2 FROM ... GROUP BY k, a, d) AS _igloo_pairs_1
+//	FROM (SELECT k AS _igloo_g1, a AS _igloo_d1, d AS _igloo_d2 FROM ... GROUP BY k, a, d) AS _igloo_pairs
 //	GROUP BY _igloo_g1
 //
 // That holds in a SELECT whose every item has an alias and is a GROUP BY
@@ -44,8 +44,9 @@ import (
 // unchanged, so names resolve as before.
 
 // pairCountPasses bounds how many SELECTs one statement has rewritten, one
-// a pass.
-const pairCountPasses = 8
+// a pass. A statement that repeats a part needs every copy rewritten, or
+// the copies differ and are computed apart (see shared.go).
+const pairCountPasses = 64
 
 // pairCountPrefix starts the names the rewrite gives the inner select and
 // its columns.
@@ -68,12 +69,12 @@ func pairCounts(text string, parse func(string) (any, error)) string {
 	if !distinctCase.MatchString(maskCode(text)) || strings.Contains(strings.ToLower(text), pairCountPrefix) {
 		return text
 	}
-	for n := 1; n <= pairCountPasses; n++ {
+	for range pairCountPasses {
 		tree, err := parse(text)
 		if err != nil {
 			return text
 		}
-		next, ok := rewritePairCount(text, tree, n)
+		next, ok := rewritePairCount(text, tree)
 		if !ok {
 			return text
 		}
@@ -83,8 +84,8 @@ func pairCounts(text string, parse func(string) (any, error)) string {
 }
 
 // rewritePairCount rewrites the first SELECT of text (whose parse is tree)
-// that has pair counts to rewrite; n numbers its inner select.
-func rewritePairCount(text string, tree any, n int) (string, bool) {
+// that has pair counts to rewrite.
+func rewritePairCount(text string, tree any) (string, bool) {
 	stmt, _ := tree.(map[string]any)
 	if stmt == nil {
 		return "", false
@@ -97,7 +98,7 @@ func rewritePairCount(text string, tree any, n int) (string, bool) {
 		if found {
 			return false
 		}
-		if r, ok := pairCountSelect(pieces, masked, m, n); ok {
+		if r, ok := pairCountSelect(pieces, masked, m); ok {
 			out, found = r, true
 			return false
 		}
@@ -142,7 +143,7 @@ type pairAggregate struct {
 
 // pairCountSelect rewrites the SELECT node m of text if it has pair counts
 // to rewrite (see the comment at the top).
-func pairCountSelect(pieces pieceText, masked string, m map[string]any, n int) (string, bool) {
+func pairCountSelect(pieces pieceText, masked string, m map[string]any) (string, bool) {
 	text := pieces.text
 	from, _ := m["from_table"].(map[string]any)
 	groups := asList(m["group_expressions"])
@@ -352,7 +353,10 @@ func pairCountSelect(pieces pieceText, masked string, m map[string]any, n int) (
 	if whereBody >= 0 {
 		q += "WHERE " + pieces.trim(whereBody, whereEnd) + "\n"
 	}
-	q += "GROUP BY " + strings.Join(innerGroups, ",\n") + "\n) AS " + fmt.Sprintf("%ss_%d", pairCountPrefix, n) +
+	// The inner select's name is the same in every SELECT rewritten (each
+	// is its own scope), so that two copies of a statement's part stay
+	// alike and shared subqueries (see shared.go) still find them.
+	q += "GROUP BY " + strings.Join(innerGroups, ",\n") + "\n) AS " + pairCountPrefix + "s" +
 		" GROUP BY " + strings.Join(outerGroups, ", ")
 	if after != "" {
 		q += " "

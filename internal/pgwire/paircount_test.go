@@ -186,3 +186,36 @@ func TestPairCountsThroughSessions(t *testing.T) {
 		}
 	}
 }
+
+// TestRewritesKeepCopiesShared checks that a statement that selects twice
+// from one report, as a top and a bottom of it, still computes the report
+// once (see shared.go) after the whole-aggregate and pair-count rewrites
+// have rewritten both copies: the copies must stay alike. On 2026-10-23 the
+// pair-count rewrite numbered its inner selects by pass, so the two copies
+// of such a report differed and were computed twice, 109 s instead of 20.
+func TestRewritesKeepCopiesShared(t *testing.T) {
+	db, parse := pairCountDB(t)
+	report := "(WITH b AS (SELECT id, k, a, b, min(id) OVER () AS lo FROM p), " +
+		"g AS (SELECT k AS k, min(lo) AS lo, count(DISTINCT a) AS people, " +
+		"count(DISTINCT CASE WHEN (a) IS NOT NULL AND (b) IS NOT NULL THEN (a, b) END) AS pairs FROM b GROUP BY k) " +
+		"SELECT * FROM g ORDER BY pairs DESC)"
+	q := "SELECT * FROM (SELECT * FROM " + report + " AS r WHERE people > 3 ORDER BY pairs DESC LIMIT 3) AS top " +
+		"UNION ALL SELECT * FROM (SELECT * FROM " + report + " AS r ORDER BY pairs LIMIT 2) AS bottom ORDER BY pairs"
+	rewritten := pairCounts(wholeCounts(q, parse), parse)
+	if strings.Contains(maskCode(rewritten), "OVER ()") || distinctCase.MatchString(maskCode(rewritten)) {
+		t.Fatalf("not rewritten: %s", rewritten)
+	}
+	shared, err := shareRepeated(rewritten, parse, sharedVolatile(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The report, rewritten, once.
+	if !strings.Contains(shared, sharedPrefix+"1") || strings.Count(shared, "AS "+pairCountPrefix+"s") != 1 {
+		t.Fatalf("the report is not computed once:\n%s", shared)
+	}
+	wantCols, wantRows := typedResultOf(t, db, q)
+	gotCols, gotRows := typedResultOf(t, db, shared)
+	if !slices.Equal(gotCols, wantCols) || !slices.Equal(gotRows, wantRows) {
+		t.Errorf("got %q %q\nwant %q %q", gotCols, gotRows, wantCols, wantRows)
+	}
+}

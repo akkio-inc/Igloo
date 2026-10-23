@@ -39,8 +39,9 @@ import (
 var emptyOver = regexp.MustCompile(`(?i)\bover\s*\(\s*\)`)
 
 // wholeCountPasses bounds how many nested SELECTs one statement has
-// rewritten, one a pass.
-const wholeCountPasses = 8
+// rewritten, one a pass. A statement that repeats a part needs every copy
+// rewritten, or the copies differ and are computed apart (see shared.go).
+const wholeCountPasses = 64
 
 // rewriteWholeCounts rewrites the whole counts and other whole aggregates
 // of a SELECT statement.
