@@ -207,23 +207,37 @@ more than the replica scans in about four seconds (4 GiB for a 16-core
 replica; workers that are stopped are started only for a minute's worth).
 For such a statement it estimates two times, over what it reads of its
 tables (each table's size times the share of its columns, weighed by type,
-that the statement's parts name): the replica's, at 150 MB/s per
-core over as much of that as its read cache can
-hold and at what it reads from object storage cold per core for the rest
-(about 11 MB/s at two threads a core), and the workers', at 16 MB/s per
-worker core from object storage; each no less than the rows its parts go
-through take at 150 million rows a second per core, once for the scan and
-again for each join and grouping (a hundredth of a table's rows where a
-part filters it by a constant), for a statement that reads little but
-joins much; plus about 4 seconds for each round of
-tasks that waits for the one before it, plus the time to start workers that
-are stopped. A replica that would run short of memory (the rows its joins
-and distinct counts hold, estimated at three times what feeds them, over
-70% of its memory limit) is estimated to take as many times longer,
-spilling, up to twice as long. It runs the statement on workers only if the replica would take
-longer than `IGLOO_WORKER_THRESHOLD` (a minute), or would run short of
-memory, and the workers are estimated to be at least 1.5 times faster. It uses the fewest workers
-estimated within a fifth of the fastest time.
+that the statement's parts name, and a hundredth of that for a table a part
+filters by a constant, `IN`, or a subquery's value, as an audience or its
+latest version is picked out of a lookup of every one): the replica's, at
+what it reads from object storage cold per core (about 9 MB/s at one and a
+half threads a core, 16 MB/s at four; its read cache holds what it read
+lately, which a statement's first run seldom has), and the workers', at
+the same rate for their cores and threads; each no less than the rows its
+parts go through take at 150 million rows a second per core, once for the
+scan and again for each join and grouping (a hundredth of a table's rows
+where a part filters it so), for a statement that reads little but joins
+much. Workers also take about 8 seconds to start a statement and 6 for each
+of its stages, whose tasks write their exchanges to object storage for the
+next to read, plus the time to start workers that are stopped: at ten times
+the data on 16 workers, reports of 2 or 3 stages took 12 to 40 seconds, and
+of 23 to 26 stages 153 to 183 seconds. A replica that would run short of
+memory (the rows its joins and distinct counts hold, estimated at six times
+what feeds them, over 70% of its memory limit) is estimated to take as many
+times longer, spilling, up to twice as long. It runs the statement on
+workers only if the replica would take longer than `IGLOO_WORKER_THRESHOLD`
+(a minute), or would run short of memory, and the workers are estimated to
+be at least 1.5 times faster. It uses the fewest workers estimated within a
+fifth of the fastest time.
+
+Against the scale environment's reports at 1x, 10x and 100x, timed on a
+16-core replica and on 16 workers of 8 cores, the estimates pick the side
+that was faster by half again, or either where the two were closer, but
+for statements whose rows cost far more than their count says, such as
+FLATTEN's unnested arrays (251 s on the replica at 10x, estimated at 7)
+and joins through a view's computed keys counted distinct (691 s on the
+replica and 170 on workers, estimated at 160 and 153). Those run on the
+replica first, and their history sends them to workers after.
 
 Estimates are rough, so Igloo corrects them with what the same statement
 took before. It recognizes a statement run again, as BI tools run theirs, by

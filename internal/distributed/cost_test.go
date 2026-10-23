@@ -15,7 +15,7 @@ func TestChoose(t *testing.T) {
 	slow := estimate{oneMachine: 600, onWorkers: 120, workers: 4}  // workers estimated 5 times faster
 	short := estimate{oneMachine: 20, onWorkers: 5, workers: 4}    // under the threshold
 	close := estimate{oneMachine: 600, onWorkers: 500, workers: 4} // not 1.5 times faster
-	memory := estimate{oneMachine: 30, onWorkers: 10, workers: 4, memory: true}
+	memory := estimate{oneMachine: 30, onWorkers: 10, workers: 4, spills: true}
 	none := estimate{oneMachine: 600, onWorkers: 120, workers: 0}
 	for _, c := range []struct {
 		name    string
@@ -61,12 +61,13 @@ func TestChoose(t *testing.T) {
 }
 
 // TestEstimateTimes checks the estimates of a plan: one machine's from
-// the coordinator's cores, the workers' from theirs, the rounds of tasks
-// and starting workers, and the fewest workers within a fifth of the
-// fastest.
+// the coordinator's cores and threads, reading cold, longer short of
+// memory; the workers' from their start, their stages and their cores and
+// threads, starting more; and the fewest workers within a fifth of the
+// fastest, as the first estimates counted them.
 func TestEstimateTimes(t *testing.T) {
-	warm := machine{cores: 16, threads: 32, memory: 50e9, cache: 1 << 50}
-	big := &Table{Schema: "main", Name: "big", Bytes: 300e9}
+	coordinator := machine{cores: 16, threads: 32, memory: 50e9}
+	big := &Table{Schema: "main", Name: "big", Bytes: 300e9, Columns: []Column{{Name: "k", Type: "VARCHAR"}}}
 	small := &Table{Schema: "main", Name: "small", Bytes: 1e6}
 	x, y := &Exchange{ID: 0}, &Exchange{ID: 1}
 	stages := []*Stage{
@@ -74,26 +75,38 @@ func TestEstimateTimes(t *testing.T) {
 		{Inputs: []Input{{Exchange: x, Partitioned: true}, {Table: small}}, Out: y},
 		{Inputs: []Input{{Exchange: y, Partitioned: true}}},
 	}
-	e := estimateTimes(stages, warm, fleet{cores: 8, running: 2, most: 16, start: 30 * time.Second})
-	if e.levels != 3 || e.bytes != 300e9+1e6 || e.exchanged != 300e9+1e6 || !e.memory {
-		t.Errorf("levels %d, bytes %d, exchanged %d, memory %v", e.levels, e.bytes, e.exchanged, e.memory)
+	f := fleet{cores: 8, running: 2, most: 16, start: 30 * time.Second}
+	e := estimateTimes(stages, coordinator, f)
+	if e.levels != 3 || e.stages != 3 || e.bytes != 300e9+1e6 || e.exchanged != 300e9+1e6 || !e.memory || !e.spills {
+		t.Errorf("levels %d, stages %d, bytes %d, exchanged %d, memory %v, spills %v", e.levels, e.stages, e.bytes, e.exchanged, e.memory, e.spills)
 	}
 	// Short of memory: spilling, up to twice as long.
-	if want := (300e9 + 1e6) / (16 * localRate) * spillFactor; math.Abs(e.oneMachine-want) > 1 {
+	if want := (300e9 + 1e6) / (16 * coldRateAt(2)) * spillFactor; math.Abs(e.oneMachine-want) > 1 {
 		t.Errorf("one machine: %.1f s, want %.1f", e.oneMachine, want)
 	}
-	// 16 workers: 12 + 300e9/(16*8*16e6) + 30 = 188.5 s, starting more
-	// than the 2 running; the fewest within a fifth of that: 13, at 222.3 s.
-	if e.workers != 13 || e.onWorkers > 188.5*1.2 {
+	// The first estimates' count, 13 of 16, starting more than the 2
+	// running: 8 + 3*6 + 300e9/(13*8*16e6) + 30 = 236.3 s.
+	if e.workers != 13 || math.Abs(e.onWorkers-236.3) > 0.5 {
 		t.Errorf("%d workers, %.1f s", e.workers, e.onWorkers)
 	}
-	if e := estimateTimes(stages, machine{cores: 16, cache: 1 << 50}, fleet{}); e.workers != 0 || e.memory {
-		t.Errorf("no workers: %d workers, memory %v", e.workers, e.memory)
+	// Workers of fewer threads a core read slower.
+	f.threads = 12
+	if slower := estimateTimes(stages, coordinator, f); slower.workers != 13 || slower.onWorkers <= e.onWorkers {
+		t.Errorf("at 1.5 threads a core: %d workers, %.1f s", slower.workers, slower.onWorkers)
 	}
-	// What the cache cannot hold, it reads cold at its threads a core.
-	cold := machine{cores: 16, threads: 32, cache: 100e9}
-	if e, want := estimateTimes(stages, cold, fleet{}), 100e9/(16*localRate)+200.001e9/(16*coldRateAt(2)); math.Abs(e.oneMachine-want) > 1 {
-		t.Errorf("one machine, partly cold: %.1f s, want %.1f", e.oneMachine, want)
+	if e := estimateTimes(stages, machine{cores: 16}, fleet{}); e.workers != 0 || e.memory || !math.IsInf(e.onWorkers, 1) {
+		t.Errorf("no workers: %d workers, memory %v, %.0f s", e.workers, e.memory, e.onWorkers)
+	}
+	// A table its stage filters selectively, by a constant or a subquery's
+	// value, counts a hundredth of its bytes, and is short of memory only
+	// as it falls back.
+	for _, value := range []node{{"class": "CONSTANT"}, {"class": "SUBQUERY"}} {
+		stages[0].fragment = node{"where_clause": node{"type": "COMPARE_EQUAL",
+			"left": node{"class": "COLUMN_REF", "column_names": []any{"k"}}, "right": value}}
+		e := estimateTimes(stages, coordinator, f)
+		if e.bytes != 3e9+1e6 || e.exchanged != 300e9+1e6 || !e.memory || e.spills || e.workers != 13 {
+			t.Errorf("filtered by %s: bytes %d, exchanged %d, memory %v, spills %v, %d workers", value["class"], e.bytes, e.exchanged, e.memory, e.spills, e.workers)
+		}
 	}
 	if r := coldRateAt(4); r != coldRate {
 		t.Errorf("cold rate at 4 threads a core: %.0f", r)
@@ -103,71 +116,105 @@ func TestEstimateTimes(t *testing.T) {
 	}
 }
 
-// TestScaleReports checks auto mode's first choice for the shapes of the
-// scale environment's reports: a coordinator of 16 cores, 32 threads and
-// a 49 GiB memory limit with a 100 GiB read cache, and up to 16 workers
-// of 8 cores. The bytes are what the reports' stages read of their
-// tables' columns, and the rows what they go through, as the planner
-// estimates them from their plans (see columnsRead and rowWork). At 1x
-// and 10x they run on one machine (at 10x, E2 ran in 174 s there and 249 s
-// on four workers; F5 in 15 s there and 917 s on four workers); at 100x,
-// where one machine read for an hour and ran out of memory, on workers,
-// and so does E1, which reads little but joins 4 billion rows to
-// themselves 16 times.
+// TestScaleReports checks auto mode's first choice for the scale
+// environment's reports at 1x, 10x and 100x, as the planner estimates
+// them (bytes as selective filters leave them, and in full; the rows
+// their stages go through, and as the first estimates counted them; their
+// levels and stages), against how long they took: on a coordinator of 16
+// cores, 24 threads and a 49.3 GiB limit (one), and on 16 workers of 8
+// cores and 12 threads (workers), zero where not measured. The side that
+// was faster by half again or more is chosen, but for those listed in
+// misses, whose first run, on the side the estimates pick, sends the next
+// to the faster side, and p1 at 10x, 24 s on one machine and 12 on
+// workers, which stays under the threshold.
 func TestScaleReports(t *testing.T) {
-	coordinator := machine{cores: 16, threads: 32, memory: 49 << 30, cache: 100 << 30}
-	// shape is a plan of levels levels over a table of bytes and of rows
-	// that its stages go through rows times in all.
-	shape := func(levels int, bytes, rows float64) []*Stage {
-		x := &Exchange{ID: 0}
-		table := &Table{Name: "t", Bytes: int64(bytes), Rows: int64(rows / float64(levels))}
-		stages := []*Stage{{Inputs: []Input{{Table: table, Split: true}}, Out: x}}
-		for range levels - 2 {
-			y := &Exchange{ID: x.ID + 1}
-			stages = append(stages, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}, Out: y})
-			x = y
-		}
-		return append(stages, &Stage{Inputs: []Input{{Exchange: x, Partitioned: true}}})
+	coordinator := machine{cores: 16, threads: 24, memory: 52_935_471_923}
+	workers := fleet{cores: 8, threads: 12, running: 16, most: 16}
+	misses := map[string]string{
+		// FLATTEN's arrays and maps cost far more a row than the rows say.
+		"E3 report-b at 10x":  "one",
+		"P p8flatmap at 100x": "one",
+		// Joins through a view's computed keys, counted distinct.
+		"F1 report-c at 10x": "one",
+		// Measured on workers before relations of uncertain size were
+		// measured first, which took it from 517 s to 161 s at 10x.
+		"F5 report-g at 100x": "workers",
+		// Under DefaultThreshold on one machine.
+		"P p1media at 10x": "one",
 	}
-	for _, c := range []struct {
-		name        string
-		levels      int
-		bytes, rows float64
-		workers     bool
-	}{
-		{"E1 at 1x", 3, 0.2e9, 6.77e9, false},
-		{"E2 at 1x", 2, 9.0e9, 8.66e9, false},
-		{"E3 at 1x", 5, 7.8e9, 4.42e8, false},
-		{"F5 at 1x", 7, 3.8e9, 1.35e10, false},
-		{"E1 at 10x", 3, 1.9e9, 6.77e10, false},
-		{"E2 at 10x", 2, 90.2e9, 1.2e11, false},
-		{"E3 at 10x", 5, 77.5e9, 4.82e9, false},
-		{"F4 at 10x", 7, 35.3e9, 1.08e11, false},
-		{"F5 at 10x", 7, 37.6e9, 1.34e11, false},
-		{"E1 at 100x", 3, 19.2e9, 6.77e11, true},
-		{"E2 at 100x", 2, 901.6e9, 1.2e12, true},
-		{"E3 at 100x", 5, 775.2e9, 4.82e10, true},
-	} {
-		for _, f := range []fleet{{cores: 8, running: 4, most: 4}, {cores: 8, most: 16, start: time.Minute}} {
-			e := estimateTimes(shape(c.levels, c.bytes, c.rows), coordinator, f)
-			got, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
-			t.Logf("%s, %d running of %d: %s (short of memory: %v)", c.name, f.running, f.most, reason, e.memory)
-			if got != c.workers {
-				t.Errorf("%s, %d running of %d: workers %v (%s)", c.name, f.running, f.most, got, reason)
-			}
-		}
-	}
-
-	// Run on workers first, as an estimate too high for one machine would
-	// have sent it, a statement is tried on one machine once, and stays on
-	// the faster side.
 	now := time.Now()
-	e := estimateTimes(shape(2, 90.2e9, 1.2e11), coordinator, fleet{cores: 8, running: 4, most: 4})
-	if workers, explore, reason := choose(e, runs{dist: 249}, true, DefaultThreshold, now); workers || !explore {
-		t.Errorf("run on workers only: workers %v, explore %v (%s)", workers, explore, reason)
-	}
-	if workers, _, reason := choose(e, runs{dist: 249, local: 174, explored: now}, true, DefaultThreshold, now); workers {
-		t.Errorf("faster on one machine: workers (%s)", reason)
+	for _, c := range []struct {
+		name         string
+		x            features
+		one, workers float64
+		faster       string
+	}{
+		{"E2 report-a at 1x", features{bytes: 1.349e+09, unfiltered: 8.999e+09, exchanged: 8.999e+09, held: 1.349e+09, rows: 1.2e+10, legacyRows: 1.2e+10, levels: 2, stages: 10}, 9, 0, "one"},
+		{"E3 report-b at 1x", features{bytes: 1.044e+08, unfiltered: 7.755e+09, exchanged: 7.755e+09, held: 1.044e+08, rows: 4.82e+08, legacyRows: 4.82e+08, levels: 5, stages: 7}, 11, 0, "one"},
+		{"F1 report-c at 1x", features{bytes: 1.186e+09, unfiltered: 5.683e+09, exchanged: 5.402e+09, held: 9.051e+08, rows: 5.68e+08, legacyRows: 5.68e+08, levels: 4, stages: 20}, 14, 0, "one"},
+		{"F2 report-d at 1x", features{bytes: 1.186e+09, unfiltered: 5.683e+09, exchanged: 5.402e+09, held: 9.051e+08, rows: 2.84e+08, legacyRows: 2.84e+08, levels: 4, stages: 10}, 13, 0, "one"},
+		{"F3 report-e at 1x", features{bytes: 4.669e+08, unfiltered: 4.669e+08, exchanged: 4.669e+08, held: 4.669e+08, rows: 7.23e+08, legacyRows: 7.23e+08, levels: 7, stages: 24}, 13, 0, "one"},
+		{"F4 report-f at 1x", features{bytes: 4.934e+08, unfiltered: 3.491e+09, exchanged: 3.491e+09, held: 4.934e+08, rows: 7.49e+08, legacyRows: 1.08e+10, levels: 7, stages: 22}, 4, 0, "one"},
+		{"F5 report-g at 1x", features{bytes: 8.144e+08, unfiltered: 3.812e+09, exchanged: 3.812e+09, held: 8.144e+08, rows: 9.34e+08, legacyRows: 1.35e+10, levels: 7, stages: 23}, 2, 0, "one"},
+		{"P p1media at 1x", features{bytes: 3.636e+08, unfiltered: 3.636e+08, exchanged: 3.636e+08, held: 3.636e+08, rows: 1.45e+08, legacyRows: 1.45e+08, levels: 2, stages: 2}, 3, 17, "one"},
+		{"P p2audmedia at 1x", features{bytes: 2.726e+08, unfiltered: 3.27e+09, exchanged: 3.27e+09, held: 2.726e+08, rows: 1.5e+08, legacyRows: 1.5e+08, levels: 2, stages: 3}, 1, 10, "one"},
+		{"P p3seggen at 1x", features{bytes: 1.248e+09, unfiltered: 1.248e+09, exchanged: 1.248e+09, held: 1.248e+09, rows: 3.49e+09, legacyRows: 3.49e+09, levels: 2, stages: 3}, 22, 87, "one"},
+		{"P p4segaud at 1x", features{bytes: 1.277e+09, unfiltered: 6.377e+09, exchanged: 6.377e+09, held: 1.277e+09, rows: 3.36e+09, legacyRows: 3.36e+09, levels: 2, stages: 3}, 2, 49, "one"},
+		{"P p5flatbrowse at 1x", features{bytes: 1.111e+08, unfiltered: 1.111e+08, exchanged: 1.111e+08, held: 1.111e+08, rows: 6.98e+07, legacyRows: 6.98e+07, levels: 2, stages: 2}, 2, 27, "one"},
+		{"P p6flatmedia at 1x", features{bytes: 6.059e+08, unfiltered: 6.059e+08, exchanged: 6.059e+08, held: 6.059e+08, rows: 1.81e+08, legacyRows: 1.81e+08, levels: 2, stages: 2}, 2, 26, "one"},
+		{"P p7flataud at 1x", features{bytes: 1.565e+08, unfiltered: 4.653e+09, exchanged: 4.653e+09, held: 1.565e+08, rows: 9.23e+07, legacyRows: 9.23e+07, levels: 2, stages: 2}, 1, 8, "one"},
+		{"P p8flatmap at 1x", features{bytes: 1.808e+07, unfiltered: 1.808e+07, exchanged: 0, held: 0, rows: 1.2e+08, legacyRows: 1.2e+08, levels: 1, stages: 1}, 7, 9, "tie"},
+		{"E2 report-a at 10x", features{bytes: 1.349e+10, unfiltered: 8.999e+10, exchanged: 8.999e+10, held: 1.349e+10, rows: 1.2e+11, legacyRows: 1.2e+11, levels: 2, stages: 10}, 172, 84, "workers"},
+		{"E3 report-b at 10x", features{bytes: 1.044e+09, unfiltered: 7.755e+10, exchanged: 7.755e+10, held: 1.044e+09, rows: 4.82e+09, legacyRows: 4.82e+09, levels: 5, stages: 7}, 251, 113, "workers"},
+		{"F1 report-c at 10x", features{bytes: 1.186e+10, unfiltered: 5.683e+10, exchanged: 5.683e+10, held: 1.186e+10, rows: 5.83e+09, legacyRows: 5.83e+09, levels: 3, stages: 22}, 691, 170, "workers"},
+		{"F2 report-d at 10x", features{bytes: 1.186e+10, unfiltered: 5.683e+10, exchanged: 5.683e+10, held: 1.186e+10, rows: 2.92e+09, legacyRows: 2.92e+09, levels: 3, stages: 11}, 621, 188, "workers"},
+		{"F4 report-f at 10x", features{bytes: 4.934e+09, unfiltered: 3.491e+10, exchanged: 3.491e+10, held: 4.934e+09, rows: 7.87e+09, legacyRows: 1.09e+11, levels: 7, stages: 26}, 40, 183, "one"},
+		{"F5 report-g at 10x", features{bytes: 8.144e+09, unfiltered: 3.812e+10, exchanged: 3.812e+10, held: 8.144e+09, rows: 1.01e+10, legacyRows: 1.32e+11, levels: 7, stages: 33}, 25, 161, "one"},
+		{"P p1media at 10x", features{bytes: 3.636e+09, unfiltered: 3.636e+09, exchanged: 3.636e+09, held: 3.636e+09, rows: 1.45e+09, legacyRows: 1.45e+09, levels: 2, stages: 2}, 24, 12, "workers"},
+		{"P p2audmedia at 10x", features{bytes: 2.726e+09, unfiltered: 3.27e+10, exchanged: 3.27e+10, held: 2.726e+09, rows: 1.5e+09, legacyRows: 1.5e+09, levels: 2, stages: 3}, 9, 22, "one"},
+		{"P p3seggen at 10x", features{bytes: 1.248e+10, unfiltered: 1.248e+10, exchanged: 1.248e+10, held: 1.248e+10, rows: 3.49e+10, legacyRows: 3.49e+10, levels: 2, stages: 3}, 259, 40, "workers"},
+		{"P p4segaud at 10x", features{bytes: 1.277e+10, unfiltered: 6.377e+10, exchanged: 6.377e+10, held: 1.277e+10, rows: 3.36e+10, legacyRows: 3.36e+10, levels: 2, stages: 3}, 30, 22, "tie"},
+		{"P p5flatbrowse at 10x", features{bytes: 1.111e+09, unfiltered: 1.111e+09, exchanged: 1.111e+09, held: 1.111e+09, rows: 6.98e+08, legacyRows: 6.98e+08, levels: 2, stages: 2}, 11, 35, "one"},
+		{"P p6flatmedia at 10x", features{bytes: 6.059e+09, unfiltered: 6.059e+09, exchanged: 6.059e+09, held: 6.059e+09, rows: 1.81e+09, legacyRows: 1.81e+09, levels: 2, stages: 2}, 34, 36, "tie"},
+		{"P p7flataud at 10x", features{bytes: 1.565e+09, unfiltered: 4.653e+10, exchanged: 4.653e+10, held: 1.565e+09, rows: 7.69e+08, legacyRows: 7.69e+08, levels: 2, stages: 3}, 9, 39, "one"},
+		{"P p8flatmap at 10x", features{bytes: 1.808e+08, unfiltered: 1.808e+08, exchanged: 0, held: 0, rows: 1.2e+09, legacyRows: 1.2e+09, levels: 1, stages: 1}, 22, 31, "tie"},
+		{"F1 report-c at 100x", features{bytes: 1.186e+11, unfiltered: 5.683e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 5.83e+10, legacyRows: 5.83e+10, levels: 3, stages: 22}, 0, 722, "workers"},
+		{"F2 report-d at 100x", features{bytes: 1.186e+11, unfiltered: 5.683e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 2.92e+10, legacyRows: 2.92e+10, levels: 3, stages: 11}, 0, 685, "workers"},
+		{"F4 report-f at 100x", features{bytes: 4.934e+10, unfiltered: 3.491e+11, exchanged: 3.491e+11, held: 4.934e+10, rows: 7.87e+10, legacyRows: 1.09e+12, levels: 7, stages: 26}, 2223, 1263, "workers"},
+		{"F5 report-g at 100x", features{bytes: 8.144e+10, unfiltered: 3.812e+11, exchanged: 3.812e+11, held: 8.144e+10, rows: 1.01e+11, legacyRows: 1.3e+12, levels: 7, stages: 34}, 311, 926, "one"},
+		{"P p1media at 100x", features{bytes: 3.636e+10, unfiltered: 3.636e+10, exchanged: 3.636e+10, held: 3.636e+10, rows: 1.45e+10, legacyRows: 1.45e+10, levels: 2, stages: 2}, 501, 72, "workers"},
+		{"P p2audmedia at 100x", features{bytes: 2.726e+10, unfiltered: 3.27e+11, exchanged: 3.27e+11, held: 2.726e+10, rows: 1.5e+10, legacyRows: 1.5e+10, levels: 2, stages: 3}, 167, 41, "workers"},
+		{"P p3seggen at 100x", features{bytes: 1.248e+11, unfiltered: 1.248e+11, exchanged: 1.248e+11, held: 1.248e+11, rows: 3.49e+11, legacyRows: 3.49e+11, levels: 2, stages: 3}, 0, 262, "workers"},
+		{"P p4segaud at 100x", features{bytes: 1.277e+11, unfiltered: 6.377e+11, exchanged: 6.377e+11, held: 1.277e+11, rows: 3.36e+11, legacyRows: 3.36e+11, levels: 2, stages: 3}, 0, 119, "workers"},
+		{"P p5flatbrowse at 100x", features{bytes: 1.111e+10, unfiltered: 1.111e+10, exchanged: 1.111e+10, held: 1.111e+10, rows: 6.98e+09, legacyRows: 6.98e+09, levels: 2, stages: 2}, 363, 146, "workers"},
+		{"P p6flatmedia at 100x", features{bytes: 6.059e+10, unfiltered: 6.059e+10, exchanged: 6.059e+10, held: 6.059e+10, rows: 1.81e+10, legacyRows: 1.81e+10, levels: 2, stages: 2}, 0, 376, "workers"},
+		{"P p7flataud at 100x", features{bytes: 1.565e+10, unfiltered: 4.653e+11, exchanged: 4.653e+11, held: 1.565e+10, rows: 7.69e+09, legacyRows: 7.69e+09, levels: 2, stages: 3}, 281, 43, "workers"},
+		{"P p8flatmap at 100x", features{bytes: 1.808e+09, unfiltered: 1.808e+09, exchanged: 0, held: 0, rows: 1.2e+10, legacyRows: 1.2e+10, levels: 1, stages: 1}, 379, 30, "workers"},
+	} {
+		e := c.x.estimate(coordinator, workers)
+		got, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
+		side := map[bool]string{true: "workers", false: "one"}[got]
+		t.Logf("%s: %s (%s)", c.name, side, reason)
+		if miss, ok := misses[c.name]; ok {
+			if side != miss {
+				t.Errorf("%s: %s first, the miss listed is %s (%s)", c.name, side, miss, reason)
+			}
+			if c.name == "P p1media at 10x" {
+				continue
+			}
+			// One run there, and the next goes to the faster side.
+			r := runs{local: c.one}
+			if got {
+				r = runs{dist: c.workers}
+			}
+			if again, _, reason := choose(e, r, true, DefaultThreshold, now); again == got {
+				t.Errorf("%s: %s again after a run there (%s)", c.name, side, reason)
+			}
+			continue
+		}
+		if c.faster != "tie" && side != c.faster {
+			t.Errorf("%s: %s, but %s was faster: %.0f s on one machine, %.0f s on workers (%s)", c.name, side, c.faster, c.one, c.workers, reason)
+		}
 	}
 }
 
@@ -224,8 +271,19 @@ func TestRowWork(t *testing.T) {
 	}
 	// 1e7 people for the filter; (4e9 + 1e7) rows, scanned, joined and
 	// grouped.
-	if got, want := rowWork(stages), 1e7+3*(4e9+1e7); got != want {
-		t.Errorf("%.3g rows, want %.3g", got, want)
+	for _, filters := range []func(node, *Table) bool{filtersByConstant, filtersSelectively} {
+		if got, want := rowWork(stages, filters), 1e7+3*(4e9+1e7); got != want {
+			t.Errorf("%.3g rows, want %.3g", got, want)
+		}
+	}
+	// The latest version, a subquery's value: selective for auto mode's
+	// estimates, not for partitions' (see exchangeEstimates).
+	stages[0].fragment = parse(`SELECT id FROM __igloo_t0 WHERE audience = (SELECT max(audience) FROM __igloo_t1)`)
+	if got, want := rowWork(stages, filtersSelectively), 1e7+3*(4e9+1e7); got != want {
+		t.Errorf("filtered by a subquery's value: %.3g rows, want %.3g", got, want)
+	}
+	if got, want := rowWork(stages, filtersByConstant), 1e9+3*(4e9+1e9); got != want {
+		t.Errorf("filtered by a subquery's value, for partitions: %.3g rows, want %.3g", got, want)
 	}
 }
 
@@ -311,7 +369,8 @@ func TestHistory(t *testing.T) {
 func TestAutoMode(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 3)
 	li := h.tables["lineitem"]
-	li.Bytes = 8 << 30
+	// Large enough to distribute, but read cold by two cores in seconds.
+	li.Bytes = 1 << 30
 	q := `SELECT l_returnflag, count(*), sum(l_quantity) FROM lineitem GROUP BY 1`
 	join := `SELECT count(*), sum(a.l_quantity - b.l_quantity) FROM lineitem a JOIN lineitem b ON a.l_orderkey = b.l_orderkey AND a.l_linenumber < b.l_linenumber`
 	h.co.maxBroadcast = h.tables["customer"].Bytes

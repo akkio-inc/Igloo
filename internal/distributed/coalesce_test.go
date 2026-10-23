@@ -234,8 +234,7 @@ func TestCoalescedPartitions(t *testing.T) {
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
 		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: []string{
 			h.lns[0].Addr().String(), h.lns[1].Addr().String(), h.lns[2].Addr().String()}},
-		CacheBytes: func() int64 { return 1 << 40 },
-		Storage:    recordingStorage{NewStorage(icebergio.LocalFS{}), h},
+		Storage: recordingStorage{NewStorage(icebergio.LocalFS{}), h},
 	}, slog.New(rec))
 	if err != nil {
 		t.Fatal(err)

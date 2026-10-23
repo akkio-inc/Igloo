@@ -141,8 +141,10 @@ type workerStatus struct {
 	Cores       int    `json:"cores"`
 	MemoryBytes int64  `json:"memory_bytes"`
 	// Slots are the tasks it runs at once (see taskSlots), which share its
-	// memory; zero from a worker that does not say.
+	// memory, and Threads its DuckDB threads; zero from a worker that does
+	// not say.
 	Slots       int     `json:"slots,omitempty"`
+	Threads     int     `json:"threads,omitempty"`
 	Running     int     `json:"running"`
 	IdleSeconds float64 `json:"idle_seconds"`
 }

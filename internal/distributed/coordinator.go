@@ -90,11 +90,10 @@ type Options struct {
 	// Cores are the coordinator's cores, and Threads its DuckDB threads,
 	// for estimating how long a statement would take on it; zero cores
 	// means those Go may use (runtime.GOMAXPROCS), zero threads one a
-	// core. CacheBytes, if set, says what its read cache may hold.
-	Cores      int
-	Threads    int
-	CacheBytes func() int64
-	Metrics    *Metrics
+	// core.
+	Cores   int
+	Threads int
+	Metrics *Metrics
 	// MaxSpoolBytes bounds what a statement's partial results may take on
 	// the coordinator's disk; past it, the statement runs on the
 	// coordinator instead. Zero means 1 GiB.
@@ -342,11 +341,7 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		}
 		return p, err
 	}
-	var cache int64
-	if co.opts.CacheBytes != nil {
-		cache = co.opts.CacheBytes()
-	}
-	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes, cache: cache}
+	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes}
 	e := estimateTimes(plan.Stages, m, co.fleet(ws, plan.mayStart))
 	plan.workers = e.workers
 	r, found := co.history.get(plan.Key)
@@ -367,7 +362,8 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	co.log.Info("chose where a statement runs", "on", where, "reason", reason, "key", plan.Key,
 		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers,
-		"levels", e.levels, "bytes", e.bytes, "short_of_memory", e.memory)
+		"levels", e.levels, "stages", e.stages, "bytes", e.bytes, "exchanged", e.exchanged, "rows", e.rows,
+		"short_of_memory", e.memory, "spills", e.spills)
 	if explore {
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
 	}
@@ -380,7 +376,7 @@ func (co *Coordinator) fleet(ws []*worker, mayStart bool) fleet {
 	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws)}
 	for i, w := range ws {
 		if i == 0 || w.status.Cores > f.cores {
-			f.cores = w.status.Cores
+			f.cores, f.threads = w.status.Cores, w.status.Threads
 		}
 	}
 	if mayStart && co.pool.canStart() {

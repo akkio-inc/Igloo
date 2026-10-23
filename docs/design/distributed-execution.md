@@ -207,28 +207,43 @@ explicit transactions, the coordinator plans it:
    (`internal/distributed/cost.go`), over what its stages read of their
    tables: each table's size times the share of its columns, weighed by
    type, that the stages' fragments name (a star in a view passes columns
-   through; one in a fragment's select list reads them all). Its time on
-   the coordinator is estimated at 150 MB/s per core over as much of that
-   as the coordinator's read cache can hold, and at its cold rate for
-   the rest (16 MB/s per core at four threads a core, about 11 at two,
-   about as the threads' 0.6th power), times its working set over 70% of
-   its memory limit, up to twice, when it would run short of memory (the
-   working set is a rough guess, from what its exchanges are fed), and
-   never less
-   than its rows take: the rows its stages go through (tables' record
-   counts, a hundredth where a stage filters one by a constant, exchanges'
-   as the rows that fed them, once for the scan and again for each join
-   and grouping) at 150 million a second per core, the fastest the reports
-   went; and
-   on n workers at 16 MB/s per worker core from object storage, plus 4 s
-   for each level of stages (a round of tasks that waits for the one before
-   it) and the start time of workers not running; it uses the fewest
-   workers within a fifth of the fastest. It goes to workers if the
-   coordinator would take over `IGLOO_WORKER_THRESHOLD` (a minute) or run
-   short of memory (three times what its exchanges are fed, over 70% of the
-   memory limit), and workers are estimated 1.5 times faster. The rates are
-   from the first scale runs, where the old rule (anything over the four
-   seconds' worth) made 1x reports of 6 to 56 s take 37 to 176 s on four
+   through; one in a fragment's select list reads them all), a hundredth
+   of that where every stage that reads a table filters it by a constant,
+   `IN` or a subquery's value (an audience, or its latest version, out of a
+   lookup of all of them). Its time on the coordinator is estimated at its
+   cold rate from object storage (16 MB/s per core at four threads a core,
+   about 9 at one and a half, as the threads' 0.6th power; DuckDB's threads
+   are capped at 2 GiB of its memory each), since its read cache holds what
+   it read lately, which a statement's first run seldom has (at ten times
+   the data, reports' first runs took 24 to 259 s and their second 3 to 51
+   s, and the estimate that counted the cache warm put one of 258 s at 15
+   s), times its working set over 70% of its memory limit, up to twice,
+   when it would run short of memory (six times what its exchanges' stages
+   read, as the selective filters leave it), and never less than its rows
+   take: the rows its stages go through (tables' record counts, a hundredth
+   where a stage filters one so, exchanges' as the rows that fed them, once
+   for the scan and again for each join and grouping) at 150 million a
+   second per core, the fastest the reports went; and on n workers at the
+   cold rate of their cores and threads, which they report, plus 8 s to
+   start the statement and 6 s for each stage, whose tasks write their
+   exchanges to object storage for the next to list and read (at ten times
+   the data on 16 workers, reports of 2 or 3 stages took 12 to 40 s, and of
+   23 to 26 stages 153 to 183 s), plus the start time of workers not
+   running. The number of workers is still that of the first estimates (at
+   16 MB/s per core and 4 s for each level of stages, the fewest workers
+   within a fifth of the fastest), so that a statement forced onto workers
+   runs on as many as before. It goes to workers if the coordinator would
+   take over `IGLOO_WORKER_THRESHOLD` (a minute) or run short of memory, and
+   workers are estimated 1.5 times faster. The rates are measured against
+   the scale environment's reports at 1x, 10x and 100x (`TestScaleReports`):
+   the first choice is the side that was faster by half again, or either
+   where the two were closer, but for statements whose rows cost far more
+   than their count says (FLATTEN's unnested arrays, 251 s on one machine
+   at 10x and estimated at 7; distinct counts through a view's computed
+   keys, 691 s and estimated at 160 against workers' 153), which their
+   history sends to workers after their first run. The old rule (anything
+   over the four seconds' worth) made 1x reports of 6 to 56 s take 37 to
+   176 s on four
    workers. What a statement took before overrides the estimates: each
    replica keeps, by plan key (the parse tree without non-integer literals,
    and its tables' sizes to a factor of two), the running averages of its

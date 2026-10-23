@@ -67,6 +67,10 @@ type WorkerOptions struct {
 	// means those Go may use (runtime.GOMAXPROCS).
 	Cores       int
 	MemoryBytes int64
+	// Threads are DuckDB's threads, reported to coordinators, which
+	// estimate how fast workers read object storage cold by their threads
+	// a core; zero for unknown.
+	Threads int
 	// Tasks is how many tasks run at once; others wait. Zero means as many
 	// as Cores and MemoryBytes allow (taskSlots).
 	Tasks   int
@@ -151,7 +155,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
-		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Slots: cap(w.slots),
+		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
 		Running: int(running), IdleSeconds: idle.Seconds(),
 	})
 }

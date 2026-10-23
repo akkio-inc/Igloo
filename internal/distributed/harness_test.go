@@ -298,8 +298,7 @@ func (h *harness) startWorkers(n int) {
 		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator"),
 		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: addrs},
 		// A cache that holds whatever the tests read: one machine reads warm.
-		CacheBytes: func() int64 { return 1 << 40 },
-		Storage:    recordingStorage{NewStorage(icebergio.LocalFS{}), h},
+		Storage: recordingStorage{NewStorage(icebergio.LocalFS{}), h},
 	}, h.log)
 	if err != nil {
 		h.t.Fatal(err)

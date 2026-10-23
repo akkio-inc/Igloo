@@ -356,6 +356,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   first, for a day; one that came out small is measured first, with the
   workers to itself, and read whole. A statement that runs out of memory on
   a worker after measuring runs again with the sizes measured.
+- Auto mode's estimates are measured against the scale environment's
+  reports at 1x, 10x and 100x. A table filtered by a subquery's value, as an
+  audience's latest version is, counts as filtered, and a filtered table a
+  hundredth of its bytes as well as of its rows; the replica reads cold,
+  as first runs do, at its threads a core; workers read at theirs, which
+  they now report, and pay 8 s a statement and 6 s a stage; and the
+  replica's working set counts six times what feeds its joins. The first
+  choice is now the faster side for all but statements whose rows cost
+  far more than their count (unnested arrays; distinct counts through a
+  view's computed keys), which their history then sends to workers. A
+  report of 25 s on the replica and 161 s on workers at 10x, which the
+  estimates sent to workers (110 s against 73 s), is estimated at 57 s and
+  216 s. Forced statements run on as many workers as before.
 - Auto mode's history counts runs on workers with runs on about as many
   workers: a statement measured on a quarter of the workers it would run on
   now, as in an earlier session on a smaller fleet, is tried on all of them
