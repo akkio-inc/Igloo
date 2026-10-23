@@ -145,16 +145,17 @@ func (g *taskGate) wait(ctx context.Context) error {
 	ch := g.open
 	g.waiting++
 	g.mu.Unlock()
-	defer func() {
+	// A canceled task stops waiting as it is counted canceled, at once:
+	// counted apart, a test that saw the cancel could still see it wait.
+	select {
+	case <-ch:
 		g.mu.Lock()
 		g.waiting--
 		g.mu.Unlock()
-	}()
-	select {
-	case <-ch:
 		return nil
 	case <-ctx.Done():
 		g.mu.Lock()
+		g.waiting--
 		g.canceled++
 		g.mu.Unlock()
 		return ctx.Err()

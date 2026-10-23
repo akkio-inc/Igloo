@@ -220,6 +220,12 @@ func TestShuffleFiles(t *testing.T) {
 	if res.Rows != 3000000 || len(res.Files) != parts {
 		t.Errorf("%d rows in %d files, want 3000000 in %d", res.Rows, len(res.Files), parts)
 	}
+	// What COPY says it wrote, file by file.
+	for _, f := range res.Files {
+		if info, err := os.Stat(f.Path); err != nil || f.Size != info.Size() || f.Rows == 0 {
+			t.Fatalf("%s: %d rows of %d bytes, stat %v", f.Path, f.Rows, f.Size, err)
+		}
+	}
 }
 
 // An error in the data, such as a failed cast, is the statement's error,
