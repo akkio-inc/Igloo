@@ -61,12 +61,34 @@ type pool struct {
 	scaledAt time.Time
 	// startTook is how long the last start took, to estimate the next.
 	startTook time.Duration
+	// memory is the smallest memory limit workers reported at the last
+	// check any answered, kept while none run.
+	memory int64
 }
 
 // worker is a worker that answered the last check.
 type worker struct {
 	addr   string
 	status workerStatus
+}
+
+// smallestMemory is the smallest memory limit of ws, or 0 if none says.
+func smallestMemory(ws []*worker) int64 {
+	var mem int64
+	for _, w := range ws {
+		if m := w.status.MemoryBytes; m > 0 && (mem == 0 || m < mem) {
+			mem = m
+		}
+	}
+	return mem
+}
+
+// lastMemory is the smallest memory limit workers reported when some last
+// answered, or 0 if none ever did.
+func (p *pool) lastMemory() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.memory
 }
 
 // statusTimeout bounds a status check.
@@ -195,6 +217,9 @@ func (p *pool) refresh(ctx context.Context) []*worker {
 	}
 	p.mu.Lock()
 	p.workers, p.refreshed = ws, time.Now()
+	if m := smallestMemory(ws); m > 0 {
+		p.memory = m
+	}
 	p.mu.Unlock()
 	p.metrics.setWorkers(len(ws))
 	return ws

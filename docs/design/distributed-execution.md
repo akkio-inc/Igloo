@@ -193,7 +193,9 @@ explicit transactions, the coordinator plans it:
    snapshot's file size in Iceberg metadata, is the split table; it must
    appear once. Every other table must be a catalog table small enough for
    every worker to read (an eighth of the smallest worker's memory, in
-   compressed bytes).
+   compressed bytes: of the workers running, or, while none run, of those
+   that answered last, so that a statement that starts them may read a
+   table in full that they will hold).
 3. **Decide.** A part is a candidate when the split table is more than the
    coordinator scans in about four seconds (64 MiB/s per core), or a
    minute plus the expected start time when no worker is running. A part

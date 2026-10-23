@@ -430,6 +430,9 @@ func (f *fakeCompute) Scale(context.Context, int) error { f.asked.Add(1); return
 // never starts any; forced by an admin, it may.
 func TestForcedByNonAdmins(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 3)
+	for _, w := range h.workers {
+		w.opts.MemoryBytes = 32 << 30
+	}
 	compute := &fakeCompute{}
 	var addrs []string
 	for _, ln := range h.lns {
@@ -484,6 +487,17 @@ func TestForcedByNonAdmins(t *testing.T) {
 	}
 	if compute.asked.Load() != before {
 		t.Error("a non-admin's statement asked for workers")
+	}
+	// While they are stopped, what every worker reads in full may be as
+	// large as the memory of the workers that last ran allows, not
+	// defaultBroadcast: orders, joined on an expression it cannot be
+	// partitioned by.
+	li, orders := h.tables["lineitem"], h.tables["orders"]
+	defer func(a, b int64) { li.Bytes, orders.Bytes = a, b }(li.Bytes, orders.Bytes)
+	li.Bytes, orders.Bytes = 40<<30, 2<<30
+	join := `SELECT count(*) FROM lineitem JOIN orders ON o_orderkey = l_orderkey + 0`
+	if _, err := co.Plan(t.Context(), join, harnessEnv{h}, ModeOn); err != nil {
+		t.Errorf("a table of 2 GiB for workers of 32 GiB, while they are stopped: %v", err)
 	}
 }
 

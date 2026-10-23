@@ -269,19 +269,19 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, unsupported("no workers are running, and only admins may start them at will")
 	case len(ws) > 0:
 		opts.minBytes = rate * warmSeconds
-		mem := int64(0)
-		for _, w := range ws {
-			if m := w.status.MemoryBytes; m > 0 && (mem == 0 || m < mem) {
-				mem = m
-			}
-		}
-		if mem > 0 {
+		if mem := smallestMemory(ws); mem > 0 {
 			// Data files are compressed several times over, and hash tables
 			// take more room than the values they hold.
 			opts.maxBroadcast = mem / 8
 		}
 	case co.pool.canStart():
 		opts.minBytes = rate*coldSeconds + int64(co.pool.startEstimate().Seconds())*rate
+		// The workers it would start are those that ran before: a table
+		// of 1.8 GB that workers of 24 GiB read in full would otherwise be
+		// held to defaultBroadcast while they are stopped.
+		if mem := co.pool.lastMemory(); mem > 0 {
+			opts.maxBroadcast = mem / 8
+		}
 	default:
 		return nil, unsupported("no workers are running")
 	}

@@ -384,6 +384,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   run distributed without waiting for maintenance: workers apply the
   position delete files those write, and the equality delete files and
   deletion vectors of other engines.
+- While workers are stopped, a statement that would start them may have
+  them read a table in full as large as the memory of the workers that ran
+  last allows, rather than 1 GiB: a report at 100x that joins a 1.8 GB
+  table on an expression, which it cannot partition, ran on the replica
+  when forced on stopped workers of 24 GiB.
 - Reports whose `min(x) OVER ()` the replica rewrites as a scalar
   subquery over the same rows run distributed again: a scalar subquery
   that stands on its own in the select list of a step that groups nothing
