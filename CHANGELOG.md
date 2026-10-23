@@ -374,6 +374,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   run distributed without waiting for maintenance: workers apply the
   position delete files those write, and the equality delete files and
   deletion vectors of other engines.
+- A subquery that workers compute as a relation, as when a report joins a
+  view of a wide table to itself, writes only the columns its reader
+  reads to the exchange. A report whose 16 branches each read three
+  columns of a 420-column view wrote every column, 159 GB, and ran past
+  its hour on four workers.
 - A statement's rows no longer wait for its exchanges to be deleted: the
   coordinator removes them in the background, with one listing of the
   statement's files and 32 deletes at a time, where it listed each of

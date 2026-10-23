@@ -536,3 +536,32 @@ func TestSmallRelation(t *testing.T) {
 		})
 	}
 }
+
+// TestRelationColumns checks that a subquery read as a relation, as the
+// branches of a report read a view of a wide table joined on its key,
+// writes only the columns its reader reads, and returns what one machine
+// does.
+func TestRelationColumns(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	h.co.maxBroadcast = 1
+	q := `WITH g AS (SELECT l_orderkey FROM lineitem)
+		SELECT x.f, count(*) FROM (
+			SELECT a.l_orderkey AS k, a.l_returnflag AS f FROM (SELECT * FROM (SELECT * FROM lineitem) AS l) AS a JOIN g ON g.l_orderkey = a.l_orderkey
+			UNION ALL
+			SELECT a.l_orderkey, a.l_linestatus FROM (SELECT * FROM (SELECT * FROM lineitem) AS l) AS a JOIN g ON g.l_orderkey = a.l_orderkey
+		) AS x GROUP BY 1 ORDER BY 1`
+	if !h.check(q) {
+		t.Fatal("did not run distributed")
+	}
+	p := h.planOf(q)
+	var written []string
+	for _, s := range p.Stages {
+		if s.Out != nil && s.split() != nil && strings.Contains(s.SQL, "AS l(") {
+			written = append(written, s.SQL[:strings.Index(s.SQL, " FROM ")])
+		}
+	}
+	slices.Sort(written)
+	if want := []string{"SELECT l_orderkey, l_linestatus", "SELECT l_orderkey, l_returnflag"}; !slices.Equal(written, want) {
+		t.Errorf("the relations' stages write %q, want %q:\n%s", written, want, p.describe())
+	}
+}

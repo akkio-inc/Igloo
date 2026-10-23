@@ -662,6 +662,7 @@ func unmark(c *candidate) {
 	for _, r := range c.rels {
 		delete(r.ref, viewMark)
 		delete(r.ref, viewQuery)
+		delete(r.ref, viewColumns)
 	}
 }
 
@@ -1577,6 +1578,10 @@ type jobBuild struct {
 const (
 	viewMark  = "__igloo_view"
 	viewQuery = "__igloo_view_query"
+	// viewColumns, on a subquery read as a view, replaces its column
+	// aliases: its relation's stages wrote only some of its columns, named
+	// as the candidate reads them (see asRelation).
+	viewColumns = "__igloo_view_columns"
 )
 
 // views names the views a job's fragment reads its inputs as, and marks
@@ -1645,9 +1650,13 @@ func pointAtViews(fragment node) {
 			if alias == "" {
 				alias = v
 			}
+			aliases := n["column_name_alias"]
+			if cols, ok := n[viewColumns]; ok {
+				aliases = cols
+			}
 			return node{
 				"type": "BASE_TABLE", "alias": alias, "sample": nil, "query_location": json.Number(queryLocationNone), "schema_name": "",
-				"table_name": v, "column_name_alias": n["column_name_alias"], "catalog_name": "", "at_clause": nil,
+				"table_name": v, "column_name_alias": aliases, "catalog_name": "", "at_clause": nil,
 			}, true
 		}
 		if str(n["alias"]) == "" {
@@ -1665,6 +1674,7 @@ func unmarked(v any) any {
 	walk(c, func(n node) bool {
 		delete(n, viewMark)
 		delete(n, viewQuery)
+		delete(n, viewColumns)
 		return true
 	})
 	return c

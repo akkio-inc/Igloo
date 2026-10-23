@@ -100,10 +100,6 @@ func (pl *planner) asRelation(c *candidate, sc *scope) error {
 	if err != nil {
 		return err
 	}
-	bytes, err := pl.estimate(q, c.ctes)
-	if err != nil {
-		return err
-	}
 	// The tables it reads, in its FROM or WHERE, are read by its stages.
 	c.uses = slices.DeleteFunc(c.uses, func(u *tableUse) bool { return contains(q, u.ref) })
 	sc.item.columns = nil
@@ -111,9 +107,103 @@ func (pl *planner) asRelation(c *candidate, sc *scope) error {
 		sc.item.columns = append(sc.item.columns, strings.ToLower(col.Name))
 	}
 	renameColumns(sc.item, list(sc.ref, "column_name_alias"))
+	// Its stages write only the columns the candidate reads: a view of a
+	// wide table, joined in each of a report's 16 branches on one key and
+	// read for three columns, was written whole, 420 columns of 400
+	// million rows a branch.
+	if used := usedColumns(c, sc); used != nil && len(used) < len(sc.item.columns) {
+		pq, err := pl.projectRelation(q, sc.item.columns, used)
+		if err != nil {
+			return err
+		}
+		if pcols, err := pl.relationColumns(pq, c.ctes, nil); err == nil {
+			q, cols, sc.item.columns = pq, pcols, used
+			// The view's columns are named as the candidate reads them.
+			sc.ref[viewColumns] = []any{}
+		}
+	}
+	bytes, err := pl.estimate(q, c.ctes)
+	if err != nil {
+		return err
+	}
 	c.rels = append(c.rels, &relUse{ref: sc.ref, q: q, scope: c.ctes, columns: cols, bytes: bytes, splittable: sc.splittable,
 		sc: c.scope, item: sc.item})
 	return nil
+}
+
+// usedColumns returns the columns of sc's item, a subquery in c's FROM
+// clause, that c refers to, in the item's order, or nil when c may refer
+// to all of them: through a star, or a natural join. A name another item
+// may own as well counts, and so does a name in a subquery of c, which may
+// be correlated. A candidate that refers to none, as count(*) does, still
+// reads one.
+func usedColumns(c *candidate, sc *scope) []string {
+	item := sc.item
+	used := map[string]bool{}
+	all := false
+	walk(c.sel, func(m node) bool {
+		if all || identity(m) == identity(sc.ref) {
+			// The subquery's own names are its own.
+			return false
+		}
+		switch str(m["class"]) {
+		case "STAR":
+			if r := strings.ToLower(str(m["relation_name"])); r == "" || r == item.name {
+				all = true
+			}
+		case "COLUMN_REF":
+			names := list(m, "column_names")
+			if len(names) == 0 {
+				break
+			}
+			first := strings.ToLower(str(names[0]))
+			if len(names) > 1 && first == item.name {
+				used[strings.ToLower(str(names[1]))] = true
+			} else if slices.Contains(item.columns, first) {
+				used[first] = true
+			}
+		}
+		if str(m["type"]) == "JOIN" {
+			if str(m["ref_type"]) == "NATURAL" {
+				all = true
+			}
+			for _, u := range list(m, "using_columns") {
+				used[strings.ToLower(str(u))] = true
+			}
+		}
+		return !all
+	})
+	if all {
+		return nil
+	}
+	var out []string
+	for _, col := range item.columns {
+		if used[col] && !slices.Contains(out, col) {
+			out = append(out, col)
+		}
+	}
+	if len(out) == 0 && len(item.columns) > 0 {
+		out = item.columns[:1]
+	}
+	return out
+}
+
+// projectRelation returns a query of q's rows, whose columns are named all,
+// with only those of them named used.
+func (pl *planner) projectRelation(q node, all, used []string) (node, error) {
+	quote := func(names []string) string {
+		quoted := make([]string, len(names))
+		for i, n := range names {
+			quoted[i] = quoteIdent(n)
+		}
+		return strings.Join(quoted, ", ")
+	}
+	pq, err := pl.p.parse("SELECT " + quote(used) + " FROM (SELECT 1) AS __igloo_r(" + quote(all) + ")")
+	if err != nil {
+		return nil, err
+	}
+	child(child(pq, "from_table"), "subquery")["node"] = q
+	return pq, nil
 }
 
 // contains reports whether n is a node of tree v.

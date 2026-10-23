@@ -294,6 +294,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	} else if s.partitioned() {
 		tasks = e.parts
 	}
+	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks)
 
 	// What every task reads in full.
 	whole := map[string]viewDef{}

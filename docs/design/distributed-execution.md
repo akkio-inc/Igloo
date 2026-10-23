@@ -650,7 +650,11 @@ as a relation that workers compute (`internal/distributed/relation.go`):
   counts add up or groups are whole in each partition. A subquery that
   only filters a large table but must be partitioned is computed as a
   relation too (its rows keyed by the join key), as a report's browsing
-  events wrapped in `SELECT * REPLACE (...)` are.
+  events wrapped in `SELECT * REPLACE (...)` are. Its stages write only the
+  columns the part reads: a view of a wide table joined on its key in
+  each of a report's 16 branches, read for three columns, had been written
+  whole, 420 columns of 400 million rows a branch, 159 GB of exchanges
+  that left no task done within the hour.
 - **Writing a relation.** A `SELECT` is planned like any part (its own
   inputs split, broadcast or by partition) and its rows go to the
   exchange instead of the coordinator. Without grouping, its stage runs it
