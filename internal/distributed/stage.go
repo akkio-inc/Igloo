@@ -171,14 +171,16 @@ const (
 // of the largest, so that each task's hash tables (the distinct people of
 // a share of the cohorts, say) hold a share of the rows that fits a
 // worker's memory: a report's hash tables held several times its tables'
-// compressed bytes. The more partitions, the more files an exchange is: as
-// many as the tasks that write it times its partitions.
+// compressed bytes. But no more than eight times the workers: an exchange
+// is as many files as the tasks that write it times its partitions, and
+// what it holds is often far smaller than the table, as a filtered
+// audience is.
 func partitions(workers int, largest, per int64) int {
 	n := max(2, 2*workers)
 	if per > 0 {
 		n = max(n, int(min((largest+per-1)/per, maxPartitions)))
 	}
-	return min(n, maxPartitions)
+	return min(n, max(2, 8*workers), maxPartitions)
 }
 
 // execution runs one statement's stages.
@@ -211,9 +213,11 @@ type exchangeRun struct {
 	mu      sync.Mutex
 	columns []Column
 	files   [][]string
-	// rows counts the rows written, in all and by partition.
+	// rows counts the rows written, in all and by partition; tasks counts
+	// the tasks that wrote them.
 	rows     int64
 	partRows []int64
+	tasks    int
 }
 
 // jobResult is where a coordinator-bound stage's partial results are.
@@ -397,12 +401,30 @@ func (e *execution) describe() string {
 	return b.String()
 }
 
+// overfull describes the exchanges with more files than their tasks times
+// their partitions, which a task writes at most (see Worker.shuffle).
+func (e *execution) overfull() []string {
+	var out []string
+	for _, id := range slices.Sorted(maps.Keys(e.exchanges)) {
+		x := e.exchanges[id]
+		files := 0
+		for _, fs := range x.files {
+			files += len(fs)
+		}
+		if files > x.tasks*e.parts {
+			out = append(out, fmt.Sprintf("exchange %d: %d files from %d tasks of %d partitions", id, files, x.tasks, e.parts))
+		}
+	}
+	return out
+}
+
 // received records the files a task wrote to its stage's exchange.
 func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) error {
 	x := e.exchanges[s.Out.ID]
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.rows += head.Rows
+	x.tasks++
 	if x.columns == nil {
 		x.columns = head.Columns
 	} else if !slices.Equal(x.columns, head.Columns) {

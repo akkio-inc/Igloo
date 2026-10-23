@@ -488,9 +488,14 @@ warehouse, written with `COPY ... (PARTITION_BY (__b))`, where
 the same number of partitions, and hashes integer keys as `BIGINT`, so a
 stage can read several exchanges keyed on equal values partition by
 partition: twice the workers, or one for every 256 MiB of the largest
-table the statement divides if that is more, up to 256, so that a task's
-hash tables (the distinct people of a share of the cohorts) fit a
-worker's memory. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
+table the statement divides if that is more, up to eight times the
+workers (and 256), so that a task's hash tables (the distinct people of a
+share of the cohorts) fit a worker's memory. A task writes one file per
+partition: DuckDB keeps only 100 of a partitioned `COPY`'s files open and
+starts new ones past that, which at 256 partitions made a task write
+17,275 files of 24 KB for 23 minutes, so workers raise that limit; the
+coordinator warns of an exchange with more files than its tasks times its
+partitions. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
 `TIME WITH TIME ZONE`) cross exchanges as text and are cast back, as
 results do. The coordinator runs each stage once every exchange it reads
 is complete, and deletes the statement's directory when it ends.

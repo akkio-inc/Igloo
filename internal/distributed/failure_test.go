@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
@@ -192,6 +194,30 @@ func TestCancel(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the worker's task was not canceled")
+	}
+}
+
+// A task writes one file for each partition of its exchange, however many
+// partitions it has: past DuckDB's 100 open files, a partitioned COPY
+// closed files and started new ones, and a task wrote tens of thousands.
+func TestShuffleFiles(t *testing.T) {
+	h := newHarness(t, 0.01, 1, 1)
+	w := h.workers[0]
+	conn, err := w.opts.Engine.Connect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	const parts = 200
+	dir := filepath.Join(h.dir, "warehouse", config.ShuffleDir, "q", "s0", "0", "a0")
+	cols := []Column{{Name: "i", Type: "BIGINT"}, {Name: "s", Type: "VARCHAR"}, {Name: "__b", Type: "INTEGER"}}
+	res, err := w.shuffle(t.Context(), conn, dir,
+		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rows != 3000000 || len(res.Files) != parts {
+		t.Errorf("%d rows in %d files, want 3000000 in %d", res.Rows, len(res.Files), parts)
 	}
 }
 

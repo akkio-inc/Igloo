@@ -483,6 +483,14 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 			sel[i] = "CAST(" + quoteIdent(c.Name) + " AS " + t + ") AS " + quoteIdent(c.Name)
 		}
 	}
+	// DuckDB keeps 100 of a partitioned COPY's files open, and past that
+	// closes them and starts new ones: a task writing 256 partitions wrote
+	// 17,275 files of 24 KB, each a request to object storage, for 23
+	// minutes. With every partition's file open, a task writes one file a
+	// partition.
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_max_open_files = %d", 4*maxPartitions), nil); err != nil {
+		return nil, err
+	}
 	res, err := conn.ExecContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+quoteLiteral(dir)+
 		" (FORMAT parquet, PARTITION_BY (__b))", nil)
 	if err != nil {

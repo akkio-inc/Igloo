@@ -317,13 +317,15 @@ func TestInlinedRelations(t *testing.T) {
 }
 
 // TestPartitions checks how many partitions exchanges have: twice the
-// workers, more for larger divided tables, up to maxPartitions.
+// workers, more for larger divided tables, up to eight times the workers
+// and maxPartitions.
 func TestPartitions(t *testing.T) {
 	for _, c := range []struct {
 		workers      int
 		largest, per int64
 		want         int
-	}{{0, 0, 1 << 20, 2}, {4, 0, 1 << 20, 8}, {4, 10 << 20, 1 << 20, 10}, {4, 10<<20 + 1, 1 << 20, 11}, {16, 1 << 50, 1 << 20, maxPartitions}} {
+	}{{0, 0, 1 << 20, 2}, {4, 0, 1 << 20, 8}, {4, 10 << 20, 1 << 20, 10}, {4, 10<<20 + 1, 1 << 20, 11},
+		{4, 1 << 50, 1 << 20, 32}, {16, 1 << 50, 1 << 20, 128}, {40, 1 << 50, 1 << 20, maxPartitions}} {
 		if got := partitions(c.workers, c.largest, c.per); got != c.want {
 			t.Errorf("partitions(%d, %d, %d) = %d, want %d", c.workers, c.largest, c.per, got, c.want)
 		}

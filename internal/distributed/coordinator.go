@@ -462,6 +462,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	if ex.SQL, err = co.parser.print(final); err != nil {
 		return nil, err
 	}
+	for _, x := range run.overfull() {
+		co.log.Warn("an exchange has more files than its tasks times its partitions", "query", qid, "exchange", x)
+	}
 	ex.Workers = len(run.used)
 	ex.Stages, ex.Exchanges = len(plan.Stages), len(run.exchanges)
 	ex.exchanges = run.describe()

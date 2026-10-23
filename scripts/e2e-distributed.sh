@@ -455,6 +455,12 @@ if compose logs --no-color igloo | grep -q "could not remove exchanged rows"; th
 else
   pass "statements removed what they exchanged"
 fi
+# A task writes at most one file per partition of an exchange.
+if compose logs --no-color igloo | grep -q "more files than its tasks times its partitions"; then
+  fail "an exchange had too many files: $(compose logs --no-color igloo | grep -m1 "more files than its tasks times its partitions")"
+else
+  pass "every exchange held at most a file per task and partition"
+fi
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
