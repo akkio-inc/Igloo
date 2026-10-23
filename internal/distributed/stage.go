@@ -291,8 +291,11 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		n = max(1, min(n, len(split)))
 		shares = assign(split, e.ws[:n])
 		tasks = len(shares)
-	} else if s.partitioned() {
-		tasks = e.parts
+	}
+	var groups [][]int
+	if s.partitioned() {
+		groups = e.groups(s)
+		tasks = len(groups)
 	}
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks)
 
@@ -334,8 +337,12 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 					Deletes: deletesOf(share)})
 			case in.Exchange != nil && in.Partitioned:
 				x := e.exchanges[in.Exchange.ID]
-				task.Views = append(task.Views, viewDef{Name: in.View, Columns: x.columns, Files: x.files[i], ByName: true,
-					Rows: x.partRows[i], Exact: true})
+				def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Exact: true}
+				for _, p := range groups[i] {
+					def.Files = append(def.Files, x.files[p]...)
+					def.Rows += x.partRows[p]
+				}
+				task.Views = append(task.Views, def)
 			default:
 				task.Views = append(task.Views, whole[in.View])
 			}

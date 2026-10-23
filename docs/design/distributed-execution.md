@@ -505,8 +505,9 @@ if added.
 
 A plan is a list of stages (`internal/distributed/stage.go`). A stage is
 a set of tasks that run one fragment each, over a share of the data files
-of its split table, over one partition of the exchanges it reads, or, with
-neither, once; and every task reads in full whatever else the stage reads.
+of its split table, over some of the partitions of the exchanges it reads,
+or, with neither, once; and every task reads in full whatever else the
+stage reads.
 Its rows go to the coordinator, as partial results that the statement's
 final query reads, or to an exchange: Parquet files under
 `_igloo_shuffle/<statement>/s<stage>/<task>/a<attempt>/__b=<p>/` in the
@@ -554,6 +555,27 @@ partition on every worker, otherwise spill or run out of memory: three
 2-thread workers of 500 MB running a cohort report spilled 1.9 GB each
 with every task at once, 0.9 GB one at a time, and nothing one at a time
 with four times the partitions.
+
+The partitions a statement's exchanges have suit its largest table, so a
+stage that reads small exchanges by partition would run a task for a few
+thousand rows, and read every table it reads in full once per task: a
+report's fourteen stages over an audience of 189,000 rows each ran 32
+tasks and read 80 GB of tables to join 6,000 rows a task. When a stage
+starts, the exchanges it reads are complete and their partitions' rows
+known (`internal/distributed/coalesce.go`), so each of its tasks reads as
+many partitions as fit in half of a task's share of a worker's memory
+limit (its limit over the tasks it runs at once), at the memory a row takes
+in the hash tables that join or aggregate it: twice the row's width by its
+columns' types, and 64 bytes. Every worker still gets a task, and a
+partition is never split; exchanges hash keys alike, so a task that reads
+several partitions of every input still finds every match of its rows.
+Compressed sizes would not do: an exchange of 4.4 million person IDs took
+25 MB, 6 bytes a row, and the hash tables counting them distinct took
+several hundred bytes a row, so tasks grouped by bytes spilled four times
+as much, and ran out of memory with two at a time. Grouped by rows, the
+same cohort report spills as it did ungrouped (nothing with one task at a
+time, about 100 MB a worker with two), its small stages running 3 to 8
+tasks instead of 24 while its large joins keep a task a partition.
 
 ## Partitioned joins
 

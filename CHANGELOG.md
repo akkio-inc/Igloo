@@ -309,6 +309,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   an aggregation (`SELECT ... FROM (SELECT ... FROM a JOIN b ON ...) AS x
   GROUP BY ...`) is partitioned where it is, and aggregated where its rows
   are made.
+  A stage that reads small exchanges by partition runs fewer tasks, each
+  over several partitions, as many as fit in a task's share of a worker's
+  memory at the memory their rows take in hash tables (by their columns'
+  types, at least 64 bytes a row), and at least one a worker: a report's
+  stages that joined an audience of 189,000 rows to tables every task read
+  in full ran 32 tasks each, and read those tables 448 times.
 - Workers start on demand and stop when idle: on Kubernetes the chart's
   `workers.enabled` adds a worker Deployment that Igloo scales between zero
   and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`

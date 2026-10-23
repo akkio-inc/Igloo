@@ -134,10 +134,13 @@ func (e *taskErr) Error() string { return e.Message }
 type workerStatus struct {
 	// ID names the worker; it decides which files the worker is given, so
 	// the same files go to the same worker and its read cache.
-	ID          string  `json:"id"`
-	Version     string  `json:"version"`
-	Cores       int     `json:"cores"`
-	MemoryBytes int64   `json:"memory_bytes"`
+	ID          string `json:"id"`
+	Version     string `json:"version"`
+	Cores       int    `json:"cores"`
+	MemoryBytes int64  `json:"memory_bytes"`
+	// Slots are the tasks it runs at once (see taskSlots), which share its
+	// memory; zero from a worker that does not say.
+	Slots       int     `json:"slots,omitempty"`
 	Running     int     `json:"running"`
 	IdleSeconds float64 `json:"idle_seconds"`
 }

@@ -151,7 +151,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
-		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes,
+		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Slots: cap(w.slots),
 		Running: int(running), IdleSeconds: idle.Seconds(),
 	})
 }
