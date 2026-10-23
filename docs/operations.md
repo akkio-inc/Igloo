@@ -245,8 +245,16 @@ using all of its cores.
   `USING SAMPLE 1000000 ROWS`, of a wide table can take many times the
   limit). So Igloo watches what it can still allocate, five times a
   second: what the container's memory limit leaves of its working set, and
-  the machine's available memory. When that falls below a sixteenth of
-  Igloo's memory (at least 256 MiB), Igloo cancels the statement that has
+  the machine's available memory. When that falls below an eighth of
+  Igloo's memory (at least 512 MiB), Igloo first lowers DuckDB's memory
+  limit, down to half of `IGLOO_MEMORY_LIMIT` at most, so that DuckDB
+  writes buffers to its spill files and gives their memory back: under
+  heavy work DuckDB keeps its tracked memory at its limit and uses more
+  besides, 8 GiB more for one statement on a 61 GiB machine. It raises the
+  limit back a step at a time once memory has stayed plentiful for 30
+  seconds, and logs `memory is running low; lowered DuckDB's memory limit
+  so that it spills` when it starts. Should memory still fall below a
+  sixteenth of Igloo's memory (at least 256 MiB), Igloo cancels the statement that has
   run longest, which fails with SQLSTATE `53200` (`out_of_memory`), rather
   than let the kernel kill the process and every session with it. It logs
   `memory is running out; canceled the statement that had run longest`

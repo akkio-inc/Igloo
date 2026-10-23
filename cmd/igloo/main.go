@@ -428,9 +428,13 @@ func serve() error {
 	// Some of DuckDB's work ignores its memory limit; rather than let the
 	// kernel kill the process, cancel the statement that has run longest
 	// when memory runs low (see memlimit.Watch).
+	// Before that, DuckDB's memory limit gives way to the memory DuckDB
+	// uses besides (see memlimit.Adapt).
 	if memory.Total > 0 {
 		go memlimit.Watch(ctx, memory.Total, srv.ShedMemory)
-		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(memory.Total)))
+		go memlimit.Adapt(ctx, memory.Total, memory.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) }, log)
+		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(memory.Total)),
+			"spills_more_below", memlimit.Format(memlimit.High(memory.Total)))
 	}
 	if shares != nil {
 		// Tables with masking or row access policies are neither shared

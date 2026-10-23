@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -141,6 +142,19 @@ type oneConn struct{ conn *duckdb.Conn }
 
 func (c oneConn) Connect(context.Context) (driver.Conn, error) { return c.conn, nil }
 func (c oneConn) Driver() driver.Driver                        { return &duckdb.Driver{} }
+
+// SetMemoryLimit changes DuckDB's memory limit to n bytes, which it then
+// keeps by writing buffers to its spill files (see memlimit.Adapt). It
+// fails if DuckDB cannot free enough memory for the new limit.
+func (e *Engine) SetMemoryLimit(ctx context.Context, n int64) error {
+	c, err := e.connector.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close() //nolint:errcheck
+	_, err = c.(*duckdb.Conn).ExecContext(ctx, fmt.Sprintf("SET GLOBAL memory_limit = '%dMiB'", n>>20), nil)
+	return err
+}
 
 // MemoryLimit is the query memory DuckDB has, in bytes: its memory_limit,
 // IGLOO_DUCKDB_MEMORY_LIMIT or 80% of the machine's memory. It is zero if

@@ -145,8 +145,19 @@ func TestMeter(t *testing.T) {
 	if meter.Last("SELECT * FROM no_such_table") != nil {
 		t.Error("a failed statement was measured")
 	}
-	if e.MemoryLimit(ctx) <= 0 {
+	limit := e.MemoryLimit(ctx)
+	if limit <= 0 {
 		t.Error("no memory limit")
+	}
+	// Changed after lockdown, as memlimit.Adapt does, and back.
+	if err := e.SetMemoryLimit(ctx, 3<<30); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.MemoryLimit(ctx); got != 3<<30 {
+		t.Errorf("memory limit %d after setting 3 GiB", got)
+	}
+	if err := e.SetMemoryLimit(ctx, limit); err != nil {
+		t.Fatal(err)
 	}
 	if err := meter.Close(); err != nil {
 		t.Fatal(err)

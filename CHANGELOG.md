@@ -822,9 +822,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   compaction caught up at 8 GB a table an hour. Igloo now sets the property
   when it creates a table, unless the statement did. See
   [operations](docs/operations.md#table-maintenance).
-- When Igloo is about to run out of memory, it cancels the statement that
-  has run longest (SQLSTATE `53200`) instead of being killed by the kernel
-  with every session. DuckDB keeps to its memory limit only for the memory
+- When memory runs low, Igloo lowers DuckDB's memory limit, so that DuckDB
+  spills more and gives memory back, and raises it again once memory has
+  stayed plentiful: under heavy work DuckDB keeps the memory it tracks at
+  its limit and uses more besides, 8 GiB more for one statement over ten
+  times the data on a 61 GiB machine. If memory still runs out, Igloo
+  cancels the statement that has run longest (SQLSTATE `53200`) instead of
+  being killed by the kernel with every session. DuckDB keeps to its memory limit only for the memory
   its buffer manager tracks: a reservoir sample of 600,000 rows of 60 text
   columns took 7.8 GB under a 500 MB limit, and one of a million rows of a
   384-column table took a replica down on a 32 GB machine. See
