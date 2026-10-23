@@ -216,10 +216,11 @@ type exchangeRun struct {
 	mu      sync.Mutex
 	columns []Column
 	files   [][]string
-	// rows counts the rows written, in all and by partition; tasks counts
-	// the tasks that wrote them.
+	// rows counts the rows written, in all and by partition, and bytes
+	// the bytes of their files; tasks counts the tasks that wrote them.
 	rows     int64
 	partRows []int64
+	bytes    int64
 	tasks    int
 }
 
@@ -454,6 +455,7 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult) erro
 		}
 		x.files[f.Partition] = append(x.files[f.Partition], f.Path)
 		x.partRows[f.Partition] += f.Rows
+		x.bytes += f.Size
 		listed += f.Rows
 	}
 	if listed != head.Rows {

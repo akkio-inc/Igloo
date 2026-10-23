@@ -32,6 +32,12 @@ func TestChoose(t *testing.T) {
 		{"no workers to run on", none, runs{}, false, false, false},
 		{"faster on workers before", close, runs{local: 300, dist: 100}, true, true, false},
 		{"faster on one machine before", slow, runs{local: 100, dist: 300}, true, false, false},
+		{"faster on one machine than on a quarter of the workers: try them all once", estimate{oneMachine: 100, onWorkers: 60, workers: 13},
+			runs{local: 178, dist: 230, distWorkers: 4}, true, true, true},
+		{"faster on one machine than on a quarter of the workers, tried today", estimate{oneMachine: 100, onWorkers: 60, workers: 13},
+			runs{local: 178, dist: 230, distWorkers: 4, explored: now.Add(-time.Hour)}, true, false, false},
+		{"faster on one machine than on as many workers", estimate{oneMachine: 100, onWorkers: 60, workers: 13},
+			runs{local: 178, dist: 230, distWorkers: 12}, true, false, false},
 		{"ran on one machine within the threshold", slow, runs{local: 30}, true, false, false},
 		{"ran on one machine for minutes: try workers once", slow, runs{local: 250}, true, true, true},
 		{"ran on one machine, tried workers today, well within its estimate", slow, runs{local: 250, explored: now.Add(-time.Hour)}, true, false, false},
@@ -256,14 +262,24 @@ func TestPlanKey(t *testing.T) {
 // as the earlier ones, and the keys used longest ago go first.
 func TestHistory(t *testing.T) {
 	h := newHistory()
-	h.observe("a", false, 100)
-	h.observe("a", false, 50)
-	h.observe("a", true, 30)
-	if r, ok := h.get("a"); !ok || r.local != 75 || r.dist != 30 {
+	h.observe("a", 0, 100)
+	h.observe("a", 0, 50)
+	h.observe("a", 4, 30)
+	if r, ok := h.get("a"); !ok || r.local != 75 || r.dist != 30 || r.distWorkers != 4 {
 		t.Errorf("runs of a: %+v", r)
 	}
+	// On about as many workers, runs average; on four times as many, the
+	// last stands alone.
+	h.observe("a", 5, 20)
+	if r, _ := h.get("a"); r.dist != 25 || r.distWorkers != 5 {
+		t.Errorf("on 5 workers: %+v", r)
+	}
+	h.observe("a", 16, 8)
+	if r, _ := h.get("a"); r.dist != 8 || r.distWorkers != 16 {
+		t.Errorf("on 16 workers: %+v", r)
+	}
 	for i := range maxHistory {
-		h.observe(fmt.Sprint("k", i), false, 1)
+		h.observe(fmt.Sprint("k", i), 0, 1)
 	}
 	if _, ok := h.get("a"); ok {
 		t.Error("kept the key used longest ago")

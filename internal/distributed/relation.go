@@ -165,6 +165,12 @@ type relUse struct {
 	query bool
 	// semi is as for tables.
 	semi bool
+	// key identifies the relation across plans of the statement (see
+	// relationKey); known says its size was measured.
+	key   string
+	known bool
+	// out is the exchange its rows are written to, once planned.
+	out *Exchange
 }
 
 // identity is a node's identity, for sets of nodes.
@@ -527,6 +533,8 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 	if err != nil {
 		return err
 	}
+	key := pl.relationKey(q, qscope)
+	bytes, known := pl.measured(key, bytes, cols)
 	item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
 	if item.name == "" && def != nil {
 		item.name = def.key
@@ -537,7 +545,7 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 	renameColumns(item, list(ref, "column_name_alias"))
 	sc.items = append(sc.items, item)
 	rd.rels = append(rd.rels, &relUse{ref: ref, q: q, scope: qscope, def: def, columns: cols, bytes: bytes,
-		splittable: splittable, sc: sc, item: item})
+		splittable: splittable, sc: sc, item: item, key: key, known: known})
 	return nil
 }
 
@@ -646,6 +654,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00")
 	if d := r.def; d != nil {
 		if x := d.outs[sig]; x != nil {
+			r.out = x
 			return x, nil
 		}
 		if d.first != nil && len(d.first.Keys) > 0 {
@@ -658,6 +667,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 			}
 			pl.stage(&Stage{fragment: f, Inputs: []Input{{View: "__igloo_r", Exchange: d.first, Partitioned: true}}, Out: x})
 			pl.remember(d, sig, x)
+			pl.relationOut(r, x)
 			return x, nil
 		}
 	}
@@ -668,7 +678,19 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 	if r.def != nil {
 		pl.remember(r.def, sig, x)
 	}
+	pl.relationOut(r, x)
 	return x, nil
+}
+
+// relationOut records that x holds the rows of relation r.
+func (pl *planner) relationOut(r *relUse, x *Exchange) {
+	if r.key != "" {
+		if pl.relKeys == nil {
+			pl.relKeys = map[*Exchange]string{}
+		}
+		pl.relKeys[x] = r.key
+	}
+	r.out = x
 }
 
 // produce plans the stages that write the rows of query node q, as scope
@@ -1149,6 +1171,11 @@ func (pl *planner) restore(sp savepoint) {
 	}
 	pl.expanded = sp.expanded
 	pl.uncertain = pl.uncertain[:sp.uncertain]
+	for x := range pl.relKeys {
+		if x.ID >= sp.exchanges {
+			delete(pl.relKeys, x)
+		}
+	}
 }
 
 // remember records that a common table expression's rows are written to x.

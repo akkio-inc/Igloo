@@ -597,6 +597,42 @@ same cohort report spills as it did ungrouped (nothing with one task at a
 time, about 100 MB a worker with two), its small stages running 3 to 8
 tasks instead of 24 while its large joins keep a task a partition.
 
+## Relations of uncertain size
+
+A relation is estimated at the size of the tables it reads, which a filter
+on a constant may cut a thousandfold: an audience, the members of one
+version of one audience in a lookup of all of them, is estimated at the
+lookup's 757 GB and holds a couple of million IDs. Estimated larger than
+every worker may read, it is partitioned, and so is every large table
+joined to it; at a hundred times the data, a report partitioned 465 GB of
+tables to meet its audience and took 925 s on 16 workers, where one
+machine filters each table by the audience as it reads it
+(`internal/distributed/probe.go`).
+
+The planner records such relations: those a stage reads by partition, with
+other large inputs partitioned to meet them, whose query or a common table
+expression it reads compares a column to a constant or to a subquery's
+value, with `=` or `IN`. A plan with any runs the stages that write them
+first (all the writers of each exchange they read, and no others), and is
+planned again with their sizes, each relation known by its query with the
+common table expressions it reads, as SQL. A relation whose bytes are
+within what every worker may read, and whose rows, at the memory a row
+takes in a hash table, fit half of a task's share of a worker's memory, is
+read whole by the tasks that read the tables' shares, which are then not
+partitioned. The new plan runs in an execution of its own, which reads what
+the first stages wrote of each relation it reads whole, or partitioned
+alike. A plan that comes out the same goes on in the first execution, so
+that measuring costs only the wait for the relations' stages before the
+rest start, about the time the relation's stages take: on a cohort report
+that kept its relations partitioned, about half a second of 5 s with two
+tasks at a time (medians of 4.9 s and 5.45 s), none with one. The coordinator remembers how each relation
+came out, by key: one read by partition all the same is planned as such,
+without the wait, for a day, while the tables it reads stay within a factor
+of two of their size then, so that a report run again pays for measuring
+once a day; one read whole is measured every time, as its readers wait for
+it anyway. `EXPLAIN DISTRIBUTED` lists the relations, and the coordinator
+logs how each came out.
+
 ## Partitioned joins
 
 When the tables a part reads besides the split table are too large for

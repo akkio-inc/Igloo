@@ -154,8 +154,13 @@ type Plan struct {
 	// out of memory there before.
 	shortOfMemory bool
 	// uncertain are relations of uncertain size its stages read by
-	// partition, with large tables partitioned to meet them.
+	// partition, with large tables partitioned to meet them; relKeys are
+	// the keys of the relations its exchanges hold, by exchange ID.
 	uncertain []uncertain
+	relKeys   map[int]string
+	// replan plans the statement again with the sizes of relations
+	// measured, as probing them does (see Execute).
+	replan func(sizes map[string]knownSize) (*Plan, error)
 }
 
 // ShortOfMemory reports whether the statement would not fit in the
@@ -205,6 +210,14 @@ type planOptions struct {
 	// aggregation, if set, overrides how aggregations complete their groups
 	// where there is a choice (aggGather or aggByGroup), for tests.
 	aggregation string
+	// sizes are the sizes of relations measured before (see probe.go), by
+	// relation key; taskMemory is what a worker's task may plan on, to
+	// check that a measured relation every task reads fits it.
+	sizes      map[string]knownSize
+	taskMemory int64
+	// large are relations measured large lately, by key, with what they
+	// were estimated at then (see outcomes).
+	large map[string]outcome
 }
 
 // planner plans one statement.
@@ -256,6 +269,8 @@ type planner struct {
 	// uncertain are the relations of uncertain size that stages read by
 	// partition, with other large inputs partitioned to meet them.
 	uncertain []uncertain
+	// relKeys are the keys of the relations exchanges hold, by exchange.
+	relKeys map[*Exchange]string
 }
 
 type tableResult struct {
@@ -309,7 +324,11 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: pl.uncertain}, nil
+	keys := map[int]string{}
+	for x, k := range pl.relKeys {
+		keys[x.ID] = k
+	}
+	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: pl.uncertain, relKeys: keys}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that

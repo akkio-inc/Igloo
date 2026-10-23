@@ -236,20 +236,31 @@ One that ran only one way, in under ten minutes, is tried once the other
 way, at most once a day, whatever the estimates say, so that runs come to
 be compared with runs; past that, one that ran only on the replica, well
 within its estimate, stays there, and one that ran only on workers stays
-there if it beat its estimates. The server logs each choice, `chose where a statement
+there if it beat its estimates. Runs on workers count with runs on about
+as many: one that ran on a quarter of the workers it would run on now, as
+in an earlier session on a smaller fleet, is tried on all of them, at most
+once a day, whatever it took on the replica. The server logs each choice, `chose where a statement
 runs`, with both estimates and the reason.
 
-A statement whose parts would partition large tables to join them to a
-relation whose size Igloo cannot estimate stays on the replica, unless it
-ran faster on workers before or ran out of memory on the replica: a
-relation filtered by a constant, a subquery's value or `IN`, as an audience
-taken from a lookup of every audience is, is estimated at the size of the
-table it filters, though it may hold a thousandth of it. Distributed, every
-table joined to it is partitioned through object storage (465 GB for one
-report at a hundred times the data, in 925 s); the replica filters each
-table by the audience as it reads it (17 s at ten times the data, where 16
-workers took 517 s). `EXPLAIN DISTRIBUTED` lists such relations as
-`uncertain size`.
+A relation filtered by a constant, a subquery's value or `IN`, as an
+audience taken from a lookup of every audience is, is estimated at the size
+of the table it filters, though it may hold a thousandth of it. Estimated
+larger than every worker may read, it would be partitioned, and so would
+every large table joined to it: 465 GB of tables for one report at a
+hundred times the data, in 925 s, where the replica filters each table by
+the audience as it reads it. So workers write and measure such a relation
+first, before they partition anything to meet it, and the statement is
+planned again with its size: a relation every task can hold (in bytes, and
+at the memory its rows take in a hash table, within half of a task's share
+of a worker's memory) is read whole beside each table's shares, and the
+tables are not partitioned at all; a larger one is read by partition as
+planned, from what was written of it. A relation that came out too large
+is planned as such, without measuring it first, for a day, while the
+tables it reads stay within a factor of two of their size then; one that
+came out small is measured each time, as the tasks that read it whole wait
+for it anyway. `EXPLAIN DISTRIBUTED` lists such relations as `uncertain
+size`, and the server logs how each came out (`measured relations of
+uncertain size`).
 
 A statement that auto mode ran on the replica and that runs out of memory
 there (DuckDB's out-of-memory error, or the replica's memory watch

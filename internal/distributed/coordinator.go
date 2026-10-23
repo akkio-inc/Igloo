@@ -130,6 +130,8 @@ type Coordinator struct {
 	background sync.WaitGroup
 	// history is what statements took before, for auto mode (see choose).
 	history *history
+	// outcomes are how relations of uncertain size came out (see probe.go).
+	outcomes *outcomes
 
 	// running are the statements whose exchanges are in use, by ID, which
 	// sweeps leave (see hold); heartbeat is how often they write under
@@ -193,7 +195,7 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 	removeCtx, cancelRemovals := context.WithCancel(context.Background())
 	co := &Coordinator{
 		opts: opts, parser: p, aggs: aggs, dir: dir, log: log, stop: stop,
-		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log), history: newHistory(),
+		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log), history: newHistory(), outcomes: &outcomes{byKey: map[string]outcome{}},
 		running: map[string]bool{}, heartbeat: heartbeatEvery, removeCtx: removeCtx, cancelRemovals: cancelRemovals,
 	}
 	co.background.Go(func() { co.pool.run(ctx) })
@@ -258,7 +260,7 @@ func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.rea
 // last background check, and tables' sizes may be a few seconds old.
 // Execute reads the tables' current snapshots.
 func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode) (*Plan, error) {
-	plan, d, err := co.plan(ctx, query, env, mode, false)
+	plan, d, err := co.plan(ctx, query, env, mode, false, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -279,8 +281,9 @@ type decision struct {
 
 // plan plans query as Plan does, and says where it runs: on workers unless
 // auto mode chooses one machine. A dry run, as EXPLAIN DISTRIBUTED's,
-// leaves the history and the log alone.
-func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mode, dry bool) (*Plan, *decision, error) {
+// leaves the history and the log alone. sizes are relations' sizes
+// measured before (see Execute).
+func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mode, dry bool, sizes map[string]knownSize) (*Plan, *decision, error) {
 	if mode == ModeOff {
 		return nil, nil, unsupported("distributed execution is off for this session")
 	}
@@ -312,6 +315,11 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		opts.maxBroadcast = co.maxBroadcast
 	}
 	opts.aggregation = co.aggregation
+	opts.sizes, opts.taskMemory = sizes, taskMemory(ws)
+	if sizes == nil {
+		// Relations measured large lately are planned as such at once.
+		opts.large = co.outcomes.large(time.Now())
+	}
 	stmt, err := co.parser.parse(query)
 	if err != nil {
 		if IsUnsupported(err) {
@@ -325,6 +333,15 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
 	plan.Key = planKey(stmt, plan.Stages)
+	plan.replan = func(sizes map[string]knownSize) (*Plan, error) {
+		// Planned as the statement was, whatever auto mode would choose
+		// now: it runs on workers already.
+		p, _, err := co.plan(ctx, query, env, mode, true, sizes)
+		if err == nil {
+			p.Key = plan.Key
+		}
+		return p, err
+	}
 	var cache int64
 	if co.opts.CacheBytes != nil {
 		cache = co.opts.CacheBytes()
@@ -340,7 +357,6 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	now := time.Now()
 	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
-	onWorkers, explore, reason = keepUncertainLocal(plan.uncertain, r, found, onWorkers, explore, reason)
 	d.onWorkers, d.reason = onWorkers, reason
 	if dry {
 		return plan, d, nil
@@ -384,6 +400,9 @@ type Execution struct {
 	// Stages is how many stages ran, and Exchanges how many exchanges they
 	// wrote, rows that later stages read.
 	Stages, Exchanges int
+	// Probes say what the relations of uncertain size measured, and how
+	// the statement read them (see runProbing).
+	Probes []string
 
 	dir string
 	// exchanges describes what the statement's exchanges held, for tests'
@@ -476,8 +495,15 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 
 	loaded := time.Since(start)
 	qid := filepath.Base(ex.dir)
+	var cleanups []func()
+	defer func() {
+		for _, f := range cleanups {
+			f()
+		}
+	}()
 	parts := exchangePartitions(plan.Stages, ws, len(ws))
 	var run *execution
+	planned := plan
 	for attempt := 0; ; attempt++ {
 		// Each attempt's tasks and exchanges are its own, so that what a
 		// canceled task of the last one still writes is not read.
@@ -485,22 +511,24 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		if attempt > 0 {
 			aqid += "-" + strconv.Itoa(attempt)
 		}
-		run = &execution{
-			co: co, qid: aqid, dir: ex.dir, ws: ws, files: files, settings: settings, force: plan.force,
-			sp: &spool{limit: limit}, parts: parts, smaller: attempt, root: shuffleRoot(co.opts.Warehouse, aqid),
-			exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
-		}
-		if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {
+		newRun := func(id string) *execution {
+			r := &execution{
+				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, force: planned.force,
+				sp: &spool{limit: limit}, parts: parts, smaller: attempt, root: shuffleRoot(co.opts.Warehouse, id),
+				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
+			}
 			// The exchanges are read only by the stages: once they have run,
 			// the statement's rows need not wait for their removal.
-			root := run.root
-			release := co.hold(aqid, root)
-			defer func() {
+			release := co.hold(id, r.root)
+			cleanups = append(cleanups, func() {
 				release()
-				co.removeLater(aqid, root)
-			}()
+				co.removeLater(id, r.root)
+			})
+			return r
 		}
-		err := run.run(ctx, plan.Stages)
+		var err error
+		ex.Probes = nil
+		run, plan, err = co.runProbing(ctx, planned, newRun(aqid), newRun, &ex.Probes)
 		if err == nil {
 			break
 		}
@@ -509,7 +537,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			// divided table halved, and half the memory to group
 			// partitions in (see groups).
 			next := min(2*parts, maxPartitions)
-			if most := writerPartitions(plan.Stages, ws); most > 0 {
+			if most := writerPartitions(planned.Stages, ws); most > 0 {
 				next = min(next, max(most, len(ws), parts))
 			}
 			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",

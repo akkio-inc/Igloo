@@ -334,12 +334,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   out of it before, fails at once, where it ran on the coordinator for half
   an hour at a hundred times the data and ran out of memory there too. Its
   workers stay up while it runs on the coordinator.
-- Auto mode keeps on the replica a statement whose parts would partition
-  large tables to join them to a relation of uncertain size, one filtered
-  by a constant, a subquery's value or `IN`, as an audience is, unless it
-  ran faster on workers or ran out of memory on the replica: an audience
-  report took 17 s on the replica and 517 s on 16 workers at ten times the
-  data.
+- A relation of uncertain size, one filtered by a constant, a subquery's
+  value or `IN`, as an audience is, is written and measured on workers
+  before any table is partitioned to meet it, and the statement is planned
+  again with its size: small enough for every task to hold, it is read
+  whole beside the tables' shares, and the tables are not partitioned; a
+  larger one is read by partition as planned, from what was written of it.
+  An audience report partitioned 465 GB of tables to meet its audience at
+  a hundred times the data, in 925 s on 16 workers. A relation that came
+  out large is planned as large, without measuring it first, for a day.
+- Auto mode's history counts runs on workers with runs on about as many
+  workers: a statement measured on a quarter of the workers it would run on
+  now, as in an earlier session on a smaller fleet, is tried on all of them
+  once a day. A report that took 230 s on 4 workers and 178 s on one
+  machine stayed there, though 16 workers took 84 s.
 - `EXPLAIN DISTRIBUTED <query>` says how a query would run without running
   it: where (workers or the replica) and why, auto mode's estimates, the
   partitions its exchanges would have, its stages with their SQL, what the

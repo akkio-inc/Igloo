@@ -138,8 +138,10 @@ func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
 	if err != nil {
 		return err
 	}
+	key := pl.relationKey(q, c.ctes)
+	bytes, known := pl.measured(key, bytes, cols)
 	c.rels = append(c.rels, &relUse{ref: sc.ref, q: q, scope: c.ctes, columns: cols, bytes: bytes, splittable: sc.splittable,
-		sc: top, item: sc.item})
+		sc: top, item: sc.item, key: key, known: known})
 	return nil
 }
 

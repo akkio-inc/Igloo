@@ -16,7 +16,7 @@ import (
 // is a key and a value, as DuckDB's EXPLAIN gives them. A statement that
 // cannot run on workers says why.
 func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode Mode) ([][2]string, error) {
-	plan, d, err := co.plan(ctx, query, env, mode, true)
+	plan, d, err := co.plan(ctx, query, env, mode, true, nil)
 	if err != nil {
 		if IsUnsupported(err) {
 			return [][2]string{{"runs on", "this replica"}, {"reason", strings.TrimPrefix(err.Error(), "cannot distribute: ")}}, nil
@@ -49,7 +49,8 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		rows = append(rows, [2]string{"the coordinator", final})
 	}
 	for _, u := range plan.uncertain {
-		rows = append(rows, [2]string{"uncertain size", u.name + ", read by partition, with large inputs partitioned to meet it"})
+		rows = append(rows, [2]string{"uncertain size", u.name + ": written and measured first, then read whole if every task can hold it, " +
+			"or by partition as planned"})
 	}
 	for _, reason := range plan.local {
 		rows = append(rows, [2]string{"stays on the coordinator", reason})

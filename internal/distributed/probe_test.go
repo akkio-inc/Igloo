@@ -1,8 +1,15 @@
 package distributed
 
 import (
+	"log/slog"
+	"maps"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	icebergio "github.com/apache/iceberg-go/io"
 )
 
 // TestUncertainRelations checks which relations count as of uncertain
@@ -38,24 +45,106 @@ func TestUncertainRelations(t *testing.T) {
 	}
 }
 
-// TestKeepUncertainLocal checks auto mode's choice for a statement that
-// partitions large tables to meet a relation of uncertain size: one
-// machine, unless workers ran it faster or one machine ran out of memory.
-func TestKeepUncertainLocal(t *testing.T) {
-	u := []uncertain{{name: "aud"}}
-	if on, _, reason := keepUncertainLocal(u, runs{}, false, true, false, "estimated"); on || !strings.Contains(reason, "aud") {
-		t.Errorf("no history: on workers %v (%s)", on, reason)
+// TestProbedRelations checks a statement that partitions a table to meet
+// a relation of uncertain size: the relation is written and measured
+// first. Small, or empty, it is read whole beside orders' shares, which
+// are not partitioned; large, the statement runs as planned, reading what
+// the first stages wrote, each stage once. Either way it returns what one
+// machine does.
+func TestProbedRelations(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	rec := &stageTasks{tasks: map[string]int64{}}
+	co, err := NewCoordinator(Options{
+		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: []string{
+			h.lns[0].Addr().String(), h.lns[1].Addr().String(), h.lns[2].Addr().String()}},
+		CacheBytes: func() int64 { return 1 << 40 },
+		Storage:    recordingStorage{NewStorage(icebergio.LocalFS{}), h},
+	}, slog.New(rec))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if on, explore, _ := keepUncertainLocal(u, runs{local: 30}, true, true, true, "trying workers"); on || explore {
-		t.Error("explored workers")
+	t.Cleanup(func() { co.Close() })
+	h.co = co
+	query := func(filter string) string {
+		return `WITH aud AS (SELECT DISTINCT l_orderkey AS k FROM lineitem WHERE ` + filter + `)
+			SELECT o.o_orderpriority, count(*), sum(o.o_totalprice) FROM orders AS o JOIN aud ON aud.k = o.o_orderkey GROUP BY 1 ORDER BY 1`
 	}
-	if on, _, _ := keepUncertainLocal(u, runs{local: 300, dist: 100}, true, true, false, "faster"); !on {
-		t.Error("kept local though workers ran it faster")
+	// run runs q, checks it against one machine, which runs it again, and
+	// returns the first run's plan, execution and stages.
+	run := func(q string) (*Plan, *Execution, []string) {
+		t.Helper()
+		rec.mu.Lock()
+		clear(rec.tasks)
+		rec.mu.Unlock()
+		_, _, plan, ex, err := h.run(t.Context(), q, ModeOn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		stages := slices.Collect(maps.Keys(rec.tasks))
+		rec.mu.Unlock()
+		if !h.check(q) {
+			t.Fatal("did not run distributed")
+		}
+		return plan, ex, stages
 	}
-	if on, _, _ := keepUncertainLocal(u, runs{outOfMemory: true}, true, true, false, "ran out"); !on {
-		t.Error("kept local though one machine ran out of memory")
+
+	// Every worker may read what is under orders' size: the audience, a
+	// fiftieth of the orders, is read whole.
+	co.maxBroadcast = h.tables["orders"].Bytes / 2
+	for _, filter := range []string{"l_quantity = 1", "l_quantity = -1"} {
+		plan, ex, stages := run(query(filter))
+		if len(plan.uncertain) != 1 || len(ex.Probes) != 1 || !strings.Contains(ex.Probes[0], "read whole") {
+			t.Errorf("%s: probes %v of %v\n%s", filter, ex.Probes, plan.uncertain, plan.describe())
+		}
+		if slices.ContainsFunc(stages, func(s string) bool { return strings.Contains(s, "split main.orders to exchange") }) {
+			t.Errorf("%s: orders partitioned, in %v", filter, stages)
+		}
 	}
-	if on, _, _ := keepUncertainLocal(nil, runs{}, false, true, false, "estimated"); !on {
-		t.Error("kept local with nothing uncertain")
+	// Nothing is small enough: as planned, each stage run once.
+	co.maxBroadcast = 1
+	plan, ex, stages := run(query("l_quantity = 1"))
+	if len(ex.Probes) != 1 || !strings.Contains(ex.Probes[0], "as planned") || len(stages) != len(plan.Stages) {
+		t.Errorf("large: probes %v, stages %v run of %d\n%s", ex.Probes, stages, len(plan.Stages), plan.describe())
+	}
+	// Measured large, it is planned as large the next time, without
+	// measuring it first; a day on, it is measured again.
+	if plan, ex, _ := run(query("l_quantity = 1")); len(ex.Probes) != 0 || len(plan.uncertain) != 0 {
+		t.Errorf("large again: probes %v of %v", ex.Probes, plan.uncertain)
+	}
+	co.outcomes.mu.Lock()
+	for k, o := range co.outcomes.byKey {
+		o.at = o.at.Add(-exploreEvery - time.Hour)
+		co.outcomes.byKey[k] = o
+	}
+	co.outcomes.mu.Unlock()
+	if _, ex, _ := run(query("l_quantity = 1")); len(ex.Probes) != 1 {
+		t.Errorf("a day on: probes %v", ex.Probes)
+	}
+	// Measured small, it is measured every time.
+	co.maxBroadcast = h.tables["orders"].Bytes / 2
+	for range 2 {
+		if _, ex, _ := run(query("l_quantity = 2")); len(ex.Probes) != 1 || !strings.Contains(ex.Probes[0], "read whole") {
+			t.Errorf("small again: probes %v", ex.Probes)
+		}
+	}
+}
+
+// TestMeasuredSize checks the size a measured relation is planned with:
+// its bytes, unless its rows would not fit a task's memory in a hash
+// table, when it is past what every worker may read.
+func TestMeasuredSize(t *testing.T) {
+	cols := []Column{{Name: "id", Type: "VARCHAR"}}
+	pl := &planner{opts: planOptions{maxBroadcast: 1 << 30, taskMemory: 1 << 30,
+		sizes: map[string]knownSize{"small": {bytes: 5 << 20, rows: 1e6}, "many": {bytes: 50 << 20, rows: 1e8}}}}
+	if b, known := pl.measured("small", 1<<40, cols); !known || b != 5<<20 {
+		t.Errorf("small: %d %v", b, known)
+	}
+	if b, known := pl.measured("many", 1<<40, cols); !known || b <= pl.opts.maxBroadcast {
+		t.Errorf("a hundred million rows: %d %v", b, known)
+	}
+	if b, known := pl.measured("other", 1<<40, cols); known || b != 1<<40 {
+		t.Errorf("unmeasured: %d %v", b, known)
 	}
 }
