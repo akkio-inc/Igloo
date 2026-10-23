@@ -283,6 +283,10 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		var de *duckdb.Error
 		if errors.As(err, &de) {
 			te.Type, te.Message, te.Data = int(de.Type), de.Msg, dataError(err)
+			// DuckDB out of its memory limit fails the task as the memory
+			// watch would have: the coordinator runs the statement again
+			// over smaller tasks, or fails it, rather than run it whole.
+			te.OutOfMemory = de.Type == duckdb.ErrorTypeOutOfMemory
 		}
 		if r.Context().Err() != nil {
 			log.Debug("task canceled", "err", err)
@@ -293,6 +297,12 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 			log.Debug("task refused", "err", err)
 			te.Unsupported = true
 			w.opts.Metrics.task("refused", start)
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
+		if te.OutOfMemory {
+			log.Warn("task ran out of memory", "err", err)
+			w.opts.Metrics.task("out_of_memory", start)
 			w.fail(rw, http.StatusUnprocessableEntity, te)
 			return
 		}

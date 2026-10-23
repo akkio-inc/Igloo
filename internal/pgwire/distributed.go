@@ -96,6 +96,9 @@ type distParts struct {
 	workers, stages, exchanges int
 	key                        string
 	since                      time.Time
+	// release lets the workers count as idle again: the statement holds
+	// them while it runs on this replica after their tasks failed.
+	release func()
 }
 
 // sessionMode is the mode user's statements run distributed in: the
@@ -139,8 +142,19 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 		return parts, false, nil
 	}
+	// The workers stay up while the statement runs, here too.
+	release := s.dist.Keep()
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
+		// Released now if the statement is done; otherwise once it has run
+		// here (parts.release).
+		defer func() {
+			if done {
+				release()
+			} else {
+				parts.release = release
+			}
+		}()
 		switch {
 		case ctx.Err() != nil:
 			return parts, true, ctx.Err()
@@ -157,6 +171,13 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 			return parts, false, nil
 		}
+		if plan.ShortOfMemory() {
+			// It would run out of memory here, after taking as long as it
+			// does on one machine: fail now.
+			s.log.Warn("workers could not run a statement, which would not fit in this replica's memory; it fails",
+				"user", user.Name, "err", err)
+			return parts, true, fmt.Errorf("workers could not run the statement, and it needs more memory than this replica has: %w", err)
+		}
 		reason := "worker_error"
 		if errors.Is(err, distributed.ErrNoWorkers) {
 			reason = "no_workers"
@@ -165,6 +186,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		s.log.Warn("workers could not run a statement; running it here", "user", user.Name, "err", err)
 		return parts, false, nil
 	}
+	defer release()
 	defer ex.Close()
 	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
 	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
@@ -173,7 +195,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		s.dist.Metrics().Fallback("combine_error")
 		s.log.Warn("could not combine a distributed statement's results; running it here", "user", user.Name, "err", err)
-		return distParts{}, false, nil
+		return distParts{release: s.dist.Keep()}, false, nil
 	}
 	return parts, true, nil
 }
@@ -213,6 +235,9 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 	// for it, and nothing else would run it.
 	p, done, err := s.runDistributed(retry, sess, user, st, args, w, distributed.ModeOn)
 	if !done {
+		if p.release != nil {
+			p.release()
+		}
 		return cause
 	}
 	if errors.Is(retry.Err(), context.DeadlineExceeded) {

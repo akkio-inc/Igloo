@@ -194,6 +194,9 @@ type execution struct {
 	sp       *spool
 	// parts is how many partitions every exchange has.
 	parts int
+	// smaller is how many times the statement ran again because a task ran
+	// out of memory: each halves the tasks (see Execute).
+	smaller int
 	// root is the statement's directory in object storage for exchanges.
 	root      string
 	exchanges map[int]*exchangeRun
@@ -282,6 +285,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	// The tasks, and each one's share of the split input.
 	tasks := 1
 	var shares [][]File
+	var owners []int
 	if in := s.split(); in != nil {
 		split := e.files[in.Table.key()]
 		n := len(e.ws)
@@ -289,7 +293,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			n = max(want, min(2, n))
 		}
 		n = max(1, min(n, len(split)))
-		shares = assign(split, e.ws[:n])
+		shares, owners = divide(assign(split, e.ws[:n]), 1<<e.smaller)
 		tasks = len(shares)
 	}
 	var groups [][]int
@@ -360,7 +364,11 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			if s.Out == nil {
 				sp = e.sp
 			}
-			w, head, err := e.co.dispatch(gctx, task, e.ws, i%len(e.ws), out, sp)
+			first := i % len(e.ws)
+			if owners != nil {
+				first = owners[i]
+			}
+			w, head, err := e.co.dispatch(gctx, task, e.ws, first, out, sp)
 			if err != nil {
 				return err
 			}

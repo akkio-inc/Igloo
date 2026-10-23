@@ -112,6 +112,65 @@ func TestWorkerShedsMemory(t *testing.T) {
 	}
 }
 
+// oomEngine fails a worker's tasks as DuckDB does out of its memory limit,
+// the first fails of them (all, if fails is negative), and runs the rest.
+type oomEngine struct {
+	inner Connector
+	fails *atomic.Int32
+	tried *atomic.Int32
+}
+
+func (e oomEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
+	e.tried.Add(1)
+	for {
+		n := e.fails.Load()
+		if n == 0 {
+			return e.inner.Connect(ctx)
+		}
+		if n < 0 || e.fails.CompareAndSwap(n, n-1) {
+			return nil, &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory,
+				Msg: "Out of Memory Error: failed to allocate data of size 2.0 MiB (24.5 GiB/24.6 GiB used)"}
+		}
+	}
+}
+
+// A task that runs out of DuckDB's memory on a worker fails as the memory
+// watch's would, not as a broken worker: the statement runs again in
+// smaller tasks, over twice the partitions, and returns what one machine
+// does; when those run out too, it fails as out of memory rather than run
+// on the coordinator.
+func TestWorkerOutOfMemory(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	h.co.maxBroadcast = 1
+	q := `SELECT o.o_orderpriority, count(*), sum(l.l_quantity) FROM lineitem AS l JOIN orders AS o ON o.o_orderkey = l.l_orderkey
+		GROUP BY 1 ORDER BY 1`
+	var fails, tried atomic.Int32
+	inner := h.workers[0].opts.Engine
+	h.workers[0].opts.Engine = oomEngine{inner, &fails, &tried}
+	// Out of memory once: the statement runs again, and completes.
+	fails.Store(1)
+	if !h.check(q) {
+		t.Fatal("did not run distributed")
+	}
+	if fails.Load() > 0 || tried.Load() < 2 {
+		t.Errorf("tasks tried %d times, %d failures left", tried.Load(), fails.Load())
+	}
+	// Out of memory every time: it fails as out of memory, after running
+	// again memoryRetries times.
+	fails.Store(-1)
+	tried.Store(0)
+	for _, w := range h.workers[1:] {
+		w.opts.Engine = oomEngine{w.opts.Engine, &fails, &tried}
+	}
+	_, _, _, _, err := h.run(t.Context(), q, ModeOn)
+	if !OutOfMemory(err) || IsUnsupported(err) || dataError(err) || !strings.Contains(err.Error(), "24.5 GiB") {
+		t.Fatalf("want the task's out of memory, got %v", err)
+	}
+	if n := tried.Load(); n < memoryRetries+1 {
+		t.Errorf("tasks tried %d times, want a run and %d more", n, memoryRetries)
+	}
+}
+
 // A worker runs as many tasks at once as its cores and memory allow
 // (taskSlots), one for the harness's, and the others wait: two stages that
 // scan lineitem side by side, then a join's stage of a task per partition,
@@ -518,6 +577,47 @@ func (s *scaleLog) stops() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(slices.DeleteFunc(slices.Clone(s.asked), func(n int) bool { return n != 0 }))
+}
+
+// Workers stay up while a statement that runs on them runs, though no task
+// of it runs, as when it runs on the coordinator after its tasks failed:
+// they count as idle from when it ends.
+func TestWorkersKeptForAStatement(t *testing.T) {
+	tr, err := newTransport(testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compute := &scaleLog{}
+	p := newPool(PoolOptions{Compute: compute, MaxWorkers: 4, IdleAfter: time.Minute}, tr, "test", nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.scale(t.Context(), 4); err != nil {
+		t.Fatal(err)
+	}
+	release := p.keep()
+	idle := []*worker{{addr: "a", status: workerStatus{IdleSeconds: 3600}}}
+	p.mu.Lock()
+	p.scaledAt, p.used = time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)
+	p.mu.Unlock()
+	p.stopIdle(t.Context(), idle)
+	if n := compute.stops(); n != 0 {
+		t.Fatalf("stopped the workers of a running statement, %d times", n)
+	}
+	release()
+	release() // once only
+	p.stopIdle(t.Context(), idle)
+	if n := compute.stops(); n != 0 {
+		t.Fatalf("stopped the workers as the statement ended, %d times", n)
+	}
+	p.mu.Lock()
+	p.used = time.Now().Add(-2 * time.Minute)
+	busy := p.busy
+	p.mu.Unlock()
+	if busy != 0 {
+		t.Fatalf("%d statements still keep the workers", busy)
+	}
+	p.stopIdle(t.Context(), idle)
+	if n := compute.stops(); n != 1 {
+		t.Fatalf("idle workers after the statement: %d stops, want 1", n)
+	}
 }
 
 // Workers a coordinator has just started stay up while they boot, though

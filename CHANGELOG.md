@@ -315,6 +315,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   types, at least 64 bytes a row), and at least one a worker: a report's
   stages that joined an audience of 189,000 rows to tables every task read
   in full ran 32 tasks each, and read those tables 448 times.
+  A task that runs out of DuckDB's memory on a worker counts as the memory
+  watch's cancel does, not as a broken worker: the statement's parts run
+  again in smaller tasks (twice the partitions, half of each task's share),
+  up to twice, and then fail with SQLSTATE `53200`. A statement whose
+  workers fail runs on the coordinator only if it fits there: one whose
+  exchanged rows would take more than the coordinator's memory, or that ran
+  out of it before, fails at once, where it ran on the coordinator for half
+  an hour at a hundred times the data and ran out of memory there too. Its
+  workers stay up while it runs on the coordinator.
 - Workers start on demand and stop when idle: on Kubernetes the chart's
   `workers.enabled` adds a worker Deployment that Igloo scales between zero
   and `workers.maxReplicas`; on virtual machines `IGLOO_WORKER_COMPUTE`

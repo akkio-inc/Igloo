@@ -309,10 +309,11 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes, cache: cache}
 	e := estimateTimes(plan.Stages, m, co.fleet(ws, plan.mayStart))
 	plan.workers = e.workers
+	r, found := co.history.get(plan.Key)
+	plan.shortOfMemory = e.memory || found && r.outOfMemory
 	if mode != ModeAuto {
 		return plan, nil
 	}
-	r, found := co.history.get(plan.Key)
 	now := time.Now()
 	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
 	where := "one machine"
@@ -374,6 +375,15 @@ func (e *Execution) Close() {
 // ErrNoWorkers means no worker could run the statement's parts.
 var ErrNoWorkers = errors.New("no workers available")
 
+// memoryRetries is how many times a statement whose task ran out of memory
+// on a worker runs again in smaller tasks before it fails.
+const memoryRetries = 2
+
+// Keep keeps the workers from stopping as idle until release is called:
+// the server holds them while a statement that ran tasks runs, on the
+// coordinator too.
+func (co *Coordinator) Keep() (release func()) { return co.pool.keep() }
+
 // Setting is a session setting a statement runs with.
 type Setting = setting
 
@@ -382,6 +392,7 @@ type Setting = setting
 // context's, means the statement should run on the coordinator instead.
 func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setting) (*Execution, error) {
 	start := time.Now()
+	defer co.pool.keep()()
 	ex := &Execution{dir: filepath.Join(co.dir, newID())}
 	if err := os.MkdirAll(ex.dir, 0o700); err != nil {
 		return nil, err
@@ -445,21 +456,44 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 
 	loaded := time.Since(start)
 	qid := filepath.Base(ex.dir)
-	run := &execution{
-		co: co, qid: qid, dir: ex.dir, ws: ws, files: files, settings: settings, force: plan.force,
-		sp: &spool{limit: limit}, parts: partitions(len(ws), split, partitionBytes), root: shuffleRoot(co.opts.Warehouse, qid),
-		exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
-	}
-	if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {
-		// The exchanges are read only by the stages: once they have run,
-		// the statement's rows need not wait for their removal.
-		release := co.hold(qid, run.root)
-		defer func() {
-			release()
-			co.removeLater(qid, run.root)
-		}()
-	}
-	if err := run.run(ctx, plan.Stages); err != nil {
+	parts := partitions(len(ws), split, partitionBytes)
+	var run *execution
+	for attempt := 0; ; attempt++ {
+		// Each attempt's tasks and exchanges are its own, so that what a
+		// canceled task of the last one still writes is not read.
+		aqid := qid
+		if attempt > 0 {
+			aqid += "-" + strconv.Itoa(attempt)
+		}
+		run = &execution{
+			co: co, qid: aqid, dir: ex.dir, ws: ws, files: files, settings: settings, force: plan.force,
+			sp: &spool{limit: limit}, parts: parts, smaller: attempt, root: shuffleRoot(co.opts.Warehouse, aqid),
+			exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
+		}
+		if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {
+			// The exchanges are read only by the stages: once they have run,
+			// the statement's rows need not wait for their removal.
+			root := run.root
+			release := co.hold(aqid, root)
+			defer func() {
+				release()
+				co.removeLater(aqid, root)
+			}()
+		}
+		err := run.run(ctx, plan.Stages)
+		if err == nil {
+			break
+		}
+		if OutOfMemory(err) && ctx.Err() == nil && attempt < memoryRetries {
+			// Smaller tasks: twice the partitions, each task's share of a
+			// divided table halved, and half the memory to group
+			// partitions in (see groups).
+			next := min(2*parts, maxPartitions)
+			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",
+				"query", qid, "attempt", attempt+1, "partitions", next, "err", err)
+			parts = next
+			continue
+		}
 		switch {
 		case ctx.Err() != nil:
 			co.opts.Metrics.query("canceled", start)
@@ -740,7 +774,10 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 		if res.Error.Unsupported {
 			return nil, &errUnsupported{reason: strings.TrimPrefix(res.Error.Message, "cannot distribute: ")}
 		}
-		if res.Error.OutOfMemory {
+		switch {
+		case duckdb.ErrorType(res.Error.Type) == duckdb.ErrorTypeOutOfMemory:
+			return nil, fmt.Errorf("%w: a task on %s: %s", ErrWorkerMemory, w.addr, res.Error.Message)
+		case res.Error.OutOfMemory:
 			return nil, fmt.Errorf("%w: %s, and canceled a task of the statement, which had run the longest there", ErrWorkerMemory, w.addr)
 		}
 		if res.Error.Type != 0 {

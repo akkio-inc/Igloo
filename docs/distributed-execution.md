@@ -294,7 +294,12 @@ the statement then runs on the coordinator at once, without trying other
 workers or leaving any out. If no worker can run it, its partial results
 would take more than 1 GiB of the coordinator's disk, or the parts cannot
 be combined, the statement also runs on the coordinator, so a client sees a
-slower statement, not an error. An error in the data itself, such as a failed cast
+slower statement, not an error; but not one whose exchanged rows Igloo
+estimates at more than the coordinator's memory holds, or that ran out of
+memory there before, which would run out of memory there after as long as
+one machine takes: that fails at once, with the workers' error. Workers stay
+up while a statement that ran tasks on them runs on the coordinator, and
+count as idle from when it ends. An error in the data itself, such as a failed cast
 or a division by zero, is the statement's error, as it would be on one
 machine. Canceling a statement (`Ctrl-C`, `statement_timeout`) cancels its
 parts on the workers.
@@ -305,11 +310,16 @@ memory its buffer manager tracks, and when what a worker can still allocate
 falls below a sixteenth of its memory (at least 256 MiB), it cancels the
 task that has run longest there rather than let the kernel kill it, and
 every task on it. It logs `memory is running out; canceled the task that had
-run longest` with the statement and task. That statement fails with SQLSTATE
-`53200` (`out_of_memory`), and the server logs `a worker ran out of memory
-running part of a statement`: run on another worker or on the coordinator,
-the part would run out of memory the same way, so neither is tried. Run it
-on less data at a time, or give the workers more memory.
+run longest` with the statement and task. A task that runs out of DuckDB's
+memory limit on a worker (`Out of Memory Error`) counts the same. The
+statement's parts then run again in smaller tasks, twice: each time over
+twice the partitions (up to 256), with each task's share of a divided table
+halved, and half the memory for grouping partitions into a task. If those
+run out too, the statement fails with SQLSTATE `53200` (`out_of_memory`), and
+the server logs `a worker ran out of memory running part of a statement`:
+run on another worker or on the coordinator, the part would run out of
+memory the same way, so neither is tried. Run it on less data at a time, or
+give the workers more memory.
 
 ## Security
 
@@ -391,7 +401,7 @@ on less data at a time, or give the workers more memory.
 
   | Metric | Labels | Meaning |
   |---|---|---|
-  | `igloo_distributed_queries_total` | `outcome` = `ok`, `error`, `out_of_memory`, `canceled`, `fallback` | Statements whose parts ran on workers (`error`: an error in the data; `out_of_memory`: a worker canceled a part as it ran out of memory), and statements that started to and ran on the coordinator instead |
+  | `igloo_distributed_queries_total` | `outcome` = `ok`, `error`, `out_of_memory`, `canceled`, `fallback` | Statements whose parts ran on workers (`error`: an error in the data; `out_of_memory`: a part ran out of memory on a worker, also in smaller tasks), and statements that started to and ran on the coordinator instead |
   | `igloo_distributed_fallbacks_total` | `reason` = `no_workers`, `worker_error`, `combine_error` | Why a statement ran on the coordinator after all |
   | `igloo_distributed_query_seconds` | | Time to run a statement's parts and combine them, before results are sent |
   | `igloo_distributed_tasks_total` | `result` = `ok`, `retried`, `failed` | Parts sent to workers |

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +42,9 @@ type lakeSource struct {
 	// size, if set, is the size every table claims, so that auto mode
 	// weighs it as a large one.
 	size int64
+	// missing, if set, lists files that are not there, which workers fail
+	// to read.
+	missing bool
 }
 
 func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distributed.Table, error) {
@@ -95,7 +99,14 @@ func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distribut
 func (s *lakeSource) Files(_ context.Context, t *distributed.Table) ([]distributed.File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.files[t.Schema+"."+t.Name], nil
+	files := s.files[t.Schema+"."+t.Name]
+	if s.missing {
+		files = slices.Clone(files)
+		for i := range files {
+			files[i].Path += ".missing"
+		}
+	}
+	return files, nil
 }
 
 // Refresh does nothing: Table wrote the table's current rows.
@@ -242,6 +253,13 @@ func startDistServer(t *testing.T, workers int, configure ...func(*Options)) *di
 // tests write, are in dir, which its DuckDB and the workers may read.
 func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(*Options)) *distServer {
 	t.Helper()
+	return startDistServerWith(t, dir, workers, nil, configure...)
+}
+
+// startDistServerWith is startDistServerIn with the coordinator's options
+// changed by coordinate, if set.
+func startDistServerWith(t *testing.T, dir string, workers int, coordinate func(*distributed.Options), configure ...func(*Options)) *distServer {
+	t.Helper()
 	ds := &distServer{source: &lakeSource{dir: dir, files: map[string][]distributed.File{}}, gate: newTaskGate()}
 	var addrs []string
 	for i := range workers {
@@ -253,12 +271,16 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 	// Partial results go to the server's spill directory, which its
 	// DuckDB may read.
 	spill := filepath.Join(t.TempDir(), "spill")
-	co, err := distributed.NewCoordinator(distributed.Options{
+	opts := distributed.Options{
 		Source: ds.source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1, Storage: distributed.NewStorage(icebergio.LocalFS{}),
 		Pool: distributed.PoolOptions{Addresses: addrs},
 		// Exchanges between stages go under the warehouse, which here is dir.
 		Warehouse: dir + "/",
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	if coordinate != nil {
+		coordinate(&opts)
+	}
+	co, err := distributed.NewCoordinator(opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,9 +420,9 @@ func TestDistributedGrants(t *testing.T) {
 }
 
 // A worker about to run out of memory cancels its task (ShedMemory): the
-// statement fails with SQLSTATE 53200 (out_of_memory), rather than run
-// again on another worker or here, either of which would run out the same
-// way.
+// statement runs again in smaller tasks, and if those run out too, fails
+// with SQLSTATE 53200 (out_of_memory), rather than run here, which would
+// run out the same way.
 func TestDistributedOutOfMemory(t *testing.T) {
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -408,25 +430,61 @@ func TestDistributedOutOfMemory(t *testing.T) {
 	mustExec(t, conn, "SET distributed_execution = on")
 	ctx := context.Background()
 	query := "SELECT amount, count(*) FROM orders GROUP BY amount"
+	// shed waits for a task to wait at the gate, and has the workers shed
+	// what they run.
+	shed := func() {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for waiting, _ := ds.gate.counts(); waiting < 1 && time.Now().Before(deadline); waiting, _ = ds.gate.counts() {
+			time.Sleep(10 * time.Millisecond)
+		}
+		_, before := ds.gate.counts()
+		shed := false
+		for _, w := range ds.workers {
+			shed = w.ShedMemory(64<<20) || shed
+		}
+		if !shed {
+			t.Fatal("no worker had a task to shed")
+		}
+		for _, canceled := ds.gate.counts(); canceled == before && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	run := func() <-chan error {
+		errc := make(chan error, 1)
+		go func() {
+			rows, err := conn.Query(ctx, query)
+			n := 0
+			if err == nil {
+				for rows.Next() {
+					n++
+				}
+				err = rows.Err()
+			}
+			if err == nil && n != 9 {
+				err = fmt.Errorf("%d groups", n)
+			}
+			errc <- err
+		}()
+		return errc
+	}
+
+	// Shed once: it runs again, and completes.
 	release := sync.OnceFunc(ds.gate.hold())
+	errc := run()
+	shed()
+	release()
+	if err := <-errc; err != nil {
+		t.Fatalf("after one shed: %v", err)
+	}
+
+	// Shed every time: the first run and its two in smaller tasks.
+	release = sync.OnceFunc(ds.gate.hold())
 	defer release()
-	errc := make(chan error, 1)
-	go func() {
-		_, err := conn.Exec(ctx, query)
-		errc <- err
-	}()
-	deadline := time.Now().Add(20 * time.Second)
-	for waiting, _ := ds.gate.counts(); waiting < 1 && time.Now().Before(deadline); waiting, _ = ds.gate.counts() {
-		time.Sleep(10 * time.Millisecond)
+	errc = run()
+	for range 3 {
+		shed()
 	}
-	shed := false
-	for _, w := range ds.workers {
-		shed = w.ShedMemory(64<<20) || shed
-	}
-	if !shed {
-		t.Fatal("no worker had a task to shed")
-	}
-	// Were the task run again, it would now complete.
 	release()
 	err := <-errc
 	if pgCode(err) != "53200" || !strings.Contains(err.Error(), "out of memory") {
@@ -538,6 +596,31 @@ func TestDistributedFallback(t *testing.T) {
 	expectAllowed(t, conn, query)
 	if n := lastWorkers(t, ds.history, query); n != 0 {
 		t.Errorf("history shows %d workers", n)
+	}
+}
+
+// A statement whose workers fail, and that would not fit in this replica's
+// memory, fails rather than run here, which would run out of memory after
+// as long as one machine takes. The same statement over a table that fits
+// still runs here.
+func TestDistributedNoFallbackShortOfMemory(t *testing.T) {
+	ds := startDistServerWith(t, t.TempDir(), 2, func(o *distributed.Options) { o.MemoryBytes = 64 << 20 })
+	ds.source.size = 300 << 20
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	mustExec(t, conn, "SET distributed_execution = on")
+	// Workers fail to read the tables' files.
+	ds.source.missing = true
+	// A table joined to itself, both sides exchanged by key: a working set
+	// several times this replica's 64 MiB.
+	_, err := conn.Exec(context.Background(), "SELECT a.amount, count(*) FROM orders AS a JOIN orders AS b ON a.id = b.id GROUP BY a.amount")
+	if err == nil || !strings.Contains(err.Error(), "needs more memory than this replica has") {
+		t.Fatalf("want a failure for want of memory, got %v", err)
+	}
+	// At the table's own size, a few kilobytes, it fits, and runs here.
+	ds.source.size = 0
+	if got := count(t, conn, "SELECT count(*) FROM (SELECT a.amount, count(*) FROM orders AS a JOIN orders AS b ON a.id = b.id GROUP BY a.amount)"); got != 9 {
+		t.Errorf("got %d groups", got)
 	}
 }
 

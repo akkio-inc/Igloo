@@ -54,8 +54,11 @@ type pool struct {
 	refreshed time.Time
 	// down are workers that failed recently, by address, until when.
 	down map[string]time.Time
-	// used is when this coordinator last ran a task.
+	// used is when this coordinator last ran a task, or a statement that
+	// ran tasks ended; busy counts the statements running that use
+	// workers, which keep them from counting as idle (see keep).
 	used time.Time
+	busy int
 	// scaled is the number of workers last asked for, and when.
 	scaled   int
 	scaledAt time.Time
@@ -330,6 +333,26 @@ func (p *pool) touch() {
 	p.mu.Unlock()
 }
 
+// keep keeps the workers from counting as idle until release is called, as
+// they are while a statement that runs on them runs: its tasks, the rest
+// of it on the coordinator, and running it again. A statement whose tasks
+// failed, which ran on the coordinator for half an hour with every worker
+// idle, had them stopped under it.
+func (p *pool) keep() (release func()) {
+	p.mu.Lock()
+	p.busy++
+	p.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.busy--
+			p.used = time.Now()
+			p.mu.Unlock()
+		})
+	}
+}
+
 // run checks the workers every few seconds, so statements decide from a
 // recent view of them without waiting, and stops idle workers (stopIdle)
 // until ctx is done.
@@ -362,7 +385,7 @@ func (p *pool) stopIdle(ctx context.Context, ws []*worker) {
 	if p.scaledAt.After(last) {
 		last = p.scaledAt
 	}
-	idle := time.Since(last) >= p.opts.IdleAfter
+	idle := time.Since(last) >= p.opts.IdleAfter && p.busy == 0
 	scaled := p.scaled
 	p.mu.Unlock()
 	if !idle {

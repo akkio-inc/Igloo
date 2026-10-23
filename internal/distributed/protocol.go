@@ -123,8 +123,8 @@ type taskErr struct {
 	// Unsupported says no worker can run the task, so the statement runs
 	// on the coordinator: its files cannot be read as the table says.
 	Unsupported bool `json:"unsupported,omitempty"`
-	// OutOfMemory says the worker canceled the task because it was running
-	// out of memory (Worker.ShedMemory).
+	// OutOfMemory says the task ran out of memory: DuckDB's memory limit,
+	// or the worker canceled it because it was running out (ShedMemory).
 	OutOfMemory bool `json:"out_of_memory,omitempty"`
 }
 
@@ -162,10 +162,11 @@ func knownSetting(name string) bool {
 // computes on, which it would have raised on one machine too.
 func DataError(err error) bool { return dataError(err) }
 
-// ErrWorkerMemory is what a statement fails with when a worker, about to
-// run out of memory, canceled one of its tasks (Worker.ShedMemory).
-// Another worker, or the coordinator on its own, would run out of memory
-// the same way, so the statement fails rather than run again.
+// ErrWorkerMemory is what a statement fails with when a task of it ran out
+// of memory on a worker, in DuckDB or canceled by the worker's memory watch
+// (Worker.ShedMemory), also over smaller tasks (see Execute). Another
+// worker would run out of memory the same way, and the coordinator on its
+// own sooner, so the statement fails rather than run again.
 var ErrWorkerMemory = errors.New("a worker was running out of memory")
 
 // OutOfMemory reports whether err is ErrWorkerMemory.

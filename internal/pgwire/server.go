@@ -1281,6 +1281,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				if done {
 					return err
 				}
+				if p.release != nil {
+					defer p.release()
+				}
 				err = s.runLocal(ctx, sess, st, args, tw)
 				if err != nil && parts.key != "" && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
 					return s.afterOutOfMemory(outer, ctx, sess, st, args, tw, &parts, err)

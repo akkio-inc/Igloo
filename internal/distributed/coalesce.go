@@ -105,7 +105,34 @@ func (e *execution) groups(s *Stage) [][]int {
 			mem[p] += rows * per
 		}
 	}
-	return groupPartitions(mem, taskMemory(e.ws), len(e.ws))
+	return groupPartitions(mem, taskMemory(e.ws)>>e.smaller, len(e.ws))
+}
+
+// divide splits each of shares, a worker's share of a divided table's
+// files each, into up to k shares of about equal size, for smaller tasks,
+// and returns them with the index of the worker each came from.
+func divide(shares [][]File, k int) ([][]File, []int) {
+	var out [][]File
+	var owners []int
+	for w, share := range shares {
+		if k <= 1 || len(share) <= 1 {
+			out, owners = append(out, share), append(owners, w)
+			continue
+		}
+		pieces := make([][]File, min(k, len(share)))
+		sizes := make([]int64, len(pieces))
+		sorted := slices.Clone(share)
+		slices.SortStableFunc(sorted, func(a, b File) int { return cmp.Compare(b.Size, a.Size) })
+		for _, f := range sorted {
+			j := slices.Index(sizes, slices.Min(sizes))
+			pieces[j] = append(pieces[j], f)
+			sizes[j] += max(f.Size, 1)
+		}
+		for _, p := range pieces {
+			out, owners = append(out, p), append(owners, w)
+		}
+	}
+	return out, owners
 }
 
 // groupPartitions groups partitions, of the memory mem says each takes,

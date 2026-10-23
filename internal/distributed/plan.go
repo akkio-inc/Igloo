@@ -149,7 +149,16 @@ type Plan struct {
 	Key string
 	// workers is how many workers the estimates call for (estimateTimes).
 	workers int
+	// shortOfMemory says the statement would not fit in the coordinator's
+	// memory: its working set is over its share (estimateTimes), or it ran
+	// out of memory there before.
+	shortOfMemory bool
 }
+
+// ShortOfMemory reports whether the statement would not fit in the
+// coordinator's memory, so that running it there instead of on workers
+// would fail, slowly.
+func (p *Plan) ShortOfMemory() bool { return p.shortOfMemory }
 
 // job is a candidate on its way to stages: the tables its fragment reads,
 // by the names it reads them as.
