@@ -1456,8 +1456,9 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 
 // rewrite points the names in text that Igloo serves itself (PostgreSQL's
 // catalog and settings, the history views, the catalog's views) at where
-// they are, and counts whole results without holding them (see
-// rewriteWholeCounts).
+// they are, computes aggregates over whole results without holding them (see
+// rewriteWholeCounts), and counts distinct pairs a row each (see
+// rewritePairCounts).
 func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, text string) string {
 	query := rewriteCurrentSetting(rewriteSystemSchemaRefs(text, s.catalogName()))
 	query = rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(query), user.Name), s.engine.LocalDatabase())
@@ -1467,7 +1468,7 @@ func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, tex
 	if readsMetadata.MatchString(query) {
 		s.refreshMetadata(ctx, sess)
 	}
-	return s.rewriteWholeCounts(ctx, sess, query)
+	return s.rewritePairCounts(ctx, sess, s.rewriteWholeCounts(ctx, sess, query))
 }
 
 // prepareChecked is prepareStatement without recording failures, for the
