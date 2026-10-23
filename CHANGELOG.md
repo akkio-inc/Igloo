@@ -317,6 +317,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   in full ran 32 tasks each, and read those tables 448 times. A statement
   whose exchanges' rows, as estimated, would not fit a task's memory over
   eight times the workers' partitions gets more, up to 256.
+  Workers writing an exchange keep its row groups small enough for one of
+  every partition to fit a quarter of a task's share of their memory: a
+  partitioned write holds a row group of each partition until it fills,
+  and 128 partitions of wide rows in groups of 122,880 took workers of 24.6
+  GiB out of memory at a hundred times the data. Their threads gather fewer
+  rows before writing them when rows are wide, and a statement whose
+  exchanges' rows are very wide (hundreds of columns) gets no more
+  partitions than its writers have room for.
   A task that runs out of DuckDB's memory on a worker counts as the memory
   watch's cancel does, not as a broken worker: the statement's parts run
   again in smaller tasks (twice the partitions, half of each task's share),

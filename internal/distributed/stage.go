@@ -358,6 +358,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		} else {
 			task.SQL = exchangeSQL(s, e.parts)
 			task.Shuffle = e.root + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
+			task.Partitions = e.parts
 		}
 		g.Go(func() error {
 			var sp *spool

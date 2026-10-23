@@ -94,6 +94,26 @@ func taskMemory(ws []*worker) int64 {
 	return share / 2
 }
 
+// exchangePartitions is how many partitions the exchanges of stages get on
+// n workers, ws those known: enough for the workers and the largest table
+// divided (see partitions), more if the exchanges' rows need them to fit a
+// task's memory (partitionsFor), at a hundred times the data, but no more
+// than their writers have memory for with wide rows (writerPartitions),
+// and still one a worker.
+func exchangePartitions(stages []*Stage, ws []*worker, n int) int {
+	var split int64
+	for _, s := range stages {
+		if in := s.split(); in != nil {
+			split = max(split, in.Table.Bytes)
+		}
+	}
+	parts := max(partitions(n, split, partitionBytes), min(partitionsFor(stages, taskMemory(ws)), maxPartitions))
+	if most := writerPartitions(stages, ws); most > 0 {
+		parts = min(parts, max(most, n))
+	}
+	return parts
+}
+
 // partitionsFor returns how many partitions the exchanges of stages need
 // for a task that reads one partition of each to hold its rows within
 // budget, as far as estimates tell: an exchange's rows are those of the
@@ -106,8 +126,19 @@ func partitionsFor(stages []*Stage, budget int64) int {
 	if budget <= 0 {
 		return 0
 	}
-	rows := map[*Exchange]float64{}
-	width := map[*Exchange]int64{}
+	rows, width := exchangeEstimates(stages)
+	need := 0
+	for x, r := range rows {
+		mem := r * float64(2*width[x]+64)
+		need = max(need, int(math.Ceil(mem/float64(budget))))
+	}
+	return need
+}
+
+// exchangeEstimates estimates each exchange's rows, as partitionsFor says,
+// and the width of a row of the columns its stages read, by their types.
+func exchangeEstimates(stages []*Stage) (rows map[*Exchange]float64, width map[*Exchange]int64) {
+	rows, width = map[*Exchange]float64{}, map[*Exchange]int64{}
 	for _, s := range stages {
 		var in float64
 		var w int64
@@ -135,12 +166,28 @@ func partitionsFor(stages []*Stage, budget int64) int {
 			width[s.Out] = max(width[s.Out], w)
 		}
 	}
-	need := 0
-	for x, r := range rows {
-		mem := r * float64(2*width[x]+64)
-		need = max(need, int(math.Ceil(mem/float64(budget))))
+	return rows, width
+}
+
+// writerPartitions is the most partitions the stages' tasks can write an
+// exchange of: each holds a row group of each partition (see
+// shuffleRowGroup), of at least minShuffleRowGroup rows, which those of
+// all partitions must fit a quarter of a task's share of the worker's
+// memory in, at the width of the widest exchange's rows. Rows of 400
+// strings took a writer of 3 GB out of memory over 128 partitions and 256,
+// even in row groups of 2,048 rows. It is 0 when the workers' memory is not
+// known or no stage writes an exchange.
+func writerPartitions(stages []*Stage, ws []*worker) int {
+	budget := taskMemory(ws) / 2
+	_, width := exchangeEstimates(stages)
+	var widest int64
+	for _, w := range width {
+		widest = max(widest, w)
 	}
-	return need
+	if budget <= 0 || widest <= 0 {
+		return 0
+	}
+	return int(budget / (minShuffleRowGroup * widest))
 }
 
 // groups returns the partitions each task of stage s, which reads

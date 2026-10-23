@@ -443,7 +443,7 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		return "", nil, err
 	}
 	if req.Shuffle != "" {
-		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols)
+		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions)
 		return "", res, err
 	}
 	// Columns Parquet would change cross as text; see transferType.
@@ -471,9 +471,74 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	return path, &taskResult{Columns: cols, Rows: rows}, nil
 }
 
+// shuffleRowGroup is how many rows a shuffle task writes to a row group.
+// DuckDB's partitioned COPY holds a row group of every partition's rows, as
+// they are, until it fills: 128 partitions of rows of 264 bytes held 3 GB,
+// as much as DuckDB's limit, in its row groups of 122,880 rows, and 0.4 GB
+// in groups of 8,192, which took no longer to write; at a hundred times the
+// data, wide rows over 128 partitions took workers of 24.6 GiB out of
+// memory. The row groups of all partitions get a quarter of the task's
+// share of the worker's memory (the limit over its slots), at the width of
+// the rows' types, between 2,048 rows and DuckDB's 122,880.
+func shuffleRowGroup(memory int64, slots, parts int, cols []Column) int64 {
+	const most = 122_880
+	if memory <= 0 {
+		return most
+	}
+	if parts <= 0 {
+		parts = maxPartitions
+	}
+	n := memory / int64(max(slots, 1)) / 4 / int64(parts) / max(rowWidth(cols), 1)
+	return min(max(n, minShuffleRowGroup), most)
+}
+
+// minShuffleRowGroup is the fewest rows a shuffle task writes to a row
+// group; the coordinator gives exchanges no more partitions than leave
+// their writers room for groups this size (see writerPartitions).
+const minShuffleRowGroup = 2_048
+
+// shuffleFlush is how many rows each of a shuffle task's threads gathers
+// before it hands them to the partitions' writers. DuckDB's 524,288 held
+// every row of a task of rows of 400 strings, 8.8 GB of a million rows, and
+// took a writer of 3 GB to its limit for minutes. Those of all threads get
+// a quarter of the task's share of the worker's memory, at the width of the
+// rows' types, between 16,384 rows (fewer took longer) and DuckDB's own.
+func shuffleFlush(memory int64, slots, threads int, cols []Column) int64 {
+	const most, least = 524_288, 16_384
+	if memory <= 0 {
+		return most
+	}
+	n := memory / int64(max(slots, 1)) / 4 / int64(max(threads, 1)) / max(rowWidth(cols), 1)
+	return min(max(n, least), most)
+}
+
+// threadsOf returns DuckDB's threads on conn, or 1 if it cannot tell.
+func threadsOf(ctx context.Context, conn *duckdb.Conn) int {
+	rows, err := conn.QueryContext(ctx, "SELECT current_setting('threads')::BIGINT", nil)
+	if err != nil {
+		return 1
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, 1)
+	if rows.Next(dest) != nil {
+		return 1
+	}
+	n, _ := dest[0].(int64)
+	return max(int(n), 1)
+}
+
+// rowWidth is the width of a row of cols, by their types (typeWidth).
+func rowWidth(cols []Column) int64 {
+	var width int64
+	for _, c := range cols {
+		width += typeWidth(c.Type)
+	}
+	return width
+}
+
 // shuffle writes the rows of query, partitioned by its __b column, under
 // dir, and lists the files written.
-func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column) (*taskResult, error) {
+func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
 	if !w.allowed(dir+"/") || !strings.Contains(dir, "/"+config.ShuffleDir+"/") {
 		return nil, fmt.Errorf("shuffle directory %s is outside the warehouse's %s", dir, config.ShuffleDir)
 	}
@@ -508,11 +573,15 @@ func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query stri
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_max_open_files = %d", 4*maxPartitions), nil); err != nil {
 		return nil, err
 	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_flush_threshold = %d",
+		shuffleFlush(w.opts.MemoryBytes, cap(w.slots), threadsOf(ctx, conn), cols)), nil); err != nil {
+		return nil, err
+	}
 	// RETURN_STATS says what the COPY wrote, file by file: listing the
 	// files and reading their footers back took requests one after
 	// another, a listing and two per file, after the files were written.
 	res, err := conn.QueryContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+quoteLiteral(dir)+
-		" (FORMAT parquet, PARTITION_BY (__b), RETURN_STATS)", nil)
+		fmt.Sprintf(" (FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d, RETURN_STATS)", shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols)), nil)
 	if err != nil {
 		return nil, err
 	}

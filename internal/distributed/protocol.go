@@ -40,8 +40,10 @@ type taskRequest struct {
 	Columns []string `json:"columns,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory
 	// in object storage, partitioned by its __b column, instead of sending
-	// it back; the response lists the files.
-	Shuffle string `json:"shuffle,omitempty"`
+	// it back; the response lists the files. Partitions is how many
+	// partitions there are, a row group of each of which the writer holds.
+	Shuffle    string `json:"shuffle,omitempty"`
+	Partitions int    `json:"partitions,omitempty"`
 }
 
 // setting is a session setting the fragment runs with.

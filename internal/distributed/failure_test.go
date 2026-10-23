@@ -272,7 +272,7 @@ func TestShuffleFiles(t *testing.T) {
 	dir := filepath.Join(h.dir, "warehouse", config.ShuffleDir, "q", "s0", "0", "a0")
 	cols := []Column{{Name: "i", Type: "BIGINT"}, {Name: "s", Type: "VARCHAR"}, {Name: "__b", Type: "INTEGER"}}
 	res, err := w.shuffle(t.Context(), conn, dir,
-		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols)
+		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols, parts)
 	if err != nil {
 		t.Fatal(err)
 	}

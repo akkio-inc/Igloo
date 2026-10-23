@@ -432,12 +432,6 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	// As many workers as the estimates call for (see estimateTimes), or
 	// every one when an admin forces it. Forced by anyone else, only
 	// workers already running, and no more than the estimates call for.
-	var split int64
-	for _, s := range plan.Stages {
-		if in := s.split(); in != nil {
-			split = max(split, in.Table.Bytes)
-		}
-	}
 	want := max(1, plan.workers)
 	var ws []*worker
 	var err error
@@ -481,10 +475,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 
 	loaded := time.Since(start)
 	qid := filepath.Base(ex.dir)
-	// Partitions enough for the workers and the largest table, and more if
-	// the exchanges' rows need more to fit a task's memory, at a hundred
-	// times the data.
-	parts := max(partitions(len(ws), split, partitionBytes), min(partitionsFor(plan.Stages, taskMemory(ws)), maxPartitions))
+	parts := exchangePartitions(plan.Stages, ws, len(ws))
 	var run *execution
 	for attempt := 0; ; attempt++ {
 		// Each attempt's tasks and exchanges are its own, so that what a
@@ -517,6 +508,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			// divided table halved, and half the memory to group
 			// partitions in (see groups).
 			next := min(2*parts, maxPartitions)
+			if most := writerPartitions(plan.Stages, ws); most > 0 {
+				next = min(next, max(most, len(ws), parts))
+			}
 			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",
 				"query", qid, "attempt", attempt+1, "partitions", next, "err", err)
 			parts = next

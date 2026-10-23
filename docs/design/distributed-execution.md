@@ -527,7 +527,23 @@ partition: DuckDB keeps only 100 of a partitioned `COPY`'s files open and
 starts new ones past that, which at 256 partitions made a task write
 17,275 files of 24 KB for 23 minutes, so workers raise that limit; the
 coordinator warns of an exchange with more files than its tasks times its
-partitions. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
+partitions. The writer also holds a row group of every partition's rows,
+as they are, until it fills: 128 partitions of rows of 264 bytes held 3 GB
+in DuckDB's row groups of 122,880 rows, and at a hundred times the data
+took workers of 24.6 GiB out of memory. So a task's row groups have as
+many rows as keep those of all partitions within a quarter of its share of
+the worker's memory, at the width of the rows' types (8,192 rows held 0.4
+GB, and took no longer to write), between 2,048 and 122,880. Each of the
+task's threads gathers rows before it hands them to the partitions'
+writers, 524,288 by default, which held every row of a task of rows of
+400 strings (8.8 GB of a million rows); the threads' together get another
+quarter, but no fewer than 16,384 rows each, as fewer took longer. And
+since even groups of 2,048 rows of 400 strings over 128 partitions took a
+3 GB writer out of memory, a statement's exchanges get no more partitions
+than leave room for groups that size at the width of its widest exchange
+(`writerPartitions`), and still one a worker: 28 for that worker, which
+wrote them in 76 s within 1.3 GB, where 32 and 64 partitions took 123 and
+194 s at its limit. Narrow exchanges, of IDs and flags, are not held back. Columns that Parquet would change (`HUGEINT`, `INTERVAL`,
 `TIME WITH TIME ZONE`) cross exchanges as text and are cast back, as
 results do. A task learns the files it wrote, their rows and their sizes
 from `COPY ... (RETURN_STATS)`, rather than listing them and reading their

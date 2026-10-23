@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +88,82 @@ func TestPartitionsFor(t *testing.T) {
 	big.Rows = 1000
 	if n := partitionsFor(stages, 1<<30); n != 1 {
 		t.Errorf("%d partitions for a thousand rows", n)
+	}
+}
+
+// TestShuffleRowGroup checks the row groups a shuffle task writes: as many
+// rows as keep a group of every partition within a quarter of the task's
+// memory, between 2,048 and DuckDB's 122,880.
+func TestShuffleRowGroup(t *testing.T) {
+	wide := []Column{{Type: "BIGINT"}, {Type: "VARCHAR"}, {Type: "VARCHAR"}, {Type: "VARCHAR"}, {Type: "VARCHAR"}, {Type: "VARCHAR"},
+		{Type: "VARCHAR"}, {Type: "VARCHAR"}, {Type: "VARCHAR"}, {Type: "INTEGER"}}
+	for _, c := range []struct {
+		memory      int64
+		slots, part int
+		cols        []Column
+		want        int64
+	}{
+		{24 << 30, 3, 128, wide, 62_601},
+		{24 << 30, 3, 8, wide, 122_880},
+		{500 << 20, 1, 256, wide, 2_048},
+		{0, 1, 128, wide, 122_880},
+		{3 << 30, 1, 0, wide, 11_737},
+	} {
+		if got := shuffleRowGroup(c.memory, c.slots, c.part, c.cols); got != c.want {
+			t.Errorf("%d bytes over %d slots, %d partitions: %d rows a group, want %d", c.memory, c.slots, c.part, got, c.want)
+		}
+	}
+}
+
+// TestWriterPartitions checks the cap on partitions that exchanges' writers
+// set: none to speak of for a few narrow columns, as a report's exchanges
+// of IDs and flags, on workers of 24.5 GiB; 28 for rows of 400 strings on
+// a worker of 3 GB, which wrote them in 76 s within 1.3 GB, where 32 and 64
+// partitions took 123 and 194 s at its limit and 128 ran out of memory.
+// Twice the partitions, as running again after running out of memory
+// gives, halve the row groups, down to the fewest rows.
+func TestWriterPartitions(t *testing.T) {
+	stagesOf := func(cols []Column) []*Stage {
+		tbl := &Table{Name: "t", Rows: 4e9, Columns: cols}
+		return []*Stage{{ID: 0, Inputs: []Input{{View: "t", Table: tbl, Split: true}}, Out: &Exchange{ID: 0}}}
+	}
+	narrow := []Column{{Name: "id", Type: "VARCHAR"}, {Name: "style", Type: "VARCHAR"}, {Name: "channel", Type: "VARCHAR"},
+		{Name: "a", Type: "BOOLEAN"}, {Name: "b", Type: "BOOLEAN"}}
+	var wide []Column
+	for i := range 400 {
+		wide = append(wide, Column{Name: "c" + strconv.Itoa(i), Type: "VARCHAR"})
+	}
+	workers := func(n int, memory int64, slots int) []*worker {
+		var ws []*worker
+		for range n {
+			ws = append(ws, &worker{status: workerStatus{MemoryBytes: memory, Slots: slots, Cores: 16}})
+		}
+		return ws
+	}
+	if most := writerPartitions(stagesOf(narrow), workers(16, 24_500<<20, 3)); most < maxPartitions {
+		t.Errorf("narrow rows on 24.5 GiB workers: at most %d partitions", most)
+	}
+	if most := writerPartitions(stagesOf(wide), workers(1, 3e9, 1)); most != 28 {
+		t.Errorf("400 strings on a 3 GB worker: at most %d partitions, want 28", most)
+	}
+	if n := exchangePartitions(stagesOf(wide), workers(1, 3e9, 1), 1); n != 28 {
+		t.Errorf("400 strings: %d partitions", n)
+	}
+	if n := exchangePartitions(stagesOf(wide), workers(16, 3e9, 1), 16); n < 16 {
+		t.Errorf("%d partitions for 16 workers", n)
+	}
+	cols := []Column{{Type: "BIGINT"}, {Type: "VARCHAR"}}
+	one, two := shuffleRowGroup(1<<30, 1, 64, cols), shuffleRowGroup(1<<30, 1, 128, cols)
+	if one >= 122_880 || two < one/2-1 || two > one/2+1 || shuffleRowGroup(1<<30, 1, 1<<20, cols) != minShuffleRowGroup {
+		t.Errorf("row groups of %d rows over 64 partitions, %d over 128", one, two)
+	}
+	if f := shuffleFlush(3e9, 1, 16, wide); f != 16_384 {
+		t.Errorf("400 strings on 16 threads flush every %d rows", f)
+	}
+	// Narrow rows on 64 threads flush at two thirds of DuckDB's 524,288,
+	// which held 3.3 GB of a task's 8.2 GB.
+	if f := shuffleFlush(24_500<<20, 3, 64, narrow); f != 341_333 {
+		t.Errorf("narrow rows flush every %d rows", f)
 	}
 }
 

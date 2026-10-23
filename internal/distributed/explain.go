@@ -36,17 +36,11 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 	rows := [][2]string{{"runs on", where}, {"reason", d.reason}, {"estimate", estimate}}
 
 	// The partitions Execute would give its exchanges.
-	var split int64
-	for _, s := range plan.Stages {
-		if in := s.split(); in != nil {
-			split = max(split, in.Table.Bytes)
-		}
-	}
 	n := len(d.ws)
 	if n == 0 {
 		n = max(1, plan.workers)
 	}
-	parts := max(partitions(n, split, partitionBytes), min(partitionsFor(plan.Stages, taskMemory(d.ws)), maxPartitions))
+	parts := exchangePartitions(plan.Stages, d.ws, n)
 	rows = append(rows, [2]string{"partitions", strconv.Itoa(parts)})
 	for _, s := range plan.Stages {
 		rows = append(rows, [2]string{s.String(), s.SQL})
