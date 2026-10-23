@@ -34,6 +34,10 @@ type structFlatten struct {
 	// which of them have a value other than a string literal.
 	keys    []string
 	general []bool
+	// text says which general keys every read casts to a type that is not
+	// semi-structured, in a FLATTEN hoisted into its FROM item's select
+	// list: their field is their text alone, _sf_tN (see keysText).
+	textKeys []bool
 	// base, when set, is the struct that reads of its VALUE read in place
 	// of alias._sf_fields: the column of the select list it is hoisted into
 	// (see hoistOf).
@@ -59,14 +63,21 @@ func (s *structFlatten) key(k string) int {
 }
 
 // fieldNames are the names of key i's fields: one for a key of string
-// literals, a list, a string and a JSON part for any other.
+// literals or one read only as text, a list, a string and a JSON part for
+// any other.
 func (s *structFlatten) fieldNames(i int) (str, list, string_, json string) {
 	n := strconv.Itoa(i + 1)
-	if !s.general[i] {
+	switch {
+	case !s.general[i]:
 		return "_sf_k" + n, "", "", ""
+	case s.textOnly(i):
+		return "_sf_t" + n, "", "", ""
 	}
 	return "", "_sf_l" + n, "_sf_s" + n, "_sf_j" + n
 }
+
+// textOnly reports whether key i's field is its text (see text).
+func (s *structFlatten) textOnly(i int) bool { return i >= 0 && i < len(s.textKeys) && s.textKeys[i] }
 
 // parts are the list, string and JSON parts of key i in the struct x, as
 // SQL: for a key of string literals, its field as the string; for a key the
@@ -82,13 +93,14 @@ func (s *structFlatten) parts(x string, i int) (list, str, json string) {
 	return x + "." + l, x + "." + st, x + "." + j
 }
 
-// json is key i of the struct x as JSON, and text as text.
+// json is key i of the struct x as JSON, and text as text. A key read only
+// as text has no JSON a read takes.
 func (s *structFlatten) json(x string, i int) string {
 	l, st, j := s.parts(x, i)
 	switch {
 	case i < 0:
 		return j
-	case !s.general[i]:
+	case !s.general[i] || s.textOnly(i):
 		return "to_json(" + st + ")"
 	}
 	return "sf_fields_json(" + l + ", " + st + ", " + j + ")"
@@ -96,7 +108,10 @@ func (s *structFlatten) json(x string, i int) string {
 
 func (s *structFlatten) text(x string, i int) string {
 	l, st, j := s.parts(x, i)
-	if i < 0 || !s.general[i] {
+	switch {
+	case s.textOnly(i):
+		return "sf_text_read(" + st + ")"
+	case i < 0 || !s.general[i]:
 		return st
 	}
 	return "sf_fields_string(" + l + ", " + st + ", " + j + ")"
@@ -182,6 +197,11 @@ func (t *translator) collectStructs(nodes []*node) {
 		}
 		hoisted[h.item] = true
 		s.base = h.alias + "._sf_t"
+		text := keysText(f.level, reads, colLists)
+		s.textKeys = make([]bool, len(s.keys))
+		for i, k := range s.keys {
+			s.textKeys[i] = s.general[i] && text[k] && i != h.key
+		}
 		t.hoists[f.args] = h
 		if h.reader != nil {
 			t.hoists[h.reader] = h
@@ -400,25 +420,116 @@ func readsText(nodes []*node, alias string, colLists map[*node]bool) bool {
 			if name, _, ok := nodes[q].name(); !ok || strings.ToUpper(name) != alias {
 				continue
 			}
-			k := nextSig(nodes, i)
-			switch {
-			case k >= 0 && nodes[k].isOp("::"):
-				end, ok := scalarType(nodes, nextSig(nodes, k))
-				if r := nextSig(nodes, end-1); !ok || r >= 0 && (nodes[r].isOp(":") || nodes[r].isOp(".") || nodes[r].isGroup('[')) {
-					text = false
-				}
-			case cast && prevSig(nodes, q) < 0 && k >= 0 && nodes[k].word() == "AS":
-				end, ok := scalarType(nodes, nextSig(nodes, k))
-				if !ok || nextSig(nodes, end-1) >= 0 {
-					text = false
-				}
-			default:
+			if !castsText(nodes, q, i, cast) {
 				text = false
 			}
 		}
 	}
 	walk(nodes, false)
 	return text
+}
+
+// keysText reports, of the keys that reads (VALUE's nodes in a select,
+// nodes, and what it nests, outside FLATTENs' column lists) read, those that
+// every read casts to a type that is not semi-structured, by the key alone:
+// alias.VALUE:key or alias.VALUE['key'], or GET_PATH(alias.VALUE, 'key') or
+// GET(alias.VALUE, 'key'), with ::type after or as the whole of CAST's or
+// TRY_CAST's value, as reports read their objects' names and metrics. Such a
+// key's field holds its text alone (0.17 s against 0.19 s for 5 million rows'
+// objects of a dimension and a string, read three times).
+func keysText(nodes []*node, reads map[*node]string, colLists map[*node]bool) map[string]bool {
+	text := map[string]bool{}
+	for _, k := range reads {
+		text[k] = true
+	}
+	// A group's place: the nodes it is in, its index there, and whether it
+	// is CAST's or TRY_CAST's.
+	type place struct {
+		nodes []*node
+		at    int
+		cast  bool
+		call  string
+	}
+	var walk func(nodes []*node, up []place)
+	walk = func(nodes []*node, up []place) {
+		for i, n := range nodes {
+			if n.kind == kGroup && !colLists[n] {
+				call := ""
+				if p := prevSig(nodes, i); p >= 0 && n.isGroup('(') {
+					call = nodes[p].word()
+				}
+				walk(n.kids, append(up, place{nodes: nodes, at: i, cast: call == "CAST" || call == "TRY_CAST", call: call}))
+			}
+			k, ok := reads[n]
+			if !ok || !text[k] {
+				continue
+			}
+			var in place
+			if len(up) > 0 {
+				in = up[len(up)-1]
+			}
+			a := prevSig(nodes, prevSig(nodes, i)) // the alias
+			end := -1
+			if i+1 < len(nodes) && nodes[i+1].isGroup('[') {
+				end = i + 1
+			} else if q := nextSig(nodes, i); q >= 0 && nodes[q].isOp(":") {
+				end = nextSig(nodes, q)
+			}
+			switch {
+			case end >= 0:
+				text[k] = castsText(nodes, a, end, in.cast)
+			case (in.call == "GET_PATH" || in.call == "GET") && singleKey(nodes, in.call):
+				// The call, from its name to its arguments, in the nodes
+				// around it.
+				var out place
+				if len(up) > 1 {
+					out = up[len(up)-2]
+				}
+				text[k] = castsText(in.nodes, prevSig(in.nodes, in.at), in.at, out.cast)
+			default:
+				text[k] = false
+			}
+		}
+	}
+	walk(nodes, nil)
+	return text
+}
+
+// singleKey reports whether the arguments of a GET_PATH or GET call, nodes,
+// read one key, as readKey reads it: GET's key, or a path of one key.
+func singleKey(nodes []*node, call string) bool {
+	args := splitArgs(nodes)
+	if len(args) != 2 {
+		return false
+	}
+	lit := trim(args[1])
+	if len(lit) != 1 {
+		return false
+	}
+	s, ok := lit[0].stringValue()
+	if !ok || call == "GET" {
+		return ok
+	}
+	segs, err := parsePath(s)
+	return err == nil && len(segs) == 1 && !segs[0].isIndex && segs[0].dyn == nil
+}
+
+// castsText reports whether the expression nodes[start:end+1] is cast to a
+// type that is not semi-structured: followed by ::type, with no path after,
+// or the whole value of the CAST or TRY_CAST whose group nodes is (cast),
+// followed by AS type.
+func castsText(nodes []*node, start, end int, cast bool) bool {
+	k := nextSig(nodes, end)
+	switch {
+	case k >= 0 && nodes[k].isOp("::"):
+		e, ok := scalarType(nodes, nextSig(nodes, k))
+		r := nextSig(nodes, e-1)
+		return ok && (r < 0 || !nodes[r].isOp(":") && !nodes[r].isOp(".") && !nodes[r].isGroup('['))
+	case cast && prevSig(nodes, start) < 0 && k >= 0 && nodes[k].word() == "AS":
+		e, ok := scalarType(nodes, nextSig(nodes, k))
+		return ok && nextSig(nodes, e-1) < 0
+	}
+	return false
 }
 
 // scalarType reports whether a type that is not semi-structured starts at
@@ -1105,6 +1216,12 @@ func structOf(s *structFlatten, o *objectParts, k int) *node {
 			}
 		}
 		str, l, st, j := s.fieldNames(i)
+		if s.textOnly(i) {
+			// Its text, as a read of its parts reads it.
+			list, text, json := structParts(x, o.keepNull)
+			kids = append(kids, raw(", '"+str+"': CAST(sf_fields_string("), list, raw(", "), text, raw(", "), json, raw(") AS VARCHAR)"))
+			continue
+		}
 		if str != "" {
 			if x == nil || x.word() == "NULL" {
 				x = raw("NULL")

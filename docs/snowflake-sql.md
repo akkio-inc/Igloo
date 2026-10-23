@@ -165,13 +165,14 @@ JSON and JSON text alike.
   the report groups by. When every read of the second `FLATTEN`'s elements
   casts them to a type that is not semi-structured, as
   `CAST(v.value AS TEXT)` does, it unnests their text rather than JSON of
-  each. Where the objects are not unnested so, a `WHERE` there stays out of
-  the joins: its conditions on the tables go into the `ON` of the first
-  `FLATTEN`'s join,
-  which DuckDB pushes down to the tables, those on the objects' keys filter
-  the objects, and those on a second `FLATTEN`'s elements filter the elements
-  when the statement reads nothing of that `FLATTEN` but its `VALUE`. Any
-  other read of `VALUE`, a star at that level, a subquery that
+  each, and a key that every read casts so is a field of its text alone.
+  Where the objects are not unnested so, a `WHERE` there stays out of the
+  joins: its conditions on the tables go into the `ON` of the first
+  `FLATTEN`'s join, which DuckDB pushes down to the tables, those on the
+  objects' keys filter the objects, and those on a second `FLATTEN`'s
+  elements filter the elements when the statement reads nothing of that
+  `FLATTEN` but its `VALUE`. Any other read of `VALUE`, a star at that level,
+  a subquery that
   names the alias, or a second `FLATTEN` of it with `OUTER`, `PATH` or a
   longer path keeps the objects JSON; so do, when a second `FLATTEN` reads
   them, a `WHERE` that cannot stay out of the joins (a condition on another

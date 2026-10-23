@@ -207,6 +207,16 @@ func TestNativeColumnsReadAsJSON(t *testing.T) {
 		{q: `select t.id, v.value from %[1]s t, lateral flatten(input => [object_construct('l', t.a)]) g, lateral flatten(input => g.value:l) v
 			%[2]s order by v.value, 1`, builds: true,
 			asJSON: `where g.value is not null`},
+		// Keys that every read casts, by each form of read: strings, lists,
+		// maps, NULLs left out or kept, numbers and objects, and a key some
+		// objects lack.
+		{q: `select t.id, cast(g.value:k as text), g.value:l::string, cast(get_path(g.value, 'n') as text), try_cast(get(g.value, 'n') as float),
+				cast(g.value['m'] as text)
+			from %[1]s t, lateral flatten(input => [object_construct('k', 'a', 'l', t.a, 'n', null, 'm', t.o),
+				object_construct_keep_null('k', 'b', 'l', t.a, 'n', null, 'm', t.s),
+				object_construct('k', null, 'l', ['x', 'y'], 'n', 1.5, 'm', parse_json('{"z": [1, "w"]}')),
+				object_construct_keep_null('l', t.o, 'n', object_construct('z', true), 'm', t.id)]) g %[2]s order by 1, 2, 3, 4, 5, 6`, builds: true,
+			asJSON: `where g.value is not null`},
 		// CTEs that each flatten objects of their own keys AS g and v.
 		{q: `with a as (select t.id, 'a' as src, g.index as gi, g.value:k::string as k, v.value::string as x from %[1]s t,
 					lateral flatten(input => [object_construct('k', 'x', 'l', t.a), object_construct('l', t.o)]) g,
@@ -364,9 +374,18 @@ func TestFlattenShapes(t *testing.T) {
 		{`select g.value:k::string from tab m, lateral flatten(input => [object_construct('k', ['p', '{"q": 1}'])]) g`,
 			`'_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST(sf_string_part(json_array('p', '{"q": 1}')) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(json_array('p', '{"q": 1}')) AS JSON)`, ``},
 		{`select g.value:n::string from tab m inner join u on u.id = m.id cross join lateral flatten(input => [object_construct('n', m.s), object_construct('n', 'x')]) as g(seq, key, path, index, value, this) where m.id > 1`,
-			`from (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), '_sf_l1': CAST(sf_list_part(m.s) AS VARCHAR[]), '_sf_s1': CAST(sf_string_part(m.s) AS VARCHAR), ` +
-				`'_sf_j1': CAST(sf_other_part(m.s) AS JSON)}, {'_sf_i': CAST(1 AS BIGINT), '_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST('x' AS VARCHAR), '_sf_j1': CAST(NULL AS JSON)}]) AS _sf_t FROM tab m) AS m ` +
+			`select sf_text_read(m._sf_t._sf_t1) AS "G.VALUE:N::STRING" from (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), ` +
+				`'_sf_t1': CAST(sf_fields_string(sf_list_part(m.s), sf_string_part(m.s), sf_other_part(m.s)) AS VARCHAR)}, ` +
+				`{'_sf_i': CAST(1 AS BIGINT), '_sf_t1': CAST(sf_fields_string(NULL, 'x', NULL) AS VARCHAR)}]) AS _sf_t FROM tab m) AS m ` +
 				`inner join u on u.id = m.id where m.id > 1`, `LATERAL`},
+		// A key that every read casts is its text alone; one read otherwise
+		// keeps its parts.
+		{`select cast(get_path(g.value, 'n') as text), try_cast(get(g.value, 'n') as float), g.value['n']::string from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`,
+			`select sf_text_read(m._sf_t._sf_t1) AS "CAST(GET_PATH(G.VALUE, 'N') AS TEXT)", TRY_CAST(sf_text_read(m._sf_t._sf_t1) AS DOUBLE) AS "TRY_CAST(GET(G.VALUE, 'N') AS FLOAT)", sf_text_read(m._sf_t._sf_t1) AS`, `_sf_l1`},
+		{`select cast(g.value:n as text), g.value:n from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`,
+			`'_sf_l1': CAST(sf_list_part(m.s) AS VARCHAR[])`, `_sf_t1`},
+		{`select cast(g.value:n.x as text) from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`, `'_sf_l1'`, `_sf_t1`},
+		{`select cast(get_path(g.value, 'n.x') as text) from tab m, lateral flatten(input => [object_construct('n', m.s)]) g`, `'_sf_l1'`, `_sf_t1`},
 		{`select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v, lateral flatten(input => v.value) w where m.id > 1`,
 			`AS _sf_t FROM tab m) AS m) AS m, LATERAL (SELECT`, `"g"`},
 		// Not when the objects read two FROM items, or a column unqualified,
@@ -652,6 +671,21 @@ func TestFlattenStructsPlan(t *testing.T) {
 	}
 	if !strings.Contains(res.SQL, "sf_parts_strings(") {
 		t.Errorf("elements not unnested as text:\n%s", res.SQL)
+	}
+	if unnestBuilt(t, conn, res.SQL) {
+		t.Errorf("a join builds its hash table on unnested rows:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
+	}
+	// So does one on a key read only as text, as reports filter their
+	// media signals' names.
+	res, err = Translate(`select cast(get_path(d.value, 'dim') as text), cast(get_path(d.value, 'name') as text), c.cohort, count(distinct m.id)
+		from tb as m inner join tc as c on c.id = m.id
+		cross join lateral flatten(input => [object_construct('dim', 'S', 'name', m.s), object_construct('dim', 'T', 'name', 'x')]) as d(seq, key, path, index, value, this)
+		where not cast(get_path(d.value, 'name') as text) is null and trim(cast(get_path(d.value, 'name') as text)) <> '' group by 1, 2, 3`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.SQL, "'_sf_t2'") {
+		t.Errorf("the name is not its text alone:\n%s", res.SQL)
 	}
 	if unnestBuilt(t, conn, res.SQL) {
 		t.Errorf("a join builds its hash table on unnested rows:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))

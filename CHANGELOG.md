@@ -897,7 +897,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   it, as one through `json_extract_string` did, so that DuckDB, which takes
   a filtered unnest for a fifth of the rows it reads, builds a join's hash
   table on the other side, as reports join their signals to cohorts: it
-  had built one on 90 million browsing elements.
+  had built one on 90 million browsing elements. A key of the objects that
+  every read casts so is one field of text, built once for each object,
+  rather than a list, a string and a JSON part that each read combines:
+  reports' media signals, objects of a dimension and a name filtered and
+  grouped by the name, took 0.20 s for 5 million rows and take 0.18 s.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables
