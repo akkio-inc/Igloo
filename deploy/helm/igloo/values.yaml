@@ -93,7 +93,8 @@ duckdb:
   # resources.limits.memory, leaving at least 512Mi for the rest of the
   # process, so queries spill to disk before the container is OOM-killed.
   memoryLimit: ""
-  # -> IGLOO_DUCKDB_THREADS. null: two per core of the node (four on workers).
+  # -> IGLOO_DUCKDB_THREADS. null: two per core of the node (four on workers),
+  # as long as each thread past the cores has 2 GiB of DuckDB's memory limit.
   threads: null
   # -> IGLOO_DUCKDB_MAX_TEMP_SIZE, e.g. "40GiB": the most spill space one pod
   # may use. Empty: 90% of spillVolume.sizeLimit, so a query that needs more

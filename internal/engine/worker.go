@@ -53,10 +53,8 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 		_, err := conn.ExecContext(ctx, stmt, nil)
 		return err
 	}
-	for _, stmt := range settingStatements(withThreads(cfg, workerThreadsPerCore)) {
-		if err := exec(stmt); err != nil {
-			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)
-		}
+	if err := configure(cfg, workerThreadsPerCore, exec, func(q string) (string, error) { return queryString(ctx, conn, q) }); err != nil {
+		return err
 	}
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)

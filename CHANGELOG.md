@@ -926,8 +926,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   instead of one. Reading object storage cold waits on requests, not on
   cores: on 8 cores, a cold scan of 23 GB read 64 MB/s on 8 threads and
   172 MB/s on 32, and a report that took 66 s cold took 33 s on 16 threads
-  (12 s warm either way). Auto mode's estimates of distributed execution
-  count cores rather than threads.
+  (12 s warm either way). Threads past one a core each need 2 GiB of
+  DuckDB's memory limit, or there are fewer of them, never fewer than the
+  cores, as every thread keeps its own hash tables: on 8 cores with a limit
+  of 18.6 GiB, two reports of `COUNT(DISTINCT)`s over 93 million rows took
+  120–139 s on 16 threads, spilling, and 46–51 s on the 9 the limit allows,
+  and five others as long as on 16. Such a machine then keeps fewer reads of
+  object storage in flight cold (a worker of 8 cores and 32 GB about 12
+  rather than 32); `IGLOO_DUCKDB_THREADS` sets more where cold scans matter
+  more. Auto mode's estimates of distributed execution count cores rather
+  than threads.
 - Tables can be clustered. `ALTER TABLE ... SET SORTED BY (a, b)` (and
   Snowflake's `CLUSTER BY`, `ALTER TABLE ... CLUSTER BY`, `DROP CLUSTERING
   KEY`) sets a table's clustering key, which `igloo.tables`,

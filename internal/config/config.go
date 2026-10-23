@@ -158,8 +158,8 @@ type DuckDB struct {
 	// default, 90% of the free space on the spill disk.
 	MaxTempSize string
 	// Threads caps DuckDB's threads. Zero means several per core when the
-	// warehouse is in object storage (see engine.withThreads), and DuckDB's
-	// default of one per core otherwise.
+	// warehouse is in object storage, as the memory limit allows (see
+	// engine.threadsFor), and DuckDB's default of one per core otherwise.
 	Threads int
 	// ExtensionDir is where pre-installed DuckDB extensions live.
 	ExtensionDir string

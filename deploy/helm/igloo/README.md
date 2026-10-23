@@ -394,7 +394,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `storage.gcs.existingSecret` | `""` | Keys `hmac-key-id`, `hmac-secret` for `IGLOO_GCS_HMAC_*`; required for `gs://` |
 | `storage.azure.existingSecret` | `""` | Key `account-key` for `IGLOO_AZURE_ACCOUNT_KEY`. Empty: workload identity. |
 | `duckdb.memoryLimit` | `""` | `IGLOO_DUCKDB_MEMORY_LIMIT`, e.g. `6GB`. Empty: 80% of `resources.limits.memory`, leaving at least 512Mi. |
-| `duckdb.threads` | `null` | `IGLOO_DUCKDB_THREADS`; null: two per core |
+| `duckdb.threads` | `null` | `IGLOO_DUCKDB_THREADS`; null: two per core, as memory allows |
 | `duckdb.maxTempSize` | `""` | `IGLOO_DUCKDB_MAX_TEMP_SIZE`; empty: 90% of `duckdb.spillVolume.sizeLimit`, so an oversized query fails instead of the pod being evicted |
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |
 | `duckdb.spillVolume.medium` | `""` | `""` (node disk, kubelet's directory; see **Spill disk** above) or `Memory` |

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"runtime"
@@ -239,23 +240,49 @@ func TestSettingStatements(t *testing.T) {
 	}
 }
 
-// TestWithThreads checks DuckDB's threads: several a core when the
-// warehouse is in object storage, unless IGLOO_DUCKDB_THREADS says
-// otherwise, and DuckDB's own default without a warehouse.
-func TestWithThreads(t *testing.T) {
+// TestThreadsFor checks DuckDB's threads: several a core when the
+// warehouse is in object storage, as long as each thread past the cores
+// keeps minThreadMemory, never fewer than the cores, unless
+// IGLOO_DUCKDB_THREADS says otherwise; and DuckDB's own default without a
+// warehouse.
+func TestThreadsFor(t *testing.T) {
 	s3 := config.Storage{Type: config.StorageS3}
 	cores := runtime.GOMAXPROCS(0)
 	for _, c := range []struct {
-		cfg  config.Config
-		want int
+		name   string
+		cfg    config.Config
+		memory int64
+		want   int
 	}{
-		{config.Config{Storage: s3}, 4 * cores},
-		{config.Config{Storage: s3, DuckDB: config.DuckDB{Threads: 3}}, 3},
-		{config.Config{}, 0},
+		{"memory unknown", config.Config{Storage: s3}, 0, 4 * cores},
+		{"plenty of memory", config.Config{Storage: s3}, int64(4*cores) * minThreadMemory * 2, 4 * cores},
+		{"memory for twice the cores", config.Config{Storage: s3}, int64(2*cores) * minThreadMemory, 2 * cores},
+		{"memory for a thread and a half a core", config.Config{Storage: s3}, int64(3*cores) * minThreadMemory / 2, 3 * cores / 2},
+		{"little memory", config.Config{Storage: s3}, minThreadMemory, cores},
+		{"set", config.Config{Storage: s3, DuckDB: config.DuckDB{Threads: 3}}, minThreadMemory, 3},
+		{"no warehouse", config.Config{}, minThreadMemory, 0},
 	} {
-		if got := withThreads(c.cfg, 4).Threads; got != c.want {
-			t.Errorf("%+v: %d threads, want %d", c.cfg.Storage, got, c.want)
+		if got := threadsFor(c.cfg, 4, c.memory); got != c.want {
+			t.Errorf("%s: %d threads, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestConfigureThreads checks that DuckDB's threads are set after its other
+// settings, from the memory limit they leave.
+func TestConfigureThreads(t *testing.T) {
+	cores := runtime.GOMAXPROCS(0)
+	cfg := config.Config{Storage: config.Storage{Type: config.StorageS3}, DuckDB: config.DuckDB{MemoryLimit: "6GB"}}
+	var stmts []string
+	exec := func(s string) error { stmts = append(stmts, s); return nil }
+	// Three GiB a core: a thread and a half a core at two GiB a thread.
+	query := func(string) (string, error) { return fmt.Sprintf("%d GiB", 3*cores), nil }
+	if err := configure(cfg, serverThreadsPerCore, exec, query); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("SET threads = %d", 3*cores/2)
+	if len(stmts) < 2 || !strings.HasPrefix(stmts[0], "SET memory_limit") || stmts[len(stmts)-1] != want {
+		t.Errorf("statements %q, want the memory limit first and %q last", stmts, want)
 	}
 }
 

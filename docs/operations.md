@@ -272,7 +272,13 @@ using all of its cores.
   from a warm read cache and is bound by its cores runs as fast or a little
   faster on one thread a core (a report took 15.9 s on 16 threads and
   17.2 s on 32, on 16 cores); set `IGLOO_DUCKDB_THREADS` to the core count
-  for one that is.
+  for one that is. Threads past one a core each need 2 GiB of DuckDB's
+  memory limit, or there are fewer of them, though never fewer than the
+  cores: every thread keeps its own hash tables, and on 8 cores with a limit
+  of 18.6 GiB, two reports of `COUNT(DISTINCT)`s over 93 million rows took
+  120–139 s on 16 threads, spilling, and 46–51 s on the 9 the limit allows.
+  Fewer threads also read object storage cold more slowly; where cold scans
+  matter more than such aggregates, set `IGLOO_DUCKDB_THREADS`.
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
   disk. Size the disk so your frequently read tables fit in half of its free
   space, or set `IGLOO_CACHE_SIZE`.

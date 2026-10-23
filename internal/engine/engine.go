@@ -506,10 +506,8 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 		return err
 	}
 
-	for _, stmt := range settingStatements(withThreads(cfg, serverThreadsPerCore)) {
-		if err := exec(stmt); err != nil {
-			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)
-		}
+	if err := configure(cfg, serverThreadsPerCore, exec, func(q string) (string, error) { return queryString(ctx, conn, q) }); err != nil {
+		return err
 	}
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
@@ -683,19 +681,63 @@ const (
 	workerThreadsPerCore = 4
 )
 
-// withThreads returns cfg's DuckDB settings with Threads set to perCore
-// threads a core, if unset and the warehouse is in object storage.
-func withThreads(cfg config.Config, perCore int) config.DuckDB {
-	d := cfg.DuckDB
+// minThreadMemory is the DuckDB memory each thread past one a core must
+// have, or there are fewer of them. Every thread keeps its own hash tables
+// and buffers, so threads beyond the cores split the memory limit into
+// shares too small for aggregates and joins, which then spill. On a machine
+// of 8 cores with a memory limit of 18.6 GiB, two reports of
+// COUNT(DISTINCT)s over 93 million unnested rows took 120-139 s on 16
+// threads (1.2 GiB each), spilling 4.2 GiB, 48 s on 8 (2.3 GiB each) and
+// 46-51 s on 9 (2.1 GiB each), while five others took as long on 9 as on 16.
+// Fewer threads also keep fewer reads of object storage in flight, which
+// slows cold scans (see serverThreadsPerCore).
+const minThreadMemory = 2 << 30
+
+// threadsFor returns DuckDB's threads for cfg: IGLOO_DUCKDB_THREADS if set;
+// when the warehouse is in object storage, perCore threads a core, but no
+// more than leave each minThreadMemory of memory, DuckDB's memory limit in
+// bytes (unknown if 0), and never fewer than the cores; and otherwise 0,
+// DuckDB's own default of one a core.
+func threadsFor(cfg config.Config, perCore int, memory int64) int {
+	if cfg.DuckDB.Threads > 0 {
+		return cfg.DuckDB.Threads
+	}
 	switch cfg.Storage.Type {
 	case config.StorageS3, config.StorageGCS, config.StorageAzure:
-		if d.Threads == 0 {
-			// The cores this process may use: a container's CPU limit, if
-			// it has one.
-			d.Threads = perCore * runtime.GOMAXPROCS(0)
+		// The cores this process may use: a container's CPU limit, if it
+		// has one.
+		cores := runtime.GOMAXPROCS(0)
+		n := perCore * cores
+		if memory > 0 {
+			n = min(n, max(cores, int(memory/minThreadMemory)))
+		}
+		return n
+	}
+	return 0
+}
+
+// configure applies cfg's DuckDB settings with exec, then its threads (see
+// threadsFor), which depend on the memory limit those settings leave, as
+// query reads it.
+func configure(cfg config.Config, perCore int, exec func(string) error, query func(string) (string, error)) error {
+	d := cfg.DuckDB
+	d.Threads = 0
+	for _, stmt := range settingStatements(d) {
+		if err := exec(stmt); err != nil {
+			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)
 		}
 	}
-	return d
+	var memory int64
+	if v, err := query("SELECT current_setting('memory_limit')::VARCHAR"); err == nil {
+		memory, _ = config.ParseSize(v)
+	}
+	if n := threadsFor(cfg, perCore, memory); n > 0 {
+		stmt := fmt.Sprintf("SET threads = %d", n)
+		if err := exec(stmt); err != nil {
+			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)
+		}
+	}
+	return nil
 }
 
 func settingStatements(d config.DuckDB) []string {
