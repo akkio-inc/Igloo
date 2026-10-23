@@ -166,6 +166,9 @@ type Maintainer struct {
 	// Options.Memory, with the snapshot it was tried at: they are not
 	// compacted again until they change.
 	tooBig map[string]int64
+	// maxRewrite, if set, is how many bytes clustering rewrites a pass in
+	// place of maxCompactBytes, for tests.
+	maxRewrite int64
 }
 
 // New maintains the tables in cat. warehouse is the warehouse root, such as

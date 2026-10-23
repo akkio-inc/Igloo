@@ -346,3 +346,71 @@ func TestClusterFields(t *testing.T) {
 		}
 	}
 }
+
+// TestClusteringBacklogTakesPasses clusters a table larger than a pass may
+// rewrite: each pass rewrites no more than its limit, and passes converge
+// on files whose ranges do not overlap, with the same rows.
+func TestClusteringBacklogTakesPasses(t *testing.T) {
+	db := openDuckDB(t)
+	dir := t.TempDir()
+	u := unsortedTable{files: 8, rows: 20_000, keys: 2000}
+	cat := u.table(t, db, dir, byAudience(t))
+	files := dataFiles(t, cat.tbl)
+	want := u.digest(t, db, files)
+	var size int64
+	tasks, err := cat.tbl.Scan().PlanFiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range tasks {
+		size += task.File.FileSizeBytes()
+	}
+	m := New(nil, dir+"/", Options{SpillDir: t.TempDir()}, quiet)
+	m.maxRewrite = size / 3
+	withTarget(t, cat, size/16)
+	passes := 0
+	for ; passes < 20; passes++ {
+		before := cat.tbl.CurrentSnapshot()
+		prev := map[string]bool{}
+		for _, f := range dataFiles(t, cat.tbl) {
+			prev[f] = true
+		}
+		if _, err := m.compactOrCluster(context.Background(), cat.tbl); err != nil {
+			t.Fatal(err)
+		}
+		if cat.tbl.CurrentSnapshot().SnapshotID == before.SnapshotID {
+			break
+		}
+		// What the pass replaced is within its limit, but for the file
+		// that crossed it, or the two files any pass merges.
+		var replaced, largest int64
+		n := 0
+		now := map[string]bool{}
+		for _, f := range dataFiles(t, cat.tbl) {
+			now[f] = true
+		}
+		for _, task := range tasks {
+			if prev[task.File.FilePath()] && !now[task.File.FilePath()] {
+				replaced += task.File.FileSizeBytes()
+				largest = max(largest, task.File.FileSizeBytes())
+				n++
+			}
+		}
+		if n > 2 && replaced > m.maxRewrite+largest {
+			t.Errorf("pass %d replaced %d files, %d bytes, more than its %d", passes+1, n, replaced, m.maxRewrite)
+		}
+		if tasks, err = cat.tbl.Scan().PlanFiles(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if passes < 2 || passes >= 20 {
+		t.Errorf("clustered in %d passes", passes)
+	}
+	if n := overlaps(t, cat.tbl); n != 0 {
+		t.Errorf("%d files overlap after %d passes", n, passes)
+	}
+	if got := u.digest(t, db, dataFiles(t, cat.tbl)); got != want {
+		t.Errorf("rows changed: %s, want %s", got, want)
+	}
+	t.Logf("clustered in %d passes into %d files", passes, len(dataFiles(t, cat.tbl)))
+}

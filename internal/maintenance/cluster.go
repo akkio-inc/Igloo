@@ -225,14 +225,18 @@ func (m *Maintainer) cluster(ctx context.Context, tbl *table.Table, fields []fil
 		total   int64
 		rewrite = map[string]struct{}{}
 	)
-	for i := 0; i < len(s); {
+	limit := m.rewriteLimit()
+	for i, full := 0, false; i < len(s) && !full; {
 		if !pick[i] {
 			i++
 			continue
 		}
 		var g table.CompactionTaskGroup
 		for ; i < len(s) && pick[i]; i++ {
-			if len(groups) > 0 && total+g.TotalSizeBytes+s[i].task.File.FileSizeBytes() > maxCompactBytes {
+			// An island gets two files, however large, so that each pass
+			// merges something; past those, the limit holds.
+			if (len(groups) > 0 && len(g.Tasks) == 0 || len(g.Tasks) >= 2) && total+g.TotalSizeBytes+s[i].task.File.FileSizeBytes() > limit {
+				full = true
 				break
 			}
 			g.Tasks = append(g.Tasks, s[i].task)
@@ -249,9 +253,6 @@ func (m *Maintainer) cluster(ctx context.Context, tbl *table.Table, fields []fil
 			for _, t := range g.Tasks {
 				rewrite[t.File.FilePath()] = struct{}{}
 			}
-		}
-		if total >= maxCompactBytes {
-			break
 		}
 	}
 	if len(groups) == 0 {
@@ -281,6 +282,14 @@ func (m *Maintainer) cluster(ctx context.Context, tbl *table.Table, fields []fil
 
 // spillPrefix starts the names of clustering's spill directories.
 const spillPrefix = "igloo-cluster-"
+
+// rewriteLimit is how many bytes of files a pass rewrites at most.
+func (m *Maintainer) rewriteLimit() int64 {
+	if m.maxRewrite > 0 {
+		return m.maxRewrite
+	}
+	return maxCompactBytes
+}
 
 // sortedWriter writes a group's files sorted by fields, spilling under
 // Options.SpillDir. Spill directories a day old, which a clustering that
