@@ -14,10 +14,19 @@ import (
 // rewrites them later, gets through 8 GB a table an hour. 512 MiB is the
 // Iceberg spec's default, the size compaction makes files, and, as
 // workers get whole files, a split as fine as their gigabyte each needs.
+//
+// It also marks the table as Igloo's to size the row groups of
+// (rowGroupsProperty): table maintenance sets the row group size DuckDB's
+// inserts write from the table's bytes a row (see package maintenance).
 const (
 	targetFileSizeProperty = "write.target-file-size-bytes"
 	targetFileSize         = "536870912"
+	rowGroupsProperty      = "igloo.row-groups"
+	rowGroupsAuto          = "auto"
 )
+
+// defaults are the properties Igloo gives each table its SQL creates.
+var defaults = map[string]string{targetFileSizeProperty: targetFileSize, rowGroupsProperty: rowGroupsAuto}
 
 // withDefaults returns body, a change DuckDB asked of the catalog at rest,
 // with Igloo's default properties added to each table it creates: in the
@@ -122,20 +131,27 @@ func createDefaults(change json.RawMessage) (json.RawMessage, bool) {
 	return remarshal(change, ch, "updates", updates), true
 }
 
-// hasDefaults reports whether props sets Igloo's default properties.
+// hasDefaults reports whether props sets all of Igloo's default properties.
 func hasDefaults(props map[string]string) bool {
-	_, ok := props[targetFileSizeProperty]
-	return ok
+	for k := range defaults {
+		if _, ok := props[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // addDefaults adds Igloo's default properties that props lacks to it, and
 // reports whether there were any.
 func addDefaults(props map[string]string) bool {
-	if hasDefaults(props) {
-		return false
+	added := false
+	for k, v := range defaults {
+		if _, ok := props[k]; !ok {
+			props[k] = v
+			added = true
+		}
 	}
-	props[targetFileSizeProperty] = targetFileSize
-	return true
+	return added
 }
 
 // remarshal returns obj, read from body, with its key set to v, or body if

@@ -131,10 +131,7 @@ func Sorted(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.Fi
 	if err != nil {
 		return nil, Layout{}, fmt.Errorf("measure rows: %w", err)
 	}
-	maxRowGroup := int64(DefaultRowGroupRows)
-	if n, err := strconv.ParseInt(tbl.Properties()[table.ParquetRowGroupLimitKey], 10, 64); err == nil && n > 0 {
-		maxRowGroup = n
-	}
+	maxRowGroup := RowGroupRows(tbl.Properties(), tasks)
 	// Reading and writing get half the budget, and the range being sorted
 	// the other half: the range as read, concatenated, and sorted.
 	lay, err := Plan(budget/2, rowBytes, 2*rowGroup+deleteBytes(tasks), maxRowGroup)

@@ -1,0 +1,86 @@
+package maintenance
+
+import (
+	"context"
+	"strconv"
+	"testing"
+
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
+
+	"github.com/akkio-inc/igloo/internal/filerewrite"
+)
+
+// TestSizeRowGroups checks the row group size maintenance sets for the
+// inserts into a table Igloo created: from its bytes a row, within the
+// memory of a row group on every thread, and never over a size a user set.
+func TestSizeRowGroups(t *testing.T) {
+	db := openDuckDB(t)
+	dir := t.TempDir()
+	u := unsortedTable{files: 4, rows: 50_000, keys: 500}
+	cat := u.table(t, db, dir, table.UnsortedSortOrder)
+	set := func(props iceberg.Properties) {
+		t.Helper()
+		tx := cat.tbl.NewTransaction()
+		if err := tx.SetProperties(props); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := New(nil, dir+"/", Options{Memory: 1 << 30, Threads: 4}, quiet)
+	size := func() string {
+		t.Helper()
+		if err := m.sizeRowGroups(context.Background(), cat.tbl, quiet); err != nil {
+			t.Fatal(err)
+		}
+		return cat.tbl.Properties()[duckDBRowGroups]
+	}
+
+	// A table Igloo did not create keeps DuckDB's own.
+	if got := size(); got != "" {
+		t.Errorf("a table without the marker got %q", got)
+	}
+	set(iceberg.Properties{rowGroupsProperty: "auto"})
+	summary := cat.tbl.CurrentSnapshot().Summary.Properties
+	bytes, _ := strconv.ParseInt(summary["total-files-size"], 10, 64)
+	rows, _ := strconv.ParseInt(summary["total-records"], 10, 64)
+	want := filerewrite.TargetRows(bytes, rows)
+	// DuckDB's commits leave the files' size out of the summary: the
+	// files say it.
+	delete(summary, "total-files-size")
+	if got := size(); got != strconv.FormatInt(want, 10) || cat.tbl.Properties()[rowGroupsProperty] != "auto:"+got {
+		t.Errorf("row groups of %q rows, marked %q; want %d", got, cat.tbl.Properties()[rowGroupsProperty], want)
+	}
+	if want <= filerewrite.DefaultRowGroupRows {
+		t.Errorf("rows of %d bytes each aim at %d rows a group", bytes/rows, want)
+	}
+
+	// A size near the one in force is not worth a commit; one far from it
+	// is.
+	near := strconv.FormatInt(want*95/100, 10)
+	set(iceberg.Properties{duckDBRowGroups: near, rowGroupsProperty: "auto:" + near})
+	if got := size(); got != near {
+		t.Errorf("%s rows in force became %q, near enough to %d", near, got, want)
+	}
+	far := strconv.FormatInt(want/2, 10)
+	set(iceberg.Properties{duckDBRowGroups: far, rowGroupsProperty: "auto:" + far})
+	if got := size(); got != strconv.FormatInt(want, 10) {
+		t.Errorf("%s rows in force became %q; want %d", far, got, want)
+	}
+
+	// Little memory a thread: as many rows as fit, but no fewer than
+	// DuckDB's own.
+	m.opts.Memory, m.opts.Threads = 64<<20, 64
+	if got := size(); got != strconv.Itoa(filerewrite.DefaultRowGroupRows) {
+		t.Errorf("with 1 MiB a thread: %q rows", got)
+	}
+
+	// A size a user set stays.
+	set(iceberg.Properties{duckDBRowGroups: "1000"})
+	m.opts.Memory, m.opts.Threads = 1<<30, 4
+	if got := size(); got != "1000" {
+		t.Errorf("a user's size became %q", got)
+	}
+}

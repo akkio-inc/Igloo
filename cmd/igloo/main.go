@@ -494,7 +494,11 @@ func serve() error {
 	maintains := cat != nil && cfg.Maintenance.Enabled
 	var schedule maintenance.Schedule
 	if maintains {
-		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, memory, reg, work, notifier.MaintenanceFailed, log)
+		threads, err := eng.Threads(ctx)
+		if err != nil {
+			return err
+		}
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, memory, threads, reg, work, notifier.MaintenanceFailed, log)
 		if err != nil {
 			return err
 		}
@@ -910,7 +914,7 @@ func rewriteMemory(cfg config.Config, memory memlimit.Plan) int64 {
 }
 
 func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
-	memory memlimit.Plan, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+	memory memlimit.Plan, threads int, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	budget := rewriteMemory(cfg, memory)
 	if memory.Go > 0 && budget > memory.Go/2 {
 		log.Warn("IGLOO_MAINTENANCE_MEMORY is more than half of Go's memory limit; compaction may leave too little for the rest of Igloo",
@@ -920,6 +924,7 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		Interval:  cfg.Maintenance.Interval,
 		Retention: cfg.Maintenance.Retention,
 		Memory:    budget,
+		Threads:   threads,
 		// Clustering spills where DuckDB does, on local disk where it
 		// is set (IGLOO_DUCKDB_TEMP_DIR).
 		SpillDir: cfg.DuckDB.TempDir,

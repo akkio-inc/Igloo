@@ -216,7 +216,7 @@ files on its own; see [table maintenance](operations.md#table-maintenance).
 | `IGLOO_MAINTENANCE` | `true` | Run table maintenance. Turn it off only if another tool maintains the tables. |
 | `IGLOO_SNAPSHOT_RETENTION` | `7d` | How long old snapshots are kept, and so how far back time travel reaches, e.g. `1d` or `36h`. A table's `history.expire.max-snapshot-age-ms` property overrides it. |
 | `IGLOO_MAINTENANCE_INTERVAL` | `1h` | Time between passes over every table |
-| `IGLOO_MAINTENANCE_MEMORY` | a quarter of Go's memory limit | Memory compaction, and the rewrite of a table's files for an [erasure request](privacy.md), may hold, e.g. `2GB`: by default between 256 MiB (or half of Go's limit, if less) and 4 GiB, or 1 GiB when Igloo cannot tell how much memory it has. A table that cannot be compacted within it is left as it is, and an erasure request that cannot rewrite one within it stops with the reason; see [compaction memory](operations.md#compaction-memory). |
+| `IGLOO_MAINTENANCE_MEMORY` | a quarter of Go's memory limit | Memory compaction, and the rewrite of a table's files for an [erasure request](privacy.md), may hold, e.g. `2GB`: by default between 256 MiB (or half of Go's limit, if less) and 4 GiB, or 1 GiB when Igloo cannot tell how much memory it has. A table that cannot be compacted within it is left as it is, and an erasure request that cannot rewrite one within it stops with the reason; see [compaction memory](operations.md#compaction-memory). It also bounds, over `IGLOO_DUCKDB_THREADS`, the row groups inserts write into the tables Igloo creates; see [row groups](operations.md#row-groups). |
 
 ## Distributed execution
 

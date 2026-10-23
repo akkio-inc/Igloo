@@ -4,10 +4,12 @@ import (
 	"context"
 	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/engine"
@@ -56,10 +58,44 @@ func TestNewTablesWriteLargeFiles(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"made", "filled"} {
-		if got := vc.fake.Metadata("public", name).Properties()["write.target-file-size-bytes"]; got != "536870912" {
+		props := vc.fake.Metadata("public", name).Properties()
+		if got := props["write.target-file-size-bytes"]; got != "536870912" {
 			t.Errorf("%s: write.target-file-size-bytes %q", name, got)
 		}
+		if got := props["igloo.row-groups"]; got != "auto" {
+			t.Errorf("%s: igloo.row-groups %q", name, got)
+		}
 	}
+
+	// Maintenance sizes the row groups of the tables Igloo marks with
+	// write.parquet.row-group-size, which DuckDB's inserts follow.
+	mustExec(t, admin, "CREATE TABLE lake.public.grouped AS SELECT * FROM seed LIMIT 0")
+	mustExec(t, admin, "SELECT * FROM set_iceberg_table_properties(lake.public.grouped, {'write.parquet.row-group-size': '400000'})")
+	mustExec(t, admin, "INSERT INTO lake.public.grouped SELECT * FROM seed")
+	var grouped []string
+	loc := strings.TrimPrefix(vc.fake.Metadata("public", "grouped").Location(), "file://")
+	_ = filepath.WalkDir(loc, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".parquet") {
+			grouped = append(grouped, p)
+		}
+		return nil
+	})
+	if len(grouped) != 1 {
+		t.Fatalf("grouped: data files %v under %s", grouped, loc)
+	}
+	f, err := os.Open(grouped[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rdr, err := file.NewParquetReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Close() //nolint:errcheck
+	if n := rdr.MetaData().RowGroup(0).NumRows(); n <= 122_880 {
+		t.Errorf("grouped: a row group of %d rows, in %d groups", n, rdr.NumRowGroups())
+	}
+
 	// DuckDB refuses to write a partitioned table that has a target file
 	// size, unless told to ignore it, as Igloo does.
 	mustExec(t, admin, "CREATE TABLE lake.public.parts AS SELECT i % 4 AS k, a FROM seed LIMIT 1000")

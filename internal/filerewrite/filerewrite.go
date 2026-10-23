@@ -38,9 +38,19 @@ import (
 const (
 	// DefaultMemory is a rewrite's budget when none is given.
 	DefaultMemory = 1 << 30
-	// DefaultRowGroupRows is the row group size a rewrite writes, DuckDB's,
-	// when the budget and the table's write.parquet.row-group-limit allow.
+	// DefaultRowGroupRows is DuckDB's row group size, the fewest rows a
+	// rewrite aims a row group at (see RowGroupRows).
 	DefaultRowGroupRows = 122_880
+	// TargetRowGroupBytes is the compressed size a rewrite aims a row group
+	// at. Narrow rows in groups of DuckDB's 122,880 rows make row groups of
+	// a few hundred kilobytes, each read with requests of its own: a cold
+	// scan of a 2.4 GB table of 0.3 MiB row groups took 24 to 29 s, and 7 s
+	// at 11 MiB; a report over it 44 s, and 21 s. Past 11 MiB, scans gained
+	// nothing, and a filter on a sorted column read up to twice as much at
+	// 90 MiB as at 15.
+	TargetRowGroupBytes = 16 << 20
+	// MaxRowGroupRows bounds a row group's rows, however narrow.
+	MaxRowGroupRows = 16 << 20
 	// MinRowGroupRows is the smallest row group a rewrite writes. Files
 	// whose rows are too wide for a row group this size to fit in the
 	// budget are not rewritten: the rewrite fails with ErrOverBudget.
@@ -148,6 +158,34 @@ func Plan(budget, rowBytes, fixed, maxRowGroup int64) (Layout, error) {
 			ErrOverBudget, memlimit.Format(budget), memlimit.Format(rowBytes), memlimit.Format(fixed))
 	}
 	return Layout{BatchRows: max(rows/4, 1), RowGroupRows: rows}, nil
+}
+
+// RowGroupRows is how many rows a rewrite of tasks' files writes to a row
+// group, before its memory budget (see Plan): the table's
+// write.parquet.row-group-limit if it sets one, and otherwise as many as
+// make TargetRowGroupBytes at the files' compressed bytes a row, between
+// DefaultRowGroupRows and MaxRowGroupRows.
+func RowGroupRows(props iceberg.Properties, tasks []table.FileScanTask) int64 {
+	if n, err := strconv.ParseInt(props[table.ParquetRowGroupLimitKey], 10, 64); err == nil && n > 0 {
+		return n
+	}
+	var size, rows int64
+	for _, t := range tasks {
+		size += t.File.FileSizeBytes()
+		rows += t.File.Count()
+	}
+	return TargetRows(size, rows)
+}
+
+// TargetRows is how many rows make a row group of TargetRowGroupBytes at
+// size bytes for rows rows, between DefaultRowGroupRows and
+// MaxRowGroupRows.
+func TargetRows(size, rows int64) int64 {
+	if size <= 0 || rows <= 0 {
+		return DefaultRowGroupRows
+	}
+	n := int64(float64(TargetRowGroupBytes) * float64(rows) / float64(size))
+	return min(max(n, DefaultRowGroupRows), MaxRowGroupRows)
 }
 
 // measure decodes the first rows of the first file of tasks that has any, and
@@ -307,10 +345,7 @@ func Rewrite(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.F
 	if err != nil {
 		return nil, Layout{}, fmt.Errorf("measure rows: %w", err)
 	}
-	maxRowGroup := int64(DefaultRowGroupRows)
-	if n, err := strconv.ParseInt(tbl.Properties()[table.ParquetRowGroupLimitKey], 10, 64); err == nil && n > 0 {
-		maxRowGroup = n
-	}
+	maxRowGroup := RowGroupRows(tbl.Properties(), tasks)
 	// The reader holds a row group's compressed column chunks, and two of
 	// them where a batch spans two row groups.
 	lay, err := Plan(budget, rowBytes, 2*rowGroup+deleteBytes(tasks), maxRowGroup)

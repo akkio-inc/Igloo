@@ -904,6 +904,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   compaction caught up at 8 GB a table an hour. Igloo now sets the property
   when it creates a table, unless the statement did. See
   [operations](docs/operations.md#table-maintenance).
+- Row groups of about 16 MiB. Compaction and clustering size the row groups
+  they write from the files' bytes a row, instead of writing DuckDB's
+  122,880 rows, a few hundred kilobytes of narrow rows, each read cold with
+  requests of its own: on a 2.4 GB table, a cold scan took 7 s instead of
+  24 to 29 s, and a report over it 21 s instead of 44 s. Table maintenance
+  sets `write.parquet.row-group-size` the same way on the tables Igloo
+  creates, so that DuckDB's inserts write such row groups too, as many rows
+  as fit in `IGLOO_MAINTENANCE_MEMORY` over DuckDB's threads; a large insert
+  into such a table holds more memory than before. A size set on a table
+  is left alone. See [operations](docs/operations.md#row-groups).
 - When memory runs low, Igloo lowers DuckDB's memory limit, so that DuckDB
   spills more and gives memory back, and raises it again once memory has
   stayed plentiful: under heavy work DuckDB keeps the memory it tracks at

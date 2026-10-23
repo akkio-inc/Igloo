@@ -124,6 +124,9 @@ type Options struct {
 	// cluster), in a directory of its own that it removes; empty means the
 	// system's temporary directory.
 	SpillDir string
+	// Threads are DuckDB's threads, each of which holds a row group while
+	// an insert writes (see sizeRowGroups); zero means one.
+	Threads int
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -376,6 +379,16 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 			at.UTC().Format(time.RFC3339), at.Add(interruptedBackoff).UTC().Format(time.RFC3339)))
 	} else {
 		errs = append(errs, m.rewrite(ctx, ident, tbl, limit, limited, log)...)
+	}
+	if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
+		return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)
+	}
+	switch err := m.sizeRowGroups(ctx, tbl, log); {
+	case err == nil:
+	case errors.Is(err, table.ErrCommitFailed):
+		log.Debug("sizing the table's row groups lost a race with a writer; retrying next pass")
+	default:
+		errs = append(errs, fmt.Errorf("size row groups: %w", err))
 	}
 	if tbl, err = m.catalog.LoadTable(ctx, ident); err != nil {
 		return nil, errors.Join(append(errs, fmt.Errorf("load: %w", err))...)

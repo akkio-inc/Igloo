@@ -705,9 +705,9 @@ tables itself, so nobody has to schedule anything. Every hour
    a [memory budget](#compaction-memory). A pass rewrites at most 8 GB per
    table; larger backlogs finish over several passes. The new files are laid
    out the way DuckDB writes Parquet, so compaction does not make scans
-   slower: row groups of 122,880 rows, Snappy compression, decimals stored as
-   integers, and dictionary encoding only for columns in which at most a
-   fifth of the values are distinct. A table's
+   slower: Snappy compression, decimals stored as integers, and dictionary
+   encoding only for columns in which at most a fifth of the values are
+   distinct, but in [row groups](#row-groups) of about 16 MiB. A table's
    `write.parquet.compression-codec` and `write.parquet.row-group-limit`
    properties override the codec and row group size. File size does not
    limit parallelism: DuckDB divides a scan by row group, so a table in a few
@@ -847,6 +847,40 @@ ends (`clustered`, with `overlapping_files_before` and
 and written. Partitioned tables, and sort orders with transforms (`bucket`,
 `day`, ...) or nested columns, which other engines can set, are compacted as
 before.
+
+### Row groups
+
+A cold scan reads a Parquet file a row group at a time, with requests of
+its own for each, so DuckDB's row groups of 122,880 rows, a few hundred
+kilobytes for narrow rows, make cold scans slow. Compaction and clustering
+write row groups of about 16 MiB compressed instead, as many rows as that
+takes at the bytes a row of the files they rewrite, between 122,880 and
+16,777,216 rows (fewer if the [memory budget](#compaction-memory) needs).
+On a 2.4 GB table of narrow rows, a cold scan took 24 to 29 s in row groups
+of 0.3 MiB and 7 s in row groups of 11 MiB, and a report over the table
+44 s and 21 s; warm, they took about the same. Larger row groups gained
+scans nothing more, and made a filter on a sorted column read more: up to
+twice as much at 90 MiB as at 15.
+
+Most of a table's rows are written by inserts, though, which DuckDB writes
+in row groups of the table's `write.parquet.row-group-size` rows, 122,880
+by default. So Igloo marks the tables its SQL creates (property
+`igloo.row-groups`), and maintenance sets their
+`write.parquet.row-group-size` from the table's bytes a row as compaction
+would, once the table has rows, and again when that size moves by more
+than 15%. DuckDB holds a row group, uncompressed, on each of its threads
+while an insert writes, so maintenance sets no more rows than fit in
+`IGLOO_MAINTENANCE_MEMORY` over `IGLOO_DUCKDB_THREADS` (and never fewer
+than 122,880). Your own large inserts into such a table therefore hold
+more memory than before, up to about `IGLOO_MAINTENANCE_MEMORY` more across
+DuckDB's threads: on 16 threads, an insert of 832 million narrow rows took
+the container to 6.7 GB in row groups of 122,880 rows and to 14.6 GB in
+row groups of 4 million. Lower `IGLOO_MAINTENANCE_MEMORY` if they need that
+memory back, or set a table's `write.parquet.row-group-size` yourself:
+maintenance leaves alone a size it did not set, as it does tables other
+engines created. The rows a table gets before maintenance first sizes its
+row groups, such as those of the `CREATE TABLE ... AS` that loads it, keep
+DuckDB's row groups until compaction or clustering rewrites their files.
 
 ### Compaction memory
 
