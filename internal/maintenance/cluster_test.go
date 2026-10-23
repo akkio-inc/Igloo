@@ -1,19 +1,23 @@
 package maintenance
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
+	"github.com/akkio-inc/igloo/internal/filerewrite"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
@@ -171,7 +175,7 @@ func TestClusteringMakesRangesDisjoint(t *testing.T) {
 	// A small target size, so that the rows make several files.
 	m := New(nil, dir+"/", Options{Memory: budget, SpillDir: spill}, quiet)
 	tbl := withTarget(t, cat, 4<<20)
-	if _, err := m.compactOrCluster(ctx, tbl); err != nil {
+	if _, err := m.compactOrCluster(ctx, tbl, quiet); err != nil {
 		t.Fatal(err)
 	}
 	after := dataFiles(t, cat.tbl)
@@ -201,7 +205,7 @@ func TestClusteringMakesRangesDisjoint(t *testing.T) {
 
 	// Clustered: the next pass leaves it.
 	snap := cat.tbl.CurrentSnapshot().SnapshotID
-	if _, err := m.compactOrCluster(ctx, cat.tbl); err != nil {
+	if _, err := m.compactOrCluster(ctx, cat.tbl, quiet); err != nil {
 		t.Fatal(err)
 	}
 	if cat.tbl.CurrentSnapshot().SnapshotID != snap {
@@ -218,7 +222,7 @@ func TestClusteringMakesRangesDisjoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	want = u.digest(t, db, dataFiles(t, cat.tbl))
-	if _, err := m.compactOrCluster(ctx, cat.tbl); err != nil {
+	if _, err := m.compactOrCluster(ctx, cat.tbl, quiet); err != nil {
 		t.Fatal(err)
 	}
 	if n := overlaps(t, cat.tbl); n != 0 {
@@ -267,15 +271,6 @@ func withTarget(t testing.TB, cat listedCatalog, target int64) *table.Table {
 	return tbl
 }
 
-// compactOrCluster runs what maintenance runs to rewrite a table's files:
-// clustering for a table with a sort order, compaction otherwise.
-func (m *Maintainer) compactOrCluster(ctx context.Context, tbl *table.Table) (*table.Table, error) {
-	if fields, first, ok := clusterFields(tbl); ok {
-		return m.cluster(ctx, tbl, fields, first, quiet)
-	}
-	return m.compact(ctx, tbl, quiet)
-}
-
 // TestClusteringMergesSmallNeighbors checks that a clustered table's small
 // files next to each other in the order are merged, and that a lone small
 // file, such as the last of a sorted rewrite, is left alone.
@@ -295,7 +290,7 @@ func TestClusteringMergesSmallNeighbors(t *testing.T) {
 	}
 	m := New(nil, dir+"/", Options{SpillDir: t.TempDir()}, quiet)
 	want := u.digest(t, db, dataFiles(t, cat.tbl))
-	if _, err := m.compactOrCluster(context.Background(), cat.tbl); err != nil {
+	if _, err := m.compactOrCluster(context.Background(), cat.tbl, quiet); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(dataFiles(t, cat.tbl)); n != 1 {
@@ -305,7 +300,7 @@ func TestClusteringMergesSmallNeighbors(t *testing.T) {
 		t.Errorf("rows changed: %s, want %s", got, want)
 	}
 	snap := cat.tbl.CurrentSnapshot().SnapshotID
-	if _, err := m.compactOrCluster(context.Background(), cat.tbl); err != nil {
+	if _, err := m.compactOrCluster(context.Background(), cat.tbl, quiet); err != nil {
 		t.Fatal(err)
 	}
 	if cat.tbl.CurrentSnapshot().SnapshotID != snap {
@@ -375,7 +370,7 @@ func TestClusteringBacklogTakesPasses(t *testing.T) {
 		for _, f := range dataFiles(t, cat.tbl) {
 			prev[f] = true
 		}
-		if _, err := m.compactOrCluster(context.Background(), cat.tbl); err != nil {
+		if _, err := m.compactOrCluster(context.Background(), cat.tbl, quiet); err != nil {
 			t.Fatal(err)
 		}
 		if cat.tbl.CurrentSnapshot().SnapshotID == before.SnapshotID {
@@ -413,4 +408,151 @@ func TestClusteringBacklogTakesPasses(t *testing.T) {
 		t.Errorf("rows changed: %s, want %s", got, want)
 	}
 	t.Logf("clustered in %d passes into %d files", passes, len(dataFiles(t, cat.tbl)))
+}
+
+// TestClusteringSplitsHeavyKeys clusters a table whose rows all have one
+// audience and one of three versions: each value of the whole sort order has
+// more rows than a range may hold, so their rows are dealt out among several
+// ranges. Clustering stays within its memory, every file is sorted, and the
+// files follow each other in the order: no two files' version ranges
+// overlap, and their audience ranges only touch.
+func TestClusteringSplitsHeavyKeys(t *testing.T) {
+	db := openDuckDB(t)
+	dir := t.TempDir()
+	u := unsortedTable{files: 6, rows: 80_000, keys: 1}
+	cat := u.table(t, db, dir, byAudience(t))
+	want := u.digest(t, db, dataFiles(t, cat.tbl))
+	const budget = 48 << 20
+	if size := arrowSize(t, cat.tbl); size <= budget {
+		t.Fatalf("the table takes %s in Arrow, no more than the budget", memlimit.Format(size))
+	}
+	outer := unmetered()
+	ctx := compute.WithAllocator(context.Background(), outer)
+	m := New(nil, dir+"/", Options{Memory: budget, SpillDir: t.TempDir()}, quiet)
+	tbl := withTarget(t, cat, 2<<20)
+	if _, err := m.compactOrCluster(ctx, tbl, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.clusterFailed) != 0 {
+		t.Fatalf("clustering needed more memory than %s", memlimit.Format(budget))
+	}
+	after := dataFiles(t, cat.tbl)
+	if len(after) < 3 {
+		t.Fatalf("clustering wrote %d files", len(after))
+	}
+	if got := u.digest(t, db, after); got != want {
+		t.Errorf("rows changed: %s, want %s", got, want)
+	}
+	if n := overlaps(t, cat.tbl); n != 0 {
+		t.Errorf("%d of %d files overlap", n, len(after))
+	}
+	if n := unsortedRows(t, db, after); n != 0 {
+		t.Errorf("%d rows out of order", n)
+	}
+	type span struct{ lo, hi int }
+	var vers []span
+	for _, f := range after {
+		var s span
+		if err := db.QueryRow(fmt.Sprintf("SELECT min(ver), max(ver) FROM read_parquet('%s')", f)).Scan(&s.lo, &s.hi); err != nil {
+			t.Fatal(err)
+		}
+		vers = append(vers, s)
+	}
+	for i, a := range vers {
+		for _, b := range vers[i+1:] {
+			if a.lo < b.hi && b.lo < a.hi {
+				t.Errorf("files with versions %d-%d and %d-%d overlap", a.lo, a.hi, b.lo, b.hi)
+			}
+		}
+	}
+	if peak := outer.Peak(); peak > budget {
+		t.Errorf("clustering held %s at once, more than its %s", memlimit.Format(peak), memlimit.Format(budget))
+	} else {
+		t.Logf("clustered %d rows of one audience into %d files holding at most %s of %s", 6*80_000, len(after), memlimit.Format(peak), memlimit.Format(budget))
+	}
+}
+
+// TestClusteringFallsBackToCompaction makes clustering need more memory than
+// maintenance may use: the table is compacted unsorted instead, with a
+// warning, so its small files are still merged. Clustering is not tried
+// again while the table stays as that pass left it, and is tried again once
+// it changes, or clusterRetry later; once it fits, the table is clustered.
+func TestClusteringFallsBackToCompaction(t *testing.T) {
+	db := openDuckDB(t)
+	dir := t.TempDir()
+	u := unsortedTable{files: 6, rows: 2000, keys: 50}
+	cat := u.table(t, db, dir, byAudience(t))
+	m := New(nil, dir+"/", Options{SpillDir: t.TempDir()}, quiet)
+	tries := 0
+	m.sorted = func([]filerewrite.SortField) groupWriter {
+		return func(context.Context, *table.Table, iceio.IO, table.CompactionTaskGroup, int64) ([]iceberg.DataFile, filerewrite.Layout, error) {
+			tries++
+			return nil, filerewrite.Layout{}, fmt.Errorf("sort a range: %w", errOverBudget)
+		}
+	}
+	var logged bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logged, nil))
+	ctx := context.Background()
+	pass := func(wantTries, wantFiles int, what string) {
+		t.Helper()
+		want := u.digest(t, db, dataFiles(t, cat.tbl))
+		if _, err := m.compactOrCluster(ctx, cat.tbl, log); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if tries != wantTries {
+			t.Errorf("%s: clustering tried %d times, want %d", what, tries, wantTries)
+		}
+		files := dataFiles(t, cat.tbl)
+		if len(files) != wantFiles {
+			t.Errorf("%s: %d files, want %d", what, len(files), wantFiles)
+		}
+		if got := u.digest(t, db, files); got != want {
+			t.Errorf("%s: rows changed: %s, want %s", what, got, want)
+		}
+	}
+	insert := func(n int) {
+		t.Helper()
+		tx := cat.tbl.NewTransaction()
+		if err := tx.AddFiles(ctx, u.write(t, db, filepath.Join(dir, "data"), 100+10*tries, n), nil, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expire := func() {
+		f := m.clusterFailed[name(cat.tbl.Identifier())]
+		f.at = f.at.Add(-clusterRetry - time.Minute)
+		m.clusterFailed[name(cat.tbl.Identifier())] = f
+	}
+
+	// Six small files, overlapping: compaction merges them.
+	pass(1, 1, "first pass")
+	if !strings.Contains(logged.String(), "compacting it unsorted") {
+		t.Errorf("no warning logged:\n%s", logged.String())
+	}
+	snap := cat.tbl.CurrentSnapshot().SnapshotID
+	pass(1, 1, "unchanged")
+	if cat.tbl.CurrentSnapshot().SnapshotID != snap {
+		t.Error("an unchanged, compacted table was rewritten")
+	}
+	// Two more, too few for compaction: they stay, overlapping.
+	insert(2)
+	pass(2, 3, "after an insert")
+	pass(2, 3, "unchanged again")
+	expire()
+	pass(3, 3, "after the backoff")
+
+	// With the memory it needs, the table is clustered.
+	m.sorted = nil
+	expire()
+	if _, err := m.compactOrCluster(ctx, cat.tbl, log); err != nil {
+		t.Fatal(err)
+	}
+	if n := overlaps(t, cat.tbl); n != 0 {
+		t.Errorf("%d files overlap once clustering fits", n)
+	}
+	if len(m.clusterFailed) != 0 {
+		t.Error("the table is still taken for one clustering does not fit")
+	}
 }

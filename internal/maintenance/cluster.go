@@ -3,6 +3,7 @@ package maintenance
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -43,9 +44,66 @@ import (
 // Each island is sorted within Options.Memory, range by range, spilling to
 // Options.SpillDir (see filerewrite.Sorted), and committed as compaction
 // commits: deletes applied, position and equality deletes that no file needs
-// any more removed, without retrying on a conflict. Partitioned tables, and
-// orders with transforms (bucket, day, ...) or nested columns, are compacted
-// as before.
+// any more removed, without retrying on a conflict. A table whose clustering
+// does not fit in Options.Memory is compacted unsorted instead (see
+// compactOrCluster). Partitioned tables, and orders with transforms (bucket,
+// day, ...) or nested columns, are compacted as before.
+
+// clusterRetry is how long maintenance compacts a table whose clustering
+// needed more memory than it may use unsorted, when the table has not
+// changed, before it tries to cluster the table again.
+const clusterRetry = 6 * time.Hour
+
+// clusterFailure is when clustering a table last needed more memory than
+// Options.Memory, and the table's snapshot as that pass left it.
+type clusterFailure struct {
+	snapshot int64
+	at       time.Time
+}
+
+// compactOrCluster rewrites tbl's files: it clusters a table with a sort
+// order it can cluster by (see cluster), and compacts the others. A table
+// whose clustering needs more memory than maintenance may use is compacted
+// unsorted instead, as tables were before clustering, so that small files
+// and deletes do not pile up in it; clustering is tried again once the table
+// has changed since, or clusterRetry later.
+func (m *Maintainer) compactOrCluster(ctx context.Context, tbl *table.Table, log *slog.Logger) (*table.Table, error) {
+	fields, first, ok := clusterFields(tbl)
+	if !ok {
+		return m.compact(ctx, tbl, log)
+	}
+	key := name(tbl.Identifier())
+	if f, failed := m.clusterFailed[key]; failed {
+		if snapshotID(tbl) == f.snapshot && time.Since(f.at) < clusterRetry {
+			log.Debug("compacting the table unsorted: clustering it needed more memory than maintenance may use, and it has not changed since")
+			return m.compact(ctx, tbl, log)
+		}
+		delete(m.clusterFailed, key)
+	}
+	committed, err := m.cluster(ctx, tbl, fields, first, log)
+	if !errors.Is(err, errOverBudget) {
+		return committed, err
+	}
+	log.Warn("clustering the table needs more memory than maintenance may use; compacting it unsorted this time",
+		"err", err, "memory_limit", m.memory(), "retry", "when the table changes, or in "+clusterRetry.String())
+	m.opts.Metrics.clusteringFellBack()
+	committed, err = m.compact(ctx, tbl, log)
+	left := tbl
+	if err == nil && committed != nil {
+		left = committed
+	}
+	// The table as this pass left it: its own compaction is not a change.
+	m.clusterFailed[key] = clusterFailure{snapshot: snapshotID(left), at: time.Now()}
+	return committed, err
+}
+
+// snapshotID is the ID of tbl's current snapshot, or 0 if it has none.
+func snapshotID(tbl *table.Table) int64 {
+	if s := tbl.CurrentSnapshot(); s != nil {
+		return s.SnapshotID
+	}
+	return 0
+}
 
 // clusterFields returns the order maintenance clusters tbl by, or false:
 // the table's default sort order, when the table is not partitioned and
@@ -178,13 +236,6 @@ func (m *Maintainer) cluster(ctx context.Context, tbl *table.Table, fields []fil
 	if tbl.CurrentSnapshot() == nil {
 		return tbl, nil
 	}
-	if id, ok := m.tooBig[name(tbl.Identifier())]; ok {
-		if id == tbl.CurrentSnapshot().SnapshotID {
-			log.Debug("not clustering the table: it needed more memory than maintenance may use, and has not changed since")
-			return tbl, nil
-		}
-		delete(m.tooBig, name(tbl.Identifier()))
-	}
 	cfg := compaction.DefaultConfig()
 	if target, err := strconv.ParseInt(tbl.Properties()[table.WriteTargetFileSizeBytesKey], 10, 64); err == nil && target > 0 {
 		cfg.TargetFileSizeBytes = target
@@ -263,7 +314,11 @@ func (m *Maintainer) cluster(ctx context.Context, tbl *table.Table, fields []fil
 	log.Info("clustering", "files", len(rewrite), "bytes", total, "islands", len(groups), "overlapping_files", before,
 		"sorted_by", fields[0].Name, "memory_limit", m.memory())
 	start := time.Now()
-	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "cluster", m.sortedWriter(fields))
+	write := m.sortedWriter(fields)
+	if m.sorted != nil {
+		write = m.sorted(fields)
+	}
+	committed, res, err := m.rewriteGroups(ctx, tbl, groups, rewrite, "cluster", write)
 	if err != nil || res.removed == 0 {
 		return committed, err
 	}

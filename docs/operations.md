@@ -787,14 +787,23 @@ new files overlap none of those it left. A clustered table is not rewritten
 again until writes add files that overlap it. A pass rewrites at most 8 GB
 per table, island by island.
 
-Sorting does not need the table in memory. Clustering samples the first
-column, splits its values into ranges small enough to sort within the
+Sorting does not need the table in memory. Clustering samples the order's
+columns, splits their values into ranges small enough to sort within the
 [memory budget](#compaction-memory), and reads the rows once, appending each
 to its range's spill file (compressed Arrow) under `IGLOO_DUCKDB_TEMP_DIR`
 (or the system's temporary directory); then it sorts the ranges one at a
-time, in order, into files of the target size. The spill takes about as much
-disk as the files it rewrites, and is deleted as each range is written. The
-new files record exact bounds of the first column.
+time, in order, into files of the target size. A value of the order that
+more rows share than a range holds (all the members of one large audience,
+say) is spread over several ranges, and so over several files whose ranges
+only touch. The spill takes about as much disk as the files it rewrites, and
+is deleted as each range is written. The new files record exact bounds of
+the first column.
+
+If clustering a table still needs more memory than the budget, maintenance
+logs a warning and compacts the table unsorted for that pass, as it compacts
+tables without a sort order, so that small files and deletes do not pile up;
+it tries clustering again once the table changes, or six hours later.
+`igloo_maintenance_clustering_fallbacks_total` counts these passes.
 
 Each table's clustering is logged as it starts (`clustering`, with the
 files, bytes, islands and `overlapping_files`) and ends (`clustered`, with

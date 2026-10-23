@@ -28,17 +28,23 @@ import (
 // Sorted rewrites. Clustering (see package maintenance) writes a table's
 // rows again in its sort order, so that the files' ranges of the order's
 // first column do not overlap. The rows rarely fit in memory, so Sorted
-// partitions them by ranges of the first column, each small enough to sort
-// within the budget, spilling each range to a file of its own; then it
-// sorts the ranges one at a time, in order, into one stream of rows that
-// the writer cuts into files of the table's target size.
+// partitions them by ranges of the order, each small enough to sort within
+// the budget, spilling each range to a file of its own; then it sorts the
+// ranges one at a time, in order, into one stream of rows that the writer
+// cuts into files of the table's target size.
 //
-//  1. It samples the first column of the files (reading that column only)
-//     and picks the ranges' bounds from the sample.
+//  1. It samples the order's columns of the files (reading those columns
+//     only) and picks the ranges' bounds from the sample.
 //  2. It reads the rows once, with their deletes applied, and appends each
 //     to its range's spill file (Arrow IPC, compressed).
 //  3. It reads each range back, sorts it by every column of the order and
 //     writes it.
+//
+// Many rows can share a value of the whole order (all members of one
+// audience, say), more than fit in one range. Such a value is the bound of
+// several ranges in a row, and its rows are dealt out among them in turn:
+// rows with equal values may come in any order, so the ranges still follow
+// each other in the order, and none holds more than its share.
 
 // SortField is a column of a sort order, as a rewrite orders rows by it.
 type SortField struct {
@@ -124,13 +130,13 @@ func Sorted(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.Fi
 	for _, t := range tasks {
 		total += t.File.Count()
 	}
-	var splits []key
+	var splits [][]key
 	if ranges := (total + rangeRows - 1) / rangeRows; ranges > 1 {
-		if splits, err = sampleSplits(ctx, view, tasks, fields[0], ranges, total); err != nil {
-			return nil, lay, fmt.Errorf("sample %s: %w", fields[0].Name, err)
+		if splits, err = sampleSplits(ctx, view, tasks, fields, ranges, total); err != nil {
+			return nil, lay, fmt.Errorf("sample the sort columns: %w", err)
 		}
 	}
-	first := keyOrder(fields[0])
+	order := tupleOrder(fields)
 
 	// 2. Each row to its range's spill file.
 	read := func(yield func(arrow.RecordBatch, error) bool) {
@@ -152,7 +158,7 @@ func Sorted(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.Fi
 		if err != nil {
 			return nil, lay, readErr(ctx, err)
 		}
-		err = sp.route(ctx, rec, cols[0], splits, first)
+		err = sp.route(ctx, rec, cols, splits, order)
 		rec.Release()
 		if err != nil {
 			return nil, lay, readErr(ctx, err)
@@ -209,41 +215,53 @@ func readErr(ctx context.Context, err error) error {
 	return err
 }
 
-// sampleSplits reads the first sort column of tasks' files and returns the
-// bounds of about ranges ranges of it, in the order's sequence: a row goes
-// to the first range whose bound comes after it.
-func sampleSplits(ctx context.Context, view *table.Table, tasks []table.FileScanTask, f SortField, ranges, total int64) ([]key, error) {
+// sampleSplits reads the sort columns of tasks' files and returns the
+// bounds of about ranges ranges of their values, in the order's sequence: a
+// row goes to the first range whose bound comes after it (see spill.route).
+// A value may be the bound of several ranges.
+func sampleSplits(ctx context.Context, view *table.Table, tasks []table.FileScanTask, fields []SortField, ranges, total int64) ([][]key, error) {
 	size := int(min(max(ranges*samplesPerRange, 4096), maxSample))
-	sample := make([]key, 0, size)
+	sample := make([][]key, 0, size)
 	rng := rand.New(rand.NewPCG(uint64(total), uint64(ranges)))
 	var seen int64
-	_, recs, err := view.Scan(table.WithSelectedFields(f.Name), table.WitMaxConcurrency(1)).ReadTasks(ctx, tasks)
+	names := make([]string, len(fields))
+	for i, f := range fields {
+		names[i] = f.Name
+	}
+	_, recs, err := view.Scan(table.WithSelectedFields(names...), table.WitMaxConcurrency(1)).ReadTasks(ctx, tasks)
 	if err != nil {
 		return nil, err
+	}
+	at := func(rec arrow.RecordBatch, i int) []key {
+		t := make([]key, len(fields))
+		for c, f := range fields {
+			idx := rec.Schema().FieldIndices(f.Name)
+			if len(idx) == 0 {
+				t[c] = key{null: true}
+				continue
+			}
+			t[c] = keyAt(rec.Column(idx[0]), i).own()
+		}
+		return t
 	}
 	for rec, err := range recs {
 		if err != nil {
 			return nil, err
 		}
-		col := rec.Column(0)
-		for i := range col.Len() {
+		for i := range int(rec.NumRows()) {
 			seen++
 			if len(sample) < size {
-				sample = append(sample, keyAt(col, i).own())
+				sample = append(sample, at(rec, i))
 			} else if j := rng.Int64N(seen); j < int64(size) {
-				sample[j] = keyAt(col, i).own()
+				sample[j] = at(rec, i)
 			}
 		}
 		rec.Release()
 	}
-	order := keyOrder(f)
-	slices.SortFunc(sample, order)
-	var splits []key
+	slices.SortFunc(sample, tupleOrder(fields))
+	var splits [][]key
 	for r := int64(1); r < ranges && len(sample) > 0; r++ {
-		s := sample[int(r*int64(len(sample))/ranges)]
-		if len(splits) == 0 || order(splits[len(splits)-1], s) < 0 {
-			splits = append(splits, s)
-		}
+		splits = append(splits, sample[int(r*int64(len(sample))/ranges)])
 	}
 	return splits, nil
 }
@@ -258,6 +276,9 @@ type spill struct {
 	writers   map[int]*rangeFile
 	pending   map[int][][]arrow.Array
 	rows      map[int]int64
+	// dealt counts, by the first of the bounds a value repeats, the rows of
+	// that value dealt out among the ranges it bounds.
+	dealt map[int]int
 }
 
 type rangeFile struct {
@@ -268,10 +289,11 @@ type rangeFile struct {
 func (s *spill) path(r int) string { return filepath.Join(s.dir, fmt.Sprintf("range-%06d.arrow", r)) }
 
 // route appends each row of rec to its range: the first whose bound comes
-// after the row's value of column col.
-func (s *spill) route(ctx context.Context, rec arrow.RecordBatch, col int, splits []key, order func(a, b key) int) error {
+// after the row's values of columns cols. A row whose values are the bound
+// of several ranges goes to one of them or the range after, in turn.
+func (s *spill) route(ctx context.Context, rec arrow.RecordBatch, cols []int, splits [][]key, order func(a, b []key) int) error {
 	if s.writers == nil {
-		s.writers, s.pending, s.rows = map[int]*rangeFile{}, map[int][][]arrow.Array{}, map[int]int64{}
+		s.writers, s.pending, s.rows, s.dealt = map[int]*rangeFile{}, map[int][][]arrow.Array{}, map[int]int64{}, map[int]int{}
 	}
 	n := int(rec.NumRows())
 	if n == 0 {
@@ -281,11 +303,24 @@ func (s *spill) route(ctx context.Context, rec arrow.RecordBatch, col int, split
 		rec.Retain()
 		return s.add(ctx, 0, rec.Columns(), int64(n), rec.Release)
 	}
-	keys := rec.Column(col)
+	arrs := make([]arrow.Array, len(cols))
+	for c, col := range cols {
+		arrs[c] = rec.Column(col)
+	}
+	k := make([]key, len(cols))
 	idx := map[int][]int32{}
 	for i := range n {
-		k := keyAt(keys, i)
+		for c, a := range arrs {
+			k[c] = keyAt(a, i)
+		}
 		r := sort.Search(len(splits), func(j int) bool { return order(splits[j], k) > 0 })
+		if r > 0 && order(splits[r-1], k) == 0 {
+			// The row's values are bounds lo to r-1: ranges lo+1 to r hold
+			// them alone or first.
+			lo := sort.Search(r, func(j int) bool { return order(splits[j], k) >= 0 })
+			r = lo + 1 + s.dealt[lo]%(r-lo)
+			s.dealt[lo]++
+		}
 		idx[r] = append(idx[r], int32(i))
 	}
 	for r, rows := range idx {
@@ -666,5 +701,22 @@ func keyOrder(f SortField) func(a, b key) int {
 			return compareKeys(b, a)
 		}
 		return compareKeys(a, b)
+	}
+}
+
+// tupleOrder is the order of the values of a sort order's columns, one key
+// each.
+func tupleOrder(fields []SortField) func(a, b []key) int {
+	orders := make([]func(a, b key) int, len(fields))
+	for i, f := range fields {
+		orders[i] = keyOrder(f)
+	}
+	return func(a, b []key) int {
+		for i, o := range orders {
+			if c := o(a[i], b[i]); c != 0 {
+				return c
+			}
+		}
+		return 0
 	}
 }

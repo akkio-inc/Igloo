@@ -849,7 +849,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   files: on 1.4 billion rows written unsorted, a filter on one value read
   140 files, and 3 once clustered (0.65 s instead of 2.3 s with nothing
   cached). A clustered table is not rewritten again until new files overlap
-  it. See [SQL](docs/sql.md#sort-orders-and-clustering) and
+  it. A value of the order that more rows share than fit in memory is
+  spread over several files, and a table whose clustering still needs more
+  memory than maintenance may use is compacted unsorted for that pass and
+  clustered again once it changes. See
+  [SQL](docs/sql.md#sort-orders-and-clustering) and
   [operations](docs/operations.md#clustering).
 - `CREATE TABLE` in Snowflake's dialect translates the column types of a
   table named with its schema (`db.schema.t`) too.

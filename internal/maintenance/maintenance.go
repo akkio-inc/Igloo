@@ -36,6 +36,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
+	"github.com/akkio-inc/igloo/internal/filerewrite"
 )
 
 // Standard Iceberg table properties that override the retention defaults for
@@ -166,9 +167,15 @@ type Maintainer struct {
 	// Options.Memory, with the snapshot it was tried at: they are not
 	// compacted again until they change.
 	tooBig map[string]int64
+	// clusterFailed holds the tables whose clustering needed more memory
+	// than Options.Memory (see compactOrCluster).
+	clusterFailed map[string]clusterFailure
 	// maxRewrite, if set, is how many bytes clustering rewrites a pass in
 	// place of maxCompactBytes, for tests.
 	maxRewrite int64
+	// sorted, if set, writes clustering's groups in place of sortedWriter,
+	// for tests.
+	sorted func([]filerewrite.SortField) groupWriter
 }
 
 // New maintains the tables in cat. warehouse is the warehouse root, such as
@@ -183,6 +190,7 @@ func New(cat Catalog, warehouse string, opts Options, log *slog.Logger) *Maintai
 		targets:        deletefiles.NewTargets(),
 		rewrites:       map[string]time.Time{},
 		tooBig:         map[string]int64{},
+		clusterFailed:  map[string]clusterFailure{},
 	}
 }
 
@@ -398,12 +406,7 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 // what failed.
 func (m *Maintainer) rewrite(ctx context.Context, ident table.Identifier, tbl *table.Table, limit time.Duration, limited bool, log *slog.Logger) []error {
 	var errs []error
-	compact := func() (*table.Table, error) { return m.compact(ctx, tbl, log) }
-	if fields, first, ok := clusterFields(tbl); ok {
-		// A table with a sort order is clustered instead (see cluster).
-		compact = func() (*table.Table, error) { return m.cluster(ctx, tbl, fields, first, log) }
-	}
-	switch _, err := compact(); {
+	switch _, err := m.compactOrCluster(ctx, tbl, log); {
 	case err == nil:
 	case errors.Is(err, table.ErrCommitFailed):
 		log.Debug("compaction lost a race with a writer; retrying next pass")

@@ -12,6 +12,7 @@ type Metrics struct {
 	orphans        prometheus.Counter
 	clusteredIn    prometheus.Counter
 	clusteredOut   prometheus.Counter
+	fellBack       prometheus.Counter
 }
 
 // NewMetrics registers the maintenance metrics with reg.
@@ -49,8 +50,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_maintenance_clustering_output_files_total",
 			Help: "Sorted data files written by clustering.",
 		}),
+		fellBack: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_maintenance_clustering_fallbacks_total",
+			Help: "Times a table's clustering needed more memory than maintenance may use, and the table was compacted unsorted instead.",
+		}),
 	}
-	reg.MustRegister(m.passes, m.lastSuccess, m.filesRewritten, m.filesWritten, m.snapshots, m.orphans, m.clusteredIn, m.clusteredOut)
+	reg.MustRegister(m.passes, m.lastSuccess, m.filesRewritten, m.filesWritten, m.snapshots, m.orphans, m.clusteredIn, m.clusteredOut, m.fellBack)
 	return m
 }
 
@@ -77,6 +82,12 @@ func (m *Metrics) clustered(before, after int) {
 	if m != nil {
 		m.clusteredIn.Add(float64(before))
 		m.clusteredOut.Add(float64(after))
+	}
+}
+
+func (m *Metrics) clusteringFellBack() {
+	if m != nil {
+		m.fellBack.Inc()
 	}
 }
 
