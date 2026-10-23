@@ -379,6 +379,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   run distributed without waiting for maintenance: workers apply the
   position delete files those write, and the equality delete files and
   deletion vectors of other engines.
+- Reports whose `min(x) OVER ()` the replica rewrites as a scalar
+  subquery over the same rows run distributed again: a scalar subquery
+  that stands on its own in the select list of a step that groups nothing
+  is computed by workers once, as one row every task reads. Forced on
+  workers, such reports had run on the replica.
 - A subquery that workers compute as a relation, as when a report joins a
   view of a wide table to itself, writes only the columns its reader
   reads to the exchange. A report whose 16 branches each read three

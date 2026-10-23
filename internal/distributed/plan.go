@@ -816,13 +816,62 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	c.scope.conds = append(c.scope.conds, conjuncts(child(sel, "where_clause"))...)
 	// Subqueries in the select list, HAVING, QUALIFY or ORDER BY would run
 	// on the coordinator over the combined result, where the columns they
-	// may refer to no longer exist.
-	for _, part := range []any{sel["select_list"], sel["having"], sel["qualify"], sel["modifiers"], sel["group_expressions"]} {
+	// may refer to no longer exist. A relation that groups nothing computes
+	// its select list in its own stage, where a scalar subquery that stands
+	// on its own is a relation of one row.
+	parts := []any{sel["having"], sel["qualify"], sel["modifiers"], sel["group_expressions"]}
+	if c.relation && len(list(sel, "group_expressions")) == 0 && !pl.hasAggregate(sel["select_list"]) {
+		if err := pl.scalarRelations(sel["select_list"], ctes, &c.reads); err != nil {
+			return err
+		}
+	} else {
+		parts = append(parts, sel["select_list"])
+	}
+	for _, part := range parts {
 		if hasClass(part, "SUBQUERY") {
 			return unsupported("a subquery outside WHERE")
 		}
 	}
 	return checkLambdas(sel)
+}
+
+// scalarRelations makes the scalar subqueries in v, a select list computed
+// where its rows are, relations of one row that every task reads, when
+// they stand on their own: pgwire writes min(m.day) OVER () in a SELECT
+// that groups nothing as (SELECT min(m.day) FROM <its FROM and WHERE>),
+// which DuckDB computes once (see pgwire's wholecount.go), and such a
+// subquery reads the large tables and common table expressions its SELECT
+// does. A correlated one, or another kind, keeps the part off the workers.
+func (pl *planner) scalarRelations(v any, ctes cteScope, rd *reads) error {
+	var err error
+	walk(v, func(n node) bool {
+		if err != nil {
+			return false
+		}
+		if str(n["class"]) != "SUBQUERY" {
+			return true
+		}
+		q := subqueryNode(n)
+		cols, cerr := pl.relationColumns(q, ctes, nil)
+		switch {
+		case str(n["subquery_type"]) != "SCALAR":
+			err = unsupported("a subquery outside WHERE")
+		case cerr != nil || len(cols) != 1:
+			err = unsupported("a scalar subquery in the select list that does not stand on its own")
+		}
+		if err != nil {
+			return false
+		}
+		bytes, eerr := pl.estimate(q, ctes)
+		if eerr != nil {
+			err = eerr
+			return false
+		}
+		rd.rels = append(rd.rels, &relUse{ref: q, q: q, scope: ctes, columns: cols, bytes: bytes, query: true,
+			item: &fromItem{name: "subquery"}})
+		return false
+	})
+	return err
 }
 
 // checkLambdas refuses lambda functions whose parameters planning could

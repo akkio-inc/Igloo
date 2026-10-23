@@ -565,3 +565,43 @@ func TestRelationColumns(t *testing.T) {
 		t.Errorf("the relations' stages write %q, want %q:\n%s", written, want, p.describe())
 	}
 }
+
+// TestScalarSubqueryRelation checks a relation whose select list has a
+// scalar subquery that stands on its own, as pgwire writes min(x) OVER ()
+// for one machine: the subquery is a relation of one row that every task
+// reads, and the statement returns what one machine does.
+func TestScalarSubqueryRelation(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	h.co.maxBroadcast = 1
+	for _, q := range []string{
+		`WITH aud AS (SELECT DISTINCT o_orderkey AS k FROM orders WHERE o_orderpriority = '1-URGENT'),
+			base AS (SELECT l.l_orderkey AS k, l.l_quantity AS q,
+				(SELECT min(l2.l_shipdate) FROM lineitem AS l2 JOIN aud ON aud.k = l2.l_orderkey) AS first_day,
+				(SELECT max(l2.l_shipdate) FROM lineitem AS l2 JOIN aud ON aud.k = l2.l_orderkey) AS last_day
+				FROM lineitem AS l JOIN aud ON aud.k = l.l_orderkey)
+			SELECT first_day, last_day, count(*), sum(q) FROM base GROUP BY 1, 2`,
+		// As written before pgwire's rewrite.
+		`WITH aud AS (SELECT DISTINCT o_orderkey AS k FROM orders WHERE o_orderpriority = '1-URGENT'),
+			base AS (SELECT l.l_orderkey AS k, l.l_quantity AS q, min(l.l_shipdate) OVER () AS first_day, max(l.l_shipdate) OVER () AS last_day
+				FROM lineitem AS l JOIN aud ON aud.k = l.l_orderkey)
+			SELECT first_day, last_day, count(*), sum(q) FROM base GROUP BY 1, 2`,
+	} {
+		t.Run(short(q), func(t *testing.T) {
+			h.t = t
+			if !h.check(q) {
+				t.Error("did not run distributed")
+			}
+		})
+	}
+	// Correlated, it stays on one machine.
+	h.t = t
+	q := `WITH base AS (SELECT l.l_orderkey AS k, (SELECT max(o_totalprice) FROM orders WHERE o_orderkey = l.l_orderkey) AS price FROM lineitem AS l)
+		SELECT count(*), sum(price) FROM base`
+	if plan, err := h.co.Plan(t.Context(), q, harnessEnv{h}, ModeOn); err == nil && len(plan.Stages) > 0 {
+		for _, s := range plan.Stages {
+			if strings.Contains(s.SQL, "o_orderkey = l.l_orderkey") {
+				t.Errorf("a correlated subquery went to the workers:\n%s", plan.describe())
+			}
+		}
+	}
+}

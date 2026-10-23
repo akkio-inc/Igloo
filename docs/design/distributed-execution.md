@@ -672,6 +672,11 @@ as a relation that workers compute (`internal/distributed/relation.go`):
   relation's rows (`min(day) OVER () AS period_start`, as the reports
   compute for every source) make it the join of its rows, a relation of
   their own, to the one row of those aggregates, a relation over that one.
+  A scalar subquery that stands on its own in the select list of a
+  relation that groups nothing is a relation of one row that every task
+  reads: pgwire writes `min(day) OVER ()` so for one machine
+  (`(SELECT min(day) FROM <the same FROM and WHERE>)`), and the planner
+  sees the statement as rewritten.
   `ORDER BY`, `LIMIT`, other window functions and grouping sets need every
   row, and keep the part that reads such a relation off the workers.
 - **Computed once.** A common table expression's exchange is remembered by

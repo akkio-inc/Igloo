@@ -267,7 +267,12 @@ using all of its cores.
   own ([spill directory](#spill-directory)).
 - **CPU.** DuckDB parallelizes each query across `IGLOO_DUCKDB_THREADS`
   threads (default: two per core, four on workers, since reading object
-  storage waits on requests more than on cores).
+  storage waits on requests more than on cores: cold reads ran two to four
+  times faster on four threads a core than on one). A workload that reads
+  from a warm read cache and is bound by its cores runs as fast or a little
+  faster on one thread a core (a report took 15.9 s on 16 threads and
+  17.2 s on 32, on 16 cores); set `IGLOO_DUCKDB_THREADS` to the core count
+  for one that is.
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
   disk. Size the disk so your frequently read tables fit in half of its free
   space, or set `IGLOO_CACHE_SIZE`.
