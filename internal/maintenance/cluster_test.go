@@ -624,9 +624,9 @@ func TestClusterFieldsFromProperty(t *testing.T) {
 // though it overlaps every file, rather than having the table rewritten
 // around it; once inserts take freshShare of the table they are sorted
 // together, alone, into runs, without rewriting the clustered files; once
-// runs stack deeper than clusterMaxDepth, passes merge everything, and no
-// files overlap. An insert of one audience is clustered in at once. The
-// depth gauges follow.
+// the runs have grown to a quarter of what they overlap, passes merge
+// everything, and no files overlap. An insert of one audience is clustered
+// in at once. The depth gauges follow.
 func TestClusteringDefersScatteredInserts(t *testing.T) {
 	db := openDuckDB(t)
 	dir := t.TempDir()
@@ -732,7 +732,7 @@ func TestClusteringDefersScatteredInserts(t *testing.T) {
 				}
 			}
 			merged = true
-			if runs < clusterMaxDepth-1 {
+			if runs < 2 {
 				t.Errorf("merged after %d runs", runs)
 			}
 		}
@@ -771,4 +771,100 @@ func TestClusteringDefersScatteredInserts(t *testing.T) {
 	if n := overlaps(t, cat.tbl); n != 0 {
 		t.Errorf("%d files overlap after an insert of one audience", n)
 	}
+}
+
+// TestClusteringTiersRuns inserts into a clustered table, 48 times, four
+// small files whose keys span the whole table, a pass after each. Fresh
+// files are sorted into runs of level 0 once they stack deeper than
+// freshMaxDepth, tierFanIn runs of a level are sorted into one of the next,
+// and the table stays shallow, with the same rows, without its clustered
+// files rewritten until the runs grow to a quarter of the table.
+func TestClusteringTiersRuns(t *testing.T) {
+	db := openDuckDB(t)
+	dir := t.TempDir()
+	u := unsortedTable{files: 20, rows: 6000, keys: 6000}
+	cat := u.table(t, db, dir, byAudience(t))
+	var size int64
+	for _, f := range dataFiles(t, cat.tbl) {
+		st, err := os.Stat(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		size += st.Size()
+	}
+	withLayout(t, cat, size/60, 250)
+	m := New(nil, dir+"/", Options{SpillDir: t.TempDir()}, quiet)
+	ctx := context.Background()
+	pass := func() (replaced []string) {
+		t.Helper()
+		before := dataFiles(t, cat.tbl)
+		if _, err := m.compactOrCluster(ctx, cat.tbl, quiet); err != nil {
+			t.Fatal(err)
+		}
+		now := dataFiles(t, cat.tbl)
+		for _, f := range before {
+			if !slices.Contains(now, f) {
+				replaced = append(replaced, f)
+			}
+		}
+		return replaced
+	}
+	for range 20 {
+		if len(pass()) == 0 {
+			break
+		}
+	}
+	clustered := dataFiles(t, cat.tbl)
+	fields, first, _ := clusterFields(cat.tbl)
+	depth := func() int {
+		tasks, err := cat.tbl.Scan().PlanFiles(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := spans(tasks, cat.tbl.Schema(), first)
+		in := make([]bool, len(s))
+		for i := range in {
+			in[i] = true
+		}
+		_, top := depthOf(s, in)
+		return top
+	}
+	small := unsortedTable{rows: 75, keys: 6000}
+	deepest, levels := 0, map[int]bool{}
+	for k := range 48 {
+		tx := cat.tbl.NewTransaction()
+		if err := tx.AddFiles(ctx, small.write(t, db, filepath.Join(dir, "data"), 1000+4*k, 4), nil, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		want := u.digest(t, db, dataFiles(t, cat.tbl))
+		deepest = max(deepest, depth())
+		for _, f := range pass() {
+			if slices.Contains(clustered, f) {
+				t.Fatalf("insert %d: a clustered file was rewritten while the runs are small", k+1)
+			}
+		}
+		for _, f := range dataFiles(t, cat.tbl) {
+			if level, _, ok := filerewrite.RunOf(f, fields); ok {
+				levels[level] = true
+			}
+		}
+		if got := u.digest(t, db, dataFiles(t, cat.tbl)); got != want {
+			t.Fatalf("insert %d: rows changed: %s, want %s", k+1, got, want)
+		}
+	}
+	if !levels[0] || !levels[1] {
+		t.Errorf("run levels seen: %v, want 0 and 1", levels)
+	}
+	// Fresh files up to freshMaxDepth and the four of one insert, a
+	// clustered file, and tierFanIn-1 runs of each of two levels.
+	if limit := freshMaxDepth + 4 + 1 + 2*(tierFanIn-1); deepest > limit {
+		t.Errorf("the table stacked %d deep, more than %d", deepest, limit)
+	}
+	if n := unsortedRows(t, db, dataFiles(t, cat.tbl)); n != 0 {
+		t.Errorf("%d rows out of order", n)
+	}
+	t.Logf("deepest %d, run levels %v", deepest, levels)
 }

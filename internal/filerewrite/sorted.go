@@ -25,6 +25,7 @@ import (
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
 )
 
 // Sorted rewrites. Clustering (see package maintenance) writes a table's
@@ -88,13 +89,41 @@ const (
 	samplesPerRange = 64
 )
 
+// RunDir names the directory, under the one of the files Sorted writes, of
+// a run of level level (see RunOf): L<level>/ and a name of its own.
+func RunDir(level int) string {
+	return "L" + strconv.Itoa(level) + "/" + uuid.NewString()
+}
+
+// RunOf returns the level and name of the run the data file at path belongs
+// to, if Sorted wrote it, sorted by fields, into a directory RunDir named.
+func RunOf(path string, fields []SortField) (level int, run string, ok bool) {
+	mark := "/" + sortedDir(fields) + "/L"
+	i := strings.Index(path, mark)
+	if len(fields) == 0 || i < 0 {
+		return 0, "", false
+	}
+	rest := path[i+len(mark):]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 {
+		return 0, "", false
+	}
+	level, err := strconv.Atoi(rest[:slash])
+	end := strings.IndexByte(rest[slash+1:], '/')
+	if err != nil || end <= 0 {
+		return 0, "", false
+	}
+	return level, rest[slash+1 : slash+1+end], true
+}
+
 // Sorted writes the rows of tasks' files, with their deletes applied, sorted
 // by fields, into new files of tbl's target size, and returns them in their
 // order. budget is the memory it may hold, as counted by the allocator of
 // ctx (see Metered); dir is an empty directory for its spill files, which it
-// removes as it goes.
+// removes as it goes. The files go to a directory of their own (see
+// WrittenSorted), or with run set to RunDir's name to that run's under it.
 func Sorted(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.FileScanTask, budget int64,
-	fields []SortField, dir string) ([]iceberg.DataFile, Layout, error) {
+	fields []SortField, dir, run string) ([]iceberg.DataFile, Layout, error) {
 	if len(fields) == 0 {
 		return nil, Layout{}, fmt.Errorf("%w: no columns", ErrNotSortable)
 	}
@@ -125,7 +154,7 @@ func Sorted(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.Fi
 		table.ParquetBatchSizeKey:                                strconv.FormatInt(lay.BatchRows, 10),
 		table.ParquetRowGroupLimitKey:                            strconv.FormatInt(lay.RowGroupRows, 10),
 		table.MetricsModeColumnConfPrefix + "." + fields[0].Name: "full",
-		table.WriteDataPathKey:                                   strings.TrimSuffix(data, "/") + "/" + sortedDir(fields),
+		table.WriteDataPathKey:                                   strings.TrimSuffix(strings.TrimSuffix(data, "/")+"/"+sortedDir(fields)+"/"+run, "/"),
 	})
 	if err != nil {
 		return nil, lay, err

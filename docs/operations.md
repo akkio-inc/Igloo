@@ -798,15 +798,20 @@ or two files of the target size): a table written unsorted, or an insert
 that falls within a file or two, as an insert of one audience does. An
 insert whose keys are spread over the whole table overlaps every file, and
 rewriting the table around it would rewrite all of it for a few new rows.
-Such fresh files (files clustering did not write, and small files) wait
-instead. Once they take 5% of the table or 4 GB, whichever is less, or
-number 100, they are sorted together, alone, into a run of their own, which
-overlaps the clustered files but not itself; each run deepens the table by
-one, and a filter on the key reads one file more per run. Once the
-clustered files stack more than 4 deep, passes merge them, island by
-island. Clustering puts the files it writes in a directory of their own
-under the table's data (`data/clustered-<hash of the key>/`), which is how
-it knows them.
+Such fresh files (files clustering did not write) wait instead, though
+every filter on the key reads each of them. Once they stack more than 8
+deep, take 5% of the table or 4 GB (whichever is less), or number 100,
+they are sorted together, alone, into a run of level 0, which overlaps the
+clustered files but not itself. Runs are tiered, as log-structured stores
+tier theirs: 4 runs of a level are sorted together into a run of the next,
+4 times as large. Each run deepens the table by one, so a filter on the key
+reads at most 3 runs of each level beside the fresh files, and a row is
+rewritten once a level. Once the runs have grown to a quarter of what they
+overlap, rewriting the island is cheap again, and passes merge them into
+the clustered files, island by island. Clustering puts the files it writes
+in a directory of their own under the table's data
+(`data/clustered-<hash of the key>/`, and a run's under `L<level>/<run>/`
+there), which is how it knows them.
 
 Sorting does not need the table in memory. Clustering samples the order's
 columns, splits their values into ranges small enough to sort within the
