@@ -935,15 +935,22 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   20 to 24% of the behaviors reports' time on data shaped like real data:
   counting people by each element of 2 million rows' five lists took
   0.22 s and takes 0.13 s, and a behaviors report over them 0.15 s and
-  0.09 s. A filter on that text stays above the select list that unnests
-  it, as one through `json_extract_string` did, so that DuckDB, which takes
-  a filtered unnest for a fifth of the rows it reads, builds a join's hash
-  table on the other side, as reports join their signals to cohorts: it
-  had built one on 90 million browsing elements. A key of the objects that
-  every read casts so is one field of text, built once for each object,
-  rather than a list, a string and a JSON part that each read combines:
-  reports' media signals, objects of a dimension and a name filtered and
-  grouped by the name, took 0.20 s for 5 million rows and take 0.18 s.
+  0.09 s. A key of the objects that every read casts so is one field of
+  text, built once for each object, rather than a list, a string and a JSON
+  part that each read combines: reports' media signals, objects of a
+  dimension and a name filtered and grouped by the name, took 0.20 s for 5
+  million rows and take 0.18 s. The objects are built in that select list
+  for each row of the item joined to the range of their indexes,
+  `CROSS JOIN range(n)`, rather than unnested from a list of them, and a
+  filter in the `WHERE` on their text stays above that select list: DuckDB,
+  which takes an unnest for as many rows as it reads and a filtered one for
+  a fifth of those, then estimates the objects at their number, and a join
+  of them with a smaller table, as reports join their signals to cohorts,
+  builds its hash table on that table. A signals report had built one on
+  90.7 million browsing elements rather than 1.0 million cohort members
+  (94 s of 465 s thread time); in a lab at those proportions every such join
+  now builds on the cohorts, and the signals take 1.29 s of thread time
+  instead of 1.86 s.
 - Faster statements on large catalogs. DuckDB lists the Iceberg catalog's
   tables again for every statement that looks one up, and Igloo's checks of
   a user without the reader role listed every attached database's tables

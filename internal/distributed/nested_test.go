@@ -123,6 +123,19 @@ func TestUnnest(t *testing.T) {
 		// Objects built with literal keys flatten as structs, through lambdas.
 		`SELECT f.value:k::string AS k, COUNT(DISTINCT p.person_id) AS n FROM people p, LATERAL FLATTEN(input =>
 			ARRAY_CONSTRUCT(OBJECT_CONSTRUCT('k', p.home:city, 'v', p.person_id), OBJECT_CONSTRUCT('k', 'x', 'v', 1))) f GROUP BY 1 ORDER BY 1`,
+		// As reports' signals flatten them: objects of a row's columns, built
+		// over the table joined to the range of their indexes, joined to
+		// cohorts, and a FLATTEN of a key of them unnested around that, both
+		// filtered on their text.
+		`SELECT CAST(GET_PATH(g.value, 'k') AS TEXT) AS k, CAST(v.value AS TEXT) AS v, c.c, COUNT(DISTINCT p.person_id) AS n
+			FROM people AS p INNER JOIN (SELECT DISTINCT person_id, person_id % 2 AS c FROM people) AS c ON c.person_id = p.person_id
+			CROSS JOIN LATERAL FLATTEN(input => [OBJECT_CONSTRUCT('k', 'segments', 'items', p.segments), OBJECT_CONSTRUCT('k', 'all', 'items', ['every'])]) AS g(seq, key, path, index, value, this)
+			CROSS JOIN LATERAL FLATTEN(input => GET_PATH(g.value, 'items')) AS v(seq, key, path, index, value, this)
+			WHERE NOT CAST(v.value AS TEXT) IS NULL AND TRIM(CAST(v.value AS TEXT)) <> '' GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
+		`SELECT CAST(GET_PATH(d.value, 'dim') AS TEXT) AS dim, CAST(GET_PATH(d.value, 'name') AS TEXT) AS name, COUNT(DISTINCT p.person_id) AS n
+			FROM people AS p CROSS JOIN LATERAL FLATTEN(input => [OBJECT_CONSTRUCT('dim', 'city', 'name', p.home:city::string),
+				OBJECT_CONSTRUCT('dim', 'gender', 'name', p.attrs:gender::string), OBJECT_CONSTRUCT('dim', 'all', 'name', 'any')]) AS d(seq, key, path, index, value, this)
+			WHERE NOT CAST(GET_PATH(d.value, 'name') AS TEXT) IS NULL AND TRIM(CAST(GET_PATH(d.value, 'name') AS TEXT)) <> '' GROUP BY 1, 2 ORDER BY 1, 2`,
 		`SELECT ARRAY_TO_STRING(p.segments, ',') AS s, COUNT(*) AS n FROM people p GROUP BY 1 ORDER BY 1 NULLS FIRST`,
 	} {
 		r, err := snowflake.Translate(q, snowflake.Options{})

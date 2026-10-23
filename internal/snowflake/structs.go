@@ -233,7 +233,10 @@ type hoist struct {
 	mode   string
 	elems  []*node
 	text   bool
-	list   *node
+	// list is the objects' struct for each row and index (see hoistList),
+	// and objects their number.
+	list    *node
+	objects int
 }
 
 // hoistOf decides whether the FLATTEN of structs at nodes[i], aliased up
@@ -242,8 +245,9 @@ type hoist struct {
 // as a dependent join when a filter is pushed onto its output, as reports'
 // outer queries filter by the keys they group by (2.3 s against 1.8 s as
 // JSON for 3 million rows of three lists), and when it reads a string or
-// number column; an unnest in a select list is neither (0.48 s), and DuckDB
-// distributes it. The FLATTEN must read the columns of one FROM item before
+// number column; a select list that builds the objects is neither (0.48 s
+// for an unnest of them there), and Igloo distributes it. The FLATTEN must
+// read the columns of one FROM item before
 // it at that level, qualified, and be joined plainly; its select must name
 // it only by its VALUE's keys; and at most one later FLATTEN, which must
 // flatten one key of it and be read only by its VALUE, may read it, which
@@ -1240,9 +1244,10 @@ func structOf(s *structFlatten, o *objectParts, k int) *node {
 	return seq(nil, append(kids, raw("}"))...)
 }
 
-// hoistList is the list of structs that the select list of a hoisted
-// FLATTEN's FROM item unnests (see hoistOf), from the FLATTEN's argument
-// group g.
+// hoistList is the struct that the select list of a hoisted FLATTEN's FROM
+// item builds for each of its rows and of the objects' indexes, _sf_k.i
+// (see hoistStructs), from the FLATTEN's argument group g: a CASE of the
+// index, or the one object's struct; it sets h.objects.
 func (t *translator) hoistList(g *node, h *hoist) (*node, error) {
 	pos, named := t.tableArgs(g)
 	input := named["INPUT"]
@@ -1250,26 +1255,33 @@ func (t *translator) hoistList(g *node, h *hoist) (*node, error) {
 		input = pos[0]
 	}
 	in := flattenInput(input)
-	kids := []*node{raw("[")}
+	h.objects = len(in.elems)
+	var kids []*node
 	for k, e := range in.elems {
 		if e.obj == nil {
 			return nil, &Error{Code: CodeSyntax, Message: "expected OBJECT_CONSTRUCT in FLATTEN's INPUT"}
 		}
-		if k > 0 {
-			kids = append(kids, raw(", "))
+		if len(in.elems) == 1 {
+			return structOf(h.s, e.obj, k), nil
 		}
-		kids = append(kids, structOf(h.s, e.obj, k))
+		kids = append(kids, raw(" WHEN "+itoa(k)+" THEN "), structOf(h.s, e.obj, k))
 	}
-	return seq(nil, append(kids, raw("]"))...), nil
+	return seq(nil, append(append([]*node{raw("CASE _sf_k.i")}, kids...), raw(" END"))...), nil
 }
 
 // hoistStructs takes out of a level of a statement its hoisted FLATTENs,
 // what tableFunctions left of them (removed), and the comma or JOIN before
-// each, and makes each FROM item they read a subquery whose select list
-// unnests their list as _sf_t: FROM m, LATERAL FLATTEN(...) t becomes FROM
-// (SELECT m.*, unnest([...]) AS _sf_t FROM m) AS m; with a reader, another
-// around that unnests the key it flattens as _sf_e, as text when its reads
-// all read text (see readsText).
+// each, and makes each FROM item they read a subquery that joins it to the
+// range of the objects' indexes and builds each row's object as _sf_t: FROM
+// m, LATERAL FLATTEN(...) t becomes FROM (SELECT m.*, CASE _sf_k.i WHEN 0
+// THEN {...} ... END AS _sf_t FROM m CROSS JOIN range(n) AS _sf_k(i)) AS m.
+// DuckDB estimates that at n times m's rows, where it takes an unnest of a
+// list of the n objects for m's rows alone, and a join of the objects with
+// a smaller table would build its hash table on the objects (in a signals
+// report, 90.7 million browsing elements against 1.0 million cohort
+// members, 94 s of 465 s thread time). With a reader, another select list
+// around that one unnests the key it flattens as _sf_e, as text when its
+// reads all read text (see readsText).
 func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*node, error) {
 	for k := 0; k < len(nodes); k++ {
 		if !removed[nodes[k]] {
@@ -1296,8 +1308,12 @@ func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*no
 			return nil, &Error{Code: CodeSyntax, Message: "FLATTEN reads a FROM item that is not there: " + h.alias}
 		}
 		item := nodes[start:end]
-		out := seq(item, append(append([]*node{raw("(SELECT " + alias + ".*, unnest("), h.list, raw(") AS _sf_t FROM ")}, item...),
-			raw(") AS "+alias))...)
+		join := ""
+		if h.objects != 1 {
+			join = " CROSS JOIN range(" + itoa(h.objects) + ") AS _sf_k(i)"
+		}
+		out := seq(item, append(append([]*node{raw("(SELECT " + alias + ".*, "), h.list, raw(" AS _sf_t FROM ")}, item...),
+			raw(join+") AS "+alias))...)
 		if h.reader != nil {
 			l, _, j := h.s.parts(alias+"._sf_t", h.key)
 			values := "sf_parts_values("

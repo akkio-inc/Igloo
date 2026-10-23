@@ -158,18 +158,21 @@ JSON and JSON text alike.
   dependent join (over 29 million elements of 2 million rows' five lists,
   0.4 s instead of 1.6 s). When the objects are built from one `FROM` item's
   columns and the select reads only their keys, that item's select list
-  unnests them, and a second select list around it unnests a second
-  `FLATTEN`'s key, with no lateral join at all. DuckDB makes a lateral
-  `FLATTEN` of string columns a dependent join, and one of structs too once
-  it pushes a filter down onto it, such as a BI tool's outer `WHERE` on a key
-  the report groups by. When every read of the second `FLATTEN`'s elements
-  casts them to a type that is not semi-structured, as
-  `CAST(v.value AS TEXT)` does, it unnests their text rather than JSON of
-  each, and a key that every read casts so is a field of its text alone.
-  Where the objects are not unnested so, a `WHERE` there stays out of the
-  joins: its conditions on the tables go into the `ON` of the first
-  `FLATTEN`'s join, which DuckDB pushes down to the tables, those on the
-  objects' keys filter the objects, and those on a second `FLATTEN`'s
+  builds them, for each of its rows joined to the range of their indexes
+  (`CROSS JOIN range(n)`), and a second select list around it unnests a
+  second `FLATTEN`'s key, with no lateral join at all; DuckDB estimates that
+  join at the objects' number, where it takes an unnest for as many rows as
+  it reads, so that a join of the objects with a smaller table builds its
+  hash table on that table. DuckDB makes a lateral `FLATTEN` of string
+  columns a dependent join, and one of structs too once it pushes a filter
+  down onto it, such as a BI tool's outer `WHERE` on a key the report groups
+  by. When every read of the second `FLATTEN`'s elements casts them to a type
+  that is not semi-structured, as `CAST(v.value AS TEXT)` does, it unnests
+  their text rather than JSON of each, and a key that every read casts so is
+  a field of its text alone. Where the objects are not built so, a `WHERE`
+  there stays out of the joins: its conditions on the tables go into the `ON`
+  of the first `FLATTEN`'s join, which DuckDB pushes down to the tables, those
+  on the objects' keys filter the objects, and those on a second `FLATTEN`'s
   elements filter the elements when the statement reads nothing of that
   `FLATTEN` but its `VALUE`. Any other read of `VALUE`, a star at that level,
   a subquery that

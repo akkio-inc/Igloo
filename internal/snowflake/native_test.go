@@ -358,10 +358,10 @@ func TestFlattenShapes(t *testing.T) {
 		// that no filter DuckDB pushes onto them makes a dependent join.
 		{`select g.value:k::string, v.value from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a), object_construct_keep_null('k', 'b', 'l', m.b)]) g, lateral flatten(input => get_path(g.value, 'l')) v`,
 			`select m._sf_t._sf_k1 AS "G.VALUE:K::STRING", m._sf_e from (SELECT m.*, unnest(sf_parts_values(m._sf_t._sf_l2, m._sf_t._sf_j2, 'BOTH')) AS _sf_e ` +
-				`FROM (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), '_sf_k1': CAST('a' AS VARCHAR), '_sf_l2': CAST(sf_list_part(m.a) AS VARCHAR[]), ` +
-				`'_sf_s2': CAST(sf_string_part(m.a) AS VARCHAR), '_sf_j2': CAST(sf_other_part(m.a) AS JSON)}, {'_sf_i': CAST(1 AS BIGINT), '_sf_k1': CAST('b' AS VARCHAR), ` +
-				`'_sf_l2': CAST(sf_list_part(m.b) AS VARCHAR[]), '_sf_s2': CAST(sf_string_part(m.b) AS VARCHAR), '_sf_j2': CAST(sf_other_part_keep_null(m.b) AS JSON)}]) AS _sf_t ` +
-				`FROM tab m) AS m) AS m`, `LATERAL`},
+				`FROM (SELECT m.*, CASE _sf_k.i WHEN 0 THEN {'_sf_i': CAST(0 AS BIGINT), '_sf_k1': CAST('a' AS VARCHAR), '_sf_l2': CAST(sf_list_part(m.a) AS VARCHAR[]), ` +
+				`'_sf_s2': CAST(sf_string_part(m.a) AS VARCHAR), '_sf_j2': CAST(sf_other_part(m.a) AS JSON)} WHEN 1 THEN {'_sf_i': CAST(1 AS BIGINT), '_sf_k1': CAST('b' AS VARCHAR), ` +
+				`'_sf_l2': CAST(sf_list_part(m.b) AS VARCHAR[]), '_sf_s2': CAST(sf_string_part(m.b) AS VARCHAR), '_sf_j2': CAST(sf_other_part_keep_null(m.b) AS JSON)} END AS _sf_t ` +
+				`FROM tab m CROSS JOIN range(2) AS _sf_k(i)) AS m) AS m`, `LATERAL`},
 		// Elements that every read casts are unnested as text; one read
 		// otherwise keeps them JSON.
 		{`select cast(g.value:k as text), cast(v.value as text), v.value::float from tab m, lateral flatten(input => [object_construct('k', 'a', 'l', m.a)]) g, lateral flatten(input => g.value:l) v`,
@@ -374,9 +374,9 @@ func TestFlattenShapes(t *testing.T) {
 		{`select g.value:k::string from tab m, lateral flatten(input => [object_construct('k', ['p', '{"q": 1}'])]) g`,
 			`'_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST(sf_string_part(json_array('p', '{"q": 1}')) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(json_array('p', '{"q": 1}')) AS JSON)`, ``},
 		{`select g.value:n::string from tab m inner join u on u.id = m.id cross join lateral flatten(input => [object_construct('n', m.s), object_construct('n', 'x')]) as g(seq, key, path, index, value, this) where m.id > 1`,
-			`select m._sf_t._sf_t1 AS "G.VALUE:N::STRING" from (SELECT m.*, unnest([{'_sf_i': CAST(0 AS BIGINT), ` +
-				`'_sf_t1': CAST(sf_fields_string(sf_list_part(m.s), sf_string_part(m.s), sf_other_part(m.s)) AS VARCHAR)}, ` +
-				`{'_sf_i': CAST(1 AS BIGINT), '_sf_t1': CAST(sf_fields_string(NULL, 'x', NULL) AS VARCHAR)}]) AS _sf_t FROM tab m) AS m ` +
+			`select m._sf_t._sf_t1 AS "G.VALUE:N::STRING" from (SELECT m.*, CASE _sf_k.i WHEN 0 THEN {'_sf_i': CAST(0 AS BIGINT), ` +
+				`'_sf_t1': CAST(sf_fields_string(sf_list_part(m.s), sf_string_part(m.s), sf_other_part(m.s)) AS VARCHAR)} ` +
+				`WHEN 1 THEN {'_sf_i': CAST(1 AS BIGINT), '_sf_t1': CAST(sf_fields_string(NULL, 'x', NULL) AS VARCHAR)} END AS _sf_t FROM tab m CROSS JOIN range(2) AS _sf_k(i)) AS m ` +
 				`inner join u on u.id = m.id where m.id > 1`, `LATERAL`},
 		// A key that every read casts is its text alone; one read otherwise
 		// keeps its parts.
@@ -425,8 +425,9 @@ func TestFlattenShapes(t *testing.T) {
 			`select sf_fields_string(m._sf_t._sf_l1, m._sf_t._sf_s1, m._sf_t._sf_j1) AS "G.VALUE:N::STRING", sf_fields_json(m._sf_t._sf_l1, m._sf_t._sf_s1, m._sf_t._sf_j1) AS "G.VALUE:N", ` +
 				`sf_fields_string(m._sf_t._sf_l1, m._sf_t._sf_s1, m._sf_t._sf_j1) = 'x'`, ``},
 		{`select g.value:n from tab m, lateral flatten(input => [object_construct('n', m.s), object_construct('n', iff(m.b, 'y', 'z')), object_construct('n', 'w')]) g`,
-			`'_sf_s1': CAST(sf_string_part(CASE WHEN (m.b) THEN 'y' ELSE 'z' END) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(CASE WHEN (m.b) THEN 'y' ELSE 'z' END) AS JSON)}, ` +
-				`{'_sf_i': CAST(2 AS BIGINT), '_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST('w' AS VARCHAR), '_sf_j1': CAST(NULL AS JSON)}`, ``},
+			`'_sf_s1': CAST(sf_string_part(CASE WHEN (m.b) THEN 'y' ELSE 'z' END) AS VARCHAR), '_sf_j1': CAST(sf_expr_part(CASE WHEN (m.b) THEN 'y' ELSE 'z' END) AS JSON)} ` +
+				`WHEN 2 THEN {'_sf_i': CAST(2 AS BIGINT), '_sf_l1': CAST(NULL AS VARCHAR[]), '_sf_s1': CAST('w' AS VARCHAR), '_sf_j1': CAST(NULL AS JSON)} END AS _sf_t ` +
+				`FROM tab m CROSS JOIN range(3) AS _sf_k(i)) AS m`, ``},
 		{`select g.value:l, g.value:l[0]::string, g.value:none from tab m, lateral flatten(input => [object_construct('l', ['x', 'y'], 'n', null), object_construct_keep_null('l', null, 'n', 1)]) g`,
 			`select sf_fields_json(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1) AS "G.VALUE:L", ` +
 				`json_extract_string(sf_fields_json(g._sf_fields._sf_l1, g._sf_fields._sf_s1, g._sf_fields._sf_j1), '$[0]') AS "G.VALUE:L[0]::STRING", CAST(NULL AS JSON) AS "G.VALUE:NONE" from`, `json_extract(`},
@@ -475,7 +476,7 @@ func TestFlattenShapes(t *testing.T) {
 		{`with a as (select v.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g, lateral flatten(input => g.value:l) v),
 				b as (select g.value from tab m, lateral flatten(input => [object_construct('l', m.a)]) g)
 				select * from a, b`,
-			`unnest(sf_parts_values(m._sf_t._sf_l1, m._sf_t._sf_j1, 'BOTH')) AS _sf_e FROM (SELECT m.*, unnest([`, ``},
+			`unnest(sf_parts_values(m._sf_t._sf_l1, m._sf_t._sf_j1, 'BOTH')) AS _sf_e FROM (SELECT m.*, {'_sf_i': CAST(0 AS BIGINT), '_sf_l1'`, `CROSS JOIN range(`},
 		{`select g.value:k, (select max(g.value:k::string) from table(flatten(input => [object_construct('k', 'b')])) g) from tab m, lateral flatten(input => [object_construct('k', 'a')]) g`,
 			`(select max(g._sf_fields._sf_k1) from LATERAL`, ``},
 		{`select g.value:k, (select max(g.value:k::string) from table(flatten(input => [object_construct('k', 'b')])) g) from tab m, lateral flatten(input => [object_construct('k', 'a')]) g`,
@@ -679,8 +680,8 @@ func TestFlattenStructsPlan(t *testing.T) {
 	if !strings.Contains(res.SQL, "sf_parts_strings(") {
 		t.Errorf("elements not unnested as text:\n%s", res.SQL)
 	}
-	if unnestBuilt(t, conn, res.SQL) {
-		t.Errorf("a join builds its hash table on unnested rows:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
+	if builtOn(t, conn, res.SQL)["tb"] {
+		t.Errorf("a join builds its hash table on the objects:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
 	}
 	// So does one on a key read only as text, as reports filter their
 	// media signals' names.
@@ -694,18 +695,19 @@ func TestFlattenStructsPlan(t *testing.T) {
 	if !strings.Contains(res.SQL, "'_sf_t2'") {
 		t.Errorf("the name is not its text alone:\n%s", res.SQL)
 	}
-	if unnestBuilt(t, conn, res.SQL) {
-		t.Errorf("a join builds its hash table on unnested rows:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
+	if builtOn(t, conn, res.SQL)["tb"] {
+		t.Errorf("a join builds its hash table on the objects:\n%s\n%s", res.SQL, explain(t, conn, res.SQL))
 	}
 }
 
-// unnestBuilt reports whether a hash join in DuckDB's plan of a statement
-// builds its hash table, on its second child, from an unnest's rows.
-func unnestBuilt(t *testing.T, conn *sql.Conn, statement string) bool {
+// builtOn returns the tables that the hash joins in DuckDB's plan of a
+// statement build their hash tables, on their second children, from.
+func builtOn(t *testing.T, conn *sql.Conn, statement string) map[string]bool {
 	t.Helper()
 	type planNode struct {
-		Name     string     `json:"name"`
-		Children []planNode `json:"children"`
+		Name      string         `json:"name"`
+		ExtraInfo map[string]any `json:"extra_info"`
+		Children  []planNode     `json:"children"`
 	}
 	rows, err := conn.QueryContext(context.Background(), "EXPLAIN (FORMAT JSON) "+statement)
 	if err != nil {
@@ -727,36 +729,29 @@ func unnestBuilt(t *testing.T, conn *sql.Conn, statement string) bool {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	var unnests func(n planNode) bool
-	unnests = func(n planNode) bool {
-		if n.Name == "UNNEST" {
-			return true
+	tables := map[string]bool{}
+	var scans func(n planNode)
+	scans = func(n planNode) {
+		if name, ok := n.ExtraInfo["Table"].(string); ok {
+			tables[name[strings.LastIndex(name, ".")+1:]] = true // catalog.schema.table
 		}
 		for _, c := range n.Children {
-			if unnests(c) {
-				return true
-			}
+			scans(c)
 		}
-		return false
 	}
-	var built func(n planNode) bool
-	built = func(n planNode) bool {
-		if n.Name == "HASH_JOIN" && len(n.Children) == 2 && unnests(n.Children[1]) {
-			return true
+	var joins func(n planNode)
+	joins = func(n planNode) {
+		if n.Name == "HASH_JOIN" && len(n.Children) == 2 {
+			scans(n.Children[1])
 		}
 		for _, c := range n.Children {
-			if built(c) {
-				return true
-			}
+			joins(c)
 		}
-		return false
 	}
 	for _, p := range plans {
-		if built(p) {
-			return true
-		}
+		joins(p)
 	}
-	return false
+	return tables
 }
 
 // explain returns DuckDB's plan of a statement.
