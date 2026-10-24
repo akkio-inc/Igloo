@@ -52,6 +52,8 @@ type harness struct {
 	views map[string]string
 	// hook, if set, sees every record the coordinator and workers log.
 	hook atomic.Pointer[func(slog.Record)]
+	// rb, if set, is the rb extension the session and workers load.
+	rb string
 }
 
 // hookHandler passes records to the harness's hook, and on to its handler.
@@ -204,13 +206,20 @@ func (c connector) Connect(ctx context.Context) (*duckdb.Conn, error) {
 // Parquet files, and starts n workers.
 func newHarness(t *testing.T, sf float64, files, n int) *harness {
 	t.Helper()
-	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}}
+	return newHarnessRB(t, sf, files, n, "")
+}
+
+// newHarnessRB is newHarness whose session and workers load the rb
+// extension at rb, if not empty, as Igloo loads it.
+func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
+	t.Helper()
+	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb}
 	var base slog.Handler = slog.NewTextHandler(io.Discard, nil)
 	if testing.Verbose() {
 		base = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	}
 	h.log = slog.New(hookHandler{h, base})
-	db, err := sql.Open("duckdb", "")
+	db, err := sql.Open("duckdb", h.dsn())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,6 +228,9 @@ func newHarness(t *testing.T, sf float64, files, n int) *harness {
 	ctx := context.Background()
 	if h.session, err = db.Conn(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if rb != "" {
+		h.exec("LOAD " + quoteLiteral(rb))
 	}
 	h.exec("INSTALL tpch")
 	h.exec("LOAD tpch")
@@ -295,6 +307,15 @@ func (h *harness) addNestedTable(name, source string, files int, nested []Column
 	h.files[tbl.key()] = fs
 }
 
+// dsn is the harness's DuckDB path: one that may load the rb extension,
+// which is not signed, when it loads it.
+func (h *harness) dsn() string {
+	if h.rb != "" {
+		return "?allow_unsigned_extensions=true"
+	}
+	return ""
+}
+
 // fieldIDs is a column's field IDs as COPY's FIELD_IDS option takes them.
 func fieldIDs(id int, nest *Nesting) string {
 	if nest == nil {
@@ -354,7 +375,7 @@ func (h *harness) startWorker(i int) {
 	}
 	// Locked down as the server and workers lock DuckDB down: once, for
 	// every connection.
-	c, err := duckdb.NewConnector("", nil)
+	c, err := duckdb.NewConnector(h.dsn(), nil)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -362,11 +383,15 @@ func (h *harness) startWorker(i int) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	for _, stmt := range []string{
+	var load []string
+	if h.rb != "" {
+		load = []string{"LOAD " + quoteLiteral(h.rb), "SET allow_unsigned_extensions = false"}
+	}
+	for _, stmt := range append(load,
 		"SET threads = 2",
-		"SET allowed_directories = [" + quoteLiteral(filepath.Join(h.dir, "warehouse")+"/") + ", " + quoteLiteral(tmp+"/") + "]",
+		"SET allowed_directories = ["+quoteLiteral(filepath.Join(h.dir, "warehouse")+"/")+", "+quoteLiteral(tmp+"/")+"]",
 		"SET enable_external_access = false",
-	} {
+	) {
 		if _, err := setup.(driver.ExecerContext).ExecContext(context.Background(), stmt, nil); err != nil {
 			h.t.Fatal(err)
 		}

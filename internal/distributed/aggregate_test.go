@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -208,5 +209,85 @@ func TestDistinctInPlace(t *testing.T) {
 				t.Errorf("%d stages wrote partial results to an exchange; want in place %v", n, tc.inPlace)
 			}
 		})
+	}
+}
+
+// TestBitmapDistinct checks the plan of a count(DISTINCT) of 32-bit
+// unsigned IDs with roaring bitmaps on: workers send a bitmap of their
+// values a group (rb_agg), no value, and the coordinator counts the union;
+// off, or over another type, the values cross as before.
+func TestBitmapDistinct(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	q := `SELECT l_shipmode, count(DISTINCT CAST(l_orderkey AS UINTEGER)) AS o, sum(l_quantity) AS q FROM lineitem GROUP BY 1 ORDER BY 1`
+	plain := `SELECT l_shipmode, count(DISTINCT l_orderkey) AS o FROM lineitem GROUP BY 1 ORDER BY 1`
+	sql := func(p *Plan) string {
+		var b strings.Builder
+		for _, s := range p.Stages {
+			b.WriteString(s.SQL + "\n")
+		}
+		if f, err := h.co.parser.print(p.final); err == nil {
+			b.WriteString(f)
+		}
+		return b.String()
+	}
+	on, off := true, false
+	for _, mode := range []string{aggGather, aggByGroup, ""} {
+		h.co.aggregation = mode
+		h.co.bitmaps = &on
+		got := sql(h.planOf(q))
+		if !strings.Contains(got, "rb_agg(") || !strings.Contains(got, "rb_cardinality(rb_or_agg(") || strings.Contains(got, "__dk") {
+			t.Errorf("%q, bitmaps on:\n%s", mode, got)
+		}
+		if got := sql(h.planOf(plain)); strings.Contains(got, "rb_agg(") {
+			t.Errorf("%q, a BIGINT counted distinct with bitmaps:\n%s", mode, got)
+		}
+		h.co.bitmaps = &off
+		if got := sql(h.planOf(q)); strings.Contains(got, "rb_") || !strings.Contains(got, "__dk") {
+			t.Errorf("%q, bitmaps off:\n%s", mode, got)
+		}
+	}
+	h.co.aggregation, h.co.bitmaps = "", nil
+	// Without the extension, bitmaps are off whatever the session says.
+	if got := sql(h.planOf(q)); strings.Contains(got, "rb_") {
+		t.Errorf("without the extension:\n%s", got)
+	}
+}
+
+// TestBitmapDistinctResults checks that with roaring bitmaps on, the
+// workers' bitmaps (rb_agg), sent to the coordinator, through an exchange to
+// a second stage, or both, count what one machine does, beside aggregates
+// over DISTINCT values that cross as values.
+func TestBitmapDistinctResults(t *testing.T) {
+	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
+	if rb == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
+	}
+	h := newHarnessRB(t, 0.02, 4, 3, rb)
+	h.exec("SET rb_count_distinct = 'auto'")
+	queries := []string{
+		`SELECT l_shipmode, count(DISTINCT CAST(l_orderkey AS UINTEGER)) AS o, sum(l_quantity) AS q FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`SELECT count(DISTINCT CAST(l_partkey AS UINTEGER)) AS p, count(DISTINCT CAST(l_suppkey AS UINTEGER)) AS s, count(*) FROM lineitem`,
+		`SELECT l_returnflag, count(DISTINCT CAST(CASE WHEN l_quantity > 25 THEN l_orderkey END AS UINTEGER)) AS big,
+			count(DISTINCT l_suppkey) AS s FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`SELECT o.o_orderpriority, count(DISTINCT CAST(l.l_partkey AS UINTEGER)) AS parts FROM lineitem AS l
+			JOIN orders AS o ON o.o_orderkey = l.l_orderkey GROUP BY 1 ORDER BY 1`,
+	}
+	h.co.maxBroadcast = 1
+	for _, mode := range []string{aggGather, aggByGroup, ""} {
+		h.co.aggregation = mode
+		for _, q := range queries {
+			t.Run(mode+" "+short(q), func(t *testing.T) {
+				h.t = t
+				if !h.check(q) {
+					t.Fatal("did not run distributed")
+				}
+				if p := h.planOf(q); !strings.Contains(p.describe(), "rb_agg(") {
+					t.Errorf("no bitmaps:\n%s", p.describe())
+				}
+			})
+		}
 	}
 }

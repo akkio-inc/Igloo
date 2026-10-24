@@ -776,6 +776,15 @@ stage completes the groups (`internal/distributed/aggregate.go`):
   `CASE` whose every branch does with no `ELSE`), as in Snowflake's
   `COUNT(DISTINCT user_id, day)` next to `COUNT(DISTINCT user_id)`;
   partitioning by that column keeps every argument's values apart.
+- **Bitmaps.** Where the session counts distinct 32-bit unsigned integers
+  with the rb extension's roaring bitmaps (`rb_count_distinct` `auto` or
+  `always`), a `count(DISTINCT)` of a `CAST(... AS UINTEGER)` or of a
+  column of an unsigned type is not an aggregate over `DISTINCT` values
+  for these modes at all: its partial is `rb_agg` of its argument, a BLOB
+  of CRoaring's portable serialization a group, and the coordinator or a
+  second stage computes `rb_cardinality(rb_or_agg(...))` of the partials,
+  so the aggregation goes as one without `DISTINCT` (gathered, or by
+  group when groups are many) and no value crosses.
 - **By group.** Other aggregates over `DISTINCT` values (`median`,
   `string_agg`, arguments none of which fixes the others), and the top
   groups of an aggregation by a column of a divided table

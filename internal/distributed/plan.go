@@ -218,6 +218,10 @@ type planOptions struct {
 	// workers are the workers the statement may run on, for weighing
 	// what every task reads whole.
 	workers int
+	// bitmaps says count(DISTINCT) of 32-bit unsigned IDs combines roaring
+	// bitmaps (combineBitmap): the rb extension is loaded, as on every
+	// machine, and the session turned them on (see bitmapsOn).
+	bitmaps bool
 	// large are relations measured large lately, by key, with what they
 	// were estimated at then (see outcomes).
 	large map[string]outcome

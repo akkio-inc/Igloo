@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -71,6 +72,9 @@ type aggCall struct {
 	// whole, if set, says why it cannot be computed in parts, only by a
 	// stage that holds whole groups.
 	whole error
+	// bitmap says it counts DISTINCT values in roaring bitmaps (see
+	// combineBitmap), whose argument is not among distincts.
+	bitmap bool
 }
 
 // How an aggregation's groups are completed. Workers always aggregate their
@@ -433,6 +437,13 @@ const (
 	// combineDistinct computes the aggregate over the distinct values
 	// the workers grouped by.
 	combineDistinct = "distinct"
+	// combineBitmap counts the values of the union of roaring bitmaps of
+	// them: a count(DISTINCT) of 32-bit unsigned IDs, whose workers each
+	// send a bitmap of their share's values a group (rb_agg) rather than
+	// every value, when the rb extension is loaded and bitmaps are on (see
+	// planOptions). The bitmap is CRoaring's portable serialization, a
+	// BLOB, the same on every machine.
+	combineBitmap = "bitmap"
 )
 
 // combinable maps the aggregates that combine by applying another
@@ -442,6 +453,8 @@ var combinable = map[string]string{
 	"bit_and": "bit_and", "bit_or": "bit_or", "bit_xor": "bit_xor", "any_value": "any_value",
 	"fsum": "fsum", "sumkahan": "fsum", "kahan_sum": "fsum", "product": "product",
 	"count": "sum", "count_star": "sum", "count_if": "sum", "countif": "sum",
+	// Roaring bitmaps: a union of unions.
+	"rb_agg": "rb_or_agg", "rb_or_agg": "rb_or_agg",
 }
 
 // collect finds the aggregate calls of the parts the coordinator evaluates
@@ -489,6 +502,9 @@ func (a *aggregation) add(call node) error {
 		ac.whole = unsupported("ORDER BY inside %s()", name)
 	case call["distinct"] == true && (len(args) != 1 || child(call, "filter") != nil):
 		ac.whole = unsupported("%s(DISTINCT ...) with several arguments or a FILTER", name)
+	case call["distinct"] == true && name == "count" && a.pl.opts.bitmaps && a.bitmapArg(args[0].(node)):
+		// A bitmap a group: no value need cross.
+		ac.bitmap = true
 	case call["distinct"] == true:
 		arg, err := a.substituteAliases(clone(args[0]).(node))
 		if err != nil {
@@ -620,6 +636,12 @@ func (a *aggregation) plan() error {
 			ac.kind = combineDistinct
 			continue
 		}
+		if ac.bitmap {
+			ac.kind = combineBitmap
+			ac.partials = []int{a.partial(ac, "rb_agg")}
+			a.partials[ac.partials[0]]["distinct"] = false
+			continue
+		}
 		switch ac.name {
 		case "avg", "mean":
 			ac.kind = combineAvg
@@ -646,6 +668,28 @@ func (a *aggregation) partial(ac *aggCall, function string) int {
 	a.partials = append(a.partials, p)
 	a.dk = append(a.dk, ac.distinct)
 	return len(a.partials) - 1
+}
+
+// bitmapArg reports whether a count(DISTINCT) argument is a 32-bit
+// unsigned integer, as roaring bitmaps hold: a cast to UINTEGER, as the
+// integer IDs of people are counted, or a column of an unsigned type that
+// widens to it.
+func (a *aggregation) bitmapArg(arg node) bool {
+	switch str(arg["class"]) {
+	case "CAST":
+		return strings.EqualFold(str(child(arg, "cast_type")["id"]), "UINTEGER")
+	case "COLUMN_REF":
+		it := resolveColumn(arg, a.c.scope)
+		for _, u := range a.c.uses {
+			if it != nil && u.item == it {
+				switch strings.ToUpper(columnType(u.table, lastName(arg))) {
+				case "UINTEGER", "USMALLINT", "UTINYINT":
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // anchor returns the index of a DISTINCT argument whose value every
@@ -1317,6 +1361,8 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 		text = "CAST(sum(" + col(0) + ") AS DOUBLE) / CAST(sum(" + col(1) + ") AS DOUBLE)"
 	case ac.kind == combineSame:
 		text = combinable[ac.name] + "(" + col(0) + ")"
+	case ac.kind == combineBitmap:
+		text = "rb_cardinality(rb_or_agg(" + col(0) + "))"
 	case ac.kind == combineDistinct:
 		c := clone(ac.call).(node)
 		ref, err := a.pl.p.expr(quoteIdent("__dk" + strconv.Itoa(ac.distinct)))
@@ -1564,3 +1610,25 @@ func limitRows(mod node) (int64, bool) {
 const maxTopN = 1_000_000
 
 func jsonInt(i int) any { return json.Number(strconv.Itoa(i)) }
+
+// bitmapSetting is the session's DuckDB setting, the rb extension's, that
+// turns roaring bitmaps on for count(DISTINCT) of 32-bit unsigned IDs:
+// 'auto' or 'always' (Igloo sets 'auto' where its integer IDs are on), and
+// absent where the extension is not loaded.
+const bitmapSetting = "rb_count_distinct"
+
+// bitmapsOn reports whether count(DISTINCT) of 32-bit unsigned IDs may
+// combine roaring bitmaps in statements of the session env: its rb
+// extension, which every machine loads where any does, is loaded, and the
+// session has bitmaps on.
+func (co *Coordinator) bitmapsOn(ctx context.Context, env Env) bool {
+	if co.bitmaps != nil {
+		return *co.bitmaps
+	}
+	v, err := env.Setting(ctx, bitmapSetting)
+	if err != nil {
+		return false
+	}
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "auto" || v == "always"
+}

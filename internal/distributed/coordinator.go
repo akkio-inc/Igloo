@@ -122,8 +122,10 @@ type Coordinator struct {
 	// for tests.
 	maxBroadcast int64
 	// aggregation, if set, overrides how aggregations complete their
-	// groups, for tests (see planOptions).
+	// groups, for tests (see planOptions); bitmaps, if set, whether
+	// count(DISTINCT) combines roaring bitmaps.
 	aggregation string
+	bitmaps     *bool
 	parser      *parser
 	aggs        map[string]bool
 	dir         string
@@ -318,6 +320,7 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		opts.maxBroadcast = co.maxBroadcast
 	}
 	opts.aggregation = co.aggregation
+	opts.bitmaps = co.bitmapsOn(ctx, env)
 	opts.sizes, opts.taskMemory, opts.workers = sizes, taskMemory(ws), len(ws)
 	if sizes == nil {
 		// Relations measured large lately are planned as such at once.

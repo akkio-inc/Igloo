@@ -86,6 +86,16 @@ exchange. The top groups of an aggregation by a column of the large table
 (`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are partitioned by
 group, and each partition sends the coordinator only its first groups.
 
+Where a session counts distinct 32-bit unsigned integers with roaring
+bitmaps (the `rb_count_distinct` setting, `auto` or `always`, which Igloo
+sets with [ID domains](sql.md#id-domains) on), a `count(DISTINCT)` of such values (a
+`CAST(... AS UINTEGER)`, as Igloo writes counts of people by their
+integer IDs, or a column of an unsigned type) crosses no values at all:
+each worker sends a bitmap of its share's values a group, a few bytes a
+value at most, and the coordinator, or a worker completing a partition of
+the groups, counts their union. Aggregates over other `DISTINCT` values in
+the same `SELECT` go as above.
+
 Statements built in steps, with common table expressions or subqueries,
 run step by step on workers, each step's rows written to object storage
 for the next, keyed by the column the next step joins or groups on. A
