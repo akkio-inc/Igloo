@@ -194,8 +194,10 @@ type execution struct {
 	// variables are the values the coordinator computed, which tasks set
 	// before they run (see values.go).
 	variables []variable
-	force     bool
-	sp        *spool
+	// local says workers write exchanges to their own disks (see localFor).
+	local bool
+	force bool
+	sp    *spool
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
@@ -495,14 +497,14 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			task.SQL = exchangeSQL(s, e.parts)
 			task.Shuffle = e.rootOf(s.ID, i) + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
 			task.Partitions = e.parts
-			if e.co.opts.LocalExchanges {
+			if e.local {
 				// What it writes is taken to be at most what it reads.
 				task.Local = e.qid + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
 				task.Expect = reads + bytes
 			}
 		}
 		task.Variables = variablesOf(e.variables, task.SQL)
-		if e.co.opts.LocalExchanges {
+		if e.local {
 			for _, w := range e.ws {
 				task.Peers = append(task.Peers, w.addr)
 			}

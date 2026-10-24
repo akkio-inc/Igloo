@@ -215,7 +215,23 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
+		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
 	})
+}
+
+// localRoom is the room the worker's disk has for exchanges: the share of
+// its exchange directory's free space a task may take, within
+// ExchangeBytes.
+func (w *Worker) localRoom() int64 {
+	free, err := w.local.free(w.local.root)
+	if err != nil {
+		return 0
+	}
+	room := free / localShare
+	if w.opts.ExchangeBytes > 0 {
+		room = min(room, w.opts.ExchangeBytes)
+	}
+	return room
 }
 
 // maxTaskRequest bounds a task's JSON: the file lists of large tables.

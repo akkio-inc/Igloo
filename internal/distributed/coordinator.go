@@ -118,6 +118,11 @@ type Options struct {
 	// where their room allows, rather than to object storage
 	// (IGLOO_EXCHANGES=local; see localx.go).
 	LocalExchanges bool
+	// AutoExchanges makes workers write exchanges to their own disks when
+	// every worker a statement runs on reports room there and runs outside
+	// Kubernetes, and to object storage otherwise (IGLOO_EXCHANGES=auto;
+	// see localFor).
+	AutoExchanges bool
 }
 
 // Coordinator splits statements into parts that workers run.
@@ -582,6 +587,10 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 	}()
 	parts := exchangePartitions(plan.Stages, ws, len(ws), uploadBytes(co.opts.Warehouse))
+	local := co.localFor(ws)
+	if slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.Out != nil }) {
+		co.opts.Metrics.exchanged(local)
+	}
 	var run *execution
 	planned := plan
 	// smaller counts the runs again in smaller tasks, and lostOnce says the
@@ -594,7 +603,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		// the next runs, so that they do not take its room there.
 		mark := len(cleanups)
 		dropAttempt := func() {
-			if !co.opts.LocalExchanges {
+			if !local {
 				// Object storage has room: they go at the end, as ever.
 				return
 			}
@@ -610,21 +619,21 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		newRun := func(id string) *execution {
 			r := &execution{
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
-				sp: &spool{limit: limit}, parts: parts, smaller: smaller, roots: spreadRoots(co.opts.Warehouse, id),
+				sp: &spool{limit: limit}, parts: parts, smaller: smaller, roots: spreadRoots(co.opts.Warehouse, id), local: local,
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 			}
 			// The exchanges are read only by the stages: once they have run,
 			// the statement's rows need not wait for their removal.
 			release := co.hold(id, r.roots...)
 			releaseLocal := func() {}
-			if co.opts.LocalExchanges {
+			if local {
 				releaseLocal = co.holdLocal(id, r.ws)
 			}
 			cleanups = append(cleanups, func() {
 				release()
 				releaseLocal()
 				co.removeLater(id, r.roots...)
-				if co.opts.LocalExchanges {
+				if local {
 					co.removeLocalLater(id, r.ws)
 				}
 			})
@@ -1107,6 +1116,34 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 type spool struct {
 	limit int64
 	used  atomic.Int64
+}
+
+// minLocalRoom is the least room for exchanges a worker reports for
+// IGLOO_EXCHANGES=auto to have workers write them to their disks; a task
+// whose share does not fit writes it to object storage all the same.
+const minLocalRoom = 1 << 30
+
+// localFor reports whether workers ws write a statement's exchanges to
+// their own disks: always with LocalExchanges; with AutoExchanges, when
+// every one reports minLocalRoom for them and runs outside Kubernetes,
+// whose pods' volumes the chart sets up for exchanges only when told to
+// (workers.exchanges: local). At ten times the data on 16 workers with
+// NVMe, two reports took 34 and 62 s with exchanges on workers' disks, 96
+// and 205 s through object storage, which also turned requests away under
+// the load.
+func (co *Coordinator) localFor(ws []*worker) bool {
+	if co.opts.LocalExchanges {
+		return true
+	}
+	if !co.opts.AutoExchanges || len(ws) == 0 {
+		return false
+	}
+	for _, w := range ws {
+		if w.status.Kubernetes || w.status.LocalRoom < minLocalRoom {
+			return false
+		}
+	}
+	return true
 }
 
 // defaultMaxSpool is the least spool of a statement when Options say

@@ -32,7 +32,9 @@ type Workers struct {
 	// auto mode runs it on workers, unless it would run short of memory.
 	Threshold time.Duration
 	// Exchanges is where workers write the rows they exchange: object (the
-	// warehouse's object storage) or local (their own disks). ExchangeMax,
+	// warehouse's object storage), local (their own disks), or auto (their
+	// own disks when every worker of a statement has room there and runs
+	// outside Kubernetes, object storage otherwise). ExchangeMax,
 	// on a worker, caps the bytes of exchanges on its disk; zero leaves
 	// them to the disk's free space.
 	Exchanges   string
@@ -77,8 +79,8 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		ListenAddr:    get("IGLOO_WORKER_LISTEN_ADDR", ":"+WorkerPort),
 		Exchanges:     get("IGLOO_EXCHANGES", "object"),
 	}
-	if w.Exchanges != "object" && w.Exchanges != "local" {
-		addErr("IGLOO_EXCHANGES must be object or local, got %q", w.Exchanges)
+	if w.Exchanges != "object" && w.Exchanges != "local" && w.Exchanges != "auto" {
+		addErr("IGLOO_EXCHANGES must be object, local or auto, got %q", w.Exchanges)
 	}
 	if v := get("IGLOO_EXCHANGE_MAX_SIZE", ""); v != "" {
 		n, err := ParseSize(v)

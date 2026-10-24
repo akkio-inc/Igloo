@@ -233,6 +233,12 @@ type workerStatus struct {
 	Boot        string  `json:"boot,omitempty"`
 	Running     int     `json:"running"`
 	IdleSeconds float64 `json:"idle_seconds"`
+	// LocalRoom is the room its disk has for exchanges (see localFor): the
+	// share of its exchange directory's free space a task may take
+	// (localShare), within IGLOO_EXCHANGE_MAX_SIZE.
+	LocalRoom int64 `json:"local_room,omitempty"`
+	// Kubernetes says it runs in a Kubernetes pod.
+	Kubernetes bool `json:"kubernetes,omitempty"`
 }
 
 // SettingNames are the session settings that change what a query computes.

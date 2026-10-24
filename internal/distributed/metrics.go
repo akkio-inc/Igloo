@@ -18,6 +18,7 @@ type Metrics struct {
 	received  prometheus.Counter
 	starts    *prometheus.CounterVec
 	guards    prometheus.Counter
+	exchanges *prometheus.CounterVec
 }
 
 // NewMetrics registers the coordinator's metrics with reg.
@@ -60,8 +61,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_auto_guard_reruns_total",
 			Help: "Statements auto mode ran on this replica that ran past three times their estimate there, and were canceled and run on workers instead.",
 		}),
+		exchanges: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_distributed_exchanging_queries_total",
+			Help: "Statements whose parts exchanged rows between stages, by where workers wrote them: local (their disks) or object (object storage).",
+		}, []string{"exchanges"}),
 	}
-	reg.MustRegister(m.queries, m.fallbacks, m.duration, m.tasks, m.workers, m.scanned, m.received, m.starts, m.guards)
+	reg.MustRegister(m.queries, m.fallbacks, m.duration, m.tasks, m.workers, m.scanned, m.received, m.starts, m.guards, m.exchanges)
 	return m
 }
 
@@ -79,6 +84,17 @@ func (m *Metrics) query(outcome string, start time.Time) {
 func (m *Metrics) guard() {
 	if m != nil {
 		m.guards.Inc()
+	}
+}
+
+// exchanged counts a statement whose parts exchange rows, by where.
+func (m *Metrics) exchanged(local bool) {
+	if m != nil {
+		where := "object"
+		if local {
+			where = "local"
+		}
+		m.exchanges.WithLabelValues(where).Inc()
 	}
 }
 

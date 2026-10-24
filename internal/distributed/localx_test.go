@@ -16,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/akkio-inc/igloo/internal/config"
 )
 
@@ -674,5 +677,50 @@ func TestExchangeWaits(t *testing.T) {
 	var lost *lostError
 	if !errors.As(err, &lost) {
 		t.Errorf("a worker that stopped sending: %v", err)
+	}
+}
+
+// With IGLOO_EXCHANGES=auto, workers write a statement's exchanges to their
+// own disks when every one reports room there and runs outside
+// Kubernetes, and to object storage otherwise; the statement returns what
+// one machine does either way.
+func TestAutoExchanges(t *testing.T) {
+	co := &Coordinator{opts: Options{AutoExchanges: true}}
+	room := func(n int64, k8s bool) *worker { return &worker{status: workerStatus{LocalRoom: n, Kubernetes: k8s}} }
+	for _, c := range []struct {
+		ws   []*worker
+		want bool
+	}{
+		{[]*worker{room(64<<30, false), room(2<<30, false)}, true},
+		{[]*worker{room(64<<30, false), room(minLocalRoom-1, false)}, false},
+		{[]*worker{room(64<<30, false), room(64<<30, true)}, false},
+		{[]*worker{room(64<<30, false), {}}, false},
+		{nil, false},
+	} {
+		if got := co.localFor(c.ws); got != c.want {
+			t.Errorf("%v: %v, want %v", c.ws, got, c.want)
+		}
+	}
+	co.opts = Options{}
+	if co.localFor([]*worker{room(64<<30, false)}) {
+		t.Error("object storage by default")
+	}
+	co.opts.LocalExchanges = true
+	if !co.localFor([]*worker{room(0, true)}) {
+		t.Error("IGLOO_EXCHANGES=local writes to workers' disks whatever they report")
+	}
+
+	h := newHarness(t, 0.01, 3, 2)
+	h.co.maxBroadcast = 1
+	h.co.opts.AutoExchanges = true
+	h.co.opts.Metrics = NewMetrics(prometheus.NewRegistry())
+	q := `SELECT o_orderpriority, count(*), sum(l_quantity) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`
+	if !h.check(q) {
+		t.Fatal("did not run distributed")
+	}
+	local := testutil.ToFloat64(h.co.opts.Metrics.exchanges.WithLabelValues("local"))
+	object := testutil.ToFloat64(h.co.opts.Metrics.exchanges.WithLabelValues("object"))
+	if local != 1 || object != 0 {
+		t.Errorf("exchanged %v times on workers' disks and %v through object storage, want 1 and 0", local, object)
 	}
 }

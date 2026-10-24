@@ -6,6 +6,8 @@
 #   - the query history records how many workers ran each statement,
 #   - grants hold on the workers,
 #   - a worker killed in the middle of a statement does not fail it,
+#   - with IGLOO_EXCHANGES=auto, workers exchange rows on their disks, and
+#     a worker killed while it holds some does not give wrong rows,
 #   - statement timeouts reach the workers,
 #   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
@@ -461,6 +463,52 @@ if compose logs --no-color igloo | grep -q "more files than its tasks times its 
 else
   pass "every exchange held at most a file per task and partition"
 fi
+
+echo "exchanges on workers' disks"
+# auto: this stack's workers run outside Kubernetes, with room on their
+# disks, so statements exchange rows there rather than through the bucket.
+set_exchanges() {
+  if grep -q '^IGLOO_EXCHANGES=' "$env_file"; then
+    sed -i.bak -e "s/^IGLOO_EXCHANGES=.*/IGLOO_EXCHANGES=$1/" "$env_file"
+  else
+    echo "IGLOO_EXCHANGES=$1" >>"$env_file"
+  fi
+  compose up -d --no-build --wait igloo >/dev/null
+}
+set_exchanges auto
+check_distributed "a join of two common table expressions, exchanged on workers' disks" relations_local "WITH s AS (SELECT l_orderkey AS k,
+    sum(l_quantity) AS q, count(DISTINCT l_suppkey) AS sups FROM lineitem GROUP BY 1),
+  u AS (SELECT o_orderkey AS k FROM orders WHERE o_orderpriority = '1-URGENT'
+    UNION ALL SELECT o_orderkey FROM orders WHERE o_orderpriority = '2-HIGH')
+  SELECT count(*), sum(q), sum(sups) FROM s JOIN u ON s.k = u.k"
+if metric_matches '^igloo_distributed_exchanging_queries_total{exchanges="local"} [1-9]'; then
+  pass "auto had the workers exchange rows on their disks"
+else
+  fail "auto exchanged no rows on the workers' disks"
+fi
+# A worker killed while its disk holds exchanged rows: the statement runs
+# again without it, or fails saying a worker holding exchanged rows was
+# lost, never with wrong rows.
+slow_local="WITH s AS (SELECT l_orderkey AS k, sum(length(repeat(l_comment, 600))) AS q FROM lineitem GROUP BY 1),
+  u AS (SELECT o_orderkey AS k FROM orders WHERE o_orderpriority IN ('1-URGENT', '2-HIGH'))
+  SELECT count(*), sum(q) FROM s JOIN u ON s.k = u.k"
+want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$slow_local" | grep -v '^SET$')"
+start=$SECONDS
+psql_admin -c "SET distributed_execution = 'on'" -c "$slow_local" 2>&1 | grep -v '^SET$' >"$work/slow_local" &
+query=$!
+sleep 1
+victim="$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=worker" | head -1)"
+docker kill "$victim" >/dev/null
+wait "$query" || true
+if [ -n "$want" ] && [ "$(cat "$work/slow_local")" = "$want" ]; then
+  pass "with exchanges on workers' disks, the statement finished with the right result in $((SECONDS - start))s"
+elif grep -q "a worker holding exchanged rows on its disk was lost" "$work/slow_local"; then
+  pass "with exchanges on workers' disks, the statement failed saying a worker holding them was lost"
+else
+  fail "after a worker holding exchanged rows died: [$(cat "$work/slow_local")], want [$want]"
+fi
+compose up -d --wait worker >/dev/null 2>&1 || compose up -d --wait --scale worker="$workers" >/dev/null
+set_exchanges object
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
