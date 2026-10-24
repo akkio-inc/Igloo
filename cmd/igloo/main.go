@@ -438,6 +438,7 @@ func serve() error {
 		IDDomainsOn:         cfg.IDDomains,
 		Bitmaps:             cfg.IDDomains && cfg.BitmapMinRows >= 0 && eng.BitmapsLoaded(),
 		BitmapMinRows:       cfg.BitmapMinRows,
+		BitmapIndexes:       cfg.BitmapIndexes && cfg.IDDomains && eng.BitmapsLoaded(),
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,
@@ -538,7 +539,11 @@ func serve() error {
 		if err != nil {
 			return err
 		}
-		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, memory, threads, reg, work, notifier.MaintenanceFailed, srv.MapIDDomains, log)
+		stopMaintenance, lock, err := startMaintenance(ctx, cfg, cat, guard, policies, memory, threads, reg, work, notifier.MaintenanceFailed, func(ctx context.Context) {
+			// Bitmap indexes hold ids, so they are built once ids are mapped.
+			srv.MapIDDomains(ctx)
+			srv.MaintainBitmapIndexes(ctx)
+		}, log)
 		if err != nil {
 			return err
 		}

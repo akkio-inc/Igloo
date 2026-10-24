@@ -61,6 +61,9 @@ type Config struct {
 	// IDs must read for Igloo to count them in roaring bitmaps
 	// (IGLOO_BITMAP_MIN_ROWS, 10 million by default; "off", -1, never).
 	BitmapMinRows int64
+	// BitmapIndexes lets tables have bitmap indexes of member columns
+	// (IGLOO_BITMAP_INDEXES, off by default; it needs IGLOO_ID_DOMAINS).
+	BitmapIndexes bool
 	// ConnectionSecretsDir holds files with the passwords of connections to
 	// other databases, which a connection names with password_secret.
 	// Empty means connections store their passwords.
@@ -521,6 +524,15 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_ID_DOMAINS must be true or false: %w", err)
 	}
 	cfg.IDDomains = idDomains
+
+	bitmapIndexes, err := strconv.ParseBool(get("IGLOO_BITMAP_INDEXES", "false"))
+	if err != nil {
+		addErr("IGLOO_BITMAP_INDEXES must be true or false: %w", err)
+	}
+	if bitmapIndexes && !idDomains {
+		addErr("IGLOO_BITMAP_INDEXES needs IGLOO_ID_DOMAINS=true: bitmap indexes hold ID domains' ids")
+	}
+	cfg.BitmapIndexes = bitmapIndexes
 
 	if v := get("IGLOO_BITMAP_MIN_ROWS", "10000000"); strings.EqualFold(v, "off") {
 		cfg.BitmapMinRows = -1

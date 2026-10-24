@@ -155,6 +155,10 @@ type Options struct {
 	// statement (see bitmaps.go).
 	Bitmaps       bool
 	BitmapMinRows int64
+	// BitmapIndexes lets tables have bitmap indexes, which Igloo builds
+	// and answers counts of distinct ids from (IGLOO_BITMAP_INDEXES, with
+	// IDDomainsOn and the rb extension; see bitmapindex.go).
+	BitmapIndexes bool
 	// AllowedLocations are where users other than admins may read files
 	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
 	// Warehouse is the warehouse's location, whose files they may not.
@@ -296,9 +300,13 @@ type Server struct {
 	bitmaps       bool
 	bitmapMinRows int64
 	bitmapReruns  atomic.Int64
-	settings      auth.SettingStore
-	workload      *workload.Controller
-	pool          string
+	// bitmapIndexesOn is Options.BitmapIndexes, and indexBuilds runs their
+	// maintenance in the background (see bitmapbuild.go).
+	bitmapIndexesOn bool
+	indexBuilds     indexBuilds
+	settings        auth.SettingStore
+	workload        *workload.Controller
+	pool            string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -466,7 +474,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
-	s.bitmaps, s.bitmapMinRows = opts.Bitmaps, opts.BitmapMinRows
+	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}
@@ -1264,6 +1272,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		return ps, err
 	}
 
+	if ps, ok, err := s.indexStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
 	if ps, ok, err := s.depthStatement(sess, q); ok || err != nil {
 		return ps, err
 	}
@@ -1886,8 +1898,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, query)
 	}
 	if err == nil {
-		// Nothing changes ID domains' dictionaries but Igloo.
-		err = dictionaryWrites(st.stmtType, query)
+		// Nothing changes ID domains' dictionaries or bitmap indexes but
+		// Igloo.
+		err = iglooSchemaWrites(st.stmtType, query)
 	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)

@@ -481,7 +481,43 @@ DROP ID DOMAIN people;
   memory. Its results are the same. A statement whose bitmaps do not fit
   in the memory DuckDB has for them runs once more counting with the hash.
 
-## Erasure and data retention
+## Bitmap indexes
+
+A bitmap index keeps, for a member column of an [ID domain](#id-domains), a
+roaring bitmap of its values' ids for each combination of the values of a
+few other columns of the table: the people in each segment, say, or in each
+audience's version. Igloo builds it and keeps it up to date in the
+background. Bitmap indexes exist only with `IGLOO_BITMAP_INDEXES=true`,
+which is off by default and needs `IGLOO_ID_DOMAINS=true`.
+
+```sql
+ALTER TABLE crm.segments ADD BITMAP INDEX people_by_segment ON (segment_name) FOR person_id;
+ALTER TABLE crm.contacts ADD BITMAP INDEX everyone ON () FOR person_id;
+SHOW BITMAP INDEXES;
+ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
+```
+
+- `FOR` names a member column, whose ids the bitmaps hold; `ON` names up to
+  four other columns of plain types, one bitmap for each combination of their
+  values (`ON ()`, one bitmap for the whole table). Only admins add and drop
+  indexes; anyone may list them. A column keeps its domain while an index
+  holds its ids.
+- An index's bitmaps are the table `igloo_bitmaps.<name>` of the catalog,
+  in CRoaring's portable format, one row for each combination, for one
+  snapshot of the table. Like the dictionaries, the tables are Igloo's own:
+  the row access policy `igloo_bitmap_index` keeps every user's statement
+  from their rows, no one may write to, create, drop or alter anything in
+  the schema `igloo_bitmaps`, and they count as protected wherever Igloo
+  serves tables or files.
+- After a statement writes the table, and at each maintenance pass once ids
+  are mapped, Igloo brings the bitmaps to the table's current snapshot: an
+  append adds the appended files' bitmaps, a compaction or clustering keeps
+  them as they are, and anything else builds them again from the snapshot.
+  A snapshot whose member values do not all have ids yet gets no bitmaps
+  until mapping fills them in. `SHOW BITMAP INDEXES` says which snapshot an
+  index's bitmaps are of, and whether that is the table's current one.
+
+
 
 [Erasure requests](privacy.md) delete a person's data from every table
 whose columns are tagged with their identifiers, physically and with a

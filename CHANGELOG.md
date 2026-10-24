@@ -106,6 +106,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   distinct people over integers, and keeping sets of them as bitmaps, is
   what the heaviest audience reports spend their time on; the work that
   fills the ids and counts through them follows.
+- Bitmap indexes, off by default (`IGLOO_BITMAP_INDEXES`, with ID domains):
+  `ALTER TABLE t ADD BITMAP INDEX name ON (segment) FOR person_id` keeps a
+  roaring bitmap of a member column's ids for each value of up to four other
+  columns (`ON ()`, one for the whole table) in Igloo's own table
+  `igloo_bitmaps.name`, which no user's statement reads or changes and which
+  counts as protected wherever Igloo serves tables or files. Igloo brings
+  the bitmaps to the table's current snapshot in the background after writes
+  and at each maintenance pass: appends add the appended files' bitmaps,
+  compaction and clustering keep them, anything else builds them again, and
+  a snapshot whose values are not all mapped to ids waits for mapping. `SHOW
+  BITMAP INDEXES` lists them and the snapshot each is of. Answering counts
+  from them follows.
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

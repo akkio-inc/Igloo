@@ -154,6 +154,7 @@ func (s *Server) finishRecord(q *audit.Query, read, written []auth.Object, locat
 	}
 	if audit.ChangesData(q.StatementType) {
 		s.metadataChanged(written)
+		s.indexesWritten(written)
 	}
 }
 

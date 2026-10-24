@@ -126,14 +126,54 @@ func IsHidden(name string) bool {
 	return len(name) >= len(hiddenPrefix) && strings.EqualFold(name[:len(hiddenPrefix)], hiddenPrefix)
 }
 
-// Catalog is every domain and member, kept as one document.
+// IndexSchema is the catalog schema that holds bitmap indexes' tables, one
+// table an index, named after it. It is Igloo's own.
+const IndexSchema = "igloo_bitmaps"
+
+// IndexPolicy is the row access policy, Igloo's own, that every bitmap
+// index's table carries, as DictionaryPolicy does the dictionaries': it is
+// false, so no user's statement reads the bitmaps, and the tables count as
+// protected wherever Igloo serves files or tables. Igloo reads them
+// itself, to answer counts.
+const IndexPolicy = "igloo_bitmap_index"
+
+// MaxIndexGroups bounds the group columns of a bitmap index: each
+// combination of their values has a bitmap.
+const MaxIndexGroups = 4
+
+// BitmapIndex keeps, for a member column of a table, a roaring bitmap of
+// its values' ids for each combination of the values of Groups (one bitmap
+// for the whole table when there are none), in the table IndexSchema.Name,
+// so that counts of distinct members by those columns read bitmaps rather
+// than the table. Names are as the catalog has them.
+type BitmapIndex struct {
+	// Name is lower case, and names the index's table.
+	Name    string    `json:"name"`
+	Schema  string    `json:"schema"`
+	Table   string    `json:"table"`
+	Column  string    `json:"column"`
+	Groups  []string  `json:"groups,omitempty"`
+	Added   time.Time `json:"added"`
+	AddedBy string    `json:"added_by,omitempty"`
+}
+
+// OfTable reports whether x is an index of schema.table.
+func (x BitmapIndex) OfTable(schema, table string) bool {
+	return strings.EqualFold(x.Schema, schema) && strings.EqualFold(x.Table, table)
+}
+
+// Catalog is every domain, member and bitmap index, kept as one document.
 type Catalog struct {
-	Domains []Domain `json:"domains,omitempty"`
-	Members []Member `json:"members,omitempty"`
+	Domains []Domain      `json:"domains,omitempty"`
+	Members []Member      `json:"members,omitempty"`
+	Indexes []BitmapIndex `json:"indexes,omitempty"`
 }
 
 func (c *Catalog) clone() Catalog {
-	out := Catalog{Domains: slices.Clone(c.Domains), Members: slices.Clone(c.Members)}
+	out := Catalog{Domains: slices.Clone(c.Domains), Members: slices.Clone(c.Members), Indexes: slices.Clone(c.Indexes)}
+	for i, x := range out.Indexes {
+		out.Indexes[i].Groups = slices.Clone(x.Groups)
+	}
 	for i, d := range out.Domains {
 		if d.Tags != nil {
 			tags := make(map[string]string, len(d.Tags))
@@ -265,6 +305,66 @@ func (c *Catalog) AddMember(m Member) error {
 	}
 	c.Members = append(c.Members, m)
 	return nil
+}
+
+// Index returns the bitmap index named name, or nil.
+func (c *Catalog) Index(name string) *BitmapIndex {
+	for i := range c.Indexes {
+		if c.Indexes[i].Name == strings.ToLower(name) {
+			return &c.Indexes[i]
+		}
+	}
+	return nil
+}
+
+// TableIndexes returns the bitmap indexes of schema.table.
+func (c *Catalog) TableIndexes(schema, table string) []BitmapIndex {
+	var out []BitmapIndex
+	for _, x := range c.Indexes {
+		if x.OfTable(schema, table) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// AddIndex adds x, which must be new: a column of its table that is a
+// member of a domain, grouped by up to MaxIndexGroups other columns, once
+// each.
+func (c *Catalog) AddIndex(x BitmapIndex) error {
+	x.Name = strings.ToLower(x.Name)
+	if !namePattern.MatchString(x.Name) {
+		return fmt.Errorf("%w: a bitmap index's name is lower-case letters, digits and _, not starting with a digit (at most 63): %q", ErrInvalid, x.Name)
+	}
+	if c.Index(x.Name) != nil {
+		return fmt.Errorf("bitmap index %s %w", x.Name, ErrExists)
+	}
+	if c.MemberOf(x.Schema, x.Table, x.Column) == nil {
+		return fmt.Errorf("%w: %s.%s.%s is not a member of an ID domain (SET ID DOMAIN first)", ErrInvalid, x.Schema, x.Table, x.Column)
+	}
+	if len(x.Groups) > MaxIndexGroups {
+		return fmt.Errorf("%w: a bitmap index groups by at most %d columns", ErrInvalid, MaxIndexGroups)
+	}
+	for i, g := range x.Groups {
+		switch {
+		case IsHidden(g):
+			return fmt.Errorf("%w: %s holds ids", ErrInvalid, g)
+		case strings.EqualFold(g, x.Column):
+			return fmt.Errorf("%w: a bitmap index of %s does not group by it", ErrInvalid, x.Column)
+		case slices.ContainsFunc(x.Groups[:i], func(o string) bool { return strings.EqualFold(o, g) }):
+			return fmt.Errorf("%w: %s is named twice", ErrInvalid, g)
+		}
+	}
+	c.Indexes = append(c.Indexes, x)
+	return nil
+}
+
+// DropIndex drops the bitmap index named name, reporting whether there was
+// one.
+func (c *Catalog) DropIndex(name string) bool {
+	n := len(c.Indexes)
+	c.Indexes = slices.DeleteFunc(c.Indexes, func(x BitmapIndex) bool { return x.Name == strings.ToLower(name) })
+	return len(c.Indexes) < n
 }
 
 // RemoveMember removes column schema.table.column from its domain,

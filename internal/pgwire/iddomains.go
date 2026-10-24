@@ -395,8 +395,8 @@ func (s *Server) domainTable(ctx context.Context, sess *session, c *domainCmd, e
 		return "", "", nil, pgerror.WithCode(fmt.Errorf("%s is a table of connection %s: only the %s catalog's tables' columns join ID domains",
 			strings.Join(c.table, "."), catalog, s.catalogName()), codes.WrongObjectType)
 	}
-	if strings.EqualFold(schema, iddomain.DictionarySchema) {
-		return "", "", nil, pgerror.WithCode(fmt.Errorf("the schema %s is Igloo's own", iddomain.DictionarySchema), codes.InsufficientPrivilege)
+	if isIglooSchema(schema) {
+		return "", "", nil, pgerror.WithCode(fmt.Errorf("the schema %s is Igloo's own", schema), codes.InsufficientPrivilege)
 	}
 	return schema, table, cols, nil
 }
@@ -475,6 +475,12 @@ func (s *Server) leaveDomain(ctx context.Context, sess *session, c *domainCmd) e
 	if m == nil {
 		return pgerror.WithCode(fmt.Errorf("column %s of table %s.%s is not a member of an ID domain", c.column, schema, table), codes.UndefinedObject)
 	}
+	for _, x := range cur.TableIndexes(schema, table) {
+		if strings.EqualFold(x.Column, m.Column) {
+			return pgerror.WithCode(fmt.Errorf("bitmap index %s holds the ids of column %s (ALTER TABLE ... DROP BITMAP INDEX %s first)", x.Name, m.Column, x.Name),
+				codes.DependentObjectsStillExist)
+		}
+	}
 	if err := s.ddl.LeaveIDDomain(ctx, schema, table, m.Column, iddomain.HiddenColumn(m.Column)); err != nil {
 		return err
 	}
@@ -535,36 +541,42 @@ func domainError(err error) error {
 	return err
 }
 
-// dictionaryDenied is the refusal of a change to what Igloo keeps for ID
-// domains: their dictionaries' schema and the policy that guards them.
-func dictionaryDenied() error {
-	return pgerror.WithCode(fmt.Errorf("permission denied: the schema %s and the row access policy %s are Igloo's own, which keep ID domains' "+
-		"dictionaries; use CREATE and DROP ID DOMAIN", iddomain.DictionarySchema, iddomain.DictionaryPolicy), codes.InsufficientPrivilege)
+// iglooDenied is the refusal of a change to what Igloo keeps for ID domains
+// and bitmap indexes: their schemas and the policies that guard them.
+func iglooDenied() error {
+	return pgerror.WithCode(fmt.Errorf("permission denied: the schemas %s and the row access policies %s are Igloo's own, which keep ID domains' "+
+		"dictionaries and bitmap indexes; use CREATE and DROP ID DOMAIN, and ALTER TABLE ... ADD and DROP BITMAP INDEX",
+		strings.Join(iglooSchemas, " and "), strings.Join(iglooPolicies, " and ")), codes.InsufficientPrivilege)
 }
 
-// dictionaryWrites refuses, whoever the user, a statement of type t that
-// would write, create, drop or alter anything in the dictionaries' schema,
-// which only Igloo changes. Any write that names the schema counts.
-func dictionaryWrites(t duckdb.StmtType, query string) error {
+// iglooSchemaWrites refuses, whoever the user, a statement of type t that
+// would write, create, drop or alter anything in Igloo's own schemas
+// (dictionaries and bitmap indexes), which only Igloo changes. Any write
+// that names one counts.
+func iglooSchemaWrites(t duckdb.StmtType, query string) error {
 	if !slices.Contains(tableWrites, t) {
 		return nil
 	}
-	if tokensOf(query).mentions(map[string]bool{iddomain.DictionarySchema: true}) {
-		return dictionaryDenied()
+	names := map[string]bool{}
+	for _, schema := range iglooSchemas {
+		names[schema] = true
+	}
+	if tokensOf(query).mentions(names) {
+		return iglooDenied()
 	}
 	return nil
 }
 
-// dictionaryPolicyChange refuses a policy or tag statement about the
-// dictionaries' policy, or about a table of their schema.
-func dictionaryPolicyChange(c *policyCmd) error {
+// iglooPolicyChange refuses a policy or tag statement about Igloo's own
+// policies, or about a table of its schemas.
+func iglooPolicyChange(c *policyCmd) error {
 	for _, name := range []string{c.name, c.policy.Name} {
-		if strings.EqualFold(name, iddomain.DictionaryPolicy) {
-			return dictionaryDenied()
+		if slices.ContainsFunc(iglooPolicies, func(p string) bool { return strings.EqualFold(p, name) }) {
+			return iglooDenied()
 		}
 	}
-	if len(c.table) >= 2 && strings.EqualFold(c.table[len(c.table)-2], iddomain.DictionarySchema) {
-		return dictionaryDenied()
+	if len(c.table) >= 2 && isIglooSchema(c.table[len(c.table)-2]) {
+		return iglooDenied()
 	}
 	return nil
 }
