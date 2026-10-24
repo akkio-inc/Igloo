@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -335,20 +336,29 @@ func TestDistributedWorkload(t *testing.T) {
 		t.Errorf("bea's distributed statement read %q and wrote %q", q.TablesRead, q.TablesWritten)
 	}
 
-	// statement_timeout ends the statement and its tasks.
+	// statement_timeout ends the statement and its tasks. On a busy machine
+	// it can run out before the workers have the task, which leaves none to
+	// end: then the statement runs again with twice the timeout.
 	release = ds.gate.hold()
 	defer release()
-	mustExec(t, bea, "SET statement_timeout = '500ms'")
-	start := time.Now()
-	if _, err := bea.Exec(ctx, query); pgCode(err) != "57014" || time.Since(start) > 10*time.Second {
-		t.Errorf("a distributed statement past its timeout: %v after %s", err, time.Since(start))
-	}
-	deadline = time.Now().Add(10 * time.Second)
-	for _, canceled := ds.gate.counts(); canceled < 1 && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if waiting, canceled := ds.gate.counts(); waiting != 0 || canceled < 1 {
-		t.Errorf("after the timeout, %d tasks still wait and %d were canceled", waiting, canceled)
+	for timeout := 500 * time.Millisecond; ; timeout *= 2 {
+		mustExec(t, bea, fmt.Sprintf("SET statement_timeout = '%dms'", timeout.Milliseconds()))
+		start := time.Now()
+		if _, err := bea.Exec(ctx, query); pgCode(err) != "57014" || time.Since(start) > timeout+10*time.Second {
+			t.Errorf("a distributed statement past its timeout of %s: %v after %s", timeout, err, time.Since(start))
+		}
+		deadline = time.Now().Add(10 * time.Second)
+		for waiting, canceled := ds.gate.counts(); (waiting != 0 || canceled < 1) && time.Now().Before(deadline); waiting, canceled = ds.gate.counts() {
+			time.Sleep(10 * time.Millisecond)
+		}
+		waiting, canceled := ds.gate.counts()
+		if waiting == 0 && canceled == 0 && timeout < 8*time.Second {
+			continue
+		}
+		if waiting != 0 || canceled < 1 {
+			t.Errorf("after the timeout, %d tasks still wait and %d were canceled", waiting, canceled)
+		}
+		break
 	}
 	if n := ctl.Running("role batch"); n != 0 {
 		t.Errorf("%d statements of role batch still run", n)

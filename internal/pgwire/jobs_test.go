@@ -28,6 +28,28 @@ func (ls *loadServer) runScheduler(t *testing.T) {
 	})
 }
 
+// settle waits for a run of the job that is under way, if any, to end:
+// suspending a job stops its schedule, not a run that began before. A run
+// holds the job's lock, which a suspended job's schedule takes no more.
+func (ls *loadServer) settle(t *testing.T, kind, name string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		unlock, ok, err := ls.tasks.Store().TryLock(context.Background(), tasks.JobKey(kind, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			unlock()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s %s still runs", kind, name)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // eventually waits up to ten seconds for sql to return want.
 func eventually(t *testing.T, conn *pgx.Conn, sql string, want int64) {
 	t.Helper()
@@ -233,7 +255,7 @@ func TestScheduledTasksRun(t *testing.T) {
 	eventually(t, ls.admin, "SELECT (count(*) >= 2)::INT FROM igloo.task_history WHERE trigger = 'schedule' AND outcome = 'succeeded' "+
 		"AND scheduled_time IS NOT NULL", 1)
 	mustExec(t, ls.admin, "ALTER TASK tick SUSPEND")
-	time.Sleep(200 * time.Millisecond)
+	ls.settle(t, tasks.KindTask, "tick")
 	before := count(t, ls.admin, "SELECT count(*) FROM lake.public.ticks")
 	time.Sleep(1500 * time.Millisecond)
 	if after := count(t, ls.admin, "SELECT count(*) FROM lake.public.ticks"); after != before {
@@ -280,7 +302,7 @@ func TestPipes(t *testing.T) {
 	}
 
 	mustExec(t, walt, "ALTER PIPE sales_pipe SUSPEND")
-	time.Sleep(200 * time.Millisecond)
+	ls.settle(t, tasks.KindPipe, "sales_pipe")
 	ls.write(t, "drops/6.csv", "id,name,amount\n6,six,6.00\n", false)
 	time.Sleep(1500 * time.Millisecond)
 	if n := count(t, ls.admin, "SELECT count(*) FROM lake.public.sales"); n != 4 {

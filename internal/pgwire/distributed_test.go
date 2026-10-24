@@ -448,8 +448,13 @@ func TestDistributedGrants(t *testing.T) {
 // statement runs again in smaller tasks, and if those run out too, fails
 // with SQLSTATE 53200 (out_of_memory), rather than run here, which would
 // run out the same way.
+//
+// It does not run in parallel: a shed must take a task of the statement's
+// latest attempt, and on a busy machine a task of one it gave up on can
+// still be running when the next shed comes. Run alone, it can still fail
+// that way, if rarely: shed waits for the tasks it saw waiting to see they
+// were canceled, but not for one still on its way to the gate.
 func TestDistributedOutOfMemory(t *testing.T) {
-	t.Parallel()
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
@@ -457,30 +462,25 @@ func TestDistributedOutOfMemory(t *testing.T) {
 	ctx := context.Background()
 	query := "SELECT amount, count(*) FROM orders GROUP BY amount"
 	// shed waits for a task to wait at the gate, and has the workers shed
-	// what they run.
+	// what they run. The statement then gives up on that attempt and
+	// cancels its other tasks: shed waits until every task that waited has
+	// seen it was canceled, so that the next shed finds none of them still
+	// running (a task counts as waiting, and running, until it sees it).
 	shed := func() {
 		t.Helper()
 		deadline := time.Now().Add(20 * time.Second)
 		for waiting, _ := ds.gate.counts(); waiting < 1 && time.Now().Before(deadline); waiting, _ = ds.gate.counts() {
 			time.Sleep(10 * time.Millisecond)
 		}
-		_, before := ds.gate.counts()
-		// A task the last shed canceled counts as waiting until it sees it
-		// was canceled, which on a busy machine can be after the tasks
-		// running again in its place have yet to start: shed once one has.
+		waiting, before := ds.gate.counts()
 		shed := false
-		for !shed {
-			for _, w := range ds.workers {
-				shed = w.ShedMemory(64<<20) || shed
-			}
-			if !shed && time.Now().After(deadline) {
-				t.Fatal("no worker had a task to shed")
-			}
-			if !shed {
-				time.Sleep(10 * time.Millisecond)
-			}
+		for _, w := range ds.workers {
+			shed = w.ShedMemory(64<<20) || shed
 		}
-		for _, canceled := ds.gate.counts(); canceled == before && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
+		if !shed {
+			t.Fatal("no worker had a task to shed")
+		}
+		for _, canceled := ds.gate.counts(); canceled < before+waiting && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
