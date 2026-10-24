@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -119,6 +120,56 @@ type indexBuilds struct {
 	mu      sync.Mutex
 	running map[string]bool
 	again   map[string]bool
+	// failed counts each index's builds that failed in a row, which are
+	// tried again after indexRetry, four times as long each time, up to
+	// indexRetries times; a maintenance pass tries again after that.
+	failed map[string]int
+	// stopped ends the retries when the server shuts down.
+	stopped atomic.Bool
+	// last is how each index was last built, for tests.
+	last map[string]string
+}
+
+// indexRetry is a variable for tests.
+var indexRetry = 30 * time.Second
+
+const indexRetries = 3
+
+// buildFailed has x built again in a while, after its build failed: object
+// storage that turns requests away under load (HTTP 503) fails a build of
+// gigabytes now and then, which would otherwise wait for the next
+// maintenance pass, an hour by default.
+func (s *Server) buildFailed(x iddomain.BitmapIndex) {
+	b := &s.indexBuilds
+	b.mu.Lock()
+	if b.failed == nil {
+		b.failed = map[string]int{}
+	}
+	n := b.failed[x.Name]
+	b.failed[x.Name] = n + 1
+	b.mu.Unlock()
+	if n >= indexRetries {
+		return
+	}
+	time.AfterFunc(indexRetry<<(2*n), func() {
+		if !b.stopped.Load() {
+			s.indexesChanged(x.Schema, x.Table)
+		}
+	})
+}
+
+// buildDone forgets x's failed builds, and notes how it was built.
+func (s *Server) buildDone(x iddomain.BitmapIndex, how string) {
+	b := &s.indexBuilds
+	b.mu.Lock()
+	delete(b.failed, x.Name)
+	if how != "" {
+		if b.last == nil {
+			b.last = map[string]string{}
+		}
+		b.last[x.Name] = how
+	}
+	b.mu.Unlock()
 }
 
 // indexesWritten has the bitmap indexes of the tables a statement wrote
@@ -135,6 +186,18 @@ func (s *Server) indexesWritten(written []auth.Object) {
 		if !o.IsSchema() && o.Catalog == "" && len(snap.TableIndexes(o.Schema, o.Table)) > 0 {
 			s.indexesChanged(o.Schema, o.Table)
 		}
+	}
+}
+
+// idsWritten has the bitmap indexes of schema.table brought up to date in
+// the background, after a write into it gave its rows ids (see fillIDs):
+// indexesWritten hears of writes from the history, which may be off.
+func (s *Server) idsWritten(schema, table string) {
+	if !s.bitmapIndexesOn {
+		return
+	}
+	if snap := s.memberSnapshot(context.Background()); snap != nil && len(snap.TableIndexes(schema, table)) > 0 {
+		s.indexesChanged(schema, table)
 	}
 }
 
@@ -209,8 +272,12 @@ func (s *Server) maintainIndexes(ctx context.Context, which func(iddomain.Bitmap
 		case errors.Is(err, iddomain.ErrBusy):
 		case err != nil && ctx.Err() == nil:
 			s.log.Warn("could not build a bitmap index", "index", x.Name, "table", x.Schema+"."+x.Table, "err", err)
-		case how != "":
-			s.log.Info("built a bitmap index", "index", x.Name, "table", x.Schema+"."+x.Table, "how", how)
+			s.buildFailed(x)
+		case err == nil:
+			s.buildDone(x, how)
+			if how != "" {
+				s.log.Info("built a bitmap index", "index", x.Name, "table", x.Schema+"."+x.Table, "how", how)
+			}
 		}
 	}
 }
@@ -263,6 +330,9 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 		if b.generation == gen && (base == nil || b.snapshot > base.snapshot) {
 			base = &built[i]
 		}
+	}
+	if err := s.sizeIndexRowGroups(ctx, conn, x, tbl); err != nil {
+		s.log.Warn("could not size a bitmap index's row groups", "index", x.Name, "err", err)
 	}
 	src := s.indexSource(x)
 	how := "rebuild"
@@ -321,6 +391,96 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 	}
 	s.ddl.TableChanged(iddomain.IndexSchema, x.Name)
 	return how, nil
+}
+
+// Index tables' row groups. DuckDB writes an insert in row groups of the
+// table's write.parquet.row-group-size rows, 122,880 by default, holding
+// one uncompressed on each thread while it writes, and a scan reads a row
+// group's column at a time, its strings outside DuckDB's memory limit. A
+// bitmap takes up to two bytes an id, and an eighth of a byte for each id
+// the domain has where dense: 90 MB at 730 million ids. An index of a few
+// hundred such bitmaps in one row group took a scan of it to gigabytes, four
+// times over in a report that counts four ways, past the machine's memory.
+// So before each build an index's table gets row groups of about
+// indexRowGroupBytes of bitmaps: at the average size of those it holds, or,
+// before it holds any, at the most one bitmap of its source table can take.
+// It changes only when off by half or more, as each change is a commit.
+const (
+	indexRowGroupBytes   = 32 << 20
+	duckDBRowGroupsMax   = 122880
+	rowGroupSizeProperty = "write.parquet.row-group-size"
+)
+
+// indexRowGroupRows is the rows a row group of bitmaps of bytes each takes.
+func indexRowGroupRows(bytes int64) int64 {
+	if bytes <= 0 {
+		return 1
+	}
+	return min(max(indexRowGroupBytes/bytes, 1), duckDBRowGroupsMax)
+}
+
+// sizeIndexRowGroups sets x's table's row groups for the build about to
+// write it from src.
+func (s *Server) sizeIndexRowGroups(ctx context.Context, conn *duckdb.Conn, x iddomain.BitmapIndex, src *table.Table) error {
+	idx, err := s.ddl.LoadTable(ctx, iddomain.IndexSchema, x.Name)
+	if err != nil {
+		return err
+	}
+	var per int64
+	if size, rows, err := tableSize(ctx, idx); err != nil {
+		return err
+	} else if size > 0 && rows > 0 {
+		per = size / rows
+	} else if rows, err := snapshotRows(ctx, src); err != nil {
+		return err
+	} else {
+		// No bitmaps yet: one of all the source's rows, at two bytes an
+		// id, or of all 2^32 ids, whichever is less.
+		per = min(2*rows+8, 1<<29)
+	}
+	want := indexRowGroupRows(per)
+	if cur, err := strconv.ParseInt(idx.Properties()[rowGroupSizeProperty], 10, 64); err == nil && cur > 0 && 2*want < 3*cur && 2*cur < 3*want {
+		return nil
+	}
+	return s.execIndex(ctx, conn, fmt.Sprintf("SELECT * FROM set_iceberg_table_properties(%s, {'%s': '%d'})", s.indexTable(x.Name), rowGroupSizeProperty, want))
+}
+
+// tableSize returns the bytes and rows of tbl's current data files: from
+// its snapshot's summary, or from the files, as DuckDB's commits leave the
+// files' size out of the summary.
+func tableSize(ctx context.Context, tbl *table.Table) (size, rows int64, err error) {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return 0, 0, nil
+	}
+	if snap.Summary != nil {
+		size, _ = strconv.ParseInt(snap.Summary.Properties["total-files-size"], 10, 64)
+		rows, _ = strconv.ParseInt(snap.Summary.Properties["total-records"], 10, 64)
+		if size > 0 && rows > 0 {
+			return size, rows, nil
+		}
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	size, rows = 0, 0
+	for _, t := range tasks {
+		size += t.File.FileSizeBytes()
+		rows += t.File.Count()
+	}
+	return size, rows, nil
+}
+
+// snapshotRows returns the rows of tbl's current data files.
+func snapshotRows(ctx context.Context, tbl *table.Table) (int64, error) {
+	if snap := tbl.CurrentSnapshot(); snap != nil && snap.Summary != nil {
+		if rows, err := strconv.ParseInt(snap.Summary.Properties["total-records"], 10, 64); err == nil && rows > 0 {
+			return rows, nil
+		}
+	}
+	_, rows, err := tableSize(ctx, tbl)
+	return rows, err
 }
 
 // indexSource is the quoted name of x's source table.

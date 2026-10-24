@@ -162,6 +162,21 @@ SELECT rb_to_list(rb_agg(x))::VARCHAR FROM (SELECT 1::UINTEGER AS x WHERE false)
 ----
 []
 
+# a bitmap that is the same for every row (a subquery's) is read once a chunk; one that differs row to row,
+# empty ones (short enough to be inlined) among them, is read every row
+statement ok
+CREATE TABLE many AS SELECT g, CASE WHEN g % 7 = 3 THEN (SELECT rb_agg(x) FROM (SELECT 1::UINTEGER AS x WHERE false)) ELSE rb_agg(i::UINTEGER) END AS bm FROM (SELECT i % 5000 AS g, i FROM range(400000) r(i)) GROUP BY g
+
+query III
+SELECT count(*), sum(rb_and_cardinality(bm, (SELECT rb_agg(i::UINTEGER) FROM range(0, 400000, 2) r(i)))), sum(rb_andnot_cardinality((SELECT rb_agg(i::UINTEGER) FROM range(0, 400000, 2) r(i)), bm)) FROM many
+----
+5000	171440	999828560
+
+query I
+SELECT count(*) FILTER (WHERE rb_contains((SELECT rb_agg(i::UINTEGER) FROM range(0, 300000, 3) r(i)), j::UINTEGER)) FROM range(300000) t(j)
+----
+100000
+
 # NULL in, NULL out
 query TTTT
 SELECT rb_cardinality(NULL), rb_and(a, NULL) IS NULL, rb_contains(NULL, 1::UINTEGER), rb_to_list(NULL) FROM s

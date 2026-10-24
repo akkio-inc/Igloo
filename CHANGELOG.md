@@ -125,8 +125,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   BITMAP INDEXES` lists them and the snapshot each is of. Counts of
   distinct members by an index's columns, alone or within another index's
   set (as audience-by-segment reports count), read the bitmaps where the
-  bitmaps are current and no policy applies (see
-  [Bitmap indexes](docs/sql.md#bitmap-indexes)).
+  bitmaps are current and no policy applies, through views that select or
+  LEFT JOIN the table too, and run again from the tables if the bitmaps
+  outgrow their memory (see [Bitmap indexes](docs/sql.md#bitmap-indexes)).
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

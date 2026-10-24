@@ -151,9 +151,14 @@ func TestBitmapIndexes(t *testing.T) {
 	// Appends of values that have ids add the appended files' bitmaps.
 	it.exec("INSERT INTO lake.public.segments SELECT 'p' || (i % 250), 'seg' || (i % 9), CAST(i % 3 AS INTEGER) FROM range(3000) r(i)",
 		"INSERT INTO lake.public.segments VALUES ('p7', 'seg1', 0), (NULL, 'seg_nobody', 1)")
+	// The writes start the builds themselves.
+	srv.waitIndexBuilds(t)
 	for _, name := range []string{"seg_day", "everyone"} {
-		if how, err := srv.maintainIndex(ctx, it.index(name), 1); err != nil || how != "append" {
-			t.Errorf("after appends, %s: %q, %v", name, how, err)
+		if how := srv.lastBuild(name); how != "append" {
+			t.Errorf("after appends, %s: %q", name, how)
+		}
+		if how, err := srv.maintainIndex(ctx, it.index(name), 1); err != nil || how != "" {
+			t.Errorf("after appends, %s again: %q, %v", name, how, err)
 		}
 	}
 	it.sameCounts("seg_day", "segment_name, day")
@@ -162,8 +167,9 @@ func TestBitmapIndexes(t *testing.T) {
 	// A write of new values, whose ids Igloo fills in after it, builds
 	// them again.
 	it.exec("INSERT INTO lake.public.segments VALUES ('newcomer', 'seg1', 0)")
-	if how, err := srv.maintainIndex(ctx, it.index("everyone"), 1); err != nil || how != "rebuild" {
-		t.Errorf("after new values: %q, %v", how, err)
+	srv.waitIndexBuilds(t)
+	if how := srv.lastBuild("everyone"); how != "rebuild" {
+		t.Errorf("after new values: %q", how)
 	}
 	it.sameCounts("everyone", "")
 
@@ -238,6 +244,49 @@ func (it *idTest) index(name string) iddomain.BitmapIndex {
 
 // waitIndexBuilds waits for the bitmap index builds running in the
 // background to end.
+// TestBitmapIndexBuildRetries builds an index again a while after its
+// build failed, a few times, then leaves it to maintenance.
+func TestBitmapIndexBuildRetries(t *testing.T) {
+	it := newIndexTest(t)
+	srv := it.r.srv
+	defer func(d time.Duration) { indexRetry = d }(indexRetry)
+	indexRetry = 10 * time.Millisecond
+	it.exec("ALTER TABLE lake.public.segments ADD BITMAP INDEX broken ON (segment_name) FOR person_id")
+	srv.waitIndexBuilds(t)
+	// Its table gone behind Igloo's back, every build after a write
+	// (which starts one, history or not) fails.
+	it.internal("DROP TABLE lake.igloo_bitmaps.broken")
+	it.exec("INSERT INTO lake.public.segments VALUES ('p1', 'seg1', 1)")
+	deadline := time.Now().Add(time.Minute)
+	for {
+		srv.indexBuilds.mu.Lock()
+		n := srv.indexBuilds.failed["broken"]
+		srv.indexBuilds.mu.Unlock()
+		if n == indexRetries+1 {
+			break
+		}
+		if n > indexRetries+1 || time.Now().After(deadline) {
+			t.Fatalf("%d failed builds, want the first and %d more", n, indexRetries)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * indexRetry)
+	srv.waitIndexBuilds(t)
+	srv.indexBuilds.mu.Lock()
+	n := srv.indexBuilds.failed["broken"]
+	srv.indexBuilds.mu.Unlock()
+	if n != indexRetries+1 {
+		t.Errorf("%d failed builds after the retries ran out, want %d", n, indexRetries+1)
+	}
+}
+
+// lastBuild is how index name was last built in the background.
+func (s *Server) lastBuild(name string) string {
+	s.indexBuilds.mu.Lock()
+	defer s.indexBuilds.mu.Unlock()
+	return s.indexBuilds.last[name]
+}
+
 func (s *Server) waitIndexBuilds(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(time.Minute)

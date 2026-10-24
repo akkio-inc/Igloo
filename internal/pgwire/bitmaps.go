@@ -152,6 +152,35 @@ func bitmapsDidNotFit(err error) bool {
 	return err != nil && strings.Contains(err.Error(), bitmapBudgetError)
 }
 
+// rerunWithoutIndexes runs st again from the tables, after the bitmaps of
+// the indexes it read did not fit in the memory DuckDB has for them. It is
+// prepared again from its text without them, and may count in bitmaps of
+// its own, which rerunWithoutBitmaps then sees to.
+func (s *Server) rerunWithoutIndexes(ctx context.Context, sess *session, st *statement, cause error, run func() error) error {
+	s.log.Warn("a statement's bitmap indexes did not fit in memory; running it again from the tables",
+		"user", sess.currentUser().Name, "err", cause)
+	s.metrics.bitmapRerun()
+	s.bitmapReruns.Add(1)
+	sess.noIndexes = true
+	fresh, err := s.prepareChecked(ctx, sess, sess.currentUser(), st.text, st.clientOIDs)
+	sess.noIndexes = false
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	if !sameShape(fresh, st, false) {
+		_ = fresh.close()
+		return errors.Join(cause, errors.New("a statement answered from bitmap indexes changed its result's columns when prepared again"))
+	}
+	old := st.stmt
+	*st = *fresh
+	_ = old.Close()
+	if sess.bitmapsRestore != nil {
+		sess.bitmapsRestore()
+	}
+	sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
+	return run()
+}
+
 // rerunWithoutBitmaps runs st again, with bitmaps off, after its bitmaps
 // did not fit (cause): it prepares st again with rb_count_distinct off, so
 // that DuckDB plans the hash, and calls run. A second failure is the

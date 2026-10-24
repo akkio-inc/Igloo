@@ -564,6 +564,7 @@ func (s *Server) Serve(l net.Listener) error {
 // Shutdown stops accepting connections and waits for open ones to finish
 // until ctx is done.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.indexBuilds.stopped.Store(true)
 	err := s.wire.Shutdown(ctx)
 	s.idDeferred.stop()
 	if s.analyzer != nil {
@@ -581,6 +582,9 @@ type session struct {
 	// memo keeps what the checks of the statement being prepared would
 	// otherwise ask DuckDB more than once; nil outside prepareChecked.
 	memo *checkMemo
+	// noIndexes keeps the statement being prepared from reading bitmap
+	// indexes (see rerunWithoutIndexes).
+	noIndexes bool
 	// bitmapsRestore sets rb_count_distinct back after the statement
 	// running with it on (see setBitmaps); nil otherwise.
 	bitmapsRestore func()
@@ -1419,9 +1423,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 					err = s.runLocal(ctx, sess, st, args, tw)
 					stopPrefetch()
 				}
-				if st.bitmaps && bitmapsDidNotFit(err) {
-					// Run again here with the hash, below, rather than on
-					// workers with bitmaps.
+				if (st.bitmaps || len(st.indexPins) > 0) && bitmapsDidNotFit(err) {
+					// Run again here from the tables or with the hash,
+					// below, rather than on workers with bitmaps.
 					return err
 				}
 				if err != nil && parts.key != "" && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
@@ -1431,6 +1435,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			}
 			run := func() error {
 				err := runOnce()
+				if len(st.indexPins) > 0 && bitmapsDidNotFit(err) && tw.Written() == 0 && outer.Err() == nil {
+					err = s.rerunWithoutIndexes(ctx, sess, st, err, runOnce)
+				}
 				if st.bitmaps && bitmapsDidNotFit(err) && tw.Written() == 0 && outer.Err() == nil {
 					return s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
 				}

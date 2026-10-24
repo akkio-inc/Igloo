@@ -527,8 +527,15 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   append adds the appended files' bitmaps, a compaction or clustering keeps
   them as they are, and anything else builds them again from the snapshot.
   A snapshot whose member values do not all have ids yet gets no bitmaps
-  until mapping fills them in. `SHOW BITMAP INDEXES` says which snapshot an
-  index's bitmaps are of, and whether that is the table's current one.
+  until mapping fills them in. A build that fails, as when object storage
+  turns requests away under load, is tried again after 30 seconds, 2
+  minutes and 8 minutes, then at the next maintenance pass. Each build
+  sizes its table's row groups (`write.parquet.row-group-size`) to hold
+  about 32 MiB of bitmaps, a bitmap of a large domain taking tens of
+  megabytes, so that neither the build nor a statement reading them holds
+  more than that at once a thread. `SHOW BITMAP INDEXES` says which
+  snapshot an index's bitmaps are of, and whether that is the table's
+  current one.
 - A count of distinct members that indexes hold reads their bitmaps
   instead of the table: `SELECT g, count(DISTINCT t.c) AS n FROM tbl AS t
   [WHERE ...] [GROUP BY g]`, where the keys and the filter use only the
@@ -549,7 +556,9 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   user's role reads the whole warehouse (users with the role `none` read the
   tables). Other references to those tables in the statement read the same
   snapshot, and a prepared statement whose tables changed reads the tables
-  until the bitmaps catch up. No statement may name `igloo_bitmaps`.
+  until the bitmaps catch up. A statement whose bitmaps do not fit in the
+  memory DuckDB has for them (`rb_memory_budget`) runs once more from the
+  tables. No statement may name `igloo_bitmaps`.
 
 
 

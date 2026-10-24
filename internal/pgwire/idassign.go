@@ -336,6 +336,7 @@ func (s *Server) fillIDs(ctx context.Context, sess *session, w *idWrite, rows in
 			s.log.Warn("could not fill a member column's ids; maintenance will", "column", m.String(), "err", err)
 		}
 	}
+	s.idsWritten(w.schema, w.table)
 }
 
 // ensureIDColumn adds the column for m's ids to schema.table if it lacks
@@ -692,7 +693,9 @@ func (s *Server) mapDeferred(schema, table string) {
 	}
 	if busy {
 		s.deferIDs(schema, table)
+		return
 	}
+	s.idsWritten(schema, table)
 }
 
 // idMapped remembers, by member column, the table snapshot maintenance

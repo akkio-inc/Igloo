@@ -100,7 +100,7 @@ func namesIn(text string) []string {
 // that a statement that read the tables tries the indexes again before it
 // runs again (see refreshIndexes).
 func (s *Server) rewriteIndexes(ctx context.Context, sess *session, user auth.User, query string, counts *idCounts) (_ string, _ []indexPin, candidate bool) {
-	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || rank[user.Role] < rank[auth.RoleReader] || !countsDistinct.MatchString(query) {
+	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.noIndexes || rank[user.Role] < rank[auth.RoleReader] || !countsDistinct.MatchString(query) {
 		return query, nil, false
 	}
 	snap := s.memberSnapshot(ctx)
@@ -590,7 +590,15 @@ func (s *Server) indexSelect(pieces pieceText, masked string, m map[string]any, 
 	}
 
 	alias := quoteIdent(c.target.alias)
-	call := "rb_cardinality(rb_or_agg(" + alias + ".bm))"
+	// Grouped by every column of the index, each group is one of its rows,
+	// one bitmap: read as it is, rather than OR-ed into a copy that the
+	// aggregate holds for every group at once.
+	bm := "rb_or_agg(" + alias + ".bm)"
+	one := groupText != "" && len(target.index.Groups) > 0 && groupsByColumns(m, target.index.Groups)
+	if one {
+		bm = alias + ".bm"
+	}
+	call := "rb_cardinality(" + bm + ")"
 	if set != nil {
 		setWhere := ""
 		if c.restrict.where != nil {
@@ -601,8 +609,12 @@ func (s *Server) indexSelect(pieces pieceText, masked string, m map[string]any, 
 			setWhere = " AND (" + t + ")"
 		}
 		sa := quoteIdent(c.restrict.innerAlias)
-		call = fmt.Sprintf("rb_and_cardinality(rb_or_agg(%s.bm), (SELECT rb_or_agg(%s.bm) FROM %s AS %s WHERE %s.source_snapshot_id = %d AND %s.generation = %d%s))",
-			alias, sa, s.indexTable(set.index.Name), sa, sa, set.snapshot, sa, set.generation, setWhere)
+		call = fmt.Sprintf("rb_and_cardinality(%s, (SELECT rb_or_agg(%s.bm) FROM %s AS %s WHERE %s.source_snapshot_id = %d AND %s.generation = %d%s))",
+			bm, sa, s.indexTable(set.index.Name), sa, sa, set.snapshot, sa, set.generation, setWhere)
+	}
+	if one {
+		// max of the group's one value: a BIGINT, as the count was.
+		call = "max(" + call + ")"
 	}
 	var outItems []string
 	for i, it := range items {
@@ -656,6 +668,21 @@ func (s *Server) indexSelect(pieces pieceText, masked string, m map[string]any, 
 	}
 	out, err := applyEdits(text, []edit{{selectAt, end, q}})
 	return out, err == nil
+}
+
+// groupsByColumns reports whether SELECT node m groups by plain columns
+// that include every one of groups.
+func groupsByColumns(m map[string]any, groups []string) bool {
+	var by []string
+	for _, g := range asList(m["group_expressions"]) {
+		gm, _ := g.(map[string]any)
+		if str(gm["class"]) != "COLUMN_REF" {
+			return false
+		}
+		cn := asList(gm["column_names"])
+		by = append(by, str(cn[len(cn)-1]))
+	}
+	return coversGroups(by, groups)
 }
 
 // setWhereText returns the text of the WHERE of a set's SELECT node.

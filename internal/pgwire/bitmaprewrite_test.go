@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -117,6 +118,29 @@ func TestBitmapIndexRewrite(t *testing.T) {
 	it.exec("CREATE OR REPLACE VIEW lake.public.v_attributes AS SELECT * FROM lake.public.attributes")
 	answered(3, "the plain view again")
 
+	// Bitmaps past their budget: the statement runs again from the tables.
+	rows := wantRows(t, it, conn)
+	mustExec(t, conn, "SET rb_memory_budget = '1B'")
+	reruns := srv.bitmapReruns.Load()
+	if got := texts(t, conn, e2Report); strings.Join(got, "\n") != strings.Join(rows, "\n") {
+		t.Errorf("past the bitmaps' budget: rows\n%q\nwant\n%q", got, rows)
+	}
+	if srv.bitmapReruns.Load() == reruns {
+		t.Error("bitmaps past their budget ran no statement again")
+	}
+	mustExec(t, conn, "RESET rb_memory_budget")
+
+	// Each index's table has row groups sized for its bitmaps.
+	for _, name := range []string{"seg", "aud", "population"} {
+		tbl, err := srv.ddl.LoadTable(ctx, "igloo_bitmaps", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := strconv.ParseInt(tbl.Properties()[rowGroupSizeProperty], 10, 64); err != nil || n < 1 || n > duckDBRowGroupsMax {
+			t.Errorf("index %s's row groups: %q", name, tbl.Properties()[rowGroupSizeProperty])
+		}
+	}
+
 	// A statement prepared once and run after a table changed reads the
 	// tables until the bitmaps catch up, then the bitmaps again.
 	cached := it.r.admin(t, pgx.QueryExecModeCacheStatement)
@@ -129,6 +153,7 @@ func TestBitmapIndexRewrite(t *testing.T) {
 	if got := texts(t, cached, e2Report); strings.Join(got, "\n") != strings.Join(wantRows(t, it, conn), "\n") {
 		t.Errorf("prepared, after an insert: rows %q", got)
 	}
+	srv.waitIndexBuilds(t)
 	srv.MaintainBitmapIndexes(ctx)
 	if got := texts(t, cached, e2Report); strings.Join(got, "\n") != strings.Join(wantRows(t, it, conn), "\n") {
 		t.Errorf("prepared, after the bitmaps caught up: rows %q", got)
@@ -148,6 +173,15 @@ func TestBitmapIndexRewrite(t *testing.T) {
 	}
 	if srv.indexRewrites.Load() != before {
 		t.Error("a statement whose reads grants decide was answered from indexes")
+	}
+}
+
+// TestIndexRowGroupRows sizes row groups of bitmaps at about 32 MiB.
+func TestIndexRowGroupRows(t *testing.T) {
+	for _, c := range []struct{ bytes, rows int64 }{{0, 1}, {90 << 20, 1}, {1 << 20, 32}, {1 << 10, 32768}, {1, duckDBRowGroupsMax}} {
+		if got := indexRowGroupRows(c.bytes); got != c.rows {
+			t.Errorf("bitmaps of %d bytes: %d rows a row group, want %d", c.bytes, got, c.rows)
+		}
 	}
 }
 
