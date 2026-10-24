@@ -57,6 +57,10 @@ type Config struct {
 	// default): columns joining domains, filling the columns that hold
 	// their ids, and statements counting through them.
 	IDDomains bool
+	// BitmapMinRows is how many rows a statement that counts ID domains'
+	// IDs must read for Igloo to count them in roaring bitmaps
+	// (IGLOO_BITMAP_MIN_ROWS, 10 million by default; "off", -1, never).
+	BitmapMinRows int64
 	// ConnectionSecretsDir holds files with the passwords of connections to
 	// other databases, which a connection names with password_secret.
 	// Empty means connections store their passwords.
@@ -517,6 +521,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_ID_DOMAINS must be true or false: %w", err)
 	}
 	cfg.IDDomains = idDomains
+
+	if v := get("IGLOO_BITMAP_MIN_ROWS", "10000000"); strings.EqualFold(v, "off") {
+		cfg.BitmapMinRows = -1
+	} else if n, err := strconv.ParseInt(v, 10, 64); err != nil || n < 0 {
+		addErr("IGLOO_BITMAP_MIN_ROWS must be a count of rows or off, not %q", v)
+	} else {
+		cfg.BitmapMinRows = n
+	}
 
 	setup, err := strconv.ParseBool(get("IGLOO_CATALOG_SETUP", "true"))
 	if err != nil {

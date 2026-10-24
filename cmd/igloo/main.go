@@ -436,6 +436,8 @@ func serve() error {
 		Scanner:             scanner,
 		Prefetcher:          eng.Prefetcher(),
 		IDDomainsOn:         cfg.IDDomains,
+		Bitmaps:             cfg.IDDomains && cfg.BitmapMinRows >= 0 && eng.BitmapsLoaded(),
+		BitmapMinRows:       cfg.BitmapMinRows,
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,

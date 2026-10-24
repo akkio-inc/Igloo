@@ -967,6 +967,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Statements that count the integer IDs of [ID domains](docs/sql.md#id-domains)
+  (`count(DISTINCT CAST(_igloo_id_c AS UINTEGER))`) and read at least
+  `IGLOO_BITMAP_MIN_ROWS` rows (10 million by default) count them in roaring
+  bitmaps, with Igloo's own DuckDB extension, rb: a few bytes an ID where
+  DuckDB's hash keeps every pair of group and ID. On a DuckDB copy of
+  Acme's seven heaviest reports, with people's ids as integers, on one
+  8-core machine (18.6 GiB), the behaviors reports went from 101 and 76 s
+  to 19 s, the signals reports from 46-48 s to 15 s and, where they compare
+  two audiences, from failing after 28 GB of spill to 29 s, with no spill
+  and the same results. A statement whose bitmaps outgrow the memory DuckDB
+  gives them runs once more with DuckDB's hash, logged and counted
+  (`igloo_bitmap_reruns_total`).
+
 - DuckDB runs two threads per core on the server and four on workers when
   the warehouse is in object storage and `IGLOO_DUCKDB_THREADS` is unset,
   instead of one. Reading object storage cold waits on requests, not on

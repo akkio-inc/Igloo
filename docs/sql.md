@@ -446,6 +446,13 @@ DROP ID DOMAIN people;
   the ids of values it has not seen stay `NULL`.
 - Columns join domains only with `IGLOO_ID_DOMAINS=true`, which is off by
   default. Only admins change domains; anyone may list them.
+- A statement that counts a domain's ids, `count(DISTINCT CAST(t._igloo_id_c
+  AS UINTEGER))`, and reads at least `IGLOO_BITMAP_MIN_ROWS` rows of the
+  catalog's tables (10 million by default, as their metadata counts them)
+  counts them in roaring bitmaps, a few bytes an id, where DuckDB's hash
+  holds every pair of group and id and spills to disk once those outgrow
+  memory. Its results are the same. A statement whose bitmaps do not fit
+  in the memory DuckDB has for them runs once more counting with the hash.
 
 ## Erasure and data retention
 

@@ -45,6 +45,9 @@ type statement struct {
 	clientOIDs []uint32
 	// access is set when grants allowed the statement (see access.go).
 	access *access
+	// bitmaps says it counts distinct IDs in roaring bitmaps, prepared and
+	// run with rb_count_distinct = 'always' (see bitmaps.go).
+	bitmaps bool
 	// original is the statement before policies rewrote it, when they did
 	// (see protect.go); guard records how they applied.
 	original string

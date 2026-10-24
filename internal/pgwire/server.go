@@ -149,6 +149,12 @@ type Options struct {
 	IDDomains iddomain.Store
 	// IDDomainsOn is IGLOO_ID_DOMAINS: columns may join ID domains.
 	IDDomainsOn bool
+	// Bitmaps counts the distinct integer IDs of ID domains in roaring
+	// bitmaps (the rb extension, which the engine must have loaded) in
+	// statements that read at least BitmapMinRows rows; 0 means every such
+	// statement (see bitmaps.go).
+	Bitmaps       bool
+	BitmapMinRows int64
 	// AllowedLocations are where users other than admins may read files
 	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
 	// Warehouse is the warehouse's location, whose files they may not.
@@ -275,9 +281,15 @@ type Server struct {
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
 	prefetcher *prefetch.Prefetcher
-	settings   auth.SettingStore
-	workload   *workload.Controller
-	pool       string
+	// bitmaps and bitmapMinRows choose the statements that count distinct
+	// IDs in roaring bitmaps, and bitmapReruns counts those run again with
+	// DuckDB's hash (see bitmaps.go).
+	bitmaps       bool
+	bitmapMinRows int64
+	bitmapReruns  atomic.Int64
+	settings      auth.SettingStore
+	workload      *workload.Controller
+	pool          string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -292,6 +304,10 @@ type Server struct {
 	// fails it with its error; tests use it to make a statement run out of
 	// memory here.
 	failLocal func(ctx context.Context, st *statement) error
+	// rewriteHook, if set, is the last of Igloo's rewrites of a statement
+	// before it is checked and prepared (see rewrite); tests use it to
+	// write what only Igloo may, such as the columns of ID domains' ids.
+	rewriteHook func(string) string
 	// rooms carries out clean room statements; partners are Delta
 	// Sharing's recipients and providers, which partners are.
 	rooms    *cleanroom.Service
@@ -441,6 +457,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.idDomains, s.idDomainsOn = opts.IDDomains, opts.IDDomainsOn
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
+	s.bitmaps, s.bitmapMinRows = opts.Bitmaps, opts.BitmapMinRows
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}
@@ -532,6 +549,9 @@ type session struct {
 	// memo keeps what the checks of the statement being prepared would
 	// otherwise ask DuckDB more than once; nil outside prepareChecked.
 	memo *checkMemo
+	// bitmapsRestore sets rb_count_distinct back after the statement
+	// running with it on (see setBitmaps); nil otherwise.
+	bitmapsRestore func()
 	// temps says the session may have temporary tables or views, which
 	// the server's index of tables leaves out (see indexedTables).
 	temps bool
@@ -1287,6 +1307,16 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 
 		start := time.Now()
 		tw := &tagWriter{DataWriter: w}
+		// A statement counting distinct IDs in roaring bitmaps runs, and
+		// is rechecked, with the rb extension's setting on, as it was
+		// prepared (see bitmaps.go).
+		sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
+		defer func() {
+			if sess.bitmapsRestore != nil {
+				sess.bitmapsRestore()
+				sess.bitmapsRestore = nil
+			}
+		}()
 		err = sess.checkAborted(st.query)
 		if err == nil {
 			// Rechecking re-plans with EXPLAIN and may re-apply policies,
@@ -1309,7 +1339,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		releaseCatalog := s.catalogRunLock(sess, st)
 		outer := ctx
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
-			run := func() error {
+			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
 				parts = p
 				if done {
@@ -1319,8 +1349,20 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 					defer p.release()
 				}
 				err = s.runLocal(ctx, sess, st, args, tw)
+				if st.bitmaps && bitmapsDidNotFit(err) {
+					// Run again here with the hash, below, rather than on
+					// workers with bitmaps.
+					return err
+				}
 				if err != nil && parts.key != "" && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
 					return s.afterOutOfMemory(outer, ctx, sess, st, args, tw, &parts, err)
+				}
+				return err
+			}
+			run := func() error {
+				err := runOnce()
+				if st.bitmaps && bitmapsDidNotFit(err) && tw.Written() == 0 && outer.Err() == nil {
+					return s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
 				}
 				return err
 			}
@@ -1583,7 +1625,11 @@ func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, tex
 	if readsMetadata.MatchString(query) {
 		s.refreshMetadata(ctx, sess)
 	}
-	return s.rewritePairCounts(ctx, sess, s.rewriteWholeCounts(ctx, sess, query))
+	query = s.rewritePairCounts(ctx, sess, s.rewriteWholeCounts(ctx, sess, query))
+	if s.rewriteHook != nil {
+		query = s.rewriteHook(query)
+	}
+	return query
 }
 
 // prepareChecked is prepareStatement without recording failures, for the
@@ -1702,6 +1748,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// computed once (see shared.go). If DuckDB cannot prepare that, say
 	// because the subquery refers to the query around it, the statement
 	// runs as written.
+	// A statement that counts ID domains' IDs in roaring bitmaps is
+	// prepared with the rb extension's setting on (see bitmaps.go).
+	bitmaps := s.bitmapsFor(ctx, sess, query)
+	defer sess.setBitmaps(ctx, bitmaps)()
 	written := query
 	if factored := s.factorUnions(ctx, sess, query); factored != "" {
 		query = factored
@@ -1760,6 +1810,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		err = shownParameterError(query, err, func(name string) bool { return s.isDuckDBSetting(ctx, sess, name) })
 		return fail(pgError(s.connectionHint(ctx, err)))
 	}
+	st.bitmaps = bitmaps
 	if pivot && st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
 		// multipleStatements let through what it takes for a query.
 		s.log.Error("a PIVOT statement that is not a query was prepared", "user", user.Name, "type", st.stmtType)

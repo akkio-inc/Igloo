@@ -488,3 +488,21 @@ func TestExchanges(t *testing.T) {
 		t.Error("IGLOO_EXCHANGE_MAX_SIZE=lots should be refused")
 	}
 }
+
+func TestBitmapMinRows(t *testing.T) {
+	for v, want := range map[string]int64{"": 10_000_000, "0": 0, "250000000": 250_000_000, "off": -1, "OFF": -1} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_BITMAP_MIN_ROWS"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.BitmapMinRows != want {
+			t.Errorf("IGLOO_BITMAP_MIN_ROWS=%q: %d %v, want %d", v, cfg.BitmapMinRows, err, want)
+		}
+	}
+	for _, v := range []string{"-5", "many", "1e7"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_BITMAP_MIN_ROWS": v})); err == nil {
+			t.Errorf("IGLOO_BITMAP_MIN_ROWS=%s should be refused", v)
+		}
+	}
+}

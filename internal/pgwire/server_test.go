@@ -150,8 +150,13 @@ func startServerWithEngine(t testing.TB, cfg config.Config, engineOpts []engine.
 // startServerOn runs Igloo on eng, which it closes when the test ends.
 func startServerOn(t testing.TB, eng *engine.Engine, configure ...func(*Options)) *testServer {
 	t.Helper()
+	return startServerLogged(t, eng, slog.New(slog.NewTextHandler(io.Discard, nil)), configure...)
+}
+
+// startServerLogged is startServerOn with the server logging to log.
+func startServerLogged(t testing.TB, eng *engine.Engine, log *slog.Logger, configure ...func(*Options)) *testServer {
+	t.Helper()
 	ctx := context.Background()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	store := &testStore{users: map[string]auth.User{}}
 	v, err := auth.NewVerifier(adminPassword)

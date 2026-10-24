@@ -16,6 +16,7 @@ type Metrics struct {
 	queries  *prometheus.CounterVec
 	duration *prometheus.HistogramVec
 	logins   *prometheus.CounterVec
+	reruns   prometheus.Counter
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -38,8 +39,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_logins_total",
 			Help: "Login attempts, by result: success or failure.",
 		}, []string{"result"}),
+		reruns: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_bitmap_reruns_total",
+			Help: "Statements counting distinct IDs in roaring bitmaps that ran out of memory for them and ran again with DuckDB's hash.",
+		}),
 	}
-	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins)
+	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns)
 	return m
 }
 
@@ -64,6 +69,12 @@ func (m *Metrics) login(ok bool) {
 		result = "success"
 	}
 	m.logins.WithLabelValues(result).Inc()
+}
+
+func (m *Metrics) bitmapRerun() {
+	if m != nil {
+		m.reruns.Inc()
+	}
 }
 
 func (m *Metrics) query(start time.Time, err error) {
