@@ -57,12 +57,14 @@ func reportError(format string, args ...any) error {
 }
 
 // reportCalls returns text with each call of the report API replaced by
-// what it stands for.
-func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (string, error) {
+// what it stands for, and the member tables whose ids it counts through, at
+// the snapshots it reads them at (see reportIDs).
+func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (string, []idPin, error) {
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, "igloo") || !strings.Contains(lower, "audience_profile") && !strings.Contains(lower, "report_api_versions") {
-		return text, nil
+		return text, nil, nil
 	}
+	var pins []idPin
 	masked := maskCode(text)
 	var edits []edit
 	for _, m := range reportCall.FindAllStringSubmatchIndex(masked, -1) {
@@ -70,43 +72,53 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 		fn := strings.ToLower(masked[m[6]:m[7]])
 		end := matchParen(text, open)
 		if end < 0 {
-			return "", reportError("%s has no closing parenthesis", fn)
+			return "", nil, reportError("%s has no closing parenthesis", fn)
 		}
 		args, err := literalArgs(text[open+1 : end])
 		if err != nil {
-			return "", reportError("igloo.%s takes string literals: %v", fn, err)
+			return "", nil, reportError("igloo.%s takes string literals: %v", fn, err)
 		}
 		var out string
 		switch fn {
 		case "report_api_versions":
 			if len(args) != 0 {
-				return "", reportError("igloo.report_api_versions takes no arguments")
+				return "", nil, reportError("igloo.report_api_versions takes no arguments")
 			}
 			out = "CAST([" + strconv.Itoa(reportAPIVersion) + "] AS INTEGER[])"
 		case "audience_profile", "audience_profile_sql":
 			if len(args) != 1 {
-				return "", reportError("igloo.%s takes one argument, the spec", fn)
+				return "", nil, reportError("igloo.%s takes one argument, the spec", fn)
 			}
 			spec, err := parseReportSpec(ctx, sess, args[0])
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			if fn == "audience_profile" {
-				out = "(" + spec.sql() + ")"
+				ids, read := s.reportIDs(ctx, sess, spec)
+				pins = append(pins, read...)
+				if ids != nil {
+					s.reportThroughIDs.Add(1)
+				}
+				out = "(" + spec.sqlWith(ids) + ")"
 			} else {
 				out = quoteLiteral(spec.sql())
 			}
 		case "audience_profile_check":
 			if len(args) != 2 {
-				return "", reportError("igloo.audience_profile_check takes two arguments, the spec and the SQL to compare")
+				return "", nil, reportError("igloo.audience_profile_check takes two arguments, the spec and the SQL to compare")
 			}
 			spec, err := parseReportSpec(ctx, sess, args[0])
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
-			q, err := spec.checkSQL(ctx, sess, args[1])
+			if err := reportOwnNames(args[1]); err != nil {
+				return "", nil, err
+			}
+			ids, read := s.reportIDs(ctx, sess, spec)
+			pins = append(pins, read...)
+			q, err := spec.checkSQL(ctx, sess, args[1], ids)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			out = "(" + q + ")"
 		}
@@ -131,7 +143,19 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 		}
 		edits = append(edits, edit{start, stop, out})
 	}
-	return applyEdits(text, edits)
+	out, err := applyEdits(text, edits)
+	return out, pins, err
+}
+
+// reportOwnNames refuses SQL a caller gave the API that names what only
+// Igloo's own text may: the columns of ids, and bitmap indexes' tables. The
+// statement the API writes names them where it counts through ids, so these
+// checks run on the caller's own parts of it.
+func reportOwnNames(sql string) error {
+	if err := hiddenReferences(sql); err != nil {
+		return err
+	}
+	return indexReferences(sql)
 }
 
 // literalArgs returns the values of a call's arguments, which must be
@@ -285,6 +309,9 @@ func (s *reportSpec) check(ctx context.Context, sess *session) error {
 		if c.SQL != "" {
 			if c.Member != "" || c.Where != nil || c.Version != nil {
 				return reportError("%s: a cohort given as sql takes no member, where or version", at)
+			}
+			if err := reportOwnNames(c.SQL); err != nil {
+				return err
 			}
 			if err := checkSelect(ctx, sess, c.SQL, 1); err != nil {
 				return reportError("%s.sql: %v", at, err)
@@ -659,8 +686,13 @@ func valueSQL(v any) (string, error) {
 func cte(name string) string { return reportCTE + name + `"` }
 
 // sql returns the statement the spec stands for: a SELECT of the result's
-// columns, in their order.
-func (s *reportSpec) sql() string {
+// columns, in their order, reading the tables as named and counting their
+// members' values.
+func (s *reportSpec) sql() string { return s.sqlWith(nil) }
+
+// sqlWith is sql, reading the tables ids holds instead, at its snapshots,
+// and counting their members' ids, when ids is not nil.
+func (s *reportSpec) sqlWith(ids *reportIDs) string {
 	var b strings.Builder
 	b.WriteString("WITH ")
 	var labels []string
@@ -670,7 +702,11 @@ func (s *reportSpec) sql() string {
 		if c.SQL != "" {
 			b.WriteString("SELECT DISTINCT q.member FROM (\n" + trimStatement(c.SQL) + "\n) AS q(member) WHERE q.member IS NOT NULL")
 		} else {
-			member := "t." + quoteIdent(c.Member)
+			member, from := "t."+quoteIdent(c.Member), tableName(c.Table)+" AS t"
+			if ids != nil {
+				x := ids.cohorts[i]
+				member, from = "CAST(t."+x.hidden+" AS UINTEGER)", x.from+" AS t AT (VERSION => "+strconv.FormatInt(x.at, 10)+")"
+			}
 			conds := []string{member + " IS NOT NULL"}
 			if w := c.Where.sql("t"); w != "" {
 				conds = append(conds, w)
@@ -688,7 +724,7 @@ func (s *reportSpec) sql() string {
 					conds = append(conds, "("+col+" = ("+sub+"))")
 				}
 			}
-			b.WriteString("SELECT DISTINCT " + member + " AS member FROM " + tableName(c.Table) + " AS t WHERE " + strings.Join(conds, " AND "))
+			b.WriteString("SELECT DISTINCT " + member + " AS member FROM " + from + " WHERE " + strings.Join(conds, " AND "))
 		}
 		b.WriteString("),\n")
 		labels = append(labels, "SELECT "+quoteLiteral(c.Label)+" AS cohort, member FROM "+name)
@@ -729,17 +765,20 @@ func (s *reportSpec) sql() string {
 			fixed = append(fixed, d.entrySQL(d.valueSQL()))
 		}
 	}
-	fixed = append(fixed, "{'d': CAST(NULL AS VARCHAR), 'g': CAST(NULL AS VARCHAR), 'v': CAST(NULL AS VARCHAR), 'm': CAST(NULL AS DOUBLE), 'k': false}")
+	fixed = append(fixed, "{'d': CAST(NULL AS VARCHAR), 'g': CAST(NULL AS VARCHAR), 'v': CAST(NULL AS VARCHAR), 'm': CAST(NULL AS DOUBLE), 'h': false, 'k': false}")
 	entries := "[" + strings.Join(fixed, ", ") + "]"
 	for _, l := range lists {
 		entries = "list_concat(" + entries + ", " + l + ")"
 	}
-	b.WriteString(", " + cte("rows") + " AS (SELECT c.cohort, s." + quoteIdent(s.Source.Member) + " AS member, ")
+	member, from := "s."+quoteIdent(s.Source.Member), tableName(s.Source.Table)+" AS s"
+	if ids != nil {
+		member, from = "CAST(s."+ids.source.hidden+" AS UINTEGER)", ids.source.from+" AS s AT (VERSION => "+strconv.FormatInt(ids.source.at, 10)+")"
+	}
+	b.WriteString(", " + cte("rows") + " AS (SELECT c.cohort, " + member + " AS member, ")
 	for _, c := range rowCols {
 		b.WriteString(c + ", ")
 	}
-	b.WriteString("unnest(" + entries + ") AS e FROM " + tableName(s.Source.Table) + " AS s JOIN " + cte("cohorts") +
-		" AS c ON c.member = s." + quoteIdent(s.Source.Member))
+	b.WriteString("unnest(" + entries + ") AS e FROM " + from + " JOIN " + cte("cohorts") + " AS c ON c.member = " + member)
 	if w := s.Source.Where.sql("s"); w != "" {
 		b.WriteString(" WHERE " + w)
 	}
@@ -747,7 +786,7 @@ func (s *reportSpec) sql() string {
 
 	// The counts, by value and, for totals, by dimension, and the extent
 	// over every row.
-	b.WriteString(", " + cte("values") + " AS (SELECT cohort, member, e.d AS dimension, e.g AS dim_group, e.v AS value, e.m AS metric, e.k AS keep")
+	b.WriteString(", " + cte("values") + " AS (SELECT cohort, member, e.d AS dimension, e.g AS dim_group, e.v AS value, e.m AS metric, e.h AS has_metric, e.k AS keep")
 	for i := range s.Metrics {
 		b.WriteString(", g" + strconv.Itoa(i))
 	}
@@ -756,8 +795,11 @@ func (s *reportSpec) sql() string {
 	}
 	b.WriteString(" FROM " + cte("rows") + ")\n")
 	b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, GROUPING(value) AS total, GROUPING(dimension) AS everything, " +
-		"count(DISTINCT member) FILTER (WHERE keep) AS people, count(*) FILTER (WHERE keep) AS \"rows\", " +
-		"sum(metric) FILTER (WHERE keep) AS metric_sum, count(metric) FILTER (WHERE keep) AS metric_count, avg(metric) FILTER (WHERE keep) AS metric_avg")
+		"count(DISTINCT CASE WHEN keep THEN member END) AS people, count(*) FILTER (WHERE keep) AS \"rows\", " +
+		"sum(metric) FILTER (WHERE keep) AS metric_sum, " +
+		// NULL, not 0, where no entry has a metric.
+		"CASE WHEN bool_or(has_metric) FILTER (WHERE keep) THEN count(metric) FILTER (WHERE keep) END AS metric_count, " +
+		"avg(metric) FILTER (WHERE keep) AS metric_avg")
 	var metricCols []string
 	for i, m := range s.Metrics {
 		g := "g" + strconv.Itoa(i)
@@ -841,7 +883,8 @@ func (d reportDim) entrySQL(v string) string {
 	if len(keep) > 0 {
 		k = "COALESCE(" + strings.Join(keep, " AND ") + ", false)"
 	}
-	return "{'d': " + quoteLiteral(d.Name) + ", 'g': " + group + ", 'v': CAST(" + v + " AS VARCHAR), 'm': " + metric + ", 'k': " + k + "}"
+	return "{'d': " + quoteLiteral(d.Name) + ", 'g': " + group + ", 'v': CAST(" + v + " AS VARCHAR), 'm': " + metric +
+		", 'h': " + strconv.FormatBool(d.Metric != "") + ", 'k': " + k + "}"
 }
 
 // elementsSQL is the entries of an elements dimension: one for each
@@ -879,7 +922,7 @@ func approximate(c string) bool {
 // checkSQL returns the statement of a parity check: the rows that differ
 // between the spec's result and the caller's SQL, by the columns they
 // share, with the side they are on.
-func (s *reportSpec) checkSQL(ctx context.Context, sess *session, text string) (string, error) {
+func (s *reportSpec) checkSQL(ctx context.Context, sess *session, text string, ids *reportIDs) (string, error) {
 	names, err := selectNames(ctx, sess, text, 0)
 	if err != nil {
 		return "", reportError("the SQL to compare: %v", err)
@@ -914,7 +957,7 @@ func (s *reportSpec) checkSQL(ctx context.Context, sess *session, text string) (
 	}
 	api, mine := reportCompareCTE+`api"`, reportCompareCTE+`sql"`
 	a, b := reportCompareCTE+`a"`, reportCompareCTE+`b"`
-	return "WITH " + api + " AS (" + s.sql() + "),\n" + mine + " AS (\n" + trimStatement(text) + "\n),\n" +
+	return "WITH " + api + " AS (" + s.sqlWith(ids) + "),\n" + mine + " AS (\n" + trimStatement(text) + "\n),\n" +
 		a + " AS (SELECT " + side("p") + " FROM " + api + " AS p),\n" +
 		b + " AS (SELECT " + side("q") + " FROM " + mine + " AS q)\n" +
 		"SELECT 'api_only' AS side, * FROM (SELECT * FROM " + a + " EXCEPT ALL SELECT * FROM " + b + ")\n" +

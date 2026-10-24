@@ -318,13 +318,21 @@ func (p *indexPlanner) use(rel indexRel) (indexUse, bool) {
 // group, are the table's. A table the view joins may be a clean room's,
 // which the view's readers may not read: such a view is read as it is.
 func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
+	base, _, ok := p.viewTable(v, rel)
+	return base, ok
+}
+
+// viewTable is viewBase, and reports whether the view joins other tables
+// to its table, which may repeat the table's rows: its rows are then not
+// the table's one for one, though its members are.
+func (p *indexPlanner) viewTable(v object, rel indexRel) (object, bool, bool) {
 	names, body, ok := viewParts(v.sql)
 	if !ok {
-		return object{}, false
+		return object{}, false, false
 	}
 	tree, err := p.r.serialize(body)
 	if err != nil {
-		return object{}, false
+		return object{}, false, false
 	}
 	stmt, _ := tree.(map[string]any)
 	node, _ := stmt["node"].(map[string]any)
@@ -333,10 +341,10 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 	}
 	if str(node["type"]) != "SELECT_NODE" || node["where_clause"] != nil || len(asList(node["group_expressions"])) > 0 ||
 		node["having"] != nil || node["qualify"] != nil || node["sample"] != nil || len(asList(node["modifiers"])) > 0 {
-		return object{}, false
+		return object{}, false, false
 	}
 	if cm, ok := node["cte_map"].(map[string]any); ok && len(asList(cm["map"])) > 0 {
-		return object{}, false
+		return object{}, false, false
 	}
 	// The tables, the view's own first.
 	var refs []map[string]any
@@ -362,7 +370,7 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 	}
 	from, _ := node["from_table"].(map[string]any)
 	if !tables(from, true) {
-		return object{}, false
+		return object{}, false, false
 	}
 	objs := make([]object, len(refs))
 	quals := make([]string, len(refs))
@@ -376,16 +384,16 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 		}
 		res, err := p.r.resolve(tableRef{parts: parts}, &v)
 		if err != nil || len(res.first) != 1 || len(res.all) != 1 || res.first[0].view {
-			return object{}, false
+			return object{}, false, false
 		}
 		objs[i] = res.first[0]
 		if i > 0 {
 			o := objs[i]
 			if !strings.EqualFold(o.db, p.s.catalogName()) || o.external || isIglooSchema(o.schema) {
-				return object{}, false
+				return object{}, false, false
 			}
 			if rules := gov.Rules(o.schema, o.name); rules != nil && len(rules.Confined) > 0 {
-				return object{}, false
+				return object{}, false, false
 			}
 		}
 		quals[i] = str(t["alias"])
@@ -419,7 +427,7 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 		case "STAR":
 			if len(asList(im["exclude_list"])) > 0 || im["replace_list"] != nil || len(asList(im["rename_list"])) > 0 ||
 				im["expr"] != nil || im["columns"] == true || im["unpacked"] == true {
-				return object{}, false
+				return object{}, false, false
 			}
 			q, found := str(im["relation_name"]), false
 			for i := range refs {
@@ -429,14 +437,14 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 				found = true
 				cs, ok := columnsOf(i)
 				if !ok {
-					return object{}, false
+					return object{}, false, false
 				}
 				for _, c := range cs {
 					out = append(out, column{c, i, c})
 				}
 			}
 			if !found {
-				return object{}, false
+				return object{}, false, false
 			}
 		case "COLUMN_REF":
 			cn := asList(im["column_names"])
@@ -448,11 +456,11 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 				for i := range refs {
 					cs, ok := columnsOf(i)
 					if !ok {
-						return object{}, false
+						return object{}, false, false
 					}
 					if slices.ContainsFunc(cs, func(c string) bool { return strings.EqualFold(c, name) }) {
 						if at >= 0 {
-							return object{}, false
+							return object{}, false, false
 						}
 						at = i
 					}
@@ -461,7 +469,7 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 				at = slices.IndexFunc(quals, func(q string) bool { return strings.EqualFold(q, str(cn[0])) })
 			}
 			if at < 0 {
-				return object{}, false
+				return object{}, false, false
 			}
 			c := column{name, at, name}
 			if a := str(im["alias"]); a != "" {
@@ -473,13 +481,13 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 			// is given may stand among the columns.
 			a := str(im["alias"])
 			if a == "" {
-				return object{}, false
+				return object{}, false, false
 			}
 			out = append(out, column{a, -1, ""})
 		}
 	}
 	if len(names) > len(out) {
-		return object{}, false
+		return object{}, false, false
 	}
 	for i, n := range names {
 		out[i].name = n
@@ -492,10 +500,10 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 			}
 		}
 		if len(is) != 1 || is[0].rel != 0 || !strings.EqualFold(is[0].of, need) {
-			return object{}, false
+			return object{}, false, false
 		}
 	}
-	return objs[0], true
+	return objs[0], len(refs) > 1, true
 }
 
 // describe returns the columns of table o that statements read: those of

@@ -168,13 +168,13 @@ FROM browsing AS b JOIN COHORT_MEMBERS AS M ON M.person_id = b.person_id GROUP B
 		},
 	}, `WITH `+reportCohortsSQL+`,
 A AS (SELECT a.*, M.cohort FROM v_attributes AS a JOIN COHORT_MEMBERS AS M ON M.person_id = a.person_id),
-E AS (SELECT person_id, cohort, 'STATE' AS d, 'REACH_CONTEXT' AS g, CAST(state AS VARCHAR) AS v, CAST(NULL AS DOUBLE) AS m FROM A WHERE state IS NOT NULL AND trim(state) <> ''
-  UNION ALL SELECT person_id, cohort, 'TECHNOLOGY', 'INTEREST', 'TECH_AFFINITY', CAST(techaffinity AS DOUBLE) FROM A WHERE CAST(techaffinity AS DOUBLE) > 0
-  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MOVIES', CAST(movie AS DOUBLE) FROM A WHERE CAST(movie AS DOUBLE) > 0
-  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MUSIC', CAST(music AS DOUBLE) FROM A WHERE CAST(music AS DOUBLE) > 0
-  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MUSIC', CAST(movie AS DOUBLE) FROM A WHERE CAST(movie AS DOUBLE) > 0)
+E AS (SELECT person_id, cohort, 'STATE' AS d, 'REACH_CONTEXT' AS g, CAST(state AS VARCHAR) AS v, CAST(NULL AS DOUBLE) AS m, false AS h FROM A WHERE state IS NOT NULL AND trim(state) <> ''
+  UNION ALL SELECT person_id, cohort, 'TECHNOLOGY', 'INTEREST', 'TECH_AFFINITY', CAST(techaffinity AS DOUBLE), true FROM A WHERE CAST(techaffinity AS DOUBLE) > 0
+  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MOVIES', CAST(movie AS DOUBLE), true FROM A WHERE CAST(movie AS DOUBLE) > 0
+  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MUSIC', CAST(music AS DOUBLE), true FROM A WHERE CAST(music AS DOUBLE) > 0
+  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MUSIC', CAST(movie AS DOUBLE), true FROM A WHERE CAST(movie AS DOUBLE) > 0)
 SELECT d AS dimension, g AS dim_group, v AS value, cohort, count(DISTINCT person_id) AS people, count(*) AS "rows",
-  sum(m) AS metric_sum, count(m) AS metric_count, avg(m) AS metric_avg FROM E GROUP BY ALL`)
+  sum(m) AS metric_sum, CASE WHEN bool_or(h) THEN count(m) END AS metric_count, avg(m) AS metric_avg FROM E GROUP BY ALL`)
 
 	reportParity(t, conn, "cohort sizes", map[string]any{"version": 1, "cohorts": reportCohorts(), "dimensions": []any{}},
 		`WITH `+reportCohortsSQL+`
@@ -353,5 +353,83 @@ func TestReportAPICheck(t *testing.T) {
 	}
 	if err := check("SELECT 'SEGMENT' AS dimension, segment_name AS value, 'x' AS cohort, count(DISTINCT person_id) AS people FROM segments GROUP BY ALL"); err != nil {
 		t.Errorf("a check nina may run: %v", err)
+	}
+}
+
+// TestReportAPIThroughIDs counts through ID domains' ids where the tables
+// allow, with the rows the values give, and by value elsewhere.
+func TestReportAPIThroughIDs(t *testing.T) {
+	it := newIndexTest(t)
+	ctx := context.Background()
+	srv := it.r.srv
+	it.exec(
+		"CREATE TABLE lake.public.audience_members AS SELECT 'p' || (i * 7 % 97) AS person_id, CASE WHEN i % 3 = 0 THEN 'a1' ELSE 'a2' END AS audience_id, CAST(1 + i % 2 AS INTEGER) AS ver FROM range(400) r(i)",
+		"CREATE TABLE lake.public.audience_revisions AS SELECT * FROM (VALUES ('a1', 1), ('a1', 2), ('a2', 1)) v(audience_id, ver)",
+		"CREATE TABLE lake.public.attributes AS SELECT 'p' || i AS person_id, CAST(i % 40 AS VARCHAR) AS household_id FROM range(250) r(i)",
+		"CREATE TABLE lake.public.survey AS SELECT CAST(i % 10 AS BIGINT) AS resp_id, 'answer ' || i AS answer FROM range(20) r(i)",
+		"CREATE VIEW lake.public.v_attributes (person_id, household_id, survey_resp_id) AS SELECT s.*, sv.resp_id FROM lake.public.attributes AS s LEFT JOIN lake.public.survey AS sv ON CAST(s.household_id AS BIGINT) = sv.resp_id",
+		"CREATE VIEW lake.public.v_segments AS SELECT person_id, segment_name FROM lake.public.segments",
+	)
+	for _, tbl := range []string{"audience_members", "attributes"} {
+		it.exec("ALTER TABLE lake.public."+tbl+" ALTER COLUMN person_id SET TAG pii = 'person_id'",
+			"ALTER TABLE lake.public."+tbl+" ALTER COLUMN person_id SET ID DOMAIN people")
+	}
+	srv.MapIDDomains(ctx)
+	conn := it.admin
+	mustExec(t, conn, "SET search_path = 'lake.public'")
+
+	segment := []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}}
+	spec := func(source string, dims []any, cohorts []any) map[string]any {
+		return map[string]any{"version": 1, "cohorts": cohorts, "totals": true, "source": map[string]any{"table": source, "member": "person_id"}, "dimensions": dims}
+	}
+	// counted runs spec as conn and checks its rows are its SQL's, and
+	// whether it counted through ids.
+	counted := func(conn *pgx.Conn, what string, spec map[string]any, throughIDs bool) {
+		t.Helper()
+		lit := specLiteral(t, spec)
+		before := srv.reportThroughIDs.Load()
+		api := texts(t, conn, "SELECT * FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+		if got := srv.reportThroughIDs.Load() > before; got != throughIDs {
+			t.Errorf("%s: through ids %v, want %v", what, got, throughIDs)
+		}
+		text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
+		if len(text) != 1 {
+			t.Fatalf("%s: %q", what, text)
+		}
+		if sql := texts(t, conn, "SELECT * FROM ("+text[0]+") ORDER BY ALL"); len(api) == 0 || !slices.Equal(api, sql) {
+			t.Errorf("%s: rows\n%q\nwant\n%q", what, api, sql)
+		}
+	}
+	counted(conn, "tables, and the population through its LEFT JOIN view", spec("segments", segment, reportCohorts()), true)
+	counted(conn, "a source through a view of its table alone", spec("v_segments", segment, reportCohorts()), true)
+	// A view that may repeat its table's rows: its rows count as the view's.
+	counted(conn, "a source through a LEFT JOIN view", spec("v_attributes", []any{map[string]any{"name": "HH", "column": "household_id"}}, reportCohorts()), false)
+	counted(conn, "a cohort given as SQL", spec("segments", segment, []any{map[string]any{"label": "x", "sql": "SELECT person_id FROM attributes"}}), false)
+
+	// Users whose reads grants decide read views as views; tables, through
+	// ids all the same.
+	it.exec("CREATE USER nina WITH PASSWORD 'nina-password' ROLE none", "GRANT SELECT ON SCHEMA lake.public TO nina")
+	nina := connect(t, it.r.url("nina", "nina-password"), pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, nina, "SET search_path = 'lake.public'")
+	counted(nina, "nina, with a view", spec("segments", segment, reportCohorts()), false)
+	counted(nina, "nina, with tables", spec("segments", segment, reportCohorts()[:1]), true)
+
+	// A prepared call reads the tables' new snapshots after a write.
+	cached := it.r.admin(t, pgx.QueryExecModeCacheStatement)
+	mustExec(t, cached, "SET search_path = 'lake.public'")
+	lit := specLiteral(t, spec("segments", segment, reportCohorts()))
+	first := texts(t, cached, "SELECT * FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+	it.exec("INSERT INTO lake.public.segments SELECT 'p' || i, 'seg_new', 0 FROM range(0, 40) r(i)")
+	before := srv.reportThroughIDs.Load()
+	again := texts(t, cached, "SELECT * FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+	if slices.Equal(first, again) {
+		t.Error("a prepared call did not see a write")
+	}
+	if srv.reportThroughIDs.Load() == before {
+		t.Error("a prepared call was not written again for the tables' new snapshots")
+	}
+	text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
+	if sql := texts(t, conn, "SELECT * FROM ("+text[0]+") ORDER BY ALL"); !slices.Equal(again, sql) {
+		t.Errorf("after a write: rows\n%q\nwant\n%q", again, sql)
 	}
 }

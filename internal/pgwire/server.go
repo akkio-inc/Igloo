@@ -317,9 +317,12 @@ type Server struct {
 	indexBuilds     indexBuilds
 	// indexRewrites counts the SELECTs answered from bitmap indexes.
 	indexRewrites atomic.Int64
-	settings      auth.SettingStore
-	workload      *workload.Controller
-	pool          string
+	// reportThroughIDs counts the report API's calls that read their tables
+	// through ids (see reportids.go).
+	reportThroughIDs atomic.Int64
+	settings         auth.SettingStore
+	workload         *workload.Controller
+	pool             string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -1740,8 +1743,11 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	fail := func(err error) (*statement, error) { return nil, err }
 	// Calls of the report API become the SQL they stand for before
-	// anything else looks at the statement (see reportapi.go).
-	text, err := s.reportCalls(ctx, sess, text)
+	// anything else looks at the statement (see reportapi.go). The
+	// statement keeps its text as written, which preparing again writes
+	// again, as the tables read through ids change.
+	source := text
+	text, reportPins, err := s.reportCalls(ctx, sess, text)
 	if err != nil {
 		return fail(err)
 	}
@@ -1750,6 +1756,12 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		viewGen = s.ddl.Generation()
 	}
 	rewritten, counts := s.rewriteCounting(ctx, sess, user, text, true)
+	if len(reportPins) > 0 {
+		if counts == nil {
+			counts = &idCounts{}
+		}
+		counts.pins = append(counts.pins, reportPins...)
+	}
 	query, err := s.resolveRefReads(ctx, sess, rewritten)
 	if err != nil {
 		return fail(err)
@@ -1767,11 +1779,13 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		return fail(err)
 	}
 	// The columns that hold ID domains' ids are Igloo's (see iddomains.go),
-	// and so are bitmap indexes' tables (see bitmaprewrite.go).
-	if err := hiddenReferences(text); err != nil {
+	// and so are bitmap indexes' tables (see bitmaprewrite.go): checked in
+	// the statement as written, and in what a caller gave the report API
+	// (reportOwnNames), not in the SQL it writes, which reads them.
+	if err := hiddenReferences(source); err != nil {
 		return fail(err)
 	}
-	if err := indexReferences(text); err != nil {
+	if err := indexReferences(source); err != nil {
 		return fail(err)
 	}
 
@@ -1928,7 +1942,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	st.bitmaps = bitmaps
 	if indexCandidate && st.stmtType == duckdb.STATEMENT_TYPE_SELECT {
-		st.indexPins, st.indexed, st.text = indexPins, indexed, text
+		st.indexPins, st.indexed, st.text = indexPins, indexed, source
 	}
 	if pivot && st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
 		// multipleStatements let through what it takes for a query.
@@ -2004,7 +2018,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		st.ids = ids
 	}
 	if counts != nil && st.stmtType == duckdb.STATEMENT_TYPE_SELECT {
-		st.idCounts, st.text = counts, text
+		st.idCounts, st.text = counts, source
 	}
 	// A statement that lists the catalog's tables or views walks the set and
 	// holds the catalog lock exclusively when it runs (see catalogRunLock);

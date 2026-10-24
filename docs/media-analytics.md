@@ -429,6 +429,18 @@ statement. The caller needs the grants that SQL needs, gets the errors it
 would, sees what row access policies, masking policies and clean rooms leave
 of the tables as it would, and the statement runs as it would, on workers
 when auto mode picks them.
+
+Where the source and the cohorts are tables whose member columns belong to
+one [ID domain](sql.md#id-domains), Igloo joins and counts the members' ids
+instead of their values, as its counts of distinct members do, which counts
+large cohorts in bitmaps; the result is the same. It does so when the
+tables' current snapshots have every row's id (it reads them at those
+snapshots, and a prepared call reads newer ones as they come), no row
+access, clean room or masking policy of a member column applies to a table,
+and no cohort is a query. A view is read through its table, as a [bitmap
+index](sql.md#bitmap-indexes) reads it, only by users whose role reads the
+whole warehouse, and, for the source, only a view of its table alone, whose
+rows are the table's.
 This release counts every call from the tables (`path` is `scan`); bitmap
 indexes are to answer calls where they cannot differ from that SQL, under
 the conditions of the [rewrite to bitmap indexes](sql.md#bitmap-indexes).
