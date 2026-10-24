@@ -608,17 +608,22 @@ each stage once every exchange it reads is complete.
 Once a statement's stages have run, the coordinator removes its exchanges
 in the background (`internal/distributed/exchanges.go`), so that its rows
 do not wait: it lists the statement's directory flat, a request per
-thousand files, and deletes 32 files at a time. Walking the directory as a
-tree took a request per directory and then one per file, one after
+thousand files, and deletes them a thousand a request on S3
+(`DeleteObjects`, eight requests at a time) and 32 at a time elsewhere: a
+statement's 55,000 files, deleted one a request, were still being deleted
+minutes later when its coordinator restarted, and outlived it. Walking
+the directory as a tree took a request per directory and then one per file, one after
 another, while the statement waited: 333 requests for a report whose two
 exchanges had 32 partitions, which spent 11 s after its stages had run. A
 statement whose replica stopped first leaves its exchanges, so every
 replica sweeps `_igloo_shuffle/` a minute after it starts and hourly, with
 one flat listing, and removes the files of each statement that none of
-its own statements holds and under which nothing was written for six
-hours. A statement writes `_igloo_shuffle/<statement>/running` every half
-hour while it runs, however long its last stages take, so the sweeps of
-other replicas, which cannot know it runs, never take its exchanges.
+its own statements holds and whose removal began (a statement marks its
+exchanges `removing` before it deletes them, and deletes the mark last),
+or under which nothing was written for six hours. A statement writes
+`_igloo_shuffle/<statement>/running` every half hour while it runs,
+however long its last stages take, so the sweeps of other replicas, which
+cannot know it runs, never take its exchanges.
 
 With `IGLOO_EXCHANGES=local` (`internal/distributed/localx.go`), a shuffle
 task writes its partitions under its worker's spill directory,

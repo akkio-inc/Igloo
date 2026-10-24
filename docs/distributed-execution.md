@@ -562,11 +562,13 @@ catalog, database or users.
 
 ### Lifecycle rule
 
-Statements delete what they exchanged under `_igloo_shuffle/`, but a
-coordinator that stops mid-statement cannot. Every replica sweeps
-`_igloo_shuffle/` a minute after it starts and hourly, and removes the
-files of statements under which nothing was written for six hours (a
-statement that still runs writes there every half hour). A lifecycle rule
+Statements delete what they exchanged under `_igloo_shuffle/` (a thousand
+files a request on S3), but a coordinator that stops mid-statement cannot.
+Every replica sweeps `_igloo_shuffle/` a minute after it starts and
+hourly, and removes the files of statements whose removal began
+(`_igloo_shuffle/<statement>/removing`), and of statements under which
+nothing was written for six hours (a statement that still runs writes
+there every half hour). A lifecycle rule
 on the warehouse's bucket that expires `_igloo_shuffle/` after a day is a
 backstop for when no replica runs for that long. On S3, for a warehouse at
 `s3://bucket/warehouse`:

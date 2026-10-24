@@ -1,12 +1,22 @@
 package distributed
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"gocloud.dev/blob/memblob"
 
 	"github.com/akkio-inc/igloo/internal/config"
@@ -76,6 +86,10 @@ func TestSweepExchanges(t *testing.T) {
 		}
 	}
 	old := staleExchanges + time.Hour
+	// A statement whose removal began, and stopped with its coordinator:
+	// recent, but marked as being removed.
+	write(root+"/stopped/s0/0/__b=0/data_0.parquet", time.Minute)
+	write(root+"/stopped/"+removingFile, time.Minute)
 	for _, q := range []string{"left", "held", "beating"} {
 		write(root+"/"+q+"/s0/0/__b=0/data_0.parquet", old)
 		write(root+"/"+q+"/s1/2/__b=3/data_0.parquet", old)
@@ -88,8 +102,10 @@ func TestSweepExchanges(t *testing.T) {
 	if err := h.co.sweep(t.Context(), now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(root + "/left"); !os.IsNotExist(err) {
-		t.Errorf("left the exchanges of a statement that no longer runs: %v", err)
+	for _, q := range []string{"left", "stopped"} {
+		if _, err := os.Stat(root + "/" + q); !os.IsNotExist(err) {
+			t.Errorf("left the exchanges of %s, which no longer runs: %v", q, err)
+		}
 	}
 	for _, q := range []string{"held", "beating", "recent"} {
 		if _, err := os.Stat(root + "/" + q + "/s0/0/__b=0/data_0.parquet"); err != nil {
@@ -126,5 +142,121 @@ func TestHeartbeat(t *testing.T) {
 	defer h.co.runningMu.Unlock()
 	if h.co.running["q"] {
 		t.Error("removed exchanges are still held")
+	}
+}
+
+// deleter is S3's DeleteObjects, recording the keys of each request.
+type deleter struct {
+	mu       sync.Mutex
+	requests [][]string
+	fail     bool
+	errors   []s3types.Error
+}
+
+func (d *deleter) DeleteObjects(_ context.Context, in *s3.DeleteObjectsInput, _ ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
+	var keys []string
+	for _, o := range in.Delete.Objects {
+		keys = append(keys, aws.ToString(in.Bucket)+"/"+aws.ToString(o.Key))
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.requests = append(d.requests, keys)
+	if d.fail {
+		return nil, errors.New("NotImplemented: DeleteObjects")
+	}
+	return &s3.DeleteObjectsOutput{Errors: d.errors}, nil
+}
+
+// TestRemoveInBatches checks that S3 deletes exchanges a thousand keys a
+// request, by bucket: a statement's 55,000 files, deleted one a request,
+// were still being deleted minutes later when its coordinator restarted.
+// A store without DeleteObjects deletes them one a request; a key S3 could
+// not delete is an error, one already gone is not.
+func TestRemoveInBatches(t *testing.T) {
+	var paths []string
+	for i := range 2500 {
+		paths = append(paths, fmt.Sprintf("s3://b1/wh/_igloo_shuffle/q/s0/%d/__b=0/data_0.parquet", i))
+	}
+	paths = append(paths, "s3://b2/wh/_igloo_shuffle/q/running")
+	var each []string
+	one := func(_ context.Context, ps []string) error {
+		each = append(each, ps...)
+		return nil
+	}
+	d := &deleter{}
+	if err := removeInBatches(t.Context(), d, paths, one); err != nil {
+		t.Fatal(err)
+	}
+	var sizes []int
+	seen := map[string]bool{}
+	for _, r := range d.requests {
+		sizes = append(sizes, len(r))
+		for _, k := range r {
+			seen[k] = true
+		}
+	}
+	slices.Sort(sizes)
+	if !slices.Equal(sizes, []int{1, 500, 1000, 1000}) || len(seen) != 2501 || len(each) > 0 ||
+		!seen["b1/wh/_igloo_shuffle/q/s0/7/__b=0/data_0.parquet"] || !seen["b2/wh/_igloo_shuffle/q/running"] {
+		t.Errorf("requests of %v keys, %d keys in all, %d deleted alone", sizes, len(seen), len(each))
+	}
+
+	d = &deleter{fail: true}
+	if err := removeInBatches(t.Context(), d, paths[:1500], one); err != nil || len(each) != 1500 {
+		t.Errorf("without DeleteObjects: %v, %d deleted alone", err, len(each))
+	}
+
+	d = &deleter{errors: []s3types.Error{{Key: aws.String("gone"), Code: aws.String("NoSuchKey")},
+		{Key: aws.String("kept"), Code: aws.String("AccessDenied"), Message: aws.String("denied")}}}
+	err := removeInBatches(t.Context(), d, paths[:10], one)
+	if err == nil || !strings.Contains(err.Error(), "kept") || strings.Contains(err.Error(), "gone") {
+		t.Errorf("errors of keys: %v", err)
+	}
+}
+
+// opStorage records what is written and removed, in order.
+type opStorage struct {
+	Storage
+	mu  sync.Mutex
+	ops []string
+}
+
+func (s *opStorage) Write(_ context.Context, path string, _ []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ops = append(s.ops, "write "+path)
+	return nil
+}
+
+func (s *opStorage) Remove(_ context.Context, paths []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sorted := slices.Sorted(slices.Values(paths))
+	s.ops = append(s.ops, "remove "+strings.Join(sorted, " "))
+	return nil
+}
+
+// TestRemoveMarked checks that a statement's exchanges are marked as being
+// removed before their files are, and the mark removed last, so that a
+// removal the coordinator stops is finished by the next sweep.
+func TestRemoveMarked(t *testing.T) {
+	s := &opStorage{}
+	co := &Coordinator{opts: Options{Storage: s}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	root := "s3://b/wh/_igloo_shuffle/q"
+	if err := co.removeMarked(t.Context(), root, []string{root + "/s0/0/__b=0/data_0.parquet", root + "/running"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"write " + root + "/removing", "remove " + root + "/running " + root + "/s0/0/__b=0/data_0.parquet",
+		"remove " + root + "/removing"}
+	if !slices.Equal(s.ops, want) {
+		t.Errorf("did %q, want %q", s.ops, want)
+	}
+	// Marked already, as a sweep finds it: not written again.
+	s.ops = nil
+	if err := co.removeMarked(t.Context(), root, []string{root + "/removing", root + "/x"}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(s.ops, []string{"remove " + root + "/x", "remove " + root + "/removing"}) {
+		t.Errorf("resuming did %q", s.ops)
 	}
 }

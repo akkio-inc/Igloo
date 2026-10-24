@@ -542,11 +542,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statement's files and 32 deletes at a time, where it listed each of
   their directories and deleted each file one after another (333 requests
   for a report over 32 partitions, which spent 11 s after its stages had
-  run). Every replica also sweeps the
+  run). On S3 they are deleted a thousand a request: a statement's 55,000
+  files, deleted one a request, outlived the coordinator deleting them.
+  Every replica also sweeps the
   exchanges of statements that no longer run, such as those of a replica
   that was killed mid-statement, once nothing has been written under them
-  for six hours; a statement that still runs writes there every half
-  hour. Workers learn what they wrote to an exchange from DuckDB's `COPY`
+  for six hours, and those whose removal began, a minute after the replica
+  starts; a statement that still runs writes there every half hour.
+  Workers learn what they wrote to an exchange from DuckDB's `COPY`
   rather than listing the files and reading their footers back.
 
 ### Tools and integrations
