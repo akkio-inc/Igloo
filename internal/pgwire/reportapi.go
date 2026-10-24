@@ -1183,17 +1183,25 @@ func (d reportDim) entrySQL(v string) string {
 		", 'h': " + strconv.FormatBool(d.Metric != "") + ", 'k': " + k + "}"
 }
 
+// elementText is how an elements dimension reads an element, e, as text:
+// as it is, or, with element_text "json", one that is a JSON object or
+// array as text as JSON, as Snowflake gives the text of a semi-structured
+// array's elements. It is a function of the element alone, so an index of
+// a list's elements answers for it too, its groups relabeled (see
+// peopleCTEs).
+func (d reportDim) elementText(e string) string {
+	if d.ElementText != "json" {
+		return e
+	}
+	return "CASE WHEN (starts_with(" + e + ", '{') OR starts_with(" + e + ", '[')) AND json_valid(" + e + ") " +
+		"THEN json_extract_string(" + e + ", '$') ELSE " + e + " END"
+}
+
 // elementsSQL is the entries of an elements dimension: one for each
 // element of the list (or JSON array) it reads.
 func (d reportDim) elementsSQL() string {
 	list := "s." + quoteIdent(d.Elements)
-	elem := "CAST(x AS VARCHAR)"
-	if d.ElementText == "json" {
-		// An element that is a JSON object or array as text reads as JSON,
-		// as Snowflake's text of a semi-structured value's elements does.
-		elem = "CASE WHEN (starts_with(CAST(x AS VARCHAR), '{') OR starts_with(CAST(x AS VARCHAR), '[')) AND json_valid(CAST(x AS VARCHAR)) " +
-			"THEN json_extract_string(CAST(x AS VARCHAR), '$') ELSE CAST(x AS VARCHAR) END"
-	}
+	elem := d.elementText("CAST(x AS VARCHAR)")
 	if d.Path != nil {
 		list = "CAST(json_extract(" + list + ", " + quoteLiteral(*d.Path) + ") AS JSON[])"
 		elem = "json_extract_string(x, '$')"

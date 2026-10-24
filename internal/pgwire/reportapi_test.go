@@ -602,11 +602,23 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		"source":     map[string]any{"table": "interests", "member": "person_id"},
 		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "skip_blank": true}}}
 	answered("a list's elements", topics, "index")
-	// Read as text, which the index does not keep: the tables, through
-	// ids, with the cohorts from their bitmaps.
+	// Read as JSON text: the index's elements, as that text reads them.
 	answered("a list's elements as JSON text", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
 		"source":     map[string]any{"table": "interests", "member": "person_id"},
-		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "element_text": "json", "skip_blank": true}}}, "index+scan")
+		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "element_text": "json", "skip_blank": true}}}, "index")
+	it.exec(
+		"CREATE TABLE lake.public.tagsets AS SELECT 'p' || i AS person_id, CASE i % 4 WHEN 0 THEN ['{\"a\": 1}', 'x'] WHEN 1 THEN ['{\"a\":1}', 'y'] "+
+			"WHEN 2 THEN ['[1, 2]', 'x'] ELSE ['{not json', ''] END AS tags FROM range(300) r(i)",
+		"ALTER TABLE lake.public.tagsets ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.tagsets ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	srv.MapIDDomains(ctx)
+	it.exec("ALTER TABLE lake.public.tagsets ADD BITMAP INDEX tagsets_tags ON (ELEMENTS(tags)) FOR person_id")
+	srv.waitIndexBuilds(t)
+	// Elements that read as JSON, two of them as the same text: one value.
+	answered("list elements that read as JSON", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
+		"source":     map[string]any{"table": "tagsets", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "TAG", "elements": "tags", "element_text": "json", "skip_blank": true}}}, "index")
 	it.internal("INSERT INTO lake.public.interests (person_id, topics, _igloo_id_person_id) SELECT value, ['cars'], id FROM lake.igloo_domains.people WHERE value = 'p0'")
 	srv.indexesChanged("public", "interests")
 	srv.waitIndexBuilds(t)

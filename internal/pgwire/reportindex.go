@@ -194,9 +194,7 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 		case d.Elements != "":
 			// An index of the list's elements, which holds nothing else
 			// to keep rows by.
-			if d.Path != nil || len(where) > 0 || d.ElementText != "" {
-				// (An index keeps the elements as they are, not their
-				// text as element_text reads it.)
+			if d.Path != nil || len(where) > 0 {
 				return nil
 			}
 			groups, elements = []string{d.Elements}, d.Elements
@@ -559,7 +557,10 @@ func (s *Server) peopleCTEs(b *strings.Builder, spec *reportSpec, plan *reportIn
 		}
 		v := "CAST(" + d.valueOf("x") + " AS VARCHAR)"
 		if d.Elements != "" {
-			v = "CAST(x." + quoteIdent(d.Elements) + " AS VARCHAR)"
+			// The element as the dimension reads it: elements whose
+			// text reads the same are one value, their groups' bitmaps
+			// OR-ed (see unions).
+			v = d.elementText("CAST(x." + quoteIdent(d.Elements) + " AS VARCHAR)")
 		}
 		conds := []string{indexRows("x", u)}
 		if w := spec.Source.Where.sql("x"); w != "" {
