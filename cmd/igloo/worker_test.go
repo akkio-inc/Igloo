@@ -41,3 +41,12 @@ func TestSeedRuns(t *testing.T) {
 		t.Errorf("seeded %+v, want %+v", got.runs, want)
 	}
 }
+
+func TestPrefetchScans(t *testing.T) {
+	got := prefetchScans([]distributed.Scan{{Table: "v", Filtered: true, FieldIDs: []int{1, 4},
+		Files: []distributed.File{{Path: "s3://b/t/data/a.parquet", Size: 10}, {Path: "s3://b/t/data/b.parquet", Size: 20}}}})
+	if len(got) != 1 || !got[0].Filtered || len(got[0].FieldIDs) != 2 || got[0].FieldIDs[1] != 4 ||
+		len(got[0].Files) != 2 || got[0].Files[1].Path != "s3://b/t/data/b.parquet" || got[0].Files[1].Size != 20 {
+		t.Errorf("prefetchScans: %+v", got)
+	}
+}

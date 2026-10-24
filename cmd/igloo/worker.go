@@ -25,6 +25,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/gateway"
 	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
 // serveWorker runs a distributed-execution worker
@@ -63,11 +64,15 @@ func serveWorker() error {
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	reg.MustRegister(eng.Metrics()...)
 	locations := append([]string{cfg.Storage.Root()}, cfg.Storage.AllowedLocations...)
-	w, err := distributed.NewWorker(distributed.WorkerOptions{
+	opts := distributed.WorkerOptions{
 		Engine: eng, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
 		Locations: locations, MemoryBytes: memory, Threads: threads, ExchangeBytes: cfg.Workers.ExchangeMax,
 		Metrics: distributed.NewWorkerMetrics(reg),
-	}, log)
+	}
+	if p := eng.Prefetcher(); p != nil {
+		opts.Prefetch = prefetchTasks(p)
+	}
+	w, err := distributed.NewWorker(opts, log)
 	if err != nil {
 		return err
 	}
@@ -231,3 +236,31 @@ func workerCompute(ctx context.Context, w config.Workers) (distributed.Compute, 
 type kubernetesWorkers struct{ k *gateway.Kubernetes }
 
 func (k kubernetesWorkers) Scale(ctx context.Context, n int) error { return k.k.ScaleAtLeast(ctx, n) }
+
+// prefetchTasks reads ahead, as each task starts, the blocks of the files
+// its tables' views read, until the task ends (see package prefetch).
+func prefetchTasks(p *prefetch.Prefetcher) func(context.Context, []distributed.Scan) {
+	return func(ctx context.Context, scans []distributed.Scan) {
+		stop := p.Start(ctx, prefetchScans(scans))
+		go func() {
+			<-ctx.Done()
+			stop()
+		}()
+	}
+}
+
+// prefetchScans are the planner's scans as the prefetcher reads them.
+func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
+	out := make([]prefetch.Scan, 0, len(scans))
+	for _, sc := range scans {
+		ps := prefetch.Scan{Filtered: sc.Filtered, FieldIDs: make([]int32, len(sc.FieldIDs)), Files: make([]prefetch.File, len(sc.Files))}
+		for i, id := range sc.FieldIDs {
+			ps.FieldIDs[i] = int32(id)
+		}
+		for i, f := range sc.Files {
+			ps.Files[i] = prefetch.File{Path: f.Path, Size: f.Size}
+		}
+		out = append(out, ps)
+	}
+	return out
+}

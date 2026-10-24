@@ -325,7 +325,7 @@ func TestCacheHTTPFSReadsBlocks(t *testing.T) {
 	const etag = `"1234-5678"`
 	var gets atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/bucket/t/data/f.parquet" {
+		if r.URL.Path != "/bucket/t/data/f.parquet" && r.URL.Path != "/bucket/t/data/other.parquet" {
 			http.NotFound(w, r)
 			return
 		}
@@ -387,5 +387,18 @@ func TestCacheHTTPFSReadsBlocks(t *testing.T) {
 	}
 	if gets.Load() == 0 {
 		t.Error("DuckDB found the other column's blocks too, so the test proves nothing")
+	}
+	// cache_httpfs evicts the blocks the prefetcher wrote as it evicts its
+	// own: with a free-space floor above the disk's, every block it adds
+	// makes it drop the least recently used.
+	before := len(blockFiles(t, dir, path, etag))
+	if _, err := db.Exec("SET GLOBAL cache_httpfs_min_disk_bytes_for_cache = 1000000000000000000"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("SELECT count(DISTINCT title) FROM read_parquet('s3://bucket/t/data/other.parquet')"); err != nil {
+		t.Fatal(err)
+	}
+	if after := len(blockFiles(t, dir, path, etag)); after >= before {
+		t.Errorf("cache_httpfs evicted none of the prefetched blocks: %d before, %d after", before, after)
 	}
 }

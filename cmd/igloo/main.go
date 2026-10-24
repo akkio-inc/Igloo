@@ -334,6 +334,16 @@ func serve() error {
 		tables = distributed.NewIceberg(cat)
 	}
 
+	// Reading ahead for statements lists their scans as distributed
+	// execution plans them.
+	var scanner *distributed.Scanner
+	if cfg.Prefetch.Enabled && tables != nil && eng.Prefetcher() != nil {
+		if scanner, err = distributed.NewScanner(tables); err != nil {
+			return err
+		}
+		defer scanner.Close() //nolint:errcheck
+	}
+
 	// Statements that read large tables run in parts on workers.
 	var dist *distributed.Coordinator
 	if len(cfg.Workers.Addresses) > 0 {
@@ -423,6 +433,8 @@ func serve() error {
 		TokenMaxLifetime:    cfg.TokenMaxLifetime,
 		Policies:            policies,
 		IDDomains:           domains,
+		Scanner:             scanner,
+		Prefetcher:          eng.Prefetcher(),
 		IDDomainsOn:         cfg.IDDomains,
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),

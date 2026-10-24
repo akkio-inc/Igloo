@@ -516,6 +516,13 @@ from local disk. Against an object store with S3's latency, a cold scan on
 - A block it has not fetched yet, or fails to, DuckDB fetches itself:
   prefetch only ever costs requests. Overfetch, blocks it read that the
   scans did not, shows in `igloo_prefetch_unread_bytes_total`.
+- It reads ahead for queries and for the queries of `CREATE TABLE ... AS`
+  and `INSERT ... SELECT` that read catalog tables, other than tables that
+  policies or a clean room protect, and on [workers](distributed-execution.md)
+  for each task's files. The scans are those distributed execution would
+  plan; until filters prune their file lists, a scan of a table the
+  statement filters reads ahead at most 256 MiB. A session turns it off
+  for itself with `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
 - It needs the read cache, on a filesystem with extended attributes; it
   writes blocks as the cache's extension does. At startup the log says
   `prefetch on`, or why it is off.

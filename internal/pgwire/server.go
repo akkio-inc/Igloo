@@ -44,6 +44,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/sharing"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -139,6 +140,10 @@ type Options struct {
 	// Policies keeps masking policies, row access policies and tags. Nil
 	// means a store in memory.
 	Policies policy.Store
+	// Scanner lists statements' scans, and Prefetcher reads ahead what they
+	// are about to read (see prefetch.go); either nil turns it off.
+	Scanner    *distributed.Scanner
+	Prefetcher *prefetch.Prefetcher
 	// IDDomains keeps ID domains and their members (package iddomain). Nil
 	// means a store in memory.
 	IDDomains iddomain.Store
@@ -265,9 +270,12 @@ type Server struct {
 	// idDomains keeps ID domains; idDomainsOn lets columns join them.
 	idDomains   iddomain.Store
 	idDomainsOn bool
-	settings    auth.SettingStore
-	workload    *workload.Controller
-	pool        string
+	// scanner and prefetcher read ahead for statements, or are nil.
+	scanner    *distributed.Scanner
+	prefetcher *prefetch.Prefetcher
+	settings   auth.SettingStore
+	workload   *workload.Controller
+	pool       string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -430,6 +438,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		policies = policy.NewMemoryStore()
 	}
 	s.idDomains, s.idDomainsOn = opts.IDDomains, opts.IDDomainsOn
+	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}
@@ -551,6 +560,9 @@ type session struct {
 	// settingGen counts the session's SET statements, which may change
 	// how its statements resolve names.
 	settingGen uint64
+	// prefetchOff turns reading ahead off for the session's statements
+	// (SET igloo_prefetch = off).
+	prefetchOff bool
 	// tokenID and tokenName identify the Igloo access token the session
 	// signed in with, if any: the session ends when the token is revoked
 	// or, at tokenExpires, expires.
@@ -998,6 +1010,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if ps, ok := s.dialectCommand(sess, q.Query); ok {
 		return ps, nil
 	}
+	if ps, ok := s.prefetchCommand(sess, q.Query); ok {
+		return ps, nil
+	}
 	// In the Snowflake dialect the statement is translated first, so that
 	// all that follows, the checks of the user's role, grants and policies
 	// above all, sees only the DuckDB statement Igloo will run.
@@ -1307,6 +1322,8 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				}
 				return err
 			}
+			// Read ahead what its scans are about to read (see prefetch.go).
+			defer s.prefetchStatement(ctx, sess, st)()
 			switch {
 			case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
 				return sess.runTransaction(ctx, st, tw, run)
