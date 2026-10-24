@@ -31,6 +31,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/federation"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
@@ -1213,4 +1214,38 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+// TestCleanRoomDatasetWithoutIDs keeps the columns that hold ID domains'
+// ids out of a clean room: a member table's dataset has its other columns,
+// and naming the column of ids is refused.
+func TestCleanRoomDatasetWithoutIDs(t *testing.T) {
+	rs := startRoomServer(t)
+	ctx := context.Background()
+	conn, err := rs.srv.engine.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE lake.marts.ids AS SELECT 'e' || i AS email,
+		CASE WHEN i < 300 THEN 'big' ELSE 'small' END AS segment, i AS _igloo_id_email FROM range(400) r(i)`, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	rs.srv.catalogChanged()
+	mustExec(t, rs.admin, "ALTER TABLE lake.marts.ids OWNER TO agency")
+	err = rs.srv.idDomains.Update(ctx, func(c *iddomain.Catalog) error {
+		if err := c.AddDomain(iddomain.Domain{Name: "people", Type: "VARCHAR", Generation: 1}); err != nil {
+			return err
+		}
+		return c.AddMember(iddomain.Member{Domain: "people", Schema: "marts", Table: "ids", Column: "email"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.srv.forgetMembers()
+	rs.setUp(t)
+	// The dataset has no column of ids to join on, and its error lists
+	// the columns it has.
+	expectCode(t, rs.ana, "ALTER CLEAN ROOM tv ADD DATASET bad OF agency FROM marts.ids JOIN ON (_igloo_id_email)", "22023", "(it has email, segment)")
+	mustExec(t, rs.ana, "ALTER CLEAN ROOM tv ADD DATASET ids OF agency FROM marts.ids JOIN ON (email) GROUP BY (segment)")
 }

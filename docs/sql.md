@@ -436,7 +436,11 @@ DROP ID DOMAIN people;
   every user; `information_schema.columns`, `pg_attribute` and
   `igloo.columns` leave them out (`DESCRIBE` and `duckdb_columns()` still
   show their names). No statement may name a column, or anything else,
-  beginning with `_igloo_id_`.
+  beginning with `_igloo_id_`. Delta Sharing refuses a member table, whose
+  files hold the ids: share a copy made with `CREATE TABLE ... AS SELECT *`,
+  which leaves them out. Igloo's Iceberg REST endpoint gives member tables
+  to admins only, and a clean room's dataset of one has the columns
+  without the ids.
 - Ids are never handed out twice and stay below 2^32, the range of a 32-bit
   bitmap. A domain that has handed out all of them hands out no more, and
   the ids of values it has not seen stay `NULL`.

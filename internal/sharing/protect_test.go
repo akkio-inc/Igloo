@@ -96,7 +96,7 @@ func TestAddProtectedTable(t *testing.T) {
 
 	f.policies["public.campaigns"] = []string{"client_rows", "pii_hash"}
 	err := svc.AddTable(ctx, add)
-	if !IsProtected(err) || !strings.Contains(err.Error(), "public.campaigns has masking or row access policies (client_rows, pii_hash)") {
+	if !IsProtected(err) || !strings.Contains(err.Error(), "public.campaigns has what Delta Sharing recipients cannot be given (client_rows, pii_hash)") {
 		t.Errorf("sharing a protected table: %v", err)
 	}
 	tables, _ := f.store.ShareTables(ctx, "internal")

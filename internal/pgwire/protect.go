@@ -225,6 +225,10 @@ func (s *Server) Erasing(ctx context.Context, schema, table string) (bool, error
 // it to others than user (see policy.Confinement). The Iceberg REST
 // catalog refuses such a table to everyone but admins.
 func (s *Server) ProtectedFor(ctx context.Context, user auth.User, schema, table string) (bool, error) {
+	if len(s.memberDomains(ctx, schema, table)) > 0 {
+		// Its files hold the columns of ids, which are Igloo's own.
+		return true, nil
+	}
 	r := s.gov.snapshot(ctx).Rules(schema, table)
 	if r == nil {
 		return false, nil
@@ -393,15 +397,21 @@ func droppedSchema(query string) (string, bool) {
 // ProtectedBy names, sorted, the policies that protect the catalog table
 // schema.table: its row access policy, and the masking policies of its
 // columns, set on them or through their tags, and the clean rooms that
-// keep it, as "clean room name". It is empty exactly when Protected
-// reports false. Delta Sharing refuses to share or serve such a table
-// (package sharing).
+// keep it, as "clean room name", and the ID domains its columns are
+// members of, as "ID domain name", whose ids are in its files. Delta
+// Sharing refuses to share or serve such a table (package sharing).
 func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string {
+	// Columns that hold ID domains' ids are in the table's files, which
+	// Delta Sharing serves whole.
+	var names []string
+	for _, d := range s.memberDomains(ctx, schema, table) {
+		names = append(names, "ID domain "+d)
+	}
 	r := s.gov.snapshot(ctx).Rules(schema, table)
 	if r == nil {
-		return nil
+		slices.Sort(names)
+		return names
 	}
-	var names []string
 	for _, room := range r.Rooms() {
 		names = append(names, "clean room "+room)
 	}

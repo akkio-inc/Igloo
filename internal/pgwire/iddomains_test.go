@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/iddomain"
@@ -239,6 +240,14 @@ func TestIDDomains(t *testing.T) {
 		if got := texts(t, rita, q); len(got) != 1 || got[0] != "person_id,n" {
 			t.Errorf("%s: %q", q, got)
 		}
+	}
+	// Its files hold the ids, so Delta Sharing refuses it, and Igloo's
+	// Iceberg REST endpoint keeps it to admins.
+	if got := r.srv.ProtectedBy(ctx, "public", "people"); strings.Join(got, ",") != "ID domain people" {
+		t.Errorf("ProtectedBy: %q", got)
+	}
+	if p, err := r.srv.ProtectedFor(ctx, auth.User{Name: "rita", Role: auth.RoleReader}, "public", "people"); err != nil || !p {
+		t.Errorf("ProtectedFor: %v, %v", p, err)
 	}
 	if _, err := admin.Exec(ctx, "DROP ID DOMAIN people"); pgCode(err) != "2BP01" {
 		t.Errorf("dropping a domain in use: %v", err)

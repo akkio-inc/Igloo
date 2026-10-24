@@ -36,10 +36,10 @@ type ProtectedError struct {
 }
 
 func (e *ProtectedError) Error() string {
-	return fmt.Sprintf("table %s.%s has masking or row access policies (%s), which Delta Sharing recipients cannot apply: "+
-		"they read the table's files with their own tools. Share a table that holds only what recipients may see instead, "+
-		"for example one made with CREATE TABLE ... AS SELECT the rows and columns they may read",
-		e.Schema, e.Table, strings.Join(e.Policies, ", "))
+	return fmt.Sprintf("table %s.%s has what Delta Sharing recipients cannot be given (%s): masking or row access policies, "+
+		"which they cannot apply as they read the table's files with their own tools, or columns of ID domains' ids, which are "+
+		"Igloo's own. Share a table that holds only what recipients may see instead, for example one made with CREATE TABLE ... "+
+		"AS SELECT the rows and columns they may read", e.Schema, e.Table, strings.Join(e.Policies, ", "))
 }
 
 // IsProtected reports whether err says a table has policies.

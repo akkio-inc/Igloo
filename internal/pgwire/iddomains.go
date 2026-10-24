@@ -582,6 +582,9 @@ type memberCache struct {
 	loaded  bool
 	// tables are schema.table and names the tables' names, lower case.
 	tables, names map[string]bool
+	// domains are the domains each table's columns are members of, by
+	// lower-case schema.table.
+	domains map[string][]string
 }
 
 // memberTables returns the tables with columns that hold ids, by lower-case
@@ -610,12 +613,17 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 		return c.tables, c.names
 	}
 	tables, names = map[string]bool{}, map[string]bool{}
+	domains := map[string][]string{}
 	for _, m := range snap.Members {
-		tables[strings.ToLower(m.Schema+"."+m.Table)] = true
+		key := strings.ToLower(m.Schema + "." + m.Table)
+		tables[key] = true
 		names[strings.ToLower(m.Table)] = true
+		if !slices.Contains(domains[key], m.Domain) {
+			domains[key] = append(domains[key], m.Domain)
+		}
 	}
 	changed := c.loaded
-	c.tables, c.names, c.version, c.loaded = tables, names, v, true
+	c.tables, c.names, c.domains, c.version, c.loaded = tables, names, domains, v, true
 	if changed {
 		s.catalogChanged()
 	}
@@ -648,4 +656,15 @@ func hiddenReferences(text string) error {
 		}
 	}
 	return nil
+}
+
+// memberDomains returns the domains columns of the catalog table
+// schema.table are members of, sorted, or none.
+func (s *Server) memberDomains(ctx context.Context, schema, table string) []string {
+	s.memberTables(ctx)
+	s.members.mu.Lock()
+	defer s.members.mu.Unlock()
+	out := slices.Clone(s.members.domains[strings.ToLower(schema+"."+table)])
+	slices.Sort(out)
+	return out
 }
