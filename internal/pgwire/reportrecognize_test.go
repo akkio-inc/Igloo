@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // Recognizing reports (IGLOO_REPORT_REWRITE) is tested by running reports
@@ -168,6 +169,9 @@ func startReportRecognitionServer(t *testing.T) *reportRecognitionServer {
 	rs := &reportRecognitionServer{}
 	rs.catalogServer = startCatalogServer(t, func(o *Options) {
 		o.ReportRewrite = true
+		// Without ID domains every call counts the tables' values, which
+		// the guard leaves as written; parity is what these tests check.
+		o.reportRewriteAnyPath = true
 		o.reportOutcomes = func(outcomes []reportOutcome) {
 			rs.mu.Lock()
 			defer rs.mu.Unlock()
@@ -501,4 +505,66 @@ func TestReportRecognitionSwitch(t *testing.T) {
 	rs.srv.reportRewrite.Store(false)
 	defer rs.srv.reportRewrite.Store(true)
 	show("off")
+}
+
+// TestReportRecognitionGuard: a CTE is replaced only where its call counts
+// ids or reads bitmaps; one whose call would count the tables' values, here
+// because its cohort is a query, stays as written.
+func TestReportRecognitionGuard(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var outcomes []reportOutcome
+	vc := newViewCatalog(t)
+	r := vc.replica(t, func(o *Options) {
+		o.IDDomainsOn = true
+		o.ReportRewrite = true
+		o.Tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
+		o.reportOutcomes = func(got []reportOutcome) {
+			mu.Lock()
+			defer mu.Unlock()
+			outcomes = append(outcomes, got...)
+		}
+	})
+	it := &idTest{t: t, vc: vc, r: r, admin: r.admin(t, pgx.QueryExecModeSimpleProtocol)}
+	it.exec(
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		"CREATE TABLE lake.public.members AS SELECT 'p' || (i % 300) AS person_id, 'seg' || (i % 7) AS segment FROM range(2000) r(i)",
+		"CREATE TABLE lake.public.panel AS SELECT 'p' || (i * 3 % 300) AS person_id, CASE WHEN i % 2 = 0 THEN 'north' ELSE 'south' END AS panel_id FROM range(200) r(i)",
+		"CREATE TAG pii",
+		"CREATE ID DOMAIN people (VARCHAR) TAG pii = 'person_id'",
+	)
+	for _, tbl := range []string{"members", "panel"} {
+		it.exec("ALTER TABLE lake.public."+tbl+" ALTER COLUMN person_id SET TAG pii = 'person_id'",
+			"ALTER TABLE lake.public."+tbl+" ALTER COLUMN person_id SET ID DOMAIN people")
+	}
+	r.srv.MapIDDomains(context.Background())
+	mustExec(t, it.admin, "SET search_path = 'lake.public'")
+	sql := `WITH NORTH AS (SELECT person_id FROM panel WHERE panel_id = 'north'),
+QUERIED AS (SELECT person_id FROM panel WHERE panel_id = 'south' ORDER BY person_id LIMIT 40),
+BY_TABLE AS (SELECT M.segment, count(DISTINCT M.person_id) AS people FROM members AS M JOIN NORTH AS N ON N.person_id = M.person_id GROUP BY M.segment),
+BY_QUERY AS (SELECT M.segment, count(DISTINCT M.person_id) AS people FROM members AS M JOIN QUERIED AS Q ON Q.person_id = M.person_id GROUP BY M.segment)
+SELECT * FROM BY_TABLE UNION ALL SELECT * FROM BY_QUERY`
+	asWritten := texts(t, it.admin, "SELECT * FROM ("+sql+") ORDER BY ALL")
+	mu.Lock()
+	outcomes = nil
+	mu.Unlock()
+	got, err := recognitionRows(it.admin, sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	byCTE := map[string]reportOutcome{}
+	for _, o := range outcomes {
+		byCTE[o.CTE] = o
+	}
+	if o := byCTE["BY_TABLE"]; o.Spec == "" {
+		t.Errorf("BY_TABLE, whose call counts ids, was left as written: %s", o.Why)
+	}
+	if o := byCTE["BY_QUERY"]; o.Spec != "" || !strings.Contains(o.Why, "path scan") {
+		t.Errorf("BY_QUERY, whose cohort is a query: %+v", o)
+	}
+	if len(got) != len(asWritten) {
+		t.Errorf("rows: %d, as written %d", len(got), len(asWritten))
+	}
 }

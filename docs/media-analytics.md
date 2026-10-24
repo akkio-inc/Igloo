@@ -553,6 +553,15 @@ whose member is `IN (SELECT ...)` one, and count:
   a `DOUBLE`, and expressions of them; the cohorts' sizes, `count(DISTINCT
   member)` of the cohorts alone.
 
+A call replaces its expression only where it does less than the
+expression: where it counts [ID domains](sql.md#id-domains)' ids or reads
+[bitmap indexes](sql.md#bitmap-indexes) (its `path` would be `index`,
+`index+scan`, or a scan through ids). One that would count the tables'
+values, because a cohort is a query, a policy applies or the tables have no
+ids, reads what the expression reads and computes its cohorts again
+besides, where the expressions as written share theirs: it stays as
+written.
+
 Measures that count rows (`count(*)`, sums, averages, the metric) are
 mapped only where a member is once in each cohort, as the API's cohorts
 are. The elements of a list that the translation of Snowflake's `FLATTEN`

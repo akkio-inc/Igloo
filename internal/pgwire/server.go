@@ -182,6 +182,9 @@ type Options struct {
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
 	ReportRewrite bool
+	// reportRewriteAnyPath, when set, has recognition replace CTEs whose
+	// calls would count the tables' values too (for tests of its parity).
+	reportRewriteAnyPath bool
 	// reportOutcomes, when set, hears what recognition did with each
 	// statement's CTEs (for tests).
 	reportOutcomes func([]reportOutcome)
@@ -350,13 +353,14 @@ type Server struct {
 	// reportRewrite is Options.ReportRewrite; reportRecognized counts the
 	// CTEs it answered through the report API, and reportUnrecognized the
 	// statements prepared again as written after a recognized form failed.
-	reportRewrite      atomic.Bool
-	rewriteMemory      int64
-	idFillRewriteRows  int64
-	reportRecognized   atomic.Int64
-	reportUnrecognized atomic.Int64
-	reportOutcomes     func([]reportOutcome)
-	reportFallback     func(recognized string, err error)
+	reportRewrite        atomic.Bool
+	rewriteMemory        int64
+	idFillRewriteRows    int64
+	reportRecognized     atomic.Int64
+	reportUnrecognized   atomic.Int64
+	reportOutcomes       func([]reportOutcome)
+	reportFallback       func(recognized string, err error)
+	reportRewriteAnyPath bool
 	// reportThroughIDs counts the report API's calls that read their tables
 	// through ids (see reportids.go).
 	reportThroughIDs atomic.Int64
@@ -554,6 +558,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.rewriteMemory = opts.RewriteMemory
 	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)
 	s.reportOutcomes, s.reportFallback = opts.reportOutcomes, opts.reportFallback
+	s.reportRewriteAnyPath = opts.reportRewriteAnyPath
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}

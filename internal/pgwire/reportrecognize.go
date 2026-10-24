@@ -85,7 +85,11 @@ func (s *Server) recognizeReports(ctx context.Context, sess *session, text strin
 	if !s.reportRewrite.Load() || sess.reportRewriteOff || !mayBeReport(text) {
 		return text
 	}
-	out, outcomes, err := recognizeReportText(connReportEnv{ctx: ctx, sess: sess}, text)
+	var accept func(spec string) error
+	if !s.reportRewriteAnyPath {
+		accept = func(spec string) error { return s.reportCallPays(ctx, sess, spec) }
+	}
+	out, outcomes, err := recognizeReportText(connReportEnv{ctx: ctx, sess: sess}, text, accept)
 	if s.reportOutcomes != nil {
 		s.reportOutcomes(outcomes)
 	}
@@ -106,14 +110,31 @@ func (s *Server) recognizeReports(ctx context.Context, sess *session, text strin
 	return out
 }
 
+// reportCallPays reports, as an error, why a recognized CTE's call would not
+// pay: one that would count the tables' values (path scan) reads what the
+// CTE as written reads, and computes its cohorts again besides, where the
+// CTEs as written share theirs; one that counts ids, or reads bitmaps,
+// does far less (see reportPlannedPath).
+func (s *Server) reportCallPays(ctx context.Context, sess *session, text string) error {
+	spec, err := parseReportSpec(ctx, sess, text)
+	if err != nil {
+		return notReport("the call's spec: %v", err)
+	}
+	if path := s.reportPlannedPath(ctx, sess, spec); path == "scan" {
+		return notReport("its call would count the tables' values (path scan), as the CTE does")
+	}
+	return nil
+}
+
 // mayBeReport is a cheap test for text that may have a counting CTE.
 func mayBeReport(text string) bool {
 	lower := strings.ToLower(text)
 	return strings.Contains(lower, "with") && strings.Contains(lower, "count") && strings.Contains(lower, "distinct")
 }
 
-// recognizeReportText is recognition on text, with env asking DuckDB.
-func recognizeReportText(env reportEnv, text string) (string, []reportOutcome, error) {
+// recognizeReportText is recognition on text, with env asking DuckDB; a CTE
+// whose call accept, if set, refuses stays as written.
+func recognizeReportText(env reportEnv, text string, accept func(spec string) error) (string, []reportOutcome, error) {
 	stmt, err := env.parse(text)
 	if err != nil {
 		return text, nil, err
@@ -133,7 +154,7 @@ func recognizeReportText(env reportEnv, text string) (string, []reportOutcome, e
 		switch v := n.(type) {
 		case jnode:
 			if cm, ok := v["cte_map"].(jnode); ok {
-				r := &reportRecognizer{env: env, t: t, cteMap: cm, types: map[string]map[string]string{}}
+				r := &reportRecognizer{env: env, t: t, cteMap: cm, types: map[string]map[string]string{}, accept: accept}
 				for _, o := range r.run() {
 					if o.Spec != "" {
 						replaced++
@@ -870,6 +891,8 @@ type reportRecognizer struct {
 	// described those types, by CTE.
 	original  jnode
 	described map[string][][2]string
+	// accept, if set, refuses calls that would not pay.
+	accept func(spec string) error
 }
 
 func (r *reportRecognizer) run() []reportOutcome {
@@ -892,6 +915,9 @@ func (r *reportRecognizer) run() []reportOutcome {
 			continue
 		}
 		repl, spec, err := r.replacement(name, q)
+		if err == nil && r.accept != nil {
+			err = r.accept(spec)
+		}
 		if err != nil {
 			out = append(out, reportOutcome{CTE: name, Why: err.Error()})
 			continue
