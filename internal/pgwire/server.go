@@ -609,8 +609,10 @@ type session struct {
 	// otherwise ask DuckDB more than once; nil outside prepareChecked.
 	memo *checkMemo
 	// noIndexes keeps the statement being prepared from reading bitmap
-	// indexes (see rerunWithoutIndexes).
+	// indexes (see rerunWithoutIndexes), and noBitmaps from counting in
+	// roaring bitmaps at all (see rerunWithoutBitmaps).
 	noIndexes bool
+	noBitmaps bool
 	// bitmapVars are the variables that hold the bitmaps of the statements
 	// Igloo wrote (see hybridBitmaps), by name.
 	bitmapVars map[string]*bitmapVar
@@ -1810,10 +1812,15 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	// anything else looks at the statement (see reportapi.go). The
 	// statement keeps its text as written, which preparing again writes
 	// again, as the tables read through ids change.
+	asGiven := text
 	text, reportPins, reportIndexPins, err := s.reportCalls(ctx, sess, text)
 	if err != nil {
 		return fail(err)
 	}
+	// A call that counts distinct pairs in roaring bitmaps (see
+	// pairBitmaps) runs as statements that count in bitmaps do, again
+	// without them if they do not fit.
+	reportBitmaps := text != asGiven && strings.Contains(text, "rb_count_distinct(")
 	var viewGen uint64
 	if s.ddl != nil {
 		viewGen = s.ddl.Generation()
@@ -1937,7 +1944,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	indexCandidate = indexCandidate || len(reportIndexPins) > 0
 	// A statement that counts ID domains' IDs in roaring bitmaps is
 	// prepared with the rb extension's setting on (see bitmaps.go).
-	bitmaps := s.bitmapsFor(ctx, sess, query)
+	bitmaps := s.bitmapsFor(ctx, sess, query) || reportBitmaps
 	defer sess.setBitmaps(ctx, bitmaps)()
 	written := query
 	if factored := s.factorUnions(ctx, sess, query); factored != "" {

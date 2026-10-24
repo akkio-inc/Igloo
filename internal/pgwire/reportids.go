@@ -32,6 +32,9 @@ import (
 type reportIDs struct {
 	source  reportIDTable
 	cohorts []reportIDTable // by cohort; all are tables
+	// pairs are the distinct_with metrics roaring bitmaps count (see
+	// pairBitmaps).
+	pairs map[int]bool
 }
 
 // reportIDTable is a member table read through its column of ids.

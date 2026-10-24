@@ -172,16 +172,66 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 		}
 	}
 	if plan != nil {
+		if plan.hybrid {
+			plan.pairs = s.pairBitmaps(ctx, sess, spec, plan.source)
+		}
 		if !probe {
 			s.reportFromIndexes.Add(1)
 		}
 		return s.reportIndexSQL(spec, plan), plan.pins, nil
 	}
 	ids, read := s.reportIDs(ctx, sess, spec)
-	if ids != nil && !probe {
-		s.reportThroughIDs.Add(1)
+	if ids != nil {
+		ids.pairs = s.pairBitmaps(ctx, sess, spec, ids.source)
+		if !probe {
+			s.reportThroughIDs.Add(1)
+		}
 	}
 	return spec.sqlWith(ids), nil, read
+}
+
+// pairBitmaps returns the distinct_with metrics of spec whose pairs roaring
+// bitmaps count, where the member is an ID domain's id: those whose column
+// in the source (src, at its snapshot) is a date or an integer, which
+// rb_count_distinct(id, key) keeps a bitmap of ids for each value of. They
+// take a bitmap of each (key, value) group's members a day, say, where
+// DuckDB's count(DISTINCT (member, day)) keeps every pair in a hash table:
+// on a table of a hundred million rows of list elements, more memory than
+// the machine has. None with bitmaps off, or after bitmaps did not fit in
+// memory (see rerunWithoutBitmaps).
+func (s *Server) pairBitmaps(ctx context.Context, sess *session, spec *reportSpec, src reportIDTable) map[int]bool {
+	if !s.bitmaps || sess == nil || sess.conn == nil || sess.noBitmaps {
+		return nil
+	}
+	var cols []string
+	var which []int
+	for i, m := range spec.Metrics {
+		if m.DistinctWith != "" {
+			cols, which = append(cols, "s."+quoteIdent(m.DistinctWith)), append(which, i)
+		}
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+	rows, err := queryRows(ctx, sess.conn, "DESCRIBE SELECT "+strings.Join(cols, ", ")+" FROM "+src.from+" AS s AT (VERSION => "+strconv.FormatInt(src.at, 10)+")")
+	if err != nil || len(rows) != len(cols) {
+		return nil
+	}
+	pairs := map[int]bool{}
+	for i, r := range rows {
+		if len(r) > 1 {
+			if t, _ := r[1].(string); pairKeyTypes[t] {
+				pairs[which[i]] = true
+			}
+		}
+	}
+	return pairs
+}
+
+// pairKeyTypes are the types of the keys rb_count_distinct(id, key) takes.
+var pairKeyTypes = map[string]bool{
+	"DATE": true, "TINYINT": true, "SMALLINT": true, "INTEGER": true, "BIGINT": true,
+	"UTINYINT": true, "USMALLINT": true, "UINTEGER": true,
 }
 
 // reportOwnNames refuses SQL a caller gave the API that names what only
@@ -794,7 +844,11 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 	if w := s.Source.Where.sql("s"); w != "" {
 		from += " WHERE " + w
 	}
-	counts, metricCols, extent := s.scanCounts(from, "c.cohort", member, true)
+	var pairs map[int]bool
+	if ids != nil {
+		pairs = ids.pairs
+	}
+	counts, metricCols, extent := s.scanCounts(from, "c.cohort", member, true, pairs)
 	b.WriteString(counts)
 	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, n.people, n.\"rows\", z.cohort_size, " +
 		"n.metric_sum, n.metric_count, n.metric_avg")
@@ -818,9 +872,12 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 // cohort, with its dimensions' entries, one for each value it has and one
 // that counts in no value, so that every row is in the extent; and their
 // counts by value and, for totals, by dimension. people counts their
-// distinct members too. It returns the CTEs, the columns of the metrics as
-// the counts' (alias n) and the SELECT of the extent, if any.
-func (s *reportSpec) scanCounts(from, cohort, member string, people bool) (string, []string, string) {
+// distinct members too. rbPairs are the distinct_with metrics whose pairs
+// roaring bitmaps count (rb_count_distinct(member, key)): member is an ID
+// domain's id and the metric's column a date or an integer (see
+// pairBitmaps). It returns the CTEs, the columns of the metrics as the
+// counts' (alias n) and the SELECT of the extent, if any.
+func (s *reportSpec) scanCounts(from, cohort, member string, people bool, rbPairs map[int]bool) (string, []string, string) {
 	var b strings.Builder
 	// Each row of the source whose member is in a cohort, once for each
 	// cohort, with its dimensions' entries: one for each value it has, and
@@ -870,32 +927,36 @@ func (s *reportSpec) scanCounts(from, cohort, member string, people bool) (strin
 		b.WriteString(", ext")
 	}
 	b.WriteString(" FROM " + cte("rows") + ")\n")
-	aggs := "count(*) FILTER (WHERE keep) AS \"rows\", " +
-		"sum(metric) FILTER (WHERE keep) AS metric_sum, " +
-		// NULL, not 0, where no entry has a metric.
-		"CASE WHEN bool_or(has_metric) FILTER (WHERE keep) THEN count(metric) FILTER (WHERE keep) END AS metric_count, " +
-		"avg(metric) FILTER (WHERE keep) AS metric_avg"
-	if people {
-		aggs = "count(DISTINCT CASE WHEN keep THEN member END) AS people, " + aggs
-	}
 	var metricCols []string
-	pairs := false
+	var hashed []int // distinct_with metrics that count their pairs by hashing
 	for i, m := range s.Metrics {
-		g := "g" + strconv.Itoa(i)
-		if m.DistinctWith != "" {
-			pairs = true
-			aggs += ", count(DISTINCT row(member, " + g + ")) FILTER (WHERE keep AND " + g + " IS NOT NULL) AS " + quoteIdent(m.Name+"_distinct")
-		} else {
-			aggs += ", sum(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_sum") + ", avg(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_avg")
+		if m.DistinctWith != "" && !rbPairs[i] {
+			hashed = append(hashed, i)
 		}
 		for _, c := range m.columns() {
 			metricCols = append(metricCols, "n."+quoteIdent(c))
 		}
 	}
-	extent := ""
-	if !pairs {
+	if len(hashed) == 0 {
 		// One pass over the rows: values, totals and the extent as
-		// grouping sets.
+		// grouping sets, with distinct pairs, if any, in roaring bitmaps.
+		aggs := "count(*) FILTER (WHERE keep) AS \"rows\", " +
+			"sum(metric) FILTER (WHERE keep) AS metric_sum, " +
+			// NULL, not 0, where no entry has a metric.
+			"CASE WHEN bool_or(has_metric) FILTER (WHERE keep) THEN count(metric) FILTER (WHERE keep) END AS metric_count, " +
+			"avg(metric) FILTER (WHERE keep) AS metric_avg"
+		if people {
+			aggs = "count(DISTINCT CASE WHEN keep THEN member END) AS people, " + aggs
+		}
+		for i, m := range s.Metrics {
+			g := "g" + strconv.Itoa(i)
+			if m.DistinctWith != "" {
+				aggs += ", rb_count_distinct(member, " + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_distinct")
+			} else {
+				aggs += ", sum(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_sum") + ", avg(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_avg")
+			}
+		}
+		extent := ""
 		ext := ""
 		if s.Extent != "" {
 			ext = ", min(ext) AS extent_min, max(ext) AS extent_max"
@@ -910,21 +971,65 @@ func (s *reportSpec) scanCounts(from, cohort, member string, people bool) (strin
 		}
 		b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, GROUPING(value) AS total, GROUPING(dimension) AS everything, " +
 			aggs + ext + " FROM " + cte("values") + " GROUP BY GROUPING SETS (" + strings.Join(sets, ", ") + "))\n")
-	} else {
-		// Counts of distinct pairs beside counts of distinct members, two
-		// distinct keys, which grouping sets cannot combine across
-		// workers: a GROUP BY for values and one for totals instead.
-		b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, 0 AS total, 0 AS everything, " + aggs +
-			" FROM " + cte("values") + " GROUP BY dimension, dim_group, value, cohort")
-		if s.Totals {
-			b.WriteString(" UNION ALL SELECT dimension, dim_group, CAST(NULL AS VARCHAR) AS value, cohort, 1 AS total, 0 AS everything, " + aggs +
-				" FROM " + cte("values") + " GROUP BY dimension, dim_group, cohort")
-		}
-		b.WriteString(")\n")
-		if s.Extent != "" {
-			extent = "SELECT min(ext) AS extent_min, max(ext) AS extent_max FROM " + cte("values")
+		return b.String(), metricCols, extent
+	}
+
+	// Distinct pairs counted in two steps, as Igloo rewrites the pair
+	// counts of SQL (see paircount.go): the rows grouped by the keys, the
+	// member and the pair's columns first, which makes each pair one row,
+	// with the parts of the other aggregates; then counted, summed and
+	// combined by key. DuckDB's DISTINCT aggregates keep a hash table of
+	// structs for each group, which on large tables takes more memory than
+	// the machine has, where a GROUP BY spills.
+	var pairCols []string
+	for i, m := range s.Metrics {
+		if m.DistinctWith != "" {
+			pairCols = append(pairCols, "g"+strconv.Itoa(i))
 		}
 	}
+	inner := "count(*) FILTER (WHERE keep) AS r, sum(metric) FILTER (WHERE keep) AS ms, count(metric) FILTER (WHERE keep) AS mc, " +
+		"bool_or(has_metric) FILTER (WHERE keep) AS hm, bool_or(keep) AS k"
+	outer := "CAST(sum(r) AS BIGINT) AS \"rows\", sum(ms) AS metric_sum, CASE WHEN bool_or(hm) THEN CAST(sum(mc) AS BIGINT) END AS metric_count, " +
+		"CASE WHEN sum(mc) > 0 THEN sum(ms) / sum(mc) END AS metric_avg"
+	if people {
+		outer = "count(DISTINCT member) FILTER (WHERE k) AS people, " + outer
+	}
+	for i, m := range s.Metrics {
+		g := "g" + strconv.Itoa(i)
+		switch {
+		case m.DistinctWith == "":
+			inner += ", sum(" + g + ") FILTER (WHERE keep) AS s" + g + ", count(" + g + ") FILTER (WHERE keep) AS c" + g
+			outer += ", sum(s" + g + ") AS " + quoteIdent(m.Name+"_sum") + ", CASE WHEN sum(c" + g + ") > 0 THEN sum(s" + g + ") / sum(c" + g + ") END AS " + quoteIdent(m.Name+"_avg")
+		case len(pairCols) == 1:
+			// Each row of a key is one of its pairs.
+			outer += ", count(*) FILTER (WHERE k AND " + g + " IS NOT NULL) AS " + quoteIdent(m.Name+"_distinct")
+		case rbPairs[i]:
+			outer += ", rb_count_distinct(member, " + g + ") FILTER (WHERE k) AS " + quoteIdent(m.Name+"_distinct")
+		default:
+			outer += ", count(DISTINCT row(member, " + g + ")) FILTER (WHERE k AND " + g + " IS NOT NULL) AS " + quoteIdent(m.Name+"_distinct")
+		}
+	}
+	ext, extent := "", ""
+	if s.Extent != "" {
+		inner += ", min(ext) AS emin, max(ext) AS emax"
+		ext = ", min(emin) AS extent_min, max(emax) AS extent_max"
+		extent = "SELECT extent_min, extent_max FROM " + cte("counts") + " WHERE everything = 1"
+	}
+	keys := strings.Join(append([]string{"member"}, pairCols...), ", ")
+	sets := []string{"(dimension, dim_group, value, cohort, " + keys + ")"}
+	if s.Totals {
+		sets = append(sets, "(dimension, dim_group, cohort, "+keys+")")
+	}
+	b.WriteString(", " + cte("pairs") + " AS (SELECT dimension, dim_group, value, cohort, " + keys + ", GROUPING(value) AS total, " + inner +
+		" FROM " + cte("values") + " GROUP BY GROUPING SETS (" + strings.Join(sets, ", ") + "))\n")
+	// The extent over every row, of either grouping set: min and max
+	// take a row again as they took it once.
+	outerSets := "(dimension, dim_group, value, cohort, total)"
+	if s.Extent != "" {
+		outerSets += ", ()"
+	}
+	b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, total, GROUPING(dimension) AS everything, " + outer + ext +
+		" FROM " + cte("pairs") + " GROUP BY GROUPING SETS (" + outerSets + "))\n")
 	return b.String(), metricCols, extent
 }
 

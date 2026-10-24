@@ -402,7 +402,8 @@ func TestReportAPICheck(t *testing.T) {
 // TestReportAPIThroughIDs counts through ID domains' ids where the tables
 // allow, with the rows the values give, and by value elsewhere.
 func TestReportAPIThroughIDs(t *testing.T) {
-	it := newIndexTest(t)
+	// Counting distinct ids in bitmaps on, for statements of any size.
+	it := newIndexTest(t, func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 0 })
 	ctx := context.Background()
 	srv := it.r.srv
 	it.exec(
@@ -412,7 +413,13 @@ func TestReportAPIThroughIDs(t *testing.T) {
 		"CREATE TABLE lake.public.survey AS SELECT CAST(i % 10 AS BIGINT) AS resp_id, 'answer ' || i AS answer FROM range(20) r(i)",
 		"CREATE VIEW lake.public.v_attributes (person_id, household_id, survey_resp_id) AS SELECT s.*, sv.resp_id FROM lake.public.attributes AS s LEFT JOIN lake.public.survey AS sv ON CAST(s.household_id AS BIGINT) = sv.resp_id",
 		"CREATE VIEW lake.public.v_segments AS SELECT person_id, segment_name FROM lake.public.segments",
+		// Daily rows of list elements, a site and minutes.
+		"CREATE TABLE lake.public.visits AS SELECT 'p' || (i % 90) AS person_id, DATE '2026-03-01' + CAST(i % 13 AS INTEGER) AS day, "+
+			"CASE i % 4 WHEN 0 THEN ['cars', 'news'] WHEN 1 THEN ['news', 'news'] WHEN 2 THEN NULL ELSE ['', 'cars'] END AS tags, "+
+			"CASE WHEN i % 5 = 0 THEN NULL ELSE 'site' || (i % 6) END AS site, CAST(i % 17 AS INTEGER) AS minutes FROM range(1200) r(i)",
 	)
+	it.exec("ALTER TABLE lake.public.visits ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.visits ALTER COLUMN person_id SET ID DOMAIN people")
 	for _, tbl := range []string{"audience_members", "attributes"} {
 		it.exec("ALTER TABLE lake.public."+tbl+" ALTER COLUMN person_id SET TAG pii = 'person_id'",
 			"ALTER TABLE lake.public."+tbl+" ALTER COLUMN person_id SET ID DOMAIN people")
@@ -449,6 +456,34 @@ func TestReportAPIThroughIDs(t *testing.T) {
 	counted(conn, "a source through a LEFT JOIN view", spec("v_attributes", []any{map[string]any{"name": "HH", "column": "household_id"}}, reportCohorts()), false)
 	counted(conn, "a cohort given as SQL", spec("segments", segment, []any{map[string]any{"label": "x", "sql": "SELECT person_id FROM attributes"}}), false)
 
+	// Distinct (member, day) pairs through ids: in roaring bitmaps, a
+	// bitmap of members a day; beside pairs of a text, which bitmaps cannot
+	// key, in two steps; and, when the bitmaps do not fit, again without
+	// them.
+	visits := func(metrics ...any) map[string]any {
+		return map[string]any{"version": 1, "cohorts": reportCohorts(), "totals": true, "extent": "day",
+			"source":     map[string]any{"table": "visits", "member": "person_id"},
+			"dimensions": []any{map[string]any{"name": "TAG", "elements": "tags", "skip_blank": true}, map[string]any{"name": "ANY", "constant": "VISIT", "metric": "minutes"}},
+			"metrics":    metrics}
+	}
+	days := map[string]any{"name": "days", "distinct_with": "day"}
+	sites := map[string]any{"name": "sites", "distinct_with": "site"}
+	minutes := map[string]any{"name": "minutes", "column": "minutes", "coalesce": 0}
+	counted(conn, "pairs of days", visits(days, minutes), true)
+	plan := strings.Join(texts(t, conn, "EXPLAIN (FORMAT JSON) SELECT * FROM igloo.audience_profile("+specLiteral(t, visits(days, minutes))+")"), "\n")
+	if !strings.Contains(plan, "rb_count_distinct") {
+		t.Errorf("pairs of days through ids, not in bitmaps:\n%s", plan)
+	}
+	counted(conn, "pairs of days and of sites", visits(days, sites, minutes), true)
+	counted(conn, "pairs of sites alone", visits(sites), true)
+	reruns := srv.bitmapReruns.Load()
+	mustExec(t, conn, "SET rb_memory_budget = '1KB'")
+	counted(conn, "pairs of days, in bitmaps that do not fit", visits(days, minutes), true)
+	mustExec(t, conn, "RESET rb_memory_budget")
+	if srv.bitmapReruns.Load() == reruns {
+		t.Error("pairs of days in bitmaps that do not fit did not run again without them")
+	}
+
 	// Users whose reads grants decide read views as views; tables, through
 	// ids all the same.
 	it.exec("CREATE USER nina WITH PASSWORD 'nina-password' ROLE none", "GRANT SELECT ON SCHEMA lake.public TO nina")
@@ -481,7 +516,8 @@ func TestReportAPIThroughIDs(t *testing.T) {
 // the tables give, where the indexes hold all the call counts, and from the
 // tables elsewhere.
 func TestReportAPIFromIndexes(t *testing.T) {
-	it := newE2Test(t)
+	// Counting distinct ids in bitmaps on, as the hybrid's pairs do.
+	it := newE2Test(t, func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 0 })
 	ctx := context.Background()
 	srv := it.r.srv
 	conn := it.admin
@@ -581,6 +617,9 @@ func TestReportAPIFromIndexes(t *testing.T) {
 			map[string]any{"name": "REACH", "constant": "ANY_PLAY", "metric": "seconds"}},
 		"metrics": []any{map[string]any{"name": "seconds", "column": "seconds", "coalesce": 0}, map[string]any{"name": "days", "distinct_with": "day"}}}
 	answered("plays, with metrics and the extent", plays, "index+scan")
+	if plan := strings.Join(texts(t, conn, "EXPLAIN (FORMAT JSON) SELECT * FROM igloo.audience_profile("+specLiteral(t, plays)+")"), "\n"); !strings.Contains(plan, "rb_count_distinct") {
+		t.Errorf("the hybrid's pairs of days, not in bitmaps:\n%s", plan)
+	}
 	// The scan's cohorts' bitmaps reach it in the session's variables,
 	// which no client's statement may name, and which go once it has run.
 	var left int64

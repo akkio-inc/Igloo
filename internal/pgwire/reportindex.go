@@ -67,8 +67,10 @@ type reportIndexPlan struct {
 	hybrid bool
 	source reportIDTable
 	// bitmaps are a hybrid's cohorts' bitmaps, in the session's variables,
-	// once hybridBitmaps computed them.
+	// once hybridBitmaps computed them; pairs the distinct_with metrics
+	// whose pairs its scan counts in bitmaps (see pairBitmaps).
 	bitmaps []hybridBitmap
+	pairs   map[int]bool
 }
 
 // hybridBitmap is a hybrid cohort's bitmap, held in variable name; latest
@@ -82,7 +84,8 @@ type hybridBitmap struct {
 // reportIndexes returns how spec's call reads bitmap indexes, or nil when
 // they cannot answer it.
 func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportSpec) *reportIndexPlan {
-	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.indexesOff || len(spec.Dimensions) == 0 || rank[sess.currentUser().Role] < rank[auth.RoleReader] {
+	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.indexesOff || sess.noIndexes || sess.noBitmaps || len(spec.Dimensions) == 0 ||
+		rank[sess.currentUser().Role] < rank[auth.RoleReader] {
 		return nil
 	}
 	snap := s.memberSnapshot(ctx)
@@ -464,7 +467,7 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 		b.WriteString(" WHERE " + w)
 	}
 	b.WriteString(")\n")
-	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", false)
+	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", false, plan.pairs)
 	b.WriteString(counts)
 	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, ")
 	if spec.Totals {

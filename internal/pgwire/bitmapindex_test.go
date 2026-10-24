@@ -56,7 +56,7 @@ func TestParseIndexCommand(t *testing.T) {
 }
 
 // indexTest is an ID domain test with bitmap indexes on.
-func newIndexTest(t *testing.T) *idTest {
+func newIndexTest(t *testing.T, opts ...func(*Options)) *idTest {
 	t.Helper()
 	if os.Getenv("IGLOO_TEST_RB_EXTENSION") == "" {
 		if os.Getenv("CI") != "" {
@@ -68,6 +68,9 @@ func newIndexTest(t *testing.T) *idTest {
 	r := vc.replica(t, func(o *Options) {
 		o.IDDomainsOn, o.BitmapIndexes = true, true
 		o.Tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
+		for _, opt := range opts {
+			opt(o)
+		}
 	})
 	it := &idTest{t: t, vc: vc, r: r, admin: r.admin(t, pgx.QueryExecModeSimpleProtocol)}
 	it.exec(

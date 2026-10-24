@@ -390,7 +390,13 @@ gives `C`, and `seconds_avg` (`DOUBLE`), with `"coalesce": 0` reading NULLs
 as 0; `{"name": "days", "distinct_with": "C"}` gives `days_distinct`
 (`BIGINT`), the distinct (member, `C`) pairs, leaving out those whose `C` is
 NULL, as Snowflake's `COUNT(DISTINCT a, b)` does. Names are lower-case
-letters, digits and `_`.
+letters, digits and `_`. Where the members are an ID domain's ids and `C` is
+a date or an integer, roaring bitmaps count the pairs, one bitmap of members
+for each value of `C` (`rb_count_distinct(id, key)`); otherwise the rows are
+grouped by the pair first, which makes each pair one row, and then counted.
+Either takes far less memory than DuckDB's `count(DISTINCT (a, b))` on a
+large table. If the bitmaps do not fit in memory, the call runs again
+without them.
 
 **Totals and extent.** `"totals": true` adds, for each dimension and cohort,
 a row with `is_total` true and `value` NULL counting across the dimension's

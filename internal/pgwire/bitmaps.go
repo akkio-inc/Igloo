@@ -64,7 +64,7 @@ var (
 // bitmapsFor decides whether query, as it is about to be prepared, counts
 // distinct IDs in bitmaps.
 func (s *Server) bitmapsFor(ctx context.Context, sess *session, query string) bool {
-	if !s.bitmaps || !countsDistinct.MatchString(query) || !domainID.MatchString(query) {
+	if !s.bitmaps || sess.noBitmaps || !countsDistinct.MatchString(query) || !domainID.MatchString(query) {
 		return false
 	}
 	if s.bitmapMinRows <= 0 {
@@ -194,6 +194,24 @@ func (s *Server) rerunWithoutBitmaps(ctx context.Context, sess *session, st *sta
 	if sess.bitmapsRestore != nil {
 		sess.bitmapsRestore()
 		sess.bitmapsRestore = nil
+	}
+	if st.reportCall {
+		// A report API call's own SQL counts in bitmaps (see pairBitmaps):
+		// written again without them.
+		sess.noBitmaps = true
+		fresh, err := s.prepareChecked(ctx, sess, sess.currentUser(), st.text, st.clientOIDs)
+		sess.noBitmaps = false
+		if err != nil {
+			return errors.Join(cause, err)
+		}
+		if !sameShape(fresh, st, false) {
+			_ = fresh.close()
+			return errors.Join(cause, errors.New("a report call changed its result's columns when prepared again without bitmaps"))
+		}
+		old := st.stmt
+		*st = *fresh
+		_ = old.Close()
+		return run()
 	}
 	release := s.holdCatalog(sess)
 	err := st.reprepare(ctx, sess.conn)

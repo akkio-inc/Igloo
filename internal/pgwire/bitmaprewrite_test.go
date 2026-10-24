@@ -24,9 +24,9 @@ FROM AUD_SEGMENTS AS A JOIN BASEPOP_SEGMENTS AS G ON A.segment_name = G.segment_
 
 // newE2Test is an index test with E2's tables, members of one domain, and
 // indexes that answer its counts, built.
-func newE2Test(t *testing.T) *idTest {
+func newE2Test(t *testing.T, opts ...func(*Options)) *idTest {
 	t.Helper()
-	it := newIndexTest(t)
+	it := newIndexTest(t, opts...)
 	it.exec(
 		"CREATE TABLE lake.public.person_segments AS SELECT 'p' || (i % 400) AS person_id, 'SEG_' || (i % 11) AS segment_name FROM range(3000) r(i)",
 		"INSERT INTO lake.public.person_segments SELECT 'p' || i, 'OTHER' FROM range(50) r(i)",
