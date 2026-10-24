@@ -253,7 +253,7 @@ func prefetchTasks(p *prefetch.Prefetcher) func(context.Context, []distributed.S
 func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
 	out := make([]prefetch.Scan, 0, len(scans))
 	for _, sc := range scans {
-		ps := prefetch.Scan{Filtered: sc.Filtered, FieldIDs: make([]int32, len(sc.FieldIDs)), Files: make([]prefetch.File, len(sc.Files))}
+		ps := prefetch.Scan{Filtered: sc.Filtered, Whole: sc.Whole, FieldIDs: make([]int32, len(sc.FieldIDs)), Files: make([]prefetch.File, len(sc.Files))}
 		for i, id := range sc.FieldIDs {
 			ps.FieldIDs[i] = int32(id)
 		}
