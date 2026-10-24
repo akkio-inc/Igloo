@@ -136,8 +136,7 @@ drop all three when the site goes public; add
 
 **Deploying.** The site is static. It is deployed as a Cloudflare Worker
 that serves `site/dist` (what Cloudflare Pages became), configured in
-`site/wrangler.jsonc`, to the workers.dev address of the Cloudflare account
-wrangler is signed in to:
+`site/wrangler.jsonc`, to https://igloo.<account>.workers.dev:
 
 ```sh
 make site

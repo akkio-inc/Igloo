@@ -11,8 +11,8 @@ import (
 	"github.com/akkio-inc/igloo/internal/iddomain"
 )
 
-// e2Report is the shape of Acme's segment-share report (E2): the members
-// of one audience's latest version in each segment, against the general
+// e2Report is the shape of the segment-share report (E2): the members
+// of one audience's latest version in each segment, against the base
 // population's, through a view of the population's table.
 const e2Report = `WITH AUDIENCE AS (SELECT person_id FROM audience_members WHERE audience_id = 'a1' AND ver = (SELECT max(ver) FROM audience_revisions WHERE audience_id = 'a1')),
 BASE_POPULATION AS (SELECT person_id FROM v_attributes),

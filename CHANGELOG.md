@@ -1154,7 +1154,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `IGLOO_BITMAP_MIN_ROWS` rows (10 million by default) count them in roaring
   bitmaps, with Igloo's own DuckDB extension, rb: a few bytes an ID where
   DuckDB's hash keeps every pair of group and ID. On a DuckDB copy of
-  Acme's seven heaviest reports, with people's ids as integers, on one
+  seven heavy audience reports, with people's ids as integers, on one
   8-core machine (18.6 GiB), the behaviors reports went from 101 and 76 s
   to 19 s, the signals reports from 46-48 s to 15 s and, where they compare
   two audiences, from failing after 28 GB of spill to 29 s, with no spill
@@ -1363,7 +1363,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   reads them.
 - Results reach clients in batches rather than one network write per row:
   large results arrive four to five times faster.
-- `COUNT(*) OVER ()` beside a query's rows, as in Acme's table previews, no
+- `COUNT(*) OVER ()` beside a query's rows, as in BI tools' table previews, no
   longer makes DuckDB hold every row before it returns the first: where it
   is the number of rows the `FROM` and `WHERE` produce, Igloo counts those
   once instead, in either dialect. Previewing 50 rows of a 37-million-row
@@ -1539,14 +1539,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   format wrote DuckDB's text rather than Snowflake's: a `FLOAT` as
   `999.8899804651736` or `9244.0` where Snowflake writes `999.889980465`
   and `9244`, a `TIMESTAMP_LTZ` with the offset `+00` rather than `+0000`, a
-  `TIME` with fractions of a second and `BINARY` as escapes. Acme's column
-  profiles compare these strings. They now follow Snowflake's default output
-  formats (a `FLOAT` with up to 12 significant digits;
-  `TIMESTAMP_OUTPUT_FORMAT`, `TIME_OUTPUT_FORMAT` and `BINARY_OUTPUT_FORMAT`
-  at their defaults), in the session's time zone; `TZH` and `TZM` in a
-  format write the offset as Snowflake does; and `ALTER SESSION` accepts the
-  output format parameters at their defaults and refuses others. Profiling
-  four columns of 37 million rows takes 12% longer.
+  `TIME` with fractions of a second and `BINARY` as escapes, so column
+  profiles that compare these strings differed. They now follow
+  Snowflake's default output formats (a `FLOAT` with up to 12 significant
+  digits; `TIMESTAMP_OUTPUT_FORMAT`, `TIME_OUTPUT_FORMAT` and
+  `BINARY_OUTPUT_FORMAT` at their defaults), in the session's time zone;
+  `TZH` and `TZM` in a format write the offset as Snowflake does; and
+  `ALTER SESSION` accepts the output format parameters at their defaults
+  and refuses others. Profiling four columns of 37 million rows takes 12%
+  longer.
 - In Snowflake's dialect, `/` gave DuckDB's `DOUBLE` quotient, where
   Snowflake divides two `NUMBER`s into a `NUMBER` of the dividend's scale
   plus 6 digits (at least 6, at most 12), rounded half away from zero:
@@ -1565,15 +1566,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and `DIV0NULL` still give 0.
 - In Snowflake's dialect, `APPROX_COUNT_DISTINCT` and `HLL` were DuckDB's
   `approx_count_distinct`, a HyperLogLog of 64 registers that errs by about
-  13% and by over 50% at worst. On an Acme table of 1.25 million rows it
+  13% and by over 50% at worst. On a table of 1.25 million rows it
   counted 1,336 values where there were 1,099 and Snowflake counted 1,102,
-  and Acme decides from these counts which columns are categories. They
-  now count with DataSketches' HyperLogLog of 4,096 registers, as many as
-  Snowflake's, within about 1.6%, and exactly up to about 300 values,
-  as fast as before. In a select with `GROUP BY` and as window functions
-  they count exactly, since a sketch per group is 25 times slower than
-  `COUNT(DISTINCT)` with millions of groups; with a few hundred groups
-  that takes up to three times as long as before.
+  and tools that decide from these counts which columns are categories
+  got it wrong. They now count with DataSketches' HyperLogLog of 4,096
+  registers, as many as Snowflake's, within about 1.6%, and exactly up to
+  about 300 values, as fast as before. In a select with `GROUP BY` and as
+  window functions they count exactly, since a sketch per group is 25
+  times slower than `COUNT(DISTINCT)` with millions of groups; with a few
+  hundred groups that takes up to three times as long as before.
 - A table whose name the catalog spells with capitals, such as one copied
   from Snowflake as `ORDERS`, was listed in whatever case a statement or
   view had last named it in: once a view read it as `orders`, every replica

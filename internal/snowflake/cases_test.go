@@ -222,7 +222,7 @@ var snowflakeCases = []runCase{
 
 	// TO_VARCHAR without a format, in Snowflake's default output formats.
 	// A FLOAT has up to 12 significant digits: 999.889980465 and 9244 are
-	// what Snowflake returned for Acme's columns (October 21, 2026), where
+	// what Snowflake returned for two columns (October 21, 2026), where
 	// DuckDB would print 999.8899804651736 and 9244.0.
 	{name: "to_varchar floats", sql: `select to_varchar(999.8899804651736::float), to_varchar(9244::float), to_varchar(1::float / 3), to_char(1e20::float), to_varchar('nan'::float), to_varchar('-inf'::float), to_varchar(1e3), (-0.0001234)::float::varchar, to_varchar(123456789012::float), to_varchar(1234567890123::float)`,
 		want: []string{"999.889980465|9244|0.333333333333|1e+20|NaN|-inf|1000|-0.0001234|123456789012|1.23456789012e+12"}},

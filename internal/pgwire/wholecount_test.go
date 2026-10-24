@@ -162,7 +162,7 @@ func TestWholeCounts(t *testing.T) {
 			t.Errorf("rewritten: %s\n  -> %s", q, got)
 		}
 	}
-	// The statement Acme previews a table with, in DuckDB's dialect.
+	// A table preview as BI tools write it, in DuckDB's dialect.
 	preview := `SELECT * FROM (SELECT *, COUNT(*) OVER () AS "_PREVIEW_ROW_TOTAL" FROM t) TABLESAMPLE reservoir(50 ROWS)`
 	want := `SELECT * FROM (SELECT *, (SELECT count(*) FROM t` + "\n" + `) AS "_PREVIEW_ROW_TOTAL" FROM t) TABLESAMPLE reservoir(50 ROWS)`
 	if got := wholeCounts(preview, parse); got != want {
@@ -170,7 +170,7 @@ func TestWholeCounts(t *testing.T) {
 	}
 }
 
-// TestWholeCountsThroughSessions runs Acme's table preview in both
+// TestWholeCountsThroughSessions runs such a table preview in both
 // dialects, and a whole count of a table with a row access policy, which
 // must count only the rows the user sees.
 func TestWholeCountsThroughSessions(t *testing.T) {

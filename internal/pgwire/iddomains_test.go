@@ -21,10 +21,10 @@ func TestParseDomainCommand(t *testing.T) {
 		"CREATE ID DOMAIN People (VARCHAR)": {kind: dcCreate, name: "people", typ: "varchar"},
 		"create id domain if not exists people (uuid) tag pii = 'person_id', src = 'crm' comment = 'who';": {kind: dcCreate, name: "people", typ: "uuid",
 			ifNotExists: true, tags: map[string]string{"pii": "person_id", "src": "crm"}, comment: "who"},
-		"DROP ID DOMAIN IF EXISTS people":                              {kind: dcDrop, name: "people", ifExists: true},
-		"SHOW ID DOMAINS":                                              {kind: dcShow},
+		"DROP ID DOMAIN IF EXISTS people":                               {kind: dcDrop, name: "people", ifExists: true},
+		"SHOW ID DOMAINS":                                               {kind: dcShow},
 		"ALTER TABLE s.t ALTER COLUMN person_id SET ID DOMAIN people":   {kind: dcSet, table: []string{"s", "t"}, column: "person_id", name: "people"},
-		"alter table if exists t modify \"Id\" unset id domain":        {kind: dcUnset, table: []string{"t"}, column: "Id", ifExists: true},
+		"alter table if exists t modify \"Id\" unset id domain":         {kind: dcUnset, table: []string{"t"}, column: "Id", ifExists: true},
 		"ALTER TABLE lake.s.t ALTER person_id SET ID DOMAIN people   ;": {kind: dcSet, table: []string{"lake", "s", "t"}, column: "person_id", name: "people"},
 	} {
 		got, ok, err := parseDomainCommand(q)
@@ -232,13 +232,13 @@ func TestIDDomains(t *testing.T) {
 			}
 		}
 	}
-	for _, q := range []string{
-		"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'people'",
-		"SELECT string_agg(column_name, ',' ORDER BY column_name) FROM igloo.columns WHERE table_schema = 'public' AND table_name = 'people'",
-		"SELECT string_agg(DISTINCT attname, ',' ORDER BY attname) FROM pg_attribute WHERE attname IN ('person_id', 'n') OR attname LIKE '%igloo%'",
+	for q, want := range map[string]string{
+		"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'people'": "person_id,n",
+		"SELECT string_agg(column_name, ',' ORDER BY column_name) FROM igloo.columns WHERE table_schema = 'public' AND table_name = 'people'":                   "n,person_id",
+		"SELECT string_agg(DISTINCT attname, ',' ORDER BY attname) FROM pg_attribute WHERE attname IN ('person_id', 'n') OR attname LIKE '%igloo%'":             "n,person_id",
 	} {
-		if got := texts(t, rita, q); len(got) != 1 || got[0] != "person_id,n" {
-			t.Errorf("%s: %q", q, got)
+		if got := texts(t, rita, q); len(got) != 1 || got[0] != want {
+			t.Errorf("%s: %q, want %q", q, got, want)
 		}
 	}
 	// Its files hold the ids, so Delta Sharing refuses it, and Igloo's

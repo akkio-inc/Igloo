@@ -17,14 +17,14 @@ func TestRewriteMemberWrite(t *testing.T) {
 	members := []iddomain.Member{{Domain: "people", Schema: "public", Table: "t", Column: "person_id"}}
 	visible := []string{"person_id", "n"}
 	for q, want := range map[string]string{
-		"INSERT INTO t VALUES ('a', 1)":                                   `INSERT INTO t ("person_id", "n") VALUES ('a', 1)`,
-		"insert into lake.public.t select * from s":                       `insert into lake.public.t ("person_id", "n") select * from s`,
-		"INSERT INTO t BY POSITION SELECT 'a', 1":                         `INSERT INTO t ("person_id", "n") SELECT 'a', 1`,
-		"INSERT INTO t (n) VALUES (1)":                                    "INSERT INTO t (n) VALUES (1)",
-		"INSERT INTO t BY NAME SELECT 1 AS n":                             "INSERT INTO t BY NAME SELECT 1 AS n",
-		"INSERT INTO t DEFAULT VALUES":                                    "INSERT INTO t DEFAULT VALUES",
-		"WITH s AS (SELECT 1) INSERT INTO t SELECT * FROM s":              `WITH s AS (SELECT 1) INSERT INTO t ("person_id", "n") SELECT * FROM s`,
-		"UPDATE t SET n = 2":                                              "UPDATE t SET n = 2",
+		"INSERT INTO t VALUES ('a', 1)":                                    `INSERT INTO t ("person_id", "n") VALUES ('a', 1)`,
+		"insert into lake.public.t select * from s":                        `insert into lake.public.t ("person_id", "n") select * from s`,
+		"INSERT INTO t BY POSITION SELECT 'a', 1":                          `INSERT INTO t ("person_id", "n") SELECT 'a', 1`,
+		"INSERT INTO t (n) VALUES (1)":                                     "INSERT INTO t (n) VALUES (1)",
+		"INSERT INTO t BY NAME SELECT 1 AS n":                              "INSERT INTO t BY NAME SELECT 1 AS n",
+		"INSERT INTO t DEFAULT VALUES":                                     "INSERT INTO t DEFAULT VALUES",
+		"WITH s AS (SELECT 1) INSERT INTO t SELECT * FROM s":               `WITH s AS (SELECT 1) INSERT INTO t ("person_id", "n") SELECT * FROM s`,
+		"UPDATE t SET n = 2":                                               "UPDATE t SET n = 2",
 		"UPDATE t SET person_id = 'b' WHERE n = 1":                         "UPDATE t SET person_id = 'b' \n, \"_igloo_id_person_id\" = NULL WHERE n = 1",
 		"UPDATE t AS x SET \"PERSON_ID\" = 'b';":                           "UPDATE t AS x SET \"PERSON_ID\" = 'b'\n, \"_igloo_id_person_id\" = NULL ;",
 		"UPDATE t x SET x.person_id = 'b' -- why":                          "UPDATE t x SET x.person_id = 'b' -- why\n, \"_igloo_id_person_id\" = NULL ",

@@ -15,7 +15,7 @@ import (
 
 // The report API's tests, and its parity harness: each spec's result is
 // compared, through igloo.audience_profile_check, with SQL written the way
-// Acme's reports count, independently of the API's own SQL.
+// audience reports count, independently of the API's own SQL.
 
 var reportFixture = []string{
 	"CREATE TABLE lake.public.audience_members AS SELECT 'p' || (i * 7 % 97) AS person_id, CASE WHEN i % 3 = 0 THEN 'a1' ELSE 'a2' END AS audience_id, CAST(1 + i % 2 AS INTEGER) AS ver FROM range(400) r(i)",

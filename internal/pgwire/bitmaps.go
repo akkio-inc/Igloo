@@ -13,7 +13,7 @@ import (
 // Counting distinct IDs in roaring bitmaps. The rb extension counts
 // count(DISTINCT x) of a 32-bit unsigned x into a bitmap per group, a few
 // bytes an ID, where DuckDB's hash keeps every (group, value) pair: on
-// Acme's heaviest reports, where the hash spilled tens of gigabytes or ran
+// the heaviest audience reports measured, where the hash spilled tens of gigabytes or ran
 // out of temporary space, bitmaps took a third to a fifth of the time with
 // no spill. Where the hash fits in memory it stays a little faster, so
 // Igloo picks the statements, as DuckDB cannot: its estimates of the rows
@@ -24,7 +24,7 @@ import (
 // UINTEGER)), and it reads at least Options.BitmapMinRows rows (10 million
 // by default): the rows, as the catalog's metadata has them, of the
 // catalog tables it reads, views expanded. A join or an unnest multiplies
-// them before they reach a count (Acme's reports read 39 and 192 million
+// them before they reach a count (the reports measured read 39 and 192 million
 // rows and counted up to 94 and 251 million), and a filter cuts them, so
 // they say how large a statement is, not what one count takes. That is
 // enough: on every report measured, bitmaps took a third to a fifth of the

@@ -17,7 +17,7 @@ func TestOutputInSessionTimeZone(t *testing.T) {
 	const at = `'2026-10-07 15:58:37.862 +00:00'::timestamp_ltz`
 	for _, c := range []runCase{
 		{sql: `alter session set timezone = 'America/Los_Angeles'`},
-		// What Snowflake returned for Acme's column, in its default time zone.
+		// What Snowflake returned for such a column, in its default time zone.
 		{name: "los angeles", sql: `select to_varchar(` + at + `), to_varchar('2026-01-07 15:58:37.862 +00:00'::timestamp_ltz), to_char(` + at + `, 'HH24:MI TZH:TZM'), ` + at + `::string`,
 			want: []string{"2026-10-07 08:58:37.862 -0700|2026-01-07 07:58:37.862 -0800|08:58 -07:00|2026-10-07 08:58:37.862 -0700"}},
 		{sql: `alter session set timezone = 'Asia/Kolkata'`},
@@ -35,7 +35,7 @@ func TestOutputInSessionTimeZone(t *testing.T) {
 
 // TestApproxCountDistinctSketches counts with the datasketches extension,
 // as Igloo's sessions do (Options.Sketches), columns of the cardinalities
-// of an Acme table whose distinct values Snowflake's
+// of a real table whose distinct values Snowflake's
 // APPROX_COUNT_DISTINCT counted within 0.3% to 1.9% and DuckDB's
 // approx_count_distinct within 1.1% to 21.6%.
 func TestApproxCountDistinctSketches(t *testing.T) {

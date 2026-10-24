@@ -8,7 +8,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
-// Whole counts and other whole aggregates. A table preview such as Acme's
+// Whole counts and other whole aggregates. A table preview such as
 //
 //	SELECT * FROM (SELECT *, COUNT(*) OVER () AS total FROM t) SAMPLE (50 ROWS)
 //

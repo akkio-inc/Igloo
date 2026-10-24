@@ -293,11 +293,11 @@ func TestBitmapIndexes(t *testing.T) {
 	mustExec(t, it.admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
 	rita := connect(t, it.r.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)
 	for q, code := range map[string]string{
-		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (day) FOR segment_name":  "55000",
-		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (nope) FOR person_id":     "42703",
-		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (day, day) FOR person_id": "22023",
+		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (day) FOR segment_name":    "55000",
+		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (nope) FOR person_id":      "42703",
+		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (day, day) FOR person_id":  "22023",
 		"ALTER TABLE lake.public.segments ADD BITMAP INDEX by_day ON (person_id) FOR person_id": "22023",
-		"ALTER TABLE lake.public.nope ADD BITMAP INDEX by_day ON (day) FOR person_id":          "42P01",
+		"ALTER TABLE lake.public.nope ADD BITMAP INDEX by_day ON (day) FOR person_id":           "42P01",
 	} {
 		if _, err := it.admin.Exec(ctx, q); pgCode(err) != code {
 			t.Errorf("%s: %v, want %s", q, err, code)
