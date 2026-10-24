@@ -40,6 +40,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -138,6 +139,11 @@ type Options struct {
 	// Policies keeps masking policies, row access policies and tags. Nil
 	// means a store in memory.
 	Policies policy.Store
+	// IDDomains keeps ID domains and their members (package iddomain). Nil
+	// means a store in memory.
+	IDDomains iddomain.Store
+	// IDDomainsOn is IGLOO_ID_DOMAINS: columns may join ID domains.
+	IDDomainsOn bool
 	// AllowedLocations are where users other than admins may read files
 	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
 	// Warehouse is the warehouse's location, whose files they may not.
@@ -255,10 +261,13 @@ type Server struct {
 	// clonePurge is Options.ClonePurge (see catalogguard.go).
 	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
-	gov      *governance
-	settings auth.SettingStore
-	workload *workload.Controller
-	pool     string
+	gov *governance
+	// idDomains keeps ID domains; idDomainsOn lets columns join them.
+	idDomains   iddomain.Store
+	idDomainsOn bool
+	settings    auth.SettingStore
+	workload    *workload.Controller
+	pool        string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -419,6 +428,10 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	policies := opts.Policies
 	if policies == nil {
 		policies = policy.NewMemoryStore()
+	}
+	s.idDomains, s.idDomainsOn = opts.IDDomains, opts.IDDomainsOn
+	if s.idDomains == nil {
+		s.idDomains = iddomain.NewMemoryStore()
 	}
 	externalFiles := opts.externalFiles
 	if opts.Sharing != nil {
@@ -1198,6 +1211,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 	}
 
 	if ps, ok, err := s.sortStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
+	if ps, ok, err := s.domainStatement(sess, q); ok || err != nil {
 		return ps, err
 	}
 

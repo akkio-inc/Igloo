@@ -88,7 +88,7 @@ type viewReplica struct {
 	eng     *engine.Engine
 }
 
-func (vc *viewCatalog) replica(t *testing.T) *viewReplica {
+func (vc *viewCatalog) replica(t *testing.T, configure ...func(*Options)) *viewReplica {
 	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.DiscardHandler)
@@ -108,7 +108,8 @@ func (vc *viewCatalog) replica(t *testing.T) *viewReplica {
 		_ = eng.Close()
 		t.Fatal(err)
 	}
-	r := &viewReplica{testServer: startServerOn(t, eng, func(o *Options) { o.DDL = objects }), objects: objects, eng: eng}
+	r := &viewReplica{testServer: startServerOn(t, eng, append([]func(*Options){func(o *Options) { o.DDL = objects }}, configure...)...),
+		objects: objects, eng: eng}
 	t.Cleanup(func() { _ = objects.Close() })
 	mustExec(t, r.admin(t, pgx.QueryExecModeSimpleProtocol), "CREATE USER walt WITH PASSWORD 'walt-password' ROLE writer")
 	return r

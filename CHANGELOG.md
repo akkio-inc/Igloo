@@ -90,6 +90,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Java's Iceberg does: iceberg-go dropped every one older than the snapshot
   retention, seven days by default, a clone's too. A max-ref-age-ms of
   Java's `Long.MAX_VALUE` reads as forever.
+- ID domains, off by default (`IGLOO_ID_DOMAINS`): `CREATE ID DOMAIN people
+  (VARCHAR) TAG pii = 'person_id'` makes a dictionary that gives the values
+  of identifier columns, across tables, dense integer ids below 2^32 that
+  are never handed out twice, and `ALTER TABLE ... ALTER COLUMN c SET ID
+  DOMAIN people` makes a column, which must carry the domain's tags, a
+  member, with a `_igloo_id_c` column beside it for its ids. Counting
+  distinct people over integers, and keeping sets of them as bitmaps, is
+  what the heaviest audience reports spend their time on; the work that
+  fills the ids and counts through them follows.
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

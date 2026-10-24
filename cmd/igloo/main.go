@@ -45,6 +45,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/flightsql"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/notify"
@@ -214,6 +215,11 @@ func serve() error {
 		return err
 	}
 	defer policies.Close()
+	domains, err := openIDDomains(startCtx, cfg, log)
+	if err != nil {
+		return err
+	}
+	defer domains.Close()
 	var historyStore audit.Store
 	if cfg.Audit.Enabled {
 		if historyStore, err = openHistory(startCtx, cfg, log); err != nil {
@@ -398,6 +404,8 @@ func serve() error {
 		DisableSSOPasswords: single != nil && !cfg.OIDC.PasswordSignIn,
 		TokenMaxLifetime:    cfg.TokenMaxLifetime,
 		Policies:            policies,
+		IDDomains:           domains,
+		IDDomainsOn:         cfg.IDDomains,
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,
@@ -802,6 +810,23 @@ func openPolicies(ctx context.Context, cfg config.Config, log *slog.Logger) (pol
 	store, err := policy.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("policies: %w", err)
+	}
+	return store, nil
+}
+
+// openIDDomains opens where ID domains and their members are kept, with
+// their id counters: the metadata database, shared by every replica, or
+// else this replica's memory.
+func openIDDomains(ctx context.Context, cfg config.Config, log *slog.Logger) (iddomain.Store, error) {
+	if cfg.MetadataDatabaseURL == "" {
+		if cfg.IDDomains {
+			log.Warn("IGLOO_METADATA_DATABASE_URL is not set; ID domains are kept in memory and lost on restart")
+		}
+		return iddomain.NewMemoryStore(), nil
+	}
+	store, err := iddomain.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("ID domains: %w", err)
 	}
 	return store, nil
 }

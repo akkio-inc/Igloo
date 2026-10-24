@@ -53,6 +53,10 @@ type Config struct {
 	// MetadataDatabaseURL is the Postgres database that stores users. Empty
 	// means the administrator is the only account.
 	MetadataDatabaseURL string
+	// IDDomains turns on ID domains' work (IGLOO_ID_DOMAINS, off by
+	// default): columns joining domains, filling the columns that hold
+	// their ids, and statements counting through them.
+	IDDomains bool
 	// ConnectionSecretsDir holds files with the passwords of connections to
 	// other databases, which a connection names with password_secret.
 	// Empty means connections store their passwords.
@@ -482,6 +486,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		*dst = v
 	}
+
+	idDomains, err := strconv.ParseBool(get("IGLOO_ID_DOMAINS", "false"))
+	if err != nil {
+		addErr("IGLOO_ID_DOMAINS must be true or false: %w", err)
+	}
+	cfg.IDDomains = idDomains
 
 	setup, err := strconv.ParseBool(get("IGLOO_CATALOG_SETUP", "true"))
 	if err != nil {

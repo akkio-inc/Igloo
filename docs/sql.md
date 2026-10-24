@@ -391,6 +391,44 @@ SELECT * FROM igloo.policy_references;
 [Masking, row access policies and tags](security-policies.md) describes every
 statement, how policies apply and what they refuse.
 
+## ID domains
+
+An ID domain gives the values of identifier columns, in every table that
+holds them, dense integer ids from 0: one id per person, say, across the
+tables of attributes, segments and events. Counting distinct people over
+these ids, and keeping sets of them as bitmaps, costs far less than over
+text identifiers. Admins create a domain with the type of its values and the
+tags its identifiers carry, and make columns its members:
+
+```sql
+CREATE TAG pii;
+CREATE ID DOMAIN people (VARCHAR) TAG pii = 'person_id' COMMENT = 'one id a person';
+ALTER TABLE crm.contacts ALTER COLUMN person_id SET TAG pii = 'person_id';
+ALTER TABLE crm.contacts ALTER COLUMN person_id SET ID DOMAIN people;
+SHOW ID DOMAINS;
+
+ALTER TABLE crm.contacts ALTER COLUMN person_id UNSET ID DOMAIN;
+DROP ID DOMAIN people;
+```
+
+- A domain's values are `VARCHAR`, `UUID`, `BIGINT` or `INTEGER`. Its
+  dictionary, the values and their ids, is the table
+  `igloo_domains.<domain>` of the catalog, whose `value` column carries the
+  domain's tags, so that an [erasure request](privacy.md) finds the
+  dictionary as it finds the tables.
+- A member column must have the domain's type and carry its tags. `SET ID
+  DOMAIN` adds the column `_igloo_id_<column>` (`BIGINT`) beside it and
+  records the membership in the table property
+  `igloo.id-domain.<column>`; other Iceberg engines see that column as a
+  nullable `BIGINT` that Igloo fills and they should not write. `UNSET ID
+  DOMAIN` drops it again. Like policies, memberships stay with a table's
+  name when it is dropped or replaced.
+- Ids are never handed out twice and stay below 2^32, the range of a 32-bit
+  bitmap. A domain that has handed out all of them hands out no more, and
+  the ids of values it has not seen stay `NULL`.
+- Columns join domains only with `IGLOO_ID_DOMAINS=true`, which is off by
+  default. Only admins change domains; anyone may list them.
+
 ## Erasure and data retention
 
 [Erasure requests](privacy.md) delete a person's data from every table
