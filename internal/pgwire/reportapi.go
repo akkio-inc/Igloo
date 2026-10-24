@@ -162,7 +162,16 @@ func (s *Server) expandReportCalls(ctx context.Context, sess *session, text stri
 // bitmap indexes where they can (reportindex.go), else from the tables,
 // through ids where it may (reportids.go); and what it pinned.
 func (s *Server) reportStatement(ctx context.Context, sess *session, spec *reportSpec, probe bool) (string, []indexPin, []idPin) {
-	if plan := s.reportIndexes(ctx, sess, spec); plan != nil {
+	plan := s.reportIndexes(ctx, sess, spec)
+	if plan != nil && plan.hybrid && !probe {
+		// Its cohorts' bitmaps first, into the session's variables; from the
+		// tables if they do not fit.
+		if err := s.hybridBitmaps(ctx, sess, spec, plan); err != nil {
+			s.log.Debug("report call counted from the tables", "reason", err)
+			plan = nil
+		}
+	}
+	if plan != nil {
 		if !probe {
 			s.reportFromIndexes.Add(1)
 		}

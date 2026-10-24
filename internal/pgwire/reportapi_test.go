@@ -540,11 +540,33 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	it.exec("ALTER TABLE lake.public.plays ADD BITMAP INDEX plays_genre ON (genre) FOR person_id",
 		"ALTER TABLE lake.public.plays ADD BITMAP INDEX plays_all ON () FOR person_id")
 	srv.waitIndexBuilds(t)
-	answered("plays, with metrics and the extent", map[string]any{"version": 1, "cohorts": cohorts, "totals": true, "extent": "day",
+	plays := map[string]any{"version": 1, "cohorts": cohorts, "totals": true, "extent": "day",
 		"source": map[string]any{"table": "plays", "member": "person_id"},
 		"dimensions": []any{map[string]any{"name": "GENRE", "column": "genre", "skip_blank": true},
 			map[string]any{"name": "REACH", "constant": "ANY_PLAY", "metric": "seconds"}},
-		"metrics": []any{map[string]any{"name": "seconds", "column": "seconds", "coalesce": 0}, map[string]any{"name": "days", "distinct_with": "day"}}}, "index+scan")
+		"metrics": []any{map[string]any{"name": "seconds", "column": "seconds", "coalesce": 0}, map[string]any{"name": "days", "distinct_with": "day"}}}
+	answered("plays, with metrics and the extent", plays, "index+scan")
+	// The scan's cohorts' bitmaps reach it in the session's variables,
+	// which no client's statement may name, and which go once it has run.
+	var left int64
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM duckdb_variables() WHERE starts_with(name, '__igloo_' || 'bitmap')").Scan(&left); err != nil || left != 0 {
+		t.Errorf("bitmap variables once the calls ran: %d, %v", left, err)
+	}
+	if _, err := conn.Exec(ctx, "SELECT getvariable('__igloo_bitmap_000000000000000000000000')"); pgCode(err) != "42501" {
+		t.Errorf("a client's statement that names a bitmap variable: %v, want 42501", err)
+	}
+	// A prepared call runs with the version its cohort's latest_from has
+	// when it runs.
+	cachedPlays := it.r.admin(t, pgx.QueryExecModeCacheStatement)
+	mustExec(t, cachedPlays, "SET search_path = 'lake.public'")
+	playsCall := "SELECT * EXCLUDE (path) FROM igloo.audience_profile(" + specLiteral(t, plays) + ") ORDER BY ALL"
+	first := texts(t, cachedPlays, playsCall)
+	it.exec("INSERT INTO lake.public.audience_revisions VALUES ('a1', 3)")
+	again := texts(t, cachedPlays, playsCall)
+	playsSQL := texts(t, conn, "SELECT igloo.audience_profile_sql("+specLiteral(t, plays)+")")
+	if want := texts(t, conn, "SELECT * EXCLUDE (path) FROM ("+playsSQL[0]+") ORDER BY ALL"); slices.Equal(first, again) || !slices.Equal(again, want) {
+		t.Errorf("a prepared hybrid call once its audience has a new version: rows\n%q\nbefore\n%q\nwant\n%q", again, first, want)
+	}
 	// A condition on a metric, which bitmaps cannot keep: the tables.
 	answered("plays, with a metric's condition", map[string]any{"version": 1, "cohorts": cohorts,
 		"source":     map[string]any{"table": "plays", "member": "person_id"},

@@ -611,6 +611,9 @@ type session struct {
 	// noIndexes keeps the statement being prepared from reading bitmap
 	// indexes (see rerunWithoutIndexes).
 	noIndexes bool
+	// bitmapVars are the variables that hold the bitmaps of the statements
+	// Igloo wrote (see hybridBitmaps), by name.
+	bitmapVars map[string]*bitmapVar
 	// bitmapsRestore sets rb_count_distinct back after the statement
 	// running with it on (see setBitmaps); nil otherwise.
 	bitmapsRestore func()
@@ -1383,7 +1386,14 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				sess.bitmapsRestore = nil
 			}
 		}()
+		// One Igloo wrote to read bitmaps from the session's variables has
+		// them set again for its run, which drops them after (see
+		// hybridBitmaps).
+		defer sess.resetBitmapVariables(ctx)
 		err = sess.checkAborted(st.query)
+		if err == nil {
+			err = sess.ensureBitmapVariables(ctx, st.query)
+		}
 		if err == nil {
 			// Rechecking re-plans with EXPLAIN and may re-apply policies,
 			// both of which read and fill in the catalog's set; release

@@ -2,7 +2,10 @@ package pgwire
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -45,9 +48,10 @@ import (
 // source, at the snapshot the bitmaps are of, that keeps the rows of each
 // cohort's members by its bitmap (rb_contains) instead of joining the
 // cohorts, and counts rows and sums by value with no distinct members
-// (path 'index+scan'). The planner computes the cohorts' bitmaps on the
-// coordinator and gives workers the values (see distributed's computed
-// values).
+// (path 'index+scan'). The scan reads the cohorts' bitmaps from the
+// session's variables, which Igloo computes first (see hybridBitmaps), and
+// so runs on this replica, as the planner keeps what reads the session's
+// variables.
 
 // reportIndexPlan is how a call reads bitmap indexes: an index for each
 // cohort and each dimension, and, for a hybrid, the source to scan.
@@ -62,6 +66,17 @@ type reportIndexPlan struct {
 	// for the rows and metrics.
 	hybrid bool
 	source reportIDTable
+	// bitmaps are a hybrid's cohorts' bitmaps, in the session's variables,
+	// once hybridBitmaps computed them.
+	bitmaps []hybridBitmap
+}
+
+// hybridBitmap is a hybrid cohort's bitmap, held in variable name; latest
+// is the version of the cohort's latest_from it is of, as text, and null
+// says the latest_from found none (both unset for a cohort without one).
+type hybridBitmap struct {
+	name, latest string
+	null         bool
 }
 
 // reportIndexes returns how spec's call reads bitmap indexes, or nil when
@@ -191,6 +206,23 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 	if m == nil {
 		return nil
 	}
+	// A hybrid's cohorts' bitmaps are computed first (hybridBitmaps), a
+	// latest_from's version too, which must then read as the statement
+	// would: a table with no row access policy, clean room or masking
+	// policy.
+	gov := s.gov.snapshot(ctx)
+	for _, c := range spec.Cohorts {
+		if c.Version == nil || c.Version.LatestFrom == nil {
+			continue
+		}
+		res, err := r.resolve(tableRef{parts: strings.Split(c.Version.LatestFrom.Table, ".")}, nil)
+		if err != nil || len(res.first) != 1 || len(res.all) != 1 {
+			return nil
+		}
+		if o := res.first[0]; o.view || o.external || !strings.EqualFold(o.db, s.catalogName()) || gov.Rules(o.schema, o.name) != nil {
+			return nil
+		}
+	}
 	plan.hybrid = true
 	plan.source = reportIDTable{from: quoteName([]string{base.db, base.schema, base.name}), hidden: quoteIdent(iddomain.HiddenColumn(m.Column)),
 		at: plan.dims[0].snapshot}
@@ -215,6 +247,12 @@ func (s *Server) indexFrom(plan *reportIndexPlan, u indexUse, alias string) stri
 // cohortBitmap is the SELECT of cohort i's bitmap: the union of its index's
 // bitmaps under its conditions.
 func (s *Server) cohortBitmap(spec *reportSpec, plan *reportIndexPlan, i int) string {
+	return s.cohortBitmapOf(spec, plan, i, nil)
+}
+
+// cohortBitmapOf is cohortBitmap, with the version of the cohort's
+// latest_from given (b.latest) when b is not nil.
+func (s *Server) cohortBitmapOf(spec *reportSpec, plan *reportIndexPlan, i int, b *hybridBitmap) string {
 	c, u := spec.Cohorts[i], plan.cohorts[i]
 	conds := []string{indexRows("x", u)}
 	if w := c.Where.sql("x"); w != "" {
@@ -225,15 +263,110 @@ func (s *Server) cohortBitmap(spec *reportSpec, plan *reportIndexPlan, i int) st
 		if v.Equals != nil {
 			l, _ := sqlLiteral(v.Equals)
 			conds = append(conds, "("+col+" = "+l+")")
-		} else {
-			sub := "SELECT max(v." + quoteIdent(v.Column) + ") FROM " + tableName(v.LatestFrom.Table) + " AS v"
-			if w := v.LatestFrom.Where.sql("v"); w != "" {
-				sub += " WHERE " + w
+		} else if b != nil {
+			if b.null {
+				conds = append(conds, "false")
+			} else {
+				conds = append(conds, "("+col+" = "+quoteLiteral(b.latest)+")")
 			}
-			conds = append(conds, "("+col+" = ("+sub+"))")
+		} else {
+			conds = append(conds, "("+col+" = ("+latestOf(v)+"))")
 		}
 	}
 	return "SELECT rb_or_agg(x.bm) AS bm FROM " + s.indexFrom(plan, u, "x") + " WHERE " + strings.Join(conds, " AND ")
+}
+
+// latestOf is the SELECT of a version's latest_from.
+func latestOf(v *reportVersion) string {
+	sub := "SELECT max(v." + quoteIdent(v.Column) + ") FROM " + tableName(v.LatestFrom.Table) + " AS v"
+	if w := v.LatestFrom.Where.sql("v"); w != "" {
+		sub += " WHERE " + w
+	}
+	return sub
+}
+
+// bitmapVarPrefix starts the names of the session's variables that hold
+// the bitmaps of the statements Igloo writes (see hybridBitmaps). No
+// client's statement may name them (indexReferences).
+const bitmapVarPrefix = "__igloo_bitmap_"
+
+// bitmapVarName matches the names of those variables.
+var bitmapVarName = regexp.MustCompile(bitmapVarPrefix + `[0-9a-f]{24}`)
+
+// hybridBitmaps computes a hybrid's cohorts' bitmaps into the session's
+// variables, which its statement reads (bitmapOf). Its scan tests each row
+// against them, and DuckDB hands a scalar subquery's value to each chunk
+// as a copy of it: a cohort's bitmap of tens of megabytes, copied for each
+// of a billion rows' chunks, costs far more than the scan. A variable's
+// value DuckDB knows when it binds the statement, and rb_contains reads it
+// once, then. A cohort's latest_from is read first, for its version:
+// the statement reads it again and fails if it changed meanwhile. The
+// variables are of the snapshots the statement pins, and named by what
+// they hold (by their SELECT), so that whatever sets one again, sets it
+// to the same bitmap; the session sets them again before the statement
+// runs, and drops them after (see ensureBitmapVariables).
+func (s *Server) hybridBitmaps(ctx context.Context, sess *session, spec *reportSpec, plan *reportIndexPlan) error {
+	plan.bitmaps = nil
+	for i, c := range spec.Cohorts {
+		var b hybridBitmap
+		if v := c.Version; v != nil && v.LatestFrom != nil {
+			rows, err := queryRows(ctx, sess.conn, "SELECT CAST(("+latestOf(v)+") AS VARCHAR)")
+			if err != nil {
+				return err
+			}
+			if len(rows) != 1 || len(rows[0]) != 1 {
+				return fmt.Errorf("the latest version of cohort %s came back as %d rows", c.Label, len(rows))
+			}
+			switch x := rows[0][0].(type) {
+			case nil:
+				b.null = true
+			case string:
+				b.latest = x
+			default:
+				return fmt.Errorf("the latest version of cohort %s came back as %T", c.Label, x)
+			}
+		}
+		query := s.cohortBitmapOf(spec, plan, i, &b)
+		sum := sha256.Sum256([]byte(query))
+		b.name = bitmapVarPrefix + hex.EncodeToString(sum[:12])
+		if err := sess.setBitmapVariable(ctx, b.name, query); err != nil {
+			return err
+		}
+		plan.bitmaps = append(plan.bitmaps, b)
+	}
+	return nil
+}
+
+// bitmapOf is the bitmap of a hybrid's cohort i as its statement reads
+// it: from its variable, once hybridBitmaps computed them, or else (a
+// probe) its SELECT. A variable that is not there gives a BLOB that is not
+// a bitmap, which rb_contains refuses, rather than NULL, which it takes
+// for no members.
+func (s *Server) bitmapOf(spec *reportSpec, plan *reportIndexPlan, i int) string {
+	if i >= len(plan.bitmaps) {
+		return "(" + s.cohortBitmap(spec, plan, i) + ")"
+	}
+	return "coalesce(getvariable(" + quoteLiteral(plan.bitmaps[i].name) + "), CAST('igloo: this statement''s bitmap is gone' AS BLOB))"
+}
+
+// cohortOf is the SELECT of a hybrid's cohort i's bitmap for its people:
+// its variable, under the condition that its latest_from still reads as it
+// did.
+func (s *Server) cohortOf(spec *reportSpec, plan *reportIndexPlan, i int) string {
+	if i >= len(plan.bitmaps) {
+		return s.cohortBitmap(spec, plan, i)
+	}
+	b, bm := plan.bitmaps[i], s.bitmapOf(spec, plan, i)
+	v := spec.Cohorts[i].Version
+	if v == nil || v.LatestFrom == nil {
+		return "SELECT " + bm + " AS bm"
+	}
+	same := "(" + latestOf(v) + ") IS NULL"
+	if !b.null {
+		same = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
+	}
+	return "SELECT CASE WHEN " + same + " THEN " + bm + " ELSE error(" +
+		quoteLiteral("igloo: the latest version of cohort "+spec.Cohorts[i].Label+" changed while the statement ran; run it again") + ") END AS bm"
 }
 
 // reportIndexSQL returns the statement spec stands for, read from the
@@ -244,7 +377,7 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 	var labels []string
 	for i, c := range spec.Cohorts {
 		name := cte("cohort_" + strconv.Itoa(i+1))
-		b.WriteString(name + " AS (" + s.cohortBitmap(spec, plan, i) + "),\n")
+		b.WriteString(name + " AS (" + s.cohortOf(spec, plan, i) + "),\n")
 		labels = append(labels, "SELECT "+quoteLiteral(c.Label)+" AS cohort, bm FROM "+name)
 	}
 	b.WriteString(cte("cohorts") + " AS (" + strings.Join(labels, " UNION ALL ") + "),\n")
@@ -321,7 +454,7 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 	member := "CAST(s." + src.hidden + " AS UINTEGER)"
 	var tests []string
 	for i, c := range spec.Cohorts {
-		tests = append(tests, "CASE WHEN rb_contains(("+s.cohortBitmap(spec, plan, i)+"), "+member+") THEN "+quoteLiteral(c.Label)+" END")
+		tests = append(tests, "CASE WHEN rb_contains("+s.bitmapOf(spec, plan, i)+", "+member+") THEN "+quoteLiteral(c.Label)+" END")
 	}
 	b.WriteString(", " + cte("members") + " AS (SELECT s.*, " + member + " AS __igloo_member, unnest(list_filter([" + strings.Join(tests, ", ") +
 		"], lambda c: c IS NOT NULL)) AS __igloo_cohort FROM " + src.from + " AS s AT (VERSION => " + strconv.FormatInt(src.at, 10) + ")")
@@ -354,4 +487,73 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
 	}
 	b.WriteString(" WHERE n.everything = 0 AND n.\"rows\" > 0")
+}
+
+// bitmapVar is a session's variable that holds a bitmap of a statement
+// Igloo wrote (see hybridBitmaps): its SELECT, and whether it is set now.
+type bitmapVar struct {
+	query string
+	set   bool
+}
+
+// maxBitmapVars bounds the SELECTs of variables a session keeps to set
+// them again: past it, those of variables not set now go.
+const maxBitmapVars = 1024
+
+// setBitmapVariable sets the session's variable name to the bitmap query
+// selects, unless it is set now: a name is that of what its SELECT reads,
+// at the snapshots it pins.
+func (sess *session) setBitmapVariable(ctx context.Context, name, query string) error {
+	if sess.bitmapVars == nil {
+		sess.bitmapVars = map[string]*bitmapVar{}
+	}
+	v := sess.bitmapVars[name]
+	if v == nil {
+		if len(sess.bitmapVars) >= maxBitmapVars {
+			for n, old := range sess.bitmapVars {
+				if !old.set {
+					delete(sess.bitmapVars, n)
+				}
+			}
+		}
+		v = &bitmapVar{query: query}
+		sess.bitmapVars[name] = v
+	}
+	if v.set {
+		return nil
+	}
+	if _, err := sess.conn.ExecContext(ctx, "SET VARIABLE "+quoteIdent(name)+" = ("+query+")", nil); err != nil {
+		return err
+	}
+	v.set = true
+	return nil
+}
+
+// ensureBitmapVariables sets again the variables text reads that are not
+// set now, before it runs.
+func (sess *session) ensureBitmapVariables(ctx context.Context, text string) error {
+	if len(sess.bitmapVars) == 0 {
+		return nil
+	}
+	for _, name := range bitmapVarName.FindAllString(text, -1) {
+		if v := sess.bitmapVars[name]; v != nil && !v.set {
+			if err := sess.setBitmapVariable(ctx, name, v.query); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// resetBitmapVariables drops the variables that are set, once a statement
+// has run: they take as much memory as their bitmaps.
+func (sess *session) resetBitmapVariables(ctx context.Context) {
+	for name, v := range sess.bitmapVars {
+		if !v.set {
+			continue
+		}
+		if _, err := sess.conn.ExecContext(context.WithoutCancel(ctx), "RESET VARIABLE "+quoteIdent(name), nil); err == nil {
+			v.set = false
+		}
+	}
 }

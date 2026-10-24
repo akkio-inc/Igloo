@@ -77,6 +77,10 @@ type indexUse struct {
 // bitmap indexes' schema: only Igloo reads them, in the statements it
 // answers from them.
 func indexReferences(text string) error {
+	// Nor the variables that hand Igloo's statements their bitmaps.
+	if strings.Contains(strings.ToLower(text), bitmapVarPrefix) {
+		return iglooDenied()
+	}
 	for _, w := range namesIn(text) {
 		if strings.EqualFold(w, iddomain.IndexSchema) {
 			return iglooDenied()
@@ -806,6 +810,11 @@ func (s *Server) refreshIndexes(ctx context.Context, sess *session, st *statemen
 	}
 	stale := false
 	switch {
+	case st.reportCall && bitmapVarName.MatchString(st.query):
+		// A hybrid call, whose cohorts' bitmaps are of the versions their
+		// latest_from had when it was prepared: prepared again, for the
+		// versions they have now (its variables are computed again anyway).
+		stale = true
 	case st.reportCall && len(st.indexPins) == 0:
 		// A report API call counted from the tables: back to the bitmaps
 		// once they can answer it.

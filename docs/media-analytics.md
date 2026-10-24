@@ -468,6 +468,16 @@ bitmap instead of joining the cohorts and counts no distinct members
 on the tables. Anything else is counted from the tables (`path` is
 `scan`).
 
+For that scan Igloo computes the cohorts' bitmaps first, into variables of
+the session that only its own statements may name, and drops them once the
+call has run. The scan then reads each bitmap once rather than once for
+each chunk of rows, and it runs on the replica the session is on. A
+cohort's `latest_from` is read first too, for the version whose bitmap to
+compute: a prepared call is prepared again before each run, for the latest
+version then, and fails, asking to be run again, if a new version appears
+while it runs. The `latest_from` table must then have no row access policy,
+clean room or masking policy, or the call is counted from the tables.
+
 ### Parity check
 
 `igloo.audience_profile_check(spec, sql)` runs the call and `sql`, one
