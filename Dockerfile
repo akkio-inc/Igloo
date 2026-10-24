@@ -13,12 +13,22 @@ COPY . .
 # minicore_disabled: leaves out the native library Snowflake's Go driver
 # would otherwise embed, and write out and load at runtime, only to report
 # its version to Snowflake (Igloo turns it off at runtime too).
+# The rb extension (extensions/rb) is built first, in the same step as the
+# binary, which carries the file's SHA-256 and refuses any other file: the
+# two cannot come from different builds.
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    go build -tags duckdb_arrow,minicore_disabled -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/igloo ./cmd/igloo
+    --mount=type=cache,target=/root/.cache/igloo \
+    extensions/rb/build.sh /out/rb && \
+    go build -tags duckdb_arrow,minicore_disabled -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION} -X github.com/akkio-inc/igloo/internal/engine.rbSHA256=$(cat /out/rb/rb.duckdb_extension.sha256)" \
+      -o /out/igloo ./cmd/igloo
 
 # Bake DuckDB's extensions into the image so the server never downloads code
-# at runtime.
-RUN /out/igloo install-extensions /out/extensions && mkdir -p /out/tmp /out/cache /out/empty
+# at runtime, then check that this binary loads its rb extension.
+RUN /out/igloo install-extensions /out/extensions && \
+    mkdir -p /out/extensions/igloo /out/tmp /out/cache /out/empty && \
+    cp /out/rb/rb.duckdb_extension /out/extensions/igloo/ && \
+    /out/igloo check-extensions /out/extensions
 
 # distroless/cc has the glibc DuckDB links against, CA certificates for
 # HTTPS object storage, and no shell.

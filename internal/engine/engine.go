@@ -81,7 +81,9 @@ type Engine struct {
 	catLocked atomic.Int64
 	// releaseTempDir lets go of the spill directory; see claimTempDir.
 	releaseTempDir func()
-	log            *slog.Logger
+	// bitmaps says the rb extension is loaded (see loadRB).
+	bitmaps bool
+	log     *slog.Logger
 }
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
@@ -95,7 +97,7 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		opt(&o)
 	}
 	release := claimTempDir(cfg.DuckDB.TempDir, log)
-	connector, err := duckdb.NewConnector(cfg.DuckDB.Path, nil)
+	connector, err := duckdb.NewConnector(rbDSN(cfg.DuckDB.Path, rbToLoad(cfg)), nil)
 	if err != nil {
 		release()
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -506,7 +508,11 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 		return err
 	}
 
-	if err := configure(cfg, serverThreadsPerCore, exec, func(q string) (string, error) { return queryString(ctx, conn, q) }); err != nil {
+	query := func(q string) (string, error) { return queryString(ctx, conn, q) }
+	if err := configure(cfg, serverThreadsPerCore, exec, query); err != nil {
+		return err
+	}
+	if e.bitmaps, err = loadRB(cfg, log, exec, query); err != nil {
 		return err
 	}
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {

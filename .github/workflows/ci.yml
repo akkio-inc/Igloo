@@ -74,6 +74,13 @@ jobs:
       - name: Vet
         run: go vet -tags duckdb_arrow ./...
 
+      # Igloo's own rb extension, against the bindings' DuckDB: the engine
+      # tests require it in CI (extensions/rb/build.sh, a minute).
+      - name: Build the rb extension
+        run: |
+          extensions/rb/build.sh "$RUNNER_TEMP/rb"
+          echo "IGLOO_TEST_RB_EXTENSION=$RUNNER_TEMP/rb/rb.duckdb_extension" >>"$GITHUB_ENV"
+
       # The spatial and sketch tests load the extensions the image ships.
       - name: Install DuckDB extensions
         run: |
@@ -142,6 +149,11 @@ jobs:
             echo "::error::igloo version printed '$out', expected it to contain $VERSION"
             exit 1
           fi
+
+      # In the runtime image, not only the build stage: its libraries, and
+      # the file the binary's hash names.
+      - name: Check that the binary loads its rb extension
+        run: docker run --rm igloo:ci check-extensions
 
   e2e:
     name: End-to-end

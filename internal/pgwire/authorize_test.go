@@ -61,6 +61,15 @@ func TestRequiredRole(t *testing.T) {
 		{duckdb.STATEMENT_TYPE_SET, "SET /*x*/ search_path = 'x'", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_SET, "SET threads = 4", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_SET, "SET allowed_directories = ['/']", auth.RoleAdmin},
+		// Settings around loading extensions: DuckDB refuses some once it is
+		// locked down and lets others change, which opens nothing (see
+		// engine's TestRBLockdownHolds), but only admins may try.
+		{duckdb.STATEMENT_TYPE_SET, "SET lock_configuration = true", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SET, "SET SESSION allow_unsigned_extensions = true", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SET, "SET enable_external_access = true", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SET, "SET extension_directory = '/tmp'", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SET, "SET autoload_known_extensions = true", auth.RoleAdmin},
+		{duckdb.STATEMENT_TYPE_SET, "SET allow_extensions_metadata_mismatch = true", auth.RoleAdmin},
 		{duckdb.STATEMENT_TYPE_VARIABLE_SET, "SET VARIABLE x = 42", auth.RoleReader},
 		{duckdb.STATEMENT_TYPE_INSERT, "INSERT INTO t VALUES (1)", auth.RoleWriter},
 		{duckdb.STATEMENT_TYPE_COPY, "COPY t FROM 's3://landing/x.csv'", auth.RoleWriter},
