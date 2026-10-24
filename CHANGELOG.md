@@ -139,7 +139,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   set (as audience-by-segment reports count), read the bitmaps where the
   bitmaps are current and no policy applies, through views that select or
   LEFT JOIN the table too, and run again from the tables if the bitmaps
-  outgrow their memory. `ON (ELEMENTS(list))` keeps a bitmap for each
+  outgrow their memory. Erasure requests empty the indexes whose bitmaps
+  hold an erased person's id, with their older snapshots and files, and have
+  them built again. `ON (ELEMENTS(list))` keeps a bitmap for each
   element of a list column (see [Bitmap indexes](docs/sql.md#bitmap-indexes)).
 - The report API, version 1: `SELECT * FROM igloo.audience_profile('<spec>')`
   counts the people of labelled cohorts (an audience's latest version, the

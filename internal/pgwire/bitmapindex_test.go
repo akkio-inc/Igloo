@@ -10,6 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
@@ -143,6 +145,138 @@ func TestBitmapIndexElements(t *testing.T) {
 		t.Errorf("after an append: %q", how)
 	}
 	same("after an append")
+}
+
+// TestBitmapIndexErasure erases ids from bitmap indexes for erasure
+// requests: an index whose bitmaps hold one is emptied, with its table's
+// older snapshots and their files, and built again from its table.
+func TestBitmapIndexErasure(t *testing.T) {
+	it := newIndexTest(t)
+	ctx := context.Background()
+	srv := it.r.srv
+	it.exec("ALTER TABLE lake.public.segments ADD BITMAP INDEX seg ON (segment_name) FOR person_id")
+	srv.waitIndexBuilds(t)
+	it.exec("INSERT INTO lake.public.segments VALUES ('p1', 'seg1', 0)")
+	srv.waitIndexBuilds(t)
+	var ids []int64
+	for _, v := range it.internal("SELECT id FROM lake.igloo_domains.people WHERE value IN ('p1', 'p2') ORDER BY id") {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("ids %v", ids)
+	}
+	sets := &BitmapIDSets{}
+	if _, err := sets.Holding(ctx, "people", ids); err == nil {
+		t.Error("erasing before the server is bound")
+	}
+	sets.Bind(srv)
+	if n, err := sets.Holding(ctx, "people", ids); err != nil || n == 0 {
+		t.Fatalf("holding before: %d, %v", n, err)
+	}
+	if n, err := sets.Holding(ctx, "other", ids); err != nil || n != 0 {
+		t.Errorf("another domain's indexes: %d, %v", n, err)
+	}
+	tbl, err := srv.ddl.LoadTable(ctx, "igloo_bitmaps", "seg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tbl.Metadata().Snapshots()) < 2 {
+		t.Fatalf("the index's table has %d snapshots", len(tbl.Metadata().Snapshots()))
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The request deletes the people's rows, then erases their ids.
+	it.exec("DELETE FROM lake.public.segments WHERE person_id IN ('p1', 'p2')")
+	srv.waitIndexBuilds(t)
+	if err := sets.Erase(ctx, "people", ids); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := sets.Holding(ctx, "people", ids); err != nil || n != 0 {
+		t.Errorf("holding after: %d, %v", n, err)
+	}
+	for _, task := range tasks {
+		if f, err := fs.Open(task.File.FilePath()); err == nil {
+			_ = f.Close()
+			t.Errorf("a file of the index's table before the erasure is still there: %s", task.File.FilePath())
+		}
+	}
+	srv.waitIndexBuilds(t)
+	srv.MaintainBitmapIndexes(ctx)
+	it.sameCounts("seg", "segment_name")
+	if n, err := sets.Holding(ctx, "people", ids); err != nil || n != 0 {
+		t.Errorf("holding after the build: %d, %v", n, err)
+	}
+	// Again, with nothing left to erase: nothing to do.
+	if err := sets.Erase(ctx, "people", ids); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestErasureBitmapIndexes erases a person through an erasure request,
+// which has the bitmap indexes of their domain drop their id: verification
+// finds no index holding it, and the index is built again without it.
+func TestErasureBitmapIndexes(t *testing.T) {
+	it := newIndexTest(t)
+	ctx := context.Background()
+	srv := it.r.srv
+	it.exec("ALTER TABLE lake.public.segments ADD BITMAP INDEX seg ON (segment_name) FOR person_id")
+	srv.waitIndexBuilds(t)
+	id, err := strconv.ParseInt(it.one("SELECT CAST(id AS VARCHAR) FROM lake.igloo_domains.people WHERE value = 'p1'"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sets := &BitmapIDSets{}
+	sets.Bind(srv)
+	if n, err := sets.Holding(ctx, "people", []int64{id}); err != nil || n == 0 {
+		t.Fatalf("holding before: %d, %v", n, err)
+	}
+	cat, err := catalog.Open(ctx, it.vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := erasure.NewMemoryStore()
+	svc := erasure.New(erasure.Options{Store: store, Catalog: cat, Policies: srv.gov.store.Load, Engine: it.r.eng,
+		Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake", Warehouse: it.vc.cfg.Storage.Location + "/",
+		IDDomains: srv.idDomains, IDSets: sets})
+	req, err := svc.Submit(ctx, "privacy", []erasure.Wanted{{Tag: "pii", Value: "person_id", Identifiers: []string{"p1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *erasure.Request
+	for range 8 {
+		if err := svc.Run(ctx, req.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got, err = store.Get(ctx, req.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status == erasure.StatusCompleted {
+			break
+		}
+		srv.waitIndexBuilds(t)
+	}
+	if got.Status != erasure.StatusCompleted {
+		t.Fatalf("status %s at %s: %s", got.Status, got.Step, got.Error)
+	}
+	if got.Verification == nil || got.Verification.IDSets != 0 {
+		t.Errorf("verification %+v", got.Verification)
+	}
+	if n, err := sets.Holding(ctx, "people", []int64{id}); err != nil || n != 0 {
+		t.Errorf("holding after: %d, %v", n, err)
+	}
+	srv.waitIndexBuilds(t)
+	srv.MaintainBitmapIndexes(ctx)
+	it.sameCounts("seg", "segment_name")
 }
 
 // TestBitmapIndexes adds, builds, keeps up to date, lists and drops bitmap

@@ -377,6 +377,9 @@ func serve() error {
 	eng.SetJobHistory(taskStore, pgwire.HistoryViewer)
 
 	var eraser *erasure.Service
+	// Erasure requests erase ids from bitmap indexes through the SQL
+	// server, which is made after them (see pgwire.BitmapIDSets).
+	bitmapIDs := &pgwire.BitmapIDSets{}
 	if cat != nil {
 		erasureStore, purger, err := openErasure(ctx, cfg, eng, log)
 		if err != nil {
@@ -389,7 +392,7 @@ func serve() error {
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
-			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains,
+			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
 		}, historyStore, taskStore)
 		if err != nil {
 			return err
@@ -467,6 +470,7 @@ func serve() error {
 	if srv, err = pgwire.New(eng, opts, log); err != nil {
 		return err
 	}
+	bitmapIDs.Bind(srv)
 	// Some of DuckDB's work ignores its memory limit; rather than let the
 	// kernel kill the process, cancel the statement that has run longest
 	// when memory runs low (see memlimit.Watch).
@@ -1120,4 +1124,14 @@ func healthcheck() error {
 		return err
 	}
 	return conn.Close()
+}
+
+// idSetsFor is what erasure requests erase ids from: bitmap indexes, which
+// exist only with ID domains, and stay in their tables when
+// IGLOO_BITMAP_INDEXES is turned off again.
+func idSetsFor(cfg config.Config, bitmaps *pgwire.BitmapIDSets) erasure.IDSets {
+	if !cfg.IDDomains {
+		return nil
+	}
+	return bitmaps
 }

@@ -533,7 +533,12 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   append adds the appended files' bitmaps, a compaction or clustering keeps
   them as they are, and anything else builds them again from the snapshot.
   A snapshot whose member values do not all have ids yet gets no bitmaps
-  until mapping fills them in. A build that fails, as when object storage
+  until mapping fills them in. An [erasure request](privacy.md) empties each
+  index of its people's domain whose bitmaps, in any snapshot of the index's
+  table, hold one of their ids, expiring the table's other snapshots and
+  deleting their files, once no table's snapshot holds the people's values;
+  the index is then built again, without them, and verification counts the
+  index rows still holding the ids (`id_sets`). A build that fails, as when object storage
   turns requests away under load, is tried again after 30 seconds, 2
   minutes and 8 minutes, then at the next maintenance pass. Each build
   sizes its table's row groups (`write.parquet.row-group-size`) to hold
