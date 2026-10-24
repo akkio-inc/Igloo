@@ -24,7 +24,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		queries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_distributed_queries_total",
-			Help: "Statements whose parts ran on workers, by outcome: ok, error (in the data), out_of_memory (a worker ran out), canceled, or fallback (ran on this replica instead).",
+			Help: "Statements whose parts ran on workers, by outcome: ok, error (in the data), out_of_memory (a worker ran out), bitmap_memory (a task's bitmaps outgrew their budget), canceled, or fallback (ran on this replica instead).",
 		}, []string{"outcome"}),
 		fallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_distributed_fallbacks_total",
@@ -127,7 +127,7 @@ func NewWorkerMetrics(reg prometheus.Registerer) *WorkerMetrics {
 	m := &WorkerMetrics{
 		tasks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_worker_tasks_total",
-			Help: "Fragments run for coordinators, by outcome: ok, error, canceled, out_of_memory (canceled as the worker ran out), or refused (files workers cannot read as the table says).",
+			Help: "Fragments run for coordinators, by outcome: ok, error, canceled, out_of_memory (canceled as the worker ran out), bitmap_memory (its bitmaps outgrew their budget), or refused (files workers cannot read as the table says).",
 		}, []string{"outcome"}),
 		duration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "igloo_worker_task_seconds",

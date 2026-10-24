@@ -211,6 +211,10 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			return parts, true, ctx.Err()
 		case distributed.DataError(err):
 			return parts, true, err
+		case distributed.BitmapMemory(err):
+			// A task's bitmaps did not fit: the session runs the statement
+			// again with DuckDB's hash (see rerunWithoutBitmaps).
+			return parts, true, err
 		case distributed.OutOfMemory(err):
 			// Another worker, or this replica, would run out the same way.
 			s.log.Warn("a worker ran out of memory running part of a statement; the statement fails rather than run again",
@@ -241,7 +245,9 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	defer ex.Close()
 	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
 	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
-		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) {
+		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
+			// Combining the workers' bitmaps did not fit either: the
+			// session runs the statement again with the hash.
 			return parts, true, err
 		}
 		s.dist.Metrics().Fallback("combine_error")
@@ -367,6 +373,13 @@ func (s *Server) distributedSettings(ctx context.Context, sess *session) ([]dist
 		switch {
 		case known:
 			out = append(out, distributed.Setting{Name: name, Value: value})
+		case slices.ContainsFunc(distributed.ChangedSettingNames, func(n string) bool { return strings.EqualFold(n, name) }):
+			// The rb extension's, sent only where the session changed
+			// them, so that a worker needs the extension only for the
+			// statements that count in bitmaps.
+			if base[name] != value {
+				out = append(out, distributed.Setting{Name: name, Value: value})
+			}
 		case base[name] != value && !slices.Contains(distributedHarmless, strings.ToLower(name)):
 			return nil, fmt.Errorf("the session changed %s", name)
 		}

@@ -164,6 +164,9 @@ type taskErr struct {
 	// OutOfMemory says the task ran out of memory: DuckDB's memory limit,
 	// or the worker canceled it because it was running out (ShedMemory).
 	OutOfMemory bool `json:"out_of_memory,omitempty"`
+	// Bitmap says the task's roaring bitmaps outgrew the memory they may
+	// take (the rb extension's error); it is not OutOfMemory.
+	Bitmap bool `json:"bitmap,omitempty"`
 	// Lost is the worker whose exchange files the task could not fetch:
 	// it stopped, or restarted without them.
 	Lost string `json:"lost,omitempty"`
@@ -199,8 +202,15 @@ var SettingNames = []string{
 	"enable_geoparquet_conversion", "binary_as_string", "arrow_large_buffer_size",
 }
 
+// ChangedSettingNames are the session settings tasks take over only where
+// the session changed them: the rb extension's, which Igloo sets for the
+// statements that count distinct IDs in roaring bitmaps, and which a
+// task's own rb_agg reads (its memory budget).
+var ChangedSettingNames = []string{"rb_count_distinct", "rb_memory_budget"}
+
 func knownSetting(name string) bool {
-	return slices.ContainsFunc(SettingNames, func(s string) bool { return strings.EqualFold(s, name) })
+	eq := func(s string) bool { return strings.EqualFold(s, name) }
+	return slices.ContainsFunc(SettingNames, eq) || slices.ContainsFunc(ChangedSettingNames, eq)
 }
 
 // DataError reports whether err is an error in the data a statement
@@ -232,6 +242,20 @@ var ErrWorkerMemory = errors.New("a worker was running out of memory")
 
 // OutOfMemory reports whether err is ErrWorkerMemory.
 func OutOfMemory(err error) bool { return errors.Is(err, ErrWorkerMemory) }
+
+// ErrBitmapMemory is what a statement fails with when the roaring bitmaps
+// of a task's count(DISTINCT) outgrew the memory they may take on a worker
+// (the rb extension's error, which starts bitmapBudgetError). Smaller tasks
+// would build the same bitmaps a group, so the statement is not run again
+// in parts: the session runs it once more counting with DuckDB's hash.
+var ErrBitmapMemory = errors.New("a task's bitmaps did not fit in a worker's memory")
+
+// bitmapBudgetError starts the rb extension's error for bitmaps that do
+// not fit.
+const bitmapBudgetError = "rb: bitmap memory budget exceeded"
+
+// BitmapMemory reports whether err is ErrBitmapMemory.
+func BitmapMemory(err error) bool { return errors.Is(err, ErrBitmapMemory) }
 
 // dataError reports whether a DuckDB error came from the values a fragment
 // computes on (a failed cast, a division by zero), which a single machine

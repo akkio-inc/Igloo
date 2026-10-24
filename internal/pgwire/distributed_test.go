@@ -189,11 +189,25 @@ func (g *taskGate) counts() (waiting, canceled int) {
 // address and a function that stops it.
 func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, *distributed.Worker, func()) {
 	t.Helper()
+	return startTestWorkerRB(t, dir, i, gate, "")
+}
+
+// startTestWorkerRB is startTestWorker with the rb extension at rb loaded
+// before the worker's lockdown, as production workers load it; "" loads
+// none.
+func startTestWorkerRB(t *testing.T, dir string, i int, gate *taskGate, rb string) (string, *distributed.Worker, func()) {
+	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "worker")
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	c, err := duckdb.NewConnector("", nil)
+	dsn := ""
+	var load []string
+	if rb != "" {
+		dsn = "?allow_unsigned_extensions=true"
+		load = []string{"LOAD " + quoteLiteral(rb), "SET allow_unsigned_extensions = false"}
+	}
+	c, err := duckdb.NewConnector(dsn, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,10 +215,10 @@ func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range []string{
-		"SET allowed_directories = [" + quoteLiteral(dir+"/") + ", " + quoteLiteral(tmp+"/") + "]",
+	for _, stmt := range append(load,
+		"SET allowed_directories = ["+quoteLiteral(dir+"/")+", "+quoteLiteral(tmp+"/")+"]",
 		"SET enable_external_access = false",
-	} {
+	) {
 		if _, err := setup.(driver.ExecerContext).ExecContext(context.Background(), stmt, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -260,10 +274,17 @@ func startDistServerIn(t *testing.T, dir string, workers int, configure ...func(
 // changed by coordinate, if set.
 func startDistServerWith(t *testing.T, dir string, workers int, coordinate func(*distributed.Options), configure ...func(*Options)) *distServer {
 	t.Helper()
+	return startDistServerRB(t, dir, workers, "", coordinate, configure...)
+}
+
+// startDistServerRB is startDistServerWith with workers that load the rb
+// extension at rb, if set.
+func startDistServerRB(t *testing.T, dir string, workers int, rb string, coordinate func(*distributed.Options), configure ...func(*Options)) *distServer {
+	t.Helper()
 	ds := &distServer{source: &lakeSource{dir: dir, files: map[string][]distributed.File{}}, gate: newTaskGate()}
 	var addrs []string
 	for i := range workers {
-		addr, w, stop := startTestWorker(t, dir, i, ds.gate)
+		addr, w, stop := startTestWorkerRB(t, dir, i, ds.gate, rb)
 		addrs = append(addrs, addr)
 		ds.workers = append(ds.workers, w)
 		ds.stops = append(ds.stops, stop)

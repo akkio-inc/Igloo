@@ -11,10 +11,13 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 )
 
@@ -230,5 +233,117 @@ func TestBitmapsByTableRows(t *testing.T) {
 		if got := texts(t, admin, query); len(got) != 7 || got[0] != "0|28572" {
 			t.Errorf("at least %d rows: counts %q", c.min, got)
 		}
+	}
+}
+
+// TestDistributedBitmapsRerunOnTheHash runs a count on workers whose tasks'
+// bitmaps outgrow a tiny rb_memory_budget, which the session's setting
+// carries to them: the statement runs once more counting with DuckDB's
+// hash, on workers, with no smaller tasks in between and no run here, and
+// the rows are right. A plain statement runs on workers that load no rb
+// extension while this replica has it.
+func TestDistributedBitmapsRerunOnTheHash(t *testing.T) {
+	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
+	if rb == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
+	}
+	reg := prometheus.NewRegistry()
+	ds := startDistServerRB(t, t.TempDir(), 2, rb, func(o *distributed.Options) { o.Metrics = distributed.NewMetrics(reg) },
+		func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 0 })
+	// outcomes counts the statements whose parts ran on workers, by outcome.
+	outcomes := func() map[string]float64 {
+		t.Helper()
+		mfs, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]float64{}
+		for _, mf := range mfs {
+			if mf.GetName() != "igloo_distributed_queries_total" {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				for _, l := range m.GetLabel() {
+					if l.GetName() == "outcome" {
+						out[l.GetValue()] = m.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+		return out
+	}
+	withIDColumns(ds.srv)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "CREATE TABLE lake.public.visits AS SELECT i % 4 AS g, hash(i) % 4294967295 AS "+personID+" FROM range(2000000) r(i)")
+	query := "SELECT g, count(DISTINCT CAST(v." + personID + " AS UINTEGER)) AS n FROM lake.public.visits AS v GROUP BY g ORDER BY g"
+	want := texts(t, conn, "SELECT g, count(DISTINCT v."+personID+") AS n FROM lake.public.visits AS v GROUP BY g ORDER BY g")
+	if len(want) != 4 {
+		t.Fatalf("expected counts: %q", want)
+	}
+
+	var mu sync.Mutex
+	local := 0
+	ds.srv.failLocal = func(_ context.Context, st *statement) error {
+		if strings.Contains(st.query, "visits") {
+			mu.Lock()
+			local++
+			mu.Unlock()
+		}
+		return nil
+	}
+	defer func() { ds.srv.failLocal = nil }()
+	mustExec(t, conn, "SET distributed_execution = on")
+
+	// Within the budget: bitmaps on workers.
+	if got := texts(t, conn, query); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("rows %q, want %q", got, want)
+	}
+	if n := ds.srv.bitmapReruns.Load(); n != 0 {
+		t.Errorf("%d reruns within the budget", n)
+	}
+
+	// Past it on the workers, in tasks of any size: once more, with the
+	// hash.
+	mustExec(t, conn, "SET rb_memory_budget = '64KB'")
+	if got := texts(t, conn, query); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("rows after the workers' bitmaps did not fit %q, want %q", got, want)
+	}
+	if n := ds.srv.bitmapReruns.Load(); n != 1 {
+		t.Errorf("%d reruns, want 1", n)
+	}
+	// The workers' tasks failed it, at once, in tasks of the first size:
+	// one statement on workers ran out of bitmap memory, and two ran.
+	if got := outcomes(); got["bitmap_memory"] != 1 || got["ok"] != 2 || got["out_of_memory"] != 0 {
+		t.Errorf("statements on workers by outcome: %v", got)
+	}
+	if q := lastRun(t, ds.history, query); q.Workers == 0 || q.Outcome != audit.OutcomeOK {
+		t.Errorf("history: %d workers, %s %s", q.Workers, q.Outcome, q.SQLState)
+	}
+	mu.Lock()
+	if local != 0 {
+		t.Errorf("ran here %d times", local)
+	}
+	mu.Unlock()
+	if got := texts(t, conn, "SELECT current_setting('rb_count_distinct')"); len(got) != 1 || got[0] != "off" {
+		t.Errorf("rb_count_distinct after the rerun: %q", got)
+	}
+}
+
+// TestDistributedWithoutRBOnWorkers runs statements on workers that load no
+// rb extension while this replica does: the rb settings, unchanged, are not
+// sent to them.
+func TestDistributedWithoutRBOnWorkers(t *testing.T) {
+	ds := startDistServer(t, 2)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET distributed_execution = on")
+	query := "SELECT amount, count(*) AS n FROM lake.public.orders GROUP BY amount ORDER BY amount"
+	if got := texts(t, conn, query); len(got) != 9 {
+		t.Errorf("rows %q", got)
+	}
+	if q := lastRun(t, ds.history, query); q.Workers == 0 || q.Outcome != audit.OutcomeOK {
+		t.Errorf("history: %d workers, %s %s", q.Workers, q.Outcome, q.SQLState)
 	}
 }

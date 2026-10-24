@@ -616,6 +616,8 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			co.opts.Metrics.query("error", start)
 		case OutOfMemory(err):
 			co.opts.Metrics.query("out_of_memory", start)
+		case BitmapMemory(err):
+			co.opts.Metrics.query("bitmap_memory", start)
 		}
 		return nil, err
 	}
@@ -920,6 +922,10 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 			return nil, &lostError{worker: res.Error.Lost, err: fmt.Errorf("a task on %s: %s", w.addr, res.Error.Message)}
 		}
 		switch {
+		case res.Error.Bitmap:
+			// The message keeps the extension's words, which the session
+			// recognizes to run the statement again without bitmaps.
+			return nil, fmt.Errorf("%w: a task on %s: %s", ErrBitmapMemory, w.addr, res.Error.Message)
 		case duckdb.ErrorType(res.Error.Type) == duckdb.ErrorTypeOutOfMemory:
 			return nil, fmt.Errorf("%w: a task on %s: %s", ErrWorkerMemory, w.addr, res.Error.Message)
 		case res.Error.OutOfMemory:
