@@ -288,6 +288,162 @@ SELECT strftime(date_trunc('week', served_at::DATE) + INTERVAL 6 DAY, '%Y-%m') A
 FROM impressions GROUP BY ALL;
 ```
 
+## Report API
+
+The report API counts the people of labelled cohorts (an audience, the
+general population) in each value of a set of dimensions of one table, in
+one call: the counting part of audience reports (cohort sizes, signals by
+media, browsing and attributes, segment shares), whose SQL joins the
+cohorts to a large table, expands each row into its dimensions and counts
+distinct people by value. The rest of a report (shares, index ratios,
+thresholds, rounding, ranking) stays SQL on top of the API's rows. This is
+version 1, a contract: a released version does not change, and new fields
+and columns come in a new version.
+
+```sql
+SELECT * FROM igloo.audience_profile('<spec>');                 -- the counts
+SELECT igloo.audience_profile_sql('<spec>');                    -- the SQL they stand for (VARCHAR)
+SELECT igloo.report_api_versions();                             -- INTEGER[]: [1]
+SELECT * FROM igloo.audience_profile_check('<spec>', '<sql>');  -- parity check, below
+```
+
+`igloo.audience_profile` stands anywhere a table can: in `FROM`, in a common
+table expression among others, in a subquery, under `DESCRIBE`; in
+Snowflake's dialect, `TABLE(igloo.audience_profile('<spec>'))` too. The spec
+is one string literal (`'...'` or `$$...$$`) holding a JSON object, and the
+name is written unquoted. A caller can tell that a server has the API from
+`igloo.report_api_versions()`; one without fails with SQLSTATE 42883.
+
+### The spec
+
+```json
+{
+  "version": 1,
+  "source": {"table": "V_DAILY_MEDIA_VIEWING", "member": "PERSON_ID"},
+  "cohorts": [
+    {"label": "AUDIENCE", "table": "AUDIENCE_MEMBERS", "member": "PERSON_ID",
+     "where": {"AUDIENCE_ID": "00000000-0000-4000-8000-0000000000a1"},
+     "version": {"column": "VER", "latest_from": {"table": "AUDIENCE_REVISIONS",
+                 "where": {"AUDIENCE_ID": "00000000-0000-4000-8000-0000000000a1"}}}},
+    {"label": "BASE_POPULATION", "table": "V_PERSON_ATTRIBUTES", "member": "PERSON_ID"}
+  ],
+  "dimensions": [
+    {"name": "GENRE", "column": "GENRE", "skip_blank": true},
+    {"name": "VIEWING_MODE", "column": "LIVE", "map": {"true": "LIVE", "false": "ON_DEMAND"}, "skip_blank": true},
+    {"name": "MEDIA_REACH", "constant": "ANY_VIEWING"}
+  ],
+  "metrics": [{"name": "seconds", "column": "TOTAL_SECONDS", "coalesce": 0}],
+  "totals": false,
+  "extent": "VIEWED_DATE"
+}
+```
+
+Tables (`a`, `schema.a` or `catalog.schema.a`) and columns resolve as in the
+caller's SQL: by the session's search path, through views, case aside.
+Values are JSON literals; nothing in a spec becomes SQL text but a cohort's
+`sql`, which is a statement of its own.
+
+**Cohorts** (at most 8), each a labelled set of distinct, non-NULL members:
+
+- A table: `{"label", "table", "member", "where", "version"}`, whose members
+  are `SELECT DISTINCT member FROM table WHERE <where> AND <version> AND
+  member IS NOT NULL`. `version` picks one version of a versioned table:
+  `{"column": "VER", "equals": 3}`, or `{"column": "VER", "latest_from":
+  {"table": "AUDIENCE_REVISIONS", "where": {...}}}` for `VER = (SELECT
+  max(VER) FROM AUDIENCE_REVISIONS WHERE ...)`.
+- A query: `{"label", "sql"}`, one `SELECT` (or `WITH ... SELECT`) of one
+  column, the members, run as a subquery of the statement, exactly as if the
+  caller ran it.
+
+**Conditions** (`where`, `metric_where`): an object of columns' conditions,
+all of which must hold. `"C": "v"` (any literal) is `C = 'v'`, `"C": null`
+is `C IS NULL`, `"C": ["a", "b"]` is `C IN ('a', 'b')`, and `"C": {...}`
+applies operators: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between` (`[low,
+high]`), `like` (with LIKE's own `%` and `_`) and `is_null` (`true` or
+`false`). A `metric_where` is one such object of operators, on the metric.
+
+**Source and dimensions** (at most 64). `source` is the table whose rows
+count, its member column and an optional `where`. Each row whose member is
+in a cohort counts, for that cohort, in each value of each dimension:
+
+| Dimension | The row's values |
+|---|---|
+| `{"name", "column": "C"}` | `CAST(C AS VARCHAR)` |
+| `{"name", "column": "C", "map": {"true": "LIVE", "false": "ON_DEMAND"}}` | the mapped text of `CAST(C AS VARCHAR)`; NULL, and text the map lacks, give NULL |
+| `{"name", "elements": "C"}` | each element of the list `C` (`UNNEST`) as `VARCHAR`; with `"path": "$.x"`, each element of the JSON array at that path of `C`, as `json_extract_string` reads it |
+| `{"name", "constant": "ANY_VIEWING"}` | that text |
+
+Options: `group` (passed through as `dim_group`); `skip_blank` (leave out
+values that are NULL or blank after `trim`; by default NULL counts as a
+value of its own); `metric` (a column, cast to `DOUBLE`, aggregated per
+value in `metric_sum`, `metric_count` and `metric_avg`); and `metric_where`
+(only rows whose cast metric meets it count in the dimension, for people,
+rows and metrics alike). Dimension names may repeat: the result has one row
+for each distinct (`dimension`, `dim_group`, `value`, `cohort`), and entries
+that give the same one count together, as a `GROUP BY` over the `UNION ALL`
+of their rows would. `"dimensions": []` with no `source` returns each
+cohort's size alone, as a row with `is_total` true and `people` its size.
+
+**Metrics** (at most 16), per row of the result:
+`{"name": "seconds", "column": "C"}` gives `seconds_sum`, of the type `sum`
+gives `C`, and `seconds_avg` (`DOUBLE`), with `"coalesce": 0` reading NULLs
+as 0; `{"name": "days", "distinct_with": "C"}` gives `days_distinct`
+(`BIGINT`), the distinct (member, `C`) pairs, leaving out those whose `C` is
+NULL, as Snowflake's `COUNT(DISTINCT a, b)` does. Names are lower-case
+letters, digits and `_`.
+
+**Totals and extent.** `"totals": true` adds, for each dimension and cohort,
+a row with `is_total` true and `value` NULL counting across the dimension's
+values: the people with any of them (a union, not a sum), and their rows and
+metrics. `"extent": "C"` adds `extent_min` and `extent_max`, the least and
+greatest `C` of the source's rows (after its `where`) whose member is in a
+cohort, on every row.
+
+A spec of another version, with a field or operator this version does not
+know, a value of the wrong kind, more than the counts above or more than 64
+KiB fails with SQLSTATE 22023, naming what it refuses.
+
+### The result
+
+| Column | Type | |
+|---|---|---|
+| `dimension`, `dim_group`, `value`, `cohort` | `VARCHAR` | `value` is NULL on totals rows |
+| `is_total` | `BOOLEAN` | |
+| `people` | `BIGINT` | distinct members of the cohort with the value |
+| `rows` | `BIGINT` | the source's rows (or list elements) of those members with the value |
+| `cohort_size` | `BIGINT` | the cohort's members |
+| `metric_sum`, `metric_count`, `metric_avg` | `DOUBLE`, `BIGINT`, `DOUBLE` | the dimension's metric; NULL without one |
+| `<name>_sum` and `<name>_avg`, or `<name>_distinct` | | each of `metrics`, in order |
+| `extent_min`, `extent_max` | the column's type | with `extent` only |
+| `path` | `VARCHAR` | what counted the row: `scan` (the tables), `index` (bitmap indexes) or `index+scan` |
+
+A row appears only where the SQL's `GROUP BY` has one: a value no member of
+a cohort has gets no row for it, nor does a cohort without members. Counts
+are exact; nothing is rounded; rows come in no particular order.
+
+### Governance
+
+A call is its SQL, `igloo.audience_profile_sql` prints it, as far as access
+goes: Igloo puts that SQL in the call's place before it checks or runs the
+statement. The caller needs the grants that SQL needs, gets the errors it
+would, sees what row access policies, masking policies and clean rooms leave
+of the tables as it would, and the statement runs as it would, on workers
+when auto mode picks them.
+This release counts every call from the tables (`path` is `scan`); bitmap
+indexes are to answer calls where they cannot differ from that SQL, under
+the conditions of the [rewrite to bitmap indexes](sql.md#bitmap-indexes).
+
+### Parity check
+
+`igloo.audience_profile_check(spec, sql)` runs the call and `sql`, one
+read-only `SELECT` (or `WITH ... SELECT`) whose columns all have names, in
+the caller's statement, so with the caller's privileges, checks and
+statement timeout, as if they had sent it. Its columns are matched to the
+result's by name; it needs `dimension`, `value` and `cohort`, and any of the
+others. The check returns each row that differs, with `side` (`api_only` or
+`sql_only`) and the columns compared: none means the two agree. Sums and
+averages compare to 9 significant digits, everything else exactly.
+
 ## Security
 
 The extensions keep the [query sandbox](../SECURITY.md#security-model):

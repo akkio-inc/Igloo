@@ -133,6 +133,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   bitmaps are current and no policy applies, through views that select or
   LEFT JOIN the table too, and run again from the tables if the bitmaps
   outgrow their memory (see [Bitmap indexes](docs/sql.md#bitmap-indexes)).
+- The report API, version 1: `SELECT * FROM igloo.audience_profile('<spec>')`
+  counts the people of labelled cohorts (an audience's latest version, the
+  general population, or any query of members) in each value of a table's
+  dimensions (columns, mapped columns, list or JSON array elements,
+  constants), with per-value rows, sums, averages and distinct (member,
+  column) pairs, totals across values and the cohorts' sizes, from a JSON
+  spec: the counting that audience reports write as SQL.
+  `igloo.audience_profile_sql` prints the SQL a call stands for, which Igloo
+  runs in its place, so grants, policies, errors and execution are that
+  SQL's; `igloo.audience_profile_check` compares a call with the caller's
+  own SQL, and `igloo.report_api_versions()` lists the versions (see
+  [Report API](docs/media-analytics.md#report-api)).
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

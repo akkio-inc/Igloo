@@ -1,0 +1,357 @@
+package pgwire
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/akkio-inc/igloo/internal/auth"
+)
+
+// The report API's tests, and its parity harness: each spec's result is
+// compared, through igloo.audience_profile_check, with SQL written the way
+// Acme's reports count, independently of the API's own SQL.
+
+var reportFixture = []string{
+	"CREATE TABLE lake.public.audience_members AS SELECT 'p' || (i * 7 % 97) AS person_id, CASE WHEN i % 3 = 0 THEN 'a1' ELSE 'a2' END AS audience_id, CAST(1 + i % 2 AS INTEGER) AS ver FROM range(400) r(i)",
+	"INSERT INTO lake.public.audience_members VALUES (NULL, 'a1', 2)",
+	"CREATE TABLE lake.public.audience_revisions AS SELECT * FROM (VALUES ('a1', 1), ('a1', 2), ('a2', 1)) v(audience_id, ver)",
+	"CREATE TABLE lake.public.attributes AS SELECT 'p' || i AS person_id, CAST(i % 40 AS VARCHAR) AS household_id, " +
+		"CASE i % 5 WHEN 0 THEN 'NY' WHEN 1 THEN 'CA' WHEN 2 THEN '' WHEN 3 THEN NULL ELSE ' ' END AS state, CAST(i % 3 AS DECIMAL(3,0)) AS techaffinity, " +
+		"CASE WHEN i % 4 = 0 THEN NULL ELSE (i % 7) - 2 END AS movie, i % 2 AS music FROM range(80) r(i)",
+	"CREATE TABLE lake.public.survey AS SELECT CAST(i % 10 AS BIGINT) AS resp_id, 'answer ' || i AS answer FROM range(20) r(i)",
+	"CREATE VIEW lake.public.v_attributes (person_id, household_id, state, techaffinity, movie, music, survey_resp_id, survey_answer) AS " +
+		"SELECT s.*, sv.resp_id, sv.answer FROM lake.public.attributes AS s LEFT JOIN lake.public.survey AS sv ON CAST(s.household_id AS BIGINT) = sv.resp_id",
+	"CREATE TABLE lake.public.media AS SELECT 'p' || (i % 120) AS person_id, CASE i % 6 WHEN 0 THEN 'drama' WHEN 1 THEN 'news' WHEN 2 THEN '' WHEN 3 THEN NULL ELSE 'sport' END AS genre, " +
+		"CASE WHEN i % 5 = 0 THEN NULL ELSE i % 2 = 0 END AS live, CASE WHEN i % 9 = 0 THEN NULL ELSE CAST(i * 3 AS INTEGER) END AS total_seconds, " +
+		"DATE '2026-01-01' + CAST(i % 50 AS INTEGER) AS viewed_date FROM range(900) r(i)",
+	"CREATE TABLE lake.public.browsing AS SELECT 'p' || (i % 90) AS person_id, CASE i % 4 WHEN 0 THEN ['cars', 'news'] WHEN 1 THEN ['', 'cars', 'cars'] WHEN 2 THEN NULL ELSE [] END AS keywords, " +
+		"CASE WHEN i % 7 = 0 THEN NULL ELSE DATE '2026-02-01' + CAST(i % 9 AS INTEGER) END AS visited_date FROM range(600) r(i)",
+	"CREATE TABLE lake.public.segments AS SELECT 'p' || (i % 110) AS person_id, CASE WHEN i % 3 = 0 THEN 'SEG_HH_' || (i % 5) ELSE 'SEGXHH_' || (i % 4) END AS segment_name FROM range(1500) r(i)",
+}
+
+// reportCohortsSQL are the reports' cohorts: an audience's latest version
+// and the general population, through the attributes view.
+const reportCohortsSQL = `AUDIENCE AS (SELECT person_id FROM audience_members WHERE audience_id = 'a1' AND ver = (SELECT max(ver) FROM audience_revisions WHERE audience_id = 'a1')),
+BASE_POPULATION AS (SELECT person_id FROM v_attributes),
+COHORT_MEMBERS AS (SELECT 'AUDIENCE' AS cohort, person_id FROM (SELECT DISTINCT person_id FROM AUDIENCE WHERE person_id IS NOT NULL)
+  UNION ALL SELECT 'BASE_POPULATION' AS cohort, person_id FROM (SELECT DISTINCT person_id FROM BASE_POPULATION WHERE person_id IS NOT NULL)),
+COHORT_TOTALS AS (SELECT cohort, count(DISTINCT person_id) AS cohort_size FROM COHORT_MEMBERS GROUP BY cohort)`
+
+func reportCohorts() []any {
+	return []any{
+		map[string]any{"label": "AUDIENCE", "table": "audience_members", "member": "person_id", "where": map[string]any{"audience_id": "a1"},
+			"version": map[string]any{"column": "ver", "latest_from": map[string]any{"table": "audience_revisions", "where": map[string]any{"audience_id": "a1"}}}},
+		map[string]any{"label": "BASE_POPULATION", "table": "v_attributes", "member": "person_id"},
+	}
+}
+
+func specLiteral(t *testing.T, spec map[string]any) string {
+	t.Helper()
+	b, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return quoteLiteral(string(b))
+}
+
+func startReportServer(t *testing.T) *catalogServer {
+	t.Helper()
+	cs := startCatalogServer(t)
+	for _, q := range reportFixture {
+		mustExec(t, cs.admin, q)
+	}
+	mustExec(t, cs.admin, "SET search_path = 'lake.public'")
+	return cs
+}
+
+// reportParity checks that spec's result is sql's, and that a result that
+// is not, sql's counts each one more, is told apart.
+func reportParity(t *testing.T, conn *pgx.Conn, name string, spec map[string]any, sql string) {
+	t.Helper()
+	lit := specLiteral(t, spec)
+	if n := texts(t, conn, "SELECT count(*) FROM igloo.audience_profile("+lit+")"); len(n) != 1 || n[0] == "0" {
+		t.Errorf("%s: the API returned %v rows", name, n)
+	}
+	if diff := texts(t, conn, "SELECT * FROM igloo.audience_profile_check("+lit+", "+quoteLiteral(sql)+")"); len(diff) != 0 {
+		api := texts(t, conn, "SELECT * FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+		t.Errorf("%s: the API and the SQL differ:\n%s\nthe API's rows:\n%s", name, strings.Join(diff, "\n"), strings.Join(api, "\n"))
+	}
+	wrong := "SELECT dimension, value, cohort, people + 1 AS people FROM (\n" + sql + "\n)"
+	if diff := texts(t, conn, "SELECT count(*) FROM igloo.audience_profile_check("+lit+", "+quoteLiteral(wrong)+")"); len(diff) != 1 || diff[0] == "0" {
+		t.Errorf("%s: the check did not tell apart counts one more: %v", name, diff)
+	}
+	// The API's SQL, run as written, gives the same.
+	text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
+	if len(text) != 1 {
+		t.Fatalf("%s: audience_profile_sql: %v", name, text)
+	}
+	viaSQL := texts(t, conn, "SELECT * FROM ("+text[0]+") ORDER BY ALL")
+	viaAPI := texts(t, conn, "SELECT * FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+	if !slices.Equal(viaSQL, viaAPI) {
+		t.Errorf("%s: the API's rows are not those of its SQL:\n%q\n%q", name, viaAPI, viaSQL)
+	}
+}
+
+// TestReportAPIParity counts as the segments, signals and behaviors reports
+// do, and gets the rows their SQL gets.
+func TestReportAPIParity(t *testing.T) {
+	cs := startReportServer(t)
+	conn := cs.admin
+
+	reportParity(t, conn, "segments", map[string]any{
+		"version": 1, "cohorts": reportCohorts(), "totals": true,
+		"source":     map[string]any{"table": "segments", "member": "person_id", "where": map[string]any{"segment_name": map[string]any{"like": "SEG_HH_%"}}},
+		"dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}},
+	}, `WITH `+reportCohortsSQL+`
+SELECT 'SEGMENT' AS dimension, S.segment_name AS value, M.cohort AS cohort, false AS is_total, count(DISTINCT S.person_id) AS people, count(*) AS "rows", Z.cohort_size AS cohort_size
+FROM segments AS S JOIN COHORT_MEMBERS AS M ON M.person_id = S.person_id JOIN COHORT_TOTALS AS Z ON Z.cohort = M.cohort WHERE S.segment_name LIKE 'SEG_HH_%' GROUP BY ALL
+UNION ALL
+SELECT 'SEGMENT', NULL, M.cohort, true, count(DISTINCT S.person_id), count(*), Z.cohort_size
+FROM segments AS S JOIN COHORT_MEMBERS AS M ON M.person_id = S.person_id JOIN COHORT_TOTALS AS Z ON Z.cohort = M.cohort WHERE S.segment_name LIKE 'SEG_HH_%' GROUP BY ALL`)
+
+	media := `WITH ` + reportCohortsSQL + `,
+B AS (SELECT md.*, cm.cohort FROM media AS md JOIN COHORT_MEMBERS AS cm ON cm.person_id = md.person_id),
+E AS (SELECT person_id, cohort, total_seconds, 'GENRE' AS d, CAST(genre AS VARCHAR) AS v FROM B
+  UNION ALL SELECT person_id, cohort, total_seconds, 'VIEWING_MODE', CASE WHEN live IS NULL THEN NULL WHEN live THEN 'LIVE' ELSE 'ON_DEMAND' END FROM B
+  UNION ALL SELECT person_id, cohort, total_seconds, 'MEDIA_REACH', 'ANY_VIEWING' FROM B)
+SELECT d AS dimension, v AS value, cohort, count(DISTINCT person_id) AS people, count(*) AS "rows",
+  sum(COALESCE(total_seconds, 0)) AS seconds_sum, avg(COALESCE(total_seconds, 0)) AS seconds_avg,
+  (SELECT min(viewed_date) FROM B) AS extent_min, (SELECT max(viewed_date) FROM B) AS extent_max
+FROM E WHERE v IS NOT NULL AND trim(v) <> '' GROUP BY d, v, cohort`
+	reportParity(t, conn, "media signals", map[string]any{
+		"version": 1, "cohorts": reportCohorts(), "extent": "viewed_date",
+		"source": map[string]any{"table": "media", "member": "person_id"},
+		"dimensions": []any{
+			map[string]any{"name": "GENRE", "column": "genre", "skip_blank": true},
+			map[string]any{"name": "VIEWING_MODE", "column": "live", "map": map[string]any{"true": "LIVE", "false": "ON_DEMAND"}, "skip_blank": true},
+			map[string]any{"name": "MEDIA_REACH", "constant": "ANY_VIEWING", "skip_blank": true},
+		},
+		"metrics": []any{map[string]any{"name": "seconds", "column": "total_seconds", "coalesce": 0}},
+	}, media)
+
+	reportParity(t, conn, "browsing signals", map[string]any{
+		"version": 1, "cohorts": reportCohorts(),
+		"source": map[string]any{"table": "browsing", "member": "person_id"},
+		"dimensions": []any{
+			map[string]any{"name": "KEYWORDS", "elements": "keywords", "skip_blank": true},
+			map[string]any{"name": "BROWSING_REACH", "constant": "ANY_BROWSING"},
+		},
+		"metrics": []any{map[string]any{"name": "days", "distinct_with": "visited_date"}},
+	}, `WITH `+reportCohortsSQL+`
+SELECT 'KEYWORDS' AS dimension, k AS value, M.cohort AS cohort, count(DISTINCT b.person_id) AS people, count(*) AS "rows",
+  count(DISTINCT CASE WHEN b.visited_date IS NULL THEN NULL ELSE (b.person_id, b.visited_date) END) AS days_distinct
+FROM browsing AS b JOIN COHORT_MEMBERS AS M ON M.person_id = b.person_id, unnest(b.keywords) AS u(k) WHERE k IS NOT NULL AND trim(k) <> '' GROUP BY ALL
+UNION ALL
+SELECT 'BROWSING_REACH', 'ANY_BROWSING', M.cohort, count(DISTINCT b.person_id), count(*),
+  count(DISTINCT CASE WHEN b.visited_date IS NULL THEN NULL ELSE (b.person_id, b.visited_date) END)
+FROM browsing AS b JOIN COHORT_MEMBERS AS M ON M.person_id = b.person_id GROUP BY ALL`)
+
+	// Through the view; entries of one name, and two of one (name, group,
+	// value), which count together.
+	interest := func(name, constant, metric string) map[string]any {
+		return map[string]any{"name": name, "group": "INTEREST", "constant": constant, "metric": metric, "metric_where": map[string]any{"gt": 0}}
+	}
+	reportParity(t, conn, "attribute signals", map[string]any{
+		"version": 1, "cohorts": reportCohorts(),
+		"source": map[string]any{"table": "v_attributes", "member": "person_id"},
+		"dimensions": []any{
+			map[string]any{"name": "STATE", "group": "REACH_CONTEXT", "column": "state", "skip_blank": true},
+			interest("TECHNOLOGY", "TECH_AFFINITY", "techaffinity"),
+			interest("ENTERTAINMENT", "MOVIES", "movie"),
+			interest("ENTERTAINMENT", "MUSIC", "music"),
+			interest("ENTERTAINMENT", "MUSIC", "movie"),
+		},
+	}, `WITH `+reportCohortsSQL+`,
+A AS (SELECT a.*, M.cohort FROM v_attributes AS a JOIN COHORT_MEMBERS AS M ON M.person_id = a.person_id),
+E AS (SELECT person_id, cohort, 'STATE' AS d, 'REACH_CONTEXT' AS g, CAST(state AS VARCHAR) AS v, CAST(NULL AS DOUBLE) AS m FROM A WHERE state IS NOT NULL AND trim(state) <> ''
+  UNION ALL SELECT person_id, cohort, 'TECHNOLOGY', 'INTEREST', 'TECH_AFFINITY', CAST(techaffinity AS DOUBLE) FROM A WHERE CAST(techaffinity AS DOUBLE) > 0
+  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MOVIES', CAST(movie AS DOUBLE) FROM A WHERE CAST(movie AS DOUBLE) > 0
+  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MUSIC', CAST(music AS DOUBLE) FROM A WHERE CAST(music AS DOUBLE) > 0
+  UNION ALL SELECT person_id, cohort, 'ENTERTAINMENT', 'INTEREST', 'MUSIC', CAST(movie AS DOUBLE) FROM A WHERE CAST(movie AS DOUBLE) > 0)
+SELECT d AS dimension, g AS dim_group, v AS value, cohort, count(DISTINCT person_id) AS people, count(*) AS "rows",
+  sum(m) AS metric_sum, count(m) AS metric_count, avg(m) AS metric_avg FROM E GROUP BY ALL`)
+
+	reportParity(t, conn, "cohort sizes", map[string]any{"version": 1, "cohorts": reportCohorts(), "dimensions": []any{}},
+		`WITH `+reportCohortsSQL+`
+SELECT CAST(NULL AS VARCHAR) AS dimension, CAST(NULL AS VARCHAR) AS value, cohort, true AS is_total, cohort_size AS people, cohort_size FROM COHORT_TOTALS`)
+
+	reportParity(t, conn, "a cohort given as SQL", map[string]any{
+		"version": 1, "cohorts": []any{map[string]any{"label": "NY", "sql": "SELECT person_id FROM attributes WHERE state = 'NY' -- New York"}},
+		"source":     map[string]any{"table": "segments", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}},
+	}, `SELECT 'SEGMENT' AS dimension, s.segment_name AS value, 'NY' AS cohort, count(DISTINCT s.person_id) AS people
+FROM segments AS s WHERE s.person_id IN (SELECT person_id FROM attributes WHERE state = 'NY') GROUP BY ALL`)
+}
+
+// TestReportAPIForms: the versions, the call in a common table expression
+// and under DESCRIBE, and specs the API refuses.
+func TestReportAPIForms(t *testing.T) {
+	cs := startReportServer(t)
+	conn := cs.admin
+	ctx := context.Background()
+	if got := texts(t, conn, "SELECT igloo.report_api_versions()"); len(got) != 1 || got[0] != "[1]" {
+		t.Errorf("report_api_versions: %q", got)
+	}
+	spec := map[string]any{"version": 1, "cohorts": reportCohorts(), "source": map[string]any{"table": "segments", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}}}
+	lit := specLiteral(t, spec)
+	all := texts(t, conn, "SELECT count(*) FROM igloo.audience_profile("+lit+")")
+	if got := texts(t, conn, "WITH S AS (SELECT * FROM igloo.audience_profile("+lit+")), T AS (SELECT 1 AS x) SELECT count(*) FROM S, T"); !slices.Equal(got, all) {
+		t.Errorf("in a CTE: %q, want %q", got, all)
+	}
+	// In Snowflake's dialect too, as a table function.
+	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+	if got := texts(t, conn, "SELECT count(*) FROM TABLE(igloo.audience_profile("+lit+"))"); !slices.Equal(got, all) {
+		t.Errorf("in Snowflake's dialect: %q, want %q", got, all)
+	}
+	mustExec(t, conn, "SET sql_dialect = 'duckdb'")
+	var cols []string
+	for _, r := range texts(t, conn, "DESCRIBE SELECT * FROM igloo.audience_profile("+lit+") AS p") {
+		f := strings.Split(r, "|")
+		cols = append(cols, f[0]+" "+f[1])
+	}
+	want := []string{"dimension VARCHAR", "dim_group VARCHAR", "value VARCHAR", "cohort VARCHAR", "is_total BOOLEAN", "people BIGINT", "rows BIGINT",
+		"cohort_size BIGINT", "metric_sum DOUBLE", "metric_count BIGINT", "metric_avg DOUBLE", "path VARCHAR"}
+	if !slices.Equal(cols, want) {
+		t.Errorf("DESCRIBE:\n%q\nwant\n%q", cols, want)
+	}
+
+	many := make([]any, 9)
+	for i := range many {
+		many[i] = map[string]any{"label": strings.Repeat("c", i+1), "table": "segments", "member": "person_id"}
+	}
+	for _, c := range []struct{ name, call string }{
+		{"no version", "igloo.audience_profile('{\"cohorts\": []}')"},
+		{"version 2", "igloo.audience_profile('{\"version\": 2}')"},
+		{"an unknown field", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": reportCohorts(), "dimensions": []any{}, "colour": "blue"}) + ")"},
+		{"nine cohorts", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": many, "dimensions": []any{}}) + ")"},
+		{"a spec over 64 KiB", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": reportCohorts(), "dimensions": []any{}, "pad": strings.Repeat("x", 70000)}) + ")"},
+		{"a metric whose columns are the result's", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": reportCohorts(),
+			"source": map[string]any{"table": "media", "member": "person_id"}, "dimensions": []any{map[string]any{"name": "G", "column": "genre"}},
+			"metrics": []any{map[string]any{"name": "metric", "column": "total_seconds"}}}) + ")"},
+		{"a cohort of two columns", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "dimensions": []any{},
+			"cohorts": []any{map[string]any{"label": "x", "sql": "SELECT person_id, state FROM attributes"}}}) + ")"},
+		{"a cohort that is no SELECT", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "dimensions": []any{},
+			"cohorts": []any{map[string]any{"label": "x", "sql": "DELETE FROM attributes"}}}) + ")"},
+		{"a spec that is no literal", "igloo.audience_profile(lower('{}'))"},
+		{"an unknown operator", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": []any{
+			map[string]any{"label": "x", "table": "segments", "member": "person_id", "where": map[string]any{"segment_name": map[string]any{"near": 1}}}}, "dimensions": []any{}}) + ")"},
+	} {
+		_, err := conn.Exec(ctx, "SELECT * FROM "+c.call)
+		if pgCode(err) != "22023" {
+			t.Errorf("%s: %v, want 22023", c.name, err)
+		}
+	}
+}
+
+// TestReportAPIGovernance: a call is allowed and refused exactly as the SQL
+// it stands for, with the same error, and policies apply to it as to that
+// SQL.
+func TestReportAPIGovernance(t *testing.T) {
+	cs := startReportServer(t)
+	ctx := context.Background()
+	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+	for _, tbl := range []string{"segments", "audience_members", "audience_revisions", "media"} {
+		mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public."+tbl+" TO nina")
+	}
+	audience := reportCohorts()[:1]
+	specs := map[string]map[string]any{
+		"granted tables": {"version": 1, "cohorts": audience, "totals": true, "source": map[string]any{"table": "segments", "member": "person_id"},
+			"dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}}},
+		"a view not granted": {"version": 1, "cohorts": reportCohorts(), "source": map[string]any{"table": "segments", "member": "person_id"},
+			"dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}}},
+		"a cohort's SQL reading a table not granted": {"version": 1, "dimensions": []any{},
+			"cohorts": []any{map[string]any{"label": "x", "sql": "SELECT person_id FROM attributes"}}},
+		"a source not granted": {"version": 1, "cohorts": audience, "source": map[string]any{"table": "browsing", "member": "person_id"},
+			"dimensions": []any{map[string]any{"name": "K", "elements": "keywords"}}},
+		"the other catalog's secrets": {"version": 1, "cohorts": []any{map[string]any{"label": "x", "table": "secrets", "member": "code"}}, "dimensions": []any{}},
+		"files":                       {"version": 1, "cohorts": []any{map[string]any{"label": "x", "sql": "SELECT column0 FROM read_csv('/etc/passwd')"}}, "dimensions": []any{}},
+	}
+	same := func(who string, conn *pgx.Conn) {
+		t.Helper()
+		for name, spec := range specs {
+			lit := specLiteral(t, spec)
+			text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
+			if len(text) != 1 {
+				t.Fatalf("%s, %s: audience_profile_sql: %q", who, name, text)
+			}
+			_, errAPI := conn.Exec(ctx, "SELECT * FROM igloo.audience_profile("+lit+")")
+			_, errSQL := conn.Exec(ctx, text[0])
+			if pgCode(errAPI) != pgCode(errSQL) || (errAPI == nil) != (errSQL == nil) {
+				t.Errorf("%s, %s: the API: %v; its SQL: %v", who, name, errAPI, errSQL)
+				continue
+			}
+			if errAPI == nil {
+				api := texts(t, conn, "SELECT * FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+				sql := texts(t, conn, "SELECT * FROM ("+text[0]+") ORDER BY ALL")
+				if !slices.Equal(api, sql) {
+					t.Errorf("%s, %s: rows differ:\n%q\n%q", who, name, api, sql)
+				}
+			}
+		}
+	}
+	same("nina", nina)
+	if _, err := nina.Exec(ctx, "SELECT * FROM igloo.audience_profile("+specLiteral(t, specs["a view not granted"])+")"); pgCode(err) != "42501" {
+		t.Errorf("nina's call reading a view she may not: %v", err)
+	}
+
+	// Row access and masking policies apply to the call as to its SQL.
+	for _, q := range []string{
+		"CREATE ROW ACCESS POLICY some_segments AS (s VARCHAR) RETURNS BOOLEAN -> starts_with(s, 'SEG_')",
+		"ALTER TABLE lake.public.segments ADD ROW ACCESS POLICY some_segments ON (segment_name)",
+		"CREATE MASKING POLICY first_letter AS (v VARCHAR) RETURNS VARCHAR -> left(v, 1)",
+		"ALTER TABLE lake.public.audience_members ALTER COLUMN person_id SET MASKING POLICY first_letter",
+	} {
+		mustExec(t, cs.admin, q)
+	}
+	same("nina, under policies", nina)
+	same("the admin, under policies", cs.admin)
+}
+
+// TestReportAPICheck: the parity check runs the caller's SQL as the caller
+// would: one read-only SELECT, refused what the caller may not read.
+func TestReportAPICheck(t *testing.T) {
+	cs := startReportServer(t)
+	ctx := context.Background()
+	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.segments TO nina")
+	spec := specLiteral(t, map[string]any{"version": 1, "cohorts": []any{map[string]any{"label": "x", "table": "segments", "member": "person_id"}},
+		"source": map[string]any{"table": "segments", "member": "person_id"}, "dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}}})
+	check := func(sql string) error {
+		_, err := nina.Exec(ctx, "SELECT * FROM igloo.audience_profile_check("+spec+", "+quoteLiteral(sql)+")")
+		return err
+	}
+	for _, c := range []struct{ name, sql, code string }{
+		{"two statements", "SELECT 'a' AS dimension, 'b' AS value, 'x' AS cohort; DELETE FROM segments", "22023"},
+		{"a DELETE", "DELETE FROM segments", "22023"},
+		{"an INSERT", "INSERT INTO segments VALUES ('p', 's')", "22023"},
+		{"a star", "SELECT * FROM segments", "22023"},
+		{"no cohort column", "SELECT 'a' AS dimension, 'b' AS value", "22023"},
+	} {
+		if err := check(c.sql); pgCode(err) != c.code {
+			t.Errorf("%s: %v, want %s", c.name, err, c.code)
+		}
+	}
+	// What nina may not read directly, she may not read through the check,
+	// with the same error.
+	for _, sql := range []string{
+		"SELECT 'a' AS dimension, code AS value, 'x' AS cohort FROM secrets",
+		"SELECT 'a' AS dimension, column0 AS value, 'x' AS cohort FROM read_csv('/etc/passwd')",
+		"SELECT 'a' AS dimension, 'b' AS value, 'x' AS cohort FROM igloo_bitmaps.anything",
+		"SELECT 'a' AS dimension, segment_name AS value, 'x' AS cohort FROM segments WHERE _igloo_id_person_id = 1",
+	} {
+		_, direct := nina.Exec(ctx, sql)
+		through := check(sql)
+		if direct == nil || through == nil || pgCode(direct) != pgCode(through) {
+			t.Errorf("%s: directly %v, through the check %v", sql, direct, through)
+		}
+	}
+	if err := check("SELECT 'SEGMENT' AS dimension, segment_name AS value, 'x' AS cohort, count(DISTINCT person_id) AS people FROM segments GROUP BY ALL"); err != nil {
+		t.Errorf("a check nina may run: %v", err)
+	}
+}

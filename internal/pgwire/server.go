@@ -1739,6 +1739,12 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		sess.temps = true
 	}
 	fail := func(err error) (*statement, error) { return nil, err }
+	// Calls of the report API become the SQL they stand for before
+	// anything else looks at the statement (see reportapi.go).
+	text, err := s.reportCalls(ctx, sess, text)
+	if err != nil {
+		return fail(err)
+	}
 	var viewGen uint64
 	if s.ddl != nil {
 		viewGen = s.ddl.Generation()
