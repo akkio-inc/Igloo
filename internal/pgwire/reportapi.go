@@ -766,6 +766,42 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 		return b.String()
 	}
 
+	member, from := "s."+quoteIdent(s.Source.Member), tableName(s.Source.Table)+" AS s"
+	if ids != nil {
+		member, from = "CAST(s."+ids.source.hidden+" AS UINTEGER)", ids.source.from+" AS s AT (VERSION => "+strconv.FormatInt(ids.source.at, 10)+")"
+	}
+	from += " JOIN " + cte("cohorts") + " AS c ON c.member = " + member
+	if w := s.Source.Where.sql("s"); w != "" {
+		from += " WHERE " + w
+	}
+	counts, metricCols, extent := s.scanCounts(from, "c.cohort", member, true)
+	b.WriteString(counts)
+	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, n.people, n.\"rows\", z.cohort_size, " +
+		"n.metric_sum, n.metric_count, n.metric_avg")
+	for _, c := range metricCols {
+		b.WriteString(", " + c)
+	}
+	if s.Extent != "" {
+		b.WriteString(", x.extent_min, x.extent_max")
+	}
+	b.WriteString(", 'scan' AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
+	if extent != "" {
+		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
+	}
+	b.WriteString(" WHERE n.everything = 0 AND n.\"rows\" > 0")
+	return b.String()
+}
+
+// scanCounts writes the CTEs that count the source's rows by value: each
+// of its rows whose member is in a cohort (from, the FROM of the source as
+// s with each row's cohort, cohort, and member, member), once for each
+// cohort, with its dimensions' entries, one for each value it has and one
+// that counts in no value, so that every row is in the extent; and their
+// counts by value and, for totals, by dimension. people counts their
+// distinct members too. It returns the CTEs, the columns of the metrics as
+// the counts' (alias n) and the SELECT of the extent, if any.
+func (s *reportSpec) scanCounts(from, cohort, member string, people bool) (string, []string, string) {
+	var b strings.Builder
 	// Each row of the source whose member is in a cohort, once for each
 	// cohort, with its dimensions' entries: one for each value it has, and
 	// one that counts in no value, so that every row is in the extent.
@@ -798,19 +834,11 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 	for _, l := range lists {
 		entries = "list_concat(" + entries + ", " + l + ")"
 	}
-	member, from := "s."+quoteIdent(s.Source.Member), tableName(s.Source.Table)+" AS s"
-	if ids != nil {
-		member, from = "CAST(s."+ids.source.hidden+" AS UINTEGER)", ids.source.from+" AS s AT (VERSION => "+strconv.FormatInt(ids.source.at, 10)+")"
-	}
-	b.WriteString(", " + cte("rows") + " AS (SELECT c.cohort, " + member + " AS member, ")
+	b.WriteString(", " + cte("rows") + " AS (SELECT " + cohort + " AS cohort, " + member + " AS member, ")
 	for _, c := range rowCols {
 		b.WriteString(c + ", ")
 	}
-	b.WriteString("unnest(" + entries + ") AS e FROM " + from + " JOIN " + cte("cohorts") + " AS c ON c.member = " + member)
-	if w := s.Source.Where.sql("s"); w != "" {
-		b.WriteString(" WHERE " + w)
-	}
-	b.WriteString(")\n")
+	b.WriteString("unnest(" + entries + ") AS e FROM " + from + ")\n")
 
 	// The counts, by value and, for totals, by dimension, and the extent
 	// over every row.
@@ -822,11 +850,14 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 		b.WriteString(", ext")
 	}
 	b.WriteString(" FROM " + cte("rows") + ")\n")
-	aggs := "count(DISTINCT CASE WHEN keep THEN member END) AS people, count(*) FILTER (WHERE keep) AS \"rows\", " +
+	aggs := "count(*) FILTER (WHERE keep) AS \"rows\", " +
 		"sum(metric) FILTER (WHERE keep) AS metric_sum, " +
 		// NULL, not 0, where no entry has a metric.
 		"CASE WHEN bool_or(has_metric) FILTER (WHERE keep) THEN count(metric) FILTER (WHERE keep) END AS metric_count, " +
 		"avg(metric) FILTER (WHERE keep) AS metric_avg"
+	if people {
+		aggs = "count(DISTINCT CASE WHEN keep THEN member END) AS people, " + aggs
+	}
 	var metricCols []string
 	pairs := false
 	for i, m := range s.Metrics {
@@ -874,20 +905,7 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 			extent = "SELECT min(ext) AS extent_min, max(ext) AS extent_max FROM " + cte("values")
 		}
 	}
-	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, n.people, n.\"rows\", z.cohort_size, " +
-		"n.metric_sum, n.metric_count, n.metric_avg")
-	for _, c := range metricCols {
-		b.WriteString(", " + c)
-	}
-	if s.Extent != "" {
-		b.WriteString(", x.extent_min, x.extent_max")
-	}
-	b.WriteString(", 'scan' AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
-	if extent != "" {
-		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
-	}
-	b.WriteString(" WHERE n.everything = 0 AND n.\"rows\" > 0")
-	return b.String()
+	return b.String(), metricCols, extent
 }
 
 // valueSQL is the value of a column or constant dimension, of the source s.

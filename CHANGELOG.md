@@ -146,8 +146,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   SQL's; `igloo.audience_profile_check` compares a call with the caller's
   own SQL, and `igloo.report_api_versions()` lists the versions. Where the
   tables are an ID domain's members, a call joins and counts their ids, and
-  where bitmap indexes hold all a call counts, it reads their bitmaps (see
-  [Report API](docs/media-analytics.md#report-api)).
+  where bitmap indexes hold all a call counts, it reads their bitmaps, and
+  where they hold its people, it reads those and scans the source for the
+  rest (see [Report API](docs/media-analytics.md#report-api)).
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

@@ -459,7 +459,14 @@ the bitmaps are of the tables' current snapshots. And:
   value are as many as its people. An index records each bitmap's rows and
   members to tell.
 
-Anything else is counted from the tables (`path` is `scan`).
+Where the bitmaps hold the people but not the rest, because members repeat
+rows in a group or the call asks for metrics or the extent, people come from
+the bitmaps and the rest from one scan of the source at the snapshot the
+bitmaps are of, which keeps each cohort's members' rows by the cohort's
+bitmap instead of joining the cohorts and counts no distinct members
+(`path` is `index+scan`); a dimension with a `metric_where` keeps its call
+on the tables. Anything else is counted from the tables (`path` is
+`scan`).
 
 ### Parity check
 

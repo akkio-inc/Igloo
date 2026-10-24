@@ -475,19 +475,15 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		"dimensions": []any{map[string]any{"name": "REACH", "constant": "ANYONE"}}}
 	// answered runs spec and checks its rows are its SQL's, and whether
 	// bitmap indexes answered it.
-	answered := func(what string, spec map[string]any, fromIndexes bool) {
+	answered := func(what string, spec map[string]any, want string) {
 		t.Helper()
 		lit := specLiteral(t, spec)
 		before := srv.reportFromIndexes.Load()
 		api := texts(t, conn, "SELECT * EXCLUDE (path) FROM igloo.audience_profile("+lit+") ORDER BY ALL")
-		if got := srv.reportFromIndexes.Load() > before; got != fromIndexes {
-			t.Errorf("%s: from indexes %v, want %v", what, got, fromIndexes)
+		if got := srv.reportFromIndexes.Load() > before; got != (want != "scan") {
+			t.Errorf("%s: from indexes %v, want %s", what, got, want)
 		}
 		paths := texts(t, conn, "SELECT DISTINCT path FROM igloo.audience_profile("+lit+")")
-		want := "scan"
-		if fromIndexes {
-			want = "index"
-		}
 		if len(paths) != 1 || paths[0] != want {
 			t.Errorf("%s: paths %q, want %s", what, paths, want)
 		}
@@ -499,17 +495,17 @@ func TestReportAPIFromIndexes(t *testing.T) {
 			t.Errorf("%s: rows\n%q\nwant\n%q", what, api, sql)
 		}
 	}
-	answered("segments", segments, true)
-	answered("a constant, over a table of one row a member", everyone, true)
+	answered("segments", segments, "index")
+	answered("a constant, over a table of one row a member", everyone, "index")
 	// Values of several groups: a constant over the segments a condition
 	// keeps (E2's totals), values a map merges, and entries that merge.
 	answered("a constant over some segments", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
 		"source":     map[string]any{"table": "person_segments", "member": "person_id", "where": map[string]any{"segment_name": map[string]any{"like": "SEG_%"}}},
-		"dimensions": []any{map[string]any{"name": "TOTAL", "constant": "ANY"}}}, true)
+		"dimensions": []any{map[string]any{"name": "TOTAL", "constant": "ANY"}}}, "index")
 	answered("a map that merges values", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
 		"source": map[string]any{"table": "person_segments", "member": "person_id"},
 		"dimensions": []any{map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_1": "low", "SEG_2": "low", "SEG_3": "high"}},
-			map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_4": "low"}, "skip_blank": true}}}, true)
+			map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_4": "low"}, "skip_blank": true}}}, "index")
 
 	// A list's elements, from an index of them: once each a member, from
 	// the bitmaps; repeated in a member's lists, from the tables.
@@ -524,12 +520,34 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	topics := map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
 		"source":     map[string]any{"table": "interests", "member": "person_id"},
 		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "skip_blank": true}}}
-	answered("a list's elements", topics, true)
+	answered("a list's elements", topics, "index")
 	it.internal("INSERT INTO lake.public.interests (person_id, topics, _igloo_id_person_id) SELECT value, ['cars'], id FROM lake.igloo_domains.people WHERE value = 'p0'")
 	srv.indexesChanged("public", "interests")
 	srv.waitIndexBuilds(t)
 	srv.MaintainBitmapIndexes(ctx)
-	answered("a list's elements, one repeated in a member's lists", topics, false)
+	answered("a list's elements, one repeated in a member's lists", topics, "index+scan")
+
+	// Metrics and the extent: people from the bitmaps, the rest from a scan
+	// of the source that keeps the cohorts' rows by their bitmaps.
+	it.exec(
+		"CREATE TABLE lake.public.plays AS SELECT 'p' || (i % 200) AS person_id, CASE i % 5 WHEN 0 THEN 'drama' WHEN 1 THEN 'news' WHEN 2 THEN '' WHEN 3 THEN NULL ELSE 'sport' END AS genre, "+
+			"CASE WHEN i % 7 = 0 THEN NULL ELSE CAST(i AS INTEGER) END AS seconds, DATE '2026-01-01' + CAST(i % 40 AS INTEGER) AS day FROM range(1500) r(i)",
+		"ALTER TABLE lake.public.plays ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.plays ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	srv.MapIDDomains(ctx)
+	it.exec("ALTER TABLE lake.public.plays ADD BITMAP INDEX plays_genre ON (genre) FOR person_id",
+		"ALTER TABLE lake.public.plays ADD BITMAP INDEX plays_all ON () FOR person_id")
+	srv.waitIndexBuilds(t)
+	answered("plays, with metrics and the extent", map[string]any{"version": 1, "cohorts": cohorts, "totals": true, "extent": "day",
+		"source": map[string]any{"table": "plays", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "GENRE", "column": "genre", "skip_blank": true},
+			map[string]any{"name": "REACH", "constant": "ANY_PLAY", "metric": "seconds"}},
+		"metrics": []any{map[string]any{"name": "seconds", "column": "seconds", "coalesce": 0}, map[string]any{"name": "days", "distinct_with": "day"}}}, "index+scan")
+	// A condition on a metric, which bitmaps cannot keep: the tables.
+	answered("plays, with a metric's condition", map[string]any{"version": 1, "cohorts": cohorts,
+		"source":     map[string]any{"table": "plays", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "LONG", "constant": "LONG_PLAY", "metric": "seconds", "metric_where": map[string]any{"gt": 1000}}}}, "scan")
 
 	// A prepared call counted from the tables while an index it needs is
 	// missing reads the bitmaps once the index is built.
@@ -552,7 +570,7 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	// A masking policy on a column read: the tables.
 	it.exec("CREATE MASKING POLICY same AS (v VARCHAR) RETURNS VARCHAR -> v",
 		"ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name SET MASKING POLICY same")
-	answered("segments under a mask", segments, false)
+	answered("segments under a mask", segments, "scan")
 	it.exec("ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name UNSET MASKING POLICY")
 
 	// A member with two rows in a group: its rows are not its people, so
@@ -560,5 +578,5 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	it.exec("INSERT INTO lake.public.person_segments VALUES ('p1', 'SEG_1'), ('p1', 'SEG_1')")
 	srv.waitIndexBuilds(t)
 	srv.MaintainBitmapIndexes(ctx)
-	answered("segments, with a member's row repeated", segments, false)
+	answered("segments, with a member's row repeated", segments, "index+scan")
 }
