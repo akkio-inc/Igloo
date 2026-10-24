@@ -565,6 +565,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	if err != nil {
 		return nil, err
 	}
+	if err := checkVersions(plan.versions, snapshots); err != nil {
+		return nil, err
+	}
 	for _, key := range plan.pins {
 		if t := snapshots[key]; t.Versioned && t.Snapshot == 0 {
 			// No snapshot to read it at: it is empty, but a commit could
@@ -634,7 +637,10 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			ex.Probes = nil
 		}
 		run, plan, err = co.runProbing(ctx, planned, newRun(aqid), newRun, func(stages []*Stage) error {
-			return co.loadMore(ctx, stages, snapshots, files)
+			if err := co.loadMore(ctx, stages, snapshots, files); err != nil {
+				return err
+			}
+			return checkVersions(plan.versions, snapshots)
 		}, &ex.Probes)
 		if err == nil {
 			co.observeExchanges(plan.Key, run, plan.Stages)
@@ -736,6 +742,20 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	co.opts.Metrics.query("ok", start)
 	ok = true
 	return ex, nil
+}
+
+// checkVersions checks that the snapshots loaded for workers are those the
+// statement pins tables to (see pinVersion). One that is not, as when a
+// commit landed after the statement was prepared, keeps the statement on
+// one machine, which reads the pinned snapshot itself.
+func checkVersions(versions map[string]int64, tables map[string]*Table) error {
+	for key, n := range versions {
+		t, ok := tables[key]
+		if ok && (!t.Versioned || t.Snapshot != n) {
+			return unsupported("it reads %s at snapshot %d, where workers would read %d", t, n, t.Snapshot)
+		}
+	}
+	return nil
 }
 
 // load brings every table the stages read to its current snapshot and lists

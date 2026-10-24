@@ -166,6 +166,10 @@ type Plan struct {
 	// values.go).
 	values   []*value
 	valueEnv ValueEnv
+	// versions are the snapshots the statement reads tables at, AT
+	// (VERSION => n), by key: Execute runs it on workers only if each is
+	// the snapshot it loads (see pinVersion).
+	versions map[string]int64
 }
 
 // ShortOfMemory reports whether the statement would not fit in the
@@ -274,6 +278,9 @@ type planner struct {
 	reasons []string
 	// tables caches resolved names.
 	tables map[string]tableResult
+	// versions are the snapshots the statement reads tables at, by key (see
+	// pinVersion).
+	versions map[string]int64
 	// defaultCollation caches the session's default_collation; nil until
 	// read.
 	defaultCollation *string
@@ -344,7 +351,8 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	for x, k := range pl.relKeys {
 		keys[x.ID] = k
 	}
-	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys}, nil
+	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys,
+		versions: pl.versions}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
@@ -421,8 +429,15 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 			return true
 		}
 		if child(n, "at_clause") != nil {
-			err = unsupported("time travel")
-			return false
+			// Pinned to the snapshot workers read, as Execute checks.
+			version, pinned := pinnedVersion(n)
+			if !pinned {
+				err = unsupported("time travel")
+				return false
+			}
+			if err = pl.pinVersion(t, version); err != nil {
+				return false
+			}
 		}
 		pins[key] = t.key()
 		return true
@@ -985,7 +1000,8 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if child(ref, "sample") != nil {
 			return unsupported("TABLESAMPLE")
 		}
-		if child(ref, "at_clause") != nil {
+		version, pinned := pinnedVersion(ref)
+		if child(ref, "at_clause") != nil && !pinned {
 			return unsupported("time travel")
 		}
 		parts := tableParts(ref)
@@ -1018,6 +1034,11 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		}
 		if err != nil {
 			return err
+		}
+		if pinned {
+			if err := pl.pinVersion(tbl, version); err != nil {
+				return err
+			}
 		}
 		item := &fromItem{name: strings.ToLower(tbl.Name)}
 		if a := str(ref["alias"]); a != "" {
@@ -1454,7 +1475,8 @@ func (pl *planner) fullRead(n node, outer, local []string, rd *reads) error {
 		}
 		switch str(m["type"]) {
 		case "BASE_TABLE":
-			if child(m, "at_clause") != nil || child(m, "sample") != nil {
+			version, pinned := pinnedVersion(m)
+			if child(m, "at_clause") != nil && !pinned || child(m, "sample") != nil {
 				err = unsupported("time travel or sampling")
 				return false
 			}
@@ -1462,6 +1484,9 @@ func (pl *planner) fullRead(n node, outer, local []string, rd *reads) error {
 			if len(parts) == 1 {
 				name := strings.ToLower(parts[0])
 				if slices.Contains(local, name) {
+					if pinned {
+						err = unsupported("time travel")
+					}
 					return false
 				}
 				if slices.Contains(outer, name) {
@@ -1471,6 +1496,9 @@ func (pl *planner) fullRead(n node, outer, local []string, rd *reads) error {
 			}
 			var t *Table
 			if t, err = pl.table(parts); err == nil {
+				if pinned {
+					err = pl.pinVersion(t, version)
+				}
 				rd.uses = append(rd.uses, &tableUse{ref: m, table: t})
 			} else if IsUnsupported(err) {
 				// A view reads as its query here too.
@@ -1503,6 +1531,36 @@ func (pl *planner) fullRead(n node, outer, local []string, rd *reads) error {
 		walk(c, visit)
 	}
 	return err
+}
+
+// pinnedVersion returns the snapshot a table reference reads, AT (VERSION
+// => n) with n an integer: the only time travel the planner takes. Igloo
+// pins a statement it answers from bitmap indexes to the snapshots the
+// bitmaps are of, and before each run prepares it again if a table has
+// moved on (see pgwire's refreshIndexes), so n is the table's current
+// snapshot nearly always.
+func pinnedVersion(ref node) (int64, bool) {
+	at := child(ref, "at_clause")
+	if at == nil || !strings.EqualFold(str(at["unit"]), "VERSION") {
+		return 0, false
+	}
+	return intConstant(child(at, "expr"))
+}
+
+// pinVersion records that the statement reads table t at snapshot n.
+// Workers read the snapshot Execute loads, and the coordinator's own reads
+// of a table workers read are pinned to it: Execute runs the statement on
+// workers only if that snapshot is n. A statement that reads two
+// snapshots of a table stays on one machine.
+func (pl *planner) pinVersion(t *Table, n int64) error {
+	if v, ok := pl.versions[t.key()]; ok && v != n {
+		return unsupported("time travel to two snapshots of %s", t)
+	}
+	if pl.versions == nil {
+		pl.versions = map[string]int64{}
+	}
+	pl.versions[t.key()] = n
+	return nil
 }
 
 func tableParts(ref node) []string {
@@ -1775,7 +1833,8 @@ func pointAtViews(fragment node) {
 		if str(n["alias"]) == "" {
 			n["alias"] = str(n["table_name"])
 		}
-		n["table_name"], n["schema_name"], n["catalog_name"] = v, "", ""
+		// A view of the snapshot a pin names (see pinVersion).
+		n["table_name"], n["schema_name"], n["catalog_name"], n["at_clause"] = v, "", "", nil
 		delete(n, viewMark)
 		return nil, false
 	})

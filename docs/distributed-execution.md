@@ -179,12 +179,14 @@ In detail, a part runs distributed when:
   among them. Workers read them, and the fields nested in them, by their
   Iceberg field IDs, as one machine does.
 - It runs outside an explicit transaction, so it reads the tables' latest
-  snapshots, and does not use time travel. Igloo's own reads of its bitmap
-  indexes are the exception: where a statement Igloo writes to answer from
-  them filters a large table by a scalar subquery over an index's table, at
-  the snapshot it pinned, the coordinator computes that subquery once and
-  workers get its value (`computed first` in `EXPLAIN DISTRIBUTED`). Values
-  over 16 MiB keep the statement on one machine.
+  snapshots, and does not use time travel. A read at the snapshot that is
+  a table's latest, `AT (VERSION => n)`, as Igloo pins the statements it
+  answers from bitmap indexes, counts as such a read; at any other, the
+  statement runs on one machine. Where such a statement filters a large
+  table by a scalar subquery over an index's table, the coordinator
+  computes that subquery once and workers get its value (`computed first`
+  in `EXPLAIN DISTRIBUTED`). Values over 16 MiB keep the statement on one
+  machine.
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
@@ -740,7 +742,8 @@ machine's memory run where that machine would run out of memory.
   worker's groups to it. (`count(DISTINCT x)` over billions of values sends
   it one row per group and partition.)
 - Tables with data files without field IDs, views that group, sort or
-  limit, and time travel run on one machine.
+  limit, and time travel to any snapshot but a table's latest run on one
+  machine.
 - Workers read each table's files directly and do not use Iceberg partition
   statistics to skip files; DuckDB skips row groups by their Parquet
   statistics instead.

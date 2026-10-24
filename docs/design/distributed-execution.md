@@ -459,6 +459,17 @@ result's columns must match the prepared statement's, or it falls back.
   statement keeps its plan key: the subquery's shape, not the variable.
   A value over 16 MiB keeps the statement on one machine, and so does a
   statement that calls `getvariable` itself.
+- **Pinned snapshots.** Such a statement also reads the indexed tables
+  themselves at the snapshots their bitmaps are of, `AT (VERSION => n)`,
+  and Igloo prepares it again before a run if a table has moved on, so n
+  is nearly always the table's current snapshot. The planner takes that
+  one form of time travel: it records the snapshot each table is pinned
+  to (two snapshots of one table keep the statement on one machine),
+  workers read their views of it as of any other read, and Execute runs
+  the statement on workers only if the snapshot it loads for them is n.
+  The coordinator's own reads of the table are pinned to that same
+  snapshot as usual. Pins do not count in the plan key, which a commit
+  would otherwise change.
 - **Exact where one machine is exact.** Sums of integers and decimals,
   counts, minimums, maximums and distinct aggregates are exact.
   Floating-point sums and averages may differ in their last digits, as they

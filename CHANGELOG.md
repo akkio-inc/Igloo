@@ -590,7 +590,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statement pinned, once, and workers read its value from a DuckDB
   variable, never the table, which a policy of Igloo's own keeps from them.
   `EXPLAIN DISTRIBUTED` lists such values as `computed first`; one over
-  16 MiB keeps the statement on one machine.
+  16 MiB keeps the statement on one machine. A table read at its latest
+  snapshot by number, `AT (VERSION => n)`, as such statements read the
+  indexed tables, runs on workers too; one read at an older snapshot, or at
+  two, still runs on one machine.
 - A subquery that workers compute as a relation, as when a report joins a
   view of a wide table to itself, writes only the columns its reader
   reads to the exchange. A report whose 16 branches each read three

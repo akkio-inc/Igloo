@@ -246,3 +246,63 @@ func TestSetVariables(t *testing.T) {
 		}
 	}
 }
+
+// A table read at a pinned snapshot, AT (VERSION => n), runs on workers
+// when n is the snapshot Execute loads, which workers read; at another, it
+// stays on one machine, and so does a statement that reads two snapshots
+// of a table or reads one at a time. The snapshot is not part of the plan
+// key. With the cohort a subquery computes, this is the shape of a
+// statement Igloo answers from bitmap indexes that scans the indexed table.
+func TestPinnedVersions(t *testing.T) {
+	h := newHarness(t, 0.01, 4, 2)
+	for name, snapshot := range map[string]int64{"lineitem": 7, "customer": 5, "orders": 9} {
+		h.tables[name].Versioned, h.tables[name].Snapshot = true, snapshot
+	}
+	h.exec(`CREATE TABLE cutoffs AS SELECT * FROM (VALUES ('a', 1000::BIGINT), ('b', 30000::BIGINT)) AS v(name, k)`)
+	env := valueEnv{harnessEnv{h}, map[string]bool{"cutoffs": true}}
+	ok := []string{
+		`SELECT l_returnflag, count(*) AS n, sum(l_quantity) AS q FROM lineitem AT (VERSION => 7) GROUP BY 1 ORDER BY 1`,
+		`SELECT l_returnflag, count(*) AS n FROM lineitem AT (VERSION => 7)
+			WHERE l_orderkey < (SELECT max(k) FROM cutoffs AT (VERSION => 3) WHERE name = 'b') GROUP BY 1 ORDER BY 1`,
+		`SELECT o_orderpriority, count(*) AS n FROM orders AT (VERSION => 9)
+			WHERE o_custkey IN (SELECT c_custkey FROM customer AT (VERSION => 5) WHERE c_mktsegment = 'BUILDING') GROUP BY 1 ORDER BY 1`,
+	}
+	for _, q := range ok {
+		got, want, plan, err := h.runValues(env, q)
+		if err != nil {
+			t.Fatalf("%s: %v", short(q), err)
+		}
+		if msg := compareRows(want, got, true); msg != "" {
+			t.Errorf("%s\n%s\n%s", short(q), msg, plan.describe())
+		}
+		for _, s := range plan.Stages {
+			if strings.Contains(s.SQL, "VERSION") {
+				t.Errorf("%s: stage %d reads at a snapshot: %s", short(q), s.ID, s.SQL)
+			}
+		}
+	}
+
+	moved := strings.ReplaceAll(ok[0], "VERSION => 7", "VERSION => 6")
+	if _, _, _, err := h.runValues(env, moved); !IsUnsupported(err) || !strings.Contains(err.Error(), "snapshot 6") {
+		t.Errorf("a pin to another snapshot: %v, want it kept on one machine", err)
+	}
+	p7, err := h.co.Plan(context.Background(), ok[0], env, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p6, err := h.co.Plan(context.Background(), moved, env, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p7.Key != p6.Key {
+		t.Error("the snapshot a pin names changed the plan key")
+	}
+	for _, q := range []string{
+		`SELECT count(*) FROM lineitem AT (VERSION => 7) AS a JOIN lineitem AT (VERSION => 6) AS b ON a.l_orderkey = b.l_orderkey`,
+		`SELECT count(*) FROM lineitem AT (TIMESTAMP => TIMESTAMP '2026-01-01')`,
+	} {
+		if _, err := h.co.Plan(context.Background(), q, env, ModeOn); !IsUnsupported(err) {
+			t.Errorf("%s: planned with %v, want it kept on one machine", short(q), err)
+		}
+	}
+}

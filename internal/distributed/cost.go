@@ -648,12 +648,18 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 }
 
 // planKey identifies a statement in the history of its runs: its syntax
-// tree without positions and without its literals other than integers,
-// and the sizes of the tables its stages read, each to a factor of two. A
-// BI tool's statement run again for another day is the same statement;
-// one over tables that have grown fourfold is not.
+// tree without positions, without its literals other than integers and
+// without the snapshots it reads tables at, and the sizes of the tables
+// its stages read, each to a factor of two. A BI tool's statement run
+// again for another day is the same statement; one over tables that have
+// grown fourfold is not.
 func planKey(stmt node, stages []*Stage) string {
 	shape := rewrite(clone(stmt), func(n node) (node, bool) {
+		if at := child(n, "at_clause"); at != nil {
+			// The snapshot a pin names moves with every commit, as the
+			// statement Igloo writes to answer from bitmap indexes does.
+			n["at_clause"] = node{"unit": at["unit"]}
+		}
 		if str(n["class"]) != "CONSTANT" {
 			return nil, false
 		}
