@@ -112,6 +112,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   distinct people over integers, and keeping sets of them as bitmaps, is
   what the heaviest audience reports spend their time on; the work that
   fills the ids and counts through them follows.
+- A star in a view over a member table of an ID domain leaves out the
+  column of ids when the view is created and whenever a replica loads it,
+  as in statements, so a column list names the columns it means and the
+  catalog lists them. Views recorded with that column among theirs load
+  without it, with the names they meant.
 - Bitmap indexes, off by default (`IGLOO_BITMAP_INDEXES`, with ID domains):
   `ALTER TABLE t ADD BITMAP INDEX name ON (segment) FOR person_id` keeps a
   roaring bitmap of a member column's ids for each value of up to four other

@@ -29,6 +29,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 )
 
 const (
@@ -380,7 +381,12 @@ func (m *Manager) CreateView(ctx context.Context, conn *duckdb.Conn, schema, nam
 	if len(columns) > 0 {
 		stmt += " (" + quoteList(columns) + ")"
 	}
-	if err := m.exec(ctx, conn, stmt+" AS "+m.rewrite(query)); err != nil {
+	body, err := hideIDs(ctx, conn, query)
+	if err != nil {
+		m.restore(ctx, k, schema, name)
+		return err
+	}
+	if err := m.exec(ctx, conn, stmt+" AS "+m.rewrite(body)); err != nil {
 		m.restore(ctx, k, schema, name)
 		return err
 	}
@@ -519,21 +525,78 @@ func (m *Manager) createLocal(ctx context.Context, conn *duckdb.Conn, v catalog.
 	if err := m.exec(ctx, conn, "CREATE SCHEMA IF NOT EXISTS "+schema); err != nil {
 		return err
 	}
-	stmt := "CREATE OR REPLACE VIEW " + m.localName(v.Schema, v.Name)
-	if len(v.Columns) > 0 {
-		names := make([]string, len(v.Columns))
-		for i, c := range v.Columns {
-			names[i] = c.Name
-		}
-		stmt += " (" + quoteList(names) + ")"
-	}
 	// Views created before CreateView qualified their own schema's names,
 	// or by another engine, may still name its tables bare.
 	query := v.SQL
 	if q, err := m.qualifyOwnSchema(ctx, conn, v.Schema, query); err == nil {
 		query = q
 	}
-	return m.exec(ctx, conn, stmt+" AS "+m.rewrite(query))
+	body, err := hideIDs(ctx, conn, query)
+	if err != nil {
+		return err
+	}
+	body = m.rewrite(body)
+	stmt := "CREATE OR REPLACE VIEW " + m.localName(v.Schema, v.Name)
+	if len(v.Columns) > 0 {
+		names := make([]string, len(v.Columns))
+		for i, c := range v.Columns {
+			names[i] = c.Name
+		}
+		stmt += " (" + quoteList(m.visibleNames(ctx, conn, v, body, names)) + ")"
+	}
+	return m.exec(ctx, conn, stmt+" AS "+body)
+}
+
+// visibleNames returns the column names to give the local copy of v, whose
+// body (as hideIDs leaves it) returns no columns of ids. Views created
+// before hideIDs recorded columns counting them: a star over a member table
+// included its columns of ids, so the recorded names include those columns'
+// own names, or, under a column list, the list's names shifted onto them
+// with the last column's own name after. Such names are put back as the
+// view meant them: without the names of columns of ids, and cut to as many
+// columns as the body returns. Names that already fit are returned as is.
+func (m *Manager) visibleNames(ctx context.Context, conn *duckdb.Conn, v catalog.View, body string, names []string) []string {
+	cols, err := m.describeQuery(ctx, conn, body)
+	if err != nil || len(cols) == len(names) {
+		return names
+	}
+	fixed := make([]string, 0, len(names))
+	for _, n := range names {
+		if !iddomain.IsHidden(n) {
+			fixed = append(fixed, n)
+		}
+	}
+	if len(fixed) > len(cols) {
+		fixed = fixed[:len(cols)]
+	}
+	if len(fixed) == len(names) {
+		return names
+	}
+	m.log.Warn("view records columns of ID domains' ids; loading it without them, and CREATE OR REPLACE VIEW records the right columns",
+		"view", v.Schema+"."+v.Name, "recorded", len(names), "columns", len(cols))
+	return fixed
+}
+
+// describeQuery returns the columns query returns.
+func (m *Manager) describeQuery(ctx context.Context, conn *duckdb.Conn, query string) ([]catalog.Column, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT column_name, column_type FROM (DESCRIBE "+query+")", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var cols []catalog.Column
+	dest := make([]driver.Value, 2)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return cols, nil
+			}
+			return nil, err
+		}
+		name, _ := dest[0].(string)
+		typ, _ := dest[1].(string)
+		cols = append(cols, catalog.Column{Name: name, Type: typ})
+	}
 }
 
 // stubLocal makes the local copy of v, a catalog view whose copy could not

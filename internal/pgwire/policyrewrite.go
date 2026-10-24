@@ -11,6 +11,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -839,7 +840,7 @@ func constantStrings(arg any) ([]string, bool) {
 }
 
 // viewParts splits a view's definition, as DuckDB prints it, into its
-// column names, if it has any, and its query.
+// column names, if it has any, and its query as the view's SQL has it.
 func viewParts(sql string) ([]string, string, bool) {
 	sc := &scanner{s: sql}
 	if !sc.keywords("CREATE") {
@@ -880,7 +881,10 @@ func viewParts(sql string) ([]string, string, bool) {
 		return nil, "", false
 	}
 	body := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sc.rest()), ";"))
-	return cols, body, body != ""
+	// The local copy reads its tables without their columns of ids (see
+	// ddl.UnhideIDs); policies and bitmap indexes read the view's own SQL,
+	// and leave those columns out themselves.
+	return cols, ddl.UnhideIDs(body), body != ""
 }
 
 // --- statements ---------------------------------------------------------------
