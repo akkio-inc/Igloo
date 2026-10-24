@@ -37,14 +37,17 @@ import (
 //  1. Without any lock, it takes the distinct values of the table's rows
 //     that have no ids yet and that the dictionary lacks.
 //  2. Under the domain's lease (iddomain.Store.Lock), it checks them again
-//     against the dictionary's latest snapshot, takes as many ids from the
-//     domain's counter and appends them to the dictionary in one commit.
-//     The lease serializes these appends and nothing else: writers of
-//     tables in one domain wait for each other only while one appends,
-//     never for another's data write. A value two writers both found new
-//     gets one id, as the second finds it on the re-check.
+//     against the dictionary's latest snapshot, the entries appended since
+//     step 1 (by assigned_at, which the appends' time order lets DuckDB
+//     skip the rest by), takes as many ids from the domain's counter and
+//     appends them to the dictionary in one commit. The lease serializes
+//     these appends and nothing else: writers of tables in one domain wait
+//     for each other only while one appends, never for another's data
+//     write. A value two writers both found new gets one id, as the second
+//     finds it on the re-check.
 //  3. Without the lease, it fills the ids of the rows that have none from
-//     the dictionary.
+//     the ids it just assigned, and the rows left, if any, from the
+//     dictionary.
 //
 // A writer that does not get the lease within idLeaseWait, a domain that
 // has handed out every id below 2^32 (iddomain.ErrExhausted), and an
@@ -321,7 +324,7 @@ func (s *Server) fillIDs(ctx context.Context, sess *session, w *idWrite) {
 			s.log.Warn("could not add the column for a member column's ids", "column", m.String(), "err", err)
 			continue
 		}
-		if _, _, err := s.mapColumn(ctx, sess.conn, w.schema, w.table, m); err != nil && ctx.Err() == nil {
+		if _, _, err := s.mapColumn(ctx, sess.conn, w.schema, w.table, m, false); err != nil && ctx.Err() == nil {
 			s.log.Warn("could not fill a member column's ids; maintenance will", "column", m.String(), "err", err)
 		}
 	}
@@ -349,96 +352,137 @@ type idConn interface {
 // and fills them in (see the top of this file). It returns how many
 // values got new ids and how many rows were filled. A busy lease, an
 // exhausted domain or an erasure meanwhile still fills the rows whose
-// values have ids.
-func (s *Server) mapColumn(ctx context.Context, conn idConn, schema, table string, m idMember) (assigned, filled int64, err error) {
+// values have ids, when thorough: maintenance's rows from other engines
+// hold values the dictionary has, where a write's rows without ids hold
+// those it lacked as it wrote them.
+//
+// A write's INSERT reads the dictionary once to look its values up; this
+// reads it once more, to find the values it lacks, and fills the rows that
+// got new ids from the ids just assigned. Only rows still without ids after
+// that, as those of maintenance, are looked up in the dictionary again.
+func (s *Server) mapColumn(ctx context.Context, conn idConn, schema, table string, m idMember, thorough bool) (assigned, filled int64, err error) {
 	tbl := quoteName([]string{s.catalogName(), schema, table})
 	col, hidden := quoteIdent(m.Column), quoteIdent(iddomain.HiddenColumn(m.Column))
 	missing := " WHERE " + hidden + " IS NULL AND " + col + " IS NOT NULL"
 	// Most often every row has its ids, which a scan of the column of ids
 	// tells, skipping row groups whose statistics say they have no NULLs.
-	rows, err := conn.QueryContext(ctx, "SELECT count(*) FROM (SELECT 1 FROM "+tbl+missing+" LIMIT 1)", nil)
-	if err != nil {
+	anyMissing := func() (bool, error) {
+		rows, err := conn.QueryContext(ctx, "SELECT count(*) FROM (SELECT 1 FROM "+tbl+missing+" LIMIT 1)", nil)
+		if err != nil {
+			return false, err
+		}
+		n, err := countOf(rows)
+		return n > 0, err
+	}
+	if some, err := anyMissing(); err != nil || !some {
 		return 0, 0, err
 	}
-	if n, err := countOf(rows); err != nil || n == 0 {
-		return 0, 0, err
+	update := func(q string) error {
+		return retryCommits(ctx, func() error {
+			res, err := conn.ExecContext(ctx, q, nil)
+			if err == nil {
+				var n int64
+				n, err = res.RowsAffected()
+				filled += n
+			}
+			return err
+		})
 	}
-	assigned, err = s.assignIDs(ctx, conn, m.domain, "SELECT "+col+" FROM "+tbl+missing)
+	assigned, ids, done, err := s.assignIDs(ctx, conn, m.domain, "SELECT "+col+" FROM "+tbl+missing)
 	if err != nil && !errors.Is(err, iddomain.ErrBusy) && !errors.Is(err, iddomain.ErrExhausted) && !errors.Is(err, iddomain.ErrErased) {
 		return 0, 0, err
 	}
 	assignErr := err
-	update := "UPDATE " + tbl + " AS igloo_t SET " + hidden + " = " + s.lookupID(m, "igloo_t."+col) +
-		" WHERE igloo_t." + hidden + " IS NULL AND igloo_t." + col + " IS NOT NULL AND EXISTS (SELECT 1 FROM " +
-		s.dictionary(m.domain.Name) + " AS igloo_dict WHERE igloo_dict.value = CAST(igloo_t." + col + " AS " + m.domain.Type + "))"
-	err = retryCommits(ctx, func() error {
-		res, err := conn.ExecContext(ctx, update, nil)
-		if err == nil {
-			filled, err = res.RowsAffected()
+	defer done()
+	if ids != "" && assigned <= idFillFromAssigned {
+		// From the ids just assigned, one value each.
+		if err := update("UPDATE " + tbl + " AS igloo_t SET " + hidden + " = igloo_a.id FROM " + ids + " AS igloo_a WHERE igloo_t." + hidden +
+			" IS NULL AND CAST(igloo_t." + col + " AS " + m.domain.Type + ") = igloo_a.value"); err != nil {
+			return assigned, filled, err
 		}
-		return err
-	})
-	if err == nil {
-		s.metrics.idsFilled(m.domain.Name, filled)
-		err = assignErr
 	}
-	return assigned, filled, err
+	if thorough || assignErr == nil {
+		// Then from the dictionary, if rows are left: values another writer
+		// gave ids meanwhile, or, for maintenance, values the dictionary
+		// had. A write left without the lease leaves them to maintenance.
+		some, err := anyMissing()
+		if err != nil {
+			return assigned, filled, err
+		}
+		if some {
+			if err := update("UPDATE " + tbl + " AS igloo_t SET " + hidden + " = " + s.lookupID(m, "igloo_t."+col) +
+				" WHERE igloo_t." + hidden + " IS NULL AND igloo_t." + col + " IS NOT NULL AND EXISTS (SELECT 1 FROM " +
+				s.dictionary(m.domain.Name) + " AS igloo_dict WHERE igloo_dict.value = CAST(igloo_t." + col + " AS " + m.domain.Type + "))"); err != nil {
+				return assigned, filled, err
+			}
+		}
+	}
+	s.metrics.idsFilled(m.domain.Name, filled)
+	return assigned, filled, assignErr
 }
 
 // assignIDs gives ids to the distinct values of the first column of the
 // query values that d's dictionary lacks (steps 1 and 2 at the top of this
-// file), and returns how many it gave. It returns iddomain.ErrBusy when
-// another writer held the lease for longer than idLeaseWait, and
-// iddomain.ErrExhausted when d has no ids left for them.
-func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, values string) (int64, error) {
+// file). It returns how many it gave, and a temporary table of them and
+// their ids (value, id), "" for none, which done drops. It returns
+// iddomain.ErrBusy when another writer held the lease for longer than
+// idLeaseWait, iddomain.ErrExhausted when d has no ids left for them, and
+// iddomain.ErrErased when an erasure deleted from the dictionary meanwhile.
+func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, values string) (n int64, ids string, done func(), err error) {
 	dict := s.dictionary(d.Name)
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	tmp := "igloo_new_ids_" + hex.EncodeToString(b[:])
-	news := "temp.main." + quoteIdent(tmp)
+	news, assigned := "temp.main."+quoteIdent(tmp), "temp.main."+quoteIdent(tmp+"_a")
 	cast := "CAST(igloo_v.v AS " + d.Type + ")"
 	exec := func(ctx context.Context, q string) error {
 		_, err := conn.ExecContext(ctx, q, nil)
 		return err
+	}
+	done = func() {
+		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+news)
+		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+assigned)
 	}
 	count := func() (int64, error) {
 		rows, err := conn.QueryContext(ctx, "SELECT count(*) FROM "+news, nil)
 		if err != nil {
 			return 0, err
 		}
-		n, err := countOf(rows)
-		return n, err
+		return countOf(rows)
 	}
 	// An erasure that deletes from the dictionary meanwhile may have
 	// deleted rows that values are found in below; it counts itself under
 	// the lease, which the count is checked against there.
 	erased, err := s.idDomains.Erased(ctx, d.Name)
 	if err != nil {
-		return 0, err
+		return 0, "", done, err
 	}
+	// Entries appended from here on are what the check under the lease
+	// looks for; their assigned_at is no earlier than this, give or take
+	// the appending replica's clock.
+	since := time.Now().Add(-idClockSkew).UTC().Format("2006-01-02 15:04:05.999999")
 	// 1. The new values, as the dictionary stands.
 	if err := exec(ctx, "CREATE TEMP TABLE "+quoteIdent(tmp)+" AS SELECT DISTINCT "+cast+" AS value FROM (\n"+values+
 		"\n) AS igloo_v(v) WHERE igloo_v.v IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "+dict+" AS igloo_dict WHERE igloo_dict.value = "+cast+")"); err != nil {
-		return 0, err
+		return 0, "", done, err
 	}
-	defer func() { _ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+news) }()
-	n, err := count()
+	n, err = count()
 	if err != nil || n == 0 {
-		return 0, err
+		return 0, "", done, err
 	}
 	if s.afterNewValues != nil {
 		s.afterNewValues()
 	}
 
-	// 2. Under the lease: again as the dictionary stands now, ids for
-	// those, and one append.
+	// 2. Under the lease: again against the entries appended since, ids
+	// for those left, and one append.
 	holder := s.idHolder + "/" + strconv.FormatUint(s.idSeq.Add(1), 10)
 	unlock, err := s.idDomains.Lock(ctx, d.Name, holder, idLeaseTTL, idLeaseWait)
 	if err != nil {
 		if errors.Is(err, iddomain.ErrBusy) {
 			s.metrics.idAssignSkipped("busy")
 		}
-		return 0, err
+		return 0, "", done, err
 	}
 	lost := s.renewLease(ctx, d.Name, holder)
 	defer func() {
@@ -450,13 +494,16 @@ func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, 
 			s.metrics.idAssignSkipped("erased")
 			err = fmt.Errorf("ID domain %s %w", d.Name, iddomain.ErrErased)
 		}
-		return 0, err
+		return 0, "", done, err
 	}
-	if err := exec(ctx, "DELETE FROM "+news+" WHERE value IN (SELECT value FROM "+dict+")"); err != nil {
-		return 0, err
+	// The dictionary's appends come in time order, so the row groups of
+	// earlier ones, whose assigned_at is older, are skipped.
+	if err := exec(ctx, "DELETE FROM "+news+" AS igloo_n WHERE EXISTS (SELECT 1 FROM "+dict+" AS igloo_dict WHERE igloo_dict.assigned_at >= TIMESTAMPTZ '"+
+		since+"+00' AND igloo_dict.value = igloo_n.value)"); err != nil {
+		return 0, "", done, err
 	}
 	if n, err = count(); err != nil || n == 0 {
-		return 0, err
+		return 0, "", done, err
 	}
 	first, err := s.idDomains.Allocate(ctx, d.Name, d.Generation, n)
 	if err != nil {
@@ -465,19 +512,31 @@ func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, 
 			s.log.Error("an ID domain has handed out every id below 2^32 and gives new values none; counts over it fall back to the values",
 				"domain", d.Name, "values", n)
 		}
-		return 0, err
+		return 0, "", done, err
 	}
 	if lost.lost() {
-		return 0, fmt.Errorf("ID domain %s: the lease ran out before its new ids were appended", d.Name)
+		return 0, "", done, fmt.Errorf("ID domain %s: the lease ran out before its new ids were appended", d.Name)
 	}
-	insert := "INSERT INTO " + dict + " (value, id, assigned_at) SELECT value, " + strconv.FormatInt(first-1, 10) +
-		" + row_number() OVER (), now() FROM " + news
+	if err := exec(ctx, "CREATE TEMP TABLE "+quoteIdent(tmp+"_a")+" AS SELECT value, CAST("+strconv.FormatInt(first-1, 10)+
+		" + row_number() OVER () AS BIGINT) AS id FROM "+news); err != nil {
+		return 0, "", done, err
+	}
+	insert := "INSERT INTO " + dict + " (value, id, assigned_at) SELECT value, id, now() FROM " + assigned
 	if err := retryCommits(ctx, func() error { return exec(ctx, insert) }); err != nil {
-		return 0, err
+		return 0, "", done, err
 	}
 	s.metrics.idsAssigned(d.Name, n)
-	return n, nil
+	return n, assigned, done, nil
 }
+
+// idFillFromAssigned is the most new ids whose rows are filled from the
+// ids just assigned; past it, as in a table's first load, DuckDB fills them
+// faster through the dictionary (31 s, against 70, for 40M people).
+const idFillFromAssigned = 1_000_000
+
+// idClockSkew is how far the clocks of replicas that append to a
+// dictionary may disagree, which the check under the lease allows for.
+const idClockSkew = 5 * time.Minute
 
 // leaseRenewal renews a lease until stopped, noting when it could not.
 type leaseRenewal struct {
@@ -598,7 +657,7 @@ func (s *Server) MapIDDomains(ctx context.Context) {
 		if ok && seen == snapshot {
 			continue
 		}
-		assigned, filled, err := s.mapColumn(ctx, conn, m.Schema, m.Table, m)
+		assigned, filled, err := s.mapColumn(ctx, conn, m.Schema, m.Table, m, true)
 		if err != nil {
 			if ctx.Err() == nil {
 				s.log.Warn("could not map a member column's ids", "column", m.String(), "err", err)
