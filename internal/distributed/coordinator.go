@@ -54,17 +54,19 @@ func ParseMode(s string) (Mode, bool) {
 	return "", false
 }
 
-// When a statement is worth distributing. Igloo estimates how long the
-// statement would take on the coordinator from the size of the table it
-// would divide: DuckDB scans, filters and aggregates compressed Parquet
-// from object storage at roughly 64 MiB/s per core or better. Running
-// workers are used for statements of a few seconds; workers are started
-// only for statements of a minute or more, since a start takes a while and
-// started workers run until they have been idle for a while.
+// When a part of a statement is worth considering for workers, in auto
+// mode: when the coordinator would take a while to read the table it would
+// divide, cold, at its threads a core (see coldRateAt). Running workers are
+// considered for parts of a few seconds; workers are started only for parts
+// of a minute or more, besides the start, since a start takes a while and
+// started workers run until they have been idle for a while. The estimates
+// then decide (see choose). At 64 MiB/s a core, as this once took the
+// coordinator to read, a report's table of 77 GB at ten times the data was
+// held under the minute; read cold, it took 259 s on one machine and 40 s on
+// workers.
 const (
-	scanRatePerCore = 64 << 20
-	warmSeconds     = 4
-	coldSeconds     = 60
+	warmSeconds = 4
+	coldSeconds = 60
 	// bytesPerWorker is how much of the divided table each worker should
 	// get at least; smaller statements use fewer workers.
 	bytesPerWorker = 1 << 30
@@ -294,7 +296,8 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	opts := planOptions{force: mode == ModeOn || mode == ModeOnRunning, now: time.Now(), maxBroadcast: defaultBroadcast}
 	ws := co.pool.known(ctx)
-	rate := int64(co.opts.Cores) * scanRatePerCore
+	cores := max(co.opts.Cores, 1)
+	rate := int64(float64(cores) * coldRateAt(float64(max(co.opts.Threads, cores))/float64(cores)))
 	switch {
 	case mode == ModeOnRunning && len(ws) == 0:
 		return nil, nil, unsupported("no workers are running, and only admins may start them at will")

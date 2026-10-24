@@ -197,7 +197,10 @@ explicit transactions, the coordinator plans it:
    that answered last, so that a statement that starts them may read a
    table in full that they will hold).
 3. **Decide.** A part is a candidate when the split table is more than the
-   coordinator scans in about four seconds (64 MiB/s per core), or a
+   coordinator reads cold in about four seconds (at its cold rate, about 9
+   MB/s a core at one and a half threads a core; it was 64 MiB/s a core,
+   which kept a report's table of 77 GB at ten times the data under the
+   minute, where it took 259 s on one machine and 40 s on workers), or a
    minute plus the expected start time when no worker is running. A part
    without aggregates is a candidate only when it keeps few rows
    (`DISTINCT`, or `ORDER BY ... LIMIT` up to a million rows); a plain

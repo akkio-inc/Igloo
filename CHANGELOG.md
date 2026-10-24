@@ -397,7 +397,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   view's computed keys), which their history then sends to workers. A
   report of 25 s on the replica and 161 s on workers at 10x, which the
   estimates sent to workers (110 s against 73 s), is estimated at 57 s and
-  216 s. Forced statements run on as many workers as before.
+  216 s. Forced statements run on as many workers as before. The size a
+  statement's table must have for auto mode to consider workers follows
+  the same cold rate: about 20 GB with workers stopped on a coordinator of
+  16 cores, rather than 160 GB at the 64 MiB/s a core it assumed, which kept
+  a report of 259 s on one machine and 40 s on workers from them.
 - Auto mode's history counts runs on workers with runs on about as many
   workers: a statement measured on a quarter of the workers it would run on
   now, as in an earlier session on a smaller fleet, is tried on all of them

@@ -213,8 +213,10 @@ only for statements that take a while: at 1x, the audience reports that
 took 6 to 56 seconds on one replica took 37 to 176 seconds on four workers.
 
 So Igloo considers a statement for workers only when its largest table is
-more than the replica scans in about four seconds (4 GiB for a 16-core
-replica; workers that are stopped are started only for a minute's worth).
+more than the replica reads from object storage cold in about four seconds
+(about 570 MB for a replica of 16 cores and 24 threads; workers that are
+stopped are started only for a minute's worth and the time to start them,
+about 20 GB).
 For such a statement it estimates two times, over what it reads of its
 tables (each table's size times the share of its columns, weighed by type,
 that the statement's parts name, and a hundredth of that for a table a part
