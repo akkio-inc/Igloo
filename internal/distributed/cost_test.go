@@ -73,6 +73,16 @@ func TestChoose(t *testing.T) {
 			runs{local: 67.4}, true, true, true},
 		{"E3 at 10x, after 220 s on one machine, estimated at 56 s", estimate{oneMachine: 56, onWorkers: 58, workers: 16, memory: true, spills: true},
 			runs{local: 219.5}, true, true, true},
+		// The auto pass at a hundred times the data: after runs on workers
+		// of 277 s, 499 s and 248 s, three reports were tried on one
+		// machine, estimated at 1290 s, 991 s and 1324 s and short of
+		// memory: 1154 s, out of memory after about 840 s, and 282 s.
+		{"E1 at 100x, after 277 s on workers", estimate{oneMachine: 1290, onWorkers: 125, workers: 16, memory: true, spills: true},
+			runs{dist: 277}, true, true, false},
+		{"E3 at 100x, after 499 s on workers", estimate{oneMachine: 991, onWorkers: 121, workers: 16, memory: true, spills: true},
+			runs{dist: 499}, true, true, false},
+		{"F5 at 100x, after 248 s on workers", estimate{oneMachine: 1324, onWorkers: 307, workers: 16, memory: true, spills: true},
+			runs{dist: 248}, true, true, false},
 		// First runs at ten times the data of reports one machine should
 		// spill: workers within half again one machine's estimate run them
 		// (E3 took 220 s on one machine and 66 s on workers); where workers
