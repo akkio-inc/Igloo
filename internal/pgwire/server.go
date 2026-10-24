@@ -2026,6 +2026,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if counts != nil && st.stmtType == duckdb.STATEMENT_TYPE_SELECT {
 		st.idCounts, st.text = counts, source
 	}
+	if source != text && st.stmtType == duckdb.STATEMENT_TYPE_SELECT {
+		st.reportCall, st.text = true, source
+	}
 	// A statement that lists the catalog's tables or views walks the set and
 	// holds the catalog lock exclusively when it runs (see catalogRunLock);
 	// checked against the statement as written and as rewritten to the

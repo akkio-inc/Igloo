@@ -511,6 +511,24 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		"dimensions": []any{map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_1": "low", "SEG_2": "low", "SEG_3": "high"}},
 			map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_4": "low"}, "skip_blank": true}}}, true)
 
+	// A prepared call counted from the tables while an index it needs is
+	// missing reads the bitmaps once the index is built.
+	it.exec("ALTER TABLE lake.public.attributes DROP BITMAP INDEX population")
+	cached := it.r.admin(t, pgx.QueryExecModeCacheStatement)
+	mustExec(t, cached, "SET search_path = 'lake.public'")
+	call := "SELECT * EXCLUDE (path) FROM igloo.audience_profile(" + specLiteral(t, segments) + ") ORDER BY ALL"
+	fromTables := texts(t, cached, call)
+	it.exec("ALTER TABLE lake.public.attributes ADD BITMAP INDEX population ON () FOR person_id")
+	srv.waitIndexBuilds(t)
+	srv.MaintainBitmapIndexes(ctx)
+	before := srv.reportFromIndexes.Load()
+	if got := texts(t, cached, call); !slices.Equal(got, fromTables) {
+		t.Errorf("a prepared call, from the bitmaps: rows\n%q\nwant\n%q", got, fromTables)
+	}
+	if srv.reportFromIndexes.Load() == before {
+		t.Error("a prepared call counted from the tables did not go to the bitmaps once its index was built")
+	}
+
 	// A masking policy on a column read: the tables.
 	it.exec("CREATE MASKING POLICY same AS (v VARCHAR) RETURNS VARCHAR -> v",
 		"ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name SET MASKING POLICY same")

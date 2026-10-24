@@ -797,11 +797,16 @@ func (p *indexPlanner) pinReferences(sess *session, text string, pins []indexPin
 // bitmaps could answer it now. Preparing takes the catalog lock it needs;
 // the caller holds none.
 func (s *Server) refreshIndexes(ctx context.Context, sess *session, st *statement) error {
-	if st.indexed == "" || st.text == "" {
+	if st.text == "" || st.indexed == "" && !st.reportCall {
 		return nil
 	}
 	stale := false
-	if len(st.indexPins) > 0 {
+	switch {
+	case st.reportCall && len(st.indexPins) == 0:
+		// A report API call counted from the tables: back to the bitmaps
+		// once they can answer it.
+		stale = s.reportWouldIndex(ctx, sess, st.text)
+	case len(st.indexPins) > 0:
 		for _, pin := range st.indexPins {
 			snap := s.memberSnapshot(ctx)
 			var x *iddomain.BitmapIndex
@@ -818,7 +823,7 @@ func (s *Server) refreshIndexes(ctx context.Context, sess *session, st *statemen
 				break
 			}
 		}
-	} else {
+	default:
 		// Back to the bitmaps once they have caught up.
 		_, pins, _ := s.rewriteIndexes(ctx, sess, sess.currentUser(), st.indexed, st.idCounts)
 		stale = len(pins) > 0

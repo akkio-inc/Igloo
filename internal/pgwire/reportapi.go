@@ -60,6 +60,19 @@ func reportError(format string, args ...any) error {
 // what it stands for, and the member tables whose ids it counts through, at
 // the snapshots it reads them at (see reportIDs).
 func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (string, []idPin, []indexPin, error) {
+	return s.expandReportCalls(ctx, sess, text, false)
+}
+
+// reportWouldIndex reports whether bitmap indexes would now answer a call
+// in text, without counting it.
+func (s *Server) reportWouldIndex(ctx context.Context, sess *session, text string) bool {
+	_, _, pins, err := s.expandReportCalls(ctx, sess, text, true)
+	return err == nil && len(pins) > 0
+}
+
+// expandReportCalls is reportCalls; probe leaves the counts of calls by
+// path alone.
+func (s *Server) expandReportCalls(ctx context.Context, sess *session, text string, probe bool) (string, []idPin, []indexPin, error) {
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, "igloo") || !strings.Contains(lower, "audience_profile") && !strings.Contains(lower, "report_api_versions") {
 		return text, nil, nil, nil
@@ -95,7 +108,7 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 				return "", nil, nil, err
 			}
 			if fn == "audience_profile" {
-				q, ip, read := s.reportStatement(ctx, sess, spec)
+				q, ip, read := s.reportStatement(ctx, sess, spec, probe)
 				pins, indexPins = append(pins, read...), append(indexPins, ip...)
 				out = "(" + q + ")"
 			} else {
@@ -112,7 +125,7 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 			if err := reportOwnNames(args[1]); err != nil {
 				return "", nil, nil, err
 			}
-			api, ip, read := s.reportStatement(ctx, sess, spec)
+			api, ip, read := s.reportStatement(ctx, sess, spec, probe)
 			pins, indexPins = append(pins, read...), append(indexPins, ip...)
 			q, err := spec.checkSQL(ctx, sess, args[1], api)
 			if err != nil {
@@ -148,13 +161,15 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 // reportStatement returns the statement that answers spec's call: from
 // bitmap indexes where they can (reportindex.go), else from the tables,
 // through ids where it may (reportids.go); and what it pinned.
-func (s *Server) reportStatement(ctx context.Context, sess *session, spec *reportSpec) (string, []indexPin, []idPin) {
+func (s *Server) reportStatement(ctx context.Context, sess *session, spec *reportSpec, probe bool) (string, []indexPin, []idPin) {
 	if plan := s.reportIndexes(ctx, sess, spec); plan != nil {
-		s.reportFromIndexes.Add(1)
+		if !probe {
+			s.reportFromIndexes.Add(1)
+		}
 		return s.reportIndexSQL(spec, plan), plan.pins, nil
 	}
 	ids, read := s.reportIDs(ctx, sess, spec)
-	if ids != nil {
+	if ids != nil && !probe {
 		s.reportThroughIDs.Add(1)
 	}
 	return spec.sqlWith(ids), nil, read
