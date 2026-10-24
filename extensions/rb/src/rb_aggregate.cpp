@@ -9,8 +9,11 @@
 //                                             are skipped, as COUNT(DISTINCT a, b) does, and one bitmap of ids is
 //                                             kept for each k, so k should have few values (dates, codes)
 //
-// Ids are buffered in each group's state and added in sorted batches: a bitmap built from a sorted batch is OR-ed
-// in, merging containers linearly, where adding ids one at a time in random order inserts into sorted arrays.
+// Ids are buffered in each group's state and added in sorted batches, which merge linearly where adding ids one at
+// a time in random order inserts into sorted arrays. A group's set is a sorted array while its ids are sparse and a
+// roaring bitmap once they are dense, and a group that never fills its buffer is counted from the buffer: the many
+// small groups of a GROUP BY that fits in memory cost little more than DuckDB's hash, and a few ids in each 2^16
+// range of a large domain take no roaring containers.
 //===----------------------------------------------------------------------===//
 #include "rb_bitmap.hpp"
 #include "rb_memory.hpp"
@@ -20,12 +23,15 @@
 #include "duckdb/storage/buffer_manager.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 
 namespace duckdb {
 namespace rb {
 
+//! The fewest and most ids buffered before a batch goes into a group's set (see IdState::Limit)
 static constexpr uint32_t FLUSH_AT = 1024;
+static constexpr uint32_t MAX_FLUSH_AT = 16384;
 
 template <class T>
 static void Push(T *&buf, uint32_t &n, uint32_t &cap, const T &value) {
@@ -56,42 +62,213 @@ static Bitmap FromSorted(const uint32_t *ids, size_t n) {
 }
 
 //===--------------------------------------------------------------------===//
-// One bitmap of ids
+// One set of ids
 //===--------------------------------------------------------------------===//
+
+//! A set of distinct ids as a sorted array, for sets too sparse for roaring bitmaps: a roaring container costs some
+//! 50 bytes of its own besides 2 bytes an id, which a few ids in each 2^16 range of a large domain do not repay.
+struct FlatSet {
+	uint32_t size;
+	//! distinct high 16 bits among the ids: the roaring containers they would take
+	uint32_t keys;
+	uint32_t ids[1];
+
+	static FlatSet *Make(uint32_t capacity) {
+		auto set = static_cast<FlatSet *>(Allocate(offsetof(FlatSet, ids) + capacity * sizeof(uint32_t)));
+		if (!set) {
+			throw OutOfMemoryException("rb: could not allocate a set of %u ids", capacity);
+		}
+		set->size = set->keys = 0;
+		return set;
+	}
+	//! The union of a (may be null) and the sorted, distinct ids b[0..m), as a new set; frees a.
+	static FlatSet *Merge(FlatSet *a, const uint32_t *b, uint32_t m) {
+		const uint32_t n = a ? a->size : 0;
+		auto out = Make(n + m);
+		uint32_t i = 0, j = 0, k = 0, keys = 0;
+		uint32_t last_key = 0;
+		auto put = [&](uint32_t id) {
+			if (k == 0 || out->ids[k - 1] != id) {
+				const uint32_t key = id >> 16;
+				if (k == 0 || key != last_key) {
+					keys++;
+					last_key = key;
+				}
+				out->ids[k++] = id;
+			}
+		};
+		while (i < n && j < m) {
+			put(a->ids[i] <= b[j] ? a->ids[i++] : b[j++]);
+		}
+		while (i < n) {
+			put(a->ids[i++]);
+		}
+		while (j < m) {
+			put(b[j++]);
+		}
+		out->size = k;
+		out->keys = keys;
+		Free(a);
+		return out;
+	}
+	//! Whether roaring containers would hold these ids in less room than the array: dozens to a container
+	bool Dense() const {
+		return size >= FLUSH_AT && size >= 32 * keys;
+	}
+};
+
+//! Ids are first buffered, unsorted, in the state itself and then in a buffer; batches go sorted into a flat set
+//! while the ids are sparse, and into a roaring bitmap once they are dense. A group that never fills its buffer
+//! is counted from the buffer, with no set at all.
 struct IdState {
-	roaring_bitmap_t *bm;
-	uint32_t *buf;
+	//! Ids a state holds in itself before it allocates a buffer: most partial states of a GROUP BY with many groups
+	//! see only a few ids, since DuckDB's hash aggregate starts new partial states as it goes.
+	static constexpr uint32_t INLINE = 4;
+
+	roaring_bitmap_t *bm; // the set once dense (then flat is null)
+	FlatSet *flat;        // the set while sparse
+	uint32_t *heap;       // the buffer once it outgrows inline_ids, of cap ids
 	uint32_t n;
 	uint32_t cap;
+	uint32_t inline_ids[INLINE];
 
+	uint32_t *Buffer() {
+		return heap ? heap : inline_ids;
+	}
+	uint64_t SetSize() const {
+		return bm ? roaring_bitmap_get_cardinality(bm) : flat ? flat->size : 0;
+	}
+	//! The set as a roaring bitmap from now on (an empty one if none)
+	roaring_bitmap_t *&AsBitmap() {
+		if (!bm) {
+			if (flat) {
+				bm = FromSorted(flat->ids, flat->size).release();
+				Free(flat);
+				flat = nullptr;
+			} else {
+				bm = roaring_bitmap_create();
+			}
+		}
+		return bm;
+	}
+	//! Adds the sorted, distinct ids[0..m) to the set.
+	void AddSorted(const uint32_t *ids, uint32_t m) {
+		if (m == 0) {
+			return;
+		}
+		if (bm) {
+			OrInto(bm, FromSorted(ids, m));
+			return;
+		}
+		flat = FlatSet::Merge(flat, ids, m);
+		if (flat->Dense()) {
+			AsBitmap();
+		}
+	}
 	void Flush() {
 		if (n == 0) {
 			return;
 		}
+		auto buf = Buffer();
 		std::sort(buf, buf + n);
-		OrInto(bm, FromSorted(buf, n));
+		const auto m = static_cast<uint32_t>(std::unique(buf, buf + n) - buf);
 		n = 0;
+		AddSorted(buf, m);
 	}
 	void Add(uint32_t id) {
-		Push(buf, n, cap, id);
-		if (n == FLUSH_AT) {
-			Flush();
+		if (!heap) {
+			if (n < INLINE) {
+				inline_ids[n++] = id;
+				return;
+			}
+			Grow();
+		} else if (n == cap) {
+			if (cap < Limit()) {
+				Grow();
+			} else {
+				Flush();
+			}
+		}
+		heap[n++] = id;
+	}
+	//! How many ids to buffer before adding them to the set: a quarter of what it holds, within bounds. Each batch
+	//! rewrites what of the set it touches, so batches that grow with the set keep the work linear, while the
+	//! buffer stays smaller than the set.
+	uint32_t Limit() const {
+		const uint64_t quarter = SetSize() / 4;
+		return static_cast<uint32_t>(MinValue<uint64_t>(MaxValue<uint64_t>(quarter, FLUSH_AT), MAX_FLUSH_AT));
+	}
+	void Grow() {
+		uint32_t next = heap ? cap * 2 : 32;
+		auto grown = static_cast<uint32_t *>(Reallocate(heap, next * sizeof(uint32_t)));
+		if (!grown) {
+			throw OutOfMemoryException("rb: could not grow a buffer of %u ids", next);
+		}
+		if (!heap) {
+			std::memcpy(grown, inline_ids, n * sizeof(uint32_t));
+		}
+		heap = grown;
+		cap = next;
+	}
+	//! Adds other's ids and set here. destructive: other may be emptied, and its buffer and set taken.
+	void Combine(IdState &other, bool destructive) {
+		auto obuf = other.Buffer();
+		if (destructive && n == 0 && other.heap) {
+			std::swap(heap, other.heap);
+			std::swap(cap, other.cap);
+			n = other.n;
+			other.n = 0;
+		} else {
+			for (uint32_t k = 0; k < other.n; k++) {
+				Add(obuf[k]);
+			}
+			if (destructive) {
+				other.n = 0;
+			}
+		}
+		if (other.flat) {
+			if (destructive && !bm && !flat) {
+				flat = other.flat;
+				other.flat = nullptr;
+			} else {
+				AddSorted(other.flat->ids, other.flat->size);
+			}
+		}
+		if (other.bm) {
+			if (destructive && !bm && !flat) {
+				bm = other.bm;
+				other.bm = nullptr;
+			} else if (!bm && !flat) {
+				bm = roaring_bitmap_copy(other.bm);
+			} else {
+				roaring_bitmap_or_inplace(AsBitmap(), other.bm);
+			}
 		}
 	}
 	void Destroy() {
 		if (bm) {
 			roaring_bitmap_free(bm);
 		}
-		Free(buf);
+		Free(flat);
+		Free(heap);
 		std::memset(this, 0, sizeof(*this));
 	}
 	//! The ids so far as one bitmap (an empty one if none)
 	roaring_bitmap_t *Finish() {
 		Flush();
-		if (!bm) {
-			bm = roaring_bitmap_create();
+		return AsBitmap();
+	}
+	//! How many distinct ids
+	int64_t Count() {
+		if (!bm && !flat) {
+			// never outgrew the buffer: count it without making a set (leaving each id in it once)
+			auto buf = Buffer();
+			std::sort(buf, buf + n);
+			n = static_cast<uint32_t>(std::unique(buf, buf + n) - buf);
+			return static_cast<int64_t>(n);
 		}
-		return bm;
+		Flush();
+		return static_cast<int64_t>(SetSize());
 	}
 };
 
@@ -273,7 +450,7 @@ static void OrUpdate(Vector inputs[], AggregateInputData &aggr, idx_t, Vector &s
 	for (idx_t i = 0; i < count; i++) {
 		auto ii = idata.sel->get_index(i);
 		if (idata.validity.RowIsValid(ii)) {
-			OrInto(sts[sdata.sel->get_index(i)]->bm, ReadBitmap(blobs[ii]));
+			OrInto(sts[sdata.sel->get_index(i)]->AsBitmap(), ReadBitmap(blobs[ii]));
 		}
 	}
 	charged.Sync();
@@ -292,23 +469,7 @@ static void IdCombine(Vector &source, Vector &target, AggregateInputData &aggr, 
 	auto tgt = FlatVector::GetData<IdState *>(target);
 	const bool destructive = aggr.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE;
 	for (idx_t i = 0; i < count; i++) {
-		auto &s = *src[i];
-		auto &t = *tgt[i];
-		for (uint32_t k = 0; k < s.n; k++) {
-			t.Add(s.buf[k]);
-		}
-		s.n = 0;
-		if (!s.bm) {
-			continue;
-		}
-		if (!t.bm && destructive) {
-			t.bm = s.bm;
-			s.bm = nullptr;
-		} else if (!t.bm) {
-			t.bm = roaring_bitmap_copy(s.bm);
-		} else {
-			roaring_bitmap_or_inplace(t.bm, s.bm);
-		}
+		tgt[i]->Combine(*src[i], destructive);
 	}
 	charged.Sync();
 }
@@ -366,7 +527,9 @@ static void PairCombine(Vector &source, Vector &target, AggregateInputData &aggr
 		for (uint32_t k = 0; k < s.n; k++) {
 			t.Add(s.buf[k].key, s.buf[k].id);
 		}
-		s.n = 0;
+		if (destructive) {
+			s.n = 0;
+		}
 		if (!s.map) {
 			continue;
 		}
@@ -414,9 +577,7 @@ static void FinalizeEach(Vector &states, Vector &result, idx_t count, idx_t offs
 
 static void IdFinalizeCount(Vector &states, AggregateInputData &aggr, Vector &result, idx_t count, idx_t offset) {
 	Charged charged(aggr);
-	FinalizeEach<IdState, int64_t>(states, result, count, offset, [](IdState &st, Vector &) {
-		return static_cast<int64_t>(roaring_bitmap_get_cardinality(st.Finish()));
-	});
+	FinalizeEach<IdState, int64_t>(states, result, count, offset, [](IdState &st, Vector &) { return st.Count(); });
 }
 
 static void IdFinalizeBlob(Vector &states, AggregateInputData &aggr, Vector &result, idx_t count, idx_t offset) {

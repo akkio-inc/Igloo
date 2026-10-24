@@ -69,6 +69,48 @@ SELECT rb_count_distinct(id) FROM t WHERE g < 0
 ----
 0
 
+# groups whose ids are sparse in the domain stay sorted arrays, and dense ones
+# become bitmaps: both agree with COUNT(DISTINCT), as counts and as bitmaps,
+# under keys DuckDB groups by hashing (here 300 groups of 10,000 ids spread over
+# all of UINTEGER, beside the dense groups of t above)
+statement ok
+CREATE TABLE sparse AS SELECT ((hash(i) % 300) * 1000003)::BIGINT AS g, (hash(i * 7) % 4294967295)::UINTEGER AS id FROM range(3000000) r(i)
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT id) AS a, rb_count_distinct(id) AS b, rb_cardinality(rb_agg(id)) AS c FROM sparse GROUP BY g) WHERE a <> b OR a <> c
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, list_sort(list_distinct(list(id))) AS a, rb_to_list(rb_agg(id)) AS b FROM sparse WHERE g < 20000000 GROUP BY g) WHERE a <> b
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, list_sort(list_distinct(list(id))) AS a, rb_to_list(rb_agg(id)) AS b FROM t WHERE g < 20 GROUP BY g) WHERE a <> b
+----
+0
+
+# a group's set may be an array in one partial state and a bitmap in another
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT id) AS a, rb_count_distinct(id) AS b FROM (SELECT g, id FROM t UNION ALL SELECT g % 997, id FROM sparse) GROUP BY g) WHERE a <> b
+----
+0
+
+# many small groups, most counted from their buffers alone, past the point
+# where DuckDB's hash aggregate starts new partial states
+query I
+SELECT count(*) FROM (SELECT (hash(i) % 400000) * 1000003 AS g, count(DISTINCT (hash(i * 7) % 3000000)::UINTEGER) AS a, rb_count_distinct((hash(i * 7) % 3000000)::UINTEGER) AS b FROM range(3000000) r(i) GROUP BY g) WHERE a <> b
+----
+0
+
+# a window combines states without consuming them, and finalizes the same
+# states more than once
+query I
+SELECT count(*) FROM (SELECT count(DISTINCT id) OVER w AS a, rb_count_distinct(id) OVER w AS b FROM (SELECT i, (hash(i) % 5000)::UINTEGER AS id FROM range(200000) r(i)) WINDOW w AS (ORDER BY i ROWS BETWEEN 3000 PRECEDING AND CURRENT ROW)) WHERE a <> b
+----
+0
+
 # pair counts: COUNT(DISTINCT id, k) skipping rows with a NULL, in either argument order
 query I
 SELECT count(*) FROM (SELECT g, count(DISTINCT CASE WHEN id IS NOT NULL AND d IS NOT NULL THEN (id, d) END) AS a, rb_count_distinct(id, d) AS b, rb_count_distinct(d, id) AS c FROM t GROUP BY g) WHERE a <> b OR a <> c

@@ -6,8 +6,17 @@ in [roaring bitmaps](https://roaringbitmap.org/) (CRoaring, vendored in
 DuckDB's `COUNT(DISTINCT)` hash table holds 72-110 bytes for each
 36-character ID. On a synthetic copy of the F1 signals report at 1x, counting
 into bitmaps took 35 s with no spill and 2.8 GB of memory, where the hash took
-183 s and spilled 51 GB. Where the hash fits in memory it stays faster, which
-is why nothing uses the bitmaps unless asked (see `rb_count_distinct` below).
+183 s and spilled 51 GB. Where the hash fits in memory it stays a little
+faster (1.1-1.6x on 30 million rows in 10 to 100,000 groups, 3x for 1,000
+groups of a small integer key, whose partial states DuckDB combines on one
+thread), which is why nothing uses the bitmaps unless asked (see
+`rb_count_distinct` below).
+
+A group's ids are buffered and added in sorted batches. Its set is a sorted
+array while the ids are sparse (a roaring container costs some 50 bytes of its
+own, which a few ids in each 2^16 range of a large domain do not repay) and a
+roaring bitmap once they are dense, and a group that never fills its buffer is
+counted from the buffer alone.
 
 ## Functions
 

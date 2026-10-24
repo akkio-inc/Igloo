@@ -50,6 +50,8 @@ public:
 	void Add(int64_t delta) {
 		bytes.fetch_add(delta, std::memory_order_relaxed);
 	}
+	//! Adds or drops references in bulk (see AccountScope); dropping the last frees the account.
+	void AddRefs(int64_t delta);
 
 private:
 	~Account();
@@ -86,7 +88,8 @@ private:
 	Account *account;
 };
 
-//! Charges this thread's allocations to account while it lives (nested scopes restore the outer one).
+//! Charges this thread's allocations to account while it lives (nested scopes restore the outer one). The
+//! charges are added to the account in bulk, when the scope ends or the account syncs.
 class AccountScope {
 public:
 	explicit AccountScope(Account *account);
@@ -98,8 +101,6 @@ private:
 
 //! Installs the CRoaring memory hook; once per process.
 void InstallMemoryHook();
-//! Bytes all bitmaps hold, in every account and none.
-int64_t TotalBytes();
 
 //! malloc/realloc/free that count toward the current account, for the extension's own buffers.
 void *Allocate(size_t size);

@@ -19,7 +19,25 @@ const char *const BUDGET_EXCEEDED = "rb: bitmap memory budget exceeded";
 static constexpr idx_t RESERVE_STEP = 4ULL << 20;
 
 static thread_local Account *current = nullptr;
-static std::atomic<int64_t> total {0};
+
+// What this thread's allocations and frees of the current account's blocks have changed, not yet added to the
+// account: shared counters touched on every allocation would bounce between cores, and the many small partial
+// states of a GROUP BY allocate often. Flushed when the thread leaves the account's scope, and before Sync.
+struct Pending {
+	Account *account = nullptr;
+	int64_t bytes = 0;
+	int64_t refs = 0;
+};
+static thread_local Pending pending;
+
+static void FlushPending() {
+	if (pending.account && (pending.bytes != 0 || pending.refs != 0)) {
+		pending.account->Add(pending.bytes);
+		pending.account->AddRefs(pending.refs);
+	}
+	pending.bytes = 0;
+	pending.refs = 0;
+}
 
 Account::Account(BufferManager &buffer_manager_p, idx_t budget_p) : buffer_manager(buffer_manager_p), budget(budget_p) {
 }
@@ -31,12 +49,21 @@ Account::~Account() {
 }
 
 void Account::Release() {
-	if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+	AddRefs(-1);
+}
+
+void Account::AddRefs(int64_t delta) {
+	// a scope's pending references are added while the aggregate holds its own (AccountRef), so only the last
+	// release of all can reach zero
+	if (refs.fetch_add(delta, std::memory_order_acq_rel) + delta == 0) {
 		delete this;
 	}
 }
 
 void Account::Sync() {
+	if (pending.account == this) {
+		FlushPending();
+	}
 	const int64_t now = bytes.load(std::memory_order_relaxed);
 	if (now <= reserved_hint.load(std::memory_order_relaxed)) {
 		return;
@@ -64,15 +91,15 @@ void Account::Sync() {
 }
 
 AccountScope::AccountScope(Account *account) : previous(current) {
+	FlushPending();
 	current = account;
+	pending.account = account;
 }
 
 AccountScope::~AccountScope() {
+	FlushPending();
 	current = previous;
-}
-
-int64_t TotalBytes() {
-	return total.load(std::memory_order_relaxed);
+	pending.account = previous;
 }
 
 //===--------------------------------------------------------------------===//
@@ -89,15 +116,19 @@ static void Charge(Header &h, size_t size) {
 	h.size = size;
 	h.account = current;
 	if (h.account) {
-		h.account->Retain();
-		h.account->Add(static_cast<int64_t>(size));
+		pending.bytes += static_cast<int64_t>(size);
+		pending.refs++;
 	}
-	total.fetch_add(static_cast<int64_t>(size), std::memory_order_relaxed);
 }
 
 static void Uncharge(const Header &h) {
-	total.fetch_sub(static_cast<int64_t>(h.size), std::memory_order_relaxed);
-	if (h.account) {
+	if (!h.account) {
+		return;
+	}
+	if (h.account == pending.account) {
+		pending.bytes -= static_cast<int64_t>(h.size);
+		pending.refs--;
+	} else {
 		h.account->Add(-static_cast<int64_t>(h.size));
 		h.account->Release();
 	}
@@ -143,8 +174,9 @@ void *Reallocate(void *ptr, size_t size) {
 		return nullptr;
 	}
 	// the block keeps its account; only its size changes
-	total.fetch_add(static_cast<int64_t>(size) - static_cast<int64_t>(old.size), std::memory_order_relaxed);
-	if (old.account) {
+	if (old.account == pending.account && old.account) {
+		pending.bytes += static_cast<int64_t>(size) - static_cast<int64_t>(old.size);
+	} else if (old.account) {
 		old.account->Add(static_cast<int64_t>(size) - static_cast<int64_t>(old.size));
 	}
 	grown->size = size;
