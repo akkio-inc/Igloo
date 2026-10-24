@@ -319,6 +319,49 @@ func TestShuffleFiles(t *testing.T) {
 	}
 }
 
+// A task's row groups of a partition hold no more bytes of rows than its
+// share of the worker's memory allows over its partitions, however wide
+// the rows' lists: rows of four lists of strings, which a list's type
+// counts as eight short strings, took a report's workers out of memory at
+// a hundred times the data while their tasks wrote 202 partitions.
+func TestShuffleRowGroupBytes(t *testing.T) {
+	h := newHarness(t, 0.01, 1, 1)
+	w := h.workers[0]
+	w.opts.MemoryBytes = 64 << 20
+	conn, err := w.opts.Engine.Connect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	const parts = 16
+	dir := filepath.Join(h.dir, "warehouse", config.ShuffleDir, "q", "s0", "0", "a0")
+	list := func(n int) string {
+		return fmt.Sprintf("list_transform(range(5 + ((i // %d) %% 36)::BIGINT), x -> repeat(chr(65 + ((x + i) %% 26)::INTEGER), 40))", n)
+	}
+	cols := []Column{{Name: "id", Type: "VARCHAR"}, {Name: "a", Type: "VARCHAR[]"}, {Name: "b", Type: "VARCHAR[]"},
+		{Name: "c", Type: "VARCHAR[]"}, {Name: "d", Type: "VARCHAR[]"}, {Name: "__b", Type: "INTEGER"}}
+	if rows := shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols); rows != minShuffleRowGroup {
+		t.Fatalf("rows a group by types: %d", rows)
+	}
+	query := fmt.Sprintf("SELECT md5(i::VARCHAR) AS id, %s AS a, %s AS b, %s AS c, %s AS d, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(160000) t(i)",
+		list(1), list(7), list(13), list(17), parts)
+	res, err := w.shuffle(t.Context(), conn, dir, query, cols, parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var groups, most int64
+	if err := h.session.QueryRowContext(t.Context(), "SELECT count(*), max(n) FROM (SELECT DISTINCT file_name, row_group_id, row_group_num_rows AS n FROM parquet_metadata("+
+		quoteLiteral(dir+"/*/*.parquet")+"))").Scan(&groups, &most); err != nil {
+		t.Fatal(err)
+	}
+	// About 3.5 KB a row, as written: DuckDB closes a group of 1 MiB, as
+	// it counts the bytes, at about a thousand rows (1,121 here), where
+	// groups by types would hold 2,048.
+	if res.Rows != 160000 || most > 3*minShuffleRowGroup/4 || groups < 2*parts {
+		t.Errorf("%d rows in %d row groups of at most %d rows", res.Rows, groups, most)
+	}
+}
+
 // An error in the data, such as a failed cast, is the statement's error,
 // as it would be on one machine.
 func TestDataError(t *testing.T) {

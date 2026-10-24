@@ -441,6 +441,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   in their estimate, and auto mode's reasons say when they are stopped: a
   report of 1,798 s on one machine, with tables of 6.2 GB, stayed there
   with workers stopped, though they had taken 362 s.
+- Workers writing an exchange bound each partition's row group by the
+  bytes of its rows as written, not only by the rows their types would
+  take: rows of four lists of strings, which a list's type counts as
+  eight short strings, took workers out of memory outside DuckDB's limit
+  at a hundred times the data; in a lab, such rows held 1.2 GB a task over
+  202 partitions where they had held 2.1 GB.
 - A statement auto mode runs on the replica, though workers could run it,
   is stopped there once it has run three times its estimate, and at least
   90 seconds, without sending a row, and runs on workers instead, which

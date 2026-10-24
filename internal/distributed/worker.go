@@ -585,6 +585,27 @@ func shuffleRowGroup(memory int64, slots, parts int, cols []Column) int64 {
 // their writers room for groups this size (see writerPartitions).
 const minShuffleRowGroup = 2_048
 
+// shuffleRowGroupBytes is how many bytes of rows, as written, a shuffle
+// task's row group of a partition holds at most: those of all partitions
+// within a quarter of the task's share of the worker's memory, as
+// shuffleRowGroup counts rows by their types' widths, but by the bytes the
+// rows take. A list's type counts eight short strings (typeWidth); at a
+// hundred times the data, a report's rows of four lists of strings took
+// workers out of memory while their tasks wrote 202 partitions, DuckDB's
+// own memory under its limit. Rows of four lists of 22 strings of 40
+// bytes, groups of rows sized by types held 2.1 GB a task over 202
+// partitions, by bytes 1.2 GB. It is 0, no bound, when the memory is not
+// known.
+func shuffleRowGroupBytes(memory int64, slots, parts int) int64 {
+	if memory <= 0 {
+		return 0
+	}
+	if parts <= 0 {
+		parts = maxPartitions
+	}
+	return max(memory/int64(max(slots, 1))/4/int64(parts), 1<<20)
+}
+
 // shuffleFlush is how many rows each of a shuffle task's threads gathers
 // before it hands them to the partitions' writers. DuckDB's 524,288 held
 // every row of a task of rows of 400 strings, 8.8 GB of a million rows, and
@@ -700,11 +721,20 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 			return nil, err
 		}
 	}
+	opts := fmt.Sprintf("FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d", shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols))
+	if n := shuffleRowGroupBytes(w.opts.MemoryBytes, cap(w.slots), parts); n > 0 {
+		// DuckDB bounds a row group's bytes only where it need not keep
+		// the rows' order, which an exchange's partitions do not.
+		if _, err := conn.ExecContext(ctx, "SET preserve_insertion_order = false", nil); err != nil {
+			return nil, err
+		}
+		opts += fmt.Sprintf(", ROW_GROUP_SIZE_BYTES %d", n)
+	}
 	// RETURN_STATS says what the COPY wrote, file by file: listing the
 	// files and reading their footers back took requests one after
 	// another, a listing and two per file, after the files were written.
 	res, err := conn.QueryContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+quoteLiteral(dir)+
-		fmt.Sprintf(" (FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d, RETURN_STATS)", shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols)), nil)
+		" ("+opts+", RETURN_STATS)", nil)
 	if err != nil {
 		return nil, err
 	}

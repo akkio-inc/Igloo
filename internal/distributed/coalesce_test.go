@@ -132,6 +132,23 @@ func TestShuffleRowGroup(t *testing.T) {
 			t.Errorf("%d bytes over %d slots, %d partitions: %d rows a group, want %d", c.memory, c.slots, c.part, got, c.want)
 		}
 	}
+	// And the bytes of rows, as written: a quarter of a task's share over
+	// its partitions, at least 1 MiB, unbounded where the memory is not
+	// known.
+	for _, c := range []struct {
+		memory      int64
+		slots, part int
+		want        int64
+	}{
+		{26_400_000_000, 2, 202, 16_336_633},
+		{26_400_000_000, 2, 0, 12_890_625},
+		{500 << 20, 1, 256, 1 << 20},
+		{0, 1, 128, 0},
+	} {
+		if got := shuffleRowGroupBytes(c.memory, c.slots, c.part); got != c.want {
+			t.Errorf("%d bytes over %d slots, %d partitions: %d bytes a group, want %d", c.memory, c.slots, c.part, got, c.want)
+		}
+	}
 }
 
 // TestWriterPartitions checks the cap on partitions that exchanges' writers

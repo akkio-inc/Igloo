@@ -598,7 +598,12 @@ partition's rows, as they are, until it fills: 128 partitions of rows of
 264 bytes held 3 GB in DuckDB's row groups of 122,880 rows. So a task's row groups have as
 many rows as keep those of all partitions within a quarter of its share of
 the worker's memory, at the width of the rows' types (8,192 rows held 0.4
-GB, and took no longer to write), between 2,048 and 122,880. Each of the
+GB, and took no longer to write), between 2,048 and 122,880, and no more
+bytes, as DuckDB counts the rows written (`ROW_GROUP_SIZE_BYTES`, with
+`preserve_insertion_order` off for the task, as an exchange's rows need no
+order): a list's type counts eight short strings, and rows of four lists
+of 22 strings of 40 bytes held 2.1 GB a task over 202 partitions in
+groups sized by types, 1.2 GB by bytes. Each of the
 task's threads gathers rows before it hands them to the partitions'
 writers, 524,288 by default, which held every row of a task of rows of
 400 strings (8.8 GB of a million rows); the threads' together get another
