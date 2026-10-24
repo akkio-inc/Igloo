@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -300,22 +301,33 @@ func (s *Server) createDomain(ctx context.Context, sess *session, user auth.User
 			codes.DuplicateObject)
 	}
 	now := time.Now().UTC()
-	if len(c.tags) > 0 {
-		err := s.gov.store.Update(ctx, func(cat *policy.Catalog) error {
-			for name, value := range c.tags {
-				ct := policy.ColumnTag{Schema: iddomain.DictionarySchema, Table: c.name, Column: "value", Tag: name, Value: value, SetBy: user.Name}
-				if err := cat.SetColumnTag(ct, now); err != nil {
-					return err
-				}
+	err = s.gov.store.Update(ctx, func(cat *policy.Catalog) error {
+		if _, ok := cat.Policy(iddomain.DictionaryPolicy); !ok {
+			p := policy.Policy{Kind: policy.RowAccess, Name: iddomain.DictionaryPolicy, Args: []policy.Arg{{Name: "id", Type: "BIGINT"}},
+				Returns: "BOOLEAN", Body: "false", CreatedBy: "igloo",
+				Comment: "Igloo's own: keeps ID domains' dictionaries (igloo_domains) from every user's statements"}
+			if err := cat.PutPolicy(p, false, now); err != nil {
+				return err
 			}
-			return nil
-		})
-		if err != nil {
-			return policyStoreError(err)
 		}
-		if err := s.gov.reload(ctx); err != nil {
-			s.log.Warn("could not reload policies", "err", err)
+		err := cat.AddRowFilter(policy.RowFilter{Schema: iddomain.DictionarySchema, Table: c.name, Policy: iddomain.DictionaryPolicy,
+			Columns: []string{"id"}, SetBy: "igloo"}, now)
+		if err != nil && !errors.Is(err, policy.ErrExists) {
+			return err
 		}
+		for name, value := range c.tags {
+			ct := policy.ColumnTag{Schema: iddomain.DictionarySchema, Table: c.name, Column: "value", Tag: name, Value: value, SetBy: user.Name}
+			if err := cat.SetColumnTag(ct, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return policyStoreError(err)
+	}
+	if err := s.gov.reload(ctx); err != nil {
+		s.log.Warn("could not reload policies", "err", err)
 	}
 	d := iddomain.Domain{Name: c.name, Type: typ, Tags: c.tags, Generation: gen + 1, Created: now, CreatedBy: user.Name, Comment: c.comment}
 	if err := s.idDomains.Update(ctx, func(cat *iddomain.Catalog) error { return cat.AddDomain(d) }); err != nil {
@@ -345,21 +357,22 @@ func (s *Server) dropDomain(ctx context.Context, sess *session, c *domainCmd) er
 	if _, err := sess.conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+s.dictionary(c.name), nil); err != nil {
 		return pgError(err)
 	}
-	if len(d.Tags) > 0 {
-		err := s.gov.store.Update(ctx, func(cat *policy.Catalog) error {
-			for name := range d.Tags {
-				if err := cat.UnsetColumnTag("", iddomain.DictionarySchema, c.name, "value", name); err != nil && !errors.Is(err, policy.ErrNotFound) {
-					return err
-				}
+	err = s.gov.store.Update(ctx, func(cat *policy.Catalog) error {
+		if err := cat.DropRowFilter("", iddomain.DictionarySchema, c.name, iddomain.DictionaryPolicy); err != nil && !errors.Is(err, policy.ErrNotFound) {
+			return err
+		}
+		for name := range d.Tags {
+			if err := cat.UnsetColumnTag("", iddomain.DictionarySchema, c.name, "value", name); err != nil && !errors.Is(err, policy.ErrNotFound) {
+				return err
 			}
-			return nil
-		})
-		if err != nil {
-			return policyStoreError(err)
 		}
-		if err := s.gov.reload(ctx); err != nil {
-			s.log.Warn("could not reload policies", "err", err)
-		}
+		return nil
+	})
+	if err != nil {
+		return policyStoreError(err)
+	}
+	if err := s.gov.reload(ctx); err != nil {
+		s.log.Warn("could not reload policies", "err", err)
 	}
 	if err := s.idDomains.Update(ctx, func(cat *iddomain.Catalog) error { return cat.DropDomain(c.name) }); err != nil {
 		return err
@@ -516,4 +529,38 @@ func domainError(err error) error {
 		return pgerror.WithCode(err, codes.InvalidParameterValue)
 	}
 	return err
+}
+
+// dictionaryDenied is the refusal of a change to what Igloo keeps for ID
+// domains: their dictionaries' schema and the policy that guards them.
+func dictionaryDenied() error {
+	return pgerror.WithCode(fmt.Errorf("permission denied: the schema %s and the row access policy %s are Igloo's own, which keep ID domains' "+
+		"dictionaries; use CREATE and DROP ID DOMAIN", iddomain.DictionarySchema, iddomain.DictionaryPolicy), codes.InsufficientPrivilege)
+}
+
+// dictionaryWrites refuses, whoever the user, a statement of type t that
+// would write, create, drop or alter anything in the dictionaries' schema,
+// which only Igloo changes. Any write that names the schema counts.
+func dictionaryWrites(t duckdb.StmtType, query string) error {
+	if !slices.Contains(tableWrites, t) {
+		return nil
+	}
+	if tokensOf(query).mentions(map[string]bool{iddomain.DictionarySchema: true}) {
+		return dictionaryDenied()
+	}
+	return nil
+}
+
+// dictionaryPolicyChange refuses a policy or tag statement about the
+// dictionaries' policy, or about a table of their schema.
+func dictionaryPolicyChange(c *policyCmd) error {
+	for _, name := range []string{c.name, c.policy.Name} {
+		if strings.EqualFold(name, iddomain.DictionaryPolicy) {
+			return dictionaryDenied()
+		}
+	}
+	if len(c.table) >= 2 && strings.EqualFold(c.table[len(c.table)-2], iddomain.DictionarySchema) {
+		return dictionaryDenied()
+	}
+	return nil
 }

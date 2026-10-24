@@ -1784,6 +1784,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		// What it changes of the tables clean rooms keep, whatever the role.
 		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, query)
 	}
+	if err == nil {
+		// Nothing changes ID domains' dictionaries but Igloo.
+		err = dictionaryWrites(st.stmtType, query)
+	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		_ = st.close()

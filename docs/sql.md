@@ -416,6 +416,14 @@ DROP ID DOMAIN people;
   `igloo_domains.<domain>` of the catalog, whose `value` column carries the
   domain's tags, so that an [erasure request](privacy.md) finds the
   dictionary as it finds the tables.
+- The dictionaries are Igloo's own. The row access policy
+  `igloo_id_domain_dictionary`, which is false, guards each, so no user's
+  statement, an admin's included, reads their rows, and they count as
+  protected tables wherever Igloo serves tables or files ([Delta
+  Sharing](sharing.md), [clean rooms](clean-rooms.md), its Iceberg REST
+  endpoint, reads of the warehouse's files). No one may write to, create,
+  drop or alter anything in the schema `igloo_domains`, or change that
+  policy; their names still show in listings.
 - A member column must have the domain's type and carry its tags. `SET ID
   DOMAIN` adds the column `_igloo_id_<column>` (`BIGINT`) beside it and
   records the membership in the table property

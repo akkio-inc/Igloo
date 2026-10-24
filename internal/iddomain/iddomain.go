@@ -39,6 +39,14 @@ const MaxIDs int64 = 1 << 32
 // table a domain, named after it. It is Igloo's own.
 const DictionarySchema = "igloo_domains"
 
+// DictionaryPolicy is the row access policy, Igloo's own, that every
+// dictionary carries: it is false, so no user's statement reads a
+// dictionary's rows, admins' included, and the dictionaries count as
+// protected tables wherever Igloo serves files or tables (Delta Sharing,
+// clean rooms, its Iceberg REST endpoint, reads of the warehouse's files).
+// Igloo reads them itself, outside users' statements.
+const DictionaryPolicy = "igloo_id_domain_dictionary"
+
 // hiddenPrefix starts the name of the column that holds a member column's
 // ids.
 const hiddenPrefix = "_igloo_id_"

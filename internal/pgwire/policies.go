@@ -509,6 +509,9 @@ func (s *Server) runPolicyCommand(ctx context.Context, sess *session, c *policyC
 	if user.Role != auth.RoleAdmin {
 		return pgerror.WithCode(fmt.Errorf("permission denied: %s requires the admin role", c.tag), codes.InsufficientPrivilege)
 	}
+	if err := dictionaryPolicyChange(c); err != nil {
+		return err
+	}
 	if s.catalogName() == "" {
 		return pgerror.WithCode(errors.New("policies need an Iceberg catalog (IGLOO_CATALOG_URI)"), codes.FeatureNotSupported)
 	}

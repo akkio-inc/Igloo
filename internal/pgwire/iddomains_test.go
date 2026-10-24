@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
@@ -102,6 +103,41 @@ func TestIDDomains(t *testing.T) {
 	}) {
 		t.Errorf("the dictionary's values do not carry the tag: %+v", snap.Catalog.ColumnTags)
 	}
+	// No user's statement reads, writes or unguards a dictionary.
+	conn, err := r.eng.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO lake.igloo_domains.people VALUES ('p1', 0, now())", nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	for _, c := range []*pgx.Conn{admin, rita} {
+		if got := texts(t, c, "SELECT count(*) FROM lake.igloo_domains.people"); len(got) != 1 || got[0] != "0" {
+			t.Errorf("rows a user reads from the dictionary: %q", got)
+		}
+	}
+	for _, q := range []string{
+		"INSERT INTO lake.igloo_domains.people VALUES ('p2', 1, now())",
+		"DELETE FROM lake.igloo_domains.people",
+		"DROP TABLE lake.igloo_domains.people",
+		"ALTER TABLE lake.igloo_domains.people ADD COLUMN x INTEGER",
+		"CREATE TABLE lake.igloo_domains.mine AS SELECT 1 AS a",
+		"DROP SCHEMA lake.igloo_domains CASCADE",
+		"ALTER TABLE lake.igloo_domains.people DROP ROW ACCESS POLICY " + iddomain.DictionaryPolicy,
+		"DROP ROW ACCESS POLICY " + iddomain.DictionaryPolicy,
+		"CREATE OR REPLACE ROW ACCESS POLICY " + iddomain.DictionaryPolicy + " AS (id BIGINT) RETURNS BOOLEAN -> true",
+		"ALTER TABLE lake.igloo_domains.people ALTER COLUMN value UNSET TAG pii",
+	} {
+		if _, err := admin.Exec(ctx, q); pgCode(err) != "42501" {
+			t.Errorf("%s: %v, want permission denied", q, err)
+		}
+	}
+	files := vc.fake.Metadata(iddomain.DictionarySchema, "people").Location() + "/data/**/*.parquet"
+	if got, err := rita.Exec(ctx, "SELECT count(*) FROM read_parquet('"+files+"')"); err == nil {
+		t.Errorf("a reader read the dictionary's files: %v", got)
+	}
+
 	show := func(conn *pgx.Conn) []string {
 		t.Helper()
 		return texts(t, conn, "SHOW ID DOMAINS")
@@ -195,5 +231,98 @@ func TestIDDomains(t *testing.T) {
 	mustExec(t, off, "CREATE TABLE lake.public.others AS SELECT 'p1' AS person_id")
 	if _, err := off.Exec(ctx, "ALTER TABLE lake.public.others ALTER COLUMN person_id SET ID DOMAIN people"); pgCode(err) != "0A000" {
 		t.Errorf("with IGLOO_ID_DOMAINS off: %v", err)
+	}
+}
+
+// TestEraseDictionaryValue erases a person whose identifier a domain has
+// in its dictionary: erasure deletes and rewrites the dictionary's row
+// through its own path while every user's statement stays refused, and its
+// verification finds nothing left.
+func TestEraseDictionaryValue(t *testing.T) {
+	vc := newViewCatalog(t)
+	r := vc.replica(t, func(o *Options) { o.IDDomainsOn = true })
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	for _, q := range []string{
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		"CREATE TABLE lake.public.people AS SELECT 'p' || i AS person_id, i AS n FROM range(3) r(i)",
+		"CREATE TAG pii",
+		"ALTER TABLE lake.public.people ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"CREATE ID DOMAIN people (VARCHAR) TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.people ALTER COLUMN person_id SET ID DOMAIN people",
+	} {
+		mustExec(t, admin, q)
+	}
+	dictionary := func() []string {
+		t.Helper()
+		conn, err := r.eng.Connect(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close() //nolint:errcheck
+		rows, err := queryRows(ctx, conn, "SELECT value || '=' || id FROM lake.igloo_domains.people ORDER BY id")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, row := range rows {
+			out = append(out, row[0].(string))
+		}
+		return out
+	}
+	conn, err := r.eng.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO lake.igloo_domains.people VALUES ('p0', 0, now()), ('p1', 1, now()), ('p2', 2, now())", nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := erasure.NewMemoryStore()
+	svc := erasure.New(erasure.Options{Store: store, Catalog: cat, Policies: r.srv.gov.store.Load, Engine: r.eng,
+		Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake", Warehouse: vc.cfg.Storage.Location + "/"})
+	req, err := svc.Submit(ctx, "privacy", []erasure.Wanted{{Tag: "pii", Value: "person_id", Identifiers: []string{"p1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *erasure.Request
+	for range 3 {
+		if err := svc.Run(ctx, req.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got, err = store.Get(ctx, req.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status == erasure.StatusCompleted {
+			break
+		}
+	}
+	if got.Status != erasure.StatusCompleted {
+		t.Fatalf("status %s at %s: %s", got.Status, got.Step, got.Error)
+	}
+	erased := map[string]int64{}
+	for _, tt := range got.Tables {
+		erased[tt.Name] = tt.RowsDeleted
+	}
+	if erased["igloo_domains.people"] != 1 || erased["public.people"] != 1 {
+		t.Errorf("rows deleted: %v", erased)
+	}
+	if v := got.Verification; v == nil || v.Rows+v.Files+v.Bounds+v.Statistics != 0 {
+		t.Errorf("verification: %+v", got.Verification)
+	}
+	if d := dictionary(); strings.Join(d, ",") != "p0=0,p2=2" {
+		t.Errorf("dictionary after erasing p1: %q", d)
+	}
+	// The guard is still on.
+	if got := texts(t, admin, "SELECT count(*) FROM lake.igloo_domains.people"); len(got) != 1 || got[0] != "0" {
+		t.Errorf("rows an admin reads from the dictionary: %q", got)
+	}
+	if _, err := admin.Exec(ctx, "DELETE FROM lake.igloo_domains.people"); pgCode(err) != "42501" {
+		t.Errorf("an admin's DELETE: %v", err)
 	}
 }
