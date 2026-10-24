@@ -74,10 +74,12 @@ type variable struct {
 	Null bool   `json:"null,omitempty"`
 }
 
-// maxValueBytes bounds a computed value: a larger one keeps the statement
-// on one machine. A cohort's roaring bitmap over an ID domain of 100
-// million members takes at most about 12.5 MB.
-const maxValueBytes = 16 << 20
+// maxValueBytes bounds a computed BLOB: a larger one keeps the statement on
+// one machine. A BLOB is written to object storage once, and each task
+// reads it once and holds it once: rb_contains folds a constant bitmap
+// when it binds. An audience's bitmap at ten times the data took about
+// 50 MB. A variable, for tests.
+var maxValueBytes = 256 << 20
 
 // maxValueText bounds a value that crosses as text, in every task.
 const maxValueText = 1 << 20
@@ -93,16 +95,43 @@ var valueTypes = map[string]bool{
 // valuePrefix starts the names of the variables of computed values.
 const valuePrefix = "__igloo_value_"
 
+// bitmapVariable matches the names of the session variables that hold the
+// cohorts' bitmaps of a report Igloo answers from bitmap indexes and a
+// scan (see pgwire's report API): set in the session before the statement
+// runs, from index tables at pinned snapshots, each named by a hash of its
+// SELECT, so a name always means the same bitmap. No user's statement may
+// name the prefix (pgwire's indexReferences), so a call with such a name is
+// Igloo's own. The coordinator computes them for the stages as it does
+// subqueries' values.
+var bitmapVariable = regexp.MustCompile(`^__igloo_bitmap_[0-9a-f]{24}$`)
+
 var valueName = regexp.MustCompile(`^` + valuePrefix + `[0-9]+$`)
 
 // computedValues replaces the scalar subqueries of stmt that the
-// coordinator computes (see ValueEnv) with the variables the stages read
-// them from, and returns them. A statement that calls getvariable() itself
-// keeps its subqueries, so that every variable a stage reads is one of
-// these.
+// coordinator computes (see ValueEnv), and its reads of the session's
+// cohort bitmaps (bitmapVariable), with the variables the stages read them
+// from, and returns them. A statement that calls getvariable() for any
+// other variable keeps them all, so that every variable a stage reads is
+// one of these.
 func (co *Coordinator) computedValues(ctx context.Context, env Env, stmt node) ([]*value, error) {
 	ve, ok := env.(ValueEnv)
-	if !ok || callsFunction(stmt, "getvariable") {
+	if !ok {
+		return nil, nil
+	}
+	var bitmaps []node
+	other := false
+	walk(stmt, func(n node) bool {
+		if isFunction(n, "getvariable") {
+			if bitmapVariable.MatchString(variableName(n)) {
+				bitmaps = append(bitmaps, n)
+			} else {
+				other = true
+			}
+			return false
+		}
+		return true
+	})
+	if other {
 		return nil, nil
 	}
 	var subs []node
@@ -151,6 +180,26 @@ func (co *Coordinator) computedValues(ctx context.Context, env Env, stmt node) (
 		clear(sub)
 		maps.Copy(sub, repl)
 		values = append(values, v)
+	}
+	// The session's cohort bitmaps, a value a name however often read.
+	byName := map[string]*value{}
+	for _, call := range bitmaps {
+		name := variableName(call)
+		v := byName[name]
+		if v == nil {
+			text := "getvariable(" + quoteLiteral(name) + ")"
+			v = &value{name: fmt.Sprintf("%s%d", valuePrefix, len(values)), typ: "BLOB", text: text, query: "SELECT " + text,
+				sub: clone(call).(node)}
+			byName[name] = v
+			values = append(values, v)
+		}
+		repl, err := co.parser.expr(fmt.Sprintf("CAST(getvariable(%s) AS BLOB)", quoteLiteral(v.name)))
+		if err != nil {
+			return nil, err
+		}
+		repl["alias"] = call["alias"]
+		clear(call)
+		maps.Copy(call, repl)
 	}
 	return values, nil
 }

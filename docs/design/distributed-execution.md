@@ -462,8 +462,14 @@ result's columns must match the prepared statement's, or it falls back.
   task, and each task sets the variable before it runs. The coordinator's
   own part keeps the subquery, which reads the same snapshot, and the
   statement keeps its plan key: the subquery's shape, not the variable.
-  A value over 16 MiB keeps the statement on one machine, and so does a
-  statement that calls `getvariable` itself.
+  A value over 256 MiB keeps the statement on one machine (a task holds a
+  bitmap once: `rb_contains` folds a constant one when it binds), and so
+  does a statement that calls `getvariable` itself, but for the session
+  variables in which a report Igloo answers from bitmap indexes and a
+  scan holds its cohorts' bitmaps (`__igloo_bitmap_` and a hash of the
+  SELECT that computed one, from index tables at pinned snapshots; no
+  user's statement may name the prefix). Those cross as computed values
+  too, one a name, and the coordinator's own part reads the variables.
 - **Pinned snapshots.** Such a statement also reads the indexed tables
   themselves at the snapshots their bitmaps are of, `AT (VERSION => n)`,
   and Igloo prepares it again before a run if a table has moved on, so n

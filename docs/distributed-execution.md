@@ -188,10 +188,10 @@ In detail, a part runs distributed when:
   a table's latest, `AT (VERSION => n)`, as Igloo pins the statements it
   answers from bitmap indexes, counts as such a read; at any other, the
   statement runs on one machine. Where such a statement filters a large
-  table by a scalar subquery over an index's table, the coordinator
-  computes that subquery once and workers get its value (`computed first`
-  in `EXPLAIN DISTRIBUTED`). Values over 16 MiB keep the statement on one
-  machine.
+  table by a scalar subquery over an index's table, or by a cohort's
+  bitmap the session computed first, the coordinator computes that value
+  once and workers get it (`computed first` in `EXPLAIN DISTRIBUTED`).
+  Values over 256 MiB keep the statement on one machine.
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,

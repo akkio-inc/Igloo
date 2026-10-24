@@ -625,7 +625,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statement pinned, once, and workers read its value from a DuckDB
   variable, never the table, which a policy of Igloo's own keeps from them.
   `EXPLAIN DISTRIBUTED` lists such values as `computed first`; one over
-  16 MiB keeps the statement on one machine. A table read at its latest
+  256 MiB keeps the statement on one machine. The session variables in
+  which a report answered from indexes and a scan holds its cohorts'
+  bitmaps cross the same way. A table read at its latest
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.

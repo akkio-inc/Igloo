@@ -75,6 +75,8 @@ func (h *harness) runValues(env valueEnv, query string) (got, want [][]any, plan
 func TestComputedValues(t *testing.T) {
 	h := newHarness(t, 0.01, 4, 2)
 	h.exec(`CREATE TABLE cutoffs AS SELECT * FROM (VALUES ('a', 1000::BIGINT), ('b', 30000::BIGINT)) AS v(name, k)`)
+	defer func(n int) { maxValueBytes = n }(maxValueBytes)
+	maxValueBytes = 1 << 20
 	h.exec(`CREATE TABLE blobs AS SELECT 'small' AS name, encode(repeat('x', 100000)) AS b UNION ALL
 		SELECT 'large', encode(repeat('y', ` + strconv.Itoa(maxValueBytes+1) + `))`)
 	env := valueEnv{harnessEnv{h}, map[string]bool{"cutoffs": true, "blobs": true}}
@@ -304,5 +306,39 @@ func TestPinnedVersions(t *testing.T) {
 		if _, err := h.co.Plan(context.Background(), q, env, ModeOn); !IsUnsupported(err) {
 			t.Errorf("%s: planned with %v, want it kept on one machine", short(q), err)
 		}
+	}
+}
+
+// A report's cohort bitmaps, which the session holds in variables while
+// the statement runs, cross to the stages as computed values, one a name
+// however often read, and the coordinator's own part reads the variables.
+func TestBitmapVariables(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	env := valueEnv{harnessEnv{h}, nil}
+	const cohort = "__igloo_bitmap_0123456789abcdef01234567"
+	h.exec(`SET VARIABLE ` + cohort + ` = encode(repeat('x', 30000))`)
+	q := `SELECT l_returnflag, count(*) AS n FROM lineitem
+		WHERE l_orderkey < octet_length(coalesce(getvariable('` + cohort + `'), CAST('gone' AS BLOB)))
+		AND l_partkey * 10 < octet_length(getvariable('` + cohort + `')) GROUP BY 1 ORDER BY 1`
+	got, want, plan, err := h.runValues(env, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg := compareRows(want, got, true); msg != "" {
+		t.Errorf("%s\n%s", msg, plan.describe())
+	}
+	if len(plan.values) != 1 || plan.values[0].typ != "BLOB" {
+		t.Errorf("computed %v, want one BLOB", plan.values)
+	}
+	for _, s := range plan.Stages {
+		if strings.Contains(s.SQL, "__igloo_bitmap_") {
+			t.Errorf("stage %d reads the session's variable: %s", s.ID, s.SQL)
+		}
+	}
+	// A variable of another name keeps the statement here.
+	other := strings.ReplaceAll(q, cohort, "__igloo_bitmap_short")
+	h.exec(`SET VARIABLE __igloo_bitmap_short = encode('y')`)
+	if _, err := h.co.Plan(context.Background(), other, env, ModeOn); !IsUnsupported(err) {
+		t.Errorf("another variable: %v, want it kept on one machine", err)
 	}
 }
