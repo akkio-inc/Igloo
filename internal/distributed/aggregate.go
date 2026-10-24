@@ -543,6 +543,14 @@ func (a *aggregation) add(call node) error {
 	case call["distinct"] == true && name == "count" && a.pl.opts.bitmaps && a.bitmapArg(args[0].(node)):
 		// A bitmap a group: no value need cross.
 		ac.bitmap = true
+	case name == "rb_count_distinct" && len(args) == 1 && call["distinct"] != true:
+		// The rb extension's own count of distinct IDs (UINTEGER), which
+		// bitmaps a group combine into as count(DISTINCT) does. Its pair
+		// form, rb_count_distinct(id, key), has no partials (see
+		// checkFunctions).
+		ac.bitmap = true
+	case name == "rb_count_distinct" && len(args) == 2:
+		ac.whole = unsupported("rb_count_distinct(id, key), which has no partials")
 	case call["distinct"] == true:
 		arg, err := a.substituteAliases(clone(args[0]).(node))
 		if err != nil {
@@ -754,15 +762,54 @@ func (a *aggregation) idValue(e node, sc *scope, depth int) bool {
 		}
 		if inner := a.innerScope(it); inner != nil && i >= 0 {
 			sub := subqueryNode(inner.ref)
-			items := list(sub, "select_list")
-			if hasClass(sub["select_list"], "STAR") || i >= len(items) {
+			item := itemOf(list(sub, "select_list"), i, len(it.columns), name)
+			if item == nil {
 				return false
 			}
-			// Columns are named after the subquery's items, by position.
-			return a.idValue(items[i].(node), inner, depth+1)
+			return a.idValue(item, inner, depth+1)
 		}
 	}
 	return false
+}
+
+// itemOf returns the select item of a subquery's column i, of n, named
+// name: the item at that position, or past a star, as in a report's
+// SELECT s.*, CAST(s.id AS UINTEGER) AS member, the item that many places
+// on, the star standing for the columns between. nil for a column of the
+// star itself, or where the items do not say.
+func itemOf(items []any, i, n int, name string) node {
+	j, stars := i, 0
+	for k, item := range items {
+		if str(item.(node)["class"]) != "STAR" {
+			continue
+		}
+		stars++
+		width := n - (len(items) - 1)
+		switch {
+		case width < 0:
+			return nil
+		case i >= k && i < k+width:
+			return nil
+		case i >= k+width:
+			j = i - width + 1
+		}
+	}
+	if stars > 1 || j >= len(items) {
+		return nil
+	}
+	item := items[j].(node)
+	if stars == 1 {
+		// Past a star, only an item named so: DuckDB numbers its columns
+		// as the items say.
+		alias := strings.ToLower(str(item["alias"]))
+		if alias == "" && str(item["class"]) == "COLUMN_REF" {
+			alias = strings.ToLower(lastName(item))
+		}
+		if alias != name {
+			return nil
+		}
+	}
+	return item
 }
 
 // idType reports whether a column type widens to UINTEGER.

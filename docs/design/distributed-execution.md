@@ -168,7 +168,11 @@ After a `SELECT` is authorized and prepared as always, and only outside
 explicit transactions, the coordinator plans it:
 
 1. **Parse** with DuckDB's own parser (`json_serialize_sql`), into the parse
-   tree DuckDB itself binds.
+   tree DuckDB itself binds. The parser's DuckDB loads no extensions, so
+   the planner learns which functions are aggregates from the first
+   session that plans a statement (`duckdb_functions()`), those of the
+   extensions the server loads included: rb's `rb_agg`, spatial's and
+   datasketches'. It takes a call of any other function for a scalar one.
 2. **Find parts to distribute.** Walking down from the statement through
    common table expressions, `FROM` subqueries and set operations, the
    planner takes the first `SELECT` it can split: one whose `FROM` tree
@@ -893,12 +897,23 @@ stage completes the groups (`internal/distributed/aggregate.go`):
 - **Bitmaps.** Where the session counts distinct 32-bit unsigned integers
   with the rb extension's roaring bitmaps (`rb_count_distinct` set to
   `always`), a `count(DISTINCT)` of a `CAST(... AS UINTEGER)` or of a
-  column of an unsigned type is not an aggregate over `DISTINCT` values
-  for these modes at all: its partial is `rb_agg` of its argument, a BLOB
+  column of an unsigned type (through common table expressions and
+  subqueries that pass rows through, past a star as in `SELECT s.*,
+  CAST(s.id AS UINTEGER) AS member`, and under a `CASE` whose other values
+  are NULL) is not an aggregate over `DISTINCT` values for these modes at
+  all: its partial is `rb_agg` of its argument, a BLOB
   of CRoaring's portable serialization a group, and the coordinator or a
   second stage computes `rb_cardinality(rb_or_agg(...))` of the partials,
   so the aggregation goes as one without `DISTINCT` (gathered, or by
-  group when groups are many) and no value crosses.
+  group when groups are many) and no value crosses. `rb_agg`, `rb_or_agg`
+  and `rb_count_distinct(id)` written in a statement combine the same way,
+  as unions of the workers' bitmaps (`rb_or_agg`), so a count of distinct
+  pairs in two levels (a bitmap of each group's members a day, then the
+  sum of the days' cardinalities) aggregates before any exchange. The pair
+  form, `rb_count_distinct(id, key)`, has no partials, and keeps its
+  statement on one machine: workers would complete its groups from every
+  row, exchanged whole, which on a report's unnested rows took several
+  times as long as one machine.
 - **By group.** Other aggregates over `DISTINCT` values (`median`,
   `string_agg`, arguments none of which fixes the others), and the top
   groups of an aggregation by a column of a divided table

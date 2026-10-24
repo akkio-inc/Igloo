@@ -467,6 +467,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`rb_count_distinct` `always`, with integer IDs): each worker
   sends a bitmap of its values a group, and the coordinator, or a worker
   completing a partition of the groups, counts their union.
+- The rb extension's aggregates distribute as aggregates. The planner's own
+  DuckDB loads no extensions, so it took `rb_agg(member)` for a scalar
+  function: a GROUP BY around it ran on one machine, and in a report that
+  counts distinct (member, day) pairs in two levels the workers exchanged
+  every row rather than their groups' bitmaps, several times slower than
+  one machine. The planner now learns the aggregate functions of the
+  extensions the server loads from the first session that plans a
+  statement; `rb_agg`, `rb_or_agg` and `rb_count_distinct(id)` combine as
+  unions of the workers' bitmaps (`rb_or_agg`), written before any
+  exchange. `rb_count_distinct(id, key)`, which has no partials, stays on
+  one machine rather than have workers exchange every row for it. A
+  `count(DISTINCT)` of IDs selected past a star (`SELECT s.*, CAST(s.id AS
+  UINTEGER) AS member`), as a report call whose cohorts come from bitmap
+  indexes selects its source's rows, crosses as bitmaps too, rather than
+  as every ID of every group.
 - Auto mode's estimates are measured against the scale environment's
   reports at 1x, 10x and 100x. A table filtered by a subquery's value, as an
   audience's latest version is, counts as filtered, and a filtered table a

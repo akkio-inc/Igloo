@@ -46,6 +46,9 @@ type Env interface {
 	UserFunction(ctx context.Context, name string) (bool, error)
 	// Setting returns the session's value of a DuckDB setting.
 	Setting(ctx context.Context, name string) (string, error)
+	// Aggregates returns the names of the session's aggregate functions,
+	// those of the extensions it loaded included.
+	Aggregates(ctx context.Context) ([]string, error)
 	// View reports whether a name, as a statement writes it, may mean a
 	// view in this session: a view, or a name that does not resolve to
 	// exactly one relation.
@@ -2440,6 +2443,15 @@ func (pl *planner) checkFunctions(fragment node) error {
 			name := strings.ToLower(str(n["function_name"]))
 			if sessionFunctions[name] && (name != "getvariable" || !pl.opts.values[variableName(n)]) {
 				err = unsupported("%s()", name)
+				return false
+			}
+			if name == "rb_count_distinct" && len(list(n, "children")) == 2 {
+				// It has no partials: workers would complete its groups from
+				// every row, exchanged whole, several times slower than one
+				// machine on a report's unnested rows. A bitmap of each
+				// group's IDs a key (rb_agg), then the sum of their
+				// cardinalities, crosses as partials.
+				err = unsupported("rb_count_distinct(id, key), which has no partials")
 				return false
 			}
 			user, uerr := pl.env.UserFunction(pl.ctx, name)

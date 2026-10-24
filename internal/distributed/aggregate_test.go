@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -115,6 +117,46 @@ func TestAggregationModes(t *testing.T) {
 		GROUP BY CASE WHEN l_linenumber % 2 = 0 THEN lower(l_returnflag) ELSE l_returnflag END ORDER BY 1, 2`
 	if n := h.exchanged(q, "aggregate"); n > 0 {
 		t.Errorf("under a collation, %d stages wrote partial results to an exchange", n)
+	}
+}
+
+// TestItemOf checks which select item a subquery's column comes from,
+// around a star.
+func TestItemOf(t *testing.T) {
+	p, err := newParser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.close() //nolint:errcheck
+	for _, tc := range []struct {
+		query string
+		cols  []string
+		// want are the items' positions, -1 for none.
+		want []int
+	}{
+		{`SELECT a, b + 1 AS c FROM t`, []string{"a", "c"}, []int{0, 1}},
+		// A star of three columns, then two items.
+		{`SELECT s.*, CAST(s.id AS UINTEGER) AS member, keep FROM t AS s`, []string{"id", "x", "y", "member", "keep"}, []int{-1, -1, -1, 1, 2}},
+		{`SELECT CAST(id AS UINTEGER) AS member, * FROM t`, []string{"member", "id", "x"}, []int{0, -1, -1}},
+		// Two stars: no telling.
+		{`SELECT a.*, b.*, 1 AS one FROM a, b`, []string{"x", "y", "z", "w", "one"}, []int{-1, -1, -1, -1, -1}},
+		// Named otherwise than the item at its place.
+		{`SELECT *, 1 AS one FROM t`, []string{"x", "y", "other"}, []int{-1, -1, -1}},
+	} {
+		n, err := p.parse(tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items := list(n, "select_list")
+		for i, name := range tc.cols {
+			got := itemOf(items, i, len(tc.cols), name)
+			at := slices.IndexFunc(items, func(it any) bool {
+				return got != nil && reflect.ValueOf(it.(node)).Pointer() == reflect.ValueOf(got).Pointer()
+			})
+			if at != tc.want[i] {
+				t.Errorf("%s, column %d (%s): item %d, want %d", tc.query, i, name, at, tc.want[i])
+			}
+		}
 	}
 }
 
@@ -288,6 +330,11 @@ func TestBitmapDistinctResults(t *testing.T) {
 		`WITH r AS (SELECT l_shipmode AS mode, CAST(l_orderkey AS UINTEGER) AS member, l_quantity > 25 AS keep FROM lineitem),
 			v AS (SELECT mode, member, keep FROM r)
 			SELECT mode, count(DISTINCT member) FILTER (WHERE keep) AS people, count(DISTINCT member) AS everyone FROM v GROUP BY 1 ORDER BY 1`,
+		// The ID past a star, as a report selects its source's rows with
+		// their members.
+		`WITH m AS (SELECT l.*, CAST(l.l_orderkey AS UINTEGER) AS member, l.l_quantity > 25 AS keep FROM lineitem AS l),
+			v AS (SELECT l_shipmode AS mode, member, keep FROM m)
+			SELECT mode, count(DISTINCT CASE WHEN keep THEN member END) AS people, count(DISTINCT member) AS everyone FROM v GROUP BY 1 ORDER BY 1`,
 	}
 	h.co.maxBroadcast = 1
 	for _, mode := range []string{aggGather, aggByGroup, ""} {
@@ -302,6 +349,83 @@ func TestBitmapDistinctResults(t *testing.T) {
 					t.Errorf("no bitmaps:\n%s", p.describe())
 				}
 			})
+		}
+	}
+}
+
+// TestExtensionAggregates checks that the planner knows the aggregates of
+// the extensions sessions load, which its own DuckDB does not: rb's rb_agg,
+// rb_or_agg and rb_count_distinct of IDs combine as unions of the workers'
+// bitmaps, written before any exchange, at one level and at two, over
+// every row and through a relation another statement joins to, and return
+// what one machine does. rb_count_distinct(id, key), which has no
+// partials, stays on one machine, rather than have workers complete its
+// groups from every row, through a common table expression too.
+func TestExtensionAggregates(t *testing.T) {
+	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
+	if rb == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
+	}
+	h := newHarnessRB(t, 0.02, 4, 3, rb)
+	h.co.maxBroadcast = 1
+	defer func() { h.co.maxBroadcast = 0 }()
+	cases := []struct {
+		query string
+		// partials says the stage that reads lineitem aggregates into
+		// bitmaps, and a later step unions them.
+		partials bool
+	}{
+		{`SELECT rb_cardinality(rb_agg(CAST(l_orderkey AS UINTEGER))) AS n FROM lineitem`, true},
+		{`SELECT l_shipmode, rb_cardinality(rb_agg(CAST(l_orderkey AS UINTEGER))) AS n, count(*) AS c FROM lineitem GROUP BY 1 ORDER BY 1`, true},
+		{`SELECT l_returnflag, rb_cardinality(rb_agg(CASE WHEN l_quantity > 25 THEN CAST(l_orderkey AS UINTEGER) END)) AS big,
+			count(*) FILTER (WHERE l_quantity > 25) AS n FROM lineitem GROUP BY 1 ORDER BY 1`, true},
+		// Two levels, as a report counts distinct (member, day) pairs: a
+		// bitmap of each group's members a day, then the days' sum and the
+		// union's members.
+		{`WITH d AS (SELECT l_shipmode AS m, l_shipdate AS day, rb_agg(CAST(l_orderkey AS UINTEGER)) AS bm FROM lineitem GROUP BY 1, 2)
+			SELECT m, CAST(sum(rb_cardinality(bm)) AS BIGINT) AS pairs, rb_cardinality(rb_or_agg(bm)) AS orders FROM d GROUP BY 1 ORDER BY 1`, true},
+		// A bitmap over every row of a table another joins to: one row.
+		{`WITH b AS (SELECT rb_agg(CAST(o_orderkey AS UINTEGER)) AS bm FROM orders WHERE o_orderpriority = '1-URGENT')
+			SELECT l_shipmode, count(*) AS n FROM lineitem, b WHERE rb_contains(b.bm, CAST(l_orderkey AS UINTEGER)) GROUP BY 1 ORDER BY 1`, false},
+		{`SELECT l_returnflag, rb_count_distinct(CAST(l_partkey AS UINTEGER)) AS parts, rb_count_distinct(CAST(l_suppkey AS UINTEGER)) FILTER (WHERE l_quantity > 25) AS s
+			FROM lineitem GROUP BY 1 ORDER BY 1`, true},
+	}
+	for _, mode := range []string{aggGather, aggByGroup, ""} {
+		h.co.aggregation = mode
+		for _, tc := range cases {
+			t.Run(mode+" "+short(tc.query), func(t *testing.T) {
+				h.t = t
+				if !h.check(tc.query) {
+					t.Fatal("did not run distributed")
+				}
+				if !tc.partials {
+					return
+				}
+				p := h.planOf(tc.query)
+				first := ""
+				for _, s := range p.Stages {
+					if in := s.split(); in != nil && in.Table.Name == "lineitem" {
+						first = s.SQL
+					}
+				}
+				final, _ := h.co.parser.print(p.final)
+				if !strings.Contains(first, "rb_agg(") || !strings.Contains(p.describe()+final, "rb_or_agg(") {
+					t.Errorf("no bitmaps before the exchange:\n%s", p.describe())
+				}
+			})
+		}
+	}
+	h.co.aggregation = ""
+	for _, q := range []string{
+		`SELECT l_shipmode, rb_count_distinct(CAST(l_orderkey AS UINTEGER), l_shipdate) AS pairs FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`WITH v AS (SELECT l_shipmode AS m, CAST(l_orderkey AS UINTEGER) AS id, l_shipdate AS day FROM lineitem, unnest([1, 2]))
+			SELECT m, rb_count_distinct(id, day) AS pairs, count(*) AS n FROM v GROUP BY 1 ORDER BY 1`,
+	} {
+		if _, err := h.co.Plan(context.Background(), q, harnessEnv{h}, ModeOn); err == nil || !strings.Contains(err.Error(), "rb_count_distinct(id, key)") {
+			t.Errorf("%s: planned on workers, or for another reason: %v", short(q), err)
 		}
 	}
 }

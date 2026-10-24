@@ -191,6 +191,23 @@ func (e harnessEnv) Setting(ctx context.Context, name string) (string, error) {
 	return v, err
 }
 
+func (e harnessEnv) Aggregates(ctx context.Context) ([]string, error) {
+	rows, err := e.h.session.QueryContext(ctx, AggregatesQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 // connector adapts a DuckDB connector to Connector.
 type connector struct{ c *duckdb.Connector }
 

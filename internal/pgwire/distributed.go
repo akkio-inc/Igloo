@@ -713,6 +713,29 @@ func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
 	return settingValue(ctx, e.sess.conn, name)
 }
 
+// Aggregates returns the names of the session's aggregate functions, those
+// of the extensions the server loaded included.
+func (e *sessionEnv) Aggregates(ctx context.Context) ([]string, error) {
+	rows, err := e.sess.conn.QueryContext(ctx, distributed.AggregatesQuery, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var names []string
+	dest := make([]driver.Value, 1)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return names, nil
+			}
+			return nil, err
+		}
+		if name, ok := dest[0].(string); ok {
+			names = append(names, name)
+		}
+	}
+}
+
 // Describe binds query on the session's connection.
 // Parameters are bound to NULL, as for the grant check's plans: the result
 // columns must match the statement's, which runFinal checks.

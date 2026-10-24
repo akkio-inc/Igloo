@@ -13,6 +13,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	mrand "math/rand/v2"
 	"net/http"
@@ -138,10 +139,15 @@ type Coordinator struct {
 	aggregation string
 	bitmaps     *bool
 	parser      *parser
-	aggs        map[string]bool
-	dir         string
-	log         *slog.Logger
-	stop        context.CancelFunc
+	// aggs are the aggregate functions statements may call: the parser's,
+	// and once a session has listed them, its extensions' (see
+	// aggregates), under aggsMu.
+	aggsMu     sync.Mutex
+	aggs       map[string]bool
+	aggsListed bool
+	dir        string
+	log        *slog.Logger
+	stop       context.CancelFunc
 	// background are the pool's checks and the sweeps, until stop.
 	background sync.WaitGroup
 	// history is what statements took before, for auto mode (see choose).
@@ -185,7 +191,7 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 		return nil, err
 	}
 	aggs := map[string]bool{}
-	rows, err := p.db.Query(`SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE function_type = 'aggregate'`)
+	rows, err := p.db.Query(AggregatesQuery)
 	if err != nil {
 		return nil, errors.Join(err, p.close())
 	}
@@ -354,7 +360,7 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, nil, err
 	}
 	opts.values = valueNames(values)
-	plan, err := newPlanner(ctx, env, co.parser, co.aggs, opts).plan(stmt)
+	plan, err := newPlanner(ctx, env, co.parser, co.aggregates(ctx, env), opts).plan(stmt)
 	if err != nil {
 		var u *errUnsupported
 		if len(ws) == 0 && errors.As(err, &u) {
@@ -417,6 +423,40 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
 	}
 	return plan, d, nil
+}
+
+// AggregatesQuery lists a DuckDB's aggregate functions, in lower case, for
+// Env.Aggregates.
+const AggregatesQuery = `SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE function_type = 'aggregate'`
+
+// aggregates returns the names of the aggregate functions statements may
+// call: those of the parser's DuckDB, and the first time a session lists
+// its own, those of the extensions it loaded, which the parser does not
+// load (rb's rb_agg and rb_or_agg, spatial's, datasketches'). The planner
+// takes a call of any other function for a scalar one: a GROUP BY around
+// rb_agg(member) was refused ("column member is neither grouped nor
+// aggregated"), and around more of a statement the rows were exchanged
+// whole rather than as partial aggregates. Every session of the server
+// loads the same extensions, at startup, so one session's list serves.
+func (co *Coordinator) aggregates(ctx context.Context, env Env) map[string]bool {
+	co.aggsMu.Lock()
+	defer co.aggsMu.Unlock()
+	if co.aggsListed {
+		return co.aggs
+	}
+	names, err := env.Aggregates(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			co.log.Warn("could not list the session's aggregate functions", "err", err)
+		}
+		return co.aggs
+	}
+	aggs := maps.Clone(co.aggs)
+	for _, name := range names {
+		aggs[strings.ToLower(name)] = true
+	}
+	co.aggs, co.aggsListed = aggs, true
+	return aggs
 }
 
 // fleet describes the workers for an estimate: ws, those that answer, and
