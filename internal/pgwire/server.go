@@ -2069,6 +2069,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	// Counts bitmap indexes answer read them (see bitmaprewrite.go).
 	indexed := query
 	query, indexPins, indexCandidate := s.rewriteIndexes(ctx, sess, user, query, counts)
+	if len(indexPins) > 0 {
+		s.metrics.indexStatement()
+	}
 	// The report API's calls read from bitmap indexes keep theirs too.
 	indexPins = append(indexPins, reportIndexPins...)
 	indexCandidate = indexCandidate || len(reportIndexPins) > 0

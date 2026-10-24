@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/akkio-inc/igloo/internal/iddomain"
 )
@@ -56,7 +58,7 @@ func newE2Test(t *testing.T, opts ...func(*Options)) *idTest {
 // and the bitmaps are of the tables' current snapshots.
 func TestBitmapIndexRewrite(t *testing.T) {
 	t.Parallel()
-	it := newE2Test(t)
+	it := newE2Test(t, func(o *Options) { o.Metrics = NewMetrics(prometheus.NewRegistry()) })
 	ctx := context.Background()
 	srv := it.r.srv
 	conn := it.admin
@@ -84,6 +86,9 @@ func TestBitmapIndexRewrite(t *testing.T) {
 	}
 	_ = want
 	answered(3, "with the indexes built")
+	if n := testutil.ToFloat64(srv.metrics.indexStatements); n != 1 {
+		t.Errorf("igloo_bitmap_index_statements_total %v, want 1", n)
+	}
 
 	// A row access policy on a table it answers for, or a masking policy on
 	// a column it reads, there or under the view: the tables.

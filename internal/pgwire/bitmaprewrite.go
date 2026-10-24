@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
@@ -152,6 +153,13 @@ func (s *Server) rewriteIndexes(ctx context.Context, sess *session, user auth.Us
 		return written, nil, true
 	}
 	s.indexRewrites.Add(rewritten)
+	if s.log.Enabled(ctx, slog.LevelDebug) {
+		names := make([]string, len(pins))
+		for i, pin := range pins {
+			names[i] = pin.index
+		}
+		s.log.Debug("counts read bitmap indexes", "selects", rewritten, "indexes", names)
+	}
 	return pinned, pins, true
 }
 

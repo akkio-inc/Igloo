@@ -721,6 +721,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_report_calls_total` | `path` = `index`, `index+scan`, `ids`, `scan` | [Report API](media-analytics.md#report-api) calls prepared, by how they count: from bitmap indexes, people from them and the rest from a scan, through ID domains' ids, or from the tables' values |
 | `igloo_report_ctes_recognized_total` | | Common table expressions of reports that `IGLOO_REPORT_REWRITE` answered through the report API ([reports as written](media-analytics.md#reports-as-written)) |
 | `igloo_report_rewrite_fallbacks_total` | | Statements whose recognized reports failed to prepare and were prepared as written instead |
+| `igloo_bitmap_index_statements_total` | | Statements prepared whose counts of distinct members in SQL read [bitmap indexes](sql.md#bitmap-indexes) instead of the tables (report API calls count in `igloo_report_calls_total`) |
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |

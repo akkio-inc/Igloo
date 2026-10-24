@@ -25,6 +25,9 @@ type Metrics struct {
 	// reportapi.go, reportrecognize.go).
 	reports               *prometheus.CounterVec
 	recognized, fallbacks prometheus.Counter
+	// indexStatements counts the statements whose counts in SQL read
+	// bitmap indexes (see bitmaprewrite.go).
+	indexStatements prometheus.Counter
 	// memoryExits counts the times Igloo gave up on a statement that did
 	// not stop when canceled for memory (see memexit.go).
 	memoryExits prometheus.Counter
@@ -78,13 +81,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_report_rewrite_fallbacks_total",
 			Help: "Statements whose recognized reports failed to prepare, which were prepared as written instead.",
 		}),
+		indexStatements: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_bitmap_index_statements_total",
+			Help: "Statements prepared whose counts of distinct members in SQL read bitmap indexes instead of the tables (the report API's calls count in igloo_report_calls_total).",
+		}),
 		memoryExits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_memory_exits_total",
 			Help: "Times Igloo exited because a statement it canceled for running out of memory did not stop and memory was nearly gone.",
 		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.memoryExits)
+		m.indexStatements, m.memoryExits)
 	return m
 }
 
@@ -97,6 +104,12 @@ func (m *Metrics) reportCall(path string) {
 func (m *Metrics) reportsRecognized(n int) {
 	if m != nil && n > 0 {
 		m.recognized.Add(float64(n))
+	}
+}
+
+func (m *Metrics) indexStatement() {
+	if m != nil {
+		m.indexStatements.Inc()
 	}
 }
 
