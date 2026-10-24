@@ -331,11 +331,11 @@ func TestFilesInManifestOrder(t *testing.T) {
 	}
 }
 
-// With prefetching on, every task's view of a catalog table carries its
-// files' sizes, the columns its query reads and whether it filters them,
-// and of an exchange its files' sizes, read whole, and the worker hands
-// them to its prefetcher as the task starts. With it off, the prefetcher
-// hears of nothing.
+// Every task's view of a catalog table carries its files' sizes, the
+// columns its query reads and whether it filters them, and a worker with
+// a prefetcher hands them to it as the task starts, whatever the
+// coordinator's own setting. Views of exchanges carry nothing: DuckDB
+// reads their files around the read cache.
 func TestPrefetchTasks(t *testing.T) {
 	h := newHarness(t, 0.01, 4, 2)
 	var mu sync.Mutex
@@ -365,17 +365,9 @@ func TestPrefetchTasks(t *testing.T) {
 
 	query := "SELECT l_returnflag, sum(l_quantity) FROM lineitem GROUP BY 1"
 	run(query)
-	if len(got) > 0 {
-		t.Fatalf("prefetching off, the prefetcher heard of %+v", got)
-	}
-	h.co.opts.Prefetch = true
-	run(query)
 	lineitem := h.tables["lineitem"]
 	var files []File
 	for _, sc := range got {
-		if sc.Whole {
-			continue
-		}
 		if !slices.Equal(sc.FieldIDs, ids(lineitem, "l_quantity", "l_returnflag")) ||
 			strings.Join(sc.Columns, ",") != "l_quantity,l_returnflag" || sc.Filtered {
 			t.Errorf("scan %+v", sc)
@@ -395,21 +387,16 @@ func TestPrefetchTasks(t *testing.T) {
 		}
 	}
 
-	// A partitioned join: its later stages read exchanges, whole.
+	// A partitioned join: its later stages read exchanges, which are left
+	// out.
 	got = nil
 	h.co.maxBroadcast = 1
 	run("SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey WHERE l_shipmode = 'AIR' GROUP BY 1")
 	tables := map[string]bool{}
 	for _, sc := range got {
 		for _, f := range sc.Files {
-			if sc.Whole != strings.Contains(f.Path, "/"+config.ShuffleDir+"/") {
-				t.Errorf("scan of %s whole %v", f.Path, sc.Whole)
-			}
-			if sc.Whole {
-				tables["exchanges"] = true
-				if f.Size <= 0 || len(sc.FieldIDs) > 0 {
-					t.Errorf("exchange scan %+v", sc)
-				}
+			if strings.Contains(f.Path, "/"+config.ShuffleDir+"/") {
+				t.Errorf("prefetched an exchange's file %s", f.Path)
 				continue
 			}
 			// Only lineitem's is filtered, which DuckDB may read less of.
@@ -428,7 +415,10 @@ func TestPrefetchTasks(t *testing.T) {
 			}
 		}
 	}
-	if !tables["orders"] || !tables["lineitem"] || !tables["exchanges"] {
-		t.Errorf("prefetched %v, want orders, lineitem and exchanges", tables)
+	if !tables["orders"] || !tables["lineitem"] {
+		t.Errorf("prefetched %v, want orders and lineitem", tables)
+	}
+	if plan := h.planOf("SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey WHERE l_shipmode = 'AIR' GROUP BY 1"); plan.exchanges("join") == 0 {
+		t.Error("the join exchanged nothing, so the test shows nothing of exchanges")
 	}
 }

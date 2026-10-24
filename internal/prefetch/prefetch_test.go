@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -516,5 +518,41 @@ func TestCacheHTTPFSReadsBlocks(t *testing.T) {
 	}
 	if after := len(blockFiles(t, dir, path, etag)); after >= before {
 		t.Errorf("cache_httpfs evicted none of the prefetched blocks: %d before, %d after", before, after)
+	}
+}
+
+// An open that the end of its statement cuts short is not an error: a
+// worker's task ends, and with it its reading ahead, while opens are in
+// flight. One that fails while the statement runs is.
+func TestFetchCanceled(t *testing.T) {
+	opened := make(chan struct{}, 1)
+	p, err := New(Options{Dir: t.TempDir(), Open: func(ctx context.Context, path string) (Object, error) {
+		if strings.HasSuffix(path, "missing.parquet") {
+			return nil, errors.New("no such object")
+		}
+		opened <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- p.fetch(ctx, block{file: &openFile{File: File{Path: "s3://b/t/f.parquet", Size: 100}}, length: 10, name: "a"})
+	}()
+	<-opened
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetch: %v", err)
+	}
+	if n := testutil.ToFloat64(p.failed); n != 0 {
+		t.Errorf("an open the statement's end cut short counted as %v errors", n)
+	}
+	err = p.fetch(context.Background(), block{file: &openFile{File: File{Path: "s3://b/t/missing.parquet", Size: 100}}, length: 10, name: "b"})
+	if err == nil || testutil.ToFloat64(p.failed) != 1 {
+		t.Errorf("a failed open: %v, %v errors", err, testutil.ToFloat64(p.failed))
 	}
 }

@@ -618,7 +618,12 @@ func (p *Prefetcher) fetch(ctx context.Context, b block) error {
 	}
 	b.file.once.Do(func() { b.file.r, b.file.err = p.opts.Open(ctx, b.file.Path) })
 	if b.file.err != nil {
-		p.failed.Inc()
+		// An open the statement's end cut short failed for that alone: a
+		// worker's task ends, and with it its reading ahead, while opens
+		// are in flight.
+		if ctx.Err() == nil {
+			p.failed.Inc()
+		}
 		return b.file.err
 	}
 	buf := make([]byte, b.length)
@@ -639,7 +644,9 @@ func (p *Prefetcher) fetch(ctx context.Context, b block) error {
 		if tracked {
 			p.watch.untrack(b.name)
 		}
-		p.failed.Inc()
+		if ctx.Err() == nil {
+			p.failed.Inc()
+		}
 		return err
 	}
 	p.fetched.Add(float64(len(buf)))

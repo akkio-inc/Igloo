@@ -113,10 +113,6 @@ type Options struct {
 	// where their room allows, rather than to object storage
 	// (IGLOO_EXCHANGES=local; see localx.go).
 	LocalExchanges bool
-	// Prefetch tells workers, with each task, the sizes of the data files
-	// it reads and the columns its query may read of them, for their
-	// prefetchers (see WorkerOptions.Prefetch).
-	Prefetch bool
 }
 
 // Coordinator splits statements into parts that workers run.

@@ -398,16 +398,18 @@ as `NULL` or as the old field's values, so such a file, like one whose
 nested fields have no IDs, makes the worker refuse the task, and the
 statement runs on the coordinator.
 
-With the prefetcher on, each task's view of a table also carries its
-files' sizes and the field IDs of the columns the fragment may read: those
-it names, or every column through a star whose columns the result needs,
-and whether its WHERE names one, for which the prefetcher reads less
-ahead; and its view of an exchange its files' sizes, which it reads whole. The
-worker hands them to the prefetcher as the task starts, so that it reads
-those columns' chunks into the read cache ahead of DuckDB. Stages that
-read exchanges wait on object storage's requests most: at a hundred times
-the data, a report's last stages took twice the slot time they had on 32
-threads a worker, on 12. For a
+Each task's view of a table also carries its files' sizes and the field
+IDs of the columns the fragment may read: those it names, or every column
+through a star whose columns the result needs, and whether its WHERE
+names one, for which the prefetcher reads less ahead. A worker with the
+prefetcher on hands them to it as the task starts, so that it reads those
+columns' chunks into the read cache ahead of DuckDB; whether it does is
+the worker's own setting. Views of exchanges carry nothing: DuckDB reads
+exchanges' files around the read cache, which leaves them out as data
+read once, so blocks read ahead into it went unread: of the 101 GB a
+report's tasks read ahead at ten times the data, 81 GB went unread, and
+its exchanges came to 65 GB. Exchanges on workers' disks
+(`IGLOO_EXCHANGES=local`) take their requests away instead. For a
 statement that runs on one machine, `distributed.Scanner` lists the same
 before it runs: each table's current snapshot, its data files in the order
 DuckDB's Iceberg scan reads them (the manifest list's, then each

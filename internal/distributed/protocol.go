@@ -112,10 +112,8 @@ type viewPrefetch struct {
 	Sizes []int64 `json:"sizes"`
 	// Used are the field IDs of the table's columns the task's query may
 	// read, with their nested fields' (see Scan.FieldIDs): none when it
-	// reads only row counts. Whole says the files are read whole, as an
-	// exchange's are.
-	Used  []int `json:"used"`
-	Whole bool  `json:"whole,omitempty"`
+	// reads only row counts.
+	Used []int `json:"used"`
 	// Filtered says the task's query filters the view by one of its
 	// columns, so DuckDB may skip row groups: the prefetcher reads less of
 	// it ahead (see Scan.Filtered).

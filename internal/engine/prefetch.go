@@ -40,7 +40,13 @@ func (e *Engine) setupPrefetch(cfg config.Config, dir string, log *slog.Logger) 
 		return
 	}
 	e.prefetcher = p
-	log.Info("prefetch on", "dir", dir, "concurrency", cfg.Prefetch.Concurrency)
+	// Unset, the concurrency is the prefetcher's default, which the log
+	// says rather than 0.
+	concurrency := cfg.Prefetch.Concurrency
+	if concurrency <= 0 {
+		concurrency = prefetch.DefaultConcurrency
+	}
+	log.Info("prefetch on", "dir", dir, "concurrency", concurrency)
 }
 
 // Prefetcher is the prefetcher, or nil when prefetching is off.

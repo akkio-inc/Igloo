@@ -608,6 +608,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- Workers read ahead as their own `IGLOO_PREFETCH` says: they read ahead
+  nothing unless the coordinating replica had it on too, though each logged
+  "prefetch on". They no longer read ahead exchanges' files, which DuckDB
+  reads around the read cache: on a report at ten times the data, workers
+  read ahead 101 GB, 81 GB of which went unread, most of it exchanges.
+  Opens cut short by a task's end no longer count in
+  `igloo_prefetch_errors_total`, and the startup line gives the
+  prefetcher's concurrency rather than 0 when it is unset.
 - Workers read ahead of a filtered scan of a task's table at most 256 MiB,
   as the replica does of its own: tasks did not say their part filters the
   table, so workers read ahead every row group of the columns it reads,
