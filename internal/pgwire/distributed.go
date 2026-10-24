@@ -403,6 +403,11 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 // rewriter.
 func policyReason(st *statement) string {
 	g := st.guard
+	if g != nil && g.hiddenOnly {
+		// Only ID domains' columns of ids left out: nothing a worker could
+		// fail to apply.
+		return ""
+	}
 	switch {
 	case st.original != "":
 		return "masking or row access policies rewrote it"

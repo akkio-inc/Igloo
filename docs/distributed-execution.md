@@ -215,7 +215,11 @@ Sharing's [external tables](sharing.md). Workers read table files
 directly and could not apply policies; a connection's table or an external
 table may still be read in the part of a statement the coordinator runs
 itself, such as a scalar subquery over a distributed part, but never on a
-worker.
+worker. An [ID domain](sql.md#id-domains)'s member table is not one of these
+for its columns of ids alone: statements read it without them, and
+workers run them as they run any other. Igloo's own text names those
+columns where it counts through ids. A member table with a policy of its
+own stays on the replica.
 
 ### When
 

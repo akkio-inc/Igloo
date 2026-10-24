@@ -888,6 +888,13 @@ type guard struct {
 	applied []string
 	// nonce marks the subqueries of the rewrite.
 	nonce string
+	// hiddenOnly says all the rewrite did was leave out the columns of ids
+	// of the ID domains' member tables it reads: no policy, clean room,
+	// connection's or external table's rules touched it. Its text reads the
+	// tables' other columns, and their ids only where Igloo's own text
+	// names them, so workers may run it as they run a statement over tables
+	// with nothing to hide (see policyReason).
+	hiddenOnly bool
 }
 
 func newNonce() string {
@@ -1015,6 +1022,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 		}
 	}
 	g.touched, g.applied, g.nonce, g.privs = rw.touched, rw.applied, rw.nonce, privs
+	g.hiddenOnly = rw.touched && !rw.beyondHiding && len(rw.applied) == 0
 	return text, g, ran, nil
 }
 

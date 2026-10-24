@@ -65,9 +65,19 @@ type rewriter struct {
 	n     int
 	plans map[string]*tablePlan
 	// touched says the statement reads a protected table; applied names
-	// the policies that applied, in order.
-	touched bool
-	applied []string
+	// the policies that applied, in order. beyondHiding says something more
+	// than leaving out the columns of ids of ID domains' member tables
+	// touched it: a table's own rules (a row access or masking policy, a
+	// clean room), a connection's, or an external table's.
+	touched      bool
+	beyondHiding bool
+	applied      []string
+}
+
+// realRules reports whether o, which rules returns rules for, has rules of
+// its own, rather than only the columns of ids its reads leave out.
+func (rw *rewriter) realRules(o object) bool {
+	return !strings.EqualFold(o.db, rw.r.catalog) || rw.snap.Rules(o.schema, o.name) != nil
 }
 
 func (rw *rewriter) alias(kind string) string {
@@ -549,7 +559,7 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		// files only its proxy serves; policies cannot be attached to
 		// one (see policyTable), but a clean room can confine it.
 		if rules := rw.snap.Rules(o.schema, o.name); rules != nil {
-			rw.touched = true
+			rw.touched, rw.beyondHiding = true, true
 			if err := rw.confined(o, rules); err != nil {
 				return nil, err
 			}
@@ -559,6 +569,9 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		plan, err := rw.plan(o, rw.rules(o))
 		if err != nil {
 			return nil, err
+		}
+		if rw.realRules(o) || plan.guards() {
+			rw.beyondHiding = true
 		}
 		if plan.noop() {
 			return rw.qualify(text, &at, o, view)
@@ -595,6 +608,7 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		return rw.replaceRef(text, &at, sp, body)
 
 	case o.view && !rw.admin && rw.sens.viewRisky[o.key()]:
+		rw.beyondHiding = true
 		if err := rw.checkView(o, depth); err != nil {
 			return nil, err
 		}
@@ -1172,6 +1186,9 @@ func (rw *rewriter) target(name []string) (object, bool, error) {
 		return o, false, nil
 	}
 	rw.touched = true
+	if rw.realRules(o) {
+		rw.beyondHiding = true
+	}
 	return o, true, nil
 }
 
