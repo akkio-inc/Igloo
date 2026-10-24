@@ -513,13 +513,21 @@ from local disk. Against an object store with S3's latency, a cold scan on
   reads, in the order the scan reads the files, and keeps at most a quarter
   of the cache's room for blocks DuckDB has not read yet, so they do not
   evict each other or other statements' blocks first.
+- It tells the blocks DuckDB read by their access times. On a filesystem
+  mounted `noatime`, which keeps access times still, it tells them by the
+  kernel's events of opens of their files (inotify, on Linux), and the log
+  says so at startup. Where neither works, it cannot tell, and says so with
+  a warning: each statement then reads ahead at most 256 MiB in all, and
+  never more than its share of the cache's free room, so reading ahead
+  evicts nothing; with a full cache it reads nothing ahead.
 - A block it has not fetched yet, or fails to, DuckDB fetches itself:
   prefetch only ever costs requests. Overfetch, blocks it read that the
   scans did not, shows in `igloo_prefetch_unread_bytes_total`.
 - It reads ahead for queries and for the queries of `CREATE TABLE ... AS`
   and `INSERT ... SELECT` that read catalog tables, other than tables that
-  policies or a clean room protect, and on [workers](distributed-execution.md)
-  for each task's files. The scans are those distributed execution would
+  policies or a clean room protect, when the statement runs on the replica:
+  for a statement [workers](distributed-execution.md) run, they read ahead
+  each task's files, and the replica reads nothing ahead. The scans are those distributed execution would
   plan; until filters prune their file lists, a scan of a table the
   statement filters reads ahead at most 256 MiB. A session turns it off
   for itself with `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
@@ -678,7 +686,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_cache_size_bytes` | | Bytes in the [read cache](#read-cache), measured every 5 minutes |
 | `igloo_cache_limit_bytes` | | Size the read cache may grow to, given the disk's free space; 0 while it is off or paused |
 | `igloo_prefetch_bytes_total`, `igloo_prefetch_blocks_total` | | Bytes and blocks the [prefetcher](#prefetch) read ahead into the read cache |
-| `igloo_prefetch_unread_bytes_total` | | Bytes it read ahead that the scans did not read (overfetch); not counted on a filesystem without access times |
+| `igloo_prefetch_unread_bytes_total` | | Bytes it read ahead that the scans did not read (overfetch); not counted where it cannot tell which blocks DuckDB read |
 | `igloo_prefetch_present_blocks_total`, `igloo_prefetch_errors_total` | | Blocks it found cached already, and reads ahead that failed (the scans then read the block themselves) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |

@@ -21,10 +21,15 @@
 // too), and then the blocks of the column chunks of the scan's columns, in
 // the order of the scan's files. It keeps at most a share of the cache's
 // room for blocks DuckDB has not read yet, so that prefetched blocks do not
-// evict each other, or other statements' blocks, before DuckDB reads them;
-// it tells a block DuckDB read by its access time, which a read moves past
-// its modification time. Blocks it fetched that DuckDB never read count as
-// overfetch.
+// evict each other, or other statements' blocks, before DuckDB reads them.
+// It tells a block DuckDB read by its access time, which a read moves past
+// its modification time. On a file system mounted noatime, which keeps
+// access times still, it tells one by the kernel's file events instead
+// (inotify, on Linux), as cache_httpfs opens a block's file to read it.
+// Where neither works, it cannot tell, and each statement reads ahead at
+// most boundedAhead, and never more than its share of the cache's free
+// room, so that reading ahead evicts nothing. Blocks it fetched that DuckDB
+// never read count as overfetch.
 package prefetch
 
 import (
@@ -80,8 +85,26 @@ const (
 )
 
 // minAhead is what a statement may keep ahead of its scans however little
-// room the cache reports.
+// room the cache reports, when the prefetcher can tell which blocks DuckDB
+// read.
 var minAhead int64 = 64 << 20
+
+// boundedAhead is the most a statement reads ahead, in all, when the
+// prefetcher cannot tell which blocks DuckDB read.
+var boundedAhead int64 = 256 << 20
+
+// tracking is how the prefetcher tells which blocks DuckDB read.
+type tracking int
+
+const (
+	// byAccessTime reads blocks' access times.
+	byAccessTime tracking = iota
+	// byOpens watches the kernel's events of opens of blocks' files, as
+	// on a file system mounted noatime.
+	byOpens
+	// bounded cannot tell: a statement reads ahead boundedAhead at most.
+	bounded
+)
 
 // Object reads ranges of a file in object storage. ReadAt may be called
 // from several goroutines at once.
@@ -135,7 +158,9 @@ type Scan struct {
 // Prefetcher reads ahead for statements' scans.
 type Prefetcher struct {
 	opts  Options
-	atime bool
+	track tracking
+	// watch tells blocks read when track is byOpens.
+	watch *openWatch
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -166,7 +191,7 @@ func New(opts Options) (*Prefetcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Prefetcher{opts: opts, atime: atime,
+	p := &Prefetcher{opts: opts,
 		fetched: prometheus.NewCounter(prometheus.CounterOpts{Name: "igloo_prefetch_bytes_total",
 			Help: "Bytes of data files the prefetcher read ahead into the read cache."}),
 		blocks: prometheus.NewCounter(prometheus.CounterOpts{Name: "igloo_prefetch_blocks_total",
@@ -184,8 +209,15 @@ func New(opts Options) (*Prefetcher, error) {
 		go p.work()
 	}
 	if !atime {
-		opts.Log.Info("prefetch cannot tell which blocks DuckDB read, as its directory's file system keeps no access times: " +
-			"each statement reads ahead a fixed amount, and overfetch is not counted")
+		if p.watch, err = newOpenWatch(opts.Dir); err == nil {
+			p.track = byOpens
+			opts.Log.Info("the read cache's file system keeps no access times (noatime): prefetch tells which blocks DuckDB read by the file events of their opens")
+		} else {
+			p.track = bounded
+			opts.Log.Warn("the read cache's file system keeps no access times (noatime), and file events are not available: "+
+				"prefetch cannot tell which blocks DuckDB read, so each statement reads ahead at most a bounded amount, "+
+				"within the cache's free room, and overfetch is not counted", "bound", boundedAhead, "err", err)
+		}
 	}
 	return p, nil
 }
@@ -202,6 +234,29 @@ func (p *Prefetcher) Close() {
 	p.cond.Broadcast()
 	p.mu.Unlock()
 	p.wg.Wait()
+	if p.watch != nil {
+		p.watch.close()
+	}
+}
+
+// readSince reports whether DuckDB read the block file name since the
+// prefetcher wrote it; ok is false when it is gone, or the prefetcher cannot
+// tell (see tracking).
+func (p *Prefetcher) readSince(name string) (read, ok bool) {
+	switch p.track {
+	case byAccessTime:
+		return readSince(filepath.Join(p.opts.Dir, name))
+	case byOpens:
+		return p.watch.readSince(name)
+	}
+	return false, false
+}
+
+// forget stops tracking the block file name.
+func (p *Prefetcher) forget(name string) {
+	if p.track == byOpens {
+		p.watch.untrack(name)
+	}
 }
 
 // probe writes a block with the attribute cache_httpfs needs into dir and
@@ -345,6 +400,15 @@ func (s *statement) budget() int64 {
 	if n == 0 {
 		n = 1
 	}
+	if p.track == bounded {
+		// What it reads ahead is never credited back, so this bounds
+		// all it reads ahead, which stays within the free room so that
+		// it evicts nothing.
+		if p.opts.Room == nil {
+			return boundedAhead
+		}
+		return min(boundedAhead, p.opts.Room()/roomShare/n)
+	}
 	if p.opts.Room == nil {
 		return 1 << 62
 	}
@@ -394,7 +458,8 @@ func (s *statement) waitForRoom(n int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for s.ctx.Err() == nil {
-		if s.ahead+n <= s.budget() || s.ahead == 0 {
+		// One block at a time at least, unless reading ahead is bounded.
+		if s.ahead+n <= s.budget() || s.ahead == 0 && s.p.track != bounded {
 			s.ahead += n
 			return true
 		}
@@ -419,7 +484,7 @@ func (s *statement) waitForRoom(n int64) bool {
 // whose access time moved, and those before one it read, which it skipped,
 // as a filter on a row group's statistics does, and counts as overfetch.
 func (s *statement) checkReads() {
-	if !s.p.atime {
+	if s.p.track == bounded {
 		return
 	}
 	s.mu.Lock()
@@ -428,7 +493,7 @@ func (s *statement) checkReads() {
 	last := -1
 	read := make([]bool, len(pending))
 	for i, b := range pending {
-		r, ok := readSince(filepath.Join(s.p.opts.Dir, b.name))
+		r, ok := s.p.readSince(b.name)
 		read[i] = r || !ok
 		if read[i] {
 			last = i
@@ -443,6 +508,7 @@ func (s *statement) checkReads() {
 		if !read[i] {
 			skipped += pending[i].length
 		}
+		s.p.forget(pending[i].name)
 	}
 	s.p.unread.Add(float64(skipped))
 	s.mu.Lock()
@@ -456,13 +522,14 @@ func (s *statement) checkReads() {
 // and closes its files.
 func (s *statement) finish() {
 	s.checkReads()
-	if s.p.atime {
+	if s.p.track != bounded {
 		s.mu.Lock()
 		var n int64
 		for _, b := range s.unread {
-			if r, ok := readSince(filepath.Join(s.p.opts.Dir, b.name)); ok && !r {
+			if r, ok := s.p.readSince(b.name); ok && !r {
 				n += b.length
 			}
+			s.p.forget(b.name)
 		}
 		s.unread = nil
 		s.mu.Unlock()
@@ -520,7 +587,10 @@ func (p *Prefetcher) work() {
 			continue
 		}
 		s.mu.Lock()
-		if err == nil {
+		if err == nil && s.ctx.Err() != nil {
+			// The statement ended, and may have finished its accounts.
+			p.forget(b.name)
+		} else if err == nil {
 			s.unread = append(s.unread, fetchedBlock{b.name, b.length})
 		} else {
 			s.ahead -= b.length
@@ -555,7 +625,17 @@ func (p *Prefetcher) fetch(ctx context.Context, b block) error {
 		}
 		return err
 	}
+	// A block read ahead is watched from before it is in place, so no
+	// open of it goes unseen; a footer's, which the prefetcher reads itself,
+	// is not (see readThroughCache).
+	tracked := p.track == byOpens && b.done == nil
+	if tracked {
+		p.watch.track(b.name)
+	}
 	if err := writeBlock(dst, b.file.Path, b.file.r.ETag(), buf); err != nil {
+		if tracked {
+			p.watch.untrack(b.name)
+		}
 		p.failed.Inc()
 		return err
 	}

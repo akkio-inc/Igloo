@@ -1348,7 +1348,12 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				if p.release != nil {
 					defer p.release()
 				}
+				// It runs here, as auto mode chose or for want of workers:
+				// read ahead what its scans are about to read (see
+				// prefetch.go). Workers read ahead for their own tasks.
+				stopPrefetch := s.prefetchStatement(ctx, sess, st)
 				err = s.runLocal(ctx, sess, st, args, tw)
+				stopPrefetch()
 				if st.bitmaps && bitmapsDidNotFit(err) {
 					// Run again here with the hash, below, rather than on
 					// workers with bitmaps.
@@ -1366,8 +1371,6 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				}
 				return err
 			}
-			// Read ahead what its scans are about to read (see prefetch.go).
-			defer s.prefetchStatement(ctx, sess, st)()
 			switch {
 			case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
 				return sess.runTransaction(ctx, st, tw, run)

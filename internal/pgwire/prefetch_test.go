@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,5 +113,52 @@ func TestPrefetchStatements(t *testing.T) {
 	}
 	if blocksOf("others") == 0 {
 		t.Error("no blocks read ahead for CREATE TABLE ... AS")
+	}
+}
+
+// TestPrefetchWhereItRuns reads ahead on this replica only for statements
+// that run here: workers read ahead for the tasks of one they run, and the
+// coordinator reading the same blocks too would double the requests and
+// evict its own cache.
+func TestPrefetchWhereItRuns(t *testing.T) {
+	var opens atomic.Int64
+	pf, err := prefetch.New(prefetch.Options{Dir: t.TempDir(), Open: func(_ context.Context, path string) (prefetch.Object, error) {
+		opens.Add(1)
+		f, err := os.Open(strings.TrimPrefix(path, "file://"))
+		return localObject{f}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pf.Close)
+	var scanner *distributed.Scanner
+	ds := startDistServerWith(t, t.TempDir(), 2, func(o *distributed.Options) {
+		var err error
+		if scanner, err = distributed.NewScanner(o.Source); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = scanner.Close() })
+	}, func(o *Options) { o.Scanner, o.Prefetcher = scanner, pf })
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	query := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	mustExec(t, conn, "SET distributed_execution = on")
+	_ = rowsOf(t, conn, query)
+	if w := lastWorkers(t, ds.history, query); w != 2 {
+		t.Fatalf("%d workers ran the statement, want 2", w)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := opens.Load(); n != 0 {
+		t.Errorf("this replica read ahead %d files for a statement workers ran", n)
+	}
+	// One that runs here reads ahead here.
+	mustExec(t, conn, "SET distributed_execution = off")
+	_ = rowsOf(t, conn, "SELECT o.amount, count(*) AS n FROM orders AS o, range(3000) GROUP BY o.amount ORDER BY o.amount")
+	deadline := time.Now().Add(10 * time.Second)
+	for opens.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if opens.Load() == 0 {
+		t.Error("a statement that ran here read nothing ahead, so the test proves nothing")
 	}
 }

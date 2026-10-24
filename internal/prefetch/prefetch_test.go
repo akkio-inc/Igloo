@@ -211,50 +211,125 @@ func TestColumns(t *testing.T) {
 	}
 }
 
+// withTracking makes p tell the blocks DuckDB read as mode says, or skips
+// the test where the platform or the file system cannot.
+func withTracking(t *testing.T, p *Prefetcher, mode tracking) {
+	t.Helper()
+	switch mode {
+	case byAccessTime:
+		if p.track != byAccessTime {
+			t.Skip("the test directory's file system keeps no access times")
+		}
+	case byOpens:
+		if p.watch == nil {
+			w, err := newOpenWatch(p.opts.Dir)
+			if err != nil {
+				t.Skipf("no file events: %v", err)
+			}
+			p.watch = w
+		}
+		p.track = byOpens
+	case bounded:
+		p.track = bounded
+	}
+}
+
 // TestAhead keeps a statement's blocks that DuckDB has not read within its
 // share of the cache's room, and goes on as DuckDB reads them; those it
-// skips count as overfetch.
+// skips count as overfetch. It tells the blocks DuckDB read by their access
+// times, and by the events of their opens, as on a file system mounted
+// noatime.
 func TestAhead(t *testing.T) {
 	local := testFile(t, 400000, 10000)
 	st, _ := os.Stat(local)
 	const path, block = "s3://bucket/t/data/f.parquet", 64 << 10
-	dir := t.TempDir()
-	p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return 0 },
-		Open: func(ctx context.Context, _ string) (Object, error) {
-			f, err := os.Open(local)
-			return &localObject{File: f}, err
-		}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-	if !p.atime {
-		t.Skip("the test's file system keeps no access times")
-	}
 	saved := minAhead
 	minAhead = 3 * block
 	defer func() { minAhead = saved }()
-	stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
-	defer stop()
-	count := func() int {
-		entries, _ := os.ReadDir(dir)
-		return len(entries)
+	for name, mode := range map[string]tracking{"access times": byAccessTime, "opens": byOpens} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return 0 },
+				Open: func(ctx context.Context, _ string) (Object, error) {
+					f, err := os.Open(local)
+					return &localObject{File: f}, err
+				}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			withTracking(t, p, mode)
+			stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
+			defer stop()
+			count := func() int {
+				entries, _ := os.ReadDir(dir)
+				return len(entries)
+			}
+			// The footer's blocks, then three ahead.
+			waitFor(t, "the first blocks", func() bool { return count() >= 3 })
+			time.Sleep(300 * time.Millisecond)
+			first := count()
+			if first > 5 {
+				t.Fatalf("%d blocks ahead of a scan that read none", first)
+			}
+			// DuckDB reads them all; the prefetcher goes on.
+			entries, _ := os.ReadDir(dir)
+			for _, e := range entries {
+				if _, err := os.ReadFile(filepath.Join(dir, e.Name())); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitFor(t, "more blocks", func() bool { return count() > first })
+		})
 	}
-	// The footer's blocks, then three ahead.
-	waitFor(t, "the first blocks", func() bool { return count() >= 3 })
-	time.Sleep(300 * time.Millisecond)
-	first := count()
-	if first > 5 {
-		t.Fatalf("%d blocks ahead of a scan that read none", first)
-	}
-	// DuckDB reads them all; the prefetcher goes on.
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if _, err := os.ReadFile(filepath.Join(dir, e.Name())); err != nil {
+}
+
+// TestBounded reads ahead, where the prefetcher cannot tell which blocks
+// DuckDB read, at most boundedAhead for a statement however much DuckDB
+// reads, and nothing past its share of the cache's free room, so reading
+// ahead evicts nothing.
+func TestBounded(t *testing.T) {
+	local := testFile(t, 400000, 10000)
+	st, _ := os.Stat(local)
+	const path, block = "s3://bucket/t/data/f.parquet", 64 << 10
+	saved := boundedAhead
+	boundedAhead = 4 * block
+	defer func() { boundedAhead = saved }()
+	footer := len(expectedBlocks(st.Size(), block, [][2]int64{{st.Size() - footerGuess, st.Size()}}))
+	for _, c := range []struct {
+		room int64
+		want int
+	}{{1 << 40, footer + 4}, {0, footer}} {
+		dir := t.TempDir()
+		p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return c.room },
+			Open: func(ctx context.Context, _ string) (Object, error) {
+				f, err := os.Open(local)
+				return &localObject{File: f}, err
+			}})
+		if err != nil {
 			t.Fatal(err)
 		}
+		withTracking(t, p, bounded)
+		stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
+		count := func() int {
+			entries, _ := os.ReadDir(dir)
+			return len(entries)
+		}
+		waitFor(t, "the first blocks", func() bool { return count() >= c.want })
+		// DuckDB reads them all, which changes nothing.
+		for range 3 {
+			entries, _ := os.ReadDir(dir)
+			for _, e := range entries {
+				_, _ = os.ReadFile(filepath.Join(dir, e.Name()))
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		if n := count(); n != c.want {
+			t.Errorf("room %d: %d blocks read ahead, want %d (the footer's %d and at most 4 more, within the room)", c.room, n, c.want, footer)
+		}
+		stop()
+		p.Close()
 	}
-	waitFor(t, "more blocks", func() bool { return count() > first })
 }
 
 // TestSharing lets concurrent statements take the requests in flight in
@@ -374,12 +449,34 @@ func TestCacheHTTPFSReadsBlocks(t *testing.T) {
 			t.Fatalf("%s: %v", q, err)
 		}
 	}
+	// Where file events tell reads (Linux), they show each block DuckDB
+	// reads, as a file system mounted noatime needs (see openWatch).
+	watch, werr := newOpenWatch(dir)
+	if werr == nil {
+		defer watch.close()
+		for _, b := range blockFiles(t, dir, path, etag) {
+			off, length, _ := strings.Cut(b, "+")
+			o, _ := strconv.ParseInt(off, 10, 64)
+			l, _ := strconv.ParseInt(length, 10, 64)
+			watch.track(BlockName(path, o, l))
+		}
+	}
 	var n int64
 	if err := db.QueryRow("SELECT count(DISTINCT id) FROM read_parquet('" + path + "')").Scan(&n); err != nil || n != 300000 {
 		t.Fatalf("count: %d, %v", n, err)
 	}
 	if g := gets.Load(); g != 0 {
 		t.Errorf("DuckDB made %d GET requests for blocks the prefetcher had read ahead", g)
+	}
+	if werr == nil {
+		for _, b := range blockFiles(t, dir, path, etag) {
+			off, length, _ := strings.Cut(b, "+")
+			o, _ := strconv.ParseInt(off, 10, 64)
+			l, _ := strconv.ParseInt(length, 10, 64)
+			if read, ok := watch.readSince(BlockName(path, o, l)); ok && !read {
+				t.Errorf("no open of block %s seen as DuckDB read the column", b)
+			}
+		}
 	}
 	// A column it did not read ahead is fetched as usual.
 	if err := db.QueryRow("SELECT count(DISTINCT title) FROM read_parquet('" + path + "')").Scan(&n); err != nil || n != 300000 {
