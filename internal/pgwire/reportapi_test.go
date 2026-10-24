@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -559,11 +560,19 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	it.exec("ALTER TABLE lake.public.attributes ADD BITMAP INDEX population ON () FOR person_id")
 	srv.waitIndexBuilds(t)
 	srv.MaintainBitmapIndexes(ctx)
-	before := srv.reportFromIndexes.Load()
-	if got := texts(t, cached, call); !slices.Equal(got, fromTables) {
-		t.Errorf("a prepared call, from the bitmaps: rows\n%q\nwant\n%q", got, fromTables)
+	// The index's state reaches the planner through a cache that refreshes
+	// every few seconds.
+	moved := false
+	for deadline := time.Now().Add(30 * time.Second); !moved && time.Now().Before(deadline); {
+		before := srv.reportFromIndexes.Load()
+		if got := texts(t, cached, call); !slices.Equal(got, fromTables) {
+			t.Fatalf("a prepared call, from the bitmaps: rows\n%q\nwant\n%q", got, fromTables)
+		}
+		if moved = srv.reportFromIndexes.Load() > before; !moved {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
-	if srv.reportFromIndexes.Load() == before {
+	if !moved {
 		t.Error("a prepared call counted from the tables did not go to the bitmaps once its index was built")
 	}
 
