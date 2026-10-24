@@ -479,6 +479,13 @@ func TestReportAPIThroughIDs(t *testing.T) {
 	if !strings.Contains(plan, "rb_count_distinct") {
 		t.Errorf("pairs of days through ids, not in bitmaps:\n%s", plan)
 	}
+	// As workers split them: a bitmap of members a day, summed.
+	srv.splitPairs = true
+	counted(conn, "pairs of days, as workers split them", visits(days, minutes), true)
+	if plan := strings.Join(texts(t, conn, "EXPLAIN (FORMAT JSON) SELECT * FROM igloo.audience_profile("+specLiteral(t, visits(days, minutes))+")"), "\n"); !strings.Contains(plan, "rb_agg") {
+		t.Errorf("pairs of days through ids, as workers split them, not in bitmaps:\n%s", plan)
+	}
+	srv.splitPairs = false
 	counted(conn, "pairs of days and of sites", visits(days, sites, minutes), true)
 	counted(conn, "pairs of sites alone", visits(sites), true)
 	reruns := srv.bitmapReruns.Load()
@@ -626,6 +633,9 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	if plan := strings.Join(texts(t, conn, "EXPLAIN (FORMAT JSON) SELECT * FROM igloo.audience_profile("+specLiteral(t, plays)+")"), "\n"); !strings.Contains(plan, "rb_count_distinct") {
 		t.Errorf("the hybrid's pairs of days, not in bitmaps:\n%s", plan)
 	}
+	srv.splitPairs = true
+	answered("plays, as workers split it", plays, "index+scan")
+	srv.splitPairs = false
 	// The scan's cohorts' bitmaps reach it in the session's variables,
 	// which no client's statement may name, and which go once it has run.
 	var left int64

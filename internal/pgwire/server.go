@@ -362,6 +362,9 @@ type Server struct {
 	fed     *federation.Manager
 	remotes connectionSource
 	dist    *distributed.Coordinator
+	// splitPairs writes report calls' pair counts as workers split them
+	// even without workers (see scanCounts), for tests.
+	splitPairs bool
 	// failLocal, if set, runs before a statement runs on this replica, and
 	// fails it with its error; tests use it to make a statement run out of
 	// memory here.

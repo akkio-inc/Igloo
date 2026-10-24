@@ -71,6 +71,10 @@ type reportIndexPlan struct {
 	// whose pairs its scan counts in bitmaps (see pairBitmaps).
 	bitmaps []hybridBitmap
 	pairs   map[int]bool
+	split   bool
+	// people are a hybrid's counts from the bitmaps, computed first (see
+	// hybridPeople): its sizes, people and total_people CTEs, of VALUES.
+	people string
 }
 
 // hybridBitmap is a hybrid cohort's bitmap, held in variable name; latest
@@ -379,11 +383,118 @@ func (s *Server) cohortOf(spec *reportSpec, plan *reportIndexPlan, i int) string
 		quoteLiteral("igloo: the latest version of cohort "+spec.Cohorts[i].Label+" changed while the statement ran; run it again") + ") END AS bm"
 }
 
-// reportIndexSQL returns the statement spec stands for, read from the
-// bitmaps plan holds, and for a hybrid from the source too.
-func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string {
+// hybridPeople computes a hybrid's counts from the bitmaps (its cohorts'
+// sizes, and its values' and dimensions' people) and writes them into
+// plan.people as CTEs of VALUES, beside a guard that its statement reads:
+// the statement then reads no bitmap index's table, which only this replica
+// may read, and so the planner may run its scan of the source on workers.
+// The counts are of the snapshots the statement pins, and of the versions
+// of the cohorts' latest_from it read (see hybridBitmaps); the guard fails
+// the statement if a cohort's variable is gone or its latest_from reads
+// otherwise when it runs.
+func (s *Server) hybridPeople(ctx context.Context, sess *session, spec *reportSpec, plan *reportIndexPlan) error {
+	var q strings.Builder
+	q.WriteString("WITH ")
+	s.peopleCTEs(&q, spec, plan)
+	q.WriteString("SELECT 'p' AS kind, dimension, dim_group, value, cohort, people FROM " + cte("people"))
+	if spec.Totals {
+		q.WriteString(" UNION ALL SELECT 't', dimension, dim_group, NULL, cohort, people FROM " + cte("total_people"))
+	}
+	q.WriteString(" UNION ALL SELECT 's', NULL, NULL, NULL, cohort, cohort_size FROM " + cte("sizes"))
+	rows, err := queryRows(ctx, sess.conn, q.String())
+	if err != nil {
+		return err
+	}
+	text := func(v any) string {
+		if x, ok := v.(string); ok {
+			return quoteLiteral(x)
+		}
+		return "NULL"
+	}
+	count := func(v any) string {
+		switch x := v.(type) {
+		case int64:
+			return strconv.FormatInt(x, 10)
+		case int32:
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return "NULL"
+	}
+	var people, totals, sizes []string
+	for _, r := range rows {
+		if len(r) != 6 {
+			return fmt.Errorf("a hybrid's counts came back with %d columns", len(r))
+		}
+		switch r[0] {
+		case "p":
+			people = append(people, "("+text(r[1])+", "+text(r[2])+", "+text(r[3])+", "+text(r[4])+", "+count(r[5])+")")
+		case "t":
+			totals = append(totals, "("+text(r[1])+", "+text(r[2])+", "+text(r[4])+", "+count(r[5])+")")
+		case "s":
+			sizes = append(sizes, "("+text(r[4])+", "+count(r[5])+")")
+		}
+	}
+	values := func(name string, cols []string, types []string, rows []string) string {
+		sel := make([]string, len(cols))
+		for i, c := range cols {
+			sel[i] = "CAST(" + c + " AS " + types[i] + ") AS " + c
+		}
+		if len(rows) == 0 {
+			for i, c := range cols {
+				sel[i] = "CAST(NULL AS " + types[i] + ") AS " + c
+			}
+			return cte(name) + " AS (SELECT " + strings.Join(sel, ", ") + " WHERE false),\n"
+		}
+		return cte(name) + " AS (SELECT " + strings.Join(sel, ", ") + " FROM (VALUES " + strings.Join(rows, ", ") + ") AS v(" + strings.Join(cols, ", ") + ")),\n"
+	}
 	var b strings.Builder
-	b.WriteString("WITH ")
+	b.WriteString(cte("guard") + " AS (SELECT " + s.hybridGuard(spec, plan) + " AS ok),\n")
+	b.WriteString(values("sizes", []string{"cohort", "cohort_size"}, []string{"VARCHAR", "BIGINT"}, sizes))
+	b.WriteString(values("people", []string{"dimension", "dim_group", "value", "cohort", "people"}, []string{"VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"}, people))
+	if spec.Totals {
+		b.WriteString(values("total_people", []string{"dimension", "dim_group", "cohort", "people"}, []string{"VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"}, totals))
+	}
+	plan.people = strings.TrimSuffix(b.String(), ",\n") + "\n"
+	return nil
+}
+
+// hybridGuard is the guard of a hybrid whose counts from the bitmaps it
+// reads as values: 1, or an error if a cohort's variable is gone or its
+// latest_from reads otherwise than when they were counted.
+func (s *Server) hybridGuard(spec *reportSpec, plan *reportIndexPlan) string {
+	var whens []string
+	for i, c := range spec.Cohorts {
+		if i >= len(plan.bitmaps) {
+			break
+		}
+		b := plan.bitmaps[i]
+		whens = append(whens, " WHEN "+s.bitmapOf(spec, plan, i)+" IS NULL THEN error("+
+			quoteLiteral("igloo: the bitmap of cohort "+c.Label+" is gone; run the statement again")+")")
+		if v := c.Version; v != nil && v.LatestFrom != nil {
+			same := "(" + latestOf(v) + ") IS NULL"
+			if !b.null {
+				same = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
+			}
+			whens = append(whens, " WHEN NOT ("+same+") THEN error("+
+				quoteLiteral("igloo: the latest version of cohort "+c.Label+" changed while the statement ran; run it again")+")")
+		}
+	}
+	if len(whens) == 0 {
+		return "1"
+	}
+	return "CASE" + strings.Join(whens, "") + " ELSE 1 END"
+}
+
+// sameValue is the condition that rows a and b are of one dimension's
+// value.
+func sameValue(a, b string) string {
+	return a + ".dimension = " + b + ".dimension AND " + a + ".dim_group IS NOT DISTINCT FROM " + b + ".dim_group AND " + a + ".value IS NOT DISTINCT FROM " + b + ".value"
+}
+
+// peopleCTEs writes the CTEs that count spec's people from the bitmaps plan
+// holds: sizes (each cohort's), people (each value's in each cohort, with
+// its rows, n) and, for totals, total_people (each dimension's).
+func (s *Server) peopleCTEs(b *strings.Builder, spec *reportSpec, plan *reportIndexPlan) {
 	var labels []string
 	for i, c := range spec.Cohorts {
 		name := cte("cohort_" + strconv.Itoa(i+1))
@@ -415,9 +526,7 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 	}
 	keys := "dimension, dim_group, value"
 	gkeys := "g." + strings.ReplaceAll(keys, ", ", ", g.")
-	same := func(a, b string) string {
-		return a + ".dimension = " + b + ".dimension AND " + a + ".dim_group IS NOT DISTINCT FROM " + b + ".dim_group AND " + a + ".value IS NOT DISTINCT FROM " + b + ".value"
-	}
+	same := sameValue
 	b.WriteString(cte("groups") + " AS (" + strings.Join(groups, " UNION ALL ") + "),\n")
 	// Each group's members in each cohort.
 	b.WriteString(cte("pairs") + " AS (SELECT g.dimension, g.dim_group, g.value, z.cohort, rb_and_cardinality(g.bm, z.bm) AS n FROM " +
@@ -437,6 +546,22 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 			"(SELECT dimension, dim_group, rb_or_agg(bm) AS bm FROM " + cte("groups") + " GROUP BY dimension, dim_group) AS t CROSS JOIN " + cte("sizes") + " AS z)")
 	}
 	b.WriteString("\n")
+}
+
+// reportIndexSQL returns the statement spec stands for, read from the
+// bitmaps plan holds, and for a hybrid from the source too: with its
+// counts from the bitmaps as values, once hybridPeople computed them, so
+// that it reads no bitmap index's table.
+func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string {
+	var b strings.Builder
+	b.WriteString("WITH ")
+	same := sameValue
+	if plan.hybrid && plan.people != "" {
+		b.WriteString(plan.people)
+		s.writeHybrid(&b, spec, plan, same)
+		return b.String()
+	}
+	s.peopleCTEs(&b, spec, plan)
 	if plan.hybrid {
 		s.writeHybrid(&b, spec, plan, same)
 		return b.String()
@@ -472,7 +597,7 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 		b.WriteString(" WHERE " + w)
 	}
 	b.WriteString(")\n")
-	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", false, plan.pairs)
+	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", false, plan.pairs, plan.split)
 	b.WriteString(counts)
 	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, ")
 	if spec.Totals {
@@ -496,7 +621,12 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 	if extent != "" {
 		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
 	}
-	b.WriteString(" WHERE n.everything = 0 AND n.\"rows\" > 0")
+	where := " WHERE n.everything = 0 AND n.\"rows\" > 0"
+	if plan.people != "" {
+		b.WriteString(" CROSS JOIN " + cte("guard") + " AS q")
+		where += " AND q.ok = 1"
+	}
+	b.WriteString(where)
 }
 
 // bitmapVar is a session's variable that holds a bitmap of a statement
