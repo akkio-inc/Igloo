@@ -19,6 +19,7 @@ import (
 // the catalog, whose scans name their tables, and once on an Iceberg
 // catalog, whose scans do not.
 func TestSchemaNamedLikeAConnections(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	t.Run("duckdb lake", func(t *testing.T) {

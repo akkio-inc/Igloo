@@ -280,6 +280,7 @@ func pgCode(err error) string {
 }
 
 func TestTypes(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	utc := func(y int, mo time.Month, d, h, mi, s int) time.Time {
 		return time.Date(y, mo, d, h, mi, s, 0, time.UTC)
@@ -373,6 +374,7 @@ func TestTypes(t *testing.T) {
 }
 
 func TestParameters(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	for _, name := range []string{"cached", "describe"} {
 		t.Run(name, func(t *testing.T) {
@@ -409,6 +411,7 @@ func TestParameters(t *testing.T) {
 }
 
 func TestCommandTags(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	for name, mode := range modes {
 		t.Run(name, func(t *testing.T) {
@@ -438,6 +441,7 @@ func TestCommandTags(t *testing.T) {
 }
 
 func TestReturning(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeCacheStatement)
 	ctx := context.Background()
@@ -460,6 +464,7 @@ func TestReturning(t *testing.T) {
 }
 
 func TestTransactions(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeCacheStatement)
 	ctx := context.Background()
@@ -504,6 +509,7 @@ func TestTransactions(t *testing.T) {
 }
 
 func TestErrorCodes(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeCacheStatement)
 
@@ -531,6 +537,7 @@ func TestErrorCodes(t *testing.T) {
 }
 
 func TestPostgresOnlySettingsAreAccepted(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	for _, sql := range []string{
@@ -549,6 +556,7 @@ func TestPostgresOnlySettingsAreAccepted(t *testing.T) {
 }
 
 func TestMultipleStatementsInOneQuery(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -600,6 +608,7 @@ func TestMultipleStatementsInOneQuery(t *testing.T) {
 }
 
 func TestLogin(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 
 	for _, c := range []struct{ user, password string }{
@@ -621,6 +630,7 @@ func TestLogin(t *testing.T) {
 }
 
 func TestUserManagement(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -687,6 +697,7 @@ func TestUserManagement(t *testing.T) {
 }
 
 func TestRoles(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -771,6 +782,7 @@ func TestRoles(t *testing.T) {
 // a statement builds from strings, which Igloo's checks cannot see into, or
 // move the read cache.
 func TestSQLFromStrings(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -821,6 +833,7 @@ func TestSQLFromStrings(t *testing.T) {
 }
 
 func TestRoleChangesReachOpenSessions(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -842,6 +855,7 @@ func TestRoleChangesReachOpenSessions(t *testing.T) {
 }
 
 func TestCancel(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 
@@ -859,6 +873,7 @@ func TestCancel(t *testing.T) {
 }
 
 func TestStatementCacheReleasesReplacedStatements(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -902,6 +917,7 @@ func TestStatementCacheReleasesReplacedStatements(t *testing.T) {
 }
 
 func TestStatementTimeout(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -946,6 +962,7 @@ func TestStatementTimeout(t *testing.T) {
 }
 
 func TestServerStatementTimeout(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t, func(o *Options) { o.StatementTimeout = 150 * time.Millisecond })
 	conn := ts.admin(t, pgx.QueryExecModeCacheStatement)
 	_, err := conn.Exec(context.Background(), "SELECT count(*) FROM range(10000000000) a, range(10) b WHERE a.range % 7 = b.range")
@@ -955,6 +972,7 @@ func TestServerStatementTimeout(t *testing.T) {
 }
 
 func TestMaxConnections(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t, func(o *Options) { o.MaxConnections = 2 })
 	first := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ts.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -983,6 +1001,7 @@ func TestMaxConnections(t *testing.T) {
 }
 
 func TestSessionIdentity(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t, func(o *Options) { o.Version = "9.9.9" })
 	conn := ts.admin(t, pgx.QueryExecModeCacheStatement)
 	var user, version string
@@ -1019,6 +1038,7 @@ func selfSignedTLS(t *testing.T) *tls.Config {
 }
 
 func TestRequireTLS(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t, func(o *Options) {
 		o.TLS = selfSignedTLS(t)
 		o.RequireTLS = true
@@ -1046,6 +1066,7 @@ func TestRequireTLS(t *testing.T) {
 }
 
 func TestReaderSettingsStayInTheSession(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, admin, "CREATE USER rita PASSWORD 'rita-password' ROLE reader")
@@ -1065,6 +1086,7 @@ func TestReaderSettingsStayInTheSession(t *testing.T) {
 }
 
 func TestMockCredentials(t *testing.T) {
+	t.Parallel()
 	s := &Server{mockSecret: []byte("secret")}
 	a1, a2, b := s.mockCredentials("ann"), s.mockCredentials("ann"), s.mockCredentials("bob")
 	if a1.Salt != a2.Salt {
@@ -1092,6 +1114,7 @@ func rawStartup(t *testing.T, addr, user string) net.Conn {
 }
 
 func TestMalformedSASLLengthDoesNotCrash(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := rawStartup(t, ts.addr, "igloo")
 	defer conn.Close() //nolint:errcheck
@@ -1113,6 +1136,7 @@ func TestMalformedSASLLengthDoesNotCrash(t *testing.T) {
 }
 
 func TestMalformedBindLengthDoesNotCrash(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	victim := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	raw := victim.PgConn().Conn()
@@ -1141,6 +1165,7 @@ func TestMalformedBindLengthDoesNotCrash(t *testing.T) {
 // parameters, temporary views it can find in the catalog, and DEALLOCATE
 // ALL, which psycopg sends after DDL.
 func TestIbisCatalogQueries(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeExec, pgx.QueryExecModeCacheStatement} {
 		conn := connect(t, ts.url("igloo", adminPassword), mode)
@@ -1183,6 +1208,7 @@ func TestIbisCatalogQueries(t *testing.T) {
 }
 
 func TestTypeArrayParams(t *testing.T) {
+	t.Parallel()
 	got, oids := typeArrayParams("SELECT $1 = ANY($2), '$2', $10 FROM t WHERE x = $2", []uint32{25, 1009})
 	want := "SELECT $1 = ANY(($2::VARCHAR[])), '$2', $10 FROM t WHERE x = ($2::VARCHAR[])"
 	if got != want || !reflect.DeepEqual(oids, []uint32{25, 1009}) {
@@ -1203,6 +1229,7 @@ func TestTypeArrayParams(t *testing.T) {
 // temporary views go to DuckDB even when a catalog is configured. Without a
 // catalog, as here, they always do; the e2e test covers the catalog case.
 func TestTemporaryViewsStayLocal(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := connect(t, ts.url("igloo", adminPassword), pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "CREATE TEMPORARY VIEW tv AS SELECT 1 AS a")
@@ -1210,6 +1237,7 @@ func TestTemporaryViewsStayLocal(t *testing.T) {
 }
 
 func TestCursors(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeExec} {
 		conn := connect(t, ts.url("igloo", adminPassword), mode)

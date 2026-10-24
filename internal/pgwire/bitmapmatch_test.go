@@ -13,6 +13,7 @@ import (
 )
 
 func TestMatchIndexCounts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

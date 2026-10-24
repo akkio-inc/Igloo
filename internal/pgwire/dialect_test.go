@@ -41,6 +41,7 @@ func resultColumns(t *testing.T, conn *pgx.Conn, sql string) []string {
 }
 
 func TestSnowflakeDialect(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	for name, mode := range modes {
@@ -109,6 +110,7 @@ func asPgError(err error, target **pgconn.PgError) bool {
 }
 
 func TestSnowflakeDialectNotices(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	var mu sync.Mutex
@@ -150,6 +152,7 @@ func TestSnowflakeDialectNotices(t *testing.T) {
 }
 
 func TestSnowflakeDialectFromConnection(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	for _, params := range []map[string]string{
@@ -188,6 +191,7 @@ func TestSnowflakeDialectFromConnection(t *testing.T) {
 }
 
 func TestSnowflakeDialectRoleSetting(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	mustExec(t, cs.admin, "CREATE ROLE migrated")
@@ -218,6 +222,7 @@ func TestSnowflakeDialectRoleSetting(t *testing.T) {
 }
 
 func TestSnowflakeDialectScripts(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -244,6 +249,7 @@ func TestSnowflakeDialectScripts(t *testing.T) {
 // DuckDB dialect, would: Igloo checks the translation, never the
 // Snowflake text.
 func TestSnowflakeTranslationIsCheckedLikeDuckDB(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	for name, mode := range modes {
@@ -311,6 +317,7 @@ func TestSnowflakeTranslationIsCheckedLikeDuckDB(t *testing.T) {
 // TestSnowflakeTranslationKeepsPolicies checks that masking and row access
 // policies apply to translated statements as to any other.
 func TestSnowflakeTranslationKeepsPolicies(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.crm TO acme_team")
 	conn := cs.user(t, "ali", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
@@ -332,6 +339,7 @@ func TestSnowflakeTranslationKeepsPolicies(t *testing.T) {
 }
 
 func TestSnowflakeDialectFlightSchema(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	user, err := ts.store.Get(ctx, "igloo")
@@ -367,6 +375,7 @@ func TestSnowflakeDialectFlightSchema(t *testing.T) {
 // Any user may choose their session's dialect: it changes how their SQL is
 // read, never what they may do.
 func TestSnowflakeDialectAsNonAdmin(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	for name, mode := range modes {
@@ -413,6 +422,7 @@ func TestSnowflakeDialectAsNonAdmin(t *testing.T) {
 // A view created in Snowflake's dialect stores its DuckDB translation,
 // which calls the dialect's macros; every session has them.
 func TestSnowflakeDialectViewInAnySession(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	sf := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -432,6 +442,7 @@ func TestSnowflakeDialectViewInAnySession(t *testing.T) {
 // console's and Flight SQL's catalog lookups, are DuckDB SQL whatever the
 // session's dialect.
 func TestSnowflakeDialectIglooSQL(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	user, err := ts.store.Get(ctx, "igloo")

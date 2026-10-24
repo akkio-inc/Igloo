@@ -12,6 +12,7 @@ import (
 // TestTransactionsAsInPostgres checks the transaction behavior that
 // psycopg2 (and so dbt) and JDBC rely on, where DuckDB's differs.
 func TestSavepoints(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	for name, mode := range modes {
@@ -63,6 +64,7 @@ func TestSavepoints(t *testing.T) {
 }
 
 func TestTransactionsAsInPostgres(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)

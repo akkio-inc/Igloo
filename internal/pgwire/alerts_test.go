@@ -136,6 +136,7 @@ func (as *alertServer) runScheduler(t *testing.T) {
 }
 
 func TestNotificationIntegrations(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	admin := as.admin
 	const token = "T000/B000/s3cr3t-hook-token"
@@ -352,7 +353,8 @@ func TestAlerts(t *testing.T) {
 	}
 }
 
-// shortAlertInterval lets alerts run every second until the test ends.
+// shortAlertInterval lets alerts run every second until the test ends. It
+// sets a package variable, so tests that call it do not run in parallel.
 func shortAlertInterval(t *testing.T) {
 	saved := minAlertInterval
 	minAlertInterval = time.Second
@@ -363,6 +365,7 @@ func shortAlertInterval(t *testing.T) {
 // comment and whose MESSAGE holds SQL: what runs and what is notified are
 // what was checked, and SHOW ALERTS shows it so that it reads back the same.
 func TestAlertDefinitionIsWhatRuns(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	admin := as.admin
 	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -388,6 +391,7 @@ func TestAlertDefinitionIsWhatRuns(t *testing.T) {
 // TestAlertLimits checks the minimum interval and the alerts a user may
 // own.
 func TestAlertLimits(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
 	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -408,6 +412,7 @@ func TestAlertLimits(t *testing.T) {
 // TestAlertCaps checks that a wide result and a MESSAGE that names a long
 // value many times are cut to the caps.
 func TestAlertCaps(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
 	var cols []string
@@ -451,6 +456,7 @@ func TestScheduledAlertsLeaveTheScheduler(t *testing.T) {
 // TestDroppedOwnersWork checks that dropping a user disowns their alerts
 // and tasks: a new user of the same name does not get them.
 func TestDroppedOwnersWork(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
 	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -482,6 +488,7 @@ func TestDroppedOwnersWork(t *testing.T) {
 // client blocked from using passwords adds no failures, however malformed
 // its logins; and names that are no user's raise no notice.
 func TestFailedLoginsCannotFlood(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION ops TYPE webhook URL '"+as.hooks.URL+"/ops' "+
 		"OPERATIONAL_ALERTS = (FAILED_LOGINS)")
@@ -525,6 +532,7 @@ func TestFailedLoginsCannotFlood(t *testing.T) {
 }
 
 func TestSendNotification(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	admin := as.admin
 	mustExec(t, admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
@@ -568,6 +576,7 @@ func TestSendNotification(t *testing.T) {
 // TestBuiltinAlertsFromSQL switches on built-in alerts for an integration
 // and checks that a failed scheduled task and a failed load reach it.
 func TestBuiltinAlertsFromSQL(t *testing.T) {
+	t.Parallel()
 	as := startAlertServer(t)
 	admin := as.admin
 	mustExec(t, admin, "CREATE NOTIFICATION INTEGRATION ops TYPE webhook URL '"+as.hooks.URL+"/ops' "+
@@ -616,6 +625,7 @@ func TestBuiltinAlertsFromSQL(t *testing.T) {
 }
 
 func TestLoginLimiterReportsBursts(t *testing.T) {
+	t.Parallel()
 	l := newLoginLimiter()
 	addr := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7)}
 	reached := 0

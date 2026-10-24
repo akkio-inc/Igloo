@@ -20,6 +20,7 @@ import (
 // DuckDB's Iceberg writer does when a table has no target: 500,000 rows of
 // five columns came to 5 files of 13 MB each.
 func TestNewTablesWriteLargeFiles(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, vc.cfg, slog.New(slog.DiscardHandler))

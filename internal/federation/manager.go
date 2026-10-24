@@ -55,6 +55,9 @@ type Options struct {
 	// LocalLocations lets Iceberg REST catalogs' tables be in directories
 	// of the server, for tests.
 	LocalLocations bool
+	// AttachRetry, if set, is how long Attach keeps trying a database it
+	// cannot reach yet instead of attachRetry, for tests.
+	AttachRetry time.Duration
 }
 
 // Manager attaches connections to DuckDB and keeps them in step with the
@@ -64,6 +67,7 @@ type Manager struct {
 	secrets   string
 	protected []server
 	locs      locationRules
+	retry     time.Duration
 	log       *slog.Logger
 	token     string
 	// vended tracks the storage credentials DuckDB keeps for connections
@@ -127,6 +131,7 @@ func NewManager(store Store, opts Options, log *slog.Logger) *Manager {
 	m := &Manager{
 		store: store, secrets: opts.SecretsDir, protected: parseServers(opts.Protected), log: log, token: newToken(),
 		locs:     newLocationRules(opts.Reserved, opts.LocalLocations),
+		retry:    opts.AttachRetry,
 		attached: map[string]*attachment{}, failed: map[string]string{}, vended: map[string]time.Time{},
 	}
 	if opts.Connect != nil {
@@ -302,9 +307,14 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 
 // retryUnreachable runs probe, and again while it fails because the
 // database cannot be reached yet (see unreachable), for up to attachRetry
-// or until ctx is done, backing off from 1 s to 10 s between tries.
+// (or Options.AttachRetry) or until ctx is done, backing off from 1 s to
+// 10 s between tries.
 func (m *Manager) retryUnreachable(ctx context.Context, name string, probe func() error) error {
-	until := time.Now().Add(attachRetry)
+	retry := attachRetry
+	if m.retry > 0 {
+		retry = m.retry
+	}
+	until := time.Now().Add(retry)
 	wait := time.Second
 	for {
 		err := probe()

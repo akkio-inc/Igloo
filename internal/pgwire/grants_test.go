@@ -105,6 +105,7 @@ func count(t *testing.T, conn *pgx.Conn, sql string, args ...any) int64 {
 }
 
 func TestNoneRoleReadsOnlyGrantedTables(t *testing.T) {
+	t.Parallel()
 	for name, mode := range modes {
 		t.Run(name, func(t *testing.T) {
 			cs := startCatalogServer(t)
@@ -165,6 +166,7 @@ func TestNoneRoleReadsOnlyGrantedTables(t *testing.T) {
 }
 
 func TestNoneRoleCannotReadFilesOrBypassAnalysis(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.public TO nina")
@@ -211,6 +213,7 @@ func TestNoneRoleCannotReadFilesOrBypassAnalysis(t *testing.T) {
 // readers may read and users with the none role may not: the files could be
 // any table's.
 func TestNoneRoleCannotReadAllowedFiles(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	cs := startCatalogServerWithConfig(t, config.Config{Storage: config.Storage{AllowedLocations: []string{dir + "/"}}})
 	parquet, csv := dir+"/orders.parquet", dir+"/orders.csv"
@@ -246,6 +249,7 @@ func TestNoneRoleCannotReadAllowedFiles(t *testing.T) {
 }
 
 func TestSchemaGrantsCoverFutureTables(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeCacheStatement)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.sales TO nina")
@@ -264,6 +268,7 @@ func TestSchemaGrantsCoverFutureTables(t *testing.T) {
 }
 
 func TestViewsReadWithTheQueryingUsersGrants(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.orders TO nina")
@@ -280,6 +285,7 @@ func TestViewsReadWithTheQueryingUsersGrants(t *testing.T) {
 }
 
 func TestGrantsAllowWrites(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeCacheStatement)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
@@ -315,6 +321,7 @@ func TestGrantsAllowWrites(t *testing.T) {
 }
 
 func TestCreateOnSchemaAllowsDDL(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT CREATE ON SCHEMA lake.sales TO nina")
@@ -335,6 +342,7 @@ func TestCreateOnSchemaAllowsDDL(t *testing.T) {
 }
 
 func TestRevokesAndRoleChangesReachSessions(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t, func(o *Options) { o.RoleRefresh = 300 * time.Millisecond })
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeCacheStatement)
 	mustExec(t, cs.admin, "CREATE ROLE analyst")
@@ -366,6 +374,7 @@ func TestRevokesAndRoleChangesReachSessions(t *testing.T) {
 // while allowed cannot read more later: DuckDB binds it again when a view
 // it reads changes, or with a new search path.
 func TestPreparedStatementsAreCheckedAgain(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeCacheStatement)
@@ -412,6 +421,7 @@ func TestPreparedStatementsAreCheckedAgain(t *testing.T) {
 // TestPivot runs PIVOTs that take their columns from the data, which DuckDB
 // turns into several statements.
 func TestPivot(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	mustExec(t, cs.admin, "CREATE TABLE lake.public.sales (region VARCHAR, quarter VARCHAR, amount INTEGER)")
@@ -480,6 +490,7 @@ func TestPivot(t *testing.T) {
 }
 
 func TestDroppedTablesLoseTheirGrants(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.orders TO nina")
@@ -495,6 +506,7 @@ func TestDroppedTablesLoseTheirGrants(t *testing.T) {
 }
 
 func TestRoleAndGrantStatements(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
@@ -586,6 +598,7 @@ func TestRoleAndGrantStatements(t *testing.T) {
 }
 
 func TestNoneRoleCursors(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.orders TO nina")
@@ -596,6 +609,7 @@ func TestNoneRoleCursors(t *testing.T) {
 }
 
 func TestQueryAndLoginHistory(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)

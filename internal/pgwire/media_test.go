@@ -15,6 +15,7 @@ import (
 )
 
 func TestGDALUse(t *testing.T) {
+	t.Parallel()
 	refused := []string{
 		"SELECT * FROM ST_Read('/etc/passwd')",
 		"select * from st_read('x.geojson')",
@@ -80,6 +81,7 @@ func TestGDALUse(t *testing.T) {
 }
 
 func TestGeometriesAsWKT(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	for name, mode := range modes {
 		t.Run(name, func(t *testing.T) {
@@ -109,6 +111,7 @@ func TestGeometriesAsWKT(t *testing.T) {
 // TestAnalyticsFunctions checks DuckDB's approximate, statistical and time
 // zone functions that agencies use and that need no extension.
 func TestAnalyticsFunctions(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, `CREATE TABLE imp AS SELECT i AS id, i % 50000 AS user_id, (i % 7)::INT AS campaign,
@@ -156,6 +159,7 @@ func mediaServer(t *testing.T) (*catalogServer, string) {
 }
 
 func TestSketches(t *testing.T) {
+	t.Parallel()
 	cs, _ := mediaServer(t)
 	ctx := context.Background()
 	conn := cs.admin
@@ -193,6 +197,7 @@ func TestSketches(t *testing.T) {
 // Snowflake's error, where the server has it, and with DuckDB's
 // approx_count_distinct where it has not.
 func TestSnowflakeApproxCountDistinct(t *testing.T) {
+	t.Parallel()
 	cs, _ := mediaServer(t)
 	ctx := context.Background()
 	mustExec(t, cs.admin, "CREATE TABLE acd AS SELECT i % 41356 AS v FROM range(1252858) t(i)")
@@ -216,6 +221,7 @@ func TestSnowflakeApproxCountDistinct(t *testing.T) {
 }
 
 func TestSpatialSandbox(t *testing.T) {
+	t.Parallel()
 	cs, dir := mediaServer(t)
 	ctx := context.Background()
 	conn := cs.admin
@@ -303,6 +309,7 @@ func TestSpatialSandbox(t *testing.T) {
 // have no rowid.) If DuckDB plans the failing ones, it has the fix: drop
 // rowidFilterFailure and check their rows here instead.
 func TestRowidFilters(t *testing.T) {
+	t.Parallel()
 	cs, _ := mediaServer(t)
 	mustExec(t, cs.admin, "CREATE TABLE lake.public.events AS SELECT range AS id FROM range(1000)")
 	mustExec(t, cs.admin, "CREATE VIEW lake.public.even_events AS SELECT * FROM lake.public.events WHERE rowid % 2 = 0")

@@ -11,6 +11,7 @@ import (
 )
 
 func TestParseCopyTo(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]copyTo{
 		"COPY (SELECT 1) TO STDOUT":                                   {query: "SELECT 1", format: "text", delimiter: "\t", null: `\N`},
 		`copy "Sales".orders (id, "Total") to stdout with csv header`: {query: `SELECT id, "Total" FROM "Sales"."orders"`, format: "csv", header: true, delimiter: ",", null: ""},
@@ -35,6 +36,7 @@ func TestParseCopyTo(t *testing.T) {
 }
 
 func TestCopyToStdout(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)

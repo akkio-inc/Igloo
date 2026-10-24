@@ -53,6 +53,7 @@ func (f *recordingIDSets) Holding(_ context.Context, _ string, _ []int64) (int64
 // still holding them in its verification, which sends it back to expire,
 // and forgets them when it ends.
 func TestErasureIDSets(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	r := vc.replica(t, func(o *Options) { o.IDDomainsOn = true })
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)

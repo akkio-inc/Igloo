@@ -23,6 +23,7 @@ import (
 // reads, and needs a grant. Temporary tables, the session's own, are seen
 // as before.
 func TestTableIndexSeesNewTables(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.sales TO nina")
@@ -56,6 +57,7 @@ func TestTableIndexSeesNewTables(t *testing.T) {
 }
 
 func TestMayCreateTemporary(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]bool{
 		"CREATE TEMP TABLE t AS SELECT 1":           true,
 		"create temporary view v as select 1":       true,
@@ -81,6 +83,7 @@ func TestMayCreateTemporary(t *testing.T) {
 // was built from that listing; DuckDB loads the name from the catalog,
 // which tells the proxy, so the statement's checks see the table it bound.
 func TestTableIndexSeesIcebergTablesMadeElsewhere(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, vc.cfg, slog.New(slog.DiscardHandler))
@@ -134,6 +137,7 @@ func TestTableIndexSeesIcebergTablesMadeElsewhere(t *testing.T) {
 // WarmSchemas has run in the background and at the first statement that
 // lists columns (LoadSchemas), which load tables side by side.
 func TestSchemasLoad(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	a := vc.replica(t)
 	admin := a.admin(t, pgx.QueryExecModeSimpleProtocol)

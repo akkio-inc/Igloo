@@ -18,6 +18,7 @@ import (
 // otherwise goes on taking it for missing, in every session, until it
 // stops (see Engine.ForgetMissingSchema).
 func TestSchemaMadeAfterALookupMissedIt(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, vc.cfg, slog.New(slog.DiscardHandler))
@@ -80,6 +81,7 @@ func TestSchemaMadeAfterALookupMissedIt(t *testing.T) {
 }
 
 func TestMissingSchemaOf(t *testing.T) {
+	t.Parallel()
 	for msg, want := range map[string]string{
 		`Catalog Error: Schema with name "c10" not found`:                                            "c10",
 		`Catalog Error: Table with name "c10.t" does not exist because schema "c10" does not exist.`: "c10",

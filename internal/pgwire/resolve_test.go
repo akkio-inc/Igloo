@@ -19,6 +19,7 @@ import (
 // stand for the Iceberg catalog and a Snowflake connection that both have
 // a schema media_demo.
 func TestResolveAsDuckDBBinds(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	connector, err := duckdb.NewConnector("", nil)
 	if err != nil {

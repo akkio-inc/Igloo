@@ -18,6 +18,7 @@ import (
 // alike. Views recorded with the column of ids among their columns, as
 // Igloo recorded them before, load with the names they meant.
 func TestViewStarLeavesOutIDs(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	vc := newViewCatalog(t)
 	withIDs := func(o *Options) {

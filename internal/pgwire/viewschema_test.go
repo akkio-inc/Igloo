@@ -19,6 +19,7 @@ import (
 // and a view whose local copy cannot be made fails with why when read, and
 // loads once it can.
 func TestViewNamesResolveInTheViewsSchema(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	vc := newViewCatalog(t)
 	a, b := vc.replica(t), vc.replica(t)
@@ -97,6 +98,7 @@ func TestViewNamesResolveInTheViewsSchema(t *testing.T) {
 // in it without one. In DuckDB's dialect and Snowflake's, for an admin and
 // a writer; and a USE of another schema leaves the view behind.
 func TestUseKeepsViewsOnPath(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	r := vc.replica(t)
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)

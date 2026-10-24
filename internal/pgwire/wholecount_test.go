@@ -70,6 +70,7 @@ func resultOf(t *testing.T, db *sql.DB, q string) ([]string, []string) {
 }
 
 func TestWholeCounts(t *testing.T) {
+	t.Parallel()
 	db, parse := wholeCountDB(t)
 	rewritten := []string{
 		"SELECT *, COUNT(*) OVER () AS total FROM t",
@@ -174,6 +175,7 @@ func TestWholeCounts(t *testing.T) {
 // dialects, and a whole count of a table with a row access policy, which
 // must count only the rows the user sees.
 func TestWholeCountsThroughSessions(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	mustExec(t, cs.admin, "CREATE TABLE lake.public.activity AS SELECT i AS id, 'site' || (i % 50) AS site, i * 1.5 AS spend FROM range(5000) r(i)")
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.crm TO acme_team")

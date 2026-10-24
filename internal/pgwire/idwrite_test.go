@@ -14,6 +14,7 @@ import (
 )
 
 func TestRewriteMemberWrite(t *testing.T) {
+	t.Parallel()
 	members := []iddomain.Member{{Domain: "people", Schema: "public", Table: "t", Column: "person_id"}}
 	visible := []string{"person_id", "n"}
 	for q, want := range map[string]string{
@@ -67,6 +68,7 @@ func TestRewriteMemberWrite(t *testing.T) {
 // inserts that name no columns name the others, and updates of the member
 // column leave no id beside a value it was not given for.
 func TestMemberWrites(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	r := vc.replica(t, func(o *Options) { o.IDDomainsOn = true })
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -158,6 +160,7 @@ func TestMemberWrites(t *testing.T) {
 // whose columns is named like a protected table: Igloo's own write names
 // the columns, quoted, and the column list is no table reference.
 func TestMemberWriteColumnNamedLikeTable(t *testing.T) {
+	t.Parallel()
 	it := newIDTest(t)
 	it.exec(
 		"CREATE SCHEMA IF NOT EXISTS lake.public",

@@ -13,6 +13,7 @@ import (
 )
 
 func TestParseShareCommand(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		sql  string
 		want shareCommand
@@ -89,6 +90,7 @@ func TestParseShareCommand(t *testing.T) {
 }
 
 func TestParseShareDuration(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[string]time.Duration{
 		"90d": 90 * 24 * time.Hour, "36h": 36 * time.Hour, "30m": 30 * time.Minute, "1 day": 24 * time.Hour,
 		"30 Days": 30 * 24 * time.Hour, "12 hours": 12 * time.Hour, "0": 0,
@@ -105,6 +107,7 @@ func TestParseShareDuration(t *testing.T) {
 }
 
 func TestShareCommandsNeedAdminAndSetup(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	v, _ := auth.NewVerifier("reader-password")
@@ -137,6 +140,7 @@ func TestShareCommandsNeedAdminAndSetup(t *testing.T) {
 }
 
 func TestProviderProfilesAreRedacted(t *testing.T) {
+	t.Parallel()
 	q := `CREATE PROVIDER tvco FROM '{"shareCredentialsVersion": 1, "endpoint": "https://x.example.com", "bearerToken": "dst_secret"}'`
 	got := redactQuery(q)
 	if strings.Contains(got, "dst_secret") || !strings.Contains(got, "'***'") {

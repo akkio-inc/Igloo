@@ -111,6 +111,7 @@ func (it *idTest) consistent(domain string, complete bool, tables ...string) {
 // maps the rows other writes leave without, checking each time that ids
 // agree with the dictionary across tables.
 func TestIDAssignment(t *testing.T) {
+	t.Parallel()
 	it := newIDTest(t)
 	ctx := context.Background()
 	it.exec(
@@ -204,6 +205,7 @@ func TestIDAssignment(t *testing.T) {
 // another holds their domain's lease, without holding up the write or
 // writes in other domains, and stops handing out ids below 2^32.
 func TestIDAssignmentLease(t *testing.T) {
+	// A package variable: this test does not run in parallel.
 	saved := idLeaseWait
 	idLeaseWait = 200 * time.Millisecond
 	defer func() { idLeaseWait = saved }()
@@ -278,6 +280,7 @@ func TestIDAssignmentLease(t *testing.T) {
 // once, many times over, with values both writers find new: each value gets
 // one id, which both tables hold.
 func TestIDAssignmentConcurrentWriters(t *testing.T) {
+	t.Parallel()
 	it := newIDTest(t)
 	it.exec(
 		"CREATE SCHEMA IF NOT EXISTS lake.public",
@@ -326,6 +329,7 @@ func TestIDAssignmentConcurrentWriters(t *testing.T) {
 // taking the lease: the erasure counts itself under the lease, and the
 // assignment checks the count there.
 func TestIDAssignmentErasedMeanwhile(t *testing.T) {
+	t.Parallel()
 	it := newIDTest(t)
 	ctx := context.Background()
 	it.exec(
@@ -380,6 +384,7 @@ func TestIDAssignmentErasedMeanwhile(t *testing.T) {
 // such writes share, and gives a larger write's new values ids before it
 // returns.
 func TestIDAssignmentDeferred(t *testing.T) {
+	// A package variable: this test does not run in parallel.
 	saved := idDeferredDelay
 	idDeferredDelay = 3 * time.Second
 	defer func() { idDeferredDelay = saved }()

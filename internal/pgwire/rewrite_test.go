@@ -11,6 +11,7 @@ import (
 )
 
 func TestApplyEdits(t *testing.T) {
+	t.Parallel()
 	got, err := applyEdits("SELECT a FROM t WHERE b", []edit{{14, 15, "(x) AS t"}, {7, 8, "c"}, {23, 23, " = 1"}})
 	if err != nil || got != "SELECT c FROM (x) AS t WHERE b = 1" {
 		t.Errorf("applyEdits: %q %v", got, err)
@@ -21,6 +22,7 @@ func TestApplyEdits(t *testing.T) {
 }
 
 func TestScanTableRef(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		text  string
 		ref   refNode
@@ -56,6 +58,7 @@ func TestScanTableRef(t *testing.T) {
 }
 
 func TestPrevWord(t *testing.T) {
+	t.Parallel()
 	for text, want := range map[string]string{
 		"TABLE /* c */ contacts":     "TABLE",
 		"SELECT * FROM contacts":     "FROM",
@@ -70,6 +73,7 @@ func TestPrevWord(t *testing.T) {
 }
 
 func TestParseDML(t *testing.T) {
+	t.Parallel()
 	q := "UPDATE lake.crm.contacts AS c SET a = c.b + 1, d = (SELECT 1) FROM s WHERE c.id = s.id RETURNING a"
 	d, ok := parseDML(duckdb.STATEMENT_TYPE_UPDATE, q)
 	text := func(s span) string { return q[s.start:s.end] }
@@ -125,6 +129,7 @@ func TestParseDML(t *testing.T) {
 }
 
 func TestComposer(t *testing.T) {
+	t.Parallel()
 	src := "UPDATE t SET a = 1 WHERE b"
 	c := &composer{}
 	c.lit("SELECT ")
@@ -143,6 +148,7 @@ func TestComposer(t *testing.T) {
 }
 
 func TestViewParts(t *testing.T) {
+	t.Parallel()
 	cols, body, ok := viewParts(`CREATE VIEW "public"."v"(a, "B") AS SELECT 1, 2;`)
 	if !ok || !slices.Equal(cols, []string{"a", "B"}) || body != "SELECT 1, 2" {
 		t.Errorf("viewParts: %q %q %v", cols, body, ok)
@@ -154,6 +160,7 @@ func TestViewParts(t *testing.T) {
 }
 
 func TestConstantExpr(t *testing.T) {
+	t.Parallel()
 	for text, want := range map[string]bool{
 		"0": true, "-1.5": true, "'x'": true, "NULL": true, "(true)": true,
 		"a": false, "a + 1": false, "$1": false, "?": false, "now()": false, `"x"`: false, "(SELECT 1)": false,
@@ -165,6 +172,7 @@ func TestConstantExpr(t *testing.T) {
 }
 
 func TestPathLike(t *testing.T) {
+	t.Parallel()
 	for name, want := range map[string]bool{
 		"s3://bucket/x": true, "data.parquet": true, "x.CSV.gz": true, "a/b/c.json.zst": true,
 		"contacts": false, "lake.crm.contacts": false, "2026-10-01": false, "a@b.com": false,
@@ -176,6 +184,7 @@ func TestPathLike(t *testing.T) {
 }
 
 func TestTextValues(t *testing.T) {
+	t.Parallel()
 	got := literalsOf(`SELECT 'it''s', E'cont\x61cts', e'\143\n', $$a'b$$, $q$x$q$, "Quoted ""x""" FROM t`)
 	want := []string{"it's", "contacts", "c\n", "a'b", "x", `Quoted "x"`}
 	if !slices.Equal(got, want) {
@@ -214,6 +223,7 @@ func TestTextValues(t *testing.T) {
 }
 
 func TestCheckPath(t *testing.T) {
+	t.Parallel()
 	s := &Server{gov: &governance{allowed: []string{"s3://landing/", "/data/"}, warehouse: "/data/warehouse/"}}
 	// With a table under a policy (allowWarehouse false), the warehouse is
 	// off limits; the rest must still be plain, in-prefix paths.
@@ -257,6 +267,7 @@ func TestCheckPath(t *testing.T) {
 }
 
 func TestPolicyRules(t *testing.T) {
+	t.Parallel()
 	for q, ok := range map[string]bool{
 		"PRAGMA table_info('t')":        true,
 		"PRAGMA storage_info('t')":      false,
@@ -275,6 +286,7 @@ func TestPolicyRules(t *testing.T) {
 }
 
 func TestParsePolicyCommand(t *testing.T) {
+	t.Parallel()
 	c, ok, err := parsePolicyCommand(`CREATE OR REPLACE MASKING POLICY mask_email AS (val VARCHAR) RETURNS VARCHAR ->
 		CASE WHEN is_role_in_session('x') THEN val ELSE '***' END COMMENT = 'emails';`)
 	if !ok || err != nil || c.kind != pcCreatePolicy || !c.replace || c.policy.Name != "mask_email" ||

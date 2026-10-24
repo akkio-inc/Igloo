@@ -244,6 +244,7 @@ func (rs *roomServer) setUp(t *testing.T) {
 }
 
 func TestCleanRoomsKeepRawDataToItsParty(t *testing.T) {
+	t.Parallel()
 	rs := startRoomServer(t)
 	ctx := context.Background()
 	expectRows(t, rs.rita, "SELECT count(*) FROM marts.crm", "400")
@@ -354,6 +355,7 @@ func TestCleanRoomsKeepRawDataToItsParty(t *testing.T) {
 }
 
 func TestCleanRoomRuns(t *testing.T) {
+	t.Parallel()
 	rs := startRoomServer(t)
 	ctx := context.Background()
 	rs.setUp(t)
@@ -488,6 +490,7 @@ func (f fakeRecipients) Recipient(r *http.Request) (string, error) {
 }
 
 func TestCleanRoomPartnerAPI(t *testing.T) {
+	t.Parallel()
 	rs := startRoomServer(t)
 	rs.setUp(t)
 	api := httptest.NewServer(cleanroom.NewAPI(rs.rooms, fakeRecipients{"dst_tvco": "tvco_ads", "dst_other": "other"}, nil, 0, nil))
@@ -600,6 +603,7 @@ func TestCleanRoomPartnerAPI(t *testing.T) {
 // dataset's own party may clone it; and a table's branches and tags, its
 // snapshots, are that party's too.
 func TestCleanRoomsAndClones(t *testing.T) {
+	t.Parallel()
 	cat := clonetest.New(t.TempDir())
 	crm, err := cat.Create(table.Identifier{"marts", "crm"}, clonetest.Schema, nil)
 	if err != nil {
@@ -664,6 +668,7 @@ func TestCleanRoomsAndClones(t *testing.T) {
 // nobody else learns its name, description, columns, tags, size, usage or
 // lineage, whatever their role.
 func TestCleanRoomsInTheCatalog(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	md := &fixedMetadata{md: &catalog.Metadata{
@@ -741,6 +746,7 @@ func TestCleanRoomsInTheCatalog(t *testing.T) {
 // An alert runs as its owner: one whose query reads a dataset runs only
 // for the dataset's own party, whenever it was made.
 func TestCleanRoomsAndAlerts(t *testing.T) {
+	t.Parallel()
 	hooks := newHooks(t)
 	n := notify.New(notify.Options{AllowHosts: []string{"127.0.0.1"}})
 	sched := tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{Ended: n.RunEnded})
@@ -794,6 +800,7 @@ func TestCleanRoomsAndAlerts(t *testing.T) {
 // A connection's table cannot be a dataset: its database is not Igloo's to
 // keep to a party.
 func TestCleanRoomsRefuseConnectionTables(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	schema := pgFixture(t, pg)
@@ -831,6 +838,7 @@ func TestCleanRoomsRefuseConnectionTables(t *testing.T) {
 // change it, or replace it, and the party's runs then read the writer's
 // rows; or write into a result.
 func TestOnlyItsPartyChangesADataset(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	rs := startRoomServer(t)
 	rs.setUp(t)
@@ -905,6 +913,7 @@ func TestOnlyItsPartyChangesADataset(t *testing.T) {
 // it in a clean room, which keeps it from everyone else: a reader of every
 // table could otherwise take a shared table from the rest of the company.
 func TestOnlyOwnersAddDatasets(t *testing.T) {
+	t.Parallel()
 	rs := startRoomServer(t)
 	rs.setUp(t) // ana, of role agency, which owns the CRM
 	for _, sql := range []string{
@@ -938,6 +947,7 @@ func TestOnlyOwnersAddDatasets(t *testing.T) {
 // A sum of a measure across parties takes bounds on the measure, and noise
 // from every party.
 func TestBoundedSumsAcrossParties(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	rs := startRoomServer(t)
 	rs.setUp(t)
@@ -965,6 +975,7 @@ func TestBoundedSumsAcrossParties(t *testing.T) {
 // A table a clean room keeps to its party runs on one machine, for the
 // party too: workers read its files, past the confinement.
 func TestCleanRoomsAndDistributedExecution(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ds := startDistServer(t, 2)
 	err := ds.srv.gov.store.Update(ctx, func(c *policy.Catalog) error {
@@ -1002,6 +1013,7 @@ func TestCleanRoomsAndDistributedExecution(t *testing.T) {
 // dataset's source or policy after it, as its party may alone, needs every
 // approval again, and so does its table being made again.
 func TestApprovalsCoverDatasets(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	rs := startRoomServer(t)
 	rs.setUp(t)
@@ -1064,6 +1076,7 @@ func TestApprovalsCoverDatasets(t *testing.T) {
 // Datasets stored with noise and the old default of 100 runs a day take
 // the new default of 10, once: a budget set to 100 later stays.
 func TestStoredNoisyBudgetsMigrate(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	url := testDatabase(t)
 	store, err := cleanroom.OpenStore(ctx, url)
@@ -1129,6 +1142,7 @@ func TestStoredNoisyBudgetsMigrate(t *testing.T) {
 // never used twice now, and an approval holds the digest of what it
 // approved.
 func TestApprovalsBindWhatWasReviewed(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	rs := startRoomServer(t)
 	rs.setUp(t)
@@ -1161,6 +1175,7 @@ func TestApprovalsBindWhatWasReviewed(t *testing.T) {
 // person's viewing outright, and the population check, counted on the
 // joined data, would tell whether they are in it.
 func TestOnePersonStaysHidden(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	rs := startRoomServer(t)
 	rs.setUp(t)
@@ -1220,6 +1235,7 @@ func mustJSON(t *testing.T, v any) string {
 // ids out of a clean room: a member table's dataset has its other columns,
 // and naming the column of ids is refused.
 func TestCleanRoomDatasetWithoutIDs(t *testing.T) {
+	t.Parallel()
 	rs := startRoomServer(t)
 	ctx := context.Background()
 	conn, err := rs.srv.engine.Connect(ctx)

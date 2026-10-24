@@ -269,6 +269,7 @@ func (rs *reportRecognitionServer) checkRecognized(t *testing.T, conn *pgx.Conn,
 }
 
 func TestReportRecognition(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	for _, c := range reportRecognitionCases {
 		rs.checkRecognized(t, rs.admin, c.name, c.sql, c.want)
@@ -282,6 +283,7 @@ func TestReportRecognition(t *testing.T) {
 // TestReportRecognitionSnowflake: reports in Snowflake's dialect are
 // recognized in the translation Igloo makes of them.
 func TestReportRecognitionSnowflake(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	conn := rs.admin
 	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
@@ -331,6 +333,7 @@ SELECT A.SEGMENT_NAME, A.PEOPLE, T.TOTAL, A.PEOPLE / NULLIF(T.TOTAL, 0) AS SHARE
 // refused as written, and policies apply to it as to the statement
 // written.
 func TestReportRecognitionGovernance(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	mustExec(t, rs.admin, "CREATE TABLE lake.public.audience_versions AS SELECT * FROM lake.public.audience_revisions")
 	nina := rs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
@@ -389,6 +392,7 @@ SELECT * FROM C`, 1)
 // TestReportRecognitionFallback: a statement whose recognized form fails,
 // here because the API takes at most eight cohorts, runs as written.
 func TestReportRecognitionFallback(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	var branches []string
 	for i := range 9 {
@@ -414,6 +418,7 @@ SELECT * FROM C`
 // TestReportRecognitionInTransaction: a recognized statement that fails
 // leaves an open transaction as the statement as written does.
 func TestReportRecognitionInTransaction(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	var branches []string
 	for i := range 9 {
@@ -437,6 +442,7 @@ SELECT * FROM C`
 // JSON, which recognition maps to element_text "json". The tables and
 // names are the test's own: panels of people in waves, and their tags.
 func TestReportRecognitionSnowflakeElements(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	conn := rs.admin
 	for _, q := range []string{
@@ -468,6 +474,7 @@ SELECT * FROM TAG_COUNTS`
 // TestReportRecognitionSwitch: a session turns recognition off and on for
 // itself.
 func TestReportRecognitionSwitch(t *testing.T) {
+	t.Parallel()
 	rs := startReportRecognitionServer(t)
 	conn := rs.admin
 	sql := reportRecognitionCases[4].sql // cohort sizes

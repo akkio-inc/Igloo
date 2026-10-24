@@ -20,6 +20,7 @@ import (
 )
 
 func TestParseErasureCommand(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		sql  string
 		ok   bool
@@ -108,6 +109,7 @@ func TestParseErasureCommand(t *testing.T) {
 // retentions and see the requests; nobody else, and the identifiers stay
 // out of the history.
 func TestEraseSubject(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	policies := policy.NewMemoryStore()
 	connector, err := duckdb.NewConnector("", nil)
@@ -235,6 +237,7 @@ func TestEraseSubject(t *testing.T) {
 // statement would change it: the request could not rewrite a table of
 // version 3.
 func TestFormatVersionWhileErasing(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	policies := policy.NewMemoryStore()
 	connector, err := duckdb.NewConnector("", nil)

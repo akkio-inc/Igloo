@@ -54,7 +54,8 @@ const catalogCrashChildEnv = "IGLOO_CATALOG_CRASH_CHILD"
 // segfaults, or wedges in a listing until its timeout, and exits non-zero;
 // with it the subprocess completes every build and returns. Remove the guard
 // (make Server.holdCatalog return a no-op), or only the bind hold
-// (openSession's SetBindHold), to see this fail.
+// (openSession's SetBindHold), to see this fail. Its readers keep every
+// core busy, so it does not run in parallel with other tests.
 func TestCatalogListingSurvivesConcurrentDDL(t *testing.T) {
 	if os.Getenv("IGLOO_TEST_EXTENSION_DIR") == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
@@ -214,6 +215,7 @@ func martTables(t *testing.T, conn *pgx.Conn) []string {
 // let go of it and take it exclusively, and back once that step is done. It
 // also checks that withoutCatalog lets go of the lock while it waits.
 func TestCatalogLockIsReentrantPerSession(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		steps func(s *Server, sess *session)

@@ -18,6 +18,7 @@ import (
 )
 
 func TestParseCloneCommand(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		query string
 		want  cloneCommand
@@ -69,6 +70,7 @@ func TestParseCloneCommand(t *testing.T) {
 }
 
 func TestParseRefCommand(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		query string
 		want  refCommand
@@ -106,6 +108,7 @@ func TestParseRefCommand(t *testing.T) {
 }
 
 func TestFindRefReads(t *testing.T) {
+	t.Parallel()
 	q := `SELECT * FROM s.t AT (BRANCH => 'dev') JOIN "U" AS u AT (TAG => 'v1') ON true, w x AT (BRANCH=>'b') ` +
 		`WHERE 'AT (BRANCH => ''no'')' <> '' -- AT (TAG => 'comment')`
 	reads, err := findRefReads(q)
@@ -141,6 +144,7 @@ func TestFindRefReads(t *testing.T) {
 }
 
 func TestCloneWithoutCatalog(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	for _, c := range []struct{ query, code string }{
@@ -180,6 +184,7 @@ func protectedContacts(t *testing.T, cat *policy.Catalog, now time.Time) {
 // reports, since engines reading its files would bypass its policies: a
 // clone of a protected table is one.
 func TestCloneOfProtectedTableIsProtected(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := policy.NewMemoryStore()
 	err := store.Update(ctx, func(cat *policy.Catalog) error {
@@ -201,6 +206,7 @@ func TestCloneOfProtectedTableIsProtected(t *testing.T) {
 }
 
 func TestAttachClonePolicies(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	base := func() *policy.Catalog {
 		cat := &policy.Catalog{}

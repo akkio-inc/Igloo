@@ -40,6 +40,7 @@ func wideTable(t testing.TB, cs *catalogServer, n int) string {
 // catalog casts lexing the whole statement again for each of its casts
 // (see BenchmarkWideProfile).
 func TestWideProfile(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.public TO nina")

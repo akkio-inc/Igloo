@@ -13,6 +13,7 @@ import (
 // wrote, as a materialized view's refresh does: on an Iceberg table, which
 // Igloo replaces itself (see replace.go), as on any other.
 func TestTaskCreateTableAsCountsRows(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	ctx := context.Background()
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -45,6 +46,7 @@ func TestTaskCreateTableAsCountsRows(t *testing.T) {
 // createsTableAs tells CREATE TABLE ... AS, whose rows the history counts,
 // from the other CREATE statements.
 func TestCreatesTableAs(t *testing.T) {
+	t.Parallel()
 	for query, want := range map[string]bool{
 		"CREATE TABLE t AS SELECT 1":                                 true,
 		"create or replace table lake.s.t as select 1":               true,

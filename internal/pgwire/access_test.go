@@ -15,6 +15,7 @@ import (
 )
 
 func TestDMLAsSelect(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		t     duckdb.StmtType
 		query string
@@ -43,6 +44,7 @@ func TestDMLAsSelect(t *testing.T) {
 }
 
 func TestInsertSource(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"INSERT INTO t VALUES (1, 'a')":                          "VALUES (1, 'a')",
 		"INSERT INTO lake.public.t (a, b) SELECT * FROM s;":      "SELECT * FROM s",
@@ -60,6 +62,7 @@ func TestInsertSource(t *testing.T) {
 }
 
 func TestParseCreateTable(t *testing.T) {
+	t.Parallel()
 	c, ok := parseCreateTable("CREATE OR REPLACE TABLE lake.s.t AS (SELECT 1) WITH NO DATA")
 	if !ok || !c.replace || c.temporary || !slices.Equal(c.name, []string{"lake", "s", "t"}) || c.query != "(SELECT 1)" {
 		t.Errorf("CTAS: %+v %v", c, ok)
@@ -74,6 +77,7 @@ func TestParseCreateTable(t *testing.T) {
 }
 
 func TestTopLevelKeyword(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		query string
 		words []string
@@ -93,6 +97,7 @@ func TestTopLevelKeyword(t *testing.T) {
 }
 
 func TestSplitQualified(t *testing.T) {
+	t.Parallel()
 	cases := map[string][]string{
 		`"temp".main.t`:     {"temp", "main", "t"},
 		`lake."My ""S""".t`: {"lake", `My "S"`, "t"},
@@ -110,6 +115,7 @@ func TestSplitQualified(t *testing.T) {
 }
 
 func TestViewBodyAndExplained(t *testing.T) {
+	t.Parallel()
 	if got := viewBody("CREATE TEMP VIEW tv (a) AS SELECT id FROM t1;"); got != "SELECT id FROM t1" {
 		t.Errorf("temp view body: %q", got)
 	}
@@ -125,6 +131,7 @@ func TestViewBodyAndExplained(t *testing.T) {
 }
 
 func TestMergeActions(t *testing.T) {
+	t.Parallel()
 	got := mergeActions("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = 1 WHEN NOT MATCHED THEN INSERT VALUES (1)")
 	if !slices.Equal(got, []auth.Privilege{auth.PrivilegeUpdate, auth.PrivilegeInsert}) {
 		t.Errorf("merge: %v", got)
@@ -135,6 +142,7 @@ func TestMergeActions(t *testing.T) {
 }
 
 func TestGrantable(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		t     duckdb.StmtType
 		query string
@@ -164,6 +172,7 @@ func TestGrantable(t *testing.T) {
 // DuckDB's own parse of queries, and that it follows CTEs as DuckDB plans
 // them: each used one once, unused ones not at all.
 func TestASTWalk(t *testing.T) {
+	t.Parallel()
 	connector, err := duckdb.NewConnector("", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -233,6 +242,7 @@ func TestASTWalk(t *testing.T) {
 }
 
 func TestWithViewSchemas(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		setting, db, want string
 		ok                bool

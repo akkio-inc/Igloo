@@ -20,6 +20,7 @@ import (
 // EXISTS, is left alone, and a query that fails part way leaves nothing
 // behind.
 func TestCreateTableAsInSteps(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	ctx := context.Background()
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -81,6 +82,7 @@ func TestCreateTableAsInSteps(t *testing.T) {
 // statement it held the lock for as long as it read, and every other
 // session waited.
 func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	schema := pgFixture(t, pg)

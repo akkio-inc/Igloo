@@ -35,7 +35,9 @@ import (
 // with dbt-postgres 1.11.0 (the versions scripts/e2e.sh pins) sends them
 // through psycopg2, while the replicas sync their views without pause and
 // the catalog is slow to list views, so that syncs often hold a list made
-// before the session's latest change.
+// before the session's latest change. They do not run in parallel with
+// other tests, whose load would change how the syncs and dbt's statements
+// interleave.
 
 // viewCatalog is icebergtest's catalog, for replicas of Igloo to share.
 type viewCatalog struct {

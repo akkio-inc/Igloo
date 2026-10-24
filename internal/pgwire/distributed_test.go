@@ -348,6 +348,7 @@ func lastRun(t *testing.T, h *audit.MemoryStore, text string) audit.Query {
 }
 
 func TestDistributedStatements(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	for name, mode := range modes {
 		t.Run(name, func(t *testing.T) {
@@ -425,6 +426,7 @@ func TestDistributedStatements(t *testing.T) {
 
 // Grants hold: a user reads through workers only what they may read.
 func TestDistributedGrants(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	nina := ds.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, nina, "SET distributed_execution = on")
@@ -447,6 +449,7 @@ func TestDistributedGrants(t *testing.T) {
 // with SQLSTATE 53200 (out_of_memory), rather than run here, which would
 // run out the same way.
 func TestDistributedOutOfMemory(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
@@ -462,12 +465,20 @@ func TestDistributedOutOfMemory(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		_, before := ds.gate.counts()
+		// A task the last shed canceled counts as waiting until it sees it
+		// was canceled, which on a busy machine can be after the tasks
+		// running again in its place have yet to start: shed once one has.
 		shed := false
-		for _, w := range ds.workers {
-			shed = w.ShedMemory(64<<20) || shed
-		}
-		if !shed {
-			t.Fatal("no worker had a task to shed")
+		for !shed {
+			for _, w := range ds.workers {
+				shed = w.ShedMemory(64<<20) || shed
+			}
+			if !shed && time.Now().After(deadline) {
+				t.Fatal("no worker had a task to shed")
+			}
+			if !shed {
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 		for _, canceled := ds.gate.counts(); canceled == before && time.Now().Before(deadline); _, canceled = ds.gate.counts() {
 			time.Sleep(10 * time.Millisecond)
@@ -523,6 +534,7 @@ func TestDistributedOutOfMemory(t *testing.T) {
 // rows as if nothing had happened; the next time, it runs on workers
 // directly. So does one the memory watch cancels (ShedMemory).
 func TestDistributedAfterOutOfMemory(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	// Large enough for auto mode to weigh, small enough for one machine,
 	// which reads it cold in about 45 s.
@@ -616,6 +628,7 @@ func TestDistributedGuard(t *testing.T) {
 	// which it estimates at about 45 s: far past the minimum the test
 	// sets, which the guard waits for.
 	ds.source.size = 300 << 20
+	// Package variables: this test does not run in parallel.
 	defer func(f float64, m time.Duration) { guardFactor, guardMinimum = f, m }(guardFactor, guardMinimum)
 	guardFactor, guardMinimum = 0, 300*time.Millisecond
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -699,6 +712,7 @@ func TestDistributedGuard(t *testing.T) {
 // A guard does not stop a statement that has begun sending its rows, and
 // once it stopped one, the statement sends nothing.
 func TestGuardGate(t *testing.T) {
+	// Package variables: this test does not run in parallel.
 	defer func(f float64, m time.Duration) { guardFactor, guardMinimum = f, m }(guardFactor, guardMinimum)
 	guardFactor, guardMinimum = 0, 50*time.Millisecond
 	ctx := context.Background()
@@ -751,6 +765,7 @@ func (w *countingWriter) CopyIn(wire.FormatCode) (*wire.CopyReader, error) { ret
 
 // When the workers are gone, statements run here.
 func TestDistributedFallback(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
@@ -773,6 +788,7 @@ func TestDistributedFallback(t *testing.T) {
 // as long as one machine takes. The same statement over a table that fits
 // still runs here.
 func TestDistributedNoFallbackShortOfMemory(t *testing.T) {
+	t.Parallel()
 	ds := startDistServerWith(t, t.TempDir(), 2, func(o *distributed.Options) { o.MemoryBytes = 64 << 20 })
 	ds.source.size = 300 << 20
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -797,6 +813,7 @@ func TestDistributedNoFallbackShortOfMemory(t *testing.T) {
 // estimates, partitions and stages, without running a task; and why one
 // that cannot run on workers runs here.
 func TestDistributedExplain(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
@@ -852,6 +869,7 @@ func TestDistributedExplain(t *testing.T) {
 // on workers, which define the same macros; a session that redefines one
 // of them computes something else, and runs such statements here.
 func TestDistributedFlatten(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	mustExec(t, ds.admin, `CREATE TABLE lake.public.events AS SELECT i AS id,
 		'["a' || (i % 3) || '", "b' || (i % 5) || '"]' AS tags FROM range(3000) t(i)`)
@@ -933,6 +951,7 @@ func TestDistributedFlatten(t *testing.T) {
 // only what grants allow reads through a view what the grant check found
 // it reads, and nothing else.
 func TestDistributedViews(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	mustExec(t, ds.admin, "CREATE VIEW lake.public.v_orders (order_id, amount) AS SELECT id, amount FROM orders WHERE amount > 0")
 	mustExec(t, ds.admin, "CREATE VIEW lake.sales.v_orders_codes AS SELECT o.id, o.amount, s.code FROM public.orders o LEFT JOIN public.secrets s ON o.id = s.id")

@@ -7,6 +7,7 @@ import (
 )
 
 func TestParseViewCommand(t *testing.T) {
+	t.Parallel()
 	c, ok := parseViewCommand(`CREATE OR REPLACE VIEW lake.public."Top" (a, "B") AS SELECT 1, 2;`)
 	if !ok || !c.replace || c.drop || !slices.Equal(c.name, []string{"lake", "public", "Top"}) ||
 		!slices.Equal(c.columns, []string{"a", "B"}) || c.query != "SELECT 1, 2" {
@@ -35,6 +36,7 @@ func TestParseViewCommand(t *testing.T) {
 }
 
 func TestParseCommentCommand(t *testing.T) {
+	t.Parallel()
 	c, ok := parseCommentCommand("COMMENT ON TABLE lake.public.events IS 'Raw events | :pii:false';")
 	if !ok || c.kind != "TABLE" || c.text == nil || *c.text != "Raw events | :pii:false" ||
 		!slices.Equal(c.name, []string{"lake", "public", "events"}) {
@@ -61,6 +63,7 @@ func TestParseCommentCommand(t *testing.T) {
 }
 
 func TestNamesDatabase(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]bool{
 		"DROP VIEW memory.public.v":                     true,
 		`CREATE TABLE "Memory"."public".t AS SELECT 1`:  true,
@@ -76,6 +79,7 @@ func TestNamesDatabase(t *testing.T) {
 }
 
 func TestParseAlterRelation(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]alterRelation{
 		"ALTER VIEW IF EXISTS s.v RENAME TO w": {view: true, ifExists: true, name: []string{"s", "v"}, renameTo: "w"},
 		// dbt renames views with ALTER TABLE, as PostgreSQL allows.
@@ -96,6 +100,7 @@ func TestParseAlterRelation(t *testing.T) {
 }
 
 func TestParseCommentDollarQuoted(t *testing.T) {
+	t.Parallel()
 	// dbt's persist_docs quotes comments so.
 	c, ok := parseCommentCommand(`comment on column "lake"."analytics"."m".id is $dbt_comment_literal_block$It's the id$dbt_comment_literal_block$;`)
 	if !ok || c.kind != "COLUMN" || c.text == nil || *c.text != "It's the id" ||
@@ -113,6 +118,7 @@ func TestParseCommentDollarQuoted(t *testing.T) {
 }
 
 func TestParseDropViewCascade(t *testing.T) {
+	t.Parallel()
 	c, ok := parseViewCommand(`drop view if exists "lake"."analytics"."stg__dbt_backup" cascade`)
 	if !ok || !c.drop || !c.ifExists || !slices.Equal(c.name, []string{"lake", "analytics", "stg__dbt_backup"}) {
 		t.Errorf("got %+v %v", c, ok)
@@ -120,6 +126,7 @@ func TestParseDropViewCascade(t *testing.T) {
 }
 
 func TestParseLocalTarget(t *testing.T) {
+	t.Parallel()
 	type want struct {
 		kind targetKind
 		name string

@@ -14,6 +14,7 @@ import (
 // client runs again makes the table it says: DuckDB 1.5.6 makes it with no
 // columns from the second run on (see statement.freshForRun).
 func TestPreparedCreateRunsAgain(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, vc.cfg, slog.New(slog.DiscardHandler))

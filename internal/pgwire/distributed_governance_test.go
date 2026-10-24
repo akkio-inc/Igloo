@@ -33,6 +33,7 @@ import (
 // value and no hidden row's contribution may come back, however the
 // statement aggregates them.
 func TestDistributedPolicies(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 3)
 	for _, sql := range policyFixture {
 		mustExec(t, ds.admin, sql)
@@ -129,6 +130,7 @@ func TestDistributedPolicies(t *testing.T) {
 // through grants of their own and of custom roles: what they may read runs
 // on workers, and nothing else does, or runs at all.
 func TestDistributedCustomGrants(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 3)
 	mustExec(t, ds.admin, "INSERT INTO lake.sales.leads SELECT i FROM range(4, 3000) t(i)")
 	mustExec(t, ds.admin, "CREATE ROLE analyst")
@@ -168,6 +170,7 @@ func TestDistributedCustomGrants(t *testing.T) {
 // a part it would distribute runs on one machine, and one that reads one
 // only in the part the coordinator runs itself reads it there.
 func TestDistributedConnections(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	schema := pgFixture(t, pg)
@@ -231,6 +234,7 @@ func TestDistributedConnections(t *testing.T) {
 // tables, views over files that only Igloo's proxy serves, run on one
 // machine, alone and joined to catalog tables.
 func TestDistributedExternalTables(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	proxy := dir + "/proxy/"
 	if err := os.MkdirAll(proxy, 0o755); err != nil {
@@ -265,6 +269,7 @@ func TestDistributedExternalTables(t *testing.T) {
 // memory alike, that statement_timeout ends its tasks on the workers, and
 // that the history records its pool and query tag.
 func TestDistributedWorkload(t *testing.T) {
+	t.Parallel()
 	ctl := workload.NewController(1 << 30)
 	ds := startDistServer(t, 2, func(o *Options) { o.Workload = ctl; o.Pool = "reporting" })
 	ctx := context.Background()
@@ -373,6 +378,7 @@ func (a *arrowRecorder) Records(rdr array.RecordReader) (int64, error) {
 // record batches, as Flight SQL reads statements: the same schema and rows
 // as on one machine.
 func TestDistributedArrow(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	ctx := context.Background()
 	user, err := ds.store.Get(ctx, "igloo")

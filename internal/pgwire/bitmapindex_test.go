@@ -17,6 +17,7 @@ import (
 )
 
 func TestParseIndexCommand(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		query  string
 		ok     bool
@@ -113,6 +114,7 @@ func (it *idTest) sameCounts(index, groups string) {
 // column's lists, with each one's rows (as often as lists hold it) and
 // members.
 func TestBitmapIndexElements(t *testing.T) {
+	t.Parallel()
 	it := newIndexTest(t)
 	ctx := context.Background()
 	srv := it.r.srv
@@ -154,6 +156,7 @@ func TestBitmapIndexElements(t *testing.T) {
 // requests: an index whose bitmaps hold one is emptied, with its table's
 // older snapshots and their files, and built again from its table.
 func TestBitmapIndexErasure(t *testing.T) {
+	t.Parallel()
 	it := newIndexTest(t)
 	ctx := context.Background()
 	srv := it.r.srv
@@ -229,6 +232,7 @@ func TestBitmapIndexErasure(t *testing.T) {
 // which has the bitmap indexes of their domain drop their id: verification
 // finds no index holding it, and the index is built again without it.
 func TestErasureBitmapIndexes(t *testing.T) {
+	t.Parallel()
 	it := newIndexTest(t)
 	ctx := context.Background()
 	srv := it.r.srv
@@ -285,6 +289,7 @@ func TestErasureBitmapIndexes(t *testing.T) {
 // TestBitmapIndexes adds, builds, keeps up to date, lists and drops bitmap
 // indexes, which only admins change and no user reads.
 func TestBitmapIndexes(t *testing.T) {
+	t.Parallel()
 	it := newIndexTest(t)
 	ctx := context.Background()
 	srv := it.r.srv
@@ -431,6 +436,7 @@ func (it *idTest) index(name string) iddomain.BitmapIndex {
 func TestBitmapIndexBuildRetries(t *testing.T) {
 	it := newIndexTest(t)
 	srv := it.r.srv
+	// A package variable: this test does not run in parallel.
 	defer func(d time.Duration) { indexRetry = d }(indexRetry)
 	indexRetry = 10 * time.Millisecond
 	it.exec("ALTER TABLE lake.public.segments ADD BITMAP INDEX broken ON (segment_name) FOR person_id")

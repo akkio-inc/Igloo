@@ -55,6 +55,7 @@ func newE2Test(t *testing.T, opts ...func(*Options)) *idTest {
 // same rows as from the tables, and only where no policy stands in the way
 // and the bitmaps are of the tables' current snapshots.
 func TestBitmapIndexRewrite(t *testing.T) {
+	t.Parallel()
 	it := newE2Test(t)
 	ctx := context.Background()
 	srv := it.r.srv
@@ -180,6 +181,7 @@ func TestBitmapIndexRewrite(t *testing.T) {
 
 // TestIndexRowGroupRows sizes row groups of bitmaps at about 32 MiB.
 func TestIndexRowGroupRows(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct{ bytes, rows int64 }{{0, 1}, {90 << 20, 1}, {1 << 20, 32}, {1 << 10, 32768}, {1, duckDBRowGroupsMax}} {
 		if got := indexRowGroupRows(c.bytes); got != c.rows {
 			t.Errorf("bitmaps of %d bytes: %d rows a row group, want %d", c.bytes, got, c.rows)
@@ -201,6 +203,7 @@ func wantRows(t *testing.T, it *idTest, conn *pgx.Conn) []string {
 // (sessionEnv.Computes), which the session computes as the statement
 // would; no other statement's, and no other table's.
 func TestIndexValues(t *testing.T) {
+	t.Parallel()
 	it := newE2Test(t)
 	ctx := context.Background()
 	srv := it.r.srv

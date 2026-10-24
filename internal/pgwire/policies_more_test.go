@@ -16,6 +16,7 @@ import (
 )
 
 func TestPoliciesApplyThroughViews(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeCacheStatement)
 	mustExec(t, cs.admin, "GRANT acme_team TO rita")
@@ -49,6 +50,7 @@ func TestPoliciesApplyThroughViews(t *testing.T) {
 }
 
 func TestPreparedStatementsFollowPolicyChanges(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	cs := startPolicyServer(t)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeCacheStatement)
@@ -117,6 +119,7 @@ func TestPreparedStatementsFollowPolicyChanges(t *testing.T) {
 }
 
 func TestPoliciesFailClosed(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	walt := cs.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -207,6 +210,7 @@ func TestPoliciesFailClosed(t *testing.T) {
 // TestPoliciesKeepFilesOut reads the warehouse's files directly, which
 // policies cannot see into.
 func TestPoliciesKeepFilesOut(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	landing, warehouse := dir+"/landing/", dir+"/warehouse/"
 	for _, d := range []string{landing, warehouse} {
@@ -254,6 +258,7 @@ func TestPoliciesKeepFilesOut(t *testing.T) {
 }
 
 func TestPolicyStatements(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
 	for _, sql := range []string{
@@ -340,6 +345,7 @@ func TestPolicyStatements(t *testing.T) {
 }
 
 func TestTags(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
@@ -390,6 +396,7 @@ func TestTags(t *testing.T) {
 }
 
 func TestPolicyHistory(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT acme_team TO rita")
@@ -404,6 +411,7 @@ func TestPolicyHistory(t *testing.T) {
 }
 
 func TestPolicyCursorsAndConsole(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	cs := startPolicyServer(t)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)

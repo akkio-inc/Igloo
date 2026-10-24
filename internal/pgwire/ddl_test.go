@@ -7,6 +7,7 @@ import (
 )
 
 func TestScannerName(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		in   string
 		want []string
@@ -31,6 +32,7 @@ func TestScannerName(t *testing.T) {
 }
 
 func TestScannerLiteral(t *testing.T) {
+	t.Parallel()
 	sc := &scanner{s: " 'it''s' ; "}
 	v, ok := sc.literal()
 	if !ok || v == nil || *v != "it's" || !sc.done() {
@@ -42,6 +44,7 @@ func TestScannerLiteral(t *testing.T) {
 }
 
 func TestParseTableReplace(t *testing.T) {
+	t.Parallel()
 	r, ok := parseTableReplace("create or replace table lake.public.\"Scores\" AS SELECT 1 AS n")
 	if !ok {
 		t.Fatal("not recognized")

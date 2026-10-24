@@ -24,6 +24,7 @@ func (localObject) ETag() string { return "" }
 // TestPrefetchStatements reads ahead, as a query runs, the blocks of the
 // files of the tables it reads, and not for a session that turned it off.
 func TestPrefetchStatements(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	ctx := context.Background()
 	cat, err := catalog.Open(ctx, vc.cfg)
@@ -121,6 +122,7 @@ func TestPrefetchStatements(t *testing.T) {
 // coordinator reading the same blocks too would double the requests and
 // evict its own cache.
 func TestPrefetchWhereItRuns(t *testing.T) {
+	t.Parallel()
 	var opens atomic.Int64
 	pf, err := prefetch.New(prefetch.Options{Dir: t.TempDir(), Open: func(_ context.Context, path string) (prefetch.Object, error) {
 		opens.Add(1)
@@ -151,12 +153,15 @@ func TestPrefetchWhereItRuns(t *testing.T) {
 	if n := opens.Load(); n != 0 {
 		t.Errorf("this replica read ahead %d files for a statement workers ran", n)
 	}
-	// One that runs here reads ahead here.
+	// One that runs here reads ahead here, once it has its files listed: on
+	// a busy machine it can end first, so it runs until one does.
 	mustExec(t, conn, "SET distributed_execution = off")
-	_ = rowsOf(t, conn, "SELECT o.amount, count(*) AS n FROM orders AS o, range(3000) GROUP BY o.amount ORDER BY o.amount")
 	deadline := time.Now().Add(10 * time.Second)
 	for opens.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+		_ = rowsOf(t, conn, "SELECT o.amount, count(*) AS n FROM orders AS o, range(3000) GROUP BY o.amount ORDER BY o.amount")
+		for wait := time.Now().Add(time.Second); opens.Load() == 0 && time.Now().Before(wait); {
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 	if opens.Load() == 0 {
 		t.Error("a statement that ran here read nothing ahead, so the test proves nothing")

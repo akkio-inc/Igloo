@@ -68,6 +68,7 @@ func typedResultOf(t *testing.T, db *sql.DB, q string) ([]string, []string) {
 }
 
 func TestPairCounts(t *testing.T) {
+	t.Parallel()
 	db, parse := pairCountDB(t)
 	pair := "count(DISTINCT CASE WHEN (a) IS NOT NULL AND (b) IS NOT NULL THEN (a, b) END)"
 	rewritten := []string{
@@ -168,6 +169,7 @@ func TestPairCounts(t *testing.T) {
 // TestPairCountsThroughSessions runs COUNT(DISTINCT a, b) beside COUNT(DISTINCT a) in both dialects; the counts
 // must be the distinct pairs without a NULL.
 func TestPairCountsThroughSessions(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	mustExec(t, cs.admin, "CREATE TABLE lake.public.visits AS SELECT i AS id, 'site' || (i % 5) AS site, "+
 		"CASE WHEN i % 7 = 0 THEN NULL ELSE i % 40 END AS person, DATE '2026-01-01' + CAST(i % 9 AS INTEGER) AS day FROM range(2000) r(i)")
@@ -198,6 +200,7 @@ func TestPairCountsThroughSessions(t *testing.T) {
 // pair-count rewrite numbered its inner selects by pass, so the two copies
 // of such a report differed and were computed twice, 109 s instead of 20.
 func TestRewritesKeepCopiesShared(t *testing.T) {
+	t.Parallel()
 	db, parse := pairCountDB(t)
 	report := "(WITH b AS (SELECT id, k, a, b, min(id) OVER () AS lo FROM p), " +
 		"g AS (SELECT k AS k, min(lo) AS lo, count(DISTINCT a) AS people, " +

@@ -9,6 +9,7 @@ import (
 )
 
 func TestRequiredRole(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		t     duckdb.StmtType
 		query string
@@ -99,6 +100,7 @@ func TestRequiredRole(t *testing.T) {
 // TestForbidden covers statements no one may run: SQL run from strings,
 // and moving the read cache or changing what it caches.
 func TestForbidden(t *testing.T) {
+	t.Parallel()
 	refused := []string{
 		"SELECT * FROM query('SELECT * FROM duckdb_secrets()')",
 		"FROM query('SELECT 1')",
@@ -185,6 +187,7 @@ func TestForbidden(t *testing.T) {
 }
 
 func TestStartsQuery(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]bool{
 		"SELECT * FROM (PIVOT t ON c USING sum(n))":        true,
 		"  /* c */ -- d\n pivot t ON c":                    true,
@@ -208,6 +211,7 @@ func TestStartsQuery(t *testing.T) {
 }
 
 func TestSessionScoped(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"SET default_order = 'desc'":    "SET SESSION default_order = 'desc'",
 		"  -- c\nset TimeZone TO 'UTC'": "set SESSION TimeZone TO 'UTC'",
@@ -225,6 +229,7 @@ func TestSessionScoped(t *testing.T) {
 }
 
 func TestAuthorizeRanksRoles(t *testing.T) {
+	t.Parallel()
 	insert := duckdb.STATEMENT_TYPE_INSERT
 	if authorize(auth.RoleReader, insert, "INSERT INTO t VALUES (1)") == nil {
 		t.Error("reader may not insert")
@@ -243,6 +248,7 @@ func TestAuthorizeRanksRoles(t *testing.T) {
 }
 
 func TestParseUserCommand(t *testing.T) {
+	t.Parallel()
 	ok := []struct {
 		query string
 		check func(userCommand) bool

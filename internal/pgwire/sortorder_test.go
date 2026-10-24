@@ -14,6 +14,7 @@ import (
 )
 
 func TestParseSortCommand(t *testing.T) {
+	t.Parallel()
 	yes, no := true, false
 	for _, c := range []struct {
 		query string
@@ -58,6 +59,7 @@ func TestParseSortCommand(t *testing.T) {
 // in both dialects, and reads it back from the catalog and the views that
 // show it.
 func TestSortOrders(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	a := vc.replica(t)
 	admin := a.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -193,6 +195,7 @@ func setIcebergOrder(t *testing.T, vc *viewCatalog, schema, name, column string)
 // order refuses writes with an error that says what to do, and takes them
 // once SET SORTED BY makes the order Igloo's key.
 func TestWritesToClusteredTables(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	a := vc.replica(t)
 	admin := a.admin(t, pgx.QueryExecModeSimpleProtocol)

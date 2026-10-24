@@ -105,6 +105,7 @@ func reportParity(t *testing.T, conn *pgx.Conn, name string, spec map[string]any
 // TestReportAPIParity counts as the segments, signals and behaviors reports
 // do, and gets the rows their SQL gets.
 func TestReportAPIParity(t *testing.T) {
+	t.Parallel()
 	cs := startReportServer(t)
 	conn := cs.admin
 
@@ -228,6 +229,7 @@ FROM segments AS s WHERE s.person_id IN (SELECT person_id FROM attributes WHERE 
 // TestReportAPIForms: the versions, the call in a common table expression
 // and under DESCRIBE, and specs the API refuses.
 func TestReportAPIForms(t *testing.T) {
+	t.Parallel()
 	cs := startReportServer(t)
 	conn := cs.admin
 	ctx := context.Background()
@@ -296,6 +298,7 @@ func TestReportAPIForms(t *testing.T) {
 // it stands for, with the same error, and policies apply to it as to that
 // SQL.
 func TestReportAPIGovernance(t *testing.T) {
+	t.Parallel()
 	cs := startReportServer(t)
 	ctx := context.Background()
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
@@ -359,6 +362,7 @@ func TestReportAPIGovernance(t *testing.T) {
 // TestReportAPICheck: the parity check runs the caller's SQL as the caller
 // would: one read-only SELECT, refused what the caller may not read.
 func TestReportAPICheck(t *testing.T) {
+	t.Parallel()
 	cs := startReportServer(t)
 	ctx := context.Background()
 	nina := cs.user(t, "nina", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
@@ -402,6 +406,7 @@ func TestReportAPICheck(t *testing.T) {
 // TestReportAPIThroughIDs counts through ID domains' ids where the tables
 // allow, with the rows the values give, and by value elsewhere.
 func TestReportAPIThroughIDs(t *testing.T) {
+	t.Parallel()
 	// Counting distinct ids in bitmaps on, for statements of any size.
 	it := newIndexTest(t, func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 0 })
 	ctx := context.Background()
@@ -516,6 +521,7 @@ func TestReportAPIThroughIDs(t *testing.T) {
 // the tables give, where the indexes hold all the call counts, and from the
 // tables elsewhere.
 func TestReportAPIFromIndexes(t *testing.T) {
+	t.Parallel()
 	// Counting distinct ids in bitmaps on, as the hybrid's pairs do.
 	it := newE2Test(t, func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 0 })
 	ctx := context.Background()

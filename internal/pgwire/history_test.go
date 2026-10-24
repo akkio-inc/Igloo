@@ -24,6 +24,7 @@ type backgroundStore struct{ *audit.MemoryStore }
 // go to the history once each, with what they read and wrote next to what
 // the session and the workload recorded of them.
 func TestBackgroundAnalysis(t *testing.T) {
+	t.Parallel()
 	store := backgroundStore{audit.NewMemoryStore(1000, 1000)}
 	history := audit.New(store, audit.Options{Pool: "etl"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if history.Immediate() {
@@ -84,6 +85,7 @@ func TestBackgroundAnalysis(t *testing.T) {
 }
 
 func TestRedactQuery(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"CREATE USER ana WITH PASSWORD 'it''s secret' ROLE writer":                                             "CREATE USER ana WITH PASSWORD '***' ROLE writer",
 		"ALTER USER ana PASSWORD 'SCRAM-SHA-256$4096:x$y:z'":                                                   "ALTER USER ana PASSWORD '***'",
@@ -110,6 +112,7 @@ func TestRedactQuery(t *testing.T) {
 }
 
 func TestTagRowsAndKinds(t *testing.T) {
+	t.Parallel()
 	for tag, want := range map[string]int64{"SELECT 3": 3, "INSERT 0 5": 5, "UPDATE 0": 0, "CREATE TABLE": -1, "": -1, "FETCH 2": 2} {
 		if got := tagRows(tag); got != want {
 			t.Errorf("tagRows(%q) = %d, want %d", tag, got, want)
@@ -132,6 +135,7 @@ func TestTagRowsAndKinds(t *testing.T) {
 }
 
 func TestRewriteHistoryRefs(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"SELECT * FROM igloo.query_history":                       `SELECT * FROM "memory"."igloo".query_history`,
 		`SELECT * FROM "igloo"."login_history" h`:                 `SELECT * FROM "memory"."igloo"."login_history" h`,
@@ -161,6 +165,7 @@ func TestRewriteHistoryRefs(t *testing.T) {
 }
 
 func TestParseACLCommand(t *testing.T) {
+	t.Parallel()
 	ok := []struct {
 		query string
 		check func(*aclCommand) bool

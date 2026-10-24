@@ -29,6 +29,7 @@ import (
 // or removed; and a table in the warehouse dropped that no clone reads has
 // its files deleted with it.
 func TestCatalogGuard(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	policies := policy.NewMemoryStore()
 	if err := policies.Update(ctx, func(cat *policy.Catalog) error {
@@ -170,6 +171,7 @@ func (failing) Sharers(context.Context, string) ([]clone.Share, error) {
 // DuckDB's error for a change the catalog proxy refused is reported as
 // permission denied, with the Guard's reason.
 func TestCatalogRefusalIsPermissionDenied(t *testing.T) {
+	t.Parallel()
 	err := &duckdb.Error{Type: duckdb.ErrorTypeIO, Msg: `IO Error: Request to 'http://127.0.0.1:1/x/v1/p/namespaces/crm/tables/people' returned 403: ` +
 		`{"error":{"code":403,"message":"` + catalogproxy.RefusalMark + `permission denied: an erasure request erases from crm.people; ` +
 		`it cannot be dropped until the request is over","type":"ForbiddenException"}}`}

@@ -7,6 +7,7 @@ import (
 )
 
 func TestSnowflakeConnectionStatement(t *testing.T) {
+	t.Parallel()
 	c, ok, err := parseConnectionCommand(`CREATE CONNECTION wh TYPE snowflake WITH (account 'myorg-acct', user 'IGLOO',
 		private_key_secret 'wh-key', warehouse = 'XS_WH', role 'READER', database 'ANALYTICS', schema 'PUBLIC', query_timeout '2m')`)
 	if err != nil || !ok || c.typ != federation.Snowflake || len(c.options) != 8 {

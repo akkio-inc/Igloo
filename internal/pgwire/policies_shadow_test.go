@@ -16,6 +16,7 @@ import (
 // session, the functions Igloo's own analysis calls on the session's
 // connection: they must not change what Igloo finds a statement reads.
 func TestMacrosCannotMisleadTheChecks(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	walt := cs.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -57,6 +58,7 @@ func TestMacrosCannotMisleadTheChecks(t *testing.T) {
 // TestViewsWithEscapedNames reads a protected table through views that
 // name it with escapes, which only DuckDB decodes.
 func TestViewsWithEscapedNames(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	walt := cs.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT acme_team TO walt")
@@ -88,6 +90,7 @@ func TestViewsWithEscapedNames(t *testing.T) {
 // change what policy expressions mean: statements that policies apply to
 // are refused until they are reset, prepared ones too.
 func TestSettingsCannotChangePolicies(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	mustExec(t, cs.admin, `CREATE OR REPLACE MASKING POLICY mask_email AS (val VARCHAR) RETURNS VARCHAR ->
 		CASE WHEN 1 / 2 = 0 THEN val ELSE '***' END`)

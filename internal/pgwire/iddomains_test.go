@@ -17,6 +17,7 @@ import (
 )
 
 func TestParseDomainCommand(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]domainCmd{
 		"CREATE ID DOMAIN People (VARCHAR)": {kind: dcCreate, name: "people", typ: "varchar"},
 		"create id domain if not exists people (uuid) tag pii = 'person_id', src = 'crm' comment = 'who';": {kind: dcCreate, name: "people", typ: "uuid",
@@ -61,6 +62,7 @@ func TestParseDomainCommand(t *testing.T) {
 // and drops it again, through sessions, checking the dictionary, the column
 // that holds ids, the table property and who may do what.
 func TestIDDomains(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	r := vc.replica(t, func(o *Options) { o.IDDomainsOn = true })
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -315,6 +317,7 @@ func TestIDDomains(t *testing.T) {
 // through its own path while every user's statement stays refused, and its
 // verification finds nothing left.
 func TestEraseDictionaryValue(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	r := vc.replica(t, func(o *Options) { o.IDDomainsOn = true })
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)

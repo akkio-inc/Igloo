@@ -61,6 +61,7 @@ func (f *fileHTTP) reset() {
 // prefix-matches the raw path; Igloo refuses the statement first, so the
 // server never sees the climbed-to path.
 func TestFileTraversalNeverReachesTheServer(t *testing.T) {
+	t.Parallel()
 	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if ext == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set; run igloo install-extensions into it")
@@ -116,6 +117,7 @@ func TestFileTraversalNeverReachesTheServer(t *testing.T) {
 // built as the statement runs is refused. The warehouse's own files stay
 // readable, since no policy is in force.
 func TestReaderFileFunctionsWithoutPolicies(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	landing, warehouse := dir+"/landing/", dir+"/warehouse/"
 	for _, d := range []string{landing, warehouse} {

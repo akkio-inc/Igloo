@@ -13,6 +13,7 @@ import (
 // TestShedMemory checks that ShedMemory cancels the statement that has run
 // longest, which fails with SQLSTATE 53200, and leaves the others running.
 func TestShedMemory(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	first, second := ts.admin(t, pgx.QueryExecModeSimpleProtocol), ts.admin(t, pgx.QueryExecModeSimpleProtocol)

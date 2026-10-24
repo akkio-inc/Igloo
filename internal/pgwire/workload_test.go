@@ -31,6 +31,7 @@ func lastQuery(t *testing.T, cs *catalogServer, user, prefix string) audit.Query
 }
 
 func TestQueryTags(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t, func(o *Options) { o.Pool = "acme" })
 	ctx := context.Background()
 	for name, mode := range modes {
@@ -72,6 +73,7 @@ func TestQueryTags(t *testing.T) {
 }
 
 func TestRoleSettings(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	mustExec(t, cs.admin, "CREATE ROLE acme")
@@ -158,6 +160,7 @@ func TestRoleSettings(t *testing.T) {
 // TestProfilingStaysOutOfTheWay checks that the profiler sessions run with
 // changes nothing clients see, and measures only the statement it should.
 func TestProfilingStaysOutOfTheWay(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	var kind, plan string
@@ -185,6 +188,7 @@ func TestProfilingStaysOutOfTheWay(t *testing.T) {
 }
 
 func TestRoleStatementTimeout(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
@@ -199,6 +203,7 @@ func TestRoleStatementTimeout(t *testing.T) {
 }
 
 func TestRoleConcurrencyLimit(t *testing.T) {
+	t.Parallel()
 	ctl := workload.NewController(0)
 	cs := startCatalogServer(t, func(o *Options) { o.Workload = ctl })
 	ctx := context.Background()
@@ -244,6 +249,7 @@ func TestRoleConcurrencyLimit(t *testing.T) {
 }
 
 func TestMemoryReservations(t *testing.T) {
+	t.Parallel()
 	ctl := workload.NewController(1 << 30)
 	cs := startCatalogServer(t, func(o *Options) { o.Workload = ctl })
 	ctx := context.Background()

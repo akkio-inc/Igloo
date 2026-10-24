@@ -57,6 +57,7 @@ func (f fakeExternal) ProviderOf(schema, name string) string {
 }
 
 func TestProtectedBy(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	ctx := context.Background()
 	mustExec(t, cs.admin, `CREATE MASKING POLICY pii_hash AS (val VARCHAR) RETURNS VARCHAR -> sha256(val)`)
@@ -87,6 +88,7 @@ func TestProtectedBy(t *testing.T) {
 // warehouse's and the copies of shared files in it, are not readable
 // directly by users other than admins.
 func TestExternalTablesAndPolicies(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	warehouse, proxy := dir+"/warehouse/", dir+"/proxy/"
 	copies := warehouse + ".igloo/sharing/0193/"
@@ -186,6 +188,7 @@ func TestExternalTablesAndPolicies(t *testing.T) {
 // recipient's bearer token in place of a password or an access token, as
 // SQL clients, Flight SQL and the web console send them: it is neither.
 func TestRecipientTokensAreNotCredentials(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	ctx := context.Background()
 	mustExec(t, cs.admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")

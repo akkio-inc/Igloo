@@ -15,6 +15,7 @@ import (
 // tasks and COPY INTO, which run as their owners: the owner's policies
 // apply, at every run.
 func TestPoliciesInJobs(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	warehouse := dir + "/warehouse/"
 	if err := os.MkdirAll(warehouse+"data", 0o755); err != nil {

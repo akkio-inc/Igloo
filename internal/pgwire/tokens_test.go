@@ -69,6 +69,7 @@ func loginFails(t *testing.T, ts *testServer, user, password, code string) {
 }
 
 func TestServiceAccountTokens(t *testing.T) {
+	t.Parallel()
 	ts, dir, history := startDirectoryServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -187,6 +188,7 @@ func TestServiceAccountTokens(t *testing.T) {
 }
 
 func TestPersonalTokens(t *testing.T) {
+	t.Parallel()
 	ts, _, _ := startDirectoryServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -271,6 +273,7 @@ func TestPersonalTokens(t *testing.T) {
 }
 
 func TestTokensNeedAStore(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	if _, err := admin.Exec(context.Background(), "CREATE TOKEN x"); pgCode(err) != "0A000" {
@@ -279,6 +282,7 @@ func TestTokensNeedAStore(t *testing.T) {
 }
 
 func TestDisabledUsers(t *testing.T) {
+	t.Parallel()
 	ts, _, history := startDirectoryServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -328,6 +332,7 @@ func TestDisabledUsers(t *testing.T) {
 }
 
 func TestDisabledOwnersJobsFail(t *testing.T) {
+	t.Parallel()
 	jobs := tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
 	ts, _, _ := startDirectoryServer(t, func(o *Options) { o.Tasks = jobs })
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -360,6 +365,7 @@ func TestDisabledOwnersJobsFail(t *testing.T) {
 }
 
 func TestLoginLimits(t *testing.T) {
+	t.Parallel()
 	ts, _, history := startDirectoryServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -396,6 +402,7 @@ func TestLoginLimits(t *testing.T) {
 }
 
 func TestLoginLimiter(t *testing.T) {
+	t.Parallel()
 	l := newLoginLimiter()
 	now := time.Now()
 	l.now = func() time.Time { return now }
@@ -479,6 +486,7 @@ func TestLoginLimiter(t *testing.T) {
 }
 
 func TestParseTokenAndGroupCommands(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]tokenCommand{
 		"CREATE TOKEN":                                        {kind: tokenCreate},
 		"create token DBT expires '90d'":                      {kind: tokenCreate, name: "dbt", lifetime: 90 * 24 * time.Hour},
@@ -523,6 +531,7 @@ func TestParseTokenAndGroupCommands(t *testing.T) {
 }
 
 func TestParseLifetime(t *testing.T) {
+	t.Parallel()
 	century := 100 * 365 * 24 * time.Hour
 	for in, want := range map[string]time.Duration{
 		"90d": 90 * 24 * time.Hour, " 2W ": 14 * 24 * time.Hour, "1y": 365 * 24 * time.Hour, "36h": 36 * time.Hour,
@@ -541,6 +550,7 @@ func TestParseLifetime(t *testing.T) {
 }
 
 func TestSSOGroupMappings(t *testing.T) {
+	t.Parallel()
 	ts, dir, _ := startDirectoryServer(t)
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
@@ -608,6 +618,7 @@ func (fakeAccessTokens) VerifyAccessToken(_ context.Context, user auth.User, tok
 }
 
 func TestAccessTokenLogins(t *testing.T) {
+	t.Parallel()
 	ts, dir, history := startDirectoryServer(t, func(o *Options) {
 		o.TLS = selfSignedTLS(t)
 		o.AccessTokens = fakeAccessTokens{}

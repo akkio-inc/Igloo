@@ -16,6 +16,7 @@ import (
 // that a login fails once the server's login wait is up, saying why, rather
 // than waiting with it, and that logins work again once the lock is free.
 func TestLoginWaitsForTheCatalogLockOnlySoLong(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	env.srv.loginWait = 500 * time.Millisecond
 	unlock := env.srv.engine.CatalogLock()

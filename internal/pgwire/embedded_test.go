@@ -121,6 +121,7 @@ func codeOf(err error) string {
 }
 
 func TestAuthenticate(t *testing.T) {
+	t.Parallel()
 	var logs syncBuffer
 	srv, _ := newEmbeddedServer(t, &logs)
 	ctx := context.Background()
@@ -152,6 +153,7 @@ func TestAuthenticate(t *testing.T) {
 }
 
 func TestEmbeddedRun(t *testing.T) {
+	t.Parallel()
 	srv, store := newEmbeddedServer(t, nil)
 	es := openAs(t, srv, store, "igloo")
 	ctx := context.Background()
@@ -190,6 +192,7 @@ func TestEmbeddedRun(t *testing.T) {
 }
 
 func TestEmbeddedAuthorization(t *testing.T) {
+	t.Parallel()
 	srv, store := newEmbeddedServer(t, nil)
 	admin := openAs(t, srv, store, "igloo")
 	ctx := context.Background()
@@ -216,6 +219,7 @@ func TestEmbeddedAuthorization(t *testing.T) {
 }
 
 func TestEmbeddedStopRows(t *testing.T) {
+	t.Parallel()
 	srv, store := newEmbeddedServer(t, nil)
 	es := openAs(t, srv, store, "igloo")
 	ctx := context.Background()
@@ -258,6 +262,7 @@ func TestEmbeddedStopRows(t *testing.T) {
 }
 
 func TestEmbeddedCancel(t *testing.T) {
+	t.Parallel()
 	srv, store := newEmbeddedServer(t, nil)
 	ctx := context.Background()
 
@@ -305,6 +310,7 @@ func TestEmbeddedCancel(t *testing.T) {
 }
 
 func TestEmbeddedSessionsCount(t *testing.T) {
+	t.Parallel()
 	srv, store := newEmbeddedServer(t, nil, func(o *Options) { o.MaxConnections = 1 })
 	user, _ := store.Get(context.Background(), "igloo")
 	es, err := srv.OpenEmbedded(context.Background(), user, "console")

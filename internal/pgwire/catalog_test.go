@@ -92,6 +92,7 @@ func startCatalogFixture(t *testing.T) (*catalogServer, *fixedMetadata) {
 }
 
 func TestCatalogShowsOnlyWhatTheUserMaySee(t *testing.T) {
+	t.Parallel()
 	cs, _ := startCatalogFixture(t)
 	nora := cs.user(t, "nora", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, cs.admin, "GRANT SELECT ON TABLE lake.public.orders TO nora")
@@ -250,6 +251,7 @@ func columnNames(t *testing.T, conn *pgx.Conn, table string) []string {
 // them; that lineage records reads of them; and that their views' files,
 // under the proxy's secret prefix, stay out of the history.
 func TestExternalTablesInTheCatalog(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	proxy := dir + "/proxy/"
 	if err := os.MkdirAll(proxy, 0o755); err != nil {
@@ -302,6 +304,7 @@ func TestExternalTablesInTheCatalog(t *testing.T) {
 }
 
 func TestLineageAndUsage(t *testing.T) {
+	t.Parallel()
 	cs, md := startCatalogFixture(t)
 	mustExec(t, cs.admin, "CREATE SCHEMA lake.sandbox")
 	wally := cs.user(t, "wally", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -381,6 +384,7 @@ func TestLineageAndUsage(t *testing.T) {
 }
 
 func TestOwners(t *testing.T) {
+	t.Parallel()
 	cs, _ := startCatalogFixture(t)
 	wally := cs.user(t, "wally", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
@@ -444,6 +448,7 @@ func TestOwners(t *testing.T) {
 }
 
 func TestLineageOfLoadsAndJobs(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	nora := ls.user(t, "nora", auth.RoleNone, pgx.QueryExecModeSimpleProtocol)
@@ -499,6 +504,7 @@ func (k *sink) Statement(q audit.Query) {
 }
 
 func TestLineageSink(t *testing.T) {
+	t.Parallel()
 	k := &sink{}
 	cs := startCatalogServer(t, func(o *Options) { o.Lineage = k })
 	mustExec(t, cs.admin, "CREATE TABLE lake.public.report AS SELECT * FROM lake.public.orders")
@@ -522,6 +528,7 @@ func TestLineageSink(t *testing.T) {
 }
 
 func TestFileReads(t *testing.T) {
+	t.Parallel()
 	connector, err := duckdb.NewConnector("", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -550,6 +557,7 @@ func sorted(s []string) []string {
 }
 
 func TestLineageOfMergesDeletesAndPipes(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	ls.write(t, "drops/day1.csv", "id,name,amount\n1,one,1.50\n", false)

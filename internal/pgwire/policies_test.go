@@ -177,6 +177,7 @@ func (cs *catalogServer) edited(t *testing.T, name, query string) string {
 var secrets = []string{"ann@", "al@", "gus@", "gia@", "dev-3", "dev-4", "globex.com"}
 
 func TestMaskingAppliesEverywhere(t *testing.T) {
+	t.Parallel()
 	for name, mode := range modes {
 		t.Run(name, func(t *testing.T) {
 			cs := startPolicyServer(t)
@@ -240,6 +241,7 @@ func TestMaskingAppliesEverywhere(t *testing.T) {
 }
 
 func TestRewrittenStatements(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
 	for q, want := range map[string]string{

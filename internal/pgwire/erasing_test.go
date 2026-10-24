@@ -25,6 +25,7 @@ import (
 // admin closes the request, which only an admin may, the table is anyone's
 // again.
 func TestTablesAnErasureErasesFrom(t *testing.T) {
+	t.Parallel()
 	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if ext == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")

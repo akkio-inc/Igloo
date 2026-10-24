@@ -14,6 +14,7 @@ import (
 // snapshot that has every row's, with the counts the values give, and
 // counts the values otherwise.
 func TestIDCounts(t *testing.T) {
+	t.Parallel()
 	it := newIDTest(t)
 	ctx := context.Background()
 	it.exec(

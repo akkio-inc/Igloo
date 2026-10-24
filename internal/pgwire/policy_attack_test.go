@@ -58,6 +58,7 @@ func noLeak(t *testing.T, conn *pgx.Conn, label, sql string) {
 }
 
 func TestPolicyAttacks(t *testing.T) {
+	t.Parallel()
 	const c = "lake.crm.contacts"
 
 	newRita := func(t *testing.T) *pgx.Conn {

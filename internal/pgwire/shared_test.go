@@ -63,6 +63,7 @@ func planCTEs(t *testing.T, db *sql.DB, q string) (ctes []string, scans int) {
 }
 
 func TestSharedSubqueries(t *testing.T) {
+	t.Parallel()
 	db, parse := wholeCountDB(t)
 	vol := sharedVolatile(t, db)
 	if _, err := db.Exec("CREATE MACRO noisy(a) AS a + random()"); err != nil {
@@ -190,6 +191,7 @@ func TestSharedSubqueries(t *testing.T) {
 // subquery as an admin and as users whose reads policies change, in both
 // dialects: the subquery is computed once, and policies apply to it.
 func TestSharedSubqueriesThroughSessions(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	mustExec(t, cs.admin, "GRANT SELECT ON SCHEMA lake.crm TO acme_team")
 	report := "(SELECT client, id, email, CAST(sum(spend) AS INTEGER) AS spend FROM lake.crm.contacts GROUP BY client, id, email)"
@@ -235,6 +237,7 @@ func TestSharedSubqueriesThroughSessions(t *testing.T) {
 // subquery with distributed execution on: workers compute the shared
 // subquery, and the result is the one-machine result.
 func TestSharedSubqueriesDistributed(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	report := "(SELECT amount, count(*) AS n, CAST(sum(id) AS BIGINT) AS s FROM lake.public.orders WHERE id > 10 GROUP BY amount ORDER BY amount)"

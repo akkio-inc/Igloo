@@ -100,6 +100,7 @@ func mustCopy(t *testing.T, conn *pgx.Conn, sql string) ([]copyResult, string) {
 }
 
 func TestCopyIntoLoadsEachFileOnce(t *testing.T) {
+	t.Parallel()
 	for name, mode := range modes {
 		t.Run(name, func(t *testing.T) {
 			ls := startLoadServer(t)
@@ -157,6 +158,7 @@ func TestCopyIntoLoadsEachFileOnce(t *testing.T) {
 }
 
 func TestCopyIntoColumns(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	conn := ls.admin
 
@@ -196,6 +198,7 @@ func TestCopyIntoColumns(t *testing.T) {
 }
 
 func TestCopyIntoFormatsAndCompression(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	conn := ls.admin
 	ls.write(t, "a.tsv", "id\tname\n1\tone\n", false)
@@ -227,6 +230,7 @@ func TestCopyIntoFormatsAndCompression(t *testing.T) {
 }
 
 func TestCopyIntoOnError(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	conn := ls.admin
 	ls.write(t, "drop/1.csv", "id,name,amount\n1,one,1.00\n", false)
@@ -281,6 +285,7 @@ func TestCopyIntoOnError(t *testing.T) {
 }
 
 func TestCopyIntoCreatesTables(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	ls.write(t, "new/a.csv", "day,clicks,campaign\n2026-10-01,10,fall\n2026-10-02,12,fall\n", false)
 	ls.write(t, "new/b.csv", "day,clicks,campaign\n2026-10-03,7,winter\n", false)
@@ -302,6 +307,7 @@ func TestCopyIntoCreatesTables(t *testing.T) {
 }
 
 func TestCopyIntoIsAuthorized(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	ls.write(t, "a.csv", "id,name,amount\n1,one,1.00\n", false)
 	from := "COPY INTO sales FROM '" + ls.dir + "/a.csv'"
@@ -344,6 +350,7 @@ func TestCopyIntoIsAuthorized(t *testing.T) {
 }
 
 func TestInterruptedLoadIsNotRepeated(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	path := ls.write(t, "a.csv", "id,name,amount\n1,one,1.00\n", false)
 	var (
@@ -373,6 +380,7 @@ func TestInterruptedLoadIsNotRepeated(t *testing.T) {
 }
 
 func TestDroppingATableForgetsItsLoads(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	ls.write(t, "a.csv", "id,name,amount\n1,one,1.00\n", false)
 	from := "COPY INTO sales FROM '" + ls.dir + "/a.csv'"
@@ -389,6 +397,7 @@ func TestDroppingATableForgetsItsLoads(t *testing.T) {
 }
 
 func TestParseCopyInto(t *testing.T) {
+	t.Parallel()
 	c, ok, err := parseCopyInto(`copy into lake."My Schema".t (a, "B") from 's3://b/p/' (format csv, header false, delimiter ';',
 		pattern '.*[.]csv', match_by position, on_error skip_file, force, compression gzip, create_table = true);`)
 	if !ok || err != nil {

@@ -12,6 +12,7 @@ import (
 )
 
 func TestRowAccessPolicy(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeCacheStatement)
@@ -73,6 +74,7 @@ func TestRowAccessPolicy(t *testing.T) {
 }
 
 func TestPolicyDML(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"

@@ -16,6 +16,7 @@ import (
 // PEOPLE as people had the listings of every replica that loaded it list
 // people.
 func TestTablesKeepTheirCatalogNames(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	vc.fake.IgnoreNameCase()
 	a := vc.replica(t)

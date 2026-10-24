@@ -7,6 +7,7 @@ import (
 )
 
 func TestParseDepthCall(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		query, table, column, alias string
 	}{
@@ -50,6 +51,7 @@ func joinName(parts []string) string {
 // TestClusteringDepth measures a catalog table's clustering depth by its
 // sort order and by a column, in both dialects, as its files stack.
 func TestClusteringDepth(t *testing.T) {
+	t.Parallel()
 	vc := newViewCatalog(t)
 	a := vc.replica(t)
 	admin := a.admin(t, pgx.QueryExecModeSimpleProtocol)

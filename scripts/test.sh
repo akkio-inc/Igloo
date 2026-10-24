@@ -55,7 +55,14 @@ docker run --rm "${mounts[@]}" -e RB_CACHE=/rb/cache -w /src "$go_image" extensi
 # MySQL first starts without networking to initialize; wait for TCP.
 ready "$name-mysql" docker exec "$name-mysql" mysql -h127.0.0.1 -uroot -ptest -e 'SELECT 1' igloo_test
 
-docker run --rm --network "$name" \
+# IGLOO_TEST_CPUS=2 gives the tests 2 CPUs, as CI's runners have, to see
+# how long they take there.
+cpus=()
+if [ -n "${IGLOO_TEST_CPUS:-}" ]; then
+  cpus=(--cpus "$IGLOO_TEST_CPUS")
+fi
+
+docker run --rm ${cpus[@]+"${cpus[@]}"} --network "$name" \
   -e IGLOO_TEST_DATABASE_URL="postgres://postgres:test@$name-db:5432/postgres" \
   -e IGLOO_TEST_MYSQL_URL="mysql://root:test@$name-mysql:3306/igloo_test" \
   -e IGLOO_TEST_EXTENSION_DIR=/ext \

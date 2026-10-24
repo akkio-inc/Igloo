@@ -135,7 +135,9 @@ func startFedServerWithConfig(t *testing.T, store *federation.MemoryStore, cfg c
 	t.Helper()
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	fed := federation.NewManager(store, federation.Options{}, log)
+	// A database these tests cannot reach is down for good: Attach tries it
+	// once rather than for 30 s.
+	fed := federation.NewManager(store, federation.Options{AttachRetry: time.Millisecond}, log)
 	cfg.DuckDB.ExtensionDir = os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	eng, err := engine.Open(ctx, cfg, log, engine.BeforeLockdown(fed.Attach))
 	if err != nil {
@@ -221,6 +223,7 @@ func pgFixture(t *testing.T, pg remoteDatabase) string {
 }
 
 func TestConnectionStatements(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	store := federation.NewMemoryStore()
@@ -370,6 +373,7 @@ func fmtValue(v any) string {
 // through grants, by every role but admin, and that nothing reaches them
 // otherwise.
 func TestConnectionGrants(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	schema := pgFixture(t, pg)
@@ -604,7 +608,9 @@ func TestConnectionGrants(t *testing.T) {
 // connections: it lists their tables, and lineage names them in full, to
 // whoever may read them, as their grants say, whatever their role;
 // information_schema answers Flight SQL as DuckDB's own does; and a
-// connection that cannot be reached keeps nothing else from working.
+// connection that cannot be reached keeps nothing else from working. It
+// does not run in parallel: its connection whole lists every schema of the
+// test database, which the tests that do run in parallel create and drop.
 func TestConnectionsInTheCatalog(t *testing.T) {
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
@@ -684,6 +690,7 @@ func TestConnectionsInTheCatalog(t *testing.T) {
 // and schemas whose names differ only in case, which PostgreSQL tells
 // apart but Igloo's grants do not, are refused to everyone but admins.
 func TestConnectionNamesDifferingInCase(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	ctx := context.Background()
@@ -750,6 +757,7 @@ func TestConnectionNamesDifferingInCase(t *testing.T) {
 // included, and a masked column that the remote database renames keeps
 // the table from being read until the policy is set again.
 func TestConnectionPolicies(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	ctx := context.Background()
@@ -873,6 +881,7 @@ func TestConnectionPolicies(t *testing.T) {
 // statements that read connections as to any other, and that file
 // functions cannot reach a connection's proxy.
 func TestConnectionWorkloadLimits(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	schema := pgFixture(t, pg)
@@ -959,6 +968,7 @@ func (l *laterAttach) attach() {
 // whatever its user's role: replacing a view it reads so that it reads the
 // connection does not get past the checks.
 func TestConnectionAttachedLater(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	pg := remoteFromEnv(t, "IGLOO_TEST_DATABASE_URL")
 	schema := pgFixture(t, pg)
@@ -1034,6 +1044,7 @@ func userName(t *testing.T, conn *pgx.Conn) string {
 }
 
 func TestMySQLConnectionGrants(t *testing.T) {
+	t.Parallel()
 	needExtensions(t)
 	my := remoteFromEnv(t, "IGLOO_TEST_MYSQL_URL")
 	ctx := context.Background()

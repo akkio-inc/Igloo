@@ -203,6 +203,7 @@ func (env *catalogEnv) checkOnce(t *testing.T, conn *pgx.Conn) {
 // on, by this very commit), DuckDB deleted the commit's data file and
 // Igloo, seeing a conflict, ran the INSERT again.
 func TestCommitAppliedButAnsweredWithErrorLandsOnce(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "CREATE TABLE "+env.table+" (n INTEGER)")
@@ -217,6 +218,7 @@ func TestCommitAppliedButAnsweredWithErrorLandsOnce(t *testing.T) {
 // TestCommitConnectionLostAfterApplyLandsOnce is the same with the answer
 // lost altogether, as when a request times out.
 func TestCommitConnectionLostAfterApplyLandsOnce(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "CREATE TABLE "+env.table+" (n INTEGER)")
@@ -233,6 +235,7 @@ func TestCommitConnectionLostAfterApplyLandsOnce(t *testing.T) {
 // repeat is refused, and the proxy finds the commit's snapshot in the
 // table instead.
 func TestCommitAppliedButAnsweredWithErrorWithoutIdempotencyKeys(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	if env.fake == nil {
 		t.Skip("needs icebergtest's catalog")
@@ -253,6 +256,7 @@ func TestCommitAppliedButAnsweredWithErrorWithoutIdempotencyKeys(t *testing.T) {
 // is unknown (SQLSTATE 40003, not a conflict to retry), and the commit's
 // files stay, since it landed.
 func TestCommitWithUnknownOutcomeKeepsItsFiles(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t, engine.CatalogProxy(func(o *catalogproxy.Options) {
 		o.AttemptTimeout = time.Second
 		o.Patience = 2 * time.Second
@@ -276,6 +280,7 @@ func TestCommitWithUnknownOutcomeKeepsItsFiles(t *testing.T) {
 // explicit transaction, which Igloo does not retry: the client must hear
 // that it committed.
 func TestCommitInTransactionAppliedButAnsweredWithError(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "CREATE TABLE "+env.table+" (n INTEGER)")
@@ -293,6 +298,7 @@ func TestCommitInTransactionAppliedButAnsweredWithError(t *testing.T) {
 // TestCommitRefusedBeforeApplyIsSentAgain checks a commit the catalog
 // answered 503 without applying it: it is sent again, and lands once.
 func TestCommitRefusedBeforeApplyIsSentAgain(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "CREATE TABLE "+env.table+" (n INTEGER)")
@@ -313,6 +319,7 @@ func TestCommitRefusedBeforeApplyIsSentAgain(t *testing.T) {
 // the statement again on the new snapshot, and the refused commit's data
 // files are deleted.
 func TestConflictingCommitIsRetried(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	other := env.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -343,6 +350,7 @@ func TestConflictingCommitIsRetried(t *testing.T) {
 // transaction still reaches the client as one, SQLSTATE 40001, and leaves
 // the table as the other writer made it.
 func TestCommitConflictErrorIsKept(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	other := env.admin(t, pgx.QueryExecModeSimpleProtocol)

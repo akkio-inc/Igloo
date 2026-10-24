@@ -18,6 +18,7 @@ import (
 // statement runs on its own connection, since some are refused by DuckDB
 // itself at prepare and that leaves the session's transaction aborted.
 func TestAlterCannotReadProtectedRows(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	mustExec(t, cs.admin, "CREATE USER walt WITH PASSWORD 'walt-password' ROLE writer")
@@ -159,6 +160,7 @@ func TestAlterCannotReadProtectedRows(t *testing.T) {
 // TestAlterUnsetThenAlter shows the escape hatch the refusals point to:
 // unset the policies, run the DDL, set them again.
 func TestAlterUnsetThenAlter(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	mustExec(t, cs.admin, "ALTER TABLE "+c+" ALTER COLUMN email UNSET MASKING POLICY")

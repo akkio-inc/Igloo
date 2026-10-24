@@ -22,6 +22,7 @@ import (
 )
 
 func TestBitmapEligibility(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		query string
 		want  bool
@@ -44,6 +45,7 @@ func TestBitmapEligibility(t *testing.T) {
 }
 
 func TestTableRows(t *testing.T) {
+	t.Parallel()
 	md := &catalog.Metadata{Tables: []catalog.TableMeta{
 		{Schema: "public", Name: "media", Rows: 36_000_000},
 		{Schema: "public", Name: "AUDIENCE_MEMBERS", Rows: 141_000_000},
@@ -131,6 +133,7 @@ const countPeople = `SELECT g, count(DISTINCT CAST(` + personID + ` AS UINTEGER)
 // the statement once more with bitmaps off, through both protocols, and a
 // statement that fails the same way again is not run a third time.
 func TestBitmapsRerunOnTheHash(t *testing.T) {
+	t.Parallel()
 	ts, logs := bitmapServer(t, func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 0 })
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeExec, pgx.QueryExecModeCacheStatement} {
 		t.Run(mode.String(), func(t *testing.T) {
@@ -190,6 +193,7 @@ func TestBitmapsRerunOnTheHash(t *testing.T) {
 // TestBitmapsNeedRows leaves statements to the hash when Igloo cannot tell
 // that they read enough rows, and when bitmaps are off.
 func TestBitmapsNeedRows(t *testing.T) {
+	t.Parallel()
 	for name, configure := range map[string]func(*Options){
 		"threshold":  func(o *Options) { o.Bitmaps, o.BitmapMinRows = true, 1_000_000 },
 		"off":        func(o *Options) { o.Bitmaps, o.BitmapMinRows = false, 0 },
@@ -209,6 +213,7 @@ func TestBitmapsNeedRows(t *testing.T) {
 // TestBitmapsByTableRows counts in bitmaps the statements that read at least
 // BitmapMinRows rows of the catalog's tables, as its metadata counts them.
 func TestBitmapsByTableRows(t *testing.T) {
+	t.Parallel()
 	if os.Getenv("IGLOO_TEST_RB_EXTENSION") == "" {
 		if os.Getenv("CI") != "" {
 			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
@@ -243,6 +248,7 @@ func TestBitmapsByTableRows(t *testing.T) {
 // the rows are right. A plain statement runs on workers that load no rb
 // extension while this replica has it.
 func TestDistributedBitmapsRerunOnTheHash(t *testing.T) {
+	t.Parallel()
 	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
 	if rb == "" {
 		if os.Getenv("CI") != "" {
@@ -336,6 +342,7 @@ func TestDistributedBitmapsRerunOnTheHash(t *testing.T) {
 // rb extension while this replica does: the rb settings, unchanged, are not
 // sent to them.
 func TestDistributedWithoutRBOnWorkers(t *testing.T) {
+	t.Parallel()
 	ds := startDistServer(t, 2)
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET distributed_execution = on")

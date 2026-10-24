@@ -13,6 +13,7 @@ import (
 // TestRefusedRecheckStaysRefused checks that a prepared statement that its
 // recheck refuses is refused every time after, not run as before.
 func TestRefusedRecheckStaysRefused(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	cs := startPolicyServer(t)
 	mustExec(t, cs.admin, `CREATE MASKING POLICY hash_device AS (val VARCHAR) RETURNS VARCHAR -> 'h' || md5(val)`)

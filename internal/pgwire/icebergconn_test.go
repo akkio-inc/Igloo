@@ -236,6 +236,7 @@ func icebergConnection(t *testing.T, rc *remoteCatalog) federation.Connection {
 }
 
 func TestIcebergConnection(t *testing.T) {
+	t.Parallel()
 	for _, lake := range []bool{false, true} {
 		name := "duckdb lake"
 		if lake {
@@ -486,6 +487,7 @@ func remoteDataFiles(t *testing.T, dir string) []string {
 // TestIcebergConnectionLeavesOutOverlaps checks that a table whose files
 // are in the warehouse is left out, with why, and the replica still starts.
 func TestIcebergConnectionLeavesOutOverlaps(t *testing.T) {
+	t.Parallel()
 	rc := newRemoteCatalog(t)
 	remoteFixture(t, rc)
 	store := federation.NewMemoryStore()
@@ -537,6 +539,7 @@ func TestIcebergConnectionLeavesOutOverlaps(t *testing.T) {
 // remote catalog's table, whose policy reads a table of Igloo's catalog:
 // both scans look alike in DuckDB's plan.
 func TestIcebergConnectionPolicies(t *testing.T) {
+	t.Parallel()
 	for _, lake := range []bool{false, true} {
 		name := "duckdb lake"
 		if lake {

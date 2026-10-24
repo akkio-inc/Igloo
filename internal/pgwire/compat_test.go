@@ -14,6 +14,7 @@ import (
 )
 
 func TestIgnoredCommand(t *testing.T) {
+	t.Parallel()
 	ignored := []string{
 		"SET application_name = 'psql'",
 		"set Application_Name to 'x'",
@@ -43,6 +44,7 @@ func TestIgnoredCommand(t *testing.T) {
 }
 
 func TestCommandTag(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		t     duckdb.StmtType
 		query string
@@ -67,6 +69,7 @@ func TestCommandTag(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		t       duckdb.StmtType
 		columns []string
@@ -86,6 +89,7 @@ func TestClassify(t *testing.T) {
 }
 
 func TestRewriteCatalogQuery(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		// Queries without pg_ names or reg* types are never touched, nor
 		// are literals, quoted identifiers and comments in queries that
@@ -125,6 +129,7 @@ func TestRewriteCatalogQuery(t *testing.T) {
 }
 
 func TestParseStatementTimeout(t *testing.T) {
+	t.Parallel()
 	cases := map[string]time.Duration{
 		"0": 0, "1500": 1500 * time.Millisecond, "'30s'": 30 * time.Second,
 		"'5min'": 5 * time.Minute, "'2h'": 2 * time.Hour, "'250 ms'": 250 * time.Millisecond,
@@ -146,6 +151,7 @@ func TestParseStatementTimeout(t *testing.T) {
 }
 
 func TestRewriteSessionUser(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"SELECT current_user":                     `SELECT 'ana' AS "current_user"`,
 		"select CURRENT_USER, session_user()":     `select 'ana' AS "current_user", 'ana' AS "session_user"`,
@@ -176,6 +182,7 @@ func TestRewriteSessionUser(t *testing.T) {
 }
 
 func TestRewriteSystemSchemaRefs(t *testing.T) {
+	t.Parallel()
 	for q, want := range map[string]string{
 		// dbt's get_columns_in_relation
 		`select column_name from "lake".information_schema.columns where table_name = 'm'`: `select column_name from information_schema.columns where table_name = 'm'`,
@@ -192,6 +199,7 @@ func TestRewriteSystemSchemaRefs(t *testing.T) {
 }
 
 func TestDBTCatalogQueries(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	// dbt-postgres lists relations from pg_tables, pg_views and pg_matviews.
@@ -209,6 +217,7 @@ func TestDBTCatalogQueries(t *testing.T) {
 }
 
 func TestShowPostgresSettings(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	for name, mode := range modes {
 		conn := ts.admin(t, mode)
@@ -247,6 +256,7 @@ func TestShowPostgresSettings(t *testing.T) {
 // TestDriverCatalogQueries runs the catalog lookups of JDBC's key metadata
 // and SQLAlchemy's reflection that need more than the views above.
 func TestDriverCatalogQueries(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	for name, mode := range modes {
@@ -278,6 +288,7 @@ func TestDriverCatalogQueries(t *testing.T) {
 }
 
 func TestToChar(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	var got []string
@@ -295,6 +306,7 @@ func TestToChar(t *testing.T) {
 // TestTimestamptzText checks that timestamps with time zone reach clients
 // in text as PostgreSQL writes them: psycopg2 cannot parse pgx's "Z".
 func TestTimestamptzText(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	res := conn.PgConn().ExecParams(context.Background(),
@@ -313,6 +325,7 @@ func TestTimestamptzText(t *testing.T) {
 // fail with PostgreSQL's SQLSTATE for what is missing, a function, a type,
 // a table or a setting, for admins and for other users.
 func TestMissingNameCodes(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -382,6 +395,7 @@ func TestMissingNameCodes(t *testing.T) {
 // session_user and current_role: PostgreSQL's, which clients read them
 // by, and in the Snowflake dialect Snowflake's.
 func TestSessionUserColumns(t *testing.T) {
+	t.Parallel()
 	ts := startServer(t)
 	ctx := context.Background()
 	admin := ts.admin(t, pgx.QueryExecModeSimpleProtocol)

@@ -49,6 +49,7 @@ func expectHidden(t *testing.T, conn *pgx.Conn, sql string, secrets ...string) {
 // DuckDB's SQL that build rows, lists and structs out of it, or name it
 // in unusual ways.
 func TestPoliciesHoldInEveryForm(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
@@ -106,6 +107,7 @@ func TestPoliciesHoldInEveryForm(t *testing.T) {
 // TestRowPolicyWithoutMasks writes to a table that has only a row access
 // policy: rows it hides stay out of reach of RETURNING and subqueries.
 func TestRowPolicyWithoutMasks(t *testing.T) {
+	t.Parallel()
 	cs := startPolicyServer(t)
 	const c = "lake.crm.contacts"
 	mustExec(t, cs.admin, "ALTER TABLE "+c+" ALTER COLUMN email UNSET MASKING POLICY")

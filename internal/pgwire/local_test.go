@@ -13,6 +13,7 @@ import (
 // own database, where each replica keeps its copies of the catalog's views,
 // by naming it or through the search path.
 func TestLocalDatabaseIsAdminsOnly(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	cs := startCatalogServer(t)
 	// Stand-ins for a view's local copy and an admin's own table.
@@ -96,6 +97,7 @@ func TestLocalDatabaseIsAdminsOnly(t *testing.T) {
 // read only up to the NUL. (The wire protocol ends a query at a NUL; the
 // web console and Flight SQL take SQL as it comes.)
 func TestNulRefused(t *testing.T) {
+	t.Parallel()
 	srv, store := newEmbeddedServer(t, nil)
 	es := openAs(t, srv, store, "igloo")
 	if err := es.Run(context.Background(), "SELECT 1\x00; DROP TABLE x", &collected{}); codeOf(err) != "22021" {

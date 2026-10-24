@@ -13,6 +13,7 @@ import (
 )
 
 func TestIcebergCast(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct{ typ, want string }{
 		{"JSON", `CAST("c" AS VARCHAR)`},
 		{"VARIANT", `CAST(CAST("c" AS JSON) AS VARCHAR)`},
@@ -34,6 +35,7 @@ func TestIcebergCast(t *testing.T) {
 }
 
 func TestIcebergColumnList(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct{ in, want string }{
 		{`CREATE TABLE t (json JSON, v variant NOT NULL, l JSON[], m MAP(VARCHAR, JSON) DEFAULT NULL, s STRUCT(json JSON, n INT), d DECIMAL(10, 2), PRIMARY KEY (json))`,
 			`CREATE TABLE t (json VARCHAR, v VARCHAR NOT NULL, l VARCHAR[], m MAP(VARCHAR, VARCHAR) DEFAULT NULL, s STRUCT(json VARCHAR, n INT), d DECIMAL(10, 2), PRIMARY KEY (json))`},
@@ -61,6 +63,7 @@ func TestIcebergColumnList(t *testing.T) {
 // with column lists, CREATE TABLE ... AS and ALTER TABLE, and checks the
 // Iceberg types they get and the values they hold.
 func TestSemiStructuredIcebergColumns(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	ctx := context.Background()
 	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -135,6 +138,7 @@ func TestSemiStructuredIcebergColumns(t *testing.T) {
 // TestMaskingSemiStructuredColumns masks ARRAY and OBJECT columns, lists
 // and maps of strings, with policies written in either dialect.
 func TestMaskingSemiStructuredColumns(t *testing.T) {
+	t.Parallel()
 	cs := startCatalogServer(t)
 	for _, sql := range []string{
 		"CREATE TABLE lake.public.ev (id INTEGER, tags VARCHAR[], attrs MAP(VARCHAR, VARCHAR))",

@@ -74,6 +74,7 @@ func showJobs(t *testing.T, conn *pgx.Conn, what string) map[string]jobRow {
 }
 
 func TestTasks(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, ls.admin, "CREATE TABLE lake.public.ticks (ts TIMESTAMPTZ)")
@@ -164,6 +165,7 @@ func TestTasks(t *testing.T) {
 }
 
 func TestTasksBelongToTheirOwners(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	wanda := ls.user(t, "wanda", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -217,6 +219,7 @@ func TestTasksBelongToTheirOwners(t *testing.T) {
 }
 
 func TestScheduledTasksRun(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	ls.runScheduler(t)
 	mustExec(t, ls.admin, "CREATE TABLE lake.public.ticks (n INTEGER)")
@@ -239,6 +242,7 @@ func TestScheduledTasksRun(t *testing.T) {
 }
 
 func TestPipes(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	ls.runScheduler(t)
 	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
@@ -300,6 +304,7 @@ func TestPipes(t *testing.T) {
 }
 
 func TestMaterializedViews(t *testing.T) {
+	t.Parallel()
 	ls := startLoadServer(t)
 	walt := ls.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, walt, "CREATE MATERIALIZED VIEW order_totals AS SELECT count(*) AS orders, sum(amount) AS total FROM lake.public.orders")
@@ -381,6 +386,7 @@ func TestMaterializedViews(t *testing.T) {
 }
 
 func TestParseJobCommands(t *testing.T) {
+	t.Parallel()
 	for sql, want := range map[string]jobCommand{
 		"create or replace task if not exists t schedule = '5 minutes' timezone = 'UTC' as select 1;": {
 			verb: "CREATE", kind: tasks.KindTask, name: []string{"t"}, replace: true, ifNotExists: true, body: "select 1"},

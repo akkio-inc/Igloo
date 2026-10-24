@@ -19,6 +19,7 @@ import (
 // write and merge-on-read deletes and overwrites. Equality deletes, whose
 // rows only a scan can count, leave it unknown.
 func TestCatalogRowCounts(t *testing.T) {
+	t.Parallel()
 	env := newCatalogEnv(t)
 	if env.fake == nil {
 		t.Skip("needs icebergtest's catalog")

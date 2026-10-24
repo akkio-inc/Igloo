@@ -129,6 +129,7 @@ func e1Shape(n int) string {
 // TestFactorUnions checks which UNION ALLs are computed as one SELECT, and
 // that the statement returns the same columns, types and rows either way.
 func TestFactorUnions(t *testing.T) {
+	t.Parallel()
 	db, tools := unionDB(t)
 	agg := func(union string) string {
 		return "SELECT k, count(*) AS n, count(x) AS nx, sum(n) AS total FROM (" + union + ") AS u GROUP BY k"
