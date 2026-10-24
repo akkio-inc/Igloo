@@ -374,3 +374,54 @@ func TestIDAssignmentErasedMeanwhile(t *testing.T) {
 	it.exec("INSERT INTO lake.public.people VALUES ('p2', 2)")
 	it.consistent("people", true, "people")
 }
+
+// TestIDAssignmentDeferred leaves the new values of writes smaller than
+// IGLOO_ID_SYNC_MIN_ROWS to a mapping pass shortly after, which several
+// such writes share, and gives a larger write's new values ids before it
+// returns.
+func TestIDAssignmentDeferred(t *testing.T) {
+	saved := idDeferredDelay
+	idDeferredDelay = 3 * time.Second
+	defer func() { idDeferredDelay = saved }()
+	vc := newViewCatalog(t)
+	r := vc.replica(t, func(o *Options) {
+		o.IDDomainsOn = true
+		o.IDSyncMinRows = 100
+		o.Tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
+	})
+	it := &idTest{t: t, vc: vc, r: r, admin: r.admin(t, pgx.QueryExecModeSimpleProtocol)}
+	it.exec(
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		"CREATE TABLE lake.public.people (person_id VARCHAR, n INTEGER)",
+		"CREATE TAG pii",
+		"ALTER TABLE lake.public.people ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"CREATE ID DOMAIN people (VARCHAR) TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.people ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	// Large enough: at once.
+	it.exec("INSERT INTO lake.public.people SELECT 'p' || i, CAST(i AS INTEGER) FROM range(150) r(i)")
+	it.consistent("people", true, "people")
+	// Small writes: values the dictionary has get their ids as they are
+	// written, new ones shortly after.
+	commits := it.vc.fake.Commits()
+	it.exec("INSERT INTO lake.public.people VALUES ('p1', 1), ('small1', 1)",
+		"INSERT INTO lake.public.people VALUES ('small2', 2)")
+	if it.id("people", "small1") != "<nil>" || it.id("people", "small2") != "<nil>" {
+		t.Errorf("small writes' new values got ids at once: %s %s", it.id("people", "small1"), it.id("people", "small2"))
+	}
+	if got := it.one("SELECT count(*) FROM lake.public.people WHERE person_id = 'p1' AND _igloo_id_person_id IS NOT NULL"); got != "2" {
+		t.Errorf("rows of p1 with ids: %s", got)
+	}
+	if n := it.vc.fake.Commits() - commits; n != 2 {
+		t.Errorf("two small writes made %d commits, want their own two only", n)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for it.id("people", "small2") == "<nil>" && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	it.consistent("people", true, "people")
+	// One pass for both: the dictionary's append and the table's fill.
+	if n := it.vc.fake.Commits() - commits; n != 4 {
+		t.Errorf("the small writes and their pass made %d commits, want 4", n)
+	}
+}

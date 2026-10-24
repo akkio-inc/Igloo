@@ -445,7 +445,8 @@ DROP ID DOMAIN people;
   `CREATE [OR REPLACE] TABLE ... AS` of a member table's name) writes the
   ids of the values the dictionary has as it writes the rows, and before
   the statement returns gives the values it lacks new ids and fills them
-  in. Giving new ids takes the domain's lease for as long as one append to
+  in; with `IGLOO_ID_SYNC_MIN_ROWS` set, a smaller write leaves that to a
+  pass about 30 seconds later, which the writes to a table meanwhile share. Giving new ids takes the domain's lease for as long as one append to
   the dictionary takes, so writers of tables in one domain wait for each
   other only for that, and those of different domains never. A writer that
   does not get the lease within 5 seconds, writes inside a transaction

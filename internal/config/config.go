@@ -57,6 +57,11 @@ type Config struct {
 	// default): columns joining domains, filling the columns that hold
 	// their ids, and statements counting through them.
 	IDDomains bool
+	// IDSyncMinRows is how many rows a write to a member table must write
+	// for Igloo to give its new values ids before it returns
+	// (IGLOO_ID_SYNC_MIN_ROWS, 0 by default: every write); smaller writes
+	// leave them to a mapping pass shortly after.
+	IDSyncMinRows int64
 	// BitmapMinRows is how many rows a statement that counts ID domains'
 	// IDs must read for Igloo to count them in roaring bitmaps
 	// (IGLOO_BITMAP_MIN_ROWS, 10 million by default; "off", -1, never).
@@ -524,6 +529,11 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_ID_DOMAINS must be true or false: %w", err)
 	}
 	cfg.IDDomains = idDomains
+	if n, err := strconv.ParseInt(get("IGLOO_ID_SYNC_MIN_ROWS", "0"), 10, 64); err != nil || n < 0 {
+		addErr("IGLOO_ID_SYNC_MIN_ROWS must be a count of rows, not %q", get("IGLOO_ID_SYNC_MIN_ROWS", "0"))
+	} else {
+		cfg.IDSyncMinRows = n
+	}
 
 	bitmapIndexes, err := strconv.ParseBool(get("IGLOO_BITMAP_INDEXES", "false"))
 	if err != nil {

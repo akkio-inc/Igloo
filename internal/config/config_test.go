@@ -489,6 +489,24 @@ func TestExchanges(t *testing.T) {
 	}
 }
 
+func TestIDSyncMinRows(t *testing.T) {
+	for v, want := range map[string]int64{"": 0, "0": 0, "100000": 100_000} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_ID_SYNC_MIN_ROWS"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.IDSyncMinRows != want {
+			t.Errorf("IGLOO_ID_SYNC_MIN_ROWS=%q: %d %v, want %d", v, cfg.IDSyncMinRows, err, want)
+		}
+	}
+	for _, v := range []string{"-1", "some"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_ID_SYNC_MIN_ROWS": v})); err == nil {
+			t.Errorf("IGLOO_ID_SYNC_MIN_ROWS=%s should be refused", v)
+		}
+	}
+}
+
 func TestBitmapMinRows(t *testing.T) {
 	for v, want := range map[string]int64{"": 10_000_000, "0": 0, "250000000": 250_000_000, "off": -1, "OFF": -1} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

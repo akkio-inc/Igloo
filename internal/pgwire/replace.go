@@ -246,7 +246,13 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 		dropStaging()
 		return 0, true, err
 	}
-	s.fillIDs(ctx, sess, ids)
+	if ids != nil && s.idSyncMinRows > 0 && rows < s.idSyncMinRows && s.idDomainsOn {
+		// A small table: mapped shortly after, under its own name once it
+		// has it.
+		defer s.deferIDs(c.target.Schema, c.target.Table)
+	} else {
+		s.fillIDs(ctx, sess, ids, -1)
+	}
 
 	// From here on, finish even if the client cancels: stopping between the
 	// drop and the rename would leave the table missing.
@@ -297,13 +303,16 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		// It exists: run it as written, under the lock it would have held.
 		defer s.holdCatalog(sess)()
 	}
+	written := int64(-1)
 	err := runWithCommitRetry(ctx, sess, st, func() error {
 		if err := st.freshForRun(ctx, sess.conn); err != nil {
 			return err
 		}
 		return sess.profiled(ctx, st, func() error {
 			// An INSERT into a member table writes the ids it can.
-			if done, err := s.runWithIDs(ctx, sess, st, args, w); done {
+			done, n, err := s.runWithIDs(ctx, sess, st, args, w)
+			if done {
+				written = n
 				return err
 			}
 			return st.run(ctx, args, w)
@@ -311,7 +320,7 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	})
 	if err == nil && st.ids != nil {
 		// And then those of the values that had none.
-		s.fillIDs(ctx, sess, st.ids)
+		s.fillIDs(ctx, sess, st.ids, written)
 	}
 	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
 		return w.Complete(commandTag(st.stmtType, st.query, 0))

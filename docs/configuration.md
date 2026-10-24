@@ -217,6 +217,7 @@ files on its own; see [table maintenance](operations.md#table-maintenance).
 |---|---|---|
 | `IGLOO_MAINTENANCE` | `true` | Run table maintenance. Turn it off only if another tool maintains the tables. |
 | `IGLOO_ID_DOMAINS` | `false` | Let columns join [ID domains](sql.md#id-domains), which give identifiers dense integer ids. |
+| `IGLOO_ID_SYNC_MIN_ROWS` | `0` | Rows a write to a member table of an [ID domain](sql.md#id-domains) must write for Igloo to give its new values ids before it returns; smaller writes leave them to a mapping pass about 30 seconds later, which the writes to a table meanwhile share. `0`: every write. |
 | `IGLOO_BITMAP_INDEXES` | `false` | Let tables have [bitmap indexes](sql.md#bitmap-indexes) of ID domains' member columns, which Igloo builds and keeps up to date. Needs `IGLOO_ID_DOMAINS=true`. |
 | `IGLOO_BITMAP_MIN_ROWS` | `10000000` | Rows a statement counting ID domains' ids must read, as the catalog's metadata counts its tables' rows, for Igloo to count them in roaring bitmaps rather than DuckDB's hash; `0` counts every such statement in bitmaps, `off` none. See [ID domains](sql.md#id-domains). |
 | `IGLOO_SNAPSHOT_RETENTION` | `7d` | How long old snapshots are kept, and so how far back time travel reaches, e.g. `1d` or `36h`. A table's `history.expire.max-snapshot-age-ms` property overrides it. |

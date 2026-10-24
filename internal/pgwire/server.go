@@ -149,6 +149,10 @@ type Options struct {
 	IDDomains iddomain.Store
 	// IDDomainsOn is IGLOO_ID_DOMAINS: columns may join ID domains.
 	IDDomainsOn bool
+	// IDSyncMinRows is IGLOO_ID_SYNC_MIN_ROWS: writes of fewer rows leave
+	// their new values' ids to a mapping pass shortly after (see
+	// idassign.go); 0 means none do.
+	IDSyncMinRows int64
 	// Bitmaps counts the distinct integer IDs of ID domains in roaring
 	// bitmaps (the rb extension, which the engine must have loaded) in
 	// statements that read at least BitmapMinRows rows; 0 means every such
@@ -288,6 +292,10 @@ type Server struct {
 	idHolder string
 	idSeq    atomic.Uint64
 	idMapped idMapped
+	// idSyncMinRows and idDeferred are the writes that leave their ids to
+	// a mapping pass shortly after, and those passes (see idassign.go).
+	idSyncMinRows int64
+	idDeferred    idDeferral
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()
@@ -478,6 +486,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		policies = policy.NewMemoryStore()
 	}
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
+	s.idSyncMinRows = opts.IDSyncMinRows
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	if s.idDomains == nil {
@@ -556,6 +565,7 @@ func (s *Server) Serve(l net.Listener) error {
 // until ctx is done.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.wire.Shutdown(ctx)
+	s.idDeferred.stop()
 	if s.analyzer != nil {
 		s.analyzer.close(ctx)
 	}

@@ -302,21 +302,29 @@ func (s *Server) execWithIDs(ctx context.Context, sess *session, st *statement, 
 	return n, true, err
 }
 
-// runWithIDs is execWithIDs for a client's statement, which completes it.
-func (s *Server) runWithIDs(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) (bool, error) {
+// runWithIDs is execWithIDs for a client's statement, which completes it,
+// and returns the rows it wrote.
+func (s *Server) runWithIDs(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) (bool, int64, error) {
 	n, done, err := s.execWithIDs(ctx, sess, st, args)
 	if !done || err != nil {
-		return done, err
+		return done, n, err
 	}
-	return true, w.Complete(commandTag(st.stmtType, st.query, n))
+	return true, n, w.Complete(commandTag(st.stmtType, st.query, n))
 }
 
 // fillIDs gives ids to the values of w's table's member columns that have
-// none, once the write committed, outside a transaction block (see the
-// top of this file). It reports what it could not do in the log only: the
-// write itself succeeded, and maintenance fills what is left.
-func (s *Server) fillIDs(ctx context.Context, sess *session, w *idWrite) {
+// none, once the write of rows rows (-1 when not known) committed, outside a
+// transaction block (see the top of this file). It reports what it could not
+// do in the log only: the write itself succeeded, and maintenance fills what
+// is left. A write of fewer than IGLOO_ID_SYNC_MIN_ROWS rows leaves them to a
+// mapping pass shortly after (see deferIDs), as a write in a transaction
+// block leaves them to maintenance.
+func (s *Server) fillIDs(ctx context.Context, sess *session, w *idWrite, rows int64) {
 	if w == nil || !s.idDomainsOn || sess.inTx {
+		return
+	}
+	if s.idSyncMinRows > 0 && rows >= 0 && rows < s.idSyncMinRows {
+		s.deferIDs(w.schema, w.table)
 		return
 	}
 	for _, m := range w.members {
@@ -599,6 +607,92 @@ func newIDHolder() string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return host + "/" + strconv.Itoa(os.Getpid()) + "/" + hex.EncodeToString(b[:])
+}
+
+// idDeferredDelay is how soon after a write that left its new values' ids
+// to it a mapping pass of its table runs; the writes to the table meanwhile
+// wait for the same pass. Tests shorten it.
+var idDeferredDelay = 30 * time.Second
+
+// idDeferral holds the mapping passes due, by table.
+type idDeferral struct {
+	mu      sync.Mutex
+	pending map[string]*time.Timer
+	stopped bool
+}
+
+// stop cancels the passes not yet begun, as the server stops; maintenance
+// maps those tables later.
+func (d *idDeferral) stop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stopped = true
+	for k, t := range d.pending {
+		t.Stop()
+		delete(d.pending, k)
+	}
+}
+
+// deferIDs has a pass map schema.table in idDeferredDelay, unless one is
+// due already: small writes, each of which would pay for a search of the
+// dictionary and two commits of their own, share one.
+func (s *Server) deferIDs(schema, table string) {
+	d := &s.idDeferred
+	key := strings.ToLower(schema + "." + table)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopped || d.pending[key] != nil {
+		return
+	}
+	if d.pending == nil {
+		d.pending = map[string]*time.Timer{}
+	}
+	d.pending[key] = time.AfterFunc(idDeferredDelay, func() {
+		d.mu.Lock()
+		delete(d.pending, key)
+		d.mu.Unlock()
+		s.mapDeferred(schema, table)
+	})
+}
+
+// mapDeferred maps the member columns schema.table has now, on a
+// connection of its own, and tries again later if another writer holds a
+// domain's lease.
+func (s *Server) mapDeferred(schema, table string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	snap := s.memberSnapshot(ctx)
+	if snap == nil {
+		return
+	}
+	members := idMembers(snap, schema, table)
+	if len(members) == 0 {
+		return
+	}
+	conn, err := s.engine.Connect(ctx)
+	if err != nil {
+		s.log.Warn("could not connect to map a table's ids; maintenance will", "table", schema+"."+table, "err", err)
+		return
+	}
+	defer conn.Close() //nolint:errcheck
+	conn.SetBindHold(s.engine.CatalogShare)
+	busy := false
+	for _, m := range members {
+		if err := s.ensureIDColumn(ctx, schema, table, m); err != nil {
+			s.log.Warn("could not add the column for a member column's ids", "column", m.String(), "err", err)
+			continue
+		}
+		_, _, err := s.mapColumn(ctx, conn, schema, table, m, true)
+		switch {
+		case errors.Is(err, iddomain.ErrBusy):
+			busy = true
+		case err != nil:
+			s.log.Warn("could not map a member column's ids; maintenance will", "column", m.String(), "err", err)
+		}
+	}
+	if busy {
+		s.deferIDs(schema, table)
+	}
 }
 
 // idMapped remembers, by member column, the table snapshot maintenance

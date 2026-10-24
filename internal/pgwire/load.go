@@ -451,7 +451,11 @@ func (s *Server) copyInto(ctx context.Context, sess *session, user auth.User, c 
 		loadErr = s.loadFiles(ctx, sess, user, todo, onError)
 		if loadErr == nil {
 			// Then the ids of the values that had none, in a member table.
-			s.fillIDs(ctx, sess, s.loadIDs(ctx, target))
+			var rows int64
+			for _, f := range todo {
+				rows += f.Rows
+			}
+			s.fillIDs(ctx, sess, s.loadIDs(ctx, target), rows)
 		}
 	}
 	finish, unloaded := finished(todo, loadErr)

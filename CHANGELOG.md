@@ -101,8 +101,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and a `MERGE ... UPDATE BY NAME` into a member table is refused. Igloo
   fills the ids: `INSERT`, `COPY INTO` and `CREATE TABLE ... AS` write
   those the dictionary has and give new values theirs before they return,
-  under a per-domain lease held only for the dictionary's append, and
-  maintenance fills what other writes left `NULL`. A query's
+  under a per-domain lease held only for the dictionary's append (writes
+  of fewer rows than `IGLOO_ID_SYNC_MIN_ROWS`, `0` by default, leave that to
+  a pass about 30 seconds later that they share), and maintenance fills what
+  other writes left `NULL`. A query's
   `count(DISTINCT t.c)` of a member column counts its ids instead, at a
   snapshot of the table that has every row's, with the same result, when
   no policy applies to the table and nothing in the query could show the
