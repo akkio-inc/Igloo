@@ -191,8 +191,8 @@ func TestBitmapIndexes(t *testing.T) {
 		t.Errorf("SHOW BITMAP INDEXES: %q", got)
 	}
 	for _, c := range []*pgx.Conn{it.admin, rita} {
-		if got := texts(t, c, "SELECT count(*) FROM lake.igloo_bitmaps.seg_day"); len(got) != 1 || got[0] != "0" {
-			t.Errorf("bitmaps a user reads: %q", got)
+		if _, err := c.Exec(ctx, "SELECT count(*) FROM lake.igloo_bitmaps.seg_day"); pgCode(err) != "42501" {
+			t.Errorf("a user's read of the bitmaps: %v", err)
 		}
 	}
 	for _, q := range []string{

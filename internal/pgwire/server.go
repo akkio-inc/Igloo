@@ -307,9 +307,11 @@ type Server struct {
 	// maintenance in the background (see bitmapbuild.go).
 	bitmapIndexesOn bool
 	indexBuilds     indexBuilds
-	settings        auth.SettingStore
-	workload        *workload.Controller
-	pool            string
+	// indexRewrites counts the SELECTs answered from bitmap indexes.
+	indexRewrites atomic.Int64
+	settings      auth.SettingStore
+	workload      *workload.Controller
+	pool          string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -1357,7 +1359,12 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			// catalog, which holds nothing, and preparing again takes the
 			// lock it needs.
 			bitmaps := st.bitmaps
-			if err = s.refreshIDCounts(ctx, sess, st); err == nil && st.bitmaps != bitmaps {
+			if err = s.refreshIDCounts(ctx, sess, st); err == nil {
+				// And one answered from bitmap indexes, their tables'
+				// current snapshots, or the tables (see bitmaprewrite.go).
+				err = s.refreshIndexes(ctx, sess, st)
+			}
+			if err == nil && st.bitmaps != bitmaps {
 				if sess.bitmapsRestore != nil {
 					sess.bitmapsRestore()
 				}
@@ -1736,8 +1743,12 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if err := forbidden(query); err != nil {
 		return fail(err)
 	}
-	// The columns that hold ID domains' ids are Igloo's (see iddomains.go).
+	// The columns that hold ID domains' ids are Igloo's (see iddomains.go),
+	// and so are bitmap indexes' tables (see bitmaprewrite.go).
 	if err := hiddenReferences(text); err != nil {
+		return fail(err)
+	}
+	if err := indexReferences(text); err != nil {
 		return fail(err)
 	}
 
@@ -1818,6 +1829,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// computed once (see shared.go). If DuckDB cannot prepare that, say
 	// because the subquery refers to the query around it, the statement
 	// runs as written.
+	// Counts bitmap indexes answer read them (see bitmaprewrite.go).
+	indexed := query
+	query, indexPins, indexCandidate := s.rewriteIndexes(ctx, sess, user, query, counts)
 	// A statement that counts ID domains' IDs in roaring bitmaps is
 	// prepared with the rb extension's setting on (see bitmaps.go).
 	bitmaps := s.bitmapsFor(ctx, sess, query)
@@ -1890,6 +1904,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		return fail(pgError(s.connectionHint(ctx, err)))
 	}
 	st.bitmaps = bitmaps
+	if indexCandidate && st.stmtType == duckdb.STATEMENT_TYPE_SELECT {
+		st.indexPins, st.indexed, st.text = indexPins, indexed, text
+	}
 	if pivot && st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
 		// multipleStatements let through what it takes for a query.
 		s.log.Error("a PIVOT statement that is not a query was prepared", "user", user.Name, "type", st.stmtType)

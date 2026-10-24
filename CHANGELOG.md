@@ -120,8 +120,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and at each maintenance pass: appends add the appended files' bitmaps,
   compaction and clustering keep them, anything else builds them again, and
   a snapshot whose values are not all mapped to ids waits for mapping. `SHOW
-  BITMAP INDEXES` lists them and the snapshot each is of. Answering counts
-  from them follows.
+  BITMAP INDEXES` lists them and the snapshot each is of. Counts of
+  distinct members by an index's columns, alone or within another index's
+  set (as audience-by-segment reports count), read the bitmaps where the
+  bitmaps are current and no policy applies (see
+  [Bitmap indexes](docs/sql.md#bitmap-indexes)).
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

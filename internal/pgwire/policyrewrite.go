@@ -537,6 +537,12 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 	at := *ref
 	at.loc = loc
 	switch {
+	case view == nil && strings.EqualFold(o.db, rw.r.catalog) && strings.EqualFold(o.schema, iddomain.IndexSchema):
+		// A bitmap index's table, which only Igloo's own text names (no
+		// user's statement may: see indexReferences), where it answers a
+		// count from it (see bitmaprewrite.go). In a view's body it stays
+		// guarded.
+		return nil, nil
 	case o.external:
 		// Igloo's own view of an external table (Delta Sharing), over
 		// files only its proxy serves; policies cannot be attached to

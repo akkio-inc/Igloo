@@ -48,6 +48,11 @@ type statement struct {
 	// bitmaps says it counts distinct IDs in roaring bitmaps, prepared and
 	// run with rb_count_distinct = 'always' (see bitmaps.go).
 	bitmaps bool
+	// indexPins are the tables it answers counts of from bitmap indexes,
+	// at the snapshots it reads, and indexed the statement before that
+	// (see bitmaprewrite.go).
+	indexPins []indexPin
+	indexed   string
 	// original is the statement before policies rewrote it, when they did
 	// (see protect.go); guard records how they applied.
 	original string

@@ -1957,8 +1957,12 @@ func (s *Server) recheck(ctx context.Context, sess *session, st *statement) erro
 	return s.recheckGrants(ctx, sess, st, changed)
 }
 
-// sourceText is the statement as the client sent it, before policies.
+// sourceText is the statement as the client sent it, before policies and
+// bitmap indexes.
 func (st *statement) sourceText() string {
+	if st.indexed != "" {
+		return st.indexed
+	}
 	if st.original != "" {
 		return st.original
 	}

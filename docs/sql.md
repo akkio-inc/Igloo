@@ -528,6 +528,23 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   A snapshot whose member values do not all have ids yet gets no bitmaps
   until mapping fills them in. `SHOW BITMAP INDEXES` says which snapshot an
   index's bitmaps are of, and whether that is the table's current one.
+- A count of distinct members that indexes hold reads their bitmaps
+  instead of the table: `SELECT g, count(DISTINCT t.c) AS n FROM tbl AS t
+  [WHERE ...] [GROUP BY g]`, where the keys and the filter use only the
+  columns of an index of `tbl` for `c`, and the same count of the members
+  that are also in another table's set, `... JOIN a ON a.x = t.c`, with `a`
+  a table, or a CTE or subquery `SELECT [DISTINCT] x FROM tbl2 [WHERE ...]`
+  filtered by the columns of an index of `tbl2` for `x`, a member of the
+  same domain. Tables may be read through views that select their columns
+  unrenamed. Each select item with such a count needs a name (`AS n`).
+- Igloo reads bitmaps only when they are of the table's current snapshot,
+  when no row access policy, clean room or masking policy (direct or through
+  a tag) applies to the table or view, the member column or the columns the
+  count groups and filters by, for whoever runs the statement, and when the
+  user's role reads the whole warehouse (users with the role `none` read the
+  tables). Other references to those tables in the statement read the same
+  snapshot, and a prepared statement whose tables changed reads the tables
+  until the bitmaps catch up. No statement may name `igloo_bitmaps`.
 
 
 
