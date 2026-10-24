@@ -100,15 +100,14 @@ jobs:
         if: matrix.part == 'packages'
         run: |
           mapfile -t packages < <(go list -tags duckdb_arrow ./... | grep -v '/internal/pgwire$')
-          go test -tags duckdb_arrow -timeout 20m "${packages[@]}"
+          go test -tags duckdb_arrow "${packages[@]}"
 
       - name: Test internal/pgwire
         if: matrix.part != 'packages'
         # pgwire 1/2 runs every other test, in the order -list gives them,
         # and pgwire 2/2 all the rest. -parallel 4, twice these runners' 2
         # cores: many of the tests spend their time waiting on timers or on
-        # other sessions. -timeout 20m: before its tests ran in parallel, the
-        # package took 8-9 minutes here, near go test's default limit of 10.
+        # other sessions.
         env:
           PART: ${{ matrix.part }}
         run: |
@@ -117,7 +116,7 @@ jobs:
           if [ "$PART" = "pgwire 1/2" ]; then
             select=-run
           fi
-          go test -tags duckdb_arrow -parallel 4 -timeout 20m "$select" "^($half)\$" ./internal/pgwire/
+          go test -tags duckdb_arrow -parallel 4 "$select" "^($half)\$" ./internal/pgwire/
 
   migrate:
     name: Migration report
