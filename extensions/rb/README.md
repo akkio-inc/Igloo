@@ -42,6 +42,15 @@ bitmap, never NULL.
 The scalars return NULL when an argument is NULL, and refuse a BLOB that is
 not a valid bitmap (`rb: invalid bitmap BLOB ...`).
 
+`rb_contains` reads a bitmap that is known when the statement is bound, such
+as a literal or a variable's (`getvariable`), once, at bind. DuckDB hands
+every chunk of rows its own copy of a constant BLOB, and of a scalar
+subquery's, before the function sees it. So testing a billion rows against
+a cohort's bitmap of tens of megabytes copies, and would read, the bitmap
+for each of half a million chunks. A subquery's bitmap is still copied and
+read once per chunk: hand a large one over in a variable (`SET VARIABLE b =
+(SELECT ...)`, then `rb_contains(getvariable('b'), id)`).
+
 ## Settings
 
 - `rb_count_distinct`: `'off'` (the default) or `'always'`. With `'always'`,

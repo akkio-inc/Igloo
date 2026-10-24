@@ -177,6 +177,32 @@ SELECT count(*) FILTER (WHERE rb_contains((SELECT rb_agg(i::UINTEGER) FROM range
 ----
 100000
 
+# a bitmap known when the statement is bound, a variable's or a literal's, is read once for the whole statement
+# (not copied and read for each chunk); one that is NULL gives NULL, and one that is not a bitmap fails at bind
+statement ok
+SET VARIABLE evens = (SELECT rb_agg(i::UINTEGER) FROM range(0, 20000000, 2) r(i))
+
+query III
+SELECT count(*) FILTER (WHERE rb_contains(getvariable('evens'), (j % 20000000)::UINTEGER)),
+       count(*) FILTER (WHERE rb_contains(CAST(getvariable('evens') AS BLOB), j::UINTEGER)),
+       count(*) FILTER (WHERE rb_contains(getvariable('evens'), (j + 1)::UINTEGER) AND rb_contains(getvariable('evens'), j::UINTEGER))
+FROM range(30000000) t(j)
+----
+15000000	10000000	0
+
+query TT
+SELECT rb_contains(getvariable('no_such_variable'), 1::UINTEGER), rb_contains(CAST(NULL AS BLOB), j::UINTEGER) FROM range(1) t(j)
+----
+NULL	NULL
+
+statement error
+SELECT rb_contains(CAST('not a bitmap at all' AS BLOB), j::UINTEGER) FROM range(3) t(j)
+----
+rb: invalid bitmap BLOB
+
+statement ok
+RESET VARIABLE evens
+
 # NULL in, NULL out
 query TTTT
 SELECT rb_cardinality(NULL), rb_and(a, NULL) IS NULL, rb_contains(NULL, 1::UINTEGER), rb_to_list(NULL) FROM s

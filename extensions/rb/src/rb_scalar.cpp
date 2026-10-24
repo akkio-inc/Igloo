@@ -3,9 +3,13 @@
 //===----------------------------------------------------------------------===//
 #include "rb_bitmap.hpp"
 
+#include <memory>
+
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
 namespace rb {
@@ -107,6 +111,52 @@ static void Contains(DataChunk &args, ExpressionState &, Vector &result) {
 	    [&](string_t blob, uint32_t id) { return roaring_bitmap_contains(bms.Get(blob), id); });
 }
 
+//! rb_contains with a constant bitmap: one known when the statement is bound, such as a literal or a variable
+//! (getvariable, which DuckDB binds to the variable's value). It is read once, at bind, and the argument goes:
+//! otherwise every chunk gets its own copy of the BLOB, which DuckDB makes before the function sees it, and a
+//! cohort's bitmap of tens of megabytes copied for each of millions of chunks costs far more than the scan.
+//! A subquery's bitmap is not known at bind; a cross product hands each chunk a copy of it too, which is why
+//! Igloo hands its own statements' bitmaps over in variables (see reportindex.go).
+struct FixedBitmap : public FunctionData {
+	std::shared_ptr<roaring_bitmap_t> bm;
+	std::shared_ptr<string> blob;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<FixedBitmap>();
+		copy->bm = bm;
+		copy->blob = blob;
+		return std::move(copy);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<FixedBitmap>();
+		return blob == other.blob || *blob == *other.blob;
+	}
+};
+
+static void ContainsFixed(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &fixed = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<FixedBitmap>();
+	const roaring_bitmap_t *bm = fixed.bm.get();
+	UnaryExecutor::Execute<uint32_t, bool>(args.data[0], result, args.size(),
+	                                       [&](uint32_t id) { return roaring_bitmap_contains(bm, id); });
+}
+
+static unique_ptr<FunctionData> BindContains(ClientContext &context, ScalarFunction &bound_function,
+                                             vector<unique_ptr<Expression>> &arguments) {
+	if (!arguments[0]->IsFoldable()) {
+		return nullptr;
+	}
+	Value value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+	if (value.IsNull()) {
+		return nullptr; // NULL for every row, as without a constant
+	}
+	auto fixed = make_uniq<FixedBitmap>();
+	fixed->blob = std::make_shared<string>(StringValue::Get(value));
+	fixed->bm = ReadBitmap(string_t(fixed->blob->data(), static_cast<uint32_t>(fixed->blob->size())));
+	Function::EraseArgument(bound_function, arguments, 0);
+	bound_function.SetFunctionCallback(ContainsFixed);
+	return std::move(fixed);
+}
+
 static void ToList(DataChunk &args, ExpressionState &, Vector &result) {
 	const idx_t count = args.size();
 	UnifiedVectorFormat input;
@@ -149,7 +199,7 @@ void RegisterScalars(ExtensionLoader &loader) {
 	loader.RegisterFunction(
 	    ScalarFunction("rb_andnot_cardinality", {blob, blob}, bigint, SetCardinality<SetOp::ANDNOT>));
 	loader.RegisterFunction(
-	    ScalarFunction("rb_contains", {blob, LogicalType::UINTEGER}, LogicalType::BOOLEAN, Contains));
+	    ScalarFunction("rb_contains", {blob, LogicalType::UINTEGER}, LogicalType::BOOLEAN, Contains, BindContains));
 	loader.RegisterFunction(
 	    ScalarFunction("rb_to_list", {blob}, LogicalType::LIST(LogicalType::UINTEGER), ToList));
 }
