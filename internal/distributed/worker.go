@@ -347,6 +347,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 			// Bitmaps over their budget are no shortage of the worker's
 			// memory: the session runs the statement again without them.
 			te.Bitmap = strings.Contains(de.Msg, bitmapBudgetError)
+			te.Data = te.Data && !te.Bitmap
 			// DuckDB out of its memory limit fails the task as the memory
 			// watch would have: the coordinator runs the statement again
 			// over smaller tasks, or fails it, rather than run it whole.
