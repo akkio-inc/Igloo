@@ -1,0 +1,194 @@
+# The rb extension's functions, in sqllogictest form (statement ok, statement
+# error with the expected message after ----, query with its rows after ----,
+# tab-separated). internal/engine's TestRBFunctions runs every *.test file
+# here against Igloo's own DuckDB with the extension loaded.
+
+statement ok
+SET threads = 4
+
+# rb_agg: the set of non-NULL ids, as a bitmap in CRoaring's portable format
+query T
+SELECT hex(rb_agg(x)) FROM (VALUES (1::UINTEGER), (5), (10000), (NULL), (5)) t(x)
+----
+3A300000010000000000020010000000010005001027
+
+query I
+SELECT rb_cardinality(rb_agg(x)) FROM (VALUES (1::UINTEGER), (5), (10000), (NULL), (5)) t(x)
+----
+3
+
+# empty input, or only NULLs, gives an empty bitmap, never NULL
+query IT
+SELECT rb_cardinality(rb_agg(x)), hex(rb_agg(x)) FROM (SELECT 1::UINTEGER AS x WHERE false)
+----
+0	3A30000000000000
+
+query I
+SELECT rb_cardinality(rb_agg(NULL::UINTEGER)) FROM range(3)
+----
+0
+
+# ids are UINTEGER: no BIGINT overload narrows silently, and a cast out of range fails
+statement error
+SELECT rb_agg(x::BIGINT) FROM range(3) t(x)
+----
+No function matches
+
+statement error
+SELECT rb_agg(CAST(-1 AS UINTEGER))
+----
+out of range
+
+query I
+SELECT rb_count_distinct(4294967295::UINTEGER)
+----
+1
+
+# rb_count_distinct agrees with COUNT(DISTINCT), grouped and not, on enough rows for
+# several threads, partial states and flushed buffers
+statement ok
+CREATE TABLE t AS SELECT (hash(i) % 997)::INTEGER AS g, CASE WHEN i % 89 = 0 THEN NULL ELSE (hash(i * 7) % 3000000)::UINTEGER END AS id, DATE '2025-01-01' + (hash(i * 13) % 91)::INTEGER AS d, (hash(i * 17) % 7)::SMALLINT AS k FROM range(3000000) r(i)
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT id) AS a, rb_count_distinct(id) AS b FROM t GROUP BY g) WHERE a <> b
+----
+0
+
+query I
+SELECT count(DISTINCT id) = rb_count_distinct(id) FROM t
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT g, rb_count_distinct(id) AS a, rb_cardinality(rb_agg(id)) AS b FROM t GROUP BY g) WHERE a <> b
+----
+0
+
+query I
+SELECT rb_count_distinct(id) FROM t WHERE g < 0
+----
+0
+
+# pair counts: COUNT(DISTINCT id, k) skipping rows with a NULL, in either argument order
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT CASE WHEN id IS NOT NULL AND d IS NOT NULL THEN (id, d) END) AS a, rb_count_distinct(id, d) AS b, rb_count_distinct(d, id) AS c FROM t GROUP BY g) WHERE a <> b OR a <> c
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT CASE WHEN id IS NOT NULL THEN (id, k) END) AS a, rb_count_distinct(id, k) AS b, rb_count_distinct(k, id) AS c FROM t GROUP BY g) WHERE a <> b OR a <> c
+----
+0
+
+query I
+SELECT rb_count_distinct(x::UINTEGER, y::UINTEGER) FROM (VALUES (1, 1), (1, 1), (1, 2), (2, 1), (NULL, 1), (3, NULL)) v(x, y)
+----
+3
+
+# rb_or_agg: the union of non-NULL bitmaps
+query I
+SELECT rb_cardinality(rb_or_agg(b)) = (SELECT count(DISTINCT id) FROM t WHERE g < 500) FROM (SELECT g, rb_agg(id) AS b FROM t WHERE g < 500 GROUP BY g)
+----
+true
+
+query I
+SELECT rb_cardinality(rb_or_agg(b)) FROM (VALUES (NULL::BLOB)) v(b)
+----
+0
+
+# set operations and their cardinalities
+statement ok
+CREATE TABLE s AS SELECT (SELECT rb_agg(x::UINTEGER) FROM range(0, 100) r(x)) AS a, (SELECT rb_agg(x::UINTEGER) FROM range(50, 200) r(x)) AS b
+
+query IIIIII
+SELECT rb_cardinality(rb_and(a, b)), rb_cardinality(rb_or(a, b)), rb_cardinality(rb_andnot(a, b)), rb_and_cardinality(a, b), rb_or_cardinality(a, b), rb_andnot_cardinality(a, b) FROM s
+----
+50	200	50	50	200	50
+
+query TT
+SELECT rb_contains(a, 99::UINTEGER), rb_contains(a, 100::UINTEGER) FROM s
+----
+true	false
+
+query T
+SELECT rb_to_list(rb_and(a, rb_agg_small))::VARCHAR FROM s, (SELECT rb_agg(x::UINTEGER) AS rb_agg_small FROM (VALUES (3), (98), (150)) v(x))
+----
+[3, 98]
+
+query T
+SELECT rb_to_list(rb_agg(x))::VARCHAR FROM (SELECT 1::UINTEGER AS x WHERE false)
+----
+[]
+
+# NULL in, NULL out
+query TTTT
+SELECT rb_cardinality(NULL), rb_and(a, NULL) IS NULL, rb_contains(NULL, 1::UINTEGER), rb_to_list(NULL) FROM s
+----
+NULL	true	NULL	NULL
+
+# a BLOB that is not a bitmap, or one cut short or padded, is refused by name
+statement error
+SELECT rb_cardinality('\x01\x02\x03'::BLOB)
+----
+rb: invalid bitmap BLOB
+
+statement error
+SELECT rb_cardinality(unhex(left(hex(a), 20))) FROM s
+----
+rb: invalid bitmap BLOB
+
+statement error
+SELECT rb_cardinality(a || '\x00'::BLOB) FROM s
+----
+rb: invalid bitmap BLOB
+
+# the setting the choice rule reads
+query T
+SELECT current_setting('rb_count_distinct')
+----
+off
+
+statement ok
+SET rb_count_distinct = 'AUTO'
+
+query T
+SELECT current_setting('rb_count_distinct')
+----
+auto
+
+statement error
+SET rb_count_distinct = 'sometimes'
+----
+rb_count_distinct is 'off', 'auto' or 'always'
+
+statement ok
+RESET rb_count_distinct
+
+# memory: bitmaps count toward DuckDB's memory limit, and a statement whose
+# bitmaps do not fit fails with the error Igloo reruns on the hash path
+statement ok
+SET rb_memory_budget = '4MB'
+
+statement error
+SELECT g, rb_count_distinct((hash(i) % 4294967295)::UINTEGER) FROM range(2000000) r(i), (SELECT i % 4 AS g) GROUP BY g
+----
+rb: bitmap memory budget exceeded
+
+statement ok
+RESET rb_memory_budget
+
+query I
+SELECT rb_count_distinct((hash(i) % 4294967295)::UINTEGER) > 1999000 FROM range(2000000) r(i)
+----
+true
+
+statement ok
+SET memory_limit = '64MB'
+
+statement error
+SELECT g, rb_count_distinct((hash(i) % 4294967295)::UINTEGER) FROM range(8000000) r(i), (SELECT i % 8 AS g) GROUP BY g
+----
+rb: bitmap memory budget exceeded
+
+statement ok
+RESET memory_limit
