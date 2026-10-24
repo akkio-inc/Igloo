@@ -145,9 +145,13 @@ func TestScanFieldIDs(t *testing.T) {
 type scanSource struct {
 	mu    sync.Mutex
 	files map[string][]File
+	loads int
 }
 
 func (s *scanSource) Table(_ context.Context, schema, name string) (*Table, error) {
+	s.mu.Lock()
+	s.loads++
+	s.mu.Unlock()
 	return &Table{Schema: schema, Name: name, Columns: scanTables[name], Snapshot: 7}, nil
 }
 
@@ -196,6 +200,45 @@ func TestScans(t *testing.T) {
 	if _, err := s.Scans(ctx, "SELECT * FROM t", scanEnv{}); !errors.Is(err, context.Canceled) {
 		t.Errorf("scanning with the context done: %v", err)
 	}
+
+	// Resolving loads nothing, and listing the files calls no ScanEnv.
+	env := &onceEnv{}
+	src.loads = 0
+	plan, err := s.Resolve(context.Background(), "SELECT a FROM v", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.loads != 0 {
+		t.Errorf("resolving loaded %d tables", src.loads)
+	}
+	env.done = true
+	scans, err = plan.Files(context.Background())
+	if err != nil || len(scans) != 1 || scans[0].Table != "t" || strings.Join(scans[0].Columns, ",") != "a,c" || !scans[0].Filtered {
+		t.Errorf("files of a resolved plan: %+v %v", scans, err)
+	}
+	if env.late > 0 {
+		t.Errorf("listing files called the ScanEnv %d times", env.late)
+	}
+}
+
+// onceEnv is scanEnv with a view, counting calls once done.
+type onceEnv struct {
+	done bool
+	late int
+}
+
+func (e *onceEnv) Resolve(ctx context.Context, parts []string) (string, string, bool, error) {
+	if e.done {
+		e.late++
+	}
+	return scanEnv{}.Resolve(ctx, parts)
+}
+
+func (e *onceEnv) ViewDefinition(ctx context.Context, parts []string) (*ViewDefinition, bool, error) {
+	if e.done {
+		e.late++
+	}
+	return scanEnv{views: map[string]string{"v": "SELECT * FROM t WHERE c = 1"}}.ViewDefinition(ctx, parts)
 }
 
 // memCatalog commits one table's metadata in memory.

@@ -49,9 +49,9 @@ type ScanEnv interface {
 
 // Scanner lists the catalog tables a statement reads and their data files,
 // before it runs, for prefetching them. It reads the tables' metadata
-// through a Source, which keeps it a few seconds and each snapshot's files
-// for as long as it is current, so a statement over tables read lately
-// costs no catalog round trip.
+// through a Source, which keeps it a few seconds, and snapshots' file
+// lists, which never change: a statement over tables read lately costs no
+// catalog round trip, nor any read of a manifest.
 type Scanner struct {
 	p   *parser
 	src Source
@@ -78,12 +78,44 @@ const maxScanLoads = 8
 // the catalog, and the session's, are read through. What it cannot list
 // is left out: tables read at another snapshot (AT), table functions,
 // tables of other databases, and tables whose metadata or files cannot be
-// loaded or listed.
+// loaded or listed. It is Resolve, then the plan's Files.
 func (s *Scanner) Scans(ctx context.Context, query string, env ScanEnv) ([]Scan, error) {
+	plan, err := s.Resolve(ctx, query, env)
+	if err != nil {
+		return nil, err
+	}
+	return plan.Files(ctx)
+}
+
+// ScanPlan is what a statement reads of each catalog table, the names it
+// writes resolved, before the tables are loaded (see Scanner.Resolve).
+type ScanPlan struct {
+	src Source
+	w   *scanWalk
+}
+
+// Resolve walks query, one SELECT, for the catalog tables it reads and the
+// columns it may read of them, as Scans does. It calls env, and nothing
+// else that may wait: neither the catalog nor object storage. The plan's
+// Files does the rest without env, so that a session may resolve a
+// statement on its connection just before running it there, and list the
+// files beside it.
+func (s *Scanner) Resolve(ctx context.Context, query string, env ScanEnv) (*ScanPlan, error) {
 	w, err := walkScans(ctx, s.p, query, env)
 	if err != nil {
 		return nil, err
 	}
+	w.ctx, w.env = nil, nil
+	return &ScanPlan{src: s.src, w: w}, nil
+}
+
+// Files loads each table's metadata and lists its data files at its
+// current snapshot, as the plan's Scanner's Source has them (see Scans).
+// It may take seconds for a snapshot the Source has not listed before,
+// reading every manifest; then none until the table changes. It calls no
+// ScanEnv, and may be called at once from several goroutines.
+func (p *ScanPlan) Files(ctx context.Context) ([]Scan, error) {
+	w := p.w
 	scans := make([]Scan, len(w.order))
 	ok := make([]bool, len(w.order))
 	g, gctx := errgroup.WithContext(ctx)
@@ -94,11 +126,11 @@ func (s *Scanner) Scans(ctx context.Context, query string, env ScanEnv) ([]Scan,
 			if err := gctx.Err(); err != nil {
 				return err
 			}
-			t, err := s.src.Table(gctx, u.schema, u.name)
+			t, err := p.src.Table(gctx, u.schema, u.name)
 			if err != nil || t == nil {
 				return gctx.Err()
 			}
-			files, err := s.src.Files(gctx, t)
+			files, err := p.src.Files(gctx, t)
 			if err != nil {
 				return gctx.Err()
 			}
@@ -142,7 +174,8 @@ func walkScans(ctx context.Context, p *parser, query string, env ScanEnv) (*scan
 	return w, nil
 }
 
-// scanWalk walks a statement for Scanner.Scans.
+// scanWalk walks a statement for Scanner.Scans. Once walked, it is only
+// read: ctx and env are those of the walk.
 type scanWalk struct {
 	ctx context.Context
 	p   *parser
