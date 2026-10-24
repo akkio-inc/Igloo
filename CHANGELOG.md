@@ -1458,6 +1458,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Compaction no longer refuses a table whose position deletes alone exceed
+  `IGLOO_MAINTENANCE_MEMORY`, as after an `UPDATE` of every row of a large
+  table: iceberg-go loads every delete file of the files it reads, whole,
+  so 141 million deleted positions took more than the default budget and
+  the table kept its hundreds of files. Where position deletes are what
+  does not fit, the rewrite applies them itself, a file at a time, reading
+  only the row groups of the delete files that name the file it reads.
 - A statement in Snowflake's dialect with a `FLATTEN` of an earlier
   `FLATTEN`'s elements and a `WHERE` on the table they flatten, such as
   `FROM t, LATERAL FLATTEN(t.a) f, LATERAL FLATTEN(f.value) g WHERE t.id >

@@ -349,6 +349,14 @@ func Rewrite(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.F
 	// The reader holds a row group's compressed column chunks, and two of
 	// them where a batch spans two row groups.
 	lay, err := Plan(budget, rowBytes, 2*rowGroup+deleteBytes(tasks), maxRowGroup)
+	read, perFile := tasks, false
+	if errors.Is(err, ErrOverBudget) && positionsOnly(tasks) {
+		// The deletes are what does not fit: applied a file at a time,
+		// they may (see positions.go).
+		if lay, err = Plan(budget, rowBytes, 2*rowGroup+fileDeleteBytes(tasks), maxRowGroup); err == nil {
+			read, perFile = withoutDeletes(tasks), true
+		}
+	}
 	if err != nil {
 		return nil, Layout{}, err
 	}
@@ -375,10 +383,13 @@ func Rewrite(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.F
 	// One reader, so batches arrive in the files' order without being held
 	// back to reorder them, and are read only as fast as they are written.
 	var records iter.Seq2[arrow.RecordBatch, error] = func(yield func(arrow.RecordBatch, error) bool) {
-		_, recs, err := view.Scan(table.WitMaxConcurrency(1)).ReadTasks(ctx, tasks)
+		_, recs, err := view.Scan(table.WitMaxConcurrency(1)).ReadTasks(ctx, read)
 		if err != nil {
 			yield(nil, err)
 			return
+		}
+		if perFile {
+			recs = applyPositions(ctx, fs, tasks, recs)
 		}
 		for rec, err := range recs {
 			if err == nil && transform != nil {

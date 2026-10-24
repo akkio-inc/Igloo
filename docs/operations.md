@@ -961,9 +961,15 @@ much memory it has. Rows wide enough to need it, such as those of a table of
 thousands of columns, get row groups smaller than DuckDB's 122,880 rows, down
 to 8,192.
 
+Deletes take memory too while they are applied. Where position deletes are
+what does not fit, as after an `UPDATE` of every row of a large table,
+whose delete files name every row, compaction applies them a file at a
+time: it holds one file's deleted positions, read from the row groups of
+the delete files that name that file, rather than all of them at once.
+
 A table that cannot be compacted within the budget, because a row group of
-8,192 of its rows (or one of its files' compressed row groups) does not fit,
-is left as it is: maintenance reports it as a failure and tries again once
+8,192 of its rows (or one of its files' compressed row groups, or one
+file's deletes) does not fit, is left as it is: maintenance reports it as a failure and tries again once
 the table has changed, or after a restart. Raise `IGLOO_MAINTENANCE_MEMORY`
 to compact it.
 
