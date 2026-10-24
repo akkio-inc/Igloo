@@ -602,10 +602,11 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		"source":     map[string]any{"table": "interests", "member": "person_id"},
 		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "skip_blank": true}}}
 	answered("a list's elements", topics, "index")
-	// Read as text, which the index does not keep: the tables.
+	// Read as text, which the index does not keep: the tables, through
+	// ids, with the cohorts from their bitmaps.
 	answered("a list's elements as JSON text", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
 		"source":     map[string]any{"table": "interests", "member": "person_id"},
-		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "element_text": "json", "skip_blank": true}}}, "scan")
+		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "element_text": "json", "skip_blank": true}}}, "index+scan")
 	it.internal("INSERT INTO lake.public.interests (person_id, topics, _igloo_id_person_id) SELECT value, ['cars'], id FROM lake.igloo_domains.people WHERE value = 'p0'")
 	srv.indexesChanged("public", "interests")
 	srv.waitIndexBuilds(t)
@@ -657,10 +658,13 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	if want := texts(t, conn, "SELECT * EXCLUDE (path) FROM ("+playsSQL[0]+") ORDER BY ALL"); slices.Equal(first, again) || !slices.Equal(again, want) {
 		t.Errorf("a prepared hybrid call once its audience has a new version: rows\n%q\nbefore\n%q\nwant\n%q", again, first, want)
 	}
-	// A condition on a metric, which bitmaps cannot keep: the tables.
+	// A condition on a metric, which bitmaps cannot keep: the tables, with
+	// the cohorts from their bitmaps.
 	answered("plays, with a metric's condition", map[string]any{"version": 1, "cohorts": cohorts,
 		"source":     map[string]any{"table": "plays", "member": "person_id"},
-		"dimensions": []any{map[string]any{"name": "LONG", "constant": "LONG_PLAY", "metric": "seconds", "metric_where": map[string]any{"gt": 1000}}}}, "scan")
+		"dimensions": []any{map[string]any{"name": "LONG", "constant": "LONG_PLAY", "metric": "seconds", "metric_where": map[string]any{"gt": 1000}}}}, "index+scan")
+	// The cohorts' sizes alone: from their bitmaps.
+	answered("the cohorts' sizes", map[string]any{"version": 1, "cohorts": cohorts, "dimensions": []any{}}, "index")
 
 	// A prepared call counted from the tables while an index it needs is
 	// missing reads the bitmaps once the index is built.
@@ -691,7 +695,7 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	// A masking policy on a column read: the tables.
 	it.exec("CREATE MASKING POLICY same AS (v VARCHAR) RETURNS VARCHAR -> v",
 		"ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name SET MASKING POLICY same")
-	answered("segments under a mask", segments, "scan")
+	answered("segments under a mask", segments, "index+scan")
 	it.exec("ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name UNSET MASKING POLICY")
 
 	// A member with two rows in a group: its rows are not its people, so

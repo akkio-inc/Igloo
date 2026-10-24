@@ -194,6 +194,30 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	if ids != nil {
 		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.dist != nil || s.splitPairs
 	}
+	// Through ids, or of the cohorts' sizes alone: the cohorts from their
+	// bitmaps, computed first, once for the statement however many calls
+	// read them (their variables are named by what they hold).
+	if ids != nil || len(spec.Dimensions) == 0 {
+		if cp := s.reportCohortIndexes(ctx, sess, spec); cp != nil {
+			if probe {
+				return spec.sqlWith(ids), cp.pins, read
+			}
+			err := s.hybridBitmaps(ctx, sess, spec, cp)
+			if err == nil {
+				err = s.hybridPeople(ctx, sess, spec, cp)
+			}
+			if err == nil {
+				s.reportFromIndexes.Add(1)
+				if ids != nil {
+					s.metrics.reportCall("index+scan")
+				} else {
+					s.metrics.reportCall("index")
+				}
+				return s.reportCohortSQL(spec, cp, ids), cp.pins, read
+			}
+			s.log.Debug("report call's cohorts read from their tables", "reason", err)
+		}
+	}
 	if !probe {
 		if ids != nil {
 			s.reportThroughIDs.Add(1)

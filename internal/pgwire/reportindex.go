@@ -75,6 +75,8 @@ type reportIndexPlan struct {
 	// people are a hybrid's counts from the bitmaps, computed first (see
 	// hybridPeople): its sizes, people and total_people CTEs, of VALUES.
 	people string
+	// domain is the ID domain of the cohorts' members.
+	domain string
 }
 
 // hybridBitmap is a hybrid cohort's bitmap, held in variable name; latest
@@ -88,7 +90,25 @@ type hybridBitmap struct {
 // reportIndexes returns how spec's call reads bitmap indexes, or nil when
 // they cannot answer it.
 func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportSpec) *reportIndexPlan {
-	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.indexesOff || sess.noIndexes || sess.noBitmaps || len(spec.Dimensions) == 0 ||
+	if len(spec.Dimensions) == 0 {
+		return nil
+	}
+	return s.planIndexes(ctx, sess, spec, false)
+}
+
+// reportCohortIndexes returns how spec's call reads its cohorts from
+// bitmap indexes, where they hold every cohort's members, of one domain,
+// and their latest_from reads as the statement would; or nil. A call
+// counted through ids then tests the source's rows against the cohorts'
+// bitmaps rather than joining their tables, and takes the cohorts' sizes
+// from them (see reportCohortSQL).
+func (s *Server) reportCohortIndexes(ctx context.Context, sess *session, spec *reportSpec) *reportIndexPlan {
+	return s.planIndexes(ctx, sess, spec, true)
+}
+
+// planIndexes is reportIndexes, of the cohorts alone when cohortsOnly.
+func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpec, cohortsOnly bool) *reportIndexPlan {
+	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.indexesOff || sess.noIndexes || sess.noBitmaps ||
 		rank[sess.currentUser().Role] < rank[auth.RoleReader] {
 		return nil
 	}
@@ -138,6 +158,13 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 			return nil
 		}
 		plan.cohorts = append(plan.cohorts, u)
+	}
+	if cohortsOnly {
+		if len(plan.cohorts) == 0 || !s.latestReadable(ctx, r, spec) {
+			return nil
+		}
+		plan.domain = domain
+		return plan
 	}
 	// The source's rows must be its table's: not a view that may repeat
 	// them.
@@ -215,10 +242,21 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 	if m == nil {
 		return nil
 	}
-	// A hybrid's cohorts' bitmaps are computed first (hybridBitmaps), a
-	// latest_from's version too, which must then read as the statement
-	// would: a table with no row access policy, clean room or masking
-	// policy.
+	// A hybrid's cohorts' bitmaps are computed first (hybridBitmaps).
+	if !s.latestReadable(ctx, r, spec) {
+		return nil
+	}
+	plan.hybrid = true
+	plan.source = reportIDTable{from: quoteName([]string{base.db, base.schema, base.name}), hidden: quoteIdent(iddomain.HiddenColumn(m.Column)),
+		at: plan.dims[0].snapshot}
+	return plan
+}
+
+// latestReadable reports whether the latest_from of each cohort that has
+// one reads, when Igloo computes it first (see hybridBitmaps), as the
+// statement would: a table of the catalog with no row access policy, clean
+// room or masking policy.
+func (s *Server) latestReadable(ctx context.Context, r *resolver, spec *reportSpec) bool {
 	gov := s.gov.snapshot(ctx)
 	for _, c := range spec.Cohorts {
 		if c.Version == nil || c.Version.LatestFrom == nil {
@@ -226,16 +264,13 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 		}
 		res, err := r.resolve(tableRef{parts: strings.Split(c.Version.LatestFrom.Table, ".")}, nil)
 		if err != nil || len(res.first) != 1 || len(res.all) != 1 {
-			return nil
+			return false
 		}
 		if o := res.first[0]; o.view || o.external || !strings.EqualFold(o.db, s.catalogName()) || gov.Rules(o.schema, o.name) != nil {
-			return nil
+			return false
 		}
 	}
-	plan.hybrid = true
-	plan.source = reportIDTable{from: quoteName([]string{base.db, base.schema, base.name}), hidden: quoteIdent(iddomain.HiddenColumn(m.Column)),
-		at: plan.dims[0].snapshot}
-	return plan
+	return true
 }
 
 // indexRows is the condition on the rows of index table alias that holds
@@ -396,11 +431,15 @@ func (s *Server) hybridPeople(ctx context.Context, sess *session, spec *reportSp
 	var q strings.Builder
 	q.WriteString("WITH ")
 	s.peopleCTEs(&q, spec, plan)
-	q.WriteString("SELECT 'p' AS kind, dimension, dim_group, value, cohort, people FROM " + cte("people"))
-	if spec.Totals {
-		q.WriteString(" UNION ALL SELECT 't', dimension, dim_group, NULL, cohort, people FROM " + cte("total_people"))
+	counted := len(plan.dims) > 0
+	if counted {
+		q.WriteString("SELECT 'p' AS kind, dimension, dim_group, value, cohort, people FROM " + cte("people"))
+		if spec.Totals {
+			q.WriteString(" UNION ALL SELECT 't', dimension, dim_group, NULL, cohort, people FROM " + cte("total_people"))
+		}
+		q.WriteString(" UNION ALL ")
 	}
-	q.WriteString(" UNION ALL SELECT 's', NULL, NULL, NULL, cohort, cohort_size FROM " + cte("sizes"))
+	q.WriteString("SELECT 's' AS kind, NULL AS dimension, NULL AS dim_group, NULL AS value, cohort, cohort_size FROM " + cte("sizes"))
 	rows, err := queryRows(ctx, sess.conn, q.String())
 	if err != nil {
 		return err
@@ -450,8 +489,10 @@ func (s *Server) hybridPeople(ctx context.Context, sess *session, spec *reportSp
 	var b strings.Builder
 	b.WriteString(cte("guard") + " AS (SELECT " + s.hybridGuard(spec, plan) + " AS ok),\n")
 	b.WriteString(values("sizes", []string{"cohort", "cohort_size"}, []string{"VARCHAR", "BIGINT"}, sizes))
-	b.WriteString(values("people", []string{"dimension", "dim_group", "value", "cohort", "people"}, []string{"VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"}, people))
-	if spec.Totals {
+	if counted {
+		b.WriteString(values("people", []string{"dimension", "dim_group", "value", "cohort", "people"}, []string{"VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"}, people))
+	}
+	if counted && spec.Totals {
 		b.WriteString(values("total_people", []string{"dimension", "dim_group", "cohort", "people"}, []string{"VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"}, totals))
 	}
 	plan.people = strings.TrimSuffix(b.String(), ",\n") + "\n"
@@ -502,7 +543,13 @@ func (s *Server) peopleCTEs(b *strings.Builder, spec *reportSpec, plan *reportIn
 		labels = append(labels, "SELECT "+quoteLiteral(c.Label)+" AS cohort, bm FROM "+name)
 	}
 	b.WriteString(cte("cohorts") + " AS (" + strings.Join(labels, " UNION ALL ") + "),\n")
-	b.WriteString(cte("sizes") + " AS (SELECT cohort, rb_cardinality(bm) AS cohort_size, bm FROM " + cte("cohorts") + " WHERE rb_cardinality(bm) > 0),\n")
+	b.WriteString(cte("sizes") + " AS (SELECT cohort, rb_cardinality(bm) AS cohort_size, bm FROM " + cte("cohorts") + " WHERE rb_cardinality(bm) > 0)")
+	if len(plan.dims) == 0 {
+		// The cohorts alone.
+		b.WriteString("\n")
+		return
+	}
+	b.WriteString(",\n")
 	var groups []string
 	for i, d := range spec.Dimensions {
 		u := plan.dims[i]
@@ -580,12 +627,11 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 	return b.String()
 }
 
-// writeHybrid ends a hybrid's statement: the source's rows of each
-// cohort's members, kept by the cohort's bitmap, expanded into their
-// values, counted and summed as reportSpec.sql counts them, with people
-// from the bitmaps.
-func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportIndexPlan, same func(a, b string) string) {
-	src := plan.source
+// writeMembers writes the CTE of the rows of src (read through its ids, at
+// its snapshot, under the source's conditions) whose member is in a
+// cohort, by the cohort's bitmap, once for each such cohort: members, with
+// the member's id and the cohort's label.
+func (s *Server) writeMembers(b *strings.Builder, spec *reportSpec, plan *reportIndexPlan, src reportIDTable) {
 	member := "CAST(s." + src.hidden + " AS UINTEGER)"
 	var tests []string
 	for i, c := range spec.Cohorts {
@@ -597,6 +643,50 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 		b.WriteString(" WHERE " + w)
 	}
 	b.WriteString(")\n")
+}
+
+// reportCohortSQL returns the statement of a call whose cohorts plan reads
+// from their bitmaps (see reportCohortIndexes), computed first with their
+// sizes (hybridBitmaps, hybridPeople), and which counts the rest through
+// ids (ids), as sqlWith does but for the cohorts: the source's rows are
+// tested against the cohorts' bitmaps rather than joined to the members of
+// their tables, which a call would otherwise read again each time (path
+// 'index+scan'). A call of the cohorts' sizes alone reads nothing else
+// (path 'index').
+func (s *Server) reportCohortSQL(spec *reportSpec, plan *reportIndexPlan, ids *reportIDs) string {
+	var b strings.Builder
+	b.WriteString("WITH " + plan.people)
+	if len(spec.Dimensions) == 0 {
+		b.WriteString("SELECT CAST(NULL AS VARCHAR) AS dimension, CAST(NULL AS VARCHAR) AS dim_group, CAST(NULL AS VARCHAR) AS value, z.cohort, true AS is_total, " +
+			"z.cohort_size AS people, CAST(NULL AS BIGINT) AS \"rows\", z.cohort_size, CAST(NULL AS DOUBLE) AS metric_sum, CAST(NULL AS BIGINT) AS metric_count, " +
+			"CAST(NULL AS DOUBLE) AS metric_avg, 'index' AS path FROM " + cte("sizes") + " AS z CROSS JOIN " + cte("guard") + " AS q WHERE q.ok = 1")
+		return b.String()
+	}
+	s.writeMembers(&b, spec, plan, ids.source)
+	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", true, ids.pairs, ids.split)
+	b.WriteString(counts)
+	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, n.people, n.\"rows\", z.cohort_size, " +
+		"n.metric_sum, n.metric_count, n.metric_avg")
+	for _, c := range metricCols {
+		b.WriteString(", " + c)
+	}
+	if spec.Extent != "" {
+		b.WriteString(", x.extent_min, x.extent_max")
+	}
+	b.WriteString(", 'index+scan' AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
+	if extent != "" {
+		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
+	}
+	b.WriteString(" CROSS JOIN " + cte("guard") + " AS q WHERE n.everything = 0 AND n.\"rows\" > 0 AND q.ok = 1")
+	return b.String()
+}
+
+// writeHybrid ends a hybrid's statement: the source's rows of each
+// cohort's members, kept by the cohort's bitmap, expanded into their
+// values, counted and summed as reportSpec.sql counts them, with people
+// from the bitmaps.
+func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportIndexPlan, same func(a, b string) string) {
+	s.writeMembers(b, spec, plan, plan.source)
 	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", false, plan.pairs, plan.split)
 	b.WriteString(counts)
 	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, ")
