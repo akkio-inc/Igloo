@@ -266,7 +266,7 @@ func TestBitmapDistinctResults(t *testing.T) {
 		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
 	}
 	h := newHarnessRB(t, 0.02, 4, 3, rb)
-	h.exec("SET rb_count_distinct = 'auto'")
+	h.exec("SET rb_count_distinct = 'always'")
 	queries := []string{
 		`SELECT l_shipmode, count(DISTINCT CAST(l_orderkey AS UINTEGER)) AS o, sum(l_quantity) AS q FROM lineitem GROUP BY 1 ORDER BY 1`,
 		`SELECT count(DISTINCT CAST(l_partkey AS UINTEGER)) AS p, count(DISTINCT CAST(l_suppkey AS UINTEGER)) AS s, count(*) FROM lineitem`,

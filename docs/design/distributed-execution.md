@@ -791,7 +791,7 @@ stage completes the groups (`internal/distributed/aggregate.go`):
   `COUNT(DISTINCT user_id, day)` next to `COUNT(DISTINCT user_id)`;
   partitioning by that column keeps every argument's values apart.
 - **Bitmaps.** Where the session counts distinct 32-bit unsigned integers
-  with the rb extension's roaring bitmaps (`rb_count_distinct` `auto` or
+  with the rb extension's roaring bitmaps (`rb_count_distinct` set to
   `always`), a `count(DISTINCT)` of a `CAST(... AS UINTEGER)` or of a
   column of an unsigned type is not an aggregate over `DISTINCT` values
   for these modes at all: its partial is `rb_agg` of its argument, a BLOB

@@ -33,6 +33,8 @@ string_t WriteBitmap(Vector &result, roaring_bitmap_t *bm);
 
 void RegisterAggregates(ExtensionLoader &loader);
 void RegisterScalars(ExtensionLoader &loader);
+//! The optimizer rule that, with rb_count_distinct = 'always', counts COUNT(DISTINCT) of unsigned ids in bitmaps
+void RegisterRewrite(DBConfig &config);
 
 } // namespace rb
 } // namespace duckdb

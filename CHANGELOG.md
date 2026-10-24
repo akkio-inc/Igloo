@@ -382,7 +382,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (60% spill, 30% exchanges, `IGLOO_EXCHANGE_MAX_SIZE`).
 - Distributed `count(DISTINCT)` of 32-bit unsigned integers sends roaring
   bitmaps rather than values where the session counts with them
-  (`rb_count_distinct` `auto` or `always`, with integer IDs): each worker
+  (`rb_count_distinct` `always`, with integer IDs): each worker
   sends a bitmap of its values a group, and the coordinator, or a worker
   completing a partition of the groups, counts their union.
 - Auto mode's estimates are measured against the scale environment's

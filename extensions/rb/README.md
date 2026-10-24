@@ -42,9 +42,23 @@ bitmap, never NULL.
 The scalars return NULL when an argument is NULL, and refuse a BLOB that is
 not a valid bitmap (`rb: invalid bitmap BLOB ...`).
 
-The setting `rb_count_distinct` (`'off'`, the default, `'auto'` or
-`'always'`) is where the planner rule that rewrites `COUNT(DISTINCT)` of a
-`UINTEGER` into `rb_count_distinct` will look.
+## Settings
+
+- `rb_count_distinct`: `'off'` (the default) or `'always'`. With `'always'`,
+  an optimizer rule counts every `COUNT(DISTINCT x)` of a `UINTEGER`,
+  `USMALLINT` or `UTINYINT` with `rb_count_distinct(x)`: same results, no
+  FILTER or ORDER BY on the aggregate, window aggregates left alone. The rule
+  weighs nothing: DuckDB's estimates of the rows reaching an aggregate are
+  20-34x off on Iceberg tables, so Igloo decides per statement, from its own
+  estimate of the rows the statement reads, and sets `'always'` around the
+  statements it picks (`internal/pgwire/bitmaps.go`). Igloo's distributed
+  planner reads it too, to combine workers' partial counts as bitmaps.
+- `rb_memory_budget`: the most memory one aggregate's bitmaps may take, such
+  as `'2GB'`; empty (the default) leaves them to DuckDB's `memory_limit`.
+  Bitmaps count toward `memory_limit` either way, and a statement whose
+  bitmaps do not fit fails with an error that starts
+  `rb: bitmap memory budget exceeded`, on which Igloo runs it again once with
+  `rb_count_distinct = 'off'`.
 
 ## Building and loading
 

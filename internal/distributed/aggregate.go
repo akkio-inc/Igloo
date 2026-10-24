@@ -1613,8 +1613,9 @@ func jsonInt(i int) any { return json.Number(strconv.Itoa(i)) }
 
 // bitmapSetting is the session's DuckDB setting, the rb extension's, that
 // turns roaring bitmaps on for count(DISTINCT) of 32-bit unsigned IDs:
-// 'auto' or 'always' (Igloo sets 'auto' where its integer IDs are on), and
-// absent where the extension is not loaded.
+// 'always' (Igloo sets it around the statements it picks; see
+// internal/pgwire/bitmaps.go), and absent where the extension is not
+// loaded.
 const bitmapSetting = "rb_count_distinct"
 
 // bitmapsOn reports whether count(DISTINCT) of 32-bit unsigned IDs may
@@ -1629,6 +1630,5 @@ func (co *Coordinator) bitmapsOn(ctx context.Context, env Env) bool {
 	if err != nil {
 		return false
 	}
-	v = strings.ToLower(strings.TrimSpace(v))
-	return v == "auto" || v == "always"
+	return strings.EqualFold(strings.TrimSpace(v), "always")
 }

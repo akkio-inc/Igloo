@@ -184,30 +184,84 @@ SELECT rb_cardinality(a || '\x00'::BLOB) FROM s
 ----
 rb: invalid bitmap BLOB
 
-# the setting the choice rule reads
+# rb_count_distinct = 'always' counts COUNT(DISTINCT) of unsigned ids up to
+# 32 bits in bitmaps, with the same results; 'off' (the default) leaves it to
+# DuckDB's hash
 query T
 SELECT current_setting('rb_count_distinct')
 ----
 off
 
+statement error
+SET rb_count_distinct = 'auto'
+----
+rb_count_distinct is 'off' or 'always'
+
 statement ok
-SET rb_count_distinct = 'AUTO'
+SET rb_count_distinct = 'ALWAYS'
 
 query T
 SELECT current_setting('rb_count_distinct')
 ----
-auto
+always
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT id) AS a, count(DISTINCT id::BIGINT) AS b, count(DISTINCT id) FILTER (WHERE true) AS c FROM t GROUP BY g) WHERE a <> b OR a <> c
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT (id % 60000)::USMALLINT) AS a, count(DISTINCT id % 60000) AS b FROM t GROUP BY g) WHERE a <> b
+----
+0
+
+query I
+SELECT count(DISTINCT id) = (SELECT count(DISTINCT id::BIGINT) FROM t) FROM t
+----
+true
+
+# which aggregates it rewrites shows in what a small bitmap budget refuses:
+# COUNT(DISTINCT) of a UINTEGER, grouped or not, and nothing else
+statement ok
+SET rb_memory_budget = '4MB'
 
 statement error
-SET rb_count_distinct = 'sometimes'
+SELECT g, count(DISTINCT (hash(i) % 4294967295)::UINTEGER) FROM range(2000000) r(i), (SELECT i % 4 AS g) GROUP BY g
 ----
-rb_count_distinct is 'off', 'auto' or 'always'
+rb: bitmap memory budget exceeded
+
+statement error
+SELECT count(DISTINCT (hash(i) % 4294967295)::UINTEGER) FROM range(2000000) r(i)
+----
+rb: bitmap memory budget exceeded
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT (hash(i) % 4294967295)::BIGINT) AS a, count(DISTINCT (hash(i) % 4294967295)::UINTEGER) FILTER (WHERE i >= 0) AS b, count(DISTINCT CASE WHEN i >= 0 THEN ((hash(i) % 4294967295)::UINTEGER, g) END) AS c FROM range(2000000) r(i), (SELECT i % 4 AS g) GROUP BY g) WHERE a = b AND a = c
+----
+4
+
+query I
+SELECT count(*) FROM (SELECT count(DISTINCT (hash(i) % 4294967295)::UINTEGER) OVER (ORDER BY i ROWS BETWEEN 1000 PRECEDING AND CURRENT ROW) AS a FROM range(20000) r(i)) WHERE a > 0
+----
+20000
+
+statement ok
+SET rb_count_distinct = 'off'
+
+query I
+SELECT count(*) FROM (SELECT g, count(DISTINCT (hash(i) % 4294967295)::UINTEGER) AS a FROM range(2000000) r(i), (SELECT i % 4 AS g) GROUP BY g) WHERE a > 400000
+----
+4
+
+statement ok
+RESET rb_memory_budget
 
 statement ok
 RESET rb_count_distinct
 
-# memory: bitmaps count toward DuckDB's memory limit, and a statement whose
-# bitmaps do not fit fails with the error Igloo reruns on the hash path
+# memory: a statement whose bitmaps outgrow rb_memory_budget fails with the
+# error Igloo reruns on the hash path, and bitmaps count toward DuckDB's
+# memory limit
 statement ok
 SET rb_memory_budget = '4MB'
 
@@ -224,13 +278,19 @@ SELECT rb_count_distinct((hash(i) % 4294967295)::UINTEGER) > 1999000 FROM range(
 ----
 true
 
+# 24 million ids spread over all of UINTEGER take some 96 MB: past a 64 MB
+# memory limit, the bitmaps' reservation or DuckDB's next allocation fails,
+# whichever comes first (the tables above leave DuckDB little room)
+statement ok
+DROP TABLE t; DROP TABLE sparse; DROP TABLE s
+
 statement ok
 SET memory_limit = '64MB'
 
 statement error
-SELECT g, rb_count_distinct((hash(i) % 4294967295)::UINTEGER) FROM range(8000000) r(i), (SELECT i % 8 AS g) GROUP BY g
+SELECT g, rb_count_distinct((hash(i) % 4294967295)::UINTEGER) FROM range(24000000) r(i), (SELECT i % 8 AS g) GROUP BY g
 ----
-rb: bitmap memory budget exceeded
+Out of Memory Error
 
 statement ok
 RESET memory_limit

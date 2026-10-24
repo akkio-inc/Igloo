@@ -23,8 +23,8 @@ public:
 
 static void CheckMode(ClientContext &, SetScope, Value &parameter) {
 	auto mode = StringUtil::Lower(parameter.ToString());
-	if (mode != "off" && mode != "auto" && mode != "always") {
-		throw InvalidInputException("rb_count_distinct is 'off', 'auto' or 'always', not '%s'", parameter.ToString());
+	if (mode != "off" && mode != "always") {
+		throw InvalidInputException("rb_count_distinct is 'off' or 'always', not '%s'", parameter.ToString());
 	}
 	parameter = Value(mode);
 }
@@ -35,9 +35,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	rb::RegisterScalars(loader);
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("rb_count_distinct",
-	                          "Whether COUNT(DISTINCT) of UINTEGER ids counts into roaring bitmaps: 'off', 'auto' "
-	                          "(where the hash would not fit its memory) or 'always'",
+	                          "Whether COUNT(DISTINCT) of 32-bit unsigned ids counts into roaring bitmaps: 'off' or "
+	                          "'always' (Igloo decides per statement)",
 	                          LogicalType::VARCHAR, Value("off"), CheckMode);
+	rb::RegisterRewrite(config);
 	config.AddExtensionOption("rb_memory_budget",
 	                          "The most memory one COUNT(DISTINCT)'s bitmaps may take (e.g. '2GB'; empty: whatever "
 	                          "DuckDB's memory_limit leaves)",
