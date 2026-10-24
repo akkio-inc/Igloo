@@ -323,9 +323,9 @@ type Server struct {
 	// reportFromIndexes counts those answered from bitmap indexes (see
 	// reportindex.go).
 	reportFromIndexes atomic.Int64
-	settings         auth.SettingStore
-	workload         *workload.Controller
-	pool             string
+	settings          auth.SettingStore
+	workload          *workload.Controller
+	pool              string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
