@@ -46,9 +46,10 @@ import (
 //  3. Without the lease, it fills the ids of the rows that have none from
 //     the dictionary.
 //
-// A writer that does not get the lease within idLeaseWait, and a domain
-// that has handed out every id below 2^32 (iddomain.ErrExhausted), leave
-// the ids NULL. So do writes inside a transaction block and other engines'
+// A writer that does not get the lease within idLeaseWait, a domain that
+// has handed out every id below 2^32 (iddomain.ErrExhausted), and an
+// erasure that deleted from the dictionary since the writer looked for new
+// values (iddomain.ErrErased; see erasure's deleteRows) leave the ids NULL. So do writes inside a transaction block and other engines'
 // writes. Maintenance fills them later (MapIDDomains), and until then
 // queries take the table's ids as incomplete. An id is never wrong: a
 // value's id is its dictionary entry's, entries are only ever appended,
@@ -346,8 +347,9 @@ type idConn interface {
 
 // mapColumn gives ids to the values of m in schema.table that have none
 // and fills them in (see the top of this file). It returns how many
-// values got new ids and how many rows were filled. A busy lease or an
-// exhausted domain still fills the rows whose values have ids.
+// values got new ids and how many rows were filled. A busy lease, an
+// exhausted domain or an erasure meanwhile still fills the rows whose
+// values have ids.
 func (s *Server) mapColumn(ctx context.Context, conn idConn, schema, table string, m idMember) (assigned, filled int64, err error) {
 	tbl := quoteName([]string{s.catalogName(), schema, table})
 	col, hidden := quoteIdent(m.Column), quoteIdent(iddomain.HiddenColumn(m.Column))
@@ -362,7 +364,7 @@ func (s *Server) mapColumn(ctx context.Context, conn idConn, schema, table strin
 		return 0, 0, err
 	}
 	assigned, err = s.assignIDs(ctx, conn, m.domain, "SELECT "+col+" FROM "+tbl+missing)
-	if err != nil && !errors.Is(err, iddomain.ErrBusy) && !errors.Is(err, iddomain.ErrExhausted) {
+	if err != nil && !errors.Is(err, iddomain.ErrBusy) && !errors.Is(err, iddomain.ErrExhausted) && !errors.Is(err, iddomain.ErrErased) {
 		return 0, 0, err
 	}
 	assignErr := err
@@ -407,6 +409,13 @@ func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, 
 		n, err := countOf(rows)
 		return n, err
 	}
+	// An erasure that deletes from the dictionary meanwhile may have
+	// deleted rows that values are found in below; it counts itself under
+	// the lease, which the count is checked against there.
+	erased, err := s.idDomains.Erased(ctx, d.Name)
+	if err != nil {
+		return 0, err
+	}
 	// 1. The new values, as the dictionary stands.
 	if err := exec(ctx, "CREATE TEMP TABLE "+quoteIdent(tmp)+" AS SELECT DISTINCT "+cast+" AS value FROM (\n"+values+
 		"\n) AS igloo_v(v) WHERE igloo_v.v IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "+dict+" AS igloo_dict WHERE igloo_dict.value = "+cast+")"); err != nil {
@@ -416,6 +425,9 @@ func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, 
 	n, err := count()
 	if err != nil || n == 0 {
 		return 0, err
+	}
+	if s.afterNewValues != nil {
+		s.afterNewValues()
 	}
 
 	// 2. Under the lease: again as the dictionary stands now, ids for
@@ -433,6 +445,13 @@ func (s *Server) assignIDs(ctx context.Context, conn idConn, d iddomain.Domain, 
 		lost.stop()
 		unlock()
 	}()
+	if now, err := s.idDomains.Erased(ctx, d.Name); err != nil || now != erased {
+		if err == nil {
+			s.metrics.idAssignSkipped("erased")
+			err = fmt.Errorf("ID domain %s %w", d.Name, iddomain.ErrErased)
+		}
+		return 0, err
+	}
 	if err := exec(ctx, "DELETE FROM "+news+" WHERE value IN (SELECT value FROM "+dict+")"); err != nil {
 		return 0, err
 	}

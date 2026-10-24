@@ -361,7 +361,8 @@ func TestEraseDictionaryValue(t *testing.T) {
 	}
 	store := erasure.NewMemoryStore()
 	svc := erasure.New(erasure.Options{Store: store, Catalog: cat, Policies: r.srv.gov.store.Load, Engine: r.eng,
-		Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake", Warehouse: vc.cfg.Storage.Location + "/"})
+		Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake", Warehouse: vc.cfg.Storage.Location + "/",
+		IDDomains: r.srv.idDomains})
 	req, err := svc.Submit(ctx, "privacy", []erasure.Wanted{{Tag: "pii", Value: "person_id", Identifiers: []string{"p1"}}})
 	if err != nil {
 		t.Fatal(err)
@@ -393,6 +394,11 @@ func TestEraseDictionaryValue(t *testing.T) {
 	}
 	if d := dictionary(); strings.Join(d, ",") != "p0=0,p2=2" {
 		t.Errorf("dictionary after erasing p1: %q", d)
+	}
+	// It deleted from the dictionary last under the domain's lease, which
+	// it counted (see TestIDAssignmentErasedMeanwhile).
+	if n, err := r.srv.idDomains.Erased(ctx, "people"); err != nil || n != 1 {
+		t.Errorf("erasures of the domain counted: %d, %v", n, err)
 	}
 	// The guard is still on.
 	if got := texts(t, admin, "SELECT count(*) FROM lake.igloo_domains.people"); len(got) != 1 || got[0] != "0" {

@@ -62,6 +62,10 @@ var (
 	ErrExhausted = errors.New("has assigned every id below 2^32")
 	// ErrBusy says another assignment holds the domain's lease.
 	ErrBusy = errors.New("is busy with another assignment")
+	// ErrErased says an erasure deleted from the domain's dictionary
+	// while an assignment looked for new values, which it then appends
+	// none of (see Store.Erased).
+	ErrErased = errors.New("was erased from during the assignment")
 )
 
 // Types are the value types a domain may have.
@@ -298,8 +302,17 @@ type Store interface {
 	// Lock takes domain's assignment lease for holder, waiting up to wait
 	// for another holder to let it go, and returns ErrBusy if it does not.
 	// A lease lasts ttl, so a holder that stops does not hold it for good;
-	// unlock lets it go early.
+	// unlock lets it go early. Holding it again renews it.
 	Lock(ctx context.Context, domain, holder string, ttl, wait time.Duration) (unlock func(), err error)
+	// Erased returns how many times erasures have deleted from domain's
+	// dictionary under its lease (MarkErased), which an assignment reads
+	// before it looks for new values and again under the lease: a change
+	// means an erasure may have deleted, meanwhile, rows the assignment
+	// found values in, and it appends none of them.
+	Erased(ctx context.Context, domain string) (int64, error)
+	// MarkErased counts one more erasure of domain; an erasure calls it
+	// holding the domain's lease.
+	MarkErased(ctx context.Context, domain string) error
 	Close()
 }
 

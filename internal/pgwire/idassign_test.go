@@ -320,3 +320,57 @@ func TestIDAssignmentConcurrentWriters(t *testing.T) {
 		t.Errorf("values in the dictionary: %s", got)
 	}
 }
+
+// TestIDAssignmentErasedMeanwhile appends no value to the dictionary that
+// an erasure deleted the rows of between the assignment finding it and
+// taking the lease: the erasure counts itself under the lease, and the
+// assignment checks the count there.
+func TestIDAssignmentErasedMeanwhile(t *testing.T) {
+	it := newIDTest(t)
+	ctx := context.Background()
+	it.exec(
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		"CREATE TABLE lake.public.people (person_id VARCHAR, n INTEGER)",
+		"CREATE TAG pii",
+		"ALTER TABLE lake.public.people ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"CREATE ID DOMAIN people (VARCHAR) TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.people ALTER COLUMN person_id SET ID DOMAIN people",
+		"INSERT INTO lake.public.people VALUES ('p1', 1)",
+	)
+	srv := it.r.srv
+	found, proceed := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	srv.afterNewValues = func() {
+		once.Do(func() {
+			close(found)
+			<-proceed
+		})
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := it.admin.Exec(ctx, "INSERT INTO lake.public.people VALUES ('gone1', 1), ('p1', 2)")
+		done <- err
+	}()
+	<-found
+	// What an erasure of gone1 does last, while the assignment waits.
+	unlock, err := srv.idDomains.Lock(ctx, "people", "erasure/test", time.Minute, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.idDomains.MarkErased(ctx, "people"); err != nil {
+		t.Fatal(err)
+	}
+	it.internal("DELETE FROM lake.public.people WHERE person_id = 'gone1'")
+	unlock()
+	close(proceed)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := it.one("SELECT count(*) FROM lake.igloo_domains.people WHERE value = 'gone1'"); got != "0" {
+		t.Errorf("an erased value came back into the dictionary: %s", got)
+	}
+	srv.afterNewValues = nil
+	// Values found afterwards get their ids as usual.
+	it.exec("INSERT INTO lake.public.people VALUES ('p2', 2)")
+	it.consistent("people", true, "people")
+}

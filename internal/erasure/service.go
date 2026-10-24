@@ -23,6 +23,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
@@ -100,8 +101,12 @@ type Options struct {
 	Locks Locks
 	// Rows deletes and counts rows. Nil means statements in DuckDB on the
 	// catalog's tables.
-	Rows    Rows
-	Metrics *Metrics
+	Rows Rows
+	// IDDomains keeps ID domains' leases, which a request holds while it
+	// deletes from a domain's dictionary for the last time (see
+	// deleteRows). Nil means no domains.
+	IDDomains iddomain.Store
+	Metrics   *Metrics
 	// Memory is what rewriting a table's files may hold at once (see
 	// package filerewrite), as compaction's IGLOO_MAINTENANCE_MEMORY; zero
 	// means filerewrite.DefaultMemory.

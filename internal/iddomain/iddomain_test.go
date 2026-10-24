@@ -214,6 +214,22 @@ func testStore(t *testing.T, s Store) {
 		t.Error("took a lease before it expired")
 	}
 	unlock()
+
+	// Erasures, counted by domain.
+	if n, err := s.Erased(ctx, "people"); err != nil || n != 0 {
+		t.Errorf("erasures at first: %d, %v", n, err)
+	}
+	for range 2 {
+		if err := s.MarkErased(ctx, "people"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.Erased(ctx, "people"); err != nil || n != 2 {
+		t.Errorf("erasures: %d, %v", n, err)
+	}
+	if n, err := s.Erased(ctx, "other"); err != nil || n != 0 {
+		t.Errorf("another domain's erasures: %d, %v", n, err)
+	}
 }
 
 func TestMemoryStore(t *testing.T) { testStore(t, NewMemoryStore()) }
@@ -229,7 +245,8 @@ func TestPostgresStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	for _, q := range []string{`UPDATE igloo_iddomain.catalog SET doc = '{}'`, `DELETE FROM igloo_iddomain.counters`, `DELETE FROM igloo_iddomain.leases`} {
+	for _, q := range []string{`UPDATE igloo_iddomain.catalog SET doc = '{}'`, `DELETE FROM igloo_iddomain.counters`, `DELETE FROM igloo_iddomain.leases`,
+		`DELETE FROM igloo_iddomain.erasures`} {
 		if _, err := s.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}

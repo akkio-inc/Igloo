@@ -284,6 +284,9 @@ type Server struct {
 	idHolder string
 	idSeq    atomic.Uint64
 	idMapped idMapped
+	// afterNewValues, if set, runs when an assignment has found new values
+	// and is about to take the lease, for tests.
+	afterNewValues func()
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
 	prefetcher *prefetch.Prefetcher

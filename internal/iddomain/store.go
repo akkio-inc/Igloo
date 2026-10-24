@@ -20,6 +20,7 @@ type MemoryStore struct {
 	catalog  Catalog
 	counters map[string]counter
 	leases   map[string]lease
+	erased   map[string]int64
 }
 
 type counter struct {
@@ -34,7 +35,7 @@ type lease struct {
 
 // NewMemoryStore returns an empty store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{counters: map[string]counter{}, leases: map[string]lease{}}
+	return &MemoryStore{counters: map[string]counter{}, leases: map[string]lease{}, erased: map[string]int64{}}
 }
 
 func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
@@ -113,6 +114,19 @@ func (m *MemoryStore) Lock(ctx context.Context, domain, holder string, ttl, wait
 	}, nil
 }
 
+func (m *MemoryStore) Erased(_ context.Context, domain string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.erased[domain], nil
+}
+
+func (m *MemoryStore) MarkErased(_ context.Context, domain string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.erased[domain]++
+	return nil
+}
+
 func (m *MemoryStore) Close() {}
 
 func wrapBusy(domain string, err error) error {
@@ -155,6 +169,11 @@ var migrations = []string{
 		domain     text PRIMARY KEY,
 		holder     text NOT NULL,
 		expires_at timestamptz NOT NULL
+	)`,
+	// How many times erasures deleted from each domain's dictionary.
+	`CREATE TABLE IF NOT EXISTS igloo_iddomain.erasures (
+		domain text PRIMARY KEY,
+		times  bigint NOT NULL
 	)`,
 }
 
@@ -296,6 +315,21 @@ func (s *PostgresStore) Lock(ctx context.Context, domain, holder string, ttl, wa
 		defer cancel()
 		_, _ = s.pool.Exec(ctx, `DELETE FROM igloo_iddomain.leases WHERE domain = $1 AND holder = $2`, domain, holder)
 	}, nil
+}
+
+func (s *PostgresStore) Erased(ctx context.Context, domain string) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT times FROM igloo_iddomain.erasures WHERE domain = $1`, domain).Scan(&n)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+func (s *PostgresStore) MarkErased(ctx context.Context, domain string) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_iddomain.erasures (domain, times) VALUES ($1, 1)
+		ON CONFLICT (domain) DO UPDATE SET times = igloo_iddomain.erasures.times + 1`, domain)
+	return err
 }
 
 func (s *PostgresStore) Close() { s.pool.Close() }

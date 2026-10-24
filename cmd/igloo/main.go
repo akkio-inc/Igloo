@@ -389,7 +389,7 @@ func serve() error {
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
-			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory),
+			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains,
 		}, historyStore, taskStore)
 		if err != nil {
 			return err

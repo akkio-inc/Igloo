@@ -56,7 +56,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"domain"}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_id_domain_assignments_skipped_total",
-			Help: "Assignments of ids left to maintenance, by reason: busy (another held the domain's lease) or exhausted (every id below 2^32 handed out).",
+			Help: "Assignments of ids left to maintenance, by reason: busy (another held the domain's lease), exhausted (every id below 2^32 handed out) or erased (an erasure deleted from the dictionary meanwhile).",
 		}, []string{"reason"}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped)

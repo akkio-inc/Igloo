@@ -22,6 +22,7 @@ import (
 	"gocloud.dev/gcerrors"
 
 	"github.com/akkio-inc/igloo/internal/clone"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -736,7 +737,56 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 			return err
 		}
 	}
-	return nil
+	return s.deleteFromDictionaries(ctx, r)
+}
+
+// dictionaryLease is how long a request holds an ID domain's lease for
+// its last delete from the dictionary, and dictionaryWait how long it
+// waits for an assignment to let the lease go.
+const (
+	dictionaryLease = 2 * time.Minute
+	dictionaryWait  = time.Minute
+)
+
+// deleteFromDictionaries deletes the matching rows from each ID domain's
+// dictionary (package iddomain) once more, once the request deleted from
+// every table, holding the domain's lease and having counted the erasure
+// (iddomain.Store.MarkErased). An assignment of ids reads the count
+// before it looks for new values in member tables, and again under the
+// lease before it appends them to the dictionary: one that found a value
+// in rows this request then deleted either appended it before this delete,
+// which removes it, or finds the count changed and appends nothing. So no
+// erased value comes back into a dictionary.
+func (s *Service) deleteFromDictionaries(ctx context.Context, r *Request) error {
+	if s.opts.IDDomains == nil {
+		return nil
+	}
+	for i := range r.Tables {
+		t := &r.Tables[i]
+		if !t.active() || len(t.Ident) != 2 || !strings.EqualFold(t.Ident[0], iddomain.DictionarySchema) {
+			continue
+		}
+		domain := t.Ident[1]
+		unlock, err := s.opts.IDDomains.Lock(ctx, domain, "erasure/"+r.ID, dictionaryLease, dictionaryWait)
+		if err != nil {
+			return contended(fmt.Errorf("delete from %s: %w", t.Name, err))
+		}
+		err = s.opts.IDDomains.MarkErased(ctx, domain)
+		if err == nil {
+			err = s.deleteFrom(ctx, r, t)
+		}
+		unlock()
+		switch {
+		case err == nil:
+		case blocking(err):
+			if err := s.setAside(ctx, r, t, err); err != nil {
+				return err
+			}
+		default:
+			return &tableError{t.Name, err}
+		}
+	}
+	return s.save(ctx, r)
 }
 
 // deleteFrom deletes the matching rows of t, as loaded and checked (see
