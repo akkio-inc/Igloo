@@ -291,6 +291,9 @@ type Server struct {
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()
+	// idComplete caches which member tables' snapshots have every row's
+	// ids (see idcount.go).
+	idComplete idComplete
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
 	prefetcher *prefetch.Prefetcher
@@ -1348,6 +1351,19 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			err = s.recheck(ctx, sess, st)
 			relist()
 		}
+		if err == nil {
+			// One that counts through ID domains' ids reads the snapshots
+			// that have them (see idcount.go); looking them up asks the
+			// catalog, which holds nothing, and preparing again takes the
+			// lock it needs.
+			bitmaps := st.bitmaps
+			if err = s.refreshIDCounts(ctx, sess, st); err == nil && st.bitmaps != bitmaps {
+				if sess.bitmapsRestore != nil {
+					sess.bitmapsRestore()
+				}
+				sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
+			}
+		}
 		if err != nil {
 			s.metrics.query(start, err)
 			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
@@ -1641,6 +1657,14 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 // rewriteWholeCounts), and counts distinct pairs a row each (see
 // rewritePairCounts).
 func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, text string) string {
+	query, _ := s.rewriteCounting(ctx, sess, user, text, false)
+	return query
+}
+
+// rewriteCounting is rewrite that, with ids set, also counts member
+// columns through ID domains' ids where it may (see idcount.go), before
+// the pair counts, and returns what it counts through them.
+func (s *Server) rewriteCounting(ctx context.Context, sess *session, user auth.User, text string, ids bool) (string, *idCounts) {
 	query := rewriteCurrentSetting(rewriteSystemSchemaRefs(text, s.catalogName()))
 	query = rewriteHistoryRefs(rewriteSessionUser(rewriteCatalogQuery(query), user.Name), s.engine.LocalDatabase())
 	if s.ddl != nil {
@@ -1649,11 +1673,15 @@ func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, tex
 	if readsMetadata.MatchString(query) {
 		s.refreshMetadata(ctx, sess)
 	}
+	var counts *idCounts
+	if ids {
+		query, counts = s.rewriteIDCounts(ctx, sess, query)
+	}
 	query = s.rewritePairCounts(ctx, sess, s.rewriteWholeCounts(ctx, sess, query))
 	if s.rewriteHook != nil {
 		query = s.rewriteHook(query)
 	}
-	return query
+	return query, counts
 }
 
 // prepareChecked is prepareStatement without recording failures, for the
@@ -1680,7 +1708,8 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if s.ddl != nil {
 		viewGen = s.ddl.Generation()
 	}
-	query, err := s.resolveRefReads(ctx, sess, s.rewrite(ctx, sess, user, text))
+	rewritten, counts := s.rewriteCounting(ctx, sess, user, text, true)
+	query, err := s.resolveRefReads(ctx, sess, rewritten)
 	if err != nil {
 		return fail(err)
 	}
@@ -1922,6 +1951,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	if st.stmtType == duckdb.STATEMENT_TYPE_INSERT {
 		st.ids = ids
+	}
+	if counts != nil && st.stmtType == duckdb.STATEMENT_TYPE_SELECT {
+		st.idCounts, st.text = counts, text
 	}
 	// A statement that lists the catalog's tables or views walks the set and
 	// holds the catalog lock exclusively when it runs (see catalogRunLock);

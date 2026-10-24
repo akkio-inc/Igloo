@@ -122,8 +122,11 @@ type tablePlan struct {
 	// masks are by column index; nil where nothing masks the column.
 	masks []*maskPlan
 	// hidden says the table has columns that hold ID domains' ids, which
-	// columns leaves out, so that no statement reads them.
+	// columns leaves out, so that no statement reads them; ids are those
+	// columns, which a reference keeps only for Igloo's own text that
+	// names them through it (see keptIDs).
 	hidden bool
+	ids    []columnType
 }
 
 func (p *tablePlan) noop() bool {
@@ -150,16 +153,18 @@ func (rw *rewriter) plan(o object, rules *policy.TableRules) (*tablePlan, error)
 		return nil, err
 	}
 	hidden := false
+	var ids []columnType
 	if strings.EqualFold(o.db, rw.r.catalog) {
 		cols = slices.DeleteFunc(cols, func(c columnType) bool {
 			if iddomain.IsHidden(c.name) {
 				hidden = true
+				ids = append(ids, c)
 				return true
 			}
 			return false
 		})
 	}
-	plan := &tablePlan{obj: o, columns: cols, masks: make([]*maskPlan, len(cols)), hidden: hidden}
+	plan := &tablePlan{obj: o, columns: cols, masks: make([]*maskPlan, len(cols)), hidden: hidden, ids: ids}
 	index := func(name string) int {
 		return slices.IndexFunc(cols, func(c columnType) bool { return strings.EqualFold(c.name, name) })
 	}
@@ -341,7 +346,7 @@ func (rw *rewriter) filterExpr(p *tablePlan, alias string) string {
 }
 
 // subquery reads the table through its policies; at is its AT clause.
-func (rw *rewriter) subquery(p *tablePlan, at string) string {
+func (rw *rewriter) subquery(p *tablePlan, at string, ids ...columnType) string {
 	a := quoteIdent(rw.alias("t"))
 	table := quoteName([]string{p.obj.db, p.obj.schema, p.obj.name})
 	if at != "" {
@@ -351,6 +356,9 @@ func (rw *rewriter) subquery(p *tablePlan, at string) string {
 	if p.filter == nil {
 		for i, c := range p.columns {
 			items[i] = rw.value(p, i, a+"."+quoteIdent(c.name)) + " AS " + quoteIdent(c.name)
+		}
+		for _, c := range ids {
+			items = append(items, a+"."+quoteIdent(c.name)+" AS "+quoteIdent(c.name))
 		}
 		return "(SELECT " + strings.Join(items, ", ") + " FROM " + table + " AS " + a + at + ")"
 	}
@@ -363,6 +371,45 @@ func (rw *rewriter) subquery(p *tablePlan, at string) string {
 	inner := "SELECT " + strings.Join(raw, ", ") + ", (" + rw.filterExpr(p, a) + ") AS " + ok +
 		" FROM " + table + " AS " + a + at
 	return "(SELECT " + strings.Join(items, ", ") + " FROM (" + inner + ") AS " + a + " WHERE " + a + "." + ok + ")"
+}
+
+// keptIDs returns the columns of ids of ref's table that text names
+// through ref, as Igloo's counts through ID domains' ids do
+// (q."_igloo_id_c", see idcount.go), which its subquery keeps: no user's
+// statement may name them (see hiddenReferences), so only Igloo's text
+// does, and only for references whose columns it checked nothing could
+// show. Names in strings and comments do not count.
+func keptIDs(text string, ref *refNode, p *tablePlan) []columnType {
+	if len(p.ids) == 0 || p.filter != nil {
+		return nil
+	}
+	qualifier := ref.alias
+	if qualifier == "" {
+		qualifier = ref.parts[len(ref.parts)-1]
+	}
+	// The code and quoted names of text, as one string.
+	var b strings.Builder
+	for _, seg := range sqllex.Segments(text) {
+		switch seg.Kind {
+		case sqllex.Code, sqllex.Ident:
+			b.WriteString(seg.Text)
+		default:
+			b.WriteString(" ")
+		}
+	}
+	code := strings.ToLower(b.String())
+	q := strings.ToLower(qualifier)
+	var out []columnType
+	for _, c := range p.ids {
+		h := strings.ToLower(c.name)
+		for _, form := range []string{q + "." + h, quoteIdent(q) + "." + quoteIdent(h), q + "." + quoteIdent(h), quoteIdent(q) + "." + h} {
+			if strings.Contains(code, form) {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // --- queries ----------------------------------------------------------------
@@ -513,7 +560,7 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		if err != nil {
 			return nil, denied("cannot apply policies to this statement: %v", err)
 		}
-		return rw.replaceRef(text, &at, sp, rw.subquery(plan, sp.at))
+		return rw.replaceRef(text, &at, sp, rw.subquery(plan, sp.at, keptIDs(text, ref, plan)...))
 
 	case o.view && rw.sens.viewProtected[o.key()]:
 		sp, err := scanTableRef(text, &at)

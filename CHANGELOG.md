@@ -102,7 +102,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   fills the ids: `INSERT`, `COPY INTO` and `CREATE TABLE ... AS` write
   those the dictionary has and give new values theirs before they return,
   under a per-domain lease held only for the dictionary's append, and
-  maintenance fills what other writes left `NULL`. Counting
+  maintenance fills what other writes left `NULL`. A query's
+  `count(DISTINCT t.c)` of a member column counts its ids instead, at a
+  snapshot of the table that has every row's, with the same result, when
+  no policy applies to the table and nothing in the query could show the
+  ids. Counting
   distinct people over integers, and keeping sets of them as bitmaps, is
   what the heaviest audience reports spend their time on; the work that
   fills the ids and counts through them follows.

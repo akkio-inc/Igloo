@@ -434,10 +434,19 @@ func outsideAggregates(n any) bool {
 	return ok
 }
 
+// idValue reports whether a value of a tuple is a column's ID domain ids
+// as Igloo counts them (see idcount.go): CAST(t._igloo_id_c AS UINTEGER).
+func idValue(e map[string]any) bool {
+	child, _ := e["child"].(map[string]any)
+	typ, _ := e["cast_type"].(map[string]any)
+	return str(e["class"]) == "CAST" && e["try_cast"] != true && str(child["class"]) == "COLUMN_REF" && strings.EqualFold(str(typ["id"]), "UINTEGER")
+}
+
 // distinctTuple returns the values of a count of distinct tuples in the
 // form the translation of COUNT(DISTINCT a, b, ...) has:
 // count(DISTINCT CASE WHEN a IS NOT NULL AND b IS NOT NULL ... THEN (a, b, ...) END),
-// with two or more values, all different columns.
+// with two or more values, all different columns, or columns' ID domain
+// ids as Igloo counts them (idValue).
 func distinctTuple(e map[string]any) ([]any, bool) {
 	if str(e["class"]) != "FUNCTION" || strings.ToLower(str(e["function_name"])) != "count" || e["distinct"] != true ||
 		e["filter"] != nil || len(asList(orderBys(e))) > 0 {
@@ -467,7 +476,7 @@ func distinctTuple(e map[string]any) ([]any, bool) {
 	}
 	for i, v := range vals {
 		vm, _ := v.(map[string]any)
-		if vm == nil || str(vm["class"]) != "COLUMN_REF" {
+		if vm == nil || str(vm["class"]) != "COLUMN_REF" && !idValue(vm) {
 			return nil, false
 		}
 		for _, w := range vals[:i] {

@@ -83,6 +83,12 @@ type statement struct {
 	// ids is set for an INSERT into a table with columns in ID domains,
 	// which writes their ids too (see idassign.go).
 	ids *idWrite
+	// idCounts is set for a query that counts member columns through ID
+	// domains' ids, or would once their tables have every row's, and text
+	// is the statement as prepareChecked got it, to prepare it again when
+	// those tables change (see idcount.go).
+	idCounts *idCounts
+	text     string
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

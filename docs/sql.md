@@ -454,6 +454,18 @@ DROP ID DOMAIN people;
   next pass. Counts through ids treat a table with such rows as not
   mapped, and an id is never wrong: each value has the one id its
   dictionary entry gives it.
+- With `IGLOO_ID_DOMAINS=true`, a query's `count(DISTINCT t.c)` of a
+  member column `c` counts the ids beside it instead, as 32-bit integers,
+  which is faster and lets large counts use bitmaps; the result is the
+  same. It does so only when the table's current snapshot has every row's
+  id, and reads the table at that snapshot; a prepared statement is
+  prepared again when the table changes. Snowflake's `COUNT(DISTINCT c, d)`
+  counts the ids too. It counts the values as written when `t` is a view,
+  a common table expression or another database's table, when a row access
+  policy, clean room or masking policy (on `c`) applies to the table for
+  anyone, when the statement has `*` or `COLUMNS(...)` over the table or
+  uses its alias as a value, when the table reads a version or sample of
+  its own, and in statements other than queries.
 - Writes to a member table keep its ids right. An `INSERT` that names no
   columns (`INSERT INTO t VALUES ...`, `INSERT INTO t SELECT ...`) names the
   table's columns other than the ids', as does a `MERGE`'s `INSERT VALUES`;
