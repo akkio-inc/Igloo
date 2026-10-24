@@ -163,6 +163,12 @@ type Options struct {
 	// and answers counts of distinct ids from (IGLOO_BITMAP_INDEXES, with
 	// IDDomainsOn and the rb extension; see bitmapindex.go).
 	BitmapIndexes bool
+	// RewriteMemory is what writing a table's files again may hold at once
+	// (IGLOO_MAINTENANCE_MEMORY), as when ids are filled in (see idfill.go);
+	// 0 is filerewrite's default.
+	RewriteMemory int64
+	// idFillRewriteRows, when set, replaces idFillRewriteRows (for tests).
+	idFillRewriteRows int64
 	// ReportRewrite has the statement layer recognize the counting CTEs
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
@@ -331,6 +337,8 @@ type Server struct {
 	// CTEs it answered through the report API, and reportUnrecognized the
 	// statements prepared again as written after a recognized form failed.
 	reportRewrite      atomic.Bool
+	rewriteMemory      int64
+	idFillRewriteRows  int64
 	reportRecognized   atomic.Int64
 	reportUnrecognized atomic.Int64
 	reportOutcomes     func([]reportOutcome)
@@ -514,6 +522,8 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)
+	s.rewriteMemory = opts.RewriteMemory
+	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)
 	s.reportOutcomes, s.reportFallback = opts.reportOutcomes, opts.reportFallback
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()

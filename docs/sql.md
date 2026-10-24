@@ -454,7 +454,15 @@ DROP ID DOMAIN people;
   changed keep `NULL` ids until maintenance fills them, at the start of its
   next pass. Counts through ids treat a table with such rows as not
   mapped, and an id is never wrong: each value has the one id its
-  dictionary entry gives it.
+  dictionary entry gives it. A fill of a million rows or more, such as a
+  table's first, writes the data files that hold them again, one after
+  another, each with its rows in their order and the ids added, as
+  compaction writes files, within `IGLOO_MAINTENANCE_MEMORY`: a table laid
+  out by a column, say by audience, keeps its layout, and filters on that
+  column keep skipping the files and row groups they skipped. Fewer rows,
+  and tables whose files Igloo cannot write again (with deletion vectors,
+  or more values without ids than a quarter of that memory holds), are
+  filled by an `UPDATE`.
 - With `IGLOO_ID_DOMAINS=true`, a query's `count(DISTINCT t.c)` of a
   member column `c` counts the ids beside it instead, as 32-bit integers,
   which is faster and lets large counts use bitmaps; the result is the

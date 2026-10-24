@@ -403,6 +403,24 @@ func (s *Server) mapColumn(ctx context.Context, conn idConn, schema, table strin
 	}
 	assignErr := err
 	defer done()
+	if thorough || assignErr == nil {
+		// Many rows: their files written again, in their order (see
+		// idfill.go).
+		if n, err := missingRows(ctx, conn, tbl, col, hidden); err != nil {
+			return assigned, filled, err
+		} else if n >= s.idFillRewriteRows {
+			n, err := s.fillByRewrite(ctx, conn, schema, table, m)
+			if err == nil {
+				filled += n
+				s.metrics.idsFilled(m.domain.Name, filled)
+				return assigned, filled, assignErr
+			}
+			if ctx.Err() != nil {
+				return assigned, filled, err
+			}
+			s.log.Warn("could not fill ids by writing the files again; filling them by UPDATE", "column", m.String(), "rows", n, "err", err)
+		}
+	}
 	if ids != "" && assigned <= idFillFromAssigned {
 		// From the ids just assigned, one value each.
 		if err := update("UPDATE " + tbl + " AS igloo_t SET " + hidden + " = igloo_a.id FROM " + ids + " AS igloo_a WHERE igloo_t." + hidden +
