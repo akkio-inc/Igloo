@@ -810,10 +810,12 @@ func (s *Server) refreshIndexes(ctx context.Context, sess *session, st *statemen
 	}
 	stale := false
 	switch {
-	case st.reportCall && bitmapVarName.MatchString(st.query):
-		// A hybrid call, whose cohorts' bitmaps are of the versions their
-		// latest_from had when it was prepared: prepared again, for the
-		// versions they have now (its variables are computed again anyway).
+	case st.reportCall && st.reportRan && bitmapVarName.MatchString(st.query):
+		// A call that reads cohorts' bitmaps, of the versions their
+		// latest_from had when it was prepared, run again: prepared again,
+		// for the versions they have now (its variables are computed again
+		// anyway). Its first run follows its preparing, whose versions it
+		// keeps.
 		stale = true
 	case st.reportCall && len(st.indexPins) == 0:
 		// A report API call counted from the tables: back to the bitmaps

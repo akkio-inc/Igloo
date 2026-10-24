@@ -54,8 +54,10 @@ type statement struct {
 	indexPins []indexPin
 	indexed   string
 	// reportCall says the statement's text calls the report API, which
-	// refreshIndexes looks at again (see reportindex.go).
+	// refreshIndexes looks at again (see reportindex.go); reportRan that
+	// it has run once since it was prepared.
 	reportCall bool
+	reportRan  bool
 	// original is the statement before policies rewrote it, when they did
 	// (see protect.go); guard records how they applied.
 	original string

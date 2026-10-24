@@ -1553,6 +1553,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
 			}
 		}
+		if err == nil && st.reportCall {
+			st.reportRan = true
+		}
 		err = prepared(err)
 		if err != nil {
 			s.metrics.query(start, err)

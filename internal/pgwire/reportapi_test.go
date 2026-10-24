@@ -659,6 +659,13 @@ func TestReportAPIFromIndexes(t *testing.T) {
 			map[string]any{"name": "REACH", "constant": "ANY_PLAY", "metric": "seconds"}},
 		"metrics": []any{map[string]any{"name": "seconds", "column": "seconds", "coalesce": 0}, map[string]any{"name": "days", "distinct_with": "day"}}}
 	answered("plays, with metrics and the extent", plays, "index+scan")
+	// Written once for a statement run once: its run keeps what preparing
+	// it computed.
+	before := srv.reportFromIndexes.Load()
+	texts(t, conn, "SELECT count(*) FROM igloo.audience_profile("+specLiteral(t, plays)+")")
+	if n := srv.reportFromIndexes.Load() - before; n != 1 {
+		t.Errorf("a hybrid call run once was written %d times, want 1", n)
+	}
 	if plan := strings.Join(texts(t, conn, "EXPLAIN (FORMAT JSON) SELECT * FROM igloo.audience_profile("+specLiteral(t, plays)+")"), "\n"); !strings.Contains(plan, "rb_count_distinct") {
 		t.Errorf("the hybrid's pairs of days, not in bitmaps:\n%s", plan)
 	}
