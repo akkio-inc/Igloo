@@ -515,7 +515,8 @@ from local disk. Against an object store with S3's latency, a cold scan on
 12 threads with prefetch ran 1.9 times as fast as on 32 threads without.
 
 - It reads each file's footer, then the blocks of the columns the statement
-  reads, in the order the scan reads the files, and keeps at most a quarter
+  reads (none for a scan that reads no column, as `COUNT(*)`'s), in the
+  order the scan reads the files, and keeps at most a quarter
   of the cache's room for blocks DuckDB has not read yet, so they do not
   evict each other or other statements' blocks first.
 - It tells the blocks DuckDB read by their access times. On a filesystem

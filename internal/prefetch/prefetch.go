@@ -145,13 +145,16 @@ type File struct {
 }
 
 // Scan is a scan of an Iceberg table: the files it reads, in the order it
-// reads them, and its columns, by Iceberg field ID (top-level or leaf).
-// Filtered says the statement filters the table, so the scan may read
-// fewer files than Files lists; the prefetcher then reads ahead at most
-// filteredBudget of it.
+// reads them, and its columns, by Iceberg field ID (top-level or leaf);
+// none means it reads no column, only the files' footers, as COUNT(*)
+// does. Whole says it reads every column, as of the files of a distributed
+// statement's exchange, which have no field IDs. Filtered says the
+// statement filters the table, so the scan may read fewer files than Files
+// lists; the prefetcher then reads ahead at most filteredBudget of it.
 type Scan struct {
 	Files    []File
 	FieldIDs []int32
+	Whole    bool
 	Filtered bool
 }
 
@@ -428,7 +431,7 @@ func (s *statement) run(scans []Scan) {
 			}
 			of := &openFile{File: f}
 			s.files = append(s.files, of)
-			ranges, err := s.columnRanges(of, ids)
+			ranges, err := s.columnRanges(of, ids, sc.Whole)
 			if err != nil {
 				if s.ctx.Err() == nil {
 					s.p.failed.Inc()
@@ -705,7 +708,7 @@ func (p *Prefetcher) blocksOf(f *openFile, ranges [][2]int64) []block {
 // columnRanges fetches f's footer, through the cache, and returns the byte
 // ranges of the column chunks of the columns ids names (all columns when
 // ids is empty), with the footer's own.
-func (s *statement) columnRanges(f *openFile, ids map[int32]bool) ([][2]int64, error) {
+func (s *statement) columnRanges(f *openFile, ids map[int32]bool, whole bool) ([][2]int64, error) {
 	if f.Size < 12 {
 		return nil, fmt.Errorf("a data file of %d bytes", f.Size)
 	}
@@ -733,7 +736,7 @@ func (s *statement) columnRanges(f *openFile, ids map[int32]bool) ([][2]int64, e
 	}
 	want := map[int]bool{}
 	for i := 0; i < meta.Schema.NumColumns(); i++ {
-		if len(ids) == 0 || projected(meta.Schema.Column(i).SchemaNode(), ids) {
+		if whole || projected(meta.Schema.Column(i).SchemaNode(), ids) {
 			want[i] = true
 		}
 	}

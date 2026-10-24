@@ -193,6 +193,25 @@ func TestColumns(t *testing.T) {
 	if left, _ := filepath.Glob(filepath.Join(dir, "*"+tmpSuffix)); len(left) > 0 {
 		t.Errorf("blocks left half written: %v", left)
 	}
+	// A scan of no column, as of COUNT(*), reads the footer alone.
+	footerOnly := t.TempDir()
+	p3, err := New(Options{Dir: footerOnly, BlockSize: block, Open: func(ctx context.Context, _ string) (Object, error) {
+		f, err := os.Open(local)
+		return &localObject{File: f, etag: etag}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p3.Close()
+	stop = p3.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
+	footer := expectedBlocks(st.Size(), block, [][2]int64{{st.Size() - footerGuess, st.Size()}})
+	waitFor(t, "the footer", func() bool { return len(blockFiles(t, footerOnly, path, etag)) >= len(footer) })
+	time.Sleep(200 * time.Millisecond)
+	stop()
+	if got := blockFiles(t, footerOnly, path, etag); strings.Join(got, " ") != strings.Join(footer, " ") {
+		t.Errorf("blocks of a scan of no column\n got %v\nwant %v", got, footer)
+	}
+
 	// What is in the cache already is not fetched again.
 	var reads atomic.Int64
 	p2, err := New(Options{Dir: dir, BlockSize: block, Open: func(ctx context.Context, _ string) (Object, error) {
@@ -259,7 +278,7 @@ func TestAhead(t *testing.T) {
 			}
 			defer p.Close()
 			withTracking(t, p, mode)
-			stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
+			stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}, Whole: true}})
 			defer stop()
 			count := func() int {
 				entries, _ := os.ReadDir(dir)
@@ -310,7 +329,7 @@ func TestBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		withTracking(t, p, bounded)
-		stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
+		stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}, Whole: true}})
 		count := func() int {
 			entries, _ := os.ReadDir(dir)
 			return len(entries)
@@ -348,8 +367,8 @@ func TestSharing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	stopA := p.Start(context.Background(), []Scan{{Files: []File{{Path: "s3://b/a/f.parquet", Size: st.Size()}}}})
-	stopB := p.Start(context.Background(), []Scan{{Files: []File{{Path: "s3://b/b/f.parquet", Size: st.Size()}}}})
+	stopA := p.Start(context.Background(), []Scan{{Files: []File{{Path: "s3://b/a/f.parquet", Size: st.Size()}}, Whole: true}})
+	stopB := p.Start(context.Background(), []Scan{{Files: []File{{Path: "s3://b/b/f.parquet", Size: st.Size()}}, Whole: true}})
 	waitFor(t, "reads of both", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
