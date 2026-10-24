@@ -178,7 +178,7 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	}
 	if plan != nil {
 		if plan.hybrid {
-			plan.pairs, plan.split = s.pairBitmaps(ctx, sess, spec, plan.source), s.dist != nil || s.splitPairs
+			plan.pairs, plan.split = s.pairBitmaps(ctx, sess, spec, plan.source), s.splitPairs
 		}
 		if !probe {
 			s.reportFromIndexes.Add(1)
@@ -192,7 +192,7 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	}
 	ids, read := s.reportIDs(ctx, sess, spec)
 	if ids != nil {
-		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.dist != nil || s.splitPairs
+		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.splitPairs
 	}
 	// Through ids, or of the cohorts' sizes alone: the cohorts from their
 	// bitmaps, computed first, once for the statement however many calls
@@ -228,6 +228,13 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	}
 	return spec.sqlWith(ids), nil, read
 }
+
+// (Pair counts are written as workers would split them (bitmapPairCounts)
+// only for tests, splitPairs, for now: the distributed planner does not
+// take rb_agg for an aggregate yet, and so moves every row of such a
+// statement between workers rather than their groups' partial bitmaps,
+// several times slower than one machine. rb_count_distinct keeps it on
+// one machine.)
 
 // pairBitmaps returns the distinct_with metrics of spec whose pairs roaring
 // bitmaps count, where the member is an ID domain's id: those whose column
