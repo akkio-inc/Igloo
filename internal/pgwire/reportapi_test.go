@@ -560,6 +560,22 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		if len(paths) != 1 || paths[0] != want {
 			t.Errorf("%s: paths %q, want %s", what, paths, want)
 		}
+		// The path the probe the recognizer asks says it would take.
+		srv.sessions.mu.Lock()
+		sess := srv.sessions.byPID[int32(conn.PgConn().PID())]
+		srv.sessions.mu.Unlock()
+		raw, err := json.Marshal(spec)
+		if err != nil || sess == nil {
+			t.Fatalf("%s: %v, session %v", what, err, sess)
+		}
+		parsed, err := parseReportSpec(ctx, sess, string(raw))
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		planned := srv.reportPlannedPath(ctx, sess, parsed)
+		if planned != want && (want != "scan" || planned != "ids") {
+			t.Errorf("%s: planned path %s, want %s", what, planned, want)
+		}
 		text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
 		if len(text) != 1 {
 			t.Fatalf("%s: %q", what, text)

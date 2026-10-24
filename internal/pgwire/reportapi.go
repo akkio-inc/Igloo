@@ -236,6 +236,34 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 // several times slower than one machine. rb_count_distinct keeps it on
 // one machine.)
 
+// reportPlannedPath returns the path a call of spec would take now, as
+// reportStatement chooses it and the path column and metrics name it:
+// "index", "index+scan", "ids" or "scan". It reads what choosing does (the
+// indexes' state and the tables' snapshots, not their bitmaps), computes
+// no bitmap and sets no variable. A call may still be counted from the
+// tables when its bitmaps do not fit in memory.
+func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *reportSpec) string {
+	if plan := s.reportIndexes(ctx, sess, spec); plan != nil {
+		if plan.hybrid {
+			return "index+scan"
+		}
+		return "index"
+	}
+	ids, _ := s.reportIDs(ctx, sess, spec)
+	if ids != nil || len(spec.Dimensions) == 0 {
+		if s.reportCohortIndexes(ctx, sess, spec) != nil {
+			if len(spec.Dimensions) == 0 {
+				return "index"
+			}
+			return "index+scan"
+		}
+	}
+	if ids != nil {
+		return "ids"
+	}
+	return "scan"
+}
+
 // pairBitmaps returns the distinct_with metrics of spec whose pairs roaring
 // bitmaps count, where the member is an ID domain's id: those whose column
 // in the source (src, at its snapshot) is a date or an integer, which
