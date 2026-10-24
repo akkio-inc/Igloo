@@ -464,3 +464,34 @@ TAG_COUNTS AS (SELECT 'TAGGING' AS FAMILY, CAST(GET_PATH(D.VALUE, 'KIND') AS TEX
 SELECT * FROM TAG_COUNTS`
 	rs.checkRecognized(t, conn, "tags in Snowflake's dialect", sql, 1)
 }
+
+// TestReportRecognitionSwitch: a session turns recognition off and on for
+// itself.
+func TestReportRecognitionSwitch(t *testing.T) {
+	rs := startReportRecognitionServer(t)
+	conn := rs.admin
+	sql := reportRecognitionCases[4].sql // cohort sizes
+	show := func(want string) {
+		t.Helper()
+		if got := texts(t, conn, "SHOW igloo_report_rewrite"); !slices.Equal(got, []string{want}) {
+			t.Errorf("SHOW igloo_report_rewrite: %q, want %s", got, want)
+		}
+	}
+	show("on")
+	mustExec(t, conn, "SET igloo_report_rewrite = off")
+	show("off")
+	if _, recognized, _, err := rs.run(t, conn, sql, true); err != nil || len(recognized) != 0 {
+		t.Errorf("off: recognized %q, %v", recognized, err)
+	}
+	if _, err := conn.Exec(context.Background(), "SET igloo_report_rewrite = sometimes"); pgCode(err) != "22023" {
+		t.Errorf("SET igloo_report_rewrite = sometimes: %v", err)
+	}
+	mustExec(t, conn, "RESET igloo_report_rewrite")
+	show("on")
+	if _, recognized, _, err := rs.run(t, conn, sql, true); err != nil || len(recognized) != 1 {
+		t.Errorf("on again: recognized %q, %v", recognized, err)
+	}
+	rs.srv.reportRewrite.Store(false)
+	defer rs.srv.reportRewrite.Store(true)
+	show("off")
+}

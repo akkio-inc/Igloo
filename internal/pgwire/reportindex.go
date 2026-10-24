@@ -82,7 +82,7 @@ type hybridBitmap struct {
 // reportIndexes returns how spec's call reads bitmap indexes, or nil when
 // they cannot answer it.
 func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportSpec) *reportIndexPlan {
-	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || len(spec.Dimensions) == 0 || rank[sess.currentUser().Role] < rank[auth.RoleReader] {
+	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.indexesOff || len(spec.Dimensions) == 0 || rank[sess.currentUser().Role] < rank[auth.RoleReader] {
 		return nil
 	}
 	snap := s.memberSnapshot(ctx)

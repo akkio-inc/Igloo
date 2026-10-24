@@ -520,6 +520,14 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		}
 	}
 	answered("segments", segments, "index")
+	// A session that turns bitmap indexes off for itself counts from the
+	// tables.
+	mustExec(t, conn, "SET igloo_bitmap_indexes = off")
+	if got := texts(t, conn, "SHOW igloo_bitmap_indexes"); !slices.Equal(got, []string{"off"}) {
+		t.Errorf("SHOW igloo_bitmap_indexes: %q", got)
+	}
+	answered("segments, with indexes off for the session", segments, "scan")
+	mustExec(t, conn, "RESET igloo_bitmap_indexes")
 	answered("a constant, over a table of one row a member", everyone, "index")
 	// Values of several groups: a constant over the segments a condition
 	// keeps (E2's totals), values a map merges, and entries that merge.

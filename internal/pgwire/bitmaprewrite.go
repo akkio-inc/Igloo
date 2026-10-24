@@ -108,7 +108,7 @@ func namesIn(text string) []string {
 // that a statement that read the tables tries the indexes again before it
 // runs again (see refreshIndexes).
 func (s *Server) rewriteIndexes(ctx context.Context, sess *session, user auth.User, query string, counts *idCounts) (_ string, _ []indexPin, candidate bool) {
-	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.noIndexes || rank[user.Role] < rank[auth.RoleReader] || !countsDistinct.MatchString(query) {
+	if !s.bitmapIndexesOn || sess == nil || sess.conn == nil || sess.noIndexes || sess.indexesOff || rank[user.Role] < rank[auth.RoleReader] || !countsDistinct.MatchString(query) {
 		return query, nil, false
 	}
 	snap := s.memberSnapshot(ctx)

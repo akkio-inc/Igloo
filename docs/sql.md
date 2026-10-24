@@ -501,7 +501,9 @@ roaring bitmap of its values' ids for each combination of the values of a
 few other columns of the table: the people in each segment, say, or in each
 audience's version. Igloo builds it and keeps it up to date in the
 background. Bitmap indexes exist only with `IGLOO_BITMAP_INDEXES=true`,
-which is off by default and needs `IGLOO_ID_DOMAINS=true`.
+which is off by default and needs `IGLOO_ID_DOMAINS=true`. A session that
+should count from the tables turns their reads off for itself with `SET
+igloo_bitmap_indexes = off` (`RESET`, `SHOW igloo_bitmap_indexes`).
 
 ```sql
 ALTER TABLE crm.segments ADD BITMAP INDEX people_by_segment ON (segment_name) FOR person_id;

@@ -82,7 +82,7 @@ type reportOutcome struct {
 // recognizeReports returns text with the counting CTEs recognition maps
 // replaced by calls of the report API, or text as it is.
 func (s *Server) recognizeReports(ctx context.Context, sess *session, text string) string {
-	if !s.reportRewrite.Load() || !mayBeReport(text) {
+	if !s.reportRewrite.Load() || sess.reportRewriteOff || !mayBeReport(text) {
 		return text
 	}
 	out, outcomes, err := recognizeReportText(connReportEnv{ctx: ctx, sess: sess}, text)

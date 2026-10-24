@@ -504,7 +504,9 @@ parse of the statement, in DuckDB's dialect and in the translation of
 Snowflake's, and maps an expression only when it is certain of the result:
 anything else, and the rest of the statement, runs as written. If the
 statement fails with the API in it, at any step, it runs as written, and
-fails or not as it would have.
+fails or not as it would have. A session turns recognition off for
+itself with `SET igloo_report_rewrite = off` (`RESET`, `SHOW
+igloo_report_rewrite`).
 
 The expressions it maps join a table, or a common table expression that
 selects its columns, to a cohort on its member column, or keep its rows
