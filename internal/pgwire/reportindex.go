@@ -22,17 +22,20 @@ import (
 //     index of it for its member;
 //   - each dimension is a column or a constant, of the source or a view of
 //     it alone (whose rows are the table's), with an index of the source
-//     for the member by that column alone (by nothing, for a constant),
-//     and the source's conditions are on that column; a dimension maps its
-//     values only one to one and leaving out the rest (skip_blank);
-//   - no two dimensions share a name and group, and there are no metrics
+//     for the member by that column and the columns of the source's
+//     conditions (by those alone, for a constant), and there are no metrics
 //     and no extent;
 //   - each bitmap's group has one row for each of its members (the index
-//     records each bitmap's rows and members): the rows a cohort's members
-//     have with a value are then as many as those members.
+//     records each bitmap's rows and members).
 //
-// People are then the members of a value's bitmap and a cohort's, rows as
-// many, and totals the members of the union of a dimension's bitmaps.
+// A value's rows are then the index rows (groups) that have it, under the
+// source's conditions: its people within a cohort are the members of the
+// union of their bitmaps and the cohort's, and its rows the sum, over the
+// groups, of those of each group's members in the cohort, one each. A
+// value most often has one group, whose bitmap is read as it is; one of a
+// constant, of a column of an index by more columns, of a map or of
+// entries that merge has several, which are OR-ed. Totals are the union of
+// a dimension's groups, and their rows the sum of its values'.
 
 // reportIndexPlan is how a call reads bitmap indexes: an index for each
 // cohort and each dimension.
@@ -100,62 +103,29 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 		}
 	}
 	where := mapKeysOf(spec.Source.Where)
-	keys := map[string]bool{}
 	for _, d := range spec.Dimensions {
 		if d.Metric != "" || d.Elements != "" {
 			return nil
 		}
-		key := d.Name + "\x00"
-		if d.Group != nil {
-			key += "g" + *d.Group
-		}
-		if keys[key] {
-			return nil
-		}
-		keys[key] = true
-		if d.Map != nil {
-			if !d.SkipBlank {
-				return nil
-			}
-			seen := map[string]bool{}
-			for _, to := range d.Map {
-				if to != nil && seen[*to] {
-					return nil
-				}
-				if to != nil {
-					seen[*to] = true
-				}
-			}
-		}
-		var groups []string
+		groups := where
 		if d.Column != "" {
-			groups = []string{d.Column}
-			for _, w := range where {
-				if !strings.EqualFold(w, d.Column) {
-					return nil
-				}
-			}
-		} else if len(where) > 0 {
-			return nil
+			groups = append([]string{d.Column}, where...)
 		}
 		u, ok := use(spec.Source.Table, spec.Source.Member, groups)
-		if !ok || len(u.index.Groups) != len(groups) || len(groups) == 1 && !strings.EqualFold(u.index.Groups[0], groups[0]) {
+		if !ok {
 			return nil
 		}
 		plan.dims = append(plan.dims, u)
 	}
 	// Each group of the bitmaps read: one row for each member. Asked on
 	// the session's connection, as preparing holds the catalog lock.
-	for i, d := range spec.Dimensions {
-		u := plan.dims[i]
+	for _, u := range plan.dims {
 		if !s.indexCounted(ctx, u.index) {
 			return nil
 		}
 		conds := indexRows("x", u)
-		if d.Column != "" {
-			if w := spec.Source.Where.sql("x"); w != "" {
-				conds += " AND " + w
-			}
+		if w := spec.Source.Where.sql("x"); w != "" {
+			conds += " AND " + w
 		}
 		rows, err := queryRows(ctx, sess.conn, "SELECT count(*) FILTER (WHERE row_count IS NULL OR members IS NULL OR row_count <> members) FROM "+
 			s.indexTable(u.index.Name)+" AS x WHERE "+conds)
@@ -215,10 +185,8 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 		}
 		v := "CAST(" + d.valueOf("x") + " AS VARCHAR)"
 		conds := []string{indexRows("x", u)}
-		if d.Column != "" {
-			if w := spec.Source.Where.sql("x"); w != "" {
-				conds = append(conds, w)
-			}
+		if w := spec.Source.Where.sql("x"); w != "" {
+			conds = append(conds, w)
 		}
 		if d.SkipBlank {
 			conds = append(conds, "("+v+") IS NOT NULL", "trim("+v+") <> ''")
@@ -226,19 +194,32 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 		groups = append(groups, "SELECT "+quoteLiteral(d.Name)+" AS dimension, "+group+" AS dim_group, "+v+" AS value, x.bm FROM "+
 			s.indexTable(u.index.Name)+" AS x WHERE "+strings.Join(conds, " AND "))
 	}
+	keys := "dimension, dim_group, value"
+	same := func(a, b string) string {
+		return a + ".dimension = " + b + ".dimension AND " + a + ".dim_group IS NOT DISTINCT FROM " + b + ".dim_group AND " + a + ".value IS NOT DISTINCT FROM " + b + ".value"
+	}
 	b.WriteString(cte("groups") + " AS (" + strings.Join(groups, " UNION ALL ") + "),\n")
-	b.WriteString(cte("pairs") + " AS (SELECT g.dimension, g.dim_group, g.value, z.cohort, z.cohort_size, rb_and_cardinality(g.bm, z.bm) AS people FROM " +
-		cte("groups") + " AS g CROSS JOIN " + cte("sizes") + " AS z)\n")
+	// Each group's members in each cohort, one row each.
+	b.WriteString(cte("pairs") + " AS (SELECT g.dimension, g.dim_group, g.value, z.cohort, rb_and_cardinality(g.bm, z.bm) AS n FROM " +
+		cte("groups") + " AS g CROSS JOIN " + cte("sizes") + " AS z),\n")
+	b.WriteString(cte("counts") + " AS (SELECT " + keys + ", cohort, count(*) AS k, max(n) AS one, CAST(sum(n) AS BIGINT) AS n FROM " + cte("pairs") +
+		" GROUP BY " + keys + ", cohort),\n")
+	// The values of several groups, whose bitmaps are OR-ed.
+	b.WriteString(cte("unions") + " AS (SELECT g." + strings.ReplaceAll(keys, ", ", ", g.") + ", rb_or_agg(g.bm) AS bm FROM " + cte("groups") +
+		" AS g JOIN (SELECT " + keys + " FROM " + cte("groups") + " GROUP BY " + keys + " HAVING count(*) > 1) AS m ON " + same("g", "m") +
+		" GROUP BY g." + strings.ReplaceAll(keys, ", ", ", g.") + ")\n")
 	none := "CAST(NULL AS DOUBLE) AS metric_sum, CAST(NULL AS BIGINT) AS metric_count, CAST(NULL AS DOUBLE) AS metric_avg, 'index' AS path"
-	b.WriteString("SELECT dimension, dim_group, value, cohort, false AS is_total, people, people AS \"rows\", cohort_size, " + none +
-		" FROM " + cte("pairs") + " WHERE people > 0")
+	b.WriteString("SELECT c.dimension, c.dim_group, c.value, c.cohort, false AS is_total, " +
+		"CASE WHEN c.k = 1 THEN c.one ELSE rb_and_cardinality(u.bm, z.bm) END AS people, c.n AS \"rows\", z.cohort_size, " + none +
+		" FROM " + cte("counts") + " AS c JOIN " + cte("sizes") + " AS z ON z.cohort = c.cohort LEFT JOIN " + cte("unions") + " AS u ON " + same("u", "c") +
+		" WHERE c.n > 0")
 	if spec.Totals {
-		// A member has one row in each group: a dimension's rows are the
-		// sum of its values', its people the members of their union.
+		// A dimension's people are the members of the union of its
+		// groups, its rows the sum of its values'.
 		b.WriteString("\nUNION ALL SELECT t.dimension, t.dim_group, CAST(NULL AS VARCHAR) AS value, z.cohort, true AS is_total, " +
 			"rb_and_cardinality(t.bm, z.bm) AS people, CAST(n.n AS BIGINT) AS \"rows\", z.cohort_size, " + none +
 			" FROM (SELECT dimension, dim_group, rb_or_agg(bm) AS bm FROM " + cte("groups") + " GROUP BY dimension, dim_group) AS t" +
-			" CROSS JOIN " + cte("sizes") + " AS z JOIN (SELECT dimension, dim_group, cohort, sum(people) AS n FROM " + cte("pairs") +
+			" CROSS JOIN " + cte("sizes") + " AS z JOIN (SELECT dimension, dim_group, cohort, sum(n) AS n FROM " + cte("pairs") +
 			" GROUP BY dimension, dim_group, cohort) AS n ON n.dimension = t.dimension AND n.dim_group IS NOT DISTINCT FROM t.dim_group AND n.cohort = z.cohort" +
 			" WHERE n.n > 0")
 	}

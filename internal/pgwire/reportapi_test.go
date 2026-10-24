@@ -501,6 +501,15 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	}
 	answered("segments", segments, true)
 	answered("a constant, over a table of one row a member", everyone, true)
+	// Values of several groups: a constant over the segments a condition
+	// keeps (E2's totals), values a map merges, and entries that merge.
+	answered("a constant over some segments", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
+		"source":     map[string]any{"table": "person_segments", "member": "person_id", "where": map[string]any{"segment_name": map[string]any{"like": "SEG_%"}}},
+		"dimensions": []any{map[string]any{"name": "TOTAL", "constant": "ANY"}}}, true)
+	answered("a map that merges values", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
+		"source": map[string]any{"table": "person_segments", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_1": "low", "SEG_2": "low", "SEG_3": "high"}},
+			map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_4": "low"}, "skip_blank": true}}}, true)
 
 	// A masking policy on a column read: the tables.
 	it.exec("CREATE MASKING POLICY same AS (v VARCHAR) RETURNS VARCHAR -> v",

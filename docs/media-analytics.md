@@ -449,12 +449,10 @@ the bitmaps are of the tables' current snapshots. And:
 
 - each cohort is a table whose conditions are on the columns of an index of
   it for its member;
-- each dimension is a column, with an index of the source by that column
-  alone, or a constant, with an index of the whole source (`ON ()`); the
-  source's conditions are on that column, and a dimension that maps its
-  values maps them one to one and skips blanks;
-- no two dimensions share a name and group, and there are no metrics and no
-  extent;
+- each dimension is a column or a constant, with an index of the source for
+  its member by that column and the columns of the source's conditions (by
+  those alone, for a constant: `ON ()` without conditions), and there are no
+  metrics and no extent;
 - every group of the bitmaps it reads has one row for each of its members,
   as a table of segment memberships does, so that a cohort's rows with a
   value are as many as its people. An index records each bitmap's rows and
