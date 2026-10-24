@@ -427,6 +427,10 @@ func (c *Catalog) createTable(w http.ResponseWriter, ns []string, body []byte, k
 	}
 	t := &tableState{ns: ns, name: req.Name, meta: meta}
 	t.metaLoc = t.nextMetadataLocation()
+	if err := writeMetadataFile(t); err != nil {
+		apiError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
+		return
+	}
 	if !req.StageCreate {
 		c.tables[k] = t
 		c.remember(key)
@@ -477,6 +481,9 @@ func (c *Catalog) commit(changes []tableChange) (int, string, error) {
 			t.ns, t.name, t.versions = old.ns, old.name, old.versions
 		}
 		t.metaLoc = t.nextMetadataLocation()
+		if err := writeMetadataFile(t); err != nil {
+			return http.StatusInternalServerError, "InternalServerError", err
+		}
 		results = append(results, result{k, t})
 	}
 	for _, r := range results {
@@ -546,6 +553,26 @@ func createOrder(action string) int {
 		return i
 	}
 	return len(order)
+}
+
+// writeMetadataFile writes t's metadata at its metadata location, when that
+// is a local path, as a real catalog writes it before it answers: DuckDB
+// reads a table's metadata from the file at times, as when another
+// connection of the same instance has just committed to the table, and
+// failed with "Cannot open file ...metadata.json" when it was not there.
+func writeMetadataFile(t *tableState) error {
+	loc := strings.TrimPrefix(t.metaLoc, "file://")
+	if !strings.HasPrefix(loc, "/") {
+		return nil
+	}
+	b, err := json.Marshal(t.meta)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(path.Dir(loc), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(loc, b, 0o644)
 }
 
 func (t *tableState) nextMetadataLocation() string {
