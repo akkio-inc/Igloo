@@ -88,7 +88,9 @@ jobs:
           echo "IGLOO_TEST_EXTENSION_DIR=$RUNNER_TEMP/duckdb-extensions" >>"$GITHUB_ENV"
 
       - name: Test
-        run: go test -tags duckdb_arrow ./...
+        # internal/pgwire alone takes 8-9 minutes on these runners, near go
+        # test's default limit of 10 a package.
+        run: go test -tags duckdb_arrow -timeout 20m ./...
 
   migrate:
     name: Migration report
