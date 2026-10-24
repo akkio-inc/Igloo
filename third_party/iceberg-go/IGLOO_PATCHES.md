@@ -26,6 +26,11 @@ were removed; the code is otherwise unchanged except for these patches:
 - `catalog/rest/rest.go`, `RenameView` (new): renames a view through the
   REST catalog's `views/rename` endpoint, as `RenameTable` does for tables.
   Igloo renames views for `ALTER VIEW ... RENAME TO`, which dbt runs.
+- `io/gocloud/s3.go`, `createS3Bucket`: the S3 client makes 10 attempts of
+  a request rather than the SDK's 3, unless `AWS_MAX_ATTEMPTS` or the AWS
+  config sets a number. S3 answers 503 SlowDown to a prefix that gets more
+  requests than it serves at once, and 3 attempts gave up on removals of a
+  distributed statement's exchanges.
 - `data_file_codec.go`: the manifest-entry schema cache is a small built-in
   LRU instead of `github.com/hashicorp/golang-lru`, which is MPL-2.0. Igloo
   links only permissively licensed code.

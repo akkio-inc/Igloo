@@ -124,6 +124,11 @@ type Worker struct {
 	// boot tells this run of the worker from others at its address: one
 	// that restarted holds no exchange files.
 	boot string
+	// httpfsOnce finds whether DuckDB has the httpfs extension loaded,
+	// whose settings storageRetries are; without it, the worker reads no
+	// object storage.
+	httpfsOnce sync.Once
+	httpfs     bool
 }
 
 // NewWorker returns a worker; call Serve to accept tasks.
@@ -381,6 +386,14 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 			w.fail(rw, http.StatusUnprocessableEntity, te)
 			return
 		}
+		if !te.Data && throttled(err) {
+			// The coordinator runs it again in a while.
+			log.Warn("object storage turned a task's requests away", "err", err)
+			te.Throttled = true
+			w.opts.Metrics.task("throttled", start)
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
 		log.Warn("task failed", "err", err)
 		w.opts.Metrics.task("error", start)
 		w.fail(rw, http.StatusUnprocessableEntity, te)
@@ -436,10 +449,44 @@ func (w *Worker) fail(rw http.ResponseWriter, status int, te *taskErr) {
 	_ = json.NewEncoder(rw).Encode(taskResult{Error: te})
 }
 
+// extensionLoaded reports whether DuckDB has the extension name loaded.
+func extensionLoaded(ctx context.Context, conn *duckdb.Conn, name string) bool {
+	rows, err := conn.QueryContext(ctx, "SELECT count(*) FROM duckdb_extensions() WHERE extension_name = "+quoteLiteral(name)+" AND loaded", nil)
+	if err != nil {
+		return false
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, 1)
+	if rows.Next(dest) != nil {
+		return false
+	}
+	n, _ := dest[0].(int64)
+	return n > 0
+}
+
+// taskFault, if set, fails a task with its error before it runs, for
+// tests.
+var taskFault func(req *taskRequest) error
+
+// storageRetries are DuckDB's retries, in a task's session, of a request
+// that object storage turns away for now (HTTP 429 or 5xx, S3's 503
+// SlowDown among them): 8 more tries, the second after 250 ms and each
+// after twice as long as the one before, half a minute in all. DuckDB's
+// own (3 more, from 0 to 400 ms) give up within half a second, as a HEAD
+// of an exchange's file did on 16 workers at a hundred times the data,
+// failing the statement. Past them, the coordinator runs the task again in
+// a while (see dispatch).
+var storageRetries = []string{"SET http_retries = 8", "SET http_retry_wait_ms = 250", "SET http_retry_backoff = 2"}
+
 // run runs a task on a connection of its own and writes the result to a
 // Parquet file, whose path it returns; a shuffle task writes it to object
 // storage instead, one directory per partition, and lists the files.
 func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult, error) {
+	if taskFault != nil {
+		if err := taskFault(req); err != nil {
+			return "", nil, err
+		}
+	}
 	if w.opts.Prefetch != nil {
 		if scans := w.prefetchScans(req); len(scans) > 0 {
 			w.opts.Prefetch(ctx, scans)
@@ -455,6 +502,14 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		return err
 	}
 
+	w.httpfsOnce.Do(func() { w.httpfs = extensionLoaded(ctx, conn, "httpfs") })
+	if w.httpfs {
+		for _, stmt := range storageRetries {
+			if err := exec(stmt); err != nil {
+				return "", nil, fmt.Errorf("set up retries of object storage's requests: %w", err)
+			}
+		}
+	}
 	for _, s := range req.Settings {
 		if !knownSetting(s.Name) {
 			return "", nil, fmt.Errorf("setting %s is not one tasks may change", s.Name)

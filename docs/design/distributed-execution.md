@@ -540,6 +540,17 @@ result's columns must match the prepared statement's, or it falls back.
   error) ran it and is healthy, and another would answer the same: the
   statement runs on the coordinator at once, and no worker is left out, so
   one user's failing statement cannot take workers away from everyone.
+- Object storage turning requests away for now (HTTP 429 or 5xx, S3's 503
+  SlowDown to a prefix that gets more requests than it serves at once) is
+  no error of the task's. A task's DuckDB session tries such a request 8
+  more times, the second after 250 ms and each after twice as long, half a
+  minute in all, where DuckDB's own 3 more give up within half a second;
+  past those, the worker says the task was throttled, and the coordinator
+  runs it again on the next worker after 2 s, then 6, 18 and 54 on average,
+  with jitter (`igloo_distributed_tasks_total{result="throttled"}`). A
+  HEAD of an exchange's file turned away on 16 workers at a hundred times
+  the data had failed a statement too large for one machine. Igloo's own S3
+  client makes 10 attempts of a request rather than the SDK's 3.
 - Partial results wait on the coordinator's disk until every task has
   answered; past a quarter of the room free there as the statement started
   (at least 1 GiB), it stops its tasks and runs on the coordinator. A

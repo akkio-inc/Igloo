@@ -619,6 +619,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- Object storage turning requests away for now no longer fails a
+  distributed statement: a HEAD of an exchange's file that S3 answered with
+  503 SlowDown, on 16 workers at a hundred times the data, failed a report
+  too large to run on one machine. Tasks' DuckDB sessions try such a
+  request 8 more times over half a minute rather than 3 within half a
+  second, the coordinator runs a task still turned away again up to four
+  times, with backoff and jitter
+  (`igloo_distributed_tasks_total{result="throttled"}`), and Igloo's own S3
+  client makes 10 attempts of a request rather than 3.
 - A distributed statement's partial results may take a quarter of the
   coordinator's free disk, at least 1 GiB, rather than 1 GiB: a report at a
   hundred times the data, whose groups the coordinator ranks, passed 1 GiB

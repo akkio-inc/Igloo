@@ -374,7 +374,10 @@ If a worker cannot be reached or stops in the middle of a statement, its
 share runs on another worker, and the failed worker is left out for 30
 seconds. A worker that answers a task with an error ran it and is healthy:
 the statement then runs on the coordinator at once, without trying other
-workers or leaving any out. If no worker can run it, its partial results
+workers or leaving any out. Object storage turning requests away for now
+(S3's 503 SlowDown) is not such an error: DuckDB tries the request again
+for half a minute, and the coordinator then runs the task again, up to four
+times over about a minute and a half. If no worker can run it, its partial results
 would take more than a quarter of the coordinator's free disk (at least
 1 GiB), or the parts cannot
 be combined, the statement also runs on the coordinator, so a client sees a

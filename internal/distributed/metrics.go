@@ -38,7 +38,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 		tasks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_distributed_tasks_total",
-			Help: "Fragments sent to workers, by result: ok, retried (failed and sent to another worker) or failed.",
+			Help: "Fragments sent to workers, by result: ok, retried (failed and sent to another worker), throttled (turned away by object storage and sent again in a while) or failed.",
 		}, []string{"result"}),
 		workers: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "igloo_distributed_workers",
@@ -138,7 +138,7 @@ func NewWorkerMetrics(reg prometheus.Registerer) *WorkerMetrics {
 	m := &WorkerMetrics{
 		tasks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_worker_tasks_total",
-			Help: "Fragments run for coordinators, by outcome: ok, error, canceled, out_of_memory (canceled as the worker ran out), bitmap_memory (its bitmaps outgrew their budget), or refused (files workers cannot read as the table says).",
+			Help: "Fragments run for coordinators, by outcome: ok, error, canceled, out_of_memory (canceled as the worker ran out), bitmap_memory (its bitmaps outgrew their budget), refused (files workers cannot read as the table says), or throttled (turned away by object storage past DuckDB's retries).",
 		}, []string{"outcome"}),
 		duration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "igloo_worker_task_seconds",

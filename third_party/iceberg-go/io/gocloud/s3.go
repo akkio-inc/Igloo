@@ -157,6 +157,14 @@ func createS3Bucket(ctx context.Context, parsed *url.URL, props map[string]strin
 		}
 		o.UsePathStyle = resolveUsePathStyle(endpoint, props)
 		o.DisableLogOutputChecksumValidationSkipped = true
+		// Igloo: S3 turns a prefix's requests away with 503 SlowDown when
+		// they come faster than it serves them; the SDK's default of 3
+		// attempts gave up on removals of a statement's exchanges. Unless
+		// AWS_MAX_ATTEMPTS or the config says otherwise, 10 attempts, with
+		// the standard retryer's backoff between them.
+		if o.RetryMaxAttempts == 0 {
+			o.RetryMaxAttempts = 10
+		}
 	})
 
 	// Create a *blob.Bucket.

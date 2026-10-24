@@ -178,9 +178,43 @@ type taskErr struct {
 	// Lost is the worker whose exchange files the task could not fetch:
 	// it stopped, or restarted without them.
 	Lost string `json:"lost,omitempty"`
+	// Throttled says object storage turned the task's requests away for
+	// now (see throttled): the same task may well run a moment later.
+	Throttled bool `json:"throttled,omitempty"`
 }
 
 func (e *taskErr) Error() string { return e.Message }
+
+// throttledError is a task that failed because object storage turned its
+// requests away for now, past DuckDB's own retries (see storageRetries).
+type throttledError struct{ msg string }
+
+func (e *throttledError) Error() string { return e.msg }
+
+// throttleSigns are how a request object storage turned away for now
+// reads in DuckDB's errors (HTTP Error: Request returned HTTP 503 for HTTP
+// HEAD to ...) and in S3's: S3 answers 503 SlowDown when one prefix gets
+// more requests than it serves at once, as an exchange's files of a
+// statement on 16 workers did at a hundred times the data.
+var throttleSigns = []string{
+	"HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+	"SlowDown", "Service Unavailable", "ServiceUnavailable", "TooManyRequests", "Reduce your request rate",
+}
+
+// throttled reports whether a task's error is object storage turning its
+// requests away for now, rather than anything the task does.
+func throttled(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range throttleSigns {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
 
 // workerStatus is what a worker reports about itself.
 type workerStatus struct {

@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	mrand "math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -74,6 +75,9 @@ const (
 	defaultBroadcast = 1 << 30
 	// maxAttempts is how often a task is tried, on different workers.
 	maxAttempts = 3
+	// maxThrottled is how often a task that object storage turned away
+	// is run again, after throttleWait, three times as long each time.
+	maxThrottled = 4
 )
 
 // Options configures a coordinator.
@@ -929,20 +933,26 @@ func assign(files []File, ws []*worker) [][]File {
 // returns the worker that ran it. A worker that answers with an error ran
 // the task and is healthy, and another would answer the same: the error
 // ends the job, without setting anyone's worker aside, and the statement
-// runs on the coordinator unless the error is in its data. The result goes
-// to path, within sp; a shuffle task writes each attempt to a directory of
-// its own, so the files of a failed attempt are never read.
+// runs on the coordinator unless the error is in its data. One error is
+// not the task's: object storage turning its requests away for now, past
+// DuckDB's retries (see storageRetries), which runs it again in a while,
+// on the next worker, up to maxThrottled times. The result goes to path,
+// within sp; a shuffle task writes each attempt to a directory of its own,
+// so the files of a failed attempt are never read.
 func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*worker, first int, path string, sp *spool) (*worker, *taskResult, error) {
 	var last error
-	for attempt := range min(maxAttempts, len(ws)) {
+	// tried counts the workers tried; runs, every attempt, which names its
+	// output.
+	tried, throttles := 0, 0
+	for runs := 0; tried < min(maxAttempts, len(ws)); runs++ {
 		t := *task
 		if t.Shuffle != "" {
-			t.Shuffle += "/a" + strconv.Itoa(attempt)
+			t.Shuffle += "/a" + strconv.Itoa(runs)
 		}
 		if t.Local != "" {
-			t.Local += "/a" + strconv.Itoa(attempt)
+			t.Local += "/a" + strconv.Itoa(runs)
 		}
-		w := ws[(first+attempt)%len(ws)]
+		w := ws[(first+tried+throttles)%len(ws)]
 		t.Worker = w.addr
 		body, err := json.Marshal(&t)
 		if err != nil {
@@ -960,11 +970,26 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 			// Every worker would refuse it.
 			return nil, nil, err
 		}
+		var th *throttledError
+		if errors.As(err, &th) && throttles < maxThrottled {
+			wait := throttleBackoff(throttles)
+			throttles++
+			co.opts.Metrics.task("throttled")
+			co.log.Warn("object storage turned a task's requests away; running it again in a while", "query", task.Query,
+				"task", task.Task, "worker", w.addr, "retry", throttles, "wait_seconds", wait.Seconds(), "err", err)
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
 		var te *transportError
 		if !errors.As(err, &te) {
 			co.opts.Metrics.task("failed")
 			return nil, nil, err
 		}
+		tried++
 		co.log.Warn("task failed on a worker; trying another", "query", task.Query, "task", task.Task, "worker", w.addr, "err", err)
 		co.opts.Metrics.task("retried")
 		co.pool.markDown(w.addr)
@@ -972,6 +997,22 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 	}
 	co.opts.Metrics.task("failed")
 	return nil, nil, fmt.Errorf("task %d failed on every worker tried: %w", task.Task, last)
+}
+
+// throttleWait is the wait before a task object storage turned away runs
+// again the first time; a variable for tests.
+var throttleWait = 2 * time.Second
+
+// throttleBackoff is the wait before the nth+1 run of a task object
+// storage turned away: throttleWait, three times as long each time, from
+// half to one and a half times that, so that tasks turned away together do
+// not come back together (2, 6, 18, 54 s on average).
+func throttleBackoff(n int) time.Duration {
+	d := throttleWait
+	for range n {
+		d *= 3
+	}
+	return d/2 + time.Duration(mrand.Int64N(int64(d)))
 }
 
 // transportError is a worker that could not be reached, broke off its
@@ -1008,6 +1049,9 @@ func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path s
 		}
 		if res.Error.Lost != "" {
 			return nil, &lostError{worker: res.Error.Lost, err: fmt.Errorf("a task on %s: %s", w.addr, res.Error.Message)}
+		}
+		if res.Error.Throttled {
+			return nil, &throttledError{msg: fmt.Sprintf("a task on %s: %s", w.addr, res.Error.Message)}
 		}
 		switch {
 		case res.Error.Bitmap:
