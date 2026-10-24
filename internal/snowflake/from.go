@@ -634,6 +634,9 @@ func fromItem(nodes []*node, alias string) (start, end int, as string, ok bool) 
 		if q := nextSig(nodes, i); q >= 0 && nodes[q].isOp(".") {
 			continue
 		}
+		if sameNamedTable(nodes, i, alias) {
+			continue // FROM t AS t: the alias names the item, not the table's name
+		}
 		if found >= 0 {
 			return 0, 0, "", false
 		}
@@ -688,6 +691,21 @@ func fromItem(nodes []*node, alias string) (start, end int, as string, ok bool) 
 		return 0, 0, "", false
 	}
 	return start, found + 1, nodes[found].String(), true
+}
+
+// sameNamedTable reports whether the name at nodes[i] is a table's name
+// that an alias of the same name, alias (upper case), follows: t in t AS t
+// or t t.
+func sameNamedTable(nodes []*node, i int, alias string) bool {
+	q := nextSig(nodes, i)
+	if q >= 0 && nodes[q].word() == "AS" {
+		q = nextSig(nodes, q)
+	}
+	if q < 0 {
+		return false
+	}
+	name, _, ok := nodes[q].name()
+	return ok && strings.ToUpper(name) == alias
 }
 
 // itemEnds are the words that may follow a FROM item.

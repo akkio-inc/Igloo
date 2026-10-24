@@ -100,6 +100,14 @@ func TestTranslate(t *testing.T) {
 		{`SELECT * FROM (VALUES (1)) v`, `SELECT * FROM (VALUES (1)) v(column1)`},
 		{`WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r`,
 			`WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r`},
+		{`WITH r AS (SELECT 1 AS n UNION ALL SELECT r.n + 1 FROM t JOIN r ON r.n = t.n) SELECT n FROM r`,
+			`WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT r.n + 1 FROM t JOIN r ON r.n = t.n) SELECT n FROM r`},
+		{`WITH r AS (SELECT 1 AS n UNION ALL SELECT r.n + 1 FROM t, r WHERE r.n = t.n) SELECT n FROM r`,
+			`WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT r.n + 1 FROM t, r WHERE r.n = t.n) SELECT n FROM r`},
+		// A column named like its common table expression is no reference
+		// to it.
+		{`WITH tags AS (SELECT t.tags, tags AS n FROM t GROUP BY t.tags, tags) SELECT * FROM tags`,
+			`WITH tags AS (SELECT t.tags, tags AS n FROM t GROUP BY t.tags, tags) SELECT * FROM tags`},
 		{`SELECT * FROM IDENTIFIER('db.sch.tbl')`, `SELECT * FROM db.sch.tbl`},
 		{`SELECT * FROM IDENTIFIER('"My Table"')`, `SELECT * FROM "My Table"`},
 		{`SELECT * FROM t PIVOT (SUM(v) FOR k IN ('a', 'b'))`, `SELECT * FROM t PIVOT (SUM(v) FOR k IN ('a' AS "'a'", 'b' AS "'b'"))`},
@@ -127,6 +135,24 @@ func TestTranslate(t *testing.T) {
 	} {
 		if got := translate(t, c.in).SQL; got != c.want {
 			t.Errorf("%s\n got: %s\nwant: %s", c.in, got, c.want)
+		}
+	}
+}
+
+// TestFlattenHoistedUnderItsTableName: a FLATTEN of objects is hoisted
+// into its FROM item's select list when the item's alias is its table's
+// name, as it is under another alias.
+func TestFlattenHoistedUnderItsTableName(t *testing.T) {
+	for _, from := range []string{"t as t", "t t", "T AS t"} {
+		res, err := Translate(`select cast(get_path(g.value, 'kind') as text), cast(v.value as text), count(distinct t.id) from `+from+`
+			cross join lateral flatten(input => [object_construct('kind', 'a', 'items', t.a), object_construct('kind', 'b', 'items', t.b)]) as g(seq, key, path, index, value, this)
+			cross join lateral flatten(input => get_path(g.value, 'items')) as v(seq, key, path, index, value, this)
+			where not cast(v.value as text) is null and trim(cast(v.value as text)) <> '' group by 1, 2`, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(res.SQL, "AS _sf_t FROM "+from) {
+			t.Errorf("from %s, not hoisted:\n%s", from, res.SQL)
 		}
 	}
 }

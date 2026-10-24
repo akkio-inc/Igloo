@@ -911,7 +911,7 @@ func (t *translator) recursiveCTE(nodes []*node) ([]*node, error) {
 			if m >= len(idx) || !nodes[idx[m]].isGroup('(') {
 				break
 			}
-			if mentions(nodes[idx[m]].kids, name) {
+			if readsRelation(nodes[idx[m]].kids, name) {
 				recursive = true
 			}
 			m++
@@ -929,13 +929,40 @@ func (t *translator) recursiveCTE(nodes []*node) ([]*node, error) {
 }
 
 // mentions reports whether nodes name name anywhere, as a word or quoted.
-func mentions(nodes []*node, name string) bool {
-	for _, n := range nodes {
-		if got, _, ok := n.name(); ok && strings.EqualFold(got, name) {
-			return true
+// readsRelation reports whether nodes, a query or part of one, read a
+// relation called name: name as a FROM item, after FROM, JOIN or a comma of
+// a FROM clause, and not part of a dotted name or a call. A column of the
+// same name, which a common table expression may well have, is not one.
+func readsRelation(nodes []*node, name string) bool {
+	idx := sig(nodes)
+	for k, i := range idx {
+		n := nodes[i]
+		if n.kind == kGroup || n.kind == kSeq {
+			if readsRelation(n.kids, name) {
+				return true
+			}
+			continue
 		}
-		if (n.kind == kGroup || n.kind == kSeq) && mentions(n.kids, name) {
+		got, _, ok := n.name()
+		if !ok || !strings.EqualFold(got, name) || k == 0 {
+			continue
+		}
+		if k+1 < len(idx) && (nodes[idx[k+1]].isOp(".") || nodes[idx[k+1]].isGroup('(')) {
+			continue
+		}
+		switch p := nodes[idx[k-1]]; {
+		case p.word() == "FROM" || p.word() == "JOIN":
 			return true
+		case p.isOp(","):
+			for j := k - 2; j >= 0; j-- {
+				w := nodes[idx[j]].word()
+				if w == "FROM" {
+					return true
+				}
+				if selectEnd[w] || w == "SELECT" {
+					break
+				}
+			}
 		}
 	}
 	return false
