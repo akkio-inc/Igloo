@@ -86,8 +86,11 @@ type Config struct {
 	// cost estimates of igloo.usage. Zero means unknown.
 	PricePerHour float64
 
-	DuckDB      DuckDB
-	Cache       Cache
+	DuckDB DuckDB
+	Cache  Cache
+	// Prefetch reads ahead, into the read cache, what scans are about to
+	// read (see package prefetch).
+	Prefetch    Prefetch
 	Catalog     Catalog
 	Storage     Storage
 	Maintenance Maintenance
@@ -132,6 +135,15 @@ type Cache struct {
 	// MaxSize caps the cache in bytes. Zero sizes it from the free space on
 	// Dir's disk.
 	MaxSize int64
+}
+
+// Prefetch configures reading ahead into the read cache.
+type Prefetch struct {
+	// Enabled is IGLOO_PREFETCH, off by default.
+	Enabled bool
+	// Concurrency is IGLOO_PREFETCH_CONCURRENCY: requests in flight for the
+	// whole process; zero means the prefetcher's default.
+	Concurrency int
 }
 
 // Maintenance controls automatic table maintenance: compaction, snapshot
@@ -485,6 +497,19 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("%s must be true or false: %w", name, err)
 		}
 		*dst = v
+	}
+
+	prefetch, err := strconv.ParseBool(get("IGLOO_PREFETCH", "false"))
+	if err != nil {
+		addErr("IGLOO_PREFETCH must be true or false: %w", err)
+	}
+	cfg.Prefetch.Enabled = prefetch
+	if v := get("IGLOO_PREFETCH_CONCURRENCY", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 4096 {
+			addErr("IGLOO_PREFETCH_CONCURRENCY must be a number from 1 to 4096, got %q", v)
+		}
+		cfg.Prefetch.Concurrency = n
 	}
 
 	idDomains, err := strconv.ParseBool(get("IGLOO_ID_DOMAINS", "false"))

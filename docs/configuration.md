@@ -205,6 +205,8 @@ disk, so that queries after a restart read them from there; see
 |---|---|---|
 | `IGLOO_CACHE_SIZE` | automatic | Largest size of the cache, e.g. `50GB` or `40GiB`. Automatic is half of the disk space other files leave free, up to 100 GiB. `0` turns the cache off. |
 | `IGLOO_CACHE_DIR` | `/var/lib/igloo/cache` in the image | Where the cache lives. Mount a volume here to keep it across restarts. |
+| `IGLOO_PREFETCH` | `false` | Read ahead, into the read cache, the blocks scans are about to read, with requests of its own; see [prefetch](operations.md#prefetch). |
+| `IGLOO_PREFETCH_CONCURRENCY` | `256` | Requests the prefetcher keeps in flight, for all statements together. |
 
 ## Table maintenance
 

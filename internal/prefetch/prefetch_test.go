@@ -1,0 +1,391 @@
+package prefetch
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	_ "github.com/duckdb/duckdb-go/v2"
+	"golang.org/x/sys/unix"
+)
+
+// localObject reads a local file as an object.
+type localObject struct {
+	*os.File
+	etag  string
+	delay time.Duration
+	reads *atomic.Int64
+}
+
+func (o *localObject) ReadAt(p []byte, off int64) (int, error) {
+	if o.delay > 0 {
+		time.Sleep(o.delay)
+	}
+	if o.reads != nil {
+		o.reads.Add(1)
+	}
+	return o.File.ReadAt(p, off)
+}
+
+func (o *localObject) ETag() string { return o.etag }
+
+// testFile writes a Parquet file of four columns, with field IDs 1 to 4,
+// in row groups of group rows, and returns its path.
+func testFile(t *testing.T, rows, group int) string {
+	t.Helper()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	path := filepath.Join(t.TempDir(), "data.parquet")
+	_, err = db.Exec(fmt.Sprintf(`COPY (SELECT md5(CAST(i AS VARCHAR)) AS id, i * 1.5 AS secs, 'genre_' || CAST(i %% 40 AS VARCHAR) AS genre,
+		md5(CAST(i * 7 AS VARCHAR)) || md5(CAST(i * 11 AS VARCHAR)) AS title
+		FROM range(%d) r(i)) TO '%s' (FORMAT parquet, ROW_GROUP_SIZE %d, FIELD_IDS {id: 1, secs: 2, genre: 3, title: 4})`, rows, path, group))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// chunkRanges returns, from DuckDB's parquet_metadata, the byte ranges of
+// the column chunks of column name in the file at path.
+func chunkRanges(t *testing.T, path, name string) [][2]int64 {
+	t.Helper()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT coalesce(nullif(dictionary_page_offset, 0), data_page_offset), total_compressed_size
+		FROM parquet_metadata(?) WHERE path_in_schema = ?`, path, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out [][2]int64
+	for rows.Next() {
+		var start, n int64
+		if err := rows.Scan(&start, &n); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, [2]int64{start, start + n})
+	}
+	return out
+}
+
+func TestBlockName(t *testing.T) {
+	sum := sha256.Sum256([]byte("s3://bucket/t/data/x.parquet"))
+	if got, want := BlockName("s3://bucket/t/data/x.parquet", 524288, 1000), hex.EncodeToString(sum[:])+"-x.parquet-524288-1000"; got != want {
+		t.Errorf("BlockName: %s, want %s", got, want)
+	}
+	p := &Prefetcher{opts: Options{BlockSize: 100}}
+	f := &openFile{File: File{Path: "s3://b/f", Size: 350}}
+	var got []string
+	for _, b := range p.blocksOf(f, [][2]int64{{250, 320}, {10, 20}, {90, 110}, {340, 350}, {5, 5}}) {
+		got = append(got, fmt.Sprintf("%d+%d", b.offset, b.length))
+	}
+	if strings.Join(got, " ") != "0+100 100+100 200+100 300+50" {
+		t.Errorf("blocks: %v", got)
+	}
+}
+
+// blockFiles lists the blocks in dir, as offset+length, and checks each is
+// marked as cache_httpfs marks its own.
+func blockFiles(t *testing.T, dir, path, etag string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := BlockName(path, 0, 0)
+	prefix = prefix[:len(prefix)-len("0-0")]
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), tmpSuffix) {
+			// Being written.
+			continue
+		}
+		rest, ok := strings.CutPrefix(e.Name(), prefix)
+		if !ok {
+			t.Errorf("a file of another name: %s", e.Name())
+			continue
+		}
+		buf := make([]byte, 256)
+		n, err := unix.Getxattr(filepath.Join(dir, e.Name()), pathAttr, buf)
+		if err != nil || string(buf[:n]) != path {
+			t.Errorf("%s: path attribute %q, %v", e.Name(), buf[:max(n, 0)], err)
+		}
+		n, err = unix.Getxattr(filepath.Join(dir, e.Name()), versionAttr, buf)
+		if err != nil || string(buf[:n]) != etag {
+			t.Errorf("%s: version attribute %q, %v", e.Name(), buf[:max(n, 0)], err)
+		}
+		out = append(out, strings.Replace(rest, "-", "+", 1))
+	}
+	slices.SortFunc(out, func(a, b string) int {
+		x, _ := strconv.ParseInt(strings.Split(a, "+")[0], 10, 64)
+		y, _ := strconv.ParseInt(strings.Split(b, "+")[0], 10, 64)
+		return int(x - y)
+	})
+	return out
+}
+
+func expectedBlocks(size, block int64, ranges [][2]int64) []string {
+	p := &Prefetcher{opts: Options{BlockSize: block}}
+	var out []string
+	for _, b := range p.blocksOf(&openFile{File: File{Size: size}}, ranges) {
+		out = append(out, fmt.Sprintf("%d+%d", b.offset, b.length))
+	}
+	return out
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestColumns reads ahead the blocks of one column of a file, and its
+// footer, and nothing else, each marked as cache_httpfs marks its blocks.
+func TestColumns(t *testing.T) {
+	local := testFile(t, 200000, 10000)
+	st, _ := os.Stat(local)
+	const path, etag, block = "s3://bucket/t/data/f.parquet", `"v1"`, 64 << 10
+	dir := t.TempDir()
+	p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 8, Open: func(ctx context.Context, p string) (Object, error) {
+		if p != path {
+			return nil, fmt.Errorf("opened %s", p)
+		}
+		f, err := os.Open(local)
+		return &localObject{File: f, etag: etag}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ranges := append(chunkRanges(t, local, "secs"), [2]int64{st.Size() - footerGuess, st.Size()})
+	want := expectedBlocks(st.Size(), block, ranges)
+	stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}, FieldIDs: []int32{2}}})
+	waitFor(t, "the blocks", func() bool { return len(blockFiles(t, dir, path, etag)) >= len(want) })
+	stop()
+	time.Sleep(100 * time.Millisecond)
+	if got := blockFiles(t, dir, path, etag); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("blocks\n got %v\nwant %v", got, want)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*"+tmpSuffix)); len(left) > 0 {
+		t.Errorf("blocks left half written: %v", left)
+	}
+	// What is in the cache already is not fetched again.
+	var reads atomic.Int64
+	p2, err := New(Options{Dir: dir, BlockSize: block, Open: func(ctx context.Context, _ string) (Object, error) {
+		f, err := os.Open(local)
+		return &localObject{File: f, etag: etag, reads: &reads}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	stop = p2.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}, FieldIDs: []int32{2}}})
+	time.Sleep(300 * time.Millisecond)
+	stop()
+	if reads.Load() != 0 {
+		t.Errorf("%d blocks read again", reads.Load())
+	}
+}
+
+// TestAhead keeps a statement's blocks that DuckDB has not read within its
+// share of the cache's room, and goes on as DuckDB reads them; those it
+// skips count as overfetch.
+func TestAhead(t *testing.T) {
+	local := testFile(t, 400000, 10000)
+	st, _ := os.Stat(local)
+	const path, block = "s3://bucket/t/data/f.parquet", 64 << 10
+	dir := t.TempDir()
+	p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return 0 },
+		Open: func(ctx context.Context, _ string) (Object, error) {
+			f, err := os.Open(local)
+			return &localObject{File: f}, err
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if !p.atime {
+		t.Skip("the test's file system keeps no access times")
+	}
+	saved := minAhead
+	minAhead = 3 * block
+	defer func() { minAhead = saved }()
+	stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}}})
+	defer stop()
+	count := func() int {
+		entries, _ := os.ReadDir(dir)
+		return len(entries)
+	}
+	// The footer's blocks, then three ahead.
+	waitFor(t, "the first blocks", func() bool { return count() >= 3 })
+	time.Sleep(300 * time.Millisecond)
+	first := count()
+	if first > 5 {
+		t.Fatalf("%d blocks ahead of a scan that read none", first)
+	}
+	// DuckDB reads them all; the prefetcher goes on.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if _, err := os.ReadFile(filepath.Join(dir, e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "more blocks", func() bool { return count() > first })
+}
+
+// TestSharing lets concurrent statements take the requests in flight in
+// turn.
+func TestSharing(t *testing.T) {
+	local := testFile(t, 400000, 10000)
+	st, _ := os.Stat(local)
+	dir := t.TempDir()
+	var mu sync.Mutex
+	var order []string
+	p, err := New(Options{Dir: dir, BlockSize: 64 << 10, Concurrency: 1, Open: func(ctx context.Context, path string) (Object, error) {
+		f, err := os.Open(local)
+		return &recordingObject{localObject: localObject{File: f}, path: path, mu: &mu, order: &order}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	stopA := p.Start(context.Background(), []Scan{{Files: []File{{Path: "s3://b/a/f.parquet", Size: st.Size()}}}})
+	stopB := p.Start(context.Background(), []Scan{{Files: []File{{Path: "s3://b/b/f.parquet", Size: st.Size()}}}})
+	waitFor(t, "reads of both", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(order) >= 20
+	})
+	stopA()
+	stopB()
+	mu.Lock()
+	defer mu.Unlock()
+	a := 0
+	for _, o := range order[:20] {
+		if strings.Contains(o, "/a/") {
+			a++
+		}
+	}
+	if a < 6 || a > 14 {
+		t.Errorf("of the first 20 reads, %d were statement A's: %v", a, order[:20])
+	}
+}
+
+type recordingObject struct {
+	localObject
+	path  string
+	mu    *sync.Mutex
+	order *[]string
+}
+
+func (o *recordingObject) ReadAt(p []byte, off int64) (int, error) {
+	time.Sleep(2 * time.Millisecond)
+	o.mu.Lock()
+	*o.order = append(*o.order, o.path)
+	o.mu.Unlock()
+	return o.File.ReadAt(p, off)
+}
+
+// TestCacheHTTPFSReadsBlocks checks the naming and marking against the
+// cache_httpfs extension Igloo bakes into its image: after the prefetcher
+// read a column ahead, DuckDB reads it without a request to object
+// storage, with the cache set up as Igloo sets it up. A new version of the
+// extension that names or marks blocks otherwise fails here.
+func TestCacheHTTPFSReadsBlocks(t *testing.T) {
+	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
+	if ext == "" {
+		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
+	}
+	local := testFile(t, 300000, 100000)
+	st, _ := os.Stat(local)
+	const etag = `"1234-5678"`
+	var gets atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bucket/t/data/f.parquet" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Last-Modified", st.ModTime().UTC().Format(http.TimeFormat))
+		if r.Method == http.MethodGet {
+			gets.Add(1)
+		}
+		http.ServeFile(w, r, local)
+	}))
+	defer srv.Close()
+	const path = "s3://bucket/t/data/f.parquet"
+	dir := t.TempDir()
+	p, err := New(Options{Dir: dir, Open: func(ctx context.Context, _ string) (Object, error) {
+		f, err := os.Open(local)
+		return &localObject{File: f, etag: etag}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	stop := p.Start(context.Background(), []Scan{{Files: []File{{Path: path, Size: st.Size()}}, FieldIDs: []int32{1}}})
+	want := expectedBlocks(st.Size(), DefaultBlockSize, append(chunkRanges(t, local, "id"), [2]int64{st.Size() - footerGuess, st.Size()}))
+	waitFor(t, "the blocks", func() bool { return len(blockFiles(t, dir, path, etag)) >= len(want) })
+	stop()
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	for _, q := range []string{
+		"SET extension_directory = '" + ext + "'", "LOAD httpfs", "LOAD cache_httpfs",
+		"SET s3_endpoint = '" + host + "'", "SET s3_use_ssl = false", "SET s3_url_style = 'path'", "SET s3_region = 'us-east-1'",
+		"SET s3_access_key_id = 'x'", "SET s3_secret_access_key = 'y'",
+		// As engine.cacheStatements sets the cache up.
+		"SET GLOBAL cache_httpfs_enable_glob_cache = false", "SET GLOBAL cache_httpfs_enable_metadata_cache = false",
+		"SET GLOBAL cache_httpfs_enable_file_handle_cache = false", "SET GLOBAL cache_httpfs_enable_cache_validation = true",
+		"SET GLOBAL cache_httpfs_cache_directory = '" + dir + "'", "SET GLOBAL cache_httpfs_evict_policy = 'lru_sp'",
+		"SET GLOBAL cache_httpfs_min_disk_bytes_for_cache = 1", "SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = false",
+		"SET GLOBAL cache_httpfs_type = 'on_disk'",
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	var n int64
+	if err := db.QueryRow("SELECT count(DISTINCT id) FROM read_parquet('" + path + "')").Scan(&n); err != nil || n != 300000 {
+		t.Fatalf("count: %d, %v", n, err)
+	}
+	if g := gets.Load(); g != 0 {
+		t.Errorf("DuckDB made %d GET requests for blocks the prefetcher had read ahead", g)
+	}
+	// A column it did not read ahead is fetched as usual.
+	if err := db.QueryRow("SELECT count(DISTINCT title) FROM read_parquet('" + path + "')").Scan(&n); err != nil || n != 300000 {
+		t.Fatalf("count of titles: %d, %v", n, err)
+	}
+	if gets.Load() == 0 {
+		t.Error("DuckDB found the other column's blocks too, so the test proves nothing")
+	}
+}

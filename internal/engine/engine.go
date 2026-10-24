@@ -24,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
 // attachRetryInterval is how long Open waits between attempts to reach the
@@ -62,6 +63,8 @@ type Engine struct {
 	catalogViewer atomic.Pointer[CatalogViewer]
 	// cache is the on-disk read cache, or nil when it is off.
 	cache *readCache
+	// prefetcher reads ahead into the cache, or is nil (see setupPrefetch).
+	prefetcher *prefetch.Prefetcher
 	// history supplies the history functions; see SetHistory.
 	history atomic.Pointer[historyConfig]
 	// jobHistory supplies the job history functions; see SetJobHistory.
@@ -483,6 +486,9 @@ func (e *Engine) SetCatalogGuard(g catalogproxy.Guard) {
 // Close shuts DuckDB down. Sessions must be closed first: DuckDB's database
 // closes, deleting its spill files, as the last connection to it closes.
 func (e *Engine) Close() error {
+	if e.prefetcher != nil {
+		e.prefetcher.Close()
+	}
 	e.stopCache()
 	e.parser.close()
 	err := e.connector.Close()

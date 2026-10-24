@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -227,5 +228,49 @@ igloo_cache_size_bytes 7
 `
 	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "igloo_cache_size_bytes"); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestSetupPrefetch starts the prefetcher with the read cache when
+// IGLOO_PREFETCH is on, with its metrics among the engine's, and not
+// otherwise.
+func TestSetupPrefetch(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, on := range []bool{false, true} {
+		cfg := s3Config(t.TempDir())
+		cfg.Prefetch.Enabled = on
+		e := &Engine{}
+		if err := e.setupCache((&recorder{}).exec, cfg, log); err != nil {
+			t.Fatal(err)
+		}
+		if (e.Prefetcher() != nil) != on {
+			t.Fatalf("IGLOO_PREFETCH=%v: prefetcher %v", on, e.Prefetcher())
+		}
+		reg := prometheus.NewRegistry()
+		reg.MustRegister(e.Metrics()...)
+		families, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, f := range families {
+			found = found || f.GetName() == "igloo_prefetch_bytes_total"
+		}
+		if found != on {
+			t.Errorf("IGLOO_PREFETCH=%v: prefetch metrics %v", on, found)
+		}
+		if p := e.Prefetcher(); p != nil {
+			p.Close()
+		}
+	}
+	// Without the cache, nothing to read ahead into.
+	cfg := s3Config("")
+	cfg.Prefetch.Enabled = true
+	e := &Engine{}
+	if err := e.setupCache((&recorder{}).exec, cfg, log); err != nil || e.Prefetcher() != nil {
+		t.Errorf("without a cache: %v %v", err, e.Prefetcher())
+	}
+	if _, err := (&objectOpener{}).open(context.Background(), "s3:/bucket"); err == nil {
+		t.Error("opened a path without a bucket and key")
 	}
 }

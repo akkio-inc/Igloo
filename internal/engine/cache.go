@@ -130,6 +130,7 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 	} else {
 		log.Warn("read cache paused: its disk is almost full", "dir", dir, "disk_free", avail)
 	}
+	e.setupPrefetch(cfg, dir, log)
 	return nil
 }
 
@@ -299,6 +300,10 @@ func (c *readCache) adjustments(reserve uint64, on bool, used uint64) []string {
 // Metrics are the read cache's Prometheus metrics. They read zero while the
 // cache is off.
 func (e *Engine) Metrics() []prometheus.Collector {
+	var extra []prometheus.Collector
+	if e.prefetcher != nil {
+		extra = e.prefetcher.Collectors()
+	}
 	gauge := func(name, help string, v func(*readCache) *atomic.Uint64) prometheus.Collector {
 		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help}, func() float64 {
 			if e.cache == nil {
@@ -307,14 +312,14 @@ func (e *Engine) Metrics() []prometheus.Collector {
 			return float64(v(e.cache).Load())
 		})
 	}
-	return []prometheus.Collector{
+	return append([]prometheus.Collector{
 		gauge("igloo_cache_size_bytes",
 			"Bytes of object storage data cached on local disk, measured every 5 minutes.",
 			func(c *readCache) *atomic.Uint64 { return &c.size }),
 		gauge("igloo_cache_limit_bytes",
 			"Size the local disk cache may grow to, given the disk's free space, measured every 5 minutes.",
 			func(c *readCache) *atomic.Uint64 { return &c.limit }),
-	}
+	}, extra...)
 }
 
 // checkWritable creates dir if needed and makes sure files can be written

@@ -496,6 +496,30 @@ community extension, baked into the image like the other extensions; DuckDB
 checks its signature when it loads. If it cannot load or its directory is
 not writable, Igloo logs a warning and runs without it.
 
+
+### Prefetch
+
+Reading object storage cold waits on requests, not on cores: each DuckDB
+thread reads a row group's column chunks a request round after another, so
+how fast a cold scan reads follows the threads, which Igloo caps by memory
+(see [sizing](#sizing)). With `IGLOO_PREFETCH=true`, Igloo reads ahead, into
+the read cache, the blocks of the data files a statement's scans are about
+to read, with `IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all
+statements together, which take them in turn; DuckDB then reads the blocks
+from local disk. Against an object store with S3's latency, a cold scan on
+12 threads with prefetch ran 1.9 times as fast as on 32 threads without.
+
+- It reads each file's footer, then the blocks of the columns the statement
+  reads, in the order the scan reads the files, and keeps at most a quarter
+  of the cache's room for blocks DuckDB has not read yet, so they do not
+  evict each other or other statements' blocks first.
+- A block it has not fetched yet, or fails to, DuckDB fetches itself:
+  prefetch only ever costs requests. Overfetch, blocks it read that the
+  scans did not, shows in `igloo_prefetch_unread_bytes_total`.
+- It needs the read cache, on a filesystem with extended attributes; it
+  writes blocks as the cache's extension does. At startup the log says
+  `prefetch on`, or why it is off.
+
 ## Connections to other databases
 
 [Connections](federation.md) to PostgreSQL, MySQL and Snowflake databases are kept in
@@ -646,6 +670,9 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_maintenance_orphan_files_deleted_total` | | Unreferenced files deleted |
 | `igloo_cache_size_bytes` | | Bytes in the [read cache](#read-cache), measured every 5 minutes |
 | `igloo_cache_limit_bytes` | | Size the read cache may grow to, given the disk's free space; 0 while it is off or paused |
+| `igloo_prefetch_bytes_total`, `igloo_prefetch_blocks_total` | | Bytes and blocks the [prefetcher](#prefetch) read ahead into the read cache |
+| `igloo_prefetch_unread_bytes_total` | | Bytes it read ahead that the scans did not read (overfetch); not counted on a filesystem without access times |
+| `igloo_prefetch_present_blocks_total`, `igloo_prefetch_errors_total` | | Blocks it found cached already, and reads ahead that failed (the scans then read the block themselves) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |
