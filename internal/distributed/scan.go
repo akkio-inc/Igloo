@@ -340,10 +340,14 @@ func (w *scanWalk) from(ref node, covered func(alias string) bool, qualify quali
 		if err := w.from(child(ref, "right"), covered, qualify); err != nil {
 			return err
 		}
+		filters := w.joinFilters(ref, qualify)
 		for _, u := range list(ref, "using_columns") {
 			w.names[strings.ToLower(str(u))] = true
+			if filters {
+				w.filters[strings.ToLower(str(u))] = true
+			}
 		}
-		return w.exprs(ref["condition"], qualify, false)
+		return w.exprs(ref["condition"], qualify, filters)
 	case "TABLE_FUNCTION":
 		return w.exprs(ref["function"], qualify, false)
 	case "EMPTY":
@@ -351,6 +355,52 @@ func (w *scanWalk) from(ref node, covered func(alias string) bool, qualify quali
 	}
 	// PIVOT and the like.
 	return w.anything(ref, qualify)
+}
+
+// joinFilters reports whether a join lets DuckDB skip row groups of the
+// catalog tables it joins, by the columns its condition names: a semi
+// join, or an inner join to a relation that is no catalog table (a common
+// table expression, a subquery or, in a task, an exchange), such as an
+// audience, whose keys DuckDB filters the scan of the other side by as it
+// builds the join. Such a scan reads ahead as one a WHERE clause filters
+// (see Scan.Filtered): what DuckDB reads of it is not known before it runs.
+func (w *scanWalk) joinFilters(ref node, qualify qualifier) bool {
+	switch str(ref["join_type"]) {
+	case "SEMI":
+		return true
+	case "INNER":
+		return w.relationRef(child(ref, "left"), qualify) || w.relationRef(child(ref, "right"), qualify)
+	}
+	return false
+}
+
+// relationRef reports whether a FROM item is a relation rather than a
+// catalog table: a subquery, a common table expression, or a name that
+// means no catalog table.
+func (w *scanWalk) relationRef(ref node, qualify qualifier) bool {
+	switch str(ref["type"]) {
+	case "SUBQUERY":
+		return true
+	case "BASE_TABLE":
+		parts := tableParts(ref)
+		if len(parts) == 1 && w.ctes[strings.ToLower(parts[0])] {
+			return true
+		}
+		if qualify != nil {
+			q, ok, err := qualify(w.ctx, parts)
+			if err != nil || !ok {
+				return false
+			}
+			parts = q
+		}
+		_, _, ok, err := w.env.Resolve(w.ctx, parts)
+		if err != nil || ok {
+			return false
+		}
+		view, ok, err := w.env.ViewDefinition(w.ctx, parts)
+		return err == nil && (!ok || view == nil)
+	}
+	return false
 }
 
 // table walks a table name in FROM: a catalog table, a common table

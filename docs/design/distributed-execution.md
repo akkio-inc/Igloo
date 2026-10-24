@@ -401,7 +401,9 @@ statement runs on the coordinator.
 Each task's view of a table also carries its files' sizes and the field
 IDs of the columns the fragment may read: those it names, or every column
 through a star whose columns the result needs, and whether its WHERE
-names one, for which the prefetcher reads less ahead. A worker with the
+names one, or a semi join or an inner join to a relation (an audience, an
+exchange) does, whose keys DuckDB skips row groups by as it builds the
+join; for those the prefetcher reads less ahead. A worker with the
 prefetcher on hands them to it as the task starts, so that it reads those
 columns' chunks into the read cache ahead of DuckDB; whether it does is
 the worker's own setting. Views of exchanges carry nothing: DuckDB reads

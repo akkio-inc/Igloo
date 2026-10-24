@@ -538,7 +538,9 @@ from local disk. Against an object store with S3's latency, a cold scan on
   leaves out, are not read ahead. The scans are those distributed
   execution would plan; until filters prune their file lists, a scan of a
   table the statement filters, or a task's of a table its part filters,
-  reads ahead at most 256 MiB. A session turns it off
+  reads ahead at most 256 MiB, as does one of a table semi-joined, or
+  inner-joined to a relation such as an audience, whose keys DuckDB skips
+  row groups by. A session turns it off
   for itself with `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
 - It needs the read cache, on a filesystem with extended attributes; it
   writes blocks as the cache's extension does. At startup the log says

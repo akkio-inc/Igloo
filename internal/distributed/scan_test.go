@@ -101,6 +101,13 @@ func TestScanColumns(t *testing.T) {
 		{"SELECT m FROM (SELECT max(COLUMNS(*)) AS m FROM t) AS q", map[string]string{"t": "a,b,c,s"}},
 		{"SELECT a FROM t NATURAL JOIN u", map[string]string{"t": "a,b,c,s", "u": "k,l"}},
 		{"SELECT k FROM t JOIN u USING (a)", map[string]string{"t": "a", "u": "k"}},
+		// A semi join, or an inner join to a relation, filters the scans by
+		// the join's columns as DuckDB builds the join; an outer join does
+		// not.
+		{"WITH aud AS (SELECT DISTINCT k FROM u WHERE l = 1) SELECT t.b FROM t JOIN aud ON aud.k = t.a", map[string]string{"t": "a,b*", "u": "k,l*"}},
+		{"SELECT t.b FROM t JOIN (SELECT k FROM u) AS q ON q.k = t.a", map[string]string{"t": "a,b*", "u": "k*"}},
+		{"SELECT t.b FROM t SEMI JOIN u ON u.k = t.a", map[string]string{"t": "a,b*", "u": "k*"}},
+		{"SELECT t.b FROM t LEFT JOIN (SELECT k FROM u) AS q ON q.k = t.a", map[string]string{"t": "a,b", "u": "k"}},
 	} {
 		w, err := walkScans(context.Background(), p, tc.query, env)
 		if err != nil {

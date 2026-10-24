@@ -673,6 +673,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Opens cut short by a task's end no longer count in
   `igloo_prefetch_errors_total`, and the startup line gives the
   prefetcher's concurrency rather than 0 when it is unset.
+- A scan of a table semi-joined, or inner-joined to a relation (a common
+  table expression, a subquery, an exchange), such as an audience, reads
+  ahead at most 256 MiB, as a filtered one does: DuckDB skips its row
+  groups by the join's keys as it builds the join, so what it reads is not
+  known before it runs.
 - Workers read ahead of a filtered scan of a task's table at most 256 MiB,
   as the replica does of its own: tasks did not say their part filters the
   table, so workers read ahead every row group of the columns it reads,
