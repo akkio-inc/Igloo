@@ -55,18 +55,17 @@ func ParseMode(s string) (Mode, bool) {
 }
 
 // When a part of a statement is worth considering for workers, in auto
-// mode: when the coordinator would take a while to read the table it would
-// divide, cold, at its threads a core (see coldRateAt). Running workers are
-// considered for parts of a few seconds; workers are started only for parts
-// of a minute or more, besides the start, since a start takes a while and
-// started workers run until they have been idle for a while. The estimates
-// then decide (see choose). At 64 MiB/s a core, as this once took the
-// coordinator to read, a report's table of 77 GB at ten times the data was
-// held under the minute; read cold, it took 259 s on one machine and 40 s on
-// workers.
+// mode: when the coordinator would take a few seconds to read the table it
+// would divide, cold, at its threads a core (see coldRateAt), whether the
+// workers run or are stopped. The estimates then decide (see choose),
+// counting stopped workers' start (see fleet), and the statement's history
+// what it took on one machine. Workers stopped were once considered only
+// for parts of a minute's reading and their start, about 20 GB: a report
+// that took 1,798 s on one machine at ten times the data, its largest
+// table 6.2 GB, stayed there again, with workers stopped, though they had
+// taken 362 s.
 const (
 	warmSeconds = 4
-	coldSeconds = 60
 	// bytesPerWorker is how much of the divided table each worker should
 	// get at least; smaller statements use fewer workers.
 	bytesPerWorker = 1 << 30
@@ -276,7 +275,11 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, err
 	}
 	if !d.onWorkers {
-		return nil, &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key}
+		u := &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key}
+		if d.e.workers > 0 && !math.IsInf(d.e.onWorkers, 1) {
+			u.oneMachine = d.e.oneMachine
+		}
+		return nil, u
 	}
 	return plan, nil
 }
@@ -313,7 +316,7 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 			opts.maxBroadcast = mem / 8
 		}
 	case co.pool.canStart():
-		opts.minBytes = rate*coldSeconds + int64(co.pool.startEstimate().Seconds())*rate
+		opts.minBytes = rate * warmSeconds
 		// The workers it would start are those that ran before: a table
 		// of 1.8 GB that workers of 24 GiB read in full would otherwise be
 		// held to defaultBroadcast while they are stopped.
@@ -342,6 +345,12 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	plan, err := newPlanner(ctx, env, co.parser, co.aggs, opts).plan(stmt)
 	if err != nil {
+		var u *errUnsupported
+		if len(ws) == 0 && errors.As(err, &u) {
+			// Not that they are stopped, but why the statement would not run
+			// on them if they ran.
+			err = &errUnsupported{reason: "workers are stopped; " + u.reason, key: u.key}
+		}
 		return nil, nil, err
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
@@ -366,6 +375,9 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	now := time.Now()
 	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
+	if len(ws) == 0 {
+		reason = "workers are stopped; " + reason
+	}
 	d.onWorkers, d.reason = onWorkers, reason
 	if dry {
 		return plan, d, nil

@@ -592,6 +592,74 @@ func TestForcedByNonAdmins(t *testing.T) {
 	}
 }
 
+// With every worker stopped, auto mode weighs a statement as it would with
+// them running, their start counted, and its reasons say they are
+// stopped. A report that took 1,798 s on one machine at ten times the
+// data, its largest table 6.2 GB, ran there again with workers stopped,
+// though they had taken 362 s: they were considered only for tables of a
+// minute's reading, about 20 GB, and its tables were "small".
+func TestAutoWithWorkersStopped(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	compute := &fakeCompute{}
+	var addrs []string
+	for _, ln := range h.lns {
+		addrs = append(addrs, ln.Addr().String())
+	}
+	co, err := NewCoordinator(Options{
+		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 16, Threads: 24, Storage: NewStorage(icebergio.LocalFS{}),
+		Pool: PoolOptions{Addresses: addrs, Compute: compute, MaxWorkers: 16, StartTimeout: time.Second},
+	}, h.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer co.Close()
+	for i := range h.workers {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		_ = h.workers[i].Shutdown(ctx)
+		cancel()
+		h.lns[i].Close()
+	}
+	co.pool.refresh(t.Context())
+	li := h.tables["lineitem"]
+	defer func(b, r int64) { li.Bytes, li.Rows = b, r }(li.Bytes, li.Rows)
+	li.Bytes, li.Rows = 6_200_000_000, 600_000_000
+	q := `SELECT l_returnflag, count(*), sum(l_quantity) FROM lineitem GROUP BY 1`
+	_, err = co.Plan(t.Context(), q, harnessEnv{h}, ModeAuto)
+	key := PlanKey(err)
+	if err != nil && (key == "" || !strings.Contains(err.Error(), "workers are stopped; ")) {
+		t.Fatalf("a table of 6.2 GB with workers stopped: %v", err)
+	}
+	// It took 1,798 s on one machine: workers, started.
+	co.Observe(key, 0, 1798*time.Second)
+	if _, err := co.Plan(t.Context(), q, harnessEnv{h}, ModeAuto); err != nil {
+		t.Errorf("after 1,798 s on one machine, with workers stopped: %v", err)
+	}
+	// A small table stays on one machine, and says why.
+	li.Bytes, li.Rows = 1<<20, 6000
+	_, err = co.Plan(t.Context(), q, harnessEnv{h}, ModeAuto)
+	if !IsUnsupported(err) || !strings.Contains(err.Error(), "workers are stopped; ") || !strings.Contains(err.Error(), "small") {
+		t.Errorf("a small table with workers stopped: %v", err)
+	}
+	if _, ok := LocalEstimate(err); ok {
+		t.Error("a statement workers would not run has a local estimate for the guard")
+	}
+}
+
+// The guard's estimate is that of a statement auto mode chose to run on
+// one machine though workers could run it, and of no other.
+func TestLocalEstimate(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	h.tables["lineitem"].Bytes = 1 << 30
+	_, err := h.co.Plan(t.Context(), `SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1`, harnessEnv{h}, ModeAuto)
+	if d, ok := LocalEstimate(err); !ok || d <= 0 || !strings.Contains(err.Error(), "one machine is faster") {
+		t.Errorf("auto mode's choice of one machine: %v, %v %v", err, d, ok)
+	}
+	if _, ok := LocalEstimate(unsupported("nothing to divide among workers")); ok {
+		t.Error("an unsupported statement has a local estimate")
+	}
+}
+
 // scaleLog records what workers a pool asked for.
 type scaleLog struct {
 	mu    sync.Mutex

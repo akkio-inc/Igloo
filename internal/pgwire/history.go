@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -211,6 +213,57 @@ type tagWriter struct {
 	// wrote is the rows a CREATE TABLE ... AS wrote, if took.
 	wrote int64
 	took  bool
+	// gate, while a guard watches the statement's run (see guardLocal),
+	// keeps its first output and the guard from both happening.
+	gate *rowGate
+}
+
+// rowGate keeps a statement's first output to the client and its guard's
+// cancel (see guardLocal) from both happening: once output has begun, the
+// guard does not fire, and once it fired, no output follows.
+type rowGate struct {
+	mu           sync.Mutex
+	begun, fired bool
+}
+
+// errGuardFired is what output fails with after the guard fired.
+var errGuardFired = errors.New("the statement is being run on workers instead")
+
+func (g *rowGate) begin() error {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fired {
+		return errGuardFired
+	}
+	g.begun = true
+	return nil
+}
+
+func (g *rowGate) fire() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.begun {
+		return false
+	}
+	g.fired = true
+	return true
+}
+
+func (w *tagWriter) Row(values []any) error {
+	if err := w.gate.begin(); err != nil {
+		return err
+	}
+	return w.DataWriter.Row(values)
+}
+
+func (w *tagWriter) Empty() error {
+	if err := w.gate.begin(); err != nil {
+		return err
+	}
+	return w.DataWriter.Empty()
 }
 
 func (w *tagWriter) tookRows(n int64) {
@@ -219,6 +272,9 @@ func (w *tagWriter) tookRows(n int64) {
 }
 
 func (w *tagWriter) Complete(tag string) error {
+	if err := w.gate.begin(); err != nil {
+		return err
+	}
 	w.tag = tag
 	return w.DataWriter.Complete(tag)
 }
@@ -231,7 +287,12 @@ func (w *tagWriter) Notice(code, message string) error {
 	return nil
 }
 
-func (w *tagWriter) Rows(rows [][]any) error { return wire.WriteRows(w.DataWriter, rows) }
+func (w *tagWriter) Rows(rows [][]any) error {
+	if err := w.gate.begin(); err != nil {
+		return err
+	}
+	return wire.WriteRows(w.DataWriter, rows)
+}
 
 func (w *tagWriter) DefineColumns(columns wire.Columns) error {
 	return wire.DefineColumns(w.DataWriter, columns)

@@ -200,8 +200,12 @@ explicit transactions, the coordinator plans it:
    coordinator reads cold in about four seconds (at its cold rate, about 9
    MB/s a core at one and a half threads a core; it was 64 MiB/s a core,
    which kept a report's table of 77 GB at ten times the data under the
-   minute, where it took 259 s on one machine and 40 s on workers), or a
-   minute plus the expected start time when no worker is running. A part
+   minute, where it took 259 s on one machine and 40 s on workers), whether
+   workers run or are stopped. Stopped workers were once considered only
+   for a minute's reading plus their start, about 20 GB: a report that
+   took 1,798 s on one machine, its largest table 6.2 GB, stayed there with
+   workers stopped, though they had taken 362 s; their start now counts in
+   their estimate instead, and reasons say they are stopped. A part
    without aggregates is a candidate only when it keeps few rows
    (`DISTINCT`, or `ORDER BY ... LIMIT` up to a million rows); a plain
    filter would only send every matching row through the coordinator's

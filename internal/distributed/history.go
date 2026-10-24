@@ -32,6 +32,9 @@ type runs struct {
 	distWorkers int
 	explored    time.Time
 	outOfMemory bool
+	// guarded says it ran on one machine past guardFactor times its
+	// estimate, and was run on workers instead (see ObserveGuard).
+	guarded bool
 }
 
 func newHistory() *history {
@@ -117,6 +120,20 @@ func (co *Coordinator) ObserveOutOfMemory(key string) {
 	if key != "" {
 		co.history.update(key, func(r *runs) { r.outOfMemory = true })
 	}
+}
+
+// ObserveGuard records that a statement whose plan key is key ran on one
+// machine, where auto mode had chosen to run it, for d, past guardFactor
+// times its estimate, and was run on workers instead: auto mode runs it on
+// workers next time, without trying one machine again (see choose).
+func (co *Coordinator) ObserveGuard(key string, d time.Duration) {
+	if key != "" {
+		co.history.update(key, func(r *runs) {
+			r.guarded = true
+			r.local = max(r.local, d.Seconds())
+		})
+	}
+	co.opts.Metrics.guard()
 }
 
 // Seed records past runs, oldest first, as from the query history when

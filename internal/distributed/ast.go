@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 )
@@ -418,8 +419,11 @@ func quoteLiteral(s string) string {
 type errUnsupported struct {
 	reason string
 	// key is the statement's plan key when auto mode chose one machine
-	// for a statement that could run on workers (PlanKey).
-	key string
+	// for a statement that could run on workers (PlanKey), and oneMachine
+	// how long one machine was estimated to take it, in seconds, when
+	// workers could run it (LocalEstimate).
+	key        string
+	oneMachine float64
 }
 
 func (e *errUnsupported) Error() string { return "cannot distribute: " + e.reason }
@@ -436,6 +440,19 @@ func PlanKey(err error) string {
 		return u.key
 	}
 	return ""
+}
+
+// LocalEstimate returns how long auto mode estimated one machine would
+// take a statement it chose to run there though workers could run it, as
+// err, Plan's error, says: the time past which the session runs it on
+// workers instead (see the server's guard). ok is false for any other
+// statement.
+func LocalEstimate(err error) (d time.Duration, ok bool) {
+	var u *errUnsupported
+	if errors.As(err, &u) && u.key != "" && u.oneMachine > 0 {
+		return time.Duration(u.oneMachine * float64(time.Second)), true
+	}
+	return 0, false
 }
 
 // IsUnsupported reports whether err only says that a statement cannot run

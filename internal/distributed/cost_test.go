@@ -88,6 +88,8 @@ func TestChoose(t *testing.T) {
 		{"ran on workers slower than one machine's estimate, tried today", slow, runs{dist: 500, explored: now.Add(-time.Hour)}, true, false, false},
 		{"ran on workers for an hour, not estimated faster there", close, runs{dist: 3600}, true, false, false},
 		{"ran out of memory on one machine", short, runs{local: 10, outOfMemory: true}, true, true, false},
+		{"stopped by the guard on one machine, at 153 s", estimate{oneMachine: 51, onWorkers: 168, workers: 16, spills: true},
+			runs{local: 153, dist: 362, guarded: true}, true, true, false},
 		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
 	} {
 		workers, explore, reason := choose(c.e, c.r, c.found, DefaultThreshold, now)

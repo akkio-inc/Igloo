@@ -431,9 +431,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   estimates sent to workers (110 s against 73 s), is estimated at 57 s and
   216 s. Forced statements run on as many workers as before. The size a
   statement's table must have for auto mode to consider workers follows
-  the same cold rate: about 20 GB with workers stopped on a coordinator of
-  16 cores, rather than 160 GB at the 64 MiB/s a core it assumed, which kept
-  a report of 259 s on one machine and 40 s on workers from them.
+  the same cold rate: about 570 MB on a coordinator of 16 cores, rather
+  than 160 GB at the 64 MiB/s a core it assumed with workers stopped, which
+  kept a report of 259 s on one machine and 40 s on workers from them. The
+  size is the same whether workers run or are stopped, their start counted
+  in their estimate, and auto mode's reasons say when they are stopped: a
+  report of 1,798 s on one machine, with tables of 6.2 GB, stayed there
+  with workers stopped, though they had taken 362 s.
+- A statement auto mode runs on the replica, though workers could run it,
+  is stopped there once it has run three times its estimate, and at least
+  90 seconds, without sending a row, and runs on workers instead, which
+  are started if stopped (`igloo_auto_guard_reruns_total`); auto mode runs
+  it on workers from then on. A report estimated at 51 s on the replica
+  that took 1,798 s there, and 362 s on workers, would take about 515 s.
+  Workers are not stopped as idle while such a statement runs on the
+  replica. Writes and statements that have sent rows are never stopped.
 - Auto mode's history counts runs on workers with runs on about as many
   workers: a statement measured on a quarter of the workers it would run on
   now, as in an earlier session on a smaller fleet, is tried on all of them

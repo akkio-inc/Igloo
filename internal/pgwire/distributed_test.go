@@ -13,12 +13,14 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
+	wire "github.com/jeroenrinzema/psql-wire"
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
@@ -600,6 +602,152 @@ func TestDistributedAfterOutOfMemory(t *testing.T) {
 		})
 	}
 }
+
+// A statement auto mode runs here, on an estimate that can run far short,
+// runs on workers once it has run here past three times its estimate (and
+// a minimum) before sending a row: the client gets its rows as if it had
+// run there, the history marks it, and the next time it runs on workers
+// directly. One that finishes in its time runs here, and a write is never
+// stopped. At ten times the data, a report estimated at 51 s took 1,798 s
+// here and 362 s on workers.
+func TestDistributedGuard(t *testing.T) {
+	ds := startDistServer(t, 2)
+	// Large enough for auto mode to weigh, small enough for one machine,
+	// which it estimates at about 45 s: far past the minimum the test
+	// sets, which the guard waits for.
+	ds.source.size = 300 << 20
+	defer func(f float64, m time.Duration) { guardFactor, guardMinimum = f, m }(guardFactor, guardMinimum)
+	guardFactor, guardMinimum = 0, 300*time.Millisecond
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	ctx := context.Background()
+	read := func(query string) string {
+		t.Helper()
+		rows, err := conn.Query(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b strings.Builder
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprintln(&b, vals...)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		return b.String()
+	}
+	slow := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	quick := "SELECT amount, max(id) AS m FROM orders GROUP BY amount ORDER BY amount"
+	mustExec(t, conn, "SET distributed_execution = off")
+	wantSlow, wantQuick := read(slow), read(quick)
+	mustExec(t, conn, "RESET distributed_execution")
+
+	var slowRuns, quickRuns, writeRuns atomic.Int32
+	ds.srv.failLocal = func(ctx context.Context, st *statement) error {
+		switch {
+		case strings.Contains(st.query, "CREATE TABLE"):
+			// A write here that runs past the guard's minimum.
+			writeRuns.Add(1)
+			time.Sleep(2 * guardMinimum)
+		case strings.Contains(st.query, "count(*) AS n FROM orders"):
+			// It runs here until stopped.
+			slowRuns.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		case strings.Contains(st.query, "max(id) AS m FROM orders"):
+			quickRuns.Add(1)
+		}
+		return nil
+	}
+	defer func() { ds.srv.failLocal = nil }()
+
+	if got := read(slow); got != wantSlow {
+		t.Errorf("guarded:\n%s\nwant:\n%s", got, wantSlow)
+	}
+	if q := lastRun(t, ds.history, slow); q.Workers == 0 || q.Outcome != audit.OutcomeOK || q.PlanKey == "" {
+		t.Errorf("guarded, history: %d workers, %s %s, plan key %q", q.Workers, q.Outcome, q.SQLState, q.PlanKey)
+	}
+	if got := read(slow); got != wantSlow {
+		t.Errorf("run again:\n%s\nwant:\n%s", got, wantSlow)
+	}
+	if q := lastRun(t, ds.history, slow); q.Workers == 0 {
+		t.Error("run again, it ran here")
+	}
+
+	// In its time: here, as auto mode chose.
+	if got := read(quick); got != wantQuick {
+		t.Errorf("in its time:\n%s\nwant:\n%s", got, wantQuick)
+	}
+	if q := lastRun(t, ds.history, quick); q.Workers != 0 {
+		t.Errorf("a statement that ran in its time here ran on %d workers", q.Workers)
+	}
+
+	// A write runs here to the end, however long.
+	mustExec(t, conn, "CREATE TABLE memory.main.guarded AS SELECT amount, count(*) AS n FROM orders GROUP BY amount")
+	if n := count(t, conn, "SELECT count(*) FROM memory.main.guarded"); n != 9 {
+		t.Errorf("the write left %d rows", n)
+	}
+	if slowRuns.Load() != 1 || quickRuns.Load() != 1 || writeRuns.Load() != 1 {
+		t.Errorf("ran here %d, %d and %d times, want each once", slowRuns.Load(), quickRuns.Load(), writeRuns.Load())
+	}
+}
+
+// A guard does not stop a statement that has begun sending its rows, and
+// once it stopped one, the statement sends nothing.
+func TestGuardGate(t *testing.T) {
+	defer func(f float64, m time.Duration) { guardFactor, guardMinimum = f, m }(guardFactor, guardMinimum)
+	guardFactor, guardMinimum = 0, 50*time.Millisecond
+	ctx := context.Background()
+
+	streaming := &tagWriter{DataWriter: &countingWriter{}}
+	g := guardLocal(ctx, time.Second, streaming)
+	if err := streaming.Row([]any{1}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(4 * guardMinimum)
+	if fired, _ := g.stop(streaming); fired {
+		t.Error("a statement sending rows was stopped")
+	}
+	if err := streaming.Row([]any{2}); err != nil {
+		t.Errorf("rows after the guard stopped watching: %v", err)
+	}
+
+	quiet := &tagWriter{DataWriter: &countingWriter{}}
+	g = guardLocal(ctx, time.Millisecond, quiet)
+	select {
+	case <-g.ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the guard did not stop a quiet statement")
+	}
+	if err := quiet.Row([]any{1}); !errors.Is(err, errGuardFired) {
+		t.Errorf("a row after the guard fired: %v", err)
+	}
+	if err := quiet.Complete("SELECT 0"); !errors.Is(err, errGuardFired) {
+		t.Errorf("completing after the guard fired: %v", err)
+	}
+	if fired, ran := g.stop(quiet); !fired || ran < guardMinimum {
+		t.Errorf("fired %v after %s", fired, ran)
+	}
+	if n := quiet.DataWriter.(*countingWriter).rows; n != 0 {
+		t.Errorf("%d rows reached the client after the guard fired", n)
+	}
+}
+
+// countingWriter counts the rows written to it.
+type countingWriter struct {
+	rows int
+}
+
+func (w *countingWriter) Row([]any) error                                  { w.rows++; return nil }
+func (w *countingWriter) Written() uint32                                  { return uint32(w.rows) }
+func (w *countingWriter) Empty() error                                     { return nil }
+func (w *countingWriter) Columns() wire.Columns                            { return nil }
+func (w *countingWriter) Complete(string) error                            { return nil }
+func (w *countingWriter) CopyIn(wire.FormatCode) (*wire.CopyReader, error) { return nil, nil }
 
 // When the workers are gone, statements run here.
 func TestDistributedFallback(t *testing.T) {

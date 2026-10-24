@@ -17,6 +17,7 @@ type Metrics struct {
 	scanned   prometheus.Counter
 	received  prometheus.Counter
 	starts    *prometheus.CounterVec
+	guards    prometheus.Counter
 }
 
 // NewMetrics registers the coordinator's metrics with reg.
@@ -55,8 +56,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_distributed_worker_starts_total",
 			Help: "Times Igloo started or stopped workers, by action (start, stop) and result (success, failure).",
 		}, []string{"action", "result"}),
+		guards: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_auto_guard_reruns_total",
+			Help: "Statements auto mode ran on this replica that ran past three times their estimate there, and were canceled and run on workers instead.",
+		}),
 	}
-	reg.MustRegister(m.queries, m.fallbacks, m.duration, m.tasks, m.workers, m.scanned, m.received, m.starts)
+	reg.MustRegister(m.queries, m.fallbacks, m.duration, m.tasks, m.workers, m.scanned, m.received, m.starts, m.guards)
 	return m
 }
 
@@ -71,6 +76,12 @@ func (m *Metrics) query(outcome string, start time.Time) {
 }
 
 // Fallback counts a statement that ran on the coordinator after all.
+func (m *Metrics) guard() {
+	if m != nil {
+		m.guards.Inc()
+	}
+}
+
 func (m *Metrics) Fallback(reason string) {
 	if m == nil {
 		return

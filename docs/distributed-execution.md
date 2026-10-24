@@ -215,9 +215,10 @@ took 6 to 56 seconds on one replica took 37 to 176 seconds on four workers.
 
 So Igloo considers a statement for workers only when its largest table is
 more than the replica reads from object storage cold in about four seconds
-(about 570 MB for a replica of 16 cores and 24 threads; workers that are
-stopped are started only for a minute's worth and the time to start them,
-about 20 GB).
+(about 570 MB for a replica of 16 cores and 24 threads), whether the
+workers run or are stopped: stopped workers' start counts in their
+estimate, and reasons say when they are stopped (`workers are stopped;
+...`).
 For such a statement it estimates two times, over what it reads of its
 tables (each table's size times the share of its columns, weighed by type,
 that the statement's parts name, and a hundredth of that for a table a part
@@ -304,6 +305,19 @@ canceling it) before it sends a row runs again on workers, and the client
 gets its rows. The replica remembers that it ran out of memory, as it reads
 statements that failed so on the replica from the query history at start,
 and runs it on workers from then on.
+
+The replica's estimate can also run far short, as for a statement that
+spills: one estimated at 51 s took 1,798 s on the replica and 362 s on
+workers. So a statement auto mode runs on the replica, though workers could
+run it, is stopped there once it has run three times its estimate and at
+least 90 seconds without sending a row, and runs on workers, started if they
+are stopped, the client getting its rows as if it had run there; the server
+logs `a statement ran on this replica past three times its estimate;
+running it on workers instead`, counts it
+(`igloo_auto_guard_reruns_total`), and runs the statement on workers from
+then on. A statement that has begun sending rows runs to the end, and so
+does a write. While such a statement runs on the replica, the workers count
+as busy, so they are not stopped as idle under it.
 
 A session can change that for testing and benchmarks:
 
@@ -544,6 +558,7 @@ disks, and the writers needed 0.9 GB of memory rather than 1.6.
   | `igloo_distributed_scanned_bytes_total` | | Data file bytes divided among workers |
   | `igloo_distributed_received_bytes_total` | | Partial results received |
   | `igloo_distributed_worker_starts_total` | `action` = `start`, `stop`; `result` | Workers started and stopped |
+  | `igloo_auto_guard_reruns_total` | | Statements auto mode ran on the replica that ran past three times their estimate there, and ran on workers instead |
 
   and on the workers' port 8080: `igloo_worker_tasks_total{outcome}`
   (`out_of_memory` counting tasks a worker canceled as it ran out),

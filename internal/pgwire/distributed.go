@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -148,8 +150,13 @@ type distParts struct {
 	key                        string
 	since                      time.Time
 	// release lets the workers count as idle again: the statement holds
-	// them while it runs on this replica after their tasks failed.
+	// them while it runs on this replica after their tasks failed, or
+	// where auto mode chose it, for the guard (see guardLocal).
 	release func()
+	// local is how long auto mode estimated this replica would take the
+	// statement, when it chose to run it here though workers could run it
+	// (see guardLocal).
+	local time.Duration
 }
 
 // sessionMode is the mode user's statements run distributed in: the
@@ -181,6 +188,11 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			return parts, true, ctx.Err()
 		}
 		parts.key = distributed.PlanKey(err)
+		if est, ok := distributed.LocalEstimate(err); ok {
+			// Workers stay up while it runs here, as an idle replica would
+			// stop them, so that the guard can run it on them.
+			parts.local, parts.release = est, s.dist.Keep()
+		}
 		if !distributed.IsUnsupported(err) {
 			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
 		} else {
@@ -255,6 +267,81 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		return distParts{release: s.dist.Keep()}, false, nil
 	}
 	return parts, true, nil
+}
+
+// guardFactor and guardMinimum say when a statement auto mode chose to run
+// on this replica, though workers could run it, has run long enough there
+// to run it on workers instead: past guardFactor times its estimate, and
+// guardMinimum. At ten times the data, a report estimated at 51 s took
+// 1,798 s here and 362 s on workers: guarded, it would have taken about
+// 515 s. One estimated at 13 s that took 67 s here, where workers took 55
+// s, finishes before the guard. Variables, for tests.
+var (
+	guardFactor  = 3.0
+	guardMinimum = 90 * time.Second
+)
+
+// localGuard cancels a statement's run on this replica once it has run
+// past its time (see guardFactor), unless it has sent the client output.
+type localGuard struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	gate   rowGate
+	timer  *time.Timer
+	start  time.Time
+	fired  atomic.Bool
+}
+
+// guardLocal arms a guard over a run on this replica of a statement auto
+// mode estimated at est here, which writes to tw: run it under the guard's
+// ctx, and stop the guard after.
+func guardLocal(ctx context.Context, est time.Duration, tw *tagWriter) *localGuard {
+	g := &localGuard{start: time.Now()}
+	g.ctx, g.cancel = context.WithCancel(ctx)
+	tw.gate = &g.gate
+	g.timer = time.AfterFunc(max(time.Duration(guardFactor*float64(est)), guardMinimum), func() {
+		if g.gate.fire() {
+			g.fired.Store(true)
+			g.cancel()
+		}
+	})
+	return g
+}
+
+// stop disarms the guard, and says whether it canceled the run and how
+// long the run had taken.
+func (g *localGuard) stop(tw *tagWriter) (fired bool, ran time.Duration) {
+	g.timer.Stop()
+	g.cancel()
+	tw.gate = nil
+	return g.fired.Load(), time.Since(g.start)
+}
+
+// afterGuard runs st on workers after its run on this replica, where auto
+// mode had chosen to run it, passed its time (see guardFactor) before it
+// sent the client output: the client gets the rows as if it had run there,
+// and the history marks it so that it runs on workers next time. If
+// workers cannot run it after all, it runs here again, to the end.
+func (s *Server) afterGuard(ctx context.Context, sess *session, st *statement, args []driver.NamedValue,
+	w *tagWriter, parts *distParts, ran time.Duration) error {
+	user := sess.currentUser()
+	s.dist.ObserveGuard(parts.key, ran)
+	s.log.Warn("a statement ran on this replica past three times its estimate; running it on workers instead",
+		"user", user.Name, "key", parts.key, "seconds", math.Round(ran.Seconds()), "estimate_seconds", math.Round(parts.local.Seconds()))
+	since := time.Now()
+	// As an admin's forced statement runs, starting stopped workers: auto
+	// mode chose this replica for it, and nothing else would run it.
+	p, done, err := s.runDistributed(ctx, sess, user, st, args, w, distributed.ModeOn)
+	if !done {
+		if p.release != nil {
+			defer p.release()
+		}
+		s.log.Warn("workers could not run a statement the guard stopped here; running it here again", "user", user.Name, "key", parts.key)
+		return s.runLocal(ctx, sess, st, args, w)
+	}
+	p.since = since
+	*parts = p
+	return err
 }
 
 // ranOutOfMemory says whether err, from running a statement on this

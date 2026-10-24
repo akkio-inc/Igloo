@@ -1389,8 +1389,19 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				// read ahead what its scans are about to read (see
 				// prefetch.go). Workers read ahead for their own tasks.
 				stopPrefetch := s.prefetchStatement(ctx, sess, st)
-				err = s.runLocal(ctx, sess, st, args, tw)
-				stopPrefetch()
+				if parts.local > 0 && tw.Written() == 0 {
+					// Auto mode chose this replica on an estimate that can run
+					// far short (see guardLocal).
+					guard := guardLocal(ctx, parts.local, tw)
+					err = s.runLocal(guard.ctx, sess, st, args, tw)
+					stopPrefetch()
+					if fired, ran := guard.stop(tw); fired && ctx.Err() == nil && outer.Err() == nil {
+						return s.afterGuard(ctx, sess, st, args, tw, &parts, ran)
+					}
+				} else {
+					err = s.runLocal(ctx, sess, st, args, tw)
+					stopPrefetch()
+				}
 				if st.bitmaps && bitmapsDidNotFit(err) {
 					// Run again here with the hash, below, rather than on
 					// workers with bitmaps.
