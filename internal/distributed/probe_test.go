@@ -176,6 +176,42 @@ func TestProbedRelations(t *testing.T) {
 	}
 }
 
+// A relation measured once, which the plan made with its size read whole
+// in one branch and by partition in another, is planned with that size the
+// next time, without measuring it: the statement gets the plan it got once
+// measured, rather than the one made without its size.
+func TestRememberedSize(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	// Every worker may read the audience, but not part, whose fewer rows
+	// than the audience's make partitioning both cheaper than every task
+	// reading the audience whole; orders' many rows make that dearer.
+	h.co.maxBroadcast = h.tables["part"].Bytes / 2
+	for _, name := range []string{"orders", "part"} {
+		h.tables[name].Rows = rowCount(h.files[h.tables[name].key()])
+	}
+	q := `WITH aud AS (SELECT DISTINCT l_orderkey AS k FROM lineitem WHERE l_quantity IN (1, 2, 3))
+		SELECT 'orders' AS side, count(*) AS n FROM orders AS o JOIN aud ON aud.k = o.o_orderkey
+		UNION ALL SELECT 'parts', count(*) FROM part AS p JOIN aud ON aud.k = p.p_partkey`
+	_, _, first, ex, err := h.run(t.Context(), q, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.uncertain) == 0 || len(ex.Probes) != 1 || !strings.Contains(ex.Probes[0], "by partition in others, planned again") {
+		t.Fatalf("first run: probes %v of %v\n%s", ex.Probes, first.uncertain, first.describe())
+	}
+	_, _, again, ex2, err := h.run(t.Context(), q, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.uncertain) != 0 || len(ex2.Probes) != 0 || len(again.Stages) != ex.Stages || ex2.Stages != ex.Stages {
+		t.Errorf("again: probes %v of %v, %d stages, where the first run's second plan had %d\n%s",
+			ex2.Probes, again.uncertain, len(again.Stages), ex.Stages, again.describe())
+	}
+	if !h.check(q) {
+		t.Error("did not run distributed")
+	}
+}
+
 // TestMeasuredSize checks the size a measured relation is planned with:
 // its bytes, unless its rows would not fit a quarter of a task's memory in
 // a hash table, when it is past what every worker may read.
@@ -197,6 +233,15 @@ func TestMeasuredSize(t *testing.T) {
 	pl.opts.sizes["long"] = knownSize{bytes: 500 << 20, rows: 200_000}
 	if b, _, known := pl.measured("long", 1<<40, cols); !known || b <= pl.opts.maxBroadcast {
 		t.Errorf("long strings: %d %v", b, known)
+	}
+	// Measured lately and read by partition somewhere: the size measured
+	// then, while the tables it reads stay within a factor of two.
+	pl.opts.large = map[string]outcome{"seen": {size: knownSize{bytes: 5 << 20, rows: 1e6}, estimate: 1 << 40, large: true}}
+	if b, rows, known := pl.measured("seen", 1<<40, cols); !known || b != 5<<20 || rows != 1e6 {
+		t.Errorf("remembered: %d %d %v", b, rows, known)
+	}
+	if _, _, known := pl.measured("seen", 1<<42, cols); known {
+		t.Error("remembered over tables four times as large")
 	}
 }
 

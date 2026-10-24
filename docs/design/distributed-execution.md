@@ -809,9 +809,10 @@ the relations before starting the rest added the relations' 9 s to a
 report of 44 s, and 25 s to one of 125 s, at ten times the data, whose
 relations came out large. The coordinator remembers how each relation came
 out, by key, while the tables it reads stay within a factor of two of their
-size then: one read by partition all the same is planned as such, without
-measuring, for a day; one read whole is measured every time, but once it
-was, alone first, as at a hundred times the data an audience took 377 s
+size then: one some stage read by partition is planned with the size it
+came out at, without measuring, for a day, and so gets the plan it got
+once measured, which may read it whole in some branches; one every stage
+read whole is measured every time, but once it was, alone first, as at a hundred times the data an audience took 377 s
 beside the stages partitioning the tables to meet it. So a report run again
 pays nothing either way, and only a relation's first run of the day bets.
 A statement that runs out of memory on a worker after its relations were

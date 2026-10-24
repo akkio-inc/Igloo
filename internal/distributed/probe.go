@@ -43,11 +43,14 @@ type outcome struct {
 }
 
 // outcomes remember how relations of uncertain size came out, by key. A
-// relation measured large is planned as large, without measuring it again,
-// for exploreEvery, while the tables it reads stay within a factor of two
-// of their size then: reports run again, and measuring makes the stages
-// that meet it wait. One measured small is measured every time, as the
-// stages that read it whole wait for it anyway.
+// relation some stage read by partition is planned with the size measured
+// then, without measuring it again, for exploreEvery, while the tables it
+// reads stay within a factor of two of their size then: reports run again,
+// and measuring makes the stages that meet it wait. Planned with that size,
+// a statement gets the plan it got once measured, which may read the
+// relation whole in some places and by partition in others. One every
+// stage read whole is measured every time, as the stages that read it
+// whole wait for it anyway.
 type outcomes struct {
 	mu    sync.Mutex
 	byKey map[string]outcome
@@ -136,10 +139,13 @@ func (pl *planner) relationKey(q node, scope cteScope) string {
 func (pl *planner) measured(key string, est int64, cols []Column) (int64, int64, bool) {
 	k, ok := pl.opts.sizes[key]
 	if o, large := pl.opts.large[key]; !ok && large && est <= 2*o.estimate && 2*est >= o.estimate {
-		// Measured large lately, over tables of about the same size: no
-		// need to measure it again before partitioning.
+		// Measured lately and read by partition, over tables of about the
+		// same size: planned with the size measured then, as the statement
+		// was planned again then. Planned past what every worker may read,
+		// a report whose audience the plan with its size read whole in some
+		// branches ran its first plan, 34 stages for 24, in 1,698 s for
+		// 248 s.
 		k, ok = o.size, true
-		k.bytes = max(k.bytes, pl.opts.maxBroadcast+1)
 	}
 	if !ok || key == "" {
 		return est, 0, false
@@ -391,14 +397,27 @@ func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *executio
 		}
 	}
 	for _, u := range distinctKeys(plan.uncertain) {
-		how, whole := "read by partition", false
+		// Read whole by every stage that reads it, it is measured again
+		// next time; read by partition anywhere, the next plan is made with
+		// its size (see outcomes), as this one was.
+		reads, whole := 0, 0
 		for id, key := range next.relKeys {
-			if key == u.key && readWhole[id] {
-				how, whole = "read whole by every task", true
+			if _, read := readWhole[id]; key == u.key && read {
+				reads++
+				if readWhole[id] {
+					whole++
+				}
 			}
 		}
+		how := "read by partition"
+		switch {
+		case reads > 0 && whole == reads:
+			how = "read whole by every task"
+		case whole > 0:
+			how = "read whole in places and by partition in others"
+		}
 		*probes = append(*probes, probeNote(u.name, sizes[u.key], how+", planned again"))
-		co.outcomes.record(u.key, outcome{size: sizes[u.key], estimate: u.estimate, large: !whole, at: time.Now()})
+		co.outcomes.record(u.key, outcome{size: sizes[u.key], estimate: u.estimate, large: reads == 0 || whole < reads, at: time.Now()})
 	}
 	co.log.Info("measured relations of uncertain size", "query", run.qid, "relations", strings.Join(*probes, "; "),
 		"stages", len(next.Stages), "before", len(plan.Stages))

@@ -619,6 +619,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- A statement whose relation of uncertain size came out read by
+  partition, but in a plan made with its size, gets that plan the next
+  time without measuring the relation again, rather than the plan made
+  without its size: a report at a hundred times the data whose audience
+  of 1.9 million rows its measured plan read whole in some branches ran
+  its first plan the second time, 34 stages for 24, in 1,698 s for 248 s.
+  The coordinator now remembers the size a relation came out at and plans
+  with it, where it planned the relation past what every worker may read.
 - Object storage turning requests away for now no longer fails a
   distributed statement: a HEAD of an exchange's file that S3 answered with
   503 SlowDown, on 16 workers at a hundred times the data, failed a report

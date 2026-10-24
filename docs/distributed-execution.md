@@ -301,11 +301,12 @@ from what was written of it. At ten times the data, an audience of 45.9
 million IDs is partitioned and one of 189,400 people read whole. While
 the relation is measured the rest of the plan starts, but for what reads
 the relation, and what started is canceled if the plan changes, so a
-relation that comes out large costs no wait. A relation that came out too
-large is planned as such, without measuring it first, for a day, while
-the tables it reads stay within a factor of two of their size then; one
-that came out small is measured each time, first, with the workers to
-itself. `EXPLAIN DISTRIBUTED` lists such relations as `uncertain size`, and
+relation that comes out large costs no wait. A relation some stage read
+by partition is planned with the size it came out at, without measuring
+it first, for a day, while the tables it reads stay within a factor of two
+of their size then, so the statement gets the plan it got once measured;
+one every stage read whole is measured each time, first, with the workers
+to itself. `EXPLAIN DISTRIBUTED` lists such relations as `uncertain size`, and
 the server logs how each came out (`measured relations of uncertain
 size`).
 
