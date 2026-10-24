@@ -518,8 +518,16 @@ disks, and the writers needed 0.9 GB of memory rather than 1.6.
   exchanges would have with the workers running now; each stage (`stage 0
   split public.events to exchange 1 (join)`) with the SQL its tasks
   run; what `the coordinator` runs over their results; and why parts of it
-  `stay on the coordinator`. The query is checked as it would be when run,
-  grants and policies included, and the same rewrites apply.
+  `stay on the coordinator`. After the statement has run on workers,
+  `measured` says what its exchanges held (rows and gigabytes) and the most
+  rows a stage wrote for each row it read, as the replica remembers them:
+  auto mode keeps on workers a statement whose exchanges would not fit in
+  the replica's memory, but never moves one to workers by them. A stage
+  that joins a table filtered by a constant to other rows, as an audience
+  joins events, shows as a `semi-join estimate` of the share of rows it
+  keeps, which the estimates do not count yet. The query is checked as it
+  would be when run, grants and policies included, and the same rewrites
+  apply.
 
   ```sql
   EXPLAIN DISTRIBUTED

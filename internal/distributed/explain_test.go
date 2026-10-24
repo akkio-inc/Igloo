@@ -47,3 +47,52 @@ func TestExplain(t *testing.T) {
 		t.Error("explaining wrote the history")
 	}
 }
+
+// After a run on workers, EXPLAIN DISTRIBUTED says what its exchanges held
+// and the most rows a stage wrote for each it read, and the history keeps
+// them; a join of a relation filtered by a constant shows the share of
+// rows it should keep, which the estimates do not count.
+func TestExplainMeasured(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	h.co.maxBroadcast = 1
+	q := `SELECT o.o_orderpriority, count(*) FROM lineitem AS l JOIN orders AS o ON o.o_orderkey = l.l_orderkey
+		WHERE o.o_orderstatus = 'F' GROUP BY 1`
+	find := func(rows [][2]string, key string) string {
+		for _, r := range rows {
+			if r[0] == key {
+				return r[1]
+			}
+		}
+		return ""
+	}
+	rows, err := h.co.Explain(t.Context(), q, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := find(rows, "measured"); m != "" {
+		t.Errorf("measured before any run: %s", m)
+	}
+	if j := find(rows, "semi-join estimate"); !strings.Contains(j, "main.orders, filtered by a constant") || !strings.Contains(j, "1%") {
+		t.Errorf("semi-join estimate: %q in %v", j, rows)
+	}
+	plan, err := h.co.Plan(t.Context(), q, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex, err := h.co.Execute(t.Context(), plan, h.settings(t.Context()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex.Close()
+	r, ok := h.co.history.get(plan.Key)
+	if !ok || r.exchangeRows <= 0 || r.exchangeBytes <= 0 || r.fanout <= 0 {
+		t.Fatalf("history after a run on workers: %+v", r)
+	}
+	rows, err = h.co.Explain(t.Context(), q, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := find(rows, "measured"); !strings.Contains(m, "exchanged") || !strings.Contains(m, "GB") {
+		t.Errorf("measured: %q", m)
+	}
+}

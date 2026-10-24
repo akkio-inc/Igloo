@@ -443,6 +443,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   in their estimate, and auto mode's reasons say when they are stopped: a
   report of 1,798 s on one machine, with tables of 6.2 GB, stayed there
   with workers stopped, though they had taken 362 s.
+- After a statement runs on workers, the replica remembers what its
+  exchanges held and the most rows a stage wrote for each row it read, by
+  its plan key, and shows them in `EXPLAIN DISTRIBUTED` (`measured`) and
+  in auto mode's log line; auto mode keeps on workers a statement whose
+  exchanges would not fit in the replica's memory, but never moves one
+  there by them: a report whose workers exchanged 14 GB took 38 s on one
+  machine, where its plan streams. `EXPLAIN DISTRIBUTED` also shows the
+  share of rows a join to a table filtered by a constant should keep
+  (`semi-join estimate`), which the estimates do not count yet.
 - Workers writing an exchange bound each partition's row group by the
   bytes of its rows as written, not only by the rows their types would
   take: rows of four lists of strings, which a list's type counts as

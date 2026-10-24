@@ -374,6 +374,9 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		return plan, d, nil
 	}
 	now := time.Now()
+	if found && r.exchangeBytes > 0 && m.memory > 0 {
+		r.heavy = float64(heldFactor*r.exchangeBytes) > memoryShare*float64(m.memory)
+	}
 	onWorkers, explore, reason := choose(e, r, found, cmp.Or(co.opts.Threshold, DefaultThreshold), now)
 	if len(ws) == 0 {
 		reason = "workers are stopped; " + reason
@@ -389,7 +392,8 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	co.log.Info("chose where a statement runs", "on", where, "reason", reason, "key", plan.Key,
 		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers,
 		"levels", e.levels, "stages", e.stages, "bytes", e.bytes, "exchanged", e.exchanged, "rows", e.rows,
-		"short_of_memory", e.memory, "spills", e.spills)
+		"short_of_memory", e.memory, "spills", e.spills,
+		"measured_exchanged", r.exchangeBytes, "measured_rows", r.exchangeRows, "measured_fanout", math.Round(r.fanout*10)/10)
 	if explore {
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
 	}
@@ -604,6 +608,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			return co.loadMore(ctx, stages, snapshots, files)
 		}, &ex.Probes)
 		if err == nil {
+			co.observeExchanges(plan.Key, run, plan.Stages)
 			break
 		}
 		if OutOfMemory(err) && ctx.Err() == nil && attempt < memoryRetries {

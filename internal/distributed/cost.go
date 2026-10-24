@@ -591,7 +591,9 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 	// Worth trying where its estimate is close to what the statement took
 	// on the other side, and, on one machine, where it should fit.
 	tryWorkers := func(took float64) bool { return e.onWorkers < exploreWithin*took }
-	tryOne := func(took float64) bool { return e.oneMachine < exploreWithin*took && !e.memory && !e.spills }
+	tryOne := func(took float64) bool {
+		return e.oneMachine < exploreWithin*took && !e.memory && !e.spills && !r.heavy
+	}
 	switch {
 	case found && r.outOfMemory && e.workers > 0:
 		return true, false, "it ran out of memory on one machine"
@@ -631,6 +633,8 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 			// spills: two reports that took 146 s and 141 s on workers,
 			// against one machine's 157 s, took 809 s and 610 s there.
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should run short of memory", r.dist)
+		case r.heavy:
+			return true, false, fmt.Sprintf("it ran in %.0f s on workers, whose exchanges held %.1f GB, more than one machine's memory holds", r.dist, float64(r.exchangeBytes)/1e9)
 		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine/speedup:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
 		}

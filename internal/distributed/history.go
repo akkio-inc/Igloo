@@ -35,6 +35,15 @@ type runs struct {
 	// guarded says it ran on one machine past guardFactor times its
 	// estimate, and was run on workers instead (see ObserveGuard).
 	guarded bool
+	// exchangeRows and exchangeBytes are what its last run on workers
+	// exchanged, and fanout the most rows a stage of it wrote for each
+	// row it read, as measured (see observeExchanges); zero before.
+	exchangeRows, exchangeBytes int64
+	fanout                      float64
+	// heavy says, for choose, that what it exchanged would not fit in one
+	// machine's memory share, held as heldFactor times its bytes; it is
+	// worked out when the runs are read, not kept.
+	heavy bool
 }
 
 func newHistory() *history {
@@ -120,6 +129,53 @@ func (co *Coordinator) ObserveOutOfMemory(key string) {
 	if key != "" {
 		co.history.update(key, func(r *runs) { r.outOfMemory = true })
 	}
+}
+
+// observeExchanges records what the exchanges of a statement's run on
+// workers held, by its plan key: their rows and bytes in all, and the most
+// rows a stage wrote for each row it read, of the stages that alone wrote
+// their exchange. Auto mode keeps on workers a statement whose exchanges
+// would not fit in one machine's memory (see choose), and EXPLAIN
+// DISTRIBUTED shows them; an estimate of one machine by them is no
+// better (a report whose workers exchanged 14 GB took 38 s on one
+// machine, its plan there streaming), so they never move one to workers.
+func (co *Coordinator) observeExchanges(key string, run *execution, stages []*Stage) {
+	if key == "" || run == nil {
+		return
+	}
+	var rows, bytes int64
+	for _, x := range run.exchanges {
+		x.mu.Lock()
+		rows, bytes = rows+x.rows, bytes+x.bytes
+		x.mu.Unlock()
+	}
+	producers := map[*Exchange]int{}
+	for _, s := range stages {
+		if s.Out != nil {
+			producers[s.Out]++
+		}
+	}
+	var fanout float64
+	for _, s := range stages {
+		if s.Out == nil || producers[s.Out] != 1 || run.exchanges[s.Out.ID] == nil {
+			continue
+		}
+		var in int64
+		for _, i := range s.Inputs {
+			switch {
+			case i.Table != nil:
+				in += rowCount(run.files[i.Table.key()])
+			case i.Exchange != nil && run.exchanges[i.Exchange.ID] != nil:
+				in += run.exchanges[i.Exchange.ID].rows
+			}
+		}
+		if in > 0 {
+			fanout = max(fanout, float64(run.exchanges[s.Out.ID].rows)/float64(in))
+		}
+	}
+	co.history.update(key, func(r *runs) {
+		r.exchangeRows, r.exchangeBytes, r.fanout = rows, bytes, fanout
+	})
 }
 
 // ObserveGuard records that a statement whose plan key is key ran on one

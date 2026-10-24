@@ -100,6 +100,13 @@ func TestChoose(t *testing.T) {
 		{"ran out of memory on one machine", short, runs{local: 10, outOfMemory: true}, true, true, false},
 		{"stopped by the guard on one machine, at 153 s", estimate{oneMachine: 51, onWorkers: 168, workers: 16, spills: true},
 			runs{local: 153, dist: 362, guarded: true}, true, true, false},
+		// Measured on workers to exchange more than one machine's memory
+		// holds, though one machine should not spill: kept on workers, not
+		// tried on one machine.
+		{"ran on workers, exchanging more than one machine holds", estimate{oneMachine: 120, onWorkers: 100, workers: 4},
+			runs{dist: 90, heavy: true}, true, true, false},
+		{"ran both ways, faster on one machine, exchanging much on workers", estimate{oneMachine: 120, onWorkers: 100, workers: 4},
+			runs{local: 38, dist: 228, heavy: true}, true, false, false},
 		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
 	} {
 		workers, explore, reason := choose(c.e, c.r, c.found, DefaultThreshold, now)

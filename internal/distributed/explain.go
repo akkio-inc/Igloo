@@ -34,6 +34,13 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		estimate += "; too large for this replica's memory"
 	}
 	rows := [][2]string{{"runs on", where}, {"reason", d.reason}, {"estimate", estimate}}
+	if r, ok := co.history.get(plan.Key); ok && r.exchangeRows > 0 {
+		rows = append(rows, [2]string{"measured", fmt.Sprintf("its last run on workers exchanged %.3g rows, %s; a stage wrote up to %.1f rows a row it read",
+			float64(r.exchangeRows), gigabytes(r.exchangeBytes), r.fanout)})
+	}
+	for _, j := range semiJoins(plan.Stages) {
+		rows = append(rows, [2]string{"semi-join estimate", j})
+	}
 
 	// The partitions Execute would give its exchanges.
 	n := len(d.ws)
@@ -56,6 +63,43 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		rows = append(rows, [2]string{"stays on the coordinator", reason})
 	}
 	return rows, nil
+}
+
+// semiJoins describes, for EXPLAIN DISTRIBUTED, the stages that join a
+// relation of a table filtered by a constant (filtersSelectively) to other
+// rows, as an audience joins people's events: such a join keeps about
+// filterSelectivity of the other rows, which auto mode's estimates do not
+// count yet. A report's audience, filtered by a constant, kept 189,400
+// of 18.9 million rows, and left a FLATTEN 2.6 million rows to unnest
+// where another, without one, unnested 140 million; counting it in the
+// estimates and not the rows unnested is left to a calibration that can
+// tell both apart.
+func semiJoins(stages []*Stage) []string {
+	selective := map[*Exchange]string{}
+	var out []string
+	for _, s := range stages {
+		var sel string
+		others := false
+		for _, in := range s.Inputs {
+			switch {
+			case in.Table != nil && filtersSelectively(s.fragment, in.Table):
+				sel = in.Table.String()
+			case in.Table != nil:
+				others = true
+			case in.Exchange != nil && selective[in.Exchange] != "":
+				sel = selective[in.Exchange]
+			case in.Exchange != nil:
+				others = true
+			}
+		}
+		switch {
+		case sel != "" && others:
+			out = append(out, fmt.Sprintf("%s joins %s, filtered by a constant, to rows of which it keeps about %.0f%%", s, sel, filterSelectivity*100))
+		case sel != "" && s.Out != nil:
+			selective[s.Out] = sel
+		}
+	}
+	return out
 }
 
 // gigabytes writes a size in gigabytes.
