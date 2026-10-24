@@ -370,7 +370,7 @@ in a cohort counts, for that cohort, in each value of each dimension:
 |---|---|
 | `{"name", "column": "C"}` | `CAST(C AS VARCHAR)` |
 | `{"name", "column": "C", "map": {"true": "LIVE", "false": "ON_DEMAND"}}` | the mapped text of `CAST(C AS VARCHAR)`; NULL, and text the map lacks, give NULL |
-| `{"name", "elements": "C"}` | each element of the list `C` (`UNNEST`) as `VARCHAR`; with `"path": "$.x"`, each element of the JSON array at that path of `C`, as `json_extract_string` reads it |
+| `{"name", "elements": "C"}` | each element of the list `C` (`UNNEST`) as `VARCHAR`; with `"path": "$.x"`, each element of the JSON array at that path of `C`, as `json_extract_string` reads it; with `"element_text": "json"` (no path), each element that is a JSON object or array, as text that starts with `{` or `[`, as `json_extract_string(e, '$')` reads it and any other as it is, as Snowflake gives the elements of an array of semi-structured values as text |
 | `{"name", "constant": "ANY_VIEWING"}` | that text |
 
 Options: `group` (passed through as `dim_group`); `skip_blank` (leave out
@@ -452,8 +452,9 @@ the bitmaps are of the tables' current snapshots. And:
 - each dimension is a column or a constant, with an index of the source for
   its member by that column and the columns of the source's conditions (by
   those alone, for a constant: `ON ()` without conditions), or a list's
-  elements, with an index `ON (ELEMENTS(list))` and no conditions on the
-  source; and there are no metrics and no extent;
+  elements as they are (no `path` or `element_text`), with an index `ON
+  (ELEMENTS(list))` and no conditions on the source; and there are no
+  metrics and no extent;
 - every group of the bitmaps it reads has one row for each of its members,
   as a table of segment memberships does, so that a cohort's rows with a
   value are as many as its people. An index records each bitmap's rows and

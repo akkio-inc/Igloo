@@ -160,7 +160,9 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 		case d.Elements != "":
 			// An index of the list's elements, which holds nothing else
 			// to keep rows by.
-			if d.Path != nil || len(where) > 0 {
+			if d.Path != nil || len(where) > 0 || d.ElementText != "" {
+				// (An index keeps the elements as they are, not their
+				// text as element_text reads it.)
 				return nil
 			}
 			groups, elements = []string{d.Elements}, d.Elements

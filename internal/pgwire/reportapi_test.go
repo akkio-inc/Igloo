@@ -33,6 +33,10 @@ var reportFixture = []string{
 	"CREATE TABLE lake.public.browsing AS SELECT 'p' || (i % 90) AS person_id, CASE i % 4 WHEN 0 THEN ['cars', 'news'] WHEN 1 THEN ['', 'cars', 'cars'] WHEN 2 THEN NULL ELSE [] END AS keywords, " +
 		"CASE WHEN i % 7 = 0 THEN NULL ELSE DATE '2026-02-01' + CAST(i % 9 AS INTEGER) END AS visited_date FROM range(600) r(i)",
 	"CREATE TABLE lake.public.segments AS SELECT 'p' || (i % 110) AS person_id, CASE WHEN i % 3 = 0 THEN 'SEG_HH_' || (i % 5) ELSE 'SEGXHH_' || (i % 4) END AS segment_name FROM range(1500) r(i)",
+	// Lists of text whose elements may be JSON, as Snowflake's arrays of
+	// semi-structured values come out of its translation.
+	"CREATE TABLE lake.public.tagged AS SELECT 'p' || (i % 70) AS person_id, CASE i % 6 WHEN 0 THEN ['{\"a\": 1}', 'plain'] WHEN 1 THEN ['\"quoted\"', '[1, 2]'] " +
+		"WHEN 2 THEN ['{not json', 'plain', ' '] WHEN 3 THEN [NULL, '{\"a\": 1}'] WHEN 4 THEN ['[\"x\", {\"b\": [true]}]'] ELSE NULL END AS tags FROM range(500) r(i)",
 }
 
 // reportCohortsSQL are the reports' cohorts: an audience's latest version
@@ -171,6 +175,19 @@ UNION ALL
 SELECT d, NULL, cohort, true, count(DISTINCT person_id), count(*), count(DISTINCT CASE WHEN visited_date IS NULL THEN NULL ELSE (person_id, visited_date) END),
   (SELECT min(visited_date) FROM B), (SELECT max(visited_date) FROM B) FROM E GROUP BY d, cohort`)
 
+	// A list's elements read as Snowflake gives a semi-structured array's
+	// text: a JSON object or array as JSON, anything else as it is.
+	reportParity(t, conn, "elements read as JSON text", map[string]any{
+		"version": 1, "cohorts": reportCohorts(), "totals": true,
+		"source":     map[string]any{"table": "tagged", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "TAG", "elements": "tags", "element_text": "json", "skip_blank": true}},
+	}, `WITH `+reportCohortsSQL+`,
+E AS (SELECT t.person_id, M.cohort, CASE WHEN (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e) THEN json_extract_string(e, '$') ELSE e END AS v
+  FROM tagged AS t JOIN COHORT_MEMBERS AS M ON M.person_id = t.person_id, unnest(t.tags) AS u(e))
+SELECT 'TAG' AS dimension, v AS value, cohort, false AS is_total, count(DISTINCT person_id) AS people, count(*) AS "rows" FROM E WHERE v IS NOT NULL AND trim(v) <> '' GROUP BY v, cohort
+UNION ALL
+SELECT 'TAG', NULL, cohort, true, count(DISTINCT person_id), count(*) FROM E WHERE v IS NOT NULL AND trim(v) <> '' GROUP BY cohort`)
+
 	// Through the view; entries of one name, and two of one (name, group,
 	// value), which count together.
 	interest := func(name, constant, metric string) map[string]any {
@@ -259,6 +276,12 @@ func TestReportAPIForms(t *testing.T) {
 		{"a cohort that is no SELECT", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "dimensions": []any{},
 			"cohorts": []any{map[string]any{"label": "x", "sql": "DELETE FROM attributes"}}}) + ")"},
 		{"a spec that is no literal", "igloo.audience_profile(lower('{}'))"},
+		{"element_text on a column", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": reportCohorts(),
+			"source": map[string]any{"table": "segments", "member": "person_id"}, "dimensions": []any{map[string]any{"name": "S", "column": "segment_name", "element_text": "json"}}}) + ")"},
+		{"an element_text there is not", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": reportCohorts(),
+			"source": map[string]any{"table": "tagged", "member": "person_id"}, "dimensions": []any{map[string]any{"name": "T", "elements": "tags", "element_text": "xml"}}}) + ")"},
+		{"element_text with a path", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": reportCohorts(),
+			"source": map[string]any{"table": "tagged", "member": "person_id"}, "dimensions": []any{map[string]any{"name": "T", "elements": "tags", "path": "$.a", "element_text": "json"}}}) + ")"},
 		{"an unknown operator", "igloo.audience_profile(" + specLiteral(t, map[string]any{"version": 1, "cohorts": []any{
 			map[string]any{"label": "x", "table": "segments", "member": "person_id", "where": map[string]any{"segment_name": map[string]any{"near": 1}}}}, "dimensions": []any{}}) + ")"},
 	} {
@@ -522,6 +545,10 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		"source":     map[string]any{"table": "interests", "member": "person_id"},
 		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "skip_blank": true}}}
 	answered("a list's elements", topics, "index")
+	// Read as text, which the index does not keep: the tables.
+	answered("a list's elements as JSON text", map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
+		"source":     map[string]any{"table": "interests", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "element_text": "json", "skip_blank": true}}}, "scan")
 	it.internal("INSERT INTO lake.public.interests (person_id, topics, _igloo_id_person_id) SELECT value, ['cars'], id FROM lake.igloo_domains.people WHERE value = 'p0'")
 	srv.indexesChanged("public", "interests")
 	srv.waitIndexBuilds(t)

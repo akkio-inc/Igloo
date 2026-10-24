@@ -269,6 +269,7 @@ type reportDim struct {
 	Name        string             `json:"name"`
 	Column      string             `json:"column"`
 	Elements    string             `json:"elements"`
+	ElementText string             `json:"element_text"`
 	Path        *string            `json:"path"`
 	Constant    *string            `json:"constant"`
 	Map         map[string]*string `json:"map"`
@@ -425,6 +426,16 @@ func (s *reportSpec) check(ctx context.Context, sess *session) error {
 		}
 		if d.Path != nil && d.Elements == "" {
 			return reportError("%s.path: only an elements dimension reads a path", at)
+		}
+		if d.ElementText != "" {
+			switch {
+			case d.Elements == "":
+				return reportError("%s.element_text: only an elements dimension reads its elements' text", at)
+			case d.Path != nil:
+				return reportError("%s.element_text: not with a path, whose elements are JSON already", at)
+			case d.ElementText != "json":
+				return reportError("%s.element_text: %q; the one there is, is \"json\"", at, d.ElementText)
+			}
 		}
 		if d.MetricWhere != nil && d.Metric == "" {
 			return reportError("%s.metric_where: needs a metric", at)
@@ -973,6 +984,12 @@ func (d reportDim) entrySQL(v string) string {
 func (d reportDim) elementsSQL() string {
 	list := "s." + quoteIdent(d.Elements)
 	elem := "CAST(x AS VARCHAR)"
+	if d.ElementText == "json" {
+		// An element that is a JSON object or array as text reads as JSON,
+		// as Snowflake's text of a semi-structured value's elements does.
+		elem = "CASE WHEN (starts_with(CAST(x AS VARCHAR), '{') OR starts_with(CAST(x AS VARCHAR), '[')) AND json_valid(CAST(x AS VARCHAR)) " +
+			"THEN json_extract_string(CAST(x AS VARCHAR), '$') ELSE CAST(x AS VARCHAR) END"
+	}
 	if d.Path != nil {
 		list = "CAST(json_extract(" + list + ", " + quoteLiteral(*d.Path) + ") AS JSON[])"
 		elem = "json_extract_string(x, '$')"
