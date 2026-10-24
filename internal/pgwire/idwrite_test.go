@@ -153,3 +153,29 @@ func TestMemberWrites(t *testing.T) {
 		t.Errorf("rows:\n got %s\nwant %s", got, want)
 	}
 }
+
+// TestMemberWriteColumnNamedLikeTable inserts into a member table one of
+// whose columns is named like a protected table: Igloo's own write names
+// the columns, quoted, and the column list is no table reference.
+func TestMemberWriteColumnNamedLikeTable(t *testing.T) {
+	it := newIDTest(t)
+	it.exec(
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		// people is also the domain's dictionary, a protected table.
+		"CREATE TABLE lake.public.visits AS SELECT 'p' || i AS person_id, ['a', 'b'] AS people FROM range(5) r(i)",
+		"CREATE TAG pii",
+		"ALTER TABLE lake.public.visits ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"CREATE ID DOMAIN people (VARCHAR) TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.visits ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	it.r.srv.MapIDDomains(context.Background())
+	it.exec(
+		"INSERT INTO lake.public.visits SELECT 'q' || i, ['news'] FROM range(3) r(i)",
+		"INSERT INTO lake.public.visits VALUES ('p1', ['cars'])",
+		`INSERT INTO lake.public.visits ("person_id", "people") VALUES ('p2', [])`,
+	)
+	it.consistent("people", true, "visits")
+	if got := it.one("SELECT count(*) FROM lake.public.visits"); got != "10" {
+		t.Errorf("rows: %s", got)
+	}
+}

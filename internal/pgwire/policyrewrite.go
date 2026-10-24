@@ -1103,9 +1103,14 @@ func (rw *rewriter) insertEdits(query string) ([]edit, error) {
 		sc.name()
 	}
 	sc.skip()
+	// The target's column list names its columns, never a table: a column
+	// named like a protected table, as Igloo's own writes to member tables
+	// quote them, is not one.
+	var columns span
 	if sc.i < len(sc.s) && sc.s[sc.i] == '(' {
 		end := matchParen(sc.s, sc.i)
 		if end > 0 && !selectLike(sc.s[sc.i+1:end]) {
+			columns = span{sc.i, end + 1}
 			sc.i = end + 1
 		}
 	}
@@ -1141,7 +1146,7 @@ func (rw *rewriter) insertEdits(query string) ([]edit, error) {
 			return nil, err
 		}
 	}
-	return edits, rw.residual(query, name, source)
+	return edits, rw.residual(query, name, columns, source)
 }
 
 // target resolves the table a statement writes, reporting whether it is a
