@@ -151,6 +151,25 @@ SELECT 'BROWSING_REACH', 'ANY_BROWSING', M.cohort, count(DISTINCT b.person_id), 
   count(DISTINCT CASE WHEN b.visited_date IS NULL THEN NULL ELSE (b.person_id, b.visited_date) END)
 FROM browsing AS b JOIN COHORT_MEMBERS AS M ON M.person_id = b.person_id GROUP BY ALL`)
 
+	reportParity(t, conn, "browsing signals, with totals and the extent", map[string]any{
+		"version": 1, "cohorts": reportCohorts(), "totals": true, "extent": "visited_date",
+		"source": map[string]any{"table": "browsing", "member": "person_id"},
+		"dimensions": []any{
+			map[string]any{"name": "KEYWORDS", "elements": "keywords", "skip_blank": true},
+			map[string]any{"name": "BROWSING_REACH", "constant": "ANY_BROWSING"},
+		},
+		"metrics": []any{map[string]any{"name": "days", "distinct_with": "visited_date"}},
+	}, `WITH `+reportCohortsSQL+`,
+B AS (SELECT br.*, cm.cohort FROM browsing AS br JOIN COHORT_MEMBERS AS cm ON cm.person_id = br.person_id),
+E AS (SELECT person_id, cohort, visited_date, 'KEYWORDS' AS d, k AS v FROM B, unnest(B.keywords) AS u(k) WHERE k IS NOT NULL AND trim(k) <> ''
+  UNION ALL SELECT person_id, cohort, visited_date, 'BROWSING_REACH', 'ANY_BROWSING' FROM B)
+SELECT d AS dimension, v AS value, cohort, false AS is_total, count(DISTINCT person_id) AS people, count(*) AS "rows",
+  count(DISTINCT CASE WHEN visited_date IS NULL THEN NULL ELSE (person_id, visited_date) END) AS days_distinct,
+  (SELECT min(visited_date) FROM B) AS extent_min, (SELECT max(visited_date) FROM B) AS extent_max FROM E GROUP BY d, v, cohort
+UNION ALL
+SELECT d, NULL, cohort, true, count(DISTINCT person_id), count(*), count(DISTINCT CASE WHEN visited_date IS NULL THEN NULL ELSE (person_id, visited_date) END),
+  (SELECT min(visited_date) FROM B), (SELECT max(visited_date) FROM B) FROM E GROUP BY d, cohort`)
+
 	// Through the view; entries of one name, and two of one (name, group,
 	// value), which count together.
 	interest := func(name, constant, metric string) map[string]any {

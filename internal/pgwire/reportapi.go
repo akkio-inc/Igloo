@@ -794,35 +794,58 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 		b.WriteString(", ext")
 	}
 	b.WriteString(" FROM " + cte("rows") + ")\n")
-	b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, GROUPING(value) AS total, GROUPING(dimension) AS everything, " +
-		"count(DISTINCT CASE WHEN keep THEN member END) AS people, count(*) FILTER (WHERE keep) AS \"rows\", " +
+	aggs := "count(DISTINCT CASE WHEN keep THEN member END) AS people, count(*) FILTER (WHERE keep) AS \"rows\", " +
 		"sum(metric) FILTER (WHERE keep) AS metric_sum, " +
 		// NULL, not 0, where no entry has a metric.
 		"CASE WHEN bool_or(has_metric) FILTER (WHERE keep) THEN count(metric) FILTER (WHERE keep) END AS metric_count, " +
-		"avg(metric) FILTER (WHERE keep) AS metric_avg")
+		"avg(metric) FILTER (WHERE keep) AS metric_avg"
 	var metricCols []string
+	pairs := false
 	for i, m := range s.Metrics {
 		g := "g" + strconv.Itoa(i)
 		if m.DistinctWith != "" {
-			b.WriteString(", count(DISTINCT row(member, " + g + ")) FILTER (WHERE keep AND " + g + " IS NOT NULL) AS " + quoteIdent(m.Name+"_distinct"))
+			pairs = true
+			aggs += ", count(DISTINCT row(member, " + g + ")) FILTER (WHERE keep AND " + g + " IS NOT NULL) AS " + quoteIdent(m.Name+"_distinct")
 		} else {
-			b.WriteString(", sum(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_sum") + ", avg(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_avg"))
+			aggs += ", sum(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_sum") + ", avg(" + g + ") FILTER (WHERE keep) AS " + quoteIdent(m.Name+"_avg")
 		}
 		for _, c := range m.columns() {
 			metricCols = append(metricCols, "n."+quoteIdent(c))
 		}
 	}
-	if s.Extent != "" {
-		b.WriteString(", min(ext) AS extent_min, max(ext) AS extent_max")
+	extent := ""
+	if !pairs {
+		// One pass over the rows: values, totals and the extent as
+		// grouping sets.
+		ext := ""
+		if s.Extent != "" {
+			ext = ", min(ext) AS extent_min, max(ext) AS extent_max"
+		}
+		sets := []string{"(dimension, dim_group, value, cohort)"}
+		if s.Totals {
+			sets = append(sets, "(dimension, dim_group, cohort)")
+		}
+		if s.Extent != "" {
+			sets = append(sets, "()")
+			extent = "SELECT extent_min, extent_max FROM " + cte("counts") + " WHERE everything = 1"
+		}
+		b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, GROUPING(value) AS total, GROUPING(dimension) AS everything, " +
+			aggs + ext + " FROM " + cte("values") + " GROUP BY GROUPING SETS (" + strings.Join(sets, ", ") + "))\n")
+	} else {
+		// Counts of distinct pairs beside counts of distinct members, two
+		// distinct keys, which grouping sets cannot combine across
+		// workers: a GROUP BY for values and one for totals instead.
+		b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, 0 AS total, 0 AS everything, " + aggs +
+			" FROM " + cte("values") + " GROUP BY dimension, dim_group, value, cohort")
+		if s.Totals {
+			b.WriteString(" UNION ALL SELECT dimension, dim_group, CAST(NULL AS VARCHAR) AS value, cohort, 1 AS total, 0 AS everything, " + aggs +
+				" FROM " + cte("values") + " GROUP BY dimension, dim_group, cohort")
+		}
+		b.WriteString(")\n")
+		if s.Extent != "" {
+			extent = "SELECT min(ext) AS extent_min, max(ext) AS extent_max FROM " + cte("values")
+		}
 	}
-	sets := []string{"(dimension, dim_group, value, cohort)"}
-	if s.Totals {
-		sets = append(sets, "(dimension, dim_group, cohort)")
-	}
-	if s.Extent != "" {
-		sets = append(sets, "()")
-	}
-	b.WriteString(" FROM " + cte("values") + " GROUP BY GROUPING SETS (" + strings.Join(sets, ", ") + "))\n")
 	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, n.people, n.\"rows\", z.cohort_size, " +
 		"n.metric_sum, n.metric_count, n.metric_avg")
 	for _, c := range metricCols {
@@ -832,8 +855,8 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 		b.WriteString(", x.extent_min, x.extent_max")
 	}
 	b.WriteString(", 'scan' AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
-	if s.Extent != "" {
-		b.WriteString(" CROSS JOIN (SELECT extent_min, extent_max FROM " + cte("counts") + " WHERE everything = 1) AS x")
+	if extent != "" {
+		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
 	}
 	b.WriteString(" WHERE n.everything = 0 AND n.\"rows\" > 0")
 	return b.String()
