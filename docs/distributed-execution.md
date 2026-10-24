@@ -369,7 +369,10 @@ run longest` with the statement and task. A task that runs out of DuckDB's
 memory limit on a worker (`Out of Memory Error`) counts the same. The
 statement's parts then run again in smaller tasks, twice: each time over
 twice the partitions (up to 256), with each task's share of a divided table
-halved, and half the memory for grouping partitions into a task. If those
+halved, and half the memory for grouping partitions into a task. A task
+that read one partition is no smaller so, so when such a task ran out, the
+partitions grow fourfold instead, up to 1,024, as far as leaves each
+writer files of a million rows of the exchange it read. If those
 run out too, the statement fails with SQLSTATE `53200` (`out_of_memory`), and
 the server logs `a worker ran out of memory running part of a statement`:
 run on another worker or on the coordinator, the part would run out of

@@ -368,7 +368,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   A task that runs out of DuckDB's memory on a worker counts as the memory
   watch's cancel does, not as a broken worker: the statement's parts run
   again in smaller tasks (twice the partitions, half of each task's share),
-  up to twice, and then fail with SQLSTATE `53200`. A statement whose
+  up to twice, and then fail with SQLSTATE `53200`. When the task read one
+  partition, which smaller tasks would not divide, the partitions grow
+  fourfold, up to 1,024, as far as leaves each writer files of a million
+  rows: a report's tasks over one partition of 52.5 million rows ran out of
+  memory on every attempt at 202 partitions until it ran out of time. A statement whose
   workers fail runs on the coordinator only if it fits there: one whose
   exchanged rows would take more than the coordinator's memory, or that ran
   out of it before, fails at once, where it ran on the coordinator for half

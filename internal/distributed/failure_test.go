@@ -171,6 +171,38 @@ func TestWorkerOutOfMemory(t *testing.T) {
 	}
 }
 
+// A task over one partition that ran out of memory reads it all again in
+// smaller tasks: at a hundred times the data, a report's tasks over one
+// partition of 52.5 million rows ran out on every attempt at 202
+// partitions, of exchanges of 10.6 billion rows on 16 workers. The
+// statement runs again over four times the partitions, but no more than
+// leave writers files of a million rows, nor maxRetryPartitions; a small
+// exchange's statement runs again over twice its partitions, as any other.
+func TestRetryPartitions(t *testing.T) {
+	for _, c := range []struct {
+		parts   int
+		rows    int64
+		workers int
+		want    int
+	}{
+		{202, 10_605_000_000, 16, 632},
+		{202, 1e12, 16, 808},
+		{512, 1e12, 16, maxRetryPartitions},
+		{32, 50_000_000, 16, 64},
+		{200, 50_000_000, 16, maxPartitions},
+		{256, 0, 16, 256},
+	} {
+		if got := retryPartitions(c.parts, c.rows, c.workers); got != c.want {
+			t.Errorf("retryPartitions(%d, %d, %d) = %d, want %d", c.parts, c.rows, c.workers, got, c.want)
+		}
+	}
+	err := &onePartition{err: fmt.Errorf("%w: a task on w:1: out of memory", ErrWorkerMemory), rows: 10}
+	var one *onePartition
+	if !OutOfMemory(err) || !errors.As(error(err), &one) || one.rows != 10 {
+		t.Errorf("%v is not a worker out of memory over one partition", err)
+	}
+}
+
 // A worker runs as many tasks at once as its cores and memory allow
 // (taskSlots), one for the harness's, and the others wait: two stages that
 // scan lineitem side by side, then a join's stage of a task per partition,

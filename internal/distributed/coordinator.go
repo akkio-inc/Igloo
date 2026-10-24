@@ -434,6 +434,30 @@ var ErrNoWorkers = errors.New("no workers available")
 // on a worker runs again in smaller tasks before it fails.
 const memoryRetries = 2
 
+// maxRetryPartitions caps the partitions a statement's exchanges get when
+// it runs again because a task over one partition ran out of memory (see
+// retryPartitions); workers keep as many files open (see writePartitions).
+const maxRetryPartitions = 4 * maxPartitions
+
+// retryPartitions returns the partitions a statement's exchanges get when
+// it runs again after a task that read one partition of them ran out of
+// memory, parts the partitions it had, rows the most rows such an exchange
+// held, on workers workers. Smaller tasks divide what tasks read of a
+// table and group fewer partitions to a task, but a task over one
+// partition reads it all again: at a hundred times the data, a report's
+// tasks over one partition of 52.5 million rows of four lists of strings
+// ran out of memory on every attempt at 202 partitions, until it ran out
+// of time. So the partitions grow fourfold, up to maxRetryPartitions, but
+// to no more than leave each writer, about one a worker, files of
+// minPartitionRows of the rows the exchange held.
+func retryPartitions(parts int, rows int64, workers int) int {
+	next := min(4*parts, maxRetryPartitions)
+	if floor := int(rows / (int64(max(workers, 1)) * minPartitionRows)); floor < next {
+		next = max(floor, min(2*parts, maxPartitions), parts)
+	}
+	return next
+}
+
 // Keep keeps the workers from stopping as idle until release is called:
 // the server holds them while a statement that ran tasks runs, on the
 // coordinator too.
@@ -575,11 +599,15 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			// divided table halved, and half the memory to group
 			// partitions in (see groups).
 			next := min(2*parts, maxPartitions)
+			var one *onePartition
+			if errors.As(err, &one) {
+				next = retryPartitions(parts, one.rows, len(ws))
+			}
 			if most := writerPartitions(planned.Stages, ws, uploadBytes(co.opts.Warehouse)); most > 0 {
 				next = min(next, max(most, len(ws), parts))
 			}
 			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",
-				"query", qid, "attempt", attempt+1, "partitions", next, "err", err)
+				"query", qid, "attempt", attempt+1, "partitions", next, "one_partition", one != nil, "err", err)
 			parts = next
 			smaller++
 			dropAttempt()

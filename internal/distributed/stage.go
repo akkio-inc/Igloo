@@ -307,6 +307,34 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 
 // prefetchUsed returns, with prefetching on (Options.Prefetch), the field
 // IDs of the columns the stage's query may read of each catalog table it
+// onePartition is a task that ran out of memory over one partition of the
+// exchanges it read, which smaller tasks would not divide (see Execute);
+// rows are the most rows one of those exchanges held in all.
+type onePartition struct {
+	err  error
+	rows int64
+}
+
+func (e *onePartition) Error() string { return e.err.Error() }
+func (e *onePartition) Unwrap() error { return e.err }
+
+// exchangeRows returns the most rows an exchange that stage s reads by
+// partition holds, as written.
+func (e *execution) exchangeRows(s *Stage) int64 {
+	var most int64
+	for _, in := range s.Inputs {
+		if in.Exchange == nil || !in.Partitioned {
+			continue
+		}
+		if x := e.exchanges[in.Exchange.ID]; x != nil {
+			x.mu.Lock()
+			most = max(most, x.rows)
+			x.mu.Unlock()
+		}
+	}
+	return most
+}
+
 // reads, by view name; nil with it off, or for a query the walk cannot
 // read, whose tasks are then not prefetched.
 func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string][]int {
@@ -505,6 +533,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			defer mu.Unlock()
 			res.files[i] = out
 			res.workers[w.addr] = true
+				if OutOfMemory(err) && groups != nil && len(groups[i]) == 1 {
+					return &onePartition{err: err, rows: e.exchangeRows(s)}
+				}
 			if res.columns == nil {
 				res.columns = head.Columns
 			} else if !slices.Equal(res.columns, head.Columns) {
