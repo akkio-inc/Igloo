@@ -319,6 +319,61 @@ SELECT rb_count_distinct((hash(i) % 4294967295)::UINTEGER) > 1999000 FROM range(
 ----
 true
 
+# the bitmaps scalar functions read from their BLOBs count too: one read from a table, as Igloo's statements read
+# bitmap indexes, and a constant's, read when the statement is bound
+statement ok
+CREATE TABLE big AS SELECT rb_agg(i::UINTEGER) AS bm FROM range(0, 3000000, 3) r(i)
+
+statement ok
+SET VARIABLE big = (SELECT bm FROM big)
+
+statement ok
+SET rb_memory_budget = '64KB'
+
+statement error
+SELECT rb_cardinality(bm) FROM big
+----
+rb: bitmap memory budget exceeded
+
+statement error
+SELECT rb_and_cardinality(bm, bm) FROM big
+----
+rb: bitmap memory budget exceeded
+
+statement error
+SELECT rb_cardinality(rb_or(bm, bm)) FROM big
+----
+rb: bitmap memory budget exceeded
+
+statement error
+SELECT count(*) FROM big, range(10) t(j) WHERE rb_contains(bm, j::UINTEGER)
+----
+rb: bitmap memory budget exceeded
+
+statement error
+SELECT len(rb_to_list(bm)) FROM big
+----
+rb: bitmap memory budget exceeded
+
+statement error
+SELECT count(*) FROM range(10) t(j) WHERE rb_contains(getvariable('big'), j::UINTEGER)
+----
+rb: bitmap memory budget exceeded
+
+statement ok
+RESET rb_memory_budget
+
+query IIII
+SELECT rb_cardinality(bm), rb_and_cardinality(bm, bm), (SELECT count(*) FROM range(10) t(j) WHERE rb_contains(getvariable('big'), j::UINTEGER)), len(rb_to_list(bm)) FROM big
+----
+1000000	1000000	4	1000000
+
+statement ok
+RESET VARIABLE big
+
+statement ok
+DROP TABLE big
+
 # 24 million ids spread over all of UINTEGER take some 96 MB: past a 64 MB
 # memory limit, the bitmaps' reservation or DuckDB's next allocation fails,
 # whichever comes first (the tables above leave DuckDB little room)

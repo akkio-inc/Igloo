@@ -4,9 +4,12 @@
 // CRoaring allocates with malloc, outside DuckDB's buffer manager, so without
 // this the memory a query's bitmaps take would count toward no memory_limit
 // and could take a process past it. CRoaring's memory hook sends every
-// allocation through a counter, charged to the aggregate running on the thread
-// (see AccountScope). After each step that grows its bitmaps, an aggregate
-// reserves the growth with DuckDB's buffer manager (MemoryTag::EXTENSION),
+// allocation through a counter, charged to the aggregate or scalar expression
+// running on the thread (see AccountScope): an aggregate's states, and the
+// bitmaps a scalar function reads from its BLOBs, one each argument a call,
+// or once at bind for a constant. After each step that grows its bitmaps, an
+// aggregate or expression reserves the growth with DuckDB's buffer manager
+// (MemoryTag::EXTENSION),
 // which evicts other buffers to make room or refuses; it gives the
 // reservation back when its last bitmap is freed. A refusal, or growth past
 // rb_memory_budget, fails the statement with an error that starts
@@ -98,6 +101,9 @@ public:
 private:
 	Account *previous;
 };
+
+//! A new account, with the session's rb_memory_budget, for one aggregate's or one scalar expression's bitmaps.
+Account *NewAccount(ClientContext &context);
 
 //! Installs the CRoaring memory hook; once per process.
 void InstallMemoryHook();

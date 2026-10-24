@@ -690,4 +690,34 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	srv.waitIndexBuilds(t)
 	srv.MaintainBitmapIndexes(ctx)
 	answered("segments, with a member's row repeated", segments, "index+scan")
+
+	// A budget below the size of a bitmap the index path reads (a group's,
+	// in rb_and_cardinality): it does not fit, and the call runs again from
+	// the tables, with the same rows.
+	it.exec(
+		"CREATE TABLE lake.public.halves AS SELECT 'h' || i AS person_id, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END AS half FROM range(20000) r(i)",
+		"ALTER TABLE lake.public.halves ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.halves ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	srv.MapIDDomains(ctx)
+	it.exec("ALTER TABLE lake.public.halves ADD BITMAP INDEX halves_half ON (half) FOR person_id",
+		"ALTER TABLE lake.public.halves ADD BITMAP INDEX halves_all ON () FOR person_id")
+	srv.waitIndexBuilds(t)
+	srv.MaintainBitmapIndexes(ctx)
+	halves := map[string]any{"version": 1, "cohorts": []any{map[string]any{"label": "EVERYONE", "table": "halves", "member": "person_id"}},
+		"source":     map[string]any{"table": "halves", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "HALF", "column": "half"}}}
+	answered("halves", halves, "index")
+	lit := specLiteral(t, halves)
+	want := texts(t, conn, "SELECT * EXCLUDE (path) FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+	reruns := srv.bitmapReruns.Load()
+	mustExec(t, conn, "SET rb_memory_budget = '4KB'")
+	got := texts(t, conn, "SELECT * EXCLUDE (path) FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+	mustExec(t, conn, "RESET rb_memory_budget")
+	if !slices.Equal(got, want) {
+		t.Errorf("halves, with bitmaps that do not fit: rows\n%q\nwant\n%q", got, want)
+	}
+	if srv.bitmapReruns.Load() == reruns {
+		t.Error("halves, with bitmaps that do not fit, did not run again from the tables")
+	}
 }

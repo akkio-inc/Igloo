@@ -62,12 +62,16 @@ read once per chunk: hand a large one over in a variable (`SET VARIABLE b =
   estimate of the rows the statement reads, and sets `'always'` around the
   statements it picks (`internal/pgwire/bitmaps.go`). Igloo's distributed
   planner reads it too, to combine workers' partial counts as bitmaps.
-- `rb_memory_budget`: the most memory one aggregate's bitmaps may take, such
-  as `'2GB'`; empty (the default) leaves them to DuckDB's `memory_limit`.
-  Bitmaps count toward `memory_limit` either way, and a statement whose
-  bitmaps do not fit fails with an error that starts
-  `rb: bitmap memory budget exceeded`, on which Igloo runs it again once with
-  `rb_count_distinct = 'off'`.
+- `rb_memory_budget`: the most memory the bitmaps of one aggregate, or of one
+  scalar expression, may take, such as `'2GB'`; empty (the default) leaves
+  them to DuckDB's `memory_limit`. A scalar function's bitmaps are those it
+  reads from its BLOBs (one for each argument while a call runs, or a
+  constant's for as long as the statement). Bitmaps count toward
+  `memory_limit` either way, and a statement whose bitmaps do not fit fails
+  with an error that starts `rb: bitmap memory budget exceeded`, on which
+  Igloo runs it again once without them: with `rb_count_distinct = 'off'`,
+  or from the tables rather than bitmap indexes. The BLOBs themselves are
+  DuckDB's values, which it copies between operators as it does any string.
 
 ## Building and loading
 

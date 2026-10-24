@@ -370,12 +370,7 @@ struct RbBindData : public FunctionData {
 };
 
 static unique_ptr<FunctionData> RbBind(ClientContext &context, AggregateFunction &, vector<unique_ptr<Expression>> &) {
-	idx_t budget = 0;
-	Value v;
-	if (context.TryGetCurrentSetting("rb_memory_budget", v) && !v.IsNull() && !v.ToString().empty()) {
-		budget = DBConfig::ParseMemoryLimit(v.ToString());
-	}
-	return make_uniq<RbBindData>(new Account(BufferManager::GetBufferManager(context), budget));
+	return make_uniq<RbBindData>(NewAccount(context));
 }
 
 static Account *AccountOf(AggregateInputData &aggr) {

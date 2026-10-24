@@ -4,6 +4,8 @@
 #include "rb_memory.hpp"
 
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "roaring.h"
 
@@ -42,6 +44,15 @@ static void FlushPending() {
 Account::Account(BufferManager &buffer_manager_p, idx_t budget_p) : buffer_manager(buffer_manager_p), budget(budget_p) {
 }
 
+Account *NewAccount(ClientContext &context) {
+	idx_t budget = 0;
+	Value v;
+	if (context.TryGetCurrentSetting("rb_memory_budget", v) && !v.IsNull() && !v.ToString().empty()) {
+		budget = DBConfig::ParseMemoryLimit(v.ToString());
+	}
+	return new Account(BufferManager::GetBufferManager(context), budget);
+}
+
 Account::~Account() {
 	if (reserved > 0) {
 		buffer_manager.FreeReservedMemory(reserved);
@@ -70,7 +81,7 @@ void Account::Sync() {
 	}
 	std::lock_guard<std::mutex> guard(lock);
 	if (budget > 0 && now > static_cast<int64_t>(budget)) {
-		throw OutOfMemoryException("%s: the bitmaps of one COUNT(DISTINCT) hold %s, past rb_memory_budget (%s)",
+		throw OutOfMemoryException("%s: the bitmaps of one aggregate or expression hold %s, past rb_memory_budget (%s)",
 		                           BUDGET_EXCEEDED, StringUtil::BytesToHumanReadableString(now),
 		                           StringUtil::BytesToHumanReadableString(budget));
 	}
@@ -83,7 +94,7 @@ void Account::Sync() {
 		buffer_manager.ReserveMemory(step);
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
-		throw OutOfMemoryException("%s: the bitmaps of one COUNT(DISTINCT) hold %s and DuckDB has no room for more: %s",
+		throw OutOfMemoryException("%s: the bitmaps of one aggregate or expression hold %s and DuckDB has no room for more: %s",
 		                           BUDGET_EXCEEDED, StringUtil::BytesToHumanReadableString(now), error.RawMessage());
 	}
 	reserved += step;
