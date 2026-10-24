@@ -482,13 +482,44 @@ func (a *aggregation) collect() error {
 	return err
 }
 
+// nullsLeftOut are the aggregates that leave NULL values out, with
+// DISTINCT as without.
+var nullsLeftOut = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
+
+// distinctFilter writes agg(DISTINCT x) FILTER (WHERE c), of an aggregate
+// that leaves NULLs out, as agg(DISTINCT CASE WHEN c THEN x END), which is
+// the same: the values the filter drops become NULLs. A report counts
+// each group's people among the rows it keeps so; a DISTINCT aggregate
+// with a FILTER does not combine across workers.
+func (a *aggregation) distinctFilter(call node, name string) error {
+	args := list(call, "children")
+	if call["distinct"] != true || child(call, "filter") == nil || len(args) != 1 || !nullsLeftOut[name] {
+		return nil
+	}
+	c, err := a.pl.p.expr("CASE WHEN true THEN NULL END")
+	if err != nil {
+		return err
+	}
+	checks := list(c, "case_checks")
+	if len(checks) != 1 {
+		return fmt.Errorf("CASE parsed with %d branches", len(checks))
+	}
+	check := checks[0].(node)
+	check["when_expr"], check["then_expr"] = call["filter"], args[0]
+	call["children"], call["filter"] = []any{c}, nil
+	return nil
+}
+
 // add records one aggregate call.
 func (a *aggregation) add(call node) error {
+	name := strings.ToLower(str(call["function_name"]))
+	if err := a.distinctFilter(call, name); err != nil {
+		return err
+	}
 	key := a.key(call)
 	if _, ok := a.aggKeys[key]; ok {
 		return nil
 	}
-	name := strings.ToLower(str(call["function_name"]))
 	args := list(call, "children")
 	if call["export_state"] == true {
 		return unsupported("EXPORT_STATE")

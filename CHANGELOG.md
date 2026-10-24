@@ -607,6 +607,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- `count(DISTINCT x) FILTER (WHERE ...)`, and `sum`, `avg`, `min` and
+  `max` over `DISTINCT` values with a `FILTER`, run distributed: the
+  planner writes them as `count(DISTINCT CASE WHEN ... THEN x END)`, which
+  is the same since they leave NULLs out. A report that counts each
+  group's people among the rows it keeps so read its whole fact table on
+  one machine.
 - A subquery that workers compute as a relation, as when a report joins a
   view of a wide table to itself, writes only the columns its reader
   reads to the exchange. A report whose 16 branches each read three

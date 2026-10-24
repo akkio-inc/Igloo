@@ -309,7 +309,9 @@ explicit transactions, the coordinator plans it:
    Every combined value is cast to the type DuckDB gives the
    original, found by binding the aggregates in the session. Grouping sets
    group the workers' rows by all of their columns and are applied by the
-   coordinator. `now()` and `current_date` become the statement's planning
+   coordinator. An aggregate over `DISTINCT` values with a `FILTER`, of
+   one that leaves NULLs out, is written as one over `CASE WHEN filter
+   THEN x END` first. `now()` and `current_date` become the statement's planning
    time everywhere. Statements translated from Snowflake's dialect call
    Igloo's own macros (`sf_flatten_values` and the like, plain expressions
    that every session defines); workers define the same macros for a

@@ -154,6 +154,8 @@ In detail, a part runs distributed when:
   `DISTINCT` values of one expression (`count(DISTINCT user_id)`), or of
   several when one of them is a column that each of the others fixes
   (`count(DISTINCT user_id)` with `count(DISTINCT (user_id, day))`).
+  `count`, `sum`, `avg`, `min` and `max` over `DISTINCT` values may have a
+  `FILTER`, which drops values as `CASE WHEN` would.
   `GROUP BY` may use positions, aliases, `ALL`, `ROLLUP`, `CUBE` and
   `GROUPING SETS`.
 - The large table appears once in it, and the other tables it reads

@@ -43,6 +43,11 @@ func TestPartitionedAggregation(t *testing.T) {
 		{`SELECT l_shipmode, count(DISTINCT l_partkey) FROM lineitem WHERE l_quantity > 1000 GROUP BY 1`, true},
 		{`SELECT l_shipmode AS m, sum(DISTINCT l_suppkey) AS s, avg(DISTINCT l_suppkey) AS a, min(DISTINCT l_suppkey), sum(l_quantity), avg(l_discount), count(*) FILTER (WHERE l_tax > 0.04)
 			FROM lineitem GROUP BY ALL HAVING count(DISTINCT l_suppkey) > 10 ORDER BY m`, true},
+		// A FILTER on a DISTINCT aggregate that leaves NULLs out drops values
+		// as CASE WHEN would.
+		{`SELECT l_shipmode, count(DISTINCT l_partkey) FILTER (WHERE l_quantity > 25) AS parts, count(*) FILTER (WHERE l_quantity > 25) AS n,
+			sum(l_quantity) FROM lineitem GROUP BY 1 ORDER BY 1`, true},
+		{`SELECT avg(DISTINCT l_suppkey) FILTER (WHERE l_tax > 0.04), max(DISTINCT l_suppkey) FILTER (WHERE l_tax > 0.04) FROM lineitem`, true},
 		// Arguments that one of them fixes: partitioned by that one.
 		{`SELECT l_shipmode, count(DISTINCT l_orderkey) AS orders, count(DISTINCT CASE WHEN l_orderkey IS NOT NULL AND l_linenumber IS NOT NULL
 			THEN (l_orderkey, l_linenumber) END) AS lines FROM lineitem GROUP BY 1 ORDER BY 1`, true},
@@ -58,6 +63,8 @@ func TestPartitionedAggregation(t *testing.T) {
 		// Grouping sets are applied by the coordinator, over every worker's
 		// finest groups.
 		{`SELECT l_returnflag, l_linestatus, count(DISTINCT l_partkey) FROM lineitem GROUP BY ROLLUP (1, 2) ORDER BY 1, 2`, false},
+		{`SELECT l_returnflag, l_linestatus, GROUPING(l_linestatus) AS total, count(DISTINCT l_partkey) FILTER (WHERE l_discount > 0.05) AS parts
+			FROM lineitem GROUP BY GROUPING SETS ((l_returnflag, l_linestatus), ()) ORDER BY 1, 2`, false},
 		{`SELECT l_returnflag, sum(l_quantity) FROM lineitem GROUP BY 1 ORDER BY 1 LIMIT 2`, true},
 		// Groups of the tables every worker reads in full are few: the
 		// coordinator combines them.
