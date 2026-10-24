@@ -80,11 +80,13 @@ type WorkerOptions struct {
 	Tasks   int
 	Metrics *WorkerMetrics
 	// Prefetch, if set, is called as a task starts to run with what it
-	// reads of catalog tables' data files, when the coordinator sends that
-	// (Options.Prefetch): one Scan per view, named by the view, of the files
-	// the worker may read. It must return at once, reading the files in the
-	// background until ctx, the task's, is done. DuckDB reads the files'
-	// footers first (see readByName), then the columns.
+	// reads of catalog tables' data files and of exchanges' files in object
+	// storage, when the coordinator sends that (Options.Prefetch): one Scan
+	// per view, named by the view, of the files the worker may read; an
+	// exchange's are read whole (Scan.Whole). It must return at once,
+	// reading the files in the background until ctx, the task's, is done.
+	// DuckDB reads the files' footers first (see readByName and
+	// checkRows), then the columns.
 	Prefetch func(ctx context.Context, scans []Scan)
 }
 
@@ -909,17 +911,19 @@ type schemaNode struct {
 // maxFooters bounds the data files whose footers a worker remembers.
 const maxFooters = 10000
 
-// prefetchScans returns what a task reads of catalog tables' data files,
-// for WorkerOptions.Prefetch: its views that the coordinator described for
-// prefetching, with the files the worker may read.
+// prefetchScans returns what a task reads of catalog tables' data files
+// and exchanges' files, for WorkerOptions.Prefetch: its views that the
+// coordinator described for prefetching, with the files the worker may
+// read (an exchange's on workers' disks are fetched, not read from object
+// storage).
 func (w *Worker) prefetchScans(req *taskRequest) []Scan {
 	var scans []Scan
 	for _, v := range req.Views {
 		p := v.Prefetch
-		if p == nil || v.Exact || len(p.Sizes) != len(v.Files) {
+		if p == nil || len(p.Sizes) != len(v.Files) {
 			continue
 		}
-		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used)}
+		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used), Whole: p.Whole}
 		for i, f := range v.Files {
 			if w.allowed(f) {
 				sc.Files = append(sc.Files, File{Path: f, Size: p.Sizes[i]})

@@ -223,7 +223,9 @@ type exchangeRun struct {
 
 	mu      sync.Mutex
 	columns []Column
-	files   [][]string
+	// files are the files of each partition, and sizes their sizes.
+	files [][]string
+	sizes [][]int64
 	// rows counts the rows written, in all and by partition, and bytes
 	// the bytes of their files, in all and by partition; tasks counts the
 	// tasks that wrote them.
@@ -255,8 +257,8 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 		}
 		x := e.exchanges[s.Out.ID]
 		if x == nil {
-			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts), partRows: make([]int64, e.parts),
-				partBytes: make([]int64, e.parts)}
+			x = &exchangeRun{done: make(chan struct{}), files: make([][]string, e.parts), sizes: make([][]int64, e.parts),
+				partRows: make([]int64, e.parts), partBytes: make([]int64, e.parts)}
 			e.exchanges[s.Out.ID] = x
 		}
 		x.producers++
@@ -305,8 +307,6 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 	return g.Wait
 }
 
-// prefetchUsed returns, with prefetching on (Options.Prefetch), the field
-// IDs of the columns the stage's query may read of each catalog table it
 // onePartition is a task that ran out of memory over one partition of the
 // exchanges it read, which smaller tasks would not divide (see Execute);
 // rows are the most rows one of those exchanges held in all.
@@ -335,6 +335,8 @@ func (e *execution) exchangeRows(s *Stage) int64 {
 	return most
 }
 
+// prefetchUsed returns, with prefetching on (Options.Prefetch), the field
+// IDs of the columns the stage's query may read of each catalog table it
 // reads, by view name; nil with it off, or for a query the walk cannot
 // read, whose tasks are then not prefetched.
 func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string][]int {
@@ -393,6 +395,22 @@ func prefetchOf(used map[string][]int, view string, files []File) *viewPrefetch 
 	return p
 }
 
+// exchangePrefetch returns p, what a worker's prefetcher needs of a view
+// of an exchange's files, with the sizes of more of its files, in the
+// order the view lists them. It is nil with prefetching off. A task reads
+// an exchange's files whole: each holds one partition of one writer's
+// rows.
+func exchangePrefetch(on bool, p *viewPrefetch, sizes []int64) *viewPrefetch {
+	if !on {
+		return nil
+	}
+	if p == nil {
+		p = &viewPrefetch{Whole: true, Used: []int{}}
+	}
+	p.Sizes = append(p.Sizes, sizes...)
+	return p
+}
+
 // stage runs one stage's tasks.
 func (e *execution) stage(ctx context.Context, s *Stage) error {
 	// The tasks, and each one's share of the split input.
@@ -442,8 +460,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		case in.Exchange != nil && !in.Partitioned:
 			x := e.exchanges[in.Exchange.ID]
 			def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: x.rows, Exact: true}
-			for _, fs := range x.files {
+			for p, fs := range x.files {
 				def.Files = append(def.Files, fs...)
+				def.Prefetch = exchangePrefetch(e.co.opts.Prefetch, def.Prefetch, x.sizes[p])
 			}
 			whole[in.View] = def
 			wholeBytes += x.bytes
@@ -475,6 +494,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Exact: true}
 				for _, p := range groups[i] {
 					def.Files = append(def.Files, x.files[p]...)
+					def.Prefetch = exchangePrefetch(e.co.opts.Prefetch, def.Prefetch, x.sizes[p])
 					def.Rows += x.partRows[p]
 					reads += x.partBytes[p]
 				}
@@ -513,6 +533,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			}
 			w, head, err := e.co.dispatch(gctx, task, e.ws, first, out, sp)
 			if err != nil {
+				if OutOfMemory(err) && groups != nil && len(groups[i]) == 1 {
+					return &onePartition{err: err, rows: e.exchangeRows(s)}
+				}
 				return err
 			}
 			e.co.opts.Metrics.scan(bytes)
@@ -533,9 +556,6 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			defer mu.Unlock()
 			res.files[i] = out
 			res.workers[w.addr] = true
-				if OutOfMemory(err) && groups != nil && len(groups[i]) == 1 {
-					return &onePartition{err: err, rows: e.exchangeRows(s)}
-				}
 			if res.columns == nil {
 				res.columns = head.Columns
 			} else if !slices.Equal(res.columns, head.Columns) {
@@ -613,6 +633,7 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *w
 			return fmt.Errorf("a worker wrote an unexpected file %s", f.Path)
 		}
 		x.files[f.Partition] = append(x.files[f.Partition], path)
+		x.sizes[f.Partition] = append(x.sizes[f.Partition], f.Size)
 		x.partRows[f.Partition] += f.Rows
 		x.partBytes[f.Partition] += f.Size
 		x.bytes += f.Size

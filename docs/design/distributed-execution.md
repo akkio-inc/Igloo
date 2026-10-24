@@ -387,9 +387,13 @@ statement runs on the coordinator.
 
 With the prefetcher on, each task's view of a table also carries its
 files' sizes and the field IDs of the columns the fragment may read: those
-it names, or every column through a star whose columns the result needs.
-The worker hands them to the prefetcher as the task starts, so that it
-reads those columns' chunks into the read cache ahead of DuckDB. For a
+it names, or every column through a star whose columns the result needs;
+and its view of an exchange its files' sizes, which it reads whole. The
+worker hands them to the prefetcher as the task starts, so that it reads
+those columns' chunks into the read cache ahead of DuckDB. Stages that
+read exchanges wait on object storage's requests most: at a hundred times
+the data, a report's last stages took twice the slot time they had on 32
+threads a worker, on 12. For a
 statement that runs on one machine, `distributed.Scanner` lists the same
 before it runs: each table's current snapshot, its data files in the order
 DuckDB's Iceberg scan reads them (the manifest list's, then each

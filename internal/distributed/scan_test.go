@@ -15,6 +15,8 @@ import (
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+
+	"github.com/akkio-inc/igloo/internal/config"
 )
 
 // scanTables are the catalog tables of scanEnv, in schema s.
@@ -330,9 +332,9 @@ func TestFilesInManifestOrder(t *testing.T) {
 }
 
 // With prefetching on, every task's view of a catalog table carries its
-// files' sizes and the columns its query reads, and the worker hands them,
-// and nothing of exchanges, to its prefetcher as the task starts. With it
-// off, the prefetcher hears of nothing.
+// files' sizes and the columns its query reads, and of an exchange its
+// files' sizes, read whole, and the worker hands them to its prefetcher as
+// the task starts. With it off, the prefetcher hears of nothing.
 func TestPrefetchTasks(t *testing.T) {
 	h := newHarness(t, 0.01, 4, 2)
 	var mu sync.Mutex
@@ -370,6 +372,9 @@ func TestPrefetchTasks(t *testing.T) {
 	lineitem := h.tables["lineitem"]
 	var files []File
 	for _, sc := range got {
+		if sc.Whole {
+			continue
+		}
 		if !slices.Equal(sc.FieldIDs, ids(lineitem, "l_quantity", "l_returnflag")) ||
 			strings.Join(sc.Columns, ",") != "l_quantity,l_returnflag" {
 			t.Errorf("scan %+v", sc)
@@ -389,14 +394,23 @@ func TestPrefetchTasks(t *testing.T) {
 		}
 	}
 
-	// A partitioned join: its later stages read exchanges, which are not
-	// prefetched.
+	// A partitioned join: its later stages read exchanges, whole.
 	got = nil
 	h.co.maxBroadcast = 1
 	run("SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey WHERE l_shipmode = 'AIR' GROUP BY 1")
 	tables := map[string]bool{}
 	for _, sc := range got {
 		for _, f := range sc.Files {
+			if sc.Whole != strings.Contains(f.Path, "/"+config.ShuffleDir+"/") {
+				t.Errorf("scan of %s whole %v", f.Path, sc.Whole)
+			}
+			if sc.Whole {
+				tables["exchanges"] = true
+				if f.Size <= 0 || len(sc.FieldIDs) > 0 {
+					t.Errorf("exchange scan %+v", sc)
+				}
+				continue
+			}
 			if strings.Contains(f.Path, "/orders/") {
 				tables["orders"] = true
 				if !slices.Equal(sc.FieldIDs, ids(h.tables["orders"], "o_orderkey", "o_orderpriority")) {
@@ -412,7 +426,7 @@ func TestPrefetchTasks(t *testing.T) {
 			}
 		}
 	}
-	if !tables["orders"] || !tables["lineitem"] {
-		t.Errorf("prefetched %v, want orders and lineitem", tables)
+	if !tables["orders"] || !tables["lineitem"] || !tables["exchanges"] {
+		t.Errorf("prefetched %v, want orders, lineitem and exchanges", tables)
 	}
 }

@@ -34,6 +34,10 @@ type Scan struct {
 	// table's columns, so that DuckDB may skip files and row groups of
 	// Files.
 	Filtered bool
+	// Whole says every column of Files is read, whatever FieldIDs say: an
+	// exchange's files, which a worker's task reads whole (see
+	// WorkerOptions.Prefetch).
+	Whole bool
 }
 
 // ScanEnv is the session a statement is scanned in.

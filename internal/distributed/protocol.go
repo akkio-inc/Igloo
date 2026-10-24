@@ -92,9 +92,10 @@ type viewDef struct {
 	// Deletes are the delete files of those of Files that have any, which
 	// the worker applies.
 	Deletes []fileDeletes `json:"deletes,omitempty"`
-	// Prefetch, for a view of a catalog table's files when the coordinator
-	// has prefetching on (Options.Prefetch), is what a worker's prefetcher
-	// needs to read them ahead of DuckDB (WorkerOptions.Prefetch).
+	// Prefetch, for a view of a catalog table's or an exchange's files when
+	// the coordinator has prefetching on (Options.Prefetch), is what a
+	// worker's prefetcher needs to read them ahead of DuckDB
+	// (WorkerOptions.Prefetch).
 	Prefetch *viewPrefetch `json:"prefetch,omitempty"`
 	// lent are files on the worker's own disk that stand for exchange files
 	// of workers' disks (see fetchExchanges), which it may read though they
@@ -108,8 +109,10 @@ type viewPrefetch struct {
 	Sizes []int64 `json:"sizes"`
 	// Used are the field IDs of the table's columns the task's query may
 	// read, with their nested fields' (see Scan.FieldIDs): none when it
-	// reads only row counts.
-	Used []int `json:"used"`
+	// reads only row counts. Whole says the files are read whole, as an
+	// exchange's are.
+	Used  []int `json:"used"`
+	Whole bool  `json:"whole,omitempty"`
 }
 
 // fileDeletes are the delete files of one data file of a view.
