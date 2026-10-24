@@ -28,6 +28,19 @@ were removed; the code is otherwise unchanged except for these patches:
   exclusively (see `Server.catalogRunLock` in `internal/pgwire`); upstream
   has no way to run code between binding a statement and running it.
 
+- `igloo_interrupt.go` (new): `Conn.Interrupt`, `Conn.Progress` and
+  `RegisterScalarUDFOn`. Igloo's memory watch cancels the statement that has
+  run longest when the process runs low on memory; when that statement does
+  not stop, because DuckDB is in a step that does not check for
+  interruptions, the watch interrupts it again and reads how far it got
+  before it gives up on the process (see `Server.ShedMemory` in
+  `internal/pgwire`). Upstream interrupts only through a context and has no
+  way to read a query's progress; `RegisterScalarUDFOn` registers a scalar
+  function on a connection Igloo holds directly, for tests of such
+  statements, through `createScalarFuncIn` (`scalar_udf.go`), which is
+  `createScalarFunc` with the connection's context store passed in rather
+  than taken from a `*sql.Conn`.
+
 Drop this copy and the `replace` directive once a duckdb-go release can
 describe and run a prepared statement as Arrow and DuckDB-Iceberg's set of
 tables is safe to bind against, list and change at once.

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -169,6 +170,14 @@ type Options struct {
 	RewriteMemory int64
 	// idFillRewriteRows, when set, replaces idFillRewriteRows (for tests).
 	idFillRewriteRows int64
+	// MemoryTotal is the memory the process may use (memlimit.Plan.Total),
+	// below a sixty-fourth of which ShedMemory gives up on a statement it
+	// canceled that does not stop, and exits (see exitForMemory); 0 never.
+	MemoryTotal int64
+	// shedStuckAfter and exit, when set, replace shedStuckAfter and
+	// os.Exit (for tests).
+	shedStuckAfter time.Duration
+	exit           func(code int)
 	// ReportRewrite has the statement layer recognize the counting CTEs
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
@@ -333,6 +342,11 @@ type Server struct {
 	indexBuilds     indexBuilds
 	// indexRewrites counts the SELECTs answered from bitmap indexes.
 	indexRewrites atomic.Int64
+	// memoryCritical, shedStuckAfter and exitProcess decide when and how
+	// ShedMemory gives up on a statement that does not stop.
+	memoryCritical int64
+	shedStuckAfter time.Duration
+	exitProcess    func(code int)
 	// reportRewrite is Options.ReportRewrite; reportRecognized counts the
 	// CTEs it answered through the report API, and reportUnrecognized the
 	// statements prepared again as written after a recognized form failed.
@@ -529,6 +543,14 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)
+	if opts.MemoryTotal > 0 {
+		s.memoryCritical = memlimit.Critical(opts.MemoryTotal)
+	}
+	s.shedStuckAfter = cmp.Or(opts.shedStuckAfter, shedStuckAfter)
+	s.exitProcess = opts.exit
+	if s.exitProcess == nil {
+		s.exitProcess = os.Exit
+	}
 	s.rewriteMemory = opts.RewriteMemory
 	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)
 	s.reportOutcomes, s.reportFallback = opts.reportOutcomes, opts.reportFallback
@@ -714,10 +736,13 @@ type session struct {
 	checked time.Time
 	running context.CancelFunc
 	// statement and started describe the running statement; shed says
-	// ShedMemory canceled it.
+	// ShedMemory canceled it, at shedAt, and exiting that it was canceled
+	// because Igloo exits (see exitForMemory).
 	statement string
 	started   time.Time
 	shed      bool
+	shedAt    time.Time
+	exiting   bool
 	// privs are the user's grants, loaded when first needed.
 	privs privilegeSnapshot
 	// fixed, when set, are the session's grants for good, and its user is
@@ -927,6 +952,11 @@ var errStatementTimeout = pgerror.WithCode(errors.New("canceling statement due t
 var errMemoryShed = pgerror.WithCode(errors.New("canceling statement: the server was running out of memory, "+
 	"and this statement had run the longest; run it again, or on less data at a time"), codes.OutOfMemory)
 
+// errServerExiting fails the statements running when Igloo exits because a
+// statement it canceled for memory did not stop (see exitForMemory).
+var errServerExiting = pgerror.WithCode(errors.New("canceling statement: Igloo is restarting, because a statement it "+
+	"canceled for running out of memory did not stop and memory was nearly gone; run this statement again once it is back"), codes.AdminShutdown)
+
 // runLocal runs st on this replica, unless failLocal, a test's, fails it.
 func (s *Server) runLocal(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
 	if s.failLocal != nil {
@@ -1033,6 +1063,12 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		if shed {
 			return errMemoryShed
 		}
+		sess.mu.Lock()
+		exiting := sess.exiting
+		sess.mu.Unlock()
+		if exiting {
+			return errServerExiting
+		}
 	}
 	return err
 }
@@ -1051,25 +1087,45 @@ func (s *Server) ShedMemory(available int64) bool {
 		all = append(all, sess)
 	}
 	r.mu.Unlock()
-	var longest *session
-	var since time.Time
+	var longest, stuck *session
+	var since, stuckSince time.Time
 	for _, sess := range all {
 		sess.mu.Lock()
-		if sess.running != nil && (longest == nil || sess.started.Before(since)) {
+		switch {
+		case sess.running == nil:
+		case sess.shed:
+			// Canceled already, and still running.
+			if stuck == nil || sess.shedAt.Before(stuckSince) {
+				stuck, stuckSince = sess, sess.shedAt
+			}
+		case longest == nil || sess.started.Before(since):
 			longest, since = sess, sess.started
 		}
 		sess.mu.Unlock()
 	}
+	acted := false
+	if stuck != nil && time.Since(stuckSince) >= s.shedStuckAfter {
+		if s.memoryCritical > 0 && available < s.memoryCritical {
+			s.exitForMemory(stuck, available, all)
+			return true
+		}
+		stuck.conn.Interrupt()
+		s.log.Warn("a statement canceled for memory has not stopped; interrupted it again", "available", memlimit.Format(available),
+			"user", stuck.user.Name, "pid", stuck.pid, "canceled_for", time.Since(stuckSince).Round(time.Millisecond))
+		acted = true
+	}
 	if longest == nil {
-		s.log.Warn("memory is running out, and no statement is running to cancel", "available", memlimit.Format(available))
-		return false
+		if stuck == nil {
+			s.log.Warn("memory is running out, and no statement is running to cancel", "available", memlimit.Format(available))
+		}
+		return acted
 	}
 	longest.mu.Lock()
 	defer longest.mu.Unlock()
 	if longest.running == nil {
 		return false
 	}
-	longest.shed = true
+	longest.shed, longest.shedAt = true, time.Now()
 	longest.running()
 	s.log.Warn("memory is running out; canceled the statement that had run longest", "available", memlimit.Format(available),
 		"user", longest.user.Name, "pid", longest.pid, "running_for", time.Since(longest.started).Round(time.Millisecond))

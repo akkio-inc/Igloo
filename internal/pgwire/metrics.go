@@ -25,6 +25,9 @@ type Metrics struct {
 	// reportapi.go, reportrecognize.go).
 	reports               *prometheus.CounterVec
 	recognized, fallbacks prometheus.Counter
+	// memoryExits counts the times Igloo gave up on a statement that did
+	// not stop when canceled for memory (see memexit.go).
+	memoryExits prometheus.Counter
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -75,8 +78,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_report_rewrite_fallbacks_total",
 			Help: "Statements whose recognized reports failed to prepare, which were prepared as written instead.",
 		}),
+		memoryExits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_memory_exits_total",
+			Help: "Times Igloo exited because a statement it canceled for running out of memory did not stop and memory was nearly gone.",
+		}),
 	}
-	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks)
+	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
+		m.memoryExits)
 	return m
 }
 
@@ -89,6 +97,12 @@ func (m *Metrics) reportCall(path string) {
 func (m *Metrics) reportsRecognized(n int) {
 	if m != nil && n > 0 {
 		m.recognized.Add(float64(n))
+	}
+}
+
+func (m *Metrics) memoryExit() {
+	if m != nil {
+		m.memoryExits.Inc()
 	}
 }
 

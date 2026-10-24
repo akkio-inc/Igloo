@@ -28,6 +28,14 @@ func Low(total int64) int64 {
 	return max(total/16, 256<<20)
 }
 
+// Critical is the memory left, of total, below which the watch gives up on a
+// statement it canceled that has not stopped, and the process exits rather
+// than page until the machine stops answering: a sixty-fourth of total, a
+// quarter of Low, at least 64 MiB.
+func Critical(total int64) int64 {
+	return max(total/64, 64<<20)
+}
+
 // settle is how long Watch gives a canceled statement to let go of its
 // memory before it sheds again, unless memory keeps running out faster.
 const settle = 15 * time.Second

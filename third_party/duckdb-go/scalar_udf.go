@@ -504,6 +504,17 @@ func registerResultParams(config ScalarFuncConfig, f mapping.ScalarFunction) err
 }
 
 func createScalarFunc(c *sql.Conn, name string, f ScalarFunc) (mapping.ScalarFunction, error) {
+	// Get the context store of the connection.
+	ctxStore, err := contextStoreFromConn(c)
+	if err != nil {
+		return mapping.ScalarFunction{}, err
+	}
+	return createScalarFuncIn(ctxStore, name, f)
+}
+
+// createScalarFuncIn is createScalarFunc with the connection's context store
+// (Igloo patch, for RegisterScalarUDFOn).
+func createScalarFuncIn(ctxStore *contextStore, name string, f ScalarFunc) (mapping.ScalarFunction, error) {
 	if name == "" {
 		return mapping.ScalarFunction{}, errScalarUDFNoName
 	}
@@ -542,13 +553,6 @@ func createScalarFunc(c *sql.Conn, name string, f ScalarFunc) (mapping.ScalarFun
 	// Set the function callback.
 	functionPtr := unsafe.Pointer(C.scalar_udf_callback_t(C.scalar_udf_callback))
 	mapping.ScalarFunctionSetFunction(function, functionPtr)
-
-	// Get the context store of the connection.
-	ctxStore, err := contextStoreFromConn(c)
-	if err != nil {
-		mapping.DestroyScalarFunction(&function)
-		return function, err
-	}
 
 	// Pin the ScalarFunc f.
 	value := pinnedValue[*scalarFuncContext]{

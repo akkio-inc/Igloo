@@ -265,6 +265,22 @@ using all of its cores.
   `memory is running out; canceled the statement that had run longest`
   with the user and session, and cancels another only if memory has not
   come back within 15 seconds, or keeps running out meanwhile.
+  A statement in a step of DuckDB that does not check for interruptions
+  goes on after it is canceled, holding and taking memory, and the machine
+  can run out of memory so slowly, paging, that the kernel never kills
+  anything and the machine stops answering. So a canceled statement still
+  running 10 seconds later, with memory still low, is interrupted again
+  (`a statement canceled for memory has not stopped; interrupted it
+  again`), and if memory then falls below a sixty-fourth of Igloo's
+  memory (at least 64 MiB), Igloo gives up on it: it fails every other
+  statement in flight with SQLSTATE `57P01` (`admin_shutdown`), saying
+  Igloo is restarting and to run the statement again, logs `a statement
+  canceled for running out of memory did not stop, and memory is nearly
+  gone` with the session, the user, a hash of the statement's text, how
+  long it ran and was canceled for and how far DuckDB says it got, counts
+  it in `igloo_memory_exits_total`, and exits with status 75, for its
+  orchestration (Docker's restart policy, Kubernetes) to start it again.
+  A statement that stops when canceled never leads to this.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk, local
   NVMe where the machine has it ([spill on local NVMe](#spill-on-local-nvme)),
@@ -705,6 +721,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_report_calls_total` | `path` = `index`, `index+scan`, `ids`, `scan` | [Report API](media-analytics.md#report-api) calls prepared, by how they count: from bitmap indexes, people from them and the rest from a scan, through ID domains' ids, or from the tables' values |
 | `igloo_report_ctes_recognized_total` | | Common table expressions of reports that `IGLOO_REPORT_REWRITE` answered through the report API ([reports as written](media-analytics.md#reports-as-written)) |
 | `igloo_report_rewrite_fallbacks_total` | | Statements whose recognized reports failed to prepare and were prepared as written instead |
+| `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

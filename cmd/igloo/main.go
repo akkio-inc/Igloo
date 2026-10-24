@@ -445,6 +445,7 @@ func serve() error {
 		BitmapIndexes:       cfg.BitmapIndexes && cfg.IDDomains && eng.BitmapsLoaded(),
 		ReportRewrite:       cfg.ReportRewrite,
 		RewriteMemory:       rewriteMemory(cfg, memory),
+		MemoryTotal:         memory.Total,
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,

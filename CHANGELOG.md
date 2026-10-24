@@ -1458,6 +1458,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A statement that does not stop when the memory watch cancels it can no
+  longer take the machine down. One in a step of DuckDB that does not check
+  for interruptions ran 19 minutes past its cancellation, until the machine
+  had 25 MiB left and paged so hard that it stopped answering, without the
+  kernel ever killing anything. The watch now interrupts such a statement
+  again after 10 seconds, and if memory falls below a sixty-fourth of
+  Igloo's, fails the other statements in flight with SQLSTATE 57P01, logs
+  the culprit, counts it in `igloo_memory_exits_total` and exits with
+  status 75 to be started again.
 - Compaction no longer refuses a table whose position deletes alone exceed
   `IGLOO_MAINTENANCE_MEMORY`, as after an `UPDATE` of every row of a large
   table: iceberg-go loads every delete file of the files it reads, whole,
