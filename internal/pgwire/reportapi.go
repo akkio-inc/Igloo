@@ -177,14 +177,24 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 		}
 		if !probe {
 			s.reportFromIndexes.Add(1)
+			if plan.hybrid {
+				s.metrics.reportCall("index+scan")
+			} else {
+				s.metrics.reportCall("index")
+			}
 		}
 		return s.reportIndexSQL(spec, plan), plan.pins, nil
 	}
 	ids, read := s.reportIDs(ctx, sess, spec)
 	if ids != nil {
 		ids.pairs = s.pairBitmaps(ctx, sess, spec, ids.source)
-		if !probe {
+	}
+	if !probe {
+		if ids != nil {
 			s.reportThroughIDs.Add(1)
+			s.metrics.reportCall("ids")
+		} else {
+			s.metrics.reportCall("scan")
 		}
 	}
 	return spec.sqlWith(ids), nil, read

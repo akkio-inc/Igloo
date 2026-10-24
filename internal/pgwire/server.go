@@ -1796,6 +1796,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 		// not in binding one, which is how a recognized form fails.)
 		sess.txFailed = txFailed
 		s.reportUnrecognized.Add(1)
+		s.metrics.reportFallback()
 		s.log.Debug("a statement whose reports were recognized runs as written", "err", err)
 		if s.reportFallback != nil {
 			s.reportFallback(recognized, err)

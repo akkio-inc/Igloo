@@ -700,6 +700,9 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_id_domain_ids_assigned_total` | `domain` | Ids [ID domains](sql.md#id-domains) gave new values |
 | `igloo_id_domain_rows_filled_total` | `domain` | Rows of member tables whose ids were filled in after they were written |
 | `igloo_id_domain_assignments_skipped_total` | `reason` | Assignments left to maintenance: `busy` (another writer held the domain's lease) or `exhausted` (every id below 2^32 handed out) |
+| `igloo_report_calls_total` | `path` = `index`, `index+scan`, `ids`, `scan` | [Report API](media-analytics.md#report-api) calls prepared, by how they count: from bitmap indexes, people from them and the rest from a scan, through ID domains' ids, or from the tables' values |
+| `igloo_report_ctes_recognized_total` | | Common table expressions of reports that `IGLOO_REPORT_REWRITE` answered through the report API ([reports as written](media-analytics.md#reports-as-written)) |
+| `igloo_report_rewrite_fallbacks_total` | | Statements whose recognized reports failed to prepare and were prepared as written instead |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

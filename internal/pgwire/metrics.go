@@ -20,6 +20,11 @@ type Metrics struct {
 	// ids, filled and skipped count ID domains' assignments (see
 	// idassign.go).
 	ids, filled, skipped *prometheus.CounterVec
+	// reports counts the report API's calls by how they were answered, and
+	// recognized and fallbacks what recognizing reports did (see
+	// reportapi.go, reportrecognize.go).
+	reports               *prometheus.CounterVec
+	recognized, fallbacks prometheus.Counter
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -58,9 +63,39 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_id_domain_assignments_skipped_total",
 			Help: "Assignments of ids left to maintenance, by reason: busy (another held the domain's lease), exhausted (every id below 2^32 handed out) or erased (an erasure deleted from the dictionary meanwhile).",
 		}, []string{"reason"}),
+		reports: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_report_calls_total",
+			Help: "Report API calls prepared, by how they count: index (bitmap indexes), index+scan (people from bitmap indexes, the rest from a scan), ids (ID domains' ids) or scan (the tables' values).",
+		}, []string{"path"}),
+		recognized: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_report_ctes_recognized_total",
+			Help: "Common table expressions of reports that IGLOO_REPORT_REWRITE answered through the report API.",
+		}),
+		fallbacks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_report_rewrite_fallbacks_total",
+			Help: "Statements whose recognized reports failed to prepare, which were prepared as written instead.",
+		}),
 	}
-	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped)
+	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks)
 	return m
+}
+
+func (m *Metrics) reportCall(path string) {
+	if m != nil {
+		m.reports.WithLabelValues(path).Inc()
+	}
+}
+
+func (m *Metrics) reportsRecognized(n int) {
+	if m != nil && n > 0 {
+		m.recognized.Add(float64(n))
+	}
+}
+
+func (m *Metrics) reportFallback() {
+	if m != nil {
+		m.fallbacks.Inc()
+	}
 }
 
 func (m *Metrics) idsAssigned(domain string, n int64) {

@@ -102,6 +102,7 @@ func (s *Server) recognizeReports(ctx context.Context, sess *session, text strin
 		}
 	}
 	s.reportRecognized.Add(int64(n))
+	s.metrics.reportsRecognized(n)
 	return out
 }
 
