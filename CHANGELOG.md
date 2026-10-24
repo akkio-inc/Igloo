@@ -158,6 +158,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   where bitmap indexes hold all a call counts, it reads their bitmaps, and
   where they hold its people, it reads those and scans the source for the
   rest (see [Report API](docs/media-analytics.md#report-api)).
+  With `IGLOO_REPORT_REWRITE=true`, reports that count as the API does
+  without calling it get its answers too: each common table expression that
+  counts cohorts' people by the values of a table's dimensions, in DuckDB's
+  dialect or Snowflake's translated, becomes a call with the same columns
+  and rows before the statement is checked, and anything Igloo cannot map
+  with certainty, or a statement that then fails, runs as written (see
+  [Reports as written](docs/media-analytics.md#reports-as-written)).
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option
   `-c sql_dialect=snowflake`) or per user and role (`ALTER USER | ROLE ...

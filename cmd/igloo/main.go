@@ -443,6 +443,7 @@ func serve() error {
 		Bitmaps:             cfg.IDDomains && cfg.BitmapMinRows >= 0 && eng.BitmapsLoaded(),
 		BitmapMinRows:       cfg.BitmapMinRows,
 		BitmapIndexes:       cfg.BitmapIndexes && cfg.IDDomains && eng.BitmapsLoaded(),
+		ReportRewrite:       cfg.ReportRewrite,
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,

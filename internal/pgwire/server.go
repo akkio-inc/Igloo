@@ -163,6 +163,16 @@ type Options struct {
 	// and answers counts of distinct ids from (IGLOO_BITMAP_INDEXES, with
 	// IDDomainsOn and the rb extension; see bitmapindex.go).
 	BitmapIndexes bool
+	// ReportRewrite has the statement layer recognize the counting CTEs
+	// of audience reports and answer them through the report API
+	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
+	ReportRewrite bool
+	// reportOutcomes, when set, hears what recognition did with each
+	// statement's CTEs (for tests).
+	reportOutcomes func([]reportOutcome)
+	// reportFallback, when set, hears of each recognized statement that
+	// failed, which then ran as written (for tests).
+	reportFallback func(recognized string, err error)
 	// AllowedLocations are where users other than admins may read files
 	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
 	// Warehouse is the warehouse's location, whose files they may not.
@@ -317,6 +327,14 @@ type Server struct {
 	indexBuilds     indexBuilds
 	// indexRewrites counts the SELECTs answered from bitmap indexes.
 	indexRewrites atomic.Int64
+	// reportRewrite is Options.ReportRewrite; reportRecognized counts the
+	// CTEs it answered through the report API, and reportUnrecognized the
+	// statements prepared again as written after a recognized form failed.
+	reportRewrite      atomic.Bool
+	reportRecognized   atomic.Int64
+	reportUnrecognized atomic.Int64
+	reportOutcomes     func([]reportOutcome)
+	reportFallback     func(recognized string, err error)
 	// reportThroughIDs counts the report API's calls that read their tables
 	// through ids (see reportids.go).
 	reportThroughIDs atomic.Int64
@@ -495,6 +513,8 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.idSyncMinRows = opts.IDSyncMinRows
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
+	s.reportRewrite.Store(opts.ReportRewrite)
+	s.reportOutcomes, s.reportFallback = opts.reportOutcomes, opts.reportFallback
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}
@@ -1744,12 +1764,37 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if !sess.temps && mayCreateTemporary(text) {
 		sess.temps = true
 	}
+	// The counting CTEs of audience reports become calls of the report API
+	// (see reportrecognize.go), which the statement then goes through as
+	// one its user wrote. If it fails that way, for whatever reason, it is
+	// prepared as written, and fails or not as written.
+	if recognized := s.recognizeReports(ctx, sess, text); recognized != text {
+		txFailed := sess.txFailed
+		st, err := s.prepareCheckedText(ctx, sess, user, text, recognized, oids)
+		if err == nil {
+			return st, nil
+		}
+		// The statement as written decides whether a transaction fails.
+		// (DuckDB's own fails only with errors in running a statement,
+		// not in binding one, which is how a recognized form fails.)
+		sess.txFailed = txFailed
+		s.reportUnrecognized.Add(1)
+		s.log.Debug("a statement whose reports were recognized runs as written", "err", err)
+		if s.reportFallback != nil {
+			s.reportFallback(recognized, err)
+		}
+	}
+	return s.prepareCheckedText(ctx, sess, user, text, text, oids)
+}
+
+// prepareCheckedText is prepareChecked of text, which is source, the
+// statement as written, or what recognizing its reports made of it.
+func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user auth.User, source, text string, oids []uint32) (*statement, error) {
 	fail := func(err error) (*statement, error) { return nil, err }
 	// Calls of the report API become the SQL they stand for before
 	// anything else looks at the statement (see reportapi.go). The
 	// statement keeps its text as written, which preparing again writes
 	// again, as the tables read through ids change.
-	source := text
 	text, reportPins, reportIndexPins, err := s.reportCalls(ctx, sess, text)
 	if err != nil {
 		return fail(err)

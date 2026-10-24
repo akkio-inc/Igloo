@@ -69,6 +69,10 @@ type Config struct {
 	// BitmapIndexes lets tables have bitmap indexes of member columns
 	// (IGLOO_BITMAP_INDEXES, off by default; it needs IGLOO_ID_DOMAINS).
 	BitmapIndexes bool
+	// ReportRewrite has Igloo recognize the counting CTEs of audience
+	// reports and answer them through the report API (IGLOO_REPORT_REWRITE,
+	// off by default).
+	ReportRewrite bool
 	// ConnectionSecretsDir holds files with the passwords of connections to
 	// other databases, which a connection names with password_secret.
 	// Empty means connections store their passwords.
@@ -543,6 +547,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		addErr("IGLOO_BITMAP_INDEXES needs IGLOO_ID_DOMAINS=true: bitmap indexes hold ID domains' ids")
 	}
 	cfg.BitmapIndexes = bitmapIndexes
+	if cfg.ReportRewrite, err = strconv.ParseBool(get("IGLOO_REPORT_REWRITE", "false")); err != nil {
+		addErr("IGLOO_REPORT_REWRITE must be true or false: %w", err)
+	}
 
 	if v := get("IGLOO_BITMAP_MIN_ROWS", "10000000"); strings.EqualFold(v, "off") {
 		cfg.BitmapMinRows = -1

@@ -507,6 +507,22 @@ func TestIDSyncMinRows(t *testing.T) {
 	}
 }
 
+func TestReportRewrite(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "false": false, "true": true} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_REPORT_REWRITE"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.ReportRewrite != want {
+			t.Errorf("IGLOO_REPORT_REWRITE=%q: %v %v, want %v", v, cfg.ReportRewrite, err, want)
+		}
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_REPORT_REWRITE": "sometimes"})); err == nil {
+		t.Error("IGLOO_REPORT_REWRITE=sometimes should be refused")
+	}
+}
+
 func TestBitmapMinRows(t *testing.T) {
 	for v, want := range map[string]int64{"": 10_000_000, "0": 0, "250000000": 250_000_000, "off": -1, "OFF": -1} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

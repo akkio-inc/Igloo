@@ -479,6 +479,54 @@ others. The check returns each row that differs, with `side` (`api_only` or
 `sql_only`) and the columns compared: none means the two agree. Sums and
 averages compare to 9 significant digits, everything else exactly.
 
+### Reports as written
+
+With `IGLOO_REPORT_REWRITE=true` (off by default), Igloo finds the counting
+in reports that do not call the API and answers it through the API, so
+that reports written as SQL get the API's ids, bitmap indexes and plans.
+Before anything else looks at a `SELECT`, each common table expression that
+counts as the API counts becomes `SELECT ... FROM igloo.audience_profile(...)`
+with the same columns, of the same types, and the same rows; the statement
+then goes on as one that calls the API, through the same checks of grants
+and policies against the tables the expression read. Igloo reads DuckDB's
+parse of the statement, in DuckDB's dialect and in the translation of
+Snowflake's, and maps an expression only when it is certain of the result:
+anything else, and the rest of the statement, runs as written. If the
+statement fails with the API in it, at any step, it runs as written, and
+fails or not as it would have.
+
+The expressions it maps join a table, or a common table expression that
+selects its columns, to a cohort on its member column, or keep its rows
+whose member is `IN (SELECT ...)` one, and count:
+
+- cohorts: an expression that selects a table's member column under
+  conditions of columns and literals, optionally its latest version
+  (`ver = (SELECT max(ver) FROM t WHERE ...)`), and `DISTINCT` and
+  `WHERE member IS NOT NULL` of one; any other `SELECT`, as a cohort's
+  `sql`; a `UNION ALL` of such, each with its label as a string;
+- dimensions: a column grouped by, or each entry of `UNNEST` (or `FLATTEN`)
+  of a list of struct literals (objects) whose fields name the dimension
+  with literals and give its value (a column, a boolean mapped to two
+  strings with NULL kept NULL, a literal, a list's elements) and its
+  metric;
+- filters: conditions of the table's columns and literals, `trim(value) <>
+  ''` (with or without `value IS NOT NULL`), and comparisons of the metric
+  with literals;
+- measures: `count(DISTINCT member)`, `count(*)`, `sum` and `avg` of a
+  column (or of its `COALESCE` with a literal), `count(DISTINCT member,
+  column)` and its `CASE` forms, `sum`, `avg` and `count` of the metric as
+  a `DOUBLE`, and expressions of them; the cohorts' sizes, `count(DISTINCT
+  member)` of the cohorts alone.
+
+Measures that count rows (`count(*)`, sums, averages, the metric) are
+mapped only where a member is once in each cohort, as the API's cohorts
+are. Windows, joins other than to the cohort, `HAVING`, `GROUPING SETS`,
+filters on the cohort's label and values grouped by as a type whose text is
+not one per value are left as written; so, until the API reads them as the
+translation does, are the elements of lists that the translation of
+Snowflake's `FLATTEN` reads, which reads elements that look like JSON as
+JSON.
+
 ## Security
 
 The extensions keep the [query sandbox](../SECURITY.md#security-model):
