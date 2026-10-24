@@ -311,8 +311,8 @@ explicit transactions, the coordinator plans it:
    group the workers' rows by all of their columns and are applied by the
    coordinator. An aggregate over `DISTINCT` values with a `FILTER`, of
    one that leaves NULLs out, is written as one over `CASE WHEN filter
-   THEN x END` first. `now()` and `current_date` become the statement's planning
-   time everywhere. Statements translated from Snowflake's dialect call
+   THEN x END` first. `now()` and `current_date` become the statement's
+   planning time everywhere. Statements translated from Snowflake's dialect call
    Igloo's own macros (`sf_flatten_values` and the like, plain expressions
    that every session defines); workers define the same macros for a
    fragment that calls them, and the planner counts them as built in only

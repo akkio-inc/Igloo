@@ -612,7 +612,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   planner writes them as `count(DISTINCT CASE WHEN ... THEN x END)`, which
   is the same since they leave NULLs out. A report that counts each
   group's people among the rows it keeps so read its whole fact table on
-  one machine.
+  one machine. Such a count of 32-bit IDs sends bitmaps, as does one of a
+  column that the common table expressions and subqueries it reads
+  compute as an ID, as the report API's member is.
 - A subquery that workers compute as a relation, as when a report joins a
   view of a wide table to itself, writes only the columns its reader
   reads to the exchange. A report whose 16 branches each read three

@@ -705,22 +705,91 @@ func (a *aggregation) partial(ac *aggCall, function string) int {
 // unsigned integer, as roaring bitmaps hold: a cast to UINTEGER, as the
 // integer IDs of people are counted, or a column of an unsigned type that
 // widens to it.
-func (a *aggregation) bitmapArg(arg node) bool {
-	switch str(arg["class"]) {
+func (a *aggregation) bitmapArg(arg node) bool { return a.idValue(arg, a.c.scope, 0) }
+
+// idValue is bitmapArg for an expression e of FROM clause sc: a cast to
+// UINTEGER; a column of a table or relation of an unsigned type that
+// widens to it, or one of a subquery that passes rows through whose
+// expression there is such a value, as a report's member is through the
+// common table expressions it reads; or a CASE whose values are such or
+// NULL, as distinctFilter writes a FILTER.
+func (a *aggregation) idValue(e node, sc *scope, depth int) bool {
+	if depth > 4*maxViewDepth {
+		return false
+	}
+	switch str(e["class"]) {
 	case "CAST":
-		return strings.EqualFold(str(child(arg, "cast_type")["id"]), "UINTEGER")
-	case "COLUMN_REF":
-		it := resolveColumn(arg, a.c.scope)
-		for _, u := range a.c.uses {
-			if it != nil && u.item == it {
-				switch strings.ToUpper(columnType(u.table, lastName(arg))) {
-				case "UINTEGER", "USMALLINT", "UTINYINT":
-					return true
-				}
+		return strings.EqualFold(str(child(e, "cast_type")["id"]), "UINTEGER")
+	case "CASE":
+		for _, c := range list(e, "case_checks") {
+			if !a.idValue(child(c.(node), "then_expr"), sc, depth+1) {
+				return false
 			}
+		}
+		el := child(e, "else_expr")
+		return el == nil || str(el["class"]) == "CONSTANT" && child(el, "value")["is_null"] == true || a.idValue(el, sc, depth+1)
+	case "COLUMN_REF":
+		it := resolveColumn(e, sc)
+		if it == nil {
+			return false
+		}
+		name := strings.ToLower(lastName(e))
+		for _, u := range a.c.uses {
+			if u.item == it {
+				return idType(columnType(u.table, name))
+			}
+		}
+		i := slices.Index(it.columns, name)
+		for _, r := range a.c.rels {
+			if r.item == it {
+				return i >= 0 && i < len(r.columns) && idType(r.columns[i].Type)
+			}
+		}
+		if inner := a.innerScope(it); inner != nil && i >= 0 {
+			sub := subqueryNode(inner.ref)
+			items := list(sub, "select_list")
+			if hasClass(sub["select_list"], "STAR") || i >= len(items) {
+				return false
+			}
+			// Columns are named after the subquery's items, by position.
+			return a.idValue(items[i].(node), inner, depth+1)
 		}
 	}
 	return false
+}
+
+// idType reports whether a column type widens to UINTEGER.
+func idType(t string) bool {
+	switch strings.ToUpper(t) {
+	case "UINTEGER", "USMALLINT", "UTINYINT":
+		return true
+	}
+	return false
+}
+
+// innerScope returns the FROM clause of the subquery that passes rows
+// through whose item is it, among those around the candidate's tables and
+// relations.
+func (a *aggregation) innerScope(it *fromItem) *scope {
+	find := func(sc *scope) *scope {
+		for ; sc != nil; sc = sc.outer {
+			if sc.item == it && sc.ref != nil {
+				return sc
+			}
+		}
+		return nil
+	}
+	for _, u := range a.c.uses {
+		if sc := find(u.scope); sc != nil {
+			return sc
+		}
+	}
+	for _, r := range a.c.rels {
+		if sc := find(r.sc); sc != nil {
+			return sc
+		}
+	}
+	return nil
 }
 
 // anchor returns the index of a DISTINCT argument whose value every

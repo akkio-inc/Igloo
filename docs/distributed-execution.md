@@ -91,7 +91,8 @@ bitmaps (the `rb_count_distinct` setting, `always`, which Igloo sets for
 the large statements that count [ID domains](sql.md#id-domains)' IDs), a
 `count(DISTINCT)` of such values (a `CAST(... AS UINTEGER)`, as Igloo
 writes counts of people by their integer IDs, or a column of an unsigned
-type) crosses no values at all:
+type, also through the common table expressions and subqueries that
+compute it, and with a `FILTER`) crosses no values at all:
 each worker sends a bitmap of its share's values a group, a few bytes a
 value at most, and the coordinator, or a worker completing a partition of
 the groups, counts their union. Aggregates over other `DISTINCT` values in

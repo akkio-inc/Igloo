@@ -281,6 +281,13 @@ func TestBitmapDistinctResults(t *testing.T) {
 			count(DISTINCT l_suppkey) AS s FROM lineitem GROUP BY 1 ORDER BY 1`,
 		`SELECT o.o_orderpriority, count(DISTINCT CAST(l.l_partkey AS UINTEGER)) AS parts FROM lineitem AS l
 			JOIN orders AS o ON o.o_orderkey = l.l_orderkey GROUP BY 1 ORDER BY 1`,
+		// A FILTER, written as a CASE, and an ID through the common table
+		// expressions that compute it, as a report counts its members.
+		`SELECT l_shipmode, count(DISTINCT CAST(l_orderkey AS UINTEGER)) FILTER (WHERE l_quantity > 25) AS big, count(*) AS n
+			FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`WITH r AS (SELECT l_shipmode AS mode, CAST(l_orderkey AS UINTEGER) AS member, l_quantity > 25 AS keep FROM lineitem),
+			v AS (SELECT mode, member, keep FROM r)
+			SELECT mode, count(DISTINCT member) FILTER (WHERE keep) AS people, count(DISTINCT member) AS everyone FROM v GROUP BY 1 ORDER BY 1`,
 	}
 	h.co.maxBroadcast = 1
 	for _, mode := range []string{aggGather, aggByGroup, ""} {
