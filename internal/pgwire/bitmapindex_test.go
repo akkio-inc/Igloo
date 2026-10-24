@@ -27,6 +27,9 @@ func TestParseIndexCommand(t *testing.T) {
 		{query: "ALTER TABLE lake.public.seg ADD BITMAP INDEX seg_by_name ON (segment_name) FOR person_id", ok: true, kind: icAdd, name: "seg_by_name", groups: "segment_name", column: "person_id"},
 		{query: "alter table seg add bitmap index if not exists S2 on (a, \"B c\") for person_id;", ok: true, kind: icAdd, name: "s2", groups: "a,B c", column: "person_id"},
 		{query: "ALTER TABLE people ADD BITMAP INDEX everyone ON () FOR person_id", ok: true, kind: icAdd, name: "everyone", column: "person_id"},
+		{query: "ALTER TABLE b ADD BITMAP INDEX k ON (ELEMENTS(keywords)) FOR person_id", ok: true, kind: icAdd, name: "k", groups: "keywords", column: "person_id"},
+		{query: "ALTER TABLE b ADD BITMAP INDEX k ON (elements) FOR person_id", ok: true, kind: icAdd, name: "k", groups: "elements", column: "person_id"},
+		{query: "ALTER TABLE b ADD BITMAP INDEX k ON (ELEMENTS(a), b) FOR person_id", ok: true, bad: true},
 		{query: "ALTER TABLE seg DROP BITMAP INDEX IF EXISTS seg_by_name", ok: true, kind: icDrop, name: "seg_by_name"},
 		{query: "SHOW BITMAP INDEXES", ok: true, kind: icShow},
 		{query: "ALTER TABLE seg ADD BITMAP INDEX x ON (a) FOR", ok: true, bad: true},
@@ -43,7 +46,8 @@ func TestParseIndexCommand(t *testing.T) {
 		if !ok || c.bad {
 			continue
 		}
-		if got.kind != c.kind || got.name != c.name || strings.Join(got.groups, ",") != c.groups || got.column != c.column {
+		if got.kind != c.kind || got.name != c.name || strings.Join(got.groups, ",") != c.groups || got.column != c.column ||
+			got.elements != strings.Contains(c.query, "ELEMENTS(") {
 			t.Errorf("%s: %+v", c.query, got)
 		}
 	}
@@ -98,6 +102,47 @@ func (it *idTest) sameCounts(index, groups string) {
 	if got := it.one("SELECT CAST(min(source_snapshot_id) AS VARCHAR) || ',' || CAST(max(source_snapshot_id) AS VARCHAR) FROM lake.igloo_bitmaps." + index); got != cur+","+cur {
 		it.t.Errorf("bitmaps of %s are of snapshots %s, want the current %s", index, got, cur)
 	}
+}
+
+// TestBitmapIndexElements keeps a bitmap of each element of a list
+// column's lists, with each one's rows (as often as lists hold it) and
+// members.
+func TestBitmapIndexElements(t *testing.T) {
+	it := newIndexTest(t)
+	ctx := context.Background()
+	srv := it.r.srv
+	it.exec(
+		"CREATE TABLE lake.public.browsing AS SELECT 'p' || (i % 90) AS person_id, CASE i % 4 WHEN 0 THEN ['cars', 'news'] WHEN 1 THEN ['', 'cars', 'cars'] WHEN 2 THEN NULL ELSE [] END AS keywords FROM range(600) r(i)",
+		"ALTER TABLE lake.public.browsing ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.browsing ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	srv.MapIDDomains(ctx)
+	if _, err := it.admin.Exec(ctx, "ALTER TABLE lake.public.browsing ADD BITMAP INDEX not_a_list ON (ELEMENTS(person_id)) FOR person_id"); pgCode(err) == "" {
+		t.Error("an index of the elements of a column that is no list")
+	}
+	it.exec("ALTER TABLE lake.public.browsing ADD BITMAP INDEX keywords ON (ELEMENTS(keywords)) FOR person_id")
+	srv.waitIndexBuilds(t)
+	same := func(what string) {
+		t.Helper()
+		want := it.internal("SELECT k, count(DISTINCT person_id), count(*) FROM (SELECT unnest(keywords) AS k, person_id FROM lake.public.browsing) GROUP BY ALL ORDER BY ALL")
+		got := it.internal("SELECT keywords, rb_cardinality(bm), row_count FROM lake.igloo_bitmaps.keywords ORDER BY ALL")
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s: bitmaps\n%q\nwant\n%q", what, got, want)
+		}
+	}
+	same("built")
+	if got := texts(t, it.admin, "SHOW BITMAP INDEXES"); len(got) != 1 || !strings.HasPrefix(got[0], "keywords|public.browsing|person_id|ELEMENTS(keywords)|") {
+		t.Errorf("SHOW BITMAP INDEXES: %q", got)
+	}
+	// Appended with their ids, as a write of known values writes them.
+	it.internal("INSERT INTO lake.public.browsing (person_id, keywords, _igloo_id_person_id) " +
+		"SELECT value, ['news', 'sport'], id FROM lake.igloo_domains.people WHERE value IN ('p1', 'p2', 'p3', 'p95')")
+	srv.indexesChanged("public", "browsing")
+	srv.waitIndexBuilds(t)
+	if how := srv.lastBuild("keywords"); how != "append" {
+		t.Errorf("after an append: %q", how)
+	}
+	same("after an append")
 }
 
 // TestBitmapIndexes adds, builds, keeps up to date, lists and drops bitmap

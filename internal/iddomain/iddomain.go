@@ -148,13 +148,16 @@ const MaxIndexGroups = 4
 // than the table. Names are as the catalog has them.
 type BitmapIndex struct {
 	// Name is lower case, and names the index's table.
-	Name    string    `json:"name"`
-	Schema  string    `json:"schema"`
-	Table   string    `json:"table"`
-	Column  string    `json:"column"`
-	Groups  []string  `json:"groups,omitempty"`
-	Added   time.Time `json:"added"`
-	AddedBy string    `json:"added_by,omitempty"`
+	Name   string   `json:"name"`
+	Schema string   `json:"schema"`
+	Table  string   `json:"table"`
+	Column string   `json:"column"`
+	Groups []string `json:"groups,omitempty"`
+	// Elements says the one group is a list column, with a bitmap for
+	// each element its lists hold: ON (ELEMENTS(column)).
+	Elements bool      `json:"elements,omitempty"`
+	Added    time.Time `json:"added"`
+	AddedBy  string    `json:"added_by,omitempty"`
 }
 
 // OfTable reports whether x is an index of schema.table.
@@ -341,6 +344,9 @@ func (c *Catalog) AddIndex(x BitmapIndex) error {
 	}
 	if c.MemberOf(x.Schema, x.Table, x.Column) == nil {
 		return fmt.Errorf("%w: %s.%s.%s is not a member of an ID domain (SET ID DOMAIN first)", ErrInvalid, x.Schema, x.Table, x.Column)
+	}
+	if x.Elements && len(x.Groups) != 1 {
+		return fmt.Errorf("%w: a bitmap index of a list's elements groups by that list alone", ErrInvalid)
 	}
 	if len(x.Groups) > MaxIndexGroups {
 		return fmt.Errorf("%w: a bitmap index groups by at most %d columns", ErrInvalid, MaxIndexGroups)

@@ -53,6 +53,7 @@ type indexCmd struct {
 	table                 []string
 	name                  string
 	groups                []string
+	elements              bool
 	column                string
 	ifExists, ifNotExists bool
 }
@@ -98,7 +99,15 @@ func parseIndexCommand(query string) (c *indexCmd, ok bool, err error) {
 			if !sc.keywords("ON") || !sc.punct('(') {
 				return nil, true, domainSyntax("expected ADD BITMAP INDEX name ON (columns) FOR column")
 			}
-			if !sc.punct(')') {
+			at := sc.i
+			if sc.keywords("ELEMENTS") && sc.punct('(') {
+				// ON (ELEMENTS(column)): a bitmap for each element of a list.
+				g, ok := sc.name()
+				if !ok || len(g) != 1 || !sc.punct(')') || !sc.punct(')') {
+					return nil, true, domainSyntax("expected ON (ELEMENTS(column)), a list column alone")
+				}
+				c.groups, c.elements = g, true
+			} else if sc.i = at; !sc.punct(')') {
 				for {
 					g, ok := sc.name()
 					if !ok || len(g) != 1 {
@@ -257,11 +266,20 @@ func (s *Server) addIndex(ctx context.Context, sess *session, user auth.User, c 
 		if slices.ContainsFunc(indexReserved, func(r string) bool { return strings.EqualFold(r, col.name) }) {
 			return pgerror.WithCode(fmt.Errorf("a bitmap index cannot group by a column called %s, a name of its own table's", col.name), codes.InvalidColumnReference)
 		}
-		if t := strings.ToUpper(col.typ); strings.Contains(t, "[") || strings.HasPrefix(t, "STRUCT") || strings.HasPrefix(t, "MAP") || strings.HasPrefix(t, "UNION") {
-			return pgerror.WithCode(fmt.Errorf("a bitmap index groups by columns of plain types, not %s %s", col.name, col.typ), codes.DatatypeMismatch)
+		typ := col.typ
+		if c.elements {
+			// The index's column holds the list's elements.
+			if !strings.HasSuffix(typ, "[]") {
+				return pgerror.WithCode(fmt.Errorf("ELEMENTS takes a list column, not %s %s", col.name, col.typ), codes.DatatypeMismatch)
+			}
+			typ = strings.TrimSuffix(typ, "[]")
+			x.Elements = true
+		}
+		if t := strings.ToUpper(typ); strings.Contains(t, "[") || strings.HasPrefix(t, "STRUCT") || strings.HasPrefix(t, "MAP") || strings.HasPrefix(t, "UNION") {
+			return pgerror.WithCode(fmt.Errorf("a bitmap index groups by columns of plain types, not %s %s", col.name, typ), codes.DatatypeMismatch)
 		}
 		x.Groups = append(x.Groups, col.name)
-		defs = append(defs, quoteIdent(col.name)+" "+col.typ)
+		defs = append(defs, quoteIdent(col.name)+" "+typ)
 	}
 	// Checked again in the store's update; checked here first so that no
 	// table is made for an index that cannot be.
@@ -392,7 +410,11 @@ func (s *Server) showIndexes(ctx context.Context, w wire.DataWriter) error {
 			}
 			current = st.built != 0 && st.built == st.current
 		}
-		row := []any{x.Name, x.Schema + "." + x.Table, x.Column, strings.Join(x.Groups, ", "), domain, snapshot, current, bitmaps, x.AddedBy, x.Added}
+		groups := strings.Join(x.Groups, ", ")
+		if x.Elements {
+			groups = "ELEMENTS(" + groups + ")"
+		}
+		row := []any{x.Name, x.Schema + "." + x.Table, x.Column, groups, domain, snapshot, current, bitmaps, x.AddedBy, x.Added}
 		if err := w.Row(row); err != nil {
 			return err
 		}

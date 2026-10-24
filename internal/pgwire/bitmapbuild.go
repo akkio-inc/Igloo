@@ -357,6 +357,7 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 			if err == nil {
 				how = "append"
 				g, h := groupList(x, ""), quoteIdent(iddomain.HiddenColumn(x.Column))
+				files = elementsOf(x, files)
 				if counted {
 					insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, bm, n, rb_cardinality(bm) FROM (SELECT %s rb_or_agg(bm) AS bm, sum(n) AS n FROM ("+
 						"SELECT %s bm, row_count AS n FROM %s WHERE source_snapshot_id = %d "+
@@ -495,11 +496,24 @@ func snapshotRows(ctx context.Context, tbl *table.Table) (int64, error) {
 // at, the source read at S; counted, with each one's rows and members.
 func (s *Server) rebuildSQL(x iddomain.BitmapIndex, S int64, gen int, at string, counted bool) string {
 	g, h := groupList(x, ""), quoteIdent(iddomain.HiddenColumn(x.Column))
+	at = elementsOf(x, at)
 	if !counted {
 		return fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, rb_agg(CAST(%s AS UINTEGER)) FROM %s %s", s.indexTable(x.Name), S, g, gen, h, at, groupBy(x))
 	}
 	return fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, bm, n, rb_cardinality(bm) FROM (SELECT %s rb_agg(CAST(%s AS UINTEGER)) AS bm, count(%s) AS n FROM %s %s)",
 		s.indexTable(x.Name), S, g, gen, g, h, h, at, groupBy(x))
+}
+
+// elementsOf is the rows of from that x's bitmaps are of: from itself, or,
+// for an index of a list's elements, one row for each element, which the
+// index's column holds, with the row's id. Its rows count each element as
+// often as lists hold it.
+func elementsOf(x iddomain.BitmapIndex, from string) string {
+	if !x.Elements {
+		return from
+	}
+	col, h := quoteIdent(x.Groups[0]), quoteIdent(iddomain.HiddenColumn(x.Column))
+	return "(SELECT unnest(" + col + ") AS " + col + ", " + h + " FROM " + from + ") AS e"
 }
 
 // indexCounted reports whether x's table records each bitmap's rows and

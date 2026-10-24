@@ -511,6 +511,26 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		"dimensions": []any{map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_1": "low", "SEG_2": "low", "SEG_3": "high"}},
 			map[string]any{"name": "KIND", "column": "segment_name", "map": map[string]any{"SEG_4": "low"}, "skip_blank": true}}}, true)
 
+	// A list's elements, from an index of them: once each a member, from
+	// the bitmaps; repeated in a member's lists, from the tables.
+	it.exec(
+		"CREATE TABLE lake.public.interests AS SELECT 'p' || i AS person_id, CASE i % 3 WHEN 0 THEN ['cars', 'news'] WHEN 1 THEN ['news', ''] ELSE NULL END AS topics FROM range(300) r(i)",
+		"ALTER TABLE lake.public.interests ALTER COLUMN person_id SET TAG pii = 'person_id'",
+		"ALTER TABLE lake.public.interests ALTER COLUMN person_id SET ID DOMAIN people",
+	)
+	srv.MapIDDomains(ctx)
+	it.exec("ALTER TABLE lake.public.interests ADD BITMAP INDEX topics ON (ELEMENTS(topics)) FOR person_id")
+	srv.waitIndexBuilds(t)
+	topics := map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
+		"source":     map[string]any{"table": "interests", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "TOPIC", "elements": "topics", "skip_blank": true}}}
+	answered("a list's elements", topics, true)
+	it.internal("INSERT INTO lake.public.interests (person_id, topics, _igloo_id_person_id) SELECT value, ['cars'], id FROM lake.igloo_domains.people WHERE value = 'p0'")
+	srv.indexesChanged("public", "interests")
+	srv.waitIndexBuilds(t)
+	srv.MaintainBitmapIndexes(ctx)
+	answered("a list's elements, one repeated in a member's lists", topics, false)
+
 	// A prepared call counted from the tables while an index it needs is
 	// missing reads the bitmaps once the index is built.
 	it.exec("ALTER TABLE lake.public.attributes DROP BITMAP INDEX population")

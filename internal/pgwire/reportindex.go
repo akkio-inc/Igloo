@@ -20,11 +20,12 @@ import (
 //
 //   - each cohort is a table, with conditions only on the columns of an
 //     index of it for its member;
-//   - each dimension is a column or a constant, of the source or a view of
-//     it alone (whose rows are the table's), with an index of the source
-//     for the member by that column and the columns of the source's
-//     conditions (by those alone, for a constant), and there are no metrics
-//     and no extent;
+//   - each dimension is a column, a list's elements or a constant, of the
+//     source or a view of it alone (whose rows are the table's), with an
+//     index of the source for the member by that column and the columns of
+//     the source's conditions (by those alone, for a constant; of the
+//     list's elements, ON (ELEMENTS(list)), without conditions), and there
+//     are no metrics and no extent;
 //   - each bitmap's group has one row for each of its members (the index
 //     records each bitmap's rows and members).
 //
@@ -63,8 +64,8 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 	p := &indexPlanner{s: s, ctx: ctx, sess: sess, r: r, states: map[string]indexState{}}
 	plan := &reportIndexPlan{}
 	domain := ""
-	use := func(table, member string, groups []string) (indexUse, bool) {
-		u, ok := p.use(indexRel{parts: strings.Split(table, "."), column: member, groups: groups})
+	use := func(table, member string, groups []string, elements string) (indexUse, bool) {
+		u, ok := p.use(indexRel{parts: strings.Split(table, "."), column: member, groups: groups, elements: elements})
 		if !ok || domain != "" && u.domain != domain {
 			return indexUse{}, false
 		}
@@ -87,7 +88,7 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 		if c.Version != nil {
 			groups = append(groups, c.Version.Column)
 		}
-		u, ok := use(c.Table, c.Member, groups)
+		u, ok := use(c.Table, c.Member, groups, "")
 		if !ok {
 			return nil
 		}
@@ -104,14 +105,22 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 	}
 	where := mapKeysOf(spec.Source.Where)
 	for _, d := range spec.Dimensions {
-		if d.Metric != "" || d.Elements != "" {
+		if d.Metric != "" {
 			return nil
 		}
-		groups := where
-		if d.Column != "" {
+		groups, elements := where, ""
+		switch {
+		case d.Elements != "":
+			// An index of the list's elements, which holds nothing else
+			// to keep rows by.
+			if d.Path != nil || len(where) > 0 {
+				return nil
+			}
+			groups, elements = []string{d.Elements}, d.Elements
+		case d.Column != "":
 			groups = append([]string{d.Column}, where...)
 		}
-		u, ok := use(spec.Source.Table, spec.Source.Member, groups)
+		u, ok := use(spec.Source.Table, spec.Source.Member, groups, elements)
 		if !ok {
 			return nil
 		}
@@ -184,6 +193,9 @@ func (s *Server) reportIndexSQL(spec *reportSpec, plan *reportIndexPlan) string 
 			group = quoteLiteral(*d.Group)
 		}
 		v := "CAST(" + d.valueOf("x") + " AS VARCHAR)"
+		if d.Elements != "" {
+			v = "CAST(x." + quoteIdent(d.Elements) + " AS VARCHAR)"
+		}
 		conds := []string{indexRows("x", u)}
 		if w := spec.Source.Where.sql("x"); w != "" {
 			conds = append(conds, w)

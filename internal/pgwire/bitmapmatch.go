@@ -31,10 +31,14 @@ import (
 // beside it the count's keys and filter name (lower case, sorted, once
 // each).
 type indexRel struct {
-	parts  []string
-	alias  string
-	column string
-	groups []string
+	// elements, when set, asks for an index of that list column's
+	// elements (ON (ELEMENTS(column))), whose groups no other relation
+	// matches; it is also among groups.
+	elements string
+	parts    []string
+	alias    string
+	column   string
+	groups   []string
 	// at says the reference reads the table at a version, as Igloo pins
 	// tables it counts through ids (see idcount.go).
 	at bool

@@ -506,15 +506,18 @@ which is off by default and needs `IGLOO_ID_DOMAINS=true`.
 ```sql
 ALTER TABLE crm.segments ADD BITMAP INDEX people_by_segment ON (segment_name) FOR person_id;
 ALTER TABLE crm.contacts ADD BITMAP INDEX everyone ON () FOR person_id;
+ALTER TABLE web.browsing ADD BITMAP INDEX by_keyword ON (ELEMENTS(keywords)) FOR person_id;
 SHOW BITMAP INDEXES;
 ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
 ```
 
 - `FOR` names a member column, whose ids the bitmaps hold; `ON` names up to
   four other columns of plain types, one bitmap for each combination of their
-  values (`ON ()`, one bitmap for the whole table). Only admins add and drop
-  indexes; anyone may list them. A column keeps its domain while an index
-  holds its ids.
+  values (`ON ()`, one bitmap for the whole table). `ON (ELEMENTS(c))` keeps
+  a bitmap for each element of the list column `c`'s lists instead, of the
+  people whose rows hold it, for the [report API](media-analytics.md#report-api);
+  counts in SQL do not read it. Only admins add and drop indexes; anyone may
+  list them. A column keeps its domain while an index holds its ids.
 - An index's bitmaps are the table `igloo_bitmaps.<name>` of the catalog,
   in CRoaring's portable format, one row for each combination, for one
   snapshot of the table, with the combination's rows that have ids

@@ -279,6 +279,10 @@ func (p *indexPlanner) use(rel indexRel) (indexUse, bool) {
 		if !strings.EqualFold(x.Column, m.Column) || !coversGroups(x.Groups, rel.groups) {
 			continue
 		}
+		// An index of a list's elements answers for those alone.
+		if x.Elements != (rel.elements != "") || x.Elements && !strings.EqualFold(x.Groups[0], rel.elements) {
+			continue
+		}
 		if best == nil || len(x.Groups) < len(best.Groups) {
 			x := x
 			best = &x
