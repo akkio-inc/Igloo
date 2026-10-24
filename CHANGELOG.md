@@ -609,6 +609,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- A distributed statement's partial results may take a quarter of the
+  coordinator's free disk, at least 1 GiB, rather than 1 GiB: a report at a
+  hundred times the data, whose groups the coordinator ranks, passed 1 GiB
+  after 54 minutes of stages and then ran on one machine until it timed
+  out.
 - Workers read ahead as their own `IGLOO_PREFETCH` says: they read ahead
   nothing unless the coordinating replica had it on too, though each logged
   "prefetch on". They no longer read ahead exchanges' files, which DuckDB

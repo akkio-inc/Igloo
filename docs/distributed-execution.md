@@ -375,7 +375,8 @@ share runs on another worker, and the failed worker is left out for 30
 seconds. A worker that answers a task with an error ran it and is healthy:
 the statement then runs on the coordinator at once, without trying other
 workers or leaving any out. If no worker can run it, its partial results
-would take more than 1 GiB of the coordinator's disk, or the parts cannot
+would take more than a quarter of the coordinator's free disk (at least
+1 GiB), or the parts cannot
 be combined, the statement also runs on the coordinator, so a client sees a
 slower statement, not an error; but not one whose exchanged rows Igloo
 estimates at more than the coordinator's memory holds, or that ran out of

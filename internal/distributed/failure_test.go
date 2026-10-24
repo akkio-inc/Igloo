@@ -552,6 +552,19 @@ func TestSpoolLimit(t *testing.T) {
 	if !h.check(`SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1 ORDER BY 1`) {
 		t.Error("did not run distributed")
 	}
+	// Unset, the limit is a quarter of the coordinator's free disk, and at
+	// least 1 GiB.
+	if got := h.co.spoolLimit(); got != 64<<10 {
+		t.Errorf("spool limit %d, want the option's", got)
+	}
+	h.co.opts.MaxSpoolBytes = 0
+	free, err := freeSpace(h.co.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.co.spoolLimit(); got < defaultMaxSpool || got > max(free/4+free/100, defaultMaxSpool) {
+		t.Errorf("spool limit %d with %d bytes free", got, free)
+	}
 }
 
 // fakeCompute records the worker counts asked for.

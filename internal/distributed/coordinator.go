@@ -97,7 +97,8 @@ type Options struct {
 	Metrics *Metrics
 	// MaxSpoolBytes bounds what a statement's partial results may take on
 	// the coordinator's disk; past it, the statement runs on the
-	// coordinator instead. Zero means 1 GiB.
+	// coordinator instead. Zero means a quarter of the room free there as
+	// the statement starts, and at least 1 GiB (see spoolLimit).
 	MaxSpoolBytes int64
 	// MemoryBytes is the coordinator's DuckDB memory limit, for estimating
 	// whether a statement fits it (see choose); zero for unknown.
@@ -550,10 +551,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		ws = ws[:want]
 	}
 	co.pool.touch()
-	limit := co.opts.MaxSpoolBytes
-	if limit <= 0 {
-		limit = defaultMaxSpool
-	}
+	limit := co.spoolLimit()
 
 	// Each table's current snapshot and its files, once per statement, so
 	// the statement sees every commit made before it.
@@ -1067,8 +1065,26 @@ type spool struct {
 	used  atomic.Int64
 }
 
-// defaultMaxSpool is the spool of a statement when Options say nothing.
+// defaultMaxSpool is the least spool of a statement when Options say
+// nothing (see spoolLimit).
 const defaultMaxSpool = 1 << 30
+
+// spoolLimit is what a statement's partial results may take on the
+// coordinator's disk: Options.MaxSpoolBytes, or else a quarter of the room
+// free there as it starts, which DuckDB's spilling shares, and at least
+// defaultMaxSpool. A report at a hundred times the data sent the
+// coordinator its groups, ranked there, past a fixed 1 GiB after 54
+// minutes of stages, and then ran on one machine until it timed out.
+func (co *Coordinator) spoolLimit() int64 {
+	if co.opts.MaxSpoolBytes > 0 {
+		return co.opts.MaxSpoolBytes
+	}
+	free, err := freeSpace(co.dir)
+	if err != nil || free/4 < defaultMaxSpool {
+		return defaultMaxSpool
+	}
+	return free / 4
+}
 
 // spoolReader reads a worker's result into the spool, and fails, with an
 // error that sends the statement back to the coordinator, once the spool

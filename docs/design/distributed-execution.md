@@ -541,8 +541,10 @@ result's columns must match the prepared statement's, or it falls back.
   statement runs on the coordinator at once, and no worker is left out, so
   one user's failing statement cannot take workers away from everyone.
 - Partial results wait on the coordinator's disk until every task has
-  answered; past 1 GiB for a statement, it stops its tasks and runs on the
-  coordinator.
+  answered; past a quarter of the room free there as the statement started
+  (at least 1 GiB), it stops its tasks and runs on the coordinator. A
+  fixed 1 GiB sent a report at a hundred times the data, whose groups the
+  coordinator ranks, back to one machine after 54 minutes of stages.
 - If no worker can run a part, or the combine step fails before sending a
   row, the statement runs on the coordinator as usual
   (`igloo_distributed_fallbacks_total`).
