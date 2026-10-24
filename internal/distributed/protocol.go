@@ -41,8 +41,11 @@ type taskRequest struct {
 	// since every machine must run the same DuckDB.
 	Version  string    `json:"version"`
 	Settings []setting `json:"settings,omitempty"`
-	Views    []viewDef `json:"views"`
-	SQL      string    `json:"sql"`
+	// Variables are values the coordinator computed, which SQL reads with
+	// getvariable() (see values.go).
+	Variables []variable `json:"variables,omitempty"`
+	Views     []viewDef  `json:"views"`
+	SQL       string     `json:"sql"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory

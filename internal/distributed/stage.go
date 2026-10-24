@@ -190,8 +190,11 @@ type execution struct {
 	ws       []*worker
 	files    map[string][]File
 	settings []setting
-	force    bool
-	sp       *spool
+	// variables are the values the coordinator computed, which tasks set
+	// before they run (see values.go).
+	variables []variable
+	force     bool
+	sp        *spool
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
@@ -517,6 +520,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				task.Expect = reads + bytes
 			}
 		}
+		task.Variables = variablesOf(e.variables, task.SQL)
 		if e.co.opts.LocalExchanges {
 			for _, w := range e.ws {
 				task.Peers = append(task.Peers, w.addr)

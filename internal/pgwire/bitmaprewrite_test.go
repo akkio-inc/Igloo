@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/akkio-inc/igloo/internal/iddomain"
 )
 
 // e2Report is the shape of Acme's segment-share report (E2): the members
@@ -192,4 +194,44 @@ func wantRows(t *testing.T, it *idTest, conn *pgx.Conn) []string {
 	srv.bitmapIndexesOn = false
 	defer func() { srv.bitmapIndexesOn = true }()
 	return texts(t, conn, e2Report)
+}
+
+// Igloo's own reads of bitmap indexes' tables, in a statement it wrote to
+// answer from them, are reads the coordinator may compute for workers
+// (sessionEnv.Computes), which the session computes as the statement
+// would; no other statement's, and no other table's.
+func TestIndexValues(t *testing.T) {
+	it := newE2Test(t)
+	ctx := context.Background()
+	srv := it.r.srv
+	user, err := it.r.store.Get(ctx, "igloo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err := srv.OpenEmbedded(ctx, user, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer es.Close() //nolint:errcheck
+	pinned := &statement{indexPins: []indexPin{{schema: "public", table: "person_segments", index: "seg"}}}
+	index := []string{"lake", iddomain.IndexSchema, "seg"}
+	for _, c := range []struct {
+		st    *statement
+		parts []string
+		want  bool
+	}{
+		{pinned, index, true},
+		{&statement{}, index, false},
+		{pinned, []string{"lake", "public", "person_segments"}, false},
+	} {
+		env := &sessionEnv{s: srv, sess: es.sess, user: user, st: c.st}
+		if got, err := env.Computes(ctx, c.parts); err != nil || got != c.want {
+			t.Errorf("Computes(%v) with %d pins: %v, %v; want %v", c.parts, len(c.st.indexPins), got, err, c.want)
+		}
+	}
+	env := &sessionEnv{s: srv, sess: es.sess, user: user, st: pinned}
+	v, err := env.Value(ctx, "SELECT (SELECT count(*) FROM lake."+iddomain.IndexSchema+".seg)")
+	if n, ok := v.(int64); err != nil || !ok || n == 0 {
+		t.Errorf("Value: %v (%T), %v", v, v, err)
+	}
 }

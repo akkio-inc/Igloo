@@ -49,6 +49,7 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 	}
 	parts := exchangePartitions(plan.Stages, d.ws, n, uploadBytes(co.opts.Warehouse))
 	rows = append(rows, [2]string{"partitions", strconv.Itoa(parts)})
+	rows = append(rows, plan.computeLater()...)
 	for _, s := range plan.Stages {
 		rows = append(rows, [2]string{s.String(), s.SQL})
 	}

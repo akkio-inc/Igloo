@@ -161,6 +161,11 @@ type Plan struct {
 	// replan plans the statement again with the sizes of relations
 	// measured, as probing them does (see Execute).
 	replan func(sizes map[string]knownSize) (*Plan, error)
+	// values are the scalar subqueries the coordinator computes, with
+	// valueEnv, before the stages run, which read them from variables (see
+	// values.go).
+	values   []*value
+	valueEnv ValueEnv
 }
 
 // ShortOfMemory reports whether the statement would not fit in the
@@ -225,6 +230,10 @@ type planOptions struct {
 	// large are relations measured large lately, by key, with what they
 	// were estimated at then (see outcomes).
 	large map[string]outcome
+	// values are the variables of the values the coordinator computes for
+	// the stages (see computedValues): the only variables fragments may
+	// read.
+	values map[string]bool
 }
 
 // planner plans one statement.
@@ -1134,6 +1143,11 @@ func (pl *planner) expandView(ref node, parts []string) (node, bool, error) {
 	body, err := pl.p.parse(def.Query)
 	if err != nil {
 		return nil, false, unsupported("view %s: %v", name, err)
+	}
+	if len(pl.opts.values) > 0 && callsFunction(body, "getvariable") {
+		// It could read a variable of the values computed for the stages,
+		// which workers would set and the coordinator not.
+		return nil, false, unsupported("view %s calls getvariable()", name)
 	}
 	var qerr error
 	walk(body, func(n node) bool {
@@ -2363,7 +2377,7 @@ func (pl *planner) checkFunctions(fragment node) error {
 		}
 		if (str(n["class"]) == "FUNCTION" && n["is_operator"] != true) || str(n["class"]) == "WINDOW" {
 			name := strings.ToLower(str(n["function_name"]))
-			if sessionFunctions[name] {
+			if sessionFunctions[name] && (name != "getvariable" || !pl.opts.values[variableName(n)]) {
 				err = unsupported("%s()", name)
 				return false
 			}

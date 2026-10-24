@@ -584,6 +584,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   that stands on its own in the select list of a step that groups nothing
   is computed by workers once, as one row every task reads. Forced on
   workers, such reports had run on the replica.
+- A statement Igloo writes to answer from bitmap indexes can filter a
+  large table on workers by a cohort's bitmap: the coordinator computes the
+  scalar subquery that reads it from the index's table, at the snapshot the
+  statement pinned, once, and workers read its value from a DuckDB
+  variable, never the table, which a policy of Igloo's own keeps from them.
+  `EXPLAIN DISTRIBUTED` lists such values as `computed first`; one over
+  16 MiB keeps the statement on one machine.
 - A subquery that workers compute as a relation, as when a report joins a
   view of a wide table to itself, writes only the columns its reader
   reads to the exchange. A report whose 16 branches each read three

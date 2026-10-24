@@ -343,6 +343,11 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		}
 		return nil, nil, unsupported("%v", err)
 	}
+	values, err := co.computedValues(ctx, env, stmt)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts.values = valueNames(values)
 	plan, err := newPlanner(ctx, env, co.parser, co.aggs, opts).plan(stmt)
 	if err != nil {
 		var u *errUnsupported
@@ -354,7 +359,15 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, nil, err
 	}
 	plan.force, plan.mayStart = opts.force, mode != ModeOnRunning
-	plan.Key = planKey(stmt, plan.Stages)
+	keyed := stmt
+	if len(values) > 0 {
+		// The coordinator's part reads the subqueries themselves, and the
+		// statement is known by them, not by the variables.
+		plan.values, plan.valueEnv = values, env.(ValueEnv)
+		plan.final = restoreValues(clone(plan.final), values).(node)
+		keyed = restoreValues(clone(stmt), values).(node)
+	}
+	plan.Key = planKey(keyed, plan.Stages)
 	plan.replan = func(sizes map[string]knownSize) (*Plan, error) {
 		// Planned as the statement was, whatever auto mode would choose
 		// now: it runs on workers already.
@@ -498,13 +511,30 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			ex.Close()
 		}
 	}()
+	qid := filepath.Base(ex.dir)
+
+	// The values the stages read, computed before any worker starts, as a
+	// value too large for them keeps the statement here.
+	var vars []variable
+	var err error
+	if len(plan.values) > 0 {
+		vid := qid + "-values"
+		root := shuffleRoot(co.opts.Warehouse, vid)
+		release := co.hold(vid, root)
+		defer func() {
+			release()
+			co.removeLater(vid, root)
+		}()
+		if vars, err = plan.compute(ctx, co.opts.Storage, root); err != nil {
+			return nil, err
+		}
+	}
 
 	// As many workers as the estimates call for (see estimateTimes), or
 	// every one when an admin forces it. Forced by anyone else, only
 	// workers already running, and no more than the estimates call for.
 	want := max(1, plan.workers)
 	var ws []*worker
-	var err error
 	if plan.mayStart {
 		if plan.force {
 			want = max(want, co.opts.Pool.MaxWorkers, len(co.pool.ready(ctx)))
@@ -544,7 +574,6 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 
 	loaded := time.Since(start)
-	qid := filepath.Base(ex.dir)
 	var cleanups []func()
 	defer func() {
 		for _, f := range cleanups {
@@ -579,7 +608,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 		newRun := func(id string) *execution {
 			r := &execution{
-				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, force: planned.force,
+				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
 				sp: &spool{limit: limit}, parts: parts, smaller: smaller, root: shuffleRoot(co.opts.Warehouse, id),
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 			}

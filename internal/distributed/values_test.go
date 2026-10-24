@@ -1,0 +1,248 @@
+package distributed
+
+import (
+	"bytes"
+	"context"
+	"database/sql/driver"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// valueEnv is the harness's Env with tables only the session has, which
+// stand in for bitmap indexes' tables: the coordinator computes reads of
+// them for workers. The session has no time travel, and its tables one
+// snapshot, which a read at any version reads.
+type valueEnv struct {
+	harnessEnv
+	private map[string]bool
+}
+
+var atVersion = regexp.MustCompile(`(?i)\s+AT\s*\(\s*VERSION\s*=>\s*\d+\s*\)`)
+
+func (e valueEnv) Computes(_ context.Context, parts []string) (bool, error) {
+	return e.private[strings.ToLower(parts[len(parts)-1])], nil
+}
+
+func (e valueEnv) Describe(ctx context.Context, query string) ([]Column, error) {
+	return e.harnessEnv.Describe(ctx, atVersion.ReplaceAllString(query, ""))
+}
+
+func (e valueEnv) Value(ctx context.Context, query string) (any, error) {
+	var v any
+	err := e.h.session.QueryRowContext(ctx, atVersion.ReplaceAllString(query, "")).Scan(&v)
+	return v, err
+}
+
+// runValues plans and executes query with env, and returns its rows next
+// to those of running it on one machine.
+func (h *harness) runValues(env valueEnv, query string) (got, want [][]any, plan *Plan, err error) {
+	h.t.Helper()
+	ctx := context.Background()
+	want, wantCols, err := h.query(ctx, atVersion.ReplaceAllString(query, ""))
+	if err != nil {
+		h.t.Fatalf("%s\nlocal: %v", short(query), err)
+	}
+	plan, err = h.co.Plan(ctx, query, env, ModeOn)
+	if err != nil {
+		return nil, want, nil, err
+	}
+	ex, err := h.co.Execute(ctx, plan, h.settings(ctx))
+	if err != nil {
+		return nil, want, plan, err
+	}
+	defer ex.Close()
+	got, gotCols, err := h.query(ctx, atVersion.ReplaceAllString(ex.SQL, ""))
+	if err == nil && !slices.Equal(gotCols, wantCols) {
+		h.t.Errorf("%s\ncolumns: got %v, want %v", short(query), gotCols, wantCols)
+	}
+	return got, want, plan, err
+}
+
+// The coordinator computes a scalar subquery over a table workers may not
+// read, at a pinned snapshot, and the stages read its value: in WHERE, in
+// a select list the coordinator's part computes (under its own name), as
+// a BLOB, which crosses through object storage. Workers never see the
+// table. A subquery that refers to the statement around it, a statement
+// that reads variables itself, an Env that vouches for nothing, and a
+// value over maxValueBytes keep the statement on one machine.
+func TestComputedValues(t *testing.T) {
+	h := newHarness(t, 0.01, 4, 2)
+	h.exec(`CREATE TABLE cutoffs AS SELECT * FROM (VALUES ('a', 1000::BIGINT), ('b', 30000::BIGINT)) AS v(name, k)`)
+	h.exec(`CREATE TABLE blobs AS SELECT 'small' AS name, encode(repeat('x', 100000)) AS b UNION ALL
+		SELECT 'large', encode(repeat('y', ` + strconv.Itoa(maxValueBytes+1) + `))`)
+	env := valueEnv{harnessEnv{h}, map[string]bool{"cutoffs": true, "blobs": true}}
+
+	ok := []string{
+		`SELECT l_returnflag, count(*) AS n, sum(l_quantity) AS q FROM lineitem
+			WHERE l_orderkey < (SELECT max(k) FROM cutoffs AT (VERSION => 3) WHERE name = 'b') GROUP BY 1 ORDER BY 1`,
+		`SELECT l_returnflag, count(*) AS n, (SELECT min(k) FROM main.cutoffs AT (VERSION => 3)) AS cutoff FROM lineitem
+			GROUP BY 1 ORDER BY 1`,
+		`SELECT count(*) AS n FROM lineitem
+			WHERE l_orderkey * 10 < octet_length((SELECT b FROM blobs AT (VERSION => 1) WHERE name = 'small'))`,
+	}
+	for _, q := range ok {
+		got, want, plan, err := h.runValues(env, q)
+		if err != nil {
+			t.Fatalf("%s: %v", short(q), err)
+		}
+		if msg := compareRows(want, got, true); msg != "" {
+			t.Errorf("%s\n%s\n%s", short(q), msg, plan.describe())
+		}
+		if len(plan.values) != 1 {
+			t.Errorf("%s: %d values computed, want 1", short(q), len(plan.values))
+		}
+		for _, s := range plan.Stages {
+			if strings.Contains(s.SQL, "cutoffs") || strings.Contains(s.SQL, "blobs") {
+				t.Errorf("%s: stage %d reads the table itself: %s", short(q), s.ID, s.SQL)
+			}
+		}
+	}
+
+	// The statement is known by its subquery: its string literals aside,
+	// as ever, not by the variable.
+	key := func(q string) string {
+		p, err := h.co.Plan(context.Background(), q, env, ModeOn)
+		if err != nil {
+			t.Fatalf("%s: %v", short(q), err)
+		}
+		return p.Key
+	}
+	base := `SELECT count(*) FROM lineitem WHERE l_orderkey < (SELECT %s(k) FROM cutoffs AT (VERSION => 3) WHERE name = '%s')`
+	if key(fmt.Sprintf(base, "max", "a")) != key(fmt.Sprintf(base, "max", "b")) {
+		t.Error("a string literal in the subquery changed the plan key")
+	}
+	if key(fmt.Sprintf(base, "max", "a")) == key(fmt.Sprintf(base, "min", "a")) {
+		t.Error("another subquery has the same plan key")
+	}
+
+	rows, err := h.co.Explain(context.Background(), ok[0], env, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explained := false
+	for _, r := range rows {
+		if r[0] == "computed first" && strings.Contains(r[1], valuePrefix+"0 BIGINT: (SELECT max(k)") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Errorf("EXPLAIN DISTRIBUTED does not say what is computed first: %v", rows)
+	}
+
+	local := []struct {
+		env   Env
+		query string
+	}{
+		{env, `SELECT count(*) FROM lineitem WHERE l_orderkey < (SELECT max(k) FROM cutoffs AT (VERSION => 3) WHERE name = l_returnflag)`},
+		{env, `SELECT count(*) FROM lineitem WHERE l_orderkey < (SELECT max(k) FROM cutoffs AT (VERSION => 3)) + getvariable('x')`},
+		{env, `SELECT count(*) FROM lineitem WHERE l_orderkey < (SELECT max(k) FROM cutoffs)`},
+		{harnessEnv{h}, ok[0]},
+	}
+	for _, c := range local {
+		if _, err := h.co.Plan(context.Background(), c.query, c.env, ModeOn); !IsUnsupported(err) {
+			t.Errorf("%s: planned with %v, want it kept on one machine", short(c.query), err)
+		}
+	}
+	large := strings.ReplaceAll(ok[2], "'small'", "'large'")
+	if _, _, _, err := h.runValues(env, large); !IsUnsupported(err) || !strings.Contains(err.Error(), "bytes") {
+		t.Errorf("a value over the cap: %v, want it kept on one machine", err)
+	}
+
+	// The BLOBs written for the tasks are removed with the statement's
+	// exchanges.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		h.removedMu.Lock()
+		removed := slices.ContainsFunc(h.removed, func(d string) bool { return strings.HasSuffix(d, "-values") })
+		h.removedMu.Unlock()
+		if removed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the values written for tasks were not removed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// With the rb extension, a cohort's bitmap that the coordinator computes
+// filters the rows workers read, as a statement answered from bitmap
+// indexes would.
+func TestComputedBitmap(t *testing.T) {
+	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
+	if rb == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
+	}
+	h := newHarnessRB(t, 0.01, 4, 2, rb)
+	h.exec(`CREATE TABLE cohorts AS SELECT o_orderpriority AS name, rb_agg(CAST(o_orderkey AS UINTEGER)) AS bm FROM orders GROUP BY 1`)
+	env := valueEnv{harnessEnv{h}, map[string]bool{"cohorts": true}}
+	q := `SELECT l_shipmode, count(*) AS n, count(DISTINCT l_orderkey) AS orders FROM lineitem
+		WHERE rb_contains((SELECT rb_or_agg(bm) FROM cohorts AT (VERSION => 2) WHERE name LIKE '1%' OR name LIKE '2%'),
+			CAST(l_orderkey AS UINTEGER))
+		GROUP BY 1 ORDER BY 1`
+	got, want, plan, err := h.runValues(env, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg := compareRows(want, got, true); msg != "" {
+		t.Errorf("%s\n%s", msg, plan.describe())
+	}
+	if len(plan.values) != 1 || plan.values[0].typ != "BLOB" {
+		t.Errorf("computed %v, want one BLOB", plan.values)
+	}
+}
+
+// Tasks set only the variables of computed values, of the types those may
+// have, and read a BLOB only from where the worker may read.
+func TestSetVariables(t *testing.T) {
+	h := newHarness(t, 0.01, 1, 1)
+	w := h.workers[0]
+	conn, err := w.opts.Engine.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	file := filepath.Join(h.dir, "warehouse", "v")
+	if err := os.WriteFile(file, []byte{0, 1, 2}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	good := []variable{
+		{Name: valuePrefix + "0", Type: "BIGINT", Text: "42"},
+		{Name: valuePrefix + "1", Type: "BLOB", File: file},
+		{Name: valuePrefix + "2", Type: "VARCHAR", Null: true},
+	}
+	if err := w.setVariables(context.Background(), conn, good); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := conn.QueryContext(context.Background(),
+		"SELECT getvariable('"+valuePrefix+"0'), getvariable('"+valuePrefix+"1'), getvariable('"+valuePrefix+"2')", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]driver.Value, 3)
+	err = rows.Next(got)
+	_ = rows.Close()
+	if err != nil || got[0] != int64(42) || !bytes.Equal(got[1].([]byte), []byte{0, 1, 2}) || got[2] != nil {
+		t.Errorf("variables set to %v, %v", got, err)
+	}
+	for _, bad := range []variable{
+		{Name: "x", Type: "BIGINT", Text: "1"},
+		{Name: valuePrefix + "0", Type: "STRUCT(a INTEGER)", Null: true},
+		{Name: valuePrefix + "0", Type: "BLOB", File: filepath.Join(h.dir, "elsewhere")},
+		{Name: valuePrefix + "0", Type: "BIGINT", File: file},
+	} {
+		if err := w.setVariables(context.Background(), conn, []variable{bad}); err == nil {
+			t.Errorf("set %+v", bad)
+		}
+	}
+}

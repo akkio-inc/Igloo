@@ -22,6 +22,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -512,28 +513,11 @@ type sessionEnv struct {
 // For users who read only what grants allow, the table must be one the
 // statement was checked to read.
 func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Table, bool, error) {
-	catalogName := e.s.catalogName()
-	if catalogName == "" {
-		return nil, false, nil
-	}
-	if e.resolver == nil {
-		r, err := e.s.newResolver(ctx, e.sess)
-		if err != nil {
-			return nil, false, err
-		}
-		e.resolver = r
-	}
-	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
-	if err != nil {
+	o, ok, err := e.catalogTable(ctx, parts)
+	if err != nil || !ok {
 		return nil, false, err
 	}
-	if len(res.all) != 1 || len(res.first) != 1 {
-		return nil, false, nil
-	}
-	o := res.first[0]
-	if o.view || !strings.EqualFold(o.db, catalogName) {
-		return nil, false, nil
-	}
+	catalogName := e.s.catalogName()
 	obj := auth.Object{Schema: o.schema, Table: o.name}
 	if rank[e.user.Role] < rank[auth.RoleReader] {
 		if e.st.access == nil || !slices.ContainsFunc(e.st.access.read, obj.Equal) {
@@ -574,6 +558,65 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		}
 	}
 	return t, true, nil
+}
+
+// catalogTable resolves a name to a table of Igloo's catalog as DuckDB
+// would in this session; ok is false unless it means exactly one such
+// table.
+func (e *sessionEnv) catalogTable(ctx context.Context, parts []string) (o object, ok bool, err error) {
+	catalogName := e.s.catalogName()
+	if catalogName == "" {
+		return o, false, nil
+	}
+	if e.resolver == nil {
+		r, err := e.s.newResolver(ctx, e.sess)
+		if err != nil {
+			return o, false, err
+		}
+		e.resolver = r
+	}
+	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	if err != nil {
+		return o, false, err
+	}
+	if len(res.all) != 1 || len(res.first) != 1 {
+		return o, false, nil
+	}
+	o = res.first[0]
+	if o.view || !strings.EqualFold(o.db, catalogName) {
+		return o, false, nil
+	}
+	return o, true, nil
+}
+
+// Computes vouches for a statement's reads of bitmap indexes' tables when
+// Igloo wrote them, to answer from the indexes (see bitmaprewrite.go): no
+// user's statement may name those tables (indexReferences), Igloo's own
+// text reads them at the snapshots it pinned, and a row access policy of
+// Igloo's own keeps everyone else, workers among them, from reading them.
+// The coordinator computes such a read for workers.
+func (e *sessionEnv) Computes(ctx context.Context, parts []string) (bool, error) {
+	if !e.st.readsIndexes() {
+		return false, nil
+	}
+	o, ok, err := e.catalogTable(ctx, parts)
+	return ok && strings.EqualFold(o.schema, iddomain.IndexSchema), err
+}
+
+// Value runs query, a SELECT of one value, on the session's connection, as
+// the statement runs there: a read of Igloo's own that Computes vouched
+// for, which the policy rewrite leaves alone in the statement too.
+func (e *sessionEnv) Value(ctx context.Context, query string) (any, error) {
+	rows, err := e.sess.conn.QueryContext(ctx, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		return nil, err
+	}
+	return dest[0], nil
 }
 
 // View reports whether a name may mean a view in this session: a view of

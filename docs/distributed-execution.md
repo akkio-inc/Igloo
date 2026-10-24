@@ -179,7 +179,12 @@ In detail, a part runs distributed when:
   among them. Workers read them, and the fields nested in them, by their
   Iceberg field IDs, as one machine does.
 - It runs outside an explicit transaction, so it reads the tables' latest
-  snapshots, and does not use time travel.
+  snapshots, and does not use time travel. Igloo's own reads of its bitmap
+  indexes are the exception: where a statement Igloo writes to answer from
+  them filters a large table by a scalar subquery over an index's table, at
+  the snapshot it pinned, the coordinator computes that subquery once and
+  workers get its value (`computed first` in `EXPLAIN DISTRIBUTED`). Values
+  over 16 MiB keep the statement on one machine.
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,

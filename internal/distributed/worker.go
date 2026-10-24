@@ -461,6 +461,9 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			return "", nil, fmt.Errorf("set %s: %w", s.Name, err)
 		}
 	}
+	if err := w.setVariables(ctx, conn, req.Variables); err != nil {
+		return "", nil, err
+	}
 	sfMacros, err := checkTaskSQL(ctx, conn, req)
 	if err != nil {
 		return "", nil, err

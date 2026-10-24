@@ -440,6 +440,25 @@ result's columns must match the prepared statement's, or it falls back.
   with snapshots but none yet (empty, it could be filled meanwhile). Data
   files are listed from metadata, so files that several tables share, as
   clones do, read like any others.
+- **Values the coordinator computes.** Workers may not read a bitmap
+  index's table: a row access policy of Igloo's own guards it, and workers
+  read data files, which no policy guards. A statement Igloo writes to
+  answer from the indexes may still filter a large table by one, as
+  `rb_contains((SELECT rb_or_agg(bm) FROM igloo_bitmaps.x AT (VERSION =>
+  7) WHERE ...), CAST(person AS UINTEGER))`. The planner replaces such a
+  scalar subquery with a DuckDB variable,
+  `CAST(getvariable('__igloo_value_0') AS BLOB)`, when the session vouches
+  for every table it reads (only in a statement Igloo wrote to read the
+  indexes, and only their tables), it reads each at a pinned snapshot, it
+  binds on its own (so it is not correlated) and its value is a BLOB or a
+  type that crosses as text unchanged. Before the stages run, the
+  coordinator computes it once in the session; a BLOB goes to object
+  storage under the statement's exchanges, once rather than with every
+  task, and each task sets the variable before it runs. The coordinator's
+  own part keeps the subquery, which reads the same snapshot, and the
+  statement keeps its plan key: the subquery's shape, not the variable.
+  A value over 16 MiB keeps the statement on one machine, and so does a
+  statement that calls `getvariable` itself.
 - **Exact where one machine is exact.** Sums of integers and decimals,
   counts, minimums, maximums and distinct aggregates are exact.
   Floating-point sums and averages may differ in their last digits, as they

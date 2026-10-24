@@ -61,6 +61,10 @@ type indexPin struct {
 	generation    int
 }
 
+// readsIndexes reports whether Igloo wrote st to read bitmap indexes'
+// tables, at the snapshots of indexPins.
+func (st *statement) readsIndexes() bool { return len(st.indexPins) > 0 }
+
 // indexUse is an index a rewrite reads for one relation of a SELECT.
 type indexUse struct {
 	index      iddomain.BitmapIndex
