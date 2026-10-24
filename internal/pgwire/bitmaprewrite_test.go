@@ -100,6 +100,23 @@ func TestBitmapIndexRewrite(t *testing.T) {
 	it.exec("ALTER TABLE lake.public.attributes ALTER COLUMN person_id UNSET MASKING POLICY")
 	answered(3, "the masks dropped")
 
+	// E2's own view names its columns and LEFT JOINs a survey, which
+	// repeats some people and leaves others out: its people are the
+	// table's. An inner join leaves people out, and a column list may give
+	// person_id another table's values: the tables.
+	it.exec("CREATE TABLE lake.public.survey AS SELECT i % 3 AS resp_id, 'answer ' || i AS answer FROM range(6) r(i)",
+		"CREATE OR REPLACE VIEW lake.public.v_attributes (person_id, x, survey_resp_id, survey_answer) AS "+
+			"SELECT s.*, sv.resp_id, sv.answer FROM lake.public.attributes AS s LEFT JOIN lake.public.survey AS sv ON CAST(s.x AS BIGINT) = sv.resp_id")
+	answered(3, "through a view naming its columns, of the population LEFT JOINed to a survey")
+	it.exec("CREATE OR REPLACE VIEW lake.public.v_attributes AS " +
+		"SELECT s.person_id, sv.answer FROM lake.public.attributes AS s JOIN lake.public.survey AS sv ON CAST(s.x AS BIGINT) = sv.resp_id")
+	answered(2, "through a view joining the population to a survey")
+	it.exec("CREATE OR REPLACE VIEW lake.public.v_attributes (person_id, x) AS " +
+		"SELECT sv.answer, s.person_id FROM lake.public.attributes AS s LEFT JOIN lake.public.survey AS sv ON CAST(s.x AS BIGINT) = sv.resp_id")
+	answered(2, "through a view naming the survey's answers person_id")
+	it.exec("CREATE OR REPLACE VIEW lake.public.v_attributes AS SELECT * FROM lake.public.attributes")
+	answered(3, "the plain view again")
+
 	// A statement prepared once and run after a table changed reads the
 	// tables until the bitmaps catch up, then the bitmaps again.
 	cached := it.r.admin(t, pgx.QueryExecModeCacheStatement)

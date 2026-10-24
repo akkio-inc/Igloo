@@ -536,7 +536,11 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   a table, or a CTE or subquery `SELECT [DISTINCT] x FROM tbl2 [WHERE ...]`
   filtered by the columns of an index of `tbl2` for `x`, a member of the
   same domain. Tables may be read through views that select their columns
-  unrenamed. Each select item with such a count needs a name (`AS n`).
+  under the same names (a column list may name them again), from the table
+  alone or from it `LEFT JOIN`ed to other tables of the catalog, with no
+  `WHERE`, grouping, `DISTINCT` or limit: such a view has the table's
+  members (one that joins a clean room's table is read as it is). Each
+  select item with such a count needs a name (`AS n`).
 - Igloo reads bitmaps only when they are of the table's current snapshot,
   when no row access policy, clean room or masking policy (direct or through
   a tag) applies to the table or view, the member column or the columns the

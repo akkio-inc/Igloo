@@ -40,8 +40,10 @@ import (
 //     whose reads grants decide, read the tables);
 //   - each select item with a count has a name of its own, which the
 //     rewrite keeps;
-//   - and a view in between is a plain projection of one table's columns
-//     under their own names.
+//   - and a view in between gives the columns the SELECT counts, groups
+//     and filters by the values of one table's columns of the same names,
+//     selecting from that table alone or LEFT JOINed to others (see
+//     viewBase).
 //
 // The statement then keeps the snapshots it read (indexPin): every other
 // reference to those tables reads the same snapshot (AT (VERSION => ...)),
@@ -110,7 +112,7 @@ func (s *Server) rewriteIndexes(ctx context.Context, sess *session, user auth.Us
 		return query, nil, false
 	}
 	r.lenient = true
-	p := &indexPlanner{s: s, ctx: ctx, r: r, states: map[string]indexState{}, counts: counts}
+	p := &indexPlanner{s: s, ctx: ctx, sess: sess, r: r, states: map[string]indexState{}, counts: counts}
 	written := query
 	rewritten := int64(0)
 	var pins []indexPin
@@ -148,8 +150,11 @@ func (s *Server) rewriteIndexes(ctx context.Context, sess *session, user auth.Us
 type indexPlanner struct {
 	s      *Server
 	ctx    context.Context
+	sess   *session
 	r      *resolver
 	states map[string]indexState
+	// columns are the tables' columns views read (see describe).
+	columns map[string][]string
 	// counts are the tables the statement counts through ids, which it
 	// reads at their pinned snapshots (see idcount.go).
 	counts *idCounts
@@ -230,7 +235,7 @@ func (p *indexPlanner) use(rel indexRel) (indexUse, bool) {
 	o := res.first[0]
 	gov := s.gov.snapshot(p.ctx)
 	if o.view {
-		// A plain projection of one table's columns under their own names.
+		// A view of one table's rows, as far as rel's columns go.
 		base, ok := p.viewBase(o, rel)
 		if !ok {
 			return indexUse{}, false
@@ -299,12 +304,18 @@ func (p *indexPlanner) use(rel indexRel) (indexUse, bool) {
 	return indexUse{index: *best, snapshot: st.built, generation: d.Generation, domain: d.Name}, true
 }
 
-// viewBase returns the table a view reads when it is SELECT * or SELECT of
-// columns under their own names FROM one table, with nothing else.
+// viewBase returns the table a view's rows are rows of, as far as rel's
+// columns go: a view that selects FROM one table, or FROM one table LEFT
+// JOINed to other tables of the catalog, with nothing else (no WHERE,
+// grouping, DISTINCT or limit), and gives each column rel needs the values
+// of the table's column of the same name, through its column list too. A
+// LEFT JOIN keeps every row of its left side, once or more, and adds no
+// values to its columns, so the members the view has, and those of each
+// group, are the table's. A table the view joins may be a clean room's,
+// which the view's readers may not read: such a view is read as it is.
 func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
-	cols, body, ok := viewParts(v.sql)
-	if !ok || len(cols) > 0 {
-		// A view that names its columns renames them.
+	names, body, ok := viewParts(v.sql)
+	if !ok {
 		return object{}, false
 	}
 	tree, err := p.r.serialize(body)
@@ -323,49 +334,188 @@ func (p *indexPlanner) viewBase(v object, rel indexRel) (object, bool) {
 	if cm, ok := node["cte_map"].(map[string]any); ok && len(asList(cm["map"])) > 0 {
 		return object{}, false
 	}
+	// The tables, the view's own first.
+	var refs []map[string]any
+	var tables func(t map[string]any, left bool) bool
+	tables = func(t map[string]any, left bool) bool {
+		if t == nil || t["sample"] != nil {
+			return false
+		}
+		switch str(t["type"]) {
+		case "BASE_TABLE":
+			refs = append(refs, t)
+			return t["at_clause"] == nil
+		case "JOIN":
+			if !left || !strings.EqualFold(str(t["join_type"]), "LEFT") || !strings.EqualFold(str(t["ref_type"]), "REGULAR") ||
+				len(asList(t["using_columns"])) > 0 || t["condition"] == nil {
+				return false
+			}
+			l, _ := t["left"].(map[string]any)
+			r, _ := t["right"].(map[string]any)
+			return tables(l, true) && tables(r, false)
+		}
+		return false
+	}
 	from, _ := node["from_table"].(map[string]any)
-	if str(from["type"]) != "BASE_TABLE" || from["at_clause"] != nil || from["sample"] != nil {
+	if !tables(from, true) {
 		return object{}, false
 	}
-	star := false
-	names := map[string]bool{}
+	objs := make([]object, len(refs))
+	quals := make([]string, len(refs))
+	gov := p.s.gov.snapshot(p.ctx)
+	for i, t := range refs {
+		var parts []string
+		for _, k := range []string{"catalog_name", "schema_name", "table_name"} {
+			if p := str(t[k]); p != "" {
+				parts = append(parts, p)
+			}
+		}
+		res, err := p.r.resolve(tableRef{parts: parts}, &v)
+		if err != nil || len(res.first) != 1 || len(res.all) != 1 || res.first[0].view {
+			return object{}, false
+		}
+		objs[i] = res.first[0]
+		if i > 0 {
+			o := objs[i]
+			if !strings.EqualFold(o.db, p.s.catalogName()) || o.external || isIglooSchema(o.schema) {
+				return object{}, false
+			}
+			if rules := gov.Rules(o.schema, o.name); rules != nil && len(rules.Confined) > 0 {
+				return object{}, false
+			}
+		}
+		quals[i] = str(t["alias"])
+		if quals[i] == "" {
+			quals[i] = parts[len(parts)-1]
+		}
+	}
+	// The view's columns, in order, and the table and column each is,
+	// where it is one (rel -1 otherwise).
+	type column struct {
+		name string
+		rel  int
+		of   string
+	}
+	var out []column
+	described := map[int][]string{}
+	columnsOf := func(i int) ([]string, bool) {
+		if cs, ok := described[i]; ok {
+			return cs, true
+		}
+		cols, err := p.describe(objs[i])
+		if err != nil {
+			return nil, false
+		}
+		described[i] = cols
+		return cols, true
+	}
 	for _, it := range asList(node["select_list"]) {
 		im, _ := it.(map[string]any)
 		switch str(im["class"]) {
 		case "STAR":
-			if len(asList(im["exclude_list"])) > 0 || im["replace_list"] != nil || len(asList(im["rename_list"])) > 0 {
+			if len(asList(im["exclude_list"])) > 0 || im["replace_list"] != nil || len(asList(im["rename_list"])) > 0 ||
+				im["expr"] != nil || im["columns"] == true || im["unpacked"] == true {
 				return object{}, false
 			}
-			star = true
+			q, found := str(im["relation_name"]), false
+			for i := range refs {
+				if q != "" && !strings.EqualFold(q, quals[i]) {
+					continue
+				}
+				found = true
+				cs, ok := columnsOf(i)
+				if !ok {
+					return object{}, false
+				}
+				for _, c := range cs {
+					out = append(out, column{c, i, c})
+				}
+			}
+			if !found {
+				return object{}, false
+			}
 		case "COLUMN_REF":
 			cn := asList(im["column_names"])
-			name := strings.ToLower(str(cn[len(cn)-1]))
-			if a := str(im["alias"]); a != "" && !strings.EqualFold(a, name) {
+			name, at := str(cn[len(cn)-1]), -1
+			switch {
+			case len(cn) == 1 && len(refs) == 1:
+				at = 0
+			case len(cn) == 1:
+				for i := range refs {
+					cs, ok := columnsOf(i)
+					if !ok {
+						return object{}, false
+					}
+					if slices.ContainsFunc(cs, func(c string) bool { return strings.EqualFold(c, name) }) {
+						if at >= 0 {
+							return object{}, false
+						}
+						at = i
+					}
+				}
+			case len(cn) == 2:
+				at = slices.IndexFunc(quals, func(q string) bool { return strings.EqualFold(q, str(cn[0])) })
+			}
+			if at < 0 {
 				return object{}, false
 			}
-			names[name] = true
+			c := column{name, at, name}
+			if a := str(im["alias"]); a != "" {
+				c.name = a
+			}
+			out = append(out, c)
 		default:
+			// An expression's own name is DuckDB's to choose: only one it
+			// is given may stand among the columns.
+			a := str(im["alias"])
+			if a == "" {
+				return object{}, false
+			}
+			out = append(out, column{a, -1, ""})
+		}
+	}
+	if len(names) > len(out) {
+		return object{}, false
+	}
+	for i, n := range names {
+		out[i].name = n
+	}
+	for _, need := range append([]string{rel.column}, rel.groups...) {
+		var is []column
+		for _, c := range out {
+			if strings.EqualFold(c.name, need) {
+				is = append(is, c)
+			}
+		}
+		if len(is) != 1 || is[0].rel != 0 || !strings.EqualFold(is[0].of, need) {
 			return object{}, false
 		}
 	}
-	if !star {
-		for _, col := range append([]string{rel.column}, rel.groups...) {
-			if !names[strings.ToLower(col)] {
-				return object{}, false
-			}
+	return objs[0], true
+}
+
+// describe returns the columns of table o that statements read: those of
+// ids left out (see policyrewrite.go), whose DESCRIBE it keeps for the
+// statement.
+func (p *indexPlanner) describe(o object) ([]string, error) {
+	if p.columns == nil {
+		p.columns = map[string][]string{}
+	}
+	if cs, ok := p.columns[o.key()]; ok {
+		return cs, nil
+	}
+	cols, err := describeTable(p.ctx, p.sess, quoteName([]string{o.db, o.schema, o.name}))
+	if err != nil {
+		return nil, err
+	}
+	var cs []string
+	for _, c := range cols {
+		if !strings.EqualFold(o.db, p.s.catalogName()) || !iddomain.IsHidden(c.name) {
+			cs = append(cs, c.name)
 		}
 	}
-	var parts []string
-	for _, k := range []string{"catalog_name", "schema_name", "table_name"} {
-		if p := str(from[k]); p != "" {
-			parts = append(parts, p)
-		}
-	}
-	res, err := p.r.resolve(tableRef{parts: parts}, &v)
-	if err != nil || len(res.first) != 1 || len(res.all) != 1 || res.first[0].view {
-		return object{}, false
-	}
-	return res.first[0], true
+	p.columns[o.key()] = cs
+	return cs, nil
 }
 
 // coversGroups reports whether an index's groups include every one of
