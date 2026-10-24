@@ -737,7 +737,7 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	// in rb_and_cardinality): it does not fit, and the call runs again from
 	// the tables, with the same rows.
 	it.exec(
-		"CREATE TABLE lake.public.halves AS SELECT 'h' || i AS person_id, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END AS half FROM range(20000) r(i)",
+		"CREATE TABLE lake.public.halves AS SELECT 'h' || i AS person_id, CASE WHEN hash(i) % 2 = 0 THEN 'even' ELSE 'odd' END AS half FROM range(20000) r(i)",
 		"ALTER TABLE lake.public.halves ALTER COLUMN person_id SET TAG pii = 'person_id'",
 		"ALTER TABLE lake.public.halves ALTER COLUMN person_id SET ID DOMAIN people",
 	)
