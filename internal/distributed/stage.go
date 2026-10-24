@@ -305,6 +305,66 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 	return g.Wait
 }
 
+// prefetchUsed returns, with prefetching on (Options.Prefetch), the field
+// IDs of the columns the stage's query may read of each catalog table it
+// reads, by view name; nil with it off, or for a query the walk cannot
+// read, whose tasks are then not prefetched.
+func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string][]int {
+	if !e.co.opts.Prefetch {
+		return nil
+	}
+	env := stageViews{}
+	for _, in := range s.Inputs {
+		if in.Table != nil {
+			env[strings.ToLower(in.View)] = in
+		}
+	}
+	w, err := walkScans(ctx, e.co.parser, s.SQL, env)
+	if err != nil {
+		e.co.log.Debug("could not tell what a stage reads, for prefetching", "query", e.qid, "stage", s.String(), "err", err)
+		return nil
+	}
+	used := map[string][]int{}
+	for _, key := range w.order {
+		u := w.uses[key]
+		in := env[strings.ToLower(u.name)]
+		var sc Scan
+		w.read(&sc, in.Table.Columns, u)
+		used[in.View] = append([]int{}, sc.FieldIDs...)
+	}
+	return used
+}
+
+// stageViews resolves the names of a stage's views of catalog tables, by
+// view name in lower case, for walkScans.
+type stageViews map[string]Input
+
+func (v stageViews) Resolve(_ context.Context, parts []string) (string, string, bool, error) {
+	if len(parts) != 1 {
+		return "", "", false, nil
+	}
+	in, ok := v[strings.ToLower(parts[0])]
+	return "", in.View, ok, nil
+}
+
+func (stageViews) ViewDefinition(context.Context, []string) (*ViewDefinition, bool, error) {
+	return nil, false, nil
+}
+
+// prefetchOf returns what a worker's prefetcher needs of a view of files,
+// with used from prefetchUsed: nil if the stage's query was not read so.
+func prefetchOf(used map[string][]int, view string, files []File) *viewPrefetch {
+	ids, ok := used[view]
+	if !ok {
+		return nil
+	}
+	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: ids}
+	for i, f := range files {
+		p.Sizes[i] = f.Size
+	}
+	return p
+}
+
 // stage runs one stage's tasks.
 func (e *execution) stage(ctx context.Context, s *Stage) error {
 	// The tasks, and each one's share of the split input.
@@ -338,6 +398,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
 	// What every task reads in full, and its bytes.
+	used := e.prefetchUsed(ctx, s)
 	whole := map[string]viewDef{}
 	var wholeBytes int64
 	for _, in := range s.Inputs {
@@ -345,6 +406,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		case in.Table != nil && !in.Split:
 			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
 			def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
+			def.Prefetch = prefetchOf(used, in.View, e.files[in.Table.key()])
 			whole[in.View] = def
 			for _, f := range e.files[in.Table.key()] {
 				wholeBytes += f.Size
@@ -379,7 +441,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 					bytes += f.Size
 				}
 				task.Views = append(task.Views, viewDef{Name: in.View, Columns: in.Table.Columns, Files: paths(share), Rows: rowCount(share),
-					Deletes: deletesOf(share)})
+					Deletes: deletesOf(share), Prefetch: prefetchOf(used, in.View, share)})
 			case in.Exchange != nil && in.Partitioned:
 				x := e.exchanges[in.Exchange.ID]
 				def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Exact: true}

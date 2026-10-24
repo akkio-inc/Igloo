@@ -79,6 +79,13 @@ type WorkerOptions struct {
 	// as Cores and MemoryBytes allow (taskSlots).
 	Tasks   int
 	Metrics *WorkerMetrics
+	// Prefetch, if set, is called as a task starts to run with what it
+	// reads of catalog tables' data files, when the coordinator sends that
+	// (Options.Prefetch): one Scan per view, named by the view, of the files
+	// the worker may read. It must return at once, reading the files in the
+	// background until ctx, the task's, is done. DuckDB reads the files'
+	// footers first (see readByName), then the columns.
+	Prefetch func(ctx context.Context, scans []Scan)
 }
 
 // Worker serves tasks.
@@ -419,6 +426,11 @@ func (w *Worker) fail(rw http.ResponseWriter, status int, te *taskErr) {
 // Parquet file, whose path it returns; a shuffle task writes it to object
 // storage instead, one directory per partition, and lists the files.
 func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult, error) {
+	if w.opts.Prefetch != nil {
+		if scans := w.prefetchScans(req); len(scans) > 0 {
+			w.opts.Prefetch(ctx, scans)
+		}
+	}
 	conn, err := w.opts.Engine.Connect(ctx)
 	if err != nil {
 		return "", nil, err
@@ -886,6 +898,34 @@ type schemaNode struct {
 
 // maxFooters bounds the data files whose footers a worker remembers.
 const maxFooters = 10000
+
+// prefetchScans returns what a task reads of catalog tables' data files,
+// for WorkerOptions.Prefetch: its views that the coordinator described for
+// prefetching, with the files the worker may read.
+func (w *Worker) prefetchScans(req *taskRequest) []Scan {
+	var scans []Scan
+	for _, v := range req.Views {
+		p := v.Prefetch
+		if p == nil || v.Exact || len(p.Sizes) != len(v.Files) {
+			continue
+		}
+		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used)}
+		for i, f := range v.Files {
+			if w.allowed(f) {
+				sc.Files = append(sc.Files, File{Path: f, Size: p.Sizes[i]})
+			}
+		}
+		for _, c := range v.Columns {
+			if slices.Contains(p.Used, c.ID) {
+				sc.Columns = append(sc.Columns, c.Name)
+			}
+		}
+		if len(sc.Files) > 0 {
+			scans = append(scans, sc)
+		}
+	}
+	return scans
+}
 
 // readByName reports whether a view's files can be read by column name,
 // and refuses files without field IDs, or that nest a column otherwise

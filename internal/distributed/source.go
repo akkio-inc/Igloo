@@ -79,6 +79,8 @@ type Iceberg struct {
 	mu    sync.Mutex
 	files map[string][]File
 	order []string
+	// cached counts the files of the snapshots kept.
+	cached int
 	// tables are recently loaded tables, for deciding.
 	tables map[string]loadedTable
 }
@@ -92,8 +94,14 @@ type loadedTable struct {
 // statement is distributed.
 const tableTTL = 10 * time.Second
 
-// maxCachedSnapshots bounds the snapshots whose file lists are kept.
-const maxCachedSnapshots = 256
+// maxCachedSnapshots and maxCachedFiles bound the snapshots whose file
+// lists are kept, and their files: a table of 100,000 files committed to
+// every minute would otherwise keep 256 lists of it, gigabytes, once a
+// Scanner lists the tables of every statement.
+const (
+	maxCachedSnapshots = 256
+	maxCachedFiles     = 1 << 20
+)
 
 // NewIceberg reads tables through cat.
 func NewIceberg(cat *catalog.Client) *Iceberg {
@@ -264,7 +272,9 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	if _, ok := s.files[key]; !ok {
 		s.files[key] = files
 		s.order = append(s.order, key)
-		if len(s.order) > maxCachedSnapshots {
+		s.cached += len(files)
+		for len(s.order) > maxCachedSnapshots || s.cached > maxCachedFiles && len(s.order) > 1 {
+			s.cached -= len(s.files[s.order[0]])
 			delete(s.files, s.order[0])
 			s.order = s.order[1:]
 		}

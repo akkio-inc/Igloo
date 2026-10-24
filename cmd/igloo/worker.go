@@ -155,7 +155,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 		Source: source, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
 		Warehouse: cfg.Storage.Root(), Threads: threads, Metrics: distributed.NewMetrics(reg),
 		MemoryBytes: eng.MemoryLimit(ctx), Threshold: cfg.Workers.Threshold, Storage: distributed.NewStorage(files),
-		LocalExchanges: cfg.Workers.Exchanges == "local",
+		LocalExchanges: cfg.Workers.Exchanges == "local", Prefetch: cfg.Prefetch.Enabled,
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, StartTimeout: cfg.Workers.StartTimeout,

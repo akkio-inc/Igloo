@@ -326,13 +326,21 @@ func serve() error {
 		defer closeRooms()
 	}
 
+	// The catalog's tables as Igloo plans reads of them: their metadata and
+	// data files, loaded once for distributed execution and for listing a
+	// statement's scans ahead of DuckDB (distributed.Scanner) alike.
+	var tables *distributed.Iceberg
+	if cat != nil {
+		tables = distributed.NewIceberg(cat)
+	}
+
 	// Statements that read large tables run in parts on workers.
 	var dist *distributed.Coordinator
 	if len(cfg.Workers.Addresses) > 0 {
 		if cat == nil {
 			return errors.New("IGLOO_WORKERS needs IGLOO_CATALOG_URI")
 		}
-		if dist, err = newCoordinator(ctx, cfg, distributed.NewIceberg(cat), eng, reg, log); err != nil {
+		if dist, err = newCoordinator(ctx, cfg, tables, eng, reg, log); err != nil {
 			return err
 		}
 		defer dist.Close() //nolint:errcheck

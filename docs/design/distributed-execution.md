@@ -385,6 +385,17 @@ as `NULL` or as the old field's values, so such a file, like one whose
 nested fields have no IDs, makes the worker refuse the task, and the
 statement runs on the coordinator.
 
+With the prefetcher on, each task's view of a table also carries its
+files' sizes and the field IDs of the columns the fragment may read: those
+it names, or every column through a star whose columns the result needs.
+The worker hands them to the prefetcher as the task starts, so that it
+reads those columns' chunks into the read cache ahead of DuckDB. For a
+statement that runs on one machine, `distributed.Scanner` lists the same
+before it runs: each table's current snapshot, its data files in the order
+DuckDB's Iceberg scan reads them (the manifest list's, then each
+manifest's) and the columns. Neither prunes files by the statement's
+filters yet; a scan says whether a `WHERE` clause names its columns.
+
 Column types Parquet would change (HUGEINT, INTERVAL, TIME WITH TIME ZONE)
 cross as text and are cast back. The coordinator then runs the rest of the
 statement on the session's own connection, with the part replaced by a

@@ -92,6 +92,13 @@ branches and tags:
   writes Parquet position delete files scoped to one data file with it set,
   as for Spark's deletes, and those are read as any position delete file.
 
+- `table/scanner.go`, `collectManifestEntries`: a scan's files are listed in
+  the manifest list's order, then each manifest's. iceberg-go opens the
+  manifests concurrently and listed each one's files as it finished, in a
+  different order on every call. Igloo's prefetcher reads files ahead of
+  DuckDB in this order, which is the order DuckDB's own Iceberg scan reads
+  them in.
+
 - `table/snapshot_producers.go` and `table/igloo_partition_schema.go`
   (new): the manifests a commit writes, for the files it adds, removes or
   keeps, take their partition type from a schema that has every column

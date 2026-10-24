@@ -490,7 +490,12 @@ func (scan *Scan) collectManifestEntries(
 
 	partitionEvaluators := newKeyDefaultMapWrapErr(scan.buildPartitionEvaluator)
 
-	for _, mf := range manifestList {
+	// Igloo: the entries are kept in the manifest list's order, then each
+	// manifest's, rather than in the order the manifests finish opening, so
+	// that a scan's files are listed in the order DuckDB's own Iceberg scan
+	// reads them.
+	perManifest := make([][]iceberg.ManifestEntry, len(manifestList))
+	for i, mf := range manifestList {
 		if !scan.checkSequenceNumber(minSeqNum, mf) {
 			continue
 		}
@@ -505,25 +510,7 @@ func (scan *Scan) collectManifestEntries(
 			if err != nil {
 				return err
 			}
-
-			for _, e := range manifestEntries {
-				df := e.DataFile()
-				switch df.ContentType() {
-				case iceberg.EntryContentData:
-					entries.addDataEntry(e)
-				case iceberg.EntryContentPosDeletes:
-					if isDeletionVector(e.DataFile()) {
-						entries.addDVEntry(e)
-					} else {
-						entries.addPositionalDeleteEntry(e)
-					}
-				case iceberg.EntryContentEqDeletes:
-					entries.addEqualityDeleteEntry(e)
-				default:
-					return fmt.Errorf("%w: unknown DataFileContent type (%s): %s",
-						ErrInvalidMetadata, df.ContentType(), e)
-				}
-			}
+			perManifest[i] = manifestEntries
 
 			return nil
 		})
@@ -531,6 +518,27 @@ func (scan *Scan) collectManifestEntries(
 
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	for _, manifestEntries := range perManifest {
+		for _, e := range manifestEntries {
+			df := e.DataFile()
+			switch df.ContentType() {
+			case iceberg.EntryContentData:
+				entries.addDataEntry(e)
+			case iceberg.EntryContentPosDeletes:
+				if isDeletionVector(e.DataFile()) {
+					entries.addDVEntry(e)
+				} else {
+					entries.addPositionalDeleteEntry(e)
+				}
+			case iceberg.EntryContentEqDeletes:
+				entries.addEqualityDeleteEntry(e)
+			default:
+				return nil, fmt.Errorf("%w: unknown DataFileContent type (%s): %s",
+					ErrInvalidMetadata, df.ContentType(), e)
+			}
+		}
 	}
 
 	return entries, nil
