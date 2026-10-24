@@ -956,7 +956,7 @@ func (w *Worker) prefetchScans(req *taskRequest) []Scan {
 		if p == nil || len(p.Sizes) != len(v.Files) {
 			continue
 		}
-		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used), Whole: p.Whole}
+		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used), Whole: p.Whole, Filtered: p.Filtered}
 		for i, f := range v.Files {
 			if w.allowed(f) {
 				sc.Files = append(sc.Files, File{Path: f, Size: p.Sizes[i]})

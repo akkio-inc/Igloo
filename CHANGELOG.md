@@ -607,6 +607,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- Workers read ahead of a filtered scan of a task's table at most 256 MiB,
+  as the replica does of its own: tasks did not say their part filters the
+  table, so workers read ahead every row group of the columns it reads,
+  however many of them DuckDB then skipped by their statistics.
 - `count(DISTINCT x) FILTER (WHERE ...)`, and `sum`, `avg`, `min` and
   `max` over `DISTINCT` values with a `FILTER`, run distributed: the
   planner writes them as `count(DISTINCT CASE WHEN ... THEN x END)`, which

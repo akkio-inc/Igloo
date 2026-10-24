@@ -332,9 +332,10 @@ func TestFilesInManifestOrder(t *testing.T) {
 }
 
 // With prefetching on, every task's view of a catalog table carries its
-// files' sizes and the columns its query reads, and of an exchange its
-// files' sizes, read whole, and the worker hands them to its prefetcher as
-// the task starts. With it off, the prefetcher hears of nothing.
+// files' sizes, the columns its query reads and whether it filters them,
+// and of an exchange its files' sizes, read whole, and the worker hands
+// them to its prefetcher as the task starts. With it off, the prefetcher
+// hears of nothing.
 func TestPrefetchTasks(t *testing.T) {
 	h := newHarness(t, 0.01, 4, 2)
 	var mu sync.Mutex
@@ -376,7 +377,7 @@ func TestPrefetchTasks(t *testing.T) {
 			continue
 		}
 		if !slices.Equal(sc.FieldIDs, ids(lineitem, "l_quantity", "l_returnflag")) ||
-			strings.Join(sc.Columns, ",") != "l_quantity,l_returnflag" {
+			strings.Join(sc.Columns, ",") != "l_quantity,l_returnflag" || sc.Filtered {
 			t.Errorf("scan %+v", sc)
 		}
 		files = append(files, sc.Files...)
@@ -411,14 +412,15 @@ func TestPrefetchTasks(t *testing.T) {
 				}
 				continue
 			}
+			// Only lineitem's is filtered, which DuckDB may read less of.
 			if strings.Contains(f.Path, "/orders/") {
 				tables["orders"] = true
-				if !slices.Equal(sc.FieldIDs, ids(h.tables["orders"], "o_orderkey", "o_orderpriority")) {
+				if !slices.Equal(sc.FieldIDs, ids(h.tables["orders"], "o_orderkey", "o_orderpriority")) || sc.Filtered {
 					t.Errorf("orders scan %+v", sc)
 				}
 			} else if strings.Contains(f.Path, "/lineitem/") {
 				tables["lineitem"] = true
-				if !slices.Equal(sc.FieldIDs, ids(lineitem, "l_orderkey", "l_shipmode")) {
+				if !slices.Equal(sc.FieldIDs, ids(lineitem, "l_orderkey", "l_shipmode")) || !sc.Filtered {
 					t.Errorf("lineitem scan %+v", sc)
 				}
 			} else {

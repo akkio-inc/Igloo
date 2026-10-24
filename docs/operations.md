@@ -533,9 +533,12 @@ from local disk. Against an object store with S3's latency, a cold scan on
   and `INSERT ... SELECT` that read catalog tables, other than tables that
   policies or a clean room protect, when the statement runs on the replica:
   for a statement [workers](distributed-execution.md) run, they read ahead
-  each task's files, and the replica reads nothing ahead. The scans are those distributed execution would
-  plan; until filters prune their file lists, a scan of a table the
-  statement filters reads ahead at most 256 MiB. A session turns it off
+  each task's files, and the replica reads nothing ahead. Workers learn
+  what a task reads from the replica, so they read ahead only when the
+  replica has `IGLOO_PREFETCH` on too. The scans are those distributed
+  execution would plan; until filters prune their file lists, a scan of a
+  table the statement filters, or a task's of a table its part filters,
+  reads ahead at most 256 MiB. A session turns it off
   for itself with `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
 - It needs the read cache, on a filesystem with extended attributes; it
   writes blocks as the cache's extension does. At startup the log says

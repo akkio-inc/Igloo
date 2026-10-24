@@ -338,11 +338,12 @@ func (e *execution) exchangeRows(s *Stage) int64 {
 	return most
 }
 
-// prefetchUsed returns, with prefetching on (Options.Prefetch), the field
-// IDs of the columns the stage's query may read of each catalog table it
-// reads, by view name; nil with it off, or for a query the walk cannot
-// read, whose tasks are then not prefetched.
-func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string][]int {
+// prefetchUsed returns, with prefetching on (Options.Prefetch), what the
+// stage's query reads of each catalog table it reads, by view name: the
+// field IDs of the columns it may read, and whether a WHERE clause names
+// one; nil with it off, or for a query the walk cannot read, whose tasks
+// are then not prefetched.
+func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string]Scan {
 	if !e.co.opts.Prefetch {
 		return nil
 	}
@@ -357,13 +358,13 @@ func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string][]int
 		e.co.log.Debug("could not tell what a stage reads, for prefetching", "query", e.qid, "stage", s.String(), "err", err)
 		return nil
 	}
-	used := map[string][]int{}
+	used := map[string]Scan{}
 	for _, key := range w.order {
 		u := w.uses[key]
 		in := env[strings.ToLower(u.name)]
 		var sc Scan
 		w.read(&sc, in.Table.Columns, u)
-		used[in.View] = append([]int{}, sc.FieldIDs...)
+		used[in.View] = Scan{FieldIDs: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered}
 	}
 	return used
 }
@@ -386,12 +387,12 @@ func (stageViews) ViewDefinition(context.Context, []string) (*ViewDefinition, bo
 
 // prefetchOf returns what a worker's prefetcher needs of a view of files,
 // with used from prefetchUsed: nil if the stage's query was not read so.
-func prefetchOf(used map[string][]int, view string, files []File) *viewPrefetch {
-	ids, ok := used[view]
+func prefetchOf(used map[string]Scan, view string, files []File) *viewPrefetch {
+	sc, ok := used[view]
 	if !ok {
 		return nil
 	}
-	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: ids}
+	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered}
 	for i, f := range files {
 		p.Sizes[i] = f.Size
 	}

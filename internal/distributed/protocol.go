@@ -116,6 +116,10 @@ type viewPrefetch struct {
 	// exchange's are.
 	Used  []int `json:"used"`
 	Whole bool  `json:"whole,omitempty"`
+	// Filtered says the task's query filters the view by one of its
+	// columns, so DuckDB may skip row groups: the prefetcher reads less of
+	// it ahead (see Scan.Filtered).
+	Filtered bool `json:"filtered,omitempty"`
 }
 
 // fileDeletes are the delete files of one data file of a view.
