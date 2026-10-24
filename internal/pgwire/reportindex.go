@@ -342,35 +342,40 @@ func (s *Server) hybridBitmaps(ctx context.Context, sess *session, spec *reportS
 	return nil
 }
 
-// bitmapOf is the bitmap of a hybrid's cohort i as its statement reads
-// it: from its variable, once hybridBitmaps computed them, or else (a
-// probe) its SELECT. A variable that is not there gives a BLOB that is not
-// a bitmap, which rb_contains refuses, rather than NULL, which it takes
-// for no members.
+// bitmapOf is the bitmap of a hybrid's cohort i as its scan reads it: its
+// variable, once hybridBitmaps computed them, or else (a probe) its
+// SELECT. It is a variable alone, which DuckDB binds to its value (and the
+// planner hands workers as a value of its own; see distributed's computed
+// values), and which rb_contains reads once.
 func (s *Server) bitmapOf(spec *reportSpec, plan *reportIndexPlan, i int) string {
 	if i >= len(plan.bitmaps) {
 		return "(" + s.cohortBitmap(spec, plan, i) + ")"
 	}
-	return "coalesce(getvariable(" + quoteLiteral(plan.bitmaps[i].name) + "), CAST('igloo: this statement''s bitmap is gone' AS BLOB))"
+	return "getvariable(" + quoteLiteral(plan.bitmaps[i].name) + ")"
 }
 
 // cohortOf is the SELECT of a hybrid's cohort i's bitmap for its people:
-// its variable, under the condition that its latest_from still reads as it
-// did.
+// its variable, under the conditions that the variable is there, and that
+// its latest_from still reads as it did. A variable that is not there
+// would read as NULL, which rb_contains takes for no members: the
+// statement fails instead, when it runs. (A BLOB in its place that is not
+// a bitmap would fail when anything binds the statement, the planner's
+// descriptions of its parts included, before workers have their values.)
 func (s *Server) cohortOf(spec *reportSpec, plan *reportIndexPlan, i int) string {
 	if i >= len(plan.bitmaps) {
 		return s.cohortBitmap(spec, plan, i)
 	}
 	b, bm := plan.bitmaps[i], s.bitmapOf(spec, plan, i)
+	when := bm + " IS NULL THEN error(" + quoteLiteral("igloo: the bitmap of cohort "+spec.Cohorts[i].Label+" is gone; run the statement again") + ")"
 	v := spec.Cohorts[i].Version
 	if v == nil || v.LatestFrom == nil {
-		return "SELECT " + bm + " AS bm"
+		return "SELECT CASE WHEN " + when + " ELSE " + bm + " END AS bm"
 	}
 	same := "(" + latestOf(v) + ") IS NULL"
 	if !b.null {
 		same = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
 	}
-	return "SELECT CASE WHEN " + same + " THEN " + bm + " ELSE error(" +
+	return "SELECT CASE WHEN " + when + " WHEN " + same + " THEN " + bm + " ELSE error(" +
 		quoteLiteral("igloo: the latest version of cohort "+spec.Cohorts[i].Label+" changed while the statement ran; run it again") + ") END AS bm"
 }
 
