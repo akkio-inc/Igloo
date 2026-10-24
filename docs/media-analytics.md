@@ -531,12 +531,11 @@ whose member is `IN (SELECT ...)` one, and count:
 
 Measures that count rows (`count(*)`, sums, averages, the metric) are
 mapped only where a member is once in each cohort, as the API's cohorts
-are. Windows, joins other than to the cohort, `HAVING`, `GROUPING SETS`,
-filters on the cohort's label and values grouped by as a type whose text is
-not one per value are left as written; so, until the API reads them as the
-translation does, are the elements of lists that the translation of
-Snowflake's `FLATTEN` reads, which reads elements that look like JSON as
-JSON.
+are. The elements of a list that the translation of Snowflake's `FLATTEN`
+reads, which reads elements that look like JSON as JSON, are a dimension
+with `"element_text": "json"`. Windows, joins other than to the cohort,
+`HAVING`, `GROUPING SETS`, filters on the cohort's label and values grouped
+by as a type whose text is not one per value are left as written.
 
 ## Security
 

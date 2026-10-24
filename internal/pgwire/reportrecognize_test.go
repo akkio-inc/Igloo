@@ -431,3 +431,36 @@ SELECT * FROM C`
 	}
 	mustExec(t, rs.admin, "COMMIT")
 }
+
+// TestReportRecognitionSnowflakeElements: the translation of a FLATTEN of
+// a list in each object of a FLATTEN reads elements that look like JSON as
+// JSON, which recognition maps to element_text "json". The tables and
+// names are the test's own: panels of people in waves, and their tags.
+func TestReportRecognitionSnowflakeElements(t *testing.T) {
+	rs := startReportRecognitionServer(t)
+	conn := rs.admin
+	for _, q := range []string{
+		"CREATE TABLE lake.public.panel AS SELECT 'p' || (i * 3 % 70) AS person_id, CASE WHEN i % 4 = 0 THEN 'north' ELSE 'south' END AS panel_id, " +
+			"CAST(1 + i % 2 AS INTEGER) AS wave FROM range(160) r(i)",
+		"CREATE TABLE lake.public.panel_waves AS SELECT * FROM (VALUES ('north', 1), ('north', 2), ('south', 1)) v(panel_id, wave)",
+	} {
+		mustExec(t, conn, q)
+	}
+	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+	sql := `WITH NORTH AS (SELECT PERSON_ID FROM PANEL WHERE panel_id = 'north' AND wave = (SELECT MAX(wave) FROM PANEL_WAVES WHERE panel_id = 'north')),
+SOUTH AS (SELECT PERSON_ID FROM PANEL WHERE panel_id = 'south'),
+NORTH_PEOPLE AS (SELECT DISTINCT PERSON_ID AS PERSON_ID FROM NORTH AS NORTH WHERE NOT PERSON_ID IS NULL),
+SOUTH_PEOPLE AS (SELECT DISTINCT PERSON_ID AS PERSON_ID FROM SOUTH AS SOUTH WHERE NOT PERSON_ID IS NULL),
+PANELS AS (SELECT 'NORTH' AS PANEL, NORTH_PEOPLE.PERSON_ID AS PERSON_ID FROM NORTH_PEOPLE AS NORTH_PEOPLE
+  UNION ALL SELECT 'SOUTH' AS PANEL, SOUTH_PEOPLE.PERSON_ID AS PERSON_ID FROM SOUTH_PEOPLE AS SOUTH_PEOPLE),
+TAG_COUNTS AS (SELECT 'TAGGING' AS FAMILY, CAST(GET_PATH(D.VALUE, 'KIND') AS TEXT) AS KIND, CAST(ITEM.VALUE AS TEXT) AS NAME, P.PANEL AS PANEL,
+  COUNT(DISTINCT TG.PERSON_ID) AS PEOPLE, COUNT(*) AS TIMES
+  FROM TAGGED AS TG INNER JOIN PANELS AS P ON P.PERSON_ID = TG.PERSON_ID
+  CROSS JOIN LATERAL FLATTEN(INPUT => [OBJECT_CONSTRUCT('KIND', 'TAG', 'ITEMS', TG.TAGS), OBJECT_CONSTRUCT('KIND', 'ANY', 'ITEMS', ['ANY_TAG'])])
+    AS D(SEQ, KEY, PATH, INDEX, VALUE, THIS)
+  CROSS JOIN LATERAL FLATTEN(INPUT => GET_PATH(D.VALUE, 'ITEMS')) AS ITEM(SEQ, KEY, PATH, INDEX, VALUE, THIS)
+  WHERE NOT CAST(ITEM.VALUE AS TEXT) IS NULL AND TRIM(CAST(ITEM.VALUE AS TEXT)) <> ''
+  GROUP BY CAST(GET_PATH(D.VALUE, 'KIND') AS TEXT), CAST(ITEM.VALUE AS TEXT), P.PANEL)
+SELECT * FROM TAG_COUNTS`
+	rs.checkRecognized(t, conn, "tags in Snowflake's dialect", sql, 1)
+}

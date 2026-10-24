@@ -37,10 +37,12 @@ import (
 //   - dimensions: a column grouped by; an UNNEST of a list of struct
 //     literals (or the translation's CASE over range(n) of them), each
 //     naming its dimension with constants and giving a value (a column, a
-//     map of a boolean that keeps NULL, a constant or, natively, the
-//     elements of a list) and optionally a metric;
-//   - filters: literal conditions on the source, TRIM(value) <> ” (with or
-//     without value IS NOT NULL), comparisons of a dimension's metric;
+//     map of a boolean that keeps NULL, a constant or the elements of a
+//     list, which the translation reads as JSON text where they look like
+//     JSON, as the API's element_text "json" does) and optionally a metric;
+//   - filters: literal conditions on the source, TRIM(value) compared
+//     unequal to the empty string (with or without value IS NOT NULL),
+//     comparisons of a dimension's metric;
 //   - measures: count(DISTINCT member), count(*), sum and avg of a source
 //     column (or of its coalesce with a literal), count(DISTINCT member,
 //     column), sum, avg and count of the metric, and expressions of them;
@@ -1620,6 +1622,11 @@ type countingSelect struct {
 	elemTable   string
 	elemField   string // the struct field the elements come from
 	elemInput   jnode  // the list the elements come from, when not a struct field
+	// elemText is the API's element_text for the elements, "json" where the
+	// Snowflake translation reads elements that look like JSON as JSON, and
+	// elemJSON the struct field of its other part of the list.
+	elemText string
+	elemJSON string
 
 	member   string
 	measures map[string]map[string]any
@@ -1816,10 +1823,10 @@ func (c *countingSelect) translatedSource(sub jnode) error {
 		return notReport("a subquery relation that is not a struct expansion")
 	}
 	star, cs := sel[0].(jnode), sel[1].(jnode)
+	if classOf(star) == "STAR" && isFunc(cs, "unnest") && c.src == nil {
+		return c.translatedElements(sub, q, star, cs)
+	}
 	if classOf(star) != "STAR" || classOf(cs) != "CASE" || strOf(cs, "alias") == "" {
-		if classOf(star) == "STAR" && isFunc(cs, "unnest") {
-			return notReport("list elements as the Snowflake translation reads them (JSON-looking elements are read as JSON)")
-		}
 		return notReport("a subquery relation that is not a struct expansion")
 	}
 	rels, err := flattenFrom(nodeOf(q, "from_table"))
@@ -1877,6 +1884,80 @@ func (c *countingSelect) translatedSource(sub jnode) error {
 	// The base's own alias names its columns inside; outside, the
 	// subquery's alias does, with the same names.
 	return nil
+}
+
+// translatedElements reads the Snowflake translation's FLATTEN of a list
+// in each entry of a struct FLATTEN: (SELECT x.*, unnest(sf_parts_strings(
+// x.s.l, x.s.j, 'BOTH')) AS e FROM (<the struct FLATTEN>) AS x) AS x, whose
+// elements are read as JSON text where they look like JSON (sf_elem_string),
+// as the API's element_text "json" reads them.
+func (c *countingSelect) translatedElements(sub, q, star, un jnode) error {
+	inner := nodeOf(q, "from_table")
+	alias := strings.ToUpper(strOf(sub, "alias"))
+	if inner == nil || typeOf(inner) != "SUBQUERY" || strings.ToUpper(strOf(inner, "alias")) != alias ||
+		strings.ToUpper(strOf(star, "relation_name")) != alias || strOf(un, "alias") == "" {
+		return notReport("elements of a subquery relation that is not a struct expansion")
+	}
+	if err := c.translatedSource(inner); err != nil {
+		return err
+	}
+	args := childrenOf(un)
+	if len(args) != 1 || !isFunc(args[0], "sf_parts_strings") || len(childrenOf(args[0])) != 3 {
+		return notReport("elements other than the translation's sf_parts_strings")
+	}
+	parts := childrenOf(args[0])
+	l, j := c.structField(parts[0]), c.structField(parts[1])
+	mode, _ := constValue(parts[2]).(string)
+	if l == "" || j == "" || !strings.HasPrefix(l, "_SF_L") || j != "_SF_J"+strings.TrimPrefix(l, "_SF_L") ||
+		mode != "BOTH" && mode != "ARRAY" {
+		return notReport("elements of other parts of a struct")
+	}
+	c.elemCol, c.elemTable, c.elemField, c.elemJSON, c.elemText = strings.ToUpper(strOf(un, "alias")), alias, l, j, "json"
+	return nil
+}
+
+// translatedItems returns the list a translated entry's elements come
+// from: a source column of strings, a list literal, or nil for none.
+func (c *countingSelect) translatedItems(fields map[string]jnode) (jnode, error) {
+	l, j := foldReport(fields[c.elemField]), foldReport(fields[c.elemJSON])
+	if l == nil || isNullConst(l) {
+		if j == nil || isNullConst(j) {
+			return nil, nil // no elements
+		}
+		return nil, notReport("elements of something other than a list")
+	}
+	if classOf(l) == "CAST" {
+		l = nodeOf(l, "child")
+	}
+	if classOf(j) == "CAST" {
+		j = nodeOf(j, "child")
+	}
+	if isFunc(l, "list_value") && (j == nil || isNullConst(j)) {
+		for _, x := range childrenOf(l) {
+			v, ok := constValue(x).(string)
+			if !isConstant(x) || !ok || strings.HasPrefix(v, "{") || strings.HasPrefix(v, "[") {
+				return nil, notReport("a list literal of other than plain strings")
+			}
+		}
+		return l, nil
+	}
+	if isFunc(l, "sf_list_part") && isFunc(j, "sf_other_part") && len(childrenOf(l)) == 1 && len(childrenOf(j)) == 1 &&
+		exprKey(childrenOf(l)[0]) == exprKey(childrenOf(j)[0]) {
+		col := childrenOf(l)[0]
+		name := c.sourceColumn(col)
+		if name == "" {
+			return nil, notReport("elements of something other than a source column")
+		}
+		t, err := c.columnType(name)
+		if err != nil {
+			return nil, err
+		}
+		if t != "VARCHAR[]" {
+			return nil, notReport("elements of %s, of type %s, as the translation reads them", name, t)
+		}
+		return col, nil
+	}
+	return nil, notReport("elements the translation reads otherwise")
 }
 
 func structFields(n jnode) (map[string]jnode, error) {
@@ -1987,6 +2068,8 @@ func (c *countingSelect) relationOf(p []string) string {
 		}
 	case 2:
 		switch {
+		case c.elemCol != "" && p[0] == c.elemTable && p[1] == c.elemCol:
+			return "element"
 		case c.src != nil && p[0] == c.src.alias:
 			if c.structRel != "" && p[1] == c.structCol {
 				return "struct"
@@ -2282,6 +2365,13 @@ func (c *countingSelect) entryList() ([]reportEntry, error) {
 			continue
 		}
 		items, ok := fields[c.elemField]
+		if c.elemText != "" {
+			var err error
+			if items, err = c.translatedItems(fields); err != nil {
+				return nil, err
+			}
+			ok = items != nil
+		}
 		if c.elemField == "" || !ok || isNullConst(items) {
 			continue // UNNEST(NULL) gives no rows
 		}
@@ -2458,6 +2548,11 @@ func (c *countingSelect) counts() (jnode, string, error) {
 			return nil, "", err
 		}
 		if vs == nil {
+			// A NULL value: its rows count in the NULL value unless the
+			// blank check drops them.
+			if !skipBlank {
+				return nil, "", notReport("a dimension whose value is NULL, kept")
+			}
 			continue
 		}
 		mcol := ""
@@ -2653,7 +2748,11 @@ func (c *countingSelect) exprType(n jnode) (string, error) {
 			return fmt.Sprintf("DECIMAL(%v,%v)", info["width"], info["scale"]), nil
 		}
 		if id == "LIST" {
-			return "?", nil
+			child := strings.ToUpper(strOf(nodeOf(t, "type_info", "child_type"), "id"))
+			if child == "" || child == "LIST" || child == "DECIMAL" || child == "STRUCT" || child == "MAP" {
+				return "?", nil
+			}
+			return child + "[]", nil
 		}
 		return id, nil
 	case isFunc(n, "sf_fields_string", "upper", "lower", "trim", "concat"):
@@ -2958,6 +3057,9 @@ func (c *countingSelect) valueSpec(n jnode) (map[string]any, error) {
 	case classOf(s) == elementMarkerClass:
 		of, _ := s["of"].(jnode)
 		if col := c.sourceColumn(of); col != "" {
+			if c.elemText != "" {
+				return map[string]any{"elements": col, "element_text": c.elemText}, nil
+			}
 			return map[string]any{"elements": col}, nil
 		}
 		return nil, notReport("elements of something other than a source column")
