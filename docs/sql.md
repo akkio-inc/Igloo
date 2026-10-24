@@ -441,6 +441,19 @@ DROP ID DOMAIN people;
   which leaves them out. Igloo's Iceberg REST endpoint gives member tables
   to admins only, and a clean room's dataset of one has the columns
   without the ids.
+- Igloo fills the ids. A write to a member table (`INSERT`, `COPY INTO`,
+  `CREATE [OR REPLACE] TABLE ... AS` of a member table's name) writes the
+  ids of the values the dictionary has as it writes the rows, and before
+  the statement returns gives the values it lacks new ids and fills them
+  in. Giving new ids takes the domain's lease for as long as one append to
+  the dictionary takes, so writers of tables in one domain wait for each
+  other only for that, and those of different domains never. A writer that
+  does not get the lease within 5 seconds, writes inside a transaction
+  block, other engines' writes and rows whose member column an `UPDATE`
+  changed keep `NULL` ids until maintenance fills them, at the start of its
+  next pass. Counts through ids treat a table with such rows as not
+  mapped, and an id is never wrong: each value has the one id its
+  dictionary entry gives it.
 - Writes to a member table keep its ids right. An `INSERT` that names no
   columns (`INSERT INTO t VALUES ...`, `INSERT INTO t SELECT ...`) names the
   table's columns other than the ids', as does a `MERGE`'s `INSERT VALUES`;
@@ -453,8 +466,11 @@ DROP ID DOMAIN people;
 - `UPDATE`, `DELETE` and `MERGE` of member tables take the forms tables
   with policies take: no `WITH` clause before them.
 - Ids are never handed out twice and stay below 2^32, the range of a 32-bit
-  bitmap. A domain that has handed out all of them hands out no more, and
-  the ids of values it has not seen stay `NULL`.
+  bitmap. A domain that has handed out all of them hands out no more, the
+  ids of values it has not seen stay `NULL`, and the log says so as an
+  error; ids never wrap. `igloo_id_domain_ids_assigned_total`,
+  `igloo_id_domain_rows_filled_total` and
+  `igloo_id_domain_assignments_skipped_total` count assignments.
 - Columns join domains only with `IGLOO_ID_DOMAINS=true`, which is off by
   default. Only admins change domains; anyone may list them.
 - A statement that counts a domain's ids, `count(DISTINCT CAST(t._igloo_id_c

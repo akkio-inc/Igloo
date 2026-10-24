@@ -688,6 +688,9 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_prefetch_bytes_total`, `igloo_prefetch_blocks_total` | | Bytes and blocks the [prefetcher](#prefetch) read ahead into the read cache |
 | `igloo_prefetch_unread_bytes_total` | | Bytes it read ahead that the scans did not read (overfetch); not counted where it cannot tell which blocks DuckDB read |
 | `igloo_prefetch_present_blocks_total`, `igloo_prefetch_errors_total` | | Blocks it found cached already, and reads ahead that failed (the scans then read the block themselves) |
+| `igloo_id_domain_ids_assigned_total` | `domain` | Ids [ID domains](sql.md#id-domains) gave new values |
+| `igloo_id_domain_rows_filled_total` | `domain` | Rows of member tables whose ids were filled in after they were written |
+| `igloo_id_domain_assignments_skipped_total` | `reason` | Assignments left to maintenance: `busy` (another writer held the domain's lease) or `exhausted` (every id below 2^32 handed out) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

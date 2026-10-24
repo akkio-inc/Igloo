@@ -208,19 +208,45 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 			_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
 		}
 	}
+	// A table of a member table's name is one too: the new one gets the
+	// columns for ids, and is filled with them (see idassign.go).
+	var (
+		ids     *idWrite
+		visible []string
+	)
+	if err == nil {
+		if ids, visible, err = s.stagedIDs(ctx, sess, c); err != nil {
+			_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		}
+	}
 	release()
 	if err != nil {
 		return 0, true, err
 	}
 
-	res, err := sess.conn.QueryContext(ctx, "INSERT INTO "+quoteName(c.staging)+"\n"+c.query, nil)
-	if err == nil {
-		rows, err = countOf(res)
+	fill := func(q string) (int64, error) {
+		res, err := sess.conn.QueryContext(ctx, q, nil)
+		if err != nil {
+			return 0, err
+		}
+		return countOf(res)
+	}
+	plain := "INSERT INTO " + quoteName(c.staging) + "\n" + c.query
+	if text, ok := s.joinedInsert(parsedInsert{target: quoteName(c.staging), columns: visible,
+		source: strings.TrimRight(c.query, "; \t\r\n")}, idMembersOf(ids)); ok {
+		rows, err = fill(text)
+		if err != nil && joinFailed(err) {
+			s.log.Debug("a new member table is filled without its ids", "table", c.target.String(), "err", err)
+			rows, err = fill(plain)
+		}
+	} else {
+		rows, err = fill(plain)
 	}
 	if err != nil {
 		dropStaging()
 		return 0, true, err
 	}
+	s.fillIDs(ctx, sess, ids)
 
 	// From here on, finish even if the client cancels: stopping between the
 	// drop and the rename would leave the table missing.
@@ -275,8 +301,18 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		if err := st.freshForRun(ctx, sess.conn); err != nil {
 			return err
 		}
-		return sess.profiled(ctx, st, func() error { return st.run(ctx, args, w) })
+		return sess.profiled(ctx, st, func() error {
+			// An INSERT into a member table writes the ids it can.
+			if done, err := s.runWithIDs(ctx, sess, st, args, w); done {
+				return err
+			}
+			return st.run(ctx, args, w)
+		})
 	})
+	if err == nil && st.ids != nil {
+		// And then those of the values that had none.
+		s.fillIDs(ctx, sess, st.ids)
+	}
 	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
 		return w.Complete(commandTag(st.stmtType, st.query, 0))
 	}

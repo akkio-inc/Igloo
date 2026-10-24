@@ -98,7 +98,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   member, with a `_igloo_id_c` column beside it for its ids. Writes keep
   the ids right: an `INSERT` that names no columns names the others, an
   `UPDATE` or `MERGE` that sets a member column sets its ids to `NULL`,
-  and a `MERGE ... UPDATE BY NAME` into a member table is refused. Counting
+  and a `MERGE ... UPDATE BY NAME` into a member table is refused. Igloo
+  fills the ids: `INSERT`, `COPY INTO` and `CREATE TABLE ... AS` write
+  those the dictionary has and give new values theirs before they return,
+  under a per-domain lease held only for the dictionary's append, and
+  maintenance fills what other writes left `NULL`. Counting
   distinct people over integers, and keeping sets of them as bitmaps, is
   what the heaviest audience reports spend their time on; the work that
   fills the ids and counts through them follows.

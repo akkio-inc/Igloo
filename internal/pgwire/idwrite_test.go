@@ -143,7 +143,10 @@ func TestMemberWrites(t *testing.T) {
 			t.Errorf("MERGE ... UPDATE BY NAME: %v", err)
 		}
 	}
-	got := strings.Join(internal("SELECT person_id, n, coalesce(CAST(_igloo_id_person_id AS VARCHAR), '-') FROM lake.public.people ORDER BY n, person_id"), " ")
+	// Rows whose value changed, and new ones, have no id or one Igloo gave
+	// them since (below 100), never the one they had.
+	got := strings.Join(internal("SELECT person_id, n, CASE WHEN _igloo_id_person_id >= 100 THEN CAST(_igloo_id_person_id AS VARCHAR) ELSE '-' END "+
+		"FROM lake.public.people ORDER BY n, person_id"), " ")
 	want := "q1|1|- q2|2|- p4|4|104 s5|5|- p6|6|106 p7|7|107 p8|8|108 p9|9|109 s10|10|- s11|11|- " +
 		"p20|20|- p21|21|- p22|22|- p30|30|- p31|31|- p33|33|- q3|33|- p0|100|100"
 	if got != want {

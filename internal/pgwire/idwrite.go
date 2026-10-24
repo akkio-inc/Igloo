@@ -6,9 +6,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -34,32 +36,34 @@ import (
 // an id is never wrong.
 
 // memberWrites rewrites query, as described above, when it writes a table
-// with member columns. The caller holds the catalog lock exclusively.
-func (s *Server) memberWrites(ctx context.Context, sess *session, query string) (string, error) {
+// with member columns. For an INSERT it also returns the table and its
+// members, whose ids it then writes (see idassign.go). The caller holds the
+// catalog lock exclusively.
+func (s *Server) memberWrites(ctx context.Context, sess *session, query string) (string, *idWrite, error) {
 	if s.catalogName() == "" {
-		return query, nil
+		return query, nil, nil
 	}
 	_, names := s.memberTables(ctx)
 	if len(names) == 0 {
-		return query, nil
+		return query, nil, nil
 	}
 	kind, name, after, ok := writeTarget(query)
 	if !ok || !names[strings.ToLower(name[len(name)-1])] {
-		return query, nil
+		return query, nil, nil
 	}
 	cat, schema, table, cols, err := s.policyTable(ctx, sess, name, true)
 	if err != nil || cat != "" {
 		// Not a table of the catalog; DuckDB reports one that does not
 		// exist.
-		return query, nil
+		return query, nil, nil
 	}
 	snap := s.memberSnapshot(ctx)
 	if snap == nil {
-		return query, nil
+		return query, nil, nil
 	}
 	members := snap.TableMembers(schema, table)
 	if len(members) == 0 {
-		return query, nil
+		return query, nil, nil
 	}
 	var visible []string
 	for _, c := range cols {
@@ -67,7 +71,11 @@ func (s *Server) memberWrites(ctx context.Context, sess *session, query string) 
 			visible = append(visible, c.name)
 		}
 	}
-	return rewriteMemberWrite(query, kind, after, schema+"."+table, members, visible)
+	rewritten, err := rewriteMemberWrite(query, kind, after, schema+"."+table, members, visible)
+	if err != nil || kind != "INSERT" {
+		return rewritten, nil, err
+	}
+	return rewritten, &idWrite{schema: schema, table: table, members: idMembers(snap, schema, table)}, nil
 }
 
 // writeTarget reads the statement kind (INSERT, UPDATE or MERGE) and target
@@ -312,4 +320,28 @@ func assignedColumns(list string) []string {
 		}
 	}
 	return out
+}
+
+// prepareWithoutIDs prepares an INSERT that reads member tables as
+// policies rewrite it, reading them without their columns of ids, or
+// returns nil. DuckDB expands a member table's * with those columns, so
+// INSERT INTO t SELECT * FROM t, which names t's other columns (see
+// memberWrites), does not prepare as written, nor does an INSERT of a
+// member table's * into a table with its other columns.
+func (s *Server) prepareWithoutIDs(ctx context.Context, sess *session, user auth.User, query string, oids []uint32) *statement {
+	if _, names := s.memberTables(ctx); len(names) == 0 {
+		return nil
+	}
+	if kind, _, _, ok := writeTarget(query); !ok || kind != "INSERT" {
+		return nil
+	}
+	protected, _, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_INSERT, query, oids)
+	if err != nil || protected == query {
+		return nil
+	}
+	st, err := prepare(ctx, sess.conn, protected, oids)
+	if err != nil {
+		return nil
+	}
+	return st
 }

@@ -179,7 +179,7 @@ func TestIDDomains(t *testing.T) {
 	if got := show(admin); len(got) != 1 || !strings.Contains(got[0], "|public.people.person_id|") {
 		t.Errorf("SHOW ID DOMAINS with a member: %q", got)
 	}
-	// Writes naming their columns leave the ids to Igloo.
+	// Writes naming their columns leave the ids to Igloo, which fills them.
 	mustExec(t, admin, "INSERT INTO lake.public.people (person_id, n) VALUES ('p10', 10)")
 	internal := func(q string) []string {
 		t.Helper()
@@ -202,7 +202,7 @@ func TestIDDomains(t *testing.T) {
 		}
 		return out
 	}
-	if got := internal("SELECT count(*), count(_igloo_id_person_id) FROM lake.public.people"); len(got) != 1 || got[0] != "11|0" {
+	if got := internal("SELECT count(*), count(_igloo_id_person_id) FROM lake.public.people"); len(got) != 1 || got[0] != "11|11" {
 		t.Errorf("rows and ids: %q", got)
 	}
 	// Statements read the table as if it did not have the column, and

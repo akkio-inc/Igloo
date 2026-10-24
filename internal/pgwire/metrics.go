@@ -17,6 +17,9 @@ type Metrics struct {
 	duration *prometheus.HistogramVec
 	logins   *prometheus.CounterVec
 	reruns   prometheus.Counter
+	// ids, filled and skipped count ID domains' assignments (see
+	// idassign.go).
+	ids, filled, skipped *prometheus.CounterVec
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -43,9 +46,39 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_bitmap_reruns_total",
 			Help: "Statements counting distinct IDs in roaring bitmaps that ran out of memory for them and ran again with DuckDB's hash.",
 		}),
+		ids: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_id_domain_ids_assigned_total",
+			Help: "Ids ID domains gave new values, by domain.",
+		}, []string{"domain"}),
+		filled: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_id_domain_rows_filled_total",
+			Help: "Rows of member tables whose ids were filled in after they were written, by domain.",
+		}, []string{"domain"}),
+		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_id_domain_assignments_skipped_total",
+			Help: "Assignments of ids left to maintenance, by reason: busy (another held the domain's lease) or exhausted (every id below 2^32 handed out).",
+		}, []string{"reason"}),
 	}
-	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns)
+	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped)
 	return m
+}
+
+func (m *Metrics) idsAssigned(domain string, n int64) {
+	if m != nil && n > 0 {
+		m.ids.WithLabelValues(domain).Add(float64(n))
+	}
+}
+
+func (m *Metrics) idsFilled(domain string, n int64) {
+	if m != nil && n > 0 {
+		m.filled.WithLabelValues(domain).Add(float64(n))
+	}
+}
+
+func (m *Metrics) idAssignSkipped(reason string) {
+	if m != nil {
+		m.skipped.WithLabelValues(reason).Inc()
+	}
 }
 
 func (m *Metrics) sessionOpened(role string) {

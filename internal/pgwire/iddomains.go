@@ -445,7 +445,7 @@ func (s *Server) joinDomain(ctx context.Context, sess *session, user auth.User, 
 	if old := cur.MemberOf(schema, table, col.name); old != nil && old.Domain != d.Name {
 		return fmt.Errorf("%w: %s is a member of ID domain %s (UNSET ID DOMAIN first)", iddomain.ErrInvalid, old, old.Domain)
 	}
-	if err := s.ddl.JoinIDDomain(ctx, schema, table, col.name, iddomain.HiddenColumn(col.name), d.Name, d.Generation); err != nil {
+	if _, err := s.ddl.JoinIDDomain(ctx, schema, table, col.name, iddomain.HiddenColumn(col.name), d.Name, d.Generation); err != nil {
 		switch {
 		case errors.Is(err, ddl.ErrNotFound):
 			return pgerror.WithCode(err, codes.UndefinedTable)

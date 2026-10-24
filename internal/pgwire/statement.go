@@ -80,6 +80,9 @@ type statement struct {
 	names []string
 	// ran says the statement has run, for freshForRun.
 	ran bool
+	// ids is set for an INSERT into a table with columns in ID domains,
+	// which writes their ids too (see idassign.go).
+	ids *idWrite
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

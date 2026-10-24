@@ -449,6 +449,10 @@ func (s *Server) copyInto(ctx context.Context, sess *session, user auth.User, c 
 			}
 		}
 		loadErr = s.loadFiles(ctx, sess, user, todo, onError)
+		if loadErr == nil {
+			// Then the ids of the values that had none, in a member table.
+			s.fillIDs(ctx, sess, s.loadIDs(ctx, target))
+		}
 	}
 	finish, unloaded := finished(todo, loadErr)
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -1050,6 +1054,10 @@ func (s *Server) execChecked(ctx context.Context, sess *session, user auth.User,
 		return 0, err
 	}
 	defer st.close() //nolint:errcheck
+	// A load into a member table writes the ids it can (see idassign.go).
+	if n, done, err := s.execWithIDs(ctx, sess, st, nil); done {
+		return n, err
+	}
 	res, err := st.stmt.ExecContext(ctx, nil)
 	if err != nil {
 		return 0, err

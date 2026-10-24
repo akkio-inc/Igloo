@@ -11,20 +11,22 @@ import (
 // JoinIDDomain makes column of the catalog's table schema.name a member of
 // ID domain domain (see catalog.JoinIDDomain), with hidden the column that
 // holds its ids, and reads the table's metadata again so the catalog views
-// show it.
-func (m *Manager) JoinIDDomain(ctx context.Context, schema, name, column, hidden, domain string, generation int) error {
+// show it, if it changed it. It returns the table's current snapshot.
+func (m *Manager) JoinIDDomain(ctx context.Context, schema, name, column, hidden, domain string, generation int) (int64, error) {
 	if m.IsView(schema, name) {
-		return fmt.Errorf("%s.%s is a view; only tables' columns join ID domains", schema, name)
+		return 0, fmt.Errorf("%s.%s is a view; only tables' columns join ID domains", schema, name)
 	}
-	err := m.cat.JoinIDDomain(ctx, schema, name, column, hidden, domain, generation)
+	changed, snapshot, err := m.cat.JoinIDDomain(ctx, schema, name, column, hidden, domain, generation)
 	if errors.Is(err, icecat.ErrNoSuchTable) {
-		return fmt.Errorf("table %q %w", name, ErrNotFound)
+		return 0, fmt.Errorf("table %q %w", name, ErrNotFound)
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	m.reloadTable(ctx, schema, name, false)
-	return nil
+	if changed {
+		m.reloadTable(ctx, schema, name, false)
+	}
+	return snapshot, nil
 }
 
 // LeaveIDDomain undoes JoinIDDomain. A table that no longer exists has

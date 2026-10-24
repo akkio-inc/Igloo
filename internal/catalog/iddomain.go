@@ -27,15 +27,20 @@ const hiddenColumnDoc = "Igloo's ids of the values of %s in ID domain %s (do not
 // JoinIDDomain makes column a member of ID domain domain, at generation, in
 // the table schema.name: in one commit it adds hidden, a nullable BIGINT,
 // if the table lacks it, and sets the column's IDDomainPropertyPrefix
-// property. Column names match case-insensitively, as in DuckDB.
-func (c *Client) JoinIDDomain(ctx context.Context, schema, name, column, hidden, domain string, generation int) error {
+// property. Column names match case-insensitively, as in DuckDB. It
+// reports whether it changed the table, which it does not when the column
+// is a member already, and the table's current snapshot (0 for none).
+func (c *Client) JoinIDDomain(ctx context.Context, schema, name, column, hidden, domain string, generation int) (changed bool, snapshot int64, err error) {
 	tbl, err := c.LoadTable(ctx, Ident(schema, name))
 	if err != nil {
-		return err
+		return false, 0, err
+	}
+	if s := tbl.CurrentSnapshot(); s != nil {
+		snapshot = s.SnapshotID
 	}
 	col, ok := tbl.Schema().FindFieldByNameCaseInsensitive(column)
 	if !ok {
-		return fmt.Errorf("%w: column %q of table %q does not exist", ErrNoSuchColumn, column, name)
+		return false, snapshot, fmt.Errorf("%w: column %q of table %q does not exist", ErrNoSuchColumn, column, name)
 	}
 	var updates []table.Update
 	reqs := []table.Requirement{table.AssertTableUUID(tbl.Metadata().TableUUID())}
@@ -44,23 +49,23 @@ func (c *Client) JoinIDDomain(ctx context.Context, schema, name, column, hidden,
 			AddColumn([]string{hidden}, iceberg.PrimitiveTypes.Int64, fmt.Sprintf(hiddenColumnDoc, col.Name, domain), false, nil)
 		u, r, err := us.BuildUpdates()
 		if err != nil {
-			return err
+			return false, snapshot, err
 		}
 		updates, reqs = append(updates, u...), append(reqs, r...)
 	} else if _, member := tbl.Metadata().Properties()[IDDomainPropertyPrefix+col.Name]; !member || !f.Type.Equals(iceberg.PrimitiveTypes.Int64) {
 		// A column of that name that Igloo did not add holds something
 		// else, which must not be taken for ids.
-		return fmt.Errorf("%w: table %q already has a column %s, the name Igloo's ids of %s go in", ErrHiddenColumnTaken, name, f.Name, col.Name)
+		return false, snapshot, fmt.Errorf("%w: table %q already has a column %s, the name Igloo's ids of %s go in", ErrHiddenColumnTaken, name, f.Name, col.Name)
 	}
 	key, value := IDDomainPropertyPrefix+col.Name, fmt.Sprintf("%s@%d", domain, generation)
 	if tbl.Metadata().Properties()[key] != value {
 		updates = append(updates, table.NewSetPropertiesUpdate(iceberg.Properties{key: value}))
 	}
 	if len(updates) == 0 {
-		return nil
+		return false, snapshot, nil
 	}
 	_, _, err = c.CommitTable(ctx, tbl.Identifier(), reqs, updates)
-	return err
+	return err == nil, snapshot, err
 }
 
 // LeaveIDDomain undoes JoinIDDomain: it drops hidden, if the table has it,

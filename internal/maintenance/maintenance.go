@@ -127,6 +127,11 @@ type Options struct {
 	// Threads are DuckDB's threads, each of which holds a row group while
 	// an insert writes (see sizeRowGroups); zero means one.
 	Threads int
+	// BeforePass, if set, runs at the start of each pass, while this
+	// replica holds the lock, before the tables are maintained: Igloo maps
+	// ID domains' ids there (pgwire.Server.MapIDDomains), so that a pass
+	// compacts what mapping rewrote.
+	BeforePass func(ctx context.Context)
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -254,6 +259,9 @@ func (m *Maintainer) RunOnce(ctx context.Context) {
 		defer release()
 	}
 	defer m.opts.Activity.Begin()()
+	if m.opts.BeforePass != nil {
+		m.opts.BeforePass(ctx)
+	}
 	if m.opts.Schedule != nil {
 		runs, err := m.opts.Schedule.LastRuns(ctx, orphanJobPrefix)
 		if err != nil {

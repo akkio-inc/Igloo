@@ -278,6 +278,12 @@ type Server struct {
 	idDomainsOn bool
 	// members caches which tables have columns that hold ids.
 	members memberCache
+	// idHolder names this replica in ID domains' leases, idSeq numbers its
+	// assignments, and idMapped is what maintenance found mapped (see
+	// idassign.go).
+	idHolder string
+	idSeq    atomic.Uint64
+	idMapped idMapped
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
 	prefetcher *prefetch.Prefetcher
@@ -455,7 +461,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	if policies == nil {
 		policies = policy.NewMemoryStore()
 	}
-	s.idDomains, s.idDomainsOn = opts.IDDomains, opts.IDDomainsOn
+	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows = opts.Bitmaps, opts.BitmapMinRows
 	if s.idDomains == nil {
@@ -1665,7 +1671,8 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	// Writes keep the columns that hold ID domains' ids right (see
 	// idwrite.go).
-	if query, err = s.memberWrites(ctx, sess, query); err != nil {
+	query, ids, err := s.memberWrites(ctx, sess, query)
+	if err != nil {
 		return fail(err)
 	}
 
@@ -1813,6 +1820,15 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 			}
 		}
 	}
+	if err != nil && st == nil {
+		// Or an INSERT whose rows come from the * of a member table, which
+		// DuckDB expands with the columns of ids: prepared as policies
+		// rewrite it, without them (see idwrite.go). Policies and checks
+		// apply below as to any statement.
+		if early := s.prepareWithoutIDs(ctx, sess, user, query, oids); early != nil {
+			st, err = early, nil
+		}
+	}
 	if err != nil {
 		sess.observe(nil, err)
 		err = shownParameterError(query, err, func(name string) bool { return s.isDuckDBSetting(ctx, sess, name) })
@@ -1887,6 +1903,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	}
 	if st.changesIceberg && st.stmtType == duckdb.STATEMENT_TYPE_CREATE && len(st.params) == 0 {
 		st.staged = s.stagedCreateOf(ctx, sess, st.query)
+	}
+	if st.stmtType == duckdb.STATEMENT_TYPE_INSERT {
+		st.ids = ids
 	}
 	// A statement that lists the catalog's tables or views walks the set and
 	// holds the catalog lock exclusively when it runs (see catalogRunLock);
