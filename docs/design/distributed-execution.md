@@ -254,7 +254,14 @@ explicit transactions, the coordinator plans it:
    reads the past week's from the query history at start. A statement that
    ran both ways runs where it was faster; one that ran on one machine
    within the threshold stays there; one that ran only one way in under ten
-   minutes is tried the other way once a day, whatever the estimates say;
+   minutes is tried the other way once a day, where that way is estimated
+   at no more than twice what it took (and, on one machine, should fit its
+   memory): a report that took 57 s on workers was tried on one machine,
+   estimated at 176 s and short of memory, and took 251 s; one that one
+   machine should spill stays on workers once it ran there, and the first
+   time runs there if they are estimated at no more than half again one
+   machine's estimate, a floor where it spills (four to thirty-five times
+   short at ten times the data);
    past that, one that ran on one machine within half its estimate stays
    there, and one that ran on workers stays there if it beat its
    estimates. One that ran out of memory

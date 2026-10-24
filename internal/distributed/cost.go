@@ -95,6 +95,23 @@ const (
 	// be for that to be worth a try.
 	exploreEvery = 24 * time.Hour
 	exploreUnder = 10 * time.Minute
+	// exploreWithin is how many times what a statement took on one side
+	// the other side's estimate may be for that side to be worth a try:
+	// at ten times the data, a report that took 57 s on workers was tried
+	// on one machine, estimated at 176 s and short of memory, and took 251
+	// s and spilled 8.4 GB, where the runs exploring fixed had been
+	// estimated close (160 s against 153), or had taken several times
+	// their own estimate (a one machine's 7 s that took longer than the
+	// workers' 51).
+	exploreWithin = 2
+	// spillWithin is how many times one machine's estimate workers may be
+	// estimated at and still run a statement that one machine should spill:
+	// its estimate is then a floor, which ran four to thirty-five times
+	// short at ten times the data (a report estimated at 56 s took 220 s
+	// on one machine and 66 s on workers). Two estimated to spill that ran
+	// five times as fast on one machine had workers estimated at 1.7 and 2
+	// times its estimate.
+	spillWithin = 1.5
 )
 
 // estimate is how long a planned statement would take on one machine and
@@ -556,7 +573,9 @@ func levels(stages []*Stage) int {
 // before (r, if found), and says why. It may run a statement where it has
 // not run, against the estimates (explore), at most once in exploreEvery,
 // to learn how long it takes there, but never one that ran on one machine
-// within threshold on workers.
+// within threshold on workers, nor on a side estimated at more than
+// exploreWithin times what it took on the other, nor on one machine where
+// it should not fit.
 func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Time) (workers, explore bool, reason string) {
 	limit := threshold.Seconds()
 	worth := func(oneMachine float64) bool {
@@ -569,6 +588,10 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 	// as a run on workers that beat an estimate of one machine far too
 	// high would.
 	mayExplore := now.Sub(r.explored) >= exploreEvery
+	// Worth trying where its estimate is close to what the statement took
+	// on the other side, and, on one machine, where it should fit.
+	tryWorkers := func(took float64) bool { return e.onWorkers < exploreWithin*took }
+	tryOne := func(took float64) bool { return e.oneMachine < exploreWithin*took && !e.memory && !e.spills }
 	switch {
 	case found && r.outOfMemory && e.workers > 0:
 		return true, false, "it ran out of memory on one machine"
@@ -587,24 +610,31 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 		switch {
 		case r.local < limit:
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit)
-		case e.workers > 0 && mayExplore && r.local < exploreUnder.Seconds():
+		case e.workers > 0 && mayExplore && r.local < exploreUnder.Seconds() && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers once, estimated at %.0f s", r.local, e.onWorkers)
 		case r.local < e.oneMachine/2:
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, well under the %.0f s estimated", r.local, e.oneMachine)
 		case worth(r.local):
 			return true, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
-		case e.workers > 0 && mayExplore:
+		case e.workers > 0 && mayExplore && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers, estimated at %.0f s", r.local, e.onWorkers)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
 	case found && r.dist > 0:
 		switch {
-		case mayExplore && r.dist < exploreUnder.Seconds():
+		case mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
+		case e.memory || e.spills:
+			// One machine's estimate runs four or five times short where it
+			// spills: two reports that took 146 s and 141 s on workers,
+			// against one machine's 157 s, took 809 s and 610 s there.
+			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should run short of memory", r.dist)
 		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine/speedup:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
+	case e.spills && e.workers > 0 && e.onWorkers <= spillWithin*e.oneMachine:
+		return true, false, fmt.Sprintf("one machine should take %.0f s or more, spilling, and workers %.0f s", e.oneMachine, e.onWorkers)
 	case worth(e.oneMachine):
 		return true, false, fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers)
 	}

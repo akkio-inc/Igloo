@@ -260,10 +260,14 @@ the last 4,096 such statements, and reads the past week's from the query
 history when it starts. A statement that ran both ways runs where it was
 faster. One that ran only on the replica within the threshold stays there.
 One that ran only one way, in under ten minutes, is tried once the other
-way, at most once a day, whatever the estimates say, so that runs come to
-be compared with runs; past that, one that ran only on the replica, well
-within its estimate, stays there, and one that ran only on workers stays
-there if it beat its estimates. Runs on workers count with runs on about
+way, at most once a day, so that runs come to be compared with runs, if
+the other way is estimated at no more than twice what it took, and, on the
+replica, if it should fit in its memory; past that, one that ran only on
+the replica, well within its estimate, stays there, and one that ran only
+on workers stays there if it beat its estimates, or if the replica should
+run short of memory. The first time, one that the replica should spill
+runs on workers if they are estimated at no more than half again the
+replica's estimate, which is then a floor. Runs on workers count with runs on about
 as many: one that ran on a quarter of the workers it would run on now, as
 in an earlier session on a smaller fleet, is tried on all of them, at most
 once a day, whatever it took on the replica. The server logs each choice, `chose where a statement

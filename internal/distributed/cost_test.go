@@ -46,7 +46,44 @@ func TestChoose(t *testing.T) {
 		{"ran long on one machine: try workers", close, runs{local: 400}, true, true, true},
 		{"ran long on one machine, tried workers today", close, runs{local: 400, explored: now.Add(-time.Hour)}, true, false, false},
 		{"ran for an hour on one machine, workers estimated faster", close, runs{local: 3600, explored: now.Add(-time.Hour)}, true, true, false},
-		{"ran on workers for minutes: try one machine once", close, runs{dist: 200}, true, false, true},
+		{"ran on workers for minutes, one machine estimated close: try it once", estimate{oneMachine: 300, onWorkers: 250, workers: 4},
+			runs{dist: 200}, true, false, true},
+		{"ran on workers for minutes, one machine estimated three times slower", close, runs{dist: 200}, true, true, false},
+		// At ten times the data, two reports that took 57 s and 25 s on
+		// workers were tried on one machine, estimated at 176 s and 180 s
+		// and short of memory: one took 251 s and spilled 8.4 GB.
+		{"p3seggen at 10x, after 57 s on workers", estimate{oneMachine: 176, onWorkers: 42, workers: 16, memory: true, spills: true},
+			runs{dist: 57.2}, true, true, false},
+		{"p4segaud at 10x, after 25 s on workers", estimate{oneMachine: 180, onWorkers: 40, workers: 16, memory: true, spills: true},
+			runs{dist: 25.4}, true, true, false},
+		{"close, but one machine should spill", estimate{oneMachine: 70, onWorkers: 50, workers: 4, spills: true},
+			runs{dist: 40}, true, true, false},
+		// The auto pass at ten times the data: after a run on workers, two
+		// reports went to one machine, estimated at 157 s and short of
+		// memory, and took 809 s and 610 s; another took 177.5 s against
+		// 103 s. Two that ran long on one machine went to workers and took
+		// a fraction.
+		{"F1 at 10x, after 146 s on workers", estimate{oneMachine: 157, onWorkers: 87, workers: 16, memory: true, spills: true},
+			runs{dist: 145.6}, true, true, false},
+		{"F2 at 10x, after 141 s on workers", estimate{oneMachine: 157, onWorkers: 87, workers: 16, memory: true, spills: true},
+			runs{dist: 140.6}, true, true, false},
+		{"E2 at 10x, after 103 s on workers", estimate{oneMachine: 193, onWorkers: 83, workers: 16, memory: true, spills: true},
+			runs{dist: 103.3}, true, true, false},
+		{"E1 at 10x, after 67 s on one machine, estimated at 13 s", estimate{oneMachine: 13, onWorkers: 30, workers: 16},
+			runs{local: 67.4}, true, true, true},
+		{"E3 at 10x, after 220 s on one machine, estimated at 56 s", estimate{oneMachine: 56, onWorkers: 58, workers: 16, memory: true, spills: true},
+			runs{local: 219.5}, true, true, true},
+		// First runs at ten times the data of reports one machine should
+		// spill: workers within half again one machine's estimate run them
+		// (E3 took 220 s on one machine and 66 s on workers); where workers
+		// are estimated at 1.7 or 2 times (F5, F4) one machine runs them,
+		// and was five times as fast. F3's 3.3 times stays a miss.
+		{"E3 at 10x, first", estimate{oneMachine: 56, onWorkers: 58, workers: 16, memory: true, spills: true}, runs{}, false, true, false},
+		{"F4 at 10x, first", estimate{oneMachine: 83, onWorkers: 169, workers: 16, memory: true, spills: true}, runs{}, false, false, false},
+		{"F5 at 10x, first", estimate{oneMachine: 96, onWorkers: 164, workers: 16, memory: true, spills: true}, runs{}, false, false, false},
+		{"F3 at 10x, first", estimate{oneMachine: 51, onWorkers: 168, workers: 16, spills: true}, runs{}, false, false, false},
+		{"ran on one machine for minutes, workers estimated far slower", estimate{oneMachine: 100, onWorkers: 600, workers: 4},
+			runs{local: 250}, true, false, false},
 		{"ran on workers within their estimate, tried one machine today", close, runs{dist: 200, explored: now.Add(-time.Hour)}, true, true, false},
 		{"ran on workers slower than one machine's estimate, tried today", slow, runs{dist: 500, explored: now.Add(-time.Hour)}, true, false, false},
 		{"ran on workers for an hour, not estimated faster there", close, runs{dist: 3600}, true, false, false},
@@ -134,11 +171,6 @@ func TestScaleReports(t *testing.T) {
 		// FLATTEN's arrays and maps cost far more a row than the rows say.
 		"E3 report-b at 10x":  "one",
 		"P p8flatmap at 100x": "one",
-		// Joins through a view's computed keys, counted distinct.
-		"F1 report-c at 10x": "one",
-		// Measured on workers before relations of uncertain size were
-		// measured first, which took it from 517 s to 161 s at 10x.
-		"F5 report-g at 100x": "workers",
 		// Under DefaultThreshold on one machine.
 		"P p1media at 10x": "one",
 	}
@@ -181,7 +213,7 @@ func TestScaleReports(t *testing.T) {
 		{"F1 report-c at 100x", features{bytes: 1.186e+11, unfiltered: 5.683e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 5.83e+10, legacyRows: 5.83e+10, levels: 3, stages: 22}, 0, 722, "workers"},
 		{"F2 report-d at 100x", features{bytes: 1.186e+11, unfiltered: 5.683e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 2.92e+10, legacyRows: 2.92e+10, levels: 3, stages: 11}, 0, 685, "workers"},
 		{"F4 report-f at 100x", features{bytes: 4.934e+10, unfiltered: 3.491e+11, exchanged: 3.491e+11, held: 4.934e+10, rows: 7.87e+10, legacyRows: 1.09e+12, levels: 7, stages: 26}, 2223, 1263, "workers"},
-		{"F5 report-g at 100x", features{bytes: 8.144e+10, unfiltered: 3.812e+11, exchanged: 3.812e+11, held: 8.144e+10, rows: 1.01e+11, legacyRows: 1.3e+12, levels: 7, stages: 34}, 311, 926, "one"},
+		{"F5 report-g at 100x", features{bytes: 8.144e+10, unfiltered: 3.812e+11, exchanged: 3.812e+11, held: 8.144e+10, rows: 1.01e+11, legacyRows: 1.3e+12, levels: 7, stages: 34}, 311, 257, "tie"},
 		{"P p1media at 100x", features{bytes: 3.636e+10, unfiltered: 3.636e+10, exchanged: 3.636e+10, held: 3.636e+10, rows: 1.45e+10, legacyRows: 1.45e+10, levels: 2, stages: 2}, 501, 72, "workers"},
 		{"P p2audmedia at 100x", features{bytes: 2.726e+10, unfiltered: 3.27e+11, exchanged: 3.27e+11, held: 2.726e+10, rows: 1.5e+10, legacyRows: 1.5e+10, levels: 2, stages: 3}, 167, 41, "workers"},
 		{"P p3seggen at 100x", features{bytes: 1.248e+11, unfiltered: 1.248e+11, exchanged: 1.248e+11, held: 1.248e+11, rows: 3.49e+11, legacyRows: 3.49e+11, levels: 2, stages: 3}, 0, 262, "workers"},

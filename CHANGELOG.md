@@ -434,7 +434,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   workers: a statement measured on a quarter of the workers it would run on
   now, as in an earlier session on a smaller fleet, is tried on all of them
   once a day. A report that took 230 s on 4 workers and 178 s on one
-  machine stayed there, though 16 workers took 84 s.
+  machine stayed there, though 16 workers took 84 s. A statement is tried
+  the other way only where that way is estimated at no more than twice
+  what it took, and never on the replica where it should not fit: a report
+  that took 57 s on workers was tried on the replica, estimated at 176 s
+  and short of memory, and took 251 s, spilling 8.4 GB. Where the replica
+  should run short of memory, a statement that ran on workers stays there,
+  and one that has not run runs on workers if they are estimated at no
+  more than half again the replica's estimate, which is then a floor: at
+  ten times the data, reports the replica should spill took four to
+  thirty-five times its estimate there (220 s for 56 s, against 66 s on
+  workers).
 - `EXPLAIN DISTRIBUTED <query>` says how a query would run without running
   it: where (workers or the replica) and why, auto mode's estimates, the
   partitions its exchanges would have, its stages with their SQL, what the
