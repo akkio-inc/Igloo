@@ -24,6 +24,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/cleanroom"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -652,6 +653,12 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 		return nil, true, err
 	}
 	for n := range snap.ProtectedNames() {
+		sens.names[n] = true
+	}
+	// And those with columns that hold ids, which statements read without
+	// them (see tablePlan.hidden).
+	_, members := s.memberTables(ctx)
+	for n := range members {
 		sens.names[n] = true
 	}
 	mark := func(protected bool, d def) {
@@ -1851,13 +1858,13 @@ func (st *statement) adopt(ctx context.Context, conn *duckdb.Conn, text string) 
 	if err != nil {
 		return pgError(trimContext(err))
 	}
-	if !sameShape(fresh, st, false) {
+	if !sameShape(fresh, st, false) && !sameShape(fresh, withoutHidden(st), true) {
 		_ = fresh.close()
 		return pgerror.WithCode(errors.New("cannot apply policies to this statement: they change its result's columns"),
 			codes.FeatureNotSupported)
 	}
 	old := st.stmt
-	st.stmt, st.query, st.prepared, st.encoders = fresh.stmt, text, fresh.prepared, fresh.encoders
+	st.stmt, st.query, st.prepared, st.encoders, st.columns = fresh.stmt, text, fresh.prepared, fresh.encoders, fresh.columns
 	return old.Close()
 }
 
@@ -1963,4 +1970,18 @@ func (st *statement) policyMarker() string {
 		return ""
 	}
 	return "__igloo_p_" + st.guard.nonce + "_"
+}
+
+// withoutHidden is st's shape without the columns that hold ID domains'
+// ids, which a star expanded as written and the rewrite leaves out (see
+// tablePlan.hidden).
+func withoutHidden(st *statement) *statement {
+	out := *st
+	out.columns = nil
+	for _, c := range st.columns {
+		if !iddomain.IsHidden(c.Name) {
+			out.columns = append(out.columns, c)
+		}
+	}
+	return &out
 }

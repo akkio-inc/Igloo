@@ -709,7 +709,8 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 			coalesce(k.comment, c.column_comment) AS column_comment)
 			FROM information_schema.columns c
 			LEFT JOIN system.main.igloo_comments() k ON k.table_catalog = c.table_catalog AND k.table_schema = c.table_schema
-				AND k.table_name = c.table_name AND k.column_name = c.column_name`,
+				AND k.table_name = c.table_name AND k.column_name = c.column_name
+			WHERE NOT c.column_name ILIKE '\_igloo\_id\_%' ESCAPE '\'`,
 		// Metabase's row count estimates; Iceberg tables have none here.
 		`CREATE OR REPLACE TEMP VIEW pg_stat_user_tables AS SELECT 0::BIGINT AS relid, ''::VARCHAR AS schemaname,
 			''::VARCHAR AS relname, 0::BIGINT AS seq_scan, 0::BIGINT AS idx_scan, 0::BIGINT AS n_live_tup,
@@ -1016,7 +1017,7 @@ var pgAttributeView = `CREATE OR REPLACE TEMP VIEW pg_attribute AS SELECT
 	'' AS attgenerated, false AS attisdropped, true AS attislocal, 0 AS attinhcount,
 	0::BIGINT AS attcollation, NULL::VARCHAR AS attcompression, NULL::VARCHAR[] AS attacl,
 	NULL::VARCHAR[] AS attoptions, NULL::VARCHAR[] AS attfdwoptions, NULL::VARCHAR AS attmissingval
-	FROM duckdb_columns()`
+	FROM duckdb_columns() WHERE NOT column_name ILIKE '\_igloo\_id\_%' ESCAPE '\'`
 
 // formatTypeMacro renders type names as PostgreSQL does, for the OIDs in
 // pgTypeView.

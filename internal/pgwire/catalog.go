@@ -12,6 +12,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -463,6 +464,10 @@ func (v *catalogView) Metadata() *catalog.Metadata {
 		out := &catalog.Metadata{}
 		for _, t := range all.Tables {
 			if v.access.SeesTable(t.Schema, t.Name) {
+				if t.Catalog == "" && slices.ContainsFunc(t.Columns, func(c catalog.ColumnMeta) bool { return iddomain.IsHidden(c.Name) }) {
+					// The columns that hold ids are Igloo's own.
+					t.Columns = slices.DeleteFunc(slices.Clone(t.Columns), func(c catalog.ColumnMeta) bool { return iddomain.IsHidden(c.Name) })
+				}
 				out.Tables = append(out.Tables, t)
 			}
 		}

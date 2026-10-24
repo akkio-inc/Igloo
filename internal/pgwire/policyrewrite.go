@@ -11,6 +11,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -120,10 +121,13 @@ type tablePlan struct {
 	filterArgs []int
 	// masks are by column index; nil where nothing masks the column.
 	masks []*maskPlan
+	// hidden says the table has columns that hold ID domains' ids, which
+	// columns leaves out, so that no statement reads them.
+	hidden bool
 }
 
 func (p *tablePlan) noop() bool {
-	return p.filter == nil && !slices.ContainsFunc(p.masks, func(m *maskPlan) bool { return m != nil })
+	return !p.hidden && p.filter == nil && !slices.ContainsFunc(p.masks, func(m *maskPlan) bool { return m != nil })
 }
 
 // plan works out how the session reads the protected table o. A table a
@@ -139,7 +143,17 @@ func (rw *rewriter) plan(o object, rules *policy.TableRules) (*tablePlan, error)
 	if err != nil {
 		return nil, err
 	}
-	plan := &tablePlan{obj: o, columns: cols, masks: make([]*maskPlan, len(cols))}
+	hidden := false
+	if strings.EqualFold(o.db, rw.r.catalog) {
+		cols = slices.DeleteFunc(cols, func(c columnType) bool {
+			if iddomain.IsHidden(c.name) {
+				hidden = true
+				return true
+			}
+			return false
+		})
+	}
+	plan := &tablePlan{obj: o, columns: cols, masks: make([]*maskPlan, len(cols)), hidden: hidden}
 	index := func(name string) int {
 		return slices.IndexFunc(cols, func(c columnType) bool { return strings.EqualFold(c.name, name) })
 	}
@@ -363,7 +377,15 @@ func (rw *rewriter) rules(o object) *policy.TableRules {
 	case o.view:
 		return nil
 	case strings.EqualFold(o.db, rw.r.catalog):
-		return rw.snap.Rules(o.schema, o.name)
+		if r := rw.snap.Rules(o.schema, o.name); r != nil {
+			return r
+		}
+		// A table with columns that hold ids is read through a subquery
+		// that leaves them out, policies or not.
+		if tables, _ := rw.s.memberTables(rw.ctx); tables[strings.ToLower(o.schema+"."+o.name)] {
+			return &policy.TableRules{Schema: o.schema, Table: o.name}
+		}
+		return nil
 	case rw.r.isConnection(o.db):
 		return rw.snap.ConnectionRules(strings.ToLower(o.db), o.schema, o.name)
 	}

@@ -270,6 +270,8 @@ type Server struct {
 	// idDomains keeps ID domains; idDomainsOn lets columns join them.
 	idDomains   iddomain.Store
 	idDomainsOn bool
+	// members caches which tables have columns that hold ids.
+	members memberCache
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
 	prefetcher *prefetch.Prefetcher
@@ -1616,6 +1618,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// Preparing runs all but the last of several statements, so this
 	// comes first.
 	if err := forbidden(query); err != nil {
+		return fail(err)
+	}
+	// The columns that hold ID domains' ids are Igloo's (see iddomains.go).
+	if err := hiddenReferences(text); err != nil {
 		return fail(err)
 	}
 

@@ -431,6 +431,12 @@ DROP ID DOMAIN people;
   nullable `BIGINT` that Igloo fills and they should not write. `UNSET ID
   DOMAIN` drops it again. Like policies, memberships stay with a table's
   name when it is dropped or replaced.
+- The columns that hold ids are Igloo's own. Statements read member
+  tables as if they did not have them, `SELECT *` included, views too, for
+  every user; `information_schema.columns`, `pg_attribute` and
+  `igloo.columns` leave them out (`DESCRIBE` and `duckdb_columns()` still
+  show their names). No statement may name a column, or anything else,
+  beginning with `_igloo_id_`.
 - Ids are never handed out twice and stay below 2^32, the range of a 32-bit
   bitmap. A domain that has handed out all of them hands out no more, and
   the ids of values it has not seen stay `NULL`.

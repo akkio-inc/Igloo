@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -179,8 +180,65 @@ func TestIDDomains(t *testing.T) {
 	}
 	// Writes naming their columns leave the ids to Igloo.
 	mustExec(t, admin, "INSERT INTO lake.public.people (person_id, n) VALUES ('p10', 10)")
-	if got := texts(t, admin, "SELECT count(*), count(_igloo_id_person_id) FROM lake.public.people"); len(got) != 1 || got[0] != "11|0" {
+	internal := func(q string) []string {
+		t.Helper()
+		conn, err := r.eng.Connect(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close() //nolint:errcheck
+		rows, err := queryRows(ctx, conn, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, row := range rows {
+			parts := make([]string, len(row))
+			for i, v := range row {
+				parts[i] = fmt.Sprint(v)
+			}
+			out = append(out, strings.Join(parts, "|"))
+		}
+		return out
+	}
+	if got := internal("SELECT count(*), count(_igloo_id_person_id) FROM lake.public.people"); len(got) != 1 || got[0] != "11|0" {
 		t.Errorf("rows and ids: %q", got)
+	}
+	// Statements read the table as if it did not have the column, and
+	// none may name it.
+	mustExec(t, admin, "CREATE VIEW lake.public.everyone AS SELECT * FROM lake.public.people")
+	for _, c := range []*pgx.Conn{admin, rita} {
+		for _, q := range []string{"SELECT * FROM lake.public.people LIMIT 1", "SELECT p.* FROM lake.public.people AS p LIMIT 1",
+			"SELECT * FROM lake.public.everyone LIMIT 1", "SELECT * FROM (SELECT * FROM lake.public.people) LIMIT 1"} {
+			rows, err := c.Query(ctx, q)
+			if err != nil {
+				t.Errorf("%s: %v", q, err)
+				continue
+			}
+			var names []string
+			for _, f := range rows.FieldDescriptions() {
+				names = append(names, f.Name)
+			}
+			rows.Close()
+			if strings.Join(names, ",") != "person_id,n" {
+				t.Errorf("%s: columns %v", q, names)
+			}
+		}
+		for _, q := range []string{"SELECT _igloo_id_person_id FROM lake.public.people", "SELECT max(\"_IGLOO_ID_PERSON_ID\") FROM lake.public.people",
+			"CREATE TABLE lake.public.ids AS SELECT 1 AS _igloo_id_x", "ALTER TABLE lake.public.people RENAME COLUMN n TO _igloo_id_n"} {
+			if _, err := c.Exec(ctx, q); pgCode(err) != "42501" {
+				t.Errorf("%s: %v, want permission denied", q, err)
+			}
+		}
+	}
+	for _, q := range []string{
+		"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'people'",
+		"SELECT string_agg(column_name, ',' ORDER BY column_name) FROM igloo.columns WHERE table_schema = 'public' AND table_name = 'people'",
+		"SELECT string_agg(DISTINCT attname, ',' ORDER BY attname) FROM pg_attribute WHERE attname IN ('person_id', 'n') OR attname LIKE '%igloo%'",
+	} {
+		if got := texts(t, rita, q); len(got) != 1 || got[0] != "person_id,n" {
+			t.Errorf("%s: %q", q, got)
+		}
 	}
 	if _, err := admin.Exec(ctx, "DROP ID DOMAIN people"); pgCode(err) != "2BP01" {
 		t.Errorf("dropping a domain in use: %v", err)
@@ -220,7 +278,16 @@ func TestIDDomains(t *testing.T) {
 
 	// A column of the name the ids would go in, which Igloo did not add,
 	// is not taken for them.
-	mustExec(t, admin, "CREATE TABLE lake.public.taken AS SELECT 'p1' AS person_id, 7 AS _igloo_id_person_id")
+	{
+		conn, err := r.eng.Connect(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.ExecContext(ctx, "CREATE TABLE lake.public.taken AS SELECT 'p1' AS person_id, 7 AS _igloo_id_person_id", nil); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}
 	mustExec(t, admin, "ALTER TABLE lake.public.taken ALTER COLUMN person_id SET TAG pii = 'person_id'")
 	if _, err := admin.Exec(ctx, "ALTER TABLE lake.public.taken ALTER COLUMN person_id SET ID DOMAIN people"); pgCode(err) != "42701" {
 		t.Errorf("a taken name: %v", err)

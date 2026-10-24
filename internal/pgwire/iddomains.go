@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -19,6 +20,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
 // ID domains (package iddomain), which Igloo carries out itself:
@@ -453,6 +455,7 @@ func (s *Server) joinDomain(ctx context.Context, sess *session, user auth.User, 
 		return err
 	}
 	m := iddomain.Member{Domain: d.Name, Schema: schema, Table: table, Column: col.name, Added: time.Now().UTC(), AddedBy: user.Name}
+	defer s.forgetMembers()
 	return s.idDomains.Update(ctx, func(cat *iddomain.Catalog) error { return cat.AddMember(m) })
 }
 
@@ -475,6 +478,7 @@ func (s *Server) leaveDomain(ctx context.Context, sess *session, c *domainCmd) e
 	if err := s.ddl.LeaveIDDomain(ctx, schema, table, m.Column, iddomain.HiddenColumn(m.Column)); err != nil {
 		return err
 	}
+	defer s.forgetMembers()
 	return s.idDomains.Update(ctx, func(cat *iddomain.Catalog) error {
 		cat.RemoveMember(schema, table, m.Column)
 		return nil
@@ -561,6 +565,87 @@ func dictionaryPolicyChange(c *policyCmd) error {
 	}
 	if len(c.table) >= 2 && strings.EqualFold(c.table[len(c.table)-2], iddomain.DictionarySchema) {
 		return dictionaryDenied()
+	}
+	return nil
+}
+
+// memberCheck is how often a replica asks the store whether ID domains'
+// members changed, which other replicas' statements may have changed.
+const memberCheck = 5 * time.Second
+
+// memberCache is which tables have columns that hold ids, as of the store's
+// version when last checked.
+type memberCache struct {
+	mu      sync.Mutex
+	checked time.Time
+	version int64
+	loaded  bool
+	// tables are schema.table and names the tables' names, lower case.
+	tables, names map[string]bool
+}
+
+// memberTables returns the tables with columns that hold ids, by lower-case
+// schema.table, and their names. A change since the last check counts as a
+// change of the catalog, so statements' policy checks are worked out again
+// (see sensitivity).
+func (s *Server) memberTables(ctx context.Context) (tables, names map[string]bool) {
+	c := &s.members
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loaded && time.Since(c.checked) < memberCheck {
+		return c.tables, c.names
+	}
+	c.checked = time.Now()
+	v, err := s.idDomains.Version(ctx)
+	if err != nil {
+		s.log.Warn("could not check ID domains' members", "err", err)
+		return c.tables, c.names
+	}
+	if c.loaded && v == c.version {
+		return c.tables, c.names
+	}
+	snap, err := s.idDomains.Load(ctx)
+	if err != nil {
+		s.log.Warn("could not load ID domains' members", "err", err)
+		return c.tables, c.names
+	}
+	tables, names = map[string]bool{}, map[string]bool{}
+	for _, m := range snap.Members {
+		tables[strings.ToLower(m.Schema+"."+m.Table)] = true
+		names[strings.ToLower(m.Table)] = true
+	}
+	changed := c.loaded
+	c.tables, c.names, c.version, c.loaded = tables, names, v, true
+	if changed {
+		s.catalogChanged()
+	}
+	return tables, names
+}
+
+// forgetMembers makes the next memberTables ask the store, after this
+// replica changed members.
+func (s *Server) forgetMembers() {
+	s.members.mu.Lock()
+	s.members.checked = time.Time{}
+	s.members.mu.Unlock()
+	s.catalogChanged()
+}
+
+// hiddenReferences refuses a statement a user wrote that names a column
+// that holds ids, or would make one: Igloo's alone, which statements read
+// as if the tables did not have them.
+func hiddenReferences(text string) error {
+	names := sqllex.CodeWords(text)
+	for _, v := range textValues(text) {
+		if v.ident {
+			names = append(names, v.value)
+		}
+	}
+	for _, n := range names {
+		if iddomain.IsHidden(n) {
+			return pgerror.WithCode(fmt.Errorf("permission denied: names beginning with _igloo_id_ are Igloo's own, the columns that hold ID domains' ids"),
+				codes.InsufficientPrivilege)
+		}
 	}
 	return nil
 }
