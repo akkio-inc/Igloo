@@ -606,11 +606,14 @@ catalog, database or users.
 
 Statements delete what they exchanged under `_igloo_shuffle/` (a thousand
 files a request on S3), but a coordinator that stops mid-statement cannot.
-Every replica sweeps `_igloo_shuffle/` a minute after it starts and
-hourly, and removes the files of statements whose removal began
-(`_igloo_shuffle/<statement>/removing`), and of statements under which
+A statement's files are spread over 16 directories,
+`_igloo_shuffle/<digit>.<statement>/`, so that S3, which serves a prefix
+so many requests a second, splits the load over prefixes every statement
+shares. Every replica sweeps `_igloo_shuffle/` a minute after it starts
+and hourly, and removes the files of statements whose removal began
+(`_igloo_shuffle/0.<statement>/removing`), and of statements under which
 nothing was written for six hours (a statement that still runs writes
-there every half hour). A lifecycle rule
+there every half hour), taking a statement's directories together. A lifecycle rule
 on the warehouse's bucket that expires `_igloo_shuffle/` after a day is a
 backstop for when no replica runs for that long. On S3, for a warehouse at
 `s3://bucket/warehouse`:

@@ -321,11 +321,13 @@ func (s fsStorage) Write(_ context.Context, path string, data []byte) error {
 	return errors.Join(err, f.Close())
 }
 
-// hold marks a statement's exchanges, under root, as in use until the
+// hold marks a statement's exchanges, under roots, as in use until the
 // returned function is called: sweeps leave them, and a heartbeat writes
-// under them every heartbeatEvery, so that the sweeps of other replicas,
-// which cannot know the statement runs, find something recent.
-func (co *Coordinator) hold(qid, root string) (release func()) {
+// under the first every heartbeatEvery, so that the sweeps of other
+// replicas, which cannot know the statement runs, find something recent
+// among the directories of its ID (see exchangeQID).
+func (co *Coordinator) hold(qid string, roots ...string) (release func()) {
+	root := roots[0]
 	co.runningMu.Lock()
 	co.running[qid] = true
 	co.runningMu.Unlock()
@@ -361,7 +363,7 @@ func (co *Coordinator) hold(qid, root string) (release func()) {
 // removes the rest rather than waiting staleExchanges for them: a
 // statement's 478 GB of exchanges outlived the coordinator that was
 // removing them.
-func (co *Coordinator) removeLater(qid, root string) {
+func (co *Coordinator) removeLater(qid string, roots ...string) {
 	co.removals.Go(func() {
 		defer func() {
 			co.runningMu.Lock()
@@ -371,21 +373,25 @@ func (co *Coordinator) removeLater(qid, root string) {
 		ctx, cancel := context.WithTimeout(co.removeCtx, removeTimeout)
 		defer cancel()
 		var paths []string
-		err := co.opts.Storage.List(ctx, root, func(path string, _ time.Time) error {
-			paths = append(paths, path)
-			return nil
-		})
+		var err error
+		for _, root := range roots {
+			err = errors.Join(err, co.opts.Storage.List(ctx, root, func(path string, _ time.Time) error {
+				paths = append(paths, path)
+				return nil
+			}))
+		}
 		if err == nil && len(paths) > 0 {
-			err = co.removeMarked(ctx, root, paths)
+			err = co.removeMarked(ctx, roots[0], paths)
 		}
 		if err != nil {
-			co.log.Warn("could not remove exchanged rows", "dir", root, "err", err)
+			co.log.Warn("could not remove exchanged rows", "dir", roots[0], "err", err)
 		}
 	})
 }
 
-// removeMarked removes paths, the files of a statement's exchanges under
-// root, marking them as being removed until the rest are gone.
+// removeMarked removes paths, the files of a statement's exchanges, marking
+// them under root, one of its directories, as being removed until the rest
+// are gone.
 func (co *Coordinator) removeMarked(ctx context.Context, root string, paths []string) error {
 	marker := root + "/" + removingFile
 	if !slices.Contains(paths, marker) {
@@ -433,12 +439,16 @@ func (co *Coordinator) sweep(ctx context.Context, now time.Time) error {
 		if i < 0 {
 			return nil
 		}
-		qid, rest, ok := strings.Cut(path[i+len(marker):], "/")
-		if !ok || qid == "" {
+		dir, rest, ok := strings.Cut(path[i+len(marker):], "/")
+		if !ok || dir == "" {
 			return nil
 		}
+		// A statement's spread directories go together (see spreadRoots).
+		qid := exchangeQID(dir)
 		files[qid] = append(files[qid], path)
-		roots[qid] = path[:i+len(marker)] + qid
+		if _, seen := roots[qid]; !seen {
+			roots[qid] = path[:i+len(marker)] + dir
+		}
 		if rest == removingFile {
 			removing[qid] = true
 		}

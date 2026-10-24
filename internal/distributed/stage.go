@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -200,8 +201,9 @@ type execution struct {
 	// smaller is how many times the statement ran again because a task ran
 	// out of memory: each halves the tasks (see Execute).
 	smaller int
-	// root is the statement's directory in object storage for exchanges.
-	root      string
+	// roots are the statement's directories in object storage for
+	// exchanges (see spreadRoots).
+	roots     []string
 	exchanges map[int]*exchangeRun
 	results   map[int]*jobResult
 	// held are stages, by ID, that wait for their channel to close once
@@ -491,7 +493,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			out = filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, i))
 		} else {
 			task.SQL = exchangeSQL(s, e.parts)
-			task.Shuffle = e.root + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
+			task.Shuffle = e.rootOf(s.ID, i) + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
 			task.Partitions = e.parts
 			if e.co.opts.LocalExchanges {
 				// What it writes is taken to be at most what it reads.
@@ -630,4 +632,42 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *w
 // shuffleRoot is a statement's directory for exchanges in object storage.
 func shuffleRoot(warehouse, qid string) string {
 	return warehouse + config.ShuffleDir + "/" + qid
+}
+
+// spread is how many directories a statement's exchanges are spread over
+// in object storage (see spreadRoots).
+const spread = 16
+
+// spreadRoots are a statement's directories for exchanges in object
+// storage: one for each hexadecimal digit, which starts the directory's
+// name, before the statement's ID. S3 serves a prefix so many requests a
+// second and turns the rest away (503 SlowDown) until it has split the
+// prefix, which it does by the characters after it: a statement's 187,000
+// files under one ID on 16 workers drew SlowDown at a hundred times the
+// data. Tasks' files spread over prefixes that every statement shares,
+// which S3 splits once and keeps split. Sweeps and removals take the
+// directories of an ID together (see exchangeQID).
+func spreadRoots(warehouse, qid string) []string {
+	roots := make([]string, spread)
+	for i := range roots {
+		roots[i] = shuffleRoot(warehouse, strconv.FormatInt(int64(i), 16)+"."+qid)
+	}
+	return roots
+}
+
+// exchangeQID returns the statement ID of a directory under the exchanges'
+// root: name itself, or what follows the digit of a spread directory.
+func exchangeQID(name string) string {
+	if len(name) > 2 && name[1] == '.' && strings.ContainsRune("0123456789abcdef", rune(name[0])) {
+		return name[2:]
+	}
+	return name
+}
+
+// rootOf returns the directory of a task's exchange files: the one of the
+// statement's spread over that a hash of the stage and the task picks.
+func (e *execution) rootOf(stage, task int) string {
+	h := fnv.New32a()
+	_, _ = fmt.Fprintf(h, "%d/%d", stage, task)
+	return e.roots[h.Sum32()%uint32(len(e.roots))]
 }

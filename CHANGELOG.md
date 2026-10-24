@@ -635,7 +635,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   second, the coordinator runs a task still turned away again up to four
   times, with backoff and jitter
   (`igloo_distributed_tasks_total{result="throttled"}`), and Igloo's own S3
-  client makes 10 attempts of a request rather than 3.
+  client makes 10 attempts of a request rather than 3. A statement's
+  exchange files are spread over 16 directories,
+  `_igloo_shuffle/<digit>.<statement>/`, whose prefixes every statement
+  shares, so that S3 splits one statement's requests over them.
 - A distributed statement's partial results may take a quarter of the
   coordinator's free disk, at least 1 GiB, rather than 1 GiB: a report at a
   hundred times the data, whose groups the coordinator ranks, passed 1 GiB

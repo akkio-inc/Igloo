@@ -610,12 +610,12 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		newRun := func(id string) *execution {
 			r := &execution{
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
-				sp: &spool{limit: limit}, parts: parts, smaller: smaller, root: shuffleRoot(co.opts.Warehouse, id),
+				sp: &spool{limit: limit}, parts: parts, smaller: smaller, roots: spreadRoots(co.opts.Warehouse, id),
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 			}
 			// The exchanges are read only by the stages: once they have run,
 			// the statement's rows need not wait for their removal.
-			release := co.hold(id, r.root)
+			release := co.hold(id, r.roots...)
 			releaseLocal := func() {}
 			if co.opts.LocalExchanges {
 				releaseLocal = co.holdLocal(id, r.ws)
@@ -623,7 +623,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			cleanups = append(cleanups, func() {
 				release()
 				releaseLocal()
-				co.removeLater(id, r.root)
+				co.removeLater(id, r.roots...)
 				if co.opts.LocalExchanges {
 					co.removeLocalLater(id, r.ws)
 				}

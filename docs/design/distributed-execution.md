@@ -550,7 +550,12 @@ result's columns must match the prepared statement's, or it falls back.
   with jitter (`igloo_distributed_tasks_total{result="throttled"}`). A
   HEAD of an exchange's file turned away on 16 workers at a hundred times
   the data had failed a statement too large for one machine. Igloo's own S3
-  client makes 10 attempts of a request rather than the SDK's 3.
+  client makes 10 attempts of a request rather than the SDK's 3. A
+  statement's exchange files are spread over 16 directories,
+  `_igloo_shuffle/<digit>.<statement>/`, a task's under the one a hash of
+  its stage and number picks, so that one statement's requests reach S3
+  under prefixes every statement shares, which S3 splits once and keeps
+  split, rather than under its own new one.
 - Partial results wait on the coordinator's disk until every task has
   answered; past a quarter of the room free there as the statement started
   (at least 1 GiB), it stops its tasks and runs on the coordinator. A

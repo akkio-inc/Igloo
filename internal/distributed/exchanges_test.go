@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -98,18 +99,32 @@ func TestSweepExchanges(t *testing.T) {
 	write(root+"/recent/s0/0/__b=0/data_0.parquet", time.Hour)
 	release := h.co.hold("held", root+"/held")
 	defer release()
+	// A statement's spread directories go together: old files in two, of
+	// which a recent heartbeat in a third keeps both; and a held one.
+	write(root+"/3.spread/s0/0/__b=0/data_0.parquet", old)
+	write(root+"/a.spread/s1/1/__b=0/data_0.parquet", old)
+	write(root+"/3.kept/s0/0/__b=0/data_0.parquet", old)
+	write(root+"/0.kept/"+heartbeatFile, heartbeatEvery/2)
+	write(root+"/7.spreadheld/s0/0/__b=0/data_0.parquet", old)
+	releaseSpread := h.co.hold("spreadheld", spreadRoots(h.co.opts.Warehouse, "spreadheld")...)
+	defer releaseSpread()
 
 	if err := h.co.sweep(t.Context(), now); err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{"left", "stopped"} {
+	for _, q := range []string{"left", "stopped", "3.spread/s0", "a.spread/s1"} {
 		if _, err := os.Stat(root + "/" + q); !os.IsNotExist(err) {
 			t.Errorf("left the exchanges of %s, which no longer runs: %v", q, err)
 		}
 	}
-	for _, q := range []string{"held", "beating", "recent"} {
+	for _, q := range []string{"held", "beating", "recent", "3.kept", "7.spreadheld"} {
 		if _, err := os.Stat(root + "/" + q + "/s0/0/__b=0/data_0.parquet"); err != nil {
 			t.Errorf("removed the exchanges of %s: %v", q, err)
+		}
+	}
+	for name, want := range map[string]string{"3.q": "q", "f.0123-1": "0123-1", "0123": "0123", "g.q": "g.q", "ab": "ab"} {
+		if got := exchangeQID(name); got != want {
+			t.Errorf("exchangeQID(%q) = %q, want %q", name, got, want)
 		}
 	}
 }
@@ -258,5 +273,28 @@ func TestRemoveMarked(t *testing.T) {
 	}
 	if !slices.Equal(s.ops, []string{"remove " + root + "/x", "remove " + root + "/removing"}) {
 		t.Errorf("resuming did %q", s.ops)
+	}
+}
+
+// A statement's tasks write their exchange files under directories of
+// every digit, which a sweep or a removal takes together.
+func TestSpreadRoots(t *testing.T) {
+	e := &execution{roots: spreadRoots("s3://bucket/warehouse/", "0123abcd")}
+	if e.roots[10] != "s3://bucket/warehouse/"+config.ShuffleDir+"/a.0123abcd" {
+		t.Errorf("roots %v", e.roots)
+	}
+	used := map[string]int{}
+	for stage := range 3 {
+		for task := range 64 {
+			used[e.rootOf(stage, task)]++
+		}
+	}
+	if len(used) != spread {
+		t.Errorf("192 tasks wrote under %d directories of %d", len(used), spread)
+	}
+	for root, n := range used {
+		if exchangeQID(path.Base(root)) != "0123abcd" || n > 24 {
+			t.Errorf("%s: %d tasks", root, n)
+		}
 	}
 }
