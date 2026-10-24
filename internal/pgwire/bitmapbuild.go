@@ -335,14 +335,19 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 		s.log.Warn("could not size a bitmap index's row groups", "index", x.Name, "err", err)
 	}
 	src := s.indexSource(x)
+	counted := s.indexCounted(ctx, x)
 	how := "rebuild"
 	var insert string
 	if base != nil {
 		switch op, added := snapshotsSince(ctx, tbl, base.snapshot, S); op {
 		case table.OpReplace:
 			how = "carry"
-			insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s generation, bm FROM %s WHERE source_snapshot_id = %d",
-				s.indexTable(x.Name), S, groupList(x, ""), s.indexTable(x.Name), base.snapshot)
+			counts := ""
+			if counted {
+				counts = ", row_count, members"
+			}
+			insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s generation, bm%s FROM %s WHERE source_snapshot_id = %d",
+				s.indexTable(x.Name), S, groupList(x, ""), counts, s.indexTable(x.Name), base.snapshot)
 		case table.OpAppend:
 			files := "read_parquet([" + strings.Join(quoteAll(added), ", ") + "])"
 			complete, err := s.idsCompleteIn(ctx, conn, x, files)
@@ -351,10 +356,17 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 			}
 			if err == nil {
 				how = "append"
-				g := groupList(x, "")
-				insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, rb_or_agg(bm) FROM (SELECT %s bm FROM %s WHERE source_snapshot_id = %d "+
-					"UNION ALL SELECT %s rb_agg(CAST(%s AS UINTEGER)) FROM %s %s) GROUP BY ALL",
-					s.indexTable(x.Name), S, g, gen, g, s.indexTable(x.Name), base.snapshot, g, quoteIdent(iddomain.HiddenColumn(x.Column)), files, groupBy(x))
+				g, h := groupList(x, ""), quoteIdent(iddomain.HiddenColumn(x.Column))
+				if counted {
+					insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, bm, n, rb_cardinality(bm) FROM (SELECT %s rb_or_agg(bm) AS bm, sum(n) AS n FROM ("+
+						"SELECT %s bm, row_count AS n FROM %s WHERE source_snapshot_id = %d "+
+						"UNION ALL SELECT %s rb_agg(CAST(%s AS UINTEGER)) AS bm, count(%s) AS n FROM %s %s) GROUP BY ALL)",
+						s.indexTable(x.Name), S, g, gen, g, g, s.indexTable(x.Name), base.snapshot, g, h, h, files, groupBy(x))
+				} else {
+					insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, rb_or_agg(bm) FROM (SELECT %s bm FROM %s WHERE source_snapshot_id = %d "+
+						"UNION ALL SELECT %s rb_agg(CAST(%s AS UINTEGER)) FROM %s %s) GROUP BY ALL",
+						s.indexTable(x.Name), S, g, gen, g, s.indexTable(x.Name), base.snapshot, g, h, files, groupBy(x))
+				}
 			}
 		}
 	}
@@ -367,9 +379,7 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 		if !complete {
 			return "unmapped", nil
 		}
-		g := groupList(x, "")
-		insert = fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, rb_agg(CAST(%s AS UINTEGER)) FROM %s %s",
-			s.indexTable(x.Name), S, g, gen, quoteIdent(iddomain.HiddenColumn(x.Column)), at, groupBy(x))
+		insert = s.rebuildSQL(x, S, gen, at, counted)
 	}
 	if err := s.execIndex(ctx, conn, insert); err != nil {
 		if how != "append" {
@@ -378,11 +388,9 @@ func (s *Server) maintainIndex(ctx context.Context, x iddomain.BitmapIndex, gen 
 		// The added files could not be read as the table's columns (a
 		// column renamed since, say): from the snapshot instead.
 		s.log.Debug("could not add appended files to a bitmap index; building it again", "index", x.Name, "err", err)
-		g := groupList(x, "")
 		at := fmt.Sprintf("%s AT (VERSION => %d)", src, S)
 		how = "rebuild"
-		if err := s.execIndex(ctx, conn, fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, rb_agg(CAST(%s AS UINTEGER)) FROM %s %s",
-			s.indexTable(x.Name), S, g, gen, quoteIdent(iddomain.HiddenColumn(x.Column)), at, groupBy(x))); err != nil {
+		if err := s.execIndex(ctx, conn, s.rebuildSQL(x, S, gen, at, counted)); err != nil {
 			return "", err
 		}
 	}
@@ -481,6 +489,30 @@ func snapshotRows(ctx context.Context, tbl *table.Table) (int64, error) {
 	}
 	_, rows, err := tableSize(ctx, tbl)
 	return rows, err
+}
+
+// rebuildSQL builds x's bitmaps of snapshot S, at the generation gen, from
+// at, the source read at S; counted, with each one's rows and members.
+func (s *Server) rebuildSQL(x iddomain.BitmapIndex, S int64, gen int, at string, counted bool) string {
+	g, h := groupList(x, ""), quoteIdent(iddomain.HiddenColumn(x.Column))
+	if !counted {
+		return fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, rb_agg(CAST(%s AS UINTEGER)) FROM %s %s", s.indexTable(x.Name), S, g, gen, h, at, groupBy(x))
+	}
+	return fmt.Sprintf("INSERT INTO %s SELECT %d, %s %d, bm, n, rb_cardinality(bm) FROM (SELECT %s rb_agg(CAST(%s AS UINTEGER)) AS bm, count(%s) AS n FROM %s %s)",
+		s.indexTable(x.Name), S, g, gen, g, h, h, at, groupBy(x))
+}
+
+// indexCounted reports whether x's table records each bitmap's rows and
+// members, which the tables of indexes added before they did lack (see
+// addIndex).
+func (s *Server) indexCounted(ctx context.Context, x iddomain.BitmapIndex) bool {
+	idx, err := s.ddl.LoadTable(ctx, iddomain.IndexSchema, x.Name)
+	if err != nil {
+		return false
+	}
+	_, rows := idx.Schema().FindFieldByNameCaseInsensitive("row_count")
+	_, members := idx.Schema().FindFieldByNameCaseInsensitive("members")
+	return rows && members
 }
 
 // indexSource is the quoted name of x's source table.

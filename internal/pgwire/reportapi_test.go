@@ -452,3 +452,66 @@ func TestReportAPIThroughIDs(t *testing.T) {
 		t.Errorf("after a write: rows\n%q\nwant\n%q", again, sql)
 	}
 }
+
+// TestReportAPIFromIndexes answers calls from bitmap indexes, with the rows
+// the tables give, where the indexes hold all the call counts, and from the
+// tables elsewhere.
+func TestReportAPIFromIndexes(t *testing.T) {
+	it := newE2Test(t)
+	ctx := context.Background()
+	srv := it.r.srv
+	conn := it.admin
+	mustExec(t, conn, "SET search_path = 'lake.public'")
+	cohorts := []any{
+		map[string]any{"label": "AUDIENCE", "table": "audience_members", "member": "person_id", "where": map[string]any{"audience_id": "a1"},
+			"version": map[string]any{"column": "ver", "latest_from": map[string]any{"table": "audience_revisions", "where": map[string]any{"audience_id": "a1"}}}},
+		map[string]any{"label": "BASE_POPULATION", "table": "v_attributes", "member": "person_id"},
+	}
+	segments := map[string]any{"version": 1, "cohorts": cohorts, "totals": true,
+		"source":     map[string]any{"table": "person_segments", "member": "person_id", "where": map[string]any{"segment_name": map[string]any{"like": "SEG_%"}}},
+		"dimensions": []any{map[string]any{"name": "SEGMENT", "column": "segment_name"}}}
+	everyone := map[string]any{"version": 1, "cohorts": cohorts[:1], "totals": true,
+		"source":     map[string]any{"table": "attributes", "member": "person_id"},
+		"dimensions": []any{map[string]any{"name": "REACH", "constant": "ANYONE"}}}
+	// answered runs spec and checks its rows are its SQL's, and whether
+	// bitmap indexes answered it.
+	answered := func(what string, spec map[string]any, fromIndexes bool) {
+		t.Helper()
+		lit := specLiteral(t, spec)
+		before := srv.reportFromIndexes.Load()
+		api := texts(t, conn, "SELECT * EXCLUDE (path) FROM igloo.audience_profile("+lit+") ORDER BY ALL")
+		if got := srv.reportFromIndexes.Load() > before; got != fromIndexes {
+			t.Errorf("%s: from indexes %v, want %v", what, got, fromIndexes)
+		}
+		paths := texts(t, conn, "SELECT DISTINCT path FROM igloo.audience_profile("+lit+")")
+		want := "scan"
+		if fromIndexes {
+			want = "index"
+		}
+		if len(paths) != 1 || paths[0] != want {
+			t.Errorf("%s: paths %q, want %s", what, paths, want)
+		}
+		text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
+		if len(text) != 1 {
+			t.Fatalf("%s: %q", what, text)
+		}
+		if sql := texts(t, conn, "SELECT * EXCLUDE (path) FROM ("+text[0]+") ORDER BY ALL"); len(api) == 0 || !slices.Equal(api, sql) {
+			t.Errorf("%s: rows\n%q\nwant\n%q", what, api, sql)
+		}
+	}
+	answered("segments", segments, true)
+	answered("a constant, over a table of one row a member", everyone, true)
+
+	// A masking policy on a column read: the tables.
+	it.exec("CREATE MASKING POLICY same AS (v VARCHAR) RETURNS VARCHAR -> v",
+		"ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name SET MASKING POLICY same")
+	answered("segments under a mask", segments, false)
+	it.exec("ALTER TABLE lake.public.person_segments ALTER COLUMN segment_name UNSET MASKING POLICY")
+
+	// A member with two rows in a group: its rows are not its people, so
+	// the tables count them.
+	it.exec("INSERT INTO lake.public.person_segments VALUES ('p1', 'SEG_1'), ('p1', 'SEG_1')")
+	srv.waitIndexBuilds(t)
+	srv.MaintainBitmapIndexes(ctx)
+	answered("segments, with a member's row repeated", segments, false)
+}

@@ -320,6 +320,9 @@ type Server struct {
 	// reportThroughIDs counts the report API's calls that read their tables
 	// through ids (see reportids.go).
 	reportThroughIDs atomic.Int64
+	// reportFromIndexes counts those answered from bitmap indexes (see
+	// reportindex.go).
+	reportFromIndexes atomic.Int64
 	settings         auth.SettingStore
 	workload         *workload.Controller
 	pool             string
@@ -1747,7 +1750,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// statement keeps its text as written, which preparing again writes
 	// again, as the tables read through ids change.
 	source := text
-	text, reportPins, err := s.reportCalls(ctx, sess, text)
+	text, reportPins, reportIndexPins, err := s.reportCalls(ctx, sess, text)
 	if err != nil {
 		return fail(err)
 	}
@@ -1869,6 +1872,9 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// Counts bitmap indexes answer read them (see bitmaprewrite.go).
 	indexed := query
 	query, indexPins, indexCandidate := s.rewriteIndexes(ctx, sess, user, query, counts)
+	// The report API's calls read from bitmap indexes keep theirs too.
+	indexPins = append(indexPins, reportIndexPins...)
+	indexCandidate = indexCandidate || len(reportIndexPins) > 0
 	// A statement that counts ID domains' IDs in roaring bitmaps is
 	// prepared with the rb extension's setting on (see bitmaps.go).
 	bitmaps := s.bitmapsFor(ctx, sess, query)

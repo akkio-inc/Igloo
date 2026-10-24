@@ -72,7 +72,7 @@ var indexColumns = wire.Columns{
 
 // indexReserved are the index table's own columns, which no group column
 // may be called.
-var indexReserved = []string{"source_snapshot_id", "generation", "bm"}
+var indexReserved = []string{"source_snapshot_id", "generation", "bm", "row_count", "members"}
 
 // parseIndexCommand recognizes the statements above. ok is false for any
 // other statement; err is set for one of them written wrong.
@@ -269,11 +269,11 @@ func (s *Server) addIndex(ctx context.Context, sess *session, user auth.User, c 
 	if err := check.AddIndex(x); err != nil {
 		return err
 	}
-	ddl := "CREATE TABLE IF NOT EXISTS " + s.indexTable(c.name) + " (source_snapshot_id BIGINT, " +
-		strings.Join(append(defs, "generation INTEGER", "bm BLOB"), ", ") + ")"
-	if len(defs) == 0 {
-		ddl = "CREATE TABLE IF NOT EXISTS " + s.indexTable(c.name) + " (source_snapshot_id BIGINT, generation INTEGER, bm BLOB)"
-	}
+	// Each bitmap with the rows of its group that have ids and its
+	// members, as many as its ids: equal, each member has one row in the
+	// group, which the report API counts by (see reportindex.go).
+	ddl := "CREATE TABLE IF NOT EXISTS " + s.indexTable(c.name) + " (" +
+		strings.Join(slices.Concat([]string{"source_snapshot_id BIGINT"}, defs, []string{"generation INTEGER", "bm BLOB", "row_count BIGINT", "members BIGINT"}), ", ") + ")"
 	for _, q := range []string{"CREATE SCHEMA IF NOT EXISTS " + quoteName([]string{s.catalogName(), iddomain.IndexSchema}), ddl} {
 		if _, err := sess.conn.ExecContext(ctx, q, nil); err != nil {
 			return pgError(err)

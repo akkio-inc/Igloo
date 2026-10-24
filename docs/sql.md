@@ -517,7 +517,10 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   holds its ids.
 - An index's bitmaps are the table `igloo_bitmaps.<name>` of the catalog,
   in CRoaring's portable format, one row for each combination, for one
-  snapshot of the table. Like the dictionaries, the tables are Igloo's own:
+  snapshot of the table, with the combination's rows that have ids
+  (`row_count`) and its distinct members (`members`). Tables of indexes
+  added before Igloo recorded these leave them out; drop and add such an
+  index for the [report API](media-analytics.md#report-api) to read it. Like the dictionaries, the tables are Igloo's own:
   the row access policy `igloo_bitmap_index` keeps every user's statement
   from their rows, no one may write to, create, drop or alter anything in
   the schema `igloo_bitmaps`, and they count as protected wherever Igloo

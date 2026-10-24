@@ -144,7 +144,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   runs in its place, so grants, policies, errors and execution are that
   SQL's; `igloo.audience_profile_check` compares a call with the caller's
   own SQL, and `igloo.report_api_versions()` lists the versions. Where the
-  tables are an ID domain's members, a call joins and counts their ids (see
+  tables are an ID domain's members, a call joins and counts their ids, and
+  where bitmap indexes hold all a call counts, it reads their bitmaps (see
   [Report API](docs/media-analytics.md#report-api)).
 - Snowflake's SQL dialect, opt-in per session (`SET sql_dialect =
   'snowflake'` or `ALTER SESSION SET`), per connection (the startup option

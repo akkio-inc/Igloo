@@ -59,12 +59,13 @@ func reportError(format string, args ...any) error {
 // reportCalls returns text with each call of the report API replaced by
 // what it stands for, and the member tables whose ids it counts through, at
 // the snapshots it reads them at (see reportIDs).
-func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (string, []idPin, error) {
+func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (string, []idPin, []indexPin, error) {
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, "igloo") || !strings.Contains(lower, "audience_profile") && !strings.Contains(lower, "report_api_versions") {
-		return text, nil, nil
+		return text, nil, nil, nil
 	}
 	var pins []idPin
+	var indexPins []indexPin
 	masked := maskCode(text)
 	var edits []edit
 	for _, m := range reportCall.FindAllStringSubmatchIndex(masked, -1) {
@@ -72,53 +73,50 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 		fn := strings.ToLower(masked[m[6]:m[7]])
 		end := matchParen(text, open)
 		if end < 0 {
-			return "", nil, reportError("%s has no closing parenthesis", fn)
+			return "", nil, nil, reportError("%s has no closing parenthesis", fn)
 		}
 		args, err := literalArgs(text[open+1 : end])
 		if err != nil {
-			return "", nil, reportError("igloo.%s takes string literals: %v", fn, err)
+			return "", nil, nil, reportError("igloo.%s takes string literals: %v", fn, err)
 		}
 		var out string
 		switch fn {
 		case "report_api_versions":
 			if len(args) != 0 {
-				return "", nil, reportError("igloo.report_api_versions takes no arguments")
+				return "", nil, nil, reportError("igloo.report_api_versions takes no arguments")
 			}
 			out = "CAST([" + strconv.Itoa(reportAPIVersion) + "] AS INTEGER[])"
 		case "audience_profile", "audience_profile_sql":
 			if len(args) != 1 {
-				return "", nil, reportError("igloo.%s takes one argument, the spec", fn)
+				return "", nil, nil, reportError("igloo.%s takes one argument, the spec", fn)
 			}
 			spec, err := parseReportSpec(ctx, sess, args[0])
 			if err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
 			if fn == "audience_profile" {
-				ids, read := s.reportIDs(ctx, sess, spec)
-				pins = append(pins, read...)
-				if ids != nil {
-					s.reportThroughIDs.Add(1)
-				}
-				out = "(" + spec.sqlWith(ids) + ")"
+				q, ip, read := s.reportStatement(ctx, sess, spec)
+				pins, indexPins = append(pins, read...), append(indexPins, ip...)
+				out = "(" + q + ")"
 			} else {
 				out = quoteLiteral(spec.sql())
 			}
 		case "audience_profile_check":
 			if len(args) != 2 {
-				return "", nil, reportError("igloo.audience_profile_check takes two arguments, the spec and the SQL to compare")
+				return "", nil, nil, reportError("igloo.audience_profile_check takes two arguments, the spec and the SQL to compare")
 			}
 			spec, err := parseReportSpec(ctx, sess, args[0])
 			if err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
 			if err := reportOwnNames(args[1]); err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
-			ids, read := s.reportIDs(ctx, sess, spec)
-			pins = append(pins, read...)
-			q, err := spec.checkSQL(ctx, sess, args[1], ids)
+			api, ip, read := s.reportStatement(ctx, sess, spec)
+			pins, indexPins = append(pins, read...), append(indexPins, ip...)
+			q, err := spec.checkSQL(ctx, sess, args[1], api)
 			if err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
 			out = "(" + q + ")"
 		}
@@ -144,7 +142,22 @@ func (s *Server) reportCalls(ctx context.Context, sess *session, text string) (s
 		edits = append(edits, edit{start, stop, out})
 	}
 	out, err := applyEdits(text, edits)
-	return out, pins, err
+	return out, pins, indexPins, err
+}
+
+// reportStatement returns the statement that answers spec's call: from
+// bitmap indexes where they can (reportindex.go), else from the tables,
+// through ids where it may (reportids.go); and what it pinned.
+func (s *Server) reportStatement(ctx context.Context, sess *session, spec *reportSpec) (string, []indexPin, []idPin) {
+	if plan := s.reportIndexes(ctx, sess, spec); plan != nil {
+		s.reportFromIndexes.Add(1)
+		return s.reportIndexSQL(spec, plan), plan.pins, nil
+	}
+	ids, read := s.reportIDs(ctx, sess, spec)
+	if ids != nil {
+		s.reportThroughIDs.Add(1)
+	}
+	return spec.sqlWith(ids), nil, read
 }
 
 // reportOwnNames refuses SQL a caller gave the API that names what only
@@ -863,11 +876,14 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 }
 
 // valueSQL is the value of a column or constant dimension, of the source s.
-func (d reportDim) valueSQL() string {
+func (d reportDim) valueSQL() string { return d.valueOf("s") }
+
+// valueOf is a column or constant dimension's value, of the rows of alias.
+func (d reportDim) valueOf(alias string) string {
 	if d.Constant != nil {
 		return quoteLiteral(*d.Constant)
 	}
-	v := "CAST(s." + quoteIdent(d.Column) + " AS VARCHAR)"
+	v := "CAST(" + alias + "." + quoteIdent(d.Column) + " AS VARCHAR)"
 	if d.Map == nil {
 		return v
 	}
@@ -945,7 +961,7 @@ func approximate(c string) bool {
 // checkSQL returns the statement of a parity check: the rows that differ
 // between the spec's result and the caller's SQL, by the columns they
 // share, with the side they are on.
-func (s *reportSpec) checkSQL(ctx context.Context, sess *session, text string, ids *reportIDs) (string, error) {
+func (s *reportSpec) checkSQL(ctx context.Context, sess *session, text, apiSQL string) (string, error) {
 	names, err := selectNames(ctx, sess, text, 0)
 	if err != nil {
 		return "", reportError("the SQL to compare: %v", err)
@@ -980,7 +996,7 @@ func (s *reportSpec) checkSQL(ctx context.Context, sess *session, text string, i
 	}
 	api, mine := reportCompareCTE+`api"`, reportCompareCTE+`sql"`
 	a, b := reportCompareCTE+`a"`, reportCompareCTE+`b"`
-	return "WITH " + api + " AS (" + s.sqlWith(ids) + "),\n" + mine + " AS (\n" + trimStatement(text) + "\n),\n" +
+	return "WITH " + api + " AS (" + apiSQL + "),\n" + mine + " AS (\n" + trimStatement(text) + "\n),\n" +
 		a + " AS (SELECT " + side("p") + " FROM " + api + " AS p),\n" +
 		b + " AS (SELECT " + side("q") + " FROM " + mine + " AS q)\n" +
 		"SELECT 'api_only' AS side, * FROM (SELECT * FROM " + a + " EXCEPT ALL SELECT * FROM " + b + ")\n" +
