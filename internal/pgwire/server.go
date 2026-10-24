@@ -362,6 +362,10 @@ type Server struct {
 	fed     *federation.Manager
 	remotes connectionSource
 	dist    *distributed.Coordinator
+	// beforeRefresh, if set, runs before a statement is checked and
+	// prepared again for its run, with the context that ends them (for
+	// tests).
+	beforeRefresh func(context.Context)
 	// splitPairs writes report calls' pair counts as workers would split
 	// them (see scanCounts), for tests until the planner combines rb_agg.
 	splitPairs bool
@@ -913,6 +917,10 @@ func (s *Server) acquireConn() bool {
 func (s *Server) releaseConn() { s.conns.Add(-1) }
 
 // errStatementTimeout matches PostgreSQL's message for the same event.
+// errCanceledBeforeRun is a cancel request's error for a statement that it
+// ended before it ran.
+var errCanceledBeforeRun = pgerror.WithCode(errors.New("canceling statement due to user request"), codes.QueryCanceled)
+
 var errStatementTimeout = pgerror.WithCode(errors.New("canceling statement due to statement timeout"), codes.QueryCanceled)
 
 // errMemoryShed is what a statement ShedMemory canceled fails with.
@@ -948,6 +956,41 @@ func (sess *session) rearm(outer, ctx context.Context) (context.Context, context
 	sess.running, sess.shed = cancel, false
 	sess.mu.Unlock()
 	return again, cancel
+}
+
+// cancelable returns a context that a cancel request, the session's
+// statement timeout and the memory watch (ShedMemory) end, as runCancelable's,
+// for what Igloo does for a statement before it runs it; query is the
+// statement as the client sent it. done ends it, and returns err as the
+// client is to read it.
+func (sess *session) cancelable(ctx context.Context, query string) (context.Context, func(err error) error) {
+	var cancel context.CancelFunc
+	if timeout := sess.statementTimeout(); timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	sess.mu.Lock()
+	sess.running, sess.statement, sess.started, sess.shed = cancel, redactQuery(query), time.Now(), false
+	sess.mu.Unlock()
+	return ctx, func(err error) error {
+		ended := ctx.Err()
+		sess.mu.Lock()
+		shed := sess.shed
+		sess.running, sess.statement, sess.started = nil, "", time.Time{}
+		sess.mu.Unlock()
+		cancel()
+		switch {
+		case ended == nil:
+			return err
+		case errors.Is(ended, context.DeadlineExceeded):
+			return errStatementTimeout
+		case shed:
+			return errMemoryShed
+		}
+		// A cancel request, whether or not the step it ended noticed.
+		return errCanceledBeforeRun
+	}
 }
 
 // runCancelable runs fn with a context that a cancel request, or the
@@ -1410,9 +1453,17 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		// them set again for its run, which drops them after (see
 		// hybridBitmaps).
 		defer sess.resetBitmapVariables(ctx)
+		// What Igloo does for the statement before it runs (setting its
+		// bitmaps' variables, checking it, preparing it again, which for a
+		// report call reads bitmap indexes) is ended as its run is: by a
+		// cancel request, the statement timeout or the memory watch.
+		pctx, prepared := sess.cancelable(ctx, q.Query)
+		if s.beforeRefresh != nil {
+			s.beforeRefresh(pctx)
+		}
 		err = sess.checkAborted(st.query)
 		if err == nil {
-			err = sess.ensureBitmapVariables(ctx, st.query)
+			err = sess.ensureBitmapVariables(pctx, st.query)
 		}
 		if err == nil {
 			// Rechecking re-plans with EXPLAIN and may re-apply policies,
@@ -1420,7 +1471,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			// before the run takes the side it needs (see holdCatalog,
 			// catalogRunLock).
 			relist := s.holdCatalog(sess)
-			err = s.recheck(ctx, sess, st)
+			err = s.recheck(pctx, sess, st)
 			relist()
 		}
 		if err == nil {
@@ -1429,10 +1480,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			// catalog, which holds nothing, and preparing again takes the
 			// lock it needs.
 			bitmaps := st.bitmaps
-			if err = s.refreshIDCounts(ctx, sess, st); err == nil {
+			if err = s.refreshIDCounts(pctx, sess, st); err == nil {
 				// And one answered from bitmap indexes, their tables'
 				// current snapshots, or the tables (see bitmaprewrite.go).
-				err = s.refreshIndexes(ctx, sess, st)
+				err = s.refreshIndexes(pctx, sess, st)
 			}
 			if err == nil && st.bitmaps != bitmaps {
 				if sess.bitmapsRestore != nil {
@@ -1441,6 +1492,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 				sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
 			}
 		}
+		err = prepared(err)
 		if err != nil {
 			s.metrics.query(start, err)
 			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})

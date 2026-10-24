@@ -82,3 +82,78 @@ func TestShedMemory(t *testing.T) {
 		t.Error("ShedMemory canceled something with nothing running")
 	}
 }
+
+// TestShedMemoryBeforeRun checks that what Igloo does for a statement
+// before it runs (checking it, preparing it again: a report call reads
+// bitmap indexes then) is ended as its run is, by the memory watch and by a
+// cancel request.
+func TestShedMemoryBeforeRun(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	ctx := context.Background()
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	const query = "SELECT 42 AS before_run"
+	ts.srv.beforeRefresh = func(ctx context.Context) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Minute):
+		}
+	}
+	running := func() []SessionInfo {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var got []SessionInfo
+			for _, s := range ts.srv.Sessions() {
+				if s.Statement == query {
+					got = append(got, s)
+				}
+			}
+			if len(got) == 1 || time.Now().After(deadline) {
+				return got
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	run := func() chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := conn.Exec(ctx, query)
+			done <- err
+		}()
+		return done
+	}
+	wait := func(what string, done chan error, code string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			var pg *pgconn.PgError
+			if !errors.As(err, &pg) || pg.Code != code {
+				t.Errorf("%s: %v, want %s", what, err, code)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("%s: not ended", what)
+		}
+	}
+
+	done := run()
+	if got := running(); len(got) != 1 {
+		t.Fatalf("running: %+v", got)
+	}
+	if !ts.srv.ShedMemory(100 << 20) {
+		t.Fatal("ShedMemory canceled nothing")
+	}
+	wait("before its run, the memory watch", done, "53200")
+
+	done = run()
+	got := running()
+	if len(got) != 1 || !ts.srv.CancelStatement(got[0].PID, "test") {
+		t.Fatalf("running: %+v", got)
+	}
+	wait("before its run, a cancel", done, "57014")
+
+	ts.srv.beforeRefresh = nil
+	if v := texts(t, conn, query); len(v) != 1 || v[0] != "42" {
+		t.Errorf("after: %q", v)
+	}
+}
