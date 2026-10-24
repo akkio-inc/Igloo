@@ -340,11 +340,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   A stage that reads small exchanges by partition runs fewer tasks, each
   over several partitions, as many as fit in a task's share of a worker's
   memory at the memory their rows take in hash tables (by their columns'
-  types, at least 64 bytes a row), and at least one a worker: a report's
-  stages that joined an audience of 189,000 rows to tables every task read
-  in full ran 32 tasks each, and read those tables 448 times. A statement
-  whose exchanges' rows, as estimated, would not fit a task's memory over
-  eight times the workers' partitions gets more, up to 256.
+  types, at least 64 bytes a row), and at least one for each task the
+  workers run at once: a report's stages that joined an audience of
+  189,000 rows to tables every task read in full ran 32 tasks each, and
+  read those tables 448 times. A statement whose exchanges' rows, as
+  estimated, would not fit a task's memory over eight times the workers'
+  partitions gets more, up to 256, by the width of the columns its stages
+  write, and no more than leave each writer files of a million rows: a
+  report at ten times the data took 256 partitions where 32 had sufficed,
+  by the width of every column its rows were made of, and ran in 362 s
+  instead of 153.
   Workers writing an exchange to object storage upload its files in parts
   of 5.25 MiB: DuckDB holds a part's buffer for every open file, 76.5 MiB
   by default, and a task over 243 partitions held 18 GiB for files of a few

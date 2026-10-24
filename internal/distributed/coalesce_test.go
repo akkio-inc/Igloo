@@ -84,7 +84,9 @@ func TestGroupPartitions(t *testing.T) {
 
 // TestPartitionsFor checks the partitions exchanges need for a task's rows
 // to fit its memory: a billion rows of two BIGINTs, 96 bytes each in hash
-// tables, need 90 partitions of 1 GiB, and an exchange fed by it as many.
+// tables, need 90 partitions of 1 GiB, and an exchange fed by it as many;
+// but written by 16 workers, no more than leave a million rows to each
+// writer's file of a partition, 59.
 func TestPartitionsFor(t *testing.T) {
 	big := &Table{Name: "events", Rows: 1e9, Columns: []Column{{Name: "a", Type: "BIGINT"}, {Name: "b", Type: "BIGINT"}}}
 	x, y := &Exchange{ID: 0}, &Exchange{ID: 1}
@@ -93,14 +95,17 @@ func TestPartitionsFor(t *testing.T) {
 		{ID: 1, Inputs: []Input{{View: "k", Exchange: x, Partitioned: true}}, Out: y},
 		{ID: 2, Inputs: []Input{{View: "k", Exchange: y, Partitioned: true}}},
 	}
-	if n := partitionsFor(stages, 1<<30); n != 90 {
+	if n := partitionsFor(stages, 1<<30, 1); n != 90 {
 		t.Errorf("%d partitions, want 90", n)
 	}
-	if n := partitionsFor(stages, 0); n != 0 {
+	if n := partitionsFor(stages, 1<<30, 16); n != 59 {
+		t.Errorf("16 writers: %d partitions, want 59", n)
+	}
+	if n := partitionsFor(stages, 0, 16); n != 0 {
 		t.Errorf("%d partitions without a budget", n)
 	}
 	big.Rows = 1000
-	if n := partitionsFor(stages, 1<<30); n != 1 {
+	if n := partitionsFor(stages, 1<<30, 16); n != 1 {
 		t.Errorf("%d partitions for a thousand rows", n)
 	}
 }
@@ -322,5 +327,125 @@ func TestPatternPartitions(t *testing.T) {
 	stages[1].fragment = nil
 	if n := exchangePartitions(stages, ws, len(ws), uploadBuffer); n != 243 {
 		t.Errorf("unfiltered: %d partitions, want 243", n)
+	}
+}
+
+// TestOutputWidths checks the widths of the columns a stage writes: those
+// of the input columns it names, a test a byte, a count a number, a cast
+// its type's, and a star every column it stands for.
+func TestOutputWidths(t *testing.T) {
+	p, err := newParser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.close() //nolint:errcheck
+	views := []stageView{
+		{name: "v", columns: map[string]int64{"id": 32, "day": 4, "tags": 272, "e0": 32, "e1": 32}, order: []string{"day", "e0", "e1", "id", "tags"}},
+		{name: "x", columns: map[string]int64{"k": 8}, order: []string{"k"}},
+	}
+	for _, c := range []struct {
+		query string
+		want  []int64
+		names string
+	}{
+		{"SELECT id, day, (e0 = 'a' OR e1 = 'b') AS flag, count(*) AS n, max(tags) AS t FROM v GROUP BY ALL",
+			[]int64{32, 4, 1, 16, 272}, "id,day,flag,n,t"},
+		{"SELECT CAST(id AS BIGINT) AS i, concat(e0, e1) AS e, list(e0) AS l, coalesce(e0, id) AS c FROM v",
+			[]int64{8, 64, 16 + listLength*32, 32}, "i,e,l,c"},
+		{"SELECT a.*, b.k FROM v AS a JOIN x AS b ON a.id = b.k", []int64{4, 32, 32, 32, 272, 8}, "day,e0,e1,id,tags,k"},
+		{"SELECT CASE WHEN e0 = 'a' THEN id ELSE e1 END AS c, b.k + 1 AS j FROM v, x AS b", []int64{32, 8}, "c,j"},
+	} {
+		q, err := p.parse(c.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		widths, names := outputWidths(&Stage{fragment: q}, views)
+		if !slices.Equal(widths, c.want) || strings.Join(names, ",") != c.names {
+			t.Errorf("%s: widths %v %v, want %v %s", c.query, widths, names, c.want, c.names)
+		}
+	}
+	if widths, _ := outputWidths(&Stage{fragment: node{"where_clause": node{}}}, views); widths != nil {
+		t.Errorf("a fragment without a SELECT list: %v", widths)
+	}
+}
+
+// TestReportPartitions checks a report's shape at ten times the data, on 16
+// workers of 24.6 GiB: visits, 299 million rows of an ID, a day, four lists
+// of strings and thirty strings the first stage tests to write a flag,
+// gathered by ID. Its exchange took the width of every column its rows were
+// made of, 2 KB a row, and 192 partitions (256 with the rest of the report)
+// where 32 had run as fast as anything, and its writers took four times as
+// long for the same rows. Now it takes its rows' own width and no partition
+// file of fewer than a million rows a writer: 32 partitions, and at a
+// hundred times the data as many as files of a million rows allow, within
+// the writers' memory.
+func TestReportPartitions(t *testing.T) {
+	p, err := newParser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.close() //nolint:errcheck
+	cols := []Column{{Name: "id", Type: "VARCHAR"}, {Name: "day", Type: "DATE"}}
+	var tests []string
+	for _, l := range []string{"cats", "kws", "doms", "urls"} {
+		cols = append(cols, Column{Name: l, Type: "VARCHAR[]"})
+	}
+	for i := range 30 {
+		name := "e" + strconv.Itoa(i)
+		cols = append(cols, Column{Name: name, Type: "VARCHAR"})
+		tests = append(tests, name+" = 'a'")
+	}
+	visits := &Table{Name: "visits", Rows: 299_400_000, Bytes: 5e9, Columns: cols}
+	first, err := p.parse("SELECT id, day, cats, kws, doms, urls, (" + strings.Join(tests, " OR ") + ") AS flag FROM v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := p.parse("SELECT id, count(*) AS n FROM x GROUP BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := &Exchange{ID: 0, Keys: []string{"id"}}
+	stages := []*Stage{
+		{ID: 0, Inputs: []Input{{View: "v", Table: visits, Split: true}}, Out: x, fragment: first},
+		{ID: 1, Inputs: []Input{{View: "x", Exchange: x, Partitioned: true}}, fragment: second},
+	}
+	var ws []*worker
+	for range 16 {
+		ws = append(ws, &worker{status: workerStatus{MemoryBytes: 26_400_000_000, Slots: 2, Cores: 8}})
+	}
+	if n := exchangePartitions(stages, ws, len(ws), uploadBuffer); n != 32 {
+		t.Errorf("ten times the data: %d partitions, want 32", n)
+	}
+	visits.Rows, visits.Bytes = 2_994_000_000, 50e9
+	n, writers := exchangePartitions(stages, ws, len(ws), uploadBuffer), writerPartitions(stages, ws, uploadBuffer)
+	if want := int(visits.Rows / (16 << 20)); n != want || n > writers {
+		t.Errorf("a hundred times the data: %d partitions, want %d, within the writers' %d", n, want, writers)
+	}
+}
+
+// TestGroupSlots checks that a stage of grouped partitions gets a task for
+// every slot of the workers: at ten times the data, 128 partitions of a
+// join on 16 workers that run two tasks each ran as 22 tasks of six
+// partitions, which took 32 to 34 s where 128 had taken 19 to 21.
+func TestGroupSlots(t *testing.T) {
+	var ws []*worker
+	for range 16 {
+		ws = append(ws, &worker{status: workerStatus{MemoryBytes: 26_400_000_000, Slots: 2, Cores: 8}})
+	}
+	cols := []Column{{Name: "id", Type: "VARCHAR"}}
+	a, s := &exchangeRun{columns: cols, partRows: make([]int64, 128)}, &exchangeRun{columns: cols, partRows: make([]int64, 128)}
+	for p := range 128 {
+		a.partRows[p], s.partRows[p] = 358_000, 4_000_000
+	}
+	e := &execution{ws: ws, parts: 128, exchanges: map[int]*exchangeRun{0: a, 1: s}}
+	stage := &Stage{Inputs: []Input{{View: "a", Exchange: &Exchange{ID: 0}, Partitioned: true}, {View: "s", Exchange: &Exchange{ID: 1}, Partitioned: true}}}
+	if g := e.groups(stage); len(g) < 32 {
+		t.Errorf("%d tasks for 32 slots", len(g))
+	}
+	if n := totalSlots(ws); n != 32 {
+		t.Errorf("%d slots, want 32", n)
+	}
+	if n := totalSlots([]*worker{{status: workerStatus{Cores: 16, MemoryBytes: 64 << 30}}, {}}); n != 5 {
+		t.Errorf("%d slots for a worker of 4 and one that does not say, want 5", n)
 	}
 }

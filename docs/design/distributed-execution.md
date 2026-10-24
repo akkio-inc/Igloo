@@ -551,11 +551,20 @@ share of the cohorts) fit a worker's memory; and more, up to 256, when the
 exchanges' rows as estimated (`partitionsFor`: the tables' rows, a
 hundredth where a filter compares a column to a constant and a fifth where
 `LIKE`, `ILIKE` or `GLOB` matches one against a constant pattern, at the
-memory a row of the columns read takes in a hash table) need them to fit
-half a task's share of a worker's memory. (Counted whole, the 8.3 billion
-segment rows of which a report's `LIKE 'SEG_HH_%'` kept 400 million
-called for 243 partitions at ten times the data, where 128 did; their
-writers took a third longer.) A task writes one file per
+memory a row of the columns the stages write takes in a hash table) need
+them to fit half a task's share of a worker's memory. A row's width is
+that of the columns its stage's `SELECT` list writes, by the types of the
+input columns it names (a test is a byte, a count a number, a cast its
+type), not that of every column it reads: a report's rows, made of 2,744
+bytes of columns, held 1,156, and took 256 partitions at ten times the data
+where 32 had sufficed. Nor does an exchange get more partitions than leave
+each writer task, about one a worker, files of a million rows as
+estimated: files of 8,000 to 80,000 rows, where 32 partitions had written
+files of a million, took that report's writers four times as long for the
+same rows, and the report 362 s against 153. (Counted whole, the 8.3
+billion segment rows of which a report's `LIKE 'SEG_HH_%'` kept 400
+million called for 243 partitions at ten times the data, where 128 did;
+their writers took a third longer.) A task writes one file per
 partition: DuckDB keeps only 100 of a partitioned `COPY`'s files open and
 starts new ones past that, which at 256 partitions made a task write
 17,275 files of 24 KB for 23 minutes, so workers raise that limit; the
@@ -667,9 +676,13 @@ known (`internal/distributed/coalesce.go`), so each of its tasks reads as
 many partitions as fit in half of a task's share of a worker's memory
 limit (its limit over the tasks it runs at once), at the memory a row takes
 in the hash tables that join or aggregate it: twice the row's width by its
-columns' types, and 64 bytes. Every worker still gets a task, and a
-partition is never split; exchanges hash keys alike, so a task that reads
-several partitions of every input still finds every match of its rows.
+columns' types, and 64 bytes. Every slot of the workers, a task each
+runs at once, still gets a task, and a partition is never split. (With
+a task a worker, a report's join stages of 128 partitions ran in 22 tasks
+of six partitions that took 32 to 34 s beside the other stages' tasks,
+where 128 tasks had taken 19 to 21.) Exchanges hash keys alike, so a
+task that reads several partitions of every input still finds every match
+of its rows.
 Compressed sizes would not do: an exchange of 4.4 million person IDs took
 25 MB, 6 bytes a row, and the hash tables counting them distinct took
 several hundred bytes a row, so tasks grouped by bytes spilled four times
