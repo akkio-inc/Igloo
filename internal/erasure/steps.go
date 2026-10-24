@@ -22,7 +22,6 @@ import (
 	"gocloud.dev/gcerrors"
 
 	"github.com/akkio-inc/igloo/internal/clone"
-	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -713,6 +712,10 @@ func (s *Service) deleteRows(ctx context.Context, r *Request) error {
 		if err := s.erasables(ctx, r); err != nil {
 			return err
 		}
+		// Before any DELETE, while the dictionaries still have them.
+		if err := s.lookUpDomainIDs(ctx, r); err != nil {
+			return err
+		}
 	}
 	for i := range r.Tables {
 		t := &r.Tables[i]
@@ -763,15 +766,20 @@ func (s *Service) deleteFromDictionaries(ctx context.Context, r *Request) error 
 	}
 	for i := range r.Tables {
 		t := &r.Tables[i]
-		if !t.active() || len(t.Ident) != 2 || !strings.EqualFold(t.Ident[0], iddomain.DictionarySchema) {
+		domain := dictionaryDomain(t)
+		if !t.active() || domain == "" {
 			continue
 		}
-		domain := t.Ident[1]
 		unlock, err := s.opts.IDDomains.Lock(ctx, domain, "erasure/"+r.ID, dictionaryLease, dictionaryWait)
 		if err != nil {
 			return contended(fmt.Errorf("delete from %s: %w", t.Name, err))
 		}
 		err = s.opts.IDDomains.MarkErased(ctx, domain)
+		if err == nil {
+			// The ids given meanwhile too, as to a value of rows that other
+			// engines wrote: after this delete, none of the values gets one.
+			err = s.addDomainIDs(ctx, r, t)
+		}
 		if err == nil {
 			err = s.deleteFrom(ctx, r, t)
 		}
@@ -1194,6 +1202,12 @@ func (s *Service) expire(ctx context.Context, r *Request) error {
 	if !waitUntil.IsZero() {
 		r.wait(waitUntil)
 		return nil
+	}
+	// The tables no longer hold the ids' values, in any snapshot left: the
+	// sets derived from them go now (a set rebuilt from them since the
+	// delete step has none of them).
+	if err := s.eraseIDSets(ctx, r); err != nil {
+		return err
 	}
 	for _, lt := range tables {
 		if lt.t.Blocked == "" {
@@ -2304,6 +2318,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		return "", err
 	}
 	v.History = c.n
+	if v.IDSets, err = s.holdingIDs(ctx, r); err != nil {
+		return "", err
+	}
 	var waiting []string
 	if v.Caches, v.Pending, waiting, err = s.caches(ctx, r); err != nil {
 		return "", err
@@ -2314,6 +2331,8 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	switch {
 	case v.Rows > 0 || v.Files > 0 || v.Bounds > 0 || v.Statistics > 0:
 		next = StepDelete
+	case v.IDSets > 0:
+		next = StepExpire
 	case v.Storage > 0 || v.Orphans > 0:
 		next = StepPurge
 	case v.Sharing > 0:
@@ -2420,7 +2439,7 @@ func (v *Verification) String() string {
 	}{
 		{v.Rows, "rows"}, {v.Files, "files"}, {v.Bounds, "manifest bounds"}, {v.Statistics, "Parquet statistics"},
 		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Sharing, "sharing copies"},
-		{v.History, "history records"},
+		{v.History, "history records"}, {v.IDSets, "sets of ids"},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", c.n, c.what))

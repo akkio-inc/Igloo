@@ -31,6 +31,9 @@ type Engine interface {
 type Rows interface {
 	Delete(ctx context.Context, tbl *table.Table, cond string) (int64, error)
 	Count(ctx context.Context, tbl *table.Table, cond string) (int64, error)
+	// IDs returns the distinct ids of the matching rows of tbl, an ID
+	// domain's dictionary (see IDSets).
+	IDs(ctx context.Context, tbl *table.Table, cond string) ([]int64, error)
 }
 
 // catalogRows runs DELETE and SELECT on the catalog's tables in DuckDB,
@@ -81,6 +84,23 @@ func (c catalogRows) Count(ctx context.Context, tbl *table.Table, cond string) (
 		return nil
 	})
 	return n, err
+}
+
+func (c catalogRows) IDs(ctx context.Context, tbl *table.Table, cond string) ([]int64, error) {
+	defer c.engine.CatalogLock()()
+	conn, err := c.engine.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close() //nolint:errcheck
+	var ids []int64
+	err = query(ctx, conn, "SELECT DISTINCT CAST(id AS BIGINT) FROM "+c.name(tbl)+" WHERE id IS NOT NULL AND "+cond, func(row []driver.Value) error {
+		if id, ok := row[0].(int64); ok {
+			ids = append(ids, id)
+		}
+		return nil
+	})
+	return ids, err
 }
 
 func commitConflict(err error) bool {

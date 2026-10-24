@@ -658,6 +658,8 @@ func (r failingRows) Count(context.Context, *table.Table, string) (int64, error)
 	return 0, nil
 }
 
+func (failingRows) IDs(context.Context, *table.Table, string) ([]int64, error) { return nil, nil }
+
 // A run that loses its lock, as when its connection to the metadata
 // database dropped and another replica may have taken it, stops before
 // its next step.

@@ -112,6 +112,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   distinct people over integers, and keeping sets of them as bitmaps, is
   what the heaviest audience reports spend their time on; the work that
   fills the ids and counts through them follows.
+- Erasure requests cover what Igloo derives from ID domains' ids, such as
+  bitmap indexes: a request looks up the ids the dictionaries gave the
+  person's values, before its first `DELETE` and again under the domain's
+  lease just before its last delete from the dictionary, keeps them sealed
+  with the identifiers and forgets them when it ends, has the derived sets
+  erase them at the end of its expire step, and counts in its verification
+  the sets still holding one (`id_sets`), which sends it back to expire.
 - A star in a view over a member table of an ID domain leaves out the
   column of ids when the view is created and whenever a replica loads it,
   as in statements, so a column list names the columns it means and the

@@ -151,7 +151,13 @@ func (k *sealer) hashSalt(salt string) string {
 
 // sealIDs encrypts identifiers, by subject, for request id.
 func (k *sealer) sealIDs(id string, ids [][]identifier) (string, error) {
-	plain, err := json.Marshal(ids)
+	return k.sealJSON(id, ids)
+}
+
+// sealJSON encrypts v as JSON, bound to aad: unsealing it with any other
+// associated data fails.
+func (k *sealer) sealJSON(aad string, v any) (string, error) {
+	plain, err := json.Marshal(v)
 	if err != nil {
 		return "", err
 	}
@@ -163,7 +169,7 @@ func (k *sealer) sealIDs(id string, ids [][]identifier) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	return base64.StdEncoding.EncodeToString(gcm.Seal(nonce, nonce, plain, []byte(id))), nil
+	return base64.StdEncoding.EncodeToString(gcm.Seal(nonce, nonce, plain, []byte(aad))), nil
 }
 
 // errKey means a request's identifiers cannot be unsealed: the erasure key
@@ -172,23 +178,28 @@ var errKey = errors.New("this replica cannot unseal the request's identifiers: i
 	"is not the key they were sealed under; set that key on every replica, and the request goes on")
 
 func (k *sealer) unsealIDs(id, sealed string) ([][]identifier, error) {
+	var ids [][]identifier
+	return ids, k.unsealJSON(id, sealed, &ids)
+}
+
+// unsealJSON decrypts what sealJSON sealed with aad into v.
+func (k *sealer) unsealJSON(aad, sealed string, v any) error {
 	b, err := base64.StdEncoding.DecodeString(sealed)
 	if err != nil {
-		return nil, errKey
+		return errKey
 	}
 	gcm, err := k.gcm()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(b) < gcm.NonceSize() {
-		return nil, errKey
+		return errKey
 	}
-	plain, err := gcm.Open(nil, b[:gcm.NonceSize()], b[gcm.NonceSize():], []byte(id))
+	plain, err := gcm.Open(nil, b[:gcm.NonceSize()], b[gcm.NonceSize():], []byte(aad))
 	if err != nil {
-		return nil, errKey
+		return errKey
 	}
-	var ids [][]identifier
-	return ids, json.Unmarshal(plain, &ids)
+	return json.Unmarshal(plain, v)
 }
 
 func (k *sealer) gcm() (cipher.AEAD, error) {

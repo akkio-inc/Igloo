@@ -330,3 +330,5 @@ type countRows int64
 
 func (n countRows) Count(context.Context, *table.Table, string) (int64, error) { return int64(n), nil }
 func (countRows) Delete(context.Context, *table.Table, string) (int64, error)  { return 0, nil }
+
+func (countRows) IDs(context.Context, *table.Table, string) ([]int64, error) { return nil, nil }

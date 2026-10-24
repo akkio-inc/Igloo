@@ -106,7 +106,11 @@ type Options struct {
 	// deletes from a domain's dictionary for the last time (see
 	// deleteRows). Nil means no domains.
 	IDDomains iddomain.Store
-	Metrics   *Metrics
+	// IDSets are what Igloo derives from ID domains' ids, such as bitmap
+	// indexes, which a request has erase the ids it erases (see IDSets).
+	// Nil means none.
+	IDSets  IDSets
+	Metrics *Metrics
 	// Memory is what rewriting a table's files may hold at once (see
 	// package filerewrite), as compaction's IGLOO_MAINTENANCE_MEMORY; zero
 	// means filerewrite.DefaultMemory.
@@ -678,6 +682,12 @@ func (s *Service) open(ctx context.Context, r *Request) error {
 		r.Subjects[i].ids = ids[i]
 		r.Subjects[i].hash(r.salt)
 	}
+	r.domainIDs = nil
+	if r.SealedIDs != "" {
+		if err := s.sealer.unsealJSON(domainIDsAAD(r.ID), r.SealedIDs, &r.domainIDs); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -722,7 +732,7 @@ func (s *Service) dropBranches(ctx context.Context, r *Request) {
 // and salt, and the paths of the files it deleted, which can hold them as
 // partition values.
 func (s *Service) end(ctx context.Context, r *Request) {
-	r.Salt, r.Sealed, r.salt = "", "", ""
+	r.Salt, r.Sealed, r.salt, r.SealedIDs, r.domainIDs = "", "", "", "", nil
 	for i := range r.Subjects {
 		r.Subjects[i].ids, r.Subjects[i].plain, r.Subjects[i].digests, r.Subjects[i].prefixes = nil, nil, nil, nil
 	}

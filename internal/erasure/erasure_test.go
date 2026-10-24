@@ -277,6 +277,32 @@ func (r testRows) Count(ctx context.Context, tbl *table.Table, _ string) (int64,
 	return rows.NumRows(), nil
 }
 
+// IDs reads the matching rows' id column, as an ID domain's dictionary
+// has.
+func (r testRows) IDs(ctx context.Context, tbl *table.Table, _ string) ([]int64, error) {
+	if tbl.CurrentSnapshot() == nil {
+		return nil, nil
+	}
+	rows, err := tbl.Scan(table.WithRowFilter(r.expr(tbl)), table.WithSelectedFields("id")).ToArrowTable(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Release()
+	var ids []int64
+	for i := 0; i < int(rows.NumCols()); i++ {
+		for _, chunk := range rows.Column(i).Data().Chunks() {
+			if c, ok := chunk.(*array.Int64); ok {
+				for j := 0; j < c.Len(); j++ {
+					if c.IsValid(j) {
+						ids = append(ids, c.Value(j))
+					}
+				}
+			}
+		}
+	}
+	return ids, nil
+}
+
 // readCache counts how often it is emptied.
 type readCache struct {
 	mu      sync.Mutex

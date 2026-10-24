@@ -138,6 +138,11 @@ type Request struct {
 	// under the erasure key. Both go when it ends.
 	Salt   string `json:"salt,omitempty"`
 	Sealed string `json:"sealed,omitempty"`
+	// SealedIDs are, while the request is open, the ids that ID domains'
+	// dictionaries gave the values it erases, by domain, sealed under the
+	// erasure key like the identifiers: what derived sets of ids, such as
+	// bitmap indexes, still hold (see IDSets). They go when it ends.
+	SealedIDs string `json:"sealed_ids,omitempty"`
 	// Tables are what the request erases from.
 	Tables []Table `json:"tables"`
 	// Downstream are tables history says were written from Tables.
@@ -178,6 +183,8 @@ type Request struct {
 	// erasure key, and written the files it wrote, while it runs.
 	salt    string
 	written map[string]bool
+	// domainIDs are SealedIDs unsealed, while it runs.
+	domainIDs map[string][]int64
 	// fold normalizes values as DuckDB does, for what Go compares.
 	fold *folding
 	// recheck, if set, is when the request looks again at what it waits
@@ -331,6 +338,9 @@ type Verification struct {
 	// running now, which are emptied when they start.
 	Caches  int `json:"caches"`
 	Pending int `json:"caches_pending"`
+	// IDSets are derived sets of ids, such as bitmap indexes' bitmaps,
+	// that still hold an id the request erased (see IDSets).
+	IDSets int64 `json:"id_sets"`
 }
 
 // File is a file a request deletes once nothing references it.
