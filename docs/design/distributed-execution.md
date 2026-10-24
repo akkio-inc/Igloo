@@ -906,6 +906,23 @@ stage completes the groups (`internal/distributed/aggregate.go`):
   `quantile_cont`, `string_agg ... ORDER BY`), and the coordinator reads
   one row per group. A part that reads one relation and has such
   aggregates has the relation keyed by its group columns for that.
+- **The first k of a ranking.** A statement that ranks an aggregation's
+  groups with `ROW_NUMBER()`, `RANK()` or `DENSE_RANK()` over one window,
+  read once through common table expressions, a `UNION ALL` and
+  projections, and keeps those ranked within the first k (`WHERE r <= k`,
+  or with conditions on the window's partition columns, which keep whole
+  partitions, as a CASE that ranks some partitions 0 does) has the stage
+  that completes the groups, by group or complete, keep only the rows
+  that may rank so: `QUALIFY rank() OVER (...) <= k`, `dense_rank()` for
+  `DENSE_RANK()`. A row's rank among its task's rows is at most its rank
+  among all, so every row within the first k reaches the coordinator, and
+  every row ahead of it in its partition too, so its rank comes out the
+  same; `RANK()` for `ROW_NUMBER()` keeps the rows tied at the kth place,
+  among which the coordinator chooses as one machine would. Two windows,
+  or rows kept by another column, keep every group: ranks would come out
+  over the rows kept. A report at a hundred times the data had sent every
+  group of four aggregations to the coordinator, 1.07 GB, to keep the
+  first ten of each partition (`internal/distributed/topk.go`).
 - **In place.** A partitioned join already holds every row of a join key's
   value in one partition. Aggregates over `DISTINCT` values of the key
   (or of what fixes it, as above) that add up are computed by the join's

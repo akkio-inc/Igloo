@@ -308,7 +308,9 @@ func newPlanner(ctx context.Context, env Env, p *parser, aggs map[string]bool, o
 // plan splits stmt, a parsed SELECT, into jobs. It returns an
 // errUnsupported error when no part of it can run distributed.
 func (pl *planner) plan(stmt node) (*Plan, error) {
-	out, err := pl.query(clone(stmt).(node), true, nil)
+	q := clone(stmt).(node)
+	pl.markTopK(q)
+	out, err := pl.query(q, true, nil)
 	if err != nil {
 		return nil, err
 	}

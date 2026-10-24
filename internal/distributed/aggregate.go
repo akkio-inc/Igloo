@@ -184,6 +184,10 @@ func (pl *planner) relationAggregate(c *candidate) (*jobBuild, error) {
 	if len(list(c.sel, "group_sets")) <= 1 && c.wholeGroups(raw) {
 		f := clone(c.sel).(node)
 		f["cte_map"] = node{"map": []any{}}
+		// The rows a statement ranks and keeps the first of (see markTopK).
+		if keep := child(c.sel, topKMark); keep != nil && child(f, "qualify") == nil {
+			f["qualify"] = clone(keep)
+		}
 		return &jobBuild{fragment: f}, nil
 	}
 	a := &aggregation{pl: pl, c: c, aliases: map[string]int{}, aggKeys: map[string]*aggCall{}}
@@ -219,6 +223,9 @@ func (pl *planner) relationAggregate(c *candidate) (*jobBuild, error) {
 	combine["from_table"], err = a.pl.p.fromRef("SELECT 1 FROM " + quoteIdent(partialsView))
 	if err != nil {
 		return nil, err
+	}
+	if q := qualifyTopK(c.sel, func(e node) (node, error) { return a.rewrite(e, "select") }); q != nil {
+		combine["qualify"] = q
 	}
 	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0}}, nil
 }
@@ -1012,6 +1019,13 @@ func (a *aggregation) fragment() (node, error) {
 		}
 		f["group_expressions"] = groups
 		f["group_sets"] = []any{set}
+		// Whole groups: the rows a statement ranks and keeps the first of
+		// (see markTopK).
+		if keep := child(a.c.sel, topKMark); keep != nil {
+			if q, err := a.substituteAliases(clone(keep).(node)); err == nil {
+				f["qualify"] = q
+			}
+		}
 		return f, nil
 	}
 	if a.mode != aggInPlace {
@@ -1128,11 +1142,15 @@ func (a *aggregation) groupStage() (*secondStage, error) {
 	f["select_list"] = items
 	// HAVING and the first rows are worth applying early, when they can be
 	// said in terms of the partial results alone; the coordinator applies
-	// them again.
+	// them again. So are the rows a statement ranks and keeps the first of
+	// (see markTopK), which it ranks again.
 	if h := child(a.c.sel, "having"); h != nil {
 		if e, err := a.rewrite(clone(h).(node), "having"); err == nil && overPartials(e) {
 			f["having"] = e
 		}
+	}
+	if q := qualifyTopK(a.c.sel, func(e node) (node, error) { return a.rewrite(e, "select") }); q != nil {
+		f["qualify"] = q
 	}
 	if mods, ok := a.firstRows(); ok {
 		f["modifiers"] = mods

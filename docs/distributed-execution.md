@@ -44,7 +44,9 @@ partial results; the coordinator combines them (sums of sums, counts of
 counts, minimums of minimums, and aggregates over `DISTINCT` values over the
 values the workers found) and runs the rest of the statement: `HAVING`,
 `ORDER BY`, `LIMIT`, window functions over the aggregates, other joins and
-subqueries. Queries without aggregation are divided the same way when they
+subqueries. A statement that ranks the groups with `ROW_NUMBER()`, `RANK()`
+or `DENSE_RANK()` and keeps the first few of each partition (`WHERE rank <=
+10`) has the workers send only the groups that may rank so. Queries without aggregation are divided the same way when they
 keep few rows: `SELECT DISTINCT`, and `ORDER BY ... LIMIT` of up to a
 million rows. A plain `SELECT ... WHERE` is not: every matching row would
 cross to the coordinator and wait on its disk before reaching the client.

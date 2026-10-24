@@ -94,7 +94,7 @@ func (p *parser) parse(query string) (node, error) {
 // that SQL into the same tree, so a construct DuckDB cannot print
 // faithfully is caught before anything runs.
 func (p *parser) print(n node) (string, error) {
-	n, err := p.crossAsInner(n)
+	n, err := p.crossAsInner(stripTopK(n))
 	if err != nil {
 		return "", err
 	}

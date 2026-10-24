@@ -629,6 +629,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   snapshot by number, `AT (VERSION => n)`, as such statements read the
   indexed tables, runs on workers too; one read at an older snapshot, or at
   two, still runs on one machine.
+- A statement that ranks an aggregation's groups with `ROW_NUMBER()`,
+  `RANK()` or `DENSE_RANK()` and keeps the first k of each partition has
+  the workers that complete the groups keep only those that may rank so
+  (`QUALIFY rank() OVER (...) <= k`), and the coordinator ranks what
+  arrives as before: a report at a hundred times the data sent it every
+  group of four aggregations, 1.07 GB, to keep the first ten of each.
+  Exact: a row's rank among a task's rows is at most its rank among all,
+  and rows tied at the kth place all arrive. Two windows, or rows kept by
+  a column the window does not partition by, keep every group.
 - A statement whose relation of uncertain size came out read by
   partition, but in a plan made with its size, gets that plan the next
   time without measuring the relation again, rather than the plan made
