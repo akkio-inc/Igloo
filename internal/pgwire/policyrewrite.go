@@ -127,7 +127,13 @@ type tablePlan struct {
 }
 
 func (p *tablePlan) noop() bool {
-	return !p.hidden && p.filter == nil && !slices.ContainsFunc(p.masks, func(m *maskPlan) bool { return m != nil })
+	return !p.hidden && !p.guards()
+}
+
+// guards reports whether a policy filters or masks the table for the
+// session, beyond leaving out the columns of ids.
+func (p *tablePlan) guards() bool {
+	return p.filter != nil || slices.ContainsFunc(p.masks, func(m *maskPlan) bool { return m != nil })
 }
 
 // plan works out how the session reads the protected table o. A table a
@@ -1595,7 +1601,11 @@ func (rw *rewriter) dmlEdits(t duckdb.StmtType, query string) ([]edit, error) {
 		if plan, err = rw.plan(o, rw.rules(o)); err != nil {
 			return nil, err
 		}
-		if plan.noop() {
+		// A target is not read for a result, so columns of ids need not
+		// be left out of it: only policies call for rewriting it. Masks
+		// do for a target whose member columns they mask, so that its
+		// ids, which hold the same information, stay out of reach.
+		if !plan.guards() {
 			plan = nil
 		}
 	}

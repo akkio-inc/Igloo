@@ -441,6 +441,17 @@ DROP ID DOMAIN people;
   which leaves them out. Igloo's Iceberg REST endpoint gives member tables
   to admins only, and a clean room's dataset of one has the columns
   without the ids.
+- Writes to a member table keep its ids right. An `INSERT` that names no
+  columns (`INSERT INTO t VALUES ...`, `INSERT INTO t SELECT ...`) names the
+  table's columns other than the ids', as does a `MERGE`'s `INSERT VALUES`;
+  the ids of new rows start out `NULL`. An `UPDATE`, or a `MERGE`'s `UPDATE
+  SET`, that sets a member column sets its ids to `NULL` too, so no row keeps
+  the id of a value it no longer holds. A `MERGE`'s `UPDATE BY NAME` (or `BY
+  POSITION`) into a member table is refused: name the columns instead.
+  Other engines' writes should do the same: name their columns, and set
+  `_igloo_id_<column>` to `NULL` where they change `<column>`.
+- `UPDATE`, `DELETE` and `MERGE` of member tables take the forms tables
+  with policies take: no `WITH` clause before them.
 - Ids are never handed out twice and stay below 2^32, the range of a 32-bit
   bitmap. A domain that has handed out all of them hands out no more, and
   the ids of values it has not seen stay `NULL`.

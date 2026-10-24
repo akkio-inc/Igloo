@@ -1660,6 +1660,11 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if err != nil {
 		return fail(err)
 	}
+	// Writes keep the columns that hold ID domains' ids right (see
+	// idwrite.go).
+	if query, err = s.memberWrites(ctx, sess, query); err != nil {
+		return fail(err)
+	}
 
 	// Preparing runs all but the last of several statements, so this
 	// comes first.

@@ -585,6 +585,8 @@ type memberCache struct {
 	// domains are the domains each table's columns are members of, by
 	// lower-case schema.table.
 	domains map[string][]string
+	// snap is the store's catalog as last loaded.
+	snap *iddomain.Snapshot
 }
 
 // memberTables returns the tables with columns that hold ids, by lower-case
@@ -623,11 +625,20 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 		}
 	}
 	changed := c.loaded
-	c.tables, c.names, c.domains, c.version, c.loaded = tables, names, domains, v, true
+	c.tables, c.names, c.domains, c.version, c.loaded, c.snap = tables, names, domains, v, true, snap
 	if changed {
 		s.catalogChanged()
 	}
 	return tables, names
+}
+
+// memberSnapshot returns the domains and members as memberTables last
+// loaded them, or nil if it could not.
+func (s *Server) memberSnapshot(ctx context.Context) *iddomain.Snapshot {
+	s.memberTables(ctx)
+	s.members.mu.Lock()
+	defer s.members.mu.Unlock()
+	return s.members.snap
 }
 
 // forgetMembers makes the next memberTables ask the store, after this
