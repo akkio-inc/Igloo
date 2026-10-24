@@ -55,8 +55,8 @@ docker run --rm "${mounts[@]}" -e RB_CACHE=/rb/cache -w /src "$go_image" extensi
 # MySQL first starts without networking to initialize; wait for TCP.
 ready "$name-mysql" docker exec "$name-mysql" mysql -h127.0.0.1 -uroot -ptest -e 'SELECT 1' igloo_test
 
-# IGLOO_TEST_CPUS=2 gives the tests 2 CPUs, as CI's runners have, to see
-# how long they take there.
+# IGLOO_TEST_CPUS=n gives the tests n CPUs' time (docker run --cpus), to
+# see how they fare on a smaller machine, such as CI's 2-core runners.
 cpus=()
 if [ -n "${IGLOO_TEST_CPUS:-}" ]; then
   cpus=(--cpus "$IGLOO_TEST_CPUS")

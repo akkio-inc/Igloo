@@ -31,9 +31,16 @@ env:
 
 jobs:
   go:
-    name: Go
+    name: Go (${{ matrix.part }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # internal/pgwire's tests used a runner's 2 cores for 7 minutes, as
+        # long as all the other packages' tests: half of them run in each
+        # of two jobs of their own.
+        part: [packages, pgwire 1/2, pgwire 2/2]
     services:
       # The user store tests need a real PostgreSQL.
       postgres:
@@ -61,6 +68,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Check formatting
+        if: matrix.part == 'packages'
         # third_party keeps its upstream formatting.
         run: |
           unformatted=$(gofmt -l cmd internal)
@@ -72,6 +80,7 @@ jobs:
 
       # duckdb_arrow builds DuckDB's Arrow results, for Arrow Flight SQL.
       - name: Vet
+        if: matrix.part == 'packages'
         run: go vet -tags duckdb_arrow ./...
 
       # Igloo's own rb extension, against the bindings' DuckDB: the engine
@@ -88,11 +97,27 @@ jobs:
           echo "IGLOO_TEST_EXTENSION_DIR=$RUNNER_TEMP/duckdb-extensions" >>"$GITHUB_ENV"
 
       - name: Test
-        # -parallel 4, twice these runners' 2 cores: many of internal/pgwire's
-        # parallel tests spend their time waiting on timers or on other
-        # sessions. -timeout 20m: before its tests ran in parallel, that
+        if: matrix.part == 'packages'
+        run: |
+          mapfile -t packages < <(go list -tags duckdb_arrow ./... | grep -v '/internal/pgwire$')
+          go test -tags duckdb_arrow -timeout 20m "${packages[@]}"
+
+      - name: Test internal/pgwire
+        if: matrix.part != 'packages'
+        # pgwire 1/2 runs every other test, in the order -list gives them,
+        # and pgwire 2/2 all the rest. -parallel 4, twice these runners' 2
+        # cores: many of the tests spend their time waiting on timers or on
+        # other sessions. -timeout 20m: before its tests ran in parallel, the
         # package took 8-9 minutes here, near go test's default limit of 10.
-        run: go test -tags duckdb_arrow -parallel 4 -timeout 20m ./...
+        env:
+          PART: ${{ matrix.part }}
+        run: |
+          half=$(go test -tags duckdb_arrow -list '^Test' ./internal/pgwire/ | grep '^Test' | awk 'NR % 2' | paste -sd '|' -)
+          select=-skip
+          if [ "$PART" = "pgwire 1/2" ]; then
+            select=-run
+          fi
+          go test -tags duckdb_arrow -parallel 4 -timeout 20m "$select" "^($half)\$" ./internal/pgwire/
 
   migrate:
     name: Migration report
