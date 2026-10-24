@@ -65,7 +65,8 @@ func serveWorker() error {
 	locations := append([]string{cfg.Storage.Root()}, cfg.Storage.AllowedLocations...)
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: eng, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
-		Locations: locations, MemoryBytes: memory, Threads: threads, Metrics: distributed.NewWorkerMetrics(reg),
+		Locations: locations, MemoryBytes: memory, Threads: threads, ExchangeBytes: cfg.Workers.ExchangeMax,
+		Metrics: distributed.NewWorkerMetrics(reg),
 	}, log)
 	if err != nil {
 		return err

@@ -464,6 +464,21 @@ func TestExchangeRoom(t *testing.T) {
 		t.Error("released, and still reserved")
 	}
 	r2()
+	// Under IGLOO_EXCHANGE_MAX_SIZE, with what files on the disk hold.
+	w.local.limit = 100
+	w.local.register("q7", map[string]int64{"s1/0/a0/__b=0/data_0.parquet": 70})
+	if _, ok := w.local.reserve(40); ok {
+		t.Error("reserved past the limit")
+	}
+	if err := w.local.remove("q7"); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := w.local.reserve(40); !ok {
+		t.Error("removed, and still held")
+	} else {
+		r()
+	}
+	w.local.limit = 0
 	w.local.free = func(string) (int64, error) { return 0, errors.New("no disk") }
 	if _, ok := w.local.reserve(0); ok {
 		t.Error("reserved without knowing the free space")

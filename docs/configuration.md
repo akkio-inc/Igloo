@@ -246,4 +246,7 @@ A worker (`igloo worker`) reads `IGLOO_WORKER_SECRET`,
 (`IGLOO_WAREHOUSE_LOCATION`, `IGLOO_ALLOWED_LOCATIONS`, `IGLOO_S3_*`,
 `IGLOO_GCS_*`, `IGLOO_AZURE_*`), DuckDB (`IGLOO_DUCKDB_*`), the read cache
 (`IGLOO_CACHE_*`), `IGLOO_HTTP_ADDR` (health checks and metrics) and logs.
-It needs no catalog, database or users.
+It needs no catalog, database or users. With `IGLOO_EXCHANGES=local` on the
+server, `IGLOO_EXCHANGE_MAX_SIZE` on a worker (a size such as `30GiB`) caps
+what exchanges may take on its disk, for a volume whose free space the
+worker cannot see, such as a Kubernetes `emptyDir` with a size limit.

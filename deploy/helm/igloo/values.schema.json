@@ -977,6 +977,13 @@
           "type": "string",
           "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
+        "exchanges": {
+          "description": "Where workers exchange rows: object storage, or their own disks.",
+          "enum": [
+            "object",
+            "local"
+          ]
+        },
         "existingSecret": {
           "type": "string"
         },

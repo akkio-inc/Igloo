@@ -96,8 +96,10 @@ type localExchanges struct {
 	mu      sync.Mutex
 	queries map[string]*localQuery
 	// reserved are the bytes tasks running expect to write or fetch, which
-	// the free space does not count yet.
-	reserved int64
+	// the free space does not count yet; held are those of the files
+	// written and fetched that are still there; limit, if not zero, caps
+	// held and reserved together.
+	reserved, held, limit int64
 
 	serving chan struct{}
 	waiting atomic.Int32
@@ -139,8 +141,9 @@ func (l *localExchanges) reserveWait(ctx context.Context, n int64) (release func
 		free, err := l.free(l.root)
 		l.mu.Lock()
 		none := l.reserved == 0
+		over := l.limit > 0 && n > l.limit
 		l.mu.Unlock()
-		if err != nil || none || n > free/localShare {
+		if err != nil || none || over || n > free/localShare {
 			return func() {}, fmt.Errorf("the worker's disk is short of room for the %d bytes of exchanged rows the task reads", n)
 		}
 		select {
@@ -160,7 +163,7 @@ func (l *localExchanges) reserve(n int64) (release func(), ok bool) {
 	n = max(n, 0)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err != nil || n+l.reserved > free/localShare {
+	if err != nil || n+l.reserved > free/localShare || l.limit > 0 && n+l.reserved+l.held > l.limit {
 		return func() {}, false
 	}
 	l.reserved += n
@@ -194,9 +197,27 @@ func (l *localExchanges) register(qid string, files map[string]int64) {
 		l.queries[qid] = q
 	}
 	for name, size := range files {
+		l.held += size - q.files[name]
 		q.files[name] = size
 	}
 	q.used = l.now()
+}
+
+// drop forgets statement qid's files, as removed. l.mu must be held.
+func (l *localExchanges) drop(qid string) {
+	if q := l.queries[qid]; q != nil {
+		for _, size := range q.files {
+			l.held -= size
+		}
+		delete(l.queries, qid)
+	}
+}
+
+// hold counts n bytes more, or fewer, of files fetched to the disk.
+func (l *localExchanges) hold(n int64) {
+	l.mu.Lock()
+	l.held += n
+	l.mu.Unlock()
 }
 
 // open opens the exchange file name of statement qid, if this worker wrote
@@ -256,7 +277,7 @@ func (l *localExchanges) remove(qid string) error {
 		return errNoExchange
 	}
 	l.mu.Lock()
-	delete(l.queries, qid)
+	l.drop(qid)
 	l.mu.Unlock()
 	return os.RemoveAll(filepath.Join(l.root, qid))
 }
@@ -289,7 +310,7 @@ func (l *localExchanges) sweep(now time.Time) []string {
 	var removed []string
 	for _, qid := range stale {
 		l.mu.Lock()
-		delete(l.queries, qid)
+		l.drop(qid)
 		l.mu.Unlock()
 		if err := os.RemoveAll(filepath.Join(l.root, filepath.Base(qid))); err == nil {
 			removed = append(removed, qid)
@@ -499,7 +520,6 @@ func (w *Worker) fetchExchanges(ctx context.Context, req *taskRequest) (func(), 
 	if err != nil {
 		return func() {}, err
 	}
-	// Fetched, the files count in the free space.
 	defer release()
 	dir, err := os.MkdirTemp(w.fetchRoot, "task-")
 	if err != nil {
@@ -523,7 +543,14 @@ func (w *Worker) fetchExchanges(ctx context.Context, req *taskRequest) (func(), 
 		done()
 		return func() {}, err
 	}
-	return done, nil
+	// Fetched, the files count in the free space, and as held until the
+	// task removes them, rather than as reserved.
+	w.local.hold(total)
+	release()
+	return func() {
+		done()
+		w.local.hold(-total)
+	}, nil
 }
 
 // fetchFile fetches exchange file f from the worker that wrote it to dst.

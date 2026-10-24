@@ -459,6 +459,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `workers.maxReplicas` | `4` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
 | `workers.idleAfter` | `10m` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks |
 | `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |
+| `workers.exchanges` | `object` | `IGLOO_EXCHANGES`: where workers exchange rows; `local` lets workers reach each other's task port and splits the spill volume 60% spill, 30% exchanges (`IGLOO_EXCHANGE_MAX_SIZE`) |
 | `workers.existingSecret` | `""` | Secret with key `secret` (32+ characters) for `IGLOO_WORKER_SECRET`; generated and kept when empty |
 | `workers.duckdb.memoryLimit`, `threads` | `""`, `null` | As `duckdb.*`, from `workers.resources`; null threads: four per core |
 | `workers.duckdb.spillVolume.sizeLimit` / `medium` | `100Gi` / `""` | Workers' spill `emptyDir`; `IGLOO_DUCKDB_MAX_TEMP_SIZE` is 90% of it |

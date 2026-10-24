@@ -76,9 +76,18 @@ spec:
             - name: IGLOO_DUCKDB_MEMORY_LIMIT
               value: {{ . | quote }}
             {{- end }}
-            {{- with .Values.workers.duckdb.spillVolume.sizeLimit }}
+            {{- if .Values.workers.duckdb.spillVolume.sizeLimit }}
+            {{- $spillMiB := float64 (include "igloo.quantityMiB" (list "workers.duckdb.spillVolume.sizeLimit" .Values.workers.duckdb.spillVolume.sizeLimit)) }}
+            {{- if eq (.Values.workers.exchanges | default "object") "local" }}
+            {{- /* Exchanges share the volume: 60% for spill, 30% for them. */}}
             - name: IGLOO_DUCKDB_MAX_TEMP_SIZE
-              value: {{ printf "%dMiB" (int64 (floor (mulf (float64 (include "igloo.quantityMiB" (list "workers.duckdb.spillVolume.sizeLimit" .))) 0.9))) | quote }}
+              value: {{ printf "%dMiB" (int64 (floor (mulf $spillMiB 0.6))) | quote }}
+            - name: IGLOO_EXCHANGE_MAX_SIZE
+              value: {{ printf "%dMiB" (int64 (floor (mulf $spillMiB 0.3))) | quote }}
+            {{- else }}
+            - name: IGLOO_DUCKDB_MAX_TEMP_SIZE
+              value: {{ printf "%dMiB" (int64 (floor (mulf $spillMiB 0.9))) | quote }}
+            {{- end }}
             {{- end }}
             {{- if not (kindIs "invalid" .Values.workers.duckdb.threads) }}
             - name: IGLOO_DUCKDB_THREADS
@@ -236,7 +245,8 @@ subjects:
 {{- if .Values.networkPolicy.enabled }}
 ---
 # Workers take tasks from their own igloo pods only (those of their compute
-# pool), and serve health checks and metrics.
+# pool), and serve health checks and metrics; with workers.exchanges local,
+# they also send each other the rows they exchange, over the same port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -257,6 +267,15 @@ spec:
       ports:
         - port: worker
           protocol: TCP
+    {{- if eq (.Values.workers.exchanges | default "object") "local" }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 14 }}
+      ports:
+        - port: worker
+          protocol: TCP
+    {{- end }}
     # Health checks and metrics: from networkPolicy.metricsFrom, or, without
     # it, from pods of this namespace only (kubelet probes are not pod
     # traffic).

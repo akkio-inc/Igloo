@@ -71,6 +71,10 @@ type WorkerOptions struct {
 	// estimate how fast workers read object storage cold by their threads
 	// a core; zero for unknown.
 	Threads int
+	// ExchangeBytes caps what exchanges on its disk, written or fetched,
+	// may take there (IGLOO_EXCHANGE_MAX_SIZE), as on a volume whose size
+	// its free space does not show; zero leaves them to the free space.
+	ExchangeBytes int64
 	// Tasks is how many tasks run at once; others wait. Zero means as many
 	// as Cores and MemoryBytes allow (taskSlots).
 	Tasks   int
@@ -140,6 +144,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	local.limit = opts.ExchangeBytes
 	fetchRoot := filepath.Join(dir, "fetched")
 	if err := os.MkdirAll(fetchRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create directory for fetched exchanges: %w", err)

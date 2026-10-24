@@ -83,6 +83,40 @@ for invalid in "pools[0].name=default" "pools[0].name=Acme" "pools[0].name=a,poo
   fi
 done
 
+echo "exchanges between workers"
+# docf FILE KIND NAME prints the rendered object of that kind and name in FILE.
+docf() {
+  awk -v kind="kind: $2" -v name="  name: $3" '
+    /^---/ { if (k && n) printf "%s", buf; buf = ""; k = 0; n = 0; next }
+    { buf = buf $0 "\n" }
+    $0 == kind { k = 1 }
+    $0 == name { n = 1 }
+    END { if (k && n) printf "%s", buf }' "$1"
+}
+# admitted FILE prints the components the workers' NetworkPolicy admits to their task port.
+admitted() {
+  docf "$1" NetworkPolicy igloo-workers | sed -n '/ingress:/,/port: http/p' | grep -o 'component: .*' | sed 's/component: //' |
+    tr '\n' ' ' | sed 's/ $//'
+}
+render "${bundled[@]}" --set workers.enabled=true >"$work/object.yaml"
+render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=local >"$work/local.yaml"
+check "exchanges through object storage by default" '"object"' \
+  "$(docf "$work/object.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
+check "workers take tasks from igloo pods only" "server" "$(admitted "$work/object.yaml")"
+check "workers.exchanges local sets IGLOO_EXCHANGES" '"local"' \
+  "$(docf "$work/local.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
+check "and lets workers reach each other's task port" "server worker" "$(admitted "$work/local.yaml")"
+spill_env() { docf "$1" Deployment igloo-workers | grep -A1 -E "^ +- name: $2\$" | sed -n 's/^ *value: //p'; }
+check "workers spill to 90% of their volume" '"92160MiB"|' \
+  "$(spill_env "$work/object.yaml" IGLOO_DUCKDB_MAX_TEMP_SIZE)|$(spill_env "$work/object.yaml" IGLOO_EXCHANGE_MAX_SIZE)"
+check "with local exchanges, 60% spill and 30% exchanges" '"61440MiB"|"30720MiB"' \
+  "$(spill_env "$work/local.yaml" IGLOO_DUCKDB_MAX_TEMP_SIZE)|$(spill_env "$work/local.yaml" IGLOO_EXCHANGE_MAX_SIZE)"
+if render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=nvme >/dev/null 2>&1; then
+  fail "refuses workers.exchanges=nvme"
+else
+  pass "refuses workers.exchanges=nvme"
+fi
+
 echo "the admin password"
 # A generated password is long enough for Igloo to create the account with.
 generated=$(render "${bundled[@]}" | sed -n 's/^  admin-password: //p' | base64 -d | wc -c | tr -d ' ')

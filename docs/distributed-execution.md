@@ -461,10 +461,15 @@ disks, and the writers needed 0.9 GB of memory rather than 1.6.
   disks when the statement is done, and tells them it still runs every 30
   minutes; a worker removes files nothing used for six hours, as after the
   server stopped, and all of them when it restarts.
-- **Networks.** Workers must reach each other's task port (7433). The Helm
-  chart's NetworkPolicy lets only igloo pods reach it, so keep the default
-  on Kubernetes for now; Docker Compose and virtual machines on one network
-  need nothing more.
+- **Networks.** Workers must reach each other's task port (7433). With the
+  Helm chart, set `workers.exchanges: local`, which sets `IGLOO_EXCHANGES`,
+  lets the workers' NetworkPolicy admit each other on that port (only the
+  workers of the same compute pool), and splits the workers' spill volume,
+  whose free space Kubernetes does not show its pods: 60% for spill
+  (`IGLOO_DUCKDB_MAX_TEMP_SIZE`), 30% for exchanges
+  (`IGLOO_EXCHANGE_MAX_SIZE` on the workers, which caps what exchanges on a
+  worker's disk may take). Docker Compose and virtual machines on one
+  network need nothing more.
 
 ## Seeing it
 
@@ -633,7 +638,8 @@ where partial results are kept while a statement combines them.
 On a worker (`igloo worker`): `IGLOO_WORKER_SECRET`,
 `IGLOO_WORKER_LISTEN_ADDR` (`:7433`), the server's storage settings, and
 `IGLOO_DUCKDB_*`, `IGLOO_CACHE_*`, `IGLOO_HTTP_ADDR` and `IGLOO_LOG_*` as on
-the server.
+the server; with local exchanges, `IGLOO_EXCHANGE_MAX_SIZE` caps what they
+may take on its disk (empty: a quarter of its free space at a time).
 
 ## Sizing and cost
 

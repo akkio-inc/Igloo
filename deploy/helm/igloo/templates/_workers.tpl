@@ -111,6 +111,8 @@ workers.resources.limits.memory leaving at least 512Mi, as for igloo pods.
   value: {{ .Values.workers.idleAfter | quote }}
 - name: IGLOO_WORKER_START_TIMEOUT
   value: {{ .Values.workers.startTimeout | quote }}
+- name: IGLOO_EXCHANGES
+  value: {{ .Values.workers.exchanges | default "object" | quote }}
 {{- end -}}
 
 {{/* Object storage settings, for workers: as the igloo pods have them. */}}

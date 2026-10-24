@@ -32,8 +32,11 @@ type Workers struct {
 	// auto mode runs it on workers, unless it would run short of memory.
 	Threshold time.Duration
 	// Exchanges is where workers write the rows they exchange: object (the
-	// warehouse's object storage) or local (their own disks).
-	Exchanges string
+	// warehouse's object storage) or local (their own disks). ExchangeMax,
+	// on a worker, caps the bytes of exchanges on its disk; zero leaves
+	// them to the disk's free space.
+	Exchanges   string
+	ExchangeMax int64
 
 	K8sNamespace   string
 	K8sDeployment  string
@@ -76,6 +79,13 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 	}
 	if w.Exchanges != "object" && w.Exchanges != "local" {
 		addErr("IGLOO_EXCHANGES must be object or local, got %q", w.Exchanges)
+	}
+	if v := get("IGLOO_EXCHANGE_MAX_SIZE", ""); v != "" {
+		n, err := ParseSize(v)
+		if err != nil {
+			addErr("IGLOO_EXCHANGE_MAX_SIZE: %v", err)
+		}
+		w.ExchangeMax = n
 	}
 	for _, a := range strings.Split(get("IGLOO_WORKERS", ""), ",") {
 		if a = strings.TrimSpace(a); a == "" {

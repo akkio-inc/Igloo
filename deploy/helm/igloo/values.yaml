@@ -377,6 +377,12 @@ workers:
   # igloo pod instead -> IGLOO_WORKER_START_TIMEOUT. Allow for the cluster
   # autoscaler adding nodes.
   startTimeout: 3m
+  # Where workers exchange rows between a statement's stages -> IGLOO_EXCHANGES:
+  # object (the warehouse's object storage) or local (their spill volumes,
+  # from which the workers that read them fetch them; the NetworkPolicy then
+  # lets workers reach each other's task port, and the spill volume is split:
+  # 60% for spill, 30% for exchanges, rather than 90% for spill).
+  exchanges: object
   # Secret with key "secret" (at least 32 characters) -> IGLOO_WORKER_SECRET,
   # which igloo and workers authenticate each other with. Generated and kept
   # across upgrades when empty.

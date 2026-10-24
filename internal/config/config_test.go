@@ -480,4 +480,11 @@ func TestExchanges(t *testing.T) {
 			t.Errorf("IGLOO_EXCHANGES=%s should be refused", v)
 		}
 	}
+	cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_EXCHANGE_MAX_SIZE": "30GiB"}))
+	if err != nil || cfg.Workers.ExchangeMax != 30<<30 {
+		t.Errorf("IGLOO_EXCHANGE_MAX_SIZE=30GiB: %d %v", cfg.Workers.ExchangeMax, err)
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_EXCHANGE_MAX_SIZE": "lots"})); err == nil {
+		t.Error("IGLOO_EXCHANGE_MAX_SIZE=lots should be refused")
+	}
 }
