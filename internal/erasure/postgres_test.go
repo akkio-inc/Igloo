@@ -118,10 +118,10 @@ func testStore(t *testing.T, s Store) {
 	if c := cacheOf(); c.Host != "replica-1" || !c.Emptied.IsZero() {
 		t.Errorf("cache: %+v", c)
 	}
-	if err := s.Emptied(ctx, cache, deleted); err != nil {
+	if err := s.Emptied(ctx, cache, deleted, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Emptied(ctx, cache, now); err != nil {
+	if err := s.Emptied(ctx, cache, now, ""); err != nil {
 		t.Fatal(err)
 	}
 	if c := cacheOf(); !c.Emptied.Equal(deleted) {

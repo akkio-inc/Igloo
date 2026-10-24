@@ -274,3 +274,45 @@ func TestSetupPrefetch(t *testing.T) {
 		t.Error("opened a path without a bucket and key")
 	}
 }
+
+// TestCacheIdentity keeps the read cache's ID and purge token in a file
+// beside it, whatever the host name, so a container made again on the
+// same volume goes on with its cache; a file from before purge tokens
+// keeps its ID on the machine it names.
+func TestCacheIdentity(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	e := &Engine{}
+	if err := e.setupCache((&recorder{}).exec, s3Config(dir), log); err != nil {
+		t.Fatal(err)
+	}
+	id, token, save, err := e.CacheIdentity()
+	if err != nil || !strings.HasPrefix(id, "disk:") || !strings.HasPrefix(token, "t:") || save == nil {
+		t.Fatalf("first: %q %q %v", id, token, err)
+	}
+	again, againToken, _, err := e.CacheIdentity()
+	if err != nil || again != id || againToken != token {
+		t.Errorf("again: %q %q, want %q %q (%v)", again, againToken, id, token, err)
+	}
+	if err := save("disk:other", "t:new"); err != nil {
+		t.Fatal(err)
+	}
+	if got, gotToken, _, err := e.CacheIdentity(); err != nil || got != "disk:other" || gotToken != "t:new" {
+		t.Errorf("after save: %q %q %v", got, gotToken, err)
+	}
+	file := filepath.Join(filepath.Dir(e.cache.dir), cacheIDFile)
+	if err := os.WriteFile(file, []byte("disk:old "+machineID()+"\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	got, gotToken, _, err := e.CacheIdentity()
+	if err != nil || got != "disk:old" || !strings.HasPrefix(gotToken, "t:") {
+		t.Errorf("a file from before tokens, on its machine: %q %q %v", got, gotToken, err)
+	}
+	if b, _ := os.ReadFile(file); strings.TrimSpace(string(b)) != got+" "+gotToken {
+		t.Errorf("the file now: %q", b)
+	}
+	// Without a cache on disk, the process's own.
+	if id, _, save, err := (&Engine{}).CacheIdentity(); err != nil || save != nil || !strings.HasPrefix(id, "memory:") {
+		t.Errorf("without a cache on disk: %q %v %v", id, save != nil, err)
+	}
+}

@@ -128,48 +128,70 @@ func (s *erasureSource) FillRow(row duckdb.Row) (bool, error) {
 	return true, nil
 }
 
-// cacheIDFile keeps the read cache's ID, beside its blocks, with the
-// machine it belongs to.
+// cacheIDFile keeps the read cache's ID and purge token, beside its
+// blocks, on the same disk.
 const cacheIDFile = "cache-id"
 
-// CacheID identifies this replica's read cache to erasure requests, which
-// wait for every running replica to empty its cache after they delete
-// files. A cache on disk keeps its ID in its directory, so the ID lasts as
-// long as the cache does, across restarts, but only on the machine that
-// made it: a disk copied with a VM image to another machine gets a new
-// one, and is emptied, so the two replicas are told apart. Without a cache
-// on disk, the ID is the process's own.
-func (e *Engine) CacheID() (string, error) {
+// CacheIdentity identifies this replica's read cache to erasure requests,
+// which wait for every running replica to empty its cache after they
+// delete files (see erasure.Purger). A cache on disk keeps its ID, and the
+// purge token it was given when last emptied, in a file in its directory,
+// so they last as long as the disk does: across restarts, and across a
+// container made again on the same volume, whose host name and machine ID
+// are new each time. save writes a new ID and token there. The purger,
+// not the machine, tells copies of a disk apart (see erasure.Purger).
+// Without a cache on disk, the ID is the process's own and save is nil.
+//
+// A file of the format before tokens, "disk:<id> <machine>", keeps its ID
+// on the machine it names, with a new token; on another machine the cache
+// is emptied and gets a new ID, as before.
+func (e *Engine) CacheIdentity() (id, token string, save func(id, token string) error, err error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
+		return "", "", nil, err
 	}
 	random := hex.EncodeToString(b[:])
 	if e.cache == nil {
-		return erasure.MemoryCache + random, nil
+		return erasure.MemoryCache + random, "", nil, nil
 	}
-	machine := machineID()
 	file := filepath.Join(filepath.Dir(e.cache.dir), cacheIDFile)
+	save = func(id, token string) error {
+		tmp := file + ".new"
+		if err := os.WriteFile(tmp, []byte(id+" "+token+"\n"), 0o640); err != nil {
+			return err
+		}
+		return os.Rename(tmp, file)
+	}
 	saved, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", err
+		return "", "", nil, err
 	}
-	if id, on, ok := strings.Cut(strings.TrimSpace(string(saved)), " "); ok && id != "" && on == machine {
-		return id, nil
-	}
-	if len(saved) > 0 {
-		// Blocks from another machine, whose erasures this one's ID has
-		// not seen: they go.
+	fields := strings.Fields(string(saved))
+	switch {
+	case len(fields) == 2 && strings.HasPrefix(fields[0], "disk:") && strings.HasPrefix(fields[1], "t:"):
+		return fields[0], fields[1], save, nil
+	case len(fields) == 2 && strings.HasPrefix(fields[0], "disk:") && fields[1] == machineID():
+		// Before tokens, on the machine that made it.
+		token = "t:" + random
+		return fields[0], token, save, save(fields[0], token)
+	case len(saved) > 0:
+		// Blocks of a cache whose erasures this one's ID has not seen:
+		// they go.
 		if err := e.EmptyCache(context.Background()); err != nil {
-			return "", err
+			return "", "", nil, err
 		}
 	}
-	id := "disk:" + random
-	return id, os.WriteFile(file, []byte(id+" "+machine+"\n"), 0o640)
+	var t [12]byte
+	if _, err := rand.Read(t[:]); err != nil {
+		return "", "", nil, err
+	}
+	id, token = "disk:"+random, "t:"+hex.EncodeToString(t[:])
+	return id, token, save, save(id, token)
 }
 
-// machineID tells this machine from others: its host name and, where
-// there is one, its machine ID, which a cloned VM gets anew.
+// machineID tells this machine from others, as the cache's ID file named
+// it before purge tokens: its host name and, where there is one, its
+// machine ID.
 func machineID() string {
 	host, _ := os.Hostname()
 	id, _ := os.ReadFile("/etc/machine-id")

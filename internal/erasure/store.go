@@ -52,6 +52,11 @@ var migrations = []string{
 		seen_at  timestamptz NOT NULL
 	)`,
 	`ALTER TABLE igloo_erasure.caches ADD COLUMN IF NOT EXISTS emptied_through timestamptz`,
+	// The purge token a cache's disk was given when last emptied, and the
+	// running replica that claims the cache's ID (see Purger.OnDisk).
+	`ALTER TABLE igloo_erasure.caches ADD COLUMN IF NOT EXISTS token text`,
+	`ALTER TABLE igloo_erasure.caches ADD COLUMN IF NOT EXISTS claim_holder text`,
+	`ALTER TABLE igloo_erasure.caches ADD COLUMN IF NOT EXISTS claim_until timestamptz`,
 	`DROP TABLE IF EXISTS igloo_erasure.purges`,
 }
 
@@ -191,7 +196,7 @@ func (s *PostgresStore) Seen(ctx context.Context, cache, host string, at time.Ti
 }
 
 func (s *PostgresStore) Caches(ctx context.Context) ([]Cache, error) {
-	rows, err := s.pool.Query(ctx, `SELECT cache_id, host, seen_at, emptied_through FROM igloo_erasure.caches ORDER BY cache_id`)
+	rows, err := s.pool.Query(ctx, `SELECT cache_id, host, seen_at, emptied_through, coalesce(token, '') FROM igloo_erasure.caches ORDER BY cache_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +205,7 @@ func (s *PostgresStore) Caches(ctx context.Context) ([]Cache, error) {
 			c       Cache
 			emptied *time.Time
 		)
-		err := row.Scan(&c.ID, &c.Host, &c.Seen, &emptied)
+		err := row.Scan(&c.ID, &c.Host, &c.Seen, &emptied, &c.Token)
 		if emptied != nil {
 			c.Emptied = *emptied
 		}
@@ -208,9 +213,29 @@ func (s *PostgresStore) Caches(ctx context.Context) ([]Cache, error) {
 	})
 }
 
-func (s *PostgresStore) Emptied(ctx context.Context, cache string, through time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE igloo_erasure.caches SET emptied_through = greatest(emptied_through, $2) WHERE cache_id = $1`,
-		cache, through)
+func (s *PostgresStore) Emptied(ctx context.Context, cache string, through time.Time, token string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE igloo_erasure.caches SET emptied_through = greatest(emptied_through, $2),
+		token = CASE WHEN $3 = '' THEN token ELSE $3 END WHERE cache_id = $1`, cache, through, token)
+	return err
+}
+
+func (s *PostgresStore) Claim(ctx context.Context, cache, holder string, ttl time.Duration) (bool, string, error) {
+	var token string
+	err := s.pool.QueryRow(ctx, `INSERT INTO igloo_erasure.caches (cache_id, host, seen_at, claim_holder, claim_until)
+		VALUES ($1, $2, now(), $2, now() + make_interval(secs => $3))
+		ON CONFLICT (cache_id) DO UPDATE SET claim_holder = excluded.claim_holder, claim_until = excluded.claim_until
+		WHERE igloo_erasure.caches.claim_holder IS NULL OR igloo_erasure.caches.claim_until < now()
+			OR igloo_erasure.caches.claim_holder = excluded.claim_holder
+		RETURNING coalesce(token, '')`, cache, holder, ttl.Seconds()).Scan(&token)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, "", nil
+	}
+	return err == nil, token, err
+}
+
+func (s *PostgresStore) Release(ctx context.Context, cache, holder string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE igloo_erasure.caches SET claim_holder = NULL, claim_until = NULL
+		WHERE cache_id = $1 AND claim_holder = $2`, cache, holder)
 	return err
 }
 
@@ -232,11 +257,14 @@ type MemoryStore struct {
 	requests map[string][]byte
 	files    map[string][]File
 	caches   map[string]Cache
+	claims   map[string]memoryClaim
+	// now, if set, is the clock claims run out by, for tests.
+	now func() time.Time
 }
 
 // NewMemoryStore returns an empty store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{requests: map[string][]byte{}, files: map[string][]File{}, caches: map[string]Cache{}}
+	return &MemoryStore{requests: map[string][]byte{}, files: map[string][]File{}, caches: map[string]Cache{}, claims: map[string]memoryClaim{}}
 }
 
 func (m *MemoryStore) Create(_ context.Context, r *Request) error {
@@ -362,14 +390,57 @@ func (m *MemoryStore) Caches(context.Context) ([]Cache, error) {
 	return out, nil
 }
 
-func (m *MemoryStore) Emptied(_ context.Context, cache string, through time.Time) error {
+func (m *MemoryStore) Emptied(_ context.Context, cache string, through time.Time, token string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if c, ok := m.caches[cache]; ok && through.After(c.Emptied) {
-		c.Emptied = through
+	if c, ok := m.caches[cache]; ok {
+		if through.After(c.Emptied) {
+			c.Emptied = through
+		}
+		if token != "" {
+			c.Token = token
+		}
 		m.caches[cache] = c
 	}
 	return nil
+}
+
+func (m *MemoryStore) Claim(_ context.Context, cache, holder string, ttl time.Duration) (bool, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.clock()
+	if cl, ok := m.claims[cache]; ok && cl.holder != holder && cl.until.After(now) {
+		return false, "", nil
+	}
+	m.claims[cache] = memoryClaim{holder: holder, until: now.Add(ttl)}
+	c, ok := m.caches[cache]
+	if !ok {
+		c = Cache{ID: cache, Host: holder, Seen: now}
+		m.caches[cache] = c
+	}
+	return true, c.Token, nil
+}
+
+func (m *MemoryStore) Release(_ context.Context, cache, holder string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cl, ok := m.claims[cache]; ok && cl.holder == holder {
+		delete(m.claims, cache)
+	}
+	return nil
+}
+
+// memoryClaim is a running replica's claim on a cache's ID.
+type memoryClaim struct {
+	holder string
+	until  time.Time
+}
+
+func (m *MemoryStore) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
 }
 
 func (m *MemoryStore) LatestDeletion(context.Context) (time.Time, error) {

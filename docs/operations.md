@@ -162,9 +162,14 @@ that shows it. Admins and holders of `GRANT ERASE ON ACCOUNT` make them.
 - Every replica checks every 15 seconds whether a request deleted files
   since it last emptied its read cache, and empties it whole; a request
   waits for the replicas seen in the last 2 minutes. A replica that was
-  stopped empties its cache when it starts. A cache on disk copied to
-  another machine, as with a VM image, is told apart by the machine, and
-  emptied.
+  stopped empties its cache when it starts, if a request deleted files
+  since. A cache on disk keeps its identity in a file in its directory, so
+  a container made again on the same volume (an image upgrade, a changed
+  setting) keeps its cache. A copy of a cache's disk, as with a VM image,
+  is told apart all the same: one running replica at a time uses a cache's
+  identity, and each emptying gives the disk a new token that the erasure
+  ledger records, so a copy that was not emptied with it takes a new
+  identity and is emptied.
 - Requests are in the metadata database (schema `igloo_erasure`) and
   survive restarts; without one, in memory.
 - `ALTER TABLE ... SET (data_retention_days = N)` limits how long a table

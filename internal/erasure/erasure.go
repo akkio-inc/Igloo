@@ -350,6 +350,9 @@ type Cache struct {
 	Seen time.Time
 	// Emptied is when it was last emptied of what requests deleted.
 	Emptied time.Time
+	// Token is the purge token the cache's disk was given when it was last
+	// emptied (see Purger.OnDisk), empty for a cache in memory.
+	Token string
 }
 
 // Store keeps requests and what they delete. Implementations must be safe
@@ -375,8 +378,15 @@ type Store interface {
 	Seen(ctx context.Context, cache, host string, at time.Time) error
 	Caches(ctx context.Context) ([]Cache, error)
 	// Emptied records that cache was emptied of what requests deleted up
-	// to through.
-	Emptied(ctx context.Context, cache string, through time.Time) error
+	// to through, and the purge token its disk was given then, if any.
+	Emptied(ctx context.Context, cache string, through time.Time, token string) error
+	// Claim takes, or renews, holder's claim on cache for ttl, unless
+	// another holder's claim on it is current, and returns the purge token
+	// last recorded for it (see Emptied). One running replica at a time
+	// uses a cache's ID.
+	Claim(ctx context.Context, cache, holder string, ttl time.Duration) (ok bool, token string, err error)
+	// Release lets holder's claim on cache go.
+	Release(ctx context.Context, cache, holder string) error
 	// LatestDeletion is when any request last deleted files.
 	LatestDeletion(ctx context.Context) (time.Time, error)
 	Close()

@@ -423,7 +423,7 @@ func TestCloseFinishesFirst(t *testing.T) {
 	if still, _ := f.store.Get(f.ctx, r.ID); still.Status != StatusBlocked || still.Sealed == "" {
 		t.Fatalf("after a refused close: %s, sealed %v", still.Status, still.Sealed != "")
 	}
-	if err := f.store.Emptied(f.ctx, "replica-2-cache", f.svc.now().Add(time.Hour)); err != nil {
+	if err := f.store.Emptied(f.ctx, "replica-2-cache", f.svc.now().Add(time.Hour), ""); err != nil {
 		t.Fatal(err)
 	}
 	closed, err := f.svc.Close(f.ctx, r.ID, "ada")

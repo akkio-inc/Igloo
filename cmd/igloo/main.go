@@ -882,13 +882,17 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 			return nil, nil, fmt.Errorf("erasure requests: %w", err)
 		}
 	}
-	cacheID, err := eng.CacheID()
+	cacheID, token, save, err := eng.CacheIdentity()
 	if err != nil {
 		store.Close()
 		return nil, nil, fmt.Errorf("read cache ID: %w", err)
 	}
 	host, _ := os.Hostname()
-	return store, erasure.NewPurger(store, eng, cacheID, host, log), nil
+	purger := erasure.NewPurger(store, eng, cacheID, host, log)
+	if save != nil {
+		purger.OnDisk(token, save)
+	}
+	return store, purger, nil
 }
 
 // newEraser sets up erasure requests. They redact the query history and
