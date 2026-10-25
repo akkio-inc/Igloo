@@ -142,6 +142,14 @@ func TestSnowflakeImplicitConversions(t *testing.T) {
 				LATERAL FLATTEN(INPUT => v.tags) AS f WHERE v.ts BETWEEN r.lo AND r.hi`).Scan(&tags); err != nil || tags != 2 {
 				t.Errorf("BETWEEN in a FLATTEN's ON: %d %v, want 2", tags, err)
 			}
+			// A value between a timestamp and text: each operand takes the
+			// type of whichever of the other two has one.
+			var between int
+			if err := conn.QueryRow(ctx, `SELECT count(*) FROM (SELECT '2024-03-01 10:00:00' AS ts) AS v
+				CROSS JOIN (SELECT '2024-03-01'::timestamp AS lo, '2024-03-01 12:00:00' AS hi) AS r
+				WHERE v.ts BETWEEN r.lo AND r.hi`).Scan(&between); err != nil || between != 1 {
+				t.Errorf("text BETWEEN a timestamp AND text: %d %v, want 1", between, err)
+			}
 			if _, err := conn.Exec(ctx, `SELECT trim(n, 'a', 'b') FROM (SELECT 5 AS n)`); err == nil || !strings.Contains(err.Error(), "trim(INTEGER") {
 				t.Errorf("trim of three arguments: %v, want DuckDB's error for the statement as translated", err)
 			}

@@ -103,11 +103,18 @@ func (t *translator) implicitCasts(nodes []*node) ([]*node, error) {
 			if loLit && hiLit {
 				continue
 			}
-			other := lo
-			if loLit {
-				other = hi
+			// Each operand takes the type of whichever of the other two has
+			// one, as v BETWEEN lo AND hi reads v >= lo AND v <= hi: a bound
+			// may be text where the other is a timestamp.
+			conv := func(x []*node, others ...[]*node) []*node {
+				for _, o := range others {
+					if !literalOperand(o) {
+						x = []*node{asOf(x, o)}
+					}
+				}
+				return x
 			}
-			parts := []*node{asOf(v, other), raw(" " + render(trim(nodes[xe+1:i+1])) + " ")}
+			parts := append(conv(v, lo, hi), raw(" "+render(trim(nodes[xe+1:i+1]))+" "))
 			for k, b := range [][]*node{lo, hi} {
 				if k == 1 {
 					parts = append(parts, raw(" AND "))
@@ -115,7 +122,7 @@ func (t *translator) implicitCasts(nodes []*node) ([]*node, error) {
 				if literalOperand(b) {
 					parts = append(parts, operand(b))
 				} else {
-					parts = append(parts, asOf(b, v))
+					parts = append(parts, conv(b, v, [][]*node{hi, lo}[k])...)
 				}
 			}
 			nodes = replace(nodes, xs, he+1, seq(nodes[xs:he+1], parts...))

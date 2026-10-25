@@ -313,8 +313,9 @@ func TestImplicitConversions(t *testing.T) {
 	for _, c := range []struct{ in, has, hasNot string }{
 		{`SELECT * FROM t WHERE a < b`, `sf_as(a, b) < sf_as(b, a)`, ""},
 		{`SELECT * FROM t WHERE x.a >= y.b AND c = d`, `sf_as(x.a, y.b) >= sf_as(y.b, x.a) AND sf_as(c, d) = sf_as(d, c)`, ""},
-		{`SELECT * FROM t WHERE ts NOT BETWEEN lo AND hi`, `sf_as(ts, lo) NOT BETWEEN sf_as(lo, ts) AND sf_as(hi, ts)`, ""},
+		{`SELECT * FROM t WHERE ts NOT BETWEEN lo AND hi`, `sf_as(sf_as(ts, lo), hi) NOT BETWEEN sf_as(sf_as(lo, ts), hi) AND sf_as(sf_as(hi, ts), lo)`, ""},
 		{`SELECT * FROM t WHERE ts BETWEEN '2024-01-01' AND hi`, `sf_as(ts, hi) BETWEEN '2024-01-01' AND sf_as(hi, ts)`, ""},
+		{`SELECT * FROM t WHERE ts BETWEEN lo AND '2024-01-01'`, `sf_as(ts, lo) BETWEEN sf_as(lo, ts) AND '2024-01-01'`, ""},
 		{`SELECT * FROM t WHERE n LIKE p`, `sf_str(n) LIKE sf_str(p)`, ""},
 		{`SELECT upper(n), left(n, 2) FROM t`, `upper(sf_str(n))`, "sf_str(2)"},
 		{`SELECT upper('a') FROM t WHERE a < 5 AND s = 'x' AND b IS NULL`, "", "sf_"},
@@ -322,7 +323,7 @@ func TestImplicitConversions(t *testing.T) {
 		{`UPDATE t SET a = b, c = d WHERE e = f`, `SET a = b, c = d WHERE sf_as(e, f) = sf_as(f, e)`, ""},
 		// A WHERE that a FLATTEN's join takes as its ON (see whereOn).
 		{`SELECT f.value FROM t AS b CROSS JOIN r, LATERAL FLATTEN(INPUT => b.tags) AS f WHERE b.ts BETWEEN r.lo AND r.hi AND b.n = r.m`,
-			`ON (sf_as(b.ts, r.lo) BETWEEN sf_as(r.lo, b.ts) AND sf_as(r.hi, b.ts) AND sf_as(b.n, r.m) = sf_as(r.m, b.n))`, ""},
+			`ON (sf_as(sf_as(b.ts, r.lo), r.hi) BETWEEN sf_as(sf_as(r.lo, b.ts), r.hi) AND sf_as(sf_as(r.hi, b.ts), r.lo) AND sf_as(b.n, r.m) = sf_as(r.m, b.n))`, ""},
 	} {
 		res, err := Translate(c.in, Options{Implicit: true})
 		if err != nil {

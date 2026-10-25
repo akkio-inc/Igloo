@@ -1557,6 +1557,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Snowflake's implicit conversions are made in a `WHERE` that a `FLATTEN`'s
   join takes as its `ON`, too: text compared with timestamps there failed
   with "Cannot mix values of type VARCHAR and TIMESTAMP in BETWEEN clause".
+- Snowflake's implicit conversions in a `BETWEEN` convert each operand
+  against both of the others, as Snowflake does: text between a timestamp
+  and text failed with "Cannot mix values of type TIMESTAMP and VARCHAR in
+  BETWEEN clause".
 - A client that opens more than 10 sessions at once for one user, as a
   pool, dbt's threads or a dashboard's queries do, signs them all in. The
   failed-login limit counts logins still running as failures to come, and
