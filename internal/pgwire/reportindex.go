@@ -101,6 +101,22 @@ func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportS
 	return s.planIndexes(ctx, sess, spec, false)
 }
 
+// wholeFromIndexes reports whether bitmap indexes could answer all spec's
+// call counts, without a scan: people and rows alone, of dimensions with no
+// metric. Otherwise a call that can be counted through ids is, and its
+// dimensions' indexes need not be planned (see reportStatement).
+func (spec *reportSpec) wholeFromIndexes() bool {
+	if len(spec.Dimensions) == 0 || len(spec.Metrics) > 0 || spec.Extent != "" {
+		return false
+	}
+	for _, d := range spec.Dimensions {
+		if d.Metric != "" || d.MetricWhere != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // reportCohortIndexes returns how spec's call reads its cohorts from
 // bitmap indexes, where they hold every cohort's members, of one domain,
 // and their latest_from reads as the statement would; or nil. A call
@@ -126,7 +142,11 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 		return nil
 	}
 	r.lenient = true
-	p := &indexPlanner{s: s, ctx: ctx, sess: sess, r: r, states: map[string]indexState{}}
+	states := sess.reportStates
+	if states == nil {
+		states = map[string]indexState{}
+	}
+	p := &indexPlanner{s: s, ctx: ctx, sess: sess, r: r, states: states}
 	plan := &reportIndexPlan{at: map[string]int64{}}
 	domain := ""
 	use := func(table, member string, groups []string, elements string) (indexUse, bool) {
@@ -144,8 +164,13 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 			plan.pins = append(plan.pins, pin)
 		}
 		if _, seen := plan.at[u.index.Name]; !seen {
-			if tbl, err := s.ddl.LoadTable(ctx, iddomain.IndexSchema, u.index.Name); err == nil && tbl.CurrentSnapshot() != nil {
+			if at, ok := sess.reportAt[u.index.Name]; ok {
+				plan.at[u.index.Name] = at
+			} else if tbl, err := s.ddl.LoadTable(ctx, iddomain.IndexSchema, u.index.Name); err == nil && tbl.CurrentSnapshot() != nil {
 				plan.at[u.index.Name] = tbl.CurrentSnapshot().SnapshotID
+				if sess.reportAt != nil {
+					sess.reportAt[u.index.Name] = plan.at[u.index.Name]
+				}
 			}
 		}
 		return u, true

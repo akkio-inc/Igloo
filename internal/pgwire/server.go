@@ -671,6 +671,12 @@ type session struct {
 	// roaring bitmaps at all (see rerunWithoutBitmaps).
 	noIndexes bool
 	noBitmaps bool
+	// reportStates and reportAt keep, while a statement is prepared, the
+	// state of the bitmap indexes its report calls plan with and the
+	// snapshots of their tables, which each call would otherwise look up
+	// again (see planIndexes).
+	reportStates map[string]indexState
+	reportAt     map[string]int64
 	// bitmapVars are the variables that hold the bitmaps of the statements
 	// Igloo wrote (see hybridBitmaps), by name.
 	bitmapVars map[string]*bitmapVar
@@ -1957,6 +1963,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// no other statement reads the set while this changes it (see
 	// holdCatalog).
 	defer s.holdCatalog(sess)()
+	if sess.reportStates == nil {
+		sess.reportStates, sess.reportAt = map[string]indexState{}, map[string]int64{}
+		defer func() { sess.reportStates, sess.reportAt = nil, nil }()
+	}
 	if sess.memo == nil {
 		sess.memo = &checkMemo{plans: map[string]any{}}
 		defer func() { sess.memo = nil }()

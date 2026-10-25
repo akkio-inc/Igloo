@@ -175,7 +175,10 @@ func (s *Server) expandReportCalls(ctx context.Context, sess *session, text stri
 // bitmap indexes where they can (reportindex.go), else from the tables,
 // through ids where it may (reportids.go); and what it pinned.
 func (s *Server) reportStatement(ctx context.Context, sess *session, spec *reportSpec, probe bool) (string, []indexPin, []idPin) {
-	plan := s.reportIndexes(ctx, sess, spec)
+	var plan *reportIndexPlan
+	if spec.wholeFromIndexes() {
+		plan = s.reportIndexes(ctx, sess, spec)
+	}
 	if plan != nil && !plan.hybrid {
 		// All from the bitmaps.
 		if !probe {
@@ -220,6 +223,9 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 			}
 			s.log.Debug("report call's cohorts read from their tables", "reason", err)
 		}
+	}
+	if plan == nil && ids == nil && !spec.wholeFromIndexes() {
+		plan = s.reportIndexes(ctx, sess, spec)
 	}
 	if plan != nil && ids == nil {
 		// A hybrid, where the source cannot be counted through ids: people
@@ -274,7 +280,10 @@ func (s *Server) cohortMembers(spec *reportSpec, plan *reportIndexPlan) []string
 // no bitmap and sets no variable. A call may still be counted from the
 // tables when its bitmaps do not fit in memory.
 func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *reportSpec) string {
-	plan := s.reportIndexes(ctx, sess, spec)
+	var plan *reportIndexPlan
+	if spec.wholeFromIndexes() {
+		plan = s.reportIndexes(ctx, sess, spec)
+	}
 	if plan != nil && !plan.hybrid {
 		return "index"
 	}
@@ -289,6 +298,9 @@ func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *rep
 			}
 			return "index+scan"
 		}
+	}
+	if plan == nil && ids == nil && !spec.wholeFromIndexes() {
+		plan = s.reportIndexes(ctx, sess, spec)
 	}
 	switch {
 	case plan != nil && ids == nil:
