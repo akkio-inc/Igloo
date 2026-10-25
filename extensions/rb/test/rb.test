@@ -203,6 +203,17 @@ rb: invalid bitmap BLOB
 statement ok
 RESET VARIABLE evens
 
+# a BLOB of Igloo's error in place of a bitmap is refused with its text; a bitmap of no members is 8 bytes
+statement error
+SELECT rb_cardinality(CAST('igloo: this cohort is gone' AS BLOB))
+----
+igloo: this cohort is gone
+
+query I
+SELECT rb_cardinality(CAST('\x3A\x30\x00\x00\x00\x00\x00\x00' AS BLOB))
+----
+0
+
 # NULL in, NULL out
 query TTTT
 SELECT rb_cardinality(NULL), rb_and(a, NULL) IS NULL, rb_contains(NULL, 1::UINTEGER), rb_to_list(NULL) FROM s

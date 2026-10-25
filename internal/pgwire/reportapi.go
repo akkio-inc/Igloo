@@ -81,6 +81,15 @@ func (s *Server) expandReportCalls(ctx context.Context, sess *session, text stri
 	var indexPins []indexPin
 	masked := maskCode(text)
 	var edits []edit
+	// The same call again in the statement, as a report of two blocks
+	// repeats its calls, is the same text, written once: which the
+	// statement then computes once (see shareSubqueries).
+	type written struct {
+		q    string
+		ip   []indexPin
+		read []idPin
+	}
+	calls := map[string]written{}
 	for _, m := range reportCall.FindAllStringSubmatchIndex(masked, -1) {
 		start, open := m[4], m[1]-1
 		fn := strings.ToLower(masked[m[6]:m[7]])
@@ -108,9 +117,13 @@ func (s *Server) expandReportCalls(ctx context.Context, sess *session, text stri
 				return "", nil, nil, err
 			}
 			if fn == "audience_profile" {
-				q, ip, read := s.reportStatement(ctx, sess, spec, probe)
-				pins, indexPins = append(pins, read...), append(indexPins, ip...)
-				out = "(" + q + ")"
+				w, seen := calls[args[0]]
+				if !seen {
+					w.q, w.ip, w.read = s.reportStatement(ctx, sess, spec, probe)
+					calls[args[0]] = w
+					pins, indexPins = append(pins, w.read...), append(indexPins, w.ip...)
+				}
+				out = "(" + w.q + ")"
 			} else {
 				out = quoteLiteral(spec.sql())
 			}

@@ -4,6 +4,7 @@
 #include "rb_bitmap.hpp"
 #include "rb_memory.hpp"
 
+#include <cstring>
 #include <memory>
 
 #include "duckdb/common/vector_operations/binary_executor.hpp"
@@ -15,9 +16,18 @@
 namespace duckdb {
 namespace rb {
 
+//! The prefix of a BLOB that stands for an error of Igloo's in place of a bitmap: one a statement reads where
+//! a check it makes fails (a cohort's bitmap gone, its version changed), which reading it reports as it is.
+//! Unlike error(), whose volatility keeps a statement's copies of a subquery apart, such a BLOB is a constant.
+static constexpr const char *IGLOO_ERROR = "igloo: ";
+
 Bitmap ReadBitmap(const string_t &blob) {
 	const char *data = blob.GetData();
 	const size_t size = blob.GetSize();
+	const size_t prefix = strlen(IGLOO_ERROR);
+	if (size >= prefix && size < 1024 && memcmp(data, IGLOO_ERROR, prefix) == 0) {
+		throw InvalidInputException(string(data, size));
+	}
 	// the portable format's size, read from its header and container headers: 0 if they do not fit
 	const size_t expected = roaring_bitmap_portable_deserialize_size(data, size);
 	if (expected == 0 || expected != size) {

@@ -392,30 +392,46 @@ func (s *Server) bitmapOf(spec *reportSpec, plan *reportIndexPlan, i int) string
 	return "getvariable(" + quoteLiteral(plan.bitmaps[i].name) + ")"
 }
 
-// cohortOf is the SELECT of a hybrid's cohort i's bitmap for its people:
-// its variable, under the conditions that the variable is there, and that
-// its latest_from still reads as it did. A variable that is not there
-// would read as NULL, which rb_contains takes for no members: the
-// statement fails instead, when it runs. (A BLOB in its place that is not
-// a bitmap would fail when anything binds the statement, the planner's
-// descriptions of its parts included, before workers have their values.)
+// cohortOf is the SELECT of cohort i's bitmap for the statement's counts
+// (its people, or its members' list on the ids path): its variable, under
+// the conditions that the variable is there, and that its latest_from still
+// reads as it did. A variable that is not there would read as NULL, which
+// the bitmap functions take for no members: the statement fails instead,
+// when it reads the bitmap. The failure is a BLOB of Igloo's error in place
+// of the bitmap (see igloo: in rb's ReadBitmap), not error(), which DuckDB
+// takes for volatile and which would keep the same call twice in a
+// statement from being computed once (see shareSubqueries).
 func (s *Server) cohortOf(spec *reportSpec, plan *reportIndexPlan, i int) string {
 	if i >= len(plan.bitmaps) {
 		return s.cohortBitmap(spec, plan, i)
 	}
-	b, bm := plan.bitmaps[i], s.bitmapOf(spec, plan, i)
-	when := bm + " IS NULL THEN error(" + quoteLiteral("igloo: the bitmap of cohort "+spec.Cohorts[i].Label+" is gone; run the statement again") + ")"
-	v := spec.Cohorts[i].Version
-	if v == nil || v.LatestFrom == nil {
-		return "SELECT CASE WHEN " + when + " ELSE " + bm + " END AS bm"
-	}
-	same := "(" + latestOf(v) + ") IS NULL"
-	if !b.null {
-		same = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
-	}
-	return "SELECT CASE WHEN " + when + " WHEN " + same + " THEN " + bm + " ELSE error(" +
-		quoteLiteral("igloo: the latest version of cohort "+spec.Cohorts[i].Label+" changed while the statement ran; run it again") + ") END AS bm"
+	return "SELECT " + s.checkedBitmap(spec, plan, i, s.bitmapOf(spec, plan, i)) + " AS bm"
 }
+
+// checkedBitmap is cohort i's check (see cohortOf) as a CASE that reads as
+// then where the check holds, and as a BLOB of Igloo's error otherwise.
+func (s *Server) checkedBitmap(spec *reportSpec, plan *reportIndexPlan, i int, then string) string {
+	b, label := plan.bitmaps[i], spec.Cohorts[i].Label
+	expr := "CASE WHEN " + s.bitmapOf(spec, plan, i) + " IS NULL THEN " + iglooError("the bitmap of cohort "+label+" is gone; run the statement again")
+	if v := spec.Cohorts[i].Version; v != nil && v.LatestFrom != nil {
+		same := "(" + latestOf(v) + ") IS NULL"
+		if !b.null {
+			same = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
+		}
+		expr += " WHEN NOT (" + same + ") THEN " + iglooError("the latest version of cohort "+label+" changed while the statement ran; run it again")
+	}
+	return expr + " ELSE " + then + " END"
+}
+
+// iglooError is a BLOB that rb's bitmap functions refuse with msg, after
+// "igloo: ".
+func iglooError(msg string) string {
+	return "CAST(" + quoteLiteral("igloo: "+msg) + " AS BLOB)"
+}
+
+// emptyBitmap is the BLOB of a roaring bitmap of no members, in the
+// portable format.
+const emptyBitmap = `CAST('\x3A\x30\x00\x00\x00\x00\x00\x00' AS BLOB)`
 
 // hybridPeople computes a hybrid's counts from the bitmaps (its cohorts'
 // sizes, and its values' and dimensions' people) and writes them into
@@ -504,31 +520,21 @@ func (s *Server) hybridPeople(ctx context.Context, sess *session, spec *reportSp
 	return nil
 }
 
-// hybridGuard is the guard of a hybrid whose counts from the bitmaps it
-// reads as values: 1, or an error if a cohort's variable is gone or its
-// latest_from reads otherwise than when they were counted.
+// hybridGuard is the guard of a call whose counts from the bitmaps it reads
+// as values: 1, or Igloo's error if a cohort's variable is gone or its
+// latest_from reads otherwise than when they were counted (see cohortOf).
 func (s *Server) hybridGuard(spec *reportSpec, plan *reportIndexPlan) string {
-	var whens []string
-	for i, c := range spec.Cohorts {
+	var checks []string
+	for i := range spec.Cohorts {
 		if i >= len(plan.bitmaps) {
 			break
 		}
-		b := plan.bitmaps[i]
-		whens = append(whens, " WHEN "+s.bitmapOf(spec, plan, i)+" IS NULL THEN error("+
-			quoteLiteral("igloo: the bitmap of cohort "+c.Label+" is gone; run the statement again")+")")
-		if v := c.Version; v != nil && v.LatestFrom != nil {
-			same := "(" + latestOf(v) + ") IS NULL"
-			if !b.null {
-				same = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
-			}
-			whens = append(whens, " WHEN NOT ("+same+") THEN error("+
-				quoteLiteral("igloo: the latest version of cohort "+c.Label+" changed while the statement ran; run it again")+")")
-		}
+		checks = append(checks, "rb_cardinality("+s.checkedBitmap(spec, plan, i, emptyBitmap)+") = 0")
 	}
-	if len(whens) == 0 {
+	if len(checks) == 0 {
 		return "1"
 	}
-	return "CASE" + strings.Join(whens, "") + " ELSE 1 END"
+	return "CASE WHEN " + strings.Join(checks, " AND ") + " THEN 1 END"
 }
 
 // sameValue is the condition that rows a and b are of one dimension's

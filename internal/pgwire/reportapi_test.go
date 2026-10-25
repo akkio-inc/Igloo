@@ -696,6 +696,20 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		if len(halves) != 2 || halves[0] != halves[1] {
 			t.Errorf("%s: the same call twice wrote different text", what)
 		}
+		// And the statement computes it once: nothing in it keeps its
+		// copies apart (a volatile function, say).
+		grouped := "SELECT dimension, count(*) AS n FROM igloo.audience_profile(" + lit + ") GROUP BY dimension"
+		out, _, _, err = srv.reportCalls(ctx, sess, grouped+" UNION ALL "+grouped)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if shared := srv.shareSubqueries(ctx, sess, out); shared == "" {
+			t.Errorf("%s: the same call twice is not computed once", what)
+		} else if st, err := prepare(ctx, sess.conn, shared, nil); err != nil {
+			t.Errorf("%s: the statement that computes it once does not prepare: %v", what, err)
+		} else {
+			_ = st.close()
+		}
 		sess.resetBitmapVariables(ctx)
 	}
 	twice("plays", plays)
