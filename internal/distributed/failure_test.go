@@ -352,37 +352,59 @@ func (e hangingEngine) Connect(ctx context.Context) (*duckdb.Conn, error) {
 	return nil, ctx.Err()
 }
 
-// Canceling a statement stops its tasks on the workers.
+// Canceling a statement stops its tasks on the workers: canceled once a
+// task has reached a worker, the statement ends at once with the
+// cancellation, and so does the task. (A deadline set before the statement
+// ran, of a fixed 300 ms, came while it was still being planned on a busy
+// runner, before any task, which then had none to stop.) Past its deadline
+// while it is planned, it ends with the deadline, not a reason to run on
+// one machine.
 func TestCancel(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)
-	stopped := make(chan struct{}, 2)
+	started, stopped := make(chan struct{}, 8), make(chan struct{}, 8)
 	for _, w := range h.workers {
 		w.beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
 			// The server notices a client going away once it has read the
 			// request.
 			_, _ = io.Copy(io.Discard, r.Body)
+			started <- struct{}{}
 			<-r.Context().Done()
 			stopped <- struct{}{}
 			return false
 		}
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, _, _, _, err := h.run(ctx, failureQuery, ModeOn)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("want the deadline, got %v", err)
+	plan, err := h.co.Plan(t.Context(), failureQuery, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if time.Since(start) > 3*time.Second {
-		t.Fatalf("took %s to stop", time.Since(start))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	canceled := make(chan time.Time, 1)
+	go func() {
+		select {
+		case <-started:
+			canceled <- time.Now()
+			cancel()
+		case <-time.After(time.Minute):
+		}
+	}()
+	_, err = h.co.Execute(ctx, plan, h.settings(t.Context()))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want the cancellation, got %v", err)
+	}
+	select {
+	case at := <-canceled:
+		if took := time.Since(at); took > 3*time.Second {
+			t.Fatalf("took %s to stop", took)
+		}
+	default:
+		t.Fatal("no task reached a worker")
 	}
 	select {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the worker's task was not canceled")
 	}
-	// Past its deadline while it plans, as when describing a part takes
-	// longer: the deadline, not a reason to run on one machine.
 	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
 	defer cancelExpired()
 	if _, err := h.co.Plan(expired, failureQuery, harnessEnv{h}, ModeOn); !errors.Is(err, context.DeadlineExceeded) || IsUnsupported(err) {
