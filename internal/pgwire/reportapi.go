@@ -187,9 +187,7 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 		}
 		return s.reportIndexSQL(spec, plan), plan.pins, nil
 	}
-	idsTimed := sess.phase("report_ids")
 	ids, read := s.reportIDs(ctx, sess, spec)
-	idsTimed()
 	if ids != nil {
 		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.splitPairs
 	}

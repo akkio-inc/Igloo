@@ -55,7 +55,7 @@ func TestPreparePhasesAddUp(t *testing.T) {
 	if len(p.names) != 2 || p.names[0] != "a" || p.names[1] != "b" {
 		t.Fatalf("phases: %v", p.names)
 	}
-	if got := p.String(); !regexp.MustCompile(`^a=\S+ b=\S+$`).MatchString(got) {
+	if got := p.String(); !regexp.MustCompile(`^a=[^ /]+/2 b=[^ /]+$`).MatchString(got) {
 		t.Fatalf("String: %q", got)
 	}
 }

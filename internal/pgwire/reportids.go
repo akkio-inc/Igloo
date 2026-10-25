@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/akkio-inc/igloo/internal/auth"
@@ -55,6 +56,35 @@ func (s *Server) reportIDs(ctx context.Context, sess *session, spec *reportSpec)
 	if !s.idDomainsOn || s.ddl == nil || s.catalogName() == "" || sess == nil || sess.conn == nil || len(spec.Dimensions) == 0 {
 		return nil, nil
 	}
+	key := reportKey(spec, "ids")
+	if c := sess.reports; c != nil && key != "" {
+		if p, ok := c.ids[key]; ok {
+			return p.ids.fresh(), slices.Clip(p.pins)
+		}
+	}
+	ids, pins := s.reportIDsNow(ctx, sess, spec)
+	if c := sess.reports; c != nil && key != "" {
+		c.ids[key] = reportIDPlan{ids: ids, pins: pins}
+	}
+	return ids.fresh(), slices.Clip(pins)
+}
+
+// fresh is a copy of ids for a call to fill in (its pairs and cohorts'
+// members), with what planning found shared, and not to be appended to.
+func (ids *reportIDs) fresh() *reportIDs {
+	if ids == nil {
+		return nil
+	}
+	cp := *ids
+	cp.cohorts = slices.Clip(ids.cohorts)
+	cp.pairs, cp.split, cp.cohortFrom = nil, false, nil
+	return &cp
+}
+
+// reportIDsNow is reportIDs, planned again.
+func (s *Server) reportIDsNow(ctx context.Context, sess *session, spec *reportSpec) (*reportIDs, []idPin) {
+	defer sess.phase("report_ids")()
+	s.reportPlanned.Add(1)
 	members := s.memberSnapshot(ctx)
 	if members == nil || len(members.Members) == 0 {
 		return nil, nil

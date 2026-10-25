@@ -375,9 +375,12 @@ type Server struct {
 	// reportFromIndexes counts those answered from bitmap indexes (see
 	// reportindex.go).
 	reportFromIndexes atomic.Int64
-	settings          auth.SettingStore
-	workload          *workload.Controller
-	pool              string
+	// reportPlanned counts how many times a call's reading of bitmap
+	// indexes, or of its tables through ids, was planned (see reportCache).
+	reportPlanned atomic.Int64
+	settings      auth.SettingStore
+	workload      *workload.Controller
+	pool          string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -671,12 +674,9 @@ type session struct {
 	// roaring bitmaps at all (see rerunWithoutBitmaps).
 	noIndexes bool
 	noBitmaps bool
-	// reportStates and reportAt keep, while a statement is prepared, the
-	// state of the bitmap indexes its report calls plan with and the
-	// snapshots of their tables, which each call would otherwise look up
-	// again (see planIndexes).
-	reportStates map[string]indexState
-	reportAt     map[string]int64
+	// reports keeps, while a statement is prepared, what planning its
+	// report calls found (see reportCache).
+	reports *reportCache
 	// phases times the steps of preparing a statement, or readying one to
 	// run, for the debug log (see timePhases).
 	phases *prepPhases
@@ -1986,10 +1986,7 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	locked := sess.phase("catalog_lock")
 	defer s.holdCatalog(sess)()
 	locked()
-	if sess.reportStates == nil {
-		sess.reportStates, sess.reportAt = map[string]indexState{}, map[string]int64{}
-		defer func() { sess.reportStates, sess.reportAt = nil, nil }()
-	}
+	defer sess.cacheReports()()
 	if sess.memo == nil {
 		sess.memo = &checkMemo{plans: map[string]any{}}
 		defer func() { sess.memo = nil }()

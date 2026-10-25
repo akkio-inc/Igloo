@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -92,6 +93,60 @@ type hybridBitmap struct {
 	null         bool
 }
 
+// reportCache is what preparing a statement keeps of planning its report
+// calls, which recognizing its reports (whose guard asks what path each
+// call would take, reportCallPays) and expanding their calls would each do
+// again: the state of the bitmap indexes they plan with and the snapshots
+// of their tables, and each call's plans, by its spec: how it reads
+// bitmap indexes (planIndexes), and its tables through ids (reportIDs).
+// It lasts as long as the preparing, which holds the catalog lock.
+type reportCache struct {
+	states map[string]indexState
+	at     map[string]int64
+	plans  map[string]*reportIndexPlan
+	ids    map[string]reportIDPlan
+}
+
+// reportIDPlan is what reportIDs returned.
+type reportIDPlan struct {
+	ids  *reportIDs
+	pins []idPin
+}
+
+// cacheReports keeps what planning the session's report calls finds until
+// the returned function (see reportCache), and within a preparing that
+// keeps it already, does nothing.
+func (sess *session) cacheReports() func() {
+	if sess.reports != nil {
+		return func() {}
+	}
+	sess.reports = &reportCache{states: map[string]indexState{}, at: map[string]int64{},
+		plans: map[string]*reportIndexPlan{}, ids: map[string]reportIDPlan{}}
+	return func() { sess.reports = nil }
+}
+
+// reportKey is the key of spec's plan of kind in reportCache, or "" if
+// spec does not marshal.
+func reportKey(spec *reportSpec, kind string) string {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return ""
+	}
+	return kind + "\x00" + string(b)
+}
+
+// fresh is a copy of plan for a call to fill in (its bitmaps, pairs and
+// people), with what planning found shared, and not to be appended to.
+func (plan *reportIndexPlan) fresh() *reportIndexPlan {
+	if plan == nil {
+		return nil
+	}
+	cp := *plan
+	cp.cohorts, cp.dims, cp.pins = slices.Clip(plan.cohorts), slices.Clip(plan.dims), slices.Clip(plan.pins)
+	cp.bitmaps, cp.pairs, cp.split, cp.people = nil, nil, false, ""
+	return &cp
+}
+
 // reportIndexes returns how spec's call reads bitmap indexes, or nil when
 // they cannot answer it.
 func (s *Server) reportIndexes(ctx context.Context, sess *session, spec *reportSpec) *reportIndexPlan {
@@ -133,7 +188,27 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 		rank[sess.currentUser().Role] < rank[auth.RoleReader] {
 		return nil
 	}
+	kind := "indexes"
+	if cohortsOnly {
+		kind = "cohort indexes"
+	}
+	key := reportKey(spec, kind)
+	if c := sess.reports; c != nil && key != "" {
+		if plan, ok := c.plans[key]; ok {
+			return plan.fresh()
+		}
+	}
+	plan := s.planIndexesNow(ctx, sess, spec, cohortsOnly)
+	if c := sess.reports; c != nil && key != "" {
+		c.plans[key] = plan
+	}
+	return plan.fresh()
+}
+
+// planIndexesNow is planIndexes, planned again.
+func (s *Server) planIndexesNow(ctx context.Context, sess *session, spec *reportSpec, cohortsOnly bool) *reportIndexPlan {
 	defer sess.phase("report_index_plans")()
+	s.reportPlanned.Add(1)
 	snap := s.memberSnapshot(ctx)
 	if snap == nil || len(snap.Indexes) == 0 {
 		return nil
@@ -143,9 +218,9 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 		return nil
 	}
 	r.lenient = true
-	states := sess.reportStates
-	if states == nil {
-		states = map[string]indexState{}
+	states, ats := map[string]indexState{}, map[string]int64{}
+	if c := sess.reports; c != nil {
+		states, ats = c.states, c.at
 	}
 	p := &indexPlanner{s: s, ctx: ctx, sess: sess, r: r, states: states}
 	plan := &reportIndexPlan{at: map[string]int64{}}
@@ -165,13 +240,11 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 			plan.pins = append(plan.pins, pin)
 		}
 		if _, seen := plan.at[u.index.Name]; !seen {
-			if at, ok := sess.reportAt[u.index.Name]; ok {
+			if at, ok := ats[u.index.Name]; ok {
 				plan.at[u.index.Name] = at
 			} else if tbl, err := s.ddl.LoadTable(ctx, iddomain.IndexSchema, u.index.Name); err == nil && tbl.CurrentSnapshot() != nil {
 				plan.at[u.index.Name] = tbl.CurrentSnapshot().SnapshotID
-				if sess.reportAt != nil {
-					sess.reportAt[u.index.Name] = plan.at[u.index.Name]
-				}
+				ats[u.index.Name] = plan.at[u.index.Name]
 			}
 		}
 		return u, true

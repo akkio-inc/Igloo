@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,6 +15,7 @@ type prepPhases struct {
 	start time.Time
 	names []string
 	took  []time.Duration
+	times []int
 }
 
 // timePhases times the steps the session's statement goes through until
@@ -45,15 +47,18 @@ func (sess *session) phase(name string) func() {
 		for i, n := range p.names {
 			if n == name {
 				p.took[i] += d
+				p.times[i]++
 				return
 			}
 		}
 		p.names = append(p.names, name)
 		p.took = append(p.took, d)
+		p.times = append(p.times, 1)
 	}
 }
 
-// String lists the steps as name=duration, in the order they ended.
+// String lists the steps as name=duration, in the order they first
+// ended, with how many times, after a slash, those taken more than once.
 func (p *prepPhases) String() string {
 	var b strings.Builder
 	for i, n := range p.names {
@@ -61,6 +66,9 @@ func (p *prepPhases) String() string {
 			b.WriteByte(' ')
 		}
 		b.WriteString(n + "=" + p.took[i].Round(time.Millisecond).String())
+		if p.times[i] > 1 {
+			b.WriteString("/" + strconv.Itoa(p.times[i]))
+		}
 	}
 	return b.String()
 }

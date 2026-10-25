@@ -576,6 +576,19 @@ func TestReportAPIFromIndexes(t *testing.T) {
 		if planned != want && (want != "scan" || planned != "ids") {
 			t.Errorf("%s: planned path %s, want %s", what, planned, want)
 		}
+		// Planned once while a statement is prepared: the probe the
+		// recognizer asks, and the call it expands to, share the plans.
+		func() {
+			defer sess.cacheReports()()
+			before := srv.reportPlanned.Load()
+			srv.reportPlannedPath(ctx, sess, parsed)
+			first := srv.reportPlanned.Load() - before
+			srv.reportStatement(ctx, sess, parsed, true)
+			srv.reportPlannedPath(ctx, sess, parsed)
+			if again := srv.reportPlanned.Load() - before - first; again != 0 || first == 0 && want != "scan" {
+				t.Errorf("%s: planned %d times, then %d more", what, first, again)
+			}
+		}()
 		text := texts(t, conn, "SELECT igloo.audience_profile_sql("+lit+")")
 		if len(text) != 1 {
 			t.Fatalf("%s: %q", what, text)
