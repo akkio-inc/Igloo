@@ -54,7 +54,7 @@ func (s *Server) authenticate(ctx context.Context, writer *buffer.Writer, reader
 
 	// After too many failures, only access tokens sign in (see
 	// ratelimit.go).
-	done, wait := s.limiter.begin(name, addr)
+	done, wait := s.limiter.begin(ctx, name, addr)
 	defer done()
 	lim := limits{wait: wait}
 	// fail ends a login that went wrong. While passwords are blocked, it

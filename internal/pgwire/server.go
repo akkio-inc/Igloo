@@ -871,7 +871,8 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 		s.releaseConn()
 		return ctx, fmt.Errorf("open session: %w", err)
 	}
-	sess.conn, sess.wl.meter, sess.wl.controller = conn, meter, s.workload
+	s.sessions.connected(sess, conn)
+	sess.wl.meter, sess.wl.controller = meter, s.workload
 	// Binding a statement looks its tables up in the catalog's in-memory set
 	// and replaces their entries there, and DuckDB binds a statement that
 	// reads the catalog again each time it runs, not only when it is
@@ -2571,6 +2572,14 @@ func (r *registry) add(sess *session) {
 	}
 	sess.added = time.Now()
 	r.byPID[sess.pid] = sess
+}
+
+// connected gives sess its connection, under r.mu: add reads other
+// sessions' connections, while their own goroutines set them up.
+func (r *registry) connected(sess *session, conn *duckdb.Conn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sess.conn = conn
 }
 
 func (r *registry) remove(sess *session) {

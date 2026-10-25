@@ -61,7 +61,7 @@ func (s *Server) Authenticate(ctx context.Context, name, password string, addr n
 // "flight sql", which the log and the login history name.
 func (s *Server) AuthenticateClient(ctx context.Context, name, password string, addr net.Addr, client string) (auth.User, error) {
 	how := login{method: audit.MethodPassword, attrs: []any{"client", client}}
-	done, wait := s.limiter.begin(name, addr)
+	done, wait := s.limiter.begin(ctx, name, addr)
 	defer done()
 	if wait > 0 {
 		s.signInRefused(name, addr, client, audit.MethodPassword, "too many failed logins")

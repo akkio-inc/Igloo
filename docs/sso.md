@@ -372,6 +372,13 @@ real ones. This covers passwords and tokens, in SQL clients and the console.
 Behind a proxy that hides clients' addresses, the address limit counts all
 of its clients together.
 
+Logins still running count as failures to come, so parallel connections get
+no more guesses: while as many logins for a user, or from an address, are
+running as it has failures left, the next one waits for one of them to end,
+for up to 10 seconds. A pool that opens many sessions at once, such as dbt's
+threads or a BI tool's, signs them all in; a login that has waited 10
+seconds is refused with `too many failed logins`.
+
 ## Troubleshooting
 
 | Message on the sign-in page | Cause and fix |

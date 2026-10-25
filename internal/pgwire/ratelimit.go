@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"context"
 	"net"
 	"sync"
 	"time"
@@ -13,7 +14,10 @@ import (
 // old. This bounds online password guessing beyond what the failed-login
 // delay does, and password spraying across users from one address. Logins
 // still running count too, so parallel connections do not get more
-// guesses. A successful login clears the user's count.
+// guesses: a login that the running ones could, by failing, take past the
+// limit waits for some of them to end, for up to runningWait, so that a
+// pool opening many sessions at once is not refused. A successful login
+// clears the user's count.
 //
 // Access tokens still sign in while a user or address is blocked: they
 // cannot be guessed, and a service account's pipelines must not stop
@@ -27,6 +31,11 @@ const (
 	failureWindow = 15 * time.Minute
 	userFailures  = 10
 	addrFailures  = 50
+	// runningWait bounds how long a login waits for running ones to end.
+	// A login has no deadline, so one that a client leaves hanging runs
+	// until its connection drops; past this wait, logins are refused, as
+	// though the running ones had failed.
+	runningWait = 10 * time.Second
 	// maxTracked bounds the names and addresses remembered.
 	maxTracked = 100_000
 )
@@ -38,10 +47,15 @@ type loginLimiter struct {
 	users   map[string][]time.Time
 	addrs   map[string][]time.Time
 	running map[string]int // by "u:"+user and "a:"+address
+	// ended is closed, and replaced, whenever a running login ends.
+	ended chan struct{}
+	// runningWait is the package's, but for tests.
+	runningWait time.Duration
 }
 
 func newLoginLimiter() *loginLimiter {
-	return &loginLimiter{now: time.Now, users: map[string][]time.Time{}, addrs: map[string][]time.Time{}, running: map[string]int{}}
+	return &loginLimiter{now: time.Now, users: map[string][]time.Time{}, addrs: map[string][]time.Time{}, running: map[string]int{},
+		ended: make(chan struct{}), runningWait: runningWait}
 }
 
 // addrKey is the address's host, without the port, which changes with
@@ -65,19 +79,51 @@ func addrKey(addr net.Addr) string {
 
 // begin starts a login for user from addr. When it may not use a password,
 // wait says for how long, and done does nothing; otherwise the login counts
-// as running until done is called, once it has succeeded or failed.
-func (l *loginLimiter) begin(user string, addr net.Addr) (done func(), wait time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
+// as running until done is called, once it has succeeded or failed. A
+// login that the running ones could take past a limit first waits for
+// some of them to end, until runningWait has passed or ctx is done.
+func (l *loginLimiter) begin(ctx context.Context, user string, addr net.Addr) (done func(), wait time.Duration) {
 	key := addrKey(addr)
-	wait = waitFor(l.users[user], l.running["u:"+user], userFailures, now)
-	if key != "" {
-		wait = max(wait, waitFor(l.addrs[key], l.running["a:"+key], addrFailures, now))
+	var timeout <-chan time.Time
+	for {
+		l.mu.Lock()
+		now := l.now()
+		wait, full := waitFor(l.users[user], l.running["u:"+user], userFailures, now)
+		if key != "" {
+			w, f := waitFor(l.addrs[key], l.running["a:"+key], addrFailures, now)
+			wait, full = max(wait, w), full || f
+		}
+		if wait > 0 {
+			l.mu.Unlock()
+			return func() {}, wait
+		}
+		if !full {
+			done := l.start(user, key)
+			l.mu.Unlock()
+			return done, 0
+		}
+		ended := l.ended
+		l.mu.Unlock()
+		if timeout == nil {
+			t := time.NewTimer(l.runningWait)
+			defer t.Stop()
+			timeout = t.C
+		}
+		select {
+		case <-ended:
+		case <-timeout:
+			// The logins running end within a second or so, unless
+			// their clients left them hanging.
+			return func() {}, time.Second
+		case <-ctx.Done():
+			return func() {}, time.Second
+		}
 	}
-	if wait > 0 {
-		return func() {}, wait
-	}
+}
+
+// start counts a login for user from the address key as running, and
+// returns the func that ends it. l.mu is held.
+func (l *loginLimiter) start(user, key string) func() {
 	keys := []string{"u:" + user}
 	if key != "" {
 		keys = append(keys, "a:"+key)
@@ -95,22 +141,21 @@ func (l *loginLimiter) begin(user string, addr net.Addr) (done func(), wait time
 					delete(l.running, k)
 				}
 			}
+			close(l.ended)
+			l.ended = make(chan struct{})
 		})
-	}, 0
+	}
 }
 
-// waitFor is how long until fewer than limit failures are recent, counting
-// the logins running as failures to come.
-func waitFor(failures []time.Time, running, limit int, now time.Time) time.Duration {
-	switch n := recent(failures, now); {
-	case n+running < limit:
-		return 0
-	case n < limit:
-		// The logins running end within a second or so.
-		return time.Second
+// waitFor is how long until fewer than limit failures are recent, and
+// whether the logins running, were they to fail, would make limit of them.
+func waitFor(failures []time.Time, running, limit int, now time.Time) (wait time.Duration, full bool) {
+	n := recent(failures, now)
+	if n < limit {
+		return 0, n+running >= limit
 	}
 	// failures holds at most limit entries, oldest first.
-	return failures[len(failures)-limit].Add(failureWindow).Sub(now)
+	return failures[len(failures)-limit].Add(failureWindow).Sub(now), true
 }
 
 // failed counts a failed login for user from addr. It reports whether this

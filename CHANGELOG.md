@@ -1537,6 +1537,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A client that opens more than 10 sessions at once for one user, as a
+  pool, dbt's threads or a dashboard's queries do, signs them all in. The
+  failed-login limit counts logins still running as failures to come, and
+  refused the 11th running at once with `too many failed logins`, though
+  none had failed; it now waits for one of them to end, for up to 10
+  seconds. Opening many sessions at once also no longer races on the
+  sessions' connections.
 - A cancel request sent while a statement is being prepared ends it. It was
   lost, and the statement ran to the end: preparing a report whose CTEs
   become report API calls takes seconds (recognizing them, computing their

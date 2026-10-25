@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -430,6 +431,59 @@ func TestLoginLimits(t *testing.T) {
 	}
 }
 
+// A pool that opens more sessions at once than the failed-login limit
+// allows logins in flight is not refused: its logins wait for the running
+// ones to end.
+func TestLoginsBeyondTheRunningLimitWait(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	ctx := context.Background()
+	here := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	var held []func()
+	for range userFailures {
+		done, wait := ts.srv.limiter.begin(ctx, "igloo", here)
+		if wait != 0 {
+			t.Fatal("blocked before the limit")
+		}
+		held = append(held, done)
+	}
+	connected := make(chan error, 1)
+	go func() {
+		c, err := tryConnect(ts.url("igloo", adminPassword), pgx.QueryExecModeSimpleProtocol)
+		if err == nil {
+			c.Close(ctx) //nolint:errcheck
+		}
+		connected <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	held[0]()
+	if err := <-connected; err != nil {
+		t.Fatalf("a login that waited for the running ones: %v", err)
+	}
+	for _, done := range held {
+		done()
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 3*userFailures)
+	for range 3 * userFailures {
+		wg.Go(func() {
+			c, err := tryConnect(ts.url("igloo", adminPassword), pgx.QueryExecModeSimpleProtocol)
+			if err == nil {
+				c.Close(ctx) //nolint:errcheck
+			}
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a login of a pool opening %d sessions at once: %v", 3*userFailures, err)
+		}
+	}
+}
+
 func TestLoginLimiter(t *testing.T) {
 	t.Parallel()
 	l := newLoginLimiter()
@@ -437,8 +491,9 @@ func TestLoginLimiter(t *testing.T) {
 	l.now = func() time.Time { return now }
 	a := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}
 	b := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2}
+	ctx := context.Background()
 	blocked := func(user string, addr net.Addr) time.Duration {
-		done, wait := l.begin(user, addr)
+		done, wait := l.begin(ctx, user, addr)
 		done()
 		return wait
 	}
@@ -480,24 +535,54 @@ func TestLoginLimiter(t *testing.T) {
 	}
 
 	// Logins still running count, so parallel connections get no more
-	// guesses than the limit.
+	// guesses than the limit: a login beyond it waits for a running one to
+	// end, and is refused if none ends in time.
 	l = newLoginLimiter()
+	l.runningWait = 20 * time.Millisecond
 	var dones []func()
 	for range userFailures {
-		done, wait := l.begin("bo", a)
+		done, wait := l.begin(ctx, "bo", a)
 		if wait != 0 {
 			t.Fatal("blocked before the limit")
 		}
 		dones = append(dones, done)
 	}
-	if _, wait := l.begin("bo", b); wait == 0 {
+	if _, wait := l.begin(ctx, "bo", b); wait == 0 {
 		t.Error("a login beyond the limit started while the others ran")
 	}
+	l.runningWait = time.Minute
+	started := make(chan time.Duration, 1)
+	go func() {
+		done, wait := l.begin(ctx, "bo", b)
+		done()
+		started <- wait
+	}()
+	select {
+	case <-started:
+		t.Fatal("a login beyond the limit started while the others ran")
+	case <-time.After(20 * time.Millisecond):
+	}
+	dones[0]()
+	select {
+	case wait := <-started:
+		if wait != 0 {
+			t.Errorf("a waiting login was refused once a running one ended: %s", wait)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a waiting login did not start once a running one ended")
+	}
+	last, _ := l.begin(ctx, "bo", a)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, wait := l.begin(canceled, "bo", b); wait == 0 {
+		t.Error("a login whose context ended while it waited started")
+	}
+	last()
 	for _, done := range dones {
 		done()
 		done()
 	}
-	if _, wait := l.begin("bo", b); wait != 0 {
+	if _, wait := l.begin(ctx, "bo", b); wait != 0 {
 		t.Error("finished logins still count")
 	}
 
