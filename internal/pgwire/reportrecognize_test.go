@@ -568,3 +568,72 @@ SELECT * FROM BY_TABLE UNION ALL SELECT * FROM BY_QUERY`
 		t.Errorf("rows: %d, as written %d", len(got), len(asWritten))
 	}
 }
+
+// TestReportRecognitionLeavesWhatRunsOnWorkers: a report that runs on
+// workers as written (here forced with distributed_execution = on) stays
+// as written, since the report API's calls run on one machine; with
+// distributed execution off, or in auto mode where one machine is faster,
+// it is recognized.
+func TestReportRecognitionLeavesWhatRunsOnWorkers(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var outcomes []reportOutcome
+	ds := startDistServer(t, 2, func(o *Options) {
+		o.ReportRewrite = true
+		o.reportRewriteAnyPath = true
+		o.reportOutcomes = func(got []reportOutcome) {
+			mu.Lock()
+			defer mu.Unlock()
+			outcomes = append(outcomes, got...)
+		}
+	})
+	for _, q := range reportFixture {
+		mustExec(t, ds.admin, q)
+	}
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public'")
+	sql := reportSegmentsSQL
+	run := func(mode string) (rows []string, recognized int, why string) {
+		t.Helper()
+		mustExec(t, conn, "SET distributed_execution = "+mode)
+		mu.Lock()
+		outcomes = nil
+		mu.Unlock()
+		rows, err := recognitionRows(conn, sql)
+		if err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, o := range outcomes {
+			if o.Spec != "" {
+				recognized++
+			} else {
+				why = o.Why
+			}
+		}
+		return rows, recognized, why
+	}
+
+	local, n, why := run("off")
+	if n != 4 {
+		t.Fatalf("with distributed execution off, %d CTEs recognized, want 4 (%s)", n, why)
+	}
+	if w := lastWorkers(t, ds.history, sql); w != 0 {
+		t.Errorf("with distributed execution off, ran on %d workers", w)
+	}
+	// Auto mode keeps tables this small on one machine: recognized.
+	if _, n, why := run("auto"); n != 4 {
+		t.Errorf("in auto mode, %d CTEs recognized, want 4 (%s)", n, why)
+	}
+	spread, n, why := run("on")
+	if n != 0 || !strings.Contains(why, "runs on workers") {
+		t.Errorf("run on workers as written: %d CTEs recognized, why %q", n, why)
+	}
+	if w := lastWorkers(t, ds.history, sql); w != 2 {
+		t.Errorf("the statement as written ran on %d workers, want 2", w)
+	}
+	if !slices.Equal(local, spread) {
+		t.Errorf("rows differ:\nrecognized:\n%s\non workers:\n%s", strings.Join(local, "\n"), strings.Join(spread, "\n"))
+	}
+}

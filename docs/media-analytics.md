@@ -556,7 +556,13 @@ expression: where it counts [ID domains](sql.md#id-domains)' ids or reads
 values, because a cohort is a query, a policy applies or the tables have no
 ids, reads what the expression reads and computes its cohorts again
 besides, where the expressions as written share theirs: it stays as
-written.
+written. And a statement that would run on workers as written, as
+`EXPLAIN DISTRIBUTED` says (in auto mode, or with `distributed_execution =
+on`), stays as written whole: the report API's calls run on one machine,
+since the lists of their cohorts' members are built there, and at a scale
+where workers finish the statement one machine can run out of memory.
+Asking prepares the statement as written once more, only where Igloo has
+workers.
 
 Measures that count rows (`count(*)`, sums, averages, the metric) are
 mapped only where a member is once in each cohort, as the API's cohorts

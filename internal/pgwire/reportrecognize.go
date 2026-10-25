@@ -12,6 +12,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
 // Recognizing audience reports (IGLOO_REPORT_REWRITE): the counting CTEs of
@@ -51,6 +55,10 @@ import (
 // Measures that count rows (count(*), sums, metrics) are mapped only where
 // each member appears once per cohort in the SQL; the API's cohorts are
 // distinct.
+//
+// A CTE is replaced only where its call does less than the CTE (see
+// reportCallPays), and a statement that would run on workers as written
+// keeps all its CTEs (see distributedAsWritten).
 
 // jnode is a node of DuckDB's parse.
 type jnode = map[string]any
@@ -90,6 +98,16 @@ func (s *Server) recognizeReports(ctx context.Context, sess *session, text strin
 		accept = func(spec string) error { return s.reportCallPays(ctx, sess, spec) }
 	}
 	out, outcomes, err := recognizeReportText(connReportEnv{ctx: ctx, sess: sess}, text, accept)
+	if err == nil && out != text {
+		if why := s.distributedAsWritten(ctx, sess, text); why != "" {
+			for i := range outcomes {
+				if outcomes[i].Spec != "" {
+					outcomes[i].Spec, outcomes[i].Why = "", why
+				}
+			}
+			out = text
+		}
+	}
 	if s.reportOutcomes != nil {
 		s.reportOutcomes(outcomes)
 	}
@@ -124,6 +142,40 @@ func (s *Server) reportCallPays(ctx context.Context, sess *session, text string)
 		return notReport("its call would count the tables' values (path scan), as the CTE does")
 	}
 	return nil
+}
+
+// distributedAsWritten says why a statement whose CTEs recognition would
+// replace stays as written, or "": auto mode (or distributed_execution =
+// on) would run it, as written, on workers, as EXPLAIN DISTRIBUTED says,
+// and the report API's calls run on one machine, which their cohorts'
+// members lists, built on this replica, keep them on. On a large enough
+// table the statement as written finishes on workers where the calls
+// would run out of memory here. It prepares the statement as written to
+// ask, which costs a prepare only where there are workers.
+func (s *Server) distributedAsWritten(ctx context.Context, sess *session, text string) string {
+	if s.dist == nil || sess.inTx {
+		return ""
+	}
+	user := sess.currentUser()
+	mode := sessionMode(sess, user)
+	if mode == distributed.ModeOff {
+		return ""
+	}
+	txFailed := sess.txFailed
+	st, err := s.prepareCheckedText(ctx, sess, user, text, text, nil)
+	sess.txFailed = txFailed
+	if err != nil {
+		return ""
+	}
+	defer st.close() //nolint:errcheck
+	if st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || policyReason(st) != "" {
+		return ""
+	}
+	rows, err := s.dist.Explain(ctx, st.query, &sessionEnv{s: s, sess: sess, user: user, st: st}, mode)
+	if err != nil || len(rows) == 0 || rows[0] != [2]string{"runs on", "workers"} {
+		return ""
+	}
+	return "as written it runs on workers, where the report API's calls would run on this replica"
 }
 
 // mayBeReport is a cheap test for text that may have a counting CTE.
