@@ -1240,6 +1240,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- A count of distinct members counts their ids where the member column
+  reaches it unchanged through common table expressions, subqueries and
+  views, as reports count people they joined, windowed and unnested a few
+  steps before: the ids come up the same steps in a column of their own
+  (see [ID domains](docs/sql.md#id-domains)). On the real-data mirror (one
+  8-core machine), the two behaviors reports, whose counts read each
+  source through three such steps and a view, went from 58-61 s to 30-32 s,
+  with the same results; Snowflake takes 69-72 s on X-Small. A session
+  counts the values with `SET igloo_id_counts = off`.
 - Statements that count the integer IDs of [ID domains](docs/sql.md#id-domains)
   (`count(DISTINCT CAST(_igloo_id_c AS UINTEGER))`) and read at least
   `IGLOO_BITMAP_MIN_ROWS` rows (10 million by default) count them in roaring

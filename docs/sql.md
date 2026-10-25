@@ -469,12 +469,24 @@ DROP ID DOMAIN people;
   same. It does so only when the table's current snapshot has every row's
   id, and reads the table at that snapshot; a prepared statement is
   prepared again when the table changes. Snowflake's `COUNT(DISTINCT c, d)`
-  counts the ids too. It counts the values as written when `t` is a view,
-  a common table expression or another database's table, when a row access
-  policy, clean room or masking policy (on `c`) applies to the table for
-  anyone, when the statement has `*` or `COLUMNS(...)` over the table or
-  uses its alias as a value, when the table reads a version or sample of
-  its own, and in statements other than queries.
+  counts the ids too. `t` may also be a common table expression, a
+  subquery or a view that selects the member column unchanged, by name or
+  through a star, from another such step or from the member table, past
+  joins, filters, windows and unnests of other columns: the ids come up
+  the same steps in a column of their own. A view on the way is expanded
+  in the statement, as policies expand it, for users whose role reads the
+  whole warehouse and where no policy applies to the view. The count
+  counts the values as written when a step on the way transforms the
+  column, groups, combines queries (`UNION`), or is a common table
+  expression that renames its columns by position, when a `*` or a
+  whole-row reference to a common table
+  expression on the way could show the ids, when `t` is another
+  database's table, when a row access policy, clean room or masking policy
+  (on `c`) applies to the table for anyone, when the statement has `*` or
+  `COLUMNS(...)` over the table where the count reads it or uses its alias
+  as a value, when the table reads a version or sample of its own, and in
+  statements other than queries. A session counts the values itself with
+  `SET igloo_id_counts = off` (`RESET`, `SHOW igloo_id_counts`).
 - Writes to a member table keep its ids right. An `INSERT` that names no
   columns (`INSERT INTO t VALUES ...`, `INSERT INTO t SELECT ...`) names the
   table's columns other than the ids', as does a `MERGE`'s `INSERT VALUES`;

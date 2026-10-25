@@ -19,6 +19,7 @@ import (
 //
 //	SET igloo_report_rewrite = off | on   -- recognizing reports (IGLOO_REPORT_REWRITE)
 //	SET igloo_bitmap_indexes = off | on   -- reading bitmap indexes (IGLOO_BITMAP_INDEXES)
+//	SET igloo_id_counts = off | on        -- counting through ID domains' ids (IGLOO_ID_DOMAINS)
 //
 // and RESET and SHOW them.
 type sessionSwitch struct {
@@ -34,6 +35,8 @@ var sessionSwitches = []sessionSwitch{
 		func(s *Server, sess *session) bool { return s.reportRewrite.Load() && !sess.reportRewriteOff }),
 	newSessionSwitch("igloo_bitmap_indexes", func(sess *session) *bool { return &sess.indexesOff },
 		func(s *Server, sess *session) bool { return s.bitmapIndexesOn && !sess.indexesOff }),
+	newSessionSwitch("igloo_id_counts", func(sess *session) *bool { return &sess.idCountsOff },
+		func(s *Server, sess *session) bool { return s.idDomainsOn && !sess.idCountsOff }),
 }
 
 func newSessionSwitch(name string, off func(*session) *bool, on func(*Server, *session) bool) sessionSwitch {

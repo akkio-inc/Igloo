@@ -39,8 +39,9 @@ import (
 //   - IGLOO_ID_DOMAINS is on, and the statement is a query.
 //   - The count is count(DISTINCT x) of a member column x, qualified with
 //     the alias (or name) of a member table in the FROM of the same SELECT,
-//     or unqualified with that table alone there. Views, connections'
-//     tables and common table expressions are not member tables.
+//     or unqualified with that table alone there; or of a column of a CTE,
+//     subquery or view there that the member column reaches unchanged (see
+//     idlineage.go). Connections' tables are not member tables.
 //   - No row access policy or clean room confinement is on the table, nor a
 //     masking policy, direct or through a tag, on the column, whoever the
 //     user: ids stand for the values and rows they would hide.
@@ -77,29 +78,50 @@ type idRef struct {
 }
 
 // rewriteIDCounts rewrites text to count member columns through ids where
-// it may (see above), and returns what it pinned.
+// it may (see above), and returns what it pinned. A view on a counted
+// column's lineage is expanded and the statement analyzed again (see
+// idlineage.go); a statement that then counts nothing through ids stays
+// as written.
 func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string) (string, *idCounts) {
-	if !s.idDomainsOn || s.ddl == nil || s.catalogName() == "" || sess == nil || sess.conn == nil {
-		return text, nil
+	current := text
+	for range maxViewDepth {
+		out, counts, inlined := s.rewriteIDCountsOnce(ctx, sess, current)
+		if inlined == "" {
+			if out == current && current != text {
+				return text, counts
+			}
+			return out, counts
+		}
+		current = inlined
+	}
+	return text, nil
+}
+
+// rewriteIDCountsOnce is rewriteIDCounts of text as it is: the statement
+// rewritten, or inlined, text with a view on a counted column's lineage
+// expanded, to analyze again.
+func (s *Server) rewriteIDCountsOnce(ctx context.Context, sess *session, text string) (_ string, _ *idCounts, inlined string) {
+	if !s.idDomainsOn || s.ddl == nil || s.catalogName() == "" || sess == nil || sess.conn == nil || sess.idCountsOff {
+		return text, nil, ""
 	}
 	if !countDistinctCall.MatchString(maskCode(text)) {
-		return text, nil
+		return text, nil, ""
 	}
 	members := s.memberSnapshot(ctx)
 	if members == nil || len(members.Members) == 0 {
-		return text, nil
+		return text, nil, ""
 	}
 	tree, err := parseStatement(ctx, sess.conn, text)
 	if err != nil {
-		return text, nil
+		return text, nil, ""
 	}
 	root, _ := tree.(map[string]any)
 	if root == nil || hasNode(root, func(m map[string]any) bool { return strings.Contains(str(m["type"]), "PIVOT") }) {
-		return text, nil
+		return text, nil, ""
 	}
 	r, err := s.newResolver(ctx, sess)
 	if err != nil {
-		return text, nil
+		return text, nil, ""
 	}
 	ctes := map[string]bool{}
 	walkMaps(root, func(m map[string]any) {
@@ -112,7 +134,9 @@ func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string
 		}
 	})
 
-	// Every SELECT and the tables of its FROM.
+	// Every SELECT and the tables of its FROM, and the CTEs and subqueries
+	// it reads, which a counted column may come through (see
+	// idlineage.go).
 	type selectRefs struct {
 		node   map[string]any
 		refs   []*idRef
@@ -126,6 +150,10 @@ func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string
 		}
 		sr := &selectRefs{node: m}
 		fromRefs(m["from_table"], func(t map[string]any) {
+			if str(t["type"]) == "SUBQUERY" && str(t["alias"]) != "" {
+				sr.refs = append(sr.refs, &idRef{node: t, alias: strings.ToLower(str(t["alias"]))})
+				return
+			}
 			if str(t["type"]) != "BASE_TABLE" {
 				sr.others++
 				return
@@ -155,9 +183,6 @@ func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string
 		})
 		selects = append(selects, sr)
 	})
-	if len(byKey) == 0 {
-		return text, nil
-	}
 
 	// Tables whose column of ids the statement could show, or that it
 	// reads at a time or sample of its own.
@@ -214,6 +239,8 @@ func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string
 		pins = append(pins, idPin{schema: schema, table: table, column: column, snapshot: snapshot, complete: complete})
 		return snapshot, complete
 	}
+	lt := newLineage(s, ctx, sess, text, root, r, members, gov, pinned)
+	counting := map[string]map[string]bool{} // SELECT -> relations whose lineage it counts
 	for _, sr := range selects {
 		// through substitutes a reference to a member column, counted in a
 		// count of distinct values or of distinct tuples, reporting false
@@ -233,7 +260,10 @@ func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string
 					ref = sr.refs[0]
 				}
 			}
-			if ref == nil || ref.key == "" || unsafe[ref.key] {
+			if ref != nil && ref.key == "" {
+				return lt.through(sr.node, ref, arg, names, apply, counting)
+			}
+			if ref == nil || unsafe[ref.key] {
 				return false
 			}
 			member := members.MemberOf(ref.schema, ref.table, str(names[len(names)-1]))
@@ -300,30 +330,47 @@ func (s *Server) rewriteIDCounts(ctx context.Context, sess *session, text string
 			}
 		})
 	}
+	if lt.inlined != "" {
+		return text, nil, lt.inlined
+	}
+	if len(lt.edits) > 0 {
+		// Unless the ids could show, when every count along a lineage
+		// stays as written.
+		if !lt.leaks(counting) {
+			edits = append(append(edits, lt.edits...), lt.counts...)
+			for key, snapshot := range lt.used {
+				used[key] = snapshot
+			}
+		}
+	}
 	if len(edits) == 0 {
 		if len(pins) == 0 {
-			return text, nil
+			return text, nil, ""
 		}
 		// Counted values for want of ids: prepared again once they are
 		// complete.
-		return text, &idCounts{pins: pins}
+		return text, &idCounts{pins: pins}, ""
 	}
 	// Every reference to a table counted through ids reads the snapshot
 	// that has them, after its alias.
 	for key, snapshot := range used {
 		for _, ref := range byKey[key] {
+			if lt.wrapped[nodeKey(ref.node)] {
+				// Read at the snapshot inside its subquery.
+				continue
+			}
 			pos, ok := afterTableRef(text, ref.node)
 			if !ok {
-				return text, nil
+				return text, nil, ""
 			}
 			edits = append(edits, edit{pos, pos, " AT (VERSION => " + strconv.FormatInt(snapshot, 10) + ")"})
 		}
 	}
 	out, err := applyEdits(text, edits)
 	if err != nil {
-		return text, nil
+		return text, nil, ""
 	}
-	return out, &idCounts{pins: pins}
+	return out, &idCounts{pins: pins}, ""
 }
 
 // countable reports whether rules allow counting column of their table

@@ -722,9 +722,10 @@ type session struct {
 	settingGen uint64
 	// prefetchOff turns reading ahead off for the session's statements
 	// (SET igloo_prefetch = off), reportRewriteOff recognizing their reports
-	// (SET igloo_report_rewrite = off) and indexesOff their reads of bitmap
-	// indexes (SET igloo_bitmap_indexes = off; see switches.go).
-	prefetchOff, reportRewriteOff, indexesOff bool
+	// (SET igloo_report_rewrite = off), indexesOff their reads of bitmap
+	// indexes (SET igloo_bitmap_indexes = off) and idCountsOff their counts
+	// through ID domains' ids (SET igloo_id_counts = off; see switches.go).
+	prefetchOff, reportRewriteOff, indexesOff, idCountsOff bool
 	// tokenID and tokenName identify the Igloo access token the session
 	// signed in with, if any: the session ends when the token is revoked
 	// or, at tokenExpires, expires.
