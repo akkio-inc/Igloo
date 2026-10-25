@@ -157,3 +157,89 @@ func TestShedMemoryBeforeRun(t *testing.T) {
 		t.Errorf("after: %q", v)
 	}
 }
+
+// TestCancelWhilePreparing: a statement a client sent is ended while it is
+// prepared, before it runs, by the memory watch, a cancel from the console
+// and a cancel request on the wire, and does not run after; one prepared
+// without interruption runs as usual.
+func TestCancelWhilePreparing(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	ctx := context.Background()
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "CREATE TABLE prepared_runs (n INTEGER)")
+	const query = "INSERT INTO prepared_runs VALUES (1)"
+	preparing := make(chan struct{}, 1)
+	ts.srv.beforePrepare = func(ctx context.Context, text string) {
+		if text != query {
+			return
+		}
+		preparing <- struct{}{}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Minute):
+		}
+	}
+	t.Cleanup(func() { ts.srv.beforePrepare = nil })
+	run := func() chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := conn.Exec(ctx, query)
+			done <- err
+		}()
+		select {
+		case <-preparing:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the statement was not prepared")
+		}
+		return done
+	}
+	wait := func(what string, done chan error, code string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if pgCode(err) != code {
+				t.Errorf("%s: %v, want %s", what, err, code)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("%s: not ended", what)
+		}
+	}
+	pid := func() int32 {
+		t.Helper()
+		for _, s := range ts.srv.Sessions() {
+			if s.Statement == query {
+				return s.PID
+			}
+		}
+		t.Fatalf("no session prepares %q", query)
+		return 0
+	}
+
+	done := run()
+	if !ts.srv.ShedMemory(100 << 20) {
+		t.Fatal("ShedMemory canceled nothing")
+	}
+	wait("while prepared, the memory watch", done, "53200")
+
+	done = run()
+	if !ts.srv.CancelStatement(pid(), "test") {
+		t.Fatal("CancelStatement canceled nothing")
+	}
+	wait("while prepared, a cancel", done, "57014")
+
+	done = run()
+	if err := conn.PgConn().CancelRequest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wait("while prepared, a cancel request", done, "57014")
+
+	if v := texts(t, conn, "SELECT count(*) FROM prepared_runs"); len(v) != 1 || v[0] != "0" {
+		t.Errorf("statements canceled while prepared ran: %q rows", v)
+	}
+	ts.srv.beforePrepare = nil
+	mustExec(t, conn, query)
+	if v := texts(t, conn, "SELECT count(*) FROM prepared_runs"); len(v) != 1 || v[0] != "1" {
+		t.Errorf("after: %q rows", v)
+	}
+}

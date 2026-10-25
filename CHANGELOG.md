@@ -1502,6 +1502,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A cancel request sent while a statement is being prepared ends it. It was
+  lost, and the statement ran to the end: preparing a report whose CTEs
+  become report API calls takes seconds (recognizing them, computing their
+  cohorts' bitmaps), and a cancel sent then came back 30 seconds later with
+  the report's rows. The statement timeout and the memory watch end a
+  statement being prepared too.
 - A statement that does not stop when the memory watch cancels it can no
   longer take the machine down. One in a step of DuckDB that does not check
   for interruptions ran 19 minutes past its cancellation, until the machine

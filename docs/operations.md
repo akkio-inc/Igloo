@@ -680,7 +680,10 @@ whose replicas share them and stop them once idle; each pool has its own.
   and see it with `SHOW statement_timeout`. A role's `statement_timeout`
   ([role limits](workload-management.md#role-limits)) caps both.
 - Clients can cancel a running query with a PostgreSQL cancel request (Ctrl-C
-  in psql, `Statement.cancel()` in JDBC, context cancellation in Go).
+  in psql, `Statement.cancel()` in JDBC, context cancellation in Go). The
+  request, the statement timeout and the memory watch end a statement while
+  it is still prepared too, which for a report whose CTEs become report API
+  calls can take seconds; it then does not run.
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
   SQLSTATE `53300`.
 

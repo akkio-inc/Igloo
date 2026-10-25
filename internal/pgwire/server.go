@@ -392,6 +392,10 @@ type Server struct {
 	// prepared again for its run, with the context that ends them (for
 	// tests).
 	beforeRefresh func(context.Context)
+	// beforePrepare, if set, runs as a statement a client sent (text)
+	// starts to be prepared, with the context that ends its preparing (for
+	// tests).
+	beforePrepare func(ctx context.Context, text string)
 	// splitPairs writes report calls' pair counts as workers split them
 	// (see scanCounts), and preferHybrid answers them as hybrids rather than
 	// through ids where both may (see reportStatement), for tests.
@@ -1849,7 +1853,21 @@ func (s *Server) catalogRunLock(sess *session, st *statement) func() {
 // and statements that fail here are recorded in the history.
 func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
 	start := time.Now()
-	st, err := s.prepareChecked(ctx, sess, user, text, oids)
+	// Preparing can take seconds: recognizing reports, writing the report
+	// API's calls, computing their cohorts' bitmaps and counts, all on the
+	// session's connection. A cancel request, the statement timeout and the
+	// memory watch end it as they end the statement's run (see cancelable);
+	// otherwise a cancel request sent while it is prepared would be lost, and
+	// the statement would run to the end.
+	pctx, prepared := sess.cancelable(ctx, text)
+	if s.beforePrepare != nil {
+		s.beforePrepare(pctx, text)
+	}
+	st, err := s.prepareChecked(pctx, sess, user, text, oids)
+	if err = prepared(err); err != nil && st != nil {
+		_ = st.close()
+		st = nil
+	}
 	if err != nil {
 		if pgerror.GetCode(err) == codes.InsufficientPrivilege {
 			s.metrics.query(time.Now(), err)
