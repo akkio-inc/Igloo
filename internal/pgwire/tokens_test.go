@@ -55,6 +55,38 @@ func newToken(t *testing.T, conn *pgx.Conn, sql string) string {
 	return secret
 }
 
+// tokenSession has conn make a token with create, a CREATE TOKEN statement
+// whose lifetime in seconds is its %d, signs in as user with the token and
+// runs a statement, and returns the token, the session and when the token
+// expires. A token expires at the start of a second, so one of 2 s can
+// last little more than one, and on a busy machine signing in can take
+// longer: then the token is dropped with drop and made again with twice
+// the lifetime.
+func tokenSession(t *testing.T, ts *testServer, conn *pgx.Conn, user, create, drop string) (string, *pgx.Conn, time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	for life := 2; ; life *= 2 {
+		sql := fmt.Sprintf(create, life)
+		var owner, name, token string
+		var expires time.Time
+		if err := conn.QueryRow(ctx, sql).Scan(&owner, &name, &token, &expires); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		session, err := tryConnect(ts.url(user, token), pgx.QueryExecModeSimpleProtocol)
+		if err == nil {
+			t.Cleanup(func() { _ = session.Close(context.Background()) })
+			_, err = session.Exec(ctx, "SELECT 1")
+		}
+		if err == nil {
+			return token, session, expires
+		}
+		if time.Now().Before(expires) || life >= 16 {
+			t.Fatalf("a session of a token with %d s to live: %v", life, err)
+		}
+		mustExec(t, conn, drop)
+	}
+}
+
 func loginFails(t *testing.T, ts *testServer, user, password, code string) {
 	t.Helper()
 	conn, err := tryConnect(ts.url(user, password), pgx.QueryExecModeSimpleProtocol)
@@ -154,10 +186,8 @@ func TestServiceAccountTokens(t *testing.T) {
 	mustExec(t, admin, "DROP TOKEN IF EXISTS ci FOR USER dbt")
 
 	// A session ends once the token it signed in with has expired.
-	brief := newToken(t, admin, "CREATE TOKEN brief FOR USER dbt EXPIRES '2s'")
-	short := connect(t, ts.url("dbt", brief), pgx.QueryExecModeSimpleProtocol)
-	mustExec(t, short, "SELECT 1")
-	time.Sleep(2100 * time.Millisecond)
+	brief, short, expires := tokenSession(t, ts, admin, "dbt", "CREATE TOKEN brief FOR USER dbt EXPIRES '%ds'", "DROP TOKEN brief FOR USER dbt")
+	time.Sleep(time.Until(expires) + 100*time.Millisecond)
 	if _, err := short.Exec(ctx, "SELECT 1"); pgCode(err) != "28000" || !strings.Contains(err.Error(), "expired") {
 		t.Errorf("a session of an expired token: %v", err)
 	}
@@ -260,9 +290,8 @@ func TestPersonalTokens(t *testing.T) {
 	loginFails(t, ts, "rita", token, "28P01")
 
 	// Tokens expire.
-	short := newToken(t, rita, "CREATE TOKEN short EXPIRES '2s'")
-	connect(t, ts.url("rita", short), pgx.QueryExecModeSimpleProtocol)
-	time.Sleep(2500 * time.Millisecond)
+	short, _, expires := tokenSession(t, ts, rita, "rita", "CREATE TOKEN short EXPIRES '%ds'", "DROP TOKEN short")
+	time.Sleep(time.Until(expires) + 500*time.Millisecond)
 	loginFails(t, ts, "rita", short, "28P01")
 
 	for _, bad := range []string{"CREATE TOKEN 'has space'", "CREATE TOKEN x EXPIRES 'soon'", "CREATE TOKEN x EXPIRES '-1d'", "DROP TOKEN", "SHOW TOKENS FOR igloo"} {
