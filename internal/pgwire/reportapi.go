@@ -163,30 +163,11 @@ func (s *Server) expandReportCalls(ctx context.Context, sess *session, text stri
 // through ids where it may (reportids.go); and what it pinned.
 func (s *Server) reportStatement(ctx context.Context, sess *session, spec *reportSpec, probe bool) (string, []indexPin, []idPin) {
 	plan := s.reportIndexes(ctx, sess, spec)
-	if plan != nil && plan.hybrid && !probe {
-		// Its cohorts' bitmaps first, into the session's variables; from the
-		// tables if they do not fit.
-		err := s.hybridBitmaps(ctx, sess, spec, plan)
-		if err == nil {
-			// And its counts from the bitmaps, as values.
-			err = s.hybridPeople(ctx, sess, spec, plan)
-		}
-		if err != nil {
-			s.log.Debug("report call counted from the tables", "reason", err)
-			plan = nil
-		}
-	}
-	if plan != nil {
-		if plan.hybrid {
-			plan.pairs, plan.split = s.pairBitmaps(ctx, sess, spec, plan.source), s.splitPairs
-		}
+	if plan != nil && !plan.hybrid {
+		// All from the bitmaps.
 		if !probe {
 			s.reportFromIndexes.Add(1)
-			if plan.hybrid {
-				s.metrics.reportCall("index+scan")
-			} else {
-				s.metrics.reportCall("index")
-			}
+			s.metrics.reportCall("index")
 		}
 		return s.reportIndexSQL(spec, plan), plan.pins, nil
 	}
@@ -194,28 +175,60 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	if ids != nil {
 		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.splitPairs
 	}
+	if s.preferHybrid {
+		ids = nil
+	}
 	// Through ids, or of the cohorts' sizes alone: the cohorts from their
 	// bitmaps, computed first, once for the statement however many calls
-	// read them (their variables are named by what they hold).
+	// read them (their variables are named by what they hold). Through ids,
+	// the scan joins each cohort's members, listed from its bitmap, as it
+	// joins those of the cohort's table, and counts people itself: with the
+	// scan there anyway, that costs less than reading the dimensions'
+	// bitmaps for them, and a join on integer ids less than testing each
+	// row against each bitmap (see the hybrid, below).
 	if ids != nil || len(spec.Dimensions) == 0 {
 		if cp := s.reportCohortIndexes(ctx, sess, spec); cp != nil {
 			if probe {
 				return spec.sqlWith(ids), cp.pins, read
 			}
 			err := s.hybridBitmaps(ctx, sess, spec, cp)
-			if err == nil {
+			if err == nil && ids == nil {
 				err = s.hybridPeople(ctx, sess, spec, cp)
 			}
 			if err == nil {
 				s.reportFromIndexes.Add(1)
-				if ids != nil {
-					s.metrics.reportCall("index+scan")
-				} else {
+				if ids == nil {
 					s.metrics.reportCall("index")
+					return s.reportCohortSQL(spec, cp), cp.pins, read
 				}
-				return s.reportCohortSQL(spec, cp, ids), cp.pins, read
+				s.metrics.reportCall("index+scan")
+				ids.cohortFrom = s.cohortMembers(spec, cp)
+				return spec.sqlWith(ids), cp.pins, read
 			}
 			s.log.Debug("report call's cohorts read from their tables", "reason", err)
+		}
+	}
+	if plan != nil && ids == nil {
+		// A hybrid, where the source cannot be counted through ids: people
+		// from the bitmaps, the rest from a scan that tests each row
+		// against the cohorts' bitmaps.
+		if !probe {
+			err := s.hybridBitmaps(ctx, sess, spec, plan)
+			if err == nil {
+				err = s.hybridPeople(ctx, sess, spec, plan)
+			}
+			if err != nil {
+				s.log.Debug("report call counted from the tables", "reason", err)
+				plan = nil
+			}
+		}
+		if plan != nil {
+			plan.pairs, plan.split = s.pairBitmaps(ctx, sess, spec, plan.source), s.splitPairs
+			if !probe {
+				s.reportFromIndexes.Add(1)
+				s.metrics.reportCall("index+scan")
+			}
+			return s.reportIndexSQL(spec, plan), plan.pins, nil
 		}
 	}
 	if !probe {
@@ -229,6 +242,18 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	return spec.sqlWith(ids), nil, read
 }
 
+// cohortMembers is, for each of spec's cohorts that plan reads from its
+// bitmap, the SELECT of its members' ids from its variable, which the ids
+// path joins in place of the cohort's table: under the conditions that the
+// variable is there and its latest_from reads as it did (see cohortOf).
+func (s *Server) cohortMembers(spec *reportSpec, plan *reportIndexPlan) []string {
+	out := make([]string, len(spec.Cohorts))
+	for i := range spec.Cohorts {
+		out[i] = "SELECT unnest(rb_to_list(x.bm)) AS member FROM (" + s.cohortOf(spec, plan, i) + ") AS x"
+	}
+	return out
+}
+
 // reportPlannedPath returns the path a call of spec would take now, as
 // reportStatement chooses it and the path column and metrics name it:
 // "index", "index+scan", "ids" or "scan". It reads what choosing does (the
@@ -236,13 +261,14 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 // no bitmap and sets no variable. A call may still be counted from the
 // tables when its bitmaps do not fit in memory.
 func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *reportSpec) string {
-	if plan := s.reportIndexes(ctx, sess, spec); plan != nil {
-		if plan.hybrid {
-			return "index+scan"
-		}
+	plan := s.reportIndexes(ctx, sess, spec)
+	if plan != nil && !plan.hybrid {
 		return "index"
 	}
 	ids, _ := s.reportIDs(ctx, sess, spec)
+	if s.preferHybrid {
+		ids = nil
+	}
 	if ids != nil || len(spec.Dimensions) == 0 {
 		if s.reportCohortIndexes(ctx, sess, spec) != nil {
 			if len(spec.Dimensions) == 0 {
@@ -251,7 +277,10 @@ func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *rep
 			return "index+scan"
 		}
 	}
-	if ids != nil {
+	switch {
+	case plan != nil && ids == nil:
+		return "index+scan"
+	case ids != nil:
 		return "ids"
 	}
 	return "scan"
@@ -875,6 +904,11 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 		if c.SQL != "" {
 			b.WriteString("SELECT DISTINCT q.member FROM (\n" + trimStatement(c.SQL) + "\n) AS q(member) WHERE q.member IS NOT NULL")
 		} else {
+			if ids != nil && i < len(ids.cohortFrom) && ids.cohortFrom[i] != "" {
+				b.WriteString(ids.cohortFrom[i] + "),\n")
+				labels = append(labels, "SELECT "+quoteLiteral(c.Label)+" AS cohort, member FROM "+name)
+				continue
+			}
 			member, from := "t."+quoteIdent(c.Member), tableName(c.Table)+" AS t"
 			if ids != nil {
 				x := ids.cohorts[i]
@@ -934,7 +968,11 @@ func (s *reportSpec) sqlWith(ids *reportIDs) string {
 	if s.Extent != "" {
 		b.WriteString(", x.extent_min, x.extent_max")
 	}
-	b.WriteString(", 'scan' AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
+	path := "scan"
+	if ids != nil && len(ids.cohortFrom) > 0 {
+		path = "index+scan"
+	}
+	b.WriteString(", " + quoteLiteral(path) + " AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
 	if extent != "" {
 		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
 	}

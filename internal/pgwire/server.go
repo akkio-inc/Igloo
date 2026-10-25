@@ -385,8 +385,9 @@ type Server struct {
 	// tests).
 	beforeRefresh func(context.Context)
 	// splitPairs writes report calls' pair counts as workers split them
-	// (see scanCounts), for tests.
-	splitPairs bool
+	// (see scanCounts), and preferHybrid answers them as hybrids rather than
+	// through ids where both may (see reportStatement), for tests.
+	splitPairs, preferHybrid bool
 	// failLocal, if set, runs before a statement runs on this replica, and
 	// fails it with its error; tests use it to make a statement run out of
 	// memory here.

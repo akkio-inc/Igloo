@@ -467,39 +467,35 @@ the bitmaps are of the tables' current snapshots. And:
   value are as many as its people. An index records each bitmap's rows and
   members to tell.
 
-Where the bitmaps hold the people but not the rest, because members repeat
-rows in a group or the call asks for metrics or the extent, people come from
-the bitmaps and the rest from one scan of the source at the snapshot the
-bitmaps are of, which keeps each cohort's members' rows by the cohort's
-bitmap instead of joining the cohorts and counts no distinct members
-(`path` is `index+scan`); a dimension with a `metric_where` has its people
-counted from the tables. Anything else is counted from the tables (`path`
-is `scan`), with the cohorts from their bitmaps where indexes hold them
-(below).
-
-Where bitmap indexes hold the cohorts' members but not the dimensions', a
-call counted through ids tests the source's rows against the cohorts'
-bitmaps rather than joining the members of the cohorts' tables, and takes
-the cohorts' sizes from the bitmaps (`path` is `index+scan` too). A call of
-the cohorts' sizes alone (`"dimensions": []`) reads only the bitmaps
-(`path` is `index`).
+Where the bitmaps cannot answer all a call counts, because members repeat
+rows in a group, the call asks for metrics or the extent, a dimension is not
+indexed or has a `metric_where`, the call scans the source. Where bitmap
+indexes hold its cohorts' members, it counts through ids as it would without
+them, but joins each cohort's members as its bitmap lists them rather than
+reading the cohort's table, and counts people in the same scan (`path` is
+`index+scan`). With the scan there anyway, that costs less than reading the
+dimensions' bitmaps for the people, and a join on integer ids costs less than
+testing each row against each cohort's bitmap. Only where the source cannot
+be counted through ids are people taken from the dimensions' bitmaps and the
+rest from a scan that keeps each cohort's members' rows by the cohort's
+bitmap (`path` is `index+scan` too). A call of the cohorts' sizes alone
+(`"dimensions": []`) reads only the bitmaps (`path` is `index`). Anything
+else is counted from the tables (`path` is `scan`).
 
 For these calls Igloo computes the cohorts' bitmaps first, into variables of
 the session that only its own statements may name, and drops them once the
 statement has run. Variables are named by what they hold, so the calls of
-one statement that read the same cohort share its bitmap, computed once.
-The scan then reads each bitmap once rather than once for each chunk of
-rows. The counts that come from bitmaps alone (cohort sizes, and people
+one statement that read the same cohort share its bitmap, computed once, and
+the same call twice in a statement writes the same text, which the statement
+computes once. Counts that come from bitmaps alone (cohort sizes, and people
 where the dimensions are indexed) are computed then too and written into
 the statement as values, so that it reads no bitmap index's table, which
-only the replica may read: with workers, the scan runs on them, and so do
-pairs counted in bitmaps, written then as a bitmap of members for each
-value of the column, which workers combine. A cohort's `latest_from` is
-read first too, for the version whose bitmap to compute: a prepared call is
-prepared again before each run, for the latest version then, and fails,
-asking to be run again, if a new version appears while it runs. The
-`latest_from` table must then have no row access policy, clean room or
-masking policy, or the call is counted from the tables.
+only the replica may read. A cohort's `latest_from` is read first too, for
+the version whose bitmap to compute. A prepared call keeps that version for
+its first run and is prepared again before each later one, for the latest
+version then; it fails, asking to be run again, if a new version appears in
+between. The `latest_from` table must then have no row access policy, clean
+room or masking policy, or the call is counted from the tables.
 
 ### Parity check
 

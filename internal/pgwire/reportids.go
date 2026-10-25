@@ -36,6 +36,9 @@ type reportIDs struct {
 	// pairBitmaps); split says workers may run the call (see scanCounts).
 	pairs map[int]bool
 	split bool
+	// cohortFrom, where set, is the SELECT of each cohort's members from
+	// its bitmap, in place of its table (see cohortMembers).
+	cohortFrom []string
 }
 
 // reportIDTable is a member table read through its column of ids.

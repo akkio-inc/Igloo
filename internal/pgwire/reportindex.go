@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -484,6 +485,12 @@ func (s *Server) hybridPeople(ctx context.Context, sess *session, spec *reportSp
 		}
 		return cte(name) + " AS (SELECT " + strings.Join(sel, ", ") + " FROM (VALUES " + strings.Join(rows, ", ") + ") AS v(" + strings.Join(cols, ", ") + ")),\n"
 	}
+	// In one order whatever order the rows came in, so that the calls of a
+	// statement that are the same call write the same text, which the
+	// statement then computes once (see shareSubqueries).
+	slices.Sort(people)
+	slices.Sort(totals)
+	slices.Sort(sizes)
 	var b strings.Builder
 	b.WriteString(cte("guard") + " AS (SELECT " + s.hybridGuard(spec, plan) + " AS ok),\n")
 	b.WriteString(values("sizes", []string{"cohort", "cohort_size"}, []string{"VARCHAR", "BIGINT"}, sizes))
@@ -646,40 +653,14 @@ func (s *Server) writeMembers(b *strings.Builder, spec *reportSpec, plan *report
 	b.WriteString(")\n")
 }
 
-// reportCohortSQL returns the statement of a call whose cohorts plan reads
-// from their bitmaps (see reportCohortIndexes), computed first with their
-// sizes (hybridBitmaps, hybridPeople), and which counts the rest through
-// ids (ids), as sqlWith does but for the cohorts: the source's rows are
-// tested against the cohorts' bitmaps rather than joined to the members of
-// their tables, which a call would otherwise read again each time (path
-// 'index+scan'). A call of the cohorts' sizes alone reads nothing else
-// (path 'index').
-func (s *Server) reportCohortSQL(spec *reportSpec, plan *reportIndexPlan, ids *reportIDs) string {
-	var b strings.Builder
-	b.WriteString("WITH " + plan.people)
-	if len(spec.Dimensions) == 0 {
-		b.WriteString("SELECT CAST(NULL AS VARCHAR) AS dimension, CAST(NULL AS VARCHAR) AS dim_group, CAST(NULL AS VARCHAR) AS value, z.cohort, true AS is_total, " +
-			"z.cohort_size AS people, CAST(NULL AS BIGINT) AS \"rows\", z.cohort_size, CAST(NULL AS DOUBLE) AS metric_sum, CAST(NULL AS BIGINT) AS metric_count, " +
-			"CAST(NULL AS DOUBLE) AS metric_avg, 'index' AS path FROM " + cte("sizes") + " AS z CROSS JOIN " + cte("guard") + " AS q WHERE q.ok = 1")
-		return b.String()
-	}
-	s.writeMembers(&b, spec, plan, ids.source)
-	counts, metricCols, extent := spec.scanCounts(cte("members")+" AS s", "s.__igloo_cohort", "s.__igloo_member", true, ids.pairs, ids.split)
-	b.WriteString(counts)
-	b.WriteString("SELECT n.dimension, n.dim_group, n.value, n.cohort, n.total = 1 AS is_total, n.people, n.\"rows\", z.cohort_size, " +
-		"n.metric_sum, n.metric_count, n.metric_avg")
-	for _, c := range metricCols {
-		b.WriteString(", " + c)
-	}
-	if spec.Extent != "" {
-		b.WriteString(", x.extent_min, x.extent_max")
-	}
-	b.WriteString(", 'index+scan' AS path FROM " + cte("counts") + " AS n JOIN " + cte("sizes") + " AS z ON z.cohort = n.cohort")
-	if extent != "" {
-		b.WriteString(" CROSS JOIN (" + extent + ") AS x")
-	}
-	b.WriteString(" CROSS JOIN " + cte("guard") + " AS q WHERE n.everything = 0 AND n.\"rows\" > 0 AND q.ok = 1")
-	return b.String()
+// reportCohortSQL returns the statement of a call of the cohorts' sizes
+// alone ("dimensions": []) whose cohorts plan reads from their bitmaps,
+// computed first with their sizes (hybridBitmaps, hybridPeople): it reads
+// nothing else (path 'index').
+func (s *Server) reportCohortSQL(spec *reportSpec, plan *reportIndexPlan) string {
+	return "WITH " + plan.people + "SELECT CAST(NULL AS VARCHAR) AS dimension, CAST(NULL AS VARCHAR) AS dim_group, CAST(NULL AS VARCHAR) AS value, z.cohort, true AS is_total, " +
+		"z.cohort_size AS people, CAST(NULL AS BIGINT) AS \"rows\", z.cohort_size, CAST(NULL AS DOUBLE) AS metric_sum, CAST(NULL AS BIGINT) AS metric_count, " +
+		"CAST(NULL AS DOUBLE) AS metric_avg, 'index' AS path FROM " + cte("sizes") + " AS z CROSS JOIN " + cte("guard") + " AS q WHERE q.ok = 1"
 }
 
 // writeHybrid ends a hybrid's statement: the source's rows of each

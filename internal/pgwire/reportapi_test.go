@@ -672,6 +672,37 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	srv.splitPairs = true
 	answered("plays, as workers split it", plays, "index+scan")
 	srv.splitPairs = false
+	// As a hybrid, as where the source cannot be counted through ids:
+	// people from the bitmaps, the rest from a scan.
+	srv.preferHybrid = true
+	answered("plays, as a hybrid", plays, "index+scan")
+	srv.splitPairs = true
+	answered("plays, as a hybrid that workers split", plays, "index+scan")
+	srv.splitPairs, srv.preferHybrid = false, false
+	// The same call twice in one statement writes the same text twice,
+	// which the statement then computes once: through ids with the cohorts
+	// from their bitmaps, as a hybrid, and of the cohorts' sizes alone.
+	twice := func(what string, spec map[string]any) {
+		t.Helper()
+		srv.sessions.mu.Lock()
+		sess := srv.sessions.byPID[int32(conn.PgConn().PID())]
+		srv.sessions.mu.Unlock()
+		lit := specLiteral(t, spec)
+		out, _, _, err := srv.reportCalls(ctx, sess, "SELECT * FROM igloo.audience_profile("+lit+") UNION ALL SELECT * FROM igloo.audience_profile("+lit+")")
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		halves := strings.Split(strings.TrimSuffix(strings.TrimPrefix(out, "SELECT * FROM ("), ")"), ") UNION ALL SELECT * FROM (")
+		if len(halves) != 2 || halves[0] != halves[1] {
+			t.Errorf("%s: the same call twice wrote different text", what)
+		}
+		sess.resetBitmapVariables(ctx)
+	}
+	twice("plays", plays)
+	srv.preferHybrid = true
+	twice("plays, as a hybrid", plays)
+	srv.preferHybrid = false
+	twice("the cohorts' sizes", map[string]any{"version": 1, "cohorts": cohorts, "dimensions": []any{}})
 	// The scan's cohorts' bitmaps reach it in the session's variables,
 	// which no client's statement may name, and which go once it has run.
 	var left int64
