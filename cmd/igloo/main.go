@@ -446,6 +446,7 @@ func serve() error {
 		ReportRewrite:       cfg.ReportRewrite,
 		RewriteMemory:       rewriteMemory(cfg, memory),
 		MemoryTotal:         memory.Total,
+		FreeMemory:          func(ctx context.Context) { dropDuckDBCaches(ctx, eng, log) },
 		AllowedLocations:    cfg.Storage.AllowedLocations,
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,
@@ -985,6 +986,25 @@ func rewriteMemory(cfg config.Config, memory memlimit.Plan) int64 {
 		budget = maintenance.DefaultMemory
 	}
 	return budget
+}
+
+// dropDuckDBCaches makes DuckDB write out or drop the buffers it can, its
+// caches among them: it asks for a memory limit of 256 MiB, which DuckDB
+// evicts buffers to meet (and refuses, having evicted what it could, while
+// running work pins more), then puts the limit back. The memory watch does
+// this before it gives up on work no statement owns any more.
+func dropDuckDBCaches(ctx context.Context, eng *engine.Engine, log *slog.Logger) {
+	limit := eng.MemoryLimit(ctx)
+	if limit <= 256<<20 {
+		return
+	}
+	if err := eng.SetMemoryLimit(ctx, 256<<20); err != nil {
+		log.Debug("DuckDB could not free enough for a 256 MiB memory limit", "err", err)
+		return
+	}
+	if err := eng.SetMemoryLimit(ctx, limit); err != nil {
+		log.Warn("could not restore DuckDB's memory limit after dropping its caches", "limit", memlimit.Format(limit), "err", err)
+	}
 }
 
 func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,

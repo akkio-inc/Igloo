@@ -280,7 +280,17 @@ using all of its cores.
   long it ran and was canceled for and how far DuckDB says it got, counts
   it in `igloo_memory_exits_total`, and exits with status 75, for its
   orchestration (Docker's restart policy, Kubernetes) to start it again.
-  A statement that stops when canceled never leads to this.
+  A canceled statement can also return while DuckDB's other threads are
+  still in such a step for it, taking memory no running statement holds.
+  So when memory is below that floor with no statement running, within
+  5 minutes of the watch canceling one, Igloo first frees what it can (Go's
+  free heap, and DuckDB's caches, by asking DuckDB for a 256 MiB memory
+  limit and then restoring it), logging `memory is nearly gone and no
+  statement is running`; if memory is still below the floor 10 seconds
+  later, with still nothing running, it exits the same way, logging
+  `memory is nearly gone with no statement running` with the session,
+  user and statement hash of the statement it canceled last. A statement
+  that stops when canceled, and lets DuckDB stop, never leads to either.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk, local
   NVMe where the machine has it ([spill on local NVMe](#spill-on-local-nvme)),
@@ -722,7 +732,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_report_ctes_recognized_total` | | Common table expressions of reports that `IGLOO_REPORT_REWRITE` answered through the report API ([reports as written](media-analytics.md#reports-as-written)) |
 | `igloo_report_rewrite_fallbacks_total` | | Statements whose recognized reports failed to prepare and were prepared as written instead |
 | `igloo_bitmap_index_statements_total` | | Statements prepared whose counts of distinct members in SQL read [bitmap indexes](sql.md#bitmap-indexes) instead of the tables (report API calls count in `igloo_report_calls_total`) |
-| `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop and memory was nearly gone (see [sizing](#sizing)) |
+| `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

@@ -174,6 +174,10 @@ type Options struct {
 	// below a sixty-fourth of which ShedMemory gives up on a statement it
 	// canceled that does not stop, and exits (see exitForMemory); 0 never.
 	MemoryTotal int64
+	// FreeMemory, when set, makes DuckDB give back the memory it can,
+	// dropping its caches, before ShedMemory gives up on work no statement
+	// owns any more (see orphanedWork).
+	FreeMemory func(context.Context)
 	// shedStuckAfter and exit, when set, replace shedStuckAfter and
 	// os.Exit (for tests).
 	shedStuckAfter time.Duration
@@ -350,6 +354,10 @@ type Server struct {
 	memoryCritical int64
 	shedStuckAfter time.Duration
 	exitProcess    func(code int)
+	freeMemory     func(context.Context)
+	// orphans is what ShedMemory knows of the work of statements it
+	// canceled once nothing runs (see orphanedWork).
+	orphans orphans
 	// reportRewrite is Options.ReportRewrite; reportRecognized counts the
 	// CTEs it answered through the report API, and reportUnrecognized the
 	// statements prepared again as written after a recognized form failed.
@@ -553,6 +561,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.shedStuckAfter = cmp.Or(opts.shedStuckAfter, shedStuckAfter)
 	s.exitProcess = opts.exit
+	s.freeMemory = opts.FreeMemory
 	if s.exitProcess == nil {
 		s.exitProcess = os.Exit
 	}
@@ -1110,6 +1119,9 @@ func (s *Server) ShedMemory(available int64) bool {
 		sess.mu.Unlock()
 	}
 	acted := false
+	if stuck != nil {
+		s.orphans.reset()
+	}
 	if stuck != nil && time.Since(stuckSince) >= s.shedStuckAfter {
 		if s.memoryCritical > 0 && available < s.memoryCritical {
 			s.exitForMemory(stuck, available, all)
@@ -1122,10 +1134,11 @@ func (s *Server) ShedMemory(available int64) bool {
 	}
 	if longest == nil {
 		if stuck == nil {
-			s.log.Warn("memory is running out, and no statement is running to cancel", "available", memlimit.Format(available))
+			return s.orphanedWork(available, all)
 		}
 		return acted
 	}
+	s.orphans.reset()
 	longest.mu.Lock()
 	defer longest.mu.Unlock()
 	if longest.running == nil {
@@ -1133,6 +1146,7 @@ func (s *Server) ShedMemory(available int64) bool {
 	}
 	longest.shed, longest.shedAt = true, time.Now()
 	longest.running()
+	s.orphans.canceled(longest.pid, longest.user.Name, longest.statement, longest.shedAt)
 	s.log.Warn("memory is running out; canceled the statement that had run longest", "available", memlimit.Format(available),
 		"user", longest.user.Name, "pid", longest.pid, "running_for", time.Since(longest.started).Round(time.Millisecond))
 	return true

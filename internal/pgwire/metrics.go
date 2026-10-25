@@ -87,7 +87,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 		memoryExits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_memory_exits_total",
-			Help: "Times Igloo exited because a statement it canceled for running out of memory did not stop and memory was nearly gone.",
+			Help: "Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone.",
 		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,

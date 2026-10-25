@@ -1483,7 +1483,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   again after 10 seconds, and if memory falls below a sixty-fourth of
   Igloo's, fails the other statements in flight with SQLSTATE 57P01, logs
   the culprit, counts it in `igloo_memory_exits_total` and exits with
-  status 75 to be started again.
+  status 75 to be started again. It does the same, after freeing Go's and
+  DuckDB's caches and waiting 10 seconds, when memory is that low with no
+  statement running soon after it canceled one: a canceled statement can
+  return while DuckDB's other threads go on with its work.
 - Compaction no longer refuses a table whose position deletes alone exceed
   `IGLOO_MAINTENANCE_MEMORY`, as after an `UPDATE` of every row of a large
   table: iceberg-go loads every delete file of the files it reads, whole,
