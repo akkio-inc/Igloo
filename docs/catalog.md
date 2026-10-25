@@ -321,10 +321,16 @@ them. Like lineage, events need the query history on.
 | `igloo.lineage` | `upstream_type` (`TABLE` or `LOCATION`), `upstream_database`, `upstream_schema`, `upstream_name`, `downstream_database`, `downstream_schema`, `downstream_name`, `first_seen`, `last_seen`, `statements`, `last_query_id`, `last_user`, `last_statement_type`, `last_job` |
 
 `information_schema.tables` has, besides its own columns, `table_owner`,
-`comment`, `row_count`, `bytes`, `last_altered` and `clustering_key`, as in
-Snowflake, and
+`comment`, `row_count`, `bytes`, `last_altered`, `clustering_key`,
+`is_transient` (always `NO`) and `is_temporary`, as in Snowflake, and
 its `TABLE_COMMENT` is filled in for Iceberg tables;
-`information_schema.schemata` has the real `schema_owner` and `comment`.
+`information_schema.schemata` has the real `schema_owner` and `comment`;
+`information_schema.columns` has each column's comment as `comment` too.
+`information_schema.functions` lists the macros admins create, with
+Snowflake's columns (`function_schema`, `function_name`,
+`argument_signature`, `data_type`, `function_definition`, `comment` and
+others), and `information_schema.procedures` has Snowflake's columns and
+no rows, as Igloo has no procedures.
 Their own columns, rows and table types are DuckDB's, connections'
 catalogs included, so tools that list tables through them, such as Flight
 SQL clients' `GetTables`, see what they did before.

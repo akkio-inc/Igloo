@@ -162,6 +162,27 @@ func TestSnowflakeImplicitConversions(t *testing.T) {
 	}
 }
 
+// Snowflake's information_schema views and columns that its clients read:
+// functions (of the macros admins create) and procedures (none), tables'
+// is_transient and columns' comment.
+func TestSnowflakeInformationSchema(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, "CREATE MACRO memory.main.plus_one(x) AS x + 1")
+	mustExec(t, cs.admin, "SET sql_dialect = 'snowflake'")
+	expectRows(t, cs.admin, `SELECT COUNT(*) AS CNT FROM information_schema.functions WHERE function_name = 'plus_one' AND FUNCTION_SCHEMA = 'main'`, "1")
+	expectRows(t, cs.admin, `SELECT argument_signature, function_definition, function_language FROM INFORMATION_SCHEMA.FUNCTIONS WHERE function_name = 'plus_one'`,
+		"(x)|(x + 1)|SQL")
+	if n := count(t, cs.admin, `SELECT COUNT(*) FROM information_schema.functions WHERE function_name LIKE 'sf!_%' ESCAPE '!'`); n != 0 {
+		t.Errorf("information_schema.functions lists %d of the session's own macros", n)
+	}
+	expectRows(t, cs.admin, `SELECT * FROM ( SELECT PROCEDURE_NAME, COMMENT FROM INFORMATION_SCHEMA.PROCEDURES WHERE PROCEDURE_SCHEMA = 'public' ) WHERE "PROCEDURE_NAME" IN ('LOAD_ORDERS', 'SCORE')`)
+	expectRows(t, cs.admin, `SELECT table_name, is_transient, is_temporary FROM information_schema.tables WHERE table_name LIKE 'ord%' AND table_catalog = 'lake'`,
+		"orders|NO|NO")
+	expectRows(t, cs.admin, `SELECT column_name FROM information_schema.columns WHERE TABLE_SCHEMA = 'public' AND table_name = 'orders' AND COALESCE(COMMENT, '') NOT LIKE '% :ignore %' ORDER BY 1`,
+		"amount", "id")
+}
+
 func TestSnowflakeDialectNotices(t *testing.T) {
 	t.Parallel()
 	ts := startServer(t)

@@ -455,8 +455,9 @@ var historyViews = append([]string{"query_history", "login_history", "task_histo
 	"policy_references", "tag_references", "data_retention", "erasure_requests"}, engine.CatalogViews()...)
 
 // informationSchemaViews are the views of information_schema that Igloo
-// adds owners, comments and sizes to (see engine.InformationSchemaView).
-var informationSchemaViews = []string{"schemata", "tables"}
+// adds owners, comments and sizes to, or has Snowflake's of, functions and
+// procedures (see engine.InformationSchemaView).
+var informationSchemaViews = []string{"schemata", "tables", "functions", "procedures"}
 
 // isHistoryView reports whether name is one of historyViews.
 func isHistoryView(name string) bool {
@@ -465,9 +466,9 @@ func isHistoryView(name string) bool {
 
 // rewriteHistoryRefs points igloo.query_history, igloo.login_history and
 // the other historyViews at the local database, where the views are,
-// whatever the session's search path, and information_schema.schemata and
-// information_schema.tables at Igloo's versions of them. Literals, comments
-// and every other name are left as written.
+// whatever the session's search path, and information_schema.schemata,
+// tables, functions and procedures at Igloo's versions of them. Literals,
+// comments and every other name are left as written.
 func rewriteHistoryRefs(query, local string) string {
 	lower := strings.ToLower(query)
 	if !(strings.Contains(lower, engine.HistorySchema) &&
@@ -702,11 +703,13 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 			[]::SMALLINT[] AS indoption, NULL::VARCHAR AS indexprs, NULL::VARCHAR AS indpred WHERE false`,
 		// Column comments too, which DuckDB does not read from Iceberg
 		// metadata, as information_schema.tables has table comments (see
-		// engine.InformationSchemaView). The catalog's comment comes first:
-		// a comment DuckDB holds can be one replaced since.
+		// engine.InformationSchemaView), also as COMMENT, Snowflake's name
+		// for them. The catalog's comment comes first: a comment DuckDB
+		// holds can be one replaced since.
 		`CREATE OR REPLACE TEMP VIEW pg_information_schema_columns AS SELECT c.* REPLACE (
 			'pg_catalog' AS udt_schema, (SELECT typname FROM pg_type WHERE oid = (` + pgTypeOID + `)) AS udt_name,
-			coalesce(k.comment, c.column_comment) AS column_comment)
+			coalesce(k.comment, c.column_comment) AS column_comment),
+			coalesce(k.comment, c.column_comment) AS comment
 			FROM information_schema.columns c
 			LEFT JOIN system.main.igloo_comments() k ON k.table_catalog = c.table_catalog AND k.table_schema = c.table_schema
 				AND k.table_name = c.table_name AND k.column_name = c.column_name

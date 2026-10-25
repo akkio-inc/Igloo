@@ -456,7 +456,12 @@ What Igloo cannot reproduce exactly, and what it does instead.
   the same column, where Snowflake would see two.
 - Views run with their reader's privileges, as Igloo's always do; `SECURE`
   does not hide their definition.
-- `information_schema` and `SHOW` are DuckDB's: their columns and rows
+- `information_schema` and `SHOW` are DuckDB's, with the Snowflake
+  columns that tools check for: `information_schema.tables` has
+  `last_altered`, `comment`, `is_transient` (always `NO`) and
+  `is_temporary`, `information_schema.columns` has `comment`,
+  `information_schema.functions` lists the macros admins create, and
+  `information_schema.procedures` is empty. Their other columns and rows
   differ from Snowflake's. Igloo's own [catalog views](catalog.md) list
   tables, columns and their usage.
 

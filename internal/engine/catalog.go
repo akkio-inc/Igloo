@@ -75,7 +75,8 @@ var catalogViews = map[string]string{
 }
 
 // InformationSchemaView names the view that stands in for
-// information_schema's view, schemata or tables, in HistorySchema.
+// information_schema's view, schemata, tables, functions or procedures, in
+// HistorySchema.
 func InformationSchemaView(name string) string { return "information_schema_" + name }
 
 // CatalogViews names the views registerCatalog defines in HistorySchema.
@@ -200,10 +201,29 @@ func (e *Engine) registerCatalog(ctx context.Context) error {
 			LEFT JOIN system.main.igloo_schemata() o ON o.catalog_name = s.catalog_name AND o.schema_name = s.schema_name`,
 		"CREATE OR REPLACE VIEW "+schema+"."+ident(InformationSchemaView("tables"))+` AS
 			SELECT t.* REPLACE (coalesce(o.comment, t.TABLE_COMMENT) AS TABLE_COMMENT),
-				o.table_owner, o.comment, o.row_count, o.bytes, o.last_altered, o.clustering_key
+				o.table_owner, o.comment, o.row_count, o.bytes, o.last_altered, o.clustering_key,
+				'NO' AS is_transient, CASE WHEN t.table_type = 'LOCAL TEMPORARY' THEN 'YES' ELSE 'NO' END AS is_temporary
 			FROM system.information_schema.tables t
 			LEFT JOIN system.main.igloo_tables() o ON o.table_schema = t.table_schema AND o.table_name = t.table_name
-				AND (o.table_catalog = t.table_catalog OR t.table_type = 'VIEW' AND t.table_catalog = `+literal(e.local)+`)`)
+				AND (o.table_catalog = t.table_catalog OR t.table_type = 'VIEW' AND t.table_catalog = `+literal(e.local)+`)`,
+		// Snowflake's information_schema.functions, of the macros admins
+		// create (not the session's own, such as the Snowflake dialect's),
+		// and information_schema.procedures, which Igloo has none of.
+		"CREATE OR REPLACE VIEW "+schema+"."+ident(InformationSchemaView("functions"))+` AS
+			SELECT database_name AS function_catalog, schema_name AS function_schema, function_name,
+				NULL::VARCHAR AS function_owner, '(' || array_to_string(parameters, ', ') || ')' AS argument_signature,
+				CASE WHEN function_type = 'table_macro' THEN 'TABLE' ELSE return_type END AS data_type,
+				'SQL' AS function_language, macro_definition AS function_definition, 'VOLATILE' AS volatility,
+				'NO' AS is_secure, 'NO' AS is_external, NULL::TIMESTAMPTZ AS created, NULL::TIMESTAMPTZ AS last_altered,
+				coalesce(comment, description) AS comment
+			FROM system.main.duckdb_functions()
+			WHERE function_type IN ('macro', 'table_macro') AND NOT internal AND database_name <> 'temp'`,
+		"CREATE OR REPLACE VIEW "+schema+"."+ident(InformationSchemaView("procedures"))+` AS
+			SELECT NULL::VARCHAR AS procedure_catalog, NULL::VARCHAR AS procedure_schema, NULL::VARCHAR AS procedure_name,
+				NULL::VARCHAR AS procedure_owner, NULL::VARCHAR AS argument_signature, NULL::VARCHAR AS data_type,
+				NULL::VARCHAR AS procedure_language, NULL::VARCHAR AS procedure_definition, NULL::TIMESTAMPTZ AS created,
+				NULL::TIMESTAMPTZ AS last_altered, NULL::VARCHAR AS comment
+			WHERE false`)
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("%s: %w", stmt, err)

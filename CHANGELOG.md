@@ -1171,6 +1171,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   with their provider, and connections' tables, the latter to admins and
   to whoever has a grant on them only, from a listing that never waits for
   a remote database.
+- `information_schema` has the Snowflake views and columns that tools and
+  dbt macros check for: `information_schema.tables` has `is_transient`
+  (always `NO`) and `is_temporary`, `information_schema.columns` has
+  `comment`, `information_schema.functions` lists the macros admins
+  create, with Snowflake's columns, and `information_schema.procedures` is
+  there, empty.
 - `igloo.lineage`, table-level lineage from the query history: edges from
   the tables and locations that `INSERT ... SELECT`, `CREATE TABLE AS`,
   `MERGE`, `UPDATE ... FROM`, `COPY INTO`, tasks, pipes and materialized

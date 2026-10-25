@@ -1226,7 +1226,7 @@ var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_
 var listsCatalog = regexp.MustCompile(`(?is)(^\s*(SHOW|DESCRIBE|DESC|PRAGMA)\b)|` +
 	`\b(sqlite_master|sqlite_schema|sqlite_temp_master|sqlite_temp_schema|` +
 	`duckdb_tables|duckdb_views|duckdb_columns|duckdb_constraints|duckdb_databases|duckdb_schemas|` +
-	`information_schema|information_schema_tables|information_schema_schemata|` +
+	`information_schema|information_schema_tables|information_schema_schemata|information_schema_functions|` +
 	`pg_catalog|pg_class|pg_attribute|pg_namespace|pg_tables|pg_views|pg_matviews|` +
 	`pg_information_schema_columns|pg_description|pg_type|pg_proc)\b`)
 
