@@ -1,5 +1,7 @@
 package snowflake
 
+import "strings"
+
 // macros define, for one session, the DuckDB macros that translated
 // statements call. Their names start with sf_, which no DuckDB function's
 // does, so they shadow nothing. Every session gets them, whatever its
@@ -285,6 +287,16 @@ var macros = []string{
 	// subquery or a volatile function as many times as it is named; this
 	// computes each once.
 	`CREATE OR REPLACE TEMP MACRO sf_div_once(a, b) AS list_transform([{'a': a, 'b': b}], lambda s: sf_div(s.a, s.b))[1]`,
+	// Snowflake's implicit conversions, which translations with
+	// Options.Implicit call. sf_str is any value as text, as a string
+	// function reads it: text as itself, which costs nothing, anything else
+	// as TO_VARCHAR writes it. sf_as is a, compared with b: text cast to
+	// b's type when b is a date, a time or a number, as Snowflake casts it,
+	// and a as it is otherwise.
+	`CREATE OR REPLACE TEMP MACRO sf_str(x VARCHAR) AS x, (x) AS ` + strings.ReplaceAll(defaultText, "{x}", "x"),
+	`CREATE OR REPLACE TEMP MACRO sf_as(a VARCHAR, b TIMESTAMP) AS CAST(a AS TIMESTAMP),
+		(a VARCHAR, b TIMESTAMPTZ) AS CAST(a AS TIMESTAMPTZ), (a VARCHAR, b DATE) AS CAST(a AS DATE),
+		(a VARCHAR, b TIME) AS CAST(a AS TIME), (a VARCHAR, b DOUBLE) AS CAST(a AS DOUBLE), (a, b) AS a`,
 }
 
 // Macros returns the statements that define, in a session, the macros

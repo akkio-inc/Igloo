@@ -2,6 +2,8 @@ package pgwire
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
@@ -107,6 +110,56 @@ func asPgError(err error, target **pgconn.PgError) bool {
 		*target = pe
 	}
 	return ok
+}
+
+// A statement DuckDB cannot bind for want of a cast that Snowflake makes
+// implicitly runs with Snowflake's conversions, and the history records it
+// once, as it ran; one that fails with them too fails as translated first.
+func TestSnowflakeImplicitConversions(t *testing.T) {
+	t.Parallel()
+	store := audit.NewMemoryStore(1000, 1000)
+	history := audit.New(store, audit.Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ts := startServer(t, func(o *Options) { o.Audit = history })
+	ctx := context.Background()
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			conn := ts.admin(t, mode)
+			mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+			var up string
+			var like, gt bool
+			if err := conn.QueryRow(ctx, `SELECT upper(n), d LIKE '2024%', s > i FROM (SELECT 5 AS n, '2024-01-01'::date AS d, '10'::varchar AS s, 9 AS i)`).
+				Scan(&up, &like, &gt); err != nil {
+				t.Fatal(err)
+			}
+			if up != "5" || !like || !gt {
+				t.Errorf("got %q %v %v, want 5 true true", up, like, gt)
+			}
+			if _, err := conn.Exec(ctx, `SELECT trim(n, 'a', 'b') FROM (SELECT 5 AS n)`); err == nil || !strings.Contains(err.Error(), "trim(INTEGER") {
+				t.Errorf("trim of three arguments: %v, want DuckDB's error for the statement as translated", err)
+			}
+		})
+	}
+	qs, err := store.Queries(ctx, audit.Viewer{All: true}, audit.Page{Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran, failed := 0, 0
+	for _, q := range qs {
+		switch {
+		case strings.Contains(q.Text, "upper(") && q.Outcome == audit.OutcomeOK:
+			ran++
+		case strings.Contains(q.Text, "upper("):
+			t.Errorf("the history has a failed attempt of a statement that ran: %+v", q)
+		case strings.Contains(q.Text, "trim(") && q.Outcome != audit.OutcomeOK:
+			failed++
+			if strings.Contains(q.Text, "sf_str(") {
+				t.Errorf("the history has the retry of a failed statement, not the statement as translated: %s", q.Text)
+			}
+		}
+	}
+	if ran < len(modes) || failed < len(modes) {
+		t.Errorf("history: %d runs and %d failures, want at least %d of each", ran, failed, len(modes))
+	}
 }
 
 func TestSnowflakeDialectNotices(t *testing.T) {

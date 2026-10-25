@@ -13,6 +13,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- Snowflake's dialect makes Snowflake's implicit conversions: string
+  functions and `LIKE` read numbers, dates and timestamps as text
+  (`TRIM(5)`, `LENGTH(ts)`), and text compared with a timestamp, a date or
+  a number is cast to it (`ts_text BETWEEN start_ts AND end_ts`). A
+  statement that binds as translated is unchanged; one DuckDB cannot bind
+  for want of such a cast is translated again with the conversions
+  (`igloo_snowflake_implicit_conversions_total`). In an `ORDER BY`
+  expression a select list's alias now comes before a column of the same
+  name, as in Snowflake, which also fixes "ambiguous reference" errors for
+  a name both joined tables have. `ARRAY_FLATTEN` is translated, and
+  `CREATE VIEW db.schema.v ("COL" COMMENT $$...$$, ...)`, as dbt-snowflake
+  writes views with documented columns, no longer fails to parse.
 - A prepared `CREATE TABLE ... AS` a client runs again makes the table it
   says. DuckDB 1.5.6 runs a prepared CREATE as written only the first time,
   and from the second on makes the table with no columns, so that the next

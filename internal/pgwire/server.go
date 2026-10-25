@@ -694,6 +694,9 @@ type session struct {
 	open     map[*wire.PreparedStatement]*statement
 	inTx     bool
 	txFailed bool
+	// held, while set, keeps queries recorded for the history (see
+	// holdRecords).
+	held *[]queryRecord
 	// changes counts the statements in the transaction block that may have
 	// changed something, and savepoints are its savepoints (see
 	// savepointCommand).
@@ -1256,11 +1259,12 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	// all that follows, the checks of the user's role, grants and policies
 	// above all, sees only the DuckDB statement Igloo will run.
 	var tr *translation
+	source := q.Query
 	if sess.sqlDialect() == dialectSnowflake && !isIglooSQL(ctx) {
 		if parts := snowflake.Split(q.Query); q.SimpleQuery && len(parts) > 1 {
 			return s.snowflakeScript(ctx, sess, q, parts)
 		}
-		if tr, err = s.translate(ctx, sess, q.Query); err != nil {
+		if tr, err = s.translate(ctx, sess, q.Query, false); err != nil {
 			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
 			return nil, err
 		}
@@ -1282,9 +1286,16 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			return nil, pgerror.WithCode(errors.New(`invalid byte sequence for encoding "UTF8": 0x00`), codes.CharacterNotInRepertoire)
 		}
 	}
-	ps, err := s.parseDuckDB(ctx, sess, user, q, tr)
-	if err != nil || tr == nil {
-		return ps, err
+	if tr == nil || tr.Untranslated {
+		ps, err := s.parseDuckDB(ctx, sess, user, q, tr)
+		if err != nil || tr == nil {
+			return ps, err
+		}
+		return withNotices(ps, tr.Notices), nil
+	}
+	ps, tr, err := s.parseTranslated(ctx, sess, user, q, source, tr)
+	if err != nil {
+		return nil, err
 	}
 	if after := tr.After; len(after) > 0 {
 		// Such as the clustering key of CREATE TABLE ... CLUSTER BY, set

@@ -133,7 +133,7 @@ JSON and JSON text alike.
   `ARRAY_CONTAINS`, `ARRAY_POSITION`, `ARRAY_TO_STRING`, `ARRAY_SLICE`,
   `ARRAY_APPEND`, `ARRAY_PREPEND`, `ARRAY_CAT`, `ARRAY_COMPACT`,
   `ARRAY_DISTINCT`, `ARRAY_INTERSECTION`, `ARRAYS_OVERLAP`,
-  `ARRAY_GENERATE_RANGE`, `SPLIT`, `STRTOK_TO_ARRAY`.
+  `ARRAY_FLATTEN`, `ARRAY_GENERATE_RANGE`, `SPLIT`, `STRTOK_TO_ARRAY`.
 - `[LATERAL] FLATTEN(input => ..., path => ..., outer => ..., recursive =>
   ..., mode => ...)` and `TABLE(FLATTEN(...))`, with the columns `SEQ`,
   `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`. `FLATTEN` of an `ARRAY` or
@@ -251,6 +251,33 @@ in both:
 A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
 `+05:30`, `TZHTZM` is `+0530`).
 
+### Implicit conversions
+
+Snowflake converts a value where DuckDB asks for a cast:
+
+- A string function (`UPPER`, `TRIM`, `LENGTH`, `SUBSTR`, `REPLACE`,
+  `CONTAINS`, `SPLIT_PART` and the others) and `LIKE` read any value as
+  text, written as `TO_VARCHAR` writes it: `TRIM(5)` is `'5'`,
+  `LENGTH('2024-01-01 10:00'::timestamp)` is 23.
+- Text compared with a date, a time, a timestamp or a number, with `=`,
+  `<` and the like or `BETWEEN`, is cast to its type: `'10' > 9` is true,
+  where `'10' > '9'` is false.
+
+Which conversion a statement needs depends on its columns' types, which
+the translation does not know. So Igloo translates a statement without
+them, and only when DuckDB cannot bind it for want of a cast does it
+translate it again with Snowflake's conversions and run that; a
+statement that binds as written is never changed. The query history
+records the statement once, as it ran, and
+`igloo_snowflake_implicit_conversions_total` counts these statements. If
+the conversions do not help either, the statement fails with DuckDB's
+error for it as first translated.
+
+The conversions apply to operands that stand alone: a column, a call, a
+semi-structured path or a parenthesized expression. In `a || b < t` the
+comparison reads `a || b`, which Igloo does not convert; write
+`(a || b) < t` or cast it.
+
 ### Syntax
 
 - `QUALIFY`, `MINUS` (as `EXCEPT`), `SELECT TOP n`, `FROM VALUES (...)`
@@ -263,6 +290,11 @@ A format's `TZH` and `TZM` write the offset as Snowflake does (`TZH:TZM` is
 - `WITH` whose CTE refers to itself, without `RECURSIVE`.
 - `ORDER BY` puts NULLs last ascending and first descending, as Snowflake
   does, in queries, windows and `WITHIN GROUP`.
+- In an `ORDER BY` expression a select list's alias comes before a column
+  of the same name, as in Snowflake: `SELECT COALESCE(a.k, b.k) AS k ...
+  ORDER BY CASE k WHEN ...` sorts by the alias, where DuckDB would read
+  `k` as a column (and find it in both tables). Not for `SELECT DISTINCT`
+  or a set operation.
 - Time travel with `AT (TIMESTAMP => ...)` and `AT (OFFSET => -seconds)`,
   the table's alias written after it as Snowflake does.
 
@@ -448,7 +480,7 @@ These fail with SQLSTATE `0A000` and a hint:
   values.
 - `OBJECT_CONSTRUCT(*)` and `{*}`: name the keys and values.
 - Functions without a faithful translation, such as `OBJECT_DELETE`,
-  `OBJECT_PICK`, `ARRAY_SORT`, `ARRAY_FLATTEN`, `PARSE_XML`, `SOUNDEX`,
+  `OBJECT_PICK`, `ARRAY_SORT`, `PARSE_XML`, `SOUNDEX`,
   `CONDITIONAL_CHANGE_EVENT`, `ENCRYPT` and `DECRYPT`, `REGEXP_REPLACE`
   of one occurrence after the first, `SHA2` of other than 256 bits, and
   arguments Igloo must know when it translates (a format, a date part or a

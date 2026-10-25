@@ -75,9 +75,32 @@ type queryRecord struct {
 	parts distParts
 }
 
+// holdRecords keeps what recordQuery is given for sess from the history
+// until the returned function is called, which returns it, for a statement
+// Igloo may try twice (see parseTranslated).
+func (sess *session) holdRecords() func() []queryRecord {
+	var held []queryRecord
+	sess.held = &held
+	return func() []queryRecord {
+		sess.held = nil
+		return held
+	}
+}
+
+// recordAll records each of recs.
+func (s *Server) recordAll(sess *session, recs []queryRecord) {
+	for _, r := range recs {
+		s.recordQuery(sess, r)
+	}
+}
+
 // recordQuery sends a statement to the history.
 func (s *Server) recordQuery(sess *session, r queryRecord) {
 	if s.audit == nil || sess == nil {
+		return
+	}
+	if sess.held != nil {
+		*sess.held = append(*sess.held, r)
 		return
 	}
 	user := sess.currentUser()

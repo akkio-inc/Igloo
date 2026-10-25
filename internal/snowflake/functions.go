@@ -206,6 +206,9 @@ func (t *translator) calls(nodes []*node) ([]*node, error) {
 		}
 		c := t.newCall(nodes, i, g)
 		c.setModes()
+		if t.opts.Implicit {
+			c.implicitText()
+		}
 		end := g + 1
 		// WITHIN GROUP (ORDER BY ...)
 		if rw.within {
@@ -276,7 +279,7 @@ var semiResults = map[string]byte{
 	"ARRAY_CONSTRUCT": 'A', "ARRAY_CONSTRUCT_COMPACT": 'A', "ARRAY_AGG": 'A', "ARRAYAGG": 'A', "ARRAY_UNIQUE_AGG": 'A',
 	"TO_ARRAY": 'A', "SPLIT": 'A', "STRTOK_TO_ARRAY": 'A', "REGEXP_SUBSTR_ALL": 'A', "REGEXP_EXTRACT_ALL": 'A',
 	"ARRAY_SLICE": 'A', "ARRAY_APPEND": 'A', "ARRAY_PREPEND": 'A', "ARRAY_CAT": 'A', "ARRAY_INTERSECTION": 'A',
-	"ARRAY_DISTINCT": 'A', "ARRAY_COMPACT": 'A', "ARRAY_GENERATE_RANGE": 'A', "OBJECT_KEYS": 'A',
+	"ARRAY_DISTINCT": 'A', "ARRAY_COMPACT": 'A', "ARRAY_FLATTEN": 'A', "ARRAY_GENERATE_RANGE": 'A', "OBJECT_KEYS": 'A',
 	"OBJECT_CONSTRUCT": 'O', "OBJECT_CONSTRUCT_KEEP_NULL": 'O', "OBJECT_AGG": 'O', "TO_OBJECT": 'O', "OBJECT_INSERT": 'O',
 }
 
@@ -611,6 +614,7 @@ func init() {
 	add(simple(func(c *call) (*node, error) { return arrayList(c, "list_distinct", 1, false) }), "ARRAY_DISTINCT")
 	add(simple(arraysOverlap), "ARRAYS_OVERLAP")
 	add(simple(arrayCompact), "ARRAY_COMPACT")
+	add(simple(arrayFlatten), "ARRAY_FLATTEN")
 	add(simple(arrayGenerateRange), "ARRAY_GENERATE_RANGE")
 	add(tmpl(1, "to_json(list_sort(json_keys(CAST(", 0, " AS JSON))))"), "OBJECT_KEYS")
 	add(simple(objectInsert), "OBJECT_INSERT")
@@ -643,7 +647,7 @@ func init() {
 		}
 		return c.out(text), nil
 	}), "IDENTIFIER")
-	for _, n := range []string{"OBJECT_DELETE", "OBJECT_PICK", "GET_IGNORE_CASE", "ARRAY_FLATTEN", "ARRAY_SORT",
+	for _, n := range []string{"OBJECT_DELETE", "OBJECT_PICK", "GET_IGNORE_CASE", "ARRAY_SORT",
 		"ARRAY_MAX", "ARRAY_MIN", "ARRAY_EXCEPT", "ARRAY_REMOVE", "ARRAY_INSERT", "PARSE_XML", "XMLGET",
 		"SOUNDEX", "SOUNDEX_P123", "ZIPF", "RANDSTR", "SYSTEM$TYPEOF", "STRTOK_SPLIT_TO_TABLE", "MATCH_RECOGNIZE",
 		"TO_GEOGRAPHY", "ST_MAKEPOINT", "ENCRYPT", "DECRYPT", "COMPRESS", "DECOMPRESS_STRING"} {
@@ -2405,6 +2409,22 @@ func arrayCompact(c *call) (*node, error) {
 		return nil, err
 	}
 	n := c.out("to_json(list_filter(", c.jsonList(0), ", lambda e: CAST(e AS VARCHAR) <> 'null'))")
+	n.json = true
+	return n, nil
+}
+
+// arrayFlatten translates ARRAY_FLATTEN, which takes an ARRAY of ARRAYs
+// one level down: NULL when the array or any of its elements is, and an
+// error when an element is not an ARRAY.
+func arrayFlatten(c *call) (*node, error) {
+	if err := c.argc(1, 1); err != nil {
+		return nil, err
+	}
+	l := c.jsonList(0)
+	n := c.out("CASE WHEN list_bool_or(list_transform(", l, ", lambda e: e IS NULL OR json_type(e) = 'NULL')) THEN NULL",
+		" WHEN NOT list_bool_and(list_transform(", l, ", lambda e: json_type(e) = 'ARRAY'))",
+		" THEN error('Input argument to ARRAY_FLATTEN is not an array of arrays')",
+		" ELSE to_json(flatten(list_transform(", l, ", lambda e: CAST(e AS JSON[])))) END")
 	n.json = true
 	return n, nil
 }

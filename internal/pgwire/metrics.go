@@ -31,6 +31,9 @@ type Metrics struct {
 	// memoryExits counts the times Igloo gave up on a statement that did
 	// not stop when canceled for memory (see memexit.go).
 	memoryExits prometheus.Counter
+	// implicitRetries counts the statements in Snowflake's dialect that
+	// bound only with its implicit conversions (see parseTranslated).
+	implicitRetries prometheus.Counter
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -89,9 +92,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_memory_exits_total",
 			Help: "Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone.",
 		}),
+		implicitRetries: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_snowflake_implicit_conversions_total",
+			Help: "Statements in Snowflake's dialect that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made.",
+		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits)
+		m.indexStatements, m.memoryExits, m.implicitRetries)
 	return m
 }
 
@@ -116,6 +123,12 @@ func (m *Metrics) indexStatement() {
 func (m *Metrics) memoryExit() {
 	if m != nil {
 		m.memoryExits.Inc()
+	}
+}
+
+func (m *Metrics) implicitRetry() {
+	if m != nil {
+		m.implicitRetries.Inc()
 	}
 }
 

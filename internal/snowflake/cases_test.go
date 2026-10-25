@@ -244,4 +244,30 @@ var snowflakeCases = []runCase{
 	{name: "decode binary", sql: `select hex_decode_binary('4142') = x'4142', base64_decode_binary('QUI=') = x'4142'`, want: []string{"true|true"}},
 	{name: "to_binary", sql: `select hex_encode(to_binary('SGVsbG8=', 'BASE64')), hex_encode(to_binary('Hello', 'UTF-8')), try_to_binary('zz'), hex_encode(to_binary('4142')), x'41'`,
 		want: []string{`48656C6C6F|48656C6C6F|NULL|4142|\x41`}, cols: []string{"HEX_ENCODE(TO_BINARY('SGVSBG8=', 'BASE64'))", "HEX_ENCODE(TO_BINARY('HELLO', 'UTF-8'))", "TRY_TO_BINARY('ZZ')", "HEX_ENCODE(TO_BINARY('4142'))", "X'41'"}},
+	// ARRAY_FLATTEN takes an ARRAY of ARRAYs one level down; a NULL element
+	// makes it NULL, and an element that is not an ARRAY an error.
+	{name: "array_flatten", sql: `select array_flatten([[1,2],[3]]), array_flatten([[1,[2]],[],[3]]), array_flatten([]), array_flatten([['a','b'],['c']]), array_flatten(null), array_flatten([[1], null])`,
+		want: []string{`[1,2,3]|[1,[2],3]|[]|["a","b","c"]|NULL|NULL`}},
+	{name: "array_flatten of a scalar", sql: `select array_flatten([[1], 2])`, wantErr: "not an array of arrays"},
+
+	// In an ORDER BY expression a select list's alias comes before a column
+	// of the same name, and a name both joined tables have is the alias.
+	{name: "order by alias in an expression", sql: `select x + 1 as a from (select 1 as a, 10 as x union all select 2, 20) order by case a when 1 then 1 when 2 then 2 when 11 then 4 when 21 then 3 end`,
+		want: []string{"21", "11"}},
+	{name: "order by alias after top", sql: `select top 2 x + 1 as a from (select 1 as a, 10 as x union all select 2, 20 union all select 3, 30) order by case a when 11 then 3 when 21 then 2 when 31 then 1 end`,
+		want: []string{"31", "21"}},
+	{name: "order by alias of joined columns", sql: `select coalesce(p.k, q.k) as k from (select 1 as k union all select 3) p full join (select 2 as k union all select 3) q on p.k = q.k order by case k when 1 then 3 when 2 then 1 when 3 then 2 end`,
+		want: []string{"2", "3", "1"}},
+
+	// Implicit conversions (Options.Implicit): string functions read any
+	// value as TO_VARCHAR writes it, LIKE does too, and text compared with
+	// a timestamp or a number is cast to it.
+	{name: "string functions of other types", implicit: true, sql: `select trim(n), upper(d), length(dt), trim(f), upper(b), lower(b2), length(ts) from (select 5 as n, 5.50::number(10,2) as d, '2024-01-01'::date as dt, 1.5::float as f, true as b, false as b2, '2024-01-01 10:00:00'::timestamp as ts)`,
+		want: []string{"5|5.50|10|1.5|TRUE|false|23"}},
+	{name: "string functions of numbers", implicit: true, sql: `select contains(n, '2'), startswith(n, '1'), replace(m, '5', 'x'), left(k, 2), substr(k, 2, 2), split_part(k, 3, 1) from (select 123 as n, 55 as m, 12345 as k)`,
+		want: []string{"true|true|xx|12|23|12"}},
+	{name: "like of other types", implicit: true, sql: `select n like '5%', d like '2024%', d not like '1999%' from (select 5 as n, '2024-01-01'::date as d)`,
+		want: []string{"true|true|true"}},
+	{name: "text compared with timestamps and numbers", implicit: true, sql: `select v between a and b, v >= a, v not between b and b, s > i, s > t2 from (select '2024-01-02 10:00:00'::varchar as v, '2024-01-01'::timestamp as a, '2024-01-03'::timestamp as b, '10'::varchar as s, 9 as i, '9'::varchar as t2)`,
+		want: []string{"true|true|true|true|false"}},
 }

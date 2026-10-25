@@ -20,6 +20,13 @@ type Options struct {
 	// which APPROX_COUNT_DISTINCT and HLL count as accurately as in
 	// Snowflake; without it they are DuckDB's approx_count_distinct.
 	Sketches bool
+	// Implicit makes Snowflake's implicit conversions that DuckDB refuses:
+	// any value read as text by a string function or LIKE, and text
+	// compared with a date, a time or a number cast to its type (see
+	// implicit.go). Igloo sets it only to translate again a statement
+	// DuckDB could not bind, since the conversions depend on types the
+	// translation does not know.
+	Implicit bool
 }
 
 // Result is a translated statement.
@@ -1001,7 +1008,10 @@ func (t *translator) createView(nodes []*node, idx []int, k int, drop map[int]bo
 	if j+2 < len(idx) && nodes[idx[j]].word() == "IF" {
 		j += 3
 	}
-	j++
+	// Past the name, which dbt and other tools write qualified
+	// (db.schema.view).
+	_, next := qualifiedName(nodes, idx, j)
+	j = max(next, j+1)
 	if j < len(idx) && nodes[idx[j]].isGroup('(') {
 		// Column names, perhaps with comments.
 		g := nodes[idx[j]]

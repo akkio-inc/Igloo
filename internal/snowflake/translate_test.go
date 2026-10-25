@@ -305,3 +305,36 @@ func TestTranslateClusterBy(t *testing.T) {
 		}
 	}
 }
+
+// TestImplicitConversions checks which operands Options.Implicit converts:
+// those of comparisons, BETWEEN and LIKE that stand alone, not literals,
+// not an UPDATE's assignments, and not an operand of a tighter operator.
+func TestImplicitConversions(t *testing.T) {
+	for _, c := range []struct{ in, has, hasNot string }{
+		{`SELECT * FROM t WHERE a < b`, `sf_as(a, b) < sf_as(b, a)`, ""},
+		{`SELECT * FROM t WHERE x.a >= y.b AND c = d`, `sf_as(x.a, y.b) >= sf_as(y.b, x.a) AND sf_as(c, d) = sf_as(d, c)`, ""},
+		{`SELECT * FROM t WHERE ts NOT BETWEEN lo AND hi`, `sf_as(ts, lo) NOT BETWEEN sf_as(lo, ts) AND sf_as(hi, ts)`, ""},
+		{`SELECT * FROM t WHERE ts BETWEEN '2024-01-01' AND hi`, `sf_as(ts, hi) BETWEEN '2024-01-01' AND sf_as(hi, ts)`, ""},
+		{`SELECT * FROM t WHERE n LIKE p`, `sf_str(n) LIKE sf_str(p)`, ""},
+		{`SELECT upper(n), left(n, 2) FROM t`, `upper(sf_str(n))`, "sf_str(2)"},
+		{`SELECT upper('a') FROM t WHERE a < 5 AND s = 'x' AND b IS NULL`, "", "sf_"},
+		{`SELECT a + b < c, a < b + c FROM t`, "", "sf_as"},
+		{`UPDATE t SET a = b, c = d WHERE e = f`, `SET a = b, c = d WHERE sf_as(e, f) = sf_as(f, e)`, ""},
+	} {
+		res, err := Translate(c.in, Options{Implicit: true})
+		if err != nil {
+			t.Errorf("%s: %v", c.in, err)
+			continue
+		}
+		if c.has != "" && !strings.Contains(res.SQL, c.has) {
+			t.Errorf("%s:\n  got  %s\n  want %s in it", c.in, res.SQL, c.has)
+		}
+		if c.hasNot != "" && strings.Contains(res.SQL, c.hasNot) {
+			t.Errorf("%s:\n  got  %s\n  want no %s in it", c.in, res.SQL, c.hasNot)
+		}
+		plain, err := Translate(c.in, Options{})
+		if err != nil || strings.Contains(plain.SQL, "sf_as(") || strings.Contains(plain.SQL, "sf_str(") {
+			t.Errorf("%s without Implicit: %s %v", c.in, plain.SQL, err)
+		}
+	}
+}

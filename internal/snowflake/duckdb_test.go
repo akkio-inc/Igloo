@@ -28,6 +28,8 @@ type runCase struct {
 	types []string
 	// cols are the result's column names as ColumnName presents them.
 	cols []string
+	// implicit translates with Options.Implicit.
+	implicit bool
 }
 
 // session opens a DuckDB connection with the macros defined.
@@ -117,7 +119,7 @@ func format(v any, typ string) string {
 func run(t *testing.T, conn *sql.Conn, c runCase) {
 	t.Helper()
 	ctx := context.Background()
-	res, err := Translate(c.sql, Options{IsSetting: func(n string) bool { return n == "timezone" }})
+	res, err := Translate(c.sql, Options{IsSetting: func(n string) bool { return n == "timezone" }, Implicit: c.implicit})
 	if err != nil {
 		if c.wantErr != "" && strings.Contains(err.Error(), c.wantErr) {
 			return
@@ -339,4 +341,32 @@ func perDoc(s string) string {
 		out = append(out, by[id]...)
 	}
 	return strings.Join(out, "\n")
+}
+
+// TestCreateViewColumnComments creates a view as dbt-snowflake does, by its
+// qualified name with a comment on each column, and reads it.
+func TestCreateViewColumnComments(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	if _, err := conn.ExecContext(ctx, "CREATE SCHEMA analytics"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Translate("create or replace view memory.analytics.v_spend (\n  \"CLIENT\" COMMENT $$the client$$,\n  \"SPEND\" COMMENT 'in dollars'\n) copy grants as (\n  select 'acme' as client, 1.5 as spend\n)", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.SQL, "COMMENT") || len(res.Notices) == 0 {
+		t.Errorf("comments kept or not noticed: %s %q", res.SQL, res.Notices)
+	}
+	if _, err := conn.ExecContext(ctx, res.SQL); err != nil {
+		t.Fatalf("%v\n%s", err, res.SQL)
+	}
+	var client string
+	var spend float64
+	if err := conn.QueryRowContext(ctx, `SELECT "CLIENT", "SPEND" FROM memory.analytics.v_spend`).Scan(&client, &spend); err != nil {
+		t.Fatal(err)
+	}
+	if client != "acme" || spend != 1.5 {
+		t.Errorf("got %q %v", client, spend)
+	}
 }

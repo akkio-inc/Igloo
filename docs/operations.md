@@ -736,6 +736,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_report_rewrite_fallbacks_total` | | Statements whose recognized reports failed to prepare and were prepared as written instead |
 | `igloo_bitmap_index_statements_total` | | Statements prepared whose counts of distinct members in SQL read [bitmap indexes](sql.md#bitmap-indexes) instead of the tables (report API calls count in `igloo_report_calls_total`) |
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
+| `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

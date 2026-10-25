@@ -18,6 +18,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -215,15 +216,17 @@ func (tr *translation) columns(cols wire.Columns) wire.Columns {
 	return out
 }
 
-// translate translates one statement in Snowflake's dialect for sess. The
-// macros translated statements call are defined in every session (see
-// sessionCatalogSetup), so that views, tasks and the like created in
-// Snowflake's dialect run in any session.
-func (s *Server) translate(ctx context.Context, sess *session, text string) (*translation, error) {
+// translate translates one statement in Snowflake's dialect for sess, with
+// Snowflake's implicit conversions when implicit is set (see
+// parseTranslated). The macros translated statements call are defined in
+// every session (see sessionCatalogSetup), so that views, tasks and the
+// like created in Snowflake's dialect run in any session.
+func (s *Server) translate(ctx context.Context, sess *session, text string, implicit bool) (*translation, error) {
 	res, err := snowflake.Translate(text, snowflake.Options{
 		IsSetting: func(name string) bool { return s.isSetting(ctx, sess, name) },
 		Variable:  func(name string) (string, bool, error) { return sessionVariable(ctx, sess, name) },
 		Sketches:  s.hasSketches(),
+		Implicit:  implicit,
 	})
 	if err != nil {
 		var te *snowflake.Error
@@ -237,6 +240,62 @@ func (s *Server) translate(ctx context.Context, sess *session, text string) (*tr
 		return nil, err
 	}
 	return &translation{Result: res}, nil
+}
+
+// parseTranslated parses q, the translation tr of source, a statement in
+// Snowflake's dialect. When DuckDB cannot bind it for want of a cast that
+// Snowflake makes implicitly (text compared with a timestamp, a number in
+// a string function), it is translated again with Snowflake's implicit
+// conversions and parsed again; if that fails too, the statement fails as
+// translated first. The conversions depend on the types of the statement's
+// columns, which only binding tells, so a statement that binds as
+// translated is never converted. The query history records the statement
+// once, as it finally ran or failed.
+func (s *Server) parseTranslated(ctx context.Context, sess *session, user auth.User, q wire.Query, source string,
+	tr *translation) (wire.PreparedStatements, *translation, error) {
+	txFailed := sess.txFailed
+	held := sess.holdRecords()
+	q.Query = tr.SQL
+	ps, err := s.parseDuckDB(ctx, sess, user, q, tr)
+	first := held()
+	if err == nil || !implicitCastError(err) {
+		s.recordAll(sess, first)
+		return ps, tr, err
+	}
+	itr, terr := s.translate(ctx, sess, source, true)
+	if terr != nil || itr.Command != "" || itr.Untranslated || itr.SQL == tr.SQL {
+		s.recordAll(sess, first)
+		return nil, nil, err
+	}
+	sess.txFailed = txFailed
+	held = sess.holdRecords()
+	iq := q
+	iq.Query = itr.SQL
+	ips, ierr := s.parseDuckDB(ctx, sess, user, iq, itr)
+	again := held()
+	if ierr != nil {
+		sess.txFailed = txFailed
+		s.recordAll(sess, first)
+		s.log.Debug("a statement failed again with Snowflake's implicit conversions", "err", ierr)
+		return nil, nil, err
+	}
+	s.recordAll(sess, again)
+	s.metrics.implicitRetry()
+	return ips, itr, nil
+}
+
+// implicitCastError reports whether err is DuckDB's for a function, a
+// comparison or a BETWEEN whose arguments' types do not match without a
+// cast, which Snowflake would have made.
+func implicitCastError(err error) bool {
+	msg := err.Error()
+	for _, m := range []string{"No function matches the given name and argument types", "Cannot compare values of type",
+		"Cannot mix values of type", "an explicit cast is required"} {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasSketches reports whether DuckDB has the datasketches extension's

@@ -21,7 +21,7 @@ func (t *translator) seq(nodes []*node, top bool) ([]*node, error) {
 	var err error
 	for _, pass := range []func([]*node) ([]*node, error){
 		t.clauses, t.literals, t.calls, t.tableFunctions, t.sample, t.values, t.paths, t.casts, t.variantModes,
-		t.operators, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere,
+		t.operators, t.implicitCasts, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere,
 	} {
 		if nodes, err = pass(nodes); err != nil {
 			return nil, err
@@ -817,11 +817,12 @@ func (t *translator) orderBy(nodes []*node) ([]*node, error) {
 		}
 		var out []*node
 		items := splitArgs(nodes[by+1 : end])
+		aliases := orderAliases(nodes[:i])
 		for k, item := range items {
 			if k > 0 {
 				out = append(out, raw(","))
 			}
-			out = append(out, orderItem(item)...)
+			out = append(out, orderItem(aliasedItem(item, aliases))...)
 		}
 		// Keep the white space before the clause's end.
 		tail := nodes[end:]
@@ -832,6 +833,162 @@ func (t *translator) orderBy(nodes []*node) ([]*node, error) {
 		i = by + len(out)
 	}
 	return nodes, nil
+}
+
+// orderAliases are the aliases of the select list in nodes, the query
+// before its ORDER BY, by name as Snowflake compares them (an unquoted
+// name upper-cased), each with its expression. There are none for a
+// set operation, whose ORDER BY reads the combined rows, or SELECT
+// DISTINCT, whose ORDER BY may read only what it selects.
+func orderAliases(nodes []*node) map[string][]*node {
+	idx := sig(nodes)
+	sel := -1
+	for k, i := range idx {
+		switch w := nodes[i].word(); {
+		case w == "UNION" || w == "EXCEPT" || w == "INTERSECT" || w == "MINUS",
+			nodes[i].kind == kRaw && strings.TrimSpace(nodes[i].text) == "EXCEPT":
+			return nil
+		case w == "SELECT" && sel < 0:
+			sel = k
+		}
+	}
+	if sel < 0 || sel+1 >= len(idx) || nodes[idx[sel+1]].word() == "DISTINCT" {
+		return nil
+	}
+	// The items start past ALL and TOP n, which the top pass translates
+	// after this one.
+	first := sel + 1
+	if nodes[idx[first]].word() == "ALL" {
+		first++
+	}
+	if first < len(idx) && nodes[idx[first]].word() == "TOP" {
+		first += 2
+	}
+	if first >= len(idx) {
+		return nil
+	}
+	start, end := idx[first], len(nodes)
+	for _, i := range idx[sel+1:] {
+		if nodes[i].word() == "FROM" {
+			end = i
+			break
+		}
+	}
+	var items [][]*node
+	from := start
+	for k := start; k <= end; k++ {
+		if k == end || nodes[k].isOp(",") || nodes[k].kind == kRaw && strings.TrimSpace(nodes[k].text) == "," {
+			items = append(items, nodes[from:k])
+			from = k + 1
+		}
+	}
+	aliases, seen := map[string][]*node{}, map[string]int{}
+	for _, item := range items {
+		ii := sig(item)
+		var alias *node
+		var expr []*node
+		switch last := len(ii) - 1; {
+		case len(ii) >= 3 && item[ii[last-1]].word() == "AS":
+			alias, expr = item[ii[last]], item[:ii[last-1]]
+		case len(ii) == 2 && endsOperand(item[ii[0]]) && !item[ii[0]].isOp("."):
+			alias, expr = item[ii[1]], item[:ii[1]]
+		default:
+			continue
+		}
+		key, ok := aliasKey(alias)
+		if !ok {
+			continue
+		}
+		seen[key]++
+		aliases[key] = trim(expr)
+	}
+	for key, n := range seen {
+		if n > 1 {
+			delete(aliases, key) // two items of one name: Snowflake reports the name as ambiguous
+		}
+	}
+	return aliases
+}
+
+// aliasKey is the name n gives, as Snowflake compares names: an unquoted
+// word upper-cased, a quoted identifier as it is.
+func aliasKey(n *node) (string, bool) {
+	switch n.kind {
+	case kWord:
+		return strings.ToUpper(n.tok.text), true
+	case kQuoted:
+		return n.tok.val, true
+	}
+	return "", false
+}
+
+// aliasedItem is an ORDER BY item with the select list's aliases it names
+// inside an expression read as the aliased expressions, as Snowflake reads
+// them: an alias comes before a column of the same name. DuckDB reads a
+// name there as a column, so a column the alias shadows, or one that two
+// joined tables have, would be read instead. An item that is only a name
+// stays as it is, as DuckDB reads that as the alias.
+func aliasedItem(item []*node, aliases map[string][]*node) []*node {
+	if len(aliases) == 0 {
+		return item
+	}
+	ii := sig(item)
+	n := len(ii)
+	for n > 0 {
+		w := item[ii[n-1]].word()
+		if w != "ASC" && w != "DESC" && w != "NULLS" && w != "FIRST" && w != "LAST" {
+			break
+		}
+		n--
+	}
+	if n <= 1 {
+		return item
+	}
+	out := append([]*node(nil), item...)
+	substituteAliases(out, aliases)
+	return out
+}
+
+// substituteAliases replaces, in nodes and the expressions within them
+// (not subqueries), each name that is one of aliases and not part of a
+// dotted name or a call with its aliased expression.
+func substituteAliases(nodes []*node, aliases map[string][]*node) {
+	for j, n := range nodes {
+		switch n.kind {
+		case kWord, kQuoted:
+			key, _ := aliasKey(n)
+			expr, ok := aliases[key]
+			if !ok {
+				continue
+			}
+			p, q := prevSig(nodes, j), nextSig(nodes, j)
+			if p >= 0 && nodes[p].isOp(".") || q >= 0 && (nodes[q].isOp(".") || nodes[q].isGroup('(')) {
+				continue
+			}
+			nodes[j] = seq([]*node{n}, raw("("), seq(expr, cloneNodes(expr)...), raw(")"))
+		case kGroup:
+			if k := sig(n.kids); len(k) > 0 && (n.kids[k[0]].word() == "SELECT" || n.kids[k[0]].word() == "WITH") {
+				continue
+			}
+			substituteAliases(n.kids, aliases)
+		case kSeq:
+			substituteAliases(n.kids, aliases)
+		}
+	}
+}
+
+// cloneNodes copies nodes and the groups and seqs within them, so that
+// a later pass rewriting one copy in place leaves the other as it was.
+func cloneNodes(nodes []*node) []*node {
+	out := make([]*node, len(nodes))
+	for i, n := range nodes {
+		c := *n
+		if n.kids != nil {
+			c.kids = cloneNodes(n.kids)
+		}
+		out[i] = &c
+	}
+	return out
 }
 
 // orderItem gives one ORDER BY item an explicit NULLS FIRST or LAST.
