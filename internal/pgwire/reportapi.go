@@ -229,13 +229,6 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	return spec.sqlWith(ids), nil, read
 }
 
-// (Pair counts are written as workers would split them (bitmapPairCounts)
-// only for tests, splitPairs, for now: the distributed planner does not
-// take rb_agg for an aggregate yet, and so moves every row of such a
-// statement between workers rather than their groups' partial bitmaps,
-// several times slower than one machine. rb_count_distinct keeps it on
-// one machine.)
-
 // reportPlannedPath returns the path a call of spec would take now, as
 // reportStatement chooses it and the path column and metrics name it:
 // "index", "index+scan", "ids" or "scan". It reads what choosing does (the
@@ -263,6 +256,14 @@ func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *rep
 	}
 	return "scan"
 }
+
+// (Pair counts are written as workers split them (bitmapPairCounts) only
+// for tests, splitPairs, for now. The planner splits that form, but its
+// workers keep a bitmap for each (value, cohort, day) of their share: on
+// three workers of 8 GB, media signals at 10x (361M rows, 6,500 titles,
+// a month of days) ran them out of memory, where one machine counts it in
+// rb_count_distinct in about 105 s; and auto mode, from its estimates,
+// chose the workers.)
 
 // pairBitmaps returns the distinct_with metrics of spec whose pairs roaring
 // bitmaps count, where the member is an ID domain's id: those whose column
@@ -1120,22 +1121,29 @@ func (s *reportSpec) scanCounts(from, cohort, member string, people bool, rbPair
 }
 
 // bitmapPairCounts writes scanCounts' counts for one distinct_with metric,
-// d, whose pairs roaring bitmaps count: the rows grouped by the keys and
-// the pair's column first (a day, say), with a bitmap of the members of
-// each (key, day) (rb_agg) and the parts of the other aggregates; then
-// combined by key, the pairs as the sum of the days' members and the
+// d, whose pairs roaring bitmaps count: the rows grouped by the finest keys
+// (each value's) and the pair's column first (a day, say), with a bitmap of
+// the members of each (value, day) (rb_agg) and the parts of the other
+// aggregates; then those grouped by the grouping sets (totals, the extent);
+// then combined by key, the pairs as the sum of the days' members and the
 // people, if counted, as the members of their union. Each step is an
-// aggregate the distributed planner splits: workers send their groups'
+// aggregate the distributed planner splits: workers write their groups'
 // bitmaps (rb_or_agg partials), which no count of pairs in one aggregate,
-// rb_count_distinct(member, day), can be split into.
+// rb_count_distinct(member, day), can be split into; and the finest groups
+// first, in a plain GROUP BY, are combined on workers, so that the
+// coordinator gets one row for each rather than one for each task.
 func (s *reportSpec) bitmapPairCounts(b *strings.Builder, people bool, d int, metricCols []string) (string, []string, string) {
 	g := "g" + strconv.Itoa(d)
-	inner := "count(*) FILTER (WHERE keep) AS r, sum(metric) FILTER (WHERE keep) AS ms, count(metric) FILTER (WHERE keep) AS mc, " +
+	// fine: by the finest keys, the value and the day, with the aggregates'
+	// parts; pairs: those combined by the grouping sets; counts: by key.
+	fine := "count(*) FILTER (WHERE keep) AS r, sum(metric) FILTER (WHERE keep) AS ms, count(metric) FILTER (WHERE keep) AS mc, " +
 		"bool_or(has_metric) FILTER (WHERE keep) AS hm, rb_agg(CASE WHEN keep AND " + g + " IS NOT NULL THEN member END) AS bm"
+	sets := "sum(r) AS r, sum(ms) AS ms, sum(mc) AS mc, bool_or(hm) AS hm, rb_or_agg(bm) AS bm"
 	outer := "CAST(sum(r) AS BIGINT) AS \"rows\", sum(ms) AS metric_sum, CASE WHEN bool_or(hm) THEN CAST(sum(mc) AS BIGINT) END AS metric_count, " +
 		"CASE WHEN sum(mc) > 0 THEN sum(ms) / sum(mc) END AS metric_avg"
 	if people {
-		inner += ", rb_agg(CASE WHEN keep THEN member END) AS pm"
+		fine += ", rb_agg(CASE WHEN keep THEN member END) AS pm"
+		sets += ", rb_or_agg(pm) AS pm"
 		outer = "rb_cardinality(rb_or_agg(pm)) AS people, " + outer
 	}
 	for i, m := range s.Metrics {
@@ -1144,24 +1152,28 @@ func (s *reportSpec) bitmapPairCounts(b *strings.Builder, people bool, d int, me
 			outer += ", CAST(sum(rb_cardinality(bm)) AS BIGINT) AS " + quoteIdent(m.Name+"_distinct")
 			continue
 		}
-		inner += ", sum(" + gi + ") FILTER (WHERE keep) AS s" + gi + ", count(" + gi + ") FILTER (WHERE keep) AS c" + gi
+		fine += ", sum(" + gi + ") FILTER (WHERE keep) AS s" + gi + ", count(" + gi + ") FILTER (WHERE keep) AS c" + gi
+		sets += ", sum(s" + gi + ") AS s" + gi + ", sum(c" + gi + ") AS c" + gi
 		outer += ", sum(s" + gi + ") AS " + quoteIdent(m.Name+"_sum") + ", CASE WHEN sum(c" + gi + ") > 0 THEN sum(s" + gi + ") / sum(c" + gi + ") END AS " + quoteIdent(m.Name+"_avg")
 	}
 	extent := ""
 	if s.Extent != "" {
-		inner += ", min(ext) AS emin, max(ext) AS emax"
+		fine += ", min(ext) AS emin, max(ext) AS emax"
+		sets += ", min(emin) AS emin, max(emax) AS emax"
 		outer += ", min(emin) AS extent_min, max(emax) AS extent_max"
 		extent = "SELECT extent_min, extent_max FROM " + cte("counts") + " WHERE everything = 1"
 	}
-	sets := []string{"(dimension, dim_group, value, cohort, " + g + ")"}
+	grouping := []string{"(dimension, dim_group, value, cohort, " + g + ")"}
 	if s.Totals {
-		sets = append(sets, "(dimension, dim_group, cohort, "+g+")")
+		grouping = append(grouping, "(dimension, dim_group, cohort, "+g+")")
 	}
 	if s.Extent != "" {
-		sets = append(sets, "()")
+		grouping = append(grouping, "()")
 	}
-	b.WriteString(", " + cte("pairs") + " AS (SELECT dimension, dim_group, value, cohort, GROUPING(value) AS total, GROUPING(dimension) AS everything, " + inner +
-		" FROM " + cte("values") + " GROUP BY GROUPING SETS (" + strings.Join(sets, ", ") + "))\n")
+	b.WriteString(", " + cte("fine") + " AS (SELECT dimension, dim_group, value, cohort, " + g + ", " + fine +
+		" FROM " + cte("values") + " GROUP BY dimension, dim_group, value, cohort, " + g + ")\n")
+	b.WriteString(", " + cte("pairs") + " AS (SELECT dimension, dim_group, value, cohort, GROUPING(value) AS total, GROUPING(dimension) AS everything, " + sets +
+		" FROM " + cte("fine") + " GROUP BY GROUPING SETS (" + strings.Join(grouping, ", ") + "))\n")
 	b.WriteString(", " + cte("counts") + " AS (SELECT dimension, dim_group, value, cohort, total, everything, " + outer +
 		" FROM " + cte("pairs") + " GROUP BY dimension, dim_group, value, cohort, total, everything)\n")
 	return b.String(), metricCols, extent

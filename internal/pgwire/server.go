@@ -384,8 +384,8 @@ type Server struct {
 	// prepared again for its run, with the context that ends them (for
 	// tests).
 	beforeRefresh func(context.Context)
-	// splitPairs writes report calls' pair counts as workers would split
-	// them (see scanCounts), for tests until the planner combines rb_agg.
+	// splitPairs writes report calls' pair counts as workers split them
+	// (see scanCounts), for tests.
 	splitPairs bool
 	// failLocal, if set, runs before a statement runs on this replica, and
 	// fails it with its error; tests use it to make a statement run out of
