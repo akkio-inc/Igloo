@@ -4,11 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/iddomain"
@@ -372,7 +376,14 @@ func (s *Server) hybridBitmaps(ctx context.Context, sess *session, spec *reportS
 		query := s.cohortBitmapOf(spec, plan, i, &b)
 		sum := sha256.Sum256([]byte(query))
 		b.name = bitmapVarPrefix + hex.EncodeToString(sum[:12])
-		if err := sess.setBitmapVariable(ctx, b.name, query); err != nil {
+		check := ""
+		if v := c.Version; v != nil && v.LatestFrom != nil {
+			check = "(" + latestOf(v) + ") IS NULL"
+			if !b.null {
+				check = "(" + latestOf(v) + ") IS NOT DISTINCT FROM " + quoteLiteral(b.latest)
+			}
+		}
+		if err := sess.setBitmapVariable(ctx, b.name, query, check, c.Label); err != nil {
 			return err
 		}
 		plan.bitmaps = append(plan.bitmaps, b)
@@ -712,6 +723,9 @@ func (s *Server) writeHybrid(b *strings.Builder, spec *reportSpec, plan *reportI
 type bitmapVar struct {
 	query string
 	set   bool
+	// check holds while the bitmap is of its cohort's latest version
+	// (empty for a cohort without latest_from); label names the cohort.
+	check, label string
 }
 
 // maxBitmapVars bounds the SELECTs of variables a session keeps to set
@@ -721,7 +735,7 @@ const maxBitmapVars = 1024
 // setBitmapVariable sets the session's variable name to the bitmap query
 // selects, unless it is set now: a name is that of what its SELECT reads,
 // at the snapshots it pins.
-func (sess *session) setBitmapVariable(ctx context.Context, name, query string) error {
+func (sess *session) setBitmapVariable(ctx context.Context, name, query, check, label string) error {
 	if sess.bitmapVars == nil {
 		sess.bitmapVars = map[string]*bitmapVar{}
 	}
@@ -734,7 +748,7 @@ func (sess *session) setBitmapVariable(ctx context.Context, name, query string) 
 				}
 			}
 		}
-		v = &bitmapVar{query: query}
+		v = &bitmapVar{query: query, check: check, label: label}
 		sess.bitmapVars[name] = v
 	}
 	if v.set {
@@ -755,9 +769,41 @@ func (sess *session) ensureBitmapVariables(ctx context.Context, text string) err
 	}
 	for _, name := range bitmapVarName.FindAllString(text, -1) {
 		if v := sess.bitmapVars[name]; v != nil && !v.set {
-			if err := sess.setBitmapVariable(ctx, name, v.query); err != nil {
+			if err := sess.setBitmapVariable(ctx, name, v.query, v.check, v.label); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// checkBitmapVariables makes sure, just before a statement Igloo wrote
+// runs, that each bitmap variable it reads is set, and of its cohort's
+// latest version as it was when computed. The statement's own checks (see
+// cohortOf) fire where it reads a bitmap, which a statement may not do in
+// every shape (with no rows to test against it, say); this one fails the
+// statement whatever its shape, before it runs.
+func (sess *session) checkBitmapVariables(ctx context.Context, text string) error {
+	seen := map[string]bool{}
+	for _, name := range bitmapVarName.FindAllString(text, -1) {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		v := sess.bitmapVars[name]
+		if v == nil || !v.set {
+			return pgerror.WithCode(errors.New("igloo: a cohort's bitmap this statement reads is gone; run it again"), codes.ObjectNotInPrerequisiteState)
+		}
+		if v.check == "" {
+			continue
+		}
+		rows, err := queryRows(ctx, sess.conn, "SELECT "+v.check)
+		if err != nil {
+			return err
+		}
+		if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != true {
+			return pgerror.WithCode(fmt.Errorf("igloo: the latest version of cohort %s changed since the statement was prepared; run it again", v.label),
+				codes.ObjectNotInPrerequisiteState)
 		}
 	}
 	return nil

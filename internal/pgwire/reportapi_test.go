@@ -814,4 +814,63 @@ func TestReportAPIFromIndexes(t *testing.T) {
 	if srv.bitmapReruns.Load() == reruns {
 		t.Error("halves, with bitmaps that do not fit, did not run again from the tables")
 	}
+
+	// Closed when a cohort's bitmap is not what the call was prepared for.
+	sessOf := func(c *pgx.Conn) *session {
+		srv.sessions.mu.Lock()
+		defer srv.sessions.mu.Unlock()
+		return srv.sessions.byPID[int32(c.PgConn().PID())]
+	}
+	byValue := func() []string {
+		text := texts(t, conn, "SELECT igloo.audience_profile_sql("+specLiteral(t, plays)+")")
+		return texts(t, conn, "SELECT * EXCLUDE (path) FROM ("+text[0]+") ORDER BY ALL")
+	}
+	pc := it.r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, pc, "SET search_path = 'lake.public'")
+	ps := sessOf(pc)
+	// Prepared, then its bitmaps gone (the session's variables dropped): its
+	// first run prepares it again and counts as by value, never no one.
+	if _, err := pc.Prepare(ctx, "plays_once", playsCall); err != nil {
+		t.Fatal(err)
+	}
+	ps.resetBitmapVariables(ctx)
+	for n := range ps.bitmapVars {
+		delete(ps.bitmapVars, n)
+	}
+	if got, want := texts(t, pc, "plays_once"), byValue(); !slices.Equal(got, want) {
+		t.Errorf("a prepared call run once its bitmaps were gone: rows\n%q\nwant\n%q", got, want)
+	}
+	// Prepared, then its cohort's latest version changed: the same.
+	if _, err := pc.Prepare(ctx, "plays_changed", playsCall); err != nil {
+		t.Fatal(err)
+	}
+	it.exec("INSERT INTO lake.public.audience_revisions VALUES ('a1', 4)")
+	if got, want := texts(t, pc, "plays_changed"), byValue(); !slices.Equal(got, want) {
+		t.Errorf("a prepared call run once its cohort changed: rows\n%q\nwant\n%q", got, want)
+	}
+	// The checks themselves. Before a run: a bitmap gone, or of a version
+	// no longer the latest, fails it.
+	out, _, _, err := srv.reportCalls(ctx, ps, playsCall)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ps.checkBitmapVariables(ctx, out); err != nil {
+		t.Errorf("the checks of bitmaps just computed: %v", err)
+	}
+	it.exec("INSERT INTO lake.public.audience_revisions VALUES ('a1', 5)")
+	if err := ps.checkBitmapVariables(ctx, out); err == nil || !strings.Contains(err.Error(), "latest version of cohort AUDIENCE changed") {
+		t.Errorf("the checks of a cohort no longer of its latest version: %v", err)
+	}
+	ps.resetBitmapVariables(ctx)
+	for n := range ps.bitmapVars {
+		delete(ps.bitmapVars, n)
+	}
+	if err := ps.checkBitmapVariables(ctx, out); err == nil || !strings.Contains(err.Error(), "bitmap this statement reads is gone") {
+		t.Errorf("the checks of a bitmap gone: %v", err)
+	}
+	// And the statement's own, where it reads a bitmap whose variable is
+	// not there: Igloo's error, not no members.
+	if rows, err := queryRows(ctx, ps.conn, out); err == nil || !strings.Contains(err.Error(), "igloo: the bitmap of cohort") {
+		t.Errorf("the statement with its bitmaps gone: %d rows, %v", len(rows), err)
+	}
 }

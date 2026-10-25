@@ -1569,7 +1569,17 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			}
 		}
 		if err == nil && st.reportCall {
+			// Its bitmaps there and of their cohorts' latest versions,
+			// whatever its shape reads of them. Prepared for bitmaps that
+			// are not, it is prepared again, now (see refreshIndexes).
+			if sess.checkBitmapVariables(pctx, st.query) != nil && !st.reportRan {
+				st.reportRan = true
+				err = s.refreshIndexes(pctx, sess, st)
+			}
 			st.reportRan = true
+		}
+		if err == nil {
+			err = sess.checkBitmapVariables(pctx, st.query)
 		}
 		err = prepared(err)
 		if err != nil {
