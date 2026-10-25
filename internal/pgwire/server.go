@@ -677,6 +677,9 @@ type session struct {
 	// again (see planIndexes).
 	reportStates map[string]indexState
 	reportAt     map[string]int64
+	// phases times the steps of preparing a statement, or readying one to
+	// run, for the debug log (see timePhases).
+	phases *prepPhases
 	// bitmapVars are the variables that hold the bitmaps of the statements
 	// Igloo wrote (see hybridBitmaps), by name.
 	bitmapVars map[string]*bitmapVar
@@ -1547,6 +1550,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		if s.beforeRefresh != nil {
 			s.beforeRefresh(pctx)
 		}
+		readied := s.timePhases(ctx, sess, "statement readied to run")
 		bitmaps := st.bitmaps
 		err = s.readyStatement(pctx, sess, st)
 		if err == nil && st.bitmaps != bitmaps {
@@ -1568,6 +1572,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		if err == nil {
 			err = sess.checkBitmapVariables(pctx, st.query)
 		}
+		readied()
 		err = prepared(err)
 		if err != nil {
 			s.metrics.query(start, err)
@@ -1901,8 +1906,12 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	// Rechecking re-plans with EXPLAIN and may re-apply policies, both of
 	// which read and fill in the catalog's set; release before the run
 	// takes the side it needs (see holdCatalog, catalogRunLock).
+	locked := sess.phase("catalog_lock")
 	relist := s.holdCatalog(sess)
+	locked()
+	rechecking := sess.phase("recheck")
 	err := s.recheck(ctx, sess, st)
+	rechecking()
 	relist()
 	if err != nil {
 		return err
@@ -1910,11 +1919,15 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	// One that counts through ID domains' ids reads the snapshots that have
 	// them (see idcount.go); looking them up asks the catalog, which holds
 	// nothing, and preparing again takes the lock it needs.
-	if err := s.refreshIDCounts(ctx, sess, st); err != nil {
+	refreshing := sess.phase("refresh_ids")
+	err = s.refreshIDCounts(ctx, sess, st)
+	refreshing()
+	if err != nil {
 		return err
 	}
 	// And one answered from bitmap indexes, their tables' current
 	// snapshots, or the tables (see bitmaprewrite.go).
+	defer sess.phase("refresh_indexes")()
 	return s.refreshIndexes(ctx, sess, st)
 }
 
@@ -1962,7 +1975,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// filling in each table it names on first use. Hold the exclusive side so
 	// no other statement reads the set while this changes it (see
 	// holdCatalog).
+	defer s.timePhases(ctx, sess, "statement prepared")()
+	locked := sess.phase("catalog_lock")
 	defer s.holdCatalog(sess)()
+	locked()
 	if sess.reportStates == nil {
 		sess.reportStates, sess.reportAt = map[string]indexState{}, map[string]int64{}
 		defer func() { sess.reportStates, sess.reportAt = nil, nil }()
@@ -1978,7 +1994,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// (see reportrecognize.go), which the statement then goes through as
 	// one its user wrote. If it fails that way, for whatever reason, it is
 	// prepared as written, and fails or not as written.
-	if recognized := s.recognizeReports(ctx, sess, text); recognized != text {
+	recognizing := sess.phase("recognize")
+	recognized := s.recognizeReports(ctx, sess, text)
+	recognizing()
+	if recognized != text {
 		txFailed := sess.txFailed
 		st, err := s.prepareCheckedText(ctx, sess, user, text, recognized, oids)
 		if err == nil {
@@ -2007,7 +2026,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	// statement keeps its text as written, which preparing again writes
 	// again, as the tables read through ids change.
 	asGiven := text
+	calls := sess.phase("report_calls")
 	text, reportPins, reportIndexPins, err := s.reportCalls(ctx, sess, text)
+	calls()
 	if err != nil {
 		return fail(err)
 	}
@@ -2019,7 +2040,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	if s.ddl != nil {
 		viewGen = s.ddl.Generation()
 	}
+	counting := sess.phase("counting")
 	rewritten, counts := s.rewriteCounting(ctx, sess, user, text, true)
+	counting()
 	if len(reportPins) > 0 {
 		if counts == nil {
 			counts = &idCounts{}
@@ -2083,7 +2106,10 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	}
 	// Policies are applied to one statement at a time, before it runs;
 	// preparing several runs all but the last.
-	if err := s.protectBeforePrepare(ctx, sess, user, query, pivot); err != nil {
+	protecting := sess.phase("policies_before")
+	err = s.protectBeforePrepare(ctx, sess, user, query, pivot)
+	protecting()
+	if err != nil {
 		s.metrics.query(time.Now(), errDenied)
 		return fail(err)
 	}
@@ -2132,7 +2158,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	// runs as written.
 	// Counts bitmap indexes answer read them (see bitmaprewrite.go).
 	indexed := query
+	indexing := sess.phase("index_rewrite")
 	query, indexPins, indexCandidate := s.rewriteIndexes(ctx, sess, user, query, counts)
+	indexing()
 	if len(indexPins) > 0 {
 		s.metrics.indexStatement()
 	}
@@ -2144,11 +2172,15 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	bitmaps := s.bitmapsFor(ctx, sess, query) || reportBitmaps
 	defer sess.setBitmaps(ctx, bitmaps)()
 	written := query
+	sharing := sess.phase("share")
 	if factored := s.factorUnions(ctx, sess, query); factored != "" {
 		query = factored
 	}
+	shared := s.shareSubqueries(ctx, sess, query)
+	sharing()
+	preparing := sess.phase("duckdb_prepare")
 	var st *statement
-	if shared := s.shareSubqueries(ctx, sess, query); shared != "" {
+	if shared != "" {
 		if st, err = prepare(ctx, sess.conn, shared, oids); err == nil {
 			query = shared
 		} else {
@@ -2164,6 +2196,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}
 	}
+	preparing()
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created: sync and try again,
 		// also when this sync changed nothing because another one, of the
@@ -2222,6 +2255,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	}
 	// Apply policies: what runs is the statement rewritten to read
 	// protected tables through them.
+	policies := sess.phase("policies")
 	protected, g, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, query, oids)
 	if err == nil && protected != query {
 		st.original = query
@@ -2229,6 +2263,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	} else if err == nil && ran {
 		err = st.reprepare(ctx, sess.conn)
 	}
+	policies()
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
 		s.metrics.query(time.Now(), err)
@@ -2243,6 +2278,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 			return fail(err)
 		}
 	}
+	granting := sess.phase("grants")
 	err = authorize(user.Role, st.stmtType, query)
 	if err != nil {
 		// The built-in role does not allow it; grants may.
@@ -2261,6 +2297,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 		// What it changes of the tables clean rooms keep, whatever the role.
 		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, query)
 	}
+	granting()
 	if err == nil {
 		// Nothing changes ID domains' dictionaries or bitmap indexes but
 		// Igloo.

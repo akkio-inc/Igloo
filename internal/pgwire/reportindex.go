@@ -133,6 +133,7 @@ func (s *Server) planIndexes(ctx context.Context, sess *session, spec *reportSpe
 		rank[sess.currentUser().Role] < rank[auth.RoleReader] {
 		return nil
 	}
+	defer sess.phase("report_index_plans")()
 	snap := s.memberSnapshot(ctx)
 	if snap == nil || len(snap.Indexes) == 0 {
 		return nil
@@ -382,7 +383,9 @@ func (s *Server) hybridBitmaps(ctx context.Context, sess *session, spec *reportS
 	for i, c := range spec.Cohorts {
 		var b hybridBitmap
 		if v := c.Version; v != nil && v.LatestFrom != nil {
+			latest := sess.phase("report_latest")
 			rows, err := queryRows(ctx, sess.conn, "SELECT CAST(("+latestOf(v)+") AS VARCHAR)")
+			latest()
 			if err != nil {
 				return err
 			}
@@ -479,6 +482,7 @@ const emptyBitmap = `CAST('\x3A\x30\x00\x00\x00\x00\x00\x00' AS BLOB)`
 // the statement if a cohort's variable is gone or its latest_from reads
 // otherwise when it runs.
 func (s *Server) hybridPeople(ctx context.Context, sess *session, spec *reportSpec, plan *reportIndexPlan) error {
+	defer sess.phase("report_people")()
 	var q strings.Builder
 	q.WriteString("WITH ")
 	s.peopleCTEs(&q, spec, plan)
@@ -779,6 +783,7 @@ func (sess *session) setBitmapVariable(ctx context.Context, name, query, check, 
 	if v.set {
 		return nil
 	}
+	defer sess.phase("set_bitmaps")()
 	if _, err := sess.conn.ExecContext(ctx, "SET VARIABLE "+quoteIdent(name)+" = ("+query+")", nil); err != nil {
 		return err
 	}
@@ -809,6 +814,7 @@ func (sess *session) ensureBitmapVariables(ctx context.Context, text string) err
 // every shape (with no rows to test against it, say); this one fails the
 // statement whatever its shape, before it runs.
 func (sess *session) checkBitmapVariables(ctx context.Context, text string) error {
+	defer sess.phase("check_bitmaps")()
 	seen := map[string]bool{}
 	for _, name := range bitmapVarName.FindAllString(text, -1) {
 		if seen[name] {

@@ -187,7 +187,9 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 		}
 		return s.reportIndexSQL(spec, plan), plan.pins, nil
 	}
+	idsTimed := sess.phase("report_ids")
 	ids, read := s.reportIDs(ctx, sess, spec)
+	idsTimed()
 	if ids != nil {
 		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.splitPairs
 	}
@@ -342,6 +344,7 @@ func (s *Server) pairBitmaps(ctx context.Context, sess *session, spec *reportSpe
 	if len(cols) == 0 {
 		return nil
 	}
+	defer sess.phase("report_pairs")()
 	rows, err := queryRows(ctx, sess.conn, "DESCRIBE SELECT "+strings.Join(cols, ", ")+" FROM "+src.from+" AS s AT (VERSION => "+strconv.FormatInt(src.at, 10)+")")
 	if err != nil || len(rows) != len(cols) {
 		return nil
