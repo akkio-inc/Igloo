@@ -134,6 +134,14 @@ func TestSnowflakeImplicitConversions(t *testing.T) {
 			if up != "5" || !like || !gt {
 				t.Errorf("got %q %v %v, want 5 true true", up, like, gt)
 			}
+			// Text compared with timestamps in a WHERE that a FLATTEN's join
+			// takes as its ON.
+			var tags int
+			if err := conn.QueryRow(ctx, `SELECT count(*) FROM (SELECT '2024-03-01 10:00:00' AS ts, ['a', 'b'] AS tags) AS v
+				CROSS JOIN (SELECT '2024-03-01'::timestamp AS lo, '2024-03-02'::timestamp AS hi) AS r,
+				LATERAL FLATTEN(INPUT => v.tags) AS f WHERE v.ts BETWEEN r.lo AND r.hi`).Scan(&tags); err != nil || tags != 2 {
+				t.Errorf("BETWEEN in a FLATTEN's ON: %d %v, want 2", tags, err)
+			}
 			if _, err := conn.Exec(ctx, `SELECT trim(n, 'a', 'b') FROM (SELECT 5 AS n)`); err == nil || !strings.Contains(err.Error(), "trim(INTEGER") {
 				t.Errorf("trim of three arguments: %v, want DuckDB's error for the statement as translated", err)
 			}

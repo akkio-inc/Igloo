@@ -1554,6 +1554,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   DuckDB's `temp` catalog instead of failing ("TEMPORARY table names can
   only use the temp catalog"), and the session's later statements that name
   it in that schema read it there, until it is dropped.
+- Snowflake's implicit conversions are made in a `WHERE` that a `FLATTEN`'s
+  join takes as its `ON`, too: text compared with timestamps there failed
+  with "Cannot mix values of type VARCHAR and TIMESTAMP in BETWEEN clause".
 - A client that opens more than 10 sessions at once for one user, as a
   pool, dbt's threads or a dashboard's queries do, signs them all in. The
   failed-login limit counts logins still running as failures to come, and

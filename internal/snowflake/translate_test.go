@@ -320,6 +320,9 @@ func TestImplicitConversions(t *testing.T) {
 		{`SELECT upper('a') FROM t WHERE a < 5 AND s = 'x' AND b IS NULL`, "", "sf_"},
 		{`SELECT a + b < c, a < b + c FROM t`, "", "sf_as"},
 		{`UPDATE t SET a = b, c = d WHERE e = f`, `SET a = b, c = d WHERE sf_as(e, f) = sf_as(f, e)`, ""},
+		// A WHERE that a FLATTEN's join takes as its ON (see whereOn).
+		{`SELECT f.value FROM t AS b CROSS JOIN r, LATERAL FLATTEN(INPUT => b.tags) AS f WHERE b.ts BETWEEN r.lo AND r.hi AND b.n = r.m`,
+			`ON (sf_as(b.ts, r.lo) BETWEEN sf_as(r.lo, b.ts) AND sf_as(r.hi, b.ts) AND sf_as(b.n, r.m) = sf_as(r.m, b.n))`, ""},
 	} {
 		res, err := Translate(c.in, Options{Implicit: true})
 		if err != nil {

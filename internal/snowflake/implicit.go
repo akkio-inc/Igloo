@@ -1,5 +1,7 @@
 package snowflake
 
+import "strings"
+
 // Snowflake converts values where DuckDB asks for a cast: it reads any
 // value as text in a string function or LIKE, and casts text compared
 // with a date, a time or a number to that type. Which conversion a
@@ -168,9 +170,16 @@ var opBoundary = map[string]bool{
 }
 
 // bound reports whether nodes[i], the significant node beside an operand,
-// or the list's end (i < 0), separates it from any other operator.
+// or the list's end (i < 0), separates it from any other operator: as do
+// the words of opBoundary, and the text the translation writes to open or
+// close a parenthesis, such as the ON ( and ) of a WHERE moved into a
+// FLATTEN's join (see whereOn).
 func bound(nodes []*node, i int) bool {
-	return i < 0 || nodes[i].isOp(",") || nodes[i].isOp(";") || opBoundary[nodes[i].word()]
+	if i < 0 || nodes[i].isOp(",") || nodes[i].isOp(";") || opBoundary[nodes[i].word()] {
+		return true
+	}
+	text := strings.TrimSpace(nodes[i].text)
+	return nodes[i].kind == kRaw && (strings.HasSuffix(text, "(") || strings.HasPrefix(text, ")"))
 }
 
 // leftOperand is the operand before the operator at nodes[i], when it
