@@ -1255,6 +1255,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   source through three such steps and a view, went from 58-61 s to 30-32 s,
   with the same results; Snowflake takes 69-72 s on X-Small. A session
   counts the values with `SET igloo_id_counts = off`.
+- While connections are attached, checking what a statement reads from
+  them no longer lists DuckDB's table functions, which took some 25 ms of
+  every statement's preparing, with the catalog to itself, so that
+  statements and catalog listings queued behind one another: `SELECT 1`
+  takes 0.5 ms rather than 26 ms, and catalog lookups on a replica with a
+  Snowflake connection of 940 tables run 11 rather than 8 a second (see
+  [concurrency](docs/operations.md#concurrency-on-a-replica)). Users with
+  the none role, who are refused most table functions, still list them.
 - Statements that count the integer IDs of [ID domains](docs/sql.md#id-domains)
   (`count(DISTINCT CAST(_igloo_id_c AS UINTEGER))`) and read at least
   `IGLOO_BITMAP_MIN_ROWS` rows (10 million by default) count them in roaring

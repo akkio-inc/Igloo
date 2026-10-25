@@ -454,6 +454,14 @@ replica, or by another engine, reach this one through the Iceberg REST
 catalog within the 30-second view sync, and this serialization, which is per
 replica, does not cover them.
 
+A listing has the catalog for as long as DuckDB takes to list every attached
+catalog, connections' included, which grows with their columns. On an
+m7g.2xlarge with 900 tables of 5 to 40 columns, a lookup in
+`information_schema.tables` or `.columns` took 30 to 55 ms, so lookups ran
+about 35 a second however many sessions sent them; with a Snowflake
+connection of 940 tables of about 100 columns attached as well, a lookup
+took about 110 ms and they ran about 11 a second.
+
 ## Read cache
 
 Reading table files from object storage is far slower than reading them

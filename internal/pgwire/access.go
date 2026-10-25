@@ -992,9 +992,15 @@ func (s *Server) planScans(ctx context.Context, sess *session, text string) (pla
 // connections are of interest.
 func (s *Server) scansOf(ctx context.Context, sess *session, plan any, strict bool) (planScans, error) {
 	var scans planScans
-	tableFunctions, err := s.tableFunctions(ctx, sess)
-	if err != nil {
-		return scans, err
+	var tableFunctions map[string]bool
+	if strict {
+		// Only strict scans refuse table functions. Listing them takes
+		// DuckDB some 25 ms, which every statement would otherwise spend
+		// holding the catalog lock while connections are attached.
+		var err error
+		if tableFunctions, err = s.tableFunctions(ctx, sess); err != nil {
+			return scans, err
+		}
 	}
 	catalogName, local := s.catalogName(), s.engine.LocalDatabase()
 	connections := len(s.connectionCatalogs()) > 0
@@ -1082,9 +1088,9 @@ func (s *Server) tableFunctions(ctx context.Context, sess *session) (map[string]
 
 // checkMemo is what the checks of one statement work out once and use
 // again: the catalog check of a user with the none role and the check of
-// connections' tables both read the statement's plan and DuckDB's table
-// functions, and neither changes while the statement is prepared (see
-// prepareChecked).
+// connections' tables both read the statement's plan, the first also
+// DuckDB's table functions, and neither changes while the statement is
+// prepared (see prepareChecked).
 type checkMemo struct {
 	// plans are explainLogical's plans, by the text explained. They are
 	// only read.
