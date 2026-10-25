@@ -381,6 +381,13 @@ func TestCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the worker's task was not canceled")
 	}
+	// Past its deadline while it plans, as when describing a part takes
+	// longer: the deadline, not a reason to run on one machine.
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	if _, err := h.co.Plan(expired, failureQuery, harnessEnv{h}, ModeOn); !errors.Is(err, context.DeadlineExceeded) || IsUnsupported(err) {
+		t.Errorf("planned past its deadline: %v, want the deadline", err)
+	}
 }
 
 // A task writes one file for each partition of its exchange, however many

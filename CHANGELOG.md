@@ -349,6 +349,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- A statement canceled, or past its timeout, while the coordinator plans
+  it ends with that error. Planning took the session's failure to describe
+  a part in time for a reason to run the statement on one machine
+  ("cannot distribute: describe: context deadline exceeded").
 - Report API calls whose cohorts come from bitmap indexes run on workers.
   They join their source to each cohort's members, listed from the bitmap
   the replica computes first (`unnest(rb_to_list(...))`), and a relation of

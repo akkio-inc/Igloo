@@ -361,6 +361,12 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	}
 	opts.values = valueNames(values)
 	plan, err := newPlanner(ctx, env, co.parser, co.aggregates(ctx, env), opts).plan(stmt)
+	if err != nil && ctx.Err() != nil {
+		// Canceled or past its deadline while it planned, as when the
+		// session could not describe a part in time: the statement ends,
+		// rather than run on one machine for a reason it does not have.
+		return nil, nil, context.Cause(ctx)
+	}
 	if err != nil {
 		var u *errUnsupported
 		if len(ws) == 0 && errors.As(err, &u) {
