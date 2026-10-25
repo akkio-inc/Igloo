@@ -1646,6 +1646,15 @@ func (pl *planner) table(parts []string) (*Table, error) {
 	if r.t.Unsupported != "" {
 		return nil, unsupported("table %s: %s", r.t, r.t.Unsupported)
 	}
+	for _, c := range r.t.Columns {
+		if c.Nested == nil && nestedType(c.Type) {
+			// A task's view of the table has every column, and a worker
+			// refuses one whose nesting it is not told (see checkNested): the
+			// statement would run here only once it ran, and EXPLAIN
+			// DISTRIBUTED would say it runs on workers.
+			return nil, unsupported("column %s of %s is nested, and its nesting is not known", c.Name, r.t)
+		}
+	}
 	return r.t, nil
 }
 

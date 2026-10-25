@@ -14,9 +14,13 @@ import (
 // its stages, each with the SQL its tasks run; what the coordinator runs
 // over their results; and why parts of it stay on the coordinator. Each row
 // is a key and a value, as DuckDB's EXPLAIN gives them. A statement that
-// cannot run on workers says why.
+// cannot run on workers says why. It decides as running the statement does
+// (Plan, then Execute's preflight), and only runs nothing.
 func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode Mode) ([][2]string, error) {
 	plan, d, err := co.plan(ctx, query, env, mode, true, nil)
+	if err == nil && d.onWorkers {
+		_, _, err = co.preflight(ctx, plan)
+	}
 	if err != nil {
 		if IsUnsupported(err) {
 			return [][2]string{{"runs on", "this replica"}, {"reason", strings.TrimPrefix(err.Error(), "cannot distribute: ")}}, nil

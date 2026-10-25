@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,8 +71,15 @@ func (s *lakeSource) Table(ctx context.Context, schema, name string) (*distribut
 			return nil, err
 		}
 		c := distributed.Column{Name: dest[0].(string), Type: dest[1].(string), ID: len(cols) + 1}
+		id := strconv.Itoa(c.ID)
+		if elem, ok := strings.CutSuffix(c.Type, "[]"); ok && !strings.ContainsAny(elem, "[(") {
+			// A list of a plain type, nested as Iceberg's catalog says: its
+			// element has a field ID of its own.
+			c.Nested = &distributed.Nesting{Kind: "list", Fields: []distributed.Field{{Name: "element", ID: 1000 + c.ID}}}
+			id = fmt.Sprintf("{__duckdb_field_id: %d, element: %d}", c.ID, 1000+c.ID)
+		}
 		cols = append(cols, c)
-		ids = append(ids, fmt.Sprintf("%s: %d", quoteIdent(c.Name), c.ID))
+		ids = append(ids, fmt.Sprintf("%s: %s", quoteIdent(c.Name), id))
 	}
 	rows.Close()
 	t := &distributed.Table{Schema: schema, Name: name, Columns: cols}

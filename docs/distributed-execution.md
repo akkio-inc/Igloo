@@ -562,7 +562,12 @@ object storage there. The default stays `object`.
   joins events, shows as a `semi-join estimate` of the share of rows it
   keeps, which the estimates do not count yet. The query is checked as it
   would be when run, grants and policies included, and the same rewrites
-  apply.
+  apply: it is prepared again as its run prepares it, through ID domains'
+  ids and bitmap indexes with the bitmaps it reads, and planned and checked
+  against its tables' current snapshots as running it is. `runs on` is
+  where running it now would run it; only what workers find in the data
+  files themselves, such as files without field IDs, can still keep it
+  here.
 
   ```sql
   EXPLAIN DISTRIBUTED

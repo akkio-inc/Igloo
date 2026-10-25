@@ -812,8 +812,26 @@ func (sess *session) checkBitmapVariables(ctx context.Context, text string) erro
 // resetBitmapVariables drops the variables that are set, once a statement
 // has run: they take as much memory as their bitmaps.
 func (sess *session) resetBitmapVariables(ctx context.Context) {
+	sess.resetBitmapVariablesExcept(ctx, nil)
+}
+
+// setBitmapVariables are the names of the variables that are set now.
+func (sess *session) setBitmapVariables() map[string]bool {
+	set := map[string]bool{}
 	for name, v := range sess.bitmapVars {
-		if !v.set {
+		if v.set {
+			set[name] = true
+		}
+	}
+	return set
+}
+
+// resetBitmapVariablesExcept is resetBitmapVariables but for those in keep,
+// as EXPLAIN DISTRIBUTED leaves the session's, which may be set for a
+// statement it runs within (see explainStatement).
+func (sess *session) resetBitmapVariablesExcept(ctx context.Context, keep map[string]bool) {
+	for name, v := range sess.bitmapVars {
+		if !v.set || keep[name] {
 			continue
 		}
 		if _, err := sess.conn.ExecContext(context.WithoutCancel(ctx), "RESET VARIABLE "+quoteIdent(name), nil); err == nil {

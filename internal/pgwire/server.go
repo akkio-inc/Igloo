@@ -1537,36 +1537,13 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		if s.beforeRefresh != nil {
 			s.beforeRefresh(pctx)
 		}
-		err = sess.checkAborted(st.query)
-		if err == nil {
-			err = sess.ensureBitmapVariables(pctx, st.query)
-		}
-		if err == nil {
-			// Rechecking re-plans with EXPLAIN and may re-apply policies,
-			// both of which read and fill in the catalog's set; release
-			// before the run takes the side it needs (see holdCatalog,
-			// catalogRunLock).
-			relist := s.holdCatalog(sess)
-			err = s.recheck(pctx, sess, st)
-			relist()
-		}
-		if err == nil {
-			// One that counts through ID domains' ids reads the snapshots
-			// that have them (see idcount.go); looking them up asks the
-			// catalog, which holds nothing, and preparing again takes the
-			// lock it needs.
-			bitmaps := st.bitmaps
-			if err = s.refreshIDCounts(pctx, sess, st); err == nil {
-				// And one answered from bitmap indexes, their tables'
-				// current snapshots, or the tables (see bitmaprewrite.go).
-				err = s.refreshIndexes(pctx, sess, st)
+		bitmaps := st.bitmaps
+		err = s.readyStatement(pctx, sess, st)
+		if err == nil && st.bitmaps != bitmaps {
+			if sess.bitmapsRestore != nil {
+				sess.bitmapsRestore()
 			}
-			if err == nil && st.bitmaps != bitmaps {
-				if sess.bitmapsRestore != nil {
-					sess.bitmapsRestore()
-				}
-				sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
-			}
+			sess.bitmapsRestore = sess.setBitmaps(ctx, st.bitmaps)
 		}
 		if err == nil && st.reportCall {
 			// Its bitmaps there and of their cohorts' latest versions,
@@ -1881,6 +1858,40 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		return nil, err
 	}
 	return st, nil
+}
+
+// readyStatement is what Igloo does for a prepared statement before each
+// run, under its cancel (ctx), and EXPLAIN DISTRIBUTED before it plans
+// what the run would: it checks the session's transaction, sets the
+// variables of the bitmaps it reads, checks it again, and prepares it again
+// where it counts through ID domains' ids, as their snapshots stand now,
+// or reads bitmap indexes. Preparing again may turn its counting in roaring
+// bitmaps on or off (st.bitmaps), which the caller applies to the session.
+func (s *Server) readyStatement(ctx context.Context, sess *session, st *statement) error {
+	if err := sess.checkAborted(st.query); err != nil {
+		return err
+	}
+	if err := sess.ensureBitmapVariables(ctx, st.query); err != nil {
+		return err
+	}
+	// Rechecking re-plans with EXPLAIN and may re-apply policies, both of
+	// which read and fill in the catalog's set; release before the run
+	// takes the side it needs (see holdCatalog, catalogRunLock).
+	relist := s.holdCatalog(sess)
+	err := s.recheck(ctx, sess, st)
+	relist()
+	if err != nil {
+		return err
+	}
+	// One that counts through ID domains' ids reads the snapshots that have
+	// them (see idcount.go); looking them up asks the catalog, which holds
+	// nothing, and preparing again takes the lock it needs.
+	if err := s.refreshIDCounts(ctx, sess, st); err != nil {
+		return err
+	}
+	// And one answered from bitmap indexes, their tables' current
+	// snapshots, or the tables (see bitmaprewrite.go).
+	return s.refreshIndexes(ctx, sess, st)
 }
 
 // rewrite points the names in text that Igloo serves itself (PostgreSQL's

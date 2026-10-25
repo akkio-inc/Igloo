@@ -13,8 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/duckdb/duckdb-go/v2"
-
 	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
@@ -168,10 +166,8 @@ func (s *Server) distributedAsWritten(ctx context.Context, sess *session, text s
 		return ""
 	}
 	defer st.close() //nolint:errcheck
-	if st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || policyReason(st) != "" {
-		return ""
-	}
-	rows, err := s.dist.Explain(ctx, st.query, &sessionEnv{s: s, sess: sess, user: user, st: st}, mode)
+	// As EXPLAIN DISTRIBUTED says, which decides as running it would.
+	rows, err := s.explainStatement(ctx, sess, user, st)
 	if err != nil || len(rows) == 0 || rows[0] != [2]string{"runs on", "workers"} {
 		return ""
 	}

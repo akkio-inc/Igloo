@@ -349,6 +349,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- `EXPLAIN DISTRIBUTED` decides as running the statement does. It planned
+  the statement as prepared, where a run prepares it again through ID
+  domains' ids and bitmap indexes and counts in roaring bitmaps as set
+  for it, and it checked neither the tables' current snapshots nor, as
+  workers do once they have their tasks, that a nested column's nesting
+  is known: a signals report said `runs on workers` and ran on one machine.
+  It now readies the statement as its run does, its bitmaps' variables
+  set, and loads and checks the snapshots as running does, and the planner
+  refuses a table whose nested columns' nesting it is not told. Report
+  recognition's guard, which keeps a report as written when it would run
+  on workers as written, asks the same way.
 - A worker that hangs no longer hangs its statements, and a C++ exception
   that escapes DuckDB no longer hangs a worker. Two workers whose memory ran
   out hit "terminate called after throwing an instance of

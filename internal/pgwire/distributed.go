@@ -108,6 +108,21 @@ func (s *Server) explainDistributed(ctx context.Context, sess *session, query st
 		return nil, err
 	}
 	defer st.close() //nolint:errcheck
+	return s.explainStatement(ctx, sess, user, st)
+}
+
+// explainStatement says where st, prepared by user, would run, as running
+// it decides: readied as its run readies it (readyStatement: its bitmaps'
+// variables set, and prepared again through ID domains' ids and bitmap
+// indexes), with the session's setting for counting in roaring bitmaps as
+// its run has it, past the checks runDistributed makes, in the session's
+// mode; then planned and checked as Plan and Execute do. A statement
+// whose EXPLAIN DISTRIBUTED said workers ran on this replica, its keywords
+// table read in full with a list column whose nesting the planner was not
+// told: workers refused it once they had their tasks. It changes nothing
+// in the session that its caller could see: the variables it set are
+// dropped again, those set before it kept.
+func (s *Server) explainStatement(ctx context.Context, sess *session, user auth.User, st *statement) ([][2]string, error) {
 	here := func(reason string) ([][2]string, error) {
 		return [][2]string{{"runs on", "this replica"}, {"reason", reason}}, nil
 	}
@@ -121,6 +136,18 @@ func (s *Server) explainDistributed(ctx context.Context, sess *session, query st
 		return here("it is in a transaction, which reads its own snapshots")
 	case mode == distributed.ModeOff:
 		return here("distributed_execution is off")
+	}
+	set := sess.setBitmapVariables()
+	defer sess.resetBitmapVariablesExcept(ctx, set)
+	restore := sess.setBitmaps(ctx, st.bitmaps)
+	defer func() { restore() }()
+	bitmaps := st.bitmaps
+	if err := s.readyStatement(ctx, sess, st); err != nil {
+		return nil, err
+	}
+	if st.bitmaps != bitmaps {
+		restore()
+		restore = sess.setBitmaps(ctx, st.bitmaps)
 	}
 	if reason := policyReason(st); reason != "" {
 		return here(reason)

@@ -602,21 +602,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	co.pool.touch()
 	limit := co.spoolLimit()
 
-	// Each table's current snapshot and its files, once per statement, so
-	// the statement sees every commit made before it.
-	snapshots, files, err := co.load(ctx, plan.Stages)
+	snapshots, files, err := co.preflight(ctx, plan)
 	if err != nil {
 		return nil, err
-	}
-	if err := checkVersions(plan.versions, snapshots); err != nil {
-		return nil, err
-	}
-	for _, key := range plan.pins {
-		if t := snapshots[key]; t.Versioned && t.Snapshot == 0 {
-			// No snapshot to read it at: it is empty, but a commit could
-			// fill it before the coordinator's part reads it.
-			return nil, unsupported("table %s has no snapshot yet", t)
-		}
 	}
 
 	loaded := time.Since(start)
@@ -840,6 +828,30 @@ func (co *Coordinator) load(ctx context.Context, stages []*Stage) (map[string]*T
 		return nil, nil, err
 	}
 	return tables, files, nil
+}
+
+// preflight loads each table plan's stages read, its current snapshot and
+// its files, once per statement, so that the statement sees every commit
+// made before it, and checks what keeps the statement here before any task
+// runs: a table pinned to a snapshot that is no longer its current one,
+// and one the coordinator's part reads that has none yet. Explain does the
+// same, so that it says what running the statement would do.
+func (co *Coordinator) preflight(ctx context.Context, plan *Plan) (map[string]*Table, map[string][]File, error) {
+	snapshots, files, err := co.load(ctx, plan.Stages)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkVersions(plan.versions, snapshots); err != nil {
+		return nil, nil, err
+	}
+	for _, key := range plan.pins {
+		if t := snapshots[key]; t.Versioned && t.Snapshot == 0 {
+			// No snapshot to read it at: it is empty, but a commit could
+			// fill it before the coordinator's part reads it.
+			return nil, nil, unsupported("table %s has no snapshot yet", t)
+		}
+	}
+	return snapshots, files, nil
 }
 
 // loadMore loads, as load does, the tables stages read that tables and
