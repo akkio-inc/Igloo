@@ -189,6 +189,11 @@ type DuckDB struct {
 	// MaxTempSize caps spill files, e.g. "45GiB". Empty keeps DuckDB's
 	// default, 90% of the free space on the spill disk.
 	MaxTempSize string
+	// SortSpillBudget is how many bytes a write of rows in order may spill
+	// to sort them at once (IGLOO_SORT_SPILL_BUDGET); a larger one sorts
+	// a range of the order at a time. Zero means half the spill disk's
+	// free space when the write starts; negative, every write sorts at once.
+	SortSpillBudget int64
 	// Threads caps DuckDB's threads. Zero means several per core when the
 	// warehouse is in object storage, as the memory limit allows (see
 	// engine.threadsFor), and DuckDB's default of one per core otherwise.
@@ -450,6 +455,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("IGLOO_DUCKDB_THREADS must be a positive integer, got %q", v)
 		}
 		cfg.DuckDB.Threads = n
+	}
+
+	switch v := get("IGLOO_SORT_SPILL_BUDGET", ""); v {
+	case "":
+	case "off":
+		cfg.DuckDB.SortSpillBudget = -1
+	default:
+		n, err := ParseSize(v)
+		if err != nil || n <= 0 {
+			addErr("IGLOO_SORT_SPILL_BUDGET must be a size such as 50GB or 40GiB, or off, got %q", v)
+		}
+		cfg.DuckDB.SortSpillBudget = n
 	}
 
 	switch v := get("IGLOO_CACHE_SIZE", ""); v {

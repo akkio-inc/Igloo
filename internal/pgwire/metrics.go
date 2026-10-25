@@ -34,6 +34,9 @@ type Metrics struct {
 	// implicitRetries counts the statements in Snowflake's dialect that
 	// bound only with its implicit conversions (see parseTranslated).
 	implicitRetries prometheus.Counter
+	// sortedWrites counts the writes of rows in order sorted a range at a
+	// time (see sortedwrite.go).
+	sortedWrites prometheus.Counter
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -96,9 +99,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_snowflake_implicit_conversions_total",
 			Help: "Statements in Snowflake's dialect that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made.",
 		}),
+		sortedWrites: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_sorted_writes_total",
+			Help: "Writes of rows in order (CREATE TABLE ... AS and INSERT with ORDER BY) too large to sort at once within IGLOO_SORT_SPILL_BUDGET, which Igloo sorted a range of the order at a time.",
+		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits, m.implicitRetries)
+		m.indexStatements, m.memoryExits, m.implicitRetries, m.sortedWrites)
 	return m
 }
 
@@ -129,6 +136,12 @@ func (m *Metrics) memoryExit() {
 func (m *Metrics) implicitRetry() {
 	if m != nil {
 		m.implicitRetries.Inc()
+	}
+}
+
+func (m *Metrics) sortedWrite() {
+	if m != nil {
+		m.sortedWrites.Inc()
 	}
 }
 

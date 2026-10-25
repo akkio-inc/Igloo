@@ -152,6 +152,45 @@ SELECT table_name, clustering_key FROM igloo.tables;  -- LINEAR(customer_id, day
   '(column)')` measures by a column instead, as for a table without a key.
   It needs `SELECT` on the table and runs on its own.
 
+### Writing rows in order
+
+`CREATE TABLE ... AS ... ORDER BY` and `INSERT INTO ... SELECT ... ORDER
+BY` into a table of the catalog write the rows in that order, so a filter
+on the order's first column reads few files, as with a clustering key.
+DuckDB sorts a query's whole result at once and spills what does
+not fit in memory to the spill directory, uncompressed. A write that its
+plan estimates would spill more than `IGLOO_SORT_SPILL_BUDGET` (half the
+spill disk's free space by default) is sorted a range of the order at a
+time instead:
+
+1. A sample of the rows gives ranges of the order with about as many rows
+   each.
+2. One run of the query writes its rows, compressed, into the spill
+   directory, apart by range.
+3. Ranges next to each other are sorted and written together, as many as
+   the budget allows, one batch after another in the order.
+
+The table gets the same rows in the same order, in files that each hold
+rows in order and follow one another in it. Sorting needs at most the
+budget at a time, besides the compressed rows. On an m7g.2xlarge with 78 GB
+of disk free, 515 million rows of a lookup table sorted by two columns took
+1,344 s and at most 71 GB more disk in one sort, and 888 s and 30 GB a range
+at a time. The query runs once to write
+the rows (and once more for the sample), so they are what that run read.
+`CREATE TABLE ... AS` fills the table under a temporary name, as always; an
+`INSERT` writes its batches in one transaction, which the catalog commits
+at once, with a snapshot for each batch. `igloo_sorted_writes_total`
+counts these writes.
+
+- Only an `ORDER BY` of the result's columns is sorted in ranges: by name,
+  alias or position (`ORDER BY audience_id, ver`, `ORDER BY 2 DESC NULLS
+  FIRST`), in any direction. One of other expressions (`ORDER BY
+  lower(name)`) sorts at once, as before, as does one with `LIMIT` or
+  `DISTINCT`, an `INSERT` with parameters or into a member table of an
+  [ID domain](#id-domains), and a result with `HUGEINT`, `BIT`, `BIGNUM`
+  or `UNION` columns, which Parquet files do not keep as they are.
+- `IGLOO_SORT_SPILL_BUDGET=off` sorts every write at once.
+
 ### Column types
 
 Tables take DuckDB's types that Iceberg has: numbers, text, dates and

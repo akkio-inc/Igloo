@@ -1246,6 +1246,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- `CREATE TABLE ... AS` and `INSERT` of a query's rows in order (an
+  `ORDER BY` of the result's columns) too many to sort within
+  `IGLOO_SORT_SPILL_BUDGET` (half the spill disk's free space by default)
+  are sorted [a range of the order at a time](docs/sql.md#writing-rows-in-order):
+  a sample bounds the ranges, one run of the query writes the rows to
+  compressed Parquet in the spill directory, and ranges next to each other
+  are sorted and written together, in order, as many as the budget allows.
+  DuckDB sorts a result whole and spills it uncompressed: a sort of billions
+  of rows ran out of a 300 GB disk. On 515 million rows with 78 GB
+  free, one sort took 1,344 s and 71 GB more disk; a range at a time, 888 s
+  and 30 GB, for the same rows in the same order. An `INSERT` commits once.
+  `igloo_sorted_writes_total` counts these writes.
 - A count of distinct members counts their ids where the member column
   reaches it unchanged through common table expressions, subqueries and
   views, as reports count people they joined, windowed and unnested a few

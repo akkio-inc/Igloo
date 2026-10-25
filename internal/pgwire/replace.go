@@ -239,6 +239,12 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 			s.log.Debug("a new member table is filled without its ids", "table", c.target.String(), "err", err)
 			rows, err = fill(plain)
 		}
+	} else if sw := s.sortedWriteOf(ctx, sess, "INSERT INTO "+quoteName(c.staging), c.query); sw != nil {
+		// Too many rows in order to sort at once: a range at a time.
+		var done bool
+		if rows, done, err = s.runSortedWrite(ctx, sess, sw); !done && err == nil {
+			rows, err = fill(plain)
+		}
 	} else {
 		rows, err = fill(plain)
 	}
@@ -288,8 +294,9 @@ func (s *Server) relationExists(ctx context.Context, sess *session, o auth.Objec
 
 // runStatement runs st, retrying lost Iceberg commits (see
 // runWithCommitRetry), and carries out CREATE OR REPLACE TABLE on an
-// Iceberg table, which DuckDB refuses, and CREATE TABLE ... AS of one in
-// steps (see stagedCreate).
+// Iceberg table, which DuckDB refuses, CREATE TABLE ... AS of one in
+// steps (see stagedCreate), and writes of too many rows in order to sort at
+// once a range of the order at a time (see sortedwrite.go).
 func (s *Server) runStatement(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
 	if st.staged != nil && !sess.inTx {
 		rows, done, err := s.runStagedCreate(ctx, sess, st.staged)
@@ -302,6 +309,11 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		}
 		// It exists: run it as written, under the lock it would have held.
 		defer s.holdCatalog(sess)()
+	}
+	// An INSERT of too many rows in order to sort at once sorts a range of
+	// the order at a time (see sortedwrite.go).
+	if done, err := s.runSortedInsert(ctx, sess, st, args, w); done {
+		return err
 	}
 	written := int64(-1)
 	err := runWithCommitRetry(ctx, sess, st, func() error {

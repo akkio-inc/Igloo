@@ -17,6 +17,7 @@ package engine
 // between containers on one machine that mount the same volume.
 
 import (
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -30,6 +31,19 @@ const tempLockName = "igloo.lock"
 // block size (duckdb_temp_storage_DEFAULT-0.tmp, ..._S128K-0.tmp) and one
 // per block larger than those (duckdb_temp_block-<id>.block).
 var duckdbTempPrefixes = []string{"duckdb_temp_storage_", "duckdb_temp_block-"}
+
+// SortedWriteDirPrefix starts the names of the directories in the spill
+// directory where a write sorted a range at a time keeps its rows until it
+// has written them (see the pgwire package's sortedwrite.go). They are
+// deleted with DuckDB's files.
+const SortedWriteDirPrefix = "igloo-sorted-write-"
+
+// FreeDiskSpace returns the bytes free for unprivileged users on the
+// filesystem holding dir.
+func FreeDiskSpace(dir string) (uint64, error) {
+	_, avail, err := diskSpace(dir)
+	return avail, err
+}
 
 // claimTempDir takes the spill directory dir for this process, first
 // deleting the files DuckDB left there if no other process uses it, and
@@ -72,8 +86,9 @@ func claimTempDir(dir string, log *slog.Logger) func() {
 	return func() { _ = f.Close() }
 }
 
-// removeTempFiles deletes DuckDB's spill files in dir, and returns how many
-// it deleted and the disk space they took.
+// removeTempFiles deletes DuckDB's spill files in dir, and the directories
+// of sorted writes, and returns how many files it deleted and the disk
+// space they took.
 func removeTempFiles(dir string, log *slog.Logger) (files int, freed uint64) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -81,6 +96,16 @@ func removeTempFiles(dir string, log *slog.Logger) (files int, freed uint64) {
 		return 0, 0
 	}
 	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), SortedWriteDirPrefix) {
+			path := filepath.Join(dir, entry.Name())
+			n, size := filesIn(path)
+			if err := os.RemoveAll(path); err != nil {
+				log.Warn("cannot delete a sorted write's directory", "path", path, "err", err)
+				continue
+			}
+			files, freed = files+n, freed+size
+			continue
+		}
 		if !entry.Type().IsRegular() || !isTempFile(entry.Name()) {
 			continue
 		}
@@ -97,6 +122,20 @@ func removeTempFiles(dir string, log *slog.Logger) (files int, freed uint64) {
 		freed += allocated(info)
 	}
 	return files, freed
+}
+
+// filesIn counts the files under dir and the disk space they take.
+func filesIn(dir string) (files int, size uint64) {
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			files, size = files+1, size+allocated(info)
+		}
+		return nil
+	})
+	return files, size
 }
 
 func isTempFile(name string) bool {

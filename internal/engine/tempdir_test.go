@@ -47,6 +47,13 @@ func TestClaimTempDir(t *testing.T) {
 		write(name, size)
 		spilled += size
 	}
+	// A sorted write's rows, and its directory, go too.
+	sortedRows := filepath.Join(SortedWriteDirPrefix+"0a1b", "__igloo_range=0", "data_0.parquet")
+	if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(sortedRows)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(sortedRows, 200<<10)
+	spilled += 200 << 10
 	// Everything else stays: other files, directories (the distributed
 	// executor's among them) and what is in them, and links.
 	for _, name := range []string{"keep.txt", "duckdb.db", "igloo-worker/duckdb_temp_storage_DEFAULT-0.tmp"} {
@@ -71,7 +78,7 @@ func TestClaimTempDir(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "igloo-worker", "duckdb_temp_storage_DEFAULT-0.tmp")); err != nil {
 		t.Errorf("a file in a subdirectory went: %v", err)
 	}
-	m := regexp.MustCompile(`files=3 bytes_freed=(\d+)`).FindStringSubmatch(logged.String())
+	m := regexp.MustCompile(`files=4 bytes_freed=(\d+)`).FindStringSubmatch(logged.String())
 	if m == nil {
 		t.Fatalf("logged %q", logged.String())
 	}

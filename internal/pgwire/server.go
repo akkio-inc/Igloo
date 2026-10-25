@@ -154,6 +154,11 @@ type Options struct {
 	// their new values' ids to a mapping pass shortly after (see
 	// idassign.go); 0 means none do.
 	IDSyncMinRows int64
+	// SortSpillBudget is IGLOO_SORT_SPILL_BUDGET: how many bytes a write
+	// of rows in order may spill to sort them at once; a larger one is
+	// sorted a range at a time (see sortedwrite.go). 0 means half the
+	// spill directory's free space; negative, every write sorts at once.
+	SortSpillBudget int64
 	// Bitmaps counts the distinct integer IDs of ID domains in roaring
 	// bitmaps (the rb extension, which the engine must have loaded) in
 	// statements that read at least BitmapMinRows rows; 0 means every such
@@ -328,6 +333,8 @@ type Server struct {
 	// a mapping pass shortly after, and those passes (see idassign.go).
 	idSyncMinRows int64
 	idDeferred    idDeferral
+	// sortBudget is Options.SortSpillBudget.
+	sortBudget int64
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()
@@ -560,7 +567,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		policies = policy.NewMemoryStore()
 	}
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
-	s.idSyncMinRows = opts.IDSyncMinRows
+	s.idSyncMinRows, s.sortBudget = opts.IDSyncMinRows, opts.SortSpillBudget
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)

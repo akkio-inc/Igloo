@@ -329,7 +329,9 @@ log says
 `deleted DuckDB temporary files an earlier run left in the spill directory`,
 with how many files and `bytes_freed`. Igloo deletes only the files DuckDB
 spills to, named `duckdb_temp_storage_*` and `duckdb_temp_block-*`, at the
-top of the directory, and leaves everything else.
+top of the directory, and the directories `igloo-sorted-write-*` where a
+[write of rows in order](sql.md#writing-rows-in-order) keeps them until it
+has written them, and leaves everything else.
 
 Give each Igloo process (each replica, compute pool and worker) a spill
 directory of its own, as the single-machine stack and the Helm chart do.
@@ -745,6 +747,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_bitmap_index_statements_total` | | Statements prepared whose counts of distinct members in SQL read [bitmap indexes](sql.md#bitmap-indexes) instead of the tables (report API calls count in `igloo_report_calls_total`) |
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
+| `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

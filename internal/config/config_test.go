@@ -491,6 +491,24 @@ func TestExchanges(t *testing.T) {
 	}
 }
 
+func TestSortSpillBudget(t *testing.T) {
+	for v, want := range map[string]int64{"": 0, "off": -1, "50GB": 50e9, "2GiB": 2 << 30} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_SORT_SPILL_BUDGET"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.DuckDB.SortSpillBudget != want {
+			t.Errorf("IGLOO_SORT_SPILL_BUDGET=%q: %d %v, want %d", v, cfg.DuckDB.SortSpillBudget, err, want)
+		}
+	}
+	for _, v := range []string{"0", "-5GB", "lots"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_SORT_SPILL_BUDGET": v})); err == nil {
+			t.Errorf("IGLOO_SORT_SPILL_BUDGET=%s should be refused", v)
+		}
+	}
+}
+
 func TestIDSyncMinRows(t *testing.T) {
 	for v, want := range map[string]int64{"": 0, "0": 0, "100000": 100_000} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
