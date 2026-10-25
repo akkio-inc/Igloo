@@ -233,8 +233,10 @@ DROP VIEW IF EXISTS recent_orders;
   CTE keeps its name. Schema-qualified table names are stored with the
   catalog's name: `sales.orders` becomes `lake.sales.orders`.
 - A view that a replica cannot load, because a table it reads is missing,
-  say, fails when read with the reason (`view sales.v could not be loaded:
-  ...`), and loads at the next sync after the cause is fixed.
+  say, is listed with its columns but fails a statement that reads it,
+  directly, through other views or in a new view's body, with the reason
+  (`view sales.v could not be loaded: ...`). Such a statement syncs the
+  replica's views first, so the view loads as soon as the cause is fixed.
 - Creating, replacing, renaming or dropping a view takes effect at once for
   every session on the replica that does it. A view created on one replica
   reaches the others within 30 seconds, or at once when a query there names

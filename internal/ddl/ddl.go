@@ -13,11 +13,14 @@ package ddl
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -79,15 +82,14 @@ type Manager struct {
 	// begun of those that applied what they listed.
 	syncs, applied uint64
 	// failed are the catalog's views whose local copies could not be made,
-	// with why: each has a stub that fails with that when read (see
-	// stubLocal), and syncs try it again.
+	// with why, an *unloadedError: each has a stub that no statement can read
+	// (see stubLocal), and every sync tries it again.
 	failed map[key]error
-	// remake are views for the next sync to make again: their local copies
-	// were made by one that then dropped other views, which they may read
-	// (see sync).
-	remake map[key]bool
 	// known is the set of view keys, read without locking by IsView.
 	known atomic.Pointer[map[key]bool]
+	// unloaded holds failed's errors by the name of the relation each stub
+	// reads, read without locking by Explain.
+	unloaded atomic.Pointer[map[string]error]
 	// gen counts changes to the local copies; see Generation.
 	gen atomic.Uint64
 
@@ -113,8 +115,9 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 		return nil, err
 	}
 	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, edited: map[key]uint64{},
-		failed: map[key]error{}, remake: map[key]bool{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
+		failed: map[key]error{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
+	m.unloaded.Store(&map[string]error{})
 	// Loading the views reads and fills in the catalog's set of tables; hold
 	// the exclusive side (see Run). Nothing else runs yet, but this keeps the
 	// rule that every sync outside a statement holds the lock.
@@ -218,16 +221,6 @@ func (m *Manager) PollViews(ctx context.Context) (changed bool, err error) {
 // them, which is as new as the catalog has them or newer, for the next
 // sync to look at again. And a list is not applied at all once a sync that
 // began later has applied its own.
-//
-// A list can also be made in the middle of another replica's changes: dbt
-// renames a model's view out of the way and then its new one into place,
-// and a list made in between lacks the model, which other views read. So
-// the views a list lacks are dropped only once the rest is made, and a
-// changed view that reads one is made against its local copy. Once that
-// copy is dropped, a statement that reads the view misses a relation and
-// syncs before it fails (see SyncViews), which it would not do on a stub.
-// The next sync makes such views again, as what they read may since have
-// become a table or be gone for good.
 func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err error) {
 	m.mu.Lock()
 	m.syncs++
@@ -248,19 +241,34 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 			m.gen.Add(1)
 		}
 	}()
-	defer m.publish(nil)
 	listed := func(k key) bool { return m.edited[k] <= since }
 	for k, n := range m.edited {
 		if n <= since {
 			delete(m.edited, k)
 		}
 	}
-	again := m.remake
-	m.remake = map[key]bool{}
 
 	want := map[key]catalog.View{}
 	for _, v := range defs {
 		want[keyOf(v.Schema, v.Name)] = v
+	}
+	for k, v := range m.views {
+		if _, ok := want[k]; !ok && listed(k) {
+			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(v.Schema, v.Name)); err != nil {
+				return changed, err
+			}
+			delete(m.views, k)
+			changed = true
+		}
+	}
+	for k := range m.failed {
+		if _, ok := want[k]; !ok && listed(k) {
+			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(k.schema, k.name)); err != nil {
+				return changed, err
+			}
+			delete(m.failed, k)
+			changed = true
+		}
 	}
 
 	// Local copies can also go missing, say if an admin drops one; they are
@@ -274,85 +282,51 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 	missing := func(k key) bool { return checkLocal && !present[k] }
 
 	// A view can read other views, which must exist locally first. Create
-	// what can be created, and repeat while that makes progress. What cannot
-	// be gets a stub, and every sync tries it again; but a view made as
-	// listed already, by a sync that then dropped others (see above), keeps
-	// its copy, to be made again by the next.
+	// what can be created, and repeat while that makes progress.
 	pending := map[key]catalog.View{}
-	kept := map[key]bool{}
 	for k, v := range want {
 		if !listed(k) {
 			continue
 		}
-		cur, ok := m.views[k]
 		_, failed := m.failed[k]
-		switch {
-		case !ok || failed || missing(k) || cur.Version != v.Version || cur.SQL != v.SQL:
+		if cur, ok := m.views[k]; !ok || failed || missing(k) || cur.Version != v.Version || cur.SQL != v.SQL {
 			pending[k] = v
-		case again[k]:
-			pending[k], kept[k] = v, true
 		}
 	}
-	var made []key
-	var errs []error
 	for len(pending) > 0 {
+		var errs []error
 		why := map[key]error{}
 		progress := false
 		for k, v := range pending {
 			// Let names in v resolve against other pending views too.
 			m.publish(pending)
 			if err := m.createLocal(ctx, m.conn, v); err != nil {
+				// Reading a view that is a stub itself, it says why that one
+				// could not be made.
+				err = m.Explain(err)
+				errs = append(errs, fmt.Errorf("view %s.%s: %w", v.Schema, v.Name, err))
 				why[k] = err
 				continue
 			}
 			m.views[k] = v
 			delete(m.failed, k)
 			delete(pending, k)
-			made = append(made, k)
 			progress, changed = true, true
 		}
 		if !progress {
 			for k, v := range pending {
-				if kept[k] {
-					m.remake[k] = true
-					continue
-				}
-				errs = append(errs, fmt.Errorf("view %s.%s: %w", v.Schema, v.Name, why[k]))
 				m.stubLocal(ctx, v, why[k])
 				if _, ok := m.failed[k]; !ok {
 					changed = true
 				}
-				m.failed[k] = why[k]
+				m.failed[k] = &unloadedError{schema: v.Schema, name: v.Name, why: why[k]}
 			}
-			break
+			m.publish(nil)
+			return changed, errors.Join(errs...)
 		}
 	}
-
-	dropped := false
-	for k, v := range m.views {
-		if _, ok := want[k]; !ok && listed(k) {
-			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(v.Schema, v.Name)); err != nil {
-				return changed, err
-			}
-			delete(m.views, k)
-			changed, dropped = true, true
-		}
-	}
-	for k := range m.failed {
-		if _, ok := want[k]; !ok && listed(k) {
-			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(k.schema, k.name)); err != nil {
-				return changed, err
-			}
-			delete(m.failed, k)
-			changed, dropped = true, true
-		}
-	}
-	if dropped {
-		for _, k := range made {
-			m.remake[k] = true
-		}
-	}
-	return changed, errors.Join(errs...)
+	m.publish(nil)
+	return changed, nil
 }
 
 // edit records that this replica is changing the views keys, whose local
@@ -378,6 +352,11 @@ func (m *Manager) publish(extra map[key]catalog.View) {
 		known[k] = true
 	}
 	m.known.Store(&known)
+	unloaded := make(map[string]error, len(m.failed))
+	for k, why := range m.failed {
+		unloaded[absentName(k)] = why
+	}
+	m.unloaded.Store(&unloaded)
 }
 
 // CreateView creates or, with replace, replaces the view schema.name as
@@ -637,10 +616,17 @@ func (m *Manager) describeQuery(ctx context.Context, conn *duckdb.Conn, query st
 }
 
 // stubLocal makes the local copy of v, a catalog view whose copy could not
-// be made, a view with v's columns that fails with why when read: a session
-// that reads it learns what is wrong, rather than that it does not exist.
+// be made, a view of v's columns that DuckDB lists but cannot bind: it
+// reads a relation that the sync's connection makes for the purpose, alone
+// can see, and drops again. A statement that reads the view, directly or
+// through others, thus fails to bind for want of a relation, as it would
+// before the replica had the view at all, and so syncs before it fails
+// (see SyncViews): a stub made from a list older than the statement, as
+// one made in the middle of dbt's swap of a view it reads, does not fail
+// it. If the view still cannot be made, the statement fails with why (see
+// Explain), as reading the view fails should the relation not drop.
 func (m *Manager) stubLocal(ctx context.Context, v catalog.View, why error) {
-	msg := fmt.Sprintf("view %s.%s could not be loaded: %s", v.Schema, v.Name, firstLine(why))
+	msg := (&unloadedError{schema: v.Schema, name: v.Name, why: why}).Error()
 	fail := "error(" + quoteLiteral(msg) + ")"
 	cols := make([]string, len(v.Columns))
 	for i, c := range v.Columns {
@@ -653,11 +639,59 @@ func (m *Manager) stubLocal(ctx context.Context, v catalog.View, why error) {
 	if err := m.exec(ctx, m.conn, "CREATE SCHEMA IF NOT EXISTS "+quoteIdent(m.eng.LocalDatabase())+"."+quoteIdent(v.Schema)); err != nil {
 		return
 	}
+	absent := "temp.main." + quoteIdent(absentName(keyOf(v.Schema, v.Name)))
+	from := " FROM " + absent
+	if m.exec(ctx, m.conn, "CREATE OR REPLACE TEMP VIEW "+absent+" AS SELECT 1") != nil {
+		from = ""
+	}
 	stmt := "CREATE OR REPLACE VIEW " + m.localName(v.Schema, v.Name) + " AS SELECT "
-	if len(cols) == 0 || m.exec(ctx, m.conn, stmt+strings.Join(cols, ", ")) != nil {
-		_ = m.exec(ctx, m.conn, stmt+fail+" AS error")
+	if len(cols) == 0 || m.exec(ctx, m.conn, stmt+strings.Join(cols, ", ")+from) != nil {
+		_ = m.exec(ctx, m.conn, stmt+fail+" AS error"+from)
+	}
+	if from != "" {
+		_ = m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+absent)
 	}
 }
+
+// absentName is the name of the relation the stub of the view k reads (see
+// stubLocal).
+func absentName(k key) string {
+	sum := sha256.Sum256([]byte(k.schema + "\x00" + k.name))
+	return "igloo_unloaded_" + hex.EncodeToString(sum[:8])
+}
+
+// absentRelation matches DuckDB's error for a statement that read a stub,
+// and the name of the relation the stub reads.
+var absentRelation = regexp.MustCompile(`Table with name (igloo_unloaded_[0-9a-f]{16}) does not exist`)
+
+// Explain returns, for err, DuckDB's error for a statement that read the
+// stub of a view this replica could not make, an error that says why it
+// could not be made; it returns any other error as is.
+func (m *Manager) Explain(err error) error {
+	if err == nil {
+		return nil
+	}
+	if match := absentRelation.FindStringSubmatch(err.Error()); match != nil {
+		if why, ok := (*m.unloaded.Load())[match[1]]; ok {
+			return why
+		}
+	}
+	return err
+}
+
+// unloadedError is why the local copy of the view schema.name could not be
+// made. It unwraps to the error that making it failed with, which decides
+// its kind, such as DuckDB's for a missing table.
+type unloadedError struct {
+	schema, name string
+	why          error
+}
+
+func (e *unloadedError) Error() string {
+	return fmt.Sprintf("view %s.%s could not be loaded: %s", e.schema, e.name, firstLine(e.why))
+}
+
+func (e *unloadedError) Unwrap() error { return e.why }
 
 // firstLine is the first line of err's message, without DuckDB's excerpt
 // of the SQL.

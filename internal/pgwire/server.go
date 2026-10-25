@@ -2216,13 +2216,17 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	}
 	preparing()
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
-		// Perhaps a view another replica just created: sync and try again,
-		// also when this sync changed nothing because another one, of the
-		// background or another session, brought the view meanwhile.
+		// Perhaps a view another replica just created, or one this replica
+		// could not make when it last synced, which DuckDB cannot bind (see
+		// ddl's stubLocal): sync and try again, also when this sync changed
+		// nothing because another one, of the background or another
+		// session, brought the view meanwhile. A view that still cannot be
+		// made fails the statement with why.
 		if changed, _ := s.ddl.SyncViews(ctx); changed || s.ddl.Generation() != viewGen {
 			query = s.ddl.RewriteViewRefs(query)
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}
+		err = s.ddl.Explain(err)
 	}
 	if err != nil && s.external != nil && missingRelation.MatchString(err.Error()) {
 		// Or an external table another replica just created.

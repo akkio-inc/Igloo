@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
@@ -468,19 +469,22 @@ func TestStatementFindsViewAnotherSyncBrought(t *testing.T) {
 	}
 }
 
-// TestViewReadsAfterAMidSwapList: a replica lists the catalog's views in
-// the middle of another replica's swap of a view, as dbt makes one, so
-// that the list lacks the view and has a new version of a second that
-// reads it. Once the swap is done, a statement on the replica must read
-// the second view. And if a later sync could not make the second view,
-// with the first gone from the catalog and the replica both, the next sync
-// after the swap must make it, though the catalog then has it at the
-// version of the replica's earlier copy, as dbt's new views come to have.
+// TestViewReadsAfterAMidSwapList: a replica's sync lists the catalog's
+// views in the middle of another replica's swap of a view, as dbt makes
+// one, so that it can make neither that view nor a new version of a second
+// that reads it. Once the swap is done, statements on the replica that read
+// the second view must read it, though no sync has run since: directly,
+// through a third view, or in a new view's body. So must one when the
+// catalog then has the second view at the version of the replica's earlier
+// copy, as each of dbt's new views comes to have it. A view that cannot be
+// made at all fails a statement with why, of the kind of error that making
+// it failed with.
 func TestViewReadsAfterAMidSwapList(t *testing.T) {
 	ctx := context.Background()
 	vc := newViewCatalog(t)
 	r := vc.replica(t)
-	mustExec(t, r.dbt(t), `create schema if not exists "lake"."analytics"`)
+	conn := r.dbt(t)
+	mustExec(t, conn, `create schema if not exists "lake"."analytics"`)
 	// The other replica's changes, made in the catalog directly.
 	cat, err := catalog.Open(ctx, vc.cfg)
 	if err != nil {
@@ -505,38 +509,41 @@ func TestViewReadsAfterAMidSwapList(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	reader := r.dbt(t)
-	read := func(when string, want int) {
+	read := func(when, view string, want int) {
 		t.Helper()
 		var run int
-		if err := reader.QueryRow(ctx, "SELECT run FROM "+relation("b")).Scan(&run); err != nil || run != want {
-			t.Errorf("%s: read run %d (%v), want %d", when, run, err, want)
+		if err := conn.QueryRow(ctx, "SELECT run FROM "+relation(view)).Scan(&run); err != nil || run != want {
+			t.Errorf("%s: %s reads run %d (%v), want %d", when, view, run, err, want)
 		}
 	}
 	const readsA = "select run from analytics.a"
+	// a's swap to run, as dbt makes it, with b replaced and the replica's
+	// views polled while a is out of the way.
+	swap := func(run int) {
+		t.Helper()
+		put("a__dbt_tmp", fmt.Sprintf("select %d as run", run), false)
+		rename("a", "a__dbt_backup")
+		put("b", readsA, true)
+		_, _ = r.objects.PollViews(ctx)
+		rename("a__dbt_tmp", "a")
+		drop("a__dbt_backup")
+	}
 	put("a", "select 1 as run", false)
 	put("b", readsA, false)
+	put("c", "select run from analytics.b", false)
 	if _, err := r.objects.SyncViews(ctx); err != nil {
 		t.Fatal(err)
 	}
-	read("before the swaps", 1)
+	read("before the swaps", "c", 1)
 
-	// Listed with a out of the way and b's new version in place, as a list
-	// made over dbt's runs of both can be.
-	put("a__dbt_tmp", "select 2 as run", false)
-	rename("a", "a__dbt_backup")
-	put("b", readsA, true)
-	_, _ = r.objects.PollViews(ctx)
-	rename("a__dbt_tmp", "a")
-	drop("a__dbt_backup")
-	read("after the first swap", 2)
+	swap(2)
+	read("after the first swap", "c", 2)
 
-	// Listed once with a out of the way, and once more with b's new version
-	// too, which then reads nothing the replica has.
+	// b's stub made from a version the catalog has no more, which it then
+	// has again.
 	put("a__dbt_tmp", "select 3 as run", false)
 	rename("a", "a__dbt_backup")
 	_, _ = r.objects.PollViews(ctx)
-	// b as the replica last made it.
 	last, _, err := cat.LoadDuckDBView(ctx, "analytics", "b")
 	if err != nil {
 		t.Fatal(err)
@@ -545,7 +552,6 @@ func TestViewReadsAfterAMidSwapList(t *testing.T) {
 	_, _ = r.objects.PollViews(ctx)
 	rename("a__dbt_tmp", "a")
 	drop("a__dbt_backup")
-	// b made anew, up to the version the replica last made.
 	drop("b")
 	put("b", readsA, false)
 	for {
@@ -561,8 +567,25 @@ func TestViewReadsAfterAMidSwapList(t *testing.T) {
 		}
 		put("b", readsA, true)
 	}
-	_, _ = r.objects.PollViews(ctx)
-	read("after the second swap", 3)
+	read("after the second swap", "b", 3)
+
+	swap(4)
+	mustExec(t, conn, `create view "lake"."analytics"."d" as select run from "lake"."analytics"."b"`)
+	read("after the third swap", "d", 4)
+
+	drop("a")
+	put("b", readsA, true)
+	if _, err := r.objects.PollViews(ctx); err == nil {
+		t.Fatal("b was made without a")
+	}
+	for _, view := range []string{"b", "c"} {
+		var pgErr *pgconn.PgError
+		err := conn.QueryRow(ctx, "SELECT run FROM "+relation(view)).Scan(new(int))
+		if !errors.As(err, &pgErr) || pgErr.Code != "42P01" ||
+			!strings.HasPrefix(pgErr.Message, "view analytics.b could not be loaded: ") || !strings.Contains(pgErr.Message, "with name a does not exist") {
+			t.Errorf("reading %s without a: %v", view, err)
+		}
+	}
 }
 
 // TestDbtRunsWhileViewsSync runs dbt's statements for a small project over

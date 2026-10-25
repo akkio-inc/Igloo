@@ -1621,9 +1621,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   stubs that fail when read; later syncs made a stub again only if the
   catalog's view differed from the replica's last good copy, and every dbt
   run makes its views anew at the same versions. Syncs now make every stub
-  again, and drop the views a list lacks only after making the rest, so a
-  read of a view whose model a list caught mid-swap syncs first and finds
-  the model swapped in, rather than failing until the next sync.
+  again, and DuckDB cannot bind a stub: a statement that reads one,
+  directly, through other views or in a new view's body, syncs before it
+  fails, as one that names a view the replica has not synced does, and
+  reads the view once the swap is done. A view the replica still cannot
+  make fails it with why, and with the SQLSTATE of the cause (`42P01` for a
+  missing table) rather than `22P02`.
 - A listing of the catalog (`information_schema`, `pg_catalog`,
   `duckdb_tables()`/`duckdb_views()`, `SHOW`, `DESCRIBE`), or even a plain
   read, could crash or wedge the whole replica, ending every session on it,

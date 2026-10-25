@@ -280,7 +280,9 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 		// Authorizing a view's reads rewrites and analyzes its body, which
 		// reads and fills in the catalog's set (see holdCatalog).
 		relist := s.holdCatalog(sess)
-		err := s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, sess, user, view.query))
+		err := s.syncingViews(ctx, func() error {
+			return s.authorizeViewReads(ctx, sess, user, s.rewrite(ctx, sess, user, view.query))
+		})
 		relist()
 		if err != nil {
 			s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)
@@ -319,7 +321,9 @@ func (s *Server) catalogDDL(ctx context.Context, sess *session, user auth.User, 
 			if view.ifNotExists && s.ddl.IsView(schema, name) {
 				return nil
 			}
-			return s.ddl.CreateView(ctx, sess.conn, schema, name, view.columns, view.query, view.replace)
+			return s.syncingViews(ctx, func() error {
+				return s.ddl.CreateView(ctx, sess.conn, schema, name, view.columns, view.query, view.replace)
+			})
 		}
 		tag = "CREATE VIEW"
 	}
@@ -532,6 +536,21 @@ func currentSchema(ctx context.Context, conn *duckdb.Conn) (db, schema string, e
 // missingRelation matches DuckDB's error for an unknown table or view: one
 // created on another replica, perhaps, that this one has not synced yet.
 var missingRelation = regexp.MustCompile(`Catalog Error: (Table|View) with name \S+ does not exist`)
+
+// syncingViews runs fn, which binds a view's body, and if that fails for
+// want of a relation, syncs the catalog's views and runs fn again, as
+// preparing a statement does (see prepareCheckedText). A view that still
+// cannot be made fails it with why.
+func (s *Server) syncingViews(ctx context.Context, fn func() error) error {
+	gen := s.ddl.Generation()
+	err := fn()
+	if err != nil && missingRelation.MatchString(err.Error()) {
+		if changed, _ := s.ddl.SyncViews(ctx); changed || s.ddl.Generation() != gen {
+			err = fn()
+		}
+	}
+	return s.ddl.Explain(err)
+}
 
 // missingSchema matches DuckDB's errors for a schema it did not find, its
 // name in group 1 or 2.
