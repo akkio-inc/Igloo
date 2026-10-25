@@ -183,6 +183,28 @@ func TestSnowflakeInformationSchema(t *testing.T) {
 		"amount", "id")
 }
 
+// dbt-snowflake's incremental models make temporary tables and views in
+// their schema's name, then read and drop them by that name, as Snowflake
+// keeps a session's temporary objects in the schemas they name.
+func TestSnowflakeTemporaryObjectsInSchemas(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, "SET sql_dialect = 'snowflake'")
+	mustExec(t, cs.admin, `create or replace temporary table lake.public.orders__dbt_tmp as (select id, amount + 1 as amount from lake.public.orders)`)
+	mustExec(t, cs.admin, `create or replace temporary view lake.public.totals__dbt_tmp ("N" COMMENT $$rows$$) as (select count(*) from lake.public.orders__dbt_tmp)`)
+	expectRows(t, cs.admin, `select N from public.totals__dbt_tmp`, "2")
+	mustExec(t, cs.admin, `delete from lake.public.orders where id in (select id from lake.public.orders__dbt_tmp where amount > 15)`)
+	expectRows(t, cs.admin, `select count(*) from lake.public.orders`, "1")
+	// In DuckDB's temp catalog, not the warehouse's.
+	expectRows(t, cs.admin, `select table_catalog, table_name from information_schema.tables where table_name ilike '%!_!_dbt!_tmp' escape '!' order by 2`,
+		"temp|orders__dbt_tmp", "temp|totals__dbt_tmp")
+	mustExec(t, cs.admin, `drop view if exists lake.public.totals__dbt_tmp`)
+	mustExec(t, cs.admin, `drop table if exists lake.public.orders__dbt_tmp`)
+	if _, err := cs.admin.Exec(context.Background(), `select * from lake.public.orders__dbt_tmp`); err == nil || !strings.Contains(err.Error(), "orders__dbt_tmp") {
+		t.Errorf("a dropped temporary table read: %v", err)
+	}
+}
+
 func TestSnowflakeDialectNotices(t *testing.T) {
 	t.Parallel()
 	ts := startServer(t)

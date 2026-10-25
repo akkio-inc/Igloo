@@ -227,6 +227,7 @@ func (s *Server) translate(ctx context.Context, sess *session, text string, impl
 		Variable:  func(name string) (string, bool, error) { return sessionVariable(ctx, sess, name) },
 		Sketches:  s.hasSketches(),
 		Implicit:  implicit,
+		Temporary: func(schema, name string) bool { return sess.sfTemps[snowflake.TempName{Schema: schema, Name: name}] },
 	})
 	if err != nil {
 		var te *snowflake.Error

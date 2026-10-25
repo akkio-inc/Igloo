@@ -332,6 +332,14 @@ comparison reads `a || b`, which Igloo does not convert; write
   `SYSTEM$CLUSTERING_DEPTH('t' [, '(columns)'])` returns the table's average
   clustering depth, by the first column given or its key's; a predicate as a
   third argument is not supported, nor is `SYSTEM$CLUSTERING_INFORMATION`.
+- Temporary tables and views named in a schema, as dbt's incremental models
+  make them (`CREATE OR REPLACE TEMPORARY TABLE db.schema.m__dbt_tmp AS
+  ...`), live in DuckDB's `temp` catalog, which keeps every temporary object,
+  for the session that made them. The session's later statements that name
+  one in its schema, with or without the database, read it there, as
+  Snowflake finds a session's temporary object before a table of the same
+  name; dropping it ends that. `information_schema.tables` lists them in
+  the `temp` catalog.
 - `CREATE [OR REPLACE] [SECURE] VIEW` (`SECURE` ignored with a notice),
   `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `DESC[RIBE] TABLE`,
   `USE DATABASE`, `USE SCHEMA`.

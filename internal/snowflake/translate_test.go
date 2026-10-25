@@ -338,3 +338,46 @@ func TestImplicitConversions(t *testing.T) {
 		}
 	}
 }
+
+func TestTemporaryNames(t *testing.T) {
+	known := func(schema, name string) bool { return schema == "s" && name == "m__dbt_tmp" }
+	for _, c := range []struct {
+		in, has, hasNot  string
+		known            bool
+		created, dropped *TempName
+	}{
+		{in: `create or replace temporary table db.s.m__dbt_tmp as (select 1 as a)`, has: `temporary table temp.main.m__dbt_tmp as`,
+			created: &TempName{"s", "m__dbt_tmp"}},
+		{in: `CREATE TEMP VIEW "S"."V__DBT_TMP" ("A" COMMENT $$x$$) AS SELECT 1 AS a`, has: `VIEW temp.main."V__DBT_TMP"`,
+			created: &TempName{"s", "v__dbt_tmp"}},
+		{in: `create temporary table t as select 1 as a`, has: `temporary table t as`},
+		{in: `create table db.s.m__dbt_tmp as select 1 as a`, has: `table db.s.m__dbt_tmp as`},
+		{in: `delete from db.s.m where id in (select id from db.s.m__dbt_tmp)`, known: true,
+			has: `delete from db.s.m where id in (select id from temp.main.m__dbt_tmp)`},
+		{in: `drop table if exists s.m__dbt_tmp`, known: true, has: `drop table if exists temp.main.m__dbt_tmp`,
+			dropped: &TempName{"s", "m__dbt_tmp"}},
+		{in: `select s.m__dbt_tmp(1), v:s.m__dbt_tmp from db.s.m__dbt_tmp`, has: `from db.s.m__dbt_tmp`},
+		{in: `select s.m__dbt_tmp(1) from t`, known: true, hasNot: "temp.main"},
+	} {
+		opts := Options{}
+		if c.known {
+			opts.Temporary = known
+		}
+		res, err := Translate(c.in, opts)
+		if err != nil {
+			t.Errorf("%s: %v", c.in, err)
+			continue
+		}
+		if c.has != "" && !strings.Contains(res.SQL, c.has) {
+			t.Errorf("%s:\n  got  %s\n  want %s in it", c.in, res.SQL, c.has)
+		}
+		if c.hasNot != "" && strings.Contains(res.SQL, c.hasNot) {
+			t.Errorf("%s:\n  got  %s\n  want no %s in it", c.in, res.SQL, c.hasNot)
+		}
+		if !sameTemp(res.Temporary, c.created) || !sameTemp(res.Dropped, c.dropped) {
+			t.Errorf("%s: created %v dropped %v, want %v %v", c.in, res.Temporary, res.Dropped, c.created, c.dropped)
+		}
+	}
+}
+
+func sameTemp(a, b *TempName) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }

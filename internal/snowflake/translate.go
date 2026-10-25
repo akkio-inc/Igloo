@@ -27,6 +27,10 @@ type Options struct {
 	// DuckDB could not bind, since the conversions depend on types the
 	// translation does not know.
 	Implicit bool
+	// Temporary reports whether the session has a temporary table or view
+	// that this dialect created as schema.name (lower-cased), which DuckDB
+	// keeps in temp.main (see temporary.go). Nil means it has none.
+	Temporary func(schema, name string) bool
 }
 
 // Result is a translated statement.
@@ -52,6 +56,10 @@ type Result struct {
 	// succeeded, as part of it: the clustering key of CREATE TABLE ...
 	// CLUSTER BY, ALTER TABLE ... SET SORTED BY (...).
 	After []string
+	// Temporary is the temporary table or view the statement creates in a
+	// schema, and Dropped the one of the session's it drops: the session
+	// records them once the statement succeeds, for Options.Temporary.
+	Temporary, Dropped *TempName
 }
 
 // translator holds the state of one statement's translation.
@@ -146,6 +154,7 @@ func Translate(sql string, opts Options) (Result, error) {
 		}
 	}
 	quoteKeywordQualifiers(toks)
+	toks, created, dropped := temporaryNames(toks, opts.Temporary)
 	nodes, err := build(toks)
 	if err != nil {
 		return Result{}, err
@@ -157,7 +166,7 @@ func Translate(sql string, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after}
+	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after, Temporary: created, Dropped: dropped}
 	if cmd == "" {
 		res.SQL = strings.TrimRight(render(out), " \t\r\n")
 	}

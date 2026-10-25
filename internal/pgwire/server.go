@@ -705,6 +705,10 @@ type session struct {
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
+	// sfTemps are the temporary tables and views that statements in
+	// Snowflake's dialect created in a schema's name, which DuckDB keeps in
+	// temp.main (see noteTemporary).
+	sfTemps map[snowflake.TempName]bool
 	// changes counts the statements in the transaction block that may have
 	// changed something, and savepoints are its savepoints (see
 	// savepointCommand).
@@ -1307,6 +1311,17 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if err != nil {
 		return nil, err
 	}
+	if created, dropped := tr.Temporary, tr.Dropped; created != nil || dropped != nil {
+		// A temporary object named in a schema is read by that name once
+		// the statement that creates it has succeeded.
+		for _, p := range ps {
+			p.WrapFn(func(fn wire.PreparedStatementFn) wire.PreparedStatementFn {
+				return func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
+					return fn(ctx, afterWriter{DataWriter: w, run: func() error { sess.noteTemporary(created, dropped); return nil }}, params)
+				}
+			})
+		}
+	}
 	if after := tr.After; len(after) > 0 {
 		// Such as the clustering key of CREATE TABLE ... CLUSTER BY, set
 		// once the table is created and before the client hears it is.
@@ -1319,6 +1334,22 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		}
 	}
 	return withNotices(ps, tr.Notices), nil
+}
+
+// noteTemporary records the temporary table or view a statement in
+// Snowflake's dialect created in a schema's name, and forgets one it
+// dropped, so that later statements read it by that name (see
+// snowflake.Options.Temporary).
+func (sess *session) noteTemporary(created, dropped *snowflake.TempName) {
+	if sess.sfTemps == nil {
+		sess.sfTemps = map[snowflake.TempName]bool{}
+	}
+	if dropped != nil {
+		delete(sess.sfTemps, *dropped)
+	}
+	if created != nil {
+		sess.sfTemps[*created] = true
+	}
 }
 
 // afterWriter runs what a statement leaves for after it (see
