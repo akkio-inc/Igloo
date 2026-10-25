@@ -951,7 +951,9 @@ if grep -q '"eventType":"COMPLETE"' <<<"$lineage_event" && grep -q '"name":"lake
 else
   fail "OpenLineage event: [$lineage_event]"
 fi
-if docker logs "$project-lineage" 2>&1 | grep -qi '"sql"\|0\.30\|globex'; then
+# A margin of the table, as a JSON value (a number or a string); a bare 0.30
+# would match the fractions of seconds of the events' timestamps.
+if docker logs "$project-lineage" 2>&1 | grep -qiE '"sql"|[:[,][[:space:]]*"?0\.30?"?[[:space:]]*[],}]|globex'; then
   fail "an OpenLineage event carries SQL or data"
 else
   pass "OpenLineage events carry neither SQL nor data"
