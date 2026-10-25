@@ -1564,6 +1564,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   changed meanwhile as those changes made them, and never apply a list older
   than one already applied; a statement that names a view another replica
   created finds it when any sync brought it, not only its own.
+- A view that reads another, such as one dbt model's view read by the
+  next, could fail with `view ... could not be loaded: ... Table with name
+  ... does not exist!` on replicas other than the one running dbt, and go
+  on failing until dbt next changed it. A replica that synced its copies
+  of the catalog's views while dbt had a model's view renamed out of the
+  way, its new one not yet in place, turned the views that read it into
+  stubs that fail when read; later syncs made a stub again only if the
+  catalog's view differed from the replica's last good copy, and every dbt
+  run makes its views anew at the same versions. Syncs now make every stub
+  again, and drop the views a list lacks only after making the rest, so a
+  read of a view whose model a list caught mid-swap syncs first and finds
+  the model swapped in, rather than failing until the next sync.
 - A listing of the catalog (`information_schema`, `pg_catalog`,
   `duckdb_tables()`/`duckdb_views()`, `SHOW`, `DESCRIBE`), or even a plain
   read, could crash or wedge the whole replica, ending every session on it,

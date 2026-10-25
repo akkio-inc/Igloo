@@ -82,6 +82,10 @@ type Manager struct {
 	// with why: each has a stub that fails with that when read (see
 	// stubLocal), and syncs try it again.
 	failed map[key]error
+	// remake are views for the next sync to make again: their local copies
+	// were made by one that then dropped other views, which they may read
+	// (see sync).
+	remake map[key]bool
 	// known is the set of view keys, read without locking by IsView.
 	known atomic.Pointer[map[key]bool]
 	// gen counts changes to the local copies; see Generation.
@@ -109,7 +113,7 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 		return nil, err
 	}
 	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, edited: map[key]uint64{},
-		failed: map[key]error{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
+		failed: map[key]error{}, remake: map[key]bool{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
 	// Loading the views reads and fills in the catalog's set of tables; hold
 	// the exclusive side (see Run). Nothing else runs yet, but this keeps the
@@ -214,6 +218,16 @@ func (m *Manager) PollViews(ctx context.Context) (changed bool, err error) {
 // them, which is as new as the catalog has them or newer, for the next
 // sync to look at again. And a list is not applied at all once a sync that
 // began later has applied its own.
+//
+// A list can also be made in the middle of another replica's changes: dbt
+// renames a model's view out of the way and then its new one into place,
+// and a list made in between lacks the model, which other views read. So
+// the views a list lacks are dropped only once the rest is made, and a
+// changed view that reads one is made against its local copy. Once that
+// copy is dropped, a statement that reads the view misses a relation and
+// syncs before it fails (see SyncViews), which it would not do on a stub.
+// The next sync makes such views again, as what they read may since have
+// become a table or be gone for good.
 func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err error) {
 	m.mu.Lock()
 	m.syncs++
@@ -234,34 +248,19 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 			m.gen.Add(1)
 		}
 	}()
+	defer m.publish(nil)
 	listed := func(k key) bool { return m.edited[k] <= since }
 	for k, n := range m.edited {
 		if n <= since {
 			delete(m.edited, k)
 		}
 	}
+	again := m.remake
+	m.remake = map[key]bool{}
 
 	want := map[key]catalog.View{}
 	for _, v := range defs {
 		want[keyOf(v.Schema, v.Name)] = v
-	}
-	for k, v := range m.views {
-		if _, ok := want[k]; !ok && listed(k) {
-			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(v.Schema, v.Name)); err != nil {
-				return changed, err
-			}
-			delete(m.views, k)
-			changed = true
-		}
-	}
-	for k := range m.failed {
-		if _, ok := want[k]; !ok && listed(k) {
-			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(k.schema, k.name)); err != nil {
-				return changed, err
-			}
-			delete(m.failed, k)
-			changed = true
-		}
 	}
 
 	// Local copies can also go missing, say if an admin drops one; they are
@@ -275,47 +274,85 @@ func (m *Manager) sync(ctx context.Context, checkLocal bool) (changed bool, err 
 	missing := func(k key) bool { return checkLocal && !present[k] }
 
 	// A view can read other views, which must exist locally first. Create
-	// what can be created, and repeat while that makes progress.
+	// what can be created, and repeat while that makes progress. What cannot
+	// be gets a stub, and every sync tries it again; but a view made as
+	// listed already, by a sync that then dropped others (see above), keeps
+	// its copy, to be made again by the next.
 	pending := map[key]catalog.View{}
+	kept := map[key]bool{}
 	for k, v := range want {
 		if !listed(k) {
 			continue
 		}
-		if cur, ok := m.views[k]; !ok || missing(k) || cur.Version != v.Version || cur.SQL != v.SQL {
+		cur, ok := m.views[k]
+		_, failed := m.failed[k]
+		switch {
+		case !ok || failed || missing(k) || cur.Version != v.Version || cur.SQL != v.SQL:
 			pending[k] = v
+		case again[k]:
+			pending[k], kept[k] = v, true
 		}
 	}
+	var made []key
+	var errs []error
 	for len(pending) > 0 {
-		var errs []error
 		why := map[key]error{}
 		progress := false
 		for k, v := range pending {
 			// Let names in v resolve against other pending views too.
 			m.publish(pending)
 			if err := m.createLocal(ctx, m.conn, v); err != nil {
-				errs = append(errs, fmt.Errorf("view %s.%s: %w", v.Schema, v.Name, err))
 				why[k] = err
 				continue
 			}
 			m.views[k] = v
 			delete(m.failed, k)
 			delete(pending, k)
+			made = append(made, k)
 			progress, changed = true, true
 		}
 		if !progress {
 			for k, v := range pending {
+				if kept[k] {
+					m.remake[k] = true
+					continue
+				}
+				errs = append(errs, fmt.Errorf("view %s.%s: %w", v.Schema, v.Name, why[k]))
 				m.stubLocal(ctx, v, why[k])
 				if _, ok := m.failed[k]; !ok {
 					changed = true
 				}
 				m.failed[k] = why[k]
 			}
-			m.publish(nil)
-			return changed, errors.Join(errs...)
+			break
 		}
 	}
-	m.publish(nil)
-	return changed, nil
+
+	dropped := false
+	for k, v := range m.views {
+		if _, ok := want[k]; !ok && listed(k) {
+			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(v.Schema, v.Name)); err != nil {
+				return changed, err
+			}
+			delete(m.views, k)
+			changed, dropped = true, true
+		}
+	}
+	for k := range m.failed {
+		if _, ok := want[k]; !ok && listed(k) {
+			if err := m.exec(ctx, m.conn, "DROP VIEW IF EXISTS "+m.localName(k.schema, k.name)); err != nil {
+				return changed, err
+			}
+			delete(m.failed, k)
+			changed, dropped = true, true
+		}
+	}
+	if dropped {
+		for _, k := range made {
+			m.remake[k] = true
+		}
+	}
+	return changed, errors.Join(errs...)
 }
 
 // edit records that this replica is changing the views keys, whose local

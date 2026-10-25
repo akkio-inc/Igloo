@@ -468,6 +468,103 @@ func TestStatementFindsViewAnotherSyncBrought(t *testing.T) {
 	}
 }
 
+// TestViewReadsAfterAMidSwapList: a replica lists the catalog's views in
+// the middle of another replica's swap of a view, as dbt makes one, so
+// that the list lacks the view and has a new version of a second that
+// reads it. Once the swap is done, a statement on the replica must read
+// the second view. And if a later sync could not make the second view,
+// with the first gone from the catalog and the replica both, the next sync
+// after the swap must make it, though the catalog then has it at the
+// version of the replica's earlier copy, as dbt's new views come to have.
+func TestViewReadsAfterAMidSwapList(t *testing.T) {
+	ctx := context.Background()
+	vc := newViewCatalog(t)
+	r := vc.replica(t)
+	mustExec(t, r.dbt(t), `create schema if not exists "lake"."analytics"`)
+	// The other replica's changes, made in the catalog directly.
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(name, sql string, replace bool) {
+		t.Helper()
+		v := catalog.View{Schema: "analytics", Name: name, SQL: sql, Columns: []catalog.Column{{Name: "run", Type: "INTEGER"}}}
+		if err := cat.PutView(ctx, v, replace); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rename := func(from, to string) {
+		t.Helper()
+		if err := cat.RenameView(ctx, "analytics", from, to); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drop := func(name string) {
+		t.Helper()
+		if err := cat.DropView(ctx, catalog.Ident("analytics", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := r.dbt(t)
+	read := func(when string, want int) {
+		t.Helper()
+		var run int
+		if err := reader.QueryRow(ctx, "SELECT run FROM "+relation("b")).Scan(&run); err != nil || run != want {
+			t.Errorf("%s: read run %d (%v), want %d", when, run, err, want)
+		}
+	}
+	const readsA = "select run from analytics.a"
+	put("a", "select 1 as run", false)
+	put("b", readsA, false)
+	if _, err := r.objects.SyncViews(ctx); err != nil {
+		t.Fatal(err)
+	}
+	read("before the swaps", 1)
+
+	// Listed with a out of the way and b's new version in place, as a list
+	// made over dbt's runs of both can be.
+	put("a__dbt_tmp", "select 2 as run", false)
+	rename("a", "a__dbt_backup")
+	put("b", readsA, true)
+	_, _ = r.objects.PollViews(ctx)
+	rename("a__dbt_tmp", "a")
+	drop("a__dbt_backup")
+	read("after the first swap", 2)
+
+	// Listed once with a out of the way, and once more with b's new version
+	// too, which then reads nothing the replica has.
+	put("a__dbt_tmp", "select 3 as run", false)
+	rename("a", "a__dbt_backup")
+	_, _ = r.objects.PollViews(ctx)
+	// b as the replica last made it.
+	last, _, err := cat.LoadDuckDBView(ctx, "analytics", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put("b", readsA, true)
+	_, _ = r.objects.PollViews(ctx)
+	rename("a__dbt_tmp", "a")
+	drop("a__dbt_backup")
+	// b made anew, up to the version the replica last made.
+	drop("b")
+	put("b", readsA, false)
+	for {
+		v, _, err := cat.LoadDuckDBView(ctx, "analytics", "b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Version > last.Version {
+			t.Fatalf("b is at version %d, past %d", v.Version, last.Version)
+		}
+		if v.Version == last.Version {
+			break
+		}
+		put("b", readsA, true)
+	}
+	_, _ = r.objects.PollViews(ctx)
+	read("after the second swap", 3)
+}
+
 // TestDbtRunsWhileViewsSync runs dbt's statements for a small project over
 // and over, with and without transaction blocks, while the replica polls
 // its views all the time and a second replica, which syncs its own as
