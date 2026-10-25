@@ -569,11 +569,12 @@ SELECT * FROM BY_TABLE UNION ALL SELECT * FROM BY_QUERY`
 	}
 }
 
-// TestReportRecognitionLeavesWhatRunsOnWorkers: a report that runs on
-// workers as written (here forced with distributed_execution = on) stays
-// as written, since the report API's calls run on one machine; with
-// distributed execution off, or in auto mode where one machine is faster,
-// it is recognized.
+// TestReportRecognitionLeavesWhatRunsOnWorkers: reports that run on
+// workers as written (forced with distributed_execution = on) whose calls,
+// counting the tables' values without ID domains, run on workers too are
+// recognized, as they are with distributed execution off and in auto mode;
+// TestReportRecognitionKeepsWhatOnlyRunsOnWorkersAsWritten has a call that
+// cannot.
 func TestReportRecognitionLeavesWhatRunsOnWorkers(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
@@ -592,8 +593,7 @@ func TestReportRecognitionLeavesWhatRunsOnWorkers(t *testing.T) {
 	}
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public'")
-	sql := reportSegmentsSQL
-	run := func(mode string) (rows []string, recognized int, why string) {
+	run := func(sql, mode string) (rows []string, recognized int, why string, workers int) {
 		t.Helper()
 		mustExec(t, conn, "SET distributed_execution = "+mode)
 		mu.Lock()
@@ -612,28 +612,29 @@ func TestReportRecognitionLeavesWhatRunsOnWorkers(t *testing.T) {
 				why = o.Why
 			}
 		}
-		return rows, recognized, why
+		return rows, recognized, why, lastWorkers(t, ds.history, sql)
 	}
-
-	local, n, why := run("off")
-	if n != 4 {
-		t.Fatalf("with distributed execution off, %d CTEs recognized, want 4 (%s)", n, why)
-	}
-	if w := lastWorkers(t, ds.history, sql); w != 0 {
-		t.Errorf("with distributed execution off, ran on %d workers", w)
-	}
-	// Auto mode keeps tables this small on one machine: recognized.
-	if _, n, why := run("auto"); n != 4 {
-		t.Errorf("in auto mode, %d CTEs recognized, want 4 (%s)", n, why)
-	}
-	spread, n, why := run("on")
-	if n != 0 || !strings.Contains(why, "runs on workers") {
-		t.Errorf("run on workers as written: %d CTEs recognized, why %q", n, why)
-	}
-	if w := lastWorkers(t, ds.history, sql); w != 2 {
-		t.Errorf("the statement as written ran on %d workers, want 2", w)
-	}
-	if !slices.Equal(local, spread) {
-		t.Errorf("rows differ:\nrecognized:\n%s\non workers:\n%s", strings.Join(local, "\n"), strings.Join(spread, "\n"))
+	// Without ID domains every call counts the tables' values, and runs on
+	// workers as the statement as written does: recognized in every mode,
+	// and on workers where it is forced to.
+	for _, c := range []struct {
+		name, sql string
+		ctes      int
+	}{{"segments", reportSegmentsSQL, 4}, {"keywords", reportRecognitionCases[2].sql, 1}} {
+		var want []string
+		for _, mode := range []string{"off", "auto", "on"} {
+			rows, n, why, w := run(c.sql, mode)
+			if n != c.ctes {
+				t.Errorf("%s, distributed_execution %s: %d CTEs recognized, want %d (%s)", c.name, mode, n, c.ctes, why)
+			}
+			if wantWorkers := map[string]int{"on": 2}[mode]; w != wantWorkers {
+				t.Errorf("%s, distributed_execution %s: ran on %d workers, want %d", c.name, mode, w, wantWorkers)
+			}
+			if want == nil {
+				want = rows
+			} else if !slices.Equal(rows, want) {
+				t.Errorf("%s, distributed_execution %s: rows differ:\n%s\nwant\n%s", c.name, mode, strings.Join(rows, "\n"), strings.Join(want, "\n"))
+			}
+		}
 	}
 }

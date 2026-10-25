@@ -172,7 +172,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   expressions whose calls count ids or read bitmap indexes are replaced: one
   whose call would count the tables' values, and compute its cohorts again
   besides, stays as written, and so does a statement that would run on
-  workers as written, since the calls run on one machine. A
+  workers as written but not with its calls. A
   session turns recognition off for itself with `SET igloo_report_rewrite =
   off`, and its reads of bitmap indexes with `SET igloo_bitmap_indexes =
   off`.

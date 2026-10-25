@@ -55,8 +55,8 @@ import (
 // distinct.
 //
 // A CTE is replaced only where its call does less than the CTE (see
-// reportCallPays), and a statement that would run on workers as written
-// keeps all its CTEs (see distributedAsWritten).
+// reportCallPays), and a statement that would run on workers as written,
+// but not with its calls, keeps all its CTEs (see distributedAsWritten).
 
 // jnode is a node of DuckDB's parse.
 type jnode = map[string]any
@@ -97,7 +97,7 @@ func (s *Server) recognizeReports(ctx context.Context, sess *session, text strin
 	}
 	out, outcomes, err := recognizeReportText(connReportEnv{ctx: ctx, sess: sess}, text, accept)
 	if err == nil && out != text {
-		if why := s.distributedAsWritten(ctx, sess, text); why != "" {
+		if why := s.distributedAsWritten(ctx, sess, text, out); why != "" {
 			for i := range outcomes {
 				if outcomes[i].Spec != "" {
 					outcomes[i].Spec, outcomes[i].Why = "", why
@@ -143,35 +143,40 @@ func (s *Server) reportCallPays(ctx context.Context, sess *session, text string)
 }
 
 // distributedAsWritten says why a statement whose CTEs recognition would
-// replace stays as written, or "": auto mode (or distributed_execution =
-// on) would run it, as written, on workers, as EXPLAIN DISTRIBUTED says,
-// and the report API's calls run on one machine, which their cohorts'
-// members lists, built on this replica, keep them on. On a large enough
-// table the statement as written finishes on workers where the calls
-// would run out of memory here. It prepares the statement as written to
-// ask, which costs a prepare only where there are workers.
-func (s *Server) distributedAsWritten(ctx context.Context, sess *session, text string) string {
+// replace (making recognized of it) stays as written, or "": auto mode (or
+// distributed_execution = on) would run it as written on workers, as
+// EXPLAIN DISTRIBUTED says, and its recognized form on this replica. Some
+// of the report API's calls run on one machine (those that count
+// distinct_with pairs in bitmaps, for one), and at a scale where workers
+// finish the statement as written, one machine can run out of memory.
+// Asking prepares the statement as written once more, and the recognized
+// form too where the first runs on workers, only where Igloo has workers.
+func (s *Server) distributedAsWritten(ctx context.Context, sess *session, text, recognized string) string {
 	if s.dist == nil || sess.inTx {
 		return ""
 	}
 	user := sess.currentUser()
-	mode := sessionMode(sess, user)
-	if mode == distributed.ModeOff {
+	if sessionMode(sess, user) == distributed.ModeOff {
 		return ""
 	}
-	txFailed := sess.txFailed
-	st, err := s.prepareCheckedText(ctx, sess, user, text, text, nil)
-	sess.txFailed = txFailed
-	if err != nil {
+	// onWorkers prepares form, text as written or recognized, and says
+	// whether it runs on workers, as EXPLAIN DISTRIBUTED says, which
+	// decides as running it would.
+	onWorkers := func(form string) bool {
+		txFailed := sess.txFailed
+		st, err := s.prepareCheckedText(ctx, sess, user, text, form, nil)
+		sess.txFailed = txFailed
+		if err != nil {
+			return false
+		}
+		defer st.close() //nolint:errcheck
+		rows, err := s.explainStatement(ctx, sess, user, st)
+		return err == nil && len(rows) > 0 && rows[0] == [2]string{"runs on", "workers"}
+	}
+	if !onWorkers(text) || onWorkers(recognized) {
 		return ""
 	}
-	defer st.close() //nolint:errcheck
-	// As EXPLAIN DISTRIBUTED says, which decides as running it would.
-	rows, err := s.explainStatement(ctx, sess, user, st)
-	if err != nil || len(rows) == 0 || rows[0] != [2]string{"runs on", "workers"} {
-		return ""
-	}
-	return "as written it runs on workers, where the report API's calls would run on this replica"
+	return "as written it runs on workers, and the report API's calls would run on this replica"
 }
 
 // mayBeReport is a cheap test for text that may have a counting CTE.

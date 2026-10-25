@@ -558,11 +558,12 @@ ids, reads what the expression reads and computes its cohorts again
 besides, where the expressions as written share theirs: it stays as
 written. And a statement that would run on workers as written, as
 `EXPLAIN DISTRIBUTED` says (in auto mode, or with `distributed_execution =
-on`), stays as written whole: the report API's calls run on one machine,
-since the lists of their cohorts' members are built there, and at a scale
-where workers finish the statement one machine can run out of memory.
-Asking prepares the statement as written once more, only where Igloo has
-workers.
+on`), but not with its calls stays as written whole: at a scale where
+workers finish the statement, one machine can run out of memory. Calls
+run on workers where their counts divide among them; one that counts
+`distinct_with` pairs in bitmaps does not. Asking prepares the statement
+as written once more, and with its calls too where the first runs on
+workers, only where Igloo has workers.
 
 Measures that count rows (`count(*)`, sums, averages, the metric) are
 mapped only where a member is once in each cohort, as the API's cohorts
