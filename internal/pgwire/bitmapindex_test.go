@@ -59,13 +59,25 @@ func TestParseIndexCommand(t *testing.T) {
 // indexTest is an ID domain test with bitmap indexes on.
 func newIndexTest(t *testing.T, opts ...func(*Options)) *idTest {
 	t.Helper()
+	needRB(t)
+	return newIndexTestOn(t, newViewCatalog(t), opts...)
+}
+
+// needRB skips a test that needs the rb extension where it is not built,
+// and fails it in CI, which builds it.
+func needRB(t *testing.T) {
+	t.Helper()
 	if os.Getenv("IGLOO_TEST_RB_EXTENSION") == "" {
 		if os.Getenv("CI") != "" {
 			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
 		}
 		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
 	}
-	vc := newViewCatalog(t)
+}
+
+// newIndexTestOn is newIndexTest with a replica of vc.
+func newIndexTestOn(t *testing.T, vc *viewCatalog, opts ...func(*Options)) *idTest {
+	t.Helper()
 	r := vc.replica(t, func(o *Options) {
 		o.IDDomainsOn, o.BitmapIndexes = true, true
 		o.Tasks = tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})

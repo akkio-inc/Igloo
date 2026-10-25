@@ -349,6 +349,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Report API calls whose cohorts come from bitmap indexes run on workers.
+  They join their source to each cohort's members, listed from the bitmap
+  the replica computes first (`unnest(rb_to_list(...))`), and a relation of
+  no table kept them on one machine, which at a hundred times the data runs
+  out of memory where the report's own SQL runs on workers. A subquery or
+  common table expression whose FROM clauses read no table, with tables
+  only in subquery expressions, and no volatile function, is now computed
+  by every task that reads it, beside its share of the divided table: the
+  scan of the call's source is split among the workers, the bitmaps cross
+  as computed values, and the cohorts' checks read their small tables in
+  full. Calls through ids from the cohorts' tables ran on workers already.
 - `EXPLAIN DISTRIBUTED` decides as running the statement does. It planned
   the statement as prepared, where a run prepares it again through ID
   domains' ids and bitmap indexes and counts in roaring bitmaps as set

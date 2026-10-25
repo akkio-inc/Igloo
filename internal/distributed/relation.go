@@ -620,6 +620,113 @@ func (pl *planner) inline(ref node, d *cteDef, ctes cteScope) (bool, error) {
 	return true, nil
 }
 
+// inlineLocal puts in place of ref, a reference to common table
+// expression d, d's query as a subquery, when every task can compute its
+// rows itself (see perTaskQuery), with the common table expressions it reads
+// in place too, as long as those are such queries. However many
+// references read it, none needs a relation: a report's cohorts, listed
+// from the bitmaps the coordinator computes first, are joined by every
+// task to its share of the report's source, which is divided among the
+// workers, rather than keep the statement on one machine for want of a
+// table to divide the cohorts by.
+func (pl *planner) inlineLocal(ref node, d *cteDef) (bool, error) {
+	if child(ref, "sample") != nil || child(ref, "at_clause") != nil || d.first != nil {
+		return false, nil
+	}
+	q, ok, err := pl.expandLocal(d.query(), d.scope, 0)
+	if err != nil || !ok {
+		return false, err
+	}
+	sub, err := pl.cteSubquery(q, ref, d)
+	if err != nil {
+		return false, err
+	}
+	original := clone(ref).(node)
+	pl.undo = append(pl.undo, func() {
+		clear(ref)
+		maps.Copy(ref, original)
+	})
+	clear(ref)
+	maps.Copy(ref, sub)
+	return true, nil
+}
+
+// expandLocal returns a copy of query q, of scope, with the references to
+// common table expressions in its FROM clauses replaced by their queries,
+// recursively, and whether it is then such a query (see perTaskQuery).
+func (pl *planner) expandLocal(q node, scope cteScope, depth int) (node, bool, error) {
+	if depth > maxViewDepth {
+		return nil, false, nil
+	}
+	out := clone(q).(node)
+	ok := true
+	var err error
+	rewrite(out, func(n node) (node, bool) {
+		switch {
+		case !ok || err != nil:
+			return n, true
+		case str(n["class"]) == "SUBQUERY":
+			// A subquery expression's tables every task reads in full.
+			return n, true
+		case str(n["type"]) != "BASE_TABLE":
+			return nil, false
+		}
+		parts := tableParts(n)
+		if len(parts) != 1 {
+			ok = false
+			return n, true
+		}
+		d := scope.find(parts[0])
+		if d == nil || child(n, "sample") != nil || child(n, "at_clause") != nil || d.first != nil {
+			ok = false
+			return n, true
+		}
+		inner, iok, ierr := pl.expandLocal(d.query(), d.scope, depth+1)
+		if ierr != nil || !iok {
+			ok, err = false, ierr
+			return n, true
+		}
+		sub, serr := pl.cteSubquery(inner, n, d)
+		if serr != nil {
+			err = serr
+			return n, true
+		}
+		return sub, true
+	})
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	return out, perTaskQuery(out), nil
+}
+
+// cteSubquery is the subquery that reads query q of common table
+// expression d as reference ref does: under ref's alias, or d's name, with
+// ref's column names, then d's.
+func (pl *planner) cteSubquery(q, ref node, d *cteDef) (node, error) {
+	sub, err := pl.p.fromRef("SELECT * FROM (SELECT 1) AS v")
+	if err != nil {
+		return nil, err
+	}
+	child(sub, "subquery")["node"] = q
+	sub["alias"] = str(ref["alias"])
+	if sub["alias"] == "" {
+		sub["alias"] = d.name
+	}
+	aliases := slices.Clone(list(d.entry, "aliases"))
+	for i, a := range list(ref, "column_name_alias") {
+		if i < len(aliases) {
+			aliases[i] = a
+		} else {
+			aliases = append(aliases, a)
+		}
+	}
+	if aliases == nil {
+		aliases = []any{}
+	}
+	sub["column_name_alias"] = aliases
+	return sub, nil
+}
+
 // opaque says why a SELECT in FROM is not transparent, passing its rows
 // through one by one, or "" if it is.
 func (pl *planner) opaque(sel node) string {

@@ -476,6 +476,23 @@ result's columns must match the prepared statement's, or it falls back.
   SELECT that computed one, from index tables at pinned snapshots; no
   user's statement may name the prefix). Those cross as computed values
   too, one a name, and the coordinator's own part reads the variables.
+- **Rows every task computes.** A subquery in FROM, or a common table
+  expression however many references read it, whose FROM clauses read no
+  table (row functions, `VALUES`, nothing, other such queries and set
+  operations of them), with tables only in subquery expressions, and that
+  calls no volatile function, is computed by every task that reads it,
+  in place, beside its share of a divided table; its subquery
+  expressions' tables every task reads in full, as small tables. A report
+  call answered from bitmap indexes and a scan joins its source to its
+  cohorts so: each cohort's members listed from its bitmap
+  (`unnest(rb_to_list(...))`), computed first, under a check that reads
+  the cohort's table of versions, through a `UNION ALL` of their labels,
+  read by the scan and by the cohorts' sizes. Such a relation had no table
+  for workers to divide, and kept the statement on one machine, which at a
+  hundred times the data runs out of memory on the families of reports
+  that need these calls. Every task builds its join's hash of every
+  member, as it would from a relation read in full; no relation is
+  written, so none has an uncertain size to measure first.
 - **Pinned snapshots.** Such a statement also reads the indexed tables
   themselves at the snapshots their bitmaps are of, `AT (VERSION => n)`,
   and Igloo prepares it again before a run if a table has moved on, so n

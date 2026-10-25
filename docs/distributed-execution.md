@@ -191,7 +191,9 @@ In detail, a part runs distributed when:
   table by a scalar subquery over an index's table, or by a cohort's
   bitmap the session computed first, the coordinator computes that value
   once and workers get it (`computed first` in `EXPLAIN DISTRIBUTED`).
-  Values over 256 MiB keep the statement on one machine.
+  Values over 256 MiB keep the statement on one machine. Cohorts listed
+  from such bitmaps, as a report call answered from bitmap indexes joins
+  its source to, every task lists itself beside its share of the source.
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,

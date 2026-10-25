@@ -1012,6 +1012,13 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		parts := tableParts(ref)
 		if len(parts) == 1 {
 			if d := ctes.find(parts[0]); d != nil {
+				// One every task computes itself, in place of its name.
+				if ok, err := pl.inlineLocal(ref, d); err != nil || ok {
+					if err != nil {
+						return err
+					}
+					return pl.from(ref, splittable, ctes, sc, rd)
+				}
 				ok, err := pl.inline(ref, d, ctes)
 				if err != nil {
 					return err
@@ -1125,6 +1132,16 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 			renameColumns(item, list(ref, "column_name_alias"))
 			sc.items = append(sc.items, item)
 			return nil
+		}
+		if perTaskQuery(sub) && !pl.forced[identity(ref)] {
+			// It reads tables only in subquery expressions, which every task
+			// reads in full: each task computes its rows itself.
+			if str(sub["type"]) == "SELECT_NODE" && !hasClass(sub["select_list"], "STAR") {
+				item.columns = outputColumns(sub, &scope{})
+			}
+			renameColumns(item, list(ref, "column_name_alias"))
+			sc.items = append(sc.items, item)
+			return pl.filterSubqueries(sub, ctes, rd)
 		}
 		if str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" || pl.forced[identity(ref)] {
 			// A relation workers compute.
@@ -1372,6 +1389,49 @@ func rowQuery(n node) bool {
 		// workers unplanned.
 		return ok
 	})
+	return ok
+}
+
+// perTaskQuery reports whether query node n computes its rows from nothing
+// a task divides: its FROM clauses hold what a rowQuery's may (row
+// functions, VALUES, nothing, other such queries and set operations of
+// them), with tables only in subquery expressions, which every task reads
+// in full; it calls no volatile function and defines no common table
+// expression of its own. Every task can compute its rows itself, as each
+// computes a rowQuery's, and reads them beside its share of a divided
+// table, as it would a small table read in full: a report's cohort, its
+// members listed from a bitmap the coordinator computed first (see
+// computedValues), under a check that reads a small table.
+func perTaskQuery(n node) bool {
+	ok := true
+	var visit func(v any, inExpr bool)
+	visit = func(v any, inExpr bool) {
+		switch m := v.(type) {
+		case node:
+			t := str(m["type"])
+			switch {
+			case !ok:
+				return
+			case !inExpr && (t == "BASE_TABLE" || t == "PIVOT" || t == "SHOW_REF" || t == "COLUMN_DATA"):
+				ok = false
+			case !inExpr && t == "TABLE_FUNCTION" && rowFunction(m) != nil:
+				ok = false
+			case str(m["class"]) == "FUNCTION" && volatileFunctions[strings.ToLower(str(m["function_name"]))]:
+				ok = false
+			case len(list(child(m, "cte_map"), "map")) > 0:
+				ok = false
+			}
+			in := inExpr || str(m["class"]) == "SUBQUERY"
+			for _, c := range m {
+				visit(c, in)
+			}
+		case []any:
+			for _, c := range m {
+				visit(c, inExpr)
+			}
+		}
+	}
+	visit(n, false)
 	return ok
 }
 
