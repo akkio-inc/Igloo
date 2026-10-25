@@ -112,10 +112,12 @@ func TestReportCallsOnWorkers(t *testing.T) {
 	}
 	onWorkers("cohorts from their bitmaps", "index+scan", plays(seconds))
 	// Pairs of days in bitmaps a day, which workers' partial bitmaps
-	// combine into.
-	srv.splitPairs = true
+	// combine into, as they fit the workers' memory.
 	onWorkers("cohorts from their bitmaps, with pairs of days", "index+scan", plays(seconds, days))
-	srv.splitPairs = false
+	if explained := strings.Join(texts(t, conn, "EXPLAIN DISTRIBUTED "+call(plays(seconds, days))), "\n"); !strings.Contains(explained, "rb_agg(") ||
+		strings.Contains(explained, "rb_count_distinct(") {
+		t.Errorf("pairs of days that fit workers, not as workers split them:\n%s", explained)
+	}
 	// Through ids, the cohorts from their tables.
 	mustExec(t, conn, "SET igloo_bitmap_indexes = off")
 	onWorkers("cohorts from their tables", "scan", plays(seconds))
@@ -125,9 +127,11 @@ func TestReportCallsOnWorkers(t *testing.T) {
 // TestReportRecognitionKeepsWhatOnlyRunsOnWorkersAsWritten: with
 // distributed_execution = on, a report that runs on workers as written but
 // whose recognized call would run on this replica (one that counts active
-// days, distinct_with pairs, which rb_count_distinct counts and the planner
-// cannot divide) stays as written, and runs on workers; one whose call runs
-// on workers too is recognized. With distributed execution off, both are.
+// days, distinct_with pairs, in rb_count_distinct, which the planner cannot
+// divide, as it does where their bitmaps would not fit workers) stays as
+// written, and runs on workers; one whose call runs on workers too is
+// recognized, as is one that counts them where they fit workers, as
+// workers split them. With distributed execution off, all are.
 func TestReportRecognitionKeepsWhatOnlyRunsOnWorkersAsWritten(t *testing.T) {
 	t.Parallel()
 	history := audit.NewMemoryStore(1000, 1000)
@@ -181,8 +185,10 @@ SELECT * FROM GENRES ORDER BY genre`
 	}
 	for _, c := range []struct {
 		name, sql string
+		unsplit   bool // its pairs taken not to fit workers
 		keep      bool // as written on workers, recognized on this replica
-	}{{"active days", days, true}, {"people", people, false}} {
+	}{{"active days, not fitting workers", days, true, true}, {"active days", days, false, false}, {"people", people, false, false}} {
+		srv.unsplitPairs = c.unsplit
 		local, n, why, w := run(c.sql, "off")
 		if n != 1 || w != 0 {
 			t.Errorf("%s, distributed execution off: %d CTEs recognized (%s), on %d workers; want 1, on none", c.name, n, why, w)
@@ -201,4 +207,5 @@ SELECT * FROM GENRES ORDER BY genre`
 			t.Errorf("%s: rows on workers\n%q\non one machine\n%q", c.name, spread, local)
 		}
 	}
+	srv.unsplitPairs = false
 }

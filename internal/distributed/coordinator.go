@@ -271,6 +271,20 @@ func (co *Coordinator) Table(ctx context.Context, schema, name string) (*Table, 
 // Metrics returns the coordinator's metrics, which may be nil.
 func (co *Coordinator) Metrics() *Metrics { return co.opts.Metrics }
 
+// WorkerMemory returns how many workers a statement would run on and the
+// smallest memory limit among them, zero if unknown: those running, or,
+// when none are and Compute may start some, as many as it may start, with
+// the memory those that ran last had (as plan takes them).
+func (co *Coordinator) WorkerMemory(ctx context.Context) (workers int, memory int64) {
+	if ws := co.pool.known(ctx); len(ws) > 0 {
+		return len(ws), smallestMemory(ws)
+	}
+	if co.pool.canStart() {
+		return co.opts.Pool.MaxWorkers, co.pool.lastMemory()
+	}
+	return 0, 0
+}
+
 // Workers returns the number of workers that answered the last check.
 func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.ready(ctx)) }
 

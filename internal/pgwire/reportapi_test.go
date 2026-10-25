@@ -403,6 +403,42 @@ func TestReportAPICheck(t *testing.T) {
 	}
 }
 
+// TestReportPairsFitWorkers checks the estimate of the bitmaps of pairs a
+// worker keeps against what synthetic media and browsing data measured:
+// media signals at 10x (361M rows) ran three workers of 8 GB out of
+// memory; at 1x (36M rows) they fit, as browsing does at 1x (14M rows) and
+// not at 10x (140M rows), where one machine kept 7.3 GiB of them.
+func TestReportPairsFitWorkers(t *testing.T) {
+	t.Parallel()
+	two := []reportCohort{{Label: "AUDIENCE"}, {Label: "POPULATION"}}
+	constant := "ANY"
+	media := &reportSpec{Cohorts: two, Dimensions: []reportDim{{Column: "genre"}, {Column: "title"}, {Column: "network"},
+		{Column: "app"}, {Column: "device"}, {Column: "live"}, {Constant: &constant}}}
+	browsing := &reportSpec{Cohorts: two, Dimensions: []reportDim{{Elements: "categories"}, {Elements: "keywords"}, {Elements: "domains"},
+		{Constant: &constant}}}
+	const workerMemory = 8 << 30
+	for _, c := range []struct {
+		what string
+		spec *reportSpec
+		rows int64
+		fits bool
+	}{
+		{"media at 10x", media, 361_362_981, false},
+		{"media at 1x", media, 36_143_645, true},
+		{"browsing at 10x", browsing, 139_695_285, false},
+		{"browsing at 1x", browsing, 13_977_974, true},
+	} {
+		b := c.spec.pairBytesAWorker(c.rows, 3)
+		if fits := b <= pairsShare*workerMemory; fits != c.fits {
+			t.Errorf("%s: %.1f GiB a worker, fits %v, want %v", c.what, b/(1<<30), fits, c.fits)
+		}
+	}
+	// A dozen such workers count browsing at 10x.
+	if b := browsing.pairBytesAWorker(139_695_285, 12); b > pairsShare*workerMemory {
+		t.Errorf("browsing at 10x on 12 workers: %.1f GiB a worker", b/(1<<30))
+	}
+}
+
 // TestReportAPIThroughIDs counts through ID domains' ids where the tables
 // allow, with the rows the values give, and by value elsewhere.
 func TestReportAPIThroughIDs(t *testing.T) {
@@ -419,7 +455,9 @@ func TestReportAPIThroughIDs(t *testing.T) {
 		"CREATE VIEW lake.public.v_attributes (person_id, household_id, survey_resp_id) AS SELECT s.*, sv.resp_id FROM lake.public.attributes AS s LEFT JOIN lake.public.survey AS sv ON CAST(s.household_id AS BIGINT) = sv.resp_id",
 		"CREATE VIEW lake.public.v_segments AS SELECT person_id, segment_name FROM lake.public.segments",
 		// Daily rows of list elements, a site and minutes.
-		"CREATE TABLE lake.public.visits AS SELECT 'p' || (i % 90) AS person_id, DATE '2026-03-01' + CAST(i % 13 AS INTEGER) AS day, "+
+		// One member's days are all NULL: a member whose pairs count none.
+		"CREATE TABLE lake.public.visits AS SELECT 'p' || (i % 90) AS person_id, "+
+			"CASE WHEN i % 90 = 7 THEN NULL ELSE DATE '2026-03-01' + CAST(i % 13 AS INTEGER) END AS day, "+
 			"CASE i % 4 WHEN 0 THEN ['cars', 'news'] WHEN 1 THEN ['news', 'news'] WHEN 2 THEN NULL ELSE ['', 'cars'] END AS tags, "+
 			"CASE WHEN i % 5 = 0 THEN NULL ELSE 'site' || (i % 6) END AS site, CAST(i % 17 AS INTEGER) AS minutes FROM range(1200) r(i)",
 	)

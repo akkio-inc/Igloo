@@ -44,9 +44,10 @@ type reportIDs struct {
 
 // reportIDTable is a member table read through its column of ids.
 type reportIDTable struct {
-	from   string // quoted, catalog.schema.table
-	hidden string // the quoted column of ids
-	at     int64
+	from         string // quoted, catalog.schema.table
+	schema, name string
+	hidden       string // the quoted column of ids
+	at           int64
 }
 
 // reportIDs returns how spec's call reads its tables through ids, or nil
@@ -148,7 +149,8 @@ func (s *Server) reportIDsNow(ctx context.Context, sess *session, spec *reportSp
 			pins = append(pins, idPin{schema: o.schema, table: o.name, column: m.Column, snapshot: snap, complete: ok})
 			snapshot, complete = snap, complete && ok
 		}
-		return reportIDTable{from: quoteName([]string{o.db, o.schema, o.name}), hidden: quoteIdent(iddomain.HiddenColumn(m.Column)), at: snapshot}, true
+		return reportIDTable{from: quoteName([]string{o.db, o.schema, o.name}), schema: o.schema, name: o.name,
+			hidden: quoteIdent(iddomain.HiddenColumn(m.Column)), at: snapshot}, true
 	}
 	ids := &reportIDs{}
 	for _, c := range spec.Cohorts {

@@ -14,6 +14,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -189,7 +190,8 @@ func (s *Server) reportStatement(ctx context.Context, sess *session, spec *repor
 	}
 	ids, read := s.reportIDs(ctx, sess, spec)
 	if ids != nil {
-		ids.pairs, ids.split = s.pairBitmaps(ctx, sess, spec, ids.source), s.splitPairs
+		ids.pairs = s.pairBitmaps(ctx, sess, spec, ids.source)
+		ids.split = s.splitPairs || s.pairsFitWorkers(ctx, sess, spec, ids.source, ids.pairs)
 	}
 	if s.preferHybrid {
 		ids = nil
@@ -311,13 +313,76 @@ func (s *Server) reportPlannedPath(ctx context.Context, sess *session, spec *rep
 	return "scan"
 }
 
-// (Pair counts are written as workers split them (bitmapPairCounts) only
-// for tests, splitPairs, for now. The planner splits that form, but its
-// workers keep a bitmap for each (value, cohort, day) of their share: on
-// three workers of 8 GB, media signals at 10x (361M rows, 6,500 titles,
-// a month of days) ran them out of memory, where one machine counts it in
-// rb_count_distinct in about 105 s; and auto mode, from its estimates,
-// chose the workers.)
+// pairsFitWorkers reports whether a call's distinct_with pairs, counted in
+// roaring bitmaps (pairs, of the source src), are written as workers split
+// them (see bitmapPairCounts): where Igloo has workers and the session may
+// run statements on them, and by an estimate of the bitmaps a worker
+// keeps, they fit in its memory. Each worker keeps a bitmap for each
+// (value, cohort, day) of its share of the rows, its share of the source's
+// entries (a row for each value it has, for each cohort, see pairBytes):
+// on three workers of 8 GB, media signals at 10x (361M rows, 6,500 titles,
+// a month of days) ran them out of memory, where one machine counts the
+// pairs in rb_count_distinct, which the planner keeps on one machine. Where
+// they do not fit, or nothing says, the call counts them so.
+func (s *Server) pairsFitWorkers(ctx context.Context, sess *session, spec *reportSpec, src reportIDTable, pairs map[int]bool) bool {
+	n := 0
+	for i, m := range spec.Metrics {
+		if m.DistinctWith != "" {
+			n++
+			if !pairs[i] {
+				return false
+			}
+		}
+	}
+	if n != 1 || s.unsplitPairs || s.dist == nil || sess == nil || sess.inTx || src.name == "" ||
+		sessionMode(sess, sess.currentUser()) == distributed.ModeOff {
+		return false
+	}
+	workers, memory := s.dist.WorkerMemory(ctx)
+	if workers == 0 || memory == 0 {
+		return false
+	}
+	t, err := s.dist.Table(ctx, src.schema, src.name)
+	if err != nil || t == nil || t.Rows == 0 {
+		return false
+	}
+	perWorker := spec.pairBytesAWorker(t.Rows, workers)
+	fits := perWorker <= pairsShare*float64(memory)
+	s.log.Debug("report call's pairs are counted as their bitmaps fit workers", "split", fits, "rows", t.Rows,
+		"workers", workers, "worker_memory", memory, "bytes_a_worker", int64(perWorker))
+	return fits
+}
+
+// pairBytesAWorker estimates the bytes of the bitmaps of pairs each of
+// workers keeps, counting them split (see pairsFitWorkers), of a source of
+// rows.
+func (spec *reportSpec) pairBytesAWorker(rows int64, workers int) float64 {
+	entries := 1.0 // the entry that counts in no value
+	for _, d := range spec.Dimensions {
+		if d.Elements != "" {
+			entries += listElements
+		} else {
+			entries++
+		}
+	}
+	return float64(rows) * entries * float64(max(len(spec.Cohorts), 1)) * pairBytes / float64(max(workers, 1))
+}
+
+// pairBytes is what an entry of the source's rows takes in a worker's
+// bitmaps of pairs: rb_count_distinct on one machine, which keeps the same
+// bitmaps, took 7 to 11 bytes an entry for the distinct days of synthetic
+// browsing data like an agency's (14M and 140M rows, lists of 1 to 2.2
+// elements, two cohorts), at 1.2 and 7.3 GiB. A row has an entry for each
+// value it has of each dimension (listElements of a list's), and one that
+// counts in no value, for each cohort, all of which pairsFitWorkers takes
+// its member to be in. pairsShare is the share of a worker's memory the
+// bitmaps may take: its DuckDB holds the scan's and the other aggregates'
+// data besides.
+const (
+	pairBytes    = 12
+	listElements = 4
+	pairsShare   = 0.5
+)
 
 // pairBitmaps returns the distinct_with metrics of spec whose pairs roaring
 // bitmaps count, where the member is an ID domain's id: those whose column
@@ -1206,9 +1271,12 @@ func (s *reportSpec) bitmapPairCounts(b *strings.Builder, people bool, d int, me
 	outer := "CAST(sum(r) AS BIGINT) AS \"rows\", sum(ms) AS metric_sum, CASE WHEN bool_or(hm) THEN CAST(sum(mc) AS BIGINT) END AS metric_count, " +
 		"CASE WHEN sum(mc) > 0 THEN sum(ms) / sum(mc) END AS metric_avg"
 	if people {
-		fine += ", rb_agg(CASE WHEN keep THEN member END) AS pm"
+		// The people: the members of the pairs' bitmaps, and of one of the
+		// members whose day is NULL, which most often holds none, rather
+		// than one of them all again.
+		fine += ", rb_agg(CASE WHEN keep AND " + g + " IS NULL THEN member END) AS pm"
 		sets += ", rb_or_agg(pm) AS pm"
-		outer = "rb_cardinality(rb_or_agg(pm)) AS people, " + outer
+		outer = "rb_or_cardinality(rb_or_agg(bm), rb_or_agg(pm)) AS people, " + outer
 	}
 	for i, m := range s.Metrics {
 		gi := "g" + strconv.Itoa(i)

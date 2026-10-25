@@ -396,7 +396,13 @@ for each value of `C` (`rb_count_distinct(id, key)`); otherwise the rows are
 grouped by the pair first, which makes each pair one row, and then counted.
 Either takes far less memory than DuckDB's `count(DISTINCT (a, b))` on a
 large table. If the bitmaps do not fit in memory, the call runs again
-without them.
+without them. `rb_count_distinct` runs on one machine. Where Igloo has
+workers that the session may run statements on, and a call has one such
+metric whose bitmaps, by an estimate, fit in half a worker's memory, the
+bitmaps are written in steps the workers split instead: a bitmap of members
+for each value, cohort and `C`, then combined (the estimate takes about 12
+bytes for each value a row has, four for a list, in each cohort, divided
+among the workers).
 
 **Totals and extent.** `"totals": true` adds, for each dimension and cohort,
 a row with `is_total` true and `value` NULL counting across the dimension's
@@ -561,7 +567,8 @@ written. And a statement that would run on workers as written, as
 on`), but not with its calls stays as written whole: at a scale where
 workers finish the statement, one machine can run out of memory. Calls
 run on workers where their counts divide among them; one that counts
-`distinct_with` pairs in bitmaps does not. Asking prepares the statement
+`distinct_with` pairs in bitmaps does only where they fit workers' memory
+(see the metrics above). Asking prepares the statement
 as written once more, and with its calls too where the first runs on
 workers, only where Igloo has workers.
 

@@ -349,8 +349,8 @@ func (s *Server) planIndexesNow(ctx context.Context, sess *session, spec *report
 		return nil
 	}
 	plan.hybrid = true
-	plan.source = reportIDTable{from: quoteName([]string{base.db, base.schema, base.name}), hidden: quoteIdent(iddomain.HiddenColumn(m.Column)),
-		at: plan.dims[0].snapshot}
+	plan.source = reportIDTable{from: quoteName([]string{base.db, base.schema, base.name}), schema: base.schema, name: base.name,
+		hidden: quoteIdent(iddomain.HiddenColumn(m.Column)), at: plan.dims[0].snapshot}
 	return plan
 }
 
