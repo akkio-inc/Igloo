@@ -1,10 +1,11 @@
 // Package crashtest crashes a thread that Go does not run, as a crash on one
-// of DuckDB's worker threads would. Only tests use it (cgo is not allowed in
-// test files).
+// of DuckDB's worker threads would, or throws a C++ exception there that
+// nothing catches. Only tests use it (cgo is not allowed in test files).
 package crashtest
 
 /*
 #cgo linux LDFLAGS: -lpthread
+#cgo CXXFLAGS: -std=c++17
 #include <pthread.h>
 #include <stddef.h>
 
@@ -19,9 +20,15 @@ static void crash_foreign_thread(void) {
 		pthread_detach(t);
 	}
 }
+
+void igloo_throw_foreign_thread(void);
 */
 import "C"
 
 // CrashForeignThread starts a thread outside Go that writes through a nil
 // pointer.
 func CrashForeignThread() { C.crash_foreign_thread() }
+
+// ThrowForeignThread starts a C++ thread outside Go that throws an
+// exception nothing catches, as one escaping a DuckDB worker would.
+func ThrowForeignThread() { C.igloo_throw_foreign_thread() }

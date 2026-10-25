@@ -170,8 +170,10 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 		local: local, fetchRoot: filepath.Clean(fetchRoot), stopSweep: make(chan struct{}),
 		peers: &http.Client{
 			Transport: &http.Transport{TLSClientConfig: t.client.Clone(), MaxIdleConnsPerHost: fetchesPerTask, IdleConnTimeout: time.Minute,
-				// A worker answers at once, if only that it is busy.
-				ResponseHeaderTimeout: stallTimeout},
+				// A worker answers at once, if only that it is busy; one that
+				// answers nothing, its kernel accepting the connection, loses
+				// the file at the handshake.
+				ResponseHeaderTimeout: stallTimeout, TLSHandshakeTimeout: 10 * time.Second},
 			// A peer answers with the file or not at all.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},

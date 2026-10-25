@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -46,6 +47,99 @@ func TestWorkerDiesMidTask(t *testing.T) {
 	if killed.Load() == 0 {
 		t.Fatal("the failing worker got no task")
 	}
+}
+
+// A worker that stops answering in the middle of a task, its connections
+// open and its kernel taking what is sent, but nothing served, as one whose
+// Go threads all wait: the coordinator finds it hung by its status, runs
+// its tasks on the others, and the result is complete.
+func TestWorkerHangsMidTask(t *testing.T) {
+	defer func(every, timeout time.Duration) { taskCheckEvery, taskCheckTimeout = every, timeout }(taskCheckEvery, taskCheckTimeout)
+	taskCheckEvery, taskCheckTimeout = 50*time.Millisecond, 200*time.Millisecond
+	h := newHarness(t, 0.02, 6, 3)
+	f := &freezer{thaw: make(chan struct{})}
+	h.wrap = func(i int, ln net.Listener) net.Listener {
+		if i != 1 {
+			return ln
+		}
+		f.Listener = ln
+		return f
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.workers[1].Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.startWorker(1)
+	// Before the worker's own cleanup, which waits for its tasks.
+	t.Cleanup(func() { close(f.thaw) })
+	var hung atomic.Int32
+	h.workers[1].beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
+		hung.Add(1)
+		f.frozen.Store(true)
+		select {
+		case <-r.Context().Done():
+		case <-f.thaw:
+		}
+		return false
+	}
+	var retried atomic.Int32
+	hook := func(r slog.Record) {
+		if strings.Contains(r.Message, "stopped answering while it ran a task") {
+			retried.Add(1)
+		}
+	}
+	h.hook.Store(&hook)
+	start := time.Now()
+	if !h.check(failureQuery) {
+		t.Fatal("did not run distributed")
+	}
+	if hung.Load() == 0 || retried.Load() == 0 {
+		t.Fatalf("the hung worker got %d tasks, and was found hung %d times", hung.Load(), retried.Load())
+	}
+	if took := time.Since(start); took > time.Minute {
+		t.Errorf("the statement took %s", took)
+	}
+}
+
+// freezer is a listener whose connections stop being served once frozen,
+// until thaw: what arrives is taken but answered by nothing, and new
+// connections are accepted, as by the kernel of a process none of whose
+// threads run.
+type freezer struct {
+	net.Listener
+	frozen atomic.Bool
+	thaw   chan struct{}
+}
+
+func (f *freezer) Accept() (net.Conn, error) {
+	c, err := f.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &frozenConn{Conn: c, f: f}, nil
+}
+
+type frozenConn struct {
+	net.Conn
+	f *freezer
+}
+
+func (c *frozenConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if c.f.frozen.Load() {
+		<-c.f.thaw
+		return 0, net.ErrClosed
+	}
+	return n, err
+}
+
+func (c *frozenConn) Write(b []byte) (int, error) {
+	if c.f.frozen.Load() {
+		<-c.f.thaw
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Write(b)
 }
 
 // A worker whose address no longer answers is skipped.

@@ -54,6 +54,8 @@ type harness struct {
 	hook atomic.Pointer[func(slog.Record)]
 	// rb, if set, is the rb extension the session and workers load.
 	rb string
+	// wrap, if set, wraps the listener of each worker startWorker starts.
+	wrap func(i int, ln net.Listener) net.Listener
 }
 
 // hookHandler passes records to the harness's hook, and on to its handler.
@@ -434,6 +436,9 @@ func (h *harness) startWorker(i int) {
 		h.lns[i], h.workers[i] = ln, w
 	} else {
 		h.lns, h.workers = append(h.lns, ln), append(h.workers, w)
+	}
+	if h.wrap != nil {
+		ln = h.wrap(i, ln)
 	}
 	go w.Serve(ln) //nolint:errcheck
 	h.t.Cleanup(func() {

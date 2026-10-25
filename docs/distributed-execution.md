@@ -377,8 +377,9 @@ table at another snapshot; other views read as their queries there too,
 at the workers' snapshots. Tables may share files, as clones do: workers
 read the files the metadata lists, wherever they lie in the warehouse.
 
-If a worker cannot be reached or stops in the middle of a statement, its
-share runs on another worker, and the failed worker is left out for 30
+If a worker cannot be reached, stops in the middle of a statement or stops
+answering its status (three checks 10 seconds apart) while it runs a task,
+its share runs on another worker, and the failed worker is left out for 30
 seconds. A worker that answers a task with an error ran it and is healthy:
 the statement then runs on the coordinator at once, without trying other
 workers or leaving any out. Object storage turning requests away for now
@@ -690,7 +691,11 @@ least 32 random characters.
 
 ### Virtual machines
 
-Run `igloo worker` on each machine and list them in `IGLOO_WORKERS`. To
+Run `igloo worker` on each machine, under a supervisor that starts it again
+when it exits (systemd's `Restart=always`, or `docker run --restart
+unless-stopped`), and list them in `IGLOO_WORKERS`. A worker exits rather
+than hang when DuckDB crashes or a C++ exception escapes it; the Compose
+file and the Helm chart restart workers that exit. To
 start and stop them on demand, set `IGLOO_WORKER_COMPUTE` to `ec2` with the
 instances' IDs, or to `command` with commands that start and stop them all
 (an instance group, for example), as for the [scale-to-zero

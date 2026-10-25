@@ -6,7 +6,14 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"syscall"
+
+	"github.com/akkio-inc/igloo/internal/engine/terminate"
 )
+
+// A C++ exception that escapes DuckDB or an extension ends every process
+// that runs DuckDB, server and worker, at once with status 134 (see package
+// terminate), from before anything opens a database.
+func init() { terminate.Install() }
 
 // crashSignals are the signals a crash in native code raises.
 var crashSignals = []os.Signal{syscall.SIGSEGV, syscall.SIGBUS, syscall.SIGFPE, syscall.SIGILL}

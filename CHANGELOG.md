@@ -348,6 +348,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- A worker that hangs no longer hangs its statements, and a C++ exception
+  that escapes DuckDB no longer hangs a worker. Two workers whose memory ran
+  out hit "terminate called after throwing an instance of
+  'duckdb::OutOfMemoryException'": C++ aborted, Go's signal handler took
+  the abort on one of DuckDB's threads, and the process neither exited nor
+  went on, for over half an hour, while Docker restarted nothing and the
+  coordinator waited on the tasks they held. Every Igloo process now ends
+  at once with status 134, after one line naming the exception's type, when
+  an exception escapes DuckDB or an extension, so that Docker or Kubernetes
+  restarts it. The coordinator asks a worker running one of its tasks for
+  its status every 10 seconds, and takes one that misses three answers in a
+  row for unreachable, running its task on another worker, which the
+  statement's other tasks then go to first; workers' connections to the
+  coordinator and to each other give up a TLS handshake after 10 seconds.
 - Queries larger than one machine: a statement whose largest table would
   take a replica more than a few seconds to scan runs in parts on worker
   machines (`igloo worker`). Each worker reads a share of the table's data

@@ -120,6 +120,9 @@ func newPool(opts PoolOptions, t *transport, version string, metrics *Metrics, l
 			DialContext: (&net.Dialer{Timeout: 5 * time.Second, KeepAliveConfig: net.KeepAliveConfig{
 				Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 3,
 			}}).DialContext,
+			// Its kernel accepts the connection of a worker that answers
+			// nothing (see watchTask); the handshake would wait for good.
+			TLSHandshakeTimeout: 10 * time.Second,
 		}},
 		down:      map[string]time.Time{},
 		startTook: 30 * time.Second,
@@ -163,6 +166,14 @@ func (p *pool) usable(ws []*worker) []*worker {
 		out = append(out, w)
 	}
 	return out
+}
+
+// isDown reports whether a worker failed a task lately (see markDown).
+func (p *pool) isDown(addr string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	until, ok := p.down[addr]
+	return ok && time.Now().Before(until)
 }
 
 // markDown keeps a worker out of new tasks for a while after it failed one.

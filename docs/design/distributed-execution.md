@@ -546,8 +546,15 @@ result's columns must match the prepared statement's, or it falls back.
 
 - A task whose worker cannot be reached, breaks off its answer or fails as
   a server (HTTP 5xx) runs on another worker, up to three tries, and the
-  worker is left out for 30 seconds. TCP keepalives detect a worker whose
-  machine vanished within about 25 seconds.
+  worker is left out for 30 seconds; the statement's other tasks pass it
+  over meanwhile while other workers remain. TCP keepalives detect a worker
+  whose machine vanished within about 25 seconds. A worker whose process
+  lives on but answers nothing keeps its connections open, its kernel
+  answering keepalives, so the coordinator also asks a worker running one of
+  its tasks for its status every 10 seconds, 5 seconds for each answer, and
+  takes one that misses three in a row for unreachable: its task runs on
+  another worker. Two workers whose C++ runtime aborted after they ran out
+  of memory had held their statements for over half an hour that way.
 - A worker that answers a task with an error (out of memory, a binder
   error) ran it and is healthy, and another would answer the same: the
   statement runs on the coordinator at once, and no worker is left out, so
