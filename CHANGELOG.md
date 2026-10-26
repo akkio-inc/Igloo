@@ -1584,6 +1584,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A view created in Snowflake's dialect whose translation calls Igloo's
+  macros for Snowflake's functions (`DATEADD`, `DATE_TRUNC`, conversions
+  to text) loads on a replica that starts after it was made, and after a
+  restart, instead of failing every read with "Scalar Function with name
+  sf_... does not exist": the connection that makes the local copies of
+  views has the macros too.
 - `CREATE TABLE ... AS` of an aggregate too large for memory runs in passes
   over its groups when the statement calls `error()`, as Snowflake's
   dialect does to refuse `ARRAY_FLATTEN` of what is not an array of

@@ -469,6 +469,25 @@ func TestStatementFindsViewAnotherSyncBrought(t *testing.T) {
 	}
 }
 
+// TestSnowflakeViewOnALaterReplica: a view created in Snowflake's dialect
+// keeps its DuckDB translation, which calls the dialect's macros; a
+// replica that starts after it was made loads it with them, as its
+// sessions have them.
+func TestSnowflakeViewOnALaterReplica(t *testing.T) {
+	vc := newViewCatalog(t)
+	sf := vc.replica(t).admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	mustExec(t, sf, "CREATE SCHEMA IF NOT EXISTS lake.public")
+	mustExec(t, sf, "CREATE TABLE lake.public.visits AS SELECT 7 AS id, '2024-01-31'::date AS d")
+	mustExec(t, sf, "CREATE VIEW lake.public.v_visits AS SELECT DATEADD(month, 1, d) AS next_month, DATE_TRUNC('week', d) AS week FROM lake.public.visits")
+	later := vc.replica(t).admin(t, pgx.QueryExecModeSimpleProtocol)
+	var next, week string
+	if err := later.QueryRow(context.Background(), "SELECT next_month::VARCHAR, week::VARCHAR FROM lake.public.v_visits").Scan(&next, &week); err != nil ||
+		next != "2024-02-29" || week != "2024-01-29" {
+		t.Errorf("read %q %q (%v), want 2024-02-29 2024-01-29", next, week, err)
+	}
+}
+
 // TestViewReadsAfterAMidSwapList: a replica's sync lists the catalog's
 // views in the middle of another replica's swap of a view, as dbt makes
 // one, so that it can make neither that view nor a new version of a second

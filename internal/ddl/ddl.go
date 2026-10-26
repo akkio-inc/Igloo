@@ -33,6 +33,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 const (
@@ -113,6 +114,14 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 	conn, err := eng.Connect(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// Igloo's macros for Snowflake's functions, which the views created in
+	// that dialect call, as every session has them: without them the local
+	// copies of those views could not be made.
+	for _, stmt := range snowflake.Macros() {
+		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+			return nil, errors.Join(fmt.Errorf("define Snowflake's functions: %w", err), conn.Close())
+		}
 	}
 	m := &Manager{cat: cat, eng: eng, conn: conn, views: map[key]catalog.View{}, edited: map[key]uint64{},
 		failed: map[key]error{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
