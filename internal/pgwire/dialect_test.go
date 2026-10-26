@@ -550,6 +550,37 @@ func TestSnowflakeDialectViewInAnySession(t *testing.T) {
 	}
 }
 
+// Snowflake refuses a view whose column list names fewer or more columns
+// than its query returns, as dbt's models with column comments do once
+// their table has gained columns; DuckDB's dialect, like PostgreSQL, names
+// the first ones.
+func TestSnowflakeViewColumnList(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	ctx := context.Background()
+	sf := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	mustExec(t, sf, "CREATE TABLE wide AS SELECT 1 AS a, 2 AS b, 3 AS c")
+	mustExec(t, sf, `CREATE OR REPLACE VIEW v_wide ("A" COMMENT $$first$$, "B", "C") AS (SELECT * FROM wide)`)
+	for q, msg := range map[string]string{
+		`CREATE OR REPLACE VIEW v_wide ("A" COMMENT $$$$, "B") AS (SELECT * FROM wide)`: "the view names 2 columns, and its query returns 3",
+		`CREATE VIEW v_more (a, b, c, d) AS SELECT * FROM wide`:                         "",
+	} {
+		_, err := sf.Exec(ctx, q)
+		if err == nil || !strings.Contains(err.Error(), msg) {
+			t.Errorf("%s: %v, want an error with %q", q, err, msg)
+		}
+	}
+	duck := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	if n := count(t, duck, "SELECT count(*) FROM (DESCRIBE v_wide)"); n != 3 {
+		t.Errorf("the refused replace left v_wide with %d columns, want 3", n)
+	}
+	mustExec(t, duck, "CREATE VIEW v_first (x) AS SELECT * FROM wide")
+	if n := count(t, duck, "SELECT count(*) FROM (DESCRIBE v_first)"); n != 3 {
+		t.Errorf("v_first: %d columns, want 3", n)
+	}
+}
+
 // Statements Igloo writes itself in an embedded session, such as the
 // console's and Flight SQL's catalog lookups, are DuckDB SQL whatever the
 // session's dialect.

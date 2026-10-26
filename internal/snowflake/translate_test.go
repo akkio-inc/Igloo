@@ -194,6 +194,21 @@ func TestTranslateNoticesAndCommands(t *testing.T) {
 	}
 }
 
+// TestViewColumns checks that a translation counts the names of CREATE
+// VIEW's column list, which Igloo checks against the query's columns.
+func TestViewColumns(t *testing.T) {
+	for in, want := range map[string]int{
+		`CREATE OR REPLACE VIEW db.s.v ("A" COMMENT $$$$, "B" COMMENT $$x, y$$, c) AS (SELECT * FROM t)`: 3,
+		`CREATE VIEW IF NOT EXISTS v (a) AS SELECT 1`:                                                    1,
+		`CREATE VIEW v AS (SELECT a, b FROM t)`:                                                          0,
+		`CREATE TABLE t (a INT, b INT)`:                                                                  0,
+	} {
+		if got := translate(t, in).ViewColumns; got != want {
+			t.Errorf("%s: %d columns, want %d", in, got, want)
+		}
+	}
+}
+
 // TestRefusals checks that constructs Igloo cannot translate faithfully
 // are refused with SQLSTATE 0A000 (or 42601 for what is not valid SQL),
 // naming the construct.

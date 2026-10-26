@@ -1360,6 +1360,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkViewColumns(ctx, sess, tr); err != nil {
+		s.recordQuery(sess, queryRecord{text: source, start: time.Now(), err: err, rows: -1})
+		return nil, err
+	}
 	if created, dropped := tr.Temporary, tr.Dropped; created != nil || dropped != nil {
 		// A temporary object named in a schema is read by that name once
 		// the statement that creates it has succeeded.

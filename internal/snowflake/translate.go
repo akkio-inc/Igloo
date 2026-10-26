@@ -60,6 +60,11 @@ type Result struct {
 	// schema, and Dropped the one of the session's it drops: the session
 	// records them once the statement succeeds, for Options.Temporary.
 	Temporary, Dropped *TempName
+	// ViewColumns is the number of names CREATE VIEW's column list gives,
+	// 0 without one. Snowflake refuses a list of fewer or more names than
+	// the view's query has columns; DuckDB, as PostgreSQL does, names the
+	// first columns and leaves the others theirs, so Igloo checks it.
+	ViewColumns int
 }
 
 // translator holds the state of one statement's translation.
@@ -75,7 +80,9 @@ type translator struct {
 	// tableIfNotExists whether it says IF NOT EXISTS.
 	table            string
 	tableIfNotExists bool
-	quoted           map[string]bool
+	// viewColumns is Result.ViewColumns.
+	viewColumns int
+	quoted      map[string]bool
 	// flatten holds the lower-cased aliases of the statement's FLATTENs,
 	// whose VALUE and THIS columns are semi-structured; anon counts those
 	// without an alias, whose columns are reached unqualified.
@@ -166,7 +173,8 @@ func Translate(sql string, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after, Temporary: created, Dropped: dropped}
+	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after, Temporary: created, Dropped: dropped,
+		ViewColumns: t.viewColumns}
 	if cmd == "" {
 		res.SQL = strings.TrimRight(render(out), " \t\r\n")
 	}
@@ -1029,7 +1037,9 @@ func (t *translator) createView(nodes []*node, idx []int, k int, drop map[int]bo
 	if j < len(idx) && nodes[idx[j]].isGroup('(') {
 		// Column names, perhaps with comments.
 		g := nodes[idx[j]]
-		for _, def := range splitArgs(g.kids) {
+		defs := splitArgs(g.kids)
+		t.viewColumns = len(defs)
+		for _, def := range defs {
 			di := sig(def)
 			for m := 1; m+1 < len(di); m++ {
 				if def[di[m]].word() == "COMMENT" {

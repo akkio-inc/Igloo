@@ -285,6 +285,30 @@ func (s *Server) parseTranslated(ctx context.Context, sess *session, user auth.U
 	return ips, itr, nil
 }
 
+// checkViewColumns refuses, as Snowflake does, CREATE VIEW whose column
+// list gives fewer or more names than its query has columns (see
+// snowflake.Result.ViewColumns). DuckDB has just prepared the statement,
+// so the query binds; if describing it fails all the same, running the
+// statement reports why.
+func (s *Server) checkViewColumns(ctx context.Context, sess *session, tr *translation) error {
+	if tr.ViewColumns == 0 {
+		return nil
+	}
+	query := viewQuery(tr.SQL)
+	if query == "" {
+		return nil
+	}
+	// Describing it walks the catalog (see catalogRunLock).
+	release := s.holdCatalog(sess)
+	cols, err := describeQuery(ctx, sess, query)
+	release()
+	if err != nil || len(cols) == tr.ViewColumns {
+		return nil
+	}
+	return pgerror.WithCode(fmt.Errorf("invalid column definition list: the view names %d columns, and its query returns %d",
+		tr.ViewColumns, len(cols)), codes.InvalidColumnDefinition)
+}
+
 // implicitCastError reports whether err is DuckDB's for a function, a
 // comparison or a BETWEEN whose arguments' types do not match without a
 // cast, which Snowflake would have made.

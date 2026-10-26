@@ -1584,6 +1584,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- In Snowflake's dialect, `CREATE VIEW v (a, b) AS ...` whose query returns
+  more columns than the list names is refused, as Snowflake refuses it
+  ("invalid column definition list"), instead of creating a view with the
+  extra columns under their own names; dbt's views with documented columns
+  over a table that has since gained columns failed in Snowflake and not
+  in Igloo.
 - `statement_timeout` counts a statement's run, not the time it waited to
   start behind role limits, as Snowflake's `STATEMENT_TIMEOUT_IN_SECONDS`
   does; the new `statement_queued_timeout` (a session or role setting, and

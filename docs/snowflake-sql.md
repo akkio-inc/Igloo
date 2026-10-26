@@ -342,7 +342,10 @@ comparison reads `a || b`, which Igloo does not convert; write
   the `temp` catalog.
 - `CREATE [OR REPLACE] [SECURE] VIEW` (`SECURE` ignored with a notice),
   `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `DESC[RIBE] TABLE`,
-  `USE DATABASE`, `USE SCHEMA`.
+  `USE DATABASE`, `USE SCHEMA`. As in Snowflake, a view's column list
+  names every column its query returns, no fewer: one that names fewer is
+  refused ("invalid column definition list"), where DuckDB's dialect
+  names the first columns and keeps the rest's own names.
 - `USE WAREHOUSE`, `USE ROLE` and `GRANT USAGE ON DATABASE | SCHEMA |
   WAREHOUSE` change nothing and say so in a notice. `GRANT ... TO ROLE r`
   and `GRANT ROLE r TO USER u` are Igloo's `GRANT`.
