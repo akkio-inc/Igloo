@@ -215,6 +215,29 @@ func (t *translator) collectStructs(nodes []*node) {
 			}
 		}
 	}
+	for _, f := range flats {
+		if structInput(f.args) != nil {
+			continue
+		}
+		h := t.listHoistOf(f.level, f.i, f.up, f.alias, f.args, f.cols, colLists)
+		if h == nil || hoisted[h.item] {
+			if t.textValuesOf(f.level, f.i, f.up, f.alias, f.args, f.cols, colLists) {
+				t.textValues[f.args] = true
+				name, _, _ := f.alias.name()
+				for _, r := range valueReads(f.level, f.up, colLists) {
+					t.elemReads[r] = quoteIdent(name) + ".\"VALUE\""
+					t.elemTexts[r] = true
+				}
+			}
+			continue
+		}
+		hoisted[h.item] = true
+		t.hoists[f.args] = h
+		for _, r := range valueReads(f.level, f.up, colLists) {
+			t.elemReads[r] = h.alias + "._sf_v"
+			t.elemTexts[r] = h.text
+		}
+	}
 }
 
 // hoist is a FLATTEN of structs that its FROM item's select list unnests
@@ -234,9 +257,182 @@ type hoist struct {
 	elems  []*node
 	text   bool
 	// list is the objects' struct for each row and index (see hoistList),
-	// and objects their number.
+	// and objects their number. A hoisted FLATTEN of a list (see
+	// listHoistOf) has no s, and list is the list that the select list
+	// unnests, as text when text is set.
 	list    *node
 	objects int
+}
+
+// listHoistOf decides whether the FLATTEN at nodes[i], aliased by the node
+// alias (upper-cased up), with arguments args and column list cols (or
+// nil), flattens a list that its FROM item's select list unnests instead
+// (see hoistStructs): a list computed from the columns of one FROM item
+// before it, such as SPLIT(t.tags, ','). flattenUnnest computes such an
+// input in a subquery of its own, which DuckDB joins to the item's rows
+// with a dependent join that holds them all in a hash table: 98 s against
+// 41 s for a report that flattened a list column of tens of millions
+// of rows joined to an audience. A column flattenUnnest unnests where it
+// reads it, unless its select's WHERE stays a WHERE (see laterallyFiltered),
+// and then DuckDB takes a dependent join for it too. INPUT must be its only
+// argument, and not an array constant; it must be joined plainly at a level
+// with no outer join, its column list must keep FLATTEN's names, no later
+// FLATTEN may read it, and its select must read only its VALUE, qualified
+// and outside subqueries, and name neither VALUE nor SEQ unqualified. A
+// SPLIT is unnested as text, as are values whose every read is cast to text
+// (see readsText), which reads of VALUE read in place of the elements' JSON
+// (see variant.render).
+func (t *translator) listHoistOf(nodes []*node, i int, up string, alias, args, cols *node, colLists map[*node]bool) *hoist {
+	if _, _, _, _, ok := whereClause(nodes); !ok || up == "VALUE" || up == "SEQ" || !t.onlyValues[args] || !onlyValue(nodes, up) ||
+		!plainlyJoined(nodes, i) || selectsStar(nodes) || !defaultColumns(cols) || len(readers(nodes, i, up)) > 0 ||
+		!readsPlainly(nodes, alias, up, colLists) {
+		return nil
+	}
+	input := onlyInput(args)
+	idx := sig(input)
+	if len(idx) == 0 || input[idx[0]].isGroup('[') || input[idx[0]].word() == "ARRAY_CONSTRUCT" ||
+		isColumnRef(input) && !laterallyFiltered(nodes, i) {
+		return nil
+	}
+	q := qualifiers(input)
+	if len(q) != 1 || q[up] || unqualified(input) {
+		return nil
+	}
+	var item string
+	for name := range q {
+		item = name
+	}
+	_, end, as, ok := fromItem(nodes, item)
+	if !ok || end > i {
+		return nil
+	}
+	text := len(idx) == 2 && input[idx[0]].word() == "SPLIT" && input[idx[1]].isGroup('(') || readsText(nodes, up, colLists)
+	return &hoist{alias: as, up: item, item: nodes[end-1], key: -1, text: text}
+}
+
+// laterallyFiltered reports whether the select at nodes, with a FLATTEN at
+// nodes[i], has a WHERE that whereOn leaves where it is: one after a FROM
+// item after the FLATTEN, after an ON that follows a comma before it, or
+// that cannot be an ON (see movable).
+func laterallyFiltered(nodes []*node, i int) bool {
+	sel, from, where, end, ok := whereClause(nodes)
+	if !ok || where < 0 {
+		return false
+	}
+	_, after, _ := flattenAt(nodes, i)
+	last := aliasIndex(nodes, after)
+	if k := nextSig(nodes, last); last >= 0 && k >= 0 && nodes[k].isGroup('(') {
+		last = k
+	}
+	if last < 0 || prevSig(nodes, where) != last {
+		return true
+	}
+	comma := false
+	for k := from + 1; k < i; k++ {
+		switch {
+		case nodes[k].isOp(","):
+			comma = true
+		case nodes[k].word() == "ON" && comma:
+			return true
+		}
+	}
+	return !movable(nodes[where+1:end], selectAliases(nodes, sel, from))
+}
+
+// onlyInput returns a FLATTEN's INPUT, as written, when that is its only
+// argument, or nil.
+func onlyInput(args *node) []*node {
+	var input []*node
+	for _, a := range splitArgs(args.kids) {
+		a = trim(a)
+		idx := sig(a)
+		named := len(idx) >= 2 && a[idx[1]].isOp("=>")
+		switch {
+		case input != nil || len(idx) == 0:
+			return nil
+		case named && a[idx[0]].word() == "INPUT":
+			input = trim(a[idx[1]+1:])
+		case named:
+			return nil
+		default:
+			input = a
+		}
+	}
+	return input
+}
+
+// textValuesOf reports whether the FLATTEN at nodes[i], aliased by the node
+// alias (upper-cased up), with arguments args and column list cols (or
+// nil), unnests its values as text, as listHoistOf's lists of text: a
+// FLATTEN of a column, its only argument, whose select reads only its VALUE,
+// qualified and outside subqueries, and only cast to text or tested for NULL
+// (see readsText), which no later FLATTEN reads. The JSON of each element,
+// which every read made text again, is not made: a report's categories of
+// pages visited, ...
+func (t *translator) textValuesOf(nodes []*node, i int, up string, alias, args, cols *node, colLists map[*node]bool) bool {
+	input := onlyInput(args)
+	return isColumnRef(input) && up != "VALUE" && up != "SEQ" && t.onlyValues[args] && onlyValue(nodes, up) && valueKept(cols) &&
+		len(readers(nodes, i, up)) == 0 && readsPlainly(nodes, alias, up, colLists) && readsText(nodes, up, colLists)
+}
+
+// defaultColumns reports whether a FLATTEN's column list, cols (or nil),
+// names its columns as FLATTEN does.
+func defaultColumns(cols *node) bool {
+	if cols == nil {
+		return true
+	}
+	names := splitArgs(cols.kids)
+	if len(names) != 6 {
+		return false
+	}
+	for k, want := range []string{"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"} {
+		n := trim(names[k])
+		if len(n) != 1 {
+			return false
+		}
+		if name, _, ok := n[0].name(); !ok || strings.ToUpper(name) != want {
+			return false
+		}
+	}
+	return true
+}
+
+// readsPlainly reports whether a select, nodes, and what it nests name the
+// FLATTEN aliased by the node alias (upper-cased up) only to qualify
+// columns, outside subqueries, and name no VALUE or SEQ unqualified,
+// outside FLATTENs' column lists (colLists).
+func readsPlainly(nodes []*node, alias *node, up string, colLists map[*node]bool) bool {
+	ok := true
+	var check func(nodes []*node, nested bool)
+	check = func(nodes []*node, nested bool) {
+		for i, n := range nodes {
+			if !ok {
+				return
+			}
+			if n.kind == kGroup && !colLists[n] {
+				k := sig(n.kids)
+				check(n.kids, nested || len(k) > 0 && (n.kids[k[0]].word() == "SELECT" || n.kids[k[0]].word() == "WITH"))
+			}
+			name, _, isName := n.name()
+			p := prevSig(nodes, i)
+			if !isName || n == alias || p >= 0 && nodes[p].isOp(":") {
+				continue
+			}
+			switch strings.ToUpper(name) {
+			case "VALUE", "SEQ":
+				if p < 0 || !nodes[p].isOp(".") && nodes[p].word() != "AS" {
+					ok = false
+				}
+			case up:
+				q := nextSig(nodes, i)
+				if nested || p >= 0 && nodes[p].isOp(".") || q < 0 || !nodes[q].isOp(".") {
+					ok = false
+				}
+			}
+		}
+	}
+	check(nodes, false)
+	return ok
 }
 
 // hoistOf decides whether the FLATTEN of structs at nodes[i], aliased up
@@ -402,7 +598,8 @@ func valueReads(nodes []*node, alias string, colLists map[*node]bool) []*node {
 // in nodes and what they nest, outside FLATTENs' column lists, is cast to
 // a type that is not semi-structured, as CAST(alias.VALUE AS type),
 // TRY_CAST(alias.VALUE AS type) or alias.VALUE::type, which read the
-// value's text (see castExpr). Reports read a FLATTEN's elements so, and
+// value's text (see castExpr), or tested for NULL, which a FLATTEN's VALUE
+// never is (see variant.render). Reports read a FLATTEN's elements so, and
 // unnesting their text spares making JSON of each string and reading it
 // back (0.65 s against 1.05 s for 3 million rows of four lists).
 func readsText(nodes []*node, alias string, colLists map[*node]bool) bool {
@@ -428,13 +625,26 @@ func readsText(nodes []*node, alias string, colLists map[*node]bool) bool {
 			if name, _, ok := nodes[q].name(); !ok || strings.ToUpper(name) != alias {
 				continue
 			}
-			if !castsText(nodes, q, i, cast) {
+			if !castsText(nodes, q, i, cast) && !nullTest(nodes, i) {
 				text = false
 			}
 		}
 	}
 	walk(nodes, false)
 	return text
+}
+
+// nullTest reports whether the read that ends at nodes[i] is tested for
+// NULL: IS NULL or IS NOT NULL after it.
+func nullTest(nodes []*node, i int) bool {
+	k := nextSig(nodes, i)
+	if k < 0 || nodes[k].word() != "IS" {
+		return false
+	}
+	if k = nextSig(nodes, k); k >= 0 && nodes[k].word() == "NOT" {
+		k = nextSig(nodes, k)
+	}
+	return k >= 0 && nodes[k].word() == "NULL"
 }
 
 // keysText reports, of the keys that reads (VALUE's nodes in a select,
@@ -1269,6 +1479,25 @@ func (t *translator) hoistList(g *node, h *hoist) (*node, error) {
 	return seq(nil, append(append([]*node{raw("CASE _sf_k.i")}, kids...), raw(" END"))...), nil
 }
 
+// listOf is the list that the select list of a hoisted FLATTEN's FROM item
+// unnests (see listHoistOf), from the FLATTEN's argument group g: a SPLIT's
+// list of strings, or FLATTEN's values of its input, as text for text.
+func (t *translator) listOf(g *node, h *hoist) (*node, error) {
+	pos, named := t.tableArgs(g)
+	input := named["INPUT"]
+	if input == nil && len(pos) > 0 {
+		input = pos[0]
+	}
+	in := flattenInput(input)
+	switch {
+	case !h.text:
+		return seq(nil, raw("sf_flatten_values("), in, raw(", 'BOTH')")), nil
+	case in.strs != nil:
+		return in.strs, nil
+	}
+	return seq(nil, raw("sf_flatten_strings("), in, raw(", 'BOTH')")), nil
+}
+
 // hoistStructs takes out of a level of a statement its hoisted FLATTENs,
 // what tableFunctions left of them (removed), and the comma or JOIN before
 // each, and makes each FROM item they read a subquery that joins it to the
@@ -1281,7 +1510,9 @@ func (t *translator) hoistList(g *node, h *hoist) (*node, error) {
 // report, 90.7 million browsing elements against 1.0 million cohort
 // members, 94 s of 465 s thread time). With a reader, another select list
 // around that one unnests the key it flattens as _sf_e, as text when its
-// reads all read text (see readsText).
+// reads all read text (see readsText). A FLATTEN of a list is unnested in
+// the one select list, as _sf_v: (SELECT m.*, unnest(list) AS _sf_v FROM
+// m) AS m.
 func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*node, error) {
 	for k := 0; k < len(nodes); k++ {
 		if !removed[nodes[k]] {
@@ -1308,6 +1539,12 @@ func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*no
 			return nil, &Error{Code: CodeSyntax, Message: "FLATTEN reads a FROM item that is not there: " + h.alias}
 		}
 		item := nodes[start:end]
+		if h.s == nil {
+			out := seq(item, append(append([]*node{raw("(SELECT " + alias + ".*, unnest("), h.list, raw(") AS _sf_v FROM ")}, item...),
+				raw(") AS "+alias))...)
+			nodes = replace(nodes, start, end, out)
+			continue
+		}
 		join := ""
 		if h.objects != 1 {
 			join = " CROSS JOIN range(" + itoa(h.objects) + ") AS _sf_k(i)"

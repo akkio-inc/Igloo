@@ -104,6 +104,9 @@ type translator struct {
 	hoists    map[*node]*hoist
 	elemReads map[*node]string
 	elemTexts map[*node]bool
+	// textValues holds the FLATTENs of columns whose VALUE is read only as
+	// text, which they unnest as text (see textValuesOf).
+	textValues map[*node]bool
 	// guarded holds the nodes of the WHEREs of selects that hoist FLATTENs,
 	// where reads of their text go through sf_text_read.
 	guarded     map[*node]bool
@@ -148,7 +151,7 @@ func Translate(sql string, opts Options) (Result, error) {
 		names: map[string]int{}, columnNames: map[string]int{}, structs: map[*node]*structFlatten{},
 		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, hoists: map[*node]*hoist{}, elemReads: map[*node]string{},
 		elemTexts: map[*node]bool{}, guarded: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
-		folds: map[*node]*structFold{}}
+		folds: map[*node]*structFold{}, textValues: map[*node]bool{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true

@@ -20,6 +20,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and so built joins' hash tables on the wrong side: with counts, most of the
   queries of a report workload that ran slower than Snowflake at ten
   times its data run faster.
+- A Snowflake `FLATTEN` of a list computed from one table's columns, such
+  as `LATERAL FLATTEN(INPUT => SPLIT(t.tags, ','))`, read only by its
+  `VALUE`, is unnested in that table's select list, not joined to its rows
+  as a lateral subquery, which DuckDB planned as a dependent join holding
+  every row in a hash table: 98 s against 41 s for a report over tens of
+  millions of rows. A `SPLIT`'s parts are unnested as text. So is a `FLATTEN`
+  of a column whose `WHERE` cannot become its join's `ON`, which DuckDB
+  joined the same way. A `FLATTEN` of a column whose `VALUE` alone is read
+  unnests its values alone, and as text when every read casts them to text
+  or tests them for NULL, without making JSON of each element and reading
+  it back.
 - Snowflake's dialect makes Snowflake's implicit conversions: string
   functions and `LIKE` read numbers, dates and timestamps as text
   (`TRIM(5)`, `LENGTH(ts)`), and text compared with a timestamp, a date or

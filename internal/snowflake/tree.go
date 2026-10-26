@@ -38,6 +38,10 @@ type node struct {
 	// be an OBJECT, which CREATE TABLE ... AS stores as such columns (see
 	// semiColumns).
 	semi byte
+	// strs, when set, is the list of strings, a VARCHAR[], that the node is
+	// the JSON array of (see split), which a FLATTEN hoisted into its FROM
+	// item's select list unnests as text (see listHoistOf).
+	strs *node
 }
 
 // closer is the bracket that closes open.

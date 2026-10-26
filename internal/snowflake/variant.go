@@ -116,6 +116,12 @@ func (v *variant) render() string {
 				return "CAST(" + base + " AS DOUBLE)"
 			}
 		}
+		if v.text {
+			// The element as JSON, as a FLATTEN of a SPLIT's strings reads
+			// it; NULL is JSON null, which a test for NULL reads as a
+			// FLATTEN's VALUE, never NULL (see readsText).
+			base = "coalesce(to_json(" + base + "), CAST('null' AS JSON))"
+		}
 	}
 	extract, extractString := "json_extract(", "json_extract_string("
 	if v.column {

@@ -302,18 +302,25 @@ func TestNativeColumnsHoldText(t *testing.T) {
 }
 
 // TestFlattenShapes checks the forms FLATTEN takes (see flattenUnnest): a
-// column is unnested where it is read, an array constant from a list of its
-// elements, and anything else computed once in a subquery.
+// column is unnested where it is read, its values alone when only they are
+// read, an array constant from a list of its elements, and anything else
+// computed once in a subquery.
 func TestFlattenShapes(t *testing.T) {
 	for _, c := range []struct{ sql, has, hasNot string }{
 		{`select f.value from t, lateral flatten(input => t.a) f`,
-			`FROM (SELECT unnest(sf_flatten_values(t.a, 'BOTH')) AS _sf_value`, `_sf_flatten_input`},
+			`FROM (SELECT unnest(sf_flatten_values(t.a, 'BOTH')) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key`, `_sf_flatten_input`},
+		{`select f.index, f.value from t, lateral flatten(input => t.a) f`,
+			`unnest(sf_flatten_indexes(t.a, 'BOTH')) AS _sf_index`, `CAST(NULL AS BIGINT) AS _sf_index`},
 		{`select f.value from t, lateral flatten(input => [object_construct('k', t.a), 'x']) f`,
 			`unnest([coalesce(to_json(to_json(map_from_entries(`, `sf_flatten_values`},
 		{`select f.value from t, lateral flatten(input => array_construct(1, t.b)) f`,
 			`unnest([coalesce(to_json(1), CAST('null' AS JSON)), coalesce(to_json(sf_to_json(t.b)), CAST('null' AS JSON))]) AS _sf_value`, `sf_flatten_values`},
-		{`select f.value from t, lateral flatten(input => parse_json(t.s)) f`,
+		{`select f.value, f.index from t, lateral flatten(input => parse_json(t.s)) f`,
 			`unnest(sf_flatten_values(_sf_this, 'BOTH')) AS _sf_value`, `sf_flatten_values(json(`},
+		// Read only by its VALUE, its table's select list unnests it (see
+		// listHoistOf), once.
+		{`select f.value from t, lateral flatten(input => parse_json(t.s)) f`,
+			`(SELECT t.*, unnest(sf_flatten_values(json((t.s)), 'BOTH')) AS _sf_v FROM t) AS t`, `_sf_this`},
 		{`select f.value from t, lateral flatten(input => [1, 2], mode => 'OBJECT') f`,
 			`FROM (SELECT json_array(1, 2) AS _sf_this) AS _sf_flatten_input`, `unnest([`},
 		// THIS only where the statement reads it.
@@ -825,6 +832,102 @@ func TestFlattenWhere(t *testing.T) {
 	} {
 		if got := nativeRows(t, conn, c.q); got != c.want {
 			t.Errorf("%s\n got %q\nwant %q", c.q, got, c.want)
+		}
+	}
+}
+
+// TestFlattenListsHoisted checks FLATTENs of lists computed from a FROM
+// item's columns, which the item's select list unnests (see listHoistOf):
+// their rows against the same FLATTENs as lateral subqueries, where OUTER =>
+// FALSE keeps them, with joins before them and WHEREs on the elements, and
+// plans without a dependent join; and FLATTENs that stay lateral subqueries.
+func TestFlattenListsHoisted(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE TABLE media AS SELECT * FROM (VALUES (1, 'drama,comedy', 30), (2, 'news', 10), (3, NULL, 5), (4, '', 7),
+			(5, 'drama, unknown,', 2), (6, '{"a":1},[2]', 4)) v(id, genres, secs)`,
+		`CREATE TABLE members AS SELECT * FROM (VALUES (1), (2), (4), (5), (6)) v(id)`,
+		`CREATE TABLE docs AS SELECT * FROM (VALUES (1, '{"items": [1, "x", {"k": 2}]}'::JSON), (2, '{"items": []}'::JSON),
+			(3, NULL)) v(id, doc)`,
+		`CREATE TABLE tagged AS SELECT * FROM (VALUES (1, ['a', 'b']), (2, ['{"k": 1}', NULL, 'c']), (3, []), (4, NULL)) v(id, tags)`,
+	} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{
+		`select m.id, trim(f.value) as genre, sum(m.secs) from (select *, 'x' as kind from media) as m
+			inner join members as a on a.id = m.id, lateral flatten(input => split(m.genres, ',')%s) as f(seq, key, path, index, value, this)
+			where m.secs > 1 and not trim(lower(f.value)) in ('unknown', '') group by 1, 2 order by 1, 2`,
+		`select distinct m.id, f.value::string, f.value, f.value:a, f.value[0] from media as m, lateral flatten(split(m.genres, ',')%s) f
+			order by 1, 2`,
+		`select media.id, upper(f.value), length(f.value) from media cross join lateral flatten(input => split(media.genres, ',')%s) as f
+			where f.value = 'news' or f.value like 'dr%%' order by 1, 2`,
+		`select d.id, f.value, f.value:k::int, f.value::string from docs as d, lateral flatten(input => d.doc:items%s) as f
+			order by 1, 4`,
+		// Read as text only, and a column whose WHERE stays a WHERE.
+		`select d.id, f.value::string, cast(f.value as text) from docs as d, lateral flatten(input => d.doc:items%s) as f
+			where d.id <= (select max(id) from members) order by 1, 2`,
+		`select t.id, f.value::string from tagged as t cross join lateral flatten(input => t.tags%s) as f
+			where t.id <= (select max(id) from members) and not upper(f.value::string) in ('B') order by 1, 2`,
+		`select t.id, f.value from tagged t, lateral flatten(t.tags%s) f where t.id <= (select max(id) from members) order by 1, 2`,
+	} {
+		hoisted := fmt.Sprintf(q, "")
+		res, err := Translate(hoisted, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(res.SQL, "AS _sf_v FROM") {
+			t.Errorf("not hoisted:\n%s", res.SQL)
+		}
+		if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
+			t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
+		}
+		lateral := fmt.Sprintf(q, ", outer => false")
+		if got, want := nativeRows(t, conn, hoisted), nativeRows(t, conn, lateral); got != want {
+			t.Errorf("%s\n got %q\nwant %q", hoisted, got, want)
+		}
+	}
+	for _, q := range []string{
+		// Another column of it, VALUE unqualified, an outer join, OUTER, a
+		// column without a WHERE and one whose WHERE becomes an ON (see
+		// whereOn), and a later FLATTEN of its elements.
+		`select m.id, f.index, f.value::string from media m, lateral flatten(input => split(m.genres, ',')) f`,
+		`select m.id, value::string from media m, lateral flatten(input => split(m.genres, ',')) f`,
+		`select m.id, f.value::string from media m left join members a on a.id = m.id, lateral flatten(input => split(m.genres, ',')) f`,
+		`select m.id, f.value::string from media m, lateral flatten(input => split(m.genres, ','), outer => true) f`,
+		`select d.id, f.value from docs d, lateral flatten(input => d.doc) f`,
+		`select t.id, f.value::string from tagged t, lateral flatten(input => t.tags) f where t.id > 1 and f.value::string <> 'a'`,
+		`select d.id, g.value from docs d, lateral flatten(input => d.doc:items) f, lateral flatten(input => f.value) g`,
+	} {
+		res, err := Translate(q, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(res.SQL, "AS _sf_v FROM") {
+			t.Errorf("hoisted:\n%s", res.SQL)
+		}
+	}
+	// A FLATTEN of a column that stays a lateral subquery, whose values are
+	// read only as text or tested for NULL, unnests them as text (see
+	// textValuesOf), with the rows of their JSON.
+	for _, q := range []string{
+		`select t.id, trim(f.value::string), cast(f.value as text) from tagged as t inner join members as m on m.id = t.id
+			inner join lateral flatten(input => t.tags%s) as f(seq, key, path, index, value, this)
+			where not f.value is null and not trim(lower(f.value::string)) in ('a') order by 1, 2`,
+		`select t.id, f.value::string, f.value is null, f.value is not null from tagged t, lateral flatten(t.tags%s) f order by 1, 2`,
+	} {
+		text := fmt.Sprintf(q, "")
+		res, err := Translate(text, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(res.SQL, "sf_flatten_strings(") {
+			t.Errorf("not unnested as text:\n%s", res.SQL)
+		}
+		if got, want := nativeRows(t, conn, text), nativeRows(t, conn, fmt.Sprintf(q, ", outer => false")); got != want {
+			t.Errorf("%s\n got %q\nwant %q", text, got, want)
 		}
 	}
 }

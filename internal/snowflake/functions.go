@@ -1447,6 +1447,7 @@ func split(c *call) (*node, error) {
 	}
 	n := c.out("to_json(string_split(", c.arg(0), ", ", c.arg(1), "))")
 	n.json = true
+	n.strs = c.out("string_split(", c.arg(0), ", ", c.arg(1), ")")
 	return n, nil
 }
 

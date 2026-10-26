@@ -223,6 +223,11 @@ var macros = []string{
 	`CREATE OR REPLACE TEMP MACRO sf_parts_strings(l, j, m) AS CASE
 		WHEN l IS NULL THEN list_transform(sf_flatten_values(j, m), lambda x: json_extract_string(x, '$'))
 		WHEN m <> 'OBJECT' THEN list_transform(l, lambda e: sf_elem_string(e)) END`,
+	// sf_flatten_strings is sf_flatten_values as text, as json_extract_string
+	// reads each value, for a FLATTEN whose values are read only as text.
+	`CREATE OR REPLACE TEMP MACRO sf_flatten_strings(x, m) AS CASE
+		WHEN typeof(x) = 'VARCHAR[]' THEN CASE WHEN m <> 'OBJECT' THEN list_transform(CAST(x AS VARCHAR[]), lambda e: sf_elem_string(e)) END
+		ELSE list_transform(sf_flatten_values(x, m), lambda v: json_extract_string(v, '$')) END`,
 	// sf_text_read is text that a select list unnested or built, x, as it
 	// is, read in a WHERE, where DuckDB keeps a filter on it above that list
 	// (a select list or GROUP BY reads it plainly, as cheaper): it does not

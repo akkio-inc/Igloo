@@ -221,7 +221,12 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 			if h := t.hoists[call]; h != nil {
 				// Hoisted into its FROM item's select list (see hoistOf).
 				if call != h.reader {
-					if h.list, err = t.hoistList(call, h); err != nil {
+					if h.s == nil {
+						h.list, err = t.listOf(call, h)
+					} else {
+						h.list, err = t.hoistList(call, h)
+					}
+					if err != nil {
 						return nil, err
 					}
 					hoists = append(hoists, h)
@@ -820,7 +825,7 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 		return t.flattenStructs(st, in, alias, cols, wantThis)
 	}
 	if !recursive && !outer {
-		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis, onlyValues)
+		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis, onlyValues, t.textValues[g])
 		if fold != nil {
 			fold.alias = alias
 			t.folds[out] = fold
@@ -889,8 +894,10 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 // KEY, PATH, INDEX and THIS (onlyValues), only its elements, which a lone
 // unnest gives faster than three together (0.9 s against 1.4 s for 3
 // million rows of three lists), in a node of their own, fold, that
-// structWhere may filter.
-func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, onlyValues bool) (out *node, fold *structFold) {
+// structWhere may filter. A column whose elements alone its select reads
+// is unnested alone too, as text when every read reads text (text, see
+// textValuesOf).
+func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, onlyValues, text bool) (out *node, fold *structFold) {
 	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
 	path := rel
 	if prefix != "" {
@@ -932,6 +939,14 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, o
 			this = "_sf_flatten._sf_this"
 			lists = append(lists, raw(", unnest(sf_parts_this("+args+")) AS _sf_this"))
 		}
+	case isColumnNode(in) && prefix == "" && onlyValues:
+		// A column of which the statement reads only the elements.
+		values := "sf_flatten_values("
+		if text {
+			values = "sf_flatten_strings("
+		}
+		lists = append(lists, raw("unnest("+values+in.String()+", "+m+
+			")) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index"))
 	case isColumnNode(in):
 		x := in.String()
 		lists = append(lists, raw("unnest(sf_flatten_values("+x+", "+m+")) AS _sf_value, unnest(sf_flatten_keys("+x+", "+m+

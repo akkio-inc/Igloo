@@ -916,7 +916,7 @@ func TestDistributedFlatten(t *testing.T) {
 				t.Fatalf("history: %v", err)
 			}
 			for _, q := range qs {
-				if strings.Contains(q.Text, "sf_flatten_values") && strings.Contains(q.Text, marker) {
+				if strings.Contains(q.Text, "sf_flatten_") && strings.Contains(q.Text, marker) {
 					return q.Workers
 				}
 			}
