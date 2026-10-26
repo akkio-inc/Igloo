@@ -38,6 +38,8 @@ services:
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_MEMORY_LIMIT:-}
       # Empty sizes the read cache from the free disk space; 0 turns it off.
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
+      # Empty keeps 256 MiB of query results; 0 turns the result cache off.
+      IGLOO_RESULT_CACHE_SIZE: ${IGLOO_RESULT_CACHE_SIZE:-}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}
