@@ -582,6 +582,47 @@ from local disk. Against an object store with S3's latency, a cold scan on
   writes blocks as the cache's extension does. At startup the log says
   `prefetch on`, or why it is off.
 
+## Result cache
+
+A dashboard that several people open at once, or that asks the same
+question in several of its charts, sends the same query again and again
+over data that has not changed. Igloo keeps the result of such a query in
+memory and sends it again, without running the query, to the next
+statement that is the same text with the same parameters, from the same
+user with the same roles and settings, as long as no table has changed
+since. A statement that arrives while the same one is running waits for
+that run's result instead of running too. Snowflake does the same
+(`USE_CACHED_RESULT`).
+
+- **What is kept.** Results of queries that read tables of the catalog,
+  through views or not, and nothing else: not DuckDB's own tables,
+  temporary tables, files, connections' tables or table functions such as
+  the history. Queries that call a function whose value changes from one
+  run or session to the next (`now()`, `current_date`, `random()`,
+  `uuid()`, `current_setting()`, `getvariable()`, or a macro that calls
+  one) are run every time, and so are statements in a transaction block.
+  The statements of a session that may have temporary tables or views
+  share no results with other sessions, since the same name may stand for
+  something else there.
+- **Always current.** DuckDB loads every table a statement reads when it
+  prepares the statement, through Igloo's [catalog
+  proxy](#writes-when-the-catalog-fails), which sees each table's metadata
+  location, and each change Igloo makes. Once a table may have changed,
+  through this replica, another replica or another engine, no result kept
+  before is used again, and a result is kept only if no table changed
+  while its statement ran. A change to the catalog's views or to policies
+  makes the results kept before unused too.
+- **Size.** Results take at most `IGLOO_RESULT_CACHE_SIZE` of memory, 256
+  MiB unless set, each at most a sixteenth of it; the least recently used
+  go first. `0` turns the cache off.
+- **Turning it off.** A session runs every statement with `SET
+  igloo_result_cache = off`, or Snowflake's `ALTER SESSION SET
+  USE_CACHED_RESULT = FALSE` (`RESET igloo_result_cache`, `SHOW
+  igloo_result_cache`).
+- **In the history.** A statement answered from the cache is recorded with
+  0 for `cpu_time_ms`, `bytes_read` and `memory_allocated_bytes`;
+  `igloo_result_cache_total` counts them.
+
 ## Connections to other databases
 
 [Connections](federation.md) to PostgreSQL, MySQL and Snowflake databases are kept in
@@ -748,6 +789,8 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
+| `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept |
+| `igloo_result_cache_bytes` | | Memory the result cache's results take, as Igloo estimates it |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |
 | `igloo_notifications_total` | `type`, `result` = `sent`, `failed`, `rate_limited` | [Notifications](alerts.md) sent or tried |

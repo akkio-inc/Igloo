@@ -73,6 +73,10 @@ type Config struct {
 	// reports and answer them through the report API (IGLOO_REPORT_REWRITE,
 	// off by default).
 	ReportRewrite bool
+	// ResultCacheSize is the memory the results Igloo keeps of queries may
+	// take, to send them again to the same query while no table changes
+	// (IGLOO_RESULT_CACHE_SIZE, 256 MiB by default; 0 or off keeps none).
+	ResultCacheSize int64
 	// ConnectionSecretsDir holds files with the passwords of connections to
 	// other databases, which a connection names with password_secret.
 	// Empty means connections store their passwords.
@@ -566,6 +570,16 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg.BitmapIndexes = bitmapIndexes
 	if cfg.ReportRewrite, err = strconv.ParseBool(get("IGLOO_REPORT_REWRITE", "false")); err != nil {
 		addErr("IGLOO_REPORT_REWRITE must be true or false: %w", err)
+	}
+
+	switch v := get("IGLOO_RESULT_CACHE_SIZE", "256MiB"); {
+	case v == "0" || strings.EqualFold(v, "off"):
+	default:
+		n, err := ParseSize(v)
+		if err != nil || n <= 0 {
+			addErr("IGLOO_RESULT_CACHE_SIZE must be a size such as 256MiB or 1GB, or off, got %q", v)
+		}
+		cfg.ResultCacheSize = n
 	}
 
 	if v := get("IGLOO_BITMAP_MIN_ROWS", "10000000"); strings.EqualFold(v, "off") {

@@ -509,6 +509,24 @@ func TestSortSpillBudget(t *testing.T) {
 	}
 }
 
+func TestResultCacheSize(t *testing.T) {
+	for v, want := range map[string]int64{"": 256 << 20, "0": 0, "off": 0, "1GB": 1e9, "64MiB": 64 << 20} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_RESULT_CACHE_SIZE"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.ResultCacheSize != want {
+			t.Errorf("IGLOO_RESULT_CACHE_SIZE=%q: %d %v, want %d", v, cfg.ResultCacheSize, err, want)
+		}
+	}
+	for _, v := range []string{"-5GB", "lots"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_RESULT_CACHE_SIZE": v})); err == nil {
+			t.Errorf("IGLOO_RESULT_CACHE_SIZE=%s should be refused", v)
+		}
+	}
+}
+
 func TestIDSyncMinRows(t *testing.T) {
 	for v, want := range map[string]int64{"": 0, "0": 0, "100000": 100_000} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

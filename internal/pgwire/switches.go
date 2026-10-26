@@ -20,8 +20,10 @@ import (
 //	SET igloo_report_rewrite = off | on   -- recognizing reports (IGLOO_REPORT_REWRITE)
 //	SET igloo_bitmap_indexes = off | on   -- reading bitmap indexes (IGLOO_BITMAP_INDEXES)
 //	SET igloo_id_counts = off | on        -- counting through ID domains' ids (IGLOO_ID_DOMAINS)
+//	SET igloo_result_cache = off | on     -- using kept results (IGLOO_RESULT_CACHE_SIZE)
 //
-// and RESET and SHOW them.
+// and RESET and SHOW them. Snowflake's ALTER SESSION SET USE_CACHED_RESULT
+// sets igloo_result_cache, in either dialect.
 type sessionSwitch struct {
 	name             string
 	set, reset, show *regexp.Regexp
@@ -37,14 +39,19 @@ var sessionSwitches = []sessionSwitch{
 		func(s *Server, sess *session) bool { return s.bitmapIndexesOn && !sess.indexesOff }),
 	newSessionSwitch("igloo_id_counts", func(sess *session) *bool { return &sess.idCountsOff },
 		func(s *Server, sess *session) bool { return s.idDomainsOn && !sess.idCountsOff }),
+	newSessionSwitch("igloo_result_cache|use_cached_result", resultCacheOff, resultCacheOn),
 }
 
+// newSessionSwitch makes the switch name, which may be spelled as any of
+// its |-separated names; the first is the one SHOW names.
 func newSessionSwitch(name string, off func(*session) *bool, on func(*Server, *session) bool) sessionSwitch {
+	names := "(?:" + name + ")"
+	name, _, _ = strings.Cut(name, "|")
 	return sessionSwitch{
 		name:  name,
-		set:   regexp.MustCompile(`(?is)^\s*(?:SET\s+(?:SESSION\s+)?|ALTER\s+SESSION\s+SET\s+)"?` + name + `"?\s*(?:=|\bTO\b)\s*'?([a-z]+)'?\s*;?\s*$`),
-		reset: regexp.MustCompile(`(?is)^\s*(?:RESET|ALTER\s+SESSION\s+UNSET)\s+"?` + name + `"?\s*;?\s*$`),
-		show:  regexp.MustCompile(`(?is)^\s*SHOW\s+"?` + name + `"?\s*;?\s*$`),
+		set:   regexp.MustCompile(`(?is)^\s*(?:SET\s+(?:SESSION\s+)?|ALTER\s+SESSION\s+SET\s+)"?` + names + `"?\s*(?:=|\bTO\b)\s*'?([a-z]+)'?\s*;?\s*$`),
+		reset: regexp.MustCompile(`(?is)^\s*(?:RESET|ALTER\s+SESSION\s+UNSET)\s+"?` + names + `"?\s*;?\s*$`),
+		show:  regexp.MustCompile(`(?is)^\s*SHOW\s+"?` + names + `"?\s*;?\s*$`),
 		off:   off,
 		on:    on,
 	}
@@ -54,14 +61,14 @@ func newSessionSwitch(name string, off func(*session) *bool, on func(*Server, *s
 func (s *Server) switchCommand(sess *session, text string) (wire.PreparedStatements, bool) {
 	query := stripComments(text)
 	lower := strings.ToLower(query)
-	if !strings.Contains(lower, "igloo_") || len(sqllex.Split(text)) > 1 {
+	if !strings.Contains(lower, "igloo_") && !strings.Contains(lower, "use_cached_result") || len(sqllex.Split(text)) > 1 {
 		return nil, false
 	}
 	respond := func(fn wire.PreparedStatementFn, opts ...wire.PreparedOptionFn) (wire.PreparedStatements, bool) {
 		return wire.Prepared(wire.NewStatement(s.audited(sess, text, fn), opts...)), true
 	}
 	for _, sw := range sessionSwitches {
-		if !strings.Contains(lower, sw.name) {
+		if !sw.set.MatchString(query) && !sw.reset.MatchString(query) && !sw.show.MatchString(query) {
 			continue
 		}
 		if m := sw.set.FindStringSubmatch(query); m != nil {

@@ -1246,6 +1246,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- The [result cache](docs/operations.md#result-cache): Igloo keeps the
+  results of queries over the catalog's tables in memory and sends them
+  again, without running the query, to the same statement (the same text
+  and parameters, from the same user with the same roles and settings)
+  while no table has changed, as Snowflake does with `USE_CACHED_RESULT`.
+  A statement sent while the same one runs waits for that run's result. It
+  sees every change, through this replica, another replica or another
+  engine, in the table loads and commits that pass Igloo's catalog proxy.
+  Only results running the statement again would give are kept: of
+  queries that read nothing but the catalog's tables, call no function
+  whose value changes between runs or sessions, outside transaction
+  blocks. `IGLOO_RESULT_CACHE_SIZE` (256 MiB by default) bounds it, and
+  `SET igloo_result_cache = off` or `ALTER SESSION SET USE_CACHED_RESULT =
+  FALSE` turns it off for a session. `igloo_result_cache_total` counts its
+  answers.
 - `CREATE TABLE ... AS` and `INSERT` of a query's rows in order (an
   `ORDER BY` of the result's columns) too many to sort within
   `IGLOO_SORT_SPILL_BUDGET` (half the spill disk's free space by default)

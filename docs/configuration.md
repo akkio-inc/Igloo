@@ -208,6 +208,7 @@ disk, so that queries after a restart read them from there; see
 | `IGLOO_CACHE_DIR` | `/var/lib/igloo/cache` in the image | Where the cache lives. Mount a volume here to keep it across restarts. |
 | `IGLOO_PREFETCH` | `false` | Read ahead, into the read cache, the blocks scans are about to read, with requests of its own; see [prefetch](operations.md#prefetch). |
 | `IGLOO_PREFETCH_CONCURRENCY` | `256` | Requests the prefetcher keeps in flight, for all statements together. |
+| `IGLOO_RESULT_CACHE_SIZE` | `256MiB` | Memory the results of queries Igloo keeps, to send them again to the same query while no table changes, may take; see [the result cache](operations.md#result-cache). `0` or `off` keeps none. |
 
 ## Table maintenance
 

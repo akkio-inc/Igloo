@@ -81,6 +81,9 @@ type Engine interface {
 	// whenever what those listings list may have.
 	CatalogChanged()
 	ListingsGeneration() uint64
+	// DataVersion goes up whenever a table of the catalog may have
+	// changed, through this replica or otherwise (see resultcache.go).
+	DataVersion() uint64
 	// ForgetMissingSchema makes DuckDB forget a schema of the catalog it
 	// took for missing, if the catalog has it, and reports whether it did.
 	ForgetMissingSchema(ctx context.Context, schema string) bool
@@ -154,6 +157,10 @@ type Options struct {
 	// their new values' ids to a mapping pass shortly after (see
 	// idassign.go); 0 means none do.
 	IDSyncMinRows int64
+	// ResultCacheSize is IGLOO_RESULT_CACHE_SIZE: the memory the results
+	// the server keeps of queries may take (see resultcache.go); 0 keeps
+	// none.
+	ResultCacheSize int64
 	// SortSpillBudget is IGLOO_SORT_SPILL_BUDGET: how many bytes a write
 	// of rows in order may spill to sort them at once; a larger one is
 	// sorted a range at a time (see sortedwrite.go). 0 means half the
@@ -335,6 +342,9 @@ type Server struct {
 	idDeferred    idDeferral
 	// sortBudget is Options.SortSpillBudget.
 	sortBudget int64
+	// results keeps queries' results (see resultcache.go); nil when it
+	// keeps none.
+	results *resultCache
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()
@@ -568,6 +578,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
 	s.idSyncMinRows, s.sortBudget = opts.IDSyncMinRows, opts.SortSpillBudget
+	s.results = newResultCache(opts.ResultCacheSize, opts.Metrics)
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)
@@ -728,8 +739,8 @@ type session struct {
 	// client describes where the session comes from, for the console's
 	// list of sessions and the history.
 	client string
-	// settingGen counts the session's SET statements, which may change
-	// how its statements resolve names.
+	// settingGen counts the session's SET and PRAGMA statements, which may
+	// change how its statements resolve names and what they return.
 	settingGen uint64
 	// prefetchOff turns reading ahead off for the session's statements
 	// (SET igloo_prefetch = off), reportRewriteOff recognizing their reports
@@ -737,6 +748,15 @@ type session struct {
 	// indexes (SET igloo_bitmap_indexes = off) and idCountsOff their counts
 	// through ID domains' ids (SET igloo_id_counts = off; see switches.go).
 	prefetchOff, reportRewriteOff, indexesOff, idCountsOff bool
+	// resultCacheOff keeps the session's statements from using kept
+	// results (SET igloo_result_cache = off, or Snowflake's
+	// USE_CACHED_RESULT = FALSE), and resultSettings is its settings'
+	// digest for the result cache (see resultcache.go).
+	resultCacheOff bool
+	resultSettings *settingsDigest
+	// resultSalt keeps the results of a session that may have temporary
+	// objects its own (see resultKey).
+	resultSalt uint64
 	// tokenID and tokenName identify the Igloo access token the session
 	// signed in with, if any: the session ends when the token is revoked
 	// or, at tokenExpires, expires.
@@ -1638,6 +1658,26 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
 			return err
 		}
+		// A result kept of the same statement, or one another session's
+		// run of it is about to give, goes out as it is (see
+		// resultcache.go); a cancel request and the statement timeout end
+		// the wait for one.
+		cctx, cached := sess.cancelable(ctx, q.Query)
+		served, fill, err := s.fromCache(cctx, sess, st, args, tw)
+		if err = cached(err); served || err != nil {
+			var used *audit.Resources
+			if err == nil {
+				// It read nothing and used nothing.
+				used = &audit.Resources{}
+			}
+			s.metrics.query(start, err)
+			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
+				policies: st.policies(), used: used, stmtType: st.stmtType})
+			return pgError(err)
+		}
+		tw.fill = fill
+		// Whatever happens to the run, those waiting for it go on.
+		defer s.finishResult(fill, errUnfinished)
 		var parts distParts
 		// Hold the catalog lock only while the statement runs, not through
 		// the metrics and ownership bookkeeping below, to keep the exclusive
@@ -1702,6 +1742,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			return run()
 		})
 		releaseCatalog()
+		s.finishResult(fill, err)
 		var used *audit.Resources
 		if err == nil {
 			used = sess.measure(st)
@@ -1714,7 +1755,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			case changesCatalog(st.stmtType):
 				s.catalogChanged()
 				sess.ddlCount++
-			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
+			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET,
+				st.stmtType == duckdb.STATEMENT_TYPE_PRAGMA:
+				// A PRAGMA may change a setting too.
 				sess.settingGen++
 			}
 			if st.effect != nil {

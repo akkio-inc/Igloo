@@ -298,6 +298,10 @@ func (e *Engine) CatalogChanged() { e.proxy.Invalidate() }
 // catalog list may have changed (see catalogproxy.Proxy.Generation).
 func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
 
+// DataVersion goes up whenever a table of the catalog may have changed (see
+// catalogproxy.Proxy.DataVersion).
+func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
+
 // ForgetMissingSchema makes DuckDB forget that schema, of the catalog, is
 // missing, if the catalog has it, and reports whether it did: a statement
 // that failed for want of the schema then binds when prepared again.

@@ -685,7 +685,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `policies` | The masking and row access policies that applied to the statement; `NULL` when none did |
 | `query_tag`, `pool` | The session's [query tag](workload-management.md#query-tags), and the compute pool of the replica that ran it |
 | `queued_ms` | Time it waited for its [role limits](workload-management.md#role-limits) |
-| `cpu_time_ms`, `bytes_read`, `memory_allocated_bytes` | What DuckDB measured while it ran; `NULL` for statements DuckDB did not run and ones that failed (see [resources](workload-management.md#resources-in-the-history)) |
+| `cpu_time_ms`, `bytes_read`, `memory_allocated_bytes` | What DuckDB measured while it ran; `NULL` for statements DuckDB did not run and ones that failed, 0 for those the [result cache](operations.md#result-cache) answered (see [resources](workload-management.md#resources-in-the-history)) |
 | `locations_read` | Locations outside the catalog that it read files from: `COPY INTO`'s, and the files a function such as `read_parquet` names; never external tables' files, which are read through the tables |
 | `job` | The task, pipe or materialized view it ran for, such as `task nightly`; `NULL` for a session's own statements |
 | `workers`, `stages`, `exchanges` | How many workers ran parts of the statement ([distributed execution](distributed-execution.md)), in how many stages of tasks, and how many exchanges of rows from one stage to later ones the stages wrote; 0 when it ran on one replica |

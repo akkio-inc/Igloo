@@ -37,6 +37,11 @@ type Metrics struct {
 	// sortedWrites counts the writes of rows in order sorted a range at a
 	// time (see sortedwrite.go).
 	sortedWrites prometheus.Counter
+	// resultCache counts the result cache's lookups and the results it
+	// kept, and resultBytes is the memory its results take (see
+	// resultcache.go).
+	resultCache *prometheus.CounterVec
+	resultBytes prometheus.Gauge
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -103,9 +108,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_sorted_writes_total",
 			Help: "Writes of rows in order (CREATE TABLE ... AS and INSERT with ORDER BY) too large to sort at once within IGLOO_SORT_SPILL_BUDGET, which Igloo sorted a range of the order at a time.",
 		}),
+		resultCache: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_result_cache_total",
+			Help: "Queries the result cache answered (hit), answered with the result of the same query another session was running (joined) or could not answer (missed), and results it kept (kept).",
+		}, []string{"outcome"}),
+		resultBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "igloo_result_cache_bytes",
+			Help: "Memory the results the result cache keeps take, as Igloo estimates it.",
+		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits, m.implicitRetries, m.sortedWrites)
+		m.indexStatements, m.memoryExits, m.implicitRetries, m.sortedWrites, m.resultCache, m.resultBytes)
 	return m
 }
 
@@ -142,6 +155,18 @@ func (m *Metrics) implicitRetry() {
 func (m *Metrics) sortedWrite() {
 	if m != nil {
 		m.sortedWrites.Inc()
+	}
+}
+
+func (m *Metrics) resultCached(outcome string) {
+	if m != nil {
+		m.resultCache.WithLabelValues(outcome).Inc()
+	}
+}
+
+func (m *Metrics) resultCacheBytes(n int64) {
+	if m != nil {
+		m.resultBytes.Set(float64(n))
 	}
 }
 

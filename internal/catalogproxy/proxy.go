@@ -143,6 +143,8 @@ type Proxy struct {
 	lists *listings
 	// names are how the catalog spells its tables' names (see names.go).
 	names *names
+	// data goes up whenever a table may have changed (see DataVersion).
+	data dataVersion
 
 	// prefix is the warehouse prefix DuckDB uses, and hide the namespaces
 	// whose next existence check the proxy answers with 404 (see
@@ -288,6 +290,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sw := &statusWriter{ResponseWriter: w}
+		table := tableLoad(r, rest)
+		if table != "" {
+			sw.scan = &locationScanner{}
+		}
 		if r.Method == http.MethodGet {
 			// Before DuckDB has a table it loaded, note whether it asked for
 			// it by another name than the catalog's (see names.go).
@@ -299,6 +305,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		p.reads.ServeHTTP(sw, r)
 		p.lists.loaded(rest, sw.status)
+		if table != "" && sw.status == http.StatusOK {
+			location := sw.scan.location
+			if enc := w.Header().Get("Content-Encoding"); enc != "" && enc != "identity" {
+				location = ""
+			}
+			p.data.loaded(table, location)
+		}
 		return
 	}
 
@@ -312,10 +325,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// listing begun before it is kept, and after it, so none answered
 	// while it was under way is.
 	p.lists.forget()
+	p.data.bump()
 	c := p.begin(r, rest, body)
 	select {
 	case <-c.done:
 		p.lists.forget()
+		p.data.bump()
 		c.res.write(w)
 	case <-r.Context().Done():
 		// DuckDB gave up waiting; it sends the change again, which joins
@@ -323,16 +338,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			<-c.done
 			p.lists.forget()
+			p.data.bump()
 		}()
 	}
 }
 
 // statusWriter notes the status a read was answered with, and calls before,
-// if set, with it before the answer goes out.
+// if set, with it before the answer goes out; scan, if set, reads the
+// answer as it passes.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
 	before func(status int)
+	scan   *locationScanner
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -348,6 +366,9 @@ func (w *statusWriter) WriteHeader(status int) {
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
+	}
+	if w.scan != nil {
+		w.scan.Write(b)
 	}
 	return w.ResponseWriter.Write(b)
 }

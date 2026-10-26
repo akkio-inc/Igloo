@@ -347,7 +347,9 @@ comparison reads `a || b`, which Igloo does not convert; write
   WAREHOUSE` change nothing and say so in a notice. `GRANT ... TO ROLE r`
   and `GRANT ROLE r TO USER u` are Igloo's `GRANT`.
 - `ALTER SESSION SET`: `TIMEZONE` and `STATEMENT_TIMEOUT_IN_SECONDS` set
-  Igloo's settings, `QUERY_TAG` the [query tag](sql.md#query-tags-and-role-settings);
+  Igloo's settings, `QUERY_TAG` the [query tag](sql.md#query-tags-and-role-settings),
+  `USE_CACHED_RESULT` whether the session uses the [result
+  cache](operations.md#result-cache);
   `WEEK_START`, `WEEK_OF_YEAR_POLICY`, `TIMESTAMP_TYPE_MAPPING`, the
   input formats and the output formats are accepted at the values Igloo
   follows (`0`, `TIMESTAMP_NTZ`, `AUTO`, the default output formats above)

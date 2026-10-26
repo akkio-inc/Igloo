@@ -208,13 +208,14 @@ func (p *Proxy) Generation() uint64 {
 	return p.lists.gen + p.lists.renewed
 }
 
-// Invalidate makes the proxy forget the listings it keeps. Igloo calls it
-// when it changes the catalog other than through DuckDB, as when it
-// creates a view, or another engine does through Igloo's Iceberg REST
-// endpoint.
+// Invalidate makes the proxy forget the listings it keeps, and raises the
+// data version (see DataVersion). Igloo calls it when it changes the
+// catalog other than through DuckDB, as when it creates a view, or another
+// engine does through Igloo's Iceberg REST endpoint.
 func (p *Proxy) Invalidate() {
 	if p != nil {
 		p.lists.forget()
+		p.data.bump()
 	}
 }
 

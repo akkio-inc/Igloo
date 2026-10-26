@@ -239,6 +239,9 @@ type tagWriter struct {
 	// gate, while a guard watches the statement's run (see guardLocal),
 	// keeps its first output and the guard from both happening.
 	gate *rowGate
+	// fill, if set, takes the rows for the result cache (see
+	// resultcache.go).
+	fill *resultFill
 }
 
 // rowGate keeps a statement's first output to the client and its guard's
@@ -279,6 +282,7 @@ func (w *tagWriter) Row(values []any) error {
 	if err := w.gate.begin(); err != nil {
 		return err
 	}
+	w.fill.add(values)
 	return w.DataWriter.Row(values)
 }
 
@@ -299,6 +303,9 @@ func (w *tagWriter) Complete(tag string) error {
 		return err
 	}
 	w.tag = tag
+	if w.fill != nil {
+		w.fill.tag = tag
+	}
 	return w.DataWriter.Complete(tag)
 }
 
@@ -313,6 +320,9 @@ func (w *tagWriter) Notice(code, message string) error {
 func (w *tagWriter) Rows(rows [][]any) error {
 	if err := w.gate.begin(); err != nil {
 		return err
+	}
+	for _, r := range rows {
+		w.fill.add(r)
 	}
 	return wire.WriteRows(w.DataWriter, rows)
 }
