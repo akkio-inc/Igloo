@@ -191,7 +191,8 @@ func TestResultCacheBeforePreparing(t *testing.T) {
 	mustExec(t, admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
 	unprepared := func() float64 { return testutil.ToFloat64(metrics.resultCache.WithLabelValues("unprepared")) }
 
-	const q = "SELECT k, count(*), sum(v)::BIGINT FROM lake.public.visits GROUP BY k ORDER BY k"
+	// A JSON path's $ is no parameter.
+	const q = "SELECT k, count(*), sum(v)::BIGINT, json_extract_string('{\"a\": 1}', '$.a') FROM lake.public.visits GROUP BY k ORDER BY k"
 	want := texts(t, admin, q)
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeDescribeExec} {
 		before, times := unprepared(), preparedTimes(q)
@@ -207,7 +208,7 @@ func TestResultCacheBeforePreparing(t *testing.T) {
 	// loaded again first.
 	mustExec(t, vc.replica(t).admin(t, pgx.QueryExecModeSimpleProtocol), "INSERT INTO lake.public.visits VALUES (0, 10000)")
 	before := unprepared()
-	if got := texts(t, admin, q); got[0] != "0|101|34750" {
+	if got := texts(t, admin, q); got[0] != "0|101|34750|1" {
 		t.Errorf("after an insert through another replica: %v", got)
 	}
 	if unprepared() != before {

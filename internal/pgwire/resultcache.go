@@ -323,9 +323,10 @@ const maxMemos = 10000
 // may have temporary objects. ok is false for a statement it does not
 // answer so.
 func (s *Server) statementKey(ctx context.Context, sess *session, user auth.User, text string) (resultKey, bool) {
-	if s.results == nil || sess.resultCacheOff || sess.inTx || user.Role != auth.RoleAdmin || isIglooSQL(ctx) ||
-		strings.Contains(text, "$") {
-		// "$": parameters, and Snowflake's session variables.
+	// A statement with parameters is never noted (see noteStatement), and
+	// Snowflake's session variables are translated into the text, or read
+	// with getvariable(), whose results are never kept.
+	if s.results == nil || sess.resultCacheOff || sess.inTx || user.Role != auth.RoleAdmin || isIglooSQL(ctx) {
 		return resultKey{}, false
 	}
 	settings, err := s.resultSettings(ctx, sess)
