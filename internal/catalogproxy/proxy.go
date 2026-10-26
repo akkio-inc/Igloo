@@ -303,7 +303,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		start := time.Now()
 		p.reads.ServeHTTP(sw, r)
+		if p.log.Enabled(r.Context(), slog.LevelDebug) {
+			p.log.Debug("catalog read", "method", r.Method, "path", rest, "status", sw.status,
+				"took", time.Since(start).Round(time.Microsecond), "bytes", sw.bytes)
+		}
 		p.lists.loaded(rest, sw.status)
 		if table != "" && sw.status == http.StatusOK {
 			location := sw.scan.location
@@ -349,6 +354,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	// bytes counts the answer's body.
+	bytes  int
 	before func(status int)
 	scan   *locationScanner
 }
@@ -370,6 +377,7 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.scan != nil {
 		w.scan.Write(b)
 	}
+	w.bytes += len(b)
 	return w.ResponseWriter.Write(b)
 }
 
