@@ -619,6 +619,16 @@ that run's result instead of running too. Snowflake does the same
   igloo_result_cache = off`, or Snowflake's `ALTER SESSION SET
   USE_CACHED_RESULT = FALSE` (`RESET igloo_result_cache`, `SHOW
   igloo_result_cache`).
+- **Before preparing.** Preparing a statement holds the catalog lock
+  exclusively, so the statements of a burst are prepared one at a time.
+  An admin's query whose result the cache kept, with no parameters, no
+  policy that applies to it and nothing read from a connection, is also
+  known by its text: the next one of the same text, user, roles, dialect
+  and settings, with the catalog's tables, views and policies as they
+  were, is answered without being prepared. The tables it read are loaded
+  from the catalog again first, all at once and holding no lock, so a
+  change made through another replica or engine shows as it would when
+  preparing it.
 - **In the history.** A statement answered from the cache is recorded with
   0 for `cpu_time_ms`, `bytes_read` and `memory_allocated_bytes`;
   `igloo_result_cache_total` counts them.
@@ -790,7 +800,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
 | `igloo_aggregate_passes_total` | | Tables `CREATE TABLE ... AS` filled in passes over its aggregate's groups, which would not have fit in memory in one ([aggregates too large for memory](sql.md#aggregates-too-large-for-memory)) |
-| `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept |
+| `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept`, `unprepared` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept; `unprepared` counts the hits and joins answered before preparing the statement |
 | `igloo_result_cache_bytes` | | Memory the result cache's results take, as Igloo estimates it |
 | `igloo_statements_waiting` | | Statements waiting for their [role limits](workload-management.md#role-limits) |
 | `igloo_statement_wait_seconds_total` | | Time statements spent waiting for their role limits |

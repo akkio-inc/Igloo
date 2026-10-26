@@ -19,7 +19,12 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/audit"
+	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -55,6 +60,19 @@ type resultCache struct {
 	// verdicts say whether statements' results may be kept (see
 	// keepable).
 	verdicts map[resultKey]bool
+	// memos are the statements answered before they are prepared, by
+	// statementKey (see memoStatement).
+	memos map[resultKey]memo
+}
+
+// memo is what answering a statement before it is prepared takes: the key
+// of its result, the columns it describes, and the loads of the catalog's
+// tables it reads, to make again so that a change made through another
+// replica shows (see catalogproxy's Reload).
+type memo struct {
+	key     resultKey
+	columns wire.Columns
+	loads   []catalogproxy.Load
 }
 
 // maxVerdicts bounds the verdicts kept; they are forgotten all at once.
@@ -103,6 +121,7 @@ func newResultCache(size int64, metrics *Metrics) *resultCache {
 	return &resultCache{
 		max: size, entryMax: size / 16, metrics: metrics, lru: list.New(),
 		entries: map[resultKey]*list.Element{}, flights: map[resultKey]*resultFlight{}, verdicts: map[resultKey]bool{},
+		memos: map[resultKey]memo{},
 	}
 }
 
@@ -224,21 +243,30 @@ func (res *cachedResult) replay(w wire.DataWriter) error {
 // same statement that another session has under way, and reports whether
 // it did. Otherwise it returns the fill st's own run is to give its rows
 // to, nil if its result is not to be kept. The caller has checked that the
-// cache may answer st (resultCandidate).
-func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w *tagWriter) (bool, *resultFill, error) {
+// cache may answer st (resultCandidate). key is st's result key when
+// st's result is one the cache keeps.
+func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w *tagWriter) (bool, *resultFill, *resultKey, error) {
 	c := s.results
 	settings, err := s.resultSettings(ctx, sess)
 	if err != nil {
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
 	if ok, err := s.keepable(ctx, sess, st, settings); !ok {
-		return false, nil, err
+		return false, nil, nil, err
 	}
 	key, err := s.resultKey(ctx, sess, st, args, settings)
 	if err != nil {
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
-	res, flight, fill := c.lookup(key, s.engine.DataVersion(), c.entryMax)
+	served, fill, err := c.answer(ctx, key, s.engine.DataVersion(), w)
+	return served, fill, &key, err
+}
+
+// answer sends key's result, kept at version or from the run of it under
+// way, and reports whether it did. Otherwise it returns the fill for the
+// caller's own run, nil if its result is not to be kept.
+func (c *resultCache) answer(ctx context.Context, key resultKey, version uint64, w *tagWriter) (bool, *resultFill, error) {
+	res, flight, fill := c.lookup(key, version, c.entryMax)
 	if flight != nil {
 		select {
 		case <-flight.done:
@@ -259,6 +287,171 @@ func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, ar
 	}
 	c.metrics.resultCached("missed")
 	return false, fill, nil
+}
+
+// has reports whether key's result is kept at version, or a run of it is
+// under way at version.
+func (c *resultCache) has(key resultKey, version uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[key]; ok && e.Value.(*cachedResult).version == version {
+		return true
+	}
+	f, ok := c.flights[key]
+	return ok && f.version == version
+}
+
+// Answering before preparing. Preparing a statement holds the catalog lock
+// exclusively (see prepareChecked), so the statements of a dashboard that
+// several charts or viewers ask at once were prepared one at a time, each
+// waiting for those before it, before the cache answered any of them. A
+// query whose result the cache keeps is also known by its text
+// (statementKey), when preparing it checks nothing that could come out
+// otherwise the next time: an admin's, with no parameters, no policy on
+// what it reads and nothing read from a connection. The same text from the
+// same user, roles, dialect and settings, with the catalog's tables, views
+// and policies as they were, is answered from the kept result, or the run
+// of it under way, without being prepared.
+
+// maxMemos bounds the memos kept; they are forgotten all at once.
+const maxMemos = 10000
+
+// statementKey tells text apart as memoStatement does: by the text, as
+// DuckDB is to prepare it, the dialect, the user with their built-in and
+// custom roles, the session's settings, and the generations of the
+// catalog, its views and the policies; and by the session itself when it
+// may have temporary objects. ok is false for a statement it does not
+// answer so.
+func (s *Server) statementKey(ctx context.Context, sess *session, user auth.User, text string) (resultKey, bool) {
+	if s.results == nil || sess.resultCacheOff || sess.inTx || user.Role != auth.RoleAdmin || isIglooSQL(ctx) ||
+		strings.Contains(text, "$") {
+		// "$": parameters, and Snowflake's session variables.
+		return resultKey{}, false
+	}
+	settings, err := s.resultSettings(ctx, sess)
+	if err != nil {
+		return resultKey{}, false
+	}
+	privs, err := s.privileges(ctx, sess, user)
+	if err != nil {
+		return resultKey{}, false
+	}
+	// Policies changed elsewhere show in their generation, as they do when
+	// a statement is prepared.
+	s.gov.snapshot(ctx)
+	h := sha256.New()
+	writeField(h, "statement")
+	writeField(h, text)
+	writeField(h, string(sess.sqlDialect()))
+	writeField(h, user.Name)
+	writeField(h, string(user.Role))
+	if privs != nil {
+		for _, r := range slices.Sorted(slices.Values(privs.Roles)) {
+			writeField(h, "role "+r)
+		}
+	}
+	h.Write(settings[:])
+	var views uint64
+	if s.ddl != nil {
+		views = s.ddl.Generation()
+	}
+	_ = binary.Write(h, binary.LittleEndian, [3]uint64{s.catalogGeneration(), s.gov.gen.Load(), views})
+	if sess.temps {
+		_ = binary.Write(h, binary.LittleEndian, sess.resultSalt)
+	}
+	var k resultKey
+	h.Sum(k[:0])
+	return k, true
+}
+
+// noteStatement has the cache answer text, from user, before it is
+// prepared from now on, with the result of key and columns, when what
+// preparing it checked could not come out otherwise (see statementKey).
+func (s *Server) noteStatement(ctx context.Context, sess *session, user auth.User, text string, st *statement, key resultKey,
+	columns wire.Columns) {
+	if !st.inert() || st.access != nil || len(st.params) > 0 || len(st.loads) == 0 {
+		return
+	}
+	mk, ok := s.statementKey(ctx, sess, user, text)
+	if !ok {
+		return
+	}
+	c := s.results
+	c.mu.Lock()
+	if len(c.memos) >= maxMemos {
+		clear(c.memos)
+	}
+	c.memos[mk] = memo{key: key, columns: columns, loads: st.loads}
+	c.mu.Unlock()
+}
+
+// memoStatement answers q, a query in DuckDB's dialect as translated by tr
+// if at all, from the cache without preparing it, if a statement of the
+// same text was answered or kept so (see statementKey). If the result is
+// gone by the time the statement runs, it is prepared and run as any
+// other, and fails if its columns are not those it described.
+func (s *Server) memoStatement(ctx context.Context, sess *session, user auth.User, q wire.Query, tr *translation) (wire.PreparedStatements, bool) {
+	if len(q.ParameterOIDs) > 0 {
+		return nil, false
+	}
+	mk, ok := s.statementKey(ctx, sess, user, q.Query)
+	if !ok {
+		return nil, false
+	}
+	c := s.results
+	c.mu.Lock()
+	m, ok := c.memos[mk]
+	c.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	// Loading its tables again, as preparing it would, shows a change made
+	// through another replica or engine meanwhile; those loads run at once,
+	// holding nothing.
+	if err := s.engine.ReloadTables(ctx, m.loads); err != nil || !c.has(m.key, s.engine.DataVersion()) {
+		return nil, false
+	}
+	ps := wire.NewStatement(func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
+		start := time.Now()
+		tw := &tagWriter{DataWriter: w}
+		served := false
+		var err error
+		if arrowWriterOf(w) == nil {
+			cctx, cached := sess.cancelable(ctx, q.Query)
+			var fill *resultFill
+			served, fill, err = c.answer(cctx, m.key, s.engine.DataVersion(), tw)
+			err = cached(err)
+			// Not answered: the caller's own run below keeps its result.
+			s.finishResult(fill, errUnfinished)
+		}
+		if served || err != nil {
+			var used *audit.Resources
+			if err == nil {
+				used = &audit.Resources{}
+				c.metrics.resultCached("unprepared")
+			}
+			s.metrics.query(start, err)
+			s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), used: used,
+				stmtType: duckdb.STATEMENT_TYPE_SELECT})
+			return pgError(err)
+		}
+		// Gone meanwhile: prepared and run as any other statement.
+		ps, err := s.preparedQuery(ctx, sess, user, q, tr)
+		if err != nil {
+			return err
+		}
+		defer sess.release(ps[0]) //nolint:errcheck
+		if !sameColumns(ps[0].Columns(), m.columns) {
+			return pgerror.WithCode(errors.New("cached plan must not change result type"), codes.FeatureNotSupported)
+		}
+		return ps[0].Run(ctx, w, params)
+	}, wire.WithColumns(m.columns))
+	return wire.Prepared(ps), true
+}
+
+// sameColumns reports whether a and b describe the same columns.
+func sameColumns(a, b wire.Columns) bool {
+	return slices.EqualFunc(a, b, func(x, y wire.Column) bool { return x.Name == y.Name && x.Oid == y.Oid })
 }
 
 // errUnfinished ends a run whose statement's handling stopped before it

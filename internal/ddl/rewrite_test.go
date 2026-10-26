@@ -27,6 +27,29 @@ func TestRewriteNames(t *testing.T) {
 	}
 }
 
+func TestRespellNames(t *testing.T) {
+	catalog := map[string]string{"common.attributes": "ATTRIBUTES", "common.visits": "visits"}
+	spell := func(cat, schema, name string) (string, bool) {
+		if !strings.EqualFold(cat, "lake") {
+			return "", false
+		}
+		n, ok := catalog[strings.ToLower(schema+"."+name)]
+		return n, ok
+	}
+	for in, want := range map[string]string{
+		"SELECT * FROM lake.common.attributes a JOIN lake.common.visits v USING (id)": `SELECT * FROM lake.common."ATTRIBUTES" a JOIN lake.common.visits v USING (id)`,
+		`SELECT * FROM "lake"."common"."Attributes"`:                                  `SELECT * FROM "lake"."common"."ATTRIBUTES"`,
+		"SELECT lake.common.attributes.age FROM lake.common.ATTRIBUTES":               `SELECT lake.common."ATTRIBUTES".age FROM lake.common.ATTRIBUTES`,
+		"SELECT * FROM lake.common.VISITS":                                            `SELECT * FROM lake.common."visits"`,
+		"SELECT * FROM lake.common.other, other.common.attributes":                    "SELECT * FROM lake.common.other, other.common.attributes",
+		"SELECT 'lake.common.attributes' -- lake.common.attributes":                   "SELECT 'lake.common.attributes' -- lake.common.attributes",
+	} {
+		if got := respellNames(in, spell); got != want {
+			t.Errorf("respellNames(%q)\n got %q\nwant %q", in, got, want)
+		}
+	}
+}
+
 func TestQualifyNames(t *testing.T) {
 	tables := map[string]bool{"sales.orders": true, "public.t": true}
 	match := func(schema, name string) bool { return tables[schema+"."+name] }

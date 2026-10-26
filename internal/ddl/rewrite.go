@@ -33,6 +33,18 @@ func (m *Manager) rewrite(query string) string {
 	query = rewriteNames(query, func(catalog, schema, name string) bool {
 		return strings.EqualFold(catalog, m.Catalog()) && m.IsView(schema, name)
 	}, local)
+	// The catalog's tables by the catalog's spelling of their names.
+	// DuckDB-Iceberg names its entry for a table as it was last looked up,
+	// so a view whose body spells a table another way had every hold of the
+	// catalog lock look the table up again by the catalog's name, before it
+	// lists anything (see the engine's respell), and every bind of the view
+	// spell it back.
+	query = respellNames(query, func(catalog, schema, name string) (string, bool) {
+		if !strings.EqualFold(catalog, m.Catalog()) {
+			return "", false
+		}
+		return m.eng.TableSpelling([]string{schema}, name)
+	})
 	return qualifyNames(query, m.IsView, local)
 }
 
@@ -258,6 +270,38 @@ func rewriteNames(query string, match func(catalog, schema, name string) bool, r
 		out.WriteString(query[last:toks[i].start])
 		out.WriteString(replacement)
 		last = toks[i].end
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
+}
+
+// respellNames writes the last part of every three-part name
+// catalog.schema.name as spell returns it, quoted, where spell knows it and
+// it spells the name another way.
+func respellNames(query string, spell func(catalog, schema, name string) (string, bool)) string {
+	toks := nameTokens(query)
+	isName := func(i int) bool { return i < len(toks) && !toks[i].dot && !toks[i].brk }
+	isDot := func(i int) bool { return i < len(toks) && toks[i].dot }
+
+	var out strings.Builder
+	last := 0
+	for i := range toks {
+		if !isName(i) || (i > 0 && isDot(i-1)) {
+			continue
+		}
+		if !isDot(i+1) || !isName(i+2) || !isDot(i+3) || !isName(i+4) {
+			continue
+		}
+		spelled, ok := spell(toks[i].name, toks[i+2].name, toks[i+4].name)
+		if !ok || spelled == toks[i+4].name {
+			continue
+		}
+		out.WriteString(query[last:toks[i+4].start])
+		out.WriteString(quoteIdent(spelled))
+		last = toks[i+4].end
 	}
 	if last == 0 {
 		return query

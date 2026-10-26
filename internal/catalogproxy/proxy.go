@@ -316,6 +316,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				location = ""
 			}
 			p.data.loaded(table, location)
+			p.data.record(Load{path: table, rest: rest, header: r.Header})
 		}
 		return
 	}

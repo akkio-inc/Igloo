@@ -100,6 +100,17 @@ func (n *names) lookup(key [2]string) (Table, bool, time.Time) {
 	return Table{Namespace: sp.namespace, Name: name}, ok, sp.at
 }
 
+// Spelling returns how the catalog spells the name of the table name in
+// namespace, as the proxy last learned it, without asking the catalog; ok
+// is false when the proxy does not know the table.
+func (p *Proxy) Spelling(namespace []string, name string) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	t, ok, _ := p.names.lookup([2]string{strings.ToLower(strings.Join(namespace, "\x1f")), strings.ToLower(name)})
+	return t.Name, ok
+}
+
 // checkSpelling runs before DuckDB has the catalog's answer 200 to r, whose
 // path under the proxy is rest: if r loaded a table under another name than
 // the catalog spells it with, the table is noted for Respelled.

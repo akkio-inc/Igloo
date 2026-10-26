@@ -159,3 +159,80 @@ func TestResultCache(t *testing.T) {
 		t.Errorf("concurrent runs: %v, joined %v", results, outcome("joined")-joined)
 	}
 }
+
+// TestResultCacheBeforePreparing checks that a query the cache keeps is
+// answered without being prepared the next time its text comes, from any
+// session of the same user, in either dialect and protocol, while nothing
+// it reads has changed, here or through another replica; and that a user
+// whose statements preparing checks is not answered so.
+func TestResultCacheBeforePreparing(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	r := vc.replica(t, func(o *Options) {
+		o.ResultCacheSize = 64 << 20
+		o.Metrics = metrics
+	})
+	var mu sync.Mutex
+	prepared := map[string]int{}
+	r.srv.beforePrepare = func(_ context.Context, text string) {
+		mu.Lock()
+		prepared[text]++
+		mu.Unlock()
+	}
+	preparedTimes := func(text string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return prepared[text]
+	}
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE SCHEMA IF NOT EXISTS lake.public")
+	mustExec(t, admin, "CREATE TABLE lake.public.visits AS SELECT i % 5 AS k, i AS v FROM range(500) r(i)")
+	mustExec(t, admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
+	unprepared := func() float64 { return testutil.ToFloat64(metrics.resultCache.WithLabelValues("unprepared")) }
+
+	const q = "SELECT k, count(*), sum(v)::BIGINT FROM lake.public.visits GROUP BY k ORDER BY k"
+	want := texts(t, admin, q)
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeDescribeExec} {
+		before, times := unprepared(), preparedTimes(q)
+		if got := texts(t, r.admin(t, mode), q); !slices.Equal(got, want) {
+			t.Errorf("mode %v: %v, want %v", mode, got, want)
+		}
+		if unprepared() != before+1 || preparedTimes(q) != times {
+			t.Errorf("mode %v: the query was prepared again", mode)
+		}
+	}
+
+	// A change through another replica shows: the tables it reads are
+	// loaded again first.
+	mustExec(t, vc.replica(t).admin(t, pgx.QueryExecModeSimpleProtocol), "INSERT INTO lake.public.visits VALUES (0, 10000)")
+	before := unprepared()
+	if got := texts(t, admin, q); got[0] != "0|101|34750" {
+		t.Errorf("after an insert through another replica: %v", got)
+	}
+	if unprepared() != before {
+		t.Error("answered from before the insert")
+	}
+	if texts(t, admin, q); unprepared() != before+1 {
+		t.Error("the new result was not answered before preparing")
+	}
+
+	// A user other than an admin, whose statements preparing checks.
+	rita := connect(t, r.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)
+	before = unprepared()
+	texts(t, rita, q)
+	texts(t, rita, q)
+	if unprepared() != before {
+		t.Error("a reader's query was answered before preparing")
+	}
+
+	// Snowflake's dialect.
+	sf := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	const sq = "select K, count(*) as N from lake.public.visits group by K order by K"
+	first := texts(t, sf, sq)
+	before = unprepared()
+	if got := texts(t, sf, sq); !slices.Equal(got, first) || unprepared() != before+1 {
+		t.Errorf("Snowflake's dialect: %v then %v, %v answered before preparing", first, got, unprepared()-before)
+	}
+}

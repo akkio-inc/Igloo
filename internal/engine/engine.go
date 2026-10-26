@@ -294,6 +294,13 @@ func (e *Engine) CatalogLockedFor() time.Duration {
 // listings).
 func (e *Engine) CatalogChanged() { e.proxy.Invalidate() }
 
+// TableSpelling returns how the catalog spells the name of its table name
+// in namespace, as far as this instance knows; ok is false when it does
+// not know the table.
+func (e *Engine) TableSpelling(namespace []string, name string) (string, bool) {
+	return e.proxy.Spelling(namespace, name)
+}
+
 // ListingsGeneration changes whenever what DuckDB's listings of the
 // catalog list may have changed (see catalogproxy.Proxy.Generation).
 func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
@@ -301,6 +308,16 @@ func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
 // DataVersion goes up whenever a table of the catalog may have changed (see
 // catalogproxy.Proxy.DataVersion).
 func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
+
+// RecordLoads records the catalog's tables DuckDB loads until the func it
+// returns is called, which returns them (see catalogproxy's RecordLoads).
+func (e *Engine) RecordLoads() func() []catalogproxy.Load { return e.proxy.RecordLoads() }
+
+// ReloadTables loads the tables of loads again, so that DataVersion goes
+// up if any changed since they were loaded (see catalogproxy's Reload).
+func (e *Engine) ReloadTables(ctx context.Context, loads []catalogproxy.Load) error {
+	return e.proxy.Reload(ctx, loads)
+}
 
 // ForgetMissingSchema makes DuckDB forget that schema, of the catalog, is
 // missing, if the catalog has it, and reports whether it did: a statement

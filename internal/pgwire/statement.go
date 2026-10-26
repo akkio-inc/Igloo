@@ -15,6 +15,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -76,6 +77,9 @@ type statement struct {
 	// table, which Igloo carries out in steps so that filling the table
 	// does not hold the catalog lock (see runStagedCreate).
 	staged *stagedCreate
+	// loads are the catalog's tables DuckDB loaded as it prepared the
+	// statement: those it reads (see prepareChecked).
+	loads []catalogproxy.Load
 	// listsCatalog says the statement walks the catalog's in-memory set of
 	// tables or views (information_schema, pg_catalog,
 	// duckdb_tables/views/columns, SHOW, DESCRIBE), so it holds the catalog

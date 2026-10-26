@@ -1246,6 +1246,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Preparing a dashboard's statements, which holds the catalog lock
+  exclusively and so goes one statement at a time, takes less of that
+  lock. A query the [result cache](docs/operations.md#result-cache) kept
+  is answered the next time its text comes without being prepared, once
+  the tables it read are loaded again, holding no lock, to see that none
+  changed. Readying a statement to run takes the lock only when there is
+  something to check again (grants, or policies, the catalog or the
+  session's settings changed). And views and statements name the
+  catalog's tables as the catalog spells them, so that a view whose body
+  spelled a table in another case no longer had every hold of the lock
+  look the table up again. A dashboard build spent about 26
+  seconds preparing, one statement at a time.
 - `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
   running at once on a replica, whoever runs them, as a Snowflake
   warehouse's `MAX_CONCURRENCY_LEVEL` does: [the replica's

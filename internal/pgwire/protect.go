@@ -1957,6 +1957,35 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 
 // recheck checks a prepared statement again before it runs: its policies,
 // then its grants.
+// needsRecheck reports whether rechecking st could do anything: it has
+// grants to check again, or its policies could apply otherwise now, as
+// policies, the catalog or the session's settings changed, or as they
+// read the user's privileges. Like recheck, it first reads the user again,
+// failing for a user dropped or disabled meanwhile, and the policies, as
+// changed elsewhere; neither holds the catalog lock.
+func (s *Server) needsRecheck(ctx context.Context, sess *session, st *statement) (bool, error) {
+	if st.access != nil {
+		return true, nil
+	}
+	g := st.guard
+	if g == nil {
+		return false, nil
+	}
+	if _, err := s.refreshUser(ctx, sess); err != nil {
+		return false, err
+	}
+	s.gov.snapshot(ctx)
+	return g.touched || g.policyGen != s.gov.gen.Load() || g.catalogGen != s.catalogGeneration() || g.settingGen != sess.settingGen, nil
+}
+
+// inert reports whether st's policies left it as written, and would have
+// whatever the user's privileges, so that its text alone, with the
+// policies, catalog and settings as they are, decides what it runs.
+func (st *statement) inert() bool {
+	g := st.guard
+	return st.original == "" && (g == nil || !g.touched && len(g.applied) == 0 && !g.hiddenOnly)
+}
+
 func (s *Server) recheck(ctx context.Context, sess *session, st *statement) error {
 	changed, err := s.recheckPolicies(ctx, sess, st)
 	if err != nil {

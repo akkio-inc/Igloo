@@ -84,6 +84,11 @@ type Engine interface {
 	// DataVersion goes up whenever a table of the catalog may have
 	// changed, through this replica or otherwise (see resultcache.go).
 	DataVersion() uint64
+	// RecordLoads records the catalog's tables DuckDB loads until the func
+	// it returns is called, and ReloadTables loads such tables again, so
+	// that DataVersion goes up if any changed meanwhile.
+	RecordLoads() func() []catalogproxy.Load
+	ReloadTables(ctx context.Context, loads []catalogproxy.Load) error
 	// ForgetMissingSchema makes DuckDB forget a schema of the catalog it
 	// took for missing, if the catalog has it, and reports whether it did.
 	ForgetMissingSchema(ctx context.Context, schema string) bool
@@ -1614,6 +1619,15 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		return ps, err
 	}
 
+	if ps, ok := s.memoStatement(ctx, sess, user, q, tr); ok {
+		return ps, nil
+	}
+	return s.preparedQuery(ctx, sess, user, q, tr)
+}
+
+// preparedQuery prepares q, a statement in DuckDB's dialect as translated
+// by tr if at all, and returns what runs it.
+func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.User, q wire.Query, tr *translation) (wire.PreparedStatements, error) {
 	st, err := s.prepareStatement(ctx, sess, user, q.Query, q.ParameterOIDs)
 	if err != nil {
 		return nil, err
@@ -1698,8 +1712,14 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		served, fill := false, (*resultFill)(nil)
 		if s.results != nil && !sess.resultCacheOff && resultCandidate(sess, st, tw) {
 			cctx, cached := sess.cancelable(ctx, q.Query)
-			served, fill, err = s.fromCache(cctx, sess, st, args, tw)
+			var key *resultKey
+			served, fill, key, err = s.fromCache(cctx, sess, st, args, tw)
 			err = cached(err)
+			if key != nil && err == nil {
+				// The next of the same text is answered before it is
+				// prepared (see memoStatement).
+				s.noteStatement(ctx, sess, user, q.Query, st, *key, tr.columns(st.columns))
+			}
 		}
 		if served || err != nil {
 			var used *audit.Resources
@@ -2048,16 +2068,29 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	}
 	// Rechecking re-plans with EXPLAIN and may re-apply policies, both of
 	// which read and fill in the catalog's set; release before the run
-	// takes the side it needs (see holdCatalog, catalogRunLock).
-	locked := sess.phase("catalog_lock")
-	relist := s.holdCatalog(sess)
-	locked()
-	rechecking := sess.phase("recheck")
-	err := s.recheck(ctx, sess, st)
-	rechecking()
-	relist()
+	// takes the side it needs (see holdCatalog, catalogRunLock). A
+	// statement with nothing to check again, as an admin's that reads no
+	// connection while the policies, the catalog and the session's settings
+	// stay as they were, holds nothing here: every run of one would
+	// otherwise wait its turn for the lock with the statements being
+	// prepared.
+	deciding := sess.phase("recheck")
+	again, err := s.needsRecheck(ctx, sess, st)
+	deciding()
 	if err != nil {
 		return err
+	}
+	if again {
+		locked := sess.phase("catalog_lock")
+		relist := s.holdCatalog(sess)
+		locked()
+		rechecking := sess.phase("recheck")
+		err := s.recheck(ctx, sess, st)
+		rechecking()
+		relist()
+		if err != nil {
+			return err
+		}
 	}
 	// One that counts through ID domains' ids reads the snapshots that have
 	// them (see idcount.go); looking them up asks the catalog, which holds
@@ -2111,7 +2144,7 @@ func (s *Server) rewriteCounting(ctx context.Context, sess *session, user auth.U
 // statements Igloo runs for a user to carry out one of its own commands
 // (COPY INTO, materialized views): they are checked exactly like the
 // user's own.
-func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (*statement, error) {
+func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (st *statement, err error) {
 	// Preparing reads and fills in the catalog's in-memory set of tables:
 	// DuckDB binds the statement (and suggests names for a missing table),
 	// and Igloo resolves names, loads schemas and checks grants the same way,
@@ -2122,6 +2155,14 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	locked := sess.phase("catalog_lock")
 	defer s.holdCatalog(sess)()
 	locked()
+	// The catalog's tables it reads: those DuckDB loads while this holds
+	// the lock, as no other bind runs alongside (see memoStatement).
+	loads := s.engine.RecordLoads()
+	defer func() {
+		if l := loads(); st != nil {
+			st.loads = l
+		}
+	}()
 	defer sess.cacheReports()()
 	if sess.memo == nil {
 		sess.memo = &checkMemo{plans: map[string]any{}}

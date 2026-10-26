@@ -1,7 +1,12 @@
 package catalogproxy
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +32,110 @@ type dataVersion struct {
 	// locations are the metadata locations the last loads found, by the
 	// table's path in the catalog's API.
 	locations map[string]string
+	// recorders take the loads made while they are set (see RecordLoads).
+	recorders []*loadRecorder
+}
+
+// Load is a load of a table DuckDB made, which Reload makes again.
+type Load struct {
+	// path is the table, as locations has it; rest the request's path
+	// under the proxy, and header its headers.
+	path, rest string
+	header     http.Header
+}
+
+// loadRecorder takes the loads made while it is set, one a table.
+type loadRecorder struct {
+	mu    sync.Mutex
+	loads map[string]Load
+}
+
+// RecordLoads records the loads of tables DuckDB makes from now on, until
+// the func it returns, which returns them, is called. A statement prepared
+// holding the catalog lock exclusively, which no other bind runs alongside,
+// loads every table it reads, its views' included, so the loads recorded
+// then are the tables the statement reads.
+func (p *Proxy) RecordLoads() func() []Load {
+	if p == nil {
+		return func() []Load { return nil }
+	}
+	r := &loadRecorder{loads: map[string]Load{}}
+	d := &p.data
+	d.mu.Lock()
+	d.recorders = append(d.recorders, r)
+	d.mu.Unlock()
+	return func() []Load {
+		d.mu.Lock()
+		d.recorders = slices.DeleteFunc(d.recorders, func(x *loadRecorder) bool { return x == r })
+		d.mu.Unlock()
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return slices.Collect(maps.Values(r.loads))
+	}
+}
+
+// record gives a load to the recorders set.
+func (d *dataVersion) record(l Load) {
+	d.mu.Lock()
+	recorders := slices.Clone(d.recorders)
+	d.mu.Unlock()
+	for _, r := range recorders {
+		r.mu.Lock()
+		if _, ok := r.loads[l.path]; !ok {
+			r.loads[l.path] = Load{path: l.path, rest: l.rest, header: l.header.Clone()}
+		}
+		r.mu.Unlock()
+	}
+}
+
+// Reload loads the tables of loads again, all at once, as DuckDB loaded
+// them, so that DataVersion goes up if any of them changed since, here or
+// through another replica or engine (see loaded), without DuckDB binding
+// anything. It returns the first error.
+func (p *Proxy) Reload(ctx context.Context, loads []Load) error {
+	if p == nil || len(loads) == 0 {
+		return nil
+	}
+	errs := make(chan error, len(loads))
+	for _, l := range loads {
+		go func() {
+			errs <- p.reload(ctx, l)
+		}()
+	}
+	var first error
+	for range loads {
+		if err := <-errs; err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+func (p *Proxy) reload(ctx context.Context, l Load) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.base+"/"+l.rest, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = forwardHeader(l.header)
+	req.Header.Del("Accept-Encoding")
+	res, err := p.do(req)
+	if err != nil {
+		return err
+	}
+	if res.status != http.StatusOK {
+		// Dropped, say: whatever read it no longer reads the same.
+		p.data.bump()
+		return fmt.Errorf("loading %s again: HTTP %d", l.path, res.status)
+	}
+	var loaded struct {
+		Location string `json:"metadata-location"`
+	}
+	if err := json.Unmarshal(res.body, &loaded); err != nil {
+		p.data.loaded(l.path, "")
+		return err
+	}
+	p.data.loaded(l.path, loaded.Location)
+	return nil
 }
 
 // DataVersion goes up whenever a table of the catalog may have changed.
