@@ -425,6 +425,7 @@ func serve() error {
 		replica = runtime.GOMAXPROCS(0)
 	}
 	limits.LimitReplica(replica)
+	limits.EstimateFromHistory(cfg.StatementReservations)
 	reg.MustRegister(limits.Metrics()...)
 
 	opts := pgwire.Options{

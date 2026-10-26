@@ -1757,6 +1757,11 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// A query or a change of data waits its turn behind the replica's
 		// limit of statements at once, if there is one.
 		sess.wl.counted = countsOnReplica(sess, st)
+		sess.wl.shape = ""
+		if sess.wl.counted {
+			sess.wl.shape = statementShape(st.prepared)
+		}
+		shape := sess.wl.shape
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
@@ -1814,12 +1819,17 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			}
 			return run()
 		})
-		sess.wl.counted = false
+		sess.wl.counted, sess.wl.shape = false, ""
 		releaseCatalog()
 		s.finishResult(fill, err)
 		var used *audit.Resources
 		if err == nil {
 			used = sess.measure(st)
+		}
+		if used != nil && parts.workers == 0 {
+			// What it allocated here, for the next statement like it; one
+			// that ran on workers allocated most of it there.
+			s.workload.Observe(shape, used.MemoryAllocated)
 		}
 		queued := sess.wl.queued
 		s.metrics.query(start, err)

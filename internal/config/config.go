@@ -16,6 +16,10 @@ import (
 	"time"
 )
 
+// DefaultStatementReservations is IGLOO_STATEMENT_RESERVATIONS's auto: a
+// statement reserves as much as its shape allocated last.
+const DefaultStatementReservations = 1.0
+
 // Config is everything the igloo server needs to start.
 type Config struct {
 	// ListenAddr is where the Postgres-protocol endpoint listens.
@@ -78,6 +82,13 @@ type Config struct {
 	// (IGLOO_MAX_CONCURRENT_STATEMENTS: a number, auto for as many as the
 	// cores, -1 here, or off, 0, for no limit, the default).
 	MaxConcurrentStatements int
+	// StatementReservations is the fraction of what a statement's shape
+	// allocated last that it reserves of the replica's memory before it
+	// starts, when its role sets no memory_limit (see workload's
+	// EstimateFromHistory); zero turns that off (IGLOO_STATEMENT_RESERVATIONS:
+	// auto for DefaultStatementReservations, the default, a fraction up to
+	// 4, or off).
+	StatementReservations float64
 	// ResultCacheSize is the memory the results Igloo keeps of queries may
 	// take, to send them again to the same query while no table changes
 	// (IGLOO_RESULT_CACHE_SIZE, 256 MiB by default; 0 or off keeps none).
@@ -587,6 +598,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("IGLOO_MAX_CONCURRENT_STATEMENTS must be a whole number from 1 to 10000, auto or off, got %q", v)
 		}
 		cfg.MaxConcurrentStatements = n
+	}
+
+	switch v := strings.ToLower(get("IGLOO_STATEMENT_RESERVATIONS", "auto")); v {
+	case "auto":
+		cfg.StatementReservations = DefaultStatementReservations
+	case "off", "0":
+	default:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f <= 0 || f > 4 {
+			addErr("IGLOO_STATEMENT_RESERVATIONS must be auto, off or a fraction from 0 to 4, got %q", v)
+		}
+		cfg.StatementReservations = f
 	}
 
 	switch v := get("IGLOO_RESULT_CACHE_SIZE", "256MiB"); {

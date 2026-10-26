@@ -223,6 +223,35 @@ other DDL do not, and neither does a result the [result
 cache](operations.md#result-cache) answers. A statement waiting for this
 limit says so: `behind the replica's limit of 8 statements at once`.
 
+### Reservations from history
+
+A replica's statements share its memory, so heavy ones that start together
+spill to disk, and on a busy disk take far longer than one after the other;
+a fixed limit, though, holds back the light statements with the heavy ones.
+Igloo instead learns what each statement allocated, by its shape (its text
+with string and number literals masked, which a dashboard sends again with
+other audiences, dates and limits), and the next statement of that shape
+reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default, is all of
+it) of the replica's memory before it starts, as a role's `memory_limit`
+reserves (see [role limits](#role-limits)). A statement whose shape
+allocated more than the replica's memory waits until the others'
+reservations are released; one whose reservation would be under a
+sixteenth of the memory, or whose shape Igloo has not seen since the
+replica started, reserves nothing and starts at once. A role's own
+`memory_limit` comes first.
+
+On a dashboard's burst of queries over billions of rows, on 8 cores and 22 GB, the
+build took 548 to 574 seconds with 8 statements running at once and 365
+with 2, and takes 306 to 310 with reservations, its median query 21 to 22
+seconds rather than 32 to 51; reserving half of what a shape allocated
+took 314 to 353, and a quarter 367 to 371. The first time a dashboard runs
+on a replica, its statements have no history and reserve nothing. What a
+statement allocates over its run is not its peak, which DuckDB 1.5 does not
+measure for one statement; the fraction stands in for how much of it the
+statement holds at once, and `off` turns the reservations off. Shapes are kept for the replica's life, up
+to 4,096 of them, and statements that ran on [workers](distributed-execution.md)
+are not learned from, since most of what they allocated was the workers'.
+
 ## Compute pools
 
 A compute pool, Snowflake's "virtual warehouse", is a group of Igloo

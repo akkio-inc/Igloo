@@ -34,6 +34,10 @@ type Controller struct {
 	// zero means none.
 	replicaMax int
 
+	// history estimates reservations from what statements allocated (see
+	// footprints.go).
+	history footprints
+
 	mu       sync.Mutex
 	reserved int64
 	running  map[string]int

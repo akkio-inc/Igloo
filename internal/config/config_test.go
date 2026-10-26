@@ -527,6 +527,25 @@ func TestMaxConcurrentStatements(t *testing.T) {
 	}
 }
 
+func TestStatementReservations(t *testing.T) {
+	for v, want := range map[string]float64{"": DefaultStatementReservations, "auto": DefaultStatementReservations,
+		"off": 0, "0": 0, "0.25": 0.25, "0.5": 0.5, "2": 2} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_STATEMENT_RESERVATIONS"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.StatementReservations != want {
+			t.Errorf("IGLOO_STATEMENT_RESERVATIONS=%q: %v %v, want %v", v, cfg.StatementReservations, err, want)
+		}
+	}
+	for _, v := range []string{"-1", "5", "lots"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_STATEMENT_RESERVATIONS": v})); err == nil {
+			t.Errorf("IGLOO_STATEMENT_RESERVATIONS=%s should be refused", v)
+		}
+	}
+}
+
 func TestResultCacheSize(t *testing.T) {
 	for v, want := range map[string]int64{"": 256 << 20, "0": 0, "off": 0, "1GB": 1e9, "64MiB": 64 << 20} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

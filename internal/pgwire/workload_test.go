@@ -335,3 +335,30 @@ func TestMemoryReservations(t *testing.T) {
 	defer release()
 	mustExec(t, cs.admin, "SELECT 2")
 }
+
+// TestStatementShape checks the shapes that reservations learn by: the same
+// for a statement sent again with other literals or comments, other for
+// another statement or a name with other digits.
+func TestStatementShape(t *testing.T) {
+	base := statementShape("SELECT a, count(*) FROM t WHERE id = 'x1' AND day >= DATE '2025-01-01' LIMIT 10")
+	for _, same := range []string{
+		"SELECT a, count(*) FROM t WHERE id = 'other' AND day >= DATE '2026-12-31' LIMIT 75",
+		"SELECT a, count(*) /* a dashboard's chart */ FROM t WHERE id = 'x1' AND day >= DATE '2025-01-01' LIMIT 1.5e3",
+	} {
+		if statementShape(same) != base {
+			t.Errorf("%q has another shape", same)
+		}
+	}
+	for _, other := range []string{
+		"SELECT a, count(*) FROM u WHERE id = 'x1' AND day >= DATE '2025-01-01' LIMIT 10",
+		"SELECT b, count(*) FROM t WHERE id = 'x1' AND day >= DATE '2025-01-01' LIMIT 10",
+	} {
+		if statementShape(other) == base {
+			t.Errorf("%q has the same shape", other)
+		}
+	}
+	if statementShape(`SELECT * FROM demo_x10.t`) == statementShape(`SELECT * FROM demo_x11.t`) ||
+		statementShape(`SELECT "c1" FROM t`) == statementShape(`SELECT "c2" FROM t`) {
+		t.Error("names with other digits have the same shape")
+	}
+}

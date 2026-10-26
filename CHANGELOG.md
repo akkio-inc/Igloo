@@ -1275,6 +1275,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Statements reserve memory by what statements like them allocated before
+  (`IGLOO_STATEMENT_RESERVATIONS`; see [reservations from
+  history](docs/workload-management.md#reservations-from-history)), so that
+  heavy ones wait for room rather than start together and spill, while
+  light ones start at once. A dashboard's burst of queries over billions of rows,
+  on 8 cores, took 548 to 574 seconds and take 306 to 310, the median
+  query 21 to 22 seconds rather than 32 to 51.
 - Preparing a dashboard's statements, which holds the catalog lock
   exclusively and so goes one statement at a time, takes less of that
   lock. A query the [result cache](docs/operations.md#result-cache) kept

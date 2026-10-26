@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"regexp"
@@ -53,6 +54,10 @@ type workloadState struct {
 	// counted says the statement about to run counts against the
 	// replica's limit of statements at once (see countsOnReplica).
 	counted bool
+	// shape is the statement's text with its literals masked, by which the
+	// controller estimates what it reserves (see statementShape); "" for
+	// none.
+	shape string
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
 	// controller holds statements back for their limits.
@@ -114,6 +119,10 @@ func countsOnReplica(sess *session, st *statement) bool {
 func (sess *session) admit(ctx context.Context) (func(), error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
+	if l.Memory == 0 && l.Counted {
+		// What statements like it allocated, when its role reserves nothing.
+		l.Memory = sess.wl.controller.Estimate(sess.wl.shape)
+	}
 	release, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
 	if err == nil {
@@ -143,6 +152,30 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 	}
 	return nil, pgerror.WithCode(fmt.Errorf("canceling statement due to %s: it waited %s to start, behind %s",
 		why, waited.Round(time.Millisecond), strings.Join(behind, " and ")), codes.QueryCanceled)
+}
+
+// numberLiteral is a number in SQL code, not part of a name.
+var numberLiteral = regexp.MustCompile(`\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b`)
+
+// statementShape is text with its string and number literals masked, its
+// comments left out and its white space collapsed: a dashboard's statement
+// sent again with another audience, date or limit has the same shape.
+func statementShape(text string) string {
+	var b strings.Builder
+	for _, seg := range sqllex.Segments(text) {
+		switch seg.Kind {
+		case sqllex.String:
+			b.WriteString("?")
+		case sqllex.Code:
+			b.WriteString(numberLiteral.ReplaceAllString(seg.Text, "?"))
+		case sqllex.Ident:
+			b.WriteString(seg.Text)
+		case sqllex.Comment:
+			b.WriteString(" ")
+		}
+	}
+	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(b.String()), " ")))
+	return string(sum[:])
 }
 
 // measure returns what DuckDB measured of st, which just ran.

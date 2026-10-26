@@ -304,3 +304,61 @@ func TestReplicaLimit(t *testing.T) {
 	}
 	release()
 }
+
+// TestEstimateFromHistory checks reservations learned from what statements
+// allocated: a fraction of the latest, by shape; none for a shape not seen,
+// one that allocated little, or with estimates off; and that a heavy
+// statement's estimate holds it back while a light one, reserving nothing,
+// starts at once.
+func TestEstimateFromHistory(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.Observe("heavy", 40*gb)
+	if got := c.Estimate("heavy"); got != 0 {
+		t.Errorf("before EstimateFromHistory: %d", got)
+	}
+	c.EstimateFromHistory(0.5)
+	c.Observe("heavy", 40*gb)
+	c.Observe("medium", 4*gb)
+	c.Observe("light", gb)
+	for shape, want := range map[string]int64{"heavy": 20 * gb, "medium": 2 * gb, "light": 0, "unseen": 0, "": 0} {
+		if got := c.Estimate(shape); got != want {
+			t.Errorf("Estimate(%q) = %d, want %d", shape, got, want)
+		}
+	}
+	c.Observe("heavy", 8*gb)
+	if got := c.Estimate("heavy"); got != 4*gb {
+		t.Errorf("after a lighter run: %d", got)
+	}
+
+	ctx := context.Background()
+	c.Observe("heavy", 40*gb)
+	running, _, _ := c.Admit(ctx, Limits{Memory: c.Estimate("medium")})
+	admitted := make(chan struct{})
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Memory: c.Estimate("heavy")})
+		if err != nil {
+			t.Error(err)
+		}
+		close(admitted)
+		r()
+	}()
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-admitted:
+		t.Error("the heavy statement started next to another's reservation")
+	default:
+	}
+	light, _, err := c.Admit(ctx, Limits{Memory: c.Estimate("light")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	light()
+	running()
+	<-admitted
+
+	c.EstimateFromHistory(0)
+	if got := c.Estimate("heavy"); got != 0 {
+		t.Errorf("with estimates off: %d", got)
+	}
+}
