@@ -310,10 +310,11 @@ check_distributed() {
 check_distributed "a table with lists, maps and structs" nested "$nested_query"
 check_distributed "an unnest of a list column" unnest \
   "SELECT seg, count(DISTINCT person_id) FROM people, unnest(segments) AS u(seg) GROUP BY 1 ORDER BY 1"
-# FLATTEN becomes unnests of Igloo's sf_ macros, which workers define too.
+# FLATTEN becomes unnests of Igloo's sf_ macros, which workers define too:
+# sf_flatten_strings when its values are read only as text.
 check_distributed "Snowflake's FLATTEN" flatten \
   "SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS people, COUNT(*) AS n
-   FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%sf_flatten_values(p.segments%'
+   FROM people p, LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%sf_flatten_%(p.segments%'
 check_distributed "Snowflake's FLATTEN of an OBJECT column" flatten_object \
   "SELECT f.key AS k, f.value::string AS v, COUNT(*) AS n FROM people p, TABLE(FLATTEN(p.attrs)) f
    WHERE p.person_id % 2 = 0 GROUP BY 1, 2 ORDER BY 1, 2" snowflake '%sf_flatten_values(p.attrs%'
@@ -335,7 +336,7 @@ check_distributed "a view that joins a small table" view_join \
   "SELECT income, count(*), count(DISTINCT person_id) FROM mirror.v_people_attrs GROUP BY 1 ORDER BY 1"
 check_distributed "FLATTEN over a view" view_flatten \
   "SELECT f.value::string AS seg, COUNT(DISTINCT p.person_id) AS n FROM mirror.v_people_latest p,
-   LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%v_people_latest%sf_flatten_values%'
+   LATERAL FLATTEN(input => p.segments) f GROUP BY 1 ORDER BY 1" snowflake '%v_people_latest%sf_flatten_%'
 
 echo "deleted rows"
 # DELETE and UPDATE write position delete files, which workers apply.
