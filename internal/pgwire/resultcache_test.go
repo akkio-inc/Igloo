@@ -68,6 +68,12 @@ func TestResultCache(t *testing.T) {
 		t.Errorf("after an insert through another replica: %v", got)
 	}
 
+	// A statement that calls pragma_table_info on an Iceberg table runs as
+	// it was prepared after the cache explained it (see judgeResult).
+	if got := texts(t, admin, "SELECT string_agg(name, '|' ORDER BY cid) FROM pragma_table_info('lake.public.sales')"); !slices.Equal(got, []string{"k|v"}) {
+		t.Errorf("describing a table: %v", got)
+	}
+
 	// Statements whose result can change, or that read what the data
 	// version does not follow, run every time.
 	for _, sql := range []string{

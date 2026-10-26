@@ -345,6 +345,9 @@ type Server struct {
 	// results keeps queries' results (see resultcache.go); nil when it
 	// keeps none.
 	results *resultCache
+	// functions is what statements' rewrites and the result cache know of
+	// DuckDB's functions (see functionlist.go).
+	functions functionList
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()

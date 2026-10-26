@@ -53,11 +53,8 @@ type resultCache struct {
 	entries map[resultKey]*list.Element
 	flights map[resultKey]*resultFlight
 	// verdicts say whether statements' results may be kept (see
-	// keepable); unstable are the functions whose calls keep a result from
-	// being kept, as of catalog generation unstableGen.
-	verdicts    map[resultKey]bool
-	unstable    map[string]bool
-	unstableGen uint64
+	// keepable).
+	verdicts map[resultKey]bool
 }
 
 // maxVerdicts bounds the verdicts kept; they are forgotten all at once.
@@ -236,8 +233,8 @@ func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, ar
 	if err != nil {
 		return false, nil, nil
 	}
-	if !s.keepable(ctx, sess, st, settings) {
-		return false, nil, nil
+	if ok, err := s.keepable(ctx, sess, st, settings); !ok {
+		return false, nil, err
 	}
 	key, err := s.resultKey(ctx, sess, st, args, settings)
 	if err != nil {
@@ -371,11 +368,11 @@ func writeField(h hash.Hash, s string) {
 	h.Write([]byte(s))
 }
 
-// keepable reports whether st's result may be kept: it calls no function
-// in unstableFunctions and its plan reads nothing but tables of the
-// catalog (see catalogReadsOnly). The verdict holds for the statement's
+// keepable reports whether st's result may be kept: it calls no unstable
+// function (see sessionFunctions) and its plan reads nothing but tables of
+// the catalog (see catalogReadsOnly). The verdict holds for the statement's
 // text while the catalog and the session's settings stay as they are.
-func (s *Server) keepable(ctx context.Context, sess *session, st *statement, settings [sha256.Size]byte) bool {
+func (s *Server) keepable(ctx context.Context, sess *session, st *statement, settings [sha256.Size]byte) (bool, error) {
 	c := s.results
 	gen := s.catalogGeneration()
 	h := sha256.New()
@@ -388,97 +385,52 @@ func (s *Server) keepable(ctx context.Context, sess *session, st *statement, set
 	v, ok := c.verdicts[vk]
 	c.mu.Unlock()
 	if ok {
-		return v
+		return v, nil
 	}
-	v = s.judgeResult(ctx, sess, st, gen)
+	v, err := s.judgeResult(ctx, sess, st)
+	if err != nil {
+		return false, err
+	}
 	c.mu.Lock()
 	if len(c.verdicts) >= maxVerdicts {
 		clear(c.verdicts)
 	}
 	c.verdicts[vk] = v
 	c.mu.Unlock()
-	return v
+	return v, nil
 }
 
-// judgeResult works out keepable's verdict.
-func (s *Server) judgeResult(ctx context.Context, sess *session, st *statement, gen uint64) bool {
-	unstable, err := s.unstableFunctions(ctx, sess, gen)
+// judgeResult works out keepable's verdict. Explaining st binds its table
+// functions again on its connection, after which DuckDB can fail st as it
+// was prepared (see reprepare), so st is prepared again; if that fails, so
+// does st.
+func (s *Server) judgeResult(ctx context.Context, sess *session, st *statement) (bool, error) {
+	_, unstable, err := s.functionSets(ctx, sess)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	for _, w := range sqllex.CodeWords(st.prepared) {
 		if unstable[strings.ToLower(w)] {
-			return false
+			return false, nil
 		}
 	}
 	release := s.shareCatalog(sess)
+	defer release()
 	plan, err := explainLogical(ctx, sess.conn, st.prepared)
-	release()
-	return err == nil && catalogReadsOnly(plan)
-}
-
-// unstableFunctions returns the functions whose calls keep a result from
-// being kept: DuckDB's volatile ones and those consistent only within a
-// query, the ones that read the session's state, and the macros that call
-// one, directly or through other macros (a macro counts as calling a
-// function when its definition has the function's name as a word, which
-// errs toward unstable). error() is volatile only so that DuckDB does not
-// move it; it gives the same result every time.
-func (s *Server) unstableFunctions(ctx context.Context, sess *session, gen uint64) (map[string]bool, error) {
-	c := s.results
-	c.mu.Lock()
-	if c.unstable != nil && c.unstableGen == gen {
-		defer c.mu.Unlock()
-		return c.unstable, nil
+	if rerr := st.reprepare(ctx, sess.conn); rerr != nil {
+		return false, rerr
 	}
-	c.mu.Unlock()
-	// Listing them walks the catalog (see catalogRunLock).
-	release := s.holdCatalog(sess)
-	rows, err := queryStrings(ctx, sess, `SELECT system.main.lower(function_name) || chr(9) || coalesce(stability, '') ||
-		chr(9) || coalesce(macro_definition, '') FROM system.main.duckdb_functions()`)
-	release()
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]bool{}
-	for k := range sessionFunctions {
-		out[k] = true
-	}
-	macros := map[string][]string{}
-	for _, r := range rows {
-		name, rest, _ := strings.Cut(r, "\t")
-		stability, def, _ := strings.Cut(rest, "\t")
-		switch {
-		case (stability == "VOLATILE" || stability == "CONSISTENT_WITHIN_QUERY") && name != "error":
-			out[name] = true
-		case def != "":
-			for _, w := range sqllex.CodeWords(def) {
-				macros[name] = append(macros[name], strings.ToLower(w))
-			}
-		}
-	}
-	for changed := true; changed; {
-		changed = false
-		for name, words := range macros {
-			if out[name] {
-				continue
-			}
-			for _, w := range words {
-				if out[w] {
-					out[name], changed = true, true
-					break
-				}
-			}
-		}
-	}
-	c.mu.Lock()
-	c.unstable, c.unstableGen = out, gen
-	c.mu.Unlock()
-	return out, nil
+	return err == nil && catalogReadsOnly(plan), nil
 }
 
 // sessionFunctions read the session's state or the clock, though DuckDB
-// counts some of them as consistent.
+// counts some of them as consistent. With DuckDB's volatile functions and
+// those consistent only within a query (but error(), volatile only so that
+// DuckDB does not move it, which gives the same result every time), and the
+// macros that call one, directly or through other macros (a macro counts as
+// calling a function when its definition has the function's name as a
+// word, which errs toward unstable), they are the unstable functions, whose
+// calls keep a result from being kept (see functionSets).
 var sessionFunctions = map[string]bool{
 	"current_setting": true, "getvariable": true, "current_user": true, "current_role": true, "session_user": true,
 	"user": true, "current_catalog": true, "current_database": true, "current_schema": true, "current_schemas": true,
