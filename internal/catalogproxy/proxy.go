@@ -145,6 +145,8 @@ type Proxy struct {
 	names *names
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
+	// counts are the distinct counts table loads had (see distinctcounts.go).
+	counts distinctCounts
 
 	// prefix is the warehouse prefix DuckDB uses, and hide the namespaces
 	// whose next existence check the proxy answers with 404 (see
@@ -293,6 +295,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		table := tableLoad(r, rest)
 		if table != "" {
 			sw.scan = &locationScanner{}
+			sw.body = &bytes.Buffer{}
 		}
 		if r.Method == http.MethodGet {
 			// Before DuckDB has a table it loaded, note whether it asked for
@@ -317,6 +320,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			p.data.loaded(table, location)
 			p.data.record(Load{path: table, rest: rest, header: r.Header})
+			if sw.body.Len() <= maxCountsBody {
+				p.counts.loaded(countsKey(rest), sw.body.Bytes(), w.Header().Get("Content-Encoding"))
+			}
 		}
 		return
 	}
@@ -359,6 +365,8 @@ type statusWriter struct {
 	bytes  int
 	before func(status int)
 	scan   *locationScanner
+	// body, if set, keeps the answer's body, up to maxCountsBody and a byte.
+	body *bytes.Buffer
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -379,6 +387,9 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 		w.scan.Write(b)
 	}
 	w.bytes += len(b)
+	if w.body != nil && w.body.Len() <= maxCountsBody {
+		w.body.Write(b[:min(len(b), maxCountsBody+1-w.body.Len())])
+	}
 	return w.ResponseWriter.Write(b)
 }
 

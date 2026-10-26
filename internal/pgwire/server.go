@@ -89,6 +89,10 @@ type Engine interface {
 	// that DataVersion goes up if any changed meanwhile.
 	RecordLoads() func() []catalogproxy.Load
 	ReloadTables(ctx context.Context, loads []catalogproxy.Load) error
+	// DistinctCounts returns the distinct counts of the catalog's tables'
+	// columns, by catalog.schema.table as DuckDB names it, lower-cased, and
+	// a generation that changes whenever they do (see analyze.go).
+	DistinctCounts() (uint64, map[string]map[string]int64)
 	// ForgetMissingSchema makes DuckDB forget a schema of the catalog it
 	// took for missing, if the catalog has it, and reports whether it did.
 	ForgetMissingSchema(ctx context.Context, schema string) bool
@@ -426,6 +430,11 @@ type Server struct {
 	// prepared again for its run, with the context that ends them (for
 	// tests).
 	beforeRefresh func(context.Context)
+	// countsGen is the generation of the distinct counts last handed to
+	// DuckDB, and countsMu serializes handing them (see
+	// registerDistinctCounts).
+	countsMu  sync.Mutex
+	countsGen atomic.Uint64
 	// beforePrepare, if set, runs as a statement a client sent (text)
 	// starts to be prepared, with the context that ends its preparing (for
 	// tests).
@@ -1578,6 +1587,10 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		return ps, err
 	}
 
+	if ps, ok, err := s.analyzeStatement(sess, q); ok || err != nil {
+		return ps, err
+	}
+
 	if ps, ok, err := s.domainStatement(sess, q); ok || err != nil {
 		return ps, err
 	}
@@ -2066,6 +2079,9 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	if err := sess.ensureBitmapVariables(ctx, st.query); err != nil {
 		return err
 	}
+	// DuckDB plans the statement again as it runs it, with the distinct
+	// counts of the tables its prepare loaded.
+	s.registerDistinctCounts(ctx, sess)
 	// Rechecking re-plans with EXPLAIN and may re-apply policies, both of
 	// which read and fill in the catalog's set; release before the run
 	// takes the side it needs (see holdCatalog, catalogRunLock). A
@@ -2155,6 +2171,8 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	locked := sess.phase("catalog_lock")
 	defer s.holdCatalog(sess)()
 	locked()
+	// DuckDB plans it with the tables' distinct counts as last loaded.
+	s.registerDistinctCounts(ctx, sess)
 	// The catalog's tables it reads: those DuckDB loads while this holds
 	// the lock, as no other bind runs alongside (see memoStatement).
 	loads := s.engine.RecordLoads()

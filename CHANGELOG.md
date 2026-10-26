@@ -13,6 +13,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- `ANALYZE table [(column, ...)]` counts the distinct values of a table's
+  columns and keeps the counts in the table, where DuckDB's planner finds
+  them (see [Distinct counts](docs/sql.md#distinct-counts)). DuckDB
+  estimated any equality filter on an Iceberg table at a fifth of its rows,
+  and so built joins' hash tables on the wrong side: with counts, most of the
+  queries of a report workload that ran slower than Snowflake at ten
+  times its data run faster.
 - Snowflake's dialect makes Snowflake's implicit conversions: string
   functions and `LIKE` read numbers, dates and timestamps as text
   (`TRIM(5)`, `LENGTH(ts)`), and text compared with a timestamp, a date or

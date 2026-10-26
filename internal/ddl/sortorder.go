@@ -37,3 +37,16 @@ func (m *Manager) LoadTable(ctx context.Context, schema, name string) (*table.Ta
 	}
 	return tbl, err
 }
+
+// SetDistinctCounts records counts as the distinct counts of the table
+// schema.name's columns (see catalog.DistinctCountsProperty).
+func (m *Manager) SetDistinctCounts(ctx context.Context, schema, name string, counts map[string]int64) error {
+	if m.IsView(schema, name) {
+		return fmt.Errorf("%s.%s is a view; only tables have distinct counts", schema, name)
+	}
+	err := m.cat.SetDistinctCounts(ctx, schema, name, counts)
+	if errors.Is(err, icecat.ErrNoSuchTable) {
+		return fmt.Errorf("table %q %w", name, ErrNotFound)
+	}
+	return err
+}

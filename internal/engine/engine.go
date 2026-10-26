@@ -313,6 +313,19 @@ func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
 // returns is called, which returns them (see catalogproxy's RecordLoads).
 func (e *Engine) RecordLoads() func() []catalogproxy.Load { return e.proxy.RecordLoads() }
 
+// DistinctCounts returns the distinct counts of the catalog's tables'
+// columns, as the latest loads of the tables had them, by
+// catalog.schema.table as DuckDB names it, lower-cased, and a generation
+// that changes whenever they do (see catalogproxy's DistinctCounts).
+func (e *Engine) DistinctCounts() (uint64, map[string]map[string]int64) {
+	gen, tables := e.proxy.DistinctCounts()
+	out := make(map[string]map[string]int64, len(tables))
+	for k, v := range tables {
+		out[strings.ToLower(e.catalog)+"."+k] = v
+	}
+	return gen, out
+}
+
 // ReloadTables loads the tables of loads again, so that DataVersion goes
 // up if any changed since they were loaded (see catalogproxy's Reload).
 func (e *Engine) ReloadTables(ctx context.Context, loads []catalogproxy.Load) error {

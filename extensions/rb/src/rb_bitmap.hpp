@@ -35,6 +35,8 @@ void RegisterAggregates(ExtensionLoader &loader);
 void RegisterScalars(ExtensionLoader &loader);
 //! The optimizer rule that, with rb_count_distinct = 'always', counts COUNT(DISTINCT) of unsigned ids in bitmaps
 void RegisterRewrite(DBConfig &config);
+//! igloo_set_distinct_counts and the pass that has scans report the counts (rb_stats.cpp).
+void RegisterStats(ExtensionLoader &loader, DBConfig &config);
 
 } // namespace rb
 } // namespace duckdb

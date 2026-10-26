@@ -73,6 +73,19 @@ read once per chunk: hand a large one over in a variable (`SET VARIABLE b =
   or from the tables rather than bitmap indexes. The BLOBs themselves are
   DuckDB's values, which it copies between operators as it does any string.
 
+## Distinct counts for the planner
+
+DuckDB estimates the rows an equality filter leaves of a table as its rows
+over the column's distinct count, and joins' sizes from their keys' counts,
+when the scan's table function reports them; DuckDB-Iceberg reports none, and
+DuckDB takes a fifth of the table instead. `igloo_set_distinct_counts(spec)`
+hands DuckDB counts Igloo keeps (`ANALYZE`, see `internal/pgwire/analyze.go`):
+`spec` is a line for each column, `catalog.schema.table`, the column and its
+count, separated by tabs, and replaces the database's counts; it returns how
+many columns it holds. An optimizer pass that runs before DuckDB's own has
+each scan of a table with counts report them beside its table function's own
+statistics, for that statement (`src/rb_stats.cpp`).
+
 ## Building and loading
 
 `extensions/rb/build.sh OUT_DIR` builds `rb.duckdb_extension` and its

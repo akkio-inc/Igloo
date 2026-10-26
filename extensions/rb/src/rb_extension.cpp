@@ -39,6 +39,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "'always' (Igloo decides per statement)",
 	                          LogicalType::VARCHAR, Value("off"), CheckMode);
 	rb::RegisterRewrite(config);
+	rb::RegisterStats(loader, config);
 	config.AddExtensionOption("rb_memory_budget",
 	                          "The most memory one COUNT(DISTINCT)'s bitmaps may take (e.g. '2GB'; empty: whatever "
 	                          "DuckDB's memory_limit leaves)",

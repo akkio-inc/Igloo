@@ -216,6 +216,34 @@ two, as do the passes after it, up to 64 passes. Each pass reads the
 aggregate's input again; `igloo_aggregate_passes_total` counts these
 tables.
 
+### Distinct counts
+
+`ANALYZE table` counts the distinct values of a table's columns and keeps
+the counts in the table, for DuckDB's planner. DuckDB estimates the rows
+that a filter such as `audience_id = 'a1'` leaves of a table from the
+column's distinct count, and from those estimates which side of a join it
+builds its hash table on. Without a count it takes a fifth of the table for
+any such filter: one audience of a few thousand rows in a lookup table of
+billions came out at hundreds of millions, and its join with tens of millions of rows of facts hashed
+the facts rather than the audience.
+
+```sql
+ANALYZE lake.public.audience_members;                -- every column
+ANALYZE lake.public.audience_members (audience_id);  -- one, keeping the others' counts
+```
+
+- The counts are approximate (`approx_count_distinct`) and as of the
+  `ANALYZE`; run it again when loads change a column's values much. A
+  stale count changes plans, never results.
+- Igloo keeps the counts in the table property `igloo.distinct-counts` (a
+  JSON object of columns' counts). Each replica takes them from the catalog
+  when it next loads the table, and hands them to DuckDB before it plans a
+  statement.
+- Columns of lists, structs, maps and unions have no count. `ANALYZE` needs
+  the admin role, runs outside transaction blocks, and only on tables of
+  the Iceberg catalog (not views or temporary tables). `ANALYZE` without a
+  table is DuckDB's own, which counts nothing in the catalog.
+
 ### Column types
 
 Tables take DuckDB's types that Iceberg has: numbers, text, dates and
