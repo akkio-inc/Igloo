@@ -37,6 +37,8 @@ void RegisterScalars(ExtensionLoader &loader);
 void RegisterRewrite(DBConfig &config);
 //! igloo_set_distinct_counts and the pass that has scans report the counts (rb_stats.cpp).
 void RegisterStats(ExtensionLoader &loader, DBConfig &config);
+//! Has trim, ltrim and rtrim of a string run faster, with DuckDB's results (rb_strings.cpp).
+void RegisterStrings(ExtensionLoader &loader);
 
 } // namespace rb
 } // namespace duckdb

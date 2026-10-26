@@ -240,6 +240,60 @@ func queryOne(t *testing.T, conn *duckdb.Conn, q string) string {
 
 // TestRBFunctions runs extensions/rb/test/*.test against Igloo's DuckDB with
 // the extension loaded.
+// TestRBStringsMatchDuckDB checks the extension's trim, ltrim and rtrim
+// (rb_strings.cpp) against DuckDB's own, in a database without it: strings
+// with spaces and Unicode's other space separators at either end and inside,
+// with characters other than ASCII, of 12 bytes, which DuckDB keeps inside
+// the string, and of more, and NULL; as a table's rows, chunks of all of
+// them and chunks of ASCII alone, and as constants.
+func TestRBStringsMatchDuckDB(t *testing.T) {
+	ctx := context.Background()
+	e, _ := openWithRB(t)
+	fast, err := e.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.Close() //nolint:errcheck
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close() //nolint:errcheck
+	dc, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dc.Close() //nolint:errcheck
+	plain := dc.(*duckdb.Conn)
+	values := []string{"", " ", "   ", "a", " a", "a ", " a b ", " x　", "     ",
+		"   ", "x᠎", "᠎x", "\tx\n", "  twelve byte", "exactly12byt", " exactly12byt ", "thirteen byte",
+		"ÉCOLE École", "straße STRASSE", "İstanbul", "ΣΊΣΥΦΟΣ", "Mixed Case ASCII", "UPPER", "lower", " 😀 emoji 😀 ",
+		strings.Repeat("ab ", 20) + "  ", "  " + strings.Repeat("Zz", 30)}
+	list := make([]string, len(values))
+	for i, v := range values {
+		list[i] = "'" + v + "'"
+	}
+	table := "CREATE TEMP TABLE strs AS SELECT row_number() OVER () AS i, s FROM (SELECT unnest([" + strings.Join(list, ", ") +
+		", NULL]) AS s), range(200)"
+	for _, conn := range []*duckdb.Conn{fast, plain} {
+		if _, err := conn.ExecContext(ctx, table, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, fn := range []string{"trim", "ltrim", "rtrim"} {
+		for _, q := range []string{
+			"SELECT i, " + fn + "(s) FROM strs ORDER BY i",
+			"SELECT i, " + fn + "(s) FROM strs WHERE NOT regexp_matches(s, '[^\\x00-\\x7f]') ORDER BY i",
+			"SELECT " + fn + "(' Mixed Case '), " + fn + "('é Î '), " + fn + "(NULL)",
+		} {
+			got, want := queryRows(t, fast, q, fn), queryRows(t, plain, q, fn)
+			if strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Errorf("%s: the extension's differ from DuckDB's", q)
+			}
+		}
+	}
+}
+
 func TestRBFunctions(t *testing.T) {
 	e, _ := openWithRB(t)
 	files, err := filepath.Glob(filepath.Join("..", "..", "extensions", "rb", "test", "*.test"))

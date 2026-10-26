@@ -31,6 +31,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   unnests its values alone, and as text when every read casts them to text
   or tests them for NULL, without making JSON of each element and reading
   it back.
+- `trim`, `ltrim` and `rtrim` of one argument run Igloo's own code, with
+  DuckDB's results (see the rb extension's
+  [README](extensions/rb/README.md#faster-trim)). DuckDB's `trim` took some
+  300 ns a row, and reports trim the values they filter and group by: a
+  filter of tens of millions of trimmed values took 4.9 s and takes 0.65 s.
 - Snowflake's dialect makes Snowflake's implicit conversions: string
   functions and `LIKE` read numbers, dates and timestamps as text
   (`TRIM(5)`, `LENGTH(ts)`), and text compared with a timestamp, a date or
