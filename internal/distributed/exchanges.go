@@ -178,7 +178,8 @@ func (s bucketStorage) Write(ctx context.Context, path string, data []byte) erro
 // removeInBatches deletes paths with d's DeleteObjects, removeBatch keys a
 // request in each bucket, removeBatches requests at a time. A batch the
 // store will not delete so, as an S3-compatible store without
-// DeleteObjects answers, is deleted by each, an object a request.
+// DeleteObjects answers, is deleted by each, an object a request; each may
+// run for several batches at once.
 func removeInBatches(ctx context.Context, d objectDeleter, paths []string, each func(context.Context, []string) error) error {
 	type batch struct {
 		bucket string

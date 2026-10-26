@@ -193,8 +193,11 @@ func TestRemoveInBatches(t *testing.T) {
 		paths = append(paths, fmt.Sprintf("s3://b1/wh/_igloo_shuffle/q/s0/%d/__b=0/data_0.parquet", i))
 	}
 	paths = append(paths, "s3://b2/wh/_igloo_shuffle/q/running")
+	var mu sync.Mutex
 	var each []string
 	one := func(_ context.Context, ps []string) error {
+		mu.Lock()
+		defer mu.Unlock()
 		each = append(each, ps...)
 		return nil
 	}
