@@ -207,10 +207,14 @@ memory in one run after spilling 307 GiB.
 The passes give the rows one run would, since each group falls in one
 pass, so Igloo runs in passes only a statement each of whose rows comes from
 one group: it reads the aggregate once, through layers that only add
-columns and filter rows, groups by one set of keys, and calls no volatile
-function. A statement that ran out of memory in one run is filled again in
-passes, if it is such a statement. Each pass reads the aggregate's input
-again; `igloo_aggregate_passes_total` counts these tables.
+columns and filter rows, groups by one set of keys, and calls no function
+whose value can change from one run to the next (`random()`, `now()`;
+`error()` can be called). A statement that ran out of memory in one run is
+filled again in passes, if it is such a statement, and a pass that runs out
+of memory, its groups more than the plan estimated, runs again split in
+two, as do the passes after it, up to 64 passes. Each pass reads the
+aggregate's input again; `igloo_aggregate_passes_total` counts these
+tables.
 
 ### Column types
 

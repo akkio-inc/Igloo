@@ -248,12 +248,12 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 	} else if ap := s.aggPassesOf(ctx, sess, c.query, 0); ap != nil {
 		// An aggregate whose states would not fit in memory: its groups a
 		// share at a time (see aggpasses.go).
-		rows, err = s.fillInPasses(fill, c.staging, ap)
+		rows, err = s.fillInPasses(ctx, fill, c.staging, ap)
 	} else if rows, err = fill(plain); isOutOfMemory(err) && ctx.Err() == nil {
 		// DuckDB's estimate was short: in passes, if the query allows,
 		// into the table the failed fill left empty.
 		if ap := s.aggPassesOf(ctx, sess, c.query, 16); ap != nil {
-			rows, err = s.fillInPasses(fill, c.staging, ap)
+			rows, err = s.fillInPasses(ctx, fill, c.staging, ap)
 		}
 	}
 	if err != nil {

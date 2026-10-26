@@ -1584,6 +1584,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- `CREATE TABLE ... AS` of an aggregate too large for memory runs in passes
+  over its groups when the statement calls `error()`, as Snowflake's
+  dialect does to refuse `ARRAY_FLATTEN` of what is not an array of
+  arrays; it ran in one and ran out of memory. A pass that runs out of
+  memory, DuckDB's estimate of the groups short, runs again split in two,
+  as do the passes after it, instead of failing the statement.
 - In Snowflake's dialect, `CREATE VIEW v (a, b) AS ...` whose query returns
   more columns than the list names is refused, as Snowflake refuses it
   ("invalid column definition list"), instead of creating a view with the

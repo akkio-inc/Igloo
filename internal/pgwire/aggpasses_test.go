@@ -1,6 +1,12 @@
 package pgwire
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -66,11 +72,13 @@ func TestAggregatePasses(t *testing.T) {
 	sf := r.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
 	before = passes()
+	// ARRAY_FLATTEN's translation calls error() for what is not an array of
+	// arrays.
 	mustExec(t, sf, `create or replace table lake.public.sf_summary as (
-		with detail as (select * from lake.public.events),
-		summary as (select ji.d as d, ji.uid as uid, array_unique_agg(ji.net) as nets, listagg(distinct ji.title, '|') as titles
-			from detail as ji group by ji.d, ji.uid)
-		select su.d, su.uid, su.nets, su.titles from summary as su)`)
+		with detail as (select *, split(title, 't') as parts from lake.public.events),
+		summary as (select ji.d as d, ji.uid as uid, array_unique_agg(ji.net) as nets, listagg(distinct ji.title, '|') as titles,
+			array_unique_agg(ji.parts) as parts from detail as ji group by ji.d, ji.uid)
+		select su.d, su.uid, su.nets, su.titles, array_distinct(array_flatten(su.parts)) as parts from summary as su)`)
 	if passes() <= before {
 		t.Error("the Snowflake model ran in one")
 	}
@@ -90,13 +98,51 @@ func TestAggregatePasses(t *testing.T) {
 	mustExec(t, admin, `CREATE TABLE lake.public.unioned AS
 		SELECT d, uid, list(DISTINCT net) AS nets FROM lake.public.events GROUP BY d, uid
 		UNION ALL SELECT DATE '2000-01-01', 'x', []`)
+	// now() would differ from one pass to the next.
+	mustExec(t, admin, `CREATE TABLE lake.public.stamped AS
+		SELECT d, uid, list(DISTINCT net) AS nets, now() AS at FROM lake.public.events GROUP BY d, uid`)
 	if passes() != before {
-		t.Error("an aggregate whose rows do not each come from one group ran in passes")
+		t.Error("an aggregate whose rows do not each come from one group, or that calls now(), ran in passes")
 	}
 	if n := count(t, admin, "SELECT n FROM lake.public.counted"); n != 50030 {
 		t.Errorf("counted: %d", n)
 	}
 	if n := count(t, admin, "SELECT count(*) FROM lake.public.unioned"); n != 50031 {
 		t.Errorf("unioned: %d rows", n)
+	}
+}
+
+// TestAggregatePassesSplit checks that a pass that runs out of memory runs
+// again as the two passes of twice as many that its groups hash to, as do
+// the passes after it, while those done stay done, and that the passes stop
+// splitting at maxAggPasses.
+func TestAggregatePassesSplit(t *testing.T) {
+	t.Parallel()
+	s := &Server{log: slog.New(slog.DiscardHandler), metrics: NewMetrics(prometheus.NewRegistry())}
+	ap := &aggPasses{passes: 2, query: func(pass, n int) (string, error) { return fmt.Sprintf("%d/%d", pass, n), nil }}
+	oom := errors.New("Out of Memory Error: could not allocate block of size 256.0 KiB")
+	run := func(tooBig func(pass string) bool) ([]string, int64, error) {
+		var ran []string
+		fill := func(q string) (int64, error) {
+			pass := strings.TrimPrefix(q, `INSERT INTO "t"`+"\n")
+			if tooBig(pass) {
+				ran = append(ran, pass+" out of memory")
+				return 0, oom
+			}
+			ran = append(ran, pass)
+			return 1, nil
+		}
+		rows, err := s.fillInPasses(context.Background(), fill, []string{"t"}, ap)
+		return ran, rows, err
+	}
+
+	ran, rows, err := run(func(pass string) bool { return pass == "1/2" || pass == "1/4" })
+	if want := []string{"0/2", "1/2 out of memory", "1/4 out of memory", "1/8", "5/8", "3/8", "7/8"}; err != nil || rows != 5 || !slices.Equal(ran, want) {
+		t.Errorf("ran %q, %d rows, %v; want %q, 5 rows", ran, rows, err, want)
+	}
+
+	ran, _, err = run(func(pass string) bool { return strings.HasPrefix(pass, "0/") })
+	if !errors.Is(err, oom) || ran[len(ran)-1] != fmt.Sprintf("0/%d out of memory", maxAggPasses) {
+		t.Errorf("ran %q, %v; want the last pass 0 of %d to run out of memory", ran, err, maxAggPasses)
 	}
 }

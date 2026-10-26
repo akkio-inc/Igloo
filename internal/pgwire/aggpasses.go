@@ -29,14 +29,17 @@ import (
 // group's rows all fall in one pass, so the passes together give the rows a
 // single run would, as long as each row of the result comes from one group:
 // the statement reads the aggregate once, through layers that only project
-// and filter, and calls no volatile function. Each pass reads the
-// aggregate's input again.
+// and filter, and calls no function whose value can change between runs
+// (see sessionFunctions). Each pass reads the aggregate's input again.
 
-// aggPasses is a query split into passes: the query of each, and the
-// groups DuckDB estimated.
+// aggPasses is a query split into passes: how many at first, the groups
+// DuckDB estimated, and the query of each pass of any number of them.
 type aggPasses struct {
-	queries []string
-	groups  int64
+	passes int
+	groups int64
+	// query is the query of pass of n: the aggregate's WHERE gains
+	// hash(keys) % n = pass.
+	query func(pass, n int) (string, error)
 }
 
 const (
@@ -80,8 +83,12 @@ func (s *Server) splitAggregate(ctx context.Context, sess *session, query string
 	if err != nil {
 		return nil, err
 	}
+	// Functions whose value can differ from one pass to the next. error(),
+	// which DuckDB counts volatile and Snowflake's dialect calls to refuse
+	// a bad value (ARRAY_FLATTEN of what is not an array of arrays, say),
+	// gives none: the passes together call it on the rows one run does.
 	for _, w := range sqllex.CodeWords(query) {
-		if f.volatile[strings.ToLower(w)] {
+		if w := strings.ToLower(w); f.unstable[w] || volatile[w] {
 			return nil, errAggPasses
 		}
 	}
@@ -133,18 +140,17 @@ func (s *Server) splitAggregate(ctx context.Context, sess *session, query string
 	if eq == nil {
 		return nil, errAggPasses
 	}
-	out := &aggPasses{groups: groups}
-	for pass := range passes {
+	out := &aggPasses{passes: passes, groups: groups, query: func(pass, n int) (string, error) {
 		d := cloneTree(doc).(map[string]any)
 		a, _, err := passAggregate(d, f)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		cond := cloneTree(eq).(map[string]any)
 		mod := asMap(cond["left"])
 		hash := asMap(asList(mod["children"])[0])
 		hash["children"] = cloneTree(keys)
-		setConstant(asMap(asList(mod["children"])[1]), passes)
+		setConstant(asMap(asList(mod["children"])[1]), n)
 		setConstant(asMap(cond["right"]), pass)
 		if where := asMap(a["where_clause"]); where != nil {
 			conj := cloneTree(and).(map[string]any)
@@ -154,20 +160,20 @@ func (s *Server) splitAggregate(ctx context.Context, sess *session, query string
 		a["where_clause"] = cond
 		text, err := json.Marshal(d)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
-		q, err := queryOne(ctx, sess.conn, "SELECT system.main.json_deserialize_sql($1::VARCHAR::JSON)", string(text))
-		if err != nil {
-			return nil, err
-		}
-		out.queries = append(out.queries, q)
-	}
+		return queryOne(ctx, sess.conn, "SELECT system.main.json_deserialize_sql($1::VARCHAR::JSON)", string(text))
+	}}
 	// The passes' rows must be the query's.
 	want, err := describeQuery(ctx, sess, query)
 	if err != nil {
 		return nil, err
 	}
-	got, err := describeQuery(ctx, sess, out.queries[0])
+	first, err := out.query(0, passes)
+	if err != nil {
+		return nil, err
+	}
+	got, err := describeQuery(ctx, sess, first)
 	if err != nil {
 		return nil, err
 	}
@@ -457,17 +463,41 @@ func asMap(v any) map[string]any {
 	return m
 }
 
-// fillInPasses fills staging with ap's passes, one after another.
-func (s *Server) fillInPasses(fill func(string) (int64, error), staging []string, ap *aggPasses) (int64, error) {
-	s.log.Debug("an aggregate runs in passes", "passes", len(ap.queries), "groups", ap.groups)
+// fillInPasses fills staging with ap's passes, one after another. A pass
+// that runs out of memory, its groups more than DuckDB estimated, runs
+// again as the two passes of twice as many that its groups hash to, and the
+// passes after it are split likewise, up to maxAggPasses: a group's
+// hash(keys) % 2n is pass or pass + n exactly when hash(keys) % n is pass,
+// so the passes already done stay done.
+func (s *Server) fillInPasses(ctx context.Context, fill func(string) (int64, error), staging []string, ap *aggPasses) (int64, error) {
+	s.log.Debug("an aggregate runs in passes", "passes", ap.passes, "groups", ap.groups)
 	s.metrics.aggregatePasses()
+	n := ap.passes
+	pending := make([]int, n)
+	for i := range pending {
+		pending[i] = i
+	}
 	var rows int64
-	for _, q := range ap.queries {
-		n, err := fill("INSERT INTO " + quoteName(staging) + "\n" + q)
+	for len(pending) > 0 {
+		q, err := ap.query(pending[0], n)
 		if err != nil {
 			return 0, err
 		}
-		rows += n
+		m, err := fill("INSERT INTO " + quoteName(staging) + "\n" + q)
+		if isOutOfMemory(err) && 2*n <= maxAggPasses && ctx.Err() == nil {
+			s.log.Debug("a pass ran out of memory; the rest run in twice as many", "passes", 2*n)
+			split := make([]int, 0, 2*len(pending))
+			for _, p := range pending {
+				split = append(split, p, p+n)
+			}
+			pending, n = split, 2*n
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		rows += m
+		pending = pending[1:]
 	}
 	return rows, nil
 }
