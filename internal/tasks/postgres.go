@@ -257,6 +257,10 @@ func unlocker(conn *pgx.Conn) func() {
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// Closing the connection ends its session and so its locks, but the
+		// server ends the session after Close returns, and a lock taken again
+		// right away could find it still held: unlock first.
+		_, _ = conn.Exec(ctx, "SELECT pg_advisory_unlock_all()")
 		_ = conn.Close(ctx)
 	}
 }
