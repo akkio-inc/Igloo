@@ -1246,6 +1246,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
+  running at once on a replica, whoever runs them, as a Snowflake
+  warehouse's `MAX_CONCURRENCY_LEVEL` does: [the replica's
+  limit](docs/workload-management.md#the-replicas-limit). Further ones wait
+  in line, in order; settings, listings, DDL and results from the result
+  cache do not. DuckDB runs every statement on all of its threads, so a
+  dashboard's burst of queries all running at once each took about as long
+  as the whole burst, and at ten times the data spilled together.
+- Preparing a statement that repeats a subquery or has unions to factor no
+  longer lists DuckDB's functions each time, about 25 ms holding the
+  catalog lock, which the statements of a burst waited for one after
+  another: they are listed once for each catalog generation.
 - The [result cache](docs/operations.md#result-cache): Igloo keeps the
   results of queries over the catalog's tables in memory and sends them
   again, without running the query, to the same statement (the same text
@@ -1564,6 +1576,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- `statement_timeout` counts a statement's run, not the time it waited to
+  start behind role limits, as Snowflake's `STATEMENT_TIMEOUT_IN_SECONDS`
+  does; the new `statement_queued_timeout` (a session or role setting, and
+  Snowflake's `STATEMENT_QUEUED_TIMEOUT_IN_SECONDS`) bounds the wait, with
+  no limit by default. The memory watch no longer picks a statement that is
+  waiting to start, which holds no memory, as the one to cancel.
 - In Snowflake's dialect, a temporary table or view named in a schema, as
   dbt's incremental models make `db.schema.m__dbt_tmp`, is created in
   DuckDB's `temp` catalog instead of failing ("TEMPORARY table names can

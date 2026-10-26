@@ -728,8 +728,12 @@ type session struct {
 	// savepointCommand).
 	changes    int
 	savepoints []savepoint
-	// timeout limits each statement; zero means none.
-	timeout time.Duration
+	// timeout limits each statement's run, and queueTimeout its wait to
+	// start (SET statement_queued_timeout); zero means none.
+	timeout, queueTimeout time.Duration
+	// queued says the statement running waits to start (see
+	// runCancelable).
+	queued bool
 	// activity records statements while they run; it may be nil.
 	activity *activity.Tracker
 	// statements holds the client's named prepared statements, once it
@@ -1074,7 +1078,7 @@ func (sess *session) cancelable(ctx context.Context, query string) (context.Cont
 	return ctx, func(err error) error {
 		ended := ctx.Err()
 		sess.mu.Lock()
-		shed := sess.shed
+		shed, exiting := sess.shed, sess.exiting
 		sess.running, sess.statement, sess.started = nil, "", time.Time{}
 		sess.mu.Unlock()
 		cancel()
@@ -1085,6 +1089,8 @@ func (sess *session) cancelable(ctx context.Context, query string) (context.Cont
 			return errStatementTimeout
 		case shed:
 			return errMemoryShed
+		case exiting:
+			return errServerExiting
 		}
 		// A cancel request, whether or not the step it ended noticed.
 		return errCanceledBeforeRun
@@ -1094,32 +1100,44 @@ func (sess *session) cancelable(ctx context.Context, query string) (context.Cont
 // runCancelable runs fn with a context that a cancel request, or the
 // session's statement timeout, can end. query is the statement as the
 // client sent it, which the console lists while it runs.
+//
+// The statement may first wait to start, behind the replica's and its
+// user's limits (see admit), for as long as its queued timeout allows; its
+// statement timeout counts from when it starts, as Snowflake's
+// STATEMENT_TIMEOUT_IN_SECONDS and STATEMENT_QUEUED_TIMEOUT_IN_SECONDS do.
+// Cancel requests end it either way.
 func (sess *session) runCancelable(ctx context.Context, query string, fn func(context.Context) error) error {
 	defer sess.activity.Begin()()
-	var cancel context.CancelFunc
-	if timeout := sess.statementTimeout(); timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
-	}
+	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started, sess.shed = cancel, redactQuery(query), time.Now(), false
+	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
 	sess.mu.Unlock()
 
 	defer func() {
 		sess.mu.Lock()
-		sess.running, sess.statement, sess.started = nil, "", time.Time{}
+		sess.running, sess.statement, sess.started, sess.queued = nil, "", time.Time{}, false
 		sess.mu.Unlock()
 		cancel()
 	}()
 
-	// The statement may wait here for its user's limits; the timeout and
-	// cancel requests apply while it does.
-	release, err := sess.admit(ctx)
+	queued, cancelQueued := ctx, context.CancelFunc(func() {})
+	if timeout := sess.queuedTimeout(); timeout > 0 {
+		queued, cancelQueued = context.WithTimeout(ctx, timeout)
+	}
+	release, err := sess.admit(queued)
+	cancelQueued()
 	if err != nil {
 		return err
 	}
 	defer release()
+	sess.mu.Lock()
+	sess.started, sess.queued = time.Now(), false
+	sess.mu.Unlock()
+	if timeout := sess.statementTimeout(); timeout > 0 {
+		var cancelRun context.CancelFunc
+		ctx, cancelRun = context.WithTimeout(ctx, timeout)
+		defer cancelRun()
+	}
 	err = fn(ctx)
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errStatementTimeout
@@ -1160,7 +1178,8 @@ func (s *Server) ShedMemory(available int64) bool {
 	for _, sess := range all {
 		sess.mu.Lock()
 		switch {
-		case sess.running == nil:
+		case sess.running == nil, sess.queued:
+			// Running nothing, or waiting to start, holding no memory.
 		case sess.shed:
 			// Canceled already, and still running.
 			if stuck == nil || sess.shedAt.Before(stuckSince) {
@@ -1665,9 +1684,13 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		// run of it is about to give, goes out as it is (see
 		// resultcache.go); a cancel request and the statement timeout end
 		// the wait for one.
-		cctx, cached := sess.cancelable(ctx, q.Query)
-		served, fill, err := s.fromCache(cctx, sess, st, args, tw)
-		if err = cached(err); served || err != nil {
+		served, fill := false, (*resultFill)(nil)
+		if s.results != nil && !sess.resultCacheOff && resultCandidate(sess, st, tw) {
+			cctx, cached := sess.cancelable(ctx, q.Query)
+			served, fill, err = s.fromCache(cctx, sess, st, args, tw)
+			err = cached(err)
+		}
+		if served || err != nil {
 			var used *audit.Resources
 			if err == nil {
 				// It read nothing and used nothing.
@@ -1687,6 +1710,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		// window short (see catalogRunLock, holdCatalog).
 		releaseCatalog := s.catalogRunLock(sess, st)
 		outer := ctx
+		// A query or a change of data waits its turn behind the replica's
+		// limit of statements at once, if there is one.
+		sess.wl.counted = countsOnReplica(sess, st)
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
@@ -1744,6 +1770,7 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 			}
 			return run()
 		})
+		sess.wl.counted = false
 		releaseCatalog()
 		s.finishResult(fill, err)
 		var used *audit.Resources
@@ -2591,6 +2618,36 @@ func (s *Server) statementTimeoutCommand(sess *session, query string) (wire.Prep
 			}
 			return w.Complete("SHOW")
 		}, wire.WithColumns(wire.Columns{{Name: "statement_timeout", Oid: pgtype.TextOID, Width: -1}}))
+	}
+	// statement_queued_timeout, the longest a statement may wait to start
+	// (see runCancelable); none unless set.
+	if m := setQueuedTimeout.FindStringSubmatch(query); m != nil {
+		d, isDefault, err := parseStatementTimeout(m[1])
+		return respond(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			if err != nil {
+				return pgerror.WithCode(errors.New(strings.ReplaceAll(err.Error(), "statement_timeout", "statement_queued_timeout")),
+					codes.InvalidParameterValue)
+			}
+			sess.queueTimeout = d
+			if isDefault {
+				sess.queueTimeout = 0
+			}
+			return w.Complete("SET")
+		})
+	}
+	if resetQueuedTimeout.MatchString(query) {
+		return respond(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			sess.queueTimeout = 0
+			return w.Complete("RESET")
+		})
+	}
+	if showQueuedTimeout.MatchString(query) {
+		return respond(func(_ context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			if err := w.Row([]any{formatTimeout(sess.queuedTimeout())}); err != nil {
+				return err
+			}
+			return w.Complete("SHOW")
+		}, wire.WithColumns(wire.Columns{{Name: "statement_queued_timeout", Oid: pgtype.TextOID, Width: -1}}))
 	}
 	return nil, false
 }

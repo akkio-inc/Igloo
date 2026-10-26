@@ -1024,7 +1024,7 @@ holder=$!
 # On a busy host the holder can take a while to start: until it holds the
 # slot, a second statement just runs, so try again while the holder lives.
 for _ in $(seq 30); do
-  got="$(psql_as nora nora-password-1 -c "SET statement_timeout = '1s'" -c "SELECT 1")" || true
+  got="$(psql_as nora nora-password-1 -c "SET statement_queued_timeout = '1s'" -c "SELECT 1")" || true
   if grep -q "behind the limit of 1 statement at once for role analysts" <<<"$got" || ! kill -0 "$holder" 2>/dev/null; then
     break
   fi

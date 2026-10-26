@@ -509,6 +509,24 @@ func TestSortSpillBudget(t *testing.T) {
 	}
 }
 
+func TestMaxConcurrentStatements(t *testing.T) {
+	for v, want := range map[string]int{"": 0, "off": 0, "0": 0, "auto": -1, "AUTO": -1, "8": 8} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_MAX_CONCURRENT_STATEMENTS"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.MaxConcurrentStatements != want {
+			t.Errorf("IGLOO_MAX_CONCURRENT_STATEMENTS=%q: %d %v, want %d", v, cfg.MaxConcurrentStatements, err, want)
+		}
+	}
+	for _, v := range []string{"-2", "lots", "1.5"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_MAX_CONCURRENT_STATEMENTS": v})); err == nil {
+			t.Errorf("IGLOO_MAX_CONCURRENT_STATEMENTS=%s should be refused", v)
+		}
+	}
+}
+
 func TestResultCacheSize(t *testing.T) {
 	for v, want := range map[string]int64{"": 256 << 20, "0": 0, "off": 0, "1GB": 1e9, "64MiB": 64 << 20} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

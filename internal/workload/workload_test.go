@@ -239,3 +239,68 @@ func TestControllerWithoutLimits(t *testing.T) {
 		}
 	}
 }
+
+// TestReplicaLimit checks the replica's limit of counted statements: they
+// wait in order behind it, statements that are not counted never do, and
+// one that waits for its role's slots alone does not hold the others up.
+func TestReplicaLimit(t *testing.T) {
+	c := NewController(0)
+	c.LimitReplica(1)
+	ctx := context.Background()
+	counted := Limits{Counted: true}
+	first, _, err := c.Admit(ctx, counted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not counted: starts at once.
+	other, _, err := c.Admit(ctx, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other()
+	// Counted: waits, in order.
+	var mu sync.Mutex
+	var order []int
+	var wg sync.WaitGroup
+	for i := range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			release, _, err := c.Admit(ctx, counted)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			order = append(order, i)
+			mu.Unlock()
+			release()
+		}()
+		// Each joins the line before the next.
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			c.mu.Lock()
+			n := len(c.queue)
+			c.mu.Unlock()
+			if n == i+1 {
+				break
+			}
+		}
+	}
+	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, waited, err := c.Admit(short, counted); !errors.Is(err, context.DeadlineExceeded) || waited < 20*time.Millisecond {
+		t.Errorf("a counted statement behind the limit: %v after %s", err, waited)
+	}
+	first()
+	wg.Wait()
+	if len(order) != 3 || order[0] != 0 || order[1] != 1 || order[2] != 2 {
+		t.Errorf("admitted in order %v", order)
+	}
+	// Without a limit, counted statements start at once.
+	free := NewController(0)
+	release, waited, err := free.Admit(ctx, counted)
+	if err != nil || waited != 0 {
+		t.Errorf("without a limit: %v, waited %s", err, waited)
+	}
+	release()
+}

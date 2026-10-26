@@ -9,9 +9,10 @@ import (
 )
 
 // Controller holds statements back until their limits allow them to start,
-// on one replica: a statement counts against its Slots while it runs, and
-// its memory reservation against the replica's query memory (DuckDB's
-// memory limit).
+// on one replica: a statement counts against its Slots while it runs, its
+// memory reservation against the replica's query memory (DuckDB's memory
+// limit), and, if it is Counted, against the replica's own limit of
+// statements at once (see LimitReplica).
 //
 // Statements that must wait do so in arrival order. A statement never
 // overtakes an earlier one that waits for the same slots, nor, if it
@@ -29,10 +30,16 @@ type Controller struct {
 	// and reservations are then not enforced.
 	budget int64
 
+	// replicaMax is the replica's limit of counted statements at once;
+	// zero means none.
+	replicaMax int
+
 	mu       sync.Mutex
 	reserved int64
 	running  map[string]int
-	queue    []*waiter
+	// replicaRunning counts the counted statements running.
+	replicaRunning int
+	queue          []*waiter
 
 	waiting prometheus.Gauge
 	waited  prometheus.Counter
@@ -42,7 +49,9 @@ type Controller struct {
 type waiter struct {
 	slots  Slots
 	memory int64
-	ready  chan struct{}
+	// counted says it counts against the replica's limit.
+	counted bool
+	ready   chan struct{}
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
@@ -55,13 +64,27 @@ func NewController(budget int64) *Controller {
 		running: make(map[string]int),
 		waiting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "igloo_statements_waiting",
-			Help: "Statements waiting for their role's concurrency or memory limit before they start.",
+			Help: "Statements waiting for the replica's or their role's concurrency or memory limit before they start.",
 		}),
 		waited: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_statement_wait_seconds_total",
-			Help: "Time statements spent waiting for their role's limits.",
+			Help: "Time statements spent waiting for the replica's or their role's limits.",
 		}),
 	}
+}
+
+// LimitReplica lets at most n statements that are Counted run at once on
+// the replica, whoever runs them, as a Snowflake warehouse's
+// MAX_CONCURRENCY_LEVEL does; further ones wait in line. Zero or less
+// means no limit. It is set once, before statements run.
+func (c *Controller) LimitReplica(n int) { c.replicaMax = max(n, 0) }
+
+// ReplicaLimit is LimitReplica's limit; zero means none.
+func (c *Controller) ReplicaLimit() int {
+	if c == nil {
+		return 0
+	}
+	return c.replicaMax
 }
 
 // Metrics are the controller's Prometheus metrics.
@@ -73,11 +96,11 @@ func (c *Controller) Metrics() []prometheus.Collector {
 // case it returns ctx's error. The statement must call release when it
 // ends. waited is how long it was held back.
 func (c *Controller) Admit(ctx context.Context, l Limits) (release func(), waited time.Duration, err error) {
-	if c == nil || !l.Limited() {
+	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) {
 		return func() {}, 0, nil
 	}
-	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), ready: make(chan struct{})}
-	if w.slots.Max == 0 && w.memory == 0 {
+	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, ready: make(chan struct{})}
+	if w.slots.Max == 0 && w.memory == 0 && !w.counted {
 		return func() {}, 0, nil
 	}
 	c.mu.Lock()
@@ -126,14 +149,18 @@ func (c *Controller) reservation(memory int64) int64 {
 // The caller holds c.mu.
 func (c *Controller) admit() {
 	blocked := map[string]bool{}
-	memoryBlocked := false
+	memoryBlocked, replicaBlocked := false, false
 	kept := c.queue[:0]
 	for _, w := range c.queue {
 		slotsFree := w.slots.Max == 0 || !blocked[w.slots.Key] && c.running[w.slots.Key] < w.slots.Max
 		memoryFree := w.memory == 0 || !memoryBlocked && c.reserved+w.memory <= c.budget
-		if slotsFree && memoryFree {
+		replicaFree := !w.counted || !replicaBlocked && c.replicaRunning < c.replicaMax
+		if slotsFree && memoryFree && replicaFree {
 			if w.slots.Max > 0 {
 				c.running[w.slots.Key]++
+			}
+			if w.counted {
+				c.replicaRunning++
 			}
 			c.reserved += w.memory
 			w.admitted = true
@@ -142,12 +169,16 @@ func (c *Controller) admit() {
 		}
 		// Later statements with the same slots wait behind this one
 		// whatever it waits for; others reserving memory only if it waits
-		// for memory, not when it waits for its slots alone.
+		// for memory, and other counted ones only if it waits for the
+		// replica's limit, not when it waits for its slots alone.
 		if w.slots.Max > 0 {
 			blocked[w.slots.Key] = true
 		}
 		if !memoryFree {
 			memoryBlocked = true
+		}
+		if !replicaFree {
+			replicaBlocked = true
 		}
 		kept = append(kept, w)
 	}
@@ -171,6 +202,9 @@ func (c *Controller) release(w *waiter) {
 		if c.running[w.slots.Key]--; c.running[w.slots.Key] <= 0 {
 			delete(c.running, w.slots.Key)
 		}
+	}
+	if w.counted {
+		c.replicaRunning--
 	}
 	c.reserved -= w.memory
 	c.admit()

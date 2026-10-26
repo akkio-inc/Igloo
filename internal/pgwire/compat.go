@@ -910,6 +910,9 @@ var (
 	setStatementTimeout   = regexp.MustCompile(`(?is)^\s*SET\s+(?:SESSION\s+|LOCAL\s+)?statement_timeout\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$`)
 	resetStatementTimeout = regexp.MustCompile(`(?is)^\s*RESET\s+statement_timeout\s*;?\s*$`)
 	showStatementTimeout  = regexp.MustCompile(`(?is)^\s*SHOW\s+statement_timeout\s*;?\s*$`)
+	setQueuedTimeout      = regexp.MustCompile(`(?is)^\s*SET\s+(?:SESSION\s+|LOCAL\s+)?statement_queued_timeout\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$`)
+	resetQueuedTimeout    = regexp.MustCompile(`(?is)^\s*RESET\s+statement_queued_timeout\s*;?\s*$`)
+	showQueuedTimeout     = regexp.MustCompile(`(?is)^\s*SHOW\s+statement_queued_timeout\s*;?\s*$`)
 )
 
 // parseStatementTimeout parses a PostgreSQL statement_timeout value: a

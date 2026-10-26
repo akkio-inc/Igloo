@@ -52,7 +52,7 @@ Every statement in `igloo.query_history` also has:
 |---|---|
 | `query_tag` | The tag it ran under, or `NULL` |
 | `pool` | The [compute pool](#compute-pools) of the replica that ran it |
-| `queued_ms` | Time it waited for its [role limits](#role-limits) before starting |
+| `queued_ms` | Time it waited for its [role limits](#role-limits) and [the replica's](#the-replicas-limit) before starting |
 | `cpu_time_ms` | CPU time DuckDB's operators spent on it, summed over threads |
 | `bytes_read` | Bytes DuckDB read from files for it, such as the data and metadata files of the tables it read |
 | `memory_allocated_bytes` | Memory DuckDB's buffer pool allocated for it over its run; memory freed and allocated again counts again, so this is not a peak |
@@ -136,6 +136,7 @@ Admins set limits on users, custom roles and built-in roles:
 ```sql
 ALTER ROLE analysts SET max_concurrent_statements = 4;
 ALTER ROLE analysts SET statement_timeout = '15min';
+ALTER ROLE analysts SET statement_queued_timeout = '5min';
 ALTER ROLE analysts SET memory_limit = '8GB';
 ALTER ROLE reader SET statement_timeout = '1h';      -- every user with the built-in role reader
 ALTER USER etl_service SET statement_timeout = 0;    -- no limit for this user
@@ -145,7 +146,8 @@ SHOW ROLE SETTINGS;                                  -- admins see all; others, 
 
 | Setting | Effect |
 |---|---|
-| `statement_timeout` | The longest a statement may run, waiting time included. A session's own `SET statement_timeout` can be shorter, not longer. `0` means no limit. |
+| `statement_timeout` | The longest a statement may run, once it has started: the time it waited to start does not count, as in Snowflake. A session's own `SET statement_timeout` can be shorter, not longer. `0` means no limit. |
+| `statement_queued_timeout` | The longest a statement may wait to start, behind the limits below and [the replica's](#the-replicas-limit) (Snowflake's `STATEMENT_QUEUED_TIMEOUT_IN_SECONDS`). A session's own `SET statement_queued_timeout` can be shorter, not longer. `0`, the default, means no limit. |
 | `max_concurrent_statements` | How many statements may run at once on a replica. On a user, it counts that user's statements; on a custom or built-in role, all its members' together. Further statements wait in line. |
 | `memory_limit` | The memory each statement reserves out of the replica's query memory (DuckDB's memory limit) before it starts. A statement whose reservation does not fit next to those already running waits in line. |
 | `query_tag` | The default [query tag](#query-tags) |
@@ -165,12 +167,13 @@ How limits are enforced:
   nor, if it reserves memory, one that waits for memory, so a large
   reservation is not starved by small ones. Statements of other users and
   roles are not held up.
-- **Until a slot frees, the timeout, or a cancel.** A waiting statement
-  counts against its timeout, and clients can cancel it. When the timeout
-  runs out while it waits, it fails with SQLSTATE `57014` and a message that
-  says what it waited behind, such as `canceling statement due to statement
-  timeout: it waited 30s to start, behind the limit of 4 statements at once
-  for role analysts`. The history records the time waited as `queued_ms`.
+- **Until a slot frees, the queued timeout, or a cancel.** A waiting
+  statement's `statement_timeout` has not started, and clients can cancel
+  it. When its `statement_queued_timeout` runs out while it waits, it fails
+  with SQLSTATE `57014` and a message that says what it waited behind, such
+  as `canceling statement due to statement queued timeout: it waited 30s to
+  start, behind the limit of 4 statements at once for role analysts`. The
+  history records the time waited as `queued_ms`.
 - **Per replica.** Each replica enforces limits on the statements it runs;
   three replicas run up to three times a role's `max_concurrent_statements`.
 - **Statements, not commands.** Limits apply to statements DuckDB runs,
@@ -201,6 +204,24 @@ How limits are enforced:
 `igloo_statements_waiting` and `igloo_statement_wait_seconds_total`
 ([metrics](operations.md#monitoring)) show how often limits hold statements
 back.
+
+### The replica's limit
+
+`IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
+running at once on a replica, whoever runs them, as a Snowflake warehouse's
+`MAX_CONCURRENCY_LEVEL` does; further ones wait in line, in arrival order,
+as for the limits above. A number sets it, `auto` makes it the replica's
+cores, and `off`, the default, means no limit.
+
+DuckDB runs every statement on all of its threads, so a hundred statements
+at once each get a hundredth of the replica: none finishes before the
+others are nearly done, and together they hold the memory of all of them,
+and spill. In line, the first ones finish in the time they take alone.
+`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY` and `CREATE TABLE
+... AS` count; settings, transaction control, `SHOW`, catalog listings and
+other DDL do not, and neither does a result the [result
+cache](operations.md#result-cache) answers. A statement waiting for this
+limit says so: `behind the replica's limit of 8 statements at once`.
 
 ## Compute pools
 

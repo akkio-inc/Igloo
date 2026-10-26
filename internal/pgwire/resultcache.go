@@ -223,12 +223,10 @@ func (res *cachedResult) replay(w wire.DataWriter) error {
 // fromCache sends st's result from the cache, kept or from a run of the
 // same statement that another session has under way, and reports whether
 // it did. Otherwise it returns the fill st's own run is to give its rows
-// to, nil if its result is not to be kept.
+// to, nil if its result is not to be kept. The caller has checked that the
+// cache may answer st (resultCandidate).
 func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w *tagWriter) (bool, *resultFill, error) {
 	c := s.results
-	if c == nil || sess.resultCacheOff || !resultCandidate(sess, st, w) {
-		return false, nil, nil
-	}
 	settings, err := s.resultSettings(ctx, sess)
 	if err != nil {
 		return false, nil, nil

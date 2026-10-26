@@ -216,7 +216,7 @@ func TestRoleConcurrencyLimit(t *testing.T) {
 	mustExec(t, cs.admin, "ALTER ROLE batch SET max_concurrent_statements = 1")
 
 	// bea's slow query holds the role's one slot; bo's waits behind it
-	// until its timeout, with a message that says so.
+	// until its queued timeout, with a message that says so.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -228,14 +228,17 @@ func TestRoleConcurrencyLimit(t *testing.T) {
 	for ctl.Running("role batch") == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	mustExec(t, conns[1], "SET statement_timeout = '300ms'")
+	mustExec(t, conns[1], "SET statement_queued_timeout = '300ms'")
 	_, err := conns[1].Exec(ctx, "SELECT 1")
-	if pgCode(err) != "57014" || !strings.Contains(err.Error(), "the limit of 1 statement at once for role batch") {
-		t.Errorf("queued past its timeout: %v", err)
+	if pgCode(err) != "57014" || !strings.Contains(err.Error(), "statement queued timeout") ||
+		!strings.Contains(err.Error(), "the limit of 1 statement at once for role batch") {
+		t.Errorf("queued past its queued timeout: %v", err)
 	}
-	// Once the slot is free, statements run, and the history says how
-	// long they waited.
-	mustExec(t, conns[1], "SET statement_timeout = '30s'")
+	// Its statement timeout counts only once it runs: a short one does not
+	// end its wait. Once the slot is free, it runs, and the history says
+	// how long it waited.
+	mustExec(t, conns[1], "RESET statement_queued_timeout")
+	mustExec(t, conns[1], "SET statement_timeout = '300ms'")
 	if _, err := conns[1].Exec(ctx, "SELECT 2 AS after_wait"); err != nil {
 		t.Fatal(err)
 	}
@@ -246,6 +249,58 @@ func TestRoleConcurrencyLimit(t *testing.T) {
 	}
 	// Other users are not held up.
 	mustExec(t, cs.admin, "SELECT 3")
+}
+
+// TestReplicaConcurrencyLimit checks the replica's own limit of statements at
+// once (IGLOO_MAX_CONCURRENT_STATEMENTS): queries of every user wait behind
+// it, in order, and settings and catalog listings do not.
+func TestReplicaConcurrencyLimit(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(0)
+	ctl.LimitReplica(1)
+	cs := startCatalogServer(t, func(o *Options) { o.Workload = ctl })
+	ctx := context.Background()
+	rita := cs.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	hal := cs.user(t, "hal", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	probe := cs.user(t, "probe", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+
+	// hal's slow query holds the replica's one slot.
+	mustExec(t, hal, "SET statement_timeout = '3s'")
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = hal.Exec(ctx, slowQuery)
+	}()
+	// Once a probe's query waits, the slot is held.
+	deadline := time.Now().Add(10 * time.Second)
+	mustExec(t, probe, "SET statement_queued_timeout = '50ms'")
+	for time.Now().Before(deadline) {
+		if _, err := probe.Exec(ctx, "SELECT 0"); err != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mustExec(t, rita, "SET statement_queued_timeout = '300ms'")
+	if got := texts(t, rita, "SHOW statement_queued_timeout"); len(got) != 1 || got[0] != "300ms" {
+		t.Errorf("SHOW statement_queued_timeout: %v", got)
+	}
+	_, err := rita.Exec(ctx, "SELECT 1")
+	if pgCode(err) != "57014" || !strings.Contains(err.Error(), "the replica's limit of 1 statement at once") {
+		t.Errorf("a query behind the replica's limit: %v", err)
+	}
+	// Settings and listings go ahead of it.
+	start := time.Now()
+	mustExec(t, rita, "SET query_tag = 'x'")
+	if n := count(t, rita, "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'main'"); n < 1 || time.Since(start) > 2*time.Second {
+		t.Errorf("a listing behind the replica's limit: %d after %s", n, time.Since(start))
+	}
+	// Once the slot is free, the query runs.
+	mustExec(t, rita, "RESET statement_queued_timeout")
+	if n := count(t, rita, "SELECT 2"); n != 2 {
+		t.Errorf("after the wait: %d", n)
+	}
+	wg.Wait()
 }
 
 func TestMemoryReservations(t *testing.T) {
@@ -261,12 +316,12 @@ func TestMemoryReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, ana, "SET statement_timeout = '200ms'")
+	mustExec(t, ana, "SET statement_queued_timeout = '200ms'")
 	if _, err := ana.Exec(ctx, "SELECT 1"); pgCode(err) != "57014" || !strings.Contains(err.Error(), "memory") {
 		t.Errorf("a reservation that does not fit: %v", err)
 	}
 	// It starts once the memory is free.
-	mustExec(t, ana, "SET statement_timeout = 0")
+	mustExec(t, ana, "RESET statement_queued_timeout")
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		release()

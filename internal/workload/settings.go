@@ -21,9 +21,14 @@ import (
 const (
 	// QueryTag tags the statements of sessions that set no tag of their own.
 	QueryTag = "query_tag"
-	// StatementTimeout is the longest a statement may run, wherever the
-	// session's own statement_timeout is longer or unset.
+	// StatementTimeout is the longest a statement may run, once it has
+	// started, wherever the session's own statement_timeout is longer or
+	// unset.
 	StatementTimeout = "statement_timeout"
+	// StatementQueuedTimeout is the longest a statement may wait to start,
+	// behind the limits of statements at once and memory, wherever the
+	// session's own statement_queued_timeout is longer or unset.
+	StatementQueuedTimeout = "statement_queued_timeout"
 	// MaxConcurrentStatements is how many statements may run at once on a
 	// replica: per user when set on a user, for all members together when
 	// set on a role.
@@ -37,7 +42,7 @@ const (
 )
 
 // Names lists the settings.
-var Names = []string{QueryTag, StatementTimeout, MaxConcurrentStatements, MemoryLimit, SQLDialect}
+var Names = []string{QueryTag, StatementTimeout, StatementQueuedTimeout, MaxConcurrentStatements, MemoryLimit, SQLDialect}
 
 // MaxQueryTag bounds a query tag's length in bytes, as Snowflake's does.
 const MaxQueryTag = 2000
@@ -50,7 +55,7 @@ func Normalize(name, value string) (string, error) {
 	switch name {
 	case QueryTag:
 		return value, CheckQueryTag(value)
-	case StatementTimeout:
+	case StatementTimeout, StatementQueuedTimeout:
 		d, err := ParseTimeout(value)
 		if err != nil {
 			return "", err
@@ -128,8 +133,10 @@ func FormatTimeout(d time.Duration) string {
 type Limits struct {
 	// QueryTag tags their statements when the session sets none.
 	QueryTag string
-	// StatementTimeout caps every statement; zero means no cap.
+	// StatementTimeout caps every statement's run, and QueuedTimeout its
+	// wait to start; zero means no cap.
 	StatementTimeout time.Duration
+	QueuedTimeout    time.Duration
 	// Slots is the concurrency limit their statements count against.
 	Slots Slots
 	// Memory is what each statement reserves, in bytes; zero means none.
@@ -137,6 +144,11 @@ type Limits struct {
 	// SQLDialect is the dialect of sessions that choose none; "" means
 	// DuckDB's.
 	SQLDialect string
+	// Counted says the statement counts against the replica's limit of
+	// statements at once (see Controller.LimitReplica): it is one that
+	// runs a query or changes data. It is the statement's, not the
+	// user's.
+	Counted bool
 }
 
 // Slots is a limit on statements running at once, shared by everyone
@@ -184,7 +196,11 @@ func Resolve(user auth.User, roles []string, settings []auth.Setting) Limits {
 			l.QueryTag = level[0].Value
 		case SQLDialect:
 			l.SQLDialect = level[0].Value
-		case StatementTimeout:
+		case StatementTimeout, StatementQueuedTimeout:
+			timeout := &l.StatementTimeout
+			if name == StatementQueuedTimeout {
+				timeout = &l.QueuedTimeout
+			}
 			// Zero, no limit, is the most generous of all.
 			for _, s := range level {
 				d, err := ParseTimeout(s.Value)
@@ -192,10 +208,10 @@ func Resolve(user auth.User, roles []string, settings []auth.Setting) Limits {
 					continue
 				}
 				if d == 0 {
-					l.StatementTimeout = 0
+					*timeout = 0
 					break
 				}
-				l.StatementTimeout = max(l.StatementTimeout, d)
+				*timeout = max(*timeout, d)
 			}
 		case MaxConcurrentStatements:
 			for _, s := range level {

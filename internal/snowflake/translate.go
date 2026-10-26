@@ -418,6 +418,9 @@ var sessionParameters = map[string]sessionParameter{
 	"STATEMENT_TIMEOUT_IN_SECONDS": {sql: func(v string) string {
 		return "SET statement_timeout = " + quoteString(v+"s")
 	}},
+	"STATEMENT_QUEUED_TIMEOUT_IN_SECONDS": {sql: func(v string) string {
+		return "SET statement_queued_timeout = " + quoteString(v+"s")
+	}},
 	"WEEK_START":                     {accept: []string{"0"}, why: "Igloo's weeks start on Monday and DAYOFWEEK counts from Sunday, as with WEEK_START = 0"},
 	"WEEK_OF_YEAR_POLICY":            {accept: []string{"0"}, why: "Igloo numbers weeks as ISO 8601 does, as with WEEK_OF_YEAR_POLICY = 0"},
 	"TIMESTAMP_TYPE_MAPPING":         {accept: []string{"TIMESTAMP_NTZ"}, why: "TIMESTAMP means TIMESTAMP_NTZ in Igloo"},
@@ -433,7 +436,7 @@ var sessionParameters = map[string]sessionParameter{
 	"BINARY_OUTPUT_FORMAT":           {accept: []string{"HEX"}, why: outputFormatWhy},
 	"QUOTED_IDENTIFIERS_IGNORE_CASE": {accept: []string{"FALSE", "TRUE"}},
 	"AUTOCOMMIT":                     {accept: []string{"TRUE"}, why: "use BEGIN and COMMIT for transactions"},
-	"USE_CACHED_RESULT":              {}, "STATEMENT_QUEUED_TIMEOUT_IN_SECONDS": {}, "ROWS_PER_RESULTSET": {},
+	"USE_CACHED_RESULT":              {}, "ROWS_PER_RESULTSET": {},
 	"ABORT_DETACHED_QUERY": {}, "LOCK_TIMEOUT": {}, "JSON_INDENT": {}, "MULTI_STATEMENT_COUNT": {},
 	"TRANSACTION_DEFAULT_ISOLATION_LEVEL": {}, "TIMESTAMP_DAY_IS_ALWAYS_24H": {}, "ERROR_ON_NONDETERMINISTIC_MERGE": {},
 	"ERROR_ON_NONDETERMINISTIC_UPDATE": {}, "BINARY_INPUT_FORMAT": {}, "GEOGRAPHY_OUTPUT_FORMAT": {},
@@ -467,6 +470,8 @@ func (t *translator) alterSession(nodes []*node, idx []int) ([]*node, string, er
 				stmts = append(stmts, "RESET TimeZone")
 			case "STATEMENT_TIMEOUT_IN_SECONDS":
 				stmts = append(stmts, "RESET statement_timeout")
+			case "STATEMENT_QUEUED_TIMEOUT_IN_SECONDS":
+				stmts = append(stmts, "RESET statement_queued_timeout")
 			case "":
 				return nil, "", &Error{Code: CodeSyntax, Message: "expected a parameter name after ALTER SESSION UNSET"}
 			}
@@ -525,7 +530,7 @@ func (t *translator) sessionStatements(stmts []string) ([]*node, string, error) 
 	case 1:
 		return []*node{raw(stmts[0])}, "", nil
 	}
-	return nil, "", unsupported("Setting TIMEZONE and STATEMENT_TIMEOUT_IN_SECONDS in one ALTER SESSION", "set them one at a time")
+	return nil, "", unsupported("Setting several of TIMEZONE, STATEMENT_TIMEOUT_IN_SECONDS and STATEMENT_QUEUED_TIMEOUT_IN_SECONDS in one ALTER SESSION", "set them one at a time")
 }
 
 func containsFold(list []string, s string) bool {

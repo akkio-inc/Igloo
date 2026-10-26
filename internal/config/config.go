@@ -73,6 +73,11 @@ type Config struct {
 	// reports and answer them through the report API (IGLOO_REPORT_REWRITE,
 	// off by default).
 	ReportRewrite bool
+	// MaxConcurrentStatements is how many queries and data changes may run
+	// at once on a replica, whoever runs them; further ones wait in line
+	// (IGLOO_MAX_CONCURRENT_STATEMENTS: a number, auto for as many as the
+	// cores, -1 here, or off, 0, for no limit, the default).
+	MaxConcurrentStatements int
 	// ResultCacheSize is the memory the results Igloo keeps of queries may
 	// take, to send them again to the same query while no table changes
 	// (IGLOO_RESULT_CACHE_SIZE, 256 MiB by default; 0 or off keeps none).
@@ -570,6 +575,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg.BitmapIndexes = bitmapIndexes
 	if cfg.ReportRewrite, err = strconv.ParseBool(get("IGLOO_REPORT_REWRITE", "false")); err != nil {
 		addErr("IGLOO_REPORT_REWRITE must be true or false: %w", err)
+	}
+
+	switch v := strings.ToLower(get("IGLOO_MAX_CONCURRENT_STATEMENTS", "off")); v {
+	case "off", "0":
+	case "auto":
+		cfg.MaxConcurrentStatements = -1
+	default:
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10_000 {
+			addErr("IGLOO_MAX_CONCURRENT_STATEMENTS must be a whole number from 1 to 10000, auto or off, got %q", v)
+		}
+		cfg.MaxConcurrentStatements = n
 	}
 
 	switch v := get("IGLOO_RESULT_CACHE_SIZE", "256MiB"); {

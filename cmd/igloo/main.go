@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -417,6 +418,13 @@ func serve() error {
 	}
 	// Memory reservations for role limits come out of DuckDB's memory.
 	limits := workload.NewController(eng.MemoryLimit(ctx))
+	replica := cfg.MaxConcurrentStatements
+	if replica < 0 {
+		// auto: as many as the cores Go may use, which follow a
+		// container's CPU limit.
+		replica = runtime.GOMAXPROCS(0)
+	}
+	limits.LimitReplica(replica)
 	reg.MustRegister(limits.Metrics()...)
 
 	opts := pgwire.Options{

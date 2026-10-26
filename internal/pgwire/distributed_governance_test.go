@@ -308,11 +308,11 @@ func TestDistributedWorkload(t *testing.T) {
 	if n := ctl.Running("role batch"); n != 1 {
 		t.Errorf("%d statements of role batch run while the workers hold bea's", n)
 	}
-	mustExec(t, bo, "SET statement_timeout = '300ms'")
+	mustExec(t, bo, "SET statement_queued_timeout = '300ms'")
 	if _, err := bo.Exec(ctx, "SELECT 1"); pgCode(err) != "57014" || !strings.Contains(err.Error(), "the limit of 1 statement at once for role batch") {
 		t.Errorf("bo's statement while bea's runs on workers: %v", err)
 	}
-	mustExec(t, cy, "SET statement_timeout = '300ms'")
+	mustExec(t, cy, "SET statement_queued_timeout = '300ms'")
 	if _, err := cy.Exec(ctx, "SELECT 2"); pgCode(err) != "57014" || !strings.Contains(err.Error(), "memory") {
 		t.Errorf("cy's reservation while bea's runs on workers: %v", err)
 	}

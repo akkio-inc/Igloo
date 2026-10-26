@@ -40,6 +40,8 @@ services:
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
       # Empty keeps 256 MiB of query results; 0 turns the result cache off.
       IGLOO_RESULT_CACHE_SIZE: ${IGLOO_RESULT_CACHE_SIZE:-}
+      # How many queries may run at once; empty or off means no limit.
+      IGLOO_MAX_CONCURRENT_STATEMENTS: ${IGLOO_MAX_CONCURRENT_STATEMENTS:-}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}

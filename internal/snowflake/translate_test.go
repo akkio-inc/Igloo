@@ -115,6 +115,8 @@ func TestTranslate(t *testing.T) {
 		// Statements.
 		{`ALTER SESSION SET TIMEZONE = 'UTC'`, `SET TimeZone = 'UTC'`},
 		{`ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 60`, `SET statement_timeout = '60s'`},
+		{`ALTER SESSION SET STATEMENT_QUEUED_TIMEOUT_IN_SECONDS = 30`, `SET statement_queued_timeout = '30s'`},
+		{`ALTER SESSION UNSET STATEMENT_QUEUED_TIMEOUT_IN_SECONDS`, `RESET statement_queued_timeout`},
 		{`USE SCHEMA analytics.marts`, `USE analytics.marts`},
 		{`DESC TABLE t`, `DESCRIBE t`},
 		{`GRANT SELECT ON TABLE t TO ROLE analyst`, `GRANT SELECT ON TABLE t TO analyst`},

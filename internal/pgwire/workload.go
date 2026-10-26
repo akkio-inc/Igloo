@@ -50,6 +50,9 @@ type workloadState struct {
 	loaded time.Time
 	// queued is how long the latest statement waited to start.
 	queued time.Duration
+	// counted says the statement about to run counts against the
+	// replica's limit of statements at once (see countsOnReplica).
+	counted bool
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
 	// controller holds statements back for their limits.
@@ -74,16 +77,56 @@ func (sess *session) statementTimeout() time.Duration {
 	return sess.timeout
 }
 
+// queuedTimeout is the session's statement_queued_timeout, capped by its
+// user's limit.
+func (sess *session) queuedTimeout() time.Duration {
+	limit := sess.wl.limits.QueuedTimeout
+	if limit > 0 && (sess.queueTimeout == 0 || sess.queueTimeout > limit) {
+		return limit
+	}
+	return sess.queueTimeout
+}
+
+// countsOnReplica reports whether st counts against the replica's limit of
+// statements at once (IGLOO_MAX_CONCURRENT_STATEMENTS): it runs a query or
+// changes data, and holds nothing while it waits to start (see
+// catalogRunLock). Settings, transaction control, catalog listings and
+// DDL do not count, and neither does a result the cache sends (see
+// fromCache), which uses nothing.
+func countsOnReplica(sess *session, st *statement) bool {
+	if st.listsCatalog || st.changesIceberg {
+		return false
+	}
+	switch st.stmtType {
+	case duckdb.STATEMENT_TYPE_SELECT, duckdb.STATEMENT_TYPE_INSERT, duckdb.STATEMENT_TYPE_UPDATE,
+		duckdb.STATEMENT_TYPE_DELETE, statementTypeMergeInto, duckdb.STATEMENT_TYPE_COPY:
+		return true
+	case duckdb.STATEMENT_TYPE_CREATE:
+		// CREATE TABLE ... AS, carried out in steps that hold the catalog
+		// only to create and rename (see runStagedCreate).
+		return st.staged != nil && !sess.inTx
+	}
+	return false
+}
+
 // admit waits until the session's limits let a statement start, and
 // returns the function to call when it ends.
 func (sess *session) admit(ctx context.Context) (func(), error) {
 	l := sess.wl.limits
+	l.Counted = sess.wl.counted
 	release, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
 	if err == nil {
 		return release, nil
 	}
 	behind := []string{}
+	if n := sess.wl.controller.ReplicaLimit(); l.Counted && n > 0 {
+		unit := "statements"
+		if n == 1 {
+			unit = "statement"
+		}
+		behind = append(behind, fmt.Sprintf("the replica's limit of %d %s at once", n, unit))
+	}
 	if l.Slots.Max > 0 {
 		unit := "statements"
 		if l.Slots.Max == 1 {
@@ -96,7 +139,7 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 	}
 	why := "user request"
 	if errors.Is(err, context.DeadlineExceeded) {
-		why = "statement timeout"
+		why = "statement queued timeout"
 	}
 	return nil, pgerror.WithCode(fmt.Errorf("canceling statement due to %s: it waited %s to start, behind %s",
 		why, waited.Round(time.Millisecond), strings.Join(behind, " and ")), codes.QueryCanceled)
