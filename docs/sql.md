@@ -191,6 +191,27 @@ counts these writes.
   or `UNION` columns, which Parquet files do not keep as they are.
 - `IGLOO_SORT_SPILL_BUDGET=off` sorts every write at once.
 
+
+### Aggregates too large for memory
+
+DuckDB keeps a group's values in memory, for each list or string
+aggregate (`list`, `string_agg`, Snowflake's `ARRAY_AGG`, `ARRAY_UNIQUE_AGG`
+and `LISTAGG`) and each `DISTINCT` aggregate, until the aggregate is done,
+and does not spill them well. A `CREATE TABLE ... AS` that reads such an
+aggregate, of more groups than a quarter of DuckDB's memory holds their
+states for as its plan estimates, fills the table in passes instead, each
+over the groups whose keys hash to its number. A dbt model that grouped tens of
+millions of rows into millions of groups, with several such aggregates, ran out of
+memory in one run after spilling 307 GiB.
+
+The passes give the rows one run would, since each group falls in one
+pass, so Igloo runs in passes only a statement each of whose rows comes from
+one group: it reads the aggregate once, through layers that only add
+columns and filter rows, groups by one set of keys, and calls no volatile
+function. A statement that ran out of memory in one run is filled again in
+passes, if it is such a statement. Each pass reads the aggregate's input
+again; `igloo_aggregate_passes_total` counts these tables.
+
 ### Column types
 
 Tables take DuckDB's types that Iceberg has: numbers, text, dates and

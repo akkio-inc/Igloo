@@ -1254,6 +1254,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   cache do not. DuckDB runs every statement on all of its threads, so a
   dashboard's burst of queries all running at once each took about as long
   as the whole burst, and at ten times the data spilled together.
+- `CREATE TABLE ... AS` of an aggregate whose list, string or `DISTINCT`
+  aggregates (`ARRAY_UNIQUE_AGG`, `LISTAGG(DISTINCT ...)` and the like) have
+  more groups than memory holds their values for fills the table in passes,
+  each over the groups whose keys hash to its number: [aggregates too large
+  for memory](docs/sql.md#aggregates-too-large-for-memory). A dbt model of
+  millions of groups with several of them ran out of memory after spilling 307
+  GiB, where Snowflake built it in two minutes. `igloo_aggregate_passes_total`
+  counts these tables.
 - Preparing a statement that repeats a subquery or has unions to factor no
   longer lists DuckDB's functions each time, about 25 ms holding the
   catalog lock, which the statements of a burst waited for one after

@@ -128,8 +128,11 @@ func (s *Server) factorUnions(ctx context.Context, sess *session, text string) s
 			}
 		},
 		volatile: func() (map[string]bool, error) {
-			volatile, _, err := s.functionSets(ctx, sess)
-			return volatile, err
+			f, err := s.functionSets(ctx, sess)
+			if err != nil {
+				return nil, err
+			}
+			return f.volatile, nil
 		},
 	}
 	out, err := factorUnionText(text, tools)

@@ -44,7 +44,16 @@ func TestFunctionSets(t *testing.T) {
 		}
 		return out
 	}
-	volatile, unstable := functionSetsOf(query(functionListQuery))
+	sets := functionSetsOf(query(functionListQuery))
+	volatile, unstable := sets.volatile, sets.unstable
+	for _, name := range []string{"sum", "list", "string_agg", "count"} {
+		if !sets.aggregates[name] {
+			t.Errorf("%s is not among the aggregates", name)
+		}
+	}
+	if sets.aggregates["upper"] {
+		t.Error("upper is among the aggregates")
+	}
 	if want := volatileSet(query(volatileFunctionsQuery)); !maps.Equal(volatile, want) {
 		t.Errorf("volatile functions differ from volatileFunctionsQuery's")
 	}

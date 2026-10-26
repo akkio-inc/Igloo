@@ -157,6 +157,10 @@ type Options struct {
 	// their new values' ids to a mapping pass shortly after (see
 	// idassign.go); 0 means none do.
 	IDSyncMinRows int64
+	// QueryMemory is DuckDB's memory limit, which CREATE TABLE ... AS
+	// plans aggregates in passes against (see aggpasses.go); 0 runs none
+	// in passes.
+	QueryMemory int64
 	// ResultCacheSize is IGLOO_RESULT_CACHE_SIZE: the memory the results
 	// the server keeps of queries may take (see resultcache.go); 0 keeps
 	// none.
@@ -345,6 +349,8 @@ type Server struct {
 	// results keeps queries' results (see resultcache.go); nil when it
 	// keeps none.
 	results *resultCache
+	// queryMemory is Options.QueryMemory.
+	queryMemory int64
 	// functions is what statements' rewrites and the result cache know of
 	// DuckDB's functions (see functionlist.go).
 	functions functionList
@@ -582,6 +588,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
 	s.idSyncMinRows, s.sortBudget = opts.IDSyncMinRows, opts.SortSpillBudget
 	s.results = newResultCache(opts.ResultCacheSize, opts.Metrics)
+	s.queryMemory = opts.QueryMemory
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)

@@ -403,12 +403,12 @@ func (s *Server) keepable(ctx context.Context, sess *session, st *statement, set
 // was prepared (see reprepare), so st is prepared again; if that fails, so
 // does st.
 func (s *Server) judgeResult(ctx context.Context, sess *session, st *statement) (bool, error) {
-	_, unstable, err := s.functionSets(ctx, sess)
+	f, err := s.functionSets(ctx, sess)
 	if err != nil {
 		return false, nil
 	}
 	for _, w := range sqllex.CodeWords(st.prepared) {
-		if unstable[strings.ToLower(w)] {
+		if f.unstable[strings.ToLower(w)] {
 			return false, nil
 		}
 	}

@@ -454,6 +454,7 @@ func serve() error {
 		BitmapIndexes:       cfg.BitmapIndexes && cfg.IDDomains && eng.BitmapsLoaded(),
 		ReportRewrite:       cfg.ReportRewrite,
 		ResultCacheSize:     cfg.ResultCacheSize,
+		QueryMemory:         eng.MemoryLimit(ctx),
 		RewriteMemory:       rewriteMemory(cfg, memory),
 		MemoryTotal:         memory.Total,
 		FreeMemory:          func(ctx context.Context) { dropDuckDBCaches(ctx, eng, log) },

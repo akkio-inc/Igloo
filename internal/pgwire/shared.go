@@ -66,8 +66,11 @@ func (s *Server) shareSubqueries(ctx context.Context, sess *session, query strin
 	}
 	parse := func(q string) (any, error) { return parseStatement(ctx, sess.conn, q) }
 	volatileNames := func() (map[string]bool, error) {
-		volatile, _, err := s.functionSets(ctx, sess)
-		return volatile, err
+		f, err := s.functionSets(ctx, sess)
+		if err != nil {
+			return nil, err
+		}
+		return f.volatile, nil
 	}
 	out, err := shareRepeated(query, parse, volatileNames)
 	if err != nil {

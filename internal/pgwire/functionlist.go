@@ -10,36 +10,43 @@ import (
 
 // functionList is what the rewrites of statements and the result cache
 // need to know of DuckDB's functions: which are volatile (see volatileSet),
-// and which give results that can change between runs or sessions (see
-// unstableFunctions). Listing them takes DuckDB some 25 ms and walks the
-// catalog, which preparing a statement does holding the catalog lock
-// exclusively, so every statement of a dashboard's burst that repeats a
-// subquery waited for the others' listings. They are the same in every
-// session, Igloo's own macros included (it makes them in each), so they
-// are listed once for each catalog generation; a session that may have
-// temporary macros of its own has its own listed every time.
+// which give results that can change between runs or sessions (see
+// sessionFunctions), and which are aggregates. Listing them takes DuckDB
+// some 25 ms and walks the catalog, which preparing a statement does
+// holding the catalog lock exclusively, so every statement of a
+// dashboard's burst that repeats a subquery waited for the others'
+// listings. They are the same in every session, Igloo's own macros
+// included (it makes them in each), so they are listed once for each
+// catalog generation; a session that may have temporary macros of its own
+// has its own listed every time.
 type functionList struct {
-	mu                 sync.Mutex
-	gen                uint64
-	volatile, unstable map[string]bool
+	mu   sync.Mutex
+	gen  uint64
+	sets *functionSets
+}
+
+// functionSets are the functions a functionList knows, by lower-case name.
+type functionSets struct {
+	volatile, unstable, aggregates map[string]bool
 }
 
 // functionListQuery lists DuckDB's functions, one a row: the name,
-// stability, whether it is built in, and a macro's definition, separated
-// by tabs.
+// stability, whether it is built in, its type, and a macro's definition,
+// separated by tabs.
 const functionListQuery = `SELECT system.main.lower(function_name) || chr(9) || coalesce(stability, '') || chr(9) ||
-	CAST(internal AS VARCHAR) || chr(9) || coalesce(macro_definition, '') FROM system.main.duckdb_functions()
-	WHERE stability <> 'CONSISTENT' OR macro_definition IS NOT NULL`
+	CAST(internal AS VARCHAR) || chr(9) || function_type || chr(9) || coalesce(macro_definition, '')
+	FROM system.main.duckdb_functions()
+	WHERE stability <> 'CONSISTENT' OR macro_definition IS NOT NULL OR function_type = 'aggregate'`
 
-// functionSets returns the volatile and the unstable functions.
-func (s *Server) functionSets(ctx context.Context, sess *session) (volatile, unstable map[string]bool, err error) {
+// functionSets returns the functions of the session's connection.
+func (s *Server) functionSets(ctx context.Context, sess *session) (*functionSets, error) {
 	gen := s.catalogGeneration()
 	f := &s.functions
 	if !sess.temps {
 		f.mu.Lock()
-		if f.volatile != nil && f.gen == gen {
+		if f.sets != nil && f.gen == gen {
 			defer f.mu.Unlock()
-			return f.volatile, f.unstable, nil
+			return f.sets, nil
 		}
 		f.mu.Unlock()
 	}
@@ -48,34 +55,38 @@ func (s *Server) functionSets(ctx context.Context, sess *session) (volatile, uns
 	rows, err := queryStrings(ctx, sess, functionListQuery)
 	release()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	volatile, unstable = functionSetsOf(rows)
+	sets := functionSetsOf(rows)
 	if !sess.temps {
 		f.mu.Lock()
-		f.gen, f.volatile, f.unstable = gen, volatile, unstable
+		f.gen, f.sets = gen, sets
 		f.mu.Unlock()
 	}
-	return volatile, unstable, nil
+	return sets, nil
 }
 
 // functionSetsOf reads functionListQuery's rows: volatileSet's volatile
-// functions and macros, and unstableFunctions' unstable ones.
-func functionSetsOf(rows []string) (volatile, unstable map[string]bool) {
+// functions and macros, the unstable ones (see sessionFunctions), and the
+// aggregates.
+func functionSetsOf(rows []string) *functionSets {
 	// volatileSet's rows: volatile functions' names, and the definitions of
 	// macros that are not built in.
 	var volatileRows []string
-	unstable = map[string]bool{}
+	unstable, aggregates := map[string]bool{}, map[string]bool{}
 	for k := range sessionFunctions {
 		unstable[k] = true
 	}
 	macros := map[string][]string{}
 	for _, r := range rows {
-		parts := strings.SplitN(r, "\t", 4)
-		if len(parts) != 4 {
+		parts := strings.SplitN(r, "\t", 5)
+		if len(parts) != 5 {
 			continue
 		}
-		name, stability, internal, def := parts[0], parts[1], parts[2], parts[3]
+		name, stability, internal, kind, def := parts[0], parts[1], parts[2], parts[3], parts[4]
+		if kind == "aggregate" {
+			aggregates[name] = true
+		}
 		if stability == "VOLATILE" {
 			volatileRows = append(volatileRows, name)
 		}
@@ -105,5 +116,5 @@ func functionSetsOf(rows []string) (volatile, unstable map[string]bool) {
 			}
 		}
 	}
-	return volatileSet(volatileRows), unstable
+	return &functionSets{volatile: volatileSet(volatileRows), unstable: unstable, aggregates: aggregates}
 }

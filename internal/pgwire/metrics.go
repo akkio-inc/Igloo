@@ -42,6 +42,9 @@ type Metrics struct {
 	// resultcache.go).
 	resultCache *prometheus.CounterVec
 	resultBytes prometheus.Gauge
+	// aggPasses counts the tables CREATE TABLE ... AS filled in passes
+	// over their aggregate's groups (see aggpasses.go).
+	aggPasses prometheus.Counter
 }
 
 // NewMetrics registers the server's metrics with reg.
@@ -116,9 +119,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_result_cache_bytes",
 			Help: "Memory the results the result cache keeps take, as Igloo estimates it.",
 		}),
+		aggPasses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_aggregate_passes_total",
+			Help: "Tables CREATE TABLE ... AS filled in passes over its aggregate's groups, whose list, string or DISTINCT aggregates would not have fit in memory in one.",
+		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits, m.implicitRetries, m.sortedWrites, m.resultCache, m.resultBytes)
+		m.indexStatements, m.memoryExits, m.implicitRetries, m.sortedWrites, m.resultCache, m.resultBytes, m.aggPasses)
 	return m
 }
 
@@ -155,6 +162,12 @@ func (m *Metrics) implicitRetry() {
 func (m *Metrics) sortedWrite() {
 	if m != nil {
 		m.sortedWrites.Inc()
+	}
+}
+
+func (m *Metrics) aggregatePasses() {
+	if m != nil {
+		m.aggPasses.Inc()
 	}
 }
 
