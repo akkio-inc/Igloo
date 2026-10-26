@@ -112,6 +112,22 @@ names the host.
 | `IGLOO_SMTP_PASSWORD_FILE` | | File holding its password, such as a mounted Kubernetes Secret. |
 | `IGLOO_SMTP_PASSWORD` | | The password itself, if not in a file. |
 
+## AI functions
+
+[AI functions](ai-functions.md) are off until an admin creates an AI
+integration with a provider's keys. These settings bound what they may do
+once one exists. Providers are reached only at public addresses, over TLS,
+unless the allow list names the host.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_AI_ALLOW_HOSTS` | | Comma-separated host names and IP addresses, as written in AI integrations' `BASE_URL`, that AI integrations may reach although they are not public, and over plain HTTP: models served on the private network by vLLM, llama.cpp or Ollama. No wildcards. |
+| `IGLOO_AI_CACHE` | `on` | Keep AI functions' results across statements, in the metadata database, so that a statement asking what an earlier one asked calls no provider. `off` keeps nothing. |
+| `IGLOO_AI_CACHE_RETENTION` | `30d` | How long a cached result is kept, e.g. `7d` or `12h`. Erasure requests purge what was derived from their tables sooner ([privacy](privacy.md)). |
+| `IGLOO_AI_MAX_CALLS` | `1000` | Calls to providers a statement may make, unless its user's roles set `ai_max_calls`. A statement that would make more fails before it sends them. `0` is no cap. |
+| `IGLOO_AI_MAX_COST_USD` | `1` | Estimated cost, in US dollars at the integrations' prices, of a statement's calls, unless its user's roles set `ai_max_cost_usd`. `0` is no cap. |
+| `IGLOO_AI_REQUEST_TIMEOUT` | `2m` | How long each request to a provider may take; one that takes longer is sent again, up to five times in all. |
+
 ## Lineage events
 
 Statements that write tables can also be sent as

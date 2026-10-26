@@ -82,6 +82,38 @@ func TestResolve(t *testing.T) {
 	if got := Resolve(auth.User{Name: "wu", Role: auth.RoleWriter}, nil, settings); got.Limited() || got != (Limits{}) {
 		t.Errorf("a writer with no settings: %+v", got)
 	}
+
+	// AI caps: the most generous of the roles', 0 (none) above all.
+	ai := []auth.Setting{
+		set(auth.GranteeRole, "analysts", AIMaxCalls, "500"),
+		set(auth.GranteeRole, "acme", AIMaxCalls, "2000"),
+		set(auth.GranteeRole, "acme", AIMaxCostUSD, "2.5"),
+		set(auth.GranteeRole, "zeta", AIMaxCostUSD, "0"),
+		set(auth.TargetBuiltin, "reader", AIMaxCalls, "10"),
+	}
+	got = Resolve(ana, []string{"acme", "analysts"}, ai)
+	if got.AIMaxCalls != 2000 || got.AIMaxCostUSD != 2.5 || got.AISet != [2]bool{true, true} || got.AISource[0] != "role acme" {
+		t.Errorf("ana's AI caps: %+v", got)
+	}
+	got = Resolve(ana, []string{"acme", "zeta"}, ai)
+	if got.AIMaxCostUSD != 0 || !got.AISet[1] || got.AISource[1] != "role zeta" {
+		t.Errorf("a role without a cost cap: %+v", got)
+	}
+	if got = Resolve(ana, nil, ai); got.AIMaxCalls != 10 || got.AISet[1] {
+		t.Errorf("the built-in role's: %+v", got)
+	}
+	for _, c := range []struct{ name, value, want string }{
+		{AIMaxCalls, "100", "100"}, {AIMaxCostUSD, "0.25", "0.25"}, {AIMaxCostUSD, "0", "0"},
+	} {
+		if got, err := Normalize(c.name, c.value); err != nil || got != c.want {
+			t.Errorf("%s = %s: %q %v", c.name, c.value, got, err)
+		}
+	}
+	for _, c := range [][2]string{{AIMaxCalls, "-1"}, {AIMaxCalls, "1.5"}, {AIMaxCostUSD, "-2"}, {AIMaxCostUSD, "lots"}} {
+		if _, err := Normalize(c[0], c[1]); err == nil {
+			t.Errorf("%s = %s accepted", c[0], c[1])
+		}
+	}
 }
 
 func TestControllerLimitsSlots(t *testing.T) {

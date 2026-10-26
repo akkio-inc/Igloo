@@ -18,6 +18,7 @@ import (
 	wire "github.com/jeroenrinzema/psql-wire"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/ai"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -73,6 +74,8 @@ type queryRecord struct {
 	queued time.Duration
 	// parts is what running the statement in parts on workers took.
 	parts distParts
+	// ai is what its AI functions did, if it called any.
+	ai *ai.Spend
 }
 
 // holdRecords keeps what recordQuery is given for sess from the history
@@ -124,6 +127,10 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Stages:          r.parts.stages,
 		Exchanges:       r.parts.exchanges,
 		PlanKey:         r.parts.key,
+	}
+	if sp := r.ai; sp != nil {
+		q.AI = &audit.AIUsage{Calls: sp.Calls, CacheHits: sp.CacheHits, InputTokens: sp.InputTokens, OutputTokens: sp.OutputTokens,
+			CostUSD: sp.CostUSD, Models: sp.Models}
 	}
 	if r.err != nil && q.Outcome != audit.OutcomeOK {
 		q.SQLState = string(pgerror.GetCode(pgError(r.err)))

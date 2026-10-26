@@ -59,6 +59,11 @@ type Usage struct {
 	// Cost is the pool's cost that day times Share, or nil when a
 	// replica's price is unknown.
 	Cost *float64
+	// AICalls, AIInputTokens and AIOutputTokens add up what the
+	// statements' AI functions sent to providers, and AICostUSD its
+	// estimated cost, which providers bill the customer for directly.
+	AICalls, AIInputTokens, AIOutputTokens int64
+	AICostUSD                              float64
 }
 
 // computeClock tracks how long this replica process has run, for the days
@@ -183,6 +188,12 @@ func (m *MemoryStore) Usage(_ context.Context, v Viewer, since, until time.Time)
 			u.CPUTime += r.CPUTime
 			u.BytesRead += r.BytesRead
 		}
+		if a := q.AI; a != nil {
+			u.AICalls += a.Calls
+			u.AIInputTokens += a.InputTokens
+			u.AIOutputTokens += a.OutputTokens
+			u.AICostUSD += a.CostUSD
+		}
 		totals[poolDay{k.day, k.pool}] += run
 	}
 	var out []Usage
@@ -253,7 +264,9 @@ const usageQuery = `WITH q AS (
 			count(*) FILTER (WHERE outcome <> 'ok') AS failed,
 			sum(greatest(duration_us - coalesce(queued_us, 0), 0))::bigint AS run_us,
 			sum(coalesce(queued_us, 0))::bigint AS queued_us, sum(coalesce(cpu_time_us, 0))::bigint AS cpu_time_us,
-			sum(coalesce(bytes_read, 0))::bigint AS bytes_read
+			sum(coalesce(bytes_read, 0))::bigint AS bytes_read, sum(coalesce(ai_calls, 0))::bigint AS ai_calls,
+			sum(coalesce(ai_input_tokens, 0))::bigint AS ai_input_tokens, sum(coalesce(ai_output_tokens, 0))::bigint AS ai_output_tokens,
+			sum(coalesce(ai_cost_usd, 0))::float8 AS ai_cost_usd
 		FROM igloo_audit.query_history
 		WHERE ($2::timestamptz IS NULL OR start_time >= $2) AND ($3::timestamptz IS NULL OR start_time < $3)
 		GROUP BY 1, 2, 3, 4, 5
@@ -267,7 +280,7 @@ const usageQuery = `WITH q AS (
 	SELECT q.day, q.pool, q.user_name, q.role, q.query_tag, q.statements, q.failed, q.run_us, q.queued_us,
 		q.cpu_time_us, q.bytes_read,
 		coalesce(q.run_us::float8 / nullif(t.run_us, 0), 0), coalesce(c.hours, -1),
-		c.cost * coalesce(q.run_us::float8 / nullif(t.run_us, 0), 0)
+		c.cost * coalesce(q.run_us::float8 / nullif(t.run_us, 0), 0), q.ai_calls, q.ai_input_tokens, q.ai_output_tokens, q.ai_cost_usd
 	FROM q JOIN totals t USING (day, pool) LEFT JOIN compute c USING (day, pool)
 	WHERE $1::text IS NULL OR q.user_name = $1
 	ORDER BY q.day DESC, q.pool, q.user_name, q.role, q.query_tag`
@@ -287,7 +300,7 @@ func (s *PostgresStore) Usage(ctx context.Context, v Viewer, since, until time.T
 			runUS, queuedUS, cpuUS int64
 		)
 		err := row.Scan(&u.Day, &u.Pool, &u.User, &u.Role, &u.QueryTag, &u.Statements, &u.Failed, &runUS, &queuedUS,
-			&cpuUS, &u.BytesRead, &u.Share, &u.ComputeHours, &u.Cost)
+			&cpuUS, &u.BytesRead, &u.Share, &u.ComputeHours, &u.Cost, &u.AICalls, &u.AIInputTokens, &u.AIOutputTokens, &u.AICostUSD)
 		u.Run, u.Queued, u.CPUTime = micros(runUS), micros(queuedUS), micros(cpuUS)
 		return u, err
 	})

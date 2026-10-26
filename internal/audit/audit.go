@@ -82,6 +82,20 @@ type Query struct {
 	// runs (distributed.Plan.Key), so that where it ran faster decides where
 	// it runs next, after a restart too; empty for others.
 	PlanKey string
+	// AI is what the statement's AI functions did; nil when it called
+	// none.
+	AI *AIUsage
+}
+
+// AIUsage is what a statement's AI functions did: the requests they sent
+// to providers, the distinct inputs the cache answered, the tokens the
+// providers counted, the estimated cost at the integrations' prices, and
+// the models, as integration/model.
+type AIUsage struct {
+	Calls, CacheHits          int64
+	InputTokens, OutputTokens int64
+	CostUSD                   float64
+	Models                    []string
 }
 
 // Resources is what DuckDB's profiler measured while a statement ran.

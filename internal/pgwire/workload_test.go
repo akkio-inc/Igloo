@@ -97,7 +97,8 @@ func TestRoleSettings(t *testing.T) {
 		"ALTER ROLE nobody SET query_tag = 'x'":               "42704",
 		"ALTER USER acme SET query_tag = 'x'":                 "42704",
 		"ALTER ROLE acme SET query_tag 'x'":                   "42601",
-		"ALTER ROLE acme SET max_concurrent_statements = 1.5": "42601",
+		"ALTER ROLE acme SET max_concurrent_statements = 1.5": "22023",
+		"ALTER ROLE acme SET max_concurrent_statements = 1.":  "42601",
 		"ALTER ROLE acme RESET query_tag, statement_timeout":  "42601",
 	} {
 		if _, err := cs.admin.Exec(ctx, sql); pgCode(err) != code {

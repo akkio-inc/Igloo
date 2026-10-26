@@ -7,6 +7,7 @@ package workload
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
@@ -39,10 +40,16 @@ const (
 	// SQLDialect is the SQL dialect of sessions that choose none of their
 	// own: duckdb or snowflake.
 	SQLDialect = "sql_dialect"
+	// AIMaxCalls and AIMaxCostUSD cap each statement's calls to AI
+	// providers and their estimated cost, in place of the server's default
+	// caps (IGLOO_AI_MAX_CALLS, IGLOO_AI_MAX_COST_USD); 0 is no cap.
+	AIMaxCalls   = "ai_max_calls"
+	AIMaxCostUSD = "ai_max_cost_usd"
 )
 
 // Names lists the settings.
-var Names = []string{QueryTag, StatementTimeout, StatementQueuedTimeout, MaxConcurrentStatements, MemoryLimit, SQLDialect}
+var Names = []string{QueryTag, StatementTimeout, StatementQueuedTimeout, MaxConcurrentStatements, MemoryLimit, SQLDialect,
+	AIMaxCalls, AIMaxCostUSD}
 
 // MaxQueryTag bounds a query tag's length in bytes, as Snowflake's does.
 const MaxQueryTag = 2000
@@ -79,6 +86,18 @@ func Normalize(name, value string) (string, error) {
 			return d, nil
 		}
 		return "", fmt.Errorf("sql_dialect must be duckdb or snowflake, got %q", value)
+	case AIMaxCalls:
+		n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || n < 0 {
+			return "", fmt.Errorf("ai_max_calls must be a whole number, 0 for no cap, got %q", value)
+		}
+		return strconv.FormatInt(n, 10), nil
+	case AIMaxCostUSD:
+		f, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+			return "", fmt.Errorf("ai_max_cost_usd must be an amount in US dollars, 0 for no cap, got %q", value)
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), nil
 	}
 	return "", fmt.Errorf("unknown setting %q; use %s", name, strings.Join(Names, ", "))
 }
@@ -144,6 +163,13 @@ type Limits struct {
 	// SQLDialect is the dialect of sessions that choose none; "" means
 	// DuckDB's.
 	SQLDialect string
+	// AIMaxCalls and AIMaxCostUSD cap each statement's AI calls and their
+	// cost; AISet says which of them a setting gave (otherwise the
+	// server's defaults apply), and AISource names where it was set.
+	AIMaxCalls   int64
+	AIMaxCostUSD float64
+	AISet        [2]bool
+	AISource     [2]string
 	// Counted says the statement counts against the replica's limit of
 	// statements at once (see Controller.LimitReplica): it is one that
 	// runs a query or changes data. It is the statement's, not the
@@ -223,6 +249,30 @@ func Resolve(user auth.User, roles []string, settings []auth.Setting) Limits {
 			for _, s := range level {
 				if n, err := config.ParseSize(s.Value); err == nil && n > 0 && (l.Memory == 0 || n < l.Memory) {
 					l.Memory = n
+				}
+			}
+		case AIMaxCalls, AIMaxCostUSD:
+			// The most generous: 0, no cap, above all.
+			k := 0
+			if name == AIMaxCostUSD {
+				k = 1
+			}
+			for _, s := range level {
+				f, err := strconv.ParseFloat(s.Value, 64)
+				if err != nil {
+					continue
+				}
+				cur := float64(l.AIMaxCalls)
+				if k == 1 {
+					cur = l.AIMaxCostUSD
+				}
+				if !l.AISet[k] || cur != 0 && (f == 0 || f > cur) {
+					if k == 0 {
+						l.AIMaxCalls = int64(f)
+					} else {
+						l.AIMaxCostUSD = f
+					}
+					l.AISet[k], l.AISource[k] = true, targetName(s)
 				}
 			}
 		}

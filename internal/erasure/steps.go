@@ -2143,11 +2143,68 @@ func (s *Service) sharedCopies(ctx context.Context, r *Request, tables []loaded)
 	return out, nil
 }
 
-// history redacts the identifiers from the history stores.
+// history redacts the identifiers from the history stores, and purges
+// what was derived from the request's tables (see Derived): this step runs
+// after expire, so no snapshot a statement begun from now on reads holds
+// the person's rows.
 func (s *Service) history(ctx context.Context, r *Request) error {
 	n, err := s.redact(ctx, newRedactor(r))
 	r.HistoryRedacted += n
-	return err
+	if err != nil {
+		return err
+	}
+	return s.purgeDerived(ctx, r)
+}
+
+// derivedTables are the tables whose derived entries a request purges:
+// those it erases from and those history says were written from them, in
+// lower case.
+func derivedTables(r *Request) []string {
+	var out []string
+	for _, t := range r.Tables {
+		if !t.Remote {
+			out = append(out, strings.ToLower(t.Name))
+		}
+	}
+	for _, d := range r.Downstream {
+		out = append(out, strings.ToLower(d.Table))
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// purgeDerived purges what was derived from the request's tables.
+func (s *Service) purgeDerived(ctx context.Context, r *Request) error {
+	tables := derivedTables(r)
+	for _, d := range s.opts.Derived {
+		if d == nil {
+			continue
+		}
+		n, err := d.Purge(ctx, tables)
+		r.DerivedPurged += n
+		if err != nil {
+			return fmt.Errorf("purge what was derived from the request's tables: %w", err)
+		}
+	}
+	return nil
+}
+
+// derivedRemaining counts what statements begun before the purge derived
+// from the request's tables.
+func (s *Service) derivedRemaining(ctx context.Context, r *Request) (int64, error) {
+	var total int64
+	tables := derivedTables(r)
+	for _, d := range s.opts.Derived {
+		if d == nil {
+			continue
+		}
+		n, err := d.Remaining(ctx, tables)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 func (s *Service) redact(ctx context.Context, x interface {
@@ -2318,6 +2375,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		return "", err
 	}
 	v.History = c.n
+	if v.Derived, err = s.derivedRemaining(ctx, r); err != nil {
+		return "", err
+	}
 	if v.IDSets, err = s.holdingIDs(ctx, r); err != nil {
 		return "", err
 	}
@@ -2337,7 +2397,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		next = StepPurge
 	case v.Sharing > 0:
 		next = StepSharing
-	case v.History > 0:
+	case v.History > 0 || v.Derived > 0:
 		next = StepHistory
 	case len(waiting) > 0:
 		next = StepCache

@@ -77,6 +77,8 @@ type Engine struct {
 	policies atomic.Pointer[func() *policy.Snapshot]
 	// erasure supplies igloo.erasure_requests; see SetErasure.
 	erasure atomic.Pointer[erasureConfig]
+	// aiHook connects the AI functions to sessions; see SetAI.
+	aiHook atomic.Pointer[aiHookBox]
 	// catMu keeps binding, walking and changing the attached catalog's
 	// in-memory set of tables apart. See CatalogLock. catLocked is when it
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
@@ -576,6 +578,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	}
 	if err := e.registerErasure(ctx); err != nil {
 		return fmt.Errorf("register erasure requests: %w", err)
+	}
+	if err := e.registerAI(ctx); err != nil {
+		return fmt.Errorf("register the AI functions: %w", err)
 	}
 
 	if cfg.Catalog.URI == "" {

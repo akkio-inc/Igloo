@@ -138,6 +138,8 @@ type Config struct {
 	TokenMaxLifetime time.Duration
 	// Notifications configures alerts' destinations (see notify.go).
 	Notifications Notifications
+	// AI configures the AI functions (see ai.go).
+	AI AI
 	// Workers configures distributed execution (see workers.go).
 	Workers Workers
 }
@@ -702,6 +704,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	loadOIDC(&cfg, lookup, addErr)
 	loadNotifications(&cfg, lookup, addErr)
+	loadAI(&cfg, lookup, addErr)
 
 	return cfg, errors.Join(errs...)
 }

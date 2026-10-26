@@ -190,6 +190,21 @@ func (t *translator) calls(nodes []*node) ([]*node, error) {
 			continue
 		}
 		name := n.word()
+		// SNOWFLAKE.CORTEX.COMPLETE(...) and the like: one name.
+		if cortex, g, ok := cortexName(nodes, i); ok {
+			rw, known := rewrites[cortex]
+			if !known {
+				return nil, unsupported(cortex, "the AI functions Igloo has are listed in docs/ai-functions.md")
+			}
+			c := t.newCall(nodes, i, g)
+			c.name = cortex
+			out, err := rw.fn(c)
+			if err != nil {
+				return nil, err
+			}
+			nodes = replace(nodes, i, g+1, out)
+			continue
+		}
 		if name == "REPLACE" && afterStar(nodes, i) {
 			continue // SELECT * REPLACE (x AS y), which DuckDB has too
 		}
@@ -565,6 +580,7 @@ func init() {
 	add(simple(uniform), "UNIFORM")
 	add(simple(normal), "NORMAL")
 	add(simple(widthBucket), "WIDTH_BUCKET")
+	addAIRewrites(add)
 
 	// Vectors (see vectorType), as lists of DOUBLE: a table's VECTOR
 	// column is a list, and DuckDB's array functions take only arrays of

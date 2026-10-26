@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -42,6 +43,19 @@ type Load struct {
 	// under the proxy, and header its headers.
 	path, rest string
 	header     http.Header
+}
+
+// Table is the table loaded, its namespace's levels and its name joined
+// with dots, in lower case, as erasure requests name tables.
+func (l Load) Table() string {
+	ns, name, _ := strings.Cut(l.path, "/")
+	if u, err := url.PathUnescape(ns); err == nil {
+		ns = u
+	}
+	if u, err := url.PathUnescape(name); err == nil {
+		name = u
+	}
+	return strings.ReplaceAll(ns, "\x1f", ".") + "." + name
 }
 
 // loadRecorder takes the loads made while it is set, one a table.

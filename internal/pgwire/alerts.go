@@ -473,6 +473,10 @@ func (s *Server) runIntegrationCommand(ctx context.Context, sess *session, user 
 		if _, gerr := store.Integration(ctx, c.name); gerr == nil && c.ifNotExists {
 			return w.Complete(c.tag())
 		}
+		if s.aiNameTaken(ctx, c.name) {
+			return pgerror.WithCode(fmt.Errorf("an AI integration is called %s; integrations of both kinds share names", c.name),
+				codes.DuplicateObject)
+		}
 		if err = s.checkIntegration(ctx, in); err != nil {
 			return err
 		}
@@ -1140,5 +1144,8 @@ func (s *Server) forgetGrantee(granteeType, name string) {
 	defer cancel()
 	if err := s.notify.Store().ForgetGrantee(ctx, granteeType, name); err != nil {
 		s.log.Warn("could not remove the integration grants of a dropped "+granteeType, granteeType, name, "err", err)
+	}
+	if err := s.ai.Store().ForgetGrantee(ctx, granteeType, name); err != nil {
+		s.log.Warn("could not remove the AI integration grants of a dropped "+granteeType, granteeType, name, "err", err)
 	}
 }

@@ -103,6 +103,10 @@ type statement struct {
 	// those tables change (see idcount.go).
 	idCounts *idCounts
 	text     string
+	// ai says the statement calls AI functions, which DuckDB bound as it
+	// was prepared: they run under an ai.Statement begun before each run
+	// (see beginAI).
+	ai bool
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

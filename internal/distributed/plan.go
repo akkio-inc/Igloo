@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/ai"
 )
 
 // Planning splits a statement into jobs. A job is one part of the statement
@@ -1361,10 +1363,26 @@ func seriesRows(name string, args []any) error {
 }
 
 // volatileFunctions return something else each time they are called, so
-// a query that calls them computes something else on each worker.
-var volatileFunctions = map[string]bool{
-	"random": true, "uuid": true, "gen_random_uuid": true, "uuidv4": true, "uuidv7": true,
-}
+// a query that calls them computes something else on each worker. The AI
+// functions are among them (see coordinatorFunctions).
+var volatileFunctions = func() map[string]bool {
+	m := map[string]bool{"random": true, "uuid": true, "gen_random_uuid": true, "uuidv4": true, "uuidv7": true}
+	for k := range coordinatorFunctions {
+		m[k] = true
+	}
+	return m
+}()
+
+// coordinatorFunctions are the AI functions (package ai), which call model
+// providers with keys only the coordinator holds: workers scan, filter and
+// aggregate, and the coordinator applies them to what workers return.
+var coordinatorFunctions = func() map[string]bool {
+	m := map[string]bool{}
+	for _, name := range ai.Names() {
+		m[name] = true
+	}
+	return m
+}()
 
 // rowQuery reports whether query node n reads no table, and so computes,
 // in FROM, rows that depend on the row it may be lateral to alone: its
@@ -2512,6 +2530,10 @@ func (pl *planner) checkFunctions(fragment node) error {
 			name := strings.ToLower(str(n["function_name"]))
 			if sessionFunctions[name] && (name != "getvariable" || !pl.opts.values[variableName(n)]) {
 				err = unsupported("%s()", name)
+				return false
+			}
+			if coordinatorFunctions[name] {
+				err = unsupported("%s(), which calls a model provider with keys only the coordinator holds", name)
 				return false
 			}
 			if name == "rb_count_distinct" && len(list(n, "children")) == 2 {

@@ -147,8 +147,10 @@ type Request struct {
 	Tables []Table `json:"tables"`
 	// Downstream are tables history says were written from Tables.
 	Downstream []Downstream `json:"downstream"`
-	// HistoryRedacted counts history records it redacted.
+	// HistoryRedacted counts history records it redacted, and
+	// DerivedPurged what it purged of what was derived from its tables.
 	HistoryRedacted int64         `json:"history_redacted"`
+	DerivedPurged   int64         `json:"derived_purged,omitempty"`
 	Steps           []StepRecord  `json:"steps"`
 	Verification    *Verification `json:"verification,omitempty"`
 	// Error is why the last run failed, while Status is retrying or
@@ -333,6 +335,10 @@ type Verification struct {
 	Sharing int64 `json:"sharing"`
 	// History are history records that still hold an identifier.
 	History int64 `json:"history"`
+	// Derived are entries derived from the tables, such as AI functions'
+	// cached answers, that statements begun before the request purged
+	// them kept.
+	Derived int64 `json:"derived"`
 	// Caches are the read caches of running replicas that were emptied
 	// since the request deleted files; Pending are those of replicas not
 	// running now, which are emptied when they start.

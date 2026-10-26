@@ -39,8 +39,9 @@ of such files that are less than 3 days old, [below](#what-is-left-of-dropped-ta
 what Delta Sharing recipients
 and engines reading through Igloo's Iceberg REST catalog can reach; the
 read cache of every running replica (a stopped one empties its own when
-it next starts, see [Known limitations](#known-limitations)); and the
-query, login, load and task history. A request finds the person's rows
+it next starts, see [Known limitations](#known-limitations)); the
+answers [AI functions](ai-functions.md#the-cache) cached from those tables;
+and the query, login, load and task history. A request finds the person's rows
 by the columns tagged for the identifiers it names
 ([below](#tag-the-columns-that-hold-identifiers)).
 
@@ -280,9 +281,9 @@ Igloo while a request has work to do.
 | `expire` | Expires the snapshots that reference a file that held matching rows, or whose bounds may, however recent, so time travel to them ends. Snapshots that reference none stay, older ones included, and so do the snapshots branches and tags point at, which the rewrite step made reference none. A snapshot staged by write-audit-publish (Spark's `wap.id`) that holds matching rows holds others' unpublished rows too: the request waits (`waiting`, with `error` saying which) for it to be published, by fast-forward or by cherry-pick (a snapshot with its `wap.id` as `published-wap-id`), and then rewrites the branch, or discarded. It waits from when the request was made, as long as maintenance keeps such a snapshot (7 days, or the table's `history.expire.max-snapshot-age-ms` if longer), and at most 21 days, so that it completes within the month the GDPR allows; then it expires the snapshot, unpublished rows and all. The commit asserts every branch and tag as the catalog has them just before it, so none made meanwhile at an expired snapshot is lost. Last, it has the sets Igloo derives from [ID domains](sql.md#id-domains)' ids, such as [bitmap indexes](sql.md#bitmap-indexes), delete or rebuild every set that holds one of the person's ids, with the versions and files that hold it. |
 | `purge` | Deletes from object storage the files only the expired snapshots referenced, and the tables' orphan files that are at least 3 days old. A newer orphan may belong to a write in progress; if one holds matching rows, the request waits until it is 3 days old, then deletes it. It also deletes the warehouse's files under no table's or view's location ([below](#what-is-left-of-dropped-tables)): all of them unread: those at least 3 days old at once, newer ones once they are 3 days old, which the request waits for. It deletes files only in the warehouse, and never one that another table references ([clones](#clones)). Paths compare without their scheme (`s3a://` and `s3://` name the same file, as `file://` and a local path do), unescaped, and a listed file that the table references under a spelling Igloo cannot tell the same, but whose name a referenced file has, is kept: if it holds matching rows, the request stops with an error that names it, for someone to check. |
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`, those of tables since replaced included; it writes them again from the files that remain. |
-| `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). |
+| `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). Then it purges what [AI functions](ai-functions.md#the-cache) cached from the request's tables and from those history says were written from them, every answer derived from them, the person's or not, and any answer of a statement that read what Igloo could not name, such as a file; and from then on no statement that began before the purge keeps anything more, since it may have read the person's rows. This step runs after `expire`, so a statement that begins after it reads no snapshot that holds them. |
 | `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. |
-| `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; the sets derived from ID domains' ids. Anything found sends the request back to the step that removes it. |
+| `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; AI functions' cached answers derived from the tables by statements that began before the purge; the sets derived from ID domains' ids. Anything found sends the request back to the step that removes it. |
 
 A failed run is tried again after a minute, then 2, 4 and so on up to an
 hour. Before its first `DELETE`, a request fails for good (`failed`) when
@@ -597,8 +598,16 @@ person by tagged columns and the identifiers as written. It leaves:
 - **Copies outside Igloo** (outside the guarantee): files in
   `IGLOO_ALLOWED_LOCATIONS`, landing buckets that loads read and exports
   wrote, other engines' copies of the tables (Spark, Trino, Snowflake), BI
-  tools' caches, and files partners already downloaded through [Delta
-  Sharing](sharing.md).
+  tools' caches, files partners already downloaded through [Delta
+  Sharing](sharing.md), and what model providers keep of the prompts AI
+  functions sent them (their logs, their own prompt caches), under your
+  agreements with them.
+- **AI functions' answers, coarsely.** A request purges every answer the
+  AI functions cached from its tables, the person's or not, which later
+  statements then ask the provider for again. A statement that began
+  before the request and is still running goes on with the rows it read,
+  as any statement does, and sends its answers to its client; it keeps
+  none in the cache.
 
 ### What keeps a request from completing
 

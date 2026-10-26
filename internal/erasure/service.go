@@ -42,6 +42,22 @@ type History interface {
 	Redact(ctx context.Context, r audit.Redactor) (int64, error)
 }
 
+// Derived keeps what was derived from tables' rows and kept apart from
+// them, tagged with the tables each entry was derived from: the AI
+// functions' cache (package ai), whose answers can hold what a provider
+// read in the rows, as a summary of a person's notes. Coarse: every entry
+// derived from a table a request erases from goes, the person's or not.
+type Derived interface {
+	// Purge deletes what was derived from any of tables, or from what
+	// Igloo could not name, and keeps statements that began before it,
+	// which may have read the person's rows, from keeping anything more;
+	// it returns how many entries it deleted.
+	Purge(ctx context.Context, tables []string) (int64, error)
+	// Remaining counts what is derived from any of tables by statements
+	// that began before the last purge.
+	Remaining(ctx context.Context, tables []string) (int64, error)
+}
+
 // Lineage tells which statements wrote tables from others: the query
 // history.
 type Lineage interface {
@@ -89,6 +105,10 @@ type Options struct {
 	// History are the stores whose records requests redact; nil ones are
 	// left out.
 	History []History
+	// Derived are what requests purge of what was derived from their
+	// tables, in their history step, once no snapshot holds the person's
+	// rows; nil ones are left out.
+	Derived []Derived
 	// Lineage, if set, finds tables written from the tables a request
 	// erases from.
 	Lineage Lineage

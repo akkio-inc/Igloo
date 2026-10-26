@@ -184,6 +184,7 @@ func startServerLogged(t testing.TB, eng *engine.Engine, log *slog.Logger, confi
 	if err != nil {
 		t.Fatal(err)
 	}
+	eng.SetAI(srv.AIHook())
 	if opts.Erasure != nil {
 		eng.SetErasure(opts.Erasure.List, srv.ErasureViewer)
 	}

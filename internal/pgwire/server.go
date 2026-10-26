@@ -30,6 +30,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 
 	"github.com/akkio-inc/igloo/internal/activity"
+	"github.com/akkio-inc/igloo/internal/ai"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -252,6 +253,9 @@ type Options struct {
 	// notifications. Nil means a service in memory that reaches only
 	// public addresses.
 	Notify *notify.Service
+	// AI runs the AI functions and keeps AI integrations (see ai.go). Nil
+	// means a runtime in memory that reaches only public addresses.
+	AI *ai.Runtime
 
 	// Metadata keeps the catalog's metadata for the catalog functions.
 	// Nil means DDL, if set.
@@ -334,6 +338,11 @@ type Server struct {
 	notify      *notify.Service
 	clones      *clone.Manager
 	erasure     *erasure.Service
+	// ai runs the AI functions; aiMaxCalls and aiMaxCost are a statement's
+	// default caps on them (IGLOO_AI_MAX_CALLS, IGLOO_AI_MAX_COST_USD).
+	ai         *ai.Runtime
+	aiMaxCalls int64
+	aiMaxCost  float64
 	// clonePurge is Options.ClonePurge (see catalogguard.go).
 	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
@@ -527,6 +536,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		external:    opts.external,
 		fed:         opts.Federation,
 		notify:      opts.Notify,
+		ai:          opts.AI,
 		clones:      opts.Clones,
 		dist:        opts.Distributed,
 		erasure:     opts.Erasure,
@@ -563,6 +573,12 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	if s.notify == nil {
 		s.notify = notify.New(notify.Options{Log: log})
 	}
+	if s.ai == nil {
+		guard := notify.NewGuard(nil, nil)
+		s.ai = ai.NewRuntime(ai.Options{Dial: guard.DialContext, CheckURL: func(u string) error { _, err := guard.CheckURL(u); return err },
+			Cache: true, MaxCalls: 1000, MaxCostUSD: 1, Log: log})
+	}
+	s.aiMaxCalls, s.aiMaxCost = s.ai.Caps()
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
 	}
@@ -849,6 +865,18 @@ type session struct {
 	// wl is what the session's statements run under: query tag, limits
 	// and meter (see workload.go).
 	wl workloadState
+
+	// aiBound says the statement being prepared calls an AI function, and
+	// aiRun is the running statement's AI functions' Statement (see
+	// ai.go). Both are reached from DuckDB's threads.
+	aiBound atomic.Bool
+	aiRun   atomic.Pointer[ai.Statement]
+	// aiIntegration, aiMaxCalls, aiMaxCost and aiThreshold are the
+	// session's AI settings (see aiSettingCommand); zero means unset.
+	aiIntegration string
+	aiMaxCalls    int64
+	aiMaxCost     float64
+	aiThreshold   float64
 }
 
 type sessionKey struct{}
@@ -1332,6 +1360,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if ps, ok := s.switchCommand(sess, q.Query); ok {
 		return ps, nil
 	}
+	if ps, ok := s.aiSettingCommand(sess, q.Query); ok {
+		return ps, nil
+	}
 	// In the Snowflake dialect the statement is translated first, so that
 	// all that follows, the checks of the user's role, grants and policies
 	// above all, sees only the DuckDB statement Igloo will run.
@@ -1531,6 +1562,9 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 		}), wire.WithColumns(wire.Columns{{Name: "password_encryption", Oid: pgtype.TextOID, Width: -1}}))), nil
 	}
 
+	if ps, ok, err := s.aiCommand(ctx, sess, q.Query); ok || err != nil {
+		return ps, err
+	}
 	if ps, ok, err := s.notificationCommand(sess, q.Query); ok || err != nil {
 		return ps, err
 	}
@@ -1660,6 +1694,17 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 
 		start := time.Now()
 		tw := &tagWriter{DataWriter: w}
+		// A statement that calls AI functions starts them now, before it
+		// binds again and reads its tables (see beginAI).
+		var aist *ai.Statement
+		explain, explaining := plainExplain(st)
+		if st.ai {
+			if aist, err = s.beginAI(ctx, sess, st, explaining); err != nil {
+				s.metrics.query(start, err)
+				s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: -1, acc: st.access, policies: st.policies()})
+				return pgError(err)
+			}
+		}
 		// A statement counting distinct IDs in roaring bitmaps runs, and
 		// is rechecked, with the rb extension's setting on, as it was
 		// prepared (see bitmaps.go).
@@ -1809,16 +1854,29 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 				}
 				return err
 			}
-			switch {
-			case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
-				return sess.runTransaction(ctx, st, tw, run)
-			case st.changesIceberg:
-				return sess.outsideTransaction(ctx, run)
-			case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
-				return s.runSetting(ctx, sess, st, args, tw)
-			}
-			return run()
+			// Its AI functions run under aist (see aiRunning).
+			return sess.aiRunning(ctx, aist, func() error {
+				if aist != nil && explaining {
+					// EXPLAIN says what the AI functions would send.
+					tw.DataWriter = &extraRows{DataWriter: tw.DataWriter, rows: s.explainAI(ctx, sess, aist, explain, args)}
+				}
+				switch {
+				case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
+					return sess.runTransaction(ctx, st, tw, run)
+				case st.changesIceberg:
+					return sess.outsideTransaction(ctx, run)
+				case st.stmtType == duckdb.STATEMENT_TYPE_SET || st.stmtType == duckdb.STATEMENT_TYPE_VARIABLE_SET:
+					return s.runSetting(ctx, sess, st, args, tw)
+				}
+				return run()
+			})
 		})
+		var spend *ai.Spend
+		if aist != nil && !explaining {
+			sp := aist.End()
+			spend = &sp
+			aiNotice(w, sp)
+		}
 		sess.wl.counted, sess.wl.shape = false, ""
 		releaseCatalog()
 		s.finishResult(fill, err)
@@ -1856,7 +1914,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			s.dist.Observe(parts.key, parts.workers, time.Since(cmp.Or(parts.since, start)))
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
-			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts})
+			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
@@ -2186,9 +2244,13 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	// The catalog's tables it reads: those DuckDB loads while this holds
 	// the lock, as no other bind runs alongside (see memoStatement).
 	loads := s.engine.RecordLoads()
+	// Whether it calls AI functions: DuckDB binds them as it prepares it
+	// (see aiHook).
+	sess.aiBound.Store(false)
 	defer func() {
 		if l := loads(); st != nil {
 			st.loads = l
+			st.ai = sess.aiBound.Load()
 		}
 	}()
 	defer sess.cacheReports()()

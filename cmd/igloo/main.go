@@ -248,6 +248,11 @@ func serve() error {
 		return err
 	}
 	defer notifyStore.Close()
+	aiRuntime, err := openAI(startCtx, cfg, users, log)
+	if err != nil {
+		return err
+	}
+	defer aiRuntime.Store().Close()
 	cancel()
 
 	reg := prometheus.NewRegistry()
@@ -394,6 +399,8 @@ func serve() error {
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
 			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
+			// What AI functions derived from the tables, cached.
+			Derived: []erasure.Derived{aiRuntime.Store()},
 		}, historyStore, taskStore)
 		if err != nil {
 			return err
@@ -466,6 +473,7 @@ func serve() error {
 		Sharing:             shares,
 		Federation:          fed,
 		Notify:              notifier,
+		AI:                  aiRuntime,
 		Clones:              clones,
 		Lineage:             lineage,
 		Distributed:         dist,
@@ -487,6 +495,12 @@ func serve() error {
 		return err
 	}
 	bitmapIDs.Bind(srv)
+	// The AI functions run in this server's sessions; workers have none.
+	eng.SetAI(srv.AIHook())
+	// The AI cache's expired entries go, every hour, until shutdown.
+	aiCtx, stopAI := context.WithCancel(ctx)
+	defer stopAI()
+	go aiRuntime.Run(aiCtx, time.Hour)
 	// Some of DuckDB's work ignores its memory limit; rather than let the
 	// kernel kill the process, cancel the statement that has run longest
 	// when memory runs low (see memlimit.Watch).

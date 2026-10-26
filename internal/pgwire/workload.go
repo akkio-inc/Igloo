@@ -353,6 +353,14 @@ func parseSettingCommand(toks []token) (c *settingCommand, ok bool, err error) {
 		}
 		return c, true, validSetting(c.name)
 	}
+	isDigits := func(s string) bool {
+		return s != "" && strings.Trim(s, "0123456789") == ""
+	}
+	if len(rest) == 5 && rest[3].text == "." && rest[2].kind == tokWord && rest[4].kind == tokWord && isDigits(rest[2].text) &&
+		isDigits(rest[4].text) {
+		// A decimal, as ai_max_cost_usd = 0.25 is.
+		rest = append(rest[:2:2], token{kind: tokWord, text: rest[2].text + "." + rest[4].text})
+	}
 	if len(rest) != 3 || rest[0].kind != tokWord || rest[1].upper() != "TO" && rest[1].text != "=" {
 		return syntax("expected SET setting = value")
 	}

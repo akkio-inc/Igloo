@@ -237,6 +237,27 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   SQLSTATE `0A000` and a hint; docs/snowflake-sql.md lists what is
   translated, the known differences and what is refused.
 
+### AI functions
+
+- Snowflake's `AI_COMPLETE`, `SNOWFLAKE.CORTEX.COMPLETE`, `PROMPT` and
+  `AI_COUNT_TOKENS`, with the customer's own keys: `CREATE AI INTEGRATION`
+  reaches OpenAI and the servers that speak its API (Azure OpenAI, vLLM,
+  llama.cpp, Ollama, OpenRouter), Anthropic, Gemini, Vertex AI, Amazon
+  Bedrock or a decision endpoint, with its keys encrypted, `MODELS`
+  mapping the names SQL uses (an unmapped name fails), and `GRANT USAGE ON
+  INTEGRATION` deciding who may call it; off until one exists. Calls run
+  in Igloo's own process, through its egress guard, on the coordinator,
+  never through a DuckDB extension. Each distinct input is sent once per
+  statement, and answers are cached across statements for 30 days
+  (`IGLOO_AI_CACHE_RETENTION`), so a rerun costs nothing; `refresh =>
+  TRUE` asks again. A statement makes at most 1,000 calls costing at most
+  $1 unless a role's `ai_max_calls` and `ai_max_cost_usd` say otherwise,
+  `EXPLAIN` says what it would send and cost, and the history and
+  `igloo.usage` record calls, tokens and cost by query tag. Erasure
+  requests purge the cached answers derived from their tables, and
+  complete only once none remain (see
+  [AI functions](docs/ai-functions.md)).
+
 ### Loading and scheduling
 
 - `COPY INTO table FROM 'location'` loads CSV, TSV, Parquet, JSON and

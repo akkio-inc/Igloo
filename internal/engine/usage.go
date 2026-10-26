@@ -81,6 +81,10 @@ func (t historyTypes) usageColumns() []duckdb.ColumnInfo {
 		{Name: "time_share", T: t.double},
 		{Name: "compute_hours", T: t.double},
 		{Name: "estimated_cost", T: t.double},
+		{Name: "ai_calls", T: t.bigint},
+		{Name: "ai_input_tokens", T: t.bigint},
+		{Name: "ai_output_tokens", T: t.bigint},
+		{Name: "ai_cost_usd", T: t.double},
 	}
 }
 
@@ -93,5 +97,6 @@ func usageValues(u audit.Usage) []any {
 		cost = *u.Cost
 	}
 	return []any{u.Day, u.Pool, u.User, u.Role, nullString(u.QueryTag), u.Statements, u.Failed,
-		millis(u.Run), millis(u.Queued), millis(u.CPUTime), u.BytesRead, u.Share, hours, cost}
+		millis(u.Run), millis(u.Queued), millis(u.CPUTime), u.BytesRead, u.Share, hours, cost,
+		u.AICalls, u.AIInputTokens, u.AIOutputTokens, u.AICostUSD}
 }

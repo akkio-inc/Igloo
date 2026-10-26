@@ -268,6 +268,12 @@ func (t historyTypes) queryColumns() []duckdb.ColumnInfo {
 		{Name: "stages", T: t.integer},
 		{Name: "exchanges", T: t.integer},
 		{Name: "plan_key", T: t.varchar},
+		{Name: "ai_calls", T: t.bigint},
+		{Name: "ai_cache_hits", T: t.bigint},
+		{Name: "ai_input_tokens", T: t.bigint},
+		{Name: "ai_output_tokens", T: t.bigint},
+		{Name: "ai_cost_usd", T: t.double},
+		{Name: "ai_models", T: t.list},
 	}
 }
 
@@ -281,12 +287,17 @@ func queryValues(q audit.Query) []any {
 	if r := q.Resources; r != nil {
 		cpu, read, memory = millis(r.CPUTime), r.BytesRead, r.MemoryAllocated
 	}
+	// A statement that called no AI function has NULLs there.
+	var aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels any
+	if a := q.AI; a != nil {
+		aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels = a.Calls, a.CacheHits, a.InputTokens, a.OutputTokens, a.CostUSD, nullList(a.Models)
+	}
 	return []any{q.ID, q.SessionID, q.User, q.Role, q.Start, q.Start.Add(q.Duration),
 		millis(q.Duration), q.Outcome, nullString(q.SQLState), rows, q.StatementType, q.Text,
 		nullList(q.TablesRead), nullList(q.TablesWritten), nullString(q.ClientAddress), nullString(q.ApplicationName),
 		nullList(q.Policies), nullString(q.QueryTag), nullString(q.Pool), millis(q.Queued), cpu, read, memory,
 		nullList(q.LocationsRead), nullString(q.Job), int32(q.Workers),
-		int32(q.Stages), int32(q.Exchanges), nullString(q.PlanKey)}
+		int32(q.Stages), int32(q.Exchanges), nullString(q.PlanKey), aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels}
 }
 
 func millis(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
