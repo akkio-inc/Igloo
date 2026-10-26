@@ -259,6 +259,19 @@ var snowflakeCases = []runCase{
 	{name: "order by alias of joined columns", sql: `select coalesce(p.k, q.k) as k from (select 1 as k union all select 3) p full join (select 2 as k union all select 3) q on p.k = q.k order by case k when 1 then 3 when 2 then 1 when 3 then 2 end`,
 		want: []string{"2", "3", "1"}},
 
+	// VECTOR(FLOAT | INT, n) is a fixed-size array, which a cast checks
+	// the dimension of; the vector functions read lists alike, as an
+	// Iceberg table's VECTOR column holds them.
+	{name: "vector casts", sql: `select [1,2,3]::vector(float, 3), cast([1,2] as vector(int, 2)), '[0.5, 1]'::vector(float, 2), try_cast([1,2] as vector(float, 3))`,
+		want: []string{"[1,2,3]|[1,2]|[0.5,1]|NULL"}, types: []string{"FLOAT[3]", "INTEGER[2]", "FLOAT[2]", "FLOAT[3]"}},
+	{name: "vector of the wrong dimension", sql: `select [1,2]::vector(float, 3)`, wantErr: "3"},
+	{name: "vector functions", sql: `select vector_cosine_similarity([3,4]::vector(float,2), [6,8]::vector(float,2)), vector_inner_product([1,2,3]::vector(float,3), [1,2,3]::vector(float,3)), vector_l1_distance([1,2,3]::vector(float,3), [2,0,3]::vector(float,3)), vector_l2_distance([0,0]::vector(int,2), [3,4]::vector(int,2))`,
+		want: []string{"1|14|3|5"}, types: []string{"DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE"}},
+	{name: "vector functions of columns", sql: `select vector_cosine_similarity(a, b), vector_l1_distance(a, b), vector_l2_distance(a, null) from (select [1, 0]::vector(float, 2) as a, [0, 1]::vector(float, 2) as b)`,
+		want: []string{"0|2|NULL"}},
+	{name: "vector functions of different dimensions", sql: `select vector_inner_product([1,2]::vector(float,2), [1,2,3]::vector(float,3))`, wantErr: "vectors of different dimensions: 2 and 3"},
+	{name: "vector l1 of different dimensions", sql: `select vector_l1_distance([1,2]::vector(float,2), [1,2,3]::vector(float,3))`, wantErr: "vectors of different dimensions"},
+
 	// Implicit conversions (Options.Implicit): string functions read any
 	// value as TO_VARCHAR writes it, LIKE does too, and text compared with
 	// a timestamp or a number is cast to it.

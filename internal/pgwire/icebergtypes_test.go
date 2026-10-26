@@ -27,6 +27,9 @@ func TestIcebergCast(t *testing.T) {
 		{"MAP(VARCHAR, VARCHAR)", ""},
 		{"STRUCT(a TIMESTAMP WITH TIME ZONE, b DOUBLE)", ""},
 		{`ENUM('JSON', 'b')`, ""},
+		{"FLOAT[3]", `CAST("c" AS FLOAT[])`},
+		{"STRUCT(v INTEGER[2], j JSON)[]", `CAST("c" AS STRUCT(v INTEGER[], j VARCHAR)[])`},
+		{"FLOAT[]", ""},
 	} {
 		if got := icebergCast(`"c"`, c.typ); got != c.want {
 			t.Errorf("%s: got %s, want %s", c.typ, got, c.want)
@@ -42,6 +45,7 @@ func TestIcebergColumnList(t *testing.T) {
 		{`CREATE OR REPLACE TABLE IF NOT EXISTS lake."S".t /* JSON */ ("JSON" json, b TIMESTAMP WITH TIME ZONE, c json) `,
 			`CREATE OR REPLACE TABLE IF NOT EXISTS lake."S".t /* JSON */ ("JSON" VARCHAR, b TIMESTAMP WITH TIME ZONE, c VARCHAR) `},
 		{`CREATE TABLE t (a INT, b VARCHAR DEFAULT 'JSON')`, `CREATE TABLE t (a INT, b VARCHAR DEFAULT 'JSON')`},
+		{`CREATE TABLE t (id INT, v FLOAT[768], w INTEGER[2][3])`, `CREATE TABLE t (id INT, v FLOAT[], w INTEGER[][])`},
 	} {
 		if got := icebergColumnList(c.in); got != c.want {
 			t.Errorf("%s:\n got %s\nwant %s", c.in, got, c.want)

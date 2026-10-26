@@ -190,9 +190,49 @@ func parseType(nodes []*node, i int) (t sqlType, end int, ok bool, err error) {
 		skipParams()
 		return sqlType{duck: "GEOMETRY"}, end, true, nil
 	case "VECTOR":
-		return sqlType{}, 0, false, unsupported("The VECTOR type", "store embeddings as ARRAY (JSON) or FLOAT columns")
+		return vectorType(nodes, end)
 	}
 	return sqlType{}, 0, false, nil
+}
+
+// maxVectorDimension is the largest VECTOR Snowflake has.
+const maxVectorDimension = 4096
+
+// vectorType reads VECTOR(INT | FLOAT, n), whose parameters start at
+// nodes[end] (significant), as DuckDB's fixed-size array of 32-bit
+// numbers, FLOAT[n] or INTEGER[n]: a cast to it checks the dimension.
+// DuckDB-Iceberg has no fixed-size arrays, so an Iceberg table's column
+// of one is a list, FLOAT[] or INTEGER[] (see pgwire's icebergTypes),
+// which the vector functions read alike.
+func vectorType(nodes []*node, end int) (sqlType, int, bool, error) {
+	invalid := &Error{Code: CodeSyntax, Message: "invalid VECTOR type",
+		Hint: "VECTOR(FLOAT, n) or VECTOR(INT, n), with n from 1 to 4096"}
+	j := nextSig(nodes, end-1)
+	if j < 0 || !nodes[j].isGroup('(') {
+		return sqlType{}, 0, false, invalid
+	}
+	args := splitArgs(nodes[j].kids)
+	if len(args) != 2 {
+		return sqlType{}, 0, false, invalid
+	}
+	elem, dim := trim(args[0]), trim(args[1])
+	if len(elem) != 1 || len(dim) != 1 || dim[0].kind != kNumber {
+		return sqlType{}, 0, false, invalid
+	}
+	var duck string
+	switch elem[0].word() {
+	case "FLOAT":
+		duck = "FLOAT"
+	case "INT":
+		duck = "INTEGER"
+	default:
+		return sqlType{}, 0, false, invalid
+	}
+	n, err := strconv.Atoi(dim[0].tok.text)
+	if err != nil || n < 1 || n > maxVectorDimension {
+		return sqlType{}, 0, false, invalid
+	}
+	return sqlType{duck: duck + "[" + strconv.Itoa(n) + "]"}, j + 1, true, nil
 }
 
 // structuredType maps a structured type, kind ARRAY, OBJECT or MAP with

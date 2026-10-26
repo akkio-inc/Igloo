@@ -565,6 +565,22 @@ func init() {
 	add(simple(uniform), "UNIFORM")
 	add(simple(normal), "NORMAL")
 	add(simple(widthBucket), "WIDTH_BUCKET")
+
+	// Vectors (see vectorType), as lists of DOUBLE: a table's VECTOR
+	// column is a list, and DuckDB's array functions take only arrays of
+	// one size. Each refuses vectors of different dimensions.
+	vector := func(fn string) rewrite {
+		return simple(func(c *call) (*node, error) {
+			if err := c.argc(2, 2); err != nil {
+				return nil, err
+			}
+			return c.out(fn+"(CAST(", c.arg(0), " AS DOUBLE[]), CAST(", c.arg(1), " AS DOUBLE[]))"), nil
+		})
+	}
+	add(vector("sf_vector_cosine_similarity"), "VECTOR_COSINE_SIMILARITY")
+	add(vector("sf_vector_inner_product"), "VECTOR_INNER_PRODUCT")
+	add(vector("sf_vector_l1_distance"), "VECTOR_L1_DISTANCE")
+	add(vector("sf_vector_l2_distance"), "VECTOR_L2_DISTANCE")
 	add(simple(func(c *call) (*node, error) {
 		return c.out("(row_number() OVER () - 1)"), nil
 	}), "SEQ1", "SEQ2", "SEQ4", "SEQ8")

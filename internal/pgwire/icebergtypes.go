@@ -22,13 +22,16 @@ import (
 // as Snowflake's TO_VARCHAR writes it, a string as itself and anything else
 // as its JSON text, as Igloo's ARRAY and OBJECT columns hold them (lists
 // and maps of strings, see package snowflake). Lists, maps and structs of
-// other types are Iceberg's own, which other engines read.
+// other types are Iceberg's own, which other engines read. Nor does
+// DuckDB-Iceberg have fixed-size arrays, such as FLOAT[3], a Snowflake
+// VECTOR's type: a column of one is a list of the same, FLOAT[], which
+// loses only the size.
 //
 // icebergTypes rewrites, to that end, the statements that give an Iceberg
 // table its columns: the types in CREATE TABLE's column list and in ALTER
-// TABLE ... ADD COLUMN, and the query of CREATE TABLE ... AS, whose JSON
-// and VARIANT columns it casts. Any other statement, and any statement it
-// cannot read, comes back as it was.
+// TABLE ... ADD COLUMN, and the query of CREATE TABLE ... AS, whose JSON,
+// VARIANT and array columns it casts. Any other statement, and any
+// statement it cannot read, comes back as it was.
 func (s *Server) icebergTypes(ctx context.Context, sess *session, query string) string {
 	if s.catalogName() == "" || !strings.Contains(strings.ToUpper(query), "TABLE") {
 		return query
@@ -178,7 +181,7 @@ func (s *Server) icebergQueryTypes(ctx context.Context, sess *session, query, q 
 // values into the table stores them. VARIANT, whose text is not JSON, goes
 // through JSON: alone, as its JSON text; in a list, map or struct, as
 // Snowflake's TO_VARCHAR writes it, a string as itself and anything else as
-// its JSON text.
+// its JSON text. A fixed-size array is a list.
 func icebergCast(col, typ string) string {
 	toks := typeTokens(typ)
 	end, edits := icebergTypeAt(toks, 0)
@@ -247,7 +250,8 @@ func typeTokens(text string) []typeToken {
 
 // icebergTypeAt reads the type that starts at toks[i] and returns the
 // index just past it, and the edits that turn JSON and VARIANT in it into
-// VARCHAR. It reads DuckDB's type names: a name of one or more words, its
+// VARCHAR, and fixed-size arrays into lists. It reads DuckDB's type names:
+// a name of one or more words, its
 // parameters (a struct's or union's fields, a map's key and value types),
 // and any [] or [n] after it.
 func icebergTypeAt(toks []typeToken, i int) (int, []edit) {
@@ -318,8 +322,11 @@ func icebergTypeAt(toks []typeToken, i int) (int, []edit) {
 		}
 	}
 	for i < len(toks) && toks[i].text == "[" {
-		for i < len(toks) && toks[i].text != "]" {
-			i++
+		for i++; i < len(toks) && toks[i].text != "]"; i++ {
+			// A fixed-size array, FLOAT[3], which DuckDB-Iceberg has no
+			// type for ("Array type not supported in Iceberg type"): a
+			// list of the same, as a VECTOR column is.
+			edits = append(edits, edit{toks[i].start, toks[i].end, ""})
 		}
 		i++
 	}

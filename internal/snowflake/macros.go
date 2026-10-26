@@ -118,6 +118,16 @@ var macros = []string{
 			+ CASE WHEN opt = 1 THEN length(regexp_extract_all(substring(s, pos), p)[occ]) ELSE 0 END END`,
 	// SEARCH's tokens: runs of letters and digits, in lower case.
 	`CREATE OR REPLACE TEMP MACRO sf_search_tokens(s) AS list_filter(regexp_split_to_array(lower(s), '[^\p{L}\p{N}]+'), lambda t: t <> '')`,
+	// VECTOR_COSINE_SIMILARITY, VECTOR_INNER_PRODUCT, VECTOR_L1_DISTANCE
+	// and VECTOR_L2_DISTANCE of lists of DOUBLE, which must be as long as
+	// each other.
+	`CREATE OR REPLACE TEMP MACRO sf_vector_dims(a, b) AS CASE WHEN len(a) <> len(b)
+		THEN error('vectors of different dimensions: ' || len(a) || ' and ' || len(b)) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_vector_cosine_similarity(a, b) AS coalesce(sf_vector_dims(a, b), list_cosine_similarity(a, b))`,
+	`CREATE OR REPLACE TEMP MACRO sf_vector_inner_product(a, b) AS coalesce(sf_vector_dims(a, b), list_inner_product(a, b))`,
+	`CREATE OR REPLACE TEMP MACRO sf_vector_l2_distance(a, b) AS coalesce(sf_vector_dims(a, b), list_distance(a, b))`,
+	`CREATE OR REPLACE TEMP MACRO sf_vector_l1_distance(a, b) AS
+		coalesce(sf_vector_dims(a, b), list_sum(list_transform(range(1, len(a) + 1), lambda i: abs(a[i] - b[i]))))`,
 
 	// Semi-structured values. A VARIANT, ARRAY or OBJECT value is JSON, as
 	// are the columns of views and of connections' tables that hold one;

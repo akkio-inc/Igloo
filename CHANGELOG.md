@@ -13,6 +13,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- Snowflake's `VECTOR(FLOAT | INT, n)` type and `VECTOR_COSINE_SIMILARITY`,
+  `VECTOR_INNER_PRODUCT`, `VECTOR_L1_DISTANCE` and `VECTOR_L2_DISTANCE`,
+  which Igloo refused. A vector is DuckDB's fixed-size array; an Iceberg
+  table's column of one, or of any fixed-size array, is a list
+  (`list<float>`), since DuckDB-Iceberg has no fixed-size arrays (see
+  [Types](docs/snowflake-sql.md#types)).
 - `ANALYZE table [(column, ...)]` counts the distinct values of a table's
   columns and keeps the counts in the table, where DuckDB's planner finds
   them (see [Distinct counts](docs/sql.md#distinct-counts)). DuckDB

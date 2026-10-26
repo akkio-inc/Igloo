@@ -229,6 +229,7 @@ values; cast it to `ARRAY` or `OBJECT` for a list or a map.
 | Numbers | `SQUARE`, `TRUNC`, `ROUND`, `CEIL` and `FLOOR` with a scale, `DIV0`, `WIDTH_BUCKET`, `RANDOM`, `UNIFORM`, `NORMAL`, `BITAND`, `BITOR`, `BITXOR`, `BITNOT`, `BITSHIFTLEFT`, `BITSHIFTRIGHT`, `GETBIT` |
 | Aggregates | `LISTAGG` (with `WITHIN GROUP` and `DISTINCT`), `COUNT(DISTINCT a, b)`, `MEDIAN`, `MODE`, `APPROX_COUNT_DISTINCT` and `HLL` (of one or more values), `HLL_ACCUMULATE`, `HLL_COMBINE`, `HLL_ESTIMATE`, `APPROX_PERCENTILE`, `APPROX_TOP_K`, `BOOLAND_AGG`, `BOOLOR_AGG`, `BITAND_AGG`, `BITOR_AGG`, `BITXOR_AGG`, `SKEW`, `VARIANCE_POP`, `VARIANCE_SAMP` |
 | Windows | `RATIO_TO_REPORT`, `CONDITIONAL_TRUE_EVENT`, `IGNORE NULLS` after `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` |
+| Vectors | `VECTOR_COSINE_SIMILARITY`, `VECTOR_INNER_PRODUCT`, `VECTOR_L1_DISTANCE`, `VECTOR_L2_DISTANCE`, in double precision; vectors of different dimensions are an error |
 | Generators | `SEQ1`, `SEQ2`, `SEQ4`, `SEQ8` with `TABLE(GENERATOR(ROWCOUNT => n))`, `TABLE(SPLIT_TO_TABLE(s, sep))` |
 | Context | `CURRENT_USER`, `CURRENT_ROLE`, `CURRENT_DATABASE`, `CURRENT_SCHEMA`, `CURRENT_VERSION`; `CURRENT_WAREHOUSE`, `CURRENT_ACCOUNT`, `CURRENT_SESSION`, `CURRENT_REGION` and similar return `NULL` |
 
@@ -313,6 +314,14 @@ comparison reads `a || b`, which Igloo does not convert; write
 | `VARIANT`, `OBJECT`, `ARRAY` | `JSON`; columns of them as [above](#semi-structured-columns) |
 | `ARRAY(type)`, `OBJECT(name type, ...)`, `MAP(type, type)` | `type[]`, `STRUCT(name type, ...)`, `MAP(type, type)` |
 | `GEOGRAPHY`, `GEOMETRY` | `GEOMETRY` |
+| `VECTOR(FLOAT, n)`, `VECTOR(INT, n)` (n up to 4096) | `FLOAT[n]`, `INTEGER[n]`; a column of an Iceberg table is a list, `FLOAT[]` or `INTEGER[]` |
+
+DuckDB-Iceberg has no fixed-size arrays, so an Iceberg table's `VECTOR`
+column, and its column of any of DuckDB's fixed-size arrays (`FLOAT[3]`),
+holds a list of the same type, which other engines read as Iceberg's
+`list<float>`: the table does not keep the dimension, and a value of
+another dimension can be stored. A cast to `VECTOR(FLOAT, n)` checks it,
+and the vector functions refuse vectors of different dimensions.
 
 ### Statements
 
@@ -504,7 +513,6 @@ These fail with SQLSTATE `0A000` and a hint:
   of one occurrence after the first, `SHA2` of other than 256 bits, and
   arguments Igloo must know when it translates (a format, a date part or a
   scale) given as expressions rather than literals.
-- `VECTOR` columns: store embeddings as `ARRAY` or `FLOAT` columns.
 - Session parameters at values Igloo does not follow (`WEEK_START = 1`,
   `TIMESTAMP_TYPE_MAPPING = TIMESTAMP_LTZ` and the like).
 
