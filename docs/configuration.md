@@ -128,6 +128,17 @@ unless the allow list names the host.
 | `IGLOO_AI_MAX_COST_USD` | `1` | Estimated cost, in US dollars at the integrations' prices, of a statement's calls, unless its user's roles set `ai_max_cost_usd`. `0` is no cap. |
 | `IGLOO_AI_REQUEST_TIMEOUT` | `2m` | How long each request to a provider may take; one that takes longer is sent again, up to five times in all. |
 
+## Model pack
+
+The [model pack](models.md) holds the open-weight models Igloo runs in its
+own processes. An admin installs them with `igloo models install`; nothing
+is downloaded at query time. Set the same directory on servers and workers.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IGLOO_MODEL_DIR` | | The pack's directory, an absolute path. Unset, no model is installed, and functions that need one fail saying so. |
+| `IGLOO_MODEL_MIRROR` | | A base URL from which `igloo models install` reads `<model>/<file>` in place of the files' upstream URLs, for hosts that cannot reach Hugging Face. Files are checked against their pinned SHA-256 all the same. |
+
 ## Lineage events
 
 Statements that write tables can also be sent as

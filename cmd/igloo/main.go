@@ -9,6 +9,7 @@
 //	igloo version                   print the version
 //	igloo healthcheck               exit 0 if the server is up (for containers)
 //	igloo install-extensions <dir>  download DuckDB extensions into dir
+//	igloo models ...                list, install, verify and remove the model pack's models (docs/models.md)
 //	igloo check-extensions [dir]    check that the rb extension in dir (default IGLOO_DUCKDB_EXTENSION_DIR) loads
 //	igloo gateway                   run the scale-to-zero gateway (docs/scale-to-zero.md)
 //	igloo worker                    run a distributed-execution worker (docs/distributed-execution.md)
@@ -93,6 +94,8 @@ func main() {
 		if msg, err = engine.CheckExtensions(context.Background(), dir); err == nil {
 			fmt.Println(msg)
 		}
+	case len(os.Args) > 1 && os.Args[1] == "models":
+		err = modelsCommand(os.Args[2:], os.Stdout)
 	case len(os.Args) > 1 && os.Args[1] == "install-extensions":
 		if len(os.Args) != 3 {
 			err = errors.New("usage: igloo install-extensions <dir>")

@@ -140,6 +140,8 @@ type Config struct {
 	Notifications Notifications
 	// AI configures the AI functions (see ai.go).
 	AI AI
+	// Models configures the model pack (see models.go).
+	Models Models
 	// Workers configures distributed execution (see workers.go).
 	Workers Workers
 }
@@ -705,6 +707,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	loadOIDC(&cfg, lookup, addErr)
 	loadNotifications(&cfg, lookup, addErr)
 	loadAI(&cfg, lookup, addErr)
+	loadModels(&cfg, lookup, addErr)
 
 	return cfg, errors.Join(errs...)
 }

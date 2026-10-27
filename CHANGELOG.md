@@ -289,6 +289,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   group's values however many there are: chunks of about 16,000 tokens,
   each answered with an intermediate result, combined until one request
   gives the answer, each request cached by its chunk.
+- The model pack: `igloo models install` installs open-weight models
+  (Chronos-Bolt, Chronos-2, TimesFM 2.5) into `IGLOO_MODEL_DIR`, each file
+  pinned by SHA-256 to an upstream revision and checked as it downloads
+  and again before a process uses it; only Apache-2.0 and MIT models are
+  installed or loaded, and nothing is downloaded at query time. A mirror
+  (`IGLOO_MODEL_MIRROR`) or a local directory can stand in for Hugging
+  Face (see [the model pack](docs/models.md)).
 
 ### Loading and scheduling
 

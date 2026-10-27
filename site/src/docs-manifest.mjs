@@ -70,6 +70,7 @@ export const groups = [
 			{ source: 'docs/scale-to-zero.md', label: 'Scale to zero' },
 			{ source: 'docs/workload-management.md', label: 'Workload management' },
 			{ source: 'docs/distributed-execution.md', label: 'Distributed execution' },
+			{ source: 'docs/models.md', label: 'Model pack' },
 		],
 	},
 	{
