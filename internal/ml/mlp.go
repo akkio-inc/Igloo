@@ -195,6 +195,9 @@ type mlpTrainer struct {
 type mlpScratch struct {
 	acts, deltas [][]float64
 	masks        [][]float64
+	// nz are the input's nonzero entries: one-hot inputs are mostly zeros,
+	// which the first layer skips.
+	nz []int
 }
 
 func newMLPTrainer(m *MLP, p MLPParams) *mlpTrainer {
@@ -313,11 +316,16 @@ func (t *mlpTrainer) backprop(x, y []float64, r int, s *mlpScratch, g []float64,
 	L := len(m.Sizes) - 1
 	d := m.Sizes[0]
 	copy(s.acts[0], x[r*d:(r+1)*d])
+	s.nz = nonzero(s.acts[0], s.nz[:0])
 	for l := range L {
 		in, out := m.Sizes[l], m.Sizes[l+1]
 		w := t.theta[t.wOff[l] : t.wOff[l]+in*out]
 		b := t.theta[t.bOff[l] : t.bOff[l]+out]
-		dense(w, b, s.acts[l], s.acts[l+1])
+		if l == 0 {
+			denseSparse(w, b, s.acts[0], s.nz, s.acts[1])
+		} else {
+			dense(w, b, s.acts[l], s.acts[l+1])
+		}
 		activate(m.Activations[l], s.acts[l+1])
 		if l+1 < L && t.p.Dropout > 0 {
 			keep := 1 - t.p.Dropout
@@ -368,6 +376,12 @@ func (t *mlpTrainer) backprop(x, y []float64, r int, s *mlpScratch, g []float64,
 				continue
 			}
 			row := gw[o*in : (o+1)*in]
+			if l == 0 {
+				for _, i := range s.nz {
+					row[i] += do * a[i]
+				}
+				continue
+			}
 			for i, ai := range a {
 				row[i] += do * ai
 			}
@@ -414,6 +428,30 @@ func (t *mlpTrainer) backprop(x, y []float64, r int, s *mlpScratch, g []float64,
 	return loss
 }
 
+// nonzero appends the indexes of v's nonzero entries to nz.
+func nonzero(v []float64, nz []int) []int {
+	for i, x := range v {
+		if x != 0 {
+			nz = append(nz, i)
+		}
+	}
+	return nz
+}
+
+// denseSparse is dense for an input whose nonzero entries are at nz: the
+// zeros, which add nothing, are skipped, and the rest added in order.
+func denseSparse(w, b, in []float64, nz []int, out []float64) {
+	n := len(in)
+	for o := range out {
+		s := b[o]
+		row := w[o*n : (o+1)*n]
+		for _, i := range nz {
+			s += row[i] * in[i]
+		}
+		out[o] = s
+	}
+}
+
 // dense computes out = w·in + b.
 func dense(w, b, in, out []float64) {
 	n := len(in)
@@ -449,7 +487,10 @@ func activate(kind string, v []float64) {
 }
 
 // MLPScratch holds one goroutine's activations for Forward.
-type MLPScratch struct{ acts [][]float64 }
+type MLPScratch struct {
+	acts [][]float64
+	nz   []int
+}
 
 // NewScratch returns buffers for Forward.
 func (m *MLP) NewScratch() *MLPScratch {
@@ -466,7 +507,12 @@ func (m *MLP) NewScratch() *MLPScratch {
 func (m *MLP) Forward(x []float64, upto int, s *MLPScratch) []float64 {
 	copy(s.acts[0], x)
 	for l := range upto {
-		dense(m.W[l], m.B[l], s.acts[l], s.acts[l+1])
+		if l == 0 {
+			s.nz = nonzero(s.acts[0], s.nz[:0])
+			denseSparse(m.W[0], m.B[0], s.acts[0], s.nz, s.acts[1])
+		} else {
+			dense(m.W[l], m.B[l], s.acts[l], s.acts[l+1])
+		}
 		activate(m.Activations[l], s.acts[l+1])
 	}
 	return s.acts[upto]

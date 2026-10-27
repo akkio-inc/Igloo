@@ -50,21 +50,19 @@ func FitPCA(x []float64, n, d, k int, ratio float64, threads int) (*PCA, error) 
 	for j := range mean {
 		mean[j] /= float64(n)
 	}
+	// The rows' products, over their nonzero entries (one-hot rows are
+	// mostly zeros), less the means' after: Σ(x-μ)(x-μ)ᵀ = Σxxᵀ - nμμᵀ.
 	covs := make([][]float64, chunks)
 	parallelFor(chunks, threads, func(c int) {
 		cov := make([]float64, d*d)
-		row := make([]float64, d)
+		var nz []int
 		for i := c * covChunk; i < min((c+1)*covChunk, n); i++ {
-			for j, v := range x[i*d : (i+1)*d] {
-				row[j] = v - mean[j]
-			}
-			for a := range d {
+			row := x[i*d : (i+1)*d]
+			nz = nonzero(row, nz[:0])
+			for ia, a := range nz {
 				ra := row[a]
-				if ra == 0 {
-					continue
-				}
 				cr := cov[a*d:]
-				for b := a; b < d; b++ {
+				for _, b := range nz[ia:] {
 					cr[b] += ra * row[b]
 				}
 			}
@@ -79,7 +77,7 @@ func FitPCA(x []float64, n, d, k int, ratio float64, threads int) (*PCA, error) 
 	}
 	for a := range d {
 		for b := a; b < d; b++ {
-			v := cov[a*d+b] / float64(n-1)
+			v := (cov[a*d+b] - float64(n)*mean[a]*mean[b]) / float64(n-1)
 			cov[a*d+b], cov[b*d+a] = v, v
 		}
 	}
@@ -122,17 +120,18 @@ func (p *PCA) Project(v, out []float64) {
 }
 
 // ReconstructionError is v's mean squared distance from its projection
-// back from the components; coords are its coordinates (Project's).
+// back from the components; coords are its coordinates (Project's). The
+// components being orthonormal, it is what of v's squared distance from
+// the mean its coordinates do not account for.
 func (p *PCA) ReconstructionError(v, coords []float64) float64 {
 	var s float64
 	for j, x := range v {
-		r := p.Mean[j]
-		for c, w := range coords {
-			r += w * p.Components[c*p.D+j]
-		}
-		s += (x - r) * (x - r)
+		s += (x - p.Mean[j]) * (x - p.Mean[j])
 	}
-	return s / float64(p.D)
+	for _, c := range coords {
+		s -= c * c
+	}
+	return math.Max(s, 0) / float64(p.D)
 }
 
 // symmetricEigen returns the eigenvalues of a symmetric d by d matrix in
