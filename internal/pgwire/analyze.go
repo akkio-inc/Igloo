@@ -188,11 +188,18 @@ func distinctCountable(typ string) bool {
 // since it last did (igloo_set_distinct_counts, which the rb extension
 // defines); they are the database's, for every session. A session inside a
 // transaction block leaves it to the next one outside.
+//
+// It takes the catalog lock before countsMu, as prepareChecked does, which
+// holds the lock's exclusive side when it calls this. A session that took
+// countsMu first, and then waited for the lock's shared side as DuckDB bound
+// the call, deadlocked with one preparing: 64 sessions that sent their
+// first statements together after a restart waited for good.
 func (s *Server) registerDistinctCounts(ctx context.Context, sess *session) {
 	gen, tables := s.engine.DistinctCounts()
 	if sess.inTx || gen == s.countsGen.Load() {
 		return
 	}
+	defer s.shareCatalog(sess)()
 	s.countsMu.Lock()
 	defer s.countsMu.Unlock()
 	if gen == s.countsGen.Load() {

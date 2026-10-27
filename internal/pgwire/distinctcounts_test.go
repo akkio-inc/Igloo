@@ -4,10 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/engine"
 )
 
 // estimatedScanRows is DuckDB's estimate of the rows the one scan of query's
@@ -107,5 +113,62 @@ func TestAnalyzeKeepsDistinctCounts(t *testing.T) {
 	rita := connect(t, first.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)
 	if _, err := rita.Exec(context.Background(), "ANALYZE lake.public.visits"); err == nil || !strings.Contains(err.Error(), "only admins") {
 		t.Errorf("a reader's ANALYZE: %v", err)
+	}
+}
+
+// countsEngine is recordingEngine with distinct counts to hand to DuckDB.
+type countsEngine struct{ recordingEngine }
+
+func (e *countsEngine) DistinctCounts() (uint64, map[string]map[string]int64) {
+	return 1, map[string]map[string]int64{"lake.public.members": {"audience": 100}}
+}
+
+// TestDistinctCountsAfterTheCatalogLock checks that a session handing
+// DuckDB the distinct counts takes the catalog lock before countsMu, as a
+// session preparing a statement does (prepareChecked holds the lock's
+// exclusive side when it hands them over): one that held countsMu while it
+// waited for the lock as DuckDB bound the call deadlocked with such a
+// session.
+func TestDistinctCountsAfterTheCatalogLock(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, config.Config{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close() //nolint:errcheck
+	conn, err := eng.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	e := &countsEngine{}
+	s := &Server{engine: e, catalog: "lake", log: slog.New(slog.DiscardHandler)}
+	sess := &session{conn: conn}
+	// Another session is handing them over.
+	s.countsMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.registerDistinctCounts(ctx, sess)
+	}()
+	shared := false
+	for deadline := time.Now().Add(5 * time.Second); !shared && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if e.mu.TryLock() {
+			e.mu.Unlock()
+		} else {
+			shared = true
+		}
+	}
+	s.countsMu.Unlock()
+	<-done
+	if !shared {
+		t.Fatal("it waited for countsMu before it took the catalog lock")
+	}
+	if !slices.Equal(e.events, []string{"rlock", "runlock"}) {
+		t.Errorf("catalog lock events %v, want rlock and runlock", e.events)
+	}
+	if s.countsGen.Load() != 1 {
+		t.Errorf("counts generation %d after handing them over, want 1", s.countsGen.Load())
 	}
 }
