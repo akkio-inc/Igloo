@@ -42,6 +42,8 @@ type node struct {
 	// the JSON array of (see split), which a FLATTEN hoisted into its FROM
 	// item's select list unnests as text (see listHoistOf).
 	strs *node
+	// ai says the node calls a model provider for its rows (see guardAI).
+	ai bool
 }
 
 // closer is the bracket that closes open.

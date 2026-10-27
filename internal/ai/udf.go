@@ -43,6 +43,30 @@ var Functions = []Function{
 		Eval: func(s *Statement, rows []row) ([]any, error) { return s.CountTokens(rows) }},
 	{Name: "ai_decide", Args: []string{"ANY", "VARCHAR", "VARCHAR"}, Result: "JSON",
 		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Decide(rows) }},
+	{Name: "ai_classify", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "JSON",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Classify(rows) }},
+	{Name: "ai_filter", Args: []string{"ANY", "VARCHAR"}, Result: "BOOLEAN",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Filter(rows) }},
+	{Name: "ai_sentiment", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "JSON",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Sentiment(rows) }},
+	{Name: "ai_sentiment_score", Args: []string{"ANY", "VARCHAR"}, Result: "DOUBLE",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.SentimentScore(rows) }},
+	{Name: "ai_extract", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "JSON",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Extract(rows) }},
+	{Name: "ai_extract_answer", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "JSON",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.ExtractAnswer(rows) }},
+	{Name: "ai_summarize", Args: []string{"ANY", "VARCHAR"}, Result: "VARCHAR",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Summarize(rows) }},
+	{Name: "ai_translate", Args: []string{"ANY", "VARCHAR", "VARCHAR", "VARCHAR"}, Result: "VARCHAR",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Translate(rows) }},
+	{Name: "ai_redact", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "VARCHAR",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Redact(rows, false) }},
+	{Name: "ai_redact_detect", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "JSON",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Redact(rows, true) }},
+	{Name: "ai_embed", Args: []string{"VARCHAR", "ANY", "VARCHAR"}, Result: "FLOAT[]",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Embed(rows) }},
+	{Name: "ai_similarity", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "DOUBLE",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Similarity(rows) }},
 }
 
 // Names lists the AI functions' names, which the distributed planner keeps
@@ -60,7 +84,11 @@ func Names() []string {
 // objects (return_error_details => TRUE), as Snowflake's AI functions
 // since its 2026_02 bundle do: those whose result is not already an
 // object that carries errors.
-var details = map[string]bool{"ai_complete": true, "ai_complete_object": true, "ai_count_tokens": true}
+var details = map[string]bool{
+	"ai_complete": true, "ai_complete_object": true, "ai_count_tokens": true, "ai_classify": true, "ai_filter": true,
+	"ai_sentiment": true, "ai_summarize": true, "ai_translate": true, "ai_redact": true, "ai_redact_detect": true,
+	"ai_embed": true, "ai_similarity": true,
+}
 
 // statementKey carries, in a call's bind context, how it finds its
 // Statement.

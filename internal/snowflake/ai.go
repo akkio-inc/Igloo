@@ -291,10 +291,485 @@ func cortexName(nodes []*node, i int) (name string, g int, ok bool) {
 	return "SNOWFLAKE.CORTEX." + nodes[m].word(), g, true
 }
 
+// aiCall builds the call of Igloo's AI function fn with args, and the
+// options object.
+func aiCall(c *call, fn string, args []any, opts []aiOption, fixed map[string]string) *node {
+	parts := []any{fn + "("}
+	for _, a := range args {
+		parts = append(parts, a, ", ")
+	}
+	parts = append(parts, aiOptions(opts, fixed)...)
+	return c.out(append(parts, ")")...)
+}
+
+// legacy are the options of SNOWFLAKE.CORTEX's functions, which fail the
+// statement on an error.
+func legacy() map[string]string { return map[string]string{"on_error": "'fail'"} }
+
+// objectResult marks n as returning an OBJECT (JSON).
+func objectResult(n *node, semi byte) *node {
+	n.json, n.semi = true, semi
+	return n
+}
+
+// aiClassify translates AI_CLASSIFY(input, list_of_categories [,
+// config_object]): {"labels": [...]}.
+func aiClassify(c *call) (*node, error) {
+	args, err := aiArgs(c, "INPUT", "LIST_OF_CATEGORIES", "CONFIG_OBJECT")
+	if err != nil {
+		return nil, err
+	}
+	input, err := required(c, args, "INPUT")
+	if err != nil {
+		return nil, err
+	}
+	cats, err := required(c, args, "LIST_OF_CATEGORIES")
+	if err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	if v, ok := args["CONFIG_OBJECT"]; ok {
+		opts = append(opts, aiOption{"config", v})
+	}
+	suffix := errorOptions(args, &opts)
+	return objectResult(aiCall(c, "ai_classify"+suffix, []any{input, cats}, opts, nil), 'O'), nil
+}
+
+// cortexClassify translates SNOWFLAKE.CORTEX.CLASSIFY_TEXT(input,
+// list_of_categories [, options]): {"label": ...}.
+func cortexClassify(c *call) (*node, error) {
+	if err := c.argc(2, 3); err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	if len(c.args) == 3 {
+		opts = append(opts, aiOption{"config", c.args[2]})
+	}
+	fixed := legacy()
+	fixed["label"] = "true"
+	return objectResult(aiCall(c, "ai_classify", []any{c.arg(0), c.arg(1)}, opts, fixed), 'O'), nil
+}
+
+// aiFilter translates AI_FILTER(predicate), whose argument is text or a
+// PROMPT object: BOOLEAN.
+func aiFilter(c *call) (*node, error) {
+	args, err := aiArgs(c, "PREDICATE", "INPUT")
+	if err != nil {
+		return nil, err
+	}
+	input, ok := args["PREDICATE"]
+	if v, given := args["INPUT"]; given {
+		if ok {
+			return nil, &Error{Code: CodeSyntax, Message: "AI_FILTER takes one argument: the predicate, as text or PROMPT(...)"}
+		}
+		input, ok = v, true
+	}
+	if !ok || len(trim(input)) == 0 {
+		return nil, &Error{Code: CodeSyntax, Message: "AI_FILTER needs the predicate, as text or PROMPT(...)"}
+	}
+	var opts []aiOption
+	suffix := errorOptions(args, &opts)
+	out := aiCall(c, "ai_filter"+suffix, []any{input}, opts, nil)
+	out.json = suffix != ""
+	return out, nil
+}
+
+// aiSentiment translates AI_SENTIMENT(text [, categories]):
+// {"categories": [{"name", "sentiment"}, ...]}.
+func aiSentiment(c *call) (*node, error) {
+	args, err := aiArgs(c, "TEXT", "CATEGORIES")
+	if err != nil {
+		return nil, err
+	}
+	input, err := required(c, args, "TEXT")
+	if err != nil {
+		return nil, err
+	}
+	var cats any = "'[]'"
+	if v, ok := args["CATEGORIES"]; ok {
+		cats = v
+	}
+	var opts []aiOption
+	suffix := errorOptions(args, &opts)
+	return objectResult(aiCall(c, "ai_sentiment"+suffix, []any{input, cats}, opts, nil), 'O'), nil
+}
+
+// aiExtract translates AI_EXTRACT(text, responseFormat): {"error",
+// "response"}.
+func aiExtract(c *call) (*node, error) {
+	args, err := aiArgs(c, "TEXT", "RESPONSEFORMAT", "FILE")
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := args["FILE"]; ok {
+		return nil, unsupported("AI_EXTRACT of a file", "extract from the file's text, as AI_EXTRACT(text => ..., responseFormat => ...)")
+	}
+	input, err := required(c, args, "TEXT")
+	if err != nil {
+		return nil, err
+	}
+	format, err := required(c, args, "RESPONSEFORMAT")
+	if err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	errorOptions(args, &opts) // its errors are in its result already
+	return objectResult(aiCall(c, "ai_extract", []any{input, format}, opts, nil), 'O'), nil
+}
+
+// aiSummarize translates AI_SUMMARIZE(text).
+func aiSummarize(c *call) (*node, error) {
+	args, err := aiArgs(c, "TEXT")
+	if err != nil {
+		return nil, err
+	}
+	input, err := required(c, args, "TEXT")
+	if err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	suffix := errorOptions(args, &opts)
+	out := aiCall(c, "ai_summarize"+suffix, []any{input}, opts, nil)
+	out.json, out.str = suffix != "", suffix == ""
+	return out, nil
+}
+
+// aiTranslate translates AI_TRANSLATE(text, source_language,
+// target_language).
+func aiTranslate(c *call) (*node, error) {
+	args, err := aiArgs(c, "TEXT", "SOURCE_LANGUAGE", "TARGET_LANGUAGE")
+	if err != nil {
+		return nil, err
+	}
+	var parts []any
+	for _, k := range []string{"TEXT", "SOURCE_LANGUAGE", "TARGET_LANGUAGE"} {
+		v, ok := args[k]
+		if !ok {
+			return nil, &Error{Code: CodeSyntax, Message: c.name + " needs " + strings.ToLower(k)}
+		}
+		parts = append(parts, v)
+	}
+	var opts []aiOption
+	suffix := errorOptions(args, &opts)
+	out := aiCall(c, "ai_translate"+suffix, parts, opts, nil)
+	out.json, out.str = suffix != "", suffix == ""
+	return out, nil
+}
+
+// aiRedact translates AI_REDACT(input [, categories] [, mode]): the text
+// redacted, or with mode 'detect' the spans found.
+func aiRedact(c *call) (*node, error) {
+	args, err := aiArgs(c, "INPUT", "CATEGORIES", "MODE")
+	if err != nil {
+		return nil, err
+	}
+	input, err := required(c, args, "INPUT")
+	if err != nil {
+		return nil, err
+	}
+	// AI_REDACT(input, 'detect'): the mode in categories' place.
+	if v, ok := args["CATEGORIES"]; ok && args["MODE"] == nil {
+		if _, isText := literalOf(v); isText {
+			args["MODE"] = v
+			delete(args, "CATEGORIES")
+		}
+	}
+	detect := false
+	if v, ok := args["MODE"]; ok {
+		m, isText := literalOf(v)
+		switch strings.ToLower(m) {
+		case "redact":
+		case "detect":
+			detect = true
+		default:
+			if !isText {
+				return nil, unsupported("AI_REDACT with a mode given by an expression", "give the mode as 'redact' or 'detect'")
+			}
+			return nil, &Error{Code: CodeInvalidValue, Message: "AI_REDACT's mode is 'redact' or 'detect', not " + quoteString(m)}
+		}
+	}
+	var cats any = "'[]'"
+	if v, ok := args["CATEGORIES"]; ok {
+		cats = v
+	}
+	var opts []aiOption
+	suffix := errorOptions(args, &opts)
+	fn := "ai_redact"
+	if detect {
+		fn = "ai_redact_detect"
+	}
+	out := aiCall(c, fn+suffix, []any{input, cats}, opts, nil)
+	if detect || suffix != "" {
+		objectResult(out, 'O')
+	} else {
+		out.str = true
+	}
+	return out, nil
+}
+
+// aiEmbed translates AI_EMBED(model, input): the input's vector, a list of
+// FLOATs.
+func aiEmbed(c *call) (*node, error) {
+	args, err := aiArgs(c, "MODEL", "INPUT")
+	if err != nil {
+		return nil, err
+	}
+	model, err := required(c, args, "MODEL")
+	if err != nil {
+		return nil, err
+	}
+	input, err := required(c, args, "INPUT")
+	if err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	suffix := errorOptions(args, &opts)
+	out := aiCall(c, "ai_embed"+suffix, []any{model, input}, opts, nil)
+	out.json = suffix != ""
+	return out, nil
+}
+
+// cortexEmbed translates SNOWFLAKE.CORTEX.EMBED_TEXT_768 and _1024(model,
+// text): a VECTOR(FLOAT, dims).
+func cortexEmbed(dims string) func(c *call) (*node, error) {
+	return func(c *call) (*node, error) {
+		if err := c.argc(2, 2); err != nil {
+			return nil, err
+		}
+		fixed := legacy()
+		fixed["dimensions"] = dims
+		return c.out("CAST(", aiCall(c, "ai_embed", []any{c.arg(0), c.arg(1)}, nil, fixed), " AS FLOAT["+dims+"])"), nil
+	}
+}
+
+// aiSimilarity translates AI_SIMILARITY(input1, input2 [, config_object]):
+// the cosine similarity of their vectors.
+func aiSimilarity(c *call) (*node, error) {
+	args, err := aiArgs(c, "INPUT1", "INPUT2", "CONFIG_OBJECT")
+	if err != nil {
+		return nil, err
+	}
+	a, err := required(c, args, "INPUT1")
+	if err != nil {
+		return nil, err
+	}
+	b, err := required(c, args, "INPUT2")
+	if err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	if v, ok := args["CONFIG_OBJECT"]; ok {
+		opts = append(opts, aiOption{"config", v})
+	}
+	suffix := errorOptions(args, &opts)
+	out := aiCall(c, "ai_similarity"+suffix, []any{a, b}, opts, nil)
+	out.json, out.num = suffix != "", suffix == ""
+	return out, nil
+}
+
+// cortexSimple translates one of SNOWFLAKE.CORTEX's functions of fixed
+// arguments to fn, which fails the statement on an error.
+func cortexSimple(fn string, n int, semi byte) func(c *call) (*node, error) {
+	return func(c *call) (*node, error) {
+		if err := c.argc(n, n); err != nil {
+			return nil, err
+		}
+		args := make([]any, n)
+		for i := range n {
+			args[i] = c.arg(i)
+		}
+		out := aiCall(c, fn, args, nil, legacy())
+		if semi != 0 {
+			objectResult(out, semi)
+		}
+		return out, nil
+	}
+}
+
+// cortexCountTokens translates SNOWFLAKE.CORTEX.COUNT_TOKENS(model, text):
+// the text's tokens for the model, as AI_COMPLETE would send it.
+func cortexCountTokens(c *call) (*node, error) {
+	if err := c.argc(2, 2); err != nil {
+		return nil, err
+	}
+	out := aiCall(c, "ai_count_tokens", []any{"'ai_complete'", c.arg(0), c.arg(1)}, nil, legacy())
+	out.num = true
+	return out, nil
+}
+
+// aiRewrite marks fn's translations as calling a model provider.
+func aiRewrite(fn func(c *call) (*node, error)) rewrite {
+	return rewrite{fn: func(c *call) (*node, error) {
+		out, err := fn(c)
+		if out != nil {
+			out.ai = true
+		}
+		return out, err
+	}}
+}
+
 // addAIRewrites registers the AI functions' translations.
 func addAIRewrites(add func(rw rewrite, names ...string)) {
-	add(rewrite{fn: aiComplete}, "AI_COMPLETE")
-	add(rewrite{fn: cortexComplete}, "SNOWFLAKE.CORTEX.COMPLETE")
+	add(aiRewrite(aiComplete), "AI_COMPLETE")
+	add(aiRewrite(cortexComplete), "SNOWFLAKE.CORTEX.COMPLETE")
 	add(rewrite{fn: prompt}, "PROMPT")
-	add(rewrite{fn: aiCountTokens}, "AI_COUNT_TOKENS")
+	add(aiRewrite(aiCountTokens), "AI_COUNT_TOKENS")
+	add(aiRewrite(cortexCountTokens), "SNOWFLAKE.CORTEX.COUNT_TOKENS")
+	add(aiRewrite(aiClassify), "AI_CLASSIFY")
+	add(aiRewrite(cortexClassify), "SNOWFLAKE.CORTEX.CLASSIFY_TEXT")
+	add(aiRewrite(aiFilter), "AI_FILTER")
+	add(aiRewrite(aiSentiment), "AI_SENTIMENT")
+	add(aiRewrite(cortexSimple("ai_sentiment_score", 1, 0)), "SNOWFLAKE.CORTEX.SENTIMENT")
+	add(aiRewrite(aiExtract), "AI_EXTRACT")
+	add(aiRewrite(cortexSimple("ai_extract_answer", 2, 'A')), "SNOWFLAKE.CORTEX.EXTRACT_ANSWER")
+	add(aiRewrite(aiSummarize), "AI_SUMMARIZE")
+	add(aiRewrite(cortexSimple("ai_summarize", 1, 0)), "SNOWFLAKE.CORTEX.SUMMARIZE")
+	add(aiRewrite(aiTranslate), "AI_TRANSLATE")
+	add(aiRewrite(cortexSimple("ai_translate", 3, 0)), "SNOWFLAKE.CORTEX.TRANSLATE")
+	add(aiRewrite(aiRedact), "AI_REDACT")
+	add(aiRewrite(aiEmbed), "AI_EMBED")
+	add(aiRewrite(cortexEmbed("768")), "SNOWFLAKE.CORTEX.EMBED_TEXT_768")
+	add(aiRewrite(cortexEmbed("1024")), "SNOWFLAKE.CORTEX.EMBED_TEXT_1024")
+	add(aiRewrite(aiSimilarity), "AI_SIMILARITY")
+}
+
+// --- Plain predicates first -------------------------------------------------
+
+// guardedClauses are the clauses whose AI predicates guardAI guards, and
+// the words that end each.
+var guardedClauses = map[string]map[string]bool{
+	"WHERE":   clauseEnds,
+	"HAVING":  clauseEnds,
+	"QUALIFY": clauseEnds,
+	"ON":      joinClauseEnds,
+}
+
+var clauseEnds = map[string]bool{
+	"GROUP": true, "HAVING": true, "QUALIFY": true, "WINDOW": true, "ORDER": true, "LIMIT": true, "OFFSET": true,
+	"FETCH": true, "UNION": true, "EXCEPT": true, "MINUS": true, "INTERSECT": true, "RETURNING": true,
+}
+
+var joinClauseEnds = func() map[string]bool {
+	m := map[string]bool{"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true, "CROSS": true,
+		"NATURAL": true, "ASOF": true, "POSITIONAL": true, "LATERAL": true, "WHERE": true, "WHEN": true, "USING": true}
+	for k := range clauseEnds {
+		m[k] = true
+	}
+	return m
+}()
+
+// volatileWords are functions whose value changes with each call, which
+// guardAI does not repeat.
+var volatileWords = []string{"random", "uniform", "uuid", "nextval", "setseed", "normal(", "seq1", "seq2", "seq4", "seq8"}
+
+// hasAI reports whether nodes call a model provider.
+func hasAI(nodes []*node) bool {
+	for _, n := range nodes {
+		if n.ai || hasAI(n.kids) || n.v != nil && n.v.base != nil && hasAI([]*node{n.v.base}) {
+			return true
+		}
+	}
+	return false
+}
+
+// guardAI makes the plain predicates of a WHERE, HAVING, QUALIFY or ON
+// clause that is a conjunction run before its AI predicates. DuckDB orders
+// a filter's conjuncts by its own estimate of their cost, in which a call
+// of an AI function is cheap, and so would call the provider for every row
+// the plain predicates would have dropped:
+//
+//	WHERE a AND AI_FILTER(x) AND b
+//	  -> WHERE a AND b AND CASE WHEN a AND b THEN ai_filter(x, ...) ELSE FALSE END
+//
+// which a filter keeps the same rows of, NULL being FALSE there.
+func (t *translator) guardAI(nodes []*node) ([]*node, error) {
+	if !hasAI(nodes) {
+		return nodes, nil
+	}
+	for i := 0; i < len(nodes); i++ {
+		ends, ok := guardedClauses[nodes[i].word()]
+		if !ok {
+			continue
+		}
+		start := i + 1
+		end := clauseEnd(nodes, start, ends)
+		if guarded, ok := guard(nodes[start:end]); ok {
+			nodes = replace(nodes, start, end, guarded...)
+			end = start + len(guarded)
+		}
+		i = end - 1
+	}
+	return nodes, nil
+}
+
+// clauseEnd returns the index of the word that ends the clause starting at
+// nodes[start], or len(nodes).
+func clauseEnd(nodes []*node, start int, ends map[string]bool) int {
+	depth := 0
+	for k := start; k < len(nodes); k++ {
+		switch w := nodes[k].word(); {
+		case w == "CASE":
+			depth++
+		case w == "END" && depth > 0:
+			depth--
+		case depth == 0 && (ends[w] || nodes[k].isOp(",") || nodes[k].isOp(";")):
+			return k
+		}
+	}
+	return len(nodes)
+}
+
+// guard rewrites a clause's condition so its plain conjuncts run first;
+// ok is false where it is not a conjunction of plain and AI predicates.
+func guard(cond []*node) ([]*node, bool) {
+	var conjuncts [][]*node
+	depth, between, from := 0, false, 0
+	for k, n := range cond {
+		switch w := n.word(); {
+		case w == "CASE":
+			depth++
+		case w == "END" && depth > 0:
+			depth--
+		case depth > 0:
+		case w == "OR":
+			return nil, false
+		case w == "BETWEEN":
+			between = true
+		case w == "AND" && between:
+			between = false
+		case w == "AND":
+			conjuncts = append(conjuncts, trim(cond[from:k]))
+			from = k + 1
+		}
+	}
+	conjuncts = append(conjuncts, trim(cond[from:]))
+	var plain, ai []string
+	for _, c := range conjuncts {
+		if len(c) == 0 {
+			return nil, false
+		}
+		if hasAI(c) {
+			ai = append(ai, "("+render(c)+")")
+		} else {
+			plain = append(plain, render(c))
+		}
+	}
+	if len(plain) == 0 || len(ai) == 0 {
+		return nil, false
+	}
+	all := strings.ToLower(strings.Join(plain, " "))
+	for _, v := range volatileWords {
+		if strings.Contains(all, v) {
+			return nil, false
+		}
+	}
+	tests := make([]string, len(plain))
+	for k, p := range plain {
+		tests[k] = "(" + p + ")"
+	}
+	text := " " + strings.Join(plain, " AND ") + " AND CASE WHEN " + strings.Join(tests, " AND ") + " THEN " +
+		strings.Join(ai, " AND ") + " ELSE FALSE END "
+	out := raw(text)
+	out.ai = true
+	return []*node{out}, true
 }

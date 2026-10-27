@@ -269,6 +269,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   requests purge the cached answers derived from their tables, and
   complete only once none remain (see
   [AI functions](docs/ai-functions.md)).
+- The task functions: `AI_CLASSIFY` (`{"labels": [...]}`, single or
+  multi-label), `AI_FILTER` (BOOLEAN), `AI_SENTIMENT`, `AI_EXTRACT`,
+  `AI_SUMMARIZE`, `AI_TRANSLATE`, `AI_REDACT` (redact or detect, Snowflake's
+  13 categories), `AI_EMBED` (vectors for `VECTOR` columns, 64 texts a
+  request) and `AI_SIMILARITY`, with Snowflake's result shapes and error
+  semantics, and `SNOWFLAKE.CORTEX`'s `CLASSIFY_TEXT`, `SENTIMENT`,
+  `EXTRACT_ANSWER`, `SUMMARIZE`, `TRANSLATE`, `EMBED_TEXT_768`,
+  `EMBED_TEXT_1024` and `COUNT_TOKENS`. The Snowflake dialect's
+  translation tests a filter's plain conditions before its AI predicates,
+  which DuckDB would otherwise call for every row.
 
 ### Loading and scheduling
 

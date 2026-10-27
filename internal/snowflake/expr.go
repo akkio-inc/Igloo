@@ -25,7 +25,7 @@ func (t *translator) seq(nodes []*node, top bool) ([]*node, error) {
 	}
 	for _, pass := range []func([]*node) ([]*node, error){
 		t.clauses, t.literals, t.calls, t.tableFunctions, t.sample, t.values, t.paths, t.casts, t.variantModes,
-		t.operators, t.implicitCasts, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere,
+		t.operators, t.implicitCasts, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere, t.guardAI,
 	} {
 		if nodes, err = pass(nodes); err != nil {
 			return nil, err

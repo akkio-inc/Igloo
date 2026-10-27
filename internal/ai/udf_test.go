@@ -141,3 +141,49 @@ func TestGuardedPredicates(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskFunctionsInDuckDB runs the task functions as DuckDB calls them,
+// with their result types: BOOLEAN, JSON, FLOAT[] and DOUBLE.
+func TestTaskFunctionsInDuckDB(t *testing.T) {
+	t.Parallel()
+	var embeds atomic.Int64
+	tasks, vectors := tasksFake(t), embedFake(t, &embeds)
+	f := newFake(t, func(r fakeRequest) (int, any) {
+		if strings.HasSuffix(r.Path, "/embeddings") {
+			return vectors.answer(r)
+		}
+		return tasks.answer(r)
+	})
+	rt := testRuntime(t, f, func(in *Integration) {
+		in.Models["e5-base-v2"] = "fake-embed"
+		in.EmbeddingModel = "fake-embed"
+	})
+	hook := &fixedHook{}
+	db := duckWithAI(t, hook)
+	hook.s.Store(begin(t, rt))
+	ctx := context.Background()
+
+	var kept int64
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM range(1000) t(i) WHERE i % 250 = 0 AND
+		CASE WHEN i % 250 = 0 THEN ai_filter('asks for a refund ' || (i % 500), '{}') ELSE false END`).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 4 || f.calls.Load() != 2 {
+		t.Errorf("ai_filter kept %d rows with %d requests", kept, f.calls.Load())
+	}
+
+	var labels, details, vector string
+	var similarity, score float64
+	err := db.QueryRowContext(ctx, `SELECT
+		json_extract_string(ai_classify('my flight', '["travel", "cooking"]', '{}'), '$.labels[0]'),
+		CAST(ai_filter_details('says thanks', '{}') AS VARCHAR),
+		CAST(ai_embed('e5-base-v2', 'bab', '{}') AS VARCHAR),
+		ai_similarity('aa', 'aa', '{}'),
+		ai_sentiment_score('awful', '{"on_error": "fail"}')`).Scan(&labels, &details, &vector, &similarity, &score)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labels != "travel" || details != `{"error":null,"value":false}` || vector != "[3.0, 1.0]" || similarity < 0.999999 || score != -1 {
+		t.Errorf("classify %q, filter %q, embed %q, similarity %v, score %v", labels, details, vector, similarity, score)
+	}
+}

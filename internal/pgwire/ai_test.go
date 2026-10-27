@@ -385,6 +385,86 @@ func TestAICacheTagsIcebergTables(t *testing.T) {
 	}
 }
 
+// TestAITaskFunctionsEndToEnd runs the task functions in Snowflake's
+// dialect: AI_FILTER after the plain predicates beside it, AI_CLASSIFY's
+// object, vectors from AI_EMBED kept in an Iceberg table, and a Cortex
+// function's error failing its statement.
+func TestAITaskFunctionsEndToEnd(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t, withAI)
+	f := newFakeModels(t)
+	f.answer = func(user, system string, body map[string]any) (int, any) {
+		if inputs, ok := body["input"].([]any); ok {
+			var data []any
+			for i, in := range inputs {
+				s, _ := in.(string)
+				v := []float64{0, 1} // [about refunds, about anything else]
+				if strings.Contains(s, "refund") {
+					v = []float64{1, 0}
+				}
+				data = append(data, map[string]any{"index": i, "embedding": v})
+			}
+			return 200, map[string]any{"data": data, "usage": map[string]any{"prompt_tokens": len(inputs)}}
+		}
+		switch {
+		case strings.HasPrefix(system, "Decide whether"):
+			return 200, openAIText(`{"value": ` + map[bool]string{true: "true", false: "false"}[strings.Contains(user, "refund")] + `}`)
+		case strings.HasPrefix(system, "Classify"):
+			if strings.Contains(user, "parcel") {
+				return 200, openAIText(`{"labels": ["shipping"]}`)
+			}
+			return 200, openAIText(`{"labels": ["billing"]}`)
+		case strings.Contains(system, "the sentiment") && strings.Contains(user, "broken"):
+			return 400, map[string]any{"error": map[string]any{"message": "this text was refused"}}
+		case strings.HasPrefix(system, "Score the sentiment"):
+			return 200, openAIText(`{"score": 0.5}`)
+		}
+		return 200, openAIText("echo: " + user)
+	}
+	mustExec(t, cs.admin, `CREATE AI INTEGRATION models PROVIDER = openai BASE_URL = '`+f.srv.URL+`/v1' API_KEY = 'sk-test-not-a-real-key'
+		MODELS = ('e5-base-v2' = 'fake-embed') DEFAULT_MODEL = 'fake-1' EMBEDDING_MODEL = 'fake-embed' PRICES = ('fake-1' = (3, 15))`)
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.tickets (id INTEGER, body VARCHAR, stars INTEGER)")
+	mustExec(t, cs.admin, `INSERT INTO lake.public.tickets VALUES (1, 'please refund me', 1), (2, 'where is my parcel', 2),
+		(3, 'please refund me', 5), (4, 'refund the extra fee', 4), (5, 'great service', 1), (6, 'broken kettle', 1)`)
+	sf := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+
+	// Only the rows of one or two stars are sent: four, of three distinct
+	// texts.
+	got := texts(t, sf, `SELECT id FROM lake.public.tickets WHERE AI_FILTER(PROMPT('Does this ask for money back? {0}', body)) AND stars <= 2 ORDER BY id`)
+	if strings.Join(got, ",") != "1" {
+		t.Errorf("AI_FILTER kept %v", got)
+	}
+	if n := f.calls.Load(); n != 4 {
+		t.Errorf("AI_FILTER sent %d requests, want 4: the plain predicate should run first", n)
+	}
+
+	got = texts(t, sf, `SELECT id, AI_CLASSIFY(body, ['billing', 'shipping']):labels[0]::VARCHAR FROM lake.public.tickets WHERE id <= 2 ORDER BY id`)
+	if strings.Join(got, ",") != "1|billing,2|shipping" {
+		t.Errorf("AI_CLASSIFY: %v", got)
+	}
+
+	// Vectors kept in a table, compared with another.
+	mustExec(t, sf, `CREATE TABLE lake.public.ticket_vectors AS SELECT id, AI_EMBED('e5-base-v2', body) AS v FROM lake.public.tickets`)
+	got = texts(t, sf, `SELECT id, VECTOR_COSINE_SIMILARITY(v, AI_EMBED('e5-base-v2', 'refund')) > 0.99 FROM lake.public.ticket_vectors
+		WHERE id IN (1, 5) ORDER BY id`)
+	if strings.Join(got, ",") != "1|true,5|false" {
+		t.Errorf("vectors: %v", got)
+	}
+	got = texts(t, sf, `SELECT round(AI_SIMILARITY(body, body), 6) FROM lake.public.tickets WHERE id = 2`)
+	if strings.Join(got, ",") != "1" {
+		t.Errorf("AI_SIMILARITY: %v", got)
+	}
+
+	// SNOWFLAKE.CORTEX.SENTIMENT fails the statement on a row's error, where
+	// AI_ functions give the row NULL.
+	expectCode(t, sf, `SELECT SNOWFLAKE.CORTEX.SENTIMENT(body) FROM lake.public.tickets WHERE stars = 1`, "58030", "refused")
+	got = texts(t, sf, `SELECT id, AI_SENTIMENT(body) IS NULL FROM lake.public.tickets WHERE id = 6`)
+	if strings.Join(got, ",") != "6|true" {
+		t.Errorf("AI_SENTIMENT of a refused text: %v", got)
+	}
+}
+
 // lastAIQuery is the newest history record of user that called an AI
 // function and whose text has part.
 func lastAIQuery(t *testing.T, cs *catalogServer, user, part string) audit.Query {

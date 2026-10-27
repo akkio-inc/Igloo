@@ -1,8 +1,10 @@
 # AI functions
 
 Igloo runs Snowflake's AI functions (Cortex AI SQL) in SQL, with your own
-model providers' keys: `AI_COMPLETE`, `SNOWFLAKE.CORTEX.COMPLETE`, `PROMPT`
-and `AI_COUNT_TOKENS`. They call OpenAI or any server that speaks its API
+model providers' keys: `AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`,
+`AI_SENTIMENT`, `AI_EXTRACT`, `AI_SUMMARIZE`, `AI_TRANSLATE`, `AI_REDACT`,
+`AI_EMBED`, `AI_SIMILARITY`, `PROMPT`, `AI_COUNT_TOKENS`, and
+`SNOWFLAKE.CORTEX`'s older forms of them. They call OpenAI or any server that speaks its API
 (Azure OpenAI, vLLM, llama.cpp, Ollama, OpenRouter), Anthropic, Gemini,
 Vertex AI, Amazon Bedrock, or a decision endpoint, through an **AI
 integration** an admin creates. Igloo never resells inference: each call is
@@ -79,7 +81,20 @@ default model, the session chooses with `SET ai_integration = 'name'`.
 | `AI_COMPLETE(model, prompt [, model_parameters [, response_format [, show_details]]])` | `ai_complete(model, prompt, options)`; with `response_format` or `show_details`, `ai_complete_object` | Text; with `response_format`, an OBJECT of its schema; with `show_details => TRUE`, `{"choices": [{"messages": ...}], "created": ..., "model": ..., "usage": {"completion_tokens", "prompt_tokens", "total_tokens"}}` (`structured_output` in place of `choices` with a `response_format`) |
 | `SNOWFLAKE.CORTEX.COMPLETE(model, prompt)` and `(model, [{'role': ..., 'content': ...}, ...], options)` | `ai_complete`, `ai_complete_object` | Text; with a conversation, a string holding the answer's JSON, as Snowflake's |
 | `PROMPT('... {0} ... {1}', arg0, arg1, ...)` | `json_object('template', ..., 'args', json_array(...))` | An OBJECT `{"template", "args"}`, which the AI functions read as the template with the arguments in place, as text (NULL as empty) |
-| `AI_COUNT_TOKENS(function, [model,] input, ...)` | `ai_count_tokens(function, model, input, options)` | The input's tokens for the model that would serve `function`: Anthropic and Gemini count them, at no cost; for other providers Igloo estimates them, about four bytes a token |
+| `AI_COUNT_TOKENS(function, [model,] input, ...)`, `SNOWFLAKE.CORTEX.COUNT_TOKENS(model, input)` | `ai_count_tokens(function, model, input, options)` | The input's tokens for the model that would serve `function`: Anthropic and Gemini count them, at no cost; for other providers Igloo estimates them, about four bytes a token |
+| `AI_CLASSIFY(input, categories [, config_object])` | `ai_classify` | `{"labels": [...]}`: the one category that fits best, or with `{'output_mode': 'multi'}` every one that applies. Categories are labels or `{'label', 'description'}` objects; the config takes `task_description`, `examples` (`[{'input', 'labels', 'explanation'}]`) and `model` |
+| `SNOWFLAKE.CORTEX.CLASSIFY_TEXT(input, categories [, options])` | `ai_classify` | `{"label": ...}` |
+| `AI_FILTER(predicate)`, the predicate as text or `PROMPT(...)` | `ai_filter` | BOOLEAN: whether the statement is true, or the question's answer yes. See [plain predicates first](#plain-predicates-first) |
+| `AI_SENTIMENT(text [, categories])` | `ai_sentiment` | `{"categories": [{"name": "overall", "sentiment": ...}, {"name": category, ...}, ...]}`, each `positive`, `negative`, `neutral`, `mixed` or `unknown` (the text does not speak of it); at most 10 categories of 30 characters |
+| `SNOWFLAKE.CORTEX.SENTIMENT(text)` | `ai_sentiment_score` | A FLOAT from -1 to 1 |
+| `AI_EXTRACT(text, responseFormat)` | `ai_extract` | `{"error": null, "response": {...}}`, or `{"error": "...", "response": null}` for a row the model could not answer. `responseFormat` is `{'key': 'question', ...}`, `['question', ...]`, `[['key', 'question'], ...]` or `{'schema': {...}}`, a JSON schema of an object |
+| `SNOWFLAKE.CORTEX.EXTRACT_ANSWER(text, question)` | `ai_extract_answer` | `[{"answer": ..., "score": null}]`, or `[]` where the text does not answer it |
+| `AI_SUMMARIZE(text)`, `SNOWFLAKE.CORTEX.SUMMARIZE(text)` | `ai_summarize` | Text: a summary of a few sentences, or text of at most 110 characters as it is, with no call |
+| `AI_TRANSLATE(text, source_language, target_language)`, `SNOWFLAKE.CORTEX.TRANSLATE(...)` | `ai_translate` | Text. Languages are Snowflake's codes (`en`, `de`, `ja`, ...); `''` as the source is the text's own |
+| `AI_REDACT(input [, categories] [, mode])` | `ai_redact`, `ai_redact_detect` | Text with each piece of personal information replaced by its category, as `[NAME]`; with mode `'detect'`, `{"spans": [{"category", "start", "end", "text"}]}`, offsets in characters. Categories are Snowflake's 13: `NAME`, `EMAIL`, `PHONE_NUMBER`, `DATE_OF_BIRTH`, `GENDER`, `AGE`, `ADDRESS`, `NATIONAL_ID`, `PASSPORT`, `TAX_IDENTIFIER`, `PAYMENT_CARD_DATA`, `DRIVERS_LICENSE`, `IP_ADDRESS` |
+| `AI_EMBED(model, input)` | `ai_embed` | The input's vector, a list of FLOATs, which `VECTOR_COSINE_SIMILARITY` and the other vector functions take and a `VECTOR` column stores |
+| `SNOWFLAKE.CORTEX.EMBED_TEXT_768(model, text)`, `EMBED_TEXT_1024` | `ai_embed` | A `VECTOR(FLOAT, 768)` or `(FLOAT, 1024)`; a model whose vectors have other dimensions fails the statement |
+| `AI_SIMILARITY(input1, input2 [, config_object])` | `ai_similarity` | The cosine similarity of the two inputs' vectors, from the config's `model` or the integration's `EMBEDDING_MODEL` |
 
 Arguments are by position or by name (`model => ...`), as in Snowflake.
 `model_parameters` takes `temperature`, `top_p` and `max_tokens` (4,096 by
@@ -92,14 +107,50 @@ reading the cache, and keeps the new answer.
 own input the provider refuses or answers with something unreadable gets
 NULL, and `return_error_details => TRUE` returns `{"value": ..., "error":
 ...}` instead; the statement then sends a NOTICE saying how many rows did.
-`SNOWFLAKE.CORTEX.COMPLETE` fails the statement instead, as Snowflake's
-does. A failure that is not the row's fails the statement with the
+`AI_EXTRACT` puts a row's error in its own `error` field. `AI_REDACT` and
+`SNOWFLAKE.CORTEX`'s functions fail the statement instead, as Snowflake's
+do. A failure that is not the row's fails the statement with the
 integration's name and the provider's message, its keys scrubbed: a key the
 provider refuses (401, 403), a model or endpoint it does not have (404), a
 spend limit it enforces, or a provider that does not answer: requests
 refused for their rate (429, with `retry-after` honored) or failing on the
 provider's side (5xx, 529) or timing out are sent again, five times in all
 over about 8 seconds plus what `retry-after` asks, before they fail it.
+
+**How the task functions ask.** `AI_CLASSIFY`, `AI_FILTER`, `AI_SENTIMENT`,
+`AI_EXTRACT`, `AI_SUMMARIZE`, `AI_TRANSLATE` and `AI_REDACT` ask the
+integration's `DEFAULT_MODEL` (or the `model` their config names), with
+Igloo's instructions for the function as the system prompt and the row's
+text as the user's message, and ask for JSON of a schema where the answer
+has a shape (OpenAI enforces it; Gemini answers JSON; Anthropic and Bedrock
+are given the schema in the instructions). The instructions are the same for every row,
+which providers' prompt caches bill for less, and are versioned in the
+cache's key. `AI_CLASSIFY`'s categories, like Snowflake's, are sent with
+every row. `AI_EMBED` and `AI_SIMILARITY` send up to 64 distinct texts a
+request, and share what the cache keeps of each text's vector.
+
+## Plain predicates first
+
+DuckDB orders a filter's conditions by its own estimate of their cost, in
+which a call of an AI function is cheap, so it would call the provider for
+rows the plain conditions beside it then drop. Igloo's translation of a
+`WHERE`, `HAVING`, `QUALIFY` or `ON` that is a conjunction tests the plain
+conditions first:
+
+```sql
+SELECT ticket_id FROM demo.tickets
+WHERE AI_FILTER(PROMPT('Does this ask for a refund? {0}', body)) AND created_at > '2026-10-01';
+-- runs as
+--   WHERE created_at > '2026-10-01'
+--     AND CASE WHEN (created_at > '2026-10-01') THEN (ai_filter(...)) ELSE FALSE END
+```
+
+which keeps the same rows. A clause with `OR` between an AI predicate and
+others, or whose plain conditions call `RANDOM()` or the like, stays as it
+is written. In DuckDB's own dialect, write the `CASE` yourself.
+`EXPLAIN` counts `AI_FILTER` as keeping every row the cache does not
+answer, so that the functions after it are counted for every row it might
+keep.
 
 ## Caps
 
@@ -194,3 +245,11 @@ Arrow Flight SQL they fail (SQLSTATE `0A000`).
 - `AI_COUNT_TOKENS` estimates tokens for providers that cannot count them.
 - An Iceberg table's `VECTOR` column is a list (see [Snowflake
   SQL](snowflake-sql.md#types)).
+- The task functions' answers are your models' and Igloo's instructions',
+  not Snowflake's: the same shapes, not always the same labels or words.
+  `AI_EXTRACT` gives no extraction scores, nor `EXTRACT_ANSWER` its
+  `score`. Vectors from `AI_EMBED` are your embedding model's, which are
+  not comparable with vectors Snowflake's models made.
+- Providers without embeddings (Anthropic, and Bedrock models other than
+  Amazon Titan's and Cohere's) fail `AI_EMBED` and `AI_SIMILARITY` with
+  SQLSTATE `22023`.
