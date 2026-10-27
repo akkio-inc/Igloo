@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -524,6 +525,39 @@ func TestAIDecisionModels(t *testing.T) {
 		FROM lake.public.tickets WHERE id = 3`)
 	if strings.Join(got, ",") != "0.3" {
 		t.Errorf("snowflake-decision: %v", got)
+	}
+}
+
+// TestAIAggEndToEnd: AI_AGG answers a task over each group's values, and
+// AI_SUMMARIZE_AGG summarizes them.
+func TestAIAggEndToEnd(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t, withAI)
+	f := newFakeModels(t)
+	f.answer = func(user, system string, _ map[string]any) (int, any) {
+		n := strings.Count(user, "\n---\n") + 1
+		return 200, openAIText(fmt.Sprintf("%d values: %s", n, strings.ReplaceAll(user, "\n---\n", ", ")))
+	}
+	createFakeIntegration(t, cs.admin, f)
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.notes (region VARCHAR, note VARCHAR)")
+	mustExec(t, cs.admin, `INSERT INTO lake.public.notes VALUES ('emea', 'late parcel'), ('emea', 'broken lid'), ('emea', NULL),
+		('apac', 'great tea'), ('emea', 'late parcel')`)
+	sf := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	got := texts(t, sf, `SELECT region, AI_AGG(note, 'What do they complain about?') FROM lake.public.notes GROUP BY region ORDER BY region`)
+	want := []string{"apac|1 values: great tea", "emea|3 values: broken lid, late parcel, late parcel"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("AI_AGG:\n got %q\nwant %q", got, want)
+	}
+	got = texts(t, sf, `SELECT AI_SUMMARIZE_AGG(DISTINCT note) FROM lake.public.notes WHERE region = 'emea'`)
+	if strings.Join(got, ",") != "2 values: broken lid, late parcel" {
+		t.Errorf("AI_SUMMARIZE_AGG: %v", got)
+	}
+	f.mu.Lock()
+	last := f.systems[len(f.systems)-1]
+	f.mu.Unlock()
+	if !strings.Contains(last, "The task: Summarize the records") {
+		t.Errorf("system prompt %q", last)
 	}
 }
 

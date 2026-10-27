@@ -618,6 +618,35 @@ func aiDecide(c *call) (*node, error) {
 	return objectResult(aiCall(c, "ai_decide", []any{state, c.out("CAST(", questions, " AS VARCHAR)")}, opts, nil), 'O'), nil
 }
 
+// aiAgg translates AI_AGG(expr, task) and, with summarize,
+// AI_SUMMARIZE_AGG(expr): an aggregate of the group's values as a list,
+// which ai_agg answers the task over.
+func aiAgg(summarize bool) func(c *call) (*node, error) {
+	return func(c *call) (*node, error) {
+		if c.over != nil {
+			return nil, unsupported(c.name+" as a window function", "aggregate with GROUP BY")
+		}
+		n := 2
+		if summarize {
+			n = 1
+		}
+		if err := c.argc(n, n); err != nil {
+			return nil, err
+		}
+		values := c.out("list_filter(list(", distinctPrefix(c), "CAST(", c.arg(0), " AS VARCHAR)), lambda v: v IS NOT NULL)")
+		task := any("''")
+		var fixed map[string]string
+		if summarize {
+			fixed = map[string]string{"summarize": "true"}
+		} else {
+			task = c.arg(1)
+		}
+		out := aiCall(c, "ai_agg", []any{values, task}, nil, fixed)
+		out.str = true
+		return out, nil
+	}
+}
+
 // aiRewrite marks fn's translations as calling a model provider.
 func aiRewrite(fn func(c *call) (*node, error)) rewrite {
 	return rewrite{fn: func(c *call) (*node, error) {
@@ -653,6 +682,11 @@ func addAIRewrites(add func(rw rewrite, names ...string)) {
 	add(aiRewrite(cortexEmbed("1024")), "SNOWFLAKE.CORTEX.EMBED_TEXT_1024")
 	add(aiRewrite(aiSimilarity), "AI_SIMILARITY")
 	add(aiRewrite(aiDecide), "AI_DECIDE")
+	for name, summarize := range map[string]bool{"AI_AGG": false, "AI_SUMMARIZE_AGG": true} {
+		rw := aiRewrite(aiAgg(summarize))
+		rw.over = true
+		add(rw, name)
+	}
 }
 
 // --- Plain predicates first -------------------------------------------------

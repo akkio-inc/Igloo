@@ -45,6 +45,8 @@ func TestTranslateAI(t *testing.T) {
 		{`SELECT AI_REDACT(x, ['NAME'], 'mask') FROM t`, CodeInvalidValue, "'redact' or 'detect'"},
 		{`SELECT AI_TRANSLATE(x, 'en') FROM t`, CodeSyntax, "needs target_language"},
 		{`SELECT SNOWFLAKE.CORTEX.EMBED_TEXT_768(x) FROM t`, CodeSyntax, "takes 2 arguments"},
+		{`SELECT AI_AGG(x, 'task') OVER (PARTITION BY y) FROM t`, CodeUnsupported, "AI_AGG as a window function"},
+		{`SELECT AI_AGG(x) FROM t`, CodeSyntax, "takes 2 arguments"},
 	} {
 		_, err := Translate(c.in, Options{})
 		e, ok := err.(*Error)
@@ -89,6 +91,10 @@ func TestTranslateAITasks(t *testing.T) {
 		{`SELECT AI_SIMILARITY(review, 'refund') AS v FROM reviews`, `SELECT ai_similarity(review, 'refund', '{}') AS "V" FROM reviews`},
 		{`SELECT SNOWFLAKE.CORTEX.COUNT_TOKENS('m', review) AS n FROM reviews`,
 			`SELECT ai_count_tokens('ai_complete', 'm', review, ` + fail + `) AS "N" FROM reviews`},
+		{`SELECT region, AI_AGG(review, 'What do customers complain about?') AS a FROM reviews GROUP BY region`,
+			`SELECT region, ai_agg(list_filter(list(CAST(review AS VARCHAR)), lambda v: v IS NOT NULL), 'What do customers complain about?', '{}') AS "A" FROM reviews GROUP BY region`},
+		{`SELECT AI_SUMMARIZE_AGG(DISTINCT review) AS a FROM reviews`,
+			`SELECT ai_agg(list_filter(list(DISTINCT CAST(review AS VARCHAR)), lambda v: v IS NOT NULL), '', CAST(json_object('summarize', true) AS VARCHAR)) AS "A" FROM reviews`},
 		{`SELECT AI_DECIDE(review, {'refund': {'type': 'noul', 'instructions': 'Does it ask for a refund?'}}):response:answers:refund:probability::FLOAT AS p FROM reviews`,
 			`SELECT CAST(json_extract_string(ai_decide(review, CAST(to_json(map_from_entries(`},
 	} {

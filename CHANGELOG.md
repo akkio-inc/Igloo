@@ -285,6 +285,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   session's `ai_decision_threshold`; `AI_DECIDE(state, questions)` returns
   Databricks' `ai_decide` shape, and `AI_COMPLETE` with a model mapped to
   it Snowflake's `snowflake-decision` shape.
+- `AI_AGG(expr, task)` and `AI_SUMMARIZE_AGG(expr)` answer a task over a
+  group's values however many there are: chunks of about 16,000 tokens,
+  each answered with an intermediate result, combined until one request
+  gives the answer, each request cached by its chunk.
 
 ### Loading and scheduling
 

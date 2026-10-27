@@ -3,9 +3,9 @@
 Igloo runs Snowflake's AI functions (Cortex AI SQL) in SQL, with your own
 model providers' keys: `AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`,
 `AI_SENTIMENT`, `AI_EXTRACT`, `AI_SUMMARIZE`, `AI_TRANSLATE`, `AI_REDACT`,
-`AI_EMBED`, `AI_SIMILARITY`, `PROMPT`, `AI_COUNT_TOKENS`,
-`SNOWFLAKE.CORTEX`'s older forms of them, and Databricks' `AI_DECIDE`.
-They call OpenAI or any server that speaks its API
+`AI_EMBED`, `AI_SIMILARITY`, `AI_AGG`, `AI_SUMMARIZE_AGG`, `PROMPT`,
+`AI_COUNT_TOKENS`, `SNOWFLAKE.CORTEX`'s older forms of them, and
+Databricks' `AI_DECIDE`. They call OpenAI or any server that speaks its API
 (Azure OpenAI, vLLM, llama.cpp, Ollama, OpenRouter), Anthropic, Gemini,
 Vertex AI, Amazon Bedrock, or a decision endpoint, through an **AI
 integration** an admin creates. Igloo never resells inference: each call is
@@ -96,6 +96,7 @@ default model, the session chooses with `SET ai_integration = 'name'`.
 | `AI_EMBED(model, input)` | `ai_embed` | The input's vector, a list of FLOATs, which `VECTOR_COSINE_SIMILARITY` and the other vector functions take and a `VECTOR` column stores |
 | `SNOWFLAKE.CORTEX.EMBED_TEXT_768(model, text)`, `EMBED_TEXT_1024` | `ai_embed` | A `VECTOR(FLOAT, 768)` or `(FLOAT, 1024)`; a model whose vectors have other dimensions fails the statement |
 | `AI_SIMILARITY(input1, input2 [, config_object])` | `ai_similarity` | The cosine similarity of the two inputs' vectors, from the config's `model` or the integration's `EMBEDDING_MODEL` |
+| `AI_AGG(expr, task)`, `AI_SUMMARIZE_AGG(expr)` | `ai_agg(list(...), task, options)` | Aggregates: the answer to the task, or a summary, over each group's values, however many; NULL for a group of none. See [AI_AGG](#ai_agg) |
 | `AI_DECIDE(state, questions)`, as Databricks' `ai_decide` | `ai_decide(state, questions, options)` | `{"response": {"answers": {...}}, "metadata": {"version": "1.0"}, "error_message": null}`; see [decision models](#decision-models) |
 
 Arguments are by position or by name (`model => ...`), as in Snowflake.
@@ -109,9 +110,9 @@ reading the cache, and keeps the new answer.
 own input the provider refuses or answers with something unreadable gets
 NULL, and `return_error_details => TRUE` returns `{"value": ..., "error":
 ...}` instead; the statement then sends a NOTICE saying how many rows did.
-`AI_EXTRACT` puts a row's error in its own `error` field. `AI_REDACT` and
-`SNOWFLAKE.CORTEX`'s functions fail the statement instead, as Snowflake's
-do. A failure that is not the row's fails the statement with the
+`AI_EXTRACT` puts a row's error in its own `error` field. `AI_REDACT`,
+`AI_AGG` and `SNOWFLAKE.CORTEX`'s functions fail the statement instead, as
+Snowflake's do. A failure that is not the row's fails the statement with the
 integration's name and the provider's message, its keys scrubbed: a key the
 provider refuses (401, 403), a model or endpoint it does not have (404), a
 spend limit it enforces, or a provider that does not answer: requests
@@ -125,11 +126,32 @@ integration's `DEFAULT_MODEL` (or the `model` their config names), with
 Igloo's instructions for the function as the system prompt and the row's
 text as the user's message, and ask for JSON of a schema where the answer
 has a shape (OpenAI enforces it; Gemini answers JSON; Anthropic and Bedrock
-are given the schema in the instructions). The instructions are the same for every row,
-which providers' prompt caches bill for less, and are versioned in the
-cache's key. `AI_CLASSIFY`'s categories, like Snowflake's, are sent with
-every row. `AI_EMBED` and `AI_SIMILARITY` send up to 64 distinct texts a
-request, and share what the cache keeps of each text's vector.
+are given the schema in the instructions). The instructions are the same
+for every row, which providers' prompt caches bill for less, and are
+versioned in the cache's key. `AI_CLASSIFY`'s categories, like Snowflake's,
+are sent with every row. `AI_EMBED` and `AI_SIMILARITY` send up to 64
+distinct texts per request, and share what the cache keeps of each text's
+vector.
+
+## AI_AGG
+
+`AI_AGG(expr, task)` and `AI_SUMMARIZE_AGG(expr)` are aggregates, with
+`GROUP BY` or over the whole result, not window functions:
+
+```sql
+SELECT campaign_id, AI_AGG(comment, 'What do viewers say about the creative?') AS feedback
+FROM demo.ad_comments GROUP BY campaign_id;
+```
+
+Igloo collects a group's values, without NULLs, and sorts them, so the
+same group makes the same requests. Values that fit one request (about
+16,000 tokens) are sent at once. More are sent in chunks of that size, each
+answered with an intermediate result, and the intermediate results are
+combined, a request per chunk of them, until one request holds them all and
+gives the answer. Each request is cached by its chunk: a group that gained
+rows asks again only for the chunks that changed and the requests that
+combine them. As Snowflake's, `AI_AGG` fails the statement on an error.
+`EXPLAIN` counts the first round of requests.
 
 ## Decision models
 

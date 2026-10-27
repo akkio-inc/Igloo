@@ -67,6 +67,8 @@ var Functions = []Function{
 		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Embed(rows) }},
 	{Name: "ai_similarity", Args: []string{"ANY", "ANY", "VARCHAR"}, Result: "DOUBLE",
 		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Similarity(rows) }},
+	{Name: "ai_agg", Args: []string{"VARCHAR[]", "VARCHAR", "VARCHAR"}, Result: "VARCHAR",
+		Eval: func(s *Statement, rows []row) ([]any, error) { return s.Agg(rows) }},
 }
 
 // Names lists the AI functions' names, which the distributed planner keeps
