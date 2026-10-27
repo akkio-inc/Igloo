@@ -643,6 +643,14 @@ func (s *Server) inputQuery(ctx context.Context, sess *session, user auth.User, 
 		if tr.Untranslated {
 			q = v.Str
 		}
+		if n, err := s.engine.CountStatements(q); err != nil || n != 1 {
+			return "", pgerror.WithCode(fmt.Errorf("%s must be one query", what), codes.InvalidParameterValue)
+		}
+		// As for a statement of the user's own: the warehouse's files are
+		// read through its tables.
+		if err := s.checkWarehouseFiles(ctx, user, q); err != nil {
+			return "", err
+		}
 		// A query may score rows with other models.
 		return s.modelRewrite(ctx, sess, user, q)
 	}

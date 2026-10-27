@@ -796,6 +796,11 @@ type session struct {
 	// modelPins are the models the session's ai_predict calls trained,
 	// which the runtime keeps until the session ends.
 	modelPins []string
+	// modelAllowed are the model blobs and results the session's
+	// statements resolved, which alone its statements may name (see
+	// checkModelCalls), with the order they came in.
+	modelAllowed map[string]int
+	modelSeq     int
 	// changes counts the statements in the transaction block that may have
 	// changed something, and savepoints are its savepoints (see
 	// savepointCommand).
@@ -2387,6 +2392,11 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	// Preparing runs all but the last of several statements, so this
 	// comes first.
 	if err := forbidden(query); err != nil {
+		return fail(err)
+	}
+	// Igloo's model functions name only what this session's statements
+	// resolved, after their checks (see mlrewrite.go).
+	if err := sess.checkModelCalls(query); err != nil {
 		return fail(err)
 	}
 	// The columns that hold ID domains' ids are Igloo's (see iddomains.go),

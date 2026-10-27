@@ -277,6 +277,7 @@ func (s *Server) resolveModelText(ctx context.Context, sess *session, user auth.
 		}
 		token := s.modelRuntime.AddResult(res)
 		sess.keepModelResult(s.modelRuntime, token)
+		sess.allowModel(token)
 		return remember(models.ResultFunction + "(" + quoteLiteral(token) + ")"), nil
 	}
 }
@@ -353,6 +354,7 @@ func (s *Server) trainAndScore(ctx context.Context, sess *session, user auth.Use
 	}
 	s.modelRuntime.Remember(sha, art, true)
 	sess.pinModel(s.modelRuntime, sha)
+	sess.allowModel(sha)
 
 	var b strings.Builder
 	b.WriteString("(SELECT * EXCLUDE (__igloo_score), ")
@@ -387,6 +389,52 @@ func featureExpr(f models.Feature, expr string) string {
 		return "epoch(" + expr + ")"
 	}
 	return "CAST(" + expr + " AS VARCHAR)"
+}
+
+// maxModelAllowed bounds what a session remembers having resolved.
+const maxModelAllowed = 4096
+
+// allowModel lets the session's statements name a model blob or result,
+// which one of its statements resolved, after its checks.
+func (sess *session) allowModel(v string) {
+	if sess.modelAllowed == nil {
+		sess.modelAllowed = map[string]int{}
+	}
+	sess.modelSeq++
+	sess.modelAllowed[v] = sess.modelSeq
+	if len(sess.modelAllowed) > maxModelAllowed {
+		for k, seq := range sess.modelAllowed {
+			if seq <= sess.modelSeq-maxModelAllowed {
+				delete(sess.modelAllowed, k)
+			}
+		}
+	}
+}
+
+// checkModelCalls refuses a statement that calls Igloo's model functions
+// with what no statement of the session resolved: a blob it did not check
+// the user may use, written some other way than through modelRewrite (a
+// clean room's template, say, which is prepared without it).
+func (sess *session) checkModelCalls(query string) error {
+	if !strings.Contains(strings.ToLower(query), "igloo_ml_") {
+		return nil
+	}
+	calls, err := mlCalls(mlTokens(query), map[string]bool{models.PredictFunction: true, models.ScoreFunction: true,
+		models.ResultFunction: true})
+	if err != nil {
+		return err
+	}
+	for _, c := range calls {
+		v, ok := "", len(c.args) > 0
+		if ok {
+			v, ok = stringLiteral(query[c.args[0][0]:c.args[0][1]])
+		}
+		if _, allowed := sess.modelAllowed[v]; !ok || !allowed {
+			return denied("%s is Igloo's own: score rows with model!PREDICT(INPUT_DATA => {*}) and read methods with "+
+				"TABLE(model!METHOD(...))", c.name)
+		}
+	}
+	return nil
 }
 
 // maxModelPins bounds the models a session's train-and-score calls keep.
@@ -475,6 +523,7 @@ func (s *Server) resolvePredict(ctx context.Context, sess *session, user auth.Us
 	default:
 		return "", modelSyntax("unknown input %q", mode)
 	}
+	sess.allowModel(m.Blob)
 	var b strings.Builder
 	b.WriteString(models.PredictFunction + "(" + quoteLiteral(m.Blob))
 	for _, f := range art.Features() {

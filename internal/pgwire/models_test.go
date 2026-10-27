@@ -330,6 +330,8 @@ func TestModelRefusals(t *testing.T) {
 			"22023", "at least two classes"},
 		`CREATE SNOWFLAKE.ML.CLASSIFICATION c(INPUT_DATA => SYSTEM$QUERY_REFERENCE('DELETE FROM leads'), TARGET_COLNAME => 'y')`: {
 			"22023", "must be a query"},
+		`CREATE SNOWFLAKE.ML.CLASSIFICATION c(INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT spend, converted FROM leads; DROP TABLE leads'),
+			TARGET_COLNAME => 'converted')`: {"22023", "one query"},
 		`DROP SNOWFLAKE.ML.FORECAST m`:          {"42809", "is a SNOWFLAKE.ML.CLASSIFICATION"},
 		`CALL nope!SHOW_TRAINING_LOGS()`:        {"42704", "does not exist"},
 		`CALL my_procedure()`:                   {"0A000", "stored procedures"},
@@ -342,6 +344,20 @@ func TestModelRefusals(t *testing.T) {
 	expectCode(t, conn, "SELECT igloo_ml_predict('00', 1)", "42501", "Igloo's own")
 	expectCode(t, conn, `SELECT * FROM "IGLOO_ML_RESULT"('x')`, "42501", "Igloo's own")
 	expectCode(t, conn, "CREATE MACRO p(x) AS igloo_ml_predict('00', x)", "42501", "Igloo's own")
+	// Prepared without the rewrite (as a clean room's template is), a call
+	// names only what the session resolved.
+	sess := &session{}
+	call := "SELECT igloo_ml_predict('" + strings.Repeat("a", 64) + "', 1) FROM t"
+	if err := sess.checkModelCalls(call); err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("an unresolved blob: %v", err)
+	}
+	sess.allowModel(strings.Repeat("a", 64))
+	if err := sess.checkModelCalls(call); err != nil {
+		t.Errorf("a resolved blob: %v", err)
+	}
+	if err := sess.checkModelCalls("SELECT igloo_ml_result(x) FROM t"); err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("a computed token: %v", err)
+	}
 	// The DuckDB dialect reads statements on models too.
 	if got := texts(t, conn, "CALL m!SHOW_TRAINING_LOGS()"); len(got) != 1 {
 		t.Errorf("CALL in DuckDB's dialect: %q", got)

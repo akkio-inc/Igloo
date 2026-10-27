@@ -365,7 +365,9 @@ own Apache-2.0 code and needs nothing besides Igloo.
   Boosting stops when a held-out tenth of the training rows stops
   improving, after at most 500 rounds. On one machine, 100 rounds over a
   million rows of 50 features take about 7 seconds on 18 cores and 13 on
-  2.
+  2; training a `CLASSIFICATION` model on such a table, holdout metrics
+  included, takes about 15 seconds on 18 cores (`BenchmarkClassifier1M` in
+  `internal/models`, run with `IGLOO_ML_BENCH=1`).
 - **Scoring** with `PREDICT` runs as the query runs: a statement that
   scores a large table runs in parts on workers like any other, each
   scoring its share. Methods that return tables (`FORECAST`,
