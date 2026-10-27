@@ -1434,6 +1434,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   place for ID domains' columns rather than reading the table through a
   subquery, which DuckDB bound again wherever a statement named the view:
   the dashboard's median query takes 1.9 seconds rather than 2.3.
+- FLATTEN's lists of values, values as text, keys and indexes are the rb
+  extension's `igloo_sf_flatten_values`, `_strings`, `_keys` and
+  `_indexes`, which DuckDB binds as the branch of the input's type alone,
+  rather than macros whose every branch it bound, casts, lambdas and nested
+  macros, at about a millisecond a call (see [Snowflake's
+  FLATTEN](extensions/rb/README.md#snowflakes-flatten)); the lists are the
+  same, to the byte. A call binds in 0.01 to 0.03 ms, and a statement of 16
+  calls prepares in 1.2 to 1.6 ms rather than 12 to 15. A FLATTEN of text
+  read only as text runs in half the time.
 - Preparing a dashboard's statements, which holds the catalog lock
   exclusively and so goes one statement at a time, takes less of that
   lock. A query the [result cache](docs/operations.md#result-cache) kept

@@ -302,30 +302,7 @@ func TestRBStringsMatchDuckDB(t *testing.T) {
 // as constants and in columns.
 func TestRBDivideMatchesMacro(t *testing.T) {
 	ctx := context.Background()
-	e, _ := openWithRB(t)
-	fast, err := e.Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fast.Close() //nolint:errcheck
-	connector, err := duckdb.NewConnector("", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connector.Close() //nolint:errcheck
-	dc, err := connector.Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dc.Close() //nolint:errcheck
-	plain := dc.(*duckdb.Conn)
-	for conn, stmts := range map[*duckdb.Conn][]string{fast: snowflake.MacrosFor(true), plain: snowflake.Macros()} {
-		for _, stmt := range stmts {
-			if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
+	fast, plain := nativeAndMacros(t)
 	if def, err := firstRow(ctx, fast, "SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'sf_div'"); err != nil ||
 		!strings.Contains(def, "igloo_sf_div") {
 		t.Fatalf("sf_div is %q (%v), not igloo_sf_div", def, err)
@@ -391,6 +368,221 @@ func TestRBDivideMatchesMacro(t *testing.T) {
 			got, want := queryRows(t, fast, q, ta+"/"+tb), queryRows(t, plain, q, ta+"/"+tb)
 			if strings.Join(got, "\n") != strings.Join(want, "\n") {
 				t.Errorf("%s / %s in columns: igloo_sf_div's differ from the macros'", ta, tb)
+			}
+		}
+	}
+}
+
+// nativeAndMacros returns a connection with the rb extension and the macros
+// as a session with it defines them (snowflake.MacrosFor), and one of a
+// plain DuckDB with the macros alone.
+func nativeAndMacros(t *testing.T) (fast, plain *duckdb.Conn) {
+	t.Helper()
+	ctx := context.Background()
+	e, _ := openWithRB(t)
+	fast, err := e.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fast.Close() }) //nolint:errcheck
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { connector.Close() }) //nolint:errcheck
+	dc, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain = dc.(*duckdb.Conn)
+	t.Cleanup(func() { plain.Close() }) //nolint:errcheck
+	for conn, stmts := range map[*duckdb.Conn][]string{fast: snowflake.MacrosFor(true), plain: snowflake.Macros()} {
+		for _, stmt := range stmts {
+			if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return fast, plain
+}
+
+// TestRBFlattenMatchesMacro checks igloo_sf_flatten_values, _strings, _keys
+// and _indexes, which FLATTEN's sf_flatten_ macros are with the rb extension
+// (see snowflake.MacrosFor), against the macros they stand for: the same
+// lists, element for element and byte for byte, of the same types, the same
+// NULLs and the same errors, for inputs of every kind the macros tell apart
+// and every MODE, as constants, parameters and columns, in lists that cross
+// DuckDB's vectors, unnested side by side as FLATTEN does, and through the
+// macros that call them.
+func TestRBFlattenMatchesMacro(t *testing.T) {
+	ctx := context.Background()
+	fast, plain := nativeAndMacros(t)
+	lists := []string{"values", "strings", "keys", "indexes"}
+	for _, l := range lists {
+		def, err := firstRow(ctx, fast, "SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'sf_flatten_"+l+"'")
+		if err != nil || !strings.Contains(def, "igloo_sf_flatten_"+l) {
+			t.Fatalf("sf_flatten_%s is %q (%v), not igloo_sf_flatten_%s", l, def, err, l)
+		}
+	}
+	// Each element's bytes, so that JSON that reads the same but is written
+	// differently differs.
+	shown := func(call string) string {
+		return "CASE WHEN (" + call + ") IS NULL THEN 'NULL' ELSE CAST(list_transform(" + call +
+			", lambda v: coalesce(hex(CAST(v AS VARCHAR)), '-')) AS VARCHAR) END"
+	}
+	same := func(where, q string) {
+		t.Helper()
+		got, gerr := firstRow(ctx, fast, q)
+		want, werr := firstRow(ctx, plain, q)
+		switch {
+		case werr != nil || gerr != nil:
+			if werr == nil || gerr == nil || werr.Error() != gerr.Error() {
+				t.Errorf("%s: %q %v, the macros %q %v", where, got, gerr, want, werr)
+			}
+		case got != want:
+			t.Errorf("%s: %s, the macros %s", where, got, want)
+		}
+	}
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+	docs := []string{
+		`[1, "a", null, true, {"b": [2, 3]}, [4], -0.5]`, `{"a": 1, "b": "x", "c": null, "d": {"e": 1}, "f": [1]}`,
+		`[]`, `{}`, `"text"`, `5`, `null`, `true`, `[1.0, 1e2, 0.10, -0, 12345678901234567890, 1E+2, 1e400]`,
+		`{"a": 1, "a": 2}`, `  [ 1 ,2 ]  `, `["é", "é", "a\"b", "\\", "\n", "日本", "\u0001", ""]`,
+		`{"é": 1, "": 2, "a b": [null], "日": {"本": []}}`, `[[[[]]]]`, `[{"x": {"y": [1, {"z": null}]}}]`,
+		`{"k": "{\"inner\": 1}"}`, `["[1, 2]", "{\"a\": 1}", "{bad"]`,
+	}
+	malformed := []string{`[1, 2`, `{"a": }`, `abc`, `[1] x`, ``, `{`}
+	var inputs []string
+	for _, d := range docs {
+		inputs = append(inputs, quote(d), quote(d)+"::JSON")
+	}
+	for _, d := range malformed {
+		inputs = append(inputs, quote(d), quote(d)+"::JSON")
+	}
+	inputs = append(inputs,
+		`['a', '{"b": 2}', '[1, 2]', '{bad', '[', NULL, '', ' {"x": 1}', '"q"', 'é', '{"a": 1, "a": 2}']`,
+		`[]::VARCHAR[]`, `NULL::VARCHAR[]`, `[NULL]::VARCHAR[]`, `['{ "spaced" : [ 1 ] }']`,
+		`MAP {'k': 'v', 'j': '{"a": [1]}', 'n': NULL, 'e': '', 'l': '[1,2]', 'b': '{nope'}`,
+		`MAP {}::MAP(VARCHAR, VARCHAR)`, `NULL::MAP(VARCHAR, VARCHAR)`,
+		`1::INTEGER`, `5`, `1.5::DOUBLE`, `true`, `DATE '2025-01-01'`, `[1, 2]`, `['1'::JSON, '{"a": 1}'::JSON]`,
+		`[['a', 'b'], ['c']]`, `MAP {'k': 1}`, `{'a': 1, 'b': 'x', 'c': [1, 2]}`, `[{'a': 1}]`, `'\x01'::BLOB`,
+		`1.25::DECIMAL(5,2)`, `NULL::INTEGER`, `NULL::JSON`, `NULL::VARCHAR`, `NULL`,
+	)
+	modes := []string{"'BOTH'", "'ARRAY'", "'OBJECT'", "NULL::VARCHAR", "'both'", "'other'"}
+	for _, l := range lists {
+		for _, in := range inputs {
+			for _, m := range modes {
+				call := "sf_flatten_" + l + "(" + in + ", " + m + ")"
+				same(call, "SELECT "+shown(call)+", typeof("+call+")")
+				// sf_flatten_values of a constant NULL is not a list.
+				same(call, "SELECT CAST("+call+" AS VARCHAR), typeof("+call+")")
+			}
+		}
+	}
+
+	// Parameters, which DuckDB binds once their values' types are known.
+	for _, arg := range []any{`[1, {"a": 2}]`, `{"k": "v"}`, nil, int64(3)} {
+		q := "SELECT " + shown("sf_flatten_values($1, 'BOTH')") + ", " + shown("sf_flatten_strings($1, 'BOTH')") + ", " +
+			shown("sf_flatten_keys($1, 'BOTH')") + ", " + shown("sf_flatten_indexes($1, 'BOTH')")
+		vals := []driver.NamedValue{{Ordinal: 1, Value: arg}}
+		got, gerr := firstRowArgs(ctx, fast, q, vals)
+		want, werr := firstRowArgs(ctx, plain, q, vals)
+		if got != want || (gerr == nil) != (werr == nil) {
+			t.Errorf("%s with %v: %q %v, the macros %q %v", q, arg, got, gerr, want, werr)
+		}
+	}
+
+	// Columns, whose lists and maps together hold more elements than a
+	// vector, some rows NULL.
+	valid := make([]string, len(docs))
+	for i, d := range docs {
+		valid[i] = quote(d)
+	}
+	tables := []string{
+		"CREATE TEMP TABLE flat_docs AS SELECT row_number() OVER () AS i, d AS doc, CAST(d AS JSON) AS js FROM " +
+			"(SELECT unnest([" + strings.Join(valid, ", ") + ", NULL]) AS d)",
+		"CREATE TEMP TABLE flat_lists AS SELECT i, CASE WHEN i % 5 = 3 THEN NULL ELSE list_transform(range(i * 397 % 3001), " +
+			"lambda x: CASE WHEN x % 7 = 0 THEN '{\"n\": ' || x || '}' WHEN x % 11 = 0 THEN NULL WHEN x % 13 = 0 THEN '[' || x || ']' " +
+			"ELSE 's' || x END) END AS l FROM range(12) AS r(i)",
+		"CREATE TEMP TABLE flat_maps AS SELECT i, CASE WHEN i % 4 = 1 THEN NULL ELSE map_from_entries(list_transform(range(i * 211 % 2500), " +
+			"lambda x: {'k': 'k' || x, 'v': CASE WHEN x % 5 = 0 THEN '{\"m\": [' || x || ']}' WHEN x % 9 = 0 THEN NULL ELSE 'v' || x END})) END AS mp " +
+			"FROM range(10) AS r(i)",
+		"CREATE TEMP TABLE flat_others AS SELECT i, i::INTEGER AS n, {'a': i, 'b': [i, i + 1]} AS st, [i, i * 2] AS il, " +
+			"MAP {'x': i} AS im FROM range(5) AS r(i)",
+		// Rows over several of DuckDB's vectors, every third one NULL.
+		"CREATE TEMP TABLE flat_many AS SELECT i, CASE WHEN i % 3 = 1 THEN NULL ELSE list_transform(range(i % 6), " +
+			"lambda x: CASE WHEN x = 2 THEN '{\"i\": ' || i || '}' ELSE 'v' || x END) END AS l, CASE WHEN i % 3 = 2 THEN NULL " +
+			"ELSE map_from_entries(list_transform(range(i % 4), lambda x: {'k': 'k' || x, 'v': '[' || i || ']'})) END AS mp " +
+			"FROM range(5000) AS r(i)",
+	}
+	for _, conn := range []*duckdb.Conn{fast, plain} {
+		for _, stmt := range tables {
+			if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	columns := map[string][]string{"flat_docs": {"doc", "js"}, "flat_lists": {"l"}, "flat_maps": {"mp"}, "flat_others": {"n", "st", "il", "im"},
+		"flat_many": {"l", "mp"}}
+	for table, cols := range columns {
+		for _, col := range cols {
+			for _, l := range lists {
+				for _, m := range modes[:3] {
+					call := "sf_flatten_" + l + "(" + col + ", " + m + ")"
+					q := "SELECT i, " + shown(call) + " FROM " + table + " ORDER BY i"
+					if got, want := queryRows(t, fast, q, call), queryRows(t, plain, q, call); strings.Join(got, "\n") != strings.Join(want, "\n") {
+						t.Errorf("%s over %s: the native lists differ from the macros'", call, table)
+					}
+				}
+			}
+			// FLATTEN's lists unnested side by side, as the translator writes them.
+			q := "SELECT i, coalesce(hex(CAST(v AS VARCHAR)), '-'), k, x FROM (SELECT i, unnest(sf_flatten_values(" + col + ", 'BOTH')) AS v, " +
+				"unnest(sf_flatten_keys(" + col + ", 'BOTH')) AS k, unnest(sf_flatten_indexes(" + col + ", 'BOTH')) AS x, " +
+				"unnest(sf_flatten_strings(" + col + ", 'BOTH')) AS s FROM " + table + ") ORDER BY ALL"
+			if got, want := queryRows(t, fast, q, table+"."+col), queryRows(t, plain, q, table+"."+col); strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Errorf("FLATTEN of %s.%s: the native rows differ from the macros'", table, col)
+			}
+			q = "SELECT i, CAST(sf_flatten_this(" + col + ", 'BOTH') AS VARCHAR) FROM " + table + " ORDER BY i"
+			if got, want := queryRows(t, fast, q, table+"."+col), queryRows(t, plain, q, table+"."+col); strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Errorf("sf_flatten_this of %s.%s: the native rows differ from the macros'", table, col)
+			}
+		}
+	}
+	// The struct parts' macros, which call sf_flatten_values on their JSON
+	// part, which is not a list where that part is a constant NULL.
+	rows := func(conn *duckdb.Conn, q string) (string, error) {
+		rs, err := conn.QueryContext(ctx, q, nil)
+		if err != nil {
+			return "", err
+		}
+		defer rs.Close() //nolint:errcheck
+		dest := make([]driver.Value, len(rs.Columns()))
+		var out []string
+		for {
+			if err := rs.Next(dest); err == io.EOF {
+				return strings.Join(out, "\n"), nil
+			} else if err != nil {
+				return "", err
+			}
+			vals := make([]string, len(dest))
+			for j, v := range dest {
+				vals[j] = render(v)
+			}
+			out = append(out, strings.Join(vals, "\t"))
+		}
+	}
+	for _, parts := range []string{"l, NULL::JSON", `NULL::VARCHAR[], CAST('[1, {"a": 2}, "x"]' AS JSON)`, `NULL::VARCHAR[], CAST('{"a": 2}' AS JSON)`} {
+		for _, m := range []string{"values", "strings", "keys", "indexes"} {
+			call := "sf_parts_" + m + "(" + parts + ", 'BOTH')"
+			for _, q := range []string{
+				"SELECT i, " + shown(call) + ", typeof(" + call + ") FROM flat_lists ORDER BY i",
+				"SELECT i, CAST(" + call + " AS VARCHAR), typeof(" + call + ") FROM flat_lists ORDER BY i",
+			} {
+				got, gerr := rows(fast, q)
+				want, werr := rows(plain, q)
+				if got != want || (gerr == nil) != (werr == nil) || (gerr != nil && gerr.Error() != werr.Error()) {
+					t.Errorf("%s: the native lists differ from the macros' (%v, the macros %v)", q, gerr, werr)
+				}
 			}
 		}
 	}
