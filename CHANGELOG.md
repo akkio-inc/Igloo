@@ -1804,6 +1804,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A view or materialized view created in Snowflake's dialect whose query
+  needs Snowflake's implicit conversions, a number in a string function or
+  text compared with a date (`TRIM(id)`, `d < '2024-02-01'`), gets them, as
+  the same query does on its own, instead of failing with "No function
+  matches the given name and argument types": DuckDB binds the query of a
+  view in the catalog's view store, and of a materialized view, when the
+  statement runs, after Igloo's retry with the conversions would have
+  happened.
 - A view created in Snowflake's dialect whose translation calls Igloo's
   macros for Snowflake's functions (`DATEADD`, `DATE_TRUNC`, conversions
   to text) loads on a replica that starts after it was made, and after a

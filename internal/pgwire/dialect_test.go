@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -578,6 +579,45 @@ func TestSnowflakeViewColumnList(t *testing.T) {
 	mustExec(t, duck, "CREATE VIEW v_first (x) AS SELECT * FROM wide")
 	if n := count(t, duck, "SELECT count(*) FROM (DESCRIBE v_first)"); n != 3 {
 		t.Errorf("v_first: %d columns, want 3", n)
+	}
+}
+
+// TestSnowflakeViewImplicitConversions checks that a Snowflake-dialect
+// view whose query needs Snowflake's implicit conversions gets them, as the
+// same query does on its own: a view in the catalog's view store, one with
+// a column list, a local one and a materialized one, whose queries DuckDB
+// binds only when the statement runs, after the retry with the conversions
+// (see parseTranslated) would have happened. A view whose query fails for
+// another reason fails as it did.
+func TestSnowflakeViewImplicitConversions(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	a := vc.replica(t)
+	sf := a.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "CREATE SCHEMA IF NOT EXISTS lake.public")
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	mustExec(t, sf, "CREATE TABLE lake.public.visits AS SELECT 7 AS id, '2024-01-31'::date AS d, '2024-02-01' AS later")
+	check := func(sql string, want ...string) {
+		t.Helper()
+		if got := rawTexts(t, sf, sql); !slices.Equal(got, want) {
+			t.Errorf("%s: %q, want %q", sql, got, want)
+		}
+	}
+	check("SELECT TRIM(id) AS id_text, d < later AS before FROM lake.public.visits", "7|t")
+	for _, q := range []string{
+		"CREATE VIEW lake.public.v_text AS SELECT TRIM(id) AS id_text, d < later AS before FROM lake.public.visits",
+		"CREATE OR REPLACE VIEW lake.public.v_cols (id_text COMMENT 'as text', before) AS SELECT TRIM(id), d < later FROM lake.public.visits",
+		"CREATE VIEW v_local AS SELECT TRIM(id) AS id_text, d < later AS before FROM lake.public.visits",
+		"CREATE MATERIALIZED VIEW lake.public.mv_text AS SELECT TRIM(id) AS id_text, d < later AS before FROM lake.public.visits",
+	} {
+		mustExec(t, sf, q)
+	}
+	for _, v := range []string{"lake.public.v_text", "lake.public.v_cols", "v_local", "lake.public.mv_text"} {
+		check("SELECT id_text, before FROM "+v, "7|t")
+	}
+	if _, err := sf.Exec(context.Background(), "CREATE VIEW lake.public.v_bad AS SELECT TRIM(id) AS t, nope FROM lake.public.visits"); err == nil ||
+		!strings.Contains(err.Error(), "nope") {
+		t.Errorf("a view naming a missing column: %v", err)
 	}
 }
 

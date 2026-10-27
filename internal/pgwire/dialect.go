@@ -254,6 +254,10 @@ func (s *Server) translate(ctx context.Context, sess *session, text string, impl
 // once, as it finally ran or failed.
 func (s *Server) parseTranslated(ctx context.Context, sess *session, user auth.User, q wire.Query, source string,
 	tr *translation) (wire.PreparedStatements, *translation, error) {
+	if itr := s.implicitView(ctx, sess, source, tr); itr != nil {
+		tr = itr
+		s.metrics.implicitRetry()
+	}
 	txFailed := sess.txFailed
 	held := sess.holdRecords()
 	q.Query = tr.SQL
@@ -283,6 +287,61 @@ func (s *Server) parseTranslated(ctx context.Context, sess *session, user auth.U
 	s.recordAll(sess, again)
 	s.metrics.implicitRetry()
 	return ips, itr, nil
+}
+
+// implicitView returns, for tr, the translation of source, a CREATE VIEW
+// or CREATE MATERIALIZED VIEW in Snowflake's dialect, the translation of
+// source with Snowflake's implicit conversions when tr's query does not
+// bind for want of one and that one's does; nil otherwise. A view in a
+// catalog's view store, and a materialized view, have their queries bound
+// when the statement runs, not when it is prepared, so the retry with the
+// conversions that parseTranslated makes never happened for them: a view
+// of TRIM(id) over a number failed where the same SELECT ran. Translating
+// is cheap and binding the query is not, so the query is described only
+// when the conversions would change it.
+func (s *Server) implicitView(ctx context.Context, sess *session, source string, tr *translation) *translation {
+	query := definedQuery(tr.SQL)
+	if query == "" {
+		return nil
+	}
+	itr, err := s.translate(ctx, sess, source, true)
+	if err != nil || itr.Command != "" || itr.Untranslated || itr.SQL == tr.SQL {
+		return nil
+	}
+	implicit := definedQuery(itr.SQL)
+	if implicit == "" {
+		return nil
+	}
+	// Describing walks the catalog (see catalogRunLock).
+	release := s.holdCatalog(sess)
+	defer release()
+	if _, err := describeQuery(ctx, sess, query); err == nil || !implicitCastError(err) {
+		return nil
+	}
+	if _, err := describeQuery(ctx, sess, implicit); err != nil {
+		return nil
+	}
+	return itr
+}
+
+// definedQuery returns the query of CREATE [OR REPLACE] [TEMP]
+// [MATERIALIZED] VIEW ... AS query, or "".
+func definedQuery(query string) string {
+	sc := &scanner{s: query}
+	if !sc.keywords("CREATE") {
+		return ""
+	}
+	sc.keywords("OR", "REPLACE")
+	_ = sc.keywords("TEMP") || sc.keywords("TEMPORARY")
+	sc.keywords("MATERIALIZED")
+	if !sc.keywords("VIEW") {
+		return ""
+	}
+	i := topLevelKeyword(query, "AS")
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query[i+2:]), ";"))
 }
 
 // checkViewColumns refuses, as Snowflake does, CREATE VIEW whose column
