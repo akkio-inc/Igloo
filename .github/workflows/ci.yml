@@ -1,22 +1,19 @@
 name: CI
 
+# Not on pushes or pull requests: the checks took half an hour a push. The
+# release workflow runs them before publishing anything, and they can be run
+# by hand on any branch.
 on:
-  pull_request:
-  push:
-    branches: [main]
-  # The release workflow runs these checks before publishing anything.
   workflow_call:
-  # To run them on a branch by hand, as when a push's run never started.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # One run per PR (a new push cancels the old run); every commit on main and
-  # every tag gets its own run.
-  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Every commit and every tag gets its own run.
+  group: ci-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 
 defaults:
   run:

@@ -52,7 +52,11 @@ The first build links DuckDB and is slow; later builds are cached.
 
 ### What CI checks
 
-Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+CI does not run on pushes or pull requests: run the checks your change
+touches locally (above, and `make e2e` for what crosses the stack).
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs before every
+release, which publishes nothing unless it passes, and by hand on any branch
+(Actions, CI, Run workflow; or `gh workflow run ci.yml --ref BRANCH`):
 
 - gofmt, `go vet` and `go test`
 - `make migrate-test`
