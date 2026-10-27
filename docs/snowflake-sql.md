@@ -147,6 +147,22 @@ JSON and JSON text alike.
   them from are turned into JSON before the join, unless the select reads
   them elsewhere: in both cases DuckDB would otherwise hold each row's
   lists or maps in a dependent join, at several times the cost.
+  A `FLATTEN` of a column whose select reads only its `VALUE` takes one of
+  two forms. In one, the lateral subquery computes the column's list, which
+  DuckDB 1.5.6 plans as a dependent join: it copies the rows the joins
+  before the `FLATTEN` keep and joins them back on their lists, the faster
+  form when those joins keep few rows. In the other, the column's table
+  computes the list in a select list of its own, for all its rows, before
+  the joins, and the lateral subquery unnests it where it reads it, the
+  faster form when the joins keep most rows: over tens of millions of rows
+  a `FLATTEN`, one dashboard query took 0.9 s the first way and 3.5 s the
+  second, another 88 s and 56 s. Igloo picks for each statement shape: the
+  first statement takes the form DuckDB's estimates point to (the second
+  when a quarter or more of the tables' rows reach the dependent joins), the
+  next the other form, and from then on the shape takes the form whose
+  latest run took the less CPU time. Either way, conditions that read
+  nothing of the `FLATTEN` but its `VALUE` (`WHERE f.value <> 'unknown'`)
+  filter the list it unnests (`list_filter`).
   `FLATTEN` of an array constant of `OBJECT_CONSTRUCT` and
   `OBJECT_CONSTRUCT_KEEP_NULL` calls with string literals for keys, whose
   `VALUE` its select reads only by a key (`f.value:k`, `f.value['k']`,

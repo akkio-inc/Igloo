@@ -151,7 +151,7 @@ var joinEndWords = map[string]bool{
 func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 	var flats []flattened
 	removed := map[*node]bool{}
-	var hoists []*hoist
+	var hoists, lists []*hoist
 	for i := 0; i < len(nodes); i++ {
 		n := nodes[i]
 		w := n.word()
@@ -242,6 +242,15 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 					alias = "flatten_" + itoa(t.gen)
 				}
 			}
+			if lc := t.listCols[call]; lc != nil {
+				// Its FROM item's select list computes its list (see
+				// listColumns).
+				if lc.list, err = t.listOf(call, lc); err != nil {
+					return nil, err
+				}
+				lc.name = "_sf_l" + itoa(len(lists)+1)
+				lists = append(lists, lc)
+			}
 			out, err = t.flattenTable(call, alias, cols, t.thisWanted(nodes, cols), t.onlyValues[call], st)
 			flats = append(flats, flattened{alias: alias, out: out, structs: st != nil})
 			t.flattenOuts[out] = alias
@@ -272,7 +281,17 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 			return nil, err
 		}
 	}
-	return whereOn(jsonAhead(nodes, flats), flats), nil
+	if len(lists) > 0 {
+		var err error
+		if nodes, err = listColumns(nodes, lists); err != nil {
+			return nil, err
+		}
+	}
+	return whereOn(jsonAhead(nodes, flats), flats, func(flatten, open, close *node) {
+		if t.valueFolds[flatten] != nil {
+			t.valueOns[flatten] = [2]*node{open, close}
+		}
+	}), nil
 }
 
 // whereOn moves the WHERE of a select whose last FROM item is a FLATTEN
@@ -280,7 +299,8 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 // becomes FROM t JOIN LATERAL (...) AS f ON (p), the same rows when every
 // join is an inner one. DuckDB unnests a list or map column of the rows a
 // lateral subquery is joined to where it reads it, but with a WHERE in the
-// select it plans a dependent join instead, which holds those rows' lists
+// select, or an ON that filters the unnested values (which valueWhere then
+// moves into the unnest), it plans a dependent join instead, which holds those rows' lists
 // or maps in a hash table: flattening a map of seven strings in 30 million
 // rows ran out of 18 GiB that way, and 5 million took 3.6 s rather than
 // 0.6 s. Commas before that FLATTEN become CROSS JOINs, so that the joins
@@ -292,8 +312,9 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 // or anti join, an ON after such a comma (whose unqualified names would see
 // more items), a subquery in its WHERE, or a WHERE that names a select
 // item's alias, which an ON cannot see. The WHERE of a select with FLATTENs
-// of structs is structWhere's.
-func whereOn(nodes []*node, flats []flattened) []*node {
+// of structs is structWhere's. moved, if not nil, is told the FLATTEN
+// whose ON the WHERE became, and the nodes that open and close it.
+func whereOn(nodes []*node, flats []flattened, moved func(flatten, open, close *node)) []*node {
 	if len(flats) == 0 || slices.ContainsFunc(flats, func(f flattened) bool { return f.structs }) {
 		return nodes // structWhere's
 	}
@@ -331,9 +352,13 @@ func whereOn(nodes []*node, flats []flattened) []*node {
 	} else if c := prevSig(out, join); c >= 0 && out[c].word() == "CROSS" {
 		out[c] = raw("")
 	}
-	out = append(out, raw(" ON ("))
+	open, close := raw(" ON ("), raw(") ")
+	out = append(out, open)
 	out = append(out, trim(cond)...)
-	out = append(out, raw(") "))
+	out = append(out, close)
+	if moved != nil {
+		moved(nodes[last], open, close)
+	}
 	return append(out, nodes[end:]...)
 }
 
@@ -807,6 +832,11 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 	}
 	prefix := ""
 	in := flattenInput(input)
+	lc := t.listCols[g]
+	listed := lc != nil && lc.name != ""
+	if listed {
+		in = raw(lc.alias + "." + lc.name)
+	}
 	if a, ok := named["PATH"]; ok {
 		s, lit := (&call{args: [][]*node{a}}).literal(0)
 		if !lit {
@@ -824,8 +854,12 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 		return t.flattenStructs(st, in, alias, cols, wantThis)
 	}
 	if !recursive && !outer {
-		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis, onlyValues, t.textValues[g])
-		if fold != nil {
+		out, fold := flattenUnnest(in, prefix, mode, alias, cols, wantThis, onlyValues, listed, t.textValues[g])
+		switch {
+		case fold != nil && fold.column:
+			fold.alias = alias
+			t.valueFolds[out] = fold
+		case fold != nil:
 			fold.alias = alias
 			t.folds[out] = fold
 		}
@@ -896,7 +930,7 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 // structWhere may filter. A column whose elements alone its select reads
 // is unnested alone too, as text when every read reads text (text, see
 // textValuesOf).
-func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, onlyValues, text bool) (out *node, fold *structFold) {
+func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, onlyValues, listed, text bool) (out *node, fold *structFold) {
 	rel := "CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END"
 	path := rel
 	if prefix != "" {
@@ -908,6 +942,13 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, o
 	var lists []*node
 	l, j, field := structField(in)
 	switch {
+	case listed:
+		// A column's list, which its FROM item's select list computes (see
+		// listColumns), in a node of its own, fold, that valueWhere may
+		// filter.
+		list := seq(nil, in)
+		fold = &structFold{values: list, column: true}
+		lists = append(lists, raw("unnest("), list, raw(") AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index"))
 	case in.elems != nil && prefix == "" && mode != "OBJECT":
 		key, path = "CAST(NULL AS VARCHAR)", "'[' || _sf_flatten._sf_index || ']'"
 		lists = append(lists, raw("unnest(["))
@@ -939,13 +980,17 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, o
 			lists = append(lists, raw(", unnest(sf_parts_this("+args+")) AS _sf_this"))
 		}
 	case isColumnNode(in) && prefix == "" && onlyValues:
-		// A column of which the statement reads only the elements.
+		// A column of which the statement reads only the elements, as
+		// text in a node of their own, fold, that valueWhere may filter.
 		values := "sf_flatten_values("
 		if text {
 			values = "sf_flatten_strings("
 		}
-		lists = append(lists, raw("unnest("+values+in.String()+", "+m+
-			")) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index"))
+		list := seq(nil, raw(values+in.String()+", "+m+")"))
+		if text {
+			fold = &structFold{values: list, column: true}
+		}
+		lists = append(lists, raw("unnest("), list, raw(") AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index"))
 	case isColumnNode(in):
 		x := in.String()
 		lists = append(lists, raw("unnest(sf_flatten_values("+x+", "+m+")) AS _sf_value, unnest(sf_flatten_keys("+x+", "+m+
@@ -968,6 +1013,39 @@ func flattenUnnest(in *node, prefix, mode, alias string, cols *node, wantThis, o
 	kids = append(kids, lists...)
 	kids = append(kids, raw(") AS _sf_flatten)"+aliasClause(alias, cols)))
 	return seq(nil, kids...), fold
+}
+
+// listColumns makes each FROM item whose columns FLATTENs unnest compute
+// their lists in a select list of its own, as the FLATTENs' names: FROM m,
+// LATERAL FLATTEN(INPUT => m.tags) f becomes FROM (SELECT m.*,
+// sf_flatten_strings(m.tags, 'BOTH') AS _sf_l1 FROM m) AS m, LATERAL
+// (... unnest(m._sf_l1) ...) f. DuckDB 1.5.6 unnests a list in a lateral
+// subquery where it reads it, after the joins before it, only when the
+// list is a column of the rows it is joined to; one it computes there, as
+// sf_flatten_strings does from JSON text, makes the subquery a dependent
+// join, which holds the rows aside and joins them back on their lists. A
+// dashboard query with six FLATTENs of 40 million rows' JSON took 89 s.
+func listColumns(nodes []*node, lists []*hoist) ([]*node, error) {
+	for k, h := range lists {
+		if h == nil {
+			continue
+		}
+		start, end, alias, ok := fromItem(nodes, h.up)
+		if !ok {
+			return nil, &Error{Code: CodeSyntax, Message: "FLATTEN reads a FROM item that is not there: " + h.alias}
+		}
+		item := nodes[start:end]
+		kids := []*node{raw("(SELECT " + alias + ".*")}
+		for j := k; j < len(lists); j++ {
+			if lists[j] != nil && lists[j].up == h.up {
+				kids = append(kids, raw(", "), lists[j].list, raw(" AS "+lists[j].name))
+				lists[j] = nil
+			}
+		}
+		kids = append(append(append(kids, raw(" FROM ")), item...), raw(") AS "+alias))
+		nodes = replace(nodes, start, end, seq(item, kids...))
+	}
+	return nodes, nil
 }
 
 // thisWanted reports whether a statement may read the THIS of a FLATTEN

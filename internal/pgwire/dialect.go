@@ -200,6 +200,11 @@ func splitOptions(s string) []string {
 // translation is how a statement in Snowflake's dialect was translated.
 type translation struct {
 	snowflake.Result
+	// flattenKey is the shape key of a statement whose FLATTENs of columns
+	// could take either form, and flattenLists the form they take (see
+	// flattenForms).
+	flattenKey   string
+	flattenLists bool
 }
 
 // columns presents a translated statement's result columns as Snowflake
@@ -223,11 +228,12 @@ func (tr *translation) columns(cols wire.Columns) wire.Columns {
 // like created in Snowflake's dialect run in any session.
 func (s *Server) translate(ctx context.Context, sess *session, text string, implicit bool) (*translation, error) {
 	res, err := snowflake.Translate(text, snowflake.Options{
-		IsSetting: func(name string) bool { return s.isSetting(ctx, sess, name) },
-		Variable:  func(name string) (string, bool, error) { return sessionVariable(ctx, sess, name) },
-		Sketches:  s.hasSketches(),
-		Implicit:  implicit,
-		Temporary: func(schema, name string) bool { return sess.sfTemps[snowflake.TempName{Schema: schema, Name: name}] },
+		IsSetting:    func(name string) bool { return s.isSetting(ctx, sess, name) },
+		Variable:     func(name string) (string, bool, error) { return sessionVariable(ctx, sess, name) },
+		Sketches:     s.hasSketches(),
+		Implicit:     implicit,
+		Temporary:    func(schema, name string) bool { return sess.sfTemps[snowflake.TempName{Schema: schema, Name: name}] },
+		FlattenLists: sess.flattenLists,
 	})
 	if err != nil {
 		var te *snowflake.Error
@@ -241,6 +247,27 @@ func (s *Server) translate(ctx context.Context, sess *session, text string, impl
 		return nil, err
 	}
 	return &translation{Result: res}, nil
+}
+
+// flattenForm translates source again, tr's statement, with its FLATTENs
+// of columns unnesting lists their FROM items compute when flattenForms
+// picks that form for its shape, DuckDB's estimates of tr's plan first.
+func (s *Server) flattenForm(ctx context.Context, sess *session, source string, tr *translation) *translation {
+	key := shapeKey(source)
+	lateral := tr.SQL
+	if !s.flattens.choose(key, func() bool { return estimateFlattenLists(ctx, sess, lateral) }) {
+		tr.flattenKey = key
+		return tr
+	}
+	sess.flattenLists = true
+	ltr, err := s.translate(ctx, sess, source, false)
+	if err != nil || ltr.Command != "" || ltr.Untranslated {
+		sess.flattenLists = false
+		tr.flattenKey = key
+		return tr
+	}
+	ltr.flattenKey, ltr.flattenLists = key, true
+	return ltr
 }
 
 // parseTranslated parses q, the translation tr of source, a statement in
@@ -272,6 +299,7 @@ func (s *Server) parseTranslated(ctx context.Context, sess *session, user auth.U
 		s.recordAll(sess, first)
 		return nil, nil, err
 	}
+	itr.flattenKey, itr.flattenLists = tr.flattenKey, tr.flattenLists
 	sess.txFailed = txFailed
 	held = sess.holdRecords()
 	iq := q

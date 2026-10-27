@@ -455,7 +455,10 @@ type Server struct {
 	reportPlanned atomic.Int64
 	settings      auth.SettingStore
 	workload      *workload.Controller
-	pool          string
+	// flattens picks the form of each statement shape's FLATTENs of
+	// columns (see flattenForms).
+	flattens flattenForms
+	pool     string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -813,6 +816,9 @@ type session struct {
 	// Snowflake's dialect created in a schema's name, which DuckDB keeps in
 	// temp.main (see noteTemporary).
 	sfTemps map[snowflake.TempName]bool
+	// flattenLists says the statement being parsed unnests FLATTENs' lists
+	// that their FROM items compute (see flattenForms).
+	flattenLists bool
 	// modelResults are the tokens of models' methods' results the
 	// session's statements read, and modelMemo the token of each method
 	// call the statement being parsed has computed (see mlrewrite.go).
@@ -1455,6 +1461,10 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
 			return nil, err
 		}
+		if tr.FlattenLists > 0 && tr.Command == "" && !tr.Untranslated {
+			defer func() { sess.flattenLists = false }()
+			tr = s.flattenForm(ctx, sess, source, tr)
+		}
 		if tr.Command != "" {
 			// A statement that changes nothing in Igloo, such as USE
 			// WAREHOUSE.
@@ -1988,6 +1998,9 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		var used *audit.Resources
 		if err == nil {
 			used = sess.measure(st)
+		}
+		if used != nil && tr != nil && tr.flattenKey != "" {
+			s.flattens.observe(tr.flattenKey, tr.flattenLists, used.CPUTime)
 		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
 		switch {

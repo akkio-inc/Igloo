@@ -220,6 +220,15 @@ func (t *translator) collectStructs(nodes []*node) {
 			continue
 		}
 		h := t.listHoistOf(f.level, f.i, f.up, f.alias, f.args, f.cols, colLists)
+		if h != nil && h.column {
+			// A column: its FROM item's select list may compute the list,
+			// which the lateral subquery unnests (see listColumns).
+			t.flattenLists++
+			if t.opts.FlattenLists {
+				t.listCols[f.args] = h
+			}
+			h = nil
+		}
 		if h == nil || hoisted[h.item] {
 			if t.textValuesOf(f.level, f.i, f.up, f.alias, f.args, f.cols, colLists) {
 				t.textValues[f.args] = true
@@ -228,6 +237,9 @@ func (t *translator) collectStructs(nodes []*node) {
 					t.elemReads[r] = quoteIdent(name) + ".\"VALUE\""
 					t.elemTexts[r] = true
 				}
+			}
+			if lc := t.listCols[f.args]; lc != nil {
+				lc.text = t.textValues[f.args]
 			}
 			continue
 		}
@@ -262,6 +274,11 @@ type hoist struct {
 	// unnests, as text when text is set.
 	list    *node
 	objects int
+	// column says the FLATTEN unnests a column, whose list the select list
+	// computes as name and the FLATTEN's lateral subquery unnests (see
+	// listColumns), rather than the select list unnesting it.
+	column bool
+	name   string
 }
 
 // listHoistOf decides whether the FLATTEN at nodes[i], aliased by the node
@@ -290,10 +307,10 @@ func (t *translator) listHoistOf(nodes []*node, i int, up string, alias, args, c
 	}
 	input := onlyInput(args)
 	idx := sig(input)
-	if len(idx) == 0 || input[idx[0]].isGroup('[') || input[idx[0]].word() == "ARRAY_CONSTRUCT" ||
-		isColumnRef(input) && !laterallyFiltered(nodes, i) {
+	if len(idx) == 0 || input[idx[0]].isGroup('[') || input[idx[0]].word() == "ARRAY_CONSTRUCT" {
 		return nil
 	}
+	column := isColumnRef(input) && !laterallyFiltered(nodes, i)
 	q := qualifiers(input)
 	if len(q) != 1 || q[up] || unqualified(input) {
 		return nil
@@ -307,7 +324,7 @@ func (t *translator) listHoistOf(nodes []*node, i int, up string, alias, args, c
 		return nil
 	}
 	text := len(idx) == 2 && input[idx[0]].word() == "SPLIT" && input[idx[1]].isGroup('(') || readsText(nodes, up, colLists)
-	return &hoist{alias: as, up: item, item: nodes[end-1], key: -1, text: text}
+	return &hoist{alias: as, up: item, item: nodes[end-1], key: -1, text: text, column: column}
 }
 
 // laterallyFiltered reports whether the select at nodes, with a FLATTEN at
@@ -1684,6 +1701,9 @@ func structColumn(base *node) string {
 type structFold struct {
 	alias  string
 	values *node
+	// column says the list is a column's elements as text, which
+	// valueWhere filters rather than structWhere.
+	column bool
 }
 
 // structWhere keeps the WHERE of a select whose first FLATTEN flattenStructs
@@ -1799,6 +1819,75 @@ func (t *translator) structWhere(nodes []*node) ([]*node, error) {
 		filter(fold.values, elems)
 	}
 	return append(append(out, raw(" ")), nodes[end:]...), nil
+}
+
+// valueWhere moves the conditions of the ON that whereOn made of a WHERE,
+// for a FLATTEN of a column whose elements its select reads only as text
+// (see flattenUnnest), that read nothing of the FLATTEN but its VALUE, into
+// a list_filter of the elements it unnests, lambdas whose element the
+// conditions' reads of VALUE read. DuckDB 1.5.6 unnests a column in a
+// lateral subquery where it reads it, after the joins before it, only when
+// nothing filters the unnested values; a filter on them, as dashboards
+// write WHERE f.value <> 'unknown', made it a dependent join, which held
+// the rows aside and joined them back on their lists: 85 s for a query
+// with six such FLATTENs of 40 million rows each. The conditions left stay
+// in the ON, which DuckDB pushes down to the tables, and an ON left with
+// none is ON (true). Conditions may read other columns, which the lambdas
+// capture.
+func (t *translator) valueWhere(nodes []*node) ([]*node, error) {
+	for k := 0; k < len(nodes); k++ {
+		on, ok := t.valueOns[nodes[k]]
+		fold := t.valueFolds[nodes[k]]
+		if !ok || fold == nil {
+			continue
+		}
+		open, close := slices.Index(nodes, on[0]), slices.Index(nodes, on[1])
+		if open < k || close < open {
+			continue
+		}
+		and := func(to []*node, term []*node) []*node {
+			if len(to) > 0 {
+				to = append(to, raw(" AND "))
+			}
+			return append(append(append(to, raw("(")), trim(term)...), raw(")"))
+		}
+		var keep, elems []*node
+		for _, term := range whereTerms(nodes[open+1 : close]) {
+			type read struct {
+				v    *variant
+				elem string
+			}
+			var marked []read
+			for _, n := range term {
+				walk(n, func(n *node) {
+					if n.kind == kVariant && n.v.text && n.v.elem != "" && isValueOf(n.v.base, fold.alias) {
+						marked = append(marked, read{n.v, n.v.elem})
+						n.v.elem = "_sf_e"
+					}
+				})
+			}
+			if len(marked) == 0 || mentionsQualifier(render(term), fold.alias) {
+				// No read of its VALUE, or a read of another column of it.
+				for _, r := range marked {
+					r.v.elem = r.elem
+				}
+				keep = and(keep, term)
+				continue
+			}
+			elems = and(elems, term)
+		}
+		if len(elems) == 0 {
+			continue
+		}
+		inner := seq(nil, fold.values.kids...)
+		fold.values.kids = append(append([]*node{raw("list_filter("), inner, raw(", lambda _sf_e: ")}, elems...), raw(")"))
+		if len(keep) == 0 {
+			keep = []*node{raw("true")}
+		}
+		out := append(append([]*node{}, nodes[:open+1]...), keep...)
+		nodes = append(out, nodes[close:]...)
+	}
+	return nodes, nil
 }
 
 // isValueOf reports whether base, a variant's base, is alias.VALUE.

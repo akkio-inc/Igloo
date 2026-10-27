@@ -31,6 +31,13 @@ type Options struct {
 	// that this dialect created as schema.name (lower-cased), which DuckDB
 	// keeps in temp.main (see temporary.go). Nil means it has none.
 	Temporary func(schema, name string) bool
+	// FlattenLists makes FLATTENs of columns whose select reads only their
+	// values unnest a list their FROM item's select list computes, rather
+	// than compute it in the lateral subquery (see listColumns): faster
+	// when the joins before a FLATTEN keep most of the item's rows, slower
+	// when they keep few. Result.FlattenLists counts the FLATTENs it would
+	// change, set or not.
+	FlattenLists bool
 }
 
 // Result is a translated statement.
@@ -67,6 +74,9 @@ type Result struct {
 	// the view's query has columns; DuckDB, as PostgreSQL does, names the
 	// first columns and leaves the others theirs, so Igloo checks it.
 	ViewColumns int
+	// FlattenLists is the number of FLATTENs that Options.FlattenLists
+	// changes.
+	FlattenLists int
 }
 
 // translator holds the state of one statement's translation.
@@ -115,6 +125,18 @@ type translator struct {
 	flattenOuts map[*node]string
 	structOuts  map[*node]*structOut
 	folds       map[*node]*structFold
+	// valueFolds holds the lists that FLATTENs of columns unnest as text,
+	// by the FLATTENs' lateral subqueries, and valueOns the ONs that whereOn
+	// gave their joins, as the nodes that open and close their conditions
+	// (see valueWhere).
+	valueFolds map[*node]*structFold
+	valueOns   map[*node][2]*node
+	// listCols holds the FLATTENs of columns, by their argument groups,
+	// whose FROM items' select lists compute the lists they unnest (see
+	// listColumns), and flattenLists counts those Options.FlattenLists
+	// would make so.
+	listCols     map[*node]*hoist
+	flattenLists int
 	// grouped holds the APPROX_COUNT_DISTINCT and HLL calls, by their
 	// names' nodes, of selects with GROUP BY (see collectGrouped).
 	grouped map[*node]bool
@@ -156,7 +178,8 @@ func Translate(sql string, opts Options) (Result, error) {
 		names: map[string]int{}, columnNames: map[string]int{}, structs: map[*node]*structFlatten{},
 		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, hoists: map[*node]*hoist{}, elemReads: map[*node]string{},
 		elemTexts: map[*node]bool{}, guarded: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
-		folds: map[*node]*structFold{}, textValues: map[*node]bool{}}
+		folds: map[*node]*structFold{}, textValues: map[*node]bool{}, valueFolds: map[*node]*structFold{}, valueOns: map[*node][2]*node{},
+		listCols: map[*node]*hoist{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true
@@ -185,7 +208,7 @@ func Translate(sql string, opts Options) (Result, error) {
 		return Result{SQL: sql, Untranslated: true, Quoted: t.quoted}, nil
 	}
 	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after, Temporary: created, Dropped: dropped,
-		ViewColumns: t.viewColumns}
+		ViewColumns: t.viewColumns, FlattenLists: t.flattenLists}
 	if cmd == "" {
 		res.SQL = strings.TrimRight(render(out), " \t\r\n")
 	}

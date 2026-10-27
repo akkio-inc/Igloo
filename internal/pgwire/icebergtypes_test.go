@@ -126,6 +126,12 @@ func TestSemiStructuredIcebergColumns(t *testing.T) {
 		parse_json('{"z":[1]}'), array_construct('p', 'q'), object_construct('city', 'Paris', 'zip', 75001), object_construct('a', 1)`)
 	check(query(sf, `select a[0]::string, a[2]:k::string, o:b::string, v:z[0]::int, st:city::string, m:a::int from sf_types`), "x|v|c|1|Paris|1")
 	check(query(sf, `select f.index, f.value::string from sf_types, lateral flatten(input => a) f order by 1`), "0|x\n1|1\n2|{\"k\":\"v\"}")
+	// The same rows in either form of a FLATTEN read only by its values (see
+	// flattenForms): DuckDB's pick, the other, then the faster.
+	for range 3 {
+		check(query(sf, `select f.value::string from sf_types, lateral flatten(input => a) f where f.value::string <> 'x' order by 1`),
+			"1\n{\"k\":\"v\"}")
+	}
 
 	// What schema browsers and clients see of them.
 	check(query(conn, `SELECT string_agg(column_name || ' ' || data_type, ', ' ORDER BY ordinal_position) FROM information_schema.columns
@@ -161,8 +167,11 @@ func TestMaskingSemiStructuredColumns(t *testing.T) {
 		t.Errorf("masked: %q", got)
 	}
 	mustExec(t, rita, "SET sql_dialect = 'snowflake'")
-	if got := rawTexts(t, rita, "select f.value::string, attrs:masked::string from ev, lateral flatten(input => tags) f"); !slices.Equal(got, []string{`***|yes`}) {
-		t.Errorf("masked, in Snowflake's dialect: %q", got)
+	// In either form of the FLATTEN (see flattenForms).
+	for range 3 {
+		if got := rawTexts(t, rita, "select f.value::string, attrs:masked::string from ev, lateral flatten(input => tags) f"); !slices.Equal(got, []string{`***|yes`}) {
+			t.Errorf("masked, in Snowflake's dialect: %q", got)
+		}
 	}
 }
 

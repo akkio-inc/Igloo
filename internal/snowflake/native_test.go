@@ -17,9 +17,16 @@ func nativeRows(t *testing.T, conn *sql.Conn, snowflake string) string {
 	if err != nil {
 		t.Fatalf("%s: %v", snowflake, err)
 	}
-	rows, err := conn.QueryContext(context.Background(), res.SQL)
+	return rowsOf(t, conn, res.SQL)
+}
+
+// rowsOf runs a statement in DuckDB's dialect and returns its rows as
+// nativeRows does.
+func rowsOf(t *testing.T, conn *sql.Conn, duck string) string {
+	t.Helper()
+	rows, err := conn.QueryContext(context.Background(), duck)
 	if err != nil {
-		t.Fatalf("%v\nSnowflake: %s\nDuckDB:    %s", err, snowflake, res.SQL)
+		t.Fatalf("%v\nDuckDB: %s", err, duck)
 	}
 	defer rows.Close()
 	types, err := rows.ColumnTypes()
@@ -43,7 +50,7 @@ func nativeRows(t *testing.T, conn *sql.Conn, snowflake string) string {
 		out = append(out, strings.Join(parts, "|"))
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("%v\nSnowflake: %s\nDuckDB:    %s", err, snowflake, res.SQL)
+		t.Fatalf("%v\nDuckDB: %s", err, duck)
 	}
 	return strings.Join(out, "\n")
 }
@@ -929,6 +936,81 @@ func TestFlattenListsHoisted(t *testing.T) {
 		if got, want := nativeRows(t, conn, text), nativeRows(t, conn, fmt.Sprintf(q, ", outer => false")); got != want {
 			t.Errorf("%s\n got %q\nwant %q", text, got, want)
 		}
+	}
+}
+
+// TestFlattenValuesFiltered checks FLATTENs of a column whose select reads
+// only their values, as text, under a WHERE that filters those values, with
+// Options.FlattenLists: the FROM item's select list computes the list (see
+// listColumns), the conditions on the values filter it where the lateral
+// subquery unnests it (see valueWhere), the others stay in its join's ON,
+// and DuckDB plans no dependent join; the rows are those of the same FLATTEN
+// filtered above it, and of the translation without the option.
+func TestFlattenValuesFiltered(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE TABLE tagged AS SELECT * FROM (VALUES (1, ['a', 'b', 'unknown'], DATE '2025-02-01'),
+			(2, ['{"k": 1}', NULL, 'c', ''], DATE '2025-01-01'), (3, [], DATE '2025-02-02'), (4, NULL, DATE '2025-02-03'),
+			(5, ['B', 'x', '5'], DATE '2025-02-04')) v(id, tags, seen)`,
+		`CREATE TABLE members AS SELECT * FROM (VALUES (1), (2), (5)) v(id)`,
+	} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct{ q, filtered string }{
+		// Conditions on the values and on the table, after a join.
+		{`select distinct t.id, f.value::string as tag from tagged as t inner join members as m on m.id = t.id,
+			lateral flatten(input => t.tags) as f where t.seen >= '2025-01-15'::date and not f.value is null
+			and lower(f.value::string) <> 'unknown' and f.value::string <> '' order by 1, 2`,
+			`select distinct id, tag from (select t.id, t.seen, f.value::string as tag from tagged as t inner join members as m
+			on m.id = t.id, lateral flatten(input => t.tags) as f) where seen >= '2025-01-15'::date and not tag is null
+			and lower(tag) <> 'unknown' and tag <> '' order by 1, 2`},
+		// Only on the values, which leaves the ON none.
+		{`select t.id, f.value::string from tagged t, lateral flatten(input => t.tags) f where f.value::string <> 'a' order by 1, 2`,
+			`select id, v from (select t.id, f.value::string as v from tagged t, lateral flatten(input => t.tags) f) where v <> 'a'
+			order by 1, 2`},
+		// One that reads the table too, which the lambda captures.
+		{`select t.id, f.value::string from tagged t, lateral flatten(t.tags) f where f.value::string <> t.id::string and t.id > 1
+			order by 1, 2`,
+			`select id, v from (select t.id, f.value::string as v from tagged t, lateral flatten(t.tags) f) where v <> id::string
+			and id > 1 order by 1, 2`},
+	} {
+		res, err := Translate(c.q, Options{FlattenLists: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.FlattenLists != 1 {
+			t.Errorf("FlattenLists %d, want 1", res.FlattenLists)
+		}
+		if !strings.Contains(res.SQL, "sf_flatten_strings(t.tags, 'BOTH') AS _sf_l1") || !strings.Contains(res.SQL, "unnest(list_filter(t._sf_l1, ") {
+			t.Errorf("values not filtered where they are unnested:\n%s", res.SQL)
+		}
+		if plan := explain(t, conn, res.SQL); strings.Contains(plan, "DELIM_JOIN") {
+			t.Errorf("a dependent join:\n%s\n%s", res.SQL, plan)
+		}
+		if got, want := rowsOf(t, conn, res.SQL), nativeRows(t, conn, c.filtered); got != want {
+			t.Errorf("%s\n got %q\nwant %q", c.q, got, want)
+		}
+		// Without the option, the same rows from a list the lateral
+		// subquery computes.
+		lateral, err := Translate(c.q, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lateral.FlattenLists != 1 || strings.Contains(lateral.SQL, "_sf_l1") {
+			t.Errorf("without FlattenLists, %d:\n%s", lateral.FlattenLists, lateral.SQL)
+		}
+		if got, want := rowsOf(t, conn, lateral.SQL), nativeRows(t, conn, c.filtered); got != want {
+			t.Errorf("%s laterally\n got %q\nwant %q", c.q, got, want)
+		}
+	}
+	// A FLATTEN of a column whose other columns its select reads stays as it
+	// was.
+	if res, err := Translate(`select f.index, f.value from tagged t, lateral flatten(t.tags) f`, Options{FlattenLists: true}); err != nil ||
+		res.FlattenLists != 0 || strings.Contains(res.SQL, "_sf_l1") {
+		t.Errorf("a FLATTEN read by its INDEX: %d, %v\n%s", res.FlattenLists, err, res.SQL)
 	}
 }
 
