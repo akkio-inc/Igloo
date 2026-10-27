@@ -392,6 +392,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   reach
 - [Media analytics](docs/media-analytics.md): reach and frequency with
   sketches, geospatial reporting, approximate and statistical functions
+- [ML functions](docs/ml-functions.md): models trained and scored in SQL,
+  with Snowflake's `SNOWFLAKE.ML` classes
 - [Workload management](docs/workload-management.md): query tags, usage and
   cost per client, role limits, compute pools
 - [Delta Sharing](docs/sharing.md): sharing tables with outside recipients,

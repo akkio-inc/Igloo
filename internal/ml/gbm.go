@@ -60,6 +60,9 @@ type Params struct {
 	// Threads bounds the goroutines training uses (default one per CPU).
 	// The model does not depend on it.
 	Threads int
+	// Interrupt, if set, is asked before each round whether to stop:
+	// training then fails with its error.
+	Interrupt func() error
 }
 
 func (p Params) withDefaults(n int) Params {
@@ -268,6 +271,11 @@ func (t *trainer) run(vdata *binned, vy []float64) (*GBM, TrainInfo, error) {
 		}
 	}
 	for round := range t.p.Rounds {
+		if t.p.Interrupt != nil {
+			if err := t.p.Interrupt(); err != nil {
+				return nil, info, err
+			}
+		}
 		if K > 1 {
 			// Every class's gradients from this round's scores, before any
 			// of its trees changes them.

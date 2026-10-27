@@ -50,7 +50,9 @@ type Result struct {
 	// ColumnName); Snowflake folds every other name to upper case.
 	Quoted map[string]bool
 	// Untranslated says the statement was passed on as written: it reads
-	// PostgreSQL's catalog, as drivers and BI tools do to list tables.
+	// PostgreSQL's catalog, as drivers and BI tools do to list tables, or
+	// it is a statement on Snowflake's ML classes, which Igloo reads itself
+	// (ParseModelStatement).
 	Untranslated bool
 	// After are Igloo statements, in DuckDB's dialect, to run once SQL has
 	// succeeded, as part of it: the clustering key of CREATE TABLE ...
@@ -122,6 +124,9 @@ type translator struct {
 	// columnNames those of them that name FLATTEN's columns, to tell
 	// whether it reads a FLATTEN's THIS (see thisWanted).
 	names, columnNames map[string]int
+	// asWritten says the statement passes on as written: a statement on
+	// Snowflake's ML classes, which Igloo reads itself (see model.go).
+	asWritten bool
 }
 
 func (t *translator) notice(format string, args ...any) {
@@ -175,6 +180,9 @@ func Translate(sql string, opts Options) (Result, error) {
 	out, cmd, err := t.statement(nodes)
 	if err != nil {
 		return Result{}, err
+	}
+	if t.asWritten {
+		return Result{SQL: sql, Untranslated: true, Quoted: t.quoted}, nil
 	}
 	res := Result{Command: cmd, Notices: t.notices, Quoted: t.quoted, After: t.after, Temporary: created, Dropped: dropped,
 		ViewColumns: t.viewColumns}
@@ -277,6 +285,10 @@ func quoteKeywordQualifiers(toks []token) {
 func (t *translator) statement(nodes []*node) ([]*node, string, error) {
 	idx := sig(nodes)
 	if len(idx) == 0 {
+		return nodes, "", nil
+	}
+	if isModelStatement(nodes) {
+		t.asWritten = true
 		return nodes, "", nil
 	}
 	w := func(k int) string {

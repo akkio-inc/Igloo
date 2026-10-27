@@ -234,6 +234,10 @@ func startTestWorkerRB(t *testing.T, dir string, i int, gate *taskGate, rb strin
 		}
 	}
 	setup.Close()
+	// Workers score models, reading their blobs from the warehouse, dir.
+	if err := registerModelScoring(c, dir); err != nil {
+		t.Fatal(err)
+	}
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: workerEngine{c, gate}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
 		Locations: []string{dir}, Cores: 1, MemoryBytes: 1 << 30,
@@ -322,6 +326,8 @@ func startDistServerRB(t *testing.T, dir string, workers int, rb string, coordin
 		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
 	}
 	ds.catalogServer = startCatalogServerWithConfig(t, cfg, append([]func(*Options){func(o *Options) { o.Distributed = co }}, configure...)...)
+	// Models' blobs go to the warehouse, where the workers read them.
+	ds.srv.modelRuntime.SetBlobs(localBlobs(dir))
 	conn, err := ds.srv.engine.Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)

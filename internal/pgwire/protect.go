@@ -25,6 +25,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -477,6 +478,10 @@ var safeTableFunctions = func() map[string]bool {
 		"igloo_policy_references": true, "igloo_tag_references": true,
 		// They change and list table properties, and read no rows.
 		"iceberg_table_properties": true,
+		// A model's method's result, computed before the statement was
+		// prepared from what its user reads, policies applied (see
+		// mlrewrite.go).
+		models.ResultFunction: true,
 	}
 	for f := range allowedFunctions {
 		m[f] = true

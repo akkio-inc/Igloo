@@ -13,6 +13,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- Models trained and scored in SQL, as Snowflake's ML classes:
+  `SNOWFLAKE.ML.FORECAST` and `ANOMALY_DETECTION` (Snowflake's `fast`
+  method, many series, exogenous columns, intervals from
+  cross-validation), `CLASSIFICATION` (`m!PREDICT(INPUT_DATA => {*})`) and
+  `TOP_INSIGHTS` (`GET_DRIVERS`), their methods by `CALL` or as
+  `TABLE(m!...)`, and `SHOW`, `DROP` and `GRANT` of models; and
+  Databricks' `ai_predict_class` and `ai_predict_value`, which train and
+  score in one query (see [ML functions](docs/ml-functions.md)). Igloo's
+  engine trains gradient-boosted trees in Go, repeatably; training reads
+  its input as its user, policies applied, and `PREDICT` runs on workers.
+  A model's row is in the metadata database and its blob in the
+  warehouse.
 - Snowflake's `VECTOR(FLOAT | INT, n)` type and `VECTOR_COSINE_SIMILARITY`,
   `VECTOR_INNER_PRODUCT`, `VECTOR_L1_DISTANCE` and `VECTOR_L2_DISTANCE`,
   which Igloo refused. A vector is DuckDB's fixed-size array; an Iceberg

@@ -63,6 +63,11 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}
+	// Workers score models in the statements they run, reading blobs from
+	// the warehouse with the same credentials as its tables' files.
+	if err := e.setupModels(ctx, cfg, false); err != nil {
+		return fmt.Errorf("register model functions: %w", err)
+	}
 	for _, stmt := range storageStatements(cfg.Storage) {
 		if err := exec(stmt); err != nil {
 			// Never echo the statement: it can contain a secret key.

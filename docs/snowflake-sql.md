@@ -370,6 +370,12 @@ and the vector functions refuse vectors of different dimensions.
   and refused at others; parameters about
   clients, caching and queuing change nothing. `ALTER SESSION UNSET`
   resets them.
+- Snowflake's ML classes: `CREATE SNOWFLAKE.ML.FORECAST`,
+  `ANOMALY_DETECTION`, `CLASSIFICATION` and `TOP_INSIGHTS`, `DROP`,
+  `SHOW` and `GRANT` of models, `CALL m!METHOD(...)`,
+  `SELECT * FROM TABLE(m!METHOD(...))` and `m!PREDICT(INPUT_DATA => {*})`,
+  with `SYSTEM$REFERENCE`, `SYSTEM$QUERY_REFERENCE` and `TABLE(...)`
+  inputs. See [ML functions](ml-functions.md).
 
 ## Known differences
 
@@ -497,17 +503,24 @@ These fail with SQLSTATE `0A000` and a hint:
   files with `COPY INTO` from a location in `IGLOO_ALLOWED_LOCATIONS` (see
   [loading data](loading.md)).
 - Snowflake Scripting (`BEGIN ... END`, `DECLARE`, `EXECUTE IMMEDIATE`,
-  `CALL`) and `CREATE FUNCTION` or `PROCEDURE`: send the statements one at a
-  time; admins can create DuckDB macros.
+  `CALL` of a procedure) and `CREATE FUNCTION` or `PROCEDURE`: send the
+  statements one at a time; admins can create DuckDB macros. `CALL` of a
+  model's method is [Igloo's](ml-functions.md).
 - `INSERT OVERWRITE`, `INSERT ALL` and `INSERT FIRST`; `ALTER TABLE ... SWAP
   WITH`; `UNDROP`; `CREATE DATABASE`, `WAREHOUSE`, `SEQUENCE`, `STREAM` and
   `DYNAMIC TABLE`; `AUTOINCREMENT` and `IDENTITY` columns; `COLLATE`.
 - `CONNECT BY`, the `(+)` outer join, `MATCH_RECOGNIZE`, `CHANGES`,
-  `BEFORE (...)` and `AT (STATEMENT => ...)`, `RESULT_SCAN`, `SEMANTIC_VIEW`
-  and model methods (`model!PREDICT`).
+  `BEFORE (...)` and `AT (STATEMENT => ...)`, `RESULT_SCAN` and
+  `SEMANTIC_VIEW`.
+- Snowflake's ML classes other than those [Igloo has](ml-functions.md)
+  (`SNOWFLAKE.ML.CUSTOM_CLASSIFIER` and the like), the Model Registry's
+  `MODEL(...)!method`, a model's methods in an expression other than
+  `PREDICT` (call them with `CALL` or `TABLE(...)`), and views, macros and
+  materialized views that call a model's methods.
 - `PIVOT ... IN (ANY)`, `IN (SELECT ...)` and `DEFAULT ON NULL`: list the
   values.
-- `OBJECT_CONSTRUCT(*)` and `{*}`: name the keys and values.
+- `OBJECT_CONSTRUCT(*)` and `{*}`, except as a model's `PREDICT` input:
+  name the keys and values.
 - Functions without a faithful translation, such as `OBJECT_DELETE`,
   `OBJECT_PICK`, `ARRAY_SORT`, `PARSE_XML`, `SOUNDEX`,
   `CONDITIONAL_CHANGE_EVENT`, `ENCRYPT` and `DECRYPT`, `REGEXP_REPLACE`

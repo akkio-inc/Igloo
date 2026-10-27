@@ -8,7 +8,8 @@ import (
 // clauses translates or refuses Snowflake's clauses of FROM and of joins
 // that DuckDB lacks or reads otherwise: ASOF JOIN ... MATCH_CONDITION,
 // DIRECTED joins, time travel by OFFSET, BEFORE and CHANGES, stages,
-// CONNECT BY, the (+) outer join and model methods.
+// CONNECT BY and the (+) outer join. Models' methods are translated before
+// (see modelMethods).
 func (t *translator) clauses(nodes []*node) ([]*node, error) {
 	for i := 0; i < len(nodes); i++ {
 		n := nodes[i]
@@ -16,8 +17,6 @@ func (t *translator) clauses(nodes []*node) ([]*node, error) {
 		switch {
 		case n.isOp("@"):
 			return nil, unsupported("stages (@stage)", "load files with COPY INTO from a location in IGLOO_ALLOWED_LOCATIONS")
-		case n.isOp("!") && next >= 0 && nodes[next].kind == kWord:
-			return nil, unsupported("model methods (model!METHOD)", "")
 		case n.isGroup('(') && len(sig(n.kids)) == 1 && n.kids[sig(n.kids)[0]].isOp("+"):
 			return nil, unsupported("the (+) outer join operator", "write the join as LEFT JOIN ... ON")
 		case n.word() == "CONNECT" && next >= 0 && nodes[next].word() == "BY",

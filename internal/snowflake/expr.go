@@ -9,6 +9,11 @@ import (
 // seq translates a list of nodes: the groups in it first, then the
 // constructs at its own level. top says the list is a whole statement.
 func (t *translator) seq(nodes []*node, top bool) ([]*node, error) {
+	// Models' methods first: their arguments are not expressions.
+	nodes, err := t.modelMethods(nodes)
+	if err != nil {
+		return nil, err
+	}
 	for _, n := range nodes {
 		if n.kind == kGroup {
 			kids, err := t.seq(n.kids, false)
@@ -18,7 +23,6 @@ func (t *translator) seq(nodes []*node, top bool) ([]*node, error) {
 			n.kids = kids
 		}
 	}
-	var err error
 	for _, pass := range []func([]*node) ([]*node, error){
 		t.clauses, t.literals, t.calls, t.tableFunctions, t.sample, t.values, t.paths, t.casts, t.variantModes,
 		t.operators, t.implicitCasts, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere,

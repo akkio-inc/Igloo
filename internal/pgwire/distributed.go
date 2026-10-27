@@ -23,6 +23,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -806,8 +807,13 @@ func (e *sessionEnv) Describe(ctx context.Context, query string) ([]distributed.
 // defined, rather than one built into DuckDB or its extensions. Igloo's
 // own macros for Snowflake's functions (snowflake.Macros), which workers
 // define too, count as built in while the session's are exactly those:
-// redefining any of them makes them all the session's own.
+// redefining any of them makes them all the session's own. So does the
+// function that scores models (models.PredictFunction), which workers
+// define too, reading models' blobs from the warehouse.
 func (e *sessionEnv) UserFunction(ctx context.Context, name string) (bool, error) {
+	if strings.EqualFold(name, models.PredictFunction) {
+		return false, nil
+	}
 	if e.userFns == nil {
 		defs, err := macroDefinitions(ctx, e.sess.conn, `NOT internal`)
 		if err != nil {

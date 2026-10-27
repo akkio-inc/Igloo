@@ -44,6 +44,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/prefetch"
@@ -278,6 +279,13 @@ type Options struct {
 	// parts on workers (docs/distributed-execution.md).
 	Distributed *distributed.Coordinator
 
+	// Models keeps the rows of models (Snowflake's ML classes; see
+	// models.go). Nil means a store in memory. ModelRuntime holds their
+	// blobs and scores them; nil means the engine's (engine.Models), or
+	// one in memory.
+	Models       models.Store
+	ModelRuntime *models.Runtime
+
 	// external and externalFiles stand in for Sharing's external tables
 	// and the prefix of their files, and partners for its recipients and
 	// providers, in tests.
@@ -345,6 +353,9 @@ type Server struct {
 	ai         *ai.Runtime
 	aiMaxCalls int64
 	aiMaxCost  float64
+	// models keeps models' rows, and modelRuntime their blobs.
+	models       models.Store
+	modelRuntime *models.Runtime
 	// clonePurge is Options.ClonePurge (see catalogguard.go).
 	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
@@ -581,6 +592,21 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 			Cache: true, MaxCalls: 1000, MaxCostUSD: 1, Log: log})
 	}
 	s.aiMaxCalls, s.aiMaxCost = s.ai.Caps()
+	s.models, s.modelRuntime = opts.Models, opts.ModelRuntime
+	if s.models == nil {
+		s.models = models.NewMemoryStore()
+	}
+	if s.modelRuntime == nil {
+		if e, ok := engine.(interface{ Models() *models.Runtime }); ok {
+			s.modelRuntime = e.Models()
+		}
+	}
+	if s.modelRuntime == nil {
+		s.modelRuntime = models.NewRuntime()
+	}
+	if s.modelRuntime.Blobs() == nil {
+		s.modelRuntime.SetBlobs(models.NewMemory())
+	}
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
 	}
@@ -762,6 +788,14 @@ type session struct {
 	// Snowflake's dialect created in a schema's name, which DuckDB keeps in
 	// temp.main (see noteTemporary).
 	sfTemps map[snowflake.TempName]bool
+	// modelResults are the tokens of models' methods' results the
+	// session's statements read, and modelMemo the token of each method
+	// call the statement being parsed has computed (see mlrewrite.go).
+	modelResults []string
+	modelMemo    map[string]string
+	// modelPins are the models the session's ai_predict calls trained,
+	// which the runtime keeps until the session ends.
+	modelPins []string
 	// changes counts the statements in the transaction block that may have
 	// changed something, and savepoints are its savepoints (see
 	// savepointCommand).
@@ -991,6 +1025,7 @@ func (s *Server) closeSession(ctx context.Context) error {
 	s.metrics.sessionClosed(string(sess.currentUser().Role))
 
 	sess.closeCursors(ctx, true)
+	sess.dropModelResults(s.modelRuntime)
 	var errs []error
 	for ps := range sess.open {
 		errs = append(errs, sess.release(ps))
@@ -1353,6 +1388,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	}
 
 	s.refreshLimits(ctx, sess, user)
+	// Models' methods are computed once per statement as it is parsed,
+	// however many times parsing tries it (see modelRewrite).
+	sess.modelMemo = nil
 	if ps, ok := s.dialectCommand(sess, q.Query); ok {
 		return ps, nil
 	}
@@ -1511,6 +1549,19 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 	if err := sess.checkAborted(q.Query); err != nil {
 		s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
 		return nil, err
+	}
+
+	// Statements on Snowflake's ML classes, and models' methods in queries
+	// (see models.go and mlrewrite.go).
+	if ps, ok, err := s.modelStatement(ctx, sess, q); ok || err != nil {
+		return ps, err
+	}
+	if rewritten, err := s.modelRewrite(ctx, sess, user, q.Query); err != nil {
+		err = pgError(err)
+		s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+		return nil, err
+	} else if rewritten != q.Query {
+		q.Query = rewritten
 	}
 
 	if stmt, ok := s.statementTimeoutCommand(sess, q.Query); ok {

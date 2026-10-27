@@ -13,6 +13,9 @@ import (
 // training never saw.
 const (
 	missingBin = 0
+	// MissingBin is the bin of a missing value, for scorers that bin
+	// values themselves.
+	MissingBin = missingBin
 	maxBins    = 256
 	// binSample is how many values numeric bins are cut from.
 	binSample = 200_000

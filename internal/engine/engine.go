@@ -23,6 +23,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
@@ -79,6 +80,8 @@ type Engine struct {
 	erasure atomic.Pointer[erasureConfig]
 	// aiHook connects the AI functions to sessions; see SetAI.
 	aiHook atomic.Pointer[aiHookBox]
+	// models scores models and serves their methods' results (see Models).
+	models *models.Runtime
 	// catMu keeps binding, walking and changing the attached catalog's
 	// in-memory set of tables apart. See CatalogLock. catLocked is when it
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
@@ -581,6 +584,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	}
 	if err := e.registerAI(ctx); err != nil {
 		return fmt.Errorf("register the AI functions: %w", err)
+	}
+	if err := e.setupModels(ctx, cfg, true); err != nil {
+		return fmt.Errorf("register model functions: %w", err)
 	}
 
 	if cfg.Catalog.URI == "" {

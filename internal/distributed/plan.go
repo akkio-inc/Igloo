@@ -2505,7 +2505,8 @@ func (pl *planner) checkTimeColumns(stmt node) error {
 }
 
 // sessionFunctions depend on the session or the machine they run on, so
-// workers would compute something else.
+// workers would compute something else. igloo_ml_score scores a model
+// that only the server that trained it for the statement has.
 var sessionFunctions = map[string]bool{
 	"getvariable": true, "current_setting": true, "current_schema": true, "current_schemas": true,
 	"current_database": true, "current_catalog": true, "current_query": true, "current_role": true,
@@ -2514,7 +2515,7 @@ var sessionFunctions = map[string]bool{
 	"has_any_column_privilege": true, "has_column_privilege": true, "has_database_privilege": true,
 	"has_function_privilege": true, "has_language_privilege": true, "has_schema_privilege": true,
 	"has_sequence_privilege": true, "has_server_privilege": true, "has_table_privilege": true,
-	"has_tablespace_privilege": true, "pg_has_role": true, "version": true,
+	"has_tablespace_privilege": true, "pg_has_role": true, "version": true, "igloo_ml_score": true,
 }
 
 // checkFunctions refuses a fragment that calls a function workers would

@@ -50,6 +50,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/openlineage"
 	"github.com/akkio-inc/igloo/internal/pgwire"
@@ -253,6 +254,11 @@ func serve() error {
 		return err
 	}
 	defer aiRuntime.Store().Close()
+	modelStore, err := openModels(startCtx, cfg, log)
+	if err != nil {
+		return err
+	}
+	defer modelStore.Close()
 	cancel()
 
 	reg := prometheus.NewRegistry()
@@ -477,6 +483,7 @@ func serve() error {
 		Clones:              clones,
 		Lineage:             lineage,
 		Distributed:         dist,
+		Models:              modelStore,
 		Erasure:             eraser,
 		CleanRooms:          rooms,
 	}
@@ -867,6 +874,21 @@ func openTasks(ctx context.Context, cfg config.Config, log *slog.Logger) (tasks.
 	store, err := tasks.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("tasks: %w", err)
+	}
+	return store, nil
+}
+
+// openModels opens where models' rows and grants are kept (their blobs
+// are in the warehouse): the metadata database, shared by every replica,
+// or else this replica's memory.
+func openModels(ctx context.Context, cfg config.Config, log *slog.Logger) (models.Store, error) {
+	if cfg.MetadataDatabaseURL == "" {
+		log.Warn("IGLOO_METADATA_DATABASE_URL is not set; models (SNOWFLAKE.ML classes) are kept in memory and lost on restart")
+		return models.NewMemoryStore(), nil
+	}
+	store, err := models.OpenPostgres(ctx, cfg.MetadataDatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("models: %w", err)
 	}
 	return store, nil
 }
