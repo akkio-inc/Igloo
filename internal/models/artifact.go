@@ -38,10 +38,11 @@ type Artifact struct {
 	Forecaster *Forecaster `json:"forecaster,omitempty"`
 	Regressor  *Regressor  `json:"regressor,omitempty"`
 	// Igloo's classes' models.
-	Supervised *Supervised `json:"supervised,omitempty"`
-	Clusters   *Clusters   `json:"clusters,omitempty"`
-	Components *Components `json:"components,omitempty"`
-	Factors    *Factors    `json:"factors,omitempty"`
+	Supervised  *Supervised  `json:"supervised,omitempty"`
+	Clusters    *Clusters    `json:"clusters,omitempty"`
+	Components  *Components  `json:"components,omitempty"`
+	Factors     *Factors     `json:"factors,omitempty"`
+	Autoencoder *Autoencoder `json:"autoencoder,omitempty"`
 }
 
 // iglooModel is a model of one of Igloo's classes.
@@ -67,6 +68,8 @@ func (a *Artifact) igloo() iglooModel {
 		return a.Components
 	case a.Factors != nil:
 		return a.Factors
+	case a.Autoencoder != nil:
+		return a.Autoencoder
 	}
 	return nil
 }

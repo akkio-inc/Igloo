@@ -327,6 +327,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `KMEANS` | `IGLOO.ML.KMEANS` | `'num_clusters'`, or none to pick one |
 | `PCA` | `IGLOO.ML.PCA` | `'num_principal_components'` or `'pca_explained_variance_ratio'` |
 | `MATRIX_FACTORIZATION` | `IGLOO.ML.MATRIX_FACTORIZATION` | `USER_COLNAME`, `ITEM_COLNAME`, `RATING_COLNAME` arguments; `'feedback_type'` |
+| `AUTOENCODER` | `IGLOO.ML.AUTOENCODER` | `'hidden_units'`, the narrowest the latent space |
 | `ARIMA_PLUS`, `ARIMA_PLUS_XREG` | `SNOWFLAKE.ML.FORECAST` | a different method, with intervals |
 | `CONTRIBUTION_ANALYSIS` | `SNOWFLAKE.ML.TOP_INSIGHTS` | |
 | `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, `XGBOOST` imports, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
@@ -335,7 +336,8 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 |---|---|---|
 | `ML.PREDICT` | `PREDICT` | all |
 | `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION` |
-| `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS`, `PCA` |
+| `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS`, `PCA`, `AUTOENCODER` |
+| `ML.RECONSTRUCTION_LOSS` | `RECONSTRUCTION_LOSS` | `AUTOENCODER` |
 | `ML.CENTROIDS` | `CENTROIDS` | `KMEANS` |
 | `ML.PRINCIPAL_COMPONENTS`, `ML.PRINCIPAL_COMPONENT_INFO` | `PRINCIPAL_COMPONENTS`, `PRINCIPAL_COMPONENT_INFO` | `PCA` |
 | `ML.RECOMMEND` | `RECOMMEND` | `MATRIX_FACTORIZATION` |
@@ -344,12 +346,12 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | the regressions and classifiers |
 | `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
 | `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
-| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, networks, `KMEANS`, `MATRIX_FACTORIZATION` |
+| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, networks (`AUTOENCODER` too), `KMEANS`, `MATRIX_FACTORIZATION` |
 
 ### Row methods and table methods
 
 **Row methods** (`PREDICT`, `EXPLAIN_PREDICT`, `DETECT_ANOMALIES`,
-`RECOMMEND`) give a value per row. In a
+`RECOMMEND`, `RECONSTRUCTION_LOSS`) give a value per row. In a
 query, `m!PREDICT(INPUT_DATA => {*})` is a JSON object, as Snowflake's
 `PREDICT` is; called as a table, as BigQuery's functions are,
 `TABLE(m!PREDICT(INPUT_DATA => TABLE(t)))` returns the input's rows and
@@ -557,6 +559,33 @@ item add up (implicit feedback) or are averaged (explicit).
 | `RECOMMEND` | for each row of `INPUT_DATA` (its user column), the `top_k` items (default 10), best first, as rows of the input's columns, the item column and the prediction; `'exclude_seen': TRUE` leaves out the items the user rated in the training data (Igloo keeps them for inputs of up to 50 million interactions). A user the model never saw gets the items of highest bias (explicit) or none (implicit). Without `INPUT_DATA`, it recommends to every user the model knows |
 | `EVALUATE` | on the held-out interactions or `INPUT_DATA`'s: a regression's metrics for explicit ratings; for implicit feedback, over up to 1,000 users, `mean_average_precision` and `normalized_discounted_cumulative_gain` of the held-out items among those each user did not rate in training, `average_rank` (their mean percentile rank, 0 at the top) and `mean_squared_error` |
 | `TRAINING_INFO` | each iteration's training loss: explicit ratings' root mean squared error, implicit feedback's weighted squared error per user |
+
+### AUTOENCODER
+
+```sql
+CREATE IGLOO.ML.AUTOENCODER demo.session_shapes(
+    INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT pages, seconds, clicks, spend, channel FROM demo.sessions'),
+    CONFIG_OBJECT => {'hidden_units': [32, 4, 32]});
+
+SELECT * FROM TABLE(demo.session_shapes!DETECT_ANOMALIES(INPUT_DATA => TABLE(demo.sessions_today),
+                                                          CONFIG_OBJECT => {'contamination': 0.005}))
+WHERE is_anomaly;
+```
+
+A network that rebuilds every column, standardized and one hot, through
+its narrowest hidden layer, the latent space (the middle one if several
+are as narrow), which is linear; the other layers take `activation_fn`.
+`hidden_units` defaults to half the encoded columns (4 to 64), a quarter
+of them (2 to 16), and half again; the other options and the training are
+the DNN classes'. Rows held out by `data_split_method` measure it.
+
+| Method | Returns |
+|---|---|
+| `PREDICT` | `latent_col_1`, `latent_col_2`, ...: the row in the latent space |
+| `RECONSTRUCTION_LOSS` | the row's `mean_absolute_error`, `mean_squared_error` and `mean_squared_log_error` (negative values' logs taken as 0's), over its encoded columns |
+| `DETECT_ANOMALIES` | `is_anomaly` and `mean_squared_error`, against the training rows' errors by `CONFIG_OBJECT => {'contamination': x}` |
+| `EVALUATE` | the three errors' means, on the held-out rows (or the training rows without them) or on `INPUT_DATA` |
+| `TRAINING_INFO` | each epoch's training and validation loss |
 
 ## Train and score in one query
 

@@ -198,6 +198,35 @@ func TestIglooDNN(t *testing.T) {
 		CONFIG_OBJECT => {'hidden_units': 64})`, "22023", "hidden_units takes an array")
 }
 
+func TestIglooAutoencoder(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, measuresTable)
+	conn := snowflakeConn(t, cs.admin)
+	mustExec(t, conn, `CREATE IGLOO.ML.AUTOENCODER squeeze(INPUT_DATA => SYSTEM$QUERY_REFERENCE(
+		'SELECT impressions, clicks, spend, visits, signups FROM measures WHERE person_id <= 600'),
+		CONFIG_OBJECT => {'hidden_units': [8, 2, 8], 'learn_rate': 0.01})`)
+	if n := count(t, conn, `SELECT count(*) FROM TABLE(squeeze!PREDICT(INPUT_DATA => TABLE(measures)))
+		WHERE latent_col_1 IS NOT NULL AND latent_col_2 IS NOT NULL`); n != 605 {
+		t.Errorf("%d of 605 rows in the latent space", n)
+	}
+	if got := texts(t, conn, `SELECT avg(mean_squared_error) < 0.05 FROM TABLE(squeeze!RECONSTRUCTION_LOSS(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT * FROM measures WHERE person_id <= 600')))`); len(got) != 1 || got[0] != "true" {
+		t.Errorf("RECONSTRUCTION_LOSS: %q", got)
+	}
+	if got := texts(t, conn, `SELECT count(*) FILTER (WHERE person_id > 600), count(*) <= 12 FROM TABLE(squeeze!DETECT_ANOMALIES(
+		INPUT_DATA => TABLE(measures), CONFIG_OBJECT => {'contamination': 0.01})) WHERE is_anomaly`); len(got) != 1 || got[0] != "5|true" {
+		t.Errorf("anomalies: %q", got)
+	}
+	if n := count(t, conn, `SELECT count(*) FROM measures WHERE person_id > 600
+		AND squeeze!DETECT_ANOMALIES(INPUT_DATA => {*}, CONFIG_OBJECT => {'contamination': 0.01}):is_anomaly::BOOLEAN`); n != 5 {
+		t.Errorf("in a query, %d of 5 anomalies", n)
+	}
+	if got := texts(t, conn, "SELECT mean_squared_error < 0.05 FROM TABLE(squeeze!EVALUATE())"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("EVALUATE: %q", got)
+	}
+}
+
 func TestIglooRegression(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()

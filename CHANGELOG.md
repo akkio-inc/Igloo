@@ -31,15 +31,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `IGLOO.ML.DNN_REGRESSOR` and `DNN_CLASSIFIER` (networks trained by Adam,
   with dropout and early stopping), `IGLOO.ML.KMEANS` (`CENTROIDS`, and
   `DETECT_ANOMALIES` by distance), `IGLOO.ML.PCA` (projections,
-  components, and anomalies by reconstruction error) and
+  components, and anomalies by reconstruction error),
   `IGLOO.ML.MATRIX_FACTORIZATION` (explicit and implicit feedback by ALS,
-  `RECOMMEND`). `CONFIG_OBJECT` takes BigQuery's options and the models'
-  methods are its functions: `PREDICT`, `EXPLAIN_PREDICT`,
-  `DETECT_ANOMALIES` and `RECOMMEND` in a query or as tables of the
-  input's rows, scored on workers, and `EVALUATE`, `CONFUSION_MATRIX`,
-  `ROC_CURVE`, `GLOBAL_EXPLAIN`, `FEATURE_IMPORTANCE`, `WEIGHTS`,
-  `TRAINING_INFO` and the like. Inputs above 10 million rows are sampled
-  repeatably.
+  `RECOMMEND`) and `IGLOO.ML.AUTOENCODER` (latent spaces,
+  `RECONSTRUCTION_LOSS`, anomalies). `CONFIG_OBJECT` takes BigQuery's
+  options and the models' methods are its functions: `PREDICT`,
+  `EXPLAIN_PREDICT`, `DETECT_ANOMALIES` and `RECOMMEND` in a query or as
+  tables of the input's rows, scored on workers, and `EVALUATE`,
+  `CONFUSION_MATRIX`, `ROC_CURVE`, `GLOBAL_EXPLAIN`, `FEATURE_IMPORTANCE`,
+  `WEIGHTS`, `TRAINING_INFO` and the like. Inputs above 10 million rows
+  are sampled repeatably.
 - Snowflake's `VECTOR(FLOAT | INT, n)` type and `VECTOR_COSINE_SIMILARITY`,
   `VECTOR_INNER_PRODUCT`, `VECTOR_L1_DISTANCE` and `VECTOR_L2_DISTANCE`,
   which Igloo refused. A vector is DuckDB's fixed-size array; an Iceberg
