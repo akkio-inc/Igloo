@@ -63,11 +63,19 @@ func (t *Tree) shap(row []uint8, phi []float64) {
 	if len(t.Nodes) == 0 || t.Nodes[0].IsLeaf() {
 		return
 	}
-	t.shapNode(row, phi, 0, 0, nil, 1, 1, -1)
+	// Each level of the recursion keeps its path in the buffer after its
+	// parent's: depth d's takes d+1 elements.
+	d := t.maxDepth
+	if d == 0 {
+		d = t.depth()
+	}
+	buf := make([]pathElem, (d+2)*(d+3)/2)
+	t.shapNode(row, phi, 0, 0, nil, buf, 1, 1, -1)
 }
 
-func (t *Tree) shapNode(row []uint8, phi []float64, node, depth int, parent []pathElem, pz, po float64, pf int) {
-	path := make([]pathElem, depth+1)
+func (t *Tree) shapNode(row []uint8, phi []float64, node, depth int, parent, buf []pathElem, pz, po float64, pf int) {
+	path := buf[:depth+1]
+	rest := buf[depth+1:]
 	copy(path, parent[:depth])
 	extendPath(path, depth, pz, po, pf)
 	n := &t.Nodes[node]
@@ -95,8 +103,8 @@ func (t *Tree) shapNode(row []uint8, phi []float64, node, depth int, parent []pa
 			break
 		}
 	}
-	t.shapNode(row, phi, hot, depth+1, path, hz*iz, io, f)
-	t.shapNode(row, phi, cold, depth+1, path, cz*iz, 0, f)
+	t.shapNode(row, phi, hot, depth+1, path, rest, hz*iz, io, f)
+	t.shapNode(row, phi, cold, depth+1, path, rest, cz*iz, 0, f)
 }
 
 // nodeMean is the cover-weighted mean of the leaves under node.

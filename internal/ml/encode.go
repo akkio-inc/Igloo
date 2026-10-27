@@ -12,8 +12,12 @@ import (
 	"reflect"
 )
 
-// maxBlob bounds a model blob, compressed and not.
-const maxBlob = 1 << 30
+// maxBlob bounds a model blob, compressed and not; blobs above bigBlob
+// are compressed fast rather than small.
+const (
+	maxBlob = 1 << 30
+	bigBlob = 16 << 20
+)
 
 // Encode serializes v as a model blob, gzipped JSON, and returns it with
 // its SHA-256 in hex. The encoding is deterministic: equal values give
@@ -27,7 +31,13 @@ func Encode(v any) ([]byte, string, error) {
 		return nil, "", err
 	}
 	var buf bytes.Buffer
-	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	// Large blobs are mostly numbers that compress little: compressing
+	// them hard takes long for nothing.
+	level := gzip.BestCompression
+	if len(raw) > bigBlob {
+		level = gzip.BestSpeed
+	}
+	zw, err := gzip.NewWriterLevel(&buf, level)
 	if err != nil {
 		return nil, "", err
 	}
@@ -65,6 +75,9 @@ func Decode(blob []byte, sha string, v any) error {
 
 // checkFinite refuses NaN and infinite floats, which JSON cannot hold.
 func checkFinite(v reflect.Value) error {
+	if !v.IsValid() || v.Type() == reflect.TypeFor[Float32s]() {
+		return nil // checked as it is written
+	}
 	switch v.Kind() {
 	case reflect.Float32, reflect.Float64:
 		if f := v.Float(); math.IsNaN(f) || math.IsInf(f, 0) {

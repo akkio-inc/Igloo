@@ -45,8 +45,15 @@ type Params struct {
 	// Lambda is the L2 penalty on leaf values (default 1).
 	Lambda float64
 	// FeatureFraction and BaggingFraction sample features and rows for
-	// each tree (default 1: all of them).
-	FeatureFraction, BaggingFraction float64
+	// each tree (default 1: all of them); FeatureFractionByNode samples the
+	// tree's features again for each split.
+	FeatureFraction, BaggingFraction, FeatureFractionByNode float64
+	// Forest makes a random forest rather than boosted trees: each round's
+	// trees fit the labels from the initial score on their own sample of
+	// rows, and the model averages them. Classes are fit as indicators, so
+	// a forest classifier's raw scores are probabilities. EarlyStopping and
+	// LearningRate do not apply.
+	Forest bool
 	// MinCategoryCount is how often a category must occur to get a bin of
 	// its own (default 5); rarer ones share one.
 	MinCategoryCount int
@@ -63,6 +70,8 @@ type Params struct {
 	// Interrupt, if set, is asked before each round whether to stop:
 	// training then fails with its error.
 	Interrupt func() error
+	// TrackLoss records the training loss after each round.
+	TrackLoss bool
 }
 
 func (p Params) withDefaults(n int) Params {
@@ -93,6 +102,14 @@ func (p Params) withDefaults(n int) Params {
 	if p.BaggingFraction <= 0 || p.BaggingFraction > 1 {
 		p.BaggingFraction = 1
 	}
+	if p.FeatureFractionByNode <= 0 || p.FeatureFractionByNode > 1 {
+		p.FeatureFractionByNode = 1
+	}
+	if p.Forest {
+		// Trees are averaged: each adds its leaves divided by their number.
+		p.LearningRate = 1 / float64(p.Rounds)
+		p.EarlyStopping = 0
+	}
 	if p.MinCategoryCount <= 0 {
 		p.MinCategoryCount = 5
 	}
@@ -114,6 +131,8 @@ type GBM struct {
 	// Init is the starting raw score, one per class for multiclass.
 	Init  []float64 `json:"init"`
 	Trees []Tree    `json:"trees"`
+	// Forest says the trees are a random forest's (Params.Forest).
+	Forest bool `json:"forest,omitempty"`
 }
 
 // TrainInfo is what training learned besides the model.
@@ -121,8 +140,8 @@ type TrainInfo struct {
 	// Rounds is the number of rounds the model kept.
 	Rounds int
 	// ValidLoss is the validation loss after each round, if there were
-	// validation rows.
-	ValidLoss []float64
+	// validation rows; TrainLoss the training loss, if tracked.
+	ValidLoss, TrainLoss []float64
 }
 
 // outputs is the number of raw scores the model gives each row.
@@ -170,6 +189,9 @@ func TrainGBM(x *Frame, y []float64, valid *Frame, validY []float64, p Params) (
 	default:
 		return nil, TrainInfo{}, fmt.Errorf("unknown objective %q", p.Objective)
 	}
+	if p.Forest && p.Objective == Quantile {
+		return nil, TrainInfo{}, errors.New("a random forest does not predict quantiles")
+	}
 	for _, v := range y {
 		if math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil, TrainInfo{}, errors.New("labels must be finite numbers")
@@ -178,7 +200,7 @@ func TrainGBM(x *Frame, y []float64, valid *Frame, validY []float64, p Params) (
 			return nil, TrainInfo{}, fmt.Errorf("label %v is not a class number", v)
 		}
 	}
-	m := &GBM{Objective: p.Objective, Alpha: p.Alpha}
+	m := &GBM{Objective: p.Objective, Alpha: p.Alpha, Forest: p.Forest}
 	if p.Objective == Multiclass {
 		m.Classes = p.Classes
 	}
@@ -216,6 +238,9 @@ func initScore(p Params, y []float64) []float64 {
 		for _, v := range y {
 			pos += v
 		}
+		if p.Forest {
+			return []float64{pos / float64(len(y))}
+		}
 		q := clamp(pos/float64(len(y)), 1e-6, 1-1e-6)
 		return []float64{math.Log(q / (1 - q))}
 	}
@@ -225,7 +250,11 @@ func initScore(p Params, y []float64) []float64 {
 	}
 	out := make([]float64, p.Classes)
 	for k, c := range counts {
-		out[k] = math.Log(clamp(c/float64(len(y)), 1e-6, 1))
+		if p.Forest {
+			out[k] = c / float64(len(y))
+		} else {
+			out[k] = math.Log(clamp(c/float64(len(y)), 1e-6, 1))
+		}
 	}
 	return out
 }
@@ -243,6 +272,9 @@ type trainer struct {
 }
 
 func (t *trainer) run(vdata *binned, vy []float64) (*GBM, TrainInfo, error) {
+	if t.p.Forest {
+		return t.runForest()
+	}
 	n, K := t.data.n, t.m.outputs()
 	t.f = make([]float64, n*K)
 	for k := range K {
@@ -303,6 +335,9 @@ func (t *trainer) run(vdata *binned, vy []float64) (*GBM, TrainInfo, error) {
 			}
 			t.m.Trees = append(t.m.Trees, tree)
 		}
+		if t.p.TrackLoss {
+			info.TrainLoss = append(info.TrainLoss, t.trainLoss())
+		}
 		if vdata != nil {
 			loss := t.loss(vf, vy, vdata.n)
 			info.ValidLoss = append(info.ValidLoss, loss)
@@ -320,6 +355,50 @@ func (t *trainer) run(vdata *binned, vy []float64) (*GBM, TrainInfo, error) {
 	}
 	t.m.Prepare()
 	return t.m, info, nil
+}
+
+// runForest grows a random forest: every tree fits the squared error of
+// the labels (each class's indicator, for classes) from the initial score,
+// on its own sample of rows and features.
+func (t *trainer) runForest() (*GBM, TrainInfo, error) {
+	n, K := t.data.n, t.m.outputs()
+	grads := make([][]float64, K)
+	for k := range K {
+		g := make([]float64, n)
+		for i, y := range t.y {
+			target := y
+			switch t.p.Objective {
+			case Binary:
+				target = y
+			case Multiclass:
+				target = 0
+				if int(y) == k {
+					target = 1
+				}
+			}
+			g[i] = t.m.Init[k] - target
+		}
+		grads[k] = g
+	}
+	h := make([]float64, n)
+	for i := range h {
+		h[i] = 1
+	}
+	gr := newGrower(t.p, t.m.Features, t.data)
+	for round := range t.p.Rounds {
+		if t.p.Interrupt != nil {
+			if err := t.p.Interrupt(); err != nil {
+				return nil, TrainInfo{}, err
+			}
+		}
+		for k := range K {
+			tree := gr.grow(grads[k], h, uint64(round*K+k))
+			tree.Class = k
+			t.m.Trees = append(t.m.Trees, tree)
+		}
+	}
+	t.m.Prepare()
+	return t.m, TrainInfo{Rounds: t.p.Rounds}, nil
 }
 
 // gradients computes the gradients of a single-output objective.
@@ -407,6 +486,41 @@ func (t *trainer) apply(gr *grower, tree *Tree, k int) {
 			f[r] += v
 		}
 	})
+}
+
+// trainLoss is the loss on the training rows, summed in fixed chunks.
+func (t *trainer) trainLoss() float64 {
+	n := t.data.n
+	K := t.m.outputs()
+	parts := make([]float64, numChunks(n))
+	parallelFor(len(parts), t.p.Threads, func(c int) {
+		lo, hi := chunkRange(c, n)
+		q := make([]float64, K)
+		var sum float64
+		for i := lo; i < hi; i++ {
+			f, y := t.f[i], t.y[i]
+			switch t.p.Objective {
+			case Regression:
+				sum += (f - y) * (f - y)
+			case Quantile:
+				sum += pinball(y, f, t.p.Alpha)
+			case Binary:
+				sum += logLoss1(y, sigmoid(f))
+			case Multiclass:
+				for k := range K {
+					q[k] = t.f[k*n+i]
+				}
+				softmax(q)
+				sum -= math.Log(math.Max(q[int(y)], 1e-15))
+			}
+		}
+		parts[c] = sum
+	})
+	var total float64
+	for _, v := range parts {
+		total += v
+	}
+	return total / float64(max(n, 1))
 }
 
 // loss is the objective's loss on rows of raw scores f.
@@ -520,6 +634,10 @@ func (m *GBM) Predict(f *Frame) ([]float64, error) {
 
 // Transform turns raw scores of n rows into predictions in place.
 func (m *GBM) Transform(raw []float64, n int) {
+	if m.Forest {
+		m.forestProbabilities(raw, n)
+		return
+	}
 	switch m.Objective {
 	case Binary:
 		for i, v := range raw {
@@ -537,6 +655,49 @@ func (m *GBM) Transform(raw []float64, n int) {
 				raw[k*n+i] = q[k]
 			}
 		}
+	}
+}
+
+// forestProbabilities turns a forest classifier's raw scores, averages of
+// class frequencies, into probabilities: within [0, 1], adding up to 1.
+func (m *GBM) forestProbabilities(raw []float64, n int) {
+	switch m.Objective {
+	case Binary:
+		for i, v := range raw {
+			raw[i] = clamp(v, 0, 1)
+		}
+	case Multiclass:
+		K := m.Classes
+		for i := range n {
+			var sum float64
+			for k := range K {
+				v := clamp(raw[k*n+i], 0, 1)
+				raw[k*n+i] = v
+				sum += v
+			}
+			for k := range K {
+				if sum > 0 {
+					raw[k*n+i] /= sum
+				} else {
+					raw[k*n+i] = 1 / float64(K)
+				}
+			}
+		}
+	}
+}
+
+// TransformRow turns one row's raw scores into predictions in place: the
+// value, the probability of class 1, or each class's probability.
+func (m *GBM) TransformRow(raw []float64) {
+	if m.Forest {
+		m.forestProbabilities(raw, 1)
+		return
+	}
+	switch m.Objective {
+	case Binary:
+		raw[0] = sigmoid(raw[0])
+	case Multiclass:
+		softmax(raw)
 	}
 }
 
@@ -609,6 +770,8 @@ type grower struct {
 	partial []binStat
 	use     []bool
 	g, h    []float64
+	// salt is the tree's, for sampling features at each split.
+	salt uint64
 }
 
 func newGrower(p Params, binners []*Binner, data *binned) *grower {
@@ -643,7 +806,7 @@ func (gr *grower) freeHist(h []binStat) {
 // sampling between trees.
 func (gr *grower) grow(g, h []float64, salt uint64) Tree {
 	p := gr.p
-	gr.g, gr.h = g, h
+	gr.g, gr.h, gr.salt = g, h, salt
 	n := gr.data.n
 	m := 0
 	for i := range n {
@@ -887,8 +1050,12 @@ func (gr *grower) findBest(l *growLeaf) {
 	if count < 4096 {
 		threads = 1
 	}
+	consider := gr.use
+	if p.FeatureFractionByNode < 1 {
+		consider = gr.nodeFeatures(l.node)
+	}
 	parallelFor(len(gr.binners), threads, func(j int) {
-		if !gr.use[j] {
+		if !consider[j] {
 			return
 		}
 		hs := l.hist[j*maxBins : j*maxBins+gr.nbins[j]]
@@ -903,6 +1070,28 @@ func (gr *grower) findBest(l *growLeaf) {
 			l.best = c
 		}
 	}
+}
+
+// nodeFeatures samples the tree's features a split of node considers: at
+// least one.
+func (gr *grower) nodeFeatures(node int) []bool {
+	out := make([]bool, len(gr.use))
+	some, best, bestHash := false, -1, 2.0
+	for j, u := range gr.use {
+		if !u {
+			continue
+		}
+		h := unitHash(gr.p.Seed, 0x40de^gr.salt<<24, j*1_000_003+node)
+		out[j] = h < gr.p.FeatureFractionByNode
+		some = some || out[j]
+		if h < bestHash {
+			best, bestHash = j, h
+		}
+	}
+	if !some && best >= 0 {
+		out[best] = true
+	}
+	return out
 }
 
 func (gr *grower) score(g, h float64) float64 { return g * g / (h + gr.p.Lambda) }

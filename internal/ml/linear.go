@@ -47,6 +47,12 @@ func (t Term) Name() string {
 // linear regression. lambda is the ridge penalty on standardized
 // coefficients (0 means 1e-6 times the rows).
 func FitLinear(x *Frame, y []float64, logistic bool, lambda float64) (*Linear, error) {
+	return FitLinearLevels(x, y, logistic, lambda, 0)
+}
+
+// FitLinearLevels is FitLinear with at most maxLevels indicators for each
+// categorical feature, its most frequent levels (0: no limit).
+func FitLinearLevels(x *Frame, y []float64, logistic bool, lambda float64, maxLevels int) (*Linear, error) {
 	if err := x.Check(); err != nil {
 		return nil, err
 	}
@@ -102,9 +108,13 @@ func FitLinear(x *Frame, y []float64, logistic bool, lambda float64) (*Linear, e
 			return c.Levels[a] < c.Levels[b]
 		})
 		// The most frequent level is the reference; rare ones join it.
+		kept := 0
 		for _, i := range order[min(1, len(order)):] {
 			if counts[i] < 5 || counts[i] == x.N {
 				continue
+			}
+			if kept++; maxLevels > 0 && kept > maxLevels {
+				break
 			}
 			l.Terms = append(l.Terms, Term{Feature: c.Name, Level: c.Levels[i], Mean: float64(counts[i]) / float64(x.N), Scale: 1, Cat: true})
 		}
@@ -302,6 +312,56 @@ func (l *Linear) Contributions(x *Frame) []float64 {
 	}
 	return out
 }
+
+// Positions maps each term to its feature's position among names, -1
+// for a feature names lacks.
+func (l *Linear) Positions(names []string) []int {
+	out := make([]int, len(l.Terms))
+	for k, t := range l.Terms {
+		out[k] = -1
+		for j, n := range names {
+			if n == t.Feature {
+				out[k] = j
+				break
+			}
+		}
+	}
+	return out
+}
+
+// RowContributions writes one row's contributions as Contributions does
+// into out (len(Terms)+1, the bias last), term k's feature at position
+// pos[k] of r (Positions'), and returns the row's raw score.
+func (l *Linear) RowContributions(r *RowValues, pos []int, out []float64) float64 {
+	bias := l.Intercept
+	for k, t := range l.Terms {
+		bias += l.Coef[k] * t.Mean
+	}
+	// Added up in Predict's order, terms then the bias.
+	sum := 0.0
+	for k, t := range l.Terms {
+		v := t.Mean
+		if j := pos[k]; j >= 0 {
+			if !t.Cat {
+				if !math.IsNaN(r.Num[j]) {
+					v = r.Num[j]
+				}
+			} else {
+				v = 0
+				if !r.Missing[j] && r.Str[j] == t.Level {
+					v = 1
+				}
+			}
+		}
+		out[k] = l.Coef[k] * (v - t.Mean)
+		sum += out[k]
+	}
+	out[len(l.Terms)] = bias
+	return sum + bias
+}
+
+// Sigmoid is the logistic function.
+func Sigmoid(x float64) float64 { return sigmoid(x) }
 
 func dot(a, b []float64) float64 {
 	s := 0.0

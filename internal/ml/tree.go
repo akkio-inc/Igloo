@@ -57,6 +57,8 @@ type Tree struct {
 	// Class is the class whose score the tree adds to, for multiclass
 	// models; 0 otherwise.
 	Class int `json:"class,omitempty"`
+
+	maxDepth int
 }
 
 // leafOf returns the index of the leaf a row reaches, given its bins.
@@ -126,6 +128,7 @@ func (t *Tree) prepare() {
 	for i := range t.Nodes {
 		t.Nodes[i].prepare()
 	}
+	t.maxDepth = t.depth()
 }
 
 // parallelFor calls fn(i) for each i in [0, n) on up to threads goroutines
