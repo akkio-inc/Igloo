@@ -184,9 +184,10 @@ type distParts struct {
 	// where auto mode chose it, for the guard (see guardLocal).
 	release func()
 	// local is how long auto mode estimated this replica would take the
-	// statement, when it chose to run it here though workers could run it
-	// (see guardLocal).
-	local time.Duration
+	// statement, when it chose to run it here though workers could run it,
+	// and budget, if set, how long it may take all the same (see
+	// guardLocal).
+	local, budget time.Duration
 }
 
 // sessionMode is the mode user's statements run distributed in: the
@@ -222,6 +223,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			// Workers stay up while it runs here, as an idle replica would
 			// stop them, so that the guard can run it on them.
 			parts.local, parts.release = est, s.dist.Keep()
+			parts.budget, _ = distributed.LocalBudget(err)
 		}
 		if !distributed.IsUnsupported(err) {
 			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
@@ -323,13 +325,13 @@ type localGuard struct {
 }
 
 // guardLocal arms a guard over a run on this replica of a statement auto
-// mode estimated at est here, which writes to tw: run it under the guard's
-// ctx, and stop the guard after.
-func guardLocal(ctx context.Context, est time.Duration, tw *tagWriter) *localGuard {
+// mode estimated at est here, or let take budget, which writes to tw: run
+// it under the guard's ctx, and stop the guard after.
+func guardLocal(ctx context.Context, est, budget time.Duration, tw *tagWriter) *localGuard {
 	g := &localGuard{start: time.Now()}
 	g.ctx, g.cancel = context.WithCancel(ctx)
 	tw.gate = &g.gate
-	g.timer = time.AfterFunc(max(time.Duration(guardFactor*float64(est)), guardMinimum), func() {
+	g.timer = time.AfterFunc(max(time.Duration(guardFactor*float64(est)), guardMinimum, budget), func() {
 		if g.gate.fire() {
 			g.fired.Store(true)
 			g.cancel()

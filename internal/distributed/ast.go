@@ -421,9 +421,12 @@ type errUnsupported struct {
 	// key is the statement's plan key when auto mode chose one machine
 	// for a statement that could run on workers (PlanKey), and oneMachine
 	// how long one machine was estimated to take it, in seconds, when
-	// workers could run it (LocalEstimate).
-	key        string
-	oneMachine float64
+	// workers could run it (LocalEstimate); tookOnWorkers is what its last
+	// run on workers took, when auto mode tries one machine after it
+	// (LocalBudget).
+	key           string
+	oneMachine    float64
+	tookOnWorkers float64
 }
 
 func (e *errUnsupported) Error() string { return "cannot distribute: " + e.reason }
@@ -451,6 +454,19 @@ func LocalEstimate(err error) (d time.Duration, ok bool) {
 	var u *errUnsupported
 	if errors.As(err, &u) && u.key != "" && u.oneMachine > 0 {
 		return time.Duration(u.oneMachine * float64(time.Second)), true
+	}
+	return 0, false
+}
+
+// LocalBudget returns, for a statement auto mode tries on one machine
+// after it ran on workers, as err, Plan's error, says, what that run on
+// workers took: the session's guard lets the run here take as long before
+// it runs the statement on workers instead, however short one machine's
+// estimate. ok is false for any other statement.
+func LocalBudget(err error) (d time.Duration, ok bool) {
+	var u *errUnsupported
+	if errors.As(err, &u) && u.key != "" && u.tookOnWorkers > 0 {
+		return time.Duration(u.tookOnWorkers * float64(time.Second)), true
 	}
 	return 0, false
 }

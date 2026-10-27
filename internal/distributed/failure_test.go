@@ -882,7 +882,9 @@ func TestAutoWithWorkersStopped(t *testing.T) {
 }
 
 // The guard's estimate is that of a statement auto mode chose to run on
-// one machine though workers could run it, and of no other.
+// one machine though workers could run it, and of no other; its budget,
+// what the statement took on workers when auto mode tries it here after
+// only such runs.
 func TestLocalEstimate(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)
 	h.tables["lineitem"].Bytes = 1 << 30
@@ -892,6 +894,16 @@ func TestLocalEstimate(t *testing.T) {
 	}
 	if _, ok := LocalEstimate(unsupported("nothing to divide among workers")); ok {
 		t.Error("an unsupported statement has a local estimate")
+	}
+	if _, ok := LocalBudget(err); ok {
+		t.Error("a statement that never ran on workers has a budget on one machine")
+	}
+	// After only a run on workers far longer than one machine's estimate,
+	// it is tried here, and may take as long as the workers took.
+	h.co.Observe(PlanKey(err), 2, 2000*time.Second)
+	_, err = h.co.Plan(t.Context(), `SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1`, harnessEnv{h}, ModeAuto)
+	if d, ok := LocalBudget(err); !ok || d != 2000*time.Second {
+		t.Errorf("tried on one machine after 2,000 s on workers: %v, budget %v %v", err, d, ok)
 	}
 }
 

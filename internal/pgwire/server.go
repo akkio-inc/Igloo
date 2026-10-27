@@ -1908,7 +1908,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 				if parts.local > 0 && tw.Written() == 0 {
 					// Auto mode chose this replica on an estimate that can run
 					// far short (see guardLocal).
-					guard := guardLocal(ctx, parts.local, tw)
+					guard := guardLocal(ctx, parts.local, parts.budget, tw)
 					err = s.runLocal(guard.ctx, sess, st, args, tw)
 					stopPrefetch()
 					if fired, ran := guard.stop(tw); fired && ctx.Err() == nil && outer.Err() == nil {

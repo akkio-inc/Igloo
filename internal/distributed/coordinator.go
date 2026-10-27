@@ -304,7 +304,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, err
 	}
 	if !d.onWorkers {
-		u := &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key}
+		u := &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key, tookOnWorkers: d.tookOnWorkers}
 		if d.e.workers > 0 && !math.IsInf(d.e.onWorkers, 1) {
 			u.oneMachine = d.e.oneMachine
 		}
@@ -320,6 +320,10 @@ type decision struct {
 	reason    string
 	e         estimate
 	ws        []*worker
+	// tookOnWorkers is what the statement's last run on workers took, when
+	// auto mode tries it on one machine after only such runs (see
+	// LocalBudget).
+	tookOnWorkers float64
 }
 
 // plan plans query as Plan does, and says where it runs: on workers unless
@@ -430,6 +434,12 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		reason = "workers are stopped; " + reason
 	}
 	d.onWorkers, d.reason = onWorkers, reason
+	if !onWorkers && explore && found && r.dist > 0 && r.local == 0 {
+		// Tried here after runs on workers only: a run here may take as
+		// long as they took before the guard runs it there again, however
+		// short one machine's estimate (see LocalBudget).
+		d.tookOnWorkers = r.dist
+	}
 	if dry {
 		return plan, d, nil
 	}

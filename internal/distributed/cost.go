@@ -112,6 +112,18 @@ const (
 	// five times as fast on one machine had workers estimated at 1.7 and 2
 	// times its estimate.
 	spillWithin = 1.5
+	// slowOnWorkers is how many times one machine's estimate a statement
+	// that ran only on workers must have taken there for auto mode to try
+	// one machine once, though one machine should run short of memory: an
+	// estimate short of memory ran four to five times short where the
+	// statement spilled (two reports estimated at 157 s took 809 s and 610
+	// s on one machine), so ten times it is past what spilling explains.
+	// A dashboard's statements at ten times the data, estimated at 14 s on
+	// one machine and short of memory, took 1,312 s split over two workers
+	// that shared the replica's machine, and stayed on workers after it
+	// from the query history, through a burst on workers of their own;
+	// the replica alone ran them in 25 s at the median, 96 at once.
+	slowOnWorkers = 10.0
 )
 
 // estimate is how long a planned statement would take on one machine and
@@ -628,6 +640,11 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 		switch {
 		case mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
+		case mayExplore && !r.heavy && r.dist > slowOnWorkers*e.oneMachine:
+			// Far slower on workers than one machine should take it, even
+			// short of memory: without this it stayed there for good.
+			return false, true, fmt.Sprintf("it ran in %.0f s on workers, over %.0f times one machine's estimate of %.0f s; trying one machine once",
+				r.dist, slowOnWorkers, e.oneMachine)
 		case e.memory || e.spills:
 			// One machine's estimate runs four or five times short where it
 			// spills: two reports that took 146 s and 141 s on workers,

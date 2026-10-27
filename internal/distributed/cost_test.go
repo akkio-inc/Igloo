@@ -108,6 +108,17 @@ func TestChoose(t *testing.T) {
 		{"ran both ways, faster on one machine, exchanging much on workers", estimate{oneMachine: 120, onWorkers: 100, workers: 4},
 			runs{local: 38, dist: 228, heavy: true}, true, false, false},
 		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
+		// A dashboard's statement at ten times the data, estimated at 14 s
+		// on one machine and short of memory, after 1,312 s split over two
+		// workers: tried on one machine once, not kept on workers for good.
+		{"ran on workers 90 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+			runs{dist: 1312}, true, false, true},
+		{"ran on workers 90 times one machine's estimate, tried today", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+			runs{dist: 1312, explored: now.Add(-time.Hour)}, true, true, false},
+		{"ran on workers 9 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+			runs{dist: 126}, true, true, false},
+		{"ran on workers 90 times one machine's estimate, exchanging more than it holds", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
+			runs{dist: 1312, heavy: true}, true, true, false},
 	} {
 		workers, explore, reason := choose(c.e, c.r, c.found, DefaultThreshold, now)
 		if workers != c.workers || explore != c.explore || reason == "" {

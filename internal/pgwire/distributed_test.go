@@ -737,7 +737,7 @@ func TestGuardGate(t *testing.T) {
 	ctx := context.Background()
 
 	streaming := &tagWriter{DataWriter: &countingWriter{}}
-	g := guardLocal(ctx, time.Second, streaming)
+	g := guardLocal(ctx, time.Second, 0, streaming)
 	if err := streaming.Row([]any{1}); err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +750,7 @@ func TestGuardGate(t *testing.T) {
 	}
 
 	quiet := &tagWriter{DataWriter: &countingWriter{}}
-	g = guardLocal(ctx, time.Millisecond, quiet)
+	g = guardLocal(ctx, time.Millisecond, 0, quiet)
 	select {
 	case <-g.ctx.Done():
 	case <-time.After(5 * time.Second):
