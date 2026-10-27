@@ -24,6 +24,51 @@ const campaignsTable = `CREATE TABLE lake.public.campaigns AS
 	FROM (SELECT i, ['north', 'south', 'east', 'west'][1 + i % 4] AS region, ((i * 7919) % 1000) / 100.0 AS spend,
 		((i * 104729) % 500) / 100.0 AS visits FROM range(1, 1501) t(i))`
 
+// segmentsTable is a synthetic table of people in three planted segments
+// by spend and visits, and ten outliers far from them (person_id 901 to
+// 910).
+const segmentsTable = `CREATE TABLE lake.public.segments AS
+	SELECT i AS person_id,
+		CASE WHEN i > 900 THEN 300 + (i % 7) * 10 ELSE [10, 50, 90][1 + i % 3] + ((i * 7919) % 600) / 100.0 - 3 END AS spend,
+		CASE WHEN i > 900 THEN 25 ELSE [1, 8, 2][1 + i % 3] + ((i * 104729) % 100) / 100.0 - 0.5 END AS visits
+	FROM range(1, 911) t(i)`
+
+func TestIglooKMeans(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, segmentsTable)
+	conn := snowflakeConn(t, cs.admin)
+	mustExec(t, conn, `CREATE IGLOO.ML.KMEANS segs(INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT spend, visits FROM segments WHERE person_id <= 900'))`)
+	if got := texts(t, conn, "SELECT count(DISTINCT centroid_id) FROM TABLE(segs!CENTROIDS())"); len(got) != 1 || got[0] != "3" {
+		t.Errorf("CENTROIDS: %q", got)
+	}
+	// Each planted segment is one cluster.
+	if got := texts(t, conn, `SELECT count(DISTINCT centroid_id) FROM TABLE(segs!PREDICT(INPUT_DATA => TABLE(segments)))
+		WHERE person_id <= 900 GROUP BY person_id % 3`); len(got) != 3 || got[0] != "1" || got[1] != "1" || got[2] != "1" {
+		t.Errorf("segments' clusters: %q", got)
+	}
+	if n := count(t, conn, `SELECT count(*) FROM segments WHERE segs!PREDICT(INPUT_DATA => {*}):nearest_centroids_distance[2]:distance::FLOAT
+		>= segs!PREDICT(INPUT_DATA => {*}):nearest_centroids_distance[0]:distance::FLOAT`); n != 910 {
+		t.Errorf("distances sorted in %d of 910 rows", n)
+	}
+	// The outliers are anomalies, and a few of the training rows (half a
+	// percent of them, by the contamination).
+	if got := texts(t, conn, `SELECT count(*) FILTER (WHERE person_id > 900), count(*) <= 16 FROM TABLE(segs!DETECT_ANOMALIES(
+		INPUT_DATA => TABLE(segments), CONFIG_OBJECT => {'contamination': 0.005})) WHERE is_anomaly AND normalized_distance > 1`); len(got) != 1 ||
+		got[0] != "10|true" {
+		t.Errorf("anomalies: %q", got)
+	}
+	if n := count(t, conn, `SELECT count(*) FROM segments
+		WHERE segs!DETECT_ANOMALIES(INPUT_DATA => {*}, CONFIG_OBJECT => {'contamination': 0.005}):is_anomaly::BOOLEAN AND person_id > 900`); n != 10 {
+		t.Errorf("in a query, %d of 10 outliers flagged", n)
+	}
+	if got := texts(t, conn, "SELECT davies_bouldin_index < 0.5 FROM TABLE(segs!EVALUATE())"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("EVALUATE: %q", got)
+	}
+	expectCode(t, conn, "SELECT * FROM TABLE(segs!DETECT_ANOMALIES(INPUT_DATA => TABLE(segments)))", "22023", "contamination")
+	expectCode(t, conn, "CALL segs!WEIGHTS()", "42883", "has no method WEIGHTS")
+}
+
 func TestIglooRegression(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()
@@ -246,7 +291,11 @@ func TestDistributedIglooScoring(t *testing.T) {
 	conn := snowflakeConn(t, ds.admin)
 	mustExec(t, conn, `CREATE IGLOO.ML.CLASSIFICATION converts(INPUT_DATA => SYSTEM$QUERY_REFERENCE(
 		'SELECT region, spend, visits, converted FROM campaigns'), TARGET_COLNAME => 'converted', CONFIG_OBJECT => {'algorithm': 'random_forest'})`)
+	mustExec(t, conn, `CREATE IGLOO.ML.KMEANS segs(INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT spend, visits FROM campaigns'),
+		CONFIG_OBJECT => {'num_clusters': 4})`)
 	for _, query := range []string{
+		`SELECT region, count(*) FROM TABLE(segs!DETECT_ANOMALIES(INPUT_DATA => TABLE(campaigns), CONFIG_OBJECT => {'contamination': 0.05}))
+			WHERE NOT is_anomaly GROUP BY region ORDER BY region`,
 		`SELECT region, count(*) FROM TABLE(converts!PREDICT(INPUT_DATA => TABLE(campaigns))) WHERE predicted_converted GROUP BY region ORDER BY region`,
 		`SELECT region, count(*) FROM campaigns WHERE converts!EXPLAIN_PREDICT(INPUT_DATA => {*}):class::STRING = 'True' GROUP BY region ORDER BY region`,
 	} {

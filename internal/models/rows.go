@@ -74,8 +74,8 @@ type rowModel interface {
 }
 
 func (a *Artifact) rowModel() rowModel {
-	if a.Supervised != nil {
-		return a.Supervised
+	if m := a.igloo(); m != nil {
+		return m
 	}
 	return nil
 }

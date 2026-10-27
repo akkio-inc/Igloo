@@ -39,6 +39,30 @@ type Artifact struct {
 	Regressor  *Regressor  `json:"regressor,omitempty"`
 	// Igloo's classes' models.
 	Supervised *Supervised `json:"supervised,omitempty"`
+	Clusters   *Clusters   `json:"clusters,omitempty"`
+}
+
+// iglooModel is a model of one of Igloo's classes.
+type iglooModel interface {
+	rowModel
+	prepare()
+	// method computes a table method; evaluateOn EVALUATE on given rows.
+	method(class, method string) (*Result, error)
+	evaluateOn(t *Table) (*Evaluation, error)
+	// summary sets what a model's row records of it.
+	summary(out map[string]any)
+}
+
+// igloo returns the model of one of Igloo's classes the artifact holds,
+// or nil.
+func (a *Artifact) igloo() iglooModel {
+	switch {
+	case a.Supervised != nil:
+		return a.Supervised
+	case a.Clusters != nil:
+		return a.Clusters
+	}
+	return nil
 }
 
 // Encode returns the artifact's blob and its SHA-256.
@@ -70,8 +94,8 @@ func (a *Artifact) prepare() {
 	if a.Regressor != nil {
 		a.Regressor.Model.Prepare()
 	}
-	if a.Supervised != nil {
-		a.Supervised.prepare()
+	if m := a.igloo(); m != nil {
+		m.prepare()
 	}
 }
 

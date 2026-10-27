@@ -323,6 +323,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `LOGISTIC_REG` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'logistic'` |
 | `BOOSTED_TREE_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'boosted_trees'` (the default) |
 | `RANDOM_FOREST_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'random_forest'` |
+| `KMEANS` | `IGLOO.ML.KMEANS` | `'num_clusters'`, or none to pick one |
 | `ARIMA_PLUS`, `ARIMA_PLUS_XREG` | `SNOWFLAKE.ML.FORECAST` | a different method, with intervals |
 | `CONTRIBUTION_ANALYSIS` | `SNOWFLAKE.ML.TOP_INSIGHTS` | |
 | `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, `XGBOOST` imports, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
@@ -331,16 +332,19 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 |---|---|---|
 | `ML.PREDICT` | `PREDICT` | all |
 | `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION` |
+| `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS` |
+| `ML.CENTROIDS` | `CENTROIDS` | `KMEANS` |
 | `ML.EVALUATE` | `EVALUATE` | all |
 | `ML.CONFUSION_MATRIX`, `ML.ROC_CURVE` | `CONFUSION_MATRIX`, `ROC_CURVE` | `CLASSIFICATION` |
 | `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | `REGRESSION`, `CLASSIFICATION` |
 | `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
 | `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
-| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees |
+| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, `KMEANS` |
 
 ### Row methods and table methods
 
-**Row methods** (`PREDICT`, `EXPLAIN_PREDICT`) give a value per row. In a
+**Row methods** (`PREDICT`, `EXPLAIN_PREDICT`, `DETECT_ANOMALIES`) give
+a value per row. In a
 query, `m!PREDICT(INPUT_DATA => {*})` is a JSON object, as Snowflake's
 `PREDICT` is; called as a table, as BigQuery's functions are,
 `TABLE(m!PREDICT(INPUT_DATA => TABLE(t)))` returns the input's rows and
@@ -419,6 +423,38 @@ model:
 | `FEATURE_IMPORTANCE` | trees: `feature`, `importance_weight` (splits), `importance_gain`, `importance_cover` (rows per split) |
 | `WEIGHTS` | linear and logistic models: `class` (for three classes or more), `processed_input` (the feature, or `__INTERCEPT__`), `category`, `weight`, `standard_error`, `p_value` (BigQuery's `ML.ADVANCED_WEIGHTS`) |
 | `TRAINING_INFO` | boosted trees: `iteration`, `loss`, `eval_loss` (on the early-stopping rows), `learning_rate` |
+
+### KMEANS
+
+```sql
+CREATE IGLOO.ML.KMEANS demo.segments(
+    INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT spend, visits, region FROM demo.people'),
+    CONFIG_OBJECT => {'num_clusters': 4});
+
+SELECT person_id, centroid_id FROM TABLE(demo.segments!PREDICT(INPUT_DATA => TABLE(demo.people)));
+
+SELECT * FROM TABLE(demo.segments!DETECT_ANOMALIES(INPUT_DATA => TABLE(demo.people),
+                                                    CONFIG_OBJECT => {'contamination': 0.01}))
+WHERE is_anomaly;
+```
+
+k-means clustering of every column, numbers standardized
+(`'standardize_features'`, default `TRUE`) and categories one hot, seeded
+by k-means++ and refined by Lloyd's iterations (`max_iterations`, default
+20, until the mean squared distance improves by less than
+`min_rel_progress`, 0.01, unless `'early_stop': FALSE`). Without
+`num_clusters` (2 to 100), Igloo clusters up to 20,000 of the rows into 2
+to 10 clusters and keeps the number whose Davies-Bouldin index is lowest;
+the model's `hyperparameters` record each. `kmeans_init_method` is
+`'kmeans++'` and `distance_type` `'euclidean'`; others are refused.
+
+| Method | Returns |
+|---|---|
+| `PREDICT` | `centroid_id` (from 1) and `nearest_centroids_distance`, every centroid's distance, nearest first, as JSON |
+| `DETECT_ANOMALIES` | `is_anomaly`, `normalized_distance` (the distance to the nearest centroid divided by the mean distance of its training rows) and `centroid_id`; `CONFIG_OBJECT => {'contamination': x}` (more than 0, at most 0.5) is the share of training rows that would be anomalies, which sets the threshold |
+| `EVALUATE` | `davies_bouldin_index` and `mean_squared_distance` (in standardized units), on the training rows or on `INPUT_DATA` |
+| `CENTROIDS` | `centroid_id`, `feature`, `numerical_value` (in the feature's own units), and for categories `category` and `categorical_value`, the share of the cluster's rows in it |
+| `TRAINING_INFO` | each iteration's mean squared distance, as `loss` |
 
 ## Train and score in one query
 

@@ -50,6 +50,11 @@ type Supervised struct {
 
 func (s *Supervised) classify() bool { return s.Task == "classification" }
 
+func (s *Supervised) summary(out map[string]any) {
+	out["rows"], out["features"], out["algorithm"] = s.Rows, len(s.Features), s.Algorithm
+	addEval(out, s.Eval)
+}
+
 // outputs is the number of values a row's prediction has: its value, or
 // each class's probability.
 func (s *Supervised) outputs() int {

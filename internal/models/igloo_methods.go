@@ -22,6 +22,7 @@ var (
 var iglooTableMethods = map[string][]string{
 	ClassRegression:      {"EVALUATE", "GLOBAL_EXPLAIN", "FEATURE_IMPORTANCE", "WEIGHTS", "TRAINING_INFO"},
 	ClassIglooClassifier: {"EVALUATE", "CONFUSION_MATRIX", "ROC_CURVE", "GLOBAL_EXPLAIN", "FEATURE_IMPORTANCE", "WEIGHTS", "TRAINING_INFO"},
+	ClassKMeans:          {"EVALUATE", "CENTROIDS", "TRAINING_INFO"},
 }
 
 // iglooRowMethods lists each class's row methods, for messages; a model's
@@ -29,6 +30,7 @@ var iglooTableMethods = map[string][]string{
 var iglooRowMethods = map[string][]string{
 	ClassRegression:      {"PREDICT", "EXPLAIN_PREDICT"},
 	ClassIglooClassifier: {"PREDICT", "EXPLAIN_PREDICT"},
+	ClassKMeans:          {"PREDICT", "DETECT_ANOMALIES"},
 }
 
 // IsRowMethodOf reports whether method is a row method of class.
@@ -102,8 +104,8 @@ func (a *Artifact) iglooMethod(method string) (*Result, error) {
 		}
 		return nil, inputErr("%s models have no method %s; they have %s", QualifiedClass(a.Class), method, joinMethods(a.Class))
 	}
-	if a.Supervised != nil {
-		return a.Supervised.method(a.Class, method)
+	if m := a.igloo(); m != nil {
+		return m.method(a.Class, method)
 	}
 	return nil, inputErr("the model holds nothing to compute %s from", method)
 }
@@ -116,8 +118,8 @@ func (a *Artifact) EvaluateOn(t *Table) (*Result, error) {
 	}
 	var e *Evaluation
 	var err error
-	if a.Supervised != nil {
-		e, err = a.Supervised.evaluateOn(t)
+	if m := a.igloo(); m != nil {
+		e, err = m.evaluateOn(t)
 	}
 	if err != nil {
 		return nil, err

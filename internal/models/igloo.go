@@ -24,7 +24,7 @@ const (
 )
 
 // IglooClasses are Igloo's classes, in the order the docs list them.
-var IglooClasses = []string{ClassRegression, ClassIglooClassifier}
+var IglooClasses = []string{ClassRegression, ClassIglooClassifier, ClassKMeans}
 
 // IsIgloo reports whether class is one of Igloo's own.
 func IsIgloo(class string) bool { return strings.HasPrefix(class, "IGLOO.ML.") }
@@ -71,6 +71,8 @@ func TrainIgloo(class string, t *Table, a IglooArgs) (*Artifact, map[string]any,
 	switch class {
 	case ClassRegression, ClassIglooClassifier:
 		art.Supervised, err = trainSupervised(class, t, a, cfg)
+	case ClassKMeans:
+		art.Clusters, err = trainKMeans(t, a, cfg)
 	default:
 		return nil, nil, inputErr("%s is not one of Igloo's classes", class)
 	}
@@ -218,22 +220,23 @@ func (c *config) accept(key string, allowed ...string) error {
 // summary is what a model's row records of its metrics.
 func (a *Artifact) summary() map[string]any {
 	out := map[string]any{}
-	add := func(e *Evaluation) {
-		if e == nil {
-			return
-		}
-		out["eval_rows"] = e.Rows
-		for _, m := range e.Metrics {
-			if !math.IsNaN(m.Value) && !math.IsInf(m.Value, 0) {
-				out[m.Name] = m.Value
-			}
-		}
-	}
-	if s := a.Supervised; s != nil {
-		out["rows"], out["features"], out["algorithm"] = s.Rows, len(s.Features), s.Algorithm
-		add(s.Eval)
+	if m := a.igloo(); m != nil {
+		m.summary(out)
 	}
 	return out
+}
+
+// addEval records an evaluation's metrics in a summary.
+func addEval(out map[string]any, e *Evaluation) {
+	if e == nil {
+		return
+	}
+	out["eval_rows"] = e.Rows
+	for _, m := range e.Metrics {
+		if !math.IsNaN(m.Value) && !math.IsInf(m.Value, 0) {
+			out[m.Name] = m.Value
+		}
+	}
 }
 
 // Metric is a named evaluation metric, as BigQuery's ML.EVALUATE names it.

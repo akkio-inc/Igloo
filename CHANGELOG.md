@@ -27,7 +27,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   warehouse.
 - BigQuery ML's model types as Igloo's own classes, with the same
   statements: `IGLOO.ML.REGRESSION` and `IGLOO.ML.CLASSIFICATION` (boosted
-  trees, random forests, linear and logistic regressions), with BigQuery's
+  trees, random forests, linear and logistic regressions), `IGLOO.ML.KMEANS`
+  (`CENTROIDS`, and `DETECT_ANOMALIES` by distance), with BigQuery's
   options in `CONFIG_OBJECT` and its functions as methods: `PREDICT` and
   `EXPLAIN_PREDICT` in a query or as tables of the input's rows, scored on
   workers, and `EVALUATE`, `CONFUSION_MATRIX`, `ROC_CURVE`,
