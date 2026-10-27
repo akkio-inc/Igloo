@@ -99,12 +99,14 @@ func trainAutoencoder(t *Table, args IglooArgs, cfg *config) (*Autoencoder, erro
 		Hyper: map[string]any{"hidden_units": o.hidden, "activation_fn": o.activation, "dropout": o.dropout, "batch_size": p.BatchSize,
 			"learn_rate": o.lr, "max_iterations": info.BestEpoch, "l2_reg": o.l2}}
 	a.Training = netTraining(info, o.lr)
-	errs := make([]float64, len(train))
-	parallelRows(len(train), func(lo, hi int) {
+	sample := sampleRows(len(train), quantileRows)
+	errs := make([]float64, len(sample))
+	parallelRows(len(sample), func(lo, hi int) {
 		s := net.NewScratch()
-		for i := lo; i < hi; i++ {
+		for k := lo; k < hi; k++ {
+			i := sample[k]
 			_, mse, _ := a.reconstruction(tx[i*w:(i+1)*w], s)
-			errs[i] = mse
+			errs[k] = mse
 		}
 	})
 	a.Quantiles = quantiles(errs, 1001)

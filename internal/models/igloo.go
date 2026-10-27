@@ -25,7 +25,7 @@ const (
 
 // IglooClasses are Igloo's classes, in the order the docs list them.
 var IglooClasses = []string{ClassRegression, ClassIglooClassifier, ClassKMeans, ClassPCA, ClassFactorization,
-	ClassDNNClassifier, ClassDNNRegressor, ClassAutoencoder}
+	ClassDNNClassifier, ClassDNNRegressor, ClassAutoencoder, ClassAutoMLClassifier, ClassAutoMLRegressor}
 
 // IsIgloo reports whether class is one of Igloo's own.
 func IsIgloo(class string) bool { return strings.HasPrefix(class, "IGLOO.ML.") }
@@ -66,12 +66,17 @@ type IglooArgs struct {
 // TrainIgloo trains a model of one of Igloo's classes on t, and returns
 // it with a summary of its metrics for the model's row.
 func TrainIgloo(class string, t *Table, a IglooArgs) (*Artifact, map[string]any, error) {
+	if err := checkOptions(class, a.Config); err != nil {
+		return nil, nil, err
+	}
 	cfg := newConfig(a.Config)
 	art := &Artifact{Class: class}
 	var err error
 	switch class {
 	case ClassRegression, ClassIglooClassifier, ClassDNNClassifier, ClassDNNRegressor:
 		art.Supervised, err = trainSupervised(class, t, a, cfg)
+	case ClassAutoMLClassifier, ClassAutoMLRegressor:
+		art.Supervised, err = trainAutoML(class, t, a, cfg)
 	case ClassKMeans:
 		art.Clusters, err = trainKMeans(t, a, cfg)
 	case ClassPCA:
@@ -308,21 +313,44 @@ func finiteOr(v, def float64) float64 {
 // data_split_eval_fraction (default 0.2); 'no_split' none. Snowflake's
 // 'evaluate': FALSE is 'no_split'. y, if given, stratifies by class.
 func splitRows(cfg *config, n int, y []float64, classify bool, seed uint64) (train, eval []int, err error) {
-	method, err := cfg.str("data_split_method", "auto_split", "auto_split", "random", "no_split")
+	o, err := readSplit(cfg)
 	if err != nil {
 		return nil, nil, err
+	}
+	train, eval = o.rows(n, y, classify, seed)
+	return train, eval, nil
+}
+
+// splitOptions are how rows are held back for evaluation.
+type splitOptions struct {
+	method string
+	frac   float64
+}
+
+// readSplit reads data_split_method, data_split_eval_fraction and
+// evaluate.
+func readSplit(cfg *config) (splitOptions, error) {
+	method, err := cfg.str("data_split_method", "auto_split", "auto_split", "random", "no_split")
+	if err != nil {
+		return splitOptions{}, err
 	}
 	frac, err := cfg.num("data_split_eval_fraction", 0.2, 0.0001, 0.9)
 	if err != nil {
-		return nil, nil, err
+		return splitOptions{}, err
 	}
 	evaluate, err := cfg.boolean("evaluate", true)
 	if err != nil {
-		return nil, nil, err
+		return splitOptions{}, err
 	}
 	if !evaluate {
 		method = "no_split"
 	}
+	return splitOptions{method, frac}, nil
+}
+
+// rows splits n rows into training and evaluation rows.
+func (o splitOptions) rows(n int, y []float64, classify bool, seed uint64) (train, eval []int) {
+	method, frac := o.method, o.frac
 	switch method {
 	case "no_split":
 		frac = 0
@@ -341,11 +369,10 @@ func splitRows(cfg *config, n int, y []float64, classify bool, seed uint64) (tra
 		all[i] = i
 	}
 	if frac == 0 {
-		return all, nil, nil
+		return all, nil
 	}
 	if classify {
-		keep, held := stratified(y, frac, seed, 0xe7a1)
-		return keep, held, nil
+		return stratified(y, frac, seed, 0xe7a1)
 	}
 	for i := range n {
 		if float64(rank(seed, 0xe7a1, i)>>11)/(1<<53) < frac {
@@ -355,7 +382,51 @@ func splitRows(cfg *config, n int, y []float64, classify bool, seed uint64) (tra
 		}
 	}
 	if len(train) == 0 || len(eval) == 0 {
-		return all, nil, nil
+		return all, nil
 	}
-	return train, eval, nil
+	return train, eval
+}
+
+// checkOptions reads every option class takes from CONFIG_OBJECT, so that
+// a misspelled or unknown one is refused before any training.
+func checkOptions(class string, m map[string]any) error {
+	cfg := newConfig(m)
+	var err error
+	switch class {
+	case ClassRegression, ClassIglooClassifier, ClassDNNRegressor, ClassDNNClassifier:
+		algorithm := "dnn"
+		switch class {
+		case ClassRegression:
+			algorithm, err = cfg.str("algorithm", "boosted_trees", "boosted_trees", "random_forest", "linear")
+		case ClassIglooClassifier:
+			algorithm, err = cfg.str("algorithm", "boosted_trees", "boosted_trees", "random_forest", "logistic")
+		}
+		if err == nil {
+			err = algorithmOptions(algorithm, cfg)
+		}
+	case ClassAutoMLRegressor, ClassAutoMLClassifier:
+		_, err = automlOptions(cfg, class == ClassAutoMLClassifier)
+	case ClassKMeans:
+		_, _, _, err = kmeansOptions(cfg)
+	case ClassPCA:
+		_, _, _, err = pcaOptions(cfg)
+	case ClassFactorization:
+		_, _, err = alsOptions(cfg)
+	case ClassAutoencoder:
+		_, err = readNetOptions(cfg, []int{1})
+	}
+	if err != nil {
+		return err
+	}
+	switch class {
+	case ClassKMeans, ClassPCA:
+	default:
+		if _, err := readSplit(cfg); err != nil {
+			return err
+		}
+	}
+	if _, err := cfg.seed(); err != nil {
+		return err
+	}
+	return cfg.unused()
 }

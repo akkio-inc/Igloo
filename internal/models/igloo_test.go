@@ -268,3 +268,40 @@ func TestClassifierAlgorithms(t *testing.T) {
 		t.Errorf("a regression's algorithm for a classifier: %v", err)
 	}
 }
+
+// Every class refuses options it does not take before it trains, and
+// takes those it does.
+func TestOptionsCheckedFirst(t *testing.T) {
+	for class, cfg := range map[string]map[string]any{
+		ClassRegression:       {"algorithm": "random_forest", "num_parallel_tree": 10.0, "data_split_method": "no_split"},
+		ClassIglooClassifier:  {"algorithm": "logistic", "l2_reg": 1.0, "calculate_p_values": true},
+		ClassDNNRegressor:     {"hidden_units": []any{8.0}, "dropout": 0.1},
+		ClassDNNClassifier:    {"activation_fn": "tanh", "optimizer": "adam"},
+		ClassAutoMLRegressor:  {"budget_hours": 0.1, "optimization_objective": "minimize_mae"},
+		ClassAutoMLClassifier: {"max_trials": 2.0, "cv_folds": 4.0},
+		ClassKMeans:           {"num_clusters": 3.0, "kmeans_init_method": "KMEANS++"},
+		ClassPCA:              {"num_principal_components": 2.0, "pca_solver": "full"},
+		ClassFactorization:    {"feedback_type": "implicit", "wals_alpha": 10.0},
+		ClassAutoencoder:      {"hidden_units": []any{8.0, 2.0, 8.0}, "seed": 3.0},
+	} {
+		if err := checkOptions(class, cfg); err != nil {
+			t.Errorf("%s: %v", class, err)
+		}
+		bad := map[string]any{"learn_rte": 0.1}
+		for k, v := range cfg {
+			bad[k] = v
+		}
+		if err := checkOptions(class, bad); err == nil || !strings.Contains(err.Error(), "unknown CONFIG_OBJECT key learn_rte") {
+			t.Errorf("%s with a misspelled key: %v", class, err)
+		}
+	}
+	// KMEANS and PCA hold no rows out.
+	if err := checkOptions(ClassKMeans, map[string]any{"data_split_method": "random"}); err == nil {
+		t.Error("KMEANS took data_split_method")
+	}
+	// The search's options are refused before it starts.
+	if _, _, err := TrainIgloo(ClassAutoMLRegressor, nil, IglooArgs{Target: "v", Config: map[string]any{"budget_hour": 1.0}}); err == nil ||
+		!strings.Contains(err.Error(), "budget_hour") {
+		t.Errorf("a misspelled budget: %v", err)
+	}
+}

@@ -29,7 +29,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statements: `IGLOO.ML.REGRESSION` and `IGLOO.ML.CLASSIFICATION` (boosted
   trees, random forests, linear and logistic regressions),
   `IGLOO.ML.DNN_REGRESSOR` and `DNN_CLASSIFIER` (networks trained by Adam,
-  with dropout and early stopping), `IGLOO.ML.KMEANS` (`CENTROIDS`, and
+  with dropout and early stopping), `IGLOO.ML.AUTOML_REGRESSOR` and
+  `AUTOML_CLASSIFIER` (a cross-validated search over those within a time
+  budget, `TRIAL_INFO`), `IGLOO.ML.KMEANS` (`CENTROIDS`, and
   `DETECT_ANOMALIES` by distance), `IGLOO.ML.PCA` (projections,
   components, and anomalies by reconstruction error),
   `IGLOO.ML.MATRIX_FACTORIZATION` (explicit and implicit feedback by ALS,

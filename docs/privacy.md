@@ -556,8 +556,10 @@ person by tagged columns and the identifiers as written. It leaves:
 - **Models** ([ML functions](ml-functions.md)), which keep no rows but
   keep what they learned from them: the categories a model splits on
   (each that at least five training rows had), a time series model's
-  series values and last steps, and each model's `CREATE` statement. Train
-  a model again after erasing rows it learned from.
+  series values and last steps, a `MATRIX_FACTORIZATION` model's users'
+  and items' identifiers with what each user rated, and each model's
+  `CREATE` statement. Train a model again after erasing rows it learned
+  from.
 - **Tables of connections** ([federation](federation.md)), which are in
   another database: Igloo reads them but cannot erase from them. A tagged
   column of one is listed in the request's `tables` as `remote`; erase the

@@ -253,6 +253,10 @@ func appendAttributions(buf []byte, attrs []attribution, k int) []byte {
 // BigQuery's predicted_<label>.
 func sqlName(parts ...string) string { return strings.ToLower(strings.Join(parts, "")) }
 
+// quantileRows bounds the training rows whose distances or errors
+// DETECT_ANOMALIES's thresholds come from.
+const quantileRows = 100_000
+
 // contaminationOptions reads DETECT_ANOMALIES's contamination and sets the
 // threshold of a model whose training rows' scores (distances or errors)
 // have quantiles q (q[i] is the i/(len(q)-1) quantile).

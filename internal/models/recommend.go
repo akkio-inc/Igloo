@@ -76,32 +76,15 @@ func trainFactorization(t *Table, a IglooArgs, cfg *config) (*Factors, error) {
 	case rc.Type != TypeNumber:
 		return nil, inputErr("RATING_COLNAME %s is of type %s; ratings are numbers", a.Rating, rc.TypeName)
 	}
-	feedback, err := cfg.str("feedback_type", "explicit", "explicit", "implicit")
+	feedback, p, err := alsOptions(cfg)
 	if err != nil {
 		return nil, err
 	}
-	p := ml.ALSParams{Implicit: feedback == "implicit", Interrupt: a.Interrupt}
-	if p.Factors, err = cfg.integer("num_factors", 16, 1, 256); err != nil {
+	split, err := readSplit(cfg)
+	if err != nil {
 		return nil, err
 	}
-	if p.L2, err = cfg.num("l2_reg", 1, 1e-9, 1e9); err != nil {
-		return nil, err
-	}
-	if p.Iterations, err = cfg.integer("max_iterations", 15, 1, 1000); err != nil {
-		return nil, err
-	}
-	if p.Alpha, err = cfg.num("wals_alpha", 40, 1e-9, 1e9); err != nil {
-		return nil, err
-	}
-	if p.Seed, err = cfg.seed(); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.boolean("early_stop", true); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.num("min_rel_progress", 0, 0, 1); err != nil {
-		return nil, err
-	}
+	p.Interrupt = a.Interrupt
 	// Each user's rating of an item once: the mean of explicit ratings,
 	// the sum of implicit feedback.
 	type pair struct{ u, i string }
@@ -143,10 +126,7 @@ func trainFactorization(t *Table, a IglooArgs, cfg *config) (*Factors, error) {
 		all.item = append(all.item, int32(f.itemIndex[k.i]))
 		all.value = append(all.value, v)
 	}
-	train, eval, err := splitRows(cfg, len(all.user), nil, false, p.Seed)
-	if err != nil {
-		return nil, err
-	}
+	train, eval := split.rows(len(all.user), nil, false, p.Seed)
 	tr := all.take(train)
 	m, info, err := ml.TrainALS(ml.Ratings{User: tr.user, Item: tr.item, Value: tr.value}, len(f.Users), len(f.Items), p)
 	if err != nil {
@@ -167,6 +147,34 @@ func trainFactorization(t *Table, a IglooArgs, cfg *config) (*Factors, error) {
 		f.Eval = f.evaluate(all.take(eval), tr)
 	}
 	return f, nil
+}
+
+// alsOptions reads MATRIX_FACTORIZATION's options.
+func alsOptions(cfg *config) (feedback string, p ml.ALSParams, err error) {
+	if feedback, err = cfg.str("feedback_type", "explicit", "explicit", "implicit"); err != nil {
+		return
+	}
+	p.Implicit = feedback == "implicit"
+	if p.Factors, err = cfg.integer("num_factors", 16, 1, 256); err != nil {
+		return
+	}
+	if p.L2, err = cfg.num("l2_reg", 1, 1e-9, 1e9); err != nil {
+		return
+	}
+	if p.Iterations, err = cfg.integer("max_iterations", 15, 1, 1000); err != nil {
+		return
+	}
+	if p.Alpha, err = cfg.num("wals_alpha", 40, 1e-9, 1e9); err != nil {
+		return
+	}
+	if p.Seed, err = cfg.seed(); err != nil {
+		return
+	}
+	if _, err = cfg.boolean("early_stop", true); err != nil {
+		return
+	}
+	_, err = cfg.num("min_rel_progress", 0, 0, 1)
+	return
 }
 
 func sortedKeys(m map[string]bool) []string {

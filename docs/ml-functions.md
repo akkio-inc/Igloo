@@ -324,6 +324,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `BOOSTED_TREE_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'boosted_trees'` (the default) |
 | `RANDOM_FOREST_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'random_forest'` |
 | `DNN_REGRESSOR`, `DNN_CLASSIFIER` | `IGLOO.ML.DNN_REGRESSOR`, `IGLOO.ML.DNN_CLASSIFIER` | `'hidden_units'`, `'dropout'` and the like |
+| `AUTOML_REGRESSOR`, `AUTOML_CLASSIFIER` | `IGLOO.ML.AUTOML_REGRESSOR`, `IGLOO.ML.AUTOML_CLASSIFIER` | `'budget_hours'`, `'optimization_objective'` |
 | `KMEANS` | `IGLOO.ML.KMEANS` | `'num_clusters'`, or none to pick one |
 | `PCA` | `IGLOO.ML.PCA` | `'num_principal_components'` or `'pca_explained_variance_ratio'` |
 | `MATRIX_FACTORIZATION` | `IGLOO.ML.MATRIX_FACTORIZATION` | `USER_COLNAME`, `ITEM_COLNAME`, `RATING_COLNAME` arguments; `'feedback_type'` |
@@ -335,7 +336,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | BigQuery function | Igloo method | Classes |
 |---|---|---|
 | `ML.PREDICT` | `PREDICT` | all |
-| `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION` |
+| `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION`, and the `AUTOML` classes but for a network |
 | `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS`, `PCA`, `AUTOENCODER` |
 | `ML.RECONSTRUCTION_LOSS` | `RECONSTRUCTION_LOSS` | `AUTOENCODER` |
 | `ML.CENTROIDS` | `CENTROIDS` | `KMEANS` |
@@ -347,6 +348,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
 | `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
 | `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, networks (`AUTOENCODER` too), `KMEANS`, `MATRIX_FACTORIZATION` |
+| `ML.TRIAL_INFO` | `TRIAL_INFO` | the `AUTOML` classes |
 
 ### Row methods and table methods
 
@@ -455,7 +457,7 @@ Options, BigQuery's names:
 | `dropout` | 0 |
 | `batch_size` | about a thirty-second of the training rows, from 32 to 1,024 |
 | `learn_rate` | 0.001 |
-| `max_iterations` | epochs: enough for some 3,000 steps, from 20 to 500 |
+| `max_iterations` | epochs: enough for some 3,000 steps, from 5 to 500 |
 | `early_stop` | `TRUE` |
 | `l2_reg` | 0 |
 | `optimizer` | `'adam'`, the only one |
@@ -467,6 +469,36 @@ feature's values are shuffled among them. `TRAINING_INFO` shows each
 epoch's training and validation loss, up to the one kept. A batch's
 gradient is added up in fixed parts of 32 rows, so networks are as
 repeatable as the other models.
+
+### AUTOML_REGRESSOR and AUTOML_CLASSIFIER
+
+```sql
+CREATE IGLOO.ML.AUTOML_CLASSIFIER demo.converts_auto(
+    INPUT_DATA => TABLE(demo.lead_features),
+    TARGET_COLNAME => 'converted',
+    CONFIG_OBJECT => {'budget_hours': 0.25, 'optimization_objective': 'maximize_au_roc'});
+
+SELECT * FROM TABLE(demo.converts_auto!TRIAL_INFO()) ORDER BY objective DESC;
+```
+
+A search over the classes above: linear or logistic regressions, boosted
+trees, random forests and networks, with a dozen settings of their
+hyperparameters, the quick ones first. Each is cross-validated on the
+training rows (up to 100,000 of them) in `cv_folds` folds (default 3, of
+the classes' shares for a classifier), and scored by
+`optimization_objective`: `'minimize_log_loss'` (the default) or
+`'maximize_au_roc'` for a classifier, `'minimize_rmse'` (the default),
+`'minimize_mae'` or `'minimize_rmsle'` for a regression. The search stops
+starting trials when `budget_hours` (default 1, at most 72; fractions are
+fine) has passed, or after `max_trials`. The best trial's algorithm and
+settings are then trained on every training row, and the model is that
+one, with its class's methods (`WEIGHTS` for a linear winner,
+`FEATURE_IMPORTANCE` for trees, no `EXPLAIN_PREDICT` for a network) and
+`TRIAL_INFO`: `trial_id`, `algorithm`, `hyperparameters` (the options it
+set, as JSON), `status` (`SUCCEEDED` or `FAILED`), `objective` (its
+cross-validated value, as the objective names it) and `is_optimal`. Within
+its budget a search tries the same trials in the same order, so the same
+rows give the same model unless the budget cuts the search short.
 
 ### KMEANS
 
@@ -512,8 +544,8 @@ FROM TABLE(demo.channel_factors!PREDICT(INPUT_DATA => TABLE(demo.daily_channels)
 ```
 
 Principal components of every column, numbers standardized
-(`'scale_features'`, default `TRUE`) and categories one hot (at most 500
-columns so encoded): `num_principal_components` of them, or as many as
+(`'scale_features'`, default `TRUE`) and categories one hot (at most
+1,000 columns so encoded): `num_principal_components` of them, or as many as
 explain `pca_explained_variance_ratio` of the variance; one of the two is
 required. The components are the covariance matrix's exact eigenvectors,
 so `pca_solver` is accepted and changes nothing.
@@ -587,6 +619,30 @@ the DNN classes'. Rows held out by `data_split_method` measure it.
 | `EVALUATE` | the three errors' means, on the held-out rows (or the training rows without them) or on `INPUT_DATA` |
 | `TRAINING_INFO` | each epoch's training and validation loss |
 
+### Differences from BigQuery
+
+- The statements are Snowflake's, not `CREATE MODEL ... OPTIONS (...) AS
+  SELECT` and `ML.<function>(MODEL m, ...)`: the tables above map one to
+  the other. `TRANSFORM`, `input_label_cols` (use `TARGET_COLNAME`),
+  `data_split_col` and the `'custom'` and `'seq'` splits, `l1_reg`,
+  `auto_class_weights`, `warm_start`, hyperparameter tuning in `CREATE`
+  (`num_trials`; the `AUTOML` classes search instead), other k-means
+  initializations and distances, and model export are not supported.
+- Models come from Igloo's engine, so their metrics and predictions differ
+  from BigQuery's for the same data, and their defaults are Igloo's: for
+  example, boosted trees stop early on a tenth of the training rows rather
+  than running `max_iterations` rounds, and `RECOMMEND` returns `top_k`
+  items rather than every item.
+- Tables BigQuery returns with a column per class or category, or arrays
+  of structures, are rows here: `CONFUSION_MATRIX` has a row per pair of
+  classes, `CENTROIDS` and `PRINCIPAL_COMPONENTS` a row per category, and
+  JSON stands in for arrays (`nearest_centroids_distance`,
+  `top_feature_attributions`, a class's probabilities). `ROC_CURVE`'s
+  thresholds are 0 to 1 by 0.01.
+- `EXPLAIN_PREDICT` attributes a class's raw score (log-odds for boosted
+  trees and logistic models), and networks have none; their
+  `GLOBAL_EXPLAIN` is by permutation.
+
 ## Train and score in one query
 
 Databricks' predictive functions train a model on the rows whose target is
@@ -642,25 +698,32 @@ by their schema there.
   statement prepared before a model was replaced fails with a message to
   run it again.
 - **Personal data.** A model keeps no training rows, but it keeps what it
-  learned from them: the categories it splits on, and a time series
-  model's series values and its series' last steps. Categories that fewer
-  than five training rows have are never kept: they share one bin. A model
-  row keeps its `CREATE` statement. [Erasure requests](privacy.md) do not
-  reach models: a model trained on rows a request later deletes still
-  answers from what it learned, so train it again after erasures.
+  learned from them: the categories it splits on or encodes, and a time
+  series model's series values and its series' last steps. Categories that
+  fewer than five training rows have are never kept: they share one bin
+  (or none, in the models that encode them). A `MATRIX_FACTORIZATION`
+  model is the exception: it keeps every user's and item's identifier, a
+  vector of factors for each, and, for `exclude_seen`, which items each
+  user rated. A model row keeps its `CREATE` statement.
+  [Erasure requests](privacy.md) do not reach models: a model trained on
+  rows a request later deletes still answers from what it learned, so
+  train it again after erasures.
 
 ## The engine
 
 Models are trained by Igloo's engine, in Go: gradient-boosted trees (binary,
 multiclass, regression and quantile objectives), with LightGBM's methods
-for speed and accuracy, and SHAP values to explain them; it is Igloo's
-own Apache-2.0 code and needs nothing besides Igloo.
+for speed and accuracy, and SHAP values to explain them; random forests,
+linear and logistic regressions, networks, k-means, PCA and alternating
+least squares for Igloo's classes. It is Igloo's own Apache-2.0 code and
+needs nothing besides Igloo.
 
 - **Training** happens on the replica that runs `CREATE`, from the rows of
   its input in memory: up to 200 million values (rows times columns),
-  which take a few gigabytes besides DuckDB's memory while it trains; train
-  on a sample of larger inputs. A statement's timeout and cancelling it stop
-  training.
+  which take a few gigabytes besides DuckDB's memory while it trains.
+  Snowflake's classes refuse larger inputs (train on a sample); Igloo's
+  sample them (see [Training](#training)). A statement's timeout and
+  cancelling it stop training.
   Boosting stops when a held-out tenth of the training rows stops
   improving, after at most 500 rounds. On one machine, 100 rounds over a
   million rows of 50 features take about 7 seconds on 18 cores and 13 on
@@ -681,6 +744,23 @@ own Apache-2.0 code and needs nothing besides Igloo.
   model, with the same blob and SHA-256: the engine puts rows in an order
   of their own before training, and adds in a fixed order whatever the
   threads.
+
+On one machine (18 cores), creating each of Igloo's classes on a million
+rows of 50 features (40 numbers, and 10 categories of 20 to 110 values,
+some 680 columns one hot), holdout metrics and explanations included,
+took (`BenchmarkIgloo1M` in `internal/models`, run with
+`IGLOO_ML_BENCH=1`):
+
+| Class | Time |
+|---|---|
+| `REGRESSION`: boosted trees, random forest, linear | 16, 22 and 8 s |
+| `CLASSIFICATION`: boosted trees, random forest, logistic | 11, 24 and 17 s |
+| `DNN_CLASSIFIER`, `DNN_REGRESSOR` (`[64, 32]`) | 19 and 15 s |
+| `AUTOML_CLASSIFIER`: twelve trials, cross-validated on 100,000 rows, and the best trained on all | 1 min 46 s |
+| `KMEANS`: 8 clusters, or picking among 2 to 10 | 10 and 13 s |
+| `PCA`: 228 components, for 90% of the variance | 9 s |
+| `AUTOENCODER`, latent space of 16 | 58 s |
+| `MATRIX_FACTORIZATION`: ten million interactions of 100,000 users with 10,000 items, explicit and implicit | 12 and 15 s |
 
 ## Differences from Snowflake
 

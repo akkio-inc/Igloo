@@ -215,22 +215,10 @@ func newSupervised(classify bool, algorithm string, tc *TableCol, d *labeled) *S
 // and explains it.
 func (s *Supervised) fit(d *labeled, train, eval []int, cfg *config, seed uint64, interrupt func() error) error {
 	tf, ty := subset(d.frame, d.y, train)
-	s.Rows = tf.N
-	var err error
-	switch s.Algorithm {
-	case "boosted_trees", "random_forest":
-		err = s.fitTrees(tf, ty, cfg, seed, interrupt)
-	case "linear", "logistic":
-		err = s.fitLinear(tf, ty, cfg)
-	case "dnn":
-		err = s.fitNet(tf, ty, cfg, seed, interrupt)
-	default:
-		return inputErr("unknown algorithm %s", s.Algorithm)
-	}
-	if err != nil {
+	if err := s.fitAlgorithm(tf, ty, cfg, seed, interrupt); err != nil {
 		return err
 	}
-	s.prepare()
+	var err error
 	if len(eval) > 0 {
 		ef, ey := subset(d.frame, d.y, eval)
 		if s.Eval, err = s.evaluate(ef, ey); err != nil {
@@ -238,6 +226,28 @@ func (s *Supervised) fit(d *labeled, train, eval []int, cfg *config, seed uint64
 		}
 	}
 	return s.explain(tf, ty, seed)
+}
+
+// fitAlgorithm trains s's algorithm on rows f with labels y, and readies
+// it to predict.
+func (s *Supervised) fitAlgorithm(f *ml.Frame, y []float64, cfg *config, seed uint64, interrupt func() error) error {
+	s.Rows = f.N
+	var err error
+	switch s.Algorithm {
+	case "boosted_trees", "random_forest":
+		err = s.fitTrees(f, y, cfg, seed, interrupt)
+	case "linear", "logistic":
+		err = s.fitLinear(f, y, cfg)
+	case "dnn":
+		err = s.fitNet(f, y, cfg, seed, interrupt)
+	default:
+		return inputErr("unknown algorithm %s", s.Algorithm)
+	}
+	if err != nil {
+		return err
+	}
+	s.prepare()
+	return nil
 }
 
 // fitTrees trains boosted trees or a random forest, with BigQuery's
@@ -397,32 +407,56 @@ const maxLinearLevels = 100
 
 // fitLinear fits a linear or logistic regression (one against the rest
 // for three classes or more).
-func (s *Supervised) fitLinear(f *ml.Frame, y []float64, cfg *config) error {
+// linearOptions reads a linear or logistic regression's options: l2_reg,
+// and BigQuery's others that IRLS needs none of.
+func linearOptions(cfg *config) (float64, error) {
 	l2, err := cfg.num("l2_reg", 0, 0, 1e9)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if l1, err := cfg.num("l1_reg", 0, 0, 0); err != nil || l1 != 0 {
-		return inputErr("l1_reg is not supported: Igloo's linear models take l2_reg")
+	if l1, err := cfg.num("l1_reg", 0, 0, 1e9); err != nil || l1 != 0 {
+		return 0, inputErr("l1_reg is not supported: Igloo's linear models take l2_reg")
 	}
 	if _, err := cfg.integer("max_iterations", 0, 1, 10_000); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := cfg.num("learn_rate", 0, 0, 1e9); err != nil {
-		return err
+		return 0, err
 	}
 	for key, allowed := range map[string][]string{"optimize_strategy": {"auto_strategy", "normal_equation", "batch_gradient_descent"},
 		"category_encoding_method": {"dummy_encoding", "one_hot_encoding"}, "learn_rate_strategy": {"line_search", "constant"}} {
 		if err := cfg.accept(key, allowed...); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	for _, key := range []string{"calculate_p_values", "enable_global_explain", "early_stop"} {
 		if _, err := cfg.boolean(key, true); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if _, err := cfg.num("min_rel_progress", 0, 0, 1); err != nil {
+		return 0, err
+	}
+	return l2, nil
+}
+
+// algorithmOptions reads a supervised algorithm's options.
+func algorithmOptions(algorithm string, cfg *config) error {
+	var err error
+	switch algorithm {
+	case "boosted_trees", "random_forest":
+		_, err = treeParams(cfg, algorithm == "random_forest", 0)
+	case "linear", "logistic":
+		_, err = linearOptions(cfg)
+	case "dnn":
+		_, err = readNetOptions(cfg, []int{64, 32})
+	}
+	return err
+}
+
+func (s *Supervised) fitLinear(f *ml.Frame, y []float64, cfg *config) error {
+	l2, err := linearOptions(cfg)
+	if err != nil {
 		return err
 	}
 	s.Hyper = map[string]any{"l2_reg": l2}
@@ -1138,7 +1172,11 @@ func (s *Supervised) method(class, method string) (*Result, error) {
 			return nil, inputErr("TRIAL_INFO is an AutoML model's")
 		}
 		for _, t := range s.Trials {
-			add(int64(t.ID), t.Algorithm, jsonText(t.Hyper), t.Status, finiteNull(t.Objective), t.Optimal)
+			var objective any
+			if t.Status == "SUCCEEDED" {
+				objective = t.Objective
+			}
+			add(int64(t.ID), t.Algorithm, jsonText(t.Hyper), t.Status, objective, t.Optimal)
 		}
 	default:
 		return nil, inputErr("%s models have no method %s; they have %s", QualifiedClass(class), method, joinMethods(class))

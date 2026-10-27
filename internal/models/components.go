@@ -14,7 +14,7 @@ import (
 
 // maxComponentsWidth bounds the encoded features a PCA takes: its
 // eigenvectors take the cube of their number to compute.
-const maxComponentsWidth = 500
+const maxComponentsWidth = 1000
 
 // Components is an IGLOO.ML.PCA model.
 type Components struct {
@@ -38,7 +38,34 @@ func (c *Components) summary(out map[string]any) {
 	addEval(out, c.Eval)
 }
 
+// pcaOptions reads PCA's options: scale_features, and one of
+// num_principal_components and pca_explained_variance_ratio.
+func pcaOptions(cfg *config) (scale bool, k int, ratio float64, err error) {
+	if scale, err = cfg.boolean("scale_features", true); err != nil {
+		return
+	}
+	if k, err = cfg.integer("num_principal_components", 0, 1, maxComponentsWidth); err != nil {
+		return
+	}
+	if ratio, err = cfg.num("pca_explained_variance_ratio", 0, 1e-9, 1); err != nil {
+		return
+	}
+	if (k == 0) == (ratio == 0) {
+		err = inputErr("PCA takes one of num_principal_components and pca_explained_variance_ratio")
+		return
+	}
+	if err = cfg.accept("pca_solver", "full", "randomized", "auto"); err != nil {
+		return
+	}
+	_, err = cfg.seed()
+	return
+}
+
 func trainPCA(t *Table, a IglooArgs, cfg *config) (*Components, error) {
+	scale, k, ratio, err := pcaOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
 	frame, feats, err := featureFrame(t, otherNames(t))
 	if err != nil {
 		return nil, err
@@ -47,27 +74,6 @@ func trainPCA(t *Table, a IglooArgs, cfg *config) (*Components, error) {
 		return nil, inputErr("INPUT_DATA has no columns")
 	}
 	frame = frame.Take(frame.CanonicalOrder(nil))
-	scale, err := cfg.boolean("scale_features", true)
-	if err != nil {
-		return nil, err
-	}
-	k, err := cfg.integer("num_principal_components", 0, 1, maxComponentsWidth)
-	if err != nil {
-		return nil, err
-	}
-	ratio, err := cfg.num("pca_explained_variance_ratio", 0, 1e-9, 1)
-	if err != nil {
-		return nil, err
-	}
-	if (k == 0) == (ratio == 0) {
-		return nil, inputErr("PCA takes one of num_principal_components and pca_explained_variance_ratio")
-	}
-	if err := cfg.accept("pca_solver", "full", "randomized", "auto"); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.seed(); err != nil {
-		return nil, err
-	}
 	enc := ml.FitEncoder(frame, scale, 5, 100)
 	switch {
 	case enc.Width == 0:
@@ -86,12 +92,16 @@ func trainPCA(t *Table, a IglooArgs, cfg *config) (*Components, error) {
 	}
 	c := &Components{Features: feats, Encoder: enc, Model: p, Rows: n,
 		Hyper: map[string]any{"scale_features": scale, "num_principal_components": len(p.Eigenvalues)}}
-	errs := make([]float64, n)
-	coords := make([]float64, len(p.Eigenvalues))
-	for i := range n {
-		p.Project(X[i*d:(i+1)*d], coords)
-		errs[i] = p.ReconstructionError(X[i*d:(i+1)*d], coords)
-	}
+	rows := sampleRows(n, quantileRows)
+	errs := make([]float64, len(rows))
+	parallelRows(len(rows), func(lo, hi int) {
+		coords := make([]float64, len(p.Eigenvalues))
+		for k := lo; k < hi; k++ {
+			i := rows[k]
+			p.Project(X[i*d:(i+1)*d], coords)
+			errs[k] = p.ReconstructionError(X[i*d:(i+1)*d], coords)
+		}
+	})
 	c.Quantiles = quantiles(errs, 1001)
 	c.Eval = &Evaluation{Rows: n, Metrics: []Metric{{"total_explained_variance_ratio", c.explained()}}}
 	return c, nil

@@ -68,7 +68,7 @@ func readNetOptions(cfg *config, defHidden []int) (netOptions, error) {
 
 // params fills in a network's defaults for n training rows: batches of
 // about a thirty-second of the rows (32 to 1,024), and enough epochs for
-// some 3,000 steps (20 to 500).
+// some 3,000 steps (5 to 500).
 func (o netOptions) params(n int, seed uint64, interrupt func() error) ml.MLPParams {
 	batch := o.batch
 	if batch == 0 {
@@ -77,7 +77,7 @@ func (o netOptions) params(n int, seed uint64, interrupt func() error) ml.MLPPar
 	epochs := o.epochs
 	if epochs == 0 {
 		steps := max(1, (n+batch-1)/batch)
-		epochs = min(500, max(20, (3000+steps-1)/steps))
+		epochs = min(500, max(5, (3000+steps-1)/steps))
 	}
 	p := ml.MLPParams{Hidden: o.hidden, LearningRate: o.lr, BatchSize: batch, Epochs: epochs, Dropout: o.dropout, L2: o.l2,
 		Seed: seed, Interrupt: interrupt}

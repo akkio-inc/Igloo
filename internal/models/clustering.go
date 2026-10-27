@@ -45,7 +45,44 @@ func (c *Clusters) summary(out map[string]any) {
 // autoClusters is the most clusters 'num_clusters' left out tries.
 const autoClusters = 10
 
+// kmeansOptions reads KMEANS's options: standardize_features, num_clusters
+// (0 to pick), and the iterations'.
+func kmeansOptions(cfg *config) (standardize bool, k int, p ml.KMeansParams, err error) {
+	if standardize, err = cfg.boolean("standardize_features", true); err != nil {
+		return
+	}
+	if k, err = cfg.integer("num_clusters", 0, 2, 100); err != nil {
+		return
+	}
+	if p.Iterations, err = cfg.integer("max_iterations", 20, 1, 1000); err != nil {
+		return
+	}
+	if p.MinRelProgress, err = cfg.num("min_rel_progress", 0.01, 0, 1); err != nil {
+		return
+	}
+	stop, err := cfg.boolean("early_stop", true)
+	if err != nil {
+		return
+	}
+	if !stop {
+		p.MinRelProgress = 1e-12
+	}
+	if err = cfg.accept("kmeans_init_method", "kmeans++"); err != nil {
+		return
+	}
+	if err = cfg.accept("distance_type", "euclidean"); err != nil {
+		return
+	}
+	p.Seed, err = cfg.seed()
+	return
+}
+
 func trainKMeans(t *Table, a IglooArgs, cfg *config) (*Clusters, error) {
+	standardize, k, p, err := kmeansOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.Interrupt = a.Interrupt
 	frame, feats, err := featureFrame(t, otherNames(t))
 	if err != nil {
 		return nil, err
@@ -54,37 +91,6 @@ func trainKMeans(t *Table, a IglooArgs, cfg *config) (*Clusters, error) {
 		return nil, inputErr("INPUT_DATA has no columns to cluster")
 	}
 	frame = frame.Take(frame.CanonicalOrder(nil))
-	standardize, err := cfg.boolean("standardize_features", true)
-	if err != nil {
-		return nil, err
-	}
-	k, err := cfg.integer("num_clusters", 0, 2, 100)
-	if err != nil {
-		return nil, err
-	}
-	p := ml.KMeansParams{Interrupt: a.Interrupt}
-	if p.Iterations, err = cfg.integer("max_iterations", 20, 1, 1000); err != nil {
-		return nil, err
-	}
-	if p.MinRelProgress, err = cfg.num("min_rel_progress", 0.01, 0, 1); err != nil {
-		return nil, err
-	}
-	stop, err := cfg.boolean("early_stop", true)
-	if err != nil {
-		return nil, err
-	}
-	if !stop {
-		p.MinRelProgress = 1e-12
-	}
-	if err := cfg.accept("kmeans_init_method", "kmeans++"); err != nil {
-		return nil, err
-	}
-	if err := cfg.accept("distance_type", "euclidean"); err != nil {
-		return nil, err
-	}
-	if p.Seed, err = cfg.seed(); err != nil {
-		return nil, err
-	}
 	enc := ml.FitEncoder(frame, standardize, 5, 100)
 	if enc.Width == 0 {
 		return nil, inputErr("the features hold nothing to cluster on")
@@ -113,11 +119,15 @@ func trainKMeans(t *Table, a IglooArgs, cfg *config) (*Clusters, error) {
 	c.Counts, c.Spread = st.Counts, st.Spread
 	c.Eval = &Evaluation{Rows: n, Metrics: finiteMetrics([]Metric{{"davies_bouldin_index", st.DaviesBouldin},
 		{"mean_squared_distance", st.MeanSquaredDistance}})}
-	norm := make([]float64, n)
-	for i := range n {
-		cen, dd := km.Nearest(X[i*d : (i+1)*d])
-		norm[i] = c.normalize(cen, math.Sqrt(dd))
-	}
+	rows := sampleRows(n, quantileRows)
+	norm := make([]float64, len(rows))
+	parallelRows(len(rows), func(lo, hi int) {
+		for k := lo; k < hi; k++ {
+			i := rows[k]
+			cen, dd := km.Nearest(X[i*d : (i+1)*d])
+			norm[k] = c.normalize(cen, math.Sqrt(dd))
+		}
+	})
 	c.Quantiles = quantiles(norm, 1001)
 	return c, nil
 }

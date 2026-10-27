@@ -227,6 +227,32 @@ func TestIglooAutoencoder(t *testing.T) {
 	}
 }
 
+func TestIglooAutoML(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, campaignsTable)
+	conn := snowflakeConn(t, cs.admin)
+	mustExec(t, conn, `CREATE IGLOO.ML.AUTOML_CLASSIFIER converts(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT region, spend, visits, converted FROM campaigns'), TARGET_COLNAME => 'converted',
+		CONFIG_OBJECT => {'max_trials': 3, 'budget_hours': 0.5, 'optimization_objective': 'maximize_au_roc'})`)
+	if got := texts(t, conn, `SELECT count(*), count(*) FILTER (WHERE is_optimal), min(objective) > 0.9, max(objective) <= 1
+		FROM TABLE(converts!TRIAL_INFO()) WHERE status = 'SUCCEEDED'`); len(got) != 1 || got[0] != "3|1|true|true" {
+		t.Errorf("TRIAL_INFO: %q", got)
+	}
+	if got := texts(t, conn, `SELECT algorithm, hyperparameters FROM TABLE(converts!TRIAL_INFO()) ORDER BY trial_id LIMIT 1`); len(got) != 1 ||
+		got[0] != "logistic|{}" {
+		t.Errorf("the first trial: %q", got)
+	}
+	if got := texts(t, conn, "SELECT roc_auc > 0.95 FROM TABLE(converts!EVALUATE())"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("EVALUATE: %q", got)
+	}
+	if n := count(t, conn, `SELECT count(*) FROM TABLE(converts!PREDICT(INPUT_DATA => TABLE(campaigns))) WHERE predicted_converted = converted`); n < 1400 {
+		t.Errorf("%d of 1500 predicted right", n)
+	}
+	expectCode(t, conn, `CREATE IGLOO.ML.AUTOML_REGRESSOR v(INPUT_DATA => TABLE(campaigns), TARGET_COLNAME => 'value',
+		CONFIG_OBJECT => {'optimization_objective': 'maximize_au_roc'})`, "22023", "optimization_objective is one of")
+}
+
 func TestIglooRegression(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()

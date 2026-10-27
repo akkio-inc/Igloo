@@ -28,19 +28,24 @@ var iglooTableMethods = map[string][]string{
 	ClassDNNRegressor:    {"EVALUATE", "GLOBAL_EXPLAIN", "TRAINING_INFO"},
 	ClassDNNClassifier:   {"EVALUATE", "CONFUSION_MATRIX", "ROC_CURVE", "GLOBAL_EXPLAIN", "TRAINING_INFO"},
 	ClassAutoencoder:     {"EVALUATE", "TRAINING_INFO"},
+	ClassAutoMLRegressor: {"EVALUATE", "GLOBAL_EXPLAIN", "FEATURE_IMPORTANCE", "WEIGHTS", "TRAINING_INFO", "TRIAL_INFO"},
+	ClassAutoMLClassifier: {"EVALUATE", "CONFUSION_MATRIX", "ROC_CURVE", "GLOBAL_EXPLAIN", "FEATURE_IMPORTANCE", "WEIGHTS",
+		"TRAINING_INFO", "TRIAL_INFO"},
 }
 
 // iglooRowMethods lists each class's row methods, for messages; a model's
 // own (Artifact.RowMethods) may have fewer.
 var iglooRowMethods = map[string][]string{
-	ClassRegression:      {"PREDICT", "EXPLAIN_PREDICT"},
-	ClassIglooClassifier: {"PREDICT", "EXPLAIN_PREDICT"},
-	ClassKMeans:          {"PREDICT", "DETECT_ANOMALIES"},
-	ClassPCA:             {"PREDICT", "DETECT_ANOMALIES"},
-	ClassFactorization:   {"PREDICT", "RECOMMEND"},
-	ClassDNNRegressor:    {"PREDICT"},
-	ClassDNNClassifier:   {"PREDICT"},
-	ClassAutoencoder:     {"PREDICT", "RECONSTRUCTION_LOSS", "DETECT_ANOMALIES"},
+	ClassRegression:       {"PREDICT", "EXPLAIN_PREDICT"},
+	ClassIglooClassifier:  {"PREDICT", "EXPLAIN_PREDICT"},
+	ClassKMeans:           {"PREDICT", "DETECT_ANOMALIES"},
+	ClassPCA:              {"PREDICT", "DETECT_ANOMALIES"},
+	ClassFactorization:    {"PREDICT", "RECOMMEND"},
+	ClassDNNRegressor:     {"PREDICT"},
+	ClassDNNClassifier:    {"PREDICT"},
+	ClassAutoencoder:      {"PREDICT", "RECONSTRUCTION_LOSS", "DETECT_ANOMALIES"},
+	ClassAutoMLRegressor:  {"PREDICT", "EXPLAIN_PREDICT"},
+	ClassAutoMLClassifier: {"PREDICT", "EXPLAIN_PREDICT"},
 }
 
 // IsRowMethodOf reports whether method is a row method of class.
