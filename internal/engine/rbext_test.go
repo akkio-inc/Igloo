@@ -547,3 +547,47 @@ func render(v driver.Value) string {
 		return fmt.Sprint(x)
 	}
 }
+
+// TestRBSettingsStayInTheirSession checks that the rb extension's
+// settings, set with SET SESSION as workers' tasks set a session's settings
+// (see the distributed package's TestTaskSettingsStayInTheTask), change
+// them for that connection only.
+func TestRBSettingsStayInTheirSession(t *testing.T) {
+	ctx := context.Background()
+	e, _ := openWithRB(t)
+	a, err := e.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close() //nolint:errcheck
+	b, err := e.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close() //nolint:errcheck
+	setting := func(conn *duckdb.Conn, name string) string {
+		t.Helper()
+		v, err := firstRow(ctx, conn, "SELECT current_setting('"+name+"')::VARCHAR")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	exec := func(conn *duckdb.Conn, stmt string) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, value := range map[string]string{"rb_count_distinct": "always", "rb_memory_budget": "123456"} {
+		before := setting(b, name)
+		exec(a, "SET SESSION "+name+" = '"+value+"'")
+		if got := setting(a, name); !strings.EqualFold(got, value) {
+			t.Errorf("%s after SET SESSION: %s, want %s", name, got, value)
+		}
+		if got := setting(b, name); got != before {
+			t.Errorf("%s on another connection: %s, want %s as before", name, got, before)
+		}
+		exec(a, "RESET SESSION "+name)
+	}
+}

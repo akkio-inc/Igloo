@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -527,6 +528,61 @@ func TestWorkerRefusesStrangers(t *testing.T) {
 	}
 	if _, err := w.viewStatement(viewDef{Name: "x; DROP TABLE y", Columns: []Column{{Name: "a", Type: "INTEGER", ID: 1}}}, ""); err == nil {
 		t.Error("a view with a bad name was accepted")
+	}
+}
+
+// A task's settings, its session's and those the worker sets for its
+// exchange, stay on the task's connection. DuckDB keeps some globally, and
+// a plain SET of one changed it for every task running on the worker: a
+// dashboard's exchanges failed to bind ("ROW_GROUP_SIZE_BYTES does not work
+// while preserving insertion order") when another task applied its
+// session's preserve_insertion_order between the worker's SET and the COPY,
+// and a task could compute with another session's default_order.
+func TestTaskSettingsStayInTheTask(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 1)
+	w := h.workers[0]
+	ctx := t.Context()
+	li := h.tables["lineitem"]
+	view := viewDef{Name: "__igloo_split", Columns: li.Columns, Files: []string{h.files[li.key()][0].Path}}
+	conn, err := w.opts.Engine.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	current := func(name string) string {
+		t.Helper()
+		rows, err := conn.QueryContext(ctx, "SELECT current_setting('"+name+"')::VARCHAR", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close() //nolint:errcheck
+		dest := make([]driver.Value, 1)
+		if err := rows.Next(dest); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprint(dest[0])
+	}
+	names := append(slices.Clone(SettingNames), "partitioned_write_max_open_files", "partitioned_write_flush_threshold")
+	before := map[string]string{}
+	for _, n := range names {
+		before[n] = current(n)
+	}
+	settings := []setting{{Name: "default_order", Value: "DESC"}, {Name: "default_null_order", Value: "NULLS_FIRST"},
+		{Name: "default_collation", Value: "nocase"}, {Name: "preserve_insertion_order", Value: "true"},
+		{Name: "arrow_large_buffer_size", Value: "true"}}
+	_, res, err := w.run(ctx, &taskRequest{Query: "q-settings", Version: "test", Views: []viewDef{view}, Settings: settings,
+		SQL: "SELECT l_orderkey, l_orderkey % 4 AS __b FROM __igloo_split", Partitions: 4,
+		Shuffle: filepath.Join(h.dir, "warehouse", config.ShuffleDir, "q-settings")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rows == 0 || len(res.Files) == 0 {
+		t.Fatalf("the exchange wrote %d rows in %d files", res.Rows, len(res.Files))
+	}
+	for _, n := range names {
+		if got := current(n); got != before[n] {
+			t.Errorf("after a task, another connection's %s is %s, was %s", n, got, before[n])
+		}
 	}
 }
 

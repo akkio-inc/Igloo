@@ -498,7 +498,7 @@ var taskFault func(req *taskRequest) error
 // of an exchange's file did on 16 workers at a hundred times the data,
 // failing the statement. Past them, the coordinator runs the task again in
 // a while (see dispatch).
-var storageRetries = []string{"SET http_retries = 8", "SET http_retry_wait_ms = 250", "SET http_retry_backoff = 2"}
+var storageRetries = []string{"SET SESSION http_retries = 8", "SET SESSION http_retry_wait_ms = 250", "SET SESSION http_retry_backoff = 2"}
 
 // run runs a task on a connection of its own and writes the result to a
 // Parquet file, whose path it returns; a shuffle task writes it to object
@@ -532,11 +532,17 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			}
 		}
 	}
+	// Every setting a task changes is its session's: DuckDB keeps some
+	// globally (default_order, default_null_order, default_collation,
+	// preserve_insertion_order and arrow_large_buffer_size), and a plain SET
+	// of one changes it for every task running on the worker beside this
+	// one, which then computed with another session's setting, or failed
+	// to bind its exchange's COPY (see writePartitions).
 	for _, s := range req.Settings {
 		if !knownSetting(s.Name) {
 			return "", nil, fmt.Errorf("setting %s is not one tasks may change", s.Name)
 		}
-		if err := exec("SET " + quoteIdent(s.Name) + " = " + quoteLiteral(s.Value)); err != nil {
+		if err := exec("SET SESSION " + quoteIdent(s.Name) + " = " + quoteLiteral(s.Value)); err != nil {
 			return "", nil, fmt.Errorf("set %s: %w", s.Name, err)
 		}
 	}
@@ -792,23 +798,26 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 	// 17,275 files of 24 KB, each a request to object storage, for 23
 	// minutes. With every partition's file open, a task writes one file a
 	// partition.
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_max_open_files = %d", 4*maxPartitions), nil); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_max_open_files = %d", 4*maxPartitions), nil); err != nil {
 		return nil, err
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET partitioned_write_flush_threshold = %d",
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_flush_threshold = %d",
 		shuffleFlush(w.opts.MemoryBytes, cap(w.slots), threadsOf(ctx, conn), cols)), nil); err != nil {
 		return nil, err
 	}
 	if uploadsInParts(dir) {
-		if _, err := conn.ExecContext(ctx, "SET s3_uploader_max_filesize = "+quoteLiteral(maxUploadFile), nil); err != nil {
+		if _, err := conn.ExecContext(ctx, "SET SESSION s3_uploader_max_filesize = "+quoteLiteral(maxUploadFile), nil); err != nil {
 			return nil, err
 		}
 	}
 	opts := fmt.Sprintf("FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d", shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols))
 	if n := shuffleRowGroupBytes(w.opts.MemoryBytes, cap(w.slots), parts); n > 0 {
 		// DuckDB bounds a row group's bytes only where it need not keep
-		// the rows' order, which an exchange's partitions do not.
-		if _, err := conn.ExecContext(ctx, "SET preserve_insertion_order = false", nil); err != nil {
+		// the rows' order, which an exchange's partitions do not. The
+		// setting is global but for SET SESSION: set plainly, another
+		// task's session settings set it back between this and the COPY,
+		// which then failed to bind.
+		if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order = false", nil); err != nil {
 			return nil, err
 		}
 		opts += fmt.Sprintf(", ROW_GROUP_SIZE_BYTES %d", n)
