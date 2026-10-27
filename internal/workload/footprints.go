@@ -40,9 +40,11 @@ func (c *Controller) EstimateFromHistory(fraction float64) {
 	c.history.fraction = max(fraction, 0)
 }
 
-// Observe records what a statement of shape allocated over its run.
+// Observe records what a statement of shape allocated over its run on this
+// replica, which it completed; the server seeds them from the query history
+// when it starts, as its statements had them under the same memory limit.
 func (c *Controller) Observe(shape string, allocated int64) {
-	if c == nil || shape == "" || c.history.fraction == 0 || allocated <= 0 {
+	if c == nil || shape == "" || allocated <= 0 {
 		return
 	}
 	f := &c.history
@@ -72,4 +74,19 @@ func (c *Controller) Estimate(shape string) int64 {
 		return 0
 	}
 	return r
+}
+
+// Footprint returns what the latest statement of shape allocated over its
+// run on this replica, which it completed; ok is false when none of its
+// shape has (see Observe). Auto mode takes it for proof that one machine is
+// not short of memory for the statement, whatever its estimate says.
+func (c *Controller) Footprint(shape string) (allocated int64, ok bool) {
+	if c == nil || shape == "" {
+		return 0, false
+	}
+	f := &c.history
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	allocated, ok = f.allocated[shape]
+	return allocated, ok
 }

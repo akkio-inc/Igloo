@@ -238,19 +238,26 @@ allocated more than the replica's memory waits until the others'
 reservations are released; one whose reservation would be under a
 sixteenth of the memory, or whose shape Igloo has not seen since the
 replica started, reserves nothing and starts at once. A role's own
-`memory_limit` comes first.
+`memory_limit` comes first. When it starts, a replica reads what the past
+week's statements allocated from the [query history](sql.md#query-history),
+those that ran on a replica with its memory limit, within a quarter, so
+that a restart does not forget them.
 
 On a dashboard's burst of queries over billions of rows, on 8 cores and 22 GB, the
 build took 548 to 574 seconds with 8 statements running at once and 365
 with 2, and takes 306 to 310 with reservations, its median query 21 to 22
 seconds rather than 32 to 51; reserving half of what a shape allocated
 took 314 to 353, and a quarter 367 to 371. The first time a dashboard runs
-on a replica, its statements have no history and reserve nothing. What a
+on a replica, its statements have no history and reserve nothing: its first
+build took 558 to 590 seconds; after a restart, with what the history kept,
+301. What a
 statement allocates over its run is not its peak, which DuckDB 1.5 does not
 measure for one statement; the fraction stands in for how much of it the
 statement holds at once, and `off` turns the reservations off. Shapes are kept for the replica's life, up
 to 4,096 of them, and statements that ran on [workers](distributed-execution.md)
 are not learned from, since most of what they allocated was the workers'.
+A shape that ran to its end on the replica also tells auto mode that the
+replica is not short of memory for it (see [when](distributed-execution.md#when)).
 
 ## Compute pools
 

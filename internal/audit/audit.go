@@ -82,6 +82,15 @@ type Query struct {
 	// runs (distributed.Plan.Key), so that where it ran faster decides where
 	// it runs next, after a restart too; empty for others.
 	PlanKey string
+	// Shape identifies the statements alike but for their literals, the
+	// workload controller's key for what they allocate (see
+	// workload.Controller.Observe); empty for statements that do not count
+	// against the replica's limits. Memory is the memory it ran with: the
+	// replica's limit, or the smallest worker's when it ran on workers;
+	// zero when not known. A restarted server takes runs from the history
+	// only under the memory it runs with now.
+	Shape  string
+	Memory int64
 	// AI is what the statement's AI functions did; nil when it called
 	// none.
 	AI *AIUsage

@@ -374,9 +374,6 @@ func serve() error {
 			return err
 		}
 		defer dist.Close() //nolint:errcheck
-		if historyStore != nil {
-			go seedRuns(ctx, dist, historyStore, log)
-		}
 	}
 
 	// srv is set before it serves anyone; single sign-on tells it about
@@ -469,6 +466,13 @@ func serve() error {
 	limits.LimitReplica(replica)
 	limits.EstimateFromHistory(cfg.StatementReservations)
 	reg.MustRegister(limits.Metrics()...)
+	if historyStore != nil {
+		var seed func([]distributed.Run)
+		if dist != nil {
+			seed = dist.Seed
+		}
+		go seedHistory(ctx, seed, limits.Observe, eng.MemoryLimit(ctx), historyStore, log)
+	}
 
 	opts := pgwire.Options{
 		Users:               users,

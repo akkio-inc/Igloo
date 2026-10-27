@@ -1025,3 +1025,46 @@ func TestIdleWorkers(t *testing.T) {
 		t.Fatalf("idle workers: %d stops, want 1", n)
 	}
 }
+
+// footprintEnv is harnessEnv whose session says a statement of the planned
+// one's shape ran here, allocating allocated.
+type footprintEnv struct {
+	harnessEnv
+	allocated int64
+}
+
+func (e footprintEnv) Footprint() (int64, bool) { return e.allocated, true }
+
+// A statement that ran on workers and that auto mode estimates short of
+// memory on one machine stays on workers, but not where a statement of its
+// shape ran to its end on one machine (see Footprints).
+func TestFootprintKeepsAStatementHere(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	h.co.maxBroadcast = 1
+	h.co.opts.MemoryBytes = 8 << 20
+	h.tables["lineitem"].Bytes = 1 << 30
+	h.tables["orders"].Bytes = 1 << 28
+	q := `SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1`
+	ctx := t.Context()
+	plan, d, err := h.co.plan(ctx, q, harnessEnv{h}, ModeAuto, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.e.memory {
+		t.Fatalf("by the estimate, not short of memory (%s)", d.reason)
+	}
+	h.co.Observe(plan.Key, 2, 100*time.Second)
+	env := harnessEnv{h}
+	_, d, err = h.co.plan(ctx, q, env, ModeAuto, true, nil)
+	if err != nil || !d.onWorkers {
+		t.Fatalf("after a run on workers, short of memory: on workers %v (%s), %v", d.onWorkers, d.reason, err)
+	}
+	ran := footprintEnv{env, 1 << 20}
+	_, d, err = h.co.plan(ctx, q, ran, ModeAuto, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.e.memory || d.e.spills || d.onWorkers {
+		t.Errorf("after a run here too: short of memory %v, spills %v, on workers %v (%s)", d.e.memory, d.e.spills, d.onWorkers, d.reason)
+	}
+}

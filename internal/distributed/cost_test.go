@@ -382,24 +382,24 @@ func TestPlanKey(t *testing.T) {
 // as the earlier ones, and the keys used longest ago go first.
 func TestHistory(t *testing.T) {
 	h := newHistory()
-	h.observe("a", 0, 100)
-	h.observe("a", 0, 50)
-	h.observe("a", 4, 30)
+	h.observe("a", 0, 100, 0)
+	h.observe("a", 0, 50, 0)
+	h.observe("a", 4, 30, 0)
 	if r, ok := h.get("a"); !ok || r.local != 75 || r.dist != 30 || r.distWorkers != 4 {
 		t.Errorf("runs of a: %+v", r)
 	}
 	// On about as many workers, runs average; on four times as many, the
 	// last stands alone.
-	h.observe("a", 5, 20)
+	h.observe("a", 5, 20, 0)
 	if r, _ := h.get("a"); r.dist != 25 || r.distWorkers != 5 {
 		t.Errorf("on 5 workers: %+v", r)
 	}
-	h.observe("a", 16, 8)
+	h.observe("a", 16, 8, 0)
 	if r, _ := h.get("a"); r.dist != 8 || r.distWorkers != 16 {
 		t.Errorf("on 16 workers: %+v", r)
 	}
 	for i := range maxHistory {
-		h.observe(fmt.Sprint("k", i), 0, 1)
+		h.observe(fmt.Sprint("k", i), 0, 1, 0)
 	}
 	if _, ok := h.get("a"); ok {
 		t.Error("kept the key used longest ago")
@@ -410,7 +410,7 @@ func TestHistory(t *testing.T) {
 
 	// Out of memory on one machine until it runs there again.
 	co := &Coordinator{history: newHistory()}
-	co.Seed([]Run{{Key: "m", Workers: 0, Duration: time.Minute}, {Key: "m", OutOfMemory: true}})
+	co.Seed([]Run{{Key: "m", Workers: 0, Duration: time.Minute, Memory: 1 << 30}, {Key: "m", OutOfMemory: true, Memory: 1 << 30}})
 	if r, _ := co.history.get("m"); !r.outOfMemory || r.local != 60 {
 		t.Errorf("runs of m: %+v", r)
 	}
@@ -475,5 +475,60 @@ func TestAutoMode(t *testing.T) {
 	// Forced, it runs on workers whatever the history.
 	if _, err := h.co.Plan(t.Context(), join, harnessEnv{h}, ModeOn); err != nil {
 		t.Fatalf("forced: %v", err)
+	}
+}
+
+// TestRanHere checks that a statement of a shape that ran to its end on
+// this machine is not short of memory there, whatever its estimate says,
+// and spills only if what it allocated over its run is over its share.
+func TestRanHere(t *testing.T) {
+	const gb = 1 << 30
+	// What a dashboard's statement at ten times the data exchanges: short of
+	// memory and spilling on a machine of 22 GB, by the estimate.
+	x := features{bytes: 3e9, unfiltered: 2e10, exchanged: 2e10, held: 1e10, rows: 2e9, legacyRows: 2e9, levels: 2, stages: 3}
+	m := machine{cores: 8, threads: 8, memory: 22 * gb}
+	f := fleet{cores: 8, threads: 8, running: 2, most: 2}
+	before := x.estimate(m, f)
+	if !before.memory || !before.spills {
+		t.Fatalf("by the estimate alone: memory %v, spills %v; want both", before.memory, before.spills)
+	}
+	m.ranHere, m.allocated = true, 4*gb
+	if e := x.estimate(m, f); e.memory || e.spills || e.oneMachine >= before.oneMachine {
+		t.Errorf("after a run here of 4 GB: memory %v, spills %v, one machine %.0f s (before %.0f)", e.memory, e.spills, e.oneMachine, before.oneMachine)
+	}
+	m.allocated = 40 * gb
+	if e := x.estimate(m, f); e.memory || !e.spills {
+		t.Errorf("after a run here of 40 GB: memory %v, spills %v; want spills alone", e.memory, e.spills)
+	}
+}
+
+// TestComparable checks that runs measured under other memory, the
+// replica's or the workers', are left out, and that unknown memory is not
+// held against a run.
+func TestComparable(t *testing.T) {
+	const gb = int64(1) << 30
+	r := runs{local: 14, localMemory: 14 * gb, outOfMemory: true, dist: 1312, distWorkers: 2, distMemory: 6 * gb, exchangeBytes: gb}
+	if got := comparable(r, 22*gb, 22*gb); got.local != 0 || got.outOfMemory || got.dist != 0 || got.distWorkers != 0 || got.exchangeBytes != 0 {
+		t.Errorf("on 22 GB with workers of 22 GB: %+v", got)
+	}
+	if got := comparable(r, 15*gb, 7*gb); got.local != 14 || !got.outOfMemory || got.dist != 1312 {
+		t.Errorf("within a quarter: %+v", got)
+	}
+	if got := comparable(runs{local: 5, dist: 9}, 22*gb, 0); got.local != 5 || got.dist != 9 {
+		t.Errorf("runs whose memory is not known: %+v", got)
+	}
+	// Seeded runs that do not say what memory they had are left out.
+	co := &Coordinator{history: newHistory()}
+	co.Seed([]Run{{Key: "old", Duration: time.Second}, {Key: "new", Duration: time.Second, Memory: 22 * gb}})
+	if _, ok := co.history.get("old"); ok {
+		t.Error("seeded a run that does not say what memory it had")
+	}
+	if r, ok := co.history.get("new"); !ok || r.local != 1 || r.localMemory != 22*gb {
+		t.Errorf("seeded run: %+v %v", r, ok)
+	}
+	// A run under other memory stands alone rather than average with them.
+	co.history.observe("new", 0, 9, 14*gb)
+	if r, _ := co.history.get("new"); r.local != 9 || r.localMemory != 14*gb {
+		t.Errorf("after a run on 14 GB: %+v", r)
 	}
 }

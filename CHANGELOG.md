@@ -1414,6 +1414,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- A replica reads what the past week's statements allocated from the
+  query history when it starts, those that ran under its memory limit, so
+  a dashboard's first build after a restart reserves memory as later ones
+  do: 301 seconds rather than 590 at ten times the data, on
+  8 cores. The history now keeps each statement's shape and the memory it
+  ran with, and auto mode counts runs only under the memory they ran with,
+  the replica's limit or the workers', so that runs from a smaller replica
+  with workers beside it no longer steer one with workers of its own. A
+  statement whose shape ran to its end on the replica is no longer
+  estimated short of memory there (see [reservations from
+  history](docs/workload-management.md#reservations-from-history)).
 - Statements reserve memory by what statements like them allocated before
   (`IGLOO_STATEMENT_RESERVATIONS`; see [reservations from
   history](docs/workload-management.md#reservations-from-history)), so that

@@ -1888,7 +1888,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		sess.wl.counted = countsOnReplica(sess, st)
 		sess.wl.shape = ""
 		if sess.wl.counted {
-			sess.wl.shape = statementShape(st.prepared)
+			sess.wl.shape = shapeKey(st.prepared)
 		}
 		shape := sess.wl.shape
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
@@ -2005,7 +2005,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			s.dist.Observe(parts.key, parts.workers, time.Since(cmp.Or(parts.since, start)))
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
-			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend})
+			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,
+			shape: shape})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}

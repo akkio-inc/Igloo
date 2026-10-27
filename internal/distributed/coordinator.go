@@ -417,9 +417,16 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		return p, err
 	}
 	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes}
+	if fe, ok := env.(Footprints); ok {
+		m.allocated, m.ranHere = fe.Footprint()
+	}
 	e := estimateTimes(plan.Stages, m, co.fleet(ws, plan.mayStart))
 	plan.workers = e.workers
 	r, found := co.history.get(plan.Key)
+	if found {
+		r = comparable(r, m.memory, co.pool.lastMemory())
+		found = r.local > 0 || r.dist > 0 || r.outOfMemory || r.guarded || !r.explored.IsZero()
+	}
 	plan.shortOfMemory = e.memory || found && r.outOfMemory
 	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws}
 	if mode != ModeAuto {

@@ -282,15 +282,31 @@ took before. It recognizes a statement run again, as BI tools run theirs, by
 its text without its literals (other than integers) and the sizes of its
 tables to a factor of two: `query_history.plan_key`. Each replica remembers
 the last 4,096 such statements, and reads the past week's from the query
-history when it starts. A statement that ran both ways runs where it was
-faster. One that ran only on the replica within the threshold stays there.
+history when it starts. Runs count only under the memory they ran with, the
+replica's limit or the smallest worker's, within a quarter of what it is
+now, which the history keeps (runs from before it kept it are not read):
+runs on a replica of 14 GB with workers of 6 GB beside it, read back on one
+of 22 GB with workers of their own, had kept a dashboard's statements on
+workers. A statement that ran both ways runs where it was faster. One that ran only on the replica within the threshold stays there.
 One that ran only one way, in under ten minutes, is tried once the other
 way, at most once a day, so that runs come to be compared with runs, if
 the other way is estimated at no more than twice what it took, and, on the
 replica, if it should fit in its memory; past that, one that ran only on
 the replica, well within its estimate, stays there, and one that ran only
 on workers stays there if it beat its estimates, or if the replica should
-run short of memory. The first time, one that the replica should spill
+run short of memory, unless it took more than ten times the replica's
+estimate there: that one is tried on the replica once a day, and may take
+as long there as it took on workers before the guard (below) runs it on
+them again. The replica is not short of memory for a statement whose
+shape, its text with its literals masked, ran to its end there, whatever
+its estimate, and it spills only if that run allocated more than its share
+(see [reservations from history](workload-management.md#reservations-from-history)):
+the estimate counts what a join exchanges, not what its filters leave, and
+held a dashboard's joins of a lookup of billions of rows too large for 22 GB.
+What a run allocated counts every allocation over the run, not its peak, so
+a heavy statement that fits may still count as spilling: such statements
+of that dashboard, at 20 seconds on the replica, still ran on workers.
+The first time, one that the replica should spill
 runs on workers if they are estimated at no more than half again the
 replica's estimate, which is then a floor. Runs on workers count with runs on about
 as many: one that ran on a quarter of the workers it would run on now, as

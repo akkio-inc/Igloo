@@ -745,6 +745,13 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 }
 
 // Setting returns the session's value of a DuckDB setting.
+// Footprint is what the latest statement of the shape of the one planned
+// allocated over its run on this replica, which it completed (see
+// distributed.Footprints); ok is false when none has.
+func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
+	return e.s.workload.Footprint(shapeKey(e.st.prepared))
+}
+
 func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
 	return settingValue(ctx, e.sess.conn, name)
 }

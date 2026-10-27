@@ -211,27 +211,42 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	return co, nil
 }
 
-// seedRuns tells co how long statements that could run on workers took in
-// the past week, by their plan keys, from the query history, so that auto
-// mode keeps choosing the faster after a restart (see distributed.Run).
-func seedRuns(ctx context.Context, co interface{ Seed([]distributed.Run) }, store audit.Store, log *slog.Logger) {
+// seedHistory reads the past week's statements from the query history,
+// oldest last, and tells seed, if any, how long statements that could run on
+// workers took, by their plan keys, so that auto mode keeps choosing the
+// faster after a restart (see distributed.Run), and observe what
+// statements that ran here allocated, by their shapes, so that heavy ones
+// reserve memory from the first after it (see workload.Controller.Observe)
+// and auto mode knows they ran here (see distributed.Footprints). A run is
+// taken only with the memory it ran with: a footprint only from this
+// replica's memory limit, memory, or one within a quarter of it.
+func seedHistory(ctx context.Context, seed func([]distributed.Run), observe func(shape string, allocated int64),
+	memory int64, store audit.Store, log *slog.Logger) {
 	const pageSize, most = 1000, 20000
 	page := audit.Page{Since: time.Now().Add(-7 * 24 * time.Hour), Limit: pageSize}
 	var rs []distributed.Run
+	type footprint struct {
+		shape     string
+		allocated int64
+	}
+	var fs []footprint
 	for read := 0; read < most; read += pageSize {
 		qs, err := store.Queries(ctx, audit.Viewer{All: true}, page)
 		if err != nil {
-			log.Warn("could not read past statements' runs for distributed execution", "err", err)
+			log.Warn("could not read past statements' runs", "err", err)
 			break
 		}
 		for _, q := range qs {
 			switch {
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
-				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Duration: q.Duration})
+				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Duration: q.Duration, Memory: q.Memory})
 			case q.Workers == 0 && q.SQLState == "53200":
 				// It ran out of memory on one machine.
-				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true})
+				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true, Memory: q.Memory})
+			}
+			if q.Shape != "" && q.Workers == 0 && q.Outcome == audit.OutcomeOK && q.Resources != nil && sameMemory(q.Memory, memory) {
+				fs = append(fs, footprint{q.Shape, q.Resources.MemoryAllocated})
 			}
 		}
 		if len(qs) < pageSize {
@@ -242,8 +257,20 @@ func seedRuns(ctx context.Context, co interface{ Seed([]distributed.Run) }, stor
 	}
 	// Newest first: oldest first, so the last run weighs most.
 	slices.Reverse(rs)
-	co.Seed(rs)
-	log.Debug("read past statements' runs for distributed execution", "runs", len(rs))
+	slices.Reverse(fs)
+	if seed != nil {
+		seed(rs)
+	}
+	for _, f := range fs {
+		observe(f.shape, f.allocated)
+	}
+	log.Debug("read past statements' runs", "runs", len(rs), "footprints", len(fs))
+}
+
+// sameMemory reports whether a run's memory, ran, is this replica's,
+// memory, within a quarter; a run that does not say is not.
+func sameMemory(ran, memory int64) bool {
+	return ran > 0 && memory > 0 && max(ran, memory) <= min(ran, memory)/4*5
 }
 
 // workerErasure is what erasure requests have the worker purge (see

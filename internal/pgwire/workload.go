@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -156,6 +157,13 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 
 // numberLiteral is a number in SQL code, not part of a name.
 var numberLiteral = regexp.MustCompile(`\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b`)
+
+// shapeKey identifies the statements of text's shape (statementShape) in
+// the workload controller and the query history, which keeps it.
+func shapeKey(text string) string {
+	sum := sha256.Sum256([]byte(statementShape(text)))
+	return hex.EncodeToString(sum[:12])
+}
 
 // statementShape is text with its string and number literals masked, its
 // comments left out and its white space collapsed: a dashboard's statement

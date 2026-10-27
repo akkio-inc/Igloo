@@ -133,6 +133,17 @@ var migrations = []string{
 			ALTER TABLE igloo_audit.query_history ADD COLUMN IF NOT EXISTS plan_key text;
 		END IF;
 	END $$`,
+	// Statements' shapes, and the memory they ran with, for reservations
+	// and auto mode after a restart. Added once, as above.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_audit' AND table_name = 'query_history' AND column_name = 'run_memory') THEN
+			ALTER TABLE igloo_audit.query_history
+				ADD COLUMN IF NOT EXISTS shape text,
+				ADD COLUMN IF NOT EXISTS run_memory bigint;
+		END IF;
+	END $$`,
 	// What statements' AI functions did. Added once, as above.
 	`DO $$
 	BEGIN
@@ -205,13 +216,15 @@ func (s *PostgresStore) WriteQueries(ctx context.Context, qs []Query) error {
 			nullable(q.SQLState), rowCount, q.StatementType, q.Text, nullSlice(q.TablesRead), nullSlice(q.TablesWritten),
 			nullable(q.ClientAddress), nullable(q.ApplicationName), nullSlice(q.Policies), nullable(q.QueryTag),
 			nullable(q.Pool), q.Queued.Microseconds(), cpu, read, memory, nullSlice(q.LocationsRead), nullable(q.Job), q.Workers,
-			q.Stages, q.Exchanges, nullable(q.PlanKey), aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels}
+			q.Stages, q.Exchanges, nullable(q.PlanKey), aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels,
+			nullable(q.Shape), nullableInt(q.Memory)}
 	}
 	return s.copy(ctx, "query_history", "query_id", []string{
 		"query_id", "session_id", "user_name", "role", "start_time", "duration_us", "outcome", "sqlstate",
 		"row_count", "statement_type", "query_text", "tables_read", "tables_written", "client_address", "application_name",
 		"policies", "query_tag", "pool", "queued_us", "cpu_time_us", "bytes_read", "memory_allocated", "locations_read", "job", "workers",
 		"stages", "exchanges", "plan_key", "ai_calls", "ai_cache_hits", "ai_input_tokens", "ai_output_tokens", "ai_cost_usd", "ai_models",
+		"shape", "run_memory",
 	}, rows)
 }
 
@@ -258,7 +271,7 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 			coalesce(pool, ''), coalesce(queued_us, 0), cpu_time_us, coalesce(bytes_read, 0), coalesce(memory_allocated, 0),
 			locations_read, coalesce(job, ''), workers, stages, exchanges, coalesce(plan_key, ''),
 			ai_calls, coalesce(ai_cache_hits, 0), coalesce(ai_input_tokens, 0), coalesce(ai_output_tokens, 0),
-			coalesce(ai_cost_usd, 0), ai_models
+			coalesce(ai_cost_usd, 0), ai_models, coalesce(shape, ''), coalesce(run_memory, 0)
 		FROM igloo_audit.query_history
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR start_time >= $2)
@@ -281,7 +294,8 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 		err := row.Scan(&q.ID, &q.SessionID, &q.User, &q.Role, &q.Start, &us, &q.Outcome, &q.SQLState, &q.Rows,
 			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName, &q.Policies,
 			&q.QueryTag, &q.Pool, &queuedUS, &cpuUS, &r.BytesRead, &r.MemoryAllocated, &q.LocationsRead, &q.Job, &q.Workers,
-			&q.Stages, &q.Exchanges, &q.PlanKey, &aiCalls, &a.CacheHits, &a.InputTokens, &a.OutputTokens, &a.CostUSD, &a.Models)
+			&q.Stages, &q.Exchanges, &q.PlanKey, &aiCalls, &a.CacheHits, &a.InputTokens, &a.OutputTokens, &a.CostUSD, &a.Models,
+			&q.Shape, &q.Memory)
 		q.Duration, q.Queued = micros(us), micros(queuedUS)
 		if cpuUS != nil {
 			r.CPUTime = micros(*cpuUS)
@@ -425,6 +439,13 @@ func nullable(s string) any {
 		return nil
 	}
 	return s
+}
+
+func nullableInt(n int64) any {
+	if n == 0 {
+		return nil
+	}
+	return n
 }
 
 func nullSlice(s []string) any {

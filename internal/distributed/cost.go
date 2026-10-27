@@ -158,6 +158,24 @@ func coldRateAt(threadsPerCore float64) float64 {
 type machine struct {
 	cores, threads int
 	memory         int64
+	// ranHere says a statement of the same shape as the one estimated ran
+	// to its end on this machine, allocating allocated bytes over its run
+	// (see Footprints).
+	ranHere   bool
+	allocated int64
+}
+
+// Footprints is an Env whose session knows what statements of the shape
+// of the one being planned did on this replica: Footprint returns what the
+// latest such statement allocated over its run, which it completed here,
+// and ok is false when none has. One machine is then not short of memory
+// for the statement, whatever its estimate says, and spills only if what
+// it allocated, all of its run's allocations, is over its share: a
+// dashboard's statements at ten times the data, estimated short of memory,
+// went to workers and took 250 s there, where the replica alone ran them
+// in 20 s at the median, 96 at once.
+type Footprints interface {
+	Footprint() (allocated int64, ok bool)
 }
 
 // fleet is what the coordinator knows of its workers for an estimate.
@@ -248,7 +266,7 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// fail then does not fall back to, by the bytes its exchanges' stages
 	// read.
 	share := memoryShare * float64(m.memory)
-	e.memory = m.memory > 0 && float64(workingSetFactor*x.exchanged) > share
+	e.memory = m.memory > 0 && float64(workingSetFactor*x.exchanged) > share && !m.ranHere
 	// As many workers as the first estimates gave a statement, so that one
 	// forced onto workers runs as it did.
 	e.workers = workerCount(x.unfiltered, x.legacyRows, x.levels, f)
@@ -273,7 +291,7 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// heldFactor times what its exchanges' stages read as the selective
 	// filters leave it, is over its share of memory, spilling, up to
 	// spillFactor times.
-	if set := heldFactor * x.held; m.memory > 0 && set > share {
+	if set := heldFactor * x.held; m.memory > 0 && set > share && !(m.ranHere && float64(m.allocated) <= share) {
 		e.spills = true
 		e.oneMachine *= min(set/share, spillFactor)
 	}

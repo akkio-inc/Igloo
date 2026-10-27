@@ -72,8 +72,10 @@ type queryRecord struct {
 	// it waited for its user's limits.
 	used   *audit.Resources
 	queued time.Duration
-	// parts is what running the statement in parts on workers took.
+	// parts is what running the statement in parts on workers took, and
+	// shape its key for the workload controller (see shapeKey), if any.
 	parts distParts
+	shape string
 	// ai is what its AI functions did, if it called any.
 	ai *ai.Spend
 }
@@ -95,6 +97,18 @@ func (s *Server) recordAll(sess *session, recs []queryRecord) {
 	for _, r := range recs {
 		s.recordQuery(sess, r)
 	}
+}
+
+// runMemory is the memory a statement that ran on workers workers, or on
+// this replica if none, ran with (see distributed.Coordinator.RunMemory).
+func (s *Server) runMemory(workers int) int64 {
+	if s.dist != nil {
+		return s.dist.RunMemory(workers)
+	}
+	if workers == 0 {
+		return s.queryMemory
+	}
+	return 0
 }
 
 // recordQuery sends a statement to the history.
@@ -127,6 +141,8 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Stages:          r.parts.stages,
 		Exchanges:       r.parts.exchanges,
 		PlanKey:         r.parts.key,
+		Shape:           r.shape,
+		Memory:          s.runMemory(r.parts.workers),
 	}
 	if sp := r.ai; sp != nil {
 		q.AI = &audit.AIUsage{Calls: sp.Calls, CacheHits: sp.CacheHits, InputTokens: sp.InputTokens, OutputTokens: sp.OutputTokens,

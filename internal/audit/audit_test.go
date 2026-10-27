@@ -234,7 +234,8 @@ func TestPostgresStore(t *testing.T) {
 	full := Query{ID: "retried-3", User: "ana", Start: time.Now().Truncate(time.Millisecond), Outcome: "ok", StatementType: "COPY",
 		Text: "COPY t FROM 's3://landing/a.csv'", TablesWritten: []string{"lake.public.t"}, LocationsRead: []string{"s3://landing/a.csv"},
 		Job: "pipe drops", QueryTag: "etl", Pool: "default", Queued: time.Second,
-		Resources: &Resources{CPUTime: 2 * time.Millisecond, BytesRead: 10, MemoryAllocated: 20}}
+		Resources: &Resources{CPUTime: 2 * time.Millisecond, BytesRead: 10, MemoryAllocated: 20},
+		Shape:     "0123456789abcdef01234567", Memory: 22 << 30}
 	if err := s.WriteQueries(ctx, append(again, full)); err != nil {
 		t.Fatalf("write 2: %v", err)
 	}
@@ -249,7 +250,8 @@ func TestPostgresStore(t *testing.T) {
 	}
 	if got := qs[i]; !slices.Equal(got.LocationsRead, full.LocationsRead) || got.Job != full.Job ||
 		!slices.Equal(got.TablesWritten, full.TablesWritten) || got.QueryTag != "etl" || got.Pool != "default" ||
-		got.Queued != time.Second || got.Resources == nil || *got.Resources != *full.Resources {
+		got.Queued != time.Second || got.Resources == nil || *got.Resources != *full.Resources ||
+		got.Shape != full.Shape || got.Memory != full.Memory {
 		t.Errorf("a statement written through the staging table read back as %+v", got)
 	}
 	if usage, err := s.TableUsage(ctx, time.Now().Add(-time.Hour)); err != nil ||
