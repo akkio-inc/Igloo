@@ -90,6 +90,9 @@ type Engine struct {
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
 	catMu     sync.RWMutex
 	catLocked atomic.Int64
+	// sharedPrepares counts the statements being prepared under the shared
+	// side of catMu (see SharedPrepare).
+	sharedPrepares atomic.Int64
 	// releaseTempDir lets go of the spill directory; see claimTempDir.
 	releaseTempDir func()
 	// bitmaps says the rb extension is loaded (see loadRB).
@@ -258,6 +261,24 @@ func (e *Engine) CatalogShare() func() {
 	e.catMu.RLock()
 	return e.catMu.RUnlock
 }
+
+// SharedPrepare says a statement is being prepared under the shared side
+// of the catalog lock, alongside other statements' prepares and binds,
+// until the func it returns is called. While any is, and the lock is not
+// held exclusively, the catalog proxy refuses the requests DuckDB-Iceberg
+// makes before it walks the catalog's in-memory set of tables (listing a
+// schema's tables) or erases from it (a drop or a rename), so that a prepare that would walk it, as DuckDB's
+// suggestion of names similar to a missing table's does, fails instead
+// (see catalogproxy's shared prepares), and SharedRefusals counts them.
+func (e *Engine) SharedPrepare() func() {
+	e.sharedPrepares.Add(1)
+	return func() { e.sharedPrepares.Add(-1) }
+}
+
+// SharedRefusals is how many of DuckDB's catalog requests the catalog proxy
+// refused while statements were prepared under the shared catalog lock
+// (see SharedPrepare).
+func (e *Engine) SharedRefusals() uint64 { return e.proxy.Refusals() }
 
 // CatalogShareContext is CatalogShare that stops waiting, and returns ctx's
 // error, when ctx ends. A sync.RWMutex cannot stop waiting, so a goroutine
@@ -637,6 +658,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if e.proxy, err = catalogproxy.New(proxyOpts); err != nil {
 		return err
 	}
+	// A listing under the exclusive lock is safe whoever is preparing:
+	// no bind runs alongside it.
+	e.proxy.SetSharedPrepares(func() bool { return e.sharedPrepares.Load() > 0 && e.catLocked.Load() == 0 })
 	// The proxy gives tables Igloo creates a target file size, which
 	// DuckDB refuses to write a partitioned table with unless told to
 	// ignore it there, as it does when a table has none.

@@ -92,6 +92,13 @@ type Engine interface {
 	// it returns is called, and ReloadTables loads such tables again, so
 	// that DataVersion goes up if any changed meanwhile.
 	RecordLoads() func() []catalogproxy.Load
+	// SharedRefusals counts DuckDB's catalog requests refused while the
+	// catalog lock was held shared (see sharedprepare.go).
+	SharedRefusals() uint64
+	// SharedPrepare says a statement is being prepared under the shared
+	// catalog lock until the func it returns is called, which has the
+	// catalog proxy refuse listings meanwhile (see sharedprepare.go).
+	SharedPrepare() func()
 	ReloadTables(ctx context.Context, loads []catalogproxy.Load) error
 	// DistinctCounts returns the distinct counts of the catalog's tables'
 	// columns, by catalog.schema.table as DuckDB names it, lower-cased, and
@@ -217,6 +224,10 @@ type Options struct {
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
 	ReportRewrite bool
+	// ExclusivePrepares has every statement prepared under the exclusive
+	// catalog lock, none alongside others (IGLOO_SHARED_PREPARES=false;
+	// see sharedprepare.go).
+	ExclusivePrepares bool
 	// reportRewriteAnyPath, when set, has recognition replace CTEs whose
 	// calls would count the tables' values too (for tests of its parity).
 	reportRewriteAnyPath bool
@@ -429,6 +440,7 @@ type Server struct {
 	// CTEs it answered through the report API, and reportUnrecognized the
 	// statements prepared again as written after a recognized form failed.
 	reportRewrite        atomic.Bool
+	exclusivePrepares    bool
 	rewriteMemory        int64
 	idFillRewriteRows    int64
 	reportRecognized     atomic.Int64
@@ -666,6 +678,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)
+	s.exclusivePrepares = opts.ExclusivePrepares
 	if opts.MemoryTotal > 0 {
 		s.memoryCritical = memlimit.Critical(opts.MemoryTotal)
 	}
@@ -897,6 +910,10 @@ type session struct {
 	catHolds   []*catalogHold
 	catHeld    catalogMode
 	catRelease func()
+	// sharedPrepare is set while prepareChecked prepares a statement holding
+	// the catalog lock shared, which stops at DuckDB's first failure to
+	// prepare it (see sharedprepare.go).
+	sharedPrepare bool
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -2316,25 +2333,29 @@ func (s *Server) rewriteCounting(ctx context.Context, sess *session, user auth.U
 	return query, counts
 }
 
-// prepareChecked is prepareStatement without recording failures, for the
-// statements Igloo runs for a user to carry out one of its own commands
-// (COPY INTO, materialized views): they are checked exactly like the
-// user's own.
-func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.User, text string, oids []uint32) (st *statement, err error) {
+// prepareHeld is prepareChecked holding the catalog lock as mode says.
+func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User, text string, oids []uint32, mode catalogMode) (st *statement, err error) {
 	// Preparing reads and fills in the catalog's in-memory set of tables:
 	// DuckDB binds the statement (and suggests names for a missing table),
 	// and Igloo resolves names, loads schemas and checks grants the same way,
 	// filling in each table it names on first use. Hold the exclusive side so
 	// no other statement reads the set while this changes it (see
-	// holdCatalog).
+	// holdCatalog), or the shared side for a query that may be prepared
+	// alongside others (see sharedprepare.go).
 	defer s.timePhases(ctx, sess, "statement prepared")()
 	locked := sess.phase("catalog_lock")
-	defer s.holdCatalog(sess)()
+	defer s.catalogHold(sess, mode)()
+	if mode == catalogShared {
+		sess.sharedPrepare = true
+		defer func() { sess.sharedPrepare = false }()
+		defer s.engine.SharedPrepare()()
+	}
 	locked()
 	// DuckDB plans it with the tables' distinct counts as last loaded.
 	s.registerDistinctCounts(ctx, sess)
 	// The catalog's tables it reads: those DuckDB loads while this holds
-	// the lock, as no other bind runs alongside (see memoStatement).
+	// the lock, as no other bind runs alongside (see memoStatement), or with
+	// the tables of binds alongside when it holds it shared.
 	loads := s.engine.RecordLoads()
 	// Whether it calls AI functions: DuckDB binds them as it prepares it
 	// (see aiHook).
@@ -2565,6 +2586,11 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 		}
 	}
 	preparing()
+	if err != nil && sess.sharedPrepare {
+		// Prepared again under the exclusive lock, which the steps below
+		// need (see sharedprepare.go).
+		return fail(err)
+	}
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created, or one this replica
 		// could not make when it last synced, which DuckDB cannot bind (see

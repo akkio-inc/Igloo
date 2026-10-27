@@ -1466,6 +1466,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   spelled a table in another case no longer had every hold of the lock
   look the table up again. A dashboard build spent about 26
   seconds preparing, one statement at a time.
+- Queries are prepared side by side: a `SELECT` outside a transaction that
+  calls no catalog function is prepared under the shared side of the
+  catalog lock, alongside other sessions' prepares and binds, rather than
+  one statement at a time. While one is, the catalog proxy refuses, with
+  423, the requests DuckDB-Iceberg makes before it walks its set of the
+  catalog's tables or erases from it (listing a schema's tables, a drop, a
+  rename), so a prepare that would walk it, as DuckDB does to suggest names
+  for a table that does not exist, fails and is prepared again under the
+  exclusive lock. 32 distinct 16 KB queries prepared on 16 connections at
+  once took 56% of the time they took one after another, against 110%
+  before. `igloo_shared_prepares_total` counts them, and
+  `IGLOO_SHARED_PREPARES=false` prepares every statement on its own (see
+  [concurrency on a replica](docs/operations.md#concurrency-on-a-replica)).
 - `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
   running at once on a replica, whoever runs them, as a Snowflake
   warehouse's `MAX_CONCURRENCY_LEVEL` does: [the replica's

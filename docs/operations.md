@@ -411,14 +411,23 @@ serialized on each replica is only the short work that reaches the catalog's
 own structure, so that a table is never listed or resolved while it is being
 created, renamed or dropped there:
 
-- Preparing a statement (resolving the tables it names and checking it),
+- Preparing a statement other than a query (resolving the tables it names
+  and checking it),
   listing the catalog (`information_schema`, `pg_catalog`,
   `duckdb_tables()`/`duckdb_views()`, `SHOW`, `DESCRIBE`, `PRAGMA`), and DDL
   (creating, renaming, dropping or altering a table, view or schema) take the
   catalog to themselves while they run.
 - Binding a statement again as it starts to run, which DuckDB does on every
   run of a statement that reads the catalog, shares it with other sessions
-  doing the same, but not with the steps above.
+  doing the same, but not with the steps above. So does preparing a query
+  (one `SELECT`, outside a transaction, that calls no catalog function):
+  binds are safe side by side. A query that would list the catalog as it is
+  prepared, as Igloo's checks for some users do and as DuckDB does to
+  suggest similar names for a table that does not exist (one another engine
+  just dropped, say), is refused that listing (the catalog proxy refuses
+  listings, drops and renames while queries are prepared this way), and is
+  prepared again on its own. `igloo_shared_prepares_total` counts both;
+  `IGLOO_SHARED_PREPARES=false` prepares every statement on its own.
 - Everything else — reading table data once the statement is bound, and
   `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
   snapshot of the tables bound — holds nothing.
@@ -619,9 +628,9 @@ that run's result instead of running too. Snowflake does the same
   igloo_result_cache = off`, or Snowflake's `ALTER SESSION SET
   USE_CACHED_RESULT = FALSE` (`RESET igloo_result_cache`, `SHOW
   igloo_result_cache`).
-- **Before preparing.** Preparing a statement holds the catalog lock
-  exclusively, so the statements of a burst are prepared one at a time.
-  An admin's query whose result the cache kept, with no parameters, no
+- **Before preparing.** Queries are prepared side by side (see
+  [concurrency on a replica](#concurrency-on-a-replica)), other statements
+  one at a time. An admin's query whose result the cache kept, with no parameters, no
   policy that applies to it and nothing read from a connection, is also
   known by its text: the next one of the same text, user, roles, dialect
   and settings, with the catalog's tables, views and policies as they

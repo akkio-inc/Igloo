@@ -500,6 +500,7 @@ func serve() error {
 		BitmapMinRows:       cfg.BitmapMinRows,
 		BitmapIndexes:       cfg.BitmapIndexes && cfg.IDDomains && eng.BitmapsLoaded(),
 		ReportRewrite:       cfg.ReportRewrite,
+		ExclusivePrepares:   !cfg.SharedPrepares,
 		ResultCacheSize:     cfg.ResultCacheSize,
 		QueryMemory:         eng.MemoryLimit(ctx),
 		RewriteMemory:       rewriteMemory(cfg, memory),

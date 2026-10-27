@@ -34,6 +34,10 @@ type Metrics struct {
 	// implicitRetries counts the statements in Snowflake's dialect that
 	// bound only with its implicit conversions (see parseTranslated).
 	implicitRetries prometheus.Counter
+	// prepares counts the queries prepared under the shared catalog lock,
+	// and those prepared again under the exclusive one (see
+	// sharedprepare.go).
+	prepares *prometheus.CounterVec
 	// sortedWrites counts the writes of rows in order sorted a range at a
 	// time (see sortedwrite.go).
 	sortedWrites prometheus.Counter
@@ -107,6 +111,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_snowflake_implicit_conversions_total",
 			Help: "Statements in Snowflake's dialect that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made.",
 		}),
+		prepares: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "igloo_shared_prepares_total",
+			Help: "Queries prepared alongside other statements, under the shared catalog lock (shared), and those that failed to prepare that way, or met a refused catalog listing meanwhile, and were prepared again under the exclusive lock (retried).",
+		}, []string{"lock"}),
 		sortedWrites: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_sorted_writes_total",
 			Help: "Writes of rows in order (CREATE TABLE ... AS and INSERT with ORDER BY) too large to sort at once within IGLOO_SORT_SPILL_BUDGET, which Igloo sorted a range of the order at a time.",
@@ -125,7 +133,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits, m.implicitRetries, m.sortedWrites, m.resultCache, m.resultBytes, m.aggPasses)
+		m.indexStatements, m.memoryExits, m.implicitRetries, m.prepares, m.sortedWrites, m.resultCache, m.resultBytes, m.aggPasses)
 	return m
 }
 
@@ -156,6 +164,12 @@ func (m *Metrics) memoryExit() {
 func (m *Metrics) implicitRetry() {
 	if m != nil {
 		m.implicitRetries.Inc()
+	}
+}
+
+func (m *Metrics) prepare(lock string) {
+	if m != nil {
+		m.prepares.WithLabelValues(lock).Inc()
 	}
 }
 

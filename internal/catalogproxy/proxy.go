@@ -143,6 +143,9 @@ type Proxy struct {
 	lists *listings
 	// names are how the catalog spells its tables' names (see names.go).
 	names *names
+	// sharedHold refuses listings and drops while statements are prepared
+	// under the shared catalog lock (see holds.go).
+	sharedHold
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
 	// counts are the distinct counts table loads had (see distinctcounts.go).
@@ -281,6 +284,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.notePrefix(rest)
+	if p.refuseShared(w, r, rest) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		if p.hidden(r, rest) {
