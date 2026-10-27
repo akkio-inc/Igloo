@@ -42,7 +42,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	rb::RegisterStats(loader, config);
 	rb::RegisterStrings(loader);
 	rb::RegisterDivide(loader);
-	rb::RegisterFlatten(loader);
 	config.AddExtensionOption("rb_memory_budget",
 	                          "The most memory one COUNT(DISTINCT)'s bitmaps may take (e.g. '2GB'; empty: whatever "
 	                          "DuckDB's memory_limit leaves)",

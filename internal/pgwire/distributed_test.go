@@ -954,17 +954,14 @@ func TestDistributedFlatten(t *testing.T) {
 	}
 
 	mustExec(t, conn, "RESET sql_dialect")
-	// Only each array's first element, of FLATTEN's values and of those read
-	// as text, which with the rb extension do not call sf_flatten_values
-	// (see snowflake.MacrosFor).
+	// Only each array's first element.
 	mustExec(t, conn, "CREATE OR REPLACE TEMP MACRO sf_flatten_values(x, m) AS [json_extract(CAST(x AS VARCHAR), '$[0]')]")
-	mustExec(t, conn, "CREATE OR REPLACE TEMP MACRO sf_flatten_strings(x, m) AS [json_extract_string(CAST(x AS VARCHAR), '$[0]')]")
 	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
 	if read(3) == local {
-		t.Fatal("redefining FLATTEN's macros changed nothing")
+		t.Fatal("redefining sf_flatten_values changed nothing")
 	}
 	if n := workers(3); n != 0 {
-		t.Errorf("with a session's own FLATTEN macros, FLATTEN ran on %d workers", n)
+		t.Errorf("with a session's own sf_flatten_values, FLATTEN ran on %d workers", n)
 	}
 }
 

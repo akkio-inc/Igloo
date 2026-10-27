@@ -321,31 +321,16 @@ var macros = []string{
 // statement of 76 divisions took to prepare.
 const nativeDivision = `CREATE OR REPLACE TEMP MACRO sf_div(a, b) AS igloo_sf_div(a, b)`
 
-// nativeFlatten makes FLATTEN's sf_flatten_ macros the rb extension's
-// functions, which give the same lists (extensions/rb/src/rb_flatten.cpp)
-// and which DuckDB binds as the branch of the input's type alone, where it
-// binds every branch of the macros, casts, lambdas and nested macros, at
-// about a millisecond a call. The macros that call them (sf_flatten_this,
-// sf_parts_values and the like) bind them so too.
-var nativeFlatten = []string{
-	`CREATE OR REPLACE TEMP MACRO sf_flatten_values(x, m) AS igloo_sf_flatten_values(x, m)`,
-	`CREATE OR REPLACE TEMP MACRO sf_flatten_strings(x, m) AS igloo_sf_flatten_strings(x, m)`,
-	`CREATE OR REPLACE TEMP MACRO sf_flatten_keys(x, m) AS igloo_sf_flatten_keys(x, m)`,
-	`CREATE OR REPLACE TEMP MACRO sf_flatten_indexes(x, m) AS igloo_sf_flatten_indexes(x, m)`,
-}
-
 // Macros returns the statements that define, in a session, the macros
 // translated statements call.
 func Macros() []string { return append([]string(nil), macros...) }
 
 // MacrosFor is Macros for a session whose DuckDB has Igloo's rb extension
-// loaded, when rb is true: sf_div divides, and the sf_flatten_ macros make
-// FLATTEN's lists, with the extension's functions.
+// loaded, when rb is true: sf_div divides with the extension's function.
 func MacrosFor(rb bool) []string {
 	m := Macros()
 	if rb {
 		m = append(m, nativeDivision)
-		m = append(m, nativeFlatten...)
 	}
 	return m
 }

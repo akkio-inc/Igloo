@@ -112,33 +112,6 @@ its branch once, from the operands' types (`src/rb_divide.cpp`); with the
 extension loaded, Igloo defines `sf_div` as a call of it
 (`snowflake.MacrosFor`).
 
-## Snowflake's FLATTEN
-
-The translator writes FLATTEN as unnests of its input's values, keys and
-indexes side by side, made by the `sf_flatten_values`, `sf_flatten_strings`
-(the values as text, for a FLATTEN read only as text), `sf_flatten_keys`
-and `sf_flatten_indexes` macros. They pick by the input's type: a list of
-strings and a map of strings give theirs as they are, text and JSON those of
-the JSON they hold, any other type those of its JSON. DuckDB binds every
-branch of a macro, the casts, lambdas and nested macros of all four kinds:
-about a millisecond a call for values and strings, half that for keys and
-indexes. A dashboard-shaped statement of 16 calls took 12 to 15 ms to
-prepare.
-
-`igloo_sf_flatten_values(x, m)` and its siblings pick the kind once, from
-`x`'s type, and bind only that kind's branch, of the same DuckDB functions
-the macros call (`src/rb_flatten.cpp`): text, JSON and other types are
-replaced by the branch, and a list's or a map's elements, which the macros
-read through `list_transform`, are read by the function, with the lambda's
-body bound once. They give the macros' lists to the byte, of the same types,
-NULLs and errors included; MODE must be a constant string, as the translator
-writes it. With the extension loaded, Igloo defines the four macros as calls
-of them (`snowflake.MacrosFor`), and the macros that call them
-(`sf_flatten_this`, `sf_parts_values` and the like) bind them so too. A call
-binds in 0.01 to 0.03 ms, and the statement above prepares in 1.2 to 1.6
-ms; the values of text read as text, `json_extract_string` with a wildcard
-path rather than for each value, run in half the time.
-
 ## Building and loading
 
 `extensions/rb/build.sh OUT_DIR` builds `rb.duckdb_extension` and its

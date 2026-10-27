@@ -41,9 +41,6 @@ void RegisterStats(ExtensionLoader &loader, DBConfig &config);
 void RegisterStrings(ExtensionLoader &loader);
 //! igloo_sf_div, Snowflake's division as Igloo's sf_div macro divides, bound as one function (rb_divide.cpp).
 void RegisterDivide(ExtensionLoader &loader);
-//! igloo_sf_flatten_values, _strings, _keys and _indexes, FLATTEN's lists as Igloo's sf_flatten_ macros give them,
-//! bound as one function each (rb_flatten.cpp).
-void RegisterFlatten(ExtensionLoader &loader);
 
 } // namespace rb
 } // namespace duckdb
