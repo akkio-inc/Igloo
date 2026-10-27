@@ -1324,6 +1324,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statements took to prepare, one at a time: its queries at 1× have their
   median query in 2.3 seconds rather than 3.9 to 4.0, and the 90th
   percentile in 9.5 to 10.4 rather than 13.6 to 14.5.
+- A view that only renames a table (`SELECT * FROM t`) filters its star in
+  place for ID domains' columns rather than reading the table through a
+  subquery, which DuckDB bound again wherever a statement named the view:
+  the dashboard's median query takes 1.9 seconds rather than 2.3.
 - Preparing a dashboard's statements, which holds the catalog lock
   exclusively and so goes one statement at a time, takes less of that
   lock. A query the [result cache](docs/operations.md#result-cache) kept

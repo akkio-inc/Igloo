@@ -54,6 +54,7 @@ func TestHideIDs(t *testing.T) {
 		"INSERT INTO people VALUES ('p1', 1, 0), ('p2', 2, 1)",
 		"CREATE TABLE survey (resp_id INTEGER, answer_text VARCHAR)",
 		"INSERT INTO survey VALUES (1, 'yes')",
+		"CREATE TABLE keyed (_igloo_id_k BIGINT, k VARCHAR, v INTEGER)",
 	} {
 		if _, err := conn.ExecContext(ctx, q, nil); err != nil {
 			t.Fatal(err)
@@ -71,6 +72,10 @@ func TestHideIDs(t *testing.T) {
 		{"columns named on the table", "SELECT * FROM people AS q(a, b)", "a,b"},
 		{"a subquery", "SELECT * FROM (SELECT * FROM people WHERE n > 0) AS x", "person_id,n"},
 		{"in a predicate", "SELECT resp_id FROM survey WHERE resp_id IN (SELECT n FROM people)", "resp_id"},
+		{"a star over a join", "SELECT * FROM people JOIN survey ON n = resp_id", "person_id,n,resp_id,answer_text"},
+		{"distinct, ordered by all", "SELECT DISTINCT * FROM people ORDER BY ALL", "person_id,n"},
+		{"columns named on a table whose ids come first", "SELECT * FROM keyed AS q(a, b)", "a,b"},
+		{"a star in a predicate's subquery", "SELECT n FROM people WHERE n IN (SELECT * FROM (SELECT resp_id FROM survey))", "n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -106,6 +111,17 @@ func TestHideIDs(t *testing.T) {
 		})
 	}
 
+	// A lone star over one table is filtered in place of the table, as a
+	// view that renames a table is written; a version stays with its table.
+	for q, want := range map[string]string{
+		"SELECT * FROM lake.s.people":                    "SELECT " + visibleColumns + " FROM lake.s.people",
+		"SELECT * FROM lake.s.t AT (VERSION => 3)":       "SELECT " + visibleColumns + " FROM lake.s.t AT (VERSION => 3)",
+		"SELECT * FROM (SELECT * FROM lake.s.t) AS x(a)": "SELECT * FROM (SELECT " + visibleColumns + " FROM lake.s.t) AS x(a)",
+	} {
+		if got, err := hideIDs(ctx, conn, q); err != nil || got != want {
+			t.Errorf("%s:\n%s (%v)\nwant\n%s", q, got, err, want)
+		}
+	}
 	// A version moves into the subquery with its table.
 	got, err := hideIDs(ctx, conn, "SELECT * FROM lake.s.t AS x AT (VERSION => 3) JOIN lake.s.u AT (TIMESTAMP => now()) ON true")
 	if err != nil {

@@ -19,6 +19,11 @@ import (
 // domains' ids (see iddomain.HiddenColumn).
 var visibleStar = "COLUMNS(lambda c: NOT starts_with(lower(c), " + quoteLiteral(iddomain.HiddenColumn("")) + "))"
 
+// visibleColumns is visibleStar where it stands for a query's own star (see
+// hideIDs), told apart by its lambda's parameter so that UnhideIDs gives the
+// star back.
+var visibleColumns = "COLUMNS(lambda col: NOT starts_with(lower(col), " + quoteLiteral(iddomain.HiddenColumn("")) + "))"
+
 // hideIDs makes query, a view's SQL, read each table it names through a
 // subquery of the table's columns other than the columns of ids:
 //
@@ -34,13 +39,42 @@ var visibleStar = "COLUMNS(lambda c: NOT starts_with(lower(c), " + quoteLiteral(
 // with it; names of the query's CTEs are left alone. A query DuckDB cannot
 // parse is returned as is: creating the view reports why. UnhideIDs undoes
 // this in a definition as DuckDB prints it.
+//
+// A SELECT of a lone * from one table, as a view that only renames a table
+// is (SELECT * FROM lake.crm.people), has its star filtered instead,
+//
+//	SELECT * FROM lake.crm.people  ->  SELECT COLUMNS(...) FROM lake.crm.people
+//
+// which gives the same columns and binds faster: DuckDB expands a view's
+// stars each time a statement names it, and the subquery's star over a
+// table of 449 columns took a third of the view's binding.
 func hideIDs(ctx context.Context, conn *duckdb.Conn, query string) (string, error) {
 	refs, err := tableRefs(ctx, conn, query)
 	if err != nil || len(refs) == 0 {
 		return query, err
 	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i].at > refs[j].at })
-	for _, r := range refs {
+	// Each edit is local to its table's name or its star, which comes
+	// before the table it is over: from the end back, none moves another.
+	type edit struct {
+		at  int
+		ref *fromRef
+	}
+	var edits []edit
+	for i := range refs {
+		r := &refs[i]
+		if r.star >= 0 && r.star < len(query) && query[r.star] == '*' {
+			edits = append(edits, edit{at: r.star})
+			continue
+		}
+		edits = append(edits, edit{at: r.at, ref: r})
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].at > edits[j].at })
+	for _, e := range edits {
+		if e.ref == nil {
+			query = query[:e.at] + visibleColumns + query[e.at+1:]
+			continue
+		}
+		r := *e.ref
 		end, ok := nameEnd(query, r.at)
 		if !ok {
 			continue
@@ -77,6 +111,9 @@ type fromRef struct {
 	versioned bool
 	// bareName says the name has no schema or catalog, as a CTE's.
 	bareName bool
+	// star is where the lone * of a SELECT of the table alone is (see
+	// loneStar), or -1.
+	star int
 }
 
 // tableRefs returns the tables query reads, by name, other than its CTEs.
@@ -110,10 +147,16 @@ func tableRefs(ctx context.Context, conn *duckdb.Conn, query string) ([]fromRef,
 	}
 	ctes := map[string]bool{}
 	var refs []fromRef
+	// stars are the lone stars of SELECTs of one table each, by where the
+	// table is.
+	stars := map[int]int{}
 	var walk func(any)
 	walk = func(n any) {
 		switch n := n.(type) {
 		case map[string]any:
+			if table, star, ok := loneStar(n); ok {
+				stars[table] = star
+			}
 			if ctm, ok := n["cte_map"].(map[string]any); ok {
 				entries, _ := ctm["map"].([]any)
 				for _, e := range entries {
@@ -130,7 +173,7 @@ func tableRefs(ctx context.Context, conn *duckdb.Conn, query string) ([]fromRef,
 				at, ok := n["query_location"].(float64)
 				bare := n["catalog_name"] == "" && n["schema_name"] == ""
 				if name != "" && ok && at >= 0 && int(at) < len(query) {
-					refs = append(refs, fromRef{name: name, alias: alias, at: int(at), versioned: n["at_clause"] != nil, bareName: bare})
+					refs = append(refs, fromRef{name: name, alias: alias, at: int(at), versioned: n["at_clause"] != nil, bareName: bare, star: -1})
 				}
 			}
 			for _, v := range n {
@@ -148,9 +191,46 @@ func tableRefs(ctx context.Context, conn *duckdb.Conn, query string) ([]fromRef,
 		if r.bareName && ctes[strings.ToLower(r.name)] {
 			continue
 		}
+		if star, ok := stars[r.at]; ok {
+			r.star = star
+		}
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// loneStar reports whether n, a node of DuckDB's parse tree, is a SELECT of
+// a lone * (no qualifier, EXCLUDE, REPLACE, RENAME or COLUMNS) from one
+// table that names none of its columns, and where the table and the star
+// are. Its star then expands to the table's columns alone, as a subquery's
+// over the table would, the same names in the same order.
+func loneStar(n map[string]any) (table, star int, ok bool) {
+	if n["type"] != "SELECT_NODE" {
+		return 0, 0, false
+	}
+	list, _ := n["select_list"].([]any)
+	from, _ := n["from_table"].(map[string]any)
+	if len(list) != 1 || from == nil || from["type"] != "BASE_TABLE" {
+		return 0, 0, false
+	}
+	if aliases, _ := from["column_name_alias"].([]any); len(aliases) > 0 {
+		return 0, 0, false
+	}
+	e, _ := list[0].(map[string]any)
+	if e == nil || e["class"] != "STAR" || e["relation_name"] != "" || e["columns"] != false || e["expr"] != nil {
+		return 0, 0, false
+	}
+	for _, k := range []string{"exclude_list", "replace_list", "rename_list", "qualified_exclude_list"} {
+		if l, _ := e[k].([]any); len(l) > 0 {
+			return 0, 0, false
+		}
+	}
+	t, tok := from["query_location"].(float64)
+	s, sok := e["query_location"].(float64)
+	if !tok || !sok || s < 0 || t < 0 {
+		return 0, 0, false
+	}
+	return int(t), int(s), true
 }
 
 // nameEnd returns where the dotted name starting at byte at in query ends.
@@ -261,6 +341,7 @@ func matchParen(s string, open int) (int, bool) {
 // a view's body and applies its own rules to the tables (Igloo's policy and
 // bitmap rewrites read member tables without their columns of ids anyway).
 func UnhideIDs(sql string) string {
+	sql = unhideStars(sql)
 	const open = "(SELECT COLUMNS("
 	marker := quoteLiteral(iddomain.HiddenColumn(""))
 	var out strings.Builder
@@ -296,6 +377,40 @@ func UnhideIDs(sql string) string {
 		if n := addedAlias(sql[last:], inner); n > 0 {
 			last += n
 		}
+		i = last
+	}
+	if last == 0 {
+		return sql
+	}
+	out.WriteString(sql[last:])
+	return out.String()
+}
+
+// unhideStars gives back the stars hideIDs filtered as visibleColumns, as
+// DuckDB prints it: COLUMNS(list_filter(*, (lambda col: ...))).
+func unhideStars(sql string) string {
+	const open = "COLUMNS("
+	marker := quoteLiteral(iddomain.HiddenColumn(""))
+	var out strings.Builder
+	last := 0
+	for i := 0; i < len(sql); {
+		j := strings.Index(sql[i:], open)
+		if j < 0 {
+			break
+		}
+		start := i + j
+		argsClose, ok := matchParen(sql, start+len(open)-1)
+		if !ok {
+			break
+		}
+		args := sql[start+len(open)-1 : argsClose+1]
+		if !strings.Contains(args, "lambda col:") || !strings.Contains(args, "starts_with") || !strings.Contains(args, marker) {
+			i = start + len(open)
+			continue
+		}
+		out.WriteString(sql[last:start])
+		out.WriteString("*")
+		last = argsClose + 1
 		i = last
 	}
 	if last == 0 {
