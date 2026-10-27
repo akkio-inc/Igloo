@@ -241,6 +241,191 @@ func snowflakeDecision(v []byte) (any, error) {
 	return jsonResult(jsonText(map[string]any{"answers": answers})), nil
 }
 
+// threshold is the probability from which a decision model's yes counts.
+func (s *Statement) threshold() float64 {
+	if t := s.opts.Threshold; t > 0 {
+		return t
+	}
+	return 0.5
+}
+
+// decisionFor returns the decision model that serves AI_FILTER and
+// AI_CLASSIFY in place of a generative one: the one an integration the
+// user may use names, unless the call names a model; ok is false where
+// none does.
+func (s *Statement) decisionFor(opts []options, model func(options) string) (*binding, string, bool, error) {
+	for _, o := range opts {
+		if model(o) != "" {
+			return nil, "", false, nil
+		}
+	}
+	b, m, ok, err := s.decisionBinding()
+	if err != nil {
+		return nil, "", false, s.fail(err)
+	}
+	return b, m, ok, nil
+}
+
+// readDecision reads a cached decision's answer to question.
+func readDecision(v []byte, question string) (Answer, error) {
+	var d decision
+	if err := json.Unmarshal(v, &d); err != nil {
+		return Answer{}, rowErrorf("the cached decision cannot be read: %v", err)
+	}
+	a, ok := d.Answers[question]
+	if !ok {
+		return Answer{}, rowErrorf("the decision model did not answer %s", question)
+	}
+	if a.Refused {
+		return Answer{}, rowErrorf("the decision model would not answer")
+	}
+	return a, nil
+}
+
+// filterQuestion is AI_FILTER's question to a decision model, whose state
+// is the row's predicate.
+var filterQuestion = Question{Name: "holds", Type: QuestionYesNo,
+	Instructions: "Is the statement true, or the answer to the question yes?"}
+
+// decideFilter answers AI_FILTER's rows with a decision model: TRUE where
+// the probability that the predicate holds reaches the threshold. ok is
+// false where no decision model serves it.
+func (s *Statement) decideFilter(rows []row, opts []options, mode ErrorMode) ([]any, bool, error) {
+	b, model, ok, err := s.decisionFor(opts, func(o options) string { return o.string("model") })
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	calls := make([]*call, len(rows))
+	for i, r := range rows {
+		input, err := s.inputText(r[0])
+		if err != nil {
+			return nil, true, err
+		}
+		calls[i] = s.decideCall("ai_filter", b, model, input, []Question{filterQuestion}, opts[i].bool("refresh"))
+	}
+	values, errs, err := s.do(calls, nil, 0)
+	if err != nil {
+		return nil, true, err
+	}
+	results := make([]result, len(rows))
+	for i := range rows {
+		if errs[i] != nil {
+			results[i].err = errs[i]
+			continue
+		}
+		a, err := readDecision(values[i], filterQuestion.Name)
+		results[i] = result{value: a.Probability >= s.threshold(), err: err}
+	}
+	out, err := s.filterResults(results, mode)
+	return out, true, err
+}
+
+// classifyQuestions are AI_CLASSIFY's questions to a decision model: one
+// choice of the categories, or for several labels a yes-or-no question
+// for each, named label_0, label_1, ....
+func classifyQuestions(cats []category, cfg classifyConfig) []Question {
+	var context strings.Builder
+	if cfg.Task != "" {
+		context.WriteString(" The task: " + cfg.Task)
+	}
+	for _, e := range cfg.Examples {
+		labels, _ := json.Marshal(e.Labels)
+		fmt.Fprintf(&context, " Example: %q has labels %s.", e.Input, labels)
+	}
+	if !cfg.Multi {
+		q := Question{Name: "category", Type: QuestionChoice, Instructions: "Which category fits the text best?" + context.String()}
+		for _, c := range cats {
+			q.Choices = append(q.Choices, Choice{Value: c.Label, Description: c.Description})
+		}
+		return []Question{q}
+	}
+	qs := make([]Question, len(cats))
+	for k, c := range cats {
+		ins := fmt.Sprintf("Does the category %q apply to the text?", c.Label)
+		if c.Description != "" {
+			ins += " It means: " + c.Description + "."
+		}
+		qs[k] = Question{Name: "label_" + strconv.Itoa(k), Type: QuestionYesNo, Instructions: ins + context.String()}
+	}
+	return qs
+}
+
+// decideClassify answers AI_CLASSIFY's rows with a decision model: the
+// likeliest category, or every category whose probability reaches the
+// threshold. ok is false where no decision model serves it.
+func (s *Statement) decideClassify(rows []row, opts []options, mode ErrorMode) ([]any, bool, error) {
+	b, model, ok, err := s.decisionFor(opts, func(o options) string {
+		m, _ := o.object("config")["model"].(string)
+		return m
+	})
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	calls := make([]*call, len(rows))
+	type shape struct {
+		cats   []category
+		multi  bool
+		legacy bool
+	}
+	shapes := make([]shape, len(rows))
+	for i, r := range rows {
+		cats, err := parseCategories(r[1])
+		if err != nil {
+			return nil, true, s.fail(err)
+		}
+		cfg, err := parseClassifyConfig(opts[i])
+		if err != nil {
+			return nil, true, s.fail(err)
+		}
+		input, err := s.inputText(r[0])
+		if err != nil {
+			return nil, true, err
+		}
+		shapes[i] = shape{cats, cfg.Multi, opts[i].bool("label")}
+		calls[i] = s.decideCall("ai_classify", b, model, input, classifyQuestions(cats, cfg), opts[i].bool("refresh"))
+	}
+	values, errs, err := s.do(calls, nil, 0)
+	if err != nil {
+		return nil, true, err
+	}
+	results := make([]result, len(rows))
+	for i, sh := range shapes {
+		if errs[i] != nil {
+			results[i].err = errs[i]
+			continue
+		}
+		var chosen []string
+		if !sh.multi {
+			a, err := readDecision(values[i], "category")
+			if err == nil && !slices.ContainsFunc(sh.cats, func(c category) bool { return c.Label == a.Choice }) {
+				err = rowErrorf("the decision model chose none of the categories")
+			}
+			if err != nil {
+				results[i].err = err
+				continue
+			}
+			chosen = []string{a.Choice}
+		} else {
+			for k, c := range sh.cats {
+				a, err := readDecision(values[i], "label_"+strconv.Itoa(k))
+				if err != nil {
+					results[i].err = err
+					break
+				}
+				if a.Probability >= s.threshold() {
+					chosen = append(chosen, c.Label)
+				}
+			}
+			if results[i].err != nil {
+				continue
+			}
+		}
+		results[i].value = classifyResult(chosen, sh.legacy)
+	}
+	out, err := s.finish(results, mode)
+	return out, true, err
+}
+
 // Decide runs AI_DECIDE for rows of (state, questions, options), with the
 // decision model of the integration that has one, and returns what
 // Databricks' ai_decide does: {"response": {"answers": {...}},

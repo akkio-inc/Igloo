@@ -166,8 +166,8 @@ type StatementOptions struct {
 	// counts, for AI_FILTER and multi-label AI_CLASSIFY (the session's
 	// ai_decision_threshold); 0 means 0.5.
 	Threshold float64
-	// DryRun answers every call without calling providers or reading the
-	// cache, counting what it would send, for EXPLAIN.
+	// DryRun answers from the cache, and counts what the statement would
+	// send for the rest without calling providers, for EXPLAIN.
 	DryRun bool
 }
 

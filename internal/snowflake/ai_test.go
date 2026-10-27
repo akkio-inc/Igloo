@@ -89,6 +89,8 @@ func TestTranslateAITasks(t *testing.T) {
 		{`SELECT AI_SIMILARITY(review, 'refund') AS v FROM reviews`, `SELECT ai_similarity(review, 'refund', '{}') AS "V" FROM reviews`},
 		{`SELECT SNOWFLAKE.CORTEX.COUNT_TOKENS('m', review) AS n FROM reviews`,
 			`SELECT ai_count_tokens('ai_complete', 'm', review, ` + fail + `) AS "N" FROM reviews`},
+		{`SELECT AI_DECIDE(review, {'refund': {'type': 'noul', 'instructions': 'Does it ask for a refund?'}}):response:answers:refund:probability::FLOAT AS p FROM reviews`,
+			`SELECT CAST(json_extract_string(ai_decide(review, CAST(to_json(map_from_entries(`},
 	} {
 		got := translate(t, c.in).SQL
 		if !strings.HasPrefix(got, c.want) {

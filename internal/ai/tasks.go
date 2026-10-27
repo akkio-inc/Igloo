@@ -274,6 +274,9 @@ func (s *Statement) Classify(rows []row) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if out, ok, err := s.decideClassify(rows, opts, mode); ok || err != nil {
+		return out, err
+	}
 	results := make([]result, len(rows))
 	tasks := make([]*task, len(rows))
 	for i, r := range rows {
@@ -348,13 +351,17 @@ const filterTemplate = "Decide whether what the user gives is true: a statement 
 	"Answer with a JSON object: {\"value\": true} or {\"value\": false}."
 
 // Filter runs AI_FILTER for rows of (input, options): whether each row's
-// statement is true. In a dry run, rows the cache cannot answer pass, so
+// statement is true, from the decision model of an integration that has
+// one, or the default model. In a dry run, rows the cache cannot answer pass, so
 // that the functions after the filter are counted for every row it might
 // let through.
 func (s *Statement) Filter(rows []row) ([]any, error) {
 	opts, mode, err := s.taskRows(rows, 1)
 	if err != nil {
 		return nil, err
+	}
+	if out, ok, err := s.decideFilter(rows, opts, mode); ok || err != nil {
+		return out, err
 	}
 	results := make([]result, len(rows))
 	tasks := make([]*task, len(rows))

@@ -279,6 +279,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `EMBED_TEXT_1024` and `COUNT_TOKENS`. The Snowflake dialect's
   translation tests a filter's plain conditions before its AI predicates,
   which DuckDB would otherwise call for every row.
+- Decision models: an integration's `DECISION_MODEL` (OpenAI's Decisions
+  API, or an endpoint of the state-and-questions shape) answers
+  `AI_FILTER` and `AI_CLASSIFY` with probabilities, kept from the
+  session's `ai_decision_threshold`; `AI_DECIDE(state, questions)` returns
+  Databricks' `ai_decide` shape, and `AI_COMPLETE` with a model mapped to
+  it Snowflake's `snowflake-decision` shape.
 
 ### Loading and scheduling
 

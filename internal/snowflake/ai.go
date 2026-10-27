@@ -597,6 +597,27 @@ func cortexCountTokens(c *call) (*node, error) {
 	return out, nil
 }
 
+// aiDecide translates AI_DECIDE(state, questions), as Databricks' ai_decide
+// takes them: the decision model's answers, {"response": {"answers":
+// {...}}, "metadata": {...}, "error_message": ...}.
+func aiDecide(c *call) (*node, error) {
+	args, err := aiArgs(c, "STATE", "QUESTIONS")
+	if err != nil {
+		return nil, err
+	}
+	state, err := required(c, args, "STATE")
+	if err != nil {
+		return nil, err
+	}
+	questions, err := required(c, args, "QUESTIONS")
+	if err != nil {
+		return nil, err
+	}
+	var opts []aiOption
+	errorOptions(args, &opts) // its errors are in its result already
+	return objectResult(aiCall(c, "ai_decide", []any{state, c.out("CAST(", questions, " AS VARCHAR)")}, opts, nil), 'O'), nil
+}
+
 // aiRewrite marks fn's translations as calling a model provider.
 func aiRewrite(fn func(c *call) (*node, error)) rewrite {
 	return rewrite{fn: func(c *call) (*node, error) {
@@ -631,6 +652,7 @@ func addAIRewrites(add func(rw rewrite, names ...string)) {
 	add(aiRewrite(cortexEmbed("768")), "SNOWFLAKE.CORTEX.EMBED_TEXT_768")
 	add(aiRewrite(cortexEmbed("1024")), "SNOWFLAKE.CORTEX.EMBED_TEXT_1024")
 	add(aiRewrite(aiSimilarity), "AI_SIMILARITY")
+	add(aiRewrite(aiDecide), "AI_DECIDE")
 }
 
 // --- Plain predicates first -------------------------------------------------

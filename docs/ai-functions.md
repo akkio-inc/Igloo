@@ -3,8 +3,9 @@
 Igloo runs Snowflake's AI functions (Cortex AI SQL) in SQL, with your own
 model providers' keys: `AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`,
 `AI_SENTIMENT`, `AI_EXTRACT`, `AI_SUMMARIZE`, `AI_TRANSLATE`, `AI_REDACT`,
-`AI_EMBED`, `AI_SIMILARITY`, `PROMPT`, `AI_COUNT_TOKENS`, and
-`SNOWFLAKE.CORTEX`'s older forms of them. They call OpenAI or any server that speaks its API
+`AI_EMBED`, `AI_SIMILARITY`, `PROMPT`, `AI_COUNT_TOKENS`,
+`SNOWFLAKE.CORTEX`'s older forms of them, and Databricks' `AI_DECIDE`.
+They call OpenAI or any server that speaks its API
 (Azure OpenAI, vLLM, llama.cpp, Ollama, OpenRouter), Anthropic, Gemini,
 Vertex AI, Amazon Bedrock, or a decision endpoint, through an **AI
 integration** an admin creates. Igloo never resells inference: each call is
@@ -95,6 +96,7 @@ default model, the session chooses with `SET ai_integration = 'name'`.
 | `AI_EMBED(model, input)` | `ai_embed` | The input's vector, a list of FLOATs, which `VECTOR_COSINE_SIMILARITY` and the other vector functions take and a `VECTOR` column stores |
 | `SNOWFLAKE.CORTEX.EMBED_TEXT_768(model, text)`, `EMBED_TEXT_1024` | `ai_embed` | A `VECTOR(FLOAT, 768)` or `(FLOAT, 1024)`; a model whose vectors have other dimensions fails the statement |
 | `AI_SIMILARITY(input1, input2 [, config_object])` | `ai_similarity` | The cosine similarity of the two inputs' vectors, from the config's `model` or the integration's `EMBEDDING_MODEL` |
+| `AI_DECIDE(state, questions)`, as Databricks' `ai_decide` | `ai_decide(state, questions, options)` | `{"response": {"answers": {...}}, "metadata": {"version": "1.0"}, "error_message": null}`; see [decision models](#decision-models) |
 
 Arguments are by position or by name (`model => ...`), as in Snowflake.
 `model_parameters` takes `temperature`, `top_p` and `max_tokens` (4,096 by
@@ -128,6 +130,37 @@ which providers' prompt caches bill for less, and are versioned in the
 cache's key. `AI_CLASSIFY`'s categories, like Snowflake's, are sent with
 every row. `AI_EMBED` and `AI_SIMILARITY` send up to 64 distinct texts a
 request, and share what the cache keeps of each text's vector.
+
+## Decision models
+
+A decision model answers questions about a state with probabilities, in
+one pass and without writing text, which costs far less per row than a
+generative model. An integration names one with `DECISION_MODEL`: an
+OpenAI integration's is asked through OpenAI's `POST /decisions`, and a
+`decisions` integration's through the state-and-questions shape that
+Snowflake's `snowflake-decision` and Databricks' `ai_decide` share.
+
+Where an integration a user may use has a decision model, it answers:
+
+- `AI_FILTER`, as a yes-or-no question about the predicate: TRUE where
+  its probability reaches the session's `ai_decision_threshold` (0.5 by
+  default; `SET ai_decision_threshold = 0.8`).
+- `AI_CLASSIFY`, as a choice of the categories, or with `output_mode`
+  `multi` a yes-or-no question for each category, kept from the threshold.
+  `task_description` and `examples` go in the questions' instructions.
+- `AI_DECIDE(state, questions)`, whose questions are `{'name': {'type':
+  'noul' | 'choice' | 'score', 'instructions': ..., 'criteria': ...}}`:
+  a yes-or-no question's criteria `{'true': ..., 'false': ...}`, a choice's
+  `{'option': 'description', ...}` or `['option', ...]`, a score's levels,
+  lowest first. Each answer has its `probability`, or its `choice`, `score`,
+  `probabilities` and `confidence`, or is `{"type": "refusal"}`.
+- `AI_COMPLETE` with a model `MODELS` maps to the decision model, as
+  Snowflake's `snowflake-decision`, whose prompt is `TO_JSON({'state': ...,
+  'questions': {...}})`: `{"answers": {...}}`, a yes-or-no question's
+  probability as `noul`.
+
+`AI_FILTER` and `AI_CLASSIFY` whose config names a `model` ask that model
+instead, and `SET ai_integration` chooses another integration.
 
 ## Plain predicates first
 

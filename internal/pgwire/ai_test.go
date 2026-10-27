@@ -465,6 +465,68 @@ func TestAITaskFunctionsEndToEnd(t *testing.T) {
 	}
 }
 
+// TestAIDecisionModels: an integration's decision model answers AI_FILTER
+// and AI_CLASSIFY, from the session's threshold, AI_DECIDE, and
+// AI_COMPLETE with snowflake-decision.
+func TestAIDecisionModels(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t, withAI)
+	f := newFakeModels(t)
+	f.answer = func(_, _ string, body map[string]any) (int, any) {
+		state, _ := body["state"].(string)
+		qs, _ := body["questions"].(map[string]any)
+		if qs == nil {
+			return 400, map[string]any{"error": map[string]any{"message": "decisions only"}}
+		}
+		answers := map[string]any{}
+		for name, q := range qs {
+			if q.(map[string]any)["type"] == "choice" {
+				pick := "billing"
+				if strings.Contains(state, "parcel") {
+					pick = "shipping"
+				}
+				answers[name] = map[string]any{"type": "choice", "choice": pick, "probabilities": map[string]any{pick: 0.9}}
+				continue
+			}
+			p := 0.3
+			if strings.Contains(state, "refund") {
+				p = 0.7
+			}
+			answers[name] = map[string]any{"type": "noul", "noul": p}
+		}
+		return 200, map[string]any{"answers": answers, "usage": map[string]any{"input_tokens": 20}}
+	}
+	mustExec(t, cs.admin, `CREATE AI INTEGRATION decider PROVIDER = decisions BASE_URL = '`+f.srv.URL+`/v1'
+		DECISION_MODEL = 'jev-1' MODELS = ('snowflake-decision' = 'jev-1')`)
+	mustExec(t, cs.admin, "CREATE TABLE lake.public.tickets (id INTEGER, body VARCHAR)")
+	mustExec(t, cs.admin, `INSERT INTO lake.public.tickets VALUES (1, 'please refund me'), (2, 'where is my parcel'), (3, 'thanks')`)
+	sf := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+
+	got := texts(t, sf, `SELECT id FROM lake.public.tickets WHERE AI_FILTER(body) ORDER BY id`)
+	if strings.Join(got, ",") != "1" {
+		t.Errorf("AI_FILTER at 0.5: %v", got)
+	}
+	mustExec(t, sf, "SET ai_decision_threshold = 0.8")
+	if got := texts(t, sf, `SELECT id FROM lake.public.tickets WHERE AI_FILTER(body) ORDER BY id`); len(got) != 0 {
+		t.Errorf("AI_FILTER at 0.8: %v", got)
+	}
+	got = texts(t, sf, `SELECT id, AI_CLASSIFY(body, ['billing', 'shipping']):labels[0]::VARCHAR FROM lake.public.tickets WHERE id <= 2 ORDER BY id`)
+	if strings.Join(got, ",") != "1|billing,2|shipping" {
+		t.Errorf("AI_CLASSIFY: %v", got)
+	}
+	got = texts(t, sf, `SELECT AI_DECIDE(body, {'refund': {'type': 'noul', 'instructions': 'Does it ask for a refund?'}}):response:answers:refund:probability::FLOAT
+		FROM lake.public.tickets WHERE id = 1`)
+	if strings.Join(got, ",") != "0.7" {
+		t.Errorf("AI_DECIDE: %v", got)
+	}
+	got = texts(t, sf, `SELECT AI_COMPLETE('snowflake-decision', TO_JSON({'state': body, 'questions': {'urgent': {'type': 'noul', 'instructions': 'Urgent?'}}})):answers:urgent:noul::FLOAT
+		FROM lake.public.tickets WHERE id = 3`)
+	if strings.Join(got, ",") != "0.3" {
+		t.Errorf("snowflake-decision: %v", got)
+	}
+}
+
 // lastAIQuery is the newest history record of user that called an AI
 // function and whose text has part.
 func lastAIQuery(t *testing.T, cs *catalogServer, user, part string) audit.Query {
