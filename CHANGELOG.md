@@ -312,6 +312,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   installed or loaded, and nothing is downloaded at query time. A mirror
   (`IGLOO_MODEL_MIRROR`) or a local directory can stand in for Hugging
   Face (see [the model pack](docs/models.md)).
+- Igloo runs Chronos-Bolt, Chronos-2 and TimesFM 2.5 itself, in Go, from
+  their published weights: no Python, GPU or runtime library, the same on
+  amd64 and arm64 (NEON and AVX2 matrix products), and within 0.01% of
+  the official implementations' forecasts.
 
 ### Loading and scheduling
 

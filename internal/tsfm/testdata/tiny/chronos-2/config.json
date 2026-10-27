@@ -1,0 +1,49 @@
+{
+  "architectures": [
+    "Chronos2Model"
+  ],
+  "chronos_config": {
+    "context_length": 64,
+    "input_patch_size": 16,
+    "input_patch_stride": 16,
+    "max_output_patches": 2,
+    "output_patch_size": 16,
+    "quantiles": [
+      0.01,
+      0.05,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9,
+      0.95,
+      0.99
+    ],
+    "time_encoding_scale": 64,
+    "use_arcsinh": true,
+    "use_reg_token": true
+  },
+  "chronos_pipeline_class": "Chronos2Pipeline",
+  "d_ff": 32,
+  "d_kv": 8,
+  "d_model": 16,
+  "dense_act_fn": "relu",
+  "dropout_rate": 0.0,
+  "dtype": "float32",
+  "feed_forward_proj": "relu",
+  "initializer_factor": 1.0,
+  "is_gated_act": false,
+  "layer_norm_epsilon": 1e-06,
+  "model_type": "t5",
+  "num_heads": 2,
+  "num_layers": 2,
+  "pad_token_id": 0,
+  "reg_token_id": 1,
+  "rope_theta": 10000.0,
+  "transformers_version": "4.57.6",
+  "vocab_size": 2
+}

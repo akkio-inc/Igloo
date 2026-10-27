@@ -115,6 +115,36 @@ catalog's.
 - The directory holds a directory per model, with its `manifest.json` and
   its files. Do not edit them: a changed file fails verification.
 
+## How Igloo runs them
+
+Igloo runs the models in Go, in its own process: Chronos-Bolt, Chronos-2
+and TimesFM 2.5 are written out layer for layer from their official
+(Apache-2.0) sources, and read their weights from the pack's
+`model.safetensors` as published. There is no Python, no GPU and no
+runtime library to install: the same binary runs them on amd64 and arm64,
+with matrix products in NEON (arm64) or AVX2 and FMA (amd64, where the CPU
+has them) and plain Go elsewhere. Igloo's tests check each architecture
+against the official implementations' forecasts; with the real weights,
+Igloo's forecasts are within 0.01% of their spread of the official ones.
+
+Throughput, every core forecasting series of the given length, on 16
+arm64 cores (an AWS Graviton3, `BenchmarkRealModels` in `internal/tsfm`):
+
+| Model | 128 points, 24 steps | 512 points, 24 steps | 512 points, 96 steps | 2,048 points, 96 steps |
+|---|---|---|---|---|
+| `chronos-bolt-tiny` | 1,243 series/s | 657 | 65 | 22 |
+| `chronos-bolt-small` | 305 | 160 | 15 | 5.1 |
+| `chronos-bolt-base` | 77 | 41 | 3.9 | 1.3 |
+| `chronos-2-small` | 226 | 135 | 126 | 45 |
+| `chronos-2` | 56 | 34 | 32 | 12 |
+| `timesfm-2.5` | 82 | 31 | 31 | 8.6 |
+
+Chronos-Bolt forecasts 64 steps at once; longer horizons forecast again
+from each of nine quantiles' paths, as its official pipeline does, which
+costs ten times as much. Chronos-2 forecasts up to 1,024 steps and TimesFM
+2.5 up to 128 at once (TimesFM's continuous quantile head covers 1,024).
+For long horizons, prefer them.
+
 ## Memory and loading
 
 A process loads a model the first time a statement needs it: it checks the

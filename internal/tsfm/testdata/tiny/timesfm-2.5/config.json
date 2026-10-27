@@ -1,0 +1,1 @@
+{"architectures":["TimesFmModelForPrediction"],"context_length":16384,"head_dim":16,"hidden_size":32,"horizon_length":16,"intermediate_size":32,"model_type":"timesfm","num_attention_heads":2,"num_hidden_layers":2,"patch_length":8,"quantile_horizon_length":32,"quantiles":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9],"rms_norm_eps":1e-06,"torch_compile":false}

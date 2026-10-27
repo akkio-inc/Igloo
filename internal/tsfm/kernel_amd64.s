@@ -1,0 +1,62 @@
+#include "textflag.h"
+
+// func dot2x4AVX(acc *[64]float32, x0, x1, w0, w1, w2, w3 *float32, k int)
+//
+// acc[(r*4+c)*8 : (r*4+c)*8+8] holds the eight lanes of x_r · w_c over the
+// first k values, k a multiple of 8. Needs AVX2 and FMA.
+TEXT ·dot2x4AVX(SB), NOSPLIT, $0-64
+	MOVQ acc+0(FP), DI
+	MOVQ x0+8(FP), SI
+	MOVQ x1+16(FP), DX
+	MOVQ w0+24(FP), R8
+	MOVQ w1+32(FP), R9
+	MOVQ w2+40(FP), R10
+	MOVQ w3+48(FP), R11
+	MOVQ k+56(FP), CX
+
+	VXORPS Y8, Y8, Y8
+	VXORPS Y9, Y9, Y9
+	VXORPS Y10, Y10, Y10
+	VXORPS Y11, Y11, Y11
+	VXORPS Y12, Y12, Y12
+	VXORPS Y13, Y13, Y13
+	VXORPS Y14, Y14, Y14
+	VXORPS Y15, Y15, Y15
+
+loop:
+	CMPQ CX, $8
+	JL   done
+	VMOVUPS (SI), Y0
+	VMOVUPS (DX), Y1
+	VMOVUPS (R8), Y2
+	VMOVUPS (R9), Y3
+	VMOVUPS (R10), Y4
+	VMOVUPS (R11), Y5
+	VFMADD231PS Y2, Y0, Y8
+	VFMADD231PS Y3, Y0, Y9
+	VFMADD231PS Y4, Y0, Y10
+	VFMADD231PS Y5, Y0, Y11
+	VFMADD231PS Y2, Y1, Y12
+	VFMADD231PS Y3, Y1, Y13
+	VFMADD231PS Y4, Y1, Y14
+	VFMADD231PS Y5, Y1, Y15
+	ADDQ $32, SI
+	ADDQ $32, DX
+	ADDQ $32, R8
+	ADDQ $32, R9
+	ADDQ $32, R10
+	ADDQ $32, R11
+	SUBQ $8, CX
+	JMP  loop
+
+done:
+	VMOVUPS Y8, (DI)
+	VMOVUPS Y9, 32(DI)
+	VMOVUPS Y10, 64(DI)
+	VMOVUPS Y11, 96(DI)
+	VMOVUPS Y12, 128(DI)
+	VMOVUPS Y13, 160(DI)
+	VMOVUPS Y14, 192(DI)
+	VMOVUPS Y15, 224(DI)
+	VZEROUPPER
+	RET
