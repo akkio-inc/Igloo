@@ -815,8 +815,12 @@ type session struct {
 	// modelAllowed are the model blobs and results the session's
 	// statements resolved, which alone its statements may name (see
 	// checkModelCalls), with the order they came in.
-	modelAllowed map[string]int
+	modelAllowed map[string]modelAllowance
 	modelSeq     int
+	// training collects, while CREATE trains a model, the tables its
+	// statements read, and those the models they used had read (see
+	// noteTraining).
+	training *[]string
 	// changes counts the statements in the transaction block that may have
 	// changed something, and savepoints are its savepoints (see
 	// savepointCommand).
@@ -1830,6 +1834,12 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if err == nil && !checked {
 			err = sess.checkBitmapVariables(pctx, st.query)
 		}
+		if err == nil {
+			// The models and results it names are still as they were when
+			// it was prepared, which an erasure request may have purged
+			// since (see checkModelCalls).
+			err = sess.checkModelCalls(st.prepared, s.modelRuntime.Gen())
+		}
 		readied()
 		err = prepared(err)
 		if err != nil {
@@ -2412,7 +2422,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	}
 	// Igloo's model functions name only what this session's statements
 	// resolved, after their checks (see mlrewrite.go).
-	if err := sess.checkModelCalls(query); err != nil {
+	if err := sess.checkModelCalls(query, s.modelRuntime.Gen()); err != nil {
 		return fail(err)
 	}
 	// The columns that hold ID domains' ids are Igloo's (see iddomains.go),

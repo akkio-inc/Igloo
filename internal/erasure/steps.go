@@ -2381,6 +2381,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if v.IDSets, err = s.holdingIDs(ctx, r); err != nil {
 		return "", err
 	}
+	if v.Models, err = s.modelsRemaining(ctx, r); err != nil {
+		return "", err
+	}
 	var waiting []string
 	if v.Caches, v.Pending, waiting, err = s.caches(ctx, r); err != nil {
 		return "", err
@@ -2399,6 +2402,8 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		next = StepSharing
 	case v.History > 0 || v.Derived > 0:
 		next = StepHistory
+	case v.Models > 0:
+		next = StepModels
 	case len(waiting) > 0:
 		next = StepCache
 	}
@@ -2499,7 +2504,8 @@ func (v *Verification) String() string {
 	}{
 		{v.Rows, "rows"}, {v.Files, "files"}, {v.Bounds, "manifest bounds"}, {v.Statistics, "Parquet statistics"},
 		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Sharing, "sharing copies"},
-		{v.History, "history records"}, {v.IDSets, "sets of ids"},
+		{v.History, "history records"}, {v.Derived, "derived entries"}, {v.Models, "models or their old blobs"},
+		{v.IDSets, "sets of ids"},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", c.n, c.what))

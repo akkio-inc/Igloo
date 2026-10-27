@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -293,15 +294,36 @@ func (s *Server) resolveModelText(ctx context.Context, sess *session, user auth.
 		return remember(repl), nil
 	}
 	{
+		gen := s.modelRuntime.Gen()
 		var res *models.Result
 		if res, err = s.modelMethod(ctx, sess, user, call); err != nil {
 			return "", modelError(err)
 		}
-		token := s.modelRuntime.AddResult(res)
-		sess.keepModelResult(s.modelRuntime, token)
-		sess.allowModel(token)
+		token, err := s.keepResult(sess, res, gen)
+		if err != nil {
+			return "", err
+		}
 		return remember(models.ResultFunction + "(" + quoteLiteral(token) + ")"), nil
 	}
+}
+
+// errModelsPurged is a statement that resolved models or computed their
+// results while an erasure request had the replica drop every model and
+// result it held (see models.Runtime.Purge): what it read may be gone.
+var errModelsPurged = pgerror.WithCode(errors.New("an erasure request had this replica drop its models while the statement resolved "+
+	"them, or since it was prepared: prepare it again"), codes.ObjectNotInPrerequisiteState)
+
+// keepResult keeps a method's result for the statement, computed from
+// what was read since generation gen of the models, unless an erasure
+// request purged them since.
+func (s *Server) keepResult(sess *session, res *models.Result, gen uint64) (string, error) {
+	if s.modelRuntime.Gen() != gen {
+		return "", errModelsPurged
+	}
+	token := s.modelRuntime.AddResult(res)
+	sess.keepModelResult(s.modelRuntime, token)
+	sess.allowModel(token, gen)
+	return token, nil
 }
 
 // trainAndScore carries out ai_predict_class or ai_predict_value: it
@@ -345,6 +367,10 @@ func (s *Server) trainAndScore(ctx context.Context, sess *session, user auth.Use
 		}
 		seed = uint64(v.Num)
 	}
+	// What the model is trained on is read after this generation of the
+	// models: a purge meanwhile, for an erasure request, means it may have
+	// read erased rows, and it is not kept.
+	gen := s.modelRuntime.Gen()
 	input, err := s.inputQuery(ctx, sess, user, call.Arg("INPUT"), fn+"'s input")
 	if err != nil {
 		return "", err
@@ -374,9 +400,12 @@ func (s *Server) trainAndScore(ctx context.Context, sess *session, user auth.Use
 	if err != nil {
 		return "", err
 	}
+	if s.modelRuntime.Gen() != gen {
+		return "", errModelsPurged
+	}
 	s.modelRuntime.Remember(sha, art, true)
 	sess.pinModel(s.modelRuntime, sha)
-	sess.allowModel(sha)
+	sess.allowModel(sha, gen)
 
 	var b strings.Builder
 	b.WriteString("(SELECT * EXCLUDE (__igloo_score), ")
@@ -416,17 +445,25 @@ func featureExpr(f models.Feature, expr string) string {
 // maxModelAllowed bounds what a session remembers having resolved.
 const maxModelAllowed = 4096
 
+// modelAllowance is what a session's statement resolved: in which order,
+// and in which generation of the models (see models.Runtime.Gen).
+type modelAllowance struct {
+	seq int
+	gen uint64
+}
+
 // allowModel lets the session's statements name a model blob or result,
-// which one of its statements resolved, after its checks.
-func (sess *session) allowModel(v string) {
+// which one of its statements resolved, after its checks, from what was
+// read in generation gen of the models.
+func (sess *session) allowModel(v string, gen uint64) {
 	if sess.modelAllowed == nil {
-		sess.modelAllowed = map[string]int{}
+		sess.modelAllowed = map[string]modelAllowance{}
 	}
 	sess.modelSeq++
-	sess.modelAllowed[v] = sess.modelSeq
+	sess.modelAllowed[v] = modelAllowance{sess.modelSeq, gen}
 	if len(sess.modelAllowed) > maxModelAllowed {
-		for k, seq := range sess.modelAllowed {
-			if seq <= sess.modelSeq-maxModelAllowed {
+		for k, a := range sess.modelAllowed {
+			if a.seq <= sess.modelSeq-maxModelAllowed {
 				delete(sess.modelAllowed, k)
 			}
 		}
@@ -436,8 +473,11 @@ func (sess *session) allowModel(v string) {
 // checkModelCalls refuses a statement that calls Igloo's model functions
 // with what no statement of the session resolved: a blob it did not check
 // the user may use, written some other way than through modelRewrite (a
-// clean room's template, say, which is prepared without it).
-func (sess *session) checkModelCalls(query string) error {
+// clean room's template, say, which is prepared without it). It checks
+// again before each run: what was resolved in an older generation of the
+// models than gen, before an erasure request purged them, may hold what
+// the request erased, and the statement must be prepared again.
+func (sess *session) checkModelCalls(query string, gen uint64) error {
 	if !strings.Contains(strings.ToLower(query), "igloo_ml_") {
 		return nil
 	}
@@ -451,9 +491,13 @@ func (sess *session) checkModelCalls(query string) error {
 		if ok {
 			v, ok = stringLiteral(query[c.args[0][0]:c.args[0][1]])
 		}
-		if _, allowed := sess.modelAllowed[v]; !ok || !allowed {
+		a, allowed := sess.modelAllowed[v]
+		if !ok || !allowed {
 			return denied("%s is Igloo's own: score rows with model!PREDICT(INPUT_DATA => {*}) and read methods with "+
 				"TABLE(model!METHOD(...))", c.name)
+		}
+		if a.gen != gen {
+			return errModelsPurged
 		}
 	}
 	return nil
@@ -485,6 +529,7 @@ func (s *Server) resolvePredict(ctx context.Context, sess *session, user auth.Us
 	}
 	// The model's name, then, for a method other than PREDICT, the method
 	// and its options: m!DETECT_ANOMALIES{"contamination": 0.01}.
+	gen := s.modelRuntime.Gen()
 	method, cfgText := "PREDICT", ""
 	sc := &scanner{s: nameText}
 	name, ok := sc.name()
@@ -574,7 +619,7 @@ func (s *Server) resolvePredict(ctx context.Context, sess *session, user auth.Us
 	default:
 		return "", modelSyntax("unknown input %q", mode)
 	}
-	sess.allowModel(spec)
+	sess.allowModel(spec, gen)
 	var b strings.Builder
 	b.WriteString(models.PredictFunction + "(" + quoteLiteral(spec))
 	for _, f := range feats {

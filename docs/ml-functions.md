@@ -720,7 +720,10 @@ SELECT * FROM ai_predict_value(input => TABLE(demo.accounts), target_col => 'nex
 - The model is trained as `CLASSIFICATION`'s (2 to 255 classes) or as a
   regression, on the rows whose target is set, without held-out metrics;
   `seed` (default 0) seeds it. It is kept in memory for the session while
-  the statement may run again, and never stored.
+  the statement may run again, and never stored. An [erasure
+  request](privacy.md) has every replica drop it: a statement prepared
+  before then fails with a message to prepare it again, which trains it
+  again on the rows there are then.
 - They read their input as the user, policies applied, as the rest of the
   query does, and score on the replica that runs the query.
 
@@ -872,15 +875,34 @@ by their schema there.
   run it again.
 - **Personal data.** A model keeps no training rows, but it keeps what it
   learned from them: the categories it splits on or encodes, and a time
-  series model's series values and its series' last steps. Categories that
+  series model's series values and its series' last steps (a foundation
+  model's context window of each series among them). Categories that
   fewer than five training rows have are never kept: they share one bin
   (or none, in the models that encode them). A `MATRIX_FACTORIZATION`
   model is the exception: it keeps every user's and item's identifier, a
   vector of factors for each, and, for `exclude_seen`, which items each
   user rated. A model row keeps its `CREATE` statement.
-  [Erasure requests](privacy.md) do not reach models: a model trained on
-  rows a request later deletes still answers from what it learned, so
-  train it again after erasures.
+- **Erasure.** A model records the catalog's tables its training read:
+  those its input names, those the views it reads read, and those the
+  models whose predictions it reads had read; what Igloo cannot name, such
+  as a file, counts as every table. An [erasure request](privacy.md#what-a-request-does)
+  on any of them trains the model again, after the person's rows are
+  gone and before the request completes: from its `CREATE` statement, as
+  its owner, with the search path and dialect it was created with, as
+  `CREATE OR REPLACE` would, grants kept. Then the blob it had is deleted,
+  and every replica drops the models and methods' results it holds in
+  memory, so a statement prepared before fails with a message to prepare
+  it again. A `CREATE` that read its rows before the request moved on
+  stores nothing, and fails with SQLSTATE 40001, asking to be run again.
+  A model the request cannot train again, because its owner is gone or
+  may no longer create models in its schema or read its input, keeps the
+  request `blocked`, with an alert, until it can be trained again, is
+  dropped, or an admin closes the request, which records it as left. A
+  model created before Igloo recorded the tables models read counts as
+  trained from every table, until a request trains it again. Training a
+  model again takes as long as creating it did, and a model trained from
+  a time-travel query (`AT (...)`) of a snapshot the request expired
+  cannot be: drop or create it again.
 
 ## The engine
 

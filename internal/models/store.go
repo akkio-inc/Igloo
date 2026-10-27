@@ -26,6 +26,43 @@ type Model struct {
 	Blob      string
 	BlobSize  int64
 	CreatedAt time.Time
+	// Tables are the catalog's tables its training read, namespace.name in
+	// lower case, with those the models it read had read, and AnyTable for
+	// what Igloo could not name (files, say): what an erasure request
+	// trains it again for (see package pgwire's ModelRetrainer). Nil means
+	// they were not recorded, as for a model created before Igloo recorded
+	// them, which every erasure request trains again; empty means none, as
+	// TOP_INSIGHTS reads nothing.
+	Tables []string
+	// Epoch is the store's erasure epoch when its training began (see
+	// Store.Put). SearchPath and Dialect are the creating session's search
+	// path and SQL dialect, which training it again uses.
+	Epoch      int64
+	SearchPath string
+	Dialect    string
+	// IfBlob, when Put replaces the model, is the blob the model it
+	// replaces must have, or Put returns ErrChanged: an erasure request
+	// training it again replaces only the model it read. It is not kept.
+	IfBlob string
+}
+
+// AnyTable stands for what a model's training read that Igloo could not
+// name, such as files: every erasure request trains such a model again.
+const AnyTable = "*"
+
+// TrainedOn reports whether the model may hold what it learned from any of
+// tables (lower case): its training read one of them, or what Igloo could
+// not name, or it did not record what it read.
+func (m Model) TrainedOn(tables []string) bool {
+	if m.Tables == nil {
+		return true
+	}
+	for _, t := range m.Tables {
+		if t == AnyTable || slices.Contains(tables, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // Privileges on a model: USAGE allows every method; PREDICT the methods
@@ -49,6 +86,12 @@ type Grant struct {
 var (
 	ErrNotFound = errors.New("model not found")
 	ErrExists   = errors.New("model exists")
+	// ErrStale is a model whose training began before an erasure request
+	// moved the epoch on: it may have read rows the request erased.
+	ErrStale = errors.New("an erasure request ran while the model trained, and the rows it read may be among those it erased: create it again")
+	// ErrChanged is a model Put was to replace (see Model.IfBlob) that was
+	// replaced or dropped since.
+	ErrChanged = errors.New("the model was replaced or dropped meanwhile")
 )
 
 // Store keeps models' rows and grants: the metadata database, shared by
@@ -60,8 +103,14 @@ type Store interface {
 	List(ctx context.Context) ([]Model, error)
 	// Put stores m, replacing a model of its name when replace is set
 	// (and returning the one replaced); otherwise one there is ErrExists.
-	// A replaced model keeps its grants.
+	// A replaced model keeps its grants. A model whose Epoch is not the
+	// store's is ErrStale: an erasure request moved the epoch on while it
+	// trained. A Put and a BumpEpoch never interleave.
 	Put(ctx context.Context, m Model, replace bool) (*Model, error)
+	// Epoch returns the erasure epoch, which a CREATE reads before it reads
+	// its training data; BumpEpoch moves it on and returns the new one.
+	Epoch(ctx context.Context) (int64, error)
+	BumpEpoch(ctx context.Context) (int64, error)
 	// Delete removes a model and its grants, and returns it.
 	Delete(ctx context.Context, schema, name string) (Model, error)
 	// BlobUsed reports whether a model's blob is sha.
@@ -82,9 +131,23 @@ type MemoryStore struct {
 	mu     sync.Mutex
 	models map[string]Model
 	grants []Grant
+	epoch  int64
 }
 
-func NewMemoryStore() *MemoryStore { return &MemoryStore{models: map[string]Model{}} }
+func NewMemoryStore() *MemoryStore { return &MemoryStore{models: map[string]Model{}, epoch: 1} }
+
+func (s *MemoryStore) Epoch(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.epoch, nil
+}
+
+func (s *MemoryStore) BumpEpoch(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.epoch++
+	return s.epoch, nil
+}
 
 func (s *MemoryStore) Get(_ context.Context, schema, name string) (Model, error) {
 	s.mu.Lock()
@@ -111,14 +174,22 @@ func (s *MemoryStore) Put(_ context.Context, m Model, replace bool) (*Model, err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m.Schema, m.Name = strings.ToLower(m.Schema), strings.ToLower(m.Name)
+	if m.Epoch != 0 && m.Epoch != s.epoch {
+		return nil, ErrStale
+	}
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = time.Now()
 	}
+	m.Tables = slices.Clone(m.Tables)
 	k := key(m.Schema, m.Name)
 	old, ok := s.models[k]
 	if ok && !replace {
 		return nil, ErrExists
 	}
+	if m.IfBlob != "" && (!ok || old.Blob != m.IfBlob) {
+		return nil, ErrChanged
+	}
+	m.IfBlob = ""
 	s.models[k] = m
 	if ok {
 		return &old, nil

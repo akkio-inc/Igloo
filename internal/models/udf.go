@@ -147,11 +147,14 @@ type predictUDF struct {
 func (f *predictUDF) Config() duckdb.ScalarFuncConfig {
 	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
 	anyType, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
+	// Volatile: a model can be replaced, or purged by an erasure request,
+	// so the result cache keeps no result of a statement that scores rows.
 	return duckdb.ScalarFuncConfig{
 		InputTypeInfos:      []duckdb.TypeInfo{varchar},
 		VariadicTypeInfo:    anyType,
 		ResultTypeInfo:      varchar,
 		SpecialNullHandling: true,
+		Volatile:            true,
 	}
 }
 
@@ -202,7 +205,8 @@ func (f *predictUDF) Executor() duckdb.ScalarFuncExecutor {
 // model returns the model, and the method, spec names (see rows.go): the
 // one the last row used, without a lock, or one from the runtime.
 func (f *predictUDF) model(spec string) (*lastModel, error) {
-	if last := f.last.Load(); last != nil && last.spec == spec {
+	gen := f.r.Gen()
+	if last := f.last.Load(); last != nil && last.spec == spec && last.gen == gen {
 		return last, nil
 	}
 	sha, method, cfg, err := ParseScoreSpec(spec)
@@ -220,7 +224,7 @@ func (f *predictUDF) model(spec string) (*lastModel, error) {
 	case err != nil:
 		return nil, err
 	}
-	lm := &lastModel{spec: spec, art: art}
+	lm := &lastModel{spec: spec, art: art, gen: gen}
 	switch {
 	case art.rowModel() != nil && !f.score:
 		if lm.method, err = art.RowMethod(method, cfg); err != nil {
@@ -242,6 +246,9 @@ func (f *predictUDF) model(spec string) (*lastModel, error) {
 type lastModel struct {
 	spec string
 	art  *Artifact
+	// gen is the runtime's generation it was loaded in: a Purge since
+	// means it may no longer be used.
+	gen uint64
 	// method is an Igloo model's row method, with its features' kinds.
 	method *RowMethod
 	kinds  []ml.Kind

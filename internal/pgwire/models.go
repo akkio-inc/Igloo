@@ -18,6 +18,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/ai"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/snowflake"
@@ -199,6 +200,7 @@ func (s *Server) findModel(ctx context.Context, sess *session, user auth.User, n
 		return m, pgerror.WithCode(fmt.Errorf("model %s.%s is a %s, not a %s", schema, n, models.QualifiedClass(m.Class),
 			models.QualifiedClass(class)), codes.WrongObjectType)
 	}
+	noteTrainingModel(sess, m)
 	return m, nil
 }
 
@@ -265,6 +267,14 @@ func (s *Server) mayCreateModel(ctx context.Context, sess *session, user auth.Us
 
 func (s *Server) createModel(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, text string,
 	w wire.DataWriter) error {
+	return s.createModelAs(ctx, sess, user, st, text, w, "")
+}
+
+// createModelAs carries out CREATE: when ifBlob is set, as an erasure
+// request training a model again, replacing only the model with that blob
+// (see models.Model.IfBlob).
+func (s *Server) createModelAs(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, text string,
+	w wire.DataWriter, ifBlob string) error {
 	tag := "CREATE " + models.QualifiedClass(st.Class)
 	schema, name, err := s.modelRef(ctx, sess, st.Name)
 	if err != nil {
@@ -290,7 +300,21 @@ func (s *Server) createModel(ctx context.Context, sess *session, user auth.User,
 			_ = n.Notice("01000", "TAG is ignored: models have no tags in Igloo")
 		}
 	}
+	// The erasure epoch before training reads anything: a request that
+	// moves it on meanwhile may have erased rows training read, and the
+	// model is not stored (see models.Store.Put).
+	epoch, err := s.models.Epoch(ctx)
+	if err != nil {
+		return err
+	}
+	searchPath, err := settingValue(ctx, sess.conn, "search_path")
+	if err != nil {
+		return err
+	}
+	tables := []string{}
+	sess.training = &tables
 	art, cfg, metrics, err := s.trainModel(ctx, sess, user, st)
+	sess.training = nil
 	if err != nil {
 		return err
 	}
@@ -302,7 +326,11 @@ func (s *Server) createModel(ctx context.Context, sess *session, user auth.User,
 		return err
 	}
 	m := models.Model{Schema: schema, Name: name, Class: st.Class, Owner: user.Name, TrainingSQL: text, Config: cfg,
-		Metrics: metrics, Blob: sha, BlobSize: int64(len(blob))}
+		Metrics: metrics, Blob: sha, BlobSize: int64(len(blob)), Tables: ai.Tables(tables), Epoch: epoch, SearchPath: searchPath,
+		Dialect: sess.sqlDialect(), IfBlob: ifBlob}
+	if m.Tables == nil {
+		m.Tables = []string{}
+	}
 	if st.Comment != nil {
 		m.Comment = *st.Comment
 	}
@@ -314,6 +342,9 @@ func (s *Server) createModel(ctx context.Context, sess *session, user auth.User,
 	case errors.Is(err, models.ErrExists):
 		s.dropBlob(ctx, sha)
 		return pgerror.WithCode(fmt.Errorf("model %s.%s already exists", schema, name), codes.DuplicateObject)
+	case errors.Is(err, models.ErrStale):
+		s.dropBlob(ctx, sha)
+		return pgerror.WithCode(err, codes.SerializationFailure)
 	case err != nil:
 		s.dropBlob(ctx, sha)
 		return err
@@ -324,6 +355,27 @@ func (s *Server) createModel(ctx context.Context, sess *session, user auth.User,
 	}
 	s.log.Info("model trained", "model", schema+"."+name, "class", st.Class, "by", user.Name, "blob", sha, "bytes", len(blob))
 	return w.Complete(tag)
+}
+
+// noteTraining adds, while CREATE trains a model, what a statement it
+// prepared reads to the tables the model records (see models.Model.Tables).
+func (s *Server) noteTraining(ctx context.Context, sess *session, st *statement) {
+	if sess.training != nil {
+		*sess.training = append(*sess.training, s.aiTables(ctx, sess, st)...)
+	}
+}
+
+// noteTrainingModel adds, while CREATE trains a model, what a model its
+// input uses had read: the new one learns from what that one learned.
+func noteTrainingModel(sess *session, m models.Model) {
+	if sess.training == nil {
+		return
+	}
+	if m.Tables == nil {
+		*sess.training = append(*sess.training, models.AnyTable)
+		return
+	}
+	*sess.training = append(*sess.training, m.Tables...)
 }
 
 // dropBlob deletes a blob no model uses any more.
@@ -691,6 +743,7 @@ func (s *Server) readRows(ctx context.Context, sess *session, user auth.User, qu
 	if st.stmtType != duckdb.STATEMENT_TYPE_SELECT {
 		return nil, pgerror.WithCode(errors.New("a model's input must be a query"), codes.InvalidParameterValue)
 	}
+	s.noteTraining(ctx, sess, st)
 	if err := st.freshForRun(ctx, sess.conn); err != nil {
 		return nil, err
 	}

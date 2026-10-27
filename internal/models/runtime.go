@@ -28,6 +28,9 @@ type Runtime struct {
 	loading map[string]*load
 
 	results sync.Map // token -> *Result
+	// gen counts Purges: what was resolved before one may not be used
+	// after it.
+	gen atomic.Uint64
 }
 
 type cached struct {
@@ -81,12 +84,14 @@ func (r *Runtime) Load(ctx context.Context, sha string) (*Artifact, error) {
 	}
 	l := &load{done: make(chan struct{})}
 	r.loading[sha] = l
+	gen := r.gen.Load()
 	r.mu.Unlock()
 
 	l.art, l.err = r.fetch(ctx, sha)
 	r.mu.Lock()
 	delete(r.loading, sha)
-	if l.err == nil {
+	// A Purge meanwhile drops what was read before it: it is not kept.
+	if l.err == nil && r.gen.Load() == gen {
 		r.put(sha, l.art, false)
 	}
 	r.mu.Unlock()
@@ -155,6 +160,27 @@ func (r *Runtime) Forget(sha string) {
 		delete(r.cache, sha)
 	}
 }
+
+// Purge drops every model the process holds in memory, pinned ones
+// included, and every method's result, and moves the generation on: an
+// erasure request has every replica do so (see engine.Engine.EmptyCache),
+// since a model or a result can hold what it learned from rows the request
+// erased. Statements prepared before name models or results of an older
+// generation, which their sessions refuse to run (see package pgwire's
+// checkModelCalls).
+func (r *Runtime) Purge() {
+	r.mu.Lock()
+	r.cache = map[string]*cached{}
+	r.gen.Add(1)
+	r.mu.Unlock()
+	r.results.Range(func(k, _ any) bool {
+		r.results.Delete(k)
+		return true
+	})
+}
+
+// Gen is the generation: how many Purges there have been.
+func (r *Runtime) Gen() uint64 { return r.gen.Load() }
 
 // AddResult keeps a method's result for igloo_ml_result to read, and
 // returns its token.

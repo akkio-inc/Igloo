@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,9 @@ type Options struct {
 	// tables, in their history step, once no snapshot holds the person's
 	// rows; nil ones are left out.
 	Derived []Derived
+	// Models, if set, are the models trained from tables' rows, which
+	// requests train again (see Models).
+	Models Models
 	// Lineage, if set, finds tables written from the tables a request
 	// erases from.
 	Lineage Lineage
@@ -816,6 +820,8 @@ func (s *Service) step(ctx context.Context, r *Request) (string, error) {
 		err = s.sharing(ctx, r)
 	case StepHistory:
 		err = s.history(ctx, r)
+	case StepModels:
+		err = s.retrainModels(ctx, r)
 	case StepCache:
 		err = s.cache(ctx, r)
 	case StepVerify:
@@ -834,8 +840,10 @@ func (s *Service) step(ctx context.Context, r *Request) (string, error) {
 // Before it forgets the identifiers, it does what needs no table: it
 // deletes the sharing copies that hold the person's rows, redacts the
 // identifiers from the history, and has every replica empty its read
-// cache of what the request deleted. If one of those cannot be done now,
-// it is not closed, and the error says why. The files the request
+// cache of what the request deleted; and it deletes the blobs the models
+// it trained again had. If one of those cannot be done now, it is not
+// closed, and the error says why. The models trained from its tables that
+// it did not train again stay, and it records them (ModelsLeft), with why. The files the request
 // recorded of a table set aside that was dropped since go, unless a table
 // references them; each table it did not finish with records why, and
 // the files it leaves that may hold the person's rows (Left), with the
@@ -858,6 +866,10 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		files, err := s.leave(ctx, r)
 		if err == nil {
 			err = s.finish(ctx, r)
+		}
+		var models []string
+		if err == nil {
+			models, err = s.leaveModels(ctx, r)
 		}
 		if err != nil {
 			err = fmt.Errorf("%w: %s; it can be closed once that is done", ErrNotYet, scrub(r, err.Error()))
@@ -891,6 +903,22 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		}
 		r.Status, r.ClosedBy, r.Completed = StatusClosed, by, s.now()
 		r.Error = "closed by " + by + " while blocked: " + why
+		if len(models) > 0 {
+			// Models it did not train again, which may hold what they
+			// learned of the person's rows: why, if it tried.
+			r.ModelsLeft = nil
+			for _, m := range models {
+				w := m + ": not trained again since its tables' rows were erased"
+				for _, f := range r.ModelsFailed {
+					if strings.HasPrefix(f, m+": ") {
+						w = f
+					}
+				}
+				r.ModelsLeft = append(r.ModelsLeft, scrub(r, w))
+			}
+			r.Error += "; it leaves " + strconv.Itoa(len(models)) + " models trained from its tables, which may hold what they learned of " +
+				"the person: " + strings.Join(r.ModelsLeft, "; ")
+		}
 		if fs := files[""]; len(fs) > 0 {
 			// Under no table's location: the request records them itself,
 			// the first maxListed by name. A later request deletes them
@@ -906,7 +934,7 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		s.end(ctx, r)
 		s.unschedule(ctx, id)
 		s.log.Warn("erasure request closed while blocked: it forgot its identifiers, and what it did not erase stays",
-			"request", id, "by", by, "step", r.Step, "tables_left", strings.Join(left, ", "), "err", why)
+			"request", id, "by", by, "step", r.Step, "tables_left", strings.Join(left, ", "), "models_left", strings.Join(models, ", "), "err", why)
 		return nil
 	})
 }
@@ -1187,6 +1215,12 @@ func (r *Request) redo(step string) {
 	at := slices.Index(steps, step)
 	if at < 0 {
 		return
+	}
+	if at <= slices.Index(steps, StepPurge) {
+		// Rows or files of its tables go again: models trained since the
+		// models step moved the epoch on may have read them, and it moves
+		// it on again.
+		r.ModelEpoch = 0
 	}
 	for i := range r.Tables {
 		for _, s := range steps[at:] {

@@ -1194,6 +1194,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
   ("forever") as forever; it overflowed into a negative age that dropped
   every branch and tag.
+- Erasure requests train models again. A model records the tables its
+  training read, through views and other models' predictions too; a
+  request on any of them, once the rows are gone, trains it again from its
+  `CREATE` statement as its owner (grants kept), deletes its old blob, and
+  has every replica drop the models and methods' results it holds in
+  memory, `ai_predict_class`'s and `ai_predict_value`'s among them, so a
+  statement prepared before must be prepared again. A `CREATE` that read
+  its rows before the request stores nothing and asks to be run again. A
+  model that cannot be trained again keeps the request blocked, with an
+  alert, until it can, is dropped, or an admin closes the request, which
+  records it as left.
 - Data retention for tables that hold personal data (`ALTER TABLE ... SET
   (data_retention_days = N)`, at least a day, `igloo.data_retention`): table
   maintenance keeps no older snapshot, whatever else the table keeps, but

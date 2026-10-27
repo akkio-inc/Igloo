@@ -92,12 +92,14 @@ const (
 	StepPurge   = "purge"
 	StepSharing = "sharing"
 	StepHistory = "history"
+	StepModels  = "models"
 	StepCache   = "cache"
 	StepVerify  = "verify"
 	StepDone    = "done"
 )
 
-var steps = []string{StepFind, StepDelete, StepRewrite, StepExpire, StepPurge, StepSharing, StepHistory, StepCache, StepVerify, StepDone}
+var steps = []string{StepFind, StepDelete, StepRewrite, StepExpire, StepPurge, StepSharing, StepHistory, StepModels, StepCache, StepVerify,
+	StepDone}
 
 func nextStep(step string) string {
 	for i, s := range steps {
@@ -149,8 +151,19 @@ type Request struct {
 	Downstream []Downstream `json:"downstream"`
 	// HistoryRedacted counts history records it redacted, and
 	// DerivedPurged what it purged of what was derived from its tables.
-	HistoryRedacted int64         `json:"history_redacted"`
-	DerivedPurged   int64         `json:"derived_purged,omitempty"`
+	HistoryRedacted int64 `json:"history_redacted"`
+	DerivedPurged   int64 `json:"derived_purged,omitempty"`
+	// ModelEpoch is the models' erasure epoch its models step moved on to
+	// (see Models), in this round of its steps; ModelsRetrained counts the
+	// models it trained again, and ModelBlobs are the SHA-256s of the blobs
+	// they had, which it deletes. ModelsFailed are the models it could not
+	// train again, with why; ModelsLeft, once it was closed, those that may
+	// still hold what they learned of the person.
+	ModelEpoch      int64         `json:"model_epoch,omitempty"`
+	ModelsRetrained int           `json:"models_retrained,omitempty"`
+	ModelBlobs      []string      `json:"model_blobs,omitempty"`
+	ModelsFailed    []string      `json:"models_failed,omitempty"`
+	ModelsLeft      []string      `json:"models_left,omitempty"`
 	Steps           []StepRecord  `json:"steps"`
 	Verification    *Verification `json:"verification,omitempty"`
 	// Error is why the last run failed, while Status is retrying or
@@ -339,6 +352,10 @@ type Verification struct {
 	// cached answers, that statements begun before the request purged
 	// them kept.
 	Derived int64 `json:"derived"`
+	// Models are models trained from the tables before the request's
+	// models step, and the blobs that models it trained again had that
+	// object storage still has (see Models).
+	Models int64 `json:"models"`
 	// Caches are the read caches of running replicas that were emptied
 	// since the request deleted files; Pending are those of replicas not
 	// running now, which are emptied when they start.

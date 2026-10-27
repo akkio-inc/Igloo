@@ -104,6 +104,77 @@ func TestStore(t *testing.T) {
 	})
 }
 
+// TestStoreErasureEpoch: a model keeps the tables its training read, and
+// the epoch it began in; one whose training began before an erasure
+// request moved the epoch on is not stored; and a model trained again
+// replaces only the model it was trained from.
+func TestStoreErasureEpoch(t *testing.T) {
+	stores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		epoch, err := s.Epoch(ctx)
+		if err != nil || epoch < 1 {
+			t.Fatalf("epoch %d, %v", epoch, err)
+		}
+		m := Model{Schema: "demo", Name: "recommender", Class: ClassFactorization, Owner: "ana", TrainingSQL: "CREATE ...",
+			Blob: strings.Repeat("a", 64), Tables: []string{"demo.ratings", AnyTable}, Epoch: epoch, SearchPath: "lake.demo",
+			Dialect: "snowflake"}
+		if _, err := s.Put(ctx, m, false); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(ctx, "demo", "recommender")
+		if err != nil || strings.Join(got.Tables, ",") != "demo.ratings,*" || got.Epoch != epoch || got.SearchPath != "lake.demo" ||
+			got.Dialect != "snowflake" {
+			t.Fatalf("get: %+v, %v", got, err)
+		}
+		// None read, and not recorded, differ.
+		none := Model{Schema: "demo", Name: "insights", Class: ClassTopInsights, Owner: "ana", Blob: strings.Repeat("c", 64), Tables: []string{}}
+		if _, err := s.Put(ctx, none, false); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := s.Get(ctx, "demo", "insights"); got.Tables == nil || got.TrainedOn([]string{"demo.ratings"}) {
+			t.Errorf("a model that read nothing: %+v", got.Tables)
+		}
+		if !(Model{}).TrainedOn([]string{"demo.ratings"}) || !got.TrainedOn([]string{"crm.people"}) {
+			t.Error("a model that did not record what it read, or read files, counts as trained from every table")
+		}
+
+		next, err := s.BumpEpoch(ctx)
+		if err != nil || next != epoch+1 {
+			t.Fatalf("bumped to %d, %v", next, err)
+		}
+		// A CREATE that read its training data before is not stored.
+		m.Blob = strings.Repeat("b", 64)
+		if _, err := s.Put(ctx, m, true); !errors.Is(err, ErrStale) {
+			t.Errorf("a model trained before the epoch moved on: %v", err)
+		}
+		if got, _ := s.Get(ctx, "demo", "recommender"); got.Blob != strings.Repeat("a", 64) {
+			t.Errorf("a stale model replaced the one there: %+v", got)
+		}
+		// Trained again, it replaces the model it was trained from, and not
+		// one replaced or dropped meanwhile.
+		m.Epoch, m.IfBlob = next, strings.Repeat("a", 64)
+		if old, err := s.Put(ctx, m, true); err != nil || old == nil || old.Blob != strings.Repeat("a", 64) {
+			t.Fatalf("trained again: %+v, %v", old, err)
+		}
+		if got, _ := s.Get(ctx, "demo", "recommender"); got.Blob != strings.Repeat("b", 64) || got.Epoch != next || got.IfBlob != "" {
+			t.Errorf("after training again: %+v", got)
+		}
+		if _, err := s.Put(ctx, m, true); !errors.Is(err, ErrChanged) {
+			t.Errorf("trained again from a model replaced since: %v", err)
+		}
+		if _, err := s.Delete(ctx, "demo", "recommender"); err != nil {
+			t.Fatal(err)
+		}
+		m.IfBlob = strings.Repeat("b", 64)
+		if _, err := s.Put(ctx, m, true); !errors.Is(err, ErrChanged) {
+			t.Errorf("trained again from a model dropped since: %v", err)
+		}
+		if _, err := s.Get(ctx, "demo", "recommender"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("a dropped model came back: %v", err)
+		}
+	})
+}
+
 func TestClassifier(t *testing.T) {
 	c, err := TrainClassifier(testTable(1000), "Converted", ClassifierConfig{Evaluate: true})
 	if err != nil {

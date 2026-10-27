@@ -32,6 +32,16 @@ var migrations = []string{
 		PRIMARY KEY (schema_name, name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS models_blob ON igloo_ml.models (blob_sha256)`,
+	// What a model's training read, for erasure requests (see Model):
+	// tables NULL for a model that did not record them.
+	`ALTER TABLE igloo_ml.models ADD COLUMN IF NOT EXISTS tables text[]`,
+	`ALTER TABLE igloo_ml.models ADD COLUMN IF NOT EXISTS epoch bigint NOT NULL DEFAULT 0`,
+	`ALTER TABLE igloo_ml.models ADD COLUMN IF NOT EXISTS search_path text NOT NULL DEFAULT ''`,
+	`ALTER TABLE igloo_ml.models ADD COLUMN IF NOT EXISTS sql_dialect text NOT NULL DEFAULT ''`,
+	// The erasure epoch: a Put holds its row FOR SHARE, and BumpEpoch
+	// updates it, so the two never interleave.
+	`CREATE TABLE IF NOT EXISTS igloo_ml.state (id int PRIMARY KEY CHECK (id = 1), epoch bigint NOT NULL)`,
+	`INSERT INTO igloo_ml.state (id, epoch) VALUES (1, 1) ON CONFLICT DO NOTHING`,
 	`CREATE TABLE IF NOT EXISTS igloo_ml.grants (
 		schema_name  text NOT NULL,
 		name         text NOT NULL,
@@ -80,11 +90,13 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 	return &PostgresStore{pool: pool}, nil
 }
 
-const modelColumns = `schema_name, name, class, owner, comment, training_sql, config::text, metrics::text, blob_sha256, blob_size, created_at`
+const modelColumns = `schema_name, name, class, owner, comment, training_sql, config::text, metrics::text, blob_sha256, blob_size, created_at,
+	tables, epoch, search_path, sql_dialect`
 
 func scanModel(row pgx.Row) (Model, error) {
 	var m Model
-	err := row.Scan(&m.Schema, &m.Name, &m.Class, &m.Owner, &m.Comment, &m.TrainingSQL, &m.Config, &m.Metrics, &m.Blob, &m.BlobSize, &m.CreatedAt)
+	err := row.Scan(&m.Schema, &m.Name, &m.Class, &m.Owner, &m.Comment, &m.TrainingSQL, &m.Config, &m.Metrics, &m.Blob, &m.BlobSize, &m.CreatedAt,
+		&m.Tables, &m.Epoch, &m.SearchPath, &m.Dialect)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -124,26 +136,54 @@ func (s *PostgresStore) Put(ctx context.Context, m Model, replace bool) (*Model,
 	m.Schema, m.Name = strings.ToLower(m.Schema), strings.ToLower(m.Name)
 	var old *Model
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var epoch int64
+		if err := tx.QueryRow(ctx, `SELECT epoch FROM igloo_ml.state WHERE id = 1 FOR SHARE`).Scan(&epoch); err != nil {
+			return err
+		}
+		if m.Epoch != 0 && m.Epoch != epoch {
+			return ErrStale
+		}
 		prev, err := scanModel(tx.QueryRow(ctx, `SELECT `+modelColumns+` FROM igloo_ml.models WHERE schema_name = $1 AND name = $2 FOR UPDATE`,
 			m.Schema, m.Name))
 		switch {
 		case err == nil && !replace:
 			return ErrExists
+		case err == nil && m.IfBlob != "" && prev.Blob != m.IfBlob:
+			return ErrChanged
 		case err == nil:
 			old = &prev
 			_, err = tx.Exec(ctx, `UPDATE igloo_ml.models SET class = $3, owner = $4, comment = $5, training_sql = $6, config = $7::jsonb,
-				metrics = $8::jsonb, blob_sha256 = $9, blob_size = $10, created_at = now() WHERE schema_name = $1 AND name = $2`,
-				m.Schema, m.Name, m.Class, m.Owner, m.Comment, m.TrainingSQL, jsonOrEmpty(m.Config), jsonOrEmpty(m.Metrics), m.Blob, m.BlobSize)
+				metrics = $8::jsonb, blob_sha256 = $9, blob_size = $10, created_at = now(), tables = $11, epoch = $12, search_path = $13,
+				sql_dialect = $14 WHERE schema_name = $1 AND name = $2`,
+				m.Schema, m.Name, m.Class, m.Owner, m.Comment, m.TrainingSQL, jsonOrEmpty(m.Config), jsonOrEmpty(m.Metrics), m.Blob, m.BlobSize,
+				m.Tables, m.Epoch, m.SearchPath, m.Dialect)
 			return err
 		case errors.Is(err, ErrNotFound):
+			if m.IfBlob != "" {
+				return ErrChanged
+			}
 			_, err = tx.Exec(ctx, `INSERT INTO igloo_ml.models (schema_name, name, class, owner, comment, training_sql, config, metrics,
-				blob_sha256, blob_size) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10)`,
-				m.Schema, m.Name, m.Class, m.Owner, m.Comment, m.TrainingSQL, jsonOrEmpty(m.Config), jsonOrEmpty(m.Metrics), m.Blob, m.BlobSize)
+				blob_sha256, blob_size, tables, epoch, search_path, sql_dialect)
+				VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11, $12, $13, $14)`,
+				m.Schema, m.Name, m.Class, m.Owner, m.Comment, m.TrainingSQL, jsonOrEmpty(m.Config), jsonOrEmpty(m.Metrics), m.Blob, m.BlobSize,
+				m.Tables, m.Epoch, m.SearchPath, m.Dialect)
 			return err
 		}
 		return err
 	})
 	return old, err
+}
+
+func (s *PostgresStore) Epoch(ctx context.Context) (int64, error) {
+	var epoch int64
+	err := s.pool.QueryRow(ctx, `SELECT epoch FROM igloo_ml.state WHERE id = 1`).Scan(&epoch)
+	return epoch, err
+}
+
+func (s *PostgresStore) BumpEpoch(ctx context.Context) (int64, error) {
+	var epoch int64
+	err := s.pool.QueryRow(ctx, `UPDATE igloo_ml.state SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch`).Scan(&epoch)
+	return epoch, err
 }
 
 func (s *PostgresStore) Delete(ctx context.Context, schema, name string) (Model, error) {

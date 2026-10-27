@@ -151,6 +151,7 @@ func (s *Server) rowMethodTable(ctx context.Context, sess *session, user auth.Us
 	if !slices.Contains(snowflake.RowMethods, call.Method) {
 		return "", false, nil
 	}
+	gen := s.modelRuntime.Gen()
 	m, err := s.findModel(ctx, sess, user, call.Name, "")
 	if err != nil {
 		return "", true, err
@@ -187,12 +188,12 @@ func (s *Server) rowMethodTable(ctx context.Context, sess *session, user auth.Us
 	if err != nil {
 		return "", true, modelError(err)
 	}
-	input, err := s.rowMethodInput(ctx, sess, user, art, call)
+	input, err := s.rowMethodInput(ctx, sess, user, art, call, gen)
 	if err != nil {
 		return "", true, err
 	}
 	spec := m.Blob + rm.Spec
-	sess.allowModel(spec)
+	sess.allowModel(spec, gen)
 	var score strings.Builder
 	score.WriteString(models.PredictFunction + "(" + quoteLiteral(spec))
 	for _, f := range rm.Features {
@@ -219,7 +220,8 @@ func (s *Server) rowMethodTable(ctx context.Context, sess *session, user auth.Us
 
 // rowMethodInput is the query of a row method's INPUT_DATA; RECOMMEND
 // without it recommends to every user the model was trained on.
-func (s *Server) rowMethodInput(ctx context.Context, sess *session, user auth.User, art *models.Artifact, call *snowflake.ModelCall) (string, error) {
+func (s *Server) rowMethodInput(ctx context.Context, sess *session, user auth.User, art *models.Artifact, call *snowflake.ModelCall,
+	gen uint64) (string, error) {
 	if in := call.Arg("INPUT_DATA"); in != nil {
 		return s.inputQuery(ctx, sess, user, in, "INPUT_DATA")
 	}
@@ -227,9 +229,10 @@ func (s *Server) rowMethodInput(ctx context.Context, sess *session, user auth.Us
 	if res == nil {
 		return "", modelSyntax("%s needs INPUT_DATA, such as INPUT_DATA => TABLE(t)", call.Method)
 	}
-	token := s.modelRuntime.AddResult(res)
-	sess.keepModelResult(s.modelRuntime, token)
-	sess.allowModel(token)
+	token, err := s.keepResult(sess, res, gen)
+	if err != nil {
+		return "", err
+	}
 	return "SELECT * FROM " + models.ResultFunction + "(" + quoteLiteral(token) + ")", nil
 }
 

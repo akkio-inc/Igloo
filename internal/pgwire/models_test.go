@@ -348,14 +348,18 @@ func TestModelRefusals(t *testing.T) {
 	// names only what the session resolved.
 	sess := &session{}
 	call := "SELECT igloo_ml_predict('" + strings.Repeat("a", 64) + "', 1) FROM t"
-	if err := sess.checkModelCalls(call); err == nil || !strings.Contains(err.Error(), "permission denied") {
+	if err := sess.checkModelCalls(call, 0); err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("an unresolved blob: %v", err)
 	}
-	sess.allowModel(strings.Repeat("a", 64))
-	if err := sess.checkModelCalls(call); err != nil {
+	sess.allowModel(strings.Repeat("a", 64), 0)
+	if err := sess.checkModelCalls(call, 0); err != nil {
 		t.Errorf("a resolved blob: %v", err)
 	}
-	if err := sess.checkModelCalls("SELECT igloo_ml_result(x) FROM t"); err == nil || !strings.Contains(err.Error(), "permission denied") {
+	// One resolved before an erasure request purged the models is not.
+	if err := sess.checkModelCalls(call, 1); err == nil || !strings.Contains(err.Error(), "prepare it again") {
+		t.Errorf("a blob of an older generation: %v", err)
+	}
+	if err := sess.checkModelCalls("SELECT igloo_ml_result(x) FROM t", 0); err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("a computed token: %v", err)
 	}
 	// The DuckDB dialect reads statements on models too.

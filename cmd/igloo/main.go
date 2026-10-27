@@ -400,6 +400,8 @@ func serve() error {
 	// Erasure requests erase ids from bitmap indexes through the SQL
 	// server, which is made after them (see pgwire.BitmapIDSets).
 	bitmapIDs := &pgwire.BitmapIDSets{}
+	// They train models again through it too (see pgwire.ModelRetrainer).
+	retrainer := &pgwire.ModelRetrainer{}
 	if cat != nil {
 		erasureStore, purger, err := openErasure(ctx, cfg, eng, log)
 		if err != nil {
@@ -413,8 +415,9 @@ func serve() error {
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
 			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
-			// What AI functions derived from the tables, cached.
-			Derived: []erasure.Derived{aiRuntime.Store()},
+			// What AI functions derived from the tables, cached, and the
+			// models trained from them.
+			Derived: []erasure.Derived{aiRuntime.Store()}, Models: retrainer,
 		}, historyStore, taskStore)
 		if err != nil {
 			return err
@@ -510,6 +513,7 @@ func serve() error {
 		return err
 	}
 	bitmapIDs.Bind(srv)
+	retrainer.Bind(srv)
 	// The AI functions run in this server's sessions; workers have none.
 	eng.SetAI(srv.AIHook())
 	// The AI cache's expired entries go, every hour, until shutdown.

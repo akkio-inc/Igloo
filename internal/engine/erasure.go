@@ -199,8 +199,13 @@ func machineID() string {
 }
 
 // EmptyCache drops everything the read cache on disk holds, and DuckDB's
-// cache of file contents in memory.
+// cache of file contents in memory; and the models, pinned ones too, and
+// methods' results the process holds, which can hold what they learned
+// from rows an erasure request erased (see models.Runtime.Purge).
 func (e *Engine) EmptyCache(ctx context.Context) error {
+	if e.models != nil {
+		e.models.Purge()
+	}
 	c, err := e.connector.Connect(ctx)
 	if err != nil {
 		return err
