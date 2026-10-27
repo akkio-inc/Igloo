@@ -69,6 +69,47 @@ func TestIglooKMeans(t *testing.T) {
 	expectCode(t, conn, "CALL segs!WEIGHTS()", "42883", "has no method WEIGHTS")
 }
 
+// measuresTable is a synthetic table of five measures driven by two
+// planted factors, a and b, with five rows off their plane (person_id 601
+// to 605).
+const measuresTable = `CREATE TABLE lake.public.measures AS
+	SELECT i AS person_id, 10 + a + 0.01 * n1 AS impressions, 10 + 2 * a + b + 0.01 * n2 AS clicks, 10 + 3 * b AS spend,
+		10 + a - b AS visits, 10 + 0.5 * a + b + CASE WHEN i > 600 THEN 6 ELSE 0 END AS signups
+	FROM (SELECT i, ((i * 7919) % 1000) / 250.0 - 2 AS a, ((i * 104729) % 997) / 250.0 - 2 AS b,
+		(i * 31) % 7 - 3 AS n1, (i * 17) % 5 - 2 AS n2 FROM range(1, 606) t(i))`
+
+func TestIglooPCA(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, measuresTable)
+	conn := snowflakeConn(t, cs.admin)
+	mustExec(t, conn, `CREATE IGLOO.ML.PCA factors(INPUT_DATA => SYSTEM$QUERY_REFERENCE(
+		'SELECT impressions, clicks, spend, visits, signups FROM measures WHERE person_id <= 600'),
+		CONFIG_OBJECT => {'pca_explained_variance_ratio': 0.99})`)
+	if got := texts(t, conn, `SELECT count(*), max(cumulative_explained_variance_ratio) > 0.99
+		FROM TABLE(factors!PRINCIPAL_COMPONENT_INFO())`); len(got) != 1 || got[0] != "2|true" {
+		t.Errorf("PRINCIPAL_COMPONENT_INFO: %q", got)
+	}
+	if got := texts(t, conn, "SELECT count(*) FROM TABLE(factors!PRINCIPAL_COMPONENTS())"); len(got) != 1 || got[0] != "10" {
+		t.Errorf("PRINCIPAL_COMPONENTS: %q", got)
+	}
+	if n := count(t, conn, `SELECT count(*) FROM TABLE(factors!PREDICT(INPUT_DATA => TABLE(measures)))
+		WHERE principal_component_1 IS NOT NULL AND principal_component_2 IS NOT NULL`); n != 605 {
+		t.Errorf("%d of 605 rows projected", n)
+	}
+	// The rows off the plane are anomalies, with at most a training row or
+	// two (the contamination's share).
+	if got := texts(t, conn, `SELECT count(*) FILTER (WHERE person_id > 600), count(*) <= 7 FROM TABLE(factors!DETECT_ANOMALIES(
+		INPUT_DATA => TABLE(measures), CONFIG_OBJECT => {'contamination': 0.001})) WHERE is_anomaly`); len(got) != 1 || got[0] != "5|true" {
+		t.Errorf("anomalies: %q", got)
+	}
+	if got := texts(t, conn, `SELECT total_explained_variance_ratio > 0.99 FROM TABLE(factors!EVALUATE(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT * FROM measures WHERE person_id <= 600')))`); len(got) != 1 || got[0] != "true" {
+		t.Errorf("EVALUATE: %q", got)
+	}
+	expectCode(t, conn, `CREATE IGLOO.ML.PCA p(INPUT_DATA => TABLE(measures))`, "22023", "num_principal_components")
+}
+
 func TestIglooRegression(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()

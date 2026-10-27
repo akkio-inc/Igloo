@@ -324,6 +324,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `BOOSTED_TREE_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'boosted_trees'` (the default) |
 | `RANDOM_FOREST_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'random_forest'` |
 | `KMEANS` | `IGLOO.ML.KMEANS` | `'num_clusters'`, or none to pick one |
+| `PCA` | `IGLOO.ML.PCA` | `'num_principal_components'` or `'pca_explained_variance_ratio'` |
 | `ARIMA_PLUS`, `ARIMA_PLUS_XREG` | `SNOWFLAKE.ML.FORECAST` | a different method, with intervals |
 | `CONTRIBUTION_ANALYSIS` | `SNOWFLAKE.ML.TOP_INSIGHTS` | |
 | `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, `XGBOOST` imports, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
@@ -332,8 +333,9 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 |---|---|---|
 | `ML.PREDICT` | `PREDICT` | all |
 | `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION` |
-| `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS` |
+| `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS`, `PCA` |
 | `ML.CENTROIDS` | `CENTROIDS` | `KMEANS` |
+| `ML.PRINCIPAL_COMPONENTS`, `ML.PRINCIPAL_COMPONENT_INFO` | `PRINCIPAL_COMPONENTS`, `PRINCIPAL_COMPONENT_INFO` | `PCA` |
 | `ML.EVALUATE` | `EVALUATE` | all |
 | `ML.CONFUSION_MATRIX`, `ML.ROC_CURVE` | `CONFUSION_MATRIX`, `ROC_CURVE` | `CLASSIFICATION` |
 | `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | `REGRESSION`, `CLASSIFICATION` |
@@ -455,6 +457,32 @@ the model's `hyperparameters` record each. `kmeans_init_method` is
 | `EVALUATE` | `davies_bouldin_index` and `mean_squared_distance` (in standardized units), on the training rows or on `INPUT_DATA` |
 | `CENTROIDS` | `centroid_id`, `feature`, `numerical_value` (in the feature's own units), and for categories `category` and `categorical_value`, the share of the cluster's rows in it |
 | `TRAINING_INFO` | each iteration's mean squared distance, as `loss` |
+
+### PCA
+
+```sql
+CREATE IGLOO.ML.PCA demo.channel_factors(
+    INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT impressions, clicks, spend, visits FROM demo.daily_channels'),
+    CONFIG_OBJECT => {'pca_explained_variance_ratio': 0.9});
+
+SELECT day, principal_component_1, principal_component_2
+FROM TABLE(demo.channel_factors!PREDICT(INPUT_DATA => TABLE(demo.daily_channels)));
+```
+
+Principal components of every column, numbers standardized
+(`'scale_features'`, default `TRUE`) and categories one hot (at most 500
+columns so encoded): `num_principal_components` of them, or as many as
+explain `pca_explained_variance_ratio` of the variance; one of the two is
+required. The components are the covariance matrix's exact eigenvectors,
+so `pca_solver` is accepted and changes nothing.
+
+| Method | Returns |
+|---|---|
+| `PREDICT` | `principal_component_1`, `principal_component_2`, ...: the row's coordinates |
+| `DETECT_ANOMALIES` | `is_anomaly` and `mean_squared_error`, the row's distance from its projection, against the training rows' errors by `CONFIG_OBJECT => {'contamination': x}` |
+| `EVALUATE` | `total_explained_variance_ratio`, of the training rows or of `INPUT_DATA` |
+| `PRINCIPAL_COMPONENTS` | `principal_component_id`, `feature`, `numerical_value` (a number's loading), and for categories `category` and `categorical_value` |
+| `PRINCIPAL_COMPONENT_INFO` | `principal_component_id`, `eigenvalue`, `explained_variance_ratio`, `cumulative_explained_variance_ratio` |
 
 ## Train and score in one query
 

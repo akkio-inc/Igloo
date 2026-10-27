@@ -40,6 +40,7 @@ type Artifact struct {
 	// Igloo's classes' models.
 	Supervised *Supervised `json:"supervised,omitempty"`
 	Clusters   *Clusters   `json:"clusters,omitempty"`
+	Components *Components `json:"components,omitempty"`
 }
 
 // iglooModel is a model of one of Igloo's classes.
@@ -61,6 +62,8 @@ func (a *Artifact) igloo() iglooModel {
 		return a.Supervised
 	case a.Clusters != nil:
 		return a.Clusters
+	case a.Components != nil:
+		return a.Components
 	}
 	return nil
 }
