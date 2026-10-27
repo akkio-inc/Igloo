@@ -129,6 +129,10 @@ type Worker struct {
 	// object storage.
 	httpfsOnce sync.Once
 	httpfs     bool
+	// rbOnce finds whether DuckDB has Igloo's rb extension loaded, which
+	// the Snowflake macros divide with (see snowflake.MacrosFor).
+	rbOnce sync.Once
+	rb     bool
 }
 
 // NewWorker returns a worker; call Serve to accept tasks.
@@ -546,7 +550,8 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	if sfMacros {
 		// Igloo's own macros, which statements translated from Snowflake's
 		// dialect call (FLATTEN among them), as every session has them.
-		for _, stmt := range snowflake.Macros() {
+		w.rbOnce.Do(func() { w.rb = extensionLoaded(ctx, conn, "rb") })
+		for _, stmt := range snowflake.MacrosFor(w.rb) {
 			if err := exec(stmt); err != nil {
 				return "", nil, fmt.Errorf("define Snowflake's functions: %w", err)
 			}

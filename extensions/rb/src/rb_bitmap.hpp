@@ -39,6 +39,8 @@ void RegisterRewrite(DBConfig &config);
 void RegisterStats(ExtensionLoader &loader, DBConfig &config);
 //! Has trim, ltrim and rtrim of a string run faster, with DuckDB's results (rb_strings.cpp).
 void RegisterStrings(ExtensionLoader &loader);
+//! igloo_sf_div, Snowflake's division as Igloo's sf_div macro divides, bound as one function (rb_divide.cpp).
+void RegisterDivide(ExtensionLoader &loader);
 
 } // namespace rb
 } // namespace duckdb

@@ -98,6 +98,20 @@ string left as it was is not copied. Over tens of millions of short strings, a f
 of `NOT trim(s) IN (...)` took 4.9 s with DuckDB's `trim` and takes 0.65 s,
 against 0.3 s without `trim`.
 
+## Snowflake's division
+
+The Snowflake translator writes `a / b` as `sf_div(a, b)`, macros
+(`internal/snowflake/macros.go`) that divide integers exactly to 6 decimal
+places, a decimal to its scale plus 6 (at most 12), anything else as
+DuckDB's `/` does, and fail on division by zero. DuckDB expands a macro
+wherever it is called and binds every branch of it, each operand named some
+25 times, so a statement's divisions took most of its prepare: 158 of the
+208 ms a dashboard's statement of 76 divisions took. `igloo_sf_div(a, b)`
+divides as the macros do, to the bit, NULLs and errors included, and picks
+its branch once, from the operands' types (`src/rb_divide.cpp`); with the
+extension loaded, Igloo defines `sf_div` as a call of it
+(`snowflake.MacrosFor`).
+
 ## Building and loading
 
 `extensions/rb/build.sh OUT_DIR` builds `rb.duckdb_extension` and its

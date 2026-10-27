@@ -314,6 +314,23 @@ var macros = []string{
 		(a VARCHAR, b TIME) AS CAST(a AS TIME), (a VARCHAR, b DOUBLE) AS CAST(a AS DOUBLE), (a, b) AS a`,
 }
 
+// nativeDivision makes sf_div the rb extension's igloo_sf_div, which divides
+// as the macros above do (extensions/rb/src/rb_divide.cpp) and which DuckDB
+// binds as one function, where it binds the macros' branches with each
+// operand named some 25 times: three quarters of the time a dashboard's
+// statement of 76 divisions took to prepare.
+const nativeDivision = `CREATE OR REPLACE TEMP MACRO sf_div(a, b) AS igloo_sf_div(a, b)`
+
 // Macros returns the statements that define, in a session, the macros
 // translated statements call.
 func Macros() []string { return append([]string(nil), macros...) }
+
+// MacrosFor is Macros for a session whose DuckDB has Igloo's rb extension
+// loaded, when rb is true: sf_div divides with the extension's function.
+func MacrosFor(rb bool) []string {
+	m := Macros()
+	if rb {
+		m = append(m, nativeDivision)
+	}
+	return m
+}

@@ -877,7 +877,7 @@ var (
 )
 
 // snowflakeMacros returns the keys (see macroDefinitions) of the macros
-// snowflake.Macros defines, as a fresh connection lists them.
+// snowflake.MacrosFor defines, as a fresh connection lists them.
 func (s *Server) snowflakeMacros(ctx context.Context) ([]string, error) {
 	sfMacrosMu.Lock()
 	defer sfMacrosMu.Unlock()
@@ -889,7 +889,7 @@ func (s *Server) snowflakeMacros(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer conn.Close() //nolint:errcheck
-	for _, stmt := range snowflake.Macros() {
+	for _, stmt := range snowflake.MacrosFor(s.engine.BitmapsLoaded()) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			return nil, err
 		}

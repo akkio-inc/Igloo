@@ -118,7 +118,7 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 	// Igloo's macros for Snowflake's functions, which the views created in
 	// that dialect call, as every session has them: without them the local
 	// copies of those views could not be made.
-	for _, stmt := range snowflake.Macros() {
+	for _, stmt := range snowflake.MacrosFor(eng.BitmapsLoaded()) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			return nil, errors.Join(fmt.Errorf("define Snowflake's functions: %w", err), conn.Close())
 		}

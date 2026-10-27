@@ -587,8 +587,9 @@ func rewriteSystemSchemaRefs(query, catalog string) string {
 // sessionCatalogSetup creates, for one session, the PostgreSQL catalog
 // functions and relations that psql's \d commands need and DuckDB lacks.
 // Relations Igloo has no use for (policies, triggers, publications) are
-// empty. user owns everything, as far as clients can tell.
-func sessionCatalogSetup(user string, superuser bool, version string) []string {
+// empty. user owns everything, as far as clients can tell. rb says DuckDB
+// has Igloo's rb extension loaded (see snowflake.MacrosFor).
+func sessionCatalogSetup(user string, superuser bool, version string, rb bool) []string {
 	name := "'" + strings.ReplaceAll(user, "'", "''") + "'"
 	return append([]string{
 		"CREATE OR REPLACE TEMP MACRO pg_get_userbyid(id) AS " + name,
@@ -752,7 +753,7 @@ func sessionCatalogSetup(user string, superuser bool, version string) []string {
 		// The sf_ macros that statements translated from Snowflake's
 		// dialect call, in every session: views, tasks and the like
 		// created in that dialect keep calling them.
-	}, snowflake.Macros()...)
+	}, snowflake.MacrosFor(rb)...)
 }
 
 // showSetting matches SHOW of one setting, SHOW TRANSACTION ISOLATION LEVEL

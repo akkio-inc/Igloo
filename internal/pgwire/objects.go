@@ -64,7 +64,7 @@ type sessionNames struct {
 // sessionCatalogSetup).
 var setupTempViews = func() map[string]bool {
 	m := map[string]bool{}
-	for _, stmt := range sessionCatalogSetup("", false, "") {
+	for _, stmt := range sessionCatalogSetup("", false, "", false) {
 		if g := tempView.FindStringSubmatch(stmt); g != nil {
 			m[strings.ToLower(g[1])] = true
 		}

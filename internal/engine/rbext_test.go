@@ -18,6 +18,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
 // testRB returns the rb extension built for the tests (extensions/rb/build.sh,
@@ -292,6 +293,138 @@ func TestRBStringsMatchDuckDB(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestRBDivideMatchesMacro checks igloo_sf_div, which sf_div is with the rb
+// extension (see snowflake.MacrosFor), against the sf_div macros it stands
+// for: the same DOUBLEs, to the last digit, the same NULLs and the same
+// errors, for operands of every type the macros take and some they refuse,
+// as constants and in columns.
+func TestRBDivideMatchesMacro(t *testing.T) {
+	ctx := context.Background()
+	e, _ := openWithRB(t)
+	fast, err := e.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.Close() //nolint:errcheck
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close() //nolint:errcheck
+	dc, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dc.Close() //nolint:errcheck
+	plain := dc.(*duckdb.Conn)
+	for conn, stmts := range map[*duckdb.Conn][]string{fast: snowflake.MacrosFor(true), plain: snowflake.Macros()} {
+		for _, stmt := range stmts {
+			if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if def, err := firstRow(ctx, fast, "SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'sf_div'"); err != nil ||
+		!strings.Contains(def, "igloo_sf_div") {
+		t.Fatalf("sf_div is %q (%v), not igloo_sf_div", def, err)
+	}
+	operands := []string{
+		"0", "1", "7", "-3", "16", "1000000", "-999999937", "3999999999999", "4000000000000", "-4000000000001",
+		"999999999999999999", "1000000000000000000", "9223372036854775807", "-9223372036854775807",
+		"123456789012345678901234567890", "1000000000000000000000000000000", "-12345678901234567890123456789012345678",
+		"5::TINYINT", "-7::SMALLINT", "100000::INTEGER", "200::UTINYINT", "60000::USMALLINT", "4000000000::UINTEGER",
+		"18000000000000000000::UBIGINT", "5::UHUGEINT", "7::HUGEINT", "(-1152921504606846977)::BIGINT",
+		"16.0", "1.5", "-0.25", "123.456", "0.000001", "1.5::DECIMAL(38,10)", "2::DECIMAL(4,0)", "-7.125::DECIMAL(9,3)",
+		"12345678901234.5678::DECIMAL(18,4)", "0.1234567890123::DECIMAL(13,13)", "99999999999999999999.99::DECIMAL(22,2)",
+		"1.5::FLOAT", "-3::FLOAT", "1e30::FLOAT", "7::DOUBLE", "-0.0::DOUBLE", "'nan'::DOUBLE", "'inf'::DOUBLE",
+		"'-inf'::DOUBLE", "1e308::DOUBLE", "1e-308::DOUBLE", "2.5e-10::DOUBLE", "0.1::DOUBLE",
+		"NULL", "NULL::INTEGER", "NULL::DOUBLE", "NULL::DECIMAL(9,2)",
+		"'4'", "'4'::JSON", "INTERVAL 1 DAY", "DATE '2025-01-01'", "true",
+	}
+	for _, a := range operands {
+		for _, b := range operands {
+			q := "SELECT sf_div(" + a + ", " + b + "), typeof(sf_div(" + a + ", " + b + "))"
+			got, gerr := firstRow(ctx, fast, q)
+			want, werr := firstRow(ctx, plain, q)
+			switch {
+			case werr != nil && strings.Contains(werr.Error(), "Overflow on abs"):
+				// The macros' abs() of a type's smallest integer
+				// overflows; igloo_sf_div divides it.
+			case werr != nil && gerr != nil:
+				if zero := "Division by zero"; strings.Contains(werr.Error(), zero) != strings.Contains(gerr.Error(), zero) {
+					t.Errorf("%s: %v, the macros %v", q, gerr, werr)
+				}
+			case werr != nil || gerr != nil:
+				t.Errorf("%s: %q %v, the macros %q %v", q, got, gerr, want, werr)
+			case got != want:
+				t.Errorf("%s: %s, the macros %s", q, got, want)
+			}
+		}
+	}
+	// Parameters, which DuckDB binds once their values' types are known.
+	for _, args := range [][]any{{int64(1), int64(3)}, {int64(7), 2.5}, {1.5, int64(4)}, {int64(5), nil}, {int64(1), int64(0)}} {
+		q := "SELECT sf_div($1, $2), sf_div($1, 16.0), sf_div(10, $2)"
+		vals := []driver.NamedValue{{Ordinal: 1, Value: args[0]}, {Ordinal: 2, Value: args[1]}}
+		got, gerr := firstRowArgs(ctx, fast, q, vals)
+		want, werr := firstRowArgs(ctx, plain, q, vals)
+		if got != want || (gerr == nil) != (werr == nil) {
+			t.Errorf("%s with %v: %q %v, the macros %q %v", q, args, got, gerr, want, werr)
+		}
+	}
+	table := "CREATE TEMP TABLE divs AS SELECT row_number() OVER () AS i, v FROM " +
+		"(SELECT unnest([-7, -3, 1, 2, 3, 5, 16, 1000003, NULL, 127, 255, 4000000000001]) AS v)"
+	for _, conn := range []*duckdb.Conn{fast, plain} {
+		if _, err := conn.ExecContext(ctx, table, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	types := []string{"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+		"UHUGEINT", "DECIMAL(9,3)", "DECIMAL(38,10)", "FLOAT", "DOUBLE"}
+	for _, ta := range types {
+		for _, tb := range types {
+			// Unsigned types hold the values' magnitudes; what a type cannot
+			// hold is NULL. The divisors are never 0.
+			q := "SELECT a.i, b.i, sf_div(try_cast(" + magnitude(ta, "a.v") + " AS " + ta + "), try_cast(" + magnitude(tb, "b.v") +
+				" AS " + tb + ")) FROM divs AS a, divs AS b ORDER BY 1, 2"
+			got, want := queryRows(t, fast, q, ta+"/"+tb), queryRows(t, plain, q, ta+"/"+tb)
+			if strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Errorf("%s / %s in columns: igloo_sf_div's differ from the macros'", ta, tb)
+			}
+		}
+	}
+}
+
+// magnitude is x, or its absolute value for an unsigned type t.
+func magnitude(t, x string) string {
+	if strings.HasPrefix(t, "U") {
+		return "abs(" + x + ")"
+	}
+	return x
+}
+
+// firstRow returns q's first row, its values rendered and joined by tabs.
+func firstRow(ctx context.Context, conn *duckdb.Conn, q string) (string, error) {
+	return firstRowArgs(ctx, conn, q, nil)
+}
+
+// firstRowArgs is firstRow of q with the parameters args.
+func firstRowArgs(ctx context.Context, conn *duckdb.Conn, q string, args []driver.NamedValue) (string, error) {
+	rows, err := conn.QueryContext(ctx, q, args)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); err != nil {
+		return "", err
+	}
+	vals := make([]string, len(dest))
+	for i, v := range dest {
+		vals[i] = render(v)
+	}
+	return strings.Join(vals, "\t"), nil
 }
 
 func TestRBFunctions(t *testing.T) {

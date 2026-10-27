@@ -97,6 +97,8 @@ type Engine interface {
 	// ForgetMissingSchema makes DuckDB forget a schema of the catalog it
 	// took for missing, if the catalog has it, and reports whether it did.
 	ForgetMissingSchema(ctx context.Context, schema string) bool
+	// BitmapsLoaded reports whether DuckDB has Igloo's rb extension.
+	BitmapsLoaded() bool
 }
 
 // Options configures the server.
@@ -968,7 +970,7 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	// listing walks the set (see shareCatalog); running the statement after
 	// that holds nothing more.
 	conn.SetBindHold(func() func() { return s.shareCatalog(sess) })
-	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version) {
+	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			s.sessions.remove(sess)
 			s.releaseConn()
