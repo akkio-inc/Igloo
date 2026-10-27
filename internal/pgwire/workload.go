@@ -59,6 +59,11 @@ type workloadState struct {
 	// controller estimates what it reserves (see statementShape); "" for
 	// none.
 	shape string
+	// peak is the most memory the latest statement was seen holding while
+	// it ran, and sampled says a sample fell within its run (see
+	// workload.Controller.SampleMemory).
+	peak    int64
+	sampled bool
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
 	// controller holds statements back for their limits.
@@ -121,13 +126,14 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
 	if l.Memory == 0 && l.Counted {
-		// What statements like it allocated, when its role reserves nothing.
+		// What statements like it held, when its role reserves nothing.
 		l.Memory = sess.wl.controller.Estimate(sess.wl.shape)
 	}
 	release, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
+	sess.wl.peak, sess.wl.sampled = 0, false
 	if err == nil {
-		return release, nil
+		return func() { sess.wl.peak, sess.wl.sampled = release() }, nil
 	}
 	behind := []string{}
 	if n := sess.wl.controller.ReplicaLimit(); l.Counted && n > 0 {

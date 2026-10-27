@@ -28,6 +28,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/spot"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // serveWorker runs a distributed-execution worker
@@ -211,23 +212,39 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	return co, nil
 }
 
+// footprints learns what statements held at once, by their shapes: the
+// workload controller.
+type footprints interface {
+	Observe(shape string, footprint int64)
+	ObserveUnfinished(shape string, held int64)
+}
+
+// longUnmeasured is how long a run that ended early must have run, without
+// a peak in the history, to be taken for one that needed all its memory.
+const longUnmeasured = 10 * time.Second
+
 // seedHistory reads the past week's statements from the query history,
 // oldest last, and tells seed, if any, how long statements that could run on
 // workers took, by their plan keys, so that auto mode keeps choosing the
-// faster after a restart (see distributed.Run), and observe what
-// statements that ran here allocated, by their shapes, so that heavy ones
-// reserve memory from the first after it (see workload.Controller.Observe)
-// and auto mode knows they ran here (see distributed.Footprints). A run is
-// taken only with the memory it ran with: a footprint only from this
-// replica's memory limit, memory, or one within a quarter of it.
-func seedHistory(ctx context.Context, seed func([]distributed.Run), observe func(shape string, allocated int64),
-	memory int64, store audit.Store, log *slog.Logger) {
+// faster after a restart (see distributed.Run), and fp what statements that
+// ran here held, by their shapes, so that heavy ones reserve memory from
+// the first after it (see workload.Controller.Observe) and auto mode knows
+// they ran here (see distributed.Footprints). Runs that ended early,
+// cancelled or out of memory, count too, at least what they were seen
+// holding; one from before the history kept that, which ran a while, at
+// least all the memory it ran with: it ran its next time alone, rather than
+// beside others like it, all spilling, as runs cancelled at their timeout
+// did when nothing learned from them. A run is taken only with the memory
+// it ran with: a footprint only from this replica's memory limit, memory,
+// or one within a quarter of it.
+func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprints, memory int64, store audit.Store, log *slog.Logger) {
 	const pageSize, most = 1000, 20000
 	page := audit.Page{Since: time.Now().Add(-7 * 24 * time.Hour), Limit: pageSize}
 	var rs []distributed.Run
 	type footprint struct {
-		shape     string
-		allocated int64
+		shape      string
+		held       int64
+		unfinished bool
 	}
 	var fs []footprint
 	for read := 0; read < most; read += pageSize {
@@ -245,8 +262,17 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), observe func
 				// It ran out of memory on one machine.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true, Memory: q.Memory})
 			}
-			if q.Shape != "" && q.Workers == 0 && q.Outcome == audit.OutcomeOK && q.Resources != nil && sameMemory(q.Memory, memory) {
-				fs = append(fs, footprint{q.Shape, q.Resources.MemoryAllocated})
+			if q.Shape == "" || q.Workers > 0 || !sameMemory(q.Memory, memory) {
+				continue
+			}
+			early := q.Outcome == audit.OutcomeCanceled || q.SQLState == "53200"
+			switch {
+			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
+				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false})
+			case early && q.Peak > 0:
+				fs = append(fs, footprint{q.Shape, q.Peak, true})
+			case early && q.Duration-q.Queued >= longUnmeasured:
+				fs = append(fs, footprint{q.Shape, q.Memory, true})
 			}
 		}
 		if len(qs) < pageSize {
@@ -262,7 +288,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), observe func
 		seed(rs)
 	}
 	for _, f := range fs {
-		observe(f.shape, f.allocated)
+		if f.unfinished {
+			fp.ObserveUnfinished(f.shape, f.held)
+		} else {
+			fp.Observe(f.shape, f.held)
+		}
 	}
 	log.Debug("read past statements' runs", "runs", len(rs), "footprints", len(fs))
 }

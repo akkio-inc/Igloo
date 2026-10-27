@@ -394,3 +394,82 @@ func TestEstimateFromHistory(t *testing.T) {
 		t.Errorf("with estimates off: %d", got)
 	}
 }
+
+// TestPeaks checks what statements are seen holding: the most of what
+// DuckDB held while each ran, less what the others beside it reserved; none
+// for one no sample fell within; FootprintOf, the smaller of that and what
+// it allocated; and runs that ended early, which only raise their shape's
+// footprint.
+func TestPeaks(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(22 * gb)
+	c.LimitReplica(8)
+	ctx := context.Background()
+	heavy, _, _ := c.Admit(ctx, Limits{Counted: true, Memory: 10 * gb})
+	light, _, _ := c.Admit(ctx, Limits{Counted: true})
+	c.sample(12 * gb)
+	c.sample(15 * gb)
+	if peak, ok := light(); !ok || peak != 5*gb {
+		t.Errorf("the light statement's peak %d (%v), want 5 GB", peak, ok)
+	}
+	c.sample(9 * gb)
+	if peak, ok := heavy(); !ok || peak != 15*gb {
+		t.Errorf("the heavy statement's peak %d (%v), want 15 GB", peak, ok)
+	}
+	short, _, _ := c.Admit(ctx, Limits{Counted: true})
+	if _, ok := short(); ok {
+		t.Error("a statement no sample fell within has a peak")
+	}
+
+	for _, f := range []struct {
+		allocated, peak int64
+		sampled         bool
+		want            int64
+	}{{84 * gb, 12 * gb, true, 12 * gb}, {gb, 12 * gb, true, gb}, {3 * gb, 0, false, 3 * gb}, {3 * gb, -2 * gb, true, 0}} {
+		if got := FootprintOf(f.allocated, f.peak, f.sampled); got != f.want {
+			t.Errorf("FootprintOf(%d, %d, %v) = %d, want %d", f.allocated, f.peak, f.sampled, got, f.want)
+		}
+	}
+	c.Observe("s", 8*gb)
+	c.ObserveUnfinished("s", 5*gb)
+	if got, _ := c.Footprint("s"); got != 8*gb {
+		t.Errorf("a run that held less before its end lowered the footprint to %d", got)
+	}
+	c.ObserveUnfinished("s", 10*gb)
+	c.ObserveUnfinished("new", 3*gb)
+	if got, _ := c.Footprint("s"); got != 10*gb {
+		t.Errorf("a run that held more before its end left the footprint at %d", got)
+	}
+	if got, ok := c.Footprint("new"); !ok || got != 3*gb {
+		t.Errorf("an unfinished run of a new shape: %d (%v)", got, ok)
+	}
+	c.Observe("s", 0)
+	if got, ok := c.Footprint("s"); !ok || got != 0 {
+		t.Errorf("a run that held nothing: %d (%v)", got, ok)
+	}
+
+	// SampleMemory reads until its context ends.
+	sctx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		c.SampleMemory(sctx, time.Millisecond, func(context.Context) (int64, error) { return 3 * gb, nil })
+		close(done)
+	}()
+	running, _, _ := c.Admit(ctx, Limits{Counted: true})
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		c.mu.Lock()
+		sampled := false
+		for w := range c.active {
+			sampled = w.sampled
+		}
+		c.mu.Unlock()
+		if sampled {
+			break
+		}
+	}
+	if peak, ok := running(); !ok || peak != 3*gb {
+		t.Errorf("sampled peak %d (%v), want 3 GB", peak, ok)
+	}
+	stop()
+	<-done
+}

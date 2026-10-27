@@ -91,6 +91,11 @@ type Query struct {
 	// only under the memory it runs with now.
 	Shape  string
 	Memory int64
+	// Peak is the most memory the statement was seen holding while it ran,
+	// as its replica samples what DuckDB holds, less what the statements
+	// beside it reserved (see workload.Controller.SampleMemory); zero when
+	// no sample fell within its run.
+	Peak int64
 	// AI is what the statement's AI functions did; nil when it called
 	// none.
 	AI *AIUsage

@@ -228,20 +228,34 @@ limit says so: `behind the replica's limit of 8 statements at once`.
 A replica's statements share its memory, so heavy ones that start together
 spill to disk, and on a busy disk take far longer than one after the other;
 a fixed limit, though, holds back the light statements with the heavy ones.
-Igloo instead learns what each statement allocated, by its shape (its text
-with string and number literals masked, which a dashboard sends again with
-other audiences, dates and limits), and the next statement of that shape
-reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default, is all of
-it) of the replica's memory before it starts, as a role's `memory_limit`
-reserves (see [role limits](#role-limits)). A statement whose shape
-allocated more than the replica's memory waits until the others'
+Igloo instead learns what each statement holds at once, by its shape (its
+text with string and number literals masked, which a dashboard sends again
+with other audiences, dates and limits), and the next statement of that
+shape reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default,
+is all of it) of the replica's memory before it starts, as a role's
+`memory_limit` reserves (see [role limits](#role-limits)). A statement whose
+shape held more than the replica's memory waits until the others'
 reservations are released; one whose reservation would be under a
 sixteenth of the memory, or whose shape Igloo has not seen since the
 replica started, reserves nothing and starts at once. A role's own
-`memory_limit` comes first. When it starts, a replica reads what the past
-week's statements allocated from the [query history](sql.md#query-history),
-those that ran on a replica with its memory limit, within a quarter, so
-that a restart does not forget them.
+`memory_limit` comes first.
+
+DuckDB measures what a statement allocated over its whole run, counting
+memory it freed and allocated again, and the peak of the whole process,
+not of one statement. So the replica reads what DuckDB holds for running
+statements (their hash tables, sorts and the like, not its caches) every
+100 ms, and charges each statement running then with what the statements
+beside it had not reserved. A statement's shape learns the smaller of that
+peak and what it allocated, or, for a statement too short for a reading,
+what it allocated. A run that ends early, cancelled or out of memory,
+raises its shape's footprint to what it was seen holding, so that heavy
+statements cancelled at their timeout do not start together again, unseen,
+next time. When it starts, a replica reads what the past week's statements
+held from the [query history](sql.md#query-history), those that ran on a
+replica with its memory limit, within a quarter, so that a restart does
+not forget them; a run from before the history kept peaks counts by what it
+allocated, and one cancelled after ten seconds or more as needing all the
+memory it ran with.
 
 On a dashboard's burst of queries over billions of rows, on 8 cores and 22 GB, the
 build took 548 to 574 seconds with 8 statements running at once and 365
@@ -250,10 +264,7 @@ seconds rather than 32 to 51; reserving half of what a shape allocated
 took 314 to 353, and a quarter 367 to 371. The first time a dashboard runs
 on a replica, its statements have no history and reserve nothing: its first
 build took 558 to 590 seconds; after a restart, with what the history kept,
-301. What a
-statement allocates over its run is not its peak, which DuckDB 1.5 does not
-measure for one statement; the fraction stands in for how much of it the
-statement holds at once, and `off` turns the reservations off. Shapes are kept for the replica's life, up
+301. `off` turns the reservations off. Shapes are kept for the replica's life, up
 to 4,096 of them, and statements that ran on [workers](distributed-execution.md)
 are not learned from, since most of what they allocated was the workers'.
 A shape that ran to its end on the replica also tells auto mode that the

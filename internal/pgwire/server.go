@@ -1989,10 +1989,19 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if err == nil {
 			used = sess.measure(st)
 		}
-		if used != nil && parts.workers == 0 {
-			// What it allocated here, for the next statement like it; one
-			// that ran on workers allocated most of it there.
-			s.workload.Observe(shape, used.MemoryAllocated)
+		peak, sampled := sess.wl.peak, sess.wl.sampled
+		switch {
+		case parts.workers > 0:
+			// One that ran on workers held most of its memory there.
+		case used != nil:
+			// What it held here, for the next statement like it.
+			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+		case err != nil && sampled:
+			// It ended before its end, holding at least that much.
+			s.workload.ObserveUnfinished(shape, peak)
+		}
+		if !sampled {
+			peak = 0
 		}
 		queued := sess.wl.queued
 		s.metrics.query(start, err)
@@ -2020,7 +2029,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,
-			shape: shape})
+			shape: shape, peak: peak})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}

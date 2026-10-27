@@ -76,6 +76,10 @@ const (
 	// for its tasks.
 	spotPoll   = 5 * time.Second
 	spotMargin = 10 * time.Second
+	// peakSampleEvery is how often the workload controller reads what
+	// DuckDB holds for running statements; a statement shorter than that
+	// may fall between two reads, and is learned by what it allocated.
+	peakSampleEvery = 100 * time.Millisecond
 )
 
 func main() {
@@ -466,12 +470,20 @@ func serve() error {
 	limits.LimitReplica(replica)
 	limits.EstimateFromHistory(cfg.StatementReservations)
 	reg.MustRegister(limits.Metrics()...)
+	// What statements hold at once, for their reservations (see
+	// workload.Controller.SampleMemory).
+	if read, closeRead, err := eng.QueryMemory(ctx); err != nil {
+		log.Warn("statements' peak memory is not sampled; reservations come from what they allocated", "err", err)
+	} else {
+		defer closeRead() //nolint:errcheck
+		go limits.SampleMemory(ctx, peakSampleEvery, read)
+	}
 	if historyStore != nil {
 		var seed func([]distributed.Run)
 		if dist != nil {
 			seed = dist.Seed
 		}
-		go seedHistory(ctx, seed, limits.Observe, eng.MemoryLimit(ctx), historyStore, log)
+		go seedHistory(ctx, seed, limits, eng.MemoryLimit(ctx), historyStore, log)
 	}
 
 	opts := pgwire.Options{

@@ -22,8 +22,10 @@ import (
 // metrics, which costs well under a millisecond per statement to read
 // back. DuckDB 1.5's profiler reports peak memory only for the whole
 // process since it started, so the history has the memory a statement
-// allocated over its run instead; and it does not count bytes written to
-// object storage, so the history has no bytes written.
+// allocated over its run, and the most it was seen holding as the workload
+// controller samples DuckDB's memory (see QueryMemory); and it does not
+// count bytes written to object storage, so the history has no bytes
+// written.
 
 // profilingStatements turn the profiler on, without output, for every kind
 // of statement. QUERY_NAME tells a statement's own measurements from those
@@ -142,6 +144,34 @@ type oneConn struct{ conn *duckdb.Conn }
 
 func (c oneConn) Connect(context.Context) (driver.Conn, error) { return c.conn, nil }
 func (c oneConn) Driver() driver.Driver                        { return &duckdb.Driver{} }
+
+// queryMemory is the memory DuckDB's buffer manager holds for the
+// statements running now: their hash tables, sorts, windows, materialized
+// rows and file readers, not the tables, metadata and caches it keeps from
+// one statement to the next.
+const queryMemory = `SELECT coalesce(sum(memory_usage_bytes), 0)::VARCHAR FROM system.main.duckdb_memory()
+	WHERE tag IN ('HASH_TABLE', 'ORDER_BY', 'WINDOW', 'COLUMN_DATA', 'ALLOCATOR', 'OVERFLOW_STRINGS',
+		'PARQUET_READER', 'CSV_READER', 'TRANSACTION')`
+
+// QueryMemory opens a connection of its own and returns read, which reads
+// over it the memory DuckDB holds for the statements running now, for
+// workload.Controller.SampleMemory, one call at a time; closeConn closes
+// the connection. A read takes well under 10 ms while statements run.
+func (e *Engine) QueryMemory(ctx context.Context) (read func(context.Context) (int64, error), closeConn func() error, err error) {
+	c, err := e.connector.Connect(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn := c.(*duckdb.Conn)
+	read = func(ctx context.Context) (int64, error) {
+		v, err := queryString(ctx, conn, queryMemory)
+		if err != nil {
+			return 0, err
+		}
+		return strconv.ParseInt(v, 10, 64)
+	}
+	return read, conn.Close, nil
+}
 
 // SetMemoryLimit changes DuckDB's memory limit to n bytes, which it then
 // keeps by writing buffers to its spill files (see memlimit.Adapt). It

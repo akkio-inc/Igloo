@@ -44,6 +44,9 @@ type Controller struct {
 	// replicaRunning counts the counted statements running.
 	replicaRunning int
 	queue          []*waiter
+	// active are the statements running under the controller's limits,
+	// whose peaks SampleMemory keeps.
+	active map[*waiter]struct{}
 
 	waiting prometheus.Gauge
 	waited  prometheus.Counter
@@ -59,6 +62,10 @@ type waiter struct {
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
+	// peak is the most memory it was seen holding while it ran, and
+	// sampled says a sample fell within its run (see SampleMemory).
+	peak    int64
+	sampled bool
 }
 
 // NewController enforces limits against budget bytes of query memory.
@@ -66,6 +73,7 @@ func NewController(budget int64) *Controller {
 	return &Controller{
 		budget:  budget,
 		running: make(map[string]int),
+		active:  make(map[*waiter]struct{}),
 		waiting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "igloo_statements_waiting",
 			Help: "Statements waiting for the replica's or their role's concurrency or memory limit before they start.",
@@ -98,14 +106,17 @@ func (c *Controller) Metrics() []prometheus.Collector {
 
 // Admit waits until a statement under l may start, or ctx ends, in which
 // case it returns ctx's error. The statement must call release when it
-// ends. waited is how long it was held back.
-func (c *Controller) Admit(ctx context.Context, l Limits) (release func(), waited time.Duration, err error) {
+// ends, which returns the most memory it was seen holding, peak, if a
+// sample fell within its run, sampled (see SampleMemory). waited is how
+// long it was held back.
+func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak int64, sampled bool), waited time.Duration, err error) {
+	unlimited := func() (int64, bool) { return 0, false }
 	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) {
-		return func() {}, 0, nil
+		return unlimited, 0, nil
 	}
 	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, ready: make(chan struct{})}
 	if w.slots.Max == 0 && w.memory == 0 && !w.counted {
-		return func() {}, 0, nil
+		return unlimited, 0, nil
 	}
 	c.mu.Lock()
 	c.queue = append(c.queue, w)
@@ -135,7 +146,10 @@ func (c *Controller) Admit(ctx context.Context, l Limits) (release func(), waite
 		c.mu.Unlock()
 	}
 	var once sync.Once
-	return func() { once.Do(func() { c.release(w) }) }, waited, nil
+	return func() (int64, bool) {
+		once.Do(func() { c.release(w) })
+		return w.peak, w.sampled
+	}, waited, nil
 }
 
 // reservation is what a statement reserving memory bytes takes from the
@@ -167,6 +181,7 @@ func (c *Controller) admit() {
 				c.replicaRunning++
 			}
 			c.reserved += w.memory
+			c.active[w] = struct{}{}
 			w.admitted = true
 			close(w.ready)
 			continue
@@ -211,6 +226,7 @@ func (c *Controller) release(w *waiter) {
 		c.replicaRunning--
 	}
 	c.reserved -= w.memory
+	delete(c.active, w)
 	c.admit()
 }
 

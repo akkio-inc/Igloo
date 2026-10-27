@@ -76,6 +76,9 @@ type queryRecord struct {
 	// shape its key for the workload controller (see shapeKey), if any.
 	parts distParts
 	shape string
+	// peak is the most memory it was seen holding, if sampled (see
+	// workload.Controller.SampleMemory); zero otherwise.
+	peak int64
 	// ai is what its AI functions did, if it called any.
 	ai *ai.Spend
 }
@@ -143,6 +146,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		PlanKey:         r.parts.key,
 		Shape:           r.shape,
 		Memory:          s.runMemory(r.parts.workers),
+		Peak:            r.peak,
 	}
 	if sp := r.ai; sp != nil {
 		q.AI = &audit.AIUsage{Calls: sp.Calls, CacheHits: sp.CacheHits, InputTokens: sp.InputTokens, OutputTokens: sp.OutputTokens,
