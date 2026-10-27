@@ -968,9 +968,9 @@
           "minimum": 1
         },
         "idleAfter": {
-          "description": "A Go duration such as 10m.",
+          "description": "A Go duration such as 10m, or auto.",
           "type": "string",
-          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
+          "pattern": "^auto$|^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
         "startTimeout": {
           "description": "A Go duration such as 10m.",
@@ -1054,6 +1054,10 @@
         },
         "affinity": {
           "type": "object"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     }

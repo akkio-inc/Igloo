@@ -26,6 +26,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/gateway"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/prefetch"
+	"github.com/akkio-inc/igloo/internal/spot"
 )
 
 // serveWorker runs a distributed-execution worker
@@ -124,19 +125,52 @@ func serveWorker() error {
 	}
 	log.Info("igloo worker is ready", "tasks", ln.Addr().String(), "http", cfg.HTTPAddr, "threads", threads, "memory_bytes", memory)
 
+	// On a Spot Instance, AWS says two minutes ahead that it takes the
+	// instance back: the worker takes no more tasks from then on, which
+	// coordinators run elsewhere, and finishes those it has until then.
+	notices := make(chan spot.Notice, 1)
+	if cfg.Workers.SpotNotice {
+		go func() {
+			n, err := spot.WatchEC2(ctx, spot.EC2, spotPoll)
+			switch {
+			case err == nil:
+				notices <- n
+			case errors.Is(err, spot.ErrNotEC2):
+				// Off EC2, or in a container the instance's metadata hop
+				// limit of 1 keeps from the service.
+				log.Info("not watching for Spot interruptions: no instance metadata", "err", err)
+			}
+		}()
+	}
+	grace := shutdownTimeout
+	var reclaimed time.Time
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
+	case n := <-notices:
+		grace, reclaimed = max(time.Until(n.Time)-spotMargin, shutdownTimeout), n.Time
+		log.Warn("AWS is taking this instance back; finishing the tasks running and taking no more",
+			"action", n.Action, "at", n.Time, "grace", grace.Round(time.Second))
 	}
 	stopping.Store(true)
 	log.Info("shutting down")
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), grace)
 	defer cancelShutdown()
 	if httpSrv != nil {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}
-	return w.Shutdown(shutdownCtx)
+	err = w.Shutdown(shutdownCtx)
+	if !reclaimed.IsZero() {
+		// Exiting now, the worker would be started again by its supervisor
+		// and take tasks it cannot finish: it stays down until AWS has
+		// taken the instance, or a minute past the time it said.
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Until(reclaimed) + time.Minute):
+		}
+	}
+	return err
 }
 
 // newCoordinator sets up distributed execution on the server, when
@@ -163,7 +197,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 		LocalExchanges: cfg.Workers.Exchanges == "local", AutoExchanges: cfg.Workers.Exchanges == "auto",
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
-			IdleAfter: cfg.Workers.IdleAfter, StartTimeout: cfg.Workers.StartTimeout,
+			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout,
 		},
 	}, log)
 	if err != nil {

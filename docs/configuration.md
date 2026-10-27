@@ -268,7 +268,7 @@ to deploy workers. On the Igloo server:
 | `IGLOO_WORKER_SECRET` | (required with `IGLOO_WORKERS`) | At least 32 characters, shared with the workers, which accept only holders of it |
 | `IGLOO_WORKER_COMPUTE` | | How Igloo starts and stops workers: `kubernetes`, `ec2`, `command`, or empty when they always run |
 | `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
-| `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
+| `IGLOO_WORKER_IDLE_AFTER` | `auto` | Stop workers after this long without tasks; `auto` for three times what their last start took, from 2 to 10 minutes |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before running on the server |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone, by its estimate or its last run there, before it may run on workers (unless it would run short of memory), and then only if workers are estimated, or were measured, to be faster |
 | `IGLOO_EXCHANGES` | `object` | Where workers write the rows they exchange between a statement's stages: `object`, the warehouse's object storage; `local`, their own disks (`IGLOO_DUCKDB_TEMP_DIR`), from which the workers that read them fetch them; or `auto`, their disks when every worker of the statement reports at least 1 GiB of room there and runs outside Kubernetes, object storage otherwise, recommended on machines with local NVMe (see [exchanges on workers' disks](distributed-execution.md#exchanges-on-workers-disks)). A worker whose disk is short of room writes to object storage instead |
@@ -280,7 +280,9 @@ Distributed execution keeps partial results in `IGLOO_DUCKDB_TEMP_DIR`, which
 must be set (the image sets it).
 
 A worker (`igloo worker`) reads `IGLOO_WORKER_SECRET`,
-`IGLOO_WORKER_LISTEN_ADDR` (`:7433`), and the server's settings for storage
+`IGLOO_WORKER_LISTEN_ADDR` (`:7433`), `IGLOO_WORKER_SPOT_NOTICE` (`on`: on
+EC2, take no more tasks and finish those running once AWS says it is taking a
+Spot Instance back; `off`), and the server's settings for storage
 (`IGLOO_WAREHOUSE_LOCATION`, `IGLOO_ALLOWED_LOCATIONS`, `IGLOO_S3_*`,
 `IGLOO_GCS_*`, `IGLOO_AZURE_*`), DuckDB (`IGLOO_DUCKDB_*`), the read cache
 (`IGLOO_CACHE_*`), `IGLOO_HTTP_ADDR` (health checks and metrics) and logs.

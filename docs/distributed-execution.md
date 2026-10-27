@@ -724,7 +724,7 @@ On the Igloo server:
 | `IGLOO_WORKER_SECRET` | (required with workers) | At least 32 characters, the same on the server and the workers |
 | `IGLOO_WORKER_COMPUTE` | | How to start and stop workers: `kubernetes`, `ec2`, `command`, or empty when they always run |
 | `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
-| `IGLOO_WORKER_IDLE_AFTER` | `10m` | Stop workers after this long without tasks |
+| `IGLOO_WORKER_IDLE_AFTER` | `auto` | Stop workers after this long without tasks; `auto` for three times what their last start took, from 2 to 10 minutes |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [when](#when)) |
 | `IGLOO_EXCHANGES` | `object` | Where workers exchange rows: `object` storage, `local` disks, or `auto`, their disks where every worker has room and runs outside Kubernetes (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
@@ -736,7 +736,8 @@ Distributed execution also needs `IGLOO_DUCKDB_TEMP_DIR` (set in the image),
 where partial results are kept while a statement combines them.
 
 On a worker (`igloo worker`): `IGLOO_WORKER_SECRET`,
-`IGLOO_WORKER_LISTEN_ADDR` (`:7433`), the server's storage settings, and
+`IGLOO_WORKER_LISTEN_ADDR` (`:7433`), `IGLOO_WORKER_SPOT_NOTICE` (`on`; see
+[Spot workers](#spot-workers)), the server's storage settings, and
 `IGLOO_DUCKDB_*`, `IGLOO_CACHE_*`, `IGLOO_HTTP_ADDR` and `IGLOO_LOG_*` as on
 the server; with local exchanges, `IGLOO_EXCHANGE_MAX_SIZE` caps what they
 may take on its disk (empty: a quarter of its free space at a time).
@@ -769,7 +770,31 @@ Distributing does not make a statement cheaper: the same work runs on more
 machines for less time, plus the start and the idle tail. It makes a
 statement that would take many minutes on one machine finish in a fraction
 of that, and lets a join of two large tables whose state is many times one
-machine's memory run where that machine would run out of memory.
+machine's memory run where that machine would run out of memory. The tail
+is what workers cost after their last task until they stop: with
+`IGLOO_WORKER_IDLE_AFTER=auto`, the default, three times what their last
+start took, from 2 to 10 minutes, about as long as a start costs. Workers
+that start in half a minute stop after 2 idle minutes; on a 32-core machine
+at $1.71 an hour, a 10-minute tail cost $0.28 after each burst of work.
+
+### Spot workers
+
+Workers suit Spot capacity, 50 to 75% cheaper on AWS: they keep nothing a
+statement needs once their tasks end, a task a lost worker ran runs again on
+another, and with exchanges in object storage (`IGLOO_EXCHANGES=object`)
+nothing they wrote is lost with them. Keep Igloo itself, the catalog and its
+database on regular capacity. AWS says two minutes ahead that it is taking
+a Spot Instance back; a worker on EC2 watches for that (instance metadata,
+IMDSv2), and from then on takes no more tasks, which coordinators send to
+other workers, and finishes those it runs until ten seconds before the time
+AWS gave. A worker in a container reaches the metadata service only with
+host networking or the instance's hop limit at 2
+(`HttpPutResponseHopLimit`); without it, it logs that it is not watching,
+and a Spot Instance taken back fails its tasks over as a lost worker's.
+On Kubernetes, where a Spot node is drained first, a stopping
+worker finishes its tasks for up to 30 seconds, within the pod's grace
+period (`workers.terminationGracePeriodSeconds`, 45 by default). Ask for
+several instance types and zones, so that capacity one lacks another has.
 
 ## Limitations
 

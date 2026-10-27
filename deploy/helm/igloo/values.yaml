@@ -371,8 +371,9 @@ workers:
   enabled: false
   # The most worker pods igloo starts -> IGLOO_WORKER_MAX.
   maxReplicas: 4
-  # Stop workers after this long without tasks -> IGLOO_WORKER_IDLE_AFTER.
-  idleAfter: 10m
+  # Stop workers after this long without tasks -> IGLOO_WORKER_IDLE_AFTER:
+  # auto for three times their last start, from 2 to 10 minutes.
+  idleAfter: auto
   # How long a statement waits for workers to start before it runs on one
   # igloo pod instead -> IGLOO_WORKER_START_TIMEOUT. Allow for the cluster
   # autoscaler adding nodes.
@@ -407,6 +408,9 @@ workers:
   tolerations: []
   # Empty: prefer one worker per node.
   affinity: {}
+  # A worker told to stop (scale-down, a node drained, as before a Spot node
+  # is reclaimed) finishes its running tasks for up to 30s; keep this above.
+  terminationGracePeriodSeconds: 45
 
 # Prometheus metrics are served on port 8080 at /metrics, through the
 # <fullname>-metrics ClusterIP Service (never through the SQL Service), and the

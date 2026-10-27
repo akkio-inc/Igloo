@@ -546,6 +546,38 @@ func TestStatementReservations(t *testing.T) {
 	}
 }
 
+func TestWorkerSpotNotice(t *testing.T) {
+	for v, want := range map[string]bool{"": true, "on": true, "off": false, "false": false} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_SPOT_NOTICE"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.Workers.SpotNotice != want {
+			t.Errorf("IGLOO_WORKER_SPOT_NOTICE=%q: %v %v, want %v", v, cfg.Workers.SpotNotice, err, want)
+		}
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_SPOT_NOTICE": "sometimes"})); err == nil {
+		t.Error("IGLOO_WORKER_SPOT_NOTICE=sometimes should be refused")
+	}
+}
+
+func TestWorkerIdleAfter(t *testing.T) {
+	for v, want := range map[string]struct {
+		after time.Duration
+		auto  bool
+	}{"": {10 * time.Minute, true}, "auto": {10 * time.Minute, true}, "5m": {5 * time.Minute, false}} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_IDLE_AFTER"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.Workers.IdleAfter != want.after || cfg.Workers.IdleAuto != want.auto {
+			t.Errorf("IGLOO_WORKER_IDLE_AFTER=%q: %v %v %v, want %v", v, cfg.Workers.IdleAfter, cfg.Workers.IdleAuto, err, want)
+		}
+	}
+}
+
 func TestResultCacheSize(t *testing.T) {
 	for v, want := range map[string]int64{"": 256 << 20, "0": 0, "off": 0, "1GB": 1e9, "64MiB": 64 << 20} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

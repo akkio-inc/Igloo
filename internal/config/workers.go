@@ -24,8 +24,10 @@ type Workers struct {
 	// Max is the most workers Compute starts.
 	Max int
 	// IdleAfter is how long workers run without tasks before Compute stops
-	// them.
+	// them; with IdleAuto (IGLOO_WORKER_IDLE_AFTER=auto, the default), the
+	// most they do, three times their start from two minutes on.
 	IdleAfter time.Duration
+	IdleAuto  bool
 	// StartTimeout bounds how long a statement waits for workers to start.
 	StartTimeout time.Duration
 	// Threshold is how long a statement must take on one machine before
@@ -48,6 +50,10 @@ type Workers struct {
 
 	// ListenAddr is where a worker accepts tasks.
 	ListenAddr string
+	// SpotNotice has a worker on EC2 watch for AWS's notice that it is
+	// taking the instance back, and then finish its tasks and take no more
+	// (IGLOO_WORKER_SPOT_NOTICE, on by default).
+	SpotNotice bool
 }
 
 // WorkerPort is the port workers listen on unless told otherwise.
@@ -122,7 +128,18 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		}
 		return d
 	}
-	w.IdleAfter = duration("IGLOO_WORKER_IDLE_AFTER", "10m")
+	switch v := strings.ToLower(get("IGLOO_WORKER_SPOT_NOTICE", "on")); v {
+	case "on", "true":
+		w.SpotNotice = true
+	case "off", "false":
+	default:
+		addErr("IGLOO_WORKER_SPOT_NOTICE must be on or off, got %q", v)
+	}
+	if strings.EqualFold(get("IGLOO_WORKER_IDLE_AFTER", "auto"), "auto") {
+		w.IdleAfter, w.IdleAuto = 10*time.Minute, true
+	} else {
+		w.IdleAfter = duration("IGLOO_WORKER_IDLE_AFTER", "10m")
+	}
 	w.StartTimeout = duration("IGLOO_WORKER_START_TIMEOUT", "3m")
 	w.Threshold = duration("IGLOO_WORKER_THRESHOLD", "1m")
 

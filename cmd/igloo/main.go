@@ -71,6 +71,11 @@ const (
 	startupTimeout = 3 * time.Minute
 	// shutdownTimeout bounds how long running queries get to finish.
 	shutdownTimeout = 30 * time.Second
+	// spotPoll is how often a worker on EC2 asks whether AWS is taking the
+	// instance back, and spotMargin how long before then it stops waiting
+	// for its tasks.
+	spotPoll   = 5 * time.Second
+	spotMargin = 10 * time.Second
 )
 
 func main() {

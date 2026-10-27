@@ -488,6 +488,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Workers stop after an idle tail sized to their start
+  (`IGLOO_WORKER_IDLE_AFTER=auto`, the default): three times what their
+  last start took, from 2 to 10 minutes, where every burst of work kept
+  them up 10 minutes. On EC2, a worker watches for AWS's two-minute notice
+  that it is taking a Spot Instance back (`IGLOO_WORKER_SPOT_NOTICE`), takes
+  no more tasks from then on, which coordinators send to other workers, and
+  finishes those it runs until ten seconds before the time AWS gave; the
+  chart gives workers a 45-second grace period
+  (`workers.terminationGracePeriodSeconds`; see [Spot
+  workers](docs/distributed-execution.md#spot-workers)).
 - A statement canceled, or past its timeout, while the coordinator plans
   it ends with that error. Planning took the session's failure to describe
   a part in time for a reason to run the statement on one machine

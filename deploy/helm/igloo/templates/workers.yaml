@@ -48,8 +48,9 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
-      # Running tasks fail over to other workers; there is nothing to drain.
-      terminationGracePeriodSeconds: 15
+      # A stopping worker takes no more tasks and finishes those it runs for
+      # up to 30s; what it has not finished then fails over to other workers.
+      terminationGracePeriodSeconds: {{ .Values.workers.terminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

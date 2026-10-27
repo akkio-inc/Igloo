@@ -899,6 +899,31 @@ func TestWorkersKeptForAStatement(t *testing.T) {
 	}
 }
 
+// With IdleAuto, workers stay up three times their last start without
+// tasks, from two minutes to IdleAfter.
+func TestIdleAfterStarts(t *testing.T) {
+	tr, err := newTransport(testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPool(PoolOptions{Compute: &scaleLog{}, MaxWorkers: 4, IdleAfter: 10 * time.Minute, IdleAuto: true}, tr, "test", nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for took, want := range map[time.Duration]time.Duration{
+		10 * time.Second: 2 * time.Minute, 30 * time.Second: 2 * time.Minute, 2 * time.Minute: 6 * time.Minute, 5 * time.Minute: 10 * time.Minute,
+	} {
+		p.mu.Lock()
+		p.startTook = took
+		p.mu.Unlock()
+		if got := p.idleAfter(); got != want {
+			t.Errorf("started in %s: idle after %s, want %s", took, got, want)
+		}
+	}
+	p.opts.IdleAuto = false
+	if got := p.idleAfter(); got != 10*time.Minute {
+		t.Errorf("without IdleAuto: idle after %s, want IdleAfter", got)
+	}
+}
+
 // Workers a coordinator has just started stay up while they boot, though
 // it has run no task yet and none answers: they stop only once it has
 // neither used them nor started them for IdleAfter, and they report as

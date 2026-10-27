@@ -35,8 +35,9 @@ type PoolOptions struct {
 	// MaxWorkers caps the workers Compute starts.
 	MaxWorkers int
 	// IdleAfter is how long workers run without tasks before Compute stops
-	// them.
+	// them; with IdleAuto, the most they do (see idleAfter).
 	IdleAfter time.Duration
+	IdleAuto  bool
 	// StartTimeout bounds how long a statement waits for workers to start.
 	StartTimeout time.Duration
 }
@@ -380,8 +381,29 @@ func (p *pool) run(ctx context.Context) {
 	}
 }
 
+// idleFloor is the least time workers stay up without tasks with
+// IdleAuto, and idleStarts how many times their start they stay up.
+const (
+	idleFloor  = 2 * time.Minute
+	idleStarts = 3
+)
+
+// idleAfter is how long workers stay up without tasks. With IdleAuto it is
+// three times what their last start took, from two minutes to IdleAfter:
+// stopped workers cost nothing but a start, which bills their machines
+// while they boot and has the next statement wait, so idle ones are kept
+// about as long as a start costs. Workers that start in 30 seconds stop
+// after 2 idle minutes rather than 10, which on a 32-core machine at
+// $1.71 an hour saves $0.23 a burst.
+func (p *pool) idleAfter() time.Duration {
+	if !p.opts.IdleAuto {
+		return p.opts.IdleAfter
+	}
+	return min(max(idleStarts*p.startEstimate(), idleFloor), p.opts.IdleAfter)
+}
+
 // stopIdle stops the workers, ws being those that answered, once this
-// coordinator has neither used them nor asked for them for IdleAfter, and
+// coordinator has neither used them nor asked for them for idleAfter, and
 // every worker reports as long without tasks, so workers another
 // coordinator uses keep running. Workers it has just asked for are about
 // to be used, though none may answer yet: counting from its last task
@@ -391,19 +413,20 @@ func (p *pool) stopIdle(ctx context.Context, ws []*worker) {
 	if !p.canStart() {
 		return
 	}
+	after := p.idleAfter()
 	p.mu.Lock()
 	last := p.used
 	if p.scaledAt.After(last) {
 		last = p.scaledAt
 	}
-	idle := time.Since(last) >= p.opts.IdleAfter && p.busy == 0
+	idle := time.Since(last) >= after && p.busy == 0
 	scaled := p.scaled
 	p.mu.Unlock()
 	if !idle {
 		return
 	}
 	busy := slices.ContainsFunc(ws, func(w *worker) bool {
-		return w.status.Running > 0 || time.Duration(w.status.IdleSeconds*float64(time.Second)) < p.opts.IdleAfter
+		return w.status.Running > 0 || time.Duration(w.status.IdleSeconds*float64(time.Second)) < after
 	})
 	if busy || (len(ws) == 0 && scaled == 0) {
 		return
@@ -414,7 +437,7 @@ func (p *pool) stopIdle(ctx context.Context, ws []*worker) {
 		p.log.Warn("could not stop idle workers", "err", err)
 		return
 	}
-	p.log.Info("stopped idle workers", "idle", p.opts.IdleAfter)
+	p.log.Info("stopped idle workers", "idle", after)
 	p.mu.Lock()
 	p.scaled, p.workers, p.refreshed = 0, nil, time.Time{}
 	p.mu.Unlock()
