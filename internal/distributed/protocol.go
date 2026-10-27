@@ -263,6 +263,10 @@ type workerStatus struct {
 	// empty and zero from a worker that does not say.
 	Cache  string `json:"cache,omitempty"`
 	Erased int64  `json:"erased,omitempty"`
+	// Alone is when it last emptied its caches for having heard from no
+	// coordinator for a while (WorkerErasure.Isolated), in Unix
+	// nanoseconds; zero for never.
+	Alone int64 `json:"alone,omitempty"`
 }
 
 // SettingNames are the session settings that change what a query computes.

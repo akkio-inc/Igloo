@@ -364,6 +364,7 @@ func (w *Worker) serveExchangeFile(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *Worker) serveExchangeKeep(rw http.ResponseWriter, r *http.Request) {
+	w.hear()
 	if !w.local.keep(r.PathValue("qid")) {
 		http.Error(rw, errNoExchange.Error(), http.StatusNotFound)
 		return
@@ -372,6 +373,7 @@ func (w *Worker) serveExchangeKeep(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *Worker) serveExchangeRemove(rw http.ResponseWriter, r *http.Request) {
+	w.hear()
 	if err := w.local.remove(r.PathValue("qid")); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return

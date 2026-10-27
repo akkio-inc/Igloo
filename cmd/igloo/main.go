@@ -438,11 +438,14 @@ func serve() error {
 		// records them in the requests' ledger (see distributed's
 		// erasure.go).
 		if dist != nil {
+			// A worker purged has requests blocked for it run at once.
+			ledger := erasure.NewWorkerLedger(erasureStore)
+			ledger.Purged = func() { eraser.WakeBlocked(context.WithoutCancel(ctx)) }
 			watchCtx, stopWatching := context.WithCancel(ctx)
 			watched := make(chan struct{})
 			go func() {
 				defer close(watched)
-				dist.WatchErasures(watchCtx, erasure.NewWorkerLedger(erasureStore))
+				dist.WatchErasures(watchCtx, ledger)
 			}()
 			defer func() {
 				stopWatching()

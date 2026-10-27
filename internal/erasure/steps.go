@@ -2296,12 +2296,18 @@ func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int,
 	through := r.DeletedThrough.Truncate(time.Microsecond)
 	now := s.now()
 	for _, c := range caches {
-		_, worker := parseWorkerCache(c.ID)
+		w, worker := parseWorkerCache(c.ID)
 		switch {
+		case worker && w.unknown:
+			// It never says it purged (see workersLeft).
 		case !c.Emptied.Before(through):
 			emptied++
 		case now.Sub(c.Seen) < liveWindow:
 			waiting = append(waiting, c.Host)
+		case worker && w.isolated > 0 && now.Before(w.purgedAlone(r)):
+			// No coordinator reaches it: it empties its caches by itself,
+			// which the request gives it time for.
+			waiting = append(waiting, c.Host+", which no coordinator reaches, until "+w.purgedAlone(r).UTC().Format(time.RFC3339))
 		case worker:
 			// Not pending: one whose cache outlives it is left (see
 			// workersLeft), and one whose cache goes with it holds nothing.

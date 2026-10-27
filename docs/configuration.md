@@ -282,7 +282,10 @@ must be set (the image sets it).
 A worker (`igloo worker`) reads `IGLOO_WORKER_SECRET`,
 `IGLOO_WORKER_LISTEN_ADDR` (`:7433`), `IGLOO_WORKER_SPOT_NOTICE` (`on`: on
 EC2, take no more tasks and finish those running once AWS says it is taking a
-Spot Instance back; `off`), and the server's settings for storage
+Spot Instance back; `off`), `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (`1m`, at
+least `10s`: how long it goes without hearing from any coordinator before it
+empties its caches by itself, for [erasure requests](privacy.md#workers)),
+and the server's settings for storage
 (`IGLOO_WAREHOUSE_LOCATION`, `IGLOO_ALLOWED_LOCATIONS`, `IGLOO_S3_*`,
 `IGLOO_GCS_*`, `IGLOO_AZURE_*`), DuckDB (`IGLOO_DUCKDB_*`), the read cache
 (`IGLOO_CACHE_*`), `IGLOO_HTTP_ADDR` (health checks and metrics) and logs.

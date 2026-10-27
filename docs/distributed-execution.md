@@ -632,10 +632,13 @@ Workers keep what they read in their read caches, and more, past a
 statement. [Erasure requests](privacy.md#workers) have every worker purge
 what they deleted: coordinators push the purge within 15 seconds, every
 task carries the last deletion its coordinator knew of, and a worker that
-was stopped meanwhile purges before it serves again. A request waits for
-the running workers, and is blocked while a worker whose read cache
-outlives it (on a disk kept when it stops) does not run and has not
-purged; an admin deregisters a worker that will not come back with
+was stopped meanwhile purges before it serves again. A worker that hears
+from no coordinator for `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (a minute)
+empties its caches by itself. A request waits for the running workers,
+and for a while for those no coordinator reaches, and is blocked while a
+worker whose read cache outlives it (on a disk kept when it stops) does
+not run and has not purged, or while a worker does not say what it
+keeps; an admin deregisters a worker that will not come back with
 `DEREGISTER WORKER`.
 
 ## Deploying workers
@@ -749,7 +752,10 @@ where partial results are kept while a statement combines them.
 
 On a worker (`igloo worker`): `IGLOO_WORKER_SECRET`,
 `IGLOO_WORKER_LISTEN_ADDR` (`:7433`), `IGLOO_WORKER_SPOT_NOTICE` (`on`; see
-[Spot workers](#spot-workers)), the server's storage settings, and
+[Spot workers](#spot-workers)), `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (`1m`,
+at least `10s`: how long it goes without hearing from any coordinator
+before it empties its caches by itself, for [erasure
+requests](privacy.md#workers)), the server's storage settings, and
 `IGLOO_DUCKDB_*`, `IGLOO_CACHE_*`, `IGLOO_HTTP_ADDR` and `IGLOO_LOG_*` as on
 the server; with local exchanges, `IGLOO_EXCHANGE_MAX_SIZE` caps what they
 may take on its disk (empty: a quarter of its free space at a time).

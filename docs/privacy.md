@@ -290,7 +290,7 @@ Igloo while a request has work to do.
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`, those of tables since replaced included; it writes them again from the files that remain. |
 | `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). Then it purges what [AI functions](ai-functions.md#the-cache) cached from the request's tables and from those history says were written from them, every answer derived from them, the person's or not, and any answer of a statement that read what Igloo could not name, such as a file; and from then on no statement that began before the purge keeps anything more, since it may have read the person's rows. This step runs after `expire`, so a statement that begins after it reads no snapshot that holds them. |
 | `models` | Trains again every [model](ml-functions.md#where-models-live) whose training read one of the request's tables, or one history says was written from them, directly, through a view or through another model's predictions; every model whose training read what Igloo could not name, such as a file; and every model created before Igloo recorded what models read. Each is trained from its `CREATE` statement, as its owner, with the search path and dialect it was created with, as `CREATE OR REPLACE` would, grants kept; oldest first, so a model trained on another's predictions is trained after it; and only if it is still the model the request read, not one its owner replaced or dropped meanwhile. First the step moves the models' erasure epoch on, once a round: a `CREATE` that read its training data before, which may have read the person's rows, stores nothing and fails, asking to be run again. Then it deletes from object storage the blobs the models had, unless a model has the same, and has every replica drop the models and methods' results it holds in memory (see `cache`), the models `ai_predict_class` and `ai_predict_value` trained among them: a statement prepared before then, which names them, fails with a message to prepare it again. A model it cannot train again, because its owner is gone or may no longer create models in its schema or read its input, or its input no longer runs, keeps the request `blocked`, with an alert naming the model and why; it goes on once the model can be trained again or is dropped. |
-| `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files or trained models again; the replica drops the models it holds in memory with it. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. It waits for every running [worker](distributed-execution.md) of distributed execution too, which coordinators have purge within 15 seconds of a deletion ([below](#workers)), and is `blocked`, with an alert naming them, while a worker whose read cache outlives it does not run and has not purged. |
+| `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files or trained models again; the replica drops the models it holds in memory with it. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. It waits for every running [worker](distributed-execution.md) of distributed execution too, which coordinators have purge within 15 seconds of a deletion ([below](#workers)), and for those no coordinator reaches until they have had time to purge by themselves; it is `blocked`, with an alert naming them, while a worker whose read cache outlives it does not run and has not purged, or a worker does not say what it keeps. |
 | `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; AI functions' cached answers derived from the tables by statements that began before the purge; the sets derived from ID domains' ids; models trained from the tables that the `models` step has not trained again, and the old blobs of those it did that object storage still has; workers whose read caches outlive them that do not run and have not purged. Anything found sends the request back to the step that removes it. |
 
 A failed run is tried again after a minute, then 2, 4 and so on up to an
@@ -686,14 +686,15 @@ REQUEST`) once what it could not erase has been erased otherwise.
 - **A replica that has yet to empty its read cache**: the request waits
   for every running replica; closing a request is refused until they
   have.
-- **A worker that does not run and whose read cache outlives it**
-  ([below](#workers)): the request is `blocked`, with an alert naming the
-  worker as `DEREGISTER WORKER` takes it. Start the worker again, which
-  purges before it serves; a blocked request looks again every hour. A
-  worker that will not come back, its disk gone, an admin deregisters
-  (`DEREGISTER WORKER 'worker/kept/...'`), and requests stop waiting for
-  it. Closing the request does not wait for it, and records it in
-  `error` (and `workers_left` in its JSON record).
+- **A worker that does not run and whose read cache outlives it, or that
+  does not say what it keeps** ([below](#workers)): the request is
+  `blocked`, with an alert naming the worker as `DEREGISTER WORKER` takes
+  it. Start the worker again, which purges before it serves, or upgrade
+  it; a blocked request goes on as soon as a coordinator finds the worker
+  purged. A worker that will not come back, its disk gone, an admin
+  deregisters (`DEREGISTER WORKER 'worker/kept/...'`), and requests stop
+  waiting for it. Closing the request does not wait for it, and records
+  it in `error` (and `workers_left` in its JSON record).
 - **A model it cannot train again** ([ML functions](ml-functions.md#where-models-live)):
   its owner is gone, or may no longer create models in its schema or read
   its input; its input no longer runs, as when a table it reads was
@@ -753,17 +754,27 @@ with requests:
   EC2 instance's EBS volume, with `IGLOO_WORKER_COMPUTE=ec2` or
   `command`), and that does not run, has not purged: the request is
   `blocked` until it starts again and purges, is deregistered, or the
-  request is closed. A worker whose cache goes with it (in memory, or on
-  a Kubernetes pod's own volume, the chart's `emptyDir`) holds nothing
-  once it is gone. Igloo cannot tell a disk wiped when its machine stops,
-  as an EC2 instance store, from one kept: such a worker counts as kept
-  until it starts again, with another cache, when the ledger forgets the
-  one it had, as it does whenever a worker comes back on the same host
+  request is closed. Igloo cannot tell a disk wiped when its machine
+  stops, as an EC2 instance store, from one kept: such a worker counts as
+  kept until it starts again, with another cache, when the ledger forgets
+  the one it had, as it does whenever a worker comes back on the same host
   with another cache.
-- A worker that does not answer while it still runs, as one cut off from
-  the coordinators, keeps what it read on its own disk until it serves
-  again, when it purges first. One that runs another version of Igloo,
-  which does not say what it keeps, is not waited for.
+- A worker that hears from no coordinator for
+  `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (a minute by default; coordinators
+  ask every worker for its status every few seconds) empties its caches
+  by itself, cancelling its tasks first, and says when in its status. So
+  a worker whose cache goes with it (in memory, or on a Kubernetes pod's
+  own volume, the chart's `emptyDir`) and that no coordinator reaches,
+  gone or cut off from them while it runs, holds nothing once that time
+  has passed: a request counts it as purged once that time, and two
+  minutes more, have passed since the request deleted files, never
+  before, and waits until then. A worker whose cache outlives it and is
+  cut off empties its cache the same way, but the request waits for it to
+  answer.
+- A worker that does not say what it keeps, as one of another version
+  of Igloo, keeps every request that deleted files from completing: the
+  request is `blocked`, with an alert naming it, until it is upgraded or
+  deregistered, or the request is closed.
 
 ## Cost
 

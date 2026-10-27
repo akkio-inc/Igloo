@@ -144,6 +144,10 @@ type Worker struct {
 	// was last purged through (see erasure.go).
 	erasureMu        sync.Mutex
 	admitted, purged atomic.Int64
+	// heard is when a coordinator last reached the worker, and alone when
+	// it last emptied its caches for having heard from none (see
+	// isolationLoop), in Unix nanoseconds.
+	heard, alone atomic.Int64
 }
 
 // NewWorker returns a worker; call Serve to accept tasks.
@@ -197,6 +201,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 		w.purged.Store(opts.Erasure.Through.UnixNano())
 		w.admitted.Store(opts.Erasure.Through.UnixNano())
 	}
+	w.hear()
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
@@ -216,6 +221,9 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 // Serve accepts coordinators' connections on ln until Shutdown.
 func (w *Worker) Serve(ln net.Listener) error {
 	go w.sweepLoop(w.stopSweep)
+	if w.opts.Erasure.Isolated > 0 {
+		go w.isolationLoop(w.stopSweep)
+	}
 	err := w.srv.ServeTLS(ln, "", "")
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -231,6 +239,7 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 }
 
 func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
+	w.hear()
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
@@ -238,7 +247,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		Cache: w.opts.Erasure.Cache, Erased: w.purged.Load(),
+		Cache: w.opts.Erasure.Cache, Erased: w.purged.Load(), Alone: w.alone.Load(),
 	})
 }
 
@@ -343,6 +352,7 @@ func (w *Worker) begin(t *runningTask) func() {
 }
 
 func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
+	w.hear()
 	defer w.activity.Begin()()
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)

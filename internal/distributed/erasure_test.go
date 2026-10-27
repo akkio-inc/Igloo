@@ -29,7 +29,7 @@ func (l *fakeLedger) LatestDeletion(context.Context) (time.Time, error) {
 	return l.latest, nil
 }
 
-func (l *fakeLedger) WorkerSeen(_ context.Context, cache, host string, _ time.Time) error {
+func (l *fakeLedger) WorkerSeen(_ context.Context, _, cache, host string, _ time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.seen == nil {
@@ -326,5 +326,46 @@ func TestPurgeCancelsOlderTasks(t *testing.T) {
 	var te *taskErr
 	if !errors.As(err, &te) || te.Erased != 5 {
 		t.Errorf("a task begun before the deletion: %v", err)
+	}
+}
+
+// TestWorkerPurgesAlone: a worker that hears from no coordinator for its
+// isolated purge time empties its caches by itself, and says when; one
+// that hears from them keeps its cache.
+func TestWorkerPurgesAlone(t *testing.T) {
+	h := newHarness(t, 0.01, 1, 1)
+	caches := withErasure(t, h)
+	erasure := h.erasure
+	h.erasure = func(i int) WorkerErasure {
+		e := erasure(i)
+		e.Isolated = 400 * time.Millisecond
+		return e
+	}
+	h.restartWorker(0)
+	ctx := context.Background()
+	addr := h.lns[0].Addr().String()
+	// Asked for its status every 100 ms, it keeps its cache.
+	caches[0].cache(t)
+	for range 15 {
+		if _, err := h.co.pool.status(ctx, addr); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if caches[0].cached() != 1 {
+		t.Fatal("a worker the coordinators reach emptied its cache")
+	}
+	// Left alone (the coordinator checks every few seconds), it empties
+	// its cache.
+	deadline := time.Now().Add(4 * time.Second)
+	for caches[0].cached() > 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	st, err := h.co.pool.status(ctx, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caches[0].cached() != 0 || st.Alone == 0 {
+		t.Errorf("%d blocks cached; status %+v", caches[0].cached(), st)
 	}
 }

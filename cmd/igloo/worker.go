@@ -74,7 +74,7 @@ func serveWorker() error {
 	if p := eng.Prefetcher(); p != nil {
 		opts.Prefetch = prefetchTasks(p)
 	}
-	if opts.Erasure, err = workerErasure(eng, &opts); err != nil {
+	if opts.Erasure, err = workerErasure(eng, &opts, cfg.Workers.IsolatedPurgeAfter); err != nil {
 		return err
 	}
 	w, err := distributed.NewWorker(opts, log)
@@ -251,8 +251,9 @@ func seedRuns(ctx context.Context, co interface{ Seed([]distributed.Run) }, stor
 // ledger, by the worker's host name and the cache's identity, kept with
 // the cache on disk; a cache on disk outlives the worker, unless on
 // Kubernetes, where it is on the pod's own volume, which goes with the pod
-// (the chart's emptyDir).
-func workerErasure(eng *engine.Engine, opts *distributed.WorkerOptions) (distributed.WorkerErasure, error) {
+// (the chart's emptyDir). Cut off from the coordinators for isolated, it
+// empties its caches by itself.
+func workerErasure(eng *engine.Engine, opts *distributed.WorkerOptions, isolated time.Duration) (distributed.WorkerErasure, error) {
 	if opts.ID == "" {
 		opts.ID, _ = os.Hostname()
 	}
@@ -265,7 +266,8 @@ func workerErasure(eng *engine.Engine, opts *distributed.WorkerOptions) (distrib
 		return distributed.WorkerErasure{}, fmt.Errorf("read what the read cache was purged of: %w", err)
 	}
 	kept := onDisk != nil && os.Getenv("KUBERNETES_SERVICE_HOST") == ""
-	e := distributed.WorkerErasure{Cache: erasure.WorkerCache(opts.ID, cache, kept), Through: through, Purge: eng.EmptyCache, Save: save}
+	e := distributed.WorkerErasure{Cache: erasure.WorkerCache(opts.ID, cache, kept, isolated), Through: through, Purge: eng.EmptyCache, Save: save,
+		Isolated: isolated}
 	if p := eng.Prefetcher(); p != nil {
 		e.Hold = p.Hold
 	}

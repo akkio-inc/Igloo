@@ -28,8 +28,8 @@ type clockLedger struct {
 	now func() time.Time
 }
 
-func (l clockLedger) WorkerSeen(ctx context.Context, cache, host string, _ time.Time) error {
-	return l.WorkerLedger.WorkerSeen(ctx, cache, host, l.now())
+func (l clockLedger) WorkerSeen(ctx context.Context, worker, cache, host string, _ time.Time) error {
+	return l.WorkerLedger.WorkerSeen(ctx, worker, cache, host, l.now())
 }
 
 // testWorker is a worker of distributed execution whose read cache is a
@@ -44,6 +44,9 @@ type testWorker struct {
 	w     *distributed.Worker
 	addr  string
 	cache string
+	// isolated is how long it goes without hearing from a coordinator
+	// before it empties its cache by itself.
+	isolated time.Duration
 }
 
 func (tw *testWorker) cacheDir() string { return filepath.Join(tw.dir, "cache") }
@@ -70,7 +73,8 @@ func (tw *testWorker) start() {
 				}
 				return os.MkdirAll(tw.cacheDir(), 0o700)
 			},
-			Save: func(at time.Time) error { return os.WriteFile(tw.mark(), []byte(at.Format(time.RFC3339Nano)), 0o600) },
+			Save:     func(at time.Time) error { return os.WriteFile(tw.mark(), []byte(at.Format(time.RFC3339Nano)), 0o600) },
+			Isolated: tw.isolated,
 		},
 	}, slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -130,20 +134,57 @@ func startWorkers(t *testing.T, f *fixture, n int) ([]*testWorker, *distributed.
 	var addrs []string
 	for i := range n {
 		name := fmt.Sprintf("worker-%d", i)
-		tw := &testWorker{t: t, name: name, dir: filepath.Join(f.dir, name), eng: f.eng, cache: WorkerCache(name, "disk:"+name, true)}
+		tw := &testWorker{t: t, name: name, dir: filepath.Join(f.dir, name), eng: f.eng, cache: WorkerCache(name, "disk:"+name, true, 0)}
 		tw.start()
 		t.Cleanup(tw.stop)
 		ws = append(ws, tw)
 		addrs = append(addrs, tw.addr)
 	}
-	co, err := distributed.NewCoordinator(distributed.Options{Secret: workerSecret, Version: "test", TempDir: filepath.Join(f.dir, "coordinator"),
+	return ws, newCoordinator(t, f, "coordinator", addrs...)
+}
+
+// newCoordinator is a coordinator of the workers at addrs.
+func newCoordinator(t *testing.T, f *fixture, name string, addrs ...string) *distributed.Coordinator {
+	t.Helper()
+	co, err := distributed.NewCoordinator(distributed.Options{Secret: workerSecret, Version: "test", TempDir: filepath.Join(f.dir, name),
 		Warehouse: f.warehouse(), Storage: distributed.NewStorage(icebergio.LocalFS{}), Pool: distributed.PoolOptions{Addresses: addrs}},
 		slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { co.Close() })
-	return ws, co
+	return co
+}
+
+// runWith runs request id as the scheduler would, with co's watch of the
+// workers before each run and the clock moved on after, until it ends or
+// is blocked; seen, if set, sees each run's request.
+func runWith(t *testing.T, f *fixture, co *distributed.Coordinator, ledger distributed.ErasureLedger, id string, seen func(*Request)) *Request {
+	t.Helper()
+	for range 16 {
+		if err := co.PurgeWorkers(f.ctx, ledger); err != nil {
+			t.Logf("purge workers: %v", err)
+		}
+		_ = f.svc.Run(f.ctx, id)
+		got, err := f.store.Get(f.ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen != nil {
+			seen(got)
+		}
+		switch got.Status {
+		case StatusCompleted, StatusBlocked, StatusFailed, StatusHeld:
+			return got
+		}
+		later := got.WaitUntil.Add(time.Minute)
+		if got.WaitUntil.IsZero() {
+			later = f.svc.now().Add(time.Minute)
+		}
+		f.svc.now = func() time.Time { return later }
+	}
+	t.Fatalf("request %s still runs", id)
+	return nil
 }
 
 // TestRequestPurgesWorkers: with real workers of distributed execution, a
@@ -238,6 +279,133 @@ func TestRequestPurgesWorkers(t *testing.T) {
 	f.completed(run())
 }
 
+// TestIsolatedWorker: a worker whose cache goes with it, that runs but that
+// no coordinator reaches, empties its cache by itself; a request counts it
+// as purged only once its isolated purge time, and a margin, have passed
+// since it deleted files, and waits for it until then.
+func TestIsolatedWorker(t *testing.T) {
+	f := newFixture(t)
+	f.people("crm.people", [][]any{ann, subject, carl})
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
+	tw := &testWorker{t: t, name: "pod-0", dir: filepath.Join(f.dir, "pod-0"), eng: f.eng, isolated: 300 * time.Millisecond}
+	tw.cache = WorkerCache(tw.name, "memory:pod-0", false, time.Second)
+	tw.start()
+	t.Cleanup(tw.stop)
+	ledger := clockLedger{NewWorkerLedger(f.store), func() time.Time { return f.svc.now() }}
+	reaching := newCoordinator(t, f, "coordinator", tw.addr)
+	if err := reaching.PurgeWorkers(f.ctx, ledger); err != nil {
+		t.Fatal(err)
+	}
+	tw.fill(filepath.Join(f.dir, "warehouse", "crm"))
+	// From now on the coordinators cannot reach it, as when its pod is cut
+	// off from them: it hears from none, and empties its cache.
+	reaching.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := ln.Addr().String()
+	ln.Close()
+	co := newCoordinator(t, f, "coordinator-2", gone)
+	deadline := time.Now().Add(10 * time.Second)
+	for tw.cached() > 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if tw.cached() != 0 {
+		t.Fatal("the worker cut off from the coordinators kept its cache")
+	}
+
+	r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	got := runWith(t, f, co, ledger, r.ID, func(r *Request) {
+		if r.Status == StatusCompleted && !r.DeletedThrough.IsZero() && f.svc.now().Before(r.DeletedThrough.Add(time.Second+isolatedMargin)) {
+			t.Errorf("completed at %s, before the worker's time to purge alone had passed since %s", f.svc.now(), r.DeletedThrough)
+		}
+		waited = waited || r.Status == StatusWaiting && r.Step == StepCache
+	})
+	f.completed(got)
+	if !waited {
+		t.Error("the request did not wait for the worker no coordinator reaches")
+	}
+}
+
+// TestUnknownWorker: a worker that does not say what it keeps, as one of
+// another version of Igloo, keeps a request from completing, which names
+// it, until it is upgraded; deregistered, it is no longer waited for.
+func TestUnknownWorker(t *testing.T) {
+	f := newFixture(t)
+	alerts := f.alerts()
+	f.people("crm.people", [][]any{ann, subject, carl})
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
+	ws, co := startWorkers(t, f, 1)
+	tw := ws[0]
+	// It runs a version of Igloo that does not say what it keeps.
+	tw.stop()
+	tw.cache = ""
+	tw.start()
+	ledger := clockLedger{NewWorkerLedger(f.store), func() time.Time { return f.svc.now() }}
+	r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := runWith(t, f, co, ledger, r.ID, nil)
+	f.blocked(got, StepCache, "worker-0 at "+tw.addr+", Igloo test, which does not say what it keeps", *alerts)
+
+	// Upgraded, it says what it keeps, and purges; the ledger forgets what
+	// it was once that has not run for a while.
+	tw.stop()
+	tw.cache = WorkerCache(tw.name, "disk:"+tw.name, true, 0)
+	tw.start()
+	later := f.svc.now().Add(liveWindow + time.Minute)
+	f.svc.now = func() time.Time { return later }
+	f.completed(runWith(t, f, co, ledger, r.ID, nil))
+
+	// Another one, deregistered.
+	tw.stop()
+	tw.cache = ""
+	tw.start()
+	r, err = f.svc.Submit(f.ctx, "privacy", []Wanted{{Tag: "pii", Value: "email", Identifiers: []string{"carl@other.com"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runWith(t, f, co, ledger, r.ID, nil); got.Status != StatusBlocked {
+		t.Fatalf("status %s at %s: %q", got.Status, got.Step, got.Error)
+	}
+	tw.stop()
+	if err := f.svc.DeregisterWorker(f.ctx, unknownWorker("worker-0")); err != nil {
+		t.Fatal(err)
+	}
+	f.completed(runWith(t, f, co, ledger, r.ID, nil))
+}
+
+// TestWorkerLedgerPurged: the ledger tells when a worker is purged of more
+// than it was, and only then.
+func TestWorkerLedgerPurged(t *testing.T) {
+	ctx := context.Background()
+	l := NewWorkerLedger(NewMemoryStore())
+	n := 0
+	l.Purged = func() { n++ }
+	c := WorkerCache("w1", "disk:a", true, 0)
+	if err := l.WorkerSeen(ctx, "w1", c, "host", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now()
+	for range 2 {
+		if err := l.Emptied(ctx, c, at, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Emptied(ctx, c, at.Add(time.Second), ""); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("told %d times", n)
+	}
+}
+
 // TestWorkerLedger: a worker that comes back with another cache leaves the
 // one it had, once that is not running; caches that go with their workers
 // leave the ledger a day after; a live worker's cache, of the same name
@@ -247,20 +415,21 @@ func TestWorkerLedger(t *testing.T) {
 	store := NewMemoryStore()
 	l := NewWorkerLedger(store)
 	now := time.Now()
-	old := WorkerCache("w1", "disk:a", true)
-	gone := WorkerCache("w2", "memory:b", false)
-	other := WorkerCache("w3", "disk:c", true)
+	old := WorkerCache("w1", "disk:a", true, 0)
+	gone := WorkerCache("w2", "memory:b", false, time.Minute)
+	other := WorkerCache("w3", "disk:c", true, 0)
 	for _, c := range []string{old, gone, other} {
-		if err := l.WorkerSeen(ctx, c, "host", now.Add(-48*time.Hour)); err != nil {
+		w, _ := parseWorkerCache(c)
+		if err := l.WorkerSeen(ctx, w.worker, c, "host", now.Add(-48*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// A replica's cache is not a worker's.
-	if err := l.WorkerSeen(ctx, MemoryCache+"r", "host", now); err == nil {
+	if err := l.WorkerSeen(ctx, "r", MemoryCache+"r", "host", now); err == nil {
 		t.Error("a replica's cache recorded as a worker's")
 	}
-	newer := WorkerCache("w1", "disk:d", true)
-	if err := l.WorkerSeen(ctx, newer, "host", now); err != nil {
+	newer := WorkerCache("w1", "disk:d", true, 0)
+	if err := l.WorkerSeen(ctx, "w1", newer, "host", now); err != nil {
 		t.Fatal(err)
 	}
 	caches, _ := store.Caches(ctx)
@@ -272,8 +441,8 @@ func TestWorkerLedger(t *testing.T) {
 		t.Errorf("ledger %q", ids)
 	}
 	// Two running workers of one name keep both.
-	twin := WorkerCache("w1", "disk:e", true)
-	if err := l.WorkerSeen(ctx, twin, "host", now.Add(time.Second)); err != nil {
+	twin := WorkerCache("w1", "disk:e", true, 0)
+	if err := l.WorkerSeen(ctx, "w1", twin, "host", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if caches, _ := store.Caches(ctx); len(caches) != 3 {
@@ -289,10 +458,11 @@ func TestWorkersLeftOnClose(t *testing.T) {
 	f.people("crm.people", [][]any{ann, subject, carl})
 	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
 	l := NewWorkerLedger(f.store)
-	kept := WorkerCache("w1", "disk:a", true)
-	ephemeral := WorkerCache("w2", "memory:b", false)
+	kept := WorkerCache("w1", "disk:a", true, 0)
+	ephemeral := WorkerCache("w2", "memory:b", false, time.Minute)
 	for _, c := range []string{kept, ephemeral} {
-		if err := l.WorkerSeen(f.ctx, c, c+" host", time.Now().Add(-time.Hour)); err != nil {
+		w, _ := parseWorkerCache(c)
+		if err := l.WorkerSeen(f.ctx, w.worker, c, c+" host", time.Now().Add(-time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 	}

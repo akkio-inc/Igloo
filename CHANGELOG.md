@@ -1217,9 +1217,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   on the coordinator). A purge cancels the tasks it would otherwise race,
   and holds the prefetcher, before it empties the cache. A request waits
   for running workers, and is blocked, with an alert naming them, while a
-  worker whose read cache outlives it does not run and has not purged;
-  `DEREGISTER WORKER` forgets one that will not come back, and closing a
-  request records those it leaves.
+  worker whose read cache outlives it does not run and has not purged, or
+  a worker does not say what it keeps; `DEREGISTER WORKER` forgets one
+  that will not come back, and closing a request records those it leaves.
+  A worker that hears from no coordinator for
+  `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (a minute) empties its caches by
+  itself, which a request waits for, from when it deleted files, before
+  it counts a worker no coordinator reaches as purged; a worker found
+  purged has the requests blocked for it go on at once.
 - Data retention for tables that hold personal data (`ALTER TABLE ... SET
   (data_retention_days = N)`, at least a day, `igloo.data_retention`): table
   maintenance keeps no older snapshot, whatever else the table keeps, but

@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,6 +44,11 @@ import (
 //     waits for them to end, holds the prefetcher, and only then empties
 //     the read cache and the rest: nothing written from before the deletion
 //     comes back after.
+//   - A worker that hears from no coordinator for WorkerErasure.Isolated
+//     (their checks come every few seconds) empties its caches by itself,
+//     cancelling its tasks, whose coordinators cannot reach it either: one
+//     cut off from them while a request ran holds nothing a little later,
+//     which requests count on for workers whose caches go with them.
 
 // erasureEvery is how often a coordinator keeps the workers up with
 // erasure requests, as replicas look for deletions (erasure.Purger).
@@ -70,7 +76,15 @@ type WorkerErasure struct {
 	// Hold, if set, runs fn while nothing writes into the read cache ahead
 	// of DuckDB (prefetch.Prefetcher.Hold).
 	Hold func(fn func() error) error
+	// Isolated, if not zero, is how long the worker goes without hearing
+	// from any coordinator before it empties its caches by itself
+	// (IGLOO_WORKER_ISOLATED_PURGE_AFTER).
+	Isolated time.Duration
 }
+
+// errIsolated is what a worker that heard from no coordinator for a while
+// cancels its tasks with, before it empties its caches.
+var errIsolated = errors.New("the worker heard from no coordinator for a while, and emptied its caches")
 
 // errErased is what a purge cancels the tasks of statements that began
 // before the deletion with.
@@ -124,6 +138,23 @@ func (w *Worker) purgeLocked(ctx context.Context, through int64) error {
 			return ctx.Err()
 		}
 	}
+	if err := w.empty(ctx); err != nil {
+		return err
+	}
+	e := w.opts.Erasure
+	if e.Save != nil {
+		if err := e.Save(time.Unix(0, target)); err != nil {
+			return fmt.Errorf("keep what the read cache was purged of: %w", err)
+		}
+	}
+	w.purged.Store(target)
+	w.log.Info("purged what erasure requests deleted", "through", time.Unix(0, target).UTC(), "canceled_tasks", len(old))
+	return nil
+}
+
+// empty empties the read cache, with the prefetcher held, the models and
+// results in memory, footers and exchange files.
+func (w *Worker) empty(ctx context.Context) error {
 	e := w.opts.Erasure
 	empty := func() error {
 		if e.Purge != nil {
@@ -139,22 +170,68 @@ func (w *Worker) purgeLocked(ctx context.Context, through int64) error {
 		}
 		return clearDir(w.fetchRoot)
 	}
-	var err error
 	if e.Hold != nil {
-		err = e.Hold(empty)
-	} else {
-		err = empty()
+		return e.Hold(empty)
 	}
-	if err != nil {
-		return err
-	}
-	if e.Save != nil {
-		if err := e.Save(time.Unix(0, target)); err != nil {
-			return fmt.Errorf("keep what the read cache was purged of: %w", err)
+	return empty()
+}
+
+// hear records that a coordinator reached the worker (see isolationLoop).
+func (w *Worker) hear() { w.heard.Store(time.Now().UnixNano()) }
+
+// isolationLoop empties the worker's caches once it has heard from no
+// coordinator for Erasure.Isolated, once each time, until stop is closed.
+func (w *Worker) isolationLoop(stop <-chan struct{}) {
+	after := w.opts.Erasure.Isolated
+	t := time.NewTicker(min(after/4, 5*time.Second))
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		heard := w.heard.Load()
+		if time.Since(time.Unix(0, heard)) < after || w.alone.Load() >= heard {
+			continue
+		}
+		if err := w.purgeAlone(); err != nil {
+			w.log.Warn("could not empty the worker's caches while it heard from no coordinator; it tries again", "err", err)
 		}
 	}
-	w.purged.Store(target)
-	w.log.Info("purged what erasure requests deleted", "through", time.Unix(0, target).UTC(), "canceled_tasks", len(old))
+}
+
+// purgeAlone cancels every task, waits for them to end, and empties the
+// caches, as a worker cut off from the coordinators does.
+func (w *Worker) purgeAlone() error {
+	ctx := context.Background()
+	w.erasureMu.Lock()
+	defer w.erasureMu.Unlock()
+	at := time.Now().UnixNano()
+	w.runningMu.Lock()
+	var running []*runningTask
+	for t := range w.running {
+		running = append(running, t)
+	}
+	w.runningMu.Unlock()
+	for _, t := range running {
+		t.cancel(errIsolated)
+	}
+	wait := time.NewTimer(purgeTasksWait)
+	defer wait.Stop()
+	for _, t := range running {
+		select {
+		case <-t.done:
+		case <-wait.C:
+			return fmt.Errorf("a task canceled for the purge, of statement %s, did not end within %s", t.query, purgeTasksWait)
+		}
+	}
+	if err := w.empty(ctx); err != nil {
+		return err
+	}
+	w.alone.Store(at)
+	w.log.Warn("heard from no coordinator for a while: emptied the worker's caches, as erasure requests that cannot reach it count on",
+		"after", w.opts.Erasure.Isolated, "canceled_tasks", len(running))
 	return nil
 }
 
@@ -184,6 +261,7 @@ func (l *localExchanges) clear() error {
 // servePurge purges the worker through the request's Through, if it is
 // purged through less, and answers with its status.
 func (w *Worker) servePurge(rw http.ResponseWriter, r *http.Request) {
+	w.hear()
 	var req purgeRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		http.Error(rw, "bad purge: "+err.Error(), http.StatusBadRequest)
@@ -219,9 +297,10 @@ func (co *Coordinator) noteErased(n int64) {
 type ErasureLedger interface {
 	// LatestDeletion is when any request last deleted files.
 	LatestDeletion(ctx context.Context) (time.Time, error)
-	// WorkerSeen records that a worker that keeps cache (WorkerErasure.
-	// Cache) answered, at host.
-	WorkerSeen(ctx context.Context, cache, host string, at time.Time) error
+	// WorkerSeen records that worker answered, at host, and that it keeps
+	// cache (WorkerErasure.Cache), or does not say what it keeps when
+	// cache is empty, as a worker of another version of Igloo.
+	WorkerSeen(ctx context.Context, worker, cache, host string, at time.Time) error
 	// Emptied records that cache was purged of what requests deleted
 	// through through.
 	Emptied(ctx context.Context, cache string, through time.Time, token string) error
@@ -249,7 +328,8 @@ func (co *Coordinator) WatchErasures(ctx context.Context, ledger ErasureLedger) 
 // worker that answers and was purged through less purge, whatever version
 // of Igloo it runs; and records in ledger every worker that answered, and
 // those purged through the latest deletion. A worker that does not say
-// what it keeps (another version of Igloo) is left out.
+// what it keeps (another version of Igloo) is recorded as such, and
+// requests do not complete while it is there.
 func (co *Coordinator) PurgeWorkers(ctx context.Context, ledger ErasureLedger) error {
 	latest, err := ledger.LatestDeletion(ctx)
 	if err != nil {
@@ -266,7 +346,9 @@ func (co *Coordinator) PurgeWorkers(ctx context.Context, ledger ErasureLedger) e
 	for i, w := range ws {
 		wg.Go(func() {
 			st := w.status
+			name := cmp.Or(st.ID, w.addr)
 			if st.Cache == "" {
+				errs[i] = ledger.WorkerSeen(ctx, name, "", name+" at "+w.addr+", Igloo "+st.Version, time.Now())
 				return
 			}
 			if through > st.Erased {
@@ -277,7 +359,7 @@ func (co *Coordinator) PurgeWorkers(ctx context.Context, ledger ErasureLedger) e
 					st = purged
 				}
 			}
-			if err := ledger.WorkerSeen(ctx, st.Cache, st.ID+" at "+w.addr, time.Now()); err != nil {
+			if err := ledger.WorkerSeen(ctx, name, st.Cache, name+" at "+w.addr, time.Now()); err != nil {
 				errs[i] = errors.Join(errs[i], err)
 				return
 			}

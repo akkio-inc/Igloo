@@ -54,6 +54,11 @@ type Workers struct {
 	// taking the instance back, and then finish its tasks and take no more
 	// (IGLOO_WORKER_SPOT_NOTICE, on by default).
 	SpotNotice bool
+	// IsolatedPurgeAfter is how long a worker goes without hearing from any
+	// coordinator before it empties its caches by itself, for erasure
+	// requests that cannot reach it (IGLOO_WORKER_ISOLATED_PURGE_AFTER, a
+	// minute by default).
+	IsolatedPurgeAfter time.Duration
 }
 
 // WorkerPort is the port workers listen on unless told otherwise.
@@ -141,6 +146,11 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		w.IdleAfter = duration("IGLOO_WORKER_IDLE_AFTER", "10m")
 	}
 	w.StartTimeout = duration("IGLOO_WORKER_START_TIMEOUT", "3m")
+	w.IsolatedPurgeAfter = duration("IGLOO_WORKER_ISOLATED_PURGE_AFTER", "1m")
+	if w.IsolatedPurgeAfter > 0 && w.IsolatedPurgeAfter < 10*time.Second {
+		addErr("IGLOO_WORKER_ISOLATED_PURGE_AFTER must be at least 10s: coordinators check workers every few seconds, got %s",
+			w.IsolatedPurgeAfter)
+	}
 	w.Threshold = duration("IGLOO_WORKER_THRESHOLD", "1m")
 
 	if len(w.Addresses) == 0 {

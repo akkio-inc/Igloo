@@ -578,6 +578,19 @@ func TestWorkerIdleAfter(t *testing.T) {
 	}
 }
 
+func TestWorkerIsolatedPurgeAfter(t *testing.T) {
+	for v, want := range map[string]time.Duration{"": time.Minute, "30s": 30 * time.Second, "5s": 0, "nope": 0} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_ISOLATED_PURGE_AFTER"] = v
+		}
+		cfg, err := Load(env(m))
+		if want == 0 && err == nil || want != 0 && (err != nil || cfg.Workers.IsolatedPurgeAfter != want) {
+			t.Errorf("IGLOO_WORKER_ISOLATED_PURGE_AFTER=%q: %v %v, want %v", v, cfg.Workers.IsolatedPurgeAfter, err, want)
+		}
+	}
+}
+
 func TestResultCacheSize(t *testing.T) {
 	for v, want := range map[string]int64{"": 256 << 20, "0": 0, "off": 0, "1GB": 1e9, "64MiB": 64 << 20} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
