@@ -158,6 +158,14 @@ Ways to spend less:
 - With instance store, `node_disk_size_gib = 30` saves about $19: the root
   volume then holds only the operating system.
 - Keep `db_multi_az = false` (the default) unless you need a database standby.
+- For what runs around the clock, the nodes of a pool that does not scale to
+  zero and the RDS database, a one- or three-year commitment lowers the
+  price: a [Compute Savings Plan](https://aws.amazon.com/savingsplans/compute-pricing/)
+  (any instance type, region and size; AWS quotes up to 66% off) or an EC2
+  Instance Savings Plan (one instance family in one region, up to 72% off)
+  for the nodes, and an RDS reserved instance for the database. Commit to
+  the steady part only, the replicas that always run, and leave what
+  scales with load, workers and burst nodes, on-demand or Spot.
 
 Why these defaults: DuckDB's speed depends mostly on memory, so the nodes are
 memory-optimized Graviton instances, which cost less than x86 for the same

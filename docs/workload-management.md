@@ -327,3 +327,25 @@ On one machine, pools share its CPU and memory; give each a memory limit
 (`IGLOO_DUCKDB_MEMORY_LIMIT`) and threads (`IGLOO_DUCKDB_THREADS`) so that
 together they fit. Pools on separate machines, each with its own
 [scale-to-zero gateway](scale-to-zero.md), are isolated like the Helm ones.
+
+### Sizing a pool
+
+Machines are billed by the second, so a statement costs its work times
+the machine's price whatever the machine's size, as long as it uses the
+cores; a larger machine finishes the same work sooner and can stop sooner.
+What a larger machine changes is what does not fit: statements that spill
+to disk on a small one take many times their work. Size each pool to the
+heaviest work it gets at once, not to its average:
+
+| Pool's work | Machine | Why |
+| --- | --- | --- |
+| Dashboards: many statements of seconds each, together | Many cores, 4 GB a core or more, local NVMe (`m7gd`) | A dashboard's statements run at once; on too few cores they wait for each other's memory |
+| dbt and other large transformations | Memory first (`r7gd`) | Joins and sorts of whole tables spill less |
+| Ad hoc analysis, a few users | Small (`m7gd.xlarge` to `2xlarge`) with [scale to zero](scale-to-zero.md) | Idle most of the day |
+
+A dashboard's burst of queries over billions of rows, all at once, took 300 to
+310 s on 8 cores and 32 GB (`m7gd.2xlarge`, $0.43 an hour: $0.04 a run)
+and 138 s on 32 cores and 128 GB (`m7gd.8xlarge`, $1.71 an hour: $0.07),
+against 171 s on a Snowflake X-Small warehouse ($0.10 to $0.14 a run at $2
+to $3 a credit). With [scale to zero](scale-to-zero.md) the larger
+machine's idle time is what its suspend setting keeps it up for.
