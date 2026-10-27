@@ -233,6 +233,11 @@ func (s *PostgresStore) Claim(ctx context.Context, cache, holder string, ttl tim
 	return err == nil, token, err
 }
 
+func (s *PostgresStore) ForgetCache(ctx context.Context, cache string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM igloo_erasure.caches WHERE cache_id = $1`, cache)
+	return err
+}
+
 func (s *PostgresStore) Release(ctx context.Context, cache, holder string) error {
 	_, err := s.pool.Exec(ctx, `UPDATE igloo_erasure.caches SET claim_holder = NULL, claim_until = NULL
 		WHERE cache_id = $1 AND claim_holder = $2`, cache, holder)
@@ -419,6 +424,14 @@ func (m *MemoryStore) Claim(_ context.Context, cache, holder string, ttl time.Du
 		m.caches[cache] = c
 	}
 	return true, c.Token, nil
+}
+
+func (m *MemoryStore) ForgetCache(_ context.Context, cache string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.caches, cache)
+	delete(m.claims, cache)
+	return nil
 }
 
 func (m *MemoryStore) Release(_ context.Context, cache, holder string) error {

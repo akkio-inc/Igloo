@@ -26,13 +26,16 @@ import (
 //	CANCEL ERASURE REQUEST 'id'
 //	CONFIRM ERASURE REQUEST 'id'
 //	CLOSE ERASURE REQUEST 'id'
+//	DEREGISTER WORKER 'name'
 //	ALTER TABLE [IF EXISTS] name SET (data_retention_days = n)
 //	ALTER TABLE [IF EXISTS] name RESET (data_retention_days)
 //
 // Admins may run them, and users granted ERASE ON ACCOUNT, directly or
 // through a role: privacy officers, who may set data retentions only of
 // tables with tags. CLOSE ERASURE REQUEST, the last resort for a blocked
-// request, is for admins only. The identifiers in ERASE SUBJECT never
+// request, is for admins only, as is DEREGISTER WORKER, which has requests
+// stop waiting for a worker of distributed execution that will not come
+// back to purge its read cache (erasure.Service.DeregisterWorker). The identifiers in ERASE SUBJECT never
 // reach the history, the logs or the list of running statements.
 
 // erasureCmd is a parsed erasure or retention statement.
@@ -55,6 +58,7 @@ const (
 	tagCancelErase  = "CANCEL ERASURE REQUEST"
 	tagConfirmErase = "CONFIRM ERASURE REQUEST"
 	tagCloseErase   = "CLOSE ERASURE REQUEST"
+	tagDeregister   = "DEREGISTER WORKER"
 	tagRetention    = "ALTER TABLE"
 )
 
@@ -138,6 +142,14 @@ func parseErasureCommand(query string) (c erasureCmd, ok bool, err error) {
 		lit, ok := sc.literal()
 		if !ok || lit == nil || !sc.done() {
 			return syntax("expected %s 'request id'", c.tag)
+		}
+		c.id = *lit
+		return c, true, nil
+	case sc.keywords("DEREGISTER", "WORKER"):
+		c.tag = tagDeregister
+		lit, ok := sc.literal()
+		if !ok || lit == nil || !sc.done() {
+			return syntax("expected DEREGISTER WORKER 'name', as a blocked erasure request names the worker")
 		}
 		c.id = *lit
 		return c, true, nil
@@ -338,6 +350,21 @@ func (s *Server) runErasureCommand(ctx context.Context, sess *session, user auth
 			return pgerror.WithCode(fmt.Errorf("permission denied: %s requires the admin role", c.tag), codes.InsufficientPrivilege)
 		}
 		r, err = s.erasure.Close(ctx, c.id, user.Name)
+	case c.tag == tagDeregister:
+		// Requests stop waiting for the worker's cache, which only an
+		// admin, who knows it is gone, decides.
+		if user.Role != auth.RoleAdmin {
+			return pgerror.WithCode(fmt.Errorf("permission denied: %s requires the admin role", c.tag), codes.InsufficientPrivilege)
+		}
+		switch err := s.erasure.DeregisterWorker(ctx, c.id); {
+		case errors.Is(err, erasure.ErrInvalid):
+			return pgerror.WithCode(err, codes.InvalidParameterValue)
+		case errors.Is(err, erasure.ErrNotFound):
+			return pgerror.WithCode(fmt.Errorf("no worker %s is registered", c.id), codes.UndefinedObject)
+		case err != nil:
+			return err
+		}
+		return w.Complete(c.tag)
 	default:
 		r, err = s.erasure.Submit(ctx, user.Name, c.wanted)
 	}

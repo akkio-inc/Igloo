@@ -159,13 +159,16 @@ type Request struct {
 	// they had, which it deletes. ModelsFailed are the models it could not
 	// train again, with why; ModelsLeft, once it was closed, those that may
 	// still hold what they learned of the person.
-	ModelEpoch      int64         `json:"model_epoch,omitempty"`
-	ModelsRetrained int           `json:"models_retrained,omitempty"`
-	ModelBlobs      []string      `json:"model_blobs,omitempty"`
-	ModelsFailed    []string      `json:"models_failed,omitempty"`
-	ModelsLeft      []string      `json:"models_left,omitempty"`
-	Steps           []StepRecord  `json:"steps"`
-	Verification    *Verification `json:"verification,omitempty"`
+	ModelEpoch      int64    `json:"model_epoch,omitempty"`
+	ModelsRetrained int      `json:"models_retrained,omitempty"`
+	ModelBlobs      []string `json:"model_blobs,omitempty"`
+	ModelsFailed    []string `json:"models_failed,omitempty"`
+	ModelsLeft      []string `json:"models_left,omitempty"`
+	// WorkersLeft are, once it was closed, the workers of distributed
+	// execution that had not purged what it deleted (see workersLeft).
+	WorkersLeft  []string      `json:"workers_left,omitempty"`
+	Steps        []StepRecord  `json:"steps"`
+	Verification *Verification `json:"verification,omitempty"`
 	// Error is why the last run failed, while Status is retrying or
 	// failed, or what it waits for.
 	Error    string `json:"error,omitempty"`
@@ -364,6 +367,10 @@ type Verification struct {
 	// IDSets are derived sets of ids, such as bitmap indexes' bitmaps,
 	// that still hold an id the request erased (see IDSets).
 	IDSets int64 `json:"id_sets"`
+	// Workers are workers of distributed execution whose read caches
+	// outlive them, not running now, that have not purged what the request
+	// deleted (see workersLeft).
+	Workers int `json:"workers"`
 }
 
 // File is a file a request deletes once nothing references it.
@@ -420,6 +427,9 @@ type Store interface {
 	Claim(ctx context.Context, cache, holder string, ttl time.Duration) (ok bool, token string, err error)
 	// Release lets holder's claim on cache go.
 	Release(ctx context.Context, cache, holder string) error
+	// ForgetCache removes cache from the ledger, as a worker's that will
+	// not come back (see Service.DeregisterWorker).
+	ForgetCache(ctx context.Context, cache string) error
 	// LatestDeletion is when any request last deleted files.
 	LatestDeletion(ctx context.Context) (time.Time, error)
 	Close()

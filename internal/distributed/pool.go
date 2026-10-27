@@ -1,10 +1,12 @@
 package distributed
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -185,9 +187,8 @@ func (p *pool) markDown(addr string) {
 	p.mu.Unlock()
 }
 
-// refresh resolves the worker addresses and asks every worker for its
-// status. Workers of another Igloo version are left out.
-func (p *pool) refresh(ctx context.Context) []*worker {
+// addresses resolves the worker addresses.
+func (p *pool) addresses(ctx context.Context) []string {
 	var addrs []string
 	for _, a := range p.opts.Addresses {
 		host, port, err := net.SplitHostPort(a)
@@ -205,8 +206,13 @@ func (p *pool) refresh(ctx context.Context) []*worker {
 		}
 	}
 	slices.Sort(addrs)
-	addrs = slices.Compact(addrs)
+	return slices.Compact(addrs)
+}
 
+// answering asks every worker the addresses resolve to for its status,
+// and returns those that answered, whatever version of Igloo they run.
+func (p *pool) answering(ctx context.Context) []*worker {
+	addrs := p.addresses(ctx)
 	results := make([]*worker, len(addrs))
 	var wg sync.WaitGroup
 	for i, addr := range addrs {
@@ -214,10 +220,6 @@ func (p *pool) refresh(ctx context.Context) []*worker {
 			st, err := p.status(ctx, addr)
 			if err != nil {
 				p.log.Debug("worker did not answer", "addr", addr, "err", err)
-				return
-			}
-			if st.Version != p.version {
-				p.log.Warn("worker runs another version of Igloo; not using it", "addr", addr, "worker", st.Version, "coordinator", p.version)
 				return
 			}
 			results[i] = &worker{addr: addr, status: st}
@@ -229,6 +231,20 @@ func (p *pool) refresh(ctx context.Context) []*worker {
 		if w != nil {
 			ws = append(ws, w)
 		}
+	}
+	return ws
+}
+
+// refresh resolves the worker addresses and asks every worker for its
+// status. Workers of another Igloo version are left out.
+func (p *pool) refresh(ctx context.Context) []*worker {
+	var ws []*worker
+	for _, w := range p.answering(ctx) {
+		if w.status.Version != p.version {
+			p.log.Warn("worker runs another version of Igloo; not using it", "addr", w.addr, "worker", w.status.Version, "coordinator", p.version)
+			continue
+		}
+		ws = append(ws, w)
 	}
 	p.mu.Lock()
 	p.workers, p.refreshed = ws, time.Now()
@@ -255,6 +271,38 @@ func (p *pool) status(ctx context.Context, addr string) (workerStatus, error) {
 	defer resp.Body.Close() //nolint:errcheck
 	if resp.StatusCode != http.StatusOK {
 		return st, fmt.Errorf("status %s", resp.Status)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	return st, err
+}
+
+// purgeTimeout bounds a purge: the worker waits for the tasks it cancels,
+// then empties its read cache.
+const purgeTimeout = 5 * time.Minute
+
+// purge has the worker at addr purge what erasure requests deleted
+// through through (see erasure.go), and returns its status after.
+func (p *pool) purge(ctx context.Context, addr string, through int64) (workerStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, purgeTimeout)
+	defer cancel()
+	var st workerStatus
+	body, err := json.Marshal(purgeRequest{Through: through})
+	if err != nil {
+		return st, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+addr+purgePath, bytes.NewReader(body))
+	if err != nil {
+		return st, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return st, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return st, fmt.Errorf("worker answered %s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
 	err = json.NewDecoder(resp.Body).Decode(&st)
 	return st, err

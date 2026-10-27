@@ -1207,6 +1207,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   model that cannot be trained again keeps the request blocked, with an
   alert, until it can, is dropped, or an admin closes the request, which
   records it as left.
+- Erasure requests purge distributed execution's workers: their read
+  caches, with what the prefetcher read ahead, footers, models and
+  exchange files on their disks. Coordinators record every worker that
+  answers in the requests' ledger and push purges within 15 seconds;
+  every task carries the last deletion its coordinator knew of, so a
+  worker stopped or cut off meanwhile purges before it serves again, and
+  refuses statements that began before a deletion it purged (they run
+  on the coordinator). A purge cancels the tasks it would otherwise race,
+  and holds the prefetcher, before it empties the cache. A request waits
+  for running workers, and is blocked, with an alert naming them, while a
+  worker whose read cache outlives it does not run and has not purged;
+  `DEREGISTER WORKER` forgets one that will not come back, and closing a
+  request records those it leaves.
 - Data retention for tables that hold personal data (`ALTER TABLE ... SET
   (data_retention_days = N)`, at least a day, `igloo.data_retention`): table
   maintenance keeps no older snapshot, whatever else the table keeps, but

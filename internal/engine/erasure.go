@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 
@@ -187,6 +188,38 @@ func (e *Engine) CacheIdentity() (id, token string, save func(id, token string) 
 	}
 	id, token = "disk:"+random, "t:"+hex.EncodeToString(t[:])
 	return id, token, save, save(id, token)
+}
+
+// erasureMarkFile keeps, beside a worker's read cache on disk, the latest
+// deletion of erasure requests the cache was purged of (see ErasureMark).
+const erasureMarkFile = "erased-through"
+
+// ErasureMark returns, for a worker with a read cache on disk, the latest
+// deletion of erasure requests its cache was purged of, as kept beside the
+// cache, so that it outlives the worker as the cache does, and what keeps
+// a new one (see package distributed's erasure.go). Without a cache on
+// disk, or with a mark that cannot be read, it is zero, so the worker
+// purges before its first task; save is nil without a cache on disk.
+func (e *Engine) ErasureMark() (through time.Time, save func(time.Time) error, err error) {
+	if e.cache == nil {
+		return time.Time{}, nil, nil
+	}
+	file := filepath.Join(filepath.Dir(e.cache.dir), erasureMarkFile)
+	save = func(t time.Time) error {
+		tmp := file + ".new"
+		if err := os.WriteFile(tmp, []byte(t.UTC().Format(time.RFC3339Nano)+"\n"), 0o640); err != nil {
+			return err
+		}
+		return os.Rename(tmp, file)
+	}
+	b, err := os.ReadFile(file)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return time.Time{}, nil, err
+	}
+	if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b))); err == nil {
+		through = t
+	}
+	return through, save, nil
 }
 
 // machineID tells this machine from others, as the cache's ID file named

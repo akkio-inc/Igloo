@@ -196,8 +196,11 @@ type execution struct {
 	variables []variable
 	// local says workers write exchanges to their own disks (see localFor).
 	local bool
-	force bool
-	sp    *spool
+	// erased is the latest deletion of erasure requests the coordinator
+	// knew of when the statement began, which its tasks carry.
+	erased int64
+	force  bool
+	sp     *spool
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
@@ -463,7 +466,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	for i := range tasks {
-		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings}
+		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
 		// bytes are what it reads of a table's share, reads all it reads.
 		var bytes int64
 		reads := wholeBytes

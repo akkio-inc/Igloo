@@ -626,6 +626,18 @@ object storage there. The default stays `object`.
   reason. Set `IGLOO_LOG_LEVEL=debug` to log why each statement ran where it
   did.
 
+## Erasure requests
+
+Workers keep what they read in their read caches, and more, past a
+statement. [Erasure requests](privacy.md#workers) have every worker purge
+what they deleted: coordinators push the purge within 15 seconds, every
+task carries the last deletion its coordinator knew of, and a worker that
+was stopped meanwhile purges before it serves again. A request waits for
+the running workers, and is blocked while a worker whose read cache
+outlives it (on a disk kept when it stops) does not run and has not
+purged; an admin deregisters a worker that will not come back with
+`DEREGISTER WORKER`.
+
 ## Deploying workers
 
 Workers are the same image as Igloo, started with `igloo worker`. They need

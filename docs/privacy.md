@@ -39,7 +39,11 @@ of such files that are less than 3 days old, [below](#what-is-left-of-dropped-ta
 what Delta Sharing recipients
 and engines reading through Igloo's Iceberg REST catalog can reach; the
 read cache of every running replica (a stopped one empties its own when
-it next starts, see [Known limitations](#known-limitations)); the
+it next starts, see [Known limitations](#known-limitations)); what every
+[worker](distributed-execution.md) of distributed execution keeps of what
+it read, its read cache, footers, models and exchange files (a worker
+purges before it serves again, and one whose cache outlives it that does
+not run keeps the request from completing until it has); the
 answers [AI functions](ai-functions.md#the-cache) cached from those tables;
 the [models](ml-functions.md#where-models-live) trained from them, which it
 trains again, and their old blobs; and the query, login, load and task
@@ -225,6 +229,7 @@ ERASE SUBJECT WHERE tag.value = 'identifier' [OR tag.value IN ('identifier', ...
 CONFIRM ERASURE REQUEST 'request_id'
 CANCEL ERASURE REQUEST 'request_id'
 CLOSE ERASURE REQUEST 'request_id'   -- admins only: the last resort for a blocked request
+DEREGISTER WORKER 'name'             -- admins only: stop waiting for a worker that will not come back
 ```
 
 A request takes up to 1,000 identifiers, of one or more tag values; send a
@@ -285,8 +290,8 @@ Igloo while a request has work to do.
 | `sharing` | Deletes the Delta Sharing copies of data files that hold matching rows, which Delta Sharing keeps under the warehouse's `.igloo/sharing/`, those of tables since replaced included; it writes them again from the files that remain. |
 | `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). Then it purges what [AI functions](ai-functions.md#the-cache) cached from the request's tables and from those history says were written from them, every answer derived from them, the person's or not, and any answer of a statement that read what Igloo could not name, such as a file; and from then on no statement that began before the purge keeps anything more, since it may have read the person's rows. This step runs after `expire`, so a statement that begins after it reads no snapshot that holds them. |
 | `models` | Trains again every [model](ml-functions.md#where-models-live) whose training read one of the request's tables, or one history says was written from them, directly, through a view or through another model's predictions; every model whose training read what Igloo could not name, such as a file; and every model created before Igloo recorded what models read. Each is trained from its `CREATE` statement, as its owner, with the search path and dialect it was created with, as `CREATE OR REPLACE` would, grants kept; oldest first, so a model trained on another's predictions is trained after it; and only if it is still the model the request read, not one its owner replaced or dropped meanwhile. First the step moves the models' erasure epoch on, once a round: a `CREATE` that read its training data before, which may have read the person's rows, stores nothing and fails, asking to be run again. Then it deletes from object storage the blobs the models had, unless a model has the same, and has every replica drop the models and methods' results it holds in memory (see `cache`), the models `ai_predict_class` and `ai_predict_value` trained among them: a statement prepared before then, which names them, fails with a message to prepare it again. A model it cannot train again, because its owner is gone or may no longer create models in its schema or read its input, or its input no longer runs, keeps the request `blocked`, with an alert naming the model and why; it goes on once the model can be trained again or is dropped. |
-| `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files or trained models again; the replica drops the models it holds in memory with it. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. |
-| `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; AI functions' cached answers derived from the tables by statements that began before the purge; the sets derived from ID domains' ids; models trained from the tables that the `models` step has not trained again, and the old blobs of those it did that object storage still has. Anything found sends the request back to the step that removes it. |
+| `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files or trained models again; the replica drops the models it holds in memory with it. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. It waits for every running [worker](distributed-execution.md) of distributed execution too, which coordinators have purge within 15 seconds of a deletion ([below](#workers)), and is `blocked`, with an alert naming them, while a worker whose read cache outlives it does not run and has not purged. |
+| `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; AI functions' cached answers derived from the tables by statements that began before the purge; the sets derived from ID domains' ids; models trained from the tables that the `models` step has not trained again, and the old blobs of those it did that object storage still has; workers whose read caches outlive them that do not run and have not purged. Anything found sends the request back to the step that removes it. |
 
 A failed run is tried again after a minute, then 2, 4 and so on up to an
 hour. Before its first `DELETE`, a request fails for good (`failed`) when
@@ -368,9 +373,10 @@ yet, an admin can end it with `CLOSE ERASURE REQUEST`, once someone has
 erased what it could not in another way. Before it forgets the
 identifiers, closing does what needs no table: it deletes the Delta
 Sharing copies that hold the person's rows, redacts the identifiers from
-the history, and has every replica empty its read cache of what the
-request deleted. If one of those cannot be done yet, as while a replica
-has yet to empty its cache, the request is not closed, and the error
+the history, and has every replica, and every running worker, empty its
+read cache of what the request deleted. If one of those cannot be done
+yet, as while a replica has yet to empty its cache, the request is not
+closed, and the error
 (SQLSTATE 55000) says why: try again. The files the request recorded for
 a table set aside that was dropped since go, unless a table references
 them, as do the old files under no table's location. What it erased
@@ -468,7 +474,7 @@ request, newest first, to admins and holders of `ERASE`:
 | `downstream` | JSON: tables written from those, as history tells, and whether the request erased from them because they have the tags too |
 | `history_redacted` | History records redacted |
 | `steps` | JSON: when each step started and last finished, and how often it ran |
-| `verification` | JSON: what the last check found, counts only (see the `verify` step), `models` among them; all zero once complete, with the number of read caches emptied since it deleted files and of those that will be when their replica starts |
+| `verification` | JSON: what the last check found, counts only (see the `verify` step), `models` and `workers` among them; all zero once complete, with the number of read caches emptied since it deleted files and of those that will be when their replica starts |
 | `error` | Why the last run failed, or what it waits for, without identifiers or the request's hashes |
 
 ```sql
@@ -562,9 +568,8 @@ person by tagged columns and the identifiers as written. It leaves:
   them did. A statement that began before the request and is still
   running goes on with the rows it read, as any statement does; one still
   scoring rows with a model the request trained again fails once its
-  replica drops its models, with a message to run it again. Workers keep
-  the models they scored with in memory until they need the room, where
-  no statement can name them once the request has trained them again.
+  replica drops its models, with a message to run it again. Workers drop
+  the models they scored with when they purge ([below](#workers)).
 - **Tables of connections** ([federation](federation.md)), which are in
   another database: Igloo reads them but cannot erase from them. A tagged
   column of one is listed in the request's `tables` as `remote`; erase the
@@ -681,6 +686,14 @@ REQUEST`) once what it could not erase has been erased otherwise.
 - **A replica that has yet to empty its read cache**: the request waits
   for every running replica; closing a request is refused until they
   have.
+- **A worker that does not run and whose read cache outlives it**
+  ([below](#workers)): the request is `blocked`, with an alert naming the
+  worker as `DEREGISTER WORKER` takes it. Start the worker again, which
+  purges before it serves; a blocked request looks again every hour. A
+  worker that will not come back, its disk gone, an admin deregisters
+  (`DEREGISTER WORKER 'worker/kept/...'`), and requests stop waiting for
+  it. Closing the request does not wait for it, and records it in
+  `error` (and `workers_left` in its JSON record).
 - **A model it cannot train again** ([ML functions](ml-functions.md#where-models-live)):
   its owner is gone, or may no longer create models in its schema or read
   its input; its input no longer runs, as when a table it reads was
@@ -703,6 +716,54 @@ REQUEST`) once what it could not erase has been erased otherwise.
   only Igloo reaches the catalog: Lakekeeper has no authentication of its
   own, so keep it on a private network, as the Helm chart's NetworkPolicy
   does.
+
+### Workers
+
+[Workers](distributed-execution.md) of distributed execution keep what
+they read past a statement: their [read cache](operations.md#read-cache),
+on disk and in memory, with the blocks the prefetcher read ahead into
+it; data files' footers; the models they scored with; and statements'
+exchange files on their disks (`IGLOO_EXCHANGES=local` or `auto`), their
+own and those they fetched from other workers. Their spill files and
+tasks' results last only as long as a task, and go when a worker
+restarts. Exchanges in object storage (`_igloo_shuffle/`) are files of
+the warehouse under no table's location, which every request deletes
+([above](#what-is-left-of-dropped-tables)).
+
+A worker cannot reach the metadata database, so coordinators keep it up
+with requests:
+
+- Every 15 seconds, every replica asks the workers for their status,
+  records in the requests' ledger each worker that answers, by its host
+  name and its read cache's identity (kept with the cache on disk), and
+  has each worker that has not purged what the last request deleted
+  purge it: the worker refuses tasks of statements that began before the
+  deletion from then on, cancels those running and waits for them to
+  end, and only then empties its read cache and the rest, so nothing read
+  from before the deletion lands after. It keeps when it last purged with
+  its cache on disk.
+- Every task carries the last deletion its coordinator knew of when the
+  statement began. A worker that has not purged through it purges before
+  it runs the task, so a worker that was stopped, or cut off, while a
+  request ran purges before it serves again; a worker that has purged
+  through a later one refuses it, and the statement runs on the
+  coordinator, whose next statements carry that deletion.
+- A request waits for the running workers, as for replicas. A worker
+  whose read cache outlives it, on a disk that stays when it stops (an
+  EC2 instance's EBS volume, with `IGLOO_WORKER_COMPUTE=ec2` or
+  `command`), and that does not run, has not purged: the request is
+  `blocked` until it starts again and purges, is deregistered, or the
+  request is closed. A worker whose cache goes with it (in memory, or on
+  a Kubernetes pod's own volume, the chart's `emptyDir`) holds nothing
+  once it is gone. Igloo cannot tell a disk wiped when its machine stops,
+  as an EC2 instance store, from one kept: such a worker counts as kept
+  until it starts again, with another cache, when the ledger forgets the
+  one it had, as it does whenever a worker comes back on the same host
+  with another cache.
+- A worker that does not answer while it still runs, as one cut off from
+  the coordinators, keeps what it read on its own disk until it serves
+  again, when it purges first. One that runs another version of Igloo,
+  which does not say what it keeps, is not waited for.
 
 ## Cost
 

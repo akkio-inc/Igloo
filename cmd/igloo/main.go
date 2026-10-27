@@ -434,6 +434,21 @@ func serve() error {
 			stopPurging()
 			<-purged
 		}()
+		// Workers keep up with requests through the coordinator, which
+		// records them in the requests' ledger (see distributed's
+		// erasure.go).
+		if dist != nil {
+			watchCtx, stopWatching := context.WithCancel(ctx)
+			watched := make(chan struct{})
+			go func() {
+				defer close(watched)
+				dist.WatchErasures(watchCtx, erasure.NewWorkerLedger(erasureStore))
+			}()
+			defer func() {
+				stopWatching()
+				<-watched
+			}()
+		}
 	}
 
 	single, err := openSSO(cfg, users, func(user string) { srv.UserChanged(user) }, log)

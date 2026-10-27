@@ -130,6 +130,9 @@ type Options struct {
 type Coordinator struct {
 	opts Options
 	pool *pool
+	// erased is the latest deletion of erasure requests it knows of, in
+	// Unix nanoseconds, which statements' tasks carry (see erasure.go).
+	erased atomic.Int64
 	// maxBroadcast, if set, overrides what every worker may read in full,
 	// for tests.
 	maxBroadcast int64
@@ -567,6 +570,9 @@ type Setting = setting
 func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setting) (*Execution, error) {
 	start := time.Now()
 	defer co.pool.keep()()
+	// Its tasks carry the latest deletion of erasure requests known before
+	// it reads the tables' snapshots (see erasure.go).
+	erased := co.erased.Load()
 	ex := &Execution{dir: filepath.Join(co.dir, newID())}
 	if err := os.MkdirAll(ex.dir, 0o700); err != nil {
 		return nil, err
@@ -667,7 +673,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		newRun := func(id string) *execution {
 			r := &execution{
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
-				sp: &spool{limit: limit}, parts: parts, smaller: smaller, roots: spreadRoots(co.opts.Warehouse, id), local: local,
+				sp: &spool{limit: limit}, parts: parts, smaller: smaller, roots: spreadRoots(co.opts.Warehouse, id), local: local, erased: erased,
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 			}
 			// The exchanges are read only by the stages: once they have run,
@@ -1217,6 +1223,13 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 		}
 		if res.Error.Throttled {
 			return nil, &throttledError{msg: fmt.Sprintf("a task on %s: %s", w.addr, res.Error.Message)}
+		}
+		if res.Error.Erased != 0 {
+			// The statement began before an erasure request this worker
+			// was purged for: it runs on the coordinator, and the next
+			// statements carry the deletion (see erasure.go).
+			co.noteErased(res.Error.Erased)
+			return nil, &errUnsupported{reason: res.Error.Message}
 		}
 		switch {
 		case res.Error.Bitmap:

@@ -171,6 +171,8 @@ type Prefetcher struct {
 	next   int
 	closed bool
 	wg     sync.WaitGroup
+	// writing is held, shared, by every fetch, and whole by Hold.
+	writing sync.RWMutex
 
 	fetched, unread, present, failed prometheus.Counter
 	blocks                           prometheus.Counter
@@ -584,7 +586,9 @@ func (p *Prefetcher) work() {
 			p.cond.Wait()
 		}
 		p.mu.Unlock()
+		p.writing.RLock()
 		err := p.fetch(s.ctx, b)
+		p.writing.RUnlock()
 		if b.done != nil {
 			b.done <- err
 			continue
@@ -601,6 +605,16 @@ func (p *Prefetcher) work() {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// Hold runs fn once no fetch is in flight, and keeps fetches from writing
+// into the cache until it returns: an erasure request empties the cache in
+// fn, and a block fetched before it, which may hold what the request
+// deleted, must not land after (see package distributed's erasure.go).
+func (p *Prefetcher) Hold(fn func() error) error {
+	p.writing.Lock()
+	defer p.writing.Unlock()
+	return fn()
 }
 
 // errPresent says a block was in the cache already.

@@ -14,6 +14,8 @@ import (
 //	POST /v1/tasks   run a fragment; the response is a header line of JSON
 //	                 (taskResult), then the result as a Parquet file
 //	GET  /v1/status  the worker's version, size and activity (workerStatus)
+//	POST /v1/purge   purge what erasure requests deleted (purgeRequest; see
+//	                 erasure.go); the response is the worker's status
 //
 // and, for exchanges on workers' disks (see localx.go), workers and
 // coordinators talk to workers over the same connections:
@@ -30,6 +32,7 @@ import (
 const (
 	tasksPath  = "/v1/tasks"
 	statusPath = "/v1/status"
+	purgePath  = "/v1/purge"
 )
 
 // taskRequest is one fragment over one share of the data.
@@ -65,6 +68,17 @@ type taskRequest struct {
 	// Peers are the workers whose disks those files may be on.
 	Worker string   `json:"worker,omitempty"`
 	Peers  []string `json:"peers,omitempty"`
+	// Erased is the latest deletion of erasure requests the coordinator
+	// knew of when the statement began, in Unix nanoseconds: a worker
+	// purged through less purges first, and one purged through more
+	// refuses the task (see erasure.go).
+	Erased int64 `json:"erased,omitempty"`
+}
+
+// purgeRequest has a worker purge what erasure requests deleted through
+// Through, Unix nanoseconds (see erasure.go).
+type purgeRequest struct {
+	Through int64 `json:"through"`
 }
 
 // setting is a session setting the fragment runs with.
@@ -181,6 +195,10 @@ type taskErr struct {
 	// Throttled says object storage turned the task's requests away for
 	// now (see throttled): the same task may well run a moment later.
 	Throttled bool `json:"throttled,omitempty"`
+	// Erased, if set, says the worker refused the task: it was purged of
+	// what erasure requests deleted through Erased, later than the
+	// statement began (see erasure.go).
+	Erased int64 `json:"erased,omitempty"`
 }
 
 func (e *taskErr) Error() string { return e.Message }
@@ -239,6 +257,12 @@ type workerStatus struct {
 	LocalRoom int64 `json:"local_room,omitempty"`
 	// Kubernetes says it runs in a Kubernetes pod.
 	Kubernetes bool `json:"kubernetes,omitempty"`
+	// Cache names what the worker keeps of what it read past its tasks,
+	// for erasure requests (WorkerErasure.Cache), and Erased is the latest
+	// deletion of erasure requests it was purged of, in Unix nanoseconds;
+	// empty and zero from a worker that does not say.
+	Cache  string `json:"cache,omitempty"`
+	Erased int64  `json:"erased,omitempty"`
 }
 
 // SettingNames are the session settings that change what a query computes.

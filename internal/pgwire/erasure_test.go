@@ -43,6 +43,8 @@ func TestParseErasureCommand(t *testing.T) {
 		{"CANCEL ERASURE REQUEST 'r1'", true, false, ""},
 		{"CONFIRM ERASURE REQUEST 'r1'", true, false, ""},
 		{"CANCEL ERASURE REQUEST r1", true, true, ""},
+		{"DEREGISTER WORKER 'worker/kept/w1/disk:abc'", true, false, ""},
+		{"DEREGISTER WORKER w1", true, true, ""},
 		{"ALTER TABLE crm.people SET SCHEMA other", false, false, ""},
 		{"ALTER TABLE crm.people ALTER COLUMN email SET TAG pii = 'email'", false, false, ""},
 		{"SELECT 1", false, false, ""},
@@ -168,6 +170,10 @@ func TestEraseSubject(t *testing.T) {
 	expectRefused(t, nora, "CANCEL ERASURE REQUEST '"+id+"'", "22023")
 	expectRefused(t, nora, "CONFIRM ERASURE REQUEST 'nope'", "42704")
 	expectDenied(t, cs.user(t, "otto", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol), "CANCEL ERASURE REQUEST '"+id+"'")
+	// Only admins deregister workers, as blocked requests name them.
+	expectDenied(t, nora, "DEREGISTER WORKER 'worker/kept/w1/disk:a'", "admin role")
+	expectRefused(t, cs.admin, "DEREGISTER WORKER 'worker/kept/w1/disk:a'", "42704")
+	expectRefused(t, cs.admin, "DEREGISTER WORKER 'disk:a'", "22023")
 
 	// A tagged column can be neither dropped nor renamed, however the
 	// statement names the table, nor left out of a table that replaces it.

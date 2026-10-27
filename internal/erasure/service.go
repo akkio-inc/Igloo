@@ -867,9 +867,12 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		if err == nil {
 			err = s.finish(ctx, r)
 		}
-		var models []string
+		var models, workers []string
 		if err == nil {
 			models, err = s.leaveModels(ctx, r)
+		}
+		if err == nil {
+			workers, err = s.workersLeft(ctx, r)
 		}
 		if err != nil {
 			err = fmt.Errorf("%w: %s; it can be closed once that is done", ErrNotYet, scrub(r, err.Error()))
@@ -919,6 +922,13 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 			r.Error += "; it leaves " + strconv.Itoa(len(models)) + " models trained from its tables, which may hold what they learned of " +
 				"the person: " + strings.Join(r.ModelsLeft, "; ")
 		}
+		if len(workers) > 0 {
+			// Each purges before it serves again, but its disk holds what
+			// it read until then.
+			r.WorkersLeft = workers
+			r.Error += "; it leaves " + strconv.Itoa(len(workers)) + " workers that do not run and had not purged what it deleted from " +
+				"their read caches, which they do when they start again: " + strings.Join(workers, "; ")
+		}
 		if fs := files[""]; len(fs) > 0 {
 			// Under no table's location: the request records them itself,
 			// the first maxListed by name. A later request deletes them
@@ -934,7 +944,8 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		s.end(ctx, r)
 		s.unschedule(ctx, id)
 		s.log.Warn("erasure request closed while blocked: it forgot its identifiers, and what it did not erase stays",
-			"request", id, "by", by, "step", r.Step, "tables_left", strings.Join(left, ", "), "models_left", strings.Join(models, ", "), "err", why)
+			"request", id, "by", by, "step", r.Step, "tables_left", strings.Join(left, ", "), "models_left", strings.Join(models, ", "),
+			"workers_left", strings.Join(workers, "; "), "err", why)
 		return nil
 	})
 }
@@ -957,11 +968,15 @@ func (s *Service) finish(ctx context.Context, r *Request) error {
 	err := s.cache(ctx, r)
 	waiting := r.Status == StatusWaiting
 	r.Status, r.WaitUntil = status, until
+	var t terminalError
 	switch {
+	case err != nil && errors.As(err, &t):
+		// Workers that do not run and have not purged stay as they are;
+		// Close records them.
 	case err != nil:
 		return fmt.Errorf("the request could not have the replicas empty their read caches: %w", err)
 	case waiting:
-		return errors.New("replicas have yet to empty their read caches of the files the request deleted; try again in a minute")
+		return errors.New("replicas or workers have yet to empty their read caches of the files the request deleted; try again in a minute")
 	}
 	return nil
 }

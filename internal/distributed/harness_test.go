@@ -58,6 +58,10 @@ type harness struct {
 	wrap func(i int, ln net.Listener) net.Listener
 	// groupFunctions are the functions the session's GroupFunctions names.
 	groupFunctions map[string]bool
+	// erasure, if set, is what worker i purges for erasure requests, and
+	// connected, if set, sees each connection worker i opens for a task.
+	erasure   func(i int) WorkerErasure
+	connected func(i int)
 }
 
 // hookHandler passes records to the harness's hook, and on to its handler.
@@ -223,6 +227,17 @@ func (c connector) Connect(ctx context.Context) (*duckdb.Conn, error) {
 		return nil, err
 	}
 	return conn.(*duckdb.Conn), nil
+}
+
+// seenConnector tells seen of each connection it opens.
+type seenConnector struct {
+	connector
+	seen func()
+}
+
+func (c seenConnector) Connect(ctx context.Context) (*duckdb.Conn, error) {
+	c.seen()
+	return c.connector.Connect(ctx)
 }
 
 // newHarness generates TPC-H data at scale sf, writes each table as files
@@ -421,10 +436,17 @@ func (h *harness) startWorker(i int) {
 	}
 	setup.Close()
 	h.t.Cleanup(func() { c.Close() })
-	w, err := NewWorker(WorkerOptions{
+	opts := WorkerOptions{
 		Engine: connector{c}, Secret: testSecret, Version: "test", ID: fmt.Sprintf("worker-%d", i), TempDir: tmp,
 		Locations: []string{filepath.Join(h.dir, "warehouse")}, Cores: 8, MemoryBytes: 4 << 30,
-	}, h.log)
+	}
+	if h.erasure != nil {
+		opts.Erasure = h.erasure(i)
+	}
+	if h.connected != nil {
+		opts.Engine = seenConnector{connector{c}, func() { h.connected(i) }}
+	}
+	w, err := NewWorker(opts, h.log)
 	if err != nil {
 		h.t.Fatal(err)
 	}

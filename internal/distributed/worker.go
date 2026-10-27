@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -90,6 +91,10 @@ type WorkerOptions struct {
 	// unread, as 65 GB of a report's did at ten times the data, or they
 	// are on workers' disks already.
 	Prefetch func(ctx context.Context, scans []Scan)
+	// Erasure is what the worker purges for erasure requests (see
+	// erasure.go). Without it, a purge empties only what the worker keeps
+	// itself: footers and exchange files.
+	Erasure WorkerErasure
 }
 
 // Worker serves tasks.
@@ -133,6 +138,12 @@ type Worker struct {
 	// the Snowflake macros divide with (see snowflake.MacrosFor).
 	rbOnce sync.Once
 	rb     bool
+	// erasureMu serializes purges for erasure requests and the admission
+	// of tasks; admitted is the latest deletion, in Unix nanoseconds, below
+	// which tasks' statements are refused, and purged the one the worker
+	// was last purged through (see erasure.go).
+	erasureMu        sync.Mutex
+	admitted, purged atomic.Int64
 }
 
 // NewWorker returns a worker; call Serve to accept tasks.
@@ -182,9 +193,14 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		boot: newID()}
+	if !opts.Erasure.Through.IsZero() {
+		w.purged.Store(opts.Erasure.Through.UnixNano())
+		w.admitted.Store(opts.Erasure.Through.UnixNano())
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
+	mux.HandleFunc("POST "+purgePath, w.servePurge)
 	mux.HandleFunc("GET "+exchangesPath+"{qid}/{file...}", w.serveExchangeFile)
 	mux.HandleFunc("POST "+exchangesPath+"{qid}/keep", w.serveExchangeKeep)
 	mux.HandleFunc("DELETE "+exchangesPath+"{qid}", w.serveExchangeRemove)
@@ -222,6 +238,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		Cache: w.opts.Erasure.Cache, Erased: w.purged.Load(),
 	})
 }
 
@@ -260,12 +277,16 @@ func taskSlots(cores int, memory int64) int {
 	return n
 }
 
-// runningTask is a task while it runs, for ShedMemory.
+// runningTask is a task while it runs, for ShedMemory and purges.
 type runningTask struct {
 	query   string
 	task    int
 	started time.Time
 	cancel  context.CancelCauseFunc
+	// erased is its statement's epoch (taskRequest.Erased); done is
+	// closed once it ends.
+	erased int64
+	done   chan struct{}
 }
 
 // errTaskMemory is what ShedMemory cancels a task with.
@@ -307,12 +328,17 @@ func (w *Worker) begin(t *runningTask) func() {
 	if w.running == nil {
 		w.running = map[*runningTask]bool{}
 	}
+	if t.done == nil {
+		t.done = make(chan struct{})
+	}
 	w.running[t] = true
 	w.runningMu.Unlock()
+	var once sync.Once
 	return func() {
 		w.runningMu.Lock()
 		delete(w.running, t)
 		w.runningMu.Unlock()
+		once.Do(func() { close(t.done) })
 	}
 }
 
@@ -347,12 +373,29 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-w.slots }()
-	done := w.begin(&runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel})
+	done, err := w.admit(ctx, &runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel, erased: req.Erased})
+	if err != nil {
+		var te *taskErr
+		if !errors.As(err, &te) {
+			te = &taskErr{Message: err.Error()}
+		}
+		log.Info("task refused for an erasure request", "err", err)
+		w.opts.Metrics.task("refused", start)
+		w.fail(rw, http.StatusUnprocessableEntity, te)
+		return
+	}
 	defer done()
 	path, res, err := w.run(ctx, &req)
 	done()
 	if path != "" {
 		defer os.Remove(path) //nolint:errcheck
+	}
+	if err != nil && errors.Is(context.Cause(ctx), errErased) {
+		// The statement runs on the coordinator (see erasure.go).
+		log.Info("task canceled for an erasure request", "err", err)
+		w.opts.Metrics.task("refused", start)
+		w.fail(rw, http.StatusUnprocessableEntity, &taskErr{Message: errErased.Error(), Erased: w.admitted.Load()})
+		return
 	}
 	if err != nil && errors.Is(context.Cause(ctx), errTaskMemory) {
 		// Another worker would run out of memory the same way: the

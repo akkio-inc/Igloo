@@ -2246,8 +2246,11 @@ const (
 	staleCache = 30 * 24 * time.Hour
 )
 
-// cache waits until every running replica emptied its read cache since
-// the request last deleted files.
+// cache waits until every running replica, and every running worker of
+// distributed execution, emptied its read cache since the request last
+// deleted files. Workers whose caches outlive them and that do not run
+// must have purged too (see workersLeft): until they have, the request is
+// blocked.
 func (s *Service) cache(ctx context.Context, r *Request) error {
 	if s.opts.Purger != nil {
 		if err := s.opts.Purger.Once(ctx); err != nil {
@@ -2259,9 +2262,19 @@ func (s *Service) cache(ctx context.Context, r *Request) error {
 		return err
 	}
 	if len(waiting) > 0 {
-		s.log.Info("erasure waits for replicas to empty their read caches", "request", r.ID,
+		s.log.Info("erasure waits for replicas and workers to empty their read caches", "request", r.ID,
 			"replicas", strings.Join(waiting, ", "))
 		r.wait(s.now().Add(cacheWait))
+		return nil
+	}
+	left, err := s.workersLeft(ctx, r)
+	if err != nil {
+		return err
+	}
+	if len(left) > 0 {
+		return terminal(fmt.Errorf("%d workers of distributed execution whose read caches outlive them do not run, and have not purged what "+
+			"the request deleted: %s; each purges when it starts again, before it serves; deregister one that will not come back "+
+			"(DEREGISTER WORKER 'name'), or an admin can close the request (CLOSE ERASURE REQUEST)", len(left), strings.Join(left, "; ")))
 	}
 	return nil
 }
@@ -2283,11 +2296,15 @@ func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int,
 	through := r.DeletedThrough.Truncate(time.Microsecond)
 	now := s.now()
 	for _, c := range caches {
+		_, worker := parseWorkerCache(c.ID)
 		switch {
 		case !c.Emptied.Before(through):
 			emptied++
 		case now.Sub(c.Seen) < liveWindow:
 			waiting = append(waiting, c.Host)
+		case worker:
+			// Not pending: one whose cache outlives it is left (see
+			// workersLeft), and one whose cache goes with it holds nothing.
 		case !strings.HasPrefix(c.ID, MemoryCache) && now.Sub(c.Seen) < staleCache:
 			pending++
 		}
@@ -2388,6 +2405,11 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if v.Caches, v.Pending, waiting, err = s.caches(ctx, r); err != nil {
 		return "", err
 	}
+	left, err := s.workersLeft(ctx, r)
+	if err != nil {
+		return "", err
+	}
+	v.Workers = len(left)
 	r.Verification = v
 
 	next := StepDone
@@ -2404,7 +2426,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		next = StepHistory
 	case v.Models > 0:
 		next = StepModels
-	case len(waiting) > 0:
+	case len(waiting) > 0 || v.Workers > 0:
 		next = StepCache
 	}
 	if next == StepDone {
@@ -2505,7 +2527,7 @@ func (v *Verification) String() string {
 		{v.Rows, "rows"}, {v.Files, "files"}, {v.Bounds, "manifest bounds"}, {v.Statistics, "Parquet statistics"},
 		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Sharing, "sharing copies"},
 		{v.History, "history records"}, {v.Derived, "derived entries"}, {v.Models, "models or their old blobs"},
-		{v.IDSets, "sets of ids"},
+		{v.IDSets, "sets of ids"}, {int64(v.Workers), "workers that have not purged"},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", c.n, c.what))
