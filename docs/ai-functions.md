@@ -57,6 +57,9 @@ Snowflake's integrations do. AI functions are off, and fail with SQLSTATE
 | `vertex` | Gemini on Vertex AI | `SERVICE_ACCOUNT` (a service account's JSON key) with `PROJECT` and `REGION`, or an express-mode `API_KEY` |
 | `bedrock` | Amazon Bedrock's Converse API | `REGION`, and `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (requests are signed, SigV4) or a Bedrock `API_KEY` |
 | `decisions` | A decision endpoint that takes a state and named questions, at `BASE_URL`/decisions | `BASE_URL`, `DECISION_MODEL` |
+| `nixtla` | Nixtla's TimeGPT API, `https://api.nixtla.io`, or a deployment of it at `BASE_URL` (Microsoft Foundry's TimeGPT): time series models alone | `API_KEY` |
+| `sagemaker` | SageMaker endpoints of Chronos models (Chronos-2, Chronos-Bolt from JumpStart): time series models alone | `REGION`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (SigV4) |
+| `bigquery` | BigQuery's `AI.FORECAST`, run as a query in your project, TimesFM 3.0 among its models: time series models alone | `SERVICE_ACCOUNT`, `PROJECT`, and `REGION` for the query's location (`'US'`) if it must run in one |
 
 | Option | Meaning |
 |---|---|
@@ -74,6 +77,13 @@ Snowflake's integrations do. AI functions are off, and fail with SQLSTATE
 
 When several integrations a user may use map the same model, or have a
 default model, the session chooses with `SET ai_integration = 'name'`.
+
+Integrations also serve **hosted time series models** to BigQuery's
+`AI.FORECAST` and `AI.DETECT_ANOMALIES` and Databricks' `ai_forecast` and
+`ai_detect_anomalies`: a `nixtla`, `sagemaker` or `bigquery` integration,
+a `vertex` integration mapping a TimesFM endpoint, or a `bedrock` one
+mapping a Marketplace endpoint of Chronos (see
+[ML functions](ml-functions.md#hosted-models)).
 
 ## Functions
 

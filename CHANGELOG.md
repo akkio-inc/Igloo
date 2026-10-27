@@ -326,6 +326,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   columns. On workers, a stage that holds whole series forecasts them; the
   distributed planner now combines `list()` and `array_agg()` from
   workers' partial lists.
+- Hosted time series models through AI integrations, with your own
+  credentials: `nixtla` (TimeGPT, also as Microsoft Foundry serves it),
+  `sagemaker` (Chronos endpoints), `bigquery` (its `AI.FORECAST`, the way
+  to TimesFM 3.0, sending the series to BigQuery), and TimesFM endpoints on
+  `vertex` and Chronos on Bedrock Marketplace. `AI.FORECAST`,
+  `ai_forecast` and their detection functions call a model an integration
+  maps on the replica, in batches, cached, with the AI functions' grants,
+  caps and usage.
 
 ### Loading and scheduling
 

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 
+	"github.com/akkio-inc/igloo/internal/ai"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/tsforecast"
@@ -21,5 +22,15 @@ func (e *Engine) setupForecasting(ctx context.Context, cfg config.Config) error 
 		return err
 	}
 	defer release()
-	return tsforecast.Register(conn, e.forecasting)
+	if err := tsforecast.Register(conn, e.forecasting); err != nil {
+		return err
+	}
+	// Hosted models, through AI integrations: on the server, which holds
+	// their keys (see SetAI).
+	return tsforecast.RegisterHosted(conn, func() ai.Hook {
+		if b := e.aiHook.Load(); b != nil {
+			return b.hook
+		}
+		return nil
+	})
 }

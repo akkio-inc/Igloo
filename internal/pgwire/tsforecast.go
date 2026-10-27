@@ -13,6 +13,7 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/ai"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/snowflake"
@@ -33,6 +34,11 @@ func points(ts, y string) string {
 }
 
 const noPoints = "CAST([] AS STRUCT(t TIMESTAMP, y DOUBLE)[])"
+
+// noPointsOf is no points, as an expression of col's points rather than a
+// constant: duckdb-go cannot hand a constant list to a function's binder,
+// as the hosted functions' is (package tsforecast's RegisterHosted).
+func noPointsOf(col string) string { return "list_slice(" + col + ", 1, 0)" }
 
 // forecastArgs reads a forecasting call's arguments: positional ones by
 // the names given, the rest by name, among names.
@@ -128,25 +134,50 @@ func timeArg(c *snowflake.ModelCall, name string) (*int64, error) {
 	return nil, pgerror.WithCode(fmt.Errorf("%s: %q is not a timestamp", strings.ToLower(name), v.Str), codes.InvalidParameterValue)
 }
 
-// forecastModel resolves the model a call names, or its default.
-func (s *Server) forecastModel(c *snowflake.ModelCall, def string) (string, error) {
+// forecaster is how a call forecasts: with a model of the model pack, or
+// a hosted one an AI integration maps, and the functions that do.
+type forecaster struct {
+	model            string
+	hosted           bool
+	forecast, detect string
+}
+
+// forecastModel resolves the model a call names, or its default: a name an
+// AI integration the user may use maps is a hosted model's, called through
+// the integration on this replica (package ai); any other the model
+// pack's.
+func (s *Server) forecastModel(ctx context.Context, sess *session, user auth.User, c *snowflake.ModelCall, def string) (forecaster, error) {
 	name := def
 	if v := c.Arg("MODEL"); v != nil && v.Kind != snowflake.ValueNull {
 		if v.Kind != snowflake.ValueString {
-			return "", modelSyntax("model takes a model's name")
+			return forecaster{}, modelSyntax("model takes a model's name")
 		}
 		name = v.Str
 	}
+	if s.ai != nil {
+		privs, err := s.privileges(ctx, sess, user)
+		if err != nil {
+			return forecaster{}, denied("could not load roles: %v", err)
+		}
+		o := ai.StatementOptions{User: user.Name, Roles: privs.Roles, Admin: user.Role == auth.RoleAdmin, Integration: sess.aiIntegration}
+		hosted, err := s.ai.ForecastModel(ctx, o, name)
+		if err != nil {
+			return forecaster{}, aiError(err)
+		}
+		if hosted {
+			return forecaster{model: name, hosted: true, forecast: ai.ForecastFunction, detect: ai.DetectFunction}, nil
+		}
+	}
 	model, ok := s.forecasting.Model(name)
 	if !ok {
-		return "", pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s is not a forecasting model Igloo has", name), codes.UndefinedObject),
-			"the model pack's forecasting models are chronos-bolt-tiny, -mini, -small and -base, chronos-2, chronos-2-small and timesfm-2.5 "+
-				"(docs/models.md)")
+		return forecaster{}, pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s is not a forecasting model Igloo has", name),
+			codes.UndefinedObject), "the model pack's forecasting models are chronos-bolt-tiny, -mini, -small and -base, chronos-2, "+
+			"chronos-2-small and timesfm-2.5 (docs/models.md); an AI integration can map hosted ones (docs/ml-functions.md)")
 	}
 	if _, err := s.forecasting.MaxContext(model); err != nil {
-		return "", loadError(err)
+		return forecaster{}, loadError(err)
 	}
-	return model, nil
+	return forecaster{model: model, forecast: tsforecast.ForecastFunction, detect: tsforecast.DetectFunction}, nil
 }
 
 // checkForecastMethod checks the method of a FORECAST or
@@ -230,12 +261,14 @@ func (s *Server) forecastQuery(ctx context.Context, sess *session, user auth.Use
 }
 
 // contextWindow reads BigQuery's context_window: for TimesFM 2.5, a power
-// of two from 64 to 8,192, or 15,360.
-func (s *Server) contextWindow(c *snowflake.ModelCall, model string) (int, error) {
+// of two from 64 to 8,192, or 15,360; for a hosted model, the most steps
+// it is sent.
+func (s *Server) contextWindow(c *snowflake.ModelCall, f forecaster) (int, error) {
 	n, err := intArg(c, "CONTEXT_WINDOW", 1, 16384)
-	if err != nil || n == 0 {
-		return 0, err
+	if err != nil || n == 0 || f.hosted {
+		return n, err
 	}
+	model := f.model
 	if model == "timesfm-2.5" && n != 15360 && (n < 64 || n > 8192 || n&(n-1) != 0) {
 		return 0, pgerror.WithCode(fmt.Errorf("context_window is 64, 128, ..., 8192 or 15360"), codes.InvalidParameterValue)
 	}
@@ -265,7 +298,7 @@ func (s *Server) bigqueryForecast(ctx context.Context, sess *session, user auth.
 	if err != nil {
 		return "", err
 	}
-	model, err := s.forecastModel(c, "TimesFM 2.5")
+	model, err := s.forecastModel(ctx, sess, user, c, "TimesFM 2.5")
 	if err != nil {
 		return "", err
 	}
@@ -309,7 +342,7 @@ func (s *Server) bigqueryForecast(ctx context.Context, sess *session, user auth.
 		return "", err
 	}
 	ts := quoteIdent(tsCol)
-	inner := grouped(ids, []string{tsforecast.ForecastFunction + "(" + quoteLiteral(model) + ", " + points(ts, quoteIdent(data)) + ", " +
+	inner := grouped(ids, []string{model.forecast + "(" + quoteLiteral(model.model) + ", " + points(ts, quoteIdent(data)) + ", " +
 		optionsJSON(opts) + ") AS __igloo_fs"}, input, ts)
 	mid := "SELECT " + withIDs(ids, "", "unnest(__igloo_fs) AS f") + " FROM (" + inner + ") AS __igloo_g"
 	conf := fmt.Sprintf("CAST(%v AS DOUBLE) AS confidence_level", opts.Confidence)
@@ -347,7 +380,7 @@ func (s *Server) bigqueryDetect(ctx context.Context, sess *session, user auth.Us
 	if err != nil {
 		return "", err
 	}
-	model, err := s.forecastModel(c, "TimesFM 2.5")
+	model, err := s.forecastModel(ctx, sess, user, c, "TimesFM 2.5")
 	if err != nil {
 		return "", err
 	}
@@ -389,7 +422,7 @@ func (s *Server) bigqueryDetect(ctx context.Context, sess *session, user auth.Us
 	}
 	ts, y := quoteIdent(tsCol), quoteIdent(data)
 	call := func(h, t string) string {
-		return "unnest(" + tsforecast.DetectFunction + "(" + quoteLiteral(model) + ", " + h + ", " + t + ", " + optionsJSON(opts) + ")) AS d"
+		return "unnest(" + model.detect + "(" + quoteLiteral(model.model) + ", " + h + ", " + t + ", " + optionsJSON(opts) + ")) AS d"
 	}
 	var mid string
 	if target != nil {
@@ -406,7 +439,7 @@ func (s *Server) bigqueryDetect(ctx context.Context, sess *session, user auth.Us
 		mid = "SELECT " + withIDs(ids, "__igloo_t.", call("coalesce(__igloo_h.p, "+noPoints+")", "__igloo_t.p")) + " FROM (" + t +
 			") AS __igloo_t" + join
 	} else {
-		mid = "SELECT " + withIDs(ids, "", call("p", noPoints)) + " FROM (" + grouped(ids, []string{points(ts, y) + " AS p"}, history, ts) +
+		mid = "SELECT " + withIDs(ids, "", call("p", noPointsOf("p"))) + " FROM (" + grouped(ids, []string{points(ts, y) + " AS p"}, history, ts) +
 			") AS __igloo_g"
 	}
 	return "(SELECT " + withIDs(ids, "", "d.ts AS time_series_timestamp", "d.value AS time_series_data", "d.is_anomaly AS is_anomaly",
@@ -450,7 +483,7 @@ func (s *Server) databricksForecast(ctx context.Context, sess *session, user aut
 	if err != nil {
 		return "", err
 	}
-	model, err := s.forecastModel(c, "chronos-2")
+	model, err := s.forecastModel(ctx, sess, user, c, "chronos-2")
 	if err != nil {
 		return "", err
 	}
@@ -486,7 +519,7 @@ func (s *Server) databricksForecast(ctx context.Context, sess *session, user aut
 	ts := quoteIdent(tsCol)
 	var calls, unnests, cols []string
 	for i, v := range values {
-		calls = append(calls, fmt.Sprintf("%s(%s, %s, %s) AS __igloo_fs%d", tsforecast.ForecastFunction, quoteLiteral(model),
+		calls = append(calls, fmt.Sprintf("%s(%s, %s, %s) AS __igloo_fs%d", model.forecast, quoteLiteral(model.model),
 			points(ts, quoteIdent(v)), optionsJSON(opts), i))
 		unnests = append(unnests, fmt.Sprintf("unnest(__igloo_fs%d) AS f%d", i, i))
 		cols = append(cols, fmt.Sprintf("f%d.value AS %s", i, quoteIdent(v+"_forecast")), fmt.Sprintf("f%d.upper AS %s", i, quoteIdent(v+"_upper")),
@@ -523,7 +556,7 @@ func (s *Server) databricksDetect(ctx context.Context, sess *session, user auth.
 	if err != nil {
 		return "", err
 	}
-	model, err := s.forecastModel(c, "chronos-2")
+	model, err := s.forecastModel(ctx, sess, user, c, "chronos-2")
 	if err != nil {
 		return "", err
 	}
@@ -550,7 +583,7 @@ func (s *Server) databricksDetect(ctx context.Context, sess *session, user auth.
 		return "", err
 	}
 	ts := quoteIdent(tsCol)
-	call := "unnest(" + tsforecast.DetectFunction + "(" + quoteLiteral(model) + ", p, " + noPoints + ", " + optionsJSON(opts) + ")) AS d"
+	call := "unnest(" + model.detect + "(" + quoteLiteral(model.model) + ", p, " + noPointsOf("p") + ", " + optionsJSON(opts) + ")) AS d"
 	mid := "SELECT " + withIDs(groups, "", call) + " FROM (" + grouped(groups, []string{points(ts, quoteIdent(value)) + " AS p"}, input, ts) +
 		") AS __igloo_g"
 	return "(SELECT " + strings.Join([]string{"d.ts AS " + quoteIdent(tsCol), withIDs(groups, "", "d.value AS "+quoteIdent(value),

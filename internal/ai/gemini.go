@@ -28,25 +28,46 @@ const googleTokenURL = "https://oauth2.googleapis.com/token"
 func newGemini(in Integration, c *client) (*gemini, error) {
 	g := &gemini{in: in, c: c}
 	if in.Provider == ProviderVertex && in.ServiceAccount != "" {
-		var sa struct {
-			ClientEmail  string `json:"client_email"`
-			PrivateKey   string `json:"private_key"`
-			PrivateKeyID string `json:"private_key_id"`
-			TokenURI     string `json:"token_uri"`
+		var err error
+		if g.tokens, err = googleTokens(in.ServiceAccount, c); err != nil {
+			return nil, err
 		}
-		if err := json.Unmarshal([]byte(in.ServiceAccount), &sa); err != nil {
-			return nil, fmt.Errorf("%w: SERVICE_ACCOUNT is not a service account's JSON key", ErrInvalid)
-		}
-		conf := &jwt.Config{Email: sa.ClientEmail, PrivateKey: []byte(sa.PrivateKey), PrivateKeyID: sa.PrivateKeyID,
-			Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, TokenURL: sa.TokenURI}
-		if conf.TokenURL == "" {
-			conf.TokenURL = googleTokenURL
-		}
-		// Tokens are minted through the same guarded connections.
-		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, c.http)
-		g.tokens = oauth2.ReuseTokenSource(nil, conf.TokenSource(ctx))
 	}
 	return g, nil
+}
+
+// googleTokens mints access tokens, for Google Cloud's APIs, from a service
+// account's JSON key.
+func googleTokens(key string, c *client) (oauth2.TokenSource, error) {
+	var sa struct {
+		ClientEmail  string `json:"client_email"`
+		PrivateKey   string `json:"private_key"`
+		PrivateKeyID string `json:"private_key_id"`
+		TokenURI     string `json:"token_uri"`
+	}
+	if err := json.Unmarshal([]byte(key), &sa); err != nil {
+		return nil, fmt.Errorf("%w: SERVICE_ACCOUNT is not a service account's JSON key", ErrInvalid)
+	}
+	conf := &jwt.Config{Email: sa.ClientEmail, PrivateKey: []byte(sa.PrivateKey), PrivateKeyID: sa.PrivateKeyID,
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}, TokenURL: sa.TokenURI}
+	if conf.TokenURL == "" {
+		conf.TokenURL = googleTokenURL
+	}
+	// Tokens are minted through the same guarded connections.
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, c.http)
+	return oauth2.ReuseTokenSource(nil, conf.TokenSource(ctx)), nil
+}
+
+// bearer returns tokens' current access token as an Authorization header's
+// value, scrubbing in's secrets from an error.
+func bearer(mu *sync.Mutex, tokens oauth2.TokenSource, in *Integration) (string, error) {
+	mu.Lock()
+	tok, err := tokens.Token()
+	mu.Unlock()
+	if err != nil {
+		return "", fmt.Errorf("could not get an access token for the service account: %s", in.Scrub(err.Error()))
+	}
+	return "Bearer " + tok.AccessToken, nil
 }
 
 // url is the address of model's method, such as generateContent.
@@ -63,13 +84,11 @@ func (p *gemini) header() (http.Header, error) {
 		h.Set(k, v)
 	}
 	if p.tokens != nil {
-		p.mu.Lock()
-		tok, err := p.tokens.Token()
-		p.mu.Unlock()
+		auth, err := bearer(&p.mu, p.tokens, &p.in)
 		if err != nil {
-			return nil, fmt.Errorf("could not get an access token for the service account: %s", p.in.Scrub(err.Error()))
+			return nil, err
 		}
-		h.Set("Authorization", "Bearer "+tok.AccessToken)
+		h.Set("Authorization", auth)
 	} else if p.in.APIKey != "" {
 		h.Set("x-goog-api-key", p.in.APIKey)
 	}

@@ -78,6 +78,7 @@ func Names() []string {
 	for _, f := range Functions {
 		out = append(out, f.Name, f.Name+"_details")
 	}
+	out = append(out, ForecastFunction, DetectFunction)
 	slices.Sort(out)
 	return out
 }

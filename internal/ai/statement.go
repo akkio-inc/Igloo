@@ -65,8 +65,9 @@ type call struct {
 	// then takes the group's calls (see batch).
 	group string
 	// input is the call's input, for a batch that sends several calls'
-	// inputs in one request.
-	input string
+	// inputs in one request; payload, when the input is not text.
+	input   string
+	payload any
 }
 
 // batchRunner sends several calls of a group in one request, and returns

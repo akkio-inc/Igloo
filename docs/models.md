@@ -44,7 +44,9 @@ it again.
 Models whose weights are not Apache-2.0 or MIT are not in the catalog and
 cannot be installed, whatever their use elsewhere: TimesFM 3.0
 (non-commercial), Moirai 2.0 (CC-BY-NC-4.0) and Timestral (a revenue-limited
-license) among them.
+license) among them. Igloo reaches TimesFM 3.0 hosted, through BigQuery's
+`AI.FORECAST` with your own Google Cloud credentials, which sends the
+series to BigQuery (see [hosted models](ml-functions.md#hosted-models)).
 
 ## Installing
 

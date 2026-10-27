@@ -143,6 +143,12 @@ func newProvider(in Integration, c *client) (Provider, error) {
 		return newBedrock(in, c)
 	case ProviderDecisions:
 		return &decisions{in: in, c: c}, nil
+	case ProviderNixtla:
+		return &nixtla{in: in, c: c}, nil
+	case ProviderSageMaker:
+		return newSageMaker(in, c), nil
+	case ProviderBigQuery:
+		return newBigQuery(in, c)
 	}
 	return nil, fmt.Errorf("%w: unknown provider %s", ErrInvalid, quote(in.Provider))
 }

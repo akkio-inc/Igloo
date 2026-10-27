@@ -68,7 +68,8 @@ const timesFM3 = "timesfm-3.0"
 func (s *Service) load(name string) (tsfm.Model, error) {
 	if name == timesFM3 {
 		return nil, fmt.Errorf("%w: TimesFM 3.0's weights are licensed for non-commercial use only, so the model pack does not "+
-			"hold them; forecast with timesfm-2.5 (docs/models.md)", modelpack.ErrLicense)
+			"hold them; forecast with timesfm-2.5, or call TimesFM 3.0 in BigQuery through a bigquery AI integration that maps it "+
+			"(docs/ml-functions.md)", modelpack.ErrLicense)
 	}
 	return s.loader.Load(name)
 }

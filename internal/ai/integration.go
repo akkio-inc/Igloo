@@ -32,17 +32,31 @@ const (
 	// questions (Liquid, Portkey's gateway, servers of open decision
 	// models); it serves AI_FILTER, AI_CLASSIFY and AI_DECIDE alone.
 	ProviderDecisions = "decisions"
+	// ProviderNixtla is Nixtla's TimeGPT API, or a deployment of it that
+	// speaks it (Microsoft Foundry's): time series models alone.
+	ProviderNixtla = "nixtla"
+	// ProviderSageMaker is SageMaker endpoints of Chronos models
+	// (InvokeEndpoint), signed with AWS credentials: time series models
+	// alone.
+	ProviderSageMaker = "sagemaker"
+	// ProviderBigQuery is BigQuery's AI.FORECAST, run as a query in the
+	// customer's Google Cloud project with a service account's key: time
+	// series models alone, TimesFM 3.0 among them. The series go to
+	// BigQuery.
+	ProviderBigQuery = "bigquery"
 )
 
 // Providers lists the providers.
 var Providers = []string{ProviderOpenAI, ProviderAzure, ProviderAnthropic, ProviderGemini, ProviderVertex, ProviderBedrock,
-	ProviderDecisions}
+	ProviderDecisions, ProviderNixtla, ProviderSageMaker, ProviderBigQuery}
 
 // defaultBase is each provider's own address, where BASE_URL is not given.
 var defaultBase = map[string]string{
 	ProviderOpenAI:    "https://api.openai.com/v1",
 	ProviderAnthropic: "https://api.anthropic.com",
 	ProviderGemini:    "https://generativelanguage.googleapis.com/v1beta",
+	ProviderNixtla:    "https://api.nixtla.io",
+	ProviderBigQuery:  "https://bigquery.googleapis.com/bigquery/v2",
 }
 
 // Price is what a model costs, in US dollars per million tokens.
@@ -119,6 +133,8 @@ func (in *Integration) Base() string {
 	switch in.Provider {
 	case ProviderBedrock:
 		return "https://bedrock-runtime." + in.Region + ".amazonaws.com"
+	case ProviderSageMaker:
+		return "https://runtime.sagemaker." + in.Region + ".amazonaws.com"
 	case ProviderVertex:
 		if in.Project == "" {
 			// Express mode, with an API key.
@@ -219,6 +235,20 @@ func (in *Integration) Check(checkURL func(string) error) error {
 		if in.BaseURL == "" {
 			return invalid("a %s integration needs BASE_URL", in.Provider)
 		}
+	case ProviderSageMaker:
+		if in.Region == "" && in.BaseURL == "" {
+			return invalid("a sagemaker integration needs REGION")
+		}
+		if in.AWSAccessKeyID == "" || in.AWSSecretAccessKey == "" {
+			return invalid("a sagemaker integration needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+		}
+	case ProviderBigQuery:
+		if in.ServiceAccount == "" || in.Project == "" {
+			return invalid("a bigquery integration needs a SERVICE_ACCOUNT key and PROJECT, the project its queries run and are billed in")
+		}
+		if err := checkServiceAccount(in.ServiceAccount, checkURL); err != nil {
+			return err
+		}
 	case ProviderBedrock:
 		if in.Region == "" && in.BaseURL == "" {
 			return invalid("a bedrock integration needs REGION")
@@ -234,33 +264,21 @@ func (in *Integration) Check(checkURL func(string) error) error {
 			return invalid("a vertex integration needs a SERVICE_ACCOUNT key or an express-mode API_KEY")
 		}
 		if in.ServiceAccount != "" {
-			var sa struct {
-				Type, ClientEmail, PrivateKey, TokenURI string
-			}
-			var raw map[string]any
-			if err := json.Unmarshal([]byte(in.ServiceAccount), &raw); err != nil {
-				return invalid("SERVICE_ACCOUNT must be a service account's JSON key")
-			}
-			sa.Type, _ = raw["type"].(string)
-			sa.ClientEmail, _ = raw["client_email"].(string)
-			sa.PrivateKey, _ = raw["private_key"].(string)
-			if sa.Type != "service_account" || sa.ClientEmail == "" || sa.PrivateKey == "" {
-				return invalid("SERVICE_ACCOUNT must be a service account's JSON key, with client_email and private_key")
-			}
-			if uri, _ := raw["token_uri"].(string); uri != "" && checkURL != nil {
-				if err := checkURL(uri); err != nil {
-					return err
-				}
+			if err := checkServiceAccount(in.ServiceAccount, checkURL); err != nil {
+				return err
 			}
 		}
 	}
-	if in.Provider != ProviderBedrock && in.Provider != ProviderVertex && in.Provider != ProviderDecisions && in.APIKey == "" &&
-		len(in.Headers) == 0 && in.BaseURL == "" {
+	if !slices.Contains([]string{ProviderBedrock, ProviderVertex, ProviderDecisions, ProviderSageMaker, ProviderBigQuery}, in.Provider) &&
+		in.APIKey == "" && len(in.Headers) == 0 && in.BaseURL == "" {
 		return invalid("a %s integration needs an API_KEY", in.Provider)
 	}
-	if in.Provider == ProviderBedrock && in.Region != "" && !validRegion(in.Region) ||
-		in.Provider == ProviderVertex && in.Region != "" && !validRegion(in.Region) {
+	if (in.Provider == ProviderBedrock || in.Provider == ProviderVertex || in.Provider == ProviderSageMaker) && in.Region != "" &&
+		!validRegion(in.Region) {
 		return invalid("REGION %s is not a region's name", quote(in.Region))
+	}
+	if in.Provider == ProviderBigQuery && in.Region != "" && !validRegion(strings.ToLower(in.Region)) {
+		return invalid("REGION %s is not a BigQuery location, such as 'US', 'EU' or 'us-central1'", quote(in.Region))
 	}
 	if in.Project != "" && !validRegion(in.Project) {
 		return invalid("PROJECT %s is not a Google Cloud project's ID", quote(in.Project))
@@ -305,6 +323,27 @@ func (in *Integration) Check(checkURL func(string) error) error {
 	}
 	if in.MaxConcurrency < 0 || in.MaxConcurrency > maxConcurrency {
 		return invalid("MAX_CONCURRENCY must be from 1 to %d", maxConcurrency)
+	}
+	return nil
+}
+
+// checkServiceAccount checks a Google service account's JSON key, and its
+// token URI with checkURL, if set.
+func checkServiceAccount(key string, checkURL func(string) error) error {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(key), &raw); err != nil {
+		return fmt.Errorf("%w: SERVICE_ACCOUNT must be a service account's JSON key", ErrInvalid)
+	}
+	typ, _ := raw["type"].(string)
+	email, _ := raw["client_email"].(string)
+	pk, _ := raw["private_key"].(string)
+	if typ != "service_account" || email == "" || pk == "" {
+		return fmt.Errorf("%w: SERVICE_ACCOUNT must be a service account's JSON key, with client_email and private_key", ErrInvalid)
+	}
+	if uri, _ := raw["token_uri"].(string); uri != "" && checkURL != nil {
+		if err := checkURL(uri); err != nil {
+			return err
+		}
 	}
 	return nil
 }

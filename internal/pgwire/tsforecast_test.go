@@ -291,6 +291,22 @@ func TestForecastReadsAsTheUser(t *testing.T) {
 	expectDenied(t, nina, q, "client_spend")
 	expectDenied(t, nina, `SELECT * FROM ai_forecast(observed => TABLE(lake.crm.client_spend), horizon => '2025-03-05', time_col => 'day',
 		value_col => 'spend', model => 'test-bolt')`, "client_spend")
+
+	// A masked value is forecast as its user reads it: ann reads zeros.
+	mustExec(t, cs.admin, `CREATE MASKING POLICY mask_spend AS (val BIGINT) RETURNS BIGINT ->
+		CASE WHEN is_role_in_session('pii_reader') THEN val ELSE 0 END`)
+	mustExec(t, cs.admin, "ALTER TABLE lake.crm.client_spend ALTER COLUMN spend SET MASKING POLICY mask_spend")
+	pia := cs.user(t, "pia", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, cs.admin, "GRANT acme_team TO pia")
+	mustExec(t, cs.admin, "GRANT pii_reader TO pia")
+	m := `SELECT round(max(abs(forecast_value))) FROM AI.FORECAST(TABLE lake.crm.client_spend, data_col => 'spend', timestamp_col => 'day',
+		id_cols => ['client'], model => 'test-bolt', horizon => 2)`
+	if got := texts(t, ann, m); len(got) != 1 || got[0] != "0" {
+		t.Errorf("ann forecasts masked spend as %q", got)
+	}
+	if got := texts(t, pia, m); len(got) != 1 || got[0] == "0" {
+		t.Errorf("pia forecasts spend as %q", got)
+	}
 }
 
 // Workers forecast the series of their partitions.
@@ -298,7 +314,7 @@ func TestDistributedForecast(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	tsforecasttest.InstallTiny(t, filepath.Join(dir, "model-pack"), "test-bolt")
-	ds := startDistServerIn(t, dir, 2)
+	ds := startDistServerIn(t, dir, 2, withAI)
 	mustExec(t, ds.admin, dailySpend)
 	conn := ds.admin
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
@@ -328,5 +344,20 @@ func TestDistributedForecast(t *testing.T) {
 	}
 	if stages != 1 {
 		t.Errorf("%d stages forecast: %q", stages, plan)
+	}
+
+	// A hosted model is called here, where the integration's keys are:
+	// workers gather the series, and this replica forecasts them.
+	f := newFakeTimeGPT(t)
+	mustExec(t, conn, `CREATE AI INTEGRATION timeseries PROVIDER = nixtla BASE_URL = '`+f.srv.URL+`'
+		API_KEY = 'nixtla-test-not-a-real-key' MODELS = ('timegpt' = 'timegpt-1')`)
+	if got := texts(t, conn, strings.Replace(q, "test-bolt", "timegpt", 1)); len(got) != 8 || f.sent() == 0 {
+		t.Errorf("hosted on workers' series: %q, %d requests", got, f.sent())
+	}
+	run = newestRun(t, ds.history, "ai_ts_forecast(")
+	for _, row := range texts(t, conn, "EXPLAIN DISTRIBUTED "+run.Text) {
+		if strings.HasPrefix(row, "stage ") && strings.Contains(row, "ai_ts_forecast(") {
+			t.Errorf("a stage calls the hosted model: %s", row)
+		}
 	}
 }

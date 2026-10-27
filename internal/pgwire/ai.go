@@ -28,7 +28,7 @@ import (
 // AI functions (package ai, docs/ai-functions.md). They are off until an
 // admin creates an AI integration, which holds a provider's keys:
 //
-//	CREATE [OR REPLACE] AI INTEGRATION [IF NOT EXISTS] name PROVIDER [=] openai | azure_openai | anthropic | gemini | vertex | bedrock | decisions [option ...]
+//	CREATE [OR REPLACE] AI INTEGRATION [IF NOT EXISTS] name PROVIDER [=] openai | azure_openai | anthropic | gemini | vertex | bedrock | decisions | nixtla | sagemaker | bigquery [option ...]
 //	ALTER AI INTEGRATION [IF EXISTS] name SET option ... | UNSET name [, ...]
 //	DROP [AI] INTEGRATION [IF EXISTS] name
 //	SHOW AI INTEGRATIONS

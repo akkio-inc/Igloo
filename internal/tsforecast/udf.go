@@ -134,8 +134,19 @@ func ParseFrequency(s string) (*models.Frequency, error) {
 	return &f, nil
 }
 
-// Register defines the functions on conn's database, with svc's models.
-func Register(conn *sql.Conn, svc *Service) error {
+// signature is a function's arguments' and result's types.
+type signature struct {
+	args   []duckdb.TypeInfo
+	result duckdb.TypeInfo
+}
+
+// types are the forecasting and detection functions' signatures.
+func types() (forecast, detect signature, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("the forecasting functions' types: %v", r)
+		}
+	}()
 	t := func(tt duckdb.Type) duckdb.TypeInfo {
 		info, err := duckdb.NewTypeInfo(tt)
 		if err != nil {
@@ -167,69 +178,82 @@ func Register(conn *sql.Conn, svc *Service) error {
 	}
 	varchar, ts, double, boolean := t(duckdb.TYPE_VARCHAR), t(duckdb.TYPE_TIMESTAMP), t(duckdb.TYPE_DOUBLE), t(duckdb.TYPE_BOOLEAN)
 	points := list(strct([]string{"t", "y"}, []duckdb.TypeInfo{ts, double}))
-	forecastResult := list(strct([]string{"kind", "ts", "value", "lower", "upper", "status"},
-		[]duckdb.TypeInfo{varchar, ts, double, double, double, varchar}))
-	detectResult := list(strct([]string{"ts", "value", "expected", "lower", "upper", "probability", "is_anomaly", "status"},
-		[]duckdb.TypeInfo{ts, double, double, double, double, double, boolean, varchar}))
-	if err := duckdb.RegisterScalarUDF(conn, ForecastFunction, &udf{svc: svc, detect: false,
-		args: []duckdb.TypeInfo{varchar, points, varchar}, result: forecastResult}); err != nil {
+	forecast = signature{args: []duckdb.TypeInfo{varchar, points, varchar},
+		result: list(strct([]string{"kind", "ts", "value", "lower", "upper", "status"},
+			[]duckdb.TypeInfo{varchar, ts, double, double, double, varchar}))}
+	detect = signature{args: []duckdb.TypeInfo{varchar, points, points, varchar},
+		result: list(strct([]string{"ts", "value", "expected", "lower", "upper", "probability", "is_anomaly", "status"},
+			[]duckdb.TypeInfo{ts, double, double, double, double, double, boolean, varchar}))}
+	return forecast, detect, nil
+}
+
+// Register defines the functions on conn's database, with svc's models.
+func Register(conn *sql.Conn, svc *Service) error {
+	forecast, detect, err := types()
+	if err != nil {
 		return err
 	}
-	return duckdb.RegisterScalarUDF(conn, DetectFunction, &udf{svc: svc, detect: true,
-		args: []duckdb.TypeInfo{varchar, points, points, varchar}, result: detectResult})
+	if err := duckdb.RegisterScalarUDF(conn, ForecastFunction, &udf{svc: svc, sig: forecast}); err != nil {
+		return err
+	}
+	return duckdb.RegisterScalarUDF(conn, DetectFunction, &udf{svc: svc, sig: detect, detect: true})
 }
 
 type udf struct {
 	svc    *Service
 	detect bool
-	args   []duckdb.TypeInfo
-	result duckdb.TypeInfo
+	sig    signature
 }
 
 func (u *udf) Config() duckdb.ScalarFuncConfig {
-	return duckdb.ScalarFuncConfig{InputTypeInfos: u.args, ResultTypeInfo: u.result}
+	return duckdb.ScalarFuncConfig{InputTypeInfos: u.sig.args, ResultTypeInfo: u.sig.result}
 }
 
 func (u *udf) Executor() duckdb.ScalarFuncExecutor {
 	return duckdb.ScalarFuncExecutor{
 		ChunkContextExecutor: func(ctx context.Context, chunk *duckdb.ChunkIteratorState) error {
-			var rows [][]any
-			for st, err := range chunk.Rows() {
-				if err != nil {
-					return err
-				}
-				r := make([]any, st.ColumnCount())
-				for i := range r {
-					r[i] = *st.GetValuePtr(i)
-				}
-				rows = append(rows, r)
-			}
-			if len(rows) == 0 {
-				return nil
-			}
-			var out []any
-			var err error
-			if u.detect {
-				out, err = u.svc.detectRows(ctx, rows)
-			} else {
-				out, err = u.svc.forecastRows(ctx, rows)
-			}
-			if err != nil {
-				return err
-			}
-			k := 0
-			for st, err := range chunk.Rows() {
-				if err != nil {
-					return err
-				}
-				if err := st.SetResult(out[k]); err != nil {
-					return err
-				}
-				k++
-			}
-			return nil
+			return evalChunk(ctx, chunk, u.svc, u.detect)
 		},
 	}
+}
+
+// evalChunk forecasts, or scores, a chunk's rows with b.
+func evalChunk(ctx context.Context, chunk *duckdb.ChunkIteratorState, b backend, detect bool) error {
+	var rows [][]any
+	for st, err := range chunk.Rows() {
+		if err != nil {
+			return err
+		}
+		r := make([]any, st.ColumnCount())
+		for i := range r {
+			r[i] = *st.GetValuePtr(i)
+		}
+		rows = append(rows, r)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	var out []any
+	var err error
+	if detect {
+		out, err = detectRows(ctx, b, rows)
+	} else {
+		out, err = forecastRows(ctx, b, rows)
+	}
+	if err != nil {
+		return err
+	}
+	k := 0
+	for st, err := range chunk.Rows() {
+		if err != nil {
+			return err
+		}
+		if err := st.SetResult(out[k]); err != nil {
+			return err
+		}
+		k++
+	}
+	return nil
 }
 
 // points reads a series' points, a list of {'t': timestamp, 'y': value}.
@@ -266,7 +290,22 @@ type job struct {
 	grid    Grid
 	// from is the grid step the forecast starts at.
 	from int
+	// interval is the interval that matters most: the forecast's
+	// confidence, or detection's threshold.
+	interval float64
 }
+
+// backend forecasts jobs: the model pack's models (Service), or hosted ones
+// through an AI integration (hosted).
+type backend interface {
+	// model resolves the model SQL names; ok is false when it names none.
+	model(name string) (string, bool)
+	// run forecasts the jobs; errors that are not ErrInput's fail the
+	// statement.
+	run(ctx context.Context, jobs []*job) ([]tsfm.Forecast, []error)
+}
+
+func (s *Service) model(name string) (string, bool) { return s.Model(name) }
 
 // run forecasts the jobs, model by model, on the machine's threads.
 func (s *Service) run(ctx context.Context, jobs []*job) ([]tsfm.Forecast, []error) {
@@ -323,7 +362,7 @@ func isInputErr(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), tsfm.ErrInput.Error()))
 }
 
-func (s *Service) forecastRows(ctx context.Context, rows [][]any) ([]any, error) {
+func forecastRows(ctx context.Context, b backend, rows [][]any) ([]any, error) {
 	out := make([]any, len(rows))
 	var jobs []*job
 	for i, r := range rows {
@@ -332,7 +371,7 @@ func (s *Service) forecastRows(ctx context.Context, rows [][]any) ([]any, error)
 		if err != nil {
 			return nil, err
 		}
-		name, ok := s.Model(model)
+		name, ok := b.model(model)
 		if !ok {
 			return nil, fmt.Errorf("%w: %q is not a forecasting model of the model pack (docs/models.md)", ErrInput, model)
 		}
@@ -357,9 +396,10 @@ func (s *Service) forecastRows(ctx context.Context, rows [][]any) ([]any, error)
 			out[i] = failed(true, fmt.Errorf("%w: the horizon ends before the series does", ErrInput))
 			continue
 		}
-		jobs = append(jobs, &job{row: i, model: name, context: g.Values, horizon: h, opts: opts, grid: g, from: len(g.Values)})
+		jobs = append(jobs, &job{row: i, model: name, context: g.Values, horizon: h, opts: opts, grid: g, from: len(g.Values),
+			interval: opts.Confidence})
 	}
-	fs, errs := s.run(ctx, jobs)
+	fs, errs := b.run(ctx, jobs)
 	for n, j := range jobs {
 		if errs[n] != nil {
 			if fatal(errs[n]) {
@@ -403,7 +443,7 @@ func Score(f tsfm.Forecast, y float64, t int) float64 {
 	return math.Abs(2*f.CDF(y, t) - 1)
 }
 
-func (s *Service) detectRows(ctx context.Context, rows [][]any) ([]any, error) {
+func detectRows(ctx context.Context, b backend, rows [][]any) ([]any, error) {
 	out := make([]any, len(rows))
 	type target struct {
 		row   int
@@ -420,7 +460,7 @@ func (s *Service) detectRows(ctx context.Context, rows [][]any) ([]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, ok := s.Model(model)
+		name, ok := b.model(model)
 		if !ok {
 			return nil, fmt.Errorf("%w: %q is not a forecasting model of the model pack (docs/models.md)", ErrInput, model)
 		}
@@ -497,7 +537,7 @@ func (s *Service) detectRows(ctx context.Context, rows [][]any) ([]any, error) {
 				return
 			}
 			jobs = append(jobs, &job{row: len(targets) - 1, model: name, context: ctxVals, horizon: window[len(window)-1] - from + 1,
-				opts: opts, grid: g, from: from})
+				opts: opts, grid: g, from: from, interval: opts.Threshold})
 			owners = append(owners, window)
 		}
 		if opts.Rolling {
@@ -522,7 +562,7 @@ func (s *Service) detectRows(ctx context.Context, rows [][]any) ([]any, error) {
 			add(from, steps)
 		}
 	}
-	fs, errs := s.run(ctx, jobs)
+	fs, errs := b.run(ctx, jobs)
 	scored := make([]map[int][]any, len(targets))
 	for n, j := range jobs {
 		tg := targets[j.row]

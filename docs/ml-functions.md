@@ -750,12 +750,14 @@ SELECT * FROM ai_forecast(
 | `ai_forecast` | `observed`, `TABLE(name)` or `TABLE(SELECT ...)`; `horizon`, the first time not forecast; `time_col`; `value_col`, a column or an array of them; `group_col`, a column or an array; `prediction_interval_width` (0.95); `frequency` (pandas' `'D'`, `'H'`, `'15min'`, `'W'`, `'MS'`, or `'1 day'`; inferred by default); `positive_only`; `version` (`'1'` or `'2'`); `model` (an Igloo extension; default `'chronos-2'`) | `time_col`, the groups, and for each value column `<v>_forecast`, `<v>_upper` and `<v>_lower` |
 | `ai_detect_anomalies` | `observed`; `time_col`; `value_col`; `group_col`; `anomaly_threshold` (0.95); `only_last_n`, a number of points or a timestamp; `smoothing` (accepted, no effect); `model` (default `'chronos-2'`) | `time_col`, the groups, the value column, `expected`, `lower_bound`, `upper_bound`, `anomaly_score`, `is_anomaly` |
 
-- **Models.** `model` names a model of the pack as `method` does (above):
-  BigQuery's `'TimesFM 2.5'` is `timesfm-2.5`. Databricks names no model;
-  Igloo forecasts with `chronos-2` unless `model` says otherwise. A model
-  the pack lacks is refused, saying how to install it. `'TimesFM 3.0'`,
-  which BigQuery offers in preview, is refused: its weights are licensed
-  for non-commercial use only, so the pack does not hold them.
+- **Models.** `model` names a model of the pack as `method` does (above),
+  or a hosted one an AI integration maps ([below](#hosted-models)):
+  BigQuery's `'TimesFM 2.5'` is the pack's `timesfm-2.5`. Databricks names
+  no model; Igloo forecasts with `chronos-2` unless `model` says otherwise.
+  A model the pack lacks is refused, saying how to install it.
+  `'TimesFM 3.0'`, which BigQuery offers in preview, is only hosted: its
+  weights are licensed for non-commercial use only, so the pack does not
+  hold them; a `bigquery` integration that maps it runs it in BigQuery.
 - **Series.** Each combination of `id_cols` (`group_col`) values is a
   series, forecast on its own. Its frequency is the most common gap between
   its timestamps; several rows at one step are averaged, and steps without
@@ -788,6 +790,62 @@ SELECT * FROM ai_forecast(
   `id_cols`, forecasts them. Without `id_cols`, and in statements that do
   not run on workers, the replica forecasts. Workers forecast with their
   own copy of the model pack (see [where the pack lives](models.md#where-the-pack-lives)).
+  A hosted model (below) is called by the replica that runs the statement.
+
+### Hosted models
+
+`model` may also name a model an [AI integration](ai-functions.md#ai-integrations)
+maps: a provider's model, called with your own credentials, for the models
+the pack cannot hold or that you already run.
+
+```sql
+-- Admins: TimeGPT, with your Nixtla key.
+CREATE AI INTEGRATION timeseries PROVIDER = nixtla API_KEY = '...'
+  MODELS = ('timegpt' = 'timegpt-1', 'timegpt-long' = 'timegpt-1-long-horizon');
+GRANT USAGE ON INTEGRATION timeseries TO ROLE analysts;
+
+-- TimesFM 3.0, run by BigQuery in your Google Cloud project.
+CREATE AI INTEGRATION bigquery_ml PROVIDER = bigquery SERVICE_ACCOUNT = '{...}' PROJECT = 'demo-project' REGION = 'US'
+  MODELS = ('TimesFM 3.0' = 'TimesFM 3.0');
+
+SELECT * FROM AI.FORECAST(TABLE demo.daily_spend, data_col => 'spend', timestamp_col => 'day',
+                          id_cols => ['campaign'], model => 'timegpt', horizon => 14);
+```
+
+| Integration | `MODELS` maps a name to | What it calls |
+|---|---|---|
+| `nixtla` | a TimeGPT model: `timegpt-1`, `timegpt-1-long-horizon`, or another your Nixtla account has | Nixtla's `/v2/forecast`, at `https://api.nixtla.io` or `BASE_URL` (a Microsoft Foundry deployment of TimeGPT) |
+| `sagemaker` | a SageMaker endpoint's name, of Chronos-2 or Chronos-Bolt deployed from JumpStart | the endpoint's `invocations` |
+| `bedrock` | a Bedrock Marketplace endpoint's ARN, of Chronos-Bolt | Bedrock's `InvokeModel` |
+| `vertex` (with a `SERVICE_ACCOUNT`) | a Vertex AI endpoint of TimesFM from Model Garden: its ID, `endpoints/ID` or `projects/P/locations/L/endpoints/ID` (shared public endpoints) | the endpoint's `predict` |
+| `bigquery` | a model `AI.FORECAST` takes: `'TimesFM 3.0'` or `'TimesFM 2.5'` | BigQuery's `AI.FORECAST`, as a query in `PROJECT` |
+
+- **Names.** A name an integration the user may use maps is that
+  integration's model, even one the pack has too; other names are the
+  pack's. Users need `USAGE` on the integration, as for AI functions, and
+  `SET ai_integration` chooses among integrations that map the same name.
+- **What is sent.** Each series' last `context_window` points (2,048 by
+  default), from its first value, with gaps filled in between their
+  neighbours, its start and its step. **With a `bigquery` integration the
+  series' timestamps and values leave for BigQuery**, which runs
+  `AI.FORECAST` over them in your project and bills that query; Google's
+  terms for BigQuery then apply to them. TimesFM 3.0's weights are licensed
+  for non-commercial use only; Google permits its commercial use through
+  BigQuery, which is why Igloo reaches it there.
+- **Intervals.** Igloo asks for the deciles and the interval's bounds where
+  the provider takes quantiles (Nixtla, as levels; Chronos, within 0.1 and
+  0.9; TimesFM's endpoint answers deciles), and reads intervals and
+  anomaly probabilities from them as for the pack's models. BigQuery
+  answers one interval, at `confidence_level` (the detection threshold for
+  detection): beyond it, quantiles are extended as a normal distribution
+  would be.
+- **Calls** are AI functions' calls: made only by the replica that runs the
+  statement (workers may still read and gather the series), a batch of
+  series a request, kept to the statement's caps, counted in the query
+  history and `igloo.usage` (Nixtla reports tokens; set `PRICES` for its
+  cost), and kept in the [cache](ai-functions.md#the-cache): the same
+  series forecast the same way again is answered from it. A series the
+  provider refuses has a status row saying why.
 
 ## Tasks
 
