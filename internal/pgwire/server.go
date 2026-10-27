@@ -1940,9 +1940,16 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			}
 			// Its AI functions run under aist (see aiRunning).
 			return sess.aiRunning(ctx, aist, func() error {
-				if aist != nil && explaining {
-					// EXPLAIN says what the AI functions would send.
-					tw.DataWriter = &extraRows{DataWriter: tw.DataWriter, rows: s.explainAI(ctx, sess, aist, explain, args)}
+				if explaining {
+					// EXPLAIN says what the AI functions would send, and which
+					// model each forecast's name means (see tsforecast.go).
+					var extra [][]any
+					if aist != nil {
+						extra = s.explainAI(ctx, sess, aist, explain, args)
+					}
+					if extra = append(extra, s.explainForecasts(ctx, sess, explain)...); len(extra) > 0 {
+						tw.DataWriter = &extraRows{DataWriter: tw.DataWriter, rows: extra}
+					}
 				}
 				switch {
 				case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -142,10 +143,12 @@ type forecaster struct {
 	forecast, detect string
 }
 
-// forecastModel resolves the model a call names, or its default: a name an
-// AI integration the user may use maps is a hosted model's, called through
-// the integration on this replica (package ai); any other the model
-// pack's.
+// forecastModel resolves the model a call names, or its default. A name
+// the model pack has is the pack's, run here, even where an AI integration
+// maps it too, so that no series leaves Igloo unless the call says so:
+// integration/name names a hosted model, and so does a name the pack does
+// not have that an integration the user may use maps. Hosted models are
+// called through the integration on this replica (package ai).
 func (s *Server) forecastModel(ctx context.Context, sess *session, user auth.User, c *snowflake.ModelCall, def string) (forecaster, error) {
 	name := def
 	if v := c.Arg("MODEL"); v != nil && v.Kind != snowflake.ValueNull {
@@ -154,30 +157,87 @@ func (s *Server) forecastModel(ctx context.Context, sess *session, user auth.Use
 		}
 		name = v.Str
 	}
-	if s.ai != nil {
-		privs, err := s.privileges(ctx, sess, user)
-		if err != nil {
-			return forecaster{}, denied("could not load roles: %v", err)
+	hosted := func() (ai.ForecastTarget, bool, error) {
+		if s.ai == nil {
+			return ai.ForecastTarget{}, false, nil
 		}
-		o := ai.StatementOptions{User: user.Name, Roles: privs.Roles, Admin: user.Role == auth.RoleAdmin, Integration: sess.aiIntegration}
-		hosted, err := s.ai.ForecastModel(ctx, o, name)
+		o, err := s.aiOptions(ctx, sess, user)
 		if err != nil {
-			return forecaster{}, aiError(err)
+			return ai.ForecastTarget{}, false, err
 		}
-		if hosted {
+		t, ok, err := s.ai.ForecastModel(ctx, o, name)
+		return t, ok, aiError(err)
+	}
+	model, local := s.forecasting.Provides(name)
+	if !local {
+		_, ok, err := hosted()
+		switch {
+		case err != nil:
+			return forecaster{}, err
+		case ok:
 			return forecaster{model: name, hosted: true, forecast: ai.ForecastFunction, detect: ai.DetectFunction}, nil
 		}
-	}
-	model, ok := s.forecasting.Model(name)
-	if !ok {
-		return forecaster{}, pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s is not a forecasting model Igloo has", name),
-			codes.UndefinedObject), "the model pack's forecasting models are chronos-bolt-tiny, -mini, -small and -base, chronos-2, "+
-			"chronos-2-small and timesfm-2.5 (docs/models.md); an AI integration can map hosted ones (docs/ml-functions.md)")
+		var named bool
+		if model, named = s.forecasting.Model(name); !named {
+			return forecaster{}, pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s is not a forecasting model Igloo has", name),
+				codes.UndefinedObject), "the model pack's forecasting models are chronos-bolt-tiny, -mini, -small and -base, chronos-2, "+
+				"chronos-2-small and timesfm-2.5 (docs/models.md); an AI integration can map hosted ones (docs/ml-functions.md)")
+		}
 	}
 	if _, err := s.forecasting.MaxContext(model); err != nil {
-		return forecaster{}, loadError(err)
+		err = loadError(err)
+		if t, ok, _ := hosted(); ok && local {
+			err = pgerror.WithHint(err, fmt.Sprintf("the AI integration %s maps %s too: name it '%s/%s' to forecast with %s's %s, "+
+				"which sends the series there", t.Integration, name, t.Integration, name, t.Provider, t.Model))
+		}
+		return forecaster{}, err
 	}
 	return forecaster{model: model, forecast: tsforecast.ForecastFunction, detect: tsforecast.DetectFunction}, nil
+}
+
+// aiOptions are what resolving a hosted model takes of the session: its
+// user, their roles and its ai_integration.
+func (s *Server) aiOptions(ctx context.Context, sess *session, user auth.User) (ai.StatementOptions, error) {
+	privs, err := s.privileges(ctx, sess, user)
+	if err != nil {
+		return ai.StatementOptions{}, denied("could not load roles: %v", err)
+	}
+	return ai.StatementOptions{User: user.Name, Roles: privs.Roles, Admin: user.Role == auth.RoleAdmin, Integration: sess.aiIntegration}, nil
+}
+
+// forecastCalls finds the forecasting functions' calls in a rewritten
+// statement, with the model each names.
+var forecastCalls = regexp.MustCompile(`\b(igloo_ts_forecast|igloo_ts_detect|ai_ts_forecast|ai_ts_detect)\('((?:[^']|'')*)'`)
+
+// explainForecasts is what EXPLAIN adds for a statement that forecasts:
+// the model each call's name resolved to, and whether its series leave
+// Igloo.
+func (s *Server) explainForecasts(ctx context.Context, sess *session, query string) [][]any {
+	var out [][]any
+	seen := map[string]bool{}
+	for _, m := range forecastCalls.FindAllStringSubmatch(query, -1) {
+		hosted := strings.HasPrefix(m[1], "ai_")
+		name := strings.ReplaceAll(m[2], "''", "'")
+		if seen[fmt.Sprint(hosted, name)] {
+			continue
+		}
+		seen[fmt.Sprint(hosted, name)] = true
+		if !hosted {
+			out = append(out, []any{"forecast model", fmt.Sprintf("%s: the model pack's, run by Igloo; the series stay in Igloo", name)})
+			continue
+		}
+		desc := "a hosted model no AI integration of the session maps"
+		if s.ai != nil {
+			if o, err := s.aiOptions(ctx, sess, sess.currentUser()); err == nil {
+				if t, ok, err := s.ai.ForecastModel(ctx, o, name); err == nil && ok {
+					desc = fmt.Sprintf("hosted: the AI integration %s's %s (%s, %s); the series are sent there", t.Integration, t.Model,
+						t.Provider, t.Target)
+				}
+			}
+		}
+		out = append(out, []any{"forecast model", name + ": " + desc})
+	}
+	return out
 }
 
 // checkForecastMethod checks the method of a FORECAST or

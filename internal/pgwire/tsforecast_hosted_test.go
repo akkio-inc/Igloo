@@ -1,7 +1,9 @@
 package pgwire
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
@@ -86,7 +89,7 @@ func TestHostedForecast(t *testing.T) {
 	mustExec(t, cs.admin, dailySpend)
 	f := newFakeTimeGPT(t)
 	mustExec(t, cs.admin, `CREATE AI INTEGRATION timeseries PROVIDER = nixtla BASE_URL = '`+f.srv.URL+`'
-		API_KEY = 'nixtla-test-not-a-real-key' MODELS = ('timegpt' = 'timegpt-1')`)
+		API_KEY = 'nixtla-test-not-a-real-key' MODELS = ('timegpt' = 'timegpt-1', 'test-bolt' = 'timegpt-1', 'chronos-2' = 'timegpt-1')`)
 	conn := cs.admin
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
 	// Series are sent as float32 values, as the model pack's models read them.
@@ -134,9 +137,49 @@ func TestHostedForecast(t *testing.T) {
 	if n := count(t, ana, hosted); n != 2 {
 		t.Errorf("ana forecasts %d steps", n)
 	}
-	// The model pack's models are as before.
-	if n := count(t, ana, `SELECT count(*) FROM AI.FORECAST(TABLE daily_spend, data_col => 'spend', timestamp_col => 'day',
-		model => 'test-bolt', horizon => 2)`); n != 2 {
-		t.Errorf("ana forecasts %d steps with test-bolt", n)
+	// A name the model pack has is the pack's, though the integration maps
+	// it too: no series leaves unless the call names the integration.
+	sent := f.sent()
+	pack := `SELECT count(*) FROM AI.FORECAST(TABLE daily_spend, data_col => 'spend', timestamp_col => 'day', model => '%s', horizon => 2)`
+	if n := count(t, ana, fmt.Sprintf(pack, "test-bolt")); n != 2 || f.sent() != sent {
+		t.Errorf("ana forecasts %d steps with test-bolt, and sent %d requests", n, f.sent()-sent)
+	}
+	// (Four steps: the cache holds the two-step forecast, from timegpt,
+	// the same model.)
+	if n := count(t, ana, strings.Replace(fmt.Sprintf(pack, "timeseries/test-bolt"), "horizon => 2", "horizon => 4", 1)); n != 4 ||
+		f.sent() != sent+1 {
+		t.Errorf("ana forecasts %d steps with timeseries/test-bolt, and sent %d requests", n, f.sent()-sent)
+	}
+	// EXPLAIN says which, and sends nothing.
+	explain := func(model string) string {
+		t.Helper()
+		for _, row := range texts(t, conn, "EXPLAIN "+fmt.Sprintf(pack, model)) {
+			if v, ok := strings.CutPrefix(row, "forecast model|"); ok {
+				return v
+			}
+		}
+		return ""
+	}
+	sent = f.sent()
+	if got := explain("TEST-BOLT"); got != "test-bolt: the model pack's, run by Igloo; the series stay in Igloo" {
+		t.Errorf("EXPLAIN of test-bolt: %q", got)
+	}
+	if got := explain("timeseries/test-bolt"); !strings.HasPrefix(got,
+		"timeseries/test-bolt: hosted: the AI integration timeseries's timegpt-1 (nixtla, http://127.0.0.1:") ||
+		!strings.HasSuffix(got, "the series are sent there") {
+		t.Errorf("EXPLAIN of timeseries/test-bolt: %q", got)
+	}
+	if got := explain("timegpt"); !strings.HasPrefix(got, "timegpt: hosted: the AI integration timeseries's timegpt-1") {
+		t.Errorf("EXPLAIN of timegpt: %q", got)
+	}
+	if f.sent() != sent {
+		t.Errorf("EXPLAIN sent %d requests", f.sent()-sent)
+	}
+	// A pack model that is not installed says how to reach the hosted one.
+	_, err := ana.Exec(context.Background(), fmt.Sprintf(pack, "chronos-2"))
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" || !strings.Contains(pgErr.Message, "igloo models install chronos-2") ||
+		!strings.Contains(pgErr.Hint, "'timeseries/chronos-2'") {
+		t.Errorf("chronos-2, not installed: %v", err)
 	}
 }

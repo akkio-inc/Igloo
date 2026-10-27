@@ -242,14 +242,21 @@ func TestStatementForecast(t *testing.T) {
 		in.DefaultModel, in.Prices = "", nil
 	})
 	ana := StatementOptions{User: "ana", Roles: []string{"analysts"}}
-	if ok, err := rt.ForecastModel(ctx, ana, "TimeGPT"); !ok || err != nil {
-		t.Errorf("timegpt for ana: %v %v", ok, err)
+	if tg, ok, err := rt.ForecastModel(ctx, ana, "TimeGPT"); !ok || err != nil || tg.Integration != "main" || tg.Model != "timegpt-1" ||
+		tg.Provider != ProviderNixtla || tg.Target != f.srv.URL {
+		t.Errorf("timegpt for ana: %+v %v %v", tg, ok, err)
 	}
-	if ok, _ := rt.ForecastModel(ctx, StatementOptions{User: "nina"}, "timegpt"); ok {
+	if tg, ok, _ := rt.ForecastModel(ctx, ana, "main/timegpt"); !ok || tg.Model != "timegpt-1" {
+		t.Errorf("main/timegpt: %+v %v", tg, ok)
+	}
+	if _, ok, _ := rt.ForecastModel(ctx, StatementOptions{User: "nina"}, "timegpt"); ok {
 		t.Error("nina has no USAGE on the integration")
 	}
-	if ok, _ := rt.ForecastModel(ctx, ana, "chronos-2"); ok {
+	if _, ok, _ := rt.ForecastModel(ctx, ana, "chronos-2"); ok {
 		t.Error("an unmapped name")
+	}
+	if _, ok, _ := rt.ForecastModel(ctx, ana, "other/timegpt"); ok {
+		t.Error("an integration that does not exist")
 	}
 	for round := range 2 {
 		s := begin(t, rt)
@@ -268,12 +275,21 @@ func TestStatementForecast(t *testing.T) {
 	if n := f.calls.Load(); n != 1 {
 		t.Errorf("%d requests for two series, twice", n)
 	}
+	// integration/name is the same model, answered from the cache.
+	s := begin(t, rt)
+	if _, errs, err := s.Forecast("main/timegpt", twoSeries(), 2, day, []float64{0.1, 0.5, 0.9}, 0.8, false); err != nil || errs[0] != nil ||
+		s.End().CacheHits != 2 {
+		t.Errorf("main/timegpt: %v %v", err, errs)
+	}
+	if _, _, err := begin(t, rt).Forecast("main/prophet", twoSeries(), 2, day, nil, 0.8, false); !errors.Is(err, ErrModel) {
+		t.Errorf("main/prophet: %v", err)
+	}
 	// A model of an integration without time series models.
 	rt2 := testRuntime(t, f)
 	if _, _, err := begin(t, rt2).Forecast("m", twoSeries(), 2, day, nil, 0.9, false); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("an openai model: %v", err)
 	}
-	if ok, _ := rt2.ForecastModel(ctx, ana, "m"); ok {
+	if _, ok, _ := rt2.ForecastModel(ctx, ana, "m"); ok {
 		t.Error("an openai model forecasts")
 	}
 }

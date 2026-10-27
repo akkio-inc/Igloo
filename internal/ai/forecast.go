@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -135,28 +136,70 @@ func (in *Integration) Forecasts() bool {
 	return false
 }
 
-// ForecastModel reports whether a hosted model forecasts for model, as
-// SQL names it: an integration the user may use maps it, and its provider
-// has time series models. Such a name is the integration's, not the model
-// pack's.
-func (rt *Runtime) ForecastModel(ctx context.Context, o StatementOptions, model string) (bool, error) {
+// ForecastTarget is a hosted model as a name resolved to it: the
+// integration, its provider, the provider's model, and where requests go.
+type ForecastTarget struct {
+	Integration, Provider, Model, Target string
+}
+
+// ForecastModel reports whether a hosted model forecasts for model, as SQL
+// names it, and which: integration/name, a model the named integration
+// maps; or a name an integration the user may use maps (the session's
+// ai_integration's, if set). The integration's provider must have time
+// series models. Whether a name the model pack has too is the pack's is
+// the caller's to decide.
+func (rt *Runtime) ForecastModel(ctx context.Context, o StatementOptions, model string) (ForecastTarget, bool, error) {
 	_, version, err := rt.opts.Store.State(ctx)
 	if err != nil {
-		return false, fmt.Errorf("read the AI cache's state: %w", err)
+		return ForecastTarget{}, false, fmt.Errorf("read the AI cache's state: %w", err)
 	}
 	bindings, usage, err := rt.load(ctx, version)
 	if err != nil {
-		return false, err
+		return ForecastTarget{}, false, err
 	}
-	for name, b := range bindings {
+	usable := func(name string, b *binding) bool {
+		return b.in.Enabled && b.in.Forecasts() && (o.Admin || mayUse(usage, name, o.User, o.Roles))
+	}
+	target := func(b *binding, m string) ForecastTarget {
+		return ForecastTarget{Integration: b.in.Name, Provider: b.in.Provider, Model: m, Target: b.in.Target()}
+	}
+	if integ, rest, ok := strings.Cut(model, "/"); ok {
+		if b, ok := bindings[strings.ToLower(strings.TrimSpace(integ))]; ok && usable(b.in.Name, b) {
+			if m, ok := b.in.Model(rest); ok {
+				return target(b, m), true, nil
+			}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(bindings)) {
+		b := bindings[name]
 		if o.Integration != "" && name != o.Integration {
 			continue
 		}
-		if _, ok := b.in.Model(model); ok && b.in.Enabled && b.in.Forecasts() && (o.Admin || mayUse(usage, name, o.User, o.Roles)) {
-			return true, nil
+		if m, ok := b.in.Model(model); ok && usable(name, b) {
+			return target(b, m), true, nil
 		}
 	}
-	return false, nil
+	return ForecastTarget{}, false, nil
+}
+
+// forecastBinding returns the integration and provider model that serve
+// model: integration/name names both, a name alone is resolved as other
+// AI functions' models are.
+func (s *Statement) forecastBinding(model string) (*binding, string, error) {
+	if integ, rest, ok := strings.Cut(model, "/"); ok {
+		integ = strings.ToLower(strings.TrimSpace(integ))
+		for _, b := range s.usable {
+			if b.in.Name != integ {
+				continue
+			}
+			if m, ok := b.in.Model(rest); ok {
+				return b, m, nil
+			}
+			return nil, "", fmt.Errorf("%w %s: the AI integration %s does not map %s; an admin maps it with ALTER AI INTEGRATION %s SET "+
+				"MODELS = (%s = 'provider-model', ...)", ErrModel, quote(model), b.in.Name, quote(rest), b.in.Name, quote(strings.ToLower(rest)))
+		}
+	}
+	return s.binding(ForecastFunction, model, "")
 }
 
 // Forecast forecasts series with the hosted model SQL names model, horizon
@@ -168,7 +211,7 @@ func (s *Statement) Forecast(model string, series []ForecastSeries, horizon int,
 	if len(series) == 0 {
 		return nil, nil, nil
 	}
-	b, provider, err := s.binding(ForecastFunction, model, "")
+	b, provider, err := s.forecastBinding(model)
 	if err != nil {
 		return nil, nil, s.fail(err)
 	}

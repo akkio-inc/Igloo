@@ -333,7 +333,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `vertex` and Chronos on Bedrock Marketplace. `AI.FORECAST`,
   `ai_forecast` and their detection functions call a model an integration
   maps on the replica, in batches, cached, with the AI functions' grants,
-  caps and usage.
+  caps and usage. A name the model pack has always means the pack's model;
+  `'integration/name'` names a hosted one, and `EXPLAIN` says which a name
+  resolved to and whether its series leave Igloo.
 
 ### Loading and scheduling
 

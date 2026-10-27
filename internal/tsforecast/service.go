@@ -61,6 +61,14 @@ func (s *Service) Model(method string) (string, bool) {
 	return "", false
 }
 
+// Provides returns the model of the pack a name means, if it means one the
+// pack can run, installed or not: a model of the catalog, or one installed
+// from a manifest; not TimesFM 3.0, which Model names only to refuse it.
+func (s *Service) Provides(name string) (string, bool) {
+	model, ok := s.Model(name)
+	return model, ok && model != timesFM3
+}
+
 // timesFM3 is TimesFM 3.0, whose weights are not openly licensed.
 const timesFM3 = "timesfm-3.0"
 

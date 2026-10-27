@@ -754,7 +754,8 @@ SELECT * FROM ai_forecast(
 | `ai_detect_anomalies` | `observed`; `time_col`; `value_col`; `group_col`; `anomaly_threshold` (0.95); `only_last_n`, a number of points or a timestamp; `smoothing` (accepted, no effect); `model` (default `'chronos-2'`) | `time_col`, the groups, the value column, `expected`, `lower_bound`, `upper_bound`, `anomaly_score`, `is_anomaly` |
 
 - **Models.** `model` names a model of the pack as `method` does (above),
-  or a hosted one an AI integration maps ([below](#hosted-models)):
+  or a hosted one an AI integration maps ([below](#hosted-models)), which
+  a name the pack has never means unless it says `'integration/name'`:
   BigQuery's `'TimesFM 2.5'` is the pack's `timesfm-2.5`. Databricks names
   no model; Igloo forecasts with `chronos-2` unless `model` says otherwise.
   A model the pack lacks is refused, saying how to install it.
@@ -823,10 +824,21 @@ SELECT * FROM AI.FORECAST(TABLE demo.daily_spend, data_col => 'spend', timestamp
 | `vertex` (with a `SERVICE_ACCOUNT`) | a Vertex AI endpoint of TimesFM from Model Garden: its ID, `endpoints/ID` or `projects/P/locations/L/endpoints/ID` (shared public endpoints) | the endpoint's `predict` |
 | `bigquery` | a model `AI.FORECAST` takes: `'TimesFM 3.0'` or `'TimesFM 2.5'` | BigQuery's `AI.FORECAST`, as a query in `PROJECT` |
 
-- **Names.** A name an integration the user may use maps is that
-  integration's model, even one the pack has too; other names are the
-  pack's. Users need `USAGE` on the integration, as for AI functions, and
-  `SET ai_integration` chooses among integrations that map the same name.
+- **Names.** A name the pack has (its catalog's, installed or not, or
+  one installed from a manifest) always means the pack's model, run by
+  Igloo, even where an integration maps the same name: no series leaves
+  Igloo unless the call names a hosted model. `'integration/name'`, such
+  as `'timeseries/timegpt'` or `'sagemaker_chronos/chronos-2'`, names the
+  model that integration maps; a name the pack does not have, such as
+  `'timegpt'` or `'TimesFM 3.0'`, means the model an integration the user
+  may use maps, if one does (the session's `ai_integration` chooses among
+  several). Users need `USAGE` on the integration, as for AI functions.
+- **Which one.** `EXPLAIN` of a statement that forecasts adds a
+  `forecast model` row for each name: the pack's model, whose series stay
+  in Igloo, or the integration, its provider, the provider's model and the
+  address the series are sent to. It sends nothing. A call of a pack model
+  that is not installed, which an integration maps too, fails with a hint
+  naming the hosted one.
 - **What is sent.** Each series' last `context_window` points (2,048 by
   default), from its first value, with gaps filled in between their
   neighbours, its start and its step. **With a `bigquery` integration the
