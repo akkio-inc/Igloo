@@ -107,6 +107,18 @@ func TrainALS(r Ratings, users, items int, p ALSParams) (*ALS, ALSInfo, error) {
 	for i := range V {
 		V[i] = (2*unitHash(p.Seed, 0xa151, i) - 1) * scale
 	}
+	// Users and items without ratings learn nothing: their factors stay 0
+	// rather than their random start.
+	for u := range users {
+		if byUser.start[u] == byUser.start[u+1] {
+			clear(U[u*k : (u+1)*k])
+		}
+	}
+	for i := range items {
+		if byItem.start[i] == byItem.start[i+1] {
+			clear(V[i*k : (i+1)*k])
+		}
+	}
 	var ub, ib []float64
 	if !p.Implicit {
 		var sum float64

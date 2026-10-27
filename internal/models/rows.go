@@ -149,6 +149,9 @@ func lowerKeys(m map[string]any) map[string]any {
 // TrainingInputs returns the rows a row method reads when it is called
 // without INPUT_DATA, or nil when it needs INPUT_DATA.
 func (a *Artifact) TrainingInputs(method string) *Result {
+	if a.Factors != nil {
+		return a.Factors.trainingInputs(method)
+	}
 	return nil
 }
 

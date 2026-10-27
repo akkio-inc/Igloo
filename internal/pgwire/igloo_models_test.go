@@ -110,6 +110,62 @@ func TestIglooPCA(t *testing.T) {
 	expectCode(t, conn, `CREATE IGLOO.ML.PCA p(INPUT_DATA => TABLE(measures))`, "22023", "num_principal_components")
 }
 
+func TestIglooMatrixFactorization(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	// Ratings of rank one, of about 40% of pairs; people are numbers.
+	mustExec(t, cs.admin, `CREATE TABLE lake.public.ratings AS
+		SELECT u AS person_id, 'c' || i AS campaign, 3 + ((u % 5) - 2) * ((i % 4) - 1.5) / 2 AS rating
+		FROM range(0, 100) a(u), range(0, 30) b(i) WHERE (u * 7 + i * 3) % 10 < 4`)
+	// Clicks of two groups of people, each on its own half of the campaigns.
+	mustExec(t, cs.admin, `CREATE TABLE lake.public.clicks AS
+		SELECT 'p' || u AS person_id, 'c' || i AS campaign, 1 + (u * i) % 3 AS clicks
+		FROM range(0, 120) a(u), range(0, 40) b(i) WHERE (u % 2 = 0) = (i < 20) AND hash(u * 1000 + i) % 5 < 2`)
+	conn := snowflakeConn(t, cs.admin)
+	mustExec(t, conn, `CREATE IGLOO.ML.MATRIX_FACTORIZATION tastes(INPUT_DATA => TABLE(ratings), USER_COLNAME => 'person_id',
+		ITEM_COLNAME => 'campaign', RATING_COLNAME => 'rating', CONFIG_OBJECT => {'num_factors': 2, 'l2_reg': 0.01})`)
+	if got := texts(t, conn, `SELECT avg(abs(predicted_rating - rating)) < 0.1
+		FROM TABLE(tastes!PREDICT(INPUT_DATA => TABLE(ratings)))`); len(got) != 1 || got[0] != "true" {
+		t.Errorf("PREDICT: %q", got)
+	}
+	// A pair no one rated is predicted from the factors: its planted rating
+	// is 4.5.
+	if got := texts(t, conn, `SELECT abs(tastes!PREDICT(INPUT_DATA => {'person_id': 4, 'campaign': 'c3'}):value::FLOAT - 4.5) < 0.5`); len(got) != 1 ||
+		got[0] != "true" {
+		t.Errorf("an unrated pair: %q", got)
+	}
+	if got := texts(t, conn, `SELECT count(*), count(DISTINCT person_id), min(predicted_rating) > 3 FROM TABLE(tastes!RECOMMEND(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT DISTINCT person_id FROM ratings WHERE person_id IN (0, 4)'),
+		CONFIG_OBJECT => {'top_k': 4}))`); len(got) != 1 || got[0] != "8|2|true" {
+		t.Errorf("RECOMMEND: %q", got)
+	}
+	// Without INPUT_DATA, to everyone the model knows.
+	if got := texts(t, conn, "SELECT count(*), count(DISTINCT campaign) > 2 FROM TABLE(tastes!RECOMMEND(CONFIG_OBJECT => {'top_k': 2}))"); len(got) != 1 ||
+		got[0] != "200|true" {
+		t.Errorf("RECOMMEND to everyone: %q", got)
+	}
+	if got := texts(t, conn, "SELECT count(*) > 10 FROM TABLE(tastes!TRAINING_INFO()) WHERE loss < 1"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("TRAINING_INFO: %q", got)
+	}
+
+	mustExec(t, conn, `CREATE IGLOO.ML.MATRIX_FACTORIZATION clicked(INPUT_DATA => TABLE(clicks), USER_COLNAME => 'person_id',
+		ITEM_COLNAME => 'campaign', RATING_COLNAME => 'clicks', CONFIG_OBJECT => {'feedback_type': 'implicit', 'num_factors': 4})`)
+	if got := texts(t, conn, `SELECT count(*) FILTER (WHERE CAST(substr(campaign, 2) AS INT) < 20), count(*)
+		FROM TABLE(clicked!RECOMMEND(INPUT_DATA => SYSTEM$QUERY_REFERENCE($$SELECT 'p0' AS person_id$$),
+			CONFIG_OBJECT => {'top_k': 5, 'exclude_seen': TRUE}))
+		WHERE (person_id, campaign) NOT IN (SELECT person_id, campaign FROM clicks)`); len(got) != 1 || got[0] != "5|5" {
+		t.Errorf("implicit RECOMMEND: %q", got)
+	}
+	if got := texts(t, conn, "SELECT average_rank < 0.4, mean_squared_error IS NOT NULL FROM TABLE(clicked!EVALUATE())"); len(got) != 1 ||
+		got[0] != "true|true" {
+		t.Errorf("implicit EVALUATE: %q", got)
+	}
+	expectCode(t, conn, `CREATE IGLOO.ML.MATRIX_FACTORIZATION m(INPUT_DATA => TABLE(clicks), USER_COLNAME => 'person_id',
+		ITEM_COLNAME => 'campaign')`, "42601", "RATING_COLNAME")
+	expectCode(t, conn, `CREATE IGLOO.ML.MATRIX_FACTORIZATION m(INPUT_DATA => TABLE(clicks), USER_COLNAME => 'person_id',
+		ITEM_COLNAME => 'campaign', RATING_COLNAME => 'nope')`, "42703")
+}
+
 func TestIglooRegression(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()
@@ -334,7 +390,11 @@ func TestDistributedIglooScoring(t *testing.T) {
 		'SELECT region, spend, visits, converted FROM campaigns'), TARGET_COLNAME => 'converted', CONFIG_OBJECT => {'algorithm': 'random_forest'})`)
 	mustExec(t, conn, `CREATE IGLOO.ML.KMEANS segs(INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT spend, visits FROM campaigns'),
 		CONFIG_OBJECT => {'num_clusters': 4})`)
+	mustExec(t, conn, `CREATE IGLOO.ML.MATRIX_FACTORIZATION slots(INPUT_DATA => SYSTEM$QUERY_REFERENCE(
+		'SELECT region, campaign_id % 20 AS slot, value FROM campaigns'), USER_COLNAME => 'region', ITEM_COLNAME => 'slot', RATING_COLNAME => 'value')`)
 	for _, query := range []string{
+		`SELECT region, count(*) FROM TABLE(slots!RECOMMEND(INPUT_DATA => TABLE(campaigns), CONFIG_OBJECT => {'top_k': 2}))
+			GROUP BY region ORDER BY region`,
 		`SELECT region, count(*) FROM TABLE(segs!DETECT_ANOMALIES(INPUT_DATA => TABLE(campaigns), CONFIG_OBJECT => {'contamination': 0.05}))
 			WHERE NOT is_anomaly GROUP BY region ORDER BY region`,
 		`SELECT region, count(*) FROM TABLE(converts!PREDICT(INPUT_DATA => TABLE(campaigns))) WHERE predicted_converted GROUP BY region ORDER BY region`,

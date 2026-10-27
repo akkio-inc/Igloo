@@ -325,6 +325,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `RANDOM_FOREST_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'random_forest'` |
 | `KMEANS` | `IGLOO.ML.KMEANS` | `'num_clusters'`, or none to pick one |
 | `PCA` | `IGLOO.ML.PCA` | `'num_principal_components'` or `'pca_explained_variance_ratio'` |
+| `MATRIX_FACTORIZATION` | `IGLOO.ML.MATRIX_FACTORIZATION` | `USER_COLNAME`, `ITEM_COLNAME`, `RATING_COLNAME` arguments; `'feedback_type'` |
 | `ARIMA_PLUS`, `ARIMA_PLUS_XREG` | `SNOWFLAKE.ML.FORECAST` | a different method, with intervals |
 | `CONTRIBUTION_ANALYSIS` | `SNOWFLAKE.ML.TOP_INSIGHTS` | |
 | `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, `XGBOOST` imports, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
@@ -336,17 +337,18 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS`, `PCA` |
 | `ML.CENTROIDS` | `CENTROIDS` | `KMEANS` |
 | `ML.PRINCIPAL_COMPONENTS`, `ML.PRINCIPAL_COMPONENT_INFO` | `PRINCIPAL_COMPONENTS`, `PRINCIPAL_COMPONENT_INFO` | `PCA` |
+| `ML.RECOMMEND` | `RECOMMEND` | `MATRIX_FACTORIZATION` |
 | `ML.EVALUATE` | `EVALUATE` | all |
 | `ML.CONFUSION_MATRIX`, `ML.ROC_CURVE` | `CONFUSION_MATRIX`, `ROC_CURVE` | `CLASSIFICATION` |
 | `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | `REGRESSION`, `CLASSIFICATION` |
 | `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
 | `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
-| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, `KMEANS` |
+| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, `KMEANS`, `MATRIX_FACTORIZATION` |
 
 ### Row methods and table methods
 
-**Row methods** (`PREDICT`, `EXPLAIN_PREDICT`, `DETECT_ANOMALIES`) give
-a value per row. In a
+**Row methods** (`PREDICT`, `EXPLAIN_PREDICT`, `DETECT_ANOMALIES`,
+`RECOMMEND`) give a value per row. In a
 query, `m!PREDICT(INPUT_DATA => {*})` is a JSON object, as Snowflake's
 `PREDICT` is; called as a table, as BigQuery's functions are,
 `TABLE(m!PREDICT(INPUT_DATA => TABLE(t)))` returns the input's rows and
@@ -483,6 +485,40 @@ so `pca_solver` is accepted and changes nothing.
 | `EVALUATE` | `total_explained_variance_ratio`, of the training rows or of `INPUT_DATA` |
 | `PRINCIPAL_COMPONENTS` | `principal_component_id`, `feature`, `numerical_value` (a number's loading), and for categories `category` and `categorical_value` |
 | `PRINCIPAL_COMPONENT_INFO` | `principal_component_id`, `eigenvalue`, `explained_variance_ratio`, `cumulative_explained_variance_ratio` |
+
+### MATRIX_FACTORIZATION
+
+```sql
+CREATE IGLOO.ML.MATRIX_FACTORIZATION demo.campaign_tastes(
+    INPUT_DATA => TABLE(demo.campaign_clicks),
+    USER_COLNAME => 'person_id', ITEM_COLNAME => 'campaign', RATING_COLNAME => 'clicks',
+    CONFIG_OBJECT => {'feedback_type': 'implicit', 'num_factors': 32});
+
+SELECT person_id, campaign, predicted_clicks_confidence
+FROM TABLE(demo.campaign_tastes!RECOMMEND(INPUT_DATA => TABLE(demo.audience),
+                                           CONFIG_OBJECT => {'top_k': 5, 'exclude_seen': TRUE}));
+```
+
+Users' ratings of items factorized by alternating least squares, as
+BigQuery's: users and items are read as text, and a user's ratings of an
+item add up (implicit feedback) or are averaged (explicit).
+
+- `'feedback_type': 'explicit'` (the default) predicts ratings as the mean
+  rating plus a user's and an item's bias plus their factors' product,
+  with the L2 penalty `l2_reg` (default 1) scaled by each user's and
+  item's ratings.
+- `'implicit'` treats any positive rating as a preference of 1 and every
+  pair not rated as one of 0, trusted by `1 + wals_alpha × rating`
+  (`wals_alpha` default 40), as Hu, Koren and Volinsky's method.
+- `num_factors` (default 16, at most 256), `max_iterations` (15), `seed`.
+  Users and items seen only in held-out rows get no factors.
+
+| Method | Returns |
+|---|---|
+| `PREDICT` | a user's and an item's predicted rating (`predicted_<rating>`), or confidence for implicit feedback (`predicted_<rating>_confidence`), from `INPUT_DATA`'s user and item columns; an explicit model predicts unknown users and items from the biases it has, an implicit one gives `NULL` |
+| `RECOMMEND` | for each row of `INPUT_DATA` (its user column), the `top_k` items (default 10), best first, as rows of the input's columns, the item column and the prediction; `'exclude_seen': TRUE` leaves out the items the user rated in the training data (Igloo keeps them for inputs of up to 50 million interactions). A user the model never saw gets the items of highest bias (explicit) or none (implicit). Without `INPUT_DATA`, it recommends to every user the model knows |
+| `EVALUATE` | on the held-out interactions or `INPUT_DATA`'s: a regression's metrics for explicit ratings; for implicit feedback, over up to 1,000 users, `mean_average_precision` and `normalized_discounted_cumulative_gain` of the held-out items among those each user did not rate in training, `average_rank` (their mean percentile rank, 0 at the top) and `mean_squared_error` |
+| `TRAINING_INFO` | each iteration's training loss: explicit ratings' root mean squared error, implicit feedback's weighted squared error per user |
 
 ## Train and score in one query
 
