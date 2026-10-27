@@ -285,6 +285,9 @@ type Options struct {
 	// one in memory.
 	Models       models.Store
 	ModelRuntime *models.Runtime
+	// trainRows, in tests, bounds the rows Igloo's classes train on, in
+	// place of models.TrainRowLimit.
+	trainRows int
 
 	// external and externalFiles stand in for Sharing's external tables
 	// and the prefix of their files, and partners for its recipients and
@@ -353,9 +356,11 @@ type Server struct {
 	ai         *ai.Runtime
 	aiMaxCalls int64
 	aiMaxCost  float64
-	// models keeps models' rows, and modelRuntime their blobs.
+	// models keeps models' rows, and modelRuntime their blobs; trainRows
+	// is Options.trainRows.
 	models       models.Store
 	modelRuntime *models.Runtime
+	trainRows    int
 	// clonePurge is Options.ClonePurge (see catalogguard.go).
 	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
@@ -592,7 +597,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 			Cache: true, MaxCalls: 1000, MaxCostUSD: 1, Log: log})
 	}
 	s.aiMaxCalls, s.aiMaxCost = s.ai.Caps()
-	s.models, s.modelRuntime = opts.Models, opts.ModelRuntime
+	s.models, s.modelRuntime, s.trainRows = opts.Models, opts.ModelRuntime, opts.trainRows
 	if s.models == nil {
 		s.models = models.NewMemoryStore()
 	}

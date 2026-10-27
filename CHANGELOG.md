@@ -25,6 +25,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   its input as its user, policies applied, and `PREDICT` runs on workers.
   A model's row is in the metadata database and its blob in the
   warehouse.
+- BigQuery ML's model types as Igloo's own classes, with the same
+  statements: `IGLOO.ML.REGRESSION` and `IGLOO.ML.CLASSIFICATION` (boosted
+  trees, random forests, linear and logistic regressions), with BigQuery's
+  options in `CONFIG_OBJECT` and its functions as methods: `PREDICT` and
+  `EXPLAIN_PREDICT` in a query or as tables of the input's rows, scored on
+  workers, and `EVALUATE`, `CONFUSION_MATRIX`, `ROC_CURVE`,
+  `GLOBAL_EXPLAIN`, `FEATURE_IMPORTANCE`, `WEIGHTS` and `TRAINING_INFO`.
+  Inputs above 10 million rows are sampled repeatably.
 - Snowflake's `VECTOR(FLOAT | INT, n)` type and `VECTOR_COSINE_SIMILARITY`,
   `VECTOR_INNER_PRODUCT`, `VECTOR_L1_DISTANCE` and `VECTOR_L2_DISTANCE`,
   which Igloo refused. A vector is DuckDB's fixed-size array; an Iceberg

@@ -1,10 +1,11 @@
-// Package models carries out Snowflake's ML classes on Igloo's engine
-// (package ml): training and the methods of FORECAST, ANOMALY_DETECTION,
-// CLASSIFICATION and TOP_INSIGHTS models, Databricks' train-and-score
-// functions, the store of models' rows in the metadata database, and their
-// blobs in the warehouse's object storage. Package pgwire reads the
-// statements, checks privileges and reads training data as the user; see
-// docs/ml-functions.md.
+// Package models carries out Snowflake's ML classes and Igloo's own on
+// Igloo's engine (package ml): training and the methods of FORECAST,
+// ANOMALY_DETECTION, CLASSIFICATION and TOP_INSIGHTS models, of the
+// IGLOO.ML classes that bring BigQuery ML's model types (igloo.go),
+// Databricks' train-and-score functions, the store of models' rows in the
+// metadata database, and their blobs in the warehouse's object storage.
+// Package pgwire reads the statements, checks privileges and reads
+// training data as the user; see docs/ml-functions.md.
 package models
 
 import (
@@ -36,6 +37,8 @@ type Artifact struct {
 	Classifier *Classifier `json:"classifier,omitempty"`
 	Forecaster *Forecaster `json:"forecaster,omitempty"`
 	Regressor  *Regressor  `json:"regressor,omitempty"`
+	// Igloo's classes' models.
+	Supervised *Supervised `json:"supervised,omitempty"`
 }
 
 // Encode returns the artifact's blob and its SHA-256.
@@ -67,7 +70,13 @@ func (a *Artifact) prepare() {
 	if a.Regressor != nil {
 		a.Regressor.Model.Prepare()
 	}
+	if a.Supervised != nil {
+		a.Supervised.prepare()
+	}
 }
+
+// Prepare readies a model just trained for scoring, as decoding does.
+func (a *Artifact) Prepare() { a.prepare() }
 
 // Feature is a model's input column, and how it was read in training,
 // which scoring reads it as again.

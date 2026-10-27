@@ -2,6 +2,7 @@ package models
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -45,6 +46,9 @@ func columns(spec ...any) []ResultColumn {
 // statement's description before it runs; ok is false for a method the
 // class does not have as a table.
 func MethodColumns(class, method string) ([]ResultColumn, bool) {
+	if IsIgloo(class) {
+		return iglooMethodColumns(class, method)
+	}
 	switch class + "!" + method {
 	case ClassClassification + "!SHOW_EVALUATION_METRICS":
 		return columns("DATASET_TYPE", KindText, "CLASS", KindText, "ERROR_METRIC", KindText, "METRIC_VALUE", KindDouble,
@@ -86,6 +90,11 @@ func MethodColumns(class, method string) ([]ResultColumn, bool) {
 
 // Methods lists a class's methods, for messages.
 func Methods(class string) []string {
+	if IsIgloo(class) {
+		out := append(slices.Clone(iglooRowMethods[class]), iglooTableMethods[class]...)
+		sort.Strings(out)
+		return out
+	}
 	var out []string
 	for _, m := range []string{"PREDICT", "FORECAST", "DETECT_ANOMALIES", "GET_DRIVERS", "SHOW_EVALUATION_METRICS",
 		"SHOW_GLOBAL_EVALUATION_METRICS", "SHOW_CONFUSION_MATRIX", "SHOW_THRESHOLD_METRICS", "SHOW_FEATURE_IMPORTANCE",
@@ -183,6 +192,9 @@ func jsonArray(items []string) string {
 
 // Method computes one of the artifact's methods that need no input data.
 func (a *Artifact) Method(method string) (*Result, error) {
+	if IsIgloo(a.Class) {
+		return a.iglooMethod(method)
+	}
 	switch {
 	case a.Classifier != nil:
 		return a.Classifier.Method(method)

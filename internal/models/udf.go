@@ -19,8 +19,9 @@ import (
 
 // Scoring in DuckDB:
 //
-//	igloo_ml_predict(sha, feature, ...)  → VARCHAR, PREDICT's JSON object
-//	igloo_ml_result(token)               → a method's result, as a table
+//	igloo_ml_predict(sha, feature, ...)          → VARCHAR, PREDICT's JSON object
+//	igloo_ml_predict(sha!METHOD{...}, feature, ...) → another row method's (rows.go)
+//	igloo_ml_result(token)                       → a method's result, as a table
 //
 // igloo_ml_predict reads the model whose blob has SHA-256 sha, and its
 // features in the model's order: numbers as DOUBLE, categories as VARCHAR
@@ -162,10 +163,14 @@ func (f *predictUDF) Config() duckdb.ScalarFuncConfig {
 // arrive, from the runtime's cache.
 func (f *predictUDF) Executor() duckdb.ScalarFuncExecutor {
 	return duckdb.ScalarFuncExecutor{RowExecutor: func(values []driver.Value) (any, error) {
-		sha, _ := values[0].(string)
-		art, err := f.model(sha)
+		spec, _ := values[0].(string)
+		lm, err := f.model(spec)
 		if err != nil {
 			return nil, err
+		}
+		art := lm.art
+		if lm.method != nil {
+			return f.scoreRow(lm, values[1:])
 		}
 		gbm, classes := (*ml.GBM)(nil), 1
 		if c := art.Classifier; c != nil {
@@ -194,11 +199,15 @@ func (f *predictUDF) Executor() duckdb.ScalarFuncExecutor {
 	}}
 }
 
-// model returns the classifier whose blob is sha: the one the last row
-// used, without a lock, or one from the runtime.
-func (f *predictUDF) model(sha string) (*Artifact, error) {
-	if last := f.last.Load(); last != nil && last.sha == sha {
-		return last.art, nil
+// model returns the model, and the method, spec names (see rows.go): the
+// one the last row used, without a lock, or one from the runtime.
+func (f *predictUDF) model(spec string) (*lastModel, error) {
+	if last := f.last.Load(); last != nil && last.spec == spec {
+		return last, nil
+	}
+	sha, method, cfg, err := ParseScoreSpec(spec)
+	if err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -210,16 +219,74 @@ func (f *predictUDF) model(sha string) (*Artifact, error) {
 		return nil, errors.New("the model was dropped or replaced since this statement was prepared; run it again")
 	case err != nil:
 		return nil, err
+	}
+	lm := &lastModel{spec: spec, art: art}
+	switch {
+	case art.rowModel() != nil && !f.score:
+		if lm.method, err = art.RowMethod(method, cfg); err != nil {
+			return nil, err
+		}
+		lm.kinds = make([]ml.Kind, len(lm.method.Features))
+		for j, ft := range lm.method.Features {
+			lm.kinds[j] = featureKind(ft)
+		}
+	case method != "PREDICT":
+		return nil, fmt.Errorf("%s models have no method %s", QualifiedClass(art.Class), method)
 	case art.Classifier == nil && (!f.score || art.Regressor == nil):
 		return nil, fmt.Errorf("%s scores classification models, not %s", PredictFunction, art.Class)
 	}
-	f.last.Store(&lastModel{sha: sha, art: art})
-	return art, nil
+	f.last.Store(lm)
+	return lm, nil
 }
 
 type lastModel struct {
-	sha string
-	art *Artifact
+	spec string
+	art  *Artifact
+	// method is an Igloo model's row method, with its features' kinds.
+	method *RowMethod
+	kinds  []ml.Kind
+}
+
+// scoreRow scores a row with an Igloo model's row method.
+func (f *predictUDF) scoreRow(lm *lastModel, values []driver.Value) (any, error) {
+	if len(values) != len(lm.kinds) {
+		return nil, fmt.Errorf("the model's %s reads %d features, not %d", lm.method.Method, len(lm.kinds), len(values))
+	}
+	s := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(s)
+	ToRow(values, lm.kinds, &s.row)
+	s.buf = lm.method.Score(lm.art, s.buf[:0], &s.row)
+	return string(s.buf), nil
+}
+
+// ToRow reads DuckDB's values for features of the kinds given into r.
+func ToRow(values []driver.Value, kinds []ml.Kind, r *ml.RowValues) {
+	r.Size(len(kinds))
+	for j, k := range kinds {
+		v := values[j]
+		r.Missing[j] = v == nil
+		r.Num[j], r.Str[j] = math.NaN(), ""
+		if v == nil {
+			continue
+		}
+		if k == ml.Numeric {
+			if x, ok := number(v); ok {
+				r.Num[j] = x
+			}
+			continue
+		}
+		switch s := v.(type) {
+		case string:
+			r.Str[j] = s
+		case bool:
+			r.Str[j] = "false"
+			if s {
+				r.Str[j] = "true"
+			}
+		default:
+			r.Str[j] = fmt.Sprint(v)
+		}
+	}
 }
 
 // scratch holds a row's buffers.
@@ -227,6 +294,7 @@ type scratch struct {
 	bins       []uint8
 	raw, probs []float64
 	buf        []byte
+	row        ml.RowValues
 }
 
 func (s *scratch) size(features, raw, classes int) {

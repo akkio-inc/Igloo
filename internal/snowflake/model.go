@@ -1,35 +1,56 @@
 package snowflake
 
 import (
+	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
 
-// Snowflake's ML classes (SNOWFLAKE.ML.FORECAST and the like) are objects
-// Igloo keeps itself, with statements and methods it carries out itself
-// (see docs/ml-functions.md). The translator passes their statements on as
-// written, for ParseModelStatement, and turns their methods in queries into
-// calls Igloo resolves before DuckDB sees the statement:
+// Snowflake's ML classes (SNOWFLAKE.ML.FORECAST and the like), and Igloo's
+// own (IGLOO.ML.KMEANS and the like), are objects Igloo keeps itself, with
+// statements and methods it carries out itself (see docs/ml-functions.md).
+// The translator passes their statements on as written, for
+// ParseModelStatement, and turns their methods in queries into calls Igloo
+// resolves before DuckDB sees the statement:
 //
 //	TABLE(m!METHOD(...)), ai_predict_class(...)  → igloo_ml_method('<the call as written>')
 //	m!PREDICT(INPUT_DATA => {*})                  → CAST(igloo_ml_predict_ref('m', '*') AS JSON)
+//	m!METHOD(INPUT_DATA => {*}, CONFIG_OBJECT => {...})
+//	                                              → CAST(igloo_ml_predict_ref('m!METHOD{...}', '*') AS JSON)
 //
-// igloo_ml_predict_ref's arguments after the model's name say what the
-// input object holds: '*' for every column, then names left out
-// ('*', 'a' for {* EXCLUDE a}); '*:t' for t's columns ({t.*}); or '=' then
-// key and value pairs ({'a': x}, OBJECT_CONSTRUCT('a', x)).
+// igloo_ml_predict_ref's first argument is the model's name, and for a row
+// method other than PREDICT the method and its CONFIG_OBJECT as JSON. The
+// arguments after it say what the input object holds: '*' for every
+// column, then names left out ('*', 'a' for {* EXCLUDE a}); '*:t' for t's
+// columns ({t.*}); or '=' then key and value pairs ({'a': x},
+// OBJECT_CONSTRUCT('a', x)).
 
-// ModelClasses are the classes Igloo has, by their names after
-// SNOWFLAKE.ML.
+// ModelClasses are Snowflake's classes Igloo has, by their names after
+// SNOWFLAKE.ML. Igloo's own are IGLOO.ML.<class>, and ModelStatement.Class
+// holds them so, namespace and all.
 var ModelClasses = []string{"FORECAST", "ANOMALY_DETECTION", "CLASSIFICATION", "TOP_INSIGHTS"}
+
+// RowMethods are the methods that give a value per row, which a query may
+// call as it reads rows: m!METHOD(INPUT_DATA => {*}).
+var RowMethods = []string{"PREDICT", "EXPLAIN_PREDICT", "DETECT_ANOMALIES", "RECOMMEND", "RECONSTRUCTION_LOSS"}
+
+// displayClass names a class as statements write it.
+func displayClass(c string) string {
+	if strings.HasPrefix(c, "IGLOO.ML.") {
+		return c
+	}
+	return "SNOWFLAKE.ML." + c
+}
 
 // ModelStatement is a statement on Snowflake's ML classes or their
 // instances, models.
 type ModelStatement struct {
 	// Verb is CREATE, DROP, SHOW, ALTER, DESCRIBE, GRANT, REVOKE or CALL.
 	Verb string
-	// Class is the class after SNOWFLAKE.ML., upper-cased; a CALL has none.
+	// Class is the class after SNOWFLAKE.ML., upper-cased, or IGLOO.ML.
+	// and the class for Igloo's; a CALL has none.
 	Class string
 	// Name is the model's name, its parts as written: unquoted ones
 	// lower-cased, quoted ones as they are.
@@ -115,6 +136,34 @@ type ModelValue struct {
 	Table []string
 }
 
+// Any returns the value as JSON's values: nil, string, float64, bool,
+// map[string]any or []any; a table's name as text.
+func (v ModelValue) Any() any {
+	switch v.Kind {
+	case ValueString, ValueQuery:
+		return v.Str
+	case ValueNumber:
+		return v.Num
+	case ValueBool:
+		return v.Bool
+	case ValueObject:
+		m := make(map[string]any, len(v.Keys))
+		for i, k := range v.Keys {
+			m[k] = v.Elems[i].Any()
+		}
+		return m
+	case ValueArray:
+		out := make([]any, len(v.Elems))
+		for i, e := range v.Elems {
+			out[i] = e.Any()
+		}
+		return out
+	case ValueTable:
+		return strings.Join(v.Table, ".")
+	}
+	return nil
+}
+
 // Field returns an object's value at key (case-insensitively), or nil.
 func (v *ModelValue) Field(key string) *ModelValue {
 	if v == nil || v.Kind != ValueObject {
@@ -182,7 +231,7 @@ func isModelStatement(nodes []*node) bool {
 		return nil
 	}
 	mlAt := func(k int) bool {
-		return w(k).isWord("SNOWFLAKE") && w(k+1).isOp(".") && w(k+2).isWord("ML") && w(k+3).isOp(".")
+		return (w(k).isWord("SNOWFLAKE") || w(k).isWord("IGLOO")) && w(k+1).isOp(".") && w(k+2).isWord("ML") && w(k+3).isOp(".")
 	}
 	switch w(0).word() {
 	case "CREATE":
@@ -250,16 +299,20 @@ func (p *modelParser) words(ws ...string) bool {
 	return true
 }
 
-// class reads SNOWFLAKE.ML.<class>.
+// class reads SNOWFLAKE.ML.<class>, or IGLOO.ML.<class> (returned so).
 func (p *modelParser) class() (string, error) {
-	if !(p.peek(0).isWord("SNOWFLAKE") && p.peek(1).isOp(".") && p.peek(2).isWord("ML") && p.peek(3).isOp(".")) {
-		return "", p.errorf("expected SNOWFLAKE.ML.<class>")
+	igloo := p.peek(0).isWord("IGLOO")
+	if !((igloo || p.peek(0).isWord("SNOWFLAKE")) && p.peek(1).isOp(".") && p.peek(2).isWord("ML") && p.peek(3).isOp(".")) {
+		return "", p.errorf("expected SNOWFLAKE.ML.<class> or IGLOO.ML.<class>")
 	}
 	c := p.peek(4).word()
 	if c == "" {
-		return "", p.errorf("expected a class after SNOWFLAKE.ML.")
+		return "", p.errorf("expected a class after %s.ML.", p.peek(0).word())
 	}
 	p.at += 5
+	if igloo {
+		c = "IGLOO.ML." + c
+	}
 	return c, nil
 }
 
@@ -303,7 +356,7 @@ func (p *modelParser) statement() (*ModelStatement, error) {
 		}
 		g := p.peek(0)
 		if !g.isGroup('(') {
-			return nil, p.errorf("expected the arguments of CREATE SNOWFLAKE.ML.%s %s(...)", st.Class, strings.Join(st.Name, "."))
+			return nil, p.errorf("expected the arguments of CREATE %s %s(...)", displayClass(st.Class), strings.Join(st.Name, "."))
 		}
 		p.at++
 		args, err := p.args(g)
@@ -330,7 +383,7 @@ func (p *modelParser) statement() (*ModelStatement, error) {
 				p.at++
 				st.Comment = &s
 			default:
-				return nil, p.errorf("unexpected text after CREATE SNOWFLAKE.ML.%s %s(...)", st.Class, strings.Join(st.Name, "."))
+				return nil, p.errorf("unexpected text after CREATE %s %s(...)", displayClass(st.Class), strings.Join(st.Name, "."))
 			}
 		}
 		return st, nil
@@ -348,7 +401,7 @@ func (p *modelParser) statement() (*ModelStatement, error) {
 			return st, nil // refused by the caller, whatever follows
 		}
 		if !p.done() {
-			return nil, p.errorf("unexpected text after %s SNOWFLAKE.ML.%s %s", st.Verb, st.Class, strings.Join(st.Name, "."))
+			return nil, p.errorf("unexpected text after %s %s %s", st.Verb, displayClass(st.Class), strings.Join(st.Name, "."))
 		}
 		return st, nil
 	case "SHOW":
@@ -382,7 +435,7 @@ func (p *modelParser) statement() (*ModelStatement, error) {
 			}
 		}
 		if !p.done() {
-			return nil, p.errorf("unexpected text after SHOW SNOWFLAKE.ML.%s", st.Class)
+			return nil, p.errorf("unexpected text after SHOW %s", displayClass(st.Class))
 		}
 		return st, nil
 	case "GRANT", "REVOKE":
@@ -432,7 +485,7 @@ func (p *modelParser) grant(st *ModelStatement) (*ModelStatement, error) {
 			return nil, err
 		}
 		if !p.words("ON", "SCHEMA") {
-			return nil, p.errorf("expected ON SCHEMA after %s CREATE SNOWFLAKE.ML.%s", st.Verb, st.Class)
+			return nil, p.errorf("expected ON SCHEMA after %s CREATE %s", st.Verb, displayClass(st.Class))
 		}
 		if st.Name, err = p.name(); err != nil {
 			return nil, err
@@ -442,8 +495,8 @@ func (p *modelParser) grant(st *ModelStatement) (*ModelStatement, error) {
 			return nil, err
 		}
 		if !p.words("ROLE") {
-			return nil, p.errorf("expected %s USAGE ON SNOWFLAKE.ML.%s name or %s SNOWFLAKE.ML.%s ROLE name!MLCONSUMER",
-				st.Verb, st.Class, st.Verb, st.Class)
+			return nil, p.errorf("expected %s USAGE ON %s name or %s %s ROLE name!MLCONSUMER",
+				st.Verb, displayClass(st.Class), st.Verb, displayClass(st.Class))
 		}
 		if st.Name, err = p.name(); err != nil {
 			return nil, err
@@ -755,11 +808,11 @@ func (t *translator) modelMethods(nodes []*node) ([]*node, error) {
 				return nil, unsupported("model methods without arguments", "")
 			}
 			method := nodes[next].word()
-			if method != "PREDICT" {
+			if !slices.Contains(RowMethods, method) {
 				return nil, unsupported("calling "+method+" in an expression",
 					"call it with CALL model!"+method+"(...) or SELECT * FROM TABLE(model!"+method+"(...))")
 			}
-			repl, err := t.predictRef(nodes[start:i], nodes[args])
+			repl, err := t.predictRef(nodes[start:i], method, nodes[args])
 			if err != nil {
 				return nil, err
 			}
@@ -797,11 +850,12 @@ func (t *translator) methodCall(nodes []*node) bool {
 }
 
 // predictRef translates model!PREDICT(INPUT_DATA => object [, CONFIG_OBJECT
-// => ...]) to igloo_ml_predict_ref, whose result is the prediction as
-// JSON.
-func (t *translator) predictRef(name []*node, args *node) (*node, error) {
+// => ...]), or another row method, to igloo_ml_predict_ref, whose result
+// is the method's object as JSON.
+func (t *translator) predictRef(name []*node, method string, args *node) (*node, error) {
 	modelName := source(t.src, name)
 	var input []*node
+	var config *ModelValue
 	for k, a := range splitArgs(args.kids) {
 		a = trim(a)
 		ix := sig(a)
@@ -810,9 +864,20 @@ func (t *translator) predictRef(name []*node, args *node) (*node, error) {
 			case "INPUT_DATA":
 				input = trim(a[ix[1]+1:])
 			case "CONFIG_OBJECT":
-				// on_error is all it holds; errors always abort.
+				if method == "PREDICT" {
+					break // on_error is all PREDICT's holds; errors always abort.
+				}
+				p := &modelParser{src: t.src, nodes: a, idx: ix}
+				v, err := p.value(trim(a[ix[1]+1:]))
+				if err != nil {
+					return nil, err
+				}
+				if v.Kind != ValueObject && v.Kind != ValueNull {
+					return nil, &Error{Code: CodeSyntax, Message: method + "'s CONFIG_OBJECT is an object, such as {'contamination': 0.01}"}
+				}
+				config = &v
 			default:
-				return nil, &Error{Code: CodeSyntax, Message: "PREDICT takes INPUT_DATA and CONFIG_OBJECT, not " + a[ix[0]].word()}
+				return nil, &Error{Code: CodeSyntax, Message: method + " takes INPUT_DATA and CONFIG_OBJECT, not " + a[ix[0]].word()}
 			}
 			continue
 		}
@@ -820,10 +885,20 @@ func (t *translator) predictRef(name []*node, args *node) (*node, error) {
 			input = a
 			continue
 		}
-		return nil, &Error{Code: CodeSyntax, Message: "name PREDICT's arguments: INPUT_DATA => {*}"}
+		return nil, &Error{Code: CodeSyntax, Message: "name " + method + "'s arguments: INPUT_DATA => {*}"}
 	}
 	if input == nil {
-		return nil, &Error{Code: CodeSyntax, Message: "PREDICT needs INPUT_DATA, such as INPUT_DATA => {*}"}
+		return nil, &Error{Code: CodeSyntax, Message: method + " needs INPUT_DATA, such as INPUT_DATA => {*}"}
+	}
+	if method != "PREDICT" {
+		modelName += "!" + method
+		if config != nil && config.Kind == ValueObject {
+			b, err := json.Marshal(config.Any())
+			if err != nil {
+				return nil, &Error{Code: CodeSyntax, Message: method + "'s CONFIG_OBJECT: " + err.Error()}
+			}
+			modelName += string(b)
+		}
 	}
 	out := []*node{raw("CAST(igloo_ml_predict_ref(" + quoteString(modelName))}
 	ix := sig(input)

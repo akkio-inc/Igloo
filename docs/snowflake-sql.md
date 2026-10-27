@@ -375,7 +375,9 @@ and the vector functions refuse vectors of different dimensions.
   `SHOW` and `GRANT` of models, `CALL m!METHOD(...)`,
   `SELECT * FROM TABLE(m!METHOD(...))` and `m!PREDICT(INPUT_DATA => {*})`,
   with `SYSTEM$REFERENCE`, `SYSTEM$QUERY_REFERENCE` and `TABLE(...)`
-  inputs. See [ML functions](ml-functions.md).
+  inputs; and the same statements for Igloo's own classes,
+  `IGLOO.ML.<class>`, which bring BigQuery ML's model types. See
+  [ML functions](ml-functions.md).
 
 ## Known differences
 
@@ -515,8 +517,9 @@ These fail with SQLSTATE `0A000` and a hint:
 - Snowflake's ML classes other than those [Igloo has](ml-functions.md)
   (`SNOWFLAKE.ML.CUSTOM_CLASSIFIER` and the like), the Model Registry's
   `MODEL(...)!method`, a model's methods in an expression other than
-  `PREDICT` (call them with `CALL` or `TABLE(...)`), and views, macros and
-  materialized views that call a model's methods.
+  those that score rows (`PREDICT`, and Igloo's classes' `EXPLAIN_PREDICT`
+  and the like; call the others with `CALL` or `TABLE(...)`), and views,
+  macros and materialized views that call a model's methods.
 - `PIVOT ... IN (ANY)`, `IN (SELECT ...)` and `DEFAULT ON NULL`: list the
   values.
 - `OBJECT_CONSTRUCT(*)` and `{*}`, except as a model's `PREDICT` input:

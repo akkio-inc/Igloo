@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -270,6 +271,14 @@ func (s *Server) resolveModelText(ctx context.Context, sess *session, user auth.
 		}
 		return remember(repl), nil
 	}
+	// An Igloo model's row method, as a table, scores INPUT_DATA's rows as
+	// they are read.
+	if repl, ok, err := s.rowMethodTable(ctx, sess, user, call); ok || err != nil {
+		if err != nil {
+			return "", modelError(err)
+		}
+		return remember(repl), nil
+	}
 	{
 		var res *models.Result
 		if res, err = s.modelMethod(ctx, sess, user, call); err != nil {
@@ -461,25 +470,54 @@ func (s *Server) resolvePredict(ctx context.Context, sess *session, user auth.Us
 	if !ok || !ok2 {
 		return "", modelSyntax("%s takes a model's name and how its input is given, as strings", predictMarker)
 	}
+	// The model's name, then, for a method other than PREDICT, the method
+	// and its options: m!DETECT_ANOMALIES{"contamination": 0.01}.
+	method, cfgText := "PREDICT", ""
 	sc := &scanner{s: nameText}
 	name, ok := sc.name()
-	if !ok || !sc.done() {
+	if ok && strings.HasPrefix(sc.rest(), "!") {
+		rest := sc.rest()[1:]
+		j := strings.IndexByte(rest, '{')
+		if j < 0 {
+			j = len(rest)
+		}
+		method, cfgText = strings.ToUpper(rest[:j]), rest[j:]
+	} else if !ok || !sc.done() {
 		return "", modelSyntax("invalid model name %q", nameText)
 	}
 	m, err := s.findModel(ctx, sess, user, name, "")
 	if err != nil {
 		return "", err
 	}
-	if err := s.mayCall(ctx, user, m, "PREDICT"); err != nil {
+	if err := s.mayCall(ctx, user, m, method); err != nil {
 		return "", err
 	}
-	if m.Class != models.ClassClassification {
-		return "", pgerror.WithCode(fmt.Errorf("model %s.%s is a SNOWFLAKE.ML.%s, which has no PREDICT", m.Schema, m.Name, m.Class),
-			codes.UndefinedFunction)
+	igloo := models.IsIgloo(m.Class)
+	if !igloo && (m.Class != models.ClassClassification || method != "PREDICT") {
+		return "", pgerror.WithCode(fmt.Errorf("model %s.%s is a %s, which has no %s in a query", m.Schema, m.Name,
+			models.QualifiedClass(m.Class), method), codes.UndefinedFunction)
 	}
 	art, err := s.modelRuntime.Load(ctx, m.Blob)
 	if err != nil {
 		return "", fmt.Errorf("load model %s.%s: %w", m.Schema, m.Name, err)
+	}
+	spec, feats := m.Blob, art.Features()
+	if igloo {
+		var cfg map[string]any
+		if cfgText != "" {
+			if err := json.Unmarshal([]byte(cfgText), &cfg); err != nil {
+				return "", modelSyntax("%s's CONFIG_OBJECT: %v", method, err)
+			}
+		}
+		if !models.IsRowMethodOf(m.Class, method) {
+			return "", pgerror.WithCode(fmt.Errorf("%s has no method %s that scores rows; it has %s", models.QualifiedClass(m.Class),
+				method, strings.Join(art.RowMethods(), ", ")), codes.UndefinedFunction)
+		}
+		rm, err := art.RowMethod(method, cfg)
+		if err != nil {
+			return "", modelError(err)
+		}
+		spec, feats = m.Blob+rm.Spec, rm.Features
 	}
 	// Each feature's value: a column of the row, an expression given for
 	// it, or NULL.
@@ -523,10 +561,10 @@ func (s *Server) resolvePredict(ctx context.Context, sess *session, user auth.Us
 	default:
 		return "", modelSyntax("unknown input %q", mode)
 	}
-	sess.allowModel(m.Blob)
+	sess.allowModel(spec)
 	var b strings.Builder
-	b.WriteString(models.PredictFunction + "(" + quoteLiteral(m.Blob))
-	for _, f := range art.Features() {
+	b.WriteString(models.PredictFunction + "(" + quoteLiteral(spec))
+	for _, f := range feats {
 		expr := "NULL"
 		switch {
 		case all && !exclude[strings.ToLower(f.Name)]:

@@ -23,8 +23,10 @@ import (
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
-// Snowflake's ML classes (docs/ml-functions.md). Igloo carries out their
-// statements itself, in either dialect, reading them as Snowflake's SQL:
+// Snowflake's ML classes, and Igloo's own IGLOO.ML.<class> with the same
+// statements (docs/ml-functions.md; igloo_models.go). Igloo carries out
+// their statements itself, in either dialect, reading them as Snowflake's
+// SQL:
 //
 //	CREATE [OR REPLACE] SNOWFLAKE.ML.<class> [IF NOT EXISTS] name(INPUT_DATA => ..., ...)
 //	DROP SNOWFLAKE.ML.<class> [IF EXISTS] name
@@ -45,7 +47,8 @@ import (
 // before the statement is prepared; see mlrewrite.go.
 
 // predictingMethods need only PREDICT.
-var predictingMethods = map[string]bool{"PREDICT": true, "FORECAST": true, "DETECT_ANOMALIES": true, "GET_DRIVERS": true}
+var predictingMethods = map[string]bool{"PREDICT": true, "FORECAST": true, "DETECT_ANOMALIES": true, "GET_DRIVERS": true,
+	"EXPLAIN_PREDICT": true, "RECOMMEND": true, "RECONSTRUCTION_LOSS": true}
 
 // modelStatement recognizes the statements above.
 func (s *Server) modelStatement(ctx context.Context, sess *session, q wire.Query) (wire.PreparedStatements, bool, error) {
@@ -115,11 +118,11 @@ func modelSyntax(format string, args ...any) error {
 
 // knownClass refuses classes Igloo does not have.
 func knownClass(class string) error {
-	if slices.Contains(snowflake.ModelClasses, class) {
+	if slices.Contains(snowflake.ModelClasses, class) || slices.Contains(models.IglooClasses, class) {
 		return nil
 	}
-	return pgerror.WithHint(pgerror.WithCode(fmt.Errorf("SNOWFLAKE.ML.%s is not supported", class), codes.FeatureNotSupported),
-		"Igloo has SNOWFLAKE.ML."+strings.Join(snowflake.ModelClasses, ", SNOWFLAKE.ML."))
+	return pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s is not supported", models.QualifiedClass(class)), codes.FeatureNotSupported),
+		"Igloo has SNOWFLAKE.ML."+strings.Join(snowflake.ModelClasses, ", SNOWFLAKE.ML.")+", and "+strings.Join(models.IglooClasses, ", "))
 }
 
 func (s *Server) runModelStatement(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, text string,
@@ -141,10 +144,10 @@ func (s *Server) runModelStatement(ctx context.Context, sess *session, user auth
 	case "CALL":
 		return s.callModel(ctx, sess, user, st, w)
 	case "ALTER":
-		return pgerror.WithHint(pgerror.WithCode(fmt.Errorf("ALTER SNOWFLAKE.ML.%s is not supported", st.Class), codes.FeatureNotSupported),
+		return pgerror.WithHint(pgerror.WithCode(fmt.Errorf("ALTER %s is not supported", models.QualifiedClass(st.Class)), codes.FeatureNotSupported),
 			"a model does not change: CREATE OR REPLACE trains it again, and COMMENT is set when it is created")
 	}
-	return pgerror.WithCode(fmt.Errorf("%s SNOWFLAKE.ML.%s is not supported", st.Verb, st.Class), codes.FeatureNotSupported)
+	return pgerror.WithCode(fmt.Errorf("%s %s is not supported", st.Verb, models.QualifiedClass(st.Class)), codes.FeatureNotSupported)
 }
 
 // modelRef resolves a model's name to its schema and name: a name alone
@@ -193,8 +196,8 @@ func (s *Server) findModel(ctx context.Context, sess *session, user auth.User, n
 		return m, err
 	}
 	if class != "" && m.Class != class {
-		return m, pgerror.WithCode(fmt.Errorf("model %s.%s is a SNOWFLAKE.ML.%s, not a SNOWFLAKE.ML.%s", schema, n, m.Class, class),
-			codes.WrongObjectType)
+		return m, pgerror.WithCode(fmt.Errorf("model %s.%s is a %s, not a %s", schema, n, models.QualifiedClass(m.Class),
+			models.QualifiedClass(class)), codes.WrongObjectType)
 	}
 	return m, nil
 }
@@ -262,7 +265,7 @@ func (s *Server) mayCreateModel(ctx context.Context, sess *session, user auth.Us
 
 func (s *Server) createModel(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, text string,
 	w wire.DataWriter) error {
-	tag := "CREATE SNOWFLAKE.ML." + st.Class
+	tag := "CREATE " + models.QualifiedClass(st.Class)
 	schema, name, err := s.modelRef(ctx, sess, st.Name)
 	if err != nil {
 		return err
@@ -338,6 +341,9 @@ func (s *Server) dropBlob(ctx context.Context, sha string) {
 // trainModel trains the model CREATE describes, and returns it with its
 // configuration and a summary of its metrics, as JSON.
 func (s *Server) trainModel(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement) (*models.Artifact, string, string, error) {
+	if models.IsIgloo(st.Class) {
+		return s.trainIglooModel(ctx, sess, user, st)
+	}
 	call := st.Call
 	cfgVal := call.Arg("CONFIG_OBJECT")
 	cfg := valueJSON(cfgVal)
@@ -694,7 +700,7 @@ func (s *Server) readRows(ctx context.Context, sess *session, user auth.User, qu
 }
 
 func (s *Server) dropModel(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, w wire.DataWriter) error {
-	tag := "DROP SNOWFLAKE.ML." + st.Class
+	tag := "DROP " + models.QualifiedClass(st.Class)
 	m, err := s.findModel(ctx, sess, user, st.Name, st.Class)
 	if err != nil {
 		if pgerror.GetCode(err) == codes.UndefinedObject && st.IfExists {
@@ -790,7 +796,7 @@ func (s *Server) grantModel(ctx context.Context, sess *session, user auth.User, 
 	case "MLCONSUMER":
 		privilege = models.PrivilegePredict
 	case "CREATE":
-		return pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s CREATE SNOWFLAKE.ML.%s is not supported", st.Verb, st.Class),
+		return pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s CREATE %s is not supported", st.Verb, models.QualifiedClass(st.Class)),
 			codes.FeatureNotSupported), "creating a model takes what creating a table does: the writer role, or GRANT CREATE ON SCHEMA "+
 			strings.Join(st.Name, ".")+" TO ...")
 	default:
@@ -834,7 +840,12 @@ func methodColumns(class, method string) ([]models.ResultColumn, error) {
 		return nil, pgerror.WithHint(pgerror.WithCode(errors.New("PREDICT is not a procedure"), codes.WrongObjectType),
 			"score rows in a query: SELECT model!PREDICT(INPUT_DATA => {*}) FROM t")
 	}
-	return nil, pgerror.WithCode(fmt.Errorf("SNOWFLAKE.ML.%s has no method %s; it has %s", class, method,
+	if models.IsRowMethodOf(class, method) {
+		return nil, pgerror.WithHint(pgerror.WithCode(fmt.Errorf("%s is not a procedure: it scores rows", method), codes.WrongObjectType),
+			"call it as a table, SELECT * FROM TABLE(model!"+method+"(INPUT_DATA => TABLE(t))), or in a query, model!"+method+
+				"(INPUT_DATA => {*})")
+	}
+	return nil, pgerror.WithCode(fmt.Errorf("%s has no method %s; it has %s", models.QualifiedClass(class), method,
 		strings.Join(models.Methods(class), ", ")), codes.UndefinedFunction)
 }
 
@@ -903,6 +914,9 @@ func (s *Server) modelMethod(ctx context.Context, sess *session, user auth.User,
 	}
 	if art.Forecaster != nil {
 		return s.forecastMethod(ctx, sess, user, art, call)
+	}
+	if models.IsIgloo(art.Class) {
+		return s.iglooMethod(ctx, sess, user, art, call)
 	}
 	if art.Class == models.ClassTopInsights {
 		if err := onlyArgs(call, "INPUT_DATA", "LABEL_COLNAME", "METRIC_COLNAME"); err != nil {

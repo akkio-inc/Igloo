@@ -25,6 +25,10 @@ CALL demo.conversion!SHOW_GLOBAL_EVALUATION_METRICS();
 | `SNOWFLAKE.ML.CLASSIFICATION` | Predicts a class (2 to 255) from a row's columns | `PREDICT`, `SHOW_EVALUATION_METRICS`, `SHOW_GLOBAL_EVALUATION_METRICS`, `SHOW_CONFUSION_MATRIX`, `SHOW_THRESHOLD_METRICS`, `SHOW_FEATURE_IMPORTANCE`, `SHOW_TRAINING_LOGS` |
 | `SNOWFLAKE.ML.TOP_INSIGHTS` | Finds the segments that drove a metric's change between two groups | `GET_DRIVERS` |
 
+Igloo has classes of its own too, `IGLOO.ML.<class>`, which bring
+BigQuery ML's model types with the same statements (see
+[Igloo's classes](#igloos-classes-bigquery-mls-model-types)).
+
 Besides the classes, Databricks' `ai_predict_class` and `ai_predict_value`
 train a model and score rows in one query, keeping no model (see
 [below](#train-and-score-in-one-query)).
@@ -85,7 +89,7 @@ REVOKE ... FROM [ ROLE | USER ] grantee
 | Create a model in a schema | What creating a table there takes: the writer role, or `CREATE` on the schema (`GRANT CREATE ON SCHEMA demo TO ...`) |
 | Replace, drop or grant a model | Owning it (its creator), or the admin role |
 | Call every method | Owning it, admin, or `USAGE` (Snowflake's `MLADMIN` instance role) |
-| Predict: `PREDICT`, `FORECAST`, `DETECT_ANOMALIES`, `GET_DRIVERS` | Any of those, or Snowflake's `MLCONSUMER` instance role |
+| Predict: `PREDICT`, `FORECAST`, `DETECT_ANOMALIES`, `GET_DRIVERS`, and Igloo's classes' `EXPLAIN_PREDICT`, `RECOMMEND` and `RECONSTRUCTION_LOSS` | Any of those, or Snowflake's `MLCONSUMER` instance role |
 
 A user who may not use a model is told it does not exist. A model answers
 from what its creator could read when it was trained; whoever may use it
@@ -288,6 +292,134 @@ SELECT * FROM TABLE(demo.spend_drivers!GET_DRIVERS(
 An instance keeps nothing: `GET_DRIVERS` analyses what it is given, as its
 caller reads it.
 
+## Igloo's classes: BigQuery ML's model types
+
+`IGLOO.ML.<class>` classes are Igloo's own, on its engine: BigQuery ML's
+model types, with the statements, privileges and storage of Snowflake's
+classes above (`SNOWFLAKE.ML` has no classes for these, and Igloo invents
+none there). A BigQuery `CREATE MODEL` becomes a `CREATE IGLOO.ML.<class>`
+whose `CONFIG_OBJECT` takes BigQuery's options by their names, in lower
+case, and its `ML.` functions become the model's methods:
+
+```sql
+-- BigQuery:
+--   CREATE MODEL demo.value_model OPTIONS (model_type = 'boosted_tree_regressor',
+--       input_label_cols = ['value'], learn_rate = 0.2) AS SELECT region, spend, visits, value FROM demo.campaigns;
+--   SELECT * FROM ML.PREDICT(MODEL demo.value_model, TABLE demo.new_campaigns);
+CREATE IGLOO.ML.REGRESSION demo.value_model(
+    INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT region, spend, visits, value FROM demo.campaigns'),
+    TARGET_COLNAME => 'value',
+    CONFIG_OBJECT => {'algorithm': 'boosted_trees', 'learn_rate': 0.2});
+
+SELECT * FROM TABLE(demo.value_model!PREDICT(INPUT_DATA => TABLE(demo.new_campaigns)));
+SELECT * FROM TABLE(demo.value_model!EVALUATE());
+```
+
+| BigQuery `model_type` | Igloo class | `CONFIG_OBJECT` |
+|---|---|---|
+| `LINEAR_REG` | `IGLOO.ML.REGRESSION` | `'algorithm': 'linear'` |
+| `BOOSTED_TREE_REGRESSOR` | `IGLOO.ML.REGRESSION` | `'algorithm': 'boosted_trees'` (the default) |
+| `RANDOM_FOREST_REGRESSOR` | `IGLOO.ML.REGRESSION` | `'algorithm': 'random_forest'` |
+| `LOGISTIC_REG` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'logistic'` |
+| `BOOSTED_TREE_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'boosted_trees'` (the default) |
+| `RANDOM_FOREST_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'random_forest'` |
+| `ARIMA_PLUS`, `ARIMA_PLUS_XREG` | `SNOWFLAKE.ML.FORECAST` | a different method, with intervals |
+| `CONTRIBUTION_ANALYSIS` | `SNOWFLAKE.ML.TOP_INSIGHTS` | |
+| `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, `XGBOOST` imports, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
+
+| BigQuery function | Igloo method | Classes |
+|---|---|---|
+| `ML.PREDICT` | `PREDICT` | all |
+| `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION` |
+| `ML.EVALUATE` | `EVALUATE` | all |
+| `ML.CONFUSION_MATRIX`, `ML.ROC_CURVE` | `CONFUSION_MATRIX`, `ROC_CURVE` | `CLASSIFICATION` |
+| `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | `REGRESSION`, `CLASSIFICATION` |
+| `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
+| `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
+| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees |
+
+### Row methods and table methods
+
+**Row methods** (`PREDICT`, `EXPLAIN_PREDICT`) give a value per row. In a
+query, `m!PREDICT(INPUT_DATA => {*})` is a JSON object, as Snowflake's
+`PREDICT` is; called as a table, as BigQuery's functions are,
+`TABLE(m!PREDICT(INPUT_DATA => TABLE(t)))` returns the input's rows and
+columns with the method's columns after them. Both are scored as the rows
+are read, on [workers](distributed-execution.md) too, so they scale with
+the input. `INPUT_DATA` takes what training's does (`TABLE(name)`,
+`SYSTEM$REFERENCE`, `SYSTEM$QUERY_REFERENCE`, `TABLE(SELECT ...)`), and a
+row method's options go in its own `CONFIG_OBJECT`. The input must have
+the model's features, by their names; other columns are kept and ignored.
+`CALL` refuses row methods: call them as tables.
+
+**Table methods** (`EVALUATE`, `WEIGHTS` and the rest) return rows about
+the model, with `CALL` or `TABLE(m!METHOD())`. `EVALUATE()` measures the
+rows held out of training; `EVALUATE(INPUT_DATA => TABLE(t))` measures t's
+rows, which must hold the target.
+
+### Training
+
+- **Features** are every column but the target, as for Snowflake's
+  classes. Linear and logistic models standardize numbers and give a
+  categorical feature's 100 most frequent categories (of at least five
+  rows) indicators against the most frequent; trees bin numbers and keep
+  categories as they are.
+- **Evaluation split**, BigQuery's `data_split_method`: `'auto_split'` (the
+  default) holds back no rows of fewer than 500, a fifth of up to 50,000,
+  and 10,000 rows of more; `'random'` holds back
+  `data_split_eval_fraction` (default 0.2); `'no_split'`, or Snowflake's
+  `'evaluate': FALSE`, none. A classifier's held-out rows keep its classes'
+  shares. Models train on the rest, as BigQuery's do.
+- **Large inputs.** Igloo's classes train on at most 10 million rows and
+  200 million values (rows times columns). Above that they train on a
+  sample of about as many rows, chosen by a hash of each row's values, so
+  the same rows give the same sample and the same model. The model's
+  metrics record `input_rows` and `sampled_rows`.
+- **`seed`** (default 0) seeds sampling and training: models are the same
+  for the same rows and seed.
+- Unknown `CONFIG_OBJECT` keys are refused, so that a misspelled option
+  does not go unnoticed.
+
+### REGRESSION and CLASSIFICATION
+
+```sql
+CREATE IGLOO.ML.CLASSIFICATION demo.converts(
+    INPUT_DATA => TABLE(demo.lead_features),
+    TARGET_COLNAME => 'converted',
+    CONFIG_OBJECT => {'algorithm': 'random_forest', 'num_parallel_tree': 200});
+
+SELECT person_id, predicted_converted, predicted_converted_probs
+FROM TABLE(demo.converts!PREDICT(INPUT_DATA => TABLE(demo.new_leads)));
+
+SELECT person_id, top_feature_attributions
+FROM TABLE(demo.converts!EXPLAIN_PREDICT(INPUT_DATA => TABLE(demo.new_leads),
+                                          CONFIG_OBJECT => {'top_k_features': 3}));
+```
+
+`REGRESSION` predicts a number; `CLASSIFICATION` a class (2 to 255), as
+Snowflake's does, booleans as `True` and `False`. `'algorithm'` picks the
+model:
+
+| `algorithm` | Options (BigQuery's names) |
+|---|---|
+| `'boosted_trees'` | `max_iterations` (rounds, default 500, stopped early on a tenth of the training rows unless `'early_stop': FALSE`), `learn_rate` (0.1), `max_tree_depth` (12), `num_leaves` (31), `subsample`, `colsample_bytree`, `colsample_bynode` (1), `l2_reg` (1), `min_tree_child_weight`, `min_data_in_leaf` (20) |
+| `'random_forest'` | `num_parallel_tree` (trees, default 100), `subsample` (0.8), `colsample_bynode` (0.8), `colsample_bytree` (1), `max_tree_depth` (12), `num_leaves` (127), `l2_reg`, `min_data_in_leaf` (2) |
+| `'linear'`, `'logistic'` | `l2_reg` (a ridge penalty on standardized features, default 0); fit exactly by iteratively reweighted least squares, so `optimize_strategy` and `learn_rate` are accepted and ignored. Three classes or more are one logistic model per class against the rest. |
+
+`l1_reg` is refused. Methods:
+
+| Method | Returns |
+|---|---|
+| `PREDICT` | `{"value": v}`, or `{"class": c, "probability": {class: p, ...}}`; as a table, `predicted_<target>` (and `predicted_<target>_probs`, JSON) |
+| `EXPLAIN_PREDICT` | the prediction with `top_feature_attributions` (`[{"feature", "attribution"}, ...]`, the `top_k_features` largest, default 5), `baseline_prediction_value`, `prediction_value` and `approximation_error` (0): attributions are SHAP values for trees and coefficients times distances from the means for linear models, and with the baseline add up to the prediction (for classes, the predicted class's raw score: log-odds for boosted trees and logistic models, a probability for forests); a table adds `probability` for classes |
+| `EVALUATE` | regression: `mean_absolute_error`, `mean_squared_error`, `mean_squared_log_error` (NULL with negative values), `median_absolute_error`, `r2_score`, `explained_variance`; classification: `precision`, `recall`, `accuracy`, `f1_score` (the second class's at a threshold of 0.5 for two classes, macro averages for more), `log_loss`, `roc_auc` |
+| `CONFUSION_MATRIX` | `expected_label`, `predicted_label`, `count`, on the held-out rows |
+| `ROC_CURVE` | two classes: `threshold` (0 to 1 by 0.01), `recall`, `false_positive_rate`, `true_positives`, `false_positives`, `true_negatives`, `false_negatives` |
+| `GLOBAL_EXPLAIN` | `feature`, `attribution`: the mean absolute attribution, largest first |
+| `FEATURE_IMPORTANCE` | trees: `feature`, `importance_weight` (splits), `importance_gain`, `importance_cover` (rows per split) |
+| `WEIGHTS` | linear and logistic models: `class` (for three classes or more), `processed_input` (the feature, or `__INTERCEPT__`), `category`, `weight`, `standard_error`, `p_value` (BigQuery's `ML.ADVANCED_WEIGHTS`) |
+| `TRAINING_INFO` | boosted trees: `iteration`, `loss`, `eval_loss` (on the early-stopping rows), `learning_rate` |
+
 ## Train and score in one query
 
 Databricks' predictive functions train a model on the rows whose target is
@@ -370,9 +502,14 @@ own Apache-2.0 code and needs nothing besides Igloo.
   `internal/models`, run with `IGLOO_ML_BENCH=1`).
 - **Scoring** with `PREDICT` runs as the query runs: a statement that
   scores a large table runs in parts on workers like any other, each
-  scoring its share. Methods that return tables (`FORECAST`,
-  `DETECT_ANOMALIES` and the `SHOW_` methods) are computed on the replica,
-  from the data they are given, before the statement that reads them runs.
+  scoring its share; so do Igloo's classes' row methods, in a query or as
+  tables. Methods that return tables (`FORECAST`, Snowflake's
+  `DETECT_ANOMALIES`, the `SHOW_` methods, and Igloo's classes' table
+  methods) are computed on the replica, from the data they are given,
+  before the statement that reads them runs.
+- **Igloo's classes** add random forests (each tree on its own sample of
+  rows and, at each split, of features, their leaves averaged), and linear
+  and logistic regressions with standard errors.
 - **Models are repeatable.** The same rows, in any order, train the same
   model, with the same blob and SHA-256: the engine puts rows in an order
   of their own before training, and adds in a fixed order whatever the

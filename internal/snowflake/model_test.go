@@ -45,6 +45,11 @@ func TestParseModelStatement(t *testing.T) {
 			Privilege: "MLCONSUMER", Name: []string{"m"}, Grantee: "ana", GranteeUser: true},
 		`GRANT CREATE SNOWFLAKE.ML.FORECAST ON SCHEMA demo TO ROLE r`: {Verb: "GRANT", Class: "FORECAST", Privilege: "CREATE",
 			Name: []string{"demo"}, Grantee: "r"},
+		// Igloo's classes, with their namespace.
+		`DROP IGLOO.ML.KMEANS IF EXISTS demo.segments`: {Verb: "DROP", Class: "IGLOO.ML.KMEANS", IfExists: true, Name: []string{"demo", "segments"}},
+		`SHOW IGLOO.ML.REGRESSION`:                     {Verb: "SHOW", Class: "IGLOO.ML.REGRESSION"},
+		`GRANT IGLOO.ML.PCA ROLE p!MLCONSUMER TO ROLE r`: {Verb: "GRANT", Class: "IGLOO.ML.PCA", Privilege: "MLCONSUMER",
+			Name: []string{"p"}, Grantee: "r"},
 	} {
 		st, ok, err := ParseModelStatement(in)
 		if err != nil || !ok {
@@ -66,7 +71,15 @@ func TestParseModelStatement(t *testing.T) {
 		t.Errorf("CALL: %+v, %v", st, err)
 	}
 
-	for _, in := range []string{`SELECT 1`, `CALL my_procedure()`, `CREATE TABLE ml (a INT)`, `SHOW TABLES`, `CREATE SNOWFLAKE_ML x`} {
+	st, ok, err = ParseModelStatement(`CREATE OR REPLACE IGLOO.ML.CLASSIFICATION churn(INPUT_DATA => TABLE(people),
+		TARGET_COLNAME => 'churned', CONFIG_OBJECT => {'algorithm': 'random_forest', 'num_parallel_tree': 50})`)
+	if err != nil || !ok || st.Class != "IGLOO.ML.CLASSIFICATION" || !st.Replace ||
+		st.Call.Arg("CONFIG_OBJECT").Field("num_parallel_tree").Num != 50 {
+		t.Errorf("CREATE IGLOO.ML: %+v, %v", st, err)
+	}
+
+	for _, in := range []string{`SELECT 1`, `CALL my_procedure()`, `CREATE TABLE ml (a INT)`, `SHOW TABLES`, `CREATE SNOWFLAKE_ML x`,
+		`CREATE TABLE igloo.ml.t (a INT)`} {
 		if _, ok, _ := ParseModelStatement(in); ok {
 			t.Errorf("%s: read as a model statement", in)
 		}
@@ -111,6 +124,10 @@ func TestModelTranslation(t *testing.T) {
 		`SELECT s.m!PREDICT(INPUT_DATA => {t.*}):class::STRING AS c FROM t`:                           `SELECT json_extract_string(CAST(igloo_ml_predict_ref('s.m', '*:t') AS JSON), '$.class') AS "C" FROM t`,
 		`SELECT m!PREDICT({'plan': UPPER(p), 'tenure': IFF(a, 1, 2)}) AS p FROM t`:                    `SELECT CAST(igloo_ml_predict_ref('m', '=', 'plan', UPPER(p), 'tenure', CASE WHEN a THEN 1 ELSE 2 END) AS JSON) AS "P" FROM t`,
 		`SELECT * FROM ai_predict_value(input => TABLE(t), target_col => 'y', feature_cols => ['a'])`: `SELECT * FROM igloo_ml_method('ai_predict_value(input => TABLE(t), target_col => ''y'', feature_cols => [''a''])')`,
+		// Row methods besides PREDICT carry their method and options.
+		`SELECT m!DETECT_ANOMALIES(INPUT_DATA => {*}, CONFIG_OBJECT => {'contamination': 0.02}):is_anomaly AS a FROM t`: `SELECT json_extract(CAST(igloo_ml_predict_ref('m!DETECT_ANOMALIES{"contamination":0.02}', '*') AS JSON), '$.is_anomaly') AS "A" FROM t`,
+		`SELECT m!EXPLAIN_PREDICT(INPUT_DATA => {*}) AS e FROM t`:                                                       `SELECT CAST(igloo_ml_predict_ref('m!EXPLAIN_PREDICT', '*') AS JSON) AS "E" FROM t`,
+		`SELECT * FROM TABLE(m!PREDICT(INPUT_DATA => TABLE(t)))`:                                                        `SELECT * FROM igloo_ml_method('m!PREDICT(INPUT_DATA => TABLE(t))')`,
 	} {
 		res, err := Translate(in, Options{})
 		if err != nil {
@@ -124,6 +141,7 @@ func TestModelTranslation(t *testing.T) {
 	// Statements on the classes pass as written.
 	for _, in := range []string{
 		`CREATE SNOWFLAKE.ML.CLASSIFICATION m(INPUT_DATA => SYSTEM$REFERENCE('TABLE', 't'), TARGET_COLNAME => 'y')`,
+		`CREATE IGLOO.ML.KMEANS k(INPUT_DATA => TABLE(t), CONFIG_OBJECT => {'num_clusters': 4})`,
 		`CALL m!SHOW_EVALUATION_METRICS()`,
 		`SHOW SNOWFLAKE.ML.FORECAST`,
 		`GRANT USAGE ON SNOWFLAKE.ML.FORECAST m TO ROLE r`,
@@ -134,11 +152,12 @@ func TestModelTranslation(t *testing.T) {
 		}
 	}
 	for in, says := range map[string]string{
-		`SELECT m!FORECAST(FORECASTING_PERIODS => 3)`:           "CALL model!FORECAST",
-		`SELECT m!PREDICT(INPUT_DATA => x) FROM t`:              "INPUT_DATA other than an object",
-		`SELECT m!PREDICT(INPUT_DATA => {* ILIKE 'a%'}) FROM t`: "{* ILIKE",
-		`SELECT m!PREDICT() FROM t`:                             "needs INPUT_DATA",
-		`CALL my_procedure()`:                                   "stored procedures",
+		`SELECT m!FORECAST(FORECASTING_PERIODS => 3)`:                             "CALL model!FORECAST",
+		`SELECT m!PREDICT(INPUT_DATA => x) FROM t`:                                "INPUT_DATA other than an object",
+		`SELECT m!PREDICT(INPUT_DATA => {* ILIKE 'a%'}) FROM t`:                   "{* ILIKE",
+		`SELECT m!PREDICT() FROM t`:                                               "needs INPUT_DATA",
+		`SELECT m!DETECT_ANOMALIES(INPUT_DATA => {*}, CONFIG_OBJECT => 3) FROM t`: "CONFIG_OBJECT is an object",
+		`CALL my_procedure()`:                                                     "stored procedures",
 	} {
 		_, err := Translate(in, Options{})
 		var e *Error
