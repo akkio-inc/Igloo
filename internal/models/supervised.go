@@ -222,6 +222,8 @@ func (s *Supervised) fit(d *labeled, train, eval []int, cfg *config, seed uint64
 		err = s.fitTrees(tf, ty, cfg, seed, interrupt)
 	case "linear", "logistic":
 		err = s.fitLinear(tf, ty, cfg)
+	case "dnn":
+		err = s.fitNet(tf, ty, cfg, seed, interrupt)
 	default:
 		return inputErr("unknown algorithm %s", s.Algorithm)
 	}

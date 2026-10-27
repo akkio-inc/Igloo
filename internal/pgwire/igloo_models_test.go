@@ -166,6 +166,38 @@ func TestIglooMatrixFactorization(t *testing.T) {
 		ITEM_COLNAME => 'campaign', RATING_COLNAME => 'nope')`, "42703")
 }
 
+func TestIglooDNN(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, campaignsTable)
+	conn := snowflakeConn(t, cs.admin)
+	mustExec(t, conn, `CREATE IGLOO.ML.DNN_CLASSIFIER converts(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT region, spend, visits, converted FROM campaigns'), TARGET_COLNAME => 'converted',
+		CONFIG_OBJECT => {'hidden_units': [16, 8], 'learn_rate': 0.01, 'dropout': 0.05})`)
+	if got := texts(t, conn, "SELECT accuracy > 0.9 FROM TABLE(converts!EVALUATE())"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("EVALUATE: %q", got)
+	}
+	if n := count(t, conn, `SELECT count(*) FROM TABLE(converts!PREDICT(INPUT_DATA => TABLE(campaigns))) WHERE predicted_converted = converted`); n < 1400 {
+		t.Errorf("%d of 1500 predicted right", n)
+	}
+	if got := texts(t, conn, "SELECT count(*) > 3 FROM TABLE(converts!TRAINING_INFO()) WHERE eval_loss > 0"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("TRAINING_INFO: %q", got)
+	}
+	if got := texts(t, conn, "SELECT feature FROM TABLE(converts!GLOBAL_EXPLAIN()) LIMIT 1"); len(got) != 1 || got[0] != "spend" && got[0] != "visits" {
+		t.Errorf("GLOBAL_EXPLAIN: %q", got)
+	}
+	mustExec(t, conn, `CREATE IGLOO.ML.DNN_REGRESSOR value_net(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT region, spend, visits, value FROM campaigns'), TARGET_COLNAME => 'value',
+		CONFIG_OBJECT => {'hidden_units': [16], 'learn_rate': 0.01})`)
+	if got := texts(t, conn, "SELECT r2_score > 0.95 FROM TABLE(value_net!EVALUATE())"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("DNN_REGRESSOR's EVALUATE: %q", got)
+	}
+	expectCode(t, conn, "SELECT * FROM TABLE(value_net!EXPLAIN_PREDICT(INPUT_DATA => TABLE(campaigns)))", "42883", "has no method EXPLAIN_PREDICT")
+	expectCode(t, conn, "CALL value_net!WEIGHTS()", "42883", "has no method WEIGHTS")
+	expectCode(t, conn, `CREATE IGLOO.ML.DNN_REGRESSOR n(INPUT_DATA => TABLE(campaigns), TARGET_COLNAME => 'value',
+		CONFIG_OBJECT => {'hidden_units': 64})`, "22023", "hidden_units takes an array")
+}
+
 func TestIglooRegression(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()

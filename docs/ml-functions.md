@@ -323,6 +323,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `LOGISTIC_REG` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'logistic'` |
 | `BOOSTED_TREE_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'boosted_trees'` (the default) |
 | `RANDOM_FOREST_CLASSIFIER` | `IGLOO.ML.CLASSIFICATION` | `'algorithm': 'random_forest'` |
+| `DNN_REGRESSOR`, `DNN_CLASSIFIER` | `IGLOO.ML.DNN_REGRESSOR`, `IGLOO.ML.DNN_CLASSIFIER` | `'hidden_units'`, `'dropout'` and the like |
 | `KMEANS` | `IGLOO.ML.KMEANS` | `'num_clusters'`, or none to pick one |
 | `PCA` | `IGLOO.ML.PCA` | `'num_principal_components'` or `'pca_explained_variance_ratio'` |
 | `MATRIX_FACTORIZATION` | `IGLOO.ML.MATRIX_FACTORIZATION` | `USER_COLNAME`, `ITEM_COLNAME`, `RATING_COLNAME` arguments; `'feedback_type'` |
@@ -339,11 +340,11 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `ML.PRINCIPAL_COMPONENTS`, `ML.PRINCIPAL_COMPONENT_INFO` | `PRINCIPAL_COMPONENTS`, `PRINCIPAL_COMPONENT_INFO` | `PCA` |
 | `ML.RECOMMEND` | `RECOMMEND` | `MATRIX_FACTORIZATION` |
 | `ML.EVALUATE` | `EVALUATE` | all |
-| `ML.CONFUSION_MATRIX`, `ML.ROC_CURVE` | `CONFUSION_MATRIX`, `ROC_CURVE` | `CLASSIFICATION` |
-| `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | `REGRESSION`, `CLASSIFICATION` |
+| `ML.CONFUSION_MATRIX`, `ML.ROC_CURVE` | `CONFUSION_MATRIX`, `ROC_CURVE` | the classifiers |
+| `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | the regressions and classifiers |
 | `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
 | `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
-| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, `KMEANS`, `MATRIX_FACTORIZATION` |
+| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, networks, `KMEANS`, `MATRIX_FACTORIZATION` |
 
 ### Row methods and table methods
 
@@ -427,6 +428,43 @@ model:
 | `FEATURE_IMPORTANCE` | trees: `feature`, `importance_weight` (splits), `importance_gain`, `importance_cover` (rows per split) |
 | `WEIGHTS` | linear and logistic models: `class` (for three classes or more), `processed_input` (the feature, or `__INTERCEPT__`), `category`, `weight`, `standard_error`, `p_value` (BigQuery's `ML.ADVANCED_WEIGHTS`) |
 | `TRAINING_INFO` | boosted trees: `iteration`, `loss`, `eval_loss` (on the early-stopping rows), `learning_rate` |
+
+### DNN_REGRESSOR and DNN_CLASSIFIER
+
+```sql
+CREATE IGLOO.ML.DNN_CLASSIFIER demo.converts_net(
+    INPUT_DATA => TABLE(demo.lead_features),
+    TARGET_COLNAME => 'converted',
+    CONFIG_OBJECT => {'hidden_units': [64, 32], 'dropout': 0.1});
+```
+
+A feed-forward network on the features, numbers standardized and each
+category one hot (a feature's 100 most frequent categories of at least
+five rows), trained by Adam on mini-batches and stopped early when the
+loss on a tenth of the training rows has not improved for 5 epochs, keeping
+the best epoch's weights. A regression's target is standardized for
+training; a classifier ends in a sigmoid (two classes) or softmax.
+Options, BigQuery's names:
+
+| Option | Default |
+|---|---|
+| `hidden_units` | `[64, 32]` |
+| `activation_fn` | `'relu'`; or `'tanh'`, `'sigmoid'`, `'linear'` |
+| `dropout` | 0 |
+| `batch_size` | about a thirty-second of the training rows, from 32 to 1,024 |
+| `learn_rate` | 0.001 |
+| `max_iterations` | epochs: enough for some 3,000 steps, from 20 to 500 |
+| `early_stop` | `TRUE` |
+| `l2_reg` | 0 |
+| `optimizer` | `'adam'`, the only one |
+
+Methods are the regressions' and classifiers' above but `EXPLAIN_PREDICT`,
+`FEATURE_IMPORTANCE` and `WEIGHTS`. `GLOBAL_EXPLAIN`'s attribution is how
+much the model's loss on up to 5,000 training rows grows when the
+feature's values are shuffled among them. `TRAINING_INFO` shows each
+epoch's training and validation loss, up to the one kept. A batch's
+gradient is added up in fixed parts of 32 rows, so networks are as
+repeatable as the other models.
 
 ### KMEANS
 

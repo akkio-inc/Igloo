@@ -25,6 +25,8 @@ var iglooTableMethods = map[string][]string{
 	ClassKMeans:          {"EVALUATE", "CENTROIDS", "TRAINING_INFO"},
 	ClassPCA:             {"EVALUATE", "PRINCIPAL_COMPONENTS", "PRINCIPAL_COMPONENT_INFO"},
 	ClassFactorization:   {"EVALUATE", "TRAINING_INFO"},
+	ClassDNNRegressor:    {"EVALUATE", "GLOBAL_EXPLAIN", "TRAINING_INFO"},
+	ClassDNNClassifier:   {"EVALUATE", "CONFUSION_MATRIX", "ROC_CURVE", "GLOBAL_EXPLAIN", "TRAINING_INFO"},
 }
 
 // iglooRowMethods lists each class's row methods, for messages; a model's
@@ -35,6 +37,8 @@ var iglooRowMethods = map[string][]string{
 	ClassKMeans:          {"PREDICT", "DETECT_ANOMALIES"},
 	ClassPCA:             {"PREDICT", "DETECT_ANOMALIES"},
 	ClassFactorization:   {"PREDICT", "RECOMMEND"},
+	ClassDNNRegressor:    {"PREDICT"},
+	ClassDNNClassifier:   {"PREDICT"},
 }
 
 // IsRowMethodOf reports whether method is a row method of class.

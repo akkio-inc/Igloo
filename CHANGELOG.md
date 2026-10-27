@@ -28,11 +28,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - BigQuery ML's model types as Igloo's own classes, with the same
   statements: `IGLOO.ML.REGRESSION` and `IGLOO.ML.CLASSIFICATION` (boosted
   trees, random forests, linear and logistic regressions),
-  `IGLOO.ML.KMEANS` (`CENTROIDS`, and `DETECT_ANOMALIES` by distance),
-  `IGLOO.ML.PCA` (projections, components, and anomalies by reconstruction
-  error) and `IGLOO.ML.MATRIX_FACTORIZATION` (explicit and implicit
-  feedback by ALS, `RECOMMEND`). `CONFIG_OBJECT` takes BigQuery's options
-  and the models' methods are its functions: `PREDICT`, `EXPLAIN_PREDICT`,
+  `IGLOO.ML.DNN_REGRESSOR` and `DNN_CLASSIFIER` (networks trained by Adam,
+  with dropout and early stopping), `IGLOO.ML.KMEANS` (`CENTROIDS`, and
+  `DETECT_ANOMALIES` by distance), `IGLOO.ML.PCA` (projections,
+  components, and anomalies by reconstruction error) and
+  `IGLOO.ML.MATRIX_FACTORIZATION` (explicit and implicit feedback by ALS,
+  `RECOMMEND`). `CONFIG_OBJECT` takes BigQuery's options and the models'
+  methods are its functions: `PREDICT`, `EXPLAIN_PREDICT`,
   `DETECT_ANOMALIES` and `RECOMMEND` in a query or as tables of the
   input's rows, scored on workers, and `EVALUATE`, `CONFUSION_MATRIX`,
   `ROC_CURVE`, `GLOBAL_EXPLAIN`, `FEATURE_IMPORTANCE`, `WEIGHTS`,

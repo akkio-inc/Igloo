@@ -24,7 +24,8 @@ const (
 )
 
 // IglooClasses are Igloo's classes, in the order the docs list them.
-var IglooClasses = []string{ClassRegression, ClassIglooClassifier, ClassKMeans, ClassPCA, ClassFactorization}
+var IglooClasses = []string{ClassRegression, ClassIglooClassifier, ClassKMeans, ClassPCA, ClassFactorization,
+	ClassDNNClassifier, ClassDNNRegressor}
 
 // IsIgloo reports whether class is one of Igloo's own.
 func IsIgloo(class string) bool { return strings.HasPrefix(class, "IGLOO.ML.") }
@@ -69,7 +70,7 @@ func TrainIgloo(class string, t *Table, a IglooArgs) (*Artifact, map[string]any,
 	art := &Artifact{Class: class}
 	var err error
 	switch class {
-	case ClassRegression, ClassIglooClassifier:
+	case ClassRegression, ClassIglooClassifier, ClassDNNClassifier, ClassDNNRegressor:
 		art.Supervised, err = trainSupervised(class, t, a, cfg)
 	case ClassKMeans:
 		art.Clusters, err = trainKMeans(t, a, cfg)
