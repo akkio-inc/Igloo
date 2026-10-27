@@ -318,6 +318,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   their published weights: no Python, GPU or runtime library, the same on
   amd64 and arm64 (NEON and AVX2 matrix products), and within 0.01% of
   the official implementations' forecasts.
+- Forecasting with those models: `FORECAST` and `ANOMALY_DETECTION` take
+  one as their `method` (`{'method': 'chronos-2'}`, zero-shot, with the
+  model's quantiles for intervals), and BigQuery's `AI.FORECAST` and
+  `AI.DETECT_ANOMALIES` and Databricks' `ai_forecast` and
+  `ai_detect_anomalies` run in both dialects with their arguments and
+  columns. On workers, a stage that holds whole series forecasts them; the
+  distributed planner now combines `list()` and `array_agg()` from
+  workers' partial lists.
 
 ### Loading and scheduling
 

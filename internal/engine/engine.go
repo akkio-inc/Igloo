@@ -26,6 +26,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/prefetch"
+	"github.com/akkio-inc/igloo/internal/tsforecast"
 )
 
 // attachRetryInterval is how long Open waits between attempts to reach the
@@ -82,6 +83,8 @@ type Engine struct {
 	aiHook atomic.Pointer[aiHookBox]
 	// models scores models and serves their methods' results (see Models).
 	models *models.Runtime
+	// forecasting forecasts with the model pack's models (see Forecasting).
+	forecasting *tsforecast.Service
 	// catMu keeps binding, walking and changing the attached catalog's
 	// in-memory set of tables apart. See CatalogLock. catLocked is when it
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
@@ -587,6 +590,9 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	}
 	if err := e.setupModels(ctx, cfg, true); err != nil {
 		return fmt.Errorf("register model functions: %w", err)
+	}
+	if err := e.setupForecasting(ctx, cfg); err != nil {
+		return fmt.Errorf("register forecasting functions: %w", err)
 	}
 
 	if cfg.Catalog.URI == "" {

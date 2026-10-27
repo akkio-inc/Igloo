@@ -51,6 +51,10 @@ type aggregation struct {
 	// final says the coordinator reads whole groups, as __f columns,
 	// rather than partial aggregates.
 	final bool
+	// staged are the select items a second stage that completes the
+	// groups (aggByGroup) computes too, as __s columns: those that call
+	// a group function (see GroupFunctions).
+	staged map[int]bool
 }
 
 // aggCall is one aggregate call and how it is computed in two steps.
@@ -451,7 +455,20 @@ const (
 	// planOptions). The bitmap is CRoaring's portable serialization, a
 	// BLOB, the same on every machine.
 	combineBitmap = "bitmap"
+	// combineList concatenates the lists of list() and array_agg(), whose
+	// order is arbitrary without ORDER BY.
+	combineList = "list"
 )
+
+// collecting are the aggregates that collect their values in a list,
+// which partial lists concatenate into (combineList).
+var collecting = map[string]bool{"list": true, "array_agg": true}
+
+// combineLists is the expression that concatenates partial lists: NULL,
+// as list() over no values, when every partial is NULL.
+func combineLists(col string) string {
+	return "flatten(list(" + col + ") FILTER (WHERE " + col + " IS NOT NULL))"
+}
 
 // combinable maps the aggregates that combine by applying another
 // aggregate to their partial results to that aggregate.
@@ -599,6 +616,10 @@ func partialArgs(name string, args int) error {
 		if args != 1 {
 			return unsupported("%s with %d arguments", name, args)
 		}
+	case collecting[name]:
+		if args != 1 {
+			return unsupported("%s with %d arguments", name, args)
+		}
 	case combinable[name] == "":
 		return unsupported("%s() cannot be computed in parts", name)
 	case (name == "min" || name == "max") && args != 1:
@@ -649,7 +670,7 @@ func (a *aggregation) choose() error {
 		a.mode = aggGather
 	case len(a.distincts) == 0:
 		a.mode = aggGather
-		if single && len(a.groups) > 0 && (a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && a.manyGroups()) {
+		if single && len(a.groups) > 0 && (a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && (a.manyGroups() || a.groupWork())) {
 			a.mode = aggByGroup
 		}
 	case !single:
@@ -692,6 +713,9 @@ func (a *aggregation) plan() error {
 		case "avg", "mean":
 			ac.kind = combineAvg
 			ac.partials = []int{a.partial(ac, "sum"), a.partial(ac, "count")}
+		case "list", "array_agg":
+			ac.kind = combineList
+			ac.partials = []int{a.partial(ac, "")}
 		default:
 			ac.kind = combineSame
 			if ac.name == "count" || ac.name == "count_star" || ac.name == "count_if" || ac.name == "countif" {
@@ -1148,6 +1172,9 @@ func (a *aggregation) valueStage() (*secondStage, error) {
 		} else {
 			name := strings.ToLower(str(p["function_name"]))
 			text := combinable[name] + "(" + quoteIdent("__a"+strconv.Itoa(i)) + ")"
+			if collecting[name] {
+				text = combineLists(quoteIdent("__a" + strconv.Itoa(i)))
+			}
 			if combinable[name] == "sum" && name != "sum" {
 				// Counts stay BIGINT, as one machine has them.
 				text = "CAST(" + text + " AS BIGINT)"
@@ -1168,9 +1195,12 @@ func (a *aggregation) valueStage() (*secondStage, error) {
 // partition holds whole groups, which it completes as the coordinator
 // would, every aggregate included, keeping only the groups HAVING keeps
 // and, under ORDER BY ... LIMIT, its first rows. The coordinator then reads
-// the completed aggregates (final).
+// the completed aggregates (final). Select items that call a group
+// function the stage computes too (staged), as __s columns; the lists only
+// they read stay on the workers.
 //
-//	SELECT __g0, ..., coalesce(sum(__a0), 0) AS __f0, count(DISTINCT __dk0) AS __f1, ...
+//	SELECT __g0, ..., coalesce(sum(__a0), 0) AS __f0, count(DISTINCT __dk0) AS __f1, ...,
+//		f(flatten(list(__a2) ...)) AS __s3, ...
 //	FROM __igloo_partials GROUP BY __g0, ... HAVING ... ORDER BY ... LIMIT ...
 func (a *aggregation) groupStage() (*secondStage, error) {
 	f, err := a.partialsSelect()
@@ -1178,7 +1208,29 @@ func (a *aggregation) groupStage() (*secondStage, error) {
 		return nil, err
 	}
 	items := list(f, "select_list")
+	var staged []any
+	if g, ok := a.pl.env.(GroupFunctions); ok {
+		for i, item := range a.items {
+			if !callsGroupFunction(item, g) {
+				continue
+			}
+			e, err := a.rewrite(bare(item), "select")
+			if err != nil || !overPartials(e) || a.pl.checkFunctions(e) != nil {
+				continue
+			}
+			staged = append(staged, aliased(e, "__s"+strconv.Itoa(i)))
+			if a.staged == nil {
+				a.staged = map[int]bool{}
+			}
+			a.staged[i] = true
+		}
+	}
+	reads := a.combineReads()
 	for k, ac := range a.aggs {
+		ac.final = -1
+		if ac.kind == combineList && len(a.staged) > 0 && !reads[ac] {
+			continue
+		}
 		e, err := a.combined(ac)
 		if err != nil {
 			return nil, err
@@ -1186,6 +1238,7 @@ func (a *aggregation) groupStage() (*secondStage, error) {
 		items = append(items, aliased(e, "__f"+strconv.Itoa(k)))
 		ac.final = k
 	}
+	items = append(items, staged...)
 	f["select_list"] = items
 	// HAVING and the first rows are worth applying early, when they can be
 	// said in terms of the partial results alone; the coordinator applies
@@ -1204,6 +1257,56 @@ func (a *aggregation) groupStage() (*secondStage, error) {
 	}
 	a.final = true
 	return &secondStage{fragment: f, keys: a.groupColumns()}, nil
+}
+
+// groupWork reports whether a select item calls a group function (see
+// GroupFunctions), which is worth calling where groups are whole.
+func (a *aggregation) groupWork() bool {
+	g, ok := a.pl.env.(GroupFunctions)
+	if !ok {
+		return false
+	}
+	return slices.ContainsFunc(a.items, func(item node) bool { return callsGroupFunction(item, g) })
+}
+
+// callsGroupFunction reports whether e calls one of g's group functions.
+func callsGroupFunction(e node, g GroupFunctions) bool {
+	found := false
+	walk(e, func(n node) bool {
+		if str(n["class"]) == "FUNCTION" && n["is_operator"] != true && g.GroupFunction(strings.ToLower(str(n["function_name"]))) {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// combineReads returns the aggregate calls the combine step reads: those
+// of the select items the second stage does not compute, HAVING, QUALIFY
+// and ORDER BY.
+func (a *aggregation) combineReads() map[*aggCall]bool {
+	reads := map[*aggCall]bool{}
+	visit := func(v any) {
+		walk(v, func(n node) bool {
+			if !a.pl.isAggregate(n) {
+				return true
+			}
+			if ac, ok := a.aggKeys[a.key(n)]; ok {
+				reads[ac] = true
+			}
+			return false
+		})
+	}
+	for i, item := range a.items {
+		if !a.staged[i] {
+			visit(item)
+		}
+	}
+	sel := a.c.sel
+	visit(child(sel, "having"))
+	visit(child(sel, "qualify"))
+	visit(sel["modifiers"])
+	return reads
 }
 
 // partialsSelect starts a second stage's SELECT: the group columns, over
@@ -1370,7 +1473,14 @@ func (a *aggregation) combine() (node, error) {
 	}
 	var items []any
 	for i, item := range a.items {
-		e, err := a.rewrite(bare(item), "select")
+		var e node
+		var err error
+		if a.staged[i] {
+			// Computed by the second stage (see groupStage).
+			e, err = a.pl.p.expr("any_value(" + quoteIdent("__s"+strconv.Itoa(i)) + ")")
+		} else {
+			e, err = a.rewrite(bare(item), "select")
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1517,6 +1627,8 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 	col := func(i int) string { return quoteIdent("__a" + strconv.Itoa(ac.partials[i])) }
 	var text string
 	switch {
+	case a.final && ac.final < 0:
+		return nil, fmt.Errorf("aggregate %s was left on the workers", ac.name)
 	case a.final:
 		// One row per group: any of its values is the value.
 		text = "any_value(" + quoteIdent("__f"+strconv.Itoa(ac.final)) + ")"
@@ -1528,6 +1640,8 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 		text = combinable[ac.name] + "(" + col(0) + ")"
 	case ac.kind == combineBitmap:
 		text = "rb_cardinality(rb_or_agg(" + col(0) + "))"
+	case ac.kind == combineList:
+		text = combineLists(col(0))
 	case ac.kind == combineDistinct:
 		c := clone(ac.call).(node)
 		ref, err := a.pl.p.expr(quoteIdent("__dk" + strconv.Itoa(ac.distinct)))

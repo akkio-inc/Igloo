@@ -87,6 +87,11 @@ already holds every row of its values, and counts them without a second
 exchange. The top groups of an aggregation by a column of the large table
 (`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are partitioned by
 group, and each partition sends the coordinator only its first groups.
+So are the groups of an aggregation that forecasts each one
+([`AI.FORECAST`](ml-functions.md#bigquerys-and-databricks-forecasting-functions)
+and the like, which gather a series' points with `list()`): each partition
+completes its series and forecasts them, and the coordinator receives the
+forecasts rather than the series.
 
 Where a session counts distinct 32-bit unsigned integers with roaring
 bitmaps (the `rb_count_distinct` setting, `always`, which Igloo sets for
@@ -153,7 +158,8 @@ In detail, a part runs distributed when:
   `UNION ALL` of them.
 - Its aggregates are `count`, `sum`, `min`, `max`, `avg`, `count_if`,
   `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `any_value`,
-  `fsum` and `product`, with or without `FILTER`, and any aggregate over
+  `fsum`, `product`, and `list` and `array_agg` (whose order, without
+  `ORDER BY` in the call, is any), with or without `FILTER`, and any aggregate over
   `DISTINCT` values of one expression (`count(DISTINCT user_id)`), or of
   several when one of them is a column that each of the others fixes
   (`count(DISTINCT user_id)` with `count(DISTINCT (user_id, day))`).
@@ -197,7 +203,7 @@ In detail, a part runs distributed when:
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list`, `stddev`), except over a relation workers compute, which is then
+`list(x ORDER BY y)`, `stddev`), except over a relation workers compute, which is then
 partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),

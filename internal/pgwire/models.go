@@ -401,6 +401,10 @@ func (s *Server) trainModel(ctx context.Context, sess *session, user auth.User, 
 			return nil, "", "", err
 		}
 		conf.Interrupt = ctx.Err
+		conf.Foundation, conf.Context = s.forecasting, ctx
+		if err := s.checkForecastMethod(conf.Method); err != nil {
+			return nil, "", "", err
+		}
 		t, err := s.readInput(ctx, sess, user, call.Arg("INPUT_DATA"), "INPUT_DATA")
 		if err != nil {
 			return nil, "", "", err
@@ -472,10 +476,13 @@ func forecastConfig(v *snowflake.ModelValue, anomaly bool) (models.ForecastConfi
 		var err error
 		switch strings.ToLower(key) {
 		case "method":
-			var m string
-			if m, err = str(e, key); err == nil && !slices.Contains([]string{"best", "fast"}, strings.ToLower(m)) {
-				err = modelSyntax("method is 'best' or 'fast', not %q", m)
+			// 'best', 'fast', or a foundation model's name, which
+			// training resolves (see models/foundation.go).
+			if c.Method, err = str(e, key); err == nil && strings.TrimSpace(c.Method) == "" {
+				err = modelSyntax("method is 'best', 'fast' or a forecasting model's name")
 			}
+		case "context_window":
+			c.ContextWindow, err = integer(e, key)
 		case "frequency":
 			c.Frequency, err = str(e, key)
 		case "on_error":
@@ -993,6 +1000,7 @@ func (s *Server) forecastMethod(ctx context.Context, sess *session, user auth.Us
 		}
 	}
 	q.Interval = interval
+	q.Foundation, q.Context = s.forecasting, ctx
 	var err error
 	if q.TimeCol, err = stringArg(call, "TIMESTAMP_COLNAME", false); err != nil {
 		return nil, err

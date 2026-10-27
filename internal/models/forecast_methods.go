@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"math"
 	"slices"
 	"strings"
@@ -24,6 +25,10 @@ type ForecastQuery struct {
 	Interval float64
 	// SkipErrors leaves out series that cannot be forecast.
 	SkipErrors bool
+	// Foundation forecasts a foundation model's series, and Context is
+	// the statement's (see foundation.go).
+	Foundation Foundation
+	Context    context.Context
 }
 
 // step is one forecast: a series' step, its forecast and interval, and the
@@ -126,6 +131,9 @@ func noExog(int, int) (float64, string, bool) { return math.NaN(), "", false }
 
 // Forecast carries out the FORECAST method.
 func (f *Forecaster) Forecast(q ForecastQuery) (*Result, error) {
+	if f.Foundation != nil {
+		return f.foundationForecast(q)
+	}
 	cols, _ := MethodColumns(ClassForecast, "FORECAST")
 	res := &Result{Columns: cols}
 	z := ml.NormalQuantile(0.5 + q.Interval/2)
@@ -226,6 +234,9 @@ func (f *Forecaster) checked(q ForecastQuery) ([]step, error) {
 // Detect carries out DETECT_ANOMALIES: each new point, its forecast and
 // interval, and whether it falls outside.
 func (f *Forecaster) Detect(q ForecastQuery) (*Result, error) {
+	if f.Foundation != nil {
+		return f.foundationDetect(q)
+	}
 	steps, err := f.checked(q)
 	if err != nil {
 		return nil, err
@@ -253,6 +264,9 @@ func (f *Forecaster) Detect(q ForecastQuery) (*Result, error) {
 // EvaluateOn carries out SHOW_EVALUATION_METRICS with new data: the
 // metrics of the forecasts of its points.
 func (f *Forecaster) EvaluateOn(q ForecastQuery) (*Result, error) {
+	if f.Foundation != nil {
+		return f.foundationEvaluate(q)
+	}
 	steps, err := f.checked(q)
 	if err != nil {
 		return nil, err

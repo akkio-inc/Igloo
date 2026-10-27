@@ -794,6 +794,11 @@ func (t *translator) modelMethods(nodes []*node) ([]*node, error) {
 		case modelFunctions[n.word()] && next >= 0 && nodes[next].isGroup('(') && !isQualified(nodes, i):
 			call := source(t.src, nodes[i:next+1])
 			nodes = replace(nodes, i, next+1, seq(nodes[i:next+1], raw("igloo_ml_method("+quoteString(call)+")")))
+		case forecastCallAt(nodes, i) > 0:
+			// AI.FORECAST and the like (see forecastcall.go).
+			end := forecastCallAt(nodes, i)
+			call := source(t.src, nodes[i:end])
+			nodes = replace(nodes, i, end, seq(nodes[i:end], raw("igloo_ml_method("+quoteString(call)+")")))
 		case n.isOp("!") && next >= 0 && nodes[next].kind == kWord:
 			p := prevSig(nodes, i)
 			if p < 0 {

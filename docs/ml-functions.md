@@ -33,6 +33,15 @@ Besides the classes, Databricks' `ai_predict_class` and `ai_predict_value`
 train a model and score rows in one query, keeping no model (see
 [below](#train-and-score-in-one-query)).
 
+Time series can also be forecast by **foundation models**, pretrained on
+many series and run zero-shot from the [model pack](models.md): Amazon's
+Chronos-Bolt and Chronos-2 and Google's TimesFM 2.5. `FORECAST` and
+`ANOMALY_DETECTION` take one as their `method`
+([below](#foundation-models)), and BigQuery's `AI.FORECAST` and
+`AI.DETECT_ANOMALIES` and Databricks' `ai_forecast` and
+`ai_detect_anomalies` forecast with them in a query
+([below](#bigquerys-and-databricks-forecasting-functions)).
+
 Models are trained by Igloo's own engine: gradient-boosted trees, as
 Snowflake's classes use (see [the engine](#the-engine)). Training reads its
 input as the user who creates the model, through their grants and
@@ -122,8 +131,9 @@ CREATE TABLE demo.spend_next_week AS
     SELECT * FROM TABLE(demo.spend_forecast!FORECAST(FORECASTING_PERIODS => 7));
 ```
 
-- **The method** is Snowflake's `fast` one, whatever `method` says
-  (`'best'`, Snowflake's default, ensembles models Igloo does not have):
+- **The method** is Snowflake's `fast` one, whether `method` says `'fast'`
+  or `'best'` (Snowflake's default, which ensembles models Igloo does not
+  have), unless it names a foundation model ([below](#foundation-models)):
   gradient-boosted trees on lags and rolling means of the target, calendar
   features of the timestamp (day of week, month and the like, by the
   series' frequency), the other columns of the input (exogenous
@@ -169,6 +179,46 @@ CREATE TABLE demo.spend_next_week AS
 | `SHOW_EVALUATION_METRICS(INPUT_DATA => ..., TIMESTAMP_COLNAME => ..., TARGET_COLNAME => ... [, SERIES_COLNAME => ...] [, CONFIG_OBJECT => {'prediction_interval': ...}])` | The same, of forecasts of new data, after the training data |
 | `EXPLAIN_FEATURE_IMPORTANCE()` | `SERIES`, `RANK`, `FEATURE_NAME`, `IMPORTANCE_SCORE` (shares of the mean absolute SHAP value, adding up to 1 per series), `FEATURE_TYPE`: `derived_from_endogenous` for `aggregated_endogenous_features` (the target's lags and rolling means together), `derived_from_timestamp` for calendar features, `user_provided` for exogenous columns |
 | `SHOW_TRAINING_LOGS()` | `SERIES`, `LOGS` |
+
+### Foundation models
+
+`CONFIG_OBJECT`'s `method` may name a forecasting model of the
+[model pack](models.md), installed, in place of `'fast'` or `'best'`: an
+Igloo extension of Snowflake's options.
+
+```sql
+CREATE SNOWFLAKE.ML.FORECAST demo.spend_forecast(
+    INPUT_DATA => TABLE(demo.daily_spend),
+    SERIES_COLNAME => 'campaign', TIMESTAMP_COLNAME => 'day', TARGET_COLNAME => 'spend',
+    CONFIG_OBJECT => {'method': 'chronos-2', 'context_window': 512});
+```
+
+- **Names.** `'chronos-bolt-tiny'`, `'chronos-bolt-mini'`,
+  `'chronos-bolt-small'`, `'chronos-bolt-base'`, `'chronos-2'`,
+  `'chronos-2-small'` and `'timesfm-2.5'`, or a model installed from a
+  manifest; case, spaces and underscores aside (`'TimesFM 2.5'` is
+  `timesfm-2.5`). A model the pack lacks is refused when the model is
+  created, saying how to install it.
+- **Nothing is trained.** The model object keeps each series' last
+  `context_window` steps (2,048 by default, at most what the model reads),
+  and `FORECAST` forecasts from them, zero-shot. Create the model again to
+  forecast from newer data.
+- **Intervals** are the model's own quantiles at `prediction_interval`,
+  interpolated between them; beyond its outermost ones (the 0.1 and 0.9
+  quantiles for most), they are extended as a normal distribution would be.
+- **Evaluation** forecasts each split's test steps from the steps before
+  them, as `evaluation_config` splits them, with the same metrics.
+  `EXPLAIN_FEATURE_IMPORTANCE` returns no rows: the models have no features.
+- The input holds the timestamp, the target and the series column alone:
+  the models forecast from the target's values, and other columns are
+  refused. Several rows at one step are aggregated as for `'fast'`, and
+  steps without a row are gaps, which the models read as missing.
+- `ANOMALY_DETECTION` takes a `method` too: `DETECT_ANOMALIES` forecasts
+  the new points from the kept steps and flags those outside the interval.
+  `PERCENTILE` is where the point falls in the model's forecast
+  distribution, and `DISTANCE` its z-score, with half the spread of the
+  forecast's 0.16 to 0.84 quantiles for the standard deviation.
+- Where they run, and how fast: see [the model pack](models.md#how-igloo-runs-them).
 
 ## ANOMALY_DETECTION
 
@@ -674,6 +724,71 @@ SELECT * FROM ai_predict_value(input => TABLE(demo.accounts), target_col => 'nex
 - They read their input as the user, policies applied, as the rest of the
   query does, and score on the replica that runs the query.
 
+## BigQuery's and Databricks' forecasting functions
+
+BigQuery's `AI.FORECAST` and `AI.DETECT_ANOMALIES` and Databricks'
+`ai_forecast` and `ai_detect_anomalies` forecast series with a foundation
+model of the [model pack](models.md) in a query, with no model object. Igloo
+reads them in both SQL dialects, with their arguments and output columns.
+They are table functions: use them in `FROM`.
+
+```sql
+SELECT * FROM AI.FORECAST(
+    TABLE demo.daily_spend,              -- or (SELECT ...)
+    data_col => 'spend', timestamp_col => 'day', id_cols => ['campaign'],
+    model => 'TimesFM 2.5', horizon => 14, confidence_level => 0.9);
+
+SELECT * FROM ai_forecast(
+    observed => TABLE(demo.daily_spend), horizon => '2026-12-01',
+    time_col => 'day', value_col => 'spend', group_col => 'campaign');
+```
+
+| Function | Arguments | Columns |
+|---|---|---|
+| `AI.FORECAST` | the input, `TABLE name` or `(query)`; `data_col`, `timestamp_col`; `model` (default `'TimesFM 2.5'`); `id_cols`; `horizon` (default 10) or `forecast_end_timestamp`, the last step's; `confidence_level` (0.95); `output_historical_time_series`; `context_window` | the `id_cols`, `forecast_timestamp`, `forecast_value`, `confidence_level`, `prediction_interval_lower_bound`, `prediction_interval_upper_bound`, `ai_forecast_status`; with the history, `time_series_type` (`'history'` or `'forecast'`), `time_series_timestamp` and `time_series_data` for the timestamp and value |
+| `AI.DETECT_ANOMALIES` | the history; the target, a second `TABLE` or `(query)`, or `target_last_n_points` or `target_start_timestamp` of the history; `data_col`, `timestamp_col`; `model`; `id_cols`; `anomaly_prob_threshold` (0.95); `context_window` | the `id_cols`, `time_series_timestamp`, `time_series_data`, `is_anomaly`, `lower_bound`, `upper_bound`, `anomaly_probability`, `ai_detect_anomalies_status` |
+| `ai_forecast` | `observed`, `TABLE(name)` or `TABLE(SELECT ...)`; `horizon`, the first time not forecast; `time_col`; `value_col`, a column or an array of them; `group_col`, a column or an array; `prediction_interval_width` (0.95); `frequency` (pandas' `'D'`, `'H'`, `'15min'`, `'W'`, `'MS'`, or `'1 day'`; inferred by default); `positive_only`; `version` (`'1'` or `'2'`); `model` (an Igloo extension; default `'chronos-2'`) | `time_col`, the groups, and for each value column `<v>_forecast`, `<v>_upper` and `<v>_lower` |
+| `ai_detect_anomalies` | `observed`; `time_col`; `value_col`; `group_col`; `anomaly_threshold` (0.95); `only_last_n`, a number of points or a timestamp; `smoothing` (accepted, no effect); `model` (default `'chronos-2'`) | `time_col`, the groups, the value column, `expected`, `lower_bound`, `upper_bound`, `anomaly_score`, `is_anomaly` |
+
+- **Models.** `model` names a model of the pack as `method` does (above):
+  BigQuery's `'TimesFM 2.5'` is `timesfm-2.5`. Databricks names no model;
+  Igloo forecasts with `chronos-2` unless `model` says otherwise. A model
+  the pack lacks is refused, saying how to install it. `'TimesFM 3.0'`,
+  which BigQuery offers in preview, is refused: its weights are licensed
+  for non-commercial use only, so the pack does not hold them.
+- **Series.** Each combination of `id_cols` (`group_col`) values is a
+  series, forecast on its own. Its frequency is the most common gap between
+  its timestamps; several rows at one step are averaged, and steps without
+  one are gaps. A series that cannot be forecast, such as one with fewer
+  than 3 points for BigQuery's functions, has a row saying why in
+  `ai_forecast_status` (`ai_detect_anomalies_status`), and the others are
+  forecast; `ai_forecast` leaves it out.
+- **Detection.** A point is anomalous when its `anomaly_probability`,
+  `|2F(y) - 1|` where `F` is the model's forecast distribution at that step
+  (0 at the median, near 1 far in either tail), is above the threshold;
+  `lower_bound` and `upper_bound` are the interval at the threshold.
+  `AI.DETECT_ANOMALIES` forecasts the target points (the last 1,024 of each
+  series) from the history before them. `ai_detect_anomalies` scores every
+  point of a series from the points before it, 64 steps at a time, and
+  leaves the first 8, which have too little before them, unscored.
+- **Context.** A model reads at most `context_window` of a series' last
+  points: for TimesFM 2.5, BigQuery's 64, 128, ..., 8,192 or 15,360, and by
+  default the smallest of those that holds the series; for the others, up
+  to what they read.
+- **Covariates** (`covariate_col`, BigQuery's `target_cols` and future
+  covariates), `holiday_region`, and version 1's prophet-like `parameters`
+  are refused: the models forecast from the values alone.
+- **Rows and policies.** The input is read as the user reads it, through
+  their grants, row access and masking policies, as the rest of the query
+  is. A view cannot call them; create a table from the query, or a
+  [task](loading.md) that does so on a schedule.
+- **Where they run.** On [workers](distributed-execution.md), when the
+  statement runs there: workers read the input and gather each series'
+  points, and a stage of workers that holds whole series, partitioned by
+  `id_cols`, forecasts them. Without `id_cols`, and in statements that do
+  not run on workers, the replica forecasts. Workers forecast with their
+  own copy of the model pack (see [where the pack lives](models.md#where-the-pack-lives)).
+
 ## Tasks
 
 A task's statement may call models' methods: the model is the one the
@@ -775,7 +890,8 @@ took (`BenchmarkIgloo1M` in `internal/models`, run with
   resolved each time it runs, with the model as it is then.
 - Forecasts, intervals, feature importance and metrics come from Igloo's
   engine, so their values differ from Snowflake's for the same data.
-  `FORECAST`'s `'best'` method is its `'fast'` one. A time series model's
+  `FORECAST`'s `'best'` method is its `'fast'` one; `method` may also name
+  a foundation model of the model pack, which Snowflake's does not. A time series model's
   series train together on one replica, not split among workers. `SHOW_FEATURE_IMPORTANCE` and
   the model's features keep their columns' names as Igloo has them: in
   lower case for a table's columns, in upper case for a Snowflake query's

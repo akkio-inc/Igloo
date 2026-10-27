@@ -238,6 +238,10 @@ func startTestWorkerRB(t *testing.T, dir string, i int, gate *taskGate, rb strin
 	if err := registerModelScoring(c, dir); err != nil {
 		t.Fatal(err)
 	}
+	// And forecast with the models of the pack in dir/model-pack.
+	if err := registerForecasting(c, filepath.Join(dir, "model-pack")); err != nil {
+		t.Fatal(err)
+	}
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: workerEngine{c, gate}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
 		Locations: []string{dir}, Cores: 1, MemoryBytes: 1 << 30,
@@ -324,6 +328,7 @@ func startDistServerRB(t *testing.T, dir string, workers int, rb string, coordin
 		// The extensions production loads, where scripts/test.sh provides them.
 		DuckDB:  config.DuckDB{TempDir: spill, ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")},
 		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
+		Models:  config.Models{Dir: filepath.Join(dir, "model-pack")},
 	}
 	ds.catalogServer = startCatalogServerWithConfig(t, cfg, append([]func(*Options){func(o *Options) { o.Distributed = co }}, configure...)...)
 	// Models' blobs go to the warehouse, where the workers read them.

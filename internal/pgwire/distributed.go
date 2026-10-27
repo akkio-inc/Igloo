@@ -25,6 +25,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/snowflake"
+	"github.com/akkio-inc/igloo/internal/tsforecast"
 )
 
 // Distributed execution (docs/distributed-execution.md): a SELECT that
@@ -810,8 +811,15 @@ func (e *sessionEnv) Describe(ctx context.Context, query string) ([]distributed.
 // redefining any of them makes them all the session's own. So does the
 // function that scores models (models.PredictFunction), which workers
 // define too, reading models' blobs from the warehouse.
+// GroupFunction reports whether name is a function that forecasts series
+// (tsforecast.Functions), which workers run over whole series, partition
+// by partition (see distributed.GroupFunctions).
+func (e *sessionEnv) GroupFunction(name string) bool {
+	return slices.ContainsFunc(tsforecast.Functions, func(f string) bool { return strings.EqualFold(name, f) })
+}
+
 func (e *sessionEnv) UserFunction(ctx context.Context, name string) (bool, error) {
-	if strings.EqualFold(name, models.PredictFunction) {
+	if strings.EqualFold(name, models.PredictFunction) || slices.ContainsFunc(tsforecast.Functions, func(f string) bool { return strings.EqualFold(name, f) }) {
 		return false, nil
 	}
 	if e.userFns == nil {

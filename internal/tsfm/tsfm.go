@@ -203,6 +203,28 @@ func (f Forecast) QuantileAt(p float64, t int) float64 {
 	return math.Max(hi, mid+normalQuantile(p)*sigma)
 }
 
+// CDF returns the level at which f's forecast of step t is y: the
+// forecast's distribution function, as QuantileAt inverts it, within
+// [0.0001, 0.9999].
+func (f Forecast) CDF(y float64, t int) float64 {
+	lo, hi := 0.0001, 0.9999
+	if y <= f.QuantileAt(lo, t) {
+		return lo
+	}
+	if y >= f.QuantileAt(hi, t) {
+		return hi
+	}
+	for range 50 {
+		mid := (lo + hi) / 2
+		if f.QuantileAt(mid, t) < y {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return (lo + hi) / 2
+}
+
 // normalQuantile is the standard normal distribution's quantile function.
 func normalQuantile(p float64) float64 { return math.Sqrt2 * math.Erfinv(2*p-1) }
 

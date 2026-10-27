@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"math"
 	"slices"
 	"sort"
@@ -55,6 +56,14 @@ type ForecastConfig struct {
 	Seed                                 uint64
 	// Interrupt, if set, stops training when it returns an error.
 	Interrupt func() error
+	// Method is CONFIG_OBJECT's method: 'fast' or 'best', or a foundation
+	// model's name, which Foundation resolves (see foundation.go), with
+	// ContextWindow of each series' last steps, and Context the
+	// statement's.
+	Method        string
+	ContextWindow int
+	Foundation    Foundation
+	Context       context.Context
 }
 
 // Forecaster is a trained FORECAST or ANOMALY_DETECTION model.
@@ -83,6 +92,9 @@ type Forecaster struct {
 	Logs       []SeriesLog     `json:"logs,omitempty"`
 	// MetricsInterval is the prediction interval the metrics used.
 	MetricsInterval float64 `json:"metrics_interval,omitempty"`
+	// Foundation, if set, says a foundation model forecasts the series
+	// (see foundation.go).
+	Foundation *FoundationState `json:"foundation,omitempty"`
 
 	interrupt func() error
 }
@@ -343,6 +355,12 @@ func (g *gridInput) layout(key string, rows []int, freq Frequency, start int64, 
 
 // TrainForecaster trains a FORECAST or ANOMALY_DETECTION model.
 func TrainForecaster(t *Table, timeCol, targetCol, seriesCol, labelCol string, cfg ForecastConfig) (*Forecaster, error) {
+	if model, ok, err := foundationFor(cfg); err != nil || ok {
+		if err != nil {
+			return nil, err
+		}
+		return trainFoundation(t, timeCol, targetCol, seriesCol, labelCol, cfg, model)
+	}
 	f := &Forecaster{AggTarget: strings.ToUpper(cfg.AggTarget), interrupt: cfg.Interrupt}
 	if f.AggTarget == "" {
 		f.AggTarget = strings.ToUpper(cfg.AggNumeric)

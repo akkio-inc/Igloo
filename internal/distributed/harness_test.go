@@ -56,6 +56,8 @@ type harness struct {
 	rb string
 	// wrap, if set, wraps the listener of each worker startWorker starts.
 	wrap func(i int, ln net.Listener) net.Listener
+	// groupFunctions are the functions the session's GroupFunctions names.
+	groupFunctions map[string]bool
 }
 
 // hookHandler passes records to the harness's hook, and on to its handler.
@@ -158,6 +160,8 @@ func (e harnessEnv) Describe(ctx context.Context, query string) ([]Column, error
 }
 
 func (e harnessEnv) UserFunction(context.Context, string) (bool, error) { return false, nil }
+
+func (e harnessEnv) GroupFunction(name string) bool { return e.h.groupFunctions[name] }
 
 // ViewDefinition returns the views addView made. Names in them mean the
 // harness's tables and views.

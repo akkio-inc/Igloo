@@ -17,6 +17,10 @@ igloo models install chronos-bolt-small timesfm-2.5
 igloo models verify                            # check every installed file again
 ```
 
+SQL forecasts with them through Snowflake's `FORECAST` and
+`ANOMALY_DETECTION` (as their `method`), BigQuery's `AI.FORECAST` and
+`AI.DETECT_ANOMALIES`, and Databricks' `ai_forecast` and
+`ai_detect_anomalies` (see [ML functions](ml-functions.md#foundation-models)).
 Models that call providers instead, with your own keys, are reached through
 [AI integrations](ai-functions.md).
 
@@ -40,8 +44,7 @@ it again.
 Models whose weights are not Apache-2.0 or MIT are not in the catalog and
 cannot be installed, whatever their use elsewhere: TimesFM 3.0
 (non-commercial), Moirai 2.0 (CC-BY-NC-4.0) and Timestral (a revenue-limited
-license) among them. Igloo reaches TimesFM 3.0 hosted, through BigQuery's
-own functions, not locally.
+license) among them.
 
 ## Installing
 

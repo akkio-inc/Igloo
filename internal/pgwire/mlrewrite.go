@@ -177,6 +177,11 @@ func keepsSQL(query string) (keeps bool, refuse string) {
 // modelRewrite resolves the calls of models' methods in query (see the
 // top of this file), for user.
 func (s *Server) modelRewrite(ctx context.Context, sess *session, user auth.User, query string) (string, error) {
+	// Forecasting functions in DuckDB's dialect (see tsforecast.go).
+	query, err := s.forecastRewrite(ctx, sess, user, query)
+	if err != nil {
+		return "", err
+	}
 	low := strings.ToLower(query)
 	if !strings.Contains(low, "igloo_ml_") && !strings.Contains(low, "ai_predict_") {
 		return query, nil
@@ -251,6 +256,14 @@ func (s *Server) resolveModelCall(ctx context.Context, sess *session, user auth.
 // returns a table, or of ai_predict_class or ai_predict_value, as written.
 func (s *Server) resolveModelText(ctx context.Context, sess *session, user auth.User, text string) (string, error) {
 	if repl, ok := sess.modelMemo[text]; ok {
+		return repl, nil
+	}
+	if snowflake.IsForecastCall(text) {
+		// AI.FORECAST and the like (see tsforecast.go).
+		repl, err := s.forecastQuery(ctx, sess, user, text)
+		if err != nil {
+			return "", modelError(err)
+		}
 		return repl, nil
 	}
 	call, err := snowflake.ParseModelCall(text)

@@ -63,6 +63,17 @@ type Env interface {
 	ViewDefinition(ctx context.Context, parts []string) (def *ViewDefinition, ok bool, err error)
 }
 
+// GroupFunctions is an Env whose session has functions worth calling where
+// a group is whole, on workers, rather than on the coordinator once every
+// group reached it: costly ones over a group's aggregates, such as one
+// that forecasts a series from list() of its points. Workers must define
+// them as the coordinator does, and UserFunction must not count them as a
+// user's. An aggregation whose select list calls one completes its groups
+// by group, in a second stage, which calls it too.
+type GroupFunctions interface {
+	GroupFunction(name string) bool
+}
+
 // ViewDefinition is a view's query and how to read the names in it.
 type ViewDefinition struct {
 	// Query is the view's SELECT.

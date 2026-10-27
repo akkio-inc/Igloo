@@ -68,6 +68,10 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if err := e.setupModels(ctx, cfg, false); err != nil {
 		return fmt.Errorf("register model functions: %w", err)
 	}
+	// And forecast with the model pack's models, as the server does.
+	if err := e.setupForecasting(ctx, cfg); err != nil {
+		return fmt.Errorf("register forecasting functions: %w", err)
+	}
 	for _, stmt := range storageStatements(cfg.Storage) {
 		if err := exec(stmt); err != nil {
 			// Never echo the statement: it can contain a secret key.

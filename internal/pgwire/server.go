@@ -44,6 +44,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/notify"
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -52,6 +53,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/tsforecast"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
 
@@ -361,6 +363,9 @@ type Server struct {
 	models       models.Store
 	modelRuntime *models.Runtime
 	trainRows    int
+	// forecasting forecasts with the model pack's models (see
+	// tsforecast.go).
+	forecasting *tsforecast.Service
 	// clonePurge is Options.ClonePurge (see catalogguard.go).
 	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
@@ -611,6 +616,12 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	if s.modelRuntime.Blobs() == nil {
 		s.modelRuntime.SetBlobs(models.NewMemory())
+	}
+	if e, ok := engine.(interface{ Forecasting() *tsforecast.Service }); ok {
+		s.forecasting = e.Forecasting()
+	}
+	if s.forecasting == nil {
+		s.forecasting = tsforecast.New(modelpack.Open(""))
 	}
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
