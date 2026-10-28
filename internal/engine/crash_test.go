@@ -43,7 +43,7 @@ const terminateChildEnv = "IGLOO_TERMINATE_CHILD"
 // TestExitOnTerminate throws a C++ exception that nothing catches on a
 // thread Go does not run, as one escaping a DuckDB worker would, in a
 // subprocess, and checks that the subprocess says so, with the exception's
-// type, and exits with status 134 at once (see package terminate). Without
+// type and message, and exits with status 134 at once (see package terminate). Without
 // the handler, C++ aborts, and Go's signal handler takes the abort.
 func TestExitOnTerminate(t *testing.T) {
 	if os.Getenv(terminateChildEnv) != "" {
@@ -57,7 +57,7 @@ func TestExitOnTerminate(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 134 || !strings.Contains(string(out), "a C++ exception escaped DuckDB or an extension") ||
-		!strings.Contains(string(out), "runtime_error") {
+		!strings.Contains(string(out), "runtime_error") || !strings.Contains(string(out), "thrown on a thread outside Go, and not caught") {
 		t.Fatalf("an exception escaping a foreign thread did not end the process with status 134: %v\n%s", err, out)
 	}
 	if took := time.Since(start); took > 30*time.Second {

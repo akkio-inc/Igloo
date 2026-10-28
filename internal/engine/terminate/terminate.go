@@ -12,10 +12,11 @@
 // Docker, seeing it run, restarted nothing and the statements whose tasks
 // it held waited too.
 //
-// The handler here writes one line to standard error and calls _exit(134),
-// the status of a process aborted by SIGABRT, with nothing that could wait
-// on a lock or allocate: no stack unwinding, no Go code, no signal. The
-// process ends, and whatever runs it restarts it.
+// The handler here writes to standard error what escaped (its type and its
+// message) and the frames of the thread it escaped on, and calls
+// _exit(134), the status of a process aborted by SIGABRT, with nothing that
+// could wait on a lock or allocate: no stack unwinding, no Go code, no
+// signal. The process ends, and whatever runs it restarts it.
 package terminate
 
 /*
