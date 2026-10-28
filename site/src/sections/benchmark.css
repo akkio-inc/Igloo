@@ -142,6 +142,13 @@
   letter-spacing: -0.035em;
   white-space: nowrap;
 }
+.vx-benchmark .vx-bm-nowrap {
+  white-space: nowrap;
+}
+.vx-benchmark .vx-bm-dash {
+  margin: 0 0.1em;
+  letter-spacing: 0;
+}
 .vx-benchmark .vx-bm-stats div + div dd {
   color: #f6c477;
 }
