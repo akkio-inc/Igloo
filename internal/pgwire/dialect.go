@@ -253,7 +253,7 @@ func (s *Server) translate(ctx context.Context, sess *session, text string, impl
 // of columns unnesting lists their FROM items compute when flattenForms
 // picks that form for its shape, DuckDB's estimates of tr's plan first.
 func (s *Server) flattenForm(ctx context.Context, sess *session, source string, tr *translation) *translation {
-	key := shapeKey(source)
+	key := s.workloadShape(ctx, sess, source)
 	lateral := tr.SQL
 	if !s.flattens.choose(key, func() bool { return estimateFlattenLists(ctx, sess, lateral) }) {
 		tr.flattenKey = key

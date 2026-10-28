@@ -749,7 +749,8 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 // allocated over its run on this replica, which it completed (see
 // distributed.Footprints); ok is false when none has.
 func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
-	return e.s.workload.Footprint(shapeKey(e.st.prepared))
+	// The session's path is read already, for the statement's shape.
+	return e.s.workload.Footprint(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
 }
 
 func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {

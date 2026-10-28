@@ -862,6 +862,11 @@ type session struct {
 	// settingGen counts the session's SET and PRAGMA statements, which may
 	// change how its statements resolve names and what they return.
 	settingGen uint64
+	// shapePath is where the session's names resolve, as of settingGen
+	// shapePathGen, for its statements' shapes (see workloadShape).
+	shapePath      string
+	shapePathGen   uint64
+	shapePathKnown bool
 	// prefetchOff turns reading ahead off for the session's statements
 	// (SET igloo_prefetch = off), reportRewriteOff recognizing their reports
 	// (SET igloo_report_rewrite = off), indexesOff their reads of bitmap
@@ -1912,7 +1917,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		sess.wl.counted = countsOnReplica(sess, st)
 		sess.wl.shape = ""
 		if sess.wl.counted {
-			sess.wl.shape = shapeKey(st.prepared)
+			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
 		}
 		shape := sess.wl.shape
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {

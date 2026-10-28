@@ -171,6 +171,27 @@ func shapeKey(text string) string {
 	return hex.EncodeToString(sum[:12])
 }
 
+// workloadShape is the shape the workload controller, the query history and
+// the FLATTEN forms know a statement of sess by: its text's (see shapeKey)
+// where its names resolve, the session's search path and database. A
+// dashboard's statements name their tables bare, so the same text over
+// another schema, another client's or the same data at ten times the size,
+// reads other tables, and its runs say nothing of them: a burst at ten times
+// the data reserved what its statements had at the data's size. The path is
+// read once for each of the session's settings (see settingGen).
+func (s *Server) workloadShape(ctx context.Context, sess *session, text string) string {
+	if !sess.shapePathKnown || sess.shapePathGen != sess.settingGen {
+		path, err := sessionPath(ctx, sess.conn)
+		if err != nil {
+			return shapeKey(text)
+		}
+		sess.shapePath = fmt.Sprintf("%q@%q", path.entries, path.defaultDB)
+		sess.shapePathGen, sess.shapePathKnown = sess.settingGen, true
+	}
+	sum := sha256.Sum256([]byte(statementShape(text) + "\x00" + sess.shapePath))
+	return hex.EncodeToString(sum[:12])
+}
+
 // statementShape is text with its string and number literals masked, its
 // comments left out and its white space collapsed: a dashboard's statement
 // sent again with another audience, date or limit has the same shape.

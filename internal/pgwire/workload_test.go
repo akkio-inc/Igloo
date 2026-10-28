@@ -2,6 +2,8 @@ package pgwire
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -361,5 +363,41 @@ func TestStatementShape(t *testing.T) {
 	if statementShape(`SELECT * FROM demo_x10.t`) == statementShape(`SELECT * FROM demo_x11.t`) ||
 		statementShape(`SELECT "c1" FROM t`) == statementShape(`SELECT "c2" FROM t`) {
 		t.Error("names with other digits have the same shape")
+	}
+}
+
+// TestWorkloadShapeFollowsSearchPath checks that a statement naming its
+// tables bare has a shape of its own on each search path, as it reads
+// other tables there, and the same shape again on the same path; the
+// history keeps it.
+func TestWorkloadShapeFollowsSearchPath(t *testing.T) {
+	t.Parallel()
+	store := audit.NewMemoryStore(1000, 1000)
+	history := audit.New(store, audit.Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ts := startServer(t, func(o *Options) { o.Audit = history })
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	for _, q := range []string{"CREATE SCHEMA small", "CREATE TABLE small.visits AS SELECT 1 AS id",
+		"CREATE SCHEMA large", "CREATE TABLE large.visits AS SELECT i AS id FROM range(1000) r(i)"} {
+		mustExec(t, conn, q)
+	}
+	const q = "SELECT count(*) FROM visits WHERE id >= 0"
+	for _, path := range []string{"small", "small", "large"} {
+		mustExec(t, conn, "SET search_path = '"+path+"'")
+		rawTexts(t, conn, q)
+	}
+	ctx := context.Background()
+	qs, err := store.Queries(ctx, audit.Viewer{All: true}, audit.Page{Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shapes []string
+	for _, r := range qs {
+		if r.Text == q {
+			shapes = append(shapes, r.Shape)
+		}
+	}
+	// Newest first: large, then small twice.
+	if len(shapes) != 3 || shapes[0] == "" || shapes[0] == shapes[1] || shapes[1] != shapes[2] {
+		t.Errorf("shapes on the paths small, small, large: %q, want one for each path", shapes)
 	}
 }
