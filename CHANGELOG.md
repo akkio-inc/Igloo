@@ -1432,6 +1432,23 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   light ones start at once. A dashboard's burst of queries over billions of rows,
   on 8 cores, took 548 to 574 seconds and take 306 to 310, the median
   query 21 to 22 seconds rather than 32 to 51.
+- Statements reserve memory by the most that statements of their shape held
+  at once, which Igloo samples while they run, rather than by everything
+  they allocated over a run, and runs cancelled at a limit count too (see
+  [reservations from
+  history](docs/workload-management.md#reservations-from-history)). A
+  larger dashboard at ten times the data, which ran 80 minutes
+  without finishing on 8 cores, takes 2,148 seconds; a smaller one
+  takes 255 seconds rather than 301.
+- A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
+  whichever form its shape's latest run took less CPU time in (see
+  [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens of
+  millions of rows took 88 seconds and take 56 and 40.
+- A statement's shape includes the session's search path and database, so
+  the same text over another schema, another client's or the same data at
+  ten times the size, learns its own memory and `FLATTEN` form: the first
+  build of a dashboard at ten times the data took 486 seconds and takes
+  328.
 - Statements translated from Snowflake's dialect divide with the rb
   extension's `igloo_sf_div`, which DuckDB binds as one function, rather
   than with macros whose every branch it bound, each operand named some 25
@@ -1814,6 +1831,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   deployments that relied on the earlier node defaults get new nodes on
   their next apply; `node_instance_types = ["r7g.xlarge"]` and
   `igloo_node_vm_size = "Standard_E4ps_v6"` keep the old ones.
+- When a C++ exception ends the process, the log names the exception's
+  message and the stack it was thrown from.
 
 ### Fixed
 
