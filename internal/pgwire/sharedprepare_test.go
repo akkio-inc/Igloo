@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -141,6 +142,47 @@ func TestSharedHoldRefusesWalks(t *testing.T) {
 	if err := exec(walks[2]); err != nil {
 		t.Errorf("dropping: %v", err)
 	}
+}
+
+// TestListingSubqueriesHoldTheCatalog checks that a query whose listing is a
+// subquery, SELECT ... FROM (SHOW TABLES ...) or (DESCRIBE ...), holds the
+// catalog lock exclusively, as SHOW and DESCRIBE statements do (see
+// listsCatalog), while other holders take its shared side over and over, as
+// other sessions' binds do: it waits its turn, rather than list alongside
+// them and have the listing refused.
+func TestListingSubqueriesHoldTheCatalog(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	r := vc.replica(t)
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE SCHEMA IF NOT EXISTS lake.crm")
+	mustExec(t, admin, "CREATE TABLE lake.crm.visits AS SELECT 1 AS id")
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			release := r.eng.CatalogShare()
+			time.Sleep(20 * time.Millisecond)
+			release()
+		}
+	})
+	for q, want := range map[string]string{
+		"SELECT name FROM (SHOW TABLES FROM lake.crm) ORDER BY 1": "visits",
+		"SELECT column_name FROM (DESCRIBE lake.crm.visits)":      "id",
+	} {
+		for range 5 {
+			if got := rawTexts(t, admin, q); !slices.Equal(got, []string{want}) {
+				t.Errorf("%s: %q, want %q", q, got, want)
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // sharedPrepareChildEnv, when set, makes TestSharedPreparesSurviveConcurrentDDL

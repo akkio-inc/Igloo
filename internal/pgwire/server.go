@@ -1399,9 +1399,10 @@ var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_
 // DuckDB's catalog listing functions and the pg_catalog, information_schema
 // and sqlite_master relations BI tools and drivers read, by the names the
 // statement is written with and the names Igloo rewrites them to, and SHOW,
-// DESCRIBE and PRAGMA. It over-approximates: a statement matched needlessly
-// only runs on its own when it could have run alongside others.
-var listsCatalog = regexp.MustCompile(`(?is)(^\s*(SHOW|DESCRIBE|DESC|PRAGMA)\b)|` +
+// DESCRIBE and PRAGMA, as statements and as subqueries (SELECT name FROM
+// (SHOW TABLES)). It over-approximates: a statement matched needlessly only
+// runs on its own when it could have run alongside others.
+var listsCatalog = regexp.MustCompile(`(?is)(^\s*(SHOW|DESCRIBE|DESC|PRAGMA)\b)|(\(\s*(SHOW|DESCRIBE|DESC)\b)|` +
 	`\b(sqlite_master|sqlite_schema|sqlite_temp_master|sqlite_temp_schema|` +
 	`duckdb_tables|duckdb_views|duckdb_columns|duckdb_constraints|duckdb_databases|duckdb_schemas|` +
 	`information_schema|information_schema_tables|information_schema_schemata|information_schema_functions|` +

@@ -1828,6 +1828,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   columns from a query of it, which lists nothing. The catalog proxy now
   refuses any listing, drop or rename while the lock is held shared, so a
   step that still did would fail rather than crash the replica.
+- A query that lists the catalog in a subquery, `SELECT name FROM (SHOW
+  TABLES ...)` or `FROM (DESCRIBE t)`, runs holding the catalog lock
+  exclusively, as `SHOW` and `DESCRIBE` statements do, rather than list
+  alongside other sessions' binds, which the catalog proxy then refused
+  with HTTP 423 now and then.
 - A view or materialized view created in Snowflake's dialect whose query
   needs Snowflake's implicit conversions, a number in a string function or
   text compared with a date (`TRIM(id)`, `d < '2024-02-01'`), gets them, as
