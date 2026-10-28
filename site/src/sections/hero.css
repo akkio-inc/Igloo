@@ -182,6 +182,7 @@
 }
 .vx-hero__title {
 	margin-left: -0.04em;
+	padding-right: 0.06em;
 	padding-bottom: 0.1em;
 	font-size: clamp(4.25rem, 2rem + 6vw, 7.5rem);
 	font-weight: 700;
