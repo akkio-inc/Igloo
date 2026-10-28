@@ -49,7 +49,7 @@ export default defineConfig({
 		starlight({
 			title: 'Igloo',
 			description: 'Open source SQL warehouse on Apache Iceberg',
-			logo: { src: './src/assets/logo.svg' },
+			logo: { light: './src/assets/logo-black.svg', dark: './src/assets/logo.svg' },
 			favicon: '/favicon.svg',
 			social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
 			sidebar,
