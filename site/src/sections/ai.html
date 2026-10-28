@@ -10,16 +10,15 @@
     <div class="vx-qs-layout">
       <div class="vx-qs-intro">
         <p class="vx-qs-eyebrow"><span class="vx-qs-led" aria-hidden="true"></span>AI</p>
-        <h2 class="vx-qs-title" id="vx-ai-title">10,000 campaign forecasts in 8 seconds, on one machine</h2>
-        <p class="vx-qs-lead">Foundation models forecast inside Igloo, zero-shot. AI functions call the model you choose, and every call is priced, capped and cached before it goes out.</p>
+        <h2 class="vx-qs-title" id="vx-ai-title">Every analyst can forecast and use AI on client data</h2>
+        <p class="vx-qs-lead">In plain SQL, with no model to train. Forecasts never leave Igloo, and AI calls go to the provider you choose, priced and capped before they run.</p>
       </div>
       <div class="vx-ai-grid">
           <article class="vx-ai-card">
-            <h3>Forecast every series</h3>
+            <h3>Forecast every campaign</h3>
             <pre class="vx-ai-sql"><code><span class="vx-qs-kw">CALL</span> spend!<span class="vx-qs-fn">FORECAST</span>(FORECASTING_PERIODS =&gt; 30);</code></pre>
             <figure class="vx-ai-viz"><svg class="vx-ai-chart" viewBox="0 0 480 190" role="img" aria-label="An example daily series and its three-week forecast, with an interval that widens with the horizon"><line class="vx-ai-grid-line" x1="14" x2="466" y1="164" y2="164"/><line class="vx-ai-now" x1="312.9" x2="312.9" y1="16" y2="164"/><path class="vx-ai-band" d="M312.9,118.9 320.2,92.6 327.5,84.6 334.8,78.5 342.1,77.7 349.4,78.9 356.6,90.7 363.9,90.3 371.2,72.3 378.5,63.7 385.8,57.0 393.1,55.6 400.4,56.1 407.7,67.3 415.0,66.2 422.3,47.7 429.5,38.4 436.8,31.1 444.1,29.1 451.4,29.0 458.7,39.5 466.0,37.8 466.0,155.0 458.7,149.9 451.4,132.7 444.1,126.4 436.8,122.2 429.5,123.4 422.3,126.8 415.0,139.6 407.7,135.1 400.4,118.5 393.1,112.8 385.8,109.2 378.5,111.1 371.2,115.1 363.9,128.5 356.6,124.6 349.4,108.7 342.1,103.6 334.8,100.7 327.5,103.2 320.2,107.8 Z"/><path class="vx-ai-hist" d="M14.0,137.5 21.3,128.1 28.6,121.4 35.9,125.0 43.2,130.4 50.5,151.9 57.7,151.7 65.0,130.6 72.3,125.7 79.6,121.9 86.9,122.2 94.2,124.1 101.5,139.5 108.8,141.0 116.1,121.3 123.4,113.9 130.6,100.1 137.9,91.2 145.2,102.0 152.5,127.6 159.8,132.9 167.1,120.1 174.4,112.1 181.7,107.1 189.0,114.4 196.3,107.3 203.5,127.5 210.8,130.4 218.1,114.7 225.4,111.1 232.7,105.3 240.0,108.1 247.3,104.8 254.6,121.7 261.9,123.5 269.2,109.9 276.5,96.8 283.7,94.3 291.0,92.7 298.3,95.0 305.6,114.3 312.9,118.9"/><path class="vx-ai-fc" pathLength="1" d="M312.9,118.9 320.2,100.2 327.5,93.9 334.8,89.6 342.1,90.7 349.4,93.8 356.6,107.6 363.9,109.4 371.2,93.7 378.5,87.4 385.8,83.1 393.1,84.2 400.4,87.3 407.7,101.2 415.0,102.9 422.3,87.2 429.5,80.9 436.8,76.6 444.1,77.7 451.4,80.8 458.7,94.7 466.0,96.4"/><circle class="vx-ai-dot" cx="312.9" cy="118.9" r="3.5"/><text class="vx-ai-axis" x="302.9" y="182" text-anchor="end">six weeks of history</text><text class="vx-ai-axis" x="322.9" y="182">forecast, 80% interval</text><text class="vx-ai-axis" x="14" y="12">example</text></svg></figure>
-            <p>Chronos and TimesFM run inside Igloo, on CPUs: nothing to train, no GPU to rent, and the series never leave.</p>
-            <p class="vx-ai-note">1,243 daily series a second (128 days of history, 24 days ahead) with Chronos-Bolt-Tiny on 16 Graviton3 cores.</p>
+            <p>Amazon's Chronos and Google's TimesFM forecast inside Igloo: nothing to train, no GPU to rent, and the data never leaves.</p>
           </article>
           <article class="vx-ai-card">
             <h3>Decide on every row</h3>
