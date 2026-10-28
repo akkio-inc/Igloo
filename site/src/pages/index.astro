@@ -1,6 +1,7 @@
 ---
 import '@fontsource-variable/inter/opsz.css';
 import '../styles/landing.css';
+import AI from '../components/landing/AI.astro';
 import Benchmark from '../components/landing/Benchmark.astro';
 import Closing from '../components/landing/Closing.astro';
 import Deploy from '../components/landing/Deploy.astro';
@@ -43,6 +44,7 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 			<Hero />
 			<Pillars />
 			<Benchmark />
+			<AI />
 			<Screens />
 			<Migrate />
 			<Features />
