@@ -16,7 +16,6 @@
 <span class="vx-qs-cmd">cd</span><span class="vx-qs-arg"> Igloo</span></code></pre></div>
         <ul class="vx-qs-next">
           <li><a href="/docs/"><svg class="vx-qs-nicon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5v-15z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20v3H6.5"/></svg>Read the docs</a></li>
-          <li><a href="/docs/configuration/"><svg class="vx-qs-nicon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg>Every setting</a></li>
           <li><a href="#deploy"><svg class="vx-qs-nicon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 18.5h10.5a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.5 9.6 4.5 4.5 0 0 0 7 18.5z"/></svg>Deploy to Kubernetes or the cloud</a></li>
         </ul>
       </div>
@@ -95,10 +94,10 @@
         <h2 class="vx-qs-title" id="vx-migrate-title">Start with the data you already have</h2>
         <p class="vx-qs-lead">Query your Snowflake tables and Databricks shares where they are, join them with Igloo&#x27;s, and copy them over one table at a time.</p>
         <ul class="vx-mg-points">
+          <li><h3>Know what runs before you move</h3><p>A migration report replays your Snowflake or Databricks query history on Igloo and shows what runs, whether the answers match, and what it would cost.</p></li>
           <li><h3>Read Snowflake in place</h3><p>Only the columns and rows a query needs come back from Snowflake, and Igloo's grants and policies apply to them.</p></li>
           <li><h3>Read Databricks shares in place</h3><p>Tables shared from Databricks over Delta Sharing are read where they live, including tables with deletion vectors.</p></li>
           <li><h3>Copy one table at a time</h3><p>CREATE TABLE AS streams a table into Iceberg without holding it in memory. PostgreSQL and MySQL databases work the same way.</p></li>
-          <li><h3>Know what runs before you move</h3><p>A migration report replays your Snowflake or Databricks query history on Igloo and shows what runs, whether the answers match, and what it would cost.</p></li>
         </ul>
       </div>
       <div class="vx-qs-panel">
