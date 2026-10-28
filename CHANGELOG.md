@@ -1469,12 +1469,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Queries are prepared side by side: a `SELECT` outside a transaction that
   calls no catalog function is prepared under the shared side of the
   catalog lock, alongside other sessions' prepares and binds, rather than
-  one statement at a time. While one is, the catalog proxy refuses, with
-  423, the requests DuckDB-Iceberg makes before it walks its set of the
-  catalog's tables or erases from it (listing a schema's tables, a drop, a
-  rename), so a prepare that would walk it, as DuckDB does to suggest names
-  for a table that does not exist, fails and is prepared again under the
-  exclusive lock. 32 distinct 16 KB queries prepared on 16 connections at
+  one statement at a time. While the lock is held shared, the catalog proxy
+  refuses, with 423, the requests DuckDB-Iceberg makes before it walks its
+  set of the catalog's tables or erases from it (listing a schema's tables,
+  a drop, a rename), so a prepare that would walk it, as DuckDB does to
+  suggest names for a table that does not exist, fails and is prepared
+  again under the exclusive lock. 32 distinct 16 KB queries prepared on 16 connections at
   once took 56% of the time they took one after another, against 110%
   before. `igloo_shared_prepares_total` counts them, and
   `IGLOO_SHARED_PREPARES=false` prepares every statement on its own (see
@@ -1817,6 +1817,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- `ALTER TABLE ... SET TAG`, `SET ID DOMAIN`, `ADD BITMAP INDEX`,
+  `SET SORTED BY`, `ANALYZE`, `SYSTEM$CLUSTERING_DEPTH`, and the other
+  commands that look up a table by name, `CREATE` and `DROP` of ID domains
+  and bitmap indexes among them, listed the catalog's tables, and created
+  and dropped Igloo's own, holding none or only the shared side of the
+  catalog lock: a walk of DuckDB-Iceberg's set of tables, or an erase from
+  it, alongside other sessions' binds, the crash the lock is there to
+  prevent. They hold it exclusively for those steps, and describe a table's
+  columns from a query of it, which lists nothing. The catalog proxy now
+  refuses any listing, drop or rename while the lock is held shared, so a
+  step that still did would fail rather than crash the replica.
 - A view or materialized view created in Snowflake's dialect whose query
   needs Snowflake's implicit conversions, a number in a string function or
   text compared with a date (`TRIM(id)`, `d < '2024-02-01'`), gets them, as

@@ -95,10 +95,6 @@ type Engine interface {
 	// SharedRefusals counts DuckDB's catalog requests refused while the
 	// catalog lock was held shared (see sharedprepare.go).
 	SharedRefusals() uint64
-	// SharedPrepare says a statement is being prepared under the shared
-	// catalog lock until the func it returns is called, which has the
-	// catalog proxy refuse listings meanwhile (see sharedprepare.go).
-	SharedPrepare() func()
 	ReloadTables(ctx context.Context, loads []catalogproxy.Load) error
 	// DistinctCounts returns the distinct counts of the catalog's tables'
 	// columns, by catalog.schema.table as DuckDB names it, lower-cased, and
@@ -2072,6 +2068,20 @@ func (s *Server) holdCatalog(sess *session) func() {
 	return s.catalogHold(sess, catalogExclusive)
 }
 
+// execHeld runs statements of Igloo's own that change the catalog, DDL of
+// its tables and schemas, holding the catalog lock exclusively, as a user's
+// DDL runs (see catalogRunLock): a drop erases from the catalog's in-memory
+// set of tables, and creating one looks through it.
+func (s *Server) execHeld(ctx context.Context, sess *session, stmts ...string) error {
+	defer s.holdCatalog(sess)()
+	for _, q := range stmts {
+		if _, err := sess.conn.ExecContext(ctx, q, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // shareCatalog takes the catalog lock shared for one step; see holdCatalog.
 func (s *Server) shareCatalog(sess *session) func() {
 	return s.catalogHold(sess, catalogShared)
@@ -2348,7 +2358,6 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 	if mode == catalogShared {
 		sess.sharedPrepare = true
 		defer func() { sess.sharedPrepare = false }()
-		defer s.engine.SharedPrepare()()
 	}
 	locked()
 	// DuckDB plans it with the tables' distinct counts as last loaded.

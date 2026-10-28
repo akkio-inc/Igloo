@@ -7,15 +7,15 @@ import (
 	"testing"
 )
 
-// TestSharedHold checks that while statements are prepared under the shared
-// catalog lock, the proxy refuses listings of a namespace's tables and
-// views, and drops and renames, with 423 and counts them, and lets
-// everything else through: loads of tables, listings of namespaces, and all
-// of it once no statement is prepared that way.
+// TestSharedHold checks that while the catalog lock is held shared, the
+// proxy refuses listings of a namespace's tables and views, and drops and
+// renames, with 423 and counts them, and lets everything else through:
+// loads of tables, listings of namespaces, and all of it once the lock is
+// no longer held shared.
 func TestSharedHold(t *testing.T) {
 	e := newListingEnv(t, -1)
 	var shared atomic.Bool
-	e.proxy.SetSharedPrepares(shared.Load)
+	e.proxy.SetSharedHold(shared.Load)
 	e.createTable(t, e.proxy.URL(), "orders")
 	e.createTable(t, e.proxy.URL(), "lines")
 	call := func(method, path, body string, want int) {

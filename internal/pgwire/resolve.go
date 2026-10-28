@@ -305,6 +305,11 @@ func (r *resolver) load(names []string) error {
 		}
 		return nil
 	}
+	// Listing tables and views walks the catalog's in-memory set of tables,
+	// which takes the catalog lock exclusively (see
+	// engine.Engine.CatalogLock): held already while a statement is
+	// prepared, but not by the commands that resolve names outside one.
+	defer r.s.holdCatalog(r.sess)()
 	quoted := make([]string, len(missing))
 	for i, n := range missing {
 		quoted[i] = quoteLiteral(n)

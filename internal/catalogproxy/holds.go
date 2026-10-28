@@ -5,40 +5,36 @@ import (
 	"sync/atomic"
 )
 
-// Shared prepares. The engine's catalog lock (engine.Engine.CatalogLock)
-// keeps DuckDB-Iceberg's in-memory set of the catalog's tables from being
-// walked, or having entries erased, while statements are bound against it:
-// either frees memory a bind or a walk is still reading. Binds hold the lock
-// shared; walks (listings, and DuckDB's suggestions of similar names for a
-// missing one) and erases (a drop or a rename committing) are to hold it
-// exclusively. Igloo prepares queries under the shared side, alongside other
-// statements' prepares and binds (see pgwire's sharedprepare.go), and a
-// prepare can walk: DuckDB suggests names for a table that does not exist,
-// say one another engine dropped a moment before. DuckDB-Iceberg walks a
-// schema's tables only after listing them in the same transaction, and
-// erases a table's or a schema's entry only after the catalog accepted the
-// drop or rename; those requests all come through the proxy. So while any
-// statement is prepared that way, the proxy refuses them (see
-// SetSharedPrepares): DuckDB fails the statement instead of walking or
-// erasing, and Igloo prepares it again under the exclusive lock. (A request
-// does not say which statement made it, so another's listing meanwhile is
-// refused too.)
+// Shared holds. The engine's catalog lock (engine.Engine.CatalogLock) keeps
+// DuckDB-Iceberg's in-memory set of the catalog's tables from being walked,
+// or having entries erased, while statements are bound against it: either
+// frees memory a bind or a walk is still reading. Binds, and the prepares
+// of queries (see pgwire's sharedprepare.go), hold the lock shared; walks
+// (listings, and DuckDB's suggestions of similar names for a missing one)
+// and erases (a drop or a rename committing) are to hold it exclusively.
+// DuckDB-Iceberg walks a schema's tables only after listing them in the
+// same transaction, and erases a table's or a schema's entry only after the
+// catalog accepted the drop or rename; those requests all come through the
+// proxy. So while the lock is held shared, and not exclusively, the proxy
+// refuses them (see SetSharedHold): DuckDB fails the statement instead of
+// walking or erasing, and Igloo can run it again holding the lock
+// exclusively.
 //
 // The refusal is 423 Locked, which DuckDB reports as an HTTP error that
 // names the status (its reason for a failed listing is the status line's),
 // and Refusals counts them.
 
 // heldShared is the message of the proxy's refusal of a listing or a drop
-// while statements are prepared under the shared catalog lock.
-const heldShared = "igloo: the catalog's tables are not listed, dropped or renamed while statements are prepared alongside others"
+// while the catalog lock is held shared.
+const heldShared = "igloo: the catalog's tables are not listed, dropped or renamed while statements are bound alongside"
 
-// SetSharedPrepares sets preparing, which reports whether statements are
-// being prepared under the shared catalog lock now, and nothing holds it
-// exclusively; until it is set, nothing is refused.
-func (p *Proxy) SetSharedPrepares(preparing func() bool) { p.shared.Store(&preparing) }
+// SetSharedHold sets held, which reports whether the engine's catalog lock
+// is held shared now, and not exclusively; until it is set, nothing is
+// refused.
+func (p *Proxy) SetSharedHold(held func() bool) { p.shared.Store(&held) }
 
-// Refusals is how many requests the proxy refused while statements were
-// prepared under the shared catalog lock.
+// Refusals is how many requests the proxy refused because the catalog lock
+// was held shared.
 func (p *Proxy) Refusals() uint64 {
 	if p == nil {
 		return 0
@@ -46,7 +42,7 @@ func (p *Proxy) Refusals() uint64 {
 	return p.refusals.Load()
 }
 
-// sharedHold is the proxy's record of the engine's shared prepares.
+// sharedHold is the proxy's record of the engine's shared holds.
 type sharedHold struct {
 	shared   atomic.Pointer[func() bool]
 	refusals atomic.Uint64
@@ -54,15 +50,14 @@ type sharedHold struct {
 
 // refuseShared answers r, whose path under the proxy is rest, with a
 // refusal if it lists a namespace's tables or views, or drops or renames a
-// table or drops a namespace, while statements are prepared under the
-// shared catalog lock.
+// table or drops a namespace, while the catalog lock is held shared.
 func (p *Proxy) refuseShared(w http.ResponseWriter, r *http.Request, rest string) bool {
 	held := p.shared.Load()
 	if held == nil || !walksOrErases(r.Method, rest) || !(*held)() {
 		return false
 	}
 	p.refusals.Add(1)
-	p.log.Debug("refused a catalog request while statements are prepared under the shared catalog lock", "method", r.Method, "path", rest)
+	p.log.Warn("refused a catalog request while the catalog lock is held shared", "method", r.Method, "path", rest)
 	writeError(w, http.StatusLocked, "CommitFailedException", heldShared)
 	return true
 }

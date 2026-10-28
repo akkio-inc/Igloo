@@ -90,8 +90,7 @@ func TestSharedPrepares(t *testing.T) {
 }
 
 // TestSharedHoldRefusesWalks checks the guard shared prepares rely on, in
-// DuckDB itself: while a statement is prepared under the shared catalog
-// lock, a listing of the
+// DuckDB itself: while the catalog lock is held shared, a listing of the
 // catalog's tables, a missing table's suggestion of similar names and a
 // drop fail with the catalog proxy's refusal, rather than walk
 // DuckDB-Iceberg's set of tables or erase from it; a table still loads, and
@@ -118,7 +117,7 @@ func TestSharedHoldRefusesWalks(t *testing.T) {
 		"DROP TABLE lake.public.kept",
 	}
 
-	release, prepared := r.eng.CatalogShare(), r.eng.SharedPrepare()
+	release := r.eng.CatalogShare()
 	refusals := r.eng.SharedRefusals()
 	for _, q := range walks {
 		if err := exec(q); err == nil || !strings.Contains(err.Error(), "423") {
@@ -131,7 +130,6 @@ func TestSharedHoldRefusesWalks(t *testing.T) {
 	if n := r.eng.SharedRefusals() - refusals; n < uint64(len(walks)) {
 		t.Errorf("%d refusals, want at least %d", n, len(walks))
 	}
-	prepared()
 	release()
 
 	if err := exec(walks[0]); err != nil {

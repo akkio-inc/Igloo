@@ -312,9 +312,18 @@ func (rw *rewriter) prepareBody(p policy.Policy, pc policyContext) (*bodyTemplat
 	return tmpl, noop, nil
 }
 
-// describeTable lists a table's columns and their types.
+// describeTable lists the columns, and their types, of a table, or of a
+// query when name is one.
 func describeTable(ctx context.Context, sess *session, name string) ([]columnType, error) {
-	rows, err := sess.conn.QueryContext(ctx, "SELECT column_name, column_type FROM (DESCRIBE "+name+")", nil)
+	// The columns of a query of the table, for which DuckDB binds it:
+	// DESCRIBE of a table of the catalog lists the tables of its schema,
+	// which may not happen alongside other binds (see
+	// engine.Engine.CatalogLock).
+	query := name
+	if words := sqllex.CodeWords(name); !startsQuery(name) && (len(words) == 0 || words[0] != "WITH" && words[0] != "VALUES") {
+		query = "SELECT * FROM " + name
+	}
+	rows, err := sess.conn.QueryContext(ctx, "SELECT column_name, column_type FROM (DESCRIBE "+query+")", nil)
 	if err != nil {
 		return nil, err
 	}

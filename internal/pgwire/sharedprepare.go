@@ -22,16 +22,13 @@ import (
 // a table a statement or a view's body names that does not exist, which
 // another engine may have dropped a moment before; it erases nothing.
 //
-// Neither happens alongside other binds: while a statement is prepared
-// under the shared lock, the catalog proxy refuses the requests
-// DuckDB-Iceberg makes before it walks the set or erases from it (see
-// catalogproxy's shared prepares, and engine.Engine.SharedPrepare), and
+// Neither happens alongside other binds: while the lock is held shared,
+// the catalog proxy refuses the requests DuckDB-Iceberg makes before it
+// walks the set or erases from it (see catalogproxy's shared holds), and
 // DuckDB fails the statement instead. So a prepare that holds the lock
 // shared is safe whatever it does; what is left to choose is which
 // prepares are likely to succeed that way, and to do the rest under the
-// exclusive lock as before. (A request does not say which statement made
-// it, so a listing that another statement makes meanwhile without the
-// exclusive lock, as a few of Igloo's own commands do, fails too.)
+// exclusive lock as before.
 // A query (one SELECT, outside a transaction) whose text calls no catalog
 // function is prepared holding the lock shared, alongside other sessions'
 // prepares and binds. If DuckDB fails to prepare it, or the proxy refused a

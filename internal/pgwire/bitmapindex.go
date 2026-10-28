@@ -292,10 +292,8 @@ func (s *Server) addIndex(ctx context.Context, sess *session, user auth.User, c 
 	// group, which the report API counts by (see reportindex.go).
 	ddl := "CREATE TABLE IF NOT EXISTS " + s.indexTable(c.name) + " (" +
 		strings.Join(slices.Concat([]string{"source_snapshot_id BIGINT"}, defs, []string{"generation INTEGER", "bm BLOB", "row_count BIGINT", "members BIGINT"}), ", ") + ")"
-	for _, q := range []string{"CREATE SCHEMA IF NOT EXISTS " + quoteName([]string{s.catalogName(), iddomain.IndexSchema}), ddl} {
-		if _, err := sess.conn.ExecContext(ctx, q, nil); err != nil {
-			return pgError(err)
-		}
+	if err := s.execHeld(ctx, sess, "CREATE SCHEMA IF NOT EXISTS "+quoteName([]string{s.catalogName(), iddomain.IndexSchema}), ddl); err != nil {
+		return pgError(err)
 	}
 	// A table left by an ADD that stopped half way is taken over only
 	// while empty.
@@ -370,7 +368,7 @@ func (s *Server) dropIndex(ctx context.Context, sess *session, c *indexCmd) erro
 	}); err != nil {
 		return err
 	}
-	if _, err := sess.conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+s.indexTable(c.name), nil); err != nil {
+	if err := s.execHeld(ctx, sess, "DROP TABLE IF EXISTS "+s.indexTable(c.name)); err != nil {
 		return pgError(err)
 	}
 	err = s.gov.store.Update(ctx, func(cat *policy.Catalog) error {

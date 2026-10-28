@@ -143,8 +143,8 @@ type Proxy struct {
 	lists *listings
 	// names are how the catalog spells its tables' names (see names.go).
 	names *names
-	// sharedHold refuses listings and drops while statements are prepared
-	// under the shared catalog lock (see holds.go).
+	// sharedHold refuses listings and drops while the catalog lock is
+	// held shared (see holds.go).
 	sharedHold
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
