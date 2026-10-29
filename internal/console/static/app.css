@@ -24,9 +24,6 @@
   --success-soft: #e1f3ee;
   --focus: #5b8ee6;
   --shadow: 0 1px 2px rgba(29, 39, 66, .06), 0 4px 16px rgba(29, 39, 66, .06);
-  --mark-fill: #cfe0f7;
-  --mark-stroke: #3565b8;
-  --mark-tunnel: #e3edfb;
   --code-keyword: #2f5fb3;
   --code-string: #a1530f;
   --code-number: #1d7f69;
@@ -66,9 +63,6 @@
     --success-soft: #1b3a3f;
     --focus: #8fb3f5;
     --shadow: 0 1px 2px rgba(0, 0, 0, .25), 0 6px 20px rgba(0, 0, 0, .25);
-    --mark-fill: #9fbcef;
-    --mark-stroke: #e4eafa;
-    --mark-tunnel: #bcd0f4;
     --code-keyword: #8fb3f7;
     --code-string: #f0c07a;
     --code-number: #6fd8b8;
@@ -105,9 +99,6 @@
   --success-soft: #1b3a3f;
   --focus: #8fb3f5;
   --shadow: 0 1px 2px rgba(0, 0, 0, .25), 0 6px 20px rgba(0, 0, 0, .25);
-  --mark-fill: #9fbcef;
-  --mark-stroke: #e4eafa;
-  --mark-tunnel: #bcd0f4;
   --code-keyword: #8fb3f7;
   --code-string: #f0c07a;
   --code-number: #6fd8b8;
@@ -167,11 +158,7 @@ code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
 /* The igloo mark */
 
 .mark svg, .signin-art svg { display: block; width: 100%; height: 100%; }
-.mk-dome, .mk-tunnel { stroke: var(--mark-stroke); stroke-width: 3; stroke-linejoin: round; }
-.mk-dome { fill: var(--mark-fill); }
-.mk-tunnel { fill: var(--mark-tunnel); }
-.mk-joints { stroke: var(--mark-stroke); stroke-width: 2; fill: none; opacity: .75; }
-.mk-door { fill: var(--warm); }
+.mk { fill: var(--text); }
 
 .wordmark {
   font-weight: 800;

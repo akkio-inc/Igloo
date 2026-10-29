@@ -48,14 +48,10 @@ function svg(viewBox, paths, cls) {
   return s;
 }
 
-// The igloo mark, styled by app.css so it follows the theme.
+// The igloo mark, a half disc with a doorway, in the text's color (app.css)
+// so it follows the theme.
 export function mark() {
-  return svg('3 23 56 30', [
-    ['M6 50A24 24 0 0 1 54 50Z', 'mk-dome'],
-    ['M7.4 42H52.6M12.1 34H47.9M21.6 27.5H38.4M18 42V50M30 42V50M24 34V42M36 34V42M30 27.5V34', 'mk-joints'],
-    ['M40 50V43a8 8 0 0 1 16 0V50Z', 'mk-tunnel'],
-    ['M44 50V46a4 4 0 0 1 8 0V50Z', 'mk-door'],
-  ]);
+  return svg('2 12 36 18', [['M2 30A18 18 0 0 1 38 30H30.5V26A4 4 0 0 0 22.5 26V30Z', 'mk']]);
 }
 
 const ICONS = {
