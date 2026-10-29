@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img alt="Igloo: open source SQL warehouse on Apache Iceberg. 5x faster, 30x cheaper per query (at 10GB query scale; exact speedup and cost reduction will vary)." src="docs/assets/banner-light.png" width="100%">
+    <img alt="An igloo with a lit doorway in the snow." src="docs/assets/banner-light.png" width="100%">
   </picture>
 </p>
 
@@ -10,15 +10,13 @@
 Igloo is an open-source SQL data warehouse that runs in your own cloud
 account or on your own hardware.
 
-On TPC-H at scale factor 10 (10 GB) with tables in Amazon S3, Igloo on one
-16-core machine ran the 22 queries 4.3 to 6.8 times faster than a Snowflake
-X-Small (Gen1 or Gen2) or Databricks SQL Serverless 2X-Small warehouse, and
-26 to 35 times cheaper per query at list prices. The margins vary with scale
-and size: at scale factor 100 the same machine was 2.2 to 3.2 times faster
-than those warehouses and 10 to 16 times cheaper, and a 64-core machine was
-2.4 to 3.2 times faster than their X-Large sizes and 59 to 69 times cheaper.
-See the [benchmark](bench/README.md) for the method, every result and its
-caveats.
+On TPC-H at scale factor 100 (100 GB), with tables in Amazon S3 and list
+prices, Igloo costs at least 9 times less per run than every Snowflake and
+Databricks warehouse size tested, X-Small to X-Large. A 64-core machine ran
+the 22 queries 4.8 times faster than a Snowflake Medium (Gen1) warehouse at
+25 times lower cost, and 2.4 to 3.2 times faster than the X-Large sizes at
+59 to 69 times lower cost. See the [benchmark](bench/README.md) for the
+method, every result and its caveats.
 
 - **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
   so `psql`, JDBC, psycopg, pgx, dbt, BI tools and notebooks work without an
@@ -32,10 +30,17 @@ caveats.
   store), with no proprietary storage to migrate out of. Spark, Trino and
   PyIceberg read and write them through Igloo's
   [Iceberg REST catalog](docs/external-engines.md), under Igloo's users and
-  grants; Databricks and Snowflake connect the same way.
-- **Fast on one machine, cheap to run.** Queries run on an embedded
-  [DuckDB](https://duckdb.org/). Most analytical workloads fit on a single
-  node; you pay for your own VMs and storage, nothing else.
+  grants.
+- **Efficient by design.** Queries run on an embedded
+  [DuckDB](https://duckdb.org/), and most analytical workloads fit on one
+  machine. You pay for your own machines and storage, with no credits to buy.
+- **AI and forecasting in SQL.** [Forecasts](docs/ml-functions.md#foundation-models)
+  on Amazon's Chronos and Google's TimesFM run inside Igloo, with no model
+  to train and no data leaving, and [AI functions](docs/ai-functions.md)
+  call the model provider you choose, priced and capped before they run.
+- **Know what runs before you move.** A [migration report](docs/migrating.md)
+  replays your Snowflake or Databricks query history on Igloo and shows what
+  runs, whether the answers match, and what it would cost.
 - **Runs anywhere.** Docker Compose for one machine, a Helm chart for any
   Kubernetes cluster, and OpenTofu modules that stand up the whole stack on
   AWS, Google Cloud or Azure.
@@ -43,14 +48,14 @@ caveats.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/console-worksheet-dark.png">
-    <img alt="Igloo's web console: a worksheet running a reach, frequency and spend query by advertiser over 21.9 million ad impressions, with its results below." src="docs/assets/screenshots/console-worksheet.png" width="100%">
+    <img alt="Igloo's web console: a worksheet running an aggregate query over 21.9 million rows, with its results below." src="docs/assets/screenshots/console-worksheet.png" width="100%">
   </picture>
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img alt="A Metabase dashboard on Igloo: impressions, spend, daily delivery, reach and frequency by campaign, top advertisers and click-through rate by channel." src="docs/assets/screenshots/metabase-dashboard.png"></td>
-    <td width="50%"><img alt="A Jupyter notebook on Igloo: a reach curve merged from stored HLL sketches and a frequency distribution pulled over Arrow Flight SQL, with their charts." src="docs/assets/screenshots/notebook.png"></td>
+    <td width="50%"><img alt="A Metabase dashboard on Igloo: totals, a daily time series, a top-ten table and rates by channel." src="docs/assets/screenshots/metabase-dashboard.png"></td>
+    <td width="50%"><img alt="A Jupyter notebook on Igloo: a distinct-count curve merged from stored HLL sketches and a distribution pulled over Arrow Flight SQL, with their charts." src="docs/assets/screenshots/notebook.png"></td>
   </tr>
   <tr>
     <td align="center"><sub>Metabase through the PostgreSQL driver</sub></td>
@@ -58,8 +63,8 @@ caveats.
   </tr>
 </table>
 
-<sub>Screenshots use synthetic ad-impression data from
-<code>deploy/single-vm/sql/load-media.sql</code>; the advertisers are
+<sub>Screenshots use synthetic data from
+<code>deploy/single-vm/sql/load-media.sql</code>; the companies in it are
 invented.</sub>
 
 Licensed under [Apache 2.0](LICENSE).
@@ -117,8 +122,7 @@ the official TPC-H answers.
 - **Iceberg tables** with `CREATE [OR REPLACE] TABLE`, `CREATE TABLE AS`,
   `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, schemas, views, comments,
   and time travel (`SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-01 00:00')`).
-- **[Zero-copy clones](docs/sql.md#clones)** of tables and schemas, as in
-  Snowflake: a full copy of production to develop and test against, made in
+- **[Zero-copy clones](docs/sql.md#clones)** of tables and schemas: a full copy of production to develop and test against, made in
   seconds without copying data, with the source's policies; and Iceberg
   [branches and tags](docs/sql.md#branches-and-tags) of tables.
 
@@ -149,8 +153,8 @@ the official TPC-H answers.
   CREATE USER dbt_prod TYPE SERVICE ROLE none;
   CREATE TOKEN ci FOR USER dbt_prod EXPIRES '90d';   -- shown once, stored hashed
   ```
-- **[Row access and masking policies, and tags](docs/security-policies.md)**,
-  as in Snowflake: show each team only its clients' rows, and mask emails,
+- **[Row access and masking policies, and tags](docs/security-policies.md)**:
+  show each team only its clients' rows, and mask emails,
   device IDs and other identifiers for everyone not allowed to see them,
   in every statement, the web console included.
 
@@ -166,8 +170,8 @@ the official TPC-H answers.
   ALTER TABLE marts.impressions ALTER COLUMN email SET TAG pii = 'email';
   ```
 - **[Delta Sharing](docs/sharing.md)**, both ways: share tables with clients
-  and partners, who read them with Databricks, Spark, pandas, Power BI or
-  Tableau through the open protocol, and query partners' shares as
+  and partners, who read them with Spark, pandas, Power BI or Tableau
+  through the open protocol, and query partners' shares as
   external tables, with grants as for any table.
 
   ```sql
@@ -264,8 +268,7 @@ the official TPC-H answers.
   store-radius reporting; DuckDB's approximate, statistical and time zone
   functions.
 - **[Other engines](docs/external-engines.md)** through an Iceberg REST
-  catalog on port 8181: Spark, Trino, PyIceberg, Databricks and Snowflake
-  sign in as Igloo users, Igloo's grants decide what they may read and change,
+  catalog on port 8181: Spark, Trino and PyIceberg sign in as Igloo users, Igloo's grants decide what they may read and change,
   their requests go to the query history, and they get storage credentials
   that last an hour and reach one table's files only.
 - **[Workload management](docs/workload-management.md)**: query tags
@@ -371,9 +374,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   backups, table maintenance, upgrades, troubleshooting
 - [Scale to zero](docs/scale-to-zero.md): stop compute when idle and start it
   on the next connection
-- [Other engines](docs/external-engines.md): Spark, Trino, PyIceberg,
-  Databricks and Snowflake on Igloo's tables, through its Iceberg REST
-  catalog
+- [Other engines](docs/external-engines.md): Spark, Trino and PyIceberg on
+  Igloo's tables, through its Iceberg REST catalog
 - [Distributed execution](docs/distributed-execution.md): queries larger than
   one machine, run in parts on workers
 - [SQL and clients](docs/sql.md): the SQL dialect, Iceberg features, type
@@ -392,8 +394,12 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   reach
 - [Media analytics](docs/media-analytics.md): reach and frequency with
   sketches, geospatial reporting, approximate and statistical functions
-- [ML functions](docs/ml-functions.md): models trained and scored in SQL,
-  with Snowflake's `SNOWFLAKE.ML` classes
+- [ML functions](docs/ml-functions.md): forecasting, anomaly detection,
+  classification and other models, trained and scored in SQL
+- [AI functions](docs/ai-functions.md): completion, classification,
+  extraction and decision models in SQL, through your own model provider
+- [Model pack](docs/models.md): the open-weight forecasting models Igloo
+  runs itself
 - [Workload management](docs/workload-management.md): query tags, usage and
   cost per client, role limits, compute pools
 - [Delta Sharing](docs/sharing.md): sharing tables with outside recipients,
@@ -447,8 +453,8 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   access to the files ([details](docs/external-engines.md#storage-credentials)).
 - **Connections attach at startup.** A new connection to another database
   is attached when each replica next restarts; changes to its credentials
-  and host apply at once. Connections are read-only, and BigQuery and
-  Snowflake are not supported yet ([details](docs/federation.md)).
+  and host apply at once. Connections are read-only, and BigQuery is not
+  supported yet ([details](docs/federation.md)).
 
 ## Repository layout
 
