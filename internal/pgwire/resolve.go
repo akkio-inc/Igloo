@@ -130,6 +130,12 @@ func splitTopLevelQuoted(s string, sep byte) []string {
 // setsSearchPath matches the SET and RESET that change the search path.
 var setsSearchPath = regexp.MustCompile(`(?is)^(SET|RESET)\s+(?:SESSION\s+|LOCAL\s+)?"?(search_path|schema)"?(\s|=|;|$)`)
 
+// resetsSearchPath matches the RESET and SET ... DEFAULT of the search path
+// or schema at session scope, which DuckDB takes to its own default, its
+// own database with an empty path, not to the path a session starts with.
+var resetsSearchPath = regexp.MustCompile(
+	`(?is)^(?:RESET\s+(?:SESSION\s+)?"?(?:search_path|schema)"?|SET\s+(?:SESSION\s+)?"?(?:search_path|schema)"?\s*(?:=|\s+TO)\s*DEFAULT)\s*;?\s*$`)
+
 // keepViewsOnPath puts the local copies of the catalog's views back on the
 // session's search path after a client set it, next to each catalog schema
 // there, as on the path sessions start with (lake.public,memory.public).

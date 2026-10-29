@@ -69,6 +69,9 @@ type Engine interface {
 	LoadSchemas(ctx context.Context, conn *duckdb.Conn) error
 	// LocalDatabase is the name of DuckDB's own database.
 	LocalDatabase() string
+	// UseDefaultSchema puts a connection back on the schema and search
+	// path a new one starts with.
+	UseDefaultSchema(ctx context.Context, conn *duckdb.Conn) error
 	// CatalogLock and CatalogShare take the lock that keeps changes to the
 	// structure of the catalog's in-memory set of tables from running
 	// alongside walks and binds of it, exclusively and shared; each returns the

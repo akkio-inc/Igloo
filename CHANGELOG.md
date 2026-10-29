@@ -1836,6 +1836,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- `RESET search_path` and `RESET schema`, and `SET search_path TO DEFAULT`
+  and `SET schema TO DEFAULT`, put a session back on the schema and search
+  path it started with, the catalog's default schema and its views' schema.
+  DuckDB's own default is its own database with an empty path, so an
+  admin's unqualified `CREATE SCHEMA` after such a `RESET` landed in
+  `memory`, and a non-admin's `RESET` was refused for making `memory` the
+  current database.
 - `ALTER TABLE ... SET TAG`, `SET ID DOMAIN`, `ADD BITMAP INDEX`,
   `SET SORTED BY`, `ANALYZE`, `SYSTEM$CLUSTERING_DEPTH`, and the other
   commands that look up a table by name, `CREATE` and `DROP` of ID domains

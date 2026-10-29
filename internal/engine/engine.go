@@ -154,13 +154,24 @@ func (e *Engine) Connect(ctx context.Context) (*duckdb.Conn, error) {
 	}
 
 	conn := c.(*duckdb.Conn)
-	for _, stmt := range e.connectStmts {
-		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
-			return nil, errors.Join(fmt.Errorf("select default schema: %w", err), conn.Close())
-		}
+	if err := e.UseDefaultSchema(ctx, conn); err != nil {
+		return nil, errors.Join(err, conn.Close())
 	}
 
 	return conn, nil
+}
+
+// UseDefaultSchema puts conn back on the schema and search path a new
+// connection starts with: the catalog's default schema, then its views'
+// schema in the local database. DuckDB's own default, which its RESET of
+// the search path restores, is its own database with an empty path.
+func (e *Engine) UseDefaultSchema(ctx context.Context, conn *duckdb.Conn) error {
+	for _, stmt := range e.connectStmts {
+		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+			return fmt.Errorf("select default schema: %w", err)
+		}
+	}
+	return nil
 }
 
 // sqlConn opens a database/sql connection to DuckDB, which duckdb-go
