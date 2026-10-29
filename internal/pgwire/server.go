@@ -1444,6 +1444,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	// Models' methods are computed once per statement as it is parsed,
 	// however many times parsing tries it (see modelRewrite).
 	sess.modelMemo = nil
+	if ps, ok := s.sessionResetCommand(sess, q.Query); ok {
+		return ps, nil
+	}
 	if ps, ok := s.dialectCommand(sess, q.Query); ok {
 		return ps, nil
 	}
@@ -1641,12 +1644,8 @@ func (s *Server) parseDuckDB(ctx context.Context, sess *session, user auth.User,
 	// has no DEALLOCATE ALL.
 	if deallocateAll.MatchString(q.Query) {
 		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
-			if c := sess.statements; c != nil {
-				for name := range c.names {
-					if err := c.Delete(ctx, name); err != nil {
-						return err
-					}
-				}
+			if err := sess.deallocateAll(ctx); err != nil {
+				return err
 			}
 			return w.Complete("DEALLOCATE ALL")
 		}))), nil

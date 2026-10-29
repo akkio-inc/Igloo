@@ -119,6 +119,24 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `igloo_comments()`, and `information_schema.tables` and `.columns`.
 - SQL cursors (`DECLARE`, `FETCH`, `CLOSE`) and array parameters, so
   psycopg's server-side cursors and Ibis's PostgreSQL backend work.
+- `RESET ALL` and `DISCARD ALL`, which PgBouncer (its default
+  `server_reset_query`) and drivers' connection pools send to clean a
+  session for its next client, in either dialect. `RESET ALL` puts every
+  setting a session can change back to what it had at login: DuckDB's
+  session settings, the search path (the catalog's default schema),
+  `statement_timeout`, `statement_queued_timeout`, `query_tag`,
+  `sql_dialect`, `distributed_execution`, the `igloo_` switches, the AI
+  settings, `application_name` and SQL variables, with the user's and
+  roles' settings applying again. `DISCARD ALL` also closes cursors and
+  drops prepared statements and temporary objects, keeping those every
+  session starts with, and runs only outside a transaction block, as in
+  PostgreSQL. `DISCARD TEMP` drops temporary objects alone. `DISCARD PLANS`
+  and `DISCARD SEQUENCES` succeed and change nothing: DuckDB keeps no plans
+  but prepared statements, and no sequence values per session. DuckDB
+  refuses `RESET ALL` and does not parse `DISCARD`, so all of these failed
+  before. What an admin set for the whole server, with `SET GLOBAL` or an
+  unscoped `SET` that DuckDB applies globally, stays, as `ALTER SYSTEM`
+  settings do in PostgreSQL.
 - Semi-structured columns. Lists, maps and structs are Iceberg's own
   `list`, `map` and `struct`, which Spark, Trino and PyIceberg read. A `JSON`
   or `VARIANT` column, which Iceberg tables of format version 1 and 2 cannot
