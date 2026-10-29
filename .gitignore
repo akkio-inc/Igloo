@@ -1,6 +1,9 @@
 # Local deployment secrets
 .env
 
+# Claude Code's local state, reports and worktrees
+/.claude/
+
 # Build output
 /bin/
 
