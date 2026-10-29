@@ -178,7 +178,7 @@ services:
   # can reach it; it is not published on the host. Other engines use the
   # catalog through Igloo's port 8181 instead.
   lakekeeper:
-    image: quay.io/lakekeeper/catalog:v0.14.0
+    image: quay.io/lakekeeper/catalog:v0.14.2
     restart: unless-stopped
     command: ["serve"]
     environment: *catalog-env
@@ -192,7 +192,7 @@ services:
         condition: service_completed_successfully
 
   catalog-migrate:
-    image: quay.io/lakekeeper/catalog:v0.14.0
+    image: quay.io/lakekeeper/catalog:v0.14.2
     command: ["migrate"]
     environment: *catalog-env
     depends_on:
@@ -218,7 +218,7 @@ services:
   # Local S3-compatible object store, for machines without cloud storage.
   # Enabled by COMPOSE_PROFILES=local-storage in .env.
   storage:
-    image: rustfs/rustfs:1.0.1
+    image: rustfs/rustfs:1.0.4
     profiles: ["local-storage"]
     restart: unless-stopped
     # Not ${VAR:?}: Compose checks every service, even ones whose profile is
