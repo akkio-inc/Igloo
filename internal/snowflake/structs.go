@@ -288,10 +288,10 @@ type hoist struct {
 // before it, such as SPLIT(t.tags, ','). flattenUnnest computes such an
 // input in a subquery of its own, which DuckDB joins to the item's rows
 // with a dependent join that holds them all in a hash table: 98 s against
-// 41 s for a report that flattened a list column of tens of millions
-// of rows joined to an audience. A column flattenUnnest unnests where it
-// reads it, unless its select's WHERE stays a WHERE (see laterallyFiltered),
-// and then DuckDB takes a dependent join for it too. INPUT must be its only
+// 41 s for a report that flattened a list column of tens of millions of
+// rows joined to an audience. A column flattenUnnest unnests where it reads
+// it, unless its select's WHERE stays a WHERE (see laterallyFiltered), and
+// then DuckDB takes a dependent join for it too. INPUT must be its only
 // argument, and not an array constant; it must be joined plainly at a level
 // with no outer join, its column list must keep FLATTEN's names, no later
 // FLATTEN may read it, and its select must read only its VALUE, qualified

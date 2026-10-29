@@ -5,8 +5,8 @@
 // category, the space separators (Zs) being what it trims, and copies what
 // is left even when it trimmed nothing: some 300 ns a row for short strings.
 // Igloo's reports trim the values they filter and group by: a report's four
-// filters of TRIM(LOWER(x)) took 154 s of its 381 s of threads over tens
-// of millions of values, where comparing the values as they were took 2.5 s.
+// filters of TRIM(LOWER(x)) took 154 s of its 381 s of threads over tens of
+// millions of values, where comparing the values as they were took 2.5 s.
 //
 // At load, the one-argument trim, ltrim and rtrim become these, which read a
 // space by its byte and decode only the characters at the ends of a string

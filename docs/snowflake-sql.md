@@ -154,8 +154,8 @@ JSON and JSON text alike.
   form when those joins keep few rows. In the other, the column's table
   computes the list in a select list of its own, for all its rows, before
   the joins, and the lateral subquery unnests it where it reads it, the
-  faster form when the joins keep most rows: over tens of millions of rows
-  a `FLATTEN`, one dashboard query took 0.9 s the first way and 3.5 s the
+  faster form when the joins keep most rows: over tens of millions of rows a
+  `FLATTEN`, one dashboard query took 0.9 s the first way and 3.5 s the
   second, another 88 s and 56 s. Igloo picks for each statement shape: the
   first statement takes the form DuckDB's estimates point to (the second
   when a quarter or more of the tables' rows reach the dependent joins), the

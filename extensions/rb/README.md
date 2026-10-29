@@ -94,9 +94,9 @@ some 300 ns a row for short strings. At load, the extension has the
 one-argument `trim`, `ltrim` and `rtrim` run its own code instead, with
 DuckDB's results (`src/rb_strings.cpp`): a space is trimmed by its byte, only
 the characters at a string's ends that are not ASCII are decoded, and a
-string left as it was is not copied. Over tens of millions of short strings, a filter
-of `NOT trim(s) IN (...)` took 4.9 s with DuckDB's `trim` and takes 0.65 s,
-against 0.3 s without `trim`.
+string left as it was is not copied. Over tens of millions of short strings, a
+filter of `NOT trim(s) IN (...)` took 4.9 s with DuckDB's `trim` and takes
+0.65 s, against 0.3 s without `trim`.
 
 ## Snowflake's division
 

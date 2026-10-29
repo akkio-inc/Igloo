@@ -257,10 +257,10 @@ not forget them; a run from before the history kept peaks counts by what it
 allocated, and one cancelled after ten seconds or more as needing all the
 memory it ran with.
 
-On a dashboard's burst of queries over billions of rows, on 8 cores and 22 GB, the
-build took 548 to 574 seconds with 8 statements running at once and 365
-with 2, and takes 306 to 310 with reservations, its median query 21 to 22
-seconds rather than 32 to 51; reserving half of what a shape allocated
+On a dashboard's burst of queries over billions of rows, on 8 cores and
+22 GB, the build took 548 to 574 seconds with 8 statements running at once
+and 365 with 2, and takes 306 to 310 with reservations, its median query 21
+to 22 seconds rather than 32 to 51; reserving half of what a shape allocated
 took 314 to 353, and a quarter 367 to 371. The first time a dashboard runs
 on a replica, its statements have no history and reserve nothing: its first
 build took 558 to 590 seconds; after a restart, with what the history kept,
@@ -361,8 +361,8 @@ heaviest work it gets at once, not to its average:
 | dbt and other large transformations | Memory first (`r7gd`) | Joins and sorts of whole tables spill less |
 | Ad hoc analysis, a few users | Small (`m7gd.xlarge` to `2xlarge`) with [scale to zero](scale-to-zero.md) | Idle most of the day |
 
-A dashboard's burst of queries over billions of rows, all at once, took 300 to
-310 s on 8 cores and 32 GB (`m7gd.2xlarge`, $0.43 an hour: $0.04 a run)
+A dashboard's burst of queries over billions of rows, all at once, took 300
+to 310 s on 8 cores and 32 GB (`m7gd.2xlarge`, $0.43 an hour: $0.04 a run)
 and 138 s on 32 cores and 128 GB (`m7gd.8xlarge`, $1.71 an hour: $0.07),
 against 171 s on a Snowflake X-Small warehouse ($0.10 to $0.14 a run at $2
 to $3 a credit). With [scale to zero](scale-to-zero.md) the larger

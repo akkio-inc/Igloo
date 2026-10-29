@@ -5,15 +5,16 @@ import "sync"
 // Reservations from statements' history. A replica's statements share one
 // memory pool, so several heavy ones at once spill to disk, and on a disk
 // that is busy enough they take many times as long as one after the other:
-// a dashboard's burst of queries over billions of rows took 548 s with 8 running at
-// once on 8 cores and 22 GB, against 365 s with 2. A fixed limit holds back
-// the light statements with the heavy ones, though. The controller instead
-// learns what each statement held at once (see Observe), by shape, the
-// text with its literals masked, which a dashboard sends again and again
-// with other audiences or dates, and gives the next statement of that shape
-// a reservation of a fraction of it (see Estimate): a statement that held
-// more than the replica's memory waits until the others' are released,
-// while one that held little reserves nothing and starts at once.
+// a dashboard's burst of queries over billions of rows took 548 s with 8
+// running at once on 8 cores and 22 GB, against 365 s with 2. A fixed limit
+// holds back the light statements with the heavy ones, though. The
+// controller instead learns what each statement held at once (see Observe),
+// by shape, the text with its literals masked, which a dashboard sends
+// again and again with other audiences or dates, and gives the next
+// statement of that shape a reservation of a fraction of it (see Estimate):
+// a statement that held more than the replica's memory waits until the
+// others' are released, while one that held little reserves nothing and
+// starts at once.
 //
 // DuckDB 1.5 measures what a statement allocated over its run, which counts
 // memory freed and allocated again each time, and the process's peak, not

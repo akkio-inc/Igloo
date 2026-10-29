@@ -5,9 +5,10 @@
 // (audience_id = 'x') as the table's rows over the column's distinct count,
 // and the size of a join from its keys' distinct counts, when the scan's
 // table function reports them. DuckDB-Iceberg reports none, so DuckDB takes
-// a fifth of the table for any such filter: one audience of a few thousand rows
-// in a lookup table of billions came out at hundreds of millions, and its join with tens of
-// millions of rows of facts hashed the facts rather than the audience.
+// a fifth of the table for any such filter: one audience of a few thousand
+// rows in a lookup table of billions came out at hundreds of millions, and
+// its join with tens of millions of rows of facts hashed the facts rather
+// than the audience.
 //
 // Igloo keeps distinct counts of its tables' columns and hands them over with
 // igloo_set_distinct_counts(spec), which replaces the database's counts. A

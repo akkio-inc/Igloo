@@ -200,9 +200,9 @@ and `LISTAGG`) and each `DISTINCT` aggregate, until the aggregate is done,
 and does not spill them well. A `CREATE TABLE ... AS` that reads such an
 aggregate, of more groups than a quarter of DuckDB's memory holds their
 states for as its plan estimates, fills the table in passes instead, each
-over the groups whose keys hash to its number. A dbt model that grouped tens of
-millions of rows into millions of groups, with several such aggregates, ran out of
-memory in one run after spilling 307 GiB.
+over the groups whose keys hash to its number. A dbt model that grouped tens
+of millions of rows into millions of groups, with several such aggregates,
+ran out of memory in one run after spilling 307 GiB.
 
 The passes give the rows one run would, since each group falls in one
 pass, so Igloo runs in passes only a statement each of whose rows comes from
@@ -224,8 +224,8 @@ that a filter such as `audience_id = 'a1'` leaves of a table from the
 column's distinct count, and from those estimates which side of a join it
 builds its hash table on. Without a count it takes a fifth of the table for
 any such filter: one audience of a few thousand rows in a lookup table of
-billions came out at hundreds of millions, and its join with tens of millions of rows of facts hashed
-the facts rather than the audience.
+billions came out at hundreds of millions, and its join with tens of
+millions of rows of facts hashed the facts rather than the audience.
 
 ```sql
 ANALYZE lake.public.audience_members;                -- every column

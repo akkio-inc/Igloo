@@ -23,9 +23,9 @@ import (
 // such as audience_id = 'x' leaves of a table, and so how it joins them, by
 // the column's distinct count, which it has for its own tables and not for
 // Iceberg tables: there it takes a fifth of the table for any such filter,
-// one audience of a few thousand rows in a lookup table of billions
-// for hundreds of millions, and built its join's hash table of the facts rather than
-// of the audience. ANALYZE counts the distinct values of a table's
+// one audience of a few thousand rows in a lookup table of billions for
+// hundreds of millions, and built its join's hash table of the facts rather
+// than of the audience. ANALYZE counts the distinct values of a table's
 // columns and keeps the counts in the table (catalog.DistinctCountsProperty);
 // the catalog proxy takes them from the loads of the tables DuckDB binds,
 // and they are handed to DuckDB's planner before each statement is prepared

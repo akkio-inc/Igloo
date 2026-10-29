@@ -302,17 +302,17 @@ shape, its text with its literals masked, ran to its end there, whatever
 its estimate, and it spills only if that run allocated more than its share
 (see [reservations from history](workload-management.md#reservations-from-history)):
 the estimate counts what a join exchanges, not what its filters leave, and
-held a dashboard's joins of a lookup of billions of rows too large for 22 GB.
-What a run allocated counts every allocation over the run, not its peak, so
-a heavy statement that fits may still count as spilling: such statements
-of that dashboard, at 20 seconds on the replica, still ran on workers.
-The first time, one that the replica should spill
-runs on workers if they are estimated at no more than half again the
-replica's estimate, which is then a floor. Runs on workers count with runs on about
-as many: one that ran on a quarter of the workers it would run on now, as
-in an earlier session on a smaller fleet, is tried on all of them, at most
-once a day, whatever it took on the replica. The server logs each choice, `chose where a statement
-runs`, with both estimates and the reason.
+held a dashboard's joins of a lookup of billions of rows too large for
+22 GB. What a run allocated counts every allocation over the run, not its
+peak, so a heavy statement that fits may still count as spilling: such
+statements of that dashboard, at 20 seconds on the replica, still ran on
+workers. The first time, one that the replica should spill runs on workers
+if they are estimated at no more than half again the replica's estimate,
+which is then a floor. Runs on workers count with runs on about as many: one
+that ran on a quarter of the workers it would run on now, as in an earlier
+session on a smaller fleet, is tried on all of them, at most once a day,
+whatever it took on the replica. The server logs each choice, `chose where a
+statement runs`, with both estimates and the reason.
 
 A relation filtered by a constant, a subquery's value or `IN`, as an
 audience taken from a lookup of every audience is, is estimated at the size

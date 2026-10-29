@@ -53,20 +53,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   columns and keeps the counts in the table, where DuckDB's planner finds
   them (see [Distinct counts](docs/sql.md#distinct-counts)). DuckDB
   estimated any equality filter on an Iceberg table at a fifth of its rows,
-  and so built joins' hash tables on the wrong side: with counts, most of the
-  queries of a report workload that ran slower than Snowflake at ten
+  and so built joins' hash tables on the wrong side: with counts, most of
+  the queries of a report workload that ran slower than Snowflake at ten
   times its data run faster.
 - A Snowflake `FLATTEN` of a list computed from one table's columns, such
   as `LATERAL FLATTEN(INPUT => SPLIT(t.tags, ','))`, read only by its
   `VALUE`, is unnested in that table's select list, not joined to its rows
   as a lateral subquery, which DuckDB planned as a dependent join holding
   every row in a hash table: 98 s against 41 s for a report over tens of
-  millions of rows. A `SPLIT`'s parts are unnested as text. So is a `FLATTEN`
-  of a column whose `WHERE` cannot become its join's `ON`, which DuckDB
-  joined the same way. A `FLATTEN` of a column whose `VALUE` alone is read
-  unnests its values alone, and as text when every read casts them to text
-  or tests them for NULL, without making JSON of each element and reading
-  it back.
+  millions of rows. A `SPLIT`'s parts are unnested as text. So is a
+  `FLATTEN` of a column whose `WHERE` cannot become its join's `ON`, which
+  DuckDB joined the same way. A `FLATTEN` of a column whose `VALUE` alone is
+  read unnests its values alone, and as text when every read casts them to
+  text or tests them for NULL, without making JSON of each element and
+  reading it back.
 - `trim`, `ltrim` and `rtrim` of one argument run Igloo's own code, with
   DuckDB's results (see the rb extension's
   [README](extensions/rb/README.md#faster-trim)). DuckDB's `trim` took some
@@ -1417,33 +1417,33 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A replica reads what the past week's statements allocated from the
   query history when it starts, those that ran under its memory limit, so
   a dashboard's first build after a restart reserves memory as later ones
-  do: 301 seconds rather than 590 at ten times the data, on
-  8 cores. The history now keeps each statement's shape and the memory it
-  ran with, and auto mode counts runs only under the memory they ran with,
-  the replica's limit or the workers', so that runs from a smaller replica
-  with workers beside it no longer steer one with workers of its own. A
-  statement whose shape ran to its end on the replica is no longer
-  estimated short of memory there (see [reservations from
+  do: 301 seconds rather than 590 at ten times the data, on 8 cores. The
+  history now keeps each statement's shape and the memory it ran with, and
+  auto mode counts runs only under the memory they ran with, the replica's
+  limit or the workers', so that runs from a smaller replica with workers
+  beside it no longer steer one with workers of its own. A statement whose
+  shape ran to its end on the replica is no longer estimated short of memory
+  there (see [reservations from
   history](docs/workload-management.md#reservations-from-history)).
 - Statements reserve memory by what statements like them allocated before
   (`IGLOO_STATEMENT_RESERVATIONS`; see [reservations from
   history](docs/workload-management.md#reservations-from-history)), so that
   heavy ones wait for room rather than start together and spill, while
-  light ones start at once. A dashboard's burst of queries over billions of rows,
-  on 8 cores, took 548 to 574 seconds and take 306 to 310, the median
+  light ones start at once. A dashboard's burst of queries over billions of
+  rows, on 8 cores, took 548 to 574 seconds and take 306 to 310, the median
   query 21 to 22 seconds rather than 32 to 51.
 - Statements reserve memory by the most that statements of their shape held
   at once, which Igloo samples while they run, rather than by everything
   they allocated over a run, and runs cancelled at a limit count too (see
   [reservations from
   history](docs/workload-management.md#reservations-from-history)). A
-  larger dashboard at ten times the data, which ran 80 minutes
-  without finishing on 8 cores, takes 2,148 seconds; a smaller one
-  takes 255 seconds rather than 301.
+  larger dashboard at ten times the data, which ran 80 minutes without
+  finishing on 8 cores, takes 2,148 seconds; a smaller one takes 255 seconds
+  rather than 301.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
   whichever form its shape's latest run took less CPU time in (see
-  [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens of
-  millions of rows took 88 seconds and take 56 and 40.
+  [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens
+  of millions of rows took 88 seconds and take 56 and 40.
 - A statement's shape includes the session's search path and database, so
   the same text over another schema, another client's or the same data at
   ten times the size, learns its own memory and `FLATTEN` form: the first
@@ -1481,8 +1481,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   session's settings changed). And views and statements name the
   catalog's tables as the catalog spells them, so that a view whose body
   spelled a table in another case no longer had every hold of the lock
-  look the table up again. A dashboard build spent about 26
-  seconds preparing, one statement at a time.
+  look the table up again. A dashboard build spent about 26 seconds
+  preparing, one statement at a time.
 - Queries are prepared side by side: a `SELECT` outside a transaction that
   calls no catalog function is prepared under the shared side of the
   catalog lock, alongside other sessions' prepares and binds, rather than
@@ -1509,9 +1509,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   more groups than memory holds their values for fills the table in passes,
   each over the groups whose keys hash to its number: [aggregates too large
   for memory](docs/sql.md#aggregates-too-large-for-memory). A dbt model of
-  millions of groups with several of them ran out of memory after spilling 307
-  GiB, where Snowflake built it in two minutes. `igloo_aggregate_passes_total`
-  counts these tables.
+  millions of groups with several of them ran out of memory after spilling
+  307 GiB, where Snowflake built it in two minutes.
+  `igloo_aggregate_passes_total` counts these tables.
 - Preparing a statement that repeats a subquery or has unions to factor no
   longer lists DuckDB's functions each time, about 25 ms holding the
   catalog lock, which the statements of a burst waited for one after
@@ -1539,9 +1539,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   compressed Parquet in the spill directory, and ranges next to each other
   are sorted and written together, in order, as many as the budget allows.
   DuckDB sorts a result whole and spills it uncompressed: a sort of billions
-  of rows ran out of a 300 GB disk. On 515 million rows with 78 GB
-  free, one sort took 1,344 s and 71 GB more disk; a range at a time, 888 s
-  and 30 GB, for the same rows in the same order. An `INSERT` commits once.
+  of rows ran out of a 300 GB disk. On 515 million rows with 78 GB free, one
+  sort took 1,344 s and 71 GB more disk; a range at a time, 888 s and 30 GB,
+  for the same rows in the same order. An `INSERT` commits once.
   `igloo_sorted_writes_total` counts these writes.
 - A count of distinct members counts their ids where the member column
   reaches it unchanged through common table expressions, subqueries and
