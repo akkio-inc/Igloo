@@ -251,3 +251,65 @@ func TestResetAllRestoresLoginSettings(t *testing.T) {
 		}
 	}
 }
+
+// asyncpgPoolReset is the query asyncpg's connection pool sends, as one
+// simple query, to clean a connection it takes back.
+const asyncpgPoolReset = "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;"
+
+// TestAsyncpgPoolReset checks that asyncpg's pool can clean a session, an
+// admin's and a non-admin's, from either dialect: its reset query succeeds
+// and leaves the session's settings as they started and no cursor open.
+// Igloo has no advisory locks and no LISTEN, so pg_advisory_unlock_all()
+// and UNLISTEN have nothing to undo, and LISTEN is refused as not
+// supported. DuckDB has no pg_advisory_unlock_all() and parses neither
+// LISTEN nor UNLISTEN.
+func TestAsyncpgPoolReset(t *testing.T) {
+	t.Parallel()
+	env := newCatalogEnv(t)
+	ctx := context.Background()
+	admin := env.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE SCHEMA lake.sales")
+	mustExec(t, admin, "CREATE USER wanda WITH PASSWORD 'wanda-password' ROLE writer")
+	writer := connect(t, env.url("wanda", "wanda-password"), pgx.QueryExecModeSimpleProtocol)
+
+	// sessionChanges end in Snowflake's dialect; without the last, the
+	// reset is sent in DuckDB's.
+	dialects := map[string][]string{"Snowflake": sessionChanges, "DuckDB": sessionChanges[:len(sessionChanges)-1]}
+	for name, conn := range map[string]*pgx.Conn{"admin": admin, "writer": writer} {
+		start := sessionState(t, conn)
+		for dialect, changes := range dialects {
+			what := fmt.Sprintf("%s, in %s's dialect", name, dialect)
+			mustExec(t, conn, "DECLARE scratch_cursor CURSOR WITH HOLD FOR SELECT 1")
+			for _, sql := range changes {
+				mustExec(t, conn, sql)
+			}
+			results, err := conn.PgConn().Exec(ctx, asyncpgPoolReset).ReadAll()
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			var tags []string
+			for _, r := range results {
+				tags = append(tags, r.CommandTag.String())
+			}
+			if got, want := strings.Join(tags, ", "), "SELECT 1, CLOSE CURSOR ALL, UNLISTEN, RESET"; got != want {
+				t.Errorf("%s: the statements completed as %s, want %s", what, got, want)
+			}
+			if got := sessionState(t, conn); got != start {
+				t.Errorf("%s: the session is at\n%s\nwant as it started\n%s", what, got, start)
+			}
+			if _, err := conn.Exec(ctx, "FETCH scratch_cursor"); err == nil {
+				t.Errorf("%s: the cursor is still open", what)
+			}
+		}
+	}
+
+	for _, dialect := range []string{"duckdb", "snowflake"} {
+		mustExec(t, writer, "SET sql_dialect = '"+dialect+"'")
+		for _, sql := range []string{"UNLISTEN synthetic_channel", `UNLISTEN "Synthetic Channel"`} {
+			mustExec(t, writer, sql)
+		}
+		if _, err := writer.Exec(ctx, "LISTEN synthetic_channel"); pgCode(err) != "0A000" {
+			t.Errorf("LISTEN in the %s dialect: want 0A000, got %v", dialect, err)
+		}
+	}
+}

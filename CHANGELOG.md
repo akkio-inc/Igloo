@@ -137,6 +137,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   before. What an admin set for the whole server, with `SET GLOBAL` or an
   unscoped `SET` that DuckDB applies globally, stays, as `ALTER SYSTEM`
   settings do in PostgreSQL.
+- `pg_advisory_unlock_all()` and `UNLISTEN`, so asyncpg's connection pool
+  can clean a session it takes back with its reset query (`SELECT
+  pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;`), in either
+  dialect. Igloo has no advisory locks and no `LISTEN`, so both succeed and
+  change nothing. DuckDB has no `pg_advisory_unlock_all()` and does not
+  parse `UNLISTEN`, so the query failed before. `LISTEN` is refused as not
+  supported (`0A000`) instead of failing as a syntax error.
 - Semi-structured columns. Lists, maps and structs are Iceberg's own
   `list`, `map` and `struct`, which Spark, Trino and PyIceberg read. A `JSON`
   or `VARIANT` column, which Iceberg tables of format version 1 and 2 cannot

@@ -28,17 +28,21 @@ import (
 //	                    -- per session; currval is the sequence's own
 //	DISCARD ALL         -- all of these, and close cursors and drop prepared
 //	                    -- statements; not in a transaction block
+//	UNLISTEN * | name   -- nothing to do: Igloo has no LISTEN, so no
+//	                    -- session listens on a channel
 //
-// DuckDB has neither statement: it refuses RESET ALL and does not parse
-// DISCARD.
+// DuckDB has none of these: it refuses RESET ALL and does not parse
+// DISCARD or UNLISTEN. LISTEN, which nothing would ever notify, is refused
+// as not supported rather than as a syntax error.
 var (
 	resetAll         = regexp.MustCompile(`(?is)^\s*RESET\s+ALL\s*;?\s*$`)
 	discardStatement = regexp.MustCompile(`(?is)^\s*DISCARD\s+(ALL|PLANS|SEQUENCES|TEMP|TEMPORARY)\s*;?\s*$`)
+	listenStatement  = regexp.MustCompile(`(?is)^\s*(LISTEN|UNLISTEN)\s+(?:\*|[\pL_][\pL\pN_$]*|"(?:[^"]|"")+")\s*;?\s*$`)
 )
 
-// sessionResetCommand handles RESET ALL and DISCARD. They come before the
-// Snowflake dialect's translation: poolers send them whatever the session
-// speaks.
+// sessionResetCommand handles RESET ALL, DISCARD and UNLISTEN, and refuses
+// LISTEN. They come before the Snowflake dialect's translation: poolers
+// send them whatever the session speaks.
 func (s *Server) sessionResetCommand(sess *session, text string) (wire.PreparedStatements, bool) {
 	query := stripComments(text)
 	var what string
@@ -49,6 +53,8 @@ func (s *Server) sessionResetCommand(sess *session, text string) (wire.PreparedS
 		if what == "TEMPORARY" {
 			what = "TEMP"
 		}
+	} else if m := listenStatement.FindStringSubmatch(query); m != nil {
+		what = strings.ToUpper(m[1])
 	} else {
 		return nil, false
 	}
@@ -71,19 +77,24 @@ func (s *Server) sessionResetCommand(sess *session, text string) (wire.PreparedS
 			if err == nil {
 				err = s.discardTemp(ctx, sess)
 			}
+		case "LISTEN":
+			err = pgerror.WithCode(errors.New("LISTEN is not supported: Igloo has no asynchronous notifications"), codes.FeatureNotSupported)
 		}
 		switch {
 		case err != nil && sess.inTx:
 			sess.txFailed = true
-		case sess.inTx && what != "PLANS" && what != "SEQUENCES":
+		case sess.inTx && what != "PLANS" && what != "SEQUENCES" && what != "UNLISTEN":
 			// Rolling back to a savepoint cannot undo it (see rollbackTo).
 			sess.changes++
 		}
 		if err != nil {
 			return err
 		}
-		if what == "RESET ALL" {
+		switch what {
+		case "RESET ALL":
 			return w.Complete("RESET")
+		case "UNLISTEN":
+			return w.Complete("UNLISTEN")
 		}
 		return w.Complete("DISCARD " + what)
 	}))), true

@@ -616,6 +616,9 @@ func sessionCatalogSetup(user string, superuser bool, version string, rb bool) [
 		`CREATE OR REPLACE TEMP MACRO pg_total_relation_size(oid) AS NULL::BIGINT`,
 		`CREATE OR REPLACE TEMP MACRO pg_backend_pid() AS 0`,
 		`CREATE OR REPLACE TEMP MACRO pg_is_in_recovery() AS false`,
+		// Igloo has no advisory locks, so a session holds none to release.
+		// asyncpg's pool calls this when a connection is released.
+		`CREATE OR REPLACE TEMP MACRO pg_advisory_unlock_all() AS NULL::VARCHAR`,
 		`CREATE OR REPLACE TEMP MACRO array_upper(arr, dim) AS len(arr)`,
 		`CREATE OR REPLACE TEMP MACRO array_lower(arr, dim) AS CASE WHEN len(arr) > 0 THEN 1 END`,
 		`CREATE OR REPLACE TEMP MACRO quote_ident(s) AS '"' || replace(s, '"', '""') || '"'`,
