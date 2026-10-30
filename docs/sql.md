@@ -99,6 +99,12 @@ Snowflake databases are catalogs of their own, such as
 drops the old table and renames the new one into place. A failure while
 writing leaves the old table as it was. The swap is quick but not atomic: a
 query that starts in the instant between drop and rename finds no table.
+When the catalog fails during the swap, Igloo asks it what the drop or
+rename did before going on, and once the old table may be gone it never
+drops the new one. If the catalog cannot say (SQLSTATE 40003, for one), the
+statement fails with an error that names the temporary table holding the
+new data, `name__igloo_new_...`, and the `ALTER TABLE ... RENAME TO` that
+puts it in place.
 
 The catalog records nothing that depends on a table, so `DROP TABLE ...
 CASCADE` drops just the table, like `DROP TABLE`: views that read it fail

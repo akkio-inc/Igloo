@@ -101,27 +101,95 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 }
 
 // swapIn drops the table r replaces and renames the new one into place.
+//
+// DuckDB can report a drop or rename failed that the catalog made all the
+// same (see doneAnyway), and the catalog proxy answers that a change's
+// outcome is unknown when the catalog does not confirm it. So after a step
+// fails, the catalog itself is asked what happened before anything more is
+// dropped: once the old table may be gone, the new one may be the only copy
+// of either. When the catalog cannot tell, swapIn stops, keeps both names'
+// tables, and says where the new one is.
 func (s *Server) swapIn(ctx context.Context, sess *session, r tableReplace) error {
 	_, drop, rename := r.statements()
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
 		return err
 	}
+	target, terr := s.newTableTarget(ctx, sess, r.target)
+	staging := r.staging[len(r.staging)-1]
+	// exists asks the catalog, not DuckDB's copy of it, whether the table
+	// name is in the target's schema; sure is false when it cannot tell.
+	exists := func(name string) (there, sure bool) {
+		if s.ddl == nil || terr != nil {
+			return false, false
+		}
+		there, err := s.ddl.TableExists(ctx, target.Schema, name)
+		return there, err == nil
+	}
+	// dropped reports whether the target is gone after a drop that failed
+	// with err; when it is not, the drop was refused if refused is set,
+	// and may yet happen otherwise.
+	dropped := func(err error) (gone, refused bool) {
+		there, sure := exists(target.Table)
+		return sure && !there, sure && there && !outcomeUnknown(err)
+	}
+	// unsure is the error when the catalog does not say whether step
+	// happened: nothing more is dropped.
+	unsure := func(step string, err error, where string) error {
+		return fmt.Errorf("%s failed, and the catalog does not say whether it happened: %w; nothing more was dropped, "+
+			"and the new table is complete as %s", step, err, where)
+	}
+
 	if err := exec(ctx, drop); err != nil {
-		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
-		return err
+		switch gone, refused := dropped(err); {
+		case refused:
+			// The old table is as it was, so the new one goes, as after
+			// any failure before the swap.
+			_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
+			return err
+		case !gone:
+			return unsure("dropping the old table "+quoteName(r.target), err, fmt.Sprintf(
+				"%s: once %s is gone, ALTER TABLE %s RENAME TO %s puts it in place",
+				quoteName(r.staging), quoteName(r.target), quoteName(r.staging), quoteIdent(r.target[len(r.target)-1])))
+		}
+		// Dropped all the same.
 	}
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = exec(ctx, rename); err == nil {
 			return nil
 		}
-		// Another session may have replaced the table in between; the last
-		// replace wins.
-		_ = exec(ctx, drop)
+		staged, sure := exists(staging)
+		placed, sureToo := exists(target.Table)
+		switch {
+		case !sure || !sureToo || staged && outcomeUnknown(err):
+			// The rename may yet happen.
+			return unsure("after dropping the old table, renaming the new one", err,
+				quoteName(r.staging)+" or, if the rename went through, as "+quoteName(r.target))
+		case !staged && placed:
+			// Renamed all the same.
+			return nil
+		case !staged:
+			return fmt.Errorf("renaming the new table %s to %s failed: %w; neither is in the catalog any more, so another session dropped the new table",
+				quoteName(r.staging), quoteName(r.target), err)
+		case placed:
+			// Another session made a table of the name in between: the
+			// last replace wins.
+			if derr := exec(ctx, drop); derr != nil {
+				if gone, _ := dropped(derr); !gone {
+					return renameFailed(r, derr)
+				}
+			}
+		}
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
-	return fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
+	return renameFailed(r, err)
+}
+
+// renameFailed is swapIn's error when the new table stays under its
+// temporary name.
+func renameFailed(r tableReplace, err error) error {
+	return fmt.Errorf("the old table was dropped and the new table is complete as %s, but renaming it to %s failed: %w",
 		quoteName(r.staging), quoteName(r.target), err)
 }
 
@@ -428,4 +496,11 @@ func (s *Server) replaceable(sess *session, st *statement) (tableReplace, bool) 
 // REPLACE TABLE on an Iceberg table.
 func isIcebergNoReplace(err error) bool {
 	return err != nil && strings.Contains(err.Error(), icebergNoReplace)
+}
+
+// outcomeUnknown reports whether err says the catalog did not confirm
+// whether a change was applied (see package catalogproxy), which it may
+// still apply.
+func outcomeUnknown(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "commitstateunknownexception")
 }
