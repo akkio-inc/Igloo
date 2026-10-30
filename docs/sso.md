@@ -392,7 +392,10 @@ Igloo records whose groups each change affects along with the change. If
 it then cannot apply their roles, for instance because the metadata
 database is briefly out of reach, it keeps the change, answers a change or
 deletion of a group with an error (500), and applies the roles when the
-provider sends the request again, or by itself within a minute.
+provider sends the request again, or by itself within a minute. Replicas
+apply one user's roles one at a time, through a lock in the metadata
+database that sign-ins take too, so when two change the user's groups at
+once, the roles that stay are those of the groups as both left them.
 
 ## Failed logins
 

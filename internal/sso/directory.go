@@ -65,9 +65,9 @@ func (s *Service) admit(id Identity) error {
 //     or if it is taken, the name followed by the domain.
 //
 // A user found by 2 to 4 is linked to the identity. Service accounts and
-// disabled users are refused. The roles follow the token's groups and
-// those SCIM gives the user (see withSCIMGroups). A failure is a *Refusal
-// or an error of the stores.
+// disabled users are refused. The roles follow the token's groups, which
+// the identity keeps, and those SCIM gives the user (see applyRoles). A
+// failure is a *Refusal or an error of the stores.
 func (s *Service) SignIn(ctx context.Context, id Identity) (auth.User, error) {
 	if err := s.admit(id); err != nil {
 		return auth.User{}, err
@@ -92,15 +92,9 @@ func (s *Service) SignIn(ctx context.Context, id Identity) (auth.User, error) {
 			s.log.Warn("cannot record a user's new email: another user has it", "user", user.Name, "email", id.Email)
 		case err != nil:
 			return auth.User{}, err
-		default:
-			user.Email = id.Email
 		}
 	}
-	groups, err := s.withSCIMGroups(ctx, user.Name, id.Groups)
-	if err != nil {
-		return auth.User{}, err
-	}
-	return s.syncRoles(ctx, user, groups)
+	return s.applyRoles(ctx, user.Name)
 }
 
 // find returns id's user, linking or creating one if needed.
@@ -209,22 +203,43 @@ func (s *Service) Provision(ctx context.Context, username, email string) (user a
 // those SCIM provisioning gives them and those their last sign-in's token
 // listed (see withSCIMGroups). SCIM calls it when groups change.
 func (s *Service) RefreshRoles(ctx context.Context, name string) error {
-	user, err := s.users.Get(ctx, name)
-	if err != nil {
-		return err
-	}
-	var groups []string
-	if link, err := s.sso.IdentityOf(ctx, name); err == nil {
-		groups = link.Groups
-	} else if !errors.Is(err, auth.ErrIdentityNotFound) {
-		return err
-	}
-	groups, err = s.withSCIMGroups(ctx, name, groups)
-	if err != nil {
-		return err
-	}
-	_, err = s.syncRoles(ctx, user, groups)
+	_, err := s.applyRoles(ctx, name)
 	return err
+}
+
+// applyRoles applies the group mappings to the groups user name is in
+// now, as RefreshRoles says, and returns the user. It holds the user's
+// roles lock (auth.SSOStore.LockRoles) from before it reads the user and
+// their groups until their roles are written: two replicas applying one
+// user's roles at once, after changes to their groups, take turns, and the
+// second works them out from the groups the first left, so the roles of
+// the latest change are those that stay.
+func (s *Service) applyRoles(ctx context.Context, name string) (auth.User, error) {
+	var user auth.User
+	err := s.sso.LockRoles(ctx, name, func(ctx context.Context) error {
+		var err error
+		if user, err = s.users.Get(ctx, name); err != nil {
+			return err
+		}
+		var groups []string
+		if link, err := s.sso.IdentityOf(ctx, name); err == nil {
+			groups = link.Groups
+		} else if !errors.Is(err, auth.ErrIdentityNotFound) {
+			return err
+		}
+		if groups, err = s.withSCIMGroups(ctx, name, groups); err != nil {
+			return err
+		}
+		user, err = s.syncRoles(ctx, user, groups)
+		return err
+	})
+	if err != nil {
+		return auth.User{}, err
+	}
+	if !user.IsService() {
+		s.changed(user.Name)
+	}
+	return user, nil
 }
 
 // withSCIMGroups returns the groups user is in, given the groups a token
@@ -336,7 +351,7 @@ var roleRank = map[auth.Role]int{auth.RoleNone: 0, auth.RoleReader: 1, auth.Role
 
 // syncRoles gives user the custom roles their groups map to, and, if any
 // group maps to a built-in role, the highest built-in role their groups
-// give (none if no group does).
+// give (none if no group does). The caller tells Options.Changed.
 func (s *Service) syncRoles(ctx context.Context, user auth.User, groups []string) (auth.User, error) {
 	if user.IsService() {
 		// Admins alone decide what service accounts may do.
@@ -375,6 +390,5 @@ func (s *Service) syncRoles(ctx context.Context, user auth.User, groups []string
 			user.Role = role
 		}
 	}
-	s.changed(user.Name)
 	return user, nil
 }

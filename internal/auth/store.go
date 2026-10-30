@@ -322,7 +322,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 }
 
 func (s *PostgresStore) Get(ctx context.Context, name string) (User, error) {
-	u, err := scanUser(s.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM igloo_auth.users WHERE name = $1`, name))
+	u, err := scanUser(s.db(ctx).QueryRow(ctx, `SELECT `+userColumns+` FROM igloo_auth.users WHERE name = $1`, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -422,7 +422,7 @@ func (s *PostgresStore) Delete(ctx context.Context, name string) error {
 // concurrent demotions from both passing the check. The names lock comes
 // first, as in every transaction that takes both.
 func (s *PostgresStore) changeAdmins(ctx context.Context, name string, change func(pgx.Tx) (pgconn.CommandTag, error)) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, s.db(ctx), func(tx pgx.Tx) error {
 		if err := lockNames(ctx, tx); err != nil {
 			return err
 		}

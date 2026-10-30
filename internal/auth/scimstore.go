@@ -219,7 +219,7 @@ func (s *PostgresStore) SCIMChangeApplied(ctx context.Context, c SCIMChange) err
 }
 
 func (s *PostgresStore) UserSCIMGroups(ctx context.Context, user string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT g.display_name FROM igloo_auth.scim_members m
+	rows, err := s.db(ctx).Query(ctx, `SELECT g.display_name FROM igloo_auth.scim_members m
 		JOIN igloo_auth.scim_groups g ON g.id = m.group_id WHERE m.user_name = $1 ORDER BY 1`, user)
 	if err != nil {
 		return nil, err
@@ -231,7 +231,7 @@ func (s *PostgresStore) SCIMGroupNames(ctx context.Context, names []string) ([]s
 	if names == nil {
 		names = []string{}
 	}
-	rows, err := s.pool.Query(ctx, `SELECT display_name FROM igloo_auth.scim_groups WHERE display_name = ANY ($1) ORDER BY 1`, names)
+	rows, err := s.db(ctx).Query(ctx, `SELECT display_name FROM igloo_auth.scim_groups WHERE display_name = ANY ($1) ORDER BY 1`, names)
 	if err != nil {
 		return nil, err
 	}

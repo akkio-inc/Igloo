@@ -103,6 +103,14 @@ type SSOStore interface {
 	// memberships an admin granted stay. Roles that do not exist are
 	// skipped.
 	SyncRoles(ctx context.Context, user string, roles []string) error
+	// LockRoles runs fn holding user's roles lock, which whatever works
+	// out a user's roles from their groups and writes them holds, on
+	// every replica: the last to hold it works them out from the groups
+	// as the others left them. The PostgreSQL store's is a transaction
+	// lock, and the store's calls fn makes with the ctx it is given run in
+	// its transaction, which commits once fn returns nil: should the lock
+	// be lost with its connection, fn's writes go with it.
+	LockRoles(ctx context.Context, user string, fn func(ctx context.Context) error) error
 }
 
 // NormalizeEmail is how emails are compared: trimmed and lowercase.

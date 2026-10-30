@@ -21,7 +21,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/sso"
@@ -72,9 +71,6 @@ type Handler struct {
 	changed  func(string)
 	log      *slog.Logger
 	mux      *http.ServeMux
-	// applying is held while the group mappings are applied (see
-	// applyChanges).
-	applying sync.Mutex
 }
 
 // New returns a handler for opts, which needs every field but Changed and

@@ -30,6 +30,8 @@ type MemoryDirectory struct {
 	scimChanges map[string]int64
 	scimMark    int64
 	secret      []byte
+	// rolesMu is LockRoles's lock.
+	rolesMu sync.Mutex
 }
 
 type memoryToken struct {
@@ -491,6 +493,14 @@ func (d *MemoryDirectory) SyncRoles(ctx context.Context, user string, roles []st
 	d.ssoMembers[user] = keep
 	d.mu.Unlock()
 	return nil
+}
+
+// LockRoles implements SSOStore with one lock for every user: there is
+// one replica.
+func (d *MemoryDirectory) LockRoles(ctx context.Context, _ string, fn func(context.Context) error) error {
+	d.rolesMu.Lock()
+	defer d.rolesMu.Unlock()
+	return fn(ctx)
 }
 
 func (d *MemoryDirectory) SCIMUsers(context.Context) ([]SCIMUser, error) {

@@ -141,12 +141,11 @@ func patchGroup(g *auth.SCIMGroup, op patchOp) error {
 // applyChanges applies the group mappings to the users whose groups
 // changed (SCIMChanges): those of this request, and those earlier ones
 // left behind. It reports the first failure; the users it failed for stay
-// recorded. A replica applies changes one call at a time, so one that read
-// a user's groups before a later change never writes its roles over that
+// recorded. Each user's roles are applied holding their roles lock, which
+// every replica takes (sso.Service.RefreshRoles), so a call that read a
+// user's groups before a later change never writes its roles over that
 // change's.
 func (h *Handler) applyChanges(ctx context.Context) error {
-	h.applying.Lock()
-	defer h.applying.Unlock()
 	changes, err := h.scim.SCIMChanges(ctx)
 	if err != nil {
 		return err
