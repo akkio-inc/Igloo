@@ -1,9 +1,46 @@
+import contextlib
+import io
+import json
 import pathlib
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 import report
 
 PRICING = pathlib.Path(report.__file__).parent / "pricing.toml"
+
+
+def burst(q01_error=None):
+    """One run.py result of two queries, where q01 may have failed."""
+    return {"platform": "snowflake", "size": "XS", "scale": 10.0, "suite": "tpch", "generation": 2,
+            "connect_seconds": 1.0, "queries": [
+                {"query": "q01", "cold": 2.0, "warm": [1.0], "error": q01_error},
+                {"query": "q02", "cold": 1.0, "warm": [0.5], "error": None}]}
+
+
+class MergeTest(unittest.TestCase):
+    def test_failed_attempts_are_counted(self):
+        [merged] = report.merge([burst(), burst("OperationalError: connection lost"), burst()])
+        s = report.summarize(merged)
+        self.assertEqual((s["failed"], s["incomplete"]), ([], {"q01": (1, 3)}))
+        self.assertEqual(s["cold"], 3.0)
+        [merged] = report.merge([burst("OperationalError: connection lost")])
+        s = report.summarize(merged)
+        self.assertEqual((s["failed"], s["incomplete"]), (["q01"], {}))
+
+    def test_incomplete_runs_are_shown(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for i, r in enumerate([burst(), burst("OperationalError: connection lost"), burst()]):
+                paths.append(pathlib.Path(d, f"{i}.json"))
+                paths[-1].write_text(json.dumps(r))
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", ["report.py", *map(str, paths)]), contextlib.redirect_stdout(out):
+                report.main()
+        row = next(line for line in out.getvalue().splitlines() if line.startswith("| snowflake | XS (Gen2)"))
+        self.assertTrue(row.endswith("| q01 (failed 1 of 3) |"), row)
 
 
 class BurstTest(unittest.TestCase):
