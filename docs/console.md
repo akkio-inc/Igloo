@@ -33,6 +33,8 @@ block, or after a setting computed by an expression
 (`SET VARIABLE x = (SELECT ...)`), which it could not match without
 running more. Worksheets are kept in the browser's local storage, per
 user, and results only in memory: nothing about them is stored in Igloo.
+Console tabs open side by side share them: a worksheet added, changed or
+closed in one tab shows in the others.
 
 Keys in the editor: Tab and Shift+Tab indent and outdent, Escape leaves the
 editor. In the results grid: arrow keys move, Enter (or a double click)
