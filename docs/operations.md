@@ -1190,7 +1190,10 @@ files then takes a lock that cloning the table takes too (in the metadata
 database, so replicas share it), and reads the metadata of each of its
 clones. The database releases the lock if the connection holding it
 drops: a clone that lost it before its shares were recorded fails, and is
-made again by running the statement again. Whenever Igloo cannot tell what a clone needs (the metadata
+made again by running the statement again, and maintenance, or the
+deletion of the files of a table a clone replaced, checks that it still
+holds the lock before each thousand files it deletes, and keeps the rest
+once it does not; a later pass deletes them. Whenever Igloo cannot tell what a clone needs (the metadata
 database does not answer, a clone was renamed or dropped during the pass,
 or was made less than an hour ago), it keeps the table's files; a later
 pass deletes them.

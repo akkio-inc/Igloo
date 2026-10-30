@@ -31,6 +31,11 @@ import (
 // references in any of its snapshots. Whenever Igloo cannot tell for sure
 // whether a clone still exists or what it references, it keeps the files;
 // a later pass, or the orphan cleanup, deletes them once it can.
+//
+// A Postgres store's lock is lost if its connection drops, and a clone of
+// the table can then be made, reading files not yet deleted. So whatever
+// deletes them checks that it still holds the lock before each batch it
+// deletes (deleteHeld), and keeps the rest once it does not.
 
 // settle is how long a share is kept, whatever the catalog says, after it
 // is recorded: a clone being made records its shares before it is in the
@@ -46,7 +51,16 @@ var (
 	// pass or made in the last hour, so the table's files were kept for
 	// now.
 	ErrUnsure = errors.New("cannot tell yet whether a clone still needs the table's files")
+	// ErrLockLost means the lock of a table's location was lost while its
+	// files were being deleted, as when its connection to the metadata
+	// database dropped, so a clone of the table may have been made since:
+	// the files not yet deleted were kept.
+	ErrLockLost = errors.New("lost the lock of the table's files while deleting them, so the files left were kept")
 )
+
+// deleteBatch is how many files are deleted between checks that the lock
+// of their location is still held.
+const deleteBatch = 1000
 
 // Guard keeps maintenance from deleting files clones share.
 type Guard struct {
@@ -79,15 +93,17 @@ func (g *Guard) Shared(ctx context.Context, location string) (bool, error) {
 // there takes too, and names the clones that read files under it, or may:
 // every clone the catalog has, under the name it was recorded with or
 // another, and every clone recorded within the hour, which may still be
-// being made. Until release is called no clone of the table is made, so a
-// caller that finds none may delete the table's files meanwhile.
-func (g *Guard) Readers(ctx context.Context, location string) (names []string, release func(), err error) {
-	release, _, err = g.store.Lock(ctx, []string{location}, true)
+// being made. While the lease holds, no clone of the table is made, so a
+// caller that finds none may delete the table's files meanwhile, checking
+// lease.Held before each batch it deletes; it calls lease.Release when
+// done.
+func (g *Guard) Readers(ctx context.Context, location string) (names []string, lease Lease, err error) {
+	lease, _, err = g.store.LockLease(ctx, []string{location}, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	fail := func(err error) ([]string, func(), error) {
-		release()
+	fail := func(err error) ([]string, Lease, error) {
+		lease.Release()
 		return nil, nil, err
 	}
 	shares, err := g.store.Sharers(ctx, location)
@@ -117,7 +133,7 @@ func (g *Guard) Readers(ctx context.Context, location string) (names []string, r
 		}
 	}
 	slices.Sort(names)
-	return slices.Compact(names), release, nil
+	return slices.Compact(names), lease, nil
 }
 
 // tables maps the UUID of every table of the catalog to its name.
@@ -235,7 +251,7 @@ func (p *Pass) relist(ctx context.Context) {
 // Delete deletes those of files that are inside tbl's location and that
 // no clone references, with remove, and returns them. It holds the lock of
 // tbl's location meanwhile, so no clone of tbl can be made until it is
-// done.
+// done, and stops with ErrLockLost if it loses it.
 func (p *Pass) Delete(ctx context.Context, tbl *table.Table, files []string, remove func(context.Context, []string) error) ([]string, error) {
 	loc := trimSlash(tbl.Location())
 	var own []string
@@ -250,14 +266,14 @@ func (p *Pass) Delete(ctx context.Context, tbl *table.Table, files []string, rem
 	if p.g == nil {
 		return own, remove(ctx, own)
 	}
-	release, ok, err := p.g.store.Lock(ctx, []string{loc}, false)
+	lease, ok, err := p.g.store.LockLease(ctx, []string{loc}, false)
 	if err != nil {
 		return nil, fmt.Errorf("lock the table's files: %w", err)
 	}
 	if !ok {
 		return nil, ErrBusy
 	}
-	defer release()
+	defer lease.Release()
 	needed, err := p.needed(ctx, tbl, loc)
 	if err != nil {
 		return nil, err
@@ -274,7 +290,24 @@ func (p *Pass) Delete(ctx context.Context, tbl *table.Table, files []string, rem
 	if len(deletable) == 0 {
 		return nil, nil
 	}
-	return deletable, remove(ctx, deletable)
+	return deleteHeld(ctx, lease.Held, deletable, remove)
+}
+
+// deleteHeld deletes files with remove, deleteBatch at a time, checking with
+// held before each batch that the lock of their location is still held:
+// once it is not, a clone of the table may have been made since that reads
+// the files left, which stay. It returns the files it deleted, or tried to.
+func deleteHeld(ctx context.Context, held func(context.Context) error, files []string, remove func(context.Context, []string) error) ([]string, error) {
+	for i := 0; i < len(files); i += deleteBatch {
+		if err := held(ctx); err != nil {
+			return files[:i], fmt.Errorf("%w: %w", ErrLockLost, err)
+		}
+		end := min(i+deleteBatch, len(files))
+		if err := remove(ctx, files[i:end]); err != nil {
+			return files[:end], err
+		}
+	}
+	return files, nil
 }
 
 // needed returns the files under loc that clones of tbl reference.

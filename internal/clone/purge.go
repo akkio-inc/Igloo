@@ -30,9 +30,12 @@ func (g *Guard) SetWarehouse(root string) { g.warehouse = root }
 type PurgeVerdict struct {
 	// Purge says they may. Release must then be called once they are
 	// deleted, or once the drop that has the catalog delete them is
-	// through: until then no clone of the table is made.
+	// through: until then no clone of the table is made, as long as Held
+	// says so. A caller that deletes the files itself checks Held before
+	// each batch, and stops once it fails (see Guard.Readers).
 	Purge   bool
 	Release func()
+	Held    func(context.Context) error
 	// Otherwise Why says why they are kept, Clones names the clones that
 	// read them if that is why, and Unsure says Igloo could not tell.
 	Why    string
@@ -109,15 +112,15 @@ func (p *Purges) Decide(ctx context.Context, what string, name table.Identifier,
 	if v, ok := p.fromCatalog(ctx, tbl, loc, inCatalog); !ok {
 		return keep(v)
 	}
-	names, release, err := g.Readers(ctx, loc)
+	names, lease, err := g.Readers(ctx, loc)
 	if err != nil {
 		return keep(PurgeVerdict{Why: "the clones that read them could not be told", Unsure: true}, "err", err)
 	}
 	if len(names) > 0 {
-		release()
+		lease.Release()
 		return keep(PurgeVerdict{Why: "clones read them", Clones: names}, "clones", strings.Join(names, ", "))
 	}
-	return PurgeVerdict{Purge: true, Release: release}
+	return PurgeVerdict{Purge: true, Release: lease.Release, Held: lease.Held}
 }
 
 // fromCatalog checks, when the Store alone cannot tell (see Decide), that
@@ -210,11 +213,11 @@ func (m *Manager) Purging(warehouse string, storage func(ctx context.Context, lo
 // which the catalog leaves when a clone takes a table's name, as a drop
 // does: those under each table's own location, and only those, when
 // Purges.Decide says they may go, holding the lock it takes until they
-// are gone. The files a replaced clone read of its source are under the
-// source's location, and stay. Otherwise the files stay, and Decide logs
-// why; erasure requests delete what is left of tables dropped or
-// replaced (package erasure). Purge logs its failures too: the clones
-// were made all the same.
+// are gone, and keeping those left if it loses it. The files a replaced
+// clone read of its source are under the source's location, and stay.
+// Otherwise the files stay, and Decide logs why; erasure requests delete
+// what is left of tables dropped or replaced (package erasure). Purge logs
+// its failures too: the clones were made all the same.
 func (m *Manager) Purge(ctx context.Context, replaced ...*table.Table) {
 	ctx = context.WithoutCancel(ctx)
 	g := &Guard{cat: m.cat, store: m.store, log: m.log, warehouse: m.warehouse}
@@ -228,7 +231,7 @@ func (m *Manager) Purge(ctx context.Context, replaced ...*table.Table) {
 			continue
 		}
 		name, loc := strings.Join(old.Identifier(), "."), trimSlash(old.Location())
-		n, err := m.deleteUnder(ctx, old, loc)
+		n, err := m.deleteUnder(ctx, old, loc, v.Held)
 		v.Release()
 		if err != nil {
 			m.log.Warn("could not delete all the files of a table a clone replaced", "table", name, "location", loc, "deleted", n, "err", err)
@@ -238,9 +241,10 @@ func (m *Manager) Purge(ctx context.Context, replaced ...*table.Table) {
 	}
 }
 
-// deleteUnder deletes the files under loc, old's location, and returns
-// how many it deleted.
-func (m *Manager) deleteUnder(ctx context.Context, old *table.Table, loc string) (int, error) {
+// deleteUnder deletes the files under loc, old's location, a batch at a
+// time while held says the lock of loc is held, and returns how many it
+// deleted.
+func (m *Manager) deleteUnder(ctx context.Context, old *table.Table, loc string, held func(context.Context) error) (int, error) {
 	var fsys iceio.IO
 	var err error
 	if m.storage != nil {
@@ -270,18 +274,22 @@ func (m *Manager) deleteUnder(ctx context.Context, old *table.Table, loc string)
 	if err != nil {
 		return 0, fmt.Errorf("list the files: %w", err)
 	}
-	if bulk, ok := fsys.(iceio.BulkRemovableIO); ok {
-		deleted, err := bulk.DeleteFiles(ctx, files)
-		return len(deleted), err
-	}
 	n := 0
-	for _, p := range files {
-		if err := fsys.Remove(p); err != nil && !notExist(err) {
-			return n, err
+	_, err = deleteHeld(ctx, held, files, func(ctx context.Context, batch []string) error {
+		if bulk, ok := fsys.(iceio.BulkRemovableIO); ok {
+			deleted, err := bulk.DeleteFiles(ctx, batch)
+			n += len(deleted)
+			return err
 		}
-		n++
-	}
-	return n, nil
+		for _, p := range batch {
+			if err := fsys.Remove(p); err != nil && !notExist(err) {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	return n, err
 }
 
 func notExist(err error) bool {
