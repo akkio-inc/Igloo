@@ -111,6 +111,16 @@ class TolerantTest(unittest.TestCase):
         self.assertFalse(compare.close(None, "\\N"))
         self.assertFalse(compare.tolerant([(1000000000,)], [(1000000001,)]).equal)
 
+    def test_decimals_of_any_precision(self):
+        # More digits than the decimal module's default precision of 28.
+        big = "123456789012345678901234567890"
+        self.assertTrue(compare.close(D(big + ".12"), D(big + ".1234")))
+        self.assertTrue(compare.close(D(big + ".1234"), D(big + ".12")))
+        self.assertFalse(compare.close(D(big + ".13"), D(big + ".1234")))
+        self.assertFalse(compare.close(D(big + ".25"), 2e30))
+        self.assertTrue(compare.tolerant([(D(big + ".5"),)], [(D(big + ".45"),)]).equal)
+        self.assertFalse(compare.tolerant([(D(big + ".5"),)], [(D(big + ".44"),)]).equal)
+
     def test_rows(self):
         a = [("N", "O", D("25.49807587")), ("A", "F", D("25.5009751"))]
         b = [("A", "F", 25.500975103), ("N", "O", 25.498075869)]

@@ -223,8 +223,13 @@ def close(a, b) -> bool:
             return False  # an integer: 2 and 2.5 differ (integer division is a real difference)
         places = decimal.Decimal(1).scaleb(-_scale(coarse))
         fine = decimal.Decimal(str(fine))
-        return decimal.Decimal(str(coarse)) in {fine.quantize(places, rounding=r) for r in
-                                                (decimal.ROUND_HALF_UP, decimal.ROUND_HALF_EVEN, decimal.ROUND_DOWN)}
+        # Enough precision for every digit the rounded value has: quantize
+        # raises past the default 28, which a NUMBER(38) can hold.
+        with decimal.localcontext() as ctx:
+            ctx.prec = max(ctx.prec, fine.adjusted() + _scale(coarse) + 2)
+            return decimal.Decimal(str(coarse)) in {fine.quantize(places, rounding=r) for r in
+                                                    (decimal.ROUND_HALF_UP, decimal.ROUND_HALF_EVEN,
+                                                     decimal.ROUND_DOWN)}
     return _field(a) == _field(b)
 
 
