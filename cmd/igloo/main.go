@@ -576,6 +576,11 @@ func serve() error {
 	if eraser != nil {
 		eng.SetErasure(eraser.List, srv.ErasureViewer)
 	}
+	// Users and roles dropped before DROP USER and DROP ROLE disowned
+	// their models and removed their model grants left them behind.
+	if err := srv.ForgetDroppedPrincipals(ctx); err != nil {
+		log.Warn("could not disown the models, and remove the model grants, of dropped users and roles", "err", err)
+	}
 	if rooms != nil {
 		// Runs execute through the SQL server, as each room's identity.
 		// Each start writes the rooms' confinements again, in case a

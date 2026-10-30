@@ -793,9 +793,40 @@ func (s *Server) readRows(ctx context.Context, sess *session, user auth.User, qu
 func (s *Server) disownModels(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.models.DisownModels(ctx, name, name+" (dropped)"); err != nil {
+	if err := s.models.DisownModels(ctx, name, models.Dropped(name)); err != nil {
 		s.log.Warn("could not disown a dropped user's models", "user", name, "err", err)
 	}
+}
+
+// ForgetDroppedPrincipals disowns the models, and removes the model
+// grants, that users and roles dropped before DROP USER and DROP ROLE did
+// so themselves left behind, which a user or role created later with the
+// same name would otherwise get (see models.Store.ForgetDropped). Each
+// replica runs it as it starts.
+func (s *Server) ForgetDroppedPrincipals(ctx context.Context) error {
+	disowned, forgotten, err := s.models.ForgetDropped(ctx, func(ctx context.Context) (models.Principals, error) {
+		p := models.Principals{Users: map[string]time.Time{}, Roles: map[string]time.Time{}}
+		users, err := s.users.List(ctx)
+		if err != nil {
+			return p, err
+		}
+		for _, u := range users {
+			p.Users[u.Name] = u.CreatedAt
+		}
+		roles, err := s.grants.Roles(ctx)
+		if err != nil {
+			return p, err
+		}
+		for _, r := range roles {
+			p.Roles[r.Name] = r.CreatedAt
+		}
+		return p, nil
+	})
+	if disowned > 0 || forgotten > 0 {
+		s.log.Info("disowned the models, and removed the model grants, of users and roles dropped before",
+			"models", disowned, "grants", forgotten)
+	}
+	return err
 }
 
 func (s *Server) dropModel(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, w wire.DataWriter) error {

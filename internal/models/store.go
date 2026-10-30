@@ -136,7 +136,38 @@ type Store interface {
 	// tombstone, a name no user can have, so that a user created later
 	// with the same name does not own them.
 	DisownModels(ctx context.Context, owner, tombstone string) error
+	// ForgetDropped disowns the models, and removes the grants, that users
+	// and roles dropped before DROP USER and DROP ROLE did so themselves
+	// (see DisownModels and ForgetGrantee) left behind. A model whose
+	// owner is no user, or a user created after the model (a later one of
+	// the same name), goes to Dropped(owner); a grant to a user or role
+	// that is not there, or was created after the grant, goes. principals
+	// says which users and roles there are; models and grants made since
+	// ForgetDropped began asking stay, as one created meanwhile may hold
+	// them. It returns how many models it disowned and grants it removed.
+	// Every replica runs it as it starts, and a second run changes nothing.
+	ForgetDropped(ctx context.Context, principals func(context.Context) (Principals, error)) (disowned, forgotten int, err error)
 	Close()
+}
+
+// Principals are the users and custom roles there are, each with when it
+// was created.
+type Principals struct {
+	Users, Roles map[string]time.Time
+}
+
+// Dropped is the owner a dropped user's models are given: a name no user
+// can have (see Store.DisownModels).
+func Dropped(owner string) string { return owner + droppedSuffix }
+
+const droppedSuffix = " (dropped)"
+
+// gone reports whether what name was given at time t went to none of
+// names: there is no one of that name, or the one there is was created
+// after t.
+func gone(names map[string]time.Time, name string, t time.Time) bool {
+	created, ok := names[name]
+	return !ok || created.After(t)
 }
 
 func key(schema, name string) string { return strings.ToLower(schema) + "." + strings.ToLower(name) }
@@ -326,6 +357,33 @@ func (s *MemoryStore) DisownModels(_ context.Context, owner, tombstone string) e
 		}
 	}
 	return nil
+}
+
+func (s *MemoryStore) ForgetDropped(ctx context.Context, principals func(context.Context) (Principals, error)) (int, int, error) {
+	asked := time.Now()
+	p, err := principals(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	disowned := 0
+	for k, m := range s.models {
+		if m.CreatedAt.Before(asked) && !strings.HasSuffix(m.Owner, droppedSuffix) && gone(p.Users, m.Owner, m.CreatedAt) {
+			m.Owner = Dropped(m.Owner)
+			s.models[k] = m
+			disowned++
+		}
+	}
+	n := len(s.grants)
+	s.grants = slices.DeleteFunc(s.grants, func(g Grant) bool {
+		names := p.Users
+		if g.GranteeType == "role" {
+			names = p.Roles
+		}
+		return g.GrantedAt.Before(asked) && gone(names, g.Grantee, g.GrantedAt)
+	})
+	return disowned, n - len(s.grants), nil
 }
 
 func (s *MemoryStore) Close() {}

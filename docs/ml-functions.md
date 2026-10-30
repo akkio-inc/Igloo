@@ -118,6 +118,17 @@ or a role also takes back the models granted to it, so that a user or
 role created later with the same name does not get them. Grants to
 others stay.
 
+Earlier versions did neither. What users and roles dropped then left
+behind is dealt with as each replica starts: a model whose owner is no
+user, or a user created after the model was last trained (so an earlier
+user of that name was dropped), is marked as a dropped user's; and a
+model grant to a user or role that does not exist, or that was created
+after the grant, is taken back. A model trained again after the new user
+was created, by them with `CREATE OR REPLACE` or by an erasure request,
+counts as theirs. Granting a model again to the new user or role changed
+nothing then, as the old grant was still there, so it is taken back with
+the old grant: grant it once more.
+
 ## FORECAST
 
 ```sql

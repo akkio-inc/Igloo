@@ -296,6 +296,46 @@ func (s *PostgresStore) DisownModels(ctx context.Context, owner, tombstone strin
 	return err
 }
 
+func (s *PostgresStore) ForgetDropped(ctx context.Context, principals func(context.Context) (Principals, error)) (int, int, error) {
+	// The database's clock, which stamps models, grants, users and roles.
+	var asked time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&asked); err != nil {
+		return 0, 0, err
+	}
+	p, err := principals(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	users, usersCreated := namesAndTimes(p.Users)
+	roles, rolesCreated := namesAndTimes(p.Roles)
+	tag, err := s.pool.Exec(ctx, `UPDATE igloo_ml.models m SET owner = owner || $4
+		WHERE created_at < $1 AND owner NOT LIKE ('%' || $4) AND NOT EXISTS (
+			SELECT 1 FROM unnest($2::text[], $3::timestamptz[]) u (name, created_at) WHERE u.name = m.owner AND u.created_at <= m.created_at)`,
+		asked, users, usersCreated, droppedSuffix)
+	if err != nil {
+		return 0, 0, err
+	}
+	disowned := int(tag.RowsAffected())
+	tag, err = s.pool.Exec(ctx, `WITH p (type, name, created_at) AS (
+			SELECT 'user', * FROM unnest($2::text[], $3::timestamptz[])
+			UNION ALL SELECT 'role', * FROM unnest($4::text[], $5::timestamptz[]))
+		DELETE FROM igloo_ml.grants g WHERE granted_at < $1 AND NOT EXISTS (
+			SELECT 1 FROM p WHERE p.type = g.grantee_type AND p.name = g.grantee AND p.created_at <= g.granted_at)`,
+		asked, users, usersCreated, roles, rolesCreated)
+	if err != nil {
+		return disowned, 0, err
+	}
+	return disowned, int(tag.RowsAffected()), nil
+}
+
+func namesAndTimes(m map[string]time.Time) ([]string, []time.Time) {
+	names, times := make([]string, 0, len(m)), make([]time.Time, 0, len(m))
+	for name, t := range m {
+		names, times = append(names, name), append(times, t)
+	}
+	return names, times
+}
+
 func (s *PostgresStore) Close() {
 	s.pool.Close()
 	s.locks.Close()

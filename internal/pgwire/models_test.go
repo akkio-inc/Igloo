@@ -489,6 +489,63 @@ func TestDroppedModelOwners(t *testing.T) {
 	}
 }
 
+// TestForgetDroppedPrincipals: models and grants that users and roles
+// dropped before DROP disowned and removed them left behind are disowned
+// and removed as the server starts, those of a user or role created again
+// since included, and a user created again does not own the model.
+func TestForgetDroppedPrincipals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models = store })
+	mustExec(t, cs.admin, "CREATE USER don WITH PASSWORD 'don-password' ROLE writer")
+	mustExec(t, cs.admin, "CREATE USER carl WITH PASSWORD 'carl-password' ROLE reader")
+	mustExec(t, cs.admin, "CREATE ROLE keepers")
+	// What dropping ana, eve, bob and the role analysts left before.
+	for _, m := range []models.Model{{Name: "anas", Owner: "ana"}, {Name: "eves", Owner: "eve"}, {Name: "dons", Owner: "don"}} {
+		m.Schema, m.Class, m.TrainingSQL, m.Blob = "public", models.ClassClassification, "CREATE ...", strings.Repeat("a", 64)
+		if _, err := store.Put(ctx, m, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, g := range []models.Grant{{Grantee: "bob", GranteeType: "user"}, {Grantee: "analysts", GranteeType: "role"},
+		{Grantee: "carl", GranteeType: "user"}, {Grantee: "keepers", GranteeType: "role"}} {
+		g.Schema, g.Name, g.Privilege = "public", "dons", models.PrivilegeUsage
+		if err := store.AddGrant(ctx, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ana, bob and analysts again.
+	ana := snowflakeConn(t, cs.user(t, "ana", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol))
+	mustExec(t, cs.admin, "CREATE USER bob WITH PASSWORD 'bob-password' ROLE reader")
+	mustExec(t, cs.admin, "CREATE ROLE analysts")
+
+	for range 2 {
+		if err := cs.srv.ForgetDroppedPrincipals(ctx); err != nil {
+			t.Fatal(err)
+		}
+		list, _ := store.List(ctx)
+		var owners []string
+		for _, m := range list {
+			owners = append(owners, m.Name+" "+m.Owner)
+		}
+		if got := strings.Join(owners, ", "); got != "anas ana (dropped), dons don, eves eve (dropped)" {
+			t.Errorf("models: %s", got)
+		}
+		gs, _ := store.Grants(ctx)
+		var left []string
+		for _, g := range gs {
+			left = append(left, g.GranteeType+" "+g.Grantee)
+		}
+		if got := strings.Join(left, ", "); got != "user carl, role keepers" {
+			t.Errorf("grants left: %s", got)
+		}
+	}
+	if got := texts(t, ana, "SHOW SNOWFLAKE.ML.CLASSIFICATION"); len(got) != 0 {
+		t.Errorf("the new ana sees %q", got)
+	}
+}
+
 // pausingBlobs holds the first write of blob sha, once made, until resume
 // is closed.
 type pausingBlobs struct {
