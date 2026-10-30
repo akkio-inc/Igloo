@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -199,6 +200,60 @@ func TestCloneOfEmptyTable(t *testing.T) {
 	}
 	if got := clonetest.IDs(t, clonetest.Append(t, res.Table, 1)); !slices.Equal(got, []int64{1}) {
 		t.Fatalf("writing the empty clone: %v", got)
+	}
+}
+
+// failingRegister is a catalog whose Register fails, after registering the
+// table if registers is set, as when the answer to the request is lost or
+// loading the table after it fails.
+type failingRegister struct {
+	*clonetest.Catalog
+	registers bool
+}
+
+func (c *failingRegister) Register(ctx context.Context, ident table.Identifier, metadataLoc string, replace bool) (*table.Table, error) {
+	if c.registers {
+		if _, err := c.Catalog.Register(ctx, ident, metadataLoc, replace); err != nil {
+			return nil, err
+		}
+	}
+	return nil, errors.New("the catalog did not answer")
+}
+
+// TestCloneRegisteredDespiteError checks a clone the catalog registered
+// though Register failed. Its metadata file and shares were deleted as if
+// it had never been made: the catalog's table could not be read, and the
+// source's maintenance could delete the files it reads. A registration the
+// catalog did not make is undone.
+func TestCloneRegisteredDespiteError(t *testing.T) {
+	ctx := context.Background()
+	inner := clonetest.New(t.TempDir())
+	src := source(t, inner)
+	store := clone.NewMemoryStore()
+	cat := &failingRegister{Catalog: inner, registers: true}
+	m := clone.NewManager(cat, store, quiet())
+
+	res, err := m.Clone(ctx, clone.Request{Source: table.Identifier{"prod", "events"}, Target: table.Identifier{"dev", "events"}})
+	if err != nil {
+		t.Fatalf("a clone the catalog registered: %v", err)
+	}
+	dst := inner.Load(t, "dev", "events")
+	if res.Table == nil || res.Table.Metadata().TableUUID() != dst.Metadata().TableUUID() {
+		t.Fatalf("the result is not the clone the catalog has: %v", res.Table)
+	}
+	if _, err := os.Stat(dst.MetadataLocation()); err != nil {
+		t.Errorf("the clone's metadata file: %v", err)
+	}
+	if recorded, _ := store.Sharers(ctx, src.Location()); len(recorded) != 1 || recorded[0].Clone != dst.Metadata().TableUUID() {
+		t.Errorf("recorded shares: %+v", recorded)
+	}
+
+	cat.registers = false
+	if _, err := m.Clone(ctx, clone.Request{Source: table.Identifier{"prod", "events"}, Target: table.Identifier{"dev", "never"}}); err == nil {
+		t.Fatal("a clone the catalog did not register succeeded")
+	}
+	if recorded, _ := store.Sharers(ctx, src.Location()); len(recorded) != 1 {
+		t.Errorf("the shares of a clone never made are kept: %+v", recorded)
 	}
 }
 

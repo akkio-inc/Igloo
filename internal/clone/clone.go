@@ -349,8 +349,24 @@ func (m *Manager) cloneLocked(ctx context.Context, r Request, first *table.Table
 	}
 	tbl, err := m.cat.Register(ctx, r.Target, metaLoc, r.Replace)
 	if err != nil {
-		undo()
-		return Result{}, false, err
+		// The catalog may have registered the clone all the same, its
+		// answer lost or the load after it failed; undoing would then
+		// delete a live clone's metadata file and shares. Undo only what
+		// the catalog does not have.
+		got, lerr := m.cat.LoadTable(context.WithoutCancel(ctx), r.Target)
+		switch {
+		case lerr == nil && got.Metadata().TableUUID() == id:
+			m.log.Warn("the catalog registered a clone whose registration failed", "table", strings.Join(r.Target, "."), "err", err)
+			tbl = got
+		case lerr == nil || errors.Is(lerr, icecat.ErrNoSuchTable):
+			undo()
+			return Result{}, false, err
+		default:
+			// A maintenance pass forgets the shares of a clone that was
+			// never made.
+			return Result{}, false, fmt.Errorf("register the clone: %w; the catalog did not say whether %s was made, so what it needs is kept",
+				err, strings.Join(r.Target, "."))
+		}
 	}
 	var snapID int64
 	if snap != nil {

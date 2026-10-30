@@ -948,6 +948,11 @@ CREATE OR REPLACE SCHEMA dev CLONE prod;       -- make dev a fresh copy of prod
   catalog](external-engines.md#clones), engines get no storage credentials
   for a clone, and cannot purge a table whose files clones read nor delete
   its files with the credentials they get for it.
+- **When the catalog fails.** A clone the catalog made though its answer
+  was lost, or reading the clone back failed, is kept and reported made.
+  When Igloo cannot learn whether the catalog made it, the statement fails
+  and says so; a clone it made is complete, and its source's files are
+  kept for it.
 - Tables of format version 1 and encrypted tables cannot be cloned, nor can
   a view on its own. `CLONE` runs outside transactions.
 
