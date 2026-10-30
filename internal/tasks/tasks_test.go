@@ -522,6 +522,70 @@ func TestSkippedRuns(t *testing.T) {
 	}
 }
 
+// TestRunStopsWhenItsLockIsLost checks a run whose connection holding the
+// job's lock drops, as when the metadata database fails over or ends an
+// idle session: Postgres releases the lock, so another replica could start
+// the job. The run went on, and two ran at once; now it is canceled, and
+// recorded as failed with why.
+func TestRunStopsWhenItsLockIsLost(t *testing.T) {
+	url := testdb.URL()
+	if url == "" {
+		t.Skip("IGLOO_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.pool.Exec(ctx, "TRUNCATE igloo_tasks.jobs, igloo_tasks.runs, igloo_tasks.loads"); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(store, Options{})
+	s.heldEvery = 50 * time.Millisecond
+	j := Job{Kind: KindTask, Name: "long", Owner: "ana", Statement: "SELECT 1", State: StateSuspended}
+	if err := store.CreateJob(ctx, j, false); err != nil {
+		t.Fatal(err)
+	}
+	started, stopped := make(chan struct{}), make(chan error, 1)
+	r := runnerFunc(func(ctx context.Context, _ Job) (int64, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+			stopped <- ctx.Err()
+			return -1, ctx.Err()
+		case <-time.After(10 * time.Second):
+			stopped <- nil
+			return 1, nil
+		}
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.RunNow(ctx, r, j)
+		done <- err
+	}()
+	<-started
+	if _, err := store.pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks
+		WHERE locktype = 'advisory' AND objid::bigint = $1::bigint & 4294967295`, lockID(JobKey(KindTask, "long"))); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-stopped:
+		if err == nil {
+			t.Fatal("the run was not canceled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run went on after its lock was lost")
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "lost its lock") {
+		t.Errorf("run: %v", err)
+	}
+	runs, _ := store.Runs(ctx, audit.Viewer{All: true}, audit.Page{})
+	if len(runs) != 1 || runs[0].Outcome != OutcomeFailed || !strings.Contains(runs[0].Error, "lost its lock") {
+		t.Errorf("recorded: %+v", runs)
+	}
+}
+
 func TestNextDue(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()

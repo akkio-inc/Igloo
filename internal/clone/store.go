@@ -2,6 +2,7 @@ package clone
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"slices"
@@ -49,6 +50,9 @@ type Store interface {
 	// wait false, giving up (ok false) if another holds one. release must
 	// be called once ok.
 	Lock(ctx context.Context, locations []string, wait bool) (release func(), ok bool, err error)
+	// LockLease is Lock, the locks held as a Lease, which says whether
+	// they still are.
+	LockLease(ctx context.Context, locations []string, wait bool) (lease Lease, ok bool, err error)
 	// Authoritative reports whether the Store has every clone the catalog
 	// has, so that what clones read can be told from it alone, without
 	// reading every table's properties. Clones are recorded as they are
@@ -57,6 +61,14 @@ type Store interface {
 	// has rebuilt it since it started (MemoryStore.Rebuilt).
 	Authoritative() bool
 	Close()
+}
+
+// Lease is locks that can tell whether they are still held.
+type Lease interface {
+	// Held returns an error once a lock is lost: a Postgres store's are
+	// when their connection drops, and another replica may take them then.
+	Held(ctx context.Context) error
+	Release()
 }
 
 // lockKeys are the advisory lock keys of locations, sorted, so two callers
@@ -155,6 +167,20 @@ func (m *MemoryStore) Remove(_ context.Context, clone uuid.UUID, location string
 	delete(m.shares, shareKey{clone, trimSlash(location)})
 	return nil
 }
+
+func (m *MemoryStore) LockLease(ctx context.Context, locations []string, wait bool) (Lease, bool, error) {
+	release, ok, err := m.Lock(ctx, locations, wait)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	return memLease(release), true, nil
+}
+
+// memLease is locks of one process, which it cannot lose.
+type memLease func()
+
+func (memLease) Held(context.Context) error { return nil }
+func (l memLease) Release()                 { l() }
 
 func (m *MemoryStore) Lock(ctx context.Context, locations []string, wait bool) (func(), bool, error) {
 	var held []chan struct{}
@@ -314,24 +340,55 @@ func (s *PostgresStore) Remove(ctx context.Context, clone uuid.UUID, location st
 }
 
 func (s *PostgresStore) Lock(ctx context.Context, locations []string, wait bool) (func(), bool, error) {
+	lease, ok, err := s.LockLease(ctx, locations, wait)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	return lease.Release, true, nil
+}
+
+// pgLease is advisory locks held by one connection of the locks pool.
+type pgLease struct {
+	conn *pgxpool.Conn
+	held []int64
+}
+
+// Held asks the locks' connection whether it holds every one: one that
+// dropped has none, and another session may have taken them since.
+func (l *pgLease) Held(ctx context.Context) error {
+	var n int
+	err := l.conn.QueryRow(ctx, `SELECT count(*) FROM unnest($1::bigint[]) k WHERE EXISTS (SELECT FROM pg_locks
+		WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()
+			AND classid::bigint = (k >> 32) & 4294967295 AND objid::bigint = k & 4294967295 AND objsubid = 1)`, l.held).Scan(&n)
+	switch {
+	case err != nil:
+		return fmt.Errorf("the lock is lost: %w", err)
+	case n != len(l.held):
+		return errors.New("the lock is lost")
+	}
+	return nil
+}
+
+func (l *pgLease) Release() {
+	// Unlock even when ctx was canceled. If this fails the connection is
+	// closed instead, which also releases the locks.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, k := range l.held {
+		if _, err := l.conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", k); err != nil {
+			_ = l.conn.Conn().Close(ctx)
+			break
+		}
+	}
+	l.conn.Release()
+}
+
+func (s *PostgresStore) LockLease(ctx context.Context, locations []string, wait bool) (Lease, bool, error) {
 	conn, err := s.locks.Acquire(ctx)
 	if err != nil {
 		return nil, false, err
 	}
-	var held []int64
-	release := func() {
-		// Unlock even when ctx was canceled. If this fails the connection
-		// is closed instead, which also releases the locks.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		for _, k := range held {
-			if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", k); err != nil {
-				_ = conn.Conn().Close(ctx)
-				break
-			}
-		}
-		conn.Release()
-	}
+	l := &pgLease{conn: conn}
 	for _, k := range lockKeys(locations) {
 		ok := true
 		if wait {
@@ -348,12 +405,12 @@ func (s *PostgresStore) Lock(ctx context.Context, locations []string, wait bool)
 			return nil, false, err
 		}
 		if !ok {
-			release()
+			l.Release()
 			return nil, false, nil
 		}
-		held = append(held, k)
+		l.held = append(l.held, k)
 	}
-	return release, true, nil
+	return l, true, nil
 }
 
 // Authoritative implements Store: always.

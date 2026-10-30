@@ -263,7 +263,13 @@ events or longer outages, at the cost of reading more each run.
   `task <name>`.
 - **One run at a time, on one replica.** Each scheduled run is claimed by
   one replica, through the metadata database. A run that comes due while
-  the previous one still runs is skipped and recorded as `skipped`.
+  the previous one still runs is skipped and recorded as `skipped`. A run
+  holds the task's lock in the metadata database, which the database
+  releases if the replica's connection to it drops (a failover, say), and
+  another replica could then start the task. So a run checks every two
+  seconds that it still holds the lock, and once it does not it is
+  canceled and recorded as `failed`: two runs overlap by those seconds at
+  most, and the time the first takes to stop.
 - **No retries.** A failed run is recorded with its error, and the task
   runs again at its next scheduled time. Runs missed while Igloo was not
   running are not made up: the task runs once when Igloo starts, if it is

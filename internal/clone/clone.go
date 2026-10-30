@@ -224,7 +224,9 @@ type Result struct {
 // Clone makes a clone. It holds the locks of the locations the clone will
 // share files with from before it reads the source until the clone is in
 // the catalog and its shares are recorded, so maintenance cannot delete a
-// file the clone references in between.
+// file the clone references in between. A Postgres store's locks are lost
+// if their connection drops, so the clone checks that it held them until
+// its shares were recorded, after which maintenance keeps the files.
 func (m *Manager) Clone(ctx context.Context, r Request) (Result, error) {
 	src, err := m.cat.LoadTable(ctx, r.Source)
 	if err != nil {
@@ -235,12 +237,12 @@ func (m *Manager) Clone(ctx context.Context, r Request) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		release, _, err := m.store.Lock(ctx, shared, true)
+		lease, _, err := m.store.LockLease(ctx, shared, true)
 		if err != nil {
 			return Result{}, fmt.Errorf("lock %s's files: %w", strings.Join(r.Source, "."), err)
 		}
-		res, again, err := m.cloneLocked(ctx, r, src, shared)
-		release()
+		res, again, err := m.cloneLocked(ctx, r, src, shared, lease)
+		lease.Release()
 		if !again || attempt == 2 {
 			return res, err
 		}
@@ -267,7 +269,7 @@ func (m *Manager) sharedLocations(ctx context.Context, src *table.Table) ([]stri
 	return slices.Compact(locs), nil
 }
 
-func (m *Manager) cloneLocked(ctx context.Context, r Request, first *table.Table, shared []string) (Result, bool, error) {
+func (m *Manager) cloneLocked(ctx context.Context, r Request, first *table.Table, shared []string, lease Lease) (Result, bool, error) {
 	src, err := m.cat.LoadTable(ctx, r.Source)
 	if err != nil {
 		return Result{}, false, err
@@ -333,6 +335,12 @@ func (m *Manager) cloneLocked(ctx context.Context, r Request, first *table.Table
 	if err := m.store.Add(ctx, recorded); err != nil {
 		undo()
 		return Result{}, false, fmt.Errorf("record the clone's shared files: %w", err)
+	}
+	// Held since before the source was read, nothing deleted its files
+	// meanwhile, and whatever deletes them from now on finds the shares.
+	if err := lease.Held(ctx); err != nil {
+		undo()
+		return Result{}, false, fmt.Errorf("%s's files could have been deleted while it was cloned; try again: %w", strings.Join(r.Source, "."), err)
 	}
 	// The table replaced, if any, as it is right before: the catalog
 	// leaves its files, for Purge.

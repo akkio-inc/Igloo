@@ -1180,7 +1180,9 @@ replica without a metadata database, or a database restored from a
 backup, has the record back before anything is deleted. Deleting a table's
 files then takes a lock that cloning the table takes too (in the metadata
 database, so replicas share it), and reads the metadata of each of its
-clones. Whenever Igloo cannot tell what a clone needs (the metadata
+clones. The database releases the lock if the connection holding it
+drops: a clone that lost it before its shares were recorded fails, and is
+made again by running the statement again. Whenever Igloo cannot tell what a clone needs (the metadata
 database does not answer, a clone was renamed or dropped during the pass,
 or was made less than an hour ago), it keeps the table's files; a later
 pass deletes them.

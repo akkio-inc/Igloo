@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go/table"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/clone/clonetest"
+	"github.com/akkio-inc/igloo/internal/testdb"
 )
 
 func TestReaders(t *testing.T) {
@@ -158,5 +160,74 @@ func TestUnreferencedKeepsOtherTablesFiles(t *testing.T) {
 		if slices.Contains(files, s.ManifestList) {
 			t.Errorf("would delete the manifest list of a retained snapshot")
 		}
+	}
+}
+
+// lockLoser is a catalog that, when a clone asks where its table goes,
+// which it does holding the locks of its source's files, ends the
+// metadata database's sessions that hold advisory locks, as a failover or
+// an idle session timeout does, and has the guard look for the source's
+// clones meanwhile, as a drop of the source does.
+type lockLoser struct {
+	*clonetest.Catalog
+	url, src string
+	g        *clone.Guard
+	found    []string
+}
+
+func (c *lockLoser) NamespaceLocation(ctx context.Context, ns string) (string, error) {
+	conn, err := pgx.Connect(ctx, c.url)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close(ctx) //nolint:errcheck
+	if _, err := conn.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks
+		WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+			AND pid <> pg_backend_pid()`); err != nil {
+		return "", err
+	}
+	names, release, err := c.g.Readers(ctx, c.src)
+	if err != nil {
+		return "", err
+	}
+	release()
+	c.found = names
+	return c.Catalog.NamespaceLocation(ctx, ns)
+}
+
+// TestCloneThatLostItsLock checks a clone whose locks of its source's files
+// were lost before its shares were recorded. The guard found no clone of
+// the source meanwhile, so a drop of the source would have deleted its
+// files, and the clone was made all the same, reading them. Now it fails,
+// and leaves nothing.
+func TestCloneThatLostItsLock(t *testing.T) {
+	url := testdb.URL()
+	if url == "" {
+		t.Skip("IGLOO_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	store, err := clone.OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inner := clonetest.New(t.TempDir())
+	src := source(t, inner)
+	cat := &lockLoser{Catalog: inner, url: url, src: src.Location()}
+	cat.g = clone.NewGuard(cat, store, quiet())
+
+	_, err = clone.NewManager(cat, store, quiet()).Clone(ctx,
+		clone.Request{Source: table.Identifier{"prod", "events"}, Target: table.Identifier{"dev", "events"}})
+	if len(cat.found) != 0 {
+		t.Fatalf("the guard found clones of the source before it was cloned: %v", cat.found)
+	}
+	if err == nil {
+		t.Fatal("a clone that lost its locks was made")
+	}
+	if _, err := inner.LoadTable(ctx, table.Identifier{"dev", "events"}); err == nil {
+		t.Error("the clone is in the catalog")
+	}
+	if shares, _ := store.Sharers(ctx, src.Location()); len(shares) != 0 {
+		t.Errorf("shares of a clone never made: %+v", shares)
 	}
 }
