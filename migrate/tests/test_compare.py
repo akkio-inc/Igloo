@@ -16,6 +16,16 @@ class CanonTest(unittest.TestCase):
         self.assertEqual(compare.canon(D("0.050006574")), compare.canon(0.0500065740000001))
         self.assertEqual(compare.canon(True), "true")
         self.assertEqual(compare.canon(float("nan")), "nan")
+        self.assertEqual(compare.canon(D("0.0000001")), compare.canon(1e-7))
+
+    def test_integers_and_decimals_are_exact(self):
+        for a, b in [(D("1000000000.01"), D("1000000000.02")), (D("123456789012.50"), D("123456789019.50")),
+                     (12345678901, 12345678902)]:
+            self.assertNotEqual(compare.canon(a), compare.canon(b))
+        self.assertEqual(compare.canon(D("123456789012.50")), "123456789012.5")
+        # A double's last digits vary with the order rows were added in.
+        self.assertEqual(compare.canon(1000000000.0000002), compare.canon(1000000000))
+        self.assertEqual(compare.canon(1234.567890123), compare.canon(1234.567890119))
 
     def test_times(self):
         aware = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone(dt.timedelta(hours=2)))
@@ -43,6 +53,35 @@ class DigestTest(unittest.TestCase):
         self.assertEqual(compare.verdict(a, 3, None), "rows match")
         self.assertEqual(compare.verdict(None, 3, None), "not compared")
 
+    def test_values_do_not_read_as_others(self):
+        def same(a, b):
+            return compare.digest([a], ["x"] * len(a)).checksum == compare.digest([b], ["x"] * len(b)).checksum
+
+        self.assertFalse(same((None,), ("\\N",)))
+        self.assertFalse(same(("a\x1fb", "c"), ("a", "b\x1fc")))
+        self.assertFalse(same((5,), ("5",)))
+        self.assertFalse(same((True,), ("true",)))
+        self.assertFalse(same(({"a": 5},), ({"a": "5"},)))
+        self.assertTrue(same((5, None), (D("5.00"), None)))
+
+    def test_numbers_exact_unless_floating_point(self):
+        def verdict(a, b):
+            da, db = compare.digest([a], ["x"] * len(a)), compare.digest([b], ["x"] * len(b))
+            return compare.verdict(da, 1, db.checksum, db.loose)
+
+        self.assertEqual(verdict((D("1000000000.01"),), (D("1000000000.02"),)), "values differ")
+        self.assertEqual(verdict((D("123456789012.50"),), (D("123456789019.50"),)), "values differ")
+        self.assertEqual(verdict((1000000000,), (1000000001,)), "values differ")
+        self.assertEqual(verdict((12345678901,), (12345678902,)), "values differ")
+        self.assertEqual(verdict((D("123456789012.50"),), (D("123456789012.5"),)), "match")
+        # Snowflake's AVG of a NUMBER(12,2) has 8 decimal places, DuckDB's is
+        # a double: they agree to 10 significant digits. Two decimals in
+        # another column must still be equal.
+        self.assertEqual(verdict((1234.567890123, "a"), (D("1234.56789012"), "a")), "match")
+        self.assertEqual(verdict((D("1234.56789012"), 1.5), (1234.567890123, D("1.50"))), "match")
+        self.assertEqual(verdict((1234.567890123, D("12345678901.5")), (D("1234.56789012"), D("12345678901.6"))),
+                         "values differ")
+
     def test_large_results_are_not_kept(self):
         d = compare.digest(((i,) for i in range(10)), ["n"], keep=5)
         self.assertEqual(d.rows, 10)
@@ -63,6 +102,14 @@ class TolerantTest(unittest.TestCase):
         self.assertTrue(compare.close(2, 2.0))
         self.assertTrue(compare.close("a", "a"))
         self.assertFalse(compare.close("a", "b"))
+
+    def test_integers_and_decimals_exactly(self):
+        self.assertFalse(compare.close(1000000000, 1000000001))
+        self.assertFalse(compare.close(D("1000000000.01"), D("1000000000.02")))
+        self.assertFalse(compare.close(D("123456789012.50"), D("123456789019.50")))
+        self.assertTrue(compare.close(1000000000, 1000000000.0000002), "a double's last digits")
+        self.assertFalse(compare.close(None, "\\N"))
+        self.assertFalse(compare.tolerant([(1000000000,)], [(1000000001,)]).equal)
 
     def test_rows(self):
         a = [("N", "O", D("25.49807587")), ("A", "F", D("25.5009751"))]

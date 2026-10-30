@@ -319,7 +319,7 @@ class Databricks:
                     raise OverflowError
                 return compare.digest(rows, cols)
             d, seconds = timed(go)
-            return Rerun(ok=True, seconds=seconds, rows=d.rows, checksum=d.checksum, columns=d.columns,
+            return Rerun(ok=True, seconds=seconds, rows=d.rows, checksum=d.checksum, loose=d.loose, columns=d.columns,
                          values=d.values)
         except OverflowError:
             return Rerun(ok=False, skipped=f"returned more than {max_rows} rows")

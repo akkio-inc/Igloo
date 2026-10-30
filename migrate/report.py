@@ -505,8 +505,9 @@ def render_html(rep: dict) -> str:
         if c[key]:
             parts.append(f"<p><b>{label}:</b> {_e(_counts(c[key]))}. Match rate "
                          f"{_rate(c[key + '_match_rate'])}.</p>")
-    parts.append("<p class='muted'>Results are compared by row count and an order-independent checksum, numbers to "
-                 f"{_e(s.get('digits'))} significant digits; small results that differ are then compared row by row, "
+    parts.append("<p class='muted'>Results are compared by row count and an order-independent checksum, integers and "
+                 f"decimals exactly and doubles to {_e(s.get('digits'))} significant digits; small results that differ "
+                 "are then compared row by row, "
                  "numbers to the precision of the less precise side (\"match within precision\"). \"(explained)\" "
                  "marks differences that need not be Igloo's: the statement depends on the time, on chance or on the "
                  "session, a LIMIT picks among ties, or Igloo's copy of a table differs from the source's table now. "

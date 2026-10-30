@@ -176,6 +176,20 @@ class CompareTest(unittest.TestCase):
         out = replay.rerun_check(s, a, Rerun(ok=False, skipped="returned more than 10 rows"), {})
         self.assertEqual(out["verdict"], "not compared")
 
+    def test_rerun_check_floating_point_in_a_large_result(self):
+        # Too many rows to compare one by one: the checksums decide.
+        D = decimal.Decimal
+        s = shape("SELECT avg(x) FROM orders")
+        mine = compare.digest([(1234.567890123,)], ["a"], keep=0)
+        theirs = compare.digest([(D("1234.56789012"),)], ["A"], keep=0)
+        rerun = Rerun(ok=True, rows=1, checksum=theirs.checksum, loose=theirs.loose, columns=theirs.columns)
+        a = Attempt("as written", "", ok=True, rows=1, checksum=mine.checksum, loose=mine.loose, columns=mine.columns)
+        self.assertEqual(replay.rerun_check(s, a, rerun, {})["verdict"], "match")
+        other = compare.digest([(D("1234.56789013"),)], ["a"], keep=0)
+        a = Attempt("as written", "", ok=True, rows=1, checksum=other.checksum, loose=other.loose,
+                    columns=other.columns)
+        self.assertEqual(replay.rerun_check(s, a, rerun, {})["verdict"], "values differ")
+
 
 if __name__ == "__main__":
     unittest.main()

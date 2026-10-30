@@ -466,7 +466,7 @@ SELECT warehouse_name, SUM(credits_used) AS credits FROM TABLE(SNOWFLAKE.INFORMA
                 semi = {i for i, c in enumerate(cur.description) if _type_name(c) in ("VARIANT", "OBJECT", "ARRAY")}
                 return compare.digest(_fetch_capped(cur, max_rows), cols, semi)
             d, seconds = timed(go)
-            return Rerun(ok=True, seconds=seconds, rows=d.rows, checksum=d.checksum, columns=d.columns,
+            return Rerun(ok=True, seconds=seconds, rows=d.rows, checksum=d.checksum, loose=d.loose, columns=d.columns,
                          values=d.values)
         except _TooMany:
             return Rerun(ok=False, skipped=f"returned more than {max_rows} rows")

@@ -46,6 +46,7 @@ class Attempt:
     seconds: float | None = None
     rows: int | None = None
     checksum: str | None = None
+    loose: str | None = None  # compare.Digest.loose
     columns: list[str] | None = None
     counted: bool = False  # rows counted on the server instead of fetched
     error_class: str | None = None
@@ -205,7 +206,7 @@ class Igloo:
                     d = compare.digest(cur.fetchall(), [c.name for c in cur.description])
                 attempt.seconds = time.perf_counter() - start
             if d is not None:
-                attempt.rows, attempt.checksum, attempt.columns = d.rows, d.checksum, d.columns
+                attempt.rows, attempt.checksum, attempt.loose, attempt.columns = d.rows, d.checksum, d.loose, d.columns
                 attempt.values = d.values
                 if d.rows > max_rows:
                     attempt.checksum = None

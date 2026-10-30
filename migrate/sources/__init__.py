@@ -63,6 +63,7 @@ class Rerun:
     seconds: float | None = None
     rows: int | None = None
     checksum: str | None = None
+    loose: str | None = None  # compare.Digest.loose
     columns: list[str] | None = None
     error: str | None = None
     cost: float | None = None  # estimated, in the source's unit
