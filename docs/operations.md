@@ -51,7 +51,10 @@ with `SET` apply to their own session only.
   [access tokens](sso.md#access-tokens)).
 - Role changes, disabled and dropped users and revoked tokens reach open
   connections within 30 seconds; on the replica that made the change,
-  immediately.
+  immediately. A replica that cannot read the metadata database goes on
+  with the users, grants and policies it read last for up to
+  `IGLOO_ACCESS_MAX_STALENESS` (2 minutes), then refuses its sessions'
+  statements with SQLSTATE `58000` until it can read them again.
 - After 10 failed logins for a user, or 50 from an address, within 15
   minutes, further logins for it are refused for a while
   ([details](sso.md#failed-logins)).
@@ -112,7 +115,8 @@ tags](security-policies.md) describes them.
   metadata database (schema `igloo_policy`); without one, in each replica's
   memory, lost on restart.
 - Changes apply at once on the replica that made them and within 30 seconds
-  on the others.
+  on the others; a replica that cannot read them refuses statements after
+  `IGLOO_ACCESS_MAX_STALENESS`, as for role changes.
 - Policies and tags stay with a table's name when the table is dropped, and
   renaming a table or column they protect or tag is refused: unset them
   first.
@@ -1293,6 +1297,7 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |
 | `CREATE TABLE` fails with `schema: data did not match any variant` | The table has a column the catalog cannot store, such as a `GEOMETRY`; store `ST_AsWKB(geom)` instead ([media analytics](media-analytics.md#loading-boundaries)). |
 | SQLSTATE `53300` | The replica is at `IGLOO_MAX_CONNECTIONS`. Use a connection pool, raise the limit, or add replicas. |
+| SQLSTATE `58000`, `cannot check this statement: the session's user could not be read from the metadata database for 2m0s` | The replica has not reached the metadata database (`IGLOO_METADATA_DATABASE_URL`) for longer than `IGLOO_ACCESS_MAX_STALENESS`, so it cannot tell whether the user, their grants or the policies changed. Statements run again once it can; check the database and the network to it. |
 | SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | A listing or DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |
 | Log says `crashed outside Go code, in DuckDB or an extension; exiting`, and the replica restarts | DuckDB crashed on one of its own threads. Igloo exits with status 2 so that Docker or Kubernetes restarts it, rather than keep a session that will never finish; the goroutine dump that follows in the log shows the statements that were running. |
 | Log says `igloo: a C++ exception escaped DuckDB or an extension (...); exiting`, and the replica or worker restarts with status 134 | An exception nothing caught reached C++'s terminate, often while DuckDB cleaned up after running out of memory (the type in parentheses, mangled, says which: `N6duckdb20OutOfMemoryExceptionE`). Igloo exits at once rather than abort, which left workers hung; look at the memory warnings before it, and lower the statements' memory or raise the limit. |

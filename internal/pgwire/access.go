@@ -196,7 +196,8 @@ func (s *Server) catalogName() string {
 
 // privileges returns the session's grants, reloading them once they are as
 // old as the role refresh interval. If the store fails, the last ones
-// loaded stay in force, as the role does.
+// loaded stay in force, as the role does, for up to maxStale (see
+// refreshAccess).
 func (s *Server) privileges(ctx context.Context, sess *session, user auth.User) (*auth.Privileges, error) {
 	sess.mu.Lock()
 	snap, fixed := sess.privs, sess.fixed
@@ -211,6 +212,9 @@ func (s *Server) privileges(ctx context.Context, sess *session, user auth.User) 
 	if err != nil {
 		if snap.privs != nil {
 			s.log.Warn("could not refresh grants", "user", user.Name, "err", err)
+			if age := time.Since(snap.loaded); age >= s.maxStale {
+				return nil, staleAccess("the session's grants", age)
+			}
 			return snap.privs, nil
 		}
 		return nil, err

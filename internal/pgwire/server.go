@@ -122,6 +122,11 @@ type Options struct {
 	// changes and dropped users take effect on open connections. Zero means
 	// 30 seconds.
 	RoleRefresh time.Duration
+	// AccessMaxStaleness is how long statements may still be checked
+	// against the user, grants and policies last read when the metadata
+	// database cannot be read; past it they are refused. Zero means four
+	// times RoleRefresh.
+	AccessMaxStaleness time.Duration
 	// StatementTimeout is the default limit on how long a statement may
 	// run; sessions can change it with SET statement_timeout. Zero means none.
 	StatementTimeout time.Duration
@@ -384,6 +389,9 @@ type Server struct {
 	clonePurge func(ctx context.Context, what string, name []string, location string, inCatalog bool) clone.PurgeVerdict
 	// gov holds the policies (see protect.go).
 	gov *governance
+	// maxStale is how long statements may be checked against the users,
+	// grants and policies last read (see refreshAccess).
+	maxStale time.Duration
 	// idDomains keeps ID domains; idDomainsOn lets columns join them.
 	idDomains   iddomain.Store
 	idDomainsOn bool
@@ -647,6 +655,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	if s.roleRefresh == 0 {
 		s.roleRefresh = 30 * time.Second
 	}
+	s.maxStale = cmp.Or(opts.AccessMaxStaleness, 4*s.roleRefresh)
 	if s.grants == nil {
 		if g, ok := opts.Users.(auth.GrantStore); ok {
 			s.grants = g
@@ -715,6 +724,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		opts.AllowedLocations, opts.Warehouse, externalFiles); err != nil {
 		return nil, err
 	}
+	s.gov.maxStale = s.maxStale
 	if e, ok := engine.(interface {
 		SetPolicies(func() *policy.Snapshot)
 	}); ok {
@@ -1107,7 +1117,8 @@ func (sess *session) release(ps *wire.PreparedStatement) error {
 // tokens take effect on open connections.
 func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, error) {
 	sess.mu.Lock()
-	user, fresh := sess.user, time.Since(sess.checked) < s.roleRefresh || sess.fixed != nil
+	user, checked := sess.user, sess.checked
+	fresh := time.Since(checked) < s.roleRefresh || sess.fixed != nil
 	sess.mu.Unlock()
 	ended := func(format string, args ...any) (auth.User, error) {
 		return user, pgerror.WithSeverity(pgerror.WithCode(
@@ -1135,8 +1146,12 @@ func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, err
 		}
 	}
 	if err != nil {
-		// Keep the last known role if the metadata database blips.
+		// Keep the last known role if the metadata database blips, but
+		// not for longer than maxStale (see refreshAccess).
 		s.log.Warn("could not refresh user", "user", user.Name, "err", err)
+		if age := time.Since(checked); age >= s.maxStale {
+			return user, staleAccess("the session's user", age)
+		}
 		return user, nil
 	}
 
@@ -1144,6 +1159,39 @@ func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, err
 	sess.user, sess.checked = latest, time.Now()
 	sess.mu.Unlock()
 	return latest, nil
+}
+
+// refreshAccess reads again, when they are due, what a statement is checked
+// against besides the session's user, which refreshUser reads: the
+// session's grants, if it has loaded them, and the policies. Every
+// statement goes through both, as it is prepared and before each run.
+//
+// Should the metadata database fail, the user, grants and policies last
+// read stay in force, so that a blip does not fail statements, but for no
+// longer than maxStale (IGLOO_ACCESS_MAX_STALENESS): past it, statements
+// are refused with staleAccess's error until they can be read again, since
+// a user disabled, a token or grant revoked or a policy attached
+// meanwhile, by another replica, would not apply. A cache that a change on
+// this replica expired counts as that old at once.
+func (s *Server) refreshAccess(ctx context.Context, sess *session, user auth.User) error {
+	sess.mu.Lock()
+	loaded := sess.privs.privs != nil
+	sess.mu.Unlock()
+	if loaded {
+		if _, err := s.privileges(ctx, sess, user); err != nil {
+			return err
+		}
+	}
+	_, err := s.gov.current(ctx)
+	return err
+}
+
+// staleAccess refuses a statement because what, which it would be checked
+// against, has not been read from the metadata database for age.
+func staleAccess(what string, age time.Duration) error {
+	return pgerror.WithCode(fmt.Errorf("cannot check this statement: %s could not be read from the metadata database "+
+		"for %s, and may have changed since (IGLOO_ACCESS_MAX_STALENESS); try again once it can be reached",
+		what, age.Round(time.Second)), codes.System)
 }
 
 // acquireConn reserves a session slot, reporting false when the server is
@@ -1443,6 +1491,9 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	}
 	sess := sessionFrom(ctx)
 	user, err := s.refreshUser(ctx, sess)
+	if err == nil {
+		err = s.refreshAccess(ctx, sess, user)
+	}
 	if err != nil {
 		return nil, err
 	}

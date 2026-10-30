@@ -57,6 +57,10 @@ type Config struct {
 	// MetadataDatabaseURL is the Postgres database that stores users. Empty
 	// means the administrator is the only account.
 	MetadataDatabaseURL string
+	// AccessMaxStaleness is how long a replica that cannot read the
+	// metadata database keeps checking statements against the users,
+	// grants and policies it read last, before it refuses them.
+	AccessMaxStaleness time.Duration
 	// IDDomains turns on ID domains' work (IGLOO_ID_DOMAINS, off by
 	// default): columns joining domains, filling the columns that hold
 	// their ids, and statements counting through them.
@@ -481,6 +485,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.MaxConnections = n
 	}
 	cfg.LoginTimeout = 30 * time.Second
+	cfg.AccessMaxStaleness = 2 * time.Minute
+	if v := get("IGLOO_ACCESS_MAX_STALENESS", ""); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			addErr("IGLOO_ACCESS_MAX_STALENESS must be a duration such as 2m or 10m, got %q", v)
+		}
+		cfg.AccessMaxStaleness = d
+	}
 	if v := get("IGLOO_LOGIN_TIMEOUT", ""); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {

@@ -494,6 +494,7 @@ func serve() error {
 		StatementTimeout:    cfg.StatementTimeout,
 		MaxConnections:      cfg.MaxConnections,
 		LoginTimeout:        cfg.LoginTimeout,
+		AccessMaxStaleness:  cfg.AccessMaxStaleness,
 		Version:             version,
 		DDL:                 objects,
 		Activity:            work,

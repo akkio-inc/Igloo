@@ -38,6 +38,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.StatementTimeout != 0 || cfg.MaxConnections != 100 || cfg.LoginTimeout != 30*time.Second {
 		t.Errorf("unexpected limits: timeout %s, max connections %d, login timeout %s", cfg.StatementTimeout, cfg.MaxConnections, cfg.LoginTimeout)
 	}
+	if cfg.AccessMaxStaleness != 2*time.Minute {
+		t.Errorf("access max staleness: %s", cfg.AccessMaxStaleness)
+	}
 	if m := cfg.Maintenance; !m.Enabled || m.Interval != time.Hour || m.Retention != 7*24*time.Hour {
 		t.Errorf("unexpected maintenance defaults: %+v", m)
 	}
@@ -179,19 +182,23 @@ func TestParseSize(t *testing.T) {
 
 func TestLimits(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"IGLOO_ADMIN_PASSWORD":    "password",
-		"IGLOO_STATEMENT_TIMEOUT": "90m",
-		"IGLOO_MAX_CONNECTIONS":   "20",
-		"IGLOO_SHUTDOWN_DELAY":    "5s",
-		"IGLOO_LOGIN_TIMEOUT":     "1m",
+		"IGLOO_ADMIN_PASSWORD":       "password",
+		"IGLOO_STATEMENT_TIMEOUT":    "90m",
+		"IGLOO_MAX_CONNECTIONS":      "20",
+		"IGLOO_SHUTDOWN_DELAY":       "5s",
+		"IGLOO_LOGIN_TIMEOUT":        "1m",
+		"IGLOO_ACCESS_MAX_STALENESS": "10m",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StatementTimeout.Minutes() != 90 || cfg.MaxConnections != 20 || cfg.ShutdownDelay.Seconds() != 5 || cfg.LoginTimeout != time.Minute {
-		t.Errorf("got timeout %s, max connections %d, login timeout %s", cfg.StatementTimeout, cfg.MaxConnections, cfg.LoginTimeout)
+	if cfg.StatementTimeout.Minutes() != 90 || cfg.MaxConnections != 20 || cfg.ShutdownDelay.Seconds() != 5 || cfg.LoginTimeout != time.Minute ||
+		cfg.AccessMaxStaleness != 10*time.Minute {
+		t.Errorf("got timeout %s, max connections %d, login timeout %s, access max staleness %s",
+			cfg.StatementTimeout, cfg.MaxConnections, cfg.LoginTimeout, cfg.AccessMaxStaleness)
 	}
-	for k, v := range map[string]string{"IGLOO_STATEMENT_TIMEOUT": "soon", "IGLOO_MAX_CONNECTIONS": "0", "IGLOO_LOGIN_TIMEOUT": "0"} {
+	for k, v := range map[string]string{"IGLOO_STATEMENT_TIMEOUT": "soon", "IGLOO_MAX_CONNECTIONS": "0", "IGLOO_LOGIN_TIMEOUT": "0",
+		"IGLOO_ACCESS_MAX_STALENESS": "never"} {
 		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", k: v})); err == nil {
 			t.Errorf("%s=%s accepted", k, v)
 		}

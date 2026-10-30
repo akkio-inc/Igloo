@@ -44,14 +44,20 @@ reference for every setting mentioned here.
   `IGLOO_METADATA_DATABASE_URL`. After 10 failed logins for a user, or 50
   from an address, in 15 minutes, each replica refuses further ones for a
   while. Disabled users (`NOLOGIN`) cannot sign in by any means, and their
-  sessions end.
+  sessions end. Changes to users, their tokens, roles and grants, and to
+  policies, reach open sessions on other replicas within 30 seconds; a
+  replica that cannot read the metadata database goes on with what it read
+  last for at most `IGLOO_ACCESS_MAX_STALENESS` (2 minutes by default),
+  then refuses statements until it can read it again.
 - **Access tokens** ([details](docs/sso.md#access-tokens)) stand in for
   passwords in SQL clients. They are 256-bit random secrets with an
   `igloo_` prefix, shown once and stored only as a SHA-256 hash and SCRAM
   keys; SQL logins with them use SCRAM, so the token does not cross the
   network, and hashes are compared in constant time. Every token expires
   (90 days by default, at most `IGLOO_TOKEN_MAX_LIFETIME`); its use is
-  recorded; revoking it ends its sessions within 30 seconds. A session that
+  recorded; revoking it ends its sessions within 30 seconds (or, on a
+  replica that cannot read the metadata database, stops their statements
+  after `IGLOO_ACCESS_MAX_STALENESS`). A session that
   signed in with a token, or a task, cannot create tokens for its user or
   set its password; an admin's token can still do anything an admin can. Tokens do
   not sign in to the web console. Service accounts have no password and
@@ -148,7 +154,8 @@ reference for every setting mentioned here.
   source behind those policies. Policies are not a boundary for admins,
   who manage them and can read the warehouse's files, nor for other
   engines reading the Iceberg tables directly. Policy changes reach other
-  replicas within 30 seconds.
+  replicas within 30 seconds, and one that cannot read them refuses
+  statements after `IGLOO_ACCESS_MAX_STALENESS`.
 - **Connections to other databases.** Only admins create, change and drop
   [connections](docs/federation.md) to PostgreSQL, MySQL and Snowflake
   databases. A

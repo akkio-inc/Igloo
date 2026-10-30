@@ -244,7 +244,9 @@ catalog's session lasts an hour at most, never longer than the token.
   every login in `igloo.login_history` with `auth_method` `token` and the
   token's `token_name`.
 - **Revoking** a token (`DROP TOKEN`) stops new logins at once and ends the
-  SQL and Arrow Flight SQL sessions it opened within 30 seconds, and its
+  SQL and Arrow Flight SQL sessions it opened within 30 seconds (a replica
+  that cannot read the metadata database refuses their statements after
+  `IGLOO_ACCESS_MAX_STALENESS` instead), and its
   Iceberg REST catalog sessions at their next request. A session also ends,
   before its next statement or request, once its token has expired. Storage
   credentials the catalog already handed an engine for a table's files last
