@@ -82,7 +82,7 @@ func (s *Service) SignIn(ctx context.Context, id Identity) (auth.User, error) {
 	case user.Disabled:
 		return auth.User{}, refuse(RefusedDisabled, user.Name, "user is disabled")
 	}
-	link := auth.Identity{Issuer: id.Issuer, Subject: id.Subject, User: user.Name, Email: id.Email, Groups: id.Groups}
+	link := auth.Identity{Issuer: id.Issuer, Subject: id.Subject, User: user.Name, Email: id.Email, Groups: id.Groups, AccountID: id.AccountID}
 	if err := s.sso.UpdateIdentity(ctx, link); err != nil {
 		return auth.User{}, err
 	}
@@ -263,7 +263,8 @@ func (s *Service) link(ctx context.Context, id Identity, user auth.User) (auth.U
 	} else if !errors.Is(err, auth.ErrIdentityNotFound) {
 		return auth.User{}, err
 	}
-	err := s.sso.LinkIdentity(ctx, auth.Identity{Issuer: id.Issuer, Subject: id.Subject, User: user.Name, Email: id.Email, Groups: id.Groups})
+	err := s.sso.LinkIdentity(ctx, auth.Identity{Issuer: id.Issuer, Subject: id.Subject, User: user.Name, Email: id.Email, Groups: id.Groups,
+		AccountID: id.AccountID})
 	if err != nil {
 		return auth.User{}, err
 	}

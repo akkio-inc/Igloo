@@ -362,9 +362,10 @@ func TestAccessTokens(t *testing.T) {
 	if err := f.svc.VerifyAccessToken(ctx, ana, good); err != nil {
 		t.Errorf("a good access token: %v", err)
 	}
-	// A token with another subject but the identity's email is ana's.
-	if err := f.svc.VerifyAccessToken(ctx, ana, f.idp.Sign(person("pairwise", "ana@agency.com"), "api://igloo", time.Hour)); err != nil {
-		t.Errorf("another subject with ana's email: %v", err)
+	// A token of another subject is not ana's, though it has her email: the
+	// provider may have given a deleted account's email to someone else.
+	if err := f.svc.VerifyAccessToken(ctx, ana, f.idp.Sign(person("s-recycled", "ana@agency.com"), "api://igloo", time.Hour)); err == nil {
+		t.Error("another subject with ana's email was accepted")
 	}
 	if err := f.dir.Create(ctx, auth.User{Name: "bob", Role: auth.RoleReader}); err != nil {
 		t.Fatal(err)
@@ -405,5 +406,73 @@ func TestAccessTokens(t *testing.T) {
 	off := newFixture(t, func(c *config.OIDC) { c.AccessTokenAudience = "" })
 	if off.svc.AccessTokensEnabled() || off.svc.VerifyAccessToken(ctx, ana, good) == nil {
 		t.Error("access tokens without an audience configured")
+	}
+}
+
+// TestAccessTokenIDClaim: for providers whose access tokens have a subject
+// of their own, the account ID claim recorded at sign-in stands in for it,
+// and the email never does.
+func TestAccessTokenIDClaim(t *testing.T) {
+	ctx := context.Background()
+	with := func(claims map[string]any, extra map[string]any) map[string]any {
+		out := map[string]any{}
+		for _, m := range []map[string]any{claims, extra} {
+			for k, v := range m {
+				out[k] = v
+			}
+		}
+		return out
+	}
+
+	// Entra ID: the subject differs between applications; oid does not.
+	f := newFixture(t)
+	ana, err := f.signIn(t, with(person("s-ana-console", "ana@agency.com"), map[string]any{"oid": "oid-ana"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiToken := f.idp.Sign(with(person("s-ana-api", "ana@agency.com"), map[string]any{"oid": "oid-ana"}), "api://igloo", time.Hour)
+	if err := f.svc.VerifyAccessToken(ctx, ana, apiToken); err == nil {
+		t.Error("another subject was accepted without IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM")
+	}
+	cfg := f.svc.cfg
+	cfg.AccessTokenIDClaim = "oid"
+	if f.svc, err = New(Options{Config: cfg, Users: f.dir, Accounts: f.dir, SSO: f.dir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.VerifyAccessToken(ctx, ana, apiToken); err == nil || !strings.Contains(err.Error(), "has not signed in") {
+		t.Errorf("before ana signed in with the claim set: %v", err)
+	}
+	if _, err := f.signIn(t, with(person("s-ana-console", "ana@agency.com"), map[string]any{"oid": "oid-ana"})); err != nil {
+		t.Fatal(err)
+	}
+	if link, _ := f.dir.IdentityOf(ctx, ana.Name); link.AccountID != "oid-ana" {
+		t.Errorf("recorded account ID %q", link.AccountID)
+	}
+	if err := f.svc.VerifyAccessToken(ctx, ana, apiToken); err != nil {
+		t.Errorf("ana's oid: %v", err)
+	}
+	for name, claims := range map[string]map[string]any{
+		"another account's oid, with ana's email": with(person("s-new-api", "ana@agency.com"), map[string]any{"oid": "oid-new"}),
+		"no oid, with ana's email":                person("s-new-api", "ana@agency.com"),
+	} {
+		if err := f.svc.VerifyAccessToken(ctx, ana, f.idp.Sign(claims, "api://igloo", time.Hour)); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+
+	// Okta: the access token's subject is the username, its uid the ID
+	// token's subject.
+	okta := newFixture(t, func(c *config.OIDC) { c.AccessTokenIDClaim = "uid" })
+	bo, err := okta.signIn(t, person("00u-bo", "bo@agency.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := okta.svc.VerifyAccessToken(ctx, bo, okta.idp.Sign(with(person("bo@agency.com", "bo@agency.com"),
+		map[string]any{"uid": "00u-bo"}), "api://igloo", time.Hour)); err != nil {
+		t.Errorf("bo's uid: %v", err)
+	}
+	if err := okta.svc.VerifyAccessToken(ctx, bo, okta.idp.Sign(with(person("bo@agency.com", "bo@agency.com"),
+		map[string]any{"uid": "00u-new"}), "api://igloo", time.Hour)); err == nil {
+		t.Error("a new account given bo's username was accepted")
 	}
 }

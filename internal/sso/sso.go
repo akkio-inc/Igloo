@@ -240,7 +240,13 @@ func (s *Service) Finish(ctx context.Context, pending Pending, code string) (Ide
 			return Identity{}, errors.New("the ID token was issued to another client")
 		}
 	}
-	return s.identity(idToken.Issuer, idToken.Subject, claims), nil
+	id := s.identity(idToken.Issuer, idToken.Subject, claims)
+	if s.cfg.AccessTokenIDClaim != "" && id.AccountID == "" {
+		// Okta's ID tokens have no uid: their subject is the ID its
+		// access tokens carry there.
+		id.AccountID = id.Subject
+	}
+	return id, nil
 }
 
 // redactOAuthError keeps a token endpoint's error code and description but
@@ -279,11 +285,18 @@ type Identity struct {
 	// Domain is the domain the allowed domains are checked against:
 	// Google's hosted domain, or the username's or email's domain.
 	Domain string
+	// AccountID is the value of the claim IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM
+	// names, if set: the account's ID at the provider, which access tokens
+	// whose subject is not the ID token's are matched by.
+	AccountID string
 }
 
 // identity reads an Identity from verified claims.
 func (s *Service) identity(issuer, subject string, claims map[string]any) Identity {
 	id := Identity{Issuer: issuer, Subject: subject, Username: stringClaim(claims, s.cfg.UsernameClaim)}
+	if s.cfg.AccessTokenIDClaim != "" {
+		id.AccountID = stringClaim(claims, s.cfg.AccessTokenIDClaim)
+	}
 	if email := stringClaim(claims, "email"); email != "" && boolClaim(claims, "email_verified") {
 		id.Email = auth.NormalizeEmail(email)
 	}

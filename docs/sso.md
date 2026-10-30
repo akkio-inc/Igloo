@@ -139,7 +139,9 @@ may (`can_login`). If someone's account at the provider is replaced, so its
 subject changes, their next sign-in is refused as belonging to someone else
 until an admin unlinks the old account: `ALTER USER ana SSO NULL` (console:
 *Unlink SSO*). Igloo never relinks by itself, since a reused email may now be
-another person's.
+another person's. For the same reason, once a user is linked, the
+provider's [access tokens](#identity-provider-access-tokens) are theirs only
+by the linked account's subject or immutable ID, never by email.
 
 ## Groups and roles
 
@@ -262,8 +264,26 @@ that already get one (for instance with a device-code login). Set
 `IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE` to the audience the provider puts in
 access tokens meant for Igloo, such as `api://igloo` (Entra ID) or a custom
 authorization server's audience (Okta). Igloo then checks such a token's
-signature, issuer, audience and expiry, and that it is the user's: their
-linked account, their email, or a username that maps to their name.
+signature, issuer, audience and expiry, and that it is the user's. For a
+user linked to an account, it must be that account's: the same subject as
+the ID token they sign in to the console with, or, with
+`IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM`, the same immutable ID. A user not linked
+yet is matched as their first console sign-in would match them: by their
+email, or by a username that maps to their name.
+
+Some providers give access tokens a subject of their own: Okta's is the
+username, and Entra ID's differs between applications. Set
+`IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM` to the claim that holds the account's
+immutable ID in their access tokens, `uid` for Okta and `oid` for Entra ID.
+Igloo records it at each console sign-in, from the ID token's claim of that
+name (Entra ID's has `oid` with the default `profile` scope), or from its
+subject when it has none, as Okta's ID tokens carry the `uid` of its access
+tokens as their subject. Each user then signs in to the console once before
+their access tokens work. The claim must never pass to another person, so
+`email`, `preferred_username`, `upn` and the username claim are refused.
+Earlier versions accepted such tokens when their verified email was the
+linked account's; they no longer do, since a provider may give a deleted
+account's email to someone new.
 
 Because SCRAM never shows the server the secret, which checking such a
 token needs, Igloo asks these users' clients for the password in clear text

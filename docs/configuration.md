@@ -82,6 +82,7 @@ setting of its own.
 | `IGLOO_OIDC_PASSWORD_SIGNIN` | `true` | Let users linked to the provider also sign in with a password. `false` makes them use single sign-on in the console and access tokens in SQL clients. |
 | `IGLOO_OIDC_DISPLAY_NAME` | `SSO` | Label of the console's sign-in button: *Sign in with ...*. |
 | `IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE` | | When set, SQL clients of users without a password may send the provider's own access tokens for this audience, inside TLS ([details](sso.md#identity-provider-access-tokens)). |
+| `IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM` | | For providers whose access tokens have a subject other than the ID token's: the claim holding the account's immutable ID, `uid` for Okta or `oid` for Entra ID. Such a token is the linked user's when it matches the ID recorded at their last console sign-in. Needs `IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE`. |
 | `IGLOO_TOKEN_MAX_LIFETIME` | `365d` | Longest an access token may last (`CREATE TOKEN ... EXPIRES`). Tokens last 90 days by default. |
 
 ## Query history

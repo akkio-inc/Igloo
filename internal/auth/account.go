@@ -41,7 +41,11 @@ type Identity struct {
 	Email   string
 	// Groups are the identity provider's groups the user was in at their
 	// last sign-in.
-	Groups     []string
+	Groups []string
+	// AccountID is the account's immutable ID at the provider, from the
+	// claim IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM names, at the last sign-in;
+	// empty without it.
+	AccountID  string
 	CreatedAt  time.Time
 	LastSignIn time.Time
 }

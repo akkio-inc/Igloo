@@ -200,7 +200,7 @@ func testDirectory(t *testing.T, d directory) {
 	}
 
 	// Single sign-on identities.
-	link := Identity{Issuer: "https://idp", Subject: "s-ana", User: "ana", Email: "ana@example.com", Groups: []string{"g1"}}
+	link := Identity{Issuer: "https://idp", Subject: "s-ana", User: "ana", Email: "ana@example.com", Groups: []string{"g1"}, AccountID: "oid-1"}
 	if err := d.LinkIdentity(ctx, link); err != nil {
 		t.Fatal(err)
 	}
@@ -213,18 +213,19 @@ func testDirectory(t *testing.T, d directory) {
 	if err := d.LinkIdentity(ctx, Identity{Issuer: "https://idp", Subject: "s-ghost", User: "ghost"}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("linking nobody: %v", err)
 	}
-	if id, err := d.IdentityBySubject(ctx, "https://idp", "s-ana"); err != nil || id.User != "ana" || !slices.Equal(id.Groups, []string{"g1"}) {
+	if id, err := d.IdentityBySubject(ctx, "https://idp", "s-ana"); err != nil || id.User != "ana" || !slices.Equal(id.Groups, []string{"g1"}) ||
+		id.AccountID != "oid-1" {
 		t.Errorf("IdentityBySubject: %+v %v", id, err)
 	}
 	if _, err := d.IdentityBySubject(ctx, "https://other", "s-ana"); !errors.Is(err, ErrIdentityNotFound) {
 		t.Errorf("another issuer's subject: %v", err)
 	}
-	link.Groups, link.Email = []string{"g2", "g3"}, "ana@example.org"
+	link.Groups, link.Email, link.AccountID = []string{"g2", "g3"}, "ana@example.org", "oid-2"
 	if err := d.UpdateIdentity(ctx, link); err != nil {
 		t.Fatal(err)
 	}
 	if id, err := d.IdentityOf(ctx, "ana"); err != nil || id.Subject != "s-ana" || !slices.Equal(id.Groups, []string{"g2", "g3"}) ||
-		id.Email != "ana@example.org" {
+		id.Email != "ana@example.org" || id.AccountID != "oid-2" {
 		t.Errorf("IdentityOf: %+v %v", id, err)
 	}
 	if ids, err := d.Identities(ctx); err != nil || len(ids) != 1 {

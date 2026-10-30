@@ -554,6 +554,9 @@
         },
         "accessTokenAudience": {
           "type": "string"
+        },
+        "accessTokenIdClaim": {
+          "type": "string"
         }
       }
     },

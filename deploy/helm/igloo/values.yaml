@@ -291,6 +291,10 @@ sso:
   # Accept the provider's access tokens for this audience as SQL passwords,
   # inside TLS -> IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE. Empty: off.
   accessTokenAudience: ""
+  # Claim holding the account's immutable ID in access tokens whose subject
+  # is not the ID token's: uid for Okta, oid for Entra ID ->
+  # IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM.
+  accessTokenIdClaim: ""
 
 # Longest lifetime of an access token (CREATE TOKEN ... EXPIRES) ->
 # IGLOO_TOKEN_MAX_LIFETIME.

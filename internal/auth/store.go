@@ -263,6 +263,18 @@ var migrations = []string{
 				CHECK (privilege IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ERASE'));
 		END IF;
 	END $$`,
+	// The account ID that the provider's access tokens are matched by
+	// besides the subject (Identity.AccountID). Added once, so later starts
+	// take no lock on the table. Identities older replicas still running
+	// link have none, and match access tokens by subject alone until their
+	// next sign-in.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_auth' AND table_name = 'identities' AND column_name = 'account_id') THEN
+			ALTER TABLE igloo_auth.identities ADD COLUMN IF NOT EXISTS account_id text NOT NULL DEFAULT '';
+		END IF;
+	END $$`,
 }
 
 // userColumns are what Get and List read.

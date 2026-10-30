@@ -372,7 +372,8 @@ func (d *MemoryDirectory) UpdateIdentity(_ context.Context, id Identity) error {
 	defer d.mu.Unlock()
 	for k, i := range d.identities {
 		if i.Issuer == id.Issuer && i.Subject == id.Subject {
-			d.identities[k].Email, d.identities[k].Groups, d.identities[k].LastSignIn = id.Email, slices.Clone(id.Groups), time.Now()
+			d.identities[k].Email, d.identities[k].Groups, d.identities[k].AccountID = id.Email, slices.Clone(id.Groups), id.AccountID
+			d.identities[k].LastSignIn = time.Now()
 			return nil
 		}
 	}

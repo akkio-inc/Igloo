@@ -20,10 +20,12 @@ func (s *Service) AccessTokensEnabled() bool { return s.cfg.AccessTokenAudience 
 // password: a JWT signed with the provider's keys, from its issuer, for the
 // configured audience and unexpired, of an identity the allowed domains
 // and groups admit, that is user's. The identity is user's when it is the
-// one user signed in to the console with (or has that one's email); or,
-// for a user not linked yet, when it has the user's email, or the user has
-// no email and could be claimed by name (see claimable) and the identity's
-// username maps to their name. It implements pgwire.AccessTokenVerifier.
+// one user signed in to the console with: the same subject, or, with
+// IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM, the same account ID. A user not linked
+// yet is matched as a first console sign-in would be: by their email, or,
+// when they have no email and could be claimed by name (see claimable), by
+// a username that maps to their name. It implements
+// pgwire.AccessTokenVerifier.
 func (s *Service) VerifyAccessToken(ctx context.Context, user auth.User, token string) error {
 	if !s.AccessTokensEnabled() {
 		return errors.New("access tokens are not accepted")
@@ -52,12 +54,23 @@ func (s *Service) VerifyAccessToken(ctx context.Context, user auth.User, token s
 	link, err := s.sso.IdentityOf(ctx, user.Name)
 	switch {
 	case err == nil:
-		// Some providers give access tokens a subject of their own, so
-		// the identity's email counts too.
-		if link.Issuer == id.Issuer && link.Subject == id.Subject || id.Email != "" && link.Email == id.Email {
+		// Some providers give access tokens a subject of their own (Okta's
+		// is the username, Entra ID's differs between applications); an
+		// immutable ID claim stands in for it then. Never the email: a
+		// provider may give a deleted account's to someone else.
+		if link.Issuer == id.Issuer && (link.Subject == id.Subject || id.AccountID != "" && link.AccountID == id.AccountID) {
 			return nil
 		}
-		return fmt.Errorf("the access token is not %s's", user.Name)
+		switch {
+		case s.cfg.AccessTokenIDClaim == "":
+			return fmt.Errorf("the access token is not %s's: its subject is not the one %s signs in to the console with "+
+				"(for a provider whose access tokens have a subject of their own, set IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM)", user.Name, user.Name)
+		case link.AccountID == "":
+			return fmt.Errorf("the access token is not %s's: its subject is not the one %s signs in to the console with, "+
+				"and %s has not signed in to the console since IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM was set", user.Name, user.Name, user.Name)
+		}
+		return fmt.Errorf("the access token is not %s's: neither its subject nor its %s claim is %s's",
+			user.Name, s.cfg.AccessTokenIDClaim, user.Name)
 	case !errors.Is(err, auth.ErrIdentityNotFound):
 		return err
 	}

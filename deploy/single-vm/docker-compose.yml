@@ -71,6 +71,7 @@ services:
       IGLOO_OIDC_PASSWORD_SIGNIN: ${IGLOO_OIDC_PASSWORD_SIGNIN:-true}
       IGLOO_OIDC_DISPLAY_NAME: ${IGLOO_OIDC_DISPLAY_NAME:-SSO}
       IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE: ${IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE:-}
+      IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM: ${IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM:-}
       IGLOO_TOKEN_MAX_LIFETIME: ${IGLOO_TOKEN_MAX_LIFETIME:-365d}
       # The compute pool, and what this machine costs an hour, for the
       # cost estimates of igloo.usage (docs/workload-management.md).

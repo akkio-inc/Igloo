@@ -436,6 +436,7 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `sso.passwordSignIn` | `true` | `false`: users linked to the provider may not use passwords |
 | `sso.displayName` | `SSO` | Label of the sign-in button |
 | `sso.accessTokenAudience` | `""` | Accept the provider's access tokens for this audience as SQL passwords, inside TLS |
+| `sso.accessTokenIdClaim` | `""` | Claim holding the account's immutable ID in access tokens whose subject is not the ID token's: `uid` for Okta, `oid` for Entra ID |
 | `tokenMaxLifetime` | `365d` | Longest lifetime of an access token (`IGLOO_TOKEN_MAX_LIFETIME`) |
 | `iceberg.enabled` | `true` | [Iceberg REST catalog](../../../docs/external-engines.md) for other engines on the SQL Service; without TLS it serves clients on private networks only |
 | `iceberg.port` | `8181` | Iceberg REST port on the SQL Service |

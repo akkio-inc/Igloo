@@ -64,11 +64,11 @@ func (s *PostgresStore) updateUser(ctx context.Context, sql, name string, args .
 	return err
 }
 
-const identityColumns = `issuer, subject, user_name, email, groups, created_at, coalesce(last_sign_in, created_at)`
+const identityColumns = `issuer, subject, user_name, email, groups, account_id, created_at, coalesce(last_sign_in, created_at)`
 
 func scanIdentity(row pgx.Row) (Identity, error) {
 	var id Identity
-	err := row.Scan(&id.Issuer, &id.Subject, &id.User, &id.Email, &id.Groups, &id.CreatedAt, &id.LastSignIn)
+	err := row.Scan(&id.Issuer, &id.Subject, &id.User, &id.Email, &id.Groups, &id.AccountID, &id.CreatedAt, &id.LastSignIn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Identity{}, ErrIdentityNotFound
 	}
@@ -97,8 +97,8 @@ func (s *PostgresStore) LinkIdentity(ctx context.Context, id Identity) error {
 	if id.Groups == nil {
 		id.Groups = []string{}
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_auth.identities (issuer, subject, user_name, email, groups, last_sign_in)
-		VALUES ($1, $2, $3, $4, $5, now())`, id.Issuer, id.Subject, id.User, id.Email, id.Groups)
+	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_auth.identities (issuer, subject, user_name, email, groups, account_id, last_sign_in)
+		VALUES ($1, $2, $3, $4, $5, $6, now())`, id.Issuer, id.Subject, id.User, id.Email, id.Groups, id.AccountID)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
@@ -115,8 +115,8 @@ func (s *PostgresStore) UpdateIdentity(ctx context.Context, id Identity) error {
 	if id.Groups == nil {
 		id.Groups = []string{}
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE igloo_auth.identities SET email = $3, groups = $4, last_sign_in = now()
-		WHERE issuer = $1 AND subject = $2`, id.Issuer, id.Subject, id.Email, id.Groups)
+	tag, err := s.pool.Exec(ctx, `UPDATE igloo_auth.identities SET email = $3, groups = $4, account_id = $5, last_sign_in = now()
+		WHERE issuer = $1 AND subject = $2`, id.Issuer, id.Subject, id.Email, id.Groups, id.AccountID)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrIdentityNotFound
 	}

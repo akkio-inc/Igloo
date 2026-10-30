@@ -30,7 +30,7 @@ func TestOIDCDefaults(t *testing.T) {
 	o := cfg.OIDC
 	if !o.Enabled() || o.ClientSecret != "s3cret" || !slices.Equal(o.Scopes, []string{"openid", "profile", "email"}) ||
 		o.UsernameClaim != "email" || o.GroupsClaim != "groups" || !o.CreateUsers || !o.PasswordSignIn ||
-		o.DisplayName != "SSO" || o.RedirectURL != "" || o.AccessTokenAudience != "" {
+		o.DisplayName != "SSO" || o.RedirectURL != "" || o.AccessTokenAudience != "" || o.AccessTokenIDClaim != "" {
 		t.Errorf("OIDC defaults: %+v", o)
 	}
 }
@@ -56,6 +56,7 @@ func TestOIDC(t *testing.T) {
 		"IGLOO_OIDC_PASSWORD_SIGNIN":       "false",
 		"IGLOO_OIDC_DISPLAY_NAME":          "Entra ID",
 		"IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE": "api://igloo",
+		"IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM": "oid",
 		"IGLOO_TOKEN_MAX_LIFETIME":         "30d",
 	}))
 	if err != nil {
@@ -66,7 +67,7 @@ func TestOIDC(t *testing.T) {
 		!slices.Equal(o.AllowedDomains, []string{"agency.com", "brand.example"}) ||
 		!slices.Equal(o.AllowedGroups, []string{"Igloo Users", "Data Team"}) || o.CreateUsers || o.PasswordSignIn ||
 		o.UsernameClaim != "preferred_username" || o.GroupsClaim != "roles" || o.DisplayName != "Entra ID" ||
-		o.AccessTokenAudience != "api://igloo" || cfg.TokenMaxLifetime != 30*24*time.Hour {
+		o.AccessTokenAudience != "api://igloo" || o.AccessTokenIDClaim != "oid" || cfg.TokenMaxLifetime != 30*24*time.Hour {
 		t.Errorf("got %+v, token lifetime %s", o, cfg.TokenMaxLifetime)
 	}
 
@@ -89,6 +90,7 @@ func TestOIDC(t *testing.T) {
 		{"IGLOO_OIDC_CREATE_USERS", "sometimes", "IGLOO_OIDC_CREATE_USERS"},
 		{"IGLOO_OIDC_USERNAME_CLAIM", "my claim", "claim"},
 		{"IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE", "igloo", "must differ"},
+		{"IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM", "oid", "IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE is not"},
 		{"IGLOO_TOKEN_MAX_LIFETIME", "1m", "IGLOO_TOKEN_MAX_LIFETIME"},
 		{"IGLOO_TOKEN_MAX_LIFETIME", "forever", "IGLOO_TOKEN_MAX_LIFETIME"},
 	} {
@@ -109,6 +111,18 @@ func TestOIDC(t *testing.T) {
 	}
 	if _, err := Load(env(both)); err == nil || !strings.Contains(err.Error(), "not both") {
 		t.Errorf("both secrets: %v", err)
+	}
+	// An access token's account is never matched by what another person
+	// may get.
+	for _, claim := range []string{"email", "Preferred_Username", "upn", "sub_email"} {
+		vars := map[string]string{"IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE": "api://igloo", "IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM": claim,
+			"IGLOO_OIDC_USERNAME_CLAIM": "sub_email"}
+		for k, v := range base {
+			vars[k] = v
+		}
+		if _, err := Load(env(vars)); err == nil || !strings.Contains(err.Error(), "immutable ID") {
+			t.Errorf("IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM=%s: %v", claim, err)
+		}
 	}
 	// Every Google account shares Google's issuer.
 	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password",
