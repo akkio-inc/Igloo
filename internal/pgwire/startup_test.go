@@ -139,8 +139,9 @@ func TestSilentConnectionsAreLimited(t *testing.T) {
 		o.MaxConnections = 4
 		o.LoginTimeout = testLoginTimeout
 	})
+	// From loopback, they count only toward the limit of all.
 	var silent []net.Conn
-	for range minStarting / 2 {
+	for range minStarting {
 		c, err := net.Dial("tcp", ts.addr)
 		if err != nil {
 			t.Fatal(err)
@@ -167,6 +168,41 @@ func TestSilentConnectionsAreLimited(t *testing.T) {
 	}
 	conn := connect(t, ts.url("igloo", adminPassword), pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SELECT 1")
+}
+
+// addrConn is a connection from addr, for the limits alone.
+type addrConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr        { return c.addr }
+func (c addrConn) SetDeadline(time.Time) error { return nil }
+
+// Connections from one public address may hold half of the sign-in slots.
+// Those from a loopback or private address, which the scale-to-zero
+// gateway, a pooler or a Kubernetes Service gives every client it passes
+// on, may hold them all.
+func TestSignInSlotsPerAddress(t *testing.T) {
+	t.Parallel()
+	for addr, want := range map[string]int{
+		"203.0.113.7": minStarting / 2,
+		"10.0.0.5":    minStarting,
+		"127.0.0.1":   minStarting,
+		"100.64.1.2":  minStarting,
+	} {
+		l := newStartupLimits(time.Minute, 4, nil)
+		admitted := 0
+		for range minStarting + 1 {
+			c := l.admit(addrConn{addr: &net.TCPAddr{IP: net.ParseIP(addr), Port: 50000}})
+			if !c.(*startupConn).refused {
+				admitted++
+			}
+		}
+		if admitted != want {
+			t.Errorf("from %s: %d signing in at once, want %d", addr, admitted, want)
+		}
+	}
 }
 
 // A connection's read buffer is small; a message larger than it is read

@@ -764,7 +764,8 @@ whose replicas share them and stop them once idle; each pool has its own.
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
   SQLSTATE `53300`. Connections that have not signed in yet are limited too:
   as many may be signing in at once (at least 100), half of them from one
-  client address, and each has `IGLOO_LOGIN_TIMEOUT` (30 seconds) to sign in
+  public client address (not from a loopback or private one, which a
+  gateway, pooler or load balancer gives all its clients), and each has `IGLOO_LOGIN_TIMEOUT` (30 seconds) to sign in
   before it is closed.
 
 ## TLS

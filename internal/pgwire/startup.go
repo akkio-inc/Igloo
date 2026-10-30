@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -19,8 +20,11 @@ import (
 // holds no login of the failed-login limits (see ratelimit.go) for longer.
 // And only so many connections may be signing in at once: as many as
 // sessions (MaxConnections), but at least minStarting, and half of those
-// from one client address, so that connections that send nothing cannot
-// keep everyone else from signing in. Further ones are refused at once, as
+// from one public client address, so that connections that send nothing
+// cannot keep everyone else from signing in. A loopback or private address
+// is the scale-to-zero gateway's, a pooler's or a Kubernetes Service's as
+// often as a client's, and all the clients behind it share it, so it
+// counts only toward the limit of all. Further ones are refused at once, as
 // PostgreSQL refuses clients past max_connections. Without these,
 // connections that never signed in stayed open for good, outside
 // MaxConnections.
@@ -78,8 +82,9 @@ func (ln startupListener) Accept() (net.Conn, error) {
 // Accept goes on.
 func (l *startupLimits) admit(c net.Conn) net.Conn {
 	key := addrKey(c.RemoteAddr())
+	perAddr := !sharedAddr(key)
 	l.mu.Lock()
-	if l.max > 0 && (l.open >= l.max || l.byAddr[key] >= l.perAddr) {
+	if l.max > 0 && (l.open >= l.max || perAddr && l.byAddr[key] >= l.perAddr) {
 		l.mu.Unlock()
 		return &startupConn{Conn: c, refused: true, limits: l}
 	}
@@ -88,6 +93,22 @@ func (l *startupLimits) admit(c net.Conn) net.Conn {
 	l.mu.Unlock()
 	_ = c.SetDeadline(time.Now().Add(l.timeout))
 	return &startupConn{Conn: c, limits: l, key: key, counted: true}
+}
+
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), which some Kubernetes
+// networks give pods.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// sharedAddr reports whether key, a client address as addrKey gives it,
+// may be many clients' at once: on this machine or a private network, or
+// not a network address at all.
+func sharedAddr(key string) bool {
+	ip, err := netip.ParseAddr(key)
+	if err != nil {
+		return true
+	}
+	ip = ip.Unmap()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || sharedAddressSpace.Contains(ip)
 }
 
 // warn logs msg, at most once a minute: connections that never sign in
