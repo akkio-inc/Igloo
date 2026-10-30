@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"github.com/akkio-inc/igloo/internal/audit"
@@ -628,6 +629,19 @@ func TestUnencryptedOnlyAtLocalhost(t *testing.T) {
 	cl := ts.client(t, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithAuthority("igloo.example.com:31337"))
 	_, err := cl.Client.AuthenticateBasicToken(context.Background(), "rita", "rita-password")
 	wantCode(t, "remote handshake without TLS", err, codes.PermissionDenied, "only at localhost")
+
+	// A client that names localhost must also be on this machine or a
+	// private network, as behind Docker's published ports: :authority
+	// alone, which a client sets as it likes, used to let anyone in.
+	from := func(ip string) context.Context {
+		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(":authority", "localhost:31337"))
+		return peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP(ip), Port: 50123}})
+	}
+	if _, err := (&Server{}).authorize(from("172.18.0.1"), handshakeMethod); err != nil {
+		t.Errorf("a handshake through Docker's published port: %v", err)
+	}
+	_, err = (&Server{}).authorize(from("198.51.100.23"), handshakeMethod)
+	wantCode(t, "a handshake from across the internet naming localhost", err, codes.PermissionDenied, "only at localhost")
 
 	for _, host := range []string{"localhost:31337", "127.0.0.1", "[::1]:1", "x.localhost"} {
 		if !loopback(host) {

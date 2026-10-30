@@ -460,30 +460,35 @@ reference for every setting mentioned here.
   with the same failed-login delay, limits and logging as SQL logins, or
   with single sign-on. The browser sends the password inside HTTPS; without
   TLS the console accepts sign-ins, single sign-on included, only from a
-  browser at `localhost`. Every statement runs as the signed-in user through
-  the same authorization as SQL clients, and admin pages are refused to
-  non-admins on the server. Sessions are encrypted, signed, `HttpOnly`,
-  `SameSite=Strict` cookies (`Secure` under TLS) that expire after 12 hours
-  or an hour idle and end when the user is dropped or disabled or their
-  password changes. Changes need a CSRF token; pages have a strict
-  Content-Security-Policy and cannot be framed. Set `IGLOO_CONSOLE_ADDR=` to
-  turn the console off.
+  browser at `localhost`: a request addressed to `localhost` from this
+  machine or a private network, which guards against plaintext across a
+  network by mistake but is not an access control, so the single-machine
+  setup binds the port to loopback. Every statement runs as the signed-in
+  user through the same authorization as SQL clients, and admin pages are
+  refused to non-admins on the server. Sessions are encrypted, signed,
+  `HttpOnly`, `SameSite=Strict` cookies (`Secure` under TLS) that expire
+  after 12 hours or an hour idle and end when the user is dropped or
+  disabled or their password changes. Changes need a CSRF token; pages have
+  a strict Content-Security-Policy and cannot be framed. Set
+  `IGLOO_CONSOLE_ADDR=` to turn the console off.
 - **Arrow Flight SQL.** Port 31337 serves [Arrow Flight SQL](docs/flight-sql.md)
   (gRPC). Clients sign in with a handshake carrying their Igloo password in
   HTTP basic authentication, checked against the same SCRAM verifier with
   the same failed-login delay, logging and login history as SQL logins.
   Basic authentication sends the password itself, so with TLS configured the
   port serves TLS only, and without TLS it serves only clients that connect
-  to it as `localhost` (on the same machine, or through an SSH tunnel or
-  `kubectl port-forward`); others are refused before their password is
-  checked. The handshake returns a random bearer token that is valid only on
-  the connection it was issued on and ends with it. Every statement and
-  metadata call runs as the user through the same authorization, sandbox,
-  statement timeout and query history as SQL clients. Set
-  `IGLOO_FLIGHT_ADDR=` to turn it off.
+  to it as `localhost` (on the same machine, or through Docker's published
+  ports, an SSH tunnel or `kubectl port-forward`), from this machine or a
+  private network, as the console requires; others are refused before
+  their password is checked. The handshake returns a random bearer token
+  that is valid only on the connection it was issued on and ends with it.
+  Every statement and metadata call runs as the user through the same
+  authorization, sandbox, statement timeout and query history as SQL
+  clients. Set `IGLOO_FLIGHT_ADDR=` to turn it off.
 - **Delta Sharing.** Port 8444 serves [Delta Sharing](docs/sharing.md) to
   outside recipients: over HTTPS, or without TLS only to requests addressed
-  to `localhost`. Only admins create shares, recipients and providers.
+  to `localhost` from this machine or a private network, as the console
+  requires. Only admins create shares, recipients and providers.
   Recipients authenticate with 256-bit bearer tokens that Igloo stores as
   SHA-256 hashes and checks in constant time; tokens expire, can be rotated,
   and are delivered through one-time activation links that only a button

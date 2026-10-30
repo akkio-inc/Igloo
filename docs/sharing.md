@@ -66,7 +66,11 @@ Recipients reach Igloo's sharing endpoint on port 8444
 (`IGLOO_SHARING_ADDR`), at the path `/delta-sharing`. Bearer tokens and data
 cross that connection, so it needs TLS: with `IGLOO_TLS_CERT_FILE` and
 `IGLOO_TLS_KEY_FILE` set it serves HTTPS with the same certificate as SQL
-clients, and without them it answers only requests addressed to `localhost`.
+clients, and without them it answers only requests addressed to `localhost`
+from this machine or a private network, as through Docker's published
+ports. That guards against sending tokens and data across a network
+unencrypted by mistake, but is not an access control: keep an endpoint
+without TLS bound to loopback.
 
 Set `IGLOO_SHARING_URL` to the address recipients use, such as
 `https://data.example.com:8444`; activation links and profile files name it.

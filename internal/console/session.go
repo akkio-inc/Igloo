@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -301,9 +302,15 @@ func sameOrigin(r *http.Request) bool {
 
 // signInAllowed refuses sign-ins that would send a password unencrypted
 // across a network: without TLS, only a browser on the same machine (or
-// through an SSH tunnel or kubectl port-forward) may sign in.
+// through an SSH tunnel or kubectl port-forward) may sign in. That is a
+// request addressed to localhost, by its Host header, which catches a
+// browser sent to the console across a network by mistake, and, since a
+// client may send any Host, one from this machine or a private network
+// (see privatePeer). It guards against that mistake; it is not an access
+// control, as a client on a private network that reaches the port can
+// address it as localhost.
 func (c *Console) signInAllowed(r *http.Request) error {
-	if r.TLS != nil || loopback(r.Host) {
+	if r.TLS != nil || loopback(r.Host) && privatePeer(r.RemoteAddr) {
 		return nil
 	}
 	return errors.New("this connection is not encrypted, so the console accepts sign-ins only at localhost; " +
@@ -321,6 +328,24 @@ func loopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), which some Kubernetes
+// networks give pods.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// privatePeer reports whether addr, a client's address as its connection
+// reports it, is on this machine or a private network, as the Iceberg REST
+// catalog requires of clients without TLS. It cannot be this machine
+// alone: Docker's published ports, which the single-machine setup binds to
+// loopback, present a client on the host as the bridge network's gateway.
+func privatePeer(addr string) bool {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := ap.Addr().Unmap()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || sharedAddressSpace.Contains(ip)
 }
 
 type loginRequest struct {

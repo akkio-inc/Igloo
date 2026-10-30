@@ -176,8 +176,13 @@ does not keep a [scale-to-zero](scale-to-zero.md) deployment awake.
   Unlike SQL clients, which use SCRAM, a browser sends the password itself,
   inside the HTTPS connection. Without TLS the console accepts sign-ins only
   from a browser that reached it as `localhost` (on the same machine, or
-  through an SSH tunnel or `kubectl port-forward`), so a password never
-  crosses a network unencrypted. Behind a load balancer or ingress that ends
+  through Docker's published ports, an SSH tunnel or `kubectl port-forward`),
+  so a password does not cross a network unencrypted by mistake: the
+  request must name `localhost` in its `Host` header and come from this
+  machine or a private network. That is a guard, not an access control: a
+  client on a private network that can reach the port can address it as
+  `localhost`, so keep a console without TLS bound to loopback, as the
+  single-machine setup does. Behind a load balancer or ingress that ends
   TLS, configure TLS on Igloo too, so the hop to Igloo is encrypted, and
   keep the request's `Host` header, which the console compares with the
   browser's `Origin`.

@@ -889,6 +889,30 @@ func TestLoopback(t *testing.T) {
 	}
 }
 
+// Without TLS, a sign-in (and SCIM, which uses the same rule) must be
+// addressed to localhost and come from this machine or a private network,
+// as through Docker's published ports: the Host header alone, which a
+// client may set to anything, used to let a request in from anywhere.
+func TestSignInWithoutTLSOnlyFromNearby(t *testing.T) {
+	c := &Console{}
+	for _, tc := range []struct {
+		host, peer string
+		want       bool
+	}{
+		{"localhost:8443", "127.0.0.1:50123", true},
+		{"localhost:8443", "[::1]:50123", true},
+		{"127.0.0.1:8443", "172.18.0.1:50123", true},
+		{"localhost:8443", "198.51.100.23:50123", false},
+		{"igloo.example.com:8443", "127.0.0.1:50123", false},
+	} {
+		r := httptest.NewRequest("POST", "/api/login", nil)
+		r.Host, r.RemoteAddr = tc.host, tc.peer
+		if got := c.signInAllowed(r) == nil; got != tc.want {
+			t.Errorf("Host %s from %s: allowed is %v", tc.host, tc.peer, got)
+		}
+	}
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
