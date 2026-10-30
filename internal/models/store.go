@@ -14,7 +14,8 @@ import (
 type Model struct {
 	Schema, Name string
 	Class        string
-	// Owner is the user who created it.
+	// Owner is the user who created it, or "name (dropped)" once that
+	// user was dropped (see Store.DisownModels).
 	Owner   string
 	Comment string
 	// TrainingSQL is the CREATE statement as written.
@@ -121,6 +122,13 @@ type Store interface {
 	// already given changes nothing. The model must exist.
 	AddGrant(ctx context.Context, g Grant) error
 	RevokeGrant(ctx context.Context, g Grant) error
+	// ForgetGrantee removes the grants to a user or role ("user" or
+	// "role") that was dropped.
+	ForgetGrantee(ctx context.Context, granteeType, grantee string) error
+	// DisownModels gives the models of owner, a user who was dropped, to
+	// tombstone, a name no user can have, so that a user created later
+	// with the same name does not own them.
+	DisownModels(ctx context.Context, owner, tombstone string) error
 	Close()
 }
 
@@ -253,6 +261,25 @@ func (s *MemoryStore) RevokeGrant(_ context.Context, g Grant) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.grants = slices.DeleteFunc(s.grants, func(o Grant) bool { return sameGrant(o, g) })
+	return nil
+}
+
+func (s *MemoryStore) ForgetGrantee(_ context.Context, granteeType, grantee string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.grants = slices.DeleteFunc(s.grants, func(g Grant) bool { return g.GranteeType == granteeType && g.Grantee == grantee })
+	return nil
+}
+
+func (s *MemoryStore) DisownModels(_ context.Context, owner, tombstone string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, m := range s.models {
+		if m.Owner == owner {
+			m.Owner = tombstone
+			s.models[k] = m
+		}
+	}
 	return nil
 }
 

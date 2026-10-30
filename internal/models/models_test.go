@@ -104,6 +104,55 @@ func TestStore(t *testing.T) {
 	})
 }
 
+// TestStoreDroppedGrantees: a dropped user's models are given to a name no
+// user can have, and the grants to a dropped user or role go, leaving those
+// to others of the same name.
+func TestStoreDroppedGrantees(t *testing.T) {
+	stores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		for _, m := range []Model{{Schema: "demo", Name: "anas", Owner: "ana"}, {Schema: "demo", Name: "bobs", Owner: "bob"}} {
+			m.Class, m.TrainingSQL, m.Blob = ClassClassification, "CREATE ...", strings.Repeat("a", 64)
+			if _, err := s.Put(ctx, m, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, g := range []Grant{
+			{Grantee: "ana", GranteeType: "user", Privilege: PrivilegeUsage},
+			{Grantee: "ana", GranteeType: "role", Privilege: PrivilegeUsage},
+			{Grantee: "analysts", GranteeType: "role", Privilege: PrivilegePredict},
+			{Grantee: "analysts", GranteeType: "user", Privilege: PrivilegePredict},
+		} {
+			g.Schema, g.Name = "demo", "bobs"
+			if err := s.AddGrant(ctx, g); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.DisownModels(ctx, "ana", "ana (dropped)"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ForgetGrantee(ctx, "user", "ana"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ForgetGrantee(ctx, "role", "analysts"); err != nil {
+			t.Fatal(err)
+		}
+		if m, _ := s.Get(ctx, "demo", "anas"); m.Owner != "ana (dropped)" {
+			t.Errorf("a dropped user's model is %q's", m.Owner)
+		}
+		if m, _ := s.Get(ctx, "demo", "bobs"); m.Owner != "bob" {
+			t.Errorf("another's model is %q's", m.Owner)
+		}
+		gs, err := s.Grants(ctx)
+		var left []string
+		for _, g := range gs {
+			left = append(left, g.GranteeType+" "+g.Grantee)
+		}
+		if err != nil || strings.Join(left, ", ") != "role ana, user analysts" {
+			t.Errorf("grants left: %q, %v", left, err)
+		}
+	})
+}
+
 // TestStoreErasureEpoch: a model keeps the tables its training read, and
 // the epoch it began in; one whose training began before an erasure
 // request moved the epoch on is not stored; and a model trained again

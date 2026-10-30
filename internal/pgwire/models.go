@@ -759,6 +759,19 @@ func (s *Server) readRows(ctx context.Context, sess *session, user auth.User, qu
 	return t, nil
 }
 
+// disownModels marks the models of a dropped user as a dropped user's,
+// "name (dropped)", as disownJobs does their jobs: a user created later
+// with the same name does not own them. Admins may use, grant and drop
+// them, or CREATE OR REPLACE them as their own; an erasure request cannot
+// train them again.
+func (s *Server) disownModels(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.models.DisownModels(ctx, name, name+" (dropped)"); err != nil {
+		s.log.Warn("could not disown a dropped user's models", "user", name, "err", err)
+	}
+}
+
 func (s *Server) dropModel(ctx context.Context, sess *session, user auth.User, st *snowflake.ModelStatement, w wire.DataWriter) error {
 	tag := "DROP " + models.QualifiedClass(st.Class)
 	m, err := s.findModel(ctx, sess, user, st.Name, st.Class)

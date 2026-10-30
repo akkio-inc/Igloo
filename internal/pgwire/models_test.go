@@ -427,6 +427,66 @@ func TestModelGrants(t *testing.T) {
 	mustExec(t, ana, "DROP SNOWFLAKE.ML.CLASSIFICATION anas")
 }
 
+// TestDroppedModelOwners: dropping a user disowns their models, and
+// dropping a user or role takes back the models granted to them, so that a
+// user or role created later with the same name, as signing in with SSO
+// may create, gets neither.
+func TestDroppedModelOwners(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models = store })
+	mustExec(t, cs.admin, leadsTable)
+	create := `CREATE OR REPLACE SNOWFLAKE.ML.CLASSIFICATION anas(INPUT_DATA => TABLE(lake.public.leads), TARGET_COLNAME => 'converted')`
+	ana := snowflakeConn(t, cs.user(t, "ana", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol))
+	bob := cs.user(t, "bob", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, cs.admin, "CREATE ROLE analysts")
+	mustExec(t, ana, create)
+	mustExec(t, ana, "GRANT USAGE ON SNOWFLAKE.ML.CLASSIFICATION anas TO USER bob")
+	mustExec(t, ana, "GRANT SNOWFLAKE.ML.CLASSIFICATION ROLE anas!MLCONSUMER TO ROLE analysts")
+	_, _ = ana.Close(ctx), bob.Close(ctx)
+	mustExec(t, cs.admin, "DROP USER ana")
+	mustExec(t, cs.admin, "DROP USER bob")
+	mustExec(t, cs.admin, "DROP ROLE analysts")
+	m, err := store.Get(ctx, "public", "anas")
+	if err != nil || m.Owner != "ana (dropped)" {
+		t.Errorf("after its owner was dropped: %+v, %v", m, err)
+	}
+	if gs, _ := store.Grants(ctx); len(gs) != 0 {
+		t.Errorf("grants to a dropped user and role are kept: %+v", gs)
+	}
+
+	// The same names again.
+	ana = snowflakeConn(t, cs.user(t, "ana", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol))
+	bob = snowflakeConn(t, cs.user(t, "bob", auth.RoleReader, pgx.QueryExecModeSimpleProtocol))
+	carl := snowflakeConn(t, cs.user(t, "carl", auth.RoleReader, pgx.QueryExecModeSimpleProtocol))
+	mustExec(t, cs.admin, "CREATE ROLE analysts")
+	mustExec(t, cs.admin, "GRANT analysts TO carl")
+	predict := "SELECT count(*) FROM leads WHERE anas!PREDICT(INPUT_DATA => {*}):class = 'True'"
+	for name, conn := range map[string]*pgx.Conn{"ana": ana, "bob": bob, "carl": carl} {
+		expectCode(t, conn, predict, "42704", "does not exist or not authorized")
+		if got := texts(t, conn, "SHOW SNOWFLAKE.ML.CLASSIFICATION"); len(got) != 0 {
+			t.Errorf("the new %s sees %q", name, got)
+		}
+	}
+	expectCode(t, ana, "DROP SNOWFLAKE.ML.CLASSIFICATION anas", "42704", "does not exist")
+	expectDenied(t, ana, create, "does not own")
+	// An erasure request does not train it again as the new ana.
+	if err := cs.srv.retrainModel(ctx, m); err == nil || !strings.Contains(err.Error(), "ana (dropped)") {
+		t.Errorf("trained again for an erasure request: %v", err)
+	}
+
+	// Admins may still use it, and replace it as their own.
+	admin := snowflakeConn(t, cs.admin)
+	if got := texts(t, admin, "SHOW SNOWFLAKE.ML.CLASSIFICATION"); len(got) != 1 || !strings.HasSuffix(got[0], "|ana (dropped)") {
+		t.Errorf("SHOW: %q", got)
+	}
+	mustExec(t, admin, create)
+	if m, _ := store.Get(ctx, "public", "anas"); m.Owner != "igloo" {
+		t.Errorf("replaced by an admin, its owner is %q", m.Owner)
+	}
+}
+
 // localBlobs keeps model blobs in a local directory, the tests' warehouse.
 func localBlobs(dir string) models.Blobs {
 	return models.NewWarehouse(dir, func(context.Context) (icebergio.IO, error) { return icebergio.LocalFS{}, nil })

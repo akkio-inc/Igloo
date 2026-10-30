@@ -107,6 +107,17 @@ through their own grants and policies, as in any query. Snowflake's
 `GRANT CREATE SNOWFLAKE.ML.<class> ON SCHEMA` is refused: grant `CREATE`
 on the schema.
 
+When a user is dropped, their models are marked as a dropped user's:
+`SHOW` gives their owner as `ana (dropped)`, as for their
+[alerts](alerts.md#alerts) and tasks. A user created later with the same
+name, by an admin or by signing in with
+[single sign-on](sso.md#who-is-who), does not own them; admins may use,
+grant and drop them, or `CREATE OR REPLACE` them as their own, and an
+erasure request cannot train them again until one does. Dropping a user
+or a role also takes back the models granted to it, so that a user or
+role created later with the same name does not get them. Grants to
+others stay.
+
 ## FORECAST
 
 ```sql

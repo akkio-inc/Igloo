@@ -237,4 +237,14 @@ func (s *PostgresStore) RevokeGrant(ctx context.Context, g Grant) error {
 	return err
 }
 
+func (s *PostgresStore) ForgetGrantee(ctx context.Context, granteeType, grantee string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM igloo_ml.grants WHERE grantee_type = $1 AND grantee = $2`, granteeType, grantee)
+	return err
+}
+
+func (s *PostgresStore) DisownModels(ctx context.Context, owner, tombstone string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE igloo_ml.models SET owner = $2 WHERE owner = $1`, owner, tombstone)
+	return err
+}
+
 func (s *PostgresStore) Close() { s.pool.Close() }
