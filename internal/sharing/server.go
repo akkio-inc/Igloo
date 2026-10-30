@@ -69,7 +69,7 @@ type ServerOptions struct {
 	Tables TableSource
 	// Protection names the policies of a catalog table. Tables with
 	// policies are never served; until a Protection is set (here or with
-	// SetProtection), no table is.
+	// SetProtection), and while it fails, no table is.
 	Protection Protection
 }
 

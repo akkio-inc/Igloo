@@ -2,6 +2,7 @@ package sharing
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"strings"
@@ -87,6 +88,45 @@ func TestProtectedTables(t *testing.T) {
 	f.expect("GET", "/shares/clients/all-tables", tok, "", 200, `"name":"campaigns"`)
 }
 
+// TestStalePoliciesServeNoTable makes the policies impossible to check, as
+// they are on a replica that could not read them for longer than
+// IGLOO_ACCESS_MAX_STALENESS: a policy attached on another replica
+// meanwhile would not be known, so no table is served or shared, files
+// listed before included, until they can be checked again.
+func TestStalePoliciesServeNoTable(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	tok := f.token
+	_, _, body := f.call("POST", "/shares/clients/schemas/public/tables/campaigns/query", tok, "{}")
+	fileURL := ndjson(t, body)[2]["file"].(map[string]any)["url"].(string)
+
+	stale := errors.New("cannot check this statement: the policies could not be read from the metadata database for 2m0s")
+	f.server.SetProtection(func(context.Context, string, string) ([]string, error) { return nil, stale })
+	for _, req := range [][3]string{
+		{"GET", "/shares/clients/schemas/public/tables/campaigns/version", tok},
+		{"GET", "/shares/clients/schemas/public/tables/campaigns/metadata", tok},
+		{"POST", "/shares/clients/schemas/public/tables/campaigns/query", tok},
+		{"GET", fileURL, ""},
+	} {
+		status, _, got := f.call(req[0], req[1], req[2], "{}")
+		if status != 503 || !strings.Contains(got, `"errorCode":"TEMPORARILY_UNAVAILABLE"`) || !strings.Contains(got, "cannot check the table's policies") {
+			t.Errorf("%s %s: %d %s, want 503", req[0], req[1], status, got)
+		}
+		if strings.Contains(got, "metadata database") {
+			t.Errorf("%s %s: the recipient is told the provider's trouble: %s", req[0], req[1], got)
+		}
+	}
+	svc := &Service{store: f.store, source: f.src, server: f.server, log: slog.New(slog.DiscardHandler)}
+	add := SharedTable{Share: "internal", Schema: "copies", Name: "campaigns", SourceSchema: "public", SourceTable: "campaigns", AddedBy: "igloo"}
+	if err := svc.AddTable(ctx, add); !errors.Is(err, stale) {
+		t.Errorf("sharing while policies are stale: %v", err)
+	}
+
+	f.server.SetProtection(func(context.Context, string, string) ([]string, error) { return nil, nil })
+	f.expect("POST", "/shares/clients/schemas/public/tables/campaigns/query", tok, "{}", 200, `"file"`)
+	f.expect("GET", fileURL, "", "", 200, "PAR1")
+}
+
 // TestAddProtectedTable refuses to share a table with policies.
 func TestAddProtectedTable(t *testing.T) {
 	f := newFixture(t)
@@ -109,7 +149,7 @@ func TestAddProtectedTable(t *testing.T) {
 		t.Errorf("sharing while policies cannot be checked: %v", err)
 	}
 
-	f.server.SetProtection(func(context.Context, string, string) []string { return nil })
+	f.server.SetProtection(func(context.Context, string, string) ([]string, error) { return nil, nil })
 	if err := svc.AddTable(ctx, add); err != nil {
 		t.Errorf("sharing a table without policies: %v", err)
 	}

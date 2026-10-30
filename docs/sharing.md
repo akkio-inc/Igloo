@@ -151,6 +151,12 @@ shared:
   is protected by the provider's policies; they are not told which. The
   share still lists the table, and its other tables are served as before.
   Removing the policy serves the table again.
+- A replica that cannot read the policies from the metadata database goes
+  on with those it read last for up to `IGLOO_ACCESS_MAX_STALENESS` (2
+  minutes), as SQL statements do; after that a policy attached on another
+  replica meanwhile would not be known, so it serves no table, files
+  listed before included, until it can read them again. Recipients get
+  `503 TEMPORARILY_UNAVAILABLE`, and the log says why.
 - The query history records each refused request as the recipient's, with
   `outcome` `denied`, `sqlstate` `42501` and the policies in `policies`:
 
@@ -338,7 +344,8 @@ How it works, and its limits:
 - **Policies.** Tables with masking or row access policies are never
   shared or served, and downloads of their files listed before a policy was
   attached are refused ([above](#tables-with-masking-or-row-access-policies)).
-  The endpoint serves no table until Igloo has loaded the policies.
+  The endpoint serves no table until Igloo has loaded the policies, nor
+  while it has not been able to read them for `IGLOO_ACCESS_MAX_STALENESS`.
 - **Tokens apart.** Recipients' tokens (`dst_...`) and activation codes
   (`dsa_...`) are kept apart from Igloo's access tokens (`igloo_...`): they
   have different forms and are stored and checked separately. A

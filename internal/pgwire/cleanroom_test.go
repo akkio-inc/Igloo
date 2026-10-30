@@ -324,8 +324,8 @@ func TestCleanRoomsKeepRawDataToItsParty(t *testing.T) {
 
 	// Other engines (the Iceberg REST catalog) and Delta Sharing ask the
 	// same rules.
-	if got := rs.srv.ProtectedBy(ctx, "marts", "crm"); !slices.Equal(got, []string{"clean room tv"}) {
-		t.Errorf("ProtectedBy: %v", got)
+	if got, err := rs.srv.ProtectedBy(ctx, "marts", "crm"); err != nil || !slices.Equal(got, []string{"clean room tv"}) {
+		t.Errorf("ProtectedBy: %v, %v", got, err)
 	}
 	for name, want := range map[string]bool{"rita": true, "ana": false, "nora": false} {
 		u, _ := rs.store.Get(ctx, name)

@@ -167,3 +167,31 @@ func TestStaleGrantsFailClosed(t *testing.T) {
 		}
 	}
 }
+
+// Delta Sharing's check of a table's policies fails the same way: a
+// replica that could not read them used to go on serving shared tables
+// that a policy attached on another replica meanwhile protects.
+func TestStalePoliciesStopSharing(t *testing.T) {
+	t.Parallel()
+	policies := &flakyPolicies{Store: policy.NewMemoryStore()}
+	ts := startServer(t, func(o *Options) {
+		o.Policies = policies
+		o.RoleRefresh = staleRefresh
+		o.AccessMaxStaleness = staleMax
+	})
+	ctx := context.Background()
+	policies.down.Store(true)
+	time.Sleep(2 * staleRefresh)
+	if names, err := ts.srv.ProtectedBy(ctx, "public", "campaigns"); err != nil || names != nil {
+		t.Errorf("through a blip: %q, %v", names, err)
+	}
+	time.Sleep(staleMax)
+	if names, err := ts.srv.ProtectedBy(ctx, "public", "campaigns"); pgerror.GetCode(err) != codes.System {
+		t.Errorf("after the maximum staleness: %q, %v", names, err)
+	}
+	policies.down.Store(false)
+	time.Sleep(2 * staleRefresh)
+	if names, err := ts.srv.ProtectedBy(ctx, "public", "campaigns"); err != nil || names != nil {
+		t.Errorf("once the metadata database is back: %q, %v", names, err)
+	}
+}

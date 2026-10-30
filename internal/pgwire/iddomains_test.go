@@ -245,8 +245,8 @@ func TestIDDomains(t *testing.T) {
 	}
 	// Its files hold the ids, so Delta Sharing refuses it, and Igloo's
 	// Iceberg REST endpoint keeps it to admins.
-	if got := r.srv.ProtectedBy(ctx, "public", "people"); strings.Join(got, ",") != "ID domain people" {
-		t.Errorf("ProtectedBy: %q", got)
+	if got, err := r.srv.ProtectedBy(ctx, "public", "people"); err != nil || strings.Join(got, ",") != "ID domain people" {
+		t.Errorf("ProtectedBy: %q, %v", got, err)
 	}
 	if p, err := r.srv.ProtectedFor(ctx, auth.User{Name: "rita", Role: auth.RoleReader}, "public", "people"); err != nil || !p {
 		t.Errorf("ProtectedFor: %v, %v", p, err)

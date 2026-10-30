@@ -425,18 +425,24 @@ func droppedSchema(query string) (string, bool) {
 // columns, set on them or through their tags, and the clean rooms that
 // keep it, as "clean room name", and the ID domains its columns are
 // members of, as "ID domain name", whose ids are in its files. Delta
-// Sharing refuses to share or serve such a table (package sharing).
-func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string {
+// Sharing refuses to share or serve such a table (package sharing). It
+// fails, as ProtectedFor does, once the policies could not be read for
+// too long (see governance.current).
+func (s *Server) ProtectedBy(ctx context.Context, schema, table string) ([]string, error) {
 	// Columns that hold ID domains' ids are in the table's files, which
 	// Delta Sharing serves whole.
 	var names []string
 	for _, d := range s.memberDomains(ctx, schema, table) {
 		names = append(names, "ID domain "+d)
 	}
-	r := s.gov.snapshot(ctx).Rules(schema, table)
+	snap, err := s.gov.current(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r := snap.Rules(schema, table)
 	if r == nil {
 		slices.Sort(names)
-		return names
+		return names, nil
 	}
 	for _, room := range r.Rooms() {
 		names = append(names, "clean room "+room)
@@ -455,7 +461,7 @@ func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string
 		}
 	}
 	slices.Sort(names)
-	return slices.Compact(names)
+	return slices.Compact(names), nil
 }
 
 // externalFiles reports whether reading prefix, the start of a path

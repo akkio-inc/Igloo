@@ -155,7 +155,8 @@ reference for every setting mentioned here.
   who manage them and can read the warehouse's files, nor for other
   engines reading the Iceberg tables directly. Policy changes reach other
   replicas within 30 seconds, and one that cannot read them refuses
-  statements after `IGLOO_ACCESS_MAX_STALENESS`.
+  statements, and Delta Sharing requests, after
+  `IGLOO_ACCESS_MAX_STALENESS`.
 - **Connections to other databases.** Only admins create, change and drop
   [connections](docs/federation.md) to PostgreSQL, MySQL and Snowflake
   databases. A
@@ -512,10 +513,11 @@ reference for every setting mentioned here.
   shared: recipients read files with their own tools, which cannot apply
   Igloo's policies. `ALTER SHARE ... ADD TABLE` refuses them, and a shared
   table that gains a policy is refused to recipients from then on (on other
-  replicas within 30 seconds), downloads of files listed before included,
-  with each refusal and the policies behind it in the query history; until
-  Igloo has loaded the policies, the endpoint serves no table. Policies do
-  not attach to external tables, and while tables have policies users
+  replicas within 30 seconds; one that cannot read the policies serves no
+  table after `IGLOO_ACCESS_MAX_STALENESS`, until it can again), downloads
+  of files listed before included, with each refusal and the policies
+  behind it in the query history; until Igloo has loaded the policies, the
+  endpoint serves no table. Policies do not attach to external tables, and while tables have policies users
   other than admins cannot read external tables' files through the proxy,
   nor the copies of shared files in the warehouse. Recipients' tokens
   (`dst_`) and Igloo's access tokens (`igloo_`) are distinct: neither

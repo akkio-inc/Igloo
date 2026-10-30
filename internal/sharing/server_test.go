@@ -135,8 +135,8 @@ func newFixture(t *testing.T) *fixture {
 	server, err := NewServer(ServerOptions{
 		Store: store, Key: key, Files: iceio.LocalFS{}, Warehouse: warehouse, Catalog: "lake", Audit: history,
 		Tables: TableSource{source: src},
-		Protection: func(_ context.Context, schema, table string) []string {
-			return policies[strings.ToLower(schema+"."+table)]
+		Protection: func(_ context.Context, schema, table string) ([]string, error) {
+			return policies[strings.ToLower(schema+"."+table)], nil
 		},
 	})
 	if err != nil {
