@@ -446,9 +446,12 @@ rows, which must hold the target.
   shares. Models train on the rest, as BigQuery's do.
 - **Large inputs.** Igloo's classes train on at most 10 million rows and
   200 million values (rows times columns). Above that they train on a
-  sample of about as many rows, chosen by a hash of each row's values, so
-  the same rows give the same sample and the same model. The model's
-  metrics record `input_rows` and `sampled_rows`.
+  sample of a little fewer rows. Each row is kept or not by a hash of its
+  values, its place among the rows equal to it, and `seed`: rows that
+  repeat are sampled like any others, each copy on its own, and the same
+  rows and seed give the same sample and the same model. A sample that
+  comes out empty fails `CREATE`. The model's metrics record `input_rows`
+  and `sampled_rows`.
 - **`seed`** (default 0) seeds sampling and training: models are the same
   for the same rows and seed.
 - Unknown `CONFIG_OBJECT` keys are refused, so that a misspelled option
