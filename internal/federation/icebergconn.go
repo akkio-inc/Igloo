@@ -304,12 +304,12 @@ type storedSettings struct {
 
 func (s IcebergSettings) stored() (storedSettings, secretValues) {
 	return storedSettings{
-		Endpoint: s.Endpoint, Warehouse: s.Warehouse, TokenSecret: s.TokenSecret, CredentialSecret: s.CredentialSecret,
-		OAuth2ServerURI: s.OAuth2ServerURI, Scope: s.Scope, SigningName: s.SigningName, StorageCredentialSecret: s.StorageCredentialSecret,
-		StorageEndpoint: s.StorageEndpoint, StorageURLStyle: s.StorageURLStyle, Region: s.Region,
-	}, secretValues{
-		Token: s.Token, Credential: s.Credential, StorageCredential: s.StorageCredential,
-	}
+			Endpoint: s.Endpoint, Warehouse: s.Warehouse, TokenSecret: s.TokenSecret, CredentialSecret: s.CredentialSecret,
+			OAuth2ServerURI: s.OAuth2ServerURI, Scope: s.Scope, SigningName: s.SigningName, StorageCredentialSecret: s.StorageCredentialSecret,
+			StorageEndpoint: s.StorageEndpoint, StorageURLStyle: s.StorageURLStyle, Region: s.Region,
+		}, secretValues{
+			Token: s.Token, Credential: s.Credential, StorageCredential: s.StorageCredential,
+		}
 }
 
 func (st storedSettings) settings(v secretValues) IcebergSettings {

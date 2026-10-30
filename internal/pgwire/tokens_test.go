@@ -602,8 +602,8 @@ func TestLoginLimiter(t *testing.T) {
 func TestParseTokenAndGroupCommands(t *testing.T) {
 	t.Parallel()
 	for q, want := range map[string]tokenCommand{
-		"CREATE TOKEN":                                        {kind: tokenCreate},
-		"create token DBT expires '90d'":                      {kind: tokenCreate, name: "dbt", lifetime: 90 * 24 * time.Hour},
+		"CREATE TOKEN":                   {kind: tokenCreate},
+		"create token DBT expires '90d'": {kind: tokenCreate, name: "dbt", lifetime: 90 * 24 * time.Hour},
 		`CREATE TOKEN "Tableau" FOR USER svc EXPIRES IN '1y'`: {kind: tokenCreate, name: "Tableau", user: "svc", lifetime: 365 * 24 * time.Hour},
 		"CREATE TOKEN 'airflow.prod' EXPIRES '12h'":           {kind: tokenCreate, name: "airflow.prod", lifetime: 12 * time.Hour},
 		"CREATE TOKEN FOR USER svc":                           {kind: tokenCreate, user: "svc"},
