@@ -14,6 +14,9 @@ python bench/run.py --platform databricks --size S --scale 10
 python bench/report.py bench/results/*.json > bench/results/report.md
 ```
 
+`python -m unittest discover -s bench` tests the scripts without a
+platform to run against.
+
 ## Method
 
 **Data.** TPC-H at scale factor 10 (about 10 GB) and 100. TPC-H's generator
@@ -52,7 +55,8 @@ rows for every query.
 **Queries.** The 22 TPC-H queries in `queries/tpch`, from DuckDB's TPC-H
 extension, translated with sqlglot for Snowflake and Databricks. Each query
 runs once cold and then three times warm, one at a time. Result caches are
-off on every platform, so warm runs measure the engine.
+off on every platform, so warm runs measure the engine; `run.py` checks
+that Igloo's is and records it in the results (`result_cache`).
 
 **Sizes.** Each platform runs at the sizes a team would actually pick, and
 the report compares them at matched cost as well as matched speed: at scale
@@ -208,9 +212,10 @@ Databricks 2X-Small to $263.
 
 `distributed.py` measures [distributed execution](../docs/distributed-execution.md)
 against one machine: it runs each query of a suite with
-`SET distributed_execution = 'off'` and `'on'`, interleaved, and reports the
-fastest of `--runs` runs of each, the speedup, how many workers ran it (from
-`igloo.query_history`) and the cost of one run at the prices given:
+`SET distributed_execution = 'off'` and `'on'`, interleaved, with the
+result cache off, and reports the fastest of `--runs` runs of each, the
+speedup, how many workers ran it (from `igloo.query_history`) and the cost
+of one run at the prices given:
 
 ```sh
 python bench/distributed.py --suite tpch --runs 3 \

@@ -36,9 +36,14 @@ def connect(platform: str):
     if platform == "igloo":
         import psycopg
 
+        # Igloo, like Snowflake and Databricks below, answers a query again
+        # from the result it kept (IGLOO_RESULT_CACHE_SIZE): off, so warm
+        # runs measure the engine; main checks that it is.
+        setup = ["SET igloo_result_cache = off"]
         # IGLOO_SCHEMA picks the schema holding the tables, e.g. one per
         # scale factor.
-        setup = [f"SET search_path = '{env['IGLOO_SCHEMA']}'"] if "IGLOO_SCHEMA" in env else []
+        if "IGLOO_SCHEMA" in env:
+            setup.append(f"SET search_path = '{env['IGLOO_SCHEMA']}'")
         return psycopg.connect(env["IGLOO_DSN"], autocommit=True), setup
     if platform == "snowflake":
         import snowflake.connector
@@ -126,6 +131,18 @@ def server_seconds(conn, platform: str, query_ids: list[str]) -> dict[str, float
     return {qid: times[qid] for qid in query_ids if qid in times}
 
 
+def igloo_result_cache(conn) -> str:
+    """The session's igloo_result_cache, which must be off: with it on, a
+    warm run is answered from the first run's result and times nothing."""
+    cur = conn.cursor()
+    cur.execute("SHOW igloo_result_cache")
+    value = cur.fetchone()[0]
+    cur.close()
+    if value != "off":
+        raise SystemExit(f"igloo: the result cache is {value} after SET igloo_result_cache = off")
+    return value
+
+
 def snowflake_generation(conn) -> int | None:
     """The hardware generation of the session's warehouse (1 or 2), which
     sets its credits per hour. Warehouses made before Gen2 existed report
@@ -197,6 +214,9 @@ def main() -> None:
         print(f"snowflake: Gen{variant['generation']} warehouse", flush=True)
     if args.platform == "igloo" and args.disk:
         variant["disk"] = args.disk
+    # Not for pricing, but to show that the times are the engine's.
+    if args.platform == "igloo":
+        variant["result_cache"] = igloo_result_cache(conn)
 
     results = []
     for name, sql in load_queries(args.suite, args.platform):
