@@ -228,11 +228,26 @@ SHOW TASKS
 
 ```sql
 CREATE TASK hourly_rollup SCHEDULE '1 hour' AS
-  INSERT INTO marts.hourly SELECT date_trunc('hour', at), count(*) FROM raw.events
-  WHERE at >= (SELECT coalesce(max(hour), '-infinity') FROM marts.hourly) GROUP BY 1;
+  MERGE INTO marts.hourly AS h
+  USING (
+    SELECT date_trunc('hour', event_time) AS hour, count(*) AS events
+    FROM raw.events
+    WHERE event_time >= date_trunc('hour', now()) - INTERVAL '6 hours'
+      AND event_time < date_trunc('hour', now())
+    GROUP BY 1
+  ) AS s ON h.hour = s.hour
+  WHEN MATCHED AND h.events <> s.events THEN UPDATE SET events = s.events
+  WHEN NOT MATCHED THEN INSERT VALUES (s.hour, s.events);
 ALTER TASK hourly_rollup RESUME;
 EXECUTE TASK hourly_rollup;   -- run it now, as it would run on its schedule
 ```
+
+Each run counts the last six complete hours again and writes only the
+hours whose count is new or changed: running it twice changes nothing, the
+hour under way waits for the first run after it ends, and the next run
+makes up for one that was skipped or failed. Events that arrive up to six
+hours late are counted; later ones are not. Widen the window for later
+events or longer outages, at the cost of reading more each run.
 
 - **A new task is suspended**, as in Snowflake: `ALTER TASK ... RESUME`
   starts its schedule. `EXECUTE TASK` runs it once, now, suspended or not,
