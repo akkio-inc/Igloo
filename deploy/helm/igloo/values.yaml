@@ -323,6 +323,13 @@ scaleToZero:
   # closes its connection -> IGLOO_GATEWAY_RESUME_TIMEOUT. Allow for the
   # cluster autoscaler adding a node.
   resumeTimeout: 5m
+  # How long a client has, from connecting, to send its first bytes; the
+  # gateway starts igloo for no connection before then, and closes one that
+  # sends nothing -> IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT.
+  firstByteTimeout: 30s
+  # Connections that may wait at once for their first bytes or for igloo to
+  # start; further ones are closed -> IGLOO_GATEWAY_MAX_WAITING.
+  maxWaiting: 200
   # Igloo pods the gateway starts -> IGLOO_GATEWAY_K8S_REPLICAS. null:
   # replicaCount, or autoscaling.minReplicas with autoscaling.enabled.
   replicas: null

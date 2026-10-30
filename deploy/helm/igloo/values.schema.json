@@ -618,6 +618,15 @@
           "type": "string",
           "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
+        "firstByteTimeout": {
+          "description": "A Go duration such as 30s.",
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
+        },
+        "maxWaiting": {
+          "type": "integer",
+          "minimum": 1
+        },
         "replicas": {
           "type": [
             "integer",

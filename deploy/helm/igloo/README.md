@@ -451,6 +451,8 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `scaleToZero.enabled` | `false` | Run the [scale-to-zero](#scale-to-zero) gateway behind the SQL Service |
 | `scaleToZero.suspendAfter` | `10m` | `IGLOO_GATEWAY_SUSPEND_AFTER`: stop igloo after this long without client traffic or running work |
 | `scaleToZero.resumeTimeout` | `5m` | `IGLOO_GATEWAY_RESUME_TIMEOUT`: how long a connecting client waits for igloo to start |
+| `scaleToZero.firstByteTimeout` | `30s` | `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT`: how long a client has to send its first bytes before the gateway closes it, starting nothing |
+| `scaleToZero.maxWaiting` | `200` | `IGLOO_GATEWAY_MAX_WAITING`: connections that may wait at once for their first bytes or for igloo to start |
 | `scaleToZero.replicas` | `null` | Igloo pods the gateway starts; null: `replicaCount`, or `autoscaling.minReplicas` with `autoscaling.enabled` |
 | `scaleToZero.resources` | `50m` / `64Mi`, limit `256Mi` | Gateway container |
 | `scaleToZero.nodeSelector`, `tolerations`, `affinity` | | Gateway pod scheduling, separate from igloo's |

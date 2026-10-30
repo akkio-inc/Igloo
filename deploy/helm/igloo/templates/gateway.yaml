@@ -99,6 +99,10 @@ spec:
               value: {{ .Values.scaleToZero.suspendAfter | quote }}
             - name: IGLOO_GATEWAY_RESUME_TIMEOUT
               value: {{ .Values.scaleToZero.resumeTimeout | quote }}
+            - name: IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT
+              value: {{ .Values.scaleToZero.firstByteTimeout | quote }}
+            - name: IGLOO_GATEWAY_MAX_WAITING
+              value: {{ .Values.scaleToZero.maxWaiting | quote }}
             - name: IGLOO_LOG_FORMAT
               value: {{ .Values.log.format | quote }}
             - name: IGLOO_LOG_LEVEL
