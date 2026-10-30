@@ -162,12 +162,12 @@ price.
 **Snowflake Gen2** runs the suite 1.25x to 1.45x faster than Gen1 at scale
 100 and about 1.5x faster at scale 10, for 1.35x the credits per hour. A
 warm run therefore costs about the same on either (from 13% less to 8%
-more), while a burst costs 2% to 35% more on Gen2, because the 60-second
-minimum and the idle tail are billed at the higher rate. Igloo's lead over
-Snowflake shrinks by Gen2's speed-up. The scale 10 Gen1 X-Small result is
-the earlier run on another warehouse (COMPUTE_WH, also Gen1); every other
-Snowflake run used one warehouse, BENCH_WH, switched between
-generations.
+more), while a burst costs from 13% less (X-Small at scale 10, whose cold
+run Gen2 cuts from 79 s to 30 s) to 23% more on Gen2, because the idle
+tail is billed at the higher rate. Igloo's lead over Snowflake shrinks by
+Gen2's speed-up. The scale 10 Gen1 X-Small result is the earlier run on
+another warehouse (COMPUTE_WH, also Gen1); every other Snowflake run used
+one warehouse, BENCH_WH, switched between generations.
 
 **The first run after a resume** is where Igloo's lead goes. It waits about
 17 s for the machine to start, then reads table data from the disk cache
@@ -181,10 +181,10 @@ here) is short, so their first runs (Snowflake Gen1 208 s at X-Small to
 c7g.4xlarge's (153 s with the start) from Snowflake Small and Databricks
 Small up, and match or beat c7g.16xlarge's (75 s) from Snowflake Gen2
 Medium, Gen1 X-Large and Databricks Medium up. Igloo still costs less per
-burst at every pairing (2.6x to 166x), because the others bill a minimum
-and an idle tail: at 24 bursts a day, c7g.4xlarge with scale to zero comes
-to $66 a month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and
-Databricks 2X-Small to $263.
+burst at every pairing (2.6x to 166x), because the others bill an idle
+tail: at 24 bursts a day, c7g.4xlarge with scale to zero comes to $66 a
+month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and Databricks
+2X-Small to $263.
 
 **Caveats.**
 
@@ -192,7 +192,7 @@ Databricks 2X-Small to $263.
   6,000 IOPS and 500 MB/s ($38 a month), which the cached first runs depend
   on. Earlier reports charged a 20 GB disk ($1.61); the real disk raises
   every Igloo scale-to-zero month by $36, e.g. c7g.4xlarge from $14 to $51
-  at scale 10 (Snowflake X-Small: $85 on Gen1, $99 on Gen2; Databricks
+  at scale 10 (Snowflake X-Small: $85 on Gen1, $74 on Gen2; Databricks
   2X-Small: $194) and from $30 to $66 at scale 100. Per-run costs do not
   change.
 - Per query, Snowflake matches or beats Igloo on the date-range scans q06

@@ -98,13 +98,14 @@ def hourly_rate(pricing: dict, result: dict) -> float:
 
 def burst_seconds(pricing: dict, platform: str, busy: float, resume: float = 0) -> float:
     """Billed seconds for one burst of work that starts from a stopped
-    warehouse or machine and is followed by idleness."""
+    warehouse or machine and is followed by idleness: from start to stop,
+    the idle tail included, at least the minimum."""
     if platform == "snowflake":
         p = pricing["snowflake"]
-        return max(busy, p["minimum_seconds"]) + p["auto_suspend_seconds"]
+        return max(busy + p["auto_suspend_seconds"], p["minimum_seconds"])
     if platform == "databricks":
         p = pricing["databricks"]
-        return max(busy, p["minimum_seconds"]) + p["auto_stop_seconds"]
+        return max(busy + p["auto_stop_seconds"], p["minimum_seconds"])
     # Igloo with scale to zero: EC2 bills from start to stop.
     p = pricing["igloo"]
     return max(resume + busy + p["suspend_after_seconds"], p["minimum_seconds"])
