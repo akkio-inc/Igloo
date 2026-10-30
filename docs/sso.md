@@ -159,7 +159,10 @@ lists and, with [SCIM](#scim-provisioning), the groups it pushed:
 Without [SCIM](#scim-provisioning), roles change at sign-in only: a user who
 leaves a group keeps its roles in SQL sessions and access tokens until they
 next sign in to the console, or an admin changes them. With SCIM they change
-as soon as the provider pushes the group.
+as soon as the provider pushes the group. SCIM alone decides who is in a
+group it pushes: a token that lists that group counts for nothing, so
+removing someone from it at the provider takes its roles away at once. The
+token's other groups still count, as without SCIM.
 
 ## Passwords and single sign-on users
 
@@ -356,7 +359,7 @@ How Igloo treats what the provider sends:
 | `active: false` / `true` | `ALTER USER name NOLOGIN` / `LOGIN`. |
 | `userName`, `emails`, `name`, `displayName`, `externalId` | Kept; the primary email becomes the user's email. Other attributes are accepted and ignored. |
 | Delete a user | Disables the user and stops managing them; their groups' roles go. An admin drops the user when they wish (`DROP USER`). |
-| Groups and members | Kept; a group's display name is what `GRANT role TO SSO GROUP 'name'` matches. Members must be users the provider provisioned. Roles follow membership changes at once, and at sign-in the token's groups count too. |
+| Groups and members | Kept; a group's display name is what `GRANT role TO SSO GROUP 'name'` matches. Members must be users the provider provisioned. Roles follow membership changes at once. A token's groups count at sign-in too, except groups SCIM pushes, whose SCIM members alone have their roles. |
 
 Changes are logged with the token that made them. Without TLS, SCIM is
 accepted only at `localhost`, as sign-ins are. Service accounts are never

@@ -66,8 +66,8 @@ func (s *Service) admit(id Identity) error {
 //
 // A user found by 2 to 4 is linked to the identity. Service accounts and
 // disabled users are refused. The roles follow the token's groups and
-// those SCIM gives the user. A failure is a *Refusal or an error of the
-// stores.
+// those SCIM gives the user (see withSCIMGroups). A failure is a *Refusal
+// or an error of the stores.
 func (s *Service) SignIn(ctx context.Context, id Identity) (auth.User, error) {
 	if err := s.admit(id); err != nil {
 		return auth.User{}, err
@@ -207,7 +207,7 @@ func (s *Service) Provision(ctx context.Context, username, email string) (user a
 
 // RefreshRoles applies the group mappings to the groups user is in now:
 // those SCIM provisioning gives them and those their last sign-in's token
-// listed. SCIM calls it when groups change.
+// listed (see withSCIMGroups). SCIM calls it when groups change.
 func (s *Service) RefreshRoles(ctx context.Context, name string) error {
 	user, err := s.users.Get(ctx, name)
 	if err != nil {
@@ -227,7 +227,11 @@ func (s *Service) RefreshRoles(ctx context.Context, name string) error {
 	return err
 }
 
-// withSCIMGroups adds the groups SCIM provisioning gives user to groups.
+// withSCIMGroups returns the groups user is in, given the groups a token
+// listed: those SCIM provisioning gives them, and those of groups that
+// SCIM does not push. SCIM alone decides who is in a group it pushes: the
+// groups a sign-in saved would otherwise keep someone SCIM removed from one
+// in it until they next signed in.
 func (s *Service) withSCIMGroups(ctx context.Context, user string, groups []string) ([]string, error) {
 	if s.scim == nil {
 		return groups, nil
@@ -236,7 +240,11 @@ func (s *Service) withSCIMGroups(ctx context.Context, user string, groups []stri
 	if err != nil {
 		return nil, err
 	}
-	out := slices.Clone(groups)
+	pushed, err := s.scim.SCIMGroupNames(ctx, groups)
+	if err != nil {
+		return nil, err
+	}
+	out := slices.DeleteFunc(slices.Clone(groups), func(g string) bool { return slices.Contains(pushed, g) })
 	for _, g := range provisioned {
 		if !slices.Contains(out, g) {
 			out = append(out, g)

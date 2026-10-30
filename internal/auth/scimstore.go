@@ -167,4 +167,15 @@ func (s *PostgresStore) UserSCIMGroups(ctx context.Context, user string) ([]stri
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+func (s *PostgresStore) SCIMGroupNames(ctx context.Context, names []string) ([]string, error) {
+	if names == nil {
+		names = []string{}
+	}
+	rows, err := s.pool.Query(ctx, `SELECT display_name FROM igloo_auth.scim_groups WHERE display_name = ANY ($1) ORDER BY 1`, names)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
 var _ SCIMStore = (*PostgresStore)(nil)

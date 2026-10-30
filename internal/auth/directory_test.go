@@ -358,6 +358,12 @@ func testDirectory(t *testing.T, d directory) {
 	if groups, _ := d.UserSCIMGroups(ctx, "pat"); len(groups) != 0 {
 		t.Errorf("pat's groups: %v", groups)
 	}
+	if names, err := d.SCIMGroupNames(ctx, []string{"Writers", "Analysts", "analysts"}); err != nil || !slices.Equal(names, []string{"Analysts"}) {
+		t.Errorf("SCIMGroupNames: %v %v", names, err)
+	}
+	if names, err := d.SCIMGroupNames(ctx, nil); err != nil || len(names) != 0 {
+		t.Errorf("SCIMGroupNames of none: %v %v", names, err)
+	}
 	if err := d.ModifySCIMGroup(ctx, "nope", func(*SCIMGroup) error { return nil }); !errors.Is(err, ErrSCIMNotFound) {
 		t.Errorf("modifying no group: %v", err)
 	}

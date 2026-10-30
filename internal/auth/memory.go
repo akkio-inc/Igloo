@@ -632,6 +632,19 @@ func (d *MemoryDirectory) UserSCIMGroups(_ context.Context, user string) ([]stri
 	return out, nil
 }
 
+func (d *MemoryDirectory) SCIMGroupNames(_ context.Context, names []string) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, g := range d.scimGroups {
+		if slices.Contains(names, g.DisplayName) {
+			out = append(out, g.DisplayName)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 var (
 	_ Store        = (*MemoryDirectory)(nil)
 	_ GrantStore   = (*MemoryDirectory)(nil)

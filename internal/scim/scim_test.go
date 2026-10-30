@@ -418,6 +418,64 @@ func TestGroups(t *testing.T) {
 	}
 }
 
+// TestSCIMDecidesItsGroups: a group the provider pushes has the members
+// SCIM says, whatever the groups saved from a sign-in's token: removing
+// someone from it takes its roles away at once. The token's other groups
+// still count.
+func TestSCIMDecidesItsGroups(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	if code, _ := f.call("POST", "/Users", map[string]any{"userName": "ana@agency.com"}); code != http.StatusCreated {
+		t.Fatalf("provisioning ana: %d", code)
+	}
+	if err := f.dir.CreateRole(ctx, "analysts"); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []auth.GroupRole{{Group: "Data Team", Role: "analysts"}, {Group: "Igloo Writers", Role: "writer"}} {
+		if err := f.dir.GrantGroupRole(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out := f.call("POST", "/Groups", map[string]any{"displayName": "Igloo Writers", "members": []map[string]any{{"value": "ana"}}})
+	if code != http.StatusCreated {
+		t.Fatalf("POST /Groups: %d %v", code, out)
+	}
+	id := out["id"].(string)
+	signIn := func() {
+		t.Helper()
+		if _, err := f.sso.SignIn(ctx, sso.Identity{Issuer: "https://idp.example.com", Subject: "s-ana", Username: "ana@agency.com",
+			Email: "ana@agency.com", Groups: []string{"Igloo Writers", "Data Team"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signIn()
+	if u := f.user("ana"); u.Role != auth.RoleWriter || !slices.Equal(f.roles("ana"), []string{"analysts"}) {
+		t.Fatalf("after signing in: %s %v", u.Role, f.roles("ana"))
+	}
+
+	code, _ = f.call("PATCH", "/Groups/"+id, map[string]any{"schemas": []string{schemaPatch},
+		"Operations": []any{map[string]any{"op": "remove", "path": `members[value eq "ana"]`}}})
+	if code != http.StatusNoContent {
+		t.Fatalf("removing ana: %d", code)
+	}
+	if u := f.user("ana"); u.Role != auth.RoleNone || !slices.Equal(f.roles("ana"), []string{"analysts"}) {
+		t.Errorf("after SCIM removed ana from Igloo Writers: %s %v", u.Role, f.roles("ana"))
+	}
+	// A token that still lists the group does not put her back in it.
+	signIn()
+	if u := f.user("ana"); u.Role != auth.RoleNone || !slices.Equal(f.roles("ana"), []string{"analysts"}) {
+		t.Errorf("after signing in with a token listing Igloo Writers: %s %v", u.Role, f.roles("ana"))
+	}
+	// Once SCIM no longer pushes the group, the token decides again.
+	if code, _ := f.call("DELETE", "/Groups/"+id, nil); code != http.StatusNoContent {
+		t.Fatalf("DELETE /Groups: %d", code)
+	}
+	signIn()
+	if u := f.user("ana"); u.Role != auth.RoleWriter {
+		t.Errorf("after the group stopped being pushed: %s", u.Role)
+	}
+}
+
 func TestFilters(t *testing.T) {
 	for in, want := range map[string]filter{
 		`userName eq "ana@x.com"`:                                    {attr: "username", value: "ana@x.com"},

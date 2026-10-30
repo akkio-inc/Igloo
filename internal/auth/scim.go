@@ -71,4 +71,6 @@ type SCIMStore interface {
 	DeleteSCIMGroup(ctx context.Context, id string) error
 	// UserSCIMGroups returns the names of the groups user is in.
 	UserSCIMGroups(ctx context.Context, user string) ([]string, error)
+	// SCIMGroupNames returns those of names that are groups' names.
+	SCIMGroupNames(ctx context.Context, names []string) ([]string, error)
 }

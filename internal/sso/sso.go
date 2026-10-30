@@ -55,7 +55,8 @@ type Options struct {
 	Accounts auth.AccountStore
 	SSO      auth.SSOStore
 	// SCIM, if set, holds the groups SCIM provisioning gives users, which
-	// count with their token's at each sign-in.
+	// count with their token's at each sign-in, and alone decide who is in
+	// the groups it pushes.
 	SCIM auth.SCIMStore
 	// HTTP reaches the provider; nil means a client with a 15 second
 	// timeout.
