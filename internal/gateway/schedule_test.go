@@ -114,6 +114,48 @@ func TestFailedStartForScheduledWorkIsRetried(t *testing.T) {
 	}
 }
 
+// The start a gateway makes when it starts, to learn when scheduled work
+// is due, is tried again too when it fails: it used to be made once, and
+// then nothing started Igloo for its work until a client connected.
+func TestFailedStartToLearnTheScheduleIsRetried(t *testing.T) {
+	compute := newFakeCompute(t)
+	compute.fail.Store(true)
+	// Igloo's /activity, which answers only while Igloo runs.
+	activity := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !compute.listening() {
+			http.Error(w, "igloo is down", http.StatusBadGateway)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"running": 0, "idle_seconds": 100, "next_due": %q}`,
+			time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
+	}))
+	t.Cleanup(activity.Close)
+	startGateway(t, Options{
+		Backend:       compute.addr,
+		ActivityURL:   activity.URL + "/activity",
+		SuspendAfter:  200 * time.Millisecond,
+		ResumeTimeout: 5 * time.Second,
+		Compute:       compute,
+	})
+	waitFor(t, "a start to learn the schedule", func() bool { starts, _ := compute.counts(); return starts == 1 })
+	waitFor(t, "another try", func() bool { starts, _ := compute.counts(); return starts == 2 })
+	time.Sleep(time.Second)
+	if starts, _ := compute.counts(); starts > 8 {
+		t.Errorf("tried %d times in a second", starts-1)
+	}
+
+	// Once the compute can start, it does; the gateway learns the schedule
+	// as it stops it, and does not start it again before the work is due.
+	compute.fail.Store(false)
+	waitFor(t, "igloo up to learn the schedule", compute.listening)
+	waitFor(t, "suspend once it is known", func() bool { return !compute.listening() })
+	starts, _ := compute.counts()
+	time.Sleep(500 * time.Millisecond)
+	if again, _ := compute.counts(); again != starts {
+		t.Errorf("started %d more times once the schedule was known", again-starts)
+	}
+}
+
 func TestWorkDueSoonKeepsIglooRunning(t *testing.T) {
 	compute := newFakeCompute(t)
 	addr := startGateway(t, Options{

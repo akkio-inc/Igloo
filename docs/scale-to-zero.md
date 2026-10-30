@@ -314,7 +314,9 @@ arrive, such as `SCHEDULE '1 hour'` for daily drops.
 The gateway keeps the due time in memory, and learns it each time it
 stops Igloo. A gateway that starts while Igloo is stopped cannot know it,
 so it starts Igloo once to find out; after a gateway restart, expect one
-start of up to `IGLOO_GATEWAY_SUSPEND_AFTER`. With
+start of up to `IGLOO_GATEWAY_SUSPEND_AFTER`. If that start fails, the
+gateway tries again as for scheduled work, waiting twice as long after each
+failure, until Igloo runs, for that start or a client's. With
 `IGLOO_GATEWAY_ACTIVITY_URL` set empty the gateway reads no activity, and
 scheduled work runs only while clients keep Igloo up.
 

@@ -129,6 +129,9 @@ type Gateway struct {
 	// lastStart is how long the last start of the compute took, by which
 	// starts for scheduled work come early.
 	lastStart time.Duration
+	// learning says the gateway starts Igloo to learn when scheduled work
+	// is due, until Igloo runs (see learnSchedule).
+	learning bool
 	// retryAt is when a start for scheduled work that failed is tried
 	// again, and retryWait how long it waits for that.
 	retryAt   time.Time
@@ -373,6 +376,7 @@ func (g *Gateway) start(w *wake) {
 		g.state = stateRunning
 		g.lastStart = elapsed
 		g.retryAt, g.retryWait = time.Time{}, 0
+		g.learning = false
 		g.touch()
 	} else {
 		g.state = stateUnknown
@@ -411,7 +415,9 @@ func (g *Gateway) waitReady(ctx context.Context) error {
 // learnSchedule asks Igloo, when the gateway starts, when scheduled work
 // is next due. If Igloo cannot be asked, it is presumably stopped, and the
 // gateway has no way to know when to start it for its schedules; it
-// starts it now, to find out the next time it stops it.
+// starts it now, to find out the next time it stops it. A start that
+// fails is tried again as one for scheduled work is (see
+// startForSchedule), until Igloo runs, as it does for a client too.
 func (g *Gateway) learnSchedule(ctx context.Context) {
 	if g.opts.ActivityURL == "" {
 		return
@@ -419,26 +425,38 @@ func (g *Gateway) learnSchedule(ctx context.Context) {
 	if _, _, err := g.busy(ctx); err == nil || ctx.Err() != nil {
 		return
 	}
-	g.opts.Log.Info("starting igloo to learn when its scheduled work is due")
-	if err := g.wake(ctx); err != nil && ctx.Err() == nil {
-		g.opts.Log.Error("could not start igloo", "err", err)
-	}
+	g.mu.Lock()
+	g.learning = g.state != stateRunning
+	g.mu.Unlock()
+	g.startForSchedule(ctx)
 }
 
 // startForSchedule starts the stopped compute when scheduled work is due,
 // early by as long as the last start took, so that the work starts about
-// on time. The due time is kept until a start succeeds: one that fails is
-// tried again, after a wait that doubles with each failure up to
-// scheduleRetryMax, rather than leaving the work until a client connects.
+// on time, or when the gateway has yet to learn when that is. The due time
+// is kept until a start succeeds: one that fails is tried again, after a
+// wait that doubles with each failure up to scheduleRetryMax, rather than
+// leaving the work until a client connects.
 func (g *Gateway) startForSchedule(ctx context.Context) {
 	g.mu.Lock()
-	st, due, known, early, retryAt := g.state, g.due, g.dueKnown, g.lastStart, g.retryAt
+	st, due, known, learning, early, retryAt := g.state, g.due, g.dueKnown, g.learning, g.lastStart, g.retryAt
 	g.mu.Unlock()
-	if st == stateRunning || st == stateStarting || !known || due.IsZero() || time.Until(due) > early ||
-		time.Now().Before(retryAt) {
+	if st == stateRunning || st == stateStarting || time.Now().Before(retryAt) {
 		return
 	}
-	g.opts.Log.Info("starting igloo for scheduled work", "due", due.UTC().Format(time.RFC3339))
+	var (
+		what string
+		args []any
+	)
+	switch {
+	case learning:
+		what = "to learn when its scheduled work is due"
+	case known && !due.IsZero() && time.Until(due) <= early:
+		what, args = "for scheduled work", []any{"due", due.UTC().Format(time.RFC3339)}
+	default:
+		return
+	}
+	g.opts.Log.Info("starting igloo "+what, args...)
 	if err := g.wake(ctx); err != nil {
 		if ctx.Err() != nil {
 			return
@@ -448,7 +466,7 @@ func (g *Gateway) startForSchedule(ctx context.Context) {
 		g.retryAt = time.Now().Add(g.retryWait)
 		wait := g.retryWait
 		g.mu.Unlock()
-		g.opts.Log.Error("could not start igloo for scheduled work", "retry_in", wait, "err", err)
+		g.opts.Log.Error("could not start igloo "+what, "retry_in", wait, "err", err)
 		return
 	}
 	// The work is underway once Igloo runs; the next due time comes from
@@ -459,6 +477,9 @@ func (g *Gateway) startForSchedule(ctx context.Context) {
 func (g *Gateway) setDue(due time.Time, known bool) {
 	g.mu.Lock()
 	g.due, g.dueKnown = due, known
+	if known {
+		g.learning = false
+	}
 	g.mu.Unlock()
 	g.opts.Metrics.setNextDue(due)
 }
@@ -661,9 +682,15 @@ func (g *Gateway) activity(ctx context.Context, u string) (activityReport, error
 	return report, json.NewDecoder(resp.Body).Decode(&report)
 }
 
+// setState notes the compute's state. Once Igloo is known to run, the
+// gateway learns its schedule the next time it stops it, without starting
+// it for that (see learnSchedule).
 func (g *Gateway) setState(s state) {
 	g.mu.Lock()
 	g.state = s
+	if s == stateRunning {
+		g.learning = false
+	}
 	g.mu.Unlock()
 	g.opts.Metrics.setRunning(s == stateRunning)
 }
