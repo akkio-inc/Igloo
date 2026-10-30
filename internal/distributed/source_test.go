@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -86,6 +87,59 @@ func TestRefreshRefusesChangedTypes(t *testing.T) {
 			})
 			if err := src.Refresh(t.Context(), tab); !IsUnsupported(err) {
 				t.Errorf("refresh after the promotion: %v, want the statement kept on one machine", err)
+			}
+		})
+	}
+}
+
+// setSchema makes fields the schema of table s.t, as another engine would.
+// (iceberg-go's UpdateSchema leaves out the initial defaults of the
+// columns it adds.)
+func setSchema(t *testing.T, cat *catalog.Client, fields ...iceberg.NestedField) {
+	t.Helper()
+	ident := table.Identifier{"s", "t"}
+	tbl, err := cat.LoadTable(t.Context(), ident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := tbl.Metadata().CurrentSchema().ID
+	if _, _, err := cat.CommitTable(t.Context(), ident, []table.Requirement{table.AssertCurrentSchemaID(current)},
+		[]table.Update{table.NewAddSchemaUpdate(iceberg.NewSchema(current+1, fields...)), table.NewSetCurrentSchemaUpdate(-1)}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInitialDefaultsAreUnsupported checks that workers do not read a
+// table of format version 3 with a column, or a field nested in one, that
+// has an initial default: they would read it as NULL from the files
+// written before it was added, where it is its default. The statement
+// runs on one machine instead.
+func TestInitialDefaultsAreUnsupported(t *testing.T) {
+	id := iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64}
+	f := iceberg.NestedField{ID: 3, Name: "f", Type: iceberg.PrimitiveTypes.Int32}
+	n := iceberg.NestedField{ID: 4, Name: "n", Type: iceberg.PrimitiveTypes.Int32, InitialDefault: 7}
+	s := func(fields ...iceberg.NestedField) iceberg.NestedField {
+		return iceberg.NestedField{ID: 2, Name: "s", Type: &iceberg.StructType{FieldList: fields}}
+	}
+	for name, c := range map[string]struct {
+		fields []iceberg.NestedField
+		column string
+	}{
+		"column":       {[]iceberg.NestedField{id, s(f), n}, "n"},
+		"nested field": {[]iceberg.NestedField{id, s(f, n)}, "s.n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cat := restTable(t, "3", id, s(f))
+			if tab, err := NewIceberg(cat).Table(t.Context(), "s", "t"); err != nil || tab.Unsupported != "" {
+				t.Fatalf("without initial defaults: %v, %v", tab, err)
+			}
+			setSchema(t, cat, c.fields...)
+			tab, err := NewIceberg(cat).Table(t.Context(), "s", "t")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(tab.Unsupported, "column "+c.column+" has an initial default") {
+				t.Errorf("unsupported %q, want it to name %s's initial default", tab.Unsupported, c.column)
 			}
 		})
 	}

@@ -188,6 +188,12 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 		}
 		t.Columns = append(t.Columns, c)
 	}
+	// Workers read a field as NULL from the data files written before it
+	// was added, which lack it; format version 3 gives it its initial
+	// default there, as DuckDB's own Iceberg scan does.
+	if name, ok := initialDefault(tbl.Schema().Fields()); ok && t.Unsupported == "" {
+		t.Unsupported = fmt.Sprintf("column %s has an initial default, which workers do not apply", name)
+	}
 	// A name mapping (schema.name-mapping.default) applies only to files
 	// without field IDs, which workers refuse; iceberg-go adds one to every
 	// table it compacts, whose files all have field IDs.
@@ -344,6 +350,22 @@ func icebergColumn(name string, id int, t iceberg.Type) (Column, bool) {
 		c.Type = typ
 	}
 	return c, true
+}
+
+// initialDefault returns the dotted path of one of fields, or of a field
+// nested in them, that has an initial default.
+func initialDefault(fields []iceberg.NestedField) (string, bool) {
+	for _, f := range fields {
+		if f.InitialDefault != nil {
+			return f.Name, true
+		}
+		if nested, ok := f.Type.(iceberg.NestedType); ok {
+			if name, ok := initialDefault(nested.Fields()); ok {
+				return f.Name + "." + name, true
+			}
+		}
+	}
+	return "", false
 }
 
 // duckType returns the DuckDB type DuckDB reads an Iceberg primitive type

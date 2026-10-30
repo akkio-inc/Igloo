@@ -215,7 +215,9 @@ equality deletes of fields nested in structs, with
 data files that have no Iceberg field IDs (files added from outside and
 read through a name mapping) or that nest a struct's fields otherwise
 than the table does now (a field renamed, or dropped and added again,
-since they were written), tables with
+since they were written), tables of Iceberg format version 3 with a
+column or nested field that has an initial default (workers would read it
+as `NULL` from the files written before it was added), tables with
 [masking or row access policies](security-policies.md) and statements those
 policies rewrite (directly or through a view), views that group, sort or
 limit, [connections](federation.md)' tables and Delta
