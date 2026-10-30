@@ -250,6 +250,13 @@ var migrations = []string{
 		PRIMARY KEY (group_id, user_name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS scim_members_user ON igloo_auth.scim_members (user_name)`,
+	// Users whose groups SCIM changed, until their roles follow them
+	// (SCIMChanges): marked with each change, so roles a failure left
+	// behind are applied later.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.scim_changes (
+		user_name text PRIMARY KEY REFERENCES igloo_auth.users (name) ON DELETE CASCADE,
+		mark      bigint NOT NULL
+	)`,
 	connectionGrantsTable,
 	// ERASE on the account, which lets a custom role erase people's data
 	// (see package erasure). Changed once, so later starts take no lock on

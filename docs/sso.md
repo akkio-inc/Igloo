@@ -386,6 +386,12 @@ accepted only at `localhost`, as sign-ins are. Service accounts are never
 provisioned, and Igloo never deactivates its last enabled admin who is a
 person.
 
+Igloo records whose groups each change affects along with the change. If
+it then cannot apply their roles, for instance because the metadata
+database is briefly out of reach, it keeps the change, answers a change or
+deletion of a group with an error (500), and applies the roles when the
+provider sends the request again, or by itself within a minute.
+
 ## Failed logins
 
 Each replica refuses logins for a user after 10 failures within 15 minutes,

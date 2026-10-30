@@ -345,6 +345,20 @@ func testDirectory(t *testing.T, d directory) {
 	if g, err := d.SCIMGroup(ctx, "g-1"); err != nil || !slices.Equal(g.Members, []string{"ana", "pat"}) {
 		t.Errorf("SCIMGroup: %+v %v", g, err)
 	}
+	// Changes record the users whose groups they changed, until their
+	// roles are applied.
+	changed := func() []SCIMChange {
+		t.Helper()
+		changes, err := d.SCIMChanges(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return changes
+	}
+	created := changed()
+	if len(created) != 2 || created[0].User != "ana" || created[1].User != "pat" {
+		t.Errorf("SCIMChanges after creating a group: %+v", created)
+	}
 	err = d.ModifySCIMGroup(ctx, "g-1", func(g *SCIMGroup) error {
 		g.DisplayName = "Analysts"
 		g.Members = slices.DeleteFunc(g.Members, func(m string) bool { return m == "pat" })
@@ -375,6 +389,27 @@ func testDirectory(t *testing.T, d directory) {
 	if g, _ := d.SCIMGroup(ctx, "g-1"); g.DisplayName != "Analysts" {
 		t.Errorf("a failed change was kept: %+v", g)
 	}
+	// Applying the first change does not forget the second.
+	modified := changed()
+	if len(modified) != 2 || modified[0].Mark == created[0].Mark || modified[1].Mark == created[1].Mark {
+		t.Errorf("SCIMChanges after removing pat: %+v, before %+v", modified, created)
+	}
+	for _, c := range created {
+		if err := d.SCIMChangeApplied(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := changed(); !slices.Equal(c, modified) {
+		t.Errorf("SCIMChanges after applying earlier changes: %+v", c)
+	}
+	for _, c := range modified {
+		if err := d.SCIMChangeApplied(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := changed(); len(c) != 0 {
+		t.Errorf("SCIMChanges once applied: %+v", c)
+	}
 	if groups, _ := d.SCIMGroups(ctx); len(groups) != 1 {
 		t.Errorf("SCIMGroups: %+v", groups)
 	}
@@ -392,6 +427,9 @@ func testDirectory(t *testing.T, d directory) {
 	}
 	if err := d.DeleteSCIMGroup(ctx, "g-1"); !errors.Is(err, ErrSCIMNotFound) {
 		t.Errorf("deleting twice: %v", err)
+	}
+	if c := changed(); len(c) != 2 || c[0].User != "ana" || c[1].User != "pat" {
+		t.Errorf("SCIMChanges after deprovisioning pat and deleting ana's group: %+v", c)
 	}
 	if err := d.CreateSCIMGroup(ctx, SCIMGroup{ID: "g-4", DisplayName: "Everyone", Members: []string{"ana"}}); err != nil {
 		t.Fatal(err)
@@ -416,6 +454,9 @@ func testDirectory(t *testing.T, d directory) {
 	}
 	if g, _ := d.SCIMGroup(ctx, "g-4"); len(g.Members) != 0 {
 		t.Errorf("a dropped user is still a member: %+v", g)
+	}
+	if c := changed(); len(c) != 1 || c[0].User != "pat" {
+		t.Errorf("SCIMChanges after dropping ana: %+v", c)
 	}
 }
 

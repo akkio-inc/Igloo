@@ -1,6 +1,8 @@
 package scim
 
 import (
+	"cmp"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -15,7 +17,10 @@ import (
 
 // Groups are kept with their members; the group mappings (GRANT role TO SSO
 // GROUP 'name') match their display names. A change to a group applies the
-// mappings to its members, old and new, at once.
+// mappings to its members, old and new, at once. The store records them
+// with the change, so that those a failure leaves behind are applied by
+// the next request, even a provider's retry that finds a removed member
+// gone already, or by Run.
 
 func groupResource(r *http.Request, g auth.SCIMGroup, members bool) map[string]any {
 	res := map[string]any{
@@ -133,20 +138,58 @@ func patchGroup(g *auth.SCIMGroup, op patchOp) error {
 	return nil
 }
 
-// refresh applies the group mappings to users whose groups changed.
-func (h *Handler) refresh(r *http.Request, users ...[]string) {
-	done := map[string]bool{}
-	for _, list := range users {
-		for _, u := range list {
-			if done[u] {
-				continue
-			}
-			done[u] = true
-			if err := h.sso.RefreshRoles(r.Context(), u); err != nil && !errors.Is(err, auth.ErrNotFound) {
-				h.log.Warn("cannot apply the group mappings to a user", "user", u, "err", err)
-			}
+// applyChanges applies the group mappings to the users whose groups
+// changed (SCIMChanges): those of this request, and those earlier ones
+// left behind. It reports the first failure; the users it failed for stay
+// recorded. A replica applies changes one call at a time, so one that read
+// a user's groups before a later change never writes its roles over that
+// change's.
+func (h *Handler) applyChanges(ctx context.Context) error {
+	h.applying.Lock()
+	defer h.applying.Unlock()
+	changes, err := h.scim.SCIMChanges(ctx)
+	if err != nil {
+		return err
+	}
+	var failed error
+	for _, c := range changes {
+		err := h.sso.RefreshRoles(ctx, c.User)
+		if err == nil || errors.Is(err, auth.ErrNotFound) {
+			err = h.scim.SCIMChangeApplied(ctx, c)
+		}
+		if err != nil {
+			h.log.Warn("cannot apply the group mappings to a user yet", "user", c.User, "err", err)
+			failed = cmp.Or(failed, err)
 		}
 	}
+	return failed
+}
+
+// Run applies the group mappings to the users whose groups changed but
+// whose roles a failure left behind, now and every interval until ctx
+// ends.
+func (h *Handler) Run(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		if err := h.applyChanges(ctx); err != nil && ctx.Err() == nil {
+			h.log.Warn("cannot apply the group mappings after SCIM changed groups; trying again", "in", interval, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// changeError answers a group change that was kept but whose members'
+// roles could not be applied: the provider may send it again, which
+// applies them, and Run applies them meanwhile.
+func (h *Handler) changeError(w http.ResponseWriter, r *http.Request, err error) {
+	h.log.Error("SCIM changed a group but cannot apply the group mappings to its members yet", "err", err, "by", caller(r))
+	writeError(w, http.StatusInternalServerError, "", "the group was changed, but its members' roles could not be updated; "+
+		"Igloo updates them within a minute, or when the request is sent again")
 }
 
 // groupError writes the response for an error of the group store.
@@ -241,7 +284,11 @@ func (h *Handler) createGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.log.Info("SCIM created a group", "group", g.DisplayName, "members", len(g.Members), "by", caller(r))
-	h.refresh(r, g.Members)
+	// The group exists now, and a retry would be refused as a duplicate:
+	// it is answered with its id, and Run applies what failed.
+	if err := h.applyChanges(r.Context()); err != nil {
+		h.log.Error("SCIM created a group but cannot apply the group mappings to its members yet", "err", err, "by", caller(r))
+	}
 	created, err := h.scim.SCIMGroup(r.Context(), g.ID)
 	if err != nil {
 		h.serverError(w, err)
@@ -254,23 +301,23 @@ func (h *Handler) createGroup(w http.ResponseWriter, r *http.Request) {
 // modify changes a group and applies the mappings to its old and new
 // members.
 func (h *Handler) modify(w http.ResponseWriter, r *http.Request, change func(*auth.SCIMGroup) error) (auth.SCIMGroup, bool) {
-	var before, after []string
 	err := h.scim.ModifySCIMGroup(r.Context(), r.PathValue("id"), func(g *auth.SCIMGroup) error {
-		before = slices.Clone(g.Members)
 		if err := change(g); err != nil {
 			return err
 		}
 		if strings.TrimSpace(g.DisplayName) == "" {
 			return invalid("displayName is required")
 		}
-		after = slices.Clone(g.Members)
 		return nil
 	})
 	if err != nil {
 		h.groupError(w, err)
 		return auth.SCIMGroup{}, false
 	}
-	h.refresh(r, before, after)
+	if err := h.applyChanges(r.Context()); err != nil {
+		h.changeError(w, r, err)
+		return auth.SCIMGroup{}, false
+	}
 	g, err := h.scim.SCIMGroup(r.Context(), r.PathValue("id"))
 	if err != nil {
 		h.groupError(w, err)
@@ -322,7 +369,10 @@ func (h *Handler) deleteGroup(w http.ResponseWriter, r *http.Request) {
 		h.groupError(w, err)
 		return
 	}
-	h.refresh(r, g.Members)
 	h.log.Info("SCIM deleted a group", "group", g.DisplayName, "by", caller(r))
+	if err := h.applyChanges(r.Context()); err != nil {
+		h.changeError(w, r, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

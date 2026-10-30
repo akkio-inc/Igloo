@@ -37,6 +37,14 @@ type SCIMGroup struct {
 	Modified    time.Time
 }
 
+// SCIMChange is a user whose groups SCIM changed, whose roles are to be
+// brought in line with them again (sso.Service.RefreshRoles). Mark tells
+// one change of the user's groups from the next.
+type SCIMChange struct {
+	User string
+	Mark int64
+}
+
 var (
 	ErrSCIMNotFound = errors.New("not provisioned")
 	// ErrSCIMGroupExists is returned for a second group of the same name.
@@ -44,7 +52,11 @@ var (
 )
 
 // SCIMStore keeps provisioned users and groups. Implementations must be
-// safe for concurrent use.
+// safe for concurrent use. CreateSCIMGroup, ModifySCIMGroup,
+// DeleteSCIMGroup and DeleteSCIMUser record a SCIMChange for each user
+// whose groups they change, the group's members before and after,
+// atomically with the change: a failure to apply the users' roles after it
+// leaves them to be applied later.
 type SCIMStore interface {
 	// SCIMUsers lists provisioned users, by user name.
 	SCIMUsers(ctx context.Context) ([]SCIMUser, error)
@@ -73,4 +85,11 @@ type SCIMStore interface {
 	UserSCIMGroups(ctx context.Context, user string) ([]string, error)
 	// SCIMGroupNames returns those of names that are groups' names.
 	SCIMGroupNames(ctx context.Context, names []string) ([]string, error)
+
+	// SCIMChanges lists the users whose groups changed since their roles
+	// were last applied.
+	SCIMChanges(ctx context.Context) ([]SCIMChange, error)
+	// SCIMChangeApplied forgets c, once the user's roles follow their
+	// groups, unless the groups changed again after c was listed.
+	SCIMChangeApplied(ctx context.Context, c SCIMChange) error
 }

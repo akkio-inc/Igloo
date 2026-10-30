@@ -587,6 +587,22 @@ func serve() error {
 	if err != nil {
 		return err
 	}
+	// The roles of users whose groups SCIM changed, which a failure left
+	// behind, are applied until shutdown begins.
+	var scimHandler http.Handler
+	if provisioning != nil {
+		scimHandler = provisioning
+		scimCtx, stopSCIM := context.WithCancel(ctx)
+		scimDone := make(chan struct{})
+		go func() {
+			defer close(scimDone)
+			provisioning.Run(scimCtx, time.Minute)
+		}()
+		defer func() {
+			stopSCIM()
+			<-scimDone
+		}()
+	}
 
 	// Built-in alerts go out until shutdown begins.
 	notifyCtx, stopNotify := context.WithCancel(ctx)
@@ -650,7 +666,7 @@ func serve() error {
 			return err
 		}
 		status := consoleStatus(cfg, started, work, health, schedule, maintains)
-		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, single, provisioning, tlsConfig, status, errc, log); err != nil {
+		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, single, scimHandler, tlsConfig, status, errc, log); err != nil {
 			_ = consoleLn.Close()
 			return err
 		}
@@ -879,7 +895,7 @@ func openSSO(cfg config.Config, users auth.Store, changed func(string), log *slo
 
 // openSCIM sets up SCIM provisioning, which comes with single sign-on. It
 // returns nil without single sign-on.
-func openSCIM(users auth.Store, single *sso.Service, changed func(string), log *slog.Logger) (http.Handler, error) {
+func openSCIM(users auth.Store, single *sso.Service, changed func(string), log *slog.Logger) (*scim.Handler, error) {
 	store, ok := users.(auth.SCIMStore)
 	accounts, _ := users.(auth.AccountStore)
 	tokens, _ := users.(auth.TokenStore)
