@@ -106,6 +106,11 @@ type Engine interface {
 	// ForgetMissingSchema makes DuckDB forget a schema of the catalog it
 	// took for missing, if the catalog has it, and reports whether it did.
 	ForgetMissingSchema(ctx context.Context, schema string) bool
+	// ForgetTable has DuckDB's next DROP TABLE of the catalog's table
+	// name of schema, which the catalog renamed to as behind DuckDB's
+	// back, erase DuckDB's entry for it and nothing in the catalog, until
+	// stop is called.
+	ForgetTable(schema, name, as string) (stop func())
 	// BitmapsLoaded reports whether DuckDB has Igloo's rb extension.
 	BitmapsLoaded() bool
 }

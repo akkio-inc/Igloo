@@ -168,6 +168,7 @@ func (s *Server) swapIn(ctx context.Context, sess *session, r tableReplace) erro
 				quoteName(r.staging)+" or, if the rename went through, as "+quoteName(r.target))
 		case !staged && placed:
 			// Renamed all the same.
+			s.forgetStaging(ctx, sess, r, target)
 			return nil
 		case !staged:
 			return fmt.Errorf("renaming the new table %s to %s failed: %w; neither is in the catalog any more, so another session dropped the new table",
@@ -184,6 +185,19 @@ func (s *Server) swapIn(ctx context.Context, sess *session, r tableReplace) erro
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
 	return renameFailed(r, err)
+}
+
+// forgetStaging has DuckDB forget the new table's temporary name after a
+// rename into place that DuckDB heard fail but the catalog made: DuckDB
+// would list the table under it, to every session of the replica, until
+// it stops. Its drop of the name drops nothing in the catalog (see
+// Engine.ForgetTable). The caller holds the catalog lock exclusively.
+func (s *Server) forgetStaging(ctx context.Context, sess *session, r tableReplace, target auth.Object) {
+	defer s.engine.ForgetTable(target.Schema, r.staging[len(r.staging)-1], target.Table)()
+	if _, err := sess.conn.ExecContext(ctx, "DROP TABLE "+quoteName(r.staging), nil); err != nil {
+		s.log.Warn("DuckDB still lists the new table of a CREATE OR REPLACE TABLE under its temporary name, which the catalog renamed",
+			"table", target.String(), "name", quoteName(r.staging), "err", err)
+	}
 }
 
 // renameFailed is swapIn's error when the new table stays under its

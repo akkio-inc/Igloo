@@ -416,6 +416,16 @@ func (e *Engine) ForgetMissingSchema(ctx context.Context, schema string) bool {
 	return err == nil
 }
 
+// ForgetTable has DuckDB forget the table name of schema, of the catalog,
+// which the catalog renamed to as though DuckDB heard the rename fail, so
+// that DuckDB stops listing it: until stop is called, DuckDB's next DROP
+// TABLE of name loads the table as as, and drops nothing in the catalog
+// (see catalogproxy's Forget). The caller runs the drop holding the
+// catalog lock exclusively.
+func (e *Engine) ForgetTable(schema, name, as string) (stop func()) {
+	return e.proxy.Forget(strings.Split(schema, "."), name, as)
+}
+
 // LoadSchemas makes the catalog views (information_schema, pg_catalog,
 // duckdb_columns) show the real columns of every Iceberg table. DuckDB loads
 // an Iceberg table's schema the first time the table is used and until then

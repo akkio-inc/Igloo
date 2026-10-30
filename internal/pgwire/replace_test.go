@@ -47,8 +47,7 @@ func (env *catalogEnv) withObjects(t *testing.T, opts ...engine.Option) {
 }
 
 // tablesNamed lists the catalog's tables whose names start with prefix,
-// as the catalog itself has them, without faults: DuckDB keeps listing a
-// table it renamed while it heard that the rename failed.
+// as the catalog itself has them, without faults.
 func (env *catalogEnv) tablesNamed(t *testing.T, prefix string) []string {
 	t.Helper()
 	ctx := context.Background()
@@ -76,7 +75,9 @@ func (env *catalogEnv) tablesNamed(t *testing.T, prefix string) []string {
 // drop the new table was dropped too, and after such a rename the table in
 // place, the new one, was dropped as if another session had made it: both
 // copies were gone, and the error said the new table was complete under
-// its temporary name.
+// its temporary name. Once that was fixed, DuckDB still listed the new
+// table under its temporary name too, on every session, after such a
+// rename.
 func TestReplaceKeepsTheNewTableWhenTheCatalogFails(t *testing.T) {
 	t.Parallel()
 	env := newCatalogEnv(t)
@@ -104,6 +105,11 @@ func TestReplaceKeepsTheNewTableWhenTheCatalogFails(t *testing.T) {
 		}
 		if got := env.tablesNamed(t, tbl); !slices.Equal(got, []string{tbl}) {
 			t.Errorf("%s applied but failed: the catalog has %v, want only %s", c.name, got, tbl)
+		}
+		// DuckDB's listing of the catalog, which the session lists it by,
+		// agrees.
+		if got := texts(t, conn, "SELECT table_name FROM information_schema.tables WHERE table_name LIKE $1 ORDER BY 1", tbl+"%"); !slices.Equal(got, []string{tbl}) {
+			t.Errorf("%s applied but failed: DuckDB lists %v, want only %s", c.name, got, tbl)
 		}
 		var n int64
 		if err := conn.QueryRow(context.Background(), "SELECT count(*) FROM "+tbl).Scan(&n); err != nil || n != 5 {

@@ -156,6 +156,10 @@ type Proxy struct {
 	// namespaces.go), keyed by their names joined by \x1f; mu guards it.
 	prefix atomic.Pointer[string]
 	hide   map[string]bool
+	// gone are the tables DuckDB is to forget, by namespace and name,
+	// lower-cased, with the names the catalog renamed them to (see
+	// gone.go); mu guards it.
+	gone map[[2]string]string
 }
 
 // New starts a proxy to the catalog on a random loopback port.
@@ -202,6 +206,7 @@ func New(opts Options) (*Proxy, error) {
 		cancel:  cancel,
 		changes: map[[sha256.Size]byte]*change{},
 		hide:    map[string]bool{},
+		gone:    map[[2]string]string{},
 		lists:   newListings(opts.ListTTL),
 		names:   newNames(opts.ListTTL),
 	}
@@ -284,7 +289,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.notePrefix(rest)
-	if p.refuseShared(w, r, rest) {
+	if p.refuseShared(w, r, rest) || p.forgotten(w, r, rest) {
 		return
 	}
 	switch r.Method {
