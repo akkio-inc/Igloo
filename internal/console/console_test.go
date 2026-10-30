@@ -795,6 +795,10 @@ func TestDownloadRepeatsTheRunsSettings(t *testing.T) {
 	if status, body := download("INSERT INTO orders VALUES ('again')", "SET GLOBAL search_path = tenant_a"); status != http.StatusOK || body != "what\nmain\n" {
 		t.Errorf("after INSERT: %d %q", status, body)
 	}
+	// Nor what follows a setting in the same entry.
+	if status, body := download("SET search_path = tenant_a; DELETE FROM orders"); status != http.StatusOK || body != "what\ntenant_a\n" {
+		t.Errorf("after SET and DELETE in one entry: %d %q", status, body)
+	}
 	// What a new session cannot have without running more, the download
 	// refuses rather than read another table.
 	for _, before := range [][]string{

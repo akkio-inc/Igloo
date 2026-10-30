@@ -376,9 +376,17 @@ func (c *Console) download(w http.ResponseWriter, r *http.Request, req *request)
 // objects were made, inside a transaction block, or after a setting
 // computed by an expression, which could do anything an expression can.
 func settingsBefore(before []string) ([]string, error) {
+	// Each entry is split again, so that one holding a setting and then
+	// more statements runs only the setting again.
+	var stmts []string
+	for _, text := range before {
+		for _, s := range sqllex.Split(text) {
+			stmts = append(stmts, s.Text)
+		}
+	}
 	var settings []string
 	inBlock := false
-	for _, text := range before {
+	for _, text := range stmts {
 		words := sqllex.CodeWords(text)
 		if len(words) == 0 {
 			continue
