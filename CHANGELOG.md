@@ -1861,6 +1861,115 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A SQL connection must sign in within `IGLOO_LOGIN_TIMEOUT` (30 seconds)
+  or is closed, and at most `IGLOO_MAX_CONNECTIONS` (at least 100) may be
+  signing in at once, half of them from one address; others are refused
+  with `53300`. A connection read through a 16 MiB buffer from its first
+  byte, and logins left hanging held their user's login slots for good, so
+  ten stalled handshakes blocked a user's password logins, and idle
+  sockets that never signed in could fill a replica's memory. The buffer
+  now starts at 8 KiB and grows to the 16 MiB message limit (see
+  [configuration](docs/configuration.md#server)).
+- A replica that cannot read the metadata database goes on with the users,
+  tokens, grants and policies it read last for up to
+  `IGLOO_ACCESS_MAX_STALENESS` (2 minutes), then refuses statements with
+  `58000` until it can read them again, rather than apply them for as long
+  as it ran: a user disabled, or a token, grant or policy changed, on a
+  healthy replica did not reach one cut off from the database.
+- Without TLS, the console, SCIM, Delta Sharing, the clean room API and
+  Flight SQL take requests addressed to `localhost` only from a loopback or
+  private address, as the Iceberg REST catalog does; a request from
+  anywhere could name `localhost` in its Host.
+- With SCIM on, removing a user from a group the identity provider pushes
+  takes the group's roles away at once. The groups of the user's last
+  sign-in token were added to SCIM's, so a group the token had listed kept
+  its roles until the next console sign-in.
+- A SCIM group change whose roles cannot be applied answers 500, and the
+  users it touches are recorded with it (`igloo_auth.scim_changes`), so the
+  provider's retry, or a sweep each minute, applies them. It answered 204,
+  and a retry, finding the removed user already out of the group, left
+  their roles.
+- Access tokens of the identity provider sign SQL clients in as the linked
+  user only by issuer and subject, or by the claim
+  `IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM` names (`uid` for Okta, `oid` for Entra
+  ID) as recorded at the user's last console sign-in, never by email: a new
+  account given a reused address signed in as the old one. Users whose
+  provider's access tokens have a subject of their own need that setting,
+  and one console sign-in, to use them again (see [single
+  sign-on](docs/sso.md)).
+- Dropping a user disowns their models, shown as owned by `name (dropped)`,
+  which only admins can then grant, replace or drop, and dropping a user or
+  role removes the models' grants to it, as for tasks and alerts. A user
+  or role created later with the same name, by SSO sign-in too, got them.
+- A task's or alert's run that came due before its owner was dropped is
+  skipped when its owner changed, rather than run as a new user of the same
+  name.
+- AI functions keep their cached answers per integration, by its ID,
+  address and API settings, rather than per provider host, so an
+  integration a user may not use cannot answer them through another one's
+  cache. Providers' error messages in row errors, `error_details` and
+  notices are scrubbed of the integration's keys and headers, as other
+  errors were.
+- `CREATE OR REPLACE TABLE` asks the catalog what happened when dropping the
+  old table or renaming the new one into its place fails, and drops the new
+  table only when the catalog refused the drop. When the catalog cannot
+  say, the error names the new table and the `ALTER TABLE ... RENAME TO`
+  that puts it in place. A drop or rename the catalog applied without
+  confirming it lost both tables.
+- A clone the catalog registered, though the answer to registering it was
+  lost, is kept and reported as made, rather than undone with its metadata
+  file and share records deleted while the catalog still served it.
+- A run of a task, pipe, materialized view or alert stops within seconds
+  of losing its lock in the metadata database, and is recorded as failed,
+  rather than run on alongside the next; a clone that lost its lock undoes
+  itself rather than let its source's files be purged.
+- Dropping or replacing a model while another model with the same blob is
+  being created no longer deletes that blob: writing and deleting a blob
+  are serialized by its hash, across replicas.
+- `COPY INTO` and pipes record their files as `unknown` in
+  `igloo.load_history` when the load's commit fails other than by a
+  conflict, as when the catalog applied it and stopped answering (`40003`),
+  rather than forget them and load them again on the next run.
+- A distributed statement runs on one machine when a column's type, nested
+  fields included, changed between planning and running it, rather than
+  read the new snapshot's files with the old types: a `FLOAT` promoted to
+  `DOUBLE` lost precision.
+- Tables of Iceberg format version 3 whose fields have initial defaults are
+  read on one machine, which applies them, rather than by workers, which
+  read `NULL`.
+- Training on a sample keeps or drops each copy of a repeated row on its
+  own, by `seed`, aims below the row and value limits, and says so when the
+  sample is empty. Identical rows were all kept or all dropped, so a class
+  could vanish from the sample.
+- The scale-to-zero gateway stops Igloo only when every replica says it is
+  idle, or when its SQL port refuses connections, and warns when it cannot
+  tell. An activity endpoint it could not read counted as idle, and stopped
+  running queries.
+- A start for scheduled work that fails is tried again, after a wait that
+  doubles up to 5 minutes, rather than forgotten until a client connects.
+- Download CSV runs a worksheet's query with the settings the statements
+  before it in the run made (`SET`, `USE`, `ALTER SESSION`), and refuses
+  one that ran after temporary objects were made, inside a transaction
+  block, or after a setting computed by an expression, rather than download
+  another schema's table.
+- The console saves each worksheet on its own, and its tabs see each
+  other's changes, rather than one tab overwriting another's work with an
+  older copy.
+- The loading guide's hourly rollup task is a `MERGE` that can run again;
+  the `INSERT` it showed did not parse, and counted the latest hour again
+  on every run.
+- The migration report compares integers and decimals exactly, and tells
+  `NULL` from `\N` and one column's values from the next's; it matched
+  results that differed in these. Only doubles are compared to 10
+  significant digits.
+- The benchmark turns Igloo's result cache off, as it does Snowflake's and
+  Databricks', checks that it is off, and records it in its results.
+- The benchmark report bills a burst for the longer of its work plus the
+  idle tail and the platform's minimum, as `pricing.toml` describes, rather
+  than the longer of its work and the minimum plus the idle tail. Four
+  Snowflake burst and monthly figures fall, X-Small Gen2 at scale 10 from
+  $99 to $74 a month; the warm-run comparisons do not change. Its Failed
+  column shows queries that failed in only some of a row's merged runs.
 - `RESET search_path` and `RESET schema`, and `SET search_path TO DEFAULT`
   and `SET schema TO DEFAULT`, put a session back on the schema and search
   path it started with, the catalog's default schema and its views' schema.
