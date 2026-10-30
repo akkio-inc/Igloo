@@ -1,29 +1,30 @@
 /*
  * Igloo landing: site header and hero (Linear style, dark only).
- * A frosted tray header floats over the whole illustration, which spans the hero; the copy sits on a frosted
- * panel between the igloo and the moon. Below 900 px the illustration becomes a banner above the copy. Colours, widths and fonts come from the site tokens.
+ * A frosted header bar floats over the scene, which fills the first screen and is animated in WebGL
+ * (hero.js); the copy is centred over its sky. On narrow screens the scene's crop moves toward the igloo.
+ * Colours, widths and fonts come from the site tokens.
  */
 .vx-header,
 .vx-hero {
 	--vx-hh: clamp(60px, 5vw, 72px);
+	--vx-gap: clamp(8px, 1.2vw, 16px);
 	--vx-ink: #0a0d12;
 	color: var(--text);
 	font-family: var(--font-sans);
 }
 
-/* ------------------------------------------------------------------ header: a frosted tray */
+/* ------------------------------------------------------------------ header: a floating frosted bar */
 .vx-header {
 	position: sticky;
 	top: 0;
 	z-index: 50;
-	height: var(--vx-hh);
-	padding: 0 clamp(8px, 2vw, 32px);
+	height: calc(var(--vx-hh) + var(--vx-gap));
+	padding: var(--vx-gap) clamp(8px, 2vw, 32px) 0;
 }
 .vx-header__bar {
 	height: 100%;
 	border: 1px solid rgba(175, 195, 220, 0.145);
-	border-top: 0;
-	border-radius: 0 0 16px 16px;
+	border-radius: 16px;
 	background: rgba(9, 13, 19, 0.55);
 	-webkit-backdrop-filter: blur(12px) saturate(1.5);
 	backdrop-filter: blur(12px) saturate(1.5);
@@ -123,75 +124,78 @@
 	display: inline;
 }
 
-/* ------------------------------------------------------------------ hero */
+/* ------------------------------------------------------------------ hero: the scene fills the first screen */
 .vx-hero {
 	position: relative;
 	isolation: isolate;
 	overflow: hidden;
-	margin-top: calc(-1 * var(--vx-hh));
-	padding-top: var(--vx-hh);
-	min-height: var(--hero-h);
-	background: var(--vx-ink);
-	--hero-h: max(clamp(520px, 40vw, 640px), 100vw / 3 + 72px);
+	display: flex;
+	margin-top: calc(-1 * (var(--vx-hh) + var(--vx-gap)));
+	padding-top: calc(var(--vx-hh) + var(--vx-gap));
+	/* the first screen, less a strip where the next section's cards begin to show */
+	min-height: clamp(600px, calc(100svh - 130px), 1080px);
+	background: var(--bg);
+	/* where the crop centres when the screen is narrower than the scene (an object-position) */
+	--focus: 50%;
 }
-/* the whole illustration (3:1) across the hero's bottom; its sky fades into the page above, its snow below */
+/* a still of the scene (the poster) until the animated canvas has drawn its first frame; it fades into the page.
+   Behind the poster, a blurred 48 x 32 copy of it (--placeholder) shows while the poster loads. */
 .vx-hero__art {
 	position: absolute;
+	inset: 0;
 	z-index: -2;
-	left: 0;
-	right: 0;
-	top: auto;
-	bottom: 0;
-	-webkit-mask-image: linear-gradient(180deg, transparent 0, #000 16%, #000 84%, transparent 100%);
-	mask-image: linear-gradient(180deg, transparent 0, #000 16%, #000 84%, transparent 100%);
-	aspect-ratio: 3 / 1;
+	--placeholder: url('data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCAAgADADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDyy50xk814DvSI4dejp25H9avR2ceoaO9xZH/SYlxcW46kdnA7j19Kn1a1kiuRNCGhk8xhjAB6A5G3gjnqOD+NQLbSpcrJvNncxglZo/uMR3yOnpnpXZHVXOWtCa67f1qYmK09MFrLLbiZ1Ro5ACD/ABLUVyXdyLiJRJ3dABn3OODVfymPABp2aKkueNti/dXxt7l0gtFhdRty/JFUSl1fzlmLzSMeWNaFtazy5V4XuWC5VVGSPqfSrVnaXH2oCeNlVeWjHyjABP8AShoVONtEvmaU1p5umI0iCM/xKhdgr4IyAuQMjHp0qnFYXDRI8U6kkEEbsnHfgj2p+n3elRJK8MUtvJIuGiZsoT7NnIH+c1ooWh043bs0UaKQg81SX7fXrSirbGtWrGFrmM8NwWbzI4W5PzMwXOKtWmgalcuCot4QRnczgYrOfUkkZ2dTuI2gk56nmnWVzLCPOTaq5PJB59K1v5kcy3aPRdH0rT9I0eRLq4ikmlk3SLGd25ecAH26/XNc9PbCV2GwyIMkAAZX8+Meta1i1o2ltO8zh/tCJ8rcAEtnt/siuWuteOA06h5F+ZVZA30HoPrzXNRlH37XfqdVS/u9D//Z') var(--focus) 50% / cover no-repeat;
+	-webkit-mask-image: linear-gradient(180deg, #000 80%, transparent 100%);
+	mask-image: linear-gradient(180deg, #000 80%, transparent 100%);
 }
-.vx-hero__art img {
+.vx-hero__art::before {
+	content: '';
+	position: absolute;
+	inset: -48px;
+	background: var(--placeholder);
+	filter: blur(24px);
+}
+.vx-hero__poster,
+.vx-hero__scene {
+	position: absolute;
+	inset: 0;
 	width: 100%;
 	height: 100%;
 	max-width: none;
 	object-fit: cover;
-	object-position: 50% 50%;
-	filter: brightness(0.9) saturate(0.82) contrast(1.04);
+	object-position: var(--focus) 50%;
 }
-/* no scrim: the copy brings its own frosted panel, so the igloo and the moon stay clear */
+.vx-hero__scene {
+	opacity: 0;
+	transition: opacity 0.8s ease;
+}
+.vx-hero__art.is-live .vx-hero__scene {
+	opacity: 1;
+}
+/* a soft shade behind the copy, so it reads over the aurora */
 .vx-hero::before {
 	content: '';
 	position: absolute;
 	inset: 0;
 	z-index: -1;
 	pointer-events: none;
-	background: none;
+	background: radial-gradient(ellipse 46% 42% at 50% 40%, rgba(6, 9, 15, 0.5), rgba(6, 9, 15, 0));
 }
 .vx-hero__inner {
-	width: 100%;
-	margin-inline: 0;
-	padding: clamp(24px, 3vw, 40px) 0 clamp(48px, 5vw, 72px);
 	display: flex;
-	align-items: center;
-	min-height: calc(var(--hero-h) - var(--vx-hh));
 	justify-content: center;
-	padding-inline: 34vw 12vw;
+	width: min(100% - 2 * var(--gutter), var(--content));
+	margin-inline: auto;
+	padding: clamp(40px, 9vh, 120px) 0 clamp(48px, 8vh, 96px);
 }
-/* a frosted panel like the header's tray, as wide as its copy, centred between the igloo (left third) and the moon */
 .vx-hero__copy {
 	display: flex;
 	flex-direction: column;
-	align-items: flex-start;
-	max-width: 100%;
-	width: fit-content;
-	padding: clamp(28px, 3vw, 44px);
-	border: 1px solid rgba(175, 195, 220, 0.145);
-	border-radius: 20px;
-	background: rgba(9, 13, 19, 0.55);
-	-webkit-backdrop-filter: blur(14px) saturate(1.4);
-	backdrop-filter: blur(14px) saturate(1.4);
-	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 24px 60px rgba(0, 0, 0, 0.35);
+	align-items: center;
+	text-align: center;
 }
 .vx-hero__title {
-	margin-left: -0.04em;
-	padding-right: 0.06em;
-	padding-bottom: 0.1em;
+	padding: 0 0.06em 0.1em;
 	font-size: clamp(4.25rem, 2rem + 6vw, 7.5rem);
 	font-weight: 700;
 	line-height: 1;
@@ -204,18 +208,14 @@
 }
 .vx-hero__tagline {
 	margin-top: 0.75rem;
+	max-width: 16em;
 	font-size: clamp(1.375rem, 0.9rem + 1.9vw, 2.625rem);
+	font-weight: 500;
 	line-height: 1.15;
+	letter-spacing: -0.025em;
 	color: var(--text);
 	text-wrap: balance;
-	max-width: 14.5em;
-	font-weight: 500;
-	letter-spacing: -0.025em;
-}
-.vx-hero__claim {
-	margin-top: clamp(20px, 2vw, 28px);
-	color: #f7c66f;
-	display: flex;
+	text-shadow: 0 2px 24px rgba(0, 0, 0, 0.45);
 }
 /* Snowflake and Databricks stay on one line; Snow and bricks take the wordmark's ice */
 .vx-hero__rivals {
@@ -232,7 +232,24 @@
 	background-clip: text;
 	-webkit-text-fill-color: transparent;
 }
-/* the claim as two figures with a label under each, divided by a hairline, as in the benchmark cards */
+/* "Up to" over two figures, each with a label under it, divided by a hairline as in the benchmark cards */
+.vx-hero__claim {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	margin-top: clamp(22px, 3vh, 34px);
+	color: #f7c66f;
+	text-align: left;
+}
+.vx-hero__upto {
+	margin-bottom: 10px;
+	font-size: 1rem;
+	font-weight: 400;
+	color: var(--text-2);
+}
+.vx-hero__stats {
+	display: flex;
+}
 .vx-hero__stat {
 	display: flex;
 	flex-direction: column;
@@ -260,8 +277,9 @@
 .vx-hero__cta {
 	display: flex;
 	flex-wrap: wrap;
+	justify-content: center;
 	gap: 14px;
-	margin: clamp(28px, 2.6vw, 36px) 0 0;
+	margin-top: clamp(28px, 3.4vh, 40px);
 }
 .vx-hero__btn {
 	display: inline-flex;
@@ -283,7 +301,6 @@
 	height: 20px;
 }
 .vx-hero__btn--primary {
-	position: relative;
 	padding-right: 24px;
 	background: linear-gradient(180deg, #fbca7c, #f7b354);
 	color: #1a1307;
@@ -292,54 +309,21 @@
 .vx-hero__btn--primary:hover {
 	filter: brightness(1.05);
 }
-/* ghost pill with a gradient border */
+/* a frosted ghost pill with a hairline border, like the header bar */
 .vx-hero__btn--ghost {
 	padding-left: 24px;
-	border: 1px solid transparent;
-	background: linear-gradient(#0e1218, #0e1218) padding-box, linear-gradient(180deg, #3a4148, #252a33) border-box;
+	border: 1px solid rgba(175, 195, 220, 0.22);
+	background: rgba(9, 13, 19, 0.55);
+	-webkit-backdrop-filter: blur(12px) saturate(1.4);
+	backdrop-filter: blur(12px) saturate(1.4);
 	color: var(--text);
 	font-weight: 500;
 }
 .vx-hero__btn--ghost:hover {
-	background: linear-gradient(var(--surface-2), var(--surface-2)) padding-box, linear-gradient(180deg, #4a525b, #2c323b) border-box;
-}
-/* ------------------------------------------------------------------ the nav collapses behind a menu button */
-/* ------------------------------------------------------------------ below 1200 px the whole illustration is a banner
-   above the copy: narrower, the 3:1 picture is too short to hold the panel */
-@media (max-width: 1199px) {
-	.vx-hero__art {
-		position: relative;
-		inset: auto;
-		width: 100%;
-		-webkit-mask-image: linear-gradient(180deg, transparent 0, #000 12%, #000 80%, transparent 100%);
-		mask-image: linear-gradient(180deg, transparent 0, #000 12%, #000 80%, transparent 100%);
-	}
-	.vx-hero::before {
-		background: none;
-	}
-	.vx-hero {
-		min-height: 0;
-	}
-	.vx-hero__inner {
-		display: block;
-		width: min(100% - 2 * var(--gutter), var(--content));
-		min-height: 0;
-		margin-inline: auto;
-		padding: 8px 0 48px;
-	}
-	.vx-hero__copy {
-		max-width: 40rem;
-		width: auto;
-		padding: 0;
-		border: 0;
-		border-radius: 0;
-		background: none;
-		-webkit-backdrop-filter: none;
-		backdrop-filter: none;
-		box-shadow: none;
-	}
+	background: rgba(22, 27, 35, 0.7);
 }
 
+/* ------------------------------------------------------------------ the nav collapses behind a menu button */
 @media (max-width: 899px) {
 	.vx-header.vx-js .vx-header__menu {
 		display: grid;
@@ -383,6 +367,13 @@
 	}
 }
 
+/* ------------------------------------------------------------------ narrower screens: the crop moves toward the igloo */
+@media (max-width: 1199px) {
+	.vx-hero {
+		--focus: 70%;
+	}
+}
+
 /* ------------------------------------------------------------------ phones */
 @media (max-width: 767px) {
 	.vx-header__inner {
@@ -393,10 +384,11 @@
 		border-right: 0;
 	}
 	.vx-hero {
-		min-height: 0;
+		min-height: max(640px, calc(100svh - 48px));
+		--focus: 82%;
 	}
-	.vx-hero__copy {
-		max-width: none;
+	.vx-hero__inner {
+		padding-top: 28px;
 	}
 	.vx-hero__title {
 		font-size: 4.5rem;
@@ -407,43 +399,8 @@
 	.vx-header__nav a,
 	.vx-header__github,
 	.vx-header__menu,
-	.vx-hero__btn {
+	.vx-hero__btn,
+	.vx-hero__scene {
 		transition: none;
 	}
-}
-
-/* section edges: fade */
-.vx-hero {
-  position: relative;
-  isolation: isolate;
-  background: var(--bg);
-}
-.vx-hero::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -3;
-  pointer-events: none;
-  background: var(--vx-ink);
-  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
-  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
-}
-.vx-hero::before {
-  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
-  mask-image: linear-gradient(to bottom, transparent, #000 120px, #000 calc(100% - 120px), transparent);
-}
-
-/* "Up to" sits over the two figures, in the labels' voice */
-.vx-hero__claim {
-	flex-direction: column;
-	align-items: flex-start;
-}
-.vx-hero__upto {
-	margin-bottom: 10px;
-	font-size: 1rem;
-	font-weight: 400;
-	color: var(--text-2);
-}
-.vx-hero__stats {
-	display: flex;
 }

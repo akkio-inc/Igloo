@@ -21,7 +21,16 @@
 </header>
 <section class="vx-hero" id="top" aria-labelledby="vx-hero-title">
 	<div class="vx-hero__art" aria-hidden="true">
-		<img src="{{asset:site/src/assets/hero-dark.png}}" alt="" width="2400" height="800" loading="eager" fetchpriority="high" decoding="async" />
+		<img class="vx-hero__poster" src="{{asset:site/src/assets/hero-2b/poster.jpg}}" alt="" width="2400" height="1600" loading="eager" fetchpriority="high" decoding="async" />
+		<canvas
+			class="vx-hero__scene"
+			data-plate="{{asset:site/src/assets/hero-2b/plate.jpg}}"
+			data-aurora="{{asset:site/src/assets/hero-2b/aurora.jpg}}"
+			data-masks="{{asset:site/src/assets/hero-2b/masks.png}}"
+			data-warm="{{asset:site/src/assets/hero-2b/warm.png}}"
+			data-ice-normal="{{asset:site/src/assets/hero-2b/ice-normal.png}}"
+			data-ice-roughness="{{asset:site/src/assets/hero-2b/ice-roughness.png}}"
+		></canvas>
 	</div>
 	<div class="vx-hero__inner">
 		<div class="vx-hero__copy">
