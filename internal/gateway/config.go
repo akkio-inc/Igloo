@@ -20,6 +20,10 @@ type Config struct {
 	ActivityURL   string
 	SuspendAfter  time.Duration
 	ResumeTimeout time.Duration
+	// FirstByteTimeout and MaxWaiting hold connections to limits until
+	// they are forwarded (see Options).
+	FirstByteTimeout time.Duration
+	MaxWaiting       int
 
 	// ConsoleListenAddr and ConsoleBackend forward the web console too,
 	// when ConsoleBackend is set.
@@ -120,6 +124,13 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 	}
 	cfg.SuspendAfter = duration("IGLOO_GATEWAY_SUSPEND_AFTER", "10m")
 	cfg.ResumeTimeout = duration("IGLOO_GATEWAY_RESUME_TIMEOUT", "5m")
+	cfg.FirstByteTimeout = duration("IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT", defaultFirstByteTimeout.String())
+	maxWaiting := get("IGLOO_GATEWAY_MAX_WAITING", strconv.Itoa(defaultMaxWaiting))
+	if n, err := strconv.Atoi(maxWaiting); err != nil || n < 1 {
+		addErr("IGLOO_GATEWAY_MAX_WAITING must be a positive integer, got %q", maxWaiting)
+	} else {
+		cfg.MaxWaiting = n
+	}
 
 	switch cfg.Compute {
 	case "ec2":

@@ -17,6 +17,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -68,7 +70,15 @@ type Options struct {
 	SuspendAfter time.Duration
 	// ResumeTimeout bounds how long a client waits for Igloo to start.
 	ResumeTimeout time.Duration
-	Compute       Compute
+	// FirstByteTimeout is how long a client has, from connecting, to send
+	// its first bytes; until it has, the gateway neither starts Igloo nor
+	// connects to it. Zero means defaultFirstByteTimeout.
+	FirstByteTimeout time.Duration
+	// MaxWaiting is how many connections may wait at once, for their
+	// first bytes or for Igloo to start; further ones are closed at once.
+	// Zero means defaultMaxWaiting.
+	MaxWaiting int
+	Compute    Compute
 	// Metrics may be nil.
 	Metrics *Metrics
 	Log     *slog.Logger
@@ -123,17 +133,39 @@ type Gateway struct {
 	// again, and retryWait how long it waits for that.
 	retryAt   time.Time
 	retryWait time.Duration
+	// waiting counts the connections not yet forwarded (see admit), and
+	// warned is when one refused or timed out was last logged.
+	waiting int
+	warned  time.Time
 }
 
 // scheduleRetryMax bounds the wait between starts for scheduled work that
 // keep failing.
 const scheduleRetryMax = 5 * time.Minute
 
+// A connection is held to limits until the gateway forwards it. Its
+// client must send its first bytes within FirstByteTimeout of connecting,
+// before the gateway starts Igloo or connects to it; every protocol the
+// gateway forwards has the client speak first. And only MaxWaiting
+// connections may wait at once, for their first bytes or for Igloo to
+// start; further ones are closed as soon as they are accepted. Once a
+// client has sent something, it waits for Igloo as long as a start takes
+// (ResumeTimeout). Without these, every connection held a socket and a
+// goroutine for as long as its client kept it open, sending nothing, and
+// started the compute. Igloo then holds connections to its own limits
+// until they sign in (IGLOO_LOGIN_TIMEOUT).
+const (
+	defaultFirstByteTimeout = 30 * time.Second
+	defaultMaxWaiting       = 200
+)
+
 // New returns a gateway; call Serve to accept connections.
 func New(opts Options) *Gateway {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
+	opts.FirstByteTimeout = cmp.Or(opts.FirstByteTimeout, defaultFirstByteTimeout)
+	opts.MaxWaiting = cmp.Or(opts.MaxWaiting, defaultMaxWaiting)
 	g := &Gateway{
 		opts:    opts,
 		dialer:  net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second},
@@ -215,6 +247,12 @@ func (g *Gateway) accept(ctx context.Context, ln net.Listener, backend string, w
 			}
 			return err
 		}
+		if !g.admit() {
+			g.warn("refused a connection: too many connections waiting", "client", conn.RemoteAddr().String(),
+				"max", g.opts.MaxWaiting)
+			_ = conn.Close()
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -227,13 +265,27 @@ func (g *Gateway) handle(ctx context.Context, client net.Conn, addr string) {
 	g.track(client, true)
 	defer g.track(client, false)
 	defer client.Close() //nolint:errcheck
+	doneWaiting := sync.OnceFunc(g.release)
+	defer doneWaiting()
 
+	first, err := g.firstBytes(client)
+	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			g.warn("closed a connection that sent nothing within the first-byte timeout",
+				"client", client.RemoteAddr().String(), "timeout", g.opts.FirstByteTimeout)
+		}
+		return
+	}
 	backend, err := g.connect(ctx, addr)
+	doneWaiting()
 	if err != nil {
 		g.opts.Log.Warn("could not reach igloo", "client", client.RemoteAddr().String(), "err", err)
 		return
 	}
 	defer backend.Close() //nolint:errcheck
+	if _, err := backend.Write(first); err != nil {
+		return
+	}
 
 	done := make(chan struct{}, 2)
 	pipe := func(dst, src net.Conn) {
@@ -628,6 +680,56 @@ func (g *Gateway) track(client net.Conn, open bool) {
 		delete(g.clients, client)
 	}
 	g.opts.Metrics.connections(len(g.clients), open)
+}
+
+// admit counts a connection as waiting, reporting false when MaxWaiting
+// already are.
+func (g *Gateway) admit() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.waiting >= g.opts.MaxWaiting {
+		return false
+	}
+	g.waiting++
+	return true
+}
+
+// release counts a connection admitted as no longer waiting: it is
+// forwarded, or closed.
+func (g *Gateway) release() {
+	g.mu.Lock()
+	g.waiting--
+	g.mu.Unlock()
+}
+
+// firstBytes waits up to FirstByteTimeout for the client to send
+// something, and returns what it sent, for the gateway to pass on to
+// Igloo.
+func (g *Gateway) firstBytes(client net.Conn) ([]byte, error) {
+	_ = client.SetReadDeadline(time.Now().Add(g.opts.FirstByteTimeout))
+	buf := make([]byte, 4096)
+	n, err := client.Read(buf)
+	if n == 0 {
+		return nil, cmp.Or(err, io.ErrNoProgress)
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	g.touch()
+	return buf[:n], nil
+}
+
+// warn logs msg, at most once a minute: connections that send nothing
+// come in floods.
+func (g *Gateway) warn(msg string, args ...any) {
+	g.mu.Lock()
+	now := time.Now()
+	quiet := now.Sub(g.warned) < time.Minute
+	if !quiet {
+		g.warned = now
+	}
+	g.mu.Unlock()
+	if !quiet {
+		g.opts.Log.Warn(msg, args...)
+	}
 }
 
 func (g *Gateway) touch() { g.traffic.Store(time.Now().UnixNano()) }

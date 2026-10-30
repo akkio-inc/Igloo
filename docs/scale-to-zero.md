@@ -22,7 +22,14 @@ Clients connect to it instead of to Igloo, and so can browsers using the
 
 - When a client connects and Igloo is stopped, the gateway starts the
   compute and holds the connection until Igloo accepts it. The client sees a
-  slow login, nothing else.
+  slow login, nothing else. The gateway waits for the client's first bytes
+  before it starts Igloo or connects to it: a connection that sends nothing
+  within `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT` (30 seconds) is closed, and
+  starts nothing. At most `IGLOO_GATEWAY_MAX_WAITING` (200) connections may
+  wait at once, for their first bytes or for Igloo to start; further ones
+  are closed at once, with a warning in the gateway's log at most once a
+  minute. A client that has sent something waits for a start as long as
+  `IGLOO_GATEWAY_RESUME_TIMEOUT`.
 - Once connected, the gateway copies bytes in both directions. TLS and
   passwords stay end to end between the client and Igloo; the gateway never
   sees them.
@@ -240,6 +247,8 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_COMPUTE` | (required) | `ec2`, `kubernetes` or `command` |
 | `IGLOO_GATEWAY_SUSPEND_AFTER` | `10m` | Stop Igloo after this long without client traffic or running work |
 | `IGLOO_GATEWAY_RESUME_TIMEOUT` | `5m` | How long a connecting client waits for Igloo to start before the gateway gives up and closes the connection |
+| `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT` | `30s` | How long a client has, from connecting, to send its first bytes. The gateway neither starts Igloo nor connects to it until then, and closes a connection that sends nothing for this long. It does not bound the wait for a start, which `IGLOO_GATEWAY_RESUME_TIMEOUT` does. |
+| `IGLOO_GATEWAY_MAX_WAITING` | `200` | How many client connections, SQL, console, Flight SQL and Iceberg REST together, may wait at once for their first bytes or for Igloo to start. Further ones are closed as soon as they connect. Raise it if more clients than this connect together while Igloo starts. |
 | `IGLOO_GATEWAY_ACTIVITY_URL` | `http://BACKEND_HOST:8080/activity` | Igloo's activity endpoint. While it cannot be read, Igloo is not stopped unless it refuses connections; a wrong address keeps Igloo running, with a warning in the gateway's log. Set it empty to judge idleness by traffic alone, which can stop Igloo during a long statement that sends nothing. |
 | `IGLOO_GATEWAY_LISTEN_ADDR` | `:5432` | Where clients connect |
 | `IGLOO_GATEWAY_CONSOLE_BACKEND` | | Igloo's web console address, `host:port` (port 8443). Set it to forward the console too. |

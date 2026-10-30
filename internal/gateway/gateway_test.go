@@ -427,6 +427,9 @@ func TestFailedStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := fmt.Fprintln(conn, "first try"); err != nil {
+		t.Fatal(err)
+	}
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expected the gateway to close the connection")
@@ -475,6 +478,66 @@ func TestRunningIglooIsUsedWithoutStart(t *testing.T) {
 	}
 }
 
+// A connection must send something within FirstByteTimeout before the
+// gateway starts Igloo or connects to it, and only MaxWaiting connections
+// may wait at once. Connections that sent nothing used to start the
+// compute and hold a socket and a goroutine each for as long as their
+// clients kept them open.
+func TestSilentConnectionsAreLimited(t *testing.T) {
+	compute := newFakeCompute(t)
+	// Igloo takes longer to start than a client has to send its first
+	// bytes, which bounds the client's silence, not that wait.
+	compute.bootTime = time.Second
+	addr := startGateway(t, Options{
+		Backend:          compute.addr,
+		SuspendAfter:     time.Hour,
+		ResumeTimeout:    5 * time.Second,
+		FirstByteTimeout: 500 * time.Millisecond,
+		MaxWaiting:       3,
+		Compute:          compute,
+	})
+	dial := func() net.Conn {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		return conn
+	}
+	// closed reports whether the gateway closes conn within wait.
+	closed := func(conn net.Conn, wait time.Duration) bool {
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
+		_, err := conn.Read(make([]byte, 1))
+		var ne net.Error
+		return err != nil && !(errors.As(err, &ne) && ne.Timeout())
+	}
+
+	silent := []net.Conn{dial(), dial(), dial()}
+	time.Sleep(200 * time.Millisecond)
+	if starts, _ := compute.counts(); starts != 0 {
+		t.Errorf("connections that sent nothing started igloo %d times", starts)
+	}
+	if extra := dial(); !closed(extra, 2*time.Second) {
+		t.Error("a connection past MaxWaiting was not closed")
+	}
+	for i, conn := range silent {
+		if !closed(conn, 5*time.Second) {
+			t.Errorf("silent connection %d was not closed", i)
+		}
+	}
+	if starts, _ := compute.counts(); starts != 0 {
+		t.Errorf("connections that sent nothing started igloo %d times", starts)
+	}
+
+	// With them gone, clients get through again, and wait for the start.
+	conn := dial()
+	roundTrip(t, conn, bufio.NewReader(conn), "hello")
+	if starts, _ := compute.counts(); starts != 1 {
+		t.Errorf("starts = %d, want 1", starts)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	env := func(kv map[string]string) func(string) (string, bool) {
 		return func(k string) (string, bool) { v, ok := kv[k]; return v, ok }
@@ -489,21 +552,24 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.ActivityURL != "http://10.0.0.5:8080/activity" || cfg.SuspendAfter != 10*time.Minute ||
-		len(cfg.EC2InstanceIDs) != 2 || cfg.ListenAddr != ":5432" {
+		len(cfg.EC2InstanceIDs) != 2 || cfg.ListenAddr != ":5432" || cfg.FirstByteTimeout != 30*time.Second || cfg.MaxWaiting != 200 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 
 	cfg, err = LoadConfig(env(map[string]string{
-		"IGLOO_GATEWAY_BACKEND":        "igloo:5432",
-		"IGLOO_GATEWAY_ACTIVITY_URL":   "",
-		"IGLOO_GATEWAY_COMPUTE":        "kubernetes",
-		"IGLOO_GATEWAY_K8S_DEPLOYMENT": "igloo",
-		"IGLOO_GATEWAY_SUSPEND_AFTER":  "60s",
+		"IGLOO_GATEWAY_BACKEND":            "igloo:5432",
+		"IGLOO_GATEWAY_ACTIVITY_URL":       "",
+		"IGLOO_GATEWAY_COMPUTE":            "kubernetes",
+		"IGLOO_GATEWAY_K8S_DEPLOYMENT":     "igloo",
+		"IGLOO_GATEWAY_SUSPEND_AFTER":      "60s",
+		"IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT": "5s",
+		"IGLOO_GATEWAY_MAX_WAITING":        "1000",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ActivityURL != "" || cfg.K8sReplicas != 1 || cfg.SuspendAfter != time.Minute {
+	if cfg.ActivityURL != "" || cfg.K8sReplicas != 1 || cfg.SuspendAfter != time.Minute || cfg.FirstByteTimeout != 5*time.Second ||
+		cfg.MaxWaiting != 1000 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 
@@ -514,6 +580,8 @@ func TestLoadConfig(t *testing.T) {
 		"no instances":  {"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "ec2"},
 		"bad duration":  {"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "kubernetes", "IGLOO_GATEWAY_K8S_DEPLOYMENT": "igloo", "IGLOO_GATEWAY_SUSPEND_AFTER": "soon"},
 		"zero replicas": {"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "kubernetes", "IGLOO_GATEWAY_K8S_DEPLOYMENT": "igloo", "IGLOO_GATEWAY_K8S_REPLICAS": "0"},
+		"zero waiting":  {"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "kubernetes", "IGLOO_GATEWAY_K8S_DEPLOYMENT": "igloo", "IGLOO_GATEWAY_MAX_WAITING": "0"},
+		"no timeout":    {"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "kubernetes", "IGLOO_GATEWAY_K8S_DEPLOYMENT": "igloo", "IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT": "0"},
 	} {
 		if _, err := LoadConfig(env(kv)); err == nil {
 			t.Errorf("%s: expected an error", name)
