@@ -993,6 +993,9 @@ func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 		s.notify.Record(ctx, rec)
 		return rows, err
 	}
+	if err := s.stillDue(ctx, j); err != nil {
+		return finish(notify.StateSkipped, -1, err)
+	}
 
 	def, err := decodeAlert(j.Statement)
 	if err != nil {

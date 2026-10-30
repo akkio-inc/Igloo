@@ -258,7 +258,8 @@ events or longer outages, at the cost of reading more each run.
   (`NOLOGIN`), its runs fail; when they are dropped, their tasks, pipes,
   materialized views and alerts are suspended and marked as a dropped
   user's (`SHOW TASKS` gives the owner as `ana (dropped)`), so a user
-  created later with the same name does not get them. A task never runs
+  created later with the same name does not get them, nor runs of them
+  that came due before the drop, which are skipped. A task never runs
   with more privileges than its owner has. Its statements are in the owner's query history, with client
   `task <name>`.
 - **One run at a time, on one replica.** Each scheduled run is claimed by

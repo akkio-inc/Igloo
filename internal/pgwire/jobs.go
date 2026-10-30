@@ -697,6 +697,9 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 	if j.Kind == tasks.KindAlert {
 		return s.runAlert(ctx, j)
 	}
+	if err := s.stillDue(ctx, j); err != nil {
+		return -1, err
+	}
 	owner, err := s.users.Get(ctx, j.Owner)
 	if errors.Is(err, auth.ErrNotFound) {
 		return -1, fmt.Errorf("%w: %s", tasks.ErrOwnerGone, j.Owner)
@@ -793,6 +796,31 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		return rows, err
 	}
 	return -1, fmt.Errorf("unknown kind of job %q", j.Kind)
+}
+
+// stillDue checks that j, as read when its run came due, is still the job
+// the scheduler holds the lock of: its owner is resolved by name, and a
+// dropped owner's jobs go to a name no user can have (see disownJobs), so
+// a run read before the drop would run as a user made again with that
+// name. A scheduled run of a job suspended since is skipped too.
+func (s *Server) stillDue(ctx context.Context, j tasks.Job) error {
+	run, ok := tasks.RunOf(ctx)
+	if !ok || s.tasks == nil {
+		return nil
+	}
+	now, err := s.tasks.Store().Job(ctx, j.Kind, j.Name)
+	switch {
+	case errors.Is(err, tasks.ErrNotFound):
+		return fmt.Errorf("%w: %s %s was dropped", tasks.ErrSkipped, j.Kind, j.Name)
+	case err != nil:
+		return err
+	case now.Owner != j.Owner:
+		return fmt.Errorf("%w: %s %s belongs to %s now, not to %s, as it did when this run came due",
+			tasks.ErrSkipped, j.Kind, j.Name, now.Owner, j.Owner)
+	case run.Trigger == tasks.TriggerSchedule && now.State != tasks.StateStarted:
+		return fmt.Errorf("%w: %s %s was suspended", tasks.ErrSkipped, j.Kind, j.Name)
+	}
+	return nil
 }
 
 // taskResult counts what a task's statement returns, or the rows a
