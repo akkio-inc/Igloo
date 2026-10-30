@@ -588,8 +588,11 @@ const memberCheck = 5 * time.Second
 type memberCache struct {
 	mu      sync.Mutex
 	checked time.Time
-	version int64
-	loaded  bool
+	// confirmed is when the store last answered, which membersCurrent
+	// holds to the maximum staleness.
+	confirmed time.Time
+	version   int64
+	loaded    bool
 	// tables are schema.table and names the tables' names, lower case.
 	tables, names map[string]bool
 	// domains are the domains each table's columns are members of, by
@@ -607,7 +610,13 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 	c := &s.members
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.loaded && time.Since(c.checked) < memberCheck {
+	// Asked at least four times within the maximum staleness, so that
+	// members the store answers for are never as old as that.
+	every := memberCheck
+	if s.maxStale > 0 {
+		every = min(every, s.maxStale/4)
+	}
+	if c.loaded && time.Since(c.checked) < every {
 		return c.tables, c.names
 	}
 	c.checked = time.Now()
@@ -617,6 +626,7 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 		return c.tables, c.names
 	}
 	if c.loaded && v == c.version {
+		c.confirmed = c.checked
 		return c.tables, c.names
 	}
 	snap, err := s.idDomains.Load(ctx)
@@ -636,10 +646,41 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 	}
 	changed := c.loaded
 	c.tables, c.names, c.domains, c.version, c.loaded, c.snap = tables, names, domains, v, true, snap
+	c.confirmed = c.checked
 	if changed {
 		s.catalogChanged()
 	}
 	return tables, names
+}
+
+// membersCurrent fails once ID domains' members have not been read from
+// the store for maxStale (IGLOO_ACCESS_MAX_STALENESS), as the policies'
+// check does (governance.current): a table whose columns joined a domain
+// on another replica meanwhile would not be protected as a member here.
+// It asks the store only once they are that old, as when no statement has
+// needed them for a while: a load that finds members changed counts as a
+// change of the catalog, which every statement asking would make far more
+// often than the statements that use the members do.
+func (s *Server) membersCurrent(ctx context.Context) error {
+	if s.maxStale <= 0 {
+		return nil
+	}
+	age := s.membersAge()
+	if age < s.maxStale {
+		return nil
+	}
+	s.memberTables(ctx)
+	if age = s.membersAge(); age >= s.maxStale {
+		return staleAccess("ID domains' members", age)
+	}
+	return nil
+}
+
+// membersAge is how long ago the store last answered memberTables.
+func (s *Server) membersAge() time.Duration {
+	s.members.mu.Lock()
+	defer s.members.mu.Unlock()
+	return time.Since(s.members.confirmed)
 }
 
 // memberSnapshot returns the domains and members as memberTables last

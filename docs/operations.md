@@ -52,9 +52,9 @@ with `SET` apply to their own session only.
 - Role changes, disabled and dropped users and revoked tokens reach open
   connections within 30 seconds; on the replica that made the change,
   immediately. A replica that cannot read the metadata database goes on
-  with the users, grants and policies it read last for up to
-  `IGLOO_ACCESS_MAX_STALENESS` (2 minutes), then refuses its sessions'
-  statements with SQLSTATE `58000` until it can read them again.
+  with the users, grants, policies and ID domains' members it read last
+  for up to `IGLOO_ACCESS_MAX_STALENESS` (2 minutes), then refuses its
+  sessions' statements with SQLSTATE `58000` until it can read them again.
 - After 10 failed logins for a user, or 50 from an address, within 15
   minutes, further logins for it are refused for a while
   ([details](sso.md#failed-logins)).

@@ -1163,11 +1163,12 @@ func (s *Server) refreshUser(ctx context.Context, sess *session) (auth.User, err
 
 // refreshAccess reads again, when they are due, what a statement is checked
 // against besides the session's user, which refreshUser reads: the
-// session's grants, if it has loaded them, and the policies. Every
-// statement goes through both, as it is prepared and before each run.
+// session's grants, if it has loaded them, the policies and ID domains'
+// members. Every statement goes through both, as it is prepared and before
+// each run.
 //
-// Should the metadata database fail, the user, grants and policies last
-// read stay in force, so that a blip does not fail statements, but for no
+// Should the metadata database fail, the user, grants, policies and
+// members last read stay in force, so that a blip does not fail statements, but for no
 // longer than maxStale (IGLOO_ACCESS_MAX_STALENESS): past it, statements
 // are refused with staleAccess's error until they can be read again, since
 // a user disabled, a token or grant revoked or a policy attached
@@ -1182,8 +1183,10 @@ func (s *Server) refreshAccess(ctx context.Context, sess *session, user auth.Use
 			return err
 		}
 	}
-	_, err := s.gov.current(ctx)
-	return err
+	if _, err := s.gov.current(ctx); err != nil {
+		return err
+	}
+	return s.membersCurrent(ctx)
 }
 
 // staleAccess refuses a statement because what, which it would be checked

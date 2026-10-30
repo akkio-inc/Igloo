@@ -12,6 +12,7 @@ import (
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -44,6 +45,26 @@ func (s *flakyPolicies) Version(ctx context.Context) (int64, error) {
 }
 
 func (s *flakyPolicies) Load(ctx context.Context) (*policy.Snapshot, error) {
+	if s.down.Load() {
+		return nil, errMetadataDown
+	}
+	return s.Store.Load(ctx)
+}
+
+// flakyIDDomains is an ID domain store whose reads fail while down is set.
+type flakyIDDomains struct {
+	iddomain.Store
+	down atomic.Bool
+}
+
+func (s *flakyIDDomains) Version(ctx context.Context) (int64, error) {
+	if s.down.Load() {
+		return 0, errMetadataDown
+	}
+	return s.Store.Version(ctx)
+}
+
+func (s *flakyIDDomains) Load(ctx context.Context) (*iddomain.Snapshot, error) {
 	if s.down.Load() {
 		return nil, errMetadataDown
 	}
@@ -194,4 +215,35 @@ func TestStalePoliciesStopSharing(t *testing.T) {
 	if names, err := ts.srv.ProtectedBy(ctx, "public", "campaigns"); err != nil || names != nil {
 		t.Errorf("once the metadata database is back: %q, %v", names, err)
 	}
+}
+
+// And once ID domains' members could not be read for that long, since a
+// table whose columns joined a domain on another replica meanwhile would
+// not be protected as a member: statements, and Delta Sharing's and the
+// Iceberg REST catalog's checks of a table's policies, used to go on with
+// the members last read.
+func TestStaleIDDomainsFailClosed(t *testing.T) {
+	t.Parallel()
+	domains := &flakyIDDomains{Store: iddomain.NewMemoryStore()}
+	ts := startServer(t, func(o *Options) {
+		o.IDDomains = domains
+		o.RoleRefresh = staleRefresh
+		o.AccessMaxStaleness = staleMax
+	})
+	stillFailsClosed(t, map[string]*pgx.Conn{
+		"simple":   ts.admin(t, pgx.QueryExecModeSimpleProtocol),
+		"prepared": ts.admin(t, pgx.QueryExecModeCacheStatement),
+	}, &domains.down)
+
+	ctx := context.Background()
+	domains.down.Store(true)
+	time.Sleep(staleMax + 2*staleRefresh)
+	if names, err := ts.srv.ProtectedBy(ctx, "public", "campaigns"); pgerror.GetCode(err) != codes.System {
+		t.Errorf("Delta Sharing, after the maximum staleness: %q, %v", names, err)
+	}
+	user := auth.User{Name: "igloo", Role: auth.RoleAdmin}
+	if _, err := ts.srv.ProtectedFor(ctx, user, "public", "campaigns"); pgerror.GetCode(err) != codes.System {
+		t.Errorf("the Iceberg REST catalog, after the maximum staleness: %v", err)
+	}
+	domains.down.Store(false)
 }

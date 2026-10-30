@@ -45,10 +45,10 @@ reference for every setting mentioned here.
   from an address, in 15 minutes, each replica refuses further ones for a
   while. Disabled users (`NOLOGIN`) cannot sign in by any means, and their
   sessions end. Changes to users, their tokens, roles and grants, and to
-  policies, reach open sessions on other replicas within 30 seconds; a
-  replica that cannot read the metadata database goes on with what it read
-  last for at most `IGLOO_ACCESS_MAX_STALENESS` (2 minutes by default),
-  then refuses statements until it can read it again.
+  policies and ID domains' members, reach open sessions on other replicas
+  within 30 seconds; a replica that cannot read the metadata database goes
+  on with what it read last for at most `IGLOO_ACCESS_MAX_STALENESS` (2
+  minutes by default), then refuses statements until it can read it again.
 - **Access tokens** ([details](docs/sso.md#access-tokens)) stand in for
   passwords in SQL clients. They are 256-bit random secrets with an
   `igloo_` prefix, shown once and stored only as a SHA-256 hash and SCRAM

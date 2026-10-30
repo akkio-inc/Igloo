@@ -247,6 +247,9 @@ func (s *Server) Erasing(ctx context.Context, schema, table string) (bool, error
 // it to others than user (see policy.Confinement). The Iceberg REST
 // catalog refuses such a table to everyone but admins.
 func (s *Server) ProtectedFor(ctx context.Context, user auth.User, schema, table string) (bool, error) {
+	if err := s.membersCurrent(ctx); err != nil {
+		return true, err
+	}
 	if len(s.memberDomains(ctx, schema, table)) > 0 {
 		// Its files hold the columns of ids, which are Igloo's own.
 		return true, nil
@@ -431,6 +434,9 @@ func droppedSchema(query string) (string, bool) {
 func (s *Server) ProtectedBy(ctx context.Context, schema, table string) ([]string, error) {
 	// Columns that hold ID domains' ids are in the table's files, which
 	// Delta Sharing serves whole.
+	if err := s.membersCurrent(ctx); err != nil {
+		return nil, err
+	}
 	var names []string
 	for _, d := range s.memberDomains(ctx, schema, table) {
 		names = append(names, "ID domain "+d)
