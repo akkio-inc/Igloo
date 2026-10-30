@@ -132,6 +132,12 @@ and a pipe can check a prefix every minute without loading anything twice.
   may not be in the table. The next load into the table marks them
   `unknown` and leaves them alone, rather than perhaps loading them twice;
   check the table, and load them with `FORCE true` if they are missing.
+- So may the files of a load whose commit failed other than by conflicting
+  with another writer, as when the catalog stops answering before it
+  confirms the commit (SQLSTATE `40003`, see [writes when the catalog
+  fails](operations.md#writes-when-the-catalog-fails)). `COPY INTO` fails
+  with that error and marks its files `unknown` at once; later loads and
+  pipes leave them alone in the same way.
 - The history of a table goes with it: renaming the table keeps it, and
   dropping the table forgets it, so a table created again under the same
   name loads every file again. `CREATE OR REPLACE TABLE` keeps it.

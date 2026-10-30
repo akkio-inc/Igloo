@@ -704,7 +704,10 @@ once whatever the catalog answers:
   are kept either way, so the table is never left referencing a missing
   file. If the write did not land, the [orphan
   cleanup](#table-maintenance) deletes them after three days, as it does
-  the files of statements that fail or roll back before they commit.
+  the files of statements that fail or roll back before they commit. A
+  `COPY INTO` or pipe that fails this way marks the files it was loading
+  `unknown` in the [load history](loading.md#loading-each-file-once), so
+  that it does not load them again.
 
 The log (component `catalog-proxy`) records each commit sent again and each
 outcome confirmed after an error. Catalogs that ignore `Idempotency-Key`

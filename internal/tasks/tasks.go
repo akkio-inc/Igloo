@@ -63,9 +63,9 @@ const (
 	// read (ON_ERROR continue).
 	LoadPartial = "partially loaded"
 	LoadFailed  = "failed"
-	// LoadUnknown is a file whose load Igloo was stopped in the middle of:
-	// it may or may not be in the table, so it is not loaded again unless
-	// forced.
+	// LoadUnknown is a file whose load Igloo was stopped in the middle of,
+	// or whose commit failed without saying whether it was applied: it may
+	// or may not be in the table, so it is not loaded again unless forced.
 	LoadUnknown = "unknown"
 )
 

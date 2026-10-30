@@ -22,6 +22,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/icebergtest"
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // These tests run Igloo on an Iceberg catalog with faults injected between
@@ -273,6 +274,39 @@ func TestCommitWithUnknownOutcomeKeepsItsFiles(t *testing.T) {
 		t.Errorf("the error names the catalog proxy rather than the catalog: %v", err)
 	}
 	env.faults.Up()
+	env.checkOnce(t, conn)
+}
+
+// TestCopyIntoWithUnknownOutcomeIsNotRepeated checks a COPY INTO whose
+// commit the catalog applied before it stopped answering: the client hears
+// that the outcome is unknown, the file stays in the load history, marked
+// unknown, and COPY INTO run again does not load it a second time.
+func TestCopyIntoWithUnknownOutcomeIsNotRepeated(t *testing.T) {
+	t.Parallel()
+	env := newCatalogEnv(t, engine.CatalogProxy(func(o *catalogproxy.Options) {
+		o.AttemptTimeout = time.Second
+		o.Patience = 2 * time.Second
+	}))
+	conn := env.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "CREATE TABLE "+env.table+" (n INTEGER)")
+	file := env.direct.Storage.Root() + env.table + ".csv"
+	mustExec(t, conn, "COPY (SELECT * FROM range(1, 4) r(n)) TO '"+file+"' (HEADER true)")
+	from := "COPY INTO " + env.table + " FROM '" + file + "'"
+
+	env.faults.Arm(icebergtest.DownAfterApply)
+	_, _, err := copyInto(t, conn, from)
+	if got := pgCode(err); got != "40003" || !strings.Contains(err.Error(), "FORCE true") {
+		t.Errorf("COPY INTO: code %q, want 40003 and what to do (%v)", got, err)
+	}
+	env.faults.Up()
+	if got, _ := mustCopy(t, conn, from); len(got) != 0 {
+		t.Errorf("loaded again a file whose load may have landed: %v", got)
+	}
+	cfg := env.direct.Catalog
+	prev, err := env.srv.tasks.Store().PreviousLoads(context.Background(), cfg.Name+"."+cfg.Schema+"."+env.table, []string{file})
+	if l := prev[file]; err != nil || l.Status != tasks.LoadUnknown || !strings.Contains(l.FirstError, "FORCE true") {
+		t.Errorf("load history: %+v (%v)", l, err)
+	}
 	env.checkOnce(t, conn)
 }
 

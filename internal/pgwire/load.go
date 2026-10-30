@@ -358,6 +358,14 @@ func (f *loadFile) fail(err error) {
 	f.Status, f.Rows, f.FirstError = tasks.LoadFailed, 0, errorText(err)
 }
 
+// unknown marks f as perhaps loaded: the commit that loaded it failed with
+// err, which does not say that the catalog did not apply it.
+func (f *loadFile) unknown(err error) {
+	f.Status, f.Rows = tasks.LoadUnknown, 0
+	f.FirstError = errorText(fmt.Errorf("the commit that loaded this file failed, so it may or may not be in the table; "+
+		"check, and load it with FORCE true if it is not: %w", err))
+}
+
 // copyInto carries out c as user on sess's connection, for pipe if it is
 // a pipe's. It returns what happened to each file it tried to load, and
 // the table it loaded into.
@@ -482,13 +490,15 @@ func (s *Server) copyInto(ctx context.Context, sess *session, user auth.User, c 
 
 // finished settles the outcome of each file once the load has ended with
 // err. With ON_ERROR abort a failure leaves nothing loaded: the file that
-// failed is recorded, and the others are forgotten (unloaded).
+// failed is recorded, and the others are forgotten (unloaded). Files whose
+// commit may have landed are recorded as unknown, so that no later load
+// loads them again.
 func finished(todo []*loadFile, err error) (done []tasks.Load, unloaded []string) {
 	end := time.Now()
 	for _, f := range todo {
 		f.End = end
 		switch {
-		case f.Status == tasks.LoadFailed:
+		case f.Status == tasks.LoadFailed, f.Status == tasks.LoadUnknown:
 		case err != nil:
 			unloaded = append(unloaded, f.ID)
 			continue
@@ -961,7 +971,10 @@ func reader(c copyCommand, file, format, compression, rejects string, ignoreErro
 // loadFiles inserts the files that have an INSERT in one transaction,
 // which commits them together. A file that fails ends the load with
 // ON_ERROR abort; otherwise it is left out and the rest are loaded again.
-// A commit that loses a race with another writer is tried again.
+// A commit that loses a race with another writer is tried again. One that
+// fails otherwise may have been applied, as when the catalog stopped
+// answering before it confirmed it (SQLSTATE 40003), and a ROLLBACK after
+// it proves nothing: its files are marked unknown.
 func (s *Server) loadFiles(ctx context.Context, sess *session, user auth.User, files []*loadFile, onError string) error {
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
@@ -1010,7 +1023,14 @@ func (s *Server) loadFiles(ctx context.Context, sess *session, user auth.User, f
 			return nil
 		}
 		rollback()
-		if !commitConflict(err) || attempt == maxCommitRetries {
+		if !commitConflict(err) {
+			for _, f := range pending {
+				f.unknown(err)
+			}
+			return fmt.Errorf("COPY INTO does not know whether its files were loaded, so they are marked unknown in "+
+				"igloo.load_history and will not be loaded again; check the table, and load those missing with FORCE true: %w", pgError(err))
+		}
+		if attempt == maxCommitRetries {
 			return pgError(err)
 		}
 		select {
