@@ -32,9 +32,9 @@ const (
 	userFailures  = 10
 	addrFailures  = 50
 	// runningWait bounds how long a login waits for running ones to end.
-	// A login has no deadline, so one that a client leaves hanging runs
-	// until its connection drops; past this wait, logins are refused, as
-	// though the running ones had failed.
+	// One that a client leaves hanging runs until the login timeout
+	// closes its connection (see startup.go); past this wait, logins are
+	// refused, as though the running ones had failed.
 	runningWait = 10 * time.Second
 	// maxTracked bounds the names and addresses remembered.
 	maxTracked = 100_000

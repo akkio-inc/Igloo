@@ -125,8 +125,12 @@ type Options struct {
 	// StatementTimeout is the default limit on how long a statement may
 	// run; sessions can change it with SET statement_timeout. Zero means none.
 	StatementTimeout time.Duration
-	// MaxConnections caps concurrent sessions. Zero means no cap.
+	// MaxConnections caps concurrent sessions, and connections signing in
+	// (see startup.go). Zero means no cap.
 	MaxConnections int
+	// LoginTimeout is how long a client may take to sign in, from
+	// connecting. Zero means 30 seconds.
+	LoginTimeout time.Duration
 	// Version is Igloo's version, reported by SELECT version().
 	Version string
 	// DDL carries out views and comments on the Iceberg catalog. Nil
@@ -521,6 +525,8 @@ type Server struct {
 	accessTokens        AccessTokenVerifier
 	// limiter refuses logins after too many failures.
 	limiter *loginLimiter
+	// startup holds connections to the limits of signing in.
+	startup *startupLimits
 
 	meta       MetadataSource
 	owners     auth.OwnerStore
@@ -590,6 +596,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		tokenMaxLifetime:    opts.TokenMaxLifetime,
 		accessTokens:        opts.AccessTokens,
 		limiter:             newLoginLimiter(),
+		startup:             newStartupLimits(opts.LoginTimeout, opts.MaxConnections, log),
 
 		meta:    opts.Metadata,
 		owners:  opts.Owners,
@@ -763,7 +770,7 @@ func (s *Server) Serve(l net.Listener) error {
 	if s.requireTLS {
 		l = requireTLS(l)
 	}
-	return s.wire.Serve(l)
+	return s.wire.Serve(s.startup.listener(l))
 }
 
 // Shutdown stops accepting connections and waits for open ones to finish

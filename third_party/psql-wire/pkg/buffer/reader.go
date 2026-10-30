@@ -15,6 +15,13 @@ import (
 // is not set or a negative value is presented.
 const DefaultBufferSize = 1 << 24 // 16777216 bytes
 
+// ReadBufferSize is the size of a connection's buffered reader. Igloo patch:
+// the buffered reader used to be as large as the largest message allowed,
+// 16 MiB by default, allocated for every connection before it sent anything.
+// A message is read into Msg, which grows to fit it, so the buffered reader
+// need not hold one.
+const ReadBufferSize = 8 << 10
+
 // BufferedReader extended io.Reader with some convenience methods.
 type BufferedReader interface {
 	io.Reader
@@ -31,20 +38,21 @@ type Reader struct {
 	header         [4]byte
 }
 
-// NewReader constructs a new Postgres wire buffer for the given io.Reader
-func NewReader(logger *slog.Logger, reader io.Reader, bufferSize int) *Reader {
+// NewReader constructs a new Postgres wire buffer for the given io.Reader,
+// for messages of up to maxMessageSize bytes.
+func NewReader(logger *slog.Logger, reader io.Reader, maxMessageSize int) *Reader {
 	if reader == nil {
 		return nil
 	}
 
-	if bufferSize <= 0 {
-		bufferSize = DefaultBufferSize
+	if maxMessageSize <= 0 {
+		maxMessageSize = DefaultBufferSize
 	}
 
 	return &Reader{
 		logger:         logger,
-		Buffer:         bufio.NewReaderSize(reader, bufferSize),
-		MaxMessageSize: bufferSize,
+		Buffer:         bufio.NewReaderSize(reader, min(maxMessageSize, ReadBufferSize)),
+		MaxMessageSize: maxMessageSize,
 	}
 }
 

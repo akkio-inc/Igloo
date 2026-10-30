@@ -38,6 +38,16 @@ otherwise unchanged except for these patches:
   (Igloo prepares each statement of a multi-statement query only once the
   one before has run), and `CopyOut`, `CopyData` and `CopyDone`, the
   messages of `COPY ... TO STDOUT`.
+- `pkg/buffer/reader.go`, `NewReader`, and `options.go`,
+  `MessageBufferSize`: a connection's buffered reader is `ReadBufferSize`,
+  8 KiB, instead of as large as the largest message allowed (16 MiB by
+  default), which every connection allocated before it sent anything.
+  Messages are still read into a buffer that grows to fit each one, up to
+  that size.
+- `igloo_conn.go` (new) and `wire.go`, `serve`: `AcceptedConn` returns the
+  connection the listener accepted for a client, so that Igloo's listener,
+  which gives each connection a deadline to sign in, can lift it once the
+  client has.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

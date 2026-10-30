@@ -493,6 +493,7 @@ func serve() error {
 		Metrics:             pgwire.NewMetrics(reg),
 		StatementTimeout:    cfg.StatementTimeout,
 		MaxConnections:      cfg.MaxConnections,
+		LoginTimeout:        cfg.LoginTimeout,
 		Version:             version,
 		DDL:                 objects,
 		Activity:            work,

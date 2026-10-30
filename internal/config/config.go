@@ -115,6 +115,9 @@ type Config struct {
 	// MaxConnections caps concurrent client sessions; each holds DuckDB
 	// resources.
 	MaxConnections int
+	// LoginTimeout is how long a SQL client may take to sign in, from
+	// connecting, before Igloo closes its connection.
+	LoginTimeout time.Duration
 	// ShutdownDelay is how long Igloo keeps accepting connections, while
 	// reporting not ready, after it is asked to stop. It gives load
 	// balancers time to stop sending new connections.
@@ -476,6 +479,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			addErr("IGLOO_MAX_CONNECTIONS must be a positive integer, got %q", v)
 		}
 		cfg.MaxConnections = n
+	}
+	cfg.LoginTimeout = 30 * time.Second
+	if v := get("IGLOO_LOGIN_TIMEOUT", ""); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			addErr("IGLOO_LOGIN_TIMEOUT must be a duration such as 30s or 1m, got %q", v)
+		}
+		cfg.LoginTimeout = d
 	}
 
 	if v := get("IGLOO_DUCKDB_THREADS", ""); v != "" {

@@ -234,6 +234,7 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 	// when multiple goroutines access the same map concurrently during query execution
 	ctx = setTypeInfo(ctx, srv.newTypeMap())
 	ctx = setRemoteAddress(ctx, conn.RemoteAddr())
+	ctx = context.WithValue(ctx, ctxConn{}, conn)
 	defer conn.Close() //nolint:errcheck
 
 	srv.logger.Debug("serving a new client connection")

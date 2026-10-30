@@ -406,7 +406,10 @@ no more guesses: while as many logins for a user, or from an address, are
 running as it has failures left, the next one waits for one of them to end,
 for up to 10 seconds. A pool that opens many sessions at once, such as dbt's
 threads or a BI tool's, signs them all in; a login that has waited 10
-seconds is refused with `too many failed logins`.
+seconds is refused with `too many failed logins`. A SQL client that has not
+signed in within 30 seconds of connecting (`IGLOO_LOGIN_TIMEOUT`) is
+disconnected, which ends its login, so connections left hanging halfway
+through hold none for long.
 
 ## Troubleshooting
 
