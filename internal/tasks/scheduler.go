@@ -234,11 +234,13 @@ func (s *Scheduler) RunNow(ctx context.Context, r Runner, j Job) (Run, error) {
 // execute runs j unless it is running already, and records the run. A
 // scheduled run that finds j running is recorded as skipped.
 //
-// The job's lock is a session advisory lock, which Postgres releases when
-// its connection drops; another replica can then take it and run the job
-// while this run goes on. So the run checks that it still holds the lock
-// right before it starts, and every heldEvery while it runs, and is
-// canceled once it does not.
+// The job's lock is a lease (Store.TryLease): a session advisory lock,
+// which Postgres releases when its connection drops, and a lease row that
+// keeps another replica from taking the lock again until this run lets it
+// go, or the row expires once this replica can no longer renew it. So the
+// run checks that it still holds the lease right before it starts, and
+// every heldEvery while it runs, and is canceled once it does not, before
+// the row can expire.
 func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string, scheduled time.Time) (Run, error) {
 	run := Run{ID: audit.NewID(s.nowFunc()), Kind: j.Kind, Name: j.Name, User: j.Owner, Trigger: trigger,
 		Scheduled: scheduled, Start: s.nowFunc(), Rows: -1}

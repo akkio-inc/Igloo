@@ -1239,10 +1239,12 @@ hear of failed runs and loads without watching for them, switch on the
 
 - Every replica runs a scheduler, which looks for due work every few
   seconds. Each due run is claimed by one replica through the metadata
-  database, and a session-level lock there keeps a job from running twice
-  at once on any replica; a run that comes due while the last one still
-  runs is recorded as `skipped`. Postgres releases the lock of a replica
-  that dies, and the next run marks the dead one's run `failed`.
+  database, and a session-level lock there, with a lease the run renews,
+  keeps a job from running twice at once on any replica (see
+  [Loading](loading.md#tasks)); a run that comes due while the last one
+  still runs is recorded as `skipped`. A replica that dies holds its jobs
+  up until their leases expire, within 30 seconds, and the next run marks
+  the dead one's run `failed`.
 - A replica runs at most four scheduled runs at once; further due work
   waits for a free slot or another replica. Each run is a session of its
   owner, which counts against `IGLOO_MAX_CONNECTIONS` while it lasts and

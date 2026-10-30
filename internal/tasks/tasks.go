@@ -190,7 +190,10 @@ type Store interface {
 	Lock(ctx context.Context, key string) (release func(), err error)
 	// TryLease takes the lock named key as TryLock does, as a lease that
 	// says whether it is still held: a lock is lost when its connection
-	// to the metadata database drops.
+	// to the metadata database drops, or when its holder cannot renew it
+	// in time. A lease is not taken again until its holder released it or
+	// it expired, and its holder takes it for lost before it expires (see
+	// PostgresStore.TryLease).
 	TryLease(ctx context.Context, key string) (lease Lease, ok bool, err error)
 
 	// WriteRun records r, or updates the run with its ID.

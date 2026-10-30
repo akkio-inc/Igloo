@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,6 +21,15 @@ const (
 	migrationKey int64 = 0x49676c6f6f54736b // "IglooTsk"
 	// pruneKey lets one replica at a time delete old runs.
 	pruneKey int64 = 0x49676c6f6f545072 // "IglooTPr"
+
+	// leaseTTL is how long a lease (TryLease) lasts in the database
+	// unless its holder renews it, which it does every renewEvery. Its
+	// holder takes it for lost leaseMargin before then, by its own clock:
+	// the time a run canceled for it has to stop before another may
+	// start.
+	leaseTTL    = 30 * time.Second
+	renewEvery  = 5 * time.Second
+	leaseMargin = 10 * time.Second
 )
 
 var migrations = []string{
@@ -69,15 +80,25 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS loads_file ON igloo_tasks.loads (lower(table_name), file, start_time DESC)`,
 	`CREATE INDEX IF NOT EXISTS loads_time ON igloo_tasks.loads (start_time DESC, load_id DESC)`,
 	`CREATE INDEX IF NOT EXISTS loads_user ON igloo_tasks.loads (user_name, start_time DESC, load_id DESC)`,
+	// The leases of locks taken with TryLease, until they expire or their
+	// holders let them go.
+	`CREATE TABLE IF NOT EXISTS igloo_tasks.leases (
+		key     text PRIMARY KEY,
+		holder  text NOT NULL,
+		expires timestamptz NOT NULL
+	)`,
 }
 
 // PostgresStore keeps jobs and history in the "igloo_tasks" schema of the
 // metadata database, shared by every replica. Locks are session advisory
 // locks, each on a connection of its own: Postgres releases them if the
-// replica holding them dies.
+// replica holding them dies. A lease (TryLease) is a lease row as well.
 type PostgresStore struct {
 	pool *pgxpool.Pool
 	url  string
+	// leaseTTL, renewEvery and leaseMargin are the constants of those
+	// names; tests shorten them.
+	leaseTTL, renewEvery, leaseMargin time.Duration
 }
 
 // OpenPostgres connects to url and creates the tables if needed.
@@ -106,7 +127,7 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 		pool.Close()
 		return nil, fmt.Errorf("create task tables: %w", err)
 	}
-	return &PostgresStore{pool: pool, url: url}, nil
+	return &PostgresStore{pool: pool, url: url, leaseTTL: leaseTTL, renewEvery: renewEvery, leaseMargin: leaseMargin}, nil
 }
 
 const jobColumns = `j.kind, j.name, j.owner, j.statement, coalesce(j.schedule, ''), coalesce(j.timezone, ''), j.state,
@@ -278,6 +299,16 @@ func (s *PostgresStore) TryLock(ctx context.Context, key string) (func(), bool, 
 	return unlocker(conn), true, nil
 }
 
+// TryLease takes the advisory lock, as TryLock does, and the key's lease
+// row. Postgres releases the lock the moment its connection drops, while
+// the run that held it may go on until it notices: the lease row stays
+// until its holder lets it go or it expires, leaseTTL after its holder
+// last renewed it, and the lock is not taken again before then. Its
+// holder renews it every renewEvery, through the pool, whether or not it
+// still has the lock, and takes it for lost once it could not for leaseTTL
+// less leaseMargin: by then a run that holds it is canceled (see Held),
+// before anyone else can take the lease. Expiry is by the database's
+// clock; the holder counts by its own, from before it sent each renewal.
 func (s *PostgresStore) TryLease(ctx context.Context, key string) (Lease, bool, error) {
 	conn, err := s.lockConn(ctx)
 	if err != nil {
@@ -288,18 +319,86 @@ func (s *PostgresStore) TryLease(ctx context.Context, key string) (Lease, bool, 
 		unlocker(conn)()
 		return nil, false, err
 	}
-	return &pgLease{conn: conn, id: lockID(key)}, true, nil
+	l := &pgLease{s: s, conn: conn, id: lockID(key), key: key, holder: uuid.NewString(),
+		stop: make(chan struct{}), stopped: make(chan struct{})}
+	sent := time.Now()
+	tag, err := s.pool.Exec(ctx, `INSERT INTO igloo_tasks.leases AS l (key, holder, expires)
+		VALUES ($1, $2, now() + $3 * interval '1 millisecond')
+		ON CONFLICT (key) DO UPDATE SET holder = excluded.holder, expires = excluded.expires WHERE l.expires <= now()`,
+		key, l.holder, s.leaseTTL.Milliseconds())
+	if err != nil || tag.RowsAffected() == 0 {
+		// The last holder lost the lock, and may still be running.
+		unlocker(conn)()
+		return nil, false, err
+	}
+	l.until = sent.Add(s.leaseTTL - s.leaseMargin)
+	go l.renew()
+	return l, true, nil
 }
 
-// pgLease is an advisory lock on a connection of its own.
+// pgLease is an advisory lock on a connection of its own, and a lease row.
 type pgLease struct {
-	conn *pgx.Conn
-	id   int64
+	s           *PostgresStore
+	conn        *pgx.Conn
+	id          int64
+	key, holder string
+
+	mu sync.Mutex
+	// until is when the holder takes the lease for lost unless renewed,
+	// and lost why it is.
+	until time.Time
+	lost  error
+
+	stop, stopped chan struct{}
+	release       sync.Once
 }
 
-// Held asks the lock's own connection whether it holds the lock: one that
+// renew renews the lease every renewEvery until Release.
+func (l *pgLease) renew() {
+	defer close(l.stopped)
+	tick := time.NewTicker(l.s.renewEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-l.stop:
+			return
+		case <-tick.C:
+		}
+		sent := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), l.s.renewEvery)
+		tag, err := l.s.pool.Exec(ctx, `UPDATE igloo_tasks.leases SET expires = now() + $3 * interval '1 millisecond'
+			WHERE key = $1 AND holder = $2 AND expires > now()`, l.key, l.holder, l.s.leaseTTL.Milliseconds())
+		cancel()
+		l.mu.Lock()
+		switch {
+		case l.lost != nil || !sent.Before(l.until):
+			// Taken for lost already: it stays lost.
+		case err != nil:
+			// Tried again next time, until until.
+		case tag.RowsAffected() == 0:
+			l.lost = errors.New("its lease expired")
+		default:
+			l.until = sent.Add(l.s.leaseTTL - l.s.leaseMargin)
+		}
+		l.mu.Unlock()
+	}
+}
+
+// Held reports the lease lost once it could not be renewed in time, and
+// asks the lock's own connection whether it holds the lock: one that
 // dropped has none, and another session may have taken it since.
 func (l *pgLease) Held(ctx context.Context) error {
+	l.mu.Lock()
+	if l.lost == nil && !time.Now().Before(l.until) {
+		l.lost = errors.New("its lease could not be renewed in time")
+	}
+	lost, until := l.lost, l.until
+	l.mu.Unlock()
+	if lost != nil {
+		return fmt.Errorf("the lock is lost: %w", lost)
+	}
+	ctx, cancel := context.WithDeadline(ctx, until)
+	defer cancel()
 	var n int
 	err := l.conn.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()
 		AND classid::bigint = ($1::bigint >> 32) & 4294967295 AND objid::bigint = $1::bigint & 4294967295 AND objsubid = 1`, l.id).Scan(&n)
@@ -312,7 +411,18 @@ func (l *pgLease) Held(ctx context.Context) error {
 	return nil
 }
 
-func (l *pgLease) Release() { unlocker(l.conn)() }
+// Release lets the lease row go, and then the lock, so that the next to
+// take the lock finds the row gone. A row left behind expires.
+func (l *pgLease) Release() {
+	l.release.Do(func() {
+		close(l.stop)
+		<-l.stopped
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = l.s.pool.Exec(ctx, `DELETE FROM igloo_tasks.leases WHERE key = $1 AND holder = $2`, l.key, l.holder)
+		unlocker(l.conn)()
+	})
+}
 
 func (s *PostgresStore) Lock(ctx context.Context, key string) (func(), error) {
 	conn, err := s.lockConn(ctx)
