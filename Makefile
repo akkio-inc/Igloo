@@ -5,10 +5,11 @@ GO_IMAGE := golang:1.27-bookworm
 NODE_IMAGE := node:24.19.0-trixie-slim@sha256:ab3eebe934147fee049b5eb83c570f68c849a13c930bdfa482de99fcdfa3b3de
 COMPOSE  := docker compose --project-directory deploy/single-vm
 VERSION  ?= dev
-# The Python the end-to-end tests' clients and the migration report run on.
+# The Python the end-to-end tests' clients, the migration report and the
+# benchmark's tests run on.
 PYTHON_IMAGE := python:3.12-slim
 
-.PHONY: help test lint migrate-test e2e e2e-distributed bi-e2e engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch site site-dev
+.PHONY: help test lint migrate-test bench-test e2e e2e-distributed bi-e2e engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch site site-dev
 
 help: ## List targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -24,6 +25,10 @@ migrate-test: ## Run the migration report's unit tests (migrate/; no warehouse n
 	docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$(CURDIR)":/src:ro -w /src $(PYTHON_IMAGE) sh -c \
 		'pip install -q --disable-pip-version-check --root-user-action=ignore "$$(grep ^sqlglot== migrate/requirements.txt)" \
 		&& python -W error::ResourceWarning -m unittest discover -s migrate/tests -t .'
+
+bench-test: ## Run the benchmark's unit tests (bench/; no platform needed)
+	docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$(CURDIR)":/src:ro -w /src $(PYTHON_IMAGE) \
+		python -W error::ResourceWarning -m unittest discover -s bench
 
 e2e: ## Run the end-to-end test against an isolated copy of the stack
 	scripts/e2e.sh

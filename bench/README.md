@@ -15,7 +15,8 @@ python bench/report.py bench/results/*.json > bench/results/report.md
 ```
 
 `python -m unittest discover -s bench` tests the scripts without a
-platform to run against.
+platform to run against; `make bench-test` runs those tests in a Python
+container, as CI does.
 
 ## Method
 
