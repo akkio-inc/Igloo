@@ -238,6 +238,8 @@ export function createWorksheets(app) {
     const label = downloadBtn.lastChild;
     try {
       const ok = await api.download(stmt.text, {
+        // The settings they made apply to the download too.
+        before: r.statements.slice(0, r.selected).map((s) => s.text),
         onProgress: (bytes) => { label.textContent = `Downloading ${(bytes / 1e6).toFixed(1)} MB`; },
       });
       if (ok) toast('Download complete');
