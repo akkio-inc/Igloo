@@ -339,6 +339,36 @@ func TestRowErrorsAndDetails(t *testing.T) {
 	}
 }
 
+// TestRowErrorsAreScrubbed: a provider refusing a row's input may echo the
+// request's credentials; they never reach the row's error, the statement's
+// first error or the failed statement.
+func TestRowErrorsAreScrubbed(t *testing.T) {
+	t.Parallel()
+	f := newFake(t, func(r fakeRequest) (int, any) {
+		return 400, map[string]any{"error": map[string]any{"type": "invalid_request_error",
+			"message": "rejected " + r.Header.Get("Authorization") + " with gateway key " + r.Header.Get("X-Gateway-Key")}}
+	})
+	rt := testRuntime(t, f, func(in *Integration) { in.Headers = map[string]string{"X-Gateway-Key": "gw-secret-123456"} })
+	leaks := func(s string) bool {
+		return strings.Contains(s, "sk-test-not-a-real-key") || strings.Contains(s, "gw-secret-123456")
+	}
+	s := begin(t, rt)
+	out, err := s.Complete([]row{{"m", "x", `{"on_error": "details"}`}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := out[0].(string); !strings.Contains(d, "rejected") || !strings.Contains(d, "***") || leaks(d) {
+		t.Errorf("details %v", out)
+	}
+	if sp := s.End(); sp.FirstError == "" || leaks(sp.FirstError) {
+		t.Errorf("first error %q", sp.FirstError)
+	}
+	_, err = begin(t, rt).Complete([]row{{"m", "y", `{"on_error": "fail"}`}}, false)
+	if err == nil || leaks(err.Error()) {
+		t.Errorf("on_error fail: %v", err)
+	}
+}
+
 // TestRetries: 429s with retry-after and 5xx are sent again; a provider
 // that keeps failing fails the statement after the attempts run out.
 func TestRetries(t *testing.T) {

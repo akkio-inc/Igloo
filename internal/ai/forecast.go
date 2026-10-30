@@ -254,6 +254,8 @@ func (s *Statement) Forecast(model string, series []ForecastSeries, horizon int,
 			if err := f.check(horizon); f.Error == "" && err != nil {
 				return nil, res.Usage, err
 			}
+			// The provider's reason becomes a row's error, as a call's do.
+			f.Error = b.in.Scrub(f.Error)
 			if values[k], err = json.Marshal(f); err != nil {
 				return nil, res.Usage, err
 			}
