@@ -1861,13 +1861,56 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Connections signing in from a loopback or private address, such as the
+  scale-to-zero gateway's, a pooler's or a Kubernetes Service's, which all
+  the clients behind it share, count only toward the limit of all
+  connections signing in, not toward half of it for one address: a burst
+  of more than 50 logins through the gateway after it woke Igloo was
+  refused with `53300`.
+- ID domains' members are held to `IGLOO_ACCESS_MAX_STALENESS` as the
+  users, grants and policies are: a replica that cannot read them for
+  that long refuses statements, and Delta Sharing's and the Iceberg REST
+  catalog's checks of a table, until it can, rather than protect tables
+  as members by what it read last.
+- Delta Sharing refuses shared tables with `503` once a replica could not
+  read the policies for `IGLOO_ACCESS_MAX_STALENESS`, rather than serve
+  them under the policies it read last.
+- The scale-to-zero gateway waits up to `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT`
+  (30 seconds) for a client's first bytes before it starts or reaches
+  Igloo, and lets at most `IGLOO_GATEWAY_MAX_WAITING` (200) connections
+  wait at once; the Helm chart sets them as `scaleToZero.firstByteTimeout`
+  and `scaleToZero.maxWaiting`. Connections that sent nothing started Igloo
+  and stayed open for good. A failed start the gateway makes as it starts,
+  to learn the schedule, is tried again as one for scheduled work is.
+- A task, pipe, materialized view or alert does not start again on another
+  replica until its last run has stopped: each run holds a lease in the
+  metadata database (`igloo_tasks.leases`), renewed every 5 seconds, which
+  another run may take only 30 seconds after its last renewal, and a run
+  that cannot renew it stops before then. Losing the advisory lock alone
+  let a second run start before the first had noticed.
+- Maintenance, and the purge of a table a clone replaced, stop deleting a
+  table's files once they lose the lock of its location, and leave the
+  rest to a later pass.
+- Replicas apply one user's roles one at a time, at SCIM group changes and
+  at sign-in, so the roles that stay follow the latest groups.
+- After a `CREATE OR REPLACE TABLE` whose rename the catalog made though
+  DuckDB heard it fail, DuckDB no longer lists the new table under its
+  temporary name too.
+- Models and model grants that users and roles dropped before `DROP` did
+  this itself left behind are disowned and removed as each replica starts,
+  those a user or role later created with the same name would have got
+  included. A grant given again to such a name before upgrading must be
+  given again.
+- The migration report compares decimals of more than 28 digits row by
+  row, which raised an error when their scales differed.
+- `make bench-test` runs the benchmark's unit tests, and CI runs it.
 - A SQL connection must sign in within `IGLOO_LOGIN_TIMEOUT` (30 seconds)
   or is closed, and at most `IGLOO_MAX_CONNECTIONS` (at least 100) may be
-  signing in at once, half of them from one address; others are refused
-  with `53300`. A connection read through a 16 MiB buffer from its first
-  byte, and logins left hanging held their user's login slots for good, so
-  ten stalled handshakes blocked a user's password logins, and idle
-  sockets that never signed in could fill a replica's memory. The buffer
+  signing in at once, half of them from one public address; others are
+  refused with `53300`. A connection read through a 16 MiB buffer from its
+  first byte, and logins left hanging held their user's login slots for
+  good, so ten stalled handshakes blocked a user's password logins, and
+  idle sockets that never signed in could fill a replica's memory. The buffer
   now starts at 8 KiB and grows to the 16 MiB message limit (see
   [configuration](docs/configuration.md#server)).
 - A replica that cannot read the metadata database goes on with the users,
