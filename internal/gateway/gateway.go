@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -58,8 +59,10 @@ type Options struct {
 	IcebergBackend string
 	// ActivityURL is Igloo's /activity endpoint. Every address its host
 	// resolves to is asked, so a headless Kubernetes Service covers all
-	// replicas. Empty means the gateway judges idleness by traffic alone,
-	// and may stop Igloo during a long query that sends nothing.
+	// replicas. While a replica does not answer, Igloo is not stopped
+	// unless it refuses connections. Empty means the gateway judges
+	// idleness by traffic alone, and may stop Igloo during a long query
+	// that sends nothing.
 	ActivityURL string
 	// SuspendAfter is how long Igloo must be idle before it is stopped.
 	SuspendAfter time.Duration
@@ -418,10 +421,17 @@ func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 	}
 	if g.opts.ActivityURL != "" {
 		busy, asked, err := g.busy(ctx)
-		if err != nil {
-			g.opts.Log.Debug("could not read igloo activity", "err", err)
-		}
 		if busy {
+			return nil
+		}
+		if err != nil && !g.refused(ctx) {
+			// A replica that does not answer may be running a statement or
+			// scheduled work that sends nothing: not knowing is not idle.
+			// Only an Igloo that refuses SQL connections is known to be
+			// down, so that stopping it interrupts nothing.
+			if ctx.Err() == nil {
+				g.opts.Log.Warn("not stopping igloo: could not read its activity", "err", err)
+			}
 			return nil
 		}
 		if !asked {
@@ -463,6 +473,18 @@ func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 	return nil
 }
 
+// refused reports whether Igloo's SQL port refuses connections, so that
+// Igloo is known not to run. A dial that times out says nothing: a
+// partition between the gateway and Igloo looks the same.
+func (g *Gateway) refused(ctx context.Context) bool {
+	conn, err := g.dialer.DialContext(ctx, "tcp", g.opts.Backend)
+	if err != nil {
+		return errors.Is(err, syscall.ECONNREFUSED)
+	}
+	_ = conn.Close()
+	return false
+}
+
 // waitDown polls Igloo's SQL port until it refuses connections.
 func (g *Gateway) waitDown(ctx context.Context) error {
 	for {
@@ -492,9 +514,9 @@ type activityReport struct {
 
 // busy asks every Igloo replica behind ActivityURL whether it is working,
 // worked within SuspendAfter, or has scheduled work due within it, and
-// remembers when that work is due. A replica that cannot be asked is
-// taken to be idle: it is down, or it is not serving clients. asked says
-// whether any replica answered.
+// remembers when that work is due. A replica that cannot be asked counts
+// as neither busy nor idle: err says which could not, and the caller
+// decides. asked says whether any replica answered.
 func (g *Gateway) busy(ctx context.Context) (busy, asked bool, err error) {
 	u, err := url.Parse(g.opts.ActivityURL)
 	if err != nil {

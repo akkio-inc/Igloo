@@ -133,27 +133,29 @@ func (f *fakeCompute) Stop(context.Context) error {
 	f.mu.Lock()
 	f.stops++
 	f.mu.Unlock()
-	shutdown := func() {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if f.ln != nil {
-			_ = f.ln.Close()
-			f.ln = nil
-		}
-		for _, c := range f.conns {
-			_ = c.Close()
-		}
-		f.conns = nil
-	}
 	if f.stopTime == 0 {
-		shutdown()
+		f.shutdown()
 		return nil
 	}
 	go func() {
 		time.Sleep(f.stopTime)
-		shutdown()
+		f.shutdown()
 	}()
 	return nil
+}
+
+// shutdown closes the port and its connections, as Igloo going down does.
+func (f *fakeCompute) shutdown() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ln != nil {
+		_ = f.ln.Close()
+		f.ln = nil
+	}
+	for _, c := range f.conns {
+		_ = c.Close()
+	}
+	f.conns = nil
 }
 
 func (f *fakeCompute) counts() (starts, stops int) {
@@ -363,6 +365,45 @@ func TestBusyIglooIsNotSuspended(t *testing.T) {
 	}
 	running.Store(0)
 	waitFor(t, "suspend after the statement ended", func() bool { _, stops := compute.counts(); return stops == 1 })
+}
+
+func TestUnansweredActivityKeepsIglooRunning(t *testing.T) {
+	compute := newFakeCompute(t)
+	var answers atomic.Bool
+	answers.Store(true)
+	activity := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !answers.Load() {
+			http.Error(w, "overloaded", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"running": 0, "idle_seconds": 100}`)
+	}))
+	defer activity.Close()
+
+	addr := startGateway(t, Options{
+		Backend:       compute.addr,
+		ActivityURL:   activity.URL + "/activity",
+		SuspendAfter:  200 * time.Millisecond,
+		ResumeTimeout: 5 * time.Second,
+		Compute:       compute,
+	})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	roundTrip(t, conn, bufio.NewReader(conn), "long query")
+
+	// A statement runs without sending anything, and Igloo cannot say so:
+	// it is overloaded, or the gateway cannot reach its activity. Not
+	// knowing is not idle, and Igloo still accepts connections: no suspend.
+	answers.Store(false)
+	time.Sleep(time.Second)
+	if _, stops := compute.counts(); stops != 0 {
+		t.Fatal("stopped while its activity could not be read")
+	}
+	answers.Store(true)
+	waitFor(t, "suspend once Igloo says it is idle", func() bool { _, stops := compute.counts(); return stops == 1 })
 }
 
 func TestFailedStart(t *testing.T) {

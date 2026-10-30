@@ -28,7 +28,10 @@ Clients connect to it instead of to Igloo, and so can browsers using the
   sees them.
 - When no client has sent or received anything for `IGLOO_GATEWAY_SUSPEND_AFTER`
   (10 minutes by default) and Igloo reports no running statements or table
-  maintenance, the gateway stops the compute.
+  maintenance, the gateway stops the compute. Not knowing is not idle: while
+  Igloo's activity endpoint does not answer, the gateway keeps Igloo
+  running and logs a warning, unless Igloo's SQL port refuses connections,
+  which says it is down.
 - When [scheduled work](#scheduled-work) (tasks, pipes, materialized views,
   alerts) is due, the gateway starts the compute for it, with nobody
   connected.
@@ -199,7 +202,9 @@ setup above is the one where scale to zero saves the machine's cost.
 
 The gateway reaches Igloo through a second Service, and asks every Igloo
 pod for running work through a headless Service on port 8080, so a
-statement running on any replica keeps them all up. If Igloo also has a
+statement running on any replica keeps them all up. So does a pod that
+does not answer, which may be busy: the gateway logs a warning each time
+it holds off for one. If Igloo also has a
 HorizontalPodAutoscaler (`autoscaling.enabled`), it pauses at zero replicas
 and takes over again after a start.
 
@@ -235,7 +240,7 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_COMPUTE` | (required) | `ec2`, `kubernetes` or `command` |
 | `IGLOO_GATEWAY_SUSPEND_AFTER` | `10m` | Stop Igloo after this long without client traffic or running work |
 | `IGLOO_GATEWAY_RESUME_TIMEOUT` | `5m` | How long a connecting client waits for Igloo to start before the gateway gives up and closes the connection |
-| `IGLOO_GATEWAY_ACTIVITY_URL` | `http://BACKEND_HOST:8080/activity` | Igloo's activity endpoint. Set it empty to judge idleness by traffic alone, which can stop Igloo during a long statement that sends nothing. |
+| `IGLOO_GATEWAY_ACTIVITY_URL` | `http://BACKEND_HOST:8080/activity` | Igloo's activity endpoint. While it cannot be read, Igloo is not stopped unless it refuses connections; a wrong address keeps Igloo running, with a warning in the gateway's log. Set it empty to judge idleness by traffic alone, which can stop Igloo during a long statement that sends nothing. |
 | `IGLOO_GATEWAY_LISTEN_ADDR` | `:5432` | Where clients connect |
 | `IGLOO_GATEWAY_CONSOLE_BACKEND` | | Igloo's web console address, `host:port` (port 8443). Set it to forward the console too. |
 | `IGLOO_GATEWAY_CONSOLE_LISTEN_ADDR` | `:8443` | Where browsers connect for the console, when it is forwarded |

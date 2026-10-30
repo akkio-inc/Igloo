@@ -103,8 +103,14 @@ func TestGatewayLearnsTheScheduleWhenItStarts(t *testing.T) {
 		Compute:       compute,
 	})
 	waitFor(t, "a start", func() bool { starts, _ := compute.counts(); return starts == 1 })
-	// It still cannot be asked, so it stops as usual, and is not started
-	// again for a due time the gateway does not know.
+	// It still cannot be asked, so it may be working: it is not stopped.
+	time.Sleep(500 * time.Millisecond)
+	if _, stops := compute.counts(); stops != 0 {
+		t.Fatalf("stopped %d times though its activity could not be read", stops)
+	}
+	// Once it goes down and refuses connections, it stops as usual, and is
+	// not started again for a due time the gateway does not know.
+	compute.shutdown()
 	waitFor(t, "suspend", func() bool { _, stops := compute.counts(); return stops == 1 })
 	time.Sleep(500 * time.Millisecond)
 	if starts, _ := compute.counts(); starts != 1 {
