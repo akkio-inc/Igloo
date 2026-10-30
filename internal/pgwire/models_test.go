@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
@@ -484,6 +486,86 @@ func TestDroppedModelOwners(t *testing.T) {
 	mustExec(t, admin, create)
 	if m, _ := store.Get(ctx, "public", "anas"); m.Owner != "igloo" {
 		t.Errorf("replaced by an admin, its owner is %q", m.Owner)
+	}
+}
+
+// pausingBlobs holds the first write of blob sha, once made, until resume
+// is closed.
+type pausingBlobs struct {
+	models.Blobs
+	sha             string
+	once            sync.Once
+	written, resume chan struct{}
+}
+
+func (b *pausingBlobs) Put(ctx context.Context, sha string, data []byte) error {
+	err := b.Blobs.Put(ctx, sha, data)
+	if sha == b.sha {
+		b.once.Do(func() {
+			close(b.written)
+			<-b.resume
+		})
+	}
+	return err
+}
+
+// TestModelBlobPublishedWhileDropped: dropping a model while another with
+// the same blob is created, between CREATE writing the blob and storing its
+// model, does not delete the blob the new model uses.
+func TestModelBlobPublishedWhileDropped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models = store })
+	mustExec(t, cs.admin, leadsTable)
+	create := `CREATE SNOWFLAKE.ML.CLASSIFICATION %s(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT region, spend, visits, converted FROM leads'), TARGET_COLNAME => 'converted')`
+	dropping := snowflakeConn(t, cs.admin)
+	mustExec(t, dropping, strings.Replace(create, "%s", "first", 1))
+	first, err := store.Get(ctx, "public", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs := cs.srv.modelRuntime.Blobs()
+	paused := &pausingBlobs{Blobs: blobs, sha: first.Blob, written: make(chan struct{}), resume: make(chan struct{})}
+	cs.srv.modelRuntime.SetBlobs(paused)
+
+	creating := snowflakeConn(t, cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol))
+	created := make(chan error, 1)
+	go func() {
+		_, err := creating.Exec(ctx, strings.Replace(create, "%s", "second", 1))
+		created <- err
+	}()
+	select {
+	case <-paused.written:
+	case err := <-created:
+		t.Fatalf("CREATE did not write the blob: %v", err)
+	}
+	var dropErr error
+	dropped := make(chan struct{})
+	go func() {
+		_, dropErr = dropping.Exec(ctx, "DROP SNOWFLAKE.ML.CLASSIFICATION first")
+		close(dropped)
+	}()
+	// DROP waits for CREATE to store its model, or would have deleted the
+	// blob by now.
+	select {
+	case <-dropped:
+	case <-time.After(time.Second):
+	}
+	close(paused.resume)
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
+	if <-dropped; dropErr != nil {
+		t.Fatal(dropErr)
+	}
+	second, err := store.Get(ctx, "public", "second")
+	if err != nil || second.Blob != first.Blob {
+		t.Fatalf("second: %+v, %v", second, err)
+	}
+	if _, err := blobs.Get(ctx, second.Blob); err != nil {
+		t.Errorf("the blob of a model just created: %v", err)
 	}
 }
 

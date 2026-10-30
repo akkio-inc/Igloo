@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akkio-inc/igloo/internal/testdb"
 )
@@ -149,6 +150,62 @@ func TestStoreDroppedGrantees(t *testing.T) {
 		}
 		if err != nil || strings.Join(left, ", ") != "role ana, user analysts" {
 			t.Errorf("grants left: %q, %v", left, err)
+		}
+	})
+}
+
+// TestStoreBlobLock: a blob's lock is held by one caller at a time, on
+// every replica, and leaves other blobs' free.
+func TestStoreBlobLock(t *testing.T) {
+	stores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		// Another replica.
+		other := s
+		if _, ok := s.(*PostgresStore); ok {
+			o, err := OpenPostgres(ctx, testdb.URL())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer o.Close()
+			other = o
+		}
+		a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
+		unlock, err := s.LockBlob(ctx, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		if u, err := other.LockBlob(short, a); err == nil {
+			u()
+			t.Fatal("a blob's lock taken twice")
+		}
+		unlockB, err := other.LockBlob(ctx, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unlockB()
+		taken := make(chan func())
+		go func() {
+			if u, err := other.LockBlob(ctx, a); err == nil {
+				taken <- u
+			}
+			close(taken)
+		}()
+		select {
+		case <-taken:
+			t.Fatal("a blob's lock taken while held")
+		case <-time.After(100 * time.Millisecond):
+		}
+		unlock()
+		select {
+		case u, ok := <-taken:
+			if !ok {
+				t.Fatal("the lock was not taken once let go")
+			}
+			u()
+		case <-time.After(10 * time.Second):
+			t.Fatal("the lock was not taken once let go")
 		}
 	})
 }

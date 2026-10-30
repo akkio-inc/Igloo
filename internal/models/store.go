@@ -116,6 +116,13 @@ type Store interface {
 	Delete(ctx context.Context, schema, name string) (Model, error)
 	// BlobUsed reports whether a model's blob is sha.
 	BlobUsed(ctx context.Context, sha string) (bool, error)
+	// LockBlob takes the lock on blob sha, until the function it returns
+	// is called. Models trained the same way share a blob: CREATE holds
+	// the lock from writing the blob until its model is stored, and
+	// deleting a blob holds it from BlobUsed until the blob is gone, so
+	// that a blob is never deleted under a model about to use it. In the
+	// metadata database the lock holds across replicas.
+	LockBlob(ctx context.Context, sha string) (func(), error)
 	// Grants returns every grant on models.
 	Grants(ctx context.Context) ([]Grant, error)
 	// AddGrant and RevokeGrant give and take back a privilege; giving one
@@ -140,9 +147,19 @@ type MemoryStore struct {
 	models map[string]Model
 	grants []Grant
 	epoch  int64
+	// blobLocks are LockBlob's locks, while held or waited for.
+	blobLocks map[string]*blobLock
 }
 
-func NewMemoryStore() *MemoryStore { return &MemoryStore{models: map[string]Model{}, epoch: 1} }
+type blobLock struct {
+	held chan struct{}
+	// users hold or wait for the lock.
+	users int
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{models: map[string]Model{}, epoch: 1, blobLocks: map[string]*blobLock{}}
+}
 
 func (s *MemoryStore) Epoch(context.Context) (int64, error) {
 	s.mu.Lock()
@@ -227,6 +244,34 @@ func (s *MemoryStore) BlobUsed(_ context.Context, sha string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (s *MemoryStore) LockBlob(ctx context.Context, sha string) (func(), error) {
+	s.mu.Lock()
+	l := s.blobLocks[sha]
+	if l == nil {
+		l = &blobLock{held: make(chan struct{}, 1)}
+		s.blobLocks[sha] = l
+	}
+	l.users++
+	s.mu.Unlock()
+	done := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if l.users--; l.users == 0 {
+			delete(s.blobLocks, sha)
+		}
+	}
+	select {
+	case l.held <- struct{}{}:
+		return func() {
+			<-l.held
+			done()
+		}, nil
+	case <-ctx.Done():
+		done()
+		return nil, ctx.Err()
+	}
 }
 
 func (s *MemoryStore) Grants(context.Context) ([]Grant, error) {

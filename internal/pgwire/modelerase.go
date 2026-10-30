@@ -138,19 +138,27 @@ func (m *ModelRetrainer) DropBlobs(ctx context.Context, blobs []string) (int64, 
 	}
 	var left int64
 	for _, sha := range blobs {
-		used, err := s.models.BlobUsed(ctx, sha)
+		// Under the blob's lock, as dropBlob deletes blobs: a CREATE may
+		// be about to store a model that uses it.
+		unlock, err := s.models.LockBlob(ctx, sha)
 		if err != nil {
 			return left, err
 		}
-		if used {
-			continue
+		used, err := s.models.BlobUsed(ctx, sha)
+		switch {
+		case err != nil:
+			unlock()
+			return left, err
+		case used:
+		default:
+			if err := b.Delete(ctx, sha); err != nil {
+				s.log.Warn("an erasure request could not delete a model's old blob; it tries again", "blob", sha, "err", err)
+				left++
+			} else {
+				s.modelRuntime.Forget(sha)
+			}
 		}
-		if err := b.Delete(ctx, sha); err != nil {
-			s.log.Warn("an erasure request could not delete a model's old blob; it tries again", "blob", sha, "err", err)
-			left++
-			continue
-		}
-		s.modelRuntime.Forget(sha)
+		unlock()
 	}
 	return left, nil
 }

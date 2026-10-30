@@ -893,9 +893,12 @@ by their schema there.
   already have, and every process keeps the models it has used in memory.
   Users other than admins cannot read the warehouse's files from SQL.
   Without a warehouse, blobs are in memory.
-- Dropping or replacing a model deletes its blob once no model uses it. A
-  statement prepared before a model was replaced fails with a message to
-  run it again.
+- Dropping or replacing a model deletes its blob once no model uses it.
+  Models trained the same way share a blob: a `CREATE` that writes one
+  holds it, on every replica, until its model is stored, so dropping
+  another model with that blob meanwhile does not delete it. A statement
+  prepared before a model was replaced fails with a message to run it
+  again.
 - **Personal data.** A model keeps no training rows, but it keeps what it
   learned from them: the categories it splits on or encodes, and a time
   series model's series values and its series' last steps (a foundation

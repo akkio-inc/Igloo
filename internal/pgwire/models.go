@@ -322,9 +322,6 @@ func (s *Server) createModelAs(ctx context.Context, sess *session, user auth.Use
 	if err != nil {
 		return err
 	}
-	if err := s.modelRuntime.Blobs().Put(ctx, sha, blob); err != nil {
-		return err
-	}
 	m := models.Model{Schema: schema, Name: name, Class: st.Class, Owner: user.Name, TrainingSQL: text, Config: cfg,
 		Metrics: metrics, Blob: sha, BlobSize: int64(len(blob)), Tables: ai.Tables(tables), Epoch: epoch, SearchPath: searchPath,
 		Dialect: sess.sqlDialect(), IfBlob: ifBlob}
@@ -334,22 +331,17 @@ func (s *Server) createModelAs(ctx context.Context, sess *session, user auth.Use
 	if st.Comment != nil {
 		m.Comment = *st.Comment
 	}
-	old, err := s.models.Put(ctx, m, st.Replace)
+	old, err := s.publishModel(ctx, m, art, blob, st.Replace)
 	switch {
 	case errors.Is(err, models.ErrExists) && st.IfNotExists:
-		s.dropBlob(ctx, sha)
 		return w.Complete(tag)
 	case errors.Is(err, models.ErrExists):
-		s.dropBlob(ctx, sha)
 		return pgerror.WithCode(fmt.Errorf("model %s.%s already exists", schema, name), codes.DuplicateObject)
 	case errors.Is(err, models.ErrStale):
-		s.dropBlob(ctx, sha)
 		return pgerror.WithCode(err, codes.SerializationFailure)
 	case err != nil:
-		s.dropBlob(ctx, sha)
 		return err
 	}
-	s.modelRuntime.Remember(sha, art, false)
 	if old != nil && old.Blob != sha {
 		s.dropBlob(ctx, old.Blob)
 	}
@@ -378,8 +370,42 @@ func noteTrainingModel(sess *session, m models.Model) {
 	*sess.training = append(*sess.training, m.Tables...)
 }
 
+// publishModel writes the blob of m, art encoded, and stores m (see
+// models.Store.Put), holding the blob's lock throughout: another model
+// trained the same way may have the blob, and dropping it meanwhile must
+// not delete the blob m is about to use (models.Store.LockBlob). If m is
+// not stored, its blob is deleted unless a model uses it.
+func (s *Server) publishModel(ctx context.Context, m models.Model, art *models.Artifact, blob []byte, replace bool) (*models.Model, error) {
+	unlock, err := s.models.LockBlob(ctx, m.Blob)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := s.modelRuntime.Blobs().Put(ctx, m.Blob, blob); err != nil {
+		return nil, err
+	}
+	old, err := s.models.Put(ctx, m, replace)
+	if err != nil {
+		s.dropLockedBlob(ctx, m.Blob)
+		return nil, err
+	}
+	s.modelRuntime.Remember(m.Blob, art, false)
+	return old, nil
+}
+
 // dropBlob deletes a blob no model uses any more.
 func (s *Server) dropBlob(ctx context.Context, sha string) {
+	unlock, err := s.models.LockBlob(ctx, sha)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	s.dropLockedBlob(ctx, sha)
+}
+
+// dropLockedBlob deletes blob sha, whose lock the caller holds, unless a
+// model uses it.
+func (s *Server) dropLockedBlob(ctx context.Context, sha string) {
 	used, err := s.models.BlobUsed(ctx, sha)
 	if err != nil || used {
 		return

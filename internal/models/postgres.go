@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -56,9 +58,14 @@ var migrations = []string{
 }
 
 // PostgresStore keeps models in the "igloo_ml" schema of the metadata
-// database.
+// database, and locks blobs with session-level advisory locks, which
+// Postgres releases if the replica holding them dies.
 type PostgresStore struct {
 	pool *pgxpool.Pool
+	// locks holds a connection for each blob lock held. It is a pool of
+	// its own, so callers holding locks always find a connection in pool
+	// for the models.
+	locks *pgxpool.Pool
 }
 
 // OpenPostgres connects to url and creates the tables if needed.
@@ -70,6 +77,14 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 	cfg.MaxConns = 4
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
+		return nil, err
+	}
+	lockCfg := cfg.Copy()
+	lockCfg.MaxConns = 16
+	lockCfg.MaxConnIdleTime = time.Minute
+	locks, err := pgxpool.NewWithConfig(ctx, lockCfg)
+	if err != nil {
+		pool.Close()
 		return nil, err
 	}
 	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
@@ -85,9 +100,10 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 	})
 	if err != nil {
 		pool.Close()
+		locks.Close()
 		return nil, fmt.Errorf("create model tables: %w", err)
 	}
-	return &PostgresStore{pool: pool}, nil
+	return &PostgresStore{pool: pool, locks: locks}, nil
 }
 
 const modelColumns = `schema_name, name, class, owner, comment, training_sql, config::text, metrics::text, blob_sha256, blob_size, created_at,
@@ -197,6 +213,39 @@ func (s *PostgresStore) BlobUsed(ctx context.Context, sha string) (bool, error) 
 	return used, err
 }
 
+// blobLockKey is the advisory lock key of blob sha.
+func blobLockKey(sha string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("igloo/model-blob/" + sha))
+	return int64(h.Sum64())
+}
+
+func (s *PostgresStore) LockBlob(ctx context.Context, sha string) (func(), error) {
+	conn, err := s.locks.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	key := blobLockKey(sha)
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
+		// A wait cut short may still be granted before the server sees
+		// the cancellation; closing the connection ends its session, and
+		// with it any lock it got.
+		_ = conn.Conn().Close(context.Background())
+		conn.Release()
+		return nil, err
+	}
+	return func() {
+		// Unlock even when ctx was canceled. If this fails the connection
+		// is closed instead, which also releases the lock.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", key); err != nil {
+			_ = conn.Conn().Close(ctx)
+		}
+		conn.Release()
+	}, nil
+}
+
 func (s *PostgresStore) Grants(ctx context.Context) ([]Grant, error) {
 	rows, err := s.pool.Query(ctx, `SELECT schema_name, name, grantee, grantee_type, privilege, granted_by, granted_at
 		FROM igloo_ml.grants ORDER BY schema_name, name, grantee_type, grantee, privilege`)
@@ -247,4 +296,7 @@ func (s *PostgresStore) DisownModels(ctx context.Context, owner, tombstone strin
 	return err
 }
 
-func (s *PostgresStore) Close() { s.pool.Close() }
+func (s *PostgresStore) Close() {
+	s.pool.Close()
+	s.locks.Close()
+}
