@@ -119,7 +119,15 @@ type Gateway struct {
 	// lastStart is how long the last start of the compute took, by which
 	// starts for scheduled work come early.
 	lastStart time.Duration
+	// retryAt is when a start for scheduled work that failed is tried
+	// again, and retryWait how long it waits for that.
+	retryAt   time.Time
+	retryWait time.Duration
 }
+
+// scheduleRetryMax bounds the wait between starts for scheduled work that
+// keep failing.
+const scheduleRetryMax = 5 * time.Minute
 
 // New returns a gateway; call Serve to accept connections.
 func New(opts Options) *Gateway {
@@ -312,6 +320,7 @@ func (g *Gateway) start(w *wake) {
 	if err == nil {
 		g.state = stateRunning
 		g.lastStart = elapsed
+		g.retryAt, g.retryWait = time.Time{}, 0
 		g.touch()
 	} else {
 		g.state = stateUnknown
@@ -366,21 +375,33 @@ func (g *Gateway) learnSchedule(ctx context.Context) {
 
 // startForSchedule starts the stopped compute when scheduled work is due,
 // early by as long as the last start took, so that the work starts about
-// on time.
+// on time. The due time is kept until a start succeeds: one that fails is
+// tried again, after a wait that doubles with each failure up to
+// scheduleRetryMax, rather than leaving the work until a client connects.
 func (g *Gateway) startForSchedule(ctx context.Context) {
 	g.mu.Lock()
-	st, due, known, early := g.state, g.due, g.dueKnown, g.lastStart
+	st, due, known, early, retryAt := g.state, g.due, g.dueKnown, g.lastStart, g.retryAt
 	g.mu.Unlock()
-	if st == stateRunning || st == stateStarting || !known || due.IsZero() || time.Until(due) > early {
+	if st == stateRunning || st == stateStarting || !known || due.IsZero() || time.Until(due) > early ||
+		time.Now().Before(retryAt) {
 		return
 	}
 	g.opts.Log.Info("starting igloo for scheduled work", "due", due.UTC().Format(time.RFC3339))
+	if err := g.wake(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		g.mu.Lock()
+		g.retryWait = min(max(2*g.retryWait, g.checkEvery()), scheduleRetryMax)
+		g.retryAt = time.Now().Add(g.retryWait)
+		wait := g.retryWait
+		g.mu.Unlock()
+		g.opts.Log.Error("could not start igloo for scheduled work", "retry_in", wait, "err", err)
+		return
+	}
 	// The work is underway once Igloo runs; the next due time comes from
 	// Igloo the next time it stops.
 	g.setDue(time.Time{}, false)
-	if err := g.wake(ctx); err != nil && ctx.Err() == nil {
-		g.opts.Log.Error("could not start igloo for scheduled work", "err", err)
-	}
 }
 
 func (g *Gateway) setDue(due time.Time, known bool) {
@@ -393,11 +414,7 @@ func (g *Gateway) setDue(due time.Time, known bool) {
 // suspendWhenIdle stops the compute after SuspendAfter without client
 // traffic or running work, and starts it when scheduled work is due.
 func (g *Gateway) suspendWhenIdle(ctx context.Context) {
-	interval := min(g.opts.SuspendAfter/4, 10*time.Second)
-	if interval <= 0 {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(g.checkEvery())
 	defer ticker.Stop()
 	for {
 		select {
@@ -410,6 +427,16 @@ func (g *Gateway) suspendWhenIdle(ctx context.Context) {
 		}
 		g.startForSchedule(ctx)
 	}
+}
+
+// checkEvery is how often the gateway checks whether to stop the compute
+// or start it for scheduled work.
+func (g *Gateway) checkEvery() time.Duration {
+	interval := min(g.opts.SuspendAfter/4, 10*time.Second)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	return interval
 }
 
 func (g *Gateway) suspendIfIdle(ctx context.Context) error {
@@ -434,9 +461,11 @@ func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 			}
 			return nil
 		}
-		if !asked {
-			// Without an answer the next due time may be stale; forget it
-			// rather than start Igloo for work that is not due.
+		if !asked && st == stateRunning {
+			// Igloo was running, and may have run that work since it last
+			// answered: without an answer the due time may be stale.
+			// Forget it rather than start Igloo for work that is not due.
+			// After a start that failed, it is kept for the next try.
 			g.setDue(time.Time{}, false)
 		}
 	}

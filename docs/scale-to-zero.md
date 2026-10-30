@@ -276,7 +276,7 @@ out when none is scheduled).
 | `igloo_gateway_next_due_timestamp_seconds` | | When Igloo last said its scheduled work is next due, which the gateway starts it for; 0 if none is, or the gateway does not know |
 
 Alert on `igloo_gateway_resumes_total{result="failure"}`: clients cannot
-connect while starts fail.
+connect, and scheduled work does not run, while starts fail.
 
 ## Scheduled work
 
@@ -291,7 +291,10 @@ scheduled run is due, and the gateway:
   took, so the work starts about on time. Igloo runs it within seconds of
   starting, and the gateway stops it again after
   `IGLOO_GATEWAY_SUSPEND_AFTER` without traffic or work, as after any
-  start.
+  start. If the start fails, the gateway keeps the due time and tries
+  again, waiting twice as long after each failure (from 10 seconds, or a
+  quarter of `IGLOO_GATEWAY_SUSPEND_AFTER` if that is less, up to five
+  minutes), until a start succeeds.
 
 So a nightly task costs one start and about `IGLOO_GATEWAY_SUSPEND_AFTER`
 of compute a night, plus its run. Work that is due often keeps Igloo

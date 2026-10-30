@@ -158,6 +158,13 @@ func (f *fakeCompute) shutdown() {
 	f.conns = nil
 }
 
+// listening reports whether the fake's port is open.
+func (f *fakeCompute) listening() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ln != nil
+}
+
 func (f *fakeCompute) counts() (starts, stops int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
