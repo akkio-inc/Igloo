@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,7 +23,7 @@ type Source interface {
 	// may be a few seconds old: it decides only whether to distribute.
 	Table(ctx context.Context, schema, name string) (*Table, error)
 	// Refresh brings t to the table's current snapshot. It fails if the
-	// table's columns changed since.
+	// table's columns changed since, their types included.
 	Refresh(ctx context.Context, t *Table) error
 	// Files lists the data files of t's snapshot.
 	Files(ctx context.Context, t *Table) ([]File, error)
@@ -111,6 +112,9 @@ func NewIceberg(cat *catalog.Client) *Iceberg {
 type icebergHandle struct {
 	tbl  *table.Table
 	snap *table.Snapshot
+	// columns are the table's columns as loaded, which Refresh compares:
+	// Coordinator.Table prints nested types afresh in the Table's own.
+	columns []Column
 }
 
 // Table returns a table's metadata, loaded at most tableTTL ago.
@@ -139,25 +143,35 @@ func (s *Iceberg) Table(ctx context.Context, schema, name string) (*Table, error
 	return &c, nil
 }
 
-// Refresh loads the table's current metadata into t.
+// Refresh loads the table's current metadata into t. The statement was
+// planned with t's columns, and workers read the new snapshot's files with
+// their types: a type promoted since, such as FLOAT to DOUBLE, would read
+// the new files' values as the old type, so any change to the columns,
+// nested fields included, keeps the statement on one machine.
 func (s *Iceberg) Refresh(ctx context.Context, t *Table) error {
+	h, ok := t.source.(*icebergHandle)
+	if !ok {
+		return fmt.Errorf("table %s was not loaded from the catalog", t)
+	}
 	fresh, err := s.load(ctx, t.Schema, t.Name)
 	if err != nil {
 		return err
 	}
-	if len(fresh.Columns) != len(t.Columns) {
+	if !slices.EqualFunc(fresh.Columns, h.columns, sameColumn) {
 		return unsupported("the columns of %s changed", t)
-	}
-	for i, c := range fresh.Columns {
-		if c.ID != t.Columns[i].ID || !strings.EqualFold(c.Name, t.Columns[i].Name) {
-			return unsupported("the columns of %s changed", t)
-		}
 	}
 	if fresh.Unsupported != "" {
 		return unsupported("table %s: %s", t, fresh.Unsupported)
 	}
 	t.Bytes, t.Snapshot, t.Versioned, t.source = fresh.Bytes, fresh.Snapshot, fresh.Versioned, fresh.source
 	return nil
+}
+
+// sameColumn reports whether workers read a and b, columns as loaded, the
+// same way: by the same field IDs and as the same type, nested fields
+// included. Names may differ in case alone, as DuckDB resolves them.
+func sameColumn(a, b Column) bool {
+	return a.ID == b.ID && strings.EqualFold(a.Name, b.Name) && a.Type == b.Type && reflect.DeepEqual(a.Nested, b.Nested)
 }
 
 // load loads a table's current metadata from the catalog.
@@ -178,7 +192,7 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	// without field IDs, which workers refuse; iceberg-go adds one to every
 	// table it compacts, whose files all have field IDs.
 	snap := tbl.CurrentSnapshot()
-	t.source = &icebergHandle{tbl: tbl, snap: snap}
+	t.source = &icebergHandle{tbl: tbl, snap: snap, columns: t.Columns}
 	if snap == nil {
 		return t, nil
 	}
