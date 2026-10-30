@@ -120,7 +120,7 @@ type decision struct {
 // decideCall is the call that asks b's decision model questions about
 // state.
 func (s *Statement) decideCall(fn string, b *binding, model, state string, qs []Question, refresh bool) *call {
-	key := cacheKey(fn, decideVersion, b.in.Provider, b.in.Target(), model, canonical(qs), state)
+	key := cacheKey(fn, decideVersion, b.in.cacheScope(), model, canonical(qs), state)
 	est := Usage{InputTokens: estimateTokens(state) + 40*int64(len(qs))}
 	return &call{key: key, fn: fn, b: b, model: model, refresh: refresh, estimate: est,
 		run: func(ctx context.Context) ([]byte, Usage, error) {

@@ -70,7 +70,10 @@ type Price struct {
 type Integration struct {
 	// Name is a lowercase SQL name, unique among all integrations,
 	// notification integrations included.
-	Name     string
+	Name string
+	// ID is given when the integration is created, kept by CREATE OR
+	// REPLACE and ALTER, which keep its grants too, and never given again.
+	ID       string
 	Provider string
 	// BaseURL is where the provider's API is, such as
 	// https://api.openai.com/v1; empty means the provider's own.
@@ -157,6 +160,15 @@ func (in *Integration) Target() string {
 		return ""
 	}
 	return u.Scheme + "://" + u.Host
+}
+
+// cacheScope is what the integration's answers are cached under, besides
+// the request: the integration, by its ID; its API's full address; and a
+// version of its other settings that shape requests, its keys aside. Two
+// integrations never share answers, though they reach one host: each is
+// granted apart, and may reach another account, deployment or route there.
+func (in *Integration) cacheScope() string {
+	return cacheKey(in.ID, in.Provider, in.Base(), in.APIVersion, in.Region, in.Project)
 }
 
 // Decides reports whether the provider has decision models.

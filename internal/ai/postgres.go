@@ -66,6 +66,16 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS cache_tables ON igloo_ai.cache USING gin (tables)`,
 	`CREATE INDEX IF NOT EXISTS cache_expires ON igloo_ai.cache (expires_at)`,
+	// Each integration's ID (Integration.ID), which CREATE OR REPLACE
+	// keeps, as it updates the row. Added once, so later starts take no
+	// lock on the table; each existing integration gets one of its own.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_ai' AND table_name = 'integrations' AND column_name = 'id') THEN
+			ALTER TABLE igloo_ai.integrations ADD COLUMN IF NOT EXISTS id text NOT NULL DEFAULT gen_random_uuid()::text;
+		END IF;
+	END $$`,
 }
 
 // PostgresStore keeps everything in the "igloo_ai" schema of the metadata
@@ -145,7 +155,7 @@ func (s *PostgresStore) encode(in Integration) (sealed []byte, set []byte, err e
 	return s.sealer.seal(in.Name, plain), set, err
 }
 
-const integrationColumns = `name, provider, enabled, sealed, settings, comment, created_by, created_at`
+const integrationColumns = `name, id, provider, enabled, sealed, settings, comment, created_by, created_at`
 
 func (s *PostgresStore) scan(row pgx.Row) (Integration, error) {
 	var (
@@ -153,7 +163,7 @@ func (s *PostgresStore) scan(row pgx.Row) (Integration, error) {
 		sealed []byte
 		set    []byte
 	)
-	if err := row.Scan(&in.Name, &in.Provider, &in.Enabled, &sealed, &set, &in.Comment, &in.CreatedBy, &in.CreatedAt); err != nil {
+	if err := row.Scan(&in.Name, &in.ID, &in.Provider, &in.Enabled, &sealed, &set, &in.Comment, &in.CreatedBy, &in.CreatedAt); err != nil {
 		return in, err
 	}
 	var st settings

@@ -18,7 +18,7 @@ const embedBatch = 64
 
 // embedCall is the call that asks b's embedding model for text's vector.
 func (s *Statement) embedCall(b *binding, model, text string, refresh bool) *call {
-	key := cacheKey("ai_embed", embedVersion, b.in.Provider, b.in.Target(), model, text)
+	key := cacheKey("ai_embed", embedVersion, b.in.cacheScope(), model, text)
 	return &call{key: key, fn: "ai_embed", b: b, model: model, refresh: refresh, group: b.in.Name + "/" + model, input: text,
 		estimate: Usage{InputTokens: estimateTokens(text)}}
 }

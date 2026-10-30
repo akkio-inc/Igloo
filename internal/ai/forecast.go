@@ -229,7 +229,7 @@ func (s *Statement) Forecast(model string, series []ForecastSeries, horizon int,
 	calls := make([]*call, len(series))
 	for i, sr := range series {
 		calls[i] = &call{
-			key: cacheKey(ForecastFunction, b.in.Name, provider, strconv.Itoa(horizon), canonical(step), canonical(levels),
+			key: cacheKey(ForecastFunction, b.in.cacheScope(), provider, strconv.Itoa(horizon), canonical(step), canonical(levels),
 				strconv.FormatFloat(interval, 'g', -1, 64), sr.Start.UTC().Format(time.RFC3339Nano), valuesKey(sr.Values)),
 			fn: ForecastFunction, b: b, model: provider, refresh: refresh,
 			// Tokens, as Nixtla counts them: a value each.

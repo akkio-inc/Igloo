@@ -2,6 +2,8 @@ package ai
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"slices"
 	"strings"
 	"sync"
@@ -57,8 +59,9 @@ const AnyTable = "*"
 
 // CacheEntry is a result kept for a function's input.
 type CacheEntry struct {
-	// Key is the hash of the function, the provider and model, the
-	// template's version, the options and the input (see cacheKey).
+	// Key is the hash of the function, the integration and model (see
+	// Integration.cacheScope), the template's version, the options and the
+	// input (see cacheKey).
 	Key string
 	// Function and Model say what made it, for operators.
 	Function, Model string
@@ -90,6 +93,13 @@ func tableSet(tables []string) map[string]bool {
 	return m
 }
 
+// newID is a new integration's ID: 16 random bytes, in hex.
+func newID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // MemoryStore keeps everything in memory, for one replica without a
 // metadata database.
 type MemoryStore struct {
@@ -108,8 +118,14 @@ func NewMemoryStore() *MemoryStore {
 func (m *MemoryStore) CreateIntegration(_ context.Context, in Integration, replace bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.integrations[in.Name]; ok && !replace {
+	old, ok := m.integrations[in.Name]
+	switch {
+	case ok && !replace:
 		return ErrExists
+	case ok:
+		in.ID = old.ID
+	default:
+		in.ID = newID()
 	}
 	if in.CreatedAt.IsZero() {
 		in.CreatedAt = time.Now()
@@ -147,7 +163,7 @@ func (m *MemoryStore) UpdateIntegration(_ context.Context, in Integration) error
 	if !ok {
 		return ErrNotFound
 	}
-	in.CreatedAt, in.CreatedBy = old.CreatedAt, old.CreatedBy
+	in.ID, in.CreatedAt, in.CreatedBy = old.ID, old.CreatedAt, old.CreatedBy
 	m.integrations[in.Name] = in.Clone()
 	m.version++
 	return nil

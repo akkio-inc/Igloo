@@ -261,8 +261,11 @@ chargeback to clients and campaigns.
 
 Answers are kept in the metadata database, for every replica, for
 `IGLOO_AI_CACHE_RETENTION` (30 days by default), keyed by a SHA-256 of the
-function, the provider and its address, the provider's model, the version
-of Igloo's template for the function, the options and the input. A rerun
+function, the integration, its full address and its API version, region
+and project, the provider's model, the version of Igloo's template for the
+function, the options and the input. Integrations never share answers, even
+at one address, and an integration dropped and created again starts
+afresh; `CREATE OR REPLACE` and new keys keep its answers. A rerun
 returns the same answer and costs nothing, which providers' sampling
 settings cannot promise: repeatability comes from the cache. `refresh =>
 TRUE` asks again, and `IGLOO_AI_CACHE=off` keeps nothing.
