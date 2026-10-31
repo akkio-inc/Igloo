@@ -92,6 +92,7 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
 | `ALTER TABLE ... CREATE BRANCH`, `CREATE TAG`, `DROP BRANCH`, `DROP TAG`, `FAST FORWARD` | Yes, outside transactions; see [branches and tags](#branches-and-tags) |
 | `ALTER TABLE ... SET SORTED BY (...)`, `RESET SORTED BY` | Yes, outside transactions; see [sort orders](#sort-orders-and-clustering) |
+| `CREATE TABLE ... PARTITIONED BY (...)`, `ALTER TABLE ... SET PARTITIONED BY (...)`, `RESET PARTITIONED BY` | Yes; see [bucketed tables](#bucketed-tables) |
 | `CREATE TASK`, `CREATE PIPE` | Yes; see [tasks](loading.md#tasks) and [pipes](loading.md#pipes) |
 | `PRIMARY KEY`, `UNIQUE` | Accepted but not enforced |
 | `NOT NULL` | Enforced |
@@ -158,6 +159,38 @@ SELECT table_name, clustering_key FROM igloo.tables;  -- LINEAR(customer_id, day
   [clustering](operations.md#clustering)). `SYSTEM$CLUSTERING_DEPTH('t',
   '(column)')` measures by a column instead, as for a table without a key.
   It needs `SELECT` on the table and runs on its own.
+
+### Bucketed tables
+
+A table partitioned by the bucket transform of a column, `bucket(n,
+column)`, keeps the rows of each bucket of the column's hash in files of
+their own, as Iceberg's spec has every engine write them. Workers then join
+two such tables on their bucketed columns, group by the column or count its
+distinct values bucket by bucket, each reading the same buckets of every
+table, without exchanging rows first (see [bucketed
+tables](distributed-execution.md#bucketed-tables)):
+
+```sql
+CREATE TABLE lake.public.orders (order_id BIGINT, customer_id BIGINT, total DECIMAL(12,2))
+  PARTITIONED BY (bucket(32, customer_id));
+CREATE TABLE lake.public.visits PARTITIONED BY (bucket(64, customer_id)) AS SELECT * FROM staging.visits;
+ALTER TABLE lake.public.customers SET PARTITIONED BY (bucket(32, customer_id));
+ALTER TABLE lake.public.customers RESET PARTITIONED BY;  -- unpartitioned again
+```
+
+- `ALTER TABLE ... SET PARTITIONED BY` changes how files are written from
+  then on: files written before keep every bucket, so workers exchange the
+  table's rows until they are written again (a table created with the
+  partitioning, or filled after it is set, is bucketed throughout).
+- Tables meet bucket by bucket where one count divides the other (16 and
+  64, 32 and 32), and their columns hash alike: integers of any width, or
+  the same type. Choose counts of a few times the workers' cores at least:
+  a statement over the table runs in as many tasks.
+- Table maintenance compacts each bucket's small files into larger files of
+  that bucket. A table partitioned so is compacted, not clustered by its
+  [sort order](#sort-orders-and-clustering).
+- In Snowflake's dialect, `CLUSTER BY (BUCKET(32, customer_id))` does the
+  same (see [Snowflake SQL](snowflake-sql.md#statements)).
 
 ### Writing rows in order
 

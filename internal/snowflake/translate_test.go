@@ -318,6 +318,15 @@ func TestTranslateClusterBy(t *testing.T) {
 		{`CREATE OR REPLACE TABLE "My Table" CLUSTER BY (a) AS SELECT 1 AS a`, `CREATE OR REPLACE TABLE "My Table" AS SELECT 1 AS a`,
 			[]string{`ALTER TABLE "My Table" SET SORTED BY (a)`}},
 		{`CREATE TABLE t (a INT) CLUSTER BY (a + 1)`, `CREATE TABLE t (a BIGINT)`, nil},
+		// BUCKET(n, column) items: the table's partition spec, bucketed.
+		{`CREATE TABLE db.s.t (a INT, b STRING, d DATE) CLUSTER BY (BUCKET(16, a), d)`, `CREATE TABLE db.s.t (a BIGINT, b VARCHAR, d DATE) PARTITIONED BY (bucket(16, a))`,
+			[]string{`ALTER TABLE db.s.t SET SORTED BY (d)`}},
+		{`CREATE OR REPLACE TABLE t CLUSTER BY (bucket(8, "Id")) AS SELECT 1 AS "Id"`, `CREATE OR REPLACE TABLE t PARTITIONED BY (bucket(8, "Id")) AS SELECT 1 AS "Id"`, nil},
+		{`CREATE TABLE IF NOT EXISTS t (a INT, b INT) CLUSTER BY (BUCKET(4, a), b)`, `CREATE TABLE IF NOT EXISTS t (a BIGINT, b BIGINT) PARTITIONED BY (bucket(4, a))`, nil},
+		{`ALTER TABLE s.t CLUSTER BY (BUCKET(32, customer_id))`, `ALTER TABLE s.t SET PARTITIONED BY (bucket(32, customer_id))`, nil},
+		{`ALTER TABLE s.t CLUSTER BY (BUCKET(32, customer_id), day)`, `ALTER TABLE s.t SET PARTITIONED BY (bucket(32, customer_id))`,
+			[]string{`ALTER TABLE s.t SET SORTED BY (day)`}},
+		{`CREATE TABLE t (a INT) CLUSTER BY (BUCKET(a, 16))`, `CREATE TABLE t (a BIGINT)`, nil},
 	} {
 		res := translate(t, c.in)
 		if res.SQL != c.want || !slices.Equal(res.After, c.after) || res.Command != "" {

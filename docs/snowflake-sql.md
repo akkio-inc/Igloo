@@ -353,7 +353,13 @@ and the vector functions refuse vectors of different dimensions.
   DROP CLUSTERING KEY` drops it; table maintenance then clusters the table's
   files, as Snowflake's automatic clustering does. Keys must be columns:
   `CLUSTER BY` of expressions (`to_date(ts)`), on a temporary table or with
-  `IF NOT EXISTS` is ignored with a notice. `ALTER TABLE ... RECLUSTER` and
+  `IF NOT EXISTS` is ignored with a notice. Igloo's `BUCKET(n, column)` in
+  the list (`CLUSTER BY (BUCKET(32, customer_id), day)`) partitions the
+  table by `bucket(n, column)` instead, as its
+  [bucketed tables](sql.md#bucketed-tables) are, which
+  [workers](distributed-execution.md#bucketed-tables) join and group on that
+  column bucket by bucket; the list's columns are its clustering key as
+  before. `ALTER TABLE ... RECLUSTER` and
   `SUSPEND | RESUME RECLUSTER` change nothing and say so.
   `SYSTEM$CLUSTERING_DEPTH('t' [, '(columns)'])` returns the table's average
   clustering depth, by the first column given or its key's; a predicate as a
