@@ -515,6 +515,35 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Auto mode picks how many workers a statement runs on: of 1, 2, 4 and so
+  on up to `IGLOO_WORKER_MAX`, and the workers running, those estimated
+  within a fifth of the fastest, the cheapest at the workers' price
+  (`IGLOO_WORKER_PRICE_PER_HOUR`), counting the start and idle tail of
+  workers it starts; of more running, it takes those with the fewest
+  tasks. A report of a few stages that took 58 s on the replica and 50 s on
+  16 workers at ten times the data now runs on 4; reports whose stages read
+  a hundred gigabytes run on all 16. The history keeps runs by how many
+  workers ran them, and corrects the other counts' estimates by the
+  nearest. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and the ways
+  weighed (`options`), and `query_history.placement` where a statement ran
+  and why (see [when](docs/distributed-execution.md#when)).
+- A compute pool may have a large worker (`IGLOO_LARGE_WORKER`, the chart's
+  `workers.large`), on which auto mode runs a statement alone when it fits
+  there and is estimated within a fifth of the fastest way and cheapest,
+  planned again for its memory; erasure requests purge its read cache as
+  the other workers' (see [a large
+  worker](docs/distributed-execution.md#a-large-worker)).
+- Auto mode's estimates of one machine spill by a curve fitted to the scale
+  runs, the working set over the memory for it to the power of 0.55, within
+  a factor of two for ten of eleven reports, where spilling was held to twice
+  as long; past twelve times the memory a machine is taken to run out of
+  it. `EXPLAIN DISTRIBUTED`'s `spill` rows show each machine's working set,
+  room and spill.
+- The OpenTofu modules can provision workers (`workers_enabled`), on Spot
+  capacity by default with an on-demand fallback: the cluster autoscaler's
+  priority expander on AWS and Azure, a compute class on GKE Autopilot. A
+  harness test interrupts a worker's Spot Instance mid-statement: its tasks
+  run elsewhere and the statement finishes with the same rows.
 - Workers stop after an idle tail sized to their start
   (`IGLOO_WORKER_IDLE_AFTER=auto`, the default): three times what their
   last start took, from 2 to 10 minutes, where every burst of work kept
@@ -739,11 +768,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   at a hundred times the data; in a lab, such rows held 1.2 GB a task over
   202 partitions where they had held 2.1 GB.
 - A statement auto mode runs on the replica, though workers could run it,
-  is stopped there once it has run three times its estimate, and at least
-  90 seconds, without sending a row, and runs on workers instead, which
-  are started if stopped (`igloo_auto_guard_reruns_total`); auto mode runs
-  it on workers from then on. A report estimated at 51 s on the replica
-  that took 1,798 s there, and 362 s on workers, would take about 515 s.
+  is stopped there once it has run three times its estimate and as long as
+  the workers are estimated to take it, start included, and at least 15
+  seconds, without sending a row, and runs on workers instead, which are
+  started if stopped (`igloo_auto_guard_reruns_total`); auto mode runs it
+  on workers from then on. That bounds the loss at about twice the faster
+  side: a report estimated at 13 s on the replica and 30 s on workers moves
+  after 39 s rather than 90.
   Workers are not stopped as idle while such a statement runs on the
   replica. Writes and statements that have sent rows are never stopped.
 - Auto mode's history counts runs on workers with runs on about as many
