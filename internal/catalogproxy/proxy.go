@@ -346,22 +346,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body = withDefaults(rest, body)
 	// A change makes the listings kept stale: forgotten before it, so no
 	// listing begun before it is kept, and after it, so none answered
-	// while it was under way is.
-	p.lists.forget()
-	p.data.bump()
+	// while it was under way is. So does it the versions of the tables it
+	// changes.
+	tables, known, none := changedTables(r.Method, rest, body)
+	changed := func() {
+		if !none {
+			p.lists.forget()
+			p.data.bumpTables(tables, known)
+		}
+	}
+	changed()
 	c := p.begin(r, rest, body)
 	select {
 	case <-c.done:
-		p.lists.forget()
-		p.data.bump()
+		changed()
 		c.res.write(w)
 	case <-r.Context().Done():
 		// DuckDB gave up waiting; it sends the change again, which joins
 		// this one.
 		go func() {
 			<-c.done
-			p.lists.forget()
-			p.data.bump()
+			changed()
 		}()
 	}
 }

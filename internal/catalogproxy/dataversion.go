@@ -2,11 +2,14 @@ package catalogproxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -26,10 +29,21 @@ import (
 // statements next loads it: at another metadata location than its last
 // load found. The version goes up then too, and when a load's location
 // cannot be read, as when the catalog compresses its answer.
+//
+// Each table has a version of its own too, which goes up whenever that
+// table may have changed (see TablesVersion): a change the proxy can tell
+// the tables of (a commit, a drop, a rename, a table made) raises theirs,
+// and a load that finds a table at another location raises that table's.
+// A change it cannot tell the tables of, as one to a namespace or a view,
+// or Invalidate, raises every table's, through the epoch.
 type dataVersion struct {
 	version atomic.Uint64
 
 	mu sync.Mutex
+	// tables are the tables' versions, by tableKey; epoch is added to
+	// every one of them.
+	tables map[string]uint64
+	epoch  uint64
 	// locations are the metadata locations the last loads found, by the
 	// table's path in the catalog's API.
 	locations map[string]string
@@ -138,7 +152,7 @@ func (p *Proxy) reload(ctx context.Context, l Load) error {
 	}
 	if res.status != http.StatusOK {
 		// Dropped, say: whatever read it no longer reads the same.
-		p.data.bump()
+		p.data.bumpTables([]string{loadKey(l.path)}, true)
 		return fmt.Errorf("loading %s again: HTTP %d", l.path, res.status)
 	}
 	var loaded struct {
@@ -160,13 +174,138 @@ func (p *Proxy) DataVersion() uint64 {
 	return p.data.version.Load()
 }
 
-func (d *dataVersion) bump() { d.version.Add(1) }
+// TablesVersion is a version of the tables loads loaded: it changes
+// whenever any of them may have changed, here or, once one of this
+// replica's statements loads it again, through another replica or engine,
+// and stays the same while none does, whatever happens to other tables.
+func (p *Proxy) TablesVersion(loads []Load) uint64 {
+	if p == nil {
+		return 0
+	}
+	keys := make([]string, len(loads))
+	for i, l := range loads {
+		keys[i] = loadKey(l.path)
+	}
+	slices.Sort(keys)
+	keys = slices.Compact(keys)
+	d := &p.data
+	h := sha256.New()
+	d.mu.Lock()
+	_ = binary.Write(h, binary.LittleEndian, d.epoch)
+	for _, k := range keys {
+		_ = binary.Write(h, binary.LittleEndian, uint64(len(k)))
+		h.Write([]byte(k))
+		_ = binary.Write(h, binary.LittleEndian, d.tables[k])
+	}
+	d.mu.Unlock()
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return binary.LittleEndian.Uint64(sum[:8])
+}
+
+// bump raises every table's version.
+func (d *dataVersion) bump() {
+	d.mu.Lock()
+	d.epoch++
+	d.mu.Unlock()
+	d.version.Add(1)
+}
+
+// bumpTables raises the versions of the tables keys, tableKey's, or every
+// table's when ok is false.
+func (d *dataVersion) bumpTables(keys []string, ok bool) {
+	if !ok {
+		d.bump()
+		return
+	}
+	d.mu.Lock()
+	if d.tables == nil {
+		d.tables = map[string]uint64{}
+	}
+	for _, k := range keys {
+		d.tables[k]++
+	}
+	d.mu.Unlock()
+	d.version.Add(1)
+}
+
+// metricsPath matches the reports of scans' metrics that clients send a
+// table, which change nothing.
+var metricsPath = regexp.MustCompile(`^v1/(?:[^/?]+/)?namespaces/[^/?]+/tables/[^/?]+/metrics$`)
+
+// tableKey identifies a table for its version: its namespace's levels and
+// its name, unescaped, in lower case.
+func tableKey(ns []string, name string) string {
+	return strings.ToLower(strings.Join(ns, "\x1f") + "/" + name)
+}
+
+// loadKey is the tableKey of a load's table, whose path is as tableLoad
+// has it.
+func loadKey(path string) string {
+	ns, name, _ := strings.Cut(path, "/")
+	return tableKey(namespace(ns), unescape(name))
+}
+
+// changedTables returns the tables a change, a request of method to the
+// catalog's path rest with body, may change, by tableKey: ok is false
+// when it cannot tell. none says the request changes no table's rows or
+// columns, as a scan's metrics report.
+func changedTables(method, rest string, body []byte) (keys []string, ok, none bool) {
+	path, _, _ := strings.Cut(rest, "?")
+	if method == http.MethodPost && strings.HasSuffix(path, "/metrics") && metricsPath.MatchString(path) {
+		return nil, true, true
+	}
+	if m := loadTablePath.FindStringSubmatch(rest); m != nil && (method == http.MethodPost || method == http.MethodDelete) {
+		return []string{tableKey(namespace(m[2]), unescape(m[3]))}, true, false
+	}
+	type ident struct {
+		Namespace []string `json:"namespace"`
+		Name      string   `json:"name"`
+	}
+	switch {
+	case method == http.MethodPost && strings.HasSuffix(path, "/transactions/commit"):
+		var tx struct {
+			TableChanges []struct {
+				Identifier *ident `json:"identifier"`
+			} `json:"table-changes"`
+		}
+		if json.Unmarshal(body, &tx) != nil {
+			return nil, false, false
+		}
+		for _, c := range tx.TableChanges {
+			if c.Identifier == nil {
+				return nil, false, false
+			}
+			keys = append(keys, tableKey(c.Identifier.Namespace, c.Identifier.Name))
+		}
+		return keys, true, false
+	case method == http.MethodPost && createTablePath.MatchString(rest):
+		var c struct {
+			Name string `json:"name"`
+		}
+		m := createTablePath.FindStringSubmatch(rest)
+		if json.Unmarshal(body, &c) != nil || c.Name == "" {
+			return nil, false, false
+		}
+		return []string{tableKey(namespace(m[1]), c.Name)}, true, false
+	case method == http.MethodPost && renameTablePath.MatchString(rest):
+		var c struct {
+			Source      *ident `json:"source"`
+			Destination *ident `json:"destination"`
+		}
+		if json.Unmarshal(body, &c) != nil || c.Source == nil || c.Destination == nil {
+			return nil, false, false
+		}
+		return []string{tableKey(c.Source.Namespace, c.Source.Name), tableKey(c.Destination.Namespace, c.Destination.Name)}, true, false
+	}
+	return nil, false, false
+}
 
 // loaded notes that a load of the table at path found its metadata at
 // location, "" when it could not be read.
 func (d *dataVersion) loaded(path, location string) {
 	if location == "" {
-		d.bump()
+		d.bumpTables([]string{loadKey(path)}, true)
 		return
 	}
 	d.mu.Lock()
@@ -177,7 +316,7 @@ func (d *dataVersion) loaded(path, location string) {
 	d.locations[path] = location
 	d.mu.Unlock()
 	if seen && last != location {
-		d.bump()
+		d.bumpTables([]string{loadKey(path)}, true)
 	}
 }
 

@@ -95,3 +95,61 @@ func TestDataVersion(t *testing.T) {
 	send(http.MethodGet)
 	step("Invalidate", p.Invalidate, true)
 }
+
+// TestTablesVersion checks that a table's version changes with changes to
+// it, however they reach the catalog, and with loads that find it
+// elsewhere, and not with changes to other tables or scans' metrics;
+// changes the proxy cannot tell the tables of change every table's.
+func TestTablesVersion(t *testing.T) {
+	catalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metadata-location": "s3://w/` + r.URL.Path + `/metadata/1.json", "metadata": {"format-version": 2}}`))
+	}))
+	t.Cleanup(catalog.Close)
+	p, err := New(Options{Catalog: catalog.URL + "/catalog"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	send := func(method, path, body string) {
+		t.Helper()
+		req, _ := http.NewRequest(method, p.URL()+"/v1/w/"+path, strings.NewReader(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	record := p.RecordLoads()
+	send(http.MethodGet, "namespaces/sales/tables/carts", "")
+	carts := record()
+	if len(carts) != 1 {
+		t.Fatalf("loads: %v", carts)
+	}
+	step := func(what string, do func(), up bool) {
+		t.Helper()
+		before := p.TablesVersion(carts)
+		do()
+		if after := p.TablesVersion(carts); (after != before) != up {
+			t.Errorf("%s: carts's version %d, then %d", what, before, after)
+		}
+	}
+	step("a commit to another table", func() { send(http.MethodPost, "namespaces/sales/tables/orders", `{"updates": []}`) }, false)
+	step("a scan's metrics", func() { send(http.MethodPost, "namespaces/sales/tables/carts/metrics", `{}`) }, false)
+	step("a table made", func() { send(http.MethodPost, "namespaces/sales/tables", `{"name": "returns"}`) }, false)
+	step("a commit", func() { send(http.MethodPost, "namespaces/sales/tables/carts", `{"updates": []}`) }, true)
+	step("a commit of a transaction", func() {
+		send(http.MethodPost, "transactions/commit", `{"table-changes": [{"identifier": {"namespace": ["Sales"], "name": "Carts"}}]}`)
+	}, true)
+	step("a transaction of another table", func() {
+		send(http.MethodPost, "transactions/commit", `{"table-changes": [{"identifier": {"namespace": ["sales"], "name": "orders"}}]}`)
+	}, false)
+	step("a rename", func() {
+		send(http.MethodPost, "tables/rename", `{"source": {"namespace": ["sales"], "name": "carts"}, "destination": {"namespace": ["sales"], "name": "old_carts"}}`)
+	}, true)
+	step("a drop", func() { send(http.MethodDelete, "namespaces/sales/tables/carts", "") }, true)
+	step("a change to a namespace", func() { send(http.MethodPost, "namespaces/sales/properties", `{"updates": {}}`) }, true)
+	step("Invalidate", p.Invalidate, true)
+}
