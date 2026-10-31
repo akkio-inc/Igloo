@@ -61,6 +61,10 @@ type Stage struct {
 	// partial results it reads by partition, whose partitions hold them
 	// whole: one task may complete them all (see execution.groups).
 	completes bool
+	// merge, for a stage whose rows are the statement's result, ordered by
+	// ORDER BY without LIMIT, are the columns its tasks sort their rows by,
+	// which the coordinator merges their files by (see merge.go).
+	merge []mergeKey
 }
 
 // Input is a relation a stage's fragment reads under a view name: a

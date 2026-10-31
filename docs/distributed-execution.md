@@ -98,11 +98,22 @@ already holds every row of its values, and counts them without exchanging
 the values. Groups that are few, or of grouping sets (`ROLLUP`), the
 coordinator combines from every worker's partial results, and adds up the
 partitions' counts itself.
-So are the groups of an aggregation that forecasts each one
+Workers complete the groups of an aggregation that forecasts each one too
 ([`AI.FORECAST`](ml-functions.md#bigquerys-and-databricks-forecasting-functions)
 and the like, which gather a series' points with `list()`): each partition
 completes its series and forecasts them, and the coordinator receives the
 forecasts rather than the series.
+
+A result ordered by `ORDER BY` without `LIMIT`, of the groups workers
+complete or the rows they keep, each worker sorts as it completes them, and
+the coordinator merges the workers' sorted rows rather than sorting them
+all, holding a batch of rows a worker in memory whatever the result: by
+columns of numbers, text and `BLOB`s (by their bytes), dates, times,
+timestamps, decimals and booleans, the result's columns or the groups and
+aggregates they show, in the session's default order and `NULLS` order.
+An order by an expression, under a `default_collation`, or in a session
+that does not keep the order rows are read in (`preserve_insertion_order
+= false`), the coordinator sorts, as before.
 
 Where a session counts distinct 32-bit unsigned integers with roaring
 bitmaps (the `rb_count_distinct` setting, `always`, which Igloo sets for

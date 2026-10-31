@@ -189,6 +189,20 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	if b.combine, err = a.combine(); err != nil {
 		return nil, err
 	}
+	if c.top {
+		if keys, order := a.mergeOrder(); keys != nil {
+			// The stage that sends the coordinator whole groups sorts them
+			// task by task, and the coordinator merges them (see merge.go).
+			last := &b.fragment
+			if b.third != nil {
+				last = &b.third.fragment
+			} else if b.second != nil {
+				last = &b.second.fragment
+			}
+			(*last)["modifiers"] = []any{order}
+			b.merge = keys
+		}
+	}
 	return b, nil
 }
 
@@ -2036,7 +2050,81 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 		outMods = append(outMods, clone(limit))
 	}
 	out["modifiers"] = outMods
-	return &jobBuild{fragment: f, combine: out, columns: columns}, nil
+	b := &jobBuild{fragment: f, combine: out, columns: columns}
+	if c.top && order != nil && limit == nil && distinct == nil {
+		// Each task sorts its rows by the ORDER BY it keeps, which the
+		// coordinator merges them by.
+		for _, ord := range orders {
+			e := child(ord, "expression")
+			names := columns[:n]
+			if str(e["class"]) != "STAR" {
+				names = columnNames(e)
+			}
+			for _, name := range names {
+				b.merge = append(b.merge, mergeKey{column: name, order: str(ord["type"]), nulls: str(ord["null_order"])})
+			}
+		}
+	}
+	return b, nil
+}
+
+// mergeOrder returns, for an aggregation whose result is its whole groups
+// (final) ordered by ORDER BY without LIMIT, the columns of the stage that
+// completes them its tasks sort their rows by, and the ORDER BY that sorts
+// them so; nil when an ORDER BY item is not a group expression, an
+// aggregate or a select item computing one of them, or the result is
+// otherwise.
+func (a *aggregation) mergeOrder() ([]mergeKey, node) {
+	sel := a.c.sel
+	if !a.final || child(sel, "qualify") != nil {
+		return nil, nil
+	}
+	var order node
+	for _, m := range list(sel, "modifiers") {
+		switch mod := m.(node); str(mod["type"]) {
+		case "ORDER_MODIFIER":
+			order = clone(mod).(node)
+		default:
+			return nil, nil
+		}
+	}
+	if order == nil {
+		return nil, nil
+	}
+	var keys []mergeKey
+	for _, o := range list(order, "orders") {
+		ord := o.(node)
+		e := child(ord, "expression")
+		staged := -1
+		if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
+			e, staged = bare(a.items[k-1]), int(k-1)
+		} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+			if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
+				if has, _ := a.c.scope.hasColumn(strings.ToLower(columnNames(e)[0])); !has {
+					e, staged = bare(a.items[i]), i
+				}
+			}
+		}
+		col := ""
+		k := a.key(e)
+		if g := slices.Index(a.groupKeys, k); g >= 0 {
+			col = "__g" + strconv.Itoa(g)
+		} else if ac, ok := a.aggKeys[k]; ok && a.pl.isAggregate(e) && ac.final >= 0 {
+			col = "__f" + strconv.Itoa(ac.final)
+		} else if staged >= 0 && a.staged[staged] {
+			col = "__s" + strconv.Itoa(staged)
+		}
+		if col == "" {
+			return nil, nil
+		}
+		ref, err := a.pl.p.expr(quoteIdent(col))
+		if err != nil {
+			return nil, nil
+		}
+		ord["expression"] = ref
+		keys = append(keys, mergeKey{column: col, order: str(ord["type"]), nulls: str(ord["null_order"])})
+	}
+	return keys, order
 }
 
 // columnIndex returns the index of the one result column called name, or

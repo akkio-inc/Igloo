@@ -655,6 +655,9 @@ type candidate struct {
 	// columns the relation is to be written by.
 	relation bool
 	want     []string
+	// top says the candidate is the statement itself, whose result the
+	// coordinator sends the client.
+	top bool
 	// window, if set, are the columns that the window functions of a
 	// candidate that does not aggregate all partition their rows by: its
 	// stage reads its inputs by partition, keyed so that each task holds
@@ -667,7 +670,7 @@ type candidate struct {
 func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 	sp := pl.save()
 	inlines := pl.inlines
-	c := &candidate{sel: sel}
+	c := &candidate{sel: sel, top: top}
 	j, b, err := pl.build(c, top, ctes)
 	var combine node
 	if err == nil {
@@ -1867,6 +1870,9 @@ type jobBuild struct {
 	// partition, before the combine step; third, if set, completes them
 	// from second's rows, partitioned by group (see aggregation.regroup).
 	second, third *secondStage
+	// merge are the columns the last stage's tasks sort their rows by, for
+	// a statement's result ordered by ORDER BY without LIMIT (see merge.go).
+	merge []mergeKey
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -1986,6 +1992,7 @@ func (pl *planner) finish(j *job, b *jobBuild) (node, error) {
 		return nil, err
 	}
 	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
+	last.merge = b.merge
 	b.combine["from_table"] = placeholderRef(last.placeholder)
 	return b.combine, nil
 }

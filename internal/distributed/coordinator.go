@@ -784,6 +784,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 
 	final := clone(plan.final).(node)
+	co.mergeOrdered(ctx, final, plan.Stages, run, settings, ex.dir, qid)
 	for _, s := range plan.Stages {
 		if s.Out != nil {
 			continue
