@@ -1029,6 +1029,9 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 	if err := c.checkWindows(); err != nil {
 		return err
 	}
+	if err := c.checkSamples(); err != nil {
+		return err
+	}
 	defer unmark(c)
 	j, err := pl.views(c)
 	if err != nil {

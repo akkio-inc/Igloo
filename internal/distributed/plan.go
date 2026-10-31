@@ -732,6 +732,9 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	if err := c.checkWindows(); err != nil {
 		return nil, nil, err
 	}
+	if err := c.checkSamples(); err != nil {
+		return nil, nil, err
+	}
 	var err error
 	if c.columns, err = pl.describe(c.sel, ctes); err != nil {
 		return nil, nil, err
@@ -1055,8 +1058,11 @@ func clauses(sel node) []any {
 func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd *reads) error {
 	switch t := str(ref["type"]); t {
 	case "BASE_TABLE":
-		if child(ref, "sample") != nil {
-			return unsupported("TABLESAMPLE")
+		if err := sampleOK(child(ref, "sample")); err != nil {
+			return err
+		}
+		if child(ref, "sample") != nil && len(tableParts(ref)) == 1 && ctes.find(tableParts(ref)[0]) != nil {
+			return unsupported("TABLESAMPLE of a common table expression")
 		}
 		version, pinned := pinnedVersion(ref)
 		if child(ref, "at_clause") != nil && !pinned {
@@ -1085,7 +1091,7 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 			}
 		}
 		tbl, err := pl.table(parts)
-		if IsUnsupported(err) {
+		if IsUnsupported(err) && child(ref, "sample") == nil {
 			// A view reads as its query, in place of its name.
 			sub, ok, verr := pl.expandView(ref, parts)
 			if verr != nil {
@@ -1175,6 +1181,16 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 	case "SUBQUERY":
 		sub := subqueryNode(ref)
 		item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
+		if sample := child(ref, "sample"); sample != nil {
+			// Sampled where its rows are made, only from a divided table's
+			// (see checkSamples).
+			if err := sampleOK(sample); err != nil {
+				return err
+			}
+			if rowQuery(sub) || perTaskQuery(sub) || str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" || pl.forced[identity(ref)] {
+				return unsupported("TABLESAMPLE of a subquery workers would not divide")
+			}
+		}
 		if rowQuery(sub) {
 			// It reads no table: for each row of the items before it, which a
 			// lateral subquery may read, its rows depend on that row alone,
