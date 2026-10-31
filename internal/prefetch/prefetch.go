@@ -22,8 +22,11 @@
 // the order of the scan's files. It keeps at most a share of the cache's
 // room for blocks DuckDB has not read yet, so that prefetched blocks do not
 // evict each other, or other statements' blocks, before DuckDB reads them.
-// It tells a block DuckDB read by its access time, which a read moves past
-// its modification time. On a file system mounted noatime, which keeps
+// It writes a block with an access time an hour before its modification
+// time and tells one DuckDB read by its access time catching up: a read
+// moves it past the modification time, and cache_httpfs, which keeps its
+// blocks in least-recently-used order, sets both to the time of the read.
+// On a file system mounted noatime, which keeps
 // access times still, it tells one by the kernel's file events instead
 // (inotify, on Linux), as cache_httpfs opens a block's file to read it.
 // Where neither works, it cannot tell, and each statement reads ahead at
@@ -76,9 +79,6 @@ const (
 	// footerGuess is how much of a file's end the prefetcher reads for its
 	// footer at first.
 	footerGuess = 64 << 10
-	// filteredBudget is the most a filtered scan reads ahead, whose files
-	// the scan may mostly skip.
-	filteredBudget = 256 << 20
 	// versionAttr is the extended attribute cache_httpfs keeps a block's
 	// object version (its ETag) in.
 	versionAttr = "user.cache_version"
@@ -149,13 +149,18 @@ type File struct {
 // none means it reads no column, only the files' footers, as COUNT(*)
 // does. Whole says it reads every column, as of the files of a distributed
 // statement's exchange, which have no field IDs. Filtered says the
-// statement filters the table, so the scan may read fewer files than Files
-// lists; the prefetcher then reads ahead at most filteredBudget of it.
+// statement filters the table, by a WHERE clause or a join DuckDB filters
+// the scan by, on the columns Filters names (field IDs, top-level or leaf;
+// none when not known), so the scan may skip files and row groups: the
+// prefetcher reads ahead only the footer of a file whose row groups such
+// filters could skip (see skippable), and the rest of a file's blocks
+// otherwise.
 type Scan struct {
 	Files    []File
 	FieldIDs []int32
 	Whole    bool
 	Filtered bool
+	Filters  []int32
 }
 
 // Prefetcher reads ahead for statements' scans.
@@ -299,17 +304,24 @@ func probe(dir string) (bool, error) {
 	return ok && read, nil
 }
 
-// readSince reports whether the file was read since it was last written:
-// its access time is past its modification time. ok is false when the file
-// is gone.
+// readSince reports whether the file was read since the prefetcher wrote
+// it, an hour before its modification time (see writeBlock): its access
+// time is no longer far behind. A read under relatime or strictatime moves
+// the access time past the modification time; cache_httpfs, reading a
+// block, sets both to the time of the read, which leaves the access time
+// no later than the modification time. ok is false when the file is gone.
 func readSince(name string) (read, ok bool) {
 	fi, err := os.Stat(name)
 	if err != nil {
 		return false, false
 	}
 	a, known := accessTime(fi)
-	return known && a.After(fi.ModTime()), true
+	return known && fi.ModTime().Sub(a) < readLag, true
 }
+
+// readLag is how far a block's access time may stay behind its
+// modification time once read; writeBlock puts it an hour behind.
+const readLag = 30 * time.Minute
 
 // BlockName is the name cache_httpfs gives the file of the block at offset
 // of length bytes of the file at path.
@@ -422,18 +434,24 @@ func (s *statement) budget() int64 {
 
 func (s *statement) run(scans []Scan) {
 	for _, sc := range scans {
-		var spent int64
 		ids := map[int32]bool{}
 		for _, id := range sc.FieldIDs {
 			ids[id] = true
 		}
+		var filter *scanFilter
+		if sc.Filtered {
+			filter = newScanFilter(sc.Filters)
+		}
+		// A filtered scan's file waits for the next file's footer, which
+		// tells whether the files themselves divide the filters' values.
+		var held *heldFile
 		for _, f := range sc.Files {
 			if s.ctx.Err() != nil {
 				return
 			}
 			of := &openFile{File: f}
 			s.files = append(s.files, of)
-			ranges, err := s.columnRanges(of, ids, sc.Whole)
+			meta, ranges, err := s.columnRanges(of, ids, sc.Whole)
 			if err != nil {
 				if s.ctx.Err() == nil {
 					s.p.failed.Inc()
@@ -441,20 +459,67 @@ func (s *statement) run(scans []Scan) {
 				}
 				continue
 			}
-			for _, b := range s.p.blocksOf(of, ranges) {
-				if sc.Filtered {
-					if spent+b.length > filteredBudget {
-						break
-					}
-					spent += b.length
-				}
-				if !s.waitForRoom(b.length) {
+			if filter == nil {
+				if !s.enqueueAll(s.p.blocksOf(of, ranges)) {
 					return
 				}
-				s.enqueue(b)
+				continue
 			}
+			next := &heldFile{file: of, ranges: ranges, cols: filter.add(meta)}
+			if held != nil && !s.release(held, filter) {
+				held = nil
+				break
+			}
+			held = next
+		}
+		if held != nil {
+			s.release(held, filter)
+		}
+		if filter != nil {
+			s.p.opts.Log.Debug("prefetch: read ahead a filtered scan", "files", len(sc.Files),
+				"whole", filter.whole, "footers_only", filter.footers, "files_divide_values", filter.divided)
 		}
 	}
+}
+
+// heldFile is a file of a filtered scan whose blocks wait for the next
+// file's footer: what it reads, and what its footer says of the columns
+// the filters name.
+type heldFile struct {
+	file   *openFile
+	ranges [][2]int64
+	cols   map[int32]*colRange
+}
+
+// release reads ahead the blocks of a filtered scan's file h, unless
+// DuckDB may skip row groups of it, whose footer is then all it reads
+// ahead. It reports false when the scan should read nothing further ahead:
+// the statement ended, or the files divide the filters' values, so DuckDB
+// may skip whole files, footers included.
+func (s *statement) release(h *heldFile, f *scanFilter) bool {
+	skip, files := f.skippable(h.cols)
+	if files {
+		f.divided = true
+		return false
+	}
+	if skip {
+		f.footers++
+		return true
+	}
+	f.whole++
+	return s.enqueueAll(s.p.blocksOf(h.file, h.ranges))
+}
+
+// enqueueAll queues blocks once there is room for them, reporting false
+// when the statement ends first.
+func (s *statement) enqueueAll(bs []block) bool {
+	for _, b := range bs {
+		if !s.waitForRoom(b.length) {
+			return false
+		}
+		s.enqueue(b)
+	}
+	return true
 }
 
 // waitForRoom waits until the statement may keep n more bytes ahead,
@@ -685,8 +750,8 @@ func writeBlock(dst, path, etag string, data []byte) error {
 			return err
 		}
 	}
-	// An access time before the modification time, which DuckDB's first
-	// read moves past it (see readSince).
+	// An access time an hour before the modification time, which DuckDB's
+	// first read moves on (see readSince).
 	now := time.Now()
 	_ = os.Chtimes(tmp, now.Add(-time.Hour), now)
 	if err := os.Rename(tmp, dst); err != nil {
@@ -726,34 +791,34 @@ func (p *Prefetcher) blocksOf(f *openFile, ranges [][2]int64) []block {
 	return out
 }
 
-// columnRanges fetches f's footer, through the cache, and returns the byte
-// ranges of the column chunks of the columns ids names (all columns when
-// ids is empty), with the footer's own.
-func (s *statement) columnRanges(f *openFile, ids map[int32]bool, whole bool) ([][2]int64, error) {
+// columnRanges fetches f's footer, through the cache, and returns it and
+// the byte ranges of the column chunks of the columns ids names (all
+// columns when whole), with the footer's own.
+func (s *statement) columnRanges(f *openFile, ids map[int32]bool, whole bool) (*metadata.FileMetaData, [][2]int64, error) {
 	if f.Size < 12 {
-		return nil, fmt.Errorf("a data file of %d bytes", f.Size)
+		return nil, nil, fmt.Errorf("a data file of %d bytes", f.Size)
 	}
 	tail := min(f.Size, footerGuess)
 	data, err := s.readThroughCache(f, f.Size-tail, tail)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if string(data[len(data)-4:]) != "PAR1" {
-		return nil, errors.New("not a Parquet file")
+		return nil, nil, errors.New("not a Parquet file")
 	}
 	metaLen := int64(binary.LittleEndian.Uint32(data[len(data)-8:]))
 	footer := metaLen + 8
 	if footer > f.Size {
-		return nil, errors.New("a footer longer than its file")
+		return nil, nil, errors.New("a footer longer than its file")
 	}
 	if footer > tail {
 		if data, err = s.readThroughCache(f, f.Size-footer, footer); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	meta, err := metadata.NewFileMetaData(data[len(data)-int(footer):len(data)-8], nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	want := map[int]bool{}
 	for i := 0; i < meta.Schema.NumColumns(); i++ {
@@ -770,7 +835,7 @@ func (s *statement) columnRanges(f *openFile, ids map[int32]bool, whole bool) ([
 			}
 			cc, err := rg.ColumnChunk(c)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			start := cc.DataPageOffset()
 			if cc.HasDictionaryPage() && cc.DictionaryPageOffset() > 0 && cc.DictionaryPageOffset() < start {
@@ -779,7 +844,7 @@ func (s *statement) columnRanges(f *openFile, ids map[int32]bool, whole bool) ([
 			ranges = append(ranges, [2]int64{start, start + cc.TotalCompressedSize()})
 		}
 	}
-	return ranges, nil
+	return meta, ranges, nil
 }
 
 // projected reports whether a leaf column, or a column it is part of, is

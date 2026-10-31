@@ -148,6 +148,28 @@ func TestScanFieldIDs(t *testing.T) {
 	if !slices.Equal(sc.FieldIDs, []int{1, 4, 5, 6}) {
 		t.Errorf("field IDs %v, want [1 4 5 6]", sc.FieldIDs)
 	}
+	// The columns that filter a scan, by field ID, nested fields included:
+	// a WHERE clause's, and a join's to a relation.
+	for query, want := range map[string][]int{
+		"SELECT a FROM t":                         nil,
+		"SELECT a FROM t WHERE b > 1":             {2},
+		"SELECT a FROM t WHERE s.f = 1 AND c > 0": {3, 4, 5, 6},
+		"WITH aud AS (SELECT DISTINCT k FROM u) SELECT t.b FROM t JOIN aud ON aud.k = t.a": {1},
+	} {
+		w, err := walkScans(context.Background(), p, query, scanEnv{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range w.order {
+			if u := w.uses[key]; u.name == "t" {
+				var sc Scan
+				w.read(&sc, scanTables["t"], u)
+				if !slices.Equal(sc.Filters, want) {
+					t.Errorf("%s: filters %v, want %v", query, sc.Filters, want)
+				}
+			}
+		}
+	}
 }
 
 // scanSource serves scanTables, with files, failing to list u's.

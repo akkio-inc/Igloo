@@ -499,6 +499,19 @@ func TestCacheHTTPFSReadsBlocks(t *testing.T) {
 			}
 		}
 	}
+	// Where reads move access times, those tell the blocks DuckDB read
+	// too, though cache_httpfs sets a block's access and modification
+	// times both to the time it reads it.
+	if atime, _ := probe(dir); atime {
+		for _, b := range blockFiles(t, dir, path, etag) {
+			off, length, _ := strings.Cut(b, "+")
+			o, _ := strconv.ParseInt(off, 10, 64)
+			l, _ := strconv.ParseInt(length, 10, 64)
+			if read, ok := readSince(filepath.Join(dir, BlockName(path, o, l))); ok && !read {
+				t.Errorf("block %s does not show as read by its access time after DuckDB read the column", b)
+			}
+		}
+	}
 	// A column it did not read ahead is fetched as usual.
 	if err := db.QueryRow("SELECT count(DISTINCT title) FROM read_parquet('" + path + "')").Scan(&n); err != nil || n != 300000 {
 		t.Fatalf("count of titles: %d, %v", n, err)

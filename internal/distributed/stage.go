@@ -381,7 +381,7 @@ func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string]Scan 
 		in := env[strings.ToLower(u.name)]
 		var sc Scan
 		w.read(&sc, in.Table.Columns, u)
-		used[in.View] = Scan{FieldIDs: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered}
+		used[in.View] = Scan{FieldIDs: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered, Filters: append([]int{}, sc.Filters...)}
 	}
 	return used
 }
@@ -409,7 +409,8 @@ func prefetchOf(used map[string]Scan, view string, files []File) *viewPrefetch {
 	if !ok {
 		return nil
 	}
-	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered}
+	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered,
+		Filters: append([]int{}, sc.Filters...)}
 	for i, f := range files {
 		p.Sizes[i] = f.Size
 	}

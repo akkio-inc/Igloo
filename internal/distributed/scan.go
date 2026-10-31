@@ -31,9 +31,11 @@ type Scan struct {
 	Columns  []string
 	FieldIDs []int
 	// Filtered says a WHERE clause of the statement names one of the
-	// table's columns, so that DuckDB may skip files and row groups of
-	// Files.
+	// table's columns, or a join DuckDB filters the table's scan by does,
+	// so that DuckDB may skip files and row groups of Files; Filters are
+	// the field IDs of those columns, with their nested fields'.
 	Filtered bool
+	Filters  []int
 }
 
 // ScanEnv is the session a statement is scanned in.
@@ -546,6 +548,7 @@ func (w *scanWalk) read(sc *Scan, columns []Column, u *scanUse) {
 		}
 		if named(w.filters) {
 			sc.Filtered = true
+			sc.Filters = appendFieldIDs(append(sc.Filters, c.ID), c.Nested)
 		}
 		if !u.all && !named(w.names) {
 			continue

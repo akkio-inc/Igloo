@@ -560,24 +560,41 @@ how fast a cold scan reads follows the threads, which Igloo caps by memory
 the read cache, the blocks of the data files a statement's scans are about
 to read, with `IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all
 statements together, which take them in turn; DuckDB then reads the blocks
-from local disk. Against an object store with S3's latency, a cold scan on
-12 threads with prefetch ran 1.9 times as fast as on 32 threads without.
+from local disk. Against an object store answering in 20 ms at 90 MB/s a
+connection, as S3 does, a cold scan of three columns of a 4 GB table took
+2.4 s rather than 11.3 s on 16 cores, and 2.4 s rather than 6.6 s on three
+workers sharing them, fetching 1 to 3% more than DuckDB alone.
 
 - It reads each file's footer, then the blocks of the columns the statement
   reads (none for a scan that reads no column, as `COUNT(*)`'s), in the
   order the scan reads the files, and keeps at most a quarter
   of the cache's room for blocks DuckDB has not read yet, so they do not
   evict each other or other statements' blocks first.
-- It tells the blocks DuckDB read by their access times. On a filesystem
-  mounted `noatime`, which keeps access times still, it tells them by the
-  kernel's events of opens of their files (inotify, on Linux), and the log
-  says so at startup. Where neither works, it cannot tell, and says so with
-  a warning: each statement then reads ahead at most 256 MiB in all, and
+- A scan the statement filters, by a `WHERE` clause or by a semi join or
+  an inner join to a relation such as an audience (whose keys DuckDB skips
+  row groups by), reads ahead in full only the files whose footers show
+  that no filter on those columns could skip a row group: every row group
+  holds values from across the file's range of each filtered column, the
+  file's range is not narrow within those of the scan's other files, and
+  no filtered column has a Bloom filter. Of other files it reads ahead the
+  footer alone, which DuckDB reads first, and once the files themselves
+  divide a filtered column's values, nothing further. In the lab above, a
+  scan of the last tenth of a date-ordered table fetched 1% more with
+  prefetch rather than 58% more, and a join of the table to an audience of
+  random devices took 2.6 s rather than 8.8.
+- It tells the blocks DuckDB read by their access times: it writes a block
+  an hour behind its modification time, and a read moves it on (cache_httpfs
+  sets both to the time it reads a block). On a filesystem mounted
+  `noatime`, which keeps access times still, it tells them by the kernel's
+  events of opens of their files (inotify, on Linux), and the log says so
+  at startup. Where neither works, it cannot tell, and says so with a
+  warning: each statement then reads ahead at most 256 MiB in all, and
   never more than its share of the cache's free room, so reading ahead
   evicts nothing; with a full cache it reads nothing ahead.
 - A block it has not fetched yet, or fails to, DuckDB fetches itself:
   prefetch only ever costs requests. Overfetch, blocks it read that the
-  scans did not, shows in `igloo_prefetch_unread_bytes_total`.
+  scans did not, shows in `igloo_prefetch_unread_bytes_total`, next to
+  `igloo_prefetch_bytes_total`.
 - It reads ahead for queries and for the queries of `CREATE TABLE ... AS`
   and `INSERT ... SELECT` that read catalog tables, other than tables that
   policies or a clean room protect, when the statement runs on the replica:
@@ -585,15 +602,13 @@ from local disk. Against an object store with S3's latency, a cold scan on
   each task's table files, as their own `IGLOO_PREFETCH` says, and the
   replica reads nothing ahead; exchanges' files, which the read cache
   leaves out, are not read ahead. The scans are those distributed
-  execution would plan; until filters prune their file lists, a scan of a
-  table the statement filters, or a task's of a table its part filters,
-  reads ahead at most 256 MiB, as does one of a table semi-joined, or
-  inner-joined to a relation such as an audience, whose keys DuckDB skips
-  row groups by. A session turns it off
-  for itself with `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
+  execution would plan. A session turns it off for itself with
+  `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
 - It needs the read cache, on a filesystem with extended attributes; it
   writes blocks as the cache's extension does. At startup the log says
-  `prefetch on`, or why it is off.
+  `prefetch on`, or why it is off. The Helm chart's igloo pods have no read
+  cache (their root filesystem is read-only), so only its workers, which
+  have a cache volume, read ahead there.
 
 ## Result cache
 

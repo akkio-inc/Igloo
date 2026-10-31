@@ -1021,15 +1021,30 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   they exchanged rows. The single-machine Compose stack passes
   `IGLOO_EXCHANGES` through. On Kubernetes the chart still sets `object`
   unless `workers.exchanges` is `local`.
-- A scan of a table semi-joined, or inner-joined to a relation (a common
-  table expression, a subquery, an exchange), such as an audience, reads
-  ahead at most 256 MiB, as a filtered one does: DuckDB skips its row
-  groups by the join's keys as it builds the join, so what it reads is not
-  known before it runs.
-- Workers read ahead of a filtered scan of a task's table at most 256 MiB,
-  as the replica does of its own: tasks did not say their part filters the
-  table, so workers read ahead every row group of the columns it reads,
-  however many of them DuckDB then skipped by their statistics.
+- A filtered scan reads ahead what DuckDB will read of it, on replicas
+  and workers (tasks tell workers which columns filter their part): a scan
+  filtered by a `WHERE` clause, or by a semi join or an inner join to a
+  relation such as an audience (whose keys DuckDB skips row groups by),
+  reads ahead in full the files whose footers show that no filter on those
+  columns could skip a row group (each row group holds values from across
+  the file's range of every filtered column, the file's range is not
+  narrow within the scan's, no Bloom filter), and only the footers of
+  others, rather than at most 256 MiB of every filtered scan. Against an
+  object store with S3's latency, reading ahead 256 MiB of a scan of the
+  last tenth of a date-ordered 4 GB table fetched 58% more than DuckDB
+  alone (145% more on three workers) for no gain; it now fetches 1% more.
+  A join of the table to an audience of random devices took 8.8 s cold
+  without prefetch, 8.4 s with 256 MiB read ahead, and takes 2.6 s; on
+  three workers, 6.5 s, 5.2 s and 2.6 s.
+- Prefetch tells the blocks DuckDB read where file systems keep access
+  times: cache_httpfs sets a block's access and modification times both to
+  the time it reads it, so the access time never passed the modification
+  time, and every block read ahead counted as unread: workers whose cache
+  was in a container's file system reported 99.9% of what they read ahead
+  as overfetch, and a statement was never credited the blocks DuckDB read,
+  so it read ahead a quarter of the cache's room at most. The prefetcher
+  now writes a block's access time an hour behind and counts it read once
+  the access time catches up.
 - `count(DISTINCT x) FILTER (WHERE ...)`, and `sum`, `avg`, `min` and
   `max` over `DISTINCT` values with a `FILTER`, run distributed: the
   planner writes them as `count(DISTINCT CASE WHEN ... THEN x END)`, which
