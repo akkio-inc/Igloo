@@ -1,0 +1,16 @@
+// The website on igloodb.com and www.igloodb.com, in the Cloudflare account that
+// holds the domain (name it with CLOUDFLARE_ACCOUNT_ID when deploying). Build with
+// SITE_URL=https://igloodb.com, so canonical URLs and link previews name the domain,
+// then `npx wrangler deploy --config wrangler.igloodb.jsonc` from this directory.
+// wrangler.jsonc stays the workers.dev deploy.
+{
+  "name": "igloo",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "igloodb.com", "custom_domain": true },
+    { "pattern": "www.igloodb.com", "custom_domain": true }
+  ],
+  "assets": { "directory": "./dist", "not_found_handling": "404-page" }
+}
