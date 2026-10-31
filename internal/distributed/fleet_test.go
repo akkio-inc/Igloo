@@ -403,6 +403,18 @@ func TestFleetOnWorkers(t *testing.T) {
 	if _, _, plan, ex, err := h.run(ctx, q, ModeOn); err != nil || plan.large || ex.Large || ex.Workers != 3 || tasks[3].Load() != 0 {
 		t.Errorf("forced: %v; large %v, %d workers, the large worker ran %d tasks", err, ex != nil && ex.Large, ex.Workers, tasks[3].Load())
 	}
+	// A statement the server runs itself keeps the fleet up, for the
+	// guard, and never the large worker, which nothing else runs on.
+	release := co.Keep()
+	co.pool.mu.Lock()
+	co.large.mu.Lock()
+	busy, largeBusy := co.pool.busy, co.large.busy
+	co.large.mu.Unlock()
+	co.pool.mu.Unlock()
+	release()
+	if busy != 1 || largeBusy != 0 {
+		t.Errorf("kept: the fleet %d, the large worker %d", busy, largeBusy)
+	}
 }
 
 // leastBusy takes the workers running the fewest tasks.

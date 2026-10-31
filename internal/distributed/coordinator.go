@@ -709,18 +709,10 @@ func retryPartitions(parts int, rows int64, workers int) int {
 
 // Keep keeps the workers from stopping as idle until release is called:
 // the server holds them while a statement that ran tasks runs, on the
-// coordinator too.
-func (co *Coordinator) Keep() (release func()) {
-	release = co.pool.keep()
-	if co.large == nil {
-		return release
-	}
-	large := co.large.keep()
-	return func() {
-		release()
-		large()
-	}
-}
+// coordinator too, and while one auto mode chose to run there runs, for
+// the guard, which runs it on them. The large worker is not kept so:
+// nothing runs on it but what Execute runs there, which holds it.
+func (co *Coordinator) Keep() (release func()) { return co.pool.keep() }
 
 // Setting is a session setting a statement runs with.
 type Setting = setting
