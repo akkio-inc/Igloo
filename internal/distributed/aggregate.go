@@ -49,8 +49,15 @@ type aggregation struct {
 	// mode says how the groups are completed (see the agg* constants).
 	mode string
 	// final says the coordinator reads whole groups, as __f columns,
-	// rather than partial aggregates.
+	// rather than partial aggregates: one row a group, which its combine
+	// step projects rather than groups again (see combine).
 	final bool
+	// regroup says the partial results of a stage that computes the
+	// aggregates over DISTINCT values (aggInPlace, aggByValue), a row a
+	// group and partition, go to an exchange keyed by the groups too, and
+	// a last stage completes the groups (groupStage), so that the
+	// coordinator reads one row a group.
+	regroup bool
 	// staged are the select items a second stage that completes the
 	// groups (aggByGroup) computes too, as __s columns: those that call
 	// a group function (see GroupFunctions).
@@ -1091,11 +1098,14 @@ func (a *aggregation) fragment() (node, error) {
 		f["group_expressions"] = groups
 		f["group_sets"] = []any{set}
 		// Whole groups: the rows a statement ranks and keeps the first of
-		// (see markTopK).
+		// (see markTopK), and under ORDER BY ... LIMIT each task's first.
 		if keep := child(a.c.sel, topKMark); keep != nil {
 			if q, err := a.substituteAliases(clone(keep).(node)); err == nil {
 				f["qualify"] = q
 			}
+		}
+		if mods, ok := a.wholeFirstRows(); ok {
+			f["modifiers"] = mods
 		}
 		return f, nil
 	}
@@ -1429,6 +1439,52 @@ func (a *aggregation) firstRows() ([]any, bool) {
 	return mods, true
 }
 
+// wholeFirstRows returns the ORDER BY and LIMIT that keep the first groups
+// of a stage that computes whole groups (aggComplete), in terms of the
+// candidate's own FROM clause, which the stage's fragment groups as the
+// candidate does.
+func (a *aggregation) wholeFirstRows() ([]any, bool) {
+	total, ok := a.topN()
+	if !ok || child(a.c.sel, topKMark) != nil {
+		return nil, false
+	}
+	var mods []any
+	for _, m := range list(a.c.sel, "modifiers") {
+		mod := clone(m).(node)
+		switch str(mod["type"]) {
+		case "ORDER_MODIFIER":
+			for _, o := range list(mod, "orders") {
+				ord := o.(node)
+				e := child(ord, "expression")
+				if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
+					e = bare(a.items[k-1])
+				} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+					if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
+						if has, _ := a.c.scope.hasColumn(strings.ToLower(columnNames(e)[0])); !has {
+							e = bare(a.items[i])
+						}
+					}
+				} else if str(e["class"]) == "STAR" {
+					return nil, false
+				}
+				r, err := a.substituteAliases(clone(e).(node))
+				if err != nil || hasClass(r, "SUBQUERY") || hasClass(r, "WINDOW") || hasClass(r, "PARAMETER") {
+					return nil, false
+				}
+				ord["expression"] = r
+			}
+		case "LIMIT_MODIFIER":
+			l, err := a.pl.p.expr(strconv.FormatInt(total, 10))
+			if err != nil {
+				return nil, false
+			}
+			mod["limit"], mod["offset"] = l, nil
+		}
+		mods = append(mods, mod)
+	}
+	return mods, true
+}
+
 // substituteAliasesInArgs substitutes aliases in a partial aggregate's
 // arguments and FILTER, which DuckDB also resolves against the select
 // list when no column has the name.
@@ -1477,7 +1533,7 @@ func (a *aggregation) combine() (node, error) {
 		var err error
 		if a.staged[i] {
 			// Computed by the second stage (see groupStage).
-			e, err = a.pl.p.expr("any_value(" + quoteIdent("__s"+strconv.Itoa(i)) + ")")
+			e, err = a.pl.p.expr(quoteIdent("__s" + strconv.Itoa(i)))
 		} else {
 			e, err = a.rewrite(bare(item), "select")
 		}
@@ -1492,7 +1548,7 @@ func (a *aggregation) combine() (node, error) {
 		items = append(items, cast)
 	}
 	out["select_list"] = items
-	if len(a.groups) > 0 {
+	if len(a.groups) > 0 && !a.final {
 		var groups []any
 		for i := range a.groups {
 			ref, err := a.pl.p.expr(quoteIdent("__g" + strconv.Itoa(i)))
@@ -1509,6 +1565,11 @@ func (a *aggregation) combine() (node, error) {
 			e, err := a.rewrite(clone(h).(node), part)
 			if err != nil {
 				return nil, err
+			}
+			if part == "having" && a.final {
+				// Whole groups, a row each: the combine step only projects
+				// them, and keeps those HAVING keeps.
+				part = "where_clause"
 			}
 			out[part] = e
 		}
@@ -1533,6 +1594,22 @@ func (a *aggregation) combine() (node, error) {
 		mods = append(mods, mod)
 	}
 	out["modifiers"] = mods
+	if a.final {
+		// Projected, not grouped: GROUPING() of the one grouping set,
+		// which groups by every group column, is 0.
+		zero, err := a.pl.p.expr("CAST(0 AS BIGINT)")
+		if err != nil {
+			return nil, err
+		}
+		out = rewrite(out, func(n node) (node, bool) {
+			if str(n["class"]) != "OPERATOR" || str(n["type"]) != "GROUPING_FUNCTION" {
+				return nil, false
+			}
+			z := clone(zero).(node)
+			z["alias"] = n["alias"]
+			return z, true
+		}).(node)
+	}
 	return out, nil
 }
 
@@ -1630,8 +1707,8 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 	case a.final && ac.final < 0:
 		return nil, fmt.Errorf("aggregate %s was left on the workers", ac.name)
 	case a.final:
-		// One row per group: any of its values is the value.
-		text = "any_value(" + quoteIdent("__f"+strconv.Itoa(ac.final)) + ")"
+		// One row per group, which the combine step projects.
+		text = quoteIdent("__f" + strconv.Itoa(ac.final))
 	case ac.kind == combineCount:
 		text = "coalesce(sum(" + col(0) + "), 0)"
 	case ac.kind == combineAvg:

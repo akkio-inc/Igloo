@@ -91,6 +91,10 @@ func TestAggregationModes(t *testing.T) {
 		`SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250 ORDER BY 1`,
 		`SELECT l_orderkey % 7 AS k, count(*) AS n FROM lineitem GROUP BY k QUALIFY rank() OVER (ORDER BY n DESC) <= 3 ORDER BY k`,
 		`SELECT DISTINCT l_returnflag, count(*) > 0 AS any FROM lineitem GROUP BY 1 ORDER BY 1`,
+		// GROUPING() of one grouping set, which the coordinator projects
+		// whole groups of: 0.
+		`SELECT l_returnflag, l_linestatus, GROUPING(l_linestatus) AS g, GROUPING(l_returnflag, l_linestatus) AS gg, count(DISTINCT l_suppkey) AS s
+			FROM lineitem GROUP BY 1, 2 HAVING GROUPING(l_returnflag) = 0 ORDER BY 1, 2`,
 		`SELECT l_partkey, count(*) AS n, bool_or(l_quantity > 45), bit_xor(l_linenumber), any_value(l_returnflag) IS NOT NULL FROM lineitem GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 20`,
 		// Partial sums of BIGINT are HUGEINT, which Parquet would make DOUBLE.
 		`SELECT l_partkey % 5 AS k, sum(l_orderkey * 100000000000 + l_linenumber) AS big, count(DISTINCT l_suppkey) FROM lineitem GROUP BY 1 ORDER BY 1`,
