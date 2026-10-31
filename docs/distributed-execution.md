@@ -47,9 +47,14 @@ values the workers found) and runs the rest of the statement: `HAVING`,
 subqueries. A statement that ranks the groups with `ROW_NUMBER()`, `RANK()`
 or `DENSE_RANK()` and keeps the first few of each partition (`WHERE rank <=
 10`) has the workers send only the groups that may rank so. Queries without aggregation are divided the same way when they
-keep few rows: `SELECT DISTINCT`, and `ORDER BY ... LIMIT` of up to a
-million rows. A plain `SELECT ... WHERE` is not: every matching row would
-cross to the coordinator and wait on its disk before reaching the client.
+keep few rows: `SELECT DISTINCT`, `ORDER BY ... LIMIT` of up to a
+million rows, and a `SELECT ... WHERE` that filters the large table by a
+column equal to a constant, in a list, or equal to a subquery's value (`WHERE
+account_id = 42`), as the statement or as a subquery or common table
+expression whose rows the coordinator reads to run the rest (a window over
+all of them, say). A plain `SELECT ... WHERE` that may keep many of the
+large table's rows is not: every matching row would cross to the
+coordinator and wait on its disk before reaching the client.
 
 When the large table is joined to a second table too large for every
 worker to read (impressions to an identity graph, exposures to
@@ -189,8 +194,30 @@ In detail, a part runs distributed when:
   (`count(DISTINCT user_id)` with `count(DISTINCT (user_id, day))`).
   `count`, `sum`, `avg`, `min` and `max` over `DISTINCT` values may have a
   `FILTER`, which drops values as `CASE WHEN` would.
+  HyperLogLog sketches combine too: `datasketch_hll(k, x)` and
+  `datasketch_hll_union(k, sketch)` of a constant `k`, which is what
+  Snowflake's `HLL_ACCUMULATE` and `HLL_COMBINE` become, and
+  `APPROX_COUNT_DISTINCT` and `HLL` without `GROUP BY` (with it, they count
+  `DISTINCT` values exactly, as above). Each worker sketches its share's values and the
+  final stage merges the sketches, so the estimate is one machine's, within
+  the sketch's error, and no values cross.
   `GROUP BY` may use positions, aliases, `ALL`, `ROLLUP`, `CUBE` and
-  `GROUPING SETS`.
+  `GROUPING SETS`. A scalar subquery that stands on its own, in the select
+  list, `HAVING` or `ORDER BY` of an aggregation (`count(*) / (SELECT
+  count(*) FROM orders)`), the coordinator computes once over the combined
+  groups, if what it reads is smaller than the large tables workers are
+  considered for (see [when](#when)).
+- Its large table may be sampled: `TABLESAMPLE bernoulli(p%)` (Snowflake's
+  `SAMPLE ROW (p)`) keeps each row with that probability where a task
+  reads it, and `TABLESAMPLE system(p%)` (`SAMPLE BLOCK (p)`) each vector of
+  rows, so the shares' samples together are a sample of the table, at the
+  same rate as on one machine, though not of the same rows. With
+  `REPEATABLE (s)` (`SEED (s)`), every task samples with that seed, and the
+  statement picks the same rows again over the same snapshot on the same
+  workers. So may a table read by bucket, and a subquery in `FROM` that
+  passes the large table's rows through. A sample of a number of rows
+  (`reservoir`, `SAMPLE (100 ROWS)`), which shares do not add up to, or of a
+  table every worker reads whole, keeps the part on one machine.
 - The large table appears once in it, and the other tables it reads
   together fit comfortably in a worker's memory (an eighth of it, in
   compressed size); or the tables too large for that, and the relations it
@@ -233,6 +260,7 @@ aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
 subquery expression (`EXISTS`, a scalar subquery: TPC-H Q17, Q20, Q21),
+subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
 equality deletes of fields nested in structs, with

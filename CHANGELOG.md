@@ -562,6 +562,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   all the same (see [bucketed
   tables](docs/distributed-execution.md#bucketed-tables)). Maintenance
   compacts each bucket's files into files of that bucket.
+- More statements run on workers: `TABLESAMPLE` of a percentage of the
+  large table (Snowflake's `SAMPLE ROW` and `SAMPLE BLOCK`), sampled where
+  each task reads it, the same rows again with a seed; HyperLogLog
+  sketches (`APPROX_COUNT_DISTINCT`, `HLL_ACCUMULATE`, `HLL_COMBINE`),
+  sketched by each task and merged in the final stage; a plain `SELECT ...
+  WHERE` that filters the large table by a column equal to a constant or a
+  list, also as a subquery the coordinator reads; and scalar subqueries
+  in an aggregation's select list, `HAVING` and `ORDER BY`, which the
+  coordinator computes over the combined groups. Masking and row access
+  policies keep a statement on one machine only when they apply to a
+  table it reads, not when it, or a view it reads, spells a protected
+  table's name, as a column named like an ID domain did.
 - Auto mode picks how many workers a statement runs on: of 1, 2, 4 and so
   on up to `IGLOO_WORKER_MAX`, and the workers running, those estimated
   within a fifth of the fastest, the cheapest at the workers' price
