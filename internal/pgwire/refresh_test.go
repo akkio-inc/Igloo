@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -447,9 +448,14 @@ func TestRefreshSavings(t *testing.T) {
 	env := startRefreshServer(t)
 	admin := env.admin
 	mustExec(t, admin, "CREATE TABLE facts (day DATE, client INTEGER, campaign INTEGER, person INTEGER, spend DECIMAL(12,2), clicks BIGINT)")
+	// IGLOO_TEST_REFRESH_DAY_ROWS measures at another scale.
+	perDay := 200_000
+	if n, err := strconv.Atoi(os.Getenv("IGLOO_TEST_REFRESH_DAY_ROWS")); err == nil && n > 0 {
+		perDay = n
+	}
 	load := func(day int) {
 		mustExec(t, admin, fmt.Sprintf(`INSERT INTO facts SELECT DATE '2026-09-01' + %d, i %% 50, i %% 1000, (i * 7919) %% 200000,
-			(i %% 9973) / 100.0, i %% 17 FROM range(%d, %d) AS r(i)`, day, day*200_000, (day+1)*200_000))
+			(i %% 9973) / 100.0, i %% 17 FROM range(%d, %d) AS r(i)`, day, day*perDay, (day+1)*perDay))
 	}
 	for day := range 30 {
 		load(day)
@@ -482,7 +488,7 @@ func TestRefreshSavings(t *testing.T) {
 	fullBytes, fullTook, fullDetail := measure("ALTER DYNAMIC TABLE full_daily REFRESH", "public.full_daily")
 	t.Logf("incremental: %d bytes of files read, %v: %s", incBytes, incTook, incDetail)
 	t.Logf("full: %d bytes of files read, %v: %s", fullBytes, fullTook, fullDetail)
-	if !strings.HasPrefix(incDetail, "incremental: read 200000 rows added") || !strings.HasPrefix(fullDetail, "full:") {
+	if !strings.HasPrefix(incDetail, fmt.Sprintf("incremental: read %d rows added", perDay)) || !strings.HasPrefix(fullDetail, "full:") {
 		t.Errorf("refreshes: %q, %q", incDetail, fullDetail)
 	}
 	if incBytes*5 > fullBytes {
