@@ -1473,7 +1473,7 @@ func (sess *session) observe(st *statement, err error) {
 	if st != nil {
 		// A block keeps the tables of a statement that ran in it by a way
 		// other than runStatement; outside one, they are forgotten.
-		sess.noteTx(st.loads)
+		sess.noteTx(st)
 	}
 	switch {
 	case err != nil && sess.inTx:
@@ -2504,7 +2504,7 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 			st.loads = l
 			st.ai = sess.aiBound.Load()
 			// DuckDB has read the tables' snapshots for the block.
-			sess.noteTx(l)
+			sess.noteTx(st)
 		}
 	}()
 	defer sess.cacheReports()()

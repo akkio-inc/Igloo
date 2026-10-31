@@ -127,11 +127,13 @@ func (r *compactRace) autocommit(t *testing.T, name string, opts maintenance.Opt
 // COMMIT, which Igloo cannot run again, and the COMMIT failed with
 // CatalogCommitConflicts. The order is forced, not timed: a block is open
 // when compaction starts; or a block opens and reads the table while
-// compaction writes the table's files, just before it commits them; or an
-// autocommit MERGE is committing. Each time compaction gives way, the
-// user's commit succeeds the first time, the MERGE applied once, and the
-// next pass compacts. Without Igloo's hooks, the same orders make the
-// block's COMMIT fail, and the autocommit MERGE run twice to commit once.
+// compaction writes the table's files, just before it commits them; or a
+// block lists the table's columns, as dbt does before each MERGE, and
+// compaction runs before its MERGE; or an autocommit MERGE is committing.
+// Each time compaction gives way, the user's commit succeeds the first
+// time, the MERGE applied once, and the next pass compacts. Without Igloo's
+// hooks, the same orders make the block's COMMIT fail, and the autocommit
+// MERGE run twice to commit once.
 func TestCompactionGivesWayToUserWrites(t *testing.T) {
 	env := startRefreshServer(t)
 	r := &compactRace{refreshEnv: env, hooked: maintenance.Options{Busy: env.srv.InTransaction, Hold: env.srv.HoldTable}}
@@ -175,6 +177,38 @@ func TestCompactionGivesWayToUserWrites(t *testing.T) {
 			t.Fatalf("COMMIT: %v, conflicts %d, compacted %v: the test no longer forces the race", err, conflicts, r.compacted(t, "unheld_block"))
 		}
 		r.rows(t, "unheld_block", unmergedRows)
+	})
+
+	// dbt lists the table's columns before each MERGE, in the block: the
+	// listing loads the table into the block's transaction as it runs, and
+	// the MERGE, prepared after compaction, loads nothing.
+	listed := func(t *testing.T, name string, opts maintenance.Options) (error, int) {
+		r.fill(t, name)
+		block := r.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+		mustExec(t, block, "BEGIN")
+		texts(t, block, "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '"+name+"'")
+		before := r.fake.Conflicts()
+		r.maintainer(opts).RunOnce(ctx)
+		mustExec(t, block, compactMerge(name))
+		_, err := block.Exec(ctx, "COMMIT")
+		return err, r.fake.Conflicts() - before
+	}
+
+	t.Run("a block that listed the table's columns", func(t *testing.T) {
+		err, conflicts := listed(t, "listed_block", r.hooked)
+		if err != nil || conflicts != 0 || r.compacted(t, "listed_block") {
+			t.Fatalf("COMMIT: %v, conflicts %d, compacted %v", err, conflicts, r.compacted(t, "listed_block"))
+		}
+		r.rows(t, "listed_block", mergedRows)
+	})
+
+	t.Run("the listing without the hooks", func(t *testing.T) {
+		err, conflicts := listed(t, "unhooked_listing", maintenance.Options{})
+		if err == nil || conflicts != 1 || !r.compacted(t, "unhooked_listing") {
+			t.Fatalf("COMMIT: %v, conflicts %d, compacted %v: the listing no longer loads the table into the block",
+				err, conflicts, r.compacted(t, "unhooked_listing"))
+		}
+		r.rows(t, "unhooked_listing", unmergedRows)
 	})
 
 	t.Run("an autocommit MERGE committing", func(t *testing.T) {

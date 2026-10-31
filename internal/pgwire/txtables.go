@@ -30,6 +30,9 @@ const holdWait = 2 * time.Second
 type txTables struct {
 	mu     sync.Mutex
 	tables map[string]bool
+	// all says the block listed the catalog (see noteListing), and so may
+	// use any table.
+	all bool
 	// running says a statement of the session runs, and last is when one
 	// last started or ended.
 	running bool
@@ -52,6 +55,17 @@ func (t *txTables) note(loads []catalogproxy.Load) {
 	t.last = time.Now()
 }
 
+// noteListing says the block listed the catalog: a listing, such as the
+// information_schema.columns query dbt runs before each MERGE, takes the
+// tables it lists into the block's transaction as DuckDB last loaded them,
+// with no request to the catalog that says which, and the MERGE then loads
+// nothing. So the block uses every table until it ends.
+func (t *txTables) noteListing() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.all, t.last = true, time.Now()
+}
+
 // start notes the tables of a statement about to run, before DuckDB binds it
 // to run it, which loads them, and finish that it ended: the tables are kept
 // if the transaction goes on (a block), forgotten if it ended with it.
@@ -67,7 +81,7 @@ func (t *txTables) finish(goesOn bool) {
 	defer t.mu.Unlock()
 	t.running, t.last = false, time.Now()
 	if !goesOn {
-		t.tables = nil
+		t.tables, t.all = nil, false
 	}
 }
 
@@ -75,7 +89,7 @@ func (t *txTables) finish(goesOn bool) {
 func (t *txTables) clear() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.tables = nil
+	t.tables, t.all = nil, false
 }
 
 // holds reports whether the transaction uses table, and is running a
@@ -83,27 +97,35 @@ func (t *txTables) clear() {
 func (t *txTables) holds(table string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.tables[table] && (t.running || time.Since(t.last) < txIdleLimit)
+	return (t.all || t.tables[table]) && (t.running || time.Since(t.last) < txIdleLimit)
 }
 
-// noteTx records the tables loads loaded while sess is in a transaction
-// block, and forgets them once it is not.
-func (sess *session) noteTx(loads []catalogproxy.Load) {
-	if sess.inTx {
-		sess.txTables.note(loads)
-	} else {
+// noteTx records the tables st loaded as it was prepared, while sess is in
+// a transaction block, and forgets them once it is not.
+func (sess *session) noteTx(st *statement) {
+	if !sess.inTx {
 		sess.txTables.clear()
+		return
+	}
+	sess.txTables.note(st.loads)
+	if st.listsCatalog {
+		sess.txTables.noteListing()
 	}
 }
 
 // useTables notes st's tables as it starts to run, if its transaction may
 // commit a change of them: a write, or any statement of a block, which may
-// write later on top of what it read. The returned func says it ended.
+// write later on top of what it read. A listing runs holding the catalog
+// lock to itself (see catalogRunLock), so maintenance cannot commit between
+// what it notes and what it lists. The returned func says it ended.
 func (sess *session) useTables(st *statement) func() {
 	if !sess.inTx && st.onlyReads() {
 		return func() {}
 	}
 	sess.txTables.start(st.loads)
+	if sess.inTx && st.listsCatalog {
+		sess.txTables.noteListing()
+	}
 	return func() { sess.txTables.finish(sess.inTx) }
 }
 
