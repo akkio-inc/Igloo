@@ -225,8 +225,8 @@ func (s *Scheduler) fire(ctx context.Context, r Runner, j Job, now time.Time) {
 	}
 }
 
-// RunNow runs j at once, as EXECUTE TASK and REFRESH MATERIALIZED VIEW
-// do, and records the run. ErrRunning means it is running already.
+// RunNow runs j at once, as EXECUTE TASK, REFRESH MATERIALIZED VIEW and
+// ALTER DYNAMIC TABLE ... REFRESH do, and records the run. ErrRunning means it is running already.
 func (s *Scheduler) RunNow(ctx context.Context, r Runner, j Job) (Run, error) {
 	return s.execute(ctx, r, j, TriggerManual, time.Time{})
 }
@@ -275,7 +275,9 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		cancel(fmt.Errorf("%w: %w", errLockLost, err))
 	} else {
 		stop := s.watch(runCtx, lease, cancel)
-		run.Rows, err = r.RunJob(context.WithValue(runCtx, runKey{}, run), j)
+		var detail string
+		run.Rows, err = r.RunJob(context.WithValue(context.WithValue(runCtx, runKey{}, run), detailKey{}, &detail), j)
+		run.Detail = detail
 		stop()
 	}
 	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) && err != nil && !errors.Is(err, ErrIdle) {

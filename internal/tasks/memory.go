@@ -104,6 +104,10 @@ func (m *MemoryStore) SetSchedule(_ context.Context, kind, name, schedule, timez
 	return m.update(kind, name, func(j *Job) { j.Schedule, j.Timezone, j.NextRun = schedule, timezone, next })
 }
 
+func (m *MemoryStore) SetRefresh(_ context.Context, kind, name, refresh string) error {
+	return m.update(kind, name, func(j *Job) { j.Refresh = refresh })
+}
+
 func (m *MemoryStore) DropJob(_ context.Context, kind, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -304,6 +308,7 @@ func (m *MemoryStore) ForgetTable(_ context.Context, table string) error {
 	defer m.mu.Unlock()
 	m.loads = slices.DeleteFunc(m.loads, func(l Load) bool { return strings.EqualFold(l.Table, table) })
 	delete(m.jobs, mapKey(KindMaterializedView, mvName(table)))
+	delete(m.jobs, mapKey(KindDynamicTable, mvName(table)))
 	return nil
 }
 
@@ -315,10 +320,12 @@ func (m *MemoryStore) RenameTable(_ context.Context, from, to string) error {
 			m.loads[i].Table = to
 		}
 	}
-	if j, ok := m.jobs[mapKey(KindMaterializedView, mvName(from))]; ok {
-		delete(m.jobs, mapKey(KindMaterializedView, mvName(from)))
-		j.Name = mvName(to)
-		m.jobs[mapKey(KindMaterializedView, j.Name)] = j
+	for _, kind := range []string{KindMaterializedView, KindDynamicTable} {
+		if j, ok := m.jobs[mapKey(kind, mvName(from))]; ok {
+			delete(m.jobs, mapKey(kind, mvName(from)))
+			j.Name = mvName(to)
+			m.jobs[mapKey(kind, j.Name)] = j
+		}
 	}
 	return nil
 }

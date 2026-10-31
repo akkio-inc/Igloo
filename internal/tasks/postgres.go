@@ -87,6 +87,10 @@ var migrations = []string{
 		holder  text NOT NULL,
 		expires timestamptz NOT NULL
 	)`,
+	// What materialized views and dynamic tables keep between refreshes,
+	// and what each run did beyond its outcome.
+	`ALTER TABLE igloo_tasks.jobs ADD COLUMN IF NOT EXISTS refresh text`,
+	`ALTER TABLE igloo_tasks.runs ADD COLUMN IF NOT EXISTS detail text`,
 }
 
 // PostgresStore keeps jobs and history in the "igloo_tasks" schema of the
@@ -131,25 +135,26 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 }
 
 const jobColumns = `j.kind, j.name, j.owner, j.statement, coalesce(j.schedule, ''), coalesce(j.timezone, ''), j.state,
-	j.next_run, j.created_at`
+	j.next_run, j.created_at, coalesce(j.refresh, '')`
 
 func scanJob(row pgx.Row, withRun bool) (Job, error) {
 	var (
 		j    Job
 		next *time.Time
 	)
-	dest := []any{&j.Kind, &j.Name, &j.Owner, &j.Statement, &j.Schedule, &j.Timezone, &j.State, &next, &j.CreatedAt}
+	dest := []any{&j.Kind, &j.Name, &j.Owner, &j.Statement, &j.Schedule, &j.Timezone, &j.State, &next, &j.CreatedAt, &j.Refresh}
 	var (
 		runID               *string
 		r                   Run
 		scheduled, end      *time.Time
 		start               *time.Time
 		outcome, errText    *string
+		detail              *string
 		rows                *int64
 		user, trigger, kind *string
 	)
 	if withRun {
-		dest = append(dest, &runID, &kind, &user, &trigger, &scheduled, &start, &end, &outcome, &errText, &rows)
+		dest = append(dest, &runID, &kind, &user, &trigger, &scheduled, &start, &end, &outcome, &errText, &rows, &detail)
 	}
 	if err := row.Scan(dest...); err != nil {
 		return j, err
@@ -174,6 +179,9 @@ func scanJob(row pgx.Row, withRun bool) (Job, error) {
 		if rows != nil {
 			r.Rows = *rows
 		}
+		if detail != nil {
+			r.Detail = *detail
+		}
 		j.LastRun = &r
 	}
 	return j, nil
@@ -181,7 +189,7 @@ func scanJob(row pgx.Row, withRun bool) (Job, error) {
 
 // lastRunJoin adds each job's latest run.
 const lastRunJoin = ` LEFT JOIN LATERAL (
-		SELECT run_id, kind, user_name, trigger, scheduled_time, start_time, end_time, outcome, error, row_count
+		SELECT run_id, kind, user_name, trigger, scheduled_time, start_time, end_time, outcome, error, row_count, detail
 		FROM igloo_tasks.runs r WHERE r.kind = j.kind AND lower(r.name) = lower(j.name)
 		ORDER BY start_time DESC LIMIT 1) r ON true`
 
@@ -192,9 +200,9 @@ func (s *PostgresStore) CreateJob(ctx context.Context, j Job, replace bool) erro
 				return err
 			}
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO igloo_tasks.jobs (kind, name, owner, statement, schedule, timezone, state, next_run)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			j.Kind, j.Name, j.Owner, j.Statement, nullable(j.Schedule), nullable(j.Timezone), j.State, nullTime(j.NextRun))
+		_, err := tx.Exec(ctx, `INSERT INTO igloo_tasks.jobs (kind, name, owner, statement, schedule, timezone, state, next_run, refresh)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			j.Kind, j.Name, j.Owner, j.Statement, nullable(j.Schedule), nullable(j.Timezone), j.State, nullTime(j.NextRun), nullable(j.Refresh))
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return ErrExists
@@ -237,6 +245,10 @@ func (s *PostgresStore) SetState(ctx context.Context, kind, name, state string, 
 func (s *PostgresStore) SetSchedule(ctx context.Context, kind, name, schedule, timezone string, next time.Time) error {
 	return s.exec(ctx, `UPDATE igloo_tasks.jobs SET schedule = $3, timezone = $4, next_run = $5
 		WHERE kind = $1 AND lower(name) = lower($2)`, kind, name, nullable(schedule), nullable(timezone), nullTime(next))
+}
+
+func (s *PostgresStore) SetRefresh(ctx context.Context, kind, name, refresh string) error {
+	return s.exec(ctx, `UPDATE igloo_tasks.jobs SET refresh = $3 WHERE kind = $1 AND lower(name) = lower($2)`, kind, name, nullable(refresh))
 }
 
 func (s *PostgresStore) DropJob(ctx context.Context, kind, name string) error {
@@ -442,12 +454,12 @@ func (s *PostgresStore) WriteRun(ctx context.Context, r Run) error {
 		rows = r.Rows
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_tasks.runs
-			(run_id, kind, name, user_name, trigger, scheduled_time, start_time, end_time, outcome, error, row_count)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			(run_id, kind, name, user_name, trigger, scheduled_time, start_time, end_time, outcome, error, row_count, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (run_id) DO UPDATE SET end_time = excluded.end_time, outcome = excluded.outcome,
-			error = excluded.error, row_count = excluded.row_count`,
+			error = excluded.error, row_count = excluded.row_count, detail = excluded.detail`,
 		r.ID, r.Kind, r.Name, r.User, r.Trigger, nullTime(r.Scheduled), r.Start, nullTime(r.End), r.Outcome,
-		nullable(r.Error), rows)
+		nullable(r.Error), rows, nullable(r.Detail))
 	return err
 }
 
@@ -459,7 +471,7 @@ func (s *PostgresStore) AbandonRuns(ctx context.Context, kind, name string) erro
 
 func (s *PostgresStore) Runs(ctx context.Context, v audit.Viewer, p audit.Page) ([]Run, error) {
 	rows, err := s.pool.Query(ctx, `SELECT run_id, kind, name, user_name, trigger, scheduled_time, start_time,
-			end_time, outcome, coalesce(error, ''), coalesce(row_count, -1)
+			end_time, outcome, coalesce(error, ''), coalesce(row_count, -1), coalesce(detail, '')
 		FROM igloo_tasks.runs
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR start_time >= $2)
@@ -475,7 +487,7 @@ func (s *PostgresStore) Runs(ctx context.Context, v audit.Viewer, p audit.Page) 
 			r              Run
 			scheduled, end *time.Time
 		)
-		err := row.Scan(&r.ID, &r.Kind, &r.Name, &r.User, &r.Trigger, &scheduled, &r.Start, &end, &r.Outcome, &r.Error, &r.Rows)
+		err := row.Scan(&r.ID, &r.Kind, &r.Name, &r.User, &r.Trigger, &scheduled, &r.Start, &end, &r.Outcome, &r.Error, &r.Rows, &r.Detail)
 		if scheduled != nil {
 			r.Scheduled = *scheduled
 		}
@@ -587,8 +599,8 @@ func (s *PostgresStore) ForgetTable(ctx context.Context, table string) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_tasks.loads WHERE lower(table_name) = lower($1)`, table); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM igloo_tasks.jobs WHERE kind = $1 AND lower(name) = lower($2)`,
-			KindMaterializedView, mvName(table))
+		_, err := tx.Exec(ctx, `DELETE FROM igloo_tasks.jobs WHERE kind IN ($1, $2) AND lower(name) = lower($3)`,
+			KindMaterializedView, KindDynamicTable, mvName(table))
 		return err
 	})
 }
@@ -598,8 +610,8 @@ func (s *PostgresStore) RenameTable(ctx context.Context, from, to string) error 
 		if _, err := tx.Exec(ctx, `UPDATE igloo_tasks.loads SET table_name = $2 WHERE lower(table_name) = lower($1)`, from, to); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `UPDATE igloo_tasks.jobs SET name = $3 WHERE kind = $1 AND lower(name) = lower($2)`,
-			KindMaterializedView, mvName(from), mvName(to))
+		_, err := tx.Exec(ctx, `UPDATE igloo_tasks.jobs SET name = $4 WHERE kind IN ($1, $2) AND lower(name) = lower($3)`,
+			KindMaterializedView, KindDynamicTable, mvName(from), mvName(to))
 		return err
 	})
 }
