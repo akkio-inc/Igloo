@@ -177,8 +177,12 @@ var errWorkerMemory = pgerror.WithCode(errors.New("canceling statement: a worker
 // it began to run on workers after running out of memory here.
 type distParts struct {
 	workers, stages, exchanges int
-	key                        string
-	since                      time.Time
+	// large says the large worker ran them; placement is where auto mode,
+	// or the session's mode, ran the statement and why, for the history.
+	large     bool
+	placement string
+	key       string
+	since     time.Time
 	// release lets the workers count as idle again: the statement holds
 	// them while it runs on this replica after their tasks failed, or
 	// where auto mode chose it, for the guard (see guardLocal).
@@ -219,6 +223,10 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			return parts, true, ctx.Err()
 		}
 		parts.key = distributed.PlanKey(err)
+		if parts.key != "" {
+			// Auto mode chose this replica.
+			parts.placement = "this replica: " + strings.TrimPrefix(err.Error(), "cannot distribute: ")
+		}
 		if est, ok := distributed.LocalEstimate(err); ok {
 			// Workers stay up while it runs here, as an idle replica would
 			// stop them, so that the guard can run it on them.
@@ -288,7 +296,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	}
 	defer release()
 	defer ex.Close()
-	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
+	parts = distParts{workers: ex.Workers, large: ex.Large, placement: plan.Placement(), stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
 	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
 		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
 			// Combining the workers' bitmaps did not fit either: the
@@ -427,6 +435,7 @@ func (s *Server) afterGuard(ctx context.Context, sess *session, st *statement, a
 		return s.runLocal(ctx, sess, st, args, w)
 	}
 	p.since = since
+	p.placement = fmt.Sprintf("moved by the guard after %.0f s on this replica, estimated at %.0f s; %s", ran.Seconds(), parts.local.Seconds(), p.placement)
 	*parts = p
 	return err
 }
@@ -475,6 +484,7 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 		return errStatementTimeout
 	}
 	p.since = since
+	p.placement = "moved after it ran out of memory on this replica; " + p.placement
 	*parts = p
 	return err
 }

@@ -185,6 +185,19 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	if err != nil {
 		return nil, err
 	}
+	// The large worker, started and stopped as the others, by its own
+	// Deployment, commands or instances.
+	l := cfg.Workers.Large
+	var large distributed.PoolOptions
+	if l.Address != "" {
+		lc, err := workerCompute(ctx, config.Workers{Compute: l.Compute, K8sNamespace: cfg.Workers.K8sNamespace, K8sDeployment: l.K8sDeployment,
+			Max: 1, StartCommand: l.StartCommand, StopCommand: l.StopCommand, EC2InstanceIDs: l.EC2InstanceIDs})
+		if err != nil {
+			return nil, fmt.Errorf("large worker: %w", err)
+		}
+		large = distributed.PoolOptions{Addresses: []string{l.Address}, Compute: lc, MaxWorkers: 1,
+			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout}
+	}
 	// The file system keeps its context for every request, long after
 	// startup.
 	files, err := catalog.FS(context.WithoutCancel(ctx), cfg.Storage, cfg.Storage.Location)
@@ -204,11 +217,13 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout,
 		},
+		WorkerPrice: cfg.Workers.Price, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
 	}, log)
 	if err != nil {
 		return nil, fmt.Errorf("distributed execution: %w", err)
 	}
-	log.Info("distributed execution is on", "workers", cfg.Workers.Addresses, "compute", cfg.Workers.Compute, "max_workers", cfg.Workers.Max)
+	log.Info("distributed execution is on", "workers", cfg.Workers.Addresses, "compute", cfg.Workers.Compute, "max_workers", cfg.Workers.Max,
+		"large_worker", l.Address)
 	return co, nil
 }
 
@@ -257,7 +272,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			switch {
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
-				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Duration: q.Duration, Memory: q.Memory})
+				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
+					Memory: q.Memory})
 			case q.Workers == 0 && q.SQLState == "53200":
 				// It ran out of memory on one machine.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true, Memory: q.Memory})

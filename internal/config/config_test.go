@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -567,6 +568,46 @@ func TestWorkerSpotNotice(t *testing.T) {
 	}
 	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_SPOT_NOTICE": "sometimes"})); err == nil {
 		t.Error("IGLOO_WORKER_SPOT_NOTICE=sometimes should be refused")
+	}
+}
+
+// A pool's large worker: its address, how to start it, its size and its
+// price, and the workers' price.
+func TestLargeWorker(t *testing.T) {
+	base := map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKERS": "workers", "IGLOO_WORKER_SECRET": strings.Repeat("s", 32),
+		"IGLOO_DUCKDB_TEMP_DIR": t.TempDir()}
+	with := func(kv map[string]string) map[string]string {
+		m := maps.Clone(base)
+		maps.Copy(m, kv)
+		return m
+	}
+	cfg, err := Load(env(with(map[string]string{
+		"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "kubernetes", "IGLOO_LARGE_WORKER_K8S_DEPLOYMENT": "igloo-workers-large",
+		"IGLOO_LARGE_WORKER_CORES": "60", "IGLOO_LARGE_WORKER_MEMORY": "367001MiB", "IGLOO_LARGE_WORKER_PRICE_PER_HOUR": "4.35",
+		"IGLOO_WORKER_PRICE_PER_HOUR": "0.48",
+	})))
+	l := cfg.Workers.Large
+	if err != nil || l.Address != "large:7433" || l.Compute != "kubernetes" || l.K8sDeployment != "igloo-workers-large" || l.Cores != 60 ||
+		l.Memory != 367001<<20 || l.Price != 4.35 || cfg.Workers.Price != 0.48 {
+		t.Errorf("large worker: %+v, workers' price %v, %v", l, cfg.Workers.Price, err)
+	}
+	if cfg, err := Load(env(base)); err != nil || cfg.Workers.Large.Address != "" || cfg.Workers.Price != 0 {
+		t.Errorf("none: %+v %v", cfg.Workers.Large, err)
+	}
+	for name, kv := range map[string]map[string]string{
+		"without workers":       {"IGLOO_WORKERS": "", "IGLOO_LARGE_WORKER": "large"},
+		"two addresses":         {"IGLOO_LARGE_WORKER": "a,b"},
+		"no deployment":         {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "kubernetes", "IGLOO_LARGE_WORKER_CORES": "60", "IGLOO_LARGE_WORKER_MEMORY": "400GiB"},
+		"started, size unknown": {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "command", "IGLOO_LARGE_WORKER_START_COMMAND": "a", "IGLOO_LARGE_WORKER_STOP_COMMAND": "b"},
+		"bad compute":           {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "magic"},
+		"bad memory":            {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_MEMORY": "lots"},
+		"bad cores":             {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_CORES": "0"},
+		"bad price":             {"IGLOO_WORKER_PRICE_PER_HOUR": "-1"},
+		"bad large price":       {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_PRICE_PER_HOUR": "cheap"},
+	} {
+		if _, err := Load(env(with(kv))); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }
 

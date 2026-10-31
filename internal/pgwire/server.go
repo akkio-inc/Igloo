@@ -2111,7 +2111,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		}
 		if err == nil && parts.key != "" {
 			// How long it took where it ran, for where it runs next time.
-			s.dist.Observe(parts.key, parts.workers, time.Since(cmp.Or(parts.since, start)))
+			s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,
