@@ -65,3 +65,16 @@ func TestWatchEC2Off(t *testing.T) {
 		t.Errorf("got %v, want ErrNotEC2", err)
 	}
 }
+
+// A machine that heard a notice finishes its work until the margin before
+// the time given, and at least the floor.
+func TestGrace(t *testing.T) {
+	n := Notice{Action: "terminate", Time: time.Now().Add(2 * time.Minute)}
+	if g := n.Grace(10*time.Second, 30*time.Second); g < 109*time.Second || g > 110*time.Second {
+		t.Errorf("two minutes ahead: grace %s", g)
+	}
+	n.Time = time.Now().Add(20 * time.Second)
+	if g := n.Grace(10*time.Second, 30*time.Second); g != 30*time.Second {
+		t.Errorf("twenty seconds ahead: grace %s, want the floor", g)
+	}
+}

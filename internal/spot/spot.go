@@ -29,6 +29,12 @@ type Notice struct {
 	Time   time.Time
 }
 
+// Grace is how long a machine that heard n may take to finish its work:
+// until margin before the time the cloud gave, and at least floor.
+func (n Notice) Grace(margin, floor time.Duration) time.Duration {
+	return max(time.Until(n.Time)-margin, floor)
+}
+
 // tokenTTL is how long the metadata tokens asked for last; one is asked for
 // again an hour before it expires.
 const tokenTTL = 6 * time.Hour

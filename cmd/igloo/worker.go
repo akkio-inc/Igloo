@@ -154,7 +154,7 @@ func serveWorker() error {
 		return err
 	case <-ctx.Done():
 	case n := <-notices:
-		grace, reclaimed = max(time.Until(n.Time)-spotMargin, shutdownTimeout), n.Time
+		grace, reclaimed = n.Grace(spotMargin, shutdownTimeout), n.Time
 		log.Warn("AWS is taking this instance back; finishing the tasks running and taking no more",
 			"action", n.Action, "at", n.Time, "grace", grace.Round(time.Second))
 	}
