@@ -349,6 +349,7 @@ func newPlanner(ctx context.Context, env Env, p *parser, aggs map[string]bool, o
 // errUnsupported error when no part of it can run distributed.
 func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
+	pl.dropOrders(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
 	if err != nil {

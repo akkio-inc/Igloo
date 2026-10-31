@@ -185,6 +185,15 @@ In detail, a part runs distributed when:
   functions but aggregates over all their rows (`min(day) OVER ()`) or
   windows that all partition their rows by the same columns (see
   [window functions](#window-functions)), or a `UNION ALL` of them.
+  An `ORDER BY` without `LIMIT` in such a subquery or common table
+  expression counts for nothing where what reads it sorts again,
+  aggregates, or takes distinct rows, as a report's last `SELECT` sorts
+  its rows and the client's query reads it, filters it and takes its first
+  rows by an order of its own: Igloo leaves it out. It stays, and keeps the
+  part on one machine, where the rows reach the client in its order, or a
+  `LIMIT` without `ORDER BY`, `DISTINCT ON`, or a call that sees rows in
+  the order they come (`list()` or `string_agg()` without an `ORDER BY` of
+  its own, `first()`, `row_number() OVER ()`).
 - Its aggregates are `count`, `sum`, `min`, `max`, `avg`, `count_if`,
   `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `any_value`,
   `fsum`, `product`, and `list` and `array_agg` (whose order, without
