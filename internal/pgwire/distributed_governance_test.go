@@ -192,7 +192,10 @@ func TestDistributedConnections(t *testing.T) {
 	}
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: source, Secret: testWorkerSecret, Version: "test", TempDir: spill, Cores: 1, Storage: distributed.NewStorage(icebergio.LocalFS{}),
-		Pool: distributed.PoolOptions{Addresses: addrs},
+		// Workers complete the groups of the table's columns through an
+		// exchange there.
+		Warehouse: dir + "/",
+		Pool:      distributed.PoolOptions{Addresses: addrs},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

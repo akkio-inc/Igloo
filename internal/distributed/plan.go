@@ -1846,8 +1846,9 @@ type jobBuild struct {
 	// columns rename the fragment's result columns positionally.
 	columns []string
 	// second, if set, completes an aggregation's groups partition by
-	// partition, before the combine step.
-	second *secondStage
+	// partition, before the combine step; third, if set, completes them
+	// from second's rows, partitioned by group (see aggregation.regroup).
+	second, third *secondStage
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -2012,12 +2013,15 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 		last.Inputs = append(last.Inputs, Input{View: v.name, Table: v.table, Split: v.name == j.splitView})
 	}
 	pl.stage(last)
-	if b.second != nil {
+	for _, next := range []*secondStage{b.second, b.third} {
+		if next == nil {
+			continue
+		}
 		// The partial results go to an exchange, which a second stage reads
 		// partition by partition (or, with no groups, whole).
-		last.Out = pl.exchange("aggregate", b.second.keys, make([]string, len(b.second.keys)))
-		last = pl.stage(&Stage{fragment: b.second.fragment, Columns: b.second.columns,
-			Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: !b.second.whole}}})
+		last.Out = pl.exchange("aggregate", next.keys, make([]string, len(next.keys)))
+		last = pl.stage(&Stage{fragment: next.fragment, Columns: next.columns, completes: true,
+			Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: !next.whole}}})
 	}
 	last.Out = out
 	return last, nil

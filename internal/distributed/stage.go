@@ -57,6 +57,10 @@ type Stage struct {
 
 	fragment    node
 	placeholder string
+	// completes says the stage completes an aggregation's groups from
+	// partial results it reads by partition, whose partitions hold them
+	// whole: one task may complete them all (see execution.groups).
+	completes bool
 }
 
 // Input is a relation a stage's fragment reads under a view name: a

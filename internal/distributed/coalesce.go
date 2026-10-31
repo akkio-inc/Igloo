@@ -548,10 +548,18 @@ func uploadBytes(warehouse string) int64 {
 	return 0
 }
 
+// smallCompletion is the most memory, as rowMemory reckons it, the partial
+// results of a stage that completes an aggregation's groups may take for
+// one task to complete them all: a statement grouped by a column of few
+// values, which partitions complete as they would many, waits for one
+// task rather than a round of them.
+const smallCompletion = 64 << 20
+
 // groups returns the partitions each task of stage s, which reads
 // exchanges by partition, reads.
 func (e *execution) groups(s *Stage) [][]int {
 	mem := make([]int64, e.parts)
+	var total int64
 	for _, in := range s.Inputs {
 		if in.Exchange == nil || !in.Partitioned {
 			continue
@@ -560,7 +568,15 @@ func (e *execution) groups(s *Stage) [][]int {
 		per := rowMemory(x.columns)
 		for p, rows := range x.partRows {
 			mem[p] += rows * per
+			total += rows * per
 		}
+	}
+	if s.completes && total <= smallCompletion && e.smaller == 0 {
+		all := make([]int, e.parts)
+		for p := range all {
+			all[p] = p
+		}
+		return [][]int{all}
 	}
 	return groupPartitions(mem, taskMemory(e.ws)>>e.smaller, totalSlots(e.ws))
 }

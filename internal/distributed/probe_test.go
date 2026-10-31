@@ -71,6 +71,9 @@ func TestProbedRelations(t *testing.T) {
 	}
 	t.Cleanup(func() { co.Close() })
 	h.co = co
+	// The coordinator completes the few groups of orders' priorities, as
+	// the stages' names below expect.
+	co.aggregation = aggGather
 	query := func(filter string) string {
 		return `WITH aud AS (SELECT DISTINCT l_orderkey AS k FROM lineitem WHERE ` + filter + `)
 			SELECT o.o_orderpriority, count(*), sum(o.o_totalprice) FROM orders AS o JOIN aud ON aud.k = o.o_orderkey GROUP BY 1 ORDER BY 1`

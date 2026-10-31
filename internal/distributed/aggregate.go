@@ -171,6 +171,15 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	switch a.mode {
 	case aggByValue:
 		b.second, err = a.valueStage()
+		if err == nil && a.regroup {
+			// The value stage's rows, a group's partial results a partition,
+			// completed by group.
+			b.third, err = a.groupStage()
+		}
+	case aggInPlace:
+		if a.regroup {
+			b.second, err = a.groupStage()
+		}
 	case aggByGroup:
 		b.second, err = a.groupStage()
 	}
@@ -663,6 +672,12 @@ func (a *aggregation) choose() error {
 			return ac.whole
 		}
 	}
+	// Workers complete the groups, so that the coordinator reads a row a
+	// group, when there may be too many for it to combine every worker's
+	// (or every partition's) partial results, or a select item calls a
+	// group function.
+	complete := single && len(a.groups) > 0 && collation == "" &&
+		(a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && (a.manyGroups() || a.groupWork()))
 	switch {
 	case a.c.relation:
 		// The coordinator's combine step runs on workers, over whole groups.
@@ -678,17 +693,17 @@ func (a *aggregation) choose() error {
 		a.mode = aggGather
 	case len(a.distincts) == 0:
 		a.mode = aggGather
-		if single && len(a.groups) > 0 && (a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && (a.manyGroups() || a.groupWork())) {
+		if complete {
 			a.mode = aggByGroup
 		}
 	case !single:
 		a.mode = aggGather
 	case additive && a.inPlace():
-		a.mode = aggInPlace
+		a.mode, a.regroup = aggInPlace, complete
 	case a.pl.opts.aggregation == aggGather:
 		a.mode = aggGather
 	case additive && anchor >= 0 && a.pl.opts.aggregation != aggByGroup:
-		a.mode = aggByValue
+		a.mode, a.regroup = aggByValue, complete
 	case len(a.groups) > 0:
 		a.mode = aggByGroup
 	default:
@@ -990,35 +1005,127 @@ func determined(e node, sc *scope) []itemColumn {
 	return nil
 }
 
-// manyGroups guesses whether the groups are too many to send every
-// worker's to the coordinator: the top of an aggregation by a column of a
-// table the workers divide, such as spend per device, top ten. Then each
-// partition's top groups are all the coordinator needs.
+// maxGatheredGroups is the most groups whose partial results, every
+// task's, the coordinator combines itself (see manyGroups).
+const maxGatheredGroups = 10_000
+
+// manyGroups guesses whether the groups may be too many to send every
+// worker's partial results to the coordinator, which would combine as many
+// rows as there are groups times tasks, or partitions, and hold every
+// group: at a hundred times the data, a report's groups ranked on the
+// coordinator filled its disk. Partitions that complete their groups send
+// it only the groups HAVING, a ranking or ORDER BY ... LIMIT keeps, a row
+// each. The groups are few when every group expression takes few values
+// (see groupValues), more than maxGatheredGroups together; a column of an
+// input the workers divide or partition counts as many, unless ANALYZE
+// counted its distinct values. Groups of the tables every worker reads in
+// full are few.
 func (a *aggregation) manyGroups() bool {
-	if _, ok := a.topN(); !ok {
-		return false
-	}
 	small := map[*fromItem]bool{}
+	tables := map[*fromItem]*Table{}
 	for _, u := range a.c.uses {
-		if u.scope == a.c.scope && u != a.c.split && !slices.ContainsFunc(a.c.keyed, func(k *keyed) bool { return k.use == u }) {
+		if u.scope != a.c.scope {
+			continue
+		}
+		tables[u.item] = u.table
+		if u != a.c.split && !slices.ContainsFunc(a.c.keyed, func(k *keyed) bool { return k.use == u }) {
 			small[u.item] = true
 		}
 	}
+	groups := 1.0
 	for _, g := range a.groups {
-		large := false
-		walk(g, func(n node) bool {
-			if str(n["class"]) == "COLUMN_REF" {
-				if it := resolveColumn(n, a.c.scope); it == nil || !small[it] {
-					large = true
-				}
-			}
-			return !large
-		})
-		if large {
+		n, ok := groupValues(g, a.c.scope, small, tables)
+		if !ok {
 			return true
 		}
+		groups *= n
 	}
-	return false
+	return groups > maxGatheredGroups
+}
+
+// fewValuesFunctions are the functions whose values are few, whatever
+// their arguments': the fields and truncations of dates and times, by
+// which reports group a quarter's rows into days or months.
+var fewValuesFunctions = map[string]bool{
+	"date_trunc": true, "datetrunc": true, "date_part": true, "datepart": true, "extract": true,
+	"year": true, "quarter": true, "month": true, "week": true, "weekofyear": true, "yearweek": true,
+	"day": true, "dayofmonth": true, "dayofweek": true, "dayofyear": true, "isodow": true, "isoyear": true,
+	"weekday": true, "hour": true, "monthname": true, "dayname": true, "last_day": true,
+}
+
+// datePartValues is how many values a date's field or truncation is taken
+// to take: the days of three years.
+const datePartValues = 1000
+
+// groupValues estimates how many values e, a group expression of FROM
+// clause sc, takes, or reports that it cannot tell: one for a constant or
+// a column of one of small, the tables every worker reads in full; a
+// column's distinct count, as ANALYZE keeps it in its table (tables); two
+// or three for a comparison or another test; datePartValues for a date or
+// time's field or truncation; the sum of a CASE's results; and for any
+// other expression the product of the values of the columns it reads.
+func groupValues(e node, sc *scope, small map[*fromItem]bool, tables map[*fromItem]*Table) (float64, bool) {
+	switch str(e["class"]) {
+	case "CONSTANT":
+		return 1, true
+	case "COLUMN_REF":
+		it := resolveColumn(e, sc)
+		if it == nil {
+			return 0, false
+		}
+		if small[it] {
+			return 1, true
+		}
+		if t := tables[it]; t != nil {
+			if n, ok := t.Distinct[strings.ToLower(lastName(e))]; ok {
+				return float64(n), true
+			}
+		}
+		return 0, false
+	case "COMPARISON", "CONJUNCTION", "BETWEEN":
+		return 3, true
+	case "OPERATOR":
+		switch str(e["type"]) {
+		case "OPERATOR_IS_NULL", "OPERATOR_IS_NOT_NULL", "OPERATOR_NOT", "COMPARE_IN", "COMPARE_NOT_IN":
+			return 3, true
+		}
+	case "CAST":
+		return groupValues(child(e, "child"), sc, small, tables)
+	case "CASE":
+		total := 0.0
+		branches := []node{child(e, "else_expr")}
+		for _, c := range list(e, "case_checks") {
+			branches = append(branches, child(c.(node), "then_expr"))
+		}
+		for _, b := range branches {
+			if b == nil {
+				total++
+				continue
+			}
+			n, ok := groupValues(b, sc, small, tables)
+			if !ok {
+				return 0, false
+			}
+			total += n
+		}
+		return total, true
+	case "FUNCTION":
+		if fewValuesFunctions[strings.ToLower(str(e["function_name"]))] {
+			return datePartValues, true
+		}
+	}
+	// Otherwise at most every combination of the columns it reads.
+	values, ok, any := 1.0, true, false
+	walk(e, func(n node) bool {
+		if str(n["class"]) == "COLUMN_REF" {
+			any = true
+			v, known := groupValues(n, sc, small, tables)
+			ok = ok && known
+			values *= v
+		}
+		return ok
+	})
+	return values, ok && any
 }
 
 // types works out the result type of each aggregate call, which its

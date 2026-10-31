@@ -528,6 +528,9 @@ type Execution struct {
 	// Probes say what the relations of uncertain size measured, and how
 	// the statement read them (see runProbing).
 	Probes []string
+	// Received is how many bytes of partial results the coordinator
+	// received, which its part of the statement reads.
+	Received int64
 
 	dir string
 	// exchanges describes what the statement's exchanges held, for tests'
@@ -812,10 +815,11 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 	ex.Workers = len(run.used)
 	ex.Stages, ex.Exchanges = len(plan.Stages), len(run.exchanges)
+	ex.Received = run.sp.used.Load()
 	ex.exchanges = run.describe()
 	co.pool.touch()
 	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers, "exchanges", ex.exchanges,
-		"local", strings.Join(plan.local, "; "),
+		"received_bytes", ex.Received, "local", strings.Join(plan.local, "; "),
 		"snapshots_seconds", loaded.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true

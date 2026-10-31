@@ -120,8 +120,10 @@ func TestAudienceReport(t *testing.T) {
 	if n, scans := relationExchanges(p, "people"); n != 2 || scans != 2 {
 		t.Errorf("%d relation exchanges and %d scans of people, want 2 and 2:\n%s", n, scans, p.describe())
 	}
-	if n := p.exchanges("aggregate"); n != 2 {
-		t.Errorf("%d stages wrote partial results to an exchange, want the 2 DISTINCTs':\n%s", n, p.describe())
+	// The sizes' and signals' groups, of the cohorts' and the tables'
+	// columns, which may be many, are completed by a last stage each.
+	if n := p.exchanges("aggregate"); n != 6 {
+		t.Errorf("%d stages wrote partial results to an exchange, want the 2 DISTINCTs' and 4 groups':\n%s", n, p.describe())
 	}
 	// The sizes and three kinds of signals, the distinct people of each
 	// counted in place, in partitions keyed by person.
@@ -165,9 +167,10 @@ func TestCohortExample(t *testing.T) {
 	}
 	p := h.planOf(q)
 	// The cohorts' DISTINCTs complete their groups by person; the genres'
-	// and sizes' distinct people are counted in place.
-	if n := coordinatorStages(p); n != 2 || p.exchanges("aggregate") != 2 {
-		t.Errorf("%d stages to the coordinator and %d aggregate exchanges, want 2 and 2:\n%s", n, p.exchanges("aggregate"), p.describe())
+	// and sizes' distinct people are counted in place, and their groups
+	// completed by group.
+	if n := coordinatorStages(p); n != 2 || p.exchanges("aggregate") != 4 {
+		t.Errorf("%d stages to the coordinator and %d aggregate exchanges, want 2 and 4:\n%s", n, p.exchanges("aggregate"), p.describe())
 	}
 }
 
@@ -232,13 +235,14 @@ func TestRelations(t *testing.T) {
 			AND l_partkey IN (SELECT p_partkey FROM part WHERE p_size < 10)`, 1, 0},
 		// A filter's subquery that reads the table the part divides: a
 		// relation of one row, which every task combines from the partial
-		// results itself.
+		// results itself. (Groups of lineitem's columns take a stage more,
+		// which completes them.)
 		{`SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem)`, 2, 2},
 		{`SELECT l_returnflag, count(*) FROM lineitem WHERE l_suppkey IN (SELECT max(l_suppkey) FROM lineitem WHERE l_shipmode = 'RAIL')
-			AND l_quantity > (SELECT avg(l_quantity) FROM lineitem WHERE l_shipmode = 'AIR') GROUP BY 1 ORDER BY 1`, 3, 3},
+			AND l_quantity > (SELECT avg(l_quantity) FROM lineitem WHERE l_shipmode = 'AIR') GROUP BY 1 ORDER BY 1`, 3, 4},
 		// A relation of one row every task reads; lineitem is split.
 		{`SELECT l_returnflag, count(*) FROM lineitem, (SELECT avg(l_quantity) AS a FROM lineitem) AS s
-			WHERE l_quantity > s.a GROUP BY 1 ORDER BY 1`, 2, 2},
+			WHERE l_quantity > s.a GROUP BY 1 ORDER BY 1`, 2, 3},
 		// TPC-H Q18 with its subquery as a common table expression: three
 		// inputs partitioned by order.
 		{`WITH big AS (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250)
@@ -284,14 +288,16 @@ func TestInlinedRelations(t *testing.T) {
 	for _, tc := range []struct {
 		query string
 		// stages and scans, if not 0, are how many stages the plan has and
-		// how many of them read lineitem's files.
+		// how many of them read lineitem's files. Groups of lineitem's
+		// columns take a stage besides the one that reads it, which
+		// completes them.
 		stages, scans int
 	}{
 		{`WITH air AS (SELECT l_returnflag AS f, l_quantity AS q FROM lineitem WHERE l_shipmode = 'AIR')
-			SELECT f, sum(q), count(*) FROM air GROUP BY 1 ORDER BY 1`, 1, 1},
+			SELECT f, sum(q), count(*) FROM air GROUP BY 1 ORDER BY 1`, 2, 1},
 		// Columns named by the expression, and by the reference.
-		{`WITH x(f) AS (SELECT l_returnflag, l_quantity AS q FROM lineitem) SELECT f, sum(q) FROM x GROUP BY 1 ORDER BY 1`, 1, 1},
-		{`WITH x(f, q) AS (SELECT l_returnflag, l_quantity FROM lineitem) SELECT y.a, sum(y.b) FROM x AS y(a, b) GROUP BY 1 ORDER BY 1`, 1, 1},
+		{`WITH x(f) AS (SELECT l_returnflag, l_quantity AS q FROM lineitem) SELECT f, sum(q) FROM x GROUP BY 1 ORDER BY 1`, 2, 1},
+		{`WITH x(f, q) AS (SELECT l_returnflag, l_quantity FROM lineitem) SELECT y.a, sum(y.b) FROM x AS y(a, b) GROUP BY 1 ORDER BY 1`, 2, 1},
 		// Distinct values of each task's rows, completed by value.
 		{`WITH big AS (SELECT l_orderkey, l_suppkey FROM lineitem WHERE l_quantity > 20)
 			SELECT l_orderkey % 7 AS k, count(DISTINCT l_suppkey) FROM big GROUP BY 1 ORDER BY 1`, 0, 1},
@@ -300,7 +306,7 @@ func TestInlinedRelations(t *testing.T) {
 			SELECT count(*), sum(a.q) FROM s a JOIN s b ON a.k = b.k`, 0, 1},
 		// One read as its query reads another, read once there.
 		{`WITH a AS (SELECT * FROM lineitem WHERE l_quantity > 5), b AS (SELECT l_returnflag AS f, l_quantity AS q FROM a WHERE l_shipmode <> 'AIR')
-			SELECT f, sum(q) FROM b GROUP BY 1 ORDER BY 1`, 1, 1},
+			SELECT f, sum(q) FROM b GROUP BY 1 ORDER BY 1`, 2, 1},
 	} {
 		t.Run(short(tc.query), func(t *testing.T) {
 			h.t = t
@@ -595,14 +601,17 @@ func TestFactoredUnion(t *testing.T) {
 				t.Fatal("did not run distributed")
 			}
 			p := h.planOf(q)
+			// The stage that joins the partitions aggregates their rows;
+			// it writes only its partial results, for the stage that
+			// completes the groups of lineitem's columns.
 			for _, s := range p.Stages {
-				if s.Out != nil && s.split() == nil {
+				if s.Out != nil && s.split() == nil && s.Out.purpose != "aggregate" {
 					t.Errorf("a stage writes rows it read by partition:\n%s", p.describe())
 					break
 				}
 			}
-			if len(p.Stages) != 3 {
-				t.Errorf("%d stages, want 3:\n%s", len(p.Stages), p.describe())
+			if len(p.Stages) != 4 {
+				t.Errorf("%d stages, want 4:\n%s", len(p.Stages), p.describe())
 			}
 		})
 	}

@@ -407,8 +407,10 @@ func TestDistributedStatements(t *testing.T) {
 			if got := read(); got != local {
 				t.Errorf("distributed result differs:\n%s\nlocal:\n%s", got, local)
 			}
-			if q := lastRun(t, ds.history, query); q.Workers != 2 || q.Stages != 1 || q.Exchanges != 0 || q.PlanKey == "" {
-				t.Errorf("history shows %d workers, %d stages, %d exchanges and plan key %q; want 2, 1, 0 and a key", q.Workers, q.Stages, q.Exchanges, q.PlanKey)
+			// The groups of amount, whose values ANALYZE did not count, a
+			// second stage completes, through an exchange.
+			if q := lastRun(t, ds.history, query); q.Workers != 2 || q.Stages != 2 || q.Exchanges != 1 || q.PlanKey == "" {
+				t.Errorf("history shows %d workers, %d stages, %d exchanges and plan key %q; want 2, 2, 1 and a key", q.Workers, q.Stages, q.Exchanges, q.PlanKey)
 			}
 
 			// Parameters are bound where the combined result is computed.

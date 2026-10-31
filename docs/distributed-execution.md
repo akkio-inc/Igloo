@@ -71,22 +71,33 @@ partition of the key's hash; then each worker joins and aggregates one
 partition of both, and the coordinator combines the results as before. The
 exchanged rows are deleted in the background once those steps have run.
 
-Aggregations whose partial results would be large complete their groups on
-workers the same way. For an aggregate over `DISTINCT` values, such as the
-reach `count(DISTINCT device_id)` above, each worker groups its rows by the
-values too and writes them to object storage, partitioned by group and
-value; then a worker per partition counts each group's values, which no
-other partition holds, and the coordinator adds up the partitions' counts,
-one row per group and partition, instead of receiving every value. `sum`,
-`min`, `max` and `avg` over `DISTINCT` values add up the same way; other
+Aggregations whose groups may be many complete them on workers the same
+way, so that the coordinator receives one row a group, final, which it only
+filters, orders and sends on: a `GROUP BY` of a column of the large table
+(spend per device), unless [`ANALYZE`](sql.md#distinct-counts) counted the
+group columns' values and their combinations come to 10,000 or fewer, as
+with a date's day or month, a flag, or a column of a table every worker
+reads in full. Each worker writes its share's partial results to object
+storage, partitioned by group, and a worker per partition completes its
+groups, keeping only those `HAVING` keeps, its first under `ORDER BY ...
+LIMIT`, and those a ranking may keep within its first k (`QUALIFY
+row_number() OVER (PARTITION BY ...) <= 10`, in the statement or in a
+`SELECT` that reads the groups); one worker completes them all when the
+partial results are small. For an aggregate over `DISTINCT` values, such as
+the reach `count(DISTINCT device_id)` above, each worker groups its rows by
+the values too and writes them partitioned by group and value; then a
+worker per partition counts each group's values, which no other partition
+holds, instead of the coordinator receiving every value, and a last round
+adds up each group's counts, partitioned by group, as above. `sum`, `min`,
+`max` and `avg` over `DISTINCT` values add up the same way; other
 aggregates over `DISTINCT` values (`median(DISTINCT x)`) are partitioned by
 group alone, and each partition computes its groups whole. When the part is
 a partitioned join on the counted value (devices reached, joining
 impressions to a device table on the device), each partition of the join
-already holds every row of its values, and counts them without a second
-exchange. The top groups of an aggregation by a column of the large table
-(`GROUP BY device_id ORDER BY spend DESC LIMIT 10`) are partitioned by
-group, and each partition sends the coordinator only its first groups.
+already holds every row of its values, and counts them without exchanging
+the values. Groups that are few, or of grouping sets (`ROLLUP`), the
+coordinator combines from every worker's partial results, and adds up the
+partitions' counts itself.
 So are the groups of an aggregation that forecasts each one
 ([`AI.FORECAST`](ml-functions.md#bigquerys-and-databricks-forecasting-functions)
 and the like, which gather a series' points with `list()`): each partition
@@ -126,8 +137,9 @@ Workers compute both cohorts' distinct people, write them once, keyed by
 person, to an exchange that both branches of the `UNION ALL` fill, and
 partition the media events by person as well; then each worker joins one
 partition of both and counts its people per genre and cohort, which no
-other partition holds, and so for the cohorts' sizes. The coordinator gets
-a row per genre, cohort and partition, and runs the final join itself. A
+other partition holds, and so for the cohorts' sizes, and a last round adds
+up each genre and cohort's counts. The coordinator gets a row per genre and
+cohort, and runs the final join itself. A
 common table expression is computed once, however many parts read it,
 and a part the coordinator runs that reads it too reads what the workers
 wrote. One that only one part reads and that only filters tables is read
@@ -945,10 +957,11 @@ several instance types and zones, so that capacity one lacks another has.
   leftovers of a coordinator that crashed mid-statement stay under
   `_igloo_shuffle/` for six hours or more, until a replica's sweep removes
   them.
-- The coordinator receives every group of an aggregation, unless only its
-  top rows are kept: a `GROUP BY` with billions of groups sends every
-  worker's groups to it. (`count(DISTINCT x)` over billions of values sends
-  it one row per group and partition.)
+- The coordinator receives an aggregation's result, one row a group, and
+  keeps it on its disk until the statement has run: a `GROUP BY` whose
+  result is billions of groups sends it all of them. Groups taken to be few
+  (see [what runs distributed](#what-runs-distributed)) it receives from
+  every worker, as partial results.
 - Tables with data files without field IDs, views that group, sort or
   limit, and time travel to any snapshot but a table's latest run on one
   machine.

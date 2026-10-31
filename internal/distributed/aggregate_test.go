@@ -239,33 +239,52 @@ func TestTPCHByGroup(t *testing.T) {
 	}
 }
 
+// valueExchanges counts the stages of p that write partial results to an
+// exchange keyed by a DISTINCT argument's values (aggByValue).
+func valueExchanges(p *Plan) int {
+	n := 0
+	for _, s := range p.Stages {
+		if s.Out != nil && s.Out.purpose == "aggregate" && slices.ContainsFunc(s.Out.Keys, func(k string) bool { return strings.HasPrefix(k, "__dk") }) {
+			n++
+		}
+	}
+	return n
+}
+
 // TestDistinctInPlace checks aggregates over DISTINCT values in a
 // partitioned join on those values: each partition holds every row of
-// each value, so the stage computes them and the coordinator adds them up,
-// with no exchange of partial results.
+// each value, so the stage computes them with no exchange of partial
+// results by value; without groups, the coordinator adds them up, and
+// with groups of the partitioned tables, which may be many, a last stage
+// adds up each group's.
 func TestDistinctInPlace(t *testing.T) {
 	h := newHarness(t, 0.02, 5, 3)
 	h.co.maxBroadcast = h.tables["orders"].Bytes - 1
 	for _, tc := range []struct {
 		query   string
 		inPlace bool
+		// exchanges is how many stages write partial results to an exchange.
+		exchanges int
 	}{
 		{`SELECT o_orderpriority, count(DISTINCT o_orderkey) AS orders, count(DISTINCT l_orderkey) AS o2, count(*) AS n, sum(l_quantity) AS q
-			FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, true},
-		{`SELECT count(DISTINCT o_orderkey), avg(DISTINCT l_orderkey), max(DISTINCT o_orderkey) FROM lineitem, orders WHERE l_orderkey = o_orderkey AND l_shipmode = 'AIR'`, true},
+			FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, true, 1},
+		{`SELECT count(DISTINCT o_orderkey), avg(DISTINCT l_orderkey), max(DISTINCT o_orderkey) FROM lineitem, orders WHERE l_orderkey = o_orderkey AND l_shipmode = 'AIR'`, true, 0},
 		{`SELECT l_shipmode, count(DISTINCT CASE WHEN o_orderkey IS NOT NULL AND l_linenumber IS NOT NULL THEN (o_orderkey, l_linenumber) END) AS lines,
-			count(DISTINCT o_orderkey) FROM lineitem JOIN orders ON o_orderkey = l_orderkey GROUP BY 1 ORDER BY 1`, true},
-		// Values the join key does not fix go through an exchange.
-		{`SELECT o_orderpriority, count(DISTINCT o_custkey) FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, false},
+			count(DISTINCT o_orderkey) FROM lineitem JOIN orders ON o_orderkey = l_orderkey GROUP BY 1 ORDER BY 1`, true, 1},
+		// Values the join key does not fix go through an exchange by value,
+		// and the groups through one by group.
+		{`SELECT o_orderpriority, count(DISTINCT o_custkey) FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, false, 2},
 	} {
 		t.Run(short(tc.query), func(t *testing.T) {
 			h.t = t
 			if !h.partitioned(tc.query) {
 				t.Fatal("did not partition the join")
 			}
-			n := h.exchanged(tc.query, "aggregate")
-			if (n == 0) != tc.inPlace {
-				t.Errorf("%d stages wrote partial results to an exchange; want in place %v", n, tc.inPlace)
+			if n := h.exchanged(tc.query, "aggregate"); n != tc.exchanges {
+				t.Errorf("%d stages wrote partial results to an exchange, want %d", n, tc.exchanges)
+			}
+			if n := valueExchanges(h.planOf(tc.query)); (n == 0) != tc.inPlace {
+				t.Errorf("%d stages wrote partial results to an exchange by value; want in place %v", n, tc.inPlace)
 			}
 		})
 	}
