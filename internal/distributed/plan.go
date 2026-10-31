@@ -714,7 +714,7 @@ func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 		combine, err = pl.finish(j, b)
 	}
 	if err == nil {
-		pl.uncertain = append(pl.uncertain, uncertainOf(c)...)
+		pl.uncertain = append(pl.uncertain, pl.uncertainOf(c)...)
 	}
 	if err != nil && IsUnsupported(err) && pl.inlines > inlines && !pl.noInline {
 		// Some parts need a common table expression's rows in an exchange:

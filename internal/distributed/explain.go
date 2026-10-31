@@ -92,8 +92,11 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		rows = append(rows, [2]string{"buckets", b})
 	}
 	for _, u := range plan.uncertain {
-		rows = append(rows, [2]string{"uncertain size", u.name + ": written and measured first, then read whole if every task can hold it, " +
-			"or by partition as planned"})
+		how := u.name + ": written and measured first, then read whole if every task can hold it, or by partition as planned"
+		if u.small {
+			how += "; its tables' statistics bound it under what every task may read, so nothing waits on it beside it"
+		}
+		rows = append(rows, [2]string{"uncertain size", how})
 	}
 	for _, reason := range plan.local {
 		rows = append(rows, [2]string{"stays on the coordinator", reason})

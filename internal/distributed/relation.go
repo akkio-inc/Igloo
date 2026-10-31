@@ -1231,7 +1231,7 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 	}
 	*last = f
 	if _, err = pl.emit(j, b, out); err == nil {
-		pl.uncertain = append(pl.uncertain, uncertainOf(c)...)
+		pl.uncertain = append(pl.uncertain, pl.uncertainOf(c)...)
 	}
 	return err
 }

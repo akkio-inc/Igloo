@@ -590,7 +590,15 @@ by partition is planned with the size it came out at, without measuring
 it first, for a day, while the tables it reads stay within a factor of two
 of their size then, so the statement gets the plan it got once measured;
 one every stage read whole is measured each time, first, with the workers
-to itself. `EXPLAIN DISTRIBUTED` lists such relations as `uncertain size`, and
+to itself. So is one the first time, where the statistics of the tables it
+reads bound it under what every worker may read: a grouping (`GROUP BY` or
+`DISTINCT`) of columns makes no more rows than the product of their
+distinct counts (from [`ANALYZE`](sql.md) or Iceberg's theta sketches), and
+a filter by `=` keeps no more of a table than its rows over the column's
+distinct count. At a hundred times the data, partitioning 16 workers'
+tables beside an audience of 1.9 million members, the distinct members of
+a lookup's latest version, took a report 305 s, and 50 s measured first.
+`EXPLAIN DISTRIBUTED` lists such relations as `uncertain size`, and
 the server logs how each came out (`measured relations of uncertain
 size`).
 

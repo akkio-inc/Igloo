@@ -604,6 +604,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- A relation of uncertain size, as an audience filtered to one version of
+  a lookup, whose tables' statistics bound it under what every worker may
+  read (a `GROUP BY` or `DISTINCT` of columns by their distinct counts,
+  from `ANALYZE` or Iceberg's theta sketches; a filter by `=` by the
+  column's) is measured with the workers to itself the first time, as one
+  measured small lately is, rather than beside the tables' partitioning to
+  meet it: at a hundred times the data, a report took 305 s with that
+  partitioning and 50 s without.
 - A compute pool may have a large worker (`IGLOO_LARGE_WORKER`, the chart's
   `workers.large`), on which auto mode runs a statement alone when it fits
   there and is estimated within a fifth of the fastest way and cheapest,
