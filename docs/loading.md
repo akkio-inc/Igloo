@@ -10,8 +10,9 @@ by itself, with no external scheduler:
   that land in a bucket are loaded without anyone running anything.
 - **Tasks** run a SQL statement on a schedule: an interval or a cron
   expression, in any time zone.
-- **Materialized views** keep a query's result as a table, refreshed on
-  demand or on a schedule.
+- **Materialized views** and **dynamic tables** keep a query's result as a
+  table, refreshed on demand, on a schedule or within a target lag, from
+  what changed in the tables it reads when the query allows.
 - **[Alerts](alerts.md)** run a query on a schedule and tell Slack, Teams,
   email or a webhook when it returns rows; built-in alerts report failed
   runs, failed loads and pipes that stop receiving files.
@@ -282,12 +283,12 @@ events or longer outages, at the cost of reading more each run.
   due, and then on schedule.
 - **What it may run:** any one statement its owner could run: `INSERT`,
   `MERGE`, `CREATE OR REPLACE TABLE ... AS`, `COPY INTO`,
-  `REFRESH MATERIALIZED VIEW`, [`CALL SYSTEM$SEND_NOTIFICATION`](alerts.md#sending-from-tasks),
+  `REFRESH MATERIALIZED VIEW`, `ALTER DYNAMIC TABLE ... REFRESH`, [`CALL SYSTEM$SEND_NOTIFICATION`](alerts.md#sending-from-tasks),
   and so on, but not statements on tasks, pipes and alerts. Unqualified names resolve in the default schema `public`, as in a
   new session. `IGLOO_STATEMENT_TIMEOUT` applies.
 
-Runs of tasks, pipes, materialized views and [alerts](alerts.md) are in
-`igloo.task_history`. Admins see every run; other users see the runs of
+Runs of tasks, pipes, materialized views, dynamic tables and
+[alerts](alerts.md) are in `igloo.task_history`. Admins see every run; other users see the runs of
 what they own.
 
 ```sql
@@ -298,21 +299,25 @@ FROM igloo.task_history WHERE outcome <> 'succeeded' ORDER BY start_time DESC LI
 | Column | Meaning |
 |---|---|
 | `run_id` | Identifies the run |
-| `kind`, `name` | `task`, `pipe`, `materialized view` or `alert`, and its name |
+| `kind`, `name` | `task`, `pipe`, `materialized view`, `dynamic table` or `alert`, and its name |
 | `user_name` | The owner it ran as |
-| `trigger` | `schedule`, or `manual` for `EXECUTE TASK` and `REFRESH MATERIALIZED VIEW` |
+| `trigger` | `schedule`, or `manual` for `EXECUTE TASK`, `REFRESH MATERIALIZED VIEW` and `ALTER DYNAMIC TABLE ... REFRESH` |
 | `scheduled_time` | When a scheduled run was due |
 | `start_time`, `end_time`, `duration_ms` | When it ran, and for how long |
 | `outcome` | `running`, `succeeded`, `failed`, or `skipped` (the previous run was still running) |
 | `error` | Why it failed |
 | `row_count` | Rows the run loaded, wrote (`CREATE TABLE ... AS` included) or returned |
+| `detail` | How a refresh went about it: incrementally, in full and why, or with nothing to do ([below](#incremental-refresh)) |
 
 Task history is kept for `IGLOO_AUDIT_RETENTION` (90 days by default).
 
 ## Materialized views
 
 A materialized view is a query whose result Igloo keeps as an Iceberg
-table, so reading it is as fast as reading any table:
+table, so reading it is as fast as reading any table. A refresh reads
+only what changed in the query's tables since the last refresh, when the
+query's shape allows it: after a day's load into a fact table of a month,
+it reads that day's rows.
 
 ```sql
 CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name [SCHEDULE 'schedule' [TIMEZONE 'zone']] AS query
@@ -324,18 +329,18 @@ SHOW MATERIALIZED VIEWS
 
 ```sql
 CREATE MATERIALIZED VIEW marts.campaign_totals SCHEDULE '30 minutes' AS
-  SELECT campaign, sum(impressions) AS impressions, sum(spend) AS spend
+  SELECT campaign, count(*) AS rows, sum(impressions) AS impressions, sum(spend) AS spend
   FROM raw.dsp_delivery GROUP BY campaign;
 ```
 
 - Creating one runs the query once and keeps the result as the table
   `name`, in the catalog like any other table; other engines read it as an
   ordinary Iceberg table.
-- A refresh, on demand or on its schedule, runs the query again and
-  replaces the table's rows in one transaction: a query sees the old rows
-  or the new ones, never neither. Refreshes are full; there is no
-  incremental refresh yet. If the query's columns change (a source table
-  changed), refreshing fails; `CREATE OR REPLACE MATERIALIZED VIEW` again.
+- A refresh, on demand or on its schedule, brings the table up to date in
+  one transaction: a query sees the old rows or the new ones, never
+  neither. Its result always equals running the query again. If the
+  query's columns change (a source table changed), refreshing fails;
+  `CREATE OR REPLACE MATERIALIZED VIEW` again.
 - **Reading one needs `SELECT` on it**, not on the tables its query reads:
   grant it like a table. Refreshes run as the owner, with the owner's
   privileges at the time, and need what `CREATE OR REPLACE TABLE ... AS`
@@ -344,6 +349,121 @@ CREATE MATERIALIZED VIEW marts.campaign_totals SCHEDULE '30 minutes' AS
   see of protected tables, and whoever may read it sees that.
 - Only its owner and admins refresh, change or drop it. Dropping it drops
   its table; dropping the table with `DROP TABLE` drops the view too.
+
+### Incremental refresh
+
+Iceberg keeps every version of a table as a snapshot, and each snapshot
+says which data files it added and removed. A refresh reads the tables
+of its query at their current snapshots, records them, and the next
+refresh reads only the rows of the files added or removed since, and of
+the files whose rows were deleted since.
+
+| Query shape | Rows appended | Rows deleted or updated |
+|---|---|---|
+| Filters and projections of a table, or of inner joins of tables | Incremental | Full |
+| Outer joins (`LEFT`, `RIGHT`, `FULL`) | Incremental while the tables the join fills with NULLs are unchanged | Full |
+| `GROUP BY` (or `SELECT DISTINCT`, or aggregates of all rows) with `count(*)`, `count(x)`, `sum(x)` and `avg(x)` of integers and decimals | Incremental | Incremental |
+| ... and also `min(x)`, `max(x)`, or `count(DISTINCT x)` of integers | Incremental | Full |
+
+- **Joins.** Rows appended to a joined table add the rows they join to;
+  when several of the tables changed, the refresh joins each one's
+  changes with the others as they were before or after them (Δ(A⋈B) =
+  ΔA⋈B' + A⋈ΔB). A dimension table that changes reads the fact table it
+  joins whole, as a full refresh would.
+- **Aggregates.** An aggregating view keeps each group's partial
+  aggregates (counts, sums, minimums, maximums, and `count(DISTINCT x)`'s
+  values in a roaring bitmap) in a table of Igloo's own schema
+  `igloo_refresh`, which no user's statement reads or writes, admins'
+  included. A refresh aggregates the changed rows, merges them into the
+  state, and writes the groups that changed; rows deleted are subtracted
+  from counts and sums. Expressions of aggregates and of the `GROUP BY`
+  columns, and `HAVING`, work: they are computed from the state.
+- **Exact, always.** Every table a refresh reads, it reads at the
+  snapshot it records, so the next refresh starts where it ended, and the
+  result equals a full refresh's to the bit. So sums and averages of
+  floating-point values (`DOUBLE`, `FLOAT`), whose results depend on the
+  order the values are added in, and averages of decimals, refresh in
+  full; `count(DISTINCT x)` needs integers from 0 to 4,294,967,295 and the
+  `rb` extension, which Igloo's image has.
+- **Full refreshes** run the query over every row of its tables, and
+  rebuild the state. Igloo refreshes in full, and says why, when the query
+  has a shape the table above leaves out (a window function, a subquery,
+  `LIMIT`, `UNION`, a `WITH` clause, a view or a table of a connection, a
+  function such as `now()` or `random()`, an aggregate such as `median`);
+  when a change is more than half of a table's rows, which reading in
+  full costs about as much as; when a table's snapshot of the last refresh
+  is gone (table maintenance expired it, or the table was replaced or
+  rolled back) or its columns changed; when a table has equality delete
+  files or deletion vectors, which other engines write; when the query or
+  the policies on its tables changed, or a statement other than a refresh
+  wrote the view's table; and for the first refresh after `CREATE`.
+- **What it did.** `SHOW MATERIALIZED VIEWS` gives each view's
+  `refresh_mode` (`INCREMENTAL` when its query can be refreshed so,
+  `FULL` otherwise), `refresh_mode_reason`, and what its last refresh did
+  (`last_refresh_action`: `INCREMENTAL`, `FULL` or `NO_DATA` when nothing
+  changed; `last_refresh_detail`), and `data_timestamp`, when the data
+  it read was current. Each run's `detail` in `igloo.task_history` says
+  the same, with the rows and bytes of files it read and the CPU time it
+  took:
+
+  ```
+  incremental: read 200000 rows added in marts.facts (1317288 bytes of files); 50 groups changed; 15ms of CPU
+  full: ran the query over every row (6200000 rows, 40835332 bytes of files): its query, or the policies on its tables, changed since the last refresh; 382ms of CPU
+  ```
+
+## Dynamic tables
+
+A dynamic table is Snowflake's form of a materialized view that keeps
+itself within a lag of its tables, and Igloo refreshes it the same way,
+incrementally when it can:
+
+```sql
+CREATE [OR REPLACE] DYNAMIC TABLE [IF NOT EXISTS] name
+  TARGET_LAG = '<n> { seconds | minutes | hours | days }' | DOWNSTREAM
+  [WAREHOUSE = name]
+  [REFRESH_MODE = AUTO | FULL | INCREMENTAL]
+  [INITIALIZE = ON_CREATE | ON_SCHEDULE]
+  AS query
+ALTER DYNAMIC TABLE [IF EXISTS] name SUSPEND | RESUME | REFRESH
+ALTER DYNAMIC TABLE [IF EXISTS] name SET TARGET_LAG = '...' | DOWNSTREAM [WAREHOUSE = name]
+DROP DYNAMIC TABLE [IF EXISTS] name
+SHOW DYNAMIC TABLES [LIKE 'pattern'] [IN ACCOUNT | DATABASE [name] | SCHEMA name]
+```
+
+```sql
+CREATE DYNAMIC TABLE marts.daily_spend TARGET_LAG = '1 hour' WAREHOUSE = transform_wh AS
+  SELECT day, client, sum(spend) AS spend, count(*) AS events
+  FROM raw.delivery GROUP BY day, client;
+```
+
+- **Target lag.** Igloo refreshes it every half of its lag (at least 30
+  seconds apart), so its data stays within the lag while a refresh takes
+  less than half of it. The shortest lag is a minute. With `DOWNSTREAM`,
+  it has no schedule of its own: a dynamic table that reads it refreshes
+  it first, when it is not suspended.
+- **It starts at once**, unlike a task: `INITIALIZE = ON_CREATE`, the
+  default, fills it as it is created; `ON_SCHEDULE` makes it empty, for
+  its first refresh to fill. `SUSPEND` stops its schedule and `RESUME`
+  starts it again; `ALTER ... REFRESH` refreshes it now.
+- **`REFRESH_MODE`**: `AUTO` (the default) refreshes incrementally when
+  the query's shape allows it, as for materialized views; `FULL` always
+  runs the query over every row; `INCREMENTAL` refuses, when the table is
+  created, a query that cannot be refreshed incrementally, with the
+  reason.
+- **`WAREHOUSE` is accepted and ignored**, with a notice: Igloo has no
+  warehouses, and a refresh runs on the replica that holds its job.
+  `COMMENT` and `DATA_RETENTION_TIME_IN_DAYS` are ignored with a notice
+  too.
+- In Snowflake's dialect the query is translated as any query is; the
+  options are as written. A column list after the name is refused.
+- **It is a table**, like a materialized view: privileges, ownership and
+  dropping work the same, a dynamic table and a materialized view cannot
+  have the same name, and creating one needs the writer role. `SHOW
+  DYNAMIC TABLES` gives Snowflake's columns (`name`, `database_name`,
+  `schema_name`, `owner`, `target_lag`, `refresh_mode`,
+  `refresh_mode_reason`, `warehouse`, `text`, `scheduling_state`,
+  `data_timestamp`), and its next and last runs and what the last
+  refresh did. Runs are in `igloo.task_history` as kind `dynamic table`.
 
 ## Schedules
 
@@ -367,11 +487,11 @@ task runs at 6 a.m. local time across daylight saving changes; a time that
 a clock change skips runs at the next time that matches. Snowflake's
 `'USING CRON 0 6 * * * America/New_York'` works too.
 
-Creating or changing a schedule (`SCHEDULE`, `RESUME`, `SET SCHEDULE`)
-needs the writer role. `SHOW TASKS`, `SHOW PIPES` and
-`SHOW MATERIALIZED VIEWS` list each one's owner, state, schedule, time
-zone, next and last run, last outcome and error, and definition: admins see
-all of them, other users their own. The console's **Tasks** and
+Creating or changing a schedule (`SCHEDULE`, `RESUME`, `SET SCHEDULE`,
+`TARGET_LAG`) needs the writer role. `SHOW TASKS`, `SHOW PIPES`,
+`SHOW MATERIALIZED VIEWS` and `SHOW DYNAMIC TABLES` list each one's owner,
+state, schedule, time zone, next and last run, last outcome and error, and
+definition: admins see all of them, other users their own. The console's **Tasks** and
 **Load history** pages show the same, with each one's runs and loads.
 
 ## With scale to zero
@@ -389,9 +509,12 @@ then starts Igloo for a few minutes.
 
 ## Where it is kept
 
-Definitions, runs and the load history are in the metadata database
+Definitions, runs, the load history and what each materialized view and
+dynamic table's last refresh read are in the metadata database
 (`IGLOO_METADATA_DATABASE_URL`, schema `igloo_tasks`), shared by every
-replica, and included in its backups. Without a metadata database they are
+replica, and included in its backups. Aggregating views' state is in
+Iceberg tables of the catalog's schema `igloo_refresh`, one a view, which
+go with the view. Without a metadata database they are
 kept in memory, lost on restart: run one replica, and only for trying
 things out.
 
@@ -410,3 +533,5 @@ things out.
 | Nobody noticed a failed run, or a partner's file that never came | Switch on the [built-in alerts](alerts.md#built-in-operational-alerts) `FAILED_RUNS`, `LOAD_ERRORS` and `IDLE_PIPES` for a Slack, Teams or email integration. |
 | Runs are `skipped` | Each run takes longer than the schedule's interval. Lengthen the interval. |
 | A file is `unknown` in the load history | Igloo stopped while loading it. Check whether its rows are in the table; if not, load it with `FORCE true`. |
+| A materialized view or dynamic table refreshes in full every time | `SHOW MATERIALIZED VIEWS` or `SHOW DYNAMIC TABLES` says why in `refresh_mode_reason` (the query's shape) or `last_refresh_detail` (what changed); see [incremental refresh](#incremental-refresh). |
+| `cannot be refreshed incrementally` creating a dynamic table | `REFRESH_MODE = INCREMENTAL` with a query whose shape needs full refreshes; the error says why. Use `AUTO`, or change the query. |

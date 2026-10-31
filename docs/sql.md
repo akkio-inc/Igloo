@@ -88,6 +88,7 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
 | `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
+| `CREATE [OR REPLACE] DYNAMIC TABLE`, `ALTER DYNAMIC TABLE ... REFRESH` | Yes, outside transactions; see [dynamic tables](loading.md#dynamic-tables) |
 | `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
 | `ALTER TABLE ... CREATE BRANCH`, `CREATE TAG`, `DROP BRANCH`, `DROP TAG`, `FAST FORWARD` | Yes, outside transactions; see [branches and tags](#branches-and-tags) |
 | `ALTER TABLE ... SET SORTED BY (...)`, `RESET SORTED BY` | Yes, outside transactions; see [sort orders](#sort-orders-and-clustering) |

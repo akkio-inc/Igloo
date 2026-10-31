@@ -1232,8 +1232,9 @@ clone's snapshots list, under each location.
 
 ## Scheduled work
 
-Tasks, pipes, materialized views ([loading and scheduling](loading.md)) and
-[alerts](alerts.md) run inside Igloo; nothing else needs scheduling. To
+Tasks, pipes, materialized views, dynamic tables ([loading and
+scheduling](loading.md)) and [alerts](alerts.md) run inside Igloo; nothing
+else needs scheduling. To
 hear of failed runs and loads without watching for them, switch on the
 [built-in alerts](alerts.md#built-in-operational-alerts). How they run:
 
@@ -1249,7 +1250,7 @@ hear of failed runs and loads without watching for them, switch on the
   waits for a free slot or another replica. Each run is a session of its
   owner, which counts against `IGLOO_MAX_CONNECTIONS` while it lasts and
   shows on the console's compute page as `task <name>`, `pipe <name>`,
-  `materialized view <name>` or `alert <name>`.
+  `materialized view <name>`, `dynamic table <name>` or `alert <name>`.
 - Runs and loads count as running work on `/activity`, so a scale-to-zero
   gateway does not stop Igloo during one. On shutdown, Igloo starts no new
   runs; those under way get the 30 seconds running queries get, then are

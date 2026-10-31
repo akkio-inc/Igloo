@@ -366,6 +366,15 @@ and the vector functions refuse vectors of different dimensions.
   Snowflake finds a session's temporary object before a table of the same
   name; dropping it ends that. `information_schema.tables` lists them in
   the `temp` catalog.
+- Dynamic tables: `CREATE [OR REPLACE] DYNAMIC TABLE name TARGET_LAG =
+  '...' | DOWNSTREAM WAREHOUSE = w [REFRESH_MODE = AUTO | FULL |
+  INCREMENTAL] [INITIALIZE = ON_CREATE | ON_SCHEDULE] AS query`, with its
+  query translated, `ALTER DYNAMIC TABLE ... SUSPEND | RESUME | REFRESH |
+  SET TARGET_LAG`, `DROP DYNAMIC TABLE` and `SHOW DYNAMIC TABLES [LIKE
+  ...]`. Igloo refreshes them incrementally when the query allows, as
+  Snowflake's `AUTO` does; `WAREHOUSE`, `COMMENT` and
+  `DATA_RETENTION_TIME_IN_DAYS` are accepted and ignored with a notice
+  (see [dynamic tables](loading.md#dynamic-tables)).
 - `CREATE [OR REPLACE] [SECURE] VIEW` (`SECURE` ignored with a notice),
   `ALTER TABLE ... ADD COLUMN` with Snowflake's types, `DESC[RIBE] TABLE`,
   `USE DATABASE`, `USE SCHEMA`. As in Snowflake, a view's column list
@@ -525,8 +534,10 @@ These fail with SQLSTATE `0A000` and a hint:
   statements one at a time; admins can create DuckDB macros. `CALL` of a
   model's method is [Igloo's](ml-functions.md).
 - `INSERT OVERWRITE`, `INSERT ALL` and `INSERT FIRST`; `ALTER TABLE ... SWAP
-  WITH`; `UNDROP`; `CREATE DATABASE`, `WAREHOUSE`, `SEQUENCE`, `STREAM` and
-  `DYNAMIC TABLE`; `AUTOINCREMENT` and `IDENTITY` columns; `COLLATE`.
+  WITH`; `UNDROP`; `CREATE DATABASE`, `WAREHOUSE`, `SEQUENCE` and
+  `STREAM`; a dynamic table's column list (`CREATE DYNAMIC TABLE t (a, b)
+  ...`: name the columns in its query); `AUTOINCREMENT` and `IDENTITY`
+  columns; `COLLATE`.
 - `CONNECT BY`, the `(+)` outer join, `MATCH_RECOGNIZE`, `CHANGES`,
   `BEFORE (...)` and `AT (STATEMENT => ...)`, `RESULT_SCAN` and
   `SEMANTIC_VIEW`.

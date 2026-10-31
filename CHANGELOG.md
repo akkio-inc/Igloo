@@ -385,6 +385,26 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Materialized views (`CREATE [OR REPLACE] MATERIALIZED VIEW ... [SCHEDULE]
   AS query`, `REFRESH MATERIALIZED VIEW`) keep a query's result as an
   Iceberg table, refreshed in one transaction on demand or on a schedule.
+- Incremental refresh: a materialized view's refresh reads only what
+  changed in its tables since the last refresh, as their Iceberg snapshots
+  tell (data files added and removed, rows deleted), for filters,
+  projections and inner joins of appended rows, and `GROUP BY` with
+  `count`, `sum`, `avg`, `min`, `max` and `count(DISTINCT)` (kept in
+  roaring bitmaps), rows deleted or updated included for counts, sums and
+  averages. After a day's load into a 6.2-million-row fact table, a
+  refresh read 1.3 MB of files where a full one read 41 MB, in 15 ms of
+  CPU against 382 ms. Results equal a full refresh's exactly: every table
+  is read at the snapshot the refresh records. Anything else refreshes in
+  full, and `SHOW MATERIALIZED VIEWS` and the run's `detail` in
+  `igloo.task_history` say why (see [incremental
+  refresh](docs/loading.md#incremental-refresh)).
+- Snowflake's dynamic tables: `CREATE [OR REPLACE] DYNAMIC TABLE ...
+  TARGET_LAG = '...' | DOWNSTREAM WAREHOUSE = ... [REFRESH_MODE = AUTO |
+  FULL | INCREMENTAL] [INITIALIZE = ...] AS query`, `ALTER DYNAMIC TABLE
+  ... SUSPEND | RESUME | REFRESH | SET TARGET_LAG`, `DROP` and `SHOW
+  DYNAMIC TABLES`, which Igloo refused, refreshed within their lag the
+  same way, in both dialects; `WAREHOUSE` is accepted and ignored with a
+  notice (see [dynamic tables](docs/loading.md#dynamic-tables)).
 - Tasks, pipes and refreshes run as their owner, with the owner's role and
   grants at the time they run; scheduling needs the writer role. When a
   user is dropped, their tasks, pipes, materialized views and alerts are
@@ -1263,6 +1283,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   model that cannot be trained again keeps the request blocked, with an
   alert, until it can, is dropped, or an admin closes the request, which
   records it as left.
+- Erasure requests replace the materialized views and dynamic tables made
+  from their tables, tagged or not (a new `views` step, after `rewrite`):
+  each is made again from its query as its owner, which deletes the old
+  table's files and snapshots, and the state its incremental refreshes
+  keep (partial aggregates, and bitmaps that can hold a person's id) is
+  dropped, so its next refresh is full. Verification counts views whose
+  table or state has a snapshot from before the step; a view that cannot
+  be replaced keeps the request blocked, with an alert, until it can, is
+  dropped, or an admin closes the request, which records it as left.
 - Erasure requests purge distributed execution's workers: their read
   caches, with what the prefetcher read ahead, footers, models and
   exchange files on their disks. Coordinators record every worker that
