@@ -1051,6 +1051,7 @@ func TestFootprintKeepsAStatementHere(t *testing.T) {
 	h.co.opts.MemoryBytes = 8 << 20
 	h.tables["lineitem"].Bytes = 1 << 30
 	h.tables["orders"].Bytes = 1 << 28
+	h.noPlans = true
 	q := `SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1`
 	ctx := t.Context()
 	plan, d, err := h.co.plan(ctx, q, harnessEnv{h}, ModeAuto, true, nil)

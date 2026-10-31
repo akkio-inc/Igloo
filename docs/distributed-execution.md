@@ -348,10 +348,31 @@ at least 1.5 times faster.
 **Spilling.** A machine that runs a statement whole spills to disk when the
 rows its joins, groupings and distinct counts hold, its working set, are
 more than the 70% of its memory limit it has for them. Igloo estimates the
-working set at six times what the stages that feed them read, as filters
-leave it (or, for a statement whose shape ran to its end on the replica,
-what that run allocated), and takes a machine whose working set is over its
-room to take longer by the ratio to the power of 0.55: twice its room, 1.5
+working set from DuckDB's own plan of the statement, as the session would
+run it (`EXPLAIN`): each join holds its build side, each grouping its groups
+(as many as DuckDB estimates, but no more than the distinct counts of its
+keys allow, from [`ANALYZE`](sql.md) or the theta sketches of Iceberg's
+statistics files, and each of DuckDB's threads holds the groups it meets
+before they are merged), each distinct aggregate the rows it is given, and
+each sort and window its input, at the widths of their columns. Where the
+distinct counts of an inner join's keys are known, its rows are the product
+of its inputs' over the larger distinct count, as DuckDB, without them,
+took a TPC-H join of customers and suppliers by nation for 2,000 rows where
+it made 12 million. Fitted against what DuckDB was seen holding (the
+replica's samples, as `query_history.memory_peak` records them) over joins,
+groupings, distinct counts, sorts and windows of 16 million rows, the
+estimates are within a quarter for most and a factor of two for all; over
+TPC-H's queries at three times its scale that held 300 MB or more, 2.9
+times off at the geometric mean, where six times what the stages read, the
+estimate before, was 37 times off, and nothing for a join of 9.8 GB whose
+smaller side every worker would read whole. Statements' peaks on the
+replica correct the estimates further, by the average of peak over
+estimate, within a factor of four. A statement is planned so once and
+remembered by its plan key. Where the session cannot plan it, the working
+set is six times what the stages that feed its joins and distinct counts
+read, as filters leave it; for a statement whose shape ran to its end on
+the replica, it is what that run allocated. A machine whose working set is
+over its room takes longer by the ratio to the power of 0.55: twice its room, 1.5
 times as long; six times, 2.7 times as long. Against the scale runs on a
 replica of 49.3 GiB, by the working sets they reached (what they held at the
 memory limit and what they spilled), eleven reports took 1.2 to 2.9 times
@@ -708,8 +729,9 @@ object storage there. The default stays `object`.
   session's `distributed_execution`, or what keeps it here); the `estimate`
   auto mode weighs (one machine's seconds, workers' seconds and how many,
   the stages' levels, what they read and exchange, the rows they go
-  through, and whether it is too large for the replica's memory); `spill`,
-  its working set against the replica's room for it, and the large
+  through, and whether it is too large for the replica's memory); `working
+  set`, where it comes from and what DuckDB's plan says its largest holders
+  hold; `spill`, its working set against the replica's room for it, and the large
   worker's, and what each would spill and how much longer it would take;
   `fleet`, how many workers, or the large worker, auto mode would take and
   why, and `options`, each way it weighed with its time, corrected by what

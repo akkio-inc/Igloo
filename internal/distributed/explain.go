@@ -1,9 +1,11 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -45,6 +47,7 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 	rows := [][2]string{{"runs on", where}, {"reason", d.reason}, {"estimate", estimate}}
 	// What this replica would spill, and the ways on workers weighed:
 	// how many workers, or the large worker, and why (see pick).
+	rows = append(rows, [2]string{"working set", describeSet(e)})
 	rows = append(rows, [2]string{"spill", "this replica: " + e.local.String()})
 	for _, o := range e.options {
 		if o.spill.factor > 1 || o.large {
@@ -129,6 +132,26 @@ func semiJoins(stages []*Stage) []string {
 		}
 	}
 	return out
+}
+
+// describeSet says where an estimate's working set comes from and, from
+// DuckDB's plan, what its largest holders hold.
+func describeSet(e estimate) string {
+	if !e.planned {
+		return fmt.Sprintf("%s: six times what the stages feeding its joins and distinct counts read", gigabytes(int64(e.local.set)))
+	}
+	parts := slices.Clone(e.parts)
+	slices.SortFunc(parts, func(a, b heldPart) int { return cmp.Compare(b.bytes, a.bytes) })
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s by DuckDB's plan", gigabytes(int64(e.local.set)))
+	for i, p := range parts {
+		if i == 3 {
+			fmt.Fprintf(&b, "; %d more", len(parts)-i)
+			break
+		}
+		fmt.Fprintf(&b, "; %s of %.3g rows %s", p.op, p.rows, gigabytes(int64(p.bytes)))
+	}
+	return b.String()
 }
 
 // gigabytes writes a size in gigabytes.

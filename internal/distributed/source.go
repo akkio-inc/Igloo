@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"reflect"
 	"slices"
 	"strconv"
@@ -204,6 +205,9 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	t.Distinct = distinctCounts(tbl.Properties()[catalog.DistinctCountsProperty])
 	snap := tbl.CurrentSnapshot()
 	t.Buckets = icebergBuckets(ctx, tbl, snap)
+	// Iceberg's own statistics: the distinct counts other engines' theta
+	// sketches give the columns, where ANALYZE gave none.
+	t.Distinct = withSketchedDistinct(t.Distinct, tbl.Metadata().Statistics(), tbl.Schema(), snap)
 	t.source = &icebergHandle{tbl: tbl, snap: snap, columns: t.Columns}
 	if snap == nil {
 		return t, nil
@@ -338,6 +342,44 @@ func distinctCounts(prop string) map[string]int64 {
 		}
 	}
 	return out
+}
+
+// withSketchedDistinct adds to counts, distinct counts by lower-case
+// column name, those the table's statistics files give: the ndv property
+// of an apache-datasketches-theta-v1 blob of one field, of the snapshot
+// snap, or else of the latest snapshot that has statistics. A column
+// counts already keeps its count.
+func withSketchedDistinct(counts map[string]int64, files iter.Seq[table.StatisticsFile], schema *iceberg.Schema, snap *table.Snapshot) map[string]int64 {
+	var chosen *table.StatisticsFile
+	for f := range files {
+		switch {
+		case snap != nil && f.SnapshotID == snap.SnapshotID:
+			chosen = &f
+		case chosen == nil || (snap == nil || chosen.SnapshotID != snap.SnapshotID) && f.SnapshotID > chosen.SnapshotID:
+			chosen = &f
+		}
+	}
+	if chosen == nil || schema == nil {
+		return counts
+	}
+	for _, b := range chosen.BlobMetadata {
+		if b.Type != table.BlobTypeApacheDatasketchesThetaV1 || len(b.Fields) != 1 {
+			continue
+		}
+		ndv, err := strconv.ParseInt(b.Properties["ndv"], 10, 64)
+		field, ok := schema.FindFieldByID(int(b.Fields[0]))
+		if err != nil || ndv <= 0 || !ok {
+			continue
+		}
+		name := strings.ToLower(field.Name)
+		if counts == nil {
+			counts = map[string]int64{}
+		}
+		if _, have := counts[name]; !have {
+			counts[name] = ndv
+		}
+	}
+	return counts
 }
 
 // icebergColumn returns a column of Iceberg type t as DuckDB reads it: a

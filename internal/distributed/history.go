@@ -50,6 +50,11 @@ type runs struct {
 	// machine's memory share, held as heldFactor times its bytes; it is
 	// worked out when the runs are read, not kept.
 	heavy bool
+	// planSet is the working set DuckDB's plan of it was estimated to hold,
+	// before the correction by statements' peaks (see workingSet), kept so
+	// that the plan is not read again for it, and to correct the estimates
+	// by its peak (see ObservePeak).
+	planSet float64
 	// localMemory, distMemory and largeMemory are the memory its runs had:
 	// the replica's limit on one machine, the smallest worker's on workers,
 	// the large worker's on it; zero when not known. Runs under other

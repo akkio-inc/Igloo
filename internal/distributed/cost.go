@@ -146,6 +146,10 @@ type estimate struct {
 	options []option
 	dollars bool
 	fleet   string
+	// planned says the working set is DuckDB's plan's, and parts what its
+	// operators hold.
+	planned bool
+	parts   []heldPart
 }
 
 // coldRateAt is how fast a core reads object storage cold at
@@ -216,12 +220,24 @@ type features struct {
 	// stages' longest chain, and stages how many there are.
 	rows           float64
 	levels, stages int
+	// planSet is the working set DuckDB's plan of the statement holds,
+	// where planned says the session could plan it, and planParts what each
+	// of its operators holds (see workingSetOf).
+	planSet   float64
+	planned   bool
+	planParts []heldPart
 }
 
-// set is the working set of a plan of features x on one machine:
-// heldFactor times what its exchanges' stages read, as selective filters
-// leave it.
-func (x features) set() float64 { return heldFactor * x.held }
+// set is the working set of a plan of features x on one machine: what
+// DuckDB's plan of the statement holds, where the session could plan it
+// (see workingSetOf), or else heldFactor times what its exchanges' stages
+// read, as selective filters leave it.
+func (x features) set() float64 {
+	if x.planned {
+		return x.planSet
+	}
+	return heldFactor * x.held
+}
 
 // planFeatures measures a plan for its estimates.
 func planFeatures(stages []*Stage) features {
@@ -275,7 +291,7 @@ func planFeatures(stages []*Stage) features {
 // estimate estimates the times of a plan of features x on the coordinator,
 // m, and on workers, f.
 func (x features) estimate(m machine, f fleet) estimate {
-	e := estimate{bytes: x.bytes, exchanged: x.exchanged, levels: x.levels, stages: x.stages, rows: x.rows}
+	e := estimate{bytes: x.bytes, exchanged: x.exchanged, levels: x.levels, stages: x.stages, rows: x.rows, planned: x.planned, parts: x.planParts}
 	// Short of memory on the coordinator, which a statement whose workers
 	// fail then does not fall back to, by the bytes its exchanges' stages
 	// read.

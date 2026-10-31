@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -62,6 +63,9 @@ type harness struct {
 	// connected, if set, sees each connection worker i opens for a task.
 	erasure   func(i int) WorkerErasure
 	connected func(i int)
+	// noPlans keeps the session from planning statements for auto mode's
+	// working sets (see harnessEnv.Explain).
+	noPlans bool
 }
 
 // hookHandler passes records to the harness's hook, and on to its handler.
@@ -164,6 +168,18 @@ func (e harnessEnv) Describe(ctx context.Context, query string) ([]Column, error
 }
 
 func (e harnessEnv) UserFunction(context.Context, string) (bool, error) { return false, nil }
+
+// Explain plans query on the session, as the server's sessions do; with
+// noPlans, it plans nothing, as for tests whose tables' sizes are set by
+// hand, which DuckDB's plan of the harness's small tables would not see.
+func (e harnessEnv) Explain(ctx context.Context, query string) (string, error) {
+	if e.h.noPlans {
+		return "", errors.New("the harness plans nothing")
+	}
+	var plan string
+	err := e.h.session.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+query).Scan(new(string), &plan)
+	return plan, err
+}
 
 func (e harnessEnv) GroupFunction(name string) bool { return e.h.groupFunctions[name] }
 

@@ -822,6 +822,33 @@ func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
 	return settingValue(ctx, e.sess.conn, name)
 }
 
+// Explain returns DuckDB's plan of query as the session would run it,
+// EXPLAIN (FORMAT JSON), its parameters bound to NULL, for auto mode's
+// estimate of what it holds (see distributed.Explainer).
+func (e *sessionEnv) Explain(ctx context.Context, query string) (string, error) {
+	ds, err := e.sess.conn.PrepareContext(ctx, "EXPLAIN (FORMAT JSON) "+query)
+	if err != nil {
+		return "", err
+	}
+	stmt := ds.(*duckdb.Stmt)
+	defer stmt.Close() //nolint:errcheck
+	args := make([]driver.NamedValue, stmt.NumInput())
+	for i := range args {
+		args[i] = driver.NamedValue{Ordinal: i + 1}
+	}
+	rows, err := stmt.QueryContext(ctx, args)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); err != nil || len(dest) < 2 {
+		return "", errors.Join(errors.New("EXPLAIN returned no plan"), err)
+	}
+	plan, _ := dest[1].(string)
+	return plan, nil
+}
+
 // Aggregates returns the names of the session's aggregate functions, those
 // of the extensions the server loaded included.
 func (e *sessionEnv) Aggregates(ctx context.Context) ([]string, error) {
