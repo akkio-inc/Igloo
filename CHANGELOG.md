@@ -1062,6 +1062,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   pull request with a sample agency project (`scripts/clients/dbt`). The
   profile's `dbname` is the catalog's name. See
   [docs/integrations.md](docs/integrations.md).
+- dbt's `microbatch` incremental strategy, tested with the others: a run
+  builds the days it is given, each merged into the model. Incremental
+  runs of every strategy delete the rows they replace with delete files
+  and add new files, rewriting no data file: the test checks that the
+  snapshots each run commits write no more rows than it changed or added.
 - Tested clients: SQLAlchemy 2 with psycopg 3, pandas and polars (through
   SQLAlchemy, connectorx and ADBC), and the JDBC metadata calls and SQL of
   Tableau and Looker, in `scripts/e2e.sh`; Metabase, Apache Superset and

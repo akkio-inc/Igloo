@@ -501,7 +501,7 @@ if docker run --rm --network "$network" -e PGHOST=igloo -e PGUSER=walt -e PGPASS
   -v "$root/scripts/clients:/clients:ro" python:3.12-slim sh -c "
     pip install -q --disable-pip-version-check --root-user-action=ignore 'dbt-core==1.12.6' 'dbt-postgres==1.11.0' >/dev/null &&
     python /clients/dbt_test.py" >"$work/dbt.out" 2>&1; then
-  pass "dbt (dbt-postgres 1.11): seeds, views, tables, incremental merge, delete+insert and append, snapshots, tests, docs, freshness"
+  pass "dbt (dbt-postgres 1.11): seeds, views, tables, incremental merge, delete+insert, append and microbatch rewriting no files, snapshots, tests, docs, freshness"
 else
   fail "dbt: $(tail -15 "$work/dbt.out")"
 fi

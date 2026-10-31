@@ -25,6 +25,12 @@ models:
         data_tests: [unique, not_null]
   - name: fct_spend_log
     description: Delivery rows in the order they were loaded.
+  - name: fct_delivery_batches
+    description: Delivery per platform, campaign and day, built a day at a time.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "platform || '-' || campaign_id || '-' || event_date"
   - name: dim_campaigns
     description: Campaigns with their current bidding settings.
     columns:
