@@ -163,3 +163,79 @@ resource "aws_iam_role_policy" "igloo_assume_engines" {
     ]
   })
 }
+
+################################################################################
+# Cluster autoscaler (with workers_enabled, see workers.tf)
+#
+# Assumable only by kube-system/cluster-autoscaler. It may read autoscaling
+# groups, launch templates, instance types and managed node groups (labels
+# and taints, to scale a group from zero), and change the size of the worker
+# node groups' autoscaling groups only, not the default node group's.
+################################################################################
+
+data "aws_caller_identity" "current" {}
+
+resource "aws_iam_role" "cluster_autoscaler" {
+  count = var.workers_enabled ? 1 : 0
+
+  name        = "${var.name_prefix}-cluster-autoscaler"
+  description = "Kubernetes cluster autoscaler: scales the worker node groups"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Federated = module.eks.oidc_provider_arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "${module.eks.oidc_provider}:sub" = "system:serviceaccount:kube-system:${local.cluster_autoscaler_service_account}"
+            "${module.eks.oidc_provider}:aud" = "sts.amazonaws.com"
+          }
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "cluster_autoscaler" {
+  count = var.workers_enabled ? 1 : 0
+
+  name = "scale-worker-node-groups"
+  role = aws_iam_role.cluster_autoscaler[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Describe"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:DescribeAutoScalingInstances",
+          "autoscaling:DescribeLaunchConfigurations",
+          "autoscaling:DescribeScalingActivities",
+          "autoscaling:DescribeTags",
+          "ec2:DescribeImages",
+          "ec2:DescribeInstanceTypes",
+          "ec2:DescribeLaunchTemplateVersions",
+          "ec2:GetInstanceTypesFromInstanceRequirements",
+          "eks:DescribeNodegroup",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ScaleWorkerNodeGroups"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:SetDesiredCapacity",
+          "autoscaling:TerminateInstanceInAutoScalingGroup",
+        ]
+        Resource = [
+          for g in local.worker_autoscaling_groups :
+          "arn:${data.aws_partition.current.partition}:autoscaling:${var.region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${g.name}"
+        ]
+      },
+    ]
+  })
+}

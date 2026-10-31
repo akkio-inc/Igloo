@@ -482,6 +482,165 @@ variable "tls_private_key_pem" {
   }
 }
 
+################################################################################
+# Distributed-execution workers (docs/distributed-execution.md)
+################################################################################
+
+variable "workers_enabled" {
+  description = "Provision node groups for distributed-execution workers, which scale from zero, install the Kubernetes cluster autoscaler to scale them, and turn workers on in the chart. Off by default, so existing deployments are unchanged."
+  type        = bool
+  default     = false
+}
+
+variable "workers_spot" {
+  description = "Run workers on Spot capacity, falling back to on-demand when Spot capacity is not available. Workers hold no state and a lost worker's tasks run again on another, so Spot suits them; igloo pods stay on the default node group."
+  type        = bool
+  default     = true
+}
+
+variable "workers_instance_types" {
+  description = "EC2 instance types for worker nodes, one worker per node. All must share one CPU architecture and should have the same vCPUs and memory, which the cluster autoscaler assumes of a node group; list several so Spot capacity one lacks another has. Types with local NVMe instance store get it RAID0ed under kubelet, and the workers' spill and read cache volumes are sized to it."
+  type        = list(string)
+  default     = ["m7gd.4xlarge", "m6gd.4xlarge"]
+
+  validation {
+    condition     = length(var.workers_instance_types) > 0 && alltrue([for t in var.workers_instance_types : can(regex("^[a-z][a-z0-9-]*\\.[a-z0-9]+$", t))])
+    error_message = "workers_instance_types must be a non-empty list of instance type names such as m7gd.4xlarge."
+  }
+
+  validation {
+    condition     = length(distinct([for t in var.workers_instance_types : can(regex("^[a-z]+[0-9]+[a-z]*g[a-z]*\\.", t))])) == 1
+    error_message = "workers_instance_types must all be Graviton (arm64) or all x86_64; a node group runs one AMI."
+  }
+}
+
+variable "workers_max" {
+  description = "The most worker pods, and so worker nodes, Igloo starts (the chart's workers.maxReplicas)."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.workers_max >= 1 && var.workers_max <= 100 && floor(var.workers_max) == var.workers_max
+    error_message = "workers_max must be a whole number from 1 to 100."
+  }
+}
+
+variable "workers_cpu" {
+  description = "CPU request per worker pod. Null takes 90% of the first instance type's vCPUs, so one worker fills a node."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.workers_cpu == null || can(regex("^([0-9]+m|[0-9]+(\\.[0-9]+)?)$", coalesce(var.workers_cpu, "1")))
+    error_message = "workers_cpu must be null or a Kubernetes CPU quantity such as 14."
+  }
+}
+
+variable "workers_memory" {
+  description = "Memory request and limit per worker pod. Null takes 85% of the first instance type's memory, leaving room for the kubelet's reservation."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.workers_memory == null || can(regex("^[0-9]+(Mi|Gi)$", coalesce(var.workers_memory, "1Gi")))
+    error_message = "workers_memory must be null or a quantity in Mi or Gi, such as 54Gi."
+  }
+}
+
+variable "workers_disk_size_gib" {
+  description = "Root EBS volume (gp3, encrypted) per worker and large-worker node in GiB. On types without instance store the workers' spill and read cache live on it (half and a fifth of it); on types with one it holds only the operating system and images."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.workers_disk_size_gib >= 30 && var.workers_disk_size_gib <= 16384
+    error_message = "workers_disk_size_gib must be between 30 and 16384."
+  }
+}
+
+variable "workers_price_per_hour" {
+  description = "What one worker node costs an hour in dollars (the chart's workers.pricePerHour), for auto mode's cost estimates. 0 is unknown."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.workers_price_per_hour >= 0
+    error_message = "workers_price_per_hour must be 0 or more."
+  }
+}
+
+variable "large_worker_enabled" {
+  description = "Provision a node group, scaling from zero, for one large worker that auto mode may run a whole statement on, and turn it on in the chart (workers.large). Needs workers_enabled."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.large_worker_enabled || var.workers_enabled
+    error_message = "large_worker_enabled needs workers_enabled: the large worker is one of the workers."
+  }
+}
+
+variable "large_worker_spot" {
+  description = "Run the large worker on Spot capacity, falling back to on-demand when there is none. Off by default: a 512 GiB Spot node is reclaimed more often, and the large worker runs whole statements."
+  type        = bool
+  default     = false
+}
+
+variable "large_worker_instance_types" {
+  description = "EC2 instance types for the large worker's node. On-demand nodes use the first; Spot nodes any of them. Default: r7gd.16xlarge, 64 Graviton vCPUs, 512 GiB, 2 x 1900 GB local NVMe."
+  type        = list(string)
+  default     = ["r7gd.16xlarge"]
+
+  validation {
+    condition     = length(var.large_worker_instance_types) > 0 && alltrue([for t in var.large_worker_instance_types : can(regex("^[a-z][a-z0-9-]*\\.[a-z0-9]+$", t))])
+    error_message = "large_worker_instance_types must be a non-empty list of instance type names such as r7gd.16xlarge."
+  }
+
+  validation {
+    condition     = length(distinct([for t in var.large_worker_instance_types : can(regex("^[a-z]+[0-9]+[a-z]*g[a-z]*\\.", t))])) == 1
+    error_message = "large_worker_instance_types must all be Graviton (arm64) or all x86_64; a node group runs one AMI."
+  }
+}
+
+variable "large_worker_cpu" {
+  description = "CPU request of the large worker pod. Null takes 90% of the first instance type's vCPUs."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.large_worker_cpu == null || can(regex("^([0-9]+m|[0-9]+(\\.[0-9]+)?)$", coalesce(var.large_worker_cpu, "1")))
+    error_message = "large_worker_cpu must be null or a Kubernetes CPU quantity such as 57."
+  }
+}
+
+variable "large_worker_memory" {
+  description = "Memory request and limit of the large worker pod. Null takes 85% of the first instance type's memory."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.large_worker_memory == null || can(regex("^[0-9]+(Mi|Gi)$", coalesce(var.large_worker_memory, "1Gi")))
+    error_message = "large_worker_memory must be null or a quantity in Mi or Gi, such as 435Gi."
+  }
+}
+
+variable "large_worker_price_per_hour" {
+  description = "What the large worker's node costs an hour in dollars (the chart's workers.large.pricePerHour), for auto mode's cost estimates. 0 is unknown."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.large_worker_price_per_hour >= 0
+    error_message = "large_worker_price_per_hour must be 0 or more."
+  }
+}
+
+variable "cluster_autoscaler_chart_version" {
+  description = "Version of the cluster-autoscaler Helm chart installed with workers_enabled. Its cluster autoscaler should match kubernetes_version's minor version: 9.59.0 runs 1.35."
+  type        = string
+  default     = "9.59.0"
+}
+
 variable "helm_values_override" {
   description = "Extra YAML merged over the values this module sets on the chart, for chart settings without a variable here (nodeSelector, autoscaling, ...)."
   type        = string

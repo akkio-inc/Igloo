@@ -19,6 +19,7 @@ module from other code, because it configures its own providers.
 | IAM | Two roles for service accounts (IRSA): one for the igloo pods and one for the Lakekeeper catalog. Each can be assumed only by its own Kubernetes service account and can only list, read, write and delete objects under `warehouse/` in the bucket. A third, `<name_prefix>-engines`, with the same access, can be assumed only by the igloo role: Igloo assumes it, with a session policy for one table, to hand [other engines](../../docs/external-engines.md) credentials for that table for an hour. |
 | Kubernetes | Namespace `igloo`, Secrets `igloo-admin` (key `password`), `igloo-database` (key `url`), `igloo-catalog-encryption` (key `encryption-key`), and `igloo-tls` when TLS is on. |
 | Helm | The Igloo chart: 2 igloo pods (1.5 CPU, 12 GiB each), the Lakekeeper catalog, and a ClusterIP SQL service (or a Network Load Balancer with `expose_sql`). |
+| Workers (optional) | With `workers_enabled`: node groups for [distributed-execution workers](#distributed-execution-workers), Spot with an on-demand fallback, from zero nodes, the Kubernetes cluster autoscaler to scale them, and an IAM role for it; with `large_worker_enabled`, a node group for one large worker too. |
 
 ## Prerequisites
 
@@ -175,9 +176,11 @@ and use idle cores. DuckDB gets about 80% of the pod's memory and spills
 larger queries to the node's disk (`duckdb_spill_size`, 50 GiB per pod),
 which is why the nodes are the `d` variant with a local NVMe disk.
 
-No cluster autoscaler is installed. To add capacity, raise `node_min_size`
-(`node_desired_size` is ignored after the node group exists) or scale the node
-group in the EKS console, and raise `igloo_replicas`.
+The default node group is sized by hand: the cluster autoscaler that
+`workers_enabled` installs scales only the worker node groups. To add
+capacity, raise `node_min_size` (`node_desired_size` is ignored after the
+node group exists) or scale the node group in the EKS console, and raise
+`igloo_replicas`.
 
 ### Spill on local NVMe
 
@@ -224,6 +227,75 @@ the node group's user data empty, as before, and spill to the gp3 root
 volume: leave `node_disk_size_gib` room for `duckdb_spill_size` times the
 igloo pods per node.
 
+## Distributed-execution workers
+
+`workers_enabled = true` runs statements that read very large tables in
+parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
+It is off by default, so applying this version to an existing deployment
+changes nothing. With it on, the module adds:
+
+| Node group | Capacity | Size | Runs |
+|---|---|---|---|
+| `workers-spot` (unless `workers_spot = false`) | Spot, any of `workers_instance_types` (`m7gd.4xlarge`, `m6gd.4xlarge`: 16 Graviton vCPUs, 64 GiB, 950 GB NVMe) | 0 to `workers_max` (4) | worker pods |
+| `workers-ondemand` | On-demand, the first type | 0 to `workers_max` | worker pods, when Spot has no capacity |
+| `large-worker-ondemand` (with `large_worker_enabled`) | On-demand, `r7gd.16xlarge` (64 vCPUs, 512 GiB, 2 x 1900 GB NVMe) | 0 to 1 | the large worker |
+| `large-worker-spot` (with `large_worker_spot` too) | Spot | 0 to 1 | the large worker, when Spot has capacity |
+
+The worker groups carry the node label `igloo.dev/node=workers` (the large
+worker's, `large-worker`) and a `NoSchedule` taint, `igloo.dev/workers`
+(`igloo.dev/large-worker`), so only worker pods run there; the chart's
+worker pods select the label and tolerate the taint, which both groups of a
+kind share. Igloo pods, Lakekeeper and system pods stay on the default node
+group, on-demand unless `node_use_spot`: igloo pods hold client sessions.
+One worker fills a node: its pod requests 90% of the first type's vCPUs and
+85% of its memory (`workers_cpu`, `workers_memory` override that), and its
+spill and read cache volumes take 55% and 25% of the instance store, which
+the module RAID0s under kubelet as on the default nodes; without instance
+store, half and a fifth of the root volume (`workers_disk_size_gib`).
+
+Igloo scales the worker Deployment up when a statement needs workers and to
+zero when they are idle. The [Kubernetes cluster
+autoscaler](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler)
+(Helm chart `cluster-autoscaler`, `cluster_autoscaler_chart_version`, in
+`kube-system`, with an IAM role for its service account that may resize
+only the worker groups' autoscaling groups) adds nodes for waiting worker
+pods and removes them five minutes after they are empty. Its priority
+expander tries the Spot groups first. When AWS has no Spot capacity for the
+listed types, the autoscaler usually sees the failed launch in the
+autoscaling group's activities and backs the Spot group off at once; at the
+latest it does so when no node has joined within
+`--max-node-provision-time` (5 minutes). The on-demand group then gets the
+pod, and the Spot group is tried again after the back-off. A statement
+waits for workers at most `workers.startTimeout` (3 minutes) and then runs
+on its igloo pod, so a statement that meets a Spot shortage may run without
+workers; the next one gets the on-demand nodes. EKS managed node groups
+drain a Spot node once AWS sends a rebalance recommendation for it, which
+usually comes before the two-minute notice, and a stopping worker finishes
+its tasks for up to 30 seconds; what it has not finished runs again on
+other workers. (A worker reads the two-minute notice from instance metadata
+itself only with a hop limit of 2, which these node groups keep at 1, so
+pods cannot take the node's credentials.)
+
+Why the cluster autoscaler rather than Karpenter: it scales the managed node
+groups this module already uses, needs only a Helm chart and one IAM role,
+and no custom resources, which the Kubernetes provider cannot plan before
+the cluster exists, so one `tofu apply` still creates everything. Karpenter
+falls back from Spot sooner and picks instance types more freely; install it
+yourself with `workers_enabled = false` and the chart's `workers.*` values
+through `helm_values_override` if you want that.
+
+The large worker (`large_worker_enabled = true`) is one pod on a 512 GiB
+node, which auto mode may run a whole statement on instead of on many small
+workers (see the chart's [large worker](../helm/igloo/README.md#a-large-worker)).
+It is on-demand by default (`large_worker_spot = true` tries Spot first),
+and costs nothing while stopped.
+
+Set `workers_price_per_hour` and `large_worker_price_per_hour` to what a
+node costs, so auto mode can weigh price: in us-east-1, an `r7gd.16xlarge`
+lists at about $4.36 an hour on-demand, an `m7gd.4xlarge` at about $0.85,
+and Spot runs 50 to 70% below on-demand, varying by zone and hour. Left at
+0, the price is unknown.
+
 ## Common settings
 
 | Variable | Default | Purpose |
@@ -239,6 +311,10 @@ igloo pods per node.
 | `expose_sql`, `sql_allowed_cidrs`, `sql_load_balancer_internal` | `false`, none, `false` | SQL access from outside the cluster |
 | `cluster_endpoint_public_access_cidrs`, `cluster_admin_arns` | `["0.0.0.0/0"]`, none | Kubernetes API access |
 | `allowed_locations`, `igloo_additional_policy_arns` | none | Let users `COPY` from or to other buckets: list the `s3://` prefixes and attach an IAM policy granting the igloo role access to them |
+| `workers_enabled`, `workers_spot`, `workers_instance_types`, `workers_max` | `false`, `true`, `["m7gd.4xlarge", "m6gd.4xlarge"]`, 4 | [Distributed-execution workers](#distributed-execution-workers): Spot with an on-demand fallback |
+| `workers_cpu`, `workers_memory`, `workers_disk_size_gib`, `workers_price_per_hour` | 90% of vCPUs, 85% of memory, 100, 0 | Worker pod size, node root volume, price for auto mode |
+| `large_worker_enabled`, `large_worker_spot`, `large_worker_instance_types`, `large_worker_price_per_hour` | `false`, `false`, `["r7gd.16xlarge"]`, 0 | One large worker, on-demand by default |
+| `cluster_autoscaler_chart_version` | `9.59.0` | Cluster autoscaler 1.35, for `kubernetes_version` 1.35; keep the two minor versions together |
 | `install_chart` | `true` | `false` creates everything except the Helm release, for installing the chart another way (the namespace and Secrets are still created) |
 | `helm_values_override` | empty | Extra chart values as YAML, e.g. node selectors or autoscaling |
 
@@ -347,4 +423,8 @@ reaches only the warehouse prefix, only the igloo role may assume the engines
 role (whose ARN the chart gets as `storage.s3.stsRoleArn`), the Helm values carry the warehouse
 location and `systemCredentials: aws`, the SQL service stays ClusterIP unless
 exposed, node types with instance store get the RAID0 `NodeConfig` and others
-none, and bad input is rejected.
+none, workers get a Spot and an on-demand node group from zero, sized pods
+and volumes, and a cluster autoscaler that prefers Spot and may resize only
+their autoscaling groups, nothing of that exists without `workers_enabled`,
+the large worker gets an on-demand group of its own, and bad input is
+rejected.

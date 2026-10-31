@@ -44,6 +44,11 @@ output "node_group" {
   value       = local.node_group
 }
 
+output "worker_node_groups" {
+  description = "With workers_enabled: the worker and large-worker node groups by name (workers-spot, workers-ondemand, large-worker-spot, large-worker-ondemand), each with its capacity type, instance types, sizes, node label, taint key and local_storage. Empty without workers."
+  value       = local.worker_node_groups
+}
+
 output "vpc_id" {
   description = "ID of the VPC."
   value       = module.vpc.vpc_id

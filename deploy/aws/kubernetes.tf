@@ -107,7 +107,9 @@ resource "kubernetes_secret_v1" "tls" {
 ################################################################################
 
 locals {
-  helm_values = {
+  helm_values = merge(local.helm_base_values, local.workers_helm_values)
+
+  helm_base_values = {
     image = merge(
       { tag = var.igloo_image_tag },
       var.igloo_image_repository == "" ? {} : { repository = var.igloo_image_repository },
