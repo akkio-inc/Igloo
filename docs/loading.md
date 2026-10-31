@@ -362,7 +362,7 @@ the files whose rows were deleted since.
 |---|---|---|
 | Filters and projections of a table, or of inner joins of tables | Incremental | Full |
 | Outer joins (`LEFT`, `RIGHT`, `FULL`) | Incremental while the tables the join fills with NULLs are unchanged | Full |
-| `GROUP BY` (or `SELECT DISTINCT`, or aggregates of all rows) with `count(*)`, `count(x)`, `sum(x)` and `avg(x)` of integers and decimals | Incremental | Incremental |
+| `GROUP BY` (or `SELECT DISTINCT`, or aggregates of all rows) with `count(*)`, `count(x)`, `sum(x)` of integers and decimals, and `avg(x)` of integers | Incremental | Incremental |
 | ... and also `min(x)`, `max(x)`, or `count(DISTINCT x)` of integers | Incremental | Full |
 
 - **Joins.** Rows appended to a joined table add the rows they join to;
