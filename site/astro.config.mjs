@@ -4,7 +4,7 @@ import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
 import { sourceFiles, syncDocs } from './scripts/sync-docs.mjs';
 import { REPO_URL, sidebar } from './src/docs-manifest.mjs';
-import { NOINDEX_META, SITE_PUBLIC, SITE_URL } from './src/site-config.mjs';
+import { NOINDEX_META, SHARE, SHARE_HEAD, SITE_PUBLIC, SITE_URL } from './src/site-config.mjs';
 
 /**
  * In `astro dev`, sync again when a repository file the site is built from
@@ -48,13 +48,13 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'Igloo',
-			description: 'Open source SQL warehouse on Apache Iceberg',
+			description: SHARE.description,
 			logo: { light: './src/assets/logo-black.svg', dark: './src/assets/logo.svg' },
 			favicon: '/favicon.svg',
 			social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
 			sidebar,
 			customCss: ['@fontsource-variable/inter/opsz.css', './src/styles/theme.css'],
-			head: SITE_PUBLIC ? [] : [NOINDEX_META],
+			head: SITE_PUBLIC ? SHARE_HEAD : [...SHARE_HEAD, NOINDEX_META],
 			tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
 			// src/pages/404.astro instead.
 			disable404Route: true,

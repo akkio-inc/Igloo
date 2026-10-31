@@ -14,12 +14,26 @@ import Pillars from '../components/landing/Pillars.astro';
 import QuickStart from '../components/landing/QuickStart.astro';
 import Migrate from '../components/landing/Migrate.astro';
 import Screens from '../components/landing/Screens.astro';
-import { SITE_PUBLIC } from '../site-config.mjs';
+import { SHARE, SITE_PUBLIC, siteUrl } from '../site-config.mjs';
 
-const title = 'Igloo: open source SQL warehouse on Apache Iceberg';
-const description =
-	'Igloo is an open-source SQL data warehouse that runs in your own cloud account or on your own hardware: PostgreSQL wire protocol, DuckDB, Apache Iceberg.';
+const { title, description, imageAlt } = SHARE;
+const image = siteUrl(SHARE.image);
 const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : undefined;
+// Structured data, so search results can describe Igloo as free, open source software.
+const jsonLd = {
+	'@context': 'https://schema.org',
+	'@type': 'SoftwareApplication',
+	name: 'Igloo',
+	description,
+	applicationCategory: 'DeveloperApplication',
+	applicationSubCategory: 'SQL data warehouse',
+	operatingSystem: 'Linux, macOS, Windows, Kubernetes',
+	license: 'https://www.apache.org/licenses/LICENSE-2.0',
+	isAccessibleForFree: true,
+	offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+	image,
+	...(canonical ? { url: canonical } : {}),
+};
 ---
 
 <!doctype html>
@@ -32,10 +46,25 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 		{!SITE_PUBLIC && <meta name="robots" content="noindex, nofollow" />}
 		{canonical && <link rel="canonical" href={canonical} />}
 		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<link rel="manifest" href="/site.webmanifest" />
+		<meta name="theme-color" content="#08090d" />
 		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Igloo" />
+		<meta property="og:locale" content="en_US" />
+		{canonical && <meta property="og:url" content={canonical} />}
 		<meta property="og:title" content={title} />
 		<meta property="og:description" content={description} />
-		<meta name="theme-color" content="#08090d" />
+		<meta property="og:image" content={image} />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:image:alt" content={imageAlt} />
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:title" content={title} />
+		<meta name="twitter:description" content={description} />
+		<meta name="twitter:image" content={image} />
+		<meta name="twitter:image:alt" content={imageAlt} />
+		<script type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
 	</head>
 	<body>
 		<a class="skip-link" href="#main">Skip to content</a>
