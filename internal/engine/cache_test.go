@@ -315,4 +315,20 @@ func TestCacheIdentity(t *testing.T) {
 	if id, _, save, err := (&Engine{}).CacheIdentity(); err != nil || save != nil || !strings.HasPrefix(id, "memory:") {
 		t.Errorf("without a cache on disk: %q %v %v", id, save != nil, err)
 	}
+
+	// On a volume that goes with the pod: an ID of that kind, kept across
+	// restarts in the pod.
+	cfg := s3Config(t.TempDir())
+	cfg.Cache.Ephemeral = true
+	pod := &Engine{}
+	if err := pod.setupCache((&recorder{}).exec, cfg, log); err != nil {
+		t.Fatal(err)
+	}
+	podID, podToken, _, err := pod.CacheIdentity()
+	if err != nil || !strings.HasPrefix(podID, "pod:") {
+		t.Fatalf("on a volume that goes with the pod: %q %v", podID, err)
+	}
+	if again, againToken, _, err := pod.CacheIdentity(); err != nil || again != podID || againToken != podToken {
+		t.Errorf("restarted in its pod: %q %q, want %q %q (%v)", again, againToken, podID, podToken, err)
+	}
 }

@@ -143,6 +143,10 @@ const cacheIDFile = "cache-id"
 // are new each time. save writes a new ID and token there. The purger,
 // not the machine, tells copies of a disk apart (see erasure.Purger).
 // Without a cache on disk, the ID is the process's own and save is nil.
+// The ID of a cache on a volume that goes with the pod (IGLOO_CACHE_EPHEMERAL)
+// starts erasure.PodCache, so requests count it gone once the replica is;
+// a file with an ID of the other kind was written under the other setting,
+// and the cache is emptied and gets a new ID of this one.
 //
 // A file of the format before tokens, "disk:<id> <machine>", keeps its ID
 // on the machine it names, with a new token; on another machine the cache
@@ -168,11 +172,15 @@ func (e *Engine) CacheIdentity() (id, token string, save func(id, token string) 
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", "", nil, err
 	}
+	kind := "disk:"
+	if e.cache.ephemeral {
+		kind = erasure.PodCache
+	}
 	fields := strings.Fields(string(saved))
 	switch {
-	case len(fields) == 2 && strings.HasPrefix(fields[0], "disk:") && strings.HasPrefix(fields[1], "t:"):
+	case len(fields) == 2 && strings.HasPrefix(fields[0], kind) && strings.HasPrefix(fields[1], "t:"):
 		return fields[0], fields[1], save, nil
-	case len(fields) == 2 && strings.HasPrefix(fields[0], "disk:") && fields[1] == machineID():
+	case len(fields) == 2 && kind == "disk:" && strings.HasPrefix(fields[0], "disk:") && fields[1] == machineID():
 		// Before tokens, on the machine that made it.
 		token = "t:" + random
 		return fields[0], token, save, save(fields[0], token)
@@ -187,7 +195,7 @@ func (e *Engine) CacheIdentity() (id, token string, save func(id, token string) 
 	if _, err := rand.Read(t[:]); err != nil {
 		return "", "", nil, err
 	}
-	id, token = "disk:"+random, "t:"+hex.EncodeToString(t[:])
+	id, token = kind+random, "t:"+hex.EncodeToString(t[:])
 	return id, token, save, save(id, token)
 }
 

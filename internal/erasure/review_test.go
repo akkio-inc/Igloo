@@ -854,6 +854,30 @@ func TestCachesAreEmptied(t *testing.T) {
 	if _, _, waiting, _ := svc.caches(ctx, r); !slices.Equal(waiting, []string{"replica-b"}) {
 		t.Errorf("waiting: %v", waiting)
 	}
+	// Gone, a replica whose disk stays is pending, and one whose disk went
+	// with its pod is not; running, both are waited for.
+	for _, id := range []string{"disk:c", "pod:c"} {
+		if err := store.Seen(ctx, id, "replica-"+id, time.Now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, pending, waiting, _ := svc.caches(ctx, r); pending != 1 || !slices.Equal(waiting, []string{"replica-b"}) {
+		t.Errorf("gone: pending %d, waiting %v", pending, waiting)
+	}
+	if err := store.Seen(ctx, "pod:c", "replica-pod:c", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, waiting, _ := svc.caches(ctx, r); !slices.Equal(waiting, []string{"replica-b", "replica-pod:c"}) {
+		t.Errorf("running: waiting %v", waiting)
+	}
+	// A cache that goes with its pod, made again with a new ID, keeps
+	// its kind.
+	podCache := &readCache{}
+	pod := NewPurger(store, podCache, "pod:d", "replica-d", slog.New(slog.DiscardHandler))
+	pod.OnDisk("t:d", func(string, string) error { return nil })
+	if err := pod.rekey(ctx); err != nil || !strings.HasPrefix(pod.ID(), "pod:") || pod.ID() == "pod:d" {
+		t.Errorf("made again: %q %v", pod.ID(), err)
+	}
 }
 
 // A column that names the person in someone else's row is set to NULL

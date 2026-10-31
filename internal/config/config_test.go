@@ -147,11 +147,15 @@ func TestCache(t *testing.T) {
 	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "0"}); err != nil || c.Dir != "" {
 		t.Errorf("0 should turn the cache off: %+v, %v", c, err)
 	}
+	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_EPHEMERAL": "true"}); err != nil || !c.Ephemeral {
+		t.Errorf("a cache that goes with its pod: %+v, %v", c, err)
+	}
 	for _, bad := range []map[string]string{
 		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "lots"},
 		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "-1GB"},
 		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "0.1"},
 		{"IGLOO_CACHE_DIR": "relative/cache"},
+		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_EPHEMERAL": "sometimes"},
 	} {
 		if _, err := load(bad); err == nil {
 			t.Errorf("%v accepted", bad)

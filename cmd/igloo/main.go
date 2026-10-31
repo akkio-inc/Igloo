@@ -1019,11 +1019,25 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 		return nil, nil, fmt.Errorf("read cache ID: %w", err)
 	}
 	host, _ := os.Hostname()
-	purger := erasure.NewPurger(store, eng, cacheID, host, log)
+	purger := erasure.NewPurger(store, heldCache{eng}, cacheID, host, log)
 	if save != nil {
 		purger.OnDisk(token, save)
 	}
 	return store, purger, nil
+}
+
+// heldCache empties the replica's read cache while the prefetcher writes
+// nothing into it, as a worker's purge does: a block fetched before an
+// erasure request's purge, which may hold what the request deleted, must
+// not land after it.
+type heldCache struct{ eng *engine.Engine }
+
+func (h heldCache) EmptyCache(ctx context.Context) error {
+	p := h.eng.Prefetcher()
+	if p == nil {
+		return h.eng.EmptyCache(ctx)
+	}
+	return p.Hold(func() error { return h.eng.EmptyCache(ctx) })
 }
 
 // newEraser sets up erasure requests. They redact the query history and

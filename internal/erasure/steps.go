@@ -2280,8 +2280,8 @@ func (s *Service) cache(ctx context.Context, r *Request) error {
 }
 
 // caches counts the caches emptied since r deleted files, and those of
-// replicas not running now, which will be when they start, and names the
-// running replicas that have yet to.
+// replicas not running now whose disks stay, which will be when they
+// start, and names the running replicas that have yet to.
 func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int, waiting []string, err error) {
 	if r.DeletedThrough.IsZero() {
 		return 0, 0, nil, nil
@@ -2311,6 +2311,8 @@ func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int,
 		case worker:
 			// Not pending: one whose cache outlives it is left (see
 			// workersLeft), and one whose cache goes with it holds nothing.
+		case strings.HasPrefix(c.ID, PodCache):
+			// Not pending either: its disk went with its pod.
 		case !strings.HasPrefix(c.ID, MemoryCache) && now.Sub(c.Seen) < staleCache:
 			pending++
 		}

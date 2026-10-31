@@ -66,6 +66,9 @@ type readCache struct {
 	dir string
 	// maxSize is IGLOO_CACHE_SIZE, or 0 to size the cache automatically.
 	maxSize uint64
+	// ephemeral is IGLOO_CACHE_EPHEMERAL: the cache's volume goes with the
+	// pod (see CacheIdentity).
+	ephemeral bool
 	// reserve is the free space the extension currently leaves on the disk,
 	// and on whether it caches at all. Once the cache is set up, only
 	// measureCache touches them.
@@ -99,7 +102,7 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 		log.Warn("read cache off: cannot measure its disk", "dir", dir, "err", err)
 		return nil
 	}
-	c := &readCache{dir: dir, maxSize: uint64(cfg.Cache.MaxSize)}
+	c := &readCache{dir: dir, maxSize: uint64(cfg.Cache.MaxSize), ephemeral: cfg.Cache.Ephemeral}
 	// Measuring what is already cached means listing every file, so it
 	// happens in the background once Igloo is up (see measure). Until then
 	// the cache counts as empty.

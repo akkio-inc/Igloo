@@ -584,11 +584,16 @@ person by tagged columns and the identifiers as written. It leaves:
   `files_outside_warehouse` and logs their paths, for whoever keeps them to
   delete.
 - **A stopped replica's read cache.** A request waits for every running
-  replica to empty its read cache of what it deleted. A replica that is
-  not running then empties its disk cache when it next starts; until
-  then, its volume holds blocks of the deleted files. The request counts
-  it in `caches_pending`, for 30 days after the replica was last seen.
-  Delete the cache volume of a replica that will not come back.
+  replica to empty its read cache of what it deleted, the blocks prefetch
+  read ahead into it included. A replica that is not running then empties
+  its disk cache when it next starts; until then, its volume holds blocks
+  of the deleted files. The request counts it in `caches_pending`, for 30
+  days after the replica was last seen. Delete the cache volume of a
+  replica that will not come back. A cache on a volume that goes with its
+  pod (`IGLOO_CACHE_EPHEMERAL`: the Helm chart's `emptyDir` or ephemeral
+  volume, not its `persistentVolumeClaim`) is not counted: once the pod is
+  gone, so is the volume. A container restarted in its pod keeps the
+  volume, and empties it when it starts.
 - **The warehouse is Igloo's.** Files someone puts under the warehouse's
   location, outside every table's and view's, as a writer can with `COPY
   ... TO`, are deleted by the next request once they are 3 days old (see
