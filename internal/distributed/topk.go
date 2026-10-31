@@ -30,9 +30,13 @@ import (
 // QUALIFY (see qualifyTopK).
 
 // topKMark marks an aggregation's SELECT with the condition its rows must
-// meet to reach a statement that ranks them (see markTopK). It never
-// reaches SQL: print removes it.
-const topKMark = "__igloo_topk"
+// meet to reach a statement that ranks them (see markTopK); rankedMark
+// marks that statement's ranking SELECT. Neither reaches SQL: print
+// removes them.
+const (
+	topKMark   = "__igloo_topk"
+	rankedMark = "__igloo_ranked"
+)
 
 // maxTopKDepth bounds the projections markTopK follows down to an
 // aggregation.
@@ -97,7 +101,11 @@ func (pl *planner) markConsumer(s node, readOnce func(node) node) {
 	}
 	for _, c := range conjuncts(child(s, "where_clause")) {
 		if keep := pl.rankedKeep(c, names, items); keep != nil {
-			pl.markRows(readOnce(child(r, "from_table")), keep, readOnce, 0)
+			if pl.markRows(readOnce(child(r, "from_table")), keep, readOnce, 0) {
+				// The rows it ranks are cut to the first k: its windows run
+				// where the rows come to, as before (see windowColumns).
+				r[rankedMark] = true
+			}
 			return
 		}
 	}
@@ -370,15 +378,16 @@ func substituteColumns(e node, names []string, items []any, noWindows bool) (nod
 
 // markRows marks the aggregations whose rows make up query q with keep, a
 // condition over q's columns as names in its select list: q itself, the
-// branches of a UNION ALL, or what a projection reads.
-func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth int) {
+// branches of a UNION ALL, or what a projection reads. It reports whether
+// it marked every one of them.
+func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth int) bool {
 	if q == nil || depth > maxTopKDepth {
-		return
+		return false
 	}
 	switch str(q["type"]) {
 	case "SET_OPERATION_NODE":
 		if str(q["setop_type"]) != "UNION" || q["setop_all"] != true || len(list(q, "modifiers")) > 0 {
-			return
+			return false
 		}
 		// The union's columns are named as its first branch's.
 		first := q
@@ -387,7 +396,7 @@ func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth i
 		}
 		names, _ := pl.selectItems(first, readOnce, 0)
 		if names == nil {
-			return
+			return false
 		}
 		var branches func(n node) []node
 		branches = func(n node) []node {
@@ -396,24 +405,27 @@ func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth i
 			}
 			return []node{n}
 		}
+		all := true
 		for _, b := range branches(q) {
 			_, items := pl.selectItems(b, readOnce, 0)
 			if str(b["type"]) != "SELECT_NODE" || len(items) != len(names) {
+				all = false
 				continue
 			}
-			if k, ok := substituteColumns(byPosition(keep, names), positions(len(names)), items, false); ok {
-				pl.markSelect(b, k, readOnce, depth+1)
-			}
+			k, ok := substituteColumns(byPosition(keep, names), positions(len(names)), items, false)
+			all = ok && pl.markSelect(b, k, readOnce, depth+1) && all
 		}
+		return all
 	case "SELECT_NODE":
 		names, items := pl.selectItems(q, readOnce, 0)
 		if len(names) != len(items) {
-			return
+			return false
 		}
 		if k, ok := substituteColumns(keep, names, items, false); ok {
-			pl.markSelect(q, k, readOnce, depth+1)
+			return pl.markSelect(q, k, readOnce, depth+1)
 		}
 	}
+	return false
 }
 
 // selectItems returns the names of a SELECT's result columns and the items
@@ -455,18 +467,19 @@ func (pl *planner) selectItems(q node, readOnce func(node) node, depth int) ([]s
 
 // markSelect marks q, a SELECT, with keep, a condition over its FROM's
 // columns: if q aggregates, q itself; if it only projects what a relation
-// read once computes, that relation's aggregations.
-func (pl *planner) markSelect(q, keep node, readOnce func(node) node, depth int) {
+// read once computes, that relation's aggregations. It reports whether it
+// marked every one.
+func (pl *planner) markSelect(q, keep node, readOnce func(node) node, depth int) bool {
 	if projectionOnly(q) && !pl.hasAggregate(q["select_list"]) {
-		pl.markRows(readOnce(child(q, "from_table")), keep, readOnce, depth+1)
-		return
+		return pl.markRows(readOnce(child(q, "from_table")), keep, readOnce, depth+1)
 	}
 	if str(q["type"]) != "SELECT_NODE" || child(q, "qualify") != nil || len(list(q, "modifiers")) > 0 || len(list(q, "group_sets")) > 1 ||
 		str(q["aggregate_handling"]) != "STANDARD_HANDLING" ||
 		len(list(q, "group_expressions")) == 0 && !pl.hasAggregate(q["select_list"]) {
-		return
+		return false
 	}
 	q[topKMark] = keep
+	return true
 }
 
 // positions names columns by their positions, for byPosition.
@@ -614,9 +627,9 @@ func overStage(e node) bool {
 func stripTopK(n node) node {
 	marked := false
 	walk(n, func(m node) bool {
-		if _, ok := m[topKMark]; ok {
-			marked = true
-		}
+		_, top := m[topKMark]
+		_, ranked := m[rankedMark]
+		marked = marked || top || ranked
 		return !marked
 	})
 	if !marked {
@@ -625,6 +638,7 @@ func stripTopK(n node) node {
 	c := clone(n).(node)
 	walk(c, func(m node) bool {
 		delete(m, topKMark)
+		delete(m, rankedMark)
 		return true
 	})
 	return c

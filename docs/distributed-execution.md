@@ -166,8 +166,9 @@ In detail, a part runs distributed when:
   It may also read relations workers compute: common table expressions
   and subqueries in `FROM` that are themselves such `SELECT`s, with
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
-  functions but aggregates over all their rows (`min(day) OVER ()`), or a
-  `UNION ALL` of them.
+  functions but aggregates over all their rows (`min(day) OVER ()`) or
+  windows that all partition their rows by the same columns (see
+  [window functions](#window-functions)), or a `UNION ALL` of them.
 - Its aggregates are `count`, `sum`, `min`, `max`, `avg`, `count_if`,
   `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `any_value`,
   `fsum`, `product`, and `list` and `array_agg` (whose order, without
@@ -219,7 +220,7 @@ not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
 partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
-window functions over rows, a large table read again in a correlated
+window functions over rows but those of the next section, a large table read again in a correlated
 subquery expression (`EXISTS`, a scalar subquery: TPC-H Q17, Q20, Q21),
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
@@ -242,6 +243,30 @@ for its columns of ids alone: statements read it without them, and
 workers run them as they run any other. Igloo's own text names those
 columns where it counts through ids. A member table with a policy of its
 own stays on the replica.
+
+### Window functions
+
+A `SELECT` that does not aggregate, and whose window functions all
+partition their rows by the same columns, runs on workers with its rows
+partitioned by those columns, so that each worker holds whole partitions
+of the windows and computes them as one machine would, frames, `lag` and
+running sums included:
+
+```sql
+-- each device's latest impression
+SELECT device_id, ts, campaign_id FROM impressions
+QUALIFY row_number() OVER (PARTITION BY device_id ORDER BY ts DESC) = 1;
+```
+
+The coordinator receives the rows the windows keep: those the statement's
+`QUALIFY` keeps, or a later `SELECT`'s `WHERE` (`WITH ranked AS (SELECT
+..., rank() OVER (PARTITION BY ...) AS r FROM ...) SELECT ... FROM ranked
+WHERE r <= 3`), which workers apply too; one that keeps every row runs on
+one machine, as rows without `DISTINCT` or a top-N do. The windows may
+partition by a column the statement's large tables are joined on. Windows
+over all rows (no `PARTITION BY`), of different partitions in one `SELECT`,
+or that rank an aggregation's groups the stages keep only the first of
+(see above) run where the rows arrive, on the coordinator.
 
 ### When
 

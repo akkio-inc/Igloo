@@ -1868,7 +1868,7 @@ func (pl *planner) cast(e node, typ string) (node, error) {
 // clause, DISTINCT, or ORDER BY with LIMIT.
 func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	sel := c.sel
-	if hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil {
+	if (hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil || hasClass(sel["modifiers"], "WINDOW")) && c.window == nil {
 		return nil, unsupported("window functions over rows")
 	}
 	var order, limit, distinct node
@@ -1885,7 +1885,13 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	if limit != nil && order == nil {
 		return nil, unsupported("LIMIT without ORDER BY, which one machine answers fastest")
 	}
-	if distinct == nil && limit == nil {
+	// Rows that workers compute anyway, a relation's, cross to the
+	// coordinator fewer for its filters; so do those of windows workers
+	// compute, for its QUALIFY, rather than every row for the coordinator to
+	// compute them over.
+	filtersRelation := child(sel, "where_clause") != nil && slices.ContainsFunc(c.keyed, func(k *keyed) bool { return k.rel != nil })
+	qualifies := c.window != nil && child(sel, "qualify") != nil
+	if distinct == nil && limit == nil && !qualifies && !filtersRelation {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
 		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())

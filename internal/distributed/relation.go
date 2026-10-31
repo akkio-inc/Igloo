@@ -825,10 +825,14 @@ func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column,
 	case "SELECT_NODE":
 		if hasClass(q["select_list"], "WINDOW") {
 			outer, sc, err := pl.overAll(q, scope)
-			if err != nil {
+			if err == nil {
+				return pl.produceSelect(outer, sc, out, cols, wraps)
+			}
+			if !partitionedWindows(q) {
 				return err
 			}
-			return pl.produceSelect(outer, sc, out, cols, wraps)
+			// Windows over partitions, which its stage computes from its
+			// inputs read by partition (see windowColumns).
 		}
 		return pl.produceSelect(q, scope, out, cols, wraps)
 	}
@@ -993,8 +997,9 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 			return unsupported("%s in a relation", strings.ToLower(t))
 		}
 	}
-	if child(sel, "qualify") != nil || hasClass(sel["select_list"], "WINDOW") {
-		return unsupported("window functions in a relation")
+	windowed := child(sel, "qualify") != nil || hasClass(sel["select_list"], "WINDOW")
+	if windowed && (len(list(sel, "modifiers")) > 0 || len(list(sel, "group_expressions")) > 0 || pl.hasAggregate(sel["select_list"])) {
+		return unsupported("window functions in a relation that groups")
 	}
 	work, err := pl.distinctAsGroups(sel)
 	if err != nil {
@@ -1004,6 +1009,14 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 	if err := pl.analyze(c, scope); err != nil {
 		return err
 	}
+	if windowed {
+		if err := pl.windowColumns(c); err != nil {
+			return err
+		}
+		if c.window == nil {
+			return unsupported("window functions in a relation")
+		}
+	}
 	if c.columns, err = pl.describe(work, scope); err != nil {
 		return err
 	}
@@ -1011,6 +1024,9 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 		return unsupported("a relation's branches have %d and %d columns", len(c.columns), len(cols))
 	}
 	if err := pl.chooseInputs(c); err != nil {
+		return err
+	}
+	if err := c.checkWindows(); err != nil {
 		return err
 	}
 	defer unmark(c)

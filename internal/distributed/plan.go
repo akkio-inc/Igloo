@@ -655,6 +655,11 @@ type candidate struct {
 	// columns the relation is to be written by.
 	relation bool
 	want     []string
+	// window, if set, are the columns that the window functions of a
+	// candidate that does not aggregate all partition their rows by: its
+	// stage reads its inputs by partition, keyed so that each task holds
+	// whole partitions of the windows (see windowColumns).
+	window []itemColumn
 }
 
 // job turns sel into a job if it qualifies and returns the combine step
@@ -695,7 +700,13 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	if err := pl.analyze(c, ctes); err != nil {
 		return nil, nil, err
 	}
+	if err := pl.windowColumns(c); err != nil {
+		return nil, nil, err
+	}
 	if err := pl.chooseInputs(c); err != nil {
+		return nil, nil, err
+	}
+	if err := c.checkWindows(); err != nil {
 		return nil, nil, err
 	}
 	var err error
@@ -718,7 +729,9 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	switch {
 	case c.aggregating(pl):
 		b, err = pl.aggregateJob(c)
-	case top:
+	case top || c.window != nil:
+		// A subquery whose windows workers compute: the coordinator reads
+		// the rows it keeps.
 		b, err = pl.rowsJob(c)
 	default:
 		err = unsupported("a subquery without aggregation reads %s", c.largest())
@@ -1771,6 +1784,11 @@ func (pl *planner) chooseInputs(c *candidate) error {
 	c.whole, c.wholeBytes = c.rels, 0
 	for _, r := range c.rels {
 		c.wholeBytes += r.bytes
+	}
+	if c.window != nil {
+		// Each task holds whole partitions of the windows: its inputs are
+		// read by partition, keyed by the windows' columns.
+		return pl.chooseKeyed(c)
 	}
 	if c.wholeBytes == 0 || c.wholeBytes <= pl.opts.maxBroadcast {
 		err := pl.chooseSplit(c)

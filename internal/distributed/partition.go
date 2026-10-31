@@ -265,8 +265,23 @@ func (pl *planner) keyInputs(c *candidate) error {
 		rest += u.table.Bytes
 		largest = max(largest, u.table.Bytes)
 	}
+	// The tables whose columns the windows partition by are read by
+	// partition whatever their size, so that each task holds whole
+	// partitions of them.
+	windowed := func(u *tableUse) bool {
+		return slices.ContainsFunc(c.window, func(ic itemColumn) bool { return ic.item == u.item })
+	}
+	slices.SortStableFunc(uses, func(a, b *tableUse) int {
+		switch wa, wb := windowed(a), windowed(b); {
+		case wa && !wb:
+			return -1
+		case wb && !wa:
+			return 1
+		}
+		return 0
+	})
 	for _, u := range uses {
-		if rest <= pl.opts.maxBroadcast && (len(c.keyed) > 0 || u.table.Bytes < pl.opts.minBytes) {
+		if rest <= pl.opts.maxBroadcast && (len(c.keyed) > 0 || u.table.Bytes < pl.opts.minBytes) && !windowed(u) {
 			break
 		}
 		if !(u.splittable || u.semi) || !inScope(u.scope) {
@@ -301,6 +316,19 @@ func (pl *planner) keyInputs(c *candidate) error {
 		}
 	} else {
 		keys = joinKeys(c.keyScope)
+		if c.window != nil {
+			// Keyed by the join's columns that the windows partition by
+			// alone, so that each task holds whole partitions of them.
+			var by [][]itemColumn
+			for _, class := range keys {
+				if slices.ContainsFunc(class, func(ic itemColumn) bool { return slices.Contains(c.window, ic) }) {
+					by = append(by, class)
+				}
+			}
+			if len(by) > 0 {
+				keys = by
+			}
+		}
 	}
 	for _, class := range keys {
 		var cols []itemColumn
@@ -399,6 +427,10 @@ func joinKeys(sc *scope) [][]itemColumn {
 // group columns, which partitions then keep whole; the columns it is asked
 // to be written by; or its first column.
 func (pl *planner) preferredKeys(c *candidate, k *keyed) []string {
+	if names := windowKeys(c, k); names != nil {
+		// Whole partitions of its windows.
+		return names
+	}
 	if k.rel != nil && k.rel.def != nil && k.rel.def.first != nil {
 		var names []string
 		for _, key := range k.rel.def.first.Keys {
