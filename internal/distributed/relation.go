@@ -163,8 +163,8 @@ type relUse struct {
 	// query says ref is a subquery expression's query, which every task
 	// reads in full.
 	query bool
-	// semi is as for tables.
-	semi bool
+	// semi and outer are as for tables.
+	semi, outer bool
 	// key identifies the relation across plans of the statement (see
 	// relationKey); known says its size was measured, and rows are the
 	// rows it was measured at.

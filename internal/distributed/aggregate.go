@@ -993,6 +993,11 @@ func (c *candidate) fixesKey(fixed []itemColumn) bool {
 		}
 	}
 	for _, k := range c.keyed {
+		if k.nullable {
+			// Its key is NULL for the rows its join matched to none of
+			// it, in every partition.
+			continue
+		}
 		all := true
 		for _, key := range k.keys {
 			if !slices.Contains(fixed, itemColumn{k.item, key}) {

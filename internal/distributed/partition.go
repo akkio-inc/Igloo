@@ -42,6 +42,10 @@ type keyed struct {
 	// by its bucketing bucket, of its key column (see bucket.go).
 	bucketed bool
 	bucket   int
+	// nullable says it supplies NULLs to an outer join (see outer.go): its
+	// key keeps no group or partition whole, and the statement's filters on
+	// it alone do not apply before the join.
+	nullable bool
 }
 
 func (k *keyed) String() string {
@@ -145,7 +149,7 @@ func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
 	key := pl.relationKey(q, c.ctes)
 	bytes, rows, known := pl.measured(key, bytes, cols)
 	c.rels = append(c.rels, &relUse{ref: sc.ref, q: q, scope: c.ctes, columns: cols, bytes: bytes, splittable: sc.splittable,
-		sc: top, item: sc.item, key: key, known: known, rows: rows})
+		outer: sc.outerSide, sc: top, item: sc.item, key: key, known: known, rows: rows})
 	return nil
 }
 
@@ -257,7 +261,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 			c.whole = append(c.whole, r)
 			continue
 		}
-		if !(r.splittable || r.semi) || !inScope(r.sc) {
+		if !(r.splittable || r.semi || r.outer) || !inScope(r.sc) {
 			return unsupported("%s is read where its rows cannot be divided", r.item.name)
 		}
 		c.keyed = append(c.keyed, &keyed{rel: r, item: r.item})
@@ -288,8 +292,8 @@ func (pl *planner) keyInputs(c *candidate) error {
 		if rest <= pl.opts.maxBroadcast && (len(c.keyed) > 0 || u.table.Bytes < pl.opts.minBytes) && !windowed(u) {
 			break
 		}
-		if !(u.splittable || u.semi) || !inScope(u.scope) {
-			if u.splittable && u.scope != nil && u.scope.ref != nil {
+		if !(u.splittable || u.semi || u.outer) || !inScope(u.scope) {
+			if (u.splittable || u.outerSub) && u.scope != nil && u.scope.ref != nil {
 				c.tooDeep = u
 			}
 			return unsupported("%s, too large for every worker to read, is read where its rows cannot be divided", u.table)
@@ -299,6 +303,9 @@ func (pl *planner) keyInputs(c *candidate) error {
 		}
 		c.keyed = append(c.keyed, &keyed{use: u, item: u.item})
 		rest -= u.table.Bytes
+	}
+	if err := pl.outerPairs(c); err != nil {
+		return err
 	}
 	if !pl.opts.force && !c.relation && largest < pl.opts.minBytes {
 		return unsupported("its inputs are small (%d bytes)", largest)
@@ -319,7 +326,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 			keys = append(keys, []itemColumn{{k.item, name}})
 		}
 	} else {
-		keys = joinKeys(c.keyScope)
+		keys = joinKeysWith(c.keyScope, outerConds(c.keyScope))
 		if c.window != nil {
 			// Keyed by the join's columns that the windows partition by
 			// alone, so that each task holds whole partitions of them.
@@ -367,6 +374,9 @@ func (pl *planner) keyInputs(c *candidate) error {
 			names[i] = k.String()
 		}
 		return unsupported("%s, too large to read in full, are not joined on equal columns", strings.Join(names, " and "))
+	}
+	if err := c.checkOuterKeys(); err != nil {
+		return err
 	}
 	pl.bucketKeyed(c)
 	return nil
@@ -518,24 +528,15 @@ func equalityClasses(pairs [][2]itemColumn) [][]itemColumn {
 // that its inner joins and WHERE clause make equal (a.x = b.y), in the
 // order they appear.
 func joinKeys(sc *scope) [][]itemColumn {
-	parent := map[itemColumn]itemColumn{}
-	var order []itemColumn
-	var find func(x itemColumn) itemColumn
-	find = func(x itemColumn) itemColumn {
-		p, ok := parent[x]
-		if !ok {
-			parent[x] = x
-			order = append(order, x)
-			return x
-		}
-		if p == x {
-			return x
-		}
-		r := find(p)
-		parent[x] = r
-		return r
-	}
-	for _, cond := range append(slices.Clone(sc.conds), sc.semiConds...) {
+	return joinKeysWith(sc, nil)
+}
+
+// joinKeysWith is joinKeys with the equalities of extra too, the
+// conditions of outer joins whose sides are read by partition alike (see
+// outer.go), which hold for every pair of rows they match.
+func joinKeysWith(sc *scope, extra []node) [][]itemColumn {
+	var pairs [][2]itemColumn
+	for _, cond := range slices.Concat(sc.conds, sc.semiConds, extra) {
 		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" {
 			continue
 		}
@@ -547,28 +548,17 @@ func joinKeys(sc *scope) [][]itemColumn {
 		if li == nil || ri == nil {
 			continue
 		}
-		a, b := find(itemColumn{li, strings.ToLower(lastName(l))}), find(itemColumn{ri, strings.ToLower(lastName(r))})
-		if a != b {
-			parent[b] = a
-		}
+		pairs = append(pairs, [2]itemColumn{{li, strings.ToLower(lastName(l))}, {ri, strings.ToLower(lastName(r))}})
 	}
-	var classes [][]itemColumn
-	index := map[itemColumn]int{}
-	for _, x := range order {
-		root := find(x)
-		i, ok := index[root]
-		if !ok {
-			i = len(classes)
-			index[root] = i
-			classes = append(classes, nil)
-		}
-		classes[i] = append(classes[i], x)
-	}
-	var out [][]itemColumn
-	for _, cl := range classes {
-		if len(cl) > 1 {
-			out = append(out, cl)
-		}
+	return equalityClasses(pairs)
+}
+
+// outerConds are the conjuncts of the conditions of sc's outer joins of
+// one item to another (see outer.go).
+func outerConds(sc *scope) []node {
+	var out []node
+	for _, oj := range sc.outerJoins {
+		out = append(out, oj.cond...)
 	}
 	return out
 }
@@ -762,10 +752,13 @@ func (pl *planner) sides(c *candidate) error {
 		if err != nil {
 			return err
 		}
-		// The statement's filters on this table alone, so less crosses.
+		// The statement's filters on this table alone, so less crosses; but
+		// not on one that supplies an outer join's NULLs, whose filters
+		// hold after the join (WHERE b.x IS NULL keeps the rows it
+		// matched to none of b).
 		var filters []any
 		for _, cond := range u.scope.conds {
-			if onlyColumnsOf(cond, u.item, u.scope) {
+			if onlyColumnsOf(cond, u.item, u.scope) && !k.nullable {
 				filters = append(filters, clone(cond))
 			}
 		}

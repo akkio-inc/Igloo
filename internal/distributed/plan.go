@@ -831,6 +831,10 @@ type scope struct {
 	// semiConds are the conjuncts of its semi joins' conditions, which hold
 	// for every pair of rows a semi join matches.
 	semiConds []node
+	// outerJoins are its LEFT, RIGHT and FULL joins of one item to another,
+	// whose sides may be read by partition by a key its condition makes
+	// equal (see outer.go).
+	outerJoins []*outerJoin
 	// For the FROM clause of a subquery that passes its rows through: the
 	// subquery's reference, the FROM clause it is in, its item there, and
 	// whether its rows may be divided among workers.
@@ -838,6 +842,9 @@ type scope struct {
 	outer      *scope
 	item       *fromItem
 	splittable bool
+	// outerSide says the subquery is a side of an outer join that may be
+	// read by partition: as a relation, for that (see outer.go).
+	outerSide bool
 }
 
 // fromItem is a table or subquery in a FROM clause.
@@ -867,6 +874,11 @@ type tableUse struct {
 	// semi says it is on the right side of a semi join that keeps the
 	// candidate's rows whole: it may be partitioned by the join's key.
 	semi bool
+	// outer says it is the side of an outer join that supplies NULLs, or a
+	// side of a FULL join: it may be partitioned by the join's key, with
+	// the other side partitioned alike (see outer.go). outerSub says it is
+	// in a subquery that is such a side, which is then a relation.
+	outer, outerSub bool
 }
 
 // hasColumn reports whether some item of sc has a column called name
@@ -1177,12 +1189,16 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if err != nil {
 			return err
 		}
+		uses0, rels0 := len(rd.uses), len(rd.rels)
 		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, rd); err != nil {
 			return err
 		}
 		uses, rels := len(rd.uses), len(rd.rels)
 		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, rd); err != nil {
 			return err
+		}
+		if splittable {
+			sc.addOuterJoin(ref, rd, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
 		}
 		switch {
 		case str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF":
@@ -1592,7 +1608,9 @@ func joinSides(ref node) (left, right bool, err error) {
 		return true, false, nil
 	case "RIGHT":
 		return false, true, nil
-	case "OUTER":
+	case "OUTER", "FULL":
+		// Neither side's rows may be divided by shares; both may be read
+		// by partition, by a key the condition makes equal (see outer.go).
 		return false, false, nil
 	default:
 		return false, false, unsupported("%s join", strings.ToLower(jt))
@@ -1883,7 +1901,9 @@ func (pl *planner) chooseInputs(c *candidate) error {
 		if err == nil && c.split != nil && len(c.keyed) == 0 {
 			pl.bucketSplit(c)
 		}
-		if err == nil || c.wholeBytes == 0 || len(c.keyed) > 0 {
+		// A side of an outer join too large to read whole, which shares
+		// cannot divide, may be read by partition (see outer.go).
+		if err == nil || c.wholeBytes == 0 && !c.hasOuter() || len(c.keyed) > 0 {
 			return err
 		}
 	}

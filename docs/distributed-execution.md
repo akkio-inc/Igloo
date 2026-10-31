@@ -170,7 +170,15 @@ In detail, a part runs distributed when:
   table expression or a branch of `UNION`) whose `FROM` clause reads catalog
   tables, through inner, cross, `LEFT` (keeping the large table's rows),
   `SEMI`, `ANTI` and `ASOF` joins and subqueries that only filter and
-  compute columns. It may unnest its rows' values: `unnest`, `json_each`
+  compute columns. A `LEFT`, `RIGHT` or `FULL` join of one item to
+  another whose side that supplies `NULL`s (either side, for `FULL`) is
+  too large for every worker to read reads both sides by partition, by
+  the key its condition makes equal (`ON o.customer = c.id`): each row
+  meets its matches in its partition, and a row nothing matches is in one
+  partition only, which keeps it once. The statement's filters on the side
+  that supplies `NULL`s apply after the join, as they must (`WHERE o.id IS
+  NULL`), and its groups by that side's columns are completed together,
+  as its `NULL`s come from every partition. It may unnest its rows' values: `unnest`, `json_each`
   and `json_tree` of them, and lateral subqueries that read no table, which
   is what Snowflake's `FLATTEN` becomes (with `OUTER` and `RECURSIVE` too).
   It may join `range` and `generate_series` of integer literals, up to
