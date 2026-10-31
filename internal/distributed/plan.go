@@ -755,12 +755,15 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	switch {
 	case c.aggregating(pl):
 		b, err = pl.aggregateJob(c)
-	case top || c.window != nil:
-		// A subquery whose windows workers compute: the coordinator reads
-		// the rows it keeps.
-		b, err = pl.rowsJob(c)
 	default:
-		err = unsupported("a subquery without aggregation reads %s", c.largest())
+		// The statement, or a subquery or common table expression the
+		// coordinator reads: workers filter, project and compute windows,
+		// and the coordinator reads the rows they keep, where that cuts
+		// them (see rowsJob).
+		b, err = pl.rowsJob(c)
+		if err != nil && !top {
+			err = unsupported("a subquery without aggregation reads %s: %v", c.largest(), strings.TrimPrefix(err.Error(), "cannot distribute: "))
+		}
 	}
 	if err != nil {
 		return nil, nil, err
@@ -957,12 +960,57 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	} else {
 		parts = append(parts, sel["select_list"])
 	}
+	if !c.relation && c.aggregating(pl) {
+		// An aggregation's combine step runs on the coordinator, which
+		// computes there a scalar subquery that stands on its own, over the
+		// combined groups (see aggregation.rewrite).
+		if err := pl.combinedSubqueries([]any{sel["select_list"], sel["having"], sel["qualify"], sel["modifiers"]}, ctes); err != nil {
+			return err
+		}
+		parts = []any{sel["group_expressions"]}
+	}
 	for _, part := range parts {
 		if hasClass(part, "SUBQUERY") {
 			return unsupported("a subquery outside WHERE")
 		}
 	}
 	return checkLambdas(sel)
+}
+
+// combinedSubqueries checks that the subqueries in v, parts of an
+// aggregation the coordinator computes over the combined groups, are scalar
+// subqueries that stand on their own, which bind alone: one that reads the
+// aggregation's columns could not be computed over its groups. The
+// coordinator computes them from scratch, so they may read no more than it
+// reads in the time a statement must take to be worth workers.
+func (pl *planner) combinedSubqueries(v any, ctes cteScope) error {
+	limit := pl.opts.minBytes
+	if limit <= 0 {
+		limit = pl.opts.maxBroadcast
+	}
+	var err error
+	walk(v, func(n node) bool {
+		if err != nil || str(n["class"]) != "SUBQUERY" {
+			return err == nil
+		}
+		if str(n["subquery_type"]) != "SCALAR" {
+			err = unsupported("a subquery outside WHERE")
+			return false
+		}
+		q := subqueryNode(n)
+		if cols, cerr := pl.relationColumns(q, ctes, nil); cerr != nil || len(cols) != 1 {
+			err = unsupported("a scalar subquery outside WHERE that does not stand on its own")
+			return false
+		}
+		switch b, berr := pl.readBytes(q, ctes, 0); {
+		case berr != nil:
+			err = berr
+		case b > limit:
+			err = unsupported("a scalar subquery outside WHERE reads %s, more than the coordinator should read itself", gigabytes(b))
+		}
+		return false
+	})
+	return err
 }
 
 // scalarRelations makes the scalar subqueries in v, a select list computed

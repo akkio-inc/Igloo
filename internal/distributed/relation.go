@@ -511,6 +511,66 @@ func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
 	return total, err == nil, err
 }
 
+// readBytes is the size of the catalog tables q reads, through its
+// subqueries, common table expressions and views, each time it reads them:
+// what a machine that computes q alone reads.
+func (pl *planner) readBytes(q node, scope cteScope, depth int) (int64, error) {
+	if depth > maxViewDepth {
+		return 0, unsupported("common table expressions nest too deep")
+	}
+	var total int64
+	var err error
+	var visit func(v any, sc cteScope)
+	visit = func(v any, sc cteScope) {
+		walk(v, func(n node) bool {
+			if err != nil {
+				return false
+			}
+			if len(list(child(n, "cte_map"), "map")) > 0 {
+				// Its common table expressions count where they are read.
+				inner := sc.with(n)
+				for k, c := range n {
+					if k != "cte_map" {
+						visit(c, inner)
+					}
+				}
+				return false
+			}
+			if str(n["type"]) != "BASE_TABLE" {
+				return true
+			}
+			parts := tableParts(n)
+			if len(parts) == 1 {
+				if d := sc.find(parts[0]); d != nil {
+					var b int64
+					b, err = pl.readBytes(d.query(), d.scope, depth+1)
+					total += b
+					return false
+				}
+			}
+			t, terr := pl.table(parts)
+			if IsUnsupported(terr) {
+				b, ok, verr := pl.viewBytes(parts, 0)
+				if verr == nil && ok {
+					total += b
+					return false
+				}
+				if verr != nil {
+					terr = verr
+				}
+			}
+			if terr != nil {
+				err = terr
+				return false
+			}
+			total += t.Bytes
+			return false
+		})
+	}
+	visit(q, scope)
+	return total, err
+}
+
 // relation adds a relation that a FROM clause reads, ref, to sc and rd.
 func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittable bool, sc *scope, rd *reads) error {
 	if child(ref, "sample") != nil {

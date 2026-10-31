@@ -360,8 +360,9 @@ func TestLocal(t *testing.T) {
 		`SELECT * FROM lineitem LIMIT 5`,
 		`SELECT l_quantity FROM lineitem`,
 		// Rows without DISTINCT or a top-N would only cross the coordinator's
-		// disk on their way to the client.
-		`SELECT l_orderkey, l_comment FROM lineitem WHERE l_quantity = 50`,
+		// disk on their way to the client, unless the estimates take them
+		// to be few of the table's (see TestSelectiveRowsAndSubqueries).
+		`SELECT l_orderkey, l_comment FROM lineitem WHERE l_quantity > 1`,
 		`SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey`,
 		// Correlated: a large table read again per row.
 		`SELECT count(*) FROM lineitem l WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = l.l_partkey)`,

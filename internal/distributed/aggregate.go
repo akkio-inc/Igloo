@@ -542,6 +542,10 @@ func (a *aggregation) collect() error {
 	var err error
 	visit := func(v any) {
 		walk(v, func(n node) bool {
+			if str(n["class"]) == "SUBQUERY" {
+				// Its own aggregates, computed with it (see rewrite).
+				return false
+			}
 			if err != nil || !a.pl.isAggregate(n) {
 				return err == nil
 			}
@@ -1832,9 +1836,17 @@ func (a *aggregation) rewrite(e node, part string) (node, error) {
 			err = unsupported("column %s is neither grouped nor aggregated", strings.Join(parts, "."))
 			return nil, false
 		case "SUBQUERY", "LAMBDA", "PARAMETER":
-			if str(n["class"]) == "PARAMETER" {
+			switch str(n["class"]) {
+			case "PARAMETER":
 				// Parameters are bound when the combine step runs.
 				return n, true
+			case "SUBQUERY":
+				// A scalar subquery that stands on its own (see analyze),
+				// which the coordinator computes, its tables read at the
+				// workers' snapshots (see pinReads).
+				if !a.c.relation {
+					return n, true
+				}
 			}
 			err = unsupported("%s outside WHERE", strings.ToLower(str(n["class"])))
 			return nil, false
@@ -1942,7 +1954,12 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	// compute them over.
 	filtersRelation := child(sel, "where_clause") != nil && slices.ContainsFunc(c.keyed, func(k *keyed) bool { return k.rel != nil })
 	qualifies := c.window != nil && child(sel, "qualify") != nil
-	if distinct == nil && limit == nil && !qualifies && !filtersRelation {
+	// So do those of a scan that keeps few of the divided table's rows, by
+	// a column equal to a constant, in a list or equal to a subquery's
+	// value, as auto mode's estimates take it (filtersSelectively): workers
+	// read the table, and the coordinator what they keep.
+	selective := c.split != nil && child(sel, "where_clause") != nil && filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table)
+	if distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
 		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())
