@@ -65,6 +65,20 @@ resource "azurerm_kubernetes_cluster" "this" {
     mode = "Manual"
   }
 
+  # With workers, the autoscaler picks node pools by priority (the ConfigMap
+  # in workers.tf: Spot worker pools first) and backs off a pool whose node
+  # has not joined within 5 minutes, so the Regular worker pool gets a
+  # worker that Spot has no capacity for. Without workers, AKS's defaults.
+  dynamic "auto_scaler_profile" {
+    for_each = var.workers_enabled ? [1] : []
+    content {
+      expander                   = "priority"
+      max_node_provisioning_time = "5m"
+      # Workers keep spill and read cache in emptyDir volumes.
+      skip_nodes_with_local_storage = false
+    }
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.aks.id]

@@ -82,6 +82,11 @@ output "sql_endpoint_fqdn" {
   value       = var.expose_sql && var.sql_dns_label != null ? azurerm_public_ip.sql[0].fqdn : null
 }
 
+output "worker_node_pools" {
+  description = "With workers_enabled: the worker and large-worker node pools by name (workerspot, workerreg, largespot, largereg), each with its VM size, Spot or not, and most nodes. Empty without workers."
+  value       = { for name, p in local.worker_pools : name => { vm_size = p.vm_size, spot = p.spot, max_count = p.max } }
+}
+
 output "helm_values" {
   description = "Values passed to the Igloo chart (no secrets; those are referenced by Secret name). Useful with install_chart = false."
   value       = yamlencode(local.helm_values)

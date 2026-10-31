@@ -376,6 +376,169 @@ run "sql_not_exposed_by_default" {
     condition     = length(azurerm_public_ip.sql) == 0 && output.sql_endpoint_ip == null
     error_message = "no public IP without expose_sql"
   }
+
+  assert {
+    condition = (
+      length(azurerm_kubernetes_cluster_node_pool.worker) == 0 &&
+      length(kubernetes_config_map_v1.cluster_autoscaler_priority_expander) == 0 &&
+      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+    )
+    error_message = "without workers_enabled there must be no worker pools, no priority expander and no workers values, so existing deployments are unchanged"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Distributed-execution workers
+# ---------------------------------------------------------------------------
+
+run "workers_on_spot_with_regular_fallback" {
+  command = plan
+
+  variables {
+    workers_enabled        = true
+    workers_price_per_hour = 0.32
+  }
+
+  assert {
+    condition = (
+      keys(azurerm_kubernetes_cluster_node_pool.worker) == ["workerreg", "workerspot"] &&
+      azurerm_kubernetes_cluster_node_pool.worker["workerspot"].priority == "Spot" &&
+      azurerm_kubernetes_cluster_node_pool.worker["workerspot"].eviction_policy == "Delete" &&
+      azurerm_kubernetes_cluster_node_pool.worker["workerreg"].priority == "Regular" &&
+      alltrue([for p in azurerm_kubernetes_cluster_node_pool.worker : p.auto_scaling_enabled && p.min_count == 0 && p.max_count == 4 && p.mode == "User"])
+    )
+    error_message = "workers must get a Spot pool and a Regular pool to fall back to, both autoscaling from zero to workers_max nodes"
+  }
+
+  assert {
+    condition = (
+      alltrue([for p in azurerm_kubernetes_cluster_node_pool.worker : p.node_labels["igloo.dev/node"] == "workers" && contains(p.node_taints, "igloo.dev/workers=true:NoSchedule")]) &&
+      contains(azurerm_kubernetes_cluster_node_pool.worker["workerspot"].node_taints, "kubernetes.azure.com/scalesetpriority=spot:NoSchedule") &&
+      length(azurerm_kubernetes_cluster_node_pool.worker["workerreg"].node_taints) == 1
+    )
+    error_message = "both worker pools must carry the workers' label and taint, and the Spot pool the Spot taint too"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in azurerm_kubernetes_cluster_node_pool.worker :
+      p.vm_size == "Standard_D16pds_v6" && p.os_disk_type == "Ephemeral"
+    ])
+    error_message = "worker nodes must default to a size with local NVMe and an ephemeral OS disk on it, where spill and read cache live"
+  }
+
+  assert {
+    condition = (
+      azurerm_kubernetes_cluster.this.auto_scaler_profile[0].expander == "priority" &&
+      azurerm_kubernetes_cluster.this.auto_scaler_profile[0].max_node_provisioning_time == "5m" &&
+      kubernetes_config_map_v1.cluster_autoscaler_priority_expander[0].metadata[0].namespace == "kube-system" &&
+      yamldecode(kubernetes_config_map_v1.cluster_autoscaler_priority_expander[0].data.priorities) == { "50" = [".*workerspot.*", ".*largespot.*"], "10" = [".*"] }
+    )
+    error_message = "the cluster autoscaler must prefer the Spot pools by priority, leave every other pool after them, and back off a pool that gets no node"
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.32 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.cpu == "14" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.limits.memory == "54Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.duckdb.spillVolume.sizeLimit == "480Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.cacheVolume.sizeLimit == "220Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == false
+    )
+    error_message = "the chart must turn workers on, sized to one node, with no large worker"
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.nodeSelector == { "igloo.dev/node" = "workers" } &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.tolerations == [
+        { key = "igloo.dev/workers", operator = "Equal", value = "true", effect = "NoSchedule" },
+        { key = "kubernetes.azure.com/scalesetpriority", operator = "Equal", value = "spot", effect = "NoSchedule" },
+      ]
+    )
+    error_message = "worker pods must select the label both worker pools carry and tolerate the workers' and the Spot taints"
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).nodeSelector == { "igloo/pool" = "query" } && azurerm_kubernetes_cluster_node_pool.igloo.priority == "Regular"
+    error_message = "igloo pods must stay on the regular Igloo pool"
+  }
+}
+
+run "workers_on_regular_vms_only" {
+  command = plan
+
+  variables {
+    workers_enabled = true
+    workers_spot    = false
+    workers_vm_size = "Standard_D16ps_v6"
+  }
+
+  assert {
+    condition = (
+      keys(azurerm_kubernetes_cluster_node_pool.worker) == ["workerreg"] &&
+      azurerm_kubernetes_cluster_node_pool.worker["workerreg"].os_disk_type == "Managed" &&
+      length(yamldecode(helm_release.igloo[0].values[0]).workers.tolerations) == 1
+    )
+    error_message = "workers_spot = false must leave only the Regular pool, and a size without a local disk a managed OS disk"
+  }
+}
+
+run "large_worker" {
+  command = plan
+
+  variables {
+    workers_enabled             = true
+    large_worker_enabled        = true
+    large_worker_price_per_hour = 4.03
+  }
+
+  assert {
+    condition = (
+      keys(azurerm_kubernetes_cluster_node_pool.worker) == ["largereg", "workerreg", "workerspot"] &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].priority == "Regular" &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].vm_size == "Standard_E64pds_v6" &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].min_count == 0 &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].max_count == 1 &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].node_labels == tomap({ "igloo.dev/node" = "large-worker" }) &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].node_taints == tolist(["igloo.dev/large-worker=true:NoSchedule"])
+    )
+    error_message = "the large worker must get a Regular Standard_E64pds_v6 pool of its own, from zero to one node, labelled and tainted for it"
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.pricePerHour == 4.03 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.requests.cpu == "57" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.limits.memory == "435Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.nodeSelector == { "igloo.dev/node" = "large-worker" } &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.tolerations == [{ key = "igloo.dev/large-worker", operator = "Equal", value = "true", effect = "NoSchedule" }]
+    )
+    error_message = "the chart's workers.large must fill the large worker's node and select it"
+  }
+}
+
+run "large_worker_on_spot" {
+  command = plan
+
+  variables {
+    workers_enabled      = true
+    large_worker_enabled = true
+    large_worker_spot    = true
+  }
+
+  assert {
+    condition = (
+      azurerm_kubernetes_cluster_node_pool.worker["largespot"].priority == "Spot" &&
+      azurerm_kubernetes_cluster_node_pool.worker["largereg"].priority == "Regular" &&
+      length(yamldecode(helm_release.igloo[0].values[0]).workers.large.tolerations) == 2
+    )
+    error_message = "large_worker_spot must add a Spot pool, keep the Regular one to fall back to, and let the large worker tolerate Spot"
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -707,4 +870,14 @@ run "rejects_bad_os_disk_type" {
   }
 
   expect_failures = [var.igloo_node_os_disk_type]
+}
+
+run "rejects_large_worker_without_workers" {
+  command = plan
+
+  variables {
+    large_worker_enabled = true
+  }
+
+  expect_failures = [var.large_worker_enabled]
 }
