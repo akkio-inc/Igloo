@@ -4,12 +4,76 @@ Distributed-execution workers (docs/distributed-execution.md)
 
 {{/* The workers' Deployment and Service: <fullname>-workers, or a compute
 pool's own, <fullname>-pool-<name>-workers. Each pool has workers of its
-own, which only its igloo pods use. */}}
-{{- define "igloo.workersName" -}}{{ include "igloo.poolComponentName" (list . "workers") }}{{- end -}}
+own, which only its igloo pods use. In the large worker's context (.Large,
+see "igloo.largeWorker"), the large worker's: <fullname>-workers-large or
+<fullname>-pool-<name>-workers-large. */}}
+{{- define "igloo.workersName" -}}
+{{- if get . "Large" -}}{{ include "igloo.largeWorkerName" . }}{{- else -}}{{ include "igloo.poolComponentName" (list . "workers") }}{{- end -}}
+{{- end -}}
 
-{{/* The workers' component label: "worker", or "pool-<name>-worker". */}}
+{{/* The large worker's Deployment and Service, from any context. */}}
+{{- define "igloo.largeWorkerName" -}}{{ include "igloo.poolComponentName" (list . "workers-large") }}{{- end -}}
+
+{{/* The workers' component label: "worker", or "pool-<name>-worker"; the
+large worker's ends in "-large". */}}
 {{- define "igloo.workerComponent" -}}
+{{- include "igloo.workerBaseComponent" . -}}{{- if get . "Large" -}}-large{{- end -}}
+{{- end -}}
+
+{{- define "igloo.workerBaseComponent" -}}
 {{- with (get . "Pool") -}}pool-{{ .name }}-worker{{- else -}}worker{{- end -}}
+{{- end -}}
+
+{{/* Where the workers' values are, for messages: "workers." or
+"workers.large.". */}}
+{{- define "igloo.workerValuesPrefix" -}}
+{{- if get . "Large" -}}workers.large.{{- else -}}workers.{{- end -}}
+{{- end -}}
+
+{{/* Whether this context (the release's or a pool's) runs a large worker:
+it needs workers.enabled too. */}}
+{{- define "igloo.runsLargeWorker" -}}
+{{- if and .Values.workers.enabled .Values.workers.large.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* The components that may reach a worker's task port to exchange rows
+(workers.exchanges local): the workers, and the large worker if there is
+one. */}}
+{{- define "igloo.workerPeerComponents" -}}
+{{- $base := include "igloo.workerBaseComponent" . -}}
+{{- $peers := list $base -}}
+{{- if or (get . "Large") (include "igloo.runsLargeWorker" .) -}}{{- $peers = append $peers (printf "%s-large" $base) -}}{{- end -}}
+{{- toJson $peers -}}
+{{- end -}}
+
+{{/*
+The large worker's values, as YAML: workers.large's own (resources, duckdb,
+cacheVolume, scheduling, pricePerHour, ...) in place of the workers', and
+the workers' secret, exchanges and timeouts. Read with fromYaml.
+*/}}
+{{- define "igloo.largeWorkerValues" -}}
+{{- $w := omit .Values.workers "large" -}}
+{{- range $k, $v := .Values.workers.large -}}
+{{- if ne $k "enabled" -}}{{- $_ := set $w $k $v -}}{{- end -}}
+{{- end -}}
+{{- toYaml $w -}}
+{{- end -}}
+
+{{/*
+The large worker ("scale up", docs/distributed-execution.md): a second
+worker Deployment of one pod on a large machine, rendered by "igloo.workers"
+in a context whose .Values.workers are the large worker's values and whose
+.Large is true.
+*/}}
+{{- define "igloo.largeWorker" -}}
+{{- /* Generated secrets are cached in .Values; fill the cache before the
+copy, so the large worker's pods see the same checksum. */ -}}
+{{- $_ := include "igloo.secretData" . -}}
+{{- $values := deepCopy .Values -}}
+{{- $_ := set $values "workers" (include "igloo.largeWorkerValues" . | fromYaml) -}}
+{{- $ctx := dict "Values" $values "Release" .Release "Chart" .Chart "Capabilities" .Capabilities "Template" .Template "Files" .Files "Large" true -}}
+{{- with (get . "Pool") -}}{{- $_ := set $ctx "Pool" . -}}{{- end -}}
+{{- include "igloo.workers" $ctx -}}
 {{- end -}}
 
 {{/* "true" when the release or any compute pool runs workers. */}}
@@ -77,19 +141,49 @@ from it. Call with (list "<setting name>" "<quantity>").
 {{/*
 A worker's IGLOO_DUCKDB_MEMORY_LIMIT: workers.duckdb.memoryLimit, or 80% of
 workers.resources.limits.memory leaving at least 512Mi, as for igloo pods.
+The large worker's comes from workers.large the same way.
 */}}
 {{- define "igloo.workerMemoryLimit" -}}
-{{- if .Values.workers.duckdb.memoryLimit -}}
-{{- .Values.workers.duckdb.memoryLimit -}}
+{{- include "igloo.workerMemoryLimitOf" (list .Values.workers (include "igloo.workerValuesPrefix" .)) -}}
+{{- end -}}
+
+{{/* The same from a workers dict. Call with (list <workers values>
+"<prefix for messages>"). */}}
+{{- define "igloo.workerMemoryLimitOf" -}}
+{{- $w := index . 0 -}}
+{{- $prefix := index . 1 -}}
+{{- if $w.duckdb.memoryLimit -}}
+{{- $w.duckdb.memoryLimit -}}
 {{- else -}}
-{{- with .Values.workers.resources -}}{{- with .limits -}}{{- with .memory -}}
-{{- $total := float64 (include "igloo.quantityMiB" (list "workers.resources.limits.memory" .)) -}}
+{{- with $w.resources -}}{{- with .limits -}}{{- with .memory -}}
+{{- $total := float64 (include "igloo.quantityMiB" (list (printf "%sresources.limits.memory" $prefix) .)) -}}
 {{- $mib := floor (min (mulf $total 0.8) (subf $total 512.0)) -}}
 {{- if lt $mib 256.0 -}}
-{{- fail "igloo: workers.resources.limits.memory leaves DuckDB less than 256Mi after a 512Mi reserve; use at least 1Gi, or set workers.duckdb.memoryLimit" -}}
+{{- fail (printf "igloo: %sresources.limits.memory leaves DuckDB less than 256Mi after a 512Mi reserve; use at least 1Gi, or set %sduckdb.memoryLimit" $prefix $prefix) -}}
 {{- end -}}
 {{- printf "%dMiB" (int64 $mib) -}}
 {{- end -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whole cores from a container's resources: requests.cpu, else limits.cpu,
+rounded down and at least 1; empty when neither is set. Call with
+(list <resources> "<name for messages>").
+*/}}
+{{- define "igloo.resourceCores" -}}
+{{- $r := index . 0 | default dict -}}
+{{- $what := index . 1 -}}
+{{- $cpu := "" -}}
+{{- with $r.requests -}}{{- with .cpu -}}{{- $cpu = toString . -}}{{- end -}}{{- end -}}
+{{- if not $cpu -}}{{- with $r.limits -}}{{- with .cpu -}}{{- $cpu = toString . -}}{{- end -}}{{- end -}}{{- end -}}
+{{- if $cpu -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?m?$" $cpu) -}}
+{{- fail (printf "igloo: cannot read %s %q" $what $cpu) -}}
+{{- end -}}
+{{- $n := float64 (trimSuffix "m" $cpu) -}}
+{{- if hasSuffix "m" $cpu -}}{{- $n = divf $n 1000.0 -}}{{- end -}}
+{{- max 1 (int64 (floor $n)) -}}
 {{- end -}}
 {{- end -}}
 
@@ -113,6 +207,33 @@ workers.resources.limits.memory leaving at least 512Mi, as for igloo pods.
   value: {{ .Values.workers.startTimeout | quote }}
 - name: IGLOO_EXCHANGES
   value: {{ .Values.workers.exchanges | default "object" | quote }}
+{{- with .Values.workers.pricePerHour }}
+- name: IGLOO_WORKER_PRICE_PER_HOUR
+  value: {{ . | toString | quote }}
+{{- end }}
+{{- if include "igloo.runsLargeWorker" . }}
+{{- $large := include "igloo.largeWorkerValues" . | fromYaml }}
+{{- $name := include "igloo.largeWorkerName" . }}
+# The large worker, for statements auto mode runs whole on one machine.
+- name: IGLOO_LARGE_WORKER
+  value: {{ printf "%s:%s" $name (include "igloo.workerPort" .) | quote }}
+- name: IGLOO_LARGE_WORKER_COMPUTE
+  value: kubernetes
+- name: IGLOO_LARGE_WORKER_K8S_DEPLOYMENT
+  value: {{ $name | quote }}
+{{- with include "igloo.resourceCores" (list $large.resources "workers.large.resources cpu") }}
+- name: IGLOO_LARGE_WORKER_CORES
+  value: {{ . | quote }}
+{{- end }}
+{{- with include "igloo.workerMemoryLimitOf" (list $large "workers.large.") }}
+- name: IGLOO_LARGE_WORKER_MEMORY
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.workers.large.pricePerHour }}
+- name: IGLOO_LARGE_WORKER_PRICE_PER_HOUR
+  value: {{ . | toString | quote }}
+{{- end }}
+{{- end }}
 {{- end -}}
 
 {{/* Object storage settings, for workers: as the igloo pods have them. */}}

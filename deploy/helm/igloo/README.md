@@ -367,6 +367,56 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
   run a CNI that enforces NetworkPolicies, which keep them apart too.
 - With `scaleToZero.enabled`, the gateway stops the workers along with the
   igloo pods.
+- `workers.pricePerHour` is what one worker's machine costs an hour
+  (`IGLOO_WORKER_PRICE_PER_HOUR`), for auto mode's cost estimates.
+
+### A large worker
+
+With `workers.large.enabled=true` (and `workers.enabled`), the chart adds a
+second worker Deployment, `<fullname>-workers-large`, of one pod on a large
+machine. Auto mode may run a whole statement on it instead of on many
+small workers or an igloo pod, when its estimate (fits in memory, no
+spill, price) is about as fast as the fastest option and cheaper:
+
+```yaml
+workers:
+  enabled: true
+  pricePerHour: 0.31             # one small worker's machine
+  large:
+    enabled: true
+    pricePerHour: 4.35           # the large worker's machine
+    resources:
+      requests: { cpu: "60", memory: 448Gi }
+      limits: { memory: 448Gi }
+    duckdb:
+      spillVolume: { sizeLimit: 1900Gi }
+    cacheVolume: { sizeLimit: 850Gi }
+    nodeSelector: { pool: igloo-large-worker }   # a node pool that scales to zero
+```
+
+- It runs `igloo worker` from the same image, with the workers' secret,
+  storage settings and exchanges, and its own resources, volumes,
+  scheduling, labels and grace period (nothing of `workers.*` but those is
+  taken). It starts at zero pods; igloo starts it when it picks it and
+  stops it when idle, as it does the other workers.
+- The chart adds its headless Service, metrics Service, a Role that lets
+  igloo pods scale only it, and a NetworkPolicy like the workers'. The
+  igloo pods get `IGLOO_LARGE_WORKER` (`<fullname>-workers-large:7433`),
+  `IGLOO_LARGE_WORKER_COMPUTE=kubernetes`,
+  `IGLOO_LARGE_WORKER_K8S_DEPLOYMENT`, `IGLOO_LARGE_WORKER_CORES` (whole
+  cores of `requests.cpu`), `IGLOO_LARGE_WORKER_MEMORY` (its DuckDB memory
+  limit, `workers.large.duckdb.memoryLimit` or 80% of
+  `resources.limits.memory`, for estimates while it is stopped) and
+  `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`.
+- Each compute pool with workers gets a large worker of its own,
+  `<fullname>-pool-<name>-workers-large`, from the release's
+  `workers.large` with the pool's `workers.large` on top; a pool sets
+  `workers.large.enabled: false` to run without. With
+  `scaleToZero.enabled`, the gateway stops it with the pool
+  (`IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT`).
+- Give it a node pool of its own with a minimum size of zero, so it costs
+  nothing while stopped. The [OpenTofu modules](../../) provision one with
+  `large_worker_enabled = true`.
 
 ## Values
 
@@ -471,6 +521,13 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 | `workers.podLabels`, `podAnnotations`, `nodeSelector`, `tolerations` | | Worker pods |
 | `workers.affinity` | `{}` | Empty: prefer one worker per node |
 | `workers.terminationGracePeriodSeconds` | `45` | A stopping worker finishes its running tasks for up to 30s, as when a Spot node is drained before it is reclaimed |
+| `workers.pricePerHour` | `0` | `IGLOO_WORKER_PRICE_PER_HOUR`: what one worker's machine costs an hour, for auto mode's estimates; `0` is unknown |
+| `workers.large.enabled` | `false` | [A large worker](#a-large-worker): `<fullname>-workers-large`, one pod; needs `workers.enabled` |
+| `workers.large.pricePerHour` | `0` | `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`: what the large worker's machine costs an hour |
+| `workers.large.resources` | requests `60` CPU / `448Gi`, limit `448Gi` | Large worker container; `requests.cpu` gives `IGLOO_LARGE_WORKER_CORES` |
+| `workers.large.duckdb.memoryLimit`, `threads`, `spillVolume` | `""`, `null`, `1000Gi` | As `workers.duckdb.*`; the memory limit is also `IGLOO_LARGE_WORKER_MEMORY` |
+| `workers.large.cacheVolume.sizeLimit` | `500Gi` | Large worker's read cache `emptyDir` |
+| `workers.large.podLabels`, `podAnnotations`, `nodeSelector`, `tolerations`, `affinity`, `terminationGracePeriodSeconds` | | Large worker pod; its own, not the workers' |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `metrics.serviceMonitor.interval`, `scrapeTimeout`, `labels` | `30s`, `""`, `{}` | |
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
@@ -506,8 +563,9 @@ early.
 ## Testing the chart
 
 `deploy/helm/template-test.sh` renders the chart with compute pools
-(`test-values/pools.yaml`) and checks the objects it makes, and that it
-refuses pools that cannot work; it needs only helm.
+(`test-values/pools.yaml`) and with workers and a large worker
+(`test-values/large-worker.yaml`) and checks the objects it makes, and that
+it refuses pools and large workers that cannot work; it needs only helm.
 
 `deploy/helm/e2e.sh` creates a kind cluster named `igloo-e2e`, builds and loads
 `igloo:dev`, installs the chart in bundled mode with two replicas and checks

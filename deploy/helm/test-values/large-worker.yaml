@@ -1,0 +1,48 @@
+# Workers and a large worker in bundled mode, for deploy/helm/template-test.sh:
+# the release's own, a pool that scales to zero with a large worker of its
+# own, and a pool that turns the large worker off.
+postgresql:
+  enabled: true
+objectStorage:
+  enabled: true
+networkPolicy:
+  enabled: true
+workers:
+  enabled: true
+  exchanges: local
+  pricePerHour: 0.31
+  nodeSelector:
+    igloo.dev/node: workers
+  large:
+    enabled: true
+    pricePerHour: 4.35
+    resources:
+      requests: { cpu: "60", memory: 448Gi }
+      limits: { memory: 448Gi }
+    duckdb:
+      spillVolume:
+        sizeLimit: 2000Gi
+    cacheVolume:
+      sizeLimit: 800Gi
+    nodeSelector:
+      igloo.dev/node: large-worker
+    tolerations:
+      - key: igloo.dev/large-worker
+        operator: Exists
+        effect: NoSchedule
+pools:
+  - name: acme
+    scaleToZero:
+      enabled: true
+    workers:
+      large:
+        pricePerHour: 3.1
+        duckdb:
+          memoryLimit: 300GiB
+        resources:
+          requests: { cpu: 31500m, memory: 384Gi }
+          limits: { memory: 384Gi }
+  - name: reporting
+    workers:
+      large:
+        enabled: false

@@ -76,6 +76,11 @@ spec:
             - name: IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT
               value: {{ include "igloo.workersName" . | quote }}
             {{- end }}
+            {{- if include "igloo.runsLargeWorker" . }}
+            # So does the large worker.
+            - name: IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT
+              value: {{ include "igloo.largeWorkerName" . | quote }}
+            {{- end }}
             - name: IGLOO_GATEWAY_BACKEND
               value: {{ printf "%s:5432" (include "igloo.serverServiceName" .) | quote }}
             {{- if .Values.console.enabled }}
@@ -158,7 +163,7 @@ spec:
       protocol: TCP
 ---
 # The gateway may read and change the igloo Deployment's replica count (and
-# the workers', to stop them too), and nothing else.
+# the workers' and the large worker's, to stop them too), and nothing else.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -173,6 +178,9 @@ rules:
       - {{ include "igloo.serverName" . | quote }}
       {{- if .Values.workers.enabled }}
       - {{ include "igloo.workersName" . | quote }}
+      {{- end }}
+      {{- if include "igloo.runsLargeWorker" . }}
+      - {{ include "igloo.largeWorkerName" . | quote }}
       {{- end }}
     verbs: ["get", "patch"]
 ---

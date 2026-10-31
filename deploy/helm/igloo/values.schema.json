@@ -1070,6 +1070,51 @@
         "terminationGracePeriodSeconds": {
           "type": "integer",
           "minimum": 0
+        },
+        "pricePerHour": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Hourly price of one worker's machine, for auto mode's cost estimates; 0 for unknown."
+        },
+        "large": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "One large worker (scale up): a Deployment of its own, with its own resources and scheduling.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "pricePerHour": {
+              "$ref": "#/properties/workers/properties/pricePerHour"
+            },
+            "duckdb": {
+              "$ref": "#/properties/workers/properties/duckdb"
+            },
+            "cacheVolume": {
+              "$ref": "#/properties/workers/properties/cacheVolume"
+            },
+            "resources": {
+              "$ref": "#/properties/workers/properties/resources"
+            },
+            "podLabels": {
+              "$ref": "#/properties/workers/properties/podLabels"
+            },
+            "podAnnotations": {
+              "$ref": "#/properties/workers/properties/podAnnotations"
+            },
+            "nodeSelector": {
+              "$ref": "#/properties/workers/properties/nodeSelector"
+            },
+            "tolerations": {
+              "$ref": "#/properties/workers/properties/tolerations"
+            },
+            "affinity": {
+              "$ref": "#/properties/workers/properties/affinity"
+            },
+            "terminationGracePeriodSeconds": {
+              "$ref": "#/properties/workers/properties/terminationGracePeriodSeconds"
+            }
+          }
         }
       }
     }

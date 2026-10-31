@@ -5,10 +5,13 @@ once the workers have been idle for workers.idleAfter; the chart leaves its
 replica count to them after the first install. Each compute pool gets
 workers of its own (pools.yaml renders this for it too), which only its
 igloo pods reach and start, so one client's distributed statements never
-take another pool's workers.
+take another pool's workers. With workers.large.enabled, the same objects
+again for the large worker (<fullname>-workers-large, one pod on a large
+machine), which auto mode may run a whole statement on.
 */ -}}
 {{- define "igloo.workers" -}}
 {{- $name := include "igloo.workersName" . -}}
+{{- $prefix := include "igloo.workerValuesPrefix" . -}}
 {{- $memoryLimit := include "igloo.workerMemoryLimit" . -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -78,7 +81,7 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- if .Values.workers.duckdb.spillVolume.sizeLimit }}
-            {{- $spillMiB := float64 (include "igloo.quantityMiB" (list "workers.duckdb.spillVolume.sizeLimit" .Values.workers.duckdb.spillVolume.sizeLimit)) }}
+            {{- $spillMiB := float64 (include "igloo.quantityMiB" (list (printf "%sduckdb.spillVolume.sizeLimit" $prefix) .Values.workers.duckdb.spillVolume.sizeLimit)) }}
             {{- if eq (.Values.workers.exchanges | default "object") "local" }}
             {{- /* Exchanges share the volume: 60% for spill, 30% for them. */}}
             - name: IGLOO_DUCKDB_MAX_TEMP_SIZE
@@ -98,7 +101,7 @@ spec:
             # The read cache's own volume: copies of the data files this
             # worker read, so repeated statements read local disk.
             - name: IGLOO_CACHE_SIZE
-              value: {{ printf "%dMiB" (int64 (floor (mulf (float64 (include "igloo.quantityMiB" (list "workers.cacheVolume.sizeLimit" .))) 0.9))) | quote }}
+              value: {{ printf "%dMiB" (int64 (floor (mulf (float64 (include "igloo.quantityMiB" (list (printf "%scacheVolume.sizeLimit" $prefix) .))) 0.9))) | quote }}
             {{- end }}
             - name: IGLOO_LOG_FORMAT
               value: {{ .Values.log.format | quote }}
@@ -198,7 +201,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "igloo.poolComponentName" (list . "workers-metrics") }}
+  name: {{ include "igloo.poolComponentName" (list . (ternary "workers-large-metrics" "workers-metrics" (empty (get . "Large") | not))) }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "igloo.labels" (dict "root" . "component" "metrics") | nindent 4 }}
@@ -270,9 +273,11 @@ spec:
           protocol: TCP
     {{- if eq (.Values.workers.exchanges | default "object") "local" }}
     - from:
+        {{- range $peer := include "igloo.workerPeerComponents" . | fromJsonArray }}
         - podSelector:
             matchLabels:
-              {{- include "igloo.selectorLabels" (dict "root" . "component" (include "igloo.workerComponent" .)) | nindent 14 }}
+              {{- include "igloo.selectorLabels" (dict "root" $ "component" $peer) | nindent 14 }}
+        {{- end }}
       ports:
         - port: worker
           protocol: TCP
@@ -294,4 +299,8 @@ spec:
 
 {{- if .Values.workers.enabled }}
 {{ include "igloo.workers" . }}
+{{- end }}
+{{- if include "igloo.runsLargeWorker" . }}
+---
+{{ include "igloo.largeWorker" . }}
 {{- end }}

@@ -24,6 +24,13 @@ pools copy the values, so their pods see the same checksum. */ -}}
 {{- if and $pool.workers (hasKey $pool.workers "enabled") }}
 {{- $_ := set $values.workers "enabled" $pool.workers.enabled }}
 {{- end }}
+{{- if and $pool.workers (hasKey $pool.workers "pricePerHour") }}
+{{- $_ := set $values.workers "pricePerHour" $pool.workers.pricePerHour }}
+{{- end }}
+{{- $poolLarge := dig "workers" "large" (dict) $pool }}
+{{- range $key := list "enabled" "pricePerHour" }}
+{{- if hasKey $poolLarge $key }}{{ $_ := set $values.workers.large $key (get $poolLarge $key) }}{{ end }}
+{{- end }}
 {{- $_ := set $values "extraEnv" (concat ($.Values.extraEnv | default list) ($pool.extraEnv | default list)) }}
 {{- $_ := set $values.autoscaling "enabled" false }}
 {{- $_ := set $values.maintenance "enabled" false }}
@@ -56,6 +63,10 @@ automountServiceAccountToken: true
 {{- if $values.workers.enabled }}
 ---
 {{ include "igloo.workers" $ctx }}
+{{- end }}
+{{- if include "igloo.runsLargeWorker" $ctx }}
+---
+{{ include "igloo.largeWorker" $ctx }}
 {{- end }}
 {{- end }}
 {{- end }}

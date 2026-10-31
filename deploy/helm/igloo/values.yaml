@@ -422,6 +422,44 @@ workers:
   # A worker told to stop (scale-down, a node drained, as before a Spot node
   # is reclaimed) finishes its running tasks for up to 30s; keep this above.
   terminationGracePeriodSeconds: 45
+  # What one worker's machine costs an hour, e.g. 0.31 for a Spot node, for
+  # auto mode's cost estimates -> IGLOO_WORKER_PRICE_PER_HOUR. 0: unknown.
+  pricePerHour: 0
+  # One large worker ("scale up"): a second worker Deployment,
+  # <fullname>-workers-large, of one pod on a large machine (512 GiB class),
+  # which auto mode may run a whole statement on when its estimate (fits in
+  # memory, no spill, price) is about as fast as the fastest option and
+  # cheaper. It starts at zero pods; igloo starts it when it picks it and
+  # stops it when idle, as the other workers. Needs workers.enabled, and
+  # shares the workers' secret, exchanges and timeouts; everything below is
+  # its own, not taken from the workers'. Give it a node pool of its own
+  # with a minimum size of zero (nodeSelector, tolerations).
+  large:
+    enabled: false
+    # -> IGLOO_LARGE_WORKER_PRICE_PER_HOUR, as workers.pricePerHour.
+    pricePerHour: 0
+    duckdb:
+      # Empty: 80% of resources.limits.memory, as for workers; igloo pods
+      # also get it as IGLOO_LARGE_WORKER_MEMORY, for estimates while the
+      # large worker is stopped.
+      memoryLimit: ""
+      threads: null
+      spillVolume:
+        sizeLimit: 1000Gi
+        medium: ""
+    cacheVolume:
+      sizeLimit: 500Gi
+    # requests.cpu -> IGLOO_LARGE_WORKER_CORES on igloo pods. The default
+    # fits a 64-core, 512 GiB machine.
+    resources:
+      requests: { cpu: "60", memory: 448Gi }
+      limits: { memory: 448Gi }
+    podLabels: {}
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    terminationGracePeriodSeconds: 45
 
 # Prometheus metrics are served on port 8080 at /metrics, through the
 # <fullname>-metrics ClusterIP Service (never through the SQL Service), and the

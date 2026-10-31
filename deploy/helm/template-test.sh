@@ -117,6 +117,54 @@ else
   pass "refuses workers.exchanges=nvme"
 fi
 
+echo "the large worker"
+render -f test-values/large-worker.yaml >"$work/large.yaml"
+envf() { docf "$1" "$2" "$3" | grep -A1 -E "^ +- name: $4\$" | sed -n 's/^ *value: //p'; }
+lw() { envf "$work/large.yaml" Deployment igloo "$1"; }
+check "igloo pods find the large worker" '"igloo-workers-large:7433"|kubernetes|"igloo-workers-large"' \
+  "$(lw IGLOO_LARGE_WORKER)|$(lw IGLOO_LARGE_WORKER_COMPUTE)|$(lw IGLOO_LARGE_WORKER_K8S_DEPLOYMENT)"
+check "and know its size and price" '"60"|"367001MiB"|"4.35"' \
+  "$(lw IGLOO_LARGE_WORKER_CORES)|$(lw IGLOO_LARGE_WORKER_MEMORY)|$(lw IGLOO_LARGE_WORKER_PRICE_PER_HOUR)"
+check "and the workers' price" '"0.31"' "$(lw IGLOO_WORKER_PRICE_PER_HOUR)"
+check "its DuckDB limit is the one igloo pods estimate with" "$(lw IGLOO_LARGE_WORKER_MEMORY)" \
+  "$(envf "$work/large.yaml" Deployment igloo-workers-large IGLOO_DUCKDB_MEMORY_LIMIT)"
+check "it starts with no pods and runs igloo worker" '  replicas: 0|args: ["worker"]' \
+  "$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -E '^  replicas:')|$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'args: .*')"
+check "with the workers' secret" "$(docf "$work/large.yaml" Deployment igloo-workers | grep -A3 'name: IGLOO_WORKER_SECRET' | tr -d ' \n')" \
+  "$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -A3 'name: IGLOO_WORKER_SECRET' | tr -d ' \n')"
+check "its own resources, volumes and scheduling" 'cpu: "60"|sizeLimit: 2000Gi|sizeLimit: 800Gi|igloo.dev/node: large-worker|key: igloo.dev/large-worker' \
+  "$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'cpu: .*')|$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'sizeLimit: [0-9]*Gi' | tr '\n' '|')$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'igloo.dev/node: .*')|$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'key: igloo.dev/.*')"
+check "the workers keep theirs" 'igloo.dev/node: workers' "$(docf "$work/large.yaml" Deployment igloo-workers | grep -o 'igloo.dev/node: .*')"
+check "a headless Service of its own" "  clusterIP: None|app.kubernetes.io/component: worker-large" \
+  "$(docf "$work/large.yaml" Service igloo-workers-large | grep -E '^  clusterIP:')|$(docf "$work/large.yaml" Service igloo-workers-large | sed -n '/^  selector:/,/^  ports:/p' | grep -o 'app.kubernetes.io/component: .*')"
+check "igloo pods may scale it, and only it" 'resourceNames: ["igloo-workers-large"]' \
+  "$(docf "$work/large.yaml" Role igloo-workers-large | grep -o 'resourceNames: .*')"
+check "it takes tasks from igloo pods and exchanges with the workers" "server worker worker-large" \
+  "$(docf "$work/large.yaml" NetworkPolicy igloo-workers-large | sed -n '/ingress:/,/port: http/p' | grep -o 'component: .*' | sed 's/component: //' | tr '\n' ' ' | sed 's/ $//')"
+check "and the workers exchange with it" "server worker worker-large" \
+  "$(docf "$work/large.yaml" NetworkPolicy igloo-workers | sed -n '/ingress:/,/port: http/p' | grep -o 'component: .*' | sed 's/component: //' | tr '\n' ' ' | sed 's/ $//')"
+pl() { envf "$work/large.yaml" Deployment igloo-pool-acme "$1"; }
+check "a pool has a large worker of its own" '"igloo-pool-acme-workers-large:7433"|"31"|"300GiB"|"3.1"' \
+  "$(pl IGLOO_LARGE_WORKER)|$(pl IGLOO_LARGE_WORKER_CORES)|$(pl IGLOO_LARGE_WORKER_MEMORY)|$(pl IGLOO_LARGE_WORKER_PRICE_PER_HOUR)"
+check "which the pool's gateway stops with the pool" '"igloo-pool-acme-workers-large"' \
+  "$(envf "$work/large.yaml" Deployment igloo-pool-acme-gateway IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT)"
+check "and may scale" '"igloo-pool-acme" "igloo-pool-acme-workers" "igloo-pool-acme-workers-large"' \
+  "$(docf "$work/large.yaml" Role igloo-pool-acme-gateway | sed -n '/resourceNames:/,/verbs:/p' | grep -v 'verbs:' | grep -o '"[^"]*"' | tr '\n' ' ' | sed 's/ $//')"
+check "a pool can turn it off" "0|" \
+  "$(grep -c 'name: igloo-pool-reporting-workers-large' "$work/large.yaml")|$(envf "$work/large.yaml" Deployment igloo-pool-reporting IGLOO_LARGE_WORKER)"
+if grep -q 'workers-large\|IGLOO_LARGE_WORKER\|IGLOO_WORKER_PRICE' "$work/object.yaml"; then
+  fail "no large worker or worker price by default"
+else
+  pass "no large worker or worker price by default"
+fi
+if out=$(render "${bundled[@]}" --set workers.large.enabled=true 2>&1); then
+  fail "refuses workers.large without workers"
+elif grep -q 'workers.large.enabled needs workers.enabled' <<<"$out"; then
+  pass "refuses workers.large without workers"
+else
+  fail "refuses workers.large without workers with a message about it: $out"
+fi
+
 echo "the admin password"
 # A generated password is long enough for Igloo to create the account with.
 generated=$(render "${bundled[@]}" | sed -n 's/^  admin-password: //p' | base64 -d | wc -c | tr -d ' ')

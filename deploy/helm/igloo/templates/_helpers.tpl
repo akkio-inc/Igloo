@@ -415,6 +415,9 @@ the schema enforces. The message never includes the password. */ -}}
 {{- if and $v.workers.enabled (lt (int $v.workers.maxReplicas) 1) -}}
 {{- fail (printf "%sworkers.maxReplicas must be at least 1 with workers.enabled" $prefix) -}}
 {{- end -}}
+{{- if and $v.workers.large.enabled (not (include "igloo.anyWorkers" .)) -}}
+{{- fail (printf "%sworkers.large.enabled needs workers.enabled too: the large worker shares the workers' secret and settings" $prefix) -}}
+{{- end -}}
 
 {{- $missing := list -}}
 {{- if not $location -}}
