@@ -591,8 +591,17 @@ func TestLargeWorker(t *testing.T) {
 		l.Memory != 367001<<20 || l.Price != 4.35 || cfg.Workers.Price != 0.48 {
 		t.Errorf("large worker: %+v, workers' price %v, %v", l, cfg.Workers.Price, err)
 	}
-	if cfg, err := Load(env(base)); err != nil || cfg.Workers.Large.Address != "" || cfg.Workers.Price != 0 {
+	if cfg, err := Load(env(base)); err != nil || cfg.Workers.Large.Address != "" || cfg.Workers.Price != 0 || cfg.Workers.Spot {
 		t.Errorf("none: %+v %v", cfg.Workers.Large, err)
+	}
+	// Instance types and Spot, for list prices.
+	cfg, err = Load(env(with(map[string]string{
+		"IGLOO_WORKER_INSTANCE_TYPE": "m7gd.2xlarge", "IGLOO_WORKER_SPOT": "true", "IGLOO_CLOUD_REGION": "us-east-2",
+		"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_INSTANCE_TYPE": "r7gd.16xlarge", "IGLOO_LARGE_WORKER_SPOT": "false",
+	})))
+	if err != nil || cfg.Workers.InstanceType != "m7gd.2xlarge" || !cfg.Workers.Spot || cfg.Workers.Region != "us-east-2" ||
+		cfg.Workers.Large.InstanceType != "r7gd.16xlarge" || cfg.Workers.Large.Spot {
+		t.Errorf("instance types: %+v, %v", cfg.Workers, err)
 	}
 	for name, kv := range map[string]map[string]string{
 		"without workers":       {"IGLOO_WORKERS": "", "IGLOO_LARGE_WORKER": "large"},
@@ -604,6 +613,7 @@ func TestLargeWorker(t *testing.T) {
 		"bad cores":             {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_CORES": "0"},
 		"bad price":             {"IGLOO_WORKER_PRICE_PER_HOUR": "-1"},
 		"bad large price":       {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_PRICE_PER_HOUR": "cheap"},
+		"bad spot":              {"IGLOO_WORKER_SPOT": "maybe"},
 	} {
 		if _, err := Load(env(with(kv))); err == nil {
 			t.Errorf("%s: no error", name)

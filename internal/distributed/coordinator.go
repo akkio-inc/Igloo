@@ -29,6 +29,8 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/akkio-inc/igloo/internal/prices"
 )
 
 // Mode says when a session's statements run distributed: auto (when Igloo
@@ -136,6 +138,14 @@ type Options struct {
 	LargeCores  int
 	LargeMemory int64
 	LargePrice  float64
+	// WorkerInstanceType and LargeInstanceType are the workers' and the
+	// large worker's instance types, WorkerSpot and LargeSpot whether they
+	// run on Spot capacity, and Region their region: where a price is not
+	// set, the list price of such a machine stands for it (package prices),
+	// and of what the workers themselves report where these are empty.
+	WorkerInstanceType, LargeInstanceType string
+	WorkerSpot, LargeSpot                 bool
+	Region                                string
 }
 
 // Coordinator splits statements into parts that workers run.
@@ -609,7 +619,8 @@ func (co *Coordinator) aggregates(ctx context.Context, env Env) map[string]bool 
 // as many more as Compute may start if mayStart; and with large, the large
 // worker, if it runs or may be started and its size is known.
 func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large bool) fleet {
-	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws), memory: smallestMemory(ws), price: co.opts.WorkerPrice}
+	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws), memory: smallestMemory(ws),
+		price: co.price(co.opts.WorkerPrice, co.opts.WorkerInstanceType, co.opts.WorkerSpot, ws)}
 	for i, w := range ws {
 		if i == 0 || w.status.Cores > f.cores {
 			f.cores, f.threads = w.status.Cores, w.status.Threads
@@ -661,15 +672,36 @@ func (co *Coordinator) largeWorker(ctx context.Context) (largeWorker, bool) {
 	if co.large == nil {
 		return largeWorker{}, false
 	}
-	l := largeWorker{cores: co.opts.LargeCores, memory: co.largeMemory(), price: co.opts.LargePrice,
+	ws := co.large.known(ctx)
+	l := largeWorker{cores: co.opts.LargeCores, memory: co.largeMemory(), price: co.price(co.opts.LargePrice, co.opts.LargeInstanceType, co.opts.LargeSpot, ws),
 		start: co.large.startEstimate(), tail: co.large.idleAfter()}
-	if ws := co.large.known(ctx); len(ws) > 0 {
+	if len(ws) > 0 {
 		st := ws[0].status
 		l.running, l.cores, l.threads, l.memory = true, st.Cores, st.Threads, st.MemoryBytes
 	} else if !co.large.canStart() {
 		return largeWorker{}, false
 	}
 	return l, l.cores > 0 && l.memory > 0
+}
+
+// price is what a worker costs an hour: set, if set; else the list price
+// of the instance type typ, on Spot if spot (package prices); else that of
+// the machine the first of ws that says reports; zero for unknown.
+func (co *Coordinator) price(set float64, typ string, spot bool, ws []*worker) float64 {
+	if set > 0 {
+		return set
+	}
+	region := co.opts.Region
+	if typ == "" {
+		for _, w := range ws {
+			if w.status.InstanceType != "" {
+				typ, spot, region = w.status.InstanceType, w.status.Spot, cmp.Or(region, w.status.Region)
+				break
+			}
+		}
+	}
+	p, _ := prices.Hourly(typ, region, spot)
+	return p
 }
 
 // largeMemory is the large worker's memory limit, as it last answered or

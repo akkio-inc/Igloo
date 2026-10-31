@@ -11,11 +11,15 @@ workers:
   enabled: true
   exchanges: local
   pricePerHour: 0.31
+  instanceType: m7gd.4xlarge
+  spot: true
+  region: us-east-2
   nodeSelector:
     igloo.dev/node: workers
   large:
     enabled: true
     pricePerHour: 4.35
+    instanceType: r7gd.16xlarge
     resources:
       requests: { cpu: "60", memory: 448Gi }
       limits: { memory: 448Gi }
@@ -44,5 +48,6 @@ pools:
           limits: { memory: 384Gi }
   - name: reporting
     workers:
+      spot: false
       large:
         enabled: false

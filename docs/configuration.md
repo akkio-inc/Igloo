@@ -279,7 +279,9 @@ to deploy workers. On the Igloo server:
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not Igloo's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances, comma separated |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop every worker |
-| `IGLOO_WORKER_PRICE_PER_HOUR` | `0` | What a worker costs an hour, for weighing how many workers, or the large worker, a statement runs on (see [when](distributed-execution.md#when)); `0` for unknown, when a machine's price is taken to go with its cores |
+| `IGLOO_WORKER_PRICE_PER_HOUR` | `0` | What a worker costs an hour, for weighing how many workers, or the large worker, a statement runs on (see [when](distributed-execution.md#when)); `0` for unknown, when the list price of `IGLOO_WORKER_INSTANCE_TYPE` stands for it (see [prices](distributed-execution.md#prices)) |
+| `IGLOO_WORKER_INSTANCE_TYPE`, `IGLOO_WORKER_SPOT`, `IGLOO_CLOUD_REGION` | | The workers' instance type (`m7gd.4xlarge`, `Standard_D16pds_v6`, `n4-standard-16`), whether they run on Spot (`false`), and the region, for their list price where no price is set |
+| `IGLOO_LARGE_WORKER_INSTANCE_TYPE`, `IGLOO_LARGE_WORKER_SPOT` | | The same for the large worker |
 | `IGLOO_LARGE_WORKER` | | The pool's [large worker](distributed-execution.md#a-large-worker), `host[:port]` (port 7433 by default), which auto mode may run a statement on alone; empty for none. Needs `IGLOO_WORKERS` |
 | `IGLOO_LARGE_WORKER_COMPUTE` | | How to start and stop it: `kubernetes` (`IGLOO_LARGE_WORKER_K8S_DEPLOYMENT`, in the workers' namespace), `ec2` (`IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS`), `command` (`IGLOO_LARGE_WORKER_START_COMMAND`, `IGLOO_LARGE_WORKER_STOP_COMMAND`), or empty when it always runs |
 | `IGLOO_LARGE_WORKER_CORES`, `IGLOO_LARGE_WORKER_MEMORY` | | Its cores and DuckDB memory limit (a size such as `400GiB`), for estimates while it is stopped and has not answered; required with `IGLOO_LARGE_WORKER_COMPUTE` |

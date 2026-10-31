@@ -461,6 +461,9 @@ run "workers_on_spot_with_on_demand_fallback" {
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
       yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.25 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "n4-standard-16" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.region == "us-central1" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == false &&
       yamldecode(helm_release.igloo[0].values[0]).workers.nodeSelector == { "cloud.google.com/compute-class" = "igloo-workers" }
     )
@@ -538,6 +541,7 @@ run "large_worker" {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == true &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.pricePerHour == 3.9 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.instanceType == "n4-highmem-64" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.requests.cpu == "57" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.limits.memory == "435Gi" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.nodeSelector == { "cloud.google.com/compute-class" = "igloo-large-worker" } &&

@@ -56,6 +56,12 @@ type Workers struct {
 	// Large is the compute pool's large worker, which a statement may run
 	// on alone (IGLOO_LARGE_WORKER*); no address for none.
 	Large LargeWorker
+	// InstanceType and Spot say what machines the workers are
+	// (IGLOO_WORKER_INSTANCE_TYPE, IGLOO_WORKER_SPOT), and Region where
+	// (IGLOO_CLOUD_REGION), for their list price where Price is not set.
+	InstanceType string
+	Spot         bool
+	Region       string
 
 	// ListenAddr is where a worker accepts tasks.
 	ListenAddr string
@@ -87,10 +93,13 @@ type LargeWorker struct {
 	EC2InstanceIDs []string
 	// Cores and Memory are its cores and DuckDB memory limit, for estimates
 	// before it has answered; Price what it costs an hour, zero for
-	// unknown.
-	Cores  int
-	Memory int64
-	Price  float64
+	// unknown; InstanceType and Spot what machine it is, for its list
+	// price where Price is not set.
+	Cores        int
+	Memory       int64
+	Price        float64
+	InstanceType string
+	Spot         bool
 }
 
 // WorkerPort is the port workers listen on unless told otherwise.
@@ -165,6 +174,17 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		return f
 	}
 	w.Price = price("IGLOO_WORKER_PRICE_PER_HOUR")
+	flag := func(key string) bool {
+		switch v := strings.ToLower(get(key, "false")); v {
+		case "true", "on", "1":
+			return true
+		case "false", "off", "0":
+		default:
+			addErr("%s must be true or false, got %q", key, v)
+		}
+		return false
+	}
+	w.InstanceType, w.Spot, w.Region = get("IGLOO_WORKER_INSTANCE_TYPE", ""), flag("IGLOO_WORKER_SPOT"), get("IGLOO_CLOUD_REGION", "")
 	w.Large = LargeWorker{
 		Address:        get("IGLOO_LARGE_WORKER", ""),
 		Compute:        get("IGLOO_LARGE_WORKER_COMPUTE", ""),
@@ -173,6 +193,8 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		StopCommand:    get("IGLOO_LARGE_WORKER_STOP_COMMAND", ""),
 		EC2InstanceIDs: ids("IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS"),
 		Price:          price("IGLOO_LARGE_WORKER_PRICE_PER_HOUR"),
+		InstanceType:   get("IGLOO_LARGE_WORKER_INSTANCE_TYPE", ""),
+		Spot:           flag("IGLOO_LARGE_WORKER_SPOT"),
 	}
 	if a := w.Large.Address; a != "" {
 		if _, _, err := net.SplitHostPort(a); err != nil {

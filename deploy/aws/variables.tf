@@ -559,7 +559,7 @@ variable "workers_disk_size_gib" {
 }
 
 variable "workers_price_per_hour" {
-  description = "What one worker node costs an hour in dollars (the chart's workers.pricePerHour), for auto mode's cost estimates. 0 is unknown."
+  description = "What one worker node costs an hour in dollars (the chart's workers.pricePerHour), for auto mode's cost estimates. 0: the list price of its instance type, from Igloo's built-in table (docs/distributed-execution.md#prices)."
   type        = number
   default     = 0
 
@@ -625,7 +625,7 @@ variable "large_worker_memory" {
 }
 
 variable "large_worker_price_per_hour" {
-  description = "What the large worker's node costs an hour in dollars (the chart's workers.large.pricePerHour), for auto mode's cost estimates. 0 is unknown."
+  description = "What the large worker's node costs an hour in dollars (the chart's workers.large.pricePerHour), for auto mode's cost estimates. 0: the list price of its instance type, from Igloo's built-in table (docs/distributed-execution.md#prices)."
   type        = number
   default     = 0
 

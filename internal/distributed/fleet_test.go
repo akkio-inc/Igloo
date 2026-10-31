@@ -431,3 +431,42 @@ func TestLeastBusy(t *testing.T) {
 		t.Errorf("least busy: %v", ids)
 	}
 }
+
+// TestListPrices checks what a worker is taken to cost where no price is
+// set: the list price of its instance type, as told or as the worker
+// reports it, on Spot or not; a set price stands.
+func TestListPrices(t *testing.T) {
+	co := &Coordinator{opts: Options{Region: "us-east-1"}}
+	reports := []*worker{{status: workerStatus{InstanceType: "m7gd.2xlarge", Spot: true, Region: "eu-west-1"}}}
+	for _, c := range []struct {
+		name string
+		set  float64
+		typ  string
+		spot bool
+		ws   []*worker
+		want float64
+	}{
+		{"set", 0.31, "m7gd.2xlarge", false, reports, 0.31},
+		{"told", 0, "r7gd.16xlarge", false, reports, 4.3546},
+		{"told, Spot", 0, "m7gd.2xlarge", true, nil, 0.4271 * 0.35},
+		{"as the worker reports", 0, "", false, reports, 0.4271 * 0.35},
+		{"unknown", 0, "", false, nil, 0},
+	} {
+		if got := co.price(c.set, c.typ, c.spot, c.ws); math.Abs(got-c.want) > 0.002 {
+			t.Errorf("%s: %.4f, want %.4f", c.name, got, c.want)
+		}
+	}
+	// With list prices alone, a statement within a fifth of the fastest on
+	// a large worker of 64 cores and 16 workers of 8 runs on the cheaper:
+	// the large worker, at its r7gd.16xlarge's $4.35 against 16
+	// m7gd.2xlarge's $6.83 an hour.
+	f := scaleWorkers
+	f.price = co.price(0, "m7gd.2xlarge", false, nil)
+	l := scaleLarge
+	l.running, l.price = true, co.price(0, "r7gd.16xlarge", false, nil)
+	f.large = &l
+	mid := features{bytes: 4e10, held: 1e10, rows: 1e10, levels: 3, stages: 10}
+	if e := mid.estimate(scaleCoordinator, f); !e.large || !e.dollars {
+		t.Errorf("by list prices: %d workers, large %v, dollars %v (%s)", e.workers, e.large, e.dollars, e.fleet)
+	}
+}

@@ -78,3 +78,35 @@ func TestGrace(t *testing.T) {
 		t.Errorf("twenty seconds ahead: grace %s, want the floor", g)
 	}
 }
+
+// TestDescribeEC2 checks what the metadata service says of the machine.
+func TestDescribeEC2(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/latest/api/token" {
+			_, _ = rw.Write([]byte("tok"))
+			return
+		}
+		if r.Header.Get("X-aws-ec2-metadata-token") != "tok" {
+			http.Error(rw, "", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/latest/meta-data/instance-type":
+			_, _ = rw.Write([]byte("m7gd.2xlarge"))
+		case "/latest/meta-data/placement/region":
+			_, _ = rw.Write([]byte("us-east-2"))
+		case "/latest/meta-data/instance-life-cycle":
+			_, _ = rw.Write([]byte("spot"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer srv.Close()
+	in, err := DescribeEC2(context.Background(), srv.URL)
+	if err != nil || in != (Instance{Type: "m7gd.2xlarge", Region: "us-east-2", Spot: true}) {
+		t.Errorf("instance %+v, %v", in, err)
+	}
+	if _, err := DescribeEC2(context.Background(), "http://127.0.0.1:1"); !errors.Is(err, ErrNotEC2) {
+		t.Errorf("no metadata service: %v", err)
+	}
+}

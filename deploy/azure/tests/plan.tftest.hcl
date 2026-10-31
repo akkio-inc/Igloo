@@ -442,6 +442,9 @@ run "workers_on_spot_with_regular_fallback" {
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
       yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.32 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "Standard_D16pds_v6" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.region != "" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.cpu == "14" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.resources.limits.memory == "54Gi" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.duckdb.spillVolume.sizeLimit == "480Gi" &&
@@ -513,6 +516,7 @@ run "large_worker" {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == true &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.pricePerHour == 4.03 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.instanceType == "Standard_E64pds_v6" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.requests.cpu == "57" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.limits.memory == "435Gi" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.nodeSelector == { "igloo.dev/node" = "large-worker" } &&

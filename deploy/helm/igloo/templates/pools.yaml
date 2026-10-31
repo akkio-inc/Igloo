@@ -24,11 +24,11 @@ pools copy the values, so their pods see the same checksum. */ -}}
 {{- if and $pool.workers (hasKey $pool.workers "enabled") }}
 {{- $_ := set $values.workers "enabled" $pool.workers.enabled }}
 {{- end }}
-{{- if and $pool.workers (hasKey $pool.workers "pricePerHour") }}
-{{- $_ := set $values.workers "pricePerHour" $pool.workers.pricePerHour }}
+{{- range $key := list "pricePerHour" "spot" }}
+{{- if and $pool.workers (hasKey $pool.workers $key) }}{{ $_ := set $values.workers $key (get $pool.workers $key) }}{{ end }}
 {{- end }}
 {{- $poolLarge := dig "workers" "large" (dict) $pool }}
-{{- range $key := list "enabled" "pricePerHour" }}
+{{- range $key := list "enabled" "pricePerHour" "spot" }}
 {{- if hasKey $poolLarge $key }}{{ $_ := set $values.workers.large $key (get $poolLarge $key) }}{{ end }}
 {{- end }}
 {{- $_ := set $values "extraEnv" (concat ($.Values.extraEnv | default list) ($pool.extraEnv | default list)) }}

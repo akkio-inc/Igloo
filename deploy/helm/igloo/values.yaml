@@ -423,8 +423,17 @@ workers:
   # is reclaimed) finishes its running tasks for up to 30s; keep this above.
   terminationGracePeriodSeconds: 45
   # What one worker's machine costs an hour, e.g. 0.31 for a Spot node, for
-  # auto mode's cost estimates -> IGLOO_WORKER_PRICE_PER_HOUR. 0: unknown.
+  # auto mode's cost estimates -> IGLOO_WORKER_PRICE_PER_HOUR. 0: unknown,
+  # when the list price of instanceType stands for it (on Spot with spot),
+  # from igloo's built-in table of common machines, in region.
   pricePerHour: 0
+  # The workers' machine, e.g. m7gd.4xlarge, Standard_D16pds_v6 or
+  # n4-standard-16 -> IGLOO_WORKER_INSTANCE_TYPE; spot -> IGLOO_WORKER_SPOT;
+  # region, e.g. us-east-1 -> IGLOO_CLOUD_REGION. The OpenTofu modules set
+  # them.
+  instanceType: ""
+  spot: false
+  region: ""
   # One large worker ("scale up"): a second worker Deployment,
   # <fullname>-workers-large, of one pod on a large machine (512 GiB class),
   # which auto mode may run a whole statement on when its estimate (fits in
@@ -436,8 +445,12 @@ workers:
   # with a minimum size of zero (nodeSelector, tolerations).
   large:
     enabled: false
-    # -> IGLOO_LARGE_WORKER_PRICE_PER_HOUR, as workers.pricePerHour.
+    # -> IGLOO_LARGE_WORKER_PRICE_PER_HOUR, as workers.pricePerHour, and
+    # -> IGLOO_LARGE_WORKER_INSTANCE_TYPE, IGLOO_LARGE_WORKER_SPOT, as
+    # workers.instanceType and workers.spot.
     pricePerHour: 0
+    instanceType: ""
+    spot: false
     duckdb:
       # Empty: 80% of resources.limits.memory, as for workers; igloo pods
       # also get it as IGLOO_LARGE_WORKER_MEMORY, for estimates while the

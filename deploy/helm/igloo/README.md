@@ -368,7 +368,12 @@ igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> 
 - With `scaleToZero.enabled`, the gateway stops the workers along with the
   igloo pods.
 - `workers.pricePerHour` is what one worker's machine costs an hour
-  (`IGLOO_WORKER_PRICE_PER_HOUR`), for auto mode's cost estimates.
+  (`IGLOO_WORKER_PRICE_PER_HOUR`), for auto mode's cost estimates. Left at
+  0, the list price of `workers.instanceType` stands for it, on Spot with
+  `workers.spot`, in `workers.region`, from Igloo's built-in table (see
+  [prices](../../../docs/distributed-execution.md#prices)); the same goes
+  for `workers.large.pricePerHour`, `instanceType` and `spot`. The OpenTofu
+  modules set the instance types, Spot and region.
 
 ### A large worker
 

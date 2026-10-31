@@ -127,9 +127,14 @@ locals {
         enabled      = true
         maxReplicas  = var.workers_max
         pricePerHour = var.workers_price_per_hour
+        # Where no price is set, igloo prices the machines from its table of
+        # list prices (docs/distributed-execution.md#prices).
+        instanceType = var.workers_instance_types[0]
+        spot         = var.workers_spot
+        region       = var.region
         large = merge(
           { enabled = var.large_worker_enabled },
-          { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour }) : k => v if var.large_worker_enabled },
+          { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour, instanceType = var.large_worker_instance_types[0], spot = var.large_worker_spot }) : k => v if var.large_worker_enabled },
         )
       })
     } : key => value if var.workers_enabled

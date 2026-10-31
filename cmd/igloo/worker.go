@@ -75,6 +75,17 @@ func serveWorker() error {
 	if p := eng.Prefetcher(); p != nil {
 		opts.Prefetch = prefetchTasks(p)
 	}
+	// What machine it runs on, for coordinators that were not told its
+	// price (package prices): on EC2, outside Kubernetes, whose chart tells
+	// them and whose pods seldom reach the metadata service.
+	if cfg.Workers.SpotNotice && os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if in, err := spot.DescribeEC2(dctx, spot.EC2); err == nil {
+			opts.InstanceType, opts.Region, opts.Spot = in.Type, in.Region, in.Spot
+			log.Info("running on EC2", "instance_type", in.Type, "region", in.Region, "spot", in.Spot)
+		}
+		dcancel()
+	}
 	if opts.Erasure, err = workerErasure(eng, &opts, cfg.Workers.IsolatedPurgeAfter); err != nil {
 		return err
 	}
@@ -218,6 +229,8 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout,
 		},
 		WorkerPrice: cfg.Workers.Price, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
+		WorkerInstanceType: cfg.Workers.InstanceType, WorkerSpot: cfg.Workers.Spot, Region: cfg.Workers.Region,
+		LargeInstanceType: l.InstanceType, LargeSpot: l.Spot,
 	}, log)
 	if err != nil {
 		return nil, fmt.Errorf("distributed execution: %w", err)

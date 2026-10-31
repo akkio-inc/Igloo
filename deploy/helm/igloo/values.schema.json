@@ -1074,7 +1074,19 @@
         "pricePerHour": {
           "type": "number",
           "minimum": 0,
-          "description": "Hourly price of one worker's machine, for auto mode's cost estimates; 0 for unknown."
+          "description": "Hourly price of one worker's machine, for auto mode's cost estimates; 0 for unknown, when instanceType's list price stands for it."
+        },
+        "instanceType": {
+          "type": "string",
+          "description": "The workers' instance type (m7gd.4xlarge, Standard_D16pds_v6, n4-standard-16), for its list price where pricePerHour is 0."
+        },
+        "spot": {
+          "type": "boolean",
+          "description": "The workers run on Spot capacity, for their list price."
+        },
+        "region": {
+          "type": "string",
+          "description": "The cloud region, for list prices (us-east-1, eastus, us-central1)."
         },
         "large": {
           "type": "object",
@@ -1086,6 +1098,12 @@
             },
             "pricePerHour": {
               "$ref": "#/properties/workers/properties/pricePerHour"
+            },
+            "instanceType": {
+              "$ref": "#/properties/workers/properties/instanceType"
+            },
+            "spot": {
+              "$ref": "#/properties/workers/properties/spot"
             },
             "duckdb": {
               "$ref": "#/properties/workers/properties/duckdb"

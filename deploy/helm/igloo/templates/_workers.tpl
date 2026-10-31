@@ -211,6 +211,18 @@ rounded down and at least 1; empty when neither is set. Call with
 - name: IGLOO_WORKER_PRICE_PER_HOUR
   value: {{ . | toString | quote }}
 {{- end }}
+{{- with .Values.workers.instanceType }}
+- name: IGLOO_WORKER_INSTANCE_TYPE
+  value: {{ . | quote }}
+{{- end }}
+{{- if .Values.workers.spot }}
+- name: IGLOO_WORKER_SPOT
+  value: "true"
+{{- end }}
+{{- with .Values.workers.region }}
+- name: IGLOO_CLOUD_REGION
+  value: {{ . | quote }}
+{{- end }}
 {{- if include "igloo.runsLargeWorker" . }}
 {{- $large := include "igloo.largeWorkerValues" . | fromYaml }}
 {{- $name := include "igloo.largeWorkerName" . }}
@@ -232,6 +244,14 @@ rounded down and at least 1; empty when neither is set. Call with
 {{- with .Values.workers.large.pricePerHour }}
 - name: IGLOO_LARGE_WORKER_PRICE_PER_HOUR
   value: {{ . | toString | quote }}
+{{- end }}
+{{- with .Values.workers.large.instanceType }}
+- name: IGLOO_LARGE_WORKER_INSTANCE_TYPE
+  value: {{ . | quote }}
+{{- end }}
+{{- if .Values.workers.large.spot }}
+- name: IGLOO_LARGE_WORKER_SPOT
+  value: "true"
 {{- end }}
 {{- end }}
 {{- end -}}

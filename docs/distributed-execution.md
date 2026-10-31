@@ -392,8 +392,9 @@ with its own estimate (its start, its stages' rounds, what its cores read,
 and the start of workers it would start), and on the pool's [large
 worker](#a-large-worker) if it has one. Of those estimated within a fifth of
 the fastest, it takes the cheapest: each machine's seconds at its price an
-hour (`IGLOO_WORKER_PRICE_PER_HOUR` and `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`;
-without prices, a machine's price goes with its cores), counting the idle
+hour (`IGLOO_WORKER_PRICE_PER_HOUR` and `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`,
+or else the list price of their instance types, see [prices](#prices)),
+counting the idle
 time a worker started for it stays up after (see [sizing and
 cost](#sizing-and-cost)). A statement of a few stages over a few gigabytes
 gains little from more workers, most of its time being their start and its
@@ -1011,7 +1012,9 @@ On the Igloo server:
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |
-| `IGLOO_WORKER_PRICE_PER_HOUR` | `0` | What a worker costs an hour, for weighing how many workers, or the large worker, a statement runs on (see [when](#when)); `0` for unknown, when a machine's price is taken to go with its cores |
+| `IGLOO_WORKER_PRICE_PER_HOUR` | `0` | What a worker costs an hour, for weighing how many workers, or the large worker, a statement runs on (see [when](#when)); `0` for unknown, when the list price of `IGLOO_WORKER_INSTANCE_TYPE` stands for it (see [prices](#prices)) |
+| `IGLOO_WORKER_INSTANCE_TYPE`, `IGLOO_WORKER_SPOT`, `IGLOO_CLOUD_REGION` | | The workers' instance type (`m7gd.4xlarge`, `Standard_D16pds_v6`, `n4-standard-16`), whether they run on Spot (`false`), and the region, for their list price where no price is set |
+| `IGLOO_LARGE_WORKER_INSTANCE_TYPE`, `IGLOO_LARGE_WORKER_SPOT` | | The same for the large worker |
 | `IGLOO_LARGE_WORKER` | | The pool's [large worker](#a-large-worker), `host[:port]` (port 7433 by default), which auto mode may run a statement on alone; empty for none. Needs `IGLOO_WORKERS` |
 | `IGLOO_LARGE_WORKER_COMPUTE` | | How to start and stop it: `kubernetes` (`IGLOO_LARGE_WORKER_K8S_DEPLOYMENT`, in the workers' namespace), `ec2` (`IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS`), `command` (`IGLOO_LARGE_WORKER_START_COMMAND`, `IGLOO_LARGE_WORKER_STOP_COMMAND`), or empty when it always runs |
 | `IGLOO_LARGE_WORKER_CORES`, `IGLOO_LARGE_WORKER_MEMORY` | | Its cores and DuckDB memory limit (a size such as `400GiB`), for estimates while it is stopped and has not answered; required with `IGLOO_LARGE_WORKER_COMPUTE` |
@@ -1064,6 +1067,37 @@ is what workers cost after their last task until they stop: with
 start took, from 2 to 10 minutes, about as long as a start costs. Workers
 that start in half a minute stop after 2 idle minutes; on a 32-core machine
 at $1.71 an hour, a 10-minute tail cost $0.28 after each burst of work.
+
+### Prices
+
+Auto mode weighs the ways a statement could run by what their machines
+cost (see [when](#when)). `IGLOO_WORKER_PRICE_PER_HOUR` and
+`IGLOO_LARGE_WORKER_PRICE_PER_HOUR` set those prices; where they are not
+set, Igloo takes the list price of the machines' instance types from a
+table it carries (`internal/prices`): `IGLOO_WORKER_INSTANCE_TYPE` and
+`IGLOO_LARGE_WORKER_INSTANCE_TYPE` (such as `m7gd.4xlarge`,
+`Standard_D16pds_v6` or `n4-standard-16`), on Spot with `IGLOO_WORKER_SPOT`
+and `IGLOO_LARGE_WORKER_SPOT`, in `IGLOO_CLOUD_REGION`. The Helm chart sets
+them from `workers.instanceType`, `workers.spot`, `workers.region` and
+`workers.large.instanceType` and `spot`, and the OpenTofu modules from their
+worker variables. A worker on an EC2 virtual machine also reports its own
+instance type, region and Spot from the instance metadata service, which
+Igloo prices where it was told nothing.
+
+The table's numbers are list prices, not anyone's bill: on-demand, Linux,
+by the vCPU of each instance family as the providers list them for their
+base regions (AWS us-east-1, Azure eastus, Google Cloud us-central1) in
+October 2026, rounded. AWS's match the benchmarks' `bench/pricing.toml`;
+Azure's and Google Cloud's are approximate. A machine of a family costs as
+its vCPUs, which is what weighing a large machine against small ones of
+the same family needs. Other regions are the base region's price times a
+rough regional factor (eu-west-1 1.11, ap-northeast-1 1.28 and so on; a
+region the table does not know counts as the base region), and Spot is a
+typical discount (AWS 65%, Azure 70%, Google Cloud 65%) that in fact varies
+by type, zone and hour. Set the prices for exact or negotiated rates. Without
+a price or a known type, a machine's price goes with its cores. `EXPLAIN
+DISTRIBUTED`'s `options` row says whether the costs it weighed are in
+dollars.
 
 ### Spot workers
 

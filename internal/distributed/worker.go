@@ -72,6 +72,11 @@ type WorkerOptions struct {
 	// estimate how fast workers read object storage cold by their threads
 	// a core; zero for unknown.
 	Threads int
+	// InstanceType, Region and Spot say what machine the worker runs on, as
+	// its cloud's metadata says, for coordinators to price it (package
+	// prices) where they were not told; empty for unknown.
+	InstanceType, Region string
+	Spot                 bool
 	// ExchangeBytes caps what exchanges on its disk, written or fetched,
 	// may take there (IGLOO_EXCHANGE_MAX_SIZE), as on a volume whose size
 	// its free space does not show; zero leaves them to the free space.
@@ -244,6 +249,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
 		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
+		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot,
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",

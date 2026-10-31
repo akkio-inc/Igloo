@@ -247,6 +247,11 @@ type workerStatus struct {
 	// not say.
 	Slots   int `json:"slots,omitempty"`
 	Threads int `json:"threads,omitempty"`
+	// InstanceType, Region and Spot say what machine it runs on, where its
+	// cloud's metadata says (see WorkerOptions).
+	InstanceType string `json:"instance_type,omitempty"`
+	Region       string `json:"region,omitempty"`
+	Spot         bool   `json:"spot,omitempty"`
 	// Boot is random to each run of the worker.
 	Boot        string  `json:"boot,omitempty"`
 	Running     int     `json:"running"`

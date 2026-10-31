@@ -138,3 +138,51 @@ func (w *watcher) check(ctx context.Context) (Notice, bool) {
 	}
 	return Notice{Action: action.Action, Time: at}, true
 }
+
+// Instance is what the instance metadata service says of the machine: its
+// instance type, its region, and whether it is a Spot Instance.
+type Instance struct {
+	Type, Region string
+	Spot         bool
+}
+
+// DescribeEC2 asks the instance metadata service at base (IMDSv2) what the
+// machine is, for the list price of its kind (package prices). It returns
+// ErrNotEC2 if the service gives no token within a few seconds.
+func DescribeEC2(ctx context.Context, base string) (Instance, error) {
+	w := &watcher{base: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 3 * time.Second}}
+	if err := w.refresh(ctx); err != nil {
+		return Instance{}, fmt.Errorf("%w: %v", ErrNotEC2, err)
+	}
+	var in Instance
+	var err error
+	if in.Type, err = w.get(ctx, "instance-type"); err != nil {
+		return Instance{}, err
+	}
+	in.Region, _ = w.get(ctx, "placement/region")
+	lifecycle, _ := w.get(ctx, "instance-life-cycle")
+	in.Spot = lifecycle == "spot"
+	return in, nil
+}
+
+// get reads a value of the instance's metadata.
+func (w *watcher) get(ctx context.Context, path string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.base+"/latest/meta-data/"+path, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-aws-ec2-metadata-token", w.token)
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s: %s", path, resp.Status)
+	}
+	return strings.TrimSpace(string(body)), nil
+}

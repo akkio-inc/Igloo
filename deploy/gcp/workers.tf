@@ -72,6 +72,14 @@ locals {
     }
   }
 
+  # The machine type Autopilot gives a worker pod, for its list price: the
+  # family's next size up from the pod's CPU, highmem where the pod asks
+  # for more than 6 GiB a vCPU; empty where the requests do not parse.
+  workers_cpus         = try(ceil(endswith(var.workers_cpu, "m") ? tonumber(trimsuffix(var.workers_cpu, "m")) / 1000 : tonumber(var.workers_cpu)), 0)
+  workers_machine_cpus = try([for n in [2, 4, 8, 16, 32, 48, 64, 80] : n if n >= local.workers_cpus][0], 0)
+  workers_machine_type = try(format("%s-%s-%d", var.workers_machine_family,
+  tonumber(trimsuffix(var.workers_memory, "Gi")) / local.workers_machine_cpus > 6 ? "highmem" : "standard", local.workers_machine_cpus), "")
+
   # Merged into helm_values in helm.tf; nothing without workers_enabled, so
   # the chart's values stay as before.
   workers_helm_values = {
@@ -80,9 +88,14 @@ locals {
         enabled      = true
         maxReplicas  = var.workers_max
         pricePerHour = var.workers_price_per_hour
+        # Where no price is set, igloo prices the machines from its table of
+        # list prices (docs/distributed-execution.md#prices).
+        instanceType = local.workers_machine_type
+        spot         = var.workers_spot
+        region       = var.region
         large = merge(
           { enabled = var.large_worker_enabled },
-          { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour }) : k => v if var.large_worker_enabled },
+          { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour, instanceType = var.large_worker_machine_type, spot = var.large_worker_spot }) : k => v if var.large_worker_enabled },
         )
       })
     } : key => value if var.workers_enabled

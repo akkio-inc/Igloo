@@ -506,6 +506,9 @@ run "workers_on_spot_with_on_demand_fallback" {
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
       yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.35 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "m7gd.4xlarge" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.region == "us-east-1" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == false
     )
     error_message = "The chart must turn workers on, with workers_max and the workers' price, and no large worker."
@@ -653,6 +656,8 @@ run "large_worker" {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == true &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.pricePerHour == 4.355 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.instanceType == "r7gd.16xlarge" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.spot == false &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.requests.cpu == "57" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.limits.memory == "435Gi" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.large.duckdb.spillVolume.sizeLimit == "1946Gi" &&

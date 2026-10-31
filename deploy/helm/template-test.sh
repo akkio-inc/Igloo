@@ -126,6 +126,9 @@ check "igloo pods find the large worker" '"igloo-workers-large:7433"|kubernetes|
 check "and know its size and price" '"60"|"367001MiB"|"4.35"' \
   "$(lw IGLOO_LARGE_WORKER_CORES)|$(lw IGLOO_LARGE_WORKER_MEMORY)|$(lw IGLOO_LARGE_WORKER_PRICE_PER_HOUR)"
 check "and the workers' price" '"0.31"' "$(lw IGLOO_WORKER_PRICE_PER_HOUR)"
+check "and the machines, for list prices" '"m7gd.4xlarge"|"true"|"us-east-2"|"r7gd.16xlarge"|' \
+  "$(lw IGLOO_WORKER_INSTANCE_TYPE)|$(lw IGLOO_WORKER_SPOT)|$(lw IGLOO_CLOUD_REGION)|$(lw IGLOO_LARGE_WORKER_INSTANCE_TYPE)|$(lw IGLOO_LARGE_WORKER_SPOT)"
+check "a pool on demand says so" '' "$(envf "$work/large.yaml" Deployment igloo-pool-reporting IGLOO_WORKER_SPOT)"
 check "its DuckDB limit is the one igloo pods estimate with" "$(lw IGLOO_LARGE_WORKER_MEMORY)" \
   "$(envf "$work/large.yaml" Deployment igloo-workers-large IGLOO_DUCKDB_MEMORY_LIMIT)"
 check "it starts with no pods and runs igloo worker" '  replicas: 0|args: ["worker"]' \
