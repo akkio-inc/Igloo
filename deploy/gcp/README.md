@@ -21,6 +21,7 @@ Run it as a root module: it configures its own providers.
 | Cloud SQL for PostgreSQL 17 | Private IP only (private services access), TLS required, daily backups and point-in-time recovery, generated password. One database, `igloo`: the catalog uses schema `public`, Igloo's users and roles use schema `igloo_auth` |
 | Kubernetes namespace and Secrets | `igloo-admin` (`password`), `igloo-database` (`url`), `igloo-catalog-encryption` (`encryption-key`), `igloo-gcs-hmac` (`hmac-key-id`, `hmac-secret`), and `igloo-tls` when you supply a certificate |
 | Helm release `igloo` | The chart at `../helm/igloo`, wired to everything above |
+| Compute classes (optional) | With `workers_enabled`, `igloo-workers` (Spot first, then on-demand) for [distributed-execution workers](#distributed-execution-workers), and with `large_worker_enabled`, `igloo-large-worker`, installed by the Helm release `igloo-compute-classes` from `compute-classes/` |
 | Google APIs | Compute, GKE, Cloud SQL Admin, Service Networking, IAM, IAM Credentials, STS, Storage, Resource Manager. Left enabled on destroy |
 
 ## Why Autopilot
@@ -171,6 +172,9 @@ psql "host=sql.example.com port=5432 user=igloo dbname=igloo sslmode=verify-full
 | `bucket_soft_delete_days` | `7` | Deleted objects stay recoverable this long |
 | `deletion_protection` | `true` | Protect the cluster and database from deletion |
 | `control_plane_authorized_cidrs` | `[]` | CIDRs allowed on the control plane's public IP endpoint (none needed; see below) |
+| `workers_enabled`, `workers_spot`, `workers_machine_family`, `workers_max` | `false`, `true`, `n4`, `4` | [Distributed-execution workers](#distributed-execution-workers): Spot first, on-demand when Spot has no capacity |
+| `workers_cpu`, `workers_memory`, `workers_spill_size`, `workers_cache_size`, `workers_price_per_hour` | `14`, `54Gi`, `80Gi`, `28Gi`, `0` | Worker pod size, volumes and price |
+| `large_worker_enabled`, `large_worker_spot`, `large_worker_machine_type`, `large_worker_price_per_hour` | `false`, `false`, `n4-highmem-64`, `0` | One large worker, on-demand by default |
 
 See `variables.tf` for the network ranges and the rest.
 
@@ -188,6 +192,9 @@ check the [pricing calculator](https://cloud.google.com/products/calculator).
 | Cloud NAT | $3, plus $0.045 per GiB processed (mostly image pulls) |
 | Cloud Storage, Standard, regional | $0.020 per GiB stored, plus operations ($2 for 100 GiB) |
 | **Total, before storage growth** | **about $255 on demand; about $125 with `spot = true`** |
+
+Workers and the large worker cost nothing while stopped; while they run,
+their nodes are billed by the hour.
 
 Traffic between the pods and a bucket in the same region is free. Logging
 (including VPC flow logs) usually stays within the free 50 GiB per project.
@@ -225,6 +232,59 @@ the machine types of that series. Local SSD is emptied when a node is
 deleted or repaired; spill files only live for a query, so nothing is lost.
 Check that the series is offered in your region with Local SSD, and that your
 GKE version supports it (C4D needs 1.32.9-gke.1711000 or later).
+
+## Distributed-execution workers
+
+`workers_enabled = true` runs statements that read very large tables in
+parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
+It is off by default, so applying this version to an existing deployment
+changes nothing. Autopilot needs no node pool for them: the module creates
+a [custom compute
+class](https://cloud.google.com/kubernetes-engine/docs/concepts/about-custom-compute-classes),
+`igloo-workers`, and the chart's worker pods select it
+(`cloud.google.com/compute-class: igloo-workers`):
+
+```yaml
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: igloo-workers
+spec:
+  priorities:
+    - { machineFamily: n4, spot: true }    # workers_machine_family; dropped with workers_spot = false
+    - { machineFamily: n4, spot: false }
+  whenUnsatisfiable: DoNotScaleUp
+```
+
+When Igloo starts workers, Autopilot creates nodes for them from the first
+rule it can satisfy: Spot when Google has Spot capacity for the series, an
+on-demand node of the same series when it does not. A worker that fits no
+rule waits; a statement waits for workers at most `workers.startTimeout` (3
+minutes) and then runs on its igloo pod. Igloo pods keep their own
+scheduling (`spot`, on-demand by default): they hold client sessions. When
+Google preempts a Spot node, its worker gets about 25 seconds to finish its
+tasks, and what it has not finished runs again on other workers. Worker
+nodes go away once Igloo stops idle workers; with a machine series named,
+Autopilot bills them per node.
+
+Each worker requests 14 vCPUs and 54 GiB (`workers_cpu`, `workers_memory`),
+which Autopilot runs on a 16-vCPU machine of the series, and ephemeral
+storage for its spill (`workers_spill_size`, 80Gi) and read cache
+(`workers_cache_size`, 28Gi), plus 1Gi: Autopilot caps `emptyDir` volumes
+at that request, and the boot disk that holds them at about 122 GiB.
+
+The large worker (`large_worker_enabled = true`) is one pod on an
+`n4-highmem-64` (64 vCPUs, 512 GB), through a class of its own,
+`igloo-large-worker`, which auto mode may run a whole statement on (see the
+chart's [large worker](../helm/igloo/README.md#a-large-worker)). It is
+on-demand by default; `large_worker_spot = true` puts a Spot rule first.
+
+The classes are installed by a small chart of the module's own,
+`compute-classes/`, rather than with `kubernetes_manifest`, which needs the
+cluster's API to plan and so cannot be created in the same apply as the
+cluster. Set `workers_price_per_hour` and `large_worker_price_per_hour` to
+what a node costs, so auto mode can weigh price; Spot is typically 60 to 91%
+below on-demand. Left at 0, the price is unknown.
 
 ## Storage access
 

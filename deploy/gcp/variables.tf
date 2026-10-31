@@ -270,6 +270,182 @@ variable "duckdb_memory_limit" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Distributed-execution workers (docs/distributed-execution.md)
+# ---------------------------------------------------------------------------
+
+variable "workers_enabled" {
+  description = "Turn on distributed-execution workers, with a GKE compute class that runs them on Spot capacity and falls back to on-demand. Off by default, so existing deployments are unchanged."
+  type        = bool
+  default     = false
+}
+
+variable "workers_spot" {
+  description = "Put Spot capacity first in the workers' compute class, before on-demand. Workers hold no state and a lost worker's tasks run again on another, so Spot suits them; igloo pods keep the spot setting above."
+  type        = bool
+  default     = true
+}
+
+variable "workers_machine_family" {
+  description = "Machine series of worker nodes in their compute class, e.g. \"n4\", \"n2\" or \"c4a\". Autopilot picks the machine type that fits a worker pod."
+  type        = string
+  default     = "n4"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9]{1,7}$", var.workers_machine_family))
+    error_message = "workers_machine_family must be a machine series name such as \"n4\"."
+  }
+}
+
+variable "workers_max" {
+  description = "The most worker pods Igloo starts (the chart's workers.maxReplicas)."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.workers_max >= 1 && var.workers_max <= 100 && floor(var.workers_max) == var.workers_max
+    error_message = "workers_max must be a whole number from 1 to 100."
+  }
+}
+
+variable "workers_cpu" {
+  description = "CPU request of each worker pod. With the default memory, Autopilot runs each on a 16-vCPU machine."
+  type        = string
+  default     = "14"
+
+  validation {
+    condition     = can(regex("^([0-9]+(\\.[0-9]+)?|[0-9]+m)$", var.workers_cpu))
+    error_message = "workers_cpu must be a Kubernetes CPU quantity such as \"14\"."
+  }
+}
+
+variable "workers_memory" {
+  description = "Memory request and limit of each worker pod."
+  type        = string
+  default     = "54Gi"
+
+  validation {
+    condition     = can(regex("^[0-9]+(Mi|Gi)$", var.workers_memory))
+    error_message = "workers_memory must be a quantity in Mi or Gi, e.g. \"54Gi\"."
+  }
+}
+
+variable "workers_spill_size" {
+  description = "Spill volume of each worker. Autopilot provisions spill and read cache as the pod's ephemeral storage, on the node's boot disk, at most about 122 GiB together."
+  type        = string
+  default     = "80Gi"
+
+  validation {
+    condition     = can(regex("^[0-9]+Gi$", var.workers_spill_size))
+    error_message = "workers_spill_size must be a quantity in Gi, e.g. \"80Gi\"."
+  }
+}
+
+variable "workers_cache_size" {
+  description = "Read cache volume of each worker, on the same ephemeral storage as its spill."
+  type        = string
+  default     = "28Gi"
+
+  validation {
+    condition     = can(regex("^[0-9]+Gi$", var.workers_cache_size))
+    error_message = "workers_cache_size must be a quantity in Gi, e.g. \"28Gi\"."
+  }
+}
+
+variable "workers_price_per_hour" {
+  description = "What one worker's machine costs an hour in dollars (the chart's workers.pricePerHour), for auto mode's cost estimates. 0 is unknown."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.workers_price_per_hour >= 0
+    error_message = "workers_price_per_hour must be 0 or more."
+  }
+}
+
+variable "large_worker_enabled" {
+  description = "Turn on one large worker that auto mode may run a whole statement on (the chart's workers.large), with a compute class of its own. Needs workers_enabled."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.large_worker_enabled || var.workers_enabled
+    error_message = "large_worker_enabled needs workers_enabled: the large worker is one of the workers."
+  }
+}
+
+variable "large_worker_spot" {
+  description = "Put Spot capacity first in the large worker's compute class. Off by default: the large worker runs whole statements, and on-demand is the default for it."
+  type        = bool
+  default     = false
+}
+
+variable "large_worker_machine_type" {
+  description = "Machine type of the large worker's node. Default: n4-highmem-64, 64 vCPUs and 512 GB of memory. Change large_worker_cpu and large_worker_memory with it."
+  type        = string
+  default     = "n4-highmem-64"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9]*-[a-z0-9-]+$", var.large_worker_machine_type))
+    error_message = "large_worker_machine_type must be a machine type such as \"n4-highmem-64\"."
+  }
+}
+
+variable "large_worker_cpu" {
+  description = "CPU request of the large worker pod: 90% of the default machine's 64 vCPUs."
+  type        = string
+  default     = "57"
+
+  validation {
+    condition     = can(regex("^([0-9]+(\\.[0-9]+)?|[0-9]+m)$", var.large_worker_cpu))
+    error_message = "large_worker_cpu must be a Kubernetes CPU quantity such as \"57\"."
+  }
+}
+
+variable "large_worker_memory" {
+  description = "Memory request and limit of the large worker pod: 85% of the default machine's 512 GB."
+  type        = string
+  default     = "435Gi"
+
+  validation {
+    condition     = can(regex("^[0-9]+(Mi|Gi)$", var.large_worker_memory))
+    error_message = "large_worker_memory must be a quantity in Mi or Gi, e.g. \"435Gi\"."
+  }
+}
+
+variable "large_worker_spill_size" {
+  description = "Spill volume of the large worker, on its ephemeral storage like the workers'. A statement auto mode sends to the large worker is one that fits in its memory."
+  type        = string
+  default     = "80Gi"
+
+  validation {
+    condition     = can(regex("^[0-9]+Gi$", var.large_worker_spill_size))
+    error_message = "large_worker_spill_size must be a quantity in Gi, e.g. \"80Gi\"."
+  }
+}
+
+variable "large_worker_cache_size" {
+  description = "Read cache volume of the large worker."
+  type        = string
+  default     = "28Gi"
+
+  validation {
+    condition     = can(regex("^[0-9]+Gi$", var.large_worker_cache_size))
+    error_message = "large_worker_cache_size must be a quantity in Gi, e.g. \"28Gi\"."
+  }
+}
+
+variable "large_worker_price_per_hour" {
+  description = "What the large worker's machine costs an hour in dollars (the chart's workers.large.pricePerHour), for auto mode's cost estimates. 0 is unknown."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.large_worker_price_per_hour >= 0
+    error_message = "large_worker_price_per_hour must be 0 or more."
+  }
+}
+
 variable "catalog_replica_count" {
   description = "Number of Lakekeeper catalog pods. The catalog is stateless; use 2 for availability during node upgrades."
   type        = number

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: igloo-compute-classes
+description: GKE compute classes for Igloo's distributed-execution workers, installed by deploy/gcp.
+type: application
+version: 0.1.0
