@@ -279,6 +279,37 @@ over all rows (no `PARTITION BY`), of different partitions in one `SELECT`,
 or that rank an aggregation's groups the stages keep only the first of
 (see above) run where the rows arrive, on the coordinator.
 
+### Bucketed tables
+
+A table [partitioned by `bucket(n, column)`](sql.md#bucketed-tables) keeps
+every row of a key in its bucket's files. Where a part needs its rows
+partitioned by that column, workers read the table by bucket instead of
+writing its rows to an exchange and reading them back: each task reads the
+files of some buckets, and of the same buckets of the other tables bucketed
+by the column they are joined on. That holds for
+
+- a join of tables bucketed by their join columns, one count dividing the
+  others (16 and 64), whose columns hash alike (integers of any width, or
+  the same type), even where one is small enough for every worker to read
+  whole: each task reads a share of each;
+- a `GROUP BY` that includes the bucket column, whose groups each bucket
+  then holds whole, so that tasks complete them;
+- aggregates over `DISTINCT` values of it, which each bucket counts alone;
+- [window functions](#window-functions) partitioned by it,
+
+when every file of the tables was written under a partition spec that
+buckets so, and the buckets are at least as many as the workers: a part
+reads them in as many tasks, two for each slot of the workers at most,
+balanced by their files' bytes. Rows whose column is `NULL` are read by one
+task. `EXPLAIN DISTRIBUTED` says, in `buckets` rows, which tables a part
+reads by bucket with no exchange, and why bucketed tables were exchanged
+all the same:
+
+```
+buckets | no exchange: public.orders by bucket[32](customer_id) and public.visits by bucket[64](customer_id), read by bucket, 32 groups of buckets a stage
+buckets | exchanged although public.orders by bucket[32](customer_id), public.events by bucket[48](customer_id): public.events's 48 buckets are not a multiple of 32
+```
+
 ### When
 
 A statement never runs on workers when the replica alone would be faster.
@@ -684,8 +715,12 @@ object storage there. The default stays `object`.
   why, and `options`, each way it weighed with its time, corrected by what
   the statement took before, and its cost; the `partitions` its
   exchanges would have with the workers running now; each stage (`stage 0
-  split public.events to exchange 1 (join)`) with the SQL its tasks
-  run; what `the coordinator` runs over their results; and why parts of it
+  split public.events to exchange 1 (join)`, `stage 1 buckets of
+  public.orders buckets of public.visits to the coordinator`) with the SQL
+  its tasks run; which bucketed tables are read by bucket with no exchange,
+  and why others are exchanged (`buckets`, see [bucketed
+  tables](#bucketed-tables)); what `the coordinator` runs over their
+  results; and why parts of it
   `stay on the coordinator`. After the statement has run on workers,
   `measured` says what its exchanges held (rows and gigabytes) and the most
   rows a stage wrote for each row it read, as the replica remembers them:

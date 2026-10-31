@@ -72,9 +72,13 @@ type Stage struct {
 type Input struct {
 	View string
 	// Table is a catalog table. Split divides its data files among the
-	// stage's tasks; otherwise every task reads all of them.
-	Table *Table
-	Split bool
+	// stage's tasks; Bucketed gives each task the files of some buckets of
+	// its bucketing Bucket (see bucket.go); otherwise every task reads all
+	// of them.
+	Table    *Table
+	Split    bool
+	Bucketed bool
+	Bucket   int
 	// Exchange is the rows earlier stages wrote. Partitioned gives each task
 	// one partition; otherwise every task reads all of them.
 	Exchange    *Exchange
@@ -104,6 +108,8 @@ func (s *Stage) String() string {
 		switch {
 		case in.Table != nil && in.Split:
 			fmt.Fprintf(&b, " split %s", in.Table)
+		case in.Table != nil && in.Bucketed:
+			fmt.Fprintf(&b, " buckets of %s", in.Table)
 		case in.Exchange != nil && in.Partitioned:
 			fmt.Fprintf(&b, " partitions of exchange %d", in.Exchange.ID)
 		case in.Exchange != nil:
@@ -440,6 +446,16 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		groups = e.groups(s)
 		tasks = len(groups)
 	}
+	// Tables read by bucket: each task reads the files of some buckets.
+	var buckets [][]int
+	var bucketFiles map[string][][]File
+	if n := s.bucketCount(); n > 0 {
+		var err error
+		if buckets, bucketFiles, err = e.bucketGroups(s, n); err != nil {
+			return err
+		}
+		tasks = len(buckets)
+	}
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
 	// What every task reads in full, and its bytes.
@@ -448,6 +464,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	var wholeBytes int64
 	for _, in := range s.Inputs {
 		switch {
+		case in.Table != nil && in.Bucketed:
 		case in.Table != nil && !in.Split:
 			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
 			def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
@@ -482,6 +499,16 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			switch {
 			case in.Table != nil && in.Split:
 				share := shares[i]
+				for _, f := range share {
+					bytes += f.Size
+				}
+				task.Views = append(task.Views, viewDef{Name: in.View, Columns: in.Table.Columns, Files: paths(share), Rows: rowCount(share),
+					Deletes: deletesOf(share), Prefetch: prefetchOf(used, in.View, share)})
+			case in.Table != nil && in.Bucketed:
+				var share []File
+				for _, b := range buckets[i] {
+					share = append(share, bucketFiles[in.View][b]...)
+				}
 				for _, f := range share {
 					bytes += f.Size
 				}

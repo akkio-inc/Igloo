@@ -38,6 +38,10 @@ type keyed struct {
 	view string
 	// stage, for a table, selects the rows its own stage partitions.
 	stage node
+	// bucketed says a table is read by bucket, with no stage of its own:
+	// by its bucketing bucket, of its key column (see bucket.go).
+	bucketed bool
+	bucket   int
 }
 
 func (k *keyed) String() string {
@@ -359,6 +363,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 		}
 		return unsupported("%s, too large to read in full, are not joined on equal columns", strings.Join(names, " and "))
 	}
+	pl.bucketKeyed(c)
 	return nil
 }
 

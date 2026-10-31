@@ -125,6 +125,10 @@ type Table struct {
 	// lower-case name, as ANALYZE keeps them; a column without one is
 	// missing.
 	Distinct map[string]int64
+	// Buckets are the bucket transforms of its partition spec that every
+	// data file of its snapshot was written under (see bucket.go); each
+	// File's Buckets says the file's bucket of each.
+	Buckets []Bucketing
 	// Unsupported, if set, says why workers cannot read the table, such as
 	// delete files they cannot apply.
 	Unsupported string
@@ -194,6 +198,10 @@ type Plan struct {
 	// (VERSION => n), by key: Execute runs it on workers only if each is
 	// the snapshot it loads (see pinVersion).
 	versions map[string]int64
+	// buckets say where bucketed tables are read by bucket, without an
+	// exchange, and why others are exchanged all the same, for EXPLAIN
+	// DISTRIBUTED (see bucket.go).
+	buckets []string
 }
 
 // ShortOfMemory reports whether the statement would not fit in the
@@ -323,6 +331,9 @@ type planner struct {
 	uncertain []uncertain
 	// relKeys are the keys of the relations exchanges hold, by exchange.
 	relKeys map[*Exchange]string
+	// bucketNotes say where bucketed tables were read by bucket, without
+	// an exchange, or why they were exchanged all the same (see bucket.go).
+	bucketNotes []string
 }
 
 type tableResult struct {
@@ -383,7 +394,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		keys[x.ID] = k
 	}
 	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys,
-		versions: pl.versions}, nil
+		versions: pl.versions, buckets: slices.Compact(slices.Clone(pl.bucketNotes))}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
@@ -1804,6 +1815,9 @@ func (pl *planner) chooseInputs(c *candidate) error {
 	}
 	if c.wholeBytes == 0 || c.wholeBytes <= pl.opts.maxBroadcast {
 		err := pl.chooseSplit(c)
+		if err == nil && c.split != nil && len(c.keyed) == 0 {
+			pl.bucketSplit(c)
+		}
 		if err == nil || c.wholeBytes == 0 || len(c.keyed) > 0 {
 			return err
 		}
@@ -2023,6 +2037,12 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 	last := &Stage{fragment: b.fragment, Columns: b.columns}
 	for _, k := range j.keyed {
 		var x *Exchange
+		if k.use != nil && k.bucketed {
+			// Read by bucket, as the table's files keep its rows: no stage
+			// and no exchange of its own (see bucket.go).
+			last.Inputs = append(last.Inputs, Input{View: k.view, Table: k.use.table, Bucketed: true, Bucket: k.bucket})
+			continue
+		}
 		if k.use != nil {
 			// A stage per partitioned table, writing its rows to an exchange
 			// keyed by its side of the join key.

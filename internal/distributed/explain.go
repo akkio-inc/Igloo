@@ -81,6 +81,9 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 	if final, err := co.parser.print(plan.final); err == nil {
 		rows = append(rows, [2]string{"the coordinator", final})
 	}
+	for _, b := range plan.buckets {
+		rows = append(rows, [2]string{"buckets", b})
+	}
 	for _, u := range plan.uncertain {
 		rows = append(rows, [2]string{"uncertain size", u.name + ": written and measured first, then read whole if every task can hold it, " +
 			"or by partition as planned"})

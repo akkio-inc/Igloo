@@ -38,6 +38,9 @@ type File struct {
 	Rows int64 `json:"rows"`
 	// Deletes, if set, are the delete files that apply to it.
 	Deletes *Deletes `json:"deletes,omitempty"`
+	// Buckets are its bucket of each of its table's Buckets, -1 for the
+	// rows whose column is NULL.
+	Buckets []int `json:"-"`
 }
 
 // Deletes are the delete files that apply to a data file, as the scan's
@@ -200,6 +203,7 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	// table it compacts, whose files all have field IDs.
 	t.Distinct = distinctCounts(tbl.Properties()[catalog.DistinctCountsProperty])
 	snap := tbl.CurrentSnapshot()
+	t.Buckets = icebergBuckets(ctx, tbl, snap)
 	t.source = &icebergHandle{tbl: tbl, snap: snap, columns: t.Columns}
 	if snap == nil {
 		return t, nil
@@ -249,11 +253,22 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 		return nil, fmt.Errorf("plan scan of %s: %w", t, err)
 	}
 	files = make([]File, 0, len(tasks))
+	bucketed := len(t.Buckets) > 0
 	for _, task := range tasks {
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
 		f := File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes(), Rows: task.File.Count()}
+		if bucketed {
+			// A file whose bucket cannot be told leaves every file without
+			// one: a stage reading the table by bucket then fails, and the
+			// statement runs on one machine.
+			if f.Buckets, bucketed = fileBuckets(h.tbl.Metadata(), task.File, t.Buckets); !bucketed {
+				for i := range files {
+					files[i].Buckets = nil
+				}
+			}
+		}
 		if n := len(task.DeleteFiles) + len(task.DeletionVectorFiles) + len(task.EqualityDeleteFiles); n > 0 {
 			f.Deletes = &Deletes{}
 		}
