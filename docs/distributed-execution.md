@@ -184,7 +184,10 @@ In detail, a part runs distributed when:
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
   functions but aggregates over all their rows (`min(day) OVER ()`) or
   windows that all partition their rows by the same columns (see
-  [window functions](#window-functions)), or a `UNION ALL` of them.
+  [window functions](#window-functions)), or a `UNION ALL` of them, or a
+  `UNION` of distinct rows, whose branches write their rows partitioned by
+  all of their columns and whose last stage keeps each partition's
+  distinct rows.
   An `ORDER BY` without `LIMIT` in such a subquery or common table
   expression counts for nothing where what reads it sorts again,
   aggregates, or takes distinct rows, as a report's last `SELECT` sorts

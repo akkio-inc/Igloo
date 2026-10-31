@@ -869,11 +869,14 @@ func (pl *planner) relationOut(r *relUse, x *Exchange) {
 func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
 	switch str(q["type"]) {
 	case "SET_OPERATION_NODE":
-		if str(q["setop_type"]) != "UNION" || q["setop_all"] != true {
+		if str(q["setop_type"]) != "UNION" {
 			return unsupported("%s in a relation", strings.ToLower(str(q["setop_type"])))
 		}
 		if len(list(q, "modifiers")) > 0 {
 			return unsupported("ORDER BY or LIMIT in a relation")
+		}
+		if q["setop_all"] != true {
+			return pl.produceUnion(q, scope, out, cols, wraps)
 		}
 		sc := scope.with(q)
 		for _, side := range []string{"left", "right"} {
@@ -897,6 +900,63 @@ func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column,
 		return pl.produceSelect(q, scope, out, cols, wraps)
 	}
 	return unsupported("%s in a relation", strings.ToLower(str(q["type"])))
+}
+
+// produceUnion plans the stages that write the rows of q, a UNION of
+// distinct rows, to out: its branches write theirs, as a UNION ALL's do,
+// to an exchange partitioned by all of their columns, so that equal rows
+// meet in one partition, and a last stage writes each partition's
+// distinct rows, applying wraps, to out.
+func (pl *planner) produceUnion(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
+	casts := make([]string, len(cols))
+	for i, c := range cols {
+		if slices.Contains(intTypes, c.Type) {
+			casts[i] = "BIGINT"
+		}
+	}
+	rows := pl.exchange("relation", names(cols), casts)
+	sc := scope.with(q)
+	for _, side := range []string{"left", "right"} {
+		branch := child(q, side)
+		if str(branch["type"]) == "SET_OPERATION_NODE" && str(branch["setop_type"]) == "UNION" && len(list(branch, "modifiers")) == 0 {
+			// UNION or UNION ALL within: the distinct rows of all, as
+			// those of a UNION ALL.
+			branch = clone(branch).(node)
+			allBranches(branch)
+		}
+		if err := pl.produce(branch, sc, rows, cols, nil); err != nil {
+			return err
+		}
+	}
+	f, err := pl.p.parse("SELECT DISTINCT * FROM " + quoteIdent("__igloo_r"))
+	if err != nil {
+		return err
+	}
+	have := cols
+	for _, w := range wraps {
+		if f, err = pl.conform(w.apply(f, have), w.have, w.want); err != nil {
+			return err
+		}
+		have = w.want
+	}
+	if len(wraps) > 0 {
+		if err := pl.checkFragment(f); err != nil {
+			return err
+		}
+	}
+	pl.stage(&Stage{fragment: f, Columns: names(have), Inputs: []Input{{View: "__igloo_r", Exchange: rows, Partitioned: true}}, Out: out})
+	return nil
+}
+
+// allBranches makes the UNIONs in a set operation, and those within it,
+// UNION ALLs.
+func allBranches(q node) {
+	if str(q["type"]) != "SET_OPERATION_NODE" || str(q["setop_type"]) != "UNION" || len(list(q, "modifiers")) > 0 {
+		return
+	}
+	q["setop_all"] = true
+	allBranches(child(q, "left"))
+	allBranches(child(q, "right"))
 }
 
 // overAll rewrites a SELECT whose window functions are aggregates over all
