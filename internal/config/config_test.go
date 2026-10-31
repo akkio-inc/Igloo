@@ -473,14 +473,15 @@ func TestErasureKey(t *testing.T) {
 	}
 }
 
-// IGLOO_EXCHANGES says where workers exchange rows: object storage unless
-// set to local or auto.
+// IGLOO_EXCHANGES says where workers exchange rows: auto (their disks
+// where every worker has room and runs outside Kubernetes) unless set to
+// object or local.
 func TestExchanges(t *testing.T) {
 	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
-	if err != nil || cfg.Workers.Exchanges != "object" {
+	if err != nil || cfg.Workers.Exchanges != "auto" {
 		t.Fatalf("default: %q %v", cfg.Workers.Exchanges, err)
 	}
-	for _, v := range []string{"local", "auto"} {
+	for _, v := range []string{"object", "local", "auto"} {
 		cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_EXCHANGES": v}))
 		if err != nil || cfg.Workers.Exchanges != v {
 			t.Fatalf("%s: %q %v", v, cfg.Workers.Exchanges, err)

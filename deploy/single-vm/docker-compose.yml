@@ -99,8 +99,8 @@ services:
       # large tables run in parts on the worker containers.
       IGLOO_WORKERS: ${IGLOO_WORKERS:-}
       IGLOO_WORKER_SECRET: ${IGLOO_WORKER_SECRET:-}
-      # Where workers exchange rows: object, local or auto (see .env).
-      IGLOO_EXCHANGES: ${IGLOO_EXCHANGES:-object}
+      # Where workers exchange rows: auto, object or local (see .env).
+      IGLOO_EXCHANGES: ${IGLOO_EXCHANGES:-auto}
     ports:
       # Loopback only by default. Set IGLOO_BIND=0.0.0.0 to accept remote
       # clients, and turn on TLS first (see .env).

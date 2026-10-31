@@ -74,7 +74,10 @@ sed -i.bak -e "s/^IGLOO_PORT=.*/IGLOO_PORT=$sql_port/" -e "s/^IGLOO_HTTP_PORT=.*
   -e "s|^IGLOO_IMAGE=.*|IGLOO_IMAGE=$image|" \
   -e "s/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=local-storage,workers/" -e "s/^IGLOO_WORKERS=.*/IGLOO_WORKERS=worker/" \
   -e "s/^IGLOO_WORKER_REPLICAS=.*/IGLOO_WORKER_REPLICAS=$workers/" -e "s/^IGLOO_WORKER_THREADS=.*/IGLOO_WORKER_THREADS=2/" \
-  -e "s/^IGLOO_WORKER_MEMORY_LIMIT=.*/IGLOO_WORKER_MEMORY_LIMIT=1GB/" -e "s/^IGLOO_CACHE_SIZE=.*/IGLOO_CACHE_SIZE=0/" "$env_file"
+  -e "s/^IGLOO_WORKER_MEMORY_LIMIT=.*/IGLOO_WORKER_MEMORY_LIMIT=1GB/" -e "s/^IGLOO_CACHE_SIZE=.*/IGLOO_CACHE_SIZE=0/" \
+  -e "s/^IGLOO_EXCHANGES=.*/IGLOO_EXCHANGES=object/" "$env_file"
+# Exchanges through object storage first; the default, auto, which has these
+# workers exchange on their disks, is checked further down.
 # Statements run with and without workers are compared, so each must run.
 echo "IGLOO_RESULT_CACHE_SIZE=0" >>"$env_file"
 admin_password="$(grep '^IGLOO_ADMIN_PASSWORD=' "$env_file" | cut -d= -f2)"
@@ -468,8 +471,9 @@ else
 fi
 
 echo "exchanges on workers' disks"
-# auto: this stack's workers run outside Kubernetes, with room on their
-# disks, so statements exchange rows there rather than through the bucket.
+# auto, the default: this stack's workers run outside Kubernetes, with room
+# on their disks, so statements exchange rows there rather than through the
+# bucket.
 set_exchanges() {
   if grep -q '^IGLOO_EXCHANGES=' "$env_file"; then
     sed -i.bak -e "s/^IGLOO_EXCHANGES=.*/IGLOO_EXCHANGES=$1/" "$env_file"

@@ -1010,15 +1010,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Opens cut short by a task's end no longer count in
   `igloo_prefetch_errors_total`, and the startup line gives the
   prefetcher's concurrency rather than 0 when it is unset.
-- `IGLOO_EXCHANGES=auto` has workers exchange a statement's rows on their
-  disks when every worker it runs on reports at least 1 GiB of room there
-  and runs outside Kubernetes, and through object storage otherwise;
-  recommended on machines with local NVMe, where two reports at ten times
-  the data on 16 workers took 34 s and 62 s rather than 95 s and 205 s
-  through S3. Workers report their room and whether they run in
-  Kubernetes; `igloo_distributed_exchanging_queries_total` counts
-  statements by where they exchanged rows. The single-machine Compose
-  stack passes `IGLOO_EXCHANGES` through. The default stays `object`.
+- `IGLOO_EXCHANGES=auto`, the default, has workers exchange a statement's
+  rows on their disks when every worker it runs on reports at least 1 GiB
+  of room there and runs outside Kubernetes, and through object storage
+  otherwise: two reports at ten times the data on 16 workers with NVMe
+  took 34 s and 62 s rather than 95 s and 205 s through S3. `object`
+  keeps every exchange in object storage, as before. Workers report their
+  room and whether they run in Kubernetes;
+  `igloo_distributed_exchanging_queries_total` counts statements by where
+  they exchanged rows. The single-machine Compose stack passes
+  `IGLOO_EXCHANGES` through. On Kubernetes the chart still sets `object`
+  unless `workers.exchanges` is `local`.
 - A scan of a table semi-joined, or inner-joined to a relation (a common
   table expression, a subquery, an exchange), such as an audience, reads
   ahead at most 256 MiB, as a filtered one does: DuckDB skips its row

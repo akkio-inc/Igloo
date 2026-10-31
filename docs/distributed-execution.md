@@ -646,9 +646,10 @@ give the workers more memory.
   and its server-side encryption. No credentials the Iceberg REST catalog
   hands out reach `_igloo_shuffle/`. What a coordinator that stopped
   mid-statement leaves behind, the replicas remove [within hours](#lifecycle-rule).
-  With `IGLOO_EXCHANGES=local` they are instead files on the workers'
-  disks, which workers send each other over the task port: see
-  [exchanges on workers' disks](#exchanges-on-workers-disks).
+  Outside Kubernetes, where workers have room on their disks (the default,
+  `IGLOO_EXCHANGES=auto`), or with `IGLOO_EXCHANGES=local`, they are instead
+  files on the workers' disks, which workers send each other over the task
+  port: see [exchanges on workers' disks](#exchanges-on-workers-disks).
 - **Pools are kept apart by secret and network.** Each compute pool's
   workers have a secret of their own (the Helm chart generates one per
   pool), so one pool's igloo pods cannot use another's workers; the
@@ -659,20 +660,20 @@ give the workers more memory.
 
 ## Exchanges on workers' disks
 
-By default workers exchange rows through the warehouse's object storage,
-which costs a request a file to write and several to read, tens of
-milliseconds each, and keeps what they wrote if a worker is lost. With
-`IGLOO_EXCHANGES=local` on the server, a worker writes them to its own disk
-(`IGLOO_DUCKDB_TEMP_DIR`, with spill), and the workers that read them fetch
-the files from it, whole, to their own disks first. In a lab of four
+Workers can exchange rows through the warehouse's object storage, which
+costs a request a file to write and several to read, tens of milliseconds
+each, and keeps what they wrote if a worker is lost; or a worker writes
+them to its own disk (`IGLOO_DUCKDB_TEMP_DIR`, with spill), and the workers
+that read them fetch the files from it, whole, to their own disks first. In a lab of four
 writers and four readers of 3 GB over 128 partitions, a stage that took 54 s
 through an object store answering in 25 ms took 17.5 s through the writers'
 disks, and the writers needed 0.9 GB of memory rather than 1.6.
 
-`IGLOO_EXCHANGES=auto` has workers exchange a statement's rows on their
-disks when every worker it runs on reports at least 1 GiB of room for them
-there and runs outside Kubernetes, and through object storage otherwise; it
-is the recommended setting for single machines and VMs with local NVMe.
+`IGLOO_EXCHANGES=auto`, the default, has workers exchange a statement's
+rows on their disks when every worker it runs on reports at least 1 GiB of
+room for them there and runs outside Kubernetes, and through object storage
+otherwise. `object` always uses object storage, and `local` the workers'
+disks wherever a task's share fits.
 On 16 workers with NVMe, at ten times the data, two reports took 34 s and
 62 s with exchanges on the workers' disks, where they took 95 s and 205 s
 through S3 (warm medians of three; the same rows, the same peak memory on
@@ -680,7 +681,7 @@ the workers, and no exchange objects in S3 rather than 11,000 and 19,000),
 and a statement through S3 at a hundred times the data had requests turned
 away (503 SlowDown). On Kubernetes the chart sets up the volume for
 exchanges only with `workers.exchanges: local`, so `auto` keeps them in
-object storage there. The default stays `object`.
+object storage there.
 
 - **Room.** A task writes to its disk only if twice what it is expected to
   write (what it reads; twice, for the copies its readers fetch), with what
@@ -898,6 +899,15 @@ default): node pools that scale from zero, or on GKE Autopilot a compute
 class, on [Spot capacity with an on-demand fallback](#spot-workers), and
 the chart's `workers` values to match.
 
+On Kubernetes, workers exchange rows through object storage unless
+`workers.exchanges` is `local`: their spill volume is an `emptyDir` on
+whatever disk the node keeps kubelet's directory on, which is local NVMe
+only on instance-store node types, and exchanges on it take a third of it
+from spill; and the modules run workers on Spot, whose nodes can go with
+the rows they hold. On worker nodes with local NVMe, set
+`workers.exchanges: local`; see [exchanges on workers'
+disks](#exchanges-on-workers-disks) for what it gains.
+
 ### Docker Compose
 
 For trying it out and testing on one machine, where workers share the
@@ -1010,7 +1020,7 @@ On the Igloo server:
 | `IGLOO_WORKER_WARM` | `1` | While some workers work, how many idle ones past them stay up; the others stop alone, on Kubernetes and EC2 (see [idle workers](#idle-workers)); `off` stops workers only all together |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [when](#when)) |
-| `IGLOO_EXCHANGES` | `object` | Where workers exchange rows: `object` storage, `local` disks, or `auto`, their disks where every worker has room and runs outside Kubernetes (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
+| `IGLOO_EXCHANGES` | `auto` | Where workers exchange rows: `auto`, their disks where every worker has room and runs outside Kubernetes, object storage otherwise; `object` storage; or `local` disks (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |
@@ -1131,7 +1141,11 @@ dollars.
 Workers suit Spot capacity, 50 to 75% cheaper on AWS: they keep nothing a
 statement needs once their tasks end, a task a lost worker ran runs again on
 another, and with exchanges in object storage (`IGLOO_EXCHANGES=object`)
-nothing they wrote is lost with them. Keep Igloo itself, the catalog and its
+nothing they wrote is lost with them; with exchanges on their disks (`auto`,
+the default outside Kubernetes), a statement that loses a worker holding
+rows it exchanged runs its parts again, once, on the others (see
+[exchanges on workers' disks](#exchanges-on-workers-disks)). Keep Igloo
+itself, the catalog and its
 database on regular capacity: igloo pods hold client sessions, and the
 modules keep them on-demand unless asked otherwise. With `workers_enabled`,
 the OpenTofu modules run workers on Spot by default (`workers_spot = true`)
