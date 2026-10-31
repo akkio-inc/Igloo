@@ -155,14 +155,21 @@ func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
 
 // usedColumns returns the columns of sc's item, a subquery in c's FROM
 // clause, that c refers to, in the item's order, or nil when c may refer
-// to all of them: through a star, or a natural join. A name another item
-// may own as well counts, and so does a name in a subquery of c, which may
-// be correlated. A candidate that refers to none, as count(*) does, still
-// reads one.
+// to all of them: through a star, or a natural join, of the SELECT whose
+// FROM clause holds the item. A name another item may own as well counts,
+// and so does a name in a subquery of c, which may be correlated. A
+// candidate that refers to none, as count(*) does, still reads one.
 func usedColumns(c *candidate, sc *scope) []string {
 	item := sc.item
 	used := map[string]bool{}
-	all := false
+	// A star elsewhere is over another SELECT's FROM clause. One inside
+	// another item of the same FROM, a common table expression read in
+	// place of its name that reads the same view (every view Igloo stores
+	// reads its tables through SELECT COLUMNS(...)), made the relation of
+	// a report's branches write every one of the view's hundreds of
+	// columns, of which they read a few, and ran its workers out of memory.
+	owner := holder(c.sel, sc.ref)
+	all := owner != nil && ownStar(owner, item.name)
 	walk(c.sel, func(m node) bool {
 		if all || identity(m) == identity(sc.ref) {
 			// The subquery's own names are its own.
@@ -170,7 +177,7 @@ func usedColumns(c *candidate, sc *scope) []string {
 		}
 		switch str(m["class"]) {
 		case "STAR":
-			if r := strings.ToLower(str(m["relation_name"])); r == "" || r == item.name {
+			if r := strings.ToLower(str(m["relation_name"])); r == item.name || r == "" && owner == nil {
 				all = true
 			}
 		case "COLUMN_REF":
@@ -186,7 +193,7 @@ func usedColumns(c *candidate, sc *scope) []string {
 			}
 		}
 		if str(m["type"]) == "JOIN" {
-			if str(m["ref_type"]) == "NATURAL" {
+			if str(m["ref_type"]) == "NATURAL" && owner == nil {
 				all = true
 			}
 			for _, u := range list(m, "using_columns") {
@@ -208,6 +215,54 @@ func usedColumns(c *candidate, sc *scope) []string {
 		out = item.columns[:1]
 	}
 	return out
+}
+
+// holder returns the SELECT in v whose FROM clause holds ref, as an item
+// of its own or a side of its joins, or nil.
+func holder(v any, ref node) node {
+	var found node
+	walk(v, func(m node) bool {
+		if found == nil && str(m["type"]) == "SELECT_NODE" && holds(child(m, "from_table"), ref) {
+			found = m
+		}
+		return found == nil
+	})
+	return found
+}
+
+// holds reports whether the FROM clause from is ref or joins it.
+func holds(from, ref node) bool {
+	switch {
+	case from == nil:
+		return false
+	case identity(from) == identity(ref):
+		return true
+	case str(from["type"]) == "JOIN":
+		return holds(child(from, "left"), ref) || holds(child(from, "right"), ref)
+	}
+	return false
+}
+
+// ownStar reports whether sel may refer to every column of an item of its
+// FROM clause named name: by a star of its own over all of its items or
+// that one, or a natural join. Its subqueries' stars are over their own
+// FROM clauses.
+func ownStar(sel node, name string) bool {
+	all := false
+	walk(clauses(sel), func(m node) bool {
+		switch {
+		case all:
+		case str(m["class"]) == "SUBQUERY", str(m["type"]) == "SUBQUERY":
+			return false
+		case str(m["class"]) == "STAR":
+			r := strings.ToLower(str(m["relation_name"]))
+			all = r == "" || r == name
+		case str(m["type"]) == "JOIN" && str(m["ref_type"]) == "NATURAL":
+			all = true
+		}
+		return !all
+	})
+	return all
 }
 
 // projectRelation returns a query of q's rows, whose columns are named all,
@@ -732,21 +787,21 @@ func columnType(t *Table, name string) string {
 // sides builds the queries that select the rows of each partitioned table:
 // the columns the statement uses, after its filters on that table alone.
 func (pl *planner) sides(c *candidate) error {
-	refs := referencedNames(c.sel)
 	for _, k := range c.keyed {
 		u := k.use
 		if u == nil {
 			continue
 		}
+		alias := str(u.ref["alias"])
+		if alias == "" {
+			alias = str(u.ref["table_name"])
+		}
+		refs := referencedNames(c.sel, u.ref, strings.ToLower(alias))
 		var cols []string
 		for _, col := range u.table.Columns {
 			if refs == nil || refs[strings.ToLower(col.Name)] {
 				cols = append(cols, quoteIdent(col.Name))
 			}
-		}
-		alias := str(u.ref["alias"])
-		if alias == "" {
-			alias = str(u.ref["table_name"])
 		}
 		stage, err := pl.p.parse("SELECT " + strings.Join(cols, ", ") + " FROM " + quoteIdent(k.view) + " AS " + quoteIdent(alias))
 		if err != nil {
@@ -781,14 +836,22 @@ func (pl *planner) sides(c *candidate) error {
 }
 
 // referencedNames returns every name a column reference in n uses, lower
-// case, or nil when a * or a NATURAL join may use any column.
-func referencedNames(n node) map[string]bool {
+// case, or nil when a * or a NATURAL join may use any column of ref, a
+// table of a FROM clause in n named name: a star qualified by name, or one
+// or a natural join of the SELECT whose FROM clause holds ref, whose
+// subqueries' stars are over their own FROM clauses (see usedColumns).
+func referencedNames(n, ref node, name string) map[string]bool {
 	names := map[string]bool{}
-	all := false
+	owner := holder(n, ref)
+	all := owner != nil && ownStar(owner, name)
 	walk(clauses(n), func(m node) bool {
 		switch {
-		case str(m["class"]) == "STAR", str(m["ref_type"]) == "NATURAL":
-			all = true
+		case all:
+		case str(m["class"]) == "STAR":
+			r := strings.ToLower(str(m["relation_name"]))
+			all = r == name || r == "" && owner == nil
+		case str(m["ref_type"]) == "NATURAL":
+			all = owner == nil
 		case str(m["class"]) == "COLUMN_REF":
 			for _, p := range columnNames(m) {
 				names[strings.ToLower(p)] = true

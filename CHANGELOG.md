@@ -2069,6 +2069,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   a quarter of the statement's expected time on one machine, between half
   a second and 10 seconds, so that a statement that falls back waits
   little for it.
+- Workers write to exchanges only the columns of a table or view that the
+  statement reads when a view joined to it has a star of its own, as
+  every stored view has where it reads its tables through
+  `SELECT COLUMNS(...)`: the view's star counted as the statement's, so a
+  table read by partition was written whole when it was joined to a view,
+  and a report's branches, factored into one `SELECT` over a wide view
+  joined to a common table expression of the same view, wrote every one
+  of the view's columns to an exchange and ran the workers out of memory.
 - No one may put Igloo's own schemas (`igloo_domains`, `igloo_bitmaps`,
   `igloo_refresh`) on the search path or make one the current schema, in
   any case or quoting: through such a path any reader read bitmap
