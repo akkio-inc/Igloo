@@ -316,7 +316,8 @@ using all of its cores.
   matter more than such aggregates, set `IGLOO_DUCKDB_THREADS`.
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
   disk. Size the disk so your frequently read tables fit in half of its free
-  space, or set `IGLOO_CACHE_SIZE`.
+  space; `IGLOO_CACHE_SIZE` can cap the cache lower, or raise the 100 GiB
+  cap, but the cache never takes more than that half.
 
 A memory-optimized machine with 4 to 8 cores and 32 to 64 GB handles most
 datasets up to a few hundred GB of compressed Parquet comfortably. To size
@@ -499,8 +500,9 @@ memory, in front of the disk cache.
   `read_parquet('s3://...')`, also record the object's ETag and are used only
   while it matches, so a file overwritten in place is fetched again.
   Directory listings and file sizes are never cached.
-- **Size.** Unless `IGLOO_CACHE_SIZE` says otherwise, the cache takes at most
-  half of the disk space that other files leave free, and at most 100 GiB.
+- **Size.** The cache takes at most half of the disk space that other files
+  leave free, and at most 100 GiB, or `IGLOO_CACHE_SIZE`, which can lower or
+  raise that cap but never the half: a cache on a small disk cannot fill it.
   It never fills the disk past 95%. Igloo remeasures every 5 minutes, so the
   cache gives way when other files (spill files, logs, a local object store)
   grow: it stops adding blocks, and drops the least recently used block each
@@ -519,7 +521,8 @@ memory, in front of the disk cache.
   does, so erasure requests count it gone with the pod. Igloo sizes the
   cache from the free space of the filesystem it is on, which an `emptyDir`
   shares with the node: with an `emptyDir`, set `IGLOO_CACHE_SIZE` below its
-  `sizeLimit`. Instance-store (local NVMe) disks are fast, but empty when
+  `sizeLimit`, as the chart does. On a volume of its own, the cache takes at
+  most half of it. Instance-store (local NVMe) disks are fast, but empty when
   the machine stops. A file share, such as EFS, Filestore or Azure Files,
   keeps no extended attributes, so the cache cannot use it.
 - **Watching it.** `igloo_cache_size_bytes` and `igloo_cache_limit_bytes`

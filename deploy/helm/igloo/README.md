@@ -183,9 +183,10 @@ pass for each cloud.
   statements, and [prefetch](../../../docs/operations.md#prefetch) reading
   ahead of scans, read local disk ([read
   cache](../../../docs/operations.md#read-cache)). By default it is an
-  `emptyDir` on the node's disk without a limit, and the cache takes at most
-  half of that disk's free space, up to 100 GiB; with
-  `cacheVolume.sizeLimit` it takes 90% of the limit. `cacheVolume.type:
+  `emptyDir` on the node's disk with a `sizeLimit` of 50Gi
+  (`cacheVolume.sizeLimit`), of which the cache takes up to 90%, and never
+  more than half of the disk's free space, so a small node disk is not
+  filled; a volume of its own holds a cache of at most half its size. `cacheVolume.type:
   ephemeral` gives each pod a volume of its own from `cacheVolume.storageClass`,
   made and deleted with the pod; `persistentVolumeClaim` keeps the cache on
   `cacheVolume.existingClaim` across restarts and scaling to zero, for a
@@ -473,7 +474,7 @@ workers:
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |
 | `duckdb.spillVolume.medium` | `""` | `""` (node disk, kubelet's directory; see **Spill disk** above) or `Memory` |
 | `cacheVolume.type` | `emptyDir` | The read cache's volume (see **Read cache** above): `emptyDir`, `ephemeral` (a volume per pod, deleted with it) or `persistentVolumeClaim` (one igloo pod; sets `IGLOO_CACHE_EPHEMERAL=false`) |
-| `cacheVolume.sizeLimit` | `""` | The `emptyDir`'s `sizeLimit` or the ephemeral volume's size; `IGLOO_CACHE_SIZE` is 90% of it. Empty: half of the disk's free space, up to 100 GiB. Required with `ephemeral`. |
+| `cacheVolume.sizeLimit` | `50Gi` | The `emptyDir`'s `sizeLimit` or the ephemeral volume's size; `IGLOO_CACHE_SIZE` is 90% of it, and the cache never takes more than half of the disk's free space. Empty: no `emptyDir` limit, and a cache of up to 100 GiB. Required with `ephemeral`. |
 | `cacheVolume.storageClass` | `""` | `ephemeral`: the volume's storage class, one with extended attributes; empty for the cluster's default |
 | `cacheVolume.existingClaim` | `""` | `persistentVolumeClaim`: the claim, `ReadWriteOnce` |
 | `tls.existingSecret` | `""` | `kubernetes.io/tls` Secret; sets `IGLOO_TLS_CERT_FILE` / `IGLOO_TLS_KEY_FILE` |
@@ -544,7 +545,7 @@ workers:
 | `workers.existingSecret` | `""` | Secret with key `secret` (32+ characters) for `IGLOO_WORKER_SECRET`; generated and kept when empty |
 | `workers.duckdb.memoryLimit`, `threads` | `""`, `null` | As `duckdb.*`, from `workers.resources`; null threads: four per core |
 | `workers.duckdb.spillVolume.sizeLimit` / `medium` | `100Gi` / `""` | Workers' spill `emptyDir`; `IGLOO_DUCKDB_MAX_TEMP_SIZE` is 90% of it |
-| `workers.cacheVolume.sizeLimit` | `50Gi` | Workers' read cache `emptyDir`; the cache may use 90% of it |
+| `workers.cacheVolume.sizeLimit` | `50Gi` | Workers' read cache `emptyDir`; the cache may use 90% of it, and at most half of the disk's free space |
 | `workers.resources` | requests `4` CPU / `16Gi`, limit `16Gi` | Worker container |
 | `workers.podLabels`, `podAnnotations`, `nodeSelector`, `tolerations` | | Worker pods |
 | `workers.affinity` | `{}` | Empty: prefer one worker per node |

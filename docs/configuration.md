@@ -234,7 +234,7 @@ disk, so that queries after a restart read them from there; see
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `IGLOO_CACHE_SIZE` | automatic | Largest size of the cache, e.g. `50GB` or `40GiB`. Automatic is half of the disk space other files leave free, up to 100 GiB. `0` turns the cache off. |
+| `IGLOO_CACHE_SIZE` | automatic | Largest size of the cache, e.g. `50GB` or `40GiB`, in place of the automatic 100 GiB; the cache never takes more than half of the disk space other files leave free, whatever it says. `0` turns the cache off. |
 | `IGLOO_CACHE_DIR` | `/var/lib/igloo/cache` in the image | Where the cache lives. Mount a volume here to keep it across restarts. |
 | `IGLOO_CACHE_EPHEMERAL` | `false` | The cache's volume goes with the pod or machine, as a Kubernetes `emptyDir` or ephemeral volume does (the Helm chart sets it): [erasure requests](privacy.md#known-limitations) then count a replica that is gone as holding nothing, rather than its cache as pending. |
 | `IGLOO_PREFETCH` | `true` | Read ahead, into the read cache, the blocks scans are about to read, with requests of its own; see [prefetch](operations.md#prefetch). |

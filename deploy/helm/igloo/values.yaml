@@ -124,10 +124,11 @@ cacheVolume:
   # erasure request deleted files meanwhile.
   type: emptyDir
   # The emptyDir's sizeLimit, or the ephemeral volume's size; the cache
-  # takes 90% of it -> IGLOO_CACHE_SIZE. Empty: no limit, and the cache takes
-  # at most half of its disk's free space, up to 100 GiB. Required with
-  # ephemeral.
-  sizeLimit: ""
+  # takes up to 90% of it -> IGLOO_CACHE_SIZE, and never more than half of
+  # its disk's free space, so it cannot fill a small node disk (or more than
+  # half of a volume of its own). Empty: no limit on the emptyDir, and the
+  # cache takes up to 100 GiB of that half. Required with ephemeral.
+  sizeLimit: 50Gi
   # ephemeral: the volume's storage class; empty for the cluster's default.
   storageClass: ""
   # persistentVolumeClaim: the claim, ReadWriteOnce, made beforehand.

@@ -32,7 +32,9 @@ func TestCacheLimits(t *testing.T) {
 		{"nothing on a nearly full disk", 100 * gib, 4 * gib, 0, 0, 0, 5 * gib},
 		{"IGLOO_CACHE_SIZE", 100 * gib, 60 * gib, 0, 10 * gib, 10 * gib, 50 * gib},
 		{"IGLOO_CACHE_SIZE above the 100 GiB cap", 2048 * gib, 1500 * gib, 0, 500 * gib, 500 * gib, 1000 * gib},
-		{"IGLOO_CACHE_SIZE never fills the disk", 100 * gib, 60 * gib, 0, 1024 * gib, 55 * gib, 5 * gib},
+		{"IGLOO_CACHE_SIZE takes at most half of the free space", 100 * gib, 60 * gib, 0, 1024 * gib, 30 * gib, 30 * gib},
+		{"IGLOO_CACHE_SIZE on a small disk", 30 * gib, 20 * gib, 0, 45 * gib, 10 * gib, 10 * gib},
+		{"and the same once full", 30 * gib, 10 * gib, 10 * gib, 45 * gib, 10 * gib, 10 * gib},
 	}
 	for _, c := range cases {
 		limit, reserve := cacheLimits(c.total, c.avail, c.used, c.maxSize)

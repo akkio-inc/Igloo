@@ -178,16 +178,18 @@ func cacheOffStatements() []string {
 
 // cacheLimits returns how large the cache may grow and the free space the
 // extension must leave on its disk for that, given the disk's size and free
-// space and the bytes already cached. Without maxSize the cache gets half of
-// the space nothing else uses, up to maxAutoCacheSize. Either way the disk
-// keeps at least 5% free, as the extension does by default; when it cannot,
-// the limit is 0.
+// space and the bytes already cached. The cache gets at most half of the
+// space nothing else uses, whatever maxSize says, so that a small disk is
+// never filled, as a node's disk under an emptyDir must not be; and at most
+// maxSize, or maxAutoCacheSize without it. Either way the disk keeps at
+// least 5% free, as the extension does by default; when it cannot, the
+// limit is 0.
 func cacheLimits(total, avail, used, maxSize uint64) (limit, reserve uint64) {
 	usable := avail + used
-	limit = maxSize
-	if limit == 0 {
-		limit = min(usable/2, maxAutoCacheSize)
+	if maxSize == 0 {
+		maxSize = maxAutoCacheSize
 	}
+	limit = min(usable/2, maxSize)
 	reserve = max(total/20, 1)
 	if usable > limit {
 		reserve = max(reserve, usable-limit)

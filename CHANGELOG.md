@@ -1594,8 +1594,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   writable `/tmp` for the cache's extension; `cacheVolume.sizeLimit` sets
   the volume's size and `IGLOO_CACHE_SIZE` to 90% of it. Statements after a
   start, and prefetch, now read the files they read before from local disk
-  rather than object storage. The chart and the docs say the volume's file
-  system must keep extended attributes (see [read
+  rather than object storage. The volume is a 50Gi emptyDir unless
+  `cacheVolume.sizeLimit` says otherwise, and the read cache, wherever it
+  runs, now takes at most half of its disk's free space whatever
+  `IGLOO_CACHE_SIZE` says, so it cannot fill a small node disk. The chart
+  and the docs say the volume's file system must keep extended attributes (see [read
   cache](docs/operations.md#read-cache)). Erasure requests have every
   running replica empty it with the prefetcher held, as workers do, and,
   with `IGLOO_CACHE_EPHEMERAL` (which the chart sets but for a claim), count
