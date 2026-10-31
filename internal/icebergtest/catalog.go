@@ -55,8 +55,67 @@ type Catalog struct {
 	// holdViewLists, if set, runs between making a list of views and
 	// sending it.
 	holdViewLists func(namespace string)
-	// commits counts applied commits.
-	commits int
+	// commits counts applied commits, and conflicts those refused with
+	// CatalogCommitConflicts.
+	commits, conflicts int
+	// beforeCommit, if set, runs ahead of each commit request (see
+	// BeforeCommit).
+	beforeCommit func(c Commit)
+}
+
+// Commit describes a commit request: the tables it changes, as
+// namespace.table, and whether it came as a transaction
+// (/transactions/commit, as DuckDB commits) or to a table's own endpoint (as
+// iceberg-go commits, and so Igloo's maintenance).
+type Commit struct {
+	Tables      []string
+	Transaction bool
+}
+
+// BeforeCommit has fn run ahead of each commit request, before the catalog
+// looks at it, while it answers other requests: a test can commit something
+// else to the table between a writer's read and its commit.
+func (c *Catalog) BeforeCommit(fn func(Commit)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.beforeCommit = fn
+}
+
+// Conflicts is how many commits the catalog refused because their
+// requirements failed.
+func (c *Catalog) Conflicts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conflicts
+}
+
+// announceCommit runs the BeforeCommit hook for a commit request to path
+// parts p with body, if it is one.
+func (c *Catalog) announceCommit(r *http.Request, p []string, body []byte) {
+	c.mu.Lock()
+	fn := c.beforeCommit
+	c.mu.Unlock()
+	if fn == nil || r.Method != http.MethodPost {
+		return
+	}
+	switch {
+	case len(p) == 4 && p[0] == "namespaces" && p[2] == "tables":
+		fn(Commit{Tables: []string{strings.ReplaceAll(p[1], "\x1f", ".") + "." + p[3]}})
+	case len(p) == 2 && p[0] == "transactions" && p[1] == "commit":
+		var req struct {
+			TableChanges []tableChange `json:"table-changes"`
+		}
+		if json.Unmarshal(body, &req) != nil {
+			return
+		}
+		cm := Commit{Transaction: true}
+		for _, ch := range req.TableChanges {
+			if ch.Identifier != nil {
+				cm.Tables = append(cm.Tables, strings.Join(ch.Identifier.Namespace, ".")+"."+ch.Identifier.Name)
+			}
+		}
+		fn(cm)
+	}
 }
 
 type tableState struct {
@@ -163,6 +222,7 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := r.Header.Get("Idempotency-Key")
+	c.announceCommit(r, parts[1:], body)
 
 	if p := parts[1:]; len(p) == 3 && p[0] == "namespaces" && p[2] == "views" && r.Method == http.MethodGet {
 		c.listViews(w, r, p)
@@ -472,6 +532,7 @@ func (c *Catalog) commit(changes []tableChange) (int, string, error) {
 		}
 		for _, req := range ch.Requirements {
 			if err := req.Validate(base); err != nil {
+				c.conflicts++
 				return http.StatusConflict, "CatalogCommitConflicts", fmt.Errorf("requirement failed: %w", err)
 			}
 		}

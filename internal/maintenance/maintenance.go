@@ -132,13 +132,20 @@ type Options struct {
 	// ID domains' ids there (pgwire.Server.MapIDDomains), so that a pass
 	// compacts what mapping rewrote.
 	BeforePass func(ctx context.Context)
-	// Busy, if set, reports whether a transaction block that has not
-	// ended has read or written table (namespace.table). Its COMMIT would
-	// fail after a rewrite of the table's files, as DuckDB commits only on
-	// top of the snapshot it read, so maintenance leaves the files for a
-	// later pass. Igloo passes its own sessions' blocks
-	// (pgwire.Server.InTransaction).
+	// Busy, if set, reports whether a user's transaction that has not
+	// ended uses table (namespace.table): a transaction block that has
+	// read or written it, or a write running. Its commit would fail after
+	// a rewrite of the table's files, as DuckDB commits only on top of the
+	// snapshots it read, so maintenance leaves the files for a later pass.
+	// Igloo passes its own sessions' (pgwire.Server.InTransaction).
 	Busy func(table string) bool
+	// Hold, if set, is called just before maintenance commits a rewrite of
+	// table's files: until release is called, no user's transaction starts
+	// using the table, and ok says none uses it already, as Busy would.
+	// The rewrite is committed only when ok is true, so that the check and
+	// the commit are one step no user's transaction can start in between
+	// (pgwire.Server.HoldTable).
+	Hold func(ctx context.Context, table string) (release func(), ok bool)
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -793,15 +800,17 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 		}
 	}
 	res.deletes = len(removed)
-	if m.busy(tbl.Identifier()) {
-		// A block began reading the table while its files were written:
-		// give way to it, as to a writer that committed first.
-		return tbl, res, fmt.Errorf("%w: a transaction block read the table while its files were rewritten", table.ErrCommitFailed)
-	}
 	if err := rw.Commit(ctx); err != nil {
 		return tbl, res, fmt.Errorf("commit the rewrite: %w", err)
 	}
+	// A user's transaction that began using the table while its files
+	// were written wins, as a writer that committed first would.
+	release, ok := m.hold(ctx, tbl.Identifier())
+	if !ok {
+		return tbl, res, fmt.Errorf("%w: a user's transaction uses the table", table.ErrCommitFailed)
+	}
 	committed, err := tx.CommitWithoutRetry(ctx)
+	release()
 	if err != nil {
 		return tbl, res, err
 	}
@@ -1005,8 +1014,16 @@ func name(ident table.Identifier) string {
 	return strings.Join(ident, ".")
 }
 
-// busy reports whether Options.Busy says a transaction block has read the
+// busy reports whether Options.Busy says a user's transaction uses the
 // table.
 func (m *Maintainer) busy(ident table.Identifier) bool {
 	return m.opts.Busy != nil && m.opts.Busy(name(ident))
+}
+
+// hold is Options.Hold, or busy's answer without it.
+func (m *Maintainer) hold(ctx context.Context, ident table.Identifier) (release func(), ok bool) {
+	if m.opts.Hold != nil {
+		return m.opts.Hold(ctx, name(ident))
+	}
+	return func() {}, !m.busy(ident)
 }

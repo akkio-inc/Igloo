@@ -276,6 +276,32 @@ func (e *Engine) CatalogLock() func() {
 	}
 }
 
+// CatalogTryLock is CatalogLock for work that may as well not happen,
+// such as maintenance's commit of a rewrite of a table's files: it takes
+// the lock only when nobody holds it, trying for up to wait, without
+// queuing for it as CatalogLock does, which would hold up every session's
+// binds behind a long holder. ok is false, with nothing to release, when
+// it did not get the lock in time or ctx ended.
+func (e *Engine) CatalogTryLock(ctx context.Context, wait time.Duration) (release func(), ok bool) {
+	deadline := time.Now().Add(wait)
+	for !e.catMu.TryLock() {
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	e.catLocked.Store(time.Now().UnixNano())
+	e.respell()
+	return func() {
+		e.catLocked.Store(0)
+		e.catMu.Unlock()
+	}, true
+}
+
 // CatalogShare takes the catalog lock shared, for binding a statement
 // against the catalog's in-memory set (see CatalogLock), and returns the
 // func that releases it.

@@ -982,13 +982,16 @@ snapshots they point at, are kept whatever the retentions, as long as the
 ref's or the table's `max-ref-age-ms` says, forever by default.
 
 Maintenance commits are ordinary Iceberg commits. A query that is running
-keeps reading the snapshot it started with; a write that commits at the same
-moment as compaction wins, and compaction tries again on the next pass. A
-transaction block (`BEGIN` ... `COMMIT`, as dbt's incremental models run)
-commits only on top of the snapshots it read, so maintenance leaves the
-files of every table an open block has read or written until the block
-ends, or for an hour at most; it sees only the blocks of its own replica's
-sessions. With
+keeps reading the snapshot it started with. A write commits only on top of
+the snapshots it read, so users' writes always win: maintenance leaves the
+files of a table alone while a write that reads or writes it runs, or while
+a transaction block (`BEGIN` ... `COMMIT`, as dbt's incremental models run)
+that has read or written it is open, unless the block has sat idle for 15
+minutes. It checks again just before it commits a rewrite, with sessions
+held off the table for that moment, and gives up the rewrite until the next
+pass if one uses it. It sees only its own replica's sessions: a write
+through another replica that loses to compaction is run again if it runs on
+its own, and fails with SQLSTATE `40001` in a block. With
 several replicas, only one maintains tables at a time; they coordinate through
 a lock in the metadata database, where they also record when passes ran. A
 replica that has just started, for example after [scaling to

@@ -30,6 +30,11 @@ type refreshEnv struct {
 	*testServer
 	admin *pgx.Conn
 	tasks *tasks.Scheduler
+	// fake is the catalog, catalog a client of it, and dir where the
+	// tables' files are.
+	fake    *icebergtest.Catalog
+	catalog *catalog.Client
+	dir     string
 }
 
 func startRefreshServer(t *testing.T, configure ...func(*Options)) *refreshEnv {
@@ -63,7 +68,7 @@ func startRefreshServer(t *testing.T, configure ...func(*Options)) *refreshEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = objects.Close() })
-	env := &refreshEnv{tasks: tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})}
+	env := &refreshEnv{tasks: tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{}), fake: fake, catalog: cat, dir: dir}
 	env.testServer = startServerOn(t, eng, append([]func(*Options){func(o *Options) { o.DDL, o.Tasks = objects, env.tasks }}, configure...)...)
 	env.admin = env.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	return env

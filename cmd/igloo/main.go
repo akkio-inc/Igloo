@@ -659,7 +659,7 @@ func serve() error {
 			// Bitmap indexes hold ids, so they are built once ids are mapped.
 			srv.MapIDDomains(ctx)
 			srv.MaintainBitmapIndexes(ctx)
-		}, srv.InTransaction, log)
+		}, srv.InTransaction, srv.HoldTable, log)
 		if err != nil {
 			return err
 		}
@@ -1145,7 +1145,7 @@ func dropDuckDBCaches(ctx context.Context, eng *engine.Engine, log *slog.Logger)
 
 func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
 	memory memlimit.Plan, threads int, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), beforePass func(context.Context),
-	busy func(string) bool, log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+	busy func(string) bool, hold func(context.Context, string) (func(), bool), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	budget := rewriteMemory(cfg, memory)
 	if memory.Go > 0 && budget > memory.Go/2 {
 		log.Warn("IGLOO_MAINTENANCE_MEMORY is more than half of Go's memory limit; compaction may leave too little for the rest of Igloo",
@@ -1165,6 +1165,7 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		Clones:     guard,
 		BeforePass: beforePass,
 		Busy:       busy,
+		Hold:       hold,
 		DataRetention: func(ctx context.Context) (map[string]time.Duration, error) {
 			snap, err := policies.Load(ctx)
 			if err != nil {

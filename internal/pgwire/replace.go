@@ -388,6 +388,9 @@ func (s *Server) relationExists(ctx context.Context, sess *session, o auth.Objec
 // steps (see stagedCreate), and writes of too many rows in order to sort at
 // once a range of the order at a time (see sortedwrite.go).
 func (s *Server) runStatement(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
+	// Maintenance leaves the tables it writes be until it commits (see
+	// txTables).
+	defer sess.useTables(st)()
 	if st.staged != nil && !sess.inTx {
 		rows, done, err := s.runStagedCreate(ctx, sess, st.staged)
 		if done {

@@ -81,8 +81,9 @@ What works, as `scripts/clients/dbt` exercises it on every pull request:
   and add the new rows in new files; `append` adds files. No data file is
   rewritten: after the test's second day, the snapshots each run committed
   hold only the rows it changed or added. Maintenance compacts the small
-  files later, leaving a table alone while a run's transaction reads it
-  (see [operations](operations.md#table-maintenance)). dbt-postgres's
+  files later, leaving a table alone while a run's transaction uses it, so
+  that it does not fail the run's `COMMIT` (see
+  [operations](operations.md#table-maintenance)). dbt-postgres's
   `microbatch` needs a `unique_key` (it merges each batch), and an
   `event_time` on the models it reads, so each batch reads only its days;
   run a range of days with `--event-time-start` and `--event-time-end`.

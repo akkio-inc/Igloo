@@ -2115,11 +2115,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   table that Igloo writes to answer counts skip its policy; any other
   gets it and no rows, and writes, drops and policy changes are refused
   by the table a name resolves to, not only by the names in the text.
-- Maintenance leaves the files of tables that an open transaction block has
-  read or written until the block ends (an hour at most): a compaction that
-  committed in the middle of a block, as dbt's incremental models and each
-  batch of a microbatch model run, made its `COMMIT` fail with
-  `CatalogCommitConflicts`.
+- Users' writes win over maintenance: compaction leaves the files of a table
+  alone while a write that reads or writes it runs, or a transaction block
+  that has read or written it is open (one idle for 15 minutes no longer
+  counts), and checks again with sessions held off the table just before it
+  commits. A compaction that committed between a MERGE's read and its
+  commit made dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail
+  with `CatalogCommitConflicts`, and had writes outside blocks run again.
 - Connections signing in from a loopback or private address, such as the
   scale-to-zero gateway's, a pooler's or a Kubernetes Service's, which all
   the clients behind it share, count only toward the limit of all

@@ -83,6 +83,9 @@ type Engine interface {
 	// CatalogLockedFor is how long the lock has been held exclusively.
 	CatalogShareContext(ctx context.Context) (func(), error)
 	CatalogLockedFor() time.Duration
+	// CatalogTryLock takes the lock exclusively if it can within wait,
+	// without queuing for it (see HoldTable).
+	CatalogTryLock(ctx context.Context, wait time.Duration) (func(), bool)
 	// CatalogChanged says the catalog changed other than through DuckDB's
 	// own requests, so that DuckDB's next listings of it ask the catalog
 	// again (see catalogproxy's listings); ListingsGeneration changes
@@ -1468,7 +1471,8 @@ func (sess *session) observe(st *statement, err error) {
 		}
 	}
 	if st != nil {
-		// A prepared statement run again in a block may load nothing new.
+		// A block keeps the tables of a statement that ran in it by a way
+		// other than runStatement; outside one, they are forgotten.
 		sess.noteTx(st.loads)
 	}
 	switch {
