@@ -1933,7 +1933,8 @@ func (pl *planner) cast(e node, typ string) (node, error) {
 // workers filter and project their rows, and, for ORDER BY with LIMIT,
 // keep only their first rows; the coordinator concatenates, sorts and
 // limits. It is only worth it when that cuts the rows down: with a WHERE
-// clause, DISTINCT, or ORDER BY with LIMIT.
+// clause, DISTINCT, or LIMIT, with ORDER BY or not (any rows, which its
+// stage stops sending once it has enough: see Stage.enough).
 func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	sel := c.sel
 	if (hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil || hasClass(sel["modifiers"], "WINDOW")) && c.window == nil {
@@ -1950,9 +1951,6 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 			distinct = mod
 		}
 	}
-	if limit != nil && order == nil {
-		return nil, unsupported("LIMIT without ORDER BY, which one machine answers fastest")
-	}
 	// Rows that workers compute anyway, a relation's, cross to the
 	// coordinator fewer for its filters; so do those of windows workers
 	// compute, for its QUALIFY, rather than every row for the coordinator to
@@ -1964,7 +1962,18 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	// value, as auto mode's estimates take it (filtersSelectively): workers
 	// read the table, and the coordinator what they keep.
 	selective := c.split != nil && child(sel, "where_clause") != nil && filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table)
-	if distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective {
+	// And so do those of a subquery whose rows the coordinator reads to run
+	// the rest, as a window over all of them, where they are fewer than
+	// the table's, by its filters or its columns: workers read the table in
+	// shares, rather than the coordinator alone, and send what they keep.
+	feeds := !c.top && c.split != nil && (child(sel, "where_clause") != nil ||
+		2*columnsRead(sel, c.split.table).bytes(c.split.table) <= c.split.table.Bytes)
+	if limit != nil && order == nil && !pl.opts.force && !selective && !filtersRelation && !qualifies && c.window == nil && len(c.keyed) == 0 {
+		// Any rows of a scan: one machine stops at the first it reads,
+		// which auto mode's estimates, of the whole scan, do not count.
+		return nil, unsupported("LIMIT without ORDER BY, which one machine answers fastest")
+	}
+	if distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective && !feeds {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
 		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())
@@ -2110,6 +2119,12 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	}
 	out["modifiers"] = outMods
 	b := &jobBuild{fragment: f, combine: out, columns: columns}
+	if limit != nil && order == nil && distinct == nil {
+		// Any rows: its tasks stop once those that ended sent enough.
+		if total, ok := limitRows(limit); ok && total > 0 {
+			b.enough = total
+		}
+	}
 	if c.top && order != nil && limit == nil && distinct == nil {
 		// Each task sorts its rows by the ORDER BY it keeps, which the
 		// coordinator merges them by.

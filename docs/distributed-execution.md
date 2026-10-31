@@ -54,7 +54,18 @@ account_id = 42`), as the statement or as a subquery or common table
 expression whose rows the coordinator reads to run the rest (a window over
 all of them, say). A plain `SELECT ... WHERE` that may keep many of the
 large table's rows is not: every matching row would cross to the
-coordinator and wait on its disk before reaching the client.
+coordinator and wait on its disk before reaching the client. A `LIMIT`
+without `ORDER BY`, any so many rows, has each task keep that many, and
+once the tasks that ended sent as many the others stop; auto mode leaves
+a scan of a table to one machine, which stops at the first rows it reads,
+unless its filters keep few of the table's rows (as above), or the rows
+come from joins of relations or windows workers compute. A subquery or
+common table expression without aggregation whose rows the coordinator
+reads every one of, to run the rest (a window over all of them, an
+aggregate that does not combine, a sample of a number of rows), is
+divided too where its filters or its columns keep less than the table:
+workers read the table in shares, rather than the coordinator alone,
+and send it what they keep.
 
 When the large table is joined to a second table too large for every
 worker to read (impressions to an identity graph, exposures to

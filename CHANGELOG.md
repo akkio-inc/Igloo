@@ -574,6 +574,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   policies keep a statement on one machine only when they apply to a
   table it reads, not when it, or a view it reads, spells a protected
   table's name, as a column named like an ID domain did.
+- Reports' last steps run on workers too, rather than on the coordinator
+  over what workers sent: an `ORDER BY` without `LIMIT` that what reads it
+  sorts again or aggregates is left out; inputs too large for every
+  worker that are joined on `upper`, `lower` or `trim` of a text column
+  are partitioned by it; a `UNION` of distinct rows is a relation workers
+  compute; the large side of a `LEFT`, `RIGHT` or `FULL` join is read by
+  partition with the other side partitioned alike; a `LIMIT` without
+  `ORDER BY` takes any rows, its tasks stopped once those that ended sent
+  enough; and a subquery whose every row the coordinator reads is divided
+  where its filters or columns keep less than its table (see [what runs
+  distributed](docs/distributed-execution.md#what-runs-distributed)).
 - Auto mode picks how many workers a statement runs on: of 1, 2, 4 and so
   on up to `IGLOO_WORKER_MAX`, and the workers running, those estimated
   within a fifth of the fastest, the cheapest at the workers' price

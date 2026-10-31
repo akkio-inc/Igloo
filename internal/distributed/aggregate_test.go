@@ -448,13 +448,18 @@ func TestExtensionAggregates(t *testing.T) {
 		}
 	}
 	h.co.aggregation = ""
-	for _, q := range []string{
-		`SELECT l_shipmode, rb_count_distinct(CAST(l_orderkey AS UINTEGER), l_shipdate) AS pairs FROM lineitem GROUP BY 1 ORDER BY 1`,
-		`WITH v AS (SELECT l_shipmode AS m, CAST(l_orderkey AS UINTEGER) AS id, l_shipdate AS day FROM lineitem, unnest([1, 2]))
-			SELECT m, rb_count_distinct(id, day) AS pairs, count(*) AS n FROM v GROUP BY 1 ORDER BY 1`,
-	} {
-		if _, err := h.co.Plan(context.Background(), q, harnessEnv{h}, ModeOn); err == nil || !strings.Contains(err.Error(), "rb_count_distinct(id, key)") {
-			t.Errorf("%s: planned on workers, or for another reason: %v", short(q), err)
-		}
+	q := `SELECT l_shipmode, rb_count_distinct(CAST(l_orderkey AS UINTEGER), l_shipdate) AS pairs FROM lineitem GROUP BY 1 ORDER BY 1`
+	if _, err := h.co.Plan(context.Background(), q, harnessEnv{h}, ModeOn); err == nil || !strings.Contains(err.Error(), "rb_count_distinct(id, key)") {
+		t.Errorf("%s: planned on workers, or for another reason: %v", short(q), err)
+	}
+	// Over a common table expression's rows, which workers send: the
+	// coordinator counts them.
+	h.t = t
+	q = `WITH v AS (SELECT l_shipmode AS m, CAST(l_orderkey AS UINTEGER) AS id, l_shipdate AS day FROM lineitem, unnest([1, 2]))
+		SELECT m, rb_count_distinct(id, day) AS pairs, count(*) AS n FROM v GROUP BY 1 ORDER BY 1`
+	h.check(q)
+	p := h.planOf(q)
+	if final, _ := h.co.parser.print(p.final); strings.Contains(p.describe(), "rb_count_distinct") || !strings.Contains(final, "rb_count_distinct") {
+		t.Errorf("workers count rb_count_distinct(id, key):\n%s", p.describe())
 	}
 }

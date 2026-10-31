@@ -356,8 +356,9 @@ func TestLocal(t *testing.T) {
 		`SELECT median(l_quantity) FROM lineitem`,
 		`SELECT l_orderkey, sum(l_quantity) OVER (PARTITION BY l_orderkey) FROM lineitem`,
 		`SELECT count(*) FROM lineitem a JOIN lineitem b USING (l_orderkey, l_linenumber)`,
-		`SELECT count(*) FROM part LEFT JOIN lineitem ON p_partkey = l_partkey`,
-		`SELECT * FROM lineitem LIMIT 5`,
+		// (A LEFT JOIN of a large table runs by partition at scale, and any
+		// rows of one, LIMIT without ORDER BY, forced on workers: see
+		// TestOuterJoinsByPartition and TestAnyRows.)
 		`SELECT l_quantity FROM lineitem`,
 		// Rows without DISTINCT or a top-N would only cross the coordinator's
 		// disk on their way to the client, unless the estimates take them

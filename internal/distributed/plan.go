@@ -1981,6 +1981,9 @@ type jobBuild struct {
 	// merge are the columns the last stage's tasks sort their rows by, for
 	// a statement's result ordered by ORDER BY without LIMIT (see merge.go).
 	merge []mergeKey
+	// enough is the rows of any that its last stage needs (see
+	// Stage.enough), or 0.
+	enough int64
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -2100,7 +2103,7 @@ func (pl *planner) finish(j *job, b *jobBuild) (node, error) {
 		return nil, err
 	}
 	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
-	last.merge = b.merge
+	last.merge, last.enough = b.merge, b.enough
 	b.combine["from_table"] = placeholderRef(last.placeholder)
 	return b.combine, nil
 }

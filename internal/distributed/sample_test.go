@@ -82,8 +82,6 @@ func TestSamples(t *testing.T) {
 	for _, q := range []string{
 		`SELECT count(*) FROM lineitem, nation TABLESAMPLE bernoulli(50%) WHERE l_suppkey % 25 = n_nationkey`,
 		`SELECT count(*) FROM lineitem TABLESAMPLE reservoir(1000 ROWS)`,
-		`SELECT count(*) FROM lineitem, (SELECT n_nationkey FROM nation) AS n TABLESAMPLE bernoulli(50%) WHERE l_suppkey % 25 = n.n_nationkey`,
-		`SELECT count(*) FROM (SELECT l_orderkey FROM lineitem) AS s TABLESAMPLE reservoir(10 ROWS)`,
 	} {
 		if _, err := h.co.Plan(ctx, q, harnessEnv{h}, ModeOn); !IsUnsupported(err) {
 			t.Errorf("%s: planned, %v", q, err)
@@ -93,12 +91,19 @@ func TestSamples(t *testing.T) {
 	}
 	// A sample of a relation's rows: the coordinator samples what the
 	// workers computed.
-	q := `WITH s AS (SELECT l_orderkey, count(*) AS n FROM lineitem GROUP BY 1) SELECT count(*) > 0, sum(n) > 0 FROM s TABLESAMPLE bernoulli(50%)`
-	h.check(q)
-	if p := h.planOf(q); strings.Contains(p.describe(), "TABLESAMPLE") {
-		t.Errorf("workers sample a relation:\n%s", p.describe())
-	} else if final, _ := h.co.parser.print(p.final); !strings.Contains(final, "TABLESAMPLE") {
-		t.Errorf("the coordinator does not sample: %s", final)
+	// So does a sample of a subquery whose rows every task would make, or of
+	// a number of rows, which workers send it.
+	for _, q := range []string{
+		`WITH s AS (SELECT l_orderkey, count(*) AS n FROM lineitem GROUP BY 1) SELECT count(*) > 0, sum(n) > 0 FROM s TABLESAMPLE bernoulli(50%)`,
+		`SELECT count(*) > 0 FROM lineitem, (SELECT n_nationkey FROM nation) AS n TABLESAMPLE bernoulli(50%) WHERE l_suppkey % 25 = n.n_nationkey`,
+		`SELECT count(*) FROM (SELECT l_orderkey FROM lineitem) AS s TABLESAMPLE reservoir(10 ROWS)`,
+	} {
+		h.check(q)
+		if p := h.planOf(q); strings.Contains(p.describe(), "TABLESAMPLE") {
+			t.Errorf("workers sample a relation:\n%s", p.describe())
+		} else if final, _ := h.co.parser.print(p.final); !strings.Contains(final, "TABLESAMPLE") {
+			t.Errorf("the coordinator does not sample: %s", final)
+		}
 	}
 	_ = fmt.Sprint
 }

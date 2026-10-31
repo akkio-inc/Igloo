@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -65,6 +66,11 @@ type Stage struct {
 	// ORDER BY without LIMIT, are the columns its tasks sort their rows by,
 	// which the coordinator merges their files by (see merge.go).
 	merge []mergeKey
+	// enough, for a stage whose rows go to the coordinator to take any so
+	// many of them (LIMIT without ORDER BY), is that many: once the tasks
+	// that ended sent as many, the others are stopped, and the coordinator
+	// reads what those sent.
+	enough int64
 }
 
 // Input is a relation a stage's fragment reads under a view name: a
@@ -502,6 +508,12 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
+	// A stage that needs only so many rows, any of them, stops its other
+	// tasks once those that ended sent that many (see Stage.enough).
+	tctx, stop := context.WithCancel(gctx)
+	defer stop()
+	var sent atomic.Int64
+	var stopped atomic.Bool
 	for i := range tasks {
 		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
 		// bytes are what it reads of a table's share, reads all it reads.
@@ -568,7 +580,11 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			if owners != nil {
 				first = owners[i]
 			}
-			w, head, err := e.co.dispatch(gctx, task, e.ws, first, out, sp)
+			w, head, err := e.co.dispatch(tctx, task, e.ws, first, out, sp)
+			if err != nil && stopped.Load() && gctx.Err() == nil {
+				// Not needed: the tasks that ended sent enough rows.
+				return nil
+			}
 			if err != nil {
 				if OutOfMemory(err) && groups != nil && len(groups[i]) == 1 {
 					return &onePartition{err: err, rows: e.exchangeRows(s)}
@@ -598,11 +614,20 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			} else if !slices.Equal(res.columns, head.Columns) {
 				return fmt.Errorf("workers returned different columns for stage %d", s.ID)
 			}
+			if s.enough > 0 && sent.Add(head.Rows) >= s.enough && !stopped.Swap(true) {
+				e.co.log.Debug("a stage's tasks sent the rows it needs; stopping the others", "query", e.qid, "stage", s.ID,
+					"rows", sent.Load(), "enough", s.enough)
+				stop()
+			}
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return err
+	}
+	if res != nil && stopped.Load() {
+		// Only the files of the tasks that ended.
+		res.files = slices.DeleteFunc(res.files, func(f string) bool { return f == "" })
 	}
 	if res != nil {
 		e.mu.Lock()

@@ -33,7 +33,12 @@ func TestSelectiveRowsAndSubqueries(t *testing.T) {
 		{`SELECT l_returnflag, count(*) * 1.0 / (SELECT count(*) FROM orders) AS per_order FROM lineitem GROUP BY 1 ORDER BY 1`, true},
 		{`SELECT l_shipmode, sum(l_quantity) AS q FROM lineitem GROUP BY 1 HAVING sum(l_quantity) > (SELECT avg(o_totalprice) / 200 FROM orders) ORDER BY 1`, true},
 		{`SELECT l_suppkey % 10 AS b, count(*) AS n FROM lineitem GROUP BY 1 ORDER BY abs(count(*) - (SELECT count(*) / 10 FROM lineitem)), 1`, true},
-		// What still runs on one machine.
+		// A subquery the coordinator reads every row of, for a window over
+		// all of them, whose filters or columns keep less than the table.
+		{`SELECT x.l_orderkey, x.l_comment, count(*) OVER () AS n FROM (SELECT l_orderkey, l_comment FROM lineitem WHERE l_quantity > 45) AS x ORDER BY 1, 2`, true},
+		{`SELECT x.l_orderkey, x.l_shipmode, rank() OVER (ORDER BY x.l_orderkey) AS r FROM (SELECT l_orderkey, l_shipmode FROM lineitem) AS x ORDER BY 3, 2 LIMIT 30`, true},
+		// What still runs on one machine: a subquery of every row and column.
+		{`SELECT x.l_orderkey, count(*) OVER () AS n FROM (SELECT * FROM lineitem) AS x ORDER BY 1 LIMIT 3`, false},
 		{`SELECT l_orderkey, l_comment FROM lineitem WHERE l_comment LIKE '%furious%'`, false},
 		{`SELECT l_returnflag, count(*) FROM lineitem l GROUP BY 1 HAVING count(*) > (SELECT count(*) FROM orders WHERE o_orderstatus = l_returnflag) ORDER BY 1`, false},
 	} {
