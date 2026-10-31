@@ -6,6 +6,8 @@ _pools.tpl and pools.yaml). */ -}}
 {{- $memoryLimit := include "igloo.duckdbMemoryLimit" . -}}
 {{- $objectStorage := include "igloo.objectStorageName" . -}}
 {{- $component := include "igloo.serverComponent" . -}}
+{{- include "igloo.validateCacheVolume" . -}}
+{{- $cache := .Values.cacheVolume -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -21,7 +23,13 @@ spec:
   {{- end }}
   {{- with .Values.strategy }}
   strategy:
+    {{- if eq (toString .type) "Recreate" }}
+    {{- /* Kubernetes refuses rollingUpdate beside Recreate, and values
+    merged over the chart's defaults keep it. */}}
+    type: Recreate
+    {{- else }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
   selector:
     matchLabels:
@@ -269,6 +277,14 @@ spec:
             - name: IGLOO_DUCKDB_THREADS
               value: {{ int .Values.duckdb.threads | quote }}
             {{- end }}
+            {{- with $cache.sizeLimit }}
+            - name: IGLOO_CACHE_SIZE
+              value: {{ printf "%dMiB" (int64 (floor (mulf (float64 (include "igloo.quantityMiB" (list "cacheVolume.sizeLimit" .))) 0.9))) | quote }}
+            {{- end }}
+            # The cache's volume goes with the pod, but for a claim: erasure
+            # requests count a pod that is gone as holding nothing.
+            - name: IGLOO_CACHE_EPHEMERAL
+              value: {{ ne $cache.type "persistentVolumeClaim" | quote }}
             {{- if .Values.tls.existingSecret }}
             - name: IGLOO_TLS_CERT_FILE
               value: /etc/igloo/tls/tls.crt
@@ -381,6 +397,13 @@ spec:
             # DuckDB spill files (IGLOO_DUCKDB_TEMP_DIR in the image).
             - name: spill
               mountPath: /var/lib/igloo/tmp
+            # The read cache (IGLOO_CACHE_DIR in the image), which prefetch
+            # reads ahead into.
+            - name: cache
+              mountPath: /var/lib/igloo/cache
+            # The read cache's extension needs a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
             {{- if .Values.tls.existingSecret }}
             - name: tls
               mountPath: /etc/igloo/tls
@@ -400,6 +423,34 @@ spec:
             {{- with .Values.duckdb.spillVolume.sizeLimit }}
             sizeLimit: {{ . }}
             {{- end }}
+        - name: cache
+          {{- if eq $cache.type "ephemeral" }}
+          # A volume of the pod's own, made and deleted with it.
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  {{- include "igloo.podLabels" (dict "root" . "component" $component) | nindent 18 }}
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                {{- with $cache.storageClass }}
+                storageClassName: {{ . }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ $cache.sizeLimit }}
+          {{- else if eq $cache.type "persistentVolumeClaim" }}
+          persistentVolumeClaim:
+            claimName: {{ $cache.existingClaim }}
+          {{- else }}
+          emptyDir:
+            {{- with $cache.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+          {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
         {{- if .Values.tls.existingSecret }}
         - name: tls
           secret:

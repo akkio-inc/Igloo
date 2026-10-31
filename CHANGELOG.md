@@ -1584,8 +1584,23 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   6.6 s on three workers, fetching 1 to 3% more than DuckDB alone; filtered
   scans that a filter can prune fetch about 1% more and run as fast as
   without. The Compose stack passes `IGLOO_PREFETCH` through;
-  `IGLOO_PREFETCH=false` turns it off. On Kubernetes the chart's workers
-  read ahead into their cache volume; its igloo pods have no read cache.
+  `IGLOO_PREFETCH=false` turns it off. On Kubernetes the chart's igloo
+  pods and workers read ahead into their cache volumes.
+- The Helm chart's igloo pods have a read cache, which they had not: a
+  volume at `/var/lib/igloo/cache` (`cacheVolume`), an `emptyDir` by
+  default, or a volume of each pod's own from a storage class
+  (`ephemeral`), or a claim that keeps the cache across restarts and
+  scaling to zero for one igloo pod (`persistentVolumeClaim`), with a
+  writable `/tmp` for the cache's extension; `cacheVolume.sizeLimit` sets
+  the volume's size and `IGLOO_CACHE_SIZE` to 90% of it. Statements after a
+  start, and prefetch, now read the files they read before from local disk
+  rather than object storage. The chart and the docs say the volume's file
+  system must keep extended attributes (see [read
+  cache](docs/operations.md#read-cache)). Erasure requests have every
+  running replica empty it with the prefetcher held, as workers do, and,
+  with `IGLOO_CACHE_EPHEMERAL` (which the chart sets but for a claim), count
+  a replica whose volume went with its pod as holding nothing rather than
+  as pending.
 - A replica reads what the past week's statements allocated from the
   query history when it starts, those that ran under its memory limit, so
   a dashboard's first build after a restart reserves memory as later ones

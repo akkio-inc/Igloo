@@ -178,6 +178,25 @@ pass for each cloud.
   this up ([spill on local NVMe](../../../docs/operations.md#spill-on-local-nvme)).
   Keep `duckdb.spillVolume.sizeLimit`, times the igloo pods per node, within
   what that disk holds.
+- **Read cache**: igloo pods keep the blocks of table files they read from
+  object storage on `/var/lib/igloo/cache` (`cacheVolume`), so later
+  statements, and [prefetch](../../../docs/operations.md#prefetch) reading
+  ahead of scans, read local disk ([read
+  cache](../../../docs/operations.md#read-cache)). By default it is an
+  `emptyDir` on the node's disk without a limit, and the cache takes at most
+  half of that disk's free space, up to 100 GiB; with
+  `cacheVolume.sizeLimit` it takes 90% of the limit. `cacheVolume.type:
+  ephemeral` gives each pod a volume of its own from `cacheVolume.storageClass`,
+  made and deleted with the pod; `persistentVolumeClaim` keeps the cache on
+  `cacheVolume.existingClaim` across restarts and scaling to zero, for a
+  single igloo pod (`replicaCount: 1`, no autoscaling, `strategy.type:
+  Recreate`). The volume's file system must keep extended attributes, which
+  the cache marks every block with: ext4, XFS or btrfs, as a node's disk and
+  block storage classes (`gp3`, `pd-balanced`, `managed-csi`) are, not a
+  file share such as EFS, Filestore or Azure Files. [Erasure
+  requests](../../../docs/privacy.md) have every running igloo pod empty it,
+  and count a pod that is gone as holding nothing unless its cache is on a
+  claim, which the pod empties when it starts again.
 - **Startup**: on first start Igloo waits up to 3 minutes for PostgreSQL and
   the catalog, then bootstraps Lakekeeper and creates the warehouse; the
   startup probe allows 5 minutes. On every start it also limits the
@@ -453,6 +472,10 @@ workers:
 | `duckdb.maxTempSize` | `""` | `IGLOO_DUCKDB_MAX_TEMP_SIZE`; empty: 90% of `duckdb.spillVolume.sizeLimit`, so an oversized query fails instead of the pod being evicted |
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |
 | `duckdb.spillVolume.medium` | `""` | `""` (node disk, kubelet's directory; see **Spill disk** above) or `Memory` |
+| `cacheVolume.type` | `emptyDir` | The read cache's volume (see **Read cache** above): `emptyDir`, `ephemeral` (a volume per pod, deleted with it) or `persistentVolumeClaim` (one igloo pod; sets `IGLOO_CACHE_EPHEMERAL=false`) |
+| `cacheVolume.sizeLimit` | `""` | The `emptyDir`'s `sizeLimit` or the ephemeral volume's size; `IGLOO_CACHE_SIZE` is 90% of it. Empty: half of the disk's free space, up to 100 GiB. Required with `ephemeral`. |
+| `cacheVolume.storageClass` | `""` | `ephemeral`: the volume's storage class, one with extended attributes; empty for the cluster's default |
+| `cacheVolume.existingClaim` | `""` | `persistentVolumeClaim`: the claim, `ReadWriteOnce` |
 | `tls.existingSecret` | `""` | `kubernetes.io/tls` Secret; sets `IGLOO_TLS_CERT_FILE` / `IGLOO_TLS_KEY_FILE` |
 | `statementTimeout` | `""` | `IGLOO_STATEMENT_TIMEOUT`, e.g. `30m`; empty: no limit |
 | `maxConnections` | `100` | `IGLOO_MAX_CONNECTIONS` per pod |

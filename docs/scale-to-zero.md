@@ -227,7 +227,10 @@ service account may then patch that Deployment's scale too.
 Pods scaled to zero lose whatever their containers held, including the
 [read cache](operations.md#read-cache) unless `/var/lib/igloo/cache` is on a
 PersistentVolumeClaim, so the first queries after a start read every table
-file from object storage again.
+file from object storage again. The chart keeps the cache on a claim with
+`cacheVolume.type: persistentVolumeClaim` and `cacheVolume.existingClaim`,
+for one igloo pod (`replicaCount: 1`, or `scaleToZero.replicas: 1`, and
+`strategy.type: Recreate`).
 
 Without the chart, set up the same pieces yourself, following its
 `gateway.yaml` and `service.yaml` templates: `IGLOO_GATEWAY_BACKEND` pointing

@@ -442,6 +442,31 @@ the schema enforces. The message never includes the password. */ -}}
 {{- end -}}
 {{- end -}}
 
+{{/*
+Refuses a read cache volume that cannot work, for the release's igloo pods
+or a pool's (called from the Deployment, in either's context): an ephemeral
+volume needs a size, and a claim, which one pod at a time can use, needs a
+Deployment of at most one pod that never runs two at once.
+*/}}
+{{- define "igloo.validateCacheVolume" -}}
+{{- $c := .Values.cacheVolume -}}
+{{- $what := "cacheVolume" -}}
+{{- with (get . "Pool") -}}{{- $what = printf "pool %q's cacheVolume" .name -}}{{- end -}}
+{{- if and (eq $c.type "ephemeral") (not $c.sizeLimit) -}}
+{{- fail (printf "igloo: %s.type ephemeral needs cacheVolume.sizeLimit, the size of each pod's volume (e.g. 100Gi)" $what) -}}
+{{- end -}}
+{{- if eq $c.type "persistentVolumeClaim" -}}
+{{- if not $c.existingClaim -}}
+{{- fail (printf "igloo: %s.type persistentVolumeClaim needs cacheVolume.existingClaim, the claim to keep the cache on" $what) -}}
+{{- end -}}
+{{- $pods := int .Values.replicaCount -}}
+{{- if .Values.scaleToZero.enabled -}}{{- $pods = int (include "igloo.scaleToZeroReplicas" .) -}}{{- end -}}
+{{- if or .Values.autoscaling.enabled (gt $pods 1) (ne (toString (dig "type" "RollingUpdate" (.Values.strategy | default dict))) "Recreate") -}}
+{{- fail (printf "igloo: %s.type persistentVolumeClaim keeps one igloo pod's cache on claim %q, which no two pods may use at once: set replicaCount (and scaleToZero.replicas) to 1, autoscaling.enabled=false and strategy.type=Recreate, or use type emptyDir or ephemeral" $what $c.existingClaim) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/* ---------------------------------------------------------------------
 Lakekeeper
 --------------------------------------------------------------------- */}}

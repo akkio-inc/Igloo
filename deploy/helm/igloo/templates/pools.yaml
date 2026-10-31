@@ -12,6 +12,13 @@ runs, and is billed, only for its own clients' statements.
 {{- /* Generated secrets are computed once per render; do it before the
 pools copy the values, so their pods see the same checksum. */ -}}
 {{- $_ := include "igloo.secretData" . }}
+{{- /* A read cache claim serves one Deployment's pod (see
+igloo.validateCacheVolume): no pool may take the release's, or another
+pool's. */ -}}
+{{- $claims := dict }}
+{{- if eq .Values.cacheVolume.type "persistentVolumeClaim" }}
+{{- $_ := set $claims .Values.cacheVolume.existingClaim "the release's igloo pods" }}
+{{- end }}
 {{- range $pool := .Values.pools }}
 {{- $values := mergeOverwrite (deepCopy $.Values) (omit $pool "name" "extraEnv") }}
 {{- /* mergeOverwrite skips zeros and false; a pool may still set them. */ -}}
@@ -34,6 +41,12 @@ pools copy the values, so their pods see the same checksum. */ -}}
 {{- $_ := set $values "extraEnv" (concat ($.Values.extraEnv | default list) ($pool.extraEnv | default list)) }}
 {{- $_ := set $values.autoscaling "enabled" false }}
 {{- $_ := set $values.maintenance "enabled" false }}
+{{- if eq $values.cacheVolume.type "persistentVolumeClaim" }}
+{{- with (get $claims $values.cacheVolume.existingClaim) }}
+{{- fail (printf "igloo: pool %q would keep its read cache on claim %q, which %s use: give the pool a cacheVolume of its own (another existingClaim, or type emptyDir or ephemeral)" $pool.name $values.cacheVolume.existingClaim .) }}
+{{- end }}
+{{- $_ := set $claims $values.cacheVolume.existingClaim (printf "pool %q's igloo pods" $pool.name) }}
+{{- end }}
 {{- $ctx := dict "Values" $values "Release" $.Release "Chart" $.Chart "Capabilities" $.Capabilities "Template" $.Template "Files" $.Files "Pool" $pool }}
 {{- if and $values.scaleToZero.enabled (lt (int (include "igloo.scaleToZeroReplicas" $ctx)) 1) }}
 {{- fail (printf "igloo: pool %q scales to zero but would start no pods: set its replicaCount or scaleToZero.replicas to at least 1" $pool.name) }}

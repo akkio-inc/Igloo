@@ -168,6 +168,43 @@ else
   fail "refuses workers.large without workers with a message about it: $out"
 fi
 
+echo "the read cache"
+cv() { envf "$1" Deployment igloo "$2"; }
+volume() { docf "$1" Deployment igloo | sed -n '/^      volumes:/,$p' | sed -n "/- name: $2\$/,/- name: /p"; }
+check "igloo pods cache on an emptyDir, sized from its disk" 'emptyDir:|"true"|' \
+  "$(volume "$work/plain.yaml" cache | grep -o 'emptyDir:.*')|$(cv "$work/plain.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/plain.yaml" IGLOO_CACHE_SIZE)"
+check "mounted at the image's cache directory, with a writable /tmp" "mountPath: /var/lib/igloo/cache|mountPath: /tmp" \
+  "$(docf "$work/plain.yaml" Deployment igloo | grep -o 'mountPath: /var/lib/igloo/cache')|$(docf "$work/plain.yaml" Deployment igloo | grep -o 'mountPath: /tmp$')"
+render "${bundled[@]}" --set cacheVolume.sizeLimit=20Gi >"$work/cache-sized.yaml"
+check "a sized emptyDir, 90% of it for the cache" 'sizeLimit: 20Gi|"18432MiB"' \
+  "$(volume "$work/cache-sized.yaml" cache | grep -o 'sizeLimit: .*')|$(cv "$work/cache-sized.yaml" IGLOO_CACHE_SIZE)"
+render "${bundled[@]}" --set cacheVolume.type=ephemeral --set cacheVolume.sizeLimit=100Gi --set cacheVolume.storageClass=gp3 >"$work/cache-ephemeral.yaml"
+check "an ephemeral volume of the pod's own" 'storageClassName: gp3|storage: 100Gi|"92160MiB"|"true"' \
+  "$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storageClassName: .*')|$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storage: .*')|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_SIZE)|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_EPHEMERAL)"
+claim=(--set cacheVolume.type=persistentVolumeClaim --set cacheVolume.existingClaim=igloo-cache --set replicaCount=1 --set strategy.type=Recreate)
+render "${bundled[@]}" "${claim[@]}" >"$work/cache-claim.yaml"
+check "a claim, which outlives the pod, for one pod at a time" 'claimName: igloo-cache|"false"|type: Recreate|' \
+  "$(volume "$work/cache-claim.yaml" cache | grep -o 'claimName: .*')|$(cv "$work/cache-claim.yaml" IGLOO_CACHE_EPHEMERAL)|$(docf "$work/cache-claim.yaml" Deployment igloo | sed -n '/^  strategy:/,/^  selector:/p' | grep -o 'type: .*')|$(docf "$work/cache-claim.yaml" Deployment igloo | grep -o 'rollingUpdate' || true)"
+if render "${bundled[@]}" "${claim[@]}" --set 'pools[0].name=a' --set 'pools[0].replicaCount=1' --set 'pools[0].cacheVolume.existingClaim=a-cache' >/dev/null 2>&1; then
+  pass "a pool with a claim of its own"
+else
+  fail "a pool with a claim of its own"
+fi
+for invalid in "cacheVolume.type=ephemeral" "cacheVolume.type=persistentVolumeClaim,replicaCount=1,strategy.type=Recreate" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,strategy.type=Recreate" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,replicaCount=1" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,replicaCount=1,strategy.type=Recreate,autoscaling.enabled=true" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,replicaCount=1,strategy.type=Recreate,pools[0].name=a,pools[0].replicaCount=1" \
+  "cacheVolume.type=nfs"; do
+  if out=$(render "${bundled[@]}" --set "$invalid" 2>&1); then
+    fail "refuses $invalid"
+  elif grep -q 'cacheVolume' <<<"$out"; then
+    pass "refuses $invalid"
+  else
+    fail "refuses $invalid with a message about the cache volume: $out"
+  fi
+done
+
 echo "the admin password"
 # A generated password is long enough for Igloo to create the account with.
 generated=$(render "${bundled[@]}" | sed -n 's/^  admin-password: //p' | base64 -d | wc -c | tr -d ' ')

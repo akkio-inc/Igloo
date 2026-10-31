@@ -292,6 +292,34 @@
         }
       }
     },
+    "cacheVolume": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The igloo pods' read cache volume, at /var/lib/igloo/cache, on a file system with extended attributes.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "emptyDir",
+            "ephemeral",
+            "persistentVolumeClaim"
+          ]
+        },
+        "sizeLimit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The emptyDir's sizeLimit or the ephemeral volume's size; IGLOO_CACHE_SIZE is 90% of it."
+        },
+        "storageClass": {
+          "type": "string"
+        },
+        "existingClaim": {
+          "type": "string"
+        }
+      }
+    },
     "tls": {
       "type": "object",
       "additionalProperties": false,
@@ -683,6 +711,9 @@
           },
           "duckdb": {
             "$ref": "#/properties/duckdb"
+          },
+          "cacheVolume": {
+            "$ref": "#/properties/cacheVolume"
           },
           "statementTimeout": {
             "$ref": "#/properties/statementTimeout"

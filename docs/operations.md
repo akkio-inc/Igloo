@@ -512,12 +512,16 @@ memory, in front of the disk cache.
   which survives restarts, `docker compose down` and machine stops. On
   Kubernetes, mount a volume there, and a small writable `/tmp` if the root
   filesystem is read-only (the extension that implements the cache needs
-  one). A PersistentVolumeClaim keeps the cache across pod restarts and
-  scaling to zero; any other volume is lost with the pod. Igloo sizes the
+  one); the Helm chart does both (`cacheVolume`, an `emptyDir` by default,
+  or an ephemeral volume or a claim). A PersistentVolumeClaim keeps the
+  cache across pod restarts and scaling to zero; any other volume is lost
+  with the pod, and then set `IGLOO_CACHE_EPHEMERAL=true`, as the chart
+  does, so erasure requests count it gone with the pod. Igloo sizes the
   cache from the free space of the filesystem it is on, which an `emptyDir`
   shares with the node: with an `emptyDir`, set `IGLOO_CACHE_SIZE` below its
   `sizeLimit`. Instance-store (local NVMe) disks are fast, but empty when
-  the machine stops.
+  the machine stops. A file share, such as EFS, Filestore or Azure Files,
+  keeps no extended attributes, so the cache cannot use it.
 - **Watching it.** `igloo_cache_size_bytes` and `igloo_cache_limit_bytes`
   ([metrics](#monitoring)) show its size and how large it may grow. The log
   says `read cache on` at startup, or why it is off. An admin can count an
@@ -607,9 +611,9 @@ more than DuckDB alone.
   `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
 - It needs the read cache, on a filesystem with extended attributes; it
   writes blocks as the cache's extension does. At startup the log says
-  `prefetch on`, or why it is off. The Helm chart's igloo pods have no read
-  cache (their root filesystem is read-only), so only its workers, which
-  have a cache volume, read ahead there.
+  `prefetch on`, or why it is off. The Helm chart gives its igloo pods and
+  its workers a cache volume (`cacheVolume`, `workers.cacheVolume`), so
+  both read ahead.
 
 ## Result cache
 

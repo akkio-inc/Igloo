@@ -107,6 +107,32 @@ duckdb:
     # see README) or "Memory".
     medium: ""
 
+# The read cache (docs/operations.md#read-cache): blocks of the table files
+# igloo pods read from object storage, kept on local disk for later
+# statements, and read ahead into by prefetch. A volume at
+# /var/lib/igloo/cache (IGLOO_CACHE_DIR), whose file system must keep
+# extended attributes, as ext4, XFS and btrfs do: a node's disk, or a block
+# storage class (gp3, pd-balanced, managed-csi), not a file share (EFS,
+# Filestore, Azure Files). Erasure requests have every running igloo pod
+# empty it (docs/privacy.md).
+cacheVolume:
+  # emptyDir: on the node's disk, gone with the pod. ephemeral: a volume of
+  # its own per pod, of storageClass, made and deleted with the pod.
+  # persistentVolumeClaim: existingClaim, which keeps the cache across
+  # restarts and scaling to zero, for one igloo pod (replicaCount 1, no
+  # autoscaling, strategy.type Recreate); a pod that starts empties it if an
+  # erasure request deleted files meanwhile.
+  type: emptyDir
+  # The emptyDir's sizeLimit, or the ephemeral volume's size; the cache
+  # takes 90% of it -> IGLOO_CACHE_SIZE. Empty: no limit, and the cache takes
+  # at most half of its disk's free space, up to 100 GiB. Required with
+  # ephemeral.
+  sizeLimit: ""
+  # ephemeral: the volume's storage class; empty for the cluster's default.
+  storageClass: ""
+  # persistentVolumeClaim: the claim, ReadWriteOnce, made beforehand.
+  existingClaim: ""
+
 # kubernetes.io/tls Secret (tls.crt, tls.key) -> IGLOO_TLS_CERT_FILE and
 # IGLOO_TLS_KEY_FILE. Igloo reads it at start; restart pods after rotating it.
 tls:
@@ -364,6 +390,7 @@ pricePerHour: 0
 #       requests: { cpu: "8", memory: 32Gi }
 #       limits: { memory: 32Gi }
 #     duckdb: {}              # memoryLimit, threads, maxTempSize, spillVolume
+#     cacheVolume: {}         # a claim of its own, with type persistentVolumeClaim
 #     scaleToZero: { enabled: true, suspendAfter: 15m }
 #     service: { type: LoadBalancer, loadBalancerSourceRanges: ["203.0.113.0/24"] }
 #     nodeSelector: {}
