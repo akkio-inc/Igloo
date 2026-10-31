@@ -612,6 +612,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   measured small lately is, rather than beside the tables' partitioning to
   meet it: at a hundred times the data, a report took 305 s with that
   partitioning and 50 s without.
+- A statement that fails on a number of workers, or on the large worker, is
+  taken to need one and a half times as long as it ran there before it
+  failed, for a day, so auto mode weighs other ways against it; the query
+  history records where it failed, which replicas read when they start
+  (a worker's running out of memory no longer reads back as the replica's).
+  A statement whose large worker fails runs on the other workers where its
+  working set by DuckDB's plan is four or more times the coordinator's
+  room, rather than on the coordinator, and one whose workers fail fails
+  there rather than run on the coordinator, whatever a run of its shape
+  allocated there at a tenth of the data: at a hundred times the data, a
+  report of 250 GB ran on the coordinator after its large worker failed,
+  spilled 167 GB and was killed after 9 minutes.
 - A compute pool may have a large worker (`IGLOO_LARGE_WORKER`, the chart's
   `workers.large`), on which auto mode runs a statement alone when it fits
   there and is estimated within a fifth of the fastest way and cheapest,

@@ -548,7 +548,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	if onLarge != nil {
 		// Decided already, by the plan for the fleet.
-		plan.workers, plan.large, plan.shortOfMemory = 1, true, onLarge.e.memory
+		plan.workers, plan.large, plan.shortOfMemory, plan.farBeyond = 1, true, onLarge.e.memory, onLarge.e.farBeyond
 		return plan, &decision{onWorkers: true, reason: onLarge.reason, e: onLarge.e, ws: ws, tookOnWorkers: onLarge.tookOnWorkers}, nil
 	}
 	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes}
@@ -585,9 +585,13 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		case !e.large && t > 0:
 			r.dist, r.distWorkers = t, e.workers
 		}
+		if e.picked.failed {
+			// It failed there lately: as long as that run, and its run again.
+			r.dist, r.distWorkers = e.picked.seconds, e.workers
+		}
 	}
 	plan.workers, plan.large = e.workers, e.large
-	plan.shortOfMemory = e.memory || found && r.outOfMemory
+	plan.shortOfMemory, plan.farBeyond = e.memory || found && r.outOfMemory, e.farBeyond
 	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws, forced: mode != ModeAuto}
 	if mode != ModeAuto {
 		return plan, d, nil

@@ -62,6 +62,15 @@ const (
 	heldFactor = 6
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// farBeyondRatio is how many times its room a working set must be for
+	// the coordinator not to run a statement whose workers failed (see
+	// Plan.FitsHere): 4 times, by the spill curve twice as long, where a
+	// report it ran at 6.8 times by its estimate was killed after 9 minutes
+	// and 167 GB of spill.
+	farBeyondRatio = 4
+	// footprintTrust is how many times what a run of a statement's shape
+	// allocated here its plan's working set may be and still yield to it.
+	footprintTrust = 3
 	// rowRate is how many rows a core goes through a second for each pass
 	// over them (see rowWork). It is the fastest of the scale environment's
 	// reports on one machine of 16 cores: two that went through 1.1 and
@@ -135,9 +144,11 @@ type estimate struct {
 	large                 bool
 	// memory says the working set is over memoryShare of the coordinator's
 	// memory, by workingSetFactor, and spills that it is by heldFactor, as
-	// local says, whose oom says it should run out of memory there.
-	memory, spills bool
-	local          spill
+	// local says, whose oom says it should run out of memory there;
+	// farBeyond that the working set by DuckDB's plan, or else by the
+	// stages, is past farBeyondRatio times the room (see Plan.FitsHere).
+	memory, spills, farBeyond bool
+	local                     spill
 	// options are the ways on workers weighed, dollars says their costs are
 	// in dollars, and fleet why the one in workers and large, picked, was
 	// chosen.
@@ -338,7 +349,12 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// a statement of its shape allocated over its run here, which fits if
 	// that is within its share.
 	set := x.set()
-	if m.ranHere {
+	e.farBeyond = m.memory > 0 && set > farBeyondRatio*memoryShare*float64(m.memory)
+	if m.ranHere && !(x.planned && set > footprintTrust*float64(m.allocated) && set > slightSpill*memoryShare*float64(m.memory)) {
+		// What a run of its shape allocated here, unless DuckDB's plan holds
+		// far more, as when its tables have grown since: a report's shape
+		// that ran here at a tenth of the data allocated 53 GB, and its plan
+		// at a hundred times held 250 GB.
 		set = float64(m.allocated)
 	}
 	e.local = spillOn(set, m.memory)

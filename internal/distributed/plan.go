@@ -180,8 +180,11 @@ type Plan struct {
 	placement string
 	// shortOfMemory says the statement would not fit in the coordinator's
 	// memory: its working set is over its share (estimateTimes), or it ran
-	// out of memory there before.
+	// out of memory there before. farBeyond says its working set by
+	// DuckDB's plan, whatever a run of its shape allocated here, is more
+	// than farBeyondRatio times the coordinator's room for it.
 	shortOfMemory bool
+	farBeyond     bool
 	// uncertain are relations of uncertain size its stages read by
 	// partition, with large tables partitioned to meet them; relKeys are
 	// the keys of the relations its exchanges hold, by exchange ID.
@@ -209,6 +212,22 @@ type Plan struct {
 // coordinator's memory, so that running it there instead of on workers
 // would fail, slowly.
 func (p *Plan) ShortOfMemory() bool { return p.shortOfMemory }
+
+// FitsHere reports whether the coordinator could run the statement itself,
+// should the workers chosen fail: not when its working set by DuckDB's
+// plan is far beyond the coordinator's memory (farBeyondRatio times its
+// room), whatever a run of its shape allocated there once, as at a tenth
+// of the data. At a hundred times the data, a report estimated at 250 GB
+// ran on the coordinator after the large worker failed, spilled 167 GB and
+// was killed after 9 minutes; 16 workers ran it in 729 s.
+func (p *Plan) FitsHere() bool { return !p.shortOfMemory && !p.farBeyond }
+
+// Workers is how many workers the statement was planned to run on, 1 for
+// the large worker; Large says it runs on the large worker.
+func (p *Plan) Workers() int { return p.workers }
+
+// Large reports whether the statement runs on the large worker alone.
+func (p *Plan) Large() bool { return p.large }
 
 // Placement says where auto mode, or the session's mode, runs the
 // statement and why: how many workers or the large worker, and the reason,

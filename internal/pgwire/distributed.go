@@ -252,6 +252,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	}
 	// The workers stay up while the statement runs, here too.
 	release := s.dist.Keep()
+	start := time.Now()
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		// Released now if the statement is done; otherwise once it has run
@@ -263,6 +264,11 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 				parts.release = release
 			}
 		}()
+		if ctx.Err() == nil && !distributed.DataError(err) && !distributed.BitmapMemory(err) && !distributed.IsUnsupported(err) {
+			// How long it ran there before it failed, so that auto mode
+			// takes that way to take longer for a while.
+			s.dist.ObserveFailure(plan.Key, plan.Workers(), plan.Large(), time.Since(start))
+		}
 		switch {
 		case ctx.Err() != nil:
 			return parts, true, ctx.Err()
@@ -274,18 +280,36 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			return parts, true, err
 		case distributed.OutOfMemory(err):
 			// Another worker, or this replica, would run out the same way.
+			// The query history records where it failed, for the replicas
+			// that read it when they start.
 			s.log.Warn("a worker ran out of memory running part of a statement; the statement fails rather than run again",
 				"user", user.Name, "err", err)
-			return parts, true, errWorkerMemory
+			return distParts{workers: plan.Workers(), large: plan.Large(), placement: plan.Placement(), key: plan.Key}, true, errWorkerMemory
 		case distributed.IsUnsupported(err):
 			// The workers found what planning could not, such as data
 			// files without field IDs.
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 			return parts, false, nil
 		}
-		if plan.ShortOfMemory() {
-			// It would run out of memory here, after taking as long as it
-			// does on one machine: fail now.
+		if plan.Large() && !plan.FitsHere() {
+			// The large worker failed, and this replica would not hold the
+			// statement: the fleet runs it, as a statement forced onto the
+			// workers does.
+			s.log.Warn("the large worker could not run a statement, which this replica would not hold; running it on the workers",
+				"user", user.Name, "err", err)
+			p, ran, err := s.runDistributed(ctx, sess, user, st, args, w, distributed.ModeOn)
+			if ran {
+				p.placement = "after the large worker failed: " + p.placement
+				return p, true, err
+			}
+			if p.release != nil {
+				p.release()
+			}
+		}
+		if !plan.FitsHere() {
+			// It would run out of memory here, or spill for far longer than
+			// the workers took, after taking as long as it does on one
+			// machine: fail now.
 			s.log.Warn("workers could not run a statement, which would not fit in this replica's memory; it fails",
 				"user", user.Name, "err", err)
 			return parts, true, fmt.Errorf("workers could not run the statement, and it needs more memory than this replica has: %w", err)

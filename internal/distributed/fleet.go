@@ -155,9 +155,12 @@ type option struct {
 	large   bool
 	// estimate is its time by the estimates, and seconds as corrected by
 	// what the statement took before (see correct); measured says seconds
-	// is what it took on as many workers.
+	// is what it took on as many workers; failed that it failed there
+	// lately, after failedAfter seconds.
 	estimate, seconds float64
 	measured          bool
+	failed            bool
+	failedAfter       float64
 	// started is how many workers it starts; spill is what each of its
 	// workers does with its share of the working set.
 	started int
@@ -337,9 +340,15 @@ func fleetBucket(n int) int { return bits.Len(uint(max(n, 0))) }
 // times what the nearest run took over its own estimate, as the estimates
 // ran short or long for the statement. The large worker is corrected only
 // by its own runs: one machine without exchanges is another kind of run.
+// An option on which the statement failed within exploreEvery takes no
+// less than failurePenalty times what it ran before it failed.
 func correct(opts []option, r runs, f fleet) {
+	correctAt(opts, r, f, time.Now())
+}
+
+func correctAt(opts []option, r runs, f fleet, now time.Time) {
 	for i := range opts {
-		opts[i].seconds, opts[i].measured = opts[i].estimate, false
+		opts[i].seconds, opts[i].measured, opts[i].failed, opts[i].failedAfter = opts[i].estimate, false, false, 0
 	}
 	var near []option
 	for i, o := range opts {
@@ -366,6 +375,16 @@ func correct(opts []option, r runs, f fleet) {
 			}
 		}
 		opts[i].seconds = o.estimate * best.seconds / best.estimate
+	}
+	for i, o := range opts {
+		fail, failed := r.failures[fleetBucket(o.workers)].recent(now)
+		if o.large {
+			fail, failed = r.largeFailure.recent(now)
+		}
+		if failed {
+			opts[i].seconds = max(o.seconds, failurePenalty*fail.seconds)
+			opts[i].failed, opts[i].failedAfter = true, fail.seconds
+		}
 	}
 	for i := range opts {
 		opts[i].cost = opts[i].costOn(f)
@@ -419,7 +438,10 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	best, f := opts[chosen], opts[fastest]
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s, %.0f s", best, best.seconds)
-	if best.measured {
+	switch {
+	case best.failed:
+		fmt.Fprintf(&b, " as it failed there lately after %.0f s", best.failedAfter)
+	case best.measured:
 		b.WriteString(" as it took before")
 	}
 	switch {
@@ -463,7 +485,7 @@ func exploreFleet(opts []option, best option, r runs, now time.Time) (option, bo
 	found := false
 	for _, o := range opts {
 		switch {
-		case o.measured, o.large, o.spill.oom, math.IsInf(fastest, 1), o.seconds > fleetExploreWithin*fastest:
+		case o.measured, o.failed, o.large, o.spill.oom, math.IsInf(fastest, 1), o.seconds > fleetExploreWithin*fastest:
 		case o.seconds >= best.seconds && o.cost >= best.cost:
 		case !found || o.cost < out.cost:
 			out, found = o, true
@@ -497,7 +519,9 @@ func describeOptions(opts []option, dollars bool) string {
 	parts := make([]string, len(opts))
 	for i, o := range opts {
 		s := fmt.Sprintf("%s %.0f s", o, o.seconds)
-		if o.measured {
+		if o.failed {
+			s += fmt.Sprintf(" (failed after %.0f s)", o.failedAfter)
+		} else if o.measured {
 			s += " (measured)"
 		} else if math.Abs(o.seconds-o.estimate) > 0.5 {
 			s += fmt.Sprintf(" (estimated %.0f s)", o.estimate)

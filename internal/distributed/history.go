@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"cmp"
 	clist "container/list"
 	"maps"
 	"sync"
@@ -36,7 +37,12 @@ type runs struct {
 	distWorkers int
 	fleets      map[int]float64
 	large       float64
-	explored    time.Time
+	// failures are when its runs on about as many workers (fleetBucket),
+	// or on the large worker (largeFailure), last failed there, and after
+	// how long, for choosing how many next time (see correct).
+	failures     map[int]failure
+	largeFailure failure
+	explored     time.Time
 	// fleetExplored is when it last ran on a number of workers it had not
 	// run on, to measure it (see exploreFleet).
 	fleetExplored time.Time
@@ -68,6 +74,25 @@ type runs struct {
 	localMemory, distMemory, largeMemory int64
 }
 
+// failure is a statement's run on workers that failed after seconds, at.
+type failure struct {
+	seconds float64
+	at      time.Time
+}
+
+// failurePenalty is how many times what a statement ran on a number of
+// workers before it failed there a run there is taken to take, for
+// exploreEvery after: it did not finish, and failing cost the run again.
+// At a hundred times the data, a report that took 729 s on 16 workers
+// failed there after 2,078 s, a worker out of memory, and took 1,537 s
+// the next time, a task run again; the runs kept said 16 took 729 s.
+const failurePenalty = 1.5
+
+// recent returns f if it failed within exploreEvery before now.
+func (f failure) recent(now time.Time) (failure, bool) {
+	return f, f.at != (time.Time{}) && now.Sub(f.at) < exploreEvery
+}
+
 func newHistory() *history {
 	return &history{order: clist.New(), byKey: map[string]*clist.Element{}}
 }
@@ -82,7 +107,7 @@ func (h *history) get(key string) (runs, bool) {
 	}
 	h.order.MoveToFront(el)
 	r := *el.Value.(*runs)
-	r.fleets = maps.Clone(r.fleets)
+	r.fleets, r.failures = maps.Clone(r.fleets), maps.Clone(r.failures)
 	return r, true
 }
 
@@ -120,7 +145,7 @@ func (h *history) observe(key string, workers int, large bool, seconds float64, 
 			avg, r.largeMemory = &r.large, memory
 		case workers > 0:
 			if !alike(memory, r.distMemory) {
-				r.fleets = nil
+				r.fleets, r.failures = nil, nil
 			}
 			if r.fleets == nil {
 				r.fleets = map[int]float64{}
@@ -137,6 +162,28 @@ func (h *history) observe(key string, workers int, large bool, seconds float64, 
 			r.outOfMemory, r.localMemory = false, memory
 		}
 		*avg = mean(*avg, seconds)
+	})
+}
+
+// observeFailure records that a run of key on workers workers, or on the
+// large worker if large, failed after seconds, on workers of memory.
+func (h *history) observeFailure(key string, workers int, large bool, seconds float64, memory int64, at time.Time) {
+	h.update(key, func(r *runs) {
+		f := failure{seconds: seconds, at: at}
+		if large {
+			if !alike(memory, r.largeMemory) {
+				r.large = 0
+			}
+			r.largeFailure, r.largeMemory = f, memory
+			return
+		}
+		if !alike(memory, r.distMemory) {
+			r.fleets, r.failures = nil, nil
+		}
+		if r.failures == nil {
+			r.failures = map[int]failure{}
+		}
+		r.failures[fleetBucket(workers)], r.distMemory = f, memory
 	})
 }
 
@@ -159,6 +206,10 @@ type Run struct {
 	Large       bool
 	Duration    time.Duration
 	OutOfMemory bool
+	// Failed says it failed on Workers workers, or the large worker, after
+	// Duration (see ObserveFailure), at At.
+	Failed bool
+	At     time.Time
 	// Memory is the memory it ran with (see RunMemory); a run that does not
 	// say is not taken.
 	Memory int64
@@ -202,10 +253,10 @@ func comparable(r runs, m, w, l int64) runs {
 		r.local, r.outOfMemory, r.guarded = 0, false, false
 	}
 	if !alike(r.distMemory, w) {
-		r.dist, r.distWorkers, r.fleets, r.exchangeRows, r.exchangeBytes, r.fanout = 0, 0, nil, 0, 0, 0
+		r.dist, r.distWorkers, r.fleets, r.failures, r.exchangeRows, r.exchangeBytes, r.fanout = 0, 0, nil, nil, 0, 0, 0
 	}
 	if !alike(r.largeMemory, l) {
-		r.large = 0
+		r.large, r.largeFailure = 0, failure{}
 	}
 	return r
 }
@@ -221,6 +272,15 @@ func (co *Coordinator) Observe(key string, workers int, d time.Duration) {
 func (co *Coordinator) ObserveOn(key string, workers int, large bool, d time.Duration) {
 	if key != "" && d > 0 {
 		co.history.observe(key, workers, large, d.Seconds(), co.RunMemoryOn(workers, large))
+	}
+}
+
+// ObserveFailure records that a statement whose plan key is key failed
+// on workers workers, or on the large worker if large, after d, so that
+// auto mode takes that way to take longer for a while (see correct).
+func (co *Coordinator) ObserveFailure(key string, workers int, large bool, d time.Duration) {
+	if key != "" && d > 0 && (workers > 0 || large) {
+		co.history.observeFailure(key, workers, large, d.Seconds(), co.RunMemoryOn(workers, large), time.Now())
 	}
 }
 
@@ -306,6 +366,8 @@ func (co *Coordinator) Seed(rs []Run) {
 	for _, r := range rs {
 		switch {
 		case r.Key == "" || r.Memory == 0:
+		case r.Failed:
+			co.history.observeFailure(r.Key, r.Workers, r.Large, r.Duration.Seconds(), r.Memory, cmp.Or(r.At, time.Now()))
 		case r.OutOfMemory:
 			co.observeOutOfMemory(r.Key, r.Memory)
 		case r.Duration > 0:

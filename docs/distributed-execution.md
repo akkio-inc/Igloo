@@ -561,7 +561,13 @@ large worker apart from them: how many workers a statement runs on takes
 what it took on each before for that one's time, and the others' estimates
 times what the nearest it ran on took over its estimate, so a statement
 that took 127 s on 16 workers, estimated at 89, is taken to need 164 s on
-8, and one that then took 112 s on 8 runs on 8 next. One that
+8, and one that then took 112 s on 8 runs on 8 next. A statement that
+failed on a number of workers, or on the large worker, in the last day (a
+worker out of memory, a read that failed) is taken to need one and a half
+times as long as it ran there before it failed, so that other ways weigh
+against it: one that took 729 s on 16 workers, and then failed there after
+2,078 s, is taken to need 3,117 s there. The query history records where a
+statement failed, and replicas read it when they start. One that
 ran on a quarter of the workers it would run on now, as in an earlier
 session on a smaller fleet, is tried on all of them, at most once a day,
 whatever it took on the replica. The server logs each choice, `chose where
@@ -699,9 +705,16 @@ would take more than a quarter of the coordinator's free disk (at least
 1 GiB), or the parts cannot
 be combined, the statement also runs on the coordinator, so a client sees a
 slower statement, not an error; but not one whose exchanged rows Igloo
-estimates at more than the coordinator's memory holds, or that ran out of
-memory there before, which would run out of memory there after as long as
-one machine takes: that fails at once, with the workers' error. Workers stay
+estimates at more than the coordinator's memory holds, that ran out of
+memory there before, or whose working set by DuckDB's plan is four or more
+times the coordinator's room for it, whatever a run of its shape allocated
+there at a tenth of the data, which would run out of memory there or
+spill for far longer than the workers take: that fails at once, with the
+workers' error. One that auto mode ran on the [large
+worker](#a-large-worker) runs on the other workers instead, as a statement
+forced onto them does: at a hundred times the data, a report of 250 GB
+whose large worker failed ran on the coordinator, spilled 167 GB and was
+killed after 9 minutes, where 16 workers took 729 s. Workers stay
 up while a statement that ran tasks on them runs on the coordinator, and
 count as idle from when it ends. An error in the data itself, such as a failed cast
 or a division by zero, is the statement's error, as it would be on one

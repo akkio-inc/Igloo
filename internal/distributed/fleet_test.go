@@ -315,6 +315,105 @@ func TestFleetCalibration(t *testing.T) {
 	}
 }
 
+// TestFailedRuns checks that a statement's failures on a number of workers
+// steer how many it runs on: F3-like at a hundred times the data took 729
+// s on 16 workers, failed there after 2,078 s, a worker out of memory, and
+// auto mode kept taking 16 as if it took 729 s.
+func TestFailedRuns(t *testing.T) {
+	now := time.Now()
+	options := func() []option {
+		return []option{{workers: 8, estimate: 1100}, {workers: 16, estimate: 600}, {workers: 1, large: true, estimate: 500}}
+	}
+	run := func(r runs) (option, string) {
+		t.Helper()
+		opts := options()
+		correctAt(opts, r, benchWorkers, now)
+		best, why, ok := pick(opts, true)
+		if !ok {
+			t.Fatal("nothing picked")
+		}
+		return best, why + "; " + describeOptions(opts, true)
+	}
+	b16 := fleetBucket(16)
+	// 729 s on 16, the large worker 900 s: 16.
+	r := runs{fleets: map[int]float64{b16: 729}, large: 900}
+	if best, why := run(r); best.workers != 16 || best.large {
+		t.Errorf("after 729 s on 16: %s (%s)", best, why)
+	}
+	// Failed on 16 an hour ago after 2,078 s: 16 takes 1.5 times that, and
+	// the large worker's 900 s is faster.
+	r.failures = map[int]failure{b16: {seconds: 2078, at: now.Add(-time.Hour)}}
+	if best, why := run(r); !best.large || !strings.Contains(why, "16 workers 3117 s (failed after 2078 s)") {
+		t.Errorf("after failing on 16: %s (%s)", best, why)
+	}
+	// A day on, the failure counts no more.
+	r.failures[b16] = failure{seconds: 2078, at: now.Add(-exploreEvery - time.Hour)}
+	if best, why := run(r); best.workers != 16 || best.large {
+		t.Errorf("a day after failing on 16: %s (%s)", best, why)
+	}
+	// Failed on the large worker after 700 s: 16 again.
+	r.failures = nil
+	r.largeFailure = failure{seconds: 700, at: now.Add(-time.Minute)}
+	r.large = 0
+	if best, why := run(r); best.large || !strings.Contains(why, "the large worker 1050 s (failed after 700 s)") {
+		t.Errorf("after failing on the large worker: %s (%s)", best, why)
+	}
+
+	// The history keeps failures by the workers' bucket, apart from the
+	// large worker's, and for workers of the memory they failed with.
+	h := newHistory()
+	h.observe("a", 16, false, 729, 24<<30)
+	h.observeFailure("a", 16, false, 2078, 24<<30, now)
+	h.observeFailure("a", 1, true, 300, 440<<30, now)
+	got, _ := h.get("a")
+	if f := got.failures[b16]; f.seconds != 2078 || got.fleets[b16] != 729 || got.largeFailure.seconds != 300 {
+		t.Errorf("history: %+v", got)
+	}
+	if c := comparable(got, 0, 48<<30, 440<<30); c.failures != nil || c.largeFailure.seconds != 300 {
+		t.Errorf("workers of other memory: %+v", c)
+	}
+	// Seeded from the query history: a run that failed on workers, then.
+	co := &Coordinator{history: newHistory()}
+	co.Seed([]Run{{Key: "b", Workers: 16, Duration: 2078 * time.Second, Memory: 24 << 30, Failed: true, At: now.Add(-2 * time.Hour)}})
+	if r, _ := co.history.get("b"); r.failures[b16].seconds != 2078 || !r.failures[b16].at.Equal(now.Add(-2*time.Hour)) || r.outOfMemory {
+		t.Errorf("seeded: %+v", r)
+	}
+}
+
+// TestFitsHere checks which statements the coordinator would run itself
+// should their workers fail: not one whose working set by DuckDB's plan
+// is four or more times its room, whatever a run of its shape allocated
+// there at a tenth of the data; one that held little there still does.
+func TestFitsHere(t *testing.T) {
+	room := memoryShare * float64(scaleCoordinator.memory)
+	f3 := features{bytes: 1e11, exchanged: 1e11, held: 1e11, rows: 1.3e11, levels: 7, stages: 35, planned: true, planSet: 250e9}
+	e := f3.estimate(scaleCoordinator, scaleWorkers)
+	if !e.farBeyond || e.local.factor <= 1 {
+		t.Errorf("F3-like at 100x, 250 GB: far beyond %v, %s", e.farBeyond, e.local)
+	}
+	// A run of its shape allocated 53 GB here, at a tenth of the data: the
+	// plan's 250 GB, more than three times that, stands.
+	here := scaleCoordinator
+	here.ranHere, here.allocated = true, 52_935_471_923
+	if e := f3.estimate(here, scaleWorkers); !e.farBeyond || e.local.set != 250e9 {
+		t.Errorf("F3-like at 100x, a run of its shape here: far beyond %v, %s", e.farBeyond, e.local)
+	}
+	// A dashboard's statement estimated at 10 GB that allocated 2 GB here:
+	// what it allocated.
+	dash := features{bytes: 1e9, held: 1e9, rows: 1e8, levels: 2, stages: 3, planned: true, planSet: 10e9}
+	here.allocated = 2e9
+	if e := dash.estimate(here, scaleWorkers); e.farBeyond || e.local.set != 2e9 {
+		t.Errorf("a dashboard's statement: far beyond %v, %s", e.farBeyond, e.local)
+	}
+	if e := (features{planned: true, planSet: 3.9 * room}).estimate(scaleCoordinator, scaleWorkers); e.farBeyond {
+		t.Error("3.9 times the room: far beyond")
+	}
+	p := &Plan{farBeyond: true}
+	if p.FitsHere() || !(&Plan{}).FitsHere() || (&Plan{shortOfMemory: true}).FitsHere() {
+		t.Error("FitsHere")
+	}
+}
+
 // TestFleetSizes checks the numbers of workers weighed: powers of two up
 // to the most, and the running workers.
 func TestFleetSizes(t *testing.T) {
