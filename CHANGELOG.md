@@ -535,6 +535,33 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Workers complete an aggregation's groups whenever they may be many (a
+  `GROUP BY` of a large table's column, unless `ANALYZE`'s distinct counts
+  put the groups at 10,000 or fewer), partitioned by group, counts of
+  distinct values (in roaring bitmaps too) by value and then by group, and
+  keep what `HAVING`, `ORDER BY ... LIMIT` and rankings of the groups keep
+  (`QUALIFY row_number() OVER (...) <= k`, also through `SELECT *`
+  unions): the coordinator receives the result's rows and only projects,
+  filters and orders them, where it combined every task's partial results
+  of every group. A report shaped like the one that did not finish at a
+  hundred times the data on 16 workers (its groups ranked on the
+  coordinator, 55.6 GB of memory and 91 GB of spill) has the coordinator
+  receive 6 KB at test scale and 19 KB at four times that. A result ordered
+  by `ORDER BY` without `LIMIT` is sorted by each task and merged by the
+  coordinator, a batch of rows a task in memory, rather than sorted there.
+  Window functions that partition their rows by the same columns run on
+  workers, partitioned so, under `QUALIFY` or a later filter (see [what
+  runs distributed](docs/distributed-execution.md#what-runs-distributed)
+  and [window functions](docs/distributed-execution.md#window-functions)).
+- Tables partitioned by `bucket(n, column)` (`CREATE TABLE ... PARTITIONED
+  BY`, `ALTER TABLE ... SET PARTITIONED BY`, or Snowflake's `CLUSTER BY
+  (BUCKET(n, column))`) are read by bucket, without an exchange, where a
+  part joins them on their bucket columns, one count dividing the others,
+  groups by the column, counts its distinct values or partitions windows by
+  it; `EXPLAIN DISTRIBUTED` says so, and why bucketed tables are exchanged
+  all the same (see [bucketed
+  tables](docs/distributed-execution.md#bucketed-tables)). Maintenance
+  compacts each bucket's files into files of that bucket.
 - Auto mode picks how many workers a statement runs on: of 1, 2, 4 and so
   on up to `IGLOO_WORKER_MAX`, and the workers running, those estimated
   within a fifth of the fastest, the cheapest at the workers' price
