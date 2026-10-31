@@ -123,12 +123,14 @@ const (
 // on workers.
 type estimate struct {
 	// bytes are what its stages read of tables, as selective filters leave
-	// them; exchanged what the stages that write exchanges read of them, in
-	// full; levels its stages' longest chain, and stages how many there are;
-	// rows the rows its stages go through (see rowWork).
-	bytes, exchanged int64
-	levels, stages   int
-	rows             float64
+	// them, and localBytes what one machine reads of them, by DuckDB's plan
+	// where it says (see planEstimate), or bytes; exchanged what the stages
+	// that write exchanges read of them, in full; levels its stages'
+	// longest chain, and stages how many there are; rows the rows its
+	// stages go through (see rowWork).
+	bytes, localBytes, exchanged int64
+	levels, stages               int
+	rows                         float64
 	// oneMachine is the coordinator's time, onWorkers that of workers,
 	// as many as workers says, or of the large worker if large, in seconds,
 	// by the estimates (see pick for the choice, which what the statement
@@ -222,10 +224,14 @@ type features struct {
 	levels, stages int
 	// planSet is the working set DuckDB's plan of the statement holds,
 	// where planned says the session could plan it, and planParts what each
-	// of its operators holds (see workingSetOf).
+	// of its operators holds (see workingSetOf); planBytes is what one
+	// machine reads of tables by the plan, zero where it does not say, and
+	// planWork the core-seconds its hash tables take (see planEstimate).
 	planSet   float64
 	planned   bool
 	planParts []heldPart
+	planBytes int64
+	planWork  float64
 }
 
 // set is the working set of a plan of features x on one machine: what
@@ -310,11 +316,19 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// cache for warm put a report of 258 s at 15 s.
 	cores := float64(max(m.cores, 1))
 	threadsPerCore := float64(max(m.threads, m.cores)) / cores
-	e.oneMachine = float64(e.bytes) / (cores * coldRateAt(threadsPerCore))
+	// What it reads by DuckDB's plan, the columns its scans project, where
+	// the stages' fragments may read a view's every column: a report whose
+	// stages read 77 GB of a table of 470 columns read 9.6 GB there.
+	e.localBytes = e.bytes
+	if x.planned && x.planBytes > 0 {
+		e.localBytes = x.planBytes
+	}
+	e.oneMachine = float64(e.localBytes) / (cores * coldRateAt(threadsPerCore))
 	// What it reads, or what it computes over the rows, whichever takes
 	// longer: a report that reads 2 GB of a table but joins its 400 million
-	// rows to themselves 16 times is no 1-second statement.
-	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate))
+	// rows to themselves 16 times is no 1-second statement. By the plan,
+	// its hash tables' rows, at hashMissRate where they outgrow the caches.
+	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate), x.planWork/cores)
 	// Short of memory, it takes longer, spilling, as much as its working
 	// set is over its share of memory (see spillOn): heldFactor times what
 	// its exchanges' stages read as the selective filters leave it, or what

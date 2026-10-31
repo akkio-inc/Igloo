@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"runtime"
@@ -77,6 +78,171 @@ func TestWorkingSetOf(t *testing.T) {
 	}
 	if _, _, err := workingSetOf("not json", st); err == nil {
 		t.Error("a plan that is not JSON gave a working set")
+	}
+}
+
+// op is an operator of a plan as DuckDB's EXPLAIN (FORMAT JSON) writes it,
+// for the plans the tests make up; extra alternates keys and values.
+func op(name string, children []map[string]any, extra ...any) map[string]any {
+	info := map[string]any{}
+	for i := 0; i+1 < len(extra); i += 2 {
+		info[extra[i].(string)] = extra[i+1]
+	}
+	if children == nil {
+		children = []map[string]any{}
+	}
+	return map[string]any{"name": name, "children": children, "extra_info": info}
+}
+
+func planJSON(t *testing.T, root map[string]any) string {
+	t.Helper()
+	b, err := json.Marshal([]map[string]any{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestPlanShapes checks the plan estimates of statements shaped like the
+// scale runs' reports whose estimates ran far off.
+func TestPlanShapes(t *testing.T) {
+	// E1-like: people joined to themselves 16 times, in branches of a
+	// UNION, each through a view joining a survey on a computed key; 400
+	// million people, 18 million survey rows. DuckDB took the plan to hold
+	// 16 hash tables of 400 million rows, 793 GB; it held 33 GB, 14 GB in
+	// hash tables, one branch's at a time; and its stages read 77 GB of the
+	// people's 470 columns where DuckDB's scans read 9.6 GB.
+	people := &Table{Name: "people", Rows: 400e6, Bytes: 77e9, Columns: []Column{{Name: "pid", Type: "VARCHAR"}, {Name: "hh", Type: "VARCHAR"}}}
+	for i := range 468 {
+		people.Columns = append(people.Columns, Column{Name: fmt.Sprint("trait", i), Type: "VARCHAR"})
+	}
+	survey := &Table{Name: "survey", Rows: 18e6, Bytes: 1e8, Columns: []Column{{Name: "survey_key", Type: "DECIMAL(38,0)"}}}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: people}, {Table: survey}}}}, 24)
+	view := func(trait string) map[string]any {
+		return op("PROJECTION", []map[string]any{
+			op("HASH_JOIN", []map[string]any{
+				op("ICEBERG_SCAN", nil, "Projections", []string{"pid", "hh", trait}, "Estimated Cardinality", "400000000"),
+				op("ICEBERG_SCAN", nil, "Projections", "survey_key", "Estimated Cardinality", "18000000"),
+			}, "Join Type", "LEFT", "Conditions", "TRY_CAST(hh AS DECIMAL(38,0)) = survey_key", "Estimated Cardinality", "400000000"),
+		}, "Projections", []string{"pid", trait}, "Estimated Cardinality", "400000000")
+	}
+	var branches []map[string]any
+	for i := range 16 {
+		branches = append(branches, op("PROJECTION", []map[string]any{
+			op("HASH_JOIN", []map[string]any{view(fmt.Sprint("trait", i)), op("CTE_SCAN", nil, "CTE Index", "0", "Estimated Cardinality", "400000000")},
+				"Join Type", "INNER", "Conditions", "pid = pid", "Estimated Cardinality", "400000000"),
+		}, "Projections", []string{"pid", "style"}, "Estimated Cardinality", "400000000"))
+	}
+	e1 := op("CTE", []map[string]any{
+		op("PROJECTION", []map[string]any{view("trait0")}, "Projections", "pid", "Estimated Cardinality", "400000000"),
+		op("HASH_GROUP_BY", []map[string]any{op("UNION", branches)}, "Groups", []string{"#0", "#1"}, "Aggregates", []string{"count(#2)"},
+			"Estimated Cardinality", "16"),
+	}, "CTE Name", "everyone", "Table Index", "0", "Estimated Cardinality", "0")
+	p, err := planOf(planJSON(t, e1), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One branch: 400 million ids of 32 bytes and a join's 32, times 1.5,
+	// and its view's survey; and the view the common table expression reads.
+	one := 400e6*64*heldFactors["join"] + 18e6*48*heldFactors["join"]
+	if p.set < one || p.set > 1.2*one {
+		t.Errorf("E1-like: %.1f GB, want about one branch's %.1f GB", p.set/1e9, one/1e9)
+	}
+	// Two columns and the 16 traits of 470, about a 26th of the table.
+	if want := int64(77e9) / 470 * 18; p.bytes < want-1e8 || p.bytes > want+2e8 {
+		t.Errorf("E1-like reads %.1f GB, want %.1f GB", float64(p.bytes)/1e9, float64(want)/1e9)
+	}
+	// 16 joins of 400 million rows to 400 million and 17 to 18 million, in
+	// tables past the caches: 2,033 core-seconds; it took 2,166.
+	if p.work < 1800 || p.work > 2300 {
+		t.Errorf("E1-like: %.0f core-seconds", p.work)
+	}
+
+	// F3-like: 157 million events joined to an audience of everyone, 2
+	// million, which DuckDB took to keep a fifth of them; the window over
+	// them all (OVER ()); FLATTEN's cross product with six objects; the
+	// people counted distinct per value. It held 51 GB in hash tables and
+	// spilled 55 GB, and was estimated at 25 GB.
+	events := &Table{Name: "events", Rows: 157e6, Bytes: 5e9, Columns: []Column{{Name: "id", Type: "VARCHAR"}, {Name: "day", Type: "DATE"},
+		{Name: "genres", Type: "VARCHAR[]"}, {Name: "titles", Type: "VARCHAR[]"}}}
+	audience := &Table{Name: "audience", Rows: 2e6, Bytes: 5e7, Columns: []Column{{Name: "member", Type: "VARCHAR"}}}
+	st = newPlanStats([]*Stage{{Inputs: []Input{{Table: events}, {Table: audience}}}}, 24)
+	f3 := op("CTE", []map[string]any{
+		op("HASH_GROUP_BY", []map[string]any{
+			op("ICEBERG_SCAN", nil, "Projections", "member", "Filters", "(NOT (member IS NULL))", "Estimated Cardinality", "2000000"),
+		}, "Groups", "#0", "Aggregates", "", "Estimated Cardinality", "2000000"),
+		op("HASH_GROUP_BY", []map[string]any{
+			op("UNNEST", []map[string]any{
+				op("BLOCKWISE_NL_JOIN", []map[string]any{
+					op("WINDOW", []map[string]any{
+						op("HASH_JOIN", []map[string]any{
+							op("ICEBERG_SCAN", nil, "Projections", []string{"day", "id", "genres", "titles"}, "Estimated Cardinality", "157000000"),
+							op("CTE_SCAN", nil, "CTE Index", "1", "Estimated Cardinality", "2000000"),
+						}, "Join Type", "INNER", "Conditions", "id = member", "Estimated Cardinality", "31400000"),
+					}, "Projections", []string{"min(day) OVER ()", "max(day) OVER ()"}),
+					op("RANGE", nil, "Function", "RANGE", "Estimated Cardinality", "6"),
+				}, "Join Type", "INNER", "Condition", "(CASE WHEN (i = 0) THEN genres ELSE titles END IS NOT NULL)"),
+			}),
+		}, "Groups", []string{"#0", "#1"}, "Aggregates", []string{"count(DISTINCT #2)", "count_star()"}, "Estimated Cardinality", "31400000"),
+	}, "CTE Name", "chosen", "Table Index", "1", "Estimated Cardinality", "0")
+	p, err = planOf(planJSON(t, f3), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]heldPart{}
+	for _, part := range p.parts {
+		got[part.op] = part
+	}
+	// An event's id, day and lists, and its member's id.
+	if w := got["WINDOW"]; w.rows != 157e6 || math.Abs(w.bytes-157e6*(32+4+64+64+32+hashEntryBytes)) > 1 {
+		t.Errorf("F3-like window: %+v, want every event, buffered once", w)
+	}
+	if d := got["HASH_GROUP_BY DISTINCT"]; d.rows != 6*157e6 {
+		t.Errorf("F3-like distinct pairs: %+v, want six for each event", d)
+	}
+	if g := got["HASH_GROUP_BY"]; g.rows > 31.4e6*24 {
+		t.Errorf("F3-like groups: %+v, no more than DuckDB's for each thread", g)
+	}
+	if p.set < 100e9 || p.set > 300e9 {
+		t.Errorf("F3-like: %.0f GB", p.set/1e9)
+	}
+
+	// F4-like: an audience lookup of every version, joined to its latest
+	// (a scalar subquery's one row), which DuckDB took to keep all 283
+	// million rows; then 157 million events joined to the members. It held
+	// 9.5 GB and was estimated at 439 GB.
+	lookup := &Table{Name: "lookup", Rows: 283e6, Bytes: 4e9, Columns: []Column{{Name: "ver", Type: "INTEGER"}, {Name: "member", Type: "VARCHAR"}}}
+	versions := &Table{Name: "versions", Rows: 934, Bytes: 1e5, Columns: []Column{{Name: "version", Type: "INTEGER"}}}
+	st = newPlanStats([]*Stage{{Inputs: []Input{{Table: events}, {Table: lookup}, {Table: versions}}}}, 24)
+	f4 := op("CTE", []map[string]any{
+		op("HASH_GROUP_BY", []map[string]any{
+			op("HASH_JOIN", []map[string]any{
+				op("ICEBERG_SCAN", nil, "Projections", []string{"ver", "member"}, "Estimated Cardinality", "283000000"),
+				op("PROJECTION", []map[string]any{
+					op("UNGROUPED_AGGREGATE", []map[string]any{
+						op("ICEBERG_SCAN", nil, "Projections", "version", "Estimated Cardinality", "934"),
+					}, "Aggregates", "max(#0)"),
+				}, "Projections", "#0", "Estimated Cardinality", "1"),
+			}, "Join Type", "INNER", "Conditions", "ver = SUBQUERY", "Estimated Cardinality", "283000000"),
+		}, "Groups", "#0", "Aggregates", "", "Estimated Cardinality", "283000000"),
+		op("HASH_JOIN", []map[string]any{
+			op("ICEBERG_SCAN", nil, "Projections", []string{"day", "id", "genres"}, "Estimated Cardinality", "157000000"),
+			op("CTE_SCAN", nil, "CTE Index", "2", "Estimated Cardinality", "283000000"),
+		}, "Join Type", "INNER", "Conditions", "id = member", "Estimated Cardinality", "283000000"),
+	}, "CTE Name", "chosen", "Table Index", "2", "Estimated Cardinality", "0")
+	p, err = planOf(planJSON(t, f4), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.set > 20e9 {
+		t.Errorf("F4-like: %.0f GB", p.set/1e9)
+	}
+	// The lookup's columns a hundredth of them, as the latest version's
+	// row groups; the events' three columns.
+	lookupBytes := int64(float64(columnSet{"ver": true, "member": true}.bytes(lookup)) * filterSelectivity)
+	eventBytes := columnSet{"day": true, "id": true, "genres": true}.bytes(events)
+	if p.bytes != lookupBytes+eventBytes+versions.Bytes {
+		t.Errorf("F4-like reads %d, want %d of the lookup and %d of the events", p.bytes, lookupBytes, eventBytes)
 	}
 }
 
@@ -211,6 +377,60 @@ func TestWorkingSetCalibration(t *testing.T) {
 	if n < 5 || newErr >= oldErr {
 		t.Errorf("over %d statements: by DuckDB's plans %.2f times off at the geometric mean, by what the stages read %.2f", n,
 			math.Exp(newErr/float64(n)), math.Exp(oldErr/float64(n)))
+	}
+}
+
+// TestWorkingSetFlatten checks a statement shaped like F3-like against
+// what DuckDB holds: 3 million events of lists joined to an audience of
+// everyone, a window over them all, FLATTEN's cross product with four
+// lists and their values unnested, people counted distinct per value.
+// DuckDB's plan took the join to keep a fifth of the events and each to
+// make one row, a working set of a tenth of what it held; corrected, the
+// estimate is within a factor of two (the unnest's values, three a list,
+// are not counted).
+func TestWorkingSetFlatten(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes and reads 4 million rows")
+	}
+	h := newHarness(t, 0.01, 2, 1)
+	const n = 1_000_000
+	h.addTable("aud", fmt.Sprintf(`(SELECT md5(i::VARCHAR) AS pid, i %% 90 AS age FROM range(%d) t(i))`, n), 4)
+	list := func(prefix string, k, mod int) string {
+		var items []string
+		for j := range k {
+			items = append(items, fmt.Sprintf("'%s-' || ((i * %d + %d) %% %d)", prefix, j+1, j, mod))
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	}
+	h.addTable("media", fmt.Sprintf(`(SELECT md5((i %% %d)::VARCHAR) AS pid, DATE '2026-01-01' + (i %% 60)::INTEGER AS d,
+		%s AS genre, %s AS title, %s AS network, %s AS app FROM range(%d) t(i))`, n, list("genre", 3, 40), list("title", 6, 5000),
+		list("net", 2, 80), list("app", 2, 30), 3*n), 8)
+	var stages []*Stage
+	for _, tb := range h.tables {
+		tb.Rows = rowCount(h.files[tb.key()])
+		stages = append(stages, &Stage{Inputs: []Input{{Table: tb}}})
+	}
+	q := `WITH sel AS (SELECT DISTINCT a.pid AS pid FROM aud AS a WHERE a.pid IS NOT NULL),
+		base AS (SELECT m.pid, m.d, m.genre, m.title, m.network, m.app, min(m.d) OVER () AS ps, max(m.d) OVER () AS pe
+			FROM media AS m INNER JOIN sel AS a ON a.pid = m.pid),
+		expanded AS (SELECT 'media' AS source, b.ps, b.pe,
+			CASE r.i WHEN 0 THEN 'genre' WHEN 1 THEN 'title' WHEN 2 THEN 'network' ELSE 'app' END AS btype,
+			unnest(CASE r.i WHEN 0 THEN b.genre WHEN 1 THEN b.title WHEN 2 THEN b.network ELSE b.app END) AS bvalue, b.pid, b.d
+			FROM base AS b JOIN range(4) AS r(i) ON (CASE r.i WHEN 0 THEN b.genre WHEN 1 THEN b.title WHEN 2 THEN b.network ELSE b.app END) IS NOT NULL)
+		SELECT source, min(ps), max(pe), btype, bvalue, count(DISTINCT pid) AS members, count(*) AS activity
+		FROM expanded GROUP BY source, btype, bvalue`
+	plan, err := harnessEnv{h}.Explain(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	est, _, err := workingSetOf(plan, newPlanStats(stages, runtime.GOMAXPROCS(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peak := heldPeak(t, h, q)
+	t.Logf("held %.0f MB, estimated %.0f MB", peak/1e6, est/1e6)
+	if est < peak/2 || est > 2*peak {
+		t.Errorf("held %.0f MB, estimated %.0f MB", peak/1e6, est/1e6)
 	}
 }
 

@@ -611,7 +611,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   corrected by statements' peaks on the replica. Over TPC-H at three times
   its scale it is 2.9 times off at the geometric mean, where six times what
   the stages read was 37 times off (see
-  [when](docs/distributed-execution.md#when)).
+  [when](docs/distributed-execution.md#when)). Where DuckDB's plan ran far
+  off at ten times the data, Igloo corrects it: a `UNION`'s branches hold
+  no more than the largest; an inner join to keys DuckDB knows nothing of
+  keeps the larger side's rows its other side's filters keep, not a fifth;
+  a join to a scalar subquery's one row keeps as a filter by a constant; a
+  cross product with a small source, as `FLATTEN` becomes, makes every
+  pair; and `OVER ()` windows buffer their rows once. Three reports
+  estimated at 793, 25 and 439 GB that held 33, about 106 and 9.5 GB are
+  estimated at 46, 215 and 14 GB. The plan also gives one machine's
+  reading, the columns its scans project (9.6 GB where the stages named 77
+  GB of a view's table), and its hash tables' time, at 10 million rows a
+  core-second past the processor's caches: the first report, which took 98
+  s on the replica, is estimated at about 140 s there, where it was
+  estimated at 2,939 s.
 - Where no worker price is set, auto mode prices workers and the large
   worker by their instance types' list prices from a built-in table of AWS,
   Azure and Google Cloud machines, on Spot and by region

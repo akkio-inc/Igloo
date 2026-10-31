@@ -39,8 +39,12 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		where = LargePlacement
 		on = fmt.Sprintf("the large worker %.0f s", math.Round(e.onWorkers))
 	}
+	reads := gigabytes(e.bytes)
+	if e.localBytes != e.bytes {
+		reads = fmt.Sprintf("%s on workers, %s on one machine", reads, gigabytes(e.localBytes))
+	}
 	estimate := fmt.Sprintf("one machine %.0f s, %s; %d levels; reads %s, exchanges %s; %.3g rows",
-		math.Round(e.oneMachine), on, e.levels, gigabytes(e.bytes), gigabytes(e.exchanged), e.rows)
+		math.Round(e.oneMachine), on, e.levels, reads, gigabytes(e.exchanged), e.rows)
 	if plan.shortOfMemory {
 		estimate += "; too large for this replica's memory"
 	}

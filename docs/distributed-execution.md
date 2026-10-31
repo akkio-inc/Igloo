@@ -422,7 +422,23 @@ each sort and window its input, at the widths of their columns. Where the
 distinct counts of an inner join's keys are known, its rows are the product
 of its inputs' over the larger distinct count, as DuckDB, without them,
 took a TPC-H join of customers and suppliers by nation for 2,000 rows where
-it made 12 million. Fitted against what DuckDB was seen holding (the
+it made 12 million. Where DuckDB's plan ran far off at ten times the data,
+Igloo corrects it: the branches of a `UNION` hold no more than the largest
+of them, as DuckDB runs them one after another where memory is short (16
+branches, each joining 400 million rows to 400 million, were estimated at
+793 GB by their sum and held 33 GB); an inner join of rows to keys it knows
+nothing of keeps no fewer of the side with more rows than the other side's
+filters keep, rather than the fifth DuckDB takes (157 million events
+joined to an audience of everyone kept every row); a join to one row, as
+of a scalar subquery's latest version, keeps what a filter by a constant
+does, where DuckDB keeps every row; a cross product with a small source of
+its own, as `FLATTEN` over a list of objects becomes, makes a row for each
+pair; a grouping makes no more groups where its input has more rows than
+DuckDB took; and a window over the whole input without an order (`OVER
+()`) buffers its rows once. Three reports estimated at 793, 25 and 439 GB
+that held 33, about 106 (51 in hash tables, 55 spilled) and 9.5 GB are now
+estimated at 46, 215 and 14 GB; the values an unnest makes are not
+counted. Fitted against what DuckDB was seen holding (the
 replica's samples, as `query_history.memory_peak` records them) over joins,
 groupings, distinct counts, sorts and windows of 16 million rows, the
 estimates are within a quarter for most and a factor of two for all; over

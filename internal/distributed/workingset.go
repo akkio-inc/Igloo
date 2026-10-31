@@ -23,6 +23,26 @@ import (
 // times off either way against the scale runs; DuckDB's plan knows which
 // side a join builds on, what a filter leaves and how many groups a key
 // makes. Where the session cannot say, the old estimate stands.
+//
+// DuckDB's estimates are corrected where the scale runs found them far
+// off (see walk and joinRows). The branches of a UNION run one after
+// another where memory is short, and hold no more than the largest of
+// them: a report of 16 branches, each joining 400 million rows to 400
+// million, was estimated at 793 GB by their sum, and held 33 GB, 14 GB of
+// it in hash tables. DuckDB takes a join of rows to keys it knows nothing
+// of to keep a fifth of them; joined to an audience of everyone, each of
+// 157 million events kept its row. A join to one row, as of a scalar
+// subquery's latest version, keeps as a filter by a constant does, where
+// DuckDB keeps every row. A cross product with a small source of its own,
+// as FLATTEN over a list of six objects becomes, makes a row for each
+// pair, where DuckDB counts one. Those took a report's working set for 25
+// GB where it held 51 GB in hash tables and spilled 55 GB, and another's
+// for 439 GB where it held 9.5 GB.
+//
+// The plan also says what one machine reads (each table's columns that
+// its scans project, once: the read cache serves them again) and the
+// rows its hash tables take in, at hashMissRate a core where a table is
+// larger than the caches (see planEstimate).
 
 // Explainer is an Env whose session plans a query as DuckDB would run it
 // on this replica: Explain returns DuckDB's EXPLAIN (FORMAT JSON) of query,
@@ -48,6 +68,16 @@ const (
 	// filterShare is the share of a scan's rows a filter keeps, where
 	// DuckDB gives the scan no estimate of its own.
 	filterShare = 0.2
+	// hashMissRate is how many rows a core puts into or looks up in a hash
+	// table larger than cacheBytes, a memory access each, where one that
+	// fits the caches takes rowRate: 16 joins of 400 million rows to 400
+	// million and 17 to 18 million took 2,166 core-seconds on one machine,
+	// about 1e7 rows a core-second.
+	hashMissRate = 1e7
+	cacheBytes   = 64 << 20
+	// smallSource is the most rows a side of a cross product without
+	// tables of its own may have for the product to count every pair.
+	smallSource = 1024
 )
 
 // heldFactors are how many times the rows and widths an operator holds by
@@ -58,7 +88,9 @@ const (
 // for the query history's peaks) over joins of 4 million rows,
 // groupings of 4 to 16 million groups, distinct counts, sorts and windows
 // of 16 million rows (see TestWorkingSetCalibration).
-var heldFactors = map[string]float64{"join": 1.5, "group": 1.5, "distinct": 1.3, "sort": 1.2, "window": 2.0}
+// A window over the whole input without an order (OVER ()) buffers its
+// rows once.
+var heldFactors = map[string]float64{"join": 1.5, "group": 1.5, "distinct": 1.3, "sort": 1.2, "window": 2.0, "constant window": 1.0}
 
 // planNode is an operator of DuckDB's EXPLAIN (FORMAT JSON).
 type planNode struct {
@@ -187,25 +219,44 @@ type heldPart struct {
 // holds rows holds. It fails for a plan with a scan whose rows neither
 // DuckDB nor st knows.
 func workingSetOf(plan string, st planStats) (float64, []heldPart, error) {
+	p, err := planOf(plan, st)
+	return p.set, p.parts, err
+}
+
+// planEstimate is what one machine does with a statement, by DuckDB's plan
+// of it: set is its working set and parts what each operator holds; bytes
+// what it reads of tables cold, each table's columns its scans project
+// once, a hundredth of them for a table every scan of which is filtered
+// by a constant (zero where no scan's table is known); work the
+// core-seconds its hash tables take, joins' and aggregates'.
+type planEstimate struct {
+	set   float64
+	parts []heldPart
+	bytes int64
+	work  float64
+}
+
+// planOf estimates a statement by its DuckDB plan (see planEstimate).
+func planOf(plan string, st planStats) (planEstimate, error) {
 	var roots []*planNode
 	if err := json.Unmarshal([]byte(plan), &roots); err != nil {
-		return 0, nil, err
+		return planEstimate{}, err
 	}
 	if len(roots) == 0 {
-		return 0, nil, errors.New("an empty plan")
+		return planEstimate{}, errors.New("an empty plan")
 	}
-	w := &setWalker{st: st}
+	w := &setWalker{st: st, ctes: map[string]cte{}}
 	for _, r := range roots {
 		w.walk(r)
 	}
 	if w.unknown != "" {
-		return 0, nil, errors.New("no estimate of the rows of " + w.unknown)
+		return planEstimate{}, errors.New("no estimate of the rows of " + w.unknown)
 	}
-	var total float64
+	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes()}
 	for _, p := range w.parts {
-		total += p.bytes
+		out.set += p.bytes
 	}
-	return total, w.parts, nil
+	return out, nil
 }
 
 type setWalker struct {
@@ -213,6 +264,61 @@ type setWalker struct {
 	parts []heldPart
 	// unknown names a scan whose rows nothing estimates.
 	unknown string
+	// ctes are the rows of the plan's common table expressions, by index,
+	// for their scans; scans what each scan of a table reads; work the
+	// core-seconds hash tables take (see planEstimate).
+	ctes  map[string]cte
+	scans []scanRead
+	work  float64
+}
+
+// cte is a common table expression's rows and columns, for its scans.
+type cte struct {
+	rows rowsEstimate
+	cols []column
+}
+
+// scanRead is what a scan reads of a table: the columns it projects, and
+// whether it is filtered by a constant, or by one row's value.
+type scanRead struct {
+	t         *Table
+	cols      columnSet
+	selective bool
+}
+
+// bytes is what the scans read cold: each table's columns once, a
+// hundredth of them where every scan of the table is filtered so.
+func (w *setWalker) bytes() int64 {
+	cols, all := map[*Table]columnSet{}, map[*Table]bool{}
+	var order []*Table
+	for _, s := range w.scans {
+		if _, seen := cols[s.t]; !seen {
+			order, all[s.t] = append(order, s.t), true
+			cols[s.t] = columnSet{}
+		}
+		for c := range s.cols {
+			cols[s.t][c] = true
+		}
+		all[s.t] = all[s.t] && s.selective
+	}
+	var total int64
+	for _, t := range order {
+		b := cols[t].bytes(t)
+		if all[t] {
+			b = int64(float64(b) * filterSelectivity)
+		}
+		total += b
+	}
+	return total
+}
+
+// hashRate is how many rows a core puts into or looks up in a hash table
+// of bytes: rowRate where it fits the caches, hashMissRate otherwise.
+func hashRate(bytes float64) float64 {
+	if bytes > cacheBytes {
+		return hashMissRate
+	}
+	return rowRate
 }
 
 // column is a column an operator outputs: its name if it is one, its
@@ -223,8 +329,10 @@ type column struct {
 }
 
 // estimate is an operator's rows: as DuckDB estimates them, and as the
-// distinct counts of its join keys correct that (see walk).
-type rowsEstimate struct{ duck, ours float64 }
+// distinct counts of its join keys correct that (see walk); kept is the
+// share of the rows of its tables its filters keep, 1 where none do or
+// it is not known.
+type rowsEstimate struct{ duck, ours, kept float64 }
 
 // scaled is DuckDB's estimate of rows d corrected as an operator's input,
 // in, was: by the ratio of ours to DuckDB's.
@@ -245,11 +353,21 @@ func (in rowsEstimate) scaled(d float64) float64 {
 // the larger distinct count of each pair of keys, and the operators above
 // it are corrected by as much.
 func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
+	name := strings.ToUpper(n.Name)
 	var rows []rowsEstimate
 	var outs [][]column
-	for _, c := range n.Children {
+	// Where each child's parts and scans begin, and end, the last.
+	parts, scans := []int{len(w.parts)}, []int{len(w.scans)}
+	for i, c := range n.Children {
 		r, o := w.walk(c)
 		rows, outs = append(rows, r), append(outs, o)
+		parts, scans = append(parts, len(w.parts)), append(scans, len(w.scans))
+		if name == "CTE" && i == 0 {
+			w.ctes[strings.Join(n.strs("Table Index"), "")] = cte{r, o}
+		}
+	}
+	if name == "UNION" && len(rows) > 1 {
+		w.largestBranch(parts)
 	}
 	card, ok := n.cardinality()
 	if !ok {
@@ -264,12 +382,18 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		return rowsEstimate{}, nil
 	}
 	in, inCols := child(0)
-	est := rowsEstimate{duck: card, ours: in.scaled(card)}
+	est := rowsEstimate{duck: card, ours: in.scaled(card), kept: in.kept}
 	if len(rows) == 0 {
-		est.ours = card
+		est.ours, est.kept = card, 1
 	}
-	name := strings.ToUpper(n.Name)
 	switch {
+	case name == "CTE_SCAN":
+		// The common table expression's rows, as corrected.
+		if c, found := w.ctes[strings.Join(n.strs("CTE Index"), "")]; found {
+			est.ours, est.kept = c.rows.ours, c.rows.kept
+			return est, limitDistinct(c.cols, est.ours)
+		}
+		return est, nil
 	case strings.Contains(name, "SCAN"), strings.HasPrefix(name, "READ_"):
 		cols := w.columns(n.strs("Projections"), nil)
 		if len(n.Children) > 0 || name == "DUMMY_SCAN" || strings.HasPrefix(name, "CTE") || strings.HasPrefix(name, "DELIM") {
@@ -292,6 +416,16 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		case !ok:
 			w.unknown = name
 		}
+		if t != nil {
+			read := columnSet{}
+			for _, c := range cols {
+				read[c.name] = true
+			}
+			w.scans = append(w.scans, scanRead{t: t, cols: read, selective: filtersByValue(n.strs("Filters"))})
+			if t.Rows > 0 {
+				est.kept = min(1, est.ours/float64(t.Rows))
+			}
+		}
 		return est, limitDistinct(cols, est.ours)
 	case name == "PROJECTION" || name == "FILTER" && len(n.strs("Projections")) > 0:
 		return est, limitDistinct(w.columns(n.strs("Projections"), inCols), est.ours)
@@ -300,16 +434,27 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		// the columns the operators above read, which the plan does not
 		// list: at most maxBuildWidth of them.
 		build, buildCols := child(len(rows) - 1)
-		w.hold(name, "join", build.ours, min(width(buildCols), maxBuildWidth)+joinEntryBytes)
+		entry := min(width(buildCols), maxBuildWidth) + joinEntryBytes
+		w.hold(name, "join", build.ours, entry)
+		if strings.Contains(name, "HASH") {
+			w.work += (in.ours + build.ours) / hashRate(build.ours*entry)
+		}
 		var all []column
 		for _, o := range outs {
 			all = append(all, o...)
 		}
-		est.ours = w.joinRows(n, rows, outs, card)
+		est.ours, est.kept = w.joinRows(n, rows, outs, card, scans)
 		all = joinedDistinct(n, all)
 		return est, limitDistinct(all, est.ours)
 	case strings.HasSuffix(name, "GROUP_BY"):
 		groups := w.columns(n.strs("Groups"), inCols)
+		// Fewer groups where the input has fewer rows than DuckDB took, but
+		// not more where it has more: joins and unnesting that multiply rows
+		// seldom multiply the keys (a report's groups of what an unnest
+		// made, taken for 945 million where its input was, made thousands).
+		if in.duck > 0 && len(rows) > 0 {
+			est.ours = card * min(1, in.ours/in.duck)
+		}
 		if ndv := product(groups); ndv > 0 {
 			est.ours = min(est.ours, ndv)
 		}
@@ -321,16 +466,22 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 			entries = est.ours
 		}
 		aggs := n.strs("Aggregates")
-		w.hold(name, "group", entries, width(groups)+float64(len(aggs))*planExprWidth+hashEntryBytes)
+		entry := width(groups) + float64(len(aggs))*planExprWidth + hashEntryBytes
+		w.hold(name, "group", entries, entry)
 		w.distinct(name, aggs, inCols, in.ours, width(groups))
+		w.work += in.ours / hashRate(entries*entry)
 		return est, append(groups, make([]column, len(aggs))...)
 	case name == "UNGROUPED_AGGREGATE":
 		w.distinct(name, n.strs("Aggregates"), inCols, in.ours, 0)
-		return rowsEstimate{duck: 1, ours: 1}, make([]column, len(n.strs("Aggregates")))
+		return rowsEstimate{duck: 1, ours: 1, kept: 1}, make([]column, len(n.strs("Aggregates")))
 	case name == "ORDER_BY" || name == "WINDOW":
 		est = in
 		if name == "WINDOW" {
-			w.hold(name, "window", in.ours, width(inCols)+hashEntryBytes)
+			kind := "window"
+			if constantWindow(n.strs("Projections")) {
+				kind = "constant window"
+			}
+			w.hold(name, kind, in.ours, width(inCols)+hashEntryBytes)
 			return est, append(inCols, column{width: planExprWidth})
 		}
 		w.hold(name, "sort", in.ours, width(inCols)+hashEntryBytes)
@@ -342,21 +493,94 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 // equality matches a join condition of equal columns.
 var equality = regexp.MustCompile(`^\s*(\S+)\s*=\s*(\S+)\s*$`)
 
-// joinRows is a join's rows: for an inner join on equal columns whose
+// joinRows is a join's rows, and the share of its tables' rows its filters
+// keep, by its inputs' (kept): for an inner join on equal columns whose
 // distinct counts are all known, the product of its inputs' rows over the
 // larger distinct count of each pair; otherwise DuckDB's estimate, card,
-// corrected as its inputs were.
-func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, card float64) float64 {
-	scaled := card
+// corrected as its inputs were, but
+//   - for an inner join on equal columns to one row, as of a scalar
+//     subquery, the other side's rows a filter by a constant keeps: over
+//     the distinct count of its key, or filterSelectivity of them, its
+//     scans, from scans, counted as filtered so;
+//   - for any other inner join on equal columns, no fewer than the rows of
+//     the side with more, as its filters leave them, that the other side's
+//     filters keep, each row of it joined to its key's row of the other;
+//   - for a left join, no fewer than its left side's rows;
+//   - for a cross product, or a join of a small source of its own, every
+//     pair of its sides' rows.
+func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, card float64, scans []int) (float64, float64) {
+	scaled, kept := card, 1.0
 	for _, r := range rows {
 		if r.duck > 0 {
 			scaled *= r.ours / r.duck
 		}
+		kept *= r.kept
 	}
+	if len(rows) != 2 {
+		return scaled, kept
+	}
+	l, r := rows[0], rows[1]
 	conds := n.strs("Conditions")
-	if len(rows) != 2 || len(conds) == 0 || !strings.EqualFold(strings.Join(n.strs("Join Type"), ""), "INNER") {
-		return scaled
+	typ := strings.ToUpper(strings.Join(n.strs("Join Type"), ""))
+	equal := len(conds) > 0
+	for _, c := range conds {
+		equal = equal && equality.MatchString(c)
 	}
+	small := func(i int) bool { return rows[i].ours <= smallSource && scans[i] == scans[i+1] }
+	name := strings.ToUpper(n.Name)
+	loop := strings.Contains(name, "NL_JOIN") || strings.Contains(name, "NESTED_LOOP")
+	switch {
+	case name == "CROSS_PRODUCT", loop && (len(conds)+len(n.strs("Condition")) == 0 || small(0) || small(1)):
+		return max(scaled, l.ours*r.ours), kept
+	case equal && (typ == "INNER" || typ == "SEMI") && (l.ours <= 1 || r.ours <= 1):
+		side, other := 0, l
+		if l.ours <= 1 {
+			side, other = 1, r
+		}
+		share := filterSelectivity
+		if c, found := w.joinKey(conds[0], outs[side]); found {
+			share = 1 / c.distinct
+		}
+		for i := scans[side]; i < scans[side+1]; i++ {
+			w.scans[i].selective = true
+		}
+		return max(other.ours*share, 1), other.kept * share
+	case equal && typ == "INNER":
+		if exact, found := w.distinctJoin(conds, rows, outs); found {
+			return exact, kept
+		}
+		fact, dim := l, r
+		if r.ours > l.ours {
+			fact, dim = r, l
+		}
+		return max(scaled, fact.ours*dim.kept), kept
+	case typ == "LEFT":
+		return max(scaled, l.ours), l.kept
+	}
+	return scaled, kept
+}
+
+// joinKey is the column of side, a join's input's columns, that a join
+// condition of equal columns compares, if its distinct count is known.
+func (w *setWalker) joinKey(cond string, side []column) (column, bool) {
+	m := equality.FindStringSubmatch(cond)
+	if m == nil {
+		return column{}, false
+	}
+	for _, name := range []string{bareName(m[1]), bareName(m[2])} {
+		for _, c := range side {
+			if c.name == name && c.distinct > 0 {
+				return c, true
+			}
+		}
+	}
+	return column{}, false
+}
+
+// distinctJoin is the rows of an inner join on equal columns whose
+// distinct counts are all known: the product of its inputs' rows over the
+// larger distinct count of each pair; found is false where one is not.
+func (w *setWalker) distinctJoin(conds []string, rows []rowsEstimate, outs [][]column) (float64, bool) {
 	find := func(name string) (column, bool) {
 		name = bareName(name)
 		for _, o := range outs {
@@ -372,16 +596,63 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 	for _, c := range conds {
 		m := equality.FindStringSubmatch(c)
 		if m == nil {
-			return scaled
+			return 0, false
 		}
 		a, okA := find(m[1])
 		b, okB := find(m[2])
 		if !okA || !okB {
-			return scaled
+			return 0, false
 		}
 		out /= max(a.distinct, b.distinct, 1)
 	}
-	return max(out, 1)
+	return max(out, 1), true
+}
+
+// largestBranch keeps, of the parts the branches of a UNION hold, those of
+// the branch that holds most: the branches run one after another where
+// memory is short (see the package's notes above). parts are where each
+// branch's parts begin in w.parts, and where the last ends.
+func (w *setWalker) largestBranch(parts []int) {
+	best, most := 0, -1.0
+	for i := 0; i+1 < len(parts); i++ {
+		var sum float64
+		for _, p := range w.parts[parts[i]:parts[i+1]] {
+			sum += p.bytes
+		}
+		if sum > most {
+			best, most = i, sum
+		}
+	}
+	kept := slices.Clone(w.parts[parts[best]:parts[best+1]])
+	w.parts = append(w.parts[:parts[0]], kept...)
+}
+
+// filterValue matches a scan's filter by a constant: a column equal to a
+// value or in a list of them.
+var filterValue = regexp.MustCompile(`(?i)(^|[^<>!=])=\s*[^=]|\sIN\s*\(`)
+
+// filtersByValue reports whether a scan's filters compare a column to a
+// constant with = or IN, which DuckDB reads only the row groups of whose
+// values may match (see filtersSelectively); IS NULL and ranges do not
+// count.
+func filtersByValue(filters []string) bool {
+	for _, f := range filters {
+		if filterValue.MatchString(f) {
+			return true
+		}
+	}
+	return false
+}
+
+// constantWindow reports whether a window's functions are all over the
+// whole input without an order, OVER ().
+func constantWindow(projections []string) bool {
+	for _, p := range projections {
+		if !strings.Contains(strings.ToUpper(p), "OVER ()") {
+			return false
+		}
+	}
+	return len(projections) > 0
 }
 
 // joinedDistinct gives the columns an inner join compares for equality

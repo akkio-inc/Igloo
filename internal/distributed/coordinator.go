@@ -559,11 +559,12 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	if mode == ModeAuto {
 		// The working set by DuckDB's plan of the statement, as the
 		// session plans it, read once for a statement run again.
-		raw, parts, ok := co.planSet(ctx, env, query, plan.Stages, r.planSet)
-		if ok && !dry && r.planSet != raw {
-			co.history.update(plan.Key, func(r *runs) { r.planSet = raw })
+		p, ok := co.planSet(ctx, env, query, plan.Stages, r)
+		if ok && !dry && r.planSet != p.set {
+			co.history.update(plan.Key, func(r *runs) { r.planSet, r.planBytes, r.planWork = p.set, p.bytes, p.work })
 		}
-		x.planSet, x.planParts, x.planned = raw*co.memory.scale(), parts, ok
+		x.planSet, x.planParts, x.planned = p.set*co.memory.scale(), p.parts, ok
+		x.planBytes, x.planWork = p.bytes, p.work
 	}
 	e := x.estimate(m, f)
 	if found {
@@ -680,28 +681,29 @@ func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large 
 	return f
 }
 
-// planSet is the working set of a statement, query, of stages, by DuckDB's
-// plan of it as env's session plans it (see workingSetOf), or known, what
-// it was found to be before; ok is false where the session cannot plan it
-// or the plan says too little. parts are what the plan's operators hold,
-// when it was read now.
-func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, known float64) (set float64, parts []heldPart, ok bool) {
-	if known > 0 {
-		return known, nil, true
+// planSet is what DuckDB's plan of a statement, query, of stages, as env's
+// session plans it, says one machine does with it (see planOf), or what r,
+// its runs, found it to be before; ok is false where the session cannot
+// plan it or the plan says too little. Its parts are what the plan's
+// operators hold, when it was read now.
+func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, r runs) (planEstimate, bool) {
+	if r.planSet > 0 {
+		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork}, true
 	}
 	ex, can := env.(Explainer)
 	if !can {
-		return 0, nil, false
+		return planEstimate{}, false
 	}
 	plan, err := ex.Explain(ctx, query)
+	var p planEstimate
 	if err == nil {
-		set, parts, err = workingSetOf(plan, newPlanStats(stages, max(co.opts.Threads, co.opts.Cores)))
+		p, err = planOf(plan, newPlanStats(stages, max(co.opts.Threads, co.opts.Cores)))
 	}
 	if err != nil {
 		co.log.Debug("no working set from DuckDB's plan; estimating it from what the stages read", "err", err)
-		return 0, nil, false
+		return planEstimate{}, false
 	}
-	return set, parts, true
+	return p, true
 }
 
 // largeWorker describes the large worker for an estimate, as it answered
