@@ -580,6 +580,26 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   planned again for its memory; erasure requests purge its read cache as
   the other workers' (see [a large
   worker](docs/distributed-execution.md#a-large-worker)).
+- Auto mode estimates a statement's working set from DuckDB's own plan of
+  it (`EXPLAIN`): joins' build sides, groupings' groups no more than the
+  distinct counts of their keys allow (ANALYZE's, or Iceberg's theta
+  sketches), distinct aggregates, sorts and windows, at their columns'
+  widths, with inner joins' rows from their keys' distinct counts, and
+  corrected by statements' peaks on the replica. Over TPC-H at three times
+  its scale it is 2.9 times off at the geometric mean, where six times what
+  the stages read was 37 times off (see
+  [when](docs/distributed-execution.md#when)).
+- Where no worker price is set, auto mode prices workers and the large
+  worker by their instance types' list prices from a built-in table of AWS,
+  Azure and Google Cloud machines, on Spot and by region
+  (`IGLOO_WORKER_INSTANCE_TYPE`, `IGLOO_WORKER_SPOT`, `IGLOO_CLOUD_REGION`;
+  set by the chart and the OpenTofu modules; see
+  [prices](docs/distributed-execution.md#prices)).
+- While some workers work, idle ones past `IGLOO_WORKER_WARM` (one) stop
+  alone: retired, not ready, then the Deployment scaled down past them or
+  their EC2 instances stopped, only where their caches go with them or
+  were purged for erasure requests (see [idle
+  workers](docs/distributed-execution.md#idle-workers)).
 - Auto mode's estimates of one machine spill by a curve fitted to the scale
   runs, the working set over the memory for it to the power of 0.55, within
   a factor of two for ten of eleven reports, where spilling was held to twice
