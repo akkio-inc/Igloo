@@ -75,7 +75,15 @@ func TestWideTableExchanges(t *testing.T) {
 				if !h.check(q) {
 					t.Fatal("ran on one machine")
 				}
-				narrowExchanges(t, h.planOf(q), 10)
+				p := h.planOf(q)
+				narrowExchanges(t, p, 10)
+				// The stage that makes each row once per branch aggregates
+				// them, rather than writing them all to an exchange.
+				for _, s := range p.Stages {
+					if strings.Contains(s.SQL, " AS br(b)") && s.Out != nil && s.Out.purpose != "aggregate" {
+						t.Errorf("%s writes a row per branch: %.300s", s, s.SQL)
+					}
+				}
 			})
 		}
 	}

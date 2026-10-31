@@ -93,6 +93,23 @@ func (pl *planner) chooseKeyed(c *candidate) error {
 				top = sc
 			}
 		}
+		if top == c.scope {
+			// The input keyed first may lie in another subquery than u, as
+			// the table of a view does when a common table expression read
+			// in place of its name reads the view too. The subquery to make
+			// a relation is then the one under the FROM clause holding both,
+			// not under the candidate's: a relation of the candidate's whole
+			// subquery wrote its rows whole, a factored union's once per
+			// branch, where the candidate's stage aggregates them as it
+			// makes them.
+			outer := commonOuter(u.scope, c.keyScope)
+			for sc := outer; sc != nil; sc = sc.outer {
+				if sc == c.scope {
+					top = outer
+					break
+				}
+			}
+		}
 		sc := u.scope
 		for sc.outer != nil && sc.outer != top {
 			sc = sc.outer
@@ -103,6 +120,30 @@ func (pl *planner) chooseKeyed(c *candidate) error {
 		return pl.chooseKeyed(c)
 	}
 	return err
+}
+
+// commonOuter returns the innermost FROM clause that holds both a and b in
+// subqueries, neither inside the other, or nil.
+func commonOuter(a, b *scope) *scope {
+	if a == nil || b == nil {
+		return nil
+	}
+	outers := map[*scope]bool{}
+	for sc := b; sc != nil; sc = sc.outer {
+		if sc == a {
+			return nil
+		}
+		outers[sc] = true
+	}
+	for sc := a.outer; sc != nil; sc = sc.outer {
+		if sc == b {
+			return nil
+		}
+		if outers[sc] {
+			return sc
+		}
+	}
+	return nil
 }
 
 // asRelation makes a subquery that passes its rows through, whose FROM

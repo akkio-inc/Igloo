@@ -2077,6 +2077,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and a report's branches, factored into one `SELECT` over a wide view
   joined to a common table expression of the same view, wrote every one
   of the view's columns to an exchange and ran the workers out of memory.
+- Such a report's stage that joins the view to the common table
+  expression aggregates the rows it makes, once per branch, as it makes
+  them. The planner made the whole factored `SELECT` a relation instead,
+  when the two large tables it partitions lay in different subqueries of
+  its `FROM` (the view's and the expression's copy of it), and wrote each
+  of its rows to an exchange once per branch before another stage
+  aggregated them.
 - No one may put Igloo's own schemas (`igloo_domains`, `igloo_bitmaps`,
   `igloo_refresh`) on the search path or make one the current schema, in
   any case or quoting: through such a path any reader read bitmap
