@@ -236,7 +236,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout,
 			Warm: cfg.Workers.Warm,
 		},
-		WorkerPrice: cfg.Workers.Price, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
+		WorkerPrice: cfg.Workers.Price, Price: cfg.PricePerHour, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
 		WorkerInstanceType: cfg.Workers.InstanceType, WorkerSpot: cfg.Workers.Spot, Region: cfg.Workers.Region,
 		LargeInstanceType: l.InstanceType, LargeSpot: l.Spot,
 	}, log)

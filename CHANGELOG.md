@@ -586,17 +586,24 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   where its filters or columns keep less than its table (see [what runs
   distributed](docs/distributed-execution.md#what-runs-distributed)).
 - Auto mode picks how many workers a statement runs on: of 1, 2, 4 and so
-  on up to `IGLOO_WORKER_MAX`, and the workers running, those estimated
-  within a fifth of the fastest, the cheapest at the workers' price
-  (`IGLOO_WORKER_PRICE_PER_HOUR`), counting the start and idle tail of
-  workers it starts; of more running, it takes those with the fewest
-  tasks. A report of a few stages that took 58 s on the replica and 50 s on
-  16 workers at ten times the data now runs on 4; reports whose stages read
-  a hundred gigabytes run on all 16. The history keeps runs by how many
-  workers ran them, and corrects the other counts' estimates by the
-  nearest. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and the ways
-  weighed (`options`), and `query_history.placement` where a statement ran
-  and why (see [when](docs/distributed-execution.md#when)).
+  on up to `IGLOO_WORKER_MAX`, and the workers running, the cheapest of
+  those whose time is within a fifth of the fastest, so never one that
+  another beats on both time and cost. A way's cost counts the workers'
+  seconds at their price (`IGLOO_WORKER_PRICE_PER_HOUR`), with the start
+  and idle tail of workers it starts, and the replica's for as long as it
+  runs (`IGLOO_PRICE_PER_HOUR`); where idle workers do not stop alone,
+  every running worker's. Times a statement took on a number of workers
+  stand for the estimates, and a number estimated near the fastest it ran
+  on is tried once a day: at ten times the data, a report that took 112 s
+  on 8 workers and 127 s on 16 runs on 8, where an earlier rule took 4, 200
+  s, for an estimate within a fifth of 16's; another that took 44 s on 16
+  and 75 s on 8 runs on 16. The workers' estimates count a statement's
+  levels of stages (5 s each) rather than its stages, and read at 0.4 of
+  one machine's rate, within a factor of 1.35 of 15 runs on 1 to 16
+  workers where they were within 2.05. Of more running, it takes those with
+  the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
+  the ways weighed (`options`), and `query_history.placement` where a
+  statement ran and why (see [when](docs/distributed-execution.md#when)).
 - A compute pool may have a large worker (`IGLOO_LARGE_WORKER`, the chart's
   `workers.large`), on which auto mode runs a statement alone when it fits
   there and is estimated within a fifth of the fastest way and cheapest,

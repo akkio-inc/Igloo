@@ -130,8 +130,8 @@ func TestChoose(t *testing.T) {
 // TestEstimateTimes checks the estimates of a plan: one machine's from
 // the coordinator's cores and threads, reading cold, longer short of
 // memory; the workers' from their start, their stages and their cores and
-// threads, starting more; and the fewest workers within a fifth of the
-// fastest, as the first estimates counted them.
+// threads, starting more; and the cheapest within a fifth of the fastest,
+// as the first estimates counted them.
 func TestEstimateTimes(t *testing.T) {
 	coordinator := machine{cores: 16, threads: 32, memory: 50e9}
 	big := &Table{Schema: "main", Name: "big", Bytes: 300e9, Columns: []Column{{Name: "k", Type: "VARCHAR"}}}
@@ -154,9 +154,9 @@ func TestEstimateTimes(t *testing.T) {
 	if want := (300e9 + 1e6) / (16 * coldRateAt(2)) * math.Pow(ratio, spillExponent); math.Abs(e.oneMachine-want) > 1 || !e.local.oom {
 		t.Errorf("one machine: %.1f s, out of memory %v; want %.1f s and out of memory", e.oneMachine, e.local.oom, want)
 	}
-	// All 16, starting 14 more than the 2 running: 8 + 3*6 + 300e9/(16*8*16e6)
-	// + 30 = 202.5 s; 8 would take 349 s.
-	if e.workers != 16 || e.large || math.Abs(e.onWorkers-202.5) > 0.5 {
+	// All 16, starting 14 more than the 2 running: 8 + 3*5 +
+	// 300e9/(16*8*16e6*0.4) + 30 = 419.2 s; 8 would take 785 s.
+	if e.workers != 16 || e.large || math.Abs(e.onWorkers-419.2) > 0.5 {
 		t.Errorf("%d workers, %.1f s", e.workers, e.onWorkers)
 	}
 	// Workers of fewer threads a core read slower.
@@ -234,7 +234,10 @@ func TestScaleReports(t *testing.T) {
 		{"F1 report-c at 10x", features{bytes: 1.186e+10, exchanged: 5.683e+10, held: 1.186e+10, rows: 5.83e+09, levels: 3, stages: 22}, 691, 170, "workers"},
 		{"F2 report-d at 10x", features{bytes: 1.186e+10, exchanged: 5.683e+10, held: 1.186e+10, rows: 2.92e+09, levels: 3, stages: 11}, 621, 188, "workers"},
 		{"F4 report-f at 10x", features{bytes: 4.934e+09, exchanged: 3.491e+10, held: 4.934e+09, rows: 7.87e+09, levels: 7, stages: 26}, 40, 183, "one"},
-		{"F5 report-g at 10x", features{bytes: 8.144e+09, exchanged: 3.812e+10, held: 8.144e+09, rows: 1.01e+10, levels: 7, stages: 33}, 25, 161, "one"},
+		// By DuckDB's plan, its working set of 31 GB fits; by six times what
+		// its stages read, it would spill.
+		{"F5 report-g at 10x", features{bytes: 8.144e+09, exchanged: 3.812e+10, held: 8.144e+09, rows: 1.01e+10, levels: 7, stages: 33,
+			planned: true, planSet: 3.1e10}, 25, 161, "one"},
 		{"P p1media at 10x", features{bytes: 3.636e+09, exchanged: 3.636e+09, held: 3.636e+09, rows: 1.45e+09, levels: 2, stages: 2}, 24, 12, "workers"},
 		{"P p2audmedia at 10x", features{bytes: 2.726e+09, exchanged: 3.27e+10, held: 2.726e+09, rows: 1.5e+09, levels: 2, stages: 3}, 9, 22, "one"},
 		{"P p3seggen at 10x", features{bytes: 1.248e+10, exchanged: 1.248e+10, held: 1.248e+10, rows: 3.49e+10, levels: 2, stages: 3}, 259, 40, "workers"},

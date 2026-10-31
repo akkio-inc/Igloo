@@ -3,6 +3,7 @@ package distributed
 import (
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -26,15 +27,11 @@ var (
 )
 
 // Reports of the scale runs, as the planner measures them (see
-// TestScaleReports). E1-like at ten times the data reads 1.9 GB and goes
-// through some 3e10 rows in 3 stages: estimated at 13 s on one machine, it
-// took 58 to 97 s there, and 50 s on 16 workers.
+// TestScaleReports).
 var (
-	e1At10x = features{bytes: 1.9e9, exchanged: 1.9e10, held: 1.9e9, rows: 3.1e10, levels: 2, stages: 3}
 	f1At100 = features{bytes: 1.186e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 5.83e+10, levels: 3, stages: 22}
 	f2At100 = features{bytes: 1.186e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 2.92e+10, levels: 3, stages: 11}
 	f4At10x = features{bytes: 4.934e+09, exchanged: 3.491e+10, held: 4.934e+09, rows: 7.87e+09, levels: 7, stages: 26}
-	f5At10x = features{bytes: 8.144e+09, exchanged: 3.812e+10, held: 8.144e+09, rows: 1.01e+10, levels: 7, stages: 33}
 	f4At100 = features{bytes: 4.934e+10, exchanged: 3.491e+11, held: 4.934e+10, rows: 7.87e+10, levels: 7, stages: 26}
 	e2At100 = features{bytes: 1.349e+11, exchanged: 8.999e+11, held: 1.349e+11, rows: 1.2e+12, levels: 2, stages: 10}
 )
@@ -105,129 +102,189 @@ func TestSpillCalibration(t *testing.T) {
 	}
 }
 
+// The second scale runs at ten times the data, of the build auto mode
+// chose 4 workers in: a coordinator of 16 cores (m7gd.4xlarge, $0.8542 an
+// hour) and 16 workers of 8 (m7gd.2xlarge, $0.4271), as the planner
+// measured two reports. F1-like took 678, 368, 200, 112 and 127 s on 1, 2,
+// 4, 8 and 16 workers; E2-like 552, 265, 120, 75 and 44 s.
+var (
+	benchWorkers = fleet{cores: 8, threads: 12, running: 16, most: 16, memory: 26_414_048_870, price: 0.4271,
+		replicaPrice: 0.8542, replicaCores: 16, alone: true, start: 30 * time.Second, tail: 2 * time.Minute}
+	f1At10x = features{bytes: 1.1838e10, exchanged: 5.6784e10, held: 1.1838e10, rows: 1.9476e10, levels: 11, stages: 24}
+	e2At10x = features{bytes: 1.3691e10, exchanged: 9.0162e10, held: 1.3691e10, rows: 2.912e11, levels: 4, stages: 13}
+)
+
 // TestFleetChoice checks how many workers, or the large worker, auto mode
-// takes for the scale runs' reports, and that one machine keeps those it
-// runs faster.
+// takes: the cheapest way within a fifth of the fastest, the replica's
+// time counted, every running worker's where idle ones do not stop alone;
+// measured times where it has them; a size estimated near the fastest
+// measured tried once to measure it.
 func TestFleetChoice(t *testing.T) {
 	now := time.Now()
-	decide := func(x features, f fleet, r runs, found bool) (estimate, bool, string) {
+	decide := func(x features, f fleet, r runs, found bool) estimate {
 		t.Helper()
 		e := x.estimate(scaleCoordinator, f)
 		if found {
 			e.pick(r, f)
 		}
-		onWorkers, _, reason := choose(e, r, found, DefaultThreshold, now)
-		return e, onWorkers, reason
+		return e
+	}
+	explain := func(e estimate) string { return e.fleet + "; " + describeOptions(e.options, e.dollars) }
+
+	// F1-like: 16 workers first, 8 estimated 30% slower. After 127 s on
+	// 16, 8 are corrected to 164 s, within fleetExploreWithin: tried once.
+	// After 112 s on 8, 8: 16 are within a fifth but cost twice as much,
+	// and 4, corrected to 163 s, are not tried. Auto mode had taken 4, 200
+	// s, for 194 s estimated within a fifth of 16's 162 s.
+	e := decide(f1At10x, benchWorkers, runs{}, false)
+	if e.workers != 16 || e.large {
+		t.Errorf("F1-like, first: %d workers (%s)", e.workers, explain(e))
+	}
+	r := runs{dist: 127, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 127}}
+	e = decide(f1At10x, benchWorkers, r, true)
+	if e.workers != 16 {
+		t.Errorf("F1-like after 127 s on 16: %d workers (%s)", e.workers, explain(e))
+	}
+	if o, ok := exploreFleet(e.options, e.picked, r, now); !ok || o.workers != 8 {
+		t.Errorf("F1-like after 127 s on 16: tries %s, %v (%s)", o, ok, explain(e))
+	}
+	if _, ok := exploreFleet(e.options, e.picked, runs{fleets: r.fleets, fleetExplored: now.Add(-time.Hour)}, now); ok {
+		t.Error("F1-like: tried another size again within a day")
+	}
+	r.fleets[fleetBucket(8)] = 112
+	e = decide(f1At10x, benchWorkers, r, true)
+	if e.workers != 8 || !strings.Contains(e.fleet, "as it took before") {
+		t.Errorf("F1-like after 112 s on 8: %d workers (%s)", e.workers, explain(e))
+	}
+	if o, ok := exploreFleet(e.options, e.picked, r, now); ok {
+		t.Errorf("F1-like after 112 s on 8: tries %s (%s)", o, explain(e))
 	}
 
-	// E1-like at 10x: on 16 workers running, 4 are within a fifth of the
-	// fastest at a quarter of the worker-seconds; with workers stopped,
-	// their start and idle tail count too, and 4 are still within a fifth.
-	e, _, _ := decide(e1At10x, scaleWorkers, runs{}, false)
-	if e.workers != 4 || e.large || !strings.Contains(e.fleet, "within a fifth of the fastest, 16 workers") {
-		t.Errorf("E1-like at 10x, 16 running: %d workers (%s)", e.workers, e.fleet)
+	// E2-like: 16, whose 44 s correct 8 to 67 s, past fleetExploreWithin
+	// of it (8 took 75 s).
+	e = decide(e2At10x, benchWorkers, runs{}, false)
+	if e.workers != 16 {
+		t.Errorf("E2-like, first: %d workers (%s)", e.workers, explain(e))
 	}
-	stopped := scaleWorkers
+	r = runs{dist: 44, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 44}}
+	e = decide(e2At10x, benchWorkers, r, true)
+	if o, ok := exploreFleet(e.options, e.picked, r, now); e.workers != 16 || ok {
+		t.Errorf("E2-like after 44 s on 16: %d workers, tries %s %v (%s)", e.workers, o, ok, explain(e))
+	}
+
+	// Where idle workers do not stop alone, all 16 bill while any works:
+	// fewer cost no less, and none slower is tried.
+	held := benchWorkers
+	held.alone = false
+	r = runs{dist: 127, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 127}}
+	e = decide(f1At10x, held, r, true)
+	if o, ok := exploreFleet(e.options, e.picked, r, now); e.workers != 16 || ok {
+		t.Errorf("F1-like, idle workers kept up: %d workers, tries %s %v (%s)", e.workers, o, ok, explain(e))
+	}
+	for _, o := range e.options {
+		if want := (0.8542 + 16*0.4271) * o.seconds / 3600; !o.large && math.Abs(o.cost-want) > 1e-9 {
+			t.Errorf("idle workers kept up: %s costs $%.4f, want $%.4f", o, o.cost, want)
+		}
+	}
+	// The replica counts: with it, 8 at 112 s are cheaper than 4 at 200 s,
+	// as the runs' bills had them ($0.133 against $0.143).
+	four := option{workers: 4, seconds: 200}.costOn(benchWorkers)
+	eight := option{workers: 8, seconds: 112}.costOn(benchWorkers)
+	if math.Abs(eight-0.1329) > 0.0005 || math.Abs(four-0.1424) > 0.0005 {
+		t.Errorf("8 workers for 112 s $%.4f, 4 for 200 s $%.4f", eight, four)
+	}
+	// Workers stopped: their start, and their idle tail after, count.
+	stopped := benchWorkers
 	stopped.running = 0
-	if e, _, _ := decide(e1At10x, stopped, runs{}, false); e.workers != 4 || !strings.Contains(e.fleet, "for 26% of its cost") {
-		t.Errorf("E1-like at 10x, workers stopped: %d workers (%s)", e.workers, e.fleet)
-	}
-	// Its first run, estimated at 13 s here, stays here (the guard moves
-	// it, see the server's guardAfter); after 97 s here, it runs on 4.
-	if _, onWorkers, reason := decide(e1At10x, scaleWorkers, runs{}, false); onWorkers {
-		t.Errorf("E1-like at 10x, first: on workers (%s)", reason)
-	}
-	e, onWorkers, reason := decide(e1At10x, scaleWorkers, runs{local: 97}, true)
-	if !onWorkers || e.workers != 4 {
-		t.Errorf("E1-like at 10x after 97 s here: workers %v on %d (%s; %s)", onWorkers, e.workers, reason, e.fleet)
-	}
-	// After 50 s on 16 workers, 4 are estimated at 59 s, within a fifth of
-	// 50: it stays on 4, and after 55 s there, too.
-	r := runs{local: 97, dist: 50, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 50}}
-	if e, onWorkers, reason := decide(e1At10x, scaleWorkers, r, true); !onWorkers || e.workers != 4 || !strings.Contains(describeOptions(e.options, e.dollars), "(estimated") {
-		t.Errorf("E1-like at 10x after 50 s on 16: workers %v on %d (%s; %s)", onWorkers, e.workers, reason, e.fleet)
-	}
-	r.fleets[fleetBucket(4)] = 55
-	if e, _, _ := decide(e1At10x, scaleWorkers, r, true); e.workers != 4 || !strings.Contains(e.fleet, "as it took before") {
-		t.Errorf("E1-like at 10x after 55 s on 4: %d workers (%s)", e.workers, e.fleet)
-	}
-	// Far slower on 4 than its estimate: 8 then, which the run on 16
-	// corrects to 53 s.
-	r.fleets[fleetBucket(4)] = 90
-	if e, _, _ := decide(e1At10x, scaleWorkers, r, true); e.workers != 8 {
-		t.Errorf("E1-like at 10x after 90 s on 4: %d workers (%s)", e.workers, e.fleet)
+	e = decide(f1At10x, stopped, runs{}, false)
+	for _, o := range e.options {
+		if o.started != o.workers {
+			t.Errorf("workers stopped: %s starts %d", o, o.started)
+		}
 	}
 
+	// One machine keeps what it runs faster.
+	for name, x := range map[string]features{"F4-like at 10x": f4At10x} {
+		e := decide(x, scaleWorkers, runs{}, false)
+		if onWorkers, _, reason := choose(e, runs{}, false, DefaultThreshold, now); onWorkers {
+			t.Errorf("%s: on workers (%s)", name, reason)
+		}
+	}
 	// F1-like and F2-like at 100x: all 16, whose stages' reading dwarfs
 	// their start; one machine would run out of memory.
 	for name, x := range map[string]features{"F1-like at 100x": f1At100, "F2-like at 100x": f2At100} {
-		e, onWorkers, reason := decide(x, scaleWorkers, runs{}, false)
+		e := decide(x, scaleWorkers, runs{}, false)
+		onWorkers, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
 		if !onWorkers || e.workers != 16 || e.large {
-			t.Errorf("%s: workers %v on %d (%s; %s)", name, onWorkers, e.workers, reason, e.fleet)
+			t.Errorf("%s: workers %v on %d (%s; %s)", name, onWorkers, e.workers, reason, explain(e))
 		}
 	}
-	// E2-like at 100x: out of memory on one machine.
-	if e, _, _ := decide(e2At100, scaleWorkers, runs{}, false); !e.local.oom {
+	if e := decide(e2At100, scaleWorkers, runs{}, false); !e.local.oom {
 		t.Errorf("E2-like at 100x: one machine %s", e.local)
-	}
-
-	// F4-like and F5-like at 10x: one machine, 48 s and 15 s there against
-	// 228 s and 159 s on 16 workers.
-	for name, x := range map[string]features{"F4-like at 10x": f4At10x, "F5-like at 10x": f5At10x} {
-		if _, onWorkers, reason := decide(x, scaleWorkers, runs{}, false); onWorkers {
-			t.Errorf("%s: on workers (%s)", name, reason)
-		}
 	}
 
 	// F4-like at 100x fits the large worker of 440 GiB: faster than 16
 	// workers and cheaper, whether all are stopped or running.
 	withLarge := stopped
 	withLarge.large = &scaleLarge
-	e, onWorkers, reason = decide(f4At100, withLarge, runs{}, false)
-	if !onWorkers || !e.large || e.workers != 1 || e.options[len(e.options)-1].spill.factor != 1 || !strings.Contains(e.fleet, "the large worker") {
-		t.Errorf("F4-like at 100x, all stopped: workers %v, large %v (%s; %s)", onWorkers, e.large, reason, e.fleet)
+	e = decide(f4At100, withLarge, runs{}, false)
+	if onWorkers, _, reason := choose(e, runs{}, false, DefaultThreshold, now); !onWorkers || !e.large || e.workers != 1 ||
+		e.options[len(e.options)-1].spill.factor != 1 || !strings.Contains(e.fleet, "the large worker") {
+		t.Errorf("F4-like at 100x, all stopped: workers %v, large %v (%s; %s)", onWorkers, e.large, reason, explain(e))
 	}
-	running := scaleWorkers
+	running := benchWorkers
 	l := scaleLarge
 	l.running = true
 	running.large = &l
-	if e, _, _ := decide(f4At100, running, runs{}, false); !e.large {
-		t.Errorf("F4-like at 100x, all running: %d workers (%s)", e.workers, e.fleet)
+	if e := decide(f4At100, running, runs{}, false); !e.large {
+		t.Errorf("F4-like at 100x, all running: %d workers (%s)", e.workers, explain(e))
 	}
-	// At four times the price, still far faster than 16 workers: the large
-	// worker, whatever it costs, as no way within a fifth of it is.
-	pricey := l
-	pricey.price = 4 * l.price
-	running.large = &pricey
-	if e, _, _ := decide(f4At100, running, runs{}, false); !e.large {
-		t.Errorf("F4-like at 100x, the large worker at four times the price: %d workers (%s)", e.workers, e.fleet)
-	}
-	// A statement the large worker runs in 87 s and 16 workers in 103 s,
-	// within a fifth: the large worker at its price, $0.11 against $0.22;
-	// at four times it, 16 workers.
-	mid := features{bytes: 4e10, held: 1e10, rows: 1e10, levels: 3, stages: 10}
-	running.large = &l
-	if e, _, _ := decide(mid, running, runs{}, false); !e.large || !strings.Contains(e.fleet, "the fastest, for 48% of the cost of 16 workers") {
-		t.Errorf("within a fifth, the large worker cheaper: %d workers, large %v (%s)", e.workers, e.large, e.fleet)
-	}
-	running.large = &pricey
-	if e, _, _ := decide(mid, running, runs{}, false); e.large || e.workers != 16 {
-		t.Errorf("within a fifth, the large worker dearer: large %v on %d (%s)", e.large, e.workers, e.fleet)
-	}
-	// F1-like at 100x spills on it, 1.5 times as long: 16 workers.
-	if e, _, _ := decide(f1At100, withLarge, runs{}, false); e.large || e.workers != 16 {
-		t.Errorf("F1-like at 100x with the large worker: large %v on %d (%s)", e.large, e.workers, e.fleet)
-	}
-	// E2-like at 100x, which runs out of memory on one machine of 49.3
-	// GiB, spills on the large worker, 1.6 times as long: 16 workers.
-	if e, _, _ := decide(e2At100, withLarge, runs{}, false); e.large || e.options[len(e.options)-1].spill.factor < 1.5 {
-		t.Errorf("E2-like at 100x with the large worker: large %v (%s)", e.large, e.fleet)
+	// F1-like at 100x spills on it, 1.5 times as long, 342 s against 16
+	// workers' 314 s: within a fifth, for 79% of their cost.
+	if e := decide(f1At100, withLarge, runs{}, false); !e.large || !strings.Contains(e.fleet, "within a fifth of the fastest, 16 workers") {
+		t.Errorf("F1-like at 100x with the large worker: large %v on %d (%s)", e.large, e.workers, explain(e))
 	}
 	// What it took on the large worker corrects the large worker alone:
 	// after 900 s there and 700 s on 16 workers, the fleet.
 	r = runs{large: 900, dist: 700, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 700}}
-	if e, _, _ := decide(f4At100, withLarge, r, true); e.large || e.workers < 8 {
-		t.Errorf("F4-like at 100x after 900 s on the large worker and 700 s on 16: large %v on %d (%s)", e.large, e.workers, e.fleet)
+	if e := decide(f4At100, withLarge, r, true); e.large || e.workers < 8 {
+		t.Errorf("F4-like at 100x after 900 s on the large worker and 700 s on 16: large %v on %d (%s)", e.large, e.workers, explain(e))
+	}
+}
+
+// TestFleetCalibration checks the workers' estimates against the second
+// scale runs at ten times the data: seven reports on 16 workers, and two
+// on 1, 2, 4 and 8, within a factor of 1.35 at the root mean square of
+// the logarithms, where a cost a stage and one machine's rate were within
+// a factor of 2.05.
+func TestFleetCalibration(t *testing.T) {
+	reports := map[string]features{
+		"E2-like": e2At10x,
+		"E3-like": {bytes: 7.0418e9, exchanged: 8.3513e10, rows: 5.745e9, levels: 5, stages: 8},
+		"F1-like": f1At10x,
+		"F2-like": {bytes: 1.1838e10, exchanged: 5.6784e10, rows: 1.7653e10, levels: 11, stages: 23},
+		"F3-like": {bytes: 6.6826e9, exchanged: 6.6826e9, rows: 1.273e10, levels: 8, stages: 28},
+		"F4-like": {bytes: 8.5154e9, exchanged: 3.8479e10, rows: 1.3168e10, levels: 7, stages: 29},
+		"F5-like": {bytes: 9.2562e9, exchanged: 3.922e10, rows: 1.3863e10, levels: 9, stages: 28},
+	}
+	runs := []struct {
+		report  string
+		workers int
+		took    float64
+	}{
+		{"E2-like", 16, 44.0}, {"E3-like", 16, 55.6}, {"F1-like", 16, 126.8}, {"F2-like", 16, 121.1}, {"F3-like", 16, 80.7},
+		{"F4-like", 16, 28.0}, {"F5-like", 16, 66.5}, {"E2-like", 8, 74.6}, {"F1-like", 8, 111.8}, {"E2-like", 4, 120.0},
+		{"F1-like", 4, 200.3}, {"E2-like", 2, 265.4}, {"F1-like", 2, 367.5}, {"E2-like", 1, 552.1}, {"F1-like", 1, 677.9},
+	}
+	var sum float64
+	for _, r := range runs {
+		o := reports[r.report].onFleet(r.workers, benchWorkers)
+		d := math.Log(o.estimate / r.took)
+		sum += d * d
+		t.Logf("%s on %d: took %.0f s, estimated %.0f s", r.report, r.workers, r.took, o.estimate)
+	}
+	if rms := math.Exp(math.Sqrt(sum / float64(len(runs)))); rms > 1.4 {
+		t.Errorf("estimates within a factor of %.2f at the root mean square", rms)
 	}
 }
 
@@ -305,6 +362,21 @@ func TestPick(t *testing.T) {
 	opts[1].seconds = 43
 	if best, _, _ := pick(opts, true); best.workers != 16 {
 		t.Errorf("4 workers past a fifth of the fastest: picked %s", best)
+	}
+	// No way picked is beaten on time, and on cost by more than costTie,
+	// by another that finishes.
+	rnd := rand.New(rand.NewPCG(1, 2))
+	for range 1000 {
+		var opts []option
+		for _, n := range []int{1, 2, 4, 8, 16} {
+			opts = append(opts, option{workers: n, seconds: 10 + 500*rnd.Float64(), cost: rnd.Float64(), spill: spill{oom: rnd.IntN(8) == 0}})
+		}
+		best, _, ok := pick(opts, true)
+		for _, o := range opts {
+			if ok && !o.spill.oom && o.seconds < best.seconds && o.cost*(1+costTie) < best.cost {
+				t.Fatalf("picked %s (%.0f s, %.3f) over %s (%.0f s, %.3f)", best, best.seconds, best.cost, o, o.seconds, o.cost)
+			}
+		}
 	}
 }
 

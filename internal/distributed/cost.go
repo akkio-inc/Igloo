@@ -25,8 +25,8 @@ import (
 // fewer (coldRateAt), as DuckDB's threads are capped at 2 GiB of its
 // memory each (a worker of 8 cores and 24.6 GiB runs 12); tables a stage
 // filters selectively count a hundredth of their bytes and rows; and a
-// statement on workers pays for its start and for each stage (startCost,
-// stageCost). Against the scale environment's reports at 1x, 10x and
+// statement on workers pays for its start and for each level of its stages
+// (startCost, levelCost in fleet.go). Against the scale environment's reports at 1x, 10x and
 // 100x on a coordinator of 16 cores and 16 workers of 8, the estimates pick
 // the side that was faster by half again, or either where the two were
 // closer (see TestScaleReports), but for statements whose rows cost far
@@ -38,14 +38,9 @@ import (
 // workers, or the large worker, is weighed in fleet.go.
 const (
 	coldRate = 16e6
-	// startCost and stageCost are what a statement on workers takes beside
-	// reading: its own start, and each stage's round of tasks, which write
-	// their exchanges' partitions to object storage, the next stage listing
-	// and reading them. At ten times the data on 16 workers, reports of 2
-	// or 3 stages over a few gigabytes took 12 to 40 s, and of 23 to 26
-	// stages 153 to 183 s.
+	// startCost is what a statement on workers takes beside its stages: its
+	// own start, planning its tasks and reading their results.
 	startCost = 8.0
-	stageCost = 6.0
 	// DefaultThreshold is how long a statement must take on one machine,
 	// by its estimate or its last run there, before auto mode runs it on
 	// workers, unless it would run short of memory: below it, the
@@ -144,10 +139,12 @@ type estimate struct {
 	memory, spills bool
 	local          spill
 	// options are the ways on workers weighed, dollars says their costs are
-	// in dollars, and fleet why the one in workers and large was chosen.
+	// in dollars, and fleet why the one in workers and large, picked, was
+	// chosen.
 	options []option
 	dollars bool
 	fleet   string
+	picked  option
 	// planned says the working set is DuckDB's plan's, and parts what its
 	// operators hold.
 	planned bool
@@ -192,13 +189,19 @@ type fleet struct {
 	// cores are a worker's cores, and threads its DuckDB threads, zero for
 	// unknown; running how many workers run; most how many may run; start
 	// how long starting more takes, and tail how long workers started stay
-	// up idle after.
+	// up idle after. alone says idle workers stop alone while others work
+	// (see pool.shrink), so a statement on fewer of the running workers
+	// bills fewer.
 	cores, threads, running, most int
 	start, tail                   time.Duration
+	alone                         bool
 	// memory is the smallest worker's memory limit, and price what a
-	// worker costs an hour, zero for unknown.
-	memory int64
-	price  float64
+	// worker costs an hour, zero for unknown; replicaPrice is what the
+	// replica costs an hour, zero for unknown, and replicaCores its cores.
+	memory       int64
+	price        float64
+	replicaPrice float64
+	replicaCores int
 	// large is the compute pool's large worker, if it has one the
 	// statement may run on.
 	large *largeWorker
@@ -306,7 +309,7 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// The ways on workers, and the one auto mode would take without what
 	// the statement took before (see plan, which corrects them).
 	e.options = x.options(f)
-	_, _, e.dollars = f.prices()
+	_, _, _, e.dollars = f.prices()
 	e.pick(runs{}, f)
 
 	// One machine reads cold from object storage at its threads a core: its
@@ -358,7 +361,7 @@ func (e *estimate) pick(r runs, f fleet) {
 	best, why, ok := pick(e.options, e.dollars)
 	e.fleet = why
 	if ok {
-		e.workers, e.large, e.onWorkers = best.workers, best.large, best.estimate
+		e.workers, e.large, e.onWorkers, e.picked = best.workers, best.large, best.estimate, best
 	}
 }
 

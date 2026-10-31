@@ -13,11 +13,16 @@ import (
 // mode weighs the ways a statement could run beside one machine: on 1, 2,
 // 4, ... of the workers up to all those it may start, and, where a compute
 // pool has one, on its large worker alone. Each way's time counts what its
-// machines would spill (spillOn); of the ways estimated within a fifth of
-// the fastest, it takes the cheapest, by the machine-seconds each takes at
-// its price (see pick), and corrects the estimates with what the statement
-// took before on as many workers (see correct). Whether the statement runs
-// on that way or on one machine is choose's to decide, as before.
+// machines would spill (spillOn), and its cost the machine-seconds it
+// bills at their prices: its workers', or every running worker's where
+// idle workers do not stop alone, and the replica's, which waits for them
+// (see costOn). The trade-off is explicit: the cheapest way whose time is
+// within fleetMargin (a fifth) of the fastest way's, so that no way is
+// taken that another beats on both time and cost (see pick). The times
+// are corrected by what the statement took before on as many workers (see
+// correct), and a size estimated near the fastest measured is tried once
+// a day to measure it (see exploreFleet). Whether the statement runs on
+// that way or on one machine is choose's to decide, as before.
 
 const (
 	// spillExponent is how a machine's time grows with its working set
@@ -37,18 +42,40 @@ const (
 	// minutes and up to 820 GB of spill, where one at 10.3 times finished,
 	// spilling 330 GB.
 	oomRatio = 12
-	// fleetMargin is how many times the fastest way's estimate a way may
-	// take and still be chosen for costing less: estimates are rough, and a
-	// fifth more time on a quarter of the workers is a better bet than the
-	// last fifth bought with four times the machines. At ten times the
-	// data, a report took 58 s on one machine and 50 s on 16 workers, most
-	// of it the start and rounds of its stages, which more workers do not
-	// shorten.
+	// fleetMargin is how many times the fastest way's time a way may take
+	// and still be chosen for costing less. At ten times the data, a report
+	// took 112 s on 8 workers and 127 s on 16 (13% more, for twice the
+	// cost): 8; another 44 s on 16 and 75 s on 8 (70% more, for 7% less):
+	// 16. Picking 4 workers, estimated within a fifth of 16 but measured at
+	// 200 s, added 60% to a run to save a few percent, which a margin
+	// against estimates alone allowed; measured times stand where there are
+	// some (see correct and exploreFleet).
 	fleetMargin = 1.2
-	// largeStageCost is what a stage's round of tasks takes on the large
-	// worker, where its exchanges, if any, stay on its own disk: at ten
-	// times the data, stages exchanging through workers' disks ran three to
-	// eight times as fast as through object storage (see stageCost).
+	// costTie is the share of a way's cost within which another costs the
+	// same (see pick).
+	costTie = 0.02
+	// fleetExploreWithin is how many times the fastest measured way's time
+	// a way not measured may be estimated at, as corrected, and still be
+	// tried once (see exploreFleet): the estimates run within a factor of
+	// 1.35 of the runs at the root mean square (see levelCost).
+	fleetExploreWithin = 1.4
+	// levelCost is what a level of a statement's stages takes on workers
+	// beside their reading: its round of tasks, which wait for the level
+	// before; stages of one level run at once. workerReadShare is the share
+	// of one machine's cold rate (coldRateAt) a worker's core reads and
+	// computes its tasks' share at, as tasks read column chunks in parts
+	// and write and read exchanges. Fitted over fifteen runs of seven
+	// reports at ten times the data on 1 to 16 workers, the estimates are
+	// within a factor of 1.35 at the root mean square of the logarithms,
+	// where a cost a stage and one machine's rate were within 2.05, and
+	// took 4 workers to be about as fast as 16 for a report that took 200
+	// s on 4 and 127 s on 16 (see TestFleetCalibration).
+	levelCost       = 5.0
+	workerReadShare = 0.4
+	// largeStageCost is what a level of stages takes on the large worker,
+	// where its exchanges, if any, stay on its own disk: at ten times the
+	// data, stages exchanging through workers' disks ran three to eight
+	// times as fast as through object storage.
 	largeStageCost = 2.0
 )
 
@@ -182,12 +209,10 @@ func threadsPerCore(threads, cores int) float64 {
 }
 
 // onFleet estimates the plan's time on n of f's workers: a statement's own
-// start, each stage's round of tasks and of the exchanges it writes to
-// object storage, and what its stages read cold, or the rows they go
-// through, whichever takes longer, on n workers' cores at their threads a
-// core; and the start of the workers that do not run. At ten times the
-// data on 16 workers, reports of 2 and 3 stages took 12 to 40 s, and of 23
-// to 26 stages 153 to 183 s, over a few gigabytes.
+// start, each level of its stages' round of tasks (levelCost), and what
+// its stages read, at workerReadShare of one machine's cold rate, or the
+// rows they go through, whichever takes longer, on n workers' cores at
+// their threads a core; and the start of the workers that do not run.
 //
 // Workers do not spill as one machine does: their exchanges' partitions
 // are sized to their memory, a task runs a few of them at once, and a task
@@ -200,9 +225,9 @@ func (x features) onFleet(n int, f fleet) option {
 	o := option{workers: n, spill: spillOn(x.set()/float64(n), f.memory)}
 	o.spill.factor, o.spill.oom = 1, false
 	cores := float64(n * max(f.cores, 1))
-	rate := coldRateAt(threadsPerCore(f.threads, f.cores))
+	rate := coldRateAt(threadsPerCore(f.threads, f.cores)) * workerReadShare
 	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
-	o.estimate = startCost + float64(x.stages)*stageCost + work
+	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work
 	if n > f.running {
 		o.estimate += f.start.Seconds()
 		o.started = n - f.running
@@ -220,7 +245,7 @@ func (x features) onLarge(l largeWorker) option {
 	cores := float64(max(l.cores, 1))
 	rate := coldRateAt(threadsPerCore(l.threads, l.cores))
 	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
-	o.estimate = startCost + float64(x.stages)*largeStageCost + work*o.spill.factor
+	o.estimate = startCost + float64(max(x.levels, 1))*largeStageCost + work*o.spill.factor
 	if !l.running {
 		o.estimate += l.start.Seconds()
 		o.started = 1
@@ -228,46 +253,63 @@ func (x features) onLarge(l largeWorker) option {
 	return o
 }
 
-// prices are what a worker of f's fleet and its large worker cost an hour,
-// and whether those are dollars. A price not known is taken to go with the
-// machine's cores, from the other's, or, with neither known, a worker of
-// the fleet counts one: cloud machines of a family cost about as their
-// size.
-func (f fleet) prices() (small, large float64, dollars bool) {
+// prices are what a worker of f's fleet, its large worker and the replica
+// cost an hour, and whether those are dollars. A price not known is taken
+// to go with the machine's cores, from a worker's or the large worker's,
+// or, with neither known, a worker of the fleet counts one: cloud machines
+// of a family cost about as their size.
+func (f fleet) prices() (small, large, replica float64, dollars bool) {
 	small = f.price
 	var lcores int
 	if f.large != nil {
 		large, lcores = f.large.price, f.large.cores
 	}
-	ratio := 1.0
-	if f.cores > 0 && lcores > 0 {
-		ratio = float64(lcores) / float64(f.cores)
+	ratio := func(cores int) float64 {
+		if f.cores > 0 && cores > 0 {
+			return float64(cores) / float64(f.cores)
+		}
+		return 1
 	}
 	switch {
 	case small > 0 && large > 0:
 	case small > 0:
-		large = small * ratio
+		large = small * ratio(lcores)
 	case large > 0:
-		small = large / ratio
+		small = large / ratio(lcores)
+	case f.replicaPrice > 0:
+		small = f.replicaPrice / ratio(f.replicaCores)
+		large = small * ratio(lcores)
 	default:
-		return 1, ratio, false
+		return 1, ratio(lcores), ratio(f.replicaCores), false
 	}
-	return small, large, true
+	replica = f.replicaPrice
+	if replica <= 0 {
+		replica = small * ratio(f.replicaCores)
+	}
+	return small, large, replica, true
 }
 
 // costOn is what the option costs on f's machines: its machines' seconds,
 // the workers it starts staying up idle after it as long as they do (see
-// pool.idleAfter), at their prices.
+// pool.idleAfter), at their prices, and the replica's, which waits for
+// the statement and runs its last step. Where idle workers do not stop
+// alone while others work (see pool.shrink), every running worker bills
+// for as long as the statement runs, so fewer of them cost no less.
 func (o option) costOn(f fleet) float64 {
-	small, large, _ := f.prices()
+	small, large, replica, _ := f.prices()
+	own := o.seconds * replica
 	if o.large {
 		tail := 0.0
 		if o.started > 0 && f.large != nil {
 			tail = f.large.tail.Seconds()
 		}
-		return (o.seconds + tail) * large / 3600
+		return (own + (o.seconds+tail)*large) / 3600
 	}
-	return (float64(o.workers)*o.seconds + float64(o.started)*f.tail.Seconds()) * small / 3600
+	billed := o.workers
+	if !f.alone {
+		billed = max(billed, f.running)
+	}
+	return (own + (float64(billed)*o.seconds+float64(o.started)*f.tail.Seconds())*small) / 3600
 }
 
 // fleetBucket groups numbers of workers whose runs stand for each other:
@@ -325,7 +367,9 @@ func abs(n int) int {
 
 // pick chooses among opts, as corrected (see correct): of those that do not
 // run out of memory, the cheapest of those within fleetMargin of the
-// fastest, the one on fewer workers on a tie; and says why. ok is false
+// fastest, the one on fewer workers on a tie (costs within costTie); and
+// says why. No option faster than the one picked and cheaper by more than
+// costTie is passed over: it would be within the margin too. ok is false
 // when none would finish.
 func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	fastest := -1
@@ -345,6 +389,16 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 		}
 		c := opts[chosen]
 		if o.cost < c.cost || o.cost == c.cost && o.workers < c.workers {
+			chosen = i
+		}
+	}
+	// Costs within costTie of the cheapest are a tie, which fewer workers
+	// win: they leave the others to other statements, as a small statement
+	// on running workers that stay up whatever it runs on costs the same
+	// on any number of them.
+	cheapest := opts[chosen].cost
+	for i, o := range opts {
+		if !o.spill.oom && o.seconds <= limit && o.cost <= cheapest*(1+costTie) && o.workers < opts[chosen].workers {
 			chosen = i
 		}
 	}
@@ -371,6 +425,37 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 		b.WriteString(" (prices not set: by worker-seconds)")
 	}
 	return best, b.String(), true
+}
+
+// exploreFleet is the option to run a statement on once, to measure it,
+// when best was picked among opts as corrected by what it took before (r):
+// the cheapest of those not measured whose time, as corrected, is within
+// fleetExploreWithin of the fastest measured option's and that best does
+// not beat on both time and cost, unless the statement was tried so
+// within exploreEvery or nothing was measured. A report took 200 s on 4
+// workers, its estimate, and 127 s on 16; the estimates, corrected by the
+// run on 16, took 8 for 162 s, and it took 112 s there.
+func exploreFleet(opts []option, best option, r runs, now time.Time) (option, bool) {
+	if now.Sub(r.fleetExplored) < exploreEvery {
+		return option{}, false
+	}
+	fastest := math.Inf(1)
+	for _, o := range opts {
+		if o.measured && !o.spill.oom {
+			fastest = min(fastest, o.seconds)
+		}
+	}
+	var out option
+	found := false
+	for _, o := range opts {
+		switch {
+		case o.measured, o.large, o.spill.oom, math.IsInf(fastest, 1), o.seconds > fleetExploreWithin*fastest:
+		case o.seconds >= best.seconds && o.cost >= best.cost:
+		case !found || o.cost < out.cost:
+			out, found = o, true
+		}
+	}
+	return out, found
 }
 
 // runnerUp is the fastest option of opts but i that would finish.

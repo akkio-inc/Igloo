@@ -37,7 +37,10 @@ type runs struct {
 	fleets      map[int]float64
 	large       float64
 	explored    time.Time
-	outOfMemory bool
+	// fleetExplored is when it last ran on a number of workers it had not
+	// run on, to measure it (see exploreFleet).
+	fleetExplored time.Time
+	outOfMemory   bool
 	// guarded says it ran on one machine far past its estimate, and was
 	// run on workers instead (see ObserveGuard).
 	guarded bool

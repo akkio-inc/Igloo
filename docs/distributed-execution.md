@@ -396,18 +396,28 @@ latest version is picked out of a lookup of every one): the replica's, at
 what it reads from object storage cold per core (about 9 MB/s at one and a
 half threads a core, 16 MB/s at four; its read cache holds what it read
 lately, which a statement's first run seldom has), and the workers', at
-the same rate for their cores and threads; each no less than the rows its
-parts go through take at 150 million rows a second per core, once for the
-scan and again for each join and grouping (a hundredth of a table's rows
-where a part filters it so), for a statement that reads little but joins
-much. Workers also take about 8 seconds to start a statement and 6 for each
-of its stages, whose tasks write their exchanges to object storage for the
-next to read, plus the time to start workers that are stopped: at ten times
-the data on 16 workers, reports of 2 or 3 stages took 12 to 40 seconds, and
-of 23 to 26 stages 153 to 183 seconds. It runs the statement on workers
-only if the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a
-minute), or would run short of memory, and the workers are estimated to be
-at least 1.5 times faster.
+0.4 of that rate for their cores and threads, as their tasks read column
+chunks in parts and write and read exchanges; each no less than the rows
+its parts go through take at 150 million rows a second per core, once for
+the scan and again for each join and grouping (a hundredth of a table's
+rows where a part filters it so), for a statement that reads little but
+joins much. Where DuckDB's plan says (see spilling, below), the replica's
+reading is what its scans project, each table's columns once, rather than
+what the parts name, which for a part reading a view's every column was
+77 GB of a table of 470 columns where the replica read 9.6 GB; and its
+time is no less than its hash tables take, at 10 million rows a second per
+core for a table larger than the processor's caches, as 16 joins of 400
+million rows to 400 million took 2,166 core-seconds. Workers also take
+about 8 seconds to start a statement and 5 for each level of its stages
+(stages that read what another wrote wait for it; those of one level run
+at once), plus the time to start workers that are stopped. Against the
+second scale runs at ten times the data, seven reports on 16 workers and
+two on 1 to 8, the workers' estimates are within a factor of 1.35 at the
+root mean square of the logarithms, where 6 seconds a stage and the
+replica's rate were within 2.05. It runs the statement on workers only if
+the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or
+would run short of memory, and the workers are estimated to be at least
+1.5 times faster.
 
 **Spilling.** A machine that runs a statement whole spills to disk when the
 rows its joins, groupings and distinct counts hold, its working set, are
@@ -468,24 +478,37 @@ set against each machine's room, and what it would spill.
 
 **How many workers.** Igloo weighs the statement on 1, 2, 4 and so on of
 the workers, up to `IGLOO_WORKER_MAX`, and on the workers running now, each
-with its own estimate (its start, its stages' rounds, what its cores read,
+with its own estimate (its start, its stages' levels, what its cores read,
 and the start of workers it would start), and on the pool's [large
-worker](#a-large-worker) if it has one. Of those estimated within a fifth of
-the fastest, it takes the cheapest: each machine's seconds at its price an
-hour (`IGLOO_WORKER_PRICE_PER_HOUR` and `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`,
-or else the list price of their instance types, see [prices](#prices)),
-counting the idle
+worker](#a-large-worker) if it has one. The trade-off is explicit: of the
+ways whose time is within a fifth of the fastest way's, it takes the
+cheapest, so it never takes a way that another beats on both time and cost
+(costs within 2% count as the same, and the way on fewer workers wins
+them). A way costs its machines' seconds at their prices an hour
+(`IGLOO_WORKER_PRICE_PER_HOUR`, `IGLOO_LARGE_WORKER_PRICE_PER_HOUR` and
+`IGLOO_PRICE_PER_HOUR` for the replica, or else the list price of the
+workers' instance types, see [prices](#prices)): its workers', with the idle
 time a worker started for it stays up after (see [sizing and
-cost](#sizing-and-cost)). A statement of a few stages over a few gigabytes
-gains little from more workers, most of its time being their start and its
-stages' rounds: at ten times the data, a report that took 58 s on the
-replica took 50 s on 16 workers, and is estimated within a fifth of that on
-4, for a quarter of the worker-seconds, so it runs on 4. Of more workers
-running, it takes those with the fewest tasks; the others serve other
-statements, or stop when idle. Reports whose stages read a hundred
-gigabytes run on all 16. The reason, in `EXPLAIN DISTRIBUTED`'s `fleet` row
-and in `query_history.placement`, says which it took and why, and its
-`options` row lists each way's time and cost.
+cost](#sizing-and-cost)), and the replica's, which waits for the statement
+and runs its last step, so that a slower way costs more for as long as it
+runs. Fewer workers save only where idle workers stop alone (see [idle
+workers](#idle-workers)); where they do not (`IGLOO_WORKER_WARM=off`,
+workers started by `command`, or a fixed list of addresses), every running
+worker counts for as long as the statement runs, and the fastest way is the
+cheapest. At ten times the data, one report took 678, 368, 200, 112 and 127
+s on 1, 2, 4, 8 and 16 workers: 8, for $0.133, where 16 cost $0.271 and 4,
+which an earlier rule took, estimated within a fifth of 16, cost $0.143 and
+60% more time. Another took 44 s on 16 and 75 s on 8: 16, for 7% more than
+8. Times a statement took on a number of workers stand for the estimates
+(below); a number it has not run on, estimated, as corrected, within 1.4
+times the fastest it ran on and not beaten by the way chosen, is tried
+once a day to measure it: the first report ran on 16 first, the estimates'
+fastest; its 127 s there took 8 to 164 s, so it was tried on 8, and stayed
+on 8 at 112 s. Of more workers running, it takes those with the fewest
+tasks; the others serve other statements, or stop when idle. The reason,
+in `EXPLAIN DISTRIBUTED`'s `fleet` row and in `query_history.placement`,
+says which it took and why, and its `options` row lists each way's time
+and cost.
 
 Against the scale environment's reports at 1x, 10x and 100x, timed on a
 16-core replica and on 16 workers of 8 cores, the estimates pick the side
@@ -532,8 +555,8 @@ which is then a floor. Runs on workers count with runs on about as many
 large worker apart from them: how many workers a statement runs on takes
 what it took on each before for that one's time, and the others' estimates
 times what the nearest it ran on took over its estimate, so a statement
-that took 50 s on 16 workers, estimated at 28, is taken to need 59 s on 4,
-within a fifth, and one that then took 90 s on 4 runs on 8 next. One that
+that took 127 s on 16 workers, estimated at 89, is taken to need 164 s on
+8, and one that then took 112 s on 8 runs on 8 next. One that
 ran on a quarter of the workers it would run on now, as in an earlier
 session on a smaller fleet, is tried on all of them, at most once a day,
 whatever it took on the replica. The server logs each choice, `chose where
@@ -1042,14 +1065,14 @@ Besides many small workers, a compute pool can have one large worker, a
 machine of 512 GiB or so, on which auto mode may run a whole statement
 alone. Its estimate is one machine's of its cores and memory, spilling as
 the statement's working set says (see [when](#when)), plus a statement's
-start, 2 seconds a stage, its exchanges staying on its own disk, and its
-own start if it is stopped; a statement that would run out of memory there
-is never run there. Auto mode runs a statement there when that estimate is
-within a fifth of the fastest way and the cheapest of those, at the prices
-the pool gives: at a hundred times the data, a report whose stages read 49
-GB and fed 296 GB of working set, 207 s on 16 workers by the estimates,
-fits a large worker of 440 GiB and is estimated at 133 s there, for a
-third of the fleet's cost. It plans the statement again for it, with its
+start, 2 seconds a level of its stages, its exchanges staying on its own
+disk, and its own start if it is stopped; a statement that would run out
+of memory there is never run there. Auto mode runs a statement there when
+that estimate is within a fifth of the fastest way and the cheapest of
+those, at the prices the pool gives (see [when](#when)): at a hundred
+times the data, a report whose stages read 49 GB and fed 296 GB of working
+set fits a large worker of 440 GiB, and is estimated faster there than on
+16 workers and at a fraction of their cost. It plans the statement again for it, with its
 memory, so that fewer tables are partitioned. Runs on it are kept apart in
 the history (`query_history.placement` begins `the large worker`), and its
 read cache is purged for [erasure requests](#erasure-requests) as the other
@@ -1196,7 +1219,11 @@ pods still starting, or the Deployment changed by another, leaves it for
 the next check, and a retired worker not stopped serves again when a
 statement wants more workers than run, or after three minutes. Workers
 started by `command` stop only all together. When every worker is idle,
-they all stop as before.
+they all stop as before. Auto mode's choice of how many workers counts
+this: where idle workers stop alone, a statement on 4 of 16 running workers
+costs 4 workers' time; where they do not, it costs all 16's, since they
+stay up while it runs, and it runs on as many as are fastest (see
+[when](#when)).
 
 A worker stopped alone is one whose read cache goes with it, as a pod's
 volumes do, or that was purged of every deletion of [erasure
@@ -1230,7 +1257,9 @@ rough regional factor (eu-west-1 1.11, ap-northeast-1 1.28 and so on; a
 region the table does not know counts as the base region), and Spot is a
 typical discount (AWS 65%, Azure 70%, Google Cloud 65%) that in fact varies
 by type, zone and hour. Set the prices for exact or negotiated rates. Without
-a price or a known type, a machine's price goes with its cores. `EXPLAIN
+a price or a known type, a machine's price goes with its cores; so does the
+replica's, which counts for as long as a statement on workers runs, unless
+`IGLOO_PRICE_PER_HOUR` sets it. `EXPLAIN
 DISTRIBUTED`'s `options` row says whether the costs it weighed are in
 dollars.
 

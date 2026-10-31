@@ -35,7 +35,7 @@ page is the reference they are built on.
 | `IGLOO_LOGIN_TIMEOUT` | `30s` | How long a SQL client may take to sign in, from connecting, through TLS and the password exchange, like PostgreSQL's `authentication_timeout`. A connection that takes longer is closed, and its login ends. |
 | `IGLOO_SHUTDOWN_DELAY` | `0` | On SIGTERM, keep accepting connections this long (e.g. `5s`) while `/readyz` reports not ready, so load balancers stop routing new connections first. Running queries then get 30 seconds to finish. |
 | `IGLOO_POOL` | `default` | The [compute pool](workload-management.md#compute-pools) this replica belongs to, recorded with every statement in the history and `igloo.usage`: up to 63 lowercase letters, digits, hyphens and underscores. |
-| `IGLOO_PRICE_PER_HOUR` | `0` | What this replica's machine costs an hour, e.g. `0.58`, for the cost estimates of [`igloo.usage`](workload-management.md#usage-and-cost). `0` means unknown, and costs are `NULL`. |
+| `IGLOO_PRICE_PER_HOUR` | `0` | What this replica's machine costs an hour, e.g. `0.58`, for the cost estimates of [`igloo.usage`](workload-management.md#usage-and-cost), and for auto mode's choice of how many workers a statement runs on, which keeps the replica busy as long as it runs (see [when](distributed-execution.md#when)). `0` means unknown: costs are `NULL`, and auto mode takes the replica to cost as its cores do against a worker's. |
 
 ## Users
 

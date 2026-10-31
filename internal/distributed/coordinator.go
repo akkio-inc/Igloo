@@ -127,8 +127,12 @@ type Options struct {
 	// see localFor).
 	AutoExchanges bool
 	// WorkerPrice is what a worker costs an hour, for weighing how many a
-	// statement runs on (see fleet.go); zero for unknown.
+	// statement runs on (see fleet.go); zero for unknown. Price is what this
+	// replica's machine costs an hour (IGLOO_PRICE_PER_HOUR), which a
+	// statement on workers keeps busy as long as it runs; zero for unknown,
+	// when it is taken to go with its cores.
 	WorkerPrice float64
+	Price       float64
 	// Large, with addresses, is the compute pool's large worker, which a
 	// statement may run on alone (see fleet.go): where it is and how to
 	// start it, its MaxWorkers taken as 1. LargeCores and LargeMemory are
@@ -596,6 +600,17 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	if len(ws) == 0 {
 		reason = "workers are stopped; " + reason
 	}
+	tryFleet := false
+	if onWorkers && !explore && found && !dry {
+		// A number of workers it has not run on, estimated near the
+		// fastest it ran on, once a day.
+		if o, ok := exploreFleet(e.options, e.picked, r, now); ok {
+			e.fleet = fmt.Sprintf("%s once, to measure it, at %.0f s as its runs correct the estimate; otherwise %s", o, o.seconds, e.fleet)
+			e.workers, e.large, e.onWorkers = o.workers, o.large, o.estimate
+			plan.workers, plan.large = o.workers, o.large
+			tryFleet = true
+		}
+	}
 	d.onWorkers, d.reason = onWorkers, reason
 	if !onWorkers && explore && found && r.dist > 0 && r.local == 0 {
 		// Tried here after runs on workers only: a run here may take as
@@ -612,11 +627,14 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	co.log.Info("chose where a statement runs", "on", where, "reason", reason, "key", plan.Key,
 		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers, "large", e.large,
-		"fleet", e.fleet, "levels", e.levels, "stages", e.stages, "bytes", e.bytes, "exchanged", e.exchanged, "rows", e.rows,
+		"fleet", e.fleet, "levels", e.levels, "stages", e.stages, "bytes", e.bytes, "local_bytes", e.localBytes, "exchanged", e.exchanged, "rows", e.rows,
 		"short_of_memory", e.memory, "spills", e.spills, "spill_factor", math.Round(e.local.factor*10)/10, "working_set", int64(e.local.set),
 		"measured_exchanged", r.exchangeBytes, "measured_rows", r.exchangeRows, "measured_fanout", math.Round(r.fanout*10)/10)
 	if explore {
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
+	}
+	if tryFleet {
+		co.history.update(plan.Key, func(r *runs) { r.fleetExplored = now })
 	}
 	return plan, d, nil
 }
@@ -660,7 +678,8 @@ func (co *Coordinator) aggregates(ctx context.Context, env Env) map[string]bool 
 // worker, if it runs or may be started and its size is known.
 func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large bool) fleet {
 	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws), memory: smallestMemory(ws),
-		price: co.price(co.opts.WorkerPrice, co.opts.WorkerInstanceType, co.opts.WorkerSpot, ws)}
+		price:        co.price(co.opts.WorkerPrice, co.opts.WorkerInstanceType, co.opts.WorkerSpot, ws),
+		replicaPrice: co.opts.Price, replicaCores: co.opts.Cores, alone: co.pool.stopsAlone()}
 	for i, w := range ws {
 		if i == 0 || w.status.Cores > f.cores {
 			f.cores, f.threads = w.status.Cores, w.status.Threads

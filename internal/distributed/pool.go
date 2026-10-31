@@ -338,6 +338,13 @@ func (p *pool) purge(ctx context.Context, addr string, through int64) (workerSta
 // canStart reports whether workers can be started on demand.
 func (p *pool) canStart() bool { return p.opts.Compute != nil && p.opts.MaxWorkers > 0 }
 
+// stopsAlone reports whether idle workers stop alone while others work
+// (see shrink): Compute can stop them so, and IGLOO_WORKER_WARM is not off.
+func (p *pool) stopsAlone() bool {
+	_, ok := p.opts.Compute.(Shrinker)
+	return ok && p.opts.Warm >= 0
+}
+
 // startEstimate is how long starting workers is expected to take.
 func (p *pool) startEstimate() time.Duration {
 	p.mu.Lock()
