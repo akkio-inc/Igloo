@@ -934,6 +934,20 @@ func TestDistributedExplain(t *testing.T) {
 	if n := count(t, conn, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'never'"); n != 0 {
 		t.Errorf("EXPLAIN DISTRIBUTED created the table")
 	}
+	// The session's statement timeout ends it as it ends any statement:
+	// planning reads the session's catalog and describes its parts, which
+	// takes more than a millisecond.
+	mustExec(t, conn, "SET distributed_execution = on")
+	mustExec(t, conn, "SET statement_timeout = '1ms'")
+	_, err := conn.Exec(context.Background(), "EXPLAIN DISTRIBUTED WITH g AS (SELECT amount, count(*) AS n FROM orders GROUP BY amount) "+
+		"SELECT a.amount, a.n + b.n FROM g AS a JOIN g AS b ON a.amount = b.amount")
+	if pgCode(err) != "57014" {
+		t.Errorf("EXPLAIN DISTRIBUTED past its statement timeout: %v", err)
+	}
+	mustExec(t, conn, "RESET statement_timeout")
+	if got := explain("SELECT amount, count(*) FROM orders GROUP BY amount"); got["runs on"] != "workers" {
+		t.Errorf("after the timeout: %v", got)
+	}
 }
 
 // Snowflake's FLATTEN, translated to unnests of Igloo's sf_ macros, runs

@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -285,6 +286,11 @@ type planner struct {
 	opts planOptions
 	// aggs are the names of DuckDB's aggregate functions.
 	aggs map[string]bool
+	// producing are the relations being produced, by relationKey, and
+	// depth how many are nested: a relation never reads itself, and
+	// relations nest no deeper than maxRelationDepth (see relationExchange).
+	producing map[string]bool
+	depth     int
 
 	stages []*Stage
 	// exchanges counts the exchanges planned.
@@ -689,10 +695,18 @@ type candidate struct {
 // job turns sel into a job if it qualifies and returns the combine step
 // that replaces it, or nil if it does not qualify.
 func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
+	if err := pl.budget(); err != nil {
+		return nil, err
+	}
 	sp := pl.save()
 	inlines := pl.inlines
 	c := &candidate{sel: sel, top: top}
 	j, b, err := pl.build(c, top, ctes)
+	if pl.ctx.Err() != nil {
+		// Out of time: the statement, not this part, runs on one machine.
+		pl.restore(sp)
+		return nil, pl.budget()
+	}
 	var combine node
 	if err == nil {
 		combine, err = pl.finish(j, b)
@@ -1296,6 +1310,34 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 
 // maxViewDepth bounds views read through other views.
 const maxViewDepth = 16
+
+// maxRelationDepth bounds how deeply relations workers compute nest, each
+// produced for the one that reads it: a report's common table expressions
+// nest a dozen deep at most.
+const maxRelationDepth = 64
+
+// planBudget is how long planning a statement may take, besides its own
+// statement timeout: a statement the planner cannot plan within it runs on
+// one machine, as auto mode must never be slower than one machine for want
+// of a plan. A report of seventeen common table expressions plans in under
+// two seconds. A variable for tests.
+var planBudget = 10 * time.Second
+
+// errPlanBudget ends a planner's context once planBudget has passed.
+var errPlanBudget = errors.New("planning took longer than its budget")
+
+// budget fails once the planner's context ended, which planBudget ends:
+// the planner checks it as it recurses, besides the calls into the
+// session that read the context.
+func (pl *planner) budget() error {
+	if err := pl.ctx.Err(); err != nil {
+		if errors.Is(context.Cause(pl.ctx), errPlanBudget) {
+			return unsupported("planning took longer than %s", planBudget)
+		}
+		return err
+	}
+	return nil
+}
 
 // expandView returns the subquery a reference to a view reads as: the
 // view's query, every table name in it qualified as DuckDB resolves it in

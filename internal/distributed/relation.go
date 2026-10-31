@@ -812,6 +812,9 @@ func (pl *planner) opaque(sel node) string {
 // rows are written once: an exchange keyed otherwise is partitioned again
 // rather than computed again.
 func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange, error) {
+	if err := pl.budget(); err != nil {
+		return nil, err
+	}
 	xkeys := make([]string, len(keys))
 	for i, k := range keys {
 		j := slices.Index(r.item.columns, k)
@@ -839,6 +842,24 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 			pl.relationOut(r, x)
 			return x, nil
 		}
+	}
+	// A relation produced while it is being produced would be planned
+	// again and again, each time anew: a relation is never its own input.
+	self := pl.relationKey(r.q, r.scope)
+	if self != "" && pl.producing[self] {
+		return nil, unsupported("relation %s would be computed from itself", r.item.name)
+	}
+	if pl.producing == nil {
+		pl.producing = map[string]bool{}
+	}
+	if self != "" {
+		pl.producing[self] = true
+		defer delete(pl.producing, self)
+	}
+	pl.depth++
+	defer func() { pl.depth-- }()
+	if pl.depth > maxRelationDepth {
+		return nil, unsupported("relations nest more than %d deep", maxRelationDepth)
 	}
 	x := pl.exchange("relation", xkeys, casts)
 	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
@@ -1254,9 +1275,16 @@ func (w *wrapper) apply(f node, inner []Column) node {
 // a subquery or a common table expression nothing else reads, and if so
 // returns the wrapper that computes it over the relation's rows.
 func (pl *planner) projection(sel node, scope cteScope) (*wrapper, *relUse, error) {
+	// Its own expressions, not those of the relation it reads, which is
+	// produced as it is: a relation over a subquery with a scalar subquery
+	// in it (ver = (SELECT max(ver) ...)) is still a projection of it.
+	// Taken for more, its subquery was made a relation, which projected the
+	// same columns of the same subquery, and was taken for more again,
+	// without end.
+	own := []any{sel["select_list"], sel["where_clause"]}
 	if len(list(sel, "modifiers")) > 0 || len(list(sel, "group_expressions")) > 0 || child(sel, "having") != nil ||
 		child(sel, "qualify") != nil || child(sel, "sample") != nil || str(sel["aggregate_handling"]) != "STANDARD_HANDLING" ||
-		pl.hasAggregate(sel["select_list"]) || hasClass(clauses(sel), "WINDOW") || hasClass(clauses(sel), "SUBQUERY") {
+		pl.hasAggregate(sel["select_list"]) || hasClass(own, "WINDOW") || hasClass(own, "SUBQUERY") {
 		return nil, nil, nil
 	}
 	ref := child(sel, "from_table")

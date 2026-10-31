@@ -594,6 +594,12 @@ distributed, but only on workers already running and on no more of them
 than the automatic decision would use; it never starts a worker. So no user can
 start a fleet of machines, or keep one busy, by repeating a query.
 
+Planning a statement for workers takes at most 10 seconds, besides the
+session's `statement_timeout`, which ends `EXPLAIN DISTRIBUTED` as it ends
+any statement: a statement that cannot be planned in that time runs on one
+machine, as does a part whose relations workers compute nest more than 64
+deep, or one that would compute a relation from itself.
+
 ## Same results as one machine
 
 Workers run the same DuckDB as the coordinator, on the same snapshot of

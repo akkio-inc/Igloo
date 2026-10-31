@@ -474,12 +474,20 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		return nil, nil, err
 	}
 	opts.values = valueNames(values)
-	plan, err := newPlanner(ctx, env, co.parser, co.aggregates(ctx, env), opts).plan(stmt)
+	// Planning has a budget of its own (see planBudget): past it, the
+	// statement runs on one machine.
+	pctx, cancel := context.WithTimeoutCause(ctx, planBudget, errPlanBudget)
+	defer cancel()
+	plan, err := newPlanner(pctx, env, co.parser, co.aggregates(ctx, env), opts).plan(stmt)
 	if err != nil && ctx.Err() != nil {
 		// Canceled or past its deadline while it planned, as when the
 		// session could not describe a part in time: the statement ends,
 		// rather than run on one machine for a reason it does not have.
 		return nil, nil, context.Cause(ctx)
+	}
+	if err != nil && pctx.Err() != nil {
+		co.log.Warn("planning a statement took longer than its budget; it runs on one machine", "budget", planBudget, "err", err)
+		err = unsupported("planning took longer than %s", planBudget)
 	}
 	if err != nil {
 		var u *errUnsupported

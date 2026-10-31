@@ -2055,6 +2055,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Planning a statement for workers no longer recurses without end on a
+  common table expression filtered by `IN` a subquery that joins two
+  subqueries, one with a scalar subquery in its filter: the subquery was
+  made a relation of the columns read, whose producing took it for more
+  than a projection of the subquery, as the scalar subquery deep in its
+  `FROM` counted against it, and made the subquery a relation again, and
+  again, in auto mode too, until the statement timed out. Planning now has
+  a budget of 10 seconds, past which the statement runs on one machine, as
+  does a part whose relations nest more than 64 deep or would compute a
+  relation from itself; and `EXPLAIN DISTRIBUTED` ends on the session's
+  `statement_timeout` and on a cancel request.
 - No one may put Igloo's own schemas (`igloo_domains`, `igloo_bitmaps`,
   `igloo_refresh`) on the search path or make one the current schema, in
   any case or quoting: through such a path any reader read bitmap

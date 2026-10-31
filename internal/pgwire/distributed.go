@@ -72,8 +72,12 @@ func (s *Server) distributedCommand(sess *session, query string) (wire.PreparedS
 	}
 	if m := explainDistributed.FindStringSubmatch(query); m != nil {
 		return respond(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			// A cancel request and the session's statement timeout end it,
+			// as they end any statement; planning has a budget of its own
+			// besides (see distributed.planBudget).
+			ctx, done := sess.cancelable(ctx, query)
 			rows, err := s.explainDistributed(ctx, sess, m[1])
-			if err != nil {
+			if err = done(err); err != nil {
 				return err
 			}
 			for _, r := range rows {
