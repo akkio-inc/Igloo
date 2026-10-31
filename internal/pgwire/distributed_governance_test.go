@@ -108,6 +108,42 @@ func TestDistributedPolicies(t *testing.T) {
 		}
 	}
 
+	// Statements that only spell a protected table's name, in a column, a
+	// string or the text of a view they read, which the rewriter analyzes
+	// and finds read none, run on workers, through the views it expanded
+	// too; one that reads the protected table besides stays here.
+	for _, sql := range []string{
+		"CREATE TABLE lake.public.visits (id INTEGER, contacts VARCHAR, spend INTEGER)",
+		"INSERT INTO lake.public.visits SELECT i, 'c' || (i % 7), i FROM range(3000) t(i)",
+		"CREATE VIEW memory.main.visit_view AS SELECT id, contacts AS who, spend FROM lake.public.visits",
+	} {
+		mustExec(t, ds.admin, sql)
+	}
+	for _, c := range []struct {
+		query   string
+		workers bool
+	}{
+		{"SELECT contacts, count(*), sum(spend)::BIGINT FROM lake.public.visits GROUP BY 1 ORDER BY 1", true},
+		{"SELECT who, count(*), max(spend) FROM memory.main.visit_view GROUP BY 1 ORDER BY 1", true},
+		{"SELECT count(*), sum(spend)::BIGINT FROM lake.public.visits WHERE contacts <> 'contacts'", true},
+		{"SELECT v.contacts, count(*) FROM lake.public.visits v JOIN lake.crm.contacts c ON c.id = v.id GROUP BY 1 ORDER BY 1", false},
+	} {
+		mustExec(t, rita, "SET distributed_execution = off")
+		want := texts(t, rita, c.query)
+		mustExec(t, rita, "SET distributed_execution = on")
+		if got := texts(t, rita, c.query); strings.Join(got, ",") != strings.Join(want, ",") || len(want) == 0 {
+			t.Errorf("%s: got %q, want %q", c.query, got, want)
+		}
+		q := lastQuery(t, ds.catalogServer, "rita", c.query)
+		if (q.Workers > 0) != c.workers || c.workers && len(q.Policies) > 0 || !c.workers && len(q.Policies) == 0 {
+			t.Errorf("%s: %d workers, policies %q; want on workers %v", c.query, q.Workers, q.Policies, c.workers)
+		}
+		explain := strings.Join(texts(t, rita, "EXPLAIN DISTRIBUTED "+c.query), "\n")
+		if strings.Contains(explain, "workers") != c.workers {
+			t.Errorf("EXPLAIN DISTRIBUTED %s:\n%s", c.query, explain)
+		}
+	}
+
 	// Should a statement reach the planner without the rewriter having
 	// seen it, the planner still refuses a protected table.
 	ctx := context.Background()

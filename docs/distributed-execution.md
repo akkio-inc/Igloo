@@ -242,8 +242,8 @@ than the table does now (a field renamed, or dropped and added again,
 since they were written), tables of Iceberg format version 3 with a
 column or nested field that has an initial default (workers would read it
 as `NULL` from the files written before it was added), tables with
-[masking or row access policies](security-policies.md) and statements those
-policies rewrite (directly or through a view), views that group, sort or
+[masking or row access policies](security-policies.md) and statements that
+read them (directly or through a view), views that group, sort or
 limit, [connections](federation.md)' tables and Delta
 Sharing's [external tables](sharing.md). Workers read table files
 directly and could not apply policies; a connection's table or an external
@@ -615,11 +615,17 @@ give the workers more memory.
   other than `unnest`, `json_each` and `json_tree` of values and `range`
   and `generate_series` of literals, a table by name). Their DuckDB is locked down as the server's is: no local
   files, no other locations, no SQL from strings.
-- **Policies keep a statement on one machine.** A statement that masking
-  or row access policies apply to, or that names anything they concern,
-  runs on the replica, where Igloo applies them. Workers never see a masked
-  column's raw values or a hidden row. So does one that reads a table a
-  [clean room](clean-rooms.md) keeps to its party, a room's runs included.
+- **Policies keep a statement on one machine.** A statement that reads a
+  table masking or row access policies apply to, directly or through a
+  view, runs on the replica, where Igloo applies them. Workers never see a
+  masked column's raw values or a hidden row. So does one that reads a
+  table a [clean room](clean-rooms.md) keeps to its party, a room's runs
+  included. What a statement reads is what applying the policies finds,
+  resolving its names: one that only spells a protected table's name, as a
+  column named like it does, or a column named like an ID domain, whose
+  dictionary is Igloo's own protected table, or that reads a view whose
+  text does, runs on workers when it reads none. The planner refuses a
+  protected table besides, whatever reaches it.
 - **Workers accept no one but Igloo.** Coordinators and workers talk TLS 1.3
   and authenticate each other with keys derived from `IGLOO_WORKER_SECRET`;
   without the secret, neither SQL users nor anything else on the network

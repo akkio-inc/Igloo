@@ -492,25 +492,30 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 // policyReason says why masking and row access policies keep st on this
 // replica, or is empty. Workers read table files directly and know nothing
 // of the requesting user, so they cannot apply policies: a statement that
-// policies rewrote, that reads a protected table or that names anything
-// policies concern (a protected table, or a view or macro that reads one)
-// is not distributed. sessionEnv.Table refuses protected tables as well,
-// should a statement reach the planner without having triggered the
-// rewriter.
+// reads a protected table, directly or through a view, is not distributed.
+//
+// Which tables a statement reads is what the rewriter found resolving its
+// names (touched, applied), not what names it spells: a statement is
+// analyzed when any word of it, or of a view it reads, spells a protected
+// table's name, as a column named like one does, or one named like an ID
+// domain, whose dictionary, Igloo's own and protected, is named after it.
+// Analyzed and found to read none, it runs on workers as the text the
+// rewriter left, views it expanded included. sessionEnv.Table refuses
+// protected tables as well, should a statement reach the planner without
+// the rewriter having seen one.
 func policyReason(st *statement) string {
 	g := st.guard
-	if g != nil && g.hiddenOnly {
+	switch {
+	case g == nil && st.original != "":
+		return "masking or row access policies rewrote it"
+	case g == nil, g.hiddenOnly:
 		// Only ID domains' columns of ids left out: nothing a worker could
 		// fail to apply.
 		return ""
-	}
-	switch {
-	case st.original != "":
-		return "masking or row access policies rewrote it"
-	case g != nil && (g.touched || len(g.applied) > 0):
+	case len(g.applied) > 0:
 		return "masking or row access policies apply to what it reads"
-	case g != nil && g.nonce != "":
-		return "it names something masking or row access policies concern"
+	case g.touched:
+		return "masking or row access policies, or a clean room, concern a table it reads"
 	}
 	return ""
 }
