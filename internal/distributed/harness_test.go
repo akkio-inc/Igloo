@@ -53,8 +53,10 @@ type harness struct {
 	views map[string]string
 	// hook, if set, sees every record the coordinator and workers log.
 	hook atomic.Pointer[func(slog.Record)]
-	// rb, if set, is the rb extension the session and workers load.
-	rb string
+	// rb, if set, is the rb extension the session and workers load, and
+	// extensions are DuckDB's that they load from IGLOO_TEST_EXTENSION_DIR.
+	rb         string
+	extensions []string
 	// wrap, if set, wraps the listener of each worker startWorker starts.
 	wrap func(i int, ln net.Listener) net.Listener
 	// groupFunctions are the functions the session's GroupFunctions names.
@@ -267,7 +269,14 @@ func newHarness(t *testing.T, sf float64, files, n int) *harness {
 // extension at rb, if not empty, as Igloo loads it.
 func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 	t.Helper()
-	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb}
+	return newHarnessWith(t, sf, files, n, rb)
+}
+
+// newHarnessWith is newHarnessRB whose session and workers also load
+// extensions, DuckDB's, from IGLOO_TEST_EXTENSION_DIR, as Igloo loads them.
+func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extensions ...string) *harness {
+	t.Helper()
+	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb, extensions: extensions}
 	var base slog.Handler = slog.NewTextHandler(io.Discard, nil)
 	if testing.Verbose() {
 		base = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
@@ -286,6 +295,9 @@ func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 	if rb != "" {
 		h.exec("LOAD " + quoteLiteral(rb))
 	}
+	for _, stmt := range h.extensionLoads() {
+		h.exec(stmt)
+	}
 	h.exec("INSTALL tpch")
 	h.exec("LOAD tpch")
 	h.exec(fmt.Sprintf("CALL dbgen(sf = %g)", sf))
@@ -294,6 +306,19 @@ func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 	}
 	h.startWorkers(n)
 	return h
+}
+
+// extensionLoads load the harness's extensions from
+// IGLOO_TEST_EXTENSION_DIR.
+func (h *harness) extensionLoads() []string {
+	if len(h.extensions) == 0 {
+		return nil
+	}
+	out := []string{"SET extension_directory = " + quoteLiteral(os.Getenv("IGLOO_TEST_EXTENSION_DIR"))}
+	for _, e := range h.extensions {
+		out = append(out, "LOAD "+e)
+	}
+	return out
 }
 
 func (h *harness) exec(query string) {
@@ -441,6 +466,7 @@ func (h *harness) startWorker(i int) {
 	if h.rb != "" {
 		load = []string{"LOAD " + quoteLiteral(h.rb), "SET allow_unsigned_extensions = false"}
 	}
+	load = append(h.extensionLoads(), load...)
 	for _, stmt := range append(load,
 		"SET threads = 2",
 		"SET allowed_directories = ["+quoteLiteral(filepath.Join(h.dir, "warehouse")+"/")+", "+quoteLiteral(tmp+"/")+"]",

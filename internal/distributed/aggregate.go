@@ -510,6 +510,29 @@ var combinable = map[string]string{
 	"count": "sum", "count_star": "sum", "count_if": "sum", "countif": "sum",
 	// Roaring bitmaps: a union of unions.
 	"rb_agg": "rb_or_agg", "rb_or_agg": "rb_or_agg",
+	// HLL sketches (the datasketches extension, as APPROX_COUNT_DISTINCT
+	// and HLL_ACCUMULATE count): a union of sketches of the same size, k,
+	// the first argument (see sketchCall).
+	"datasketch_hll": "datasketch_hll_union", "datasketch_hll_union": "datasketch_hll_union",
+}
+
+// sketches are the aggregates of combinable whose first argument is the
+// sketch's size, which their combination takes first too.
+var sketches = map[string]bool{"datasketch_hll": true, "datasketch_hll_union": true}
+
+// sketchCall is the call that combines partial sketches, col, of call's
+// size: datasketch_hll_union(k, col). Unions of sketches of one size
+// estimate as a sketch of all their values does, within its error.
+func (pl *planner) sketchCall(call node, col string) (node, error) {
+	ref, err := pl.p.expr(quoteIdent(col))
+	if err != nil {
+		return nil, err
+	}
+	c := clone(call).(node)
+	c["function_name"] = combinable[strings.ToLower(str(call["function_name"]))]
+	c["children"] = []any{clone(list(call, "children")[0]), ref}
+	c["alias"], c["filter"] = "", nil
+	return c, nil
 }
 
 // collect finds the aggregate calls of the parts the coordinator evaluates
@@ -611,6 +634,9 @@ func (a *aggregation) add(call node) error {
 			ac.distinct = len(a.distincts)
 			a.distincts, a.distinctKeys = append(a.distincts, arg), append(a.distinctKeys, k)
 		}
+	case sketches[name] && (len(args) != 2 || str(args[0].(node)["class"]) != "CONSTANT" || call["distinct"] == true ||
+		len(list(child(call, "order_bys"), "orders")) > 0):
+		ac.whole = unsupported("%s() of a size that is not a constant", name)
 	default:
 		ac.whole = partialArgs(name, len(args))
 	}
@@ -1311,7 +1337,12 @@ func (a *aggregation) valueStage() (*secondStage, error) {
 				// Counts stay BIGINT, as one machine has them.
 				text = "CAST(" + text + " AS BIGINT)"
 			}
-			if e, err = a.pl.p.expr(text); err != nil {
+			if sketches[name] {
+				e, err = a.pl.sketchCall(p, "__a"+strconv.Itoa(i))
+			} else {
+				e, err = a.pl.p.expr(text)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -1835,6 +1866,12 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 		text = "coalesce(sum(" + col(0) + "), 0)"
 	case ac.kind == combineAvg:
 		text = "CAST(sum(" + col(0) + ") AS DOUBLE) / CAST(sum(" + col(1) + ") AS DOUBLE)"
+	case ac.kind == combineSame && sketches[ac.name]:
+		e, err := a.pl.sketchCall(ac.call, "__a"+strconv.Itoa(ac.partials[0]))
+		if err != nil {
+			return nil, err
+		}
+		return a.pl.cast(e, ac.typ)
 	case ac.kind == combineSame:
 		text = combinable[ac.name] + "(" + col(0) + ")"
 	case ac.kind == combineBitmap:
