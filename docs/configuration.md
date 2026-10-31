@@ -236,7 +236,7 @@ disk, so that queries after a restart read them from there; see
 |---|---|---|
 | `IGLOO_CACHE_SIZE` | automatic | Largest size of the cache, e.g. `50GB` or `40GiB`. Automatic is half of the disk space other files leave free, up to 100 GiB. `0` turns the cache off. |
 | `IGLOO_CACHE_DIR` | `/var/lib/igloo/cache` in the image | Where the cache lives. Mount a volume here to keep it across restarts. |
-| `IGLOO_PREFETCH` | `false` | Read ahead, into the read cache, the blocks scans are about to read, with requests of its own; see [prefetch](operations.md#prefetch). |
+| `IGLOO_PREFETCH` | `true` | Read ahead, into the read cache, the blocks scans are about to read, with requests of its own; see [prefetch](operations.md#prefetch). |
 | `IGLOO_PREFETCH_CONCURRENCY` | `256` | Requests the prefetcher keeps in flight, for all statements together. |
 | `IGLOO_MAX_CONCURRENT_STATEMENTS` | `off` | How many queries and changes of data may run at once on a replica, for every user together, e.g. `8`, or `auto` for as many as its cores; further ones wait in line. See [the replica's limit](workload-management.md#the-replicas-limit). |
 | `IGLOO_STATEMENT_RESERVATIONS` | `auto` | The fraction of what a statement's shape allocated last that it reserves of the replica's memory before it starts, when its role sets no `memory_limit`: `auto` for all of it (1), a fraction up to 4, or `off`. See [reservations from history](workload-management.md#reservations-from-history). |

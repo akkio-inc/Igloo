@@ -191,7 +191,7 @@ type Cache struct {
 
 // Prefetch configures reading ahead into the read cache.
 type Prefetch struct {
-	// Enabled is IGLOO_PREFETCH, off by default.
+	// Enabled is IGLOO_PREFETCH, on by default.
 	Enabled bool
 	// Concurrency is IGLOO_PREFETCH_CONCURRENCY: requests in flight for the
 	// whole process; zero means the prefetcher's default.
@@ -584,7 +584,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		*dst = v
 	}
 
-	prefetch, err := strconv.ParseBool(get("IGLOO_PREFETCH", "false"))
+	prefetch, err := strconv.ParseBool(get("IGLOO_PREFETCH", "true"))
 	if err != nil {
 		addErr("IGLOO_PREFETCH must be true or false: %w", err)
 	}

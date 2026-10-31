@@ -556,14 +556,15 @@ not writable, Igloo logs a warning and runs without it.
 Reading object storage cold waits on requests, not on cores: each DuckDB
 thread reads a row group's column chunks a request round after another, so
 how fast a cold scan reads follows the threads, which Igloo caps by memory
-(see [sizing](#sizing)). With `IGLOO_PREFETCH=true`, Igloo reads ahead, into
-the read cache, the blocks of the data files a statement's scans are about
-to read, with `IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all
-statements together, which take them in turn; DuckDB then reads the blocks
-from local disk. Against an object store answering in 20 ms at 90 MB/s a
-connection, as S3 does, a cold scan of three columns of a 4 GB table took
-2.4 s rather than 11.3 s on 16 cores, and 2.4 s rather than 6.6 s on three
-workers sharing them, fetching 1 to 3% more than DuckDB alone.
+(see [sizing](#sizing)). Igloo therefore reads ahead, into the read cache,
+the blocks of the data files a statement's scans are about to read, with
+`IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all statements
+together, which take them in turn; DuckDB then reads the blocks from local
+disk. `IGLOO_PREFETCH=false` turns it off. Against an object store
+answering in 20 ms at 90 MB/s a connection, as S3 does, a cold scan of
+three columns of a 4 GB table took 2.4 s rather than 11.3 s on 16 cores,
+and 2.4 s rather than 6.6 s on three workers sharing them, fetching 1 to 3%
+more than DuckDB alone.
 
 - It reads each file's footer, then the blocks of the columns the statement
   reads (none for a scan that reads no column, as `COUNT(*)`'s), in the

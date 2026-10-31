@@ -1576,7 +1576,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   opening a five-chart dashboard three times while a pipe loaded a raw
   table, 36 of 45 chart queries were answered from the cache, against none
   before. Erasure requests empty every replica's result cache.
-
+- Prefetch is on by default (`IGLOO_PREFETCH`): replicas and workers read
+  ahead, into the read cache, the blocks statements are about to read, with
+  256 requests in flight rather than DuckDB's few per thread. Against an
+  object store with S3's latency, cold, a scan of three columns of a 4 GB
+  table took 2.4 s rather than 11.3 s on 16 cores and 2.4 s rather than
+  6.6 s on three workers, fetching 1 to 3% more than DuckDB alone; filtered
+  scans that a filter can prune fetch about 1% more and run as fast as
+  without. The Compose stack passes `IGLOO_PREFETCH` through;
+  `IGLOO_PREFETCH=false` turns it off. On Kubernetes the chart's workers
+  read ahead into their cache volume; its igloo pods have no read cache.
 - A replica reads what the past week's statements allocated from the
   query history when it starts, those that ran under its memory limit, so
   a dashboard's first build after a restart reserves memory as later ones

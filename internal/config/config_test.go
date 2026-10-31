@@ -473,6 +473,21 @@ func TestErasureKey(t *testing.T) {
 	}
 }
 
+// IGLOO_PREFETCH reads ahead unless set to false.
+func TestPrefetchSetting(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil || !cfg.Prefetch.Enabled {
+		t.Fatalf("default: %v %v", cfg.Prefetch.Enabled, err)
+	}
+	cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_PREFETCH": "false"}))
+	if err != nil || cfg.Prefetch.Enabled {
+		t.Fatalf("false: %v %v", cfg.Prefetch.Enabled, err)
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_PREFETCH": "sometimes"})); err == nil {
+		t.Error("IGLOO_PREFETCH=sometimes should be refused")
+	}
+}
+
 // IGLOO_EXCHANGES says where workers exchange rows: auto (their disks
 // where every worker has room and runs outside Kubernetes) unless set to
 // object or local.

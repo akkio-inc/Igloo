@@ -38,6 +38,8 @@ services:
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_MEMORY_LIMIT:-}
       # Empty sizes the read cache from the free disk space; 0 turns it off.
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
+      # Read ahead, into the read cache, what statements are about to read.
+      IGLOO_PREFETCH: ${IGLOO_PREFETCH:-true}
       # Empty keeps 256 MiB of query results; 0 turns the result cache off.
       IGLOO_RESULT_CACHE_SIZE: ${IGLOO_RESULT_CACHE_SIZE:-}
       # How many queries may run at once; empty or off means no limit.
@@ -163,6 +165,7 @@ services:
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_WORKER_MEMORY_LIMIT:-}
       IGLOO_DUCKDB_THREADS: ${IGLOO_WORKER_THREADS:-}
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
+      IGLOO_PREFETCH: ${IGLOO_PREFETCH:-true}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}
