@@ -90,7 +90,7 @@ func (s *Service) downstream(ctx context.Context, r *Request) ([]Downstream, err
 			}
 		}
 		if s.opts.Jobs != nil {
-			for _, k := range []struct{ kind, via string }{{tasks.KindMaterializedView, "materialized view"}, {tasks.KindTask, "task"}} {
+			for _, k := range []struct{ kind, via string }{{tasks.KindMaterializedView, "materialized view"}, {tasks.KindDynamicTable, "dynamic table"}, {tasks.KindTask, "task"}} {
 				kind, via := k.kind, k.via
 				jobs, err := s.opts.Jobs.Store().Jobs(ctx, kind)
 				if err != nil {

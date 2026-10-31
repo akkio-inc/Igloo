@@ -113,6 +113,9 @@ type Options struct {
 	// Models, if set, are the models trained from tables' rows, which
 	// requests train again (see Models).
 	Models Models
+	// Views, if set, are the materialized views and dynamic tables made
+	// from tables' rows, which requests replace (see Views).
+	Views Views
 	// Lineage, if set, finds tables written from the tables a request
 	// erases from.
 	Lineage Lineage
@@ -812,6 +815,8 @@ func (s *Service) step(ctx context.Context, r *Request) (string, error) {
 		err = s.deleteRows(ctx, r)
 	case StepRewrite:
 		err = s.rewrite(ctx, r)
+	case StepViews:
+		err = s.rebuildViews(ctx, r)
 	case StepExpire:
 		err = s.expire(ctx, r)
 	case StepPurge:
@@ -867,9 +872,12 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 		if err == nil {
 			err = s.finish(ctx, r)
 		}
-		var models, workers []string
+		var models, workers, views []string
 		if err == nil {
 			models, err = s.leaveModels(ctx, r)
+		}
+		if err == nil {
+			views, err = s.leaveViews(ctx, r)
 		}
 		if err == nil {
 			workers, err = s.workersLeft(ctx, r)
@@ -921,6 +929,22 @@ func (s *Service) Close(ctx context.Context, id, by string) (*Request, error) {
 			}
 			r.Error += "; it leaves " + strconv.Itoa(len(models)) + " models trained from its tables, which may hold what they learned of " +
 				"the person: " + strings.Join(r.ModelsLeft, "; ")
+		}
+		if len(views) > 0 {
+			// Views it did not replace, which may hold what the person's
+			// rows gave: why, if it tried.
+			r.ViewsLeft = nil
+			for _, v := range views {
+				w := v + ": not replaced since its tables' rows were erased"
+				for _, f := range r.ViewsFailed {
+					if strings.HasPrefix(f, v+": ") {
+						w = f
+					}
+				}
+				r.ViewsLeft = append(r.ViewsLeft, scrub(r, w))
+			}
+			r.Error += "; it leaves " + strconv.Itoa(len(views)) + " materialized views or dynamic tables made from its tables, which may " +
+				"hold the person's rows: " + strings.Join(r.ViewsLeft, "; ")
 		}
 		if len(workers) > 0 {
 			// Each purges before it serves again, but its disk holds what
@@ -1236,6 +1260,10 @@ func (r *Request) redo(step string) {
 		// models step moved the epoch on may have read them, and it moves
 		// it on again.
 		r.ModelEpoch = 0
+	}
+	if at <= slices.Index(steps, StepViews) {
+		// So may views refreshed since the views step began.
+		r.ViewsSince = time.Time{}
 	}
 	for i := range r.Tables {
 		for _, s := range steps[at:] {

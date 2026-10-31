@@ -88,6 +88,7 @@ const (
 	StepFind    = "find"
 	StepDelete  = "delete"
 	StepRewrite = "rewrite"
+	StepViews   = "views"
 	StepExpire  = "expire"
 	StepPurge   = "purge"
 	StepSharing = "sharing"
@@ -98,8 +99,8 @@ const (
 	StepDone    = "done"
 )
 
-var steps = []string{StepFind, StepDelete, StepRewrite, StepExpire, StepPurge, StepSharing, StepHistory, StepModels, StepCache, StepVerify,
-	StepDone}
+var steps = []string{StepFind, StepDelete, StepRewrite, StepViews, StepExpire, StepPurge, StepSharing, StepHistory, StepModels, StepCache,
+	StepVerify, StepDone}
 
 func nextStep(step string) string {
 	for i, s := range steps {
@@ -164,6 +165,15 @@ type Request struct {
 	ModelBlobs      []string `json:"model_blobs,omitempty"`
 	ModelsFailed    []string `json:"models_failed,omitempty"`
 	ModelsLeft      []string `json:"models_left,omitempty"`
+	// ViewsSince is when its views step began, in this round of its steps:
+	// it replaces the materialized views and dynamic tables made from its
+	// tables before then (see Views). ViewsRebuilt counts those it
+	// replaced, ViewsFailed those it could not, with why, and ViewsLeft,
+	// once it was closed, those that may still hold the person's rows.
+	ViewsSince   time.Time `json:"views_since,omitzero"`
+	ViewsRebuilt int       `json:"views_rebuilt,omitempty"`
+	ViewsFailed  []string  `json:"views_failed,omitempty"`
+	ViewsLeft    []string  `json:"views_left,omitempty"`
 	// WorkersLeft are, once it was closed, the workers of distributed
 	// execution that had not purged what it deleted (see workersLeft).
 	WorkersLeft  []string      `json:"workers_left,omitempty"`
@@ -359,6 +369,10 @@ type Verification struct {
 	// models step, and the blobs that models it trained again had that
 	// object storage still has (see Models).
 	Models int64 `json:"models"`
+	// Views are materialized views and dynamic tables made from the tables
+	// whose own tables, or state, have a snapshot from before the request's
+	// views step (see Views).
+	Views int64 `json:"views"`
 	// Caches are the read caches of running replicas that were emptied
 	// since the request deleted files; Pending are those of replicas not
 	// running now, which are emptied when they start.

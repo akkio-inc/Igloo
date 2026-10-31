@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -253,6 +254,9 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			delete(c.tables, c.tableKey(ns, p[3]))
+			if purge, _ := strconv.ParseBool(r.URL.Query().Get("purgeRequested")); purge {
+				c.purge(t)
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodPost:
 			var change tableChange
@@ -586,6 +590,17 @@ func loadResult(t *tableState) map[string]any {
 
 func commitResponse(t *tableState) map[string]any {
 	return map[string]any{"metadata-location": t.metaLoc, "metadata": t.meta}
+}
+
+// purge deletes the files of t, a table dropped with purgeRequested, as
+// Lakekeeper's hard deletion does: its location, when it is a directory
+// under the catalog's own.
+func (c *Catalog) purge(t *tableState) {
+	loc := strings.TrimPrefix(t.meta.Location(), "file://")
+	if !strings.HasPrefix(c.location, "/") || !strings.HasPrefix(loc, c.location+"/") {
+		return
+	}
+	_ = os.RemoveAll(loc)
 }
 
 // tableKey is the key of the table or view ns.name. c.mu is held.
