@@ -356,6 +356,11 @@ func (pl *planner) keyInputs(c *candidate) error {
 			k.casts = append(k.casts, cast)
 		}
 	}
+	if len(c.keyed[0].keys) == 0 && len(c.keyed) > 1 {
+		if err := pl.expressionKeys(c); err != nil {
+			return err
+		}
+	}
 	if len(c.keyed[0].keys) == 0 {
 		names := make([]string, len(c.keyed))
 		for i, k := range c.keyed {
@@ -365,6 +370,148 @@ func (pl *planner) keyInputs(c *candidate) error {
 	}
 	pl.bucketKeyed(c)
 	return nil
+}
+
+// keyFunctions are the functions of one text argument whose equal values
+// expressionKeys partitions rows by: deterministic, of the text alone.
+var keyFunctions = map[string]bool{"upper": true, "lower": true, "ucase": true, "lcase": true, "trim": true, "ltrim": true, "rtrim": true}
+
+// keyTemplate returns the column an expression computes from through
+// keyFunctions alone, and the expression as a template of it, %s for the
+// column (upper(trim(%s))); ok is false for any other expression, a
+// column's own included.
+func keyTemplate(e node) (col node, tmpl string, ok bool) {
+	tmpl = "%s"
+	for {
+		switch str(e["class"]) {
+		case "COLUMN_REF":
+			return e, tmpl, tmpl != "%s"
+		case "FUNCTION":
+			name := strings.ToLower(str(e["function_name"]))
+			args := list(e, "children")
+			if !keyFunctions[name] || len(args) != 1 || str(e["schema"]) != "" || str(e["catalog"]) != "" || e["distinct"] == true ||
+				e["is_operator"] == true || child(e, "filter") != nil || len(list(child(e, "order_bys"), "orders")) > 0 {
+				return nil, "", false
+			}
+			tmpl = strings.Replace(tmpl, "%s", name+"(%s)", 1)
+			e, _ = args[0].(node)
+		default:
+			return nil, "", false
+		}
+	}
+}
+
+// expressionKeys keys a candidate's inputs read by partition, which no
+// equal columns join, by an expression of a column of each that its joins
+// make equal, the same on both sides (upper(m.name) = upper(s.name), as a
+// report joins its metrics): each input's rows are partitioned by the
+// expression's value, which the rows a join pairs share, so that each
+// partition holds every pair. The columns must be text of one type, and
+// the session's text compares by its bytes, as hashes do.
+func (pl *planner) expressionKeys(c *candidate) error {
+	sc := c.keyScope
+	byTemplate := map[string][][2]itemColumn{}
+	var templates []string
+	for _, cond := range sc.conds {
+		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" {
+			continue
+		}
+		l, lt, lok := keyTemplate(child(cond, "left"))
+		r, rt, rok := keyTemplate(child(cond, "right"))
+		if !lok || !rok || lt != rt {
+			continue
+		}
+		li, ri := resolveColumn(l, sc), resolveColumn(r, sc)
+		if li == nil || ri == nil || li == ri {
+			continue
+		}
+		if _, seen := byTemplate[lt]; !seen {
+			templates = append(templates, lt)
+		}
+		byTemplate[lt] = append(byTemplate[lt], [2]itemColumn{{li, strings.ToLower(lastName(l))}, {ri, strings.ToLower(lastName(r))}})
+	}
+	for _, tmpl := range templates {
+		for _, class := range equalityClasses(byTemplate[tmpl]) {
+			var cols []itemColumn
+			for _, k := range c.keyed {
+				i := slices.IndexFunc(class, func(ic itemColumn) bool { return ic.item == k.item })
+				if i < 0 {
+					cols = nil
+					break
+				}
+				cols = append(cols, class[i])
+			}
+			if cols == nil {
+				continue
+			}
+			typ := c.keyed[0].columnType(cols[0].name)
+			same := strings.HasPrefix(typ, "VARCHAR")
+			for i := range cols {
+				same = same && c.keyed[i].columnType(cols[i].name) == typ
+			}
+			if !same {
+				continue
+			}
+			collation, err := pl.collation()
+			if err != nil {
+				return err
+			}
+			if collation != "" {
+				return unsupported("a text join key under collation %s", collation)
+			}
+			for i, k := range c.keyed {
+				k.keys = append(k.keys, cols[i].name)
+				k.casts = append(k.casts, tmpl)
+			}
+		}
+	}
+	return nil
+}
+
+// equalityClasses returns the classes of columns that pairs make equal,
+// those of more than one column, in the order they appear.
+func equalityClasses(pairs [][2]itemColumn) [][]itemColumn {
+	parent := map[itemColumn]itemColumn{}
+	var order []itemColumn
+	var find func(x itemColumn) itemColumn
+	find = func(x itemColumn) itemColumn {
+		p, ok := parent[x]
+		if !ok {
+			parent[x] = x
+			order = append(order, x)
+			return x
+		}
+		if p == x {
+			return x
+		}
+		root := find(p)
+		parent[x] = root
+		return root
+	}
+	for _, p := range pairs {
+		if a, b := find(p[0]), find(p[1]); a != b {
+			parent[b] = a
+		}
+	}
+	index := map[itemColumn]int{}
+	var classes [][]itemColumn
+	for _, x := range order {
+		root := find(x)
+		i, ok := index[root]
+		if !ok {
+			i = len(classes)
+			index[root] = i
+			classes = append(classes, nil)
+		}
+		classes[i] = append(classes[i], x)
+	}
+	var out [][]itemColumn
+	for _, cl := range classes {
+		if len(cl) > 1 {
+			out = append(out, cl)
+		}
+	}
+	return out
 }
 
 // joinKeys returns the classes of columns of the candidate's FROM items

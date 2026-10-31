@@ -105,7 +105,9 @@ FROM ranked WHERE r <= 5 ORDER BY category, r`
 // reports: the cohorts are computed once, by workers, and written to an
 // exchange keyed by person, which the media, browsing, attribute and size
 // aggregations read partition by partition, counting distinct people in
-// place; only the signal-level rows reach the coordinator.
+// place; their signal-level rows are joined, compared and ranked on
+// workers too, partitioned by upper(...) of the columns they are joined
+// on, and only the ranks the statement keeps reach the coordinator.
 func TestAudienceReport(t *testing.T) {
 	h := audienceHarness(t)
 	if !h.check(audienceReport) {
@@ -113,22 +115,25 @@ func TestAudienceReport(t *testing.T) {
 	}
 	p := h.planOf(audienceReport)
 	// memberships, written once, through both branches of its UNION ALL,
-	// and the browsing subquery. audience and population, read once each
-	// and only filtering tables, are read as their queries by the cohorts'
-	// DISTINCTs, whose stages write each worker's distinct people, and
-	// whose second stages complete them and add the branches' labels.
-	if n, scans := relationExchanges(p, "people"); n != 2 || scans != 2 {
-		t.Errorf("%d relation exchanges and %d scans of people, want 2 and 2:\n%s", n, scans, p.describe())
+	// the audience and the population its branches read, the browsing
+	// subquery, the sizes and three kinds of signals, the distinct people
+	// of each counted in place, in partitions keyed by person, and the
+	// metrics, comparisons and ranks over them, joined on upper(...) of
+	// their columns and partitioned so.
+	if n, scans := relationExchanges(p, "people"); n != 9 || scans != 2 {
+		t.Errorf("%d relation exchanges and %d scans of people, want 9 and 2:\n%s", n, scans, p.describe())
 	}
 	// The sizes' and signals' groups, of the cohorts' and the tables'
 	// columns, which may be many, are completed by a last stage each.
-	if n := p.exchanges("aggregate"); n != 6 {
-		t.Errorf("%d stages wrote partial results to an exchange, want the 2 DISTINCTs' and 4 groups':\n%s", n, p.describe())
+	if n := p.exchanges("aggregate"); n != 4 {
+		t.Errorf("%d stages wrote partial results to an exchange, want the 4 groups':\n%s", n, p.describe())
 	}
-	// The sizes and three kinds of signals, the distinct people of each
-	// counted in place, in partitions keyed by person.
-	if n := coordinatorStages(p); n != 4 {
-		t.Errorf("%d stages send rows to the coordinator, want 4:\n%s", n, p.describe())
+	// Only the ranks' rows the statement keeps reach the coordinator.
+	if n := coordinatorStages(p); n != 1 {
+		t.Errorf("%d stages send rows to the coordinator, want 1:\n%s", n, p.describe())
+	}
+	if !slices.ContainsFunc(p.Stages, func(s *Stage) bool { return s.Out != nil && slices.Contains(s.Out.Casts, "upper(%s)") }) {
+		t.Errorf("no exchange partitioned by upper(...):\n%s", p.describe())
 	}
 	// memberships: the exchange both branches write.
 	writers := map[int]int{}

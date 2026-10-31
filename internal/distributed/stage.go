@@ -94,7 +94,9 @@ type Exchange struct {
 	Keys []string
 	// Casts are the types the keys are hashed as, or "" for their own:
 	// integers of every width are hashed as BIGINT, so that equal values of
-	// different types land in the same partition.
+	// different types land in the same partition. A cast may instead be an
+	// expression of the key, upper(%s), whose value is hashed (see
+	// keyExpression).
 	Casts []string
 	// purpose says what the exchange is for, in logs and tests.
 	purpose string
@@ -139,14 +141,23 @@ func (s *Stage) partitioned() bool {
 	return slices.ContainsFunc(s.Inputs, func(in Input) bool { return in.Exchange != nil && in.Partitioned })
 }
 
-// hashKey returns the expression a key column is hashed by.
+// hashKey returns the expression a key column is hashed by: the column, as
+// a type, or in an expression of it (see keyExpression).
 func hashKey(name, cast string) string {
 	e := quoteIdent(name)
-	if cast != "" {
+	switch {
+	case keyExpression(cast):
+		e = fmt.Sprintf(cast, e)
+	case cast != "":
 		e = "CAST(" + e + " AS " + cast + ")"
 	}
 	return e
 }
+
+// keyExpression says whether an exchange's key cast is an expression of
+// the key column, %s, such as upper(%s), rather than a type: rows are
+// partitioned by its value, as a join on upper(a.x) = upper(b.y) needs.
+func keyExpression(cast string) bool { return strings.Contains(cast, "%s") }
 
 // exchangeSQL wraps a stage's fragment for writing to its exchange: the
 // fragment's rows, renamed, with __b, the partition of each.

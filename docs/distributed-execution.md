@@ -234,7 +234,12 @@ In detail, a part runs distributed when:
   conditions of the same `SELECT`, or of a subquery in its `FROM` that
   passes the join's rows through (`SELECT ... FROM (SELECT ... FROM a JOIN
   b ON ...) AS x GROUP BY ...`), on equal columns of the same type
-  (integer types may mix).
+  (integer types may mix), or, where no columns are equal, on the same
+  `upper`, `lower` or `trim` of a text column on each side, as reports
+  join their metrics (`upper(m.name) = upper(s.name)`): each is
+  partitioned by that expression's value, so the rows it pairs meet. Not
+  under a `default_collation`, by which text that hashes apart compares
+  equal.
 - It may read views: a view reads as its query, its names resolved as in
   the view, so a view that passes a large table's rows through, filters
   them, or joins small tables to them, distributes like its query, and one

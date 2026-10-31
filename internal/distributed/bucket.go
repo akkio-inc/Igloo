@@ -183,6 +183,13 @@ func (pl *planner) bucketKeyed(c *candidate) {
 			why = append(why, fmt.Sprintf("%s is keyed by %d columns", t, len(k.keys)))
 			continue
 		}
+		if keyExpression(k.casts[0]) {
+			// Keyed by an expression of the column, which its buckets
+			// do not hold apart.
+			ok = false
+			why = append(why, fmt.Sprintf("%s is keyed by %s", t, fmt.Sprintf(k.casts[0], k.keys[0])))
+			continue
+		}
 		i := bucketOf(t, k.keys[0])
 		if i < 0 {
 			ok = false

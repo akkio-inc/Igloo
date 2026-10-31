@@ -55,10 +55,10 @@ const signalReport = `WITH cohorts AS (
   UNION ALL SELECT 'EVERYONE', c_custkey FROM (SELECT DISTINCT c_custkey FROM customer)),
 sizes AS (SELECT cohort, count(DISTINCT id) AS size FROM cohorts GROUP BY cohort),
 signals AS (
-  SELECT 'SHIPPING' AS category, e.dimension, e.name, c.cohort, count(DISTINCT o_custkey) AS people, avg(l_quantity) AS intensity
-  FROM lineitem JOIN orders ON o_orderkey = l_orderkey JOIN cohorts AS c ON c.id = o_custkey,
-    unnest([{'dimension': 'MODE', 'name': l_shipmode}, {'dimension': 'INSTRUCTION', 'name': l_shipinstruct},
-      {'dimension': 'SUPPLIER', 'name': CAST(l_suppkey % 60 AS VARCHAR)}]) AS u(e)
+  SELECT 'ORDERS' AS category, e.dimension, e.name, c.cohort, count(DISTINCT o_custkey) AS people, avg(o_totalprice) AS intensity
+  FROM orders JOIN cohorts AS c ON c.id = o_custkey,
+    unnest([{'dimension': 'PRIORITY', 'name': o_orderpriority}, {'dimension': 'CLERK', 'name': o_clerk},
+      {'dimension': 'STATUS', 'name': o_orderstatus}]) AS u(e)
   GROUP BY e.dimension, e.name, c.cohort),
 metrics AS (
   SELECT s.category, s.dimension, s.name, s.cohort, s.people, z.size, s.people / NULLIF(z.size, 0) AS share, s.intensity
@@ -137,7 +137,7 @@ var reportShapes = []struct{ group, query string }{
 // still reads, and why.
 func TestReportShapes(t *testing.T) {
 	h := newHarness(t, 0.02, 4, 3)
-	h.co.maxBroadcast = h.tables["orders"].Bytes - 1
+	h.co.maxBroadcast = h.tables["customer"].Bytes - 1
 	ctx := context.Background()
 	type tally struct {
 		clean, total int
