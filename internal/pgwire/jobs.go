@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,19 +23,22 @@ import (
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
-// Tasks, pipes, materialized views and alerts. DuckDB has none of them, so
-// Igloo carries out these statements itself and keeps the definitions in
-// the tasks store (package tasks):
+// Tasks, pipes, materialized views, dynamic tables and alerts. DuckDB has
+// none of them, so Igloo carries out these statements itself and keeps the
+// definitions in the tasks store (package tasks):
 //
 //	CREATE [OR REPLACE] TASK [IF NOT EXISTS] name SCHEDULE 'spec' [TIMEZONE 'tz'] AS statement
 //	CREATE [OR REPLACE] PIPE [IF NOT EXISTS] name [SCHEDULE 'spec' [TIMEZONE 'tz']] AS COPY INTO ...
 //	CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name [SCHEDULE 'spec' [TIMEZONE 'tz']] AS query
+//	CREATE [OR REPLACE] DYNAMIC TABLE [IF NOT EXISTS] name TARGET_LAG = 'lag' | DOWNSTREAM [WAREHOUSE = w]
+//		[REFRESH_MODE = AUTO | FULL | INCREMENTAL] [INITIALIZE = ON_CREATE | ON_SCHEDULE] AS query
 //	CREATE [OR REPLACE] ALERT [IF NOT EXISTS] name SCHEDULE 'spec' [TIMEZONE 'tz'] IF (EXISTS (query)) THEN NOTIFY ...
 //	ALTER TASK | PIPE | MATERIALIZED VIEW | ALERT [IF EXISTS] name RESUME | SUSPEND | SET SCHEDULE 'spec' [TIMEZONE 'tz']
-//	DROP TASK | PIPE | MATERIALIZED VIEW | ALERT [IF EXISTS] name
+//	ALTER DYNAMIC TABLE [IF EXISTS] name RESUME | SUSPEND | REFRESH | SET TARGET_LAG = 'lag' | DOWNSTREAM [WAREHOUSE = w]
+//	DROP TASK | PIPE | MATERIALIZED VIEW | DYNAMIC TABLE | ALERT [IF EXISTS] name
 //	EXECUTE TASK | ALERT name
 //	REFRESH MATERIALIZED VIEW name
-//	SHOW TASKS | PIPES | MATERIALIZED VIEWS | ALERTS
+//	SHOW TASKS | PIPES | MATERIALIZED VIEWS | DYNAMIC TABLES [LIKE 'pattern'] [IN ...] | ALERTS
 //
 // What an alert does, IF ... THEN NOTIFY ..., is in alerts.go.
 //
@@ -55,10 +60,20 @@ type jobCommand struct {
 	replace, ifExists, ifNotExists bool
 	// schedule and timezone, when set, are the SCHEDULE and TIMEZONE.
 	schedule, timezone *string
-	// action is ALTER's RESUME, SUSPEND or SCHEDULE.
+	// action is ALTER's RESUME, SUSPEND, SCHEDULE or LAG.
 	action string
 	// body is what follows CREATE's AS.
 	body string
+	// lag, warehouse, refreshMode and initialize are a dynamic table's
+	// TARGET_LAG (DOWNSTREAM, or the lag as written), WAREHOUSE,
+	// REFRESH_MODE and INITIALIZE.
+	lag, warehouse          *string
+	refreshMode, initialize string
+	// like and schema are SHOW's LIKE pattern and IN SCHEMA.
+	like   *string
+	schema string
+	// notices are said to the client: options accepted and ignored.
+	notices []string
 }
 
 // parseJobCommand recognizes the statements above. ok is false for any
@@ -73,6 +88,8 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			c.kind = tasks.KindPipe
 		case sc.keywords("MATERIALIZED", "VIEW"):
 			c.kind = tasks.KindMaterializedView
+		case sc.keywords("DYNAMIC", "TABLE"):
+			c.kind = tasks.KindDynamicTable
 		case sc.keywords("ALERT"):
 			c.kind = tasks.KindAlert
 		default:
@@ -88,6 +105,8 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			c.kind = tasks.KindPipe
 		case sc.keywords("MATERIALIZED", "VIEWS"):
 			c.kind = tasks.KindMaterializedView
+		case sc.keywords("DYNAMIC", "TABLES"):
+			c.kind = tasks.KindDynamicTable
 		case sc.keywords("ALERTS"):
 			c.kind = tasks.KindAlert
 		default:
@@ -123,6 +142,28 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			return c, false, nil
 		}
 		c.verb = "SHOW"
+		if tasks.Refreshed(c.kind) {
+			if sc.keywords("LIKE") {
+				if c.like, ok = sc.literal(); !ok || c.like == nil {
+					return c, true, jobSyntax("LIKE takes a string, such as LIKE 'daily%%'")
+				}
+			}
+			if sc.keywords("IN") {
+				switch {
+				case sc.keywords("ACCOUNT"):
+				case sc.keywords("DATABASE"):
+					sc.name()
+				case sc.keywords("SCHEMA"):
+					name, ok := sc.name()
+					if !ok {
+						return c, true, jobSyntax("IN SCHEMA needs a schema")
+					}
+					c.schema = name[len(name)-1]
+				default:
+					return c, true, jobSyntax("expected IN ACCOUNT, IN DATABASE or IN SCHEMA after SHOW %s", c.plural())
+				}
+			}
+		}
 		if !sc.done() {
 			return c, true, jobSyntax("unexpected text after SHOW %s", c.plural())
 		}
@@ -141,7 +182,7 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 	if c.name, ok = sc.name(); !ok {
 		return c, true, jobSyntax("%s needs a name", what)
 	}
-	if c.kind != tasks.KindMaterializedView && len(c.name) != 1 {
+	if !tasks.Refreshed(c.kind) && len(c.name) != 1 {
 		return c, true, jobSyntax("%s names are not qualified: %s", c.kind, strings.Join(c.name, "."))
 	}
 
@@ -164,7 +205,14 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 	}
 	switch c.verb {
 	case "CREATE":
-		if sc.keywords("SCHEDULE") {
+		if c.kind == tasks.KindDynamicTable {
+			if err := c.dynamicOptions(sc, false); err != nil {
+				return c, true, err
+			}
+			if c.lag == nil {
+				return c, true, jobSyntax("CREATE DYNAMIC TABLE needs a TARGET_LAG, such as TARGET_LAG = '5 minutes' or TARGET_LAG = DOWNSTREAM")
+			}
+		} else if sc.keywords("SCHEDULE") {
 			if err := scheduleClause(); err != nil {
 				return c, true, err
 			}
@@ -182,6 +230,10 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			return c, true, nil
 		}
 		if !sc.keywords("AS") {
+			if c.kind == tasks.KindDynamicTable {
+				return c, true, jobSyntax("expected TARGET_LAG = '...' [WAREHOUSE = ...] [REFRESH_MODE = ...] [INITIALIZE = ...] AS ... after %s %s",
+					what, strings.Join(c.name, "."))
+			}
 			return c, true, jobSyntax("expected [SCHEDULE '...' [TIMEZONE '...']] AS ... after %s %s", what, strings.Join(c.name, "."))
 		}
 		c.body = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sc.rest()), ";"))
@@ -198,6 +250,18 @@ func parseJobCommand(query string) (c jobCommand, ok bool, err error) {
 			c.action = "RESUME"
 		case sc.keywords("SUSPEND"):
 			c.action = "SUSPEND"
+		case c.kind == tasks.KindDynamicTable && sc.keywords("REFRESH"):
+			c.verb = "REFRESH"
+		case c.kind == tasks.KindDynamicTable && sc.keywords("SET"):
+			c.action = "LAG"
+			if err := c.dynamicOptions(sc, true); err != nil {
+				return c, true, err
+			}
+			if c.lag == nil && c.warehouse == nil {
+				return c, true, jobSyntax("expected TARGET_LAG = '...' or WAREHOUSE = ... after ALTER DYNAMIC TABLE %s SET", strings.Join(c.name, "."))
+			}
+		case c.kind == tasks.KindDynamicTable:
+			return c, true, jobSyntax("expected RESUME, SUSPEND, REFRESH or SET TARGET_LAG after %s %s", what, strings.Join(c.name, "."))
 		case sc.keywords("SET", "SCHEDULE"):
 			c.action = "SCHEDULE"
 			if err := scheduleClause(); err != nil {
@@ -217,9 +281,89 @@ func jobSyntax(format string, args ...any) error {
 	return pgerror.WithCode(fmt.Errorf(format, args...), codes.Syntax)
 }
 
+// dynamicOptions reads a dynamic table's options, in any order: TARGET_LAG,
+// WAREHOUSE, REFRESH_MODE and INITIALIZE, and Snowflake's options Igloo
+// accepts and ignores, with a notice. alter says they follow ALTER ...
+// SET, which takes TARGET_LAG and WAREHOUSE.
+func (c *jobCommand) dynamicOptions(sc *scanner, alter bool) error {
+	for {
+		switch w := sc.word(); {
+		case w == "TARGET_LAG":
+			sc.keywords(w)
+			sc.punct('=')
+			if sc.keywords("DOWNSTREAM") {
+				v := "DOWNSTREAM"
+				c.lag = &v
+				continue
+			}
+			lag, ok := sc.literal()
+			if !ok || lag == nil {
+				return jobSyntax("TARGET_LAG takes a string, such as TARGET_LAG = '5 minutes', or DOWNSTREAM")
+			}
+			c.lag = lag
+		case w == "WAREHOUSE":
+			sc.keywords(w)
+			sc.punct('=')
+			name, ok := sc.name()
+			if !ok {
+				return jobSyntax("WAREHOUSE takes a name")
+			}
+			v := strings.Join(name, ".")
+			c.warehouse = &v
+			c.notices = append(c.notices, "WAREHOUSE is ignored: Igloo has no warehouses, and refreshes run on the replica that holds the job "+
+				"(see docs/workload-management.md for compute pools)")
+		case !alter && w == "REFRESH_MODE":
+			sc.keywords(w)
+			sc.punct('=')
+			switch m := sc.word(); m {
+			case refreshAuto, refreshFull, refreshIncremental:
+				sc.keywords(m)
+				c.refreshMode = m
+			default:
+				return jobSyntax("REFRESH_MODE is AUTO, FULL or INCREMENTAL")
+			}
+		case !alter && w == "INITIALIZE":
+			sc.keywords(w)
+			sc.punct('=')
+			switch m := sc.word(); m {
+			case "ON_CREATE", "ON_SCHEDULE":
+				sc.keywords(m)
+				c.initialize = m
+			default:
+				return jobSyntax("INITIALIZE is ON_CREATE or ON_SCHEDULE")
+			}
+		case !alter && w == "COMMENT":
+			sc.keywords(w)
+			sc.punct('=')
+			if _, ok := sc.literal(); !ok {
+				return jobSyntax("COMMENT takes a string")
+			}
+			c.notices = append(c.notices, "COMMENT is ignored: use COMMENT ON TABLE")
+		case w == "DATA_RETENTION_TIME_IN_DAYS" || w == "MAX_DATA_EXTENSION_TIME_IN_DAYS":
+			sc.keywords(w)
+			sc.punct('=')
+			sc.skip()
+			j := sc.i
+			for j < len(sc.s) && sc.s[j] >= '0' && sc.s[j] <= '9' {
+				j++
+			}
+			if j == sc.i {
+				return jobSyntax("%s takes a number of days", w)
+			}
+			sc.i = j
+			c.notices = append(c.notices, w+" is ignored: Igloo keeps snapshots as table maintenance says (see docs/operations.md)")
+		default:
+			return nil
+		}
+	}
+}
+
 func (c jobCommand) plural() string {
-	if c.kind == tasks.KindMaterializedView {
+	switch c.kind {
+	case tasks.KindMaterializedView:
 		return "MATERIALIZED VIEWS"
+	case tasks.KindDynamicTable:
+		return "DYNAMIC TABLES"
 	}
 	return strings.ToUpper(c.kind) + "S"
 }
@@ -230,12 +374,48 @@ func (c jobCommand) tag() string {
 	case "EXECUTE":
 		return "EXECUTE " + strings.ToUpper(c.kind)
 	case "REFRESH":
+		if c.kind == tasks.KindDynamicTable {
+			return "ALTER DYNAMIC TABLE"
+		}
 		return "REFRESH MATERIALIZED VIEW"
 	}
 	return c.verb + " " + strings.ToUpper(c.kind)
 }
 
-// jobColumns describe SHOW TASKS, PIPES and MATERIALIZED VIEWS.
+// mvColumns describe SHOW MATERIALIZED VIEWS: jobColumns, and how it is
+// refreshed.
+var mvColumns = append(slices.Clone(jobColumns),
+	wire.Column{Name: "refresh_mode", Oid: pgtype.TextOID, Width: -1},
+	wire.Column{Name: "refresh_mode_reason", Oid: pgtype.TextOID, Width: -1},
+	wire.Column{Name: "last_refresh_action", Oid: pgtype.TextOID, Width: -1},
+	wire.Column{Name: "last_refresh_detail", Oid: pgtype.TextOID, Width: -1},
+	wire.Column{Name: "data_timestamp", Oid: pgtype.TimestamptzOID, Width: 8},
+)
+
+// dynamicColumns describe SHOW DYNAMIC TABLES, with Snowflake's names
+// where Snowflake has the column.
+var dynamicColumns = wire.Columns{
+	{Name: "created_on", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "name", Oid: pgtype.TextOID, Width: -1},
+	{Name: "database_name", Oid: pgtype.TextOID, Width: -1},
+	{Name: "schema_name", Oid: pgtype.TextOID, Width: -1},
+	{Name: "owner", Oid: pgtype.TextOID, Width: -1},
+	{Name: "target_lag", Oid: pgtype.TextOID, Width: -1},
+	{Name: "refresh_mode", Oid: pgtype.TextOID, Width: -1},
+	{Name: "refresh_mode_reason", Oid: pgtype.TextOID, Width: -1},
+	{Name: "warehouse", Oid: pgtype.TextOID, Width: -1},
+	{Name: "text", Oid: pgtype.TextOID, Width: -1},
+	{Name: "scheduling_state", Oid: pgtype.TextOID, Width: -1},
+	{Name: "data_timestamp", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "next_run", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "last_run", Oid: pgtype.TimestamptzOID, Width: 8},
+	{Name: "last_outcome", Oid: pgtype.TextOID, Width: -1},
+	{Name: "last_error", Oid: pgtype.TextOID, Width: -1},
+	{Name: "last_refresh_action", Oid: pgtype.TextOID, Width: -1},
+	{Name: "last_refresh_detail", Oid: pgtype.TextOID, Width: -1},
+}
+
+// jobColumns describe SHOW TASKS, PIPES and ALERTS.
 var jobColumns = wire.Columns{
 	{Name: "name", Oid: pgtype.TextOID, Width: -1},
 	{Name: "owner", Oid: pgtype.TextOID, Width: -1},
@@ -287,9 +467,16 @@ func (s *Server) loadingCommand(sess *session, query string) (wire.PreparedState
 	}
 	var opts []wire.PreparedOptionFn
 	if job.verb == "SHOW" {
-		opts = append(opts, wire.WithColumns(jobColumns))
+		switch job.kind {
+		case tasks.KindMaterializedView:
+			opts = append(opts, wire.WithColumns(mvColumns))
+		case tasks.KindDynamicTable:
+			opts = append(opts, wire.WithColumns(dynamicColumns))
+		default:
+			opts = append(opts, wire.WithColumns(jobColumns))
+		}
 	}
-	return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+	return withNotices(wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
 		start := time.Now()
 		tw := &tagWriter{DataWriter: w}
 		// What the command read and wrote, for the history.
@@ -307,7 +494,7 @@ func (s *Server) loadingCommand(sess *session, query string) (wire.PreparedState
 		s.recordQuery(sess, queryRecord{text: query, start: start, err: err, rows: tw.rows(),
 			written: rec.written, analyze: rec.analyze, stmtType: rec.stmtType})
 		return pgError(err)
-	}, opts...)), true, nil
+	}, opts...)), job.notices), true, nil
 }
 
 // runJobCommand carries out c. A command that creates a materialized view
@@ -351,9 +538,12 @@ func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.Use
 	case "ALTER":
 		err = s.alterJob(ctx, user, c, j)
 	case "DROP":
-		if c.kind == tasks.KindMaterializedView {
+		if tasks.Refreshed(c.kind) {
 			schema, table, _ := strings.Cut(j.Name, ".")
 			err = s.execDDL(ctx, sess, user, "DROP TABLE IF EXISTS "+quoteName([]string{s.catalogName(), schema, table}))
+			if err == nil {
+				s.dropViewState(ctx, sess, j)
+			}
 		}
 		if err == nil {
 			if err = store.DropJob(ctx, c.kind, j.Name); errors.Is(err, tasks.ErrNotFound) {
@@ -394,9 +584,9 @@ func (s *Server) disownJobs(name string) {
 }
 
 // jobName is the name c's job is stored under: a task's or pipe's name,
-// or a materialized view's schema.table in the catalog.
+// or a materialized view's or dynamic table's schema.table in the catalog.
 func (s *Server) jobName(ctx context.Context, sess *session, c jobCommand) (string, error) {
-	if c.kind != tasks.KindMaterializedView {
+	if !tasks.Refreshed(c.kind) {
 		name := c.name[0]
 		if !config.ValidName(name) {
 			return "", pgerror.WithCode(fmt.Errorf("invalid %s name %q: use lowercase letters, digits and underscores", c.kind, name),
@@ -407,8 +597,8 @@ func (s *Server) jobName(ctx context.Context, sess *session, c jobCommand) (stri
 	if c.verb == "CREATE" {
 		o, err := s.newTableTarget(ctx, sess, c.name)
 		if errors.Is(err, errNoGrantPath) {
-			err = pgerror.WithCode(fmt.Errorf("materialized views are tables of the %s catalog; %s is not one",
-				s.catalogName(), strings.Join(c.name, ".")), codes.FeatureNotSupported)
+			err = pgerror.WithCode(fmt.Errorf("%ss are tables of the %s catalog; %s is not one",
+				c.kind, s.catalogName(), strings.Join(c.name, ".")), codes.FeatureNotSupported)
 		}
 		if err != nil {
 			return "", err
@@ -428,7 +618,7 @@ func (s *Server) jobName(ctx context.Context, sess *session, c jobCommand) (stri
 
 func jobMissing(c jobCommand, name string) error {
 	code := codes.UndefinedObject
-	if c.kind == tasks.KindMaterializedView {
+	if tasks.Refreshed(c.kind) {
 		code = codes.UndefinedTable
 	}
 	return pgerror.WithCode(fmt.Errorf("%s %s does not exist", c.kind, name), code)
@@ -468,6 +658,23 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 			return err
 		}
 	}
+	var state refreshState
+	if c.kind == tasks.KindDynamicTable {
+		state = refreshState{Mode: refreshAuto, Lag: *c.lag}
+		if c.refreshMode != "" {
+			state.Mode = c.refreshMode
+		}
+		if c.warehouse != nil {
+			state.Warehouse = *c.warehouse
+		}
+		spec, err := lagSchedule(*c.lag)
+		if err != nil {
+			return err
+		}
+		if spec != "" {
+			c.schedule = &spec
+		}
+	}
 	if c.schedule != nil {
 		tz := ""
 		if c.timezone != nil {
@@ -486,6 +693,29 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 	}
 
 	existing, err := store.Job(ctx, c.kind, name)
+	if tasks.Refreshed(c.kind) && errors.Is(err, tasks.ErrNotFound) {
+		// A materialized view and a dynamic table are tables: one name, one
+		// table.
+		other := tasks.KindDynamicTable
+		if c.kind == tasks.KindDynamicTable {
+			other = tasks.KindMaterializedView
+		}
+		if o, oerr := store.Job(ctx, other, name); oerr == nil {
+			if !c.replace {
+				return pgerror.WithCode(fmt.Errorf("%s is a %s", name, other), codes.DuplicateRelation)
+			}
+			if o.Owner != user.Name && user.Role != auth.RoleAdmin {
+				return pgerror.WithCode(fmt.Errorf("permission denied: %s %s belongs to %s; only its owner or an admin may replace it",
+					other, name, o.Owner), codes.InsufficientPrivilege)
+			}
+			defer func() {
+				if err := store.DropJob(context.WithoutCancel(ctx), other, name); err != nil && !errors.Is(err, tasks.ErrNotFound) {
+					s.log.Warn("could not drop the job a table replaced", "kind", other, "name", name, "err", err)
+				}
+				s.dropViewState(ctx, sess, o)
+			}()
+		}
+	}
 	switch {
 	case err == nil && c.ifNotExists:
 		return nil
@@ -548,27 +778,52 @@ func (s *Server) createJob(ctx context.Context, sess *session, user auth.User, c
 			return err
 		}
 		j.Statement = def.encode()
-	case tasks.KindMaterializedView:
+	case tasks.KindMaterializedView, tasks.KindDynamicTable:
 		if n, err := s.engine.CountStatements(c.body); err != nil || n != 1 || !selectLike(c.body) {
-			return pgerror.WithCode(errors.New("a materialized view is defined by one query: CREATE MATERIALIZED VIEW name AS SELECT ..."),
+			return pgerror.WithCode(fmt.Errorf("a %s is defined by one query: CREATE %s name AS SELECT ...", c.kind, strings.ToUpper(c.kind)),
 				codes.Syntax)
 		}
 		j.Statement = c.body
+		// Whether it can be refreshed incrementally, as SHOW says, and as
+		// REFRESH_MODE = INCREMENTAL requires. A query that cannot be read
+		// fails below, as creating its table does.
+		if reason, err := s.refreshReason(ctx, sess, user, c.body); err == nil && reason == "" {
+			state.Incremental = true
+		} else if err == nil {
+			state.Reason = reason
+			if state.Mode == refreshIncremental {
+				return pgerror.WithCode(fmt.Errorf("%s %s cannot be refreshed incrementally: %s; use REFRESH_MODE = AUTO or FULL", c.kind, name, reason),
+					codes.FeatureNotSupported)
+			}
+		}
+		if c.kind == tasks.KindMaterializedView {
+			state.Mode = refreshAuto
+		}
+		j.Refresh = state.encode()
 		schema, table, _ := strings.Cut(name, ".")
 		create := "CREATE TABLE "
 		if c.replace {
 			create = "CREATE OR REPLACE TABLE "
 		}
-		create += quoteName([]string{s.catalogName(), schema, table}) + " AS " + c.body
+		body := c.body
+		if c.initialize == "ON_SCHEDULE" {
+			// Its first refresh fills it.
+			body = "SELECT * FROM (" + c.body + ") AS initialize WHERE false"
+		}
+		create += quoteName([]string{s.catalogName(), schema, table}) + " AS " + body
 		if err := s.execDDL(ctx, sess, user, create); err != nil {
 			return err
 		}
 		rec.written = []auth.Object{{Schema: schema, Table: table}}
 		rec.analyze, rec.stmtType = s.rewrite(ctx, sess, user, create), duckdb.STATEMENT_TYPE_CREATE
+		if err == nil && existing.Refresh != "" {
+			// The state of what it replaced.
+			s.dropViewState(ctx, sess, existing)
+		}
 	}
-	// A materialized view's table is in place by now, so its definition
-	// goes with it, whatever was there.
-	err = store.CreateJob(ctx, j, c.replace || c.kind == tasks.KindMaterializedView)
+	// A materialized view's or dynamic table's table is in place by now,
+	// so its definition goes with it, whatever was there.
+	err = store.CreateJob(ctx, j, c.replace || tasks.Refreshed(c.kind))
 	if errors.Is(err, tasks.ErrExists) {
 		return pgerror.WithCode(fmt.Errorf("%s %s already exists", c.kind, name), codes.DuplicateObject)
 	}
@@ -591,6 +846,14 @@ func (s *Server) alterJob(ctx context.Context, user auth.User, c jobCommand, j t
 		if err := needsWriter(user, "ALTER "+strings.ToUpper(c.kind)+" ... RESUME"); err != nil {
 			return err
 		}
+		if j.Schedule == "" && j.Kind == tasks.KindDynamicTable {
+			// Its TARGET_LAG is DOWNSTREAM: it refreshes before the dynamic
+			// tables that read it do, while it is resumed.
+			if err := store.SetState(ctx, j.Kind, j.Name, tasks.StateStarted, time.Time{}); err != nil {
+				return err
+			}
+			break
+		}
 		if j.Schedule == "" {
 			return pgerror.WithCode(fmt.Errorf("%s %s has no schedule; give it one with SET SCHEDULE", c.kind, j.Name),
 				codes.ObjectNotInPrerequisiteState)
@@ -606,6 +869,33 @@ func (s *Server) alterJob(ctx context.Context, user auth.User, c jobCommand, j t
 			next = now
 		}
 		if err := store.SetState(ctx, j.Kind, j.Name, tasks.StateStarted, next); err != nil {
+			return err
+		}
+	case "LAG":
+		if err := needsWriter(user, "ALTER DYNAMIC TABLE ... SET"); err != nil {
+			return err
+		}
+		st := decodeRefresh(j.Refresh)
+		if c.warehouse != nil {
+			st.Warehouse = *c.warehouse
+		}
+		if c.lag != nil {
+			spec, err := lagSchedule(*c.lag)
+			if err != nil {
+				return err
+			}
+			st.Lag = *c.lag
+			next := time.Time{}
+			if spec != "" && j.State == tasks.StateStarted {
+				if _, next, err = parseSchedule(spec, "", now); err != nil {
+					return err
+				}
+			}
+			if err := store.SetSchedule(ctx, j.Kind, j.Name, spec, "", next); err != nil {
+				return err
+			}
+		}
+		if err := store.SetRefresh(ctx, j.Kind, j.Name, st.encode()); err != nil {
 			return err
 		}
 	case "SCHEDULE":
@@ -647,6 +937,12 @@ func (s *Server) showJobs(ctx context.Context, user auth.User, c jobCommand, w w
 		if j.Owner != user.Name && user.Role != auth.RoleAdmin {
 			continue
 		}
+		if tasks.Refreshed(j.Kind) {
+			if err := s.showView(c, j, w); err != nil {
+				return err
+			}
+			continue
+		}
 		definition := j.Statement
 		if j.Kind == tasks.KindAlert {
 			definition = alertDefinition(j.Statement)
@@ -664,6 +960,91 @@ func (s *Server) showJobs(ctx context.Context, user auth.User, c jobCommand, w w
 		}
 	}
 	return w.Complete(fmt.Sprintf("SELECT %d", w.Written()))
+}
+
+// showView writes the row of SHOW MATERIALIZED VIEWS or SHOW DYNAMIC
+// TABLES for j, if it matches c's LIKE and IN SCHEMA.
+func (s *Server) showView(c jobCommand, j tasks.Job, w wire.DataWriter) error {
+	st := decodeRefresh(j.Refresh)
+	schema, table, _ := strings.Cut(j.Name, ".")
+	if c.schema != "" && !strings.EqualFold(c.schema, schema) {
+		return nil
+	}
+	if c.like != nil && !likeMatch(strings.ToLower(*c.like), table) {
+		return nil
+	}
+	reason := any(nil)
+	if !st.Incremental && st.Reason != "" {
+		reason = st.Reason
+	}
+	mode := st.Mode
+	if mode == refreshAuto {
+		// What AUTO comes to, as Snowflake shows it.
+		mode = refreshFull
+		if st.Incremental {
+			mode = refreshIncremental
+		}
+	}
+	var lastRun, lastOutcome, lastError any
+	if r := j.LastRun; r != nil {
+		lastRun, lastOutcome, lastError = r.Start, r.Outcome, nullText(r.Error)
+	}
+	if j.Kind == tasks.KindDynamicTable {
+		scheduling := "RUNNING"
+		if j.State != tasks.StateStarted {
+			scheduling = "SUSPENDED"
+		}
+		return w.Row([]any{j.CreatedAt, table, s.catalogName(), schema, j.Owner, st.Lag, mode, reason, nullText(st.Warehouse), j.Statement,
+			scheduling, nullTime(st.DataTimestamp), nullTime(j.NextRun), lastRun, lastOutcome, lastError, nullText(st.Action), nullText(st.Detail)})
+	}
+	row := []any{j.Name, j.Owner, j.State, nullText(j.Schedule), nullText(j.Timezone), nullTime(j.NextRun),
+		lastRun, lastOutcome, lastError, j.Statement, j.CreatedAt, mode, reason, nullText(st.Action), nullText(st.Detail), nullTime(st.DataTimestamp)}
+	if j.Schedule != "" && j.Timezone == "" {
+		row[4] = "UTC"
+	}
+	return w.Row(row)
+}
+
+// lagSchedule turns a dynamic table's TARGET_LAG into the schedule of its
+// refreshes: every half of the lag, at least every 30 seconds apart, so
+// that its data stays within the lag while a refresh takes less than half
+// of it. DOWNSTREAM has none: the table refreshes before those that read
+// it.
+func lagSchedule(lag string) (string, error) {
+	if strings.EqualFold(lag, "DOWNSTREAM") {
+		return "", nil
+	}
+	fields := strings.Fields(strings.ToLower(lag))
+	bad := pgerror.WithCode(fmt.Errorf("TARGET_LAG %q is not a lag such as '90 seconds', '5 minutes', '2 hours' or '1 day', or DOWNSTREAM", lag),
+		codes.InvalidParameterValue)
+	if len(fields) != 2 {
+		return "", bad
+	}
+	n, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || n <= 0 {
+		return "", bad
+	}
+	var unit time.Duration
+	switch strings.TrimSuffix(fields[1], "s") {
+	case "second":
+		unit = time.Second
+	case "minute":
+		unit = time.Minute
+	case "hour":
+		unit = time.Hour
+	case "day":
+		unit = 24 * time.Hour
+	default:
+		return "", bad
+	}
+	if n > int64(366*24*time.Hour/unit) {
+		return "", bad
+	}
+	d := time.Duration(n) * unit
+	if d < time.Minute {
+		return "", pgerror.WithCode(fmt.Errorf("TARGET_LAG %q is under a minute, the shortest lag", lag), codes.InvalidParameterValue)
+	}
+	return strconv.FormatInt(int64(max(d/2, 30*time.Second)/time.Second), 10) + " seconds", nil
 }
 
 func nullText(s string) any {
@@ -777,20 +1158,31 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 			written: written, locations: []string{cp.location}})
 		return rows, err
 
-	case tasks.KindMaterializedView:
+	case tasks.KindMaterializedView, tasks.KindDynamicTable:
+		if j.Kind == tasks.KindDynamicTable {
+			if err := s.refreshUpstream(ctx, sess, j); err != nil {
+				return -1, err
+			}
+		}
 		start := time.Now()
-		var (
-			rows     int64
-			policies []string
-		)
-		err := sess.runCancelable(ctx, "REFRESH MATERIALIZED VIEW "+j.Name, func(ctx context.Context) error {
+		var res refreshResult
+		schema, table, _ := strings.Cut(j.Name, ".")
+		text := "REFRESH MATERIALIZED VIEW " + quoteName([]string{schema, table})
+		if j.Kind == tasks.KindDynamicTable {
+			text = "ALTER DYNAMIC TABLE " + quoteName([]string{schema, table}) + " REFRESH"
+		}
+		err := sess.runCancelable(ctx, text, func(ctx context.Context) error {
 			var err error
-			rows, policies, err = s.refreshMaterializedView(ctx, sess, owner, j)
+			res, err = s.refreshView(ctx, sess, owner, j)
 			return err
 		})
-		schema, table, _ := strings.Cut(j.Name, ".")
-		s.recordQuery(sess, queryRecord{text: "REFRESH MATERIALIZED VIEW " + quoteName([]string{schema, table}),
-			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: policies,
+		rows := res.rows
+		if err != nil {
+			rows = -1
+		}
+		used := res.used
+		s.recordQuery(sess, queryRecord{text: text, used: &used,
+			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: res.policies,
 			analyze:  s.rewrite(ctx, sess, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
 			stmtType: duckdb.STATEMENT_TYPE_CREATE})
 		return rows, err
@@ -840,76 +1232,20 @@ func (r *taskResult) Complete(tag string) error {
 	return nil
 }
 
-// refreshMaterializedView replaces the rows of j's table with its query's,
-// as user, in one transaction: queries see the old rows or the new ones,
-// never neither. It is what CREATE OR REPLACE TABLE ... AS does, and needs
-// the same privileges, which is how it is checked.
-func (s *Server) refreshMaterializedView(ctx context.Context, sess *session, user auth.User, j tasks.Job) (int64, []string, error) {
-	schema, table, _ := strings.Cut(j.Name, ".")
-	qualified := quoteName([]string{s.catalogName(), schema, table})
-	if n, err := s.engine.CountStatements(j.Statement); err != nil || n != 1 || !selectLike(j.Statement) {
-		return -1, nil, fmt.Errorf("the definition of materialized view %s is not one query", j.Name)
-	}
-	st, err := s.prepareChecked(ctx, sess, user, "CREATE OR REPLACE TABLE "+qualified+" AS "+j.Statement, nil)
-	if err != nil {
-		return -1, nil, err
-	}
-	_ = st.close()
-	// What runs is the query as policies rewrite it for user, so the view
-	// holds what its owner may see of protected tables.
-	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, j.Statement), nil)
-	if err != nil {
-		return -1, nil, pgError(err)
-	}
-
-	exec := func(ctx context.Context, q string) (int64, error) {
-		res, err := sess.conn.ExecContext(ctx, q, nil)
-		if err != nil {
-			return 0, err
-		}
-		return res.RowsAffected()
-	}
-	backoff := 20 * time.Millisecond
-	for attempt := 0; ; attempt++ {
-		var rows int64
-		// The DELETE and INSERT resolve the table and commit a new snapshot,
-		// which reach the catalog's in-memory set; hold the exclusive side
-		// around each attempt, releasing it before any backoff (see
-		// holdCatalog).
-		releaseCatalog := s.holdCatalog(sess)
-		_, err := exec(ctx, "BEGIN")
-		if err == nil {
-			_, err = exec(ctx, "DELETE FROM "+qualified)
-		}
-		if err == nil {
-			rows, err = exec(ctx, "INSERT INTO "+qualified+" SELECT * FROM ("+query+") AS refresh")
-		}
-		if err == nil {
-			if _, err = exec(ctx, "COMMIT"); err == nil {
-				releaseCatalog()
-				return rows, g.applied, nil
-			}
-		}
-		_, _ = exec(context.WithoutCancel(ctx), "ROLLBACK")
-		releaseCatalog()
-		if !commitConflict(err) || attempt == maxCommitRetries {
-			return -1, nil, pgError(err)
-		}
-		select {
-		case <-ctx.Done():
-			return -1, nil, ctx.Err()
-		case <-time.After(backoff):
-		}
-		backoff = min(2*backoff, time.Second)
-	}
-}
-
-// tableGone drops the load history and materialized view of a catalog
-// table that was dropped, or moves them to its new name if it was renamed.
-func (s *Server) tableGone(ctx context.Context, o auth.Object, renameTo string) {
+// tableGone drops the load history and the materialized view or dynamic
+// table of a catalog table that was dropped, with its state, or moves them
+// to its new name if it was renamed.
+func (s *Server) tableGone(ctx context.Context, sess *session, o auth.Object, renameTo string) {
 	store := s.tasks.Store()
 	table := s.catalogName() + "." + o.String()
 	var err error
+	if renameTo == "" {
+		for _, kind := range []string{tasks.KindMaterializedView, tasks.KindDynamicTable} {
+			if j, jerr := store.Job(ctx, kind, o.String()); jerr == nil {
+				s.dropViewState(ctx, sess, j)
+			}
+		}
+	}
 	if renameTo != "" {
 		err = store.RenameTable(ctx, table, s.catalogName()+"."+auth.Object{Schema: o.Schema, Table: renameTo}.String())
 	} else {

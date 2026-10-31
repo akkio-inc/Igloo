@@ -539,12 +539,14 @@ func domainError(err error) error {
 	return err
 }
 
-// iglooDenied is the refusal of a change to what Igloo keeps for ID domains
-// and bitmap indexes: their schemas and the policies that guard them.
+// iglooDenied is the refusal of a change to what Igloo keeps for ID
+// domains, bitmap indexes and refreshes: their schemas and the policies
+// that guard them.
 func iglooDenied() error {
 	return pgerror.WithCode(fmt.Errorf("permission denied: the schemas %s and the row access policies %s are Igloo's own, which keep ID domains' "+
-		"dictionaries and bitmap indexes; use CREATE and DROP ID DOMAIN, and ALTER TABLE ... ADD and DROP BITMAP INDEX",
-		strings.Join(iglooSchemas, " and "), strings.Join(iglooPolicies, " and ")), codes.InsufficientPrivilege)
+		"dictionaries, bitmap indexes and the state of materialized views and dynamic tables; use CREATE and DROP ID DOMAIN, ALTER TABLE ... "+
+		"ADD and DROP BITMAP INDEX, and the statements on materialized views and dynamic tables",
+		strings.Join(iglooSchemas, ", "), strings.Join(iglooPolicies, ", ")), codes.InsufficientPrivilege)
 }
 
 // iglooSchemaWrites refuses, whoever the user, a statement of type t that

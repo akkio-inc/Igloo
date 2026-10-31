@@ -38,6 +38,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/erasure"
@@ -417,6 +418,12 @@ type Server struct {
 	// results keeps queries' results (see resultcache.go); nil when it
 	// keeps none.
 	results *resultCache
+	// refreshFraction is the share of a table's rows past which a change
+	// is refreshed in full (defaultFullFraction when zero), and
+	// deleteTargets what refreshes know of which data files position
+	// delete files delete rows of (see refresh.go).
+	refreshFraction float64
+	deleteTargets   *deletefiles.Targets
 	// queryMemory is Options.QueryMemory.
 	queryMemory int64
 	// functions is what statements' rewrites and the result cache know of
@@ -697,6 +704,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
 	s.idSyncMinRows, s.sortBudget = opts.IDSyncMinRows, opts.SortSpillBudget
 	s.results = newResultCache(opts.ResultCacheSize, opts.Metrics)
+	s.deleteTargets = deletefiles.NewTargets()
 	s.queryMemory = opts.QueryMemory
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes

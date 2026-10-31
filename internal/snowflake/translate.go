@@ -819,8 +819,22 @@ func (t *translator) createStatement(nodes []*node, idx []int) ([]*node, string,
 		return t.createTable(nodes, idx, k, drop)
 	case "VIEW":
 		return t.createView(nodes, idx, k, drop)
+	case "DYNAMIC":
+		if word(k+1) == "TABLE" {
+			// Igloo's own statement (see package pgwire's jobs.go): its
+			// options as written, its query translated.
+			j := k + 2
+			if word(j) == "IF" {
+				j += 3
+			}
+			if _, next := qualifiedName(nodes, idx, j); next < len(idx) && nodes[idx[next]].isGroup('(') {
+				return nil, "", unsupported("CREATE DYNAMIC TABLE with a column list", "name the columns in its query")
+			}
+			return t.expressions(dropNodes(nodes, drop))
+		}
+		return nil, "", unsupported("CREATE DYNAMIC", createHints["DYNAMIC"])
 	case "DATABASE", "WAREHOUSE", "STAGE", "FILE", "STREAM", "PROCEDURE", "PIPE_", "EXTERNAL_FUNCTION",
-		"SEQUENCE", "DYNAMIC", "EVENT", "NETWORK", "STORAGE", "API", "SECURITY", "ICEBERG", "HYBRID":
+		"SEQUENCE", "EVENT", "NETWORK", "STORAGE", "API", "SECURITY", "ICEBERG", "HYBRID":
 		if kind == "FILE" {
 			kind = "FILE FORMAT"
 		}
@@ -837,7 +851,7 @@ var createHints = map[string]string{
 	"STAGE":     "load files with COPY INTO from a location in IGLOO_ALLOWED_LOCATIONS",
 	"SEQUENCE":  "Iceberg tables have no sequences; generate keys with uuid() or row_number()",
 	"STREAM":    "query a table's changes with time travel (AT (TIMESTAMP => ...))",
-	"DYNAMIC":   "use CREATE MATERIALIZED VIEW, refreshed on a schedule by a task",
+	"DYNAMIC":   "Igloo has dynamic tables: CREATE DYNAMIC TABLE name TARGET_LAG = ... AS query",
 }
 
 // dropNodes returns nodes without those at the indexes in drop, and the

@@ -26,8 +26,11 @@ type functionList struct {
 }
 
 // functionSets are the functions a functionList knows, by lower-case name.
+// aggregateMacros are the macros that may call an aggregate, directly or
+// through other macros (by the words of their definitions, which errs
+// toward calling one).
 type functionSets struct {
-	volatile, unstable, aggregates map[string]bool
+	volatile, unstable, aggregates, aggregateMacros map[string]bool
 }
 
 // functionListQuery lists DuckDB's functions, one a row: the name,
@@ -116,5 +119,20 @@ func functionSetsOf(rows []string) *functionSets {
 			}
 		}
 	}
-	return &functionSets{volatile: volatileSet(volatileRows), unstable: unstable, aggregates: aggregates}
+	aggregateMacros := map[string]bool{}
+	for changed := true; changed; {
+		changed = false
+		for name, words := range macros {
+			if aggregateMacros[name] || aggregates[name] {
+				continue
+			}
+			for _, w := range words {
+				if w != name && (aggregates[w] || aggregateMacros[w]) {
+					aggregateMacros[name], changed = true, true
+					break
+				}
+			}
+		}
+	}
+	return &functionSets{volatile: volatileSet(volatileRows), unstable: unstable, aggregates: aggregates, aggregateMacros: aggregateMacros}
 }
