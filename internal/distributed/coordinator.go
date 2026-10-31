@@ -181,6 +181,9 @@ type Coordinator struct {
 	history *history
 	// outcomes are how relations of uncertain size came out (see probe.go).
 	outcomes *outcomes
+	// shapes are the plans statements' shapes got, and the shapes whose
+	// planning ran past its budget (see budget.go).
+	shapes planShapes
 	// memory corrects the working sets DuckDB's plans give by what
 	// statements were seen holding (see ObservePeak).
 	memory memoryScale
@@ -469,16 +472,32 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		}
 		return nil, nil, unsupported("%v", err)
 	}
+	// Auto mode plans within a share of what the statement is expected to
+	// take on one machine (see budget.go); forced runs, EXPLAIN DISTRIBUTED
+	// and a plan again with relations' sizes within planBudget.
+	shape := ""
+	if mode == ModeAuto && !dry && sizes == nil && onLarge == nil {
+		shape = planKey(stmt, nil)
+	}
 	values, err := co.computedValues(ctx, env, stmt)
 	if err != nil {
 		return nil, nil, err
 	}
 	opts.values = valueNames(values)
-	// Planning has a budget of its own (see planBudget): past it, the
-	// statement runs on one machine.
-	pctx, cancel := context.WithTimeoutCause(ctx, planBudget, errPlanBudget)
+	pl := newPlanner(ctx, env, co.parser, co.aggregates(ctx, env), opts)
+	budget := planBudget
+	if shape != "" {
+		if seconds, ok := co.expectedLocal(pl, stmt, shape); ok {
+			budget = autoBudget(seconds)
+		}
+		if co.shapes.gaveUpLately(shape, budget, time.Now()) {
+			return nil, nil, unsupported("planning a statement of its shape ran past a budget of %s or more lately", budget)
+		}
+	}
+	pctx, cancel := budgetContext(ctx, budget)
 	defer cancel()
-	plan, err := newPlanner(pctx, env, co.parser, co.aggregates(ctx, env), opts).plan(stmt)
+	pl.ctx, pl.limit = pctx, budget
+	plan, err := pl.plan(stmt)
 	if err != nil && ctx.Err() != nil {
 		// Canceled or past its deadline while it planned, as when the
 		// session could not describe a part in time: the statement ends,
@@ -486,8 +505,11 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		return nil, nil, context.Cause(ctx)
 	}
 	if err != nil && pctx.Err() != nil {
-		co.log.Warn("planning a statement took longer than its budget; it runs on one machine", "budget", planBudget, "err", err)
-		err = unsupported("planning took longer than %s", planBudget)
+		co.log.Warn("planning a statement took longer than its budget; it runs on one machine", "budget", budget, "err", err)
+		if shape != "" {
+			co.shapes.gaveUpOn(shape, budget, time.Now())
+		}
+		err = unsupported("planning took longer than its budget of %s", budget)
 	}
 	if err != nil {
 		var u *errUnsupported
@@ -508,6 +530,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		keyed = restoreValues(clone(stmt), values).(node)
 	}
 	plan.Key = planKey(keyed, plan.Stages)
+	if shape != "" {
+		co.shapes.planned(shape, plan.Key)
+	}
 	plan.replan = func(sizes map[string]knownSize) (*Plan, error) {
 		// Planned as the statement was, whatever auto mode would choose
 		// now: it runs on workers already.

@@ -291,6 +291,8 @@ type planner struct {
 	// relations nest no deeper than maxRelationDepth (see relationExchange).
 	producing map[string]bool
 	depth     int
+	// limit is the planning budget ctx ends at (see budget.go).
+	limit time.Duration
 
 	stages []*Stage
 	// exchanges counts the exchanges planned.
@@ -1320,7 +1322,8 @@ const maxRelationDepth = 64
 // statement timeout: a statement the planner cannot plan within it runs on
 // one machine, as auto mode must never be slower than one machine for want
 // of a plan. A report of seventeen common table expressions plans in under
-// two seconds. A variable for tests.
+// two seconds. Auto mode budgets less for statements expected to take less
+// on one machine (see budget.go). A variable for tests.
 var planBudget = 10 * time.Second
 
 // errPlanBudget ends a planner's context once planBudget has passed.
@@ -1332,7 +1335,7 @@ var errPlanBudget = errors.New("planning took longer than its budget")
 func (pl *planner) budget() error {
 	if err := pl.ctx.Err(); err != nil {
 		if errors.Is(context.Cause(pl.ctx), errPlanBudget) {
-			return unsupported("planning took longer than %s", planBudget)
+			return unsupported("planning took longer than its budget of %s", pl.limit)
 		}
 		return err
 	}

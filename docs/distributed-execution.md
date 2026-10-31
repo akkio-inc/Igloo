@@ -598,7 +598,13 @@ Planning a statement for workers takes at most 10 seconds, besides the
 session's `statement_timeout`, which ends `EXPLAIN DISTRIBUTED` as it ends
 any statement: a statement that cannot be planned in that time runs on one
 machine, as does a part whose relations workers compute nest more than 64
-deep, or one that would compute a relation from itself.
+deep, or one that would compute a relation from itself. In auto mode the
+budget is a quarter of the time the statement is expected to take on one
+machine (what it took before, else the estimate), between half a second
+and 10 seconds, so that a statement that falls back waits little for it;
+a statement whose shape ran past a budget at least as large in the last
+hour goes to one machine without planning. `distributed_execution = on` and
+`EXPLAIN DISTRIBUTED` keep 10 seconds.
 
 ## Same results as one machine
 

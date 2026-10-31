@@ -2065,7 +2065,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   a budget of 10 seconds, past which the statement runs on one machine, as
   does a part whose relations nest more than 64 deep or would compute a
   relation from itself; and `EXPLAIN DISTRIBUTED` ends on the session's
-  `statement_timeout` and on a cancel request.
+  `statement_timeout` and on a cancel request. In auto mode the budget is
+  a quarter of the statement's expected time on one machine, between half
+  a second and 10 seconds, so that a statement that falls back waits
+  little for it.
 - No one may put Igloo's own schemas (`igloo_domains`, `igloo_bitmaps`,
   `igloo_refresh`) on the search path or make one the current schema, in
   any case or quoting: through such a path any reader read bitmap

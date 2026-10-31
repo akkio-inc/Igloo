@@ -495,8 +495,13 @@ func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
 		}
 		t, terr := pl.table(q)
 		if IsUnsupported(terr) {
-			var b int64
-			if b, ok, terr = pl.viewBytes(q, depth+1); terr == nil && ok {
+			// A view, in turn; or neither a catalog table nor a view, which
+			// stays the error.
+			b, isView, verr := pl.viewBytes(q, depth+1)
+			switch {
+			case verr != nil:
+				terr = verr
+			case isView:
 				total += b
 				return false
 			}
