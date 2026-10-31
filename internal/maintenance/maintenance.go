@@ -132,6 +132,13 @@ type Options struct {
 	// ID domains' ids there (pgwire.Server.MapIDDomains), so that a pass
 	// compacts what mapping rewrote.
 	BeforePass func(ctx context.Context)
+	// Busy, if set, reports whether a transaction block that has not
+	// ended has read or written table (namespace.table). Its COMMIT would
+	// fail after a rewrite of the table's files, as DuckDB commits only on
+	// top of the snapshot it read, so maintenance leaves the files for a
+	// later pass. Igloo passes its own sessions' blocks
+	// (pgwire.Server.InTransaction).
+	Busy func(table string) bool
 }
 
 // Catalog is the Iceberg catalog; *catalog.Client implements it.
@@ -426,6 +433,10 @@ func (m *Maintainer) maintain(ctx context.Context, ident table.Identifier, pass 
 // rewrites the files with rows deleted longer ago than limit. It returns
 // what failed.
 func (m *Maintainer) rewrite(ctx context.Context, ident table.Identifier, tbl *table.Table, limit time.Duration, limited bool, log *slog.Logger) []error {
+	if m.busy(ident) {
+		log.Debug("a transaction block that read the table is open; its files are rewritten on a later pass")
+		return nil
+	}
 	var errs []error
 	switch _, err := m.compactOrCluster(ctx, tbl, log); {
 	case err == nil:
@@ -782,6 +793,11 @@ func (m *Maintainer) rewriteGroups(ctx context.Context, tbl *table.Table, groups
 		}
 	}
 	res.deletes = len(removed)
+	if m.busy(tbl.Identifier()) {
+		// A block began reading the table while its files were written:
+		// give way to it, as to a writer that committed first.
+		return tbl, res, fmt.Errorf("%w: a transaction block read the table while its files were rewritten", table.ErrCommitFailed)
+	}
 	if err := rw.Commit(ctx); err != nil {
 		return tbl, res, fmt.Errorf("commit the rewrite: %w", err)
 	}
@@ -987,4 +1003,10 @@ func millis(ms int64) time.Duration {
 
 func name(ident table.Identifier) string {
 	return strings.Join(ident, ".")
+}
+
+// busy reports whether Options.Busy says a transaction block has read the
+// table.
+func (m *Maintainer) busy(ident table.Identifier) bool {
+	return m.opts.Busy != nil && m.opts.Busy(name(ident))
 }

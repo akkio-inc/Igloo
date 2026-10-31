@@ -1962,6 +1962,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Maintenance leaves the files of tables that an open transaction block has
+  read or written until the block ends (an hour at most): a compaction that
+  committed in the middle of a block, as dbt's incremental models and each
+  batch of a microbatch model run, made its `COMMIT` fail with
+  `CatalogCommitConflicts`.
 - Connections signing in from a loopback or private address, such as the
   scale-to-zero gateway's, a pooler's or a Kubernetes Service's, which all
   the clients behind it share, count only toward the limit of all

@@ -50,6 +50,7 @@ func (s *Server) parseScript(sess *session, parts []sqllex.Statement) wire.Prepa
 				err = pgError(eerr)
 			}
 			sess.inTx, sess.txFailed, sess.savepoints, sess.changes = false, false, nil, 0
+			sess.txTables.clear()
 			sess.closeCursors(ctx, false)
 			return err
 		})

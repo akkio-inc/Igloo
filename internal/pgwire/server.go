@@ -852,6 +852,9 @@ type session struct {
 	open     map[*wire.PreparedStatement]*statement
 	inTx     bool
 	txFailed bool
+	// txTables are the tables the open transaction block read, which
+	// maintenance leaves be until it ends.
+	txTables txTables
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
@@ -1457,11 +1460,16 @@ func (sess *session) observe(st *statement, err error) {
 			case change < 0 && sess.inTx:
 				sess.inTx, sess.txFailed = false, false
 				sess.savepoints, sess.changes = nil, 0
+				sess.txTables.clear()
 				// Cursors without WITH HOLD end with their transaction.
 				sess.closeCursors(context.Background(), false)
 			}
 			return
 		}
+	}
+	if st != nil {
+		// A prepared statement run again in a block may load nothing new.
+		sess.noteTx(st.loads)
 	}
 	switch {
 	case err != nil && sess.inTx:
@@ -2491,6 +2499,8 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 		if l := loads(); st != nil {
 			st.loads = l
 			st.ai = sess.aiBound.Load()
+			// DuckDB has read the tables' snapshots for the block.
+			sess.noteTx(l)
 		}
 	}()
 	defer sess.cacheReports()()

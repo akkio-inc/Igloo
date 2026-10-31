@@ -957,7 +957,12 @@ ref's or the table's `max-ref-age-ms` says, forever by default.
 
 Maintenance commits are ordinary Iceberg commits. A query that is running
 keeps reading the snapshot it started with; a write that commits at the same
-moment as compaction wins, and compaction tries again on the next pass. With
+moment as compaction wins, and compaction tries again on the next pass. A
+transaction block (`BEGIN` ... `COMMIT`, as dbt's incremental models run)
+commits only on top of the snapshots it read, so maintenance leaves the
+files of every table an open block has read or written until the block
+ends, or for an hour at most; it sees only the blocks of its own replica's
+sessions. With
 several replicas, only one maintains tables at a time; they coordinate through
 a lock in the metadata database, where they also record when passes ran. A
 replica that has just started, for example after [scaling to
