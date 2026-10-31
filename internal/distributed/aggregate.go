@@ -153,6 +153,7 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	if err := a.collect(); err != nil {
 		return nil, err
 	}
+	a.ownTopK()
 	if err := a.choose(); err != nil {
 		return nil, err
 	}

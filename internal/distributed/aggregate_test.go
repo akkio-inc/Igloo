@@ -90,6 +90,12 @@ func TestAggregationModes(t *testing.T) {
 		`SELECT l_shipmode, count(DISTINCT l_orderkey) AS o, sum(l_quantity) AS q FROM lineitem GROUP BY 1 HAVING sum(l_quantity) > 100 ORDER BY 1`,
 		`SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250 ORDER BY 1`,
 		`SELECT l_orderkey % 7 AS k, count(*) AS n FROM lineitem GROUP BY k QUALIFY rank() OVER (ORDER BY n DESC) <= 3 ORDER BY k`,
+		// A ranking of many groups, whose first the partitions keep, and
+		// one beside another window, which needs every group.
+		`SELECT l_partkey % 50 AS b, l_suppkey, count(*) AS n FROM lineitem GROUP BY 1, 2
+			QUALIFY dense_rank() OVER (PARTITION BY b ORDER BY n DESC) <= 2 ORDER BY 1, 3 DESC, 2`,
+		`SELECT l_suppkey, count(*) AS n, sum(count(*)) OVER () AS total FROM lineitem GROUP BY 1
+			QUALIFY row_number() OVER (ORDER BY n DESC, l_suppkey) <= 5 ORDER BY 2 DESC, 1`,
 		`SELECT DISTINCT l_returnflag, count(*) > 0 AS any FROM lineitem GROUP BY 1 ORDER BY 1`,
 		// GROUPING() of one grouping set, which the coordinator projects
 		// whole groups of: 0.

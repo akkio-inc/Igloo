@@ -385,7 +385,7 @@ func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth i
 		for str(first["type"]) == "SET_OPERATION_NODE" {
 			first = child(first, "left")
 		}
-		names := outputColumns(first, &scope{})
+		names, _ := pl.selectItems(first, readOnce, 0)
 		if names == nil {
 			return
 		}
@@ -397,7 +397,7 @@ func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth i
 			return []node{n}
 		}
 		for _, b := range branches(q) {
-			items := list(b, "select_list")
+			_, items := pl.selectItems(b, readOnce, 0)
 			if str(b["type"]) != "SELECT_NODE" || len(items) != len(names) {
 				continue
 			}
@@ -406,8 +406,7 @@ func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth i
 			}
 		}
 	case "SELECT_NODE":
-		names := outputColumns(q, &scope{})
-		items := list(q, "select_list")
+		names, items := pl.selectItems(q, readOnce, 0)
 		if len(names) != len(items) {
 			return
 		}
@@ -415,6 +414,43 @@ func (pl *planner) markRows(q node, keep node, readOnce func(node) node, depth i
 			pl.markSelect(q, k, readOnce, depth+1)
 		}
 	}
+}
+
+// selectItems returns the names of a SELECT's result columns and the items
+// that compute them. Those of SELECT * of what one FROM item reads once, as
+// a union's branches read their common table expressions, are the columns
+// of that, which the star passes through by name. Nil if they cannot be
+// told.
+func (pl *planner) selectItems(q node, readOnce func(node) node, depth int) ([]string, []any) {
+	items := list(q, "select_list")
+	if str(q["type"]) != "SELECT_NODE" || len(items) != 1 || !projectionOnly(q) {
+		return outputColumns(q, &scope{}), items
+	}
+	star := items[0].(node)
+	if str(star["class"]) != "STAR" || str(star["relation_name"]) != "" || len(list(star, "exclude_list")) > 0 ||
+		len(list(star, "replace_list")) > 0 || len(list(star, "rename_list")) > 0 || star["columns"] == true || depth > maxTopKDepth {
+		return outputColumns(q, &scope{}), items
+	}
+	r := readOnce(child(q, "from_table"))
+	for r != nil && str(r["type"]) == "SET_OPERATION_NODE" {
+		r = child(r, "left")
+	}
+	if r == nil || len(list(child(q, "from_table"), "column_name_alias")) > 0 {
+		return nil, nil
+	}
+	names, _ := pl.selectItems(r, readOnce, depth+1)
+	if names == nil {
+		return nil, nil
+	}
+	refs := make([]any, len(names))
+	for i, n := range names {
+		ref, err := pl.p.expr(quoteIdent(n))
+		if err != nil {
+			return nil, nil
+		}
+		refs[i] = ref
+	}
+	return names, refs
 }
 
 // markSelect marks q, a SELECT, with keep, a condition over its FROM's
@@ -460,6 +496,77 @@ func byPosition(e node, names []string) node {
 		}
 		return nil, false
 	}).(node)
+}
+
+// ownTopK marks an aggregation whose own QUALIFY keeps the rows a ranking
+// of its groups puts within the first k, as markTopK marks one a later
+// SELECT ranks: SELECT g, count(*) AS n ... GROUP BY g QUALIFY
+// row_number() OVER (PARTITION BY p ORDER BY n DESC) <= 10. The stage that
+// completes its groups keeps those that may rank so, and the coordinator
+// ranks them as the statement says. Another window function in the select
+// list or ORDER BY, which the coordinator computes over the groups that
+// reach it, keeps every group.
+func (a *aggregation) ownTopK() {
+	sel := a.c.sel
+	q := child(sel, "qualify")
+	if q == nil || child(sel, topKMark) != nil {
+		return
+	}
+	sub, err := a.substituteAliases(clone(q).(node))
+	if err != nil {
+		return
+	}
+	// The window QUALIFY ranks by, named as a column of its own.
+	var names []string
+	var items []any
+	sub = rewrite(sub, func(n node) (node, bool) {
+		if str(n["class"]) != "WINDOW" {
+			return nil, false
+		}
+		name := "__igloo_qw" + strconv.Itoa(len(names))
+		names, items = append(names, name), append(items, clone(n))
+		ref, perr := a.pl.p.expr(quoteIdent(name))
+		if perr != nil {
+			return nil, false
+		}
+		return ref, true
+	}).(node)
+	if len(items) != 1 {
+		return
+	}
+	// Its partitions and order may name select items by their aliases too.
+	windowKey := func(w node) (string, bool) {
+		e, err := a.substituteAliases(clone(w).(node))
+		if err != nil {
+			return "", false
+		}
+		return canonical(stripAliases(e)), true
+	}
+	w, err := a.substituteAliases(items[0].(node))
+	if err != nil {
+		return
+	}
+	items[0] = w
+	key, _ := windowKey(w)
+	for _, part := range []any{sel["select_list"], sel["modifiers"]} {
+		other := false
+		walk(part, func(n node) bool {
+			if str(n["class"]) == "WINDOW" {
+				k, ok := windowKey(n)
+				other = !ok || k != key
+			}
+			return !other
+		})
+		if other {
+			return
+		}
+	}
+	for _, c := range conjuncts(sub) {
+		if keep := a.pl.rankedKeep(c, names, items); keep != nil {
+			sel[topKMark] = keep
+			return
+		}
+	}
 }
 
 // qualifyTopK returns the QUALIFY a stage that completes an aggregation's
