@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"slices"
@@ -197,6 +198,7 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 	// A name mapping (schema.name-mapping.default) applies only to files
 	// without field IDs, which workers refuse; iceberg-go adds one to every
 	// table it compacts, whose files all have field IDs.
+	t.Distinct = distinctCounts(tbl.Properties()[catalog.DistinctCountsProperty])
 	snap := tbl.CurrentSnapshot()
 	t.source = &icebergHandle{tbl: tbl, snap: snap, columns: t.Columns}
 	if snap == nil {
@@ -301,6 +303,26 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	}
 	s.mu.Unlock()
 	return files, nil
+}
+
+// distinctCounts reads the distinct counts ANALYZE keeps in a table's
+// property (catalog.DistinctCountsProperty), by lower-case column name;
+// nil if there are none or they cannot be read.
+func distinctCounts(prop string) map[string]int64 {
+	if prop == "" {
+		return nil
+	}
+	var counts map[string]int64
+	if err := json.Unmarshal([]byte(prop), &counts); err != nil {
+		return nil
+	}
+	out := make(map[string]int64, len(counts))
+	for name, n := range counts {
+		if n > 0 {
+			out[strings.ToLower(name)] = n
+		}
+	}
+	return out
 }
 
 // icebergColumn returns a column of Iceberg type t as DuckDB reads it: a

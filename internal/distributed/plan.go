@@ -121,6 +121,10 @@ type Table struct {
 	// Bytes is the size of the table's data files, and Rows its records,
 	// zero if unknown.
 	Bytes, Rows int64
+	// Distinct are the approximate distinct counts of its columns, by
+	// lower-case name, as ANALYZE keeps them; a column without one is
+	// missing.
+	Distinct map[string]int64
 	// Unsupported, if set, says why workers cannot read the table, such as
 	// delete files they cannot apply.
 	Unsupported string

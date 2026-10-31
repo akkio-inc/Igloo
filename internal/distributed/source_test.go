@@ -144,3 +144,23 @@ func TestInitialDefaultsAreUnsupported(t *testing.T) {
 		})
 	}
 }
+
+// TestDistinctCountsLoaded checks that a table's distinct counts, as
+// ANALYZE keeps them in its property, come with it, by lower-case name.
+func TestDistinctCountsLoaded(t *testing.T) {
+	cat := restTable(t, "2", iceberg.NestedField{ID: 1, Name: "Kind", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 2, Name: "id", Type: iceberg.PrimitiveTypes.Int64})
+	if err := cat.SetDistinctCounts(t.Context(), "s", "t", map[string]int64{"Kind": 7, "id": 0}); err != nil {
+		t.Fatal(err)
+	}
+	tab, err := NewIceberg(cat).Table(t.Context(), "s", "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tab.Distinct) != 1 || tab.Distinct["kind"] != 7 {
+		t.Errorf("distinct counts %v, want kind's 7", tab.Distinct)
+	}
+	if got := distinctCounts("not json"); got != nil {
+		t.Errorf("unreadable counts: %v", got)
+	}
+}
