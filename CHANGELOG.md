@@ -629,9 +629,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   estimated at 46, 215 and 14 GB. The plan also gives one machine's
   reading, the columns its scans project (9.6 GB where the stages named 77
   GB of a view's table), and its hash tables' time, at 10 million rows a
-  core-second past the processor's caches: the first report, which took 98
-  s on the replica, is estimated at about 140 s there, where it was
-  estimated at 2,939 s.
+  core-second past the processor's caches. A working set estimated within
+  half again the replica's room counts as fitting, as the estimates ran up
+  to half again high where nothing spilled: the first report, which held
+  33 GB and took 98 s on the replica, is estimated at 46 GB and 127 s
+  there, without spilling, where it was estimated at 2,939 s and sent to
+  workers; the second, at 215 GB, still runs on workers.
 - Where no worker price is set, auto mode prices workers and the large
   worker by their instance types' list prices from a built-in table of AWS,
   Azure and Google Cloud machines, on Spot and by region

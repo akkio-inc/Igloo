@@ -461,9 +461,14 @@ estimate, within a factor of four. A statement is planned so once and
 remembered by its plan key. Where the session cannot plan it, the working
 set is six times what the stages that feed its joins and distinct counts
 read, as filters leave it; for a statement whose shape ran to its end on
-the replica, it is what that run allocated. A machine whose working set is
-over its room takes longer by the ratio to the power of 0.55: twice its room, 1.5
-times as long; six times, 2.7 times as long. Against the scale runs on a
+the replica, it is what that run allocated. A working set estimated within
+half again a machine's room counts as fitting: the estimates ran up to half
+again high where nothing spilled (one of 46 GB, 1.24 times a 49.3 GiB
+replica's room, held 33 GB and ran in 98 s), and DuckDB spills a slight
+overflow at little cost; every scale run that spilled reached twice the
+room or more. A machine whose working set is over that takes longer by the
+ratio to its room to the power of 0.55: twice its room, 1.5 times as long;
+six times, 2.7 times as long. Against the scale runs on a
 replica of 49.3 GiB, by the working sets they reached (what they held at the
 memory limit and what they spilled), eleven reports took 1.2 to 2.9 times
 as long as without spilling, at 2 to 10 times the room, and the curve is

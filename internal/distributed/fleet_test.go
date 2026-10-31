@@ -47,6 +47,14 @@ func TestSpillOn(t *testing.T) {
 	if s := spillOn(1e15, 0); s.factor != 1 || s.oom {
 		t.Errorf("memory unknown: %+v", s)
 	}
+	// Within half again its room (35 GB of 50e9): fits, as estimates run
+	// high; past it, spills.
+	if s := spillOn(1.45*35*gb, 50e9); s.factor != 1 || s.oom || !strings.Contains(s.String(), "within half again") {
+		t.Errorf("1.45 times its room: %+v %s", s, s)
+	}
+	if s := spillOn(1.55*35*gb, 50e9); s.factor <= 1 || s.oom {
+		t.Errorf("1.55 times its room: %+v %s", s, s)
+	}
 	s := spillOn(70*gb, 50e9)
 	if want := math.Pow(2, spillExponent); math.Abs(s.factor-want) > 1e-9 || s.oom || !strings.Contains(s.String(), "spills about 35.0 GB") {
 		t.Errorf("twice its room: %+v %s, want factor %.2f", s, s, want)
@@ -201,6 +209,25 @@ func TestFleetChoice(t *testing.T) {
 		if o.started != o.workers {
 			t.Errorf("workers stopped: %s starts %d", o, o.started)
 		}
+	}
+
+	// E1-like at ten times the data, by DuckDB's plan: a working set of 46
+	// GB, 1.24 times the replica's room, which fits; its joins' hash tables
+	// take 2,033 core-seconds, 127 s on 16 cores, and its stages read 77 GB
+	// where its scans read 3: one machine, which held 33 GB and took 98 s,
+	// where 16 workers are estimated at 198 s. F3-like: 215 GB, 5.8 times
+	// the room, spilling: workers.
+	e1 := features{bytes: 7.744e10, exchanged: 7.744e10, held: 7.744e10, rows: 6.688e9, levels: 4, stages: 5,
+		planned: true, planSet: 46e9, planBytes: 3e9, planWork: 2033}
+	f3 := features{bytes: 6.683e9, exchanged: 6.683e9, held: 6.683e9, rows: 1.273e10, levels: 8, stages: 28,
+		planned: true, planSet: 215e9, planBytes: 6.7e9, planWork: 153}
+	e = decide(e1, benchWorkers, runs{}, false)
+	if onWorkers, _, reason := choose(e, runs{}, false, DefaultThreshold, now); onWorkers || e.spills || e.oneMachine < 100 || e.oneMachine > 160 {
+		t.Errorf("E1-like at 10x: workers %v, one machine %.0f s (%s; %s)", onWorkers, e.oneMachine, reason, e.local)
+	}
+	e = decide(f3, benchWorkers, runs{}, false)
+	if onWorkers, _, reason := choose(e, runs{}, false, DefaultThreshold, now); !onWorkers || !e.spills {
+		t.Errorf("F3-like at 10x: workers %v, one machine %.0f s (%s; %s)", onWorkers, e.oneMachine, reason, e.local)
 	}
 
 	// One machine keeps what it runs faster.

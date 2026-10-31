@@ -42,6 +42,18 @@ const (
 	// minutes and up to 820 GB of spill, where one at 10.3 times finished,
 	// spilling 330 GB.
 	oomRatio = 12
+	// slightSpill is how many times the memory a machine has for it a
+	// working set may be estimated at and still count as fitting: the
+	// estimates from DuckDB's plans ran up to half again high where nothing
+	// spilled (a report estimated at 46 GB, 1.24 times the room of a
+	// machine of 49.3 GiB, held 33 GB and ran in 98 s without spilling;
+	// another estimated at 14 GB held 9.5 GB; over joins, groupings and
+	// sorts of 16 million rows, up to a quarter high), and DuckDB spills a
+	// slight overflow at little cost, 1.25 times as long by the curve at
+	// half again the room. Every scale run that spilled reached twice the
+	// room or more (see TestSpillCalibration), and a report estimated at
+	// 5.8 times it held about 2.9 times.
+	slightSpill = 1.5
 	// fleetMargin is how many times the fastest way's time a way may take
 	// and still be chosen for costing less. At ten times the data, a report
 	// took 112 s on 8 workers and 127 s on 16 (13% more, for twice the
@@ -94,12 +106,12 @@ type spill struct {
 
 // spillOn estimates what a machine of memory bytes (its DuckDB limit) does
 // with a working set of set bytes: nothing if it fits in memoryShare of the
-// memory, or if the memory is not known; otherwise it spills, and takes
-// (set/room)^spillExponent times as long, or runs out of memory past
-// oomRatio.
+// memory, by up to slightSpill, or if the memory is not known; otherwise it
+// spills, and takes (set/room)^spillExponent times as long, or runs out of
+// memory past oomRatio.
 func spillOn(set float64, memory int64) spill {
 	s := spill{set: set, room: memoryShare * float64(max(memory, 0)), factor: 1}
-	if s.room <= 0 || set <= s.room {
+	if s.room <= 0 || set <= slightSpill*s.room {
 		return s
 	}
 	ratio := set / s.room
@@ -118,6 +130,8 @@ func (s spill) String() string {
 	case s.factor > 1:
 		return fmt.Sprintf("working set %s over the %s it has for it: spills about %s, %.1f times as long",
 			gigabytes(int64(s.set)), gigabytes(int64(s.room)), gigabytes(int64(s.set-s.room)), s.factor)
+	case s.set > s.room:
+		return fmt.Sprintf("working set %s within half again the %s it has for it: fits, as such estimates run high", gigabytes(int64(s.set)), gigabytes(int64(s.room)))
 	}
 	return fmt.Sprintf("working set %s within the %s it has for it", gigabytes(int64(s.set)), gigabytes(int64(s.room)))
 }
