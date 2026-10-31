@@ -300,8 +300,8 @@ func (k *Kubernetes) request(ctx context.Context, method, body string) (*http.Re
 }
 
 // AlsoStops makes a driver stop more compute when it stops: the
-// distributed-execution workers' Deployment, so they do not outlive the
-// Igloo pods that start them.
+// distributed-execution workers' Deployments, small and large, so they do
+// not outlive the Igloo pods that start them.
 type AlsoStops struct {
 	Compute
 	Others []Compute

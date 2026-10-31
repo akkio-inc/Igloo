@@ -589,6 +589,52 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
+// The kubernetes driver stops the workers' Deployments, small and large,
+// along with Igloo's, and starts only Igloo's.
+func TestKubernetesStopsWorkers(t *testing.T) {
+	defer func(f func(string, string, int) (Compute, error)) { newKubernetes = f }(newKubernetes)
+	var made []string
+	newKubernetes = func(namespace, name string, replicas int) (Compute, error) {
+		made = append(made, fmt.Sprintf("%s/%s=%d", namespace, name, replicas))
+		return Command{StartCommand: "true", StopCommand: "true"}, nil
+	}
+	cfg := Config{Compute: "kubernetes", K8sNamespace: "ns", K8sDeployment: "igloo-pool-acme", K8sReplicas: 2}
+	for _, c := range []struct {
+		workers, large string
+		want           []string
+	}{
+		{"", "", []string{"ns/igloo-pool-acme=2"}},
+		{"igloo-pool-acme-workers", "", []string{"ns/igloo-pool-acme=2", "ns/igloo-pool-acme-workers=0"}},
+		{"", "igloo-pool-acme-workers-large", []string{"ns/igloo-pool-acme=2", "ns/igloo-pool-acme-workers-large=0"}},
+		{"igloo-pool-acme-workers", "igloo-pool-acme-workers-large",
+			[]string{"ns/igloo-pool-acme=2", "ns/igloo-pool-acme-workers=0", "ns/igloo-pool-acme-workers-large=0"}},
+	} {
+		made = nil
+		cfg.K8sWorkerDeployment, cfg.K8sLargeWorkerDeployment = c.workers, c.large
+		compute, err := NewCompute(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(made) != fmt.Sprint(c.want) {
+			t.Errorf("workers %q, large %q: made %v, want %v", c.workers, c.large, made, c.want)
+		}
+		also, ok := compute.(AlsoStops)
+		if others := len(c.want) - 1; (others > 0) != ok || ok && len(also.Others) != others {
+			t.Errorf("workers %q, large %q: %T stops %d others", c.workers, c.large, compute, len(also.Others))
+		}
+	}
+	got, err := LoadConfig(func(k string) (string, bool) {
+		v, ok := map[string]string{
+			"IGLOO_GATEWAY_BACKEND": "igloo:5432", "IGLOO_GATEWAY_COMPUTE": "kubernetes", "IGLOO_GATEWAY_K8S_DEPLOYMENT": "igloo",
+			"IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT": "igloo-workers", "IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT": "igloo-workers-large",
+		}[k]
+		return v, ok
+	})
+	if err != nil || got.K8sWorkerDeployment != "igloo-workers" || got.K8sLargeWorkerDeployment != "igloo-workers-large" {
+		t.Errorf("config: %+v, %v", got, err)
+	}
+}
+
 func TestCommandCompute(t *testing.T) {
 	dir := t.TempDir()
 	c := Command{StartCommand: "echo up > " + dir + "/state", StopCommand: "exit 3"}

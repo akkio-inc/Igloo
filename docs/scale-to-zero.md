@@ -263,6 +263,7 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_K8S_NAMESPACE` | the gateway's own | `kubernetes`: its namespace |
 | `IGLOO_GATEWAY_K8S_REPLICAS` | `1` | `kubernetes`: replicas to start |
 | `IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT` | | `kubernetes`: a Deployment of [distributed-execution workers](distributed-execution.md) to stop along with Igloo. Igloo starts them itself when a statement needs them. |
+| `IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT` | | `kubernetes`: the Deployment of the pool's [large worker](distributed-execution.md#a-large-worker) to stop along with Igloo, as the workers' |
 | `IGLOO_GATEWAY_START_COMMAND`, `IGLOO_GATEWAY_STOP_COMMAND` | | `command`: shell commands that start and stop the compute |
 | `IGLOO_LOG_FORMAT`, `IGLOO_LOG_LEVEL` | `text`, `info` | As for the server |
 
