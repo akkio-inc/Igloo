@@ -59,7 +59,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"action", "result"}),
 		guards: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_auto_guard_reruns_total",
-			Help: "Statements auto mode ran on this replica that ran past three times their estimate there, and were canceled and run on workers instead.",
+			Help: "Statements auto mode ran on this replica that ran far past their estimate there, and were canceled and run on workers instead.",
 		}),
 		exchanges: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_distributed_exchanging_queries_total",

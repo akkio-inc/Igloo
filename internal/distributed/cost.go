@@ -628,7 +628,7 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 	case found && r.outOfMemory && e.workers > 0:
 		return true, false, "it ran out of memory on one machine"
 	case found && r.guarded && e.workers > 0:
-		return true, false, fmt.Sprintf("it ran on one machine for %.0f s, past three times its estimate", r.local)
+		return true, false, fmt.Sprintf("it ran on one machine for %.0f s, far past its estimate", r.local)
 	case found && r.dist > 0 && r.distWorkers > 0 && e.workers >= 2*r.distWorkers && mayExplore:
 		// Measured on far fewer workers than it would run on now, as
 		// after an earlier session's runs on a smaller fleet: a report

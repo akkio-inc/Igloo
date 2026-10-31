@@ -892,8 +892,15 @@ func TestLocalEstimate(t *testing.T) {
 	if d, ok := LocalEstimate(err); !ok || d <= 0 || !strings.Contains(err.Error(), "one machine is faster") {
 		t.Errorf("auto mode's choice of one machine: %v, %v %v", err, d, ok)
 	}
+	// The workers' estimate, which the guard waits for too.
+	if d, ok := WorkersEstimate(err); !ok || d < startCost*time.Second {
+		t.Errorf("workers' estimate: %v %v", d, ok)
+	}
 	if _, ok := LocalEstimate(unsupported("nothing to divide among workers")); ok {
 		t.Error("an unsupported statement has a local estimate")
+	}
+	if _, ok := WorkersEstimate(unsupported("nothing to divide among workers")); ok {
+		t.Error("an unsupported statement has a workers' estimate")
 	}
 	if _, ok := LocalBudget(err); ok {
 		t.Error("a statement that never ran on workers has a budget on one machine")

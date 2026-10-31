@@ -185,9 +185,9 @@ type distParts struct {
 	release func()
 	// local is how long auto mode estimated this replica would take the
 	// statement, when it chose to run it here though workers could run it,
-	// and budget, if set, how long it may take all the same (see
-	// guardLocal).
-	local, budget time.Duration
+	// alt how long it estimated the workers would, and budget, if set, how
+	// long it may take all the same (see guardAfter).
+	local, alt, budget time.Duration
 }
 
 // sessionMode is the mode user's statements run distributed in: the
@@ -223,6 +223,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			// Workers stay up while it runs here, as an idle replica would
 			// stop them, so that the guard can run it on them.
 			parts.local, parts.release = est, s.dist.Keep()
+			parts.alt, _ = distributed.WorkersEstimate(err)
 			parts.budget, _ = distributed.LocalBudget(err)
 		}
 		if !distributed.IsUnsupported(err) {
@@ -301,20 +302,73 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	return parts, true, nil
 }
 
-// guardFactor and guardMinimum say when a statement auto mode chose to run
-// on this replica, though workers could run it, has run long enough there
-// to run it on workers instead: past guardFactor times its estimate, and
-// guardMinimum. At ten times the data, a report estimated at 51 s took
-// 1,798 s here and 362 s on workers: guarded, it would have taken about
-// 515 s. One estimated at 13 s that took 67 s here, where workers took 55
-// s, finishes before the guard. Variables, for tests.
+// guardFactor, guardAlternative and guardMinimum say when a statement auto
+// mode chose to run on this replica, though workers could run it, has run
+// long enough there to run it on workers instead (see guardAfter).
+// Variables, for tests.
 var (
-	guardFactor  = 3.0
-	guardMinimum = 90 * time.Second
+	guardFactor      = 3.0
+	guardAlternative = 1.0
+	guardMinimum     = 15 * time.Second
 )
 
+// guardUnknown is when the guard fires for a statement whose workers'
+// estimate is not known, as the guard fired before it weighed them.
+const guardUnknown = 90 * time.Second
+
+// guardAfter is how long a statement auto mode estimated at est on this
+// replica, and at alt on workers, their start included, runs here before
+// the guard runs it on workers instead: once it has run guardFactor times
+// its estimate, as many times as statements ran on the replica when it
+// started (load), which share its cores; and once the workers, from
+// scratch, are estimated to take no longer than it has run here
+// (guardAlternative times alt), so that running it there is clearly the
+// better bet; never before guardMinimum, nor budget, what a run on workers
+// took when auto mode tries this replica after one (see
+// distributed.LocalBudget).
+//
+// Moving when the run here has taken what the workers would bounds the
+// loss at about twice the faster side's time, as long as their estimate
+// holds: either the statement finishes here before, or it pays its time
+// here and then theirs. A fixed floor of 90 s let a report estimated at 13
+// s here and 30 s on workers, which took 58 to 97 s here and 50 s on 16
+// workers at ten times the data, run 90 s before moving: 140 s. It now
+// moves at 39 s. A statement whose workers are estimated far slower than
+// its run here is never moved there, however long it runs, and one that
+// ran on workers after the guard moved it runs there from then on, so the
+// guard cannot send a statement back and forth.
+func guardAfter(est, alt, budget time.Duration, load int) time.Duration {
+	after := time.Duration(guardFactor * float64(est) * float64(max(load, 1)))
+	if alt <= 0 {
+		after = max(after, guardUnknown)
+	}
+	return max(after, time.Duration(guardAlternative*float64(alt)), guardMinimum, budget)
+}
+
+// statementsRunning counts the statements running on this replica, which
+// share its cores, for the guard (see guardAfter): its sessions' that are
+// past waiting for their limits.
+func (s *Server) statementsRunning() int {
+	r := s.sessions
+	r.mu.Lock()
+	all := make([]*session, 0, len(r.byPID))
+	for _, sess := range r.byPID {
+		all = append(all, sess)
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, sess := range all {
+		sess.mu.Lock()
+		if sess.statement != "" && !sess.queued {
+			n++
+		}
+		sess.mu.Unlock()
+	}
+	return n
+}
+
 // localGuard cancels a statement's run on this replica once it has run
-// past its time (see guardFactor), unless it has sent the client output.
+// past its time (see guardAfter), unless it has sent the client output.
 type localGuard struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -324,14 +378,14 @@ type localGuard struct {
 	fired  atomic.Bool
 }
 
-// guardLocal arms a guard over a run on this replica of a statement auto
-// mode estimated at est here, or let take budget, which writes to tw: run
-// it under the guard's ctx, and stop the guard after.
-func guardLocal(ctx context.Context, est, budget time.Duration, tw *tagWriter) *localGuard {
+// guardLocal arms a guard over a run on this replica, which writes to tw,
+// that fires after d (see guardAfter): run it under the guard's ctx, and
+// stop the guard after.
+func guardLocal(ctx context.Context, d time.Duration, tw *tagWriter) *localGuard {
 	g := &localGuard{start: time.Now()}
 	g.ctx, g.cancel = context.WithCancel(ctx)
 	tw.gate = &g.gate
-	g.timer = time.AfterFunc(max(time.Duration(guardFactor*float64(est)), guardMinimum, budget), func() {
+	g.timer = time.AfterFunc(d, func() {
 		if g.gate.fire() {
 			g.fired.Store(true)
 			g.cancel()
@@ -350,7 +404,7 @@ func (g *localGuard) stop(tw *tagWriter) (fired bool, ran time.Duration) {
 }
 
 // afterGuard runs st on workers after its run on this replica, where auto
-// mode had chosen to run it, passed its time (see guardFactor) before it
+// mode had chosen to run it, passed its time (see guardAfter) before it
 // sent the client output: the client gets the rows as if it had run there,
 // and the history marks it so that it runs on workers next time. If
 // workers cannot run it after all, it runs here again, to the end.
@@ -358,8 +412,9 @@ func (s *Server) afterGuard(ctx context.Context, sess *session, st *statement, a
 	w *tagWriter, parts *distParts, ran time.Duration) error {
 	user := sess.currentUser()
 	s.dist.ObserveGuard(parts.key, ran)
-	s.log.Warn("a statement ran on this replica past three times its estimate; running it on workers instead",
-		"user", user.Name, "key", parts.key, "seconds", math.Round(ran.Seconds()), "estimate_seconds", math.Round(parts.local.Seconds()))
+	s.log.Warn("a statement ran on this replica far past its estimate; running it on workers instead",
+		"user", user.Name, "key", parts.key, "seconds", math.Round(ran.Seconds()), "estimate_seconds", math.Round(parts.local.Seconds()),
+		"workers_seconds", math.Round(parts.alt.Seconds()))
 	since := time.Now()
 	// As an admin's forced statement runs, starting stopped workers: auto
 	// mode chose this replica for it, and nothing else would run it.

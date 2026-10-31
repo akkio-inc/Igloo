@@ -306,7 +306,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 	if !d.onWorkers {
 		u := &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key, tookOnWorkers: d.tookOnWorkers}
 		if d.e.workers > 0 && !math.IsInf(d.e.onWorkers, 1) {
-			u.oneMachine = d.e.oneMachine
+			u.oneMachine, u.onWorkers = d.e.oneMachine, d.e.onWorkers
 		}
 		return nil, u
 	}

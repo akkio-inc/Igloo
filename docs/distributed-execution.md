@@ -364,13 +364,22 @@ and runs it on workers from then on.
 The replica's estimate can also run far short, as for a statement that
 spills: one estimated at 51 s took 1,798 s on the replica and 362 s on
 workers. So a statement auto mode runs on the replica, though workers could
-run it, is stopped there once it has run three times its estimate and at
-least 90 seconds without sending a row, and runs on workers, started if they
-are stopped, the client getting its rows as if it had run there; the server
-logs `a statement ran on this replica past three times its estimate;
-running it on workers instead`, counts it
-(`igloo_auto_guard_reruns_total`), and runs the statement on workers from
-then on. A statement that has begun sending rows runs to the end, and so
+run it, is stopped there once, without sending a row, it has run three
+times its estimate (times the statements running on the replica when it
+started, which share its cores) and as long as the workers are estimated to
+take it from scratch, their start included, and at least 15 seconds; it
+then runs on workers, started if they are stopped, the client getting its
+rows as if it had run there. Moving once the run has taken what the workers
+would take bounds the loss at about twice the faster side, as long as the
+workers' estimate holds: a report estimated at 13 s on the replica and 30 s
+on workers, which took 58 to 97 s on the replica and 50 s on workers at ten
+times the data, moves after 39 s, where a fixed floor of 90 s let it run 90
+s first. A statement whose workers are estimated slower than its run so far
+is not moved, however long it runs. The server logs `a statement ran on
+this replica far past its estimate; running it on workers instead`, counts
+it (`igloo_auto_guard_reruns_total`), and runs the statement on workers
+from then on, never back on the replica, so the guard cannot send it back
+and forth. A statement that has begun sending rows runs to the end, and so
 does a write. While such a statement runs on the replica, the workers count
 as busy, so they are not stopped as idle under it.
 
@@ -646,7 +655,7 @@ object storage there. The default stays `object`.
   | `igloo_distributed_scanned_bytes_total` | | Data file bytes divided among workers |
   | `igloo_distributed_received_bytes_total` | | Partial results received |
   | `igloo_distributed_worker_starts_total` | `action` = `start`, `stop`; `result` | Workers started and stopped |
-  | `igloo_auto_guard_reruns_total` | | Statements auto mode ran on the replica that ran past three times their estimate there, and ran on workers instead |
+  | `igloo_auto_guard_reruns_total` | | Statements auto mode ran on the replica that ran far past their estimate there (see [when](#when)), and ran on workers instead |
 
   and on the workers' port 8080: `igloo_worker_tasks_total{outcome}`
   (`out_of_memory` counting tasks a worker canceled as it ran out),

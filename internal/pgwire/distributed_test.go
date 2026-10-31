@@ -650,8 +650,8 @@ func TestDistributedGuard(t *testing.T) {
 	// sets, which the guard waits for.
 	ds.source.size = 300 << 20
 	// Package variables: this test does not run in parallel.
-	defer func(f float64, m time.Duration) { guardFactor, guardMinimum = f, m }(guardFactor, guardMinimum)
-	guardFactor, guardMinimum = 0, 300*time.Millisecond
+	defer func(f, a float64, m time.Duration) { guardFactor, guardAlternative, guardMinimum = f, a, m }(guardFactor, guardAlternative, guardMinimum)
+	guardFactor, guardAlternative, guardMinimum = 0, 0, 300*time.Millisecond
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
 	ctx := context.Background()
@@ -733,17 +733,15 @@ func TestDistributedGuard(t *testing.T) {
 // A guard does not stop a statement that has begun sending its rows, and
 // once it stopped one, the statement sends nothing.
 func TestGuardGate(t *testing.T) {
-	// Package variables: this test does not run in parallel.
-	defer func(f float64, m time.Duration) { guardFactor, guardMinimum = f, m }(guardFactor, guardMinimum)
-	guardFactor, guardMinimum = 0, 50*time.Millisecond
+	const after = 50 * time.Millisecond
 	ctx := context.Background()
 
 	streaming := &tagWriter{DataWriter: &countingWriter{}}
-	g := guardLocal(ctx, time.Second, 0, streaming)
+	g := guardLocal(ctx, after, streaming)
 	if err := streaming.Row([]any{1}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(4 * guardMinimum)
+	time.Sleep(4 * after)
 	if fired, _ := g.stop(streaming); fired {
 		t.Error("a statement sending rows was stopped")
 	}
@@ -752,7 +750,7 @@ func TestGuardGate(t *testing.T) {
 	}
 
 	quiet := &tagWriter{DataWriter: &countingWriter{}}
-	g = guardLocal(ctx, time.Millisecond, 0, quiet)
+	g = guardLocal(ctx, after, quiet)
 	select {
 	case <-g.ctx.Done():
 	case <-time.After(5 * time.Second):
@@ -764,11 +762,63 @@ func TestGuardGate(t *testing.T) {
 	if err := quiet.Complete("SELECT 0"); !errors.Is(err, errGuardFired) {
 		t.Errorf("completing after the guard fired: %v", err)
 	}
-	if fired, ran := g.stop(quiet); !fired || ran < guardMinimum {
+	if fired, ran := g.stop(quiet); !fired || ran < after {
 		t.Errorf("fired %v after %s", fired, ran)
 	}
 	if n := quiet.DataWriter.(*countingWriter).rows; n != 0 {
 		t.Errorf("%d rows reached the client after the guard fired", n)
+	}
+}
+
+// TestGuardAfter checks when the guard runs a statement auto mode ran here
+// on workers instead: past three times its estimate here, times the
+// statements sharing the replica, and only once its run here has taken as
+// long as the workers' estimate, start included; never before the minimum
+// or a run's budget.
+func TestGuardAfter(t *testing.T) {
+	const s = time.Second
+	for _, c := range []struct {
+		name             string
+		est, alt, budget time.Duration
+		load             int
+		want             time.Duration
+	}{
+		// E1-like at ten times the data: estimated at 13 s here and 30 s on
+		// workers; it took 58 to 97 s here and 50 s on workers. The fixed
+		// 90 s floor let it run 90 s here first.
+		{"E1-like at 10x", 13 * s, 30 * s, 0, 1, 39 * s},
+		// Workers stopped: their start counts, and the run here may take as
+		// long before it moves.
+		{"E1-like at 10x, workers stopped", 13 * s, 75 * s, 0, 1, 75 * s},
+		// F3-like at ten times the data: 51 s here by the estimate, 1,798 s
+		// in fact; 168 s estimated on workers, 150 to 190 s in fact.
+		{"F3-like at 10x", 51 * s, 168 * s, 0, 1, 168 * s},
+		// A short statement waits the minimum, not three times its estimate.
+		{"short", 2 * s, 5 * s, 0, 1, guardMinimum},
+		// Eight statements at once share the replica: each takes about
+		// eight times as long, which is no reason to move any.
+		{"one of eight at once", 13 * s, 30 * s, 0, 8, 312 * s},
+		// Workers estimated far slower than the run here: it is not moved
+		// before it has run as long as they would take.
+		{"workers far slower", 10 * s, 600 * s, 0, 1, 600 * s},
+		// Tried here after a run of 200 s on workers.
+		{"budget", 14 * s, 30 * s, 200 * s, 1, 200 * s},
+		{"workers' estimate unknown", 13 * s, 0, 0, 1, 90 * s},
+	} {
+		if got := guardAfter(c.est, c.alt, c.budget, c.load); got != c.want {
+			t.Errorf("%s: after %s, want %s", c.name, got, c.want)
+		}
+	}
+	// Moving once the run here has taken the workers' time bounds the
+	// loss: a statement that would have run just past the guard here takes
+	// the guard's time and then the workers', about twice the faster side
+	// at most when the workers' estimate holds and the guard is not held
+	// back by three times the estimate here.
+	for _, c := range []struct{ est, alt time.Duration }{{13 * s, 30 * s}, {51 * s, 168 * s}, {5 * s, 40 * s}} {
+		after := guardAfter(c.est, c.alt, 0, 1)
+		if worst := float64(after+c.alt) / float64(c.alt); after > max(3*c.est, c.alt, guardMinimum) || worst > 2 && after != 3*c.est {
+			t.Errorf("estimated %s here, %s on workers: after %s, up to %.1f times the workers' time", c.est, c.alt, after, worst)
+		}
 	}
 }
 

@@ -421,11 +421,13 @@ type errUnsupported struct {
 	// key is the statement's plan key when auto mode chose one machine
 	// for a statement that could run on workers (PlanKey), and oneMachine
 	// how long one machine was estimated to take it, in seconds, when
-	// workers could run it (LocalEstimate); tookOnWorkers is what its last
-	// run on workers took, when auto mode tries one machine after it
-	// (LocalBudget).
+	// workers could run it (LocalEstimate), and onWorkers how long the
+	// workers auto mode would have run it on, their start included
+	// (WorkersEstimate); tookOnWorkers is what its last run on workers
+	// took, when auto mode tries one machine after it (LocalBudget).
 	key           string
 	oneMachine    float64
+	onWorkers     float64
 	tookOnWorkers float64
 }
 
@@ -454,6 +456,20 @@ func LocalEstimate(err error) (d time.Duration, ok bool) {
 	var u *errUnsupported
 	if errors.As(err, &u) && u.key != "" && u.oneMachine > 0 {
 		return time.Duration(u.oneMachine * float64(time.Second)), true
+	}
+	return 0, false
+}
+
+// WorkersEstimate returns how long auto mode estimated the workers it
+// would have run a statement on take it, starting them if they are
+// stopped, for a statement it chose to run on one machine though workers
+// could run it, as err, Plan's error, says: the session's guard runs the
+// statement on them only once its run here has taken that long (see the
+// server's guard). ok is false for any other statement.
+func WorkersEstimate(err error) (d time.Duration, ok bool) {
+	var u *errUnsupported
+	if errors.As(err, &u) && u.key != "" && u.oneMachine > 0 && u.onWorkers > 0 {
+		return time.Duration(u.onWorkers * float64(time.Second)), true
 	}
 	return 0, false
 }

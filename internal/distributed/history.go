@@ -32,8 +32,8 @@ type runs struct {
 	distWorkers int
 	explored    time.Time
 	outOfMemory bool
-	// guarded says it ran on one machine past guardFactor times its
-	// estimate, and was run on workers instead (see ObserveGuard).
+	// guarded says it ran on one machine far past its estimate, and was
+	// run on workers instead (see ObserveGuard).
 	guarded bool
 	// exchangeRows and exchangeBytes are what its last run on workers
 	// exchanged, and fanout the most rows a stage of it wrote for each
@@ -229,9 +229,10 @@ func (co *Coordinator) observeExchanges(key string, run *execution, stages []*St
 }
 
 // ObserveGuard records that a statement whose plan key is key ran on one
-// machine, where auto mode had chosen to run it, for d, past guardFactor
-// times its estimate, and was run on workers instead: auto mode runs it on
-// workers next time, without trying one machine again (see choose).
+// machine, where auto mode had chosen to run it, for d, far past its
+// estimate (the server's guard), and was run on workers instead: auto mode
+// runs it on workers next time, without trying one machine again (see
+// choose), so the guard cannot move it back and forth.
 func (co *Coordinator) ObserveGuard(key string, d time.Duration) {
 	if key != "" {
 		co.history.update(key, func(r *runs) {
